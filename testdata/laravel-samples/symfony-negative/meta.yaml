@@ -1,0 +1,4 @@
+is_laravel: false
+note: "Негативный образец: csrf-token meta есть, сессия не Laravel — ложных срабатываний быть не должно"
+source: synthetic
+obtained: 2026-10-16

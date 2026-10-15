@@ -1,0 +1,70 @@
+# Dev-конфигурация сервисов Domain Crawler (ТЗ 5.10 основного ТЗ).
+# Подставляется в контейнеры как /etc/crawler/config.yaml.
+# Значения-адреса соответствуют статическим IP сети crawler_net в compose.yaml;
+# при развитии сервисов значения из переменных окружения имеют приоритет.
+
+postgres:
+  # Полный DSN собирается из APP_PG_DSN (env), здесь — форма по умолчанию.
+  dsn: "postgres://crawler:crawler@172.28.100.2:5432/crawler?sslmode=disable"
+  pool_size: 20
+
+redis:
+  addr: "172.28.100.3:6379"
+
+ingest:
+  dir: "/data/incoming"
+  batch_size: 50000
+  stable_seconds: 10
+
+scheduler:
+  recheck_interval: "4380h"          # ~6 месяцев
+  batch_size: 5000
+  queue_high_watermark: 100000
+  lease: "30m"
+  temp_error_retry_after: "24h"
+
+dns:
+  resolvers: ["172.28.100.10:53"]      # unbound
+  fallback_resolvers: []             # в dev наружу не ходим
+  concurrency: 2000
+  max_qps: 10000
+  ipv6: false                        # в docker-сети IPv6 нет
+
+http:
+  concurrency: 2000
+  per_ip_limit: 4
+  connect_timeout: "5s"
+  header_timeout: "10s"
+  total_timeout: "20s"
+  max_redirects: 8
+  max_body_bytes: 2097152
+  user_agent: "DomainCrawler/dev (+dev-environment; contact: dev@example.invalid)"
+
+render:
+  # dev: внешний chromium-контейнер (compose-сервис chromium, ws://172.28.100.14:9222)
+  remote_url: "ws://172.28.100.14:9222"
+  contexts: 3
+  timeout: "25s"
+  restart_every_pages: 500
+
+content:
+  dir: "/data/content"
+  pack_size: "512MB"
+  max_store_bytes: 2097152
+  zstd_dictionary: "/data/content/dict.zst"
+
+analyzer:
+  rules_dir: "/etc/crawler/rules"
+  laravel_min_score: 0.6
+
+subdomains:                          # начальное наполнение таблицы subdomains
+  - ""
+  - "www"
+  - "admin"
+  - "crm"
+  - "api"
+  - "app"
+
+monitor:
+  listen: ":9100"
+  zone_stats_interval: "60s"

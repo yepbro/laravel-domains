@@ -1,0 +1,29 @@
+# Образ рендера: headless-Chromium + бинарник render-worker (ТЗ 4.3).
+# render-worker запускает Chromium сам (chromedp), поэтому один процесс
+# на контейнер; shm_size/init/mem_limit задаются в compose.
+#
+# Проверочная сборка: make build-runtime
+
+# syntax=docker/dockerfile:1
+
+ARG GO_VERSION=1.26.9
+ARG CHROMEDP_HEADLESS_IMAGE=chromedp/headless-shell:156.0.8078.17
+
+FROM golang:${GO_VERSION}-alpine AS build
+ENV GOFLAGS=-mod=readonly \
+    GOMODCACHE=/gomod \
+    GOCACHE=/gocache \
+    CGO_ENABLED=0
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/render-worker ./cmd/render-worker
+
+FROM ${CHROMEDP_HEADLESS_IMAGE} AS render
+COPY --from=build /out/render-worker /usr/local/bin/render-worker
+ENV HOME=/tmp
+# headless-shell лежит в /headless-shell; render-worker запускает его сам
+# (флаг --no-sandbox передаётся кодом воркера при запуске в контейнере).
+USER nobody
+ENTRYPOINT ["/usr/local/bin/render-worker"]

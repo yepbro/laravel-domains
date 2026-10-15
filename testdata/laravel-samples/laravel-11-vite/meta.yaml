@@ -1,0 +1,6 @@
+is_laravel: true
+ver_min: "9.19"        # Vite появился в Laravel 9.19
+ver_max: ""
+note: "Синтетический образец (Laravel 11 + Vite + Inertia) до передачи реальных образцов заказчиком"
+source: synthetic
+obtained: 2026-10-16

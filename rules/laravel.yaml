@@ -1,0 +1,56 @@
+# Начальный набор правил поиска Laravel (ТЗ 5.8 основного ТЗ).
+# Версионные границы уточняются по документации Laravel по мере накопления
+# реальных образцов (testdata/laravel-samples).
+#
+# Порог попадания в laravel_domains задаётся конфигом (по умолчанию 0.6).
+# Все срабатывания (любое правило) пишутся в laravel_findings.
+rules:
+  - id: cookie_xsrf_token
+    description: Кука XSRF-TOKEN (Laravel шифрует значение)
+    target: cookie_name
+    match: "XSRF-TOKEN"
+    weight: 0.25
+
+  - id: cookie_session_suffix
+    description: Имя сессионной куки Laravel (<name>_session)
+    target: cookie_name
+    regex: "^[a-z0-9_\\-]+_session$"
+    weight: 0.2
+
+  - id: cookie_encrypted_payload
+    description: Зашифрованное Laravel-значение (base64 от {"iv":)
+    target: cookie_value
+    regex: "^eyJpdiI6"
+    weight: 0.45
+
+  - id: meta_csrf_token
+    description: meta csrf-token (встречается и вне Laravel — слабый признак)
+    target: html
+    regex: '<meta\s+name="csrf-token"'
+    weight: 0.2
+
+  - id: vite_assets
+    description: Сборка Vite (build/assets c 8-символьным хэшем)
+    target: html
+    regex: '/build/assets/[^"]+-[A-Za-z0-9_-]{8}\.(js|css)'
+    weight: 0.15
+    ver_min: "9.19"
+
+  - id: mix_assets
+    description: Сборка Laravel Mix (?id= с 20 hex-символами)
+    target: html
+    regex: '\.(css|js)\?id=[0-9a-f]{20}'
+    weight: 0.15
+    ver_max: "9.x"
+
+  - id: inertia
+    description: Inertia.js (data-page)
+    target: html
+    regex: 'data-page=[''"]'
+    weight: 0.2
+
+  - id: livewire
+    description: Livewire (wire:* атрибуты / livewire.js)
+    target: html
+    regex: 'wire:(id|model|click)|livewire(\.min)?\.js'
+    weight: 0.3

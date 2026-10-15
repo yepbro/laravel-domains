@@ -1,0 +1,496 @@
+# Domain Crawler — dev-окружение.
+# Запуск через Makefile из корня репозитория (make up / make up-infra / ...),
+# либо вручную: docker compose --project-directory . -f deploy/docker/compose.yaml ...
+#
+# Профили:
+#   (по умолчанию) postgres, redis, unbound, migrate
+#   testbed        coredns, testweb, mockserver — изолированный «мини-интернет»
+#   app            Go-сервисы проекта + chromium
+#   monitoring     prometheus
+#   tools          adminer, redis-insight, tools (запускаются по требованию)
+#
+# Сеть crawler_net использует статические адреса:
+#   postgres 172.28.100.2, redis 172.28.100.3, unbound 172.28.100.10, coredns 172.28.100.11,
+#   testweb 172.28.100.12, mockserver 172.28.100.13, chromium 172.28.100.14,
+#   172.28.100.250 — «чёрная дыра» (адрес без слушателя для сценариев закрытых портов).
+# Приложениям адреса инфраструктуры выдаются через переменные окружения,
+# а DNS всех сервисов приложения указывает на unbound (см. 7.2 ТЗ).
+
+name: crawler
+
+x-go-build: &go-build
+  context: .
+  dockerfile: deploy/docker/Dockerfile.go
+  target: dev
+  args:
+    GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (см. .env.example)}
+    ALPINE_VERSION: ${ALPINE_VERSION:-3.24.2}
+    AIR_VERSION: ${AIR_VERSION:-v1.67.4}
+    DELVE_VERSION: ${DELVE_VERSION:-v1.27.2}
+    GOLANGCI_LINT_VERSION: ${GOLANGCI_LINT_VERSION:-v2.14.0}
+    MIGRATE_VERSION: ${MIGRATE_VERSION:-v4.20.1}
+
+x-go-common: &go-common
+  image: crawler/go-dev:local
+  working_dir: /src
+  user: "${DEV_UID:-1000}:${DEV_GID:-1000}"
+  environment: &go-common-env
+    HOME: /tmp
+    GOMODCACHE: /gomod
+    GOCACHE: /gocache
+    GOFLAGS: -mod=readonly
+    # Значения подставляются из .env; DSN/адреса — статические IP сети crawler_net
+    APP_PG_DSN: postgres://${APP_DB_USER:-crawler}:${APP_DB_PASSWORD:-dev-only-crawler}@172.28.100.2:5432/${POSTGRES_DB:-crawler}?sslmode=disable
+    APP_REDIS_ADDR: 172.28.100.3:6379
+    APP_RESOLVER: 172.28.100.10:53
+    APP_CONFIG: /etc/crawler/config.yaml
+    APP_RULES_DIR: /etc/crawler/rules
+    APP_INCOMING_DIR: /data/incoming
+    APP_CONTENT_DIR: /data/content
+    CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-DomainCrawler/dev}
+    CHROMIUM_WS_URL: ws://172.28.100.14:9222
+  volumes:
+    - .:/src                      # исходный код (bind, hot reload)
+    - gomodcache:/gomod           # кэш Go-модулей (общий, именованный том)
+    - gocache:/gocache            # кэш сборки (общий, именованный том)
+    - ./deploy/docker/config.dev.yaml:/etc/crawler/config.yaml:ro
+    - ./rules:/etc/crawler/rules:ro
+    - ./var/content:/data/content
+  dns_opt:
+    - "ndots:1"
+  networks:
+    - crawler_net
+  restart: unless-stopped
+  stop_grace_period: 15s
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  sysctls:
+    net.ipv4.ip_local_port_range: "1024 65535"
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:$${METRICS_PORT:-9090}/healthz || exit 1"]
+    interval: 15s
+    timeout: 3s
+    retries: 20
+    start_period: 120s
+
+# Сервисы приложения используют unbound как единственный внешний резолвер
+# (ТЗ 7.2): Docker пересылает на указанный адрес всё, что не является именем
+# сервисов compose. У tools DNS оставлен стандартным (нужен proxy.golang.org).
+x-app-dns: &app-dns
+  dns:
+    - 172.28.100.10
+
+services:
+  # ==========================================================================
+  # Инфраструктура (профиль по умолчанию)
+  # ==========================================================================
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine3.24}
+    environment:
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev-only-admin}
+      POSTGRES_DB: ${POSTGRES_DB:-crawler}
+      APP_DB_USER: ${APP_DB_USER:-crawler}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-dev-only-crawler}
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.dev.conf
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./deploy/docker/postgres/postgresql.dev.conf:/etc/postgresql/postgresql.dev.conf:ro
+      - ./deploy/docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.2
+    mem_limit: ${MEM_POSTGRES:-1536m}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER:-admin} -d ${POSTGRES_DB:-crawler}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4.11-alpine3.21}
+    command: ["redis-server", "/usr/local/etc/redis/redis.dev.conf"]
+    volumes:
+      - ./deploy/docker/redis/redis.dev.conf:/usr/local/etc/redis/redis.dev.conf:ro
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.3
+    mem_limit: ${MEM_REDIS:-256m}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  unbound:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.unbound
+      args:
+        ALPINE_VERSION: ${ALPINE_VERSION:-3.24.2}
+    image: crawler/unbound:local
+    environment:
+      # testbed: всё форвардится в coredns, остальное REFUSED.
+      # Режим internet включается только make up-internet (ALLOW_INTERNET=1).
+      UNBOUND_MODE: ${UNBOUND_MODE:-testbed}
+    command: ["/bin/sh", "-c", "exec unbound -d -c /etc/unbound/unbound.$${UNBOUND_MODE:-testbed}.conf"]
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.10
+    mem_limit: ${MEM_UNBOUND:-256m}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nslookup $${UNBOUND_HEALTH_NAME:-same-site.crawl.test} 127.0.0.1 >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  migrate:
+    # Однократное применение миграций при поднятии окружения.
+    <<: *go-common
+    command:
+      - sh
+      - -c
+      - 'migrate -path /migrations -database "$$APP_PG_DSN" up && echo "миграции применены"'
+    volumes:
+      - .:/src
+      - gomodcache:/gomod
+      - gocache:/gocache
+      - ./migrations:/migrations:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    mem_limit: 256m
+    healthcheck:
+      disable: true
+
+  # ==========================================================================
+  # Тестовый стенд (profile: testbed)
+  # ==========================================================================
+
+  coredns:
+    image: ${COREDNS_IMAGE:-coredns/coredns:1.14.7}
+    command: ["-conf", "/Corefile"]
+    volumes:
+      - ./deploy/docker/testbed/coredns/Corefile:/Corefile:ro
+      - ./deploy/docker/testbed/coredns/zones.conf:/etc/coredns/zones.conf:ro
+      - ./deploy/docker/testbed/coredns/zones:/zones:ro
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.11
+    mem_limit: 128m
+    restart: unless-stopped
+    profiles: ["testbed"]
+
+  testweb:
+    # Caddy с виртуальными хостами по сценариям из deploy/docker/testbed/web/Caddyfile
+    image: ${CADDY_IMAGE:-caddy:2.11.7-alpine}
+    volumes:
+      - ./deploy/docker/testbed/web/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/docker/testbed/web/sites:/srv/sites:ro
+      - ./testdata/laravel-samples:/srv/samples:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "127.0.0.1:${TESTWEB_HTTP_PORT:-8088}:80"
+      - "127.0.0.1:${TESTWEB_HTTPS_PORT:-8443}:443"
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.12
+    mem_limit: 128m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    profiles: ["testbed"]
+
+  mockserver:
+    # «Злые» сценарии, которые нельзя описать статикой: тарпит, огромные тела,
+    # zip-бомба, обрыв соединения, бесконечные редиректы, плохие TLS-сертификаты.
+    # Исходник: cmd/mockserver
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.go
+      target: mockserver
+      args:
+        GO_VERSION: ${GO_VERSION:?GO_VERSION must be set}
+        ALPINE_VERSION: ${ALPINE_VERSION:-3.24.2}
+    image: crawler/mockserver:local
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.13
+    mem_limit: 128m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    profiles: ["testbed"]
+
+  # ==========================================================================
+  # Приложения проекта (profile: app)
+  # ==========================================================================
+
+  ingest:
+    <<: [*go-common, *app-dns]
+    build: *go-build
+    command: ["./deploy/docker/scripts/air-entrypoint.sh"]
+    environment:
+      <<: *go-common-env
+      SERVICE: ingest
+      METRICS_PORT: "9101"
+    volumes:
+      - .:/src
+      - gomodcache:/gomod
+      - gocache:/gocache
+      - ./deploy/docker/config.dev.yaml:/etc/crawler/config.yaml:ro
+      - ./rules:/etc/crawler/rules:ro
+      # наблюдаемая папка и соседние каталоги — bind с хоста (ТЗ 4.2)
+      - ./var/incoming:/data/incoming
+      - ./var/content:/data/content
+    mem_limit: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    profiles: ["app"]
+
+  scheduler:
+    <<: [*go-common, *app-dns]
+    build: *go-build
+    command: ["./deploy/docker/scripts/air-entrypoint.sh"]
+    environment:
+      <<: *go-common-env
+      SERVICE: scheduler
+      METRICS_PORT: "9102"
+    mem_limit: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    profiles: ["app"]
+
+  dns-worker:
+    <<: [*go-common, *app-dns]
+    build: *go-build
+    command: ["./deploy/docker/scripts/air-entrypoint.sh"]
+    environment:
+      <<: *go-common-env
+      SERVICE: dns-worker
+      METRICS_PORT: "9103"
+    mem_limit: 384m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    profiles: ["app"]
+
+  http-worker:
+    <<: [*go-common, *app-dns]
+    build: *go-build
+    command: ["./deploy/docker/scripts/air-entrypoint.sh"]
+    environment:
+      <<: *go-common-env
+      SERVICE: http-worker
+      METRICS_PORT: "9104"
+    mem_limit: 384m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    profiles: ["app"]
+
+  render-worker:
+    <<: [*go-common, *app-dns]
+    build: *go-build
+    command: ["./deploy/docker/scripts/air-entrypoint.sh"]
+    environment:
+      <<: *go-common-env
+      SERVICE: render-worker
+      METRICS_PORT: "9105"
+    mem_limit: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    profiles: ["app"]
+
+  analyzer:
+    <<: [*go-common, *app-dns]
+    build: *go-build
+    command: ["./deploy/docker/scripts/air-entrypoint.sh"]
+    environment:
+      <<: *go-common-env
+      SERVICE: analyzer
+      METRICS_PORT: "9106"
+    mem_limit: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    profiles: ["app"]
+
+  monitor:
+    <<: [*go-common, *app-dns]
+    build: *go-build
+    command: ["./deploy/docker/scripts/air-entrypoint.sh"]
+    environment:
+      <<: *go-common-env
+      SERVICE: monitor
+      METRICS_PORT: "9100"
+    mem_limit: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    profiles: ["app"]
+
+  chromium:
+    # Headless Chromium для render-worker (CDP на :9222).
+    # shm_size вместо --disable-dev-shm-usage; init — уборка zombie (ТЗ 4.3).
+    image: ${CHROMEDP_HEADLESS_IMAGE:-chromedp/headless-shell:156.0.8078.17}
+    shm_size: "1gb"
+    init: true
+    dns:
+      - 172.28.100.10
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.14
+    mem_limit: ${MEM_CHROMIUM:-2048m}
+    restart: unless-stopped
+    profiles: ["app"]
+
+  # ==========================================================================
+  # Мониторинг (profile: monitoring)
+  # ==========================================================================
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.13.4}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./deploy/docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - crawler_net
+    mem_limit: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    profiles: ["monitoring"]
+
+  # ==========================================================================
+  # Сервисные инструменты (profile: tools)
+  # ==========================================================================
+
+  adminer:
+    image: ${ADMINER_IMAGE:-adminer:5.5.1-standalone}
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: dracula
+    ports:
+      - "127.0.0.1:${ADMINER_PORT:-8080}:8080"
+    networks:
+      - crawler_net
+    mem_limit: 128m
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  redis-insight:
+    image: ${REDIS_INSIGHT_IMAGE:-redis/redisinsight:3.2.0}
+    environment:
+      RI_REDIS_HOST: redis
+      RI_REDIS_PORT: "6379"
+    ports:
+      - "127.0.0.1:${REDIS_INSIGHT_PORT:-5540}:5540"
+    networks:
+      - crawler_net
+    mem_limit: 512m
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  tools:
+    # Контейнер с Go-тулчейном, crawlerctl, migrate, lint.
+    # У него НЕ переопределён DNS (нужен proxy.golang.org для новых модулей),
+    # поэтому новые зависимости качаются отсюда: make mod-download.
+    <<: *go-common
+    build: *go-build
+    command: ["sleep", "infinity"]
+    volumes:
+      - .:/src
+      - gomodcache:/gomod
+      - gocache:/gocache
+      - ./migrations:/migrations
+      - ./testdata:/testdata:ro
+      - ./rules:/rules:ro
+      - ./var/incoming:/data/incoming
+    restart: "no"
+    mem_limit: 384m
+    profiles: ["tools"]
+
+networks:
+  crawler_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.100.0/24
+
+volumes:
+  pg_data:
+  caddy_data:
+  caddy_config:
+  prom_data:
+  gomodcache:
+  gocache:

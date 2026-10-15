@@ -1,0 +1,4 @@
+[
+  {"name": "XSRF-TOKEN", "value": "eyJpdiI6ZmFrZVRva2VuOjE2Oml7InZhbCI6IjEyMzQ1Njc4OTAiLCJpdiI6ImFiY2RlZmFhYmNkZWYiLCJ0YWciOiIifQ=="},
+  {"name": "laravel_session", "value": "eyJpdiI6c2Vzc2lvbjoxNjp7ImlzcyI6Imh0dHBzOi8vZXhhbXBsZSJ9"}
+]

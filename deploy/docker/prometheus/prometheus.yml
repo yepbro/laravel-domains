@@ -1,0 +1,67 @@
+# Prometheus (dev) — сбор метрик всех сервисов проекта.
+# Сервисы приложения находяться через docker DNS (dns_sd), поэтому у самого
+# prometheus DNS не переопределён.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: dev
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: monitor
+    dns_sd_configs:
+      - names: ["monitor"]
+        port: 9100
+        type: A
+
+  - job_name: ingest
+    dns_sd_configs:
+      - names: ["ingest"]
+        port: 9101
+        type: A
+
+  - job_name: scheduler
+    dns_sd_configs:
+      - names: ["scheduler"]
+        port: 9102
+        type: A
+
+  - job_name: dns-worker
+    dns_sd_configs:
+      - names: ["dns-worker"]
+        port: 9103
+        type: A
+
+  - job_name: http-worker
+    dns_sd_configs:
+      - names: ["http-worker"]
+        port: 9104
+        type: A
+
+  - job_name: render-worker
+    dns_sd_configs:
+      - names: ["render-worker"]
+        port: 9105
+        type: A
+
+  - job_name: analyzer
+    dns_sd_configs:
+      - names: ["analyzer"]
+        port: 9106
+        type: A
+
+  - job_name: mockserver
+    dns_sd_configs:
+      - names: ["mockserver"]
+        port: 8080
+        type: A
+
+  - job_name: coredns
+    dns_sd_configs:
+      - names: ["coredns"]
+        port: 9153
+        type: A

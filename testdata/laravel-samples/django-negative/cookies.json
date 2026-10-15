@@ -1,0 +1,4 @@
+[
+  {"name": "csrftoken", "value": "django_csrf_not_laravel"},
+  {"name": "sessionid", "value": "abc123def456"}
+]

@@ -1,0 +1,3 @@
+{
+  "Set-Cookie": ["csrftoken=django_csrf_not_laravel; path=/; secure"]
+}

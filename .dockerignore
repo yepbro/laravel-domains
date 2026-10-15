@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+.vscode
+.env
+var
+tmp
+bin
+docs
+tasks
+deploy/docker/testbed/web/sites
+deploy/docker/testbed/coredns/zones
+testdata/laravel-samples

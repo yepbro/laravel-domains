@@ -1,0 +1,39 @@
+# Шаблон локальных переопределений compose.
+# Скопируйте в deploy/docker/compose.override.yaml (в .gitignore) и правьте
+# под себя. Файл подхватывается автоматически, если запускать compose из
+# каталога deploy/docker; при запуске через Makefile добавьте путь явно:
+#   make up COMPOSE="docker compose --project-directory . \
+#     -f deploy/docker/compose.yaml -f deploy/docker/compose.override.yaml \
+#     --env-file .env"
+#
+# Типовые примеры — раскомментируйте нужное.
+
+services:
+
+  # Отладка выбранного сервиса под delve (make debug SERVICE=dns-worker):
+  # сервис пересобирается и стартует под отладчиком на 127.0.0.1:2345.
+  dns-worker:
+    environment:
+      SERVICE: dns-worker
+      METRICS_PORT: "9103"
+    ports:
+      - "127.0.0.1:2345:2345"
+    command:
+      - dlv
+      - debug
+      - ./cmd/dns-worker
+      - --headless
+      - --listen=0.0.0.0:2345
+      - --api-version=2
+      - --accept-multiclient
+    # под отладчиком перезапускать по падению не нужно
+    restart: "no"
+
+  # Уменьшение лимитов для слабой машины:
+  # postgres:
+  #   mem_limit: 768m
+
+  # Проброс дополнительных портов:
+  # http-worker:
+  #   ports:
+  #     - "127.0.0.1:9104:9104"

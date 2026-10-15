@@ -1,0 +1,16 @@
+# CoreDNS тестового стенда. Зоны подключаются из сгенерированного zones.conf
+# (make testbed-gen). Всё, что не покрыто тестовыми зонами, — REFUSED:
+# наружу testbed не ходит (ТЗ 4.4, критерий 5).
+.:53 {
+    errors
+    log
+    prometheus :9153
+    template IN A . {
+        rcode REFUSED
+    }
+    template IN AAAA . {
+        rcode REFUSED
+    }
+}
+
+import /etc/coredns/zones.conf

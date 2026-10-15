@@ -1,0 +1,7 @@
+{
+  "Set-Cookie": [
+    "XSRF-TOKEN=eyJpdiI6ZmFrZVRva2VuOjE2Oml7InZhbCI6IjEyMzQ1Njc4OTAiLCJpdiI6ImFiY2RlZmFhYmNkZWYiLCJ0YWciOiIifQ==; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; secure; samesite=lax",
+    "laravel_session=eyJpdiI6c2Vzc2lvbjoxNjp7ImlzcyI6Imh0dHBzOi8vZXhhbXBsZSJ9; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; httponly; samesite=lax"
+  ],
+  "X-Frame-Options": ["SAMEORIGIN"]
+}

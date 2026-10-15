@@ -1,0 +1,6 @@
+{
+  "Set-Cookie": [
+    "XSRF-TOKEN=eyJpdiI6bWl4a2V5OjE2Ont9; path=/; secure",
+    "laravel_session=eyJpdiI6bWl4c2Vzc2lvbjoxNjp7fQ==; path=/; httponly"
+  ]
+}

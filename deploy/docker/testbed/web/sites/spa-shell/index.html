@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head><meta charset="utf-8"><title>spa-shell.crawl.test</title></head>
+<body>
+<div id="root"></div>
+<noscript>Для работы сайта требуется включённый JavaScript.</noscript>
+<script>
+  // JS выставляет cookie и рисует контент — проверка рендера (ТЗ 5.6).
+  document.cookie = "js_session=rendered-by-js; path=/";
+  setTimeout(function () {
+    document.getElementById("root").innerHTML =
+      "<h1>SPA-контент после рендера</h1><p>Этот текст виден только после исполнения JS.</p>";
+  }, 150);
+</script>
+</body>
+</html>

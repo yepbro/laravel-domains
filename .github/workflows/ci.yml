@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Те же compose-файлы, что и локально, + кэш слоёв type=gha
+      COMPOSE: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Подготовить .env
+        run: cp .env.example .env
+
+      - name: Сборка образов (с кэшем слоёв)
+        run: make build COMPOSE="$COMPOSE"
+
+      - name: Линт (golangci-lint)
+        run: make lint COMPOSE="$COMPOSE"
+
+      - name: Модульные тесты
+        run: make test COMPOSE="$COMPOSE"
+
+      - name: Правила Laravel по корпусу образцов
+        run: make test-rules COMPOSE="$COMPOSE"
+
+      - name: Интеграционные тесты на testbed
+        run: make test-integration COMPOSE="$COMPOSE"
+
+      - name: Проверка боевых образов (runtime + render)
+        run: make build-runtime
+
+      - name: Логи сервисов (при падении)
+        if: failure()
+        run: docker compose --project-directory . -f deploy/docker/compose.yaml --env-file .env --profile '*' logs --tail=200

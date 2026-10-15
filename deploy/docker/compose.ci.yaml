@@ -1,0 +1,18 @@
+# Кэш слоёв BuildKit для CI (GitHub Actions, type=gha).
+# Применяется ТОЛЬКО в CI явным ключом -f; локально файл не используется:
+#   docker compose -f compose.yaml -f compose.ci.yaml build
+services:
+  ingest: &build-cache
+    build:
+      cache_from:
+        - type=gha,scope=crawler
+      cache_to:
+        - type=gha,scope=crawler,mode=max
+  scheduler: *build-cache
+  dns-worker: *build-cache
+  http-worker: *build-cache
+  render-worker: *build-cache
+  analyzer: *build-cache
+  monitor: *build-cache
+  tools: *build-cache
+  mockserver: *build-cache

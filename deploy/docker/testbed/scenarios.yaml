@@ -1,0 +1,228 @@
+# Сценарии тестового стенда (ТЗ 4.4). Формат описан в cmd/testbedgen.
+# После правок запустите: make testbed-gen
+#
+# Каждый сценарий — домен <name>.crawl.test (или <name>.<zone>).
+# Поле expect документирует ожидание для интеграционных тестов и разработки.
+
+network:
+  testweb_ip: 172.28.100.12
+  mockserver_ip: 172.28.100.13
+  blackhole_ip: 172.28.100.250   # адрес без слушателя: таймауты/закрытые порты
+  coredns_ip: 172.28.100.11
+  serial: 1
+
+# Базовая зона сценариев — первая; остальные для «обычных» доменов и проверок
+# составных зон / IDN. Unicode-имена приводятся к punycode генератором.
+zones:
+  - crawl.test
+  - crawl2.test
+  - co.test          # составная зона, аналог публичного суффикса co.uk
+  - проверка.test    # IDN-зона
+
+scenarios:
+  # --- DNS-сценарии -----------------------------------------------------
+  - name: nxdomain-case
+    dns: {}
+    expect: "NXDOMAIN апекса → статус not_delegated, субдомены не проверяются"
+
+  - name: delegated-no-address
+    dns: {ns: true}
+    expect: "NS есть, A/AAAA нет → статус delegated_no_address"
+
+  - name: servfail
+    dns: {special: servfail}
+    expect: "SERVFAIL → статус temp_error, повторы"
+
+  - name: dns-timeout
+    dns: {special: timeout}
+    expect: "таймаут DNS (forward в чёрную дыру) → temp_error"
+
+  - name: wildcard
+    dns: {a: testweb, wildcard: true, www: true}
+    site: {}
+    expect: "wildcard DNS: случайная метка резолвится → детект и пропуск лишних субдоменов"
+
+  - name: cname-chain
+    dns: {cname: alias-target}
+    expect: "CNAME-цепочка разворачивается, HTTP идёт с исходным Host"
+
+  - name: alias-target
+    dns: {a: testweb, www: true}
+    site: {}
+    expect: "цель CNAME-цепочки"
+
+  - name: cname-loop
+    dns: {cname_loop: true}
+    expect: "зацикленная CNAME → защита от циклов"
+
+  - name: closed-ports
+    dns: {a: blackhole}
+    expect: "адрес есть, порты закрыты → статус no_http"
+
+  # --- HTTP/HTTPS-сценарии ----------------------------------------------
+  - name: http-only
+    dns: {a: testweb}
+    site: {scheme: http-only}
+    expect: "только http → одна запись, scheme = http"
+
+  - name: https-only
+    dns: {a: testweb}
+    site: {scheme: https-only}
+    expect: "только https → одна запись, scheme = https"
+
+  - name: same-site
+    dns: {a: testweb, www: true}
+    site: {http: redirect-to-https}
+    expect: "http → https на один сайт → единственная запись, variant = 0"
+
+  - name: different-sites
+    dns: {a: testweb}
+    site: {http: different}
+    expect: "http и https — разные сайты → две записи, variant 0 и 1"
+
+  - name: bare-to-www
+    dns: {a: testweb, www: true}
+    site: {apex_redirect_to_www: true}
+    expect: "bare → www редирект → alias_kind = 2, контент хранится один раз"
+
+  - name: www-to-bare
+    dns: {a: testweb, www: true}
+    site: {www_redirect_to_apex: true}
+    expect: "www → bare редирект → alias_kind = 2"
+
+  - name: equal-pair
+    dns: {a: testweb, www: true}
+    site: {www_same_as_apex: true}
+    expect: "www и bare одинаковы без редиректа → alias_kind = 1"
+
+  # --- Редиректы --------------------------------------------------------
+  - name: redirect-chain
+    dns: {a: testweb}
+    site: {template: redirect-chain}
+    expect: "цепочка HTTP-редиректов → поиск финальной страницы"
+
+  - name: meta-refresh
+    dns: {a: testweb}
+    site: {template: meta-refresh}
+    expect: "meta refresh → финальная страница"
+
+  - name: js-redirect
+    dns: {a: testweb}
+    site: {template: js-redirect}
+    expect: "JS-редирект → решение о рендере"
+
+  - name: infinite-redirect
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /redirect/infinite}
+    expect: "бесконечный редирект → срабатывание лимита max_redirects"
+
+  - name: cycle-redirect
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /redirect/cycle/a}
+    expect: "циклический редирект → детект цикла"
+
+  # --- «Злые» ответы (mockserver) ---------------------------------------
+  - name: slow-headers
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: "/slow?delay=30s"}
+    expect: "медленные заголовки → header timeout"
+
+  - name: tarpit
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /tarpit}
+    expect: "тарпит: минимальная скорость 512 Б/с → обрыв по лимиту скорости"
+
+  - name: huge-body
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /huge}
+    expect: "огромное тело → лимит размера (2 МБ)"
+
+  - name: zip-bomb
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /zipbomb}
+    expect: "gzip-бомба → лимит распаковки"
+
+  - name: truncated
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /truncate}
+    expect: "обрыв соединения посреди тела → ошибка чтения"
+
+  - name: garbage-content
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /garbage}
+    expect: "мусорные байты с text/html → устойчивость парсера"
+
+  - name: bad-charset-declared
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /bad-charset/declared}
+    expect: "windows-1251 с честным charset → приведение к UTF-8"
+
+  - name: bad-charset-wrong
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /bad-charset/wrong}
+    expect: "windows-1251 с utf-8 в заголовке → детект кодировки"
+
+  # --- TLS ---------------------------------------------------------------
+  - name: tls-self-signed
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /host}
+    expect: "самоподписанный сертификат: загрузка при InsecureSkipVerify, данные сертификата сохраняются"
+
+  - name: tls-expired
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /host}
+    expect: "просроченный сертификат → сохранение результата + загрузка"
+
+  - name: tls-wrong-san
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /host}
+    expect: "сертификат с чужим SAN → сохранение результата + загрузка"
+
+  # --- Контент -----------------------------------------------------------
+  - name: cookies
+    dns: {a: mockserver}
+    site: {template: mock, mock_path: /cookies}
+    expect: "XSRF-TOKEN + laravel_session → корректное сохранение cookies"
+
+  - name: parked-1
+    dns: {a: testweb}
+    site: {template: parked}
+    expect: "парковка: контент одинаков с parked-2 → дедупликация по хэшу"
+
+  - name: parked-2
+    dns: {a: testweb}
+    site: {template: parked}
+    expect: "парковка: контент одинаков с parked-1 → дедупликация по хэшу"
+
+  - name: spa-shell
+    dns: {a: testweb}
+    site: {template: spa}
+    expect: "SPA-оболочка #root + noscript → задача рендера, DOM и cookies от JS"
+
+  - name: shared-a
+    dns: {a: testweb}
+    site: {}
+    expect: "домены на общем IP (с shared-b) → ограничение соединений на IP"
+
+  - name: shared-b
+    dns: {a: testweb}
+    site: {}
+    expect: "домены на общем IP (с shared-a) → ограничение соединений на IP"
+
+  # Образцы Laravel/не-Laravel (testdata/laravel-samples/<id>) подключаются
+  # генератором автоматически как <id>.crawl.test.
+
+# Простые домены в дополнительных зонах (проверка составных зон и IDN).
+plain:
+  - zone: crawl2.test
+    names:
+      - {label: alpha}
+      - {label: beta}
+  - zone: co.test
+    names:
+      - {label: example, www: true}   # example.co.test + www: отделение зоны от домена
+      - {label: shop}
+  - zone: проверка.test
+    names:
+      - {label: сайт}      # сайт.проверка.test → punycode
+      - {label: магазин}   # магазин.проверка.test → punycode

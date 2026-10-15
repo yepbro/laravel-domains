@@ -1,0 +1,27 @@
+# Конфигурация hot-reload (air) для Go-сервисов.
+#
+# __SERVICE__ заменяется на имя сервиса (ingest, scheduler, ...) скриптом
+# deploy/docker/scripts/air-entrypoint.sh при запуске контейнера, поэтому
+# один файл обслуживает все сервисы Compose.
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/__SERVICE__ ./cmd/__SERVICE__"
+bin = "./tmp/__SERVICE__"
+# Пересобираем только при изменении Go-кода. Каталог rules/ исключён:
+# правила Laravel перезагружаются по SIGHUP (make rules-reload), без рестарта.
+include_ext = ["go"]
+exclude_dir = ["tmp", "var", "bin", "deploy", "docs", "testdata", "migrations", "rules", "tasks", ".git", ".github", ".idea", ".vscode"]
+exclude_regex = ["_test\\.go$"]
+delay = 1000
+stop_on_root_error = true
+send_interrupt = true
+kill_delay = "5s"
+
+[log]
+time = true
+main_only = false
+
+[misc]
+clean_on_exit = true

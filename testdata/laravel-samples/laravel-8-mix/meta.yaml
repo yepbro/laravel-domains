@@ -1,0 +1,6 @@
+is_laravel: true
+ver_min: "8"
+ver_max: "9.x"         # Mix использовался до Laravel 10, но признаки страницы соответствуют 8.x
+note: "Синтетический образец (Laravel 8 + Mix) — контроль старых сборок"
+source: synthetic
+obtained: 2026-10-16

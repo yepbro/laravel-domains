@@ -1,0 +1,349 @@
+# Сгенерировано testbedgen (make testbed-gen). Не редактировать вручную.
+{
+	# TLS-сертификаты выпускает внутренний CA Caddy (self-signed);
+	# автоматические HTTP->HTTPS-редиректы отключены — редиректы часть сценариев.
+	auto_https disable_redirects
+	admin localhost:2019
+	log
+}
+
+http://alias-target.crawl.test {
+root * /srv/sites/alias-target
+file_server
+}
+
+https://alias-target.crawl.test {
+    tls internal
+root * /srv/sites/alias-target
+file_server
+}
+
+http://bare-to-www.crawl.test {
+    redir https://www.bare-to-www.crawl.test{uri} permanent
+}
+
+https://bare-to-www.crawl.test {
+    tls internal
+    redir https://www.bare-to-www.crawl.test{uri} permanent
+}
+
+http://www.bare-to-www.crawl.test {
+root * /srv/sites/bare-to-www
+file_server
+}
+
+https://www.bare-to-www.crawl.test {
+    tls internal
+root * /srv/sites/bare-to-www
+file_server
+}
+
+http://cname-chain.crawl.test {
+root * /srv/sites/cname-chain
+file_server
+}
+
+https://cname-chain.crawl.test {
+    tls internal
+root * /srv/sites/cname-chain
+file_server
+}
+
+http://different-sites.crawl.test {
+root * /srv/sites/different-sites/http
+file_server
+}
+
+https://different-sites.crawl.test {
+    tls internal
+root * /srv/sites/different-sites/https
+file_server
+}
+
+http://equal-pair.crawl.test, http://www.equal-pair.crawl.test {
+root * /srv/sites/equal-pair
+file_server
+}
+
+https://equal-pair.crawl.test, https://www.equal-pair.crawl.test {
+    tls internal
+root * /srv/sites/equal-pair
+file_server
+}
+
+http://http-only.crawl.test {
+root * /srv/sites/http-only
+file_server
+}
+
+https://https-only.crawl.test {
+    tls internal
+root * /srv/sites/https-only
+file_server
+}
+
+http://js-redirect.crawl.test {
+root * /srv/sites/js-redirect
+file_server
+}
+
+https://js-redirect.crawl.test {
+    tls internal
+root * /srv/sites/js-redirect
+file_server
+}
+
+http://meta-refresh.crawl.test {
+root * /srv/sites/meta-refresh
+file_server
+}
+
+https://meta-refresh.crawl.test {
+    tls internal
+root * /srv/sites/meta-refresh
+file_server
+}
+
+http://parked-1.crawl.test {
+root * /srv/sites/parked-1
+file_server
+}
+
+https://parked-1.crawl.test {
+    tls internal
+root * /srv/sites/parked-1
+file_server
+}
+
+http://parked-2.crawl.test {
+root * /srv/sites/parked-2
+file_server
+}
+
+https://parked-2.crawl.test {
+    tls internal
+root * /srv/sites/parked-2
+file_server
+}
+
+(chain_redirect-chain) {
+    redir / /r1 307
+    redir /r1 /r2 307
+    redir /r2 /r3 307
+    redir /r3 /final.html 307
+    root * /srv/sites/redirect-chain
+    file_server
+}
+
+http://redirect-chain.crawl.test {
+    import chain_redirect-chain
+}
+
+https://redirect-chain.crawl.test {
+    tls internal
+    import chain_redirect-chain
+}
+
+http://same-site.crawl.test {
+    redir https://same-site.crawl.test{uri} permanent
+}
+
+https://same-site.crawl.test {
+    tls internal
+root * /srv/sites/same-site
+file_server
+}
+
+http://shared-a.crawl.test {
+root * /srv/sites/shared-a
+file_server
+}
+
+https://shared-a.crawl.test {
+    tls internal
+root * /srv/sites/shared-a
+file_server
+}
+
+http://shared-b.crawl.test {
+root * /srv/sites/shared-b
+file_server
+}
+
+https://shared-b.crawl.test {
+    tls internal
+root * /srv/sites/shared-b
+file_server
+}
+
+http://spa-shell.crawl.test {
+root * /srv/sites/spa-shell
+file_server
+}
+
+https://spa-shell.crawl.test {
+    tls internal
+root * /srv/sites/spa-shell
+file_server
+}
+
+http://wildcard.crawl.test {
+root * /srv/sites/wildcard
+file_server
+}
+
+https://wildcard.crawl.test {
+    tls internal
+root * /srv/sites/wildcard
+file_server
+}
+
+http://www.www-to-bare.crawl.test {
+    redir https://www-to-bare.crawl.test{uri} permanent
+}
+
+https://www.www-to-bare.crawl.test {
+    tls internal
+    redir https://www-to-bare.crawl.test{uri} permanent
+}
+
+http://www-to-bare.crawl.test {
+root * /srv/sites/www-to-bare
+file_server
+}
+
+https://www-to-bare.crawl.test {
+    tls internal
+root * /srv/sites/www-to-bare
+file_server
+}
+
+http://alpha.crawl2.test {
+    root * /srv/sites/crawl2.test/alpha
+    file_server
+}
+
+https://alpha.crawl2.test {
+    tls internal
+    root * /srv/sites/crawl2.test/alpha
+    file_server
+}
+
+http://beta.crawl2.test {
+    root * /srv/sites/crawl2.test/beta
+    file_server
+}
+
+https://beta.crawl2.test {
+    tls internal
+    root * /srv/sites/crawl2.test/beta
+    file_server
+}
+
+http://example.co.test, http://www.example.co.test {
+    root * /srv/sites/co.test/example
+    file_server
+}
+
+https://example.co.test, https://www.example.co.test {
+    tls internal
+    root * /srv/sites/co.test/example
+    file_server
+}
+
+http://shop.co.test {
+    root * /srv/sites/co.test/shop
+    file_server
+}
+
+https://shop.co.test {
+    tls internal
+    root * /srv/sites/co.test/shop
+    file_server
+}
+
+http://xn--80aswg.xn--80adjurfhd.test {
+    root * /srv/sites/xn--80adjurfhd.test/xn--80aswg
+    file_server
+}
+
+https://xn--80aswg.xn--80adjurfhd.test {
+    tls internal
+    root * /srv/sites/xn--80adjurfhd.test/xn--80aswg
+    file_server
+}
+
+http://xn--80aairftm.xn--80adjurfhd.test {
+    root * /srv/sites/xn--80adjurfhd.test/xn--80aairftm
+    file_server
+}
+
+https://xn--80aairftm.xn--80adjurfhd.test {
+    tls internal
+    root * /srv/sites/xn--80adjurfhd.test/xn--80aairftm
+    file_server
+}
+
+(sample_django-negative) {
+    header +Set-Cookie "csrftoken=django_csrf_not_laravel; path=/; secure"
+    root * /srv/samples/django-negative
+    file_server
+}
+
+http://django-negative.crawl.test {
+    import sample_django-negative
+}
+
+https://django-negative.crawl.test {
+    tls internal
+    import sample_django-negative
+}
+
+(sample_laravel-11-vite) {
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6ZmFrZVRva2VuOjE2Oml7InZhbCI6IjEyMzQ1Njc4OTAiLCJpdiI6ImFiY2RlZmFhYmNkZWYiLCJ0YWciOiIifQ==; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; secure; samesite=lax"
+    header +Set-Cookie "laravel_session=eyJpdiI6c2Vzc2lvbjoxNjp7ImlzcyI6Imh0dHBzOi8vZXhhbXBsZSJ9; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; httponly; samesite=lax"
+    header +X-Frame-Options "SAMEORIGIN"
+    root * /srv/samples/laravel-11-vite
+    file_server
+}
+
+http://laravel-11-vite.crawl.test {
+    import sample_laravel-11-vite
+}
+
+https://laravel-11-vite.crawl.test {
+    tls internal
+    import sample_laravel-11-vite
+}
+
+(sample_laravel-8-mix) {
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6bWl4a2V5OjE2Ont9; path=/; secure"
+    header +Set-Cookie "laravel_session=eyJpdiI6bWl4c2Vzc2lvbjoxNjp7fQ==; path=/; httponly"
+    root * /srv/samples/laravel-8-mix
+    file_server
+}
+
+http://laravel-8-mix.crawl.test {
+    import sample_laravel-8-mix
+}
+
+https://laravel-8-mix.crawl.test {
+    tls internal
+    import sample_laravel-8-mix
+}
+
+(sample_symfony-negative) {
+    header +Set-Cookie "PHPSESSID=haha_not_laravel_session_value; path=/; httponly"
+    root * /srv/samples/symfony-negative
+    file_server
+}
+
+http://symfony-negative.crawl.test {
+    import sample_symfony-negative
+}
+
+https://symfony-negative.crawl.test {
+    tls internal
+    import sample_symfony-negative
+}
+
