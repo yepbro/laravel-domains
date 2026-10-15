@@ -18,6 +18,8 @@ make test-integration  # проверка окружения на testbed
 ```
 
 Полная инструкция: [`docs/dev-environment.md`](docs/dev-environment.md).
+Работа с Docker (запуск/остановка, команды в контейнерах, тома, диагностика):
+[`docs/docker.md`](docs/docker.md).
 Список команд: `make help`.
 
 ## Структура
