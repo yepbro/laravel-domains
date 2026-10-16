@@ -61,6 +61,21 @@ make migrate-down    # откатить все миграции (--all)
 make psql            # ручные SQL-запросы
 ```
 
+## Миграция 000003: процедура create_zone_partitions
+
+Миграция `000003_zone_hash_subpartitioning` (T-005) добавляет хранимую
+процедуру `create_zone_partitions(zone_id, hash_parts)` выделения крупных зон
+из DEFAULT-партиций. Сервисы применяют миграцию как обычно, но саму процедуру
+не вызывают — это операционная команда:
+
+```bash
+make psql    # CALL create_zone_partitions(<zone_id>, <hash_parts>);
+```
+
+Когда выделять зону, как считать `hash_parts` под целевые ≈ 30–50 млн строк,
+устройство партиций и блокировки — [`schema.md`](schema.md#субпартиционирование-крупных-зон-t-005).
+Down-миграция удаляет процедуру, но не созданные ею партиции зон.
+
 ## Восстановление после сбоя
 
 Если миграция прервалась на середине, таблица `schema_migrations` остаётся
@@ -83,4 +98,5 @@ CLI-вариант: `docker compose run --rm tools sh -c \
 идемпотентность и одновременный старт восьми экземпляров
 (`test/integration/migrate_test.go`). Контракт самой схемы (партиционирование,
 fillfactor, индексы, sequence, HOT-совместимость) проверяет
-`test/integration/schema_test.go` — см. [`schema.md`](schema.md).
+`test/integration/schema_test.go`, выделение зон из DEFAULT-партиций —
+`test/integration/zone_partitions_test.go` — см. [`schema.md`](schema.md).
