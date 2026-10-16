@@ -35,7 +35,7 @@
 
 - **T-001** [сделана] — Скелет монорепозитория: каталоги `cmd/` (8 сервисов: ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, crawlerctl), `internal/`, `migrations/`, `rules/`, `deploy/`, `docs/`, `testdata/`; `go.mod` с зависимостями. ТЗ: §4.1, Прил. А, Прил. Б.
 - **T-002** [сделана] — Механизм миграций PostgreSQL (up/down), хранение схемы БД в репозитории, применение при старте сервисов. ТЗ: §6.3, §6.1.
-- **T-003** [новая] — Миграция таблиц `zones`, `subdomains`, `domains`: партиционирование LIST по `zone_id`, `fillfactor = 85`, частичный индекс `domains_pending_idx` (`check_state = 0`), sequence `domain_id_seq`, `last_checked_at` без индекса (HOT-апдейты). ТЗ: §6.1, §6 (принципы).
+- **T-003** [сделана] — Миграция таблиц `zones`, `subdomains`, `domains`: партиционирование LIST по `zone_id`, `fillfactor = 85`, частичный индекс `domains_pending_idx` (`check_state = 0`), sequence `domain_id_seq`, `last_checked_at` без индекса (HOT-апдейты). ТЗ: §6.1, §6 (принципы).
 - **T-004** [новая] — Миграция таблиц `subdomain_results`, `contents`, `laravel_domains`, `laravel_findings`, `ingest_files` (партиционирование где требуется по эскизу DDL). ТЗ: §6.1.
 - **T-005** [новая] — Субпартиционирование крупных зон по хэшу `id`, чтобы партиция не превышала ≈ 30–50 млн строк; процедура создания новой партиции зоны. ТЗ: §6 (принципы).
 - **T-006** [новая] — Пакет `internal/config`: единый YAML + переопределение через переменные окружения; полный состав из ТЗ (postgres, redis, ingest, scheduler, dns, http, render, content, analyzer, subdomains, monitor), значения по умолчанию, валидация. ТЗ: §5.10.

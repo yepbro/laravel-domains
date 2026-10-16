@@ -81,4 +81,6 @@ CLI-вариант: `docker compose run --rm tools sh -c \
 `make test-integration` накатывает схему CLI (сервисы приложения в прогоне
 не участвуют) и проверяет раннер напрямую: применение к чистой схеме,
 идемпотентность и одновременный старт восьми экземпляров
-(`test/integration/migrate_test.go`).
+(`test/integration/migrate_test.go`). Контракт самой схемы (партиционирование,
+fillfactor, индексы, sequence, HOT-совместимость) проверяет
+`test/integration/schema_test.go` — см. [`schema.md`](schema.md).

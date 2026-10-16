@@ -22,6 +22,8 @@ make test-integration  # проверка окружения на testbed
 [`docs/docker.md`](docs/docker.md).
 Миграции PostgreSQL (применение при старте сервисов, создание новых):
 [`docs/migrations.md`](docs/migrations.md).
+Схема доменных таблиц (`zones`, `subdomains`, `domains`): партиционирование,
+fillfactor, индексы, HOT-апдейты — [`docs/schema.md`](docs/schema.md).
 Список команд: `make help`.
 
 ## Структура

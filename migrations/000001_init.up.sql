@@ -1,6 +1,13 @@
 -- Начальная схема Domain Crawler (эскиз DDL из основного ТЗ, п. 6.1).
 -- Партиционирование по LIST (zone_id); DEFAULT-партиции создаются сразу,
 -- выделенные партиции крупных зон добавляются позже по мере надобности.
+--
+-- fillfactor = 85 задаётся каждой партиции отдельно: PostgreSQL 16 запрещает
+-- storage parameters на партиционированном родителе (ошибка «cannot specify
+-- storage parameters for a partitioned table»), и reloptions партиций от
+-- родителя не наследуются. Новые партиции (T-005) создаются с тем же
+-- fillfactor — контракт закреплён тестом test/integration/schema_test.go.
+-- Подробности: docs/schema.md.
 
 CREATE TABLE zones (
     id              smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -47,6 +54,9 @@ CREATE TABLE domains (
 CREATE INDEX domains_pending_idx
     ON domains (zone_id, id) WHERE check_state = 0;
 
+-- DEFAULT-партиция: приём всех зон до выделения отдельных партиций (T-005).
+-- fillfactor = 85 — запас на странице под версии строк при частых апдейтах
+-- статусов (ТЗ 6, HOT-апдейты; см. комментарий в шапке файла).
 CREATE TABLE domains_default PARTITION OF domains DEFAULT WITH (fillfactor = 85);
 
 CREATE TABLE subdomain_results (
