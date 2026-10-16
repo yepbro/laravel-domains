@@ -21,13 +21,27 @@ jobs:
   # и томами; вынос шагов в отдельные jobs удвоил бы сборки без выгоды.
   build-and-test:
     name: build · lint · test · integration
-    runs-on: ubuntu-latest
+    # ubuntu-latest с 19.10.2026 мигрирует на Ubuntu 26 — фиксируем образ
+    # раннера, чтобы окружение CI не менялось под проектом само по себе.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       # Те же compose-файлы, что и локально, + кэш слоёв type=gha
       COMPOSE: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env
     steps:
       - uses: actions/checkout@v7
+
+      # Сборка всех образов (dev-образ с golangci-lint/delve/air + mockserver
+      # с полной компиляцией + unbound) с кэшем BuildKit и загрузкой в docker
+      # не влезает в ~14 ГБ свободных на раннере: «no space left on device».
+      # Прекомпилированные SDK раннера (Android, .NET, GHC, CodeQL ≈ 20 ГБ)
+      # проекту не нужны — убираем их до сборки.
+      - name: Освободить место на диске раннера
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker image prune -af || true
+          df -h /
 
       - uses: docker/setup-buildx-action@v4
 
@@ -36,6 +50,16 @@ jobs:
 
       - name: Сборка образов (с кэшем слоёв)
         run: make build COMPOSE="$COMPOSE"
+
+      # Образы уже загружены в docker daemon, слои выгружены в кэш GHA —
+      # состояние BuildKit (несколько ГБ) не нужно дальнейшим шагам (lint/
+      # test/test-integration запускают готовые образы без пересборки),
+      # а build-runtime в конце собирает с нуля и так. Освобождаем место
+      # для образов инфраструктуры и томов тестового прогона.
+      - name: Освободить кэш BuildKit после сборки
+        run: |
+          docker builder prune -af || true
+          df -h /
 
       - name: Линт (golangci-lint)
         run: make lint COMPOSE="$COMPOSE"
