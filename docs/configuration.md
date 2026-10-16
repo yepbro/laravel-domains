@@ -60,7 +60,12 @@
 | YAML | Переменная | Тип | По умолчанию |
 |---|---|---|---|
 | `dsn` | `CRAWLER_POSTGRES_DSN` | строка | — (**обязателен**) |
-| `pool_size` | `CRAWLER_POSTGRES_POOL_SIZE` | целое | `20` (рекомендация ТЗ: суммарно 20–50 на все сервисы) |
+| `pool_size` | `CRAWLER_POSTGRES_POOL_SIZE` | целое | `20` |
+
+`pool_size` — лимит соединений **одного сервиса** (пул `internal/db`,
+T-007); рекомендация ТЗ — суммарно 20–50 соединений на все сервисы, то есть
+при восьми сервисах задавайте 4–6 на сервис. Соединения открываются лениво.
+Подробнее: [`db.md`](db.md).
 
 ### `redis`
 
@@ -211,6 +216,8 @@
 - `service.Options.Config` — загруженный конфиг передаётся в каркас
   (`internal/service`); DSN для миграций берётся из него (или из прямого
   `Options.PGDSN`).
+- `db.NewOptions(cfg.Postgres)` — секция `postgres` → параметры пула
+  `internal/db` (`db.Open`; см. [`db.md`](db.md)).
 
 Таблица привязок «переменная → поле» — `envSpecs()` в
 `internal/config/load.go`; тесты: `internal/config/config_test.go`

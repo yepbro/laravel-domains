@@ -17,7 +17,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"crawler/internal/config"
+	"crawler/internal/db"
 	"crawler/internal/metrics"
 	"crawler/internal/migrate"
 )
@@ -39,6 +42,15 @@ type Options struct {
 	// (ТЗ 6.3), healthcheck отвечает только на актуальной схеме. Пустая
 	// строка вместе с пустым Config.Postgres.DSN — сервис без БД.
 	PGDSN string
+	// OnDBPool — инициализация БД-части сервиса (T-007): если задан и DSN
+	// известен, каркас после применения миграций создаёт пул подключений
+	// internal/db (postgres.dsn + postgres.pool_size из Config, либо
+	// PGDSN с размером по умолчанию) и вызывает OnDBPool с готовым пулом.
+	// Пул закрывается каркасом при graceful shutdown после остановки
+	// HTTP-сервера метрик — БД-логика сервиса должна завершать работу по
+	// отмене контекста SIGTERM раньше. nil — сервису пул не нужен
+	// (текущие заглушки): поведение прежнее, соединения не открываются.
+	OnDBPool func(pool *pgxpool.Pool)
 	// OnSIGHUP вызывается при получении SIGHUP (перезагрузка правил Laravel).
 	OnSIGHUP func()
 	// ExtraMux позволяет зарегистрировать дополнительные хендлеры.
@@ -75,6 +87,26 @@ func Run(opts Options) {
 		if err := migrate.Up(context.Background(), dsn); err != nil {
 			log.Fatalf("[%s] %v", opts.Name, err)
 		}
+	}
+
+	// Пул подключений создаётся после миграций и только если сервис
+	// запросил его (OnDBPool): заглушки продолжают работать без БД.
+	// Размер — из конфигурации, если она есть (бюджет ТЗ 6.3 — суммарно
+	// 20–50 соединений на все сервисы; pool_size задаётся на сервис).
+	var pool *pgxpool.Pool
+	if dsn != "" && opts.OnDBPool != nil {
+		poolSize := 0
+		if opts.Config != nil {
+			poolSize = opts.Config.Postgres.PoolSize
+		}
+		openCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		p, err := db.Open(openCtx, db.Options{DSN: dsn, PoolSize: poolSize})
+		cancel()
+		if err != nil {
+			log.Fatalf("[%s] %v", opts.Name, err)
+		}
+		pool = p
+		opts.OnDBPool(pool)
 	}
 
 	mux := http.NewServeMux()
@@ -124,4 +156,11 @@ func Run(opts Options) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+
+	// Пул закрывается последним: HTTP-сервер метрик уже остановлен,
+	// БД-логика сервиса должна была завершиться по отмене контекста.
+	if pool != nil {
+		pool.Close()
+		log.Printf("[%s] пул PostgreSQL закрыт", opts.Name)
+	}
 }
