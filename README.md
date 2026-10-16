@@ -64,7 +64,7 @@ make test-integration  # проверка окружения на testbed
 | `rules/` | Правила обнаружения Laravel (перезагрузка по SIGHUP) |
 | `testdata/laravel-samples/` | Корпус образцов страниц (позитивные/негативные) |
 | `test/integration/` | Интеграционные тесты dev-окружения на testbed |
-| `var/` | Рабочие данные: `incoming/` (файлы доменов), `content/` |
+| `var/` | Рабочие данные: `incoming/` (файлы доменов и архив ingest: `processed/`, `failed/`), `content/` |
 
 ## Зависимости
 
