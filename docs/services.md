@@ -86,5 +86,14 @@ SIGTERM/SIGINT и корректно останавливается — healthch
 файлы через конвейер приёма `internal/ingest` (разбор пути → зона →
 разбор с sha256 → валидация → staging → применение → отчёт `ingest_files`
 → архив `processed/`/`failed/`), плюс фоновая очистка удалённых доменов
-(CleanupDeleted, T-020). Поведение каталогов и отчёты — в
-[`dev-environment.md`](dev-environment.md).
+(CleanupDeleted, T-020); поведение каталогов и отчёты — в
+[`dev-environment.md`](dev-environment.md). И `scheduler` (этап 2,
+T-027…T-031): его `OnRun` держит главный цикл постановки пачек — выборка
+pending с чередованием зон (`DispatchBatch`, T-027) → перевод в `queued`
+с lease (`queued_at`) одним пакетным UPDATE с охраной pending и публикация
+пачки `DNSBatch` в `q:dns` (`EnqueueLoop`/`EnqueueBatch`, T-028; порядок
+«перевод → публикация» и гарантии — комментарии
+`internal/scheduler/enqueue.go`), — и фоновые циклы суточной перепроверки
+(`RecheckDaily`, T-030) и повторных проверок `temp_error`
+(`RetryTempErrors`, T-031); возврат доменов с истёкшим lease подключается
+задачей T-029.
