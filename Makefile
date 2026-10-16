@@ -89,7 +89,9 @@ ps: ## Состояние всех сервисов
 .PHONY: build
 build: ## Собрать dev-образы (hot reload)
 	$(check_env)
-	$(COMPOSE) build
+	# Все профили: без них compose собирает только сервисы без профиля
+	# (unbound); go-dev (app+tools) и mockserver (testbed) остались бы несобранными.
+	$(COMPOSE) $(ALL_PROFILES) build
 
 # Прогрев общего кэша сборки: одна компиляция всех сервисов в tools (лимит 2G)
 # вместо восьми параллельных air-сборок с лимитом 256m — на холодном кэше

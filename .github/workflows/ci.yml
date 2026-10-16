@@ -1,23 +1,33 @@
 name: ci
 
+# Прогон только на master и в PR: событие push на ветке с открытым PR
+# дублировало бы тот же коммит двумя ранами.
 on:
   push:
+    branches: [master]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Один job: сборка общая (одни образы для линта, тестов и integration),
+  # integration-стек — единственный compose-проект со статической подсетью
+  # и томами; вынос шагов в отдельные jobs удвоил бы сборки без выгоды.
   build-and-test:
+    name: build · lint · test · integration
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       # Те же compose-файлы, что и локально, + кэш слоёв type=gha
       COMPOSE: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
 
@@ -42,6 +52,21 @@ jobs:
       - name: Проверка боевых образов (runtime + render)
         run: make build-runtime
 
-      - name: Логи сервисов (при падении)
+      # Диагностика при падении: состояние и логи всех сервисов — в artifact
+      # (консольный лог раннера GitHub хранит и так, но без хвостов сервисов).
+      - name: Собрать диагностику (при падении)
         if: failure()
-        run: docker compose --project-directory . -f deploy/docker/compose.yaml --env-file .env --profile '*' logs --tail=200
+        run: |
+          mkdir -p ci-logs
+          { echo '$ docker compose ps -a'; \
+            $COMPOSE --profile '*' ps -a; } > ci-logs/ps.txt 2>&1 || true
+          $COMPOSE --profile '*' logs --no-color --tail=500 \
+            > ci-logs/services.log 2>&1 || true
+
+      - name: Выгрузить диагностику в artifact (при падении)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          path: ci-logs/

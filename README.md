@@ -1,5 +1,8 @@
 # Domain Crawler
 
+[![CI](https://github.com/yepbro/laravel-domains/actions/workflows/ci.yml/badge.svg)](https://github.com/yepbro/laravel-domains/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/github/go-mod/go-version/yepbro/laravel-domains)](https://github.com/yepbro/laravel-domains/blob/master/go.mod)
+
 Сервис массовой проверки доменов и поиска сайтов на Laravel.
 Технические задания: [`tasks/TZ_domain_crawler.md`](tasks/TZ_domain_crawler.md),
 [`tasks/TZ_docker_dev_environment.md`](tasks/TZ_docker_dev_environment.md).
@@ -32,6 +35,20 @@ make test-integration  # проверка окружения на testbed
 Конфигурация сервисов (единый YAML + переменные окружения, приоритеты,
 валидация; пример — `config.example.yaml`): [`docs/configuration.md`](docs/configuration.md).
 Список команд: `make help`.
+
+## CI
+
+При каждом пуше в `master` и в каждом pull request GitHub Actions
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) прогоняет проверки —
+те же make-цели через Docker Compose, что и локально, Go на хосте CI не нужен:
+
+сборка образов (`make build`, слои кэшируются в GitHub Actions cache через
+`deploy/docker/compose.ci.yaml`) → `make lint` → `make test` → `make test-rules`
+→ `make test-integration` (testbed) → `make build-runtime`.
+
+Статус — бейджем в шапке; при падении логи всех сервисов выгружаются в artifact
+рана. Обновления GitHub Actions и Go-зависимостей поднимает Dependabot
+([`.github/dependabot.yml`](.github/dependabot.yml)).
 
 ## Структура
 

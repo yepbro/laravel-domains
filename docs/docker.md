@@ -241,7 +241,7 @@ make db-reset
 make domain NAME=laravel-11-vite.crawl.test
 
 # прогнать всё, что гоняет CI
-make lint && make test && make test-rules && make test-integration
+make lint && make test && make test-rules && make test-integration && make build-runtime
 
 # закончить день
 make down
