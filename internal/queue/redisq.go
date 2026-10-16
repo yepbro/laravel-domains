@@ -125,13 +125,25 @@ func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string
 	if err := q.ensureGroup(ctx, stream, group); err != nil {
 		return nil, err
 	}
-	res, err := q.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+	read := &redis.XReadGroupArgs{
 		Group:    group,
 		Consumer: consumer,
 		Streams:  []string{stream, ">"},
 		Count:    int64(n),
 		Block:    q.opt.Block,
-	}).Result()
+	}
+	res, err := q.rdb.XReadGroup(ctx, read).Result()
+	if isNoGroup(err) {
+		// Потеря Redis при живых воркерах (ТЗ 3.4): группа исчезла вместе
+		// со стримом, а кэш созданных групп устарел. Пересоздаём группу
+		// и читаем повторно — потребитель продолжает работу без
+		// рестарта процесса; задачи переиздаст планировщик по lease.
+		q.groups.Delete(groupKey(stream, group))
+		if err := q.ensureGroup(ctx, stream, group); err != nil {
+			return nil, err
+		}
+		res, err = q.rdb.XReadGroup(ctx, read).Result()
+	}
 	if isNil(err) { // истёк интервал ожидания — новых записей нет
 		return nil, nil
 	}
@@ -169,7 +181,7 @@ func (q *RedisQueue) Ack(ctx context.Context, stream, group string, ids ...strin
 // (BUSYGROUP от другого воркера) — не ошибка. Созданные группы
 // запоминаются, чтобы не тратить круг обращения на каждый Consume.
 func (q *RedisQueue) ensureGroup(ctx context.Context, stream, group string) error {
-	key := stream + "|" + group
+	key := groupKey(stream, group)
 	if _, ok := q.groups.Load(key); ok {
 		return nil
 	}
@@ -194,6 +206,9 @@ func payloadBytes(values map[string]any) []byte {
 	}
 }
 
+// groupKey — ключ кэша созданных групп.
+func groupKey(stream, group string) string { return stream + "|" + group }
+
 // knownStream сообщает, что имя — один из рабочих стримов очереди (ТЗ 4.2).
 func knownStream(stream string) bool {
 	switch stream {
@@ -207,6 +222,12 @@ func knownStream(stream string) bool {
 // isBusyGroup распознаёт ответ BUSYGROUP — группа уже существует.
 func isBusyGroup(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "BUSYGROUP")
+}
+
+// isNoGroup распознаёт ответ NOGROUP — группа потребителей отсутствует:
+// стрим или группу удалили (потеря/очистка Redis при живых воркерах).
+func isNoGroup(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "NOGROUP")
 }
 
 // isNil — «ничего не прочитано» (в том числе таймаут BLOCK).

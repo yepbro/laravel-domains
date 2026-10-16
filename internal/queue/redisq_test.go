@@ -31,6 +31,10 @@ type fakeRedis struct {
 	reads   []redis.XReadGroupArgs
 	readRes []redis.XStream
 	readErr error
+	// readErrs — ошибки чтения по вызовам подряд (очередь); пусто —
+	// постоянная readErr. Нужно сценариям с меняющимся ответом Redis
+	// (NOGROUP после потери стрима, T-032).
+	readErrs []error
 
 	acks     []ackCall
 	ackCount int64
@@ -55,7 +59,12 @@ func (f *fakeRedis) XGroupCreateMkStream(ctx context.Context, stream, group, sta
 
 func (f *fakeRedis) XReadGroup(ctx context.Context, a *redis.XReadGroupArgs) *redis.XStreamSliceCmd {
 	f.reads = append(f.reads, *a)
-	return redis.NewXStreamSliceCmdResult(f.readRes, f.readErr)
+	err := f.readErr
+	if len(f.readErrs) > 0 {
+		err = f.readErrs[0]
+		f.readErrs = f.readErrs[1:]
+	}
+	return redis.NewXStreamSliceCmdResult(f.readRes, err)
 }
 
 func (f *fakeRedis) XAck(ctx context.Context, stream, group string, ids ...string) *redis.IntCmd {
@@ -245,6 +254,36 @@ func TestRedisQueueConsumeBusyGroup(t *testing.T) {
 	q := NewRedisQueue(fake, RedisOptions{})
 	if _, err := q.Consume(context.Background(), StreamAnalyze, "analyzer", "analyzer-1", 1); err != nil {
 		t.Fatalf("BUSYGROUP — не ошибка: %v", err)
+	}
+}
+
+// TestRedisQueueConsumeGroupLost — потеря Redis при живом воркере
+// (ТЗ 3.4, T-032): группа исчезла вместе со стримом, кэш созданных групп
+// устарел — XREADGROUP отвечает NOGROUP. Consume пересоздаёт группу
+// (XGROUP CREATE MKSTREAM) и повторяет чтение, а не падает до рестарта
+// процесса; задачи в это время переиздаёт планировщик по lease.
+func TestRedisQueueConsumeGroupLost(t *testing.T) {
+	fake := &fakeRedis{readErrs: []error{
+		nil, // чтение до потери: пусто, без ошибки
+		errors.New("NOGROUP No such consumer group 'dns' for key name 'q:dns'"),
+		redis.Nil, // повторное чтение: новых записей нет
+	}}
+	q := NewRedisQueue(fake, RedisOptions{})
+
+	// Первое чтение создаёт группу и попадает в кэш.
+	if _, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1); err != nil {
+		t.Fatalf("Consume до потери: %v", err)
+	}
+	// Второе — после «потери» стрима: NOGROUP, пересоздание, повтор.
+	got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1)
+	if err != nil || got != nil {
+		t.Fatalf("Consume после потери: (%v, %v), хочу (nil, nil)", got, err)
+	}
+	if len(fake.creates) != 2 {
+		t.Errorf("XGROUP CREATE вызван %d раз, хочу 2 (пересоздание после NOGROUP)", len(fake.creates))
+	}
+	if len(fake.reads) != 3 {
+		t.Errorf("XREADGROUP вызван %d раз, хочу 3", len(fake.reads))
 	}
 }
 
