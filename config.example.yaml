@@ -37,7 +37,7 @@ scheduler:
 
 dns:
   resolvers: ["127.0.0.1:53"]        # локальный unbound
-  fallback_resolvers: ["1.1.1.1:53", "9.9.9.9:53"]
+  fallback_resolvers: ["1.1.1.1:53", "9.9.9.9:53"]   # только при SERVFAIL/таймауте локального
   concurrency: 2000
   max_qps: 10000
   ipv6: true                         # false — AAAA-запросы не выполняются

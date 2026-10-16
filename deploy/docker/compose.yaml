@@ -149,13 +149,23 @@ services:
     image: crawler/unbound:local
     environment:
       # testbed: всё форвардится в coredns, остальное REFUSED.
-      # Режим internet включается только make up-internet (ALLOW_INTERNET=1).
+      # Режим internet включается только make up-internet (ALLOW_INTERNET=1):
+      # рекурсия с корневых серверов, prefetch, кэш ≈ 542 МБ (ТЗ 5.4/3.2).
+      # Публичные fallback-резолверы unbound НЕ получает — семантика forward-zone
+      # делает форвардеры первичными; fallback — на клиенте dns-worker
+      # (dns.fallback_resolvers, см. docs/docker.md, раздел «Unbound»).
       UNBOUND_MODE: ${UNBOUND_MODE:-testbed}
     command: ["/bin/sh", "-c", "exec unbound -d -c /etc/unbound/unbound.$${UNBOUND_MODE:-testbed}.conf"]
     networks:
       crawler_net:
         ipv4_address: 172.28.100.10
-    mem_limit: ${MEM_UNBOUND:-256m}
+    # ТЗ 3.2: бюджет Unbound ≈ 0,7 ГБ (mem_limit — docker-аналог MemoryMax из
+    # ТЗ 10.1). Режим internet дорастает до кэшей суммарно ≈ 542 МБ (таблицы
+    # растут лениво по заполнении, стартовый RSS ~20 МБ) — запас ~160 МБ на
+    # процесс и буферы потоков; режим testbed занимает ~150 МБ, лимит-потолок
+    # память не резервирует. Для слабых машин в testbed можно вернуть 256m
+    # (.env: MEM_UNBOUND).
+    mem_limit: ${MEM_UNBOUND:-700m}
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "nslookup $${UNBOUND_HEALTH_NAME:-same-site.crawl.test} 127.0.0.1 >/dev/null 2>&1 || exit 1"]
