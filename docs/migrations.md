@@ -37,8 +37,8 @@ DSN берётся из переменной окружения `APP_PG_DSN` (з
 ## Создание новой миграции
 
 ```bash
-make migrate-new NAME=domains_hash_subpartitions
-# → migrations/000002_domains_hash_subpartitions.{up,down}.sql
+make migrate-new NAME=results_indexes
+# → migrations/000003_results_indexes.{up,down}.sql
 ```
 
 Правьте SQL-файлы; при следующем рестарте сервисов (или сразу — air видит
