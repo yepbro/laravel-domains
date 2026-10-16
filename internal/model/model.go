@@ -57,6 +57,11 @@ type Domain struct {
 	DNSMask       DNSMask    `db:"dns_mask"`        // резолвящиеся субдомены
 	QueuedAt      *time.Time `db:"queued_at"`       // lease постановки в очередь
 	LastCheckedAt *time.Time `db:"last_checked_at"` // date; не индексируется (HOT-апдейты)
+	// TempAttempts — число назначенных подряд повторных проверок
+	// temp_error (T-031, миграция 000005): наращивает планировщик при
+	// назначении повтора, сбрасывается при итоговом статусе и успешной
+	// проверке (ТЗ 5.3).
+	TempAttempts int16 `db:"temp_attempts"`
 }
 
 // SubdomainResult — строка subdomain_results: результат проверки одного

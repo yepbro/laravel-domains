@@ -342,7 +342,7 @@ func TestSchema_DomainsHOTColumns(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 
-	hotColumns := []string{"status", "flags", "dns_mask", "queued_at", "last_checked_at"}
+	hotColumns := []string{"status", "flags", "dns_mask", "queued_at", "last_checked_at", "temp_attempts"}
 	for _, ix := range tableIndexes(t, pool, "domains") {
 		for _, col := range hotColumns {
 			if containsWord(ix.def, col) {
@@ -393,6 +393,7 @@ func TestSchema_TableColumns(t *testing.T) {
 			"status": "smallint", "check_state": "smallint", "flags": "smallint",
 			"dns_mask": "bigint", "queued_at": "timestamp with time zone",
 			"last_checked_at": "date",
+			"temp_attempts":   "smallint", // T-031: счётчик повторов temp_error (миграция 000005)
 		}},
 	}
 	// Уникальные ключи справочников: зоны дедуплицируются по punycode-имени

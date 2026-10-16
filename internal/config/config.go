@@ -76,6 +76,11 @@ type Scheduler struct {
 	QueueHighWatermark  int      `yaml:"queue_high_watermark"`
 	Lease               Duration `yaml:"lease"`
 	TempErrorRetryAfter Duration `yaml:"temp_error_retry_after"`
+	// TempErrorMaxRetries — максимум повторных проверок temp_error подряд
+	// (ТЗ 5.3: «не более N раз подряд»); после исчерпания домен получает
+	// итоговый статус по результату последней проверки (T-031). ТЗ число
+	// не задаёт; 3 — как счётчик попыток доставки очереди (T-025).
+	TempErrorMaxRetries int `yaml:"temp_error_max_retries"`
 }
 
 // DNS — параметры DNS-этапа (ТЗ 5.4).
@@ -162,6 +167,7 @@ func Default() *Config {
 			QueueHighWatermark:  100000,
 			Lease:               Duration(30 * time.Minute),
 			TempErrorRetryAfter: Duration(24 * time.Hour),
+			TempErrorMaxRetries: 3,
 		},
 		DNS: DNS{
 			Resolvers:         []string{"127.0.0.1:53"},
@@ -272,6 +278,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Scheduler.TempErrorRetryAfter <= 0 {
 		problems = append(problems, nonPositiveDur("scheduler.temp_error_retry_after", c.Scheduler.TempErrorRetryAfter))
+	}
+	if !inRange(c.Scheduler.TempErrorMaxRetries, 1, 100) {
+		problems = append(problems, rangeMsg("scheduler.temp_error_max_retries", c.Scheduler.TempErrorMaxRetries, 1, 100)+"; минимум 1 — temp_error по определению требует повтор (ТЗ 6.2)")
 	}
 
 	// dns

@@ -27,6 +27,7 @@ scheduler:
   queue_high_watermark: 100000       # backpressure: выше порога задачи не публикуются
   lease: "30m"                       # срок аренды queued-домена
   temp_error_retry_after: "24h"      # повтор temp_error
+  temp_error_max_retries: 3          # максимум повторов подряд, далее итоговый статус
 
 dns:
   resolvers: ["127.0.0.1:53"]        # локальный unbound
