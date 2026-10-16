@@ -18,6 +18,7 @@ ingest:
   dir: "/data/incoming"              # наблюдаемая папка: <зона>/add|delete/*.txt
   batch_size: 50000                  # строк на одну пачку COPY
   stable_seconds: 10                 # размер/mtime файла должны быть стабильны
+  scan_interval: "30s"               # полный обход папки как страховка fsnotify
 
 scheduler:
   recheck_interval: "4380h"          # ≈ 6 месяцев (done → pending)

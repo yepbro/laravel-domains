@@ -58,6 +58,10 @@ type Ingest struct {
 	Dir           string `yaml:"dir"`
 	BatchSize     int    `yaml:"batch_size"`
 	StableSeconds int    `yaml:"stable_seconds"`
+	// ScanInterval — интервал периодического полного обхода incoming как
+	// страховки к fsnotify (T-013; расширение к минимальному составу
+	// ТЗ 5.10, поэтому длительность, а не секунды, как у stable_seconds).
+	ScanInterval Duration `yaml:"scan_interval"`
 }
 
 // Scheduler — планировщик проверок (ТЗ 5.3).
@@ -142,6 +146,7 @@ func Default() *Config {
 			Dir:           "/data/incoming",
 			BatchSize:     50000,
 			StableSeconds: 10,
+			ScanInterval:  Duration(30 * time.Second),
 		},
 		Scheduler: Scheduler{
 			RecheckInterval:     Duration(4380 * time.Hour), // ≈ 6 месяцев
@@ -232,6 +237,10 @@ func (c *Config) Validate() error {
 	}
 	if !inRange(c.Ingest.StableSeconds, 1, 3600) {
 		problems = append(problems, rangeMsg("ingest.stable_seconds", c.Ingest.StableSeconds, 1, 3600))
+	}
+	if c.Ingest.ScanInterval < Duration(10*time.Millisecond) || c.Ingest.ScanInterval > Duration(time.Hour) {
+		problems = append(problems, fmt.Sprintf("ingest.scan_interval: ожидается %s..%s, задано %s",
+			Duration(10*time.Millisecond), Duration(time.Hour), c.Ingest.ScanInterval))
 	}
 
 	// scheduler

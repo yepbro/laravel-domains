@@ -80,6 +80,14 @@ T-007); рекомендация ТЗ — суммарно 20–50 соедин�
 | `dir` | `CRAWLER_INGEST_DIR` | путь | `/data/incoming` |
 | `batch_size` | `CRAWLER_INGEST_BATCH_SIZE` | целое | `50000` |
 | `stable_seconds` | `CRAWLER_INGEST_STABLE_SECONDS` | секунды | `10` |
+| `scan_interval` | `CRAWLER_INGEST_SCAN_INTERVAL` | длительность | `30s` |
+
+`dir` — наблюдаемая папка (создаётся при отсутствии). `stable_seconds` —
+сколько размер и mtime файла должны быть неизменны, чтобы ingest взял его
+в обработку (дозаписываемые и временные `*.tmp`/`*.part` файлы не
+берутся). `scan_interval` — период полного обхода папки как страховки к
+fsnotify (T-013): подхватывает файлы, существовавшие до старта сервиса, и
+компенсирует потерянные события наблюдения.
 
 ### `scheduler` (ТЗ 5.3)
 
@@ -180,8 +188,8 @@ T-007); рекомендация ТЗ — суммарно 20–50 соедин�
 - `redis.addr`, `dns.resolvers`, `dns.fallback_resolvers`, `monitor.listen` —
   корректные `host:port` (порт 1..65535); резолверы — хотя бы один;
 - все таймауты/интервалы положительны; `ingest.batch_size` 1..1000000,
-  `ingest.stable_seconds` 1..3600, `scheduler.batch_size` 1..100000,
-  `queue_high_watermark` ≥ 1;
+  `ingest.stable_seconds` 1..3600, `ingest.scan_interval` 10ms..1h,
+  `scheduler.batch_size` 1..100000, `queue_high_watermark` ≥ 1;
 - `dns.concurrency`/`http.concurrency` 1..100000, `dns.max_qps` 1..1000000,
   `http.per_ip_limit` 1..64, `http.max_redirects` 0..100, `max_body_bytes` > 0;
 - `http.user_agent` непуст;

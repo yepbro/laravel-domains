@@ -15,6 +15,7 @@ ingest:
   dir: "/data/incoming"
   batch_size: 50000
   stable_seconds: 10
+  scan_interval: "5s"               # dev: страховочный обход чаще
 
 scheduler:
   recheck_interval: "4380h"          # ~6 месяцев

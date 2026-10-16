@@ -49,6 +49,7 @@ func TestDefault(t *testing.T) {
 		{"ingest.dir", c.Ingest.Dir, "/data/incoming"},
 		{"ingest.batch_size", c.Ingest.BatchSize, 50000},
 		{"ingest.stable_seconds", c.Ingest.StableSeconds, 10},
+		{"ingest.scan_interval", c.Ingest.ScanInterval.D(), 30 * time.Second},
 		{"scheduler.recheck_interval", c.Scheduler.RecheckInterval.D(), 4380 * time.Hour},
 		{"scheduler.batch_size", c.Scheduler.BatchSize, 5000},
 		{"scheduler.queue_high_watermark", c.Scheduler.QueueHighWatermark, 100000},
@@ -108,6 +109,7 @@ ingest:
   dir: "/srv/incoming"
   batch_size: 10000
   stable_seconds: 30
+  scan_interval: "45s"
 scheduler:
   recheck_interval: "8760h"
   batch_size: 2000
@@ -165,6 +167,7 @@ log:
 		{"ingest.dir", cfg.Ingest.Dir, "/srv/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 10000},
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 30},
+		{"ingest.scan_interval", cfg.Ingest.ScanInterval.D(), 45 * time.Second},
 		{"scheduler.recheck_interval", cfg.Scheduler.RecheckInterval.D(), 8760 * time.Hour},
 		{"scheduler.batch_size", cfg.Scheduler.BatchSize, 2000},
 		{"scheduler.queue_high_watermark", cfg.Scheduler.QueueHighWatermark, 50000},
@@ -296,6 +299,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_INGEST_DIR":                       "/env/incoming",
 		"CRAWLER_INGEST_BATCH_SIZE":                "1234",
 		"CRAWLER_INGEST_STABLE_SECONDS":            "25",
+		"CRAWLER_INGEST_SCAN_INTERVAL":             "90s",
 		"CRAWLER_SCHEDULER_RECHECK_INTERVAL":       "2190h",
 		"CRAWLER_SCHEDULER_BATCH_SIZE":             "777",
 		"CRAWLER_SCHEDULER_QUEUE_HIGH_WATERMARK":   "4242",
@@ -341,6 +345,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"ingest.dir", cfg.Ingest.Dir, "/env/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 1234},
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 25},
+		{"ingest.scan_interval", cfg.Ingest.ScanInterval.D(), 90 * time.Second},
 		{"scheduler.recheck_interval", cfg.Scheduler.RecheckInterval.D(), 2190 * time.Hour},
 		{"scheduler.batch_size", cfg.Scheduler.BatchSize, 777},
 		{"scheduler.queue_high_watermark", cfg.Scheduler.QueueHighWatermark, 4242},
@@ -534,6 +539,8 @@ func TestValidate(t *testing.T) {
 		{"ingest.dir пуст", func(c *Config) { c.Ingest.Dir = "" }, "ingest.dir"},
 		{"batch_size 0", func(c *Config) { c.Ingest.BatchSize = 0 }, "ingest.batch_size"},
 		{"stable_seconds 0", func(c *Config) { c.Ingest.StableSeconds = 0 }, "ingest.stable_seconds"},
+		{"scan_interval 0", func(c *Config) { c.Ingest.ScanInterval = 0 }, "ingest.scan_interval"},
+		{"scan_interval слишком велик", func(c *Config) { c.Ingest.ScanInterval = Duration(2 * time.Hour) }, "ingest.scan_interval"},
 		{"recheck_interval 0", func(c *Config) { c.Scheduler.RecheckInterval = 0 }, "scheduler.recheck_interval"},
 		{"batch scheduler 0", func(c *Config) { c.Scheduler.BatchSize = 0 }, "scheduler.batch_size"},
 		{"watermark 0", func(c *Config) { c.Scheduler.QueueHighWatermark = 0 }, "scheduler.queue_high_watermark"},
