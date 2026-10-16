@@ -41,9 +41,11 @@ type RedisOptions struct {
 	// Block — время ожидания новых записей в одном вызове Consume
 	// (XREADGROUP BLOCK); 0 — DefaultRedisBlock.
 	Block time.Duration
-	// MaxLen — приблизительный предел длины стрима при публикации
-	// (XADD MAXLEN ~); 0 — не обрезать. Сама политика надёжности
-	// (какие пределы и на каких стримах) — T-025.
+	// MaxLen — явный предел длины всех стримов при публикации
+	// (XADD MAXLEN ~); 0 — пределы политики надёжности по стримам
+	// (DefaultStreamMaxLen, T-025: ТЗ 4.2 требует MAXLEN на каждом
+	// стриме, поэтому режим «не обрезать» не предусмотрен — источник
+	// истины PostgreSQL, усечение восстановимо по lease, ТЗ 3.4).
 	MaxLen int64
 }
 
@@ -68,9 +70,11 @@ func NewRedisQueue(rdb redisStreams, opt RedisOptions) *RedisQueue {
 }
 
 // Publish сериализует сообщение (поле data) и добавляет запись в стрим
-// командой XADD, возвращая её идентификатор. Стрим обязан соответствовать
-// типу сообщения, значения проходят проверку до записи (ошибка — сообщение
-// не публикуется).
+// командой XADD, возвращая её идентификатор. Каждый XADD усекает стрим
+// приблизительным пределом MAXLEN ~ (ТЗ 4.2): явным из RedisOptions.MaxLen
+// или пределом стрима по политике T-025 (DefaultStreamMaxLen). Стрим обязан
+// соответствовать типу сообщения, значения проходят проверку до записи
+// (ошибка — сообщение не публикуется).
 func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (string, error) {
 	if !knownStream(stream) {
 		return "", fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamAnalyze, StreamDead)", stream)
@@ -89,10 +93,12 @@ func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (s
 		Stream: stream,
 		Values: map[string]any{fieldData: data},
 	}
-	if q.opt.MaxLen > 0 {
-		args.MaxLen = q.opt.MaxLen
-		args.Approx = true // MAXLEN ~: обрезка без точного подсчёта (T-025)
+	maxLen := q.opt.MaxLen
+	if maxLen == 0 {
+		maxLen = DefaultStreamMaxLen(stream) // политика T-025 (ТЗ 4.2)
 	}
+	args.MaxLen = maxLen
+	args.Approx = true // MAXLEN ~: обрезка без точного подсчёта (T-025)
 	id, err := q.rdb.XAdd(ctx, args).Result()
 	if err != nil {
 		return "", fmt.Errorf("queue: publish в %s: %w", stream, err)

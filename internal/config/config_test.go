@@ -46,6 +46,9 @@ func TestDefault(t *testing.T) {
 	}{
 		{"postgres.pool_size", c.Postgres.PoolSize, 20},
 		{"redis.addr", c.Redis.Addr, "127.0.0.1:6379"},
+		{"redis.maxlen", c.Redis.MaxLen, 0},
+		{"redis.max_attempts", c.Redis.MaxAttempts, 3},
+		{"redis.claim_min_idle", c.Redis.ClaimMinIdle.D(), 5 * time.Minute},
 		{"ingest.dir", c.Ingest.Dir, "/data/incoming"},
 		{"ingest.batch_size", c.Ingest.BatchSize, 50000},
 		{"ingest.stable_seconds", c.Ingest.StableSeconds, 10},
@@ -107,6 +110,9 @@ postgres:
   pool_size: 40
 redis:
   addr: "10.0.0.1:6379"
+  maxlen: 250000
+  max_attempts: 5
+  claim_min_idle: "90s"
 ingest:
   dir: "/srv/incoming"
   batch_size: 10000
@@ -168,6 +174,9 @@ log:
 		{"postgres.dsn", cfg.Postgres.DSN, "postgres://crawler:secret@db.local:5432/crawler?sslmode=disable"},
 		{"postgres.pool_size", cfg.Postgres.PoolSize, 40},
 		{"redis.addr", cfg.Redis.Addr, "10.0.0.1:6379"},
+		{"redis.maxlen", cfg.Redis.MaxLen, 250000},
+		{"redis.max_attempts", cfg.Redis.MaxAttempts, 5},
+		{"redis.claim_min_idle", cfg.Redis.ClaimMinIdle.D(), 90 * time.Second},
 		{"ingest.dir", cfg.Ingest.Dir, "/srv/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 10000},
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 30},
@@ -302,6 +311,9 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_POSTGRES_DSN":                     "postgres://env@db/crawler",
 		"CRAWLER_POSTGRES_POOL_SIZE":               "40",
 		"CRAWLER_REDIS_ADDR":                       "10.9.8.7:6379",
+		"CRAWLER_REDIS_MAXLEN":                     "300000",
+		"CRAWLER_REDIS_MAX_ATTEMPTS":               "6",
+		"CRAWLER_REDIS_CLAIM_MIN_IDLE":             "2m",
 		"CRAWLER_INGEST_DIR":                       "/env/incoming",
 		"CRAWLER_INGEST_BATCH_SIZE":                "1234",
 		"CRAWLER_INGEST_STABLE_SECONDS":            "25",
@@ -350,6 +362,9 @@ func TestEnvOverrides(t *testing.T) {
 		{"postgres.dsn", cfg.Postgres.DSN, "postgres://env@db/crawler"},
 		{"postgres.pool_size", cfg.Postgres.PoolSize, 40},
 		{"redis.addr", cfg.Redis.Addr, "10.9.8.7:6379"},
+		{"redis.maxlen", cfg.Redis.MaxLen, 300000},
+		{"redis.max_attempts", cfg.Redis.MaxAttempts, 6},
+		{"redis.claim_min_idle", cfg.Redis.ClaimMinIdle.D(), 2 * time.Minute},
 		{"ingest.dir", cfg.Ingest.Dir, "/env/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 1234},
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 25},
@@ -547,6 +562,10 @@ func TestValidate(t *testing.T) {
 		{"pool_size 0", func(c *Config) { c.Postgres.PoolSize = 0 }, "postgres.pool_size"},
 		{"redis без порта", func(c *Config) { c.Redis.Addr = "127.0.0.1" }, "redis.addr"},
 		{"redis кривой порт", func(c *Config) { c.Redis.Addr = "127.0.0.1:port" }, "redis.addr"},
+		{"redis.maxlen мал", func(c *Config) { c.Redis.MaxLen = 10 }, "redis.maxlen"},
+		{"redis.max_attempts 0", func(c *Config) { c.Redis.MaxAttempts = 0 }, "redis.max_attempts"},
+		{"redis.max_attempts велик", func(c *Config) { c.Redis.MaxAttempts = 101 }, "redis.max_attempts"},
+		{"claim_min_idle 0", func(c *Config) { c.Redis.ClaimMinIdle = 0 }, "redis.claim_min_idle"},
 		{"ingest.dir пуст", func(c *Config) { c.Ingest.Dir = "" }, "ingest.dir"},
 		{"batch_size 0", func(c *Config) { c.Ingest.BatchSize = 0 }, "ingest.batch_size"},
 		{"stable_seconds 0", func(c *Config) { c.Ingest.StableSeconds = 0 }, "ingest.stable_seconds"},

@@ -48,9 +48,19 @@ type Postgres struct {
 	PoolSize int    `yaml:"pool_size"`
 }
 
-// Redis — адрес очередей задач (ТЗ 4.2).
+// Redis — адрес и параметры надёжности очередей задач (ТЗ 4.2).
 type Redis struct {
 	Addr string `yaml:"addr"`
+	// MaxLen — явный предел длины всех стримов при публикации
+	// (XADD MAXLEN ~); 0 — пределы по стримам из пакета queue
+	// (queue.DefaultStreamMaxLen, T-025).
+	MaxLen int `yaml:"maxlen"`
+	// MaxAttempts — максимальное число доставок задачи до перевода в
+	// q:dead (ТЗ 4.2: настраивается, по умолчанию 3; счётчик — T-025).
+	MaxAttempts int `yaml:"max_attempts"`
+	// ClaimMinIdle — минимальный простой зависшей (pending без XACK)
+	// записи до возврата в работу клеймом XAUTOCLAIM (T-025).
+	ClaimMinIdle Duration `yaml:"claim_min_idle"`
 }
 
 // Ingest — приём файлов доменов (ТЗ 5.1).
@@ -151,6 +161,11 @@ func Default() *Config {
 		},
 		Redis: Redis{
 			Addr: "127.0.0.1:6379",
+			// Пределы по стримам — из queue.DefaultStreamMaxLen (T-025).
+			MaxLen:      0,
+			MaxAttempts: 3, // ТЗ 4.2: по умолчанию 3
+			// С запасом над таймаутами этапов (ТЗ 5.5/5.6: секунды).
+			ClaimMinIdle: Duration(5 * time.Minute),
 		},
 		Ingest: Ingest{
 			Dir:           "/data/incoming",
@@ -240,6 +255,18 @@ func (c *Config) Validate() error {
 	// redis
 	if err := checkHostPort(c.Redis.Addr); err != nil {
 		problems = append(problems, fmt.Sprintf("redis.addr: ожидается host:port, задано %q", c.Redis.Addr))
+	}
+	// 0 — пределы по стримам из пакета queue (T-025); явный предел ниже
+	// 1000 усекал бы рабочий набор даже маленькой очереди.
+	if c.Redis.MaxLen != 0 && !inRange(c.Redis.MaxLen, 1000, 100000000) {
+		problems = append(problems, rangeMsg("redis.maxlen", c.Redis.MaxLen, 1000, 100000000)+" (0 — пределы по стримам по умолчанию)")
+	}
+	// Минимум 1: ноль доставок означал бы q:dead до первой обработки.
+	if !inRange(c.Redis.MaxAttempts, 1, 100) {
+		problems = append(problems, rangeMsg("redis.max_attempts", c.Redis.MaxAttempts, 1, 100)+" (ТЗ 4.2: по умолчанию 3)")
+	}
+	if c.Redis.ClaimMinIdle <= 0 {
+		problems = append(problems, nonPositiveDur("redis.claim_min_idle", c.Redis.ClaimMinIdle))
 	}
 
 	// ingest

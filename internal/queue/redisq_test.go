@@ -91,8 +91,10 @@ func TestRedisQueuePublish(t *testing.T) {
 	if add.Stream != StreamDNS {
 		t.Errorf("XADD в стрим %q, хочу %q", add.Stream, StreamDNS)
 	}
-	if add.MaxLen != 0 || add.Approx {
-		t.Errorf("XADD без MaxLen в опциях: MaxLen=%d Approx=%v", add.MaxLen, add.Approx)
+	// Политика T-025: без явного предела применяется предел стрима.
+	if add.MaxLen != DefaultStreamMaxLen(StreamDNS) || !add.Approx {
+		t.Errorf("XADD без MaxLen в опциях: MaxLen=%d Approx=%v, хочу MAXLEN ~ %d",
+			add.MaxLen, add.Approx, DefaultStreamMaxLen(StreamDNS))
 	}
 	values, ok := add.Values.(map[string]any)
 	if !ok {

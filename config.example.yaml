@@ -13,6 +13,12 @@ postgres:
 
 redis:
   addr: "127.0.0.1:6379"
+  # maxlen — явный предел длины всех стримов (XADD MAXLEN ~);
+  # 0 — пределы по стримам по умолчанию (10 000 пачек q:dns, 1 млн штучных
+  # задач q:http/q:render/q:analyze, 100 000 q:dead)
+  maxlen: 0
+  max_attempts: 3                   # доставок задачи до перевода в q:dead (ТЗ 4.2)
+  claim_min_idle: "5m"              # простой pending-записи до возврата клеймом XAUTOCLAIM
 
 ingest:
   dir: "/data/incoming"              # наблюдаемая папка: <зона>/add|delete/*.txt
