@@ -23,8 +23,9 @@ make test-integration  # проверка окружения на testbed
 Миграции PostgreSQL (применение при старте сервисов, создание новых):
 [`docs/migrations.md`](docs/migrations.md).
 Схема PostgreSQL (`zones`, `subdomains`, `domains`, `subdomain_results`,
-`contents`, `laravel_*`, `ingest_files`): партиционирование, fillfactor,
-индексы, HOT-апдейты — [`docs/schema.md`](docs/schema.md).
+`contents`, `laravel_*`, `ingest_files`) и её типизация в Go
+(`internal/model`): партиционирование, fillfactor, индексы, HOT-апдейты,
+статусы домена, флаги, `dns_mask` — [`docs/schema.md`](docs/schema.md).
 Слой БД (пул подключений `pgx` с бюджетом 20–50 соединений, потокочный
 `COPY` пачками, пакетные `UPDATE … FROM unnest(...)`):
 [`docs/db.md`](docs/db.md).
@@ -40,7 +41,7 @@ make test-integration  # проверка окружения на testbed
 | Каталог | Назначение |
 |---|---|
 | `cmd/` | Go-сервисы (ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, crawlerctl) и утилиты testbed (mockserver, testbedgen) |
-| `internal/` | Общий код: каркас сервисов (`service`), конфигурация (`config`), доступ к PostgreSQL — пул и массовая запись (`db`), метрики Prometheus (`metrics`), миграции при старте (`migrate`), движок правил Laravel (`rules`), каркасы `queue` (Redis Streams), `content` (zstd), `render` (Chromium), `watch` (fsnotify); пакеты idn, dnsclient, httpfetch, model — в своих задачах |
+| `internal/` | Общий код: каркас сервисов (`service`), конфигурация (`config`), доступ к PostgreSQL — пул и массовая запись (`db`), модель домена — статусы, флаги, маски субдоменов (`model`), метрики Prometheus (`metrics`), миграции при старте (`migrate`), движок правил Laravel (`rules`), каркасы `queue` (Redis Streams), `content` (zstd), `render` (Chromium), `watch` (fsnotify); пакеты idn, dnsclient, httpfetch — в своих задачах |
 | `deploy/docker/` | Compose-окружение, Dockerfile'ы, конфиги, testbed (systemd-юниты и тюнинг ОС — этап 9 ТЗ) |
 | `migrations/` | Миграции PostgreSQL (golang-migrate): встраиваются в бинарники и применяются сервисами при старте |
 | `rules/` | Правила обнаружения Laravel (перезагрузка по SIGHUP) |

@@ -244,3 +244,31 @@ parameters for a partitioned table»). Поэтому `WITH (fillfactor = 85)` �
   `refcount`, а не создаёт строку (ТЗ 5.7);
 - `ingest_files` — уникальный `sha256`: уже обработанный файл не
   обрабатывается повторно (ТЗ 5.1).
+
+## Модель в Go: internal/model
+
+Пакет `internal/model` (T-008) — зеркалит схему в типы Go: структуры
+строк всех таблиц (теги `db` = имена колонок из миграции 000001 в том же
+порядке, NULL — указатели или nil `[]byte`, `jsonb` — сырой JSON `[]byte`),
+перечисления и битовые типы. Пакет не содержит логики проверки: переходы
+статусов и состояний вводят планировщик и воркеры (ТЗ 7).
+
+| Тип | Колонка | Значения |
+|---|---|---|
+| `model.Status` | `domains.status` | 0 `new`, 1 `not_delegated`, 2 `delegated_no_address`, 3 `no_http`, 4 `alive`, 5 `temp_error`, 6 `deleted` (ТЗ 6.2); имена и `ParseStatus` для разбора |
+| `model.CheckState` | `domains.check_state` | 0 `pending`, 1 `queued`, 2 `done` |
+| `model.Flags` | `domains.flags` | бит 0 `is_idn` (ТЗ 5.2 п. 9 — метка содержит `xn--`), бит 1 `render_pending` (ТЗ 5.6); методы `Set`/`Clear`/`Test` |
+| `model.DNSMask` | `domains.dns_mask`, `laravel_domains.found_on_mask` | бит № = `subdomains.id`, биты 0..62 (максимум 63 субдомена, ТЗ 5.10); `Set`/`Unset`/`Test`/`IDs`/`Count` |
+| `model.Variant` | `subdomain_results.variant` | 0 основной, 1 http-вариант (ТЗ 5.5 п. 5) |
+| `model.Scheme` | `subdomain_results.scheme` | 1 http, 2 https |
+| `model.AliasKind` | `subdomain_results.alias_kind` | 0 нет, 1 идентичен, 2 редирект (ТЗ 5.5 п. 6) |
+| `model.Action` | `ingest_files.action` | 1 add, 2 delete |
+
+Границы маски защищены в самом типе: бит 63 `bigint` знаковый, поэтому
+`DNSMask.Set`/`Unset` отвергают номера вне 0..62 ошибкой (все номера
+проверяются до изменения — маска не меняется частично), `Test` для
+недопустимого номера возвращает false, `ValidateSubdomainID` — та же
+проверка для `crawlerctl subdomains add`. Нулевые значения структур
+совпадают с `DEFAULT`-ами колонок (`TestDomainZeroValueMatchesDefaults`),
+соответствие тегов колонкам миграции закреплено тестом
+`TestStructColumnsMatchSchema`.
