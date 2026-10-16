@@ -3,7 +3,7 @@
 # либо вручную: docker compose --project-directory . -f deploy/docker/compose.yaml ...
 #
 # Профили:
-#   (по умолчанию) postgres, redis, unbound, migrate
+#   (по умолчанию) postgres, redis, unbound
 #   testbed        coredns, testweb, mockserver — изолированный «мини-интернет»
 #   app            Go-сервисы проекта + chromium
 #   monitoring     prometheus
@@ -36,6 +36,10 @@ x-go-common: &go-common
   user: "${DEV_UID:-1000}:${DEV_GID:-1000}"
   environment: &go-common-env
     HOME: /tmp
+    # GOPATH — во временный каталог внутри контейнера: каталог /go из образа
+    # принадлежит root, а сюда Go кладёт кэш sumdb (make mod-download/go get
+    # после make clean). Модули — в общем томе GOMODCACHE, он тут ни при чём.
+    GOPATH: /tmp/gopath
     GOMODCACHE: /gomod
     GOCACHE: /gocache
     GOFLAGS: -mod=readonly
@@ -158,26 +162,6 @@ services:
       retries: 20
       start_period: 10s
 
-  migrate:
-    # Однократное применение миграций при поднятии окружения.
-    <<: *go-common
-    command:
-      - sh
-      - -c
-      - 'migrate -path /migrations -database "$$APP_PG_DSN" up && echo "миграции применены"'
-    volumes:
-      - .:/src
-      - gomodcache:/gomod
-      - gocache:/gocache
-      - ./migrations:/migrations:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: "no"
-    mem_limit: 256m
-    healthcheck:
-      disable: true
-
   # ==========================================================================
   # Тестовый стенд (profile: testbed)
   # ==========================================================================
@@ -273,8 +257,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
     profiles: ["app"]
 
   scheduler:
@@ -291,8 +273,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
     profiles: ["app"]
 
   dns-worker:
@@ -309,8 +289,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
     profiles: ["app"]
 
   http-worker:
@@ -327,8 +305,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
     profiles: ["app"]
 
   render-worker:
@@ -345,8 +321,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
     profiles: ["app"]
 
   analyzer:
@@ -363,8 +337,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
     profiles: ["app"]
 
   monitor:
@@ -381,8 +353,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
     profiles: ["app"]
 
   chromium:

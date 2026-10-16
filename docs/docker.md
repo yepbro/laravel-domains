@@ -22,7 +22,7 @@ cp .env.example .env                            # один раз; DEV_UID/DEV_G
 
 ```bash
 make up          # инфраструктура + testbed + приложения; ждёт все healthchecks
-make up-infra    # только postgres + redis + unbound (+ миграции)
+make up-infra    # только postgres + redis + unbound (схему применят сервисы)
 make down        # остановить всё; тома и данные сохраняются
 make clean       # остановить И удалить все тома (БД, кэши, контент); спросит подтверждение
 make clean FORCE=1   # то же без вопроса
@@ -109,7 +109,7 @@ make psql                # интерактивная консоль PostgreSQL
 make redis-cli           # интерактивная консоль Redis
 make test                # модульные тесты (в tools)
 make lint                # golangci-lint
-make migrate-up          # применить миграции
+make migrate-up          # применить миграции вручную (обычно не нужно: сервисы сами)
 make migrate-new NAME=my_migration
 make debug SERVICE=dns-worker   # сервис под delve, отладчик на 127.0.0.1:2345
 ```

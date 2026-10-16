@@ -39,10 +39,11 @@ help: ## Показать список команд
 up: ## Запустить инфраструктуру + testbed + приложения
 	$(check_env)
 	mkdir -p var/incoming var/content
+	$(MAKE) warm-cache
 	$(COMPOSE) $(APP_PROFILES) up -d --build --wait
 
 .PHONY: up-infra
-up-infra: ## Только postgres, redis, unbound (+ автомиграция)
+up-infra: ## Только postgres, redis, unbound (схему применят сервисы при старте)
 	$(check_env)
 	$(COMPOSE) up -d --build --wait
 
@@ -90,6 +91,14 @@ build: ## Собрать dev-образы (hot reload)
 	$(check_env)
 	$(COMPOSE) build
 
+# Прогрев общего кэша сборки: одна компиляция всех сервисов в tools (лимит 2G)
+# вместо восьми параллельных air-сборок с лимитом 256m — на холодном кэше
+# (первый запуск / после make clean) параллельная компиляция не влезает в память.
+.PHONY: warm-cache
+warm-cache: ## Прогреть общий кэш сборки Go (одна компиляция в tools)
+	$(check_env)
+	$(COMPOSE) run --rm tools go build ./cmd/...
+
 .PHONY: build-runtime
 build-runtime: ## Собрать боевые образы (runtime + render) для проверки
 	$(check_env)
@@ -98,7 +107,7 @@ build-runtime: ## Собрать боевые образы (runtime + render) д
 	docker build $(BUILD_ARGS) -f deploy/docker/Dockerfile.render \
 		--target render -t crawler/render:check .
 
-GO_PKGS := ./cmd/... ./internal/... ./test/...
+GO_PKGS := ./cmd/... ./internal/... ./migrations/... ./test/...
 
 .PHONY: test
 test: ## Модульные тесты Go (в контейнере)
@@ -110,6 +119,8 @@ test-integration: ## Интеграционные тесты окружения 
 	$(check_env)
 	$(COMPOSE) --profile testbed --profile app up -d --wait \
 		postgres redis unbound coredns testweb mockserver chromium
+	# Сервисы приложения не запускаются, поэтому схему для тестов накатывает
+	# CLI (тот же набор migrations/); раннер сервисов проверяют TestMigrate_*.
 	$(COMPOSE) run --rm tools sh -c \
 	  'migrate -path /migrations -database "$$APP_PG_DSN" up'
 	$(COMPOSE) run --rm -e CRAWLER_INTEGRATION=1 tools \
@@ -131,15 +142,17 @@ mod-download: ## Докачать Go-модули в общий кэш (нуже
 	$(COMPOSE) run --rm tools go mod download all
 
 # --------------------------------------------------------------- БД
+# Сервисы применяют миграции автоматически при старте (internal/migrate);
+# цели ниже — ручные операции через CLI golang-migrate в контейнере tools.
 
 .PHONY: migrate-up
-migrate-up: ## Применить миграции
+migrate-up: ## Применить миграции вручную (обычно не нужно: сервисы сами)
 	$(check_env)
 	$(COMPOSE) run --rm tools sh -c \
 	  'migrate -path /migrations -database "$$APP_PG_DSN" up'
 
 .PHONY: migrate-down
-migrate-down: ## Откатить все миграции
+migrate-down: ## Откатить все миграции (у сервисов отката нет)
 	$(check_env)
 	$(COMPOSE) run --rm tools sh -c \
 	  'migrate -path /migrations -database "$$APP_PG_DSN" down --all'

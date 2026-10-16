@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"crawler/internal/metrics"
+	"crawler/internal/migrate"
 )
 
 // Options — параметры запуска сервиса.
@@ -26,6 +27,11 @@ type Options struct {
 	Name string
 	// MetricsAddr — адрес HTTP-сервера метрик, например ":9101".
 	MetricsAddr string
+	// PGDSN — DSN PostgreSQL. Если задан, сервис перед стартом применяет
+	// встроенные миграции схемы (internal/migrate): все долгоживущие
+	// сервисы проекта работают с БД (ТЗ 6.3), healthcheck отвечает только
+	// на актуальной схеме. Пустая строка — сервис без БД.
+	PGDSN string
 	// OnSIGHUP вызывается при получении SIGHUP (перезагрузка правил Laravel).
 	OnSIGHUP func()
 	// ExtraMux позволяет зарегистрировать дополнительные хендлеры.
@@ -47,6 +53,15 @@ func Run(opts Options) {
 	}
 	if opts.MetricsAddr == "" {
 		opts.MetricsAddr = ":9090"
+	}
+
+	// Схема БД применяется до старта HTTP-сервера: healthcheck отвечает
+	// только на актуальной схеме. Параллельный старт нескольких сервисов
+	// безопасен (advisory-блокировки в internal/migrate).
+	if opts.PGDSN != "" {
+		if err := migrate.Up(context.Background(), opts.PGDSN); err != nil {
+			log.Fatalf("[%s] %v", opts.Name, err)
+		}
 	}
 
 	mux := http.NewServeMux()

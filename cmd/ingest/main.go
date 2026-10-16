@@ -11,5 +11,6 @@ func main() {
 	service.Run(service.Options{
 		Name:        "ingest",
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9101"),
+		PGDSN:       service.EnvOr("APP_PG_DSN", ""),
 	})
 }

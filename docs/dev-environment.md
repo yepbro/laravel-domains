@@ -57,9 +57,12 @@ make clean                   # остановить и удалить тома (
 
 | Профиль | Что включает |
 |---|---|
-| (по умолчанию) | `postgres`, `redis`, `unbound`, разовая `migrate` |
+| (по умолчанию) | `postgres`, `redis`, `unbound` |
 | `testbed` | `coredns`, `testweb` (Caddy), `mockserver` |
 | `app` | Go-сервисы (`ingest` … `monitor`, `render-worker`) + `chromium` |
+
+Миграции PostgreSQL отдельного сервиса не имеют: каждый Go-сервис применяет
+их сам при старте (см. [`migrations.md`](migrations.md)).
 | `monitoring` | `prometheus` (UI на http://127.0.0.1:9090) |
 | `tools` | `adminer` (http://127.0.0.1:8080), `redis-insight` (http://127.0.0.1:5540), контейнер `tools` |
 
@@ -101,7 +104,8 @@ make up-internet     # пересоздаст unbound в режиме рекур
 ```
 deploy/docker/           compose-файлы, Dockerfile'ы, конфиги сервисов
   testbed/               тестовый стенд: сценарии, зоны, фикстуры, mockserver
-migrations/              миграции golang-migrate (make migrate-new)
+migrations/              миграции golang-migrate: встраиваются в бинарники,
+                        применяются сервисами при старте (make migrate-new)
 rules/                   правила Laravel (YAML), перезагрузка: make rules-reload
 testdata/laravel-samples/  образцы страниц (index.html, headers.json, cookies.json, meta.yaml)
 var/incoming/            наблюдаемая папка ingest: <зона>/add/*.txt, <зона>/delete/*.txt
@@ -171,6 +175,11 @@ make redis-cli    # Redis: XLEN q:dns, XINFO GROUPS q:dns и т.п.
 
 - **`make up` падает на healthcheck** — `make logs SERVICE=<имя>`; первое
   включение air-сборки может занимать до минуты (`start_period` это учитывает).
+- **После `make clean` первый `make up` долгий** — пустеют кэши Go: `make up`
+  сначала прогревает общий кэш сборки в tools (`make warm-cache`), затем
+  стартует сервисы; при желании модули можно докачать заранее `make mod-download`.
+- **Схема БД в dirty-состоянии** — миграция прервалась на середине; сервис
+  падает с понятной ошибкой. Восстановление: см. [`migrations.md`](migrations.md).
 - **Нехватка памяти** — суммарные лимиты ≤ 8 ГБ; на слабых машинах уменьшите
   `MEM_*` в `.env` (postgres, chromium) — compose пересоздаст сервисы.
 - **Права на bind-mount** — `DEV_UID`/`DEV_GID` в `.env` должны совпадать с
@@ -184,8 +193,6 @@ make redis-cli    # Redis: XLEN q:dns, XINFO GROUPS q:dns и т.п.
 - **Новый модуль не находится при hot reload** — `GOFLAGS=-mod=readonly`:
   после правки `go.mod` выполните `make mod-download`, затем сервис
   пересоберётся сам.
-- **Unhealthy migrate** — это одноразовый сервис (`restart: no`); статус
-  `exited (0)` — норма. Смотрите `make logs SERVICE=migrate` при ошибках SQL.
 
 ## 8. Настройка хоста для нагрузочных тестов
 

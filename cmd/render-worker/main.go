@@ -11,5 +11,6 @@ func main() {
 	service.Run(service.Options{
 		Name:        "render-worker",
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9105"),
+		PGDSN:       service.EnvOr("APP_PG_DSN", ""),
 	})
 }
