@@ -38,9 +38,9 @@ scheduler:
 dns:
   resolvers: ["127.0.0.1:53"]        # локальный unbound
   fallback_resolvers: ["1.1.1.1:53", "9.9.9.9:53"]   # только при SERVFAIL/таймауте локального
-  concurrency: 2000
-  max_qps: 10000
-  ipv6: true                         # false — AAAA-запросы не выполняются
+  concurrency: 2000                  # потолок одновременных обменов (лимитёр T-035)
+  max_qps: 10000                     # средний темп; всплески до concurrency подряд
+  ipv6: true                         # false — AAAA отвечаются локально (пустой NOERROR, без сети)
   timeout: "2s"                      # таймаут одной UDP-попытки (internal/dnsclient)
   tcp_timeout: "5s"                  # таймаут TCP-fallback при усечении (TC=1)
   retries: 2                         # повторы сверх первой попытки (таймаут/сеть)
