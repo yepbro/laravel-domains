@@ -193,7 +193,7 @@ func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
 func redactDSN(dsn string) string {
 	u, err := url.Parse(dsn)
 	if err != nil || u.User == nil {
-		return "см. APP_PG_DSN"
+		return "см. postgres.dsn (конфигурация) / APP_PG_DSN"
 	}
 	// url.UserPassword кодирует символы маски, поэтому пароль просто
 	// отбрасывается: важно, чтобы он не попал в лог, а не как выглядит замена.

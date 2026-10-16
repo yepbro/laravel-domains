@@ -10,7 +10,7 @@
 | SQL-миграции | `migrations/` | пары `NNNNNN_имя.up.sql` / `.down.sql` (формат golang-migrate) |
 | Встраивание | `migrations/embed.go` | `go:embed *.sql` — набор попадает в бинарник сервиса |
 | Раннер | `internal/migrate` | применяет встроенный набор через golang-migrate как библиотеку |
-| Подключение к запуску | `internal/service` | `Options.PGDSN` → `migrate.Up` до старта HTTP-сервера метрик |
+| Подключение к запуску | `internal/service` | DSN из конфигурации (`Options.Config`, ТЗ 5.10) или `Options.PGDSN` → `migrate.Up` до старта HTTP-сервера метрик |
 
 Все долгоживущие сервисы (ingest, scheduler, dns-worker, http-worker,
 render-worker, analyzer, monitor) применяют миграции при старте: healthcheck
@@ -18,9 +18,9 @@ render-worker, analyzer, monitor) применяют миграции при с�
 — это CLI, схему к его запуску гарантируют сервисы (команды с доступом к БД
 появятся позже).
 
-DSN берётся из переменной окружения `APP_PG_DSN` (задаётся в
-`deploy/docker/compose.yaml`). После появления `internal/config` (T-006) он
-придёт из единого YAML.
+DSN сервисы берут из конфигурации ([`configuration.md`](configuration.md)):
+переменная `CRAWLER_POSTGRES_DSN` или устаревшая `APP_PG_DSN` (её задаёт
+`deploy/docker/compose.yaml` и Makefile) поверх `postgres.dsn` YAML-файла.
 
 ## Параллельный старт
 

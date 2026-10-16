@@ -25,6 +25,8 @@ make test-integration  # проверка окружения на testbed
 Схема PostgreSQL (`zones`, `subdomains`, `domains`, `subdomain_results`,
 `contents`, `laravel_*`, `ingest_files`): партиционирование, fillfactor,
 индексы, HOT-апдейты — [`docs/schema.md`](docs/schema.md).
+Конфигурация сервисов (единый YAML + переменные окружения, приоритеты,
+валидация; пример — `config.example.yaml`): [`docs/configuration.md`](docs/configuration.md).
 Список команд: `make help`.
 
 ## Структура
@@ -35,7 +37,7 @@ make test-integration  # проверка окружения на testbed
 | Каталог | Назначение |
 |---|---|
 | `cmd/` | Go-сервисы (ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, crawlerctl) и утилиты testbed (mockserver, testbedgen) |
-| `internal/` | Общий код: каркас сервисов (`service`), метрики Prometheus (`metrics`), миграции при старте (`migrate`), движок правил Laravel (`rules`), каркасы `queue` (Redis Streams), `content` (zstd), `render` (Chromium), `watch` (fsnotify); пакеты config, db, idn, dnsclient, httpfetch, model — в своих задачах |
+| `internal/` | Общий код: каркас сервисов (`service`), конфигурация (`config`), метрики Prometheus (`metrics`), миграции при старте (`migrate`), движок правил Laravel (`rules`), каркасы `queue` (Redis Streams), `content` (zstd), `render` (Chromium), `watch` (fsnotify); пакеты db, idn, dnsclient, httpfetch, model — в своих задачах |
 | `deploy/docker/` | Compose-окружение, Dockerfile'ы, конфиги, testbed (systemd-юниты и тюнинг ОС — этап 9 ТЗ) |
 | `migrations/` | Миграции PostgreSQL (golang-migrate): встраиваются в бинарники и применяются сервисами при старте |
 | `rules/` | Правила обнаружения Laravel (перезагрузка по SIGHUP) |
@@ -58,4 +60,4 @@ make test-integration  # проверка окружения на testbed
 | `github.com/klauspost/compress/zstd` | сжатие контента | `internal/content` |
 | `github.com/fsnotify/fsnotify` | наблюдение за папкой `incoming/` | `internal/watch` |
 | `github.com/prometheus/client_golang` | метрики Prometheus | `internal/metrics` → `/metrics` каждого сервиса |
-| `gopkg.in/yaml.v3` | конфиг и YAML-правила Laravel | `internal/rules`, конфиг — T-006 |
+| `gopkg.in/yaml.v3` | конфиг и YAML-правила Laravel | `internal/config`, `internal/rules` |

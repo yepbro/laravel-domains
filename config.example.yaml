@@ -1,0 +1,74 @@
+# Пример конфигурации сервисов Domain Crawler (ТЗ 5.10 основного ТЗ).
+# Скопируйте в config.yaml рядом с бинарниками (или укажите путь
+# переменной окружения CRAWLER_CONFIG):
+#
+#   cp config.example.yaml config.yaml
+#
+# Приоритет значений: переменные окружения > этот файл > значения по
+# умолчанию. Полный список переменных и правила валидации — docs/configuration.md.
+
+postgres:
+  dsn: "postgres://crawler:PASSWORD@127.0.0.1:5432/crawler?sslmode=disable"
+  pool_size: 20                      # рекомендация ТЗ: суммарно 20–50 на все сервисы
+
+redis:
+  addr: "127.0.0.1:6379"
+
+ingest:
+  dir: "/data/incoming"              # наблюдаемая папка: <зона>/add|delete/*.txt
+  batch_size: 50000                  # строк на одну пачку COPY
+  stable_seconds: 10                 # размер/mtime файла должны быть стабильны
+
+scheduler:
+  recheck_interval: "4380h"          # ≈ 6 месяцев (done → pending)
+  batch_size: 5000                   # рекомендация ТЗ: 1000–10000
+  queue_high_watermark: 100000       # backpressure: выше порога задачи не публикуются
+  lease: "30m"                       # срок аренды queued-домена
+  temp_error_retry_after: "24h"      # повтор temp_error
+
+dns:
+  resolvers: ["127.0.0.1:53"]        # локальный unbound
+  fallback_resolvers: ["1.1.1.1:53", "9.9.9.9:53"]
+  concurrency: 2000
+  max_qps: 10000
+  ipv6: true                         # false — AAAA-запросы не выполняются
+
+http:
+  concurrency: 2000
+  per_ip_limit: 4                    # рекомендация ТЗ: 3–4 соединения на IP
+  connect_timeout: "5s"
+  header_timeout: "10s"
+  total_timeout: "20s"
+  max_redirects: 8
+  max_body_bytes: 2097152            # 2 MiB
+  user_agent: "DomainCrawler/1.0 (+https://example.invalid; contact: admin@example.invalid)"  # честный UA с контактами — обязателен (ТЗ §9)
+
+render:
+  # remote_url — расширение dev-окружения: внешний Chromium по CDP.
+  # В боевом режиме воркер запускает браузер сам, оставьте пустым.
+  remote_url: ""
+  contexts: 3                        # рекомендация ТЗ: 2–4
+  timeout: "25s"
+  restart_every_pages: 500
+
+content:
+  dir: "/data/content"
+  pack_size: "512MB"                 # рекомендация ТЗ: 512 МБ–1 ГБ
+  max_store_bytes: 2097152           # рекомендация ТЗ: 1–2 МБ
+  zstd_dictionary: "/data/content/dict.zst"   # пусто — без словаря
+
+analyzer:
+  rules_dir: "/etc/crawler/rules"    # YAML-правила Laravel (ТЗ 5.8)
+  laravel_min_score: 0.6             # порог is_laravel, диапазон (0, 1]
+
+subdomains:                          # начальное наполнение таблицы subdomains;
+  - ""                               # "" — апекс домена; максимум 63 (dns_mask)
+  - "www"
+  - "admin"
+  - "crm"
+  - "api"
+  - "app"
+
+monitor:
+  listen: ":9100"
+  zone_stats_interval: "60s"         # обновление счётчиков зон, 30–60 с

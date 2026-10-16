@@ -4,13 +4,23 @@
 package main
 
 import (
+	"log"
+
+	"crawler/internal/config"
 	"crawler/internal/service"
 )
 
 func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("[monitor] %v", err)
+	}
+	// Адрес мониторинга — monitor.listen из конфигурации (ТЗ 5.10);
+	// METRICS_ADDR из окружения важнее (адреса метрик остальных сервисов
+	// задаются только переменной, ТЗ 5.9).
 	service.Run(service.Options{
 		Name:        "monitor",
-		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9100"),
-		PGDSN:       service.EnvOr("APP_PG_DSN", ""),
+		Config:      cfg,
+		MetricsAddr: service.EnvOr("METRICS_ADDR", cfg.Monitor.Listen),
 	})
 }

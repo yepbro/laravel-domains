@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"crawler/internal/config"
 	"crawler/internal/metrics"
 	"crawler/internal/migrate"
 )
@@ -27,10 +28,16 @@ type Options struct {
 	Name string
 	// MetricsAddr — адрес HTTP-сервера метрик, например ":9101".
 	MetricsAddr string
-	// PGDSN — DSN PostgreSQL. Если задан, сервис перед стартом применяет
-	// встроенные миграции схемы (internal/migrate): все долгоживущие
-	// сервисы проекта работают с БД (ТЗ 6.3), healthcheck отвечает только
-	// на актуальной схеме. Пустая строка — сервис без БД.
+	// Config — конфигурация сервиса (internal/config, ТЗ 5.10): загружается
+	// в main через config.Load (приоритет: env > YAML > defaults). Если
+	// задан, DSN PostgreSQL берётся из него.
+	Config *config.Config
+	// PGDSN — DSN PostgreSQL напрямую; имеет приоритет над Config
+	// (используется утилитами, которым конфиг-файл не нужен). Если задан,
+	// сервис перед стартом применяет встроенные миграции схемы
+	// (internal/migrate): все долгоживущие сервисы проекта работают с БД
+	// (ТЗ 6.3), healthcheck отвечает только на актуальной схеме. Пустая
+	// строка вместе с пустым Config.Postgres.DSN — сервис без БД.
 	PGDSN string
 	// OnSIGHUP вызывается при получении SIGHUP (перезагрузка правил Laravel).
 	OnSIGHUP func()
@@ -58,8 +65,14 @@ func Run(opts Options) {
 	// Схема БД применяется до старта HTTP-сервера: healthcheck отвечает
 	// только на актуальной схеме. Параллельный старт нескольких сервисов
 	// безопасен (advisory-блокировки в internal/migrate).
-	if opts.PGDSN != "" {
-		if err := migrate.Up(context.Background(), opts.PGDSN); err != nil {
+	// DSN: явный Options.PGDSN > конфигурация (env-переопределения уже
+	// применены в config.Load: CRAWLER_POSTGRES_DSN/APP_PG_DSN > postgres.dsn).
+	dsn := opts.PGDSN
+	if dsn == "" && opts.Config != nil {
+		dsn = opts.Config.Postgres.DSN
+	}
+	if dsn != "" {
+		if err := migrate.Up(context.Background(), dsn); err != nil {
 			log.Fatalf("[%s] %v", opts.Name, err)
 		}
 	}

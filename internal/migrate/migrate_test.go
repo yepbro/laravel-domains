@@ -174,7 +174,7 @@ func TestRedactDSN(t *testing.T) {
 		{
 			"мусор — не раскрываем",
 			"not a url at all",
-			"см. APP_PG_DSN",
+			"см. postgres.dsn (конфигурация) / APP_PG_DSN",
 		},
 	}
 	for _, c := range cases {

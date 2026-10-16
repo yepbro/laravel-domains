@@ -4,13 +4,20 @@
 package main
 
 import (
+	"log"
+
+	"crawler/internal/config"
 	"crawler/internal/service"
 )
 
 func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("[scheduler] %v", err)
+	}
 	service.Run(service.Options{
 		Name:        "scheduler",
+		Config:      cfg,
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9102"),
-		PGDSN:       service.EnvOr("APP_PG_DSN", ""),
 	})
 }

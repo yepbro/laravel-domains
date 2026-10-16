@@ -43,15 +43,17 @@ x-go-common: &go-common
     GOMODCACHE: /gomod
     GOCACHE: /gocache
     GOFLAGS: -mod=readonly
-    # Значения подставляются из .env; DSN/адреса — статические IP сети crawler_net
+    # Значения подставляются из .env; DSN/адреса — статические IP сети crawler_net.
+    # CRAWLER_CONFIG — путь к единому YAML (internal/config, ТЗ 5.10);
+    # переменные CRAWLER_* переопределяют значения из него (docs/configuration.md).
     APP_PG_DSN: postgres://${APP_DB_USER:-crawler}:${APP_DB_PASSWORD:-dev-only-crawler}@172.28.100.2:5432/${POSTGRES_DB:-crawler}?sslmode=disable
     APP_REDIS_ADDR: 172.28.100.3:6379
     APP_RESOLVER: 172.28.100.10:53
-    APP_CONFIG: /etc/crawler/config.yaml
+    CRAWLER_CONFIG: /etc/crawler/config.yaml
+    CRAWLER_HTTP_USER_AGENT: "${CRAWLER_USER_AGENT:-DomainCrawler/dev (+dev-environment; contact: dev@example.invalid)}"
     APP_RULES_DIR: /etc/crawler/rules
     APP_INCOMING_DIR: /data/incoming
     APP_CONTENT_DIR: /data/content
-    CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-DomainCrawler/dev}
     CHROMIUM_WS_URL: ws://172.28.100.14:9222
   volumes:
     - .:/src                      # исходный код (bind, hot reload)
@@ -442,6 +444,7 @@ services:
       - .:/src
       - gomodcache:/gomod
       - gocache:/gocache
+      - ./deploy/docker/config.dev.yaml:/etc/crawler/config.yaml:ro
       - ./migrations:/migrations
       - ./testdata:/testdata:ro
       - ./rules:/rules:ro
