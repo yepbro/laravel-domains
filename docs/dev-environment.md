@@ -146,7 +146,34 @@ tmp/                     артефакты hot-reload (air)
   `testdata/laravel-samples`, сверка `is_laravel`/диапазона версий с `meta.yaml`.
 - Переанализ сохранённого контента: `make reanalyze` (после реализации analyzer).
 
-## 6. Отладка, метрики, БД, очереди
+## 6. CLI crawlerctl
+
+`crawlerctl` — CLI управления краулером (ТЗ 4.1). Каркас команд готов
+(задача T-011): роутинг, флаги, валидация имён (internal/idn) и `--help`
+для каждой команды; функциональность подключается по мере реализации
+этапов. Коды возврата: 0 — успех, 1 — ошибка/«не реализовано»,
+2 — ошибка использования (аргументы/флаги).
+
+```
+crawlerctl status                        # сводка по зонам/очередям (T-079)
+crawlerctl domain <имя> [--json] [--content]
+                                         # информация о домене (T-081);
+                                         # имя в любой форме, зона/метка
+                                         # нормализуются уже сейчас
+crawlerctl subdomains list|add|disable   # справочник субдоменов (T-083)
+crawlerctl zones list|enable|disable     # управление зонами (T-084)
+crawlerctl reanalyze [--zone ИМЯ]        # переанализ по новым правилам (T-074)
+crawlerctl recheck <домен> [домен …]     # принудительная постановка домена
+                                         # на проверку (T-084)
+crawlerctl seed / test-rules             # dev-команды (make seed, make test-rules)
+```
+
+Через make: `make status`, `make domain NAME=example.crawl.test`,
+`make reanalyze`, `make seed`, `make test-rules`. Остальные команды —
+`docker compose run --rm tools go run ./cmd/crawlerctl <команда>`
+(см. `make shell`).
+
+## 7. Отладка, метрики, БД, очереди
 
 Отладка (delve, порт 2345 на 127.0.0.1):
 
@@ -171,7 +198,7 @@ make redis-cli    # Redis: XLEN q:dns, XINFO GROUPS q:dns и т.п.
 # Redis Insight:  http://127.0.0.1:5540 (профиль tools)
 ```
 
-## 7. Диагностика частых проблем
+## 8. Диагностика частых проблем
 
 - **`make up` падает на healthcheck** — `make logs SERVICE=<имя>`; первое
   включение air-сборки может занимать до минуты (`start_period` это учитывает).
@@ -194,7 +221,7 @@ make redis-cli    # Redis: XLEN q:dns, XINFO GROUPS q:dns и т.п.
   после правки `go.mod` выполните `make mod-download`, затем сервис
   пересоберётся сам.
 
-## 8. Настройка хоста для нагрузочных тестов
+## 9. Настройка хоста для нагрузочных тестов
 
 Параметры контейнеров (заданы в compose): `ulimits.nofile=65535`,
 `net.ipv4.ip_local_port_range=1024 65535` для воркеров.
