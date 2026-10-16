@@ -403,9 +403,13 @@ func TestZonePartitions_Validation(t *testing.T) {
 	}
 }
 
-// TestZonePartitions_DownMigration — откат миграции 000003 (один шаг down
+// TestZonePartitions_DownMigration — откат миграции 000003 (down к версии 2
 // тем же golang-migrate, что применяет раннер) удаляет процедуру, не трогая
-// таблицы и данные.
+// таблицы и данные. Версия указана явно: 000003 — не последняя миграция
+// схемы (после неё идут миграции других задач, например 000004 ingest_stage),
+// Steps(-1) откатывал бы чужую миграцию.
+const zoneSubpartitioningVersion = 3
+
 func TestZonePartitions_DownMigration(t *testing.T) {
 	skipUnlessIntegration(t)
 
@@ -416,8 +420,8 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
-	// Один шаг down — та же операция, которую выполнял бы CLI migrate
-	// (internal/migrate сознательно применяет только up).
+	// Откат до версии ниже 000003 — та же операция, которую выполнял бы
+	// CLI migrate (internal/migrate сознательно применяет только up).
 	db, err := sql.Open("pgx/v5", dsn)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
@@ -436,8 +440,8 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("инициализация golang-migrate: %v", err)
 	}
-	if err := m.Steps(-1); err != nil {
-		t.Fatalf("откат одной миграции: %v", err)
+	if err := m.Migrate(zoneSubpartitioningVersion - 1); err != nil {
+		t.Fatalf("откат к версии %d: %v", zoneSubpartitioningVersion-1, err)
 	}
 
 	pool, err := pgxpool.New(context.Background(), dsn)
@@ -446,8 +450,8 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 	}
 	defer pool.Close()
 
-	if version, ok := schemaVersion(t, dsn); !ok || version != latestEmbeddedVersion(t)-1 {
-		t.Errorf("версия схемы после отката = %d (ok=%v), want %d", version, ok, latestEmbeddedVersion(t)-1)
+	if version, ok := schemaVersion(t, dsn); !ok || version != zoneSubpartitioningVersion-1 {
+		t.Errorf("версия схемы после отката = %d (ok=%v), want %d", version, ok, zoneSubpartitioningVersion-1)
 	}
 
 	var procExists bool
