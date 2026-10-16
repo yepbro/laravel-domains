@@ -65,6 +65,11 @@ func TestDefault(t *testing.T) {
 		{"dns.concurrency", c.DNS.Concurrency, 2000},
 		{"dns.max_qps", c.DNS.MaxQPS, 10000},
 		{"dns.ipv6", c.DNS.IPv6, true},
+		{"dns.timeout", c.DNS.Timeout.D(), 2 * time.Second},
+		{"dns.tcp_timeout", c.DNS.TCPTimeout.D(), 5 * time.Second},
+		{"dns.retries", c.DNS.Retries, 2},
+		{"dns.retry_delay", c.DNS.RetryDelay.D(), 200 * time.Millisecond},
+		{"dns.udp_pool_size", c.DNS.UDPPoolSize, 2000},
 		{"http.concurrency", c.HTTP.Concurrency, 2000},
 		{"http.per_ip_limit", c.HTTP.PerIPLimit, 4},
 		{"http.connect_timeout", c.HTTP.ConnectTimeout.D(), 5 * time.Second},
@@ -132,6 +137,11 @@ dns:
   concurrency: 500
   max_qps: 2000
   ipv6: false
+  timeout: "3s"
+  tcp_timeout: "7s"
+  retries: 4
+  retry_delay: "250ms"
+  udp_pool_size: 64
 http:
   concurrency: 1500
   per_ip_limit: 3
@@ -193,6 +203,11 @@ log:
 		{"dns.concurrency", cfg.DNS.Concurrency, 500},
 		{"dns.max_qps", cfg.DNS.MaxQPS, 2000},
 		{"dns.ipv6", cfg.DNS.IPv6, false},
+		{"dns.timeout", cfg.DNS.Timeout.D(), 3 * time.Second},
+		{"dns.tcp_timeout", cfg.DNS.TCPTimeout.D(), 7 * time.Second},
+		{"dns.retries", cfg.DNS.Retries, 4},
+		{"dns.retry_delay", cfg.DNS.RetryDelay.D(), 250 * time.Millisecond},
+		{"dns.udp_pool_size", cfg.DNS.UDPPoolSize, 64},
 		{"http.concurrency", cfg.HTTP.Concurrency, 1500},
 		{"http.per_ip_limit", cfg.HTTP.PerIPLimit, 3},
 		{"http.connect_timeout", cfg.HTTP.ConnectTimeout.D(), 3 * time.Second},
@@ -330,6 +345,11 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_DNS_CONCURRENCY":                  "321",
 		"CRAWLER_DNS_MAX_QPS":                      "123",
 		"CRAWLER_DNS_IPV6":                         "false",
+		"CRAWLER_DNS_TIMEOUT":                      "4s",
+		"CRAWLER_DNS_TCP_TIMEOUT":                  "8s",
+		"CRAWLER_DNS_RETRIES":                      "5",
+		"CRAWLER_DNS_RETRY_DELAY":                  "333ms",
+		"CRAWLER_DNS_UDP_POOL_SIZE":                "77",
 		"CRAWLER_HTTP_CONCURRENCY":                 "654",
 		"CRAWLER_HTTP_PER_IP_LIMIT":                "3",
 		"CRAWLER_HTTP_CONNECT_TIMEOUT":             "2s",
@@ -381,6 +401,11 @@ func TestEnvOverrides(t *testing.T) {
 		{"dns.concurrency", cfg.DNS.Concurrency, 321},
 		{"dns.max_qps", cfg.DNS.MaxQPS, 123},
 		{"dns.ipv6", cfg.DNS.IPv6, false},
+		{"dns.timeout", cfg.DNS.Timeout.D(), 4 * time.Second},
+		{"dns.tcp_timeout", cfg.DNS.TCPTimeout.D(), 8 * time.Second},
+		{"dns.retries", cfg.DNS.Retries, 5},
+		{"dns.retry_delay", cfg.DNS.RetryDelay.D(), 333 * time.Millisecond},
+		{"dns.udp_pool_size", cfg.DNS.UDPPoolSize, 77},
 		{"http.concurrency", cfg.HTTP.Concurrency, 654},
 		{"http.per_ip_limit", cfg.HTTP.PerIPLimit, 3},
 		{"http.connect_timeout", cfg.HTTP.ConnectTimeout.D(), 2 * time.Second},
@@ -588,6 +613,12 @@ func TestValidate(t *testing.T) {
 		{"fallback кривой", func(c *Config) { c.DNS.FallbackResolvers = []string{"noport"} }, "dns.fallback"},
 		{"dns concurrency 0", func(c *Config) { c.DNS.Concurrency = 0 }, "dns.concurrency"},
 		{"max_qps 0", func(c *Config) { c.DNS.MaxQPS = 0 }, "dns.max_qps"},
+		{"dns timeout 0", func(c *Config) { c.DNS.Timeout = 0 }, "dns.timeout"},
+		{"dns tcp_timeout 0", func(c *Config) { c.DNS.TCPTimeout = 0 }, "dns.tcp_timeout"},
+		{"dns retries 0", func(c *Config) { c.DNS.Retries = 0 }, "dns.retries"},
+		{"dns retries велик", func(c *Config) { c.DNS.Retries = 11 }, "dns.retries"},
+		{"dns retry_delay 0", func(c *Config) { c.DNS.RetryDelay = 0 }, "dns.retry_delay"},
+		{"dns udp_pool_size 0", func(c *Config) { c.DNS.UDPPoolSize = 0 }, "dns.udp_pool_size"},
 		{"http concurrency 0", func(c *Config) { c.HTTP.Concurrency = 0 }, "http.concurrency"},
 		{"per_ip_limit 0", func(c *Config) { c.HTTP.PerIPLimit = 0 }, "http.per_ip_limit"},
 		{"connect_timeout 0", func(c *Config) { c.HTTP.ConnectTimeout = 0 }, "http.connect_timeout"},
