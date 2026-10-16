@@ -305,7 +305,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_INGEST_SCAN_INTERVAL":             "90s",
 		"CRAWLER_INGEST_MAX_ERROR_RATIO":           "0.25",
 		"CRAWLER_SCHEDULER_RECHECK_INTERVAL":       "2190h",
-		"CRAWLER_SCHEDULER_BATCH_SIZE":             "777",
+		"CRAWLER_SCHEDULER_BATCH_SIZE":             "7777",
 		"CRAWLER_SCHEDULER_QUEUE_HIGH_WATERMARK":   "4242",
 		"CRAWLER_SCHEDULER_LEASE":                  "15m",
 		"CRAWLER_SCHEDULER_TEMP_ERROR_RETRY_AFTER": "6h",
@@ -352,7 +352,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"ingest.scan_interval", cfg.Ingest.ScanInterval.D(), 90 * time.Second},
 		{"ingest.max_error_ratio", cfg.Ingest.MaxErrorRatio, 0.25},
 		{"scheduler.recheck_interval", cfg.Scheduler.RecheckInterval.D(), 2190 * time.Hour},
-		{"scheduler.batch_size", cfg.Scheduler.BatchSize, 777},
+		{"scheduler.batch_size", cfg.Scheduler.BatchSize, 7777},
 		{"scheduler.queue_high_watermark", cfg.Scheduler.QueueHighWatermark, 4242},
 		{"scheduler.lease", cfg.Scheduler.Lease.D(), 15 * time.Minute},
 		{"scheduler.temp_error_retry_after", cfg.Scheduler.TempErrorRetryAfter.D(), 6 * time.Hour},
@@ -552,6 +552,8 @@ func TestValidate(t *testing.T) {
 		{"max_error_ratio больше 1", func(c *Config) { c.Ingest.MaxErrorRatio = 1.5 }, "ingest.max_error_ratio"},
 		{"recheck_interval 0", func(c *Config) { c.Scheduler.RecheckInterval = 0 }, "scheduler.recheck_interval"},
 		{"batch scheduler 0", func(c *Config) { c.Scheduler.BatchSize = 0 }, "scheduler.batch_size"},
+		{"batch scheduler меньше 1000", func(c *Config) { c.Scheduler.BatchSize = 999 }, "scheduler.batch_size"},
+		{"batch scheduler больше 10000", func(c *Config) { c.Scheduler.BatchSize = 10001 }, "scheduler.batch_size"},
 		{"watermark 0", func(c *Config) { c.Scheduler.QueueHighWatermark = 0 }, "scheduler.queue_high_watermark"},
 		{"lease 0", func(c *Config) { c.Scheduler.Lease = 0 }, "scheduler.lease"},
 		{"retry_after 0", func(c *Config) { c.Scheduler.TempErrorRetryAfter = 0 }, "scheduler.temp_error_retry_after"},
@@ -614,12 +616,17 @@ func TestValidate(t *testing.T) {
 	c.Analyzer.LaravelMinScore = 1
 	c.HTTP.MaxRedirects = 0
 	c.Ingest.MaxErrorRatio = 1
+	c.Scheduler.BatchSize = 10000 // верхняя граница пачек планировщика (ТЗ 5.3)
 	c.Subdomains = make([]string, maxSubdomains)
 	for i := range c.Subdomains {
 		c.Subdomains[i] = fmt.Sprintf("s%d", i)
 	}
 	if err := c.Validate(); err != nil {
 		t.Errorf("граничные значения должны быть валидны: %v", err)
+	}
+	c.Scheduler.BatchSize = 1000 // нижняя граница пачек планировщика (ТЗ 5.3)
+	if err := c.Validate(); err != nil {
+		t.Errorf("нижняя граница scheduler.batch_size должна быть валидна: %v", err)
 	}
 }
 

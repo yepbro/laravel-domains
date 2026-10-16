@@ -258,8 +258,11 @@ func (c *Config) Validate() error {
 	if c.Scheduler.RecheckInterval <= 0 {
 		problems = append(problems, nonPositiveDur("scheduler.recheck_interval", c.Scheduler.RecheckInterval))
 	}
-	if !inRange(c.Scheduler.BatchSize, 1, 100000) {
-		problems = append(problems, rangeMsg("scheduler.batch_size", c.Scheduler.BatchSize, 1, 100000)+"; рекомендация ТЗ: 1000–10000")
+	// ТЗ 5.3: пачки планировщика 1000–10000 — границы нормативные
+	// (T-027), не рекомендация: пачка задаёт память выборки (ТЗ 3.5) и
+	// размер сообщений q:dns.
+	if !inRange(c.Scheduler.BatchSize, 1000, 10000) {
+		problems = append(problems, rangeMsg("scheduler.batch_size", c.Scheduler.BatchSize, 1000, 10000)+" (ТЗ 5.3)")
 	}
 	if c.Scheduler.QueueHighWatermark < 1 {
 		problems = append(problems, "scheduler.queue_high_watermark: ожидается положительное число, задано "+strconv.Itoa(c.Scheduler.QueueHighWatermark))
