@@ -2,8 +2,9 @@
 
 Решения по схеме (задачи T-003 — `zones`, `subdomains`, `domains`; T-004 —
 `subdomain_results`, `contents`, `laravel_domains`, `laravel_findings`,
-`ingest_files`; T-005 — субпартиционирование крупных зон). Механизм применения
-миграций — в [`migrations.md`](migrations.md).
+`ingest_files`; T-005 — субпартиционирование крупных зон; T-031 — колонка
+`domains.temp_attempts`). Механизм применения миграций — в
+[`migrations.md`](migrations.md).
 
 Контракт схемы закреплён интеграционными тестами
 `test/integration/schema_test.go` и
@@ -212,14 +213,15 @@ parameters for a partitioned table»). Поэтому `WITH (fillfactor = 85)` �
 ## HOT-апдейты
 
 При проверке домена обновляются `status`, `check_state`, `flags`,
-`dns_mask`, `queued_at`, `last_checked_at`. Апдейт остаётся HOT (без записи
-в индексы), пока обновляемая колонка не входит ни в один индекс — ни в ключ,
-ни в предикат:
+`dns_mask`, `queued_at`, `last_checked_at`, `temp_attempts`. Апдейт остаётся
+HOT (без записи в индексы), пока обновляемая колонка не входит ни в один
+индекс — ни в ключ, ни в предикат:
 
-- `status`, `flags`, `dns_mask`, `queued_at`, `last_checked_at` **не входят
-  ни в один индекс** — массовые апдейты результатов HOT; `last_checked_at`
-  не индексируется явно по ТЗ §6. Проверено эмпирически по `pg_stat_user_tables`
-  (`n_tup_hot_upd` растёт) и закреплено тестом `TestSchema_DomainsHOTColumns`.
+- `status`, `flags`, `dns_mask`, `queued_at`, `last_checked_at`,
+  `temp_attempts` **не входят ни в один индекс** — массовые апдейты
+  результатов HOT; `last_checked_at` не индексируется явно по ТЗ §6.
+  Проверено эмпирически по `pg_stat_user_tables` (`n_tup_hot_upd` растёт)
+  и закреплено тестом `TestSchema_DomainsHOTColumns`.
 - `check_state` входит в предикат `domains_pending_idx` — смены состояния
   `pending → queued → done` всегда non-HOT. Это неустранимый компромисс
   самого ТЗ: индекс выборки pending (§5.3) обязан фильтровать по
@@ -248,7 +250,8 @@ parameters for a partitioned table»). Поэтому `WITH (fillfactor = 85)` �
 ## Модель в Go: internal/model
 
 Пакет `internal/model` (T-008) — зеркалит схему в типы Go: структуры
-строк всех таблиц (теги `db` = имена колонок из миграции 000001 в том же
+строк всех таблиц (теги `db` = имена колонок из миграции 000001
+(+ `domains.temp_attempts` из 000005) в том же
 порядке, NULL — указатели или nil `[]byte`, `jsonb` — сырой JSON `[]byte`),
 перечисления и битовые типы. Пакет не содержит логики проверки: переходы
 статусов и состояний вводят планировщик и воркеры (ТЗ 7).
@@ -259,6 +262,7 @@ parameters for a partitioned table»). Поэтому `WITH (fillfactor = 85)` �
 | `model.CheckState` | `domains.check_state` | 0 `pending`, 1 `queued`, 2 `done` |
 | `model.Flags` | `domains.flags` | бит 0 `is_idn` (ТЗ 5.2 п. 9 — метка содержит `xn--`), бит 1 `render_pending` (ТЗ 5.6); методы `Set`/`Clear`/`Test` |
 | `model.DNSMask` | `domains.dns_mask`, `laravel_domains.found_on_mask` | бит № = `subdomains.id`, биты 0..62 (максимум 63 субдомена, ТЗ 5.10); `Set`/`Unset`/`Test`/`IDs`/`Count` |
+| `int16` | `domains.temp_attempts` | счётчик назначенных подряд повторных проверок `temp_error` (T-031, миграция 000005; ТЗ 5.3: «не более N раз подряд»); наращивает планировщик, сброс — при итоговом статусе и успешной проверке |
 | `model.Variant` | `subdomain_results.variant` | 0 основной, 1 http-вариант (ТЗ 5.5 п. 5) |
 | `model.Scheme` | `subdomain_results.scheme` | 1 http, 2 https |
 | `model.AliasKind` | `subdomain_results.alias_kind` | 0 нет, 1 идентичен, 2 редирект (ТЗ 5.5 п. 6) |

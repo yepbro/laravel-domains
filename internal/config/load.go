@@ -109,6 +109,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_SCHEDULER_QUEUE_HIGH_WATERMARK", setInt(func(c *Config) *int { return &c.Scheduler.QueueHighWatermark })},
 		{"CRAWLER_SCHEDULER_LEASE", setDuration(func(c *Config) *Duration { return &c.Scheduler.Lease })},
 		{"CRAWLER_SCHEDULER_TEMP_ERROR_RETRY_AFTER", setDuration(func(c *Config) *Duration { return &c.Scheduler.TempErrorRetryAfter })},
+		{"CRAWLER_SCHEDULER_TEMP_ERROR_MAX_RETRIES", setInt(func(c *Config) *int { return &c.Scheduler.TempErrorMaxRetries })},
 		{"CRAWLER_DNS_RESOLVERS", setStrings(func(c *Config) *[]string { return &c.DNS.Resolvers })},
 		{"CRAWLER_DNS_FALLBACK_RESOLVERS", setStrings(func(c *Config) *[]string { return &c.DNS.FallbackResolvers })},
 		{"CRAWLER_DNS_CONCURRENCY", setInt(func(c *Config) *int { return &c.DNS.Concurrency })},

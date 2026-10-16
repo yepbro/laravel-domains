@@ -56,6 +56,7 @@ func TestDefault(t *testing.T) {
 		{"scheduler.queue_high_watermark", c.Scheduler.QueueHighWatermark, 100000},
 		{"scheduler.lease", c.Scheduler.Lease.D(), 30 * time.Minute},
 		{"scheduler.temp_error_retry_after", c.Scheduler.TempErrorRetryAfter.D(), 24 * time.Hour},
+		{"scheduler.temp_error_max_retries", c.Scheduler.TempErrorMaxRetries, 3},
 		{"dns.resolvers", strings.Join(c.DNS.Resolvers, ","), "127.0.0.1:53"},
 		{"dns.fallback_resolvers", strings.Join(c.DNS.FallbackResolvers, ","), "1.1.1.1:53,9.9.9.9:53"},
 		{"dns.concurrency", c.DNS.Concurrency, 2000},
@@ -118,6 +119,7 @@ scheduler:
   queue_high_watermark: 50000
   lease: "45m"
   temp_error_retry_after: "12h"
+  temp_error_max_retries: 5
 dns:
   resolvers: ["10.0.0.2:53", "10.0.0.3:53"]
   fallback_resolvers: ["8.8.8.8:53"]
@@ -176,6 +178,7 @@ log:
 		{"scheduler.queue_high_watermark", cfg.Scheduler.QueueHighWatermark, 50000},
 		{"scheduler.lease", cfg.Scheduler.Lease.D(), 45 * time.Minute},
 		{"scheduler.temp_error_retry_after", cfg.Scheduler.TempErrorRetryAfter.D(), 12 * time.Hour},
+		{"scheduler.temp_error_max_retries", cfg.Scheduler.TempErrorMaxRetries, 5},
 		{"dns.resolvers", strings.Join(cfg.DNS.Resolvers, ";"), "10.0.0.2:53;10.0.0.3:53"},
 		{"dns.fallback_resolvers", strings.Join(cfg.DNS.FallbackResolvers, ";"), "8.8.8.8:53"},
 		{"dns.concurrency", cfg.DNS.Concurrency, 500},
@@ -309,6 +312,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_SCHEDULER_QUEUE_HIGH_WATERMARK":   "4242",
 		"CRAWLER_SCHEDULER_LEASE":                  "15m",
 		"CRAWLER_SCHEDULER_TEMP_ERROR_RETRY_AFTER": "6h",
+		"CRAWLER_SCHEDULER_TEMP_ERROR_MAX_RETRIES": "9",
 		"CRAWLER_DNS_RESOLVERS":                    "10.0.0.2:53, 10.0.0.3:53",
 		"CRAWLER_DNS_FALLBACK_RESOLVERS":           "8.8.8.8:53",
 		"CRAWLER_DNS_CONCURRENCY":                  "321",
@@ -356,6 +360,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"scheduler.queue_high_watermark", cfg.Scheduler.QueueHighWatermark, 4242},
 		{"scheduler.lease", cfg.Scheduler.Lease.D(), 15 * time.Minute},
 		{"scheduler.temp_error_retry_after", cfg.Scheduler.TempErrorRetryAfter.D(), 6 * time.Hour},
+		{"scheduler.temp_error_max_retries", cfg.Scheduler.TempErrorMaxRetries, 9},
 		{"dns.resolvers", strings.Join(cfg.DNS.Resolvers, ";"), "10.0.0.2:53;10.0.0.3:53"},
 		{"dns.fallback_resolvers", strings.Join(cfg.DNS.FallbackResolvers, ";"), "8.8.8.8:53"},
 		{"dns.concurrency", cfg.DNS.Concurrency, 321},
@@ -555,6 +560,8 @@ func TestValidate(t *testing.T) {
 		{"watermark 0", func(c *Config) { c.Scheduler.QueueHighWatermark = 0 }, "scheduler.queue_high_watermark"},
 		{"lease 0", func(c *Config) { c.Scheduler.Lease = 0 }, "scheduler.lease"},
 		{"retry_after 0", func(c *Config) { c.Scheduler.TempErrorRetryAfter = 0 }, "scheduler.temp_error_retry_after"},
+		{"max retries 0", func(c *Config) { c.Scheduler.TempErrorMaxRetries = 0 }, "scheduler.temp_error_max_retries"},
+		{"max retries велик", func(c *Config) { c.Scheduler.TempErrorMaxRetries = 101 }, "scheduler.temp_error_max_retries"},
 		{"resolvers пуст", func(c *Config) { c.DNS.Resolvers = nil }, "dns.resolvers"},
 		{"resolver без порта", func(c *Config) { c.DNS.Resolvers = []string{"127.0.0.1"} }, "dns.resolvers"},
 		{"fallback кривой", func(c *Config) { c.DNS.FallbackResolvers = []string{"noport"} }, "dns.fallback"},

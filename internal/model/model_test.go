@@ -11,9 +11,9 @@ import (
 )
 
 // TestStructColumnsMatchSchema — колонки каждой таблицы перечислены
-// жёстко по migrations/000001_init.up.sql (миграции 000002/000003 колонок
-// не меняют). Порядок обязателен: структуры используются с COPY и
-// pgx.RowToStructByName.
+// жёстко по migrations/000001_init.up.sql (000002/000003 колонок не
+// меняют, 000005 добавляет domains.temp_attempts). Порядок обязателен:
+// структуры используются с COPY и pgx.RowToStructByName.
 func TestStructColumnsMatchSchema(t *testing.T) {
 	cases := []struct {
 		row     any
@@ -26,7 +26,7 @@ func TestStructColumnsMatchSchema(t *testing.T) {
 		{Subdomain{}, []string{"id", "label", "enabled"}},
 		{Domain{}, []string{
 			"zone_id", "id", "label", "status", "check_state",
-			"flags", "dns_mask", "queued_at", "last_checked_at",
+			"flags", "dns_mask", "queued_at", "last_checked_at", "temp_attempts",
 		}},
 		{SubdomainResult{}, []string{
 			"zone_id", "domain_id", "subdomain_id", "variant", "scheme",
