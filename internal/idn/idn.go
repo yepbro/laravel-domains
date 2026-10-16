@@ -231,9 +231,9 @@ func normalizeASCII(name string) (string, error) {
 // по краям («убрать пробелы» без уточнения в ТЗ): помарки ввода
 // («при мер.рф») не должны отправлять имя в rejected-лог. Скрытые
 // символы — не пробелы и остаются на усмотрение UTS-46: BOM (U+FEFF),
-// U+00AD и U+200B убираются маппингом idna.Lookup, ZWNJ/ZWJ
-// (U+200C/U+200D) отклоняются контекстными правилами; исчерпывающий
-// корпус — T-010.
+// U+00AD, U+200B и U+2060 убираются маппингом idna.Lookup (ignored),
+// ZWNJ/ZWJ (U+200C/U+200D) проходят только по контекстным правилам
+// (CONTEXTJ), U+180E — disallowed; корпус — corpus_test.go (T-010).
 func cleanup(name string) string {
 	if strings.IndexFunc(name, unicode.IsSpace) < 0 {
 		return strings.TrimRight(strings.ToLower(name), ".")
