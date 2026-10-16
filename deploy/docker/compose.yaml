@@ -477,7 +477,9 @@ services:
       - ./rules:/rules:ro
       - ./var/incoming:/data/incoming
     restart: "no"
-    mem_limit: 384m
+    # Лимит выше, чем у сервисов: go vet/lint/test компилируют все пакеты
+    # модуля, включая тяжёлые зависимости (go-redis, chromedp, prometheus).
+    mem_limit: 2g
     profiles: ["tools"]
 
 networks:

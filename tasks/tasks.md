@@ -33,7 +33,7 @@
 
 ## Этап 0. Основа проекта (ТЗ §12, этап 1)
 
-- **T-001** [новая] — Скелет монорепозитория: каталоги `cmd/` (8 сервисов: ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, crawlerctl), `internal/`, `migrations/`, `rules/`, `deploy/`, `docs/`, `testdata/`; `go.mod` с зависимостями. ТЗ: §4.1, Прил. А, Прил. Б.
+- **T-001** [сделана] — Скелет монорепозитория: каталоги `cmd/` (8 сервисов: ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, crawlerctl), `internal/`, `migrations/`, `rules/`, `deploy/`, `docs/`, `testdata/`; `go.mod` с зависимостями. ТЗ: §4.1, Прил. А, Прил. Б.
 - **T-002** [новая] — Механизм миграций PostgreSQL (up/down), хранение схемы БД в репозитории, применение при старте сервисов. ТЗ: §6.3, §6.1.
 - **T-003** [новая] — Миграция таблиц `zones`, `subdomains`, `domains`: партиционирование LIST по `zone_id`, `fillfactor = 85`, частичный индекс `domains_pending_idx` (`check_state = 0`), sequence `domain_id_seq`, `last_checked_at` без индекса (HOT-апдейты). ТЗ: §6.1, §6 (принципы).
 - **T-004** [новая] — Миграция таблиц `subdomain_results`, `contents`, `laravel_domains`, `laravel_findings`, `ingest_files` (партиционирование где требуется по эскизу DDL). ТЗ: §6.1.

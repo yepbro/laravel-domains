@@ -10,13 +10,14 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"crawler/internal/metrics"
 )
 
 // Options — параметры запуска сервиса.
@@ -54,15 +55,10 @@ func Run(opts Options) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		_, _ = fmt.Fprintf(w, "# HELP crawler_service_up Сервис запущен и отвечает.\n"+
-			"# TYPE crawler_service_up gauge\n"+
-			"crawler_service_up{service=%q} 1\n", opts.Name)
-		_, _ = fmt.Fprintf(w, "# HELP crawler_build_info Информация о сборке (заглушка dev-каркаса).\n"+
-			"# TYPE crawler_build_info gauge\n"+
-			"crawler_build_info{service=%q,mode=\"dev-stub\"} 1\n", opts.Name)
-	})
+	// /metrics — реестр Prometheus (internal/metrics): базовые метрики
+	// каркаса + коллекторы Go/runtime; метрики сервисов добавляются в него.
+	registry := metrics.New(opts.Name)
+	mux.Handle("/metrics", metrics.Handler(registry))
 	if opts.ExtraMux != nil {
 		opts.ExtraMux(mux)
 	}
@@ -89,7 +85,7 @@ func Run(opts Options) {
 	defer stop()
 
 	go func() {
-		log.Printf("[%s] слушаю метрики на %s (заглушка dev-каркаса)", opts.Name, opts.MetricsAddr)
+		log.Printf("[%s] слушаю healthz/metrics на %s (Prometheus)", opts.Name, opts.MetricsAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("[%s] HTTP-сервер метрик: %v", opts.Name, err)
 		}
