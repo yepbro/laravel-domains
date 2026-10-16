@@ -19,6 +19,7 @@ ingest:
   batch_size: 50000                  # строк на одну пачку COPY
   stable_seconds: 10                 # размер/mtime файла должны быть стабильны
   scan_interval: "30s"               # полный обход папки как страховка fsnotify
+  max_error_ratio: 0.1               # доля отклонённых строк, выше которой файл ошибочен
 
 scheduler:
   recheck_interval: "4380h"          # ≈ 6 месяцев (done → pending)
