@@ -102,7 +102,7 @@ fsnotify (T-013): подхватывает файлы, существовавш�
 | YAML | Переменная | Тип | По умолчанию |
 |---|---|---|---|
 | `recheck_interval` | `CRAWLER_SCHEDULER_RECHECK_INTERVAL` | длительность | `4380h` (≈ 6 мес.) |
-| `batch_size` | `CRAWLER_SCHEDULER_BATCH_SIZE` | целое | `5000` (рекомендация: 1000–10000) |
+| `batch_size` | `CRAWLER_SCHEDULER_BATCH_SIZE` | целое | `5000` (ТЗ 5.3: 1000–10000) |
 | `queue_high_watermark` | `CRAWLER_SCHEDULER_QUEUE_HIGH_WATERMARK` | целое | `100000` (backpressure, ТЗ 4.2) |
 | `lease` | `CRAWLER_SCHEDULER_LEASE` | длительность | `30m` |
 | `temp_error_retry_after` | `CRAWLER_SCHEDULER_TEMP_ERROR_RETRY_AFTER` | длительность | `24h` |
@@ -197,7 +197,7 @@ fsnotify (T-013): подхватывает файлы, существовавш�
   корректные `host:port` (порт 1..65535); резолверы — хотя бы один;
 - все таймауты/интервалы положительны; `ingest.batch_size` 1..1000000,
   `ingest.stable_seconds` 1..3600, `ingest.scan_interval` 10ms..1h,
-  `scheduler.batch_size` 1..100000, `queue_high_watermark` ≥ 1;
+  `scheduler.batch_size` 1000..10000 (ТЗ 5.3), `queue_high_watermark` ≥ 1;
 - `dns.concurrency`/`http.concurrency` 1..100000, `dns.max_qps` 1..1000000,
   `http.per_ip_limit` 1..64, `http.max_redirects` 0..100, `max_body_bytes` > 0;
 - `http.user_agent` непуст;
