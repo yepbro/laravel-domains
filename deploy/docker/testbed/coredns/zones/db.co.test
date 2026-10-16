@@ -1,0 +1,8 @@
+$ORIGIN co.test.
+@ 3600 IN SOA ns.co.test. hostmaster.co.test. ( 1 3600 600 86400 300 )
+@ IN NS ns.co.test.
+ns IN A 172.28.100.11
+
+example IN A 172.28.100.12
+shop IN A 172.28.100.12
+www.example IN A 172.28.100.12

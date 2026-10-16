@@ -1,0 +1,7 @@
+$ORIGIN xn--80adjurfhd.test.
+@ 3600 IN SOA ns.xn--80adjurfhd.test. hostmaster.xn--80adjurfhd.test. ( 1 3600 600 86400 300 )
+@ IN NS ns.xn--80adjurfhd.test.
+ns IN A 172.28.100.11
+
+xn--80aairftm IN A 172.28.100.12
+xn--80aswg IN A 172.28.100.12

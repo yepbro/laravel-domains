@@ -10,6 +10,12 @@
 *.test
 *.out
 coverage.*
+# ...кроме генерата testbedgen: DNS-зоны CoreDNS (db.<zone>.test) и фикстуры
+# Caddy для зон *.test коммитятся в репо — в CI testbed не регенерируется,
+# а без зон unbound/coredns не проходят healthcheck.
+!deploy/docker/testbed/coredns/zones/*
+!deploy/docker/testbed/web/sites/*.test/
+!deploy/docker/testbed/web/sites/*.test/**
 
 # IDE
 .idea/
