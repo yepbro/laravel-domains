@@ -15,7 +15,7 @@ import (
 func newValidator(t *testing.T, zone string, ratio float64) (*Validator, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
-	v, err := NewValidator(Options{
+	v, err := NewValidator(ValidatorOptions{
 		File:          "incoming/example.com/add/list.txt",
 		Zone:          zone,
 		MaxErrorRatio: ratio,
@@ -225,7 +225,7 @@ func TestFinishStats(t *testing.T) {
 
 func TestNewValidator(t *testing.T) {
 	t.Run("зона каталога нормализуется", func(t *testing.T) {
-		v, err := NewValidator(Options{Zone: "РФ"})
+		v, err := NewValidator(ValidatorOptions{Zone: "РФ"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -234,19 +234,19 @@ func TestNewValidator(t *testing.T) {
 		}
 	})
 	t.Run("кривая зона каталога", func(t *testing.T) {
-		if _, err := NewValidator(Options{Zone: "под_чёркивание.рф"}); err == nil {
+		if _, err := NewValidator(ValidatorOptions{Zone: "под_чёркивание.рф"}); err == nil {
 			t.Error("невалидная зона должна давать ошибку")
 		}
 	})
 	t.Run("порог вне диапазона", func(t *testing.T) {
 		for _, ratio := range []float64{-0.1, 1.0001} {
-			if _, err := NewValidator(Options{Zone: "com", MaxErrorRatio: ratio}); err == nil {
+			if _, err := NewValidator(ValidatorOptions{Zone: "com", MaxErrorRatio: ratio}); err == nil {
 				t.Errorf("порог %v должен отклоняться", ratio)
 			}
 		}
 	})
 	t.Run("без логгера", func(t *testing.T) {
-		v, err := NewValidator(Options{Zone: "com"})
+		v, err := NewValidator(ValidatorOptions{Zone: "com"})
 		if err != nil {
 			t.Fatal(err)
 		}

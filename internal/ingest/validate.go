@@ -31,12 +31,11 @@ import (
 // к единице, — их отсекает и десять процентов.
 const DefaultMaxErrorRatio = 0.1
 
-// Reason — устойчивая причина отклонения строки: лог rejected и отчёт
-// файла (ТЗ 5.1). Классы ошибок нормализации совпадают с idn.ErrorKind
-// (T-016 только отображает их наружу); wrong_zone — собственная причина
-// ingest: домен принадлежит другой зоне, чем каталог файла (ТЗ 5.2 п. 6).
-type Reason string
-
+// Причины отклонения строки. Тип Reason общий для пакета (объявлен в
+// parser.go): лог rejected и отчёт файла (ТЗ 5.1). Классы ошибок
+// нормализации совпадают с idn.ErrorKind (T-016 только отображает их
+// наружу); wrong_zone — собственная причина ingest: домен принадлежит
+// другой зоне, чем каталог файла (ТЗ 5.2 п. 6).
 const (
 	// ReasonEmpty — имя пусто после уборки пробелов и завершающих точек.
 	ReasonEmpty Reason = "empty"
@@ -84,8 +83,8 @@ type Entry struct {
 	IsIDN bool
 }
 
-// Options — параметры валидации одного файла.
-type Options struct {
+// ValidatorOptions — параметры валидации одного файла.
+type ValidatorOptions struct {
 	// File — путь файла: атрибут каждой записи лога rejected.
 	File string
 	// Zone — зона из пути файла (incoming/<зона>/add|delete, T-014).
@@ -117,7 +116,7 @@ type Validator struct {
 // NewValidator подготавливает валидацию файла: зона нормализуется тем же
 // конвейером, что и строки (ТЗ 5.2 п. 6: «зона тоже нормализуется тем же
 // способом»), поэтому каталог зоны в unicode и punycode даёт одну зону.
-func NewValidator(opts Options) (*Validator, error) {
+func NewValidator(opts ValidatorOptions) (*Validator, error) {
 	zone, err := idn.NormalizeZone(opts.Zone)
 	if err != nil {
 		return nil, fmt.Errorf("ingest: зона файла %s: %w", opts.File, err)
@@ -212,8 +211,8 @@ func (v *Validator) reject(n int, line string, reason Reason) {
 	)
 }
 
-// Stats — счётчики строк файла (отчёт ingest_files, ТЗ 5.1, T-021).
-type Stats struct {
+// ValidatorStats — счётчики строк файла (отчёт ingest_files, ТЗ 5.1, T-021).
+type ValidatorStats struct {
 	// Total — содержательных строк файла (без пустых и комментариев —
 	// их исключает парсер T-015).
 	Total int
@@ -227,7 +226,7 @@ type Stats struct {
 
 // FileResult — итог валидации файла.
 type FileResult struct {
-	Stats
+	ValidatorStats
 	// Failed — доля отклонённых строк превысила ingest.max_error_ratio:
 	// файл целиком считается ошибочным (ТЗ 5.1), T-021 перемещает его
 	// в failed/ с лог-отчётом; валидные строки такого файла не грузятся.
@@ -241,7 +240,7 @@ type FileResult struct {
 func (v *Validator) Finish() FileResult {
 	rejected := v.total - v.accepted
 	return FileResult{
-		Stats: Stats{
+		ValidatorStats: ValidatorStats{
 			Total:    v.total,
 			Accepted: v.accepted,
 			Rejected: rejected,

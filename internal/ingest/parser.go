@@ -51,8 +51,9 @@ const MaxLineLen = 1024
 // вход недоверенный, rejected-логу (T-016) длинный мусор не нужен.
 const maxRejectText = 255
 
-// Reason — причина, по которой парсер отклонил строку. Попадает в
-// rejected-лог (T-016) рядом с классами ошибок нормализации internal/idn.
+// Reason — устойчивая причина отклонения строки в пакете ingest: у парсера
+// (невалидный UTF-8, длинная строка) и у валидатора (классы idn.ErrorKind,
+// wrong_zone — см. validate.go). Попадает в rejected-лог и отчёт файла.
 type Reason string
 
 const (
