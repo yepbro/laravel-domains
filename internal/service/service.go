@@ -1,19 +1,28 @@
-// Package service — общий каркас Go-сервисов Domain Crawler (dev-этап).
+// Package service — общий каркас Go-сервисов Domain Crawler.
 //
-// Пока сервисы проекта находятся в стадии заглушек, каждый из них поднимает
-// HTTP-сервер на порту метрик с обязательными эндпоинтами /healthz и /metrics
-// (ТЗ 4.2), корректно обрабатывает SIGTERM/SIGINT (graceful shutdown) и
-// SIGHUP (перезагрузка правил, ТЗ 5.8 основного ТЗ). По мере реализации
-// сервисов каркас дополняется их рабочей логикой.
+// Каркас берёт на себя всё, что не относится к рабочей логике сервиса:
+// структурированное логирование (log/slog, уровень из конфигурации),
+// применение миграций и пул подключений PostgreSQL (internal/migrate,
+// internal/db), HTTP-сервер с /healthz и /metrics (internal/metrics,
+// ТЗ 4.1, 5.9) и graceful shutdown по ТЗ 3.4: при SIGTERM/SIGINT сначала
+// отменяется контекст рабочей логики (Options.OnRun) и каркас ждёт её
+// завершения, затем останавливается HTTP-сервер метрик, последним
+// закрывается пул БД. Повторный сигнал прерывает ожидание — принудительный
+// выход. SIGHUP — перезагрузка правил без рестарта (ТЗ 5.8). Рабочая логика
+// подключается опцией OnRun (воркеры этапов 2+); сейчас сервисы-заглушки
+// живут до сигнала завершения.
 package service
 
 import (
 	"context"
 	"errors"
-	"log"
+	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -24,6 +33,11 @@ import (
 	"crawler/internal/metrics"
 	"crawler/internal/migrate"
 )
+
+// DefaultShutdownTimeout — бюджет graceful shutdown по умолчанию: время,
+// за которое рабочая логика обязана доработать текущую задачу или вернуть
+// её в очередь (ТЗ 3.4).
+const DefaultShutdownTimeout = 10 * time.Second
 
 // Options — параметры запуска сервиса.
 type Options struct {
@@ -46,16 +60,34 @@ type Options struct {
 	// известен, каркас после применения миграций создаёт пул подключений
 	// internal/db (postgres.dsn + postgres.pool_size из Config, либо
 	// PGDSN с размером по умолчанию) и вызывает OnDBPool с готовым пулом.
-	// Пул закрывается каркасом при graceful shutdown после остановки
-	// HTTP-сервера метрик — БД-логика сервиса должна завершать работу по
-	// отмене контекста SIGTERM раньше. nil — сервису пул не нужен
-	// (текущие заглушки): поведение прежнее, соединения не открываются.
+	// Пул закрывается каркасом при graceful shutdown — последним, после
+	// завершения OnRun и остановки HTTP-сервера метрик. nil — сервису пул
+	// не нужен (текущие заглушки): соединения не открываются.
 	OnDBPool func(pool *pgxpool.Pool)
+	// OnRun — рабочая логика сервиса (воркеры этапов 2+): вызывается после
+	// полной инициализации (миграции, пул, HTTP метрик). Полученный
+	// контекст отменяется при SIGTERM/SIGINT — по отмене воркер дорабатывает
+	// текущую задачу или возвращает её в очередь (ТЗ 3.4) и возвращается;
+	// каркас ждёт возврата в пределах ShutdownTimeout. Возврат без сигнала
+	// останавливает сервис: nil — чистое завершение (одноразовые задачи),
+	// ошибка — завершение с кодом 1. nil — заглушка без рабочей логики:
+	// сервис живёт до сигнала завершения.
+	OnRun func(ctx context.Context) error
 	// OnSIGHUP вызывается при получении SIGHUP (перезагрузка правил Laravel).
 	OnSIGHUP func()
 	// ExtraMux позволяет зарегистрировать дополнительные хендлеры.
 	ExtraMux func(mux *http.ServeMux)
+	// Logger — структурированный логгер сервиса (см. NewLogger). nil —
+	// каркас создаёт логгер сам и делает его дефолтным (slog.SetDefault).
+	Logger *slog.Logger
+	// ShutdownTimeout — бюджет graceful shutdown (ожидание OnRun и остановка
+	// HTTP-сервера метрик); 0 или отрицательное — DefaultShutdownTimeout.
+	ShutdownTimeout time.Duration
 }
+
+// errForcedExit — повторный сигнал завершения во время graceful shutdown:
+// Run завершает процесс немедленно, не дожидаясь OnRun и очистки ресурсов.
+var errForcedExit = errors.New("повторный сигнал завершения")
 
 // EnvOr возвращает значение переменной окружения или defaultVal.
 func EnvOr(key, defaultVal string) string {
@@ -65,14 +97,34 @@ func EnvOr(key, defaultVal string) string {
 	return defaultVal
 }
 
-// Run блокирует до получения SIGTERM/SIGINT. Вызывается из main каждого сервиса.
-func Run(opts Options) {
+// Run поднимает сервис (миграции → пул БД → HTTP метрик → OnRun) и
+// блокирует до завершения: SIGTERM/SIGINT (graceful shutdown), ошибка
+// рабочей логики или HTTP-сервера либо нормальное завершение OnRun.
+// Все ошибки Run логирует сам (уровень Error, с контекстом сервиса) и
+// возвращает вызывающему main — тому достаточно выйти с кодом 1:
+//
+//	if err := service.Run(opts); err != nil {
+//		os.Exit(1)
+//	}
+//
+// Повторный сигнал завершения во время graceful shutdown — немедленный
+// os.Exit(1) без ожидания OnRun.
+func Run(opts Options) error {
 	if opts.Name == "" {
-		log.Fatal("service: имя сервиса обязательно")
+		return errors.New("service: имя сервиса обязательно")
 	}
 	if opts.MetricsAddr == "" {
 		opts.MetricsAddr = ":9090"
 	}
+	if opts.ShutdownTimeout <= 0 {
+		opts.ShutdownTimeout = DefaultShutdownTimeout
+	}
+	if opts.Logger == nil {
+		opts.Logger = NewLogger(opts.Name, opts.Config)
+	}
+	// Дефолтный логгер — логгер сервиса: миграции (ниже) и код сервиса
+	// через slog.Default пишут с контекстом имени.
+	slog.SetDefault(opts.Logger)
 
 	// Схема БД применяется до старта HTTP-сервера: healthcheck отвечает
 	// только на актуальной схеме. Параллельный старт нескольких сервисов
@@ -85,7 +137,8 @@ func Run(opts Options) {
 	}
 	if dsn != "" {
 		if err := migrate.Up(context.Background(), dsn); err != nil {
-			log.Fatalf("[%s] %v", opts.Name, err)
+			opts.Logger.Error("миграции", "err", err)
+			return err
 		}
 	}
 
@@ -103,7 +156,8 @@ func Run(opts Options) {
 		p, err := db.Open(openCtx, db.Options{DSN: dsn, PoolSize: poolSize})
 		cancel()
 		if err != nil {
-			log.Fatalf("[%s] %v", opts.Name, err)
+			opts.Logger.Error("пул PostgreSQL", "err", err)
+			return err
 		}
 		pool = p
 		opts.OnDBPool(pool)
@@ -127,40 +181,167 @@ func Run(opts Options) {
 		Addr:              opts.MetricsAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ErrorLog:          slog.NewLogLogger(opts.Logger.Handler(), slog.LevelError),
 	}
 
-	// SIGHUP — перезагрузка правил без рестарта (make rules-reload).
+	// Listen отделён от Serve: ошибка занятого адреса — до старта OnRun.
+	ln, err := net.Listen("tcp", opts.MetricsAddr)
+	if err != nil {
+		opts.Logger.Error("HTTP-сервер метрик", "addr", opts.MetricsAddr, "err", err)
+		return err
+	}
+
+	term := make(chan os.Signal, 1)
+	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(term)
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+
+	closePool := func() {}
+	if pool != nil {
+		closePool = func() {
+			pool.Close()
+			opts.Logger.Info("пул PostgreSQL закрыт")
+		}
+	}
+
+	err = serve(opts, srv, ln, closePool, term, hup)
+	if errors.Is(err, errForcedExit) {
+		opts.Logger.Warn("повторный сигнал — принудительное завершение без ожидания остановки")
+		os.Exit(1)
+	}
+	return err
+}
+
+// serve — жизненный цикл после инициализации: HTTP-сервер метрик на ln и
+// рабочая логика opts.OnRun. Завершается по первому из: сигнал term,
+// ошибка HTTP-сервера, возврат OnRun. Порядок остановки (ТЗ 3.4):
+//  1. рабочая логика: отмена контекста OnRun и ожидание её завершения
+//     в пределах ShutdownTimeout (повторный term прерывает ожидание);
+//  2. HTTP-сервер метрик — дожидается начатых запросов;
+//  3. пул БД (closePool).
+//
+// Ошибки остановки логируются, но не прерывают последовательность.
+func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), term <-chan os.Signal, hup <-chan os.Signal) error {
+	logger := opts.Logger
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+
+	// SIGHUP — перезагрузка правил без рестарта (make rules-reload).
+	hupDone := make(chan struct{})
+	defer close(hupDone)
 	go func() {
-		for range hup {
-			log.Printf("[%s] получен SIGHUP", opts.Name)
-			if opts.OnSIGHUP != nil {
-				opts.OnSIGHUP()
+		for {
+			select {
+			case <-hupDone:
+				return
+			case <-hup:
+				logger.Info("получен SIGHUP")
+				if opts.OnSIGHUP != nil {
+					opts.OnSIGHUP()
+				}
 			}
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
+	httpErr := make(chan error, 1)
 	go func() {
-		log.Printf("[%s] слушаю healthz/metrics на %s (Prometheus)", opts.Name, opts.MetricsAddr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("[%s] HTTP-сервер метрик: %v", opts.Name, err)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			httpErr <- err
 		}
 	}()
 
-	<-ctx.Done()
-	log.Printf("[%s] останавливаюсь (graceful shutdown)", opts.Name)
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	var onRunDone <-chan error
+	if opts.OnRun != nil {
+		done := make(chan error, 1)
+		onRunDone = done
+		go func() {
+			defer func() {
+				// Паника рабочей логики не должна ронять процесс без
+				// лога и очистки: превращаем в ошибку, дальше — обычный
+				// graceful shutdown (переведёт в код выхода 1).
+				if r := recover(); r != nil {
+					logger.Error("паника в рабочей логике", "panic", r, "stack", string(debug.Stack()))
+					done <- fmt.Errorf("OnRun: паника: %v", r)
+				}
+			}()
+			done <- opts.OnRun(runCtx)
+		}()
+	}
 
-	// Пул закрывается последним: HTTP-сервер метрик уже остановлен,
-	// БД-логика сервиса должна была завершиться по отмене контекста.
-	if pool != nil {
-		pool.Close()
-		log.Printf("[%s] пул PostgreSQL закрыт", opts.Name)
+	// Стадия ожидания: работаем до сигнала, ошибки HTTP/OnRun или
+	// самостоятельного завершения OnRun (одноразовая задача).
+	var (
+		onRunErr      error
+		onRunFinished = opts.OnRun == nil
+		httpFail      error
+	)
+	select {
+	case sig := <-term:
+		logger.Info("сигнал завершения — graceful shutdown", "signal", sig.String())
+	case err := <-httpErr:
+		logger.Error("HTTP-сервер метрик", "err", err)
+		httpFail = fmt.Errorf("HTTP-сервер метрик: %w", err)
+	case err := <-onRunDone:
+		onRunFinished = true
+		onRunErr = err
+		if err != nil {
+			logger.Error("рабочая логика", "err", err)
+		} else {
+			logger.Info("рабочая логика завершена — останавливаю сервис")
+		}
+	}
+	cancelRun()
+
+	// Стадия остановки. 1) Рабочая логика: доработать текущую задачу или
+	// вернуть её в очередь (ТЗ 3.4) в пределах общего бюджета остановки;
+	// повторный сигнал — принудительный выход.
+	deadline := time.Now().Add(opts.ShutdownTimeout)
+	timedOut := false
+	if !onRunFinished {
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		select {
+		case err := <-onRunDone:
+			onRunErr = err
+			// Основной ошибкой выхода при httpFail остаётся сбой HTTP
+			// (именно он остановил сервис), но финализация воркера
+			// (возврат задач в очередь, ТЗ 3.4) тоже заслуживает лога.
+			if err != nil {
+				logger.Error("рабочая логика при остановке", "err", err)
+			}
+		case <-term:
+			return errForcedExit
+		case <-timer.C:
+			timedOut = true
+			logger.Warn("рабочая логика не остановилась за таймаут — продолжаю остановку",
+				"timeout", opts.ShutdownTimeout.String())
+		}
+	}
+
+	// 2) HTTP-сервер метрик: остаток бюджета — закончить начатые скрейпы
+	// /metrics; если бюджет исчерпан зависшей рабочей логикой, соединения
+	// закрываются немедленно (общий бюджет остановки не превышается).
+	if remain := time.Until(deadline); remain > 0 {
+		httpCtx, cancelHTTP := context.WithTimeout(context.Background(), remain)
+		defer cancelHTTP()
+		if err := srv.Shutdown(httpCtx); err != nil {
+			logger.Warn("остановка HTTP-сервера метрик", "err", err)
+		}
+	} else if err := srv.Close(); err != nil {
+		logger.Warn("закрытие HTTP-сервера метрик", "err", err)
+	}
+
+	// 3) Пул БД — последним.
+	closePool()
+
+	switch {
+	case httpFail != nil:
+		return httpFail
+	case timedOut:
+		return fmt.Errorf("рабочая логика не остановилась за %s", opts.ShutdownTimeout)
+	default:
+		return onRunErr
 	}
 }

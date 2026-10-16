@@ -68,3 +68,6 @@ subdomains:                          # начальное наполнение �
 monitor:
   listen: ":9100"
   zone_stats_interval: "60s"
+
+log:
+  level: "info"                    # dev: info, для отладки воркеров — debug

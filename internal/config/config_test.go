@@ -79,6 +79,7 @@ func TestDefault(t *testing.T) {
 		{"analyzer.laravel_min_score", c.Analyzer.LaravelMinScore, 0.6},
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
 		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 60 * time.Second},
+		{"log.level", c.Log.Level, "info"},
 	}
 	for _, ch := range checks {
 		if ch.got != ch.want {
@@ -148,6 +149,8 @@ subdomains:
 monitor:
   listen: "127.0.0.1:9110"
   zone_stats_interval: "30s"
+log:
+  level: "warn"
 `, nil)
 
 	type check struct {
@@ -192,6 +195,7 @@ monitor:
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.75},
 		{"monitor.listen", cfg.Monitor.Listen, "127.0.0.1:9110"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 30 * time.Second},
+		{"log.level", cfg.Log.Level, "warn"},
 	}
 	for _, ch := range checks {
 		if ch.got != ch.want {
@@ -323,6 +327,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_SUBDOMAINS":                       "www, mail",
 		"CRAWLER_MONITOR_LISTEN":                   ":9199",
 		"CRAWLER_MONITOR_ZONE_STATS_INTERVAL":      "45s",
+		"CRAWLER_LOG_LEVEL":                        "debug",
 	})
 	type check struct {
 		name string
@@ -366,6 +371,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.9},
 		{"monitor.listen", cfg.Monitor.Listen, ":9199"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 45 * time.Second},
+		{"log.level", cfg.Log.Level, "debug"},
 	}
 	for _, ch := range checks {
 		if ch.got != ch.want {
@@ -388,6 +394,7 @@ func TestEnvBadValues(t *testing.T) {
 		{map[string]string{"CRAWLER_HTTP_TOTAL_TIMEOUT": "20"}, "CRAWLER_HTTP_TOTAL_TIMEOUT"},
 		{map[string]string{"CRAWLER_CONTENT_PACK_SIZE": "big"}, "CRAWLER_CONTENT_PACK_SIZE"},
 		{map[string]string{"CRAWLER_ANALYZER_LARAVEL_MIN_SCORE": "x"}, "CRAWLER_ANALYZER_LARAVEL_MIN_SCORE"},
+		{map[string]string{"CRAWLER_LOG_LEVEL": "verbose"}, "log.level"},
 	}
 	for _, tt := range tests {
 		env := validDSN()
@@ -569,6 +576,7 @@ func TestValidate(t *testing.T) {
 		{"subdomain повтор", func(c *Config) { c.Subdomains = []string{"", "www", "www"} }, "subdomains"},
 		{"listen кривой", func(c *Config) { c.Monitor.Listen = "abc" }, "monitor.listen"},
 		{"zone_stats_interval 0", func(c *Config) { c.Monitor.ZoneStatsInterval = 0 }, "monitor.zone_stats_interval"},
+		{"log.level кривой", func(c *Config) { c.Log.Level = "verbose" }, "log.level"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -607,6 +615,21 @@ func TestSubdomainsNormalize(t *testing.T) {
 	_, err := loadFrom(t, "subdomains:\n  - \"\"\n  - \"www\"\n  - \"WWW\"\n", validDSN())
 	if err == nil || !strings.Contains(err.Error(), "повтор") {
 		t.Errorf("www и WWW после normalize — дубль, ожидается ошибка, получено %v", err)
+	}
+}
+
+// Регистр и пробелы log.level приводятся к каноничной форме (normalize);
+// уровень нужен каркасу сервисов (internal/service).
+func TestLogLevelNormalize(t *testing.T) {
+	cfg := mustLoad(t, "log:\n  level: \"  WARN \"\n", validDSN())
+	if cfg.Log.Level != "warn" {
+		t.Errorf("log.level после normalize: ожидается %q, получено %q", "warn", cfg.Log.Level)
+	}
+	env := validDSN()
+	env["CRAWLER_LOG_LEVEL"] = "ERROR"
+	cfg = mustLoad(t, "", env)
+	if cfg.Log.Level != "error" {
+		t.Errorf("log.level из env после normalize: ожидается %q, получено %q", "error", cfg.Log.Level)
 	}
 }
 

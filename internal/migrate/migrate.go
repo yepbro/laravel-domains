@@ -22,7 +22,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/url"
 	"time"
 
@@ -118,10 +118,10 @@ func Up(ctx context.Context, dsn string) error {
 		if verr != nil {
 			return fmt.Errorf("миграции: версия после применения: %w", verr)
 		}
-		log.Printf("миграции: схема применена, версия %d", version)
+		slog.Info("миграции: схема применена", "version", version)
 		return nil
 	case errors.Is(err, migrate.ErrNoChange):
-		log.Printf("миграции: схема уже актуальна, применение не требуется")
+		slog.Info("миграции: схема уже актуальна, применение не требуется")
 		return nil
 	case errors.As(err, new(migrate.ErrDirty)):
 		return ErrDirty
@@ -148,7 +148,7 @@ func acquireAdvisoryLock(ctx context.Context, conn *sql.Conn) error {
 func releaseAdvisoryLock(conn *sql.Conn) {
 	const query = `SELECT pg_advisory_unlock($1)`
 	if _, err := conn.ExecContext(context.Background(), query, advisoryLockKey); err != nil {
-		log.Printf("миграции: снятие advisory-блокировки: %v (снимется при закрытии соединения)", err)
+		slog.Warn("миграции: снятие advisory-блокировки не удалось (снимется при закрытии соединения)", "err", err)
 	}
 }
 
@@ -180,7 +180,7 @@ func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
 			redacted := redactDSN(dsn)
 			return nil, fmt.Errorf("миграции: PostgreSQL недоступен (%s): %w", redacted, err)
 		}
-		log.Printf("миграции: PostgreSQL ещё недоступен (%v), повтор через %s", err, connectRetryInterval)
+		slog.Info("миграции: PostgreSQL ещё недоступен, повторю попытку", "err", err.Error(), "retry_in", connectRetryInterval.String())
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("миграции: ожидание PostgreSQL прервано: %w", ctx.Err())

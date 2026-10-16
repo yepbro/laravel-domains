@@ -162,6 +162,16 @@ T-007); рекомендация ТЗ — суммарно 20–50 соедин�
 | `listen` | `CRAWLER_MONITOR_LISTEN` | [host]:port | `:9100` |
 | `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `60s` (рекомендация: 30–60 с) |
 
+### `log` (каркас сервисов)
+
+| YAML | Переменная | Тип | По умолчанию |
+|---|---|---|---|
+| `level` | `CRAWLER_LOG_LEVEL` | `debug`\\|`info`\\|`warn`\\|`error` | `info` |
+
+Уровень структурированного логгера `log/slog` каркаса `internal/service`
+(T-012). Расширение к минимальному составу ТЗ 5.10: уровень нужен всем
+сервисам сразу, а не отдельному этапу. Регистр значения не важен.
+
 ## Валидация
 
 Проверяется всё сразу, ошибка перечисляет проблемы вида `секция.поле: что не так`:
@@ -180,7 +190,8 @@ T-007); рекомендация ТЗ — суммарно 20–50 соедин�
 - `content.pack_size` 1 MiB..8 GiB, `max_store_bytes` 1 байт..16 MiB;
 - `analyzer.laravel_min_score` в (0, 1];
 - `subdomains`: 1..63 записи, метки в нижнем регистре без точек, без повторов;
-- пути (`ingest.dir`, `content.dir`, `analyzer.rules_dir`) непустые.
+- пути (`ingest.dir`, `content.dir`, `analyzer.rules_dir`) непустые;
+- `log.level` — одно из `debug`/`info`/`warn`/`error`.
 
 ## Устаревшие переменные (обратная совместимость)
 
@@ -215,7 +226,9 @@ T-007); рекомендация ТЗ — суммарно 20–50 соедин�
 - `config.Default()` — значения по умолчанию из ТЗ 5.10.
 - `service.Options.Config` — загруженный конфиг передаётся в каркас
   (`internal/service`); DSN для миграций берётся из него (или из прямого
-  `Options.PGDSN`).
+  `Options.PGDSN`), `log.level` — для логгера каркаса
+  (`service.NewLogger`; сам `Run` тоже создаёт логгер, если `Options.Logger`
+  не задан, и делает его дефолтным `slog.SetDefault`).
 - `db.NewOptions(cfg.Postgres)` — секция `postgres` → параметры пула
   `internal/db` (`db.Open`; см. [`db.md`](db.md)).
 

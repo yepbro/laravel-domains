@@ -39,6 +39,7 @@ type Config struct {
 	Analyzer   Analyzer  `yaml:"analyzer"`
 	Subdomains []string  `yaml:"subdomains"`
 	Monitor    Monitor   `yaml:"monitor"`
+	Log        Log       `yaml:"log"`
 }
 
 // Postgres — подключение к БД (ТЗ 6.3).
@@ -119,6 +120,13 @@ type Monitor struct {
 	ZoneStatsInterval Duration `yaml:"zone_stats_interval"`
 }
 
+// Log — уровень логирования сервисов (каркас internal/service). Расширение
+// к минимальному составу ТЗ 5.10: уровень нужен каркасу, а не отдельному
+// этапу, поэтому вынесен в свою секцию верхнего уровня.
+type Log struct {
+	Level string `yaml:"level"` // debug | info | warn | error
+}
+
 // Default возвращает конфигурацию со значениями по умолчанию из ТЗ 5.10
 // (кроме postgres.dsn: он обязан быть задан в YAML или окружении).
 func Default() *Config {
@@ -181,6 +189,9 @@ func Default() *Config {
 			Listen:            ":9100",
 			ZoneStatsInterval: Duration(60 * time.Second),
 		},
+		Log: Log{
+			Level: "info",
+		},
 	}
 }
 
@@ -189,6 +200,7 @@ func (c *Config) normalize() {
 	for i, s := range c.Subdomains {
 		c.Subdomains[i] = strings.ToLower(strings.TrimSpace(s))
 	}
+	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
 }
 
 var subdomainLabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -348,6 +360,13 @@ func (c *Config) Validate() error {
 	}
 	if c.Monitor.ZoneStatsInterval <= 0 {
 		problems = append(problems, nonPositiveDur("monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval))
+	}
+
+	// log (расширение каркаса, T-012)
+	switch c.Log.Level {
+	case "", "debug", "info", "warn", "error": // "" — конфиг без Default()
+	default:
+		problems = append(problems, fmt.Sprintf("log.level: ожидается debug|info|warn|error, задано %q", c.Log.Level))
 	}
 
 	if len(problems) == 0 {
