@@ -97,3 +97,35 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
 (`RecheckDaily`, T-030) и повторных проверок `temp_error`
 (`RetryTempErrors`, T-031); возврат доменов с истёкшим lease подключается
 задачей T-029.
+
+И `dns-worker` (этап 3, T-036…T-039) — не заглушка: его `OnRun` выполняет
+цикл `dnsworker.Run` (`internal/dnsworker/result.go`):
+
+- потребление пачек `q:dns` группой потребителей `dns-worker` (по одной
+  записи-пачке за чтение), обработка каждой доставки паттерном
+  `queue.Processing` (T-025) — XACK только после записи результата в БД;
+- на каждую доставку: перечитывается справочник `subdomains` (изменения
+  `crawlerctl` подхватываются без рестарта), пачка фильтруется одним
+  SELECT по актуальности (`check_state <> done`, `status <> deleted`) —
+  повторная доставка обрабатывает только недоработанные домены
+  (идемпотентность, ТЗ 3.4);
+- эпизод домена (параллельно до `dns.concurrency`): `CheckApex` (T-036)
+  → субдомены `CheckSubdomains` и wildcard-детект
+  `DetectWildcard`/`MarkWildcardSubdomains` (T-037/T-038) → решение
+  (`DecideEpisode`): терминальные ветки `not_delegated`/`temp_error`/
+  `delegated_no_address` пишут `domains.status`, найденные адреса —
+  задача `q:http` с адресами и CNAME (без терминального статуса: итог
+  `alive`/`no_http` ставит HTTP-этап);
+- порядок «публикация `q:http` → запись `done`» (обоснование — в
+  комментарии `internal/dnsworker/result.go`): сбой записи возвращает
+  эпизод повторной доставкой, а инвариант «`done` ⇒ задача опубликована»
+  делает фильтр актуальности страховкой от потери задачи;
+- запись — одним UPDATE на домен: `dns_mask`, статус (терминальные
+  ветки), `check_state = done`, `queued_at = NULL`, `last_checked_at`,
+  сброс `temp_attempts` на не-`temp_error` итоге (контракт T-031);
+  охраны `status <> deleted` (§13.1) и `check_state <> done`
+  (идемпотентность);
+- обмены — `dnsclient.Client` (пул UDP-сокетов, T-034) под
+  `LimitResolver` (`dns.concurrency`/`dns.max_qps`, адаптив, `dns.ipv6`,
+  T-035); публикация `q:http` — под гейтом backpressure
+  (`WatermarkPublisher`, T-026).
