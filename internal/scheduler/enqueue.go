@@ -261,12 +261,9 @@ func (o EnqueueOptions) withDefaults() EnqueueOptions {
 // пачку; ошибка цикла не останавливает сервис — логируется Warn, очередная
 // итерация повторит, состояние в БД консистентно: перевод и публикация
 // идемпотентны с точки зрения следующего круга, зависшие строки возвращает
-// lease T-029).
-//
-// TODO(T-026): гейт backpressure — публиковать пачку только когда длина
-// q:dns ниже scheduler.queue_high_watermark; до него цикл публикует
-// напрямую (T-026 параллелен T-028 и в этом дереве отсутствует), темп
-// ограничен только паузой Interval.
+// lease T-029). Гейт backpressure подключается обёрткой очереди в сборке
+// сервиса (queue.WatermarkPublisher, T-026) — цикл публикует через
+// интерфейс Queue и гейта не знает.
 func EnqueueLoop(ctx context.Context, pool db.DB, q queue.Queue, opts EnqueueOptions) error {
 	if pool == nil {
 		return errors.New("scheduler: цикл постановки: пул не задан")

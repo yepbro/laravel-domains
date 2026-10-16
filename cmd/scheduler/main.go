@@ -2,12 +2,13 @@
 // проверку — выборка пачек pending с чередованием зон (internal/scheduler
 // DispatchBatch, T-027), перевод в queued с lease и публикация пачек
 // DNSBatch в q:dns (EnqueueBatch/EnqueueLoop, T-028) — и фоновые циклы в
-// тех же OnRun: суточная перепроверка done-доменов (RecheckDaily, T-030)
-// и повторные проверки temp_error (RetryTempErrors, T-031). Возврат
-// доменов с истёкшим lease — T-029 (параллельная задача, подключается
-// своей сборкой). Очередь — Redis Streams (internal/queue, клиент
-// queue.NewClient/RedisQueue); каркас — internal/service: миграции, пул БД
-// (OnDBPool), /healthz и /metrics, graceful shutdown (ТЗ 3.4).
+// тех же OnRun: суточная перепроверка done-доменов (RecheckDaily, T-030),
+// повторные проверки temp_error (RetryTempErrors, T-031) и возврат
+// доменов с истёкшим lease (LeaseWatch, T-029). Публикация — под гейтом
+// backpressure (WatermarkPublisher, T-026). Очередь — Redis Streams
+// (internal/queue, клиент queue.NewClient/RedisQueue); каркас —
+// internal/service: миграции, пул БД (OnDBPool), /healthz и /metrics,
+// graceful shutdown (ТЗ 3.4).
 package main
 
 import (
@@ -60,11 +61,16 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
-	// MaxLen/backpressure — политика надёжности очереди T-025/T-026;
-	// постановке нужен только Publish.
-	dnsq := queue.NewRedisQueue(rdb, queue.RedisOptions{})
+	// Публикация пачек — под гейтом backpressure (T-026): длина q:dns
+	// ниже scheduler.queue_high_watermark; MAXLEN/надёжность — T-025 в
+	// RedisQueue.Publish.
+	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
+		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
+		Log:       logger,
+	})
+	dnsq := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
 
-	bg := make(chan error, 2)
+	bg := make(chan error, 3)
 	go func() {
 		bg <- scheduler.RecheckDaily(ctx, pool, scheduler.RecheckOptions{
 			Interval: cfg.Scheduler.RecheckInterval.D(),
@@ -78,6 +84,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			Log:        logger,
 		})
 	}()
+	go func() {
+		bg <- scheduler.LeaseWatch(ctx, pool, scheduler.LeaseOptions{
+			Timeout: cfg.Scheduler.Lease.D(),
+			Log:     logger,
+		})
+	}()
 
 	// Главный цикл живёт до отмены ctx; после него фоновые циклы уже
 	// завершаются по той же отмене — забираем их результаты.
@@ -85,6 +97,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		BatchSize: cfg.Scheduler.BatchSize,
 		Log:       logger,
 	})
+	<-bg
 	<-bg
 	<-bg
 	return err
