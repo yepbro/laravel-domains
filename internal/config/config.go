@@ -93,13 +93,31 @@ type Scheduler struct {
 	TempErrorMaxRetries int `yaml:"temp_error_max_retries"`
 }
 
-// DNS — параметры DNS-этапа (ТЗ 5.4).
+// DNS — параметры DNS-этапа (ТЗ 5.4). Клиент — internal/dnsclient
+// (T-034): miekg/dns, пул UDP-сокетов, TCP-fallback при TC=1, ретраи.
 type DNS struct {
 	Resolvers         []string `yaml:"resolvers"`
 	FallbackResolvers []string `yaml:"fallback_resolvers"`
 	Concurrency       int      `yaml:"concurrency"`
 	MaxQPS            int      `yaml:"max_qps"`
 	IPv6              bool     `yaml:"ipv6"`
+	// Timeout — таймаут одной UDP-попытки обмена. Расширение к
+	// минимальному составу ТЗ 5.10 (таймауты транспорта там не
+	// перечислены, но ТЗ 5.4 требует ретраев при таймаутах).
+	Timeout Duration `yaml:"timeout"`
+	// TCPTimeout — таймаут TCP-fallback при усечении ответа (TC=1):
+	// установка соединения + обмен, отдельный от UDP.
+	TCPTimeout Duration `yaml:"tcp_timeout"`
+	// Retries — повторы запроса сверх первой попытки при таймауте/ошибке
+	// сети; «SERVFAIL/таймаут после ретраев» → temp_error (ТЗ 5.4 п. 1).
+	// Минимум 1: ТЗ ретраи требует, «без ретраев» не рабочий режим.
+	Retries int `yaml:"retries"`
+	// RetryDelay — пауза между попытками.
+	RetryDelay Duration `yaml:"retry_delay"`
+	// UDPPoolSize — размер пула UDP-сокетов клиента. По умолчанию равен
+	// concurrency: пул меньше планового параллелизма сам становится
+	// ограничителем ниже настроенного.
+	UDPPoolSize int `yaml:"udp_pool_size"`
 }
 
 // HTTP — параметры HTTP-этапа (ТЗ 5.5, таблица лимитов).
@@ -190,6 +208,16 @@ func Default() *Config {
 			Concurrency:       2000,
 			MaxQPS:            10000,
 			IPv6:              true,
+			// Локальный unbound (ТЗ 5.4) отвечает быстро даже на холодном
+			// кэше; TCP-fallback реже и дороже — установка соединения.
+			Timeout:    Duration(2 * time.Second),
+			TCPTimeout: Duration(5 * time.Second),
+			// Как попытки доставки очереди (T-025) и перепроверки
+			// temp_error (T-031): единая политика повторов системы.
+			Retries:    2,
+			RetryDelay: Duration(200 * time.Millisecond),
+			// = concurrency: пул не должен резать плановый параллелизм.
+			UDPPoolSize: 2000,
 		},
 		HTTP: HTTP{
 			Concurrency:    2000,
@@ -329,6 +357,22 @@ func (c *Config) Validate() error {
 	}
 	if !inRange(c.DNS.MaxQPS, 1, 1000000) {
 		problems = append(problems, rangeMsg("dns.max_qps", c.DNS.MaxQPS, 1, 1000000))
+	}
+	if c.DNS.Timeout <= 0 {
+		problems = append(problems, nonPositiveDur("dns.timeout", c.DNS.Timeout))
+	}
+	if c.DNS.TCPTimeout <= 0 {
+		problems = append(problems, nonPositiveDur("dns.tcp_timeout", c.DNS.TCPTimeout))
+	}
+	// Минимум 1 — ТЗ 5.4 ретраи требует; максимум — dnsclient.MaxRetries.
+	if !inRange(c.DNS.Retries, 1, 10) {
+		problems = append(problems, rangeMsg("dns.retries", c.DNS.Retries, 1, 10)+"; минимум 1 — ТЗ 5.4 требует ретраев")
+	}
+	if c.DNS.RetryDelay <= 0 {
+		problems = append(problems, nonPositiveDur("dns.retry_delay", c.DNS.RetryDelay))
+	}
+	if !inRange(c.DNS.UDPPoolSize, 1, 100000) {
+		problems = append(problems, rangeMsg("dns.udp_pool_size", c.DNS.UDPPoolSize, 1, 100000))
 	}
 
 	// http

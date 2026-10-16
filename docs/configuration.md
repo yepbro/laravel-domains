@@ -166,6 +166,21 @@ XACK: записи не исчезают до обрезки `MAXLEN ~` (T-025),
 | `concurrency` | `CRAWLER_DNS_CONCURRENCY` | целое | `2000` |
 | `max_qps` | `CRAWLER_DNS_MAX_QPS` | целое | `10000` |
 | `ipv6` | `CRAWLER_DNS_IPV6` | булево | `true` (`false` — AAAA не запрашиваются) |
+| `timeout` | `CRAWLER_DNS_TIMEOUT` | длительность | `2s` |
+| `tcp_timeout` | `CRAWLER_DNS_TCP_TIMEOUT` | длительность | `5s` |
+| `retries` | `CRAWLER_DNS_RETRIES` | целое | `2` (диапазон 1..10) |
+| `retry_delay` | `CRAWLER_DNS_RETRY_DELAY` | длительность | `200ms` |
+| `udp_pool_size` | `CRAWLER_DNS_UDP_POOL_SIZE` | целое | `2000` |
+
+`timeout`/`tcp_timeout`/`retries`/`retry_delay`/`udp_pool_size` — параметры
+транспорта `internal/dnsclient` (T-034, ТЗ 5.4): `timeout` — одна
+UDP-попытка обмена с резолвером; `tcp_timeout` — повтор того же вопроса
+по TCP, когда ответ пришёл с флагом усечения (TC=1); `retries` — повторы
+сверх первой попытки при таймауте/ошибке сети (после исчерпания
+потребитель этапа фиксирует temp_error, ТЗ 5.4 п. 1); `udp_pool_size` —
+пул заранее открытых подключённых UDP-сокетов к первому резолверу из
+`resolvers`; по умолчанию равен `concurrency`, чтобы пул не ограничивал
+плановый параллелизм (параллелизм/QPS и адаптивное снижение — T-035).
 
 `fallback_resolvers` (ТЗ 5.4: «публичные резолверы — только как fallback»)
 потребляется DNS-клиентом воркера: при SERVFAIL/таймауте локального unbound
@@ -262,6 +277,9 @@ Quad9), как в ТЗ 5.10.
   `temp_error_max_retries` 1..100;
 - `dns.concurrency`/`http.concurrency` 1..100000, `dns.max_qps` 1..1000000,
   `http.per_ip_limit` 1..64, `http.max_redirects` 0..100, `max_body_bytes` > 0;
+- `dns.timeout`/`dns.tcp_timeout`/`dns.retry_delay` положительны,
+  `dns.retries` 1..10 (ТЗ 5.4: ретраи обязательны), `dns.udp_pool_size`
+  1..100000;
 - `http.user_agent` непуст;
 - `render.contexts` 1..16, `restart_every_pages` 1..1000000,
   `remote_url` (если задан) — корректный URL;

@@ -41,6 +41,11 @@ dns:
   concurrency: 2000
   max_qps: 10000
   ipv6: true                         # false — AAAA-запросы не выполняются
+  timeout: "2s"                      # таймаут одной UDP-попытки (internal/dnsclient)
+  tcp_timeout: "5s"                  # таймаут TCP-fallback при усечении (TC=1)
+  retries: 2                         # повторы сверх первой попытки (таймаут/сеть)
+  retry_delay: "200ms"               # пауза между попытками
+  udp_pool_size: 2000                # пул UDP-сокетов; обычно = concurrency
 
 http:
   concurrency: 2000
