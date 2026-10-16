@@ -146,7 +146,9 @@ deleted, `delete` — перевод в deleted) → отчёт в таблиц�
 
 1. Опишите домен в `deploy/docker/testbed/scenarios.yaml`:
    DNS-записи (`a: testweb|mockserver|blackhole`, `www`, `ns`, `wildcard`,
-   `cname`, `cname_loop`, `special: servfail|timeout`) и сайт
+   `cname`, `cname_loop`, `a_many` — N различных A-записей 192.0.2.0/24:
+   большой ответ режется в UDP без EDNS0 (TC=1) и требует TCP-fallback,
+   `special: servfail|timeout`) и сайт
    (`site.template`, схема http/https, поведение редиректов).
    В поле `expect` зафиксируйте ожидание — оно используется интеграционными
    тестами и документирует сценарий.

@@ -49,6 +49,12 @@ type DNSCfg struct {
 	CNAME     string `yaml:"cname"`      // CNAME на <cname>.<zone>
 	CNAMELoop bool   `yaml:"cname_loop"` // зацикленная CNAME-цепочка
 	Special   string `yaml:"special"`    // servfail | timeout
+	// AMany — сгенерировать столько различных A-записей (round-robin) из
+	// блока документации 192.0.2.0/24: большой ответ не помещается в
+	// UDP-датаграмму без EDNS0 → резолвер ставит TC=1, клиент повторяет
+	// вопрос по TCP (TCP-fallback, ТЗ 5.4/11.2). Сайта у сценария нет —
+	// адреса TEST-NET-1 заведомо никуда не ходят.
+	AMany int `yaml:"a_many"`
 }
 
 type SiteCfg struct {
@@ -200,6 +206,14 @@ func (g *generator) addScenario(zone string, sc Scenario) {
 
 	if sc.DNS.NS {
 		z.add("%s IN NS ns.%s.", sc.Name, zone)
+	}
+	if sc.DNS.AMany > 0 {
+		// Различные адреса 192.0.2.1..N: записи обязаны отличаться, иначе
+		// ответ не растёт (RRset сжимается до одной записи); 60 × ~16 Б
+		// в сжатой упаковке ≈ 1 КиБ > 512 Б лимита UDP без EDNS0.
+		for i := 1; i <= sc.DNS.AMany; i++ {
+			z.add("%s IN A 192.0.2.%d", sc.Name, i)
+		}
 	}
 	if sc.DNS.Wildcard {
 		z.add("*.%s IN A %s", sc.Name, net.TestwebIP)
