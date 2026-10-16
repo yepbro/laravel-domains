@@ -62,6 +62,11 @@ type Ingest struct {
 	// страховки к fsnotify (T-013; расширение к минимальному составу
 	// ТЗ 5.10, поэтому длительность, а не секунды, как у stable_seconds).
 	ScanInterval Duration `yaml:"scan_interval"`
+	// MaxErrorRatio — порог доли отклонённых строк файла (T-016, ТЗ 5.1:
+	// «файл не считается ошибочным из-за единичных плохих строк»):
+	// при превышении файл целиком считается ошибочным (failed/, T-021).
+	// Доля 0..1; расширение к минимальному составу ТЗ 5.10.
+	MaxErrorRatio float64 `yaml:"max_error_ratio"`
 }
 
 // Scheduler — планировщик проверок (ТЗ 5.3).
@@ -147,6 +152,9 @@ func Default() *Config {
 			BatchSize:     50000,
 			StableSeconds: 10,
 			ScanInterval:  Duration(30 * time.Second),
+			// Единичный мусор файлу не вредит, а файл не в той зоне
+			// или битый дамп дают долю ошибок ~1 (T-016).
+			MaxErrorRatio: 0.1,
 		},
 		Scheduler: Scheduler{
 			RecheckInterval:     Duration(4380 * time.Hour), // ≈ 6 месяцев
@@ -241,6 +249,9 @@ func (c *Config) Validate() error {
 	if c.Ingest.ScanInterval < Duration(10*time.Millisecond) || c.Ingest.ScanInterval > Duration(time.Hour) {
 		problems = append(problems, fmt.Sprintf("ingest.scan_interval: ожидается %s..%s, задано %s",
 			Duration(10*time.Millisecond), Duration(time.Hour), c.Ingest.ScanInterval))
+	}
+	if c.Ingest.MaxErrorRatio <= 0 || c.Ingest.MaxErrorRatio > 1 {
+		problems = append(problems, fmt.Sprintf("ingest.max_error_ratio: ожидается (0, 1], задано %v", c.Ingest.MaxErrorRatio))
 	}
 
 	// scheduler

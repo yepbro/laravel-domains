@@ -103,6 +103,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_INGEST_BATCH_SIZE", setInt(func(c *Config) *int { return &c.Ingest.BatchSize })},
 		{"CRAWLER_INGEST_STABLE_SECONDS", setInt(func(c *Config) *int { return &c.Ingest.StableSeconds })},
 		{"CRAWLER_INGEST_SCAN_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Ingest.ScanInterval })},
+		{"CRAWLER_INGEST_MAX_ERROR_RATIO", setFloat(func(c *Config) *float64 { return &c.Ingest.MaxErrorRatio })},
 		{"CRAWLER_SCHEDULER_RECHECK_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Scheduler.RecheckInterval })},
 		{"CRAWLER_SCHEDULER_BATCH_SIZE", setInt(func(c *Config) *int { return &c.Scheduler.BatchSize })},
 		{"CRAWLER_SCHEDULER_QUEUE_HIGH_WATERMARK", setInt(func(c *Config) *int { return &c.Scheduler.QueueHighWatermark })},
