@@ -190,3 +190,12 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
   `dnsclient` с лимитами T-035 → адаптер `httpworker.NewDNSLookup` →
   кэш `CachingResolver` (T-047); TLS — `InsecureSkipVerify` с сохранением
   атрибутов сертификата (`TLSInfo`, T-050).
+
+`render-worker` остаётся заглушкой до цикла очередей (T-066/T-067), но
+подводка этапа готова (T-061, `internal/render`,
+[`render.md`](render.md)): один Chromium (внешний по `render.remote_url`
+или собственный процесс), пул до `render.contexts` изолированных
+инкогнито-контекстов — свежий профиль на каждую страницу без сохранения
+состояния (ТЗ §9), классификация ошибок (страница / контекст / браузер) и
+счётчик страниц под перезапуск T-065; live-проверки против
+compose-сервиса `chromium` — флагом `CRAWLER_RENDER_TEST=1`.
