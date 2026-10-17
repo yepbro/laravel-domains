@@ -16,7 +16,8 @@ import (
 //	index.html   — итоговый HTML/DOM в том виде, как его сохраняет сервис;
 //	headers.json — заголовки ответа, объект имя -> массив значений;
 //	cookies.json — массив {name, value, ...};
-//	meta.yaml    — is_laravel, ожидаемый диапазон версий, примечание.
+//	meta.yaml    — is_laravel, ожидаемый диапазон версий, состав сработавших
+//	               правил (rules), примечание.
 type Sample struct {
 	ID      string
 	HTML    []byte
@@ -27,10 +28,15 @@ type Sample struct {
 }
 
 // SampleExpect — ожидания из meta.yaml (пустые поля — не проверяются).
+//
+// Rules — полный состав сработавших правил (id) для сверки в тестах:
+// непустой список означает точное совпадение, `rules: []` — ни одно правило
+// не должно сработать, отсутствие поля — состав не проверяется.
 type SampleExpect struct {
 	IsLaravel *bool
 	VerMin    string
 	VerMax    string
+	Rules     []string
 	Note      string
 	Source    string
 }
@@ -96,11 +102,12 @@ func loadSample(dir, id string) (Sample, error) {
 
 	if raw, err := os.ReadFile(filepath.Join(dir, "meta.yaml")); err == nil {
 		var m struct {
-			IsLaravel *bool  `yaml:"is_laravel"`
-			VerMin    string `yaml:"ver_min"`
-			VerMax    string `yaml:"ver_max"`
-			Note      string `yaml:"note"`
-			Source    string `yaml:"source"`
+			IsLaravel *bool    `yaml:"is_laravel"`
+			VerMin    string   `yaml:"ver_min"`
+			VerMax    string   `yaml:"ver_max"`
+			Rules     []string `yaml:"rules"`
+			Note      string   `yaml:"note"`
+			Source    string   `yaml:"source"`
 		}
 		if err := yaml.Unmarshal(raw, &m); err != nil {
 			return s, fmt.Errorf("samples/%s/meta.yaml: %w", id, err)
@@ -109,6 +116,7 @@ func loadSample(dir, id string) (Sample, error) {
 			IsLaravel: m.IsLaravel,
 			VerMin:    m.VerMin,
 			VerMax:    m.VerMax,
+			Rules:     m.Rules,
 			Note:      m.Note,
 			Source:    m.Source,
 		}

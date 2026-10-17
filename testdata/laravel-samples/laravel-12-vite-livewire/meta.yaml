@@ -1,0 +1,15 @@
+is_laravel: true
+ver_min: "12"         # реальная версия образца; вычисленный диапазон [9.19, ∞)
+note: "Синтетический образец (Laravel 12 + Livewire 3): нестандартное имя сессии acme_session (APP_NAME=Acme), Ziggy, пагинация по умолчанию"
+source: synthetic
+obtained: 2026-10-17
+rules:
+  - cookie_xsrf_token
+  - cookie_session_suffix
+  - cookie_encrypted_payload
+  - meta_csrf_token
+  - vite_assets
+  - livewire_attrs
+  - livewire_script
+  - ziggy_routes
+  - pagination_aria

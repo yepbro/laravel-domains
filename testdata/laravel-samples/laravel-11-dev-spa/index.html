@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="eyJpdiI6REVTUEEtU1BBOjE2Ont9">
+    <title>Acme SPA — dev</title>
+
+    <script type="module" src="http://localhost:5173/@vite/client"></script>
+    <link rel="stylesheet" href="http://localhost:5173/build/app.css">
+</head>
+<body class="antialiased">
+    <div id="app">
+        <form id="login">
+            <input type="email" name="email" placeholder="Email">
+            <input type="password" name="password" placeholder="Password">
+            <button onclick="login()">Sign in</button>
+        </form>
+    </div>
+    <script>
+        async function login() {
+            await axios.get('/sanctum/csrf-cookie');
+        }
+    </script>
+    <div id="phpdebugbar" class="phpdebugbar" style="position: fixed; bottom: 0; left: 0; width: 100%; z-index: 100;"></div>
+    <script src="/vendor/barryvdh/laravel-debugbar/assets/app.js" defer></script>
+</body>
+</html>

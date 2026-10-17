@@ -1,0 +1,7 @@
+{
+  "Content-Type": ["text/html; charset=UTF-8"],
+  "Set-Cookie": [
+    "XSRF-TOKEN=eyJpdiI6QlJFRVpFLUxPR0lOOjE2Ont9; expires=Sat, 17 Oct 2026 19:00:00 GMT; path=/; secure; samesite=lax",
+    "laravel_session=eyJpdiI6c2Vzc2lvbi0xMDoxNjp7fQ%3D%3D; expires=Sat, 17 Oct 2026 19:00:00 GMT; path=/; httponly; samesite=lax"
+  ]
+}

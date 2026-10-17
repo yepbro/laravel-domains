@@ -1,0 +1,8 @@
+{
+  "Content-Type": ["text/html; charset=UTF-8"],
+  "X-Powered-By": ["PHP/8.2.8"],
+  "Set-Cookie": [
+    "wordpress_test_cookie=WP%20Cookie%20check; path=/",
+    "wp-settings-time-1=1758000000; path=/; expires=Sun, 17 Oct 2027 18:00:00 GMT"
+  ]
+}

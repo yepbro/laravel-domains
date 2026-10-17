@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="eyJpdiI6Q1JTRi1UT0s6MTY6e30=">
+    <title>Log in — App</title>
+
+    <link rel="stylesheet" href="/build/assets/app-Bk3kX93l.css">
+    <script type="module" src="/build/assets/app-DJIrOSj4.js"></script>
+</head>
+<body class="font-sans text-gray-900 antialiased">
+    <div class="grid min-h-screen place-items-center bg-gray-100">
+        <div class="w-full max-w-md px-6 py-4 bg-white shadow-md overflow-hidden sm:rounded-lg">
+            <form method="POST" action="https://app.example/login">
+                <input type="hidden" name="_token" value="eyJpdiI6Rk9STS1UT0s6MTY6e30=" autocomplete="off">
+
+                <label for="email" class="block font-medium text-sm text-gray-700">Email</label>
+                <input id="email" type="email" name="email" class="mt-1 block w-full" required autofocus>
+
+                <label for="password" class="block mt-4 font-medium text-sm text-gray-700">Password</label>
+                <input id="password" type="password" name="password" class="mt-1 block w-full" required>
+
+                <button class="mt-4 w-full py-2 bg-gray-800 text-white rounded">Log in</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,15 @@
+is_laravel: true
+ver_min: "11"         # реальная версия образца; вычисленный диапазон [9.19, ∞)
+note: "Синтетический образец (Laravel 11, dev-бокс artisan serve + npm run dev): Vite dev-сервер (@vite/client, без хэшей сборки), Sanctum CSRF-cookie, Laravel Debugbar"
+source: synthetic
+obtained: 2026-10-17
+rules:
+  - cookie_xsrf_token
+  - cookie_laravel_session
+  - cookie_session_suffix
+  - cookie_encrypted_payload
+  - header_php_cli_server
+  - meta_csrf_token
+  - vite_dev_client
+  - sanctum_csrf_cookie
+  - laravel_debugbar

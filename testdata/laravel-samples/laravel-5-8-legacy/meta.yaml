@@ -1,0 +1,15 @@
+is_laravel: true
+ver_min: "5.8"
+ver_max: "5.8"
+note: "Синтетический образец (Laravel 5.8, внутренний раздел залогиненного пользователя): window.Laravel из дефолтного layout'а, кука remember_web_<sha1>, Mix без версионирования страницы"
+source: synthetic
+obtained: 2026-10-17
+rules:
+  - cookie_xsrf_token
+  - cookie_laravel_session
+  - cookie_session_suffix
+  - cookie_encrypted_payload
+  - cookie_remember_guard
+  - meta_csrf_token
+  - mix_assets
+  - window_laravel

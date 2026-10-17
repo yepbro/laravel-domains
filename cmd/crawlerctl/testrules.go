@@ -9,6 +9,8 @@ package main
 import (
 	"fmt"
 	"io"
+	"slices"
+	"sort"
 
 	"crawler/internal/rules"
 )
@@ -20,8 +22,8 @@ const testRulesHelp = `crawlerctl test-rules — прогон правил Larav
   crawlerctl test-rules [--rules DIR] [--samples DIR] [--min-score F]
 
 Оценивает каждую страницу из samples правилами из rules и сверяет
-is_laravel (score >= min-score) и диапазон версий с ожиданиями meta.yaml.
-Несовпадения — ошибка выполнения (код 1).
+is_laravel (score >= min-score), диапазон версий и состав сработавших
+правил с ожиданиями meta.yaml. Несовпадения — ошибка выполнения (код 1).
 `
 
 func cmdTestRules(args []string, stdout, stderr io.Writer) error {
@@ -63,6 +65,20 @@ func cmdTestRules(args []string, stdout, stderr io.Writer) error {
 			if !res.Contains(s.Expect.VerMin, s.Expect.VerMax) {
 				status = "FAIL"
 				failed++
+			}
+		}
+		if s.Expect.Rules != nil {
+			fired := make([]string, 0, len(res.Signals))
+			for _, ev := range res.Signals {
+				fired = append(fired, ev.Rule)
+			}
+			sort.Strings(fired)
+			want := slices.Clone(s.Expect.Rules)
+			sort.Strings(want)
+			if !slices.Equal(fired, want) {
+				status = "FAIL"
+				failed++
+				out(stdout, "     ! правила: в meta.yaml %v, сработали %v\n", want, fired)
 			}
 		}
 
