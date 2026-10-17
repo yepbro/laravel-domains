@@ -12,7 +12,11 @@
 //   - резолв хостов HTTP-редиректов «через тот же резолвер с кэшем»
 //     (ТЗ 5.5 п. 2): подключение к хосту, для которого нет адресов
 //     DNS-этапа (редирект на другой хост), идёт через Resolver
-//     транспорта; обёртка-кэш — CachingResolver.
+//     транспорта; обёртка-кэш — CachingResolver;
+//   - лимиты и защита T-049 (таблица лимитов ТЗ 5.5): потолок тела с
+//     признаком обрезки, анти-тарпит (мин. скорость после первого
+//     байта), соединения на один IP, глобальные соединения и RPS —
+//     limits.go, включаются Options.Limits.
 //
 // Редиректы транспорт не обрабатывает: один запрос — один ответ,
 // Location остаётся заголовком ответа; следование по цепочке
@@ -75,11 +79,16 @@ type Options struct {
 	// FallbackDelay — пауза между попытками подключения к очередному
 	// адресу из нескольких (см. dialAddrs).
 	FallbackDelay time.Duration
-	// MaxBodyBytes — предел читаемого тела. Транспорт его не применяет:
-	// лимит чтения (вместе с защитой от тарпитов по скорости) реализует
-	// T-049; здесь значение только переносится из конфигурации к
-	// потребителю (ТЗ 5.5, «макс. размер читаемого тела 2 МБ»).
+	// MaxBodyBytes — предел читаемого тела («макс. размер читаемого
+	// тела | 2 МБ», ТЗ 5.5). Применяет лимитёр T-049 (Options.Limits:
+	// обрезка с признаком BodyLimiter.Truncated); без лимитёра
+	// значение переносится из конфигурации к потребителю как есть.
 	MaxBodyBytes int64
+	// Limits — лимиты и защита T-049 (таблица лимитов ТЗ 5.5): потолок
+	// тела, анти-тарпит, соединения на один IP, глобальные соединения
+	// и RPS. nil — транспорт без лимитов (изолированные тесты слоёв
+	// T-047); NewOptions включает лимиты из секции http конфигурации.
+	Limits *LimitOptions
 	// UserAgent — User-Agent запросов Fetch (честный, с контактами —
 	// ТЗ 5.5, §9; формализация контактов — T-052). Пустой — не ставится,
 	// и транспорт посылает UA Go по умолчанию.
@@ -97,11 +106,13 @@ type Options struct {
 	TLSClientConfig *tls.Config
 }
 
-// NewOptions собирает параметры из секции http конфигурации (T-006).
-// FallbackDelay, Resolver и TLSClientConfig в ТЗ числами не заданы:
-// пауза гонки адресов — транспортная деталь, резолвер этапа и TLS
-// подключаются при сборке воркера (T-050/T-053).
+// NewOptions собирает параметры из секции http конфигурации (T-006);
+// лимиты T-049 включаются всегда — боевой транспорт не бывает без
+// лимитов таблицы ТЗ 5.5. FallbackDelay, Resolver и TLSClientConfig в
+// ТЗ числами не заданы: пауза гонки адресов — транспортная деталь,
+// резолвер этапа и TLS подключаются при сборке воркера (T-050/T-053).
 func NewOptions(cfg config.HTTP) Options {
+	limits := NewLimitOptions(cfg)
 	return Options{
 		ConnectTimeout:      cfg.ConnectTimeout.D(),
 		TLSHandshakeTimeout: cfg.TLSHandshakeTimeout.D(),
@@ -109,6 +120,7 @@ func NewOptions(cfg config.HTTP) Options {
 		TotalTimeout:        cfg.TotalTimeout.D(),
 		MaxBodyBytes:        cfg.MaxBodyBytes.B(),
 		UserAgent:           cfg.UserAgent,
+		Limits:              &limits,
 	}
 }
 
@@ -157,9 +169,15 @@ type FetchResult struct {
 	Header http.Header
 	// Body — тело ответа. Обязательно закрывается вызывающим: Close
 	// освобождает соединение и останавливает общий таймаут запроса.
-	// Лимит чтения (ТЗ 5.5 — 2 МБ) применяет потребитель (T-049);
-	// допустимый предел перенесён в Options.MaxBodyBytes.
+	// С лимитами T-049 (Options.Limits) тело дополнительно обёрнуто в
+	// BodyLimiter: потолок MaxBodyBytes и анти-тарпит (ТЗ 5.5).
 	Body io.ReadCloser
+	// BodyLimiter — лимитёр тела T-049; nil — лимиты выключены и Body
+	// без обёртки. Truncated — признак «тело обрезано потолком
+	// MaxBodyBytes»: данные частичны, не ошибка сети (ТЗ 8), решение —
+	// за потребителем (T-058). Признак выставляется чтением Body к
+	// моменту io.EOF.
+	BodyLimiter *BodyLimiter
 	// FinalURL — URL этого ответа: у одного запроса совпадает с
 	// запрошенным; в цепочке редиректов T-048 подставит адрес
 	// последнего ответа.
@@ -202,6 +220,8 @@ type Fetcher struct {
 	rt   *http.Transport
 	res  Resolver
 	dial dialFunc
+	// lim — активные лимиты T-049 (Options.Limits); nil — выключены.
+	lim *limitState
 }
 
 // compile-time check: *Fetcher — http.RoundTripper.
@@ -220,6 +240,9 @@ func NewFetcher(opts Options) *Fetcher {
 		res: opts.Resolver,
 	}
 	f.dial = f.dialNet
+	if opts.Limits != nil {
+		f.lim = newLimitState(opts.Limits.withDefaults())
+	}
 	f.rt = &http.Transport{
 		// Прямые подключения: исходящие соединения одного IP краулера
 		// (ТЗ 10.2), прокси не настраиваются.
@@ -228,11 +251,14 @@ func NewFetcher(opts Options) *Fetcher {
 		// приходят в ctx запроса Fetch, хосты редиректов резолвит
 		// dialContext через Resolver.
 		DialContext: f.dialContext,
-		// ТЗ 5.5: keep-alive «отключён или очень короткий idle». Здесь
-		// отключён: запрашивается одна главная страница на сайт (минимум
-		// запросов), а пул соединений по ключу «хост» переживал бы смену
+		// ТЗ 5.5: keep-alive «отключён или очень короткий idle». Выбрано
+		// «отключён» — зафиксировано в T-049: запрашивается одна главная
+		// страница на сайт (минимум запросов), цепочка редиректов идёт
+		// по разным хостам, а пул по ключу «хост» переживал бы смену
 		// адреса при перерезолве и держал тысячи неактивных соединений
-		// при concurrency 2000. Короткий idle — на усмотрение T-049.
+		// при concurrency 2000. IdleConnTimeout при DisableKeepAlives
+		// эффекта не имеет (соединения не живут дольше ответа) —
+		// «короткий idle» не настраивается.
 		DisableKeepAlives: true,
 		// Послойные таймауты (таблица лимитов ТЗ 5.5): рукопожатие TLS
 		// и ожидание заголовков; connect и общий — в диале и Fetch.
@@ -254,6 +280,14 @@ func (f *Fetcher) CloseIdleConnections() { f.rt.CloseIdleConnections() }
 // подключается через Resolver транспорта — http.Client поверх Fetcher
 // получает резолв хостов редиректов без дополнительного кода.
 func (f *Fetcher) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Токен темпа берётся и здесь: ходы цепочки редиректов http.Client —
+	// те же исходящие запросы (ТЗ 5.5: ограничение по RPS). Fetch берёт
+	// токен сам и в f.rt.RoundTrip не заходит — двойного ожидания нет.
+	if f.lim != nil {
+		if err := f.lim.rps.take(req.Context()); err != nil {
+			return nil, fmt.Errorf("httpfetch: %s %s: %w", req.Method, req.URL, err)
+		}
+	}
 	return f.rt.RoundTrip(req)
 }
 
@@ -290,19 +324,39 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (*FetchResult, erro
 	}
 
 	start := time.Now()
+	if f.lim != nil {
+		// Токен темпа запросов (ТЗ 5.5: RPS): ожидание — часть общего
+		// бюджета запроса (tctx), но не времени ответа (Elapsed ниже).
+		if err := f.lim.rps.take(tctx); err != nil {
+			cancel()
+			return nil, fmt.Errorf("httpfetch: GET %s: %w", r.URL, err)
+		}
+	}
 	resp, err := f.rt.RoundTrip(req)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("httpfetch: GET %s: %w", r.URL, err)
 	}
+
+	body := io.ReadCloser(&cancelBody{rc: resp.Body, cancel: cancel})
+	var limiter *BodyLimiter
+	if f.lim != nil {
+		// Лимиты тела T-049: обрезка по MaxBodyBytes (признак —
+		// Truncated, не ошибка сети) и анти-тарпит по мин. скорости
+		// после первого байта (нарушение — таймаут, соединение
+		// закрывается). Отмена общего таймаута — та же cancel.
+		limiter = newBodyLimiter(body, cancel, f.lim.opt)
+		body = limiter
+	}
 	return &FetchResult{
-		StatusCode: resp.StatusCode,
-		Status:     resp.Status,
-		Header:     resp.Header,
-		Body:       &cancelBody{rc: resp.Body, cancel: cancel},
-		FinalURL:   resp.Request.URL,
-		Elapsed:    time.Since(start),
-		TLS:        resp.TLS,
+		StatusCode:  resp.StatusCode,
+		Status:      resp.Status,
+		Header:      resp.Header,
+		Body:        body,
+		BodyLimiter: limiter,
+		FinalURL:    resp.Request.URL,
+		Elapsed:     time.Since(start),
+		TLS:         resp.TLS,
 	}, nil
 }
 
@@ -424,7 +478,7 @@ func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string
 	case 0:
 		return nil, errors.New("httpfetch: нет адресов для подключения")
 	case 1:
-		return f.dialTimed(ctx, addrs[0], port)
+		return f.dialLimited(ctx, addrs[0], port)
 	}
 
 	// Производный контекст останавливает висящие попытки после
@@ -441,7 +495,7 @@ func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string
 	event := make(chan struct{}, 1) // будит цикл ожидания; буфер 1 — сигнал не теряется
 
 	attempt := func(i int) {
-		conn, err := f.dialTimed(stop, addrs[i], port)
+		conn, err := f.dialLimited(stop, addrs[i], port)
 		mu.Lock()
 		defer mu.Unlock()
 		if won {

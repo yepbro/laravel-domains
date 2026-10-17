@@ -134,6 +134,17 @@ type HTTP struct {
 	MaxRedirects        int      `yaml:"max_redirects"`
 	MaxBodyBytes        ByteSize `yaml:"max_body_bytes"`
 	UserAgent           string   `yaml:"user_agent"`
+	// MinBodySpeed — мин. скорость чтения тела после первого байта,
+	// байт/с (ТЗ 5.5: «защита от тарпитов: мин. скорость 2 КБ/с»).
+	// Расширение к минимальному составу ТЗ 5.10 — значение из таблицы
+	// лимитов ТЗ 5.5 (T-049).
+	MinBodySpeed ByteSize `yaml:"min_body_speed"`
+	// MaxRPS — глобальный темп запросов (ТЗ 5.5: «ограничение исходящей
+	// нагрузки по глобальному числу соединений и RPS»). Числа в ТЗ нет:
+	// дефолт — порядок естественного темпа этапа (страница ~1–2 с при
+	// concurrency 2000). Расширение к минимальному составу ТЗ 5.10
+	// (T-049).
+	MaxRPS int `yaml:"max_rps"`
 }
 
 // Render — параметры рендера (ТЗ 5.6). RemoteURL — расширение dev-окружения:
@@ -241,6 +252,12 @@ func Default() *Config {
 			MaxRedirects:        8,
 			MaxBodyBytes:        ByteSize(2 << 20), // 2 MiB
 			UserAgent:           "DomainCrawler/1.0 (contact: admin@example.invalid)",
+			// Таблица лимитов ТЗ 5.5: мин. скорость 2 КБ/с (тарпиты).
+			MinBodySpeed: ByteSize(2 << 10),
+			// Естественный темп этапа ~1000–2000 RPS (страница 1–2 с,
+			// concurrency 2000): дефолт держит порядок исходящей нагрузки
+			// одного IP (тюнинг сети — ТЗ 10.2).
+			MaxRPS: 1000,
 		},
 		Render: Render{
 			RemoteURL:         "",
@@ -416,6 +433,12 @@ func (c *Config) Validate() error {
 	}
 	if c.HTTP.MaxBodyBytes <= 0 {
 		problems = append(problems, "http.max_body_bytes: ожидается положительный размер, задано "+c.HTTP.MaxBodyBytes.String())
+	}
+	if c.HTTP.MinBodySpeed <= 0 {
+		problems = append(problems, "http.min_body_speed: ожидается положительная скорость (байт/с), задано "+c.HTTP.MinBodySpeed.String())
+	}
+	if !inRange(c.HTTP.MaxRPS, 1, 1000000) {
+		problems = append(problems, rangeMsg("http.max_rps", c.HTTP.MaxRPS, 1, 1000000))
 	}
 	if strings.TrimSpace(c.HTTP.UserAgent) == "" {
 		problems = append(problems, "http.user_agent: обязателен (честный User-Agent с контактами, ТЗ 5.5/§9)")
