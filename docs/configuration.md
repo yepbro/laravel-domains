@@ -400,6 +400,9 @@ rules:
 `/metrics`, его собственные метрики): у каждого сервиса проекта свой
 эндпоинт (ТЗ 5.9, адреса — в [`services.md`](services.md)), Prometheus
 скрейпит их по отдельности, агрегации через monitor нет.
+`zone_stats_interval` — период пакетного пересчёта счётчиков прогресса зон
+`zones.domains_total` / `domains_checked` (T-078; семантика —
+[`services.md`](services.md)).
 
 ### `log` (каркас сервисов)
 
