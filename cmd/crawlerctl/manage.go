@@ -1,10 +1,10 @@
 // ---------------------------------------------------------------- управление
 //
-// Команды управления из ТЗ 4.1: reanalyze (T-074), subdomains (T-083),
-// zones и recheck (T-084); status — в status.go (T-079).
-// Команда разбирает аргументы и валидирует вход (имена — через
-// internal/idn); каркасы зон возвращают notImplemented с номером задачи,
-// выборки из БД выполнят сами задачи.
+// Команды управления из ТЗ 4.1: reanalyze (T-074), subdomains (T-083);
+// status — в status.go (T-079), domain — в domain.go (T-081), zones и
+// recheck — в zones.go/recheck.go (T-084). Команда разбирает аргументы
+// и валидирует вход (имена — через internal/idn); выборки из БД
+// выполняют сами команды.
 
 package main
 
@@ -576,10 +576,11 @@ func subdomainRecheckOnce(ctx context.Context, pool db.DB, zoneID *int16) (int64
 
 // ---------------------------------------------------------------- команды
 
-// openSubdomainsPool — пул БД для команд subdomains: единый YAML + окружение
-// (internal/config), pool_size 2 — бюджет соединений ТЗ 6.3 (стиль
-// reanalyze). Закрывает вызывающий (defer pool.Close()).
-func openSubdomainsPool(ctx context.Context) (*pgxpool.Pool, error) {
+// openManagePool — пул БД для команд управления (subdomains, zones,
+// recheck): единый YAML + окружение (internal/config), pool_size 2 —
+// бюджет соединений ТЗ 6.3 (стиль reanalyze). Закрывает вызывающий
+// (defer pool.Close()).
+func openManagePool(ctx context.Context) (*pgxpool.Pool, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, err
@@ -598,7 +599,7 @@ func subdomainsList(args []string, stdout, stderr io.Writer) error {
 		return usagef("subdomains list: лишние аргументы %v (команда без аргументов)", fs.Args())
 	}
 	ctx := context.Background()
-	pool, err := openSubdomainsPool(ctx)
+	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains list: %w", err)
 	}
@@ -622,7 +623,7 @@ func subdomainsAdd(args []string, stdout, stderr io.Writer) error {
 		return usagef("subdomains add: %v", err)
 	}
 	ctx := context.Background()
-	pool, err := openSubdomainsPool(ctx)
+	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains add %s: %w", label, err)
 	}
@@ -642,7 +643,7 @@ func subdomainsDisable(args []string, stdout, stderr io.Writer) error {
 		return usagef("укажите субдомен: crawlerctl subdomains disable www|бит")
 	}
 	ctx := context.Background()
-	pool, err := openSubdomainsPool(ctx)
+	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains disable %s: %w", fs.Arg(0), err)
 	}
@@ -684,7 +685,7 @@ func subdomainsRecheckCmd(args []string, stdout, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := openSubdomainsPool(ctx)
+	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains recheck %s: %w", label, err)
 	}
@@ -747,102 +748,4 @@ func validSubdomainLabel(ascii string) bool {
 		}
 	}
 	return true
-}
-
-// ---------------------------------------------------------------- zones
-
-// zonesHelp — справка crawlerctl zones [--help] и по действиям.
-const zonesHelp = `crawlerctl zones — управление зонами проверки (ТЗ 4.1)
-
-Использование:
-  crawlerctl zones list
-  crawlerctl zones enable <зона>
-  crawlerctl zones disable <зона>
-
-Зона — имя в любой форме (unicode/punycode, регистр, точка на конце),
-как каталог incoming/<зона>. Выключенная зона не проверяется, данные
-сохраняются. Реализация — задача T-084.
-`
-
-func cmdZones(args []string, stdout, stderr io.Writer) error {
-	if len(args) == 0 {
-		return usagef("укажите действие: crawlerctl zones list|enable|disable")
-	}
-	action, rest := args[0], args[1:]
-	switch action {
-	case "list":
-		return zonesList(rest, stdout, stderr)
-	case "enable", "disable":
-		return zonesToggle(action, rest, stdout, stderr)
-	case "-h", "--help", "help":
-		out(stdout, "%s", zonesHelp)
-		return flag.ErrHelp
-	default:
-		return usagef("неизвестное действие %q (допустимы: list, enable, disable)", action)
-	}
-}
-
-func zonesList(args []string, stdout, stderr io.Writer) error {
-	if handled, err := parseFlags(newFlagSet("zones list"), zonesHelp, args, stdout); handled {
-		return err
-	}
-	return notImplemented("zones list", "T-084")
-}
-
-func zonesToggle(action string, args []string, stdout, stderr io.Writer) error {
-	fs := newFlagSet("zones " + action)
-	if handled, err := parseFlags(fs, zonesHelp, args, stdout); handled {
-		return err
-	}
-	if fs.NArg() != 1 {
-		return usagef("укажите зону: crawlerctl zones %s crawl.test", action)
-	}
-	zone, err := idn.NormalizeZone(fs.Arg(0))
-	if err != nil {
-		return usagef("zones %s: некорректное имя зоны %q: %v", action, fs.Arg(0), err)
-	}
-	return notImplemented("zones "+action+" "+zone, "T-084")
-}
-
-// ---------------------------------------------------------------- recheck
-
-// recheckHelp — справка crawlerctl recheck --help.
-const recheckHelp = `crawlerctl recheck — принудительная постановка домена на проверку
-
-Использование:
-  crawlerctl recheck <домен> [домен …]
-
-Домены (одно имя или несколько) немедленно ставятся в очередь q:dns,
-не дожидаясь истечения интервала перепроверки. Это «ручные задачи»
-crawlerctl из ТЗ 4.1; реализация — задача T-084 (после планировщика
-и очереди).
-`
-
-func cmdRecheck(args []string, stdout, stderr io.Writer) error {
-	fs := newFlagSet("recheck")
-	if handled, err := parseFlags(fs, recheckHelp, args, stdout); handled {
-		return err
-	}
-	if fs.NArg() == 0 {
-		return usagef("укажите домен: crawlerctl recheck example.crawl.test")
-	}
-	names := make([]string, 0, fs.NArg())
-	for _, a := range fs.Args() {
-		res, err := idn.Normalize(a)
-		if err != nil {
-			return usagef("recheck: некорректное имя домена %q: %v", a, err)
-		}
-		names = append(names, res.ASCII)
-	}
-	return notImplemented("recheck "+summarizeNames(names), "T-084")
-}
-
-// summarizeNames сжимает список имён для сообщения-заглушки: первые три
-// полностью, остаток счётчиком (+N) — строка ошибки не простраивается.
-func summarizeNames(names []string) string {
-	const show = 3
-	if len(names) <= show {
-		return strings.Join(names, " ")
-	}
-	return fmt.Sprintf("%s (+%d)", strings.Join(names[:show], " "), len(names)-show)
 }
