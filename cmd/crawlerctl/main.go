@@ -54,7 +54,9 @@ const usageText = `crawlerctl — CLI Domain Crawler
   domain <имя> [--json] [--content]
                                 информация о домене: статус, признаки
                                 Laravel, контент (T-081)
-  subdomains list|add|disable   управление проверяемыми субдоменами (T-083)
+  subdomains list|add|disable|recheck
+                                 управление проверяемыми субдоменами
+                                 (T-083)
   zones list|enable|disable     управление зонами (T-084)
   reanalyze [--zone ИМЯ]        переанализ результатов по новым правилам (T-074)
   recheck <домен> [домен …]     принудительная постановка домена на

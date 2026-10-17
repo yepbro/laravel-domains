@@ -60,19 +60,18 @@ func TestRun(t *testing.T) {
 			inErr: "domain: "},
 		{name: "domain --help", args: []string{"domain", "--help"}, code: exitOK, inOut: "ТЗ 5.11"},
 
-		// subdomains — заглушки, код 1 с номером задачи.
+		// subdomains — функциональная команда (T-083): требует конфигурацию
+		// (БД) — путь выполнения без инфраструктуры проверяет отдельный
+		// TestRunSubdomainsExecution и субтесты subdomains_test.go; здесь —
+		// использование и справка.
 		{name: "subdomains без действия", args: []string{"subdomains"}, code: exitUsage, inErr: "укажите действие"},
-		{name: "subdomains неизвестное действие", args: []string{"subdomains", "fly"}, code: exitUsage, inErr: `допустимы: list, add, disable`},
-		{name: "subdomains list", args: []string{"subdomains", "list"}, code: exitError, inErr: "subdomains list: не реализовано (задача T-083)"},
+		{name: "subdomains неизвестное действие", args: []string{"subdomains", "fly"}, code: exitUsage, inErr: `допустимы: list, add, disable, recheck`},
 		{name: "subdomains add без метки", args: []string{"subdomains", "add"}, code: exitUsage, inErr: "укажите метку"},
-		{name: "subdomains add", args: []string{"subdomains", "add", "www"}, code: exitError, inErr: "subdomains add www: не реализовано (задача T-083)"},
-		{name: "subdomains add unicode-метка", args: []string{"subdomains", "add", "МосквА"}, code: exitError, inErr: "subdomains add xn--80adxhks: не реализовано"},
 		{name: "subdomains add пустая метка", args: []string{"subdomains", "add", ""}, code: exitUsage, inErr: "апекс"},
 		{name: "subdomains add дефис по краям (после --)", args: []string{"subdomains", "add", "--", "-bad-"}, code: exitUsage, inErr: "некорректная метка субдомена"},
 		{name: "subdomains add метка 64", args: []string{"subdomains", "add", strings.Repeat("a", 64)}, code: exitUsage, inErr: "некорректная метка субдомена"},
 		{name: "subdomains add метка с точкой", args: []string{"subdomains", "add", "a.b"}, code: exitUsage, inErr: "некорректная метка субдомена"},
-		{name: "subdomains disable без метки", args: []string{"subdomains", "disable"}, code: exitUsage, inErr: "укажите метку"},
-		{name: "subdomains disable", args: []string{"subdomains", "disable", "www"}, code: exitError, inErr: "subdomains disable www: не реализовано (задача T-083)"},
+		{name: "subdomains disable без метки", args: []string{"subdomains", "disable"}, code: exitUsage, inErr: "укажите субдомен"},
 		{name: "subdomains --help", args: []string{"subdomains", "--help"}, code: exitOK, inOut: "subdomains list"},
 		{name: "subdomains add --help", args: []string{"subdomains", "add", "--help"}, code: exitOK, inOut: "управление проверяемыми субдоменами"},
 
@@ -208,7 +207,7 @@ func TestUsageTextListsCommands(t *testing.T) {
 			t.Errorf("usageText не упоминает команду %q", name)
 		}
 	}
-	for _, want := range []string{"--json", "--content", "--zone", "--bulk", "--min-score", "--samples", "list|add|disable", "list|enable|disable"} {
+	for _, want := range []string{"--json", "--content", "--zone", "--bulk", "--min-score", "--samples", "list|add|disable|recheck", "list|enable|disable"} {
 		if !strings.Contains(usageText, want) {
 			t.Errorf("usageText не упоминает %q", want)
 		}
