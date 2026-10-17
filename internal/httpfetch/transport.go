@@ -253,8 +253,61 @@ func (f *Fetcher) CloseIdleConnections() { f.rt.CloseIdleConnections() }
 // Запрос к хосту, для которого в ctx нет адресов DNS-этапа (редирект),
 // подключается через Resolver транспорта — http.Client поверх Fetcher
 // получает резолв хостов редиректов без дополнительного кода.
+//
+// Здесь же — сжатие (T-051, ТЗ 5.5): запросу ставится Accept-Encoding
+// (gzip, br), ответ распаковывается с потолком. Хук в RoundTrip, а не
+// только в Fetch: путь http.Client поверх Fetcher (цепочка редиректов
+// T-048) идёт через этот метод и получает то же поведение. Запрос
+// клонируется — контракт RoundTrip запрещает менять чужой запрос, а
+// переиспользуемые запросы гоняются по заголовкам конкурентно.
 func (f *Fetcher) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f.rt.RoundTrip(req)
+	req = req.Clone(req.Context())
+	if req.Header.Get("Accept-Encoding") == "" {
+		req.Header.Set("Accept-Encoding", acceptEncoding)
+	}
+	resp, err := f.rt.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.decodeResponseBody(resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// decodeResponseBody распаковывает тело ответа по Content-Encoding с
+// потолком распакованного размера (защита от zip-бомб, ТЗ 5.5) и
+// вписывается в цепочку чтения: сеть → gunzip/brotli (потолок
+// MaxBodyBytes) → лимит читаемого тела T-049 → потребитель. Потолок
+// равен лимиту тела: распакованный поток и есть тело, иначе чтение до
+// конца (хэш дедупа) раздуло бы бомбу до лимита, но гигабайтами
+// распаковки. Заголовки Content-Encoding/Content-Length снимаются:
+// тело в руках уже распаковано, кодирующие заголовки лгали бы (как у
+// прозрачной распаковки net/http). Неподдерживаемая кодировка — ошибка
+// запроса: молча отдать сжатые байты телом хуже честного отказа.
+func (f *Fetcher) decodeResponseBody(resp *http.Response) error {
+	ce := resp.Header.Get("Content-Encoding")
+	if ce == "" {
+		return nil // сжатия нет — тело как есть
+	}
+	limit := f.opt.MaxBodyBytes
+	if limit <= 0 {
+		limit = defaultDecompressLimit
+	}
+	body, err := decodeContentEncoding(resp.Body, ce, limit)
+	if err != nil {
+		_ = resp.Body.Close()
+		return err
+	}
+	resp.Body = body
+	if strings.ToLower(strings.TrimSpace(ce)) != "identity" {
+		// Реальная распаковка: кодирующие заголовки лгали бы про тело
+		// в руках — снимаем (как прозрачная распаковка net/http);
+		// при identity оба остаются правдой.
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length")
+	}
+	return nil
 }
 
 // Fetch выполняет GET одного URL с подключением к заранее резолвленным
@@ -262,7 +315,8 @@ func (f *Fetcher) RoundTrip(req *http.Request) (*http.Response, error) {
 // подключение идёт к Addrs. Общий таймаут (TotalTimeout, по умолчанию
 // 20 с) покрывает запрос целиком, включая чтение тела вызывающим —
 // до закрытия Body. Ошибочный статус ответа — не ошибка Fetch (код в
-// FetchResult); error — только транспорт (сеть, таймауты, отмена ctx).
+// FetchResult); error — только транспорт (сеть, таймауты, отмена ctx,
+// неподдерживаемое Content-Encoding — см. RoundTrip).
 func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (*FetchResult, error) {
 	if r.URL == nil {
 		return nil, errors.New("httpfetch: запрос без URL")
@@ -289,8 +343,11 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (*FetchResult, erro
 		req.Header.Set("User-Agent", f.opt.UserAgent)
 	}
 
+	// Через собственный RoundTrip: Accept-Encoding (gzip, br — ТЗ 5.5)
+	// и распаковку с потолком получает и этот путь, и http.Client
+	// поверх Fetcher (цепочка редиректов T-048) — один код на оба.
 	start := time.Now()
-	resp, err := f.rt.RoundTrip(req)
+	resp, err := f.RoundTrip(req)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("httpfetch: GET %s: %w", r.URL, err)
