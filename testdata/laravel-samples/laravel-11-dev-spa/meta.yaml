@@ -1,5 +1,9 @@
 is_laravel: true
 ver_min: "11"         # реальная версия образца; вычисленный диапазон [9.19, ∞)
+score: 0.936          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
+calc_ver_min: "9.19"  # вычисленный диапазон — точные строки границ из правил ("" — границы нет)
+calc_ver_max: ""
+conflict: false
 note: "Синтетический образец (Laravel 11, dev-бокс artisan serve + npm run dev): Vite dev-сервер (@vite/client, без хэшей сборки), Sanctum CSRF-cookie, Laravel Debugbar"
 source: synthetic
 obtained: 2026-10-17

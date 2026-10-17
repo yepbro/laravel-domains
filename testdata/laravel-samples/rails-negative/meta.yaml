@@ -1,4 +1,8 @@
 is_laravel: false
+score: 0.32           # точные ожидания движка: noisy-OR(0.2, 0.15) — слабые срабатывания
+calc_ver_min: ""      # вычисленный диапазон: сработавшие правила не задают границ
+calc_ver_max: ""
+conflict: false
 note: "Негативный образец Ruby on Rails: csrf-token meta и кука _shop_session дают только слабые срабатывания (score ~0.32 < порога 0.6) — контроль ложноположительных срабатываний"
 source: synthetic
 obtained: 2026-10-17

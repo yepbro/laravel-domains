@@ -1,6 +1,10 @@
 is_laravel: true
 ver_min: "10"         # реальная версия образца; вычисленный диапазон [9.19, ∞)
 ver_max: "10.x"       # (vite_assets ver_min 9.19) должен его покрывать
+score: 0.891          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
+calc_ver_min: "9.19"  # вычисленный диапазон — точные строки границ из правил ("" — границы нет)
+calc_ver_max: ""
+conflict: false
 note: "Синтетический образец (Laravel 10 + Breeze, Blade-стек): форма входа с csrf_field (_token), Vite-сборка"
 source: synthetic
 obtained: 2026-10-17

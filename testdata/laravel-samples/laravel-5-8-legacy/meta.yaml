@@ -1,6 +1,10 @@
 is_laravel: true
 ver_min: "5.8"
 ver_max: "5.8"
+score: 0.940          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
+calc_ver_min: ""      # вычисленный диапазон — точные строки границ из правил ("" — границы нет)
+calc_ver_max: "9.x"   # mix_assets: ver_max 9.x, нижней границы ни одно правило не даёт
+conflict: false
 note: "Синтетический образец (Laravel 5.8, внутренний раздел залогиненного пользователя): window.Laravel из дефолтного layout'а, кука remember_web_<sha1>, Mix без версионирования страницы"
 source: synthetic
 obtained: 2026-10-17

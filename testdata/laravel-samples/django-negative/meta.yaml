@@ -1,4 +1,8 @@
 is_laravel: false
+score: 0.0            # точные ожидания движка: ни одно правило не срабатывает
+calc_ver_min: ""      # вычисленный диапазон без срабатываний не определён ("" = NULL)
+calc_ver_max: ""
+conflict: false
 note: "Негативный образец Django: csrf-кука с похожим смыслом, но не Laravel"
 source: synthetic
 obtained: 2026-10-16

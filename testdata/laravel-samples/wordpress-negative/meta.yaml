@@ -1,4 +1,8 @@
 is_laravel: false
+score: 0.0            # точные ожидания движка: ни одно правило не срабатывает
+calc_ver_min: ""      # вычисленный диапазон без срабатываний не определён ("" = NULL)
+calc_ver_max: ""
+conflict: false
 note: "Негативный образец WordPress: PHP-хостинг (X-Powered-By) и ?ver= у ассетов не должны давать ни одного срабатывания"
 source: synthetic
 obtained: 2026-10-17

@@ -1,4 +1,8 @@
 is_laravel: false
+score: 0.2            # точные ожидания движка: единственное слабое срабатывание 0.2
+calc_ver_min: ""      # вычисленный диапазон: сработавшее правило не задаёт границ
+calc_ver_max: ""
+conflict: false
 note: "Негативный образец: csrf-token meta есть, сессия не Laravel — ложных срабатываний быть не должно"
 source: synthetic
 obtained: 2026-10-16

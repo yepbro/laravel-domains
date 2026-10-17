@@ -1,6 +1,10 @@
 is_laravel: true
 ver_min: "9.19"        # Vite появился в Laravel 9.19
 ver_max: ""
+score: 0.883          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
+calc_ver_min: "9.19"  # вычисленный диапазон — точные строки границ из правил ("" — границы нет)
+calc_ver_max: ""
+conflict: false
 note: "Синтетический образец (Laravel 11 + Vite + Inertia) до передачи реальных образцов заказчиком"
 source: synthetic
 obtained: 2026-10-16

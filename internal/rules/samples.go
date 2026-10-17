@@ -17,7 +17,8 @@ import (
 //	headers.json — заголовки ответа, объект имя -> массив значений;
 //	cookies.json — массив {name, value, ...};
 //	meta.yaml    — is_laravel, ожидаемый диапазон версий, состав сработавших
-//	               правил (rules), примечание.
+//	               правил (rules), точные ожидания движка (score, calc_ver_*,
+//	               conflict — T-075), примечание.
 type Sample struct {
 	ID      string
 	HTML    []byte
@@ -29,16 +30,30 @@ type Sample struct {
 
 // SampleExpect — ожидания из meta.yaml (пустые поля — не проверяются).
 //
+// Две группы ожиданий:
+//
+//   - VerMin/VerMax — реальная версия образца: вычисленный движком диапазон
+//     обязан её покрывать (проверка через Result.Contains);
+//   - CalcVerMin/CalcVerMax/Score/Conflict — точные итоги движка (T-075):
+//     строки границ как в правилах ("" — границы нет, при записи в БД NULL),
+//     score — noisy-OR весов правил из Rules, округление до 3 знаков
+//     (допуск сверке задаёт тест-потребитель), Conflict — пустое
+//     пересечение диапазонов.
+//
 // Rules — полный состав сработавших правил (id) для сверки в тестах:
 // непустой список означает точное совпадение, `rules: []` — ни одно правило
 // не должно сработать, отсутствие поля — состав не проверяется.
 type SampleExpect struct {
-	IsLaravel *bool
-	VerMin    string
-	VerMax    string
-	Rules     []string
-	Note      string
-	Source    string
+	IsLaravel  *bool
+	VerMin     string
+	VerMax     string
+	CalcVerMin *string  `yaml:"calc_ver_min"`
+	CalcVerMax *string  `yaml:"calc_ver_max"`
+	Score      *float64 `yaml:"score"`
+	Conflict   bool
+	Rules      []string
+	Note       string
+	Source     string
 }
 
 type cookieJSON struct {
@@ -102,23 +117,31 @@ func loadSample(dir, id string) (Sample, error) {
 
 	if raw, err := os.ReadFile(filepath.Join(dir, "meta.yaml")); err == nil {
 		var m struct {
-			IsLaravel *bool    `yaml:"is_laravel"`
-			VerMin    string   `yaml:"ver_min"`
-			VerMax    string   `yaml:"ver_max"`
-			Rules     []string `yaml:"rules"`
-			Note      string   `yaml:"note"`
-			Source    string   `yaml:"source"`
+			IsLaravel  *bool    `yaml:"is_laravel"`
+			VerMin     string   `yaml:"ver_min"`
+			VerMax     string   `yaml:"ver_max"`
+			CalcVerMin *string  `yaml:"calc_ver_min"`
+			CalcVerMax *string  `yaml:"calc_ver_max"`
+			Score      *float64 `yaml:"score"`
+			Conflict   bool     `yaml:"conflict"`
+			Rules      []string `yaml:"rules"`
+			Note       string   `yaml:"note"`
+			Source     string   `yaml:"source"`
 		}
 		if err := yaml.Unmarshal(raw, &m); err != nil {
 			return s, fmt.Errorf("samples/%s/meta.yaml: %w", id, err)
 		}
 		s.Expect = SampleExpect{
-			IsLaravel: m.IsLaravel,
-			VerMin:    m.VerMin,
-			VerMax:    m.VerMax,
-			Rules:     m.Rules,
-			Note:      m.Note,
-			Source:    m.Source,
+			IsLaravel:  m.IsLaravel,
+			VerMin:     m.VerMin,
+			VerMax:     m.VerMax,
+			CalcVerMin: m.CalcVerMin,
+			CalcVerMax: m.CalcVerMax,
+			Score:      m.Score,
+			Conflict:   m.Conflict,
+			Rules:      m.Rules,
+			Note:       m.Note,
+			Source:     m.Source,
 		}
 	} else {
 		return s, fmt.Errorf("samples/%s: нет meta.yaml", id)
