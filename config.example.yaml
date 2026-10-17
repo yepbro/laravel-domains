@@ -66,9 +66,9 @@ render:
   restart_every_pages: 500
 
 content:
-  dir: "/data/content"
-  pack_size: "512MB"                 # рекомендация ТЗ: 512 МБ–1 ГБ
-  max_store_bytes: 2097152           # рекомендация ТЗ: 1–2 МБ
+  dir: "/data/content"                # пак-файлы pack-NNNNNN.pack (docs/content.md)
+  pack_size: "512MB"                 # порог ротации пака; рекомендация ТЗ: 512 МБ–1 ГБ
+  max_store_bytes: 2097152           # лимит одного контента; рекомендация ТЗ: 1–2 МБ
   zstd_dictionary: "/data/content/dict.zst"   # crawlerctl dict train; пусто — без словаря
 
 analyzer:
