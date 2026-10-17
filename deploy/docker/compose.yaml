@@ -521,6 +521,7 @@ services:
       - ./testdata:/testdata:ro
       - ./rules:/rules:ro
       - ./var/incoming:/data/incoming
+      - ./var/content:/data/content
     restart: "no"
     # Лимит выше, чем у сервисов: go vet/lint/test компилируют все пакеты
     # модуля, включая тяжёлые зависимости (go-redis, chromedp, prometheus).
