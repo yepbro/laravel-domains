@@ -170,7 +170,9 @@ func Run(opts Options) error {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	// /metrics — реестр Prometheus (internal/metrics): базовые метрики
-	// каркаса + коллекторы Go/runtime; метрики сервисов добавляются в него.
+	// каркаса + коллекторы Go/runtime; метрики рабочей логики добавляются
+	// фабрикой реестра (Counter/Gauge/Histogram с автометкой service,
+	// T-076; приборы этапов — T-077).
 	registry := metrics.New(opts.Name)
 	mux.Handle("/metrics", metrics.Handler(registry))
 	if opts.ExtraMux != nil {

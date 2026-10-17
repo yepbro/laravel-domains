@@ -71,10 +71,65 @@ if err := service.Run(service.Options{
 
 ## Метрики
 
-Каждый сервис получает собственный реестр Prometheus (`internal/metrics`)
-с меткой `service`: базовые `crawler_service_up` и `crawler_build_info`,
-коллекторы Go/runtime (uptime выводится из `process_start_time_seconds`).
-Метрики этапов добавляются в этот же реестр задачами этапов (T-076/T-077).
+ТЗ 5.9: HTTP-эндпоинт Prometheus на каждом сервисе. Каркас поднимает
+`/healthz` и `/metrics` на `Options.MetricsAddr` (адрес `monitor` —
+`monitor.listen` из конфигурации, ТЗ 5.10, важнее `METRICS_ADDR`; адреса
+остальных сервисов — только `METRICS_ADDR`, dev-порты `:9101`…`:9106`).
+Prometheus скрейпит каждый сервис отдельно (dev-конфиг
+`deploy/docker/prometheus/prometheus.yml`, профиль `monitoring`):
+`monitor.listen` — адрес HTTP-эндпоинта самого сервиса monitor, а не
+агрегатор чужих метрик.
+
+| Сервис | Адрес | Чем задаётся |
+|---|---|---|
+| monitor | `:9100` | `monitor.listen` (ТЗ 5.10), важнее `METRICS_ADDR` |
+| ingest | `:9101` | `METRICS_ADDR` |
+| scheduler | `:9102` | `METRICS_ADDR` |
+| dns-worker | `:9103` | `METRICS_ADDR` |
+| http-worker | `:9104` | `METRICS_ADDR` |
+| render-worker | `:9105` | `METRICS_ADDR` |
+| analyzer | `:9106` | `METRICS_ADDR` |
+
+Реестр метрик — `metrics.New(name)` (T-076): собственный
+`*prometheus.Registry` на сервис (одноимённые метрики разных сервисов не
+конфликтуют) с метриками каркаса — `crawler_service_up{service}`,
+`crawler_build_info{service,mode}` — и коллекторами Go/runtime и
+процесса (uptime выводится из `process_start_time_seconds` в PromQL).
+
+Реестр — фабрика метрик рабочей логики: `Counter`/`Gauge`/`Histogram`
+(+ `Must`-варианты) создают вектор с единой первой меткой `service` и
+возвращают его каррированным — значение `service` подставляется
+автоматически, вызывающий передаёт только значения остальных метк:
+
+```go
+tasks := registry.MustCounter(prometheus.CounterOpts{
+    Name: "crawler_stage_tasks_total",
+    Help: "Обработанные домены по этапам конвейера.",
+}, metrics.LabelStage)
+tasks.WithLabelValues("dns").Inc() // service подставится сама
+```
+
+Имена метрик начинаются с `crawler_`, счётчики — с суффиксом `_total`;
+HELP/TYPE экспортируются Prometheus из `Name`/`Help` — документация
+метрики пишется там же, где создаётся прибор. Единые имена меток —
+константы пакета: `LabelService` (вручную не передаётся), `LabelStage`
+(этап конвейера: dns/http/render/analyze), `LabelQueue` (имя очереди:
+`q:dns`/`q:http`/`q:render`/`q:analyze`/`q:dead`), `LabelType` (тип
+ошибки).
+
+Повторная регистрация идентичной метрики (то же имя, help и метки) — не
+ошибка: возвращается уже зарегистрированный вектор, поэтому конструкторы
+приборов можно вызывать многократно в тестах (прометеевский
+`AlreadyRegisteredError` не паникует; гистограммы — корзины первого
+вызова выигрывают, `Buckets` не входят в дескриптор). Конфликт описаний
+— то же имя с другим help, набором меток или типом — ошибка
+(`Must`-варианты паникуют): это программная ошибка, а не штатный
+случай. Зарезервированная метка `service` и дубликаты меток
+отклоняются ошибкой до создания вектора.
+
+Сами приборы этапов (пропускная способность по этапам, длины очередей,
+ошибки по типам, доля рендера, время ответа, глубина backlog, память
+воркеров — ТЗ 5.9) навешивают сервисы в T-077.
 
 ## Поведение заглушек
 

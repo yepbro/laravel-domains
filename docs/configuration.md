@@ -396,6 +396,11 @@ rules:
 | `listen` | `CRAWLER_MONITOR_LISTEN` | [host]:port | `:9100` |
 | `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `60s` (рекомендация: 30–60 с) |
 
+`listen` — адрес HTTP-эндпоинта самого сервиса monitor (`/healthz` +
+`/metrics`, его собственные метрики): у каждого сервиса проекта свой
+эндпоинт (ТЗ 5.9, адреса — в [`services.md`](services.md)), Prometheus
+скрейпит их по отдельности, агрегации через monitor нет.
+
 ### `log` (каркас сервисов)
 
 | YAML | Переменная | Тип | По умолчанию |
