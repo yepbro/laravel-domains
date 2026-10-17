@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -39,19 +38,15 @@ func TestRun(t *testing.T) {
 		{name: "status неизвестный флаг", args: []string{"status", "--nope"}, code: exitUsage, inErr: "status: "},
 		{name: "status --help", args: []string{"status", "--help"}, code: exitOK, inOut: "сводка по зонам"},
 
-		// domain — нормализация работает, код 0.
+		// domain — функциональная команда (T-081): требует конфигурацию
+		// (PostgreSQL, для --content — каталог контента); путь выполнения
+		// без инфраструктуры — TestRunDomain в domain_test.go, здесь —
+		// использование и справка.
 		{name: "domain без имени", args: []string{"domain"}, code: exitUsage, inErr: "укажите имя домена"},
 		{name: "domain два имени", args: []string{"domain", "a.test", "b.test"}, code: exitUsage, inErr: "укажите имя домена"},
-		{name: "domain", args: []string{"domain", "example.crawl.test"}, code: exitOK,
-			inOut: "punycode:   example.crawl.test", noOut: `{"ascii"`},
-		{name: "domain нормализация входа", args: []string{"domain", "Example.CRAWL.TEST."}, code: exitOK,
-			inOut: "punycode:   example.crawl.test"},
-		{name: "domain зона и метка", args: []string{"domain", "пример.crawl.test"}, code: exitOK,
-			inOut: "punycode:   xn--e1afmkfd.crawl.test"},
-		{name: "domain --json", args: []string{"domain", "--json", "Example.CRAWL.test."}, code: exitOK, inOut: `"zone":"test"`}, // полный разбор полей — TestRunDomainJSON
-		{name: "domain --content", args: []string{"domain", "--content", "example.crawl.test"}, code: exitOK,
-			inOut: "контент (--content)", noOut: `"ascii"`},
-		{name: "domain невалидное имя", args: []string{"domain", "bad!!name.test"}, code: exitUsage,
+		{name: "domain --json --content несовместимы", args: []string{"domain", "--json", "--content", "x.crawl.test"},
+			code: exitUsage, inErr: "несовместимы"},
+		{name: "domain невалидное имя (до конфигурации)", args: []string{"domain", "bad!!name.test"}, code: exitUsage,
 			inErr: "некорректное имя домена"},
 		{name: "domain help первым аргументом", args: []string{"domain", "help"}, code: exitOK, inOut: "crawlerctl domain"},
 		{name: "domain help после флага — позиционный аргумент", args: []string{"domain", "--json", "help"},
@@ -174,29 +169,6 @@ func TestRunReanalyze(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Errorf("stdout до соединения не пуст:\n%s", stdout.String())
-	}
-}
-
-// TestRunDomainJSON — машинный вывод domain: json разбирается и содержит
-// поля нормализации (заготовка T-081).
-func TestRunDomainJSON(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"domain", "--json", "Example.CRAWL.test."}, &stdout, &stderr)
-	if code != exitOK {
-		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitOK, stderr.String())
-	}
-	var got struct {
-		ASCII   string `json:"ascii"`
-		Unicode string `json:"unicode"`
-		Zone    string `json:"zone"`
-		Label   string `json:"label"`
-		IsIDN   bool   `json:"is_idn"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("вывод не json: %v;\n%s", err, stdout.String())
-	}
-	if got.ASCII != "example.crawl.test" || got.Zone != "test" || got.Label != "example.crawl" {
-		t.Errorf("поля нормализации: %+v", got)
 	}
 }
 
