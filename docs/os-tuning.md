@@ -253,6 +253,7 @@ allow), ломает NAT — несовместимо с Docker-хостами. 
 ss -tan state time-wait | wc -l          # рост к tcp_max_tw_buckets — пересчитать churn
 cat /proc/sys/net/netfilter/nf_conntrack_count   # рост к max — пересчитать таблицу
 cat /proc/sys/fs/file-nr                 # first column → к fs.file-max
+journalctl -t smartd -p warning          # SMART/TBW накопителя (T-089, docs/disks.md)
 dmesg | grep -E "table full|time wait bucket"    # должно быть пусто
 awk '{print $2}' /proc/net/softnet_stat | sort | uniq -c | tail   # дропы RX = 0
 ```

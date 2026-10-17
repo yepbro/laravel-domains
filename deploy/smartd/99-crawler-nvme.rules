@@ -1,0 +1,16 @@
+# Domain Crawler — доступ юнита crawler-monitor к NVMe (T-089, ТЗ §10.3).
+#
+# Алерт износа monitor (internal/monitor/alerts.go, T-080) читает health-лог
+# ioctl-ом NVME_IOCTL_ADMIN_CMD; ioctl требует открытия char-узла контроллера
+# (/dev/nvme0) на запись. Дефолт ядра — root:root 0600: правило отдаёт узлы
+# контроллеров выделенной группе nvme-smart, которую юниту добавляет drop-in
+# crawler-monitor.service.d/90-nvme-smart.conf (SupplementaryGroups).
+#
+# Отдельная группа вместо существующей disk: доступ ровно к узлам NVMe,
+# без прав на прочие блочные устройства. Право записи на узел — требование
+# ядра к admin-командам; фактически выполняются только чтения журналов.
+#
+# Установка (docs/disks.md, deploy/smartd/README.md):
+#   install -m 0644 99-crawler-nvme.rules /etc/udev/rules.d/
+#   udevadm control --reload && udevadm trigger --subsystem-match=nvme
+SUBSYSTEM=="nvme", KERNEL=="nvme[0-9]*", GROUP="nvme-smart", MODE="0660"

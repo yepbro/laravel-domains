@@ -118,10 +118,15 @@ dev-сервиса chromium, docs/docker.md §6).
 исключение — сборка бинарников (4.2): от обычного пользователя, установка
 в `/opt` — с `sudo`.
 
+До пакетов и пользователей выполняется **раскладка дисков**
+([`disks.md`](disks.md) §4): тома `/var/lib/postgresql` и
+`/var/lib/crawler/content` монтируются до `apt install postgresql` —
+кластер пакета создаётся сразу в точке монтирования, а не на корневой ФС.
+
 ### 4.1. Пакеты ОС
 
 ```bash
-apt install postgresql redis-server unbound
+apt install postgresql redis-server unbound smartmontools
 ```
 
 Drop-in'ы бюджета (копируются каталогами — имя каталога = имя юнита):
@@ -240,6 +245,15 @@ redis-server unbound`.
 «Жизненный цикл»). Первым поднявшийся сервис накатывает схему, остальные
 ждут блокировку и видят актуальную версию. Порядок включения юнитов не важен.
 
+### 4.8. Мониторинг SMART/TBW накопителя
+
+Комплект `deploy/smartd/` (T-089, ТЗ §10.3): конфиг smartd (critical
+warning, рост журнала ошибок, температура), обработчик предупреждений в
+syslog/journald и доступ алерту износа сервиса monitor к `/dev/nvme*`
+(udev-группа `nvme-smart` + drop-in юнита). Установка, проверка и откат —
+[`deploy/smartd/README.md`](../deploy/smartd/README.md); обоснование,
+оценка TBW от нагрузки и связь слоёв — [`disks.md`](disks.md).
+
 ## 5. Эксплуатация
 
 ```bash
@@ -278,6 +292,10 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
   установленный на сервере Prometheus (его юнит — инфраструктура оператора,
   вне комплекта; конфиг джобов — как
   `deploy/docker/prometheus/prometheus.yml`, адреса хостовые).
+- **SMART/TBW накопителя**: предупреждения smartd и алерта monitor — в
+  journald (`journalctl -t smartd -p warning`), живые показания —
+  `smartctl -H -A /dev/nvme0` (percentage_used, TBW). Детали —
+  [`disks.md`](disks.md) «Мониторинг SMART и TBW».
 
 ## 6. Границы комплекта (смежные задачи этапа 9)
 
@@ -289,6 +307,7 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
   `fs.file-max`/`nr_open`, `nf_conntrack`, UDP-буферы). Юниты фиксируют
   только per-process `LimitNOFILE=65535` — паритет с dev-окружением
   (`deploy/docker/compose.yaml`, ulimits), потолок sysctl ведёт T-088.
-- **T-089** — диски (тома PG и контента) и SMART: мониторинг износа NVMe
-  потребует доступа юнита `crawler-monitor` к `/dev/nvme*` (udev-правило или
-  supplementary-группа; сейчас алерт износа честно «не измеряется»).
+- **T-089** — диски и SMART — [`disks.md`](disks.md): тома PostgreSQL
+  (`/var/lib/postgresql`) и контента (`/var/lib/crawler/content`) —
+  LVM/ext4/`noatime`, шаг установки §4 выше; мониторинг износа NVMe —
+  smartd + доступ юнита monitor к `/dev/nvme*` (`deploy/smartd/`, §4.8).

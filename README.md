@@ -41,6 +41,8 @@ Redis как транспорт очередей задач и его конфи
 [`docs/analyzer.md`](docs/analyzer.md).
 Тюнинг ОС боевого сервера (sysctl: эфемерные порты, TIME_WAIT, nofile,
 conntrack, UDP-буферы DNS — ТЗ §10.2): [`docs/os-tuning.md`](docs/os-tuning.md).
+Диски боевого сервера (тома PostgreSQL и контента, SMART/TBW — ТЗ §10.3):
+[`docs/disks.md`](docs/disks.md).
 Список команд: `make help`.
 
 ## CI
@@ -69,6 +71,7 @@ conntrack, UDP-буферы DNS — ТЗ §10.2): [`docs/os-tuning.md`](docs/os-
 | `deploy/docker/` | Compose-окружение, Dockerfile'ы, конфиги, testbed |
 | `deploy/systemd/` | Боевой деплой на целевом сервере: systemd-юниты сервисов, drop-in'ы бюджета пакетов ОС, окружение ([docs/deploy.md](docs/deploy.md)) |
 | `deploy/sysctl/` | Тюнинг ядра боевого сервера (ТЗ §10.2): `99-crawler.conf` для `/etc/sysctl.d` + инструкция применения; расчёты — [docs/os-tuning.md](docs/os-tuning.md) |
+| `deploy/smartd/` | Мониторинг SMART/TBW NVMe (ТЗ §10.3): конфиг smartd, обработчик предупреждений в syslog/journald, udev-правило и drop-in доступа алерта monitor к `/dev/nvme*`; расчёты — [docs/disks.md](docs/disks.md) |
 | `migrations/` | Миграции PostgreSQL (golang-migrate): встраиваются в бинарники и применяются сервисами при старте |
 | `rules/` | Правила обнаружения Laravel (перезагрузка по SIGHUP) |
 | `testdata/laravel-samples/` | Корпус образцов страниц (позитивные/негативные) |
