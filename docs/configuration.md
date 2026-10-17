@@ -396,6 +396,11 @@ rules:
 | `listen` | `CRAWLER_MONITOR_LISTEN` | [host]:port | `:9100` |
 | `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `60s` (рекомендация: 30–60 с) |
 
+`listen` — адрес healthz/metrics сервиса `monitor`; `zone_stats_interval` —
+период пакетного пересчёта счётчиков прогресса зон
+`zones.domains_total` / `domains_checked` (T-078; семантика —
+[`services.md`](services.md)).
+
 ### `log` (каркас сервисов)
 
 | YAML | Переменная | Тип | По умолчанию |
