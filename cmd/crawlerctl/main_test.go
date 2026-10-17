@@ -4,8 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"crawler/internal/content"
 )
 
 // runCase — сценарий TestRun: аргументы CLI, ожидаемый код возврата и
@@ -94,6 +99,19 @@ func TestRun(t *testing.T) {
 		{name: "recheck невалидное имя", args: []string{"recheck", "ok.crawl.test", "bad!!name"}, code: exitUsage, inErr: "некорректное имя домена"},
 		{name: "recheck --help", args: []string{"recheck", "--help"}, code: exitOK, inOut: "принудительная постановка"},
 
+		// dict — обучение словаря zstd (T-043).
+		{name: "dict без действия", args: []string{"dict"}, code: exitUsage, inErr: "укажите действие"},
+		{name: "dict неизвестное действие", args: []string{"dict", "fly"}, code: exitUsage, inErr: `допустимы: train`},
+		{name: "dict --help", args: []string{"dict", "--help"}, code: exitOK, inOut: "словарём сжатия zstd"},
+		{name: "dict train --help", args: []string{"dict", "train", "--help"}, code: exitOK, inOut: "crawlerctl dict"},
+		{name: "dict train без файла", args: []string{"dict", "train"}, code: exitUsage, inErr: "укажите выходной файл"},
+		{name: "dict train два позиционных", args: []string{"dict", "train", "a.zst", "b.zst"}, code: exitUsage,
+			inErr: "укажите выходной файл"},
+		{name: "dict train несуществующие образцы", args: []string{"dict", "train", "d.zst", "--samples", "/nonexistent"},
+			code: exitError, inErr: "dict train:"},
+		{name: "dict train неизвестный флаг", args: []string{"dict", "train", "--nope", "d.zst"}, code: exitUsage,
+			inErr: "dict train: "},
+
 		// dev-команды: роутинг и справка (функциональные тесты — у самих команд).
 		{name: "seed --help", args: []string{"seed", "--help"}, code: exitOK, inOut: "crawlerctl seed"},
 		{name: "seed несуществующий сценарий", args: []string{"seed", "--scenarios", "/nonexistent/scenarios.yaml"},
@@ -152,7 +170,7 @@ func TestUsageTextListsCommands(t *testing.T) {
 			t.Errorf("usageText не упоминает команду %q", name)
 		}
 	}
-	for _, want := range []string{"--json", "--content", "--zone", "--bulk", "--min-score", "list|add|disable", "list|enable|disable"} {
+	for _, want := range []string{"--json", "--content", "--zone", "--bulk", "--min-score", "--samples", "list|add|disable", "list|enable|disable"} {
 		if !strings.Contains(usageText, want) {
 			t.Errorf("usageText не упоминает %q", want)
 		}
@@ -261,5 +279,78 @@ func TestSummarizeNames(t *testing.T) {
 		if got := summarizeNames(tc.in); got != tc.want {
 			t.Errorf("summarizeNames(%q) = %q, хочу %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// dictTrainSamplePages — детерминированные HTML-образцы для функционального
+// теста команды: общий шаблон + уникальные вставки (как в internal/content).
+func dictTrainSamplePages(n int) []string {
+	pages := make([]string, n)
+	for i := 0; i < n; i++ {
+		pages[i] = fmt.Sprintf(
+			"<!DOCTYPE html><html><head><title>site %d</title></head>"+
+				"<body><header class=\"site-header\">шапка парковки</header>"+
+				"<main><p>уникальный текст страницы %d</p></main>"+
+				"<footer class=\"site-footer\">продаётся: admin@example.invalid</footer>"+
+				"</body></html>", i, i)
+	}
+	return pages
+}
+
+// TestRunDictTrain — сквозной прогон команды: образцы → словарь в файле,
+// код 0; словарь валиден и распаковывается (content.NewDict).
+func TestRunDictTrain(t *testing.T) {
+	dir := t.TempDir()
+	samples := filepath.Join(dir, "samples")
+	if err := os.MkdirAll(samples, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i, page := range dictTrainSamplePages(10) {
+		if err := os.WriteFile(filepath.Join(samples, fmt.Sprintf("page%02d.html", i)), []byte(page), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Не-HTML файл — игнорируется сборщиком образцов.
+	if err := os.WriteFile(filepath.Join(samples, "meta.yaml"), []byte("id: x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dictPath := filepath.Join(dir, "dict.zst")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"dict", "train", dictPath, "--samples", samples}, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitOK, stderr.String())
+	}
+	outStr := stdout.String()
+	// meta.yaml не входит: сборщик берёт только *.html/*.htm.
+	for _, want := range []string{"файлов-образцов 10 из 10", "словарь обучен", "словарь записан"} {
+		if !strings.Contains(outStr, want) {
+			t.Errorf("stdout не содержит %q:\n%s", want, outStr)
+		}
+	}
+
+	raw, err := os.ReadFile(dictPath)
+	if err != nil {
+		t.Fatalf("файл словаря не создан: %v", err)
+	}
+	d, err := content.NewDict(raw)
+	if err != nil {
+		t.Fatalf("словарь невалиден: %v", err)
+	}
+	page := dictTrainSamplePages(101)[100] // новая страница, не из обучающих
+	if _, err := d.Decompress(d.Compress([]byte(page))); err != nil {
+		t.Errorf("roundtrip со словарём команды: %v", err)
+	}
+
+	// Каталог без HTML — ошибка выполнения (код 1), не использования.
+	empty := filepath.Join(dir, "empty")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"dict", "train", dictPath, "--samples", empty}, &stdout, &stderr)
+	if code != exitError || !strings.Contains(stderr.String(), "нет HTML-образцов") {
+		t.Errorf("пустой каталог: код = %d, stderr:\n%s", code, stderr.String())
 	}
 }

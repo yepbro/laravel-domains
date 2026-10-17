@@ -69,7 +69,7 @@ content:
   dir: "/data/content"
   pack_size: "512MB"                 # рекомендация ТЗ: 512 МБ–1 ГБ
   max_store_bytes: 2097152           # рекомендация ТЗ: 1–2 МБ
-  zstd_dictionary: "/data/content/dict.zst"   # пусто — без словаря
+  zstd_dictionary: "/data/content/dict.zst"   # crawlerctl dict train; пусто — без словаря
 
 analyzer:
   rules_dir: "/etc/crawler/rules"    # YAML-правила Laravel (ТЗ 5.8)

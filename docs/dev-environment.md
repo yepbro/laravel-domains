@@ -193,7 +193,22 @@ crawlerctl zones list|enable|disable     # управление зонами (T-
 crawlerctl reanalyze [--zone ИМЯ]        # переанализ по новым правилам (T-074)
 crawlerctl recheck <домен> [домен …]     # принудительная постановка домена
                                          # на проверку (T-084)
+crawlerctl dict train <файл> [--samples ПУТЬ]…
+                                         # обучение/переобучение словаря
+                                         # сжатия zstd (ТЗ 5.7)
 crawlerctl seed / test-rules             # dev-команды (make seed, make test-rules)
+```
+
+Обучение словаря сжатия контента (ТЗ 5.7): `--samples` — файл или каталог
+с `*.html`/`*.htm` (по умолчанию `testdata/laravel-samples`; флаг можно
+повторять, образцы читаются до лимита корпуса 64 МиБ). Словарь записывается
+атомарно и подключается конфигурацией `content.zstd_dictionary`; страницы,
+сжатые прежним словарём, для чтения требуют прежний словарь. Пример
+(словарь — в каталоге данных dev-окружения):
+
+```
+docker compose run --rm -v "$(pwd)/var/content:/out tools \
+    go run ./cmd/crawlerctl dict train /out/dict.zst --samples testdata/laravel-samples
 ```
 
 Через make: `make status`, `make domain NAME=example.crawl.test`,
