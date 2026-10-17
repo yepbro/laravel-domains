@@ -6,14 +6,16 @@
 // кодировки T-051, честный UA T-052), параллельно внутри задачи с общим
 // кэшем «итоговый URL → результат» (ТЗ 5.5 п. 6); вариант-логика T-054,
 // алиасы T-055, SPA-эвристика T-057 — internal/httpworker (T-053).
-// Подтверждение q:http — паттерном Processing (T-025): XACK после
-// полного цикла обработки домена; запись результата в БД и публикация
-// q:render/q:analyze — T-058/T-067, точка подключения — хук
-// Options.OnResult (вызывается до XACK). Хосты редиректов резолвятся
-// «через тот же резолвер» (ТЗ 5.5 п. 2): dnsclient с лимитами T-035 →
-// адаптер httpworker.DNSLookup → кэш CachingResolver. Каркас —
-// internal/service: миграции, пул БД, /healthz и /metrics, graceful
-// shutdown.
+// Контент оригинальных записей сохраняется в ContentStore (T-056: паки
+// T-042, словарь zstd T-043, дедуп по хэшу §8; контроль диска T-046 —
+// DiskWatchLoop) в хуке Options.OnResult — до XACK и до будущей записи
+// результата T-058 (ТЗ 4.2). Подтверждение q:http — паттерном Processing
+// (T-025): XACK после полного цикла обработки домена; публикация
+// q:render/q:analyze — T-058/T-067, той же точкой подключения. Хосты
+// редиректов резолвятся «через тот же резолвер» (ТЗ 5.5 п. 2): dnsclient
+// с лимитами T-035 → адаптер httpworker.DNSLookup → кэш CachingResolver.
+// Каркас — internal/service: миграции, пул БД, /healthz и /metrics,
+// graceful shutdown.
 package main
 
 import (
@@ -27,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/config"
+	"crawler/internal/content"
 	"crawler/internal/dnsclient"
 	"crawler/internal/httpfetch"
 	"crawler/internal/httpworker"
@@ -43,10 +46,12 @@ func main() {
 	logger := service.NewLogger("http-worker", cfg)
 
 	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
-	// готов до старта OnRun: postgres.dsn обязателен (config.Validate).
+	// готов до старта OnRun: postgres.dsn обязателен (config.Validate);
+	// им пользуется и хранилище контента (строки contents, T-042/T-056).
 	// Записи результатов в БД пока нет (T-058 подключит её хуком
-	// Options.OnResult до XACK) — пул держится сборкой сервиса, чтобы
-	// добавление записи не меняло окружение.
+	// Options.OnResult до XACK, вслед за сохранением контента T-056) —
+	// пул держится сборкой сервиса, чтобы добавление записи не меняло
+	// окружение.
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "http-worker",
@@ -63,10 +68,12 @@ func main() {
 // run — рабочая логика http-worker: клиент DNS (резолв хостов редиректов,
 // ТЗ 5.5 п. 2) под лимитами T-035 → транспорт httpfetch с лимитами T-049
 // и TLS без проверки сертификата (ТЗ 5.5 п. 3: контент нужен всегда,
-// результат проверки сертификата сохраняет TLSInfo T-050) → воркер
-// (кэш итоговых URL, варианты, алиасы, SPA) → цикл q:http. Завершение —
-// отмена ctx (graceful shutdown, ТЗ 3.4): начатые задачи дорабатывают
-// или возвращаются очереди повторной доставкой (Processing, T-025).
+// результат проверки сертификата сохраняет TLSInfo T-050) → хранилище
+// контента (T-056: паки T-042 + словарь T-043 + контроль диска T-046) →
+// воркер (кэш итоговых URL, варианты, алиасы, SPA, сохранение контента
+// в OnResult) → цикл q:http. Завершение — отмена ctx (graceful
+// shutdown, ТЗ 3.4): начатые задачи дорабатывают или возвращаются
+// очереди повторной доставкой (Processing, T-025).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) error {
 	if pool == nil {
 		return errors.New("http-worker: пул БД не получен (postgres.dsn обязателен)")
@@ -94,9 +101,57 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	fetcher := httpfetch.NewFetcher(opts)
 	defer fetcher.CloseIdleConnections()
 
+	// Хранилище контента (T-056, ТЗ 5.7): словарь zstd (T-043)
+	// активируется до открытия — блоки сжимаются активным словарём
+	// (CompressWithDict), его ID попадает в заголовок создаваемых паков;
+	// отсутствующий файл — не ошибка (сжатие без словаря). Лимиты —
+	// секция content: max_store_bytes (ErrTooLarge), disk_free_percent
+	// (ErrStoreFull, ТЗ 8), pack_size (ротация).
+	if _, err := content.SetDictFile(cfg.Content.ZstdDictionary, logger); err != nil {
+		return err
+	}
+	store, err := content.OpenPackStore(pool, content.PackOptions{
+		Dir:             cfg.Content.Dir,
+		PackSize:        cfg.Content.PackSize.B(),
+		MaxStoreBytes:   cfg.Content.MaxStoreBytes.B(),
+		DiskFreePercent: cfg.Content.DiskFreePercent,
+		// OnStoreFull — хук алерта T-080 (метрики): до него события
+		// «место ниже порога» видны в Warn-логах DiskWatchLoop и
+		// ContentSaver.
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	// Контроль свободного места каталога контента (T-046, ТЗ 8):
+	// периодический наблюдатель горутиной (не зависит от цикла задач),
+	// Warn и событие при входе в паузу записи/восстановлении; завершается
+	// с отменой ctx.
+	go func() { _ = content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger}) }()
+
+	saver, err := httpworker.NewContentSaver(store, logger)
+	if err != nil {
+		return err
+	}
+
 	opts2 := httpworker.Options{
 		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — не следовать (T-006/T-048)
 		Log:          logger,
+		// Сохранение контента (T-056) — внутри обработки задачи, до XACK
+		// и до будущей записи результата (T-058, ТЗ 4.2): сбой сохранения
+		// — доставка без подтверждения, повторная доставка переиграет
+		// сохранение (лишние ссылки Put безопасны по ТЗ 3.4 — новых
+		// байтов дедуп не пишет).
+		OnResult: func(c context.Context, res *httpworker.DomainResult) error {
+			if err := saver.Save(c, res); err != nil {
+				return err
+			}
+			// T-058: запись subdomain_results (content_hash — только
+			// сохранённый контент), статус alive/no_http, публикация
+			// q:render/q:analyze.
+			return nil
+		},
 	}
 	w, err := httpworker.New(httpworker.ChainFetch(fetcher), opts2)
 	if err != nil {

@@ -15,10 +15,14 @@
 // Run до подтверждения XACK: при добавлении T-058 запись встанет туда и
 // порядок «XACK только после записи результата в БД» (ТЗ 4.2) сохранится.
 //
-// Тела страниц держатся в памяти только в пределах обработки одной
-// проверки (чтение → UTF-8 → хэш → SPA-вердикт → байты отбрасываются):
-// сохранение контента в хранилище — T-056, для него нужны хэши
-// (content.HashOf над UTF-8-нормализованным телом), а не сами тела.
+// Тела страниц (UTF-8, T-051) удерживаются в памяти до конца задачи
+// домена: в фазе проверок — по одному экземпляру на скачанную страницу
+// (кэш итоговых URL), после разметки алиасов — только у записей-
+// оригиналов (Record.Body, StoreContent от T-055); сохранение контента
+// в ContentStore — ContentSaver (store.go, T-056), после него байты
+// отбрасываются. Потолок тела — max_body_bytes (2 МиБ, ТЗ 5.5), страниц
+// в задаче не больше 2 × субдомены ≤ 126 (§5.10) — память задачи
+// ограничена; DefaultConcurrency учитывает её при выборе окна задач.
 package httpworker
 
 import (
@@ -165,9 +169,10 @@ func workerCacheKey(u *url.URL) string {
 	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Hostname()) + path
 }
 
-// workerPage — скачанная страница (итог цепочки) в кэше: всё, кроме тела —
-// хэш и SPA-вердикт вычислены при чтении, байты больше не нужны (хранение
-// контента — T-056).
+// workerPage — скачанная страница (итог цепочки) в кэше: хэш и SPA-вердикт
+// вычислены при чтении; тело (UTF-8) удерживается до конца задачи — его
+// заберёт запись-оригинал для сохранения контента (Record.Body, T-056),
+// кэш-попадания делят те же байты (одна копия на скачанную страницу).
 type workerPage struct {
 	final     *url.URL
 	status    int
@@ -175,6 +180,7 @@ type workerPage struct {
 	cookies   []*http.Cookie
 	tls       *httpfetch.TLSInfo
 	hash      *content.Hash
+	body      []byte
 	charset   string
 	truncated bool
 	spa       *httpfetch.SPAVerdict
@@ -259,6 +265,13 @@ type SchemeCheck struct {
 	Truncated bool
 	// Charset — каноническое имя кодировки ответа (ToUTF8, T-051).
 	Charset string
+	// Body — тело итоговой страницы в UTF-8 (T-051): те же байты, от
+	// которых вычислен ContentHash (content.HashOf). Удерживается до
+	// конца задачи домена — запись-оригинал (StoreContent, T-055)
+	// переносит его в Record.Body для сохранения в хранилище (T-056);
+	// после разметки алиасов проверки без оригинальных записей тело
+	// отпускают. nil — тела нет (ошибка загрузки, обрыв чтения).
+	Body []byte
 	// SPA — вердикт эвристики по телу (DetectSPA, T-057); nil при ошибке
 	// загрузки. Публикацию q:render по нему сделает T-058.
 	SPA *httpfetch.SPAVerdict
@@ -299,6 +312,20 @@ type Record struct {
 	Truncated   bool
 	Charset     string
 	SPA         *httpfetch.SPAVerdict
+	// Body — тело проверки-источника в UTF-8 (те же байты, от которых
+	// вычислен ContentHash): заполняется у записей-оригиналов с хэшем
+	// без обрезки — ContentSaver (T-056) пишет его в ContentStore.Put
+	// и отбрасывает. nil — тело записи не положено (алиас, обрезанное
+	// тело, контента нет) либо сохранение уже выполнено.
+	Body []byte
+	// ContentNotStored — тело получено (хэш вычислен), но контент НЕ
+	// сохранён: переполнение диска (ErrStoreFull, ТЗ 8), лимит
+	// max_store_bytes (ТЗ 5.5) или обрезка тела потолком max_body_bytes.
+	// Запись живёт с content_hash = NULL: content_hash — ссылка на
+	// contents (§6.1), без блока в хранилище строки нет; повторная
+	// проверка домена (recheck, T-030) скачает страницу и сохранит.
+	// У алиасов не ставится: их контент — в записи-оригинале (T-055).
+	ContentNotStored bool
 	// AliasKind, AliasSubdomainID, StoreContent — решение DetectAliases
 	// (T-055): вид связи с субдоменом-оригиналом и признак «контент
 	// хранится один раз у оригинала» (само сохранение — T-056).
@@ -379,10 +406,12 @@ const (
 	// экземпляр в цикле Run. Скромное число против http.concurrency=2000:
 	// глобальный потолок соединений и RPS держит транспорт (T-049,
 	// Options.Limits — семафор GlobalConns), задачи лишь заполняют его;
-	// каждая задача держит в памяти результат домена (заголовки и хэши,
-	// тела не хранятся) — 64 задачи ≈ единицы МБ. Масштабирование
-	// нагрузки — инстансами (ТЗ 4.1 «масштабируется количеством горутин
-	// и процессов»), потолок поднимается Options.Concurrency.
+	// каждая задача держит в памяти результат домена — заголовки, хэши
+	// и до сохранения контента (T-056) тела записей-оригиналов (≤ 2 МиБ
+	// каждое, оригиналов ≤ записей ≤ 126) — типичная задача единицы МБ.
+	// Масштабирование нагрузки — инстансами (ТЗ 4.1 «масштабируется
+	// количеством горутин и процессов»), потолок поднимается
+	// Options.Concurrency.
 	DefaultConcurrency = 64
 
 	// DefaultConsume — записей q:http за одно чтение: меньше
@@ -658,6 +687,28 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 		rec.AliasSubdomainID = ar.AliasSubdomainID
 		rec.StoreContent = ar.StoreContent
 	}
+
+	// Тела оригиналов (T-056): запись-оригинал класса несёт тело для
+	// сохранения в ContentStore (ContentSaver.Save); алиасы, записи без
+	// контента и обрезанные тела (хэш усечённых байт врал бы при дедупе,
+	// частичность уже отмечена Truncated, T-049) тела не получают. После
+	// разметки тела проверок отпускаются — Record.Body остаётся
+	// единственным владельцем, в памяти только тела оригиналов.
+	for i := range res.Subdomains {
+		sub := &res.Subdomains[i]
+		for j := range sub.Records {
+			r := &sub.Records[j]
+			if r.StoreContent && r.ContentHash != nil && !r.Truncated {
+				src := &sub.HTTPS
+				if r.Scheme == model.SchemeHTTP {
+					src = &sub.HTTP
+				}
+				r.Body = src.Body
+			}
+		}
+		sub.HTTPS.Body = nil
+		sub.HTTP.Body = nil
+	}
 	return res, nil
 }
 
@@ -708,6 +759,7 @@ func (w *Worker) checkScheme(
 		check.ContentHash = page.hash
 		check.Truncated = page.truncated
 		check.Charset = page.charset
+		check.Body = page.body
 		check.SPA = page.spa
 		return check
 	}
@@ -780,6 +832,7 @@ func (w *Worker) checkScheme(
 	check.Charset = cs.Charset
 	hash := content.HashOf(cs.UTF8)
 	check.ContentHash = &hash
+	check.Body = cs.UTF8
 	spa := httpfetch.DetectSPA(cs.UTF8)
 	check.SPA = &spa
 
@@ -792,6 +845,7 @@ func (w *Worker) checkScheme(
 		cookies:   check.Cookies,
 		tls:       check.TLS,
 		hash:      check.ContentHash,
+		body:      check.Body,
 		charset:   check.Charset,
 		truncated: check.Truncated,
 		spa:       check.SPA,
