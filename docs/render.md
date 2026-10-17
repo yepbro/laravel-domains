@@ -2,9 +2,9 @@
 
 Пакет `internal/render` (T-061) — управление **одним** Chromium на воркер и
 параллельный рендер страниц в изолированных контекстах. Блокировка
-ресурсов (T-062) и ожидание готовности страницы (T-063) описаны ниже;
-съём итогового DOM/cookies (T-064), перезапуск браузера (T-065) и цикл
-очередей (T-066/T-067) строятся поверх описанного здесь API.
+ресурсов (T-062), ожидание готовности страницы (T-063) и съём итогового
+DOM/cookies/заголовков (T-064) описаны ниже; перезапуск браузера (T-065)
+и цикл очередей (T-066/T-067) строятся поверх описанного здесь API.
 
 ## Один браузер, два режима
 
@@ -64,11 +64,34 @@ IndexedDB, service workers) и одна вкладка `about:blank`.
 (`ErrClosed` → повторная доставка уровнем очереди), текущие дорабатываются
 (каждая ограничена `render.timeout`), затем останавливается браузер.
 
-Задача и результат — `RenderTask{URL}` и `RenderOutput{FinalURL, Title}`
-(пока минимальный съём T-061; итоговый DOM и все cookies добавит T-064
-полями). User-Agent страниц — единый идентифицируемый UA краулера
-`http.user_agent` (ТЗ §9; в секции render ТЗ 5.10 отдельного поля нет):
-применяется к вкладке через `Emulation.setUserAgentOverride`.
+Задача и результат — `RenderTask{URL}` и `RenderOutput`: итоговый URL
+(включая JS-редиректы, которых HTTP-этап не видит), `Title`,
+итоговый `DOM`, `Cookies` и `ResponseHeaders` (T-064, ниже). User-Agent
+страниц — единый идентифицируемый UA краулера `http.user_agent` (ТЗ §9; в
+секции render ТЗ 5.10 отдельного поля нет): применяется к вкладке через
+`Emulation.setUserAgentOverride`.
+
+## Съём результата (T-064)
+
+Финальный этап `Session.Run` после перехода (`extract.go`; ТЗ 5.6 «Результат:
+итоговый DOM (`document.documentElement.outerHTML`) и все cookies (включая
+выставленные JS) через CDP», §11.4 п. 3):
+
+| Что | Как | Почему |
+|---|---|---|
+| итоговый DOM | `chromedp.Evaluate` выражения `document.documentElement.outerHTML` | сериализация живого дерева после дорисовки JS тем же HTML-сериализатором Chrome, что отдаёт «сохранить страницу»: формат идентичен сыровму HTML — прямо в хранилище (T-067) и в правила по HTML/meta (T-068) без преобразований; `DOM.getFlattenedDocument` (дерево узлов с nodeId, требует посереди `DOM.getOuterHTML`) отвергнут |
+| все cookies | CDP `Network.getCookies` с URL итоговой страницы | читает хранилище cookies изолированного контекста, а не `document.cookie` — видны httpOnly и выставленные JS. `Network.getAllCookies` из актуального протокола удалён (в cdproto v0.157.8 команды нет); `Network.getCookies` над сессией вкладки — то же хранилище, а явный URL даёт набор «cookies этой страницы» без subframe-шума |
+| заголовки ответа | `chromedp.NavigateResponse` (ответ основной навигации из `Network.responseReceived`) | ТЗ 5.8 — правила по заголовкам: у отрендеренной страницы итоговый документ не обязан совпадать со снятым HTTP-этапом. Chromedp сам ведёт цепочку loader/request через редиректы — подписки на события не нужны. Формат `http.Header` — единый контракт с HTTP-этапом (T-058) |
+
+`Cookies` — `[]ExtractCookie`: форма записи повторяет cookie HTTP-этапа
+(`subdomain_results.cookies`, T-058: `name`/`value` — цели правил ТЗ 5.8,
+`path`/`domain`/`expires` RFC 3339 UTC/`secure`/`http_only`/`same_site`
+строчными `lax`/`strict`/`none`), порядок детерминирован
+(name, domain, path). `max_age` не заполняется: хранилище браузера держит
+только абсолютный срок. Cookies снимаются по итоговому URL; для схем без
+cookie-хранилища (`data:`, `about:`) шаг пропускается. У навигаций без
+сетевого запроса Chromium отдаёт псевдо-ответ (`data:` — Content-Type из
+самого URL).
 
 ## Блокировка изображений, шрифтов и медиа (T-062)
 
@@ -102,7 +125,7 @@ IndexedDB, service workers) и одна вкладка `about:blank`.
 `wait.go`, план `DefaultWaitPlan(render.timeout)`):
 
 ```
-Page.navigate (старт перехода, без ожидания)
+NavigateResponse (переход; само ждёт загрузку — T-064)
   → событие загрузки Page.loadEventFired, потолок = 1/2 таймаута
   → «затишье» сети: окно 2 с без новых Network.requestWillBeSent,
     потолок фазы = 1/5 таймаута
@@ -172,5 +195,7 @@ docker compose --project-directory . -f deploy/docker/compose.yaml \
 `wait_live_test.go`): тихая data:-страница заканчивается окном затишья,
 «шумная» (fetch на TEST-NET каждые 300 мс) — потолком фазы затишья,
 страница с вечным скриптом — общим таймаутом с ошибкой `task`/
-`DeadlineExceeded`. Флаг доступен и в worktree-агентах следующих задач
-(T-064…T-067).
+`DeadlineExceeded`. Съём результата T-064 (`extract_live_test.go`): точный
+`outerHTML` data:-страницы после исполнения скрипта, JS-cookie
+`js_session` на внутренней странице `spa-shell.crawl.test` и заголовки её
+ответа. Флаг доступен и в worktree-агентах следующих задач (T-065…T-067).

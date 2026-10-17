@@ -28,15 +28,17 @@
 // обычный результат этапа (повторная доставка — уровень очереди, T-066).
 //
 // Развитие T-062…T-067 поверх текущего API: блокировка ресурсов (T-062) и
-// ожидание «затишья» сети (T-063) встраиваются этапами в Session.Run (между
-// Navigate и съёмом результата), итоговый DOM и cookies (T-064) — полями
-// RenderOutput; счётчик Browser.Pages обслуживает перезапуск каждые N
-// страниц (T-065); цикл очередей (T-066/T-067) вызовет Pool.Run.
+// ожидание «затишья» сети (T-063) встраиваются этапами в Session.Run (до
+// перехода и до съёма результата соответственно); итоговый DOM, cookies и
+// заголовки ответа (T-064) — поля RenderOutput (extract.go); счётчик
+// Browser.Pages обслуживает перезапуск каждые N страниц (T-065); цикл
+// очередей (T-066/T-067) вызовет Pool.Run.
 package render
 
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -53,15 +55,31 @@ type RenderTask struct {
 	URL string
 }
 
-// RenderOutput — минимальный результат T-061: итоговый URL документа (после
-// редиректов загрузки) и заголовок. T-064 дополнит его итоговым DOM
-// (document.documentElement.outerHTML) и всеми cookies: поля добавляются,
-// интерфейс не меняется.
+// RenderOutput — результат задачи: итоговый URL и заголовок (T-061),
+// итоговый DOM, все cookies итоговой страницы и заголовки ответа основной
+// навигации (T-064; extract.go — обоснование способов съёма).
 type RenderOutput struct {
-	// FinalURL — document.location после загрузки страницы.
+	// FinalURL — document.location после загрузки страницы: включает
+	// JS-редиректы, которых HTTP-этап не видит (T-048 отслеживает только
+	// HTTP-переходы и meta refresh).
 	FinalURL string
 	// Title — содержимое document.title (диагностика и live-проверки).
 	Title string
+	// DOM — итоговый DOM документа (document.documentElement.outerHTML,
+	// ТЗ 5.6): полное дерево после дорисовки JS; формат HTML — замена
+	// сырого HTML в хранилище (T-067) и вход правил по HTML/meta (T-068).
+	DOM string
+	// Cookies — все cookies итоговой страницы, включая httpOnly и
+	// выставленные JS (ТЗ 5.6, §11.4 п. 3): CDP читает хранилище
+	// изолированного контекста, document.cookie их не видит. Формат —
+	// единый контракт subdomain_results.cookies (T-058). Для страниц без
+	// cookie-хранилища (data:, about:) — nil.
+	Cookies []ExtractCookie
+	// ResponseHeaders — заголовки ответа основной навигации (ТЗ 5.8 —
+	// правила по заголовкам): http.Header, как у HTTP-этапа (T-058).
+	// У навигаций без сетевого запроса — псевдо-ответ Chromium (data: —
+	// Content-Type из URL) либо nil.
+	ResponseHeaders http.Header
 }
 
 // Options — параметры Browser и Pool. Собираются из конфигурации NewOptions;

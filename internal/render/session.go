@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
 
@@ -89,18 +90,20 @@ func (s *Session) start(ctx context.Context) error {
 	}
 }
 
-// Run выполняет задачу: переход на task.URL, ожидание готовности страницы
-// (T-063: событие загрузки с потолком + ограниченное «затишье» сети) и съём
-// минимального результата (итоговый URL и заголовок). Общий таймаут
-// страницы — Options.Timeout (ТЗ 5.6: 25 с по умолчанию); он ограничивает
-// действия задачи, а не жизнь профиля. Истечение общего таймаута — ошибка
-// задачи (ClassTask), а не частичный результат: по ТЗ §8 прерывание по
-// лимиту фиксируется кодом ошибки, «частичного» DOM в схеме §6.1 нет —
-// T-067 заменил бы полный сырой HTML недорисованным DOM без маркера; сырой
-// HTML уже сохранён HTTP-этапом и остаётся результатом до успешного рендера
-// (§7: рендер — асинхронное дополнение, неудача — повторная доставка
-// уровнем очереди, T-066). Мягкие потолки фаз ожидания — не ошибка, после
-// них результат снимается как есть (wait.go).
+// Run выполняет задачу: переход на task.URL (NavigateResponse — с ответом
+// основной навигации, T-064), ожидание готовности страницы (T-063: событие
+// загрузки с потолком + ограниченное «затишье» сети) и съём результата —
+// итоговый URL и заголовок (T-061), итоговый DOM, все cookies итоговой
+// страницы и заголовки ответа основной навигации (T-064, extract.go).
+// Общий таймаут страницы — Options.Timeout (ТЗ 5.6: 25 с по умолчанию); он
+// ограничивает действия задачи, а не жизнь профиля. Истечение общего
+// таймаута — ошибка задачи (ClassTask), а не частичный результат: по ТЗ §8
+// прерывание по лимиту фиксируется кодом ошибки, «частичного» DOM в схеме
+// §6.1 нет — T-067 заменил бы полный сырой HTML недорисованным DOM без
+// маркера; сырой HTML уже сохранён HTTP-этапом и остаётся результатом до
+// успешного рендера (§7: рендер — асинхронное дополнение, неудача —
+// повторная доставка уровнем очереди, T-066). Мягкие потолки фаз ожидания —
+// не ошибка, после них результат снимается как есть (wait.go).
 //
 // Цепочка контекстов идёт от вкладки (s.ctx): chromedp ищет сессию по
 // значению в контексте, производный от вызывающего контекст её не видит.
@@ -109,8 +112,7 @@ func (s *Session) start(ctx context.Context) error {
 //
 // Блокировка изображений/шрифтов/медиа (T-062, ТЗ 5.6) включается здесь,
 // до перехода (startBlock, перед waitSubscribe): перехват видит запросы
-// страницы с первого. Съём итогового DOM и cookies (T-064) — рядом с
-// Title/Location; этапы — chromedp.Do над s.Context().
+// страницы с первого. Этапы — chromedp.Run/Do над s.Context().
 func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	tctx, stop := context.WithTimeout(s.ctx, s.b.opts.Timeout)
 	defer stop()
@@ -125,16 +127,24 @@ func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 
 	var out RenderOutput
 	// T-063: подписки на события вкладки — до перехода и до Network.enable:
-	// подписка начинает буферизацию с момента вызова, события между ней и
-	// Page.navigate не теряются.
+	// подписка начинает буферизацию с момента вызова; событие загрузки,
+	// случившееся за время NavigateResponse (своё ожидание load), waitLoop
+	// возьмёт из буфера мгновенно и перейдёт к «затишью» сети.
 	evs, err := waitSubscribe(tctx)
+	var resp *network.Response
 	if err == nil {
-		// T-063: Page.navigate без ожидания load (chromedp.Navigate ждал бы
-		// конца загрузки без отдельного потолка фазы) — событие загрузки и
-		// «затишье» сети ждёт waitLoop с потолками WaitPlan.
-		err = waitNavigate(tctx, task.URL)
+		// NavigateResponse — переход с ожиданием загрузки (то же ожидание,
+		// что у Navigate) плюс ответ основной навигации: chromedp отслеживает
+		// цепочку loader/request через редиректы и возвращает итоговый
+		// документ (T-064 — заголовки для правил ТЗ 5.8). У навигаций без
+		// сетевого запроса Chromium отдаёт псевдо-ответ (data: —
+		// Content-Type из URL), возможен и nil — оба случая обрабатываются
+		// ниже проверкой resp != nil.
+		resp, err = chromedp.Run(tctx, chromedp.NavigateResponse(task.URL))
 	}
 	if err == nil {
+		// T-063: событие загрузки (из буфера — мгновенно) и «затишье» сети
+		// (окно без новых запросов) с потолками WaitPlan.
 		_, err = waitLoop(tctx, DefaultWaitPlan(s.b.opts.Timeout), evs, waitRealTimerFactory)
 	}
 	if err == nil {
@@ -142,6 +152,12 @@ func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 	}
 	if err == nil {
 		out.FinalURL, err = chromedp.Run(tctx, chromedp.Location())
+	}
+	if err == nil {
+		err = newExtractCDP().extractResult(tctx, &out) // T-064: DOM + cookies
+	}
+	if err == nil && resp != nil {
+		out.ResponseHeaders = extractResponseHeaders(resp.Headers) // T-064
 	}
 	if err != nil {
 		return out, s.wrap(err, ctx, tctx, task.URL)

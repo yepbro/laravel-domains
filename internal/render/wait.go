@@ -4,9 +4,9 @@ package render
 // событие загрузки с собственным потолком, затем ограниченное ожидание
 // «затишья» сети. Комбинированный алгоритм Session.Run:
 //
-//	переход (Page.navigate, без ожидания) → событие загрузки (потолок
-//	Load) → окно затишья Quiet без новых запросов (потолок Settle) → съём
-//	результата
+//	переход (NavigateResponse, T-064 — с ожиданием загрузки и заголовками
+//	ответа) → событие загрузки из буфера подписок (потолок Load) → окно
+//	затишья Quiet без новых запросов (потолок Settle) → съём результата
 //
 // Все ожидания — производные контекста вкладки (урок T-061: контекст
 // действий обязан производиться от контекста вкладки, chromedp ищет
@@ -166,28 +166,6 @@ func waitSubscribe(ctx context.Context) (waitEvents, error) {
 		}
 	}()
 	return evs, nil
-}
-
-// waitNavigate стартует переход командой Page.navigate, НЕ ожидая события
-// загрузки. Почему не chromedp.Navigate: он объединяет Page.navigate с
-// ожиданием конца загрузки (chromedp v0.21, nav.go: Navigate =
-// waitLoad(navigate)) без отдельного потолка — висящая страница съела бы
-// весь бюджет ещё до фазы затишья. Событие загрузки и затишье ждёт waitLoop
-// с потолками WaitPlan. Повторяет внутренний navigate chromedp, включая
-// разбор ответа команды: errorText (net::ERR_*) → *chromedp.LoadError —
-// classifyCtx распознаёт его через errors.Is(ErrPageLoad) как ошибку
-// страницы, семантика T-061 сохранена.
-func waitNavigate(ctx context.Context, url string) error {
-	return chromedp.Do(ctx, chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
-		res, err := cdp.Call(ctx, t, page.Navigate, page.NavigateParams{URL: url})
-		if err != nil {
-			return err
-		}
-		if res.ErrorText != "" {
-			return &chromedp.LoadError{ErrorText: res.ErrorText}
-		}
-		return nil
-	}))
 }
 
 // waitLoop — две фазы ожидания готовности:
