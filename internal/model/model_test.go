@@ -44,7 +44,7 @@ func TestStructColumnsMatchSchema(t *testing.T) {
 		}},
 		{LaravelFinding{}, []string{
 			"zone_id", "domain_id", "subdomain_id", "variant", "score",
-			"ver_min", "ver_max", "signals", "is_laravel",
+			"ver_min", "ver_max", "signals", "is_laravel", "rules_version",
 		}},
 		{IngestFile{}, []string{
 			"id", "zone_id", "action", "path", "sha256",
