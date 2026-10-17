@@ -220,6 +220,8 @@ Quad9), как в ТЗ 5.10.
 | `total_timeout` | `CRAWLER_HTTP_TOTAL_TIMEOUT` | длительность | `20s` |
 | `max_redirects` | `CRAWLER_HTTP_MAX_REDIRECTS` | целое | `8` (`0` — не следовать) |
 | `max_body_bytes` | `CRAWLER_HTTP_MAX_BODY_BYTES` | размер | `2097152` (2 MiB) |
+| `min_body_speed` | `CRAWLER_HTTP_MIN_BODY_SPEED` | размер (байт/с) | `2048` (ТЗ 5.5: мин. скорость после первого байта) |
+| `max_rps` | `CRAWLER_HTTP_MAX_RPS` | целое | `1000` |
 | `user_agent` | `CRAWLER_HTTP_USER_AGENT` | строка | `DomainCrawler/1.0 (contact: admin@example.invalid)` |
 
 `user_agent` обязателен: честный User-Agent с контактами (ТЗ 5.5, §9).
@@ -233,6 +235,21 @@ Quad9), как в ТЗ 5.10.
 резолвером с кэшем (ТЗ 5.5 п. 2). При нескольких адресах попытки
 подключения стартуют поочерёдно с паузой 300 мс (happy-eyeballs-подобная
 гонка, RFC 8305) — падение одного адреса не сжигает таймауты запроса.
+
+Лимиты и защита (T-049, `internal/httpfetch/limits.go`): тело читается
+до `max_body_bytes` — превышение не ошибка сети, тело обрезается
+с признаком «данные частичны» (`BodyLimiter.Truncated`, решение за
+потребителем). Анти-тарпит — `min_body_speed`: после первого байта
+дедлайн дочитания остатка продлевается по мере чтения
+(`now + остаток/скорость`), нарушение классифицируется как таймаут,
+соединение закрывается. Число одновременных соединений на один
+диалимый IP — `per_ip_limit` (ожидающие стоят в очереди, прерываемой
+отменой контекста запроса), глобальные соединения — `concurrency`,
+темп запросов — `max_rps` (токен-ведро со всплеском до `concurrency`,
+единая механика с `dns.max_qps`). Keep-alive отключён (вариант ТЗ 5.5
+«отключён или очень короткий idle»): одна главная страница на сайт,
+пул по хостам переживал бы перерезолв адресов и держал тысячи
+неактивных соединений при concurrency 2000.
 
 ### `render` (ТЗ 5.6)
 
@@ -316,7 +333,8 @@ Quad9), как в ТЗ 5.10.
   `scheduler.batch_size` 1000..10000 (ТЗ 5.3), `queue_high_watermark` ≥ 1,
   `temp_error_max_retries` 1..100;
 - `dns.concurrency`/`http.concurrency` 1..100000, `dns.max_qps` 1..1000000,
-  `http.per_ip_limit` 1..64, `http.max_redirects` 0..100, `max_body_bytes` > 0;
+  `http.per_ip_limit` 1..64, `http.max_redirects` 0..100, `http.max_rps`
+  1..1000000, `max_body_bytes`/`min_body_speed` > 0;
 - `dns.timeout`/`dns.tcp_timeout`/`dns.retry_delay` положительны,
   `dns.retries` 1..10 (ТЗ 5.4: ретраи обязательны), `dns.udp_pool_size`
   1..100000;
