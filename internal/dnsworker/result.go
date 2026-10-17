@@ -73,6 +73,7 @@ import (
 
 	"crawler/internal/db"
 	"crawler/internal/dnsclient"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 	"crawler/internal/queue"
 )
@@ -273,7 +274,8 @@ func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 //
 // dom — домен пачки q:dns (T-024); subs — справочник subdomains (все
 // строки; отключённые пропускает CheckSubdomains); askAAAA — dns.ipv6
-// (ТЗ 5.4: AAAA отключаются конфигом без IPv6); log — nil подавляет записи.
+// (ТЗ 5.4: AAAA отключаются конфигом без IPv6); met — приборы этапа
+// (T-077; nil — изолированные сборки без метрик); log — nil подавляет записи.
 func ProcessDomain(
 	ctx context.Context,
 	pool db.DB,
@@ -282,6 +284,7 @@ func ProcessDomain(
 	dom queue.DNSDomain,
 	subs []model.Subdomain,
 	askAAAA bool,
+	met *Metrics,
 	log *slog.Logger,
 ) error {
 	if log == nil {
@@ -355,6 +358,11 @@ func ProcessDomain(
 		log.Debug("результат не записан — домен удалён или уже done",
 			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 		return nil
+	}
+	if res.SetStatus {
+		// Терминальная ветка DNS-этапа — счётчик финальных статусов
+		// (T-077, ТЗ 5.9); ветка «есть адреса» статуса не пишет.
+		met.DomainStatus(res.Status)
 	}
 	log.Debug("DNS-эпизод записан",
 		"domain", dom.Name, "mask", int64(res.Mask), "http_subs", len(res.HTTPSubdomains),
@@ -502,6 +510,11 @@ type Options struct {
 	Consume int
 	// AskAAAA — запрашивать ли AAAA субдоменов (dns.ipv6, ТЗ 5.4).
 	AskAAAA bool
+	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него Run
+	// строит приборы этапа (NewMetrics — счётчик эпизодов, гистограмма
+	// длительностей, счётчик финальных статусов); nil — без метрик
+	// (изолированные сборки и тесты).
+	Metrics *metrics.Registry
 	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 }
@@ -545,6 +558,7 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	met := NewMetrics(o.Metrics) // nil без реестра — приборы no-op (T-077)
 	log.Info("цикл dns-worker",
 		"group", o.Group, "consumer", o.Consumer,
 		"concurrency", o.Concurrency, "consume", o.Consume, "ask_aaaa", o.AskAAAA)
@@ -573,7 +587,7 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 				return nil // остановка: доставка не читалась — не подтверждена
 			}
 			err := queue.Processing(ctx, q, o.Group, d, func(c context.Context, del queue.Delivery) error {
-				return processBatch(c, pool, q, resolve, del, o, log)
+				return processBatch(c, pool, q, resolve, del, o, met, log)
 			})
 			if err == nil {
 				continue
@@ -593,6 +607,9 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 // любого эпизода — ошибка всей доставки (без XACK): повторная доставка
 // прогонит пачку заново, фильтр отсечёт уже записанные домены —
 // повторяется только недоработанное (идемпотентность, ТЗ 3.4).
+// Завершённые эпизоды идут в приборы met (T-077): счётчик задач этапа,
+// гистограмма длительностей (статусы терминальных веток считает
+// ProcessDomain после записи).
 func processBatch(
 	ctx context.Context,
 	pool db.DB,
@@ -600,6 +617,7 @@ func processBatch(
 	resolve dnsclient.Resolver,
 	del queue.Delivery,
 	o Options,
+	met *Metrics,
 	log *slog.Logger,
 ) error {
 	batch, err := queue.Decode[queue.DNSBatch](del)
@@ -646,7 +664,13 @@ func processBatch(
 		go func(dom queue.DNSDomain) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := ProcessDomain(ctx, pool, q, resolve, dom, subs, o.AskAAAA, log); err != nil {
+			start := time.Now()
+			err := ProcessDomain(ctx, pool, q, resolve, dom, subs, o.AskAAAA, met, log)
+			if err == nil {
+				// Эпизод завершён — пропускная способность и
+				// длительность этапа (T-077, ТЗ 5.9).
+				met.Episode(time.Since(start))
+			} else {
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = fmt.Errorf("домен %s: %w", dom.Name, err)

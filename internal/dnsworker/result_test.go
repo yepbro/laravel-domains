@@ -893,7 +893,7 @@ func TestResultProcessDomainWithAddrs(t *testing.T) {
 		resultReply(dnsclient.RCodeNOERROR, apexAAAARR("cdn.example.com.", "2001:db8::2")))
 
 	dom := queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}
-	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), true, nil); err != nil {
+	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), true, nil, nil); err != nil {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
 
@@ -947,7 +947,7 @@ func TestResultProcessDomainNXDOMAIN(t *testing.T) {
 	resultSetNXDOMAIN(resolve, "gone.example.com")
 
 	dom := queue.DNSDomain{ZoneID: 3, DomainID: 12, Name: "gone.example.com"}
-	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), true, nil); err != nil {
+	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), true, nil, nil); err != nil {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
 
@@ -980,7 +980,7 @@ func TestResultProcessDomainWildcard(t *testing.T) {
 
 		if err := ProcessDomain(context.Background(), pool, q, resolve,
 			queue.DNSDomain{ZoneID: 5, DomainID: 21, Name: "parked.example.com"},
-			resultSubs(), false, nil); err != nil {
+			resultSubs(), false, nil, nil); err != nil {
 			t.Fatalf("ProcessDomain: %v", err)
 		}
 
@@ -1010,7 +1010,7 @@ func TestResultProcessDomainWildcard(t *testing.T) {
 
 		if err := ProcessDomain(context.Background(), pool, q, resolve,
 			queue.DNSDomain{ZoneID: 5, DomainID: 22, Name: "flaky.example.com"},
-			resultSubs(), false, nil); err != nil {
+			resultSubs(), false, nil, nil); err != nil {
 			t.Fatalf("ProcessDomain: %v (политика T-038 — продолжить)", err)
 		}
 		publishes := q.resultPublishes()
@@ -1036,7 +1036,7 @@ func TestResultProcessDomainErrors(t *testing.T) {
 		resultSetDelegated(resolve, "example.com")
 
 		err := ProcessDomain(context.Background(), pool, q, resolve,
-			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil)
+			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "публикация q:http") {
 			t.Fatalf("ошибка = %v, want «публикация q:http»", err)
 		}
@@ -1053,7 +1053,7 @@ func TestResultProcessDomainErrors(t *testing.T) {
 		resultSetDelegated(resolve, "example.com")
 
 		err := ProcessDomain(context.Background(), pool, q, resolve,
-			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil)
+			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "запись результата") {
 			t.Fatalf("ошибка = %v, want «запись результата»", err)
 		}
@@ -1072,7 +1072,7 @@ func TestResultProcessDomainErrors(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		err := ProcessDomain(ctx, pool, q, resolve,
-			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil)
+			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil, nil)
 		if err == nil || !errors.Is(err, context.Canceled) {
 			t.Fatalf("ошибка = %v, want context.Canceled", err)
 		}
@@ -1098,7 +1098,7 @@ func TestResultProcessDomainErrors(t *testing.T) {
 		}
 
 		err := ProcessDomain(ctx, pool, q, resolve,
-			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil)
+			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil, nil)
 		if err == nil || !errors.Is(err, context.Canceled) {
 			t.Fatalf("ошибка = %v, want context.Canceled", err)
 		}
@@ -1110,7 +1110,7 @@ func TestResultProcessDomainErrors(t *testing.T) {
 	t.Run("очередь не задана", func(t *testing.T) {
 		err := ProcessDomain(context.Background(), &resultFakePool{j: &resultJournal{}}, nil,
 			resultNewResolver(), queue.DNSDomain{ZoneID: 1, DomainID: 1, Name: "example.com"},
-			resultSubs(), false, nil)
+			resultSubs(), false, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "очередь не задана") {
 			t.Fatalf("ошибка = %v, want «очередь не задана»", err)
 		}

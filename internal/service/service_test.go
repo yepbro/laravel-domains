@@ -15,7 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"crawler/internal/config"
+	"crawler/internal/metrics"
 )
 
 // ---- Логирование ----
@@ -459,6 +462,66 @@ func TestServeOnRunPanic(t *testing.T) {
 func TestRunValidation(t *testing.T) {
 	if err := Run(Options{}); err == nil || !strings.Contains(err.Error(), "имя сервиса") {
 		t.Fatalf("Run без Name = %v, хочу ошибку об обязательном имени", err)
+	}
+}
+
+// TestNewRegistry — выбор реестра метрик: Options.Metrics (создан main-ом
+// под приборы рабочей логики, T-077) используется как есть, nil — каркас
+// строит собственный по имени сервиса.
+func TestNewRegistry(t *testing.T) {
+	own := metrics.New("workers-svc")
+	if got := newRegistry(Options{Metrics: own}); got != own {
+		t.Errorf("newRegistry с Options.Metrics = %v, хочу тот же реестр", got)
+	}
+
+	reg := newRegistry(Options{Name: "plain-svc"})
+	if reg == nil {
+		t.Fatal("newRegistry без Metrics = nil, хочу собственный реестр каркаса")
+	}
+	// Собственный реестр каркаса инициализирован как metrics.New:
+	// прибор рабочей логики регистрируется фабрикой и виден в Gather.
+	tasks := reg.MustCounter(prometheus.CounterOpts{
+		Name: "crawler_stage_tasks_total",
+		Help: "Обработанные домены по этапам конвейера.",
+	}, metrics.LabelStage)
+	tasks.WithLabelValues(metrics.StageDNS).Inc()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	found := false
+	for _, mf := range families {
+		if mf.GetName() == "crawler_stage_tasks_total" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("прибор рабочей логики не попал в Gather реестра каркаса")
+	}
+}
+
+// TestRunWithOwnMetrics — Run принимает готовый реестр Options.Metrics
+// (T-077): сервис поднимается и завершается чисто, реестр остаётся
+// пригодным для приборов рабочей логики.
+func TestRunWithOwnMetrics(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+
+	reg := metrics.New("run-test")
+	reg.MustCounter(prometheus.CounterOpts{
+		Name: "crawler_stage_tasks_total",
+		Help: "Обработанные домены по этапам конвейера.",
+	}, metrics.LabelStage).WithLabelValues(metrics.StageDNS).Inc()
+
+	err := Run(Options{
+		Name:        "run-test",
+		MetricsAddr: "127.0.0.1:0",
+		Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
+		Metrics:     reg,
+		OnRun:       func(context.Context) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("Run с Options.Metrics = %v, хочу nil", err)
 	}
 }
 

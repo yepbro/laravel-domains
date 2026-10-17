@@ -38,6 +38,7 @@ import (
 	"crawler/internal/dnsclient"
 	"crawler/internal/httpfetch"
 	"crawler/internal/httpworker"
+	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/service"
 )
@@ -53,15 +54,20 @@ func main() {
 	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
 	// готов до старта OnRun: postgres.dsn обязателен (config.Validate);
 	// им пользуется и хранилище контента (строки contents, T-042/T-056),
-	// и запись результата (subdomain_results/domains, T-058).
+	// и запись результата (subdomain_results/domains, T-058). Реестр
+	// метрик — здесь же (T-077): приборы HTTP-этапа и коллектор длины
+	// q:http получают его до старта OnRun, каркас отдаёт тот же реестр
+	// через /metrics.
+	reg := metrics.New("http-worker")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "http-worker",
 		Config:      cfg,
 		Logger:      logger,
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9104"),
+		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool) },
+		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}
@@ -73,10 +79,11 @@ func main() {
 // результат проверки сертификата сохраняет TLSInfo T-050) → хранилище
 // контента (T-056: паки T-042 + словарь T-043 + контроль диска T-046) →
 // воркер (кэш итоговых URL, варианты, алиасы, SPA, сохранение контента
-// в OnResult) → цикл q:http. Завершение — отмена ctx (graceful
-// shutdown, ТЗ 3.4): начатые задачи дорабатывают или возвращаются
-// очереди повторной доставкой (Processing, T-025).
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) error {
+// в OnResult) с приборами этапа (T-077) и коллектор длины q:http
+// (метрика длин очередей, ТЗ 5.9) → цикл q:http. Завершение — отмена
+// ctx (graceful shutdown, ТЗ 3.4): начатые задачи дорабатывают или
+// возвращаются очереди повторной доставкой (Processing, T-025).
+func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("http-worker: пул БД не получен (postgres.dsn обязателен)")
 	}
@@ -160,6 +167,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 
+	// Длина потребляемого стрима q:http → crawler_queue_depth (T-077):
+	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	go func() {
+		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
+			[]string{queue.StreamHTTP}, metrics.DefaultQueueCollectInterval, logger)
+	}()
+
 	recorder, err := httpworker.NewRenderRecorder(pool, q, renderQ, logger)
 	if err != nil {
 		return err
@@ -177,6 +191,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	opts2 := httpworker.Options{
 		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — не следовать (T-006/T-048)
+		Metrics:      reg,                   // приборы этапа: задачи, ошибки, статусы, время ответа, rendered (T-077)
 		Log:          logger,
 		// Цепочка OnResult (внутри обработки задачи, до XACK, ТЗ 4.2):
 		// сохранение контента (T-056) → запись subdomain_results со свопом

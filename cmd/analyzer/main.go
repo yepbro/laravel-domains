@@ -27,6 +27,7 @@ import (
 	"crawler/internal/analyzer"
 	"crawler/internal/config"
 	"crawler/internal/content"
+	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/rules"
 	"crawler/internal/service"
@@ -53,15 +54,19 @@ func main() {
 	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
 	// готов до старта OnRun: postgres.dsn обязателен (config.Validate);
 	// им пользуется и хранилище контента (строки contents, T-042), и
-	// чтение subdomain_results/запись findings.
+	// чтение subdomain_results/запись findings. Реестр метрик — здесь же
+	// (T-077): приборы этапа и коллектор длины q:analyze получают его до
+	// старта OnRun, каркас отдаёт тот же реестр через /metrics.
+	reg := metrics.New("analyzer")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "analyzer",
 		Config:      cfg,
 		Logger:      logger,
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9106"),
+		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reloader) },
+		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reloader, reg) },
 		OnSIGHUP:    reloader.HandleSIGHUP,
 	}); err != nil {
 		os.Exit(1)
@@ -71,11 +76,13 @@ func main() {
 // run — рабочая логика analyzer: хранилище контента (чтение — тот же
 // PackStore, что пишет HTTP/рендер-этапы: словарь zstd T-043 обязан
 // совпадать, иначе распаковка чужих блоков невозможна) → очередь →
-// воркер q:analyze (передний план) + фоновый цикл переанализа (T-074).
-// Завершение — отмена ctx (graceful shutdown, ТЗ 3.4): начатые доставки
-// дорабатывают или возвращаются очереди повторной доставкой (Processing,
-// T-025); ReanalyzeLoop на отмене возвращает чистый nil.
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reloader *rules.Reloader) error {
+// воркер q:analyze (передний план) с приборами этапа (T-077) и коллектор
+// длины q:analyze (метрика длин очередей, ТЗ 5.9) + фоновый цикл
+// переанализа (T-074). Завершение — отмена ctx (graceful shutdown,
+// ТЗ 3.4): начатые доставки дорабатывают или возвращаются очереди
+// повторной доставкой (Processing, T-025); ReanalyzeLoop на отмене
+// возвращает чистый nil.
+func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reloader *rules.Reloader, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("analyzer: пул БД не получен (postgres.dsn обязателен)")
 	}
@@ -117,10 +124,18 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		}
 	}()
 
+	// Длина потребляемого стрима q:analyze → crawler_queue_depth (T-077):
+	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	go func() {
+		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
+			[]string{queue.StreamAnalyze}, metrics.DefaultQueueCollectInterval, logger)
+	}()
+
 	// Опции воркера — одни на сборку (стиль render-worker): Worker хранит
 	// их для ProcessResult, цикл Run берёт те же Group/Consume.
 	opts := analyzer.Options{
 		MinScore: cfg.Analyzer.LaravelMinScore,
+		Metrics:  reg, // приборы этапа: задачи и длительности (T-077)
 		Log:      logger,
 	}
 	w, err := analyzer.New(pool, q, store, reloader, opts)
