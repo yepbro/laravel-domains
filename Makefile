@@ -109,7 +109,7 @@ build-runtime: ## Собрать боевые образы (runtime + render) д
 	docker build $(BUILD_ARGS) -f deploy/docker/Dockerfile.render \
 		--target render -t crawler/render:check .
 
-GO_PKGS := ./cmd/... ./internal/... ./migrations/... ./test/...
+GO_PKGS := ./cmd/... ./internal/... ./migrations/... ./test/... ./deploy/postgres
 
 .PHONY: test
 test: ## Модульные тесты Go (в контейнере)
@@ -139,7 +139,7 @@ lint: ## golangci-lint (в контейнере)
 .PHONY: fmt
 fmt: ## gofmt + go vet (в контейнере)
 	$(check_env)
-	$(COMPOSE) run --rm tools sh -c 'gofmt -l -w cmd internal test && go vet $(GO_PKGS)'
+	$(COMPOSE) run --rm tools sh -c 'gofmt -l -w cmd internal test deploy/postgres && go vet $(GO_PKGS)'
 
 .PHONY: mod-download
 mod-download: ## Докачать Go-модули в общий кэш (нужен интернет; tools его имеет)
