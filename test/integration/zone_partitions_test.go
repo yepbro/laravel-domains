@@ -132,8 +132,8 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 				SELECT $1, g, 0, 2, now() FROM generate_series(1, $2) g`,
 			"laravel_domains": `INSERT INTO laravel_domains (zone_id, domain_id, score, ver_min, ver_max, found_on_mask, rules_version, updated_at)
 				SELECT $1, g, 0.75, '10', '11', 3, 1, now() FROM generate_series(1, $2) g`,
-			"laravel_findings": `INSERT INTO laravel_findings (zone_id, domain_id, subdomain_id, variant, score, signals, is_laravel)
-				SELECT $1, g, 0, 0, 0.8, '[{"rule":"x","weight":0.5}]', true FROM generate_series(1, $2) g`,
+			"laravel_findings": `INSERT INTO laravel_findings (zone_id, domain_id, subdomain_id, variant, score, signals, is_laravel, rules_version)
+				SELECT $1, g, 0, 0, 0.8, '[{"rule":"x","weight":0.5}]', true, 1 FROM generate_series(1, $2) g`,
 		}
 		if _, err := pool.Exec(ctx, queries[table], zoneID, n); err != nil {
 			t.Fatalf("seed %s: %v", table, err)

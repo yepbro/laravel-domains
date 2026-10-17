@@ -734,14 +734,14 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 
 	// laravel_findings: срабатывания правил по (домен, субдомен, вариант).
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO laravel_findings (zone_id, domain_id, subdomain_id, variant, score, signals, is_laravel)
-		VALUES (1, 10, 0, 0, 0.75, '[{"rule":"cookie_xsrf_token","weight":0.25}]', true)`,
+		INSERT INTO laravel_findings (zone_id, domain_id, subdomain_id, variant, score, signals, is_laravel, rules_version)
+		VALUES (1, 10, 0, 0, 0.75, '[{"rule":"cookie_xsrf_token","weight":0.25}]', true, 1)`,
 	); err != nil {
 		t.Fatalf("insert laravel_findings: %v", err)
 	}
 	dupInsert("laravel_findings", `
-		INSERT INTO laravel_findings (zone_id, domain_id, subdomain_id, variant, score, signals, is_laravel)
-		VALUES (1, 10, 0, 0, 1, '[]', true)`)
+		INSERT INTO laravel_findings (zone_id, domain_id, subdomain_id, variant, score, signals, is_laravel, rules_version)
+		VALUES (1, 10, 0, 0, 1, '[]', true, 1)`)
 
 	// ingest_files: отчёт по обработанному файлу; дубль sha256 — другой
 	// путь, тот же контент файла — отбивается уникальным индексом.
