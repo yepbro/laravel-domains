@@ -27,6 +27,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"crawler/internal/db"
 )
@@ -105,10 +108,11 @@ type PackStore struct {
 	pool db.DB
 	opts PackOptions
 
-	mu     sync.Mutex // позиция записи и ротация (внутри процесса)
-	active *packFile  // пак для дописывания (может отставать от новейшего, см. appendBlock)
-	lock   *os.File   // flock каталога паков (между процессами)
-	closed bool
+	mu       sync.Mutex   // позиция записи и ротация (внутри процесса)
+	active   *packFile    // пак для дописывания — всегда новейший (appendBlockLocked)
+	lock     *os.File     // flock каталога паков (между процессами)
+	dirCache packDirCache // новейший пак с кэшем по mtime каталога
+	closed   bool
 }
 
 // compile-time: PackStore реализует ContentStore (T-041).
@@ -203,24 +207,56 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 		return PutResult{Hash: h}, nil
 	}
 
-	// 2) спул блока в пак.
+	// 2) спул блока в пак и 3) фиксация метаданных — под одним захватом
+	// мьютекса и flock (appendAndMeta): блок и его строка появляются в
+	// хранилище атомарно относительно компактификации (T-045), которая
+	// удаляет старые паки под той же блокировкой. Комментарий о конфликтах
+	// INSERT — в appendAndMeta.
 	block := CompressWithDict(data)
-	packID, off, err := s.appendBlock(block)
+	tag, err = s.appendAndMeta(ctx, h, block, len(data))
 	if err != nil {
 		return PutResult{}, err
 	}
-
-	// 3) метаданные. INSERT-ветка — новый контент (Created), UPDATE-ветка
-	// конфликта — конкурент успел раньше (блок этого вызова — мусор).
-	// Конфликт с мёртвой строкой (refcount = 0) tag-ом неотличим: Created
-	// остаётся false при фактически дописанном свежем блоке — редкий
-	// случай, влияющий только на метрику доли дедупликации (ТЗ 11.4 п. 3);
-	// размещение переводится на свежий блок (EXCLUDED), чтение корректно.
-	tag, err = s.pool.Exec(ctx, sqlMetaPut, h[:], packID, off, int32(len(block)), int32(len(data)))
-	if err != nil {
-		return PutResult{}, fmt.Errorf("content: метаданные %s: %w", h, err)
-	}
 	return PutResult{Hash: h, Created: tag.Insert()}, nil
+}
+
+// appendAndMeta дописывает блок в новейший пак и фиксирует строку
+// метаданных под одним захватом мьютекса и flock каталога (T-045):
+// строка появляется в БД не позже снятия блокировки, удерживавшейся при
+// дописывании блока, — компактификация, взявшая flock следующим, не может
+// счесть блок мусорным и удалить пак до фиксации строки. Ошибка на любом
+// шаге оставляет блок мусорным без строки — невидим, вычистит
+// компактификация (семантика краш-окна T-042 сохранена); блокировка в
+// критической секции удерживается и на время запроса к БД — цена
+// корректности межпроцессного протокола, запись контента не является
+// горячим путём (страницы приходят с сети медленнее коммита).
+//
+// INSERT-ветка sqlMetaPut — новый контент (Created), UPDATE-ветка
+// конфликта — конкурент успел раньше (блок этого вызова — мусор).
+// Конфликт с мёртвой строкой (refcount = 0) tag-ом неотличим: Created
+// остаётся false при фактически дописанном свежем блоке — редкий случай,
+// влияющий только на метрику доли дедупликации (ТЗ 11.4 п. 3);
+// размещение переводится на свежий блок (EXCLUDED), чтение корректно.
+func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, rawLen int) (pgconn.CommandTag, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return pgconn.CommandTag{}, errPackClosed
+	}
+	if err := flockDir(s.lock); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	defer func() { unlockDir(s.lock) }()
+
+	packID, off, err := s.appendBlockLocked(block)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	tag, err := s.pool.Exec(ctx, sqlMetaPut, h[:], packID, off, int32(len(block)), int32(rawLen))
+	if err != nil {
+		return pgconn.CommandTag{}, fmt.Errorf("content: метаданные %s: %w", h, err)
+	}
+	return tag, nil
 }
 
 // Get возвращает контент по метаданным contents: блок (pack_id, off, len)
@@ -280,23 +316,50 @@ func (s *PackStore) Delete(ctx context.Context, hash Hash) error {
 	return nil
 }
 
-// appendBlock дописывает сжатый блок в активный пак и возвращает
+// appendBlock дописывает сжатый блок в новейший пак и возвращает
 // (pack_id, смещение блока). Один писатель в процессе — мьютекс,
 // между процессами — flock каталога: размер пака и номер новейшего
 // пересчитываются под блокировкой, поэтому смещения не конфликтуют.
+// Используется компактификацией (T-045); Put проходит через
+// appendAndMeta, удерживающий ту же блокировку до фиксации метаданных.
 func (s *PackStore) appendBlock(block []byte) (int32, int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return 0, 0, errPackClosed
 	}
-	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
-		return 0, 0, fmt.Errorf("content: блокировка каталога паков: %w", err)
+	if err := flockDir(s.lock); err != nil {
+		return 0, 0, err
 	}
-	defer func() { _ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN) }()
+	defer func() { unlockDir(s.lock) }()
+	return s.appendBlockLocked(block)
+}
 
-	recLen := int64(4 + len(block))
-	if s.active != nil {
+// appendBlockLocked — ядро дописывания, вызывается под мьютексом и
+// flock. Активный пак синхронизируется с новейшим в каталоге: писатели
+// дописывают ТОЛЬКО в новейший пак, все остальные закрыты для записи —
+// предусловие компактификации (T-045), удаляющей старые паки: множество
+// строк не-новейшего пака замораживается в момент появления следующего
+// пака, опоздавших дописываний не бывает (в прежней схеме активный пак
+// мог отставать от новейшего и старый пак оставался открытым для записи).
+func (s *PackStore) appendBlockLocked(block []byte) (int32, int64, error) {
+	maxID, err := s.newestPackIDLocked()
+	if err != nil {
+		return 0, 0, err
+	}
+	if maxID == 0 {
+		maxID = 1 // пустой каталог — создаётся пак номер 1
+	}
+	if s.active == nil || s.active.id != maxID {
+		pf, err := s.openPackForWrite(maxID)
+		if err != nil {
+			return 0, 0, err
+		}
+		if s.active != nil {
+			_ = s.active.f.Close()
+		}
+		s.active = pf
+	} else {
 		// Другой процесс мог дописать пак с момента прошлого вызова.
 		st, err := s.active.f.Stat()
 		if err != nil {
@@ -304,11 +367,9 @@ func (s *PackStore) appendBlock(block []byte) (int32, int64, error) {
 		}
 		s.active.size = st.Size()
 	}
-	if s.active == nil {
-		if err := s.openNewestLocked(); err != nil {
-			return 0, 0, err
-		}
-	} else if s.active.size > packHeaderLen && s.active.size+recLen > s.opts.PackSize {
+
+	recLen := int64(4 + len(block))
+	if s.active.size > packHeaderLen && s.active.size+recLen > s.opts.PackSize {
 		if err := s.rotateLocked(recLen); err != nil {
 			return 0, 0, err
 		}
@@ -325,23 +386,37 @@ func (s *PackStore) appendBlock(block []byte) (int32, int64, error) {
 	return s.active.id, off, nil
 }
 
-// openNewestLocked открывает новейший пак каталога (по максимальному id
-// в имени файла); пустой каталог — создаётся пак номер 1. Вызывается
-// под мьютексом и flock.
-func (s *PackStore) openNewestLocked() error {
+// packDirCache — кэш реестра паков: mtime каталога меняется при создании
+// и удалении pak-файлов, но не при дописывании в них, поэтому свежесть
+// кэша проверяется одним os.Stat вместо ReadDir на каждую запись.
+type packDirCache struct {
+	valid   bool
+	modTime time.Time
+	maxID   int32
+}
+
+// newestPackIDLocked — максимальный id пака в каталоге (0 — паков нет)
+// с кэшем по mtime каталога; вызывается под мьютексом. Каталог контента
+// локальный (ТЗ 5.7: NVMe), mtime наносекундный — событие создания или
+// удаления пака не проскочит незамеченным между двумя os.Stat.
+func (s *PackStore) newestPackIDLocked() (int32, error) {
+	// stat до ReadDir: события между ними лишь лишний раз инвалидируют кэш.
+	st, err := os.Stat(s.opts.Dir)
+	if err != nil {
+		return 0, fmt.Errorf("content: каталог паков %s: %w", s.opts.Dir, err)
+	}
+	if s.dirCache.valid && !s.dirCache.modTime.Equal(st.ModTime()) {
+		s.dirCache.valid = false // реестр паков менялся — пересобрать
+	}
+	if s.dirCache.valid {
+		return s.dirCache.maxID, nil
+	}
 	maxID, err := s.scanPackIDs()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if maxID == 0 {
-		maxID = 1
-	}
-	pf, err := s.openPackForWrite(maxID)
-	if err != nil {
-		return err
-	}
-	s.active = pf
-	return nil
+	s.dirCache = packDirCache{valid: true, modTime: st.ModTime(), maxID: maxID}
+	return maxID, nil
 }
 
 // rotateLocked вызывается, когда текущий пак полон: переключиться на
@@ -351,7 +426,7 @@ func (s *PackStore) openNewestLocked() error {
 // сверх порога, — ротация обязана продвигаться (контент ≤ 16 МиБ
 // по валидации max_store_bytes, порог ≥ 1 МиБ).
 func (s *PackStore) rotateLocked(recLen int64) error {
-	maxID, err := s.scanPackIDs()
+	maxID, err := s.newestPackIDLocked()
 	if err != nil {
 		return err
 	}
@@ -370,6 +445,7 @@ func (s *PackStore) rotateLocked(recLen int64) error {
 	if err != nil {
 		return err
 	}
+	s.dirCache.valid = false // создан новый пак — реестр изменился
 	_ = s.active.f.Close()
 	s.active = pf
 	return nil
@@ -529,6 +605,19 @@ func wrapPackWriteErr(err error, packID int32) error {
 		return fmt.Errorf("%w: пак %d: %w", ErrStoreFull, packID, err)
 	}
 	return fmt.Errorf("content: запись пака %d: %w", packID, err)
+}
+
+// flockDir/unlockDir — захват/освобождение межпроцессной блокировки
+// каталога паков: писатели (T-042) и компактификация (T-045).
+func flockDir(f *os.File) error {
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("content: блокировка каталога паков: %w", err)
+	}
+	return nil
+}
+
+func unlockDir(f *os.File) {
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
 // activeDictID — ID активного словаря пакета (0 — без словаря) для
