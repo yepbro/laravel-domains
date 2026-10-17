@@ -38,9 +38,12 @@
 //	    ограничены попытками доставки (at-least-once, ТЗ 3.4; потребитель
 //	    обязан быть идемпотентным по ключу — тот же контракт, что у XACK,
 //	    потерявшего ответ);
-//	  - публикация q:render (SPA-вердикты T-057) — НЕ здесь: render_pending/
-//	    q:render — территория T-066/T-067, граница зафиксирована в конце
-//	    файла.
+//	  - публикация q:render (SPA-вердикты T-057) — T-066, renderq.go:
+//	    неблокирующая проверка ёмкости q:render ДО транзакции; переполнение
+//	    — флаг render_pending ТОЙ ЖЕ транзакцией (§3.4), при свободной
+//	    очереди — публикация после фиксации мимо WatermarkPublisher
+//	    (§5.6: рендер не задерживает остальные этапы — XACK не ждёт
+//	    ёмкости).
 //
 // Идемпотентность повторной доставки (ТЗ 3.4): перезапись результата —
 // DELETE+INSERT строк домена (§3.5 «история проверок не хранится: только
@@ -151,14 +154,20 @@ type RecordDB interface {
 }
 
 // Recorder — записывает результат HTTP-эпизода в subdomain_results,
-// переводит домен в итоговый статус и публикует q:analyze (T-058).
-// Подключается сборкой сервиса в Options.OnResult — вслед за
-// ContentSaver (T-056: новый контент уже имеет +1 refcount от Put) и до
-// XACK (ТЗ 4.2). Потокобезопасен: состояние неизменно после New.
+// переводит домен в итоговый статус и публикует q:analyze (T-058), а при
+// подключённой очереди рендера — q:render по SPA-записям с флагом
+// render_pending при переполнении (T-066, renderq.go). Подключается
+// сборкой сервиса в Options.OnResult — вслед за ContentSaver (T-056:
+// новый контент уже имеет +1 refcount от Put) и до XACK (ТЗ 4.2).
+// Потокобезопасен: состояние неизменно после New.
 type Recorder struct {
 	pool RecordDB
 	q    queue.Queue
-	log  *slog.Logger
+	// render — очередь рендера (T-066): nil у NewRecorder — этап рендера
+	// отключён (q:render не публикуется, флаг не ставится); ставится
+	// NewRenderRecorder.
+	render *RenderQueue
+	log    *slog.Logger
 }
 
 // NewRecorder строит записатель поверх пула БД и очереди (продакшн —
@@ -178,13 +187,17 @@ func NewRecorder(pool RecordDB, q queue.Queue, log *slog.Logger) (*Recorder, err
 }
 
 // RecordAndPublish записывает результат домена одной транзакцией (UPDATE
-// domains + DELETE старых строк + своп ссылок contents + INSERT новых,
-// ТЗ 3.4/§5.5 п. 7) и после фиксации публикует q:analyze по одному Result
-// на запись субдомен×вариант (формат T-024). Возвращает false без ошибки,
-// когда охрана отсекла запись (домен удалён — §8/§13.1, или строки нет):
-// это успех, публикация не нужна. Ошибка — сбой любого шага: доставка
-// q:http не подтверждается и вернётся повторной доставкой (Processing,
-// T-025); повторная доставка перезапишет результат идемпотентно.
+// domains + флаг render_pending при переполнении q:render, T-066 + DELETE
+// старых строк + своп ссылок contents + INSERT новых, ТЗ 3.4/§5.5 п. 7)
+// и после фиксации публикует q:analyze по одному Result на запись
+// субдомен×вариант (формат T-024) и q:render по SPA-записям при
+// свободной очереди (T-066). Возвращает false без ошибки, когда охрана
+// отсекла запись (домен удалён — §8/§13.1, или строки нет): это успех,
+// публикация не нужна. Ошибка — сбой любого шага: доставка q:http не
+// подтверждается и вернётся повторной доставкой (Processing, T-025);
+// повторная доставка перезапишет результат идемпотентно и заново решит
+// вопрос рендера (флаг — CASE-free: ставится только при переполнении,
+// снимает проход доработки renderq.go).
 func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (bool, error) {
 	if res == nil {
 		return false, nil // не бывает (processDelivery); защита прямых вызовов
@@ -194,6 +207,31 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		return false, err
 	}
 	status := recordStatus(res)
+
+	// T-066: SPA-ключи q:render (§5.5 п. 8) и решение о ёмкости — ДО
+	// транзакции: при переполнении флаг render_pending фиксируется той же
+	// транзакцией результата (§3.4), потому решение нужно до её открытия.
+	// Проверка неблокирующая (HasCapacity, не WatermarkPublisher):
+	// ожидание ёмкости задержало бы XACK — рендер не должен задерживать
+	// остальные этапы (§5.6).
+	var renderKeys []queue.Result
+	renderPending := false
+	if r.render != nil {
+		renderKeys = renderSPAResults(res)
+		if len(renderKeys) > 0 {
+			free, err := r.render.HasCapacity(ctx)
+			if err != nil {
+				// XLEN недоступен — консервативно «места нет»: флаг
+				// сохраняет задачи рендера, эпизод не задерживается;
+				// настоящая недоступность Redis всё равно вернёт
+				// доставку на публикации q:analyze ниже.
+				r.log.Warn("ёмкость q:render не проверена — домен помечен render_pending",
+					"domain", res.Name, "err", err)
+				free = false
+			}
+			renderPending = !free
+		}
+	}
 
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -214,6 +252,20 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		r.log.Debug("результат не записан — домен удалён или отсутствует",
 			"domain", res.Name, "zone_id", res.ZoneID, "domain_id", res.DomainID)
 		return false, nil
+	}
+
+	// Флаг render_pending — той же транзакцией (T-066, §5.6): решение
+	// относится к этому результату (переполнение q:render в момент
+	// записи), сбой фиксации откатывает и строки, и флаг; строка уже
+	// заблокирована UPDATE выше — RowsAffected обязан быть 1.
+	if renderPending {
+		tag, err := tx.Exec(ctx, renderSetPendingSQL, res.ZoneID, res.DomainID)
+		if err != nil {
+			return false, fmt.Errorf("httpworker: домен %s: флаг render_pending: %w", res.Name, err)
+		}
+		if tag.RowsAffected() != 1 {
+			return false, fmt.Errorf("httpworker: домен %s: флаг render_pending: затронуто %d строк", res.Name, tag.RowsAffected())
+		}
 	}
 
 	// Перезапись (§3.5): старые строки домена уходят целиком, их ссылки
@@ -254,9 +306,21 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		}
 	}
 
+	// q:render по SPA-записям (T-066, §5.5 п. 8): после фиксации — как и
+	// q:analyze, Result указывает на строку. Только при свободной очереди:
+	// переполнение уже закрыто флагом в транзакции. Публикация мимо
+	// WatermarkPublisher (T-026) — ёмкость проверена выше, ожидание здесь
+	// задержало бы XACK (§5.6).
+	if len(renderKeys) > 0 && !renderPending {
+		if err := r.render.Publish(ctx, renderKeys); err != nil {
+			return true, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		}
+	}
+
 	r.log.Debug("HTTP-результат записан",
 		"domain", res.Name, "status", status.String(), "records", len(batch.zone),
-		"swapped_refs", len(oldHashes))
+		"swapped_refs", len(oldHashes),
+		"render_pending", renderPending, "q_render", len(renderKeys))
 	return true, nil
 }
 

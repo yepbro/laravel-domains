@@ -13,9 +13,12 @@
 // alive/no_http/temp_error, домен done, §7) и каждая запись публикуется
 // в q:analyze (Result, T-024) — вся цепочка в хуке Options.OnResult до
 // XACK (ТЗ 4.2), подтверждение q:http — паттерном Processing (T-025).
-// Публикация q:render по SPA-вердиктам — рендер-этап (T-066/T-067), не
-// здесь. Хосты редиректов резолвятся «через тот же резолвер» (ТЗ 5.5
-// п. 2): dnsclient с лимитами T-035 → адаптер httpworker.DNSLookup → кэш
+// SPA-записи публикуются в q:render (T-066, renderq.go): свободная
+// очередь — сразу после фиксации, переполнение — флаг render_pending той
+// же транзакцией без задержки XACK (§5.6), доработка — фоновым проходом
+// RequeueRenderPending (повторный SPA-вердикт по сохранённому контенту).
+// Хосты редиректов резолвятся «через тот же резолвер» (ТЗ 5.5 п. 2):
+// dnsclient с лимитами T-035 → адаптер httpworker.DNSLookup → кэш
 // CachingResolver. Каркас — internal/service: миграции, пул БД,
 // /healthz и /metrics, graceful shutdown.
 package main
@@ -136,19 +139,41 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Очередь: потребление q:http и публикация q:analyze — под гейтом
 	// backpressure (T-026: порог единый для рабочих стримов; Consume/Ack
-	// проходят прозрачно, как у dns-worker).
+	// проходят прозрачно, как у dns-worker). Публикация q:render идёт
+	// мимо WatermarkPublisher, через ту же RedisQueue (T-066, §5.6):
+	// ожидание ёмкости задержало бы XACK задачи q:http — при переполнении
+	// домен получает флаг render_pending вместо публикации (renderq.go).
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
 		Log:       logger,
 	})
-	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
+	rawQ := queue.NewRedisQueue(rdb, queue.RedisOptions{})
+	q := queue.NewWatermarkPublisher(rawQ, gate)
 
-	recorder, err := httpworker.NewRecorder(pool, q, logger)
+	// Очередь рендера: неблокирующая проверка ёмкости (XLEN через гейт
+	// T-026, общий порог scheduler.queue_high_watermark) + публикация
+	// без ожидания ёмкости.
+	renderQ, err := httpworker.NewRenderQueue(rawQ, gate, int64(cfg.Scheduler.QueueHighWatermark), logger)
 	if err != nil {
 		return err
 	}
+
+	recorder, err := httpworker.NewRenderRecorder(pool, q, renderQ, logger)
+	if err != nil {
+		return err
+	}
+
+	// Проход доработки рендера (T-066, §5.6 «дорабатываются позже»):
+	// домены с флагом render_pending → повторный SPA-вердикт по
+	// сохранённому контенту → публикация q:render при свободной очереди.
+	// Отдельной горутиной в том же OnRun (образец CleanupDeleted
+	// T-020/T-021): не зависит от цикла задач q:http, завершается
+	// отменой ctx.
+	go func() {
+		_ = httpworker.RequeueRenderPending(ctx, pool, store, renderQ, httpworker.RequeueOptions{Log: logger})
+	}()
 
 	opts2 := httpworker.Options{
 		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — не следовать (T-006/T-048)
