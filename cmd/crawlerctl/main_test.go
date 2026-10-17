@@ -83,11 +83,13 @@ func TestRun(t *testing.T) {
 		{name: "zones enable невалидная зона", args: []string{"zones", "enable", "bad!!zone"}, code: exitUsage, inErr: "некорректное имя зоны"},
 		{name: "zones --help", args: []string{"zones", "--help"}, code: exitOK, inOut: "zones list"},
 
-		// reanalyze — информационная заглушка, код 0 (как раньше).
-		{name: "reanalyze", args: []string{"reanalyze"}, code: exitOK, inOut: "T-074"},
-		{name: "reanalyze --zone", args: []string{"reanalyze", "--zone", "Crawl.Test."}, code: exitOK, inOut: "T-074"},
+		// reanalyze — функциональная команда (T-074): требует конфигурацию
+		// (БД/Redis) — путь выполнения с инфраструктурой проверяет отдельный
+		// TestRunReanalyze; здесь — использование и справка.
 		{name: "reanalyze --zone невалидная", args: []string{"reanalyze", "--zone", "bad!!zone"}, code: exitUsage, inErr: "некорректное имя зоны"},
-		{name: "reanalyze --help", args: []string{"reanalyze", "--help"}, code: exitOK, inOut: "crawlerctl reanalyze"},
+		{name: "reanalyze --zone без значения", args: []string{"reanalyze", "--zone"}, code: exitUsage, inErr: "reanalyze: "},
+		{name: "reanalyze лишний аргумент", args: []string{"reanalyze", "foo"}, code: exitUsage, inErr: "лишние аргументы"},
+		{name: "reanalyze --help", args: []string{"reanalyze", "--help"}, code: exitOK, inOut: "переанализ сохранённых результатов"},
 
 		// recheck — заглушка, код 1 с номером задачи.
 		{name: "recheck без домена", args: []string{"recheck"}, code: exitUsage, inErr: "укажите домен"},
@@ -136,6 +138,39 @@ func TestRun(t *testing.T) {
 				t.Errorf("run(%q) stderr не содержит %q;\nstderr:\n%s", tc.args, tc.inErr, stderr.String())
 			}
 		})
+	}
+}
+
+// TestRunReanalyze — путь выполнения reanalyze (T-074) без инфраструктуры:
+// команда требует конфигурацию (DSN PostgreSQL, Redis, каталог правил) —
+// при её отсутствии завершается ошибкой выполнения (код 1) с контекстом
+// задачи, не трогая сеть. Валидация входа идёт раньше: неверная зона —
+// код 2 даже без конфигурации (таблица TestRun). Работа против живых
+// БД/Redis — dev-окружение (make reanalyze).
+func TestRunReanalyze(t *testing.T) {
+	// Явно отсутствующий конфиг-файл: детерминированный отказ до любых
+	// соединений (в контейнере tools переменные APP_* могли бы собрать
+	// конфигурацию из окружения — тест не должен ходить в живой стек).
+	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"reanalyze"}, &stdout, &stderr)
+	if code != exitError {
+		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitError, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "reanalyze: config:") {
+		t.Errorf("stderr не содержит контекст конфигурации:\n%s", stderr.String())
+	}
+
+	// Валидная зона — та же ошибка конфигурации (проверка входа прошла).
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"reanalyze", "--zone", "Crawl.Test."}, &stdout, &stderr)
+	if code != exitError || !strings.Contains(stderr.String(), "reanalyze: config:") {
+		t.Errorf("код = %d, stderr:\n%s; хочу ошибку конфигурации (код 1)", code, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout до соединения не пуст:\n%s", stdout.String())
 	}
 }
 

@@ -182,7 +182,11 @@ deleted, `delete` — перевод в deleted) → отчёт в таблиц�
   состава сработавших правил с `meta.yaml` (поле `rules`; `rules: []` — ни
   одно правило не должно сработать). Ту же сверку выполняет юнит-тест
   `internal/rules/laravel_test.go`.
-- Переанализ сохранённого контента: `make reanalyze` (после реализации analyzer).
+- Переанализ сохранённого контента: `make reanalyze` — находит результаты
+  с устаревшим `rules_version` и ставит их в `q:analyze` (без повторного
+  скачивания; детали — [`analyzer.md`](analyzer.md), раздел «Переанализ»).
+  Тот же проход фоновой горутиной делает сервис analyzer: смена правил
+  по `make rules-reload` запускает переанализ без рестарта.
 
 ## 6. CLI crawlerctl
 
@@ -200,7 +204,9 @@ crawlerctl domain <имя> [--json] [--content]
                                          # нормализуются уже сейчас
 crawlerctl subdomains list|add|disable   # справочник субдоменов (T-083)
 crawlerctl zones list|enable|disable     # управление зонами (T-084)
-crawlerctl reanalyze [--zone ИМЯ]        # переанализ по новым правилам (T-074)
+crawlerctl reanalyze [--zone ИМЯ]        # переанализ по новым правилам
+                                          # (T-074): постановка в q:analyze
+                                          # без повторного скачивания
 crawlerctl recheck <домен> [домен …]     # принудительная постановка домена
                                          # на проверку (T-084)
 crawlerctl dict train <файл> [--samples ПУТЬ]…
@@ -225,6 +231,14 @@ docker compose run --rm -v "$(pwd)/var/content:/out tools \
 `make reanalyze`, `make seed`, `make test-rules`. Остальные команды —
 `docker compose run --rm tools go run ./cmd/crawlerctl <команда>`
 (см. `make shell`).
+
+`reanalyze` (T-074, ТЗ 5.8): находит `subdomain_results` с устаревшим
+`rules_version` (NULL — никогда не анализированные) и пачками ставит их
+в `q:analyze` — анализ пойдёт по сохранённому контенту, сайты не
+загружаются заново. `--zone` ограничивает зону (имя в любой форме,
+punycode/unicode); без флага — все зоны. Версия набора правил читается
+из `analyzer.rules_dir` на момент запуска; счётчик постановок печатается
+в stdout. Команда работает на стеке dev-окружения (PostgreSQL/Redis).
 
 ## 7. Отладка, метрики, БД, очереди
 
