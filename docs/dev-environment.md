@@ -406,20 +406,15 @@ resilience_test.go`, T-032) работают в выделенной БД Redis 
 `net.ipv4.ip_local_port_range=1024 65535` для воркеров.
 
 Для нагрузочных тестов, приближенных к боевым (один IP, тысячи соединений),
-на хосте дополнительно:
+на хосте примените комплект sysctl боевого сервера — расчёты и обоснование
+в [`os-tuning.md`](os-tuning.md):
 
 ```bash
-# эфемерные порты и переиспользование TIME_WAIT
-sysctl -w net.ipv4.ip_local_port_range="1024 65535"
-sysctl -w net.ipv4.tcp_tw_reuse=1
-
-# conntrack: увеличить таблицу или исключить трафик краулера
-sysctl -w net.netfilter.nf_conntrack_max=1048576
-
-# UDP-буферы для DNS
-sysctl -w net.core.rmem_max=16777216
-sysctl -w net.core.wmem_max=16777216
+sudo install -m 0644 deploy/sysctl/99-crawler.conf /etc/sysctl.d/
+sudo sysctl --system
 ```
 
-Постоянно — через `/etc/sysctl.d/99-crawler.conf`. Настройки уровня ядра
-хоста влияют на все контейнеры; в CI не требуются.
+Файл покрывает эфемерные порты и TIME_WAIT, nofile/fs.file-max, conntrack
+(таблица + хэш) и UDP-буферы DNS. Инструкция, проверка и откат —
+[`deploy/sysctl/README.md`](../deploy/sysctl/README.md). Настройки уровня
+ядра хоста влияют на все контейнеры; в CI не требуются.
