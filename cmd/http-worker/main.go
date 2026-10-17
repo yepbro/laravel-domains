@@ -8,14 +8,16 @@
 // алиасы T-055, SPA-эвристика T-057 — internal/httpworker (T-053).
 // Контент оригинальных записей сохраняется в ContentStore (T-056: паки
 // T-042, словарь zstd T-043, дедуп по хэшу §8; контроль диска T-046 —
-// DiskWatchLoop) в хуке Options.OnResult — до XACK и до будущей записи
-// результата T-058 (ТЗ 4.2). Подтверждение q:http — паттерном Processing
-// (T-025): XACK после полного цикла обработки домена; публикация
-// q:render/q:analyze — T-058/T-067, той же точкой подключения. Хосты
-// редиректов резолвятся «через тот же резолвер» (ТЗ 5.5 п. 2): dnsclient
-// с лимитами T-035 → адаптер httpworker.DNSLookup → кэш CachingResolver.
-// Каркас — internal/service: миграции, пул БД, /healthz и /metrics,
-// graceful shutdown.
+// DiskWatchLoop), затем результат домена записывается в subdomain_results
+// одной транзакцией со свопом ссылок на контент (Recorder T-058: статус
+// alive/no_http/temp_error, домен done, §7) и каждая запись публикуется
+// в q:analyze (Result, T-024) — вся цепочка в хуке Options.OnResult до
+// XACK (ТЗ 4.2), подтверждение q:http — паттерном Processing (T-025).
+// Публикация q:render по SPA-вердиктам — рендер-этап (T-066/T-067), не
+// здесь. Хосты редиректов резолвятся «через тот же резолвер» (ТЗ 5.5
+// п. 2): dnsclient с лимитами T-035 → адаптер httpworker.DNSLookup → кэш
+// CachingResolver. Каркас — internal/service: миграции, пул БД,
+// /healthz и /metrics, graceful shutdown.
 package main
 
 import (
@@ -47,11 +49,8 @@ func main() {
 
 	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
 	// готов до старта OnRun: postgres.dsn обязателен (config.Validate);
-	// им пользуется и хранилище контента (строки contents, T-042/T-056).
-	// Записи результатов в БД пока нет (T-058 подключит её хуком
-	// Options.OnResult до XACK, вслед за сохранением контента T-056) —
-	// пул держится сборкой сервиса, чтобы добавление записи не меняло
-	// окружение.
+	// им пользуется и хранилище контента (строки contents, T-042/T-056),
+	// и запись результата (subdomain_results/domains, T-058).
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "http-worker",
@@ -135,22 +134,36 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 
+	// Очередь: потребление q:http и публикация q:analyze — под гейтом
+	// backpressure (T-026: порог единый для рабочих стримов; Consume/Ack
+	// проходят прозрачно, как у dns-worker).
+	rdb := queue.NewClient(cfg.Redis.Addr)
+	defer func() { _ = rdb.Close() }()
+	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
+		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
+		Log:       logger,
+	})
+	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
+
+	recorder, err := httpworker.NewRecorder(pool, q, logger)
+	if err != nil {
+		return err
+	}
+
 	opts2 := httpworker.Options{
 		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — не следовать (T-006/T-048)
 		Log:          logger,
-		// Сохранение контента (T-056) — внутри обработки задачи, до XACK
-		// и до будущей записи результата (T-058, ТЗ 4.2): сбой сохранения
-		// — доставка без подтверждения, повторная доставка переиграет
-		// сохранение (лишние ссылки Put безопасны по ТЗ 3.4 — новых
-		// байтов дедуп не пишет).
+		// Цепочка OnResult (внутри обработки задачи, до XACK, ТЗ 4.2):
+		// сохранение контента (T-056) → запись subdomain_results со свопом
+		// ссылок contents (T-058/T-044) → публикация q:analyze (T-058,
+		// §5.5 п. 9). Сбой любого звена — доставка без подтверждения,
+		// повторная доставка переигрывает цепочку идемпотентно (ТЗ 3.4).
 		OnResult: func(c context.Context, res *httpworker.DomainResult) error {
 			if err := saver.Save(c, res); err != nil {
 				return err
 			}
-			// T-058: запись subdomain_results (content_hash — только
-			// сохранённый контент), статус alive/no_http, публикация
-			// q:render/q:analyze.
-			return nil
+			_, err := recorder.RecordAndPublish(c, res)
+			return err
 		},
 	}
 	w, err := httpworker.New(httpworker.ChainFetch(fetcher), opts2)
@@ -158,13 +171,5 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 
-	rdb := queue.NewClient(cfg.Redis.Addr)
-	defer func() { _ = rdb.Close() }()
-	q := queue.NewRedisQueue(rdb, queue.RedisOptions{})
-
-	// Публикаций из http-worker пока нет (q:render/q:analyze — T-058),
-	// поэтому гейт backpressure не подключался: Consume/Ack проходят
-	// напрямую. T-058 при добавлении публикаций обернёт очередь
-	// WatermarkPublisher'ом (как dns-worker).
 	return httpworker.Run(ctx, q, w, opts2)
 }

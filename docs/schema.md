@@ -238,9 +238,12 @@ HOT (без записи в индексы), пока обновляемая к�
 (закреплено тестом `TestSchema_ResultsIdempotency`):
 
 - `subdomain_results` / `laravel_findings` — ключ
-  `(zone_id, domain_id, subdomain_id, variant)`; воркеры пишут результат
-  `INSERT … ON CONFLICT … DO UPDATE` (последний результат выигрывает,
-  ТЗ 3.4, 3.5);
+  `(zone_id, domain_id, subdomain_id, variant)`; HTTP-этап пишет результат
+  домена перезаписью в одной транзакции (T-058): `DELETE` старых строк
+  домена (включая исчезнувшие ключи — §3.5 «только последний результат») с
+  `RETURNING content_hash` → −1 `refcount` старого контента (`SwapRefTx`,
+  T-044) → `INSERT` новых unnest-пачкой; повторная доставка идемпотентна
+  (ТЗ 3.4, 3.5);
 - `laravel_domains` — ключ `(zone_id, domain_id)`;
 - `contents` — ключ `hash`: повторная запись того же контента наращивает
   `refcount`, а не создаёт строку (ТЗ 5.7);
@@ -267,6 +270,23 @@ HOT (без записи в индексы), пока обновляемая к�
 | `model.Scheme` | `subdomain_results.scheme` | 1 http, 2 https |
 | `model.AliasKind` | `subdomain_results.alias_kind` | 0 нет, 1 идентичен, 2 редирект (ТЗ 5.5 п. 6) |
 | `model.Action` | `ingest_files.action` | 1 add, 2 delete |
+
+Представления бинарных и jsonb-колонок `subdomain_results` фиксирует
+HTTP-этап (T-058, `internal/httpworker/record.go`):
+
+- `addrs` — по 16 октетов на адрес, IPv4 в v4-mapped форме
+  (`::ffff:a.b.c.d`, `netip.Addr.As16`): смешанные наборы A/AAAA не
+  двусмысленны, длина всегда кратна 16; порядок адресов — задачи
+  `q:http` (A, затем AAAA, порядок ответа DNS-этапа);
+- `tls`, `redirects` — JSON структур `httpfetch.TLSInfo` (T-050) и
+  `[]httpfetch.RedirectStep` (T-048), теги snake_case;
+- `headers` — канонические имена заголовков итогового ответа
+  (`http.Header`: `{"Content-Type":["text/html"], …}`);
+- `cookies` — массив `{name, value, path, domain, expires, max_age,
+  secure, http_only, same_site}` (RFC 3339 для `expires`);
+- `error` — класс ошибки проверки (T-053: 1 таймаут, 2 редиректы, 3 TLS,
+  4 тело, 5 сеть; NULL — без ошибки), `rendered = false` до рендера
+  (T-067), `rules_version` заполняет анализатор (T-068+).
 
 Границы маски защищены в самом типе: бит 63 `bigint` знаковый, поэтому
 `DNSMask.Set`/`Unset` отвергают номера вне 0..62 ошибкой (все номера
