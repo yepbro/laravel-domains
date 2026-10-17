@@ -50,13 +50,23 @@ file_server
 }
 
 http://different-sites.crawl.test {
-root * /srv/sites/different-sites/http
-file_server
+    redir http://different-sites-alt.crawl.test{uri} permanent
 }
 
 https://different-sites.crawl.test {
     tls internal
 root * /srv/sites/different-sites/https
+file_server
+}
+
+http://different-sites-alt.crawl.test {
+root * /srv/sites/different-sites-alt
+file_server
+}
+
+https://different-sites-alt.crawl.test {
+    tls internal
+root * /srv/sites/different-sites-alt
 file_server
 }
 

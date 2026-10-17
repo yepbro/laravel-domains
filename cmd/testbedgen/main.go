@@ -316,7 +316,6 @@ func (g *generator) addSamples(baseZone string) {
 
 // addSite генерирует Caddy-блоки и фикстуры по описанию сайта сценария.
 func (g *generator) addSite(sc Scenario, zone, fqdn, www string) {
-	_ = zone
 	s := sc.Site
 	sitesDir := filepath.Join(g.baseDir, "deploy/docker/testbed/web/sites", sc.Name)
 
@@ -324,7 +323,7 @@ func (g *generator) addSite(sc Scenario, zone, fqdn, www string) {
 	case "parked":
 		// Идентичное содержимое для parked-1/parked-2 — дедупликация по хэшу.
 		g.writeFixture(sitesDir, "index.html", parkedPage())
-		g.serveBlocks(sc, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
+		g.serveBlocks(sc, zone, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
 
 	case "redirect-chain":
 		g.writeFixture(sitesDir, "final.html", genericPage(fqdn+" — финал цепочки"))
@@ -337,25 +336,25 @@ func (g *generator) addSite(sc Scenario, zone, fqdn, www string) {
 	case "meta-refresh":
 		g.writeFixture(sitesDir, "index.html", metaRefreshPage(fqdn, "final.html"))
 		g.writeFixture(sitesDir, "final.html", genericPage(fqdn+" — финал meta refresh"))
-		g.serveBlocks(sc, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
+		g.serveBlocks(sc, zone, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
 
 	case "js-redirect":
 		g.writeFixture(sitesDir, "index.html", jsRedirectPage(fqdn, "final.html"))
 		g.writeFixture(sitesDir, "final.html", genericPage(fqdn+" — финал js redirect"))
-		g.serveBlocks(sc, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
+		g.serveBlocks(sc, zone, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
 
 	case "spa":
 		g.writeFixture(sitesDir, "index.html", spaPage(fqdn))
-		g.serveBlocks(sc, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
+		g.serveBlocks(sc, zone, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
 
 	default: // generic
 		g.writeFixture(sitesDir, "index.html", genericPage(fqdn))
-		g.serveBlocks(sc, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
+		g.serveBlocks(sc, zone, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
 	}
 }
 
 // serveBlocks — стандартные комбинации http/https-блоков сценария.
-func (g *generator) serveBlocks(sc Scenario, fqdn, www, serveBody string) {
+func (g *generator) serveBlocks(sc Scenario, zone, fqdn, www, serveBody string) {
 	s := sc.Site
 
 	switch {
@@ -385,11 +384,15 @@ func (g *generator) serveBlocks(sc Scenario, fqdn, www, serveBody string) {
 		g.caddySiteBlock("http://"+fqdn, "", "    redir https://"+fqdn+"{uri} permanent")
 		g.caddySiteBlock("https://"+fqdn, "    tls internal\n", serveBody)
 
-	case s.HTTP == "different": // http и https — разные сайты: variant 0 и 1
+	case s.HTTP == "different": // http и https — разные сайты: variant 0 и 1.
+		// «Разные» по ТЗ §5.5 п. 5 — различие итоговых host+path И хэшей:
+		// одинаковый host с разным контентом «одним сайтом» считает критерий
+		// (host+path равен), поэтому http редиректит на отдельный хост-спутник
+		// <имя>-alt (обычный сценарий testbed со своим A и vhost).
+		alt := "http://" + sc.Name + "-alt." + zone + "{uri} permanent"
+		g.caddySiteBlock("http://"+fqdn, "", "    redir "+alt)
 		sitesDir := filepath.Join(g.baseDir, "deploy/docker/testbed/web/sites", sc.Name)
-		g.writeFixture(filepath.Join(sitesDir, "http"), "index.html", genericPage(fqdn+" — HTTP-версия"))
 		g.writeFixture(filepath.Join(sitesDir, "https"), "index.html", genericPage(fqdn+" — HTTPS-версия"))
-		g.caddySiteBlock("http://"+fqdn, "", fmt.Sprintf("root * /srv/sites/%s/http\nfile_server", sc.Name))
 		g.caddySiteBlock("https://"+fqdn, "    tls internal\n", fmt.Sprintf("root * /srv/sites/%s/https\nfile_server", sc.Name))
 
 	default: // оба протокола, одинаковый контент, без редиректа

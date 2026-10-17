@@ -663,13 +663,14 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 		}
 
 		revive := env.process(t, filepath.Join(accIDNZoneUni, "add", "revive.txt"), fileContent(
-			accIDNLabelU+"."+accIDNZoneUni,
+			accIDNLabel+"."+accIDNZone, // punycode-форма того же домена: другой sha256, чем у delete-файла
+			"возврат."+accIDNZoneUni,   // новый домен — Added=1
 		))
 		if revive.Kind != ingest.OutcomeApplied {
 			t.Fatalf("итог возврата = %q, хочу applied", revive.Kind)
 		}
-		if revive.Report.Revived != 1 || revive.Report.Added != 1 {
-			t.Errorf("возврат: added=%d revived=%d, хочу 1/1", revive.Report.Added, revive.Report.Revived)
+		if revive.Report.Revived != 1 || revive.Report.Added != 2 {
+			t.Errorf("возврат: added=%d revived=%d, хочу 2/1 (Added включает Revived — контракт T-021)", revive.Report.Added, revive.Report.Revived)
 		}
 		d, _ = env.domain(t, accIDNZone, accIDNLabel)
 		if d.status != int16(model.StatusNew) || d.checkState != int16(model.CheckStatePending) {
@@ -703,7 +704,9 @@ func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 	// проверку (§5.5 п. 7); столько же сообщений q:analyze.
 	var totalRows int
 	for _, l := range labels {
-		totalRows += len(accRows(t, env.pool, ids[l]))
+		n := len(accRows(t, env.pool, ids[l]))
+		t.Logf("домен %s: записей %d", l, n)
+		totalRows += n
 	}
 	if totalRows != 8 {
 		t.Fatalf("записей subdomain_results по 4 доменам: %d, хочу 8", totalRows)
@@ -766,6 +769,9 @@ func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 		}
 		if accStr(main.finalURL) == accStr(alt.finalURL) {
 			t.Errorf("итоговые URL совпали: %q — сайты обязаны быть разными", accStr(main.finalURL))
+		}
+		if got := accStr(alt.finalURL); got != "http://different-sites-alt.crawl.test/" {
+			t.Errorf("итоговый URL http-варианта = %q, хочу http://different-sites-alt.crawl.test/ (редирект на хост-спутник)", got)
 		}
 		for i, r := range rows {
 			if r.aliasKind != int16(model.AliasNone) || r.aliasSub != nil {
@@ -1128,9 +1134,14 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	for _, l := range labels {
 		fs := accFindings(t, env.pool, zoneID, ids[l])
 		sample := accSampleByID(t, l)
-		if len(fs) != len(sample.Expect.Rules) {
-			t.Errorf("%s: findings после переанализа = %d строк, хочу %d", l, len(fs), len(sample.Expect.Rules))
+		// Строка findings — одна на (домен, субдомен, вариант): срабатывания
+		// в signals jsonb, отдельной строки на правило нет (T-071, §6.1).
+		if len(fs) != 1 {
+			t.Errorf("%s: findings после переанализа = %d строк, хочу 1", l, len(fs))
 			continue
+		}
+		if got := len(accFiredRules(t, fs[0].signals)); got != len(sample.Expect.Rules) {
+			t.Errorf("%s: срабатываний в signals = %d, хочу %d", l, got, len(sample.Expect.Rules))
 		}
 		for _, f := range fs {
 			if f.rulesVersion != v2 {
@@ -1503,7 +1514,7 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		if key == "CRAWLER_SCHEDULER_RECHECK_INTERVAL" {
 			return "170h"
 		}
-		return ""
+		return os.Getenv(key) // остальное окружение (в т.ч. APP_PG_DSN) — как есть
 	})
 	if err != nil {
 		t.Fatalf("конфиг с переопределением: %v", err)
@@ -1543,10 +1554,12 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		t.Errorf("повторный проход перевёл ещё %d — интервал не соблюдается", res.Domains)
 	}
 
-	// Интервал меняется конфигом: 10 лет — fresh тоже созрел, never
-	// (никогда не проверялся) и pending/deleted по-прежнему нет.
+	// Интервал меняется конфигом: 7 дней (короче возраста fresh ~17 дней,
+	// но длиннее возраста «сегодня проверенных») — fresh тоже созрел, never
+	// (никогда не проверялся) и pending/deleted по-прежнему нет. Созревание
+	// — возраст > интервала (§11.4 п. 8 «не чаще»), длиннее — только старше.
 	res, err = scheduler.RecheckOnce(ctx, pool, scheduler.RecheckOptions{
-		Interval: 10 * 365 * 24 * time.Hour,
+		Interval: 7 * 24 * time.Hour,
 		Now:      func() time.Time { return now },
 	})
 	if err != nil {

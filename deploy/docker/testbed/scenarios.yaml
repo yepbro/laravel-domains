@@ -82,7 +82,11 @@ scenarios:
   - name: different-sites
     dns: {a: testweb}
     site: {http: different}
-    expect: "http и https — разные сайты → две записи, variant 0 и 1"
+    expect: "http редиректит на другой хост (different-sites-alt), https — свой сайт → две записи, variant 0 и 1 (ТЗ 5.5 п. 5: разные host+path И хэши)"
+
+  - name: different-sites-alt
+    dns: {a: testweb}
+    expect: "спутник different-sites: цель http-редиректа, отдельный сайт"
 
   - name: bare-to-www
     dns: {a: testweb, www: true}

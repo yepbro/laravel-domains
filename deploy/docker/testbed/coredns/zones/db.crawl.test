@@ -16,6 +16,7 @@ cookies IN A 172.28.100.13
 cycle-redirect IN A 172.28.100.13
 delegated-no-address IN NS ns.crawl.test.
 different-sites IN A 172.28.100.12
+different-sites-alt IN A 172.28.100.12
 django-negative IN A 172.28.100.12
 equal-pair IN A 172.28.100.12
 garbage-content IN A 172.28.100.13
