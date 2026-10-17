@@ -38,13 +38,17 @@ import (
 type anEventKind string
 
 const (
-	anEvGet    anEventKind = "get"    // чтение контента
-	anEvBegin  anEventKind = "begin"  // открытие транзакции
-	anEvMark   anEventKind = "mark"   // UPDATE-штамп rules_version
-	anEvUpsert anEventKind = "upsert" // INSERT ... ON CONFLICT laravel_findings
-	anEvDelete anEventKind = "delete" // DELETE laravel_findings
-	anEvCommit anEventKind = "commit"
-	anEvAck    anEventKind = "ack"
+	anEvGet       anEventKind = "get"        // чтение контента
+	anEvBegin     anEventKind = "begin"      // открытие транзакции
+	anEvMark      anEventKind = "mark"       // UPDATE-штамп rules_version
+	anEvUpsert    anEventKind = "upsert"     // INSERT ... ON CONFLICT laravel_findings
+	anEvDelete    anEventKind = "delete"     // DELETE laravel_findings
+	anEvLock      anEventKind = "lock"       // advisory-блокировка домена (T-072)
+	anEvAggSelect anEventKind = "agg_select" // SELECT findings домена для агрегации
+	anEvAggUpsert anEventKind = "agg_upsert" // upsert laravel_domains
+	anEvAggDelete anEventKind = "agg_delete" // DELETE laravel_domains
+	anEvCommit    anEventKind = "commit"
+	anEvAck       anEventKind = "ack"
 )
 
 // anJournal — потокобезопасный протокол (цикл Run работает в горутине).
@@ -122,23 +126,29 @@ type anFinding struct {
 
 // anFakePool — AnalyzerDB без БД: живая семантика subdomain_results
 // (SELECT по PK, UPDATE-штамп с охранами content_hash IS NOT DISTINCT
-// FROM и «домен не deleted»), domains (status) и laravel_findings
-// (upsert/DELETE по PK). Транзакция работает на снапшоте: Rollback
-// восстанавливает состояние, Commit оставляет (конкурентные транзакции
-// не моделируются — их сериализует PostgreSQL).
+// FROM и «домен не deleted»), domains (status), laravel_findings
+// (upsert/DELETE по PK) и laravel_domains (upsert/DELETE по PK домена,
+// SELECT уверенных срабатываний — агрегация T-072). Транзакция работает
+// на снапшоте: Rollback восстанавливает состояние, Commit оставляет
+// (конкурентные транзакции не моделируются — их сериализует PostgreSQL).
 type anFakePool struct {
 	j *anJournal
 
 	results  map[anRowKey]*anResultRow
 	statuses map[anRowKey]int16 // status домена по ключу строки
 	findings map[anRowKey]*anFinding
+	domains  map[anDomainKey]*anDomain
 
-	queryErr  error
-	beginErr  error
-	markErr   error
-	upsertErr error
-	deleteErr error
-	commitErr error
+	queryErr     error
+	beginErr     error
+	markErr      error
+	upsertErr    error
+	deleteErr    error
+	lockErr      error
+	aggSelectErr error
+	aggUpsertErr error
+	aggDeleteErr error
+	commitErr    error
 
 	// mutateBeforeTx — хук: вызывается перед снапшотом транзакции
 	// (симуляция перезаписи строки перепроверкой/рендером между SELECT
@@ -154,6 +164,7 @@ func newANFakePool() *anFakePool {
 		results:  make(map[anRowKey]*anResultRow),
 		statuses: make(map[anRowKey]int16),
 		findings: make(map[anRowKey]*anFinding),
+		domains:  make(map[anDomainKey]*anDomain),
 	}
 }
 
@@ -270,8 +281,13 @@ func (p *anFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 		c := *v
 		snapFindings[k] = &c
 	}
+	snapDomains := make(map[anDomainKey]*anDomain, len(p.domains))
+	for k, v := range p.domains {
+		c := *v
+		snapDomains[k] = &c
+	}
 	p.j.record(anEvBegin)
-	return &anFakeTx{pool: p, snapResults: snapResults, snapFindings: snapFindings}, nil
+	return &anFakeTx{pool: p, snapResults: snapResults, snapFindings: snapFindings, snapDomains: snapDomains}, nil
 }
 
 type anFakeTx struct {
@@ -280,6 +296,7 @@ type anFakeTx struct {
 	pool         *anFakePool
 	snapResults  map[anRowKey]*anResultRow
 	snapFindings map[anRowKey]*anFinding
+	snapDomains  map[anDomainKey]*anDomain
 	commit       bool
 }
 
@@ -289,9 +306,9 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 	}
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
-	key := anRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
 	switch sql {
 	case analyzeMarkSQL:
+		key := anRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
 		if t.pool.markErr != nil {
 			return pgconn.CommandTag{}, t.pool.markErr
 		}
@@ -316,6 +333,7 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 
 	case findingUpsertSQL:
+		key := anRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
 		if t.pool.upsertErr != nil {
 			return pgconn.CommandTag{}, t.pool.upsertErr
 		}
@@ -331,12 +349,53 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 
 	case findingDeleteSQL:
+		key := anRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
 		if t.pool.deleteErr != nil {
 			return pgconn.CommandTag{}, t.pool.deleteErr
 		}
 		delete(t.pool.findings, key)
 		t.pool.j.record(anEvDelete)
 		return pgconn.NewCommandTag("DELETE 1"), nil
+
+	case aggregateLockSQL:
+		if t.pool.lockErr != nil {
+			return pgconn.CommandTag{}, t.pool.lockErr
+		}
+		if args[0].(int64) == 0 {
+			return pgconn.CommandTag{}, errors.New("anFakePool: ключ блокировки не задан")
+		}
+		t.pool.j.record(anEvLock)
+		return pgconn.NewCommandTag("SELECT 1"), nil
+
+	case aggregateUpsertSQL:
+		key := anDomainKey{zone: args[0].(int16), domain: args[1].(int64)}
+		if t.pool.aggUpsertErr != nil {
+			return pgconn.CommandTag{}, t.pool.aggUpsertErr
+		}
+		t.pool.domains[key] = &anDomain{
+			score:        args[2].(float32),
+			verMin:       args[3].(*string),
+			verMax:       args[4].(*string),
+			foundOnMask:  model.DNSMask(args[5].(int64)),
+			rulesVersion: args[6].(int32),
+			updatedAt:    time.Now(),
+		}
+		t.pool.j.record(anEvAggUpsert)
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
+
+	case aggregateDeleteSQL:
+		key := anDomainKey{zone: args[0].(int16), domain: args[1].(int64)}
+		if t.pool.aggDeleteErr != nil {
+			return pgconn.CommandTag{}, t.pool.aggDeleteErr
+		}
+		_, ok := t.pool.domains[key]
+		delete(t.pool.domains, key)
+		tag := "DELETE 0"
+		if ok {
+			tag = "DELETE 1"
+		}
+		t.pool.j.record(anEvAggDelete)
+		return pgconn.NewCommandTag(tag), nil
 
 	default:
 		return pgconn.CommandTag{}, fmt.Errorf("anFakePool: неожидаемый SQL: %s", sql)
@@ -360,7 +419,7 @@ func (t *anFakeTx) Rollback(context.Context) error {
 	if t.commit {
 		return nil // откат после Commit — no-op
 	}
-	t.pool.results, t.pool.findings = t.snapResults, t.snapFindings
+	t.pool.results, t.pool.findings, t.pool.domains = t.snapResults, t.snapFindings, t.snapDomains
 	return nil
 }
 

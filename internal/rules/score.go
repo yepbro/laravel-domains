@@ -131,6 +131,29 @@ func (v version) less(o version) bool {
 	return false
 }
 
+// CompareVersions — сравнение строк версий по числовым компонентам
+// (семантика границ правил, T-070): отсутствующий компонент — 0, «x»/«*» —
+// +∞; возвращает -1 (a < b), 0 (эквивалентны, в том числе разная запись
+// «9.19» и «9.19.0») или 1 (a > b). Экспортирован для агрегации
+// laravel_domains (T-072: min(ver_min)/max(ver_max) по findings домена) —
+// текстовое MIN/MAX в SQL упорядочило бы «10» раньше «5.3». Пустая или
+// некорректная версия (parseVersion = nil) не упорядочена — 0; findings
+// хранят только строки, прошедшие валидацию набора (T-068), вызывающий
+// не передаёт сюда мусор.
+func CompareVersions(a, b string) int {
+	va, vb := parseVersion(a), parseVersion(b)
+	switch {
+	case va == nil || vb == nil:
+		return 0
+	case va.less(vb):
+		return -1
+	case vb.less(va):
+		return 1
+	default:
+		return 0
+	}
+}
+
 // Contains — попадает ли ожидаемый диапазон [expMin, expMax] внутрь
 // вычисленного (используется make test-rules).
 func (res Result) Contains(expMin, expMax string) bool {

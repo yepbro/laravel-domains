@@ -263,8 +263,12 @@ Chromium (`render.StartBrowser` — внешний по `render.remote_url` ил
   «домен не deleted» — 0 строк: успех без записи, стиль render-worker)
   → upsert `laravel_findings` (score, диапазон версий с NULL при
   конфликте, `signals` jsonb, `is_laravel`, `rules_version`) либо DELETE
-  при пустом итоге (§3.5 перезапись); повторные доставки идемпотентны
-  (ТЗ 3.4); агрегация в `laravel_domains` — T-072;
+  при пустом итоге (§3.5 перезапись) → пересчёт агрегата `laravel_domains`
+  (T-072: максимальный score, объединённый диапазон версий,
+  `found_on_mask` — бит № = `subdomains.id` у уверенных срабатываний;
+  advisory-блокировка домена согласует параллельные доставки); повторные
+  доставки идемпотентны (ТЗ 3.4) — детали в
+  [`analyzer.md`](analyzer.md);
 - analyzer ничего не публикует (конец конвейера §7) — гейт backpressure
   не нужен, очередь читается и подтверждается напрямую.
 

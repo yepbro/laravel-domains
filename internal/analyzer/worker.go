@@ -36,9 +36,10 @@
 // состояние не меняется; сбой между шагами откатывает транзакцию целиком,
 // повторная доставка проходит заново.
 //
-// Агрегация на уровне домена в laravel_domains (максимальный score,
-// объединённый диапазон версий, found_on_mask, rules_version) — задача
-// T-072: в транзакции findings пишутся ТОЛЬКО findings.
+// Агрегация на уровне домена — T-072 (aggregate.go): той же транзакцией,
+// сразу после findings, пересчитывается строка laravel_domains (§6.1:
+// максимальный score, объединённый диапазон версий, found_on_mask,
+// rules_version; ТЗ 5.8 «на уровне домена — агрегат»).
 package analyzer
 
 import (
@@ -240,10 +241,11 @@ type analyzeRow struct {
 }
 
 // ProcessResult обрабатывает одну задачу q:analyze (§5.8, §7): пассивный
-// анализ строки по текущему набору правил и запись laravel_findings в
-// одной транзакции со штампом rules_version. Возвращает true, когда
-// транзакция зафиксирована — findings записаны (все срабатывания
-// независимо от порога) либо при пустом итоге удалена прошлая строка и
+// анализ строки по текущему набору правил, запись laravel_findings и
+// пересчёт агрегата домена laravel_domains (T-072) в одной транзакции со
+// штампом rules_version. Возвращает true, когда транзакция зафиксирована —
+// findings записаны (все срабатывания независимо от порога) и агрегат
+// домена пересчитан, либо при пустом итоге удалена прошлая строка и
 // поставлен штамп (§3.5: «признаков нет» — тоже результат анализа).
 // false без ошибки — задачи делать нечего: строки нет (домен удалён/
 // перепроверен без этого ключа) или она ушла из-под задачи (контент
@@ -329,6 +331,13 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 			task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant)); err != nil {
 			return false, fmt.Errorf("analyzer: %s: удаление findings: %w", name, err)
 		}
+	}
+
+	// Агрегация домена — T-072: пересчёт laravel_domains по findings
+	// домена той же транзакцией (решения и согласование параллельных
+	// доставок — aggregate.go).
+	if err := aggregateDomain(ctx, tx, task.ZoneID, task.DomainID, set.Version); err != nil {
+		return false, fmt.Errorf("analyzer: %s: %w", name, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {

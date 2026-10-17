@@ -219,6 +219,36 @@ func TestVersionCompare(t *testing.T) {
 	}
 }
 
+// TestCompareVersions — экспортированное сравнение (агрегация
+// laravel_domains, T-072): порядок числовых компонент, эквивалентность
+// разной записи, неупорядоченность пустых/некорректных строк.
+func TestCompareVersions(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"9.19", "11", -1}, // числовое, а не текстовое: текстовый MIN взял бы «10»/«11» раньше «5.3»
+		{"10", "5.3", 1},
+		{"5.3", "10", -1},
+		{"9.x", "11", -1},     // 9.x = 9.∞ < 10 < 11
+		{"11", "9.x", 1},      // верхняя граница max(9.x, 11) = 11
+		{"9.19", "9.19.0", 0}, // эквивалентны в разной записи
+		{"9.19.0", "9.19", 0},
+		{"7.x", "7.x", 0},
+		{"5.3", "5.3", 0},
+		{"", "9.19", 0}, // пустая — нет данных
+		{"9.19", "", 0},
+		{"", "", 0},
+		{"abc", "9.19", 0}, // некорректная — нет данных
+		{"9.19", "9,19", 0},
+	}
+	for _, c := range cases {
+		if got := CompareVersions(c.a, c.b); got != c.want {
+			t.Errorf("CompareVersions(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
 func TestResultContains(t *testing.T) {
 	res := Result{VerMin: "9.19", VerMax: ""}
 	if !res.Contains("9.19", "") {
