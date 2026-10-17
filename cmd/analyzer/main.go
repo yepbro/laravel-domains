@@ -1,16 +1,18 @@
 // Сервис analyzer (ТЗ 5.8, §7; T-071): этап анализа Laravel. Потребляет
 // задачи q:analyze (Result — ключ строки subdomain_results, T-024;
-// публикуют HTTP-этап T-058 и render-worker T-067) группой потребителей;
-// вход пассивного анализа читается из БД (заголовки/cookies jsonb,
-// content_hash) и хранилища контента (HTML/DOM, ТЗ 5.7), правила
-// применяются из текущего снапшота набора (Reloader, T-068: SIGHUP
-// перезагружает каталог analyzer.rules_dir без рестарта — хук
-// OnSIGHUP каркаса), срабатывания записываются в laravel_findings
+// публикуют HTTP-этап T-058, render-worker T-067 и переанализ T-074)
+// группой потребителей; вход пассивного анализа читается из БД
+// (заголовки/cookies jsonb, content_hash) и хранилища контента (HTML/DOM,
+// ТЗ 5.7), правила применяются из текущего снапшота набора (Reloader,
+// T-068: SIGHUP перезагружает каталог analyzer.rules_dir без рестарта —
+// хук OnSIGHUP каркаса), срабатывания записываются в laravel_findings
 // (все, независимо от порога; is_laravel = score ≥ порога, §13.1) одной
-// транзакцией со штампом subdomain_results.rules_version (переанализ
-// T-074); подтверждение q:analyze — паттерном Processing (XACK только
-// после записи в БД, T-025). Каркас — internal/service: миграции, пул БД
-// (OnDBPool), /healthz и /metrics, graceful shutdown.
+// транзакцией со штампом subdomain_results.rules_version; подтверждение
+// q:analyze — паттерном Processing (XACK только после записи в БД,
+// T-025). Фоновый цикл переанализа (T-074) ставит записи с устаревшим
+// rules_version в q:analyze без повторного скачивания. Каркас —
+// internal/service: миграции, пул БД (OnDBPool), /healthz и /metrics,
+// graceful shutdown.
 package main
 
 import (
@@ -68,10 +70,11 @@ func main() {
 
 // run — рабочая логика analyzer: хранилище контента (чтение — тот же
 // PackStore, что пишет HTTP/рендер-этапы: словарь zstd T-043 обязан
-// совпадать, иначе распаковка чужих блоков невозможна) → цикл q:analyze.
+// совпадать, иначе распаковка чужих блоков невозможна) → очередь →
+// воркер q:analyze (передний план) + фоновый цикл переанализа (T-074).
 // Завершение — отмена ctx (graceful shutdown, ТЗ 3.4): начатые доставки
 // дорабатывают или возвращаются очереди повторной доставкой (Processing,
-// T-025).
+// T-025); ReanalyzeLoop на отмене возвращает чистый nil.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reloader *rules.Reloader) error {
 	if pool == nil {
 		return errors.New("analyzer: пул БД не получен (postgres.dsn обязателен)")
@@ -90,11 +93,29 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}
 	defer func() { _ = store.Close() }()
 
-	// Очередь: только потребление q:analyze и XACK — analyzer ничего не
-	// публикует (конец конвейера §7), гейт backpressure не нужен.
+	// Очередь: воркер только потребляет q:analyze и XACK (конец конвейера
+	// §7); циклу переанализа публикация нужна под гейтом backpressure
+	// (WatermarkPublisher, T-026) — один клиент Redis на сервис.
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 	q := queue.NewRedisQueue(rdb, queue.RedisOptions{})
+
+	// Фоновый цикл переанализа (T-074, ТЗ 5.8): стартовый дренаж + тикер +
+	// внеочередной проход по смене набора правил (Reloader.Subscribe);
+	// ошибки проходов цикл логирует Warn сам, возвращает только по отмене
+	// ctx — живёт до остановки сервиса рядом с воркером.
+	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
+		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
+		Log:       logger,
+	})
+	publish := queue.NewWatermarkPublisher(q, gate)
+	go func() {
+		if err := analyzer.ReanalyzeLoop(ctx, pool, publish, reloader, analyzer.ReanalyzeOptions{
+			Log: logger,
+		}); err != nil {
+			logger.Warn("переанализ: цикл остановлен", slog.Any("err", err))
+		}
+	}()
 
 	// Опции воркера — одни на сборку (стиль render-worker): Worker хранит
 	// их для ProcessResult, цикл Run берёт те же Group/Consume.

@@ -1,19 +1,30 @@
 // ---------------------------------------------------------------- управление
 //
-// Каркасы команд управления из ТЗ 4.1: status (T-079), reanalyze (T-074),
-// subdomains (T-083), zones и recheck (T-084). Каждая команда разбирает
-// аргументы, валидирует вход (имена — через internal/idn) и возвращает
-// notImplemented с номером задачи; выборки из БД выполнят сами задачи.
+// Команды управления из ТЗ 4.1: status (T-079), reanalyze (реализован,
+// T-074), subdomains (T-083), zones и recheck (T-084). Команда разбирает
+// аргументы и валидирует вход (имена — через internal/idn); каркасы
+// возвращают notImplemented с номером задачи, выборки из БД выполнят
+// сами задачи.
 
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
+	"crawler/internal/analyzer"
+	"crawler/internal/config"
+	"crawler/internal/db"
 	"crawler/internal/idn"
+	"crawler/internal/queue"
+	"crawler/internal/rules"
 )
 
 // ---------------------------------------------------------------- status
@@ -53,10 +64,13 @@ const reanalyzeHelp = `crawlerctl reanalyze — переанализ сохра�
 Использование:
   crawlerctl reanalyze [--zone ИМЯ]
 
-Находит записи с устаревшим rules_version и ставит их в q:analyze без
-повторного скачивания. Реализация — задача T-074 (вместе с analyzer).
-
-Пока правила можно обновлять: правьте rules/*.yaml и выполните make rules-reload.
+Находит subdomain_results с устаревшим rules_version (включая никогда не
+анализированные) и ставит их в q:analyze пачками — повторное скачивание
+не выполняется, анализ идёт по сохранённому контенту. Без --zone — все
+зоны. Версия набора правил берётся из каталога analyzer.rules_dir на
+момент запуска (живой сервис analyzer перезагружает правила SIGHUP и
+переанализирует сам); воркер analyzer фиксирует новые результаты.
+Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
 `
 
 func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
@@ -65,15 +79,81 @@ func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
 	if handled, err := parseFlags(fs, reanalyzeHelp, args, stdout); handled {
 		return err
 	}
+	zoneName := ""
 	if *zone != "" {
-		// Валидация входа уже сейчас: имя зоны — тем же конвейером, что и
-		// каталоги incoming (internal/idn.NormalizeZone).
-		if _, err := idn.NormalizeZone(*zone); err != nil {
+		// Валидация входа — тем же конвейером, что и каталоги incoming
+		// (internal/idn.NormalizeZone): зона хранится в punycode.
+		normalized, err := idn.NormalizeZone(*zone)
+		if err != nil {
 			return usagef("reanalyze: некорректное имя зоны %q: %v", *zone, err)
 		}
+		zoneName = normalized
 	}
-	out(stdout, "crawlerctl reanalyze: будет реализован вместе с analyzer (задача T-074, ТЗ 5.8).\n")
-	out(stdout, "Правила можно обновлять уже сейчас: правьте rules/*.yaml и выполните make rules-reload.\n")
+	if fs.NArg() > 0 {
+		return usagef("reanalyze: лишние аргументы %v (команда принимает только --zone)", fs.Args())
+	}
+
+	// Конфигурация — единый YAML + окружение (internal/config): DSN
+	// PostgreSQL, адрес Redis, каталог правил и порог backpressure.
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("reanalyze: %w", err)
+	}
+
+	// Версия набора — критерий устаревания; каталог читается разово.
+	set, err := rules.LoadDir(cfg.Analyzer.RulesDir)
+	if err != nil {
+		return fmt.Errorf("reanalyze: %w", err)
+	}
+
+	// Одноразовый CLI: Ctrl-C/SIGTERM прерывают дренаж (опубликованное
+	// остаётся, at-least-once).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	poolOpts := db.NewOptions(cfg.Postgres)
+	poolOpts.PoolSize = 2 // бюджет соединений ТЗ 6.3 — у сервисов
+	pool, err := db.Open(ctx, poolOpts)
+	if err != nil {
+		return fmt.Errorf("reanalyze: %w", err)
+	}
+	defer pool.Close()
+
+	zoneDesc := "все"
+	var zoneID *int16
+	if zoneName != "" {
+		id, found, err := analyzer.ZoneIDByName(ctx, pool, zoneName)
+		if err != nil {
+			return fmt.Errorf("reanalyze: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("reanalyze: зона %s не найдена в справочнике (зоны создаёт ingest при первом файле)", zoneName)
+		}
+		zoneID, zoneDesc = &id, zoneName
+	}
+
+	// Очередь — как у сервисов (RedisQueue + гейт backpressure T-026);
+	// публикация q:analyze ждёт ёмкости (Warn о паузе — в stderr), отмена
+	// ctx прерывает.
+	log := slog.New(slog.NewTextHandler(stderr, nil))
+	rdb := queue.NewClient(cfg.Redis.Addr)
+	defer func() { _ = rdb.Close() }()
+	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
+		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
+		Log:       log,
+	})
+	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
+
+	out(stdout, "reanalyze: набор правил v%d, зона: %s\n", set.Version, zoneDesc)
+	res, err := analyzer.ReanalyzeDrain(ctx, pool, q, set.Version, zoneID, analyzer.ReanalyzeOptions{})
+	if err != nil {
+		return fmt.Errorf("reanalyze: поставлено в q:analyze %d, прервано: %w", res.Published, err)
+	}
+	if res.Published == 0 {
+		out(stdout, "reanalyze: устаревших результатов нет — переанализ не требуется\n")
+		return nil
+	}
+	out(stdout, "reanalyze: поставлено в q:analyze: %d\n", res.Published)
 	return nil
 }
 
