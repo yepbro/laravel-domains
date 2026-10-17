@@ -120,15 +120,16 @@ type LaravelDomain struct {
 // результату (домен, субдомен, вариант); пишутся при любом срабатывании
 // независимо от порога (ТЗ 5.8).
 type LaravelFinding struct {
-	ZoneID      int16   `db:"zone_id"`
-	DomainID    int64   `db:"domain_id"`
-	SubdomainID int16   `db:"subdomain_id"`
-	Variant     Variant `db:"variant"`
-	Score       float32 `db:"score"`
-	VerMin      *string `db:"ver_min"`
-	VerMax      *string `db:"ver_max"`
-	Signals     []byte  `db:"signals"` // jsonb: [{rule, weight, evidence}, …]
-	IsLaravel   bool    `db:"is_laravel"`
+	ZoneID       int16   `db:"zone_id"`
+	DomainID     int64   `db:"domain_id"`
+	SubdomainID  int16   `db:"subdomain_id"`
+	Variant      Variant `db:"variant"`
+	Score        float32 `db:"score"`
+	VerMin       *string `db:"ver_min"`
+	VerMax       *string `db:"ver_max"`
+	Signals      []byte  `db:"signals"` // jsonb: [{rule, weight, evidence}, …]
+	IsLaravel    bool    `db:"is_laravel"`
+	RulesVersion int32   `db:"rules_version"` // хэш набора (internal/rules)
 }
 
 // IngestFile — строка ingest_files: журнал обработанных входных файлов,

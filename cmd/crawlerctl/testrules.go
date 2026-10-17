@@ -46,7 +46,7 @@ func cmdTestRules(args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 
-	out(stdout, "test-rules: набор правил %s (%d правил), образцов: %d, порог %.2f\n\n",
+	out(stdout, "test-rules: набор правил v%d (%d правил), образцов: %d, порог %.2f\n\n",
 		set.Version, len(set.Rules), len(samples), *minScore)
 
 	failed := 0

@@ -584,9 +584,10 @@ func TestSchema_ResultsTablesColumns(t *testing.T) {
 			"zone_id": "smallint", "domain_id": "bigint", "subdomain_id": "smallint",
 			"variant": "smallint", "score": "real", "ver_min": "text",
 			"ver_max": "text", "signals": "jsonb", "is_laravel": "boolean",
+			"rules_version": "integer",
 		}, notNull: []string{
 			"zone_id", "domain_id", "subdomain_id", "variant",
-			"score", "signals", "is_laravel",
+			"score", "signals", "is_laravel", "rules_version",
 		}},
 		"ingest_files": {relkind: "r", columns: map[string]string{
 			"id": "bigint", "zone_id": "smallint", "action": "smallint",

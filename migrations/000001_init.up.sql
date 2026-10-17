@@ -119,6 +119,7 @@ CREATE TABLE laravel_findings (
     ver_max       text,
     signals       jsonb    NOT NULL,                -- [{rule, weight, evidence}, …]
     is_laravel    boolean  NOT NULL,                -- score >= порога из конфига
+    rules_version integer  NOT NULL,                -- хэш набора правил (internal/rules, T-068)
     PRIMARY KEY (zone_id, domain_id, subdomain_id, variant)
 ) PARTITION BY LIST (zone_id);
 
