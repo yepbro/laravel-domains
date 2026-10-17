@@ -3,11 +3,8 @@ package rules
 import (
 	"context"
 	"errors"
-	"math"
 	"regexp"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 )
 
@@ -72,12 +69,7 @@ func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
 
 	res := Result{}
 
-	var (
-		minStr, maxStr   string
-		minV, maxV       version
-		haveMin, haveMax bool
-	)
-
+	var matched []Rule
 	for _, r := range s.Rules {
 		if ctx.Err() != nil {
 			break // бюджет времени исчерпан — что нашли, то нашли
@@ -86,31 +78,11 @@ func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
 		if !ok {
 			continue
 		}
-		res.Score = noisyOR(res.Score, r.Weight)
 		res.Signals = append(res.Signals, Evidence{Rule: r.ID, Weight: r.Weight, Evidence: ev})
-
-		if v := parseVersion(r.VerMin); v != nil {
-			if !haveMin || minV.less(v) {
-				minV, minStr, haveMin = v, r.VerMin, true
-			}
-		}
-		if v := parseVersion(r.VerMax); v != nil {
-			if !haveMax || v.less(maxV) {
-				maxV, maxStr, haveMax = v, r.VerMax, true
-			}
-		}
+		matched = append(matched, r)
 	}
 
-	if haveMin {
-		res.VerMin = minStr
-	}
-	if haveMax {
-		res.VerMax = maxStr
-	}
-	if haveMin && haveMax && maxV.less(minV) {
-		res.Conflict = true
-		res.VerMin, res.VerMax = "", ""
-	}
+	res.Score, res.VerMin, res.VerMax, res.Conflict = ScoreRules(matched)
 	return res
 }
 
@@ -249,88 +221,4 @@ func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool
 		}
 	}
 	return "", false
-}
-
-// noisyOR: 1 − (1−a)(1−b) — слабые признаки накапливаются, но не дают 100%.
-func noisyOR(a, b float64) float64 {
-	return 1 - (1-a)*(1-b)
-}
-
-// ScoreFixed — noisy-OR по набору весов.
-func ScoreFixed(weights []float64) float64 {
-	s := 0.0
-	for _, w := range weights {
-		s = noisyOR(s, w)
-	}
-	return s
-}
-
-// ---------------------------------------------------------------- версии
-
-// version — числовые компоненты версии; "x" означает +∞ (граница «до конца
-// мажорной ветки», например ver_max: "9.x"). Отсутствующий компонент — 0.
-type version []float64
-
-func parseVersion(s string) version {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, ".")
-	out := make(version, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "x" || p == "*" {
-			out = append(out, math.Inf(1))
-			continue
-		}
-		n, err := strconv.ParseFloat(p, 64)
-		if err != nil {
-			return nil // некорректная версия игнорируется
-		}
-		out = append(out, n)
-	}
-	return out
-}
-
-func (v version) less(o version) bool {
-	for i := 0; i < len(v) || i < len(o); i++ {
-		var a, b float64
-		if i < len(v) {
-			a = v[i]
-		}
-		if i < len(o) {
-			b = o[i]
-		}
-		if a != b {
-			return a < b
-		}
-	}
-	return false
-}
-
-// Contains — попадает ли ожидаемый диапазон [expMin, expMax] внутрь
-// вычисленного (используется make test-rules).
-func (res Result) Contains(expMin, expMax string) bool {
-	if expMin != "" {
-		e := parseVersion(expMin)
-		lo := parseVersion(res.VerMin)
-		if e == nil {
-			return false
-		}
-		if lo != nil && e.less(lo) {
-			return false
-		}
-	}
-	if expMax != "" {
-		e := parseVersion(expMax)
-		hi := parseVersion(res.VerMax)
-		if e == nil {
-			return false
-		}
-		if hi != nil && hi.less(e) {
-			return false
-		}
-	}
-	return true
 }

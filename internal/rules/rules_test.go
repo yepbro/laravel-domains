@@ -7,52 +7,6 @@ import (
 	"testing"
 )
 
-func TestNoisyOR(t *testing.T) {
-	cases := []struct {
-		ws   []float64
-		want float64
-	}{
-		{[]float64{0.25}, 0.25},
-		{[]float64{0.25, 0.45}, 1 - 0.75*0.55},
-		{[]float64{0.2, 0.2, 0.2, 0.2, 0.2}, 1 - 0.8*0.8*0.8*0.8*0.8},
-	}
-	for _, c := range cases {
-		if got := ScoreFixed(c.ws); diff(got, c.want) > 1e-9 {
-			t.Errorf("noisyOR(%v) = %v, want %v", c.ws, got, c.want)
-		}
-	}
-}
-
-func diff(a, b float64) float64 {
-	if a-b < 0 {
-		return b - a
-	}
-	return a - b
-}
-
-func TestVersionCompare(t *testing.T) {
-	cases := []struct {
-		a, b string
-		less bool
-	}{
-		{"9.19", "11", true},
-		{"11", "9.19", false},
-		{"9.19", "9.x", true}, // 9.19 < всё девятое
-		{"9.x", "10", true},   // бесконечность только в последнем компоненте
-		{"9", "9.1", true},    // отсутствующий компонент = 0
-		{"9.19", "9.19", false},
-	}
-	for _, c := range cases {
-		va, vb := parseVersion(c.a), parseVersion(c.b)
-		if va == nil || vb == nil {
-			t.Fatalf("parseVersion(%q или %q) вернул nil", c.a, c.b)
-		}
-		if got := va.less(vb); got != c.less {
-			t.Errorf("%s < %s = %v, want %v", c.a, c.b, got, c.less)
-		}
-	}
-}
-
 func writeRules(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -494,22 +448,5 @@ func TestCanonicalHashDisambiguation(t *testing.T) {
 	b := []Rule{{ID: "a", Target: "b\x00c"}}
 	if canonicalHash(a) == canonicalHash(b) {
 		t.Error("разные наборы дали одинаковый канонический хэш")
-	}
-}
-
-func TestResultContains(t *testing.T) {
-	res := Result{VerMin: "9.19", VerMax: ""}
-	if !res.Contains("9.19", "") {
-		t.Error("[9.19,∞) должен включать 9.19")
-	}
-	if !res.Contains("10", "11") {
-		t.Error("[9.19,∞) должен включать [10,11]")
-	}
-	if res.Contains("9.18", "") {
-		t.Error("[9.19,∞) не должен включать 9.18")
-	}
-	res2 := Result{VerMin: "9.19", VerMax: "11.x"}
-	if res2.Contains("11", "12") {
-		t.Error("[9.19,11.x] не должен включать 12")
 	}
 }
