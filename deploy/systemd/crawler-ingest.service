@@ -1,0 +1,64 @@
+# Domain Crawler — ingest: приём файлов с доменами из incoming/ (ТЗ 5.1).
+# MemoryMax — строка бюджета «Go-сервисы ≈ 1,3 ГБ» (ТЗ 3.2), раскладка по
+# сервисам — docs/deploy.md. Пользователь — статический системный
+# crawler-ingest (обоснование выбора против DynamicUser — docs/deploy.md).
+
+[Unit]
+Description=Domain Crawler — ingest (приём файлов с доменами)
+PartOf=crawler.target
+# Порядок после инфраструктуры — best effort (метаюниты пакетов ОС);
+# готовность PostgreSQL не гарантируется — миграции/пул падают с кодом 1
+# и перезапускаются Restart=on-failure (ТЗ 3.4: источник истины — БД,
+# воркер переживает её рестарт). Requires намеренно нет: остановка БД
+# не должна останавливать воркеры (пул переподключится сам).
+After=network-online.target postgresql.service redis-server.service unbound.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-ingest
+Group=crawler
+EnvironmentFile=/etc/crawler/crawler.env
+Environment=METRICS_ADDR=127.0.0.1:9101
+WorkingDirectory=/var/lib/crawler
+SyslogIdentifier=crawler-ingest
+ExecStart=/opt/crawler/bin/ingest
+Restart=on-failure
+RestartSec=5s
+# Graceful shutdown воркера (ТЗ 3.4): SIGTERM → доработка задачи, бюджет
+# каркаса 10 с (service.ShutdownTimeout) + HTTP-сервер метрик и пул БД.
+TimeoutStopSec=30s
+# ТЗ 3.2/10.1: потолок памяти cgroup — OOM-killer затронет только этот
+# сервис (и его перезапустит systemd), PostgreSQL не тронет.
+MemoryMax=128M
+# Паритет с dev-окружением (nofile 65535 в deploy/docker/compose.yaml);
+# sysctl fs.file-max/fs.nr_open — T-088. ingest файловых дескрипторов
+# почти не держит, значение едино для всех сервисов набора.
+LimitNOFILE=65535
+# Группа crawler пишет в общие каталоги (content) совместно; 0007 —
+# файлы 660/каталоги 770 внутри группы.
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1: отдельный пользователь, минимум привилегий) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# incoming: отчёты не пишет (ingest_files в БД), но перемещает файлы в
+# processed/failed/ внутри наблюдаемого каталога — ему нужна запись.
+ReadWritePaths=/var/lib/crawler/incoming
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target
