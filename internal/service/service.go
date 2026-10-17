@@ -77,6 +77,13 @@ type Options struct {
 	OnSIGHUP func()
 	// ExtraMux позволяет зарегистрировать дополнительные хендлеры.
 	ExtraMux func(mux *http.ServeMux)
+	// Metrics — реестр Prometheus сервиса (internal/metrics): если задан,
+	// каркас отдаёт через /metrics именно его вместо собственного
+	// metrics.New(Name). main создаёт реестр заранее, чтобы построить
+	// приборы рабочей логики до старта OnRun (воркеры и коллекторы
+	// получают его же, T-077); nil — каркас создаёт реестр сам
+	// (сервисам без собственных приборов).
+	Metrics *metrics.Registry
 	// Logger — структурированный логгер сервиса (см. NewLogger). nil —
 	// каркас создаёт логгер сам и делает его дефолтным (slog.SetDefault).
 	Logger *slog.Logger
@@ -88,6 +95,16 @@ type Options struct {
 // errForcedExit — повторный сигнал завершения во время graceful shutdown:
 // Run завершает процесс немедленно, не дожидаясь OnRun и очистки ресурсов.
 var errForcedExit = errors.New("повторный сигнал завершения")
+
+// newRegistry — реестр метрик сервиса: Options.Metrics, если main создал
+// его сам (приборы рабочей логики строятся до старта OnRun, T-077), иначе
+// собственный metrics.New по имени сервиса.
+func newRegistry(opts Options) *metrics.Registry {
+	if opts.Metrics != nil {
+		return opts.Metrics
+	}
+	return metrics.New(opts.Name)
+}
 
 // EnvOr возвращает значение переменной окружения или defaultVal.
 func EnvOr(key, defaultVal string) string {
@@ -172,8 +189,10 @@ func Run(opts Options) error {
 	// /metrics — реестр Prometheus (internal/metrics): базовые метрики
 	// каркаса + коллекторы Go/runtime; метрики рабочей логики добавляются
 	// фабрикой реестра (Counter/Gauge/Histogram с автометкой service,
-	// T-076; приборы этапов — T-077).
-	registry := metrics.New(opts.Name)
+	// T-076; приборы этапов — T-077). Options.Metrics — реестр, созданный
+	// main-ом для приборов рабочей логики; nil — собственный реестр
+	// каркаса (newRegistry).
+	registry := newRegistry(opts)
 	mux.Handle("/metrics", metrics.Handler(registry))
 	if opts.ExtraMux != nil {
 		opts.ExtraMux(mux)

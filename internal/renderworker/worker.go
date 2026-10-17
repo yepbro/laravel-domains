@@ -49,6 +49,7 @@ import (
 
 	"crawler/internal/content"
 	"crawler/internal/db"
+	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/render"
 )
@@ -151,6 +152,10 @@ type Options struct {
 	Alive func() bool
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
+	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
+	// строит приборы этапа (NewMetrics); nil — без метрик (изолированные
+	// сборки и тесты).
+	Metrics *metrics.Registry
 }
 
 func (o Options) withDefaults() Options {
@@ -185,6 +190,7 @@ type Worker struct {
 	contents ContentStore
 	renderer Renderer
 	opt      Options
+	met      *Metrics // приборы этапа (T-077); nil — no-op
 }
 
 // New строит воркер поверх пула БД, очереди (публикация q:analyze — под
@@ -204,7 +210,7 @@ func New(db RenderDB, q queue.Queue, contents ContentStore, renderer Renderer, o
 	if renderer == nil {
 		return nil, errors.New("renderworker: пул рендера не задан")
 	}
-	return &Worker{db: db, q: q, contents: contents, renderer: renderer, opt: opts.withDefaults()}, nil
+	return &Worker{db: db, q: q, contents: contents, renderer: renderer, opt: opts.withDefaults(), met: NewMetrics(opts.Metrics)}, nil
 }
 
 // renderTarget — прочитанная строка результата: цель рендера и старая
@@ -496,14 +502,24 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 // Result-ключа и замена контента. Подтверждение (XACK) выполняет
 // Processing после nil-возврата — «XACK только после записи результата в
 // БД» (ТЗ 4.2); ядовитая запись (вне формата T-024) возвращается ошибкой —
-// очередь исчерпает попытки и унесёт её в q:dead (T-025).
+// очередь исчерпает попытки и унесёт её в q:dead (T-025). Успешная
+// обработка идёт в приборы этапа (T-077): счётчик задач и длительность,
+// rendered=true при записанном DOM; ошибка — в счётчик классов рендера
+// (доставка вернётся повторной доставкой, ТЗ 3.4).
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery) error {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
 		return fmt.Errorf("renderworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
 	}
-	if _, err := w.ProcessResult(ctx, task); err != nil {
+	start := time.Now()
+	rendered, err := w.ProcessResult(ctx, task)
+	if err != nil {
+		w.met.Error(render.ClassOf(err))
 		return fmt.Errorf("renderworker: домен %s: замена контента: %w", task.Name, err)
+	}
+	w.met.Task(time.Since(start))
+	if rendered {
+		w.met.Rendered()
 	}
 	return nil
 }

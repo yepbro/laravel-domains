@@ -29,6 +29,7 @@ import (
 
 	"crawler/internal/config"
 	"crawler/internal/content"
+	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/render"
 	"crawler/internal/renderworker"
@@ -46,15 +47,20 @@ func main() {
 	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
 	// готов до старта OnRun: postgres.dsn обязателен (config.Validate);
 	// им пользуется и хранилище контента (строки contents, T-042), и
-	// замена ссылки в subdomain_results (T-067).
+	// замена ссылки в subdomain_results (T-067). Реестр метрик — здесь
+	// же (T-077): приборы этапа рендера и коллектор длины q:render
+	// получают его до старта OnRun, каркас отдаёт тот же реестр через
+	// /metrics.
+	reg := metrics.New("render-worker")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "render-worker",
 		Config:      cfg,
 		Logger:      logger,
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9105"),
+		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool) },
+		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}
@@ -64,10 +70,12 @@ func main() {
 // T-061; внешний по render.remote_url или собственный процесс) с пулом
 // изолированных контекстов → хранилище контента (то же, что у HTTP-этапа:
 // паки T-042 + словарь zstd T-043 + контроль диска T-046) → цикл
-// q:render. Завершение — отмена ctx (graceful shutdown, ТЗ 3.4): пул
-// дорабатывает начатые страницы (каждая ограничена render.timeout) или
-// возвращает их очереди повторной доставкой (Processing, T-025).
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) error {
+// q:render с приборами этапа (T-077) и коллектор длины q:render
+// (метрика длин очередей, ТЗ 5.9). Завершение — отмена ctx (graceful
+// shutdown, ТЗ 3.4): пул дорабатывает начатые страницы (каждая ограничена
+// render.timeout) или возвращает их очереди повторной доставкой
+// (Processing, T-025).
+func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("render-worker: пул БД не получен (postgres.dsn обязателен)")
 	}
@@ -121,10 +129,18 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	})
 	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
 
+	// Длина потребляемого стрима q:render → crawler_queue_depth (T-077):
+	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	go func() {
+		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
+			[]string{queue.StreamRender}, metrics.DefaultQueueCollectInterval, logger)
+	}()
+
 	// Опции воркера — одни на сборку (стиль http-worker): Worker хранит
 	// их для ProcessResult, цикл Run берёт те же Group/Consume/Alive.
 	opts := renderworker.Options{
-		Log: logger,
+		Metrics: reg, // приборы этапа: задачи, длительности, ошибки классов, rendered (T-077)
+		Log:     logger,
 		// Зонд браузера: недоступный Chromium — пауза потребления
 		// (доставки остаются в стриме, не в PEL); перезапуск — T-065.
 		Alive: browser.Alive,

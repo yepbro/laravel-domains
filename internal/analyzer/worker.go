@@ -56,6 +56,7 @@ import (
 
 	"crawler/internal/content"
 	"crawler/internal/db"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 	"crawler/internal/queue"
 	"crawler/internal/rules"
@@ -177,6 +178,10 @@ type Options struct {
 	MinScore float64
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
+	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
+	// строит приборы этапа (NewMetrics); nil — без метрик (изолированные
+	// сборки и тесты).
+	Metrics *metrics.Registry
 }
 
 func (o Options) withDefaults() Options {
@@ -211,6 +216,7 @@ type Worker struct {
 	contents ContentGetter
 	sets     SetSource
 	opt      Options
+	met      *Metrics // приборы этапа (T-077); nil — no-op
 }
 
 // New строит воркер поверх пула БД, очереди, хранилища контента и
@@ -229,7 +235,7 @@ func New(db AnalyzerDB, q queue.Queue, contents ContentGetter, sets SetSource, o
 	if sets == nil {
 		return nil, errors.New("analyzer: источник набора правил не задан")
 	}
-	return &Worker{db: db, q: q, contents: contents, sets: sets, opt: opts.withDefaults()}, nil
+	return &Worker{db: db, q: q, contents: contents, sets: sets, opt: opts.withDefaults(), met: NewMetrics(opts.Metrics)}, nil
 }
 
 // analyzeRow — прочитанная строка subdomain_results: вход пассивного
@@ -564,14 +570,17 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 // Result-ключа и анализ. Подтверждение (XACK) выполняет Processing после
 // nil-возврата — «XACK только после записи результата в БД» (ТЗ 4.2);
 // ядовитая запись (вне формата T-024) возвращается ошибкой — очередь
-// исчерпает попытки и унесёт её в q:dead (T-025).
+// исчерпает попытки и унесёт её в q:dead (T-025). Успешная обработка
+// идёт в приборы этапа (T-077): счётчик задач и длительность.
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery) error {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
 		return fmt.Errorf("analyzer: запись %s стрима %s: %w", del.ID, del.Stream, err)
 	}
+	start := time.Now()
 	if _, err := w.ProcessResult(ctx, task); err != nil {
 		return fmt.Errorf("analyzer: домен %s: анализ: %w", task.Name, err)
 	}
+	w.met.Task(time.Since(start))
 	return nil
 }

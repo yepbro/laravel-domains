@@ -46,6 +46,7 @@ import (
 	"crawler/internal/content"
 	"crawler/internal/dnsclient"
 	"crawler/internal/httpfetch"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 	"crawler/internal/queue"
 )
@@ -460,6 +461,10 @@ type Options struct {
 	MaxRedirects int
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
+	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
+	// строит приборы этапа (NewMetrics); nil — без метрик (изолированные
+	// сборки и тесты).
+	Metrics *metrics.Registry
 	// OnResult — обработчик готового результата домена, вызывается в
 	// цикле Run ПОСЛЕ обработки и ДО XACK. Сборка сервиса (cmd/http-worker)
 	// ставит сюда цепочку: ContentSaver (T-056) → Recorder — запись
@@ -504,6 +509,7 @@ func (o Options) log() *slog.Logger {
 type Worker struct {
 	fetch FetchFunc
 	opt   Options
+	met   *Metrics // приборы этапа (T-077); nil — no-op
 }
 
 // New создаёт воркер поверх шва загрузки fetch (продакшн — ChainFetch).
@@ -511,7 +517,7 @@ func New(fetch FetchFunc, opts Options) (*Worker, error) {
 	if fetch == nil {
 		return nil, errors.New("httpworker: шов загрузки не задан (ChainFetch)")
 	}
-	return &Worker{fetch: fetch, opt: opts.withDefaults()}, nil
+	return &Worker{fetch: fetch, opt: opts.withDefaults(), met: NewMetrics(opts.Metrics)}, nil
 }
 
 // workerSub — разобранный субдомен задачи: адреса распарсены один раз.
@@ -936,7 +942,9 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 // только после записи результата в БД»): запись результата и публикация
 // q:analyze идут в Options.OnResult (ContentSaver T-056 → Recorder T-058,
 // сборка cmd/http-worker) до возврата, и порядок «запись → публикация →
-// XACK» сохраняется без правки цикла.
+// XACK» сохраняется без правки цикла. Успешно завершённая задача идёт
+// в приборы этапа (T-077): пропускная способность, длительность,
+// финальный статус, ошибки проверок, время ответа, записи rendered=false.
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, o Options) error {
 	task, err := queue.Decode[queue.HTTPTask](del)
 	if err != nil {
@@ -944,6 +952,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, o Opti
 		// исчерпает попытки и унесёт её в q:dead (T-025).
 		return fmt.Errorf("httpworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
 	}
+	start := time.Now()
 	res, err := w.ProcessDomain(ctx, task)
 	if err != nil {
 		return fmt.Errorf("httpworker: домен %s: %w", task.Name, err)
@@ -953,6 +962,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, o Opti
 			return fmt.Errorf("httpworker: домен %s: обработка результата: %w", task.Name, err)
 		}
 	}
+	w.met.Episode(res, time.Since(start))
 	o.log().Debug("HTTP-задача обработана",
 		"domain", task.Name, "subdomains", len(res.Subdomains), "records", res.RecordCount())
 	return nil

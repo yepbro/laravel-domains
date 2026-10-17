@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/config"
+	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/scheduler"
 	"crawler/internal/service"
@@ -34,6 +35,11 @@ func main() {
 	}
 	logger := service.NewLogger("scheduler", cfg)
 
+	// Реестр метрик создаётся здесь (T-077): коллектору глубины backlog
+	// (run ниже) нужны приборы до старта OnRun, каркас отдаёт тот же
+	// реестр через /metrics (Options.Metrics).
+	reg := metrics.New("scheduler")
+
 	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
 	// готов до старта OnRun: postgres.dsn обязателен (config.Validate).
 	var pool *pgxpool.Pool
@@ -42,8 +48,9 @@ func main() {
 		Config:      cfg,
 		Logger:      logger,
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9102"),
+		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool) },
+		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}
@@ -52,9 +59,11 @@ func main() {
 // run — рабочая логика scheduler: главный цикл постановки пачек в q:dns
 // и фоновые циклы перепроверок (T-030/T-031) горутинами в том же OnRun —
 // они возвращают домены в pending, главный цикл подберёт их следующей
-// пачкой. Завершение — отмена ctx (graceful shutdown, ТЗ 3.4): цикл
-// дорабатывает текущую пачку, фоновые — текущий проход, все возвращают nil.
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) error {
+// пачкой; рядом — коллектор глубины backlog (T-077, ТЗ 5.9): gauge
+// pending/queued из БД, живёт у владельца состояний domains. Завершение —
+// отмена ctx (graceful shutdown, ТЗ 3.4): цикл дорабатывает текущую
+// пачку, фоновые — текущий проход, все возвращают nil.
+func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("scheduler: пул БД не получен (postgres.dsn обязателен)")
 	}
@@ -70,7 +79,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	})
 	dnsq := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
 
-	bg := make(chan error, 3)
+	bg := make(chan error, 4)
 	go func() {
 		bg <- scheduler.RecheckDaily(ctx, pool, scheduler.RecheckOptions{
 			Interval: cfg.Scheduler.RecheckInterval.D(),
@@ -90,6 +99,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			Log:     logger,
 		})
 	}()
+	go func() {
+		bg <- scheduler.BacklogLoop(ctx, pool, reg, scheduler.BacklogOptions{Log: logger})
+	}()
 
 	// Главный цикл живёт до отмены ctx; после него фоновые циклы уже
 	// завершаются по той же отмене — забираем их результаты.
@@ -97,6 +109,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		BatchSize: cfg.Scheduler.BatchSize,
 		Log:       logger,
 	})
+	<-bg
 	<-bg
 	<-bg
 	<-bg

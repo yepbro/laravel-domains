@@ -46,6 +46,7 @@ config.Load (в main)
 | `OnDBPool(pool)` | получить пул PostgreSQL (после миграций); пул закрывается каркасом при shutdown последним |
 | `OnSIGHUP()` | перезагрузка правил Laravel без рестарта (`make rules-reload`, ТЗ 5.8) |
 | `ExtraMux(mux)` | дополнительные хендлеры HTTP-сервера метрик |
+| `Metrics` | готовый реестр Prometheus сервиса (T-077): main создаёт реестр под приборы рабочей логики до старта `OnRun`, каркас отдаёт его через `/metrics`; nil — каркас создаёт реестр сам |
 | `Logger` | готовый логгер (иначе каркас создаст сам) |
 | `ShutdownTimeout` | бюджет остановки (иначе 10 с) |
 
@@ -127,9 +128,53 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 случай. Зарезервированная метка `service` и дубликаты меток
 отклоняются ошибкой до создания вектора.
 
-Сами приборы этапов (пропускная способность по этапам, длины очередей,
-ошибки по типам, доля рендера, время ответа, глубина backlog, память
-воркеров — ТЗ 5.9) навешивают сервисы в T-077.
+Сами приборы этапов (ТЗ 5.9: пропускная способность по этапам, длины
+очередей, ошибки по типам, доля рендера, время ответа, глубина backlog,
+память воркеров) регистрируют сервисы через `NewMetrics`-конструкторы
+своих пакетов воркеров (`Options.Metrics` — реестр сервиса; `nil` —
+изолированные сборки без метрик) и коллекторы
+(`internal/metrics/collect.go`, `internal/scheduler/backlog.go`).
+
+### Метрики рабочей логики (T-077)
+
+| Метрика | Тип | Метки | Экспортирует | Точка инкремента |
+|---|---|---|---|---|
+| `crawler_stage_tasks_total` | counter | `stage` | dns-worker (`dns`), http-worker (`http`), render-worker (`render`), analyzer (`analyze`) | завершённая задача этапа: домен (dns, http) или запись субдомен×вариант (render, analyze) |
+| `crawler_stage_seconds` | histogram | `stage` | те же четыре | длительность той же задачи (корзины свои по этапу) |
+| `crawler_stage_errors_total` | counter | `stage`, `type` | http-worker (`timeout`/`redirects`/`tls`/`body`/`network` — классы ErrorClass, §8), render-worker (`task`/`context`/`browser` — классы render.Class) | каждая ошибочная проверка протокола / неподтверждённая доставка рендера |
+| `crawler_domain_status_total` | counter | `type` | dns-worker (`not_delegated`/`delegated_no_address`/`temp_error`), http-worker (`alive`/`no_http`/`temp_error`) | финальный статус домена терминальной ветки эпизода (ТЗ 6.2) |
+| `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
+| `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
+| `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`) | коллектор XLEN потребляемого стрима раз в 15 с (`metrics.CollectQueueLoop`, источник — гейт backpressure T-026) |
+| `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) раз в 30 с (`scheduler.BacklogLoop`) |
+
+Решения (зафиксированы):
+
+- **Длины очередей** живут у потребителей стрима: XLEN дёшев, клиент
+  Redis у каждого сервиса уже есть (гейт backpressure), а привязка к
+  потребителю гарантирует «очередь читается ⇔ глубина публикуется».
+  `q:dead` потребителя не имеет (ручной разбор, ТЗ 4.2; слой возврата
+  зависших T-025 в сервисы ещё не встроен) — его глубину показывает
+  `crawlerctl status` (T-079), метрика появится вместе с потребителем.
+- **Глубина backlog** (pending/queued из БД) — в scheduler: он владелец
+  состояний `domains` (постановка T-028, возврат lease T-029,
+  перепроверки T-030/T-031), пул БД и периодический цикл уже его.
+  Длина стримов и backlog — разные метрики: Redis усечётся MAXLEN и
+  теряется при сбое (восстановит планировщик, ТЗ 3.4), БД — полный
+  объём невыполненной работы.
+- **Память воркеров** — без собственных метрик: коллектор Go/runtime
+  (T-076) уже отдаёт `go_memstats_*` (heap alloc/inuse/sys, GC),
+  process-коллектор — `process_resident_memory_bytes` (RSS — именно
+  его ограничивает systemd `MemoryMax`, ТЗ 3.2). Дублировать их
+  `runtime.MemStats`-снимком нет смысла.
+- Счётчики статусов/записей считаются по завершённому эпизоду
+  (после успешной записи в БД до XACK, ТЗ 4.2): гонка с удалением
+  домена (§13.1) не различается, повторные доставки at-least-once
+  считаются честной работой (ТЗ 3.4).
+- DNS-этап не типизирует ошибки обменов отдельным счётчиком: сбои
+  резолвера сводятся к `temp_error` (T-036), счётчик финальных
+  статусов и есть типизация итога; analyzer пассивен (ТЗ 5.8) — его
+  результаты (findings, is_laravel) — данные БД, не метрики процесса.
 
 ## Поведение заглушек
 
@@ -151,7 +196,9 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
 `internal/scheduler/enqueue.go`), — и фоновые циклы суточной перепроверки
 (`RecheckDaily`, T-030) и повторных проверок `temp_error`
 (`RetryTempErrors`, T-031); возврат доменов с истёкшим lease подключается
-задачей T-029.
+задачей T-029. Рядом с ними — коллектор глубины backlog `BacklogLoop`
+(T-077): gauge `crawler_backlog_domains{pending|queued}` из БД раз в
+30 с.
 
 И `dns-worker` (этап 3, T-036…T-039) — не заглушка: его `OnRun` выполняет
 цикл `dnsworker.Run` (`internal/dnsworker/result.go`):
@@ -349,7 +396,10 @@ Chromium (`render.StartBrowser` — внешний по `render.remote_url` ил
 - первый проход — сразу при старте (свежие счётчики после простоя),
   ошибка прохода — Warn, цикл живёт; отмена ctx — чистый nil (graceful
   shutdown, ТЗ 3.4). Счётчики читают `crawlerctl status` (T-079) и выбор
-  размера партиций (`docs/schema.md`). Метрики прогресса зон — T-077.
+  размера партиций (`docs/schema.md`). Метрики прогресса зон (доля
+  проверенного, длительность прохода) — территория алертов monitor
+  (T-080); счётчики очередей/backlog/этапов конвейера собирают сами
+  сервисы (таблица выше, T-077).
 
 Подробности браузерного слоя (изоляция, блокировка ресурсов, ожидание,
 съём результата) — [`render.md`](render.md); live-проверки против
