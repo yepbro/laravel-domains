@@ -1,0 +1,7 @@
+{
+  "Content-Type": ["application/json"],
+  "Set-Cookie": [
+    "XSRF-TOKEN=eyJpdiI6U0FOQ1RVTS1UT0s6MTY6e30%3D; expires=Sat, 17 Oct 2026 18:30:00 GMT; path=/; secure; samesite=lax",
+    "laravel_session=eyJpdiI6c2Vzc2lvbi05OjE2Ont9; expires=Sat, 17 Oct 2026 18:30:00 GMT; path=/; httponly; samesite=lax"
+  ]
+}

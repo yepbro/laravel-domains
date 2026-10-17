@@ -173,11 +173,15 @@ deleted, `delete` — перевод в deleted) → отчёт в таблиц�
 
 - Файлы правил: `rules/*.yaml` (формат, валидация и `rules_version` —
   [`configuration.md`](configuration.md), раздел `analyzer`; справочник —
-  ТЗ 5.8 основного ТЗ).
+  ТЗ 5.8 основного ТЗ). Рабочий набор — `rules/laravel.yaml` (22 правила;
+  веса и версионные границы обоснованы в комментариях к каждому правилу).
 - Изменение правил: правите YAML → `make rules-reload` (SIGHUP анализатору,
   без рестарта контейнера; air не следит за `rules/` специально).
 - Проверка по корпусу без сети: `make test-rules` — прогон по
-  `testdata/laravel-samples`, сверка `is_laravel`/диапазона версий с `meta.yaml`.
+  `testdata/laravel-samples`, сверка `is_laravel`/диапазона версий и полного
+  состава сработавших правил с `meta.yaml` (поле `rules`; `rules: []` — ни
+  одно правило не должно сработать). Ту же сверку выполняет юнит-тест
+  `internal/rules/laravel_test.go`.
 - Переанализ сохранённого контента: `make reanalyze` (после реализации analyzer).
 
 ## 6. CLI crawlerctl

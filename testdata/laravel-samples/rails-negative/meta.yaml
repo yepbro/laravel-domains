@@ -1,0 +1,7 @@
+is_laravel: false
+note: "Негативный образец Ruby on Rails: csrf-token meta и кука _shop_session дают только слабые срабатывания (score ~0.32 < порога 0.6) — контроль ложноположительных срабатываний"
+source: synthetic
+obtained: 2026-10-17
+rules:
+  - meta_csrf_token
+  - cookie_session_suffix

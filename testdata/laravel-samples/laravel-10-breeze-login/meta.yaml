@@ -1,0 +1,14 @@
+is_laravel: true
+ver_min: "10"         # реальная версия образца; вычисленный диапазон [9.19, ∞)
+ver_max: "10.x"       # (vite_assets ver_min 9.19) должен его покрывать
+note: "Синтетический образец (Laravel 10 + Breeze, Blade-стек): форма входа с csrf_field (_token), Vite-сборка"
+source: synthetic
+obtained: 2026-10-17
+rules:
+  - cookie_xsrf_token
+  - cookie_laravel_session
+  - cookie_session_suffix
+  - cookie_encrypted_payload
+  - meta_csrf_token
+  - form_csrf_input
+  - vite_assets

@@ -1,0 +1,16 @@
+is_laravel: true
+ver_min: "6"          # реальная версия образца; вычисленный диапазон [5.3, 7.x]
+ver_max: "6.x"        # (welcome_classic 5.3–7.x + mix ver_max 9.x) должен его покрывать
+note: "Синтетический образец (Laravel 6, php artisan serve): классическая welcome-страница, Mix-сборка, шифрованные куки, Host в ответе (PHP built-in server)"
+source: synthetic
+obtained: 2026-10-17
+rules:                # полный список сработавших правил (сверка в тестах)
+  - cookie_xsrf_token
+  - cookie_laravel_session
+  - cookie_session_suffix
+  - cookie_encrypted_payload
+  - header_php_cli_server
+  - meta_csrf_token
+  - mix_assets
+  - welcome_classic
+  - laravel_docs_link

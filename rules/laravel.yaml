@@ -1,56 +1,178 @@
-# Начальный набор правил поиска Laravel (ТЗ 5.8 основного ТЗ).
-# Версионные границы уточняются по документации Laravel по мере накопления
-# реальных образцов (testdata/laravel-samples).
+# Рабочий набор правил поиска Laravel (ТЗ §5.8; порог is_laravel — score >= 0.6,
+# конфиг analyzer.laravel_min_score, §13.1). Все срабатывания (любое правило)
+# пишутся в laravel_findings, поэтому слабые признаки сознательно получают низкий
+# вес: поодиночке они остаются ниже порога и не попадают в laravel_domains.
 #
-# Порог попадания в laravel_domains задаётся конфигом (по умолчанию 0.6).
-# Все срабатывания (любое правило) пишутся в laravel_findings.
+# Вес (0..1] — «сила» признака: чем реже он встречается вне Laravel, тем выше.
+# Накопление независимых признаков — noisy-OR: 1 − Π(1 − wᵢ) (ТЗ §5.8), порог
+# 0.6 достигается 1–2 сильными признаками либо сочетанием слабых.
+#
+# Версионные границы ver_min/ver_max — по документации и истории каркаса Laravel
+# (laravel.com/docs, github.com/laravel/laravel):
+#   * Vite — основная сборка начиная с Laravel 9.19.0 (июнь 2022,
+#     laravel-vite-plugin); Vite можно подключить и вручную на любую версию,
+#     граница индикативная, как и все границы набора;
+#   * Laravel Mix — сборка по умолчанию до 9.19 (сам Mix — с Laravel 5.4, до
+#     этого Elixir); Mix ставится и на новые версии — ver_max индикативный;
+#   * классическая welcome-страница (стиль position-ref) — Laravel 5.3–7.x,
+#     в 8.0 (сентябрь 2020) заменена на Tailwind-версию.
+# Пересечение диапазонов сработавших правил и фиксацию конфликта (пустое
+# пересечение) считает движок (ТЗ §5.8).
+#
+# Корпус образцов для проверки — testdata/laravel-samples (make test-rules и
+# тест internal/rules/laravel_test.go): ожидаемый состав сработавших правил,
+# is_laravel и диапазон версий фиксируются в meta.yaml каждого образца.
+
 rules:
+  # ------------------------------------------------------------ cookies
+  # Laravel шифрует значения всех кук (EncryptCookies): значение — base64
+  # JSON {"iv":..., "tag":..., "value":...}, т.е. начинается с eyJpdiI6.
+  # XSRF-TOKEN выставляет VerifyCsrfToken, имя сессии по умолчанию —
+  # laravel_session (Str::slug(APP_NAME)+'_session', Laravel 5+).
   - id: cookie_xsrf_token
-    description: Кука XSRF-TOKEN (Laravel шифрует значение)
+    description: Кука XSRF-TOKEN (VerifyCsrfToken; имя встречается и вне Laravel — средний вес)
     target: cookie_name
     match: "XSRF-TOKEN"
     weight: 0.25
 
-  - id: cookie_session_suffix
-    description: Имя сессионной куки Laravel (<name>_session)
+  - id: cookie_laravel_session
+    description: Кука laravel_session — имя сессии по умолчанию (Laravel 4+)
     target: cookie_name
-    regex: "^[a-z0-9_\\-]+_session$"
-    weight: 0.2
+    match: "laravel_session"
+    weight: 0.35
+
+  - id: cookie_session_suffix
+    description: Кука <имя_приложения>_session (слабый признак — ci_session у CodeIgniter, _<app>_session у Rails)
+    target: cookie_name
+    regex: '^[a-z0-9_\-]+_session$'
+    weight: 0.15
 
   - id: cookie_encrypted_payload
-    description: Зашифрованное Laravel-значение (base64 от {"iv":)
+    description: Зашифрованное Laravel-значение куки (base64 от {"iv":…} — EncryptCookies)
     target: cookie_value
-    regex: "^eyJpdiI6"
+    regex: '^eyJpdiI6'
     weight: 0.45
 
-  - id: meta_csrf_token
-    description: meta csrf-token (встречается и вне Laravel — слабый признак)
-    target: html
-    regex: '<meta\s+name="csrf-token"'
+  - id: cookie_remember_guard
+    description: Кука remember_<guard>_<sha1> — «запомнить меня» (SessionGuard; вне Laravel не встречается)
+    target: cookie_name
+    regex: '^remember_[a-z0-9]+_[0-9a-f]{32,40}$'
+    weight: 0.35
+
+  # ------------------------------------------------------------ headers
+  # PHP built-in server (php -S; php artisan serve — команда фреймворка с
+  # Laravel 5.7) — практически единственный сервер, шлющий заголовок Host в
+  # ОТВЕТЕ. Слабый признак «dev-бокса»: php -S годится и для не-Laravel
+  # приложений. Обычные PHP-хостинги (X-Powered-By, Server: PHP/…) не берём —
+  # это признак PHP вообще, а не Laravel, и шумел бы на каждом WordPress.
+  - id: header_php_cli_server
+    description: Заголовок Host в ответе — PHP built-in server (php artisan serve)
+    target: header_name
+    match: "Host"
     weight: 0.2
 
-  - id: vite_assets
-    description: Сборка Vite (build/assets c 8-символьным хэшем)
+  # ------------------------------------------------------------ meta
+  - id: meta_csrf_token
+    description: meta csrf-token (слабый признак — те же мета-теги генерируют Rails и Symfony-шаблоны)
+    target: meta
+    regex: 'name=["'']csrf-token["'']'
+    weight: 0.2
+
+  # ------------------------------------------------------------ HTML: формы
+  - id: form_csrf_input
+    description: Скрытое поле _token — вывод csrf_field() (Symfony пишет form[_token], CakePHP — _csrfToken)
     target: html
-    regex: '/build/assets/[^"]+-[A-Za-z0-9_-]{8}\.(js|css)'
-    weight: 0.15
+    regex: '<input[^>]+name="_token"'
+    weight: 0.25
+
+  # ------------------------------------------------------------ HTML: сборка
+  - id: vite_assets
+    description: Сборка Vite — laravel-vite-plugin по умолчанию (/build/assets/ + 8-символьный хэш)
+    target: html
+    regex: '/build/assets/[^"'']+-[A-Za-z0-9_-]{8}\.(js|css)'
+    weight: 0.2
+    ver_min: "9.19"
+
+  - id: vite_dev_client
+    description: Vite dev-сервер (@vite/client при npm run dev; сам Vite не только про Laravel)
+    target: html
+    regex: '@vite/client'
+    weight: 0.1
     ver_min: "9.19"
 
   - id: mix_assets
-    description: Сборка Laravel Mix (?id= с 20 hex-символами)
+    description: Сборка Laravel Mix (?id= с 20 hex из mix-manifest.json)
     target: html
     regex: '\.(css|js)\?id=[0-9a-f]{20}'
     weight: 0.15
     ver_max: "9.x"
 
+  # ------------------------------------------------------------ HTML: стек
   - id: inertia
-    description: Inertia.js (data-page)
+    description: Inertia.js (атрибут data-page; экосистема Laravel-first, но есть адаптеры и для Rails)
     target: html
-    regex: 'data-page=[''"]'
+    regex: 'data-page=["'']'
     weight: 0.2
 
-  - id: livewire
-    description: Livewire (wire:* атрибуты / livewire.js)
+  - id: livewire_attrs
+    description: Livewire — атрибуты wire:* (Livewire работает только поверх Laravel)
     target: html
-    regex: 'wire:(id|model|click)|livewire(\.min)?\.js'
+    regex: '\swire:[a-z]+'
+    weight: 0.5
+
+  - id: livewire_script
+    description: Livewire — клиентский скрипт livewire*.js
+    target: html
+    regex: 'livewire[^"'']{0,40}\.js'
+    weight: 0.25
+
+  - id: ziggy_routes
+    description: Ziggy — маршруты Laravel в JS (const Ziggy = ...; пакет Laravel-экосистемы)
+    target: html
+    regex: 'const Ziggy\s*='
+    weight: 0.35
+
+  - id: sanctum_csrf_cookie
+    description: Sanctum SPA-аутентификация (запрос /sanctum/csrf-cookie во inline-скрипте)
+    target: html
+    regex: '/sanctum/csrf-cookie'
     weight: 0.3
+
+  - id: laravel_debugbar
+    description: Laravel Debugbar (barryvdh; голый phpdebugbar вне Laravel встречается редко)
+    target: html
+    regex: 'phpdebugbar|laravel-debugbar'
+    weight: 0.3
+
+  - id: window_laravel
+    description: window.Laravel = {...} — дефолтные layout'ы Laravel (5.3+; вне Laravel не встречается)
+    target: html
+    regex: 'window\.Laravel\s*='
+    weight: 0.4
+
+  - id: json_unauthenticated
+    description: JSON-ответ {"message":"Unauthenticated."} — Authenticate middleware (API/Sanctum)
+    target: html
+    regex: '\{"message":"Unauthenticated\."\}'
+    weight: 0.3
+
+  # --------------------------------------- HTML: страницы/виды по умолчанию
+  - id: welcome_classic
+    description: Классическая welcome-страница Laravel 5.3–7.x (position-ref / title m-b-md)
+    target: html
+    regex: 'position-ref full-height|title m-b-md'
+    weight: 0.45
+    ver_min: "5.3"
+    ver_max: "7.x"
+
+  - id: laravel_docs_link
+    description: Ссылка на https://laravel.com/docs (welcome-страницы Laravel; иногда — обзоры и блоги)
+    target: html
+    regex: 'https://laravel\.com/docs'
+    weight: 0.3
+
+  - id: pagination_aria
+    description: Пагинация по умолчанию — Tailwind-вид (aria-label="Pagination Navigation")
+    target: html
+    regex: 'aria-label="Pagination Navigation"'
+    weight: 0.25

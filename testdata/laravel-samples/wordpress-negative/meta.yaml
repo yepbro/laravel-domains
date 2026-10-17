@@ -1,0 +1,5 @@
+is_laravel: false
+note: "Негативный образец WordPress: PHP-хостинг (X-Powered-By) и ?ver= у ассетов не должны давать ни одного срабатывания"
+source: synthetic
+obtained: 2026-10-17
+rules: []

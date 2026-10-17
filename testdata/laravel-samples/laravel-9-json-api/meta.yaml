@@ -1,0 +1,11 @@
+is_laravel: true
+# диапазон версий не проверяется: срабатывают только правила без ver_min/ver_max
+note: "Синтетический образец (Laravel 9, API под auth:sanctum): JSON-ответ 401 без HTML-признаков — Laravel определяется по кукам и телу ответа"
+source: synthetic
+obtained: 2026-10-17
+rules:
+  - cookie_xsrf_token
+  - cookie_laravel_session
+  - cookie_session_suffix
+  - cookie_encrypted_payload
+  - json_unauthenticated

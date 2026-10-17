@@ -1,0 +1,8 @@
+{
+  "Host": ["127.0.0.1:8000"],
+  "X-Powered-By": ["PHP/8.3.12"],
+  "Set-Cookie": [
+    "XSRF-TOKEN=eyJpdiI6REVWLVNQQToxNjp7fQ%3D%3D; path=/; secure; samesite=lax",
+    "laravel_session=eyJpdiI6c2Vzc2lvbi0xMToxNjp7fQ%3D%3D; path=/; httponly; samesite=lax"
+  ]
+}

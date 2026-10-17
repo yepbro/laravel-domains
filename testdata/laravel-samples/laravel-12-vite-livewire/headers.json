@@ -1,0 +1,7 @@
+{
+  "Content-Type": ["text/html; charset=UTF-8"],
+  "Set-Cookie": [
+    "XSRF-TOKEN=eyJpdiI6QUNNRS1UT0s6MTY6e30%3D; expires=Sat, 17 Oct 2026 19:30:00 GMT; path=/; secure; samesite=lax",
+    "acme_session=eyJpdiI6YWNtZS1zZXNzaW9uOjE2Ont9; expires=Sat, 17 Oct 2026 19:30:00 GMT; path=/; httponly; samesite=lax"
+  ]
+}

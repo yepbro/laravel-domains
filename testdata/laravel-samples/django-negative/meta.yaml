@@ -2,3 +2,4 @@ is_laravel: false
 note: "Негативный образец Django: csrf-кука с похожим смыслом, но не Laravel"
 source: synthetic
 obtained: 2026-10-16
+rules: []             # ни одно правило не должно сработать

@@ -1,0 +1,6 @@
+{
+  "Content-Type": ["text/html; charset=utf-8"],
+  "Set-Cookie": [
+    "_shop_session=RXhhbXBsZVNlc3Npb25FbmNyeXB0ZWQ--YWJjZGVmZ2hpamtsbW4--cXl6d2Vy; path=/; httponly; SameSite=Lax"
+  ]
+}

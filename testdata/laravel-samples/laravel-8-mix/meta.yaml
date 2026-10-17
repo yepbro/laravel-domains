@@ -4,3 +4,10 @@ ver_max: "9.x"         # Mix использовался до Laravel 10, но п
 note: "Синтетический образец (Laravel 8 + Mix) — контроль старых сборок"
 source: synthetic
 obtained: 2026-10-16
+rules:                # полный список сработавших правил (сверка в тестах)
+  - cookie_xsrf_token
+  - cookie_laravel_session
+  - cookie_session_suffix
+  - cookie_encrypted_payload
+  - meta_csrf_token
+  - mix_assets
