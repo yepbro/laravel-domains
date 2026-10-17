@@ -3,6 +3,7 @@ package render
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -433,5 +434,57 @@ func TestBrowserNeedsRestart(t *testing.T) {
 	b.pages.Add(1)
 	if !b.NeedsRestart() {
 		t.Error("порог 3 достигнут")
+	}
+}
+
+func TestBrowserRSSUnknown(t *testing.T) {
+	// rootPID не определён (remote-режим, процесс не найден) — RSS
+	// неизвестен, порог памяти не триггерует.
+	b := testBrowser(1)
+	b.opts.MemoryThreshold = 1
+	if got := b.RSS(); got != -1 {
+		t.Errorf("RSS без процесса = %d, хочу -1", got)
+	}
+	if b.OverMemory() {
+		t.Error("неизвестный RSS не должен триггерить перезапуск")
+	}
+	if (*Browser)(nil).OverMemory() {
+		t.Error("nil-браузер не должен триггерить перезапуск")
+	}
+}
+
+func TestBrowserOverMemory(t *testing.T) {
+	// RSS живого процесса с стабильной памятью: спящий потомок теста
+	// (RSS самого теста «дышит» между чтениями — сравнения флакают).
+	cmd := exec.Command("sleep", "5")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("sleep не запустился: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+
+	b := testBrowser(1)
+	b.rootPID = cmd.Process.Pid
+	var rss int64
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if rss = b.RSS(); rss > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rss <= 0 {
+		t.Skip("RSS недоступен (нет /proc)")
+	}
+	b.opts.MemoryThreshold = rss // ровно порог — превышен (>=)
+	if !b.OverMemory() {
+		t.Error("RSS равен порогу: перезапуск должен срабатывать")
+	}
+	b.opts.MemoryThreshold = rss + 1<<30 // заведомо выше живого RSS
+	if b.OverMemory() {
+		t.Error("RSS ниже порога — без перезапуска")
+	}
+	b.opts.MemoryThreshold = 0 // контроль отключён
+	if b.OverMemory() {
+		t.Error("нулевой порог отключает контроль")
 	}
 }

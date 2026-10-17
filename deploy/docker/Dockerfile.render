@@ -1,6 +1,14 @@
 # Образ рендера: headless-Chromium + бинарник render-worker (ТЗ 4.3).
 # render-worker запускает Chromium сам (chromedp), поэтому один процесс
-# на контейнер; shm_size/init/mem_limit задаются в compose.
+# на контейнер; shm_size/init/mem_limit задаются при запуске.
+#
+# Пользователь — nobody: отдельный непривилегированный пользователь для
+# рендера недоверенных страниц (ТЗ §9, §10.1). Лимит памяти контейнера —
+# бюджет Chromium ≈ 2 ГБ (ТЗ 3.2): compose-профиль runtime
+# (deploy/docker/compose.yaml, сервис render, mem_limit — docker-аналог
+# cgroup MemoryMax из ТЗ 10.1); systemd-юниты с MemoryMax — этап 9.
+# Перезапуски Chromium по страницам/памяти выполняет воркер (T-065,
+# render.restart_every_pages / render.restart_memory_bytes).
 #
 # Проверочная сборка: make build-runtime
 

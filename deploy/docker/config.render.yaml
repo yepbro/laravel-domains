@@ -1,0 +1,20 @@
+# Конфигурация боевого render-контейнера — compose-профиль runtime, сервис
+# render (deploy/docker/compose.yaml). Отличие от dev-конфига
+# config.dev.yaml: remote_url пуст — render-worker запускает собственный
+# процесс headless-shell (боевой режим, Dockerfile.render), а не подключается
+# к внешнему compose-сервису chromium. Остальные секции берутся значениями по
+# умолчанию (internal/config, ТЗ 5.10); адреса БД/очереди приходят переменными
+# окружения (APP_PG_DSN, CRAWLER_REDIS_ADDR — см. compose.yaml).
+
+postgres:
+  dsn: "" # задаётся APP_PG_DSN из compose.yaml
+
+render:
+  remote_url: "" # боевой режим: собственный процесс headless-shell
+  contexts: 3
+  timeout: "25s"
+  restart_every_pages: 500
+  # Порог перезапуска по RSS (T-065): 1,5 ГиБ при лимите контейнера 2 ГиБ
+  # (бюджет Chromium ≈ 2 ГБ, ТЗ 3.2) — перезапуск до cgroup-OOM;
+  # обоснование — docs/render.md, раздел «Перезапуск браузера».
+  restart_memory_bytes: "1536MiB"

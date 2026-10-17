@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,11 @@ type Browser struct {
 	cancelAlloc context.CancelFunc
 
 	pages atomic.Int64 // успешно отрендеренные страницы (T-065)
+
+	// rootPID — PID главного процесса Chromium в локальном режиме
+	// (0 — remote-режим или процесс не определён): корень дерева процессов
+	// для контроля памяти (Browser.RSS, T-065). Неизменен после старта.
+	rootPID int
 
 	mu     sync.Mutex
 	closed bool
@@ -103,6 +109,21 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 			Err:   fmt.Errorf("инициализация Chromium (%s): %w", mode, err),
 		}
 	}
+
+	// Локальный режим: запомнить процесс Chromium — корень дерева для
+	// контроля памяти (T-065). chromedp отдаёт его явно (Browser.Process
+	// задокументирован как раз для сбора метрик процесса); в remote-режиме
+	// процесса рядом нет — контроль памяти отключён (RSS = -1).
+	if opts.RemoteURL == "" {
+		if c := chromedp.FromContext(bctx); c != nil && c.Browser != nil {
+			if p := c.Browser.Process(); p != nil {
+				b.rootPID = p.Pid
+			}
+		}
+		if b.rootPID == 0 {
+			slog.Warn("процесс Chromium не определён: перезапуск по памяти отключён")
+		}
+	}
 	return b, nil
 }
 
@@ -129,9 +150,35 @@ func (b *Browser) Alive() bool {
 // сам перезапуск — T-065).
 func (b *Browser) Pages() int64 { return b.pages.Load() }
 
-// NeedsRestart — достигнут ли порог перезапуска по числу страниц (T-065).
+// NeedsRestart — достигнут ли порог перезапуска по числу страниц (T-065):
+// счётчик Pages обнуляется сменой поколения (Manager).
 func (b *Browser) NeedsRestart() bool {
 	return b.Pages() >= int64(b.opts.RestartEveryPages)
+}
+
+// RSS — суммарный RSS дерева процессов Chromium (главный процесс и все
+// потомки — рендереры, GPU: в бюджет ТЗ 3.2 вкладывается каждый), байт;
+// корень — PID процесса локального режима. -1 — неизвестно: remote-режим
+// (браузер в чужом контейнере, там потолок держит mem_limit контейнера)
+// или /proc недоступен.
+func (b *Browser) RSS() int64 {
+	if b == nil || b.rootPID <= 0 {
+		return -1
+	}
+	return procTreeRSS(b.rootPID)
+}
+
+// OverMemory — превышен ли порог памяти перезапуска
+// Options.MemoryThreshold (ТЗ 5.6). Неизвестный RSS и нулевой порог
+// (контроль отключён) не триггеруют: перезапуск — мягкая профилактика
+// роста памяти, жёсткий потолок в любом режиме держит cgroup контейнера
+// (mem_limit — docker-аналог MemoryMax, ТЗ 3.2/10.1).
+func (b *Browser) OverMemory() bool {
+	if b == nil || b.opts.MemoryThreshold <= 0 {
+		return false
+	}
+	rss := b.RSS()
+	return rss > 0 && rss >= b.opts.MemoryThreshold
 }
 
 // Close останавливает браузер: закрываются вкладки и изолированные

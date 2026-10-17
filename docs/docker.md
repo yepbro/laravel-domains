@@ -182,6 +182,37 @@ dc build --no-cache unbound   # пересобрать без кэша (если
 После смены версий в `.env` (`GO_VERSION`, `ALPINE_VERSION`, …) образы
 пересоберутся автоматически при следующем `make up`/`make build`.
 
+### Боевой render-контейнер (профиль runtime)
+
+`make build-runtime` проверяет только сборку образов. Полный боевой
+контейнер рендера поднимается профилем `runtime` — сервис `render`
+(`crawler/render:local`): render-worker + собственный Chromium в одном
+контейнере (`Dockerfile.render`, `USER nobody`), с фиксированными
+ресурсными требованиями ТЗ §3.2/§9/§10.1 (T-065):
+
+```bash
+dc --profile runtime up -d render   # поднимет и зависимости (postgres, redis)
+docker inspect crawler-render-1 --format '{{.HostConfig.Memory}}'   # 2147483648 ≈ 2 ГБ (ТЗ 3.2)
+dc --profile runtime stop render    # остановить
+```
+
+- `mem_limit: ${MEM_RENDER:-2048m}` — бюджет Chromium ≈ 2 ГБ (ТЗ 3.2);
+  `mem_limit` — docker-аналог cgroup `MemoryMax` из ТЗ 10.1: OOM-killer
+  не затрагивает PostgreSQL и остальные сервисы.
+- `shm_size: 1gb`, `init: true` — как dev-сервису chromium (ТЗ 4.3).
+- `cap_drop: ALL`, `no-new-privileges`, пользователь `nobody` в образе —
+  непривилегированный запуск рендера недоверенных страниц (ТЗ §9).
+- перезапуск Chromium каждые N страниц и по порогу RSS — изнутри воркера
+  (`render.restart_every_pages`, `render.restart_memory_bytes`; конфиг —
+  `deploy/docker/config.render.yaml`, `remote_url` пуст — боевой режим),
+  жёсткий потолок — `mem_limit`; детали — [`render.md`](render.md),
+  раздел «Перезапуск браузера и порог памяти».
+- systemd-юниты с `MemoryMax`/`User=` (постановка вне Docker) — этап 9
+  (ТЗ 10.1).
+
+Рабочий цикл очередей рендера подключается T-067; сейчас сервис стартует
+и отвечает `healthz`.
+
 ## 7. Диагностика Docker
 
 ```bash
@@ -226,6 +257,7 @@ dc events                         # поток событий (restart, oom и �
 | `172.28.100.12` | testweb (все домены-фикстуры) |
 | `172.28.100.13` | mockserver |
 | `172.28.100.14` | chromium (CDP `ws://…:9222`) |
+| `172.28.100.15` | render — боевой render-контейнер (профиль `runtime`) |
 | `172.28.100.250` | «чёрная дыра» (сценарий закрытых портов) |
 
 Порты на хосте (только `127.0.0.1`): `5432` PostgreSQL, `6379` Redis,

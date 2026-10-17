@@ -67,6 +67,10 @@ render:
   contexts: 3                        # рекомендация ТЗ: 2–4
   timeout: "25s"
   restart_every_pages: 500
+  # Порог перезапуска браузера по памяти: суммарный RSS процессов Chromium
+  # (боевой режим) ≥ порога → перезапуск до cgroup-OOM; 0 — отключить.
+  # Ниже лимита контейнера (бюджет Chromium ≈ 2 ГБ, ТЗ 3.2).
+  restart_memory_bytes: "1536MiB"
 
 content:
   dir: "/data/content"                # пак-файлы pack-NNNNNN.pack (docs/content.md)

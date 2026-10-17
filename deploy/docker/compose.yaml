@@ -7,11 +7,13 @@
 #   testbed        coredns, testweb, mockserver — изолированный «мини-интернет»
 #   app            Go-сервисы проекта + chromium
 #   monitoring     prometheus
+#   runtime        render — боевой render-контейнер (Dockerfile.render)
 #   tools          adminer, redis-insight, tools (запускаются по требованию)
 #
 # Сеть crawler_net использует статические адреса:
 #   postgres 172.28.100.2, redis 172.28.100.3, unbound 172.28.100.10, coredns 172.28.100.11,
 #   testweb 172.28.100.12, mockserver 172.28.100.13, chromium 172.28.100.14,
+#   render (профиль runtime) 172.28.100.15,
 #   172.28.100.250 — «чёрная дыра» (адрес без слушателя для сценариев закрытых портов).
 # Приложениям адреса инфраструктуры выдаются через переменные окружения,
 # а DNS всех сервисов приложения указывает на unbound (см. 7.2 ТЗ).
@@ -370,6 +372,10 @@ services:
   chromium:
     # Headless Chromium для render-worker (CDP на :9222).
     # shm_size вместо --disable-dev-shm-usage; init — уборка zombie (ТЗ 4.3).
+    # mem_limit — бюджет Chromium ТЗ 3.2 (≈2 ГБ, docker-аналог cgroup
+    # MemoryMax из ТЗ 10.1). Перезапуск по страницам/памяти (T-065) здесь
+    # ограничен порогом страниц: воркер в remote-режиме не видит RSS чужого
+    # контейнера — жёсткий потолок и рестарт держит этот лимит + restart.
     image: ${CHROMEDP_HEADLESS_IMAGE:-chromedp/headless-shell:156.0.8078.17}
     shm_size: "1gb"
     init: true
@@ -381,6 +387,62 @@ services:
     mem_limit: ${MEM_CHROMIUM:-2048m}
     restart: unless-stopped
     profiles: ["app"]
+
+  # ==========================================================================
+  # Боевой render-контейнер (profile: runtime)
+  # ==========================================================================
+
+  render:
+    # Боевой режим рендера целиком в одном контейнере: render-worker запускает
+    # собственный Chromium (deploy/docker/Dockerfile.render, USER nobody —
+    # отдельный непривилегированный пользователь, ТЗ §9/§10.1). Ресурсные
+    # требования фиксируются здесь (T-065): mem_limit — бюджет Chromium ≈2 ГБ
+    # (ТЗ 3.2, docker-аналог cgroup MemoryMax из ТЗ 10.1 — OOM не заденет
+    # остальные сервисы); shm_size/init — как dev-сервису chromium (ТЗ 4.3);
+    # cap_drop/no-new-privileges — непривилегированный запуск (§9). Перезапуск
+    # Chromium каждые N страниц и по порогу RSS — изнутри воркера
+    # (render.restart_every_pages / render.restart_memory_bytes, T-065,
+    # docs/render.md); systemd-юниты с MemoryMax — этап 9 (ТЗ 10.1).
+    # Рабочий цикл очередей подключается T-067; сейчас сервис стартует и
+    # отвечает healthz.
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.render
+      target: render
+      args:
+        GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (см. .env.example)}
+        CHROMEDP_HEADLESS_IMAGE: ${CHROMEDP_HEADLESS_IMAGE:-chromedp/headless-shell:156.0.8078.17}
+    image: crawler/render:local
+    environment:
+      APP_PG_DSN: postgres://${APP_DB_USER:-crawler}:${APP_DB_PASSWORD:-dev-only-crawler}@172.28.100.2:5432/${POSTGRES_DB:-crawler}?sslmode=disable
+      CRAWLER_REDIS_ADDR: 172.28.100.3:6379
+      CRAWLER_CONFIG: /etc/crawler/config.render.yaml
+      CRAWLER_HTTP_USER_AGENT: "${CRAWLER_USER_AGENT:-DomainCrawler/dev (+dev-environment; contact: dev@example.invalid)}"
+    volumes:
+      - ./deploy/docker/config.render.yaml:/etc/crawler/config.render.yaml:ro
+      - ./var/content:/data/content
+    # DNS — unbound: и воркеру (очереди по именам не нужны, адреса статические),
+    # и Chromium — он резолвит имена страниц контейнера (ТЗ 5.4 через unbound).
+    dns:
+      - 172.28.100.10
+    dns_opt:
+      - "ndots:1"
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.15
+    mem_limit: ${MEM_RENDER:-2048m}
+    shm_size: "1gb"
+    init: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles: ["runtime"]
 
   # ==========================================================================
   # Мониторинг (profile: monitoring)

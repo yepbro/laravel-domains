@@ -24,15 +24,16 @@
 //     каждая в своём изолированном контексте.
 //
 // Ошибки классифицируются (Class): упавший контекст — повтор на новом,
-// недоступный браузер — наверх (перезапуск — T-065), ошибка страницы —
-// обычный результат этапа (повторная доставка — уровень очереди, T-066).
+// недоступный браузер — наверх, ошибка страницы — обычный результат этапа
+// (повторная доставка — уровень очереди, T-066).
 //
 // Развитие T-062…T-067 поверх текущего API: блокировка ресурсов (T-062) и
 // ожидание «затишья» сети (T-063) встраиваются этапами в Session.Run (до
 // перехода и до съёма результата соответственно); итоговый DOM, cookies и
-// заголовки ответа (T-064) — поля RenderOutput (extract.go); счётчик
-// Browser.Pages обслуживает перезапуск каждые N страниц (T-065); цикл
-// очередей (T-066/T-067) вызовет Pool.Run.
+// заголовки ответа (T-064) — поля RenderOutput (extract.go); Manager (T-065)
+// владеет поколениями «браузер + пул» — перезапуск каждые N страниц
+// (счётчик Browser.Pages) и по порогу RSS; цикл очередей (T-066/T-067)
+// вызывает Manager.Run.
 package render
 
 import (
@@ -96,8 +97,17 @@ type Options struct {
 	// Timeout — общий таймаут одной страницы (ТЗ 5.6: по умолчанию 25 с).
 	Timeout time.Duration
 	// RestartEveryPages — порог перезапуска браузера по числу страниц
-	// (ТЗ 5.6): Browser ведёт счётчик Pages, сам перезапуск — T-065.
+	// (ТЗ 5.6): Browser ведёт счётчик Pages, смена поколения — Manager
+	// (T-065).
 	RestartEveryPages int
+	// MemoryThreshold — порог перезапуска браузера по памяти, байт:
+	// суммарный RSS дерева процессов Chromium ≥ порога → перезапуск
+	// (ТЗ 5.6). Бюджет Chromium ≈ 2 ГБ (ТЗ 3.2, cgroup MemoryMax), порог
+	// обязан быть ниже лимита контейнера: перезапуск — профилактика до
+	// срабатывания cgroup-OOM. 0 — контроль отключён; в remote-режиме
+	// процесс Chromium рядом нет (RSS неизвестен) и контроль не работает —
+	// потолок там держит mem_limit контейнера Chromium.
+	MemoryThreshold int64
 	// UserAgent — идентифицируемый User-Agent страниц рендера (ТЗ §9):
 	// подменяет UA браузера в сессиях (Emulation.setUserAgentOverride).
 	// В секции render ТЗ 5.10 отдельного поля нет, краулер представлен
@@ -126,6 +136,7 @@ func NewOptions(cfg config.Config) Options {
 		Contexts:          cfg.Render.Contexts,
 		Timeout:           time.Duration(cfg.Render.Timeout),
 		RestartEveryPages: cfg.Render.RestartEveryPages,
+		MemoryThreshold:   cfg.Render.RestartMemoryBytes.B(),
 		UserAgent:         cfg.HTTP.UserAgent,
 	}
 }
@@ -166,6 +177,16 @@ func (o Options) validate() error {
 	if o.RestartEveryPages < 1 {
 		problems = append(problems,
 			fmt.Sprintf("restart_every_pages: ожидается >= 1, задано %d", o.RestartEveryPages))
+	}
+	// Диапазон порога памяти повторяет render.restart_memory_bytes
+	// internal/config: 0 — контроль отключён, ниже 256 MiB — ниже холостого
+	// RSS headless-shell с контекстами (краш-луп перезапусков), выше
+	// 16 GiB — за пределами разумного бюджета одного воркера (ТЗ 3.2).
+	if o.MemoryThreshold < 0 ||
+		(o.MemoryThreshold != 0 && (o.MemoryThreshold < 256<<20 || o.MemoryThreshold > 16<<30)) {
+		problems = append(problems, fmt.Sprintf(
+			"memory_threshold: ожидается 0 (отключено) или %d..%d байт, задано %d",
+			256<<20, 16<<30, o.MemoryThreshold))
 	}
 	if len(problems) > 0 {
 		return errors.New("render: " + strings.Join(problems, "; "))

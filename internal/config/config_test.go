@@ -83,6 +83,7 @@ func TestDefault(t *testing.T) {
 		{"render.contexts", c.Render.Contexts, 3},
 		{"render.timeout", c.Render.Timeout.D(), 25 * time.Second},
 		{"render.restart_every_pages", c.Render.RestartEveryPages, 500},
+		{"render.restart_memory_bytes", c.Render.RestartMemoryBytes.B(), int64(1536 << 20)},
 		{"content.dir", c.Content.Dir, "/data/content"},
 		{"content.pack_size", c.Content.PackSize.B(), int64(512 << 20)},
 		{"content.max_store_bytes", c.Content.MaxStoreBytes.B(), int64(2 << 20)},
@@ -159,6 +160,7 @@ render:
   contexts: 4
   timeout: "40s"
   restart_every_pages: 200
+  restart_memory_bytes: "1GiB"
 content:
   dir: "/srv/content"
   pack_size: "1GiB"
@@ -225,6 +227,7 @@ log:
 		{"render.contexts", cfg.Render.Contexts, 4},
 		{"render.timeout", cfg.Render.Timeout.D(), 40 * time.Second},
 		{"render.restart_every_pages", cfg.Render.RestartEveryPages, 200},
+		{"render.restart_memory_bytes", cfg.Render.RestartMemoryBytes.B(), int64(1 << 30)},
 		{"content.dir", cfg.Content.Dir, "/srv/content"},
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(1 << 30)},
 		{"content.max_store_bytes", cfg.Content.MaxStoreBytes.B(), int64(1 << 20)},
@@ -369,6 +372,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_RENDER_CONTEXTS":                  "2",
 		"CRAWLER_RENDER_TIMEOUT":                   "11s",
 		"CRAWLER_RENDER_RESTART_EVERY_PAGES":       "99",
+		"CRAWLER_RENDER_RESTART_MEMORY_BYTES":      "768MiB",
 		"CRAWLER_CONTENT_DIR":                      "/env/content",
 		"CRAWLER_CONTENT_PACK_SIZE":                "256MB",
 		"CRAWLER_CONTENT_MAX_STORE_BYTES":          "512KiB",
@@ -427,6 +431,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"render.contexts", cfg.Render.Contexts, 2},
 		{"render.timeout", cfg.Render.Timeout.D(), 11 * time.Second},
 		{"render.restart_every_pages", cfg.Render.RestartEveryPages, 99},
+		{"render.restart_memory_bytes", cfg.Render.RestartMemoryBytes.B(), int64(768 << 20)},
 		{"content.dir", cfg.Content.Dir, "/env/content"},
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(256 * 1000 * 1000)},
 		{"content.max_store_bytes", cfg.Content.MaxStoreBytes.B(), int64(512 << 10)},
@@ -642,6 +647,8 @@ func TestValidate(t *testing.T) {
 		{"contexts 0", func(c *Config) { c.Render.Contexts = 0 }, "render.contexts"},
 		{"render.timeout 0", func(c *Config) { c.Render.Timeout = 0 }, "render.timeout"},
 		{"restart_every_pages 0", func(c *Config) { c.Render.RestartEveryPages = 0 }, "render.restart_every_pages"},
+		{"restart_memory_bytes мал", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(1 << 20) }, "render.restart_memory_bytes"},
+		{"restart_memory_bytes велик", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(17 << 30) }, "render.restart_memory_bytes"},
 		{"content.dir пуст", func(c *Config) { c.Content.Dir = "" }, "content.dir"},
 		{"pack_size мал", func(c *Config) { c.Content.PackSize = 1 }, "content.pack_size"},
 		{"pack_size велик", func(c *Config) { c.Content.PackSize = ByteSize(16 << 30) }, "content.pack_size"},
@@ -686,7 +693,8 @@ func TestValidate(t *testing.T) {
 	c.Analyzer.LaravelMinScore = 1
 	c.HTTP.MaxRedirects = 0
 	c.Ingest.MaxErrorRatio = 1
-	c.Scheduler.BatchSize = 10000 // верхняя граница пачек планировщика (ТЗ 5.3)
+	c.Render.RestartMemoryBytes = 0 // контроль памяти отключён — допустимо
+	c.Scheduler.BatchSize = 10000   // верхняя граница пачек планировщика (ТЗ 5.3)
 	c.Subdomains = make([]string, maxSubdomains)
 	for i := range c.Subdomains {
 		c.Subdomains[i] = fmt.Sprintf("s%d", i)

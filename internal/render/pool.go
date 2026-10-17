@@ -108,12 +108,21 @@ func (p *Pool) attempt(ctx context.Context, task RenderTask) (RenderOutput, erro
 
 // Close останавливает пул: новые задачи отклоняются (ErrClosed), текущие
 // дорабатываются — каждая ограничена Options.Timeout (ТЗ 3.4), — затем
-// останавливается браузер.
+// останавливается браузер. Повторный вызов безвреден.
 func (p *Pool) Close() {
+	p.retire()
+	p.wg.Wait()
+	p.b.Close()
+}
+
+// retire закрывает пул для новых задач (ErrClosed), не дожидаясь текущих:
+// менеджер (T-065) выводит сменяемое поколение из работы синхронно с
+// решением о перезапуске, а доработку задач и остановку браузера оставляет
+// фоновому Close (гонки «задача попала в закрываемый пул после acquire»
+// закрыты повтором в Manager.Run).
+func (p *Pool) retire() {
 	if !p.closed.CompareAndSwap(false, true) {
 		return
 	}
 	close(p.done)
-	p.wg.Wait()
-	p.b.Close()
 }

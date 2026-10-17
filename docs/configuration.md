@@ -272,12 +272,21 @@ Quad9), как в ТЗ 5.10.
 | `contexts` | `CRAWLER_RENDER_CONTEXTS` | целое | `3` (рекомендация: 2–4) |
 | `timeout` | `CRAWLER_RENDER_TIMEOUT` | длительность | `25s` |
 | `restart_every_pages` | `CRAWLER_RENDER_RESTART_EVERY_PAGES` | целое | `500` |
+| `restart_memory_bytes` | `CRAWLER_RENDER_RESTART_MEMORY_BYTES` | размер | `1536MiB` (диапазон: 256MiB–16GiB, `0` — отключено) |
 
 `remote_url` — расширение dev-окружения: адрес внешнего Chromium по CDP
 (`ws://host:9222`); в боевом режиме воркер запускает браузер сам, поле
 пусто. User-Agent страниц рендера — единый `http.user_agent` (ТЗ §9);
 архитектура этапа (изолированные контексты, пул, ошибки) — в
 [`render.md`](render.md).
+
+`restart_every_pages` и `restart_memory_bytes` — пороги перезапуска
+браузера (ТЗ 5.6 «перезапуск браузера каждые N страниц и при превышении
+порогога памяти», T-065). Порог памяти — суммарный RSS процессов Chromium
+в боевом режиме; по умолчанию 1,5 ГиБ при бюджете ≈ 2 ГБ (ТЗ 3.2,
+`mem_limit`/cgroup `MemoryMax`): перезапуск срабатывает до cgroup-OOM.
+В remote-режиме (dev-стек) RSS чужого контейнера недоступен — контроль по
+памяти не работает, потолок держит лимит контейнера Chromium.
 
 ### `content` (ТЗ 5.7)
 

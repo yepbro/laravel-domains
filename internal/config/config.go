@@ -168,6 +168,14 @@ type Render struct {
 	Contexts          int      `yaml:"contexts"`
 	Timeout           Duration `yaml:"timeout"`
 	RestartEveryPages int      `yaml:"restart_every_pages"`
+	// RestartMemoryBytes — порог перезапуска браузера по памяти (ТЗ 5.6
+	// «при превышении порога памяти»): суммарный RSS процессов Chromium
+	// ≥ порога → перезапуск (T-065). Расширение к минимальному составу
+	// ТЗ 5.10: числа ТЗ не задаёт, ориентир — бюджет Chromium ≈ 2 ГБ
+	// (ТЗ 3.2, cgroup MemoryMax), порог берётся ниже лимита контейнера.
+	// 0 — контроль отключён; в remote-режиме (dev) RSS недоступен и
+	// контроль не работает (потолок держит mem_limit контейнера).
+	RestartMemoryBytes ByteSize `yaml:"restart_memory_bytes"`
 }
 
 // Content — хранилище контента (ТЗ 5.7).
@@ -277,6 +285,11 @@ func Default() *Config {
 			Contexts:          3,
 			Timeout:           Duration(25 * time.Second),
 			RestartEveryPages: 500,
+			// 1,5 ГиБ = 75 % бюджета Chromium ≈ 2 ГБ (ТЗ 3.2, cgroup
+			// MemoryMax ≈ 2 ГБ): перезапуск — до cgroup-OOM; запас — на
+			// рост между проверками (раз в задачу) и tmpfs /dev/shm,
+			// который учитывается в памяти cgroup, но не в RSS процессов.
+			RestartMemoryBytes: ByteSize(1536 << 20),
 		},
 		Content: Content{
 			Dir:            "/data/content",
@@ -483,6 +496,13 @@ func (c *Config) Validate() error {
 	}
 	if !inRange(c.Render.RestartEveryPages, 1, 1000000) {
 		problems = append(problems, rangeMsg("render.restart_every_pages", c.Render.RestartEveryPages, 1, 1000000))
+	}
+	// 0 — контроль отключён (remote-режим и малые машины); рабочий диапазон —
+	// от холостого RSS headless-shell с контекстами (ниже — краш-луп
+	// перезапусков) до разумного бюджета одного воркера (ТЗ 3.2).
+	if t := c.Render.RestartMemoryBytes; t != 0 && (t < 256<<20 || t > 16<<30) {
+		problems = append(problems, fmt.Sprintf("render.restart_memory_bytes: ожидается 0 (отключено) или %s..%s, задано %s",
+			ByteSize(256<<20), ByteSize(16<<30), t))
 	}
 
 	// content

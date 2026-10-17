@@ -32,10 +32,11 @@ func testBrowser(contexts int) *Browser {
 func TestNewOptions(t *testing.T) {
 	cfg := config.Default()
 	cfg.Render = config.Render{
-		RemoteURL:         "ws://chromium:9222",
-		Contexts:          3,
-		Timeout:           config.Duration(25 * time.Second),
-		RestartEveryPages: 500,
+		RemoteURL:          "ws://chromium:9222",
+		Contexts:           3,
+		Timeout:            config.Duration(25 * time.Second),
+		RestartEveryPages:  500,
+		RestartMemoryBytes: config.ByteSize(1536 << 20),
 	}
 	cfg.HTTP.UserAgent = "Crawler/1.0 (+https://example.example; admin@example.example)"
 
@@ -45,6 +46,7 @@ func TestNewOptions(t *testing.T) {
 		Contexts:          3,
 		Timeout:           25 * time.Second,
 		RestartEveryPages: 500,
+		MemoryThreshold:   1536 << 20,
 		UserAgent:         "Crawler/1.0 (+https://example.example; admin@example.example)",
 	}
 	if got != want {
@@ -95,6 +97,9 @@ func TestOptionsValidate(t *testing.T) {
 		{"timeout 0", Options{Contexts: 2, Timeout: 0, RestartEveryPages: 1}, "timeout"},
 		{"timeout отрицательный", Options{Contexts: 2, Timeout: -time.Second, RestartEveryPages: 1}, "timeout"},
 		{"restart_every_pages 0", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 0}, "restart_every_pages"},
+		{"memory_threshold отрицательный", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: -1}, "memory_threshold"},
+		{"memory_threshold ниже минимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 1 << 20}, "memory_threshold"},
+		{"memory_threshold выше максимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 17 << 30}, "memory_threshold"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -106,5 +111,10 @@ func TestOptionsValidate(t *testing.T) {
 				t.Fatalf("ошибка не называет поле %s: %v", tc.field, err)
 			}
 		})
+	}
+	// 0 — контроль памяти отключён (remote-режим и малые машины), не ошибка.
+	off := Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}
+	if err := off.validate(); err != nil {
+		t.Fatalf("нулевой порог памяти должен быть допустим: %v", err)
 	}
 }
