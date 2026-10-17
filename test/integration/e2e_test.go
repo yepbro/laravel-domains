@@ -151,9 +151,16 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 		t.Fatal(err)
 	}
 
-	// Набор правил — рабочий rules/ (в контейнере tools смонтирован в
-	// APP_RULES_DIR; иначе путь от каталога теста к корню репозитория).
+	// Набор правил — рабочий rules/. Приоритет: APP_RULES_DIR (если каталог
+	// существует — контейнеры сервисов), иначе путь от каталога теста к корню
+	// репозитория (tools монтирует правила в /rules, а унаследованный из
+	// go-common APP_RULES_DIR=/etc/crawler/rules в tools не смонтирован).
 	rulesDir := os.Getenv("APP_RULES_DIR")
+	if dir := rulesDir; dir != "" {
+		if _, err := os.Stat(dir); err != nil {
+			rulesDir = ""
+		}
+	}
 	if rulesDir == "" {
 		rulesDir = "../../rules"
 	}
