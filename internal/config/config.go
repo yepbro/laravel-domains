@@ -125,11 +125,15 @@ type HTTP struct {
 	Concurrency    int      `yaml:"concurrency"`
 	PerIPLimit     int      `yaml:"per_ip_limit"`
 	ConnectTimeout Duration `yaml:"connect_timeout"`
-	HeaderTimeout  Duration `yaml:"header_timeout"`
-	TotalTimeout   Duration `yaml:"total_timeout"`
-	MaxRedirects   int      `yaml:"max_redirects"`
-	MaxBodyBytes   ByteSize `yaml:"max_body_bytes"`
-	UserAgent      string   `yaml:"user_agent"`
+	// TLSHandshakeTimeout — таймаут TLS-рукопожатия (5 с из таблицы
+	// лимитов ТЗ 5.5). В минимальном составе ТЗ 5.10 поля нет — как и
+	// других таймаутов таблицы, все они «настраиваются» по ТЗ 5.5.
+	TLSHandshakeTimeout Duration `yaml:"tls_handshake_timeout"`
+	HeaderTimeout       Duration `yaml:"header_timeout"`
+	TotalTimeout        Duration `yaml:"total_timeout"`
+	MaxRedirects        int      `yaml:"max_redirects"`
+	MaxBodyBytes        ByteSize `yaml:"max_body_bytes"`
+	UserAgent           string   `yaml:"user_agent"`
 }
 
 // Render — параметры рендера (ТЗ 5.6). RemoteURL — расширение dev-окружения:
@@ -230,11 +234,13 @@ func Default() *Config {
 			Concurrency:    2000,
 			PerIPLimit:     4,
 			ConnectTimeout: Duration(5 * time.Second),
-			HeaderTimeout:  Duration(10 * time.Second),
-			TotalTimeout:   Duration(20 * time.Second),
-			MaxRedirects:   8,
-			MaxBodyBytes:   ByteSize(2 << 20), // 2 MiB
-			UserAgent:      "DomainCrawler/1.0 (contact: admin@example.invalid)",
+			// Таблица лимитов ТЗ 5.5: TLS handshake 5 с.
+			TLSHandshakeTimeout: Duration(5 * time.Second),
+			HeaderTimeout:       Duration(10 * time.Second),
+			TotalTimeout:        Duration(20 * time.Second),
+			MaxRedirects:        8,
+			MaxBodyBytes:        ByteSize(2 << 20), // 2 MiB
+			UserAgent:           "DomainCrawler/1.0 (contact: admin@example.invalid)",
 		},
 		Render: Render{
 			RemoteURL:         "",
@@ -395,6 +401,9 @@ func (c *Config) Validate() error {
 	}
 	if c.HTTP.ConnectTimeout <= 0 {
 		problems = append(problems, nonPositiveDur("http.connect_timeout", c.HTTP.ConnectTimeout))
+	}
+	if c.HTTP.TLSHandshakeTimeout <= 0 {
+		problems = append(problems, nonPositiveDur("http.tls_handshake_timeout", c.HTTP.TLSHandshakeTimeout))
 	}
 	if c.HTTP.HeaderTimeout <= 0 {
 		problems = append(problems, nonPositiveDur("http.header_timeout", c.HTTP.HeaderTimeout))

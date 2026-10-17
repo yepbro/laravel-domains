@@ -215,6 +215,7 @@ Quad9), как в ТЗ 5.10.
 | `concurrency` | `CRAWLER_HTTP_CONCURRENCY` | целое | `2000` |
 | `per_ip_limit` | `CRAWLER_HTTP_PER_IP_LIMIT` | целое | `4` (рекомендация: 3–4) |
 | `connect_timeout` | `CRAWLER_HTTP_CONNECT_TIMEOUT` | длительность | `5s` |
+| `tls_handshake_timeout` | `CRAWLER_HTTP_TLS_HANDSHAKE_TIMEOUT` | длительность | `5s` |
 | `header_timeout` | `CRAWLER_HTTP_HEADER_TIMEOUT` | длительность | `10s` |
 | `total_timeout` | `CRAWLER_HTTP_TOTAL_TIMEOUT` | длительность | `20s` |
 | `max_redirects` | `CRAWLER_HTTP_MAX_REDIRECTS` | целое | `8` (`0` — не следовать) |
@@ -222,6 +223,16 @@ Quad9), как в ТЗ 5.10.
 | `user_agent` | `CRAWLER_HTTP_USER_AGENT` | строка | `DomainCrawler/1.0 (contact: admin@example.invalid)` |
 
 `user_agent` обязателен: честный User-Agent с контактами (ТЗ 5.5, §9).
+
+Таймауты секции — послойные (транспорт `internal/httpfetch`, T-047):
+`connect_timeout` ограничивает установку TCP-соединения к одному адресу,
+`tls_handshake_timeout` — рукопожатие TLS, `header_timeout` — ожидание
+заголовков ответа (ResponseHeaderTimeout), `total_timeout` — запрос
+целиком, включая чтение тела. Подключение выполняется к заранее
+резолвленным IP из DNS-этапа; хосты HTTP-редиректов резолвятся тем же
+резолвером с кэшем (ТЗ 5.5 п. 2). При нескольких адресах попытки
+подключения стартуют поочерёдно с паузой 300 мс (happy-eyeballs-подобная
+гонка, RFC 8305) — падение одного адреса не сжигает таймауты запроса.
 
 ### `render` (ТЗ 5.6)
 

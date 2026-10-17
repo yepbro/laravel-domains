@@ -73,6 +73,7 @@ func TestDefault(t *testing.T) {
 		{"http.concurrency", c.HTTP.Concurrency, 2000},
 		{"http.per_ip_limit", c.HTTP.PerIPLimit, 4},
 		{"http.connect_timeout", c.HTTP.ConnectTimeout.D(), 5 * time.Second},
+		{"http.tls_handshake_timeout", c.HTTP.TLSHandshakeTimeout.D(), 5 * time.Second},
 		{"http.header_timeout", c.HTTP.HeaderTimeout.D(), 10 * time.Second},
 		{"http.total_timeout", c.HTTP.TotalTimeout.D(), 20 * time.Second},
 		{"http.max_redirects", c.HTTP.MaxRedirects, 8},
@@ -147,6 +148,7 @@ http:
   concurrency: 1500
   per_ip_limit: 3
   connect_timeout: "3s"
+  tls_handshake_timeout: "4s"
   header_timeout: "7s"
   total_timeout: "15s"
   max_redirects: 5
@@ -213,6 +215,7 @@ log:
 		{"http.concurrency", cfg.HTTP.Concurrency, 1500},
 		{"http.per_ip_limit", cfg.HTTP.PerIPLimit, 3},
 		{"http.connect_timeout", cfg.HTTP.ConnectTimeout.D(), 3 * time.Second},
+		{"http.tls_handshake_timeout", cfg.HTTP.TLSHandshakeTimeout.D(), 4 * time.Second},
 		{"http.header_timeout", cfg.HTTP.HeaderTimeout.D(), 7 * time.Second},
 		{"http.total_timeout", cfg.HTTP.TotalTimeout.D(), 15 * time.Second},
 		{"http.max_redirects", cfg.HTTP.MaxRedirects, 5},
@@ -356,6 +359,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_HTTP_CONCURRENCY":                 "654",
 		"CRAWLER_HTTP_PER_IP_LIMIT":                "3",
 		"CRAWLER_HTTP_CONNECT_TIMEOUT":             "2s",
+		"CRAWLER_HTTP_TLS_HANDSHAKE_TIMEOUT":       "6s",
 		"CRAWLER_HTTP_HEADER_TIMEOUT":              "4s",
 		"CRAWLER_HTTP_TOTAL_TIMEOUT":               "9s",
 		"CRAWLER_HTTP_MAX_REDIRECTS":               "3",
@@ -413,6 +417,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"http.concurrency", cfg.HTTP.Concurrency, 654},
 		{"http.per_ip_limit", cfg.HTTP.PerIPLimit, 3},
 		{"http.connect_timeout", cfg.HTTP.ConnectTimeout.D(), 2 * time.Second},
+		{"http.tls_handshake_timeout", cfg.HTTP.TLSHandshakeTimeout.D(), 6 * time.Second},
 		{"http.header_timeout", cfg.HTTP.HeaderTimeout.D(), 4 * time.Second},
 		{"http.total_timeout", cfg.HTTP.TotalTimeout.D(), 9 * time.Second},
 		{"http.max_redirects", cfg.HTTP.MaxRedirects, 3},
@@ -627,6 +632,7 @@ func TestValidate(t *testing.T) {
 		{"http concurrency 0", func(c *Config) { c.HTTP.Concurrency = 0 }, "http.concurrency"},
 		{"per_ip_limit 0", func(c *Config) { c.HTTP.PerIPLimit = 0 }, "http.per_ip_limit"},
 		{"connect_timeout 0", func(c *Config) { c.HTTP.ConnectTimeout = 0 }, "http.connect_timeout"},
+		{"tls_handshake_timeout 0", func(c *Config) { c.HTTP.TLSHandshakeTimeout = 0 }, "http.tls_handshake_timeout"},
 		{"header_timeout 0", func(c *Config) { c.HTTP.HeaderTimeout = 0 }, "http.header_timeout"},
 		{"total_timeout отрицательный", func(c *Config) { c.HTTP.TotalTimeout = Duration(-time.Second) }, "http.total_timeout"},
 		{"max_redirects -1", func(c *Config) { c.HTTP.MaxRedirects = -1 }, "http.max_redirects"},

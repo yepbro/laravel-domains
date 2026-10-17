@@ -126,6 +126,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_HTTP_CONCURRENCY", setInt(func(c *Config) *int { return &c.HTTP.Concurrency })},
 		{"CRAWLER_HTTP_PER_IP_LIMIT", setInt(func(c *Config) *int { return &c.HTTP.PerIPLimit })},
 		{"CRAWLER_HTTP_CONNECT_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.HTTP.ConnectTimeout })},
+		{"CRAWLER_HTTP_TLS_HANDSHAKE_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.HTTP.TLSHandshakeTimeout })},
 		{"CRAWLER_HTTP_HEADER_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.HTTP.HeaderTimeout })},
 		{"CRAWLER_HTTP_TOTAL_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.HTTP.TotalTimeout })},
 		{"CRAWLER_HTTP_MAX_REDIRECTS", setInt(func(c *Config) *int { return &c.HTTP.MaxRedirects })},

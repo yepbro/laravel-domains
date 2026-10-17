@@ -51,6 +51,7 @@ http:
   concurrency: 2000
   per_ip_limit: 4                    # рекомендация ТЗ: 3–4 соединения на IP
   connect_timeout: "5s"
+  tls_handshake_timeout: "5s"          # TLS-рукопожатие (таблица лимитов ТЗ 5.5)
   header_timeout: "10s"
   total_timeout: "20s"
   max_redirects: 8
