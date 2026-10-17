@@ -9,6 +9,9 @@
 
 Практическая работа с Docker (запуск/остановка, команды внутри контейнеров,
 тома, диагностика) вынесена в отдельную шпаргалку: [`docker.md`](docker.md).
+Эксплуатация в целом (запуск, обновление, метрики, процедуры) —
+[`operations.md`](operations.md); контракт входных файлов —
+[`incoming-files.md`](incoming-files.md).
 
 ## 1. Требования и быстрый старт
 
@@ -120,6 +123,9 @@ tmp/                     артефакты hot-reload (air)
 
 ### Поток данных ingest (ТЗ 5.1)
 
+Полный контракт входных файлов (формат, кодировка, отклонения, порог
+доли ошибок, отчёты) — [`incoming-files.md`](incoming-files.md).
+
 Сервис `ingest` наблюдает `var/incoming/` (fsnotify + периодический обход,
 стабильность размера/mtime) и прогоняет каждый готовый файл через
 конвейер: разбор пути `<зона>/add|delete/*.txt` → зона (создаётся
@@ -197,7 +203,9 @@ deleted, `delete` — перевод в deleted) → отчёт в таблиц�
   с устаревшим `rules_version` и ставит их в `q:analyze` (без повторного
   скачивания; детали — [`analyzer.md`](analyzer.md), раздел «Переанализ»).
   Тот же проход фоновой горутиной делает сервис analyzer: смена правил
-  по `make rules-reload` запускает переанализ без рестарта.
+  по `make rules-reload` запускает переанализ без рестарта. Пошаговая
+  инструкция оператора (правка → проверка → применение → контроль) —
+  [`runbooks.md`](runbooks.md) §3.
 
 ## 6. CLI crawlerctl
 
@@ -239,6 +247,9 @@ crawlerctl seed / test-rules             # dev-команды (make seed, make t
 docker compose run --rm -v "$(pwd)/var/content:/out tools \
     go run ./cmd/crawlerctl dict train /out/dict.zst --samples testdata/laravel-samples
 ```
+
+Полная процедура (когда переобучать, подключение, ограничение
+читаемости старых кадров) — [`runbooks.md`](runbooks.md) §1.
 
 Через make: `make status`, `make domain NAME=example.crawl.test`,
 `make reanalyze`, `make seed`, `make test-rules`. Остальные команды —

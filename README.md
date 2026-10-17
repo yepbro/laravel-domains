@@ -20,29 +20,31 @@ make test        # модульные тесты
 make test-integration  # проверка окружения на testbed
 ```
 
-Полная инструкция: [`docs/dev-environment.md`](docs/dev-environment.md).
-Работа с Docker (запуск/остановка, команды в контейнерах, тома, диагностика):
-[`docs/docker.md`](docs/docker.md).
-Миграции PostgreSQL (применение при старте сервисов, создание новых):
-[`docs/migrations.md`](docs/migrations.md).
-Схема PostgreSQL (`zones`, `subdomains`, `domains`, `subdomain_results`,
-`contents`, `laravel_*`, `ingest_files`) и её типизация в Go
-(`internal/model`): партиционирование, fillfactor, индексы, HOT-апдейты,
-статусы домена, флаги, `dns_mask` — [`docs/schema.md`](docs/schema.md).
-Слой БД (пул подключений `pgx` с бюджетом 20–50 соединений, потокочный
-`COPY` пачками, пакетные `UPDATE … FROM unnest(...)`):
-[`docs/db.md`](docs/db.md).
-Конфигурация сервисов (единый YAML + переменные окружения, приоритеты,
-валидация; пример — `config.example.yaml`): [`docs/configuration.md`](docs/configuration.md).
-Redis как транспорт очередей задач и его конфигурация (dev/бой, бюджет
-памяти, `noeviction`, отказ от персистентности): [`docs/redis.md`](docs/redis.md).
-Движок правил Laravel: цели (cookie/заголовки/HTML/meta), свидетельства
-срабатываний и ограничения на недоверенном контенте:
-[`docs/analyzer.md`](docs/analyzer.md).
-Тюнинг ОС боевого сервера (sysctl: эфемерные порты, TIME_WAIT, nofile,
-conntrack, UDP-буферы DNS — ТЗ §10.2): [`docs/os-tuning.md`](docs/os-tuning.md).
-Диски боевого сервера (тома PostgreSQL и контента, SMART/TBW — ТЗ §10.3):
-[`docs/disks.md`](docs/disks.md).
+## Документация
+
+Карта документации (та же таблица с пояснениями «когда читать» — в
+[`docs/operations.md`](docs/operations.md) §1):
+
+| Документ | Что внутри |
+|---|---|
+| [`docs/operations.md`](docs/operations.md) | эксплуатация: сценарии запуска (dev/бой), обновление и миграции, логи, метрики/алерты, чек-лист оператора |
+| [`docs/dev-environment.md`](docs/dev-environment.md) | dev-окружение: профили compose, testbed, CLI `crawlerctl`, отладка, диагностика |
+| [`docs/docker.md`](docs/docker.md) | шпаргалка Docker: запуск/остановка, команды в контейнерах, тома, диагностика |
+| [`docs/configuration.md`](docs/configuration.md) | конфигурация: единый YAML + переменные окружения, приоритеты, валидация (пример — `config.example.yaml`) |
+| [`docs/incoming-files.md`](docs/incoming-files.md) | контракт входных файлов `incoming/<зона>/add\|delete/*.txt` |
+| [`docs/services.md`](docs/services.md) | каркас Go-сервисов: жизненный цикл, логирование, метрики и алерты |
+| [`docs/migrations.md`](docs/migrations.md) | миграции PostgreSQL (применение при старте сервисов, создание новых) |
+| [`docs/schema.md`](docs/schema.md) | схема PostgreSQL (`zones`, `subdomains`, `domains`, `subdomain_results`, `contents`, `laravel_*`, `ingest_files`): партиционирование, fillfactor, индексы, HOT-апдейты, `domain_info` |
+| [`docs/db.md`](docs/db.md) | слой БД: пул `pgx` (бюджет 20–50 соединений), потокочный `COPY` пачками, пакетные `UPDATE … FROM unnest(...)`; тюнинг боевого PostgreSQL |
+| [`docs/redis.md`](docs/redis.md) | Redis как транспорт очередей: dev/бой, бюджет памяти, `noeviction`, отказ от персистентности |
+| [`docs/content.md`](docs/content.md) | хранилище контента: пак-файлы, словарь zstd, дедупликация, компактификация, порог диска |
+| [`docs/render.md`](docs/render.md) | рендер: Chromium, изолированные контексты, ожидание готовности, съём DOM/cookies |
+| [`docs/analyzer.md`](docs/analyzer.md) | движок правил Laravel: цели (cookie/заголовки/HTML/meta), свидетельства срабатываний, переанализ |
+| [`docs/runbooks.md`](docs/runbooks.md) | процедурные инструкции: переобучение словаря zstd, разбор `q:dead`, переанализ |
+| [`docs/deploy.md`](docs/deploy.md) | боевой деплой systemd: юниты, бюджет памяти, установка |
+| [`docs/disks.md`](docs/disks.md) | диски боевого сервера: тома PostgreSQL и контента, SMART/TBW (ТЗ §10.3) |
+| [`docs/os-tuning.md`](docs/os-tuning.md) | тюнинг ОС боевого сервера: sysctl — эфемерные порты, TIME_WAIT, nofile, conntrack, UDP-буферы DNS (ТЗ §10.2) |
+
 Список команд: `make help`.
 
 ## CI
@@ -67,7 +69,7 @@ conntrack, UDP-буферы DNS — ТЗ §10.2): [`docs/os-tuning.md`](docs/os-
 | Каталог | Назначение |
 |---|---|
 | `cmd/` | Go-сервисы (ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, crawlerctl) и утилиты testbed (mockserver, testbedgen) |
-| `internal/` | Общий код: каркас сервисов (`service`, [docs/services.md](docs/services.md)), конфигурация (`config`), доступ к PostgreSQL — пул и массовая запись (`db`), модель домена — статусы, флаги, маски субдоменов (`model`), нормализация имён — punycode/UTS-46, публичные суффиксы (`idn`), метрики Prometheus (`metrics`), миграции при старте (`migrate`), движок правил Laravel (`rules`, [docs/analyzer.md](docs/analyzer.md)), каркасы `queue` (Redis Streams), `content` (пак-файлы контента и zstd, [docs/content.md](docs/content.md)), `render` (Chromium: пул изолированных контекстов, [docs/render.md](docs/render.md)), `renderworker` (цикл q:render: DOM в хранилище, `rendered = true`), `analyzer` (цикл q:analyze: матчинг правил, запись `laravel_findings`, агрегат домена `laravel_domains`), `watch` (fsnotify); пакеты dnsclient, httpfetch — в своих задачах |
+| `internal/` | Общий код: каркас сервисов (`service`, [docs/services.md](docs/services.md)), конфигурация (`config`), доступ к PostgreSQL — пул и массовая запись (`db`), модель домена — статусы, флаги, маски субдоменов (`model`), нормализация имён — punycode/UTS-46, публичные суффиксы (`idn`), метрики Prometheus (`metrics`), миграции при старте (`migrate`), приём файлов — наблюдение и конвейер ingest (`watch`, `ingest`), планировщик — выборка/постановка/lease/перепроверки (`scheduler`), очереди Redis Streams (`queue`), DNS-клиент с лимитами (`dnsclient`) и цикл q:dns (`dnsworker`), HTTP-транспорт с лимитами и редиректами (`httpfetch`) и цикл q:http (`httpworker`), хранилище контента (`content`, [docs/content.md](docs/content.md)), рендер (`render`, [docs/render.md](docs/render.md)) и цикл q:render (`renderworker`), движок правил Laravel и цикл q:analyze (`rules`, `analyzer`, [docs/analyzer.md](docs/analyzer.md)), счётчики зон и алерты (`monitor`) |
 | `deploy/docker/` | Compose-окружение, Dockerfile'ы, конфиги, testbed |
 | `deploy/systemd/` | Боевой деплой на целевом сервере: systemd-юниты сервисов, drop-in'ы бюджета пакетов ОС, окружение ([docs/deploy.md](docs/deploy.md)) |
 | `deploy/sysctl/` | Тюнинг ядра боевого сервера (ТЗ §10.2): `99-crawler.conf` для `/etc/sysctl.d` + инструкция применения; расчёты — [docs/os-tuning.md](docs/os-tuning.md) |
