@@ -185,8 +185,14 @@ type FetchResult struct {
 	// Elapsed — время до заголовков ответа (время ответа ТЗ 5.5 п. 7).
 	Elapsed time.Duration
 	// TLS — параметры установленного TLS-соединения (nil для http).
-	// Разбор сертификата (издатель, срок действия, SAN) — T-050.
 	TLS *tls.ConnectionState
+	// TLSInfo — разбор сертификата соединения и результат
+	// самостоятельной проверки (ТЗ 5.5 п. 3): издатель, субъект,
+	// серийный номер, срок действия, SAN, цепочка, valid+причины.
+	// Заполняется Fetch — хост URL (SNI/Host) для проверки известен
+	// там, а не в ConnectionState; nil для http (не ошибка, §8).
+	// Пользователи RoundTrip напрямую собирают сами (NewTLSInfo).
+	TLSInfo *TLSInfo
 }
 
 // cancelBody — тело ответа, остановка общего таймаута при Close:
@@ -357,6 +363,7 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (*FetchResult, erro
 		FinalURL:    resp.Request.URL,
 		Elapsed:     time.Since(start),
 		TLS:         resp.TLS,
+		TLSInfo:     NewTLSInfo(resp.TLS, host),
 	}, nil
 }
 
