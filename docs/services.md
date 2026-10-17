@@ -176,31 +176,33 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
   статусов и есть типизация итога; analyzer пассивен (ТЗ 5.8) — его
   результаты (findings, is_laravel) — данные БД, не метрики процесса.
 
-## Поведение заглушек
+## Рабочая логика сервисов
 
-Пока рабочая логика не реализована (до этапов 2–7), сервисы запускаются
-без `OnRun`/`OnDBPool`: подняты `/healthz` и `/metrics`, сервис живёт до
-SIGTERM/SIGINT и корректно останавливается — healthcheck в compose остаётся
-зелёным. Исключение — `ingest` (этап 1 завершён, T-013…T-021): его
+Все семь сервисов реализованы и подключаются через `OnRun`/`OnDBPool`
+(сервис без `OnRun` тоже валиден: `/healthz` и `/metrics` подняты, он
+живёт до SIGTERM/SIGINT и корректно останавливается — каркас не требует
+рабочей логики).
+
+`ingest` (этап 1, T-013…T-021): его
 `OnRun` наблюдает `ingest.dir` через `internal/watch` и прогоняет готовые
 файлы через конвейер приёма `internal/ingest` (разбор пути → зона →
 разбор с sha256 → валидация → staging → применение → отчёт `ingest_files`
 → архив `processed/`/`failed/`), плюс фоновая очистка удалённых доменов
-(CleanupDeleted, T-020); поведение каталогов и отчёты — в
-[`dev-environment.md`](dev-environment.md). И `scheduler` (этап 2,
+(CleanupDeleted, T-020); контракт файлов и отчёты — в
+[`incoming-files.md`](incoming-files.md). `scheduler` (этап 2,
 T-027…T-031): его `OnRun` держит главный цикл постановки пачек — выборка
 pending с чередованием зон (`DispatchBatch`, T-027) → перевод в `queued`
 с lease (`queued_at`) одним пакетным UPDATE с охраной pending и публикация
 пачки `DNSBatch` в `q:dns` (`EnqueueLoop`/`EnqueueBatch`, T-028; порядок
 «перевод → публикация» и гарантии — комментарии
-`internal/scheduler/enqueue.go`), — и фоновые циклы суточной перепроверки
+`internal/scheduler/enqueue.go`), — фоновые циклы возврата доменов с
+истёкшим lease (`LeaseWatch`, T-029), суточной перепроверки
 (`RecheckDaily`, T-030) и повторных проверок `temp_error`
-(`RetryTempErrors`, T-031); возврат доменов с истёкшим lease подключается
-задачей T-029. Рядом с ними — коллектор глубины backlog `BacklogLoop`
-(T-077): gauge `crawler_backlog_domains{pending|queued}` из БД раз в
-30 с.
+(`RetryTempErrors`, T-031). Рядом с ними — коллектор глубины backlog
+`BacklogLoop` (T-077): gauge `crawler_backlog_domains{pending|queued}`
+из БД раз в 30 с.
 
-И `dns-worker` (этап 3, T-036…T-039) — не заглушка: его `OnRun` выполняет
+`dns-worker` (этап 3, T-036…T-039): его `OnRun` выполняет
 цикл `dnsworker.Run` (`internal/dnsworker/result.go`):
 
 - потребление пачек `q:dns` группой потребителей `dns-worker` (по одной
@@ -235,7 +237,7 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
   T-035); публикация `q:http` — под гейтом backpressure
   (`WatermarkPublisher`, T-026).
 
-И `http-worker` (этап 5, T-053) — не заглушка: его `OnRun` выполняет цикл
+`http-worker` (этап 5, T-053): его `OnRun` выполняет цикл
 `httpworker.Run` (`internal/httpworker/worker.go`):
 
 - потребление `q:http` группой потребителей `http-worker` окном до 16
@@ -310,7 +312,7 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
   кэш `CachingResolver` (T-047); TLS — `InsecureSkipVerify` с сохранением
   атрибутов сертификата (`TLSInfo`, T-050).
 
-И `render-worker` (этап 6, T-067) — не заглушка: его `OnRun` запускает
+`render-worker` (этап 6, T-067): его `OnRun` запускает
 Chromium (`render.StartBrowser` — внешний по `render.remote_url` или
 собственный процесс, T-061) с пулом изолированных контекстов
 (`render.NewPool`), хранилище контента (то же, что у http-worker:
@@ -344,7 +346,7 @@ Chromium (`render.StartBrowser` — внешний по `render.remote_url` ил
   (доставки остаются в стриме, не в PEL); перезапуск браузера каждые N
   страниц и по памяти — T-065.
 
-И `analyzer` (этап 7, T-071) — не заглушка: его `OnRun` выполняет цикл
+`analyzer` (этап 7, T-071): его `OnRun` выполняет цикл
 `analyzer.Run` (`internal/analyzer`; подробный конвейер — в
 [`analyzer.md`](analyzer.md)):
 
@@ -377,7 +379,7 @@ Chromium (`render.StartBrowser` — внешний по `render.remote_url` ил
 - analyzer ничего не публикует (конец конвейера §7) — гейт backpressure
   не нужен, очередь читается и подтверждается напрямую.
 
-И `monitor` (этап 8, T-078) — не заглушка: его `OnRun` выполняет цикл
+`monitor` (этап 8, T-078): его `OnRun` выполняет цикл
 `monitor.ZoneStatsLoop` (`internal/monitor/zonestats.go`):
 
 - периодический пакетный пересчёт кэширующих счётчиков прогресса зон
@@ -396,10 +398,9 @@ Chromium (`render.StartBrowser` — внешний по `render.remote_url` ил
 - первый проход — сразу при старте (свежие счётчики после простоя),
   ошибка прохода — Warn, цикл живёт; отмена ctx — чистый nil (graceful
   shutdown, ТЗ 3.4). Счётчики читают `crawlerctl status` (T-079) и выбор
-  размера партиций (`docs/schema.md`). Метрики прогресса зон (доля
-  проверенного, длительность прохода) — территория алертов monitor
-  (T-080); счётчики очередей/backlog/этапов конвейера собирают сами
-  сервисы (таблица выше, T-077).
+  размера партиций (`docs/schema.md`). Прогресс зон наблюдается алертами
+  monitor (T-080, цикл ниже); счётчики очередей/backlog/этапов конвейера
+  собирают сами сервисы (таблица выше, T-077).
 
 Второй цикл того же сервиса — оценка алертов минимального набора ТЗ 5.9
 (`internal/monitor/alerts.go`, T-080; ТЗ 8, ТЗ 10.3), период — тот же

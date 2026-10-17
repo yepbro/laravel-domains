@@ -15,8 +15,9 @@
 Все долгоживущие сервисы (ingest, scheduler, dns-worker, http-worker,
 render-worker, analyzer, monitor) применяют миграции при старте: healthcheck
 начинает отвечать только на актуальной схеме. `crawlerctl` миграции не применяет
-— это CLI, схему к его запуску гарантируют сервисы (команды с доступом к БД
-появятся позже).
+— это CLI: схему к его запуску гарантируют сервисы (БД-команды `status`,
+`domain`, `zones`, `subdomains`, `reanalyze`, `recheck` рассчитывают на
+уже подготовленную схему).
 
 DSN сервисы берут из конфигурации ([`configuration.md`](configuration.md)):
 переменная `CRAWLER_POSTGRES_DSN` или устаревшая `APP_PG_DSN` (её задаёт
