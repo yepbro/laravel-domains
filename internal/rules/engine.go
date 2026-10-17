@@ -1,10 +1,14 @@
 package rules
 
 import (
+	"context"
+	"errors"
 	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Cookie — cookie со страницы (достаточно для пассивного анализа).
@@ -20,7 +24,8 @@ type Page struct {
 	Headers map[string][]string // имена в канонической форме MIME-заголовка
 }
 
-// Evidence — сработавшее правило и краткое свидетельство.
+// Evidence — сработавшее правило и краткое свидетельство; формат колонки
+// laravel_findings.signals (jsonb, миграция 000001: [{rule, weight, evidence}]).
 type Evidence struct {
 	Rule     string
 	Weight   float64
@@ -38,8 +43,33 @@ type Result struct {
 
 var metaTagRe = regexp.MustCompile(`(?is)<meta\b[^>]*>`)
 
-// Evaluate применяет все правила набора к странице.
+// errPatternTooLong — паттерн не проходит по Limits.MaxPatternBytes (ТЗ §9:
+// ограничение недоверенного входа; правило молча пропускается, как и
+// некомпилируемое — валидация набора на этапе загрузки за T-068, движок
+// подстраховывается сам).
+var errPatternTooLong = errors.New("rules: паттерн длиннее лимита")
+
+// Evaluate применяет все правила набора к странице с ограничениями по
+// умолчанию (DefaultLimits, ТЗ §9). Основной вход анализатора.
 func (s *Set) Evaluate(page Page) Result {
+	return s.EvaluateCtx(context.Background(), page, DefaultLimits())
+}
+
+// EvaluateCtx применяет правила с явным контекстом и ограничениями
+// (анализатор задаёт бюджет отмены shutdown/потребления, тесты — узкие
+// лимиты). Нулевые Limits целиком включают DefaultLimits; контекст
+// проверяется между правилами и между значениями cookie/заголовков; при
+// отмене просмотр прекращается, результат содержит сработавшее до отмены.
+func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
+	if lim == (Limits{}) {
+		lim = DefaultLimits()
+	}
+	if lim.EvalTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, lim.EvalTimeout)
+		defer cancel()
+	}
+
 	res := Result{}
 
 	var (
@@ -49,7 +79,10 @@ func (s *Set) Evaluate(page Page) Result {
 	)
 
 	for _, r := range s.Rules {
-		ev, ok := matchRule(r, page)
+		if ctx.Err() != nil {
+			break // бюджет времени исчерпан — что нашли, то нашли
+		}
+		ev, ok := matchRule(ctx, r, page, lim)
 		if !ok {
 			continue
 		}
@@ -81,12 +114,62 @@ func (s *Set) Evaluate(page Page) Result {
 	return res
 }
 
-func matchRule(r Rule, page Page) (string, bool) {
-	regex, err := regexp.Compile(r.Regex)
+// compileCache кэширует скомпилированные паттерны (sync.Map — наборы
+// перезагружаются по SIGHUP без перезапуска, Evaluate зовут параллельные
+// горутины воркера): без кэша каждая страница платила бы компиляцию каждого
+// правила. Ошибки компиляции кэшируются тоже — некорректный паттерн не
+// перекомпилируется на каждом вызове.
+var compileCache sync.Map // string → compileResult
+
+type compileResult struct {
+	re  *regexp.Regexp
+	err error
+}
+
+func compileCached(pattern string) (*regexp.Regexp, error) {
+	if v, ok := compileCache.Load(pattern); ok {
+		cr := v.(compileResult)
+		return cr.re, cr.err
+	}
+	re, err := regexp.Compile(pattern) // RE2: линейный матчинг, без бэктрекинга
+	compileCache.Store(pattern, compileResult{re, err})
+	return re, err
+}
+
+// ruleRegex компилирует паттерн правила с учётом лимитов; nil-regex —
+// правило точного совпадения (match) либо пропускаемое (лимит/ошибка).
+func ruleRegex(r Rule, lim Limits) (*regexp.Regexp, error) {
 	if r.Regex == "" {
-		regex = nil
-	} else if err != nil {
-		return "", false // некорректные выражения отсеиваются при загрузке
+		return nil, nil
+	}
+	if !lim.patternAllowed(r.Regex) {
+		return nil, errPatternTooLong
+	}
+	return compileCached(r.Regex)
+}
+
+// sortedHeaderNames — детерминированный порядок имён заголовков: обход map
+// в Go случайный, а свидетельства переанализа должны быть воспроизводимы.
+func sortedHeaderNames(h map[string][]string) []string {
+	names := make([]string, 0, len(h))
+	for name := range h {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// matchRule ищет первое совпадение правила на странице: cookie имя/значение
+// и заголовки — точное совпадение (match) или regex; html/meta — только
+// regex (ТЗ 5.8: «регулярное выражение по HTML»). Возвращает свидетельство
+// сработавшего совпадения. Порядок обхода детерминирован (см. evidence.go).
+func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool) {
+	if ctx.Err() != nil {
+		return "", false // бюджет исчерпан — правило не смотрится
+	}
+	regex, err := ruleRegex(r, lim)
+	if err != nil {
+		return "", false // некорректные/раздутые выражения отсеиваются
 	}
 	matches := func(s string) bool {
 		if r.Match != "" {
@@ -94,52 +177,74 @@ func matchRule(r Rule, page Page) (string, bool) {
 		}
 		return regex != nil && regex.MatchString(s)
 	}
-	snippet := func(s string) string {
-		if len(s) > 64 {
-			return s[:64] + "…"
-		}
-		return s
-	}
 
 	switch r.Target {
 	case TargetCookieName:
 		for _, c := range page.Cookies {
-			if matches(c.Name) {
-				return "cookie " + c.Name, true
+			if ctx.Err() != nil {
+				return "", false
+			}
+			if matches(lim.valueCap(c.Name)) {
+				return finalizeEvidence(evidenceCookieName(c.Name), lim), true
 			}
 		}
 	case TargetCookieValue:
 		for _, c := range page.Cookies {
-			if regex != nil && regex.MatchString(c.Value) {
-				return "cookie " + c.Name + "=" + snippet(c.Value), true
+			if ctx.Err() != nil {
+				return "", false
+			}
+			if matches(lim.valueCap(c.Value)) {
+				return finalizeEvidence(evidenceCookieValue(c.Name, c.Value), lim), true
 			}
 		}
 	case TargetHeaderName:
-		for name := range page.Headers {
-			if matches(name) {
-				return "header " + name, true
+		for _, name := range sortedHeaderNames(page.Headers) {
+			if ctx.Err() != nil {
+				return "", false
+			}
+			if matches(lim.valueCap(name)) {
+				return finalizeEvidence(evidenceHeaderName(name), lim), true
 			}
 		}
 	case TargetHeaderValue:
-		for name, vals := range page.Headers {
-			for _, v := range vals {
-				if regex != nil && regex.MatchString(v) {
-					return "header " + name + ": " + snippet(v), true
+		for _, name := range sortedHeaderNames(page.Headers) {
+			for _, v := range page.Headers[name] {
+				if ctx.Err() != nil {
+					return "", false
+				}
+				if matches(lim.valueCap(v)) {
+					return finalizeEvidence(evidenceHeaderValue(name, v), lim), true
 				}
 			}
 		}
 	case TargetHTML:
 		if regex != nil {
-			if m := regex.Find(page.HTML); m != nil {
-				return snippet(string(m)), true
+			// вход ограничен до матчинга (ТЗ §9); Find возвращает первый
+			// фрагмент — он и есть свидетельство
+			if m := regex.Find(lim.htmlCap(page.HTML)); m != nil {
+				return finalizeEvidence(string(m), lim), true
 			}
 		}
 	case TargetMeta:
 		if regex != nil {
-			for _, tag := range metaTagRe.FindAllString(string(page.HTML), -1) {
-				if regex.MatchString(tag) {
-					return snippet(tag), true
+			// скользящий поиск meta-тегов без материализации всех совпадений:
+			// выход на первом сработавшем, каждый шаг двигает позицию за конец
+			// предыдущего тега
+			html := lim.htmlCap(page.HTML)
+			pos := 0
+			for pos < len(html) {
+				if ctx.Err() != nil {
+					return "", false
 				}
+				loc := metaTagRe.FindIndex(html[pos:])
+				if loc == nil {
+					break
+				}
+				tag := html[pos+loc[0] : pos+loc[1]]
+				if regex.Match(tag) {
+					return finalizeEvidence(string(tag), lim), true
+				}
+				pos += loc[1]
 			}
 		}
 	}
