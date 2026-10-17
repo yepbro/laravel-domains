@@ -207,8 +207,11 @@ dc --profile runtime stop render    # остановить
   `deploy/docker/config.render.yaml`, `remote_url` пуст — боевой режим),
   жёсткий потолок — `mem_limit`; детали — [`render.md`](render.md),
   раздел «Перезапуск браузера и порог памяти».
-- systemd-юниты с `MemoryMax`/`User=` (постановка вне Docker) — этап 9
-  (ТЗ 10.1).
+- systemd-юниты с `MemoryMax`/`User=` (постановка вне Docker) —
+  [`deploy/systemd/`](../deploy/systemd/), инструкция
+  [`deploy.md`](deploy.md) (этап 9, ТЗ 10.1 — нативный боевой деплой:
+  пакеты ОС, статические бинарники; docker-runtime остаётся вариантом
+  для Docker-хостов).
 
 Рабочий цикл очередей рендера подключается T-067; сейчас сервис стартует
 и отвечает `healthz`.

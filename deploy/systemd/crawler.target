@@ -1,0 +1,21 @@
+# Domain Crawler — групповая цель всех сервисов приложения (ТЗ 4.1).
+# Сервисы привязаны PartOf= к этой цели: `systemctl stop crawler.target`
+# останавливает весь набор разом (в graceful-порядке юнитов), restart —
+# перезапускает. Инфраструктура (postgresql/redis/unbound — пакеты ОС,
+# см. drop-in'ы рядом) в цель не входит: у них свой жизненный цикл пакета.
+# Установка и включение — docs/deploy.md (ТЗ 10.1).
+
+[Unit]
+Description=Domain Crawler — все сервисы приложения
+Wants=crawler-chromium.service
+Wants=crawler-ingest.service
+Wants=crawler-scheduler.service
+Wants=crawler-dns-worker.service
+Wants=crawler-http-worker.service
+Wants=crawler-render-worker.service
+Wants=crawler-analyzer.service
+Wants=crawler-monitor.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

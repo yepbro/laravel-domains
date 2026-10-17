@@ -1,0 +1,65 @@
+# Domain Crawler — Chromium headless-shell для render-worker (CDP на
+# 127.0.0.1:9222). ТЗ 3.2: строка бюджета отдельная — «Chromium (рендер,
+# cgroup MemoryMax) ≈ 2 ГБ»; ТЗ 10.1: Chromium — отдельный пакет/каталог
+# (не пакет ОС, а дистрибутив headless-shell в /opt/crawler/chromium —
+# та же сборка, что в образе chromedp/headless-shell dev/dev-runtime
+# окружения, версия — CHROMEDP_HEADLESS_IMAGE в .env.example).
+#
+# Отдельный юнит, а не процесс воркера (render.remote_url пуст = собственный
+# процесс): у Chromium своя cgroup с потолком 2 ГБ — OOM внутри браузера
+# (отдельная вкладка/процесс рендера) убивается ядром в пределах этой
+# cgroup и перезапускается systemd'ом, не затрагивая воркер и остальные
+# сервисы; рестарты по числу страниц изнутри воркера (T-065) в remote-режиме
+# не работают (чужой процесс) — потолок и рестарт держит этот юнит
+# (аналогия mem_limit dev-сервиса chromium, docs/render.md, docs/deploy.md).
+#
+# --no-sandbox обязателен: непривилегированный пользователь без
+# user-namespace sandbox (тот же флаг передаёт воркер в локальном режиме,
+# internal/render). Слушает только loopback — CDP не наружу (ТЗ §9).
+
+[Unit]
+Description=Domain Crawler — Chromium (headless-shell, CDP 127.0.0.1:9222)
+PartOf=crawler.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-chromium
+Group=crawler
+SyslogIdentifier=crawler-chromium
+ExecStart=/opt/crawler/chromium/headless-shell --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --no-sandbox --disable-gpu --user-data-dir=/var/lib/crawler/chromium/profile
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+# ТЗ 3.2: бюджет Chromium ≈ 2 ГБ (2560M не нужен: воркер в отдельной cgroup,
+# это потолок только браузера; сопоставимо с MEM_CHROMIUM/MEM_RENDER
+# dev-окружения).
+MemoryMax=2048M
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+# Набор мягче, чем у Go-сервисов: V8 требует исполняемую память JIT
+# (MemoryDenyWriteExecute сломал бы JS), network change listener браузера
+# общается через AF_NETLINK. Остальное — как у сервисов.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Служебный профиль браузера (страницы задач живут в изолированных
+# контекстах CDP и его не касаются — docs/render.md).
+ReadWritePaths=/var/lib/crawler/chromium
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target

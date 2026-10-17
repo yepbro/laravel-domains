@@ -1,0 +1,49 @@
+# Domain Crawler — monitor: прогресс зон, метрики, алерты (ТЗ 5.9).
+# MemoryMax — строка бюджета «Go-сервисы ≈ 1,3 ГБ» (ТЗ 3.2), раскладка —
+# docs/deploy.md. Адрес HTTP-ендпоинта задаёт monitor.listen в конфиге
+# (важнее METRICS_ADDR — docs/services.md): в боевом конфиге
+# 127.0.0.1:9100. /dev/nvme* (SMART, ТЗ 10.3) не пробрасывается: алерт
+# износа честно «не измеряется», доступ к устройствам заведёт T-089.
+
+[Unit]
+Description=Domain Crawler — monitor (прогресс, метрики, алерты)
+PartOf=crawler.target
+# Комментарий о After/Wants без Requires — crawler-ingest.service.
+After=network-online.target postgresql.service redis-server.service unbound.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-monitor
+Group=crawler
+EnvironmentFile=/etc/crawler/crawler.env
+WorkingDirectory=/var/lib/crawler
+SyslogIdentifier=crawler-monitor
+ExecStart=/opt/crawler/bin/monitor
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+MemoryMax=128M
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target

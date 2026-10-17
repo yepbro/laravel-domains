@@ -1,0 +1,50 @@
+# Domain Crawler — analyzer: поиск Laravel по правилам (ТЗ 5.8).
+# MemoryMax — строка бюджета «Go-сервисы ≈ 1,3 ГБ» (ТЗ 3.2), раскладка —
+# docs/deploy.md. Правила читает из /etc/crawler/rules (RO — ProtectSystem),
+# перезагрузка без рестарта: systemctl kill -s HUP crawler-analyzer
+# (Options.OnSIGHUP, docs/services.md).
+
+[Unit]
+Description=Domain Crawler — analyzer (поиск Laravel)
+PartOf=crawler.target
+# Комментарий о After/Wants без Requires — crawler-ingest.service.
+After=network-online.target postgresql.service redis-server.service unbound.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-analyzer
+Group=crawler
+EnvironmentFile=/etc/crawler/crawler.env
+Environment=METRICS_ADDR=127.0.0.1:9106
+WorkingDirectory=/var/lib/crawler
+SyslogIdentifier=crawler-analyzer
+ExecStart=/opt/crawler/bin/analyzer
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+MemoryMax=128M
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Контент читает из хранилища (RO под strict), ничего не пишет.
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target

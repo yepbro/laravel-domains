@@ -1,0 +1,57 @@
+# Domain Crawler — render-worker: рендер SPA в Chromium, DOM в хранилище
+# (ТЗ 5.6). Браузер — внешний юнит crawler-chromium (CDP ws://127.0.0.1:9222,
+# render.remote_url): строка бюджета Chromium ≈ 2 ГБ у ТЗ 3.2 отдельная,
+# поэтому в нативном деплое Chromium живёт в собственной cgroup, а воркер
+# работает в remote-режиме (тот же контракт, что у dev-профиля app,
+# deploy/docker/compose.yaml). Пока браузер недоступен — пауза потребления
+# (доставки остаются в стриме), падение браузера не роняет воркер.
+# Перезапуск Chromium по страницам/памяти изнутри воркера (T-065) в
+# remote-режиме невозможен (чужой процесс) — потолок держит MemoryMax
+# юнита crawler-chromium + его Restart=on-failure (аналогия mem_limit
+# dev-сервиса chromium, docs/render.md).
+
+[Unit]
+Description=Domain Crawler — render-worker (рендер в Chromium)
+PartOf=crawler.target
+# Комментарий о After/Wants без Requires — crawler-ingest.service.
+After=network-online.target crawler-chromium.service postgresql.service redis-server.service unbound.service
+Wants=network-online.target crawler-chromium.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-render-worker
+Group=crawler
+EnvironmentFile=/etc/crawler/crawler.env
+Environment=METRICS_ADDR=127.0.0.1:9105
+WorkingDirectory=/var/lib/crawler
+SyslogIdentifier=crawler-render-worker
+ExecStart=/opt/crawler/bin/render-worker
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+MemoryMax=128M
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Заменяет HTML на DOM в общем с http-worker хранилище контента.
+ReadWritePaths=/var/lib/crawler/content
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target

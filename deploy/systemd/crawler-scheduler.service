@@ -1,0 +1,50 @@
+# Domain Crawler — scheduler: выборка доменов, постановка задач в Redis
+# Streams, возврат зависших (ТЗ 5.3). MemoryMax — строка бюджета
+# «Go-сервисы ≈ 1,3 ГБ» (ТЗ 3.2), раскладка — docs/deploy.md.
+
+[Unit]
+Description=Domain Crawler — scheduler (постановка задач)
+PartOf=crawler.target
+# Комментарий о After/Wants без Requires — crawler-ingest.service.
+After=network-online.target postgresql.service redis-server.service unbound.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-scheduler
+Group=crawler
+EnvironmentFile=/etc/crawler/crawler.env
+Environment=METRICS_ADDR=127.0.0.1:9102
+WorkingDirectory=/var/lib/crawler
+SyslogIdentifier=crawler-scheduler
+ExecStart=/opt/crawler/bin/scheduler
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+# ТЗ 3.2/10.1: OOM в cgroup — только этот сервис, PostgreSQL не затрагивается.
+MemoryMax=128M
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Файлов не пишет: работа целиком в PostgreSQL/Redis (миграции при старте
+# применяет через БД).
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target
