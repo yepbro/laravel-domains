@@ -70,15 +70,16 @@ func TestRun(t *testing.T) {
 		{name: "subdomains --help", args: []string{"subdomains", "--help"}, code: exitOK, inOut: "subdomains list"},
 		{name: "subdomains add --help", args: []string{"subdomains", "add", "--help"}, code: exitOK, inOut: "управление проверяемыми субдоменами"},
 
-		// zones — заглушки, код 1 с номером задачи.
+		// zones — функциональная команда (T-084): требует конфигурацию
+		// (БД) — путь выполнения без инфраструктуры проверяет отдельный
+		// TestRunZonesExecution и субтесты zones_test.go; здесь —
+		// использование и справка.
 		{name: "zones без действия", args: []string{"zones"}, code: exitUsage, inErr: "укажите действие"},
 		{name: "zones неизвестное действие", args: []string{"zones", "fly"}, code: exitUsage, inErr: `допустимы: list, enable, disable`},
-		{name: "zones list", args: []string{"zones", "list"}, code: exitError, inErr: "zones list: не реализовано (задача T-084)"},
 		{name: "zones enable без зоны", args: []string{"zones", "enable"}, code: exitUsage, inErr: "укажите зону"},
-		{name: "zones enable", args: []string{"zones", "enable", "Crawl.TEST."}, code: exitError, inErr: "zones enable crawl.test: не реализовано (задача T-084)"},
-		{name: "zones disable punycode", args: []string{"zones", "disable", "xn--80adxhks"}, code: exitError, inErr: "zones disable xn--80adxhks: не реализовано (задача T-084)"},
 		{name: "zones enable невалидная зона", args: []string{"zones", "enable", "bad!!zone"}, code: exitUsage, inErr: "некорректное имя зоны"},
 		{name: "zones --help", args: []string{"zones", "--help"}, code: exitOK, inOut: "zones list"},
+		{name: "zones enable --help", args: []string{"zones", "enable", "--help"}, code: exitOK, inOut: "управление зонами проверки"},
 
 		// reanalyze — функциональная команда (T-074): требует конфигурацию
 		// (БД/Redis) — путь выполнения с инфраструктурой проверяет отдельный
@@ -88,13 +89,11 @@ func TestRun(t *testing.T) {
 		{name: "reanalyze лишний аргумент", args: []string{"reanalyze", "foo"}, code: exitUsage, inErr: "лишние аргументы"},
 		{name: "reanalyze --help", args: []string{"reanalyze", "--help"}, code: exitOK, inOut: "переанализ сохранённых результатов"},
 
-		// recheck — заглушка, код 1 с номером задачи.
+		// recheck — функциональная команда (T-084): требует конфигурацию
+		// (БД) — путь выполнения без инфраструктуры проверяет отдельный
+		// TestRunRecheckExecution и субтесты recheck_test.go; здесь —
+		// использование и справка.
 		{name: "recheck без домена", args: []string{"recheck"}, code: exitUsage, inErr: "укажите домен"},
-		{name: "recheck", args: []string{"recheck", "example.crawl.test"}, code: exitError, inErr: "recheck example.crawl.test: не реализовано (задача T-084)"},
-		{name: "recheck несколько доменов", args: []string{"recheck", "a.crawl.test", "b.crawl.test"}, code: exitError,
-			inErr: "recheck a.crawl.test b.crawl.test: не реализовано"},
-		{name: "recheck список сжимается", args: []string{"recheck", "a.crawl.test", "b.crawl.test", "c.crawl.test", "d.crawl.test"},
-			code: exitError, inErr: "recheck a.crawl.test b.crawl.test c.crawl.test (+1): не реализовано"},
 		{name: "recheck невалидное имя", args: []string{"recheck", "ok.crawl.test", "bad!!name"}, code: exitUsage, inErr: "некорректное имя домена"},
 		{name: "recheck --help", args: []string{"recheck", "--help"}, code: exitOK, inOut: "принудительная постановка"},
 
@@ -269,24 +268,6 @@ func TestNormalizeSubdomainLabel(t *testing.T) {
 	for _, in := range bad {
 		if got, err := normalizeSubdomainLabel(in); err == nil {
 			t.Errorf("normalizeSubdomainLabel(%q) = %q, хочу ошибку", in, got)
-		}
-	}
-}
-
-// TestSummarizeNames — сжатие списка имён в сообщении-заглушке recheck.
-func TestSummarizeNames(t *testing.T) {
-	cases := []struct {
-		in   []string
-		want string
-	}{
-		{[]string{"a"}, "a"},
-		{[]string{"a", "b", "c"}, "a b c"},
-		{[]string{"a", "b", "c", "d"}, "a b c (+1)"},
-		{[]string{"a", "b", "c", "d", "e"}, "a b c (+2)"},
-	}
-	for _, tc := range cases {
-		if got := summarizeNames(tc.in); got != tc.want {
-			t.Errorf("summarizeNames(%q) = %q, хочу %q", tc.in, got, tc.want)
 		}
 	}
 }
