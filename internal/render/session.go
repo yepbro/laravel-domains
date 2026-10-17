@@ -90,32 +90,45 @@ func (s *Session) start(ctx context.Context) error {
 }
 
 // Run выполняет задачу: переход на task.URL с ожиданием события загрузки и
-// съём минимального результата (итоговый URL и заголовок). Общий таймаут
-// страницы — Options.Timeout (ТЗ 5.6: 25 с по умолчанию); он ограничивает
-// действия задачи, а не жизнь профиля.
+// съём результата — итоговый URL, заголовок (T-061), итоговый DOM, все
+// cookies итоговой страницы и заголовки ответа основной навигации (T-064,
+// extract.go). Общий таймаут страницы — Options.Timeout (ТЗ 5.6: 25 с по
+// умолчанию); он ограничивает действия задачи, а не жизнь профиля.
 //
 // Цепочка контекстов идёт от вкладки (s.ctx): chromedp ищет сессию по
 // значению в контексте, производный от вызывающего контекст её не видит.
 // Отмена и дедлайн вызывающего ctx привносятся AfterFunc: останавливают
 // действия задачи, не трогая профиль.
 //
-// Развитие T-062…T-064 встраивается сюда же этапами chromedp.Do над
+// Развитие T-062/T-063 встраивается сюда же этапами chromedp.Do над
 // s.Context(): блокировка ресурсов (T-062) — до перехода, ожидание
-// «затишья» сети (T-063) — после, съём итогового DOM и cookies (T-064) —
-// рядом с Title/Location.
+// «затишья» сети (T-063) — после; съём итогового DOM и cookies (T-064) —
+// финальным этапом extractResult (extract.go), рядом с Title/Location.
 func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	tctx, stop := context.WithTimeout(s.ctx, s.b.opts.Timeout)
 	defer stop()
 	stopCaller := context.AfterFunc(ctx, stop)
 	defer stopCaller()
 
-	err := chromedp.Do(tctx, chromedp.Navigate(task.URL))
+	// NavigateResponse — переход с ожиданием загрузки (то же ожидание, что
+	// у Navigate) плюс ответ основной навигации: chromedp отслеживает
+	// цепочку loader/request через редиректы и возвращает итоговый документ
+	// (T-064 — заголовки для правил ТЗ 5.8). У навигаций без сетевого
+	// запроса Chromium отдаёт псевдо-ответ (data: — Content-Type из URL),
+	// возможен и nil — оба случая обрабатываются ниже проверкой resp != nil.
+	resp, err := chromedp.Run(tctx, chromedp.NavigateResponse(task.URL))
 	var out RenderOutput
 	if err == nil {
 		out.Title, err = chromedp.Run(tctx, chromedp.Title())
 	}
 	if err == nil {
 		out.FinalURL, err = chromedp.Run(tctx, chromedp.Location())
+	}
+	if err == nil {
+		err = newExtractCDP().extractResult(tctx, &out) // T-064: DOM + cookies
+	}
+	if err == nil && resp != nil {
+		out.ResponseHeaders = extractResponseHeaders(resp.Headers) // T-064
 	}
 	if err != nil {
 		return out, s.wrap(err, ctx, tctx, task.URL)
