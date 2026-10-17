@@ -32,8 +32,8 @@
 // перехода и до съёма результата соответственно); итоговый DOM, cookies и
 // заголовки ответа (T-064) — поля RenderOutput (extract.go); Manager (T-065)
 // владеет поколениями «браузер + пул» — перезапуск каждые N страниц
-// (счётчик Browser.Pages) и по порогу RSS; цикл очередей (T-066/T-067)
-// вызывает Manager.Run.
+// (счётчик Browser.Pages) и по порогу RSS; цикл очередей — T-066 (публикация
+// q:render) и T-067 (потребитель — internal/renderworker, Manager.Run).
 package render
 
 import (
