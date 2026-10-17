@@ -37,6 +37,8 @@ make test-integration  # проверка окружения на testbed
 Движок правил Laravel: цели (cookie/заголовки/HTML/meta), свидетельства
 срабатываний и ограничения на недоверенном контенте:
 [`docs/analyzer.md`](docs/analyzer.md).
+Тюнинг ОС боевого сервера (sysctl: эфемерные порты, TIME_WAIT, nofile,
+conntrack, UDP-буферы DNS — ТЗ §10.2): [`docs/os-tuning.md`](docs/os-tuning.md).
 Список команд: `make help`.
 
 ## CI
@@ -64,6 +66,7 @@ make test-integration  # проверка окружения на testbed
 | `internal/` | Общий код: каркас сервисов (`service`, [docs/services.md](docs/services.md)), конфигурация (`config`), доступ к PostgreSQL — пул и массовая запись (`db`), модель домена — статусы, флаги, маски субдоменов (`model`), нормализация имён — punycode/UTS-46, публичные суффиксы (`idn`), метрики Prometheus (`metrics`), миграции при старте (`migrate`), движок правил Laravel (`rules`, [docs/analyzer.md](docs/analyzer.md)), каркасы `queue` (Redis Streams), `content` (пак-файлы контента и zstd, [docs/content.md](docs/content.md)), `render` (Chromium: пул изолированных контекстов, [docs/render.md](docs/render.md)), `renderworker` (цикл q:render: DOM в хранилище, `rendered = true`), `analyzer` (цикл q:analyze: матчинг правил, запись `laravel_findings`, агрегат домена `laravel_domains`), `watch` (fsnotify); пакеты dnsclient, httpfetch — в своих задачах |
 | `deploy/docker/` | Compose-окружение, Dockerfile'ы, конфиги, testbed |
 | `deploy/systemd/` | Боевой деплой на целевом сервере: systemd-юниты сервисов, drop-in'ы бюджета пакетов ОС, окружение ([docs/deploy.md](docs/deploy.md)) |
+| `deploy/sysctl/` | Тюнинг ядра боевого сервера (ТЗ §10.2): `99-crawler.conf` для `/etc/sysctl.d` + инструкция применения; расчёты — [docs/os-tuning.md](docs/os-tuning.md) |
 | `migrations/` | Миграции PostgreSQL (golang-migrate): встраиваются в бинарники и применяются сервисами при старте |
 | `rules/` | Правила обнаружения Laravel (перезагрузка по SIGHUP) |
 | `testdata/laravel-samples/` | Корпус образцов страниц (позитивные/негативные) |
