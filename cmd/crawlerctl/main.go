@@ -40,6 +40,7 @@ var commands = map[string]commandFunc{
 	"zones":      cmdZones,
 	"reanalyze":  cmdReanalyze,
 	"recheck":    cmdRecheck,
+	"dict":       cmdDict,
 	"seed":       cmdSeed,
 	"test-rules": cmdTestRules,
 }
@@ -58,6 +59,9 @@ const usageText = `crawlerctl — CLI Domain Crawler
   reanalyze [--zone ИМЯ]        переанализ результатов по новым правилам (T-074)
   recheck <домен> [домен …]     принудительная постановка домена на
                                 проверку (T-084)
+  dict train <файл> [--samples ПУТЬ]…
+                                обучение/переобучение словаря сжатия zstd
+                                по HTML-образцам (ТЗ 5.7)
 
 Команды dev-окружения:
   seed [--incoming DIR] [--scenarios FILE] [--bulk N]
