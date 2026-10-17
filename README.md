@@ -34,6 +34,8 @@ make test-integration  # проверка окружения на testbed
 [`docs/db.md`](docs/db.md).
 Конфигурация сервисов (единый YAML + переменные окружения, приоритеты,
 валидация; пример — `config.example.yaml`): [`docs/configuration.md`](docs/configuration.md).
+Redis как транспорт очередей задач и его конфигурация (dev/бой, бюджет
+памяти, `noeviction`, отказ от персистентности): [`docs/redis.md`](docs/redis.md).
 Движок правил Laravel: цели (cookie/заголовки/HTML/meta), свидетельства
 срабатываний и ограничения на недоверенном контенте:
 [`docs/analyzer.md`](docs/analyzer.md).
