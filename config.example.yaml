@@ -94,7 +94,7 @@ subdomains:                          # начальное наполнение �
 
 monitor:
   listen: ":9100"
-  zone_stats_interval: "60s"         # обновление счётчиков зон, 30–60 с
+  zone_stats_interval: "60s"         # пересчёт счётчиков зон и цикл алертов, 30–60 с
 
 log:
   level: "info"                      # уровень логирования сервисов: debug|info|warn|error
