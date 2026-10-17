@@ -1,5 +1,5 @@
 $ORIGIN crawl.test.
-@ 3600 IN SOA ns.crawl.test. hostmaster.crawl.test. ( 2 3600 600 86400 300 )
+@ 3600 IN SOA ns.crawl.test. hostmaster.crawl.test. ( 3 3600 600 86400 300 )
 @ IN NS ns.crawl.test.
 ns IN A 172.28.100.11
 
@@ -24,11 +24,19 @@ https-only IN A 172.28.100.12
 huge-body IN A 172.28.100.13
 infinite-redirect IN A 172.28.100.13
 js-redirect IN A 172.28.100.12
+laravel-10-breeze-login IN A 172.28.100.12
+laravel-11-dev-spa IN A 172.28.100.12
 laravel-11-vite IN A 172.28.100.12
+laravel-12-vite-livewire IN A 172.28.100.12
+laravel-5-8-legacy IN A 172.28.100.12
+laravel-6-welcome IN A 172.28.100.12
 laravel-8-mix IN A 172.28.100.12
+laravel-9-json-api IN A 172.28.100.12
 meta-refresh IN A 172.28.100.12
 parked-1 IN A 172.28.100.12
 parked-2 IN A 172.28.100.12
+parking-negative IN A 172.28.100.12
+rails-negative IN A 172.28.100.12
 redirect-chain IN A 172.28.100.12
 same-site IN A 172.28.100.12
 shared-a IN A 172.28.100.12
@@ -102,6 +110,7 @@ tls-self-signed IN A 172.28.100.13
 tls-wrong-san IN A 172.28.100.13
 truncated IN A 172.28.100.13
 wildcard IN A 172.28.100.12
+wordpress-negative IN A 172.28.100.12
 www-to-bare IN A 172.28.100.12
 www.alias-target IN A 172.28.100.12
 www.bare-to-www IN A 172.28.100.12

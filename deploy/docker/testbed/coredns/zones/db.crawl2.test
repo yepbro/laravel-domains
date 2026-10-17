@@ -1,5 +1,5 @@
 $ORIGIN crawl2.test.
-@ 3600 IN SOA ns.crawl2.test. hostmaster.crawl2.test. ( 2 3600 600 86400 300 )
+@ 3600 IN SOA ns.crawl2.test. hostmaster.crawl2.test. ( 3 3600 600 86400 300 )
 @ IN NS ns.crawl2.test.
 ns IN A 172.28.100.11
 

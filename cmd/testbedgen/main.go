@@ -64,6 +64,11 @@ type SiteCfg struct {
 	ApexRedirect bool   `yaml:"apex_redirect_to_www"`
 	WWWRedirect  bool   `yaml:"www_redirect_to_apex"`
 	WWWSame      bool   `yaml:"www_same_as_apex"`
+	// MockPath — путь «злого» обработчика для template=mock. Генератор
+	// маршрутов не пишет (это делает cmd/mockserver.hostRoutes по Host
+	// сценария), поле нужно для сверки контракта «сценарий → обработчик»
+	// в TestScenariosCoverTZ (см. main_test.go).
+	MockPath string `yaml:"mock_path"`
 }
 
 type Scenario struct {

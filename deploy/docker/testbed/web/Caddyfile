@@ -299,6 +299,41 @@ https://django-negative.crawl.test {
     import sample_django-negative
 }
 
+(sample_laravel-10-breeze-login) {
+    header +Content-Type "text/html; charset=UTF-8"
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6QlJFRVpFLUxPR0lOOjE2Ont9; expires=Sat, 17 Oct 2026 19:00:00 GMT; path=/; secure; samesite=lax"
+    header +Set-Cookie "laravel_session=eyJpdiI6c2Vzc2lvbi0xMDoxNjp7fQ%3D%3D; expires=Sat, 17 Oct 2026 19:00:00 GMT; path=/; httponly; samesite=lax"
+    root * /srv/samples/laravel-10-breeze-login
+    file_server
+}
+
+http://laravel-10-breeze-login.crawl.test {
+    import sample_laravel-10-breeze-login
+}
+
+https://laravel-10-breeze-login.crawl.test {
+    tls internal
+    import sample_laravel-10-breeze-login
+}
+
+(sample_laravel-11-dev-spa) {
+    header +Host "127.0.0.1:8000"
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6REVWLVNQQToxNjp7fQ%3D%3D; path=/; secure; samesite=lax"
+    header +Set-Cookie "laravel_session=eyJpdiI6c2Vzc2lvbi0xMToxNjp7fQ%3D%3D; path=/; httponly; samesite=lax"
+    header +X-Powered-By "PHP/8.3.12"
+    root * /srv/samples/laravel-11-dev-spa
+    file_server
+}
+
+http://laravel-11-dev-spa.crawl.test {
+    import sample_laravel-11-dev-spa
+}
+
+https://laravel-11-dev-spa.crawl.test {
+    tls internal
+    import sample_laravel-11-dev-spa
+}
+
 (sample_laravel-11-vite) {
     header +Set-Cookie "XSRF-TOKEN=eyJpdiI6ZmFrZVRva2VuOjE2Oml7InZhbCI6IjEyMzQ1Njc4OTAiLCJpdiI6ImFiY2RlZmFhYmNkZWYiLCJ0YWciOiIifQ==; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; secure; samesite=lax"
     header +Set-Cookie "laravel_session=eyJpdiI6c2Vzc2lvbjoxNjp7ImlzcyI6Imh0dHBzOi8vZXhhbXBsZSJ9; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; httponly; samesite=lax"
@@ -314,6 +349,59 @@ http://laravel-11-vite.crawl.test {
 https://laravel-11-vite.crawl.test {
     tls internal
     import sample_laravel-11-vite
+}
+
+(sample_laravel-12-vite-livewire) {
+    header +Content-Type "text/html; charset=UTF-8"
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6QUNNRS1UT0s6MTY6e30%3D; expires=Sat, 17 Oct 2026 19:30:00 GMT; path=/; secure; samesite=lax"
+    header +Set-Cookie "acme_session=eyJpdiI6YWNtZS1zZXNzaW9uOjE2Ont9; expires=Sat, 17 Oct 2026 19:30:00 GMT; path=/; httponly; samesite=lax"
+    root * /srv/samples/laravel-12-vite-livewire
+    file_server
+}
+
+http://laravel-12-vite-livewire.crawl.test {
+    import sample_laravel-12-vite-livewire
+}
+
+https://laravel-12-vite-livewire.crawl.test {
+    tls internal
+    import sample_laravel-12-vite-livewire
+}
+
+(sample_laravel-5-8-legacy) {
+    header +Content-Type "text/html; charset=UTF-8"
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6VFlQRi1UT0s6MTY6e30%3D; path=/; secure"
+    header +Set-Cookie "laravel_session=eyJpdiI6c2Vzc2lvbi01Ljg6MTY6e30%3D; path=/; httponly"
+    header +Set-Cookie "remember_web_7f3a1c9e2b8d4f60a5c1e9b3d7f28a40c6e59173=eyJpdiI6cmVtZW1iZXI6MTY6e30%3D; path=/; expires=Tue, 17 Nov 2026 12:00:00 GMT; secure; httponly"
+    root * /srv/samples/laravel-5-8-legacy
+    file_server
+}
+
+http://laravel-5-8-legacy.crawl.test {
+    import sample_laravel-5-8-legacy
+}
+
+https://laravel-5-8-legacy.crawl.test {
+    tls internal
+    import sample_laravel-5-8-legacy
+}
+
+(sample_laravel-6-welcome) {
+    header +Host "127.0.0.1:8000"
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6WlNSRi1UT0tLRU46MTY6e30%3D; expires=Sat, 17 Oct 2026 20:00:00 GMT; path=/; secure"
+    header +Set-Cookie "laravel_session=eyJpdiI6c2Vzc2lvbjoxNjoie30%3D; expires=Sat, 17 Oct 2026 20:00:00 GMT; path=/; httponly; samesite=lax"
+    header +X-Powered-By "PHP/7.4.33"
+    root * /srv/samples/laravel-6-welcome
+    file_server
+}
+
+http://laravel-6-welcome.crawl.test {
+    import sample_laravel-6-welcome
+}
+
+https://laravel-6-welcome.crawl.test {
+    tls internal
+    import sample_laravel-6-welcome
 }
 
 (sample_laravel-8-mix) {
@@ -332,6 +420,55 @@ https://laravel-8-mix.crawl.test {
     import sample_laravel-8-mix
 }
 
+(sample_laravel-9-json-api) {
+    header +Content-Type "application/json"
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6U0FOQ1RVTS1UT0s6MTY6e30%3D; expires=Sat, 17 Oct 2026 18:30:00 GMT; path=/; secure; samesite=lax"
+    header +Set-Cookie "laravel_session=eyJpdiI6c2Vzc2lvbi05OjE2Ont9; expires=Sat, 17 Oct 2026 18:30:00 GMT; path=/; httponly; samesite=lax"
+    root * /srv/samples/laravel-9-json-api
+    file_server
+}
+
+http://laravel-9-json-api.crawl.test {
+    import sample_laravel-9-json-api
+}
+
+https://laravel-9-json-api.crawl.test {
+    tls internal
+    import sample_laravel-9-json-api
+}
+
+(sample_parking-negative) {
+    header +Content-Type "text/html; charset=utf-8"
+    header +Server "nginx"
+    root * /srv/samples/parking-negative
+    file_server
+}
+
+http://parking-negative.crawl.test {
+    import sample_parking-negative
+}
+
+https://parking-negative.crawl.test {
+    tls internal
+    import sample_parking-negative
+}
+
+(sample_rails-negative) {
+    header +Content-Type "text/html; charset=utf-8"
+    header +Set-Cookie "_shop_session=RXhhbXBsZVNlc3Npb25FbmNyeXB0ZWQ--YWJjZGVmZ2hpamtsbW4--cXl6d2Vy; path=/; httponly; SameSite=Lax"
+    root * /srv/samples/rails-negative
+    file_server
+}
+
+http://rails-negative.crawl.test {
+    import sample_rails-negative
+}
+
+https://rails-negative.crawl.test {
+    tls internal
+    import sample_rails-negative
+}
+
 (sample_symfony-negative) {
     header +Set-Cookie "PHPSESSID=haha_not_laravel_session_value; path=/; httponly"
     root * /srv/samples/symfony-negative
@@ -345,5 +482,23 @@ http://symfony-negative.crawl.test {
 https://symfony-negative.crawl.test {
     tls internal
     import sample_symfony-negative
+}
+
+(sample_wordpress-negative) {
+    header +Content-Type "text/html; charset=UTF-8"
+    header +Set-Cookie "wordpress_test_cookie=WP%20Cookie%20check; path=/"
+    header +Set-Cookie "wp-settings-time-1=1758000000; path=/; expires=Sun, 17 Oct 2027 18:00:00 GMT"
+    header +X-Powered-By "PHP/8.2.8"
+    root * /srv/samples/wordpress-negative
+    file_server
+}
+
+http://wordpress-negative.crawl.test {
+    import sample_wordpress-negative
+}
+
+https://wordpress-negative.crawl.test {
+    tls internal
+    import sample_wordpress-negative
 }
 

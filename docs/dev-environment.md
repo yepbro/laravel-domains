@@ -167,7 +167,34 @@ deleted, `delete` — перевод в deleted) → отчёт в таблиц�
 
 Образцы Laravel добавляются каталогом в `testdata/laravel-samples/<id>/`
 (`index.html`, `headers.json`, `cookies.json`, `meta.yaml`) — домен
-`<id>.crawl.test` создаётся автоматически при следующем `make testbed-gen`.
+`<id>.crawl.test` создаётся автоматически при следующем `make testbed-gen`;
+заголовки из `headers.json` (в т.ч. `Set-Cookie` с куками Laravel) testweb
+отдаёт вместе со страницей, поэтому анализ по кукам работает на e2e.
+
+Генерат (`coredns/zones/`, `zones.conf`, `Caddyfile`, фикстуры `web/sites/`)
+коммитится в репозиторий: CI собирает зоны из коммита. Рассинхрон с
+`scenarios.yaml`/образцами ловит юнит-тест `TestGeneratedArtifactsInSync`
+(`cmd/testbedgen/main_test.go`) — после правки сценариев или образцов
+он падает до выполнения `make testbed-gen`. Состав стенда против
+обязательного списка ТЗ 11.2 сверяется там же (`TestScenariosCoverTZ`):
+
+| ТЗ 11.2 | Сценарий | Где реализовано |
+|---|---|---|
+| NXDOMAIN | `nxdomain-case` | зона без записей (coredns, авторитетный NXDOMAIN) |
+| wildcard | `wildcard` | `*.wildcard` A в зоне + SPA-независимая страница (testweb) |
+| тарпит | `tarpit` | mockserver `/tarpit`: тело со скоростью 512 Б/с |
+| бесконечный редирект | `infinite-redirect` (+`cycle-redirect`) | mockserver `/redirect/infinite`, `/redirect/cycle/a` |
+| гигантское тело | `huge-body` | mockserver `/huge`: Content-Length 1 ГиБ |
+| SPA-страница | `spa-shell` | testweb: `#root` + `<noscript>` + JS-кука/контент |
+| страницы Laravel разных версий | `<id>.crawl.test` для 13 образцов `testdata/laravel-samples` | testweb: статика + `headers.json` (куки `XSRF-TOKEN`/`*_session`, `Content-Type` и пр.), версии 5.8–12, стеки mix/vite/inertia/livewire + 5 негативов |
+
+Сверх обязательного списка стенд также эмулирует: SERVFAIL и таймаут DNS
+(`servfail`, `dns-timeout`), NODATA у делегированного (`delegated-no-address`),
+CNAME-цепочку и цикл, TCP-fallback (`tc-fallback`, 60 A-записей), закрытые
+порты (`closed-ports`), варианты http/https и алиасы www, медленные заголовки,
+zip-бомбу, обрыв соединения, мусорные байты, кривые кодировки, дефектные
+TLS-сертификаты (самоподписанный/просроченный/чужой SAN), парковки для
+дедупликации контента, общий IP для лимита соединений.
 
 ## 5. Правила Laravel
 
