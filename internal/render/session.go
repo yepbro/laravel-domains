@@ -99,17 +99,24 @@ func (s *Session) start(ctx context.Context) error {
 // Отмена и дедлайн вызывающего ctx привносятся AfterFunc: останавливают
 // действия задачи, не трогая профиль.
 //
-// Развитие T-062…T-064 встраивается сюда же этапами chromedp.Do над
-// s.Context(): блокировка ресурсов (T-062) — до перехода, ожидание
-// «затишья» сети (T-063) — после, съём итогового DOM и cookies (T-064) —
-// рядом с Title/Location.
+// Блокировка изображений/шрифтов/медиа (T-062, ТЗ 5.6) включается здесь,
+// до перехода (startBlock): перехват видит запросы страницы с первого.
+// Дальнейшее развитие: ожидание «затишья» сети (T-063) — после Navigate,
+// съём итогового DOM и cookies (T-064) — рядом с Title/Location; этапы —
+// chromedp.Do над s.Context().
 func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	tctx, stop := context.WithTimeout(s.ctx, s.b.opts.Timeout)
 	defer stop()
 	stopCaller := context.AfterFunc(ctx, stop)
 	defer stopCaller()
 
-	err := chromedp.Do(tctx, chromedp.Navigate(task.URL))
+	stopBlock, err := s.startBlock(tctx)
+	if err != nil {
+		return RenderOutput{}, s.wrap(err, ctx, tctx, task.URL)
+	}
+	defer stopBlock()
+
+	err = chromedp.Do(tctx, chromedp.Navigate(task.URL))
 	var out RenderOutput
 	if err == nil {
 		out.Title, err = chromedp.Run(tctx, chromedp.Title())
