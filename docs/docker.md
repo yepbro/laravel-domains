@@ -141,6 +141,15 @@ dc exec unbound nslookup example.com 127.0.0.1    # → ошибка: наруж
 dc run --rm --no-deps tools wget -qO- http://172.28.100.13:8080/healthz
 ```
 
+Домены сценариев (`tarpit.crawl.test`, `huge-body.crawl.test`, `zip-bomb.crawl.test`,
+`infinite-redirect`/`cycle-redirect`, `truncated`, `garbage-content`,
+`bad-charset-*`, `cookies`, `slow-headers`, `tls-*`) резолвятся в mockserver и
+обслуживаются как виртуальные хосты: запрос `/` по Host сценария получает его
+«злой» ответ (карта маршрутов — `cmd/mockserver`, соответствует `mock_path` из
+`scenarios.yaml`). TLS-сценарии получают по SNI сертификат со своим дефектом
+(самоподписанный / просроченный / чужой SAN). Правки исходника mockserver
+подхватываются `make test-integration` (образ пересобирается).
+
 Полный список сценариев: `deploy/docker/testbed/scenarios.yaml`.
 
 ## 5. Томa и данные

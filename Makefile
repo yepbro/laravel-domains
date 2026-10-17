@@ -119,7 +119,10 @@ test: ## Модульные тесты Go (в контейнере)
 .PHONY: test-integration
 test-integration: ## Интеграционные тесты окружения на testbed
 	$(check_env)
-	$(COMPOSE) --profile testbed --profile app up -d --wait \
+	# --build: сценарии HTTP-этапа живут в исходнике mockserver (виртуальные
+	# хосты сценариев, TLS-сертификаты) — образ обязан быть свежее исходника;
+	# стадия mockserver-build собирается за секунды (stdlib-only).
+	$(COMPOSE) --profile testbed --profile app up -d --build --wait \
 		postgres redis unbound coredns testweb mockserver chromium
 	# Сервисы приложения не запускаются, поэтому схему для тестов накатывает
 	# CLI (тот же набор migrations/); раннер сервисов проверяют TestMigrate_*.

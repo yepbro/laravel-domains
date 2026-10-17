@@ -9,3 +9,12 @@ Go-приложение для «злых» сценариев тестовог�
 
 Образ собирается из `deploy/docker/Dockerfile.go` (target `mockserver`),
 контейнер слушает `:80` (HTTP), `:443` (TLS по SNI) и `:8080` (healthcheck).
+
+Сценарии testbed (`site: {template: mock, mock_path: …}` в
+[`../scenarios.yaml`](../scenarios.yaml)) адресуются виртуальными хостами:
+запрос `/` по Host сценария (например, `tarpit.crawl.test`) маршрутизируется
+на его обработчик (`/tarpit`) — HTTP-воркер запрашивает только главную
+страницу (ТЗ 5.5, §9), «злой» ответ приезжает на `/`. TLS-сценарии
+(`tls-self-signed` / `tls-expired` / `tls-wrong-san`) получают по SNI
+сертификаты с соответствующим дефектом; отладочные имена
+`*.bad-tls.crawl.test` сохранены.

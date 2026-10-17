@@ -60,11 +60,20 @@ USER nonroot
 # Точка входа задаётся на уровне compose: ["/app/<сервис>"]
 
 # --------------------------------------------------------------------------
+# Сборка mockserver — отдельная стадия: исходник ограничен stdlib, поэтому
+# правки остального модуля (включая тесты) не инвалидируют слой, а make
+# test-integration пересобирает образ быстро (--build на up тестбеда).
+FROM base AS mockserver-build
+COPY go.mod go.sum ./
+COPY cmd/mockserver/ cmd/mockserver/
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/mockserver ./cmd/mockserver
+
+# --------------------------------------------------------------------------
 FROM alpine:${ALPINE_VERSION} AS mockserver
 RUN apk add --no-cache ca-certificates tzdata \
  && addgroup -S -g 10001 mock \
  && adduser -S -H -u 10001 -G mock mock
-COPY --from=build /out/mockserver /usr/local/bin/mockserver
+COPY --from=mockserver-build /out/mockserver /usr/local/bin/mockserver
 USER mock
 EXPOSE 80 443 8080
 ENTRYPOINT ["/usr/local/bin/mockserver"]

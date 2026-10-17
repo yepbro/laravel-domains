@@ -155,7 +155,11 @@ deleted, `delete` — перевод в deleted) → отчёт в таблиц�
 2. Для статических страниц шаблон (`generic`, `parked`, `redirect-chain`,
    `meta-refresh`, `js-redirect`, `spa`) сгенерирует фикстуру автоматически.
    Для динамических сценариев используйте `mockserver` (см. `cmd/mockserver`,
-   при необходимости добавьте эндпоинт и пересоберите: `make build`).
+   при необходимости добавьте эндпоинт и пересоберите: `make build`):
+   сценарий `site: {template: mock, mock_path: …}` обслуживается по своему
+   домену как виртуальный хост — «/» по Host сценария маршрутизируется на
+   `mock_path` (карта хостов в `cmd/mockserver` правится вместе со
+   сценариями), TLS-сценарии получают дефектный сертификат по SNI.
 3. `make testbed-gen` — перегенерирует зоны (`coredns/zones/`), `zones.conf`
    и `Caddyfile` с фикстурами; сервисы coredns/testweb перезапустятся.
 4. Добавьте проверку в `test/integration/env_test.go`, если сценарий

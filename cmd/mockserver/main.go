@@ -17,11 +17,63 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// hostRoutes — виртуальные хосты сценариев из scenarios.yaml (сценарии с
+// site: {template: mock, mock_path: …}): запрос «/» по Host сценария
+// маршрутизируется на его обработчик, как это делал бы выделенный сервер
+// сценария — HTTP-воркер запрашивает только главную страницу «/» (ТЗ 5.5,
+// §9), и «злой» ответ обязан приезжать именно на неё. Прямые пути
+// (env_test.go, ручная отладка) работают как раньше. Синхронность карты со
+// scenarios.yaml — контракт тестбеда (изменение набора сценариев mock —
+// правка карты в той же правке).
+var hostRoutes = map[string]string{
+	"tarpit.crawl.test":               "/tarpit",
+	"slow-headers.crawl.test":         "/slow?delay=30s",
+	"huge-body.crawl.test":            "/huge",
+	"zip-bomb.crawl.test":             "/zipbomb",
+	"infinite-redirect.crawl.test":    "/redirect/infinite",
+	"cycle-redirect.crawl.test":       "/redirect/cycle/a",
+	"truncated.crawl.test":            "/truncate",
+	"garbage-content.crawl.test":      "/garbage",
+	"bad-charset-declared.crawl.test": "/bad-charset/declared",
+	"bad-charset-wrong.crawl.test":    "/bad-charset/wrong",
+	"cookies.crawl.test":              "/cookies",
+	"tls-self-signed.crawl.test":      "/host",
+	"tls-expired.crawl.test":          "/host",
+	"tls-wrong-san.crawl.test":        "/host",
+}
+
+// routeByHost обслуживает виртуальные хосты сценариев: «/» по Host из
+// hostRoutes переписывается на целевой путь (с query, если задан) и
+// передаётся дальше в mux. Остальные запросы — без изменений. Маршрутизация
+// проверяется интеграционными тестами HTTP-этапа (test/integration/http_test.go,
+// T-060): каждый «злой» сценарий обязан приезжать воркеру на «/».
+func routeByHost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			host := strings.ToLower(r.Host)
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			if target, ok := hostRoutes[host]; ok {
+				rr := r.Clone(r.Context())
+				if i := strings.IndexByte(target, '?'); i >= 0 {
+					rr.URL.Path, rr.URL.RawQuery = target[:i], target[i+1:]
+				} else {
+					rr.URL.Path = target
+				}
+				r = rr
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 func main() {
 	certs, err := buildCerts()
@@ -45,8 +97,9 @@ func main() {
 
 	handler := http.NewServeMux()
 	registerRoutes(handler)
+	routed := routeByHost(handler)
 
-	httpSrv := &http.Server{Addr: ":80", Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	httpSrv := &http.Server{Addr: ":80", Handler: routed, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		log.Println("mockserver: HTTP на :80")
 		if err := httpSrv.ListenAndServe(); err != nil {
@@ -63,7 +116,7 @@ func main() {
 			return certs["*"], nil
 		},
 	}
-	tlsSrv := &http.Server{Addr: ":443", Handler: handler, ReadHeaderTimeout: 10 * time.Second, TLSConfig: tlsCfg}
+	tlsSrv := &http.Server{Addr: ":443", Handler: routed, ReadHeaderTimeout: 10 * time.Second, TLSConfig: tlsCfg}
 	log.Println("mockserver: TLS на :443")
 	if err := tlsSrv.ListenAndServeTLS("", ""); err != nil {
 		log.Fatalf("mockserver: tls: %v", err)
@@ -228,7 +281,9 @@ func writePage(w http.ResponseWriter, title, body string) {
 }
 
 // buildCerts генерирует самодельные сертификаты для TLS-сценариев:
-// самоподписанный валидный, просроченный и с чужим SAN.
+// самоподписанный валидный, просроченный и с чужим SAN. Имена сценариев
+// (scenarios.yaml: tls-self-signed/tls-expired/tls-wrong-san) и отладочные
+// bad-tls-имена (env_test.go) получают собственные сертификаты по SNI.
 func buildCerts() (map[string]*tls.Certificate, error) {
 	mk := func(cn string, sans []string, notAfter time.Time) (*tls.Certificate, error) {
 		key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -257,24 +312,49 @@ func buildCerts() (map[string]*tls.Certificate, error) {
 	far := time.Now().AddDate(10, 0, 0)
 	past := time.Now().AddDate(-2, 0, 0)
 
-	c, err := mk("self-signed.bad-tls.crawl.test", []string{"self-signed.bad-tls.crawl.test"}, far)
+	// Валидный самоподписанный: ключ "*" — SNI по умолчанию.
+	name := "self-signed.bad-tls.crawl.test"
+	c, err := mk(name, []string{name}, far)
 	if err != nil {
 		return nil, err
 	}
-	out["self-signed.bad-tls.crawl.test"] = c
-	out["*"] = c // SNI по умолчанию
+	out[name] = c
+	out["*"] = c
 
-	c, err = mk("expired.bad-tls.crawl.test", []string{"expired.bad-tls.crawl.test"}, past)
+	// Просроченный.
+	name = "expired.bad-tls.crawl.test"
+	c, err = mk(name, []string{name}, past)
 	if err != nil {
 		return nil, err
 	}
-	out["expired.bad-tls.crawl.test"] = c
+	out[name] = c
 
+	// Чужой SAN: сертификат издан для другого хоста.
 	c, err = mk("other-host.test", []string{"other-host.test", "www.other-host.test"}, far)
 	if err != nil {
 		return nil, err
 	}
 	out["wrong-san.bad-tls.crawl.test"] = c
+
+	// Домены сценариев тестбеда (scenarios.yaml): каждый получает своё
+	// «злое» свойство — самоподписанность, просрочку, чужой SAN.
+	scenarioCerts := []struct {
+		host string
+		cn   string
+		sans []string
+		end  time.Time
+	}{
+		{"tls-self-signed.crawl.test", "tls-self-signed.crawl.test", []string{"tls-self-signed.crawl.test"}, far},
+		{"tls-expired.crawl.test", "tls-expired.crawl.test", []string{"tls-expired.crawl.test"}, past},
+		{"tls-wrong-san.crawl.test", "other-host.test", []string{"other-host.test", "www.other-host.test"}, far},
+	}
+	for _, sc := range scenarioCerts {
+		c, err := mk(sc.cn, sc.sans, sc.end)
+		if err != nil {
+			return nil, err
+		}
+		out[sc.host] = c
+	}
 
 	return out, nil
 }
