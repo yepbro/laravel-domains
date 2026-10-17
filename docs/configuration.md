@@ -222,9 +222,22 @@ Quad9), как в ТЗ 5.10.
 | `max_body_bytes` | `CRAWLER_HTTP_MAX_BODY_BYTES` | размер | `2097152` (2 MiB) |
 | `min_body_speed` | `CRAWLER_HTTP_MIN_BODY_SPEED` | размер (байт/с) | `2048` (ТЗ 5.5: мин. скорость после первого байта) |
 | `max_rps` | `CRAWLER_HTTP_MAX_RPS` | целое | `1000` |
-| `user_agent` | `CRAWLER_HTTP_USER_AGENT` | строка | `DomainCrawler/1.0 (contact: admin@example.invalid)` |
+| `user_agent` | `CRAWLER_HTTP_USER_AGENT` | строка | `DomainCrawler/1.0 (+https://example.example/contact; admin@example.example)` |
 
-`user_agent` обязателен: честный User-Agent с контактами (ТЗ 5.5, §9).
+`user_agent` обязателен: честный User-Agent с контактами оператора в
+общепринятой форме `Имя/версия (+URL; e-mail)` (ТЗ 5.5, §9) — по UA
+владелец сайта определяет, кто и зачем его проверяет, и может связаться.
+Значение по умолчанию — заглушки на зарезервированных домене и адресе
+(RFC 2606): оператор подставляет реальные контакты (страницу с
+контактами и/или e-mail) в YAML или переменной `CRAWLER_HTTP_USER_AGENT`.
+Валидация: непустое, до 512 байт, без переводов строк и управляющих
+символов (значение ставится в заголовок).
+
+Минимум запросов (ТЗ 5.5, §9): HTTP-этап запрашивает только главную
+страницу `/` и не обращается к `robots.txt`; иные пути внутри цепочки
+редиректов задаёт сервер (Location, meta refresh), а не краулер. Один
+запрос на (субдомен, вариант) без повторов держит кэш итоговых URL
+воркера; транспорт `internal/httpfetch` повторов не делает.
 
 Таймауты секции — послойные (транспорт `internal/httpfetch`, T-047):
 `connect_timeout` ограничивает установку TCP-соединения к одному адресу,
@@ -338,7 +351,8 @@ Quad9), как в ТЗ 5.10.
 - `dns.timeout`/`dns.tcp_timeout`/`dns.retry_delay` положительны,
   `dns.retries` 1..10 (ТЗ 5.4: ретраи обязательны), `dns.udp_pool_size`
   1..100000;
-- `http.user_agent` непуст;
+- `http.user_agent` непуст, до 512 байт, без переводов строк и
+  управляющих символов;
 - `render.contexts` 1..16, `restart_every_pages` 1..1000000,
   `remote_url` (если задан) — корректный URL;
 - `content.pack_size` 1 MiB..8 GiB, `max_store_bytes` 1 байт..16 MiB,

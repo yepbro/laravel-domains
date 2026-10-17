@@ -26,6 +26,19 @@ import (
 // хранится в int8, бит = subdomains.id (ТЗ 5.10, §5.2 п. 9).
 const maxSubdomains = 63
 
+// maxUserAgentLen — разумная длина http.user_agent (ТЗ 5.5, §9): имя
+// продукта с контактами укладывается в десятки байт; 512 — щедрый
+// потолок, отсекающий мусор вместо контактов.
+const maxUserAgentLen = 512
+
+// DefaultUserAgent — честный User-Agent HTTP-этапа по умолчанию (ТЗ 5.5,
+// §9). Контакты — заглушки на зарезервированных домене и адресе
+// (RFC 2606, зона .example): реальных владельцев краулера ими не
+// представить, поэтому оператор обязан подставить свои контакты
+// конфигом http.user_agent — дефолт лишь не даёт сервису быть
+// анонимным. Форма — общепринятая «имя/версия (+URL; e-mail)».
+const DefaultUserAgent = "DomainCrawler/1.0 (+https://example.example/contact; admin@example.example)"
+
 // Config — корень конфигурации; секции соответствуют ТЗ 5.10.
 type Config struct {
 	Postgres   Postgres  `yaml:"postgres"`
@@ -251,7 +264,7 @@ func Default() *Config {
 			TotalTimeout:        Duration(20 * time.Second),
 			MaxRedirects:        8,
 			MaxBodyBytes:        ByteSize(2 << 20), // 2 MiB
-			UserAgent:           "DomainCrawler/1.0 (contact: admin@example.invalid)",
+			UserAgent:           DefaultUserAgent,
 			// Таблица лимитов ТЗ 5.5: мин. скорость 2 КБ/с (тарпиты).
 			MinBodySpeed: ByteSize(2 << 10),
 			// Естественный темп этапа ~1000–2000 RPS (страница 1–2 с,
@@ -442,6 +455,17 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.HTTP.UserAgent) == "" {
 		problems = append(problems, "http.user_agent: обязателен (честный User-Agent с контактами, ТЗ 5.5/§9)")
+	}
+	// Значение идёт в заголовок запроса одним полем: переводы строк и
+	// управляющие символы ломали бы запрос (а \r\n — инъекция заголовков).
+	for _, r := range c.HTTP.UserAgent {
+		if r < 0x20 || r == 0x7f {
+			problems = append(problems, "http.user_agent: переводы строк и управляющие символы недопустимы (значение ставится в заголовок)")
+			break
+		}
+	}
+	if n := len(c.HTTP.UserAgent); n > maxUserAgentLen {
+		problems = append(problems, fmt.Sprintf("http.user_agent: слишком длинный (%d байт, максимум %d) — имя и контакты, не текст", n, maxUserAgentLen))
 	}
 
 	// render

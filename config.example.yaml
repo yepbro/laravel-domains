@@ -58,7 +58,7 @@ http:
   max_body_bytes: 2097152            # 2 MiB
   min_body_speed: 2048               # мин. скорость тела после первого байта, байт/с — тарпиты (ТЗ 5.5)
   max_rps: 1000                      # глобальный темп запросов (RPS); всплески до concurrency
-  user_agent: "DomainCrawler/1.0 (+https://example.invalid; contact: admin@example.invalid)"  # честный UA с контактами — обязателен (ТЗ §9)
+  user_agent: "DomainCrawler/1.0 (+https://example.example/contact; admin@example.example)"  # честный UA с контактами — обязателен; подставьте реальные контакты оператора (ТЗ §9)
 
 render:
   # remote_url — расширение dev-окружения: внешний Chromium по CDP.
