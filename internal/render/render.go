@@ -32,7 +32,8 @@
 // перехода и до съёма результата соответственно); итоговый DOM, cookies и
 // заголовки ответа (T-064) — поля RenderOutput (extract.go); счётчик
 // Browser.Pages обслуживает перезапуск каждые N страниц (T-065); цикл
-// очередей (T-066/T-067) вызовет Pool.Run.
+// очередей — T-066 (публикация q:render) и T-067 (потребитель —
+// internal/renderworker, Pool.Run).
 package render
 
 import (
