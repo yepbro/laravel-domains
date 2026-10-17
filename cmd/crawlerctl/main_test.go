@@ -32,9 +32,12 @@ func TestRun(t *testing.T) {
 		{name: "--help", args: []string{"--help"}, code: exitOK, inOut: "crawlerctl — CLI"},
 		{name: "неизвестная команда", args: []string{"nope"}, code: exitUsage, inErr: `неизвестная команда "nope"`},
 
-		// status — информационная заглушка, код 0 (как раньше).
-		{name: "status", args: []string{"status"}, code: exitOK, inOut: "make ps"},
-		{name: "status --help", args: []string{"status", "--help"}, code: exitOK, inOut: "T-079"},
+		// status — функциональная команда (T-079): требует конфигурацию
+		// (БД/Redis); путь выполнения без инфраструктуры — TestRunStatus
+		// в status_test.go, здесь — использование и справка.
+		{name: "status лишний аргумент", args: []string{"status", "foo"}, code: exitUsage, inErr: "лишние аргументы"},
+		{name: "status неизвестный флаг", args: []string{"status", "--nope"}, code: exitUsage, inErr: "status: "},
+		{name: "status --help", args: []string{"status", "--help"}, code: exitOK, inOut: "сводка по зонам"},
 
 		// domain — нормализация работает, код 0.
 		{name: "domain без имени", args: []string{"domain"}, code: exitUsage, inErr: "укажите имя домена"},

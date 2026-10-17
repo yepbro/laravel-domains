@@ -1,10 +1,10 @@
 // ---------------------------------------------------------------- управление
 //
-// Команды управления из ТЗ 4.1: status (T-079), reanalyze (реализован,
-// T-074), subdomains (T-083), zones и recheck (T-084). Команда разбирает
-// аргументы и валидирует вход (имена — через internal/idn); каркасы
-// возвращают notImplemented с номером задачи, выборки из БД выполнят
-// сами задачи.
+// Команды управления из ТЗ 4.1: reanalyze (реализован, T-074), subdomains
+// (T-083), zones и recheck (T-084); status — в status.go (T-079).
+// Команда разбирает аргументы и валидирует вход (имена — через
+// internal/idn); каркасы возвращают notImplemented с номером задачи,
+// выборки из БД выполнят сами задачи.
 
 package main
 
@@ -26,35 +26,6 @@ import (
 	"crawler/internal/queue"
 	"crawler/internal/rules"
 )
-
-// ---------------------------------------------------------------- status
-
-// statusHelp — справка crawlerctl status --help.
-const statusHelp = `crawlerctl status — сводка по зонам, очередям, скорости (ТЗ 5.9)
-
-Использование:
-  crawlerctl status
-
-Покажет: прогресс по зонам (domains_total/domains_checked), длины очередей
-q:dns/q:http/q:render/q:analyze, скорость этапов и оценку времени
-завершения цикла. Реализация — задача T-079 (после планировщика и monitor).
-`
-
-func cmdStatus(args []string, stdout, stderr io.Writer) error {
-	if handled, err := parseFlags(newFlagSet("status"), statusHelp, args, stdout); handled {
-		return err
-	}
-	out(stdout, "%s", `crawlerctl status: сводка появится после реализации планировщика
-и monitor (задача T-079).
-
-Пока можно смотреть:
-  make ps                    — состояние контейнеров
-  make psql                  — консоль PostgreSQL (таблицы zones/domains)
-  make redis-cli             — консоль Redis (XLEN q:dns и т.п.)
-  http://127.0.0.1:9090      — Prometheus (профиль monitoring: make up && docker compose --profile monitoring up -d)
-`)
-	return nil
-}
 
 // ---------------------------------------------------------------- reanalyze
 
