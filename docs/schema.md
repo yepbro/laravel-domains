@@ -3,8 +3,8 @@
 Решения по схеме (задачи T-003 — `zones`, `subdomains`, `domains`; T-004 —
 `subdomain_results`, `contents`, `laravel_domains`, `laravel_findings`,
 `ingest_files`; T-005 — субпартиционирование крупных зон; T-031 — колонка
-`domains.temp_attempts`). Механизм применения миграций — в
-[`migrations.md`](migrations.md).
+`domains.temp_attempts`; T-082 — SQL-функция `domain_info`). Механизм
+применения миграций — в [`migrations.md`](migrations.md).
 
 Контракт схемы закреплён интеграционными тестами
 `test/integration/schema_test.go` и
@@ -336,3 +336,61 @@ HTTP-этап (T-058, `internal/httpworker/record.go`):
 совпадают с `DEFAULT`-ами колонок (`TestDomainZeroValueMatchesDefaults`),
 соответствие тегов колонкам миграции закреплено тестом
 `TestStructColumnsMatchSchema`.
+
+## Функция domain_info(text) — поиск домена по имени (T-082)
+
+Миграция `000006_domain_info` (ТЗ 5.11) создаёт SQL-функцию для прямого
+запроса из psql — сводка домена одним значением `jsonb`; CLI-обёртка
+`crawlerctl domain` (T-081) — над теми же таблицами на стороне Go.
+
+```sql
+SELECT domain_info('example.com');            -- сводка или NULL
+SELECT jsonb_pretty(domain_info('example.com'));
+```
+
+Домен или зона не найдены — `NULL` (не ошибка): SQL-функция отвечает
+фактом, «понятное сообщение» формирует CLI.
+
+### Обработка имени
+
+- **SQL-минимум нормализации** (ТЗ 5.2 п. 1): нижний регистр, снятие
+  краевых пробелов и точек — `'  Example.COM.  '` находит домен. Полный
+  конвейер IDN (пробелы внутри, punycode, проверки длин) — сторона Go
+  (`internal/idn`): в БД имена хранятся punycode, unicode-вход
+  нормализует CLI до обращения к функции.
+- **Зона отделяется самым длинным суффиксом имени, присутствующим
+  в `zones`** (для `site.co.uk` — зона `co.uk`, не `uk`; составные
+  метки домена остаются в `label`). Список публичных суффиксов в SQL
+  недоступен, а справочник `zones` — фактический набор зон каталога;
+  поведение совпадает с `idn.Normalize` (зона по PSL).
+- Поиск домена — по уникальному ключу `(zone_id, label)` через индекс
+  `domains_zone_id_label_key`, без полного сканирования (ТЗ 5.11).
+
+### Состав ответа
+
+| Путь | Содержимое |
+|---|---|
+| `zone` | `{id, name, name_unicode}` — зона домена |
+| `domain` | `{id, label, name, status, status_name, check_state, check_state_name, is_idn, render_pending, dns_mask, temp_attempts, queued_at, last_checked_at}` — строка `domains`; `*_name` дублируют коды именами из ТЗ 6.2 / `internal/model` (`alive`, `done`, …) для чтения из psql без справочника |
+| `dns_alive` | `[{id, label}]` — расшифровка `dns_mask` по справочнику `subdomains` |
+| `results` | `[{subdomain_id, subdomain, variant, scheme, scheme_name, http_status, final_url, alias_kind, alias_kind_name, alias, rendered, error, content_hash, checked_at}]` — результаты по (субдомен, вариант); `alias` — метка субдомена-цели алиаса; контент не раскрывается, `content_hash` (hex) — ссылка на него |
+| `laravel` | `{score, ver_min, ver_max, found_on_mask, found_on, rules_version, updated_at, findings}` — агрегат `laravel_domains` (json `null`, когда признаков нет), `found_on` — расшифровка `found_on_mask`; `findings` — все срабатывания `laravel_findings` домена **по убыванию score**, включая слабые ниже порога с пометкой `is_laravel`, `signals` передаются как есть |
+
+Времена (`checked_at`, `updated_at`, `queued_at`) — строки RFC 3339
+со смещением зоны сессии; `last_checked_at` — дата (`date`).
+
+### Безопасность
+
+Функция только читает: `STABLE`, `PARALLEL SAFE`, `SECURITY INVOKER`,
+таблицы не изменяет. Тело обращается к таблицам по неквалифицированным
+именам, поэтому `search_path` **зафиксирован за функцией** —
+`pg_catalog` + схема, по которой накатана миграция (ALTER после CREATE:
+имя схемы в момент миграции неизвестно — набор применяется и в рабочую
+схему, и в изолированные схемы интеграционных тестов через `search_path`
+DSN). Вызывающий не может подменить таблицы через свой `search_path`.
+
+Контракт закреплён интеграционным тестом `TestSchema_DomainInfoFunction`
+(`test/integration/schema_test.go`): атрибуты функции, состав JSON по
+тестовым данным (включая сортировку findings и расшифровки масок),
+отделение зоны самым длинным суффиксом и `NULL` для неизвестных
+домена/зоны. Down-миграция — `DROP FUNCTION IF EXISTS domain_info(text)`.

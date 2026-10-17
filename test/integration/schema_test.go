@@ -18,9 +18,12 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -754,4 +757,371 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 	dupInsert("ingest_files", `
 		INSERT INTO ingest_files (zone_id, action, path, sha256)
 		VALUES (1, 1, 'processed/com/add/a.txt', '\x0102')`)
+}
+
+// ---------------------------------------------------------------- T-082: domain_info
+
+// dinfoDecode разбирает ответ domain_info в карту (encoding/json:
+// числа — float64, порядок ключей jsonb не сохраняет — сравнение
+// по картам, а не по строкам).
+func dinfoDecode(t *testing.T, raw []byte) map[string]any {
+	t.Helper()
+	if raw == nil {
+		t.Fatal("domain_info: ответ NULL, ожидался jsonb")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("domain_info: разбор jsonb: %v", err)
+	}
+	return m
+}
+
+// dinfoMap, dinfoSlice, dinfoFloat, dinfoStr — доступ к элементам
+// ответа с проверкой типа: имена и виды полей — часть контракта
+// (детерминированные пути для psql и тестов).
+func dinfoMap(t *testing.T, v any, what string) map[string]any {
+	t.Helper()
+	m, ok := v.(map[string]any)
+	if !ok {
+		t.Fatalf("domain_info: %s — не объект: %T", what, v)
+	}
+	return m
+}
+
+func dinfoSlice(t *testing.T, v any, what string) []any {
+	t.Helper()
+	s, ok := v.([]any)
+	if !ok {
+		t.Fatalf("domain_info: %s — не массив: %T", what, v)
+	}
+	return s
+}
+
+func dinfoFloat(t *testing.T, v any, what string) float64 {
+	t.Helper()
+	f, ok := v.(float64)
+	if !ok {
+		t.Fatalf("domain_info: %s — не число: %T", what, v)
+	}
+	return f
+}
+
+func dinfoStr(t *testing.T, v any, what string) string {
+	t.Helper()
+	s, ok := v.(string)
+	if !ok {
+		t.Fatalf("domain_info: %s — не строка: %T", what, v)
+	}
+	return s
+}
+
+// dinfoTime разбирает метку времени ответа: timestamptz в jsonb —
+// строка RFC 3339 со смещением зоны сессии, поэтому сравниваются
+// моменты, а не строки.
+func dinfoTime(t *testing.T, v any, what string) time.Time {
+	t.Helper()
+	tm, err := time.Parse(time.RFC3339, dinfoStr(t, v, what))
+	if err != nil {
+		t.Fatalf("domain_info: %s: %v", what, err)
+	}
+	return tm
+}
+
+// TestSchema_DomainInfoFunction — контракт SQL-функции domain_info(text)
+// (миграция 000006, ТЗ 5.11): сводка домена одним jsonb — зона, строка
+// домена с именами статусов, расшифровка dns_mask, результаты по
+// субдоменам/вариантам и признаки Laravel (агрегат laravel_domains +
+// все findings по убыванию score, слабые с пометкой is_laravel).
+// Вход нормализуется SQL-минимумом (регистр, краевые пробелы и точка),
+// зона — самый длинный суффикс из справочника zones; поиск домена —
+// по уникальному ключу (zone_id, label). Домен/зона не найдены — NULL,
+// не ошибка. Функция только читает: STABLE, PARALLEL SAFE, SECURITY
+// INVOKER, search_path зафиксирован (pg_catalog + схема миграции).
+func TestSchema_DomainInfoFunction(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	ctx := context.Background()
+
+	// Функция на месте и только читает: provolatile/proparallel 's'
+	// (STABLE, PARALLEL SAFE), prokind 'f', возврат jsonb, конфигурация
+	// search_path указывает на pg_catalog и схему миграции.
+	var retType, kind, volatile, parallel, config string
+	err := pool.QueryRow(ctx, `
+		SELECT p.prorettype::regtype::text, p.prokind::text,
+		       p.provolatile::text, p.proparallel::text,
+		       COALESCE(array_to_string(p.proconfig, ','), '')
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = current_schema() AND p.proname = 'domain_info'`,
+	).Scan(&retType, &kind, &volatile, &parallel, &config)
+	if err != nil {
+		t.Fatalf("pg_proc domain_info: %v", err)
+	}
+	if retType != "jsonb" || kind != "f" {
+		t.Errorf("domain_info: возврат %s/%s, want jsonb/f", retType, kind)
+	}
+	if volatile != "s" {
+		t.Errorf("domain_info: provolatile = %s, want s (STABLE — только чтение)", volatile)
+	}
+	if parallel != "s" {
+		t.Errorf("domain_info: proparallel = %s, want s (PARALLEL SAFE)", parallel)
+	}
+	if !strings.Contains(config, "search_path") || !strings.Contains(config, "pg_catalog") {
+		t.Errorf("domain_info: search_path не зафиксирован: %q", config)
+	}
+
+	mustExec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, q, args...); err != nil {
+			t.Fatalf("подготовка данных: %v", err)
+		}
+	}
+	zoneID := func(name string) int {
+		t.Helper()
+		var id int
+		if err := pool.QueryRow(ctx,
+			`SELECT id FROM zones WHERE name = $1`, name,
+		).Scan(&id); err != nil {
+			t.Fatalf("зона %s: %v", name, err)
+		}
+		return id
+	}
+
+	// Данные: зоны test + uk/co.uk (для отделения зоны по самому длинному
+	// суффиксу), домен example с результатами и признаками Laravel,
+	// домен site в co.uk без результатов.
+	mustExec(`INSERT INTO zones (name) VALUES ('test'), ('uk'), ('co.uk')`)
+	var domID int64
+	err = pool.QueryRow(ctx, `
+		INSERT INTO domains (zone_id, label, status, check_state, flags, dns_mask,
+		                     last_checked_at, temp_attempts)
+		VALUES ($1, 'example', 4, 2, 3, 5, DATE '2026-10-01', 2)
+		RETURNING id`, zoneID("test"),
+	).Scan(&domID)
+	if err != nil {
+		t.Fatalf("insert domains: %v", err)
+	}
+	mustExec(`
+		INSERT INTO subdomain_results
+		    (zone_id, domain_id, subdomain_id, variant, scheme, http_status,
+		     final_url, alias_kind, alias_subdomain_id, rendered, content_hash,
+		     error, checked_at, rules_version)
+		VALUES
+		    ($1, $2, 0, 0, 2, 200, 'https://example.test/', 0, NULL, true,
+		     '\x0102030405060708090a0b0c0d0e0f10', NULL,
+		     TIMESTAMPTZ '2026-10-01 12:00:00+00', 1),
+		    ($1, $2, 2, 1, 1, NULL, NULL, 0, NULL, false, NULL, 1,
+		     TIMESTAMPTZ '2026-10-01 12:00:01+00', NULL)`,
+		zoneID("test"), domID)
+	mustExec(`
+		INSERT INTO laravel_findings
+		    (zone_id, domain_id, subdomain_id, variant, score, ver_min, ver_max,
+		     signals, is_laravel, rules_version)
+		VALUES
+		    ($1, $2, 0, 0, 0.8, '9.19', '11.0',
+		     '[{"rule":"cookie_xsrftoken","weight":0.3,"evidence":"XSRF-TOKEN"},
+	               {"rule":"header_laravel","weight":0.5,"evidence":"Set-Cookie: laravel_session"}]',
+		     true, 42),
+		    ($1, $2, 2, 1, 0.2, NULL, NULL,
+		     '[{"rule":"generator","weight":0.2,"evidence":"meta generator"}]',
+		     false, 42)`,
+		zoneID("test"), domID)
+	mustExec(`
+		INSERT INTO laravel_domains (zone_id, domain_id, score, ver_min, ver_max,
+		                             found_on_mask, rules_version, updated_at)
+		VALUES ($1, $2, 0.8, '9.19', '11.0', 1, 42, TIMESTAMPTZ '2026-10-01 12:05:00+00')`,
+		zoneID("test"), domID)
+	mustExec(`INSERT INTO domains (zone_id, label)
+		SELECT id, 'site' FROM zones WHERE name = 'co.uk'`)
+
+	// Найденный домен: вход с регистром, краевыми пробелами и точкой —
+	// SQL-минимум нормализации (ТЗ 5.2 п. 1); поля — ТЗ 5.11.
+	var raw []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT domain_info('  Example.TEST.  ')`,
+	).Scan(&raw); err != nil {
+		t.Fatalf("domain_info: %v", err)
+	}
+	info := dinfoDecode(t, raw)
+
+	wantZone := map[string]any{
+		"id":           float64(zoneID("test")),
+		"name":         "test",
+		"name_unicode": nil,
+	}
+	if got := dinfoMap(t, info["zone"], "zone"); !reflect.DeepEqual(got, wantZone) {
+		t.Errorf("zone = %v, want %v", got, wantZone)
+	}
+
+	wantDomain := map[string]any{
+		"id":               float64(domID),
+		"label":            "example",
+		"name":             "example.test",
+		"status":           4.0,
+		"status_name":      "alive",
+		"check_state":      2.0,
+		"check_state_name": "done",
+		"is_idn":           true,
+		"render_pending":   true,
+		"dns_mask":         5.0,
+		"temp_attempts":    2.0,
+		"queued_at":        nil,
+		"last_checked_at":  "2026-10-01",
+	}
+	if got := dinfoMap(t, info["domain"], "domain"); !reflect.DeepEqual(got, wantDomain) {
+		t.Errorf("domain = %v, want %v", got, wantDomain)
+	}
+
+	// Расшифровка dns_mask = 5 (биты 0 и 2): апекс и admin.
+	wantAlive := []any{
+		map[string]any{"id": 0.0, "label": ""},
+		map[string]any{"id": 2.0, "label": "admin"},
+	}
+	if got := dinfoSlice(t, info["dns_alive"], "dns_alive"); !reflect.DeepEqual(got, wantAlive) {
+		t.Errorf("dns_alive = %v, want %v", got, wantAlive)
+	}
+
+	// Результаты по (субдомен, вариант) в порядке субдомен/вариант;
+	// checked_at сравнивается моментом (смещение зависит от зоны сессии).
+	wantChecked := []time.Time{
+		time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
+		time.Date(2026, 10, 1, 12, 0, 1, 0, time.UTC),
+	}
+	wantResults := []map[string]any{
+		{
+			"subdomain_id": 0.0, "subdomain": "", "variant": 0.0,
+			"scheme": 2.0, "scheme_name": "https",
+			"http_status": 200.0, "final_url": "https://example.test/",
+			"alias_kind": 0.0, "alias_kind_name": "none", "alias": nil,
+			"rendered": true, "error": nil,
+			"content_hash": "0102030405060708090a0b0c0d0e0f10",
+		},
+		{
+			"subdomain_id": 2.0, "subdomain": "admin", "variant": 1.0,
+			"scheme": 1.0, "scheme_name": "http",
+			"http_status": nil, "final_url": nil,
+			"alias_kind": 0.0, "alias_kind_name": "none", "alias": nil,
+			"rendered": false, "error": 1.0,
+			"content_hash": nil,
+		},
+	}
+	results := dinfoSlice(t, info["results"], "results")
+	if len(results) != len(wantResults) {
+		t.Fatalf("results: %d записей, want %d", len(results), len(wantResults))
+	}
+	for i, w := range wantResults {
+		got := dinfoMap(t, results[i], "results[i]")
+		if tm := dinfoTime(t, got["checked_at"], "results[i].checked_at"); !tm.UTC().Equal(wantChecked[i]) {
+			t.Errorf("results[%d].checked_at = %v, want %v", i, tm.UTC(), wantChecked[i])
+		}
+		delete(got, "checked_at")
+		if !reflect.DeepEqual(got, w) {
+			t.Errorf("results[%d] = %v, want %v", i, got, w)
+		}
+	}
+
+	// Признаки Laravel: агрегат laravel_domains + findings по убыванию
+	// score — уверенное срабатывание первым, слабое (is_laravel = false)
+	// тоже возвращается (ТЗ 5.11).
+	lar := dinfoMap(t, info["laravel"], "laravel")
+	wantFoundOn := []any{map[string]any{"id": 0.0, "label": ""}}
+	if got := dinfoSlice(t, lar["found_on"], "laravel.found_on"); !reflect.DeepEqual(got, wantFoundOn) {
+		t.Errorf("laravel.found_on = %v, want %v", got, wantFoundOn)
+	}
+	for field, want := range map[string]float64{
+		"score": 0.8, "found_on_mask": 1.0, "rules_version": 42.0,
+	} {
+		if got := dinfoFloat(t, lar[field], "laravel."+field); got != want {
+			t.Errorf("laravel.%s = %v, want %v", field, got, want)
+		}
+	}
+	for field, want := range map[string]string{"ver_min": "9.19", "ver_max": "11.0"} {
+		if got := dinfoStr(t, lar[field], "laravel."+field); got != want {
+			t.Errorf("laravel.%s = %q, want %q", field, got, want)
+		}
+	}
+	if tm := dinfoTime(t, lar["updated_at"], "laravel.updated_at"); !tm.UTC().Equal(time.Date(2026, 10, 1, 12, 5, 0, 0, time.UTC)) {
+		t.Errorf("laravel.updated_at = %v, want 2026-10-01 12:05 UTC", tm.UTC())
+	}
+	wantFindings := []map[string]any{
+		{
+			"subdomain_id": 0.0, "subdomain": "", "variant": 0.0,
+			"score": 0.8, "ver_min": "9.19", "ver_max": "11.0",
+			"is_laravel": true,
+			"signals": []any{
+				map[string]any{"rule": "cookie_xsrftoken", "weight": 0.3, "evidence": "XSRF-TOKEN"},
+				map[string]any{"rule": "header_laravel", "weight": 0.5, "evidence": "Set-Cookie: laravel_session"},
+			},
+		},
+		{
+			"subdomain_id": 2.0, "subdomain": "admin", "variant": 1.0,
+			"score": 0.2, "ver_min": nil, "ver_max": nil,
+			"is_laravel": false,
+			"signals": []any{
+				map[string]any{"rule": "generator", "weight": 0.2, "evidence": "meta generator"},
+			},
+		},
+	}
+	findings := dinfoSlice(t, lar["findings"], "laravel.findings")
+	if len(findings) != len(wantFindings) {
+		t.Fatalf("laravel.findings: %d записей, want %d", len(findings), len(wantFindings))
+	}
+	for i, w := range wantFindings {
+		if got := dinfoMap(t, findings[i], "findings[i]"); !reflect.DeepEqual(got, w) {
+			t.Errorf("laravel.findings[%d] = %v, want %v", i, got, w)
+		}
+	}
+
+	// Зона — самый длинный суффикс имени из zones: site.co.uk в зоне
+	// co.uk, хотя зона uk тоже существует (как PSL в idn.Normalize).
+	var zoneName, label string
+	if err := pool.QueryRow(ctx, `
+		SELECT domain_info('site.co.uk') -> 'zone' ->> 'name',
+		       domain_info('site.co.uk') -> 'domain' ->> 'label'`,
+	).Scan(&zoneName, &label); err != nil {
+		t.Fatalf("domain_info site.co.uk: %v", err)
+	}
+	if zoneName != "co.uk" || label != "site" {
+		t.Errorf("суффикс зоны: zone=%q label=%q, want co.uk/site", zoneName, label)
+	}
+
+	// Не найдено — NULL, не ошибка: неизвестный домен в известной зоне,
+	// неизвестная зона, имя из одной метки (это зона, не домен), пустой
+	// вход и NULL.
+	var noDomain, noZone, singleLabel, empty, nullIn bool
+	err = pool.QueryRow(ctx, `
+		SELECT domain_info('unknown.test') IS NULL,
+		       domain_info('example.unknownzone') IS NULL,
+		       domain_info('test') IS NULL,
+		       domain_info('') IS NULL,
+		       domain_info(NULL) IS NULL`,
+	).Scan(&noDomain, &noZone, &singleLabel, &empty, &nullIn)
+	if err != nil {
+		t.Fatalf("domain_info не найдено: %v", err)
+	}
+	for name, got := range map[string]bool{
+		"неизвестный домен": noDomain, "неизвестная зона": noZone,
+		"одна метка": singleLabel, "пустой вход": empty, "NULL": nullIn,
+	} {
+		if !got {
+			t.Errorf("domain_info(%s): ожидался NULL", name)
+		}
+	}
+
+	// Домен без результатов и признаков: пустые массивы, laravel —
+	// jsonb null (не SQL NULL: jsonb_build_object кладёт JSON null);
+	// свежий домен отображается именами статусов по умолчанию.
+	var noResults, noAlive, noLaravel, newStatus bool
+	if err := pool.QueryRow(ctx, `
+		SELECT domain_info('site.co.uk') -> 'results' = '[]'::jsonb,
+		       domain_info('site.co.uk') -> 'dns_alive' = '[]'::jsonb,
+		       domain_info('site.co.uk') -> 'laravel' = 'null'::jsonb,
+		       domain_info('site.co.uk') -> 'domain' ->> 'status_name' = 'new'`,
+	).Scan(&noResults, &noAlive, &noLaravel, &newStatus); err != nil {
+		t.Fatalf("domain_info site (пустой): %v", err)
+	}
+	if !noResults || !noAlive || !noLaravel || !newStatus {
+		t.Errorf("домен без результатов: results-пусто=%v dns_alive-пусто=%v laravel-null=%v status=%v, want все true",
+			noResults, noAlive, noLaravel, newStatus)
+	}
 }
