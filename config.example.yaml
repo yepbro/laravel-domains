@@ -70,6 +70,8 @@ content:
   pack_size: "512MB"                 # порог ротации пака; рекомендация ТЗ: 512 МБ–1 ГБ
   max_store_bytes: 2097152           # лимит одного контента; рекомендация ТЗ: 1–2 МБ
   zstd_dictionary: "/data/content/dict.zst"   # crawlerctl dict train; пусто — без словаря
+  disk_free_percent: 5               # порог свободного места каталога контента, %:
+                                     # ниже — пауза записи контента + алерт (ТЗ 8)
 
 analyzer:
   rules_dir: "/etc/crawler/rules"    # YAML-правила Laravel (ТЗ 5.8)

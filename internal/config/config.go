@@ -148,6 +148,13 @@ type Content struct {
 	PackSize       ByteSize `yaml:"pack_size"`
 	MaxStoreBytes  ByteSize `yaml:"max_store_bytes"`
 	ZstdDictionary string   `yaml:"zstd_dictionary"`
+	// DiskFreePercent — порог реакции на переполнение диска (ТЗ 8):
+	// при доле свободного места каталога контента ниже порога запись
+	// контента приостанавливается (ErrStoreFull) и сигнализируется
+	// алерт. Расширение к минимальному составу ТЗ 5.10, имя — по смыслу
+	// настраиваемого порога ТЗ 8 («порог настраивается»): доля свободного
+	// места, %.
+	DiskFreePercent float64 `yaml:"disk_free_percent"`
 }
 
 // Analyzer — анализатор Laravel (ТЗ 5.8).
@@ -240,6 +247,10 @@ func Default() *Config {
 			PackSize:       ByteSize(512 << 20), // 512 MiB
 			MaxStoreBytes:  ByteSize(2 << 20),   // 2 MiB
 			ZstdDictionary: "/data/content/dict.zst",
+			// ТЗ 8 числа не задаёт: 5% — типовой нижний предел для томов
+			// данных (место хватает и на компактификацию, и на журналы);
+			// валидация не даёт выключить контроль нулём.
+			DiskFreePercent: 5,
 		},
 		Analyzer: Analyzer{
 			RulesDir:        "/etc/crawler/rules",
@@ -429,6 +440,11 @@ func (c *Config) Validate() error {
 	if c.Content.MaxStoreBytes <= 0 || c.Content.MaxStoreBytes > 16<<20 {
 		problems = append(problems, fmt.Sprintf("content.max_store_bytes: ожидается %s..%s, задано %s (рекомендация ТЗ: 1–2 МБ)",
 			ByteSize(1), ByteSize(16<<20), c.Content.MaxStoreBytes))
+	}
+	// Порог переполнения диска (ТЗ 8): 0 выключал бы обязательную для ТЗ
+	// паузу записи, > 95 останавливал бы запись на заведомо живом томе.
+	if c.Content.DiskFreePercent <= 0 || c.Content.DiskFreePercent > 95 {
+		problems = append(problems, fmt.Sprintf("content.disk_free_percent: ожидается (0, 95], задано %v", c.Content.DiskFreePercent))
 	}
 
 	// analyzer

@@ -98,6 +98,14 @@ type PackOptions struct {
 	Dir           string // каталог пак-файлов (content.dir)
 	PackSize      int64  // порог ротации, байты (content.pack_size)
 	MaxStoreBytes int64  // лимит одного контента, байты (content.max_store_bytes)
+	// DiskFreePercent — порог свободного места каталога контента, %
+	// (content.disk_free_percent, ТЗ 8): ниже порога Put возвращает
+	// ErrStoreFull — пауза записи контента; 0 — контроль выключен
+	// (конфиг задаёт его всегда, T-046).
+	DiskFreePercent float64
+	// OnStoreFull — хук алерта T-080: типизированные события «место
+	// ниже порога» от Put, ENOSPC и DiskWatchLoop. nil — не задан.
+	OnStoreFull OnStoreFullFunc
 }
 
 // PackStore — ContentStore на пак-файлах: блоки в pack-NNNNNN.pack,
@@ -112,6 +120,7 @@ type PackStore struct {
 	active   *packFile    // пак для дописывания — всегда новейший (appendBlockLocked)
 	lock     *os.File     // flock каталога паков (между процессами)
 	dirCache packDirCache // новейший пак с кэшем по mtime каталога
+	stat     SpaceChecker // источник statfs для контроля места (nil — OSStatfs; тесты подменяют)
 	closed   bool
 }
 
@@ -159,8 +168,11 @@ func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("content: файл блокировки %s: %w", filepath.Join(opts.Dir, packLockFile), err)
 	}
-	return &PackStore{pool: pool, opts: opts, lock: lock}, nil
+	return &PackStore{pool: pool, opts: opts, lock: lock, stat: OSStatfs{}}, nil
 }
+
+// Dir — каталог пак-файлов хранилища (диагностика, тесты, сервисы).
+func (s *PackStore) Dir() string { return s.opts.Dir }
 
 // Close закрывает файлы хранилища; Get после Close продолжает работать
 // (паки открываются на чтение по запросу), запись — ошибка.
@@ -207,6 +219,14 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 		return PutResult{Hash: h}, nil
 	}
 
+	// 1.5) пауза записи контента (ТЗ 8, T-046): свободное место каталога
+	// ниже порога — новый блок не пишется, ErrStoreFull + событие алерта.
+	// Дедуп выше уже вернулся: ссылки на живой контент и чтение продолжают
+	// работать — байты не расходуются.
+	if err := s.pauseIfDiskFull(); err != nil {
+		return PutResult{}, err
+	}
+
 	// 2) спул блока в пак и 3) фиксация метаданных — под одним захватом
 	// мьютекса и flock (appendAndMeta): блок и его строка появляются в
 	// хранилище атомарно относительно компактификации (T-045), которая
@@ -215,6 +235,11 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 	block := CompressWithDict(data)
 	tag, err = s.appendAndMeta(ctx, h, block, len(data))
 	if err != nil {
+		// ENOSPC при физической записи — последняя линия обороны после
+		// порога (wrapPackWriteErr): тоже сигнал алерта (ТЗ 8).
+		if errors.Is(err, ErrStoreFull) {
+			s.fireStoreFull(s.enospcEvent())
+		}
 		return PutResult{}, err
 	}
 	return PutResult{Hash: h, Created: tag.Insert()}, nil

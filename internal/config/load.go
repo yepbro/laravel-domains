@@ -139,6 +139,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_CONTENT_PACK_SIZE", setSize(func(c *Config) *ByteSize { return &c.Content.PackSize })},
 		{"CRAWLER_CONTENT_MAX_STORE_BYTES", setSize(func(c *Config) *ByteSize { return &c.Content.MaxStoreBytes })},
 		{"CRAWLER_CONTENT_ZSTD_DICTIONARY", setString(func(c *Config) *string { return &c.Content.ZstdDictionary })},
+		{"CRAWLER_CONTENT_DISK_FREE_PERCENT", setFloat(func(c *Config) *float64 { return &c.Content.DiskFreePercent })},
 		{"CRAWLER_ANALYZER_RULES_DIR", setString(func(c *Config) *string { return &c.Analyzer.RulesDir })},
 		{"CRAWLER_ANALYZER_LARAVEL_MIN_SCORE", setFloat(func(c *Config) *float64 { return &c.Analyzer.LaravelMinScore })},
 		{"CRAWLER_SUBDOMAINS", setStrings(func(c *Config) *[]string { return &c.Subdomains })},

@@ -243,6 +243,7 @@ Quad9), как в ТЗ 5.10.
 | `pack_size` | `CRAWLER_CONTENT_PACK_SIZE` | размер | `512MB` (рекомендация: 512 МБ–1 ГБ) |
 | `max_store_bytes` | `CRAWLER_CONTENT_MAX_STORE_BYTES` | размер | `2097152` (рекомендация: 1–2 МБ) |
 | `zstd_dictionary` | `CRAWLER_CONTENT_ZSTD_DICTIONARY` | путь | `/data/content/dict.zst` (пусто — без словаря) |
+| `disk_free_percent` | `CRAWLER_CONTENT_DISK_FREE_PERCENT` | число | `5`, диапазон (0, 95] |
 
 Словарь обучается командой `crawlerctl dict train <файл> [--samples ПУТЬ]…`
 (dev-окружение — `docs/dev-environment.md` §6); отсутствующий файл — не
@@ -251,8 +252,9 @@ Quad9), как в ТЗ 5.10.
 своим (прежним) словарём, пока он зарегистрирован.
 
 `dir` — каталог пак-файлов хранилища контента (`pack-NNNNNN.pack`,
-файл блокировки `.packs.lock`, словарь): формат, ротация по `pack_size` и
-метаданные `contents` — [`docs/content.md`](content.md).
+файл блокировки `.packs.lock`, словарь): формат, ротация по `pack_size`,
+метаданные `contents` и лимиты (включая реакцию на переполнение диска по
+`disk_free_percent`, ТЗ 8) — [`docs/content.md`](content.md).
 
 ### `analyzer` (ТЗ 5.8)
 
@@ -310,7 +312,8 @@ Quad9), как в ТЗ 5.10.
 - `http.user_agent` непуст;
 - `render.contexts` 1..16, `restart_every_pages` 1..1000000,
   `remote_url` (если задан) — корректный URL;
-- `content.pack_size` 1 MiB..8 GiB, `max_store_bytes` 1 байт..16 MiB;
+- `content.pack_size` 1 MiB..8 GiB, `max_store_bytes` 1 байт..16 MiB,
+  `disk_free_percent` в (0, 95];
 - `analyzer.laravel_min_score` в (0, 1];
 - `ingest.max_error_ratio` в (0, 1];
 - `subdomains`: 1..63 записи, метки в нижнем регистре без точек, без повторов;

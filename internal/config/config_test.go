@@ -86,6 +86,7 @@ func TestDefault(t *testing.T) {
 		{"content.pack_size", c.Content.PackSize.B(), int64(512 << 20)},
 		{"content.max_store_bytes", c.Content.MaxStoreBytes.B(), int64(2 << 20)},
 		{"content.zstd_dictionary", c.Content.ZstdDictionary, "/data/content/dict.zst"},
+		{"content.disk_free_percent", c.Content.DiskFreePercent, 5.0},
 		{"analyzer.rules_dir", c.Analyzer.RulesDir, "/etc/crawler/rules"},
 		{"analyzer.laravel_min_score", c.Analyzer.LaravelMinScore, 0.6},
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
@@ -161,6 +162,7 @@ content:
   pack_size: "1GiB"
   max_store_bytes: "1MiB"
   zstd_dictionary: ""
+  disk_free_percent: 12.5
 analyzer:
   rules_dir: "/srv/rules"
   laravel_min_score: 0.75
@@ -224,6 +226,7 @@ log:
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(1 << 30)},
 		{"content.max_store_bytes", cfg.Content.MaxStoreBytes.B(), int64(1 << 20)},
 		{"content.zstd_dictionary", cfg.Content.ZstdDictionary, ""},
+		{"content.disk_free_percent", cfg.Content.DiskFreePercent, 12.5},
 		{"analyzer.rules_dir", cfg.Analyzer.RulesDir, "/srv/rules"},
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.75},
 		{"monitor.listen", cfg.Monitor.Listen, "127.0.0.1:9110"},
@@ -366,6 +369,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_CONTENT_PACK_SIZE":                "256MB",
 		"CRAWLER_CONTENT_MAX_STORE_BYTES":          "512KiB",
 		"CRAWLER_CONTENT_ZSTD_DICTIONARY":          "/env/dict.zst",
+		"CRAWLER_CONTENT_DISK_FREE_PERCENT":        "7.5",
 		"CRAWLER_ANALYZER_RULES_DIR":               "/env/rules",
 		"CRAWLER_ANALYZER_LARAVEL_MIN_SCORE":       "0.9",
 		"CRAWLER_SUBDOMAINS":                       "www, mail",
@@ -422,6 +426,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(256 * 1000 * 1000)},
 		{"content.max_store_bytes", cfg.Content.MaxStoreBytes.B(), int64(512 << 10)},
 		{"content.zstd_dictionary", cfg.Content.ZstdDictionary, "/env/dict.zst"},
+		{"content.disk_free_percent", cfg.Content.DiskFreePercent, 7.5},
 		{"analyzer.rules_dir", cfg.Analyzer.RulesDir, "/env/rules"},
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.9},
 		{"monitor.listen", cfg.Monitor.Listen, ":9199"},
@@ -635,6 +640,8 @@ func TestValidate(t *testing.T) {
 		{"pack_size мал", func(c *Config) { c.Content.PackSize = 1 }, "content.pack_size"},
 		{"pack_size велик", func(c *Config) { c.Content.PackSize = ByteSize(16 << 30) }, "content.pack_size"},
 		{"max_store_bytes 0", func(c *Config) { c.Content.MaxStoreBytes = 0 }, "content.max_store_bytes"},
+		{"disk_free_percent 0", func(c *Config) { c.Content.DiskFreePercent = 0 }, "content.disk_free_percent"},
+		{"disk_free_percent >95", func(c *Config) { c.Content.DiskFreePercent = 96 }, "content.disk_free_percent"},
 		{"rules_dir пуст", func(c *Config) { c.Analyzer.RulesDir = "" }, "analyzer.rules_dir"},
 		{"min_score 0", func(c *Config) { c.Analyzer.LaravelMinScore = 0 }, "analyzer.laravel_min_score"},
 		{"min_score >1", func(c *Config) { c.Analyzer.LaravelMinScore = 1.5 }, "analyzer.laravel_min_score"},
