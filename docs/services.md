@@ -239,6 +239,35 @@ Chromium (`render.StartBrowser` — внешний по `render.remote_url` ил
   (доставки остаются в стриме, не в PEL); перезапуск браузера каждые N
   страниц и по памяти — T-065.
 
+И `analyzer` (этап 7, T-071) — не заглушка: его `OnRun` выполняет цикл
+`analyzer.Run` (`internal/analyzer`; подробный конвейер — в
+[`analyzer.md`](analyzer.md)):
+
+- потребление `q:analyze` группой потребителей `analyzer` окном до 16
+  записей, параллельно до 8 доставок на экземпляр, каждая — паттерном
+  `queue.Processing` (T-025): XACK только после записи в БД;
+- набор правил обязан загрузиться при старте (`rules.NewReloader` по
+  `analyzer.rules_dir`, ошибка — код 1): без валидного набора analyzer
+  молча не находил бы Laravel; SIGHUP (`make rules-reload`) перезагружает
+  каталог на живом сервисе (`Options.OnSIGHUP` → `HandleSIGHUP`), каждая
+  доставка берёт актуальный снапшот через `Set()`;
+- задача — `Result`-ключ строки `subdomain_results` (T-024; публикуют
+  HTTP-этап T-058 и render-worker T-067): вход анализа (заголовки/cookies
+  jsonb, `content_hash`) читается из строки, контент — из того же
+  хранилища PackStore (словарь zstd совпадает с пишущими этапами);
+  `Set.EvaluateCtx` с `DefaultLimits` (T-069) — все срабатывания любого
+  правила независимо от порога, `is_laravel = score ≥
+  analyzer.laravel_min_score` (по умолчанию 0.6, §13.1);
+- запись — одной транзакцией: `UPDATE subdomain_results.rules_version`
+  (штамп версии набора для переанализа T-074; охрана `content_hash` и
+  «домен не deleted» — 0 строк: успех без записи, стиль render-worker)
+  → upsert `laravel_findings` (score, диапазон версий с NULL при
+  конфликте, `signals` jsonb, `is_laravel`, `rules_version`) либо DELETE
+  при пустом итоге (§3.5 перезапись); повторные доставки идемпотентны
+  (ТЗ 3.4); агрегация в `laravel_domains` — T-072;
+- analyzer ничего не публикует (конец конвейера §7) — гейт backpressure
+  не нужен, очередь читается и подтверждается напрямую.
+
 Подробности браузерного слоя (изоляция, блокировка ресурсов, ожидание,
 съём результата) — [`render.md`](render.md); live-проверки против
 compose-сервиса `chromium` — флагом `CRAWLER_RENDER_TEST=1`.
