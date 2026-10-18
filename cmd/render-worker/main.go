@@ -17,7 +17,7 @@
 // (WatermarkPublisher, T-026). Перезапуск браузера — менеджер T-065;
 // при недоступном Chromium цикл лишь приостанавливает потребление
 // (зонд Manager.Alive — реконнект и перезапуск делает сам зонд).
-// Каркас — internal/service: миграции, пул БД (OnDBPool), /healthz
+// Каркас — internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz
 // и /metrics, graceful shutdown.
 package main
 

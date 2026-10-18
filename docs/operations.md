@@ -33,7 +33,8 @@
 2. `make up` — инфраструктура + testbed + приложения; первый запуск
    5–15 минут (сборка образов).
 3. `make ps` — дождаться `healthy` у всех сервисов (healthcheck —
-   `/healthz` на порту метрик).
+   `/livez` на порту метрик; readiness `/healthz` с проверкой БД —
+   отдельно, [`services.md`](services.md) «Пробы живости и готовности»).
 4. `make seed` — тестовые списки доменов в `var/incoming/`; наблюдать
    обработку: файлы уходят в `var/incoming/processed/` (контракт —
    [`incoming-files.md`](incoming-files.md)).
@@ -130,8 +131,8 @@ SELECT * FROM schema_migrations;   -- version, dirty = false
 
 ### 4.3. Метрики и алерты
 
-**Метрики.** Каждый сервис отдаёт `/healthz` и `/metrics` на своём
-порту (таблица адресов — [`services.md`](services.md) «Метрики»;
+**Метрики.** Каждый сервис отдаёт `/livez`, `/healthz` и `/metrics` на
+своём порту (таблица адресов — [`services.md`](services.md) «Метрики»;
 бой — loopback). Ключевые метрики конвейера
 ([`services.md`](services.md), таблица «Метрики рабочей логики»):
 

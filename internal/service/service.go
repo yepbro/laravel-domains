@@ -3,8 +3,9 @@
 // Каркас берёт на себя всё, что не относится к рабочей логике сервиса:
 // структурированное логирование (log/slog, уровень из конфигурации),
 // применение миграций и пул подключений PostgreSQL (internal/migrate,
-// internal/db), HTTP-сервер с /healthz и /metrics (internal/metrics,
-// ТЗ 4.1, 5.9) и graceful shutdown по ТЗ 3.4: при SIGTERM/SIGINT сначала
+// internal/db), HTTP-сервер с пробами /livez + /healthz и метриками
+// /metrics (internal/metrics, ТЗ 4.1, 5.9; T-110) и graceful shutdown
+// по ТЗ 3.4: при SIGTERM/SIGINT сначала
 // отменяется контекст рабочей логики (Options.OnRun) и каркас ждёт её
 // завершения, затем останавливается HTTP-сервер метрик, последним
 // закрывается пул БД. Повторный сигнал прерывает ожидание — принудительный
@@ -238,7 +239,7 @@ func Run(opts Options) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthzHandler(pool))
+	registerProbes(mux, pool)
 	// /metrics — реестр Prometheus (internal/metrics): базовые метрики
 	// каркаса + коллекторы Go/runtime; метрики рабочей логики добавляются
 	// фабрикой реестра (Counter/Gauge/Histogram с автометкой service,
@@ -287,11 +288,45 @@ func Run(opts Options) error {
 	return err
 }
 
-// healthzHandler — readiness-проба каркаса (её использует healthcheck
-// compose/systemd): сервис с пулом БД проверяет PostgreSQL коротким
-// Ping — недоступная БД видна оркестратору как 503/unhealthy, а не
-// «healthy» с бесконечными ошибками в логе воркера. Сервис без пула
-// (Options без OnDBPool/DSN) всегда готов: зависимостей нет.
+// registerProbes — маршруты проб каркаса на общем mux (порт метрик; отдельного
+// слушателя для проб нет — ТЗ 5.9 один HTTP-эндпоинт на сервис). /livez —
+// liveness, /healthz — readiness (C-03 → T-110).
+func registerProbes(mux *http.ServeMux, pool *pgxpool.Pool) {
+	mux.HandleFunc("/livez", livezHandler())
+	mux.HandleFunc("/healthz", healthzHandler(pool))
+}
+
+// livezHandler — liveness-проба: процесс жив и его HTTP-цикл отвечает.
+// Зависимости (БД, Redis) сознательно не проверяются: их недоступность —
+// не смерть процесса, 503 здесь говорил бы оркестратору «перезапусти»
+// при сбое PostgreSQL/Redis и маскировал бы причину рестартами воркеров.
+//
+// Отдельный признак «фоновый цикл не паниковал» не нужен: в каркасе такое
+// состояние не живёт дольше бюджета остановки — паника/ошибка/завершение
+// OnRun перехватываются serve и останавливают весь процесс (Run
+// возвращается, main выходит, рестарт-политика оркестратора поднимает
+// сервис), поэтому ответ этой пробы уже означает «Run активен» (в окне
+// graceful shutdown, ≤ ShutdownTimeout, процесс и так останавливается).
+func livezHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	}
+}
+
+// healthzHandler — readiness-проба (зависимости; её проверяет оператор
+// и мониторинг): сервис с пулом БД проверяет PostgreSQL коротким Ping —
+// недоступная БД видна как 503/unhealthy, а не «готов» с бесконечными
+// ошибками в логе воркера (C-03). Сервис без пула (Options без
+// OnDBPool/DSN) всегда готов: зависимостей нет.
+//
+// Redis в пробу не входит (T-110): клиенты Redis живут внутри OnRun
+// воркеров — каркас их не видит, а втягивание зависимости в путь пробы
+// меняло бы готовность на «обе инфраструктуры ответили» ценой новой
+// связности в каркасе. Потребителя «впускать задачи» тоже нет — воркеры
+// тянут их из стримов сами; доступность Redis видна по метрикам очередей
+// (crawler_queue_depth) и логам.
 func healthzHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pool != nil {

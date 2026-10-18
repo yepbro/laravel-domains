@@ -20,7 +20,7 @@
 // Хосты редиректов резолвятся «через тот же резолвер» (ТЗ 5.5 п. 2):
 // dnsclient с лимитами T-035 → адаптер httpworker.DNSLookup → кэш
 // CachingResolver. Каркас — internal/service: миграции, пул БД,
-// /healthz и /metrics, graceful shutdown.
+// пробы /livez + /healthz, /metrics, graceful shutdown.
 package main
 
 import (

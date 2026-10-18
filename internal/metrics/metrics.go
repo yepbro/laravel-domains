@@ -3,7 +3,7 @@
 // с единой меткой service.
 //
 // Каждый сервис создаёт собственный реестр New(name) — каркас
-// internal/service поднимает его вместе с /healthz и /metrics: адрес
+// internal/service поднимает его вместе с /livez + /healthz и /metrics: адрес
 // monitor — monitor.listen из конфигурации (ТЗ 5.10), адреса остальных
 // сервисов — METRICS_ADDR; Prometheus скрейпит каждый сервис отдельно,
 // агрегации через monitor нет. Реестр уже несёт метрики каркаса

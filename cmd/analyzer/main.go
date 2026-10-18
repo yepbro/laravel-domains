@@ -11,7 +11,7 @@
 // q:analyze — паттерном Processing (XACK только после записи в БД,
 // T-025). Фоновый цикл переанализа (T-074) ставит записи с устаревшим
 // rules_version в q:analyze без повторного скачивания. Каркас —
-// internal/service: миграции, пул БД (OnDBPool), /healthz и /metrics,
+// internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz, /metrics,
 // graceful shutdown.
 package main
 

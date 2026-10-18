@@ -279,7 +279,8 @@ syslog/journald и доступ алерту износа сервиса monitor
 systemctl list-units 'crawler-*'        # статус всех сервисов набора
 systemctl stop crawler.target           # весь набор (graceful: PartOf=)
 journalctl -t crawler-scheduler -f      # логи по SyslogIdentifier
-curl -fsS 127.0.0.1:9102/healthz        # healthz/metrics каждого сервиса
+curl -fsS 127.0.0.1:9102/livez         # liveness каждого сервиса
+curl -fsS 127.0.0.1:9102/healthz       # readiness (пул БД); /metrics — тот же порт
 systemctl kill -s HUP crawler-analyzer  # перезагрузка правил Laravel без рестарта
 /opt/crawler/bin/crawlerctl status      # CLI: статус, поиск, управление (ТЗ 4.1)
 ```

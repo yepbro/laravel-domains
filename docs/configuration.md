@@ -464,10 +464,10 @@ rules:
 | `listen` | `CRAWLER_MONITOR_LISTEN` | [host]:port | `:9100` |
 | `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `60s` (рекомендация: 30–60 с) |
 
-`listen` — адрес HTTP-эндпоинта самого сервиса monitor (`/healthz` +
-`/metrics`, его собственные метрики): у каждого сервиса проекта свой
-эндпоинт (ТЗ 5.9, адреса — в [`services.md`](services.md)), Prometheus
-скрейпит их по отдельности, агрегации через monitor нет.
+`listen` — адрес HTTP-эндпоинта самого сервиса monitor (`/livez` +
+`/healthz` + `/metrics`, его собственные метрики): у каждого сервиса
+проекта свой эндпоинт (ТЗ 5.9, адреса — в [`services.md`](services.md)),
+Prometheus скрейпит их по отдельности, агрегации через monitor нет.
 `zone_stats_interval` — период пакетного пересчёта счётчиков прогресса зон
 `zones.domains_total` / `domains_checked` (T-078; семантика —
 [`services.md`](services.md)) и одновременно период цикла алертов
@@ -528,7 +528,7 @@ rules:
 |---|---|
 | `APP_PG_DSN` | переопределяет `postgres.dsn`, если не задана `CRAWLER_POSTGRES_DSN`; используется `deploy/docker/compose.yaml` и Makefile |
 | `APP_CONFIG` | запасное имя переменной пути к файлу конфигурации |
-| `METRICS_ADDR` | адрес healthz/metrics конкретного сервиса (фиксированные порты dev-каркаса `:9101`…`:9106`); для `monitor` практически не применяется: адрес задаёт `monitor.listen` (важнее, переопределяется `CRAWLER_MONITOR_LISTEN`), `METRICS_ADDR` — страховка только при пустом `monitor.listen` |
+| `METRICS_ADDR` | адрес проб (livez/healthz) и /metrics конкретного сервиса (фиксированные порты dev-каркаса `:9101`…`:9106`); для `monitor` практически не применяется: адрес задаёт `monitor.listen` (важнее, переопределяется `CRAWLER_MONITOR_LISTEN`), `METRICS_ADDR` — страховка только при пустом `monitor.listen` |
 
 Новые имена (`CRAWLER_*`) всегда важнее устаревших. Дополнять стоит только
 ими; устаревшие поддерживаются, пока на них ссылается dev-окружение.

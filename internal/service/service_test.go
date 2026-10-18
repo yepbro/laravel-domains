@@ -467,18 +467,10 @@ func TestRunValidation(t *testing.T) {
 	}
 }
 
-// TestHealthzHandler — /healthz отражает готовность зависимостей:
-// без пула БД (сервис без OnDBPool/DSN) — 200; с пулом на недоступной
-// БД — 503, healthcheck оркестратора видит падение PostgreSQL.
-func TestHealthzHandler(t *testing.T) {
-	rec := httptest.NewRecorder()
-	healthzHandler(nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
-		t.Errorf("без пула: %d %q, want 200 %q", rec.Code, rec.Body.String(), "ok\n")
-	}
-
-	// Пул на гарантированно закрытый порт: Ping внутри пробы падает
-	// быстрее секундного таймаута хендлера.
+// newDeadPool — пул на гарантированно закрытый порт для readiness-проверок:
+// Ping внутри пробы падает быстрее её секундного таймаута.
+func newDeadPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
 	cfg, err := pgxpool.ParseConfig("postgres://nobody@127.0.0.1:1/crawler?sslmode=disable")
 	if err != nil {
 		t.Fatal(err)
@@ -488,12 +480,69 @@ func TestHealthzHandler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// TestHealthzHandler — /healthz отражает готовность зависимостей:
+// без пула БД (сервис без OnDBPool/DSN) — 200; с пулом на недоступной
+// БД — 503: падение PostgreSQL видно readiness-пробой (потребитель —
+// оператор/мониторинг; compose-healthcheck сервисов приложения
+// с T-110 проверяет /livez).
+func TestHealthzHandler(t *testing.T) {
+	rec := httptest.NewRecorder()
+	healthzHandler(nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
+		t.Errorf("без пула: %d %q, want 200 %q", rec.Code, rec.Body.String(), "ok\n")
+	}
+
+	pool := newDeadPool(t)
 
 	rec = httptest.NewRecorder()
 	healthzHandler(pool).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("с недоступной БД: %d %q, want 503", rec.Code, rec.Body.String())
+	}
+}
+
+// TestLivezHandler — liveness-проба всегда отвечает 200, пока процесс
+// жив: зависимостей не касается ни структурно (хендлер без параметров),
+// ни по смыслу — недоступные БД/Redis не повод считать процесс мёртвым
+// и требовать его рестарта.
+func TestLivezHandler(t *testing.T) {
+	rec := httptest.NewRecorder()
+	livezHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/livez", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
+		t.Errorf("livez: %d %q, want 200 %q", rec.Code, rec.Body.String(), "ok\n")
+	}
+}
+
+// TestRegisterProbes — маршрутизация проб на общем mux (путь Run):
+// ключевое разделение T-110 — живой процесс с мёртвой БД отвечает
+// /livez 200 (liveness) и /healthz 503 (readiness); посторонних
+// маршрутов пробы не занимают.
+func TestRegisterProbes(t *testing.T) {
+	pool := newDeadPool(t)
+
+	mux := http.NewServeMux()
+	registerProbes(mux, pool)
+
+	get := func(path string) int {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec.Code
+	}
+	if got := get("/livez"); got != http.StatusOK {
+		t.Errorf("/livez = %d, want 200 (liveness не зависит от БД)", got)
+	}
+	if got := get("/healthz"); got != http.StatusServiceUnavailable {
+		t.Errorf("/healthz = %d, want 503 (readiness: БД недоступна)", got)
+	}
+	if got := get("/metrics"); got != http.StatusNotFound {
+		t.Errorf("/metrics = %d, want 404 (пробы не занимают чужие маршруты)", got)
+	}
+	if got := get("/nope"); got != http.StatusNotFound {
+		t.Errorf("/nope = %d, want 404", got)
 	}
 }
 

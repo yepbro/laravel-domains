@@ -3,8 +3,8 @@
 // разбор пути → зона → разбор файла с sha256 в один проход → валидация →
 // staging → применение add/delete → отчёт ingest_files → processed/failed)
 // и держит фоновую очистку удалённых доменов (CleanupDeleted, T-020).
-// Каркас — internal/service: миграции, пул БД (OnDBPool), /healthz и
-// /metrics, graceful shutdown (ТЗ 3.4).
+// Каркас — internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz
+// и /metrics, graceful shutdown (ТЗ 3.4).
 package main
 
 import (

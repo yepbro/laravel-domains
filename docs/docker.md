@@ -35,6 +35,27 @@ make logs SERVICE=analyzer   # логи одного сервиса (tail + foll
 - `make up` идемпотентен: повторный запуск ничего не ломает.
 - `make clean && make up` поднимает окружение с нуля без ручных шагов.
 
+### Что проверяют healthchecks (T-110)
+
+- Инфраструктура — собственные проверки образов: `pg_isready` (postgres),
+  `redis-cli ping` (redis), резолв тестового имени (unbound).
+- Сервисы приложения (профиль app) — **liveness** `/livez` на порту метрик:
+  контейнер здоров, пока процесс жив и отвечает HTTP. Readiness `/healthz`
+  (пинг пула PostgreSQL, 503 при сбое) в healthcheck сознательно не
+  используется: задачи воркеры тянут из Redis-очередей сами, а при
+  недоступной БД стена unhealthy-воркеров лишь дублирует статус самого
+  postgres. Проверить готовность вручную (порты метрик наружу не
+  публикуются — изнутри контейнера сервиса или через tools):
+  `dc exec scheduler wget -qO- http://127.0.0.1:9102/healthz`
+  (порты — таблица «Метрики» в [`services.md`](services.md)).
+- `tools` — healthcheck отключён: контейнер живёт как `sleep infinity` без
+  HTTP-сервера, проверка была вечно красной (шум в `dc ps`, подвисший
+  `up --wait` с профилем tools).
+- `render` (профиль runtime) — healthcheck-а нет: образ headless-shell без
+  HTTP-клиента (wget/curl); живость процесса держит `restart: unless-stopped`
+  по коду выхода. Пробы доступны из сети crawler_net с хоста:
+  `wget -qO- http://172.28.100.15:9105/healthz`.
+
 ### Прямые команды docker compose
 
 Makefile — обёртка над compose. Канонический вызов из корня репозитория:

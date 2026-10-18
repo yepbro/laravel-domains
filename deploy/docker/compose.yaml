@@ -73,8 +73,15 @@ x-go-common: &go-common
       hard: 65535
   sysctls:
     net.ipv4.ip_local_port_range: "1024 65535"
+  # Healthcheck контейнеров приложения — liveness-проба /livez (T-110):
+  # контейнер здоров, пока процесс жив и отвечает HTTP. Readiness /healthz
+  # (пинг пула PostgreSQL, 503 при сбое) в healthcheck сознательно не
+  # используется: задачи воркеры тянут из Redis-очередей сами —
+  # маршрутизатора «впускать трафик» нет, а при недоступной БД стена
+  # unhealthy-воркеров лишь дублировала бы статус самого postgres
+  # (у него свой healthcheck); /healthz остаётся оператору и мониторингу.
   healthcheck:
-    test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:$${METRICS_PORT:-9090}/healthz || exit 1"]
+    test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:$${METRICS_PORT:-9090}/livez || exit 1"]
     interval: 15s
     timeout: 3s
     retries: 20
@@ -535,6 +542,11 @@ services:
       - ./var/incoming:/data/incoming
       - ./var/content:/data/content
     restart: "no"
+    # Healthcheck общего якоря здесь вечно красный: tools — sleep infinity,
+    # HTTP-сервера метрик в контейнере нет. Отключаем — иначе шум в dc ps
+    # и подвисший up --wait, если поднять профиль tools целиком (T-110).
+    healthcheck:
+      disable: true
     # Лимит выше, чем у сервисов: go vet/lint/test компилируют все пакеты
     # модуля, включая тяжёлые зависимости (go-redis, chromedp, prometheus).
     mem_limit: 2g

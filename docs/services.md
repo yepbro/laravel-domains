@@ -13,7 +13,7 @@ config.Load (в main)
       логгер (slog) + slog.SetDefault
       → миграции PostgreSQL (advisory-блокировка, ТЗ 6.3)
       → пул БД (Options.OnDBPool, internal/db)
-      → HTTP /healthz + /metrics (Options.MetricsAddr)
+      → HTTP /livez + /healthz + /metrics (Options.MetricsAddr)
       → Options.OnRun(ctx)                — рабочая логика
       ⟵ SIGTERM/SIGINT | ошибка OnRun | ошибка HTTP | завершение OnRun
       остановка (ТЗ 3.4):
@@ -73,11 +73,9 @@ if err := service.Run(service.Options{
 ## Метрики
 
 ТЗ 5.9: HTTP-эндпоинт Prometheus на каждом сервисе. Каркас поднимает
-`/healthz` и `/metrics` на `Options.MetricsAddr` (адрес `monitor` —
+`/livez`, `/healthz` и `/metrics` на `Options.MetricsAddr` (адрес `monitor` —
 `monitor.listen` из конфигурации, ТЗ 5.10, важнее `METRICS_ADDR`; адреса
 остальных сервисов — только `METRICS_ADDR`, dev-порты `:9101`…`:9106`).
-`/healthz` — readiness: сервис с пулом БД проверяет PostgreSQL коротким
-Ping (503 при недоступности), сервис без БД всегда отвечает 200.
 Prometheus скрейпит каждый сервис отдельно (dev-конфиг
 `deploy/docker/prometheus/prometheus.yml`, профиль `monitoring`):
 `monitor.listen` — адрес HTTP-эндпоинта самого сервиса monitor, а не
@@ -92,6 +90,33 @@ Prometheus скрейпит каждый сервис отдельно (dev-ко
 | http-worker | `:9104` | `METRICS_ADDR` |
 | render-worker | `:9105` | `METRICS_ADDR` |
 | analyzer | `:9106` | `METRICS_ADDR` |
+
+### Пробы живости и готовности (T-110)
+
+| Проба | Семантика | Что проверяет | Потребитель |
+|---|---|---|---|
+| `/livez` | liveness: процесс жив | HTTP-цикл процесса отвечает; зависимости не трогает | compose-healthcheck сервисов приложения (`docker ps`, `up --wait`), оператор |
+| `/healthz` | readiness: зависимости | пул PostgreSQL коротким Ping (503 при недоступности, C-03); сервис без пула — всегда 200 | оператор (`curl 127.0.0.1:91xx/healthz` в systemd-деплое, `dc exec` в dev) |
+
+`/livez` сознательно не ходит в БД/Redis: их недоступность — не смерть
+процесса, и рестартовать воркеры при сбое PostgreSQL значило бы лечить
+симптом. Отдельного признака «фоновый цикл не паниковал» каркас не
+держит: паника/ошибка/завершение `OnRun` и так останавливают весь
+процесс (`Run` возвращается, оркестратор рестартует по политике) —
+состояние «цикл умер, процесс жив» не живёт дольше бюджета остановки.
+
+`/healthz` в compose-healthcheck не стоит (T-110): задачи воркеры тянут
+из Redis-стримов сами — маршрутизатора «впускать трафик» нет, а при
+недоступной БД стена unhealthy-воркеров лишь дублировала бы статус
+самого postgres (у него свой healthcheck). Redis в пробу также не
+входит: клиенты Redis живут внутри `OnRun` воркеров (каркас их не
+видит), лёгкой готовой проверки нет, а втягивание зависимости в путь
+пробы меняло бы семантику readiness; доступность Redis для конвейера
+видна по `crawler_queue_depth` и логам. Для мониторинга живость сервиса
+фиксирует метрика `up` скрейпов Prometheus (`/metrics`), пробы он не
+читает. Systemd-деплой healthcheck-ов и watchdog-а не имеет
+(`Restart=on-failure` по коду выхода, T-085) — обе пробы там доступны
+оператору на loopback.
 
 Реестр метрик — `metrics.New(name)` (T-076): собственный
 `*prometheus.Registry` на сервис (одноимённые метрики разных сервисов не
@@ -185,7 +210,8 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 ## Рабочая логика сервисов
 
 Все семь сервисов реализованы и подключаются через `OnRun`/`OnDBPool`
-(сервис без `OnRun` тоже валиден: `/healthz` и `/metrics` подняты, он
+(сервис без `OnRun` тоже валиден: `/livez`, `/healthz` и `/metrics`
+подняты, он
 живёт до SIGTERM/SIGINT и корректно останавливается — каркас не требует
 рабочей логики).
 

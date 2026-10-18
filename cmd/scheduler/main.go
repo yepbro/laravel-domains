@@ -7,7 +7,7 @@
 // доменов с истёкшим lease (LeaseWatch, T-029). Публикация — под гейтом
 // backpressure (WatermarkPublisher, T-026). Очередь — Redis Streams
 // (internal/queue, клиент queue.NewClient/RedisQueue); каркас —
-// internal/service: миграции, пул БД (OnDBPool), /healthz и /metrics,
+// internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz, /metrics,
 // graceful shutdown (ТЗ 3.4).
 package main
 

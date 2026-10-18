@@ -13,7 +13,7 @@
 // dns.concurrency. Публикация q:http — под гейтом backpressure
 // (WatermarkPublisher, T-026). Подтверждение q:dns — паттерном Processing
 // (XACK только после записи в БД, T-025). Каркас — internal/service:
-// миграции, пул БД (OnDBPool), /healthz и /metrics, graceful shutdown.
+// миграции, пул БД (OnDBPool), пробы /livez + /healthz, /metrics, graceful shutdown.
 package main
 
 import (

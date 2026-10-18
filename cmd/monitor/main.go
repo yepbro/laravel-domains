@@ -5,7 +5,7 @@
 // (internal/monitor.AlertsLoop, T-080): доля ошибок DNS, переполнение
 // очередей, остановка прогресса, свободное место каталога контента,
 // износ NVMe (SMART). Каркас — internal/service: миграции, пул БД
-// (OnDBPool), /healthz и /metrics, graceful shutdown (ТЗ 3.4).
+// (OnDBPool), пробы /livez + /healthz, /metrics, graceful shutdown (ТЗ 3.4).
 package main
 
 import (
