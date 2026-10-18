@@ -99,6 +99,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 	defer func() { _ = store.Close() }()
+	// Словарь против новейшего пака (T-043): нечитаемые кадры прежнего
+	// словаря видны Warn-ом при старте, а не ошибками чтения контента.
+	content.WarnDictMismatch(store.Dir(), logger)
 
 	// Очередь: воркер только потребляет q:analyze и XACK (конец конвейера
 	// §7); циклу переанализа публикация нужна под гейтом backpressure

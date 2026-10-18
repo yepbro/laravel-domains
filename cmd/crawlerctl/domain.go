@@ -729,6 +729,7 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("domain: %w", err)
 		}
 		defer func() { _ = store.Close() }()
+		content.WarnDictMismatch(store.Dir(), slog.New(slog.NewTextHandler(stderr, nil)))
 		return writeDomainContent(ctx, store, info, cfg.Analyzer.LaravelMinScore, stdout, stderr)
 	}
 

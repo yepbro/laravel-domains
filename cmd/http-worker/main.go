@@ -132,6 +132,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 	defer func() { _ = store.Close() }()
+	// Словарь против новейшего пака (T-043): переобучение делает кадры
+	// прежнего словаря нечитаемыми — расхождение видно сразу при старте.
+	content.WarnDictMismatch(store.Dir(), logger)
 
 	// Контроль свободного места каталога контента (T-046, ТЗ 8):
 	// периодический наблюдатель горутиной (не зависит от цикла задач),

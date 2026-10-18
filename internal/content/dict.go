@@ -364,6 +364,47 @@ func SetDictFile(path string, log *slog.Logger) (bool, error) {
 	return true, nil
 }
 
+// WarnDictMismatch сверяет активный словарь пакета с dictID заголовка
+// новейшего пака каталога dir — диагностика при старте сервиса (T-043).
+// Декодер распаковывает кадры только зарегистрированным в процессе
+// словарём (SetDict/SetDictFile): после переобучения кадры, сжатые
+// прежним словарём, нечитаемы, и расхождение показывается оператору
+// сразу (Warn), а не списком ошибок чтения контента. Паков нет или
+// заголовок новейшего нечитаем — молча: это не расхождение словаря.
+// Реестра словарей в хранилище нет (docs/configuration.md) — Warn
+// призыв вручную вернуть прежний файл словаря.
+func WarnDictMismatch(dir string, log *slog.Logger) {
+	if log == nil || dir == "" {
+		return
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var max int32
+	for _, e := range ents {
+		if id, ok := packIDFromName(e.Name()); ok && id > max {
+			max = id
+		}
+	}
+	if max == 0 {
+		return // паков нет — сверять не с чем
+	}
+	f, err := os.Open(filepath.Join(dir, packFileName(max)))
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	hdr, err := readPackHeader(f)
+	if err != nil {
+		return
+	}
+	if id := activeDictID(); id != hdr.dictID {
+		log.Warn("словарь zstd не соответствует новейшему паку — кадры прежнего словаря нечитаемы (верните прежний файл словаря)",
+			"pack", max, "pack_dict_id", fmt.Sprintf("%08x", hdr.dictID), "active_dict_id", fmt.Sprintf("%08x", id))
+	}
+}
+
 // CompressWithDict сжимает src активным словарём пакета (SetDict /
 // SetDictFile); без установленного словаря — то же, что Compress:
 // запись контента не зависит от того, обучен ли уже словарь. Точка
