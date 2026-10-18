@@ -1540,7 +1540,7 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 	set("old", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d, last_checked_at = DATE '2025-04-01' WHERE zone_id = $1 AND label = 'old'`, alive, done), zone)
 	set("fresh", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d, last_checked_at = DATE '2026-10-01' WHERE zone_id = $1 AND label = 'fresh'`, alive, done), zone)
 	set("never", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d WHERE zone_id = $1 AND label = 'never'`, alive, done), zone)
-	set("pending", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = 0, last_checked_at = DATE '2025-04-01' WHERE zone_id = $1 AND label = 'pending'`, alive), zone)
+	set("pending", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d, last_checked_at = DATE '2025-04-01' WHERE zone_id = $1 AND label = 'pending'`, alive, int16(model.CheckStatePending)), zone)
 	set("gone", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d, last_checked_at = DATE '2025-04-01' WHERE zone_id = $1 AND label = 'gone'`, del, done), zone)
 
 	state := func(label string) (int16, int16) {
