@@ -161,6 +161,40 @@ func TestTrackerDeliveredSameSignatureNotTrackedAgain(t *testing.T) {
 	}
 }
 
+// TestTrackerForgetDropsDelivered — память о выданных ограничена
+// существующими путями: путь исчез (Remove/Rename — в том числе перенос
+// обработанного файла в processed/) → запись о выданном убирается,
+// иначе карта delivered росла бы неограниченно по числу различных
+// путей у долгоживущего сервиса (ING-P3-3). Повторно появившийся файл
+// с той же сигнатурой снова станет кандидатом; повторная обработка
+// завершится дублем по sha256 в БД (T-021).
+func TestTrackerForgetDropsDelivered(t *testing.T) {
+	clock := newFakeClock()
+	tr := newTracker(10*time.Second, clock.Now)
+
+	mtime := time.Unix(1000, 0)
+	tr.observe("f.txt", 42, mtime, false)
+	clock.Add(10 * time.Second)
+	if _, ok := tr.ready("f.txt", 42, mtime); !ok {
+		t.Fatal("файл не выдан")
+	}
+	if tr.observe("f.txt", 42, mtime, false) {
+		t.Fatal("выданный файл не должен становиться кандидатом повторно")
+	}
+
+	tr.forget("f.txt") // файл ушёл из наблюдаемого каталога
+	if len(tr.delivered) != 0 {
+		t.Errorf("delivered = %v, want пусто после forget", tr.delivered)
+	}
+	if !tr.observe("f.txt", 42, mtime, false) {
+		t.Error("повторно появившийся файл с той же сигнатурой должен стать кандидатом")
+	}
+	clock.Add(10 * time.Second)
+	if _, ok := tr.ready("f.txt", 42, mtime); !ok {
+		t.Error("повторно появившийся файл не выдан после окна стабильности")
+	}
+}
+
 func TestTrackerPathsSorted(t *testing.T) {
 	clock := newFakeClock()
 	tr := newTracker(time.Second, clock.Now)
