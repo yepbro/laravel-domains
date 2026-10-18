@@ -73,14 +73,18 @@ const (
 // ORDER BY по ключу домена (совпадает с PK, ТЗ 6.1) даёт
 // детерминированные пачки. Сравнение date < timestamptz — неявный
 // привод даты к моменту: гранулярность колонки — день (ТЗ 6.1),
-// «старше интервала» выполняется с точностью до дня.
+// «старше интервала» выполняется с точностью до дня. Внешний WHERE
+// перепроверяет ВСЕ условия отбора на актуальной версии строки —
+// включая возраст last_checked_at (симметрия с lease.go: гонка со
+// свежей записью результата между выборкой и блокировкой не переведёт
+// заново проверенный домен).
 const recheckUpdateSQL = "UPDATE domains AS d " +
 	"SET check_state = $1, queued_at = NULL " +
 	"FROM (SELECT zone_id, id FROM domains " +
 	"WHERE check_state = $2 AND status <> $3 AND last_checked_at < $4 " +
 	"ORDER BY zone_id, id LIMIT $5) AS b " +
 	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3"
+	"AND d.check_state = $2 AND d.status <> $3 AND d.last_checked_at < $4"
 
 // RecheckOptions — параметры перепроверки; нулевые значения заменяются
 // дефолтами (withDefaults, стиль ingest.CleanupOptions).
