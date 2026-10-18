@@ -689,7 +689,10 @@ func TestHTTPWorker_E2E(t *testing.T) {
 		if pageHash == nil {
 			t.Fatal("хэш страницы не зафиксирован (проверка bare→www не прошла)")
 		}
-		before, _ := contentRowByHash(t, env.pool, *pageHash)
+		before, ok := contentRowByHash(t, env.pool, *pageHash)
+		if !ok {
+			t.Fatal("контент страницы не записан в contents до повтора")
+		}
 		if before.refc != 1 {
 			t.Fatalf("refcount до повтора = %d, want 1", before.refc)
 		}

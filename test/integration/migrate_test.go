@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -65,6 +66,12 @@ func latestEmbeddedVersion(t *testing.T) uint {
 	return max
 }
 
+// schemaSeq — счётчик схем внутри одного тест-бинаря: имя схемы
+// уникально на каждый вызов withTestSchema, иначе второй env внутри
+// одного теста (TestContent_Compaction) делал DROP SCHEMA первого, а
+// t.Parallel был бы небезопасен.
+var schemaSeq atomic.Uint64
+
 // withTestSchema создаёт изолированную схему и возвращает DSN с search_path
 // на неё плюс функцию очистки.
 func withTestSchema(t *testing.T) (string, func()) {
@@ -76,7 +83,7 @@ func withTestSchema(t *testing.T) (string, func()) {
 	}
 	defer pool.Close()
 
-	name := fmt.Sprintf("mig_test_%d", os.Getpid())
+	name := fmt.Sprintf("mig_test_%d_%d", os.Getpid(), schemaSeq.Add(1))
 	if _, err := pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+name+" CASCADE"); err != nil {
 		t.Fatalf("drop schema: %v", err)
 	}

@@ -36,9 +36,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -59,7 +59,6 @@ import (
 	"crawler/internal/httpworker"
 	"crawler/internal/idn"
 	"crawler/internal/ingest"
-	"crawler/internal/metrics"
 	"crawler/internal/model"
 	"crawler/internal/monitor"
 	"crawler/internal/queue"
@@ -190,10 +189,22 @@ func accRulesDir(t *testing.T) string {
 	return "../../rules"
 }
 
-// accModifiedRulesDir — копия рабочего набора с правилом-пробой, которое
-// никогда не срабатывает: канонический хэш (Version) меняется, состав
-// срабатываний на образцах — нет (переанализ TestAccept04 проверяет
-// обновление правил без изменения выводов).
+// accModifiedRulesDir — копия рабочего набора с правилом-пробой,
+// срабатывающей ровно на одном образце конвейера (symfony-negative):
+// канонический хэш (Version) меняется, а reanalyze обязан переприменить
+// правила — у образца-мишени появляется срабатывание пробы и растёт
+// score, у остальных выводы прежние (TestAccept04).
+const (
+	// accProbeRule — id правила-пробы в копии набора.
+	accProbeRule = "t094_reanalyze_probe"
+	// accProbeSample — образец-мишень пробы: устойчивая подстрока его
+	// HTML не встречается в остальных образцах и правилах корпуса.
+	accProbeSample = "symfony-negative"
+	// accProbeWeight — вес пробы: заметен в score (noisy-OR), но не
+	// переводит слабый негатив через порог is_laravel 0.6.
+	accProbeWeight = 0.05
+)
+
 func accModifiedRulesDir(t *testing.T) string {
 	t.Helper()
 	src := accRulesDir(t)
@@ -215,11 +226,11 @@ func accModifiedRulesDir(t *testing.T) string {
 		}
 	}
 	probe := "rules:\n" +
-		"  - id: t094_no_fire_probe\n" +
-		"    description: приёмочная проба T-094 — никогда не срабатывает, меняет только версию набора\n" +
+		"  - id: " + accProbeRule + "\n" +
+		"    description: приёмочная проба T-094 — срабатывает на образце " + accProbeSample + ", доказывая переприменение правил после reanalyze\n" +
 		"    target: html\n" +
-		"    regex: '__t094_acceptance_no_fire__'\n" +
-		"    weight: 0.05\n"
+		"    regex: 'Hello Symfony!'\n" +
+		"    weight: " + fmt.Sprintf("%g", accProbeWeight) + "\n"
 	if err := os.WriteFile(filepath.Join(dst, "t094_probe.yaml"), []byte(probe), 0o644); err != nil {
 		t.Fatalf("правило-проба: %v", err)
 	}
@@ -881,6 +892,16 @@ func accChromiumWS() string {
 	return "ws://172.28.100.14:9222"
 }
 
+// accMonitorMetricsURL — адрес /metrics реального сервиса monitor: имя
+// compose-сервиса через docker DNS (его скрейбит Prometheus dev-стенда,
+// deploy/docker/prometheus/prometheus.yml), переопределяется окружением.
+func accMonitorMetricsURL() string {
+	if u := os.Getenv("CRAWLER_MONITOR_METRICS_URL"); u != "" {
+		return u
+	}
+	return "http://monitor:9100/metrics"
+}
+
 // TestAccept03_SPADomCookiesContent — §11.4 п. 3: «Для SPA-страниц
 // сохраняется итоговый DOM и cookies; для остальных — HTML; дедупликация
 // и сжатие работают; контент можно прочитать обратно». SPA-сценарий
@@ -1045,12 +1066,14 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 
 // TestAccept04_ReanalyzeNoRefetch — §11.4 п. 4: «…изменение правил +
 // reanalyze обновляет результаты без повторного скачивания». Анализ
-// рабочих образцов первым набором → правила меняются (версия набора
-// растёт, выводы — нет: проба не срабатывает) → ReanalyzeOnce публикует
-// q:analyze → воркер со вторым набором перезаписывает findings. Следы
-// повторного скачивания проверяются отсутствием: эпизоды HTTP не
-// запускаются, строки результатов не меняются (checked_at, content_hash),
-// хранилище не растёт.
+// рабочих образцов первым набором → правила меняются (добавляется проба,
+// срабатывающая на одном из образцов) → ReanalyzeOnce публикует
+// q:analyze → воркер со вторым набором перезаписывает findings: у
+// образца-мишени появляются срабатывание пробы и новый score (правила
+// реально переприменены, а не перештампована rules_version), у остальных
+// выводы прежние. Следы повторного скачивания проверяются отсутствием:
+// эпизоды HTTP не запускаются, строки результатов не меняются
+// (checked_at, content_hash), хранилище не растёт.
 func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newAccEnv(t)
@@ -1101,8 +1124,9 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	httpBefore := streamLen(t, env.rdb, queue.StreamHTTP)
 	renderBefore := streamLen(t, env.rdb, queue.StreamRender)
 
-	// Правила изменились: копия набора с никогда не срабатывающей пробой —
-	// канонический хэш (Version) другой, выводы на образцах прежние.
+	// Правила изменились: копия набора с пробой, срабатывающей на
+	// symfony-negative, — канонический хэш (Version) другой, у мишени
+	// должен появиться новый сигнал и вырасти score.
 	loader2, err := rules.NewReloader(accModifiedRulesDir(t), nil)
 	if err != nil {
 		t.Fatalf("изменённый набор правил: %v", err)
@@ -1130,7 +1154,11 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	// Воркер второго набора перепотребляет q:analyze.
 	accAnalyze(ctx, t, env, an2, len(labels))
 
-	// findings перезаписаны новой версией, выводы прежние (проба молчит).
+	// findings перезаписаны новой версией; правила реально переприменены:
+	// у образца-мишени пробы срабатывание появилось и score пересчитан
+	// (noisy-OR с весом пробы), у остальных выводы прежние. Заглушка
+	// «обновили только штамп rules_version, переиспользовав signals/score»
+	// здесь падает.
 	for _, l := range labels {
 		fs := accFindings(t, env.pool, zoneID, ids[l])
 		sample := accSampleByID(t, l)
@@ -1140,15 +1168,27 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 			t.Errorf("%s: findings после переанализа = %d строк, хочу 1", l, len(fs))
 			continue
 		}
-		if got := len(accFiredRules(t, fs[0].signals)); got != len(sample.Expect.Rules) {
-			t.Errorf("%s: срабатываний в signals = %d, хочу %d", l, got, len(sample.Expect.Rules))
+		fired := accFiredRules(t, fs[0].signals)
+		wantScore := *sample.Expect.Score
+		wantFired := len(sample.Expect.Rules)
+		if l == accProbeSample {
+			wantFired++
+			wantScore = 1 - (1-*sample.Expect.Score)*(1-accProbeWeight)
+			if !fired[accProbeRule] {
+				t.Errorf("%s: в signals нет пробы %s — правила не переприменены (перештамповка rules_version?)", l, accProbeRule)
+			}
+		} else if fired[accProbeRule] {
+			t.Errorf("%s: проба %s сработала вне образца-мишени %s", l, accProbeRule, accProbeSample)
+		}
+		if got := len(fired); got != wantFired {
+			t.Errorf("%s: срабатываний в signals = %d (%v), хочу %d", l, got, fired, wantFired)
 		}
 		for _, f := range fs {
 			if f.rulesVersion != v2 {
 				t.Errorf("%s: rules_version срабатывания = %d, хочу %d (новый набор)", l, f.rulesVersion, v2)
 			}
-			if math.Abs(float64(f.score)-*sample.Expect.Score) > accScoreTol {
-				t.Errorf("%s: score изменился: %.4f, хочу ≈%.3f (проба не срабатывает)", l, f.score, *sample.Expect.Score)
+			if math.Abs(float64(f.score)-wantScore) > accScoreTol {
+				t.Errorf("%s: score после переанализа = %.4f, хочу ≈%.3f", l, f.score, wantScore)
 			}
 		}
 	}
@@ -1448,20 +1488,30 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Errorf("ZoneStatsLoop завершился с ошибкой: %v", err)
 	}
 
-	// Метрики: экспозиция реестра сервиса (metrics.New — то, что каркас
-	// T-012 отдаёт на /metrics и скрейбит Prometheus dev-стека; сами
-	// приборы этапов — T-077, здесь доступность экспозиции).
-	reg := metrics.New("monitor")
-	handler := metrics.Handler(reg)
-	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("/metrics: код %d, хочу 200", w.Code)
+	// Метрики: реальная экспозиция работающего сервиса monitor — то, что
+	// скрейбит Prometheus dev-стенда (docker DNS monitor:9100, как в
+	// deploy/docker/prometheus/prometheus.yml). HTTP-запрос к сервису,
+	// а не локальный реестр: забытый маршрут, неверный порт или молчащий
+	// хендлер здесь падают по вине продового кода. Если сервис приложения
+	// не поднят (make test-integration запускает только инфраструктуру
+	// и testbed) — честный пропуск, а не тавтология «свой реестр → свой
+	// хендлер».
+	url := accMonitorMetricsURL()
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Skipf("сервис monitor недоступен (%s: %v) — поднимите профиль app (make up): реальная экспозиция /metrics требует работающего сервиса", url, err)
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, `crawler_service_up{service="monitor"} 1`) {
-		t.Errorf("экспозиция без crawler_service_up{service=\"monitor\"}:\n%s", body)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		t.Fatalf("чтение %s: %v", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/metrics сервиса monitor: код %d, хочу 200", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), `crawler_service_up{service="monitor"} 1`) {
+		t.Errorf("экспозиция monitor без crawler_service_up{service=\"monitor\"} 1:\n%s", string(body))
 	}
 }
 
@@ -1490,7 +1540,7 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 	set("old", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d, last_checked_at = DATE '2025-04-01' WHERE zone_id = $1 AND label = 'old'`, alive, done), zone)
 	set("fresh", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d, last_checked_at = DATE '2026-10-01' WHERE zone_id = $1 AND label = 'fresh'`, alive, done), zone)
 	set("never", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d WHERE zone_id = $1 AND label = 'never'`, alive, done), zone)
-	set("pending", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = 0, last_checked_at = DATE '2025-04-01' WHERE zone_id = $1 AND label = 'pending'`, alive), zone)
+	set("pending", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d, last_checked_at = DATE '2025-04-01' WHERE zone_id = $1 AND label = 'pending'`, alive, int16(model.CheckStatePending)), zone)
 	set("gone", fmt.Sprintf(`UPDATE domains SET status = %d, check_state = %d, last_checked_at = DATE '2025-04-01' WHERE zone_id = $1 AND label = 'gone'`, del, done), zone)
 
 	state := func(label string) (int16, int16) {
@@ -1652,6 +1702,13 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	if len(got) != len(want) {
 		t.Fatalf("множество доменов изменилось: %v против %v — потеря данных", got, want)
 	}
+	// Состав, а не только размер: перевыбор чужих/дублей при том же
+	// размере — тоже потеря данных.
+	for id := range want {
+		if !got[id] {
+			t.Fatalf("домен %d потерян при переиздании: %v против %v", id, got, want)
+		}
+	}
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, batch2); err != nil {
 		t.Fatal(err)
 	}
@@ -1790,8 +1847,8 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 			t.Fatalf("findings = %d, хочу 1", len(findings))
 		}
 		first := dinfoMap(t, findings[0], "findings[0]")
-		if ok, _ := first["is_laravel"].(bool); !ok {
-			t.Error("уверенное срабатывание не помечено is_laravel")
+		if v, ok := first["is_laravel"].(bool); !ok || !v {
+			t.Errorf("уверенное срабатывание: is_laravel = %v (present=%v), хочу true", first["is_laravel"], ok)
 		}
 	})
 

@@ -440,6 +440,7 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("инициализация golang-migrate: %v", err)
 	}
+	defer m.Close() //nolint:errcheck // тестовое соединение — как db выше
 	if err := m.Migrate(zoneSubpartitioningVersion - 1); err != nil {
 		t.Fatalf("откат к версии %d: %v", zoneSubpartitioningVersion-1, err)
 	}
