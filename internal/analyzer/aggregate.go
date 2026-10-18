@@ -38,6 +38,11 @@
 // Домен без is_laravel-строк не попадает в laravel_domains (порог §13.1):
 // пересчёт удаляет существующую строку — прежние признаки в текущем
 // эпизоде не подтвердились (§3.5: хранится только последний результат).
+// Переходы наличия строки пишутся в append-only журнал laravel_history
+// (T-118, appeared/lost) — только по свежим эпизодам HTTP
+// (queue.Result.Fresh): переанализ (T-074) пересчитывает тот же
+// скачанный контент по новым правилам и фактом о сайте не является;
+// детали семантики — в комментарии aggregateDomain.
 //
 // Согласование параллельных доставок домена: воркер обрабатывает до
 // Concurrency доставок одновременно, инстансов может быть несколько
@@ -97,6 +102,22 @@ var (
 	// строки — не ошибка (DELETE 0).
 	aggregateDeleteSQL = "DELETE FROM laravel_domains " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8"
+
+	// aggregateExistsSQL — была ли строка домена до пересчёта: переход
+	// appeared/lost — сравнение «было» и «стало» (T-118). По PK —
+	// индексный lookup; выполняется под advisory-блокировкой домена,
+	// параллельный пересчёт не вставит между проверкой и записью.
+	aggregateExistsSQL = "SELECT EXISTS (" +
+		"SELECT 1 FROM laravel_domains WHERE zone_id = $1::int2 AND domain_id = $2::int8)"
+
+	// aggregateHistorySQL — журнал переходов appeared/lost (T-118,
+	// аналог laravel_histories larasites): append-only, changed_at —
+	// время транзакции (now() сервера БД). Пишется только при fresh —
+	// свежем эпизоде HTTP (queue.Result.Fresh): переанализ того же
+	// контента по новым правилам — не факт о сайте (см. док-комментарий
+	// пакета).
+	aggregateHistorySQL = "INSERT INTO laravel_history (zone_id, domain_id, appeared) " +
+		"VALUES ($1::int2, $2::int8, $3)"
 )
 
 // aggregateDomain пересчитывает строку laravel_domains домена по его
@@ -104,7 +125,17 @@ var (
 // findings: SELECT видит записи этой транзакции, сбой любого шага
 // откатывает findings и агрегат вместе. version — версия набора доставки
 // (rules.Set.Version): ей штампуется пересчёт.
-func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int64, version int32) error {
+//
+// fresh — доставка свежего эпизода HTTP (queue.Result.Fresh: публикация
+// HTTP/рендер-этапа; переанализ T-074 — false). При смене наличия строки
+// laravel_domains и fresh в laravel_history пишется переход (T-118):
+// появление — appeared=true, исчезновение — false. Без fresh история не
+// пишется: пересчёт по новому набору правил и флап borderline-скоров
+// вокруг порога (T-116) — не события о сайте. Семантика привязана к
+// строке, а не к сайту: «ушёл при переанализе, вернулся свежим
+// эпизодом» оставит один appeared (появление) без парного lost —
+// плата за защиту от шума правил, тренд по множеству доменов верен.
+func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int64, version int32, fresh bool) error {
 	// Сначала блокировка: пересчёты одного домена выстраиваются в очередь,
 	// второй читает findings после фиксации первого.
 	if _, err := tx.Exec(ctx, aggregateLockSQL, domainID); err != nil {
@@ -121,9 +152,24 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 		return fmt.Errorf("чтение срабатываний: %w", err)
 	}
 
+	// Наличие строки до пересчёта — для перехода appeared/lost (T-118);
+	// под advisory-блокировкой конкурентный пересчёт не изменит его
+	// между проверкой и записью.
+	var existed bool
+	if err := tx.QueryRow(ctx, aggregateExistsSQL, zoneID, domainID).Scan(&existed); err != nil {
+		return fmt.Errorf("чтение строки домена: %w", err)
+	}
+
 	if agg.findings == 0 {
-		if _, err := tx.Exec(ctx, aggregateDeleteSQL, zoneID, domainID); err != nil {
+		tag, err := tx.Exec(ctx, aggregateDeleteSQL, zoneID, domainID)
+		if err != nil {
 			return fmt.Errorf("удаление строки домена: %w", err)
+		}
+		if tag.RowsAffected() > 0 && fresh && existed {
+			// Строка была и исчезла — lost (только свежий эпизод, T-118).
+			if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, false); err != nil {
+				return fmt.Errorf("запись истории (lost): %w", err)
+			}
 		}
 		return nil
 	}
@@ -135,6 +181,12 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	}
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("запись строки домена: затронуто %d строк", tag.RowsAffected())
+	}
+	if !existed && fresh {
+		// Строки не было и появилась — appeared (только свежий эпизод).
+		if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, true); err != nil {
+			return fmt.Errorf("запись истории (appeared): %w", err)
+		}
 	}
 	return nil
 }

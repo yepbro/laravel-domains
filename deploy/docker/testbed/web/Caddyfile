@@ -344,6 +344,22 @@ https://laravel-11-dev-spa.crawl.test {
     import sample_laravel-11-dev-spa
 }
 
+(sample_laravel-11-stateless-api) {
+    header +Content-Type "application/json"
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6dlE0YXJzR2VxOFo2b0k9%3D; expires=Mon, 19 Oct 2026 12:00:00 GMT; path=/; secure; samesite=lax"
+    root * /srv/samples/laravel-11-stateless-api
+    file_server
+}
+
+http://laravel-11-stateless-api.crawl.test {
+    import sample_laravel-11-stateless-api
+}
+
+https://laravel-11-stateless-api.crawl.test {
+    tls internal
+    import sample_laravel-11-stateless-api
+}
+
 (sample_laravel-11-vite) {
     header +Set-Cookie "XSRF-TOKEN=eyJpdiI6ZmFrZVRva2VuOjE2Oml7InZhbCI6IjEyMzQ1Njc4OTAiLCJpdiI6ImFiY2RlZmFhYmNkZWYiLCJ0YWciOiIifQ==; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; secure; samesite=lax"
     header +Set-Cookie "laravel_session=eyJpdiI6c2Vzc2lvbjoxNjp7ImlzcyI6Imh0dHBzOi8vZXhhbXBsZSJ9; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; httponly; samesite=lax"
@@ -359,6 +375,22 @@ http://laravel-11-vite.crawl.test {
 https://laravel-11-vite.crawl.test {
     tls internal
     import sample_laravel-11-vite
+}
+
+(sample_laravel-12-api-404) {
+    header +Content-Type "application/json"
+    header +Set-Cookie "XSRF-TOKEN=eyJpdiI6ZEZyYWdtVFlaVFlaM2hRN0E9%3D; expires=Mon, 19 Oct 2026 12:00:00 GMT; path=/; secure; samesite=lax"
+    root * /srv/samples/laravel-12-api-404
+    file_server
+}
+
+http://laravel-12-api-404.crawl.test {
+    import sample_laravel-12-api-404
+}
+
+https://laravel-12-api-404.crawl.test {
+    tls internal
+    import sample_laravel-12-api-404
 }
 
 (sample_laravel-12-vite-livewire) {

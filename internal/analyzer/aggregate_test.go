@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"crawler/internal/model"
+	"crawler/internal/queue"
 )
 
 // --- фейковый пул: laravel_domains (расширение anFakePool) ----------------------
@@ -525,7 +526,7 @@ func TestAggregate_CtxCancelled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := aggregateDomain(ctx, tx, anKey.zone, anKey.domain, 1001); err == nil {
+	if err := aggregateDomain(ctx, tx, anKey.zone, anKey.domain, 1001, false); err == nil {
 		t.Fatal("отменённый ctx — ошибка агрегации")
 	}
 }
@@ -538,6 +539,99 @@ func mustMask(t *testing.T, ids ...int) model.DNSMask {
 		t.Fatalf("NewDNSMask: %v", err)
 	}
 	return m
+}
+
+// --- история детекции appeared/lost (T-118) -----------------------------------
+
+// anHistorySnapshot — снапшот журнала переходов фикстуры.
+func anHistorySnapshot(p *anFakePool) []anHistoryRec {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]anHistoryRec(nil), p.history...)
+}
+
+// TestAggregate_History — семантика журнала переходов laravel_history
+// (T-118): запись только при свежем эпизоде HTTP (queue.Result.Fresh) —
+// появление строки → appeared=true, исчезновение → false; повторный
+// пересчёт без смены наличия строки историю не пишет; переанализ
+// (fresh=false) не пишет ничего — смена правил не факт о сайте.
+func TestAggregate_History(t *testing.T) {
+	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
+	ctx := context.Background()
+
+	runTask := func(task queue.Result) {
+		t.Helper()
+		if _, err := f.w.ProcessResult(ctx, task); err != nil {
+			t.Fatalf("ProcessResult: %v", err)
+		}
+	}
+
+	// Эпизод 1 (fresh): страница с признаками → строка появилась.
+	laravelHash := anTestHash(7)
+	f.store.blocks[laravelHash] = anPageHTML()
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
+	task := anTask
+	task.Fresh = true
+	runTask(task)
+
+	hist := anHistorySnapshot(f.pool)
+	if len(hist) != 1 || !hist[0].appeared || hist[0].domain != anKey.domain {
+		t.Fatalf("история после появления = %+v, хочу одну запись appeared=true", hist)
+	}
+
+	// Эпизод 2 (fresh): те же признаки — строка есть, перехода нет.
+	runTask(task)
+	if hist = anHistorySnapshot(f.pool); len(hist) != 1 {
+		t.Fatalf("повторный пересчёт без смены наличия: история = %+v, хочу без изменений", hist)
+	}
+
+	// Эпизод 3 (fresh): страница без признаков — findings пусты, строка
+	// удалена → appeared=false.
+	plainHash := anTestHash(8)
+	f.store.blocks[plainHash] = []byte(`<html><body>nothing here</body></html>`)
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t), plainHash[:])
+	runTask(task)
+
+	hist = anHistorySnapshot(f.pool)
+	if len(hist) != 2 || hist[1].appeared {
+		t.Fatalf("история после исчезновения = %+v, хочу вторую запись appeared=false", hist)
+	}
+	if _, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain); ok {
+		t.Fatal("строка laravel_domains не удалена")
+	}
+
+	// Переанализ появления (fresh=false): findings появятся, строка
+	// запишется — история не растёт (смена правил не факт о сайте).
+	rKey := anRowKey{zone: 3, domain: 43, subdomain: 1, variant: 0}
+	f.pool.seedResult(rKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
+	rTask := queue.Result{
+		ZoneID: rKey.zone, DomainID: rKey.domain,
+		SubdomainID: rKey.subdomain, Variant: 0, Name: "reanalyzed.example",
+	}
+	runTask(rTask)
+	if _, ok := anDomainSnapshot(f.pool, rKey.zone, rKey.domain); !ok {
+		t.Fatal("строка переанализированного домена не записана")
+	}
+	if hist = anHistorySnapshot(f.pool); len(hist) != 2 {
+		t.Fatalf("переанализ-появление пишeт историю: %+v, хочу без изменений (fresh=false)", hist)
+	}
+
+	// Переанализ исчезновения (fresh=false): findings пусты, строка
+	// удалена — история не растёт.
+	f.pool.seedResult(rKey, anHeaders(t), anCookies(t), plainHash[:])
+	runTask(rTask)
+	if _, ok := anDomainSnapshot(f.pool, rKey.zone, rKey.domain); ok {
+		t.Fatal("строка переанализированного домена не удалена")
+	}
+	if hist = anHistorySnapshot(f.pool); len(hist) != 2 {
+		t.Fatalf("переанализ-исчезновение пишет историю: %+v, хочу без изменений (fresh=false)", hist)
+	}
+
+	// Пустой fresh-эпизод без строки (DELETE 0): перехода нет — записи нет.
+	runTask(task)
+	if hist = anHistorySnapshot(f.pool); len(hist) != 2 {
+		t.Fatalf("удаление отсутствующей строки пишет историю: %+v, хочу без изменений", hist)
+	}
 }
 
 // anStrEq / anStrDeref — сравнение и печать NULL-границ.

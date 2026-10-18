@@ -27,7 +27,9 @@ infinite-redirect IN A 172.28.100.13
 js-redirect IN A 172.28.100.12
 laravel-10-breeze-login IN A 172.28.100.12
 laravel-11-dev-spa IN A 172.28.100.12
+laravel-11-stateless-api IN A 172.28.100.12
 laravel-11-vite IN A 172.28.100.12
+laravel-12-api-404 IN A 172.28.100.12
 laravel-12-vite-livewire IN A 172.28.100.12
 laravel-5-8-legacy IN A 172.28.100.12
 laravel-6-welcome IN A 172.28.100.12

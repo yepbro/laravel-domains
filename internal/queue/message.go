@@ -165,6 +165,14 @@ type Result struct {
 	SubdomainID int16         `json:"subdomain_id"`
 	Variant     model.Variant `json:"variant"`        // 0 основной, 1 http (ТЗ 6.1)
 	Name        string        `json:"name,omitempty"` // полное имя, punycode
+	// Fresh — строка записана новым эпизодом HTTP-проверки (T-118):
+	// публикация HTTP/рендер-этапом (в той же транзакции эпизода) — true,
+	// переанализ по сохранённому контенту (ReanalyzeLoop, T-074) — false.
+	// Читает анализатор: история детекции laravel_history (appeared/lost)
+	// пишется только по свежим эпизодам — смена правил не факт о сайте.
+	// omitempty: записи до T-118 читаются как false (переанализ), старые
+	// и новые форматы совместимы без миграции стрима.
+	Fresh bool `json:"fresh,omitempty"`
 }
 
 // Streams — стримы результата: формат один, рендер и анализ публикуют

@@ -178,6 +178,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_stage_errors_total` | counter | `stage`, `type` | http-worker (`timeout`/`redirects`/`tls`/`body`/`network` — классы ErrorClass, §8), render-worker (`task`/`context`/`browser` — классы render.Class) | каждая ошибочная проверка протокола / неподтверждённая доставка рендера |
 | `crawler_domain_status_total` | counter | `type` | dns-worker (`not_delegated`/`delegated_no_address`/`temp_error`/`invalid` — диагноз ядовитой строки, T-109), http-worker (`alive`/`no_http`/`temp_error`) | финальный статус домена терминальной ветки эпизода (ТЗ 6.2) |
 | `crawler_laravel_near_findings` | gauge | — | monitor (T-115) | находки Laravel в серой зоне порога `[min_score/2, min_score)` — материал калибровки правил |
+| `crawler_laravel_appeared_total` / `crawler_laravel_lost_total` | gauge | — | monitor (T-118) | кумулятивные появления/исчезновения строк `laravel_domains` (журнал `laravel_history`, свежие эпизоды HTTP); монотонны — counter-семантика |
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
@@ -444,7 +445,11 @@ T-109) и повторных проверок `temp_error`
   при пустом итоге (§3.5 перезапись) → пересчёт агрегата `laravel_domains`
   (T-072: максимальный score, объединённый диапазон версий,
   `found_on_mask` — бит № = `subdomains.id` у уверенных срабатываний;
-  advisory-блокировка домена согласует параллельные доставки); повторные
+  advisory-блокировка домена согласует параллельные доставки); при
+  смене наличия строки и свежем эпизоде HTTP (`Result.Fresh` в задаче —
+  ставят HTTP/рендер-этапы) той же транзакцией пишется журнал детекции
+  `laravel_history` appeared/lost (T-118: переанализ по старому
+  контенту историю не пишет — смена правил не факт о сайте); повторные
   доставки идемпотентны (ТЗ 3.4) — детали в
   [`analyzer.md`](analyzer.md);
 - analyzer ничего не публикует (конец конвейера §7) — гейт backpressure
@@ -483,6 +488,16 @@ T-109) и повторных проверок `temp_error`
 строк поимённо — `crawlerctl near`. Стабильная серая зона — норма
 (слабые признаки частых не-Laravel стеков), всплеск после смены правил —
 сигнал деградации точности (материал T-116/T-117).
+
+Четвёртый цикл — счётчики истории детекции
+(`internal/monitor/historystats.go`, T-118): пара gauge
+`crawler_laravel_appeared_total` / `crawler_laravel_lost_total` —
+кумулятивные числа переходов из append-only журнала `laravel_history`
+(появление/исчезновение строки `laravel_domains` по свежим эпизодам
+HTTP). Значения монотонны (журнал append-only) — gauge с
+counter-семантикой корректен для `rate()`/`increase()`; период — 1 ч,
+как у серой зоны: тренды детекции — материал дашборда, не оперативный
+сигнал конвейера.
 
 Второй цикл того же сервиса — оценка алертов минимального набора ТЗ 5.9
 (`internal/monitor/alerts.go`, T-080; ТЗ 8, ТЗ 10.3), период — тот же

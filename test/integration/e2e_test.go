@@ -203,7 +203,7 @@ type e2eSample struct {
 var e2eSamples = []e2eSample{
 	{
 		label: "laravel-11-vite", title: "Laravel Vite App",
-		isLaravel: true, score: 0.883, verMin: "9.19", verMax: "",
+		isLaravel: true, score: 0.894, verMin: "9.19", verMax: "",
 		rules: []string{
 			"cookie_xsrf_token", "cookie_laravel_session", "cookie_session_suffix",
 			"cookie_encrypted_payload", "meta_csrf_token", "vite_assets", "inertia",
@@ -211,7 +211,7 @@ var e2eSamples = []e2eSample{
 	},
 	{
 		label: "laravel-8-mix", title: "Laravel",
-		isLaravel: true, score: 0.845, verMin: "", verMax: "9.x",
+		isLaravel: true, score: 0.859, verMin: "", verMax: "9.x",
 		rules: []string{
 			"cookie_xsrf_token", "cookie_laravel_session", "cookie_session_suffix",
 			"cookie_encrypted_payload", "meta_csrf_token", "mix_assets",
@@ -674,6 +674,43 @@ func TestE2E_FileToLaravel(t *testing.T) {
 				}
 				if !found {
 					t.Errorf("в списке доменов с Laravel нет %s (получено %v)", label, withLaravel)
+				}
+			}
+		}
+
+		// История детекции appeared (T-118): доставки q:analyze этого
+		// цикла свежие (HTTP-этап) — каждый Laravel-домен получил ровно
+		// одну запись appeared=true; lost нет.
+		{
+			rows, err := env.pool.Query(ctx, `
+				SELECT d.label, h.appeared FROM laravel_history AS h
+				JOIN domains AS d ON d.zone_id = h.zone_id AND d.id = h.domain_id
+				WHERE h.zone_id = $1 ORDER BY d.label`, zoneID)
+			if err != nil {
+				t.Fatalf("чтение laravel_history: %v", err)
+			}
+			defer rows.Close()
+			type histRow struct {
+				label    string
+				appeared bool
+			}
+			var hist []histRow
+			for rows.Next() {
+				var h histRow
+				if err := rows.Scan(&h.label, &h.appeared); err != nil {
+					t.Fatalf("строка laravel_history: %v", err)
+				}
+				hist = append(hist, h)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("чтение laravel_history: %v", err)
+			}
+			if len(hist) != len(want) {
+				t.Fatalf("laravel_history = %d записей, хочу %d (по одной appeared на Laravel-домен)", len(hist), len(want))
+			}
+			for _, h := range hist {
+				if !h.appeared {
+					t.Errorf("laravel_history %s: appeared=false, хочу true (потерь в цикле нет)", h.label)
 				}
 			}
 		}

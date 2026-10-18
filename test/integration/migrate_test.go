@@ -252,7 +252,9 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	// её down-миграцией, версия возвращается к 7 (эквивалент force 7).
 	// Псевдо-откат обязан покрывать и миграции ПОСЛЕ 000008 (новые —
 	// дополнять сюда их down-эффектами), иначе повторный Up споткнётся
-	// в них: 000009 возвращает глобальный ключ ingest_files.sha256.
+	// в них: 000009 возвращает глобальный ключ ingest_files.sha256,
+	// 000011 снимает таблицу laravel_history (000010 — CREATE OR REPLACE
+	// функции, повторное применение безопасно без подготовки).
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -264,6 +266,7 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		"ALTER TABLE ingest_files ADD CONSTRAINT ingest_files_sha256_key UNIQUE (sha256)",
 		"DROP INDEX IF EXISTS domains_recheck_idx",
 		"DROP INDEX IF EXISTS domains_lease_idx",
+		"DROP TABLE IF EXISTS laravel_history",
 		"TRUNCATE schema_migrations",
 		"INSERT INTO schema_migrations (version, dirty) VALUES (7, false)",
 	} {

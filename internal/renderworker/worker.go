@@ -358,6 +358,9 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// контенте. Сбой публикации → доставка q:render без XACK: повторная
 	// доставка перезапишет результат идемпотентно и опубликует заново
 	// (at-least-once, ТЗ 3.4; дубликаты ограничены попытками доставки).
+	// Fresh: рендер дорабатывает запись текущего HTTP-эпизода (T-066),
+	// а не переанализ — история детекции пишётся (T-118).
+	task.Fresh = true
 	if _, err := w.q.Publish(ctx, queue.StreamAnalyze, task); err != nil {
 		return true, fmt.Errorf("renderworker: %s: публикация q:analyze: %w", name, err)
 	}

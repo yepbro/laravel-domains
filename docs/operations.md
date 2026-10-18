@@ -143,6 +143,8 @@ SELECT * FROM schema_migrations;   -- version, dirty = false
 - `crawler_domain_status_total{type}` — статусы доменов;
 - `crawler_laravel_near_findings` — находки Laravel в серой зоне порога
   (материал калибровки правил, T-115);
+- `crawler_laravel_appeared_total` / `crawler_laravel_lost_total` —
+  появления/исчезновения Laravel-доменов (история детекции T-118);
 - `crawler_service_up{service}` — живость (включая полную смерть
   процесса).
 

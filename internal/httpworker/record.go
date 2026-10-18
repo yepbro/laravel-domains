@@ -510,6 +510,7 @@ func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 				SubdomainID: sub.SubdomainID,
 				Variant:     rec.Variant,
 				Name:        res.Name,
+				Fresh:       true, // новый эпизод HTTP — история детекции пишётся (T-118)
 			})
 		}
 	}

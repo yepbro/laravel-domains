@@ -45,8 +45,10 @@ const (
 	anEvDelete    anEventKind = "delete"     // DELETE laravel_findings
 	anEvLock      anEventKind = "lock"       // advisory-блокировка домена (T-072)
 	anEvAggSelect anEventKind = "agg_select" // SELECT findings домена для агрегации
+	anEvAggExists anEventKind = "agg_exists" // SELECT EXISTS laravel_domains (T-118)
 	anEvAggUpsert anEventKind = "agg_upsert" // upsert laravel_domains
 	anEvAggDelete anEventKind = "agg_delete" // DELETE laravel_domains
+	anEvHistory   anEventKind = "agg_hist"   // INSERT laravel_history appeared/lost (T-118)
 	anEvCommit    anEventKind = "commit"
 	anEvAck       anEventKind = "ack"
 )
@@ -138,6 +140,7 @@ type anFakePool struct {
 	statuses map[anRowKey]int16 // status домена по ключу строки
 	findings map[anRowKey]*anFinding
 	domains  map[anDomainKey]*anDomain
+	history  []anHistoryRec // laravel_history (T-118): append-only журнал переходов
 
 	queryErr     error
 	beginErr     error
@@ -148,6 +151,7 @@ type anFakePool struct {
 	aggSelectErr error
 	aggUpsertErr error
 	aggDeleteErr error
+	aggHistErr   error
 	commitErr    error
 
 	// mutateBeforeTx — хук: вызывается перед снапшотом транзакции
@@ -156,6 +160,13 @@ type anFakePool struct {
 	mutateBeforeTx func(p *anFakePool)
 
 	mu sync.Mutex
+}
+
+// anHistoryRec — запись laravel_history в фейке (T-118).
+type anHistoryRec struct {
+	zone     int16
+	domain   int64
+	appeared bool
 }
 
 func newANFakePool() *anFakePool {
@@ -286,8 +297,10 @@ func (p *anFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 		c := *v
 		snapDomains[k] = &c
 	}
+	snapHistory := append([]anHistoryRec(nil), p.history...)
 	p.j.record(anEvBegin)
-	return &anFakeTx{pool: p, snapResults: snapResults, snapFindings: snapFindings, snapDomains: snapDomains}, nil
+	return &anFakeTx{pool: p, snapResults: snapResults, snapFindings: snapFindings,
+		snapDomains: snapDomains, snapHistory: snapHistory}, nil
 }
 
 type anFakeTx struct {
@@ -297,6 +310,7 @@ type anFakeTx struct {
 	snapResults  map[anRowKey]*anResultRow
 	snapFindings map[anRowKey]*anFinding
 	snapDomains  map[anDomainKey]*anDomain
+	snapHistory  []anHistoryRec
 	commit       bool
 }
 
@@ -397,9 +411,59 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		t.pool.j.record(anEvAggDelete)
 		return pgconn.NewCommandTag(tag), nil
 
+	case aggregateHistorySQL:
+		if t.pool.aggHistErr != nil {
+			return pgconn.CommandTag{}, t.pool.aggHistErr
+		}
+		t.pool.history = append(t.pool.history, anHistoryRec{
+			zone:     args[0].(int16),
+			domain:   args[1].(int64),
+			appeared: args[2].(bool),
+		})
+		t.pool.j.record(anEvHistory)
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
+
 	default:
 		return pgconn.CommandTag{}, fmt.Errorf("anFakePool: неожидаемый SQL: %s", sql)
 	}
+}
+
+// anFakeRow — pgx.Row с единственным значением (EXISTS, T-118).
+type anFakeRow struct {
+	v   any
+	err error
+}
+
+func (r anFakeRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if len(dest) != 1 {
+		return fmt.Errorf("anFakeRow: приёмников %d, нужно 1", len(dest))
+	}
+	d, ok := dest[0].(*bool)
+	if !ok {
+		return fmt.Errorf("anFakeRow: приёмник %T, нужно *bool", dest[0])
+	}
+	*d = r.v.(bool)
+	return nil
+}
+
+// QueryRow — единственный строковый запрос агрегации: наличие строки
+// laravel_domains (aggregateExistsSQL, T-118); прочее — громкий отказ
+// (неиспользуемые пути всплывут в тестах).
+func (t *anFakeTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if err := ctx.Err(); err != nil {
+		return anFakeRow{err: err}
+	}
+	if sql != aggregateExistsSQL {
+		return anFakeRow{err: fmt.Errorf("anFakeTx: неожидаемый SQL QueryRow: %s", sql)}
+	}
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	_, exists := t.pool.domains[anDomainKey{zone: args[0].(int16), domain: args[1].(int64)}]
+	t.pool.j.record(anEvAggExists)
+	return anFakeRow{v: exists}
 }
 
 func (t *anFakeTx) Commit(context.Context) error {
@@ -420,6 +484,7 @@ func (t *anFakeTx) Rollback(context.Context) error {
 		return nil // откат после Commit — no-op
 	}
 	t.pool.results, t.pool.findings, t.pool.domains = t.snapResults, t.snapFindings, t.snapDomains
+	t.pool.history = t.snapHistory
 	return nil
 }
 

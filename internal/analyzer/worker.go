@@ -366,8 +366,9 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 
 	// Агрегация домена — T-072: пересчёт laravel_domains по findings
 	// домена той же транзакцией (решения и согласование параллельных
-	// доставок — aggregate.go).
-	if err := aggregateDomain(ctx, tx, task.ZoneID, task.DomainID, set.Version); err != nil {
+	// доставок — aggregate.go); fresh — признак свежего эпизода HTTP
+	// в задаче: при переходе пишет историю appeared/lost (T-118).
+	if err := aggregateDomain(ctx, tx, task.ZoneID, task.DomainID, set.Version, task.Fresh); err != nil {
 		return false, fmt.Errorf("analyzer: %s: %w", name, err)
 	}
 

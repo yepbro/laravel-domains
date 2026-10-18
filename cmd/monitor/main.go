@@ -91,10 +91,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Фоновые циклы: пересчёт счётчиков зон (T-078) и gauge серой зоны
-	// Laravel-находок (T-115) — оба периодические проходы по БД,
-	// завершаются отменой ctx.
-	bg := make(chan error, 2)
+	// Фоновые циклы: пересчёт счётчиков зон (T-078), gauge серой зоны
+	// Laravel-находок (T-115) и счётчики истории детекции appeared/lost
+	// (T-118) — все периодические проходы по БД, завершаются отменой ctx.
+	bg := make(chan error, 3)
 	go func() {
 		bg <- monitor.ZoneStatsLoop(ctx, pool, monitor.ZoneStatsOptions{
 			Interval: cfg.Monitor.ZoneStatsInterval.D(),
@@ -105,6 +105,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		bg <- monitor.NearStatsLoop(ctx, pool, reg, monitor.NearStatsOptions{
 			MinScore: cfg.Analyzer.LaravelMinScore,
 			Log:      logger,
+		})
+	}()
+	go func() {
+		bg <- monitor.HistoryStatsLoop(ctx, pool, reg, monitor.HistoryStatsOptions{
+			Log: logger,
 		})
 	}()
 
@@ -134,7 +139,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// (отмена идемпотентна и при уже остановленных циклах). Их сбой не
 	// прячем за nil алертов — забираем результаты.
 	cancel()
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		bgErr := <-bg
 		if err == nil {
 			err = bgErr
