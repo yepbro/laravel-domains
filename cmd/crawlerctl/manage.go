@@ -495,13 +495,15 @@ func subdomainsDisableRun(ctx context.Context, pool db.DB, arg string, stdout io
 	if s.id == 0 {
 		return subdomainApexGuard()
 	}
+	// Идемпотентная ветка — до записи: «уже выключен» не делает UPDATE
+	// (лишняя запись ни к чему, сообщение соответствует состоянию lookup).
+	if !s.enabled {
+		out(stdout, "субдомен %s (бит %d) уже выключен\n", s.label, s.id)
+		return nil
+	}
 	after, err := disableSubdomainByID(ctx, pool, s.id)
 	if err != nil {
 		return err
-	}
-	if !s.enabled {
-		out(stdout, "субдомен %s (бит %d) уже выключен\n", after.label, after.id)
-		return nil
 	}
 	out(stdout, "субдомен %s (бит %d) выключен: бит и накопленные маски/результаты не меняются (ТЗ 13.1)\n",
 		after.label, after.id)

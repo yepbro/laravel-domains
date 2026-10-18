@@ -494,6 +494,12 @@ func TestSubdomainsDisableRunAlreadyDisabled(t *testing.T) {
 	if !strings.Contains(stdout.String(), "уже выключен") {
 		t.Errorf("вывод не сообщает «уже выключен»:\n%s", stdout.String())
 	}
+	// Идемпотентная ветка — до записи: UPDATE не выполнялся вовсе.
+	for _, c := range pool.queries {
+		if c.sql == subdomainDisableSQL {
+			t.Errorf("«уже выключен» не должен делать UPDATE: %v", c)
+		}
+	}
 }
 
 // --- recheck ------------------------------------------------------------------
