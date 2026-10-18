@@ -42,6 +42,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -491,6 +492,17 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 			go func(d queue.Delivery) {
 				defer wg.Done()
 				defer func() { <-sem }()
+				// Паника доставки не должна ронять процесс без лога и
+				// очистки — тот же инвариант, что у горутины OnRun
+				// (internal/service): panic → Error-лог, доставка без
+				// XACK вернётся повторной доставкой (XAUTOCLAIM, T-025);
+				// in-flight соседей и graceful shutdown сохраняются.
+				defer func() {
+					if r := recover(); r != nil {
+						log.Error("паника обработки доставки q:render",
+							"entry", d.ID, "panic", r, "stack", string(debug.Stack()))
+					}
+				}()
 				err := queue.Processing(ctx, w.q, o.Group, d, w.processDelivery)
 				if err != nil && ctx.Err() == nil {
 					log.Warn("задача q:render не подтверждена — вернётся повторной доставкой",
