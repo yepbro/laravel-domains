@@ -1,10 +1,12 @@
 # Декомпозиция ТЗ «Сервис массовой проверки доменов и поиска сайтов на Laravel»
 
 Источник: [`TZ_domain_crawler.md`](./TZ_domain_crawler.md) (версия 1.1).
+Дополнительные ТЗ этапов: [`TZ_dashboard.md`](./TZ_dashboard.md) —
+операторский веб-дашборд конвейера (этап 15).
 
 ## Как работать с файлом
 
-- Задачи пронумерованы `T-001…T-114` и упорядочены по выполнению (сверху вниз).
+- Задачи пронумерованы `T-001…T-131` и упорядочены по выполнению (сверху вниз).
 - Статус задачи — метка в квадратных скобках, меняется редактированием:
   - `[новая]` — задача не начата;
   - `[в работе]` — задача выполняется;
@@ -34,6 +36,7 @@
 | 12 | Доработки по итогам анализа larasites (2026-10-19) | — | T-115…T-119 |
 | 13 | Публичный лендинг — перенос из larasites (2026-10-19) | — | T-120…T-124 |
 | 14 | Начальное наполнение справочника зон (IANA) (2026-10-19) | — | T-125 |
+| 15 | Операторский веб-дашборд конвейера (2026-10-19) | — | T-126…T-131 |
 
 Этапы 0–9 и задача T-090/T-091/T-094/T-095 завершены — их 93 строки
 перенесены в архив [`tasks_done.md`](./tasks_done.md). Здесь остаются
@@ -45,8 +48,10 @@
 задачи (larasites, 2026-10-19), задачи этапа 13 — перенос публичного
 лендинга из той же реализации (продуктовое расширение вне основного ТЗ;
 зафиксированные решения: гибридная семантика формы проверки, лог ручных
-проверок web_checks, i18n ru+en) и задача этапа 14 — начальное
-наполнение справочника зон из реестра IANA.
+проверок web_checks, i18n ru+en), задача этапа 14 — начальное
+наполнение справочника зон из реестра IANA, задачи этапа 15 —
+операторский веб-дашборд конвейера по отдельному ТЗ
+([`TZ_dashboard.md`](./TZ_dashboard.md)).
 
 ---
 
@@ -178,4 +183,25 @@ IDN-зоны уже в punycode — совпадает с контрактом z
 срез не содержит, схеме zones они и не нужны.
 
 - **T-125** [новая] — `crawlerctl zones sync` — добавление/обновление справочника зон из реестра IANA (четвёртое действие zones рядом с list/enable/disable). Флаги: `--file <путь>` (офлайн-режим — прод без исходящего интернета: файл качается заранее, например curl'ом) / `--url <url>` (по умолчанию — канонический data.iana.org, stdlib net/http с таймаутом), `--deactivate-missing` — зоны БД, отсутствующие в списке (retired TLD), выключать is_active = false (явный флаг, по умолчанию выключен; отчёт — какие выключены). Парсинг: строки-комментарии `#` пропускаются, первая несёт версию файла — выводить в отчёт; каждая строка валидируется idn.NormalizeZone (мусор — ошибка с номером строки, не тихий скип), дедупликация внутри файла. Семантика записи: одна вставка `INSERT … SELECT … FROM unnest(…) ON CONFLICT (name) DO NOTHING` — идемпотентно, повторный запуск ничего не меняет; новые зоны — is_active = true, как авто-создание ingest'ом (ТЗ 5.1; пустая зона планировщику безразлична — DispatchBatch идёт от доменов; вариант is_active = false отвергнут: тогда первый файл ingest'а не активировал бы зону, а активация в EnsureZone сломала бы документированный контракт паузы — приём файлов выключенной зоны работает, включение только руками zones enable, см. cmd/crawlerctl/zones.go); существующие строки не трогаются вовсе (is_active — владение оператора, счётчики — monitor): sync ничего не «обновляет» у существующих, добавление и выключение пропавших — весь эффект; name_unicode — displayUnicode (idna.ToUnicode) для XN--зон, NULL для ASCII. Ёмкость: ~1460 зон — zones.id smallint (до 32767) с запасом. Отчёт: версия файла, прочитано/добавлено/уже было, при --deactivate-missing — список выключенных. Тесты: парсер (версия из комментария, верхний регистр, дедуп, мусор с номером строки), SQL-текст и параметры на фейковом пуле (стиль zones_test.go), e2e run() по образцу соседних команд, --deactivate-missing на фейке; документация: zonesHelp, README (список команд crawlerctl).
+
+---
+
+## Этап 15. Операторский веб-дашборд конвейера (2026-10-19)
+
+Источник — [`TZ_dashboard.md`](./TZ_dashboard.md) (далее — ТЗД): внутренний
+веб-дашборд — сводка «одним взглядом» (прогресс, скорость, счётчики,
+очереди, находки, здоровье сервисов) с доступом по паролю. Ключевые
+решения зафиксированы в ТЗД §13: собственный Go-сервис вместо Grafana (без
+новых контейнеров и зависимостей), отдельный от публичного лендинга этапа
+13 (другая аудитория и данные), Basic Auth + PBKDF2-SHA256 (stdlib
+crypto/pbkdf2) с cookie-сессией, read-only доступ к тем же источникам,
+что crawlerctl status, кэш снимков фоновым циклом. Порты: публичный
+127.0.0.1:8090, метрики — loopback :9108.
+
+- **T-126** [новая] — Выделение пакета internal/status — общей библиотеки сводки (ТЗД §4.5): перенос из cmd/crawlerctl/status.go без изменения поведения SQL-текстов (zoneStatsSQL, throughputSQL), типов (zoneStats, throughput, statusTotals, statusRates), выборок (fetchZoneStats, fetchThroughput, fetchQueueLens + порядок стримов statusStreams) и расчётов (computeTotals, computeRates, formatDuration); crawlerctl переключается на пакет, вывод (таблица/JSON) остаётся в CLI. Дублирование SQL между CLI и дашбордом запрещено — ТЗД §4.5. Тесты: перенос статусных тестов status_test.go (SQL-контракты, фейковый пул db.DB с живой семантикой агрегатов, computeRates/formatDuration) в internal/status со сменой пакета; в crawlerctl остаются тесты вывода и роутинга. Приёмка: make test + make lint; вывод crawlerctl status на dev-стеке не изменился (ручная сверка).
+- **T-127** [новая] — Конфигурация dashboard и генерация секрета (ТЗД §7.2–7.3, §7.7, §8): секция по рецепту KnownFields (Default/Validate/envSpecs + config.example.yaml + docs/configuration.md) — listen (дефолт 127.0.0.1:8090), refresh (5s, коридор 1s–5m), username, password_hash, probes (карта имя→базовый URL метрик сервисов для /livez-проб); env CRAWLER_DASHBOARD_LISTEN/REFRESH_INTERVAL/USERNAME/PASSWORD_HASH/PROBES (probes — «имя=url,имя2=url2» по образцу zone_weights). Validate проверяет listen/refresh/probes (ТЗД §8.3), но НЕ username/password_hash — обязательность кредов проверяет cmd/dashboard на старте (ТЗД §7.7), иначе требование коснулось бы всех сервисов. Команда `crawlerctl dashboard-secret` (ТЗД §7.3): пароль из аргумента или stdin (справка предупреждает про историю shell), печать строки `pbkdf2-sha256$<итерации>$<соль-b64>$<ключ-b64>` — PBKDF2-HMAC-SHA256 stdlib crypto/pbkdf2, соль 16 байт crypto/rand, ключ 32 байта, 600 000 итераций (ТЗД §7.2); регистрация в commands/usageText. Тесты: config_test.go (дефолты/env/валидация секции), раундтрип секрета (генерация→разбор→сверка; неверный пароль; битый формат; несовместимые итерации/длина ключа), команда (stdin, аргумент, пустой ввод). Документация: docs/configuration.md, справка crawlerctl, README (список команд).
+- **T-128** [новая] — Каркас cmd/dashboard + internal/dashboard и авторизация (ТЗД §4.1–4.2, §6.1–6.3, §7): cmd/dashboard по образцу cmd/monitor (config.Load → service.Run, OnDBPool; метрики каркаса — METRICS_ADDR 127.0.0.1:9108, ТЗД §4.2), OnRun — собственный публичный http.Server на dashboard.listen с graceful stop по отмене ctx (прецедент жизненного цикла спроектирован в T-121; кто раньше — задаёт образец). Публичный mux: роуты и методы по ТЗД §6.1–6.3 — /, /assets/*, /api/status (заглушки до T-129/T-130), /healthz (ping PG, 503), /livez, robots.txt — без авторизации; не GET/HEAD — 405; security-заголовки и таймауты сервера по ТЗД §6.3. Авторизация (ТЗД §7): middleware Basic — имя constant-time, пароль PBKDF2 из формата T-127 constant-time (§7.4); при успехе — cookie-сессия `<expiry>.<HMAC-SHA256(expiry, производный ключ KDF)>` (§7.5): HttpOnly, SameSite=Lax, 24 ч, быстрая проверка cookie вместо KDF на каждом опросе, смена пароля инвалидирует сессии; per-IP защита от подбора — 5 неудач/минуту → 429 + Retry-After (§7.6, по образцу токен-бакета T-123); стартовая проверка кредов — пустые username/password_hash → отказ запуска (§7.7); лог Warn без кредов (§9.2). Тесты: 401 + WWW-Authenticate без кредов; неверные креды; блокировка подбора и её экспирация; cookie валидна/тамперена/просрочена; 405/404/заголовки; healthz/livez/robots без авторизации; graceful stop.
+- **T-129** [новая] — Сборщик снимков и `GET /api/status` (ТЗД §4.3–4.4, §5, §6.2, §10): фоновый цикл с периодом dashboard.refresh и атомарной заменой снимка; до первого успешного сбора /api/status — 503 (§5.9). Секции: зоны/итоги/темп/скорости/ETA — internal/status (T-126); распределение domains по status — имена по ТЗ 6.2 основного ТЗ, model.Statuses (§5.5); Laravel — всего, за 24 ч, последние 10 с JOIN зон, ORDER BY updated_at DESC (§5.6; до индекса из T-120 — честный LIMIT, после — по индексу); последние 10 ingest_files (§5.7); глубины стримов — BackpressureGate.Len, как monitor (§5.4); пробы /livez из dashboard.probes параллельно, таймаут 2 с (§5.8). Деградация по §5.9: ошибки секций в отдельной карте, значения null/«н/д». Метрики собственного сервиса: crawler_dashboard_snapshots_total{result}, crawler_dashboard_snapshot_seconds (§10, фабрика internal/metrics). Тесты: SQL-контракты новых выборок на фейковом пуле (стиль status_test.go), деградация секций, JSON-форма (поля + null), пробы на httptest (up/таймаут/отказ), цикл сборки (период, замена снимка); интеграционный — полный снимок на testbed (skipUnlessIntegration, приёмка §12 ТЗД). Зависит от T-126, T-128.
+- **T-130** [новая] — Фронт дашборда (ТЗД §5, §6.1, §6.4–6.5): assets/ (page.html, app.js, style.css) через go:embed (прецедент migrations/embed.go), без внешних CDN (ТЗД §3.2.2). Разметка (ru): карточки — всего/проверено %/в работе (pending+queued)/дом./с (окно суток)/HTTP-рез./с и рендеры/с (окно часа)/ETA цикла/Laravel-находок (всего + за 24 ч) (§5.1–5.2); очереди — 5 стримов с подсветкой watermark (scheduler.queue_high_watermark) и q:dead (§5.4); таблица зон с прогресс-барами, pending/queued/done, активность (§5.3); распределение статусов — полоса-легенда со счётчиками (§5.5); последние находки — домен, зона, score, ver_min–ver_max, updated_at (§5.6); последние ingest-файлы (§5.7); чипы здоровья сервисов (§5.8); «н/д» для секций с ошибками (§5.9). app.js: автообновление fetch /api/status каждые ~5 с, спарклайны SVG polyline из истории опросов в памяти (~120 точек), обработка 401 (§6.4). Тесты: рендер страницы (секции, ru), роуты статики (Content-Type, ненулевые body), заголовки ответов (§6.3). Документация: docs/services.md — раздел дашборда с описанием секций. Зависит от T-129.
+- **T-131** [новая] — Развёртывание и документация (ТЗД §9.1, §11, §12): compose-сервис dashboard в profile app (клон go-common: SERVICE=dashboard, METRICS_PORT=9108, app-dns; порт 127.0.0.1:${DASHBOARD_PORT:-8090}:8090; depends_on postgres/redis healthy; mem_limit 256m — §11.1); config.dev.yaml — секция dashboard (listen «:8090», username admin, password_hash от dev-пароля через crawlerctl dashboard-secret, probes по именам сервисов ingest/scheduler/dns-worker/http-worker/render-worker/analyzer/monitor с их метрик-портами); .env.example — DASHBOARD_PORT; prometheus.yml — job dashboard :9108 (§11.3); systemd crawler-dashboard.service по образцу crawler-monitor (User=crawler-dashboard, Group=crawler, CRAWLER_DASHBOARD_LISTEN=127.0.0.1:8090, MemoryMax=128M, изоляция ТЗ §9/§10.1 — §11.2; пользователь — в docs/deploy.md рядом с прочими). Документация: docs/services.md (новый сервис, порты 8090/9108), docs/deploy.md (юнит, пользователь, генерация пароля crawlerctl dashboard-secret, схема доступа loopback/reverse-proxy с TLS — §9.1), docs/configuration.md (сверка с T-127), README (таблица сервисов, структура). Приёмка по ТЗД §12: make test + make lint зелёные; make up → 127.0.0.1:8090 запрашивает пароль, после входа числа сходятся с crawlerctl status; остановка Redis — очереди «н/д», остальная сводка жива. Зависит от T-128, T-129, T-130.
 
