@@ -980,6 +980,59 @@ func TestWorkerRunBackoffOnFailures(t *testing.T) {
 	}
 }
 
+// TestWorkerRunCancelWhileWaitingSlot — отмена ctx во время ожидания слота
+// семафора не запускает доставку с уже отменённым ctx: окно из двух задач
+// при Concurrency=1, первая блокируется в сети до отмены — вторая обязана
+// остаться не начатой (её хост не читается из сети), окно возвращается
+// очереди повторной доставкой.
+func TestWorkerRunCancelWhileWaitingSlot(t *testing.T) {
+	fetch, log := workerFakeFetch(map[string]*workerPageScript{
+		"block.test": {blockCtx: true},
+		"next.test":  {status: 200, body: "<html>страница второй доставки окна</html>"},
+	})
+	w := workerWorker(t, fetch, nil)
+	q := &workerFakeQueue{deliveries: []queue.Delivery{
+		workerDelivery(t, queue.HTTPTask{ZoneID: 11, DomainID: 61, Name: "block.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
+		workerDelivery(t, queue.HTTPTask{ZoneID: 11, DomainID: 62, Name: "next.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
+	}}
+	// Concurrency — параметр цикла Run (семафор окна), не воркера.
+	opts := Options{Concurrency: 1}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	// Первая доставка ушла в сеть (держит единственный слот) — отменяем:
+	// вторая в этот момент ждёт семафор.
+	deadline := time.After(5 * time.Second)
+	for log.countHost("block.test") == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("первая доставка не дошла до сети")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	if got := log.countHost("next.test"); got != 0 {
+		t.Errorf("доставка запущена после отмены ctx: обращений к next.test %d", got)
+	}
+	if q.ackedCount() != 0 {
+		t.Errorf("подтверждений %d — окно обязано вернуться очереди", q.ackedCount())
+	}
+}
+
 // --- адаптер DNS-резолвера (ТЗ 5.5 п. 2) ---------------------------------------
 
 // workerAddr — парсинг адреса сценария (падение — ошибка теста).

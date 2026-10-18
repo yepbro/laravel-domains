@@ -980,11 +980,24 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 		// здесь (у dns-worker домены параллелятся внутри пачки).
 		var wg sync.WaitGroup
 		failed.Store(0)
+	window: // метка выхода из окна по отмене (select семафора ниже)
 		for _, d := range deliveries {
 			if ctx.Err() != nil {
 				break // не начатые доставки окна не подтверждены
 			}
-			sem <- struct{}{}
+			// Слот семафора — с выходом по отмене: отмена ctx во время
+			// ожидания слота не должна запускать доставку с уже
+			// отменённым ctx (выбор канала select недетерминирован,
+			// поэтому отмена проверяется и после получения слота).
+			select {
+			case <-ctx.Done():
+				break window
+			case sem <- struct{}{}:
+			}
+			if ctx.Err() != nil {
+				<-sem
+				break window
+			}
 			wg.Add(1)
 			go func(d queue.Delivery) {
 				defer wg.Done()
