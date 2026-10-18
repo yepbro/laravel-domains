@@ -159,6 +159,26 @@ func TestMatchRuleMeta(t *testing.T) {
 	if ok {
 		t.Error("meta + match не должен срабатывать")
 	}
+
+	// «>» внутри кавычек значения атрибута не обрывает тег (AN-08):
+	// regex по имени после значения с «>» срабатывает, свидетельство —
+	// весь тег целиком
+	quoted := Page{HTML: []byte(`<meta content="a>b" name="csrf-token">`)}
+	ev, ok = matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `csrf-token`}, quoted, DefaultLimits())
+	if !ok || ev != `<meta content="a>b" name="csrf-token">` {
+		t.Errorf("meta с «>» в кавычках: ok=%v ev=%q", ok, ev)
+	}
+	// одинарные кавычки — та же семантика
+	ev, ok = matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `csrf-token`},
+		Page{HTML: []byte(`<meta content='a>b' name='csrf-token'>`)}, DefaultLimits())
+	if !ok || ev != `<meta content='a>b' name='csrf-token'>` {
+		t.Errorf("meta с «>» в одинарных кавычках: ok=%v ev=%q", ok, ev)
+	}
+	// незакрытая кавычка — тег не выделяется вовсе (не обрыв по «>»)
+	if _, ok := matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `unterminated`},
+		Page{HTML: []byte(`<meta content="unterminated>`)}, DefaultLimits()); ok {
+		t.Error("незакрытая кавычка не должна давать усечённый meta-тег")
+	}
 }
 
 func TestMatchRuleEvidenceFromCappedInput(t *testing.T) {
