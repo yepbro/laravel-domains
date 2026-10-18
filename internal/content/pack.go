@@ -695,12 +695,23 @@ func parsePackHeader(b []byte) (packHeader, error) {
 }
 
 // readPackBlock читает clen байт блока из пака packID со смещения off.
+// Размещение сверяется с размером файла до аллокации: len приходит из
+// БД (contents.len), повреждённая строка не должна заказывать буфер
+// до 2 ГиБ (C-14) — тот же контроль, что у скана CompactScan.
 func readPackBlock(dir string, packID int32, off int64, clen int32) ([]byte, error) {
 	f, err := os.Open(filepath.Join(dir, packFileName(packID)))
 	if err != nil {
 		return nil, fmt.Errorf("content: пак %d: %w", packID, err)
 	}
 	defer func() { _ = f.Close() }() // только чтение
+	st, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("content: пак %d: %w", packID, err)
+	}
+	if clen < 0 || off < packHeaderLen+4 || off+int64(clen) > st.Size() {
+		return nil, fmt.Errorf("content: пак %d, смещение %d, длина %d: блок вне файла (%d байт)",
+			packID, off, clen, st.Size())
+	}
 	buf := make([]byte, clen)
 	if _, err := f.ReadAt(buf, off); err != nil {
 		return nil, fmt.Errorf("content: пак %d, смещение %d: %w", packID, off, err)

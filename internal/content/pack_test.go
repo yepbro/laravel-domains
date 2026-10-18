@@ -944,6 +944,35 @@ func TestParsePackHeaderHdrLen(t *testing.T) {
 	}
 }
 
+// TestPackReadBlockBounds — readPackBlock сверяет размещение с файлом до
+// аллокации (C-14): повреждённая строка (len до 2 ГиБ или отрицательный,
+// смещение мимо файла) — ошибка, а не гигантский буфер и не паника.
+func TestPackReadBlockBounds(t *testing.T) {
+	dir := t.TempDir()
+	compactCraftPack(t, dir, 1, [][]byte{bytes.Repeat([]byte("block"), 8)})
+	const size = packHeaderLen + 4 + 40
+
+	for _, tc := range []struct {
+		name string
+		off  int64
+		clen int32
+	}{
+		{"len из повреждённой строки", packHeaderLen + 4, 1 << 30},
+		{"отрицательный len", packHeaderLen + 4, -1},
+		{"смещение мимо файла", size, 4},
+		{"блок длиннее файла", packHeaderLen + 4, 41},
+	} {
+		if _, err := readPackBlock(dir, 1, tc.off, tc.clen); err == nil {
+			t.Errorf("%s: readPackBlock принял (%d, %d)", tc.name, tc.off, tc.clen)
+		}
+	}
+	// Живое размещение читается как раньше.
+	block, err := readPackBlock(dir, 1, packHeaderLen+4, 40)
+	if err != nil || len(block) != 40 {
+		t.Errorf("чтение целого блока: %v, длина %d", err, len(block))
+	}
+}
+
 // TestPackWriteErrENOSPC — кончившееся место на диске — ErrStoreFull
 // (ТЗ 8); исходная ошибка остаётся доступной errors.Is.
 func TestPackWriteErrENOSPC(t *testing.T) {
