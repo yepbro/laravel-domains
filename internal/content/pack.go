@@ -672,9 +672,10 @@ func readPackHeader(f *os.File) (packHeader, error) {
 	return parsePackHeader(buf)
 }
 
-// parsePackHeader разбирает заголовок v1; hdrLen допускается больше
-// packHeaderLen (будущие версии дописывают поля в конец), но не больше
-// прочитанного буфера.
+// parsePackHeader разбирает заголовок v1: первые packHeaderLen байт с
+// полями v1. hdrLen допускается больше packHeaderLen — будущие версии
+// дописывают поля в конец, v1 их не читает (документировано в
+// docs/content.md); hdrLen меньше обязательных полей v1 — повреждение.
 func parsePackHeader(b []byte) (packHeader, error) {
 	bad := errors.New("заголовок пака нечитаем")
 	if len(b) < packHeaderLen || string(b[:len(packMagic)]) != packMagic {
@@ -683,8 +684,7 @@ func parsePackHeader(b []byte) (packHeader, error) {
 	if b[4] != packVersion {
 		return packHeader{}, fmt.Errorf("версия пака %d не поддерживается (поддерживается %d)", b[4], packVersion)
 	}
-	hdrLen := binary.LittleEndian.Uint16(b[5:7])
-	if int(hdrLen) < packHeaderLen || int(hdrLen) > len(b) {
+	if hdrLen := binary.LittleEndian.Uint16(b[5:7]); hdrLen < packHeaderLen {
 		return packHeader{}, bad
 	}
 	return packHeader{

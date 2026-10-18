@@ -922,6 +922,28 @@ func TestPackOpenValidation(t *testing.T) {
 	}
 }
 
+// TestParsePackHeaderHdrLen — заголовок будущей версии (hdrLen больше
+// полей v1) читается: v1 берёт первые 23 байта и не отвергает расширение
+// (документированная совместимость вперёд); укороченный hdrLen — порча.
+func TestParsePackHeaderHdrLen(t *testing.T) {
+	future := packHeader{id: 7, maxSize: 1 << 20, dictID: 0xABCD}
+	b := future.bytes()
+	// hdrLen = 40: поля v1 читаются, расширение игнорируется.
+	binary.LittleEndian.PutUint16(b[5:7], 40)
+	hdr, err := parsePackHeader(b)
+	if err != nil {
+		t.Fatalf("заголовок будущей версии отвергнут: %v", err)
+	}
+	if hdr.id != 7 || hdr.maxSize != 1<<20 || hdr.dictID != 0xABCD {
+		t.Errorf("поля v1 искажены: %+v", hdr)
+	}
+	// hdrLen меньше обязательных полей — нечитаем.
+	binary.LittleEndian.PutUint16(b[5:7], packHeaderLen-4)
+	if _, err := parsePackHeader(b); err == nil {
+		t.Error("укороченный hdrLen принят")
+	}
+}
+
 // TestPackWriteErrENOSPC — кончившееся место на диске — ErrStoreFull
 // (ТЗ 8); исходная ошибка остаётся доступной errors.Is.
 func TestPackWriteErrENOSPC(t *testing.T) {
