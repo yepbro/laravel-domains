@@ -84,7 +84,7 @@ func NewBacklogGauge(reg *metrics.Registry) *prometheus.GaugeVec {
 	return reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_backlog_domains",
 		Help: "Глубина backlog из БД: домены в ожидании выборки (pending) и в работе с lease (queued), без удалённых.",
-	}, metrics.LabelType)
+	}, metrics.LabelState)
 }
 
 // BacklogOnce — один проход: GROUP BY check_state живых доменов → gauge

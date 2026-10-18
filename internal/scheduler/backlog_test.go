@@ -137,7 +137,8 @@ func backlogGaugeValue(t *testing.T, reg *metrics.Registry, state string) (float
 		}
 		for _, m := range mf.GetMetric() {
 			for _, l := range m.GetLabel() {
-				if l.GetValue() == state {
+				// Имя метки — state (docs/services.md, ТЗ 5.9): не type.
+				if l.GetName() == metrics.LabelState && l.GetValue() == state {
 					return m.GetGauge().GetValue(), true
 				}
 			}

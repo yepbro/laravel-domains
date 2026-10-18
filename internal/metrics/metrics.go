@@ -45,6 +45,11 @@ const (
 	// ошибок по типам; он же — имя статуса домена в счётчике финальных
 	// статусов (not_delegated, temp_error, no_http, …).
 	LabelType = "type"
+	// LabelState — состояние проверки домена (pending, queued) для
+	// глубины backlog из БД: имя метки зафиксировано документацией
+	// (docs/services.md, docs/operations.md, ТЗ 5.9) — отдельное от
+	// LabelType: «type» уже занят типом ошибки/статусом домена.
+	LabelState = "state"
 )
 
 // Значения метки LabelStage — этапы конвейера (ТЗ 4.2, §7). Единые
