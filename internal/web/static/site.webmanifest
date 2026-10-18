@@ -1,0 +1,14 @@
+{
+    "name": "LaraSites",
+    "short_name": "LaraSites",
+    "icons": [
+        {
+            "src": "/static/favicon.svg",
+            "sizes": "any",
+            "type": "image/svg+xml"
+        }
+    ],
+    "theme_color": "#0B0B0C",
+    "background_color": "#0B0B0C",
+    "display": "standalone"
+}

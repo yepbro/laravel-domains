@@ -2,12 +2,383 @@
 <html lang="{{.Locale}}">
 <head>
     <meta charset="utf-8">
-    <title>Domain Crawler</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="{{$.Msg "description"}}">
+
+    <link rel="canonical" href="/{{.Locale}}"/>
+    <link rel="alternate" hreflang="ru" href="/ru"/>
+    <link rel="alternate" hreflang="en" href="/en"/>
+
+    <title>{{$.Msg "title"}}</title>
+
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg"/>
+    <link rel="manifest" href="/static/site.webmanifest"/>
+    <meta name="theme-color" content="#0B0B0C"/>
+
+    <meta property="og:title" content="{{$.Msg "sharing.title"}}">
+    <meta property="og:description" content="{{$.Msg "sharing.desc"}}">
+    <meta property="og:type" content="website">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="{{$.Msg "sharing.title"}}">
+    <meta name="twitter:description" content="{{$.Msg "sharing.desc"}}">
+
+    <!-- Yandex.Metrika counter (перенос счётчика из larasites, T-122) -->
+    <script type="text/javascript">
+        (function(m,e,t,r,i,k,a){
+            m[i]=m[i]||function(){(m[i].a=m[i].a||[]).push(arguments)};
+            m[i].l=1*new Date();
+            for (var j = 0; j < document.scripts.length; j++) {if (document.scripts[j].src === r) { return; }}
+            k=e.createElement(t),a=e.getElementsByTagName(t)[0],k.async=1,k.src=r,a.parentNode.insertBefore(k,a)
+        })(window, document,'script','https://mc.yandex.ru/metrika/tag.js?id=105207729', 'ym');
+        ym(105207729, 'init', {ssr:true, webvisor:true, trackHash:true, clickmap:true, accurateTrackBounce:true, trackLinks:true});
+    </script>
+    <noscript><div><img src="https://mc.yandex.ru/watch/105207729" style="position:absolute; left:-9999px;" alt=""/></div></noscript>
+    <!-- /Yandex.Metrika counter -->
+
+    <link rel="stylesheet" href="/static/app.css"/>
 </head>
-<body>
-    <!-- Каркас T-121: разметку лендинга наполняет T-122 (перенос
-         components/landing/* из larasites: hero, статистика, облако
-         зон, таблица зон, последние находки, форма проверки). -->
-    <main>landing placeholder — T-122 (locale {{.Locale}})</main>
+<body class="min-h-screen bg-[#0B0B0C] text-zinc-100">
+
+<header id="header" class="bg-[#0B0B0C] fixed top-0 left-0 right-0 z-50 transition-all duration-200" data-header>
+    <div class="container mx-auto px-4 sm:px-6 lg:px-8">
+        <div class="flex items-center justify-between h-16 lg:h-18">
+            <a href="/{{.Locale}}#hero_section" class="text-xl lg:text-2xl font-bold text-orange-500 hover:text-orange-400 transition-colors">
+                LaraSites
+            </a>
+            <nav class="hidden md:flex items-center gap-6 lg:gap-8">
+                <a href="#statistics_section" class="text-zinc-300 hover:text-orange-500 transition-colors text-sm lg:text-base">{{$.Msg "header.nav_statistics"}}</a>
+                <a href="#how_it_works_section" class="text-zinc-300 hover:text-orange-500 transition-colors text-sm lg:text-base">{{$.Msg "header.nav_how_it_works"}}</a>
+                <a href="#domain_check_form_section" class="text-zinc-300 hover:text-orange-500 transition-colors text-sm lg:text-base">{{$.Msg "header.nav_domain_check_form"}}</a>
+                <a href="#latest_domains_section" class="text-zinc-300 hover:text-orange-500 transition-colors text-sm lg:text-base">{{$.Msg "header.nav_latest"}}</a>
+                <a href="#contacts_section" class="text-zinc-300 hover:text-orange-500 transition-colors text-sm lg:text-base">{{$.Msg "header.nav_contacts"}}</a>
+            </nav>
+            <div class="flex items-center gap-2">
+                {{range .Locales}}
+                    {{if eq . $.Locale}}
+                        <span class="px-3 py-1 bg-orange-500 text-white rounded-lg font-medium text-sm">{{.}}</span>
+                    {{else}}
+                        <a href="/{{.}}" class="px-3 py-1 bg-zinc-800/80 hover:bg-zinc-800 text-zinc-300 hover:text-white rounded-lg font-medium text-sm transition-colors">{{.}}</a>
+                    {{end}}
+                {{end}}
+            </div>
+        </div>
+    </div>
+</header>
+
+<main class="pt-16">
+
+<section id="hero_section" class="relative pt-16 pb-20 px-4 sm:px-6 lg:px-8 min-h-[calc(100vh-4rem)] flex items-center">
+    <div class="container mx-auto">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-12 lg:gap-16 items-center">
+            <div class="text-center lg:text-left">
+                <h1 class="text-white mb-6">{{$.Msg "hero.title"}}</h1>
+                <p class="text-lg lg:text-xl text-zinc-400 mb-10 max-w-2xl mx-auto lg:mx-0 leading-relaxed">
+                    {{$.Msg "hero.subtitle"}}
+                </p>
+                <div class="flex flex-col sm:flex-row gap-4 justify-center lg:justify-start">
+                    <a href="#domain_check_form_section" class="inline-flex items-center justify-center px-8 py-4 bg-orange-500 text-white rounded-xl font-semibold text-lg hover:bg-orange-600 transition-all duration-200 shadow-lg hover:shadow-xl hover:shadow-orange-500/25">
+                        {{$.Msg "hero.cta_primary"}}
+                    </a>
+                    <a href="#latest_domains_section" class="inline-flex items-center justify-center px-8 py-4 bg-transparent border-2 border-orange-500 text-orange-500 rounded-xl font-semibold text-lg hover:bg-orange-500/10 transition-all duration-200">
+                        {{$.Msg "hero.cta_secondary"}}
+                    </a>
+                </div>
+            </div>
+            <div class="relative flex items-center justify-center lg:justify-end">
+                <div class="relative w-full max-w-md aspect-square">
+                    <svg class="w-full h-full" viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="200" cy="200" r="180" fill="none" stroke="rgba(249, 115, 22, 0.1)" stroke-width="2"/>
+                        <circle cx="200" cy="200" r="140" fill="none" stroke="rgba(249, 115, 22, 0.15)" stroke-width="2"/>
+                        <circle cx="200" cy="200" r="100" fill="none" stroke="rgba(249, 115, 22, 0.2)" stroke-width="2"/>
+                        <circle cx="200" cy="200" r="60" fill="none" stroke="rgba(249, 115, 22, 0.25)" stroke-width="2"/>
+                        <g class="sweep-line">
+                            <defs>
+                                <linearGradient id="sweepGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                                    <stop offset="0%" style="stop-color:rgba(249, 115, 22, 0);stop-opacity:0"/>
+                                    <stop offset="50%" style="stop-color:rgba(249, 115, 22, 0.5);stop-opacity:1"/>
+                                    <stop offset="100%" style="stop-color:rgba(249, 115, 22, 0);stop-opacity:0"/>
+                                </linearGradient>
+                            </defs>
+                            <line x1="200" y1="200" x2="380" y2="200" stroke="url(#sweepGradient)" stroke-width="3" class="sweep-animation">
+                                <animateTransform attributeName="transform" attributeType="XML" type="rotate"
+                                        from="0 200 200" to="360 200 200" dur="25s" repeatCount="indefinite"/>
+                            </line>
+                        </g>
+                        <circle cx="200" cy="200" r="8" fill="rgba(249, 115, 22, 0.6)" class="pulse-animation"/>
+                    </svg>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section id="statistics_section" class="py-16 lg:py-24 px-4 sm:px-6 lg:px-8">
+    <div class="container mx-auto">
+        <h2 class="text-center text-white mb-12 lg:mb-16">{{$.Msg "statistics.title"}}</h2>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-6 lg:gap-8">
+            <div class="bg-zinc-900 rounded-2xl p-6 lg:p-8 shadow-lg hover:shadow-xl transition-shadow">
+                <div class="text-4xl lg:text-5xl font-bold text-white mb-3 tabular-nums" data-count="{{.Data.Stats.Zones}}">0</div>
+                <div class="text-zinc-400 text-sm lg:text-base">{{$.Msg "statistics.total_zones"}}</div>
+            </div>
+            <div class="bg-zinc-900 rounded-2xl p-6 lg:p-8 shadow-lg hover:shadow-xl transition-shadow">
+                <div class="text-4xl lg:text-5xl font-bold text-white mb-3 tabular-nums" data-count="{{.Data.Stats.Total}}">0</div>
+                <div class="text-zinc-400 text-sm lg:text-base">{{$.Msg "statistics.total_domains"}}</div>
+            </div>
+            <div class="bg-zinc-900 rounded-2xl p-6 lg:p-8 shadow-lg hover:shadow-xl transition-shadow">
+                <div class="text-4xl lg:text-5xl font-bold text-white mb-3 tabular-nums" data-count="{{.Data.Stats.Checked}}">0</div>
+                <div class="text-zinc-400 text-sm lg:text-base">{{$.Msg "statistics.checked"}}</div>
+            </div>
+            <div class="bg-zinc-900 rounded-2xl p-6 lg:p-8 shadow-lg hover:shadow-xl transition-shadow">
+                <div class="text-4xl lg:text-5xl font-bold text-orange-500 mb-3 tabular-nums" data-count="{{.Data.Stats.Laravel}}">0</div>
+                <div class="text-zinc-400 text-sm lg:text-base">{{$.Msg "statistics.with_laravel"}}</div>
+            </div>
+            <div class="bg-zinc-900 rounded-2xl p-6 lg:p-8 shadow-lg hover:shadow-xl transition-shadow">
+                <div class="text-4xl lg:text-5xl font-bold text-orange-500 mb-3 tabular-nums" data-count="{{.Data.Stats.Last24h}}">0</div>
+                <div class="text-zinc-400 text-sm lg:text-base">{{$.Msg "statistics.per_day"}}</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+{{if .Data.Cloud}}
+<section id="zone_cloud_section" class="py-16 lg:py-24 px-4 sm:px-6 lg:px-8">
+    <div class="container mx-auto">
+        <div class="text-center mb-12 lg:mb-16">
+            <h2 class="text-white mb-4">{{$.Msg "zone_cloud.title"}}</h2>
+            <p class="text-zinc-400 text-lg max-w-2xl mx-auto">{{$.Msg "zone_cloud.subtitle"}}</p>
+        </div>
+        <div class="relative min-h-[300px] lg:min-h-[400px]" id="zone-cloud">
+            {{range .Data.Cloud}}
+            <button type="button"
+                    class="zone-item absolute inline-flex items-center justify-center px-4 lg:px-6 py-2 lg:py-3 rounded-full font-medium transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    style="font-size: {{printf "%.3f" .Size}}rem;"
+                    data-zone="{{.Name}}">
+                <span class="zone-name">.{{.Name}}</span>
+                <span class="zone-tooltip absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-zinc-800 text-white text-sm rounded-lg opacity-0 pointer-events-none transition-opacity duration-150 whitespace-nowrap shadow-lg z-10">
+                    .{{.Name}} — {{.Laravel}} {{$.Msg "zone_cloud.domains"}}
+                </span>
+            </button>
+            {{end}}
+        </div>
+    </div>
+</section>
+{{end}}
+
+{{if .Data.Table}}
+<section class="py-16 lg:py-24 px-4 sm:px-6 lg:px-8">
+    <div class="container mx-auto">
+        <div class="bg-zinc-900 rounded-2xl shadow-xl overflow-hidden">
+            <div class="overflow-x-auto">
+                <table id="zone-table" class="w-full">
+                    <thead>
+                        <tr class="border-b border-zinc-800">
+                            <th class="px-6 py-4 text-left text-sm font-semibold text-zinc-300 cursor-pointer hover:bg-zinc-800/50 transition-colors select-none" data-sort="name" data-sort-type="string">
+                                <div class="flex items-center gap-2"><span>{{$.Msg "zone_table.zone"}}</span><span class="sort-indicator text-orange-500 opacity-0">▼</span></div>
+                            </th>
+                            <th class="px-6 py-4 text-left text-sm font-semibold text-zinc-300 cursor-pointer hover:bg-zinc-800/50 transition-colors select-none" data-sort="checked" data-sort-type="number">
+                                <div class="flex items-center gap-2"><span>{{$.Msg "zone_table.checked"}}</span><span class="sort-indicator text-orange-500 opacity-0">▼</span></div>
+                            </th>
+                            <th class="px-6 py-4 text-left text-sm font-semibold text-zinc-300 cursor-pointer hover:bg-zinc-800/50 transition-colors select-none" data-sort="laravel" data-sort-type="number">
+                                <div class="flex items-center gap-2"><span>{{$.Msg "zone_table.laravel"}}</span><span class="sort-indicator text-orange-500 opacity-0">▼</span></div>
+                            </th>
+                            <th class="px-6 py-4 text-left text-sm font-semibold text-zinc-300 cursor-pointer hover:bg-zinc-800/50 transition-colors select-none" data-sort="percentage" data-sort-type="number">
+                                <div class="flex items-center gap-2"><span>{{$.Msg "zone_table.percentage"}}</span><span class="sort-indicator text-orange-500 opacity-0">▼</span></div>
+                            </th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-zinc-800">
+                        {{range .Data.Table}}
+                        <tr class="hover:bg-zinc-800/50 transition-colors">
+                            <td class="px-6 py-4 text-white font-medium" data-sort-value="{{.Name}}">.{{.Name}}</td>
+                            <td class="px-6 py-4 text-zinc-300 tabular-nums" data-sort-value="{{.Checked}}">{{.Checked}}</td>
+                            <td class="px-6 py-4 text-orange-400 tabular-nums" data-sort-value="{{.Laravel}}">{{.Laravel}}</td>
+                            <td class="px-6 py-4 text-orange-400 tabular-nums" data-sort-value="{{printf "%.2f" .Percent}}">{{printf "%.2f" .Percent}}%</td>
+                        </tr>
+                        {{end}}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</section>
+{{end}}
+
+<section id="how_it_works_section" class="py-16 lg:py-24 px-4 sm:px-6 lg:px-8">
+    <div class="container mx-auto">
+        <h2 class="text-center text-white mb-12 lg:mb-16">{{$.Msg "how.title"}}</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8 lg:gap-12 max-w-5xl mx-auto">
+            <div class="text-center">
+                <div class="relative inline-flex items-center justify-center w-20 h-20 lg:w-24 lg:h-24 mb-6">
+                    <div class="absolute inset-0 bg-orange-500/20 rounded-full"></div>
+                    <div class="relative w-16 h-16 lg:w-20 lg:h-20 bg-orange-500 rounded-full flex items-center justify-center">
+                        <span class="text-3xl lg:text-4xl font-bold text-white">1</span>
+                    </div>
+                </div>
+                <h3 class="text-xl lg:text-2xl font-bold text-white mb-3">{{$.Msg "how.s1.title"}}</h3>
+                <p class="text-zinc-400 leading-relaxed">{{$.Msg "how.s1.desc"}}</p>
+            </div>
+            <div class="text-center">
+                <div class="relative inline-flex items-center justify-center w-20 h-20 lg:w-24 lg:h-24 mb-6">
+                    <div class="absolute inset-0 bg-orange-500/20 rounded-full"></div>
+                    <div class="relative w-16 h-16 lg:w-20 lg:h-20 bg-orange-500 rounded-full flex items-center justify-center">
+                        <span class="text-3xl lg:text-4xl font-bold text-white">2</span>
+                    </div>
+                </div>
+                <h3 class="text-xl lg:text-2xl font-bold text-white mb-3">{{$.Msg "how.s2.title"}}</h3>
+                <p class="text-zinc-400 leading-relaxed">{{$.Msg "how.s2.desc"}}</p>
+            </div>
+            <div class="text-center">
+                <div class="relative inline-flex items-center justify-center w-20 h-20 lg:w-24 lg:h-24 mb-6">
+                    <div class="absolute inset-0 bg-orange-500/20 rounded-full"></div>
+                    <div class="relative w-16 h-16 lg:w-20 lg:h-20 bg-orange-500 rounded-full flex items-center justify-center">
+                        <span class="text-3xl lg:text-4xl font-bold text-white">3</span>
+                    </div>
+                </div>
+                <h3 class="text-xl lg:text-2xl font-bold text-white mb-3">{{$.Msg "how.s3.title"}}</h3>
+                <p class="text-zinc-400 leading-relaxed">{{$.Msg "how.s3.desc"}}</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="py-16 lg:py-24 px-4 sm:px-6 lg:px-8">
+    <div class="container mx-auto flex flex-col lg:flex-row gap-8">
+        <div id="domain_check_form_section" class="w-full lg:w-2/3">
+            <div class="bg-zinc-900 rounded-2xl p-8 lg:p-12 shadow-xl">
+                <h2 class="text-white mb-6 text-center lg:text-left">{{$.Msg "form.title"}}</h2>
+                <form id="domain-check-form" class="space-y-4" data-endpoint="/api/check-domain">
+                    <div>
+                        <label for="domain-input" class="block text-zinc-300 text-sm font-medium mb-2">{{$.Msg "form.label"}}</label>
+                        <input type="text" id="domain-input" name="domain" placeholder="{{$.Msg "form.placeholder"}}"
+                               class="w-full px-4 py-3 lg:py-4 bg-zinc-800 border border-zinc-700 rounded-xl text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent transition-all"
+                               required aria-describedby="domain-help domain-result"/>
+                        <p id="domain-help" class="mt-2 text-xs text-zinc-500">{{$.Msg "form.help"}}</p>
+                    </div>
+                    <button type="submit" id="check-button"
+                            class="w-full px-8 py-4 bg-orange-500 text-white rounded-xl font-semibold text-lg hover:bg-orange-600 transition-all duration-200 shadow-lg disabled:opacity-50 disabled:cursor-not-allowed">
+                        {{$.Msg "form.button"}}
+                    </button>
+                    <div id="domain-result" class="hidden mt-4 p-4 rounded-xl" role="alert" aria-live="polite">
+                        <span id="domain-result-text"></span>
+                    </div>
+                    <div id="domain-details" class="hidden mt-4 bg-zinc-800 rounded-xl p-6 border border-zinc-700">
+                        <h3 class="text-white font-semibold text-lg mb-4">{{$.Msg "form.details.title"}}</h3>
+                        <div id="domain-details-content" class="space-y-4 text-sm text-zinc-300"></div>
+                    </div>
+                    <script type="application/json" id="domain-check-messages">{
+                        "found": {{$.ToJSON ($.MsgRaw "form.found")}},
+                        "not_found": {{$.ToJSON ($.MsgRaw "form.not_found")}},
+                        "error": {{$.ToJSON ($.MsgRaw "form.error")}},
+                        "rate_limited": {{$.ToJSON ($.MsgRaw "form.rate_limited")}},
+                        "invalid": {{$.ToJSON ($.MsgRaw "form.invalid")}},
+                        "server_error": {{$.ToJSON ($.MsgRaw "form.server_error")}}
+                    }</script>
+                </form>
+            </div>
+        </div>
+        <div id="catalog_teaser_section" class="hidden lg:block w-full lg:w-1/3">
+            <div class="bg-zinc-900 rounded-2xl p-8 lg:p-12 shadow-xl text-center">
+                <h2 class="text-white mb-4">{{$.Msg "catalog.title"}}</h2>
+                <p class="text-zinc-400 mb-6 lg:mb-8 text-lg">{{$.Msg "catalog.desc"}}</p>
+                <a href="https://laravel.city/sites" target="_blank" rel="noopener noreferrer"
+                   class="inline-flex items-center justify-center px-8 py-4 bg-orange-500 text-white rounded-xl font-semibold text-lg hover:bg-orange-600 transition-all duration-200 shadow-lg">
+                    {{$.Msg "catalog.button"}}
+                </a>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section id="latest_domains_section" class="py-16 lg:py-24 px-4 sm:px-6 lg:px-8">
+    <div class="container mx-auto">
+        <div class="text-center mb-12 lg:mb-16">
+            <h2 class="text-white mb-4">{{$.Msg "latest.title"}}</h2>
+            <p class="text-zinc-400 text-lg max-w-2xl mx-auto">{{$.Msg "latest.subtitle"}}</p>
+        </div>
+        {{if .Data.Latest}}
+        <div class="bg-zinc-900 rounded-2xl shadow-xl overflow-hidden">
+            <div id="domains-list" class="divide-y divide-zinc-800">
+                {{range .Data.Latest}}
+                <div class="domain-item p-4 lg:p-6 hover:bg-zinc-800/50 transition-colors">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <a href="https://{{.Name}}" target="_blank" rel="noopener noreferrer"
+                               class="text-lg lg:text-xl font-semibold text-white hover:text-orange-500 transition-colors">{{.Name}}</a>
+                            {{range .Subdomains}}
+                            <a href="https://{{.Host}}" target="_blank" rel="noopener noreferrer"
+                               class="text-zinc-400 hover:text-orange-500 transition-colors"
+                               aria-label="{{.Host}}">
+                                <span class="px-2 py-1 bg-orange-500/20 text-orange-400 text-xs font-medium rounded-md">{{.Label}}</span>
+                            </a>
+                            {{end}}
+                        </div>
+                        <div class="text-zinc-400 text-sm whitespace-nowrap">
+                            {{if .VerText}}<span class="mr-3 text-orange-400">{{.VerText}}</span>{{end}}
+                            <span>{{$.Msg "latest.updated"}}: {{.UpdatedText}}</span>
+                        </div>
+                    </div>
+                </div>
+                {{end}}
+            </div>
+            <div class="p-6 text-center border-t border-zinc-800">
+                <a href="https://laravel.city/sites" target="_blank" rel="noopener noreferrer"
+                   class="inline-flex items-center justify-center px-6 py-3 bg-orange-500 text-white rounded-xl font-medium hover:bg-orange-600 transition-colors">
+                    {{$.Msg "latest.catalog"}}
+                </a>
+            </div>
+        </div>
+        {{else}}
+        <div class="text-center text-zinc-400 py-12">{{$.Msg "latest.empty"}}</div>
+        {{end}}
+    </div>
+</section>
+
+<section class="py-16 lg:py-24 px-4 sm:px-6 lg:px-8">
+    <div class="container mx-auto flex flex-col md:flex-row gap-8">
+        <div class="w-full md:w-1/2">
+            <div id="contacts_section">
+                <h2 class="text-center text-white mb-12 lg:mb-16">{{$.Msg "contacts.title"}}</h2>
+                <div class="max-w-md mx-auto">
+                    <div class="bg-zinc-900 rounded-2xl p-8 shadow-xl">
+                        <div class="space-y-4">
+                            <div>
+                                <p class="text-zinc-400 text-sm mb-2">Email</p>
+                                <a href="mailto:{{$.Msg "contacts.email"}}" class="text-orange-500 hover:text-orange-400 transition-colors underline">{{$.Msg "contacts.email"}}</a>
+                            </div>
+                            <div>
+                                <p class="text-zinc-400 text-sm mb-2">Telegram</p>
+                                <a href="{{$.Msg "contacts.telegram"}}" target="_blank" rel="noopener noreferrer" class="text-orange-500 hover:text-orange-400 transition-colors underline">{{$.Msg "contacts.telegram"}}</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="w-full md:w-1/2">
+            <div class="bg-zinc-900 rounded-2xl p-8 lg:p-12 shadow-xl border-l-4 border-orange-500 h-full flex flex-col justify-center">
+                <h2 class="text-white mb-4">{{$.Msg "telegram.title"}}</h2>
+                <p class="text-zinc-400 mb-6 lg:mb-8">{{$.Msg "telegram.subtitle"}}</p>
+                <a href="https://t.me/laravelcity" target="_blank" rel="noopener noreferrer"
+                   class="inline-flex items-center gap-2 px-6 lg:px-8 py-3 lg:py-4 bg-orange-500 text-white rounded-xl font-semibold text-lg hover:bg-orange-600 transition-all duration-200 shadow-lg w-fit">
+                    <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
+                    {{$.Msg "telegram.button"}}
+                </a>
+            </div>
+        </div>
+    </div>
+</section>
+
+</main>
+
+<footer class="border-t border-zinc-800/50 mt-20">
+    <div class="container mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div class="flex flex-col sm:flex-row items-center justify-between gap-4 text-sm text-zinc-400">
+            <div>{{$.Msg "footer.copyright"}}</div>
+            <div>{{$.Msg "footer.not_affiliated"}}</div>
+        </div>
+    </div>
+</footer>
+
+<script src="/static/landing.js" defer></script>
 </body>
 </html>

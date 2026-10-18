@@ -1,0 +1,91 @@
+/*
+ * Исходник Tailwind v4 лендинга (T-122): классы разметки сканируются из
+ * шаблонов (@source), утилиты Tailwind — по умолчанию. Сборка — стадия
+ * css Dockerfile.go (T-124) или make web-css для dev (standalone-CLI
+ * tailwindcss v4 через одноразовый docker run); собранный бандл
+ * internal/web/static/app.css в git НЕ хранится (placeholder держит
+ * go:embed/сборку зелёными — свежий клон даёт страницу без стилей).
+ */
+@import "tailwindcss";
+
+@source "../templates/landing.html";
+
+/* Каркас страницы — тёмная тема larasites (перенос T-122). */
+:root {
+    color-scheme: dark;
+}
+
+/* Анимации радара героя (перенос из hero.blade.php). */
+@media (prefers-reduced-motion: no-preference) {
+    .sweep-animation {
+        animation: sweep 25s linear infinite;
+    }
+
+    .pulse-animation {
+        animation: pulse 2s ease-in-out infinite;
+    }
+}
+
+@keyframes sweep {
+    from {
+        transform: rotate(0deg);
+        transform-origin: 200px 200px;
+    }
+    to {
+        transform: rotate(360deg);
+        transform-origin: 200px 200px;
+    }
+}
+
+@keyframes pulse {
+    0%, 100% {
+        opacity: 0.6;
+        transform: scale(1);
+    }
+    50% {
+        opacity: 1;
+        transform: scale(1.2);
+    }
+}
+
+/* Облако зон: раскладку делает landing.js (коллизии), стили — перенос
+ * из zone-cloud.blade.php. */
+#zone-cloud {
+    overflow: visible;
+}
+
+.zone-item {
+    background: linear-gradient(135deg, rgba(249, 115, 22, 0.15) 0%, rgba(249, 115, 22, 0.25) 100%);
+    color: rgba(249, 115, 22, 0.9);
+    border: 1px solid rgba(249, 115, 22, 0.3);
+    opacity: 0;
+    transition: opacity 0.3s ease-in-out;
+    cursor: pointer;
+    user-select: none;
+}
+
+.zone-item.animating {
+    opacity: 1;
+    will-change: transform;
+}
+
+.zone-item:hover,
+.zone-item:focus {
+    background: linear-gradient(135deg, rgba(249, 115, 22, 0.25) 0%, rgba(249, 115, 22, 0.35) 100%);
+    color: rgb(249, 115, 22);
+    border-color: rgba(249, 115, 22, 0.6);
+    box-shadow: 0 0 0 2px rgba(249, 115, 22, 0.4);
+    z-index: 20 !important;
+    pointer-events: auto;
+}
+
+.zone-item:hover .zone-tooltip,
+.zone-item:focus .zone-tooltip {
+    opacity: 1 !important;
+    pointer-events: none;
+}
+
+.zone-tooltip {
+    z-index: 30;
+    transition: opacity 0.2s ease-in-out;
+}

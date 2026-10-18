@@ -556,19 +556,27 @@ Warn при срабатывании, Info при снятии; «не изме�
 gauge-реестр в monitor не заводится — метрики алертов в Prometheus заведёт
 слой T-077 поверх `internal/metrics`, чтобы не дублировать реестры и метки.
 
-`web` (этап 13, T-121; продуктовое расширение вне основного ТЗ — перенос
-из larasites): публичный лендинг. Каркас — `cmd/web` (`config.Load` →
-`service.Run`, пул через `OnDBPool`, метрики/проб — loopback
-`127.0.0.1:9107`); публичный слушатель `web.listen` — собственный
-`http.Server` внутри OnRun с graceful stop по отмене ctx: каркас даёт
-один HTTP-порт на сервис и вешает туда `/metrics`, выставлять который
-наружу нельзя (ТЗ §9) — прецедент управления жизненным циклом внутри
-OnRun. Роуты: `GET /` — редирект на дефолтную локаль `/ru`,
-`GET /{ru|en}` — лендинг (T-122 наполняет), `POST /api/check-domain` —
-живая проверка из формы (T-123), `GET /healthz` — readiness ping
-PostgreSQL (503), статика. Шаблоны — `html/template` + `go:embed`
-(`internal/web/templates`), новых зависимостей нет. Конфигурация — секция
-`web` (`listen`/`rate_limit`/`timeout`, [`configuration.md`](configuration.md)).
+`web` (этап 13, T-121/T-122; продуктовое расширение вне основного ТЗ —
+перенос из larasites): публичный лендинг. Каркас — `cmd/web`
+(`config.Load` → `service.Run`, пул через `OnDBPool`, метрики/проб —
+loopback `127.0.0.1:9107`); публичный слушатель `web.listen` —
+собственный `http.Server` внутри OnRun с graceful stop по отмене ctx:
+каркас даёт один HTTP-порт на сервис и вешает туда `/metrics`,
+выставлять который наружу нельзя (ТЗ §9) — прецедент управления
+жизненным циклом внутри OnRun. Роуты: `GET /` — редирект на дефолтную
+локаль `/ru`, `GET /{ru|en}` — лендинг (T-122: перенос разметки
+larasites — hero с SVG-радаром, карточки статистики со счётчиками
+count-up, облако зон топ-50 с лог-масштабом и коллизиями, таблица зон
+топ-10 с сортировкой, how-it-works, форма ручной проверки, последние
+находки с бейджами субдоменов и диапазоном версий, контакты/Telegram;
+SEO canonical/hreflang/OG/Twitter, счётчик Яндекс.Метрики), данные —
+кэши T-120 + laravel_history («находки за 24 ч», T-118), `POST
+/api/check-domain` — живая проверка из формы (T-123), `GET /healthz` —
+readiness ping PostgreSQL (503), `GET /static/*` — статика (go:embed;
+`app.css` — генерат Tailwind `make web-css`, в git placeholder).
+Шаблоны — `html/template` + `go:embed`, новых зависимостей нет.
+Конфигурация — секция `web` (`listen`/`rate_limit`/`timeout`,
+[`configuration.md`](configuration.md)).
 
 Подробности браузерного слоя (изоляция, блокировка ресурсов, ожидание,
 съём результата) — [`render.md`](render.md); live-проверки против

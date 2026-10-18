@@ -1,46 +1,60 @@
-// Package web — публичный сервис лендинга (этап 13, T-121; продуктовое
-// расширение вне основного ТЗ — перенос из larasites): предподсчитанные
-// счётчики конвейера, форма ручной проверки домена, i18n ru/en.
+// Package web — публичный сервис лендинга (этап 13, T-121/T-122;
+// продуктовое расширение вне основного ТЗ — перенос из larasites):
+// предподсчитанные счётчики конвейера, форма ручной проверки домена,
+// i18n ru/en.
 //
 // Каркас (T-121): публичный слушатель — собственный http.Server внутри
 // OnRun с graceful stop по отмене ctx. Каркас internal/service даёт один
-// порт HTTP на сервис и вешает туда /metrics с пробыми эндпоинтами —
+// порт HTTP на сервис и вешает туда /metrics с пробными эндпоинтами —
 // выставлять его наружу нельзя (метрики — внутренняя поверхность,
 // ТЗ §9), поэтому MetricsAddr остаётся на loopback (:9107, cmd/web), а
 // посетителя обслуживает web.listen. Прецедент управления жизненным
 // циклом внутри OnRun — клиенты воркеров (Redis-очереди).
 //
-// Роуты (наполнение лендинга — T-122, форма — T-123):
+// Роуты:
 //
 //   - GET /            → редирект на дефолтную локаль /ru;
-//   - GET /{locale}    — лендинг локали ru|en (T-122);
+//   - GET /{locale}    — лендинг локали ru|en (T-122: перенос разметки
+//     larasites — статистика/облако/таблица зон, последние находки,
+//     форма, SEO canonical/hreflang/OG/Twitter);
 //   - POST /api/check-domain — живая проверка (T-123, заглушка 501);
-//   - GET /healthz     — readiness: ping PostgreSQL (503 при отказе) —
-//     отдельный от metrics-порта эндпоинт;
-//   - GET /static/*    — статика лендинга (T-122).
-//
-// Методы: не GET/HEAD на страницах и не POST на API — 405. Шаблоны и
-// статика — html/template + go:embed (прецедент migrations/embed.go),
-// новых зависимостей нет.
+//   - GET /healthz     — readiness: ping PostgreSQL (503 при отказе);
+//   - GET /static/*    — статика лендинга (go:embed; app.css —
+//     генерат Tailwind, placeholder до make web-css/T-124).
 package web
 
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
-// Pinger — зависимость readiness-проб: пул БД (*pgxpool.Pool
-// удовлетворяет). Выделен для тестов каркаса без PostgreSQL.
+// Pinger — readiness-часть зависимости БД.
 type Pinger interface {
 	Ping(ctx context.Context) error
+}
+
+// Querier — выборки данных лендинга (*pgxpool.Pool удовлетворяет вместе
+// с Pinger). Выделен для тестов без PostgreSQL.
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// DB — зависимость сервиса: readiness ping + данные страницы.
+type DB interface {
+	Pinger
+	Querier
 }
 
 // Locales — поддерживаемые локали лендинга (зафиксированное решение
@@ -58,28 +72,61 @@ type Options struct {
 
 // Server — публичный HTTP-сервер лендинга.
 type Server struct {
-	ping Pinger
-	opt  Options
-	tpl  *template.Template
+	db  DB
+	opt Options
+	tpl *template.Template
 }
 
-// New собирает сервер: ping — источник readiness-проверки /healthz.
-func New(ping Pinger, opts Options) (*Server, error) {
-	if ping == nil {
+// landingVM — данные рендера лендинга: локаль, список локалей,
+// данные страницы и словарь локали (методы Msg/MsgRaw/ToJSON вызываются
+// из шаблона как {{$.Msg "ключ"}} — функции данных, а не FuncMap:
+// шаблон парсится один раз без локали).
+type landingVM struct {
+	Locale  string
+	Locales []string
+	Data    LandingData
+	msgs    messages
+}
+
+// Msg — строка локали, безопасно экранированная.
+func (v landingVM) Msg(key string) template.HTML {
+	return template.HTML(template.HTMLEscapeString(v.msgs[key]))
+}
+
+// MsgRaw — строка локали без экранирования (для JSON-вставок).
+func (v landingVM) MsgRaw(key string) string { return v.msgs[key] }
+
+// ToJSON — JSON-литерал строки для <script type="application/json">.
+func (v landingVM) ToJSON(s string) template.HTML {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return template.HTML(`""`)
+	}
+	return template.HTML(b)
+}
+
+// New собирает сервер: db — пул БД (ping + данные страницы). Шаблон
+// парсится один раз: локаль приходит данными (landingVM), словарь —
+// метод рендера.
+func New(db DB, opts Options) (*Server, error) {
+	if db == nil {
 		return nil, errors.New("web: пул БД не задан (postgres.dsn обязателен)")
 	}
-	tpl, err := template.ParseFS(templates, "templates/*.html")
+	tpl, err := template.ParseFS(templates, "templates/landing.html")
 	if err != nil {
 		return nil, fmt.Errorf("web: шаблоны: %w", err)
 	}
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
-	return &Server{ping: ping, opt: opts, tpl: tpl}, nil
+	return &Server{db: db, opt: opts, tpl: tpl}, nil
 }
 
 //go:embed templates
 var templates embed.FS
+
+//go:embed static
+var staticFS embed.FS
 
 // Handler — маршрутизатор публичной поверхности (тесты — httptest).
 func (s *Server) Handler() http.Handler {
@@ -91,6 +138,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/check-domain", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
+	mux.HandleFunc("GET /static/", s.handleStatic)
 	mux.HandleFunc("GET /{$}", s.handleRoot)
 	mux.HandleFunc("GET /", s.handleLanding)
 	return mux
@@ -136,30 +184,53 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 	}
 }
 
-// handleRoot — GET / — редирект на дефолтную локаль (i18n ru+en, ru —
-// дефолт; выбор локали префиксом пути, не cookie — канонические адреса
-// для SEO).
+// handleRoot — GET / — редирект на дефолтную локаль (выбор локали
+// префиксом пути, не cookie — канонические адреса для SEO).
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/"+DefaultLocale, http.StatusFound)
 }
 
-// handleLanding — GET /{locale} и статика: лендинг локали (T-122
-// наполняет разметкой и данными; каркас рендерит шаблон с локалью и
-// закрывает чужие префиксы 404).
+// handleLanding — GET /{locale}: данные страницы из кэшей (T-120) и
+// рендер шаблона локали. Сбой БД — 500 без раскрытия деталей: страница
+// без данных бессмысленна (деградация секций — паттерн внутреннего
+// дашборда T-129, не публичной страницы).
 func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	locale, _, _ := strings.Cut(path, "/")
-	if !localeSupported(locale) {
+	if _, ok := localeMessagesMap[locale]; !ok {
 		http.NotFound(w, r)
 		return
 	}
+	data, err := FetchLandingData(r.Context(), s.db)
+	if err != nil {
+		s.opt.Log.Warn("данные лендинга", "locale", locale, "err", err)
+		http.Error(w, "temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.tpl.ExecuteTemplate(w, "landing.html", map[string]any{
-		"Locale": locale,
+	if err := s.tpl.ExecuteTemplate(w, "landing.html", landingVM{
+		Locale:  locale,
+		Locales: Locales,
+		Data:    data,
+		msgs:    localeMessages(locale),
 	}); err != nil {
 		// Заголовок уже мог уйти — статус не сменить; логируем и рвём.
 		s.opt.Log.Warn("рендер лендинга", "locale", locale, "err", err)
 	}
+}
+
+// handleStatic — статика из embed: собирается в бинарий, отдаётся
+// immutable-заголовком (имена без хэшей — кэш по общему правилу).
+func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
+	sub, err := fs.Sub(staticFS, "static")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	// app.css — генерат Tailwind (make web-css / стадия css Dockerfile,
+	// T-124); в git — placeholder, чтобы go:embed не падал на свежем
+	// клоне (страница откроется без стилей, не 500).
+	http.StripPrefix("/static/", http.FileServer(http.FS(sub))).ServeHTTP(w, r)
 }
 
 // handleCheckDomain — POST /api/check-domain: живая проверка домена из
@@ -171,18 +242,13 @@ func (s *Server) handleCheckDomain(w http.ResponseWriter, _ *http.Request) {
 
 // handleHealthz — readiness: ping PostgreSQL с коротким таймаутом
 // (посетитель не ждёт восстановления БД дольше секунды — 503 быстрее).
-// nil-зависимости каркас не допускает (New).
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 	defer cancel()
-	if err := s.ping.Ping(ctx); err != nil {
+	if err := s.db.Ping(ctx); err != nil {
 		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
-}
-
-func localeSupported(locale string) bool {
-	return locale == "ru" || locale == "en"
 }
