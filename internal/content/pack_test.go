@@ -944,6 +944,37 @@ func TestParsePackHeaderHdrLen(t *testing.T) {
 	}
 }
 
+// TestPackIDFromNameCanonical — реестр паков принимает только
+// канонические имена pack-NNNNNN.pack (C-16): имя без паддинга — чужой
+// файл, а не второй файл того же pack_id; длинные id (≥ 7 цифр)
+// каноничны — packFileName не усекает разряды.
+func TestPackIDFromNameCanonical(t *testing.T) {
+	for _, ok := range []struct {
+		name string
+		id   int32
+	}{
+		{"pack-000001.pack", 1},
+		{"pack-123456.pack", 123456},
+		{"pack-1000000.pack", 1000000}, // 7 цифр: %06d не усекает
+	} {
+		if id, valid := packIDFromName(ok.name); !valid || id != ok.id {
+			t.Errorf("packIDFromName(%q) = %d, %v; want %d, true", ok.name, id, valid, ok.id)
+		}
+	}
+	for _, bad := range []string{
+		"pack-1.pack",       // без паддинга
+		"pack-0001.pack",    // короткий паддинг
+		"pack-0000001.pack", // длинный паддинг
+		"pack-000001.pack.bak",
+		"dict.zst",
+		".packs.lock",
+	} {
+		if _, valid := packIDFromName(bad); valid {
+			t.Errorf("packIDFromName(%q) принял чужое имя", bad)
+		}
+	}
+}
+
 // TestPackReadBlockBounds — readPackBlock сверяет размещение с файлом до
 // аллокации (C-14): повреждённая строка (len до 2 ГиБ или отрицательный,
 // смещение мимо файла) — ошибка, а не гигантский буфер и не паника.

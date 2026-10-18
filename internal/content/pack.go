@@ -638,7 +638,10 @@ func packFileName(id int32) string {
 }
 
 // packIDFromName разбирает имя пак-файла; чужие файлы (словарь, замок,
-// временные) отвергаются.
+// временные) отвергаются. Принимается только каноническое имя
+// pack-NNNNNN.pack (packFileName): «pack-1.pack» — чужой файл, иначе
+// один pack_id получил бы два файла (писатель создаёт каноничное имя
+// рядом с неканоничным), и удаление с ротацией путались бы между ними.
 func packIDFromName(name string) (int32, bool) {
 	const prefix, suffix = "pack-", ".pack"
 	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
@@ -647,6 +650,9 @@ func packIDFromName(name string) (int32, bool) {
 	n, err := strconv.Atoi(name[len(prefix) : len(name)-len(suffix)])
 	if err != nil || n < 1 || int64(n) > 1<<31-1 {
 		return 0, false
+	}
+	if name != packFileName(int32(n)) {
+		return 0, false // имя без паддинга — не наш пак
 	}
 	return int32(n), true
 }
