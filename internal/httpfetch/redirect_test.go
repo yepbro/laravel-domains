@@ -957,3 +957,72 @@ func TestFetchChainContextCancel(t *testing.T) {
 		t.Errorf("цепочка: %+v, ожидался 1 шаг до отмены", got.Chain)
 	}
 }
+
+// --- IP-литералы в переходах ----------------------------------------------
+
+// TestRedirectResolveIPLiteral: IP-литералы в Location проходят как
+// есть — без punycode (Hostname() срезает скобки, прежняя проверка
+// префикса "[" никогда не срабатывала, а HostToASCII падает на IPv6 —
+// переход не выполнялся), с портом и без, IPv4 и IPv6; чужая схема —
+// по-прежнему false.
+func TestRedirectResolveIPLiteral(t *testing.T) {
+	base := &url.URL{Scheme: "http", Host: "start.example-test.net", Path: "/page"}
+	cases := []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{"http://[::1]:8080/next", "http://[::1]:8080/next", true},
+		{"http://[2001:db8::1]/", "http://[2001:db8::1]/", true},
+		{"http://192.0.2.10/p", "http://192.0.2.10/p", true},
+		{"ftp://[::1]/", "", false},
+	}
+	for _, c := range cases {
+		u, ok := redirectResolve(base, c.raw)
+		if ok != c.ok {
+			t.Errorf("redirectResolve(%q): ok=%v, ожидалось %v", c.raw, ok, c.ok)
+			continue
+		}
+		if ok && u.String() != c.want {
+			t.Errorf("redirectResolve(%q) = %q, ожидалось %q", c.raw, u, c.want)
+		}
+	}
+}
+
+// TestFetchChainIPv6LiteralLocation: Location с IPv6-литералом —
+// обычный переход цепочки: хост [::1] берётся литералом (lookup не
+// трогает резолвер), итог — страница по IPv6.
+func TestFetchChainIPv6LiteralLocation(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6-петля недоступна: %v", err)
+	}
+	srv6 := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "V6-LAND")
+	})}
+	go func() { _ = srv6.Serve(ln) }()
+	t.Cleanup(func() { _ = srv6.Close() })
+	_, v6port, _ := net.SplitHostPort(ln.Addr().String())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://[::1]:"+v6port+"/land")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(Options{Resolver: redirectResolverFail})
+	got, err := FetchChain(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "v6start.example.net", "/start"), Addrs: loopbackAddr()})
+	if err != nil {
+		t.Fatalf("FetchChain: %v", err)
+	}
+	if body := redirectReadBody(t, got); body != "V6-LAND" {
+		t.Errorf("итоговое тело: %q, ожидался переход на [::1]", body)
+	}
+	if host := got.Result.FinalURL.Hostname(); host != "::1" {
+		t.Errorf("хост итогового URL: %q, ожидался ::1", host)
+	}
+	if len(got.Chain) != 2 {
+		t.Errorf("цепочка: %+v, ожидались 2 шага", got.Chain)
+	}
+}

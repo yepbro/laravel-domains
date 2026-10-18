@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -216,10 +217,11 @@ func redirectNext(res *FetchResult) (*url.URL, bool) {
 // текущего ответа (net/url), хост приводится к punycode (ТЗ 5.2 п. 8 —
 // «хосты из Location и <meta refresh>, содержащие unicode, приводятся
 // к punycode перед запросом») и нижнему регистру, пустой путь
-// нормализуется в "/". IPv6-литералы HostToASCII не поддержаны (T-009)
-// и проходят как есть. false — по строке нельзя идти: не URL, чужая
-// схема, нет хоста или невалидное имя (битый punycode, запрещённые
-// UTS-46 символы).
+// нормализуется в "/". IP-литералы (IPv4/IPv6) HostToASCII не нужны и
+// IPv6 на нём падает (T-009) — проходят как есть: url.URL.Hostname()
+// отдаёт литерал без скобок, готовый к диалу. false — по строке
+// нельзя идти: не URL, чужая схема, нет хоста или невалидное имя
+// (битый punycode, запрещённые UTS-46 символы).
 func redirectResolve(base *url.URL, raw string) (*url.URL, bool) {
 	ref, err := url.Parse(raw)
 	if err != nil {
@@ -233,7 +235,8 @@ func redirectResolve(base *url.URL, raw string) (*url.URL, bool) {
 	if host == "" {
 		return nil, false
 	}
-	if !strings.HasPrefix(host, "[") {
+	if _, err := netip.ParseAddr(host); err != nil {
+		// Имя (не IP-литерал): punycode и нижний регистр.
 		ascii, err := idn.HostToASCII(host)
 		if err != nil {
 			return nil, false
