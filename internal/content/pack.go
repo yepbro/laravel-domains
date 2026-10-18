@@ -491,13 +491,15 @@ func (s *PackStore) rotateLocked(recLen int64) error {
 
 // createPackLocked создаёт пак с заголовком. Файл может существовать
 // пустым (крах после create до записи заголовка) — заголовок дописывается;
-// несовместимое содержимое — ошибка.
+// несовместимое содержимое — ошибка (открытый файл закрывается: утечка
+// fd на каждом повторе ротации скормила бы процессу EMFILE).
 func (s *PackStore) createPackLocked(id int32) (*packFile, error) {
 	pf, err := s.openPackForWrite(id)
 	if err != nil {
 		return nil, err
 	}
 	if pf.size != packHeaderLen {
+		_ = pf.f.Close()
 		return nil, fmt.Errorf("content: пак %d: файл уже содержит %d байт, ожидался только заголовок",
 			id, pf.size)
 	}

@@ -6,6 +6,7 @@
 package content
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -796,6 +797,43 @@ func TestPackClosed(t *testing.T) {
 	}
 	if got, err := st.Get(ctx, res.Hash); err != nil || string(got) != "до закрытия" {
 		t.Errorf("Get после Close: %v", err)
+	}
+}
+
+// TestPackCreatePackClosesOnSize — несовместимое содержимое при создании
+// пака: ошибка, и открытый файл не утекает (fd закрыт — повторяющаяся
+// ротация по устаревшему кэшу не выест дескрипторы до EMFILE).
+func TestPackCreatePackClosesOnSize(t *testing.T) {
+	st, _ := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
+	// Пак 2 уже существует с содержимым сверх заголовка — createPackLocked
+	// обязан отказаться и закрыть открытый файл.
+	compactCraftPack(t, st.opts.Dir, 2, [][]byte{bytes.Repeat([]byte("x"), 32)})
+
+	openPacks := func() int {
+		t.Helper()
+		ents, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Skipf("/proc/self/fd недоступен: %v", err)
+		}
+		n := 0
+		for _, e := range ents {
+			if link, err := os.Readlink("/proc/self/fd/" + e.Name()); err == nil &&
+				strings.Contains(link, packFileName(2)) {
+				n++
+			}
+		}
+		return n
+	}
+	if before := openPacks(); before != 0 {
+		t.Fatalf("пак 2 уже открыт до вызова: %d fd", before)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := st.createPackLocked(2); err == nil {
+			t.Fatal("createPackLocked поверх непустого пака: ожидалась ошибка")
+		}
+		if n := openPacks(); n != 0 {
+			t.Fatalf("после ошибки createPackLocked открытых fd пака 2: %d, want 0 (утечка)", n)
+		}
 	}
 }
 
