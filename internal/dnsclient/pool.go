@@ -49,9 +49,13 @@ type UDPPool struct {
 	dial func(ctx context.Context) (*net.UDPConn, error)
 }
 
-// NewUDPPool создаёт пул и заранее открывает все size сокетов
-// (fail-fast: недоступный адрес — ошибка создания пула, а не первого
-// запроса). Контекст ограничивает открытие.
+// NewUDPPool создаёт пул и заранее открывает все size сокетов: ошибка
+// набора (кривой адрес/порт, нет маршрута) — ошибка создания пула на
+// старте, а не первого запроса. Доступность резолвера connect не
+// проверяет (UDP connect пакетов не шлёт): мёртвый сервер звучит в
+// первом обмене — ECONNREFUSED от подключённого сокета (ICMP port
+// unreachable) либо таймаут; см. NewClient о стартовой пробе (DNS-12).
+// Контекст ограничивает открытие.
 func NewUDPPool(ctx context.Context, addr string, size int) (*UDPPool, error) {
 	if size < 1 {
 		return nil, fmt.Errorf("dnsclient: размер пула UDP-сокетов %d: ожидается ≥ 1", size)
