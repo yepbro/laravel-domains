@@ -17,7 +17,8 @@
 //     фиксируют строку метаданных, не отпуская flock (T-042, уточнено
 //     здесь), поэтому множество строк не-новейшего пака заморожено;
 //   - живые блоки переписываются в новейший пак обычным путём записи
-//     (appendBlock: мьютекс + flock, O_APPEND) — старый пак не трогается;
+//     (пачка appendBatch: мьютекс + flock, O_APPEND, один fsync на
+//     пачку — C-11) — старый пак не трогается;
 //   - транзакция (пачками, короткими — стиль T-020) переводит размещения
 //     живых строк на новые блоки и удаляет мёртвые строки пака. До
 //     коммита старый пак цел — краш оставляет скопированные блоки
@@ -375,6 +376,16 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		return CompactResult{}, fmt.Errorf("content: компактификация пака %d: %w", packID, err)
 	}
 	size := st.Size()
+	// Пак короче заголовка легитимен для удаления (скан C-7 видит его
+	// «пустым»): строк в нём быть не может (скан бы ошибся), flush
+	// пройдёт пустым, файл удалится. Явной ошибки здесь не нужно.
+	// Исходный пак открывается один раз на проход (C-11): блоки читаются
+	// ReadAt по смещениям — без open/close на каждый блок.
+	src, err := os.Open(path)
+	if err != nil {
+		return CompactResult{}, fmt.Errorf("content: компактификация пака %d: %w", packID, err)
+	}
+	defer func() { _ = src.Close() }() // только чтение
 
 	rows, err := s.pool.Query(ctx, sqlCompactRows, packID)
 	if err != nil {
@@ -391,6 +402,8 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 	// flush переписывает накопленную пачку живых блоков в новейший пак и
 	// фиксирует транзакцию. Сбой до Commit оставляет скопированные блоки
 	// мусором, строки не тронуты — повтор прохода переиграет пачку.
+	// Дописывание — одной пачкой под одним захватом мьютекса и flock
+	// и одним fsync (C-11); байты пачки — на диске до транзакции (C-1).
 	flush := func() error {
 		if len(live) == 0 && len(dead) == 0 {
 			return nil
@@ -399,30 +412,43 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		packs := make([]int32, 0, len(live))
 		offs := make([]int64, 0, len(live))
 		var corruptHashes [][]byte
-		for _, r := range live {
-			block, err := readPackBlock(s.opts.Dir, packID, r.off, r.clen)
-			if err != nil {
-				// Блок недоступен: чтение и повторный Put этот контент
-				// не восстановят (дедуп видит живую строку). Строка
-				// помечается мёртвой в той же транзакции — пак остаётся
-				// компактифицируемым, место освобождается; расхождение
-				// целостности уходит в итог прохода (Warn цикла).
-				corrupt = append(corrupt, fmt.Errorf(
-					"content: компактификация пака %d: %x: блок нечитаем, строка помечена мёртвой: %w",
-					packID, r.hash, err))
-				corruptHashes = append(corruptHashes, r.hash[:])
-				res.Corrupted++
-				continue
-			}
-			newPack, newOff, err := s.appendBlock(block)
+		if len(live) > 0 {
+			batch, err := s.beginAppend()
 			if err != nil {
 				return err
 			}
-			hashes = append(hashes, r.hash[:])
-			packs = append(packs, newPack)
-			offs = append(offs, newOff)
-			res.CopiedBlocks++
-			res.CopiedBytes += 4 + int64(r.clen)
+			for _, r := range live {
+				block, err := readPackBlockAt(src, size, packID, r.off, r.clen)
+				if err != nil {
+					// Блок недоступен: чтение и повторный Put этот
+					// контент не восстановят (дедуп видит живую строку).
+					// Строка помечается мёртвой в той же транзакции — пак
+					// остаётся компактифицируемым, место освобождается;
+					// расхождение целостности уходит в итог прохода
+					// (Warn цикла).
+					corrupt = append(corrupt, fmt.Errorf(
+						"content: компактификация пака %d: %x: блок нечитаем, строка помечена мёртвой: %w",
+						packID, r.hash, err))
+					corruptHashes = append(corruptHashes, r.hash[:])
+					res.Corrupted++
+					continue
+				}
+				newPack, newOff, err := batch.append(block)
+				if err != nil {
+					if ferr := batch.finish(); ferr != nil {
+						err = errors.Join(err, ferr)
+					}
+					return err
+				}
+				hashes = append(hashes, r.hash[:])
+				packs = append(packs, newPack)
+				offs = append(offs, newOff)
+				res.CopiedBlocks++
+				res.CopiedBytes += 4 + int64(r.clen)
+			}
+			if err := batch.finish(); err != nil {
+				return err
+			}
 		}
 		tx, err := cdb.Begin(ctx)
 		if err != nil {
