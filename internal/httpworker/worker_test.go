@@ -290,7 +290,8 @@ func TestWorkerProcessDomain(t *testing.T) {
 }
 
 // TestWorkerCacheKey — нормализация ключа кэша: схема+хост+путь; query,
-// фрагмент и порт не входят, регистр хоста не важен (критерий T-054).
+// фрагмент и дефолтные порты схем (80/443) не входят, нестандартный порт
+// различает ключи, регистр хоста не важен (критерий T-054).
 func TestWorkerCacheKey(t *testing.T) {
 	base, err := url.Parse("https://www.example.com/some/path")
 	if err != nil {
@@ -311,11 +312,24 @@ func TestWorkerCacheKey(t *testing.T) {
 			t.Errorf("ключ %q ≠ ключу базы", raw)
 		}
 	}
+	httpBase, err := url.Parse("http://www.example.com/some/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse("http://www.example.com:80/some/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workerCacheKey(u) != workerCacheKey(httpBase) {
+		t.Error("ключ с явным дефолтным портом :80 ≠ ключу без порта")
+	}
 	for _, raw := range []string{
-		"http://www.example.com/some/path",  // другая схема
-		"https://old.example.com/some/path", // другой хост
-		"https://www.example.com/other",     // другой путь
-		"https://www.example.com",           // пустой путь — корень «/»
+		"http://www.example.com/some/path",          // другая схема
+		"https://old.example.com/some/path",         // другой хост
+		"https://www.example.com/other",             // другой путь
+		"https://www.example.com",                   // пустой путь — корень «/»
+		"https://www.example.com:8443/some/path",    // нестандартный порт — другой сервис
+		"https://www.example.com:444/some/path?q=1", // порт не глушится query
 	} {
 		u, err := url.Parse(raw)
 		if err != nil {
