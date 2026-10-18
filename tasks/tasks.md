@@ -32,6 +32,8 @@
 | 10 | Тестирование и приёмка | этап 10 (часть) | T-090…T-095 |
 | 11 | Доработки по итогам код-ревью (2026-10-18) | этап 11 | T-096…T-114 |
 | 12 | Доработки по итогам анализа larasites (2026-10-19) | — | T-115…T-119 |
+| 13 | Публичный лендинг — перенос из larasites (2026-10-19) | — | T-120…T-124 |
+| 14 | Начальное наполнение справочника зон (IANA) (2026-10-19) | — | T-125 |
 
 Этапы 0–9 и задача T-090/T-091/T-094/T-095 завершены — их 93 строки
 перенесены в архив [`tasks_done.md`](./tasks_done.md). Здесь остаются
@@ -40,7 +42,11 @@
 кандидаты из финальных отчётов групп fixes массового код-ревью
 (130 находок; отчёты — у основной сессии конвейера ревью) — и задачи
 этапа 12 — доработки по итогам анализа старой PHP-реализации той же
-задачи (larasites, 2026-10-19).
+задачи (larasites, 2026-10-19), задачи этапа 13 — перенос публичного
+лендинга из той же реализации (продуктовое расширение вне основного ТЗ;
+зафиксированные решения: гибридная семантика формы проверки, лог ручных
+проверок web_checks, i18n ru+en) и задача этапа 14 — начальное
+наполнение справочника зон из реестра IANA.
 
 ---
 
@@ -124,4 +130,52 @@ rules/laravel.yaml); переносимое — процессы вокруг д
 - Признак «хост начинается с api.» (пятое правило larasites): не индикатор Laravel; api-субдомен уже проверяется контентно (subdomains, dns_mask).
 - Булев счёт «2 из 5»: noisy-OR с весами — обобщение, учитывающее силу признаков; возврат к равнозначным голосам — шаг назад.
 - Приоритетная пере-проверка, fallback www→bare, отдельные режимы редиректов и 3-месячный цикл larasites закрыты: crawlerctl recheck, резолв всех субдоменов dns-этапом, redirect budget + alias/варианты, recheck_interval.
+
+---
+
+## Этап 13. Публичный лендинг — перенос из larasites (2026-10-19)
+
+Источник — публичная часть старой реализации (`~/projects/old/larasites`):
+лендинг `GET /{locale}` (HomeController + home.blade.php, 12 Blade-компонентов,
+~600 строк шаблонов) на предподсчитанных счётчиках, с облаком зон (топ-50),
+таблицей избранных зон, последними 5 находками и формой ручной проверки
+(`POST /api/check-domain`, троттлинг 4/мин, IDN/punycode); фронт — vanilla JS
+(landing.js, 897 строк: count-up, анимированное облако с коллизиями,
+сортировка таблицы, AJAX формы) + Tailwind v4; i18n ru/en (lang/landing.php).
+Продуктовое расширение вне основного ТЗ (в T-119 помечено «не делается в той
+задаче» — здесь делается). Зафиксированные решения (2026-10-19): семантика
+формы — гибрид (сначала сохранённые данные `domain_info`, затем живая
+проверка конвейером T-119), история ручных проверок — таблица web_checks,
+i18n — ru+en. Пределы переноса: активный 404-зонд отклонён ранее (Этап 12 —
+пассивная этика ТЗ §5.8/§9), CSRF/PHP-сессии не нужны (JSON API + рейт-лимит),
+Tailwind собирается один раз и артефакт комитится (node не появляется ни в
+сборке проекта, ни в рантайме), is_featured зон не переносится (админки нет —
+«избранные» зоны = топ-N по счётчику), «скорость шт/час» из
+daily_domain_statistics не переносится (таблицы нет; аналог динамики —
+«находок за 24 ч» появится с T-118, до того карточка не выводится).
+
+- **T-120** [новая] — Миграция 000010, данные лендинга: колонка `zones.domains_laravel bigint NOT NULL DEFAULT 0` — кэш числа Laravel-доменов зоны, обновляется тем же проходом ZoneStatsLoop (дополнительный `SELECT zone_id, count(*) FROM laravel_domains GROUP BY zone_id` — строка в таблице уже прошла порог analyzer); партиционированный индекс `laravel_domains (updated_at)` — «последние находки» сегодня сортируются по updated_at без индекса (PK только zone+domain); таблица `web_checks` — лог ручных проверок из формы (аналог form_histories larasites): id bigint identity PK, domain text NOT NULL (как введено), punycode_domain text NOT NULL, ip_address inet NOT NULL, found boolean NOT NULL, score real, duration_ms integer, created_at timestamptz NOT NULL DEFAULT now(); индексы (ip_address, created_at) и created_at; пишет только cmd/web (T-123), ротации в этой задаче нет. Тесты: schema_test (колонки/индексы/таблица), zonestats_test (обновление domains_laravel тем же проходом); docs/schema.md.
+- **T-121** [новая] — Каркас публичного сервиса `cmd/web` + `internal/web` (сегодня публичных портов нет — ТЗ §9 держит метрики на loopback). По образцу cmd/monitor (config.Load → service.Run), но публичный слушатель — собственный http.Server внутри OnRun с graceful stop по ctx: каркас service даёт один порт на сервис и вешает туда /metrics, выставлять его наружу нельзя, поэтому MetricsAddr остаётся на loopback (:9107 — следующий за analyzer), публичный `web.listen` — отдельный сервер (прецедент управления жизненным циклом внутри OnRun — клиенты воркеров). Конфиг-секция `web` по рецепту KnownFields (Default/Validate/envSpecs + config.example.yaml + docs/configuration.md): listen, check rate_limit (4/мин), timeout живой проверки. Роуты: GET /{locale} и / (лендинг, T-122), POST /api/check-domain (T-123), /healthz (свой ping PG — без metrics-порта), статика. Шаблоны/статика — html/template + go:embed (прецедент — migrations/embed.go), новых зависимостей нет. Тесты каркаса по образцу internal/service/service_test.go (httptest: маршрутизация, 404, healthz, graceful stop).
+- **T-122** [новая] — Лендинг: перенос разметки Blade → html/template (компоненты larasites components/landing/*: header, hero с SVG-радаром, statistics, zone-cloud, zone-table, how-it-works, latest-domains, contacts, telegram; layout с SEO — canonical/hreflang/OG/Twitter, favicon/manifest). Данные, все дёшево по кэшам T-120: карточки — активных зон, сумма zones.domains_total, сумма zones.domains_checked, сумма zones.domains_laravel (+«находок за 24 ч» из laravel_history после T-118, до того секция динамики не выводится); облако зон — топ-50 по domains_laravel с лог-масштабом размера как в larasites; таблица зон — топ-10 с долей domains_laravel/domains_checked; последние находки — laravel_domains JOIN domains JOIN zones ORDER BY updated_at DESC LIMIT 5, бейджи субдоменов из found_on_mask + справочника subdomains (www/api/crm/app/admin) со ссылками https://{sub}.{domain}, диапазон версий ver_min–ver_max, punycode→Unicode для отображения через x/net/idna (уже зависимость). i18n ru+en: словари (перенос lang/{ru,en}/landing.php) в internal/web, префикс /ru (default, / → редирект) и /en, hreflang, переключатель. Фронт: landing.js переносится с адаптацией эндпоинта и удалением CSRF-заголовка; Tailwind v4 предсобрать tailwind CLI один раз, артефакт + og-картинки/favicon/manifest — go:embed; счётчик Яндекс.Метрики сохранить. Тесты: handler-тесты на фейковом db.DB (запросы статистики/областей/находок), рендер ru/en; docs/services.md.
+- **T-123** [новая] — `POST /api/check-domain`, гибрид: (1) валидация ввода по образцу CheckDomainRequest larasites — trim, срез хвостовой точки, parse_url (http/https → host+scheme), regex ASCII-домена или IDN (≥2 непустые метки), max 2048; нормализация idn.Normalize (UTS46→punycode); (2) секция `stored` — SELECT domain_info($1): последний эпизод краулера, если домен известен; (3) секция `live` — живая проверка: рефакторинг конвейера T-119 (crawlerctl check) в переиспользуемую библиотечную функцию, общую для CLI и веба (DNS всех субдоменов → HTTP живых → правила; read-only к БД и очередям, UA/таймауты из конфигурации, никаких активных зондов — этика ТЗ §5.8/§9). Запись результата в web_checks (T-120). Рейт-лимит 4 req/min на IP — in-memory token bucket (один инстанс, stdlib, 429 + Retry-After). Ответ — единый JSON (found, score, версии, per-subdomain: статус, редиректы, сработавшие правила с evidence), ошибки валидации — 422 в формате, который рендерит перенесённый landing.js. Тесты: таблица валидатора (URL/IDN/мусор), рейт-лимит, e2e handler с фейковым чекером (интерфейсный шов), интеграционный на testbed (mockserver). Зависит от T-119, T-120, T-121.
+- **T-124** [новая] — Развёртывание и документация: compose-сервис web в profile app (клон go-common: SERVICE=web, METRICS_PORT=9107; публичный порт в dev — на 127.0.0.1); systemd crawler-web.service по образцу crawler-monitor (метрики loopback, наружу — только web.listen; вариант unix socket + nginx по месту деплоя); пример reverse-proxy с TLS в deploy/ (сегодня публичной точки входа в репо нет — фиксируем первый образец); robots.txt/sitemap.xml — статика лендинга. Документация: docs/services.md (новый сервис), docs/deploy.md, docs/configuration.md (секция web), README (таблица сервисов и структуры). Приёмка: make test + make lint зелёные; интеграционные — при затронутых миграциях (T-120).
+
+---
+
+## Этап 14. Начальное наполнение справочника зон (IANA) (2026-10-19)
+
+Справочник zones сегодня наполняется только автоматически — ingest'ом при
+первом файле зоны (ТЗ 5.1), предзаполнения нет. Полный каталог делегированных
+TLD (реестр корневой зоны IANA, ~1460 имён) — операционная база: полнота
+справочника для лендинга (T-122, облако/таблица зон), контроль имён входящих
+каталогов incoming, быстрый `zones enable` без ожидания первого файла.
+Источник — машинно-читаемый срез реестра
+`https://data.iana.org/TLD/tlds-alpha-by-domain.txt` (то же содержимое, что
+страница iana.org/domains/root/db, без парсинга HTML): одна зона на строку,
+IDN-зоны уже в punycode — совпадает с контрактом zones.name (ТЗ 5.2).
+Ограничение: это справочник имён TLD, НЕ источник доменов — домены
+по-прежнему только через ingest (var/incoming); метаданных (тип, менеджер)
+срез не содержит, схеме zones они и не нужны.
+
+- **T-125** [новая] — `crawlerctl zones sync` — добавление/обновление справочника зон из реестра IANA (четвёртое действие zones рядом с list/enable/disable). Флаги: `--file <путь>` (офлайн-режим — прод без исходящего интернета: файл качается заранее, например curl'ом) / `--url <url>` (по умолчанию — канонический data.iana.org, stdlib net/http с таймаутом), `--deactivate-missing` — зоны БД, отсутствующие в списке (retired TLD), выключать is_active = false (явный флаг, по умолчанию выключен; отчёт — какие выключены). Парсинг: строки-комментарии `#` пропускаются, первая несёт версию файла — выводить в отчёт; каждая строка валидируется idn.NormalizeZone (мусор — ошибка с номером строки, не тихий скип), дедупликация внутри файла. Семантика записи: одна вставка `INSERT … SELECT … FROM unnest(…) ON CONFLICT (name) DO NOTHING` — идемпотентно, повторный запуск ничего не меняет; новые зоны — is_active = true, как авто-создание ingest'ом (ТЗ 5.1; пустая зона планировщику безразлична — DispatchBatch идёт от доменов; вариант is_active = false отвергнут: тогда первый файл ingest'а не активировал бы зону, а активация в EnsureZone сломала бы документированный контракт паузы — приём файлов выключенной зоны работает, включение только руками zones enable, см. cmd/crawlerctl/zones.go); существующие строки не трогаются вовсе (is_active — владение оператора, счётчики — monitor): sync ничего не «обновляет» у существующих, добавление и выключение пропавших — весь эффект; name_unicode — displayUnicode (idna.ToUnicode) для XN--зон, NULL для ASCII. Ёмкость: ~1460 зон — zones.id smallint (до 32767) с запасом. Отчёт: версия файла, прочитано/добавлено/уже было, при --deactivate-missing — список выключенных. Тесты: парсер (версия из комментария, верхний регистр, дедуп, мусор с номером строки), SQL-текст и параметры на фейковом пуле (стиль zones_test.go), e2e run() по образцу соседних команд, --deactivate-missing на фейке; документация: zonesHelp, README (список команд crawlerctl).
 
