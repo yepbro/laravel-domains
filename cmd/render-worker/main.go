@@ -129,6 +129,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	})
 	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
 
+	// Возврат зависших доставок q:render (T-025): RecoverLoop в воркере —
+	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
+	// — секция redis (max_attempts, claim_min_idle).
+	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
+		MaxAttempts: cfg.Redis.MaxAttempts,
+		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
+	})
+
 	// Длина потребляемого стрима q:render → crawler_queue_depth (T-077):
 	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
 	go func() {
@@ -139,6 +147,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// Опции воркера — одни на сборку (стиль http-worker): Worker хранит
 	// их для ProcessResult, цикл Run берёт те же Group/Consume/Alive.
 	opts := renderworker.Options{
+		Recover: rel, // возврат зависших задач q:render (T-025)
 		Metrics: reg, // приборы этапа: задачи, длительности, ошибки классов, rendered (T-077)
 		Log:     logger,
 		// Зонд браузера: недоступный Chromium — пауза потребления

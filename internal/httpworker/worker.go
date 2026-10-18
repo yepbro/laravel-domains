@@ -459,6 +459,11 @@ type Options struct {
 	// T-048): 0 — не следовать вовсе; отрицательные значения — дефолт
 	// таблицы лимитов ТЗ 5.5 (httpfetch.DefaultMaxRedirects).
 	MaxRedirects int
+	// Recover — слой возврата зависших доставок (Reliab, T-025): Run
+	// поднимает фоновый RecoverLoop (XAUTOCLAIM → та же обработка →
+	// XACK) с теми же Group/Consumer/Batch; nil — восстановления нет
+	// (изолированные сборки и тесты без Redis-специфики).
+	Recover *queue.Reliab
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
@@ -894,6 +899,27 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 		case <-ctx.Done():
 		case <-t.C:
 		}
+	}
+
+	// Возврат зависших доставок (T-025): фоновый RecoverLoop от имени
+	// того же потребителя — клейм XAUTOCLAIM и та же обработка задач.
+	// Живёт до отмены ctx; Run дожидается его выхода (начатая задача
+	// дорабатывает или остаётся неподтверждённой, ТЗ 3.4).
+	if o.Recover != nil {
+		recDone := make(chan struct{})
+		go func() {
+			defer close(recDone)
+			_ = queue.RecoverLoop(ctx, o.Recover, func(c context.Context, del queue.Delivery) error {
+				return w.processDelivery(c, del, o)
+			}, queue.RecoverOptions{
+				Stream:   queue.StreamHTTP,
+				Group:    o.Group,
+				Consumer: o.Consumer,
+				Batch:    o.Consume,
+				Log:      log,
+			})
+		}()
+		defer func() { <-recDone }()
 	}
 
 	sem := make(chan struct{}, o.Concurrency)

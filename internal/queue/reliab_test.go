@@ -36,8 +36,20 @@ type fakeClaimRedis struct {
 
 func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
 	f.claims = append(f.claims, *a)
+	msgs := f.claimMsgs
+	if f.claimErr == nil && len(msgs) > 0 {
+		// Живой клейм возвращает до Count записей и закрепляет их
+		// (idle сброшен — повторный вызов не вернёт); остаток PEL —
+		// следующим вызовам.
+		if int64(len(msgs)) > a.Count {
+			msgs = msgs[:a.Count]
+			f.claimMsgs = f.claimMsgs[a.Count:]
+		} else {
+			f.claimMsgs = nil
+		}
+	}
 	cmd := redis.NewXAutoClaimCmd(ctx, "xautoclaim")
-	cmd.SetVal(f.claimMsgs, f.claimNext)
+	cmd.SetVal(msgs, f.claimNext)
 	cmd.SetErr(f.claimErr)
 	return cmd
 }

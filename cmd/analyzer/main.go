@@ -107,6 +107,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	defer func() { _ = rdb.Close() }()
 	q := queue.NewRedisQueue(rdb, queue.RedisOptions{})
 
+	// Возврат зависших доставок q:analyze (T-025): RecoverLoop в воркере —
+	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
+	// — секция redis (max_attempts, claim_min_idle).
+	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
+		MaxAttempts: cfg.Redis.MaxAttempts,
+		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
+	})
+
 	// Фоновый цикл переанализа (T-074, ТЗ 5.8): стартовый дренаж + тикер +
 	// внеочередной проход по смене набора правил (Reloader.Subscribe);
 	// ошибки проходов цикл логирует Warn сам, возвращает только по отмене
@@ -135,6 +143,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// их для ProcessResult, цикл Run берёт те же Group/Consume.
 	opts := analyzer.Options{
 		MinScore: cfg.Analyzer.LaravelMinScore,
+		Recover:  rel, // возврат зависших задач q:analyze (T-025)
 		Metrics:  reg, // приборы этапа: задачи и длительности (T-077)
 		Log:      logger,
 	}

@@ -245,6 +245,15 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 	return out, nil
 }
 
+// Process — паттерн Processing поверх очереди слоя: клеймнутая Claim
+// запись обрабатывается тем же правилом «результат в БД → XACK» (ТЗ 4.2),
+// что и свежие доставки воркера. RecoverLoop использует для повторов
+// общий с воркером обработчик — идемпотентность записей (ТЗ 3.4) делает
+// повтор безопасным.
+func (r *Reliab) Process(ctx context.Context, group string, d Delivery, process func(context.Context, Delivery) error) error {
+	return Processing(ctx, r.q, group, d, process)
+}
+
 // bury переводит запись, исчерпавшую лимит попыток, в q:dead и
 // подтверждает её в исходном стриме группы group (T-025): Dead — с task_id
 // и payload исходного сообщения без изменений; Reason фиксирует причу —
