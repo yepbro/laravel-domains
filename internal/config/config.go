@@ -158,6 +158,15 @@ type HTTP struct {
 	// concurrency 2000). Расширение к минимальному составу ТЗ 5.10
 	// (T-049).
 	MaxRPS int `yaml:"max_rps"`
+	// BlockInternalAddrs — запрет подключения к внутренним адресам
+	// (loopback/RFC1918/ULA/link-local/unspecified/multicast) по хостам
+	// HTTP-редиректов: SSRF-защита — недоверенный сайт может увести
+	// краулер на 127.0.0.1, cloud metadata или адрес сети БД/Redis.
+	// Адреса DNS-этапа не фильтруются. По умолчанию false (testbed и
+	// dev-стенды резолвят сценарии во внутренние сети 172.28.100.0/24);
+	// для Internet-боевой эксплуатации рекомендуется включать.
+	// Расширение к минимальному составу ТЗ 5.10.
+	BlockInternalAddrs bool `yaml:"block_internal_addrs"`
 }
 
 // Render — параметры рендера (ТЗ 5.6). RemoteURL — расширение dev-окружения:

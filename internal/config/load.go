@@ -134,6 +134,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_HTTP_MIN_BODY_SPEED", setSize(func(c *Config) *ByteSize { return &c.HTTP.MinBodySpeed })},
 		{"CRAWLER_HTTP_MAX_RPS", setInt(func(c *Config) *int { return &c.HTTP.MaxRPS })},
 		{"CRAWLER_HTTP_USER_AGENT", setString(func(c *Config) *string { return &c.HTTP.UserAgent })},
+		{"CRAWLER_HTTP_BLOCK_INTERNAL_ADDRS", setBool(func(c *Config) *bool { return &c.HTTP.BlockInternalAddrs })},
 		{"CRAWLER_RENDER_REMOTE_URL", setString(func(c *Config) *string { return &c.Render.RemoteURL })},
 		{"CRAWLER_RENDER_CONTEXTS", setInt(func(c *Config) *int { return &c.Render.Contexts })},
 		{"CRAWLER_RENDER_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Render.Timeout })},

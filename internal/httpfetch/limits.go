@@ -414,10 +414,12 @@ type BodyLimiter struct {
 	rc     io.ReadCloser
 	cancel context.CancelFunc
 
-	speed  int64         // байт/с; 0 — анти-тарпит выключен
-	window time.Duration // пол дедлайна (MinSpeedWindow)
-	remain int64         // осталось до потолка MaxBodyBytes
-	trunc  bool          // тело длиннее потолка — данные частичны
+	speed    int64         // байт/с; 0 — анти-тарпит выключен
+	window   time.Duration // пол дедлайна (MinSpeedWindow)
+	remain   int64         // осталось до потолка MaxBodyBytes
+	trunc    bool          // тело длиннее потолка — данные частичны
+	probed   bool          // хвост за потолком уже классифицирован
+	probeErr error         // итог классификации хвоста (повторные чтения источник не трогают)
 
 	mu     sync.Mutex
 	timer  *time.Timer
@@ -440,9 +442,14 @@ func newBodyLimiter(rc io.ReadCloser, cancel context.CancelFunc, opt LimitOption
 // Read читает тело не дальше потолка MaxBodyBytes. Когда потолок отдан,
 // единственный пробный байт решает, длиннее ли тело лимита: байт есть —
 // truncated=true и io.EOF (обрезка, не ошибка), сразу io.EOF — тело
-// ровно в лимите. Проба идёт под тем же сторожем скорости: молчащий
-// хвост — то же нарушение темпа.
+// ровно в лимите; итог пробы запоминается — повторные чтения возвращают
+// его, не трогая источник. Буфер длины 0 не читает источник вовсе
+// (контракт io.Reader). Проба идёт под тем же сторожем скорости:
+// молчащий хвост — то же нарушение темпа.
 func (b *BodyLimiter) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
@@ -453,6 +460,11 @@ func (b *BodyLimiter) Read(p []byte) (int, error) {
 		return 0, b.speedError()
 	}
 	if b.remain <= 0 {
+		if b.probed {
+			probeErr := b.probeErr
+			b.mu.Unlock()
+			return 0, probeErr
+		}
 		b.mu.Unlock()
 		return b.probeTail()
 	}
@@ -478,7 +490,8 @@ func (b *BodyLimiter) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// probeTail — классификация хвоста после исчерпания потолка (см. Read).
+// probeTail — классификация хвоста после исчерпания потолка (см. Read);
+// выполняется один раз, итог запоминается (probed/probeErr).
 func (b *BodyLimiter) probeTail() (int, error) {
 	b.mu.Lock()
 	if b.closed {
@@ -494,8 +507,12 @@ func (b *BodyLimiter) probeTail() (int, error) {
 	b.mu.Lock()
 	b.disarmLocked()
 	fired := b.fired
+	b.probed = true
 	if n > 0 {
 		b.trunc = true
+		b.probeErr = io.EOF // классифицировано как обрезка
+	} else {
+		b.probeErr = err // io.EOF — ровно в лимите; ошибка сети — как есть
 	}
 	b.mu.Unlock()
 

@@ -429,6 +429,29 @@ func TestFetchChainZeroLimit(t *testing.T) {
 	}
 }
 
+// TestFetchChainZeroLimitNoMetaScan: при max_redirects=0 мета-скан тела
+// не выполняется вовсе (тело не оборачивается redirectBody): без
+// переходов чтение до 256 КБ на meta refresh — лишний I/O.
+func TestFetchChainZeroLimitNoMetaScan(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprint(w, `<html><head><meta http-equiv="refresh" content="0; url=/after"></head><body>STAY</body></html>`)
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(Options{Resolver: redirectResolverFail})
+	got, err := FetchChainOpts(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "zero-noscan.example.net", "/page"), Addrs: loopbackAddr(),
+	}, ChainOptions{MaxRedirects: 0})
+	if err != nil {
+		t.Fatalf("FetchChainOpts: %v", err)
+	}
+	defer func() { _ = got.Result.Body.Close() }()
+	if _, wrapped := got.Result.Body.(*redirectBody); wrapped {
+		t.Error("при max_redirects=0 тело не должно сканироваться на meta refresh")
+	}
+}
+
 // --- meta refresh -------------------------------------------------------------
 
 // TestFetchChainMetaRefresh: разбор content мета-тега — обычный,
@@ -692,6 +715,67 @@ func TestFetchChainMetaRefreshSelfURL(t *testing.T) {
 	}
 }
 
+// TestFetchChainMetaRefreshUnfollowableURLKeepsBody: мета-скан нашёл url,
+// по которому нельзя идти (чужая схема — redirectResolve даёт false), —
+// ответ остаётся итоговым, и прочитанный сканом префикс тела обязан
+// вернуться потребителю: контент/хэш не должны видеть «дыру» или пустоту
+// на месте первых килобайт страницы.
+func TestFetchChainMetaRefreshUnfollowableURLKeepsBody(t *testing.T) {
+	want := fmt.Sprintf(
+		`<html><head><meta http-equiv="refresh" content="0; url=ftp://elsewhere.example/"></head><body>%s</body></html>`,
+		strings.Repeat("page-body ", 8<<10)) // ~80 КиБ: заведомо больше чанков скана
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprint(w, want)
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(Options{Resolver: redirectResolverFail})
+	got, err := FetchChain(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "meta-unfollow.example.net", "/page"), Addrs: loopbackAddr()})
+	if err != nil {
+		t.Fatalf("FetchChain: %v", err)
+	}
+	if body := redirectReadBody(t, got); body != want {
+		t.Errorf("итоговое тело: %d байт, ожидалось %d (префикс мета-скана потерян)", len(body), len(want))
+	}
+	if len(got.Chain) != 1 {
+		t.Errorf("цепочка: %+v, ожидался 1 шаг (перехода нет)", got.Chain)
+	}
+}
+
+// TestFetchChainMetaRefreshZeroLimitKeepsBody: валидный meta refresh при
+// MaxRedirects 0 — «не следовать» (T-006): итог — первый ответ, и его
+// тело возвращается целиком, хотя скан уже прочёл начало.
+func TestFetchChainMetaRefreshZeroLimitKeepsBody(t *testing.T) {
+	want := `<html><head><meta http-equiv="refresh" content="0; url=/after"></head><body>ZERO-STAY</body></html>`
+	var lands atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/after" {
+			lands.Add(1)
+			_, _ = fmt.Fprint(w, "AFTER")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprint(w, want)
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(Options{Resolver: redirectResolverFail})
+	got, err := FetchChainOpts(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "meta-zero.example.net", "/page"), Addrs: loopbackAddr(),
+	}, ChainOptions{MaxRedirects: 0})
+	if err != nil {
+		t.Fatalf("FetchChainOpts: %v", err)
+	}
+	if body := redirectReadBody(t, got); body != want {
+		t.Errorf("итоговое тело: %q, ожидалось исходное (%d байт)", body, len(want))
+	}
+	if n := lands.Load(); n != 0 {
+		t.Errorf("MaxRedirects 0: выполнено переходов %d", n)
+	}
+}
+
 // --- хосты переходов ----------------------------------------------------------
 
 // TestFetchChainUnicodeHostInLocation: unicode-хост в Location приводится
@@ -894,5 +978,148 @@ func TestFetchChainContextCancel(t *testing.T) {
 	}
 	if len(got.Chain) != 1 {
 		t.Errorf("цепочка: %+v, ожидался 1 шаг до отмены", got.Chain)
+	}
+}
+
+// --- бюджет цепочки -------------------------------------------------------
+
+// TestFetchChainBudget: общий бюджет цепочки (ChainOptions.TotalTimeout)
+// ограничивает все хопы вместе, а не по одному: молчащий хоп и цепочка
+// медленных хопов прерываются тайм-классифицированной ошибкой (temp_error
+// у потребителя, ТЗ 6.2), не занимая слот воркера минуты.
+func TestFetchChainBudget(t *testing.T) {
+	t.Run("молчаливый хоп прерывается бюджетом", func(t *testing.T) {
+		stall := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/start" {
+				w.Header().Set("Location", "/final")
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+			select {
+			case <-stall:
+			case <-time.After(5 * time.Second):
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer func() {
+			select {
+			case <-stall:
+			default:
+				close(stall)
+			}
+			srv.Close()
+		}()
+
+		// Слои хопа не срабатывают (5 с), прервать запрос обязан
+		// именно бюджет цепочки.
+		f := NewFetcher(Options{HeaderTimeout: 5 * time.Second, TotalTimeout: 5 * time.Second})
+		start := time.Now()
+		got, err := FetchChainOpts(context.Background(), f, FetchRequest{
+			URL: redirectReqURL(srv.URL, "budget.example.net", "/start"), Addrs: loopbackAddr(),
+		}, ChainOptions{MaxRedirects: 3, TotalTimeout: 250 * time.Millisecond})
+		elapsed := time.Since(start)
+		if err == nil || !IsTimeout(err) {
+			t.Fatalf("ожидался таймаут бюджета цепочки, получено: %v", err)
+		}
+		if elapsed >= 2*time.Second {
+			t.Errorf("бюджет сработал поздно: %s", elapsed)
+		}
+		if len(got.Chain) != 1 {
+			t.Errorf("цепочка: %+v, ожидался 1 шаг до таймаута", got.Chain)
+		}
+	})
+
+	t.Run("бюджет копится по хопам", func(t *testing.T) {
+		// Каждый хоп укладывается в свои таймауты (400 мс < 5 с), но
+		// три хопа не влезают в бюджет 1 с: третий прерывается на
+		// середине. Поля допуска по 200 мс в обе стороны — устойчиво
+		// к джиттеру под нагрузкой прогона.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(400 * time.Millisecond)
+			w.Header().Set("Location", r.URL.Path+"x")
+			w.WriteHeader(http.StatusFound)
+		}))
+		defer srv.Close()
+
+		f := NewFetcher(Options{HeaderTimeout: 5 * time.Second, TotalTimeout: 5 * time.Second})
+		got, err := FetchChainOpts(context.Background(), f, FetchRequest{
+			URL: redirectReqURL(srv.URL, "slowchain.example.net", "/a"), Addrs: loopbackAddr(),
+		}, ChainOptions{MaxRedirects: 3, TotalTimeout: 1 * time.Second})
+		if err == nil || !IsTimeout(err) {
+			t.Fatalf("ожидался таймаут бюджета цепочки, получено: %v", err)
+		}
+		if len(got.Chain) != 2 {
+			t.Errorf("цепочка: %d шагов, ожидались 2 (третий хоп за бюджетом)", len(got.Chain))
+		}
+	})
+}
+
+// --- IP-литералы в переходах ----------------------------------------------
+
+// TestRedirectResolveIPLiteral: IP-литералы в Location проходят как
+// есть — без punycode (Hostname() срезает скобки, прежняя проверка
+// префикса "[" никогда не срабатывала, а HostToASCII падает на IPv6 —
+// переход не выполнялся), с портом и без, IPv4 и IPv6; чужая схема —
+// по-прежнему false.
+func TestRedirectResolveIPLiteral(t *testing.T) {
+	base := &url.URL{Scheme: "http", Host: "start.example-test.net", Path: "/page"}
+	cases := []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{"http://[::1]:8080/next", "http://[::1]:8080/next", true},
+		{"http://[2001:db8::1]/", "http://[2001:db8::1]/", true},
+		{"http://192.0.2.10/p", "http://192.0.2.10/p", true},
+		{"ftp://[::1]/", "", false},
+	}
+	for _, c := range cases {
+		u, ok := redirectResolve(base, c.raw)
+		if ok != c.ok {
+			t.Errorf("redirectResolve(%q): ok=%v, ожидалось %v", c.raw, ok, c.ok)
+			continue
+		}
+		if ok && u.String() != c.want {
+			t.Errorf("redirectResolve(%q) = %q, ожидалось %q", c.raw, u, c.want)
+		}
+	}
+}
+
+// TestFetchChainIPv6LiteralLocation: Location с IPv6-литералом —
+// обычный переход цепочки: хост [::1] берётся литералом (lookup не
+// трогает резолвер), итог — страница по IPv6.
+func TestFetchChainIPv6LiteralLocation(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6-петля недоступна: %v", err)
+	}
+	srv6 := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "V6-LAND")
+	})}
+	go func() { _ = srv6.Serve(ln) }()
+	t.Cleanup(func() { _ = srv6.Close() })
+	_, v6port, _ := net.SplitHostPort(ln.Addr().String())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://[::1]:"+v6port+"/land")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(Options{Resolver: redirectResolverFail})
+	got, err := FetchChain(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "v6start.example.net", "/start"), Addrs: loopbackAddr()})
+	if err != nil {
+		t.Fatalf("FetchChain: %v", err)
+	}
+	if body := redirectReadBody(t, got); body != "V6-LAND" {
+		t.Errorf("итоговое тело: %q, ожидался переход на [::1]", body)
+	}
+	if host := got.Result.FinalURL.Hostname(); host != "::1" {
+		t.Errorf("хост итогового URL: %q, ожидался ::1", host)
+	}
+	if len(got.Chain) != 2 {
+		t.Errorf("цепочка: %+v, ожидались 2 шага", got.Chain)
 	}
 }

@@ -96,6 +96,9 @@ type Options struct {
 	// тела | 2 МБ», ТЗ 5.5). Применяет лимитёр T-049 (Options.Limits:
 	// обрезка с признаком BodyLimiter.Truncated); без лимитёра
 	// значение переносится из конфигурации к потребителю как есть.
+	// С включёнными Limits потолок тела один на транспорт и лимитёр —
+	// Limits.MaxBodyBytes (bodyCeiling), это поле на распаковку
+	// не влияет.
 	MaxBodyBytes int64
 	// Limits — лимиты и защита T-049 (таблица лимитов ТЗ 5.5): потолок
 	// тела, анти-тарпит, соединения на один IP, глобальные соединения
@@ -115,6 +118,17 @@ type Options struct {
 	// Кэш — обёртка NewCachingResolver поверх резолвера этапа; «тот же
 	// резолвер» ТЗ 5.5 п. 2 — адаптер dnsclient соберёт wiring воркера.
 	Resolver Resolver
+	// BlockInternalAddrs — не подключаться к внутренним адресам
+	// (loopback, RFC1918/ULA, link-local, unspecified, multicast) на
+	// пути резолва хостов редиректов (SSRF-защита: недоверенный сайт
+	// может увести краулер на 127.0.0.1, 169.254.169.254 — cloud
+	// metadata — или адрес сети, где живут БД/Redis). Адреса DNS-этапа
+	// (выданные стартовому хосту задачей q:http) не фильтруются — это
+	// решение DNS-этапа. false — поведение прежнее: dev/testbed-стенды
+	// резолвят сценарии во внутренние сети (172.28.100.0/24);
+	// Internet-боевой эксплуатации рекомендуется включать
+	// (http.block_internal_addrs).
+	BlockInternalAddrs bool
 	// TLSClientConfig — конфигурация TLS-клиента. SNI и проверка
 	// сертификата выполняются по хосту URL (DialContext подключается к
 	// заранее резолвенному IP, не меняя целевой адрес). nil — обычная
@@ -145,6 +159,7 @@ func NewOptions(cfg config.HTTP) Options {
 		MaxBodyBytes:        cfg.MaxBodyBytes.B(),
 		UserAgent:           ua,
 		Limits:              &limits,
+		BlockInternalAddrs:  cfg.BlockInternalAddrs,
 	}
 }
 
@@ -344,24 +359,51 @@ func (f *Fetcher) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// bodyCeiling — единый источник потолка тела для распаковки и лимита
+// чтения: при включённых лимитах T-049 — Limits.MaxBodyBytes (то же
+// число, по которому режет BodyLimiter), без лимитов — Options.MaxBodyBytes
+// либо дефолт таблицы лимитов. Два раздельных поля (Options и Limits)
+// в боевой сборке NewOptions заполняются одним cfg.MaxBodyBytes, но
+// ручная сборка Options расходилась — распаковка и чтение видели
+// разные потолки.
+func (f *Fetcher) bodyCeiling() int64 {
+	if f.lim != nil && f.lim.opt.MaxBodyBytes > 0 {
+		return f.lim.opt.MaxBodyBytes
+	}
+	if f.opt.MaxBodyBytes > 0 {
+		return f.opt.MaxBodyBytes
+	}
+	return defaultDecompressLimit
+}
+
 // decodeResponseBody распаковывает тело ответа по Content-Encoding с
 // потолком распакованного размера (защита от zip-бомб, ТЗ 5.5) и
 // вписывается в цепочку чтения: сеть → gunzip/brotli (потолок
-// MaxBodyBytes) → лимит читаемого тела T-049 → потребитель. Потолок
+// bodyCeiling) → лимит читаемого тела T-049 → потребитель. Потолок
 // равен лимиту тела: распакованный поток и есть тело, иначе чтение до
 // конца (хэш дедупа) раздуло бы бомбу до лимита, но гигабайтами
-// распаковки. Заголовки Content-Encoding/Content-Length снимаются:
-// тело в руках уже распаковано, кодирующие заголовки лгали бы (как у
-// прозрачной распаковки net/http). Неподдерживаемая кодировка — ошибка
-// запроса: молча отдать сжатые байты телом хуже честного отказа.
+// распаковки. С лимитёром T-049 потолок пропускает ещё один пробный
+// байт за пределом (лимит+1): лимитёр, исчерпав лимит, читает его для
+// классификации хвоста, и сжатое тело чуть больше лимита даёт ту же
+// обрезку с Truncated, что и несжатое, — бомба при этом дальше
+// лимита+1 не читается. Заголовки Content-Encoding/Content-Length
+// снимаются: тело в руках уже распаковано, кодирующие заголовки лгали
+// бы (как у прозрачной распаковки net/http). Неподдерживаемая
+// кодировка — ошибка запроса: молча отдать сжатые байты телом хуже
+// честного отказа.
 func (f *Fetcher) decodeResponseBody(resp *http.Response) error {
 	ce := resp.Header.Get("Content-Encoding")
 	if ce == "" {
 		return nil // сжатия нет — тело как есть
 	}
-	limit := f.opt.MaxBodyBytes
-	if limit <= 0 {
-		limit = defaultDecompressLimit
+	limit := f.bodyCeiling()
+	if f.lim != nil {
+		// Выше распаковки стоит BodyLimiter: его пробный байт за
+		// пределом лимита проходит сквозь распаковку (см. комментарий
+		// функции). Без +1 байт натыкался на потолок распаковки и
+		// превращал обрезку в ErrDecompressTooLarge — read-ошибку,
+		// по которой воркер гасит Available живого сайта.
+		limit++
 	}
 	body, err := decodeContentEncoding(resp.Body, ce, limit)
 	if err != nil {
@@ -511,18 +553,47 @@ func (f *Fetcher) dialContext(ctx context.Context, network, addr string) (net.Co
 
 // lookup возвращает адреса хоста: IP-литерал из URL редиректа — сам
 // по себе (резолверу имя не нужно), имя — через Resolver транспорта.
+// С Options.BlockInternalAddrs внутренние адреса отбраковываются
+// (SSRF-защита пути редиректов, см. Options): фильтр сидит здесь —
+// единственная воронка, через которую идут и литералы из Location,
+// и резолвы новых хостов; адреса DNS-этапа (FetchRequest.Addrs) в
+// воронку не попадают и не фильтруются.
 func (f *Fetcher) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
+	var addrs []netip.Addr
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return []netip.Addr{ip}, nil
+		addrs = []netip.Addr{ip}
+	} else {
+		var err error
+		addrs, err = f.res.LookupNetIP(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("httpfetch: резолв %q: %w", host, err)
+		}
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("httpfetch: резолв %q: пустой ответ", host)
+		}
 	}
-	addrs, err := f.res.LookupNetIP(ctx, host)
-	if err != nil {
-		return nil, fmt.Errorf("httpfetch: резолв %q: %w", host, err)
-	}
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("httpfetch: резолв %q: пустой ответ", host)
+	if f.opt.BlockInternalAddrs {
+		external := make([]netip.Addr, 0, len(addrs))
+		for _, a := range addrs {
+			if !addrIsInternal(a) {
+				external = append(external, a)
+			}
+		}
+		if len(external) == 0 {
+			return nil, fmt.Errorf("httpfetch: резолв %q: только внутренние адреса %v — заблокировано (SSRF, http.block_internal_addrs)", host, addrs)
+		}
+		addrs = external
 	}
 	return addrs, nil
+}
+
+// addrIsInternal — адрес внутреннего/специального диапазона, куда
+// Internet-краулеру хода нет: loopback, приватные (RFC1918 и ULA —
+// netip объединяет их в IsPrivate), link-local (включая cloud metadata
+// 169.254.169.254), unspecified и multicast.
+func addrIsInternal(a netip.Addr) bool {
+	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() ||
+		a.IsLinkLocalMulticast() || a.IsUnspecified() || a.IsMulticast()
 }
 
 // dialNet — продакшн-диал (поле dial — шов подмены в тестах): TCP
@@ -575,6 +646,7 @@ func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string
 
 	var mu sync.Mutex
 	won := false
+	gaveUp := false // вызывающий ушёл по отмене: победитель больше не нужен
 	var winner net.Conn
 	failed := 0
 	var lastErr error
@@ -584,7 +656,7 @@ func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string
 		conn, err := f.dialLimited(stop, addrs[i], port)
 		mu.Lock()
 		defer mu.Unlock()
-		if won {
+		if won || gaveUp {
 			if conn != nil {
 				_ = conn.Close() // гонка проиграна уже после успеха
 			}
@@ -631,6 +703,18 @@ func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string
 				}
 			}
 		case <-ctx.Done():
+			// Отмена может выиграть select уже после победы попытки:
+			// установленное соединение (со слотами лимитов limitConn)
+			// обязано освобождаться здесь, а не утекать с проигравшим
+			// выходом. Опоздавшие попытки видит флаг gaveUp.
+			mu.Lock()
+			gaveUp = true
+			conn := winner
+			winner = nil
+			mu.Unlock()
+			if conn != nil {
+				_ = conn.Close()
+			}
 			return nil, ctx.Err()
 		}
 	}

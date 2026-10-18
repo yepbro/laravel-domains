@@ -211,6 +211,71 @@ func TestDialAddrsConnectTimeout(t *testing.T) {
 	}
 }
 
+// TestDialAddrsCancelAfterWinner: отмена ctx в момент победы попытки —
+// select может взять ветку отмены уже после того, как попытка положила
+// соединение в winner. Проигравший выход обязан закрыть это соединение
+// (вместе со слотами лимитов limitConn), а не утекать: слоты глобального
+// семафора GC не собирает, накопившись, они останавливают транспорт.
+func TestDialAddrsCancelAfterWinner(t *testing.T) {
+	var mu sync.Mutex
+	created, closed := 0, 0
+	newConn := func() net.Conn {
+		c1, _ := net.Pipe()
+		mu.Lock()
+		created++
+		mu.Unlock()
+		return &closeCountingConn{Conn: c1, onClose: func() {
+			mu.Lock()
+			closed++
+			mu.Unlock()
+		}}
+	}
+	f, _ := newTestFetcher(t, Options{
+		ConnectTimeout: 2 * time.Second,
+		FallbackDelay:  time.Hour, // второй адрес не стартует — в гонке одна попытка
+	}, func(ctx context.Context, addr netip.Addr, port string) (net.Conn, error) {
+		<-ctx.Done() // «победа» прибывает вместе с отменой — окно утечки
+		return newConn(), nil
+	})
+
+	addrs := []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")}
+	cancelled := 0
+	for i := 0; i < 64; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Millisecond, cancel)
+		conn, err := f.dialAddrs(ctx, addrs, "80")
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				cancel()
+				t.Fatalf("ожидалась ошибка отмены, получено: %v", err)
+			}
+			cancelled++
+			continue
+		}
+		_ = conn.Close() // победитель отдан вызывающему — закрывает он
+		cancel()
+	}
+	if cancelled == 0 {
+		t.Fatal("гонка не выполнилась: ни одного выхода по отмене")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if closed != created {
+		t.Errorf("закрыто %d из %d соединений — утечка победителя по отмене ctx", closed, created)
+	}
+}
+
+// closeCountingConn — соединение с подсчётом Close (утечки по отмене).
+type closeCountingConn struct {
+	net.Conn
+	onClose func()
+}
+
+func (c *closeCountingConn) Close() error {
+	c.onClose()
+	return c.Conn.Close()
+}
+
 // TestDialAddrsEmptyAndSingle — границы списка адресов.
 func TestDialAddrsEmptyAndSingle(t *testing.T) {
 	f := NewFetcher(Options{})
@@ -447,6 +512,80 @@ func TestDialContextRedirectIPLiteral(t *testing.T) {
 	_ = resp.Body.Close()
 	if resolverCalls != 0 {
 		t.Errorf("IP-литерал вызвал резолвер (%d раз)", resolverCalls)
+	}
+}
+
+// --- SSRF-защита пути редиректов ---------------------------------------------
+
+// TestLookupBlocksInternalAddrs: Options.BlockInternalAddrs отбраковывает
+// в воронке lookup внутренние адреса — литералы из Location (SSRF:
+// loopback, RFC1918, cloud metadata) и адреса резолва; внешний адрес
+// смешанного ответа остаётся.
+func TestLookupBlocksInternalAddrs(t *testing.T) {
+	f := NewFetcher(Options{
+		BlockInternalAddrs: true,
+		Resolver: ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return []netip.Addr{
+				netip.MustParseAddr("192.0.2.10"),      // TEST-NET-1 — не внутренний
+				netip.MustParseAddr("10.0.0.5"),        // RFC1918
+				netip.MustParseAddr("169.254.169.254"), // cloud metadata
+			}, nil
+		}),
+	})
+
+	addrs, err := f.lookup(context.Background(), "mixed.example.net")
+	if err != nil {
+		t.Fatalf("резолв со внешним адресом: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0] != netip.MustParseAddr("192.0.2.10") {
+		t.Errorf("ожидался только внешний адрес, получено %v", addrs)
+	}
+
+	for _, host := range []string{"127.0.0.1", "10.0.0.5", "169.254.169.254", "::1", "fd00::1", "192.168.1.1"} {
+		if _, err := f.lookup(context.Background(), host); err == nil {
+			t.Errorf("внутренний литерал %q не заблокирован", host)
+		}
+	}
+	f2 := NewFetcher(Options{
+		BlockInternalAddrs: true,
+		Resolver: ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("172.16.0.1")}, nil
+		}),
+	})
+	if _, err := f2.lookup(context.Background(), "internal-only.example.net"); err == nil {
+		t.Error("ответ только с внутренними адресами не заблокирован")
+	}
+
+	// Флаг выключен — прежнее поведение: адреса проходят как есть.
+	f3 := NewFetcher(Options{
+		Resolver: ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("10.0.0.5")}, nil
+		}),
+	})
+	if addrs, err := f3.lookup(context.Background(), "legacy.example.net"); err != nil || len(addrs) != 1 {
+		t.Errorf("без флага внутренние адреса должны проходить: %v %v", addrs, err)
+	}
+}
+
+// TestFetchChainBlocksInternalRedirect: Location на внутренний адрес —
+// переход не выполняется (ошибка резолва, цепочка — выполненная часть);
+// адреса DNS-этапа стартового хоста фильтр не затрагивает.
+func TestFetchChainBlocksInternalRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://169.254.169.254/latest/meta-data/")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	// Стартовый запрос идёт по адресам DNS-этапа (петля!) — не фильтруется.
+	f := NewFetcher(Options{BlockInternalAddrs: true, Resolver: redirectResolverFail})
+	got, err := FetchChain(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "ssrf.example.net", "/start"), Addrs: loopbackAddr()})
+	if err == nil || !strings.Contains(err.Error(), "внутренние") {
+		t.Fatalf("ожидалась блокировка внутреннего адреса, получено: %v", err)
+	}
+	if len(got.Chain) != 1 {
+		t.Errorf("цепочка: %+v, ожидался 1 шаг (перехода нет)", got.Chain)
 	}
 }
 

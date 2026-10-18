@@ -15,9 +15,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"crawler/internal/idn"
 )
@@ -26,6 +28,15 @@ import (
 // ТЗ 5.5: «макс. число редиректов 8»). Подставляется FetchChain для
 // пустых опций; явное значение приходит из http.max_redirects (T-006).
 const DefaultMaxRedirects = 8
+
+// DefaultChainTimeout — потолок общего бюджета цепочки редиректов.
+// ТЗ 5.5 числом его не задаёт: TotalTimeout (20 с) действует на один
+// хоп, а цепочка без общего бюджета тянулась бы (max_redirects хопов ×
+// хоп-таймаут, конфиг допускает до 100 переходов) десятки минут, занимая
+// слот concurrency воркера и per-IP семафор. Дефолт бюджета — сумма
+// бюджетов хопов, но не выше этого потолка: медленные/враждебные сайты
+// не могут удерживать проверку домена дольше двух минут.
+const DefaultChainTimeout = 2 * time.Minute
 
 // Лимиты сканирования тела на meta refresh. В конфигурации их нет:
 // ТЗ 5.5 числом не задаёт — деталь реализации.
@@ -84,6 +95,11 @@ type ChainOptions struct {
 	// ответ), отрицательные значения сводятся к 0. Удобное значение по
 	// умолчанию — DefaultMaxRedirects, его подставляет FetchChain.
 	MaxRedirects int
+	// TotalTimeout — общий бюджет цепочки: родительский контекст для
+	// таймаута каждого хопа и чтения итогового тела. 0 — по умолчанию:
+	// сумма бюджетов хопов (1+MaxRedirects)×TotalTimeout, не выше
+	// DefaultChainTimeout. Явное значение принимается как есть.
+	TotalTimeout time.Duration
 }
 
 // FetchChain проходит цепочку редиректов от стартового запроса до
@@ -134,27 +150,53 @@ func FetchChainOpts(ctx context.Context, f *Fetcher, req FetchRequest, opts Chai
 	visited := map[string]struct{}{redirectKey(start): {}}
 	cur := FetchRequest{URL: start, Addrs: req.Addrs}
 
+	// Общий бюджет цепочки: родительский контекст для всех хопов (свой
+	// TotalTimeout у каждого Fetch остаётся внутри). Отмена бюджета в
+	// полёте закрывает соединение хопа — ошибка тайм-класса
+	// (temp_error у потребителя). Итоговое тело читается потребителем
+	// уже после возврата: бюджет живёт до закрытия тела (chainBody),
+	// в ошибочных путях снимается здесь.
+	budget := opts.TotalTimeout
+	if budget <= 0 {
+		budget = time.Duration(1+max) * f.opt.TotalTimeout
+		if budget > DefaultChainTimeout {
+			budget = DefaultChainTimeout
+		}
+	}
+	ctx, cancelBudget := context.WithTimeout(ctx, budget)
+
 	var chain []RedirectStep
 	redirects := 0
 	for {
 		res, err := f.Fetch(ctx, cur)
 		if err != nil {
+			cancelBudget()
 			return &ChainResult{Chain: chain}, err
 		}
 		chain = append(chain, RedirectStep{URL: cur.URL.String(), Status: res.StatusCode})
 
+		if max == 0 {
+			// Режим «не следовать» (T-006): первый ответ итоговый.
+			// До redirectNext — мета-скан не выполняется вовсе:
+			// без перехода чтение до 256 КБ тела на meta refresh —
+			// лишний I/O.
+			res.Body = &chainBody{rc: res.Body, cancel: cancelBudget}
+			return &ChainResult{Result: res, Chain: chain}, nil
+		}
 		next, follow := redirectNext(res)
-		if !follow || max == 0 {
-			// Конец цепочки: итог — этот ответ. max_redirects = 0 —
-			// режим «не следовать» (T-006): первый ответ итоговый.
+		if !follow {
+			// Конец цепочки: итог — этот ответ.
+			res.Body = &chainBody{rc: res.Body, cancel: cancelBudget}
 			return &ChainResult{Result: res, Chain: chain}, nil
 		}
 		_ = res.Body.Close()
 		if redirects >= max {
+			cancelBudget()
 			return &ChainResult{Chain: chain}, fmt.Errorf(
 				"%w: лимит %d превышен на переходе к %s", ErrTooManyRedirects, max, next)
 		}
 		if _, dup := visited[redirectKey(next)]; dup {
+			cancelBudget()
 			return &ChainResult{Chain: chain}, fmt.Errorf("%w: цикл на %s", ErrTooManyRedirects, next)
 		}
 		visited[redirectKey(next)] = struct{}{}
@@ -166,6 +208,7 @@ func FetchChainOpts(ctx context.Context, f *Fetcher, req FetchRequest, opts Chai
 			// выданы стартовому хосту) — резолв резолвером транспорта.
 			addrs, err = f.lookup(ctx, host)
 			if err != nil {
+				cancelBudget()
 				return &ChainResult{Chain: chain}, err
 			}
 		}
@@ -216,10 +259,11 @@ func redirectNext(res *FetchResult) (*url.URL, bool) {
 // текущего ответа (net/url), хост приводится к punycode (ТЗ 5.2 п. 8 —
 // «хосты из Location и <meta refresh>, содержащие unicode, приводятся
 // к punycode перед запросом») и нижнему регистру, пустой путь
-// нормализуется в "/". IPv6-литералы HostToASCII не поддержаны (T-009)
-// и проходят как есть. false — по строке нельзя идти: не URL, чужая
-// схема, нет хоста или невалидное имя (битый punycode, запрещённые
-// UTS-46 символы).
+// нормализуется в "/". IP-литералы (IPv4/IPv6) HostToASCII не нужны и
+// IPv6 на нём падает (T-009) — проходят как есть: url.URL.Hostname()
+// отдаёт литерал без скобок, готовый к диалу. false — по строке
+// нельзя идти: не URL, чужая схема, нет хоста или невалидное имя
+// (битый punycode, запрещённые UTS-46 символы).
 func redirectResolve(base *url.URL, raw string) (*url.URL, bool) {
 	ref, err := url.Parse(raw)
 	if err != nil {
@@ -233,7 +277,8 @@ func redirectResolve(base *url.URL, raw string) (*url.URL, bool) {
 	if host == "" {
 		return nil, false
 	}
-	if !strings.HasPrefix(host, "[") {
+	if _, err := netip.ParseAddr(host); err != nil {
+		// Имя (не IP-литерал): punycode и нижний регистр.
 		ascii, err := idn.HostToASCII(host)
 		if err != nil {
 			return nil, false
@@ -283,6 +328,14 @@ func redirectScanMeta(res *FetchResult) (string, bool) {
 			var stop bool
 			pos, raw, stop = redirectScanBuffer(buf.Bytes(), pos)
 			if raw != "" {
+				// Переход найден, но может не состояться: url чужой
+				// схемы (redirectResolve вернёт false) или режим
+				// «не следовать» у вызывающего. Прочитанный сканом
+				// префикс возвращается потребителю обёрткой — итог
+				// без перехода не теряет байтов и в этом пути.
+				if buf.Len() > 0 {
+					res.Body = &redirectBody{prefix: bytes.NewReader(buf.Bytes()), rc: res.Body}
+				}
 				return raw, true // переход: тело закроет вызывающий
 			}
 			if stop {
@@ -494,3 +547,20 @@ func (b *redirectBody) Read(p []byte) (int, error) {
 }
 
 func (b *redirectBody) Close() error { return b.rc.Close() }
+
+// chainBody — тело итогового ответа под бюджетом цепочки: Close тела
+// останавливает бюджет (общий ctx цепочки), как cancelBody останавливает
+// общий таймаут одного запроса (T-047). Чтение итогового тела идёт уже
+// после возврата FetchChainOpts — бюджет живёт до закрытия тела.
+type chainBody struct {
+	rc     io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *chainBody) Read(p []byte) (int, error) { return b.rc.Read(p) }
+
+func (b *chainBody) Close() error {
+	err := b.rc.Close()
+	b.cancel()
+	return err
+}

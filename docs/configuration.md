@@ -226,6 +226,7 @@ Quad9), как в ТЗ 5.10.
 | `min_body_speed` | `CRAWLER_HTTP_MIN_BODY_SPEED` | размер (байт/с) | `2048` (ТЗ 5.5: мин. скорость после первого байта) |
 | `max_rps` | `CRAWLER_HTTP_MAX_RPS` | целое | `1000` |
 | `user_agent` | `CRAWLER_HTTP_USER_AGENT` | строка | `DomainCrawler/1.0 (+https://example.example/contact; admin@example.example)` |
+| `block_internal_addrs` | `CRAWLER_HTTP_BLOCK_INTERNAL_ADDRS` | булево | `false` |
 
 `user_agent` обязателен: честный User-Agent с контактами оператора в
 общепринятой форме `Имя/версия (+URL; e-mail)` (ТЗ 5.5, §9) — по UA
@@ -266,6 +267,16 @@ Quad9), как в ТЗ 5.10.
 «отключён или очень короткий idle»): одна главная страница на сайт,
 пул по хостам переживал бы перерезолв адресов и держал тысячи
 неактивных соединений при concurrency 2000.
+
+`block_internal_addrs` — SSRF-защита пути редиректов: хост из
+Location/meta refresh, резолвящийся только во внутренние адреса
+(loopback, RFC1918/ULA, link-local — включая cloud metadata
+169.254.169.254, unspecified, multicast), не подключается, проверка
+фиксирует ошибку резолва. Адреса DNS-этапа (стартовые хосты задачи)
+фильтром не затрагиваются. По умолчанию выключено: dev/testbed-стенды
+резолвируют сценарии во внутренние сети (172.28.100.0/24); для
+Internet-боевой эксплуатации включать обязательно — рядом с краулером
+в сети живут БД, Redis и resolver.
 
 ### `render` (ТЗ 5.6)
 

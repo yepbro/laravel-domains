@@ -20,8 +20,11 @@
 package httpfetch
 
 import (
+	"bufio"
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"errors"
 	"fmt"
 	"io"
@@ -84,12 +87,15 @@ var ErrDecompressTooLarge = errors.New("httpfetch: распакованное т
 // --- сжатие: Accept-Encoding и распаковка с потолком ------------------------
 
 // decodeContentEncoding оборачивает сжатое тело по значению
-// Content-Encoding (gzip, br, identity/пустое) читателем с потолком
-// распакованного размера limit (<= 0 — defaultDecompressLimit).
-// Неподдерживаемая или составная («gzip, br») кодировка — ошибка:
-// краулер рекламирует только gzip и br, сервер, приславший иное,
-// сломан, и молча отдать потребителю сжатые байты как тело — хуже
-// честного отказа. Возвращает читатель, закрывающий исходное тело.
+// Content-Encoding (gzip, br, deflate, identity/пустое) читателем с
+// потолком распакованного размера limit (<= 0 — defaultDecompressLimit).
+// deflate краулер не рекламирует (Accept-Encoding: gzip, br), но часть
+// серверов отдаёт его незапрошенным — поток принимается оборонительно:
+// zlib-обёртка (RFC 1950) или сырой deflate (RFC 1951), форма различается
+// по заголовку. Составные кодировки («gzip, br») — ошибка: транспорт
+// их не запрашивает, сервер, приславший составное значение, сломан, и
+// молча отдать потребителю сжатые байты как тело — хуже честного
+// отказа. Возвращает читатель, закрывающий исходное тело.
 func decodeContentEncoding(rc io.ReadCloser, contentEncoding string, limit int64) (io.ReadCloser, error) {
 	if limit <= 0 {
 		limit = defaultDecompressLimit
@@ -111,9 +117,39 @@ func decodeContentEncoding(rc io.ReadCloser, contentEncoding string, limit int64
 	case "br":
 		// brotli.NewReader заголовок валидирует лениво, при чтении.
 		return &decompressCap{dec: brotli.NewReader(rc), src: rc, left: limit}, nil
+	case "deflate":
+		return &decompressCap{dec: newDeflateReader(rc), src: rc, left: limit}, nil
 	default:
-		return nil, fmt.Errorf("httpfetch: неподдерживаемое Content-Encoding %q (ожидается gzip/br/identity)", contentEncoding)
+		return nil, fmt.Errorf("httpfetch: неподдерживаемое Content-Encoding %q (ожидается gzip/br/deflate/identity)", contentEncoding)
 	}
+}
+
+// newDeflateReader — читатель deflate-потока: zlib-обёртка (RFC 1950)
+// или сырой поток (RFC 1951); в реальном «Content-Encoding: deflate»
+// встречаются обе формы (историческая двусмысленность HTTP-серверов,
+// ту же развилку проходят браузеры и curl). Заголовок zlib различается
+// по двум байтам: метод deflate (CM=8), окно ≤ 32 КБ (CINFO ≤ 7), без
+// предустановленного словаря (FDICT=0) и контрольная сумма заголовка
+// кратна 31. Чтение лениво: данные источника не теряются (reader
+// держит peek-буфер).
+func newDeflateReader(rc io.ReadCloser) io.Reader {
+	br := bufio.NewReader(rc)
+	if hdr, err := br.Peek(2); err == nil && looksLikeZlib(hdr) {
+		if zr, err := zlib.NewReader(br); err == nil {
+			return zr
+		}
+	}
+	return flate.NewReader(br)
+}
+
+// looksLikeZlib — правдоподобный zlib-заголовок (см. newDeflateReader).
+func looksLikeZlib(hdr []byte) bool {
+	if len(hdr) < 2 {
+		return false
+	}
+	cmf, flg := hdr[0], hdr[1]
+	return cmf&0x0f == 8 && cmf>>4 <= 7 && flg&0x20 == 0 &&
+		(int(cmf)*256+int(flg))%31 == 0
 }
 
 // decompressCap — распакованный поток с потолком (защита от zip-бомб).

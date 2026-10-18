@@ -12,7 +12,9 @@ package httpfetch
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"errors"
 	"io"
 	"net/http"
@@ -360,6 +362,9 @@ func TestDecodeContentEncoding(t *testing.T) {
 		{"gzip", "gzip", func() []byte { return gzipBytes(t, plain) }},
 		{"gzip-регистр", " GZip ", func() []byte { return gzipBytes(t, plain) }},
 		{"br", "br", func() []byte { return brotliBytes(t, plain) }},
+		{"deflate-zlib", "deflate", func() []byte { return zlibBytes(t, plain) }},
+		{"deflate-регистр", " Deflate ", func() []byte { return zlibBytes(t, plain) }},
+		{"deflate-сырой", "deflate", func() []byte { return flateRawBytes(t, plain) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(tc.compressed())), tc.enc, 0)
@@ -375,14 +380,45 @@ func TestDecodeContentEncoding(t *testing.T) {
 	}
 }
 
-// TestDecodeContentEncodingUnsupported: deflate и составные значения —
-// ошибка (краулер рекламирует только gzip и br).
+// TestDecodeContentEncodingUnsupported: составные значения и экзотика —
+// ошибка (краулер рекламирует только gzip и br; одиночный deflate
+// принимается оборонительно — незапрошенным его отдают часть серверов).
 func TestDecodeContentEncodingUnsupported(t *testing.T) {
-	for _, ce := range []string{"deflate", "compress", "gzip, br", "zstd"} {
+	for _, ce := range []string{"compress", "gzip, br", "zstd", "br, gzip"} {
 		if _, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(nil)), ce, 0); err == nil {
 			t.Errorf("Content-Encoding %q: ожидалась ошибка", ce)
 		}
 	}
+}
+
+// zlibBytes — zlib-обёртка (RFC 1950) поверх deflate.
+func zlibBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatalf("zlib write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zlib close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// flateRawBytes — сырой deflate-поток (RFC 1951, без zlib-заголовка):
+// такую форму «Content-Encoding: deflate» отдают серверы, не читавшие
+// RFC 1950.
+func flateRawBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	fw, _ := flate.NewWriter(&buf, flate.DefaultCompression)
+	if _, err := fw.Write(b); err != nil {
+		t.Fatalf("flate write: %v", err)
+	}
+	if err := fw.Close(); err != nil {
+		t.Fatalf("flate close: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // TestDecodeContentEncodingBomb: распакованный поток сверх потолка —
@@ -618,14 +654,51 @@ func TestFetchGzipEmptyBody(t *testing.T) {
 // TestFetchUnsupportedEncoding: сервер прислал незапрашиваемое
 // Content-Encoding — честная ошибка, не сжатые байты телом.
 func TestFetchUnsupportedEncoding(t *testing.T) {
-	srv, _ := encodingServer(t, []byte{0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01}, map[string]string{
-		"Content-Encoding": "deflate",
+	srv, _ := encodingServer(t, []byte("x"), map[string]string{
+		"Content-Encoding": "compress",
 	})
 	f := NewFetcher(Options{})
 	u, _ := url.Parse(srv.URL)
 	_, err := f.Fetch(t.Context(), FetchRequest{URL: u, Addrs: loopbackAddr()})
 	if err == nil || !strings.Contains(err.Error(), "Content-Encoding") {
 		t.Fatalf("ожидалась ошибка Content-Encoding, получено %v", err)
+	}
+}
+
+// TestFetchDeflateRoundtrip: незапрошенный deflate (zlib-обёртка и
+// сырой поток — историческая двусмысленность серверов) распаковывается:
+// страница не проваливается ошибкой запроса, кодирующие заголовки
+// снимаются; Accept-Encoding по-прежнему рекламирует только gzip и br.
+func TestFetchDeflateRoundtrip(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{"zlib", zlibBytes(t, []byte("deflate-zlib-body")), "deflate-zlib-body"},
+		{"сырой-поток", flateRawBytes(t, []byte("deflate-raw-body")), "deflate-raw-body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, ae := encodingServer(t, tc.body, map[string]string{
+				"Content-Encoding": "deflate",
+			})
+			f := NewFetcher(Options{})
+			res := fetchFrom(t, f, srv.URL)
+			defer func() { _ = res.Body.Close() }()
+			b, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatalf("чтение: %v", err)
+			}
+			if string(b) != tc.want {
+				t.Errorf("тело: %q, ожидалось %q", b, tc.want)
+			}
+			if res.Header.Get("Content-Encoding") != "" {
+				t.Errorf("Content-Encoding не снят: %q", res.Header.Get("Content-Encoding"))
+			}
+			if ae.Get() != acceptEncoding {
+				t.Errorf("Accept-Encoding: %q, ожидался %q (deflate не рекламируем)", ae.Get(), acceptEncoding)
+			}
+		})
 	}
 }
 
@@ -646,6 +719,98 @@ func TestFetchGzipBomb(t *testing.T) {
 	}
 	if len(b) != 64<<10 {
 		t.Errorf("до потолка должно читаться 64 КиБ, прочитано %d", len(b))
+	}
+}
+
+// TestFetchGzipJustOverLimit: сжатое тело чуть больше лимита ведёт себя
+// как несжатое сверх лимита (TestFetchBodyLimitExactAndTruncated в
+// limits_test.go): обрезка по лимиту с Truncated и чтение без ошибки
+// (ТЗ 8 «данные частичны, статус получен»), а не ErrDecompressTooLarge,
+// который воркер прочёл бы как read-ошибку и погасил бы Available
+// живого сайта. Потолки распаковки и чтения равны (боевая сборка
+// NewOptions ставит оба из http.max_body_bytes).
+func TestFetchGzipJustOverLimit(t *testing.T) {
+	run := func(t *testing.T, size, limit int, wantTrunc bool) {
+		t.Helper()
+		srv, _ := encodingServer(t, gzipBytes(t, bytes.Repeat([]byte("z"), size)), map[string]string{
+			"Content-Encoding": "gzip",
+		})
+		f := NewFetcher(Options{
+			MaxBodyBytes: int64(limit),
+			Limits:       &LimitOptions{MaxBodyBytes: int64(limit)},
+		})
+		res := fetchFrom(t, f, srv.URL)
+		defer func() { _ = res.Body.Close() }()
+		b, readErr := io.ReadAll(res.Body)
+		if readErr != nil {
+			t.Fatalf("обрезка — не ошибка чтения: %v", readErr)
+		}
+		if len(b) != min(size, limit) {
+			t.Errorf("прочитано %d байт, ожидалось %d", len(b), min(size, limit))
+		}
+		if res.BodyLimiter == nil || !res.BodyLimiter.Truncated() == wantTrunc {
+			t.Errorf("признак обрезки: %v, ожидался %v", res.BodyLimiter.Truncated(), wantTrunc)
+		}
+	}
+	t.Run("ровно в лимит", func(t *testing.T) { run(t, 1000, 1000, false) })
+	t.Run("на байт больше", func(t *testing.T) { run(t, 1001, 1000, true) })
+	t.Run("заметно больше", func(t *testing.T) { run(t, 64<<10, 1000, true) })
+}
+
+// TestFetchGzipBombUnderLimiter: бомба при включённых лимитах T-049 —
+// данные частичны: тело читается до лимита без ошибки, признак
+// Truncated выставляется (дальше лимита+1 распаковка не идёт). Ошибка
+// ErrDecompressTooLarge остаётся защитой пути без лимитёра
+// (TestFetchGzipBomb).
+func TestFetchGzipBombUnderLimiter(t *testing.T) {
+	bomb := bytes.Repeat([]byte("A"), 1<<20)
+	srv, _ := encodingServer(t, gzipBytes(t, bomb), map[string]string{
+		"Content-Encoding": "gzip",
+	})
+	const limit = 64 << 10
+	f := NewFetcher(Options{
+		MaxBodyBytes: limit,
+		Limits:       &LimitOptions{MaxBodyBytes: limit},
+	})
+	res := fetchFrom(t, f, srv.URL)
+	defer func() { _ = res.Body.Close() }()
+	b, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		t.Fatalf("бомба под лимитёром — обрезка, не ошибка чтения: %v", readErr)
+	}
+	if len(b) != limit {
+		t.Errorf("прочитано %d байт, ожидался лимит %d", len(b), limit)
+	}
+	if !res.BodyLimiter.Truncated() {
+		t.Error("признак обрезки не выставлен")
+	}
+}
+
+// TestFetchDecompressCeilingFollowsLimiter: потолок распаковки и лимит
+// чтения — одно число из одного источника: при включённых лимитах
+// T-049 это Limits.MaxBodyBytes, Options.MaxBodyBytes на распаковку не
+// влияет (два независимых поля в ручной сборке Options расходились —
+// распаковка резала тело по своему числу до лимитёра).
+func TestFetchDecompressCeilingFollowsLimiter(t *testing.T) {
+	page := bytes.Repeat([]byte("q"), 1000) // меньше лимита лимитёра
+	srv, _ := encodingServer(t, gzipBytes(t, page), map[string]string{
+		"Content-Encoding": "gzip",
+	})
+	f := NewFetcher(Options{
+		MaxBodyBytes: 500, // ловушка: не источник при включённых Limits
+		Limits:       &LimitOptions{MaxBodyBytes: 1500},
+	})
+	res := fetchFrom(t, f, srv.URL)
+	defer func() { _ = res.Body.Close() }()
+	b, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		t.Fatalf("тело меньше лимита — чтение без ошибки: %v", readErr)
+	}
+	if len(b) != len(page) {
+		t.Errorf("прочитано %d байт, ожидалось %d (потолок не из Limits.MaxBodyBytes)", len(b), len(page))
+	}
+	if res.BodyLimiter.Truncated() {
+		t.Error("тело меньше лимита помечено обрезкой")
 	}
 }
 

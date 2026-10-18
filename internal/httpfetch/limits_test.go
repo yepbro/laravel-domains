@@ -106,6 +106,71 @@ func TestBodyLimiterClosedRead(t *testing.T) {
 	}
 }
 
+// readCountingRC — источник с подсчётом Read (нулевые буферы и повторные
+// чтения не должны трогать источник).
+type readCountingRC struct {
+	io.Reader
+	reads *int
+}
+
+func (r *readCountingRC) Read(p []byte) (int, error) {
+	*r.reads++
+	return r.Reader.Read(p)
+}
+
+func (r *readCountingRC) Close() error { return nil }
+
+// TestBodyLimiterZeroBufAndRepeatRead: буфер длины 0 не читает источник
+// (контракт io.Reader); после классификации хвоста за потолком
+// повторные чтения возвращают запомненный итог (io.EOF или ошибку),
+// не перечитывая пробный байт.
+func TestBodyLimiterZeroBufAndRepeatRead(t *testing.T) {
+	run := func(t *testing.T, size, limit int, wantTrunc bool) {
+		t.Helper()
+		var reads int
+		bl := newBodyLimiter(&readCountingRC{Reader: bytes.NewReader(bytes.Repeat([]byte("a"), size)), reads: &reads},
+			func() {}, LimitOptions{MaxBodyBytes: int64(limit)}) // speed 0 — сторож выключен
+
+		if n, err := bl.Read(nil); n != 0 || err != nil {
+			t.Errorf("Read(nil) = (%d, %v), ожидалось (0, nil)", n, err)
+		}
+		if n, err := bl.Read(make([]byte, 0)); n != 0 || err != nil {
+			t.Errorf("Read(пустой буфер) = (%d, %v), ожидалось (0, nil)", n, err)
+		}
+		if reads != 0 {
+			t.Fatalf("нулевые буферы прочитали источник: %d чтений", reads)
+		}
+
+		buf := make([]byte, size+8)
+		got := 0
+		for got < limit && got < size {
+			n, err := bl.Read(buf[got:])
+			if err != nil {
+				t.Fatalf("чтение до потолка: %v", err)
+			}
+			got += n
+		}
+		if _, err := bl.Read(buf); err != io.EOF {
+			t.Fatalf("проба хвоста: %v, ожидался io.EOF", err)
+		}
+		if bl.Truncated() != wantTrunc {
+			t.Errorf("признак обрезки: %v, ожидался %v", bl.Truncated(), wantTrunc)
+		}
+		probes := reads
+		for i := 0; i < 3; i++ {
+			if n, err := bl.Read(buf); n != 0 || err != io.EOF {
+				t.Errorf("повторное чтение №%d: (%d, %v), ожидалось (0, io.EOF)", i+1, n, err)
+			}
+		}
+		if reads != probes {
+			t.Errorf("повторные чтения тронули источник: %d → %d чтений", probes, reads)
+		}
+		_ = bl.Close()
+	}
+	t.Run("сверх лимита", func(t *testing.T) { run(t, 10, 5, true) })
+	t.Run("ровно в лимит", func(t *testing.T) { run(t, 5, 5, false) })
+}
+
 // --- токен-ведро темпа -------------------------------------------------------
 
 // TestLimitBucketPacing: всплеск до burst уходит сразу, дальнейшие
