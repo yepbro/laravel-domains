@@ -111,6 +111,11 @@ build-runtime: ## Собрать боевые образы (runtime + render) д
 
 GO_PKGS := ./cmd/... ./internal/... ./migrations/... ./test/... ./deploy/postgres
 
+# Пути gofmt (каталогами): тот же охват, что у линта — gofmt в CI гейтится
+# golangci-lint (formatters.gofmt на GO_PKGS, включая migrations/embed.go),
+# make fmt должен править те же файлы, иначе гейт ловит то, что fmt не чинит.
+GOFMT_PATHS := cmd internal test deploy/postgres migrations
+
 .PHONY: test
 test: ## Модульные тесты Go (в контейнере)
 	$(check_env)
@@ -139,7 +144,7 @@ lint: ## golangci-lint (в контейнере)
 .PHONY: fmt
 fmt: ## gofmt + go vet (в контейнере)
 	$(check_env)
-	$(COMPOSE) run --rm tools sh -c 'gofmt -l -w cmd internal test deploy/postgres && go vet $(GO_PKGS)'
+	$(COMPOSE) run --rm tools sh -c 'gofmt -l -w $(GOFMT_PATHS) && go vet $(GO_PKGS)'
 
 .PHONY: mod-download
 mod-download: ## Докачать Go-модули в общий кэш (нужен интернет; tools его имеет)
