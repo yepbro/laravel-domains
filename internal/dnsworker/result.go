@@ -32,7 +32,11 @@
 //     каждому субдомену отдельно; потерянное имя покроет регулярная
 //     перепроверка T-030), без адресов — temp_error: классифицировать
 //     «нет адресов» по молчащему резолверу нельзя (ложный терминальный
-//     статус), повтор T-031 перепроверит эпизод.
+//     статус), повтор T-031 перепроверит эпизод. Дефекты самой зоны —
+//     цикл и превышение глубины CNAME (ErrSubdomCNAMELoop/Depth) — сбоям
+//     не ровня: резолвер ответил, сломано у домена; итог субдомена
+//     «адресов нет» без temp_error (sentinel-ошибки разбираются
+//     errors.Is, T-037).
 //
 // Порядок «публикация q:http → запись done» (§3.4, в духе T-028:
 // PostgreSQL — источник истины, done — точка фиксации эпизода):
@@ -184,8 +188,17 @@ func DecideEpisode(apex *ApexResult, rep *SubdomReport, wild WildcardResult) (Ep
 	for _, r := range rep.Results {
 		// Сбой резолвера: транспорт (Err) либо код вне {NOERROR, NXDOMAIN}
 		// — NXDOMAIN субдомена авторитетен (имени нет, RFC 8020),
-		// в том числе CNAME→NXDOMAIN (T-037).
-		if r.Err != nil || (r.RCode != dnsclient.RCodeNOERROR && r.RCode != dnsclient.RCodeNXDOMAIN) {
+		// в том числе CNAME→NXDOMAIN (T-037). Дефекты цепочки CNAME
+		// (ErrSubdomCNAMELoop/Depth, sentinel-ошибки T-037) — не сбой
+		// резолвера: резолвер ответил исправно, зона сломана постоянно —
+		// повтор эпизода не изменит исход, итог субдомена «адресов нет»,
+		// а не temp_error (три полных повтора T-031 здесь — лишняя работа
+		// и шумный статус).
+		if r.Err != nil {
+			if !errors.Is(r.Err, ErrSubdomCNAMELoop) && !errors.Is(r.Err, ErrSubdomCNAMEDepth) {
+				temp = true
+			}
+		} else if r.RCode != dnsclient.RCodeNOERROR && r.RCode != dnsclient.RCodeNXDOMAIN {
 			temp = true
 		}
 		if !r.HasAddrs() || wild.IsWildcard(r.ID) {

@@ -703,6 +703,44 @@ func TestResultDecideEpisode(t *testing.T) {
 			wantTemp: true,
 		},
 		{
+			// DNS-02: дефект зоны — не сбой резолвера: цикл CNAME на www
+			// постоянен, повторы T-031 ничего не изменят — «адресов нет».
+			name: "адресов нет, цикл CNAME субдомена — delegated_no_address",
+			apex: noAddress,
+			rep: &SubdomReport{Results: []SubdomResult{
+				{ID: 0, Label: "", RCode: dnsclient.RCodeNOERROR},
+				{ID: 1, Label: "www",
+					Err: fmt.Errorf("%w: www.example.net. → cdn.example.net.", ErrSubdomCNAMELoop)},
+			}},
+			wantSet: true,
+			wantSt:  model.StatusDelegatedNoAddress,
+		},
+		{
+			name: "адресов нет, глубина CNAME субдомена — delegated_no_address",
+			apex: noAddress,
+			rep: &SubdomReport{Results: []SubdomResult{
+				{ID: 0, Label: "", RCode: dnsclient.RCodeNOERROR},
+				{ID: 1, Label: "www",
+					Err: fmt.Errorf("%w: 10 переходов от www.example.net.", ErrSubdomCNAMEDepth)},
+			}},
+			wantSet: true,
+			wantSt:  model.StatusDelegatedNoAddress,
+		},
+		{
+			// Транспортный сбой рядом с дефектом зоны всё же temp:
+			// «адресов нет» по молчащему резолверу не выводится.
+			name: "адресов нет, цикл CNAME и транспорт — temp_error",
+			apex: noAddress,
+			rep: &SubdomReport{Results: []SubdomResult{
+				{ID: 0, Label: "",
+					Err: fmt.Errorf("%w: a.example.net. → b.example.net.", ErrSubdomCNAMELoop)},
+				{ID: 1, Label: "www", Err: errResultNet},
+			}},
+			wantSet:  true,
+			wantSt:   model.StatusTempError,
+			wantTemp: true,
+		},
+		{
 			name: "адреса есть несмотря на сбой одного субдомена — частичный итог",
 			apex: delegated,
 			rep: &SubdomReport{Mask: mustMask(t, 0), Results: []SubdomResult{
@@ -714,6 +752,21 @@ func TestResultDecideEpisode(t *testing.T) {
 				{SubdomainID: 0, Label: "", Addrs: []string{"192.0.2.10"}},
 			},
 			wantTemp: true,
+		},
+		{
+			// DNS-02: дефект зоны у субдомена без адресов не портит итог
+			// нашедшим адреса и не помечает эпизод temp.
+			name: "адреса есть, у другого субдомена цикл CNAME — без temp",
+			apex: delegated,
+			rep: &SubdomReport{Mask: mustMask(t, 0), Results: []SubdomResult{
+				{ID: 0, Label: "", A: apexAddrs("192.0.2.10")},
+				{ID: 1, Label: "www",
+					Err: fmt.Errorf("%w: www.example.net. → cdn.example.net.", ErrSubdomCNAMELoop)},
+			}},
+			wantMask: mustMask(t, 0),
+			wantSubs: []queue.HTTPSubdomain{
+				{SubdomainID: 0, Label: "", Addrs: []string{"192.0.2.10"}},
+			},
 		},
 		{
 			name: "nxdomain субдомена — не сбой (RFC 8020)",
