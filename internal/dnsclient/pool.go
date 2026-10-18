@@ -54,7 +54,7 @@ type UDPPool struct {
 // старте, а не первого запроса. Доступность резолвера connect не
 // проверяет (UDP connect пакетов не шлёт): мёртвый сервер звучит в
 // первом обмене — ECONNREFUSED от подключённого сокета (ICMP port
-// unreachable) либо таймаут; см. NewClient о стартовой пробе (DNS-12).
+// unreachable) либо таймаут; см. NewClient о стартовой пробе (T-107).
 // Контекст ограничивает открытие.
 func NewUDPPool(ctx context.Context, addr string, size int) (*UDPPool, error) {
 	if size < 1 {

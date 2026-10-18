@@ -181,8 +181,8 @@ var _ Resolver = (*Client)(nil)
 type Options struct {
 	// Addr — адрес резолвера host:port (первый из dns.resolvers —
 	// локальный Unbound, ТЗ 5.4). Один клиент — один резолвер:
-	// публичные fallback-резолверы (dns.fallback_resolvers) — политика
-	// более высокого уровня (T-035), а не транспорта.
+	// публичные fallback-резолверы (dns.fallback_resolvers) — цепочка
+	// FallbackResolver выше транспорта (fallback.go, T-107).
 	Addr string
 	// Timeout — таймаут одной UDP-попытки. По умолчанию 2s.
 	Timeout time.Duration
@@ -280,8 +280,9 @@ type Client struct {
 // резолвера UDP connect не проверяет (пакетов не шлёт) — мёртвый сервер
 // проявляется в первом же обмене (ECONNREFUSED/таймаут → temp_error)
 // и виден в метриках лимитёра (crawler_dns_limit_timeout_ratio, DNS-06),
-// а не ошибкой старта. Стартовая синтетическая проба и переход на
-// dns.fallback_resolvers — политика T-035, в бэклоге (DNS-12).
+// а не ошибкой старта. Стартовая синтетическая проба резолвера и
+// переключение на dns.fallback_resolvers — декораторы выше клиента
+// (probe.go, fallback.go, T-107).
 // Контекст ограничивает открытие сокетов.
 func NewClient(ctx context.Context, opts Options) (*Client, error) {
 	opts = opts.withDefaults()

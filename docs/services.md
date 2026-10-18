@@ -238,10 +238,13 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
   сброс `temp_attempts` на не-`temp_error` итоге (контракт T-031);
   охраны `status <> deleted` (§13.1) и `check_state <> done`
   (идемпотентность);
-- обмены — `dnsclient.Client` (пул UDP-сокетов, T-034) под
-  `LimitResolver` (`dns.concurrency`/`dns.max_qps`, адаптив, `dns.ipv6`,
-  T-035); публикация `q:http` — под гейтом backpressure
-  (`WatermarkPublisher`, T-026).
+- обмены — цепь `dnsclient.FallbackResolver` (локальный `Client`
+  с пулом UDP-сокетов, T-034, + резервные клиенты `dns.fallback_resolvers`,
+  переключение при транспортном отказе, T-107) под `LimitResolver`
+  (`dns.concurrency`/`dns.max_qps`, адаптив, `dns.ipv6`, T-035); старт
+  сервиса — синтетическая проба цепи (fail-fast на всех мёртвых, Warn
+  на частичном отказе, T-107); публикация `q:http` — под гейтом
+  backpressure (`WatermarkPublisher`, T-026).
 
 `http-worker` (этап 5, T-053): его `OnRun` выполняет цикл
 `httpworker.Run` (`internal/httpworker/worker.go`):
