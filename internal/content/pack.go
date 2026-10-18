@@ -333,15 +333,15 @@ func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 
 	block, err := readPackBlock(s.opts.Dir, packID, off, clen)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %s: %w", ErrCorrupted, hash, err)
 	}
 	raw, err := DecompressWithDict(block)
 	if err != nil {
-		return nil, fmt.Errorf("content: %s: распаковка блока пака %d: %w", hash, packID, err)
+		return nil, fmt.Errorf("%w: %s: распаковка блока пака %d: %w", ErrCorrupted, hash, packID, err)
 	}
 	if int32(len(raw)) != rawLen {
-		return nil, fmt.Errorf("content: %s: блок пака %d повреждён: распаковано %d байт, в метаданных %d",
-			hash, packID, len(raw), rawLen)
+		return nil, fmt.Errorf("%w: %s: блок пака %d повреждён: распаковано %d байт, в метаданных %d",
+			ErrCorrupted, hash, packID, len(raw), rawLen)
 	}
 	return raw, nil
 }

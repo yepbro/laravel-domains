@@ -108,9 +108,10 @@ type compactFakeMove struct {
 type compactFakeTx struct {
 	pgx.Tx // остальные методы pgx.Tx проход не использует
 
-	pool  *compactFakePool
-	moves []compactFakeMove
-	deads [][HashLen]byte
+	pool     *compactFakePool
+	moves    []compactFakeMove
+	deads    [][HashLen]byte
+	corrupts [][HashLen]byte
 }
 
 func (t *compactFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -142,12 +143,29 @@ func (t *compactFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn
 		for _, hb := range hashes {
 			var h [HashLen]byte
 			copy(h[:], hb)
-			if r := t.pool.contents[h]; r != nil && r.packID == from && r.refc == 0 {
-				t.deads = append(t.deads, h)
-				n++
+			if r := t.pool.contents[h]; r != nil && r.packID == from {
+				// Охрана refcount = 0 оценивается в момент выполнения
+				// оператора (как в PostgreSQL): пометки мёртвыми из той
+				// же транзакции уже применились — sqlCompactCorrupt идёт
+				// в CompactPack раньше sqlCompactDead.
+				if r.refc == 0 || t.corruptPending(h) {
+					t.deads = append(t.deads, h)
+					n++
+				}
 			}
 		}
 		return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n)), nil
+	case sqlCompactCorrupt:
+		hb := args[0].([]byte)
+		from := args[1].(int32)
+		var h [HashLen]byte
+		copy(h[:], hb)
+		var n int64
+		if r := t.pool.contents[h]; r != nil && r.packID == from && r.refc > 0 {
+			t.corrupts = append(t.corrupts, h)
+			n = 1
+		}
+		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", n)), nil
 	default:
 		return pgconn.CommandTag{}, fmt.Errorf("compactFakeTx: неожидаемый SQL: %s", sql)
 	}
@@ -158,6 +176,11 @@ func (t *compactFakeTx) Commit(context.Context) error {
 	defer t.pool.mu.Unlock()
 	if t.pool.commitErr != nil {
 		return t.pool.commitErr
+	}
+	for _, h := range t.corrupts { // пометки мёртвыми — до удаления deads
+		if r := t.pool.contents[h]; r != nil {
+			r.refc = 0
+		}
 	}
 	for _, m := range t.moves {
 		if r := t.pool.contents[m.h]; r != nil {
@@ -174,6 +197,17 @@ func (t *compactFakeTx) Commit(context.Context) error {
 }
 
 func (t *compactFakeTx) Rollback(context.Context) error { return nil }
+
+// corruptPending — строка помечается мёртвой оператором sqlCompactCorrupt
+// этой же транзакции (применяются в Commit раньше deads).
+func (t *compactFakeTx) corruptPending(h [HashLen]byte) bool {
+	for _, c := range t.corrupts {
+		if c == h {
+			return true
+		}
+	}
+	return false
+}
 
 // --- общий конструктор и утилиты --------------------------------------------
 
@@ -356,6 +390,84 @@ func TestCompactShortPackSwept(t *testing.T) {
 	compactCraftRow(t, pool, "orphan", 3, 0, 8, 1)
 	if _, err := st.CompactScan(ctx, 3); err == nil {
 		t.Error("скан пака без заголовка со строками: ожидалась ошибка")
+	}
+}
+
+// TestGetCorrupted — порча байтов блока при живой строке: Get отвечает
+// ErrCorrupted (отличимо от ErrNotFound и от ошибки БД).
+func TestGetCorrupted(t *testing.T) {
+	st, pool := newCompactTestStore(t, nil)
+	ctx := context.Background()
+	d := []byte("контент, чьи байты сейчас испортим")
+	res, err := st.Put(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := pool.row(res.Hash)
+	path := filepath.Join(st.opts.Dir, packFileName(row.packID))
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("\xFF\xFF\xFF\xFF"), row.off); err != nil { // затираем кадр zstd
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrCorrupted) {
+		t.Errorf("Get испорченного блока: %v, want ErrCorrupted", err)
+	}
+	if _, err := st.Get(ctx, HashOf([]byte("никогда не писали"))); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get отсутствующего: %v, want ErrNotFound", err)
+	}
+}
+
+// TestCompactCorruptBlock — нечитаемый при копировании блок (обрыв хвоста
+// файла) живой строки: строка помечается мёртвой, пак удаляется, живые
+// соседи переезжают, расхождение целостности — в ошибке прохода.
+func TestCompactCorruptBlock(t *testing.T) {
+	st, pool := newCompactTestStore(t, nil)
+	ctx := context.Background()
+	var hashes []Hash
+	for i := 0; i < 3; i++ {
+		d := []byte(strings.Repeat(fmt.Sprintf("<p>сосед %d для порчи</p>", i), 10))
+		res, err := st.Put(ctx, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hashes = append(hashes, res.Hash)
+	}
+	compactCraftPack(t, st.opts.Dir, 2, nil) // новейший
+
+	// Обрываем хвост пака: блок последней строки выходит за конец файла
+	// (краш записи/потеря хвоста), чтение его — ошибка I/O, не декодера.
+	row, _ := pool.row(hashes[2])
+	if err := os.Truncate(filepath.Join(st.opts.Dir, packFileName(row.packID)), row.off-2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Get(ctx, hashes[2]); !errors.Is(err, ErrCorrupted) {
+		t.Errorf("Get блока за концом файла: %v, want ErrCorrupted", err)
+	}
+
+	res, err := st.CompactPack(ctx, 1)
+	if err == nil {
+		t.Fatal("компактификация с нечитаемым блоком: ожидалась ошибка целостности")
+	}
+	if !strings.Contains(err.Error(), "блок нечитаем") {
+		t.Errorf("ошибка не называет нечитаемый блок: %v", err)
+	}
+	if !res.Removed || res.Corrupted != 1 || res.CopiedBlocks != 2 || res.Tombstones != 1 {
+		t.Errorf("итог %+v, want удалённый пак, 1 порченая и 2 переписанные строки", res)
+	}
+	// Порченая строка мертва (удалена компактификацией), соседи переехали.
+	if _, ok := pool.row(hashes[2]); ok {
+		t.Error("строка нечитаемого блока не помечена мёртвой")
+	}
+	for _, h := range []Hash{hashes[0], hashes[1]} {
+		if r, _ := pool.row(h); r.packID != 2 {
+			t.Errorf("живой сосед %s не переехал: %+v", h, r)
+		}
 	}
 }
 

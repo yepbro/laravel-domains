@@ -109,6 +109,14 @@ const (
 	// пака без заголовка (строк нет — файл-мусор) от повреждения
 	// (строки, указывающие в файл без заголовка).
 	sqlCompactAll = "SELECT count(*) FROM contents WHERE pack_id = $1"
+
+	// Пометка мёртвой строки с нечитаемым блоком (потеря/порча байтов):
+	// повторный Put её не чинит (дедуп видит живую строку), компактификация
+	// без пометки не смогла бы ни перенести блок, ни удалить пак — «ядовитый»
+	// пак вечно блокировал бы освобождение места. Охраны pack_id (строка
+	// не переехала) и refcount > 0 (уже мёртвая не нужна).
+	sqlCompactCorrupt = "UPDATE contents SET refcount = 0 " +
+		"WHERE hash = $1 AND pack_id = $2 AND refcount > 0"
 )
 
 // errCompactNewest — попытка компактифицировать новейший пак: он открыт
@@ -187,6 +195,10 @@ type CompactResult struct {
 	Tombstones   int64 // удалённые мёртвые строки contents
 	Removed      bool  // файл старого пака удалён
 	FreedBytes   int64 // освобождено места (размер удалённого файла)
+	// Corrupted — живые строки с нечитаемыми блоками: помечены мёртвыми,
+	// компактификация пака продолжена; расхождение целостности — в ошибке
+	// CompactPack (Warn прохода), детали — в её тексте.
+	Corrupted int64
 }
 
 // CompactStats — итог одного прохода CompactOnce.
@@ -361,8 +373,9 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 
 	res := CompactResult{PackID: packID}
 	var (
-		live []compactLiveRow
-		dead [][]byte
+		live    []compactLiveRow
+		dead    [][]byte
+		corrupt []error
 	)
 	// flush переписывает накопленную пачку живых блоков в новейший пак и
 	// фиксирует транзакцию. Сбой до Commit оставляет скопированные блоки
@@ -374,10 +387,21 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		hashes := make([][]byte, 0, len(live))
 		packs := make([]int32, 0, len(live))
 		offs := make([]int64, 0, len(live))
+		var corruptHashes [][]byte
 		for _, r := range live {
 			block, err := readPackBlock(s.opts.Dir, packID, r.off, r.clen)
 			if err != nil {
-				return err
+				// Блок недоступен: чтение и повторный Put этот контент
+				// не восстановят (дедуп видит живую строку). Строка
+				// помечается мёртвой в той же транзакции — пак остаётся
+				// компактифицируемым, место освобождается; расхождение
+				// целостности уходит в итог прохода (Warn цикла).
+				corrupt = append(corrupt, fmt.Errorf(
+					"content: компактификация пака %d: %x: блок нечитаем, строка помечена мёртвой: %w",
+					packID, r.hash, err))
+				corruptHashes = append(corruptHashes, r.hash[:])
+				res.Corrupted++
+				continue
 			}
 			newPack, newOff, err := s.appendBlock(block)
 			if err != nil {
@@ -395,6 +419,16 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		}
 		// Откат безусловно: после Commit — no-op (стиль T-020).
 		defer func() { _ = tx.Rollback(ctx) }()
+		if len(corruptHashes) > 0 {
+			// До sqlCompactDead: помеченная строка удаляется той же
+			// транзакцией (охрана refcount = 0 после пометки сойдётся).
+			for _, hb := range corruptHashes {
+				if _, err := tx.Exec(ctx, sqlCompactCorrupt, hb, packID); err != nil {
+					return fmt.Errorf("content: компактификация пака %d: пометка нечитаемого блока: %w", packID, err)
+				}
+			}
+			dead = append(dead, corruptHashes...)
+		}
 		if len(hashes) > 0 {
 			if _, err := tx.Exec(ctx, sqlCompactMove, hashes, packs, offs, packID); err != nil {
 				return fmt.Errorf("content: компактификация пака %d: перенос размещений: %w", packID, err)
@@ -491,7 +525,9 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 	}
 	res.Removed = true
 	res.FreedBytes = size
-	return res, nil
+	// Пак скомпактифицирован и удалён; расхождения целостности
+	// (нечитаемые блоки) — в итоговой ошибке, проход их не теряет.
+	return res, errors.Join(corrupt...)
 }
 
 // checkNotNewest — предусловие компактификации: пак закрыт для записи.
@@ -615,13 +651,16 @@ func CompactOnce(ctx context.Context, st *PackStore, opts CompactOptions) (Compa
 			continue
 		}
 		res, err := st.CompactPack(ctx, id)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
+		// Пак может быть скомпактифицирован и удалён даже при ошибке
+		// (расхождения целостности нечитаемых блоков собираются в неё) —
+		// освобождённое место и правка учитываются в любом случае.
 		if res.Removed {
 			stats.Compacted++
 			stats.FreedBytes += res.FreedBytes
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
 		}
 	}
 	return stats, errors.Join(errs...)
