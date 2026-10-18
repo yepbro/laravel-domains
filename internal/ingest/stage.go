@@ -21,7 +21,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -58,7 +57,9 @@ type Batch struct {
 }
 
 // Row — валидированная строка входного файла (проверка имён — T-016):
-// метка домена без зоны в punycode (ТЗ 5.2) и её позиция в файле.
+// метка домена без зоны в punycode (ТЗ 5.2; может быть составной —
+// «магазин.рф.co.uk» в зоне co.uk даёт «xn--80aairftm.xn--p1ai»,
+// контракт internal/idn) и её позиция в файле.
 type Row struct {
 	Label  string
 	LineNo int64 // номер строки в исходном файле, с единицы
@@ -146,9 +147,11 @@ func ClearBatch(ctx context.Context, pool db.DB, id BatchID) (int64, error) {
 // значения колонок COPY (в порядке StageColumns) и проверяет дешёвые
 // инварианты каждой строки — полная валидация имён делается до загрузки
 // (T-016). Проверки защищают staging от программных ошибок источника:
-// метка непустая, без точки и не-ASCII (это метка без зоны в punycode,
-// ТЗ 5.2), не длиннее MaxLabelLen (ТЗ 5.2 п. 4); номер строки с единицы и
-// строго растёт — уникальность (batch_id, line_no) внутри партии до БД.
+// метка непустая и не-ASCII (это метка без зоны в punycode, ТЗ 5.2),
+// составной бывает (контракт internal/idn — точки допустимы), но каждая
+// её часть непустая и не длиннее MaxLabelLen (ТЗ 5.2 п. 4); номер строки
+// с единицы и строго растёт — уникальность (batch_id, line_no) внутри
+// партии до БД.
 func (b Batch) rowIter(next RowIter) db.RowIter {
 	var lastLine int64
 	return func() ([]any, error) {
@@ -159,12 +162,10 @@ func (b Batch) rowIter(next RowIter) db.RowIter {
 		switch {
 		case row.Label == "":
 			return nil, fmt.Errorf("ingest: строка %d: пустая метка домена", row.LineNo)
-		case strings.Contains(row.Label, "."):
-			return nil, fmt.Errorf("ingest: строка %d: %q — метка домена без зоны, без точек", row.LineNo, row.Label)
 		case !isASCII(row.Label):
 			return nil, fmt.Errorf("ingest: строка %d: %q — не-ASCII в метке: ожидается punycode (ТЗ 5.2)", row.LineNo, row.Label)
-		case len(row.Label) > MaxLabelLen:
-			return nil, fmt.Errorf("ingest: строка %d: метка %d октетов, максимум %d (ТЗ 5.2 п. 4)", row.LineNo, len(row.Label), MaxLabelLen)
+		case !validLabelParts(row.Label):
+			return nil, fmt.Errorf("ingest: строка %d: %q — каждая метка без зоны непустая и не длиннее %d октетов (ТЗ 5.2 п. 4)", row.LineNo, row.Label, MaxLabelLen)
 		case row.LineNo < 1:
 			return nil, fmt.Errorf("ingest: номер строки %d: нумерация с единицы", row.LineNo)
 		case row.LineNo <= lastLine:
@@ -173,6 +174,22 @@ func (b Batch) rowIter(next RowIter) db.RowIter {
 		lastLine = row.LineNo
 		return []any{b.ID[:], b.ZoneID, row.Label, int16(b.Action), row.LineNo}, nil
 	}
+}
+
+// validLabelParts — составная метка допустима (контракт internal/idn,
+// ТЗ 5.2): каждая часть между точками — непустая метка DNS не длиннее
+// MaxLabelLen октет.
+func validLabelParts(label string) bool {
+	start := 0
+	for i := 0; i <= len(label); i++ {
+		if i == len(label) || label[i] == '.' {
+			if n := i - start; n < 1 || n > MaxLabelLen {
+				return false
+			}
+			start = i + 1
+		}
+	}
+	return true
 }
 
 // isASCII — все октеты метки меньше 0x80 (punycode-форма, ТЗ 5.2).
