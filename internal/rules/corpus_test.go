@@ -206,7 +206,7 @@ func TestCorpusSamplesFullHistory(t *testing.T) {
 // TestCorpusJSONAPIEmptyHTML — JSON-API образец без HTML: JSON-эпизод мог
 // тела не сохранить (ошибка до чтения тела, контент сверх лимита), пассивный
 // анализ по кукам обязан работать и на пустом контенте. htmlCap на nil-HTML
-// безопасен, HTML-правила (json_unauthenticated) не срабатывают, порог
+// безопасен, HTML-правила (json_message_key) не срабатывают, порог
 // достигается одними куками: 1 − 0.5·0.65·0.85·0.75 = 0.793 ≥ 0.6
 // (вес cookie_encrypted_payload 0.5 — калибровка T-116).
 func TestCorpusJSONAPIEmptyHTML(t *testing.T) {
@@ -237,7 +237,60 @@ func TestCorpusJSONAPIEmptyHTML(t *testing.T) {
 	}
 }
 
+// TestCorpusJSONMessageKey — широкое правило json_message_key (T-117,
+// пассивный аналог активного 404-зонда larasites): матчит и точный
+// «Unauthenticated.», и «Not Found» — ровно один раз на ответ (двойного
+// учёта нет: точного правила рядом не существует), но поодиночке порога
+// не достигает (вес 0.25 понижен против точного 0.3: паттерн пишут
+// NestJS/Express — {"message":"Cannot GET /"}).
+func TestCorpusJSONMessageKey(t *testing.T) {
+	set := corpusSet(t)
+
+	for _, body := range []string{
+		`{"message":"Unauthenticated."}`, // точная форма (бывший json_unauthenticated)
+		`{"message":"Not Found"}`,        // 404 API-поддомена (образец T-117)
+		`{"message":"Too Many Attempts."}`,
+	} {
+		res := set.EvaluateCtx(context.Background(), Page{HTML: []byte(body)}, DefaultLimits())
+		if fired := corpusFired(res); !slices.Equal(fired, []string{"json_message_key"}) {
+			t.Errorf("тело %q: сработали %v, хочу ровно json_message_key (без дублей)", body, fired)
+		}
+		if res.Score != 0.25 {
+			t.Errorf("тело %q: score = %v, want 0.25", body, res.Score)
+		}
+		if res.IsLaravel(DefaultMinScore) {
+			t.Errorf("тело %q: одиночное правило 0.25 не должно достигать порога %.2f", body, DefaultMinScore)
+		}
+	}
+
+	// Границы паттерна: длинное значение (>120) и ключ-не-строка —
+	// несовпадение; пустое — тоже (квантификатор {1,120}).
+	for _, body := range []string{
+		`{"message":"` + strings.Repeat("x", 121) + `"}`,
+		`{"message":""}`,
+		`{"message":404}`,
+		`{"messages":"Not Found"}`,
+	} {
+		res := set.EvaluateCtx(context.Background(), Page{HTML: []byte(body)}, DefaultLimits())
+		if len(res.Signals) != 0 {
+			t.Errorf("тело %.40q…: неожиданные срабатывания %v", body, corpusFired(res))
+		}
+	}
+
+	// Чужой стек: NestJS/Express даёт ту же форму — поодиночке ниже порога,
+	// в сочетании с куками T-116 детектируется (образец laravel-12-api-404).
+	nest := set.EvaluateCtx(context.Background(),
+		Page{HTML: []byte(`{"message":"Cannot GET /"}`)}, DefaultLimits())
+	if nest.IsLaravel(DefaultMinScore) || nest.Score != 0.25 {
+		t.Errorf("NestJS-ответ: score %.3f — одиночное правило ниже порога, не Laravel", nest.Score)
+	}
+}
+
 // TestCorpusNegativesWeakSignals — негативные образцы (ТЗ §13.3: «в том
+// числе на других фреймворках, использующих похожие признаки»): is_laravel
+// обязана быть false, и тест разбирает, какими слабыми срабатываниями
+// ограничивается движок и почему они ниже порога.
+
 // числе на других фреймворках, использующих похожие признаки»): is_laravel
 // обязана быть false, и тест разбирает, какими слабыми срабатываниями
 // ограничивается движок и почему они ниже порога.

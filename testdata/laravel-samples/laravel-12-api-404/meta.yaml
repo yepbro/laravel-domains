@@ -1,0 +1,18 @@
+is_laravel: true
+# T-117 (пассивный аналог 404-зонда larasites): api-субдомен Laravel 12,
+# GET / — 404 JSON {"message":"Not Found"} (fallback-обработчик API-роутов);
+# куки Sanctum: XSRF-TOKEN с шифрованным конвертом, сессии нет (T-116).
+# Детекция — три признака: 0.25 + 0.5 + 0.25 → noisy-OR 0.719; одиночное
+# json_message_key (вес 0.25, паттерн встречается у NestJS/Express) порога
+# не достигает — проверяется тестом корпуса.
+score: 0.719          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
+calc_ver_min: ""      # вычисленный диапазон: ни одно из сработавших правил не задаёт границ
+calc_ver_max: ""
+conflict: false
+note: "Синтетический образец API-поддомена (Laravel 12): 404 JSON с ключом message — пассивный аналог активного 404-зонда larasites (T-117)"
+source: synthetic
+obtained: 2026-10-19
+rules:
+  - cookie_xsrf_token
+  - cookie_encrypted_payload
+  - json_message_key

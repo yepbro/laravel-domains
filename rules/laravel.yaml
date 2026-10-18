@@ -158,11 +158,11 @@ rules:
     regex: 'window\.Laravel\s*='
     weight: 0.4
 
-  - id: json_unauthenticated
-    description: JSON-ответ {"message":"Unauthenticated."} — Authenticate middleware (API/Sanctum)
+  - id: json_message_key
+    description: JSON-ответ {"message":"…"} — обработка ошибок Laravel (API-роуты/JSON-запросы; в larasites добывалось активным зондом 404 — здесь пассивно, T-117)
     target: html
-    regex: '\{"message":"Unauthenticated\."\}'
-    weight: 0.3
+    regex: '\{"message":"[^"]{1,120}"\}'
+    weight: 0.25
 
   # --------------------------------------- HTML: страницы/виды по умолчанию
   - id: welcome_classic
