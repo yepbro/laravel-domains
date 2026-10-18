@@ -14,11 +14,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -83,7 +80,7 @@ func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
 
 	// Одноразовый CLI: Ctrl-C/SIGTERM прерывают дренаж (опубликованное
 	// остаётся, at-least-once).
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalCtx()
 	defer stop()
 
 	poolOpts := db.NewOptions(cfg.Postgres)
@@ -405,7 +402,13 @@ func resolveSubdomainArg(ctx context.Context, pool db.DB, arg string) (subdomain
 			return s, found, err
 		}
 	}
+	// Диапазон 0..62 проверяется до поиска (ValidateSubdomainID, как в add):
+	// без проверки усечение int16(id) молча свело бы 65537 к биту 1 —
+	// disable выключил бы чужой субдомен вместо «не найден».
 	if id, perr := strconv.Atoi(strings.TrimSpace(arg)); perr == nil {
+		if err := model.ValidateSubdomainID(id); err != nil {
+			return subdomainRow{}, false, nil
+		}
 		return lookupSubdomainID(ctx, pool, int16(id))
 	}
 	return subdomainRow{}, false, nil
@@ -489,13 +492,15 @@ func subdomainsDisableRun(ctx context.Context, pool db.DB, arg string, stdout io
 	if s.id == 0 {
 		return subdomainApexGuard()
 	}
+	// Идемпотентная ветка — до записи: «уже выключен» не делает UPDATE
+	// (лишняя запись ни к чему, сообщение соответствует состоянию lookup).
+	if !s.enabled {
+		out(stdout, "субдомен %s (бит %d) уже выключен\n", s.label, s.id)
+		return nil
+	}
 	after, err := disableSubdomainByID(ctx, pool, s.id)
 	if err != nil {
 		return err
-	}
-	if !s.enabled {
-		out(stdout, "субдомен %s (бит %d) уже выключен\n", after.label, after.id)
-		return nil
 	}
 	out(stdout, "субдомен %s (бит %d) выключен: бит и накопленные маски/результаты не меняются (ТЗ 13.1)\n",
 		after.label, after.id)
@@ -601,7 +606,8 @@ func subdomainsList(args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() > 0 {
 		return usagef("subdomains list: лишние аргументы %v (команда без аргументов)", fs.Args())
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains list: %w", err)
@@ -625,7 +631,8 @@ func subdomainsAdd(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return usagef("subdomains add: %v", err)
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains add %s: %w", label, err)
@@ -645,7 +652,8 @@ func subdomainsDisable(args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() != 1 {
 		return usagef("укажите субдомен: crawlerctl subdomains disable www|бит")
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains disable %s: %w", fs.Arg(0), err)
@@ -685,7 +693,7 @@ func subdomainsRecheckCmd(args []string, stdout, stderr io.Writer) error {
 
 	// Одноразовый CLI: Ctrl-C/SIGTERM прерывают дренаж — переведённое
 	// остаётся (перевод идемпотентен), повтор команды продолжает.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalCtx()
 	defer stop()
 
 	pool, err := openManagePool(ctx)

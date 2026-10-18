@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -132,17 +133,16 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 	total += n
 
 	// 4. Большой синтетический набор для замеров (без обращения к сети).
+	// Запись потоковая: N не материализуется в памяти (при N = 10^6 список
+	// строк занял бы сотни МБ).
 	if *bulk > 0 {
-		var bulkLines []string
-		for i := 0; i < *bulk; i++ {
-			bulkLines = append(bulkLines, fmt.Sprintf("b%08d.%s", i, baseZone))
-		}
-		n, err := writeFile(filepath.Join(*incoming, baseZone, "add", "seed-bulk.txt"), bulkLines)
+		path := filepath.Join(*incoming, baseZone, "add", "seed-bulk.txt")
+		n, err := writeBulkFile(path, *bulk, baseZone)
 		if err != nil {
 			return err
 		}
 		total += n
-		out(stdout, "seed: bulk %d доменов → %s\n", *bulk, filepath.Join(*incoming, baseZone, "add", "seed-bulk.txt"))
+		out(stdout, "seed: bulk %d доменов → %s\n", *bulk, path)
 	}
 
 	// Каталоги processed/failed рядом с incoming.
@@ -171,4 +171,32 @@ func writeFile(path string, lines []string) (int, error) {
 		return 0, err
 	}
 	return len(lines), nil
+}
+
+// writeBulkFile записывает n синтетических доменов b%08d.<зона> потоково
+// (bufio.Writer): bulk-набор для замеров бывает миллионом строк — список
+// в памяти не материализуется. Идемпотентность — как у writeFile.
+func writeBulkFile(path string, n int, zone string) (int, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return 0, err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return 0, err
+	}
+	bw := bufio.NewWriter(f)
+	for i := 0; i < n; i++ {
+		if _, err := fmt.Fprintf(bw, "b%08d.%s\n", i, zone); err != nil {
+			_ = f.Close()
+			return 0, err
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		_ = f.Close()
+		return 0, err
+	}
+	if err := f.Close(); err != nil {
+		return 0, err
+	}
+	return n, nil
 }

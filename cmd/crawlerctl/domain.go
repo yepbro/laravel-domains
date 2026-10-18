@@ -475,8 +475,8 @@ func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 		widths := make([]int, len(head))
 		for _, row := range rows {
 			for i, c := range row {
-				if len(c) > widths[i] {
-					widths[i] = len(c)
+				if w := cellWidth(c); w > widths[i] {
+					widths[i] = w
 				}
 			}
 		}
@@ -639,7 +639,8 @@ func writeDomainContent(ctx context.Context, store domainContentStore, info doma
 	}
 	rawHash, err := hex.DecodeString(sel.ContentHash)
 	if err != nil || len(rawHash) != content.HashLen {
-		return fmt.Errorf("domain: некорректный content_hash %q в результате (субдомен %s, вариант %s)", sel.ContentHash, sel.Subdomain, model.Variant(sel.Variant))
+		return fmt.Errorf("domain: некорректный content_hash %q в результате (субдомен %s, вариант %s)",
+			sel.ContentHash, subLabel(sel.Subdomain), model.Variant(sel.Variant))
 	}
 	var hash content.Hash
 	copy(hash[:], rawHash)
@@ -693,7 +694,8 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("domain: %w", err)
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 
 	// CLI pool_size = 2 — бюджет соединений ТЗ 6.3 у сервисов (стиль
 	// manage.go, T-074).
@@ -721,10 +723,13 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 		// Читатель хранилища контента без записи — стиль analyzer
 		// (T-071): тот же словарь zstd и PackStore, что у пишущих этапов
 		// (иначе распаковка чужих блоков невозможна), лимиты Put не нужны.
+		// ReadOnly: чтение не создаёт каталог и файл блокировки — работает
+		// и без прав на запись в content.dir, опечатка в каталоге не
+		// создаёт посторонних путей (runbook: проверка чтения контента).
 		if _, err := content.SetDictFile(cfg.Content.ZstdDictionary, slog.New(slog.NewTextHandler(stderr, nil))); err != nil {
 			return fmt.Errorf("domain: %w", err)
 		}
-		store, err := content.OpenPackStore(pool, content.PackOptions{Dir: cfg.Content.Dir})
+		store, err := content.OpenPackStore(pool, content.PackOptions{Dir: cfg.Content.Dir, ReadOnly: true})
 		if err != nil {
 			return fmt.Errorf("domain: %w", err)
 		}

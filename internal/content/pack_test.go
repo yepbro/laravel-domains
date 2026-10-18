@@ -922,6 +922,79 @@ func TestPackOpenValidation(t *testing.T) {
 	}
 }
 
+// TestPackReadOnly — читатель без записи (crawlerctl domain --content):
+// открытие не создаёт каталог и файл блокировки, отсутствующий каталог —
+// ошибка; Put/Delete/beginAppend отказывают, Get читает существующий
+// контент, Close работает без замка.
+func TestPackReadOnly(t *testing.T) {
+	pool := newPackFakePool()
+	ctx := context.Background()
+
+	// Каталога нет — ошибка, и он не создаётся (опечатка в content.dir
+	// не должна молча выглядеть пустым хранилищем).
+	missing := filepath.Join(t.TempDir(), "missing")
+	if _, err := OpenPackStore(pool, PackOptions{Dir: missing, ReadOnly: true}); err == nil {
+		t.Fatal("ReadOnly на отсутствующем каталоге: ожидалась ошибка")
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("ReadOnly не должен создавать каталог: %v", err)
+	}
+
+	// Пустой существующий каталог — открытие и закрытие читателя не
+	// оставляют следов (ни замка, ни паков).
+	clean := t.TempDir()
+	roClean, err := OpenPackStore(pool, PackOptions{Dir: clean, ReadOnly: true})
+	if err != nil {
+		t.Fatalf("OpenPackStore ReadOnly на пустом каталоге: %v", err)
+	}
+	if err := roClean.Close(); err != nil {
+		t.Errorf("Close читателем: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(clean, packLockFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("читатель не создаёт файл блокировки: %v", err)
+	}
+
+	// Наполнение обычным хранилищем (замок и пак на месте) — чтение
+	// читателем без записи.
+	dir := t.TempDir()
+	wr, err := OpenPackStore(pool, PackOptions{Dir: dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("OpenPackStore: %v", err)
+	}
+	data := []byte("<html>контент для читателя</html>")
+	res, err := wr.Put(ctx, data)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := wr.Close(); err != nil {
+		t.Fatalf("Close писателя: %v", err)
+	}
+
+	ro, err := OpenPackStore(pool, PackOptions{Dir: dir, ReadOnly: true})
+	if err != nil {
+		t.Fatalf("OpenPackStore ReadOnly: %v", err)
+	}
+	got, err := ro.Get(ctx, res.Hash)
+	if err != nil {
+		t.Fatalf("Get читателем: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Errorf("Get читателем = %q, want исходный контент", got)
+	}
+	if _, err := ro.Put(ctx, []byte("x")); !errors.Is(err, errReadOnly) {
+		t.Errorf("Put читателем: err = %v, want errReadOnly", err)
+	}
+	if err := ro.Delete(ctx, res.Hash); !errors.Is(err, errReadOnly) {
+		t.Errorf("Delete читателем: err = %v, want errReadOnly", err)
+	}
+	if _, err := ro.beginAppend(); !errors.Is(err, errReadOnly) {
+		t.Errorf("beginAppend читателем: err = %v, want errReadOnly", err)
+	}
+	if err := ro.Close(); err != nil { // Close без замка не падает
+		t.Errorf("Close читателем: %v", err)
+	}
+}
+
 // TestParsePackHeaderHdrLen — заголовок будущей версии (hdrLen больше
 // полей v1) читается: v1 берёт первые 23 байта и не отвергает расширение
 // (документированная совместимость вперёд); укороченный hdrLen — порча.

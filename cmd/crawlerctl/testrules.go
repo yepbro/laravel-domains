@@ -12,6 +12,7 @@ import (
 	"slices"
 	"sort"
 
+	"crawler/internal/config"
 	"crawler/internal/rules"
 )
 
@@ -24,15 +25,29 @@ const testRulesHelp = `crawlerctl test-rules — прогон правил Larav
 Оценивает каждую страницу из samples правилами из rules и сверяет
 is_laravel (score >= min-score), диапазон версий и состав сработавших
 правил с ожиданиями meta.yaml. Несовпадения — ошибка выполнения (код 1).
+
+Порог is_laravel по умолчанию — analyzer.laravel_min_score из конфигурации
+(боевой порог записи в laravel_domains, ТЗ 5.8/13.1): офлайн-проверка
+калибруется тем же порогом, что и analyzer; без конфигурации — 0.6.
+Явный --min-score переопределяет оба источника.
 `
 
 func cmdTestRules(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("test-rules")
 	rulesDir := fs.String("rules", "/rules", "каталог правил")
 	samplesDir := fs.String("samples", "/testdata/laravel-samples", "каталог образцов")
-	minScore := fs.Float64("min-score", 0.6, "порог is_laravel")
+	minScore := fs.Float64("min-score", 0.6,
+		"порог is_laravel (по умолчанию analyzer.laravel_min_score из конфигурации, без неё 0.6)")
 	if handled, err := parseFlags(fs, testRulesHelp, args, stdout); handled {
 		return err
+	}
+	// Дефолт порога синхронизирован с боевой конфигурацией (CLI-06):
+	// явно заданный флаг важнее, недоступная конфигурация (локальный
+	// прогон без стека) оставляет 0.6 — команда остаётся офлайн-инструментом.
+	if !flagExplicit(fs, "min-score") {
+		if cfg, err := config.Load(); err == nil {
+			*minScore = cfg.Analyzer.LaravelMinScore
+		}
 	}
 
 	set, err := rules.LoadDir(*rulesDir)

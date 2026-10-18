@@ -333,8 +333,8 @@ func writeStatusTable(w io.Writer, zones []zoneStats, tot statusTotals, thr thro
 	widths := make([]int, len(head))
 	for _, r := range rows {
 		for i, c := range r {
-			if len(c) > widths[i] {
-				widths[i] = len(c)
+			if w := cellWidth(c); w > widths[i] {
+				widths[i] = w
 			}
 		}
 	}
@@ -475,7 +475,10 @@ func cmdStatus(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("status: %w", err)
 	}
-	ctx := context.Background()
+	// Ctrl-C/SIGTERM отменяют тяжёлые агрегаты (полные проходы больших
+	// таблиц) — единый хелпер команд (signalCtx).
+	ctx, stop := signalCtx()
+	defer stop()
 
 	// CLI pool_size = 2 — бюджет соединений ТЗ 6.3 у сервисов (стиль
 	// manage.go, T-074).

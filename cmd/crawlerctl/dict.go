@@ -153,7 +153,10 @@ func collectSampleFiles(paths []string) ([]string, error) {
 	for _, p := range paths {
 		st, err := os.Stat(p)
 		if err != nil {
-			return nil, err
+			// Путь образцов указывается в справке, а не в сырой ошибке os:
+			// «stat …: no such file» без контекста не говорит, что это
+			// именно --samples.
+			return nil, fmt.Errorf("образцы %s: %w", p, err)
 		}
 		if !st.IsDir() {
 			if isHTMLFile(p) {

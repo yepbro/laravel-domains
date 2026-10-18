@@ -451,6 +451,25 @@ func TestSubdomainsDisableRunNotFound(t *testing.T) {
 	}
 }
 
+// TestSubdomainsDisableRunBitOutOfRange — числовой аргумент вне диапазона
+// битов 0..62: усечение int16 не должно молча сводить его к чужому биту
+// (65537 → www, бит 1) — «не найден», справочник не тронут.
+func TestSubdomainsDisableRunBitOutOfRange(t *testing.T) {
+	pool := newSubdomainsPool()
+	for _, arg := range []string{"65537", "131073", "100", "-1", "65536"} {
+		err := subdomainsDisableRun(context.Background(), pool, arg, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "не найден") {
+			t.Errorf("disable %q: ошибка = %v, хочу «не найден»", arg, err)
+		}
+	}
+	if pool.subs[1] != (subdomainRow{1, "www", true}) {
+		t.Errorf("www не должен меняться: %+v", pool.subs[1])
+	}
+	if pool.subs[0] != (subdomainRow{0, "", true}) {
+		t.Errorf("апекс не должен меняться: %+v", pool.subs[0])
+	}
+}
+
 func TestSubdomainsDisableRunApexGuard(t *testing.T) {
 	pool := newSubdomainsPool()
 	for _, arg := range []string{"", "0", "  "} {
@@ -474,6 +493,12 @@ func TestSubdomainsDisableRunAlreadyDisabled(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "уже выключен") {
 		t.Errorf("вывод не сообщает «уже выключен»:\n%s", stdout.String())
+	}
+	// Идемпотентная ветка — до записи: UPDATE не выполнялся вовсе.
+	for _, c := range pool.queries {
+		if c.sql == subdomainDisableSQL {
+			t.Errorf("«уже выключен» не должен делать UPDATE: %v", c)
+		}
 	}
 }
 
