@@ -147,6 +147,13 @@ type CleanupOptions struct {
 	// (slog.DiscardHandler). CleanupOnce не логирует — итог возвращается
 	// CleanupResult.
 	Log *slog.Logger
+	// OnPass — хук итога успешного прохода: снапшот CleanupResult сразу
+	// после фиксации транзакции (ошибочный проход хуку не отдаётся — его
+	// уже записал Warn). Точка подключения экспорта метрик (T-099)
+	// без зависимости цикла от internal/metrics; стиль AlertsOptions.OnPass
+	// (лог + поле). Обязан быть быстрым и не паниковать — вызывается
+	// в цикле прохода.
+	OnPass func(CleanupResult)
 }
 
 // withDefaults заменяет неположительные значения дефолтами.
@@ -425,6 +432,11 @@ func CleanupDeleted(ctx context.Context, pool CleanupDB, opts CleanupOptions) er
 			if res.Domains > 0 {
 				log.Info("проход очистки удалённых доменов",
 					"domains", res.Domains, "results", res.Results, "contents", res.Contents)
+			}
+			// Итог прохода — потребителям (метрика T-099): после лога,
+			// до зачистки staging — строго итог CleanupOnce.
+			if o.OnPass != nil {
+				o.OnPass(res)
 			}
 		}
 

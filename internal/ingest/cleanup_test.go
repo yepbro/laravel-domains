@@ -667,7 +667,9 @@ func TestCleanupStaleBatchesErrors(t *testing.T) {
 func TestCleanupOptionsDefaults(t *testing.T) {
 	got := CleanupOptions{}.withDefaults()
 	want := CleanupOptions{BatchSize: DefaultCleanupBatch, Interval: DefaultCleanupInterval}
-	if got != want {
+	// OnPass (функция) не сравнима оператором == — структура целиком
+	// сверяется через reflect.DeepEqual (nil == nil).
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("withDefaults = %+v, want %+v", got, want)
 	}
 
@@ -677,7 +679,7 @@ func TestCleanupOptionsDefaults(t *testing.T) {
 	}
 
 	neg := CleanupOptions{BatchSize: -1, Interval: -time.Second}.withDefaults()
-	if neg != want {
+	if !reflect.DeepEqual(neg, want) {
 		t.Errorf("withDefaults(отрицательные) = %+v, want дефолты %+v", neg, want)
 	}
 }

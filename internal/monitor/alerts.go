@@ -19,7 +19,12 @@
 //     в паузу, ТЗ 8; формула — как в internal/content/disk.go, подход
 //     переиспользован собственной копией, пакет хранилища не тянется);
 //   - износ NVMe (SMART) — percentage_used из health-лога NVMe (ТЗ 10.3),
-//     чтение ioctl-ом admin-команды, без nvme-cli.
+//     чтение ioctl-ом admin-команды, без nvme-cli;
+//   - мусорные content_hash очистки (T-099) — всплеск счётчика
+//     crawler_ingest_bad_hashes_total в экспозиции /metrics сервиса
+//     ingest (BadHashesSource, реализация IngestBadHashes — badhashes.go):
+//     рост счётчика — ошибка писателя результатов (T-056), данные не
+//     теряются (refcount по мусорной ссылке не менялся, ING-P2-4).
 //
 // Сигнал фронтовой (на переходах, стиль DiskWatchLoop в internal/content):
 // Warn при срабатывании, Info при снятии, Debug когда алерт неприменим
@@ -83,6 +88,7 @@ const (
 	AlertProgressStall = "progress_stall"       // zones.updated_at устарел
 	AlertDiskFree      = "disk_free"            // место каталога контента
 	AlertNVMeWear      = "nvme_wear"            // SMART percentage_used
+	AlertBadHashes     = "ingest_bad_hashes"    // всплеск мусорных content_hash
 )
 
 // alertDescs — человекочитаемые описания алертов для записей лога.
@@ -92,6 +98,7 @@ var alertDescs = map[string]string{
 	AlertProgressStall: "остановка прогресса",
 	AlertDiskFree:      "нехватка места на диске",
 	AlertNVMeWear:      "износ NVMe (SMART)",
+	AlertBadHashes:     "мусорные content_hash при очистке удалённых доменов",
 }
 
 // Пороги оценки. Числа ТЗ не задаёт; переиспользуются существующие пороги
@@ -140,6 +147,22 @@ const (
 	// замены. Ресурс монотонен (не восстанавливается) — гистерезис не
 	// нужен; значения >100 % валидны (ресурс исчерпан) и тоже алертятся.
 	AlertNVMeWearPercent = 90
+
+	// AlertBadHashesThreshold — порог всплеска мусорных content_hash
+	// (T-099): новых строк за окно AlertBadHashesWindow. В норме инвариант
+	// писателя результатов (ТЗ 6.1: 16 октет) держит ноль всегда, но
+	// единичные реликты — строки, посаженные до фикса ING-P2-4 и
+	// добираемые очисткой по одному — не должны будить оператора:
+	// 10 за окно — уверенная ошибка писателя (T-056), не эхо прошлого.
+	AlertBadHashesThreshold = 10
+
+	// AlertBadHashesWindow — окно всплеска в проходах алертов: 15 × 60 с
+	// = 15 минут. Проходы очистки идут раз в минуту (DefaultCleanupInterval):
+	// окно охватывает ≈15 проходов — всплеск не проскакивает между
+	// оценками, а короткий (одно-два мусорных строки) не набирает порог;
+	// против дребезга гистерезис не нужен — сумма окна убывает только
+	// старением дельт, у порога она держится лишь при продолжении потока.
+	AlertBadHashesWindow = 15
 )
 
 // dnsShareSQL — числитель и знаменатель доли temp_error одним проходом по
@@ -393,6 +416,17 @@ type StreamLener interface {
 	Len(ctx context.Context, stream string) (int64, error)
 }
 
+// BadHashesSource — счётчик мусорных content_hash очистки ingest
+// (crawler_ingest_bad_hashes_total, T-099); реализация IngestBadHashes
+// читает его из экспозиции /metrics сервиса ingest, юнит-тесты подменяют
+// фейком. Отдельный интерфейс в стиле StreamLener/SpaceChecker: источник
+// заменяем, алерт не зависит от HTTP.
+type BadHashesSource interface {
+	// BadHashes возвращает текущее значение счётчика (монотонно растёт
+	// итогами проходов CleanupDeleted; рестарт ingest обнуляет).
+	BadHashes(ctx context.Context) (int64, error)
+}
+
 // alertStreams — проверяемые стримы: рабочие, ограниченные гейтом
 // backpressure (q:dead не ограничивается — см. шапку backpressure.go).
 var alertStreams = []string{
@@ -411,6 +445,9 @@ type AlertsDeps struct {
 	Space SpaceChecker
 	// Wear — износ NVMe; nil — OSWear (sysfs/ioctl).
 	Wear WearSource
+	// BadHashes — счётчик мусорных content_hash очистки ingest (T-099);
+	// nil — алерт «не измеряется».
+	BadHashes BadHashesSource
 }
 
 // AlertsOptions — параметры оценки; нулевые значения заменяются
@@ -507,14 +544,50 @@ type alertEval struct {
 	eval func(ctx context.Context, prev string) verdict
 }
 
+// badHashesWindow — память окна всплеска мусорных content_hash (T-099):
+// дельты счётчика между проходами алертов в кольце последних
+// AlertBadHashesWindow значений. Первое наблюдение только базирует prev —
+// старт мониторинга позже накопленного счётчика не ретроспективен (окно
+// считает новые события, а не всю историю); убывание счётчика (рестарт
+// ingest) даёт нулевую дельту — счётчик начинается заново, ложного
+// всплеска нет.
+type badHashesWindow struct {
+	prev   int64
+	seen   bool
+	deltas []int64
+	i      int
+}
+
+// push принимает текущее значение счётчика и возвращает сумму окна.
+func (w *badHashesWindow) push(cur int64) int64 {
+	var d int64
+	if !w.seen {
+		w.seen = true // база: накопленное до старта мониторинга не считается
+	} else if cur > w.prev {
+		d = cur - w.prev
+	}
+	w.prev = cur
+	if w.deltas == nil {
+		w.deltas = make([]int64, AlertBadHashesWindow)
+	}
+	w.deltas[w.i] = d
+	w.i = (w.i + 1) % len(w.deltas)
+	var sum int64
+	for _, d := range w.deltas {
+		sum += d
+	}
+	return sum
+}
+
 // Alerts — оценка алертов с памятью состояний между проходами
 // (гистерезис, фронтовые записи лога только на переходах).
 type Alerts struct {
-	deps  AlertsDeps
-	opts  AlertsOptions
-	log   *slog.Logger
-	now   func() time.Time
-	state map[string]string
+	deps    AlertsDeps
+	opts    AlertsOptions
+	log     *slog.Logger
+	now     func() time.Time
+	state   map[string]string
+	badHash badHashesWindow // окно всплеска мусорных content_hash (T-099)
 }
 
 // NewAlerts строит оценщик: нормализует опции (дефолты периодов), источники
@@ -547,6 +620,7 @@ func (a *Alerts) evaluators() []alertEval {
 		{AlertProgressStall, a.evalStall},
 		{AlertDiskFree, a.evalDisk},
 		{AlertNVMeWear, a.evalWear},
+		{AlertBadHashes, a.evalBadHashes},
 	}
 }
 
@@ -834,6 +908,37 @@ func (a *Alerts) evalWear(ctx context.Context, _ string) verdict {
 // ТБ — как в спецификации TBW).
 func nvmeTBW(w NVMeWear) float64 {
 	return float64(w.DataUnitsWritten) * 512000 / 1e12
+}
+
+// evalBadHashes — всплеск мусорных content_hash очистки ingest (T-099):
+// сумма дельт счётчика за окно AlertBadHashesWindow проходов ≥
+// AlertBadHashesThreshold — срабатывание. Снятие — старением: окно
+// держит сработавшим только при продолжении потока новых мусорных
+// строк; гистерезис не нужен (см. AlertBadHashesWindow). Ошибка
+// источника (ingest недоступен, метрики нет) — «не измеряется» с Warn:
+// смерть самого ingest видна по crawler_service_up, а не этим алертом.
+func (a *Alerts) evalBadHashes(ctx context.Context, _ string) verdict {
+	if a.deps.BadHashes == nil {
+		return verdict{
+			status: AlertStatusNotMeasured,
+			detail: "источник не задан (monitor.ingest_metrics_url)",
+		}
+	}
+	cur, err := a.deps.BadHashes.BadHashes(ctx)
+	if err != nil {
+		return verdict{err: fmt.Errorf("monitor: мусорные content_hash: %w", err)}
+	}
+	sum := a.badHash.push(cur)
+	detail := fmt.Sprintf("счётчик %d, новых за окно %s — %d (порог %d)",
+		cur, (time.Duration(AlertBadHashesWindow) * a.opts.Interval).Round(time.Second),
+		sum, AlertBadHashesThreshold)
+	if sum >= AlertBadHashesThreshold {
+		return verdict{
+			status: AlertStatusFiring,
+			detail: detail + " — ошибка писателя результатов (T-056), refcount не менялся",
+		}
+	}
+	return verdict{status: AlertStatusOK, detail: detail}
 }
 
 // AlertsLoop — периодический цикл оценки алертов (стиль ZoneStatsLoop):

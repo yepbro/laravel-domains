@@ -20,6 +20,7 @@ import (
 
 	"crawler/internal/config"
 	"crawler/internal/ingest"
+	"crawler/internal/metrics"
 	"crawler/internal/service"
 	"crawler/internal/watch"
 )
@@ -32,16 +33,19 @@ func main() {
 	}
 	logger := service.NewLogger("ingest", cfg)
 
-	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
-	// готов до старта OnRun: postgres.dsn обязателен (config.Validate).
+	// Реестр метрик — здесь же (T-077): счётчик мусорных content_hash
+	// очистки (T-099) получает его до старта OnRun, каркас отдаёт тот же
+	// реестр через /metrics.
+	reg := metrics.New("ingest")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "ingest",
 		Config:      cfg,
 		Logger:      logger,
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9101"),
+		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool) },
+		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}
@@ -51,10 +55,11 @@ func main() {
 // обход-страховка, стабильность размера/mtime — internal/watch, T-013),
 // конвейер обработки каждого готового файла (internal/ingest, T-014…T-021)
 // и фоновая очистка удалённых доменов в отдельной горутине (T-020;
-// интервал и пачка — дефолты пакета). Завершение — отмена ctx (graceful
+// интервал и пачка — дефолты пакета; итоги проходов — в счётчик мусорных
+// content_hash, T-099). Завершение — отмена ctx (graceful
 // shutdown, ТЗ 3.4): канал готовых файлов закрывается, конвейер
 // дорабатывает текущий файл, очистка выходит по отмене.
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) error {
+func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("ingest: пул БД не получен (postgres.dsn обязателен)")
 	}
@@ -89,7 +94,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	cleanupDone := make(chan error, 1)
 	go func() {
-		cleanupDone <- ingest.CleanupDeleted(ctx, pool, ingest.CleanupOptions{Log: logger})
+		cleanupDone <- ingest.CleanupDeleted(ctx, pool, ingest.CleanupOptions{
+			Log: logger,
+			// Итог прохода — в счётчик мусорных content_hash (T-099):
+			// нулевой BadHashes значение не меняет, nil-реестр — no-op.
+			OnPass: ingest.NewCleanupMetrics(reg).Observe,
+		})
 	}()
 
 	for f := range files {

@@ -4,7 +4,8 @@
 // monitor.zone_stats_interval и оценка алертов минимального набора ТЗ 5.9
 // (internal/monitor.AlertsLoop, T-080): доля ошибок DNS, переполнение
 // очередей, остановка прогресса, свободное место каталога контента,
-// износ NVMe (SMART). Каркас — internal/service: миграции, пул БД
+// износ NVMe (SMART), всплеск мусорных content_hash очистки ingest
+// (T-099, зонд /metrics). Каркас — internal/service: миграции, пул БД
 // (OnDBPool), пробы /livez + /healthz, /metrics, graceful shutdown (ТЗ 3.4).
 package main
 
@@ -96,10 +97,16 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// мониторинга (коридор ТЗ 5.9 30–60 с), и порог остановки прогресса
 	// считается в тех же периодах; отдельного поля конфигурации под
 	// период алертов не заводим.
-	err := monitor.AlertsLoop(ctx, monitor.AlertsDeps{
-		Pool:  pool,
-		Redis: gate,
-	}, monitor.AlertsOptions{
+	//
+	// Источник мусорных content_hash (T-099) — зонд экспозиции /metrics
+	// сервиса ingest: счётчик растёт в процессе ingest, монитор читает
+	// его тем же адресом, что скрейпит Prometheus. Пустой адрес — алерт
+	// «не измеряется» (тихо), а не Warn зондом на каждый проход.
+	deps := monitor.AlertsDeps{Pool: pool, Redis: gate}
+	if cfg.Monitor.IngestMetricsURL != "" {
+		deps.BadHashes = monitor.IngestBadHashes{URL: cfg.Monitor.IngestMetricsURL}
+	}
+	err := monitor.AlertsLoop(ctx, deps, monitor.AlertsOptions{
 		Interval:          cfg.Monitor.ZoneStatsInterval.D(),
 		ZoneStatsInterval: cfg.Monitor.ZoneStatsInterval.D(),
 		QueueWatermark:    int64(cfg.Scheduler.QueueHighWatermark),

@@ -112,6 +112,9 @@ monitor:
   # «:9100» (все интерфейсы) — только внутри docker-сети (config.dev.yaml).
   listen: "127.0.0.1:9100"
   zone_stats_interval: "60s"         # пересчёт счётчиков зон и цикл алертов, 30–60 с
+  # Зонд алерта мусорных content_hash (T-099): /metrics сервиса ingest
+  # (loopback по METRICS_ADDR юнита); пустая строка — алерт «не измеряется».
+  ingest_metrics_url: "http://127.0.0.1:9101/metrics"
 
 log:
   level: "info"                      # уровень логирования сервисов: debug|info|warn|error

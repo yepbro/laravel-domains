@@ -226,6 +226,11 @@ type Analyzer struct {
 type Monitor struct {
 	Listen            string   `yaml:"listen"`
 	ZoneStatsInterval Duration `yaml:"zone_stats_interval"`
+	// IngestMetricsURL — адрес /metrics сервиса ingest (T-099): алерт
+	// мусорных content_hash очистки читает счётчик из экспозиции ingest
+	// зондом раз в период алертов. Тот же адрес, что скрейпит Prometheus;
+	// пустая строка — алерт «не измеряется».
+	IngestMetricsURL string `yaml:"ingest_metrics_url"`
 }
 
 // Log — уровень логирования сервисов (каркас internal/service). Расширение
@@ -338,6 +343,10 @@ func Default() *Config {
 		Monitor: Monitor{
 			Listen:            ":9100",
 			ZoneStatsInterval: Duration(60 * time.Second),
+			// Loopback ingest по METRICS_ADDR (systemd-юниты привязывают
+			// 127.0.0.1:9101); docker-сети переопределяют именем сервиса
+			// (config.dev.yaml: http://ingest:9101/metrics).
+			IngestMetricsURL: "http://127.0.0.1:9101/metrics",
 		},
 		Log: Log{
 			Level: "info",
@@ -624,6 +633,13 @@ func (c *Config) Validate() error {
 	}
 	if c.Monitor.ZoneStatsInterval <= 0 {
 		problems = append(problems, nonPositiveDur("monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval))
+	}
+	if c.Monitor.IngestMetricsURL != "" {
+		if u, err := url.Parse(c.Monitor.IngestMetricsURL); err != nil ||
+			(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			problems = append(problems, fmt.Sprintf(
+				"monitor.ingest_metrics_url: ожидается абсолютный http(s)-адрес, задано %q", c.Monitor.IngestMetricsURL))
+		}
 	}
 
 	// log (расширение каркаса, T-012)

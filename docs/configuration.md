@@ -465,6 +465,7 @@ rules:
 |---|---|---|---|
 | `listen` | `CRAWLER_MONITOR_LISTEN` | [host]:port | `:9100` |
 | `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `60s` (рекомендация: 30–60 с) |
+| `ingest_metrics_url` | `CRAWLER_MONITOR_INGEST_METRICS_URL` | http(s)-URL | `http://127.0.0.1:9101/metrics` |
 
 `listen` — адрес HTTP-эндпоинта самого сервиса monitor (`/livez` +
 `/healthz` + `/metrics`, его собственные метрики): у каждого сервиса
@@ -475,11 +476,18 @@ Prometheus скрейпит их по отдельности, агрегации
 [`services.md`](services.md)) и одновременно период цикла алертов
 минимального набора ТЗ 5.9 (T-080: доля ошибок DNS, переполнение очередей,
 остановка прогресса — порог считается в периодах этого поля, место на
-диске, износ NVMe). Новых полей под алерты нет: порог очередей —
+диске, износ NVMe, всплеск мусорных `content_hash` — окно тоже в периодах
+этого поля). Новых полей под пороги алертов нет: порог очередей —
 `scheduler.queue_high_watermark`, порог места — `content.disk_free_percent`
 (тот же, что пауза записи контента, ТЗ 8), остальные пороги — константы
 `internal/monitor` с обоснованием (набор и числа —
 [`services.md`](services.md)).
+`ingest_metrics_url` — адрес `/metrics` сервиса ingest для зонда алерта
+мусорных `content_hash` (T-099): тот же адрес, что скрейпит Prometheus;
+в docker-сети — по имени сервиса (`http://ingest:9101/metrics`,
+config.dev.yaml), на боевом хосте — loopback ingest по `METRICS_ADDR`
+юнита. Пустая строка — алерт «не измеряется» (зонд не поднимается);
+значение обязано быть абсолютным http(s)-адресом.
 
 ### `log` (каркас сервисов)
 
@@ -498,6 +506,7 @@ Prometheus скрейпит их по отдельности, агрегации
 - `postgres.dsn` непуст; `pool_size` 1..100;
 - `redis.addr`, `dns.resolvers`, `dns.fallback_resolvers`, `monitor.listen` —
   корректные `host:port` (порт 1..65535); резолверы — хотя бы один;
+  `monitor.ingest_metrics_url` (если задан) — абсолютный http(s)-адрес;
   `redis.maxlen` — 0 или 1000..100000000, `redis.max_attempts` 1..100,
   `redis.claim_min_idle` положительна;
 - все таймауты/интервалы положительны; `ingest.batch_size` 1..1000000,

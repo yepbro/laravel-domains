@@ -179,6 +179,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_domain_status_total` | counter | `type` | dns-worker (`not_delegated`/`delegated_no_address`/`temp_error`), http-worker (`alive`/`no_http`/`temp_error`) | финальный статус домена терминальной ветки эпизода (ТЗ 6.2) |
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
+| `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: lag + pending; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026) |
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) раз в 30 с (`scheduler.BacklogLoop`) |
 
@@ -227,7 +228,10 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 → архив `processed/`/`failed/`), плюс фоновые очистки — удалённых доменов
 (T-020) и осиротевших партий staging по возрасту `batch_id` (T-098),
 одним циклом CleanupDeleted; контракт файлов и отчёты — в
-[`incoming-files.md`](incoming-files.md). `scheduler` (этап 2,
+[`incoming-files.md`](incoming-files.md). Итоги проходов очистки
+экспортируются метрикой `crawler_ingest_bad_hashes_total` (T-099):
+счётчик мусорных `content_hash` растёт только при ошибке писателя
+результатов и читается алертом мониторинга (раздел об алертах ниже). `scheduler` (этап 2,
 T-027…T-031): его `OnRun` держит главный цикл постановки пачек — выборка
 pending с чередованием зон (`DispatchBatch`, T-027) → перевод в `queued`
 с lease (`queued_at`) одним пакетным UPDATE с охраной pending (тем же
@@ -495,12 +499,23 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
   честно «не измеряется» (Debug, без ложного срабатывания и без Warn):
   на боевом systemd-хосте слой включается доступом юнита к устройствам
   (группа `nvme-smart`, T-089) рядом с хостовым smartd —
-  [`disks.md`](disks.md) «Мониторинг SMART и TBW».
+  [`disks.md`](disks.md) «Мониторинг SMART и TBW»;
+- **мусорные content_hash очистки** (T-099) — всплеск счётчика
+  `crawler_ingest_bad_hashes_total`: зонд читает экспозицию `/metrics`
+  сервиса ingest (`monitor.ingest_metrics_url`, тот же адрес, что
+  скрейпит Prometheus) раз в период алертов, окно — 15 проходов
+  (≈15 мин), порог — 10 новых мусорных строк. В норме инвариант писателя
+  результатов держит 16 октет (ТЗ 6.1) и счётчик не растёт вовсе: рост —
+  программная ошибка писателя (T-056), данные не теряются (refcount по
+  мусорной ссылке не менялся, ING-P2-4); снятие — старением окна без
+  продолжения потока. Ошибка зонда (ingest остановлен, метрики нет) —
+  «не измеряется» с Warn: смерть самого ingest видна по
+  `crawler_service_up`, не этим алертом.
 
 Сигнал фронтовой (на переходах, стиль `DiskWatchLoop` в internal/content):
 Warn при срабатывании, Info при снятии; «не измеряется» — Debug. Ошибки
-источников (БД, Redis, statfs) — Warn каждого прохода, цикл живёт.
-Состояние прохода — снапшот `AlertsResult` (ок/сработал/не измеряется +
+источников (БД, Redis, statfs, зонд ingest) — Warn каждого прохода, цикл
+живёт. Состояние прохода — снапшот `AlertsResult` (ок/сработал/не измеряется +
 детали) в хук `AlertsOptions.OnPass`: лог + поле, собственный
 gauge-реестр в monitor не заводится — метрики алертов в Prometheus заведёт
 слой T-077 поверх `internal/metrics`, чтобы не дублировать реестры и метки.

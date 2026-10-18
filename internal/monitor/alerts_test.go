@@ -668,7 +668,7 @@ func TestAlertsTransitionsLogging(t *testing.T) {
 	}
 }
 
-// TestAlertsOnPassSnapshot — хук получает снапшот всех пяти алертов
+// TestAlertsOnPassSnapshot — хук получает снапшот всех шести алертов
 // в фиксированном порядке; Firing() отбирает сработавшие.
 func TestAlertsOnPassSnapshot(t *testing.T) {
 	var mu sync.Mutex
@@ -688,7 +688,7 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 	if len(passes) != 1 {
 		t.Fatalf("OnPass вызовов = %d, want 1", len(passes))
 	}
-	wantNames := []string{AlertDNSErrors, AlertQueueOverflow, AlertProgressStall, AlertDiskFree, AlertNVMeWear}
+	wantNames := []string{AlertDNSErrors, AlertQueueOverflow, AlertProgressStall, AlertDiskFree, AlertNVMeWear, AlertBadHashes}
 	if len(res.Alerts) != len(wantNames) {
 		t.Fatalf("алертов в снапшоте = %d, want %d", len(res.Alerts), len(wantNames))
 	}

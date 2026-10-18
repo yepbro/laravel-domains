@@ -93,6 +93,7 @@ func TestDefault(t *testing.T) {
 		{"analyzer.laravel_min_score", c.Analyzer.LaravelMinScore, 0.6},
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
 		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 60 * time.Second},
+		{"monitor.ingest_metrics_url", c.Monitor.IngestMetricsURL, "http://127.0.0.1:9101/metrics"},
 		{"log.level", c.Log.Level, "info"},
 	}
 	for _, ch := range checks {
@@ -396,6 +397,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_SUBDOMAINS":                       "www, mail",
 		"CRAWLER_MONITOR_LISTEN":                   ":9199",
 		"CRAWLER_MONITOR_ZONE_STATS_INTERVAL":      "45s",
+		"CRAWLER_MONITOR_INGEST_METRICS_URL":       "http://env-ingest:9101/metrics",
 		"CRAWLER_LOG_LEVEL":                        "debug",
 	})
 	type check struct {
@@ -454,6 +456,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.9},
 		{"monitor.listen", cfg.Monitor.Listen, ":9199"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 45 * time.Second},
+		{"monitor.ingest_metrics_url", cfg.Monitor.IngestMetricsURL, "http://env-ingest:9101/metrics"},
 		{"log.level", cfg.Log.Level, "debug"},
 	}
 	for _, ch := range checks {
@@ -706,6 +709,8 @@ func TestValidate(t *testing.T) {
 		{"subdomain повтор", func(c *Config) { c.Subdomains = []string{"", "www", "www"} }, "subdomains"},
 		{"listen кривой", func(c *Config) { c.Monitor.Listen = "abc" }, "monitor.listen"},
 		{"zone_stats_interval 0", func(c *Config) { c.Monitor.ZoneStatsInterval = 0 }, "monitor.zone_stats_interval"},
+		{"ingest_metrics_url не адрес", func(c *Config) { c.Monitor.IngestMetricsURL = "ingest:9101" }, "monitor.ingest_metrics_url"},
+		{"ingest_metrics_url не http(s)", func(c *Config) { c.Monitor.IngestMetricsURL = "ftp://ingest:9101/metrics" }, "monitor.ingest_metrics_url"},
 		{"log.level кривой", func(c *Config) { c.Log.Level = "verbose" }, "log.level"},
 	}
 	for _, tt := range tests {
