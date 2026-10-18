@@ -48,13 +48,14 @@ var targets = map[string]bool{
 }
 
 // regexOnlyTargets — цели, где соответствие ищется только регулярным
-// выражением по значению/телу (движок match для них не применяет):
-// точное совпадение имён осмысленно только для cookie_name/header_name.
+// выражением (ТЗ 5.8: «регулярное выражение по HTML»; движок match по
+// ним не применяет). Для остальных целей match и regex равноправны:
+// движок применяет оба режима (engine.go matchRule), включая точное
+// совпадение значений cookie/header — docs/analyzer.md «Цели и режимы
+// матчинга».
 var regexOnlyTargets = map[string]bool{
-	TargetCookieValue: true,
-	TargetHeaderValue: true,
-	TargetHTML:        true,
-	TargetMeta:        true,
+	TargetHTML: true,
+	TargetMeta: true,
 }
 
 // Rule — одно правило поиска признака Laravel.

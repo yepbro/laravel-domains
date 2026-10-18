@@ -116,6 +116,35 @@ rules:
 	}
 }
 
+// TestEvaluateMatchValueRules — контракт «match по значению cookie/
+// заголовка поддерживается» (движок matchRule + docs/analyzer.md
+// «Цели и режимы матчинга»): валидатор загрузчика не бракует такие
+// правила, набор грузится и срабатывает.
+func TestEvaluateMatchValueRules(t *testing.T) {
+	dir := writeRules(t, `
+rules:
+  - id: cookie_exact
+    target: cookie_value
+    match: "exact-value"
+    weight: 0.3
+  - id: header_exact
+    target: header_value
+    match: "PHP/8.2.8"
+    weight: 0.4
+`)
+	set, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("правила с match по значениям обязаны загружаться: %v", err)
+	}
+	res := set.Evaluate(Page{
+		Cookies: []Cookie{{Name: "c", Value: "exact-value"}},
+		Headers: map[string][]string{"X-Powered-By": {"PHP/8.2.8"}},
+	})
+	if len(res.Signals) != 2 {
+		t.Fatalf("сработало %d правил, want 2: %+v", len(res.Signals), res.Signals)
+	}
+}
+
 func TestLoadDirValidation(t *testing.T) {
 	valid := `
 rules:
@@ -127,6 +156,14 @@ rules:
     target: header_name
     regex: "^X-"
     weight: 0.2
+  - id: ok_match_value
+    target: cookie_value
+    match: "eyJpdiI6"
+    weight: 0.3
+  - id: ok_match_header_value
+    target: header_value
+    match: "PHP/8.2.8"
+    weight: 0.3
   - id: ok_ver_eq
     target: html
     regex: "MARKER"
@@ -195,20 +232,6 @@ rules:
 rules:
   - id: neither
     target: cookie_name
-    weight: 0.5
-`},
-		{"cookie_value без regex", `
-rules:
-  - id: cv_match
-    target: cookie_value
-    match: "value"
-    weight: 0.5
-`},
-		{"header_value без regex", `
-rules:
-  - id: hv_match
-    target: header_value
-    match: "value"
     weight: 0.5
 `},
 		{"html без regex", `
