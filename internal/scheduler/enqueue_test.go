@@ -38,7 +38,8 @@ import (
 type enqueueCallKind string
 
 const (
-	enqueueKindDispatch enqueueCallKind = "dispatch" // SELECT пачки (T-027)
+	enqueueKindZones    enqueueCallKind = "zones"    // SELECT активных зон (T-027)
+	enqueueKindDispatch enqueueCallKind = "dispatch" // SELECT очередей зон (T-027)
 	enqueueKindUpdate   enqueueCallKind = "update"   // UPDATE … RETURNING (T-028)
 )
 
@@ -108,16 +109,18 @@ func (r *enqueueFakeRows) RawValues() [][]byte    { return nil }
 func (r *enqueueFakeRows) Conn() *pgx.Conn      { return nil }
 func (r *enqueueFakeRows) TypeMap() *pgtype.Map { return nil }
 
-// enqueueFakePool — db.DB без БД: Query различает выборку диспетчера
-// (dispatchSelectSQL) и перевод (UPDATE) по тексту, выдаёт заготовленные
-// результаты по шагам. Очередь выборки исчерпана — пустой набор (pending
-// пуст); очередь перевода исчерпана — переводятся все ключи пачки (нет
-// гонки). Всё под замком: цикл EnqueueLoop работает в горутине.
+// enqueueFakePool — db.DB без БД: Query различает запросы выборки
+// (справочник зон и очереди зон, dispatch.go) и перевод (UPDATE) по
+// тексту, выдаёт заготовленные результаты по шагам. Очередь выборки
+// исчерпана — пустой набор (pending пуст); очередь перевода исчерпана —
+// переводятся все ключи пачки (нет гонки). Всё под замком: цикл
+// EnqueueLoop работает в горутине.
 type enqueueFakePool struct {
 	mu          sync.Mutex
+	zones       [][]any // ответ справочника активных зон (nil — зон нет)
 	dispatches  []*enqueueFakeRows
 	updates     []*enqueueFakeRows
-	dispatchErr error // липовая ошибка выборки
+	dispatchErr error // липовая ошибка выборки (зоны/очереди)
 	updateErr   error // липовая ошибка перевода
 	calls       []enqueueCall
 	notify      chan struct{} // если задан — неблокирующий сигнал на каждый Query
@@ -139,8 +142,11 @@ func (p *enqueueFakePool) Query(ctx context.Context, sql string, args ...any) (p
 	defer p.mu.Unlock()
 
 	kind := enqueueKindDispatch
-	if strings.HasPrefix(sql, "UPDATE") {
+	switch {
+	case strings.HasPrefix(sql, "UPDATE"):
 		kind = enqueueKindUpdate
+	case strings.HasPrefix(sql, "SELECT id, name FROM zones"):
+		kind = enqueueKindZones
 	}
 	p.calls = append(p.calls, enqueueCall{kind: kind, sql: sql, args: args})
 	if p.notify != nil {
@@ -148,6 +154,15 @@ func (p *enqueueFakePool) Query(ctx context.Context, sql string, args ...any) (p
 		case p.notify <- struct{}{}:
 		default:
 		}
+	}
+
+	if kind == enqueueKindZones {
+		if p.dispatchErr != nil {
+			return nil, p.dispatchErr
+		}
+		// Справочник мал и стабилен — один и тот же ответ на каждый
+		// вызов (строки не расходуются, в отличие от очередей).
+		return enqueueFakeRowsOf(p.zones...), nil
 	}
 
 	if kind == enqueueKindDispatch {
@@ -604,9 +619,13 @@ func enqueueLoopRun(ctx context.Context, pool *enqueueFakePool, q *enqueueFakeQu
 // ждёт — тест детерминирован.
 func TestEnqueueLoop(t *testing.T) {
 	pool := &enqueueFakePool{
+		zones: [][]any{
+			{int16(1), "example.com"},
+			{int16(2), "example.net"},
+		},
 		dispatches: []*enqueueFakeRows{enqueueFakeRowsOf(
-			[]any{int64(101), int16(1), "a.example.com"},
-			[]any{int64(201), int16(2), "b.example.net"},
+			[]any{int16(1), int64(101), "a"},
+			[]any{int16(2), int64(201), "b"},
 		)},
 		notify: make(chan struct{}, 8),
 	}
@@ -635,8 +654,9 @@ func TestEnqueueLoop(t *testing.T) {
 	}
 
 	calls := pool.enqueuePoolCalls()
-	if len(calls) != 2 || calls[0].kind != enqueueKindDispatch || calls[1].kind != enqueueKindUpdate {
-		t.Fatalf("обращения = %v, want выборка, затем перевод", calls)
+	if len(calls) != 3 || calls[0].kind != enqueueKindZones ||
+		calls[1].kind != enqueueKindDispatch || calls[2].kind != enqueueKindUpdate {
+		t.Fatalf("обращения = %v, want зоны, выборка, затем перевод", calls)
 	}
 	pubs := q.enqueueQueuePublishes()
 	if len(pubs) != 1 {
@@ -676,8 +696,8 @@ func TestEnqueueLoop_EmptyBatchWaits(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("цикл не остановился по отмене ctx")
 	}
-	if calls := pool.enqueuePoolCalls(); len(calls) != 1 || calls[0].kind != enqueueKindDispatch {
-		t.Errorf("обращения = %v, want одна выборка без перевода", calls)
+	if calls := pool.enqueuePoolCalls(); len(calls) != 1 || calls[0].kind != enqueueKindZones {
+		t.Errorf("обращения = %v, want один запрос зон без выборки очередей и перевода", calls)
 	}
 	if pubs := q.enqueueQueuePublishes(); len(pubs) != 0 {
 		t.Errorf("публикаций = %d, want 0", len(pubs))
@@ -716,14 +736,19 @@ func TestEnqueueLoop_DispatchError(t *testing.T) {
 // строки остаются в queued (вернёт lease, T-029), цикл после паузы
 // продолжает работу и публикует следующие пачки.
 func TestEnqueueLoop_PublishErrorContinues(t *testing.T) {
-	// Фейки хранят курсор чтения — каждой выборке свой экземпляр строк.
+	// Фейки хранят курсор чтения — каждой выборке свой экземпляр строк
+	// (колонки очередей зон: zone_id, id, label — имя собирает выборка).
 	batch := func() *enqueueFakeRows {
 		return enqueueFakeRowsOf(
-			[]any{int64(101), int16(1), "a.example.com"},
-			[]any{int64(201), int16(2), "b.example.net"},
+			[]any{int16(1), int64(101), "a"},
+			[]any{int16(2), int64(201), "b"},
 		)
 	}
 	pool := &enqueueFakePool{
+		zones: [][]any{
+			{int16(1), "example.com"},
+			{int16(2), "example.net"},
+		},
 		dispatches: []*enqueueFakeRows{batch(), batch()},
 		notify:     make(chan struct{}, 64),
 	}

@@ -62,7 +62,7 @@ const enqueueMaxNameLen = 253
 // UPDATE … FROM unnest(...)»; каждый массив-ключ — один параметр, размер
 // пачки не упирается в лимит протокола). Ключи — (zone_id, id), PK domains
 // (ТЗ 6.1). Присваивания — общие выражения пачки: check_state литералом
-// кода модели (коды схемы, а не данные — стиль dispatchSelectSQL),
+// кода модели (коды схемы, а не данные — стиль dispatchZoneSQL),
 // queued_at = now() — время сервера БД (без расхождения часов клиентов)
 // и единый момент начала lease всей пачки. Охрана t.check_state = pending
 // перепроверяет состояние на момент блокировки строки; RETURNING — ключи
@@ -164,7 +164,7 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 		msg.Domains = append(msg.Domains, queue.DNSDomain{
 			ZoneID:   r.ZoneID,
 			DomainID: r.DomainID,
-			Name:     r.Name, // полное имя, punycode (dispatchSelectSQL, ТЗ 5.2)
+			Name:     r.Name, // полное имя, punycode (dispatch.go, ТЗ 5.2)
 		})
 	}
 	if len(msg.Domains) == 0 {

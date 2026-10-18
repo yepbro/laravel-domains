@@ -145,17 +145,19 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_domain_status_total` | counter | `type` | dns-worker (`not_delegated`/`delegated_no_address`/`temp_error`), http-worker (`alive`/`no_http`/`temp_error`) | финальный статус домена терминальной ветки эпизода (ТЗ 6.2) |
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
-| `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`) | коллектор XLEN потребляемого стрима раз в 15 с (`metrics.CollectQueueLoop`, источник — гейт backpressure T-026) |
+| `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: lag + pending; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026) |
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) раз в 30 с (`scheduler.BacklogLoop`) |
 
 Решения (зафиксированы):
 
-- **Длины очередей** живут у потребителей стрима: XLEN дёшев, клиент
-  Redis у каждого сервиса уже есть (гейт backpressure), а привязка к
-  потребителю гарантирует «очередь читается ⇔ глубина публикуется».
-  `q:dead` потребителя не имеет (ручной разбор, ТЗ 4.2; слой возврата
-  зависших T-025 в сервисы ещё не встроен) — его глубину показывает
-  `crawlerctl status` (T-079), метрика появится вместе с потребителем.
+- **Глубина очередей** живёт у потребителей стрима: backlog группы
+  потребления (XINFO GROUPS через гейт backpressure, клиент Redis у
+  каждого сервиса уже есть), а привязка к потребителю гарантирует
+  «очередь читается ⇔ глубина публикуется». XLEN для этого не годится:
+  он считает и подтверждённую историю до обрезки MAXLEN.
+  `q:dead` потребителя не имеет (ручной разбор, ТЗ 4.2) — его глубину
+  показывает `crawlerctl status` (T-079), метрика появится вместе
+  с потребителем.
 - **Глубина backlog** (pending/queued из БД) — в scheduler: он владелец
   состояний `domains` (постановка T-028, возврат lease T-029,
   перепроверки T-030/T-031), пул БД и периодический цикл уже его.

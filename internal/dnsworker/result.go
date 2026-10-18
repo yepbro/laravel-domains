@@ -83,7 +83,7 @@ import (
 // удалённый во время проверки домен не перезаписывается (§13.1, §8:
 // «результат не записывается (проверка статуса при записи)»), уже
 // записанный результат не затирается повторной доставкой (идемпотентность
-// ТЗ 3.4). Коды схемы — литералами, а не данными (стиль dispatchSelectSQL,
+// ТЗ 3.4). Коды схемы — литералами, а не данными (стиль dispatchZoneSQL,
 // T-027); last_checked_at = now() — время сервера БД (T-028), колонка
 // date получает дату приведением присваивания.
 //
@@ -510,6 +510,11 @@ type Options struct {
 	Consume int
 	// AskAAAA — запрашивать ли AAAA субдоменов (dns.ipv6, ТЗ 5.4).
 	AskAAAA bool
+	// Recover — слой возврата зависших доставок (Reliab, T-025): Run
+	// поднимает фоновый RecoverLoop (XAUTOCLAIM → та же обработка →
+	// XACK) с теми же Group/Consumer/Batch; nil — восстановления нет
+	// (изолированные сборки и тесты без Redis-специфики).
+	Recover *queue.Reliab
 	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него Run
 	// строит приборы этапа (NewMetrics — счётчик эпизодов, гистограмма
 	// длительностей, счётчик финальных статусов); nil — без метрик
@@ -570,6 +575,27 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 		case <-ctx.Done():
 		case <-t.C:
 		}
+	}
+
+	// Возврат зависших доставок (T-025): фоновый RecoverLoop от имени
+	// того же потребителя — клейм XAUTOCLAIM и та же обработка пачек.
+	// Живёт до отмены ctx; Run дожидается его выхода (начатая пачка
+	// дорабатывает или остаётся неподтверждённой, ТЗ 3.4).
+	if o.Recover != nil {
+		recDone := make(chan struct{})
+		go func() {
+			defer close(recDone)
+			_ = queue.RecoverLoop(ctx, o.Recover, func(c context.Context, del queue.Delivery) error {
+				return processBatch(c, pool, q, resolve, del, o, met, log)
+			}, queue.RecoverOptions{
+				Stream:   queue.StreamDNS,
+				Group:    o.Group,
+				Consumer: o.Consumer,
+				Batch:    o.Consume,
+				Log:      log,
+			})
+		}()
+		defer func() { <-recDone }()
 	}
 
 	for {

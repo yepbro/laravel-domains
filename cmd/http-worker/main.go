@@ -161,12 +161,23 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	defer func() { _ = rdb.Close() }()
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
+		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
 		Log:       logger,
 	})
-	rawQ := queue.NewRedisQueue(rdb, queue.RedisOptions{})
+	rawQ := queue.NewRedisQueue(rdb, queue.RedisOptions{
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+	})
 	q := queue.NewWatermarkPublisher(rawQ, gate)
 
-	// Очередь рендера: неблокирующая проверка ёмкости (XLEN через гейт
+	// Возврат зависших доставок q:http (T-025): RecoverLoop в воркере —
+	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
+	// — секция redis (max_attempts, claim_min_idle).
+	rel := queue.NewReliab(rdb, rawQ, queue.ReliabOptions{
+		MaxAttempts: cfg.Redis.MaxAttempts,
+		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
+	})
+
+	// Очередь рендера: неблокирующая проверка ёмкости (глубина через гейт
 	// T-026, общий порог scheduler.queue_high_watermark) + публикация
 	// без ожидания ёмкости.
 	renderQ, err := httpworker.NewRenderQueue(rawQ, gate, int64(cfg.Scheduler.QueueHighWatermark), logger)
@@ -175,7 +186,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}
 
 	// Длина потребляемого стрима q:http → crawler_queue_depth (T-077):
-	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
 	go func() {
 		bg <- metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamHTTP}, metrics.DefaultQueueCollectInterval, logger)
@@ -198,6 +209,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	opts2 := httpworker.Options{
 		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — не следовать (T-006/T-048)
+		Recover:      rel,                   // возврат зависших задач q:http (T-025)
 		Metrics:      reg,                   // приборы этапа: задачи, ошибки, статусы, время ответа, rendered (T-077)
 		Log:          logger,
 		// Цепочка OnResult (внутри обработки задачи, до XACK, ТЗ 4.2):

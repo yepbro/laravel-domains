@@ -93,7 +93,7 @@ const wantRecheckUpdate = "UPDATE domains AS d " +
 	"WHERE check_state = $2 AND status <> $3 AND last_checked_at < $4 " +
 	"ORDER BY zone_id, id LIMIT $5) AS b " +
 	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3"
+	"AND d.check_state = $2 AND d.status <> $3 AND d.last_checked_at < $4"
 
 // recheckFixedClock — часы с фиксированным «сейчас» (порог прохода
 // воспроизводим до наносекунды).

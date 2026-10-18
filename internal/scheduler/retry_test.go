@@ -674,13 +674,59 @@ func TestRetryTempErrorsLoop(t *testing.T) {
 	log := buf.String()
 	for _, want := range []string{
 		"фоновые повторные проверки temp_error", // старт
-		"проход повторных проверок temp_error",  // итог первого прохода
+		"дренаж повторных проверок temp_error",  // итог первого дренажа
 		"requeued=1",    // счётчики прохода
 		"бд недоступна", // ошибка второго прохода
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("лог не содержит %q:\n%s", want, log)
 		}
+	}
+}
+
+// TestRetryTempErrorsDrain — созревшие кандидаты разбираются одним
+// дренажом до исчерпания (полная пачка — следующий проход сразу, без
+// ожидания тика), а не по пачке за интервал (S-03).
+func TestRetryTempErrorsDrain(t *testing.T) {
+	pool := &retryFakePool{
+		// Две полные пачки по 1 домену, затем исчерпание.
+		selects: []*retryFakeRows{
+			retryRows([]any{int16(1), int64(10), int16(0)}),
+			retryRows([]any{int16(2), int64(20), int16(0)}),
+			retryRows(),
+		},
+		requeues: []*retryFakeRows{
+			retryRows([]any{int16(1), int64(10)}),
+			retryRows([]any{int16(2), int64(20)}),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- RetryTempErrors(ctx, pool, RetryOptions{
+			BatchSize: 1,
+			Interval:  time.Hour, // тик не наступит: всё должен разобрать дренаж
+			Log:       slog.New(slog.DiscardHandler),
+		})
+	}()
+
+	// Три SELECT (две полные пачки + пустая) обязаны пройти без тика.
+	deadline := time.Now().Add(2 * time.Second)
+	for pool.stats().selects < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("дренаж не дошёл до исчерпания: %+v", pool.stats())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RetryTempErrors: %v", err)
+	}
+	st := pool.stats()
+	if st.begins != 2 || st.commits != 2 {
+		t.Errorf("транзакций %d, коммитов %d, want 2 и 2 (обе пачки в одном дренаже)", st.begins, st.commits)
 	}
 }
 

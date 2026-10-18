@@ -48,7 +48,7 @@ func TestDefault(t *testing.T) {
 		{"redis.addr", c.Redis.Addr, "127.0.0.1:6379"},
 		{"redis.maxlen", c.Redis.MaxLen, 0},
 		{"redis.max_attempts", c.Redis.MaxAttempts, 3},
-		{"redis.claim_min_idle", c.Redis.ClaimMinIdle.D(), 5 * time.Minute},
+		{"redis.claim_min_idle", c.Redis.ClaimMinIdle.D(), 10 * time.Minute},
 		{"ingest.dir", c.Ingest.Dir, "/data/incoming"},
 		{"ingest.batch_size", c.Ingest.BatchSize, 50000},
 		{"ingest.stable_seconds", c.Ingest.StableSeconds, 10},

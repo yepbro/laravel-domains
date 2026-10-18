@@ -176,6 +176,11 @@ type Options struct {
 	// DefaultMinScore внутри Result.IsLaravel (T-070) — валидация конфига
 	// допускает только (0, 1], защита для прямых вызовов.
 	MinScore float64
+	// Recover — слой возврата зависших доставок (Reliab, T-025): Run
+	// поднимает фоновый RecoverLoop (XAUTOCLAIM → та же обработка →
+	// XACK) с теми же Group/Consumer/Batch; nil — восстановления нет
+	// (изолированные сборки и тесты без Redis-специфики).
+	Recover *queue.Reliab
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
@@ -528,6 +533,25 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 		case <-ctx.Done():
 		case <-t.C:
 		}
+	}
+
+	// Возврат зависших доставок (T-025): фоновый RecoverLoop от имени
+	// того же потребителя — клейм XAUTOCLAIM и та же обработка задач.
+	// Живёт до отмены ctx; Run дожидается его выхода (начатая задача
+	// дорабатывает или остаётся неподтверждённой, ТЗ 3.4).
+	if o.Recover != nil {
+		recDone := make(chan struct{})
+		go func() {
+			defer close(recDone)
+			_ = queue.RecoverLoop(ctx, o.Recover, w.processDelivery, queue.RecoverOptions{
+				Stream:   queue.StreamAnalyze,
+				Group:    o.Group,
+				Consumer: o.Consumer,
+				Batch:    o.Consume,
+				Log:      log,
+			})
+		}()
+		defer func() { <-recDone }()
 	}
 
 	sem := make(chan struct{}, o.Concurrency)

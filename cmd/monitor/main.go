@@ -59,7 +59,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return errors.New("monitor: пул БД не получен (postgres.dsn обязателен)")
 	}
 
-	// Длины стримов для алерта очередей — XLEN через BackpressureGate
+	// Глубина стримов для алерта очередей — через BackpressureGate
 	// (T-026): тот же узкий API над go-redis, что у планировщика и
 	// crawlerctl status (T-079); сам гейт ничего не ждёт — только Len.
 	rdb := queue.NewClient(cfg.Redis.Addr)
@@ -95,6 +95,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		Interval:          cfg.Monitor.ZoneStatsInterval.D(),
 		ZoneStatsInterval: cfg.Monitor.ZoneStatsInterval.D(),
 		QueueWatermark:    int64(cfg.Scheduler.QueueHighWatermark),
+		QueueMaxLen:       int64(cfg.Redis.MaxLen),
 		ContentDir:        cfg.Content.Dir,
 		DiskFreePercent:   cfg.Content.DiskFreePercent,
 		Log:               logger,

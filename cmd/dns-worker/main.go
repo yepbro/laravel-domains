@@ -61,7 +61,7 @@ func main() {
 // run — рабочая логика dns-worker: клиент DNS (пул сокетов fail-fast —
 // недоступный резолвер ошибка старта, T-034) под лимитами T-035, цикл
 // воркера dnsworker.Run с приборами этапа (T-077) и коллектор длины
-// q:dns (метрика длин очередей, ТЗ 5.9: XLEN стрима, который потребляет
+// q:dns (метрика глубины очередей, ТЗ 5.9: backlog стрима, который потребляет
 // этот воркер). Завершение — отмена ctx (graceful shutdown,
 // ТЗ 3.4): начатые эпизоды дорабатывают или возвращаются очереди
 // повторной доставкой (Processing, T-025).
@@ -86,12 +86,23 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// для рабочих стримов); потребление q:dns и XACK проходят прозрачно.
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
+		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
 		Log:       logger,
 	})
-	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
+	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+	}), gate)
+
+	// Возврат зависших доставок q:dns (T-025): RecoverLoop в воркере —
+	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
+	// — секция redis (max_attempts, claim_min_idle).
+	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
+		MaxAttempts: cfg.Redis.MaxAttempts,
+		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
+	})
 
 	// Длина потребляемого стрима q:dns → crawler_queue_depth (T-077):
-	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
 	go func() {
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamDNS}, metrics.DefaultQueueCollectInterval, logger)
@@ -100,6 +111,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	return dnsworker.Run(ctx, pool, q, resolve, dnsworker.Options{
 		Concurrency: cfg.DNS.Concurrency, // параллелизм эпизодов = dns.concurrency (ТЗ 5.10)
 		AskAAAA:     cfg.DNS.IPv6,        // AAAA отключаются конфигом без IPv6 (ТЗ 5.4)
+		Recover:     rel,                 // возврат зависших пачек q:dns (T-025)
 		Metrics:     reg,                 // приборы этапа: эпизоды, длительности, статусы (T-077)
 		Log:         logger,
 	})

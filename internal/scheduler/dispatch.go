@@ -4,37 +4,63 @@
 // (T-028), возврат доменов с истёкшим lease (T-029), плановые перепроверки
 // done- и temp_error-доменов (T-030/T-031).
 //
-// Выборка пачки — один SQL, чередующий зоны (ТЗ 5.3: «по кругу между
-// зонами, чтобы крупная зона не задерживала остальные»):
+// Выборка пачки (T-027) — два дешёвых запроса вместо одной оконной
+// функции по всему множеству pending (которое на целевом корпусе — сотни
+// миллионов строк, ТЗ 3.3):
 //
-//   - каждая зона — очередь: внутри зоны домены упорядочены по id, ровно
-//     по частичному индексу domains_pending_idx (zone_id, id) WHERE
-//     check_state = 0 (миграция 000001) — нумерация очередей идёт по
-//     готовому индексу, без дополнительных структур;
-//   - row_number() PARTITION BY zone_id нумерует позиции в очередях зон,
-//     а сортировка по (позиция, zone_id) отдаёт по одному домену из
-//     каждой зоны за круг: за одной зоной в пачке не идут её соседние
-//     строки, крупная зона не забивает пачку (что было бы при ORDER BY
-//     zone_id);
+//   - активные зоны: zones — малый справочник, читается целиком;
+//   - префикс очереди каждой зоны: LATERAL-подзапрос по зоне с LIMIT —
+//     ровно частичный индекс domains_pending_idx (zone_id, id) WHERE
+//     check_state = 0 (миграция 000001): чтение и сортировка идут по
+//     готовому индексу, число прочитанных строк пропорционально пачке и
+//     числу зон, а не объёму pending.
+//
+// Круговое чередование зон (ТЗ 5.3: «по кругу между зонами, чтобы крупная
+// зона не задерживала остальные») собирается в приложении по тем же
+// правилам, что раньше задавал SQL:
+//
+//   - каждая зона — очередь: внутри зоны домены упорядочены по id (порядок
+//     LATERAL-выборки = префикс очереди зоны, предыдущие пачки потребили
+//     её начало — переведённые в queued строки покидают выборку);
+//   - позиция rn — номер в очереди зоны (1-based); слияние берёт
+//     элемент зоны с минимальным ключом (rn − 0.5)/weight, при
+//     равенстве — меньший zone_id: за одной зоной в пачке не идут её
+//     соседние строки, крупная зона не забивает пачку;
 //   - вес зоны (ТЗ 5.3: «веса зон — опционально») сдвигает позицию её
 //     элемента к (rn − 0.5)/weight — зона с весом w занимает в общем
 //     порядке долю, пропорциональную w (шаговое планирование); вес 1 у
 //     всех вырождается в равный круговой порядок. Колонки weight в схеме
-//     нет (ТЗ 6.1 её не требует), поэтому веса приходят параметрами
-//     (unnest-массивы zone_id/weight, стиль пакетных операций
-//     internal/db) — источник весов задаёт вызывающий; миграция не
-//     вводится.
+//     нет (ТЗ 6.1 её не требует), веса приходят параметрами DispatchQuery.
+//
+// Долевая квота зоны на пачку — LIMIT LATERAL-подзапроса: ceil(L ×
+// max_вес / Σвесов активных зон) + 1 — верхняя оценка доли самой тяжёлой
+// зоны (у равных весов — ceil(L/число зон) + 1: столько строк одной зоны
+// максимально в первых L кругового порядка). Запас +1 и чтение «лишних»
+// строк безвредны: внешнее ограничение — LIMIT пачки в слиянии.
+//
+// Дозаполнение: если пула прочитанных строк не хватило на полную пачку
+// (часть зон исчерпана — их доли уходят соседям), выборка повторяется
+// только для «голодных» зон (вернули ровно LIMIT — возможно, обрезаны),
+// с keyset-курсором по последнему id зоны (d.id > after: смещения OFFSET
+// не нужны и невозможны — перевод в queued меняет множество между
+// запросами). Не более dispatchMaxRounds раундов: хвост доберёт следующий
+// вызов цикла (доставка at-least-once, ТЗ 3.4; выборка состояние не
+// меняет — до T-028).
 //
 // Охрана d.status <> deleted: применение delete (T-019) переводит статус,
 // не трогая check_state, — без охраны удалённые домены оставались бы
 // кандидатами вечно, хотя их результаты воркеры не записывают (ТЗ §8);
 // воскрешённый add-файлом домен имеет status = new и возвращается в
-// выборку сам (T-018). JOIN по zones задерживает неактивные зоны
-// (is_active = false, crawlerctl zones disable): их проверка приостановлена,
-// домены остаются pending и вернутся в цикл при включении зоны.
+// выборку сам (T-018). Коды check_state/status вшиты в текст литералами
+// через model.* — это коды схемы, а не данные (стиль internal/ingest);
+// литералы нужны и для пригодности частичного индекса domains_pending_idx
+// (параметр в предикате частичного индекса планировщик не доказывает).
+// Неактивные зоны (is_active = false, crawlerctl zones disable) в выборку
+// не попадают: их проверка приостановлена, домены остаются pending и
+// вернутся в цикл при включении зоны.
 //
-// Память (ТЗ 3.5): строки читаются потоком, размер пачки ограничен
-// Limit (scheduler.batch_size, ТЗ 5.3: 1000–10000).
+// Память (ТЗ 3.5): пачка ограничена Limit (scheduler.batch_size, ТЗ 5.3:
+// 1000–10000), прочитанные строки — зоны × квота.
 package scheduler
 
 import (
@@ -46,23 +72,29 @@ import (
 	"crawler/internal/model"
 )
 
-// dispatchSelectSQL — пачка pending-доменов в круговом порядке между
-// зонами. Семантические константы (коды check_state/status) вшиты в текст
-// через model.* — это коды схемы, а не данные (стиль internal/ingest);
-// тест-контракт связывает литералы с константами. LIMIT/OFFSET — пачка и
-// страница повторной выборки; name — полное имя в ASCII-форме (метка
-// без зоны + punycode-имя зоны, ТЗ 5.2) — готовые данные сообщения q:dns
-// (ТЗ 4.2: только идентификаторы и имя домена).
-var dispatchSelectSQL = fmt.Sprintf(
-	"SELECT t.domain_id, t.zone_id, t.label || '.' || t.zone_name AS name "+
-		"FROM (SELECT d.id AS domain_id, d.zone_id, d.label, z.name AS zone_name, "+
-		"row_number() OVER (PARTITION BY d.zone_id ORDER BY d.id) AS rn "+
-		"FROM domains AS d "+
-		"JOIN zones AS z ON z.id = d.zone_id AND z.is_active "+
-		"WHERE d.check_state = %d AND d.status <> %d) AS t "+
-		"LEFT JOIN unnest($1::int2[], $2::int4[]) AS w(zone_id, weight) ON w.zone_id = t.zone_id "+
-		"ORDER BY (t.rn - 0.5) / COALESCE(w.weight, 1), t.zone_id, t.rn "+
-		"LIMIT $3 OFFSET $4",
+// dispatchMaxRounds — предел раундов дозаполнения пачки: каждый следующий
+// раунд — отдельный запрос, но только по «голодным» зонам с keyset; чаще
+// двух раундов не бывает (равные доли исчерпываются первым раундом),
+// предел страхует патологические веса.
+const dispatchMaxRounds = 4
+
+// dispatchZonesSQL — активные зоны (малый справочник, без агрегатов):
+// зона вне выборки — её pending-домены ждут включения (crawlerctl).
+const dispatchZonesSQL = "SELECT id, name FROM zones WHERE is_active"
+
+// dispatchZoneSQL — префиксы очередей зон: unnest пачки зон с keyset-
+// курсорами (after = 0 — с головы), LATERAL читает очередь зоны по
+// частичному индексу domains_pending_idx (ORDER BY id, LIMIT — квота).
+// Порядок строк ответа не определён — слияние сортирует само.
+var dispatchZoneSQL = fmt.Sprintf(
+	"SELECT d.zone_id, d.id, d.label "+
+		"FROM unnest($1::int2[], $2::int8[]) AS z(zone_id, after_id) "+
+		"JOIN LATERAL ("+
+		"SELECT dd.id, dd.label FROM domains AS dd "+
+		"WHERE dd.zone_id = z.zone_id AND dd.id > z.after_id "+
+		"AND dd.check_state = %d AND dd.status <> %d "+
+		"ORDER BY dd.id LIMIT $3"+
+		") AS d ON true",
 	int16(model.CheckStatePending), int16(model.StatusDeleted))
 
 // DispatchRow — домен выбранной пачки: вход перевода в queued и
@@ -78,62 +110,227 @@ type DispatchRow struct {
 type DispatchQuery struct {
 	// Limit — размер пачки: scheduler.batch_size (ТЗ 5.3: 1000–10000).
 	Limit int
-	// Offset — смещение в порядке выдачи для повторных выборок.
-	//
-	// Выборка не меняет состояние доменов (до T-028 строки остаются
-	// pending), поэтому повторный вызов с тем же смещением отдал бы те же
-	// строки; следующая пачка — Offset += Limit. Порядок выдачи
-	// детерминирован ((rn − 0.5)/вес, zone_id, rn), и пока множество
-	// pending не меняется, страницы не пересекаются. В рабочем цикле
-	// после T-028 выбранные строки уходят в queued и покидают выборку —
-	// Offset сбрасывается в 0, смещение нужно только повторным выборкам
-	// без перевода состояния (например, публикация у порога очереди —
-	// T-026). Побочный эффект конкурентных изменений множества pending
-	// (возврат по lease T-029, плановые перепроверки T-030/T-031: домены
-	// возвращаются с прежними, часто меньшими id и сдвигают rn хвоста
-	// зоны) — на границе страниц возможен повтор отдельных строк
-	// (безопасно: доставка at-least-once, ТЗ 3.4) или пропуск единичных
-	// строк (подберутся следующим циклом планировщика). Keyset по domain_id
-	// невозможен для глобального кругового порядка (он строится по позициям
-	// сразу всех зон), а курсоры на зону — запрос на каждую зону; выбран
-	// OFFSET по детерминированной сортировке.
-	Offset int
 	// ZoneWeights — веса зон: zone_id → вес ≥ 1. nil или пустая карта —
 	// все веса 1 (равный круговой порядок). Колонки weight в схеме нет
 	// (ТЗ 6.1) — веса аргумент выборки, а не данные БД.
 	ZoneWeights map[int16]int
 }
 
+// dispatchZone — зона выборки: справочное имя и очередь прочитанных
+// строк (префикс pending-очереди зоны, id по возрастанию).
+type dispatchZone struct {
+	id   int16
+	name string
+	rows []dispatchPick
+}
+
+// dispatchPick — строка очереди зоны: ключ домена, метка (имя без зоны)
+// и зона (для полного имени и слияния).
+type dispatchPick struct {
+	zoneID   int16
+	domainID int64
+	label    string
+}
+
 // DispatchBatch выбирает пачку доменов check_state = pending в круговом
-// порядке между зонами (ТЗ 5.3). Пачка ограничена q.Limit, строки
-// читаются потоком (ТЗ 3.5); пустой результат — пустой срез без ошибки.
-// Состояние доменов не меняется: перевод в queued и публикацию выполняет
-// следующий шаг цикла (T-028), поэтому повторные выборки адресуют
-// следующие строки смещением q.Offset.
+// порядке между зонами (ТЗ 5.3): активные зоны → префиксы их очередей по
+// индексу → слияние с весами до Limit строк. Пустой результат — пустой
+// срез без ошибки. Состояние доменов не меняется: перевод в queued и
+// публикацию выполняет следующий шаг цикла (T-028), следующая выборка
+// продолжает очереди зон с места потребления (переведённые строки
+// покидают множество pending).
 func DispatchBatch(ctx context.Context, pool db.DB, q DispatchQuery) ([]DispatchRow, error) {
 	if err := q.dispatchValidate(); err != nil {
 		return nil, err
 	}
-	zoneIDs, weights := q.dispatchWeightArrays()
+	zones, err := dispatchActiveZones(ctx, pool)
+	if err != nil {
+		return nil, err
+	}
+	if len(zones) == 0 {
+		// Активных зон нет — pending ждать некому (и его нет: домены
+		// живут в зонах); запрос очередей не нужен.
+		return []DispatchRow{}, nil
+	}
 
-	rows, err := pool.Query(ctx, dispatchSelectSQL, zoneIDs, weights, q.Limit, q.Offset)
+	// Квота зоны на раунд — верхняя оценка её доли в пачке (см. шапку).
+	weights := q.ZoneWeights
+	sumW, maxW := 0, 1
+	for _, z := range zones {
+		w := weights[z.id]
+		if w < 1 {
+			w = 1
+		}
+		sumW += w
+		if w > maxW {
+			maxW = w
+		}
+	}
+	quota := (q.Limit*maxW + sumW - 1) / sumW // ceil(L × maxW / ΣW)
+	if quota < 1 {
+		quota = 1
+	}
+	quota++
+
+	// Раунды: сперва все зоны, далее — только «голодные» (вернули ровно
+	// квоту: возможно, обрезаны LIMIT), keyset от последнего id зоны.
+	var merged []dispatchPick
+	pending := zones // зоны раунда
+	for round := 0; round < dispatchMaxRounds; round++ {
+		ids := make([]any, len(pending))
+		afters := make([]any, len(pending))
+		for i, z := range pending {
+			after := int64(0) // с головы очереди зоны
+			if n := len(z.rows); n > 0 {
+				after = z.rows[n-1].domainID
+			}
+			ids[i] = z.id
+			afters[i] = after
+		}
+		picked, err := dispatchPickZones(ctx, pool, ids, afters, quota)
+		if err != nil {
+			return nil, err
+		}
+		starving := make([]*dispatchZone, 0, len(pending))
+		for _, z := range pending {
+			n := len(picked[z.id])
+			if n == 0 {
+				continue
+			}
+			z.rows = append(z.rows, picked[z.id]...)
+			if n == quota {
+				starving = append(starving, z) // возможно, есть ещё
+			}
+		}
+		merged = dispatchMerge(zones, weights, q.Limit)
+		if len(merged) == q.Limit {
+			break // пачка полная
+		}
+		if len(starving) == 0 {
+			break // все зоны отдали всё pending — добирать нечего
+		}
+		quota = q.Limit // голодная зона может заполнить остаток целиком
+		pending = starving
+	}
+
+	names := make(map[int16]string, len(zones))
+	for _, z := range zones {
+		names[z.id] = z.name
+	}
+	batch := make([]DispatchRow, 0, len(merged))
+	for _, m := range merged {
+		batch = append(batch, DispatchRow{
+			DomainID: m.domainID,
+			ZoneID:   m.zoneID,
+			Name:     m.label + "." + names[m.zoneID],
+		})
+	}
+	return batch, nil
+}
+
+// dispatchActiveZones — активные зоны справочника: id и имя (имя —
+// суффикс полного имени домена, ТЗ 5.2). Зоны — малая таблица, чтение
+// целиком дёшево; снимок согласован в пределах вызова (выключение зоны
+// между запросами выборки оставит её домены в очереди раунда — их
+// перевод в queued идёт вслед за выборкой, at-least-once, ТЗ 3.4).
+func dispatchActiveZones(ctx context.Context, pool db.DB) ([]*dispatchZone, error) {
+	rows, err := pool.Query(ctx, dispatchZonesSQL)
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: выборка пачки доменов: активные зоны: %w", err)
+	}
+	defer rows.Close()
+
+	zones := make([]*dispatchZone, 0, 16)
+	for rows.Next() {
+		var z dispatchZone
+		if err := rows.Scan(&z.id, &z.name); err != nil {
+			return nil, fmt.Errorf("scheduler: выборка пачки доменов: активные зоны: чтение: %w", err)
+		}
+		zones = append(zones, &z)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scheduler: выборка пачки доменов: активные зоны: %w", err)
+	}
+	return zones, nil
+}
+
+// dispatchPickZones — префиксы очередей зон (dispatchZoneSQL): по after
+// (последний прочитанный id зоны, 0 — с головы) до limit строк каждой.
+// Ответ группируется по зоне; внутри зоны сортируется по id — порядок
+// строк SQL не определён, очередь обязана быть возрастающей.
+func dispatchPickZones(ctx context.Context, pool db.DB, zoneIDs, afters []any, limit int) (map[int16][]dispatchPick, error) {
+	rows, err := pool.Query(ctx, dispatchZoneSQL, zoneIDs, afters, limit)
 	if err != nil {
 		return nil, fmt.Errorf("scheduler: выборка пачки доменов: %w", err)
 	}
 	defer rows.Close()
 
-	batch := make([]DispatchRow, 0, q.Limit)
+	picked := make(map[int16][]dispatchPick, len(zoneIDs))
 	for rows.Next() {
-		var r DispatchRow
-		if err := rows.Scan(&r.DomainID, &r.ZoneID, &r.Name); err != nil {
+		var p dispatchPick
+		if err := rows.Scan(&p.zoneID, &p.domainID, &p.label); err != nil {
 			return nil, fmt.Errorf("scheduler: выборка пачки доменов: чтение строки: %w", err)
 		}
-		batch = append(batch, r)
+		picked[p.zoneID] = append(picked[p.zoneID], p)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("scheduler: выборка пачки доменов: %w", err)
 	}
-	return batch, nil
+	for z := range picked {
+		ps := picked[z]
+		sort.Slice(ps, func(i, j int) bool { return ps[i].domainID < ps[j].domainID })
+	}
+	return picked, nil
+}
+
+// dispatchMerge — слияние очередей зон в круговой порядок пачки: пока не
+// набрано limit строк, берётся голова зоны с минимальным ключом
+// (rn − 0.5)/вес (rn — позиция в очереди зоны, 1-based), при равенстве —
+// меньший zone_id. Повторяет порядок оконной выборки T-027 (глобальный
+// ORDER BY (rn − 0.5)/вес, zone_id, rn) над прочитанными префиксами.
+func dispatchMerge(zones []*dispatchZone, weights map[int16]int, limit int) []dispatchPick {
+	type head struct {
+		zone *dispatchZone
+		rn   int     // позиция следующей строки очереди зоны
+		key  float64 // (rn − 0.5)/вес
+	}
+	heads := make([]*head, 0, len(zones))
+	for _, z := range zones {
+		if len(z.rows) == 0 {
+			continue
+		}
+		w := float64(weights[z.id])
+		if w < 1 {
+			w = 1
+		}
+		h := &head{zone: z, rn: 1, key: (1 - 0.5) / w}
+		heads = append(heads, h)
+	}
+
+	out := make([]dispatchPick, 0, limit)
+	for len(out) < limit && len(heads) > 0 {
+		// Минимальный ключ; равные — меньший zone_id (детерминизм).
+		best := 0
+		for i := 1; i < len(heads); i++ {
+			h, b := heads[i], heads[best]
+			if h.key < b.key || (h.key == b.key && h.zone.id < b.zone.id) {
+				best = i
+			}
+		}
+		h := heads[best]
+		out = append(out, h.zone.rows[h.rn-1])
+		h.rn++
+		if h.rn > len(h.zone.rows) {
+			heads = append(heads[:best], heads[best+1:]...) // зона исчерпана
+			continue
+		}
+		w := float64(weights[h.zone.id])
+		if w < 1 {
+			w = 1
+		}
+		h.key = (float64(h.rn) - 0.5) / w
+	}
+	return out
 }
 
 // dispatchValidate проверяет параметры до обращения к БД: невалидный
@@ -142,29 +339,10 @@ func (q DispatchQuery) dispatchValidate() error {
 	if q.Limit < 1 {
 		return fmt.Errorf("scheduler: выборка пачки: Limit = %d, ожидается ≥ 1 (scheduler.batch_size, ТЗ 5.3)", q.Limit)
 	}
-	if q.Offset < 0 {
-		return fmt.Errorf("scheduler: выборка пачки: Offset = %d, ожидается ≥ 0", q.Offset)
-	}
 	for zoneID, w := range q.ZoneWeights {
 		if w < 1 {
 			return fmt.Errorf("scheduler: выборка пачки: вес зоны %d = %d, ожидается ≥ 1", zoneID, w)
 		}
 	}
 	return nil
-}
-
-// dispatchWeightArrays — карта весов в параллельные массивы zone_id/weight
-// для unnest: порядок детерминирован (по zone_id), длины совпадают.
-func (q DispatchQuery) dispatchWeightArrays() ([]int16, []int32) {
-	zoneIDs := make([]int16, 0, len(q.ZoneWeights))
-	for id := range q.ZoneWeights {
-		zoneIDs = append(zoneIDs, id)
-	}
-	sort.Slice(zoneIDs, func(i, j int) bool { return zoneIDs[i] < zoneIDs[j] })
-
-	weights := make([]int32, 0, len(zoneIDs))
-	for _, id := range zoneIDs {
-		weights = append(weights, int32(q.ZoneWeights[id]))
-	}
-	return zoneIDs, weights
 }

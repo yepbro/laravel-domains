@@ -105,7 +105,17 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// (WatermarkPublisher, T-026) — один клиент Redis на сервис.
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
-	q := queue.NewRedisQueue(rdb, queue.RedisOptions{})
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+	})
+
+	// Возврат зависших доставок q:analyze (T-025): RecoverLoop в воркере —
+	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
+	// — секция redis (max_attempts, claim_min_idle).
+	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
+		MaxAttempts: cfg.Redis.MaxAttempts,
+		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
+	})
 
 	// Фоновый цикл переанализа (T-074, ТЗ 5.8): стартовый дренаж + тикер +
 	// внеочередной проход по смене набора правил (Reloader.Subscribe);
@@ -113,6 +123,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// ctx — живёт до остановки сервиса рядом с воркером.
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
+		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
 		Log:       logger,
 	})
 	publish := queue.NewWatermarkPublisher(q, gate)
@@ -125,7 +136,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}()
 
 	// Длина потребляемого стрима q:analyze → crawler_queue_depth (T-077):
-	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
 	go func() {
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamAnalyze}, metrics.DefaultQueueCollectInterval, logger)
@@ -135,6 +146,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// их для ProcessResult, цикл Run берёт те же Group/Consume.
 	opts := analyzer.Options{
 		MinScore: cfg.Analyzer.LaravelMinScore,
+		Recover:  rel, // возврат зависших задач q:analyze (T-025)
 		Metrics:  reg, // приборы этапа: задачи и длительности (T-077)
 		Log:      logger,
 	}

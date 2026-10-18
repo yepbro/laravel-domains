@@ -317,12 +317,14 @@ func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
 	return n, nil
 }
 
-// RetryTempErrors — фоновая задача повторных проверок (ТЗ 5.3): повторяет
-// RetryOnce по ticker (первый проход — сразу: дренаж накопленного после
-// рестарта) до отмены ctx и возвращает nil — контракт OnRun каркаса
-// сервисов (T-012: чистое завершение по SIGTERM). Ошибка прохода не
-// останавливает задачу и сервис: логируется (Warn), очередной проход
-// повторит — проход идемпотентен (ТЗ 3.4).
+// RetryTempErrors — фоновая задача повторных проверок (ТЗ 5.3): по
+// ticker выполняет дренаж всех созревших кандидатов пачками RetryOnce
+// (первый дренаж — сразу при старте: накопленное за простой разбирается
+// целиком, а не по пачке за тик), до отмены ctx и возвращает nil —
+// контракт OnRun каркаса сервисов (T-012: чистое завершение по
+// SIGTERM). Ошибка пачки прерывает только текущий дренаж: логируется
+// (Warn), цикл живёт — очередной дренаж продолжит, проход идемпотентен
+// (ТЗ 3.4).
 func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error {
 	if pool == nil {
 		return errors.New("scheduler: повторные проверки temp_error: пул не задан")
@@ -336,20 +338,39 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 		"interval", o.Interval.String(), "batch", o.BatchSize,
 		"retry_after", o.RetryAfter.String(), "max_retries", o.MaxRetries)
 
-	pass := func() {
-		res, err := RetryOnce(ctx, pool, o)
-		switch {
-		case err != nil && ctx.Err() != nil:
-			// Отмена во время прохода — часть остановки, не тревога.
-		case err != nil:
-			log.Warn("проход повторных проверок temp_error", "err", err)
-		case res.Requeued > 0 || res.Finalized > 0:
-			log.Info("проход повторных проверок temp_error",
-				"requeued", res.Requeued, "finalized", res.Finalized)
+	// Дренаж до исчерпания кандидатов (стиль LeaseWatch/RecheckDaily):
+	// один тик обрабатывает все созревшие пачки, а не одну — иначе
+	// очередь повторов рассасывалась темпом BatchSize за интервал
+	// (1000/час по дефолту: массовый DNS-сбой оставался бы в temp_error
+	// месяцами). Пачки повторяются, пока проходят целиком; переведённые
+	// в pending не выбираются повторно — дренаж конечен, переводы
+	// подбирает главный цикл постановки (T-028).
+	drain := func() {
+		var total RetryResult
+		for {
+			res, err := RetryOnce(ctx, pool, o)
+			switch {
+			case err != nil && ctx.Err() != nil:
+				// Отмена во время прохода — часть остановки, не тревога.
+				return
+			case err != nil:
+				log.Warn("дренаж повторных проверок temp_error", "err", err,
+					"requeued", total.Requeued, "finalized", total.Finalized)
+				return
+			}
+			total.Requeued += res.Requeued
+			total.Finalized += res.Finalized
+			if res.Requeued+res.Finalized < o.BatchSize {
+				if total.Requeued > 0 || total.Finalized > 0 {
+					log.Info("дренаж повторных проверок temp_error",
+						"requeued", total.Requeued, "finalized", total.Finalized)
+				}
+				return // неполная пачка — множество исчерпано
+			}
 		}
 	}
 
-	pass()
+	drain()
 	ticker := time.NewTicker(o.Interval)
 	defer ticker.Stop()
 	for {
@@ -357,7 +378,7 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			pass()
+			drain()
 		}
 	}
 }

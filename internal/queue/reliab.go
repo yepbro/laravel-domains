@@ -8,6 +8,7 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -21,21 +22,25 @@ import (
 const DefaultMaxAttempts = 3
 
 // DefaultClaimMinIdle — минимальный простой pending-записи до возврата в
-// работу (MINIDLE XAUTOCLAIM) по умолчанию. Должен превышать худшее время
-// обработки одной задачи живым воркером, иначе чужая работа перехватывается
-// на ходу; 5 минут — с запасом над таймаутами этапов (полный HTTP-проход —
-// секунды, ТЗ 5.5; рендер — до 25 с, ТЗ 5.6).
-const DefaultClaimMinIdle = 5 * time.Minute
+// работу (MINIDLE XAUTOCLAIM) по умолчанию. Должен превышать худшее
+// время, в течение которого живой воркер держит доставку неподтверждённой,
+// иначе чужая работа перехватывается на ходу: это не время одной задачи,
+// а окно потребления — Consume-окно записей, обрабатываемых циклом
+// последовательно при минимальном параллелизме. Худший настроенный
+// случай — рендер: окно 16 × таймаут 25 с при contexts = 1 ≈ 6,7 мин
+// (q:http при concurrency 1 — 16 × 20 с ≈ 5,3 мин); 10 минут даёт
+// полуторакратный запас. Настройка — redis.claim_min_idle (Q-03).
+const DefaultClaimMinIdle = 10 * time.Minute
 
 // Пределы длины стримов политики MAXLEN по умолчанию (ТЗ 4.2: «MAXLEN на
 // каждом стриме»). MAXLEN ~ усекает прежде всего историю подтвержденных
 // записей — без усечения стримы растут неограниченно (350 млн доменов,
 // несколько стримов на домен), а неусечённая необработанной запись не
 // теряется бесследно: источник истины — PostgreSQL, задачу восстанавливает
-// планировщик по lease (ТЗ 3.4, 5.3). Пределы заведомо выше рабочей глубины
-// очередей — backpressure останавливает публикацию задолго до них
-// (queue_high_watermark = 100 000, ТЗ 5.10), поэтому в здоровой системе
-// усекается только уже обработанное.
+// планировщик по lease (ТЗ 3.4, 5.3). Пределы выше рабочей глубины
+// очередей — гейт backpressure срабатывает раньше обрезки: его порог
+// ограничен половиной предела стрима (BackpressureGate.watermarkFor),
+// поэтому в здоровой системе усекается только уже обработанное.
 const (
 	// defaultMaxLenDNS — записи q:dns — пачки до scheduler.batch_size
 	// (5000) доменов, до ~250 КБ каждая; реальная глубина — десятки пачек,
@@ -47,9 +52,13 @@ const (
 	// выше порога backpressure.
 	defaultMaxLenUnit = 1_000_000
 	// defaultMaxLenDead — поток q:dead редок (исчерпанные попытки), а
-	// ручному разбору нужна длинная история; payload — исходное сообщение,
-	// включая крупные пачки q:dns.
-	defaultMaxLenDead = 100_000
+	// ручному разбору нужна длинная история; payload — исходное
+	// сообщение, включая крупные пачки q:dns (до ~250 КБ). Потолок
+	// ограничен байтовым бюджетом Redis (≤ 0,5 ГБ, ТЗ 3.2), а не числом
+	// записей: 10 000 × 250 КБ ≈ 2,5 ГБ — уже за бюджетом, но это
+	// предельный случай «все пачки q:dns ушли в dead»; типовой поток —
+	// штучные задачи (~200 Б), 10 000 ≈ 2 МБ истории.
+	defaultMaxLenDead = 10_000
 )
 
 // DefaultStreamMaxLen — предел длины стрима из политики T-025: применяется
@@ -153,7 +162,11 @@ type Claimed struct {
 
 // Claim возвращает до n зависших записей стрима stream — прочитанных
 // группой group и не подтверждённых не менее minIdle (0 — ReliabOptions.
-// MinIdle), закрепляя их за потребителем consumer.
+// MinIdle), закрепляя их за потребителем consumer. Сканирование PEL
+// начинается с курсора start ("" или "0-0" — с начала); next в возврате —
+// курсор следующего сканирования ("0-0" — обход PEL завершён): вызывающий
+// цикл продолжает с него, не перечитывая пропущенные (ещё не
+// «созревшие» по MinIdle) записи с начала на каждом вызове.
 //
 // Выбор XAUTOCLAIM (а не XPENDING+XCLAIM): ТЗ 4.2 называет XAUTOCLAIM
 // прямо; go-redis v9 поддерживает его полностью. Одна атомарная команда
@@ -179,35 +192,52 @@ type Claimed struct {
 // pending и даст дубль в q:dead на следующем проходе — поток q:dead редок
 // и разбирается вручную, дубль предпочтительнее потери (ТЗ 3.4).
 //
+// Ошибка XPENDING одной записи не рушит пачку: XAUTOCLAIM уже закрепил
+// записи за потребителем и сбросил им idle — потеря всей пачки на сбое
+// одной проверки означала бы ещё один MinIdle простоя для записей,
+// счётчик которых известен. Ошибки собираются в возврат (errors.Join),
+// валидная часть отдаётся; запись с неизвестным счётчиком остаётся
+// закреплённой и вернётся следующим клеймом после нового MinIdle.
+// Счётчик читается XPENDING EXTENDED по каждой вернувшейся записи
+// (диапазон id..id: XAUTOCLAIM его не возвращает); чтение без побочных
+// эффектов, поэтому безопасно при гонках с другими восстановителями.
+//
 // Пустой результат без ошибки — зависших записей нет.
-func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, n int) ([]Claimed, error) {
+func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, n int, start string) ([]Claimed, string, error) {
 	if !knownStream(stream) {
-		return nil, fmt.Errorf("queue: неизвестный стрим %q", stream)
+		return nil, "", fmt.Errorf("queue: неизвестный стрим %q", stream)
 	}
 	if group == "" {
-		return nil, fmt.Errorf("queue: не задана группа потребителей стрима %s", stream)
+		return nil, "", fmt.Errorf("queue: не задана группа потребителей стрима %s", stream)
 	}
 	if consumer == "" {
-		return nil, fmt.Errorf("queue: не задано имя потребителя группы %s", group)
+		return nil, "", fmt.Errorf("queue: не задано имя потребителя группы %s", group)
 	}
 	if minIdle <= 0 {
 		minIdle = r.opt.MinIdle
 	}
 	if n < 1 {
-		return nil, fmt.Errorf("queue: размер пачки клейма %d < 1", n)
+		return nil, "", fmt.Errorf("queue: размер пачки клейма %d < 1", n)
 	}
-	msgs, _, err := r.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+	if start == "" {
+		start = "0-0"
+	}
+	msgs, next, err := r.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 		Stream:   stream,
 		Group:    group,
 		Consumer: consumer,
 		MinIdle:  minIdle,
-		Start:    "0-0", // с начала PEL: закреплённые записи получают новое время доставки и повторно не находятся
+		Start:    start, // курсор вызывающего цикла: продолжение обхода PEL, а не всегда с начала
 		Count:    int64(n),
 	}).Result()
 	if err != nil {
-		return nil, fmt.Errorf("queue: claim %s (группа %s): %w", stream, group, err)
+		return nil, "", fmt.Errorf("queue: claim %s (группа %s): %w", stream, group, err)
+	}
+	if next == "" {
+		next = "0-0" // обход PEL завершён — следующий с начала
 	}
 	out := make([]Claimed, 0, len(msgs))
+	var errs []error
 	for _, m := range msgs {
 		d := Delivery{Stream: stream, ID: m.ID, Payload: payloadBytes(m.Values)}
 		if len(d.Payload) == 0 {
@@ -223,7 +253,8 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 			Count:  1,
 		}).Result()
 		if err != nil {
-			return nil, fmt.Errorf("queue: счётчик доставок записи %s (%s): %w", m.ID, stream, err)
+			errs = append(errs, fmt.Errorf("queue: счётчик доставок записи %s (%s): %w", m.ID, stream, err))
+			continue
 		}
 		if len(pending) == 0 {
 			// Запись покинула PEL между командами (подтверждена тем, кто
@@ -233,16 +264,28 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 		attempts := int(pending[0].RetryCount)
 		if attempts > r.opt.MaxAttempts {
 			if err := r.bury(ctx, group, d, attempts); err != nil {
-				return nil, err
+				errs = append(errs, err)
 			}
 			continue
 		}
 		out = append(out, Claimed{Delivery: d, Attempts: attempts})
 	}
 	if len(out) == 0 {
-		return nil, nil
+		if len(errs) > 0 {
+			return nil, next, errors.Join(errs...)
+		}
+		return nil, next, nil
 	}
-	return out, nil
+	return out, next, errors.Join(errs...)
+}
+
+// Process — паттерн Processing поверх очереди слоя: клеймнутая Claim
+// запись обрабатывается тем же правилом «результат в БД → XACK» (ТЗ 4.2),
+// что и свежие доставки воркера. RecoverLoop использует для повторов
+// общий с воркером обработчик — идемпотентность записей (ТЗ 3.4) делает
+// повтор безопасным.
+func (r *Reliab) Process(ctx context.Context, group string, d Delivery, process func(context.Context, Delivery) error) error {
+	return Processing(ctx, r.q, group, d, process)
 }
 
 // bury переводит запись, исчерпавшую лимит попыток, в q:dead и

@@ -29,15 +29,28 @@ type fakeClaimRedis struct {
 	claimNext string // курсор следующего сканирования из ответа
 	claimErr  error
 
-	pends   []redis.XPendingExtArgs
-	pendRes map[string][]redis.XPendingExt // ответ XPENDING по Start-идентификатору
-	pendErr error
+	pends      []redis.XPendingExtArgs
+	pendRes    map[string][]redis.XPendingExt // ответ XPENDING по Start-идентификатору
+	pendErr    error
+	pendOneErr map[string]error // ошибка XPENDING по конкретному Start-идентификатору
 }
 
 func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
 	f.claims = append(f.claims, *a)
+	msgs := f.claimMsgs
+	if f.claimErr == nil && len(msgs) > 0 {
+		// Живой клейм возвращает до Count записей и закрепляет их
+		// (idle сброшен — повторный вызов не вернёт); остаток PEL —
+		// следующим вызовам.
+		if int64(len(msgs)) > a.Count {
+			msgs = msgs[:a.Count]
+			f.claimMsgs = f.claimMsgs[a.Count:]
+		} else {
+			f.claimMsgs = nil
+		}
+	}
 	cmd := redis.NewXAutoClaimCmd(ctx, "xautoclaim")
-	cmd.SetVal(f.claimMsgs, f.claimNext)
+	cmd.SetVal(msgs, f.claimNext)
 	cmd.SetErr(f.claimErr)
 	return cmd
 }
@@ -45,6 +58,11 @@ func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs
 func (f *fakeClaimRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd {
 	f.pends = append(f.pends, *a)
 	cmd := redis.NewXPendingExtCmd(ctx, "xpending")
+	if err, ok := f.pendOneErr[a.Start]; ok {
+		cmd.SetVal(nil)
+		cmd.SetErr(err)
+		return cmd
+	}
 	cmd.SetVal(f.pendRes[a.Start])
 	cmd.SetErr(f.pendErr)
 	return cmd
@@ -92,9 +110,12 @@ func TestReliabClaim(t *testing.T) {
 	}
 	r := newTestReliab(fake, ReliabOptions{})
 
-	got, err := r.Claim(context.Background(), StreamHTTP, "http", "recover-1", 15*time.Minute, 10)
+	got, next, err := r.Claim(context.Background(), StreamHTTP, "http", "recover-1", 15*time.Minute, 10, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
+	}
+	if next != "1720-0" {
+		t.Errorf("курсор следующего сканирования = %q, хочу %q (из ответа XAUTOCLAIM)", next, "1720-0")
 	}
 
 	// XAUTOCLAIM: тот же стрим/группа, закрепление за восстановителем,
@@ -111,6 +132,15 @@ func TestReliabClaim(t *testing.T) {
 	}
 	if args.Start != "0-0" || args.Count != 10 {
 		t.Errorf("XAUTOCLAIM Start/Count: %q/%d, хочу 0-0/10", args.Start, args.Count)
+	}
+
+	// Явный курсор передаётся в XAUTOCLAIM без искажений (Q-07):
+	// вызывающий цикл продолжает обход PEL с сохранённой позиции.
+	if _, _, err := r.Claim(context.Background(), StreamHTTP, "http", "recover-1", 15*time.Minute, 10, "1750-3"); err != nil {
+		t.Fatalf("Claim с курсором: %v", err)
+	}
+	if got := fake.claims[1].Start; got != "1750-3" {
+		t.Errorf("XAUTOCLAIM Start с курсором: %q, хочу 1750-3", got)
 	}
 
 	// Счётчик попыток — XPENDING EXTENDED по каждой записи (ровно её
@@ -148,7 +178,7 @@ func TestReliabClaim(t *testing.T) {
 func TestReliabClaimMinIdleDefault(t *testing.T) {
 	fake := &fakeClaimRedis{}
 	r := newTestReliab(fake, ReliabOptions{})
-	if _, err := r.Claim(context.Background(), StreamDNS, "dns", "recover-1", 0, 1); err != nil {
+	if _, _, err := r.Claim(context.Background(), StreamDNS, "dns", "recover-1", 0, 1, ""); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if got := fake.claims[0].MinIdle; got != DefaultClaimMinIdle {
@@ -157,7 +187,7 @@ func TestReliabClaimMinIdleDefault(t *testing.T) {
 
 	fake = &fakeClaimRedis{}
 	r = newTestReliab(fake, ReliabOptions{MinIdle: 2 * time.Minute})
-	if _, err := r.Claim(context.Background(), StreamDNS, "dns", "recover-1", 0, 1); err != nil {
+	if _, _, err := r.Claim(context.Background(), StreamDNS, "dns", "recover-1", 0, 1, ""); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if got := fake.claims[0].MinIdle; got != 2*time.Minute {
@@ -180,7 +210,7 @@ func TestReliabClaimDead(t *testing.T) {
 	}
 	r := newTestReliab(fake, ReliabOptions{})
 
-	got, err := r.Claim(context.Background(), StreamRender, "render", "recover-1", time.Minute, 5)
+	got, _, err := r.Claim(context.Background(), StreamRender, "render", "recover-1", time.Minute, 5, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -242,8 +272,8 @@ func TestReliabClaimBoundary(t *testing.T) {
 					"1-0": {{ID: "1-0", RetryCount: c.attempt}},
 				},
 			}
-			got, err := newTestReliab(fake, ReliabOptions{}).Claim(
-				context.Background(), StreamDNS, "dns", "recover-1", time.Minute, 1)
+			got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+				context.Background(), StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0")
 			if err != nil {
 				t.Fatalf("Claim: %v", err)
 			}
@@ -276,8 +306,8 @@ func TestReliabClaimSkips(t *testing.T) {
 			"1719-0": nil, // запись уже покинула PEL — подтверждена другим
 		},
 	}
-	got, err := newTestReliab(fake, ReliabOptions{}).Claim(
-		context.Background(), StreamHTTP, "http", "recover-1", time.Minute, 5)
+	got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+		context.Background(), StreamHTTP, "http", "recover-1", time.Minute, 5, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -300,19 +330,19 @@ func TestReliabClaimErrors(t *testing.T) {
 	// Плохие аргументы — без обращения к Redis.
 	for name, call := range map[string]func(r *Reliab) error{
 		"неизвестный стрим": func(r *Reliab) error {
-			_, err := r.Claim(ctx, "q:typo", "g", "c", time.Minute, 1)
+			_, _, err := r.Claim(ctx, "q:typo", "g", "c", time.Minute, 1, "0-0")
 			return err
 		},
 		"без группы": func(r *Reliab) error {
-			_, err := r.Claim(ctx, StreamDNS, "", "c", time.Minute, 1)
+			_, _, err := r.Claim(ctx, StreamDNS, "", "c", time.Minute, 1, "0-0")
 			return err
 		},
 		"без потребителя": func(r *Reliab) error {
-			_, err := r.Claim(ctx, StreamDNS, "g", "", time.Minute, 1)
+			_, _, err := r.Claim(ctx, StreamDNS, "g", "", time.Minute, 1, "0-0")
 			return err
 		},
 		"пачка 0": func(r *Reliab) error {
-			_, err := r.Claim(ctx, StreamDNS, "g", "c", time.Minute, 0)
+			_, _, err := r.Claim(ctx, StreamDNS, "g", "c", time.Minute, 0, "0-0")
 			return err
 		},
 	} {
@@ -329,7 +359,7 @@ func TestReliabClaimErrors(t *testing.T) {
 
 	// Ошибка XAUTOCLAIM.
 	fake := &fakeClaimRedis{claimErr: errors.New("ERR connection refused")}
-	if _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1); err == nil ||
+	if _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil ||
 		!contains(err, "claim") {
 		t.Errorf("ошибка XAUTOCLAIM: %v", err)
 	}
@@ -339,7 +369,7 @@ func TestReliabClaimErrors(t *testing.T) {
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
 		pendErr:   errors.New("ERR connection refused"),
 	}
-	if _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1); err == nil ||
+	if _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil ||
 		!contains(err, "счётчик доставок") {
 		t.Errorf("ошибка XPENDING: %v", err)
 	}
@@ -351,7 +381,7 @@ func TestReliabClaimErrors(t *testing.T) {
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
 		pendRes:   map[string][]redis.XPendingExt{"1-0": {{ID: "1-0", RetryCount: 9}}},
 	}
-	if _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1); err == nil ||
+	if _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil ||
 		!contains(err, "q:dead") {
 		t.Errorf("ошибка публикации Dead: %v", err)
 	}
@@ -366,7 +396,7 @@ func TestReliabClaimErrors(t *testing.T) {
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
 		pendRes:   map[string][]redis.XPendingExt{"1-0": {{ID: "1-0", RetryCount: 9}}},
 	}
-	if _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1); err == nil ||
+	if _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil ||
 		!contains(err, "подтверждение") {
 		t.Errorf("ошибка XACK: %v", err)
 	}
@@ -380,7 +410,7 @@ func TestReliabClaimErrors(t *testing.T) {
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"no_task":"id"}`}}},
 		pendRes:   map[string][]redis.XPendingExt{"1-0": {{ID: "1-0", RetryCount: 9}}},
 	}
-	if _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1); err == nil ||
+	if _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil ||
 		!contains(err, "task_id") {
 		t.Errorf("запись без task_id: %v", err)
 	}
@@ -392,13 +422,48 @@ func TestReliabClaimErrors(t *testing.T) {
 // TestReliabClaimEmpty — зависших записей нет: пустой результат без ошибки.
 func TestReliabClaimEmpty(t *testing.T) {
 	fake := &fakeClaimRedis{}
-	got, err := newTestReliab(fake, ReliabOptions{}).Claim(
-		context.Background(), StreamAnalyze, "analyzer", "recover-1", time.Minute, 5)
+	got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+		context.Background(), StreamAnalyze, "analyzer", "recover-1", time.Minute, 5, "0-0")
 	if err != nil || got != nil {
 		t.Errorf("пустой claim: (%v, %v), хочу (nil, nil)", got, err)
 	}
 	if len(fake.pends) != 0 {
 		t.Errorf("XPENDING без клейм не нужен: %+v", fake.pends)
+	}
+}
+
+// TestReliabClaimPartialError — сбой XPENDING одной записи не рушит
+// пачку: записи с известным счётчиком возвращаются, ошибки собраны
+// в возврат (Q-04: XAUTOCLAIM уже закрепил записи — терять пачку на
+// сбое одной проверки значило бы лишний MinIdle простоя всем).
+func TestReliabClaimPartialError(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 2}},
+			// "1719-0" — счётчик недоступен (сбой чтения по записи).
+		},
+		pendOneErr: map[string]error{
+			"1719-0": errors.New("ERR connection refused"),
+		},
+	}
+
+	got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+		context.Background(), StreamHTTP, "http", "recover-1", time.Minute, 5, "0-0")
+	if err == nil || !contains(err, "счётчик доставок") || !contains(err, "1719-0") {
+		t.Fatalf("частичный сбой: err = %v, want ошибки счётчика записи 1719-0", err)
+	}
+	want := []Claimed{
+		{Delivery{StreamHTTP, "1718-0", []byte(`{"task_id":"t1"}`)}, 2},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("валидная часть:\n получил  %+v\n хочу     %+v", got, want)
+	}
+	if len(fake.acks) != 0 || len(fake.adds) != 0 {
+		t.Errorf("клейм не подтверждает и не хоронит: %+v %+v", fake.acks, fake.adds)
 	}
 }
 
