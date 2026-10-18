@@ -107,6 +107,9 @@ func TestRun(t *testing.T) {
 			inErr: "укажите выходной файл"},
 		{name: "dict train несуществующие образцы", args: []string{"dict", "train", "d.zst", "--samples", "/nonexistent"},
 			code: exitError, inErr: "dict train:"},
+		{name: "dict train --help значением --samples — не справка, а путь образцов",
+			args: []string{"dict", "train", "d.zst", "--samples", "--help"},
+			code: exitError, inErr: "dict train:", noOut: "словарём сжатия zstd"},
 		{name: "dict train неизвестный флаг", args: []string{"dict", "train", "--nope", "d.zst"}, code: exitUsage,
 			inErr: "dict train: "},
 
@@ -220,6 +223,38 @@ func TestParseFlags(t *testing.T) {
 		}
 		if !strings.Contains(stdout.String(), "СПРАВКА x") {
 			t.Errorf("справка не напечатана:\n%s", stdout.String())
+		}
+	})
+
+	// Значение флага, требующего значения, — не запрос справки, даже
+	// если это сам токен --help (CLI-03).
+	t.Run("help значением флага", func(t *testing.T) {
+		fs := newFlagSet("x")
+		fs.String("incoming", "", "")
+		stdout.Reset()
+		handled, err := parseFlags(fs, "СПРАВКА x", []string{"--incoming", "--help"}, &stdout)
+		if handled || err != nil {
+			t.Fatalf("handled=%v err=%v, хочу успех без справки", handled, err)
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("справка напечатана:\n%s", stdout.String())
+		}
+		if got := fs.Lookup("incoming").Value.String(); got != "--help" {
+			t.Errorf("--incoming = %q, хочу значение %q", got, "--help")
+		}
+	})
+
+	t.Run("help после терминатора и позиционного", func(t *testing.T) {
+		for _, args := range [][]string{{"--", "--help"}, {"pos", "--help"}} {
+			fs := newFlagSet("x")
+			stdout.Reset()
+			handled, err := parseFlags(fs, "СПРАВКА x", args, &stdout)
+			if handled || err != nil {
+				t.Fatalf("parseFlags(%q): handled=%v err=%v, хочу успех без справки", args, handled, err)
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("parseFlags(%q): справка напечатана:\n%s", args, stdout.String())
+			}
 		}
 	})
 

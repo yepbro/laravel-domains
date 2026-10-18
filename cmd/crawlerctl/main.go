@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 // Коды возврата crawlerctl (полный контракт — в комментарии пакета).
@@ -154,23 +155,62 @@ func newFlagSet(name string) *flag.FlagSet {
 
 // parseFlags парсит флаги команды; help — её человекочитаемая справка.
 // Явный запрос справки печатает её и возвращает (true, flag.ErrHelp) —
-// run превращает это в код 0. Флаги -h/--help распознаются в любом месте
-// аргументов; голое слово help — только первым аргументом команды, иначе
-// это позиционный аргумент (crawlerctl domain --json help — имя домена).
-// Ошибка парсинга — (true, usageErr), т.е. код 2.
+// run превращает это в код 0. Флаги -h/--help распознаются только там,
+// где их считал бы флагами сам flag (flagHelpRequested): токен-значение
+// флага (--samples --help — путь «--help») и всё после терминатора «--»
+// или первого позиционного аргумента — не запрос справки, а обычный
+// аргумент команды. Голое слово help — только первым аргументом команды,
+// иначе это позиционный аргумент (crawlerctl domain --json help — имя
+// домена). Ошибка парсинга — (true, usageErr), т.е. код 2.
 func parseFlags(fs *flag.FlagSet, help string, args []string, stdout io.Writer) (bool, error) {
 	if len(args) > 0 && args[0] == "help" {
 		out(stdout, "%s", help)
 		return true, flag.ErrHelp
 	}
-	for _, a := range args {
-		if a == "-h" || a == "--help" {
-			out(stdout, "%s", help)
-			return true, flag.ErrHelp
-		}
+	if flagHelpRequested(fs, args) {
+		out(stdout, "%s", help)
+		return true, flag.ErrHelp
 	}
 	if err := fs.Parse(args); err != nil {
 		return true, usagef("%s: %v", fs.Name(), err)
 	}
 	return false, nil
+}
+
+// flagHelpRequested — есть ли в аргументах -h/--help как флаг. Разбор
+// повторяет правила пакета flag: на первом позиционном аргументе (и на
+// терминаторе «--») разбор флагов заканчивается; за флагом, требующим
+// отдельного значения (не булевым, без «=»), следующий токен — значение,
+// даже если выглядит как --help (crawlerctl seed --incoming --help —
+// каталог «--help», а не справка).
+func flagHelpRequested(fs *flag.FlagSet, args []string) bool {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" || len(a) < 2 || a[0] != '-' {
+			return false // терминатор/позиционный: дальше флагов нет
+		}
+		if a == "-h" || a == "--help" {
+			return true
+		}
+		if flagTakesValue(fs, a) {
+			i++ // следующий токен — значение флага
+		}
+	}
+	return false
+}
+
+// flagTakesValue — требует ли токен флага отдельного значения: булевы
+// флаги (flag.Bool) значения не берут, остальные (--zone, --samples,
+// включая fs.Func) — берут; форма -name=value самодостаточна.
+func flagTakesValue(fs *flag.FlagSet, a string) bool {
+	if strings.Contains(a, "=") {
+		return false
+	}
+	f := fs.Lookup(strings.TrimLeft(a, "-"))
+	if f == nil {
+		return false // неизвестный флаг — ошибка разбора в fs.Parse
+	}
+	type boolFlag interface{ IsBoolFlag() bool }
+	bf, ok := f.Value.(boolFlag)
+	return !ok || !bf.IsBoolFlag()
 }
