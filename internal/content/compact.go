@@ -225,7 +225,7 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 	if st.Size() < packHeaderLen {
 		// Файл короче заголовка (обрыв записи заголовка при сбое, C-7):
 		// ни одной целой записи в нём быть не может. Строк contents на
-		// Строк contents на такой пак не должно быть — «пустой» пак (доля живых 0) проход
+		// такой пак не должно быть — «пустой» пак (доля живых 0) проход
 		// удалит вместо вечной ошибки скана; строки у пака — повреждение.
 		n, err := s.allContents(ctx, packID)
 		if err != nil {
