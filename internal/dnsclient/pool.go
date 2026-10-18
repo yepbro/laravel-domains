@@ -37,6 +37,9 @@ type UDPPool struct {
 	addr string
 	size int
 	free chan *net.UDPConn
+	// done закрывается в Close: ждущие Get просыпаются с ErrPoolClosed,
+	// не дожидаясь дедлайна собственного ctx (DNS-09).
+	done chan struct{}
 
 	mu     sync.Mutex
 	live   int // открытые сокеты: свободные + выданные + набираемые
@@ -60,6 +63,7 @@ func NewUDPPool(ctx context.Context, addr string, size int) (*UDPPool, error) {
 		addr: addr,
 		size: size,
 		free: make(chan *net.UDPConn, size),
+		done: make(chan struct{}),
 	}
 	p.dial = p.dialUDP
 	for i := 0; i < size; i++ {
@@ -132,6 +136,8 @@ func (p *UDPPool) Get(ctx context.Context) (*net.UDPConn, error) {
 	select {
 	case conn := <-p.free:
 		return conn, nil
+	case <-p.done:
+		return nil, ErrPoolClosed
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -174,8 +180,11 @@ func (p *UDPPool) Discard(conn *net.UDPConn) {
 	p.mu.Unlock()
 }
 
-// Close закрывает свободные сокеты; выданные закроются при их возврате
-// (Put в закрытый пул закрывает сокет). Повторный Close — no-op.
+// Close закрывает свободные сокеты и будит ждущих Get (done →
+// ErrPoolClosed — без этого ждущий освобождался только дедлайном
+// собственного ctx, а с context.Background висел бы вечно); выданные
+// сокеты закроются при их возврате (Put в закрытый пул закрывает сокет).
+// Повторный Close — no-op.
 func (p *UDPPool) Close() error {
 	p.mu.Lock()
 	if p.closed {
@@ -184,6 +193,7 @@ func (p *UDPPool) Close() error {
 	}
 	p.closed = true
 	p.mu.Unlock()
+	close(p.done) // будит ждущих Get — сокетов в закрытом пуле больше нет
 	for {
 		select {
 		case conn := <-p.free:

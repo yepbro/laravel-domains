@@ -283,6 +283,40 @@ func TestUDPPoolClose(t *testing.T) {
 	}
 }
 
+// TestUDPPoolCloseWakesWaiters — Close будит ждущих Get (done-канал):
+// без дедлайна собственного ctx ждущий получает ErrPoolClosed, а не
+// висит до конца процесса (DNS-09).
+func TestUDPPoolCloseWakesWaiters(t *testing.T) {
+	addr := loopUDPAddr(t)
+	p, err := NewUDPPool(context.Background(), addr, 1)
+	if err != nil {
+		t.Fatalf("NewUDPPool: %v", err)
+	}
+
+	held, err := p.Get(context.Background()) // единственный сокет занят
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	res := make(chan error, 1)
+	go func() {
+		_, err := p.Get(context.Background()) // ctx без дедлайна
+		res <- err
+	}()
+	time.Sleep(30 * time.Millisecond) // ждущий встал в select
+	if err := p.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case err := <-res:
+		if !errors.Is(err, ErrPoolClosed) {
+			t.Fatalf("ждущий Get после Close: %v, want ErrPoolClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close не разбудил ждущего Get")
+	}
+	p.Put(held)
+}
+
 func TestUDPPoolBadArguments(t *testing.T) {
 	if _, err := NewUDPPool(context.Background(), "127.0.0.1:53", 0); err == nil {
 		t.Fatal("size 0: ожидается ошибка")
