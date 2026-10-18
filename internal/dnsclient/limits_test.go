@@ -487,6 +487,64 @@ func TestLimitBucketUnreserve(t *testing.T) {
 	}
 }
 
+// TestLimitBucketBurstCappedByQPS — типовой тюнинг слабого резолвера
+// (max_qps ≪ concurrency): начальная ёмкость не выше секунды темпа —
+// «полная волна» слотов не уходит залпом секунд бюджета (DNS-10).
+func TestLimitBucketBurstCappedByQPS(t *testing.T) {
+	fc := newLimitManualClock()
+	b := newLimitBucket(50, 2000, fc.clock()) // темп 50/с, затрошено 2000
+	took := 0
+	for i := 0; i < 60; i++ {
+		if _, ok := b.reserve(); ok {
+			took++
+		} else {
+			break
+		}
+	}
+	if took != 50 {
+		t.Fatalf("мгновенно взято %d токенов, want 50 (секунда темпа, не 2000)", took)
+	}
+}
+
+// TestLimitBucketBurstFollowsRate — ёмкость следует за темпом адаптива:
+// после снижения всплеск ограничен секундой нового темпа (и накопленные
+// токены подрезаны), восстановление темпа возвращает ёмкость до исходной
+// (DNS-10).
+func TestLimitBucketBurstFollowsRate(t *testing.T) {
+	fc := newLimitManualClock()
+	b := newLimitBucket(1000, 100, fc.clock())
+
+	// Ведро полно (100), темп упали на два порядка.
+	fc.advance(time.Second)
+	b.setRate(10)
+	took := 0
+	for i := 0; i < 12; i++ {
+		if _, ok := b.reserve(); ok {
+			took++
+		} else {
+			break
+		}
+	}
+	if took != 10 {
+		t.Fatalf("мгновенно взято %d токенов после снижения, want 10 (секунда нового темпа)", took)
+	}
+
+	// Темп восстановлен — ёмкость вернулась к исходной.
+	b.setRate(1000)
+	fc.advance(time.Second)
+	took = 0
+	for i := 0; i < 102; i++ {
+		if _, ok := b.reserve(); ok {
+			took++
+		} else {
+			break
+		}
+	}
+	if took != 100 {
+		t.Fatalf("мгновенно взято %d токенов после восстановления, want 100", took)
+	}
+}
+
 // --- декоратор: семафор ----------------------------------------------------------
 
 func TestLimitResolverConcurrency(t *testing.T) {

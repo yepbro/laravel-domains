@@ -96,7 +96,10 @@ type LimitOptions struct {
 	// Burst — ёмкость токен-ведра: сколько обменов разрешено подряд без
 	// ожидания (короткие всплески конвейера). По умолчанию равен
 	// Concurrency — «полная волна» всех слотов разом; больше бессмысленно:
-	// одновременно летит не больше Concurrency обменов.
+	// одновременно летит не больше Concurrency обменов. Эффективная
+	// ёмкость дополнительно ограничивается секундой темпа (см.
+	// newLimitBucket): всплеск дольше секунды бюджета max_qps —
+	// перегрузка резолвера, а не всплеск (DNS-10).
 	Burst int
 	// DisableAAAA — отвечать на AAAA-вопросы локальным пустым NOERROR
 	// без похода в резолвер. Ставится из dns.ipv6=false (NewLimitOptions):
@@ -333,23 +336,32 @@ func (s *limitSemaphore) wake() {
 // секунду плюс джиттер выдачи (свежепришедший перехватывает токен у
 // разбуженного).
 type limitBucket struct {
-	mu     sync.Mutex
-	clock  limitClock
-	rate   float64 // токенов в секунду (эффективный QPS)
-	burst  float64 // ёмкость ведра
-	tokens float64
-	last   time.Time // момент последнего начисления
+	mu       sync.Mutex
+	clock    limitClock
+	rate     float64 // токенов в секунду (эффективный QPS)
+	burst    float64 // текущая ёмкость ведра (следует за темпом, ≤ maxBurst)
+	maxBurst float64 // исходная ёмкость (потолок восстановления)
+	tokens   float64
+	last     time.Time // момент последнего начисления
 }
 
-// newLimitBucket создаёт полное ведро (burst токенов): плановая волна
-// старта конвейера уходит без ожидания.
+// newLimitBucket создаёт полное ведро (ёмкость токенов): плановая волна
+// старта конвейера уходит без ожидания. Ёмкость не выше секундного
+// бюджета темпа: при типовом тюнинге слабого резолвера
+// (max_qps ≪ concurrency) «полная волна» слотов — секунды обмена залпом
+// мимо настроенного темпа (DNS-10).
 func newLimitBucket(qps float64, burst int, clock limitClock) *limitBucket {
+	cap := math.Min(float64(burst), qps)
+	if cap < 1 {
+		cap = 1
+	}
 	return &limitBucket{
-		clock:  clock,
-		rate:   qps,
-		burst:  float64(burst),
-		tokens: float64(burst),
-		last:   clock.now(),
+		clock:    clock,
+		rate:     qps,
+		burst:    cap,
+		maxBurst: cap,
+		tokens:   cap,
+		last:     clock.now(),
 	}
 }
 
@@ -415,12 +427,22 @@ func (b *limitBucket) unreserve() {
 	b.tokens = math.Min(b.burst, b.tokens+1)
 }
 
-// setRate меняет темп (адаптив): сначала начисляет токены по старому темпу.
+// setRate меняет темп (адаптив): сначала начисляет токены по старому
+// темпу. Ёмкость следует за темпом — не выше исходной (maxBurst):
+// всплеск после простоя обязан вписываться в секундный бюджет
+// действующего QPS, иначе накопленный до снижения burst уходил бы
+// залпом мимо сниженного темпа (DNS-10); накопленные токены подрезаются
+// до новой ёмкости. Восстановление темпа возвращает ёмкость до исходной.
 func (b *limitBucket) setRate(qps float64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.refill()
 	b.rate = qps
+	b.burst = math.Min(b.maxBurst, qps)
+	if b.burst < 1 {
+		b.burst = 1
+	}
+	b.tokens = math.Min(b.tokens, b.burst)
 }
 
 // refill начисляет токены по прошедшему времени; вызывающий держит b.mu.
