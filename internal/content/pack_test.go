@@ -53,7 +53,10 @@ type packFakePool struct {
 	execSeq    int   // счётчик Exec для failOnExec
 	failOnExec int   // уронить Exec с этим порядковым номером (1-based)
 	execErr    error // чем уронить (по умолчанию общая ошибка БД)
-	queryErr   error
+
+	querySeq    int // счётчик Query для failOnQuery
+	failOnQuery int // уронить Query с этим порядковым номером (1-based)
+	queryErr    error
 }
 
 func newPackFakePool() *packFakePool {
@@ -97,18 +100,6 @@ func (p *packFakePool) Exec(ctx context.Context, sql string, args ...any) (pgcon
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		}
 		return pgconn.NewCommandTag("UPDATE 0"), nil
-	case sqlMetaPut:
-		if r := p.contents[h]; r != nil {
-			r.refc++ // ON CONFLICT: ссылка конкурента/мёртвой строки
-			r.packID, r.off = args[1].(int32), args[2].(int64)
-			r.clen, r.rawLen = args[3].(int32), args[4].(int32)
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		}
-		p.contents[h] = &packFakeRow{
-			packID: args[1].(int32), off: args[2].(int64),
-			clen: args[3].(int32), rawLen: args[4].(int32), refc: 1,
-		}
-		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case sqlMetaDelRef:
 		if r := p.contents[h]; r != nil && r.refc > 0 {
 			r.refc--
@@ -126,18 +117,42 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.querySeq++
+	if p.failOnQuery == p.querySeq {
+		err := p.queryErr
+		if err == nil {
+			err = errors.New("packFakePool: сбой БД")
+		}
+		return nil, err
+	}
 	if p.queryErr != nil {
 		return nil, p.queryErr
 	}
-	if sql != sqlMetaGet {
-		return nil, fmt.Errorf("packFakePool: неожидаемый SQL: %s", sql)
-	}
 	var h [HashLen]byte
 	copy(h[:], args[0].([]byte))
-	if r := p.contents[h]; r != nil && r.refc > 0 {
-		return &packRows{rows: [][]any{{r.packID, r.off, r.clen, r.rawLen}}}, nil
+	switch sql {
+	case sqlMetaPut:
+		// RETURNING (xmax = 0): вставка — true, конфликт
+		// (ON CONFLICT DO UPDATE) — false, как в PostgreSQL.
+		if r := p.contents[h]; r != nil {
+			r.refc++ // ON CONFLICT: ссылка конкурента/мёртвой строки
+			r.packID, r.off = args[1].(int32), args[2].(int64)
+			r.clen, r.rawLen = args[3].(int32), args[4].(int32)
+			return &packRows{rows: [][]any{{false}}}, nil
+		}
+		p.contents[h] = &packFakeRow{
+			packID: args[1].(int32), off: args[2].(int64),
+			clen: args[3].(int32), rawLen: args[4].(int32), refc: 1,
+		}
+		return &packRows{rows: [][]any{{true}}}, nil
+	case sqlMetaGet:
+		if r := p.contents[h]; r != nil && r.refc > 0 {
+			return &packRows{rows: [][]any{{r.packID, r.off, r.clen, r.rawLen}}}, nil
+		}
+		return &packRows{}, nil // pgx: ноль строк → ErrNoRows у вызывающего
+	default:
+		return nil, fmt.Errorf("packFakePool: неожидаемый SQL: %s", sql)
 	}
-	return &packRows{}, nil // pgx: ноль строк → ErrNoRows у вызывающего
 }
 
 // row — снимок строки contents для проверок (refcount, смещения).
@@ -244,7 +259,8 @@ const (
 		"VALUES ($1, $2, $3, $4, $5, 1) " +
 		"ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + 1, " +
 		"pack_id = EXCLUDED.pack_id, off = EXCLUDED.off, " +
-		"len = EXCLUDED.len, raw_len = EXCLUDED.raw_len"
+		"len = EXCLUDED.len, raw_len = EXCLUDED.raw_len " +
+		"RETURNING (xmax = 0) AS created"
 	wantSQLGet = "SELECT pack_id, off, len, raw_len FROM contents " +
 		"WHERE hash = $1 AND refcount > 0"
 	wantSQLDelRef = "UPDATE contents SET refcount = refcount - 1 " +
@@ -515,7 +531,7 @@ func TestPackCrashWindow(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
 	d := []byte("контент, чьи метаданные не закоммитятся")
-	pool.failOnExec = 2 // первый Exec (addRef) проходит, второй (метаданные) падает
+	pool.failOnQuery = 1 // первый Exec (addRef) проходит, фиксация метаданных (Query 1) падает
 
 	if _, err := st.Put(ctx, d); err == nil {
 		t.Fatal("Put с упавшей БД метаданных должен вернуть ошибку")
@@ -581,8 +597,8 @@ func TestPackDeadRowInvisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Конфликт с мёртвой строкой tag-ом неотличим от живой гонки —
-	// Created = false (зафиксировано в pack.go), но блок пишется свежий
+	// Конфликт с мёртвой строкой — ON CONFLICT DO UPDATE, не вставка:
+	// Created = false (RETURNING (xmax = 0)), хотя блок пишется свежий
 	// и размещение переводится на него.
 	if again.Created {
 		t.Error("Put после исчерпания ссылок: Created = true, want false (конфликт мёртвой строки)")

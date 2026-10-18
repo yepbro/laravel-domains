@@ -102,7 +102,7 @@ Get не блокирует: паки append-only, зафиксированны�
 | Операция | SQL |
 |---|---|
 | Put, дедуп | `UPDATE contents SET refcount = refcount + 1 WHERE hash = $1 AND refcount > 0` |
-| Put, новый блок | `INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) VALUES (…) ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + 1, pack_id = EXCLUDED.pack_id, off = EXCLUDED.off, …` |
+| Put, новый блок | `INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) VALUES (…) ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + 1, pack_id = EXCLUDED.pack_id, off = EXCLUDED.off, … RETURNING (xmax = 0)` |
 | Get | `SELECT pack_id, off, len, raw_len FROM contents WHERE hash = $1 AND refcount > 0` |
 | Delete | `UPDATE contents SET refcount = refcount - 1 WHERE hash = $1 AND refcount > 0` |
 
@@ -127,8 +127,11 @@ fsync-ом заголовка/каталога при создании пака)
   мёртвые строки вместе с блоками;
 - воскрешение: Put контента с мёртвой строкой дописывает свежий блок и
   переводит размещение на него (`EXCLUDED`-поля upsert); `Created` при
-  этом `false` — конфликт tag-ом неотличим от живой гонки, случай редкий
-  и влияет только на метрику доли дедупликации (ТЗ 11.4 п. 3);
+  этом `false` — конфликт идёт веткой `DO UPDATE` (`RETURNING
+  (xmax = 0)` различает вставку и обновление; CommandTag на
+  `INSERT … ON CONFLICT` всегда `INSERT 0 1` и ветки не различает).
+  Фактически байты писались — расхождение с «дедупликацией» редкое и
+  влияет только на метрику доли дедупликации (ТЗ 11.4 п. 3);
 - перезапись результата со сменой контента — своп ссылок `SwapRef` /
   `SwapRefTx` / `(*PackStore).SwapRef` (T-044, ТЗ 5.7, 8): атомарно
   в одной транзакции `+1` новому хэшу, затем `−1` старому (те же

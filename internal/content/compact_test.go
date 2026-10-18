@@ -296,9 +296,10 @@ func TestCompactScanMixed(t *testing.T) {
 	if err := st.Delete(ctx, HashOf(dead)); err != nil {
 		t.Fatal(err)
 	}
-	// Третий Put: addRef (Exec 6) проходит, дописывание проходит,
-	// фиксация метаданных (Exec 7) падает — блок без строки.
-	pool.failOnExec = 7
+	// Третий Put: addRef (Exec) проходит, дописывание проходит,
+	// фиксация метаданных (Query 3 — после put live и put dead) падает —
+	// блок без строки.
+	pool.failOnQuery = 3
 	if _, err := st.Put(ctx, orphan); err == nil {
 		t.Fatal("Put с упавшей фиксацией метаданных должен вернуть ошибку")
 	}

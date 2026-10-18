@@ -33,8 +33,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
-
 	"crawler/internal/db"
 )
 
@@ -77,12 +75,17 @@ const (
 	// добавляет ссылку, размещение переводится на только что дописанный
 	// блок (EXCLUDED — его байты гарантированно на месте, блок прежнего
 	// размещенерия мог быть скомпактифицирован), блок проигравшего —
-	// мусор для T-045.
+	// мусор для T-045. RETURNING (xmax = 0) — различение вставки и
+	// обновления: у вставленной строки xmax не установлен (0), у
+	// обновлённой конфликтником равен xid текущей транзакции; CommandTag
+	// на INSERT … ON CONFLICT DO UPDATE всегда «INSERT 0 1» и ветки не
+	// различает.
 	sqlMetaPut = "INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) " +
 		"VALUES ($1, $2, $3, $4, $5, 1) " +
 		"ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + 1, " +
 		"pack_id = EXCLUDED.pack_id, off = EXCLUDED.off, " +
-		"len = EXCLUDED.len, raw_len = EXCLUDED.raw_len"
+		"len = EXCLUDED.len, raw_len = EXCLUDED.raw_len " +
+		"RETURNING (xmax = 0) AS created"
 
 	// Метаданные для чтения: мёртвые строки (refcount = 0) невидимы —
 	// контракт Delete (T-041): после последней ссылки контент недоступен.
@@ -237,7 +240,7 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 	// удаляет старые паки под той же блокировкой. Комментарий о конфликтах
 	// INSERT — в appendAndMeta.
 	block := CompressWithDict(data)
-	tag, err = s.appendAndMeta(ctx, h, block, len(data))
+	created, err := s.appendAndMeta(ctx, h, block, len(data))
 	if err != nil {
 		// ENOSPC при физической записи — последняя линия обороны после
 		// порога (wrapPackWriteErr): тоже сигнал алерта (ТЗ 8).
@@ -246,7 +249,7 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 		}
 		return PutResult{}, err
 	}
-	return PutResult{Hash: h, Created: tag.Insert()}, nil
+	return PutResult{Hash: h, Created: created}, nil
 }
 
 // appendAndMeta дописывает блок в новейший пак и фиксирует строку
@@ -260,32 +263,45 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 // корректности межпроцессного протокола, запись контента не является
 // горячим путём (страницы приходят с сети медленнее коммита).
 //
-// INSERT-ветка sqlMetaPut — новый контент (Created), UPDATE-ветка
-// конфликта — конкурент успел раньше (блок этого вызова — мусор).
-// Конфликт с мёртвой строкой (refcount = 0) tag-ом неотличим: Created
-// остаётся false при фактически дописанном свежем блоке — редкий случай,
-// влияющий только на метрику доли дедупликации (ТЗ 11.4 п. 3);
-// размещение переводится на свежий блок (EXCLUDED), чтение корректно.
-func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, rawLen int) (pgconn.CommandTag, error) {
+// INSERT-ветка sqlMetaPut — новый контент; UPDATE-ветка конфликта —
+// конкурент успел раньше (блок этого вызова — мусор) или воскрешение
+// мёртвой строки (свежий блок дописан, размещение переведено на него).
+// Created берётся из RETURNING (xmax = 0): true — фактическая вставка,
+// false — обновление. Ветка воскрешения даёт false, хотя байты писались:
+// для метрики доли дедупликации (ТЗ 11.4 п. 3) это редкое расхождение,
+// зафиксированное в docs/content.md.
+func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, rawLen int) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return pgconn.CommandTag{}, errPackClosed
+		return false, errPackClosed
 	}
 	if err := flockDir(s.lock); err != nil {
-		return pgconn.CommandTag{}, err
+		return false, err
 	}
 	defer func() { unlockDir(s.lock) }()
 
 	packID, off, err := s.appendBlockLocked(block)
 	if err != nil {
-		return pgconn.CommandTag{}, err
+		return false, err
 	}
-	tag, err := s.pool.Exec(ctx, sqlMetaPut, h[:], packID, off, int32(len(block)), int32(rawLen))
+	rows, err := s.pool.Query(ctx, sqlMetaPut, h[:], packID, off, int32(len(block)), int32(rawLen))
 	if err != nil {
-		return pgconn.CommandTag{}, fmt.Errorf("content: метаданные %s: %w", h, err)
+		return false, fmt.Errorf("content: метаданные %s: %w", h, err)
 	}
-	return tag, nil
+	defer rows.Close()
+	if !rows.Next() {
+		err := rows.Err()
+		if err == nil {
+			err = errors.New("upsert не вернул строки RETURNING")
+		}
+		return false, fmt.Errorf("content: метаданные %s: %w", h, err)
+	}
+	var created bool
+	if err := rows.Scan(&created); err != nil {
+		return false, fmt.Errorf("content: метаданные %s: %w", h, err)
+	}
+	return created, nil
 }
 
 // Get возвращает контент по метаданным contents: блок (pack_id, off, len)
