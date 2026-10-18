@@ -17,6 +17,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -82,6 +83,23 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
 	}), gate)
 
+	// Веса зон выборки (ТЗ 5.3: «опционально в конфиге», T-106): имена
+	// из scheduler.zone_weights разрешаются в zone_id по справочнику
+	// один раз на старте — как и остальной конфиг, веса не меняются на
+	// лету. Имени может не быть в справочнике (зону создаёт ingest
+	// первым файлом, ТЗ 5.1) — Warn: зона проверяется с весом 1 до
+	// рестарта с появившейся зоной. Неактивные зоны разрешаются тоже:
+	// их вес вступит в силу при включении зоны (crawlerctl zones
+	// enable, T-084) без рестарта.
+	zoneWeights, unknownZones, err := scheduler.ResolveZoneWeights(ctx, pool, cfg.Scheduler.ZoneWeights)
+	if err != nil {
+		return err
+	}
+	if len(unknownZones) > 0 {
+		logger.Warn("веса зон: нет в справочнике zones (создаёт ingest первым файлом) — проверяются с весом 1 до рестарта с появившейся зоной",
+			"zones", strings.Join(unknownZones, ", "))
+	}
+
 	bg := make(chan error, 4)
 	go func() {
 		bg <- scheduler.RecheckDaily(ctx, pool, scheduler.RecheckOptions{
@@ -108,9 +126,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Главный цикл живёт до отмены ctx; после него фоновые циклы уже
 	// завершаются по той же отмене — забираем их результаты.
-	err := scheduler.EnqueueLoop(ctx, pool, dnsq, scheduler.EnqueueOptions{
-		BatchSize: cfg.Scheduler.BatchSize,
-		Log:       logger,
+	err = scheduler.EnqueueLoop(ctx, pool, dnsq, scheduler.EnqueueOptions{
+		BatchSize:   cfg.Scheduler.BatchSize,
+		ZoneWeights: zoneWeights,
+		Log:         logger,
 	})
 	<-bg
 	<-bg

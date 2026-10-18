@@ -234,7 +234,9 @@ type EnqueueOptions struct {
 	// IdleWait — ожидание пополнения при пустой пачке и пауза после
 	// ошибок (DefaultEnqueueIdleWait).
 	IdleWait time.Duration
-	// ZoneWeights — веса зон выборки (DispatchQuery.ZoneWeights, T-027).
+	// ZoneWeights — веса зон выборки (DispatchQuery.ZoneWeights, T-027):
+	// источник — scheduler.zone_weights, имена разрешены в zone_id к
+	// моменту сборки (ResolveZoneWeights, T-106); nil — равные веса.
 	ZoneWeights map[int16]int
 	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
@@ -277,7 +279,8 @@ func EnqueueLoop(ctx context.Context, pool db.DB, q queue.Queue, opts EnqueueOpt
 		log = slog.New(slog.DiscardHandler)
 	}
 	log.Info("цикл постановки пачек в q:dns",
-		"batch", o.BatchSize, "interval", o.Interval.String(), "idle_wait", o.IdleWait.String())
+		"batch", o.BatchSize, "interval", o.Interval.String(), "idle_wait", o.IdleWait.String(),
+		"zone_weights", len(o.ZoneWeights))
 
 	// wait прерывается отменой ctx: выход из ожидания — часть остановки.
 	wait := func(d time.Duration) {

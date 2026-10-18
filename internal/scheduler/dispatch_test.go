@@ -375,6 +375,133 @@ func TestDispatchBatch_ContextCanceled(t *testing.T) {
 	}
 }
 
+// --- веса зон из конфигурации (T-106) ---------------------------------
+
+// TestResolveZoneWeights — имена зон (ключи scheduler.zone_weights)
+// разрешаются в zone_id по справочнику одним запросом: все зоны, не
+// только активные (вес неактивной вступит в силу при её включении);
+// лишние строки справочника — мимо карты; имена без строки — unknown
+// по возрастанию (Warn вызывающего); карта вызывающего не изменяется.
+func TestResolveZoneWeights(t *testing.T) {
+	pool := &dispatchPool{results: []*dispatchRows{
+		dispatchZonesResult(
+			zrow(2, "example.net"), // активная или нет — справочник целиком
+			zrow(1, "example.com"),
+			zrow(3, "example.org"),
+		),
+	}}
+	byName := map[string]int{"example.com": 1, "example.net": 3, "example.org": 2,
+		"zzz.missing": 7, "aaa.missing": 5}
+
+	weights, unknown, err := ResolveZoneWeights(context.Background(), pool, byName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int16]int{1: 1, 2: 3, 3: 2}
+	if !reflect.DeepEqual(weights, want) {
+		t.Errorf("веса = %v, want %v (имена → zone_id по справочнику)", weights, want)
+	}
+	// Неизвестные имена — по возрастанию: детерминированный Warn.
+	if want := []string{"aaa.missing", "zzz.missing"}; !reflect.DeepEqual(unknown, want) {
+		t.Errorf("unknown = %v, want %v", unknown, want)
+	}
+	// Карта вызывающего не изменяется (конфиг живёт своей жизнью).
+	if len(byName) != 5 || byName["example.net"] != 3 {
+		t.Errorf("карта вызывающего изменена: %v", byName)
+	}
+	if len(pool.queries) != 1 || pool.queries[0].sql != resolveZoneWeightsSQL {
+		t.Errorf("запросы = %v, want один resolveZoneWeightsSQL", pool.queries)
+	}
+
+	// Пустая карта и nil — nil без обращения к БД: равные веса,
+	// поведение по умолчанию (ТЗ 5.3: «опционально»).
+	for _, m := range []map[string]int{nil, {}} {
+		pool := &dispatchPool{}
+		weights, unknown, err := ResolveZoneWeights(context.Background(), pool, m)
+		if err != nil || unknown != nil || weights != nil {
+			t.Fatalf("карта %v: weights=%v unknown=%v err=%v, want nil, nil, nil", m, weights, unknown, err)
+		}
+		if len(pool.queries) != 0 {
+			t.Errorf("карта %v: обращений к БД быть не должно, got %v", m, pool.queries)
+		}
+	}
+}
+
+// TestResolveZoneWeights_Errors — ошибки запроса/чтения/итерации
+// прерывают разрешение обёрнутой ошибкой; отменённый ctx не доходит до
+// БД (как реальный pgx).
+func TestResolveZoneWeights_Errors(t *testing.T) {
+	boom := errors.New("справочник недоступен")
+	weights := map[string]int{"example.com": 2}
+
+	pool := &dispatchPool{err: boom}
+	if _, _, err := ResolveZoneWeights(context.Background(), pool, weights); err == nil ||
+		!errors.Is(err, boom) || !strings.Contains(err.Error(), "справочник зон") {
+		t.Fatalf("err = %v, want обёрнутая ошибка запроса справочника", err)
+	}
+
+	pool = &dispatchPool{results: []*dispatchRows{
+		{colNames: dispatchZonesCols, rows: [][]any{zrow(1, "example.com")}, scanErr: boom},
+	}}
+	if _, _, err := ResolveZoneWeights(context.Background(), pool, weights); err == nil ||
+		!errors.Is(err, boom) || !strings.Contains(err.Error(), "чтение") {
+		t.Fatalf("err = %v, want обёрнутая ошибка чтения справочника", err)
+	}
+
+	pool = &dispatchPool{results: []*dispatchRows{
+		{colNames: dispatchZonesCols, rows: [][]any{zrow(1, "example.com")}, err: boom},
+	}}
+	if _, _, err := ResolveZoneWeights(context.Background(), pool, weights); err == nil || !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want ошибка итерации (rows.Err)", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	pool = &dispatchPool{}
+	if _, _, err := ResolveZoneWeights(ctx, pool, weights); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if len(pool.queries) != 0 {
+		t.Errorf("обращений к БД быть не должно, got %v", pool.queries)
+	}
+}
+
+// TestResolveZoneWeights_Dispatch — веса из конфигурации доходят до
+// слияния пачки: имена разрешаются в zone_id, выборка с полученной
+// картой чередует зоны пропорционально весам (по образцу TestDispatchBatch
+// с ZoneWeights — то же ожидание при весе зоны 2 = 3).
+func TestResolveZoneWeights_Dispatch(t *testing.T) {
+	pool := &dispatchPool{results: []*dispatchRows{
+		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")), // разрешение имён
+		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")), // выборка
+		dispatchDomainsResult(
+			drow(2, 201, "b"),
+			drow(1, 102, "c"),
+			drow(1, 101, "a"),
+		),
+	}}
+
+	weights, unknown, err := ResolveZoneWeights(context.Background(), pool, map[string]int{"example.net": 3})
+	if err != nil || len(unknown) != 0 {
+		t.Fatalf("разрешение весов: unknown=%v err=%v", unknown, err)
+	}
+
+	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 3, ZoneWeights: weights})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Вес зоны 2 = 3: её первая строка идёт первой (ключ 0.5/3 < 0.5/1),
+	// дальше — чередование по ключу (rn − 0.5)/вес.
+	want := []DispatchRow{
+		{DomainID: 201, ZoneID: 2, Name: "b.example.net"},
+		{DomainID: 101, ZoneID: 1, Name: "a.example.com"},
+		{DomainID: 102, ZoneID: 1, Name: "c.example.com"},
+	}
+	if !reflect.DeepEqual(batch, want) {
+		t.Errorf("пачка = %+v, want %+v (веса из конфигурации влияют на слияние)", batch, want)
+	}
+}
+
 // ---------------------------------------------------------------- контракт SQL
 
 const wantDispatchZonesSQL = "SELECT id, name FROM zones WHERE is_active"
@@ -424,6 +551,24 @@ func TestDispatch_SQLContract(t *testing.T) {
 	// Весов в схеме нет — источник весов только DispatchQuery.
 	if strings.Contains(up, "zones.weight") {
 		t.Error("в схеме появилась колонка zones.weight — веса можно брать из БД, а не параметрами")
+	}
+}
+
+// wantResolveZoneWeightsSQL — разрешение имён весов из конфигурации:
+// справочник целиком (активные и неактивные зоны — вес неактивной
+// вступит в силу при включении зоны без рестарта планировщика).
+const wantResolveZoneWeightsSQL = "SELECT id, name FROM zones"
+
+// TestResolveZoneWeights_SQLContract — точный текст запроса и опора на
+// схему: уникальность zones.name (миграция 000001) делает разрешение
+// «имя → zone_id» однозначным.
+func TestResolveZoneWeights_SQLContract(t *testing.T) {
+	if resolveZoneWeightsSQL != wantResolveZoneWeightsSQL {
+		t.Errorf("resolveZoneWeightsSQL = %q,\nwant %q", resolveZoneWeightsSQL, wantResolveZoneWeightsSQL)
+	}
+	up := dispatchReadMigration(t, "000001_init.up.sql")
+	if !strings.Contains(up, "name            text     NOT NULL UNIQUE") {
+		t.Error("в миграции 000001 нет UNIQUE на zones.name — разрешение имён весов опирается на уникальность")
 	}
 }
 

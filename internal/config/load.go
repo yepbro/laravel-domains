@@ -113,6 +113,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_SCHEDULER_LEASE", setDuration(func(c *Config) *Duration { return &c.Scheduler.Lease })},
 		{"CRAWLER_SCHEDULER_TEMP_ERROR_RETRY_AFTER", setDuration(func(c *Config) *Duration { return &c.Scheduler.TempErrorRetryAfter })},
 		{"CRAWLER_SCHEDULER_TEMP_ERROR_MAX_RETRIES", setInt(func(c *Config) *int { return &c.Scheduler.TempErrorMaxRetries })},
+		{"CRAWLER_SCHEDULER_ZONE_WEIGHTS", setZoneWeights(func(c *Config) *map[string]int { return &c.Scheduler.ZoneWeights })},
 		{"CRAWLER_DNS_RESOLVERS", setStrings(func(c *Config) *[]string { return &c.DNS.Resolvers })},
 		{"CRAWLER_DNS_FALLBACK_RESOLVERS", setStrings(func(c *Config) *[]string { return &c.DNS.FallbackResolvers })},
 		{"CRAWLER_DNS_CONCURRENCY", setInt(func(c *Config) *int { return &c.DNS.Concurrency })},
@@ -245,6 +246,35 @@ func setStrings(get func(*Config) *[]string) func(*Config, string) error {
 			parts[i] = strings.TrimSpace(parts[i])
 		}
 		*get(c) = parts
+		return nil
+	}
+}
+
+// setZoneWeights разбирает карту «имя зоны = вес» через запятую
+// (com=5, xn--p1ai=2); значение целиком заменяет карту из YAML (как
+// списки). Имя приводится к нижнему регистру, вес — целое; пустые
+// элементы (хвостовая запятая) пропускаются, диапазон веса и форму имени
+// проверяет валидация. Зона не содержит «=» и «,» (DNS-имя) —
+// разделители однозначны.
+func setZoneWeights(get func(*Config) *map[string]int) func(*Config, string) error {
+	return func(c *Config, v string) error {
+		m := make(map[string]int)
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			name, weight, ok := strings.Cut(part, "=")
+			if !ok {
+				return fmt.Errorf("ожидается карта «имя_зоны=вес» через запятую (com=5,org=2), получено %q", part)
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(weight))
+			if err != nil {
+				return fmt.Errorf("вес зоны %s: ожидается целое число, получено %q", strings.TrimSpace(name), weight)
+			}
+			m[strings.ToLower(strings.TrimSpace(name))] = n
+		}
+		*get(c) = m
 		return nil
 	}
 }

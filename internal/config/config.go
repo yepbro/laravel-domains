@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -104,6 +105,19 @@ type Scheduler struct {
 	// итоговый статус по результату последней проверки (T-031). ТЗ число
 	// не задаёт; 3 — как счётчик попыток доставки очереди (T-025).
 	TempErrorMaxRetries int `yaml:"temp_error_max_retries"`
+	// ZoneWeights — веса зон выборки пачек (ТЗ 5.3: «веса зон —
+	// опционально в конфиге», T-106): имя зоны (punycode, как в
+	// справочнике zones) → вес 1..1000; зона с весом w занимает в пачке
+	// долю, пропорциональную w, вес 1 у всех — равный круговой порядок.
+	// nil или пустая карта — веса не заданы, поведение по умолчанию.
+	// cmd/scheduler разрешает имена в zone_id по справочнику на старте
+	// (scheduler.ResolveZoneWeights): имени может не быть в справочнике
+	// (зону создаёт ingest первым файлом, ТЗ 5.1) — Warn, зона
+	// проверяется с весом 1; неактивные зоны разрешаются тоже — вес
+	// вступает в силу при включении зоны (crawlerctl zones enable)
+	// без рестарта. Расширение к минимальному составу ТЗ 5.10: новое
+	// поле внутри секции scheduler, секция верхнего уровня не вводится.
+	ZoneWeights map[string]int `yaml:"zone_weights"`
 }
 
 // DNS — параметры DNS-этапа (ТЗ 5.4). Клиент — internal/dnsclient
@@ -255,6 +269,9 @@ func Default() *Config {
 			Lease:               Duration(30 * time.Minute),
 			TempErrorRetryAfter: Duration(24 * time.Hour),
 			TempErrorMaxRetries: 3,
+			// Веса зон не заданы — равный круговой порядок (ТЗ 5.3:
+			// «опционально»).
+			ZoneWeights: nil,
 		},
 		DNS: DNS{
 			Resolvers:         []string{"127.0.0.1:53"},
@@ -334,9 +351,33 @@ func (c *Config) normalize() {
 		c.Subdomains[i] = strings.ToLower(strings.TrimSpace(s))
 	}
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
+	// Ключи весов зон — punycode-имена в нижнем регистре (как zones.name);
+	// карта пересобирается в порядке возрастания ключей, чтобы столкновение
+	// после приведения («Com» и «com» в одном YAML) разрешалось
+	// детерминированно — побеждает лексикографически больший ключ.
+	if len(c.Scheduler.ZoneWeights) > 0 {
+		names := make([]string, 0, len(c.Scheduler.ZoneWeights))
+		for name := range c.Scheduler.ZoneWeights {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		w := make(map[string]int, len(names))
+		for _, name := range names {
+			w[strings.ToLower(strings.TrimSpace(name))] = c.Scheduler.ZoneWeights[name]
+		}
+		c.Scheduler.ZoneWeights = w
+	}
 }
 
 var subdomainLabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// zoneNameRe — ключ scheduler.zone_weights: имя зоны в punycode нижним
+// регистром, как хранит справочник zones (ingest нормализует через
+// idn.NormalizeZone, ТЗ 5.2): DNS-метки через точку, составные зоны
+// (co.uk) и IDN-зоны (xn--p1ai) допустимы, unicode-форма — нет (её
+// справочник не содержит, ключ никогда бы не сработал). Полная длина
+// отдельно — ≤ 253 октет (ТЗ 5.2 п. 4).
+var zoneNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
 
 // Validate проверяет значения конфигурации и возвращает ошибку со списком
 // всех проблем сразу (формат «секция.поле: что не так»).
@@ -407,6 +448,23 @@ func (c *Config) Validate() error {
 	}
 	if !inRange(c.Scheduler.TempErrorMaxRetries, 1, 100) {
 		problems = append(problems, rangeMsg("scheduler.temp_error_max_retries", c.Scheduler.TempErrorMaxRetries, 1, 100)+"; минимум 1 — temp_error по определению требует повтор (ТЗ 6.2)")
+	}
+	// Веса зон (ТЗ 5.3, T-106): ключи по возрастанию — детерминированный
+	// список проблем. Имя, которого нет в справочнике zones, — не ошибка
+	// конфигурации (зоны создаёт ingest первым файлом, ТЗ 5.1):
+	// взвешивание просто не срабатывает, разрешение в cmd/scheduler
+	// предупреждает Warn-ом. Синтаксически невозможное имя ловим здесь —
+	// справочник такого имени содержать не может.
+	for _, name := range sortedKeys(c.Scheduler.ZoneWeights) {
+		if name == "" || len(name) > 253 || !zoneNameRe.MatchString(name) {
+			problems = append(problems, fmt.Sprintf(
+				"scheduler.zone_weights: %q — ожидается имя зоны в punycode нижним регистром, как в справочнике zones (составные — co.uk, IDN — xn--p1ai)", name))
+			continue
+		}
+		if w := c.Scheduler.ZoneWeights[name]; !inRange(w, 1, 1000) {
+			problems = append(problems, fmt.Sprintf(
+				"scheduler.zone_weights: зона %q: ожидается вес 1..1000, задано %d (доля зоны в пачке пропорциональна весу; 1 — равный круговой порядок)", name, w))
+		}
 	}
 
 	// dns
@@ -596,6 +654,17 @@ func checkHostPort(s string) error {
 }
 
 func inRange(v, lo, hi int) bool { return v >= lo && v <= hi }
+
+// sortedKeys — ключи карты по возрастанию (детерминированный порядок
+// сообщений валидации; Go-карты не упорядочены).
+func sortedKeys(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 func rangeMsg(field string, v, lo, hi int) string {
 	return fmt.Sprintf("%s: ожидается %d..%d, задано %d", field, lo, hi, v)

@@ -30,7 +30,9 @@
 //     элемента к (rn − 0.5)/weight — зона с весом w занимает в общем
 //     порядке долю, пропорциональную w (шаговое планирование); вес 1 у
 //     всех вырождается в равный круговой порядок. Колонки weight в схеме
-//     нет (ТЗ 6.1 её не требует), веса приходят параметрами DispatchQuery.
+//     нет (ТЗ 6.1 её не требует), веса приходят параметрами DispatchQuery;
+//     источник значений — конфигурация scheduler.zone_weights: имена зон
+//     разрешаются в zone_id по справочнику (ResolveZoneWeights, T-106).
 //
 // Долевая квота зоны на пачку — LIMIT LATERAL-подзапроса: ceil(L ×
 // max_вес / Σвесов активных зон) + 1 — верхняя оценка доли самой тяжёлой
@@ -81,6 +83,13 @@ const dispatchMaxRounds = 4
 // dispatchZonesSQL — активные зоны (малый справочник, без агрегатов):
 // зона вне выборки — её pending-домены ждут включения (crawlerctl).
 const dispatchZonesSQL = "SELECT id, name FROM zones WHERE is_active"
+
+// resolveZoneWeightsSQL — справочник зон целиком для разрешения имён
+// весов из конфигурации (scheduler.zone_weights, T-106): не только
+// активные — вес неактивной зоны разрешается и вступит в силу при её
+// включении (crawlerctl zones enable, T-084) без рестарта планировщика.
+// zones — малый справочник; name уникален (миграция 000001).
+const resolveZoneWeightsSQL = "SELECT id, name FROM zones"
 
 // dispatchZoneSQL — префиксы очередей зон: unnest пачки зон с keyset-
 // курсорами (after = 0 — с головы), LATERAL читает очередь зоны по
@@ -252,6 +261,58 @@ func dispatchActiveZones(ctx context.Context, pool db.DB) ([]*dispatchZone, erro
 		return nil, fmt.Errorf("scheduler: выборка пачки доменов: активные зоны: %w", err)
 	}
 	return zones, nil
+}
+
+// ResolveZoneWeights — источник весов зон из конфигурации (ТЗ 5.3:
+// «веса зон — опционально в конфиге», T-106): карта «имя зоны
+// (punycode, ключи scheduler.zone_weights) → вес» переводится в карту
+// «zone_id → вес» (DispatchQuery.ZoneWeights) чтением справочника zones
+// одним запросом — все зоны, не только активные (вес неактивной вступит
+// в силу при её включении, crawlerctl zones enable, без рестарта).
+// Карта вызывающего не изменяется. Значения уже проверены конфигурацией
+// (вес 1..1000); повторная проверка — dispatchValidate на каждой выборке.
+//
+// Имена без строки в справочнике — не ошибка: зоны создаёт ingest при
+// первом файле (ТЗ 5.1), планировщик может стартовать раньше; такие
+// имена возвращаются отдельно (unknown, по возрастанию) для Warn
+// вызывающего — до появления зоны и рестарта она проверяется с весом 1.
+// Пустая карта или nil — nil без обращения к БД: равные веса,
+// поведение по умолчанию.
+func ResolveZoneWeights(ctx context.Context, pool db.DB, byName map[string]int) (weights map[int16]int, unknown []string, err error) {
+	if len(byName) == 0 {
+		return nil, nil, nil
+	}
+	rows, err := pool.Query(ctx, resolveZoneWeightsSQL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("scheduler: веса зон: справочник зон: %w", err)
+	}
+	defer rows.Close()
+
+	rest := make(map[string]int, len(byName)) // имена, ждущие строку справочника
+	for name, w := range byName {
+		rest[name] = w
+	}
+	weights = make(map[int16]int, len(byName))
+	for rows.Next() {
+		var id int16
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, nil, fmt.Errorf("scheduler: веса зон: справочник зон: чтение: %w", err)
+		}
+		if w, ok := rest[name]; ok {
+			weights[id] = w
+			delete(rest, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("scheduler: веса зон: справочник зон: %w", err)
+	}
+	unknown = make([]string, 0, len(rest))
+	for name := range rest {
+		unknown = append(unknown, name)
+	}
+	sort.Strings(unknown)
+	return weights, unknown, nil
 }
 
 // dispatchPickZones — префиксы очередей зон (dispatchZoneSQL): по after

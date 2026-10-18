@@ -103,6 +103,9 @@ func TestDefault(t *testing.T) {
 	if want := []string{"", "www", "admin", "crm", "api", "app"}; strings.Join(c.Subdomains, ",") != strings.Join(want, ",") {
 		t.Errorf("subdomains: ожидается %v, получено %v", want, c.Subdomains)
 	}
+	if len(c.Scheduler.ZoneWeights) != 0 {
+		t.Errorf("scheduler.zone_weights: по умолчанию пуст (равные веса, ТЗ 5.3 «опционально»), получено %v", c.Scheduler.ZoneWeights)
+	}
 
 	// Все значения по умолчанию проходят валидацию после задания dsn.
 	c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
@@ -134,6 +137,10 @@ scheduler:
   lease: "45m"
   temp_error_retry_after: "12h"
   temp_error_max_retries: 5
+  zone_weights:
+    com: 5
+    co.uk: 3
+    xn--p1ai: 2
 dns:
   resolvers: ["10.0.0.2:53", "10.0.0.3:53"]
   fallback_resolvers: ["8.8.8.8:53"]
@@ -247,6 +254,9 @@ log:
 	if want := []string{"", "www", "dev"}; strings.Join(cfg.Subdomains, ",") != strings.Join(want, ",") {
 		t.Errorf("subdomains: ожидается %v, получено %v", want, cfg.Subdomains)
 	}
+	if w := cfg.Scheduler.ZoneWeights; len(w) != 3 || w["com"] != 5 || w["co.uk"] != 3 || w["xn--p1ai"] != 2 {
+		t.Errorf("scheduler.zone_weights: ожидается map[com:5 co.uk:3 xn--p1ai:2], получено %v", w)
+	}
 }
 
 // Частичный YAML: отсутствующие ключи сохраняют значения по умолчанию.
@@ -281,6 +291,8 @@ func TestLoadYAMLErrors(t *testing.T) {
 		{"кривой размер", "content:\n  pack_size: \"512QB\"\n", "размер"},
 		{"размер не число", "content:\n  pack_size: \"много\"\n", "размер"},
 		{"не тот тип", "http:\n  concurrency: \"много\"\n", "unmarshal"},
+		{"веса не карта", "scheduler:\n  zone_weights: [1, 2]\n", "unmarshal"},
+		{"вес не число", "scheduler:\n  zone_weights:\n    com: много\n", "unmarshal"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -349,6 +361,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_SCHEDULER_LEASE":                  "15m",
 		"CRAWLER_SCHEDULER_TEMP_ERROR_RETRY_AFTER": "6h",
 		"CRAWLER_SCHEDULER_TEMP_ERROR_MAX_RETRIES": "9",
+		"CRAWLER_SCHEDULER_ZONE_WEIGHTS":           "Org=7, xn--p1ai=2",
 		"CRAWLER_DNS_RESOLVERS":                    "10.0.0.2:53, 10.0.0.3:53",
 		"CRAWLER_DNS_FALLBACK_RESOLVERS":           "8.8.8.8:53",
 		"CRAWLER_DNS_CONCURRENCY":                  "321",
@@ -452,6 +465,10 @@ func TestEnvOverrides(t *testing.T) {
 	if want := []string{"www", "mail"}; strings.Join(cfg.Subdomains, ",") != strings.Join(want, ",") {
 		t.Errorf("subdomains: ожидается %v (замена целиком, без апекса), получено %v", want, cfg.Subdomains)
 	}
+	// Карта весов зон из env: ключи приводятся к нижнему регистру.
+	if w := cfg.Scheduler.ZoneWeights; len(w) != 2 || w["org"] != 7 || w["xn--p1ai"] != 2 {
+		t.Errorf("scheduler.zone_weights: ожидается map[org:7 xn--p1ai:2], получено %v", w)
+	}
 }
 
 func TestEnvBadValues(t *testing.T) {
@@ -466,6 +483,8 @@ func TestEnvBadValues(t *testing.T) {
 		{map[string]string{"CRAWLER_ANALYZER_LARAVEL_MIN_SCORE": "x"}, "CRAWLER_ANALYZER_LARAVEL_MIN_SCORE"},
 		{map[string]string{"CRAWLER_INGEST_MAX_ERROR_RATIO": "много"}, "CRAWLER_INGEST_MAX_ERROR_RATIO"},
 		{map[string]string{"CRAWLER_LOG_LEVEL": "verbose"}, "log.level"},
+		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
+		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com=много"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
 	}
 	for _, tt := range tests {
 		env := validDSN()
@@ -491,9 +510,14 @@ postgres:
 http:
   total_timeout: "30s"
   header_timeout: "11s"
+scheduler:
+  zone_weights:
+    com: 5
+    org: 2
 `, map[string]string{
-		"CRAWLER_HTTP_TOTAL_TIMEOUT":  "40s",
-		"CRAWLER_HTTP_HEADER_TIMEOUT": "",
+		"CRAWLER_HTTP_TOTAL_TIMEOUT":     "40s",
+		"CRAWLER_HTTP_HEADER_TIMEOUT":    "",
+		"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "net=9",
 	})
 	if cfg.HTTP.TotalTimeout.D() != 40*time.Second {
 		t.Errorf("env > yaml: ожидается 40s, получено %s", cfg.HTTP.TotalTimeout)
@@ -506,6 +530,10 @@ http:
 	}
 	if cfg.Postgres.DSN != "postgres://yaml@db/crawler" {
 		t.Errorf("postgres.dsn должен прийти из YAML, получено %q", cfg.Postgres.DSN)
+	}
+	// Карта весов из env заменяет карту из YAML целиком (как списки).
+	if w := cfg.Scheduler.ZoneWeights; len(w) != 1 || w["net"] != 9 {
+		t.Errorf("scheduler.zone_weights: ожидается map[net:9] (замена целиком), получено %v", w)
 	}
 }
 
@@ -623,6 +651,13 @@ func TestValidate(t *testing.T) {
 		{"retry_after 0", func(c *Config) { c.Scheduler.TempErrorRetryAfter = 0 }, "scheduler.temp_error_retry_after"},
 		{"max retries 0", func(c *Config) { c.Scheduler.TempErrorMaxRetries = 0 }, "scheduler.temp_error_max_retries"},
 		{"max retries велик", func(c *Config) { c.Scheduler.TempErrorMaxRetries = 101 }, "scheduler.temp_error_max_retries"},
+		{"вес зоны 0", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com": 0} }, "scheduler.zone_weights"},
+		{"вес зоны отрицательный", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com": -2} }, "scheduler.zone_weights"},
+		{"вес зоны велик", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com": 1001} }, "scheduler.zone_weights"},
+		{"имя зоны пустое", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"": 1} }, "scheduler.zone_weights"},
+		{"имя зоны unicode", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"рф": 1} }, "scheduler.zone_weights"},
+		{"имя зоны с точкой в конце", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com.": 1} }, "scheduler.zone_weights"},
+		{"имя зоны с дефисом в начале", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"-com": 1} }, "scheduler.zone_weights"},
 		{"resolvers пуст", func(c *Config) { c.DNS.Resolvers = nil }, "dns.resolvers"},
 		{"resolver без порта", func(c *Config) { c.DNS.Resolvers = []string{"127.0.0.1"} }, "dns.resolvers"},
 		{"fallback кривой", func(c *Config) { c.DNS.FallbackResolvers = []string{"noport"} }, "dns.fallback"},
@@ -693,8 +728,9 @@ func TestValidate(t *testing.T) {
 	c.Analyzer.LaravelMinScore = 1
 	c.HTTP.MaxRedirects = 0
 	c.Ingest.MaxErrorRatio = 1
-	c.Render.RestartMemoryBytes = 0 // контроль памяти отключён — допустимо
-	c.Scheduler.BatchSize = 10000   // верхняя граница пачек планировщика (ТЗ 5.3)
+	c.Render.RestartMemoryBytes = 0                                                    // контроль памяти отключён — допустимо
+	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)
+	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // границы весов
 	c.Subdomains = make([]string, maxSubdomains)
 	for i := range c.Subdomains {
 		c.Subdomains[i] = fmt.Sprintf("s%d", i)
@@ -717,6 +753,28 @@ func TestSubdomainsNormalize(t *testing.T) {
 	_, err := loadFrom(t, "subdomains:\n  - \"\"\n  - \"www\"\n  - \"WWW\"\n", validDSN())
 	if err == nil || !strings.Contains(err.Error(), "повтор") {
 		t.Errorf("www и WWW после normalize — дубль, ожидается ошибка, получено %v", err)
+	}
+}
+
+// Ключи весов зон приводятся к нижнему регистру без пробелов (normalize):
+// справочник зон хранит punycode-имена в нижнем регистре, «COM» и «com»
+// должны разрешаться одинаково.
+func TestZoneWeightsNormalize(t *testing.T) {
+	cfg := mustLoad(t, "scheduler:\n  zone_weights:\n    \" COM \": 5\n    net: 2\n", validDSN())
+	if w := cfg.Scheduler.ZoneWeights; len(w) != 2 || w["com"] != 5 || w["net"] != 2 {
+		t.Errorf("scheduler.zone_weights после normalize: ожидается map[com:5 net:2], получено %v", w)
+	}
+	// Столкновение после приведения («Com» и «com») разрешается
+	// детерминированно — лексикографически больший ключ побеждает
+	// («com» > «Com»), независимо от порядка в YAML.
+	for _, yaml := range []string{
+		"scheduler:\n  zone_weights:\n    Com: 1\n    com: 2\n",
+		"scheduler:\n  zone_weights:\n    com: 2\n    Com: 1\n",
+	} {
+		cfg := mustLoad(t, yaml, validDSN())
+		if w := cfg.Scheduler.ZoneWeights; len(w) != 1 || w["com"] != 2 {
+			t.Errorf("%q: после normalize: ожидается map[com:2], получено %v", yaml, w)
+		}
 	}
 }
 
