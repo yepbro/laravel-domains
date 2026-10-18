@@ -516,9 +516,14 @@ func newLimitAdaptive(o LimitOptions) *limitAdaptive {
 	}
 }
 
-// record добавляет исход обмена и возвращает эффективные лимиты; changed —
-// лимиты изменились (вызывающему достаточно применить их только тогда).
-func (a *limitAdaptive) record(timedOut bool) (conc int, qps float64, changed bool) {
+// record добавляет исход обмена и возвращает эффективные лимиты.
+// Изменившиеся лимиты применяются колбэком apply под тем же мьютексом
+// (DNS-11): применение вне блокировки позволяло параллельным
+// наблюдателям окна наложить значения в произвольном порядке —
+// устаревший больший лимит ложился последним и на один шаг возвращал
+// нагрузку резолверу в момент аварии. Порядок блокировок
+// a.mu → семафор/ведро обратных путей не имеет: те об адаптиве не знают.
+func (a *limitAdaptive) record(timedOut bool, apply func(conc int, qps float64)) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -542,7 +547,7 @@ func (a *limitAdaptive) record(timedOut bool) (conc int, qps float64, changed bo
 		a.filled = true
 	}
 	if !a.filled {
-		return a.conc, a.qps, false
+		return
 	}
 
 	ratio := float64(a.timeouts) / float64(a.total)
@@ -553,7 +558,9 @@ func (a *limitAdaptive) record(timedOut bool) (conc int, qps float64, changed bo
 		newQPS := math.Max(a.minQPS, a.qps*a.down)
 		if newConc != a.conc || newQPS != a.qps {
 			a.conc, a.qps = newConc, newQPS
-			changed = true
+			if apply != nil {
+				apply(a.conc, a.qps)
+			}
 		}
 	case ratio <= a.low && (a.conc < a.baseConc || a.qps < a.baseQPS):
 		// Восстановление: вверх с округлением к большему (ceil даёт рост
@@ -562,10 +569,11 @@ func (a *limitAdaptive) record(timedOut bool) (conc int, qps float64, changed bo
 		newQPS := math.Min(a.baseQPS, a.qps*a.up)
 		if newConc != a.conc || newQPS != a.qps {
 			a.conc, a.qps = newConc, newQPS
-			changed = true
+			if apply != nil {
+				apply(a.conc, a.qps)
+			}
 		}
 	}
-	return a.conc, a.qps, changed
 }
 
 // snapshot возвращает текущее состояние (Stats): эффективные и базовые
@@ -662,8 +670,9 @@ func (r *LimitResolver) Exchange(ctx context.Context, q Question) (*Result, erro
 	return res, err
 }
 
-// observe учитывает исход обмена: счётчики и адаптив; при изменении
-// эффективных лимитов применяет их к семафору и ведру.
+// observe учитывает исход обмена: счётчики и адаптив; изменившиеся
+// эффективные лимиты применяются к семафору и ведру под блокировкой
+// адаптива (см. limitAdaptive.record — DNS-11).
 func (r *LimitResolver) observe(err error) {
 	r.exchanges.Add(1)
 	timedOut := IsTimeout(err)
@@ -674,11 +683,10 @@ func (r *LimitResolver) observe(err error) {
 			r.errors.Add(1)
 		}
 	}
-	conc, qps, changed := r.adaptive.record(timedOut)
-	if changed {
+	r.adaptive.record(timedOut, func(conc int, qps float64) {
 		r.sem.setMax(conc)
 		r.bucket.setRate(qps)
-	}
+	})
 }
 
 // Stats возвращает снимок состояния (точки для мониторинга T-077:

@@ -751,6 +751,43 @@ func TestLimitResolverAdaptiveIgnoresOtherErrors(t *testing.T) {
 	}
 }
 
+// TestLimitAdaptiveAppliesUnderLock — применение изменившихся лимитов
+// происходит под мьютексом адаптива (DNS-11): параллельные наблюдения
+// окна не могут наложить устаревший больший лимит последним. Детектор —
+// TryLock из apply: под блокировкой записи он обязан отказывать.
+func TestLimitAdaptiveAppliesUnderLock(t *testing.T) {
+	a := newLimitAdaptive(LimitOptions{
+		Concurrency: 100, MaxQPS: 100, AdaptiveWindow: 2,
+		AdaptiveHighRatio: 0.5, AdaptiveLowRatio: 0.01,
+		AdaptiveDownFactor: 0.5, AdaptiveUpFactor: 1.25,
+		AdaptiveFloorDivisor: 100,
+	}.withDefaults())
+
+	applied, inLock := 0, true
+	apply := func(conc int, qps float64) {
+		applied++
+		if a.mu.TryLock() {
+			a.mu.Unlock()
+			inLock = false // применено вне блокировки адаптива
+		}
+	}
+
+	a.record(true, apply) // окно ещё не заполнено — изменений нет
+	if applied != 0 {
+		t.Fatalf("применений до заполнения окна: %d, want 0", applied)
+	}
+	a.record(true, apply) // окно заполнено таймаутами: снижение ×0.5
+	if applied != 1 {
+		t.Fatalf("применений: %d, want 1", applied)
+	}
+	if !inLock {
+		t.Fatal("лимиты применены вне блокировки адаптива")
+	}
+	if conc, _, _, _, _, _, _ := a.snapshot(); conc != 50 {
+		t.Fatalf("conc = %d, want 50 (первое снижение)", conc)
+	}
+}
+
 func TestLimitResolverAdaptiveShrinksLiveSemaphore(t *testing.T) {
 	// Снижение обязано действовать, а не только лежать в Stats: после
 	// урезки потолка к резолверу пробивается не больше нового потолка.
