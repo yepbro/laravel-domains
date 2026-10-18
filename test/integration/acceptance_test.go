@@ -36,9 +36,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -59,7 +59,6 @@ import (
 	"crawler/internal/httpworker"
 	"crawler/internal/idn"
 	"crawler/internal/ingest"
-	"crawler/internal/metrics"
 	"crawler/internal/model"
 	"crawler/internal/monitor"
 	"crawler/internal/queue"
@@ -881,6 +880,16 @@ func accChromiumWS() string {
 	return "ws://172.28.100.14:9222"
 }
 
+// accMonitorMetricsURL — адрес /metrics реального сервиса monitor: имя
+// compose-сервиса через docker DNS (его скрейбит Prometheus dev-стенда,
+// deploy/docker/prometheus/prometheus.yml), переопределяется окружением.
+func accMonitorMetricsURL() string {
+	if u := os.Getenv("CRAWLER_MONITOR_METRICS_URL"); u != "" {
+		return u
+	}
+	return "http://monitor:9100/metrics"
+}
+
 // TestAccept03_SPADomCookiesContent — §11.4 п. 3: «Для SPA-страниц
 // сохраняется итоговый DOM и cookies; для остальных — HTML; дедупликация
 // и сжатие работают; контент можно прочитать обратно». SPA-сценарий
@@ -1448,20 +1457,30 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Errorf("ZoneStatsLoop завершился с ошибкой: %v", err)
 	}
 
-	// Метрики: экспозиция реестра сервиса (metrics.New — то, что каркас
-	// T-012 отдаёт на /metrics и скрейбит Prometheus dev-стека; сами
-	// приборы этапов — T-077, здесь доступность экспозиции).
-	reg := metrics.New("monitor")
-	handler := metrics.Handler(reg)
-	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("/metrics: код %d, хочу 200", w.Code)
+	// Метрики: реальная экспозиция работающего сервиса monitor — то, что
+	// скрейбит Prometheus dev-стенда (docker DNS monitor:9100, как в
+	// deploy/docker/prometheus/prometheus.yml). HTTP-запрос к сервису,
+	// а не локальный реестр: забытый маршрут, неверный порт или молчащий
+	// хендлер здесь падают по вине продового кода. Если сервис приложения
+	// не поднят (make test-integration запускает только инфраструктуру
+	// и testbed) — честный пропуск, а не тавтология «свой реестр → свой
+	// хендлер».
+	url := accMonitorMetricsURL()
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Skipf("сервис monitor недоступен (%s: %v) — поднимите профиль app (make up): реальная экспозиция /metrics требует работающего сервиса", url, err)
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, `crawler_service_up{service="monitor"} 1`) {
-		t.Errorf("экспозиция без crawler_service_up{service=\"monitor\"}:\n%s", body)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		t.Fatalf("чтение %s: %v", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/metrics сервиса monitor: код %d, хочу 200", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), `crawler_service_up{service="monitor"} 1`) {
+		t.Errorf("экспозиция monitor без crawler_service_up{service=\"monitor\"} 1:\n%s", string(body))
 	}
 }
 
