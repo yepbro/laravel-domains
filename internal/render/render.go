@@ -49,9 +49,11 @@ import (
 
 // RenderTask — одна задача рендера: открыть страницу и снять результат.
 //
-// URL приходит из результата HTTP-этапа (сообщение q:render, T-066) и здесь
-// дополнительно не валидируется: формальный контроль входа — уровень
-// воркера, некорректный адрес отвергнёт сам браузер (chromedp.ErrPageLoad).
+// URL приходит из результата HTTP-этапа (сообщение q:render, T-066); схема
+// контролируется перед переходом (validateTaskURL): рендер открывает только
+// http/https, прочие адреса (file:, data:, ftp:) отвергаются классом task —
+// браузер открыл бы и локальный файл (R-09). Формальный контроль входа —
+// уровень воркера, остальное отвергает сам браузер (chromedp.ErrPageLoad).
 type RenderTask struct {
 	URL string
 }
@@ -203,6 +205,22 @@ func (o Options) validate() error {
 	}
 	if len(problems) > 0 {
 		return errors.New("render: " + strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// validateTaskURL — контроль схемы задачи рендера: открываются только
+// http/https. URL приходит из subdomain_results.final_url — в штатном
+// потоке это адрес из HTTP-редиректов, но при аномалии пайплайна или
+// компрометации БД он может нести file:///data: — браузер открыл бы
+// локальный файл, а съём DOM унёс бы его содержимое в хранилище контента
+// (R-09). Отказ — класс task: страница не рендерится, повторная доставка
+// уровня очереди (T-066).
+func validateTaskURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return &Error{Class: ClassTask, URL: raw,
+			Err: fmt.Errorf("рендер открывает только http/https, задано %q", raw)}
 	}
 	return nil
 }

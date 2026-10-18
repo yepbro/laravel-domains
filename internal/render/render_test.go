@@ -120,3 +120,30 @@ func TestOptionsValidate(t *testing.T) {
 		t.Fatalf("нулевой порог памяти должен быть допустим: %v", err)
 	}
 }
+
+// TestValidateTaskURL — схема задачи рендера (R-09): открываются только
+// http/https; file:/data: браузер принял бы, а съём DOM унёс бы содержимое
+// локального ресурса в хранилище контента.
+func TestValidateTaskURL(t *testing.T) {
+	for _, u := range []string{
+		"http://example.com/", "https://example.com/deep/path?q=1",
+		"https://spa.example:8443/",
+	} {
+		if err := validateTaskURL(u); err != nil {
+			t.Errorf("%s: неожиданная ошибка: %v", u, err)
+		}
+	}
+	for _, u := range []string{
+		"file:///etc/passwd", "data:text/html,<html>", "ftp://example.com/",
+		"chrome://version", "about:blank", "", "not a url", "/relative/path",
+	} {
+		err := validateTaskURL(u)
+		if err == nil {
+			t.Errorf("%s: ожидалась ошибка схемы", u)
+			continue
+		}
+		if ClassOf(err) != ClassTask {
+			t.Errorf("%s: класс %v, хочу task (повторная доставка уровня очереди)", u, ClassOf(err))
+		}
+	}
+}
