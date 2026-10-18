@@ -131,6 +131,13 @@ var (
 	subdomainsSelectSQL = "SELECT id, label, enabled FROM subdomains ORDER BY id"
 )
 
+// ErrSubdomainsEmpty — справочник subdomains пуст (сбой миграции/чистка):
+// состояние детерминировано, повторная доставка его не лечит — цикл
+// воркера подтверждает пачку с Warn (домены вернёт lease-проход
+// T-029/T-030 после починки справочника), а не крутит повторы до q:dead
+// (DNS-03).
+var ErrSubdomainsEmpty = errors.New("dnsworker: справочник subdomains пуст — нужен хотя бы апекс (ТЗ 5.10)")
+
 // EpisodeResult — решение DNS-эпизода одного домена: что писать в
 // domains и что публиковать в q:http (ТЗ 5.4 пп. 4–5, §7). Строится
 // чистой функцией DecideEpisode из результатов T-036/037/038.
@@ -427,7 +434,7 @@ func LoadSubdomains(ctx context.Context, pool db.DB) ([]model.Subdomain, error) 
 		return nil, fmt.Errorf("dnsworker: справочник субдоменов: %w", err)
 	}
 	if len(subs) == 0 {
-		return nil, errors.New("dnsworker: справочник subdomains пуст — нужен хотя бы апекс (ТЗ 5.10)")
+		return nil, ErrSubdomainsEmpty
 	}
 	return subs, nil
 }
@@ -649,6 +656,16 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 // Завершённые эпизоды идут в приборы met (T-077): счётчик задач этапа,
 // гистограмма длительностей (статусы терминальных веток считает
 // ProcessDomain после записи).
+//
+// Не ронывают доставку детерминированные состояния, которые повторная
+// доставка не лечит (DNS-03): пустой или целиком отключённый/кривой
+// справочник субдоменов — конфигурация, а не яд (пачка подтверждается с
+// Warn, домены вернёт lease-проход T-029/T-030 после починки справочника
+// — повторами до q:dead очередь замусоривалась бы каждой пачкой);
+// домен с пустым именем — мусорная строка (Warn по домену, строка
+// остаётся queued для разбора оператором). Транспортные сбои (БД/Redis)
+// и порченое сообщение (Decode) — по-прежнему ошибка без XACK: их
+// повторная доставка лечит (T-025).
 func processBatch(
 	ctx context.Context,
 	pool db.DB,
@@ -667,7 +684,26 @@ func processBatch(
 	}
 	subs, err := LoadSubdomains(ctx, pool)
 	if err != nil {
+		if errors.Is(err, ErrSubdomainsEmpty) {
+			log.Warn("справочник subdomains пуст — пачка q:dns подтверждена без обработки",
+				"entry", del.ID, "batch", len(batch.Domains), "err", err)
+			return nil
+		}
 		return err
+	}
+	enabled, err := filterEnabledSubdomains(subs)
+	if err != nil || len(enabled) == 0 {
+		// Кривые строки или все субдомены отключены (штатная операция
+		// crawlerctl subdomains disable) — конфигурация: повтор доставки
+		// не изменит исход.
+		if err != nil {
+			log.Warn("справочник subdomains некорректен — пачка q:dns подтверждена без обработки",
+				"entry", del.ID, "batch", len(batch.Domains), "err", err)
+		} else {
+			log.Warn("нет включённых субдоменов — пачка q:dns подтверждена без обработки",
+				"entry", del.ID, "batch", len(batch.Domains))
+		}
+		return nil
 	}
 	pending, err := PendingDomains(ctx, pool, batch.Domains)
 	if err != nil {
@@ -705,11 +741,20 @@ func processBatch(
 			defer func() { <-sem }()
 			start := time.Now()
 			err := ProcessDomain(ctx, pool, q, resolve, dom, subs, o.AskAAAA, met, log)
-			if err == nil {
+			switch {
+			case err == nil:
 				// Эпизод завершён — пропускная способность и
 				// длительность этапа (T-077, ТЗ 5.9).
 				met.Episode(time.Since(start))
-			} else {
+			case errors.Is(err, ErrEmptyDomain):
+				// Ядовитый домен: детерминированная ошибка, повтор
+				// доставки не изменит исход. Warn и продолжение:
+				// остальные домены пачки обрабатываются, доставка
+				// подтверждается; строка остаётся queued — lease-проход
+				// вернёт её после чистки мусора.
+				log.Warn("домен с пустым именем — пропущен без записи",
+					"entry", del.ID, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
+			default:
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = fmt.Errorf("домен %s: %w", dom.Name, err)

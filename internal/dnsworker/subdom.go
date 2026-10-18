@@ -156,30 +156,9 @@ func CheckSubdomains(
 	// Валидация входа до первого обмена: ошибки справочника — ошибка
 	// вызова, а не отдельных субдоменов (id вне 0..62 ломают DNSMask,
 	// кривые метки — вопрос с мусорным именем на каждый субдомен).
-	enabled := make([]model.Subdomain, 0, len(subs))
-	seenIDs := make(map[int]struct{}, len(subs))
-	seenLabels := make(map[string]struct{}, len(subs))
-	for _, s := range subs {
-		if !s.Enabled {
-			continue
-		}
-		if err := model.ValidateSubdomainID(int(s.ID)); err != nil {
-			return nil, fmt.Errorf("dnsworker: субдомен id %d: %w", s.ID, err)
-		}
-		// Метка — одна DNS-метка (как в конфиге T-006 и задаче q:http);
-		// punycode-метки (xn--…) проходят как обычные октеты.
-		if len(s.Label) > 63 || strings.ContainsAny(s.Label, ". ") {
-			return nil, fmt.Errorf("dnsworker: субдомен id %d: метка %q — одна DNS-метка до 63 октетов без точек и пробелов (пустая строка — апекс)", s.ID, s.Label)
-		}
-		if _, dup := seenIDs[int(s.ID)]; dup {
-			return nil, fmt.Errorf("dnsworker: субдомен id %d повторяется во входе", s.ID)
-		}
-		if _, dup := seenLabels[s.Label]; dup {
-			return nil, fmt.Errorf("dnsworker: метка субдомена %q повторяется во входе", s.Label)
-		}
-		seenIDs[int(s.ID)] = struct{}{}
-		seenLabels[s.Label] = struct{}{}
-		enabled = append(enabled, s)
+	enabled, err := filterEnabledSubdomains(subs)
+	if err != nil {
+		return nil, err
 	}
 	if len(enabled) == 0 {
 		return nil, errors.New("dnsworker: нет включённых субдоменов — проверять нечего")
@@ -208,6 +187,41 @@ func CheckSubdomains(
 		return nil, err
 	}
 	return report, nil
+}
+
+// filterEnabledSubdomains валидирует строки справочника и отбирает
+// включённые субдомены. Отдельная функция (а не тело CheckSubdomains):
+// детерминированный сбой справочника — id вне 0..62, кривые или
+// повторяющиеся метки, «включённых нет» — цикл воркера отличает от
+// транспортных сбоев: повторная доставку это не лечит, пачка
+// подтверждается с Warn, а не крутится в повторах (DNS-03).
+func filterEnabledSubdomains(subs []model.Subdomain) ([]model.Subdomain, error) {
+	enabled := make([]model.Subdomain, 0, len(subs))
+	seenIDs := make(map[int]struct{}, len(subs))
+	seenLabels := make(map[string]struct{}, len(subs))
+	for _, s := range subs {
+		if !s.Enabled {
+			continue
+		}
+		if err := model.ValidateSubdomainID(int(s.ID)); err != nil {
+			return nil, fmt.Errorf("dnsworker: субдомен id %d: %w", s.ID, err)
+		}
+		// Метка — одна DNS-метка (как в конфиге T-006 и задаче q:http);
+		// punycode-метки (xn--…) проходят как обычные октеты.
+		if len(s.Label) > 63 || strings.ContainsAny(s.Label, ". ") {
+			return nil, fmt.Errorf("dnsworker: субдомен id %d: метка %q — одна DNS-метка до 63 октетов без точек и пробелов (пустая строка — апекс)", s.ID, s.Label)
+		}
+		if _, dup := seenIDs[int(s.ID)]; dup {
+			return nil, fmt.Errorf("dnsworker: субдомен id %d повторяется во входе", s.ID)
+		}
+		if _, dup := seenLabels[s.Label]; dup {
+			return nil, fmt.Errorf("dnsworker: метка субдомена %q повторяется во входе", s.Label)
+		}
+		seenIDs[int(s.ID)] = struct{}{}
+		seenLabels[s.Label] = struct{}{}
+		enabled = append(enabled, s)
+	}
+	return enabled, nil
 }
 
 // subdomCheckOne проверяет одно имя (полное имя субдомена): фаза A с

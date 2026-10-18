@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
@@ -1267,8 +1268,8 @@ func TestResultLoadSubdomains(t *testing.T) {
 	t.Run("пустой справочник — ошибка", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}}
 		_, err := LoadSubdomains(context.Background(), pool)
-		if err == nil || !strings.Contains(err.Error(), "справочник subdomains пуст") {
-			t.Fatalf("ошибка = %v, want «справочник subdomains пуст»", err)
+		if err == nil || !errors.Is(err, ErrSubdomainsEmpty) {
+			t.Fatalf("ошибка = %v, want ErrSubdomainsEmpty", err)
 		}
 	})
 
@@ -1310,6 +1311,77 @@ func TestResultRunValidation(t *testing.T) {
 	if err := Run(context.Background(), &resultFakePool{j: &resultJournal{}}, &resultFakeQueue{j: &resultJournal{}}, nil, opts); err == nil ||
 		!strings.Contains(err.Error(), "резолвер не задан") {
 		t.Fatalf("ошибка = %v, want «резолвер не задан»", err)
+	}
+}
+
+// --- детерминированные состояния пачки (DNS-03) ----------------------------
+
+// TestResultProcessBatchDictStates — пустой, целиком отключённый или
+// кривой справочник subdomains — конфигурация, а не яд: пачка
+// подтверждается без эпизодов, повторная доставка её не крутит.
+func TestResultProcessBatchDictStates(t *testing.T) {
+	dom := queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}
+	cases := []struct {
+		name string
+		subs []model.Subdomain
+	}{
+		{"пустой справочник", nil},
+		{"все субдомены отключены", []model.Subdomain{
+			{ID: 0, Label: "", Enabled: false},
+			{ID: 1, Label: "www", Enabled: false},
+		}},
+		{"кривая строка справочника", []model.Subdomain{
+			{ID: 0, Label: "", Enabled: true},
+			{ID: 99, Label: "bad", Enabled: true}, // id вне 0..62
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			j := &resultJournal{}
+			pool := &resultFakePool{j: j, subdomains: tc.subs}
+			q := &resultFakeQueue{j: j}
+			resolve := resultNewResolver()
+			err := processBatch(context.Background(), pool, q, resolve,
+				resultDelivery("9-1", "task-9", dom), Options{Concurrency: 1},
+				nil, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("processBatch = %v, want nil (пачка подтверждается с Warn)", err)
+			}
+			if got := len(resolve.resultCalls()); got != 0 {
+				t.Errorf("обменов %d, want 0 (эпизоды не стартуют)", got)
+			}
+			if n := j.count(resultEvExec) + j.count(resultEvPublish); n != 0 {
+				t.Errorf("записей+публикаций = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestResultProcessBatchPoisonDomain — домен с пустым именем
+// (детерминированная ошибка эпизода) не роняет пачку: Warn и пропуск —
+// строка остаётся queued, остальные домены обрабатываются, доставка
+// подтверждается.
+func TestResultProcessBatchPoisonDomain(t *testing.T) {
+	j := &resultJournal{}
+	pool := &resultFakePool{j: j, subdomains: resultSubs()}
+	q := &resultFakeQueue{j: j}
+	resolve := resultNewResolver()
+	resultSetDelegated(resolve, "example.com")
+
+	err := processBatch(context.Background(), pool, q, resolve,
+		resultDelivery("9-2", "task-10",
+			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"},
+			queue.DNSDomain{ZoneID: 3, DomainID: 12, Name: "   "}),
+		Options{Concurrency: 2}, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("processBatch = %v, want nil (ядовитый домен не роняет пачку)", err)
+	}
+	execs := pool.resultPoolExecs()
+	if len(execs) != 1 || execs[0].args[1].(int64) != 11 {
+		t.Fatalf("записи = %+v, want одна — только здоровый домен", execs)
+	}
+	if got := len(resolve.resultCalls()); got == 0 {
+		t.Fatal("здоровый домен не обработан")
 	}
 }
 
