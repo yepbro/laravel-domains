@@ -23,6 +23,14 @@ PG_DB          ?= $(shell sed -n 's/^POSTGRES_DB=\(.*\)/\1/p' .env 2>/dev/null)
 
 BUILD_ARGS := --build-arg GO_VERSION=$(GO_VERSION) --build-arg ALPINE_VERSION=$(ALPINE_VERSION)
 
+# Версия/ревизия боевых образов для метрик crawler_build_info (T-111):
+# .git исключён .dockerignore, значения вычисляются на вызывающей машине
+# и передаются build-аргами (ARG BUILD_VERSION/BUILD_REVISION в Dockerfile);
+# без git (или вне репозитория) — graceful fallback unknown.
+BUILD_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
+BUILD_REVISION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+VERSION_ARGS := --build-arg BUILD_VERSION=$(BUILD_VERSION) --build-arg BUILD_REVISION=$(BUILD_REVISION)
+
 .DEFAULT_GOAL := help
 
 define check_env
@@ -104,9 +112,9 @@ warm-cache: ## Прогреть общий кэш сборки Go (одна ко
 .PHONY: build-runtime
 build-runtime: ## Собрать боевые образы (runtime + render) для проверки
 	$(check_env)
-	docker build $(BUILD_ARGS) -f deploy/docker/Dockerfile.go \
+	docker build $(BUILD_ARGS) $(VERSION_ARGS) -f deploy/docker/Dockerfile.go \
 		--target runtime -t crawler/runtime:check .
-	docker build $(BUILD_ARGS) -f deploy/docker/Dockerfile.render \
+	docker build $(BUILD_ARGS) $(VERSION_ARGS) -f deploy/docker/Dockerfile.render \
 		--target render -t crawler/render:check .
 
 GO_PKGS := ./cmd/... ./internal/... ./migrations/... ./test/... ./deploy/postgres

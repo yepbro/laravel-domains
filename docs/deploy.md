@@ -172,16 +172,26 @@ T-087 (≤ 512M, под потолком MemoryMax).
 "-s -w"`. На машине с Go (или в контейнере tools: `make shell`):
 
 ```bash
+version="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+revision="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+mkdir -p out
 for svc in ingest scheduler dns-worker http-worker render-worker analyzer monitor crawlerctl; do
     CGO_ENABLED=0 go build -trimpath \
-      -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod" \
+      -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod -X crawler/internal/metrics.buildVersion=$version -X crawler/internal/metrics.buildRevision=$revision" \
       -o "out/$svc" "./cmd/$svc"
 done
 sudo install -D -t /opt/crawler/bin out/*
 ```
 
 `buildMode=prod` помечает боевые сборки в метрике `crawler_build_info`
-(метка `mode`); dev-сборки без `-X` остаются на `dev-stub`.
+(метка `mode`); `buildVersion`/`buildRevision` (T-111) вычисляются из git —
+`version` = `git describe --tags --always --dirty` (тег либо хеш с пометкой
+несохранённых правок), `revision` = короткий хеш коммита; при недоступном
+git подставляется `unknown`. Dev-сборки без `-X` остаются на `dev-stub` /
+`dev` / пустой `revision`. В Docker-сборке значения передаются build-аргами
+`BUILD_VERSION`/`BUILD_REVISION`: `.git` исключён из контекста
+(`.dockerignore`), значения вычисляет вызывающая сторона — так делает
+`make build-runtime`; прямая `docker build` без арок получает `unknown`.
 
 Миграции схем зашиты в бинарники (`migrations/embed.go`, golang-migrate).
 

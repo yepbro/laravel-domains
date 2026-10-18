@@ -45,13 +45,20 @@ ENV PATH="/go/bin:${PATH}" \
 
 # --------------------------------------------------------------------------
 FROM base AS build
+# Версия/ревизия для crawler_build_info (T-111): .git исключён из контекста
+# сборки (.dockerignore), поэтому значения вычисляет вызывающая сторона
+# (make build-runtime) и передаёт build-аргами; прямая сборка docker build
+# без арок получает unknown.
+ARG BUILD_VERSION=unknown
+ARG BUILD_REVISION=unknown
 COPY . .
 # Статические бинарники всех сервисов (ТЗ 6.1: CGO_ENABLED=0, -trimpath, -ldflags).
 # buildMode=prod честно помечает боевые сборки в crawler_build_info
-# (dev без -X остаётся dev-stub).
+# (dev без -X остаётся dev-stub); buildVersion/buildRevision — git-тег/хеш
+# сборки (T-111).
 RUN set -eux; \
     for cmd in ingest scheduler dns-worker http-worker render-worker analyzer monitor crawlerctl mockserver testbedgen; do \
-        CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod" -o /out/$cmd ./cmd/$cmd; \
+        CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod -X crawler/internal/metrics.buildVersion=${BUILD_VERSION} -X crawler/internal/metrics.buildRevision=${BUILD_REVISION}" -o /out/$cmd ./cmd/$cmd; \
     done
 
 # --------------------------------------------------------------------------

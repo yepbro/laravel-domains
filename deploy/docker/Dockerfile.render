@@ -25,8 +25,14 @@ ENV GOFLAGS=-mod=readonly \
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
+# Версия/ревизия для crawler_build_info (T-111) — как в Dockerfile.go:
+# передаются build-аргами вызывающей стороной (.git вне контекста сборки),
+# без арок — unknown. ARG объявлен у первого использования (COPY . .),
+# после кэшируемого слоя go mod download.
+ARG BUILD_VERSION=unknown
+ARG BUILD_REVISION=unknown
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod" -o /out/render-worker ./cmd/render-worker
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod -X crawler/internal/metrics.buildVersion=${BUILD_VERSION} -X crawler/internal/metrics.buildRevision=${BUILD_REVISION}" -o /out/render-worker ./cmd/render-worker
 
 FROM ${CHROMEDP_HEADLESS_IMAGE} AS render
 COPY --from=build /out/render-worker /usr/local/bin/render-worker

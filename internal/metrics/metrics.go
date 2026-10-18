@@ -66,6 +66,29 @@ const (
 // разработки, значение по умолчанию сохранено, чтобы не ломать dev.
 var buildMode = "dev-stub"
 
+// buildVersion/buildRevision — значения меток version/revision метрики
+// crawler_build_info (T-111). Инъекцируются линковщиком тем же способом,
+// что и buildMode:
+//
+//	go build -ldflags "-X crawler/internal/metrics.buildVersion=v1.2.0 \
+//	   -X crawler/internal/metrics.buildRevision=abc1234"
+//
+// Источник — git сборки: buildVersion = git describe --tags --always
+// --dirty (тег либо хеш, с пометкой несохранённых правок), buildRevision
+// = git rev-parse --short HEAD. Контекст Docker-сборки не содержит .git
+// (.dockerignore), поэтому значения вычисляет вызывающая сторона и
+// передаёт build-аргами (make build-runtime, ARG BUILD_VERSION/
+// BUILD_REVISION в Dockerfile); при недоступном git — unknown.
+//
+// Без инъекции — dev-сборка: version=dev, revision пуста. Набор имён меток
+// метрики одинаков для dev и prod (дашборды не зависят от способа сборки);
+// пустое значение метки в PromQL эквивалентно её отсутствию, поэтому
+// dev-сборки не плодят лишнее значение в группировках по revision.
+var (
+	buildVersion  = "dev"
+	buildRevision = ""
+)
+
 // Значения метки LabelStage — этапы конвейера (ТЗ 4.2, §7). Единые
 // значения фиксируются здесь, чтобы метрики всех сервисов агрегировались
 // в PromQL без нормализации.
@@ -112,9 +135,9 @@ func New(name string) *Registry {
 
 	build := reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_build_info",
-		Help: "Информация о сборке: mode — режим сборки (dev-stub — dev/тесты, prod — боевые сборки через -ldflags -X).",
-	}, "mode")
-	build.WithLabelValues(buildMode).Set(1)
+		Help: "Информация о сборке: mode — режим (dev-stub — dev/тесты, prod — боевые сборки через -ldflags -X), version — версия из git describe (dev — без инъекции), revision — короткий хеш коммита (пусто — без инъекции, в PromQL метка отсутствует).",
+	}, "mode", "version", "revision")
+	build.WithLabelValues(buildMode, buildVersion, buildRevision).Set(1)
 
 	return reg
 }

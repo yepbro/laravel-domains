@@ -53,7 +53,7 @@ func TestHandler(t *testing.T) {
 	text := string(body)
 	for _, want := range []string{
 		`crawler_service_up{service="test-service"} 1`,
-		`crawler_build_info{mode="dev-stub",service="test-service"} 1`,
+		`crawler_build_info{mode="dev-stub",revision="",service="test-service",version="dev"} 1`,
 		`go_goroutines`, // коллектор Go/runtime
 	} {
 		if !strings.Contains(text, want) {
@@ -62,15 +62,32 @@ func TestHandler(t *testing.T) {
 	}
 }
 
-// buildMode — точка инъекции ldflags: подмена переменной меняет метку
-// crawler_build_info (боевая сборка -X ...buildMode=prod).
+// buildMode/buildVersion/buildRevision — точки инъекции ldflags: подмена
+// переменных меняет метки crawler_build_info (боевая сборка -X
+// ...buildMode=prod, см. TestBuildInfoVersionRevision).
 func TestBuildInfoMode(t *testing.T) {
 	prev := buildMode
 	buildMode = "prod"
 	defer func() { buildMode = prev }()
 
-	if text := scrape(t, New("svc")); !strings.Contains(text, `crawler_build_info{mode="prod",service="svc"} 1`) {
+	if text := scrape(t, New("svc")); !strings.Contains(text, `crawler_build_info{mode="prod",revision="",service="svc",version="dev"} 1`) {
 		t.Errorf("в /metrics нет crawler_build_info с инъекцированным mode:\n%s", text)
+	}
+}
+
+// Боевая сборка инъекцирует и version, и revision (git describe и короткий
+// хеш коммита): все три метки попадают в экспозицию; набор имён меток тот
+// же, что и у dev-сборки, — значения подменяются на месте.
+func TestBuildInfoVersionRevision(t *testing.T) {
+	prevV, prevR := buildVersion, buildRevision
+	buildVersion = "v1.2.3-4-gabc1234-dirty"
+	buildRevision = "abc1234"
+	defer func() { buildVersion, buildRevision = prevV, prevR }()
+
+	if text := scrape(t, New("svc")); !strings.Contains(text,
+		`crawler_build_info{mode="dev-stub",revision="abc1234",service="svc",version="v1.2.3-4-gabc1234-dirty"} 1`,
+	) {
+		t.Errorf("в /metrics нет crawler_build_info с инъекцированными version/revision:\n%s", text)
 	}
 }
 
