@@ -90,10 +90,12 @@ func (p *leaseFakePool) calls() []leaseCall {
 const wantLeaseUpdate = "UPDATE domains AS d " +
 	"SET check_state = $1, queued_at = NULL " +
 	"FROM (SELECT zone_id, id FROM domains " +
-	"WHERE check_state = $2 AND status <> $3 AND queued_at < $4 " +
-	"ORDER BY zone_id, id LIMIT $5) AS b " +
+	"WHERE check_state = $2 AND status <> $3 " +
+	"AND queued_at < COALESCE($4::timestamptz, now()) - make_interval(secs => $5) " +
+	"ORDER BY zone_id, id LIMIT $6) AS b " +
 	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3 AND d.queued_at < $4"
+	"AND d.check_state = $2 AND d.status <> $3 " +
+	"AND d.queued_at < COALESCE($4::timestamptz, now()) - make_interval(secs => $5)"
 
 // leaseFixedClock — часы с фиксированным «сейчас» (порог прохода
 // воспроизводим до наносекунды).
@@ -106,7 +108,8 @@ func leaseFixedClock() (time.Time, func() time.Time) {
 
 // TestLeaseOnceSQL — один оператор UPDATE с точными параметрами:
 // целевое состояние pending со сбросом queued_at, отбор queued/не-deleted
-// по возрасту аренды, граница now() − lease и размер пачки.
+// по возрасту аренды; порог считает сервер БД (NULL «сейчас» — только
+// тесты подставляют часы), срок — секунды make_interval, размер пачки.
 func TestLeaseOnceSQL(t *testing.T) {
 	now, clock := leaseFixedClock()
 	pool := &leaseFakePool{tags: []int64{42}}
@@ -131,7 +134,8 @@ func TestLeaseOnceSQL(t *testing.T) {
 		int16(model.CheckStatePending), // SET check_state
 		int16(model.CheckStateQueued),  // отбор: в аренде
 		int16(model.StatusDeleted),     // отбор: удалённые вне цикла
-		now.Add(-15 * time.Minute),     // граница now() − lease
+		&now,                           // «сейчас» тестовых часов (в бою NULL → now() БД)
+		(15 * time.Minute).Seconds(),   // срок аренды — make_interval
 		8000,                           // LIMIT пачки
 	}
 	if !reflect.DeepEqual(calls[0].args, wantArgs) {
@@ -142,8 +146,26 @@ func TestLeaseOnceSQL(t *testing.T) {
 	}
 }
 
+// TestLeaseOnceClockIsServer — без тестовых часов «сейчас» не передаётся
+// вовсе (NULL): порог считает now() сервера БД, а не часы процесса
+// планировщика (S-02).
+func TestLeaseOnceClockIsServer(t *testing.T) {
+	pool := &leaseFakePool{}
+	if _, err := LeaseOnce(context.Background(), pool, LeaseOptions{}); err != nil {
+		t.Fatalf("LeaseOnce: %v", err)
+	}
+	args := pool.calls()[0].args
+	if got, ok := args[3].(*time.Time); !ok || got != nil {
+		t.Errorf("«сейчас» = %v (%T), want nil *time.Time — часы сервера БД", args[3], args[3])
+	}
+	if got, ok := args[4].(float64); !ok || got != (30*time.Minute).Seconds() {
+		t.Errorf("срок = %v, want %v секунд дефолта", args[4], (30 * time.Minute).Seconds())
+	}
+}
+
 // TestLeaseOnceDefaults — нулевые опции: срок аренды и пачка — дефолты
-// (30 минут по ТЗ 5.3), часы — фиксированные: порог считается точно.
+// (30 минут по ТЗ 5.3), часы фиксированные: «сейчас» и срок уходят в SQL
+// параметрами.
 func TestLeaseOnceDefaults(t *testing.T) {
 	now, clock := leaseFixedClock()
 	pool := &leaseFakePool{}
@@ -153,11 +175,14 @@ func TestLeaseOnceDefaults(t *testing.T) {
 	}
 
 	args := pool.calls()[0].args
-	if args[4] != DefaultLeaseBatch {
-		t.Errorf("LIMIT = %v, want дефолт %d", args[4], DefaultLeaseBatch)
+	if args[5] != DefaultLeaseBatch {
+		t.Errorf("LIMIT = %v, want дефолт %d", args[5], DefaultLeaseBatch)
 	}
-	if got, ok := args[3].(time.Time); !ok || !got.Equal(now.Add(-DefaultLeaseTimeout)) {
-		t.Errorf("порог = %v, want %v (now − дефолт %s)", args[3], now.Add(-DefaultLeaseTimeout), DefaultLeaseTimeout)
+	if got, ok := args[3].(*time.Time); !ok || !got.Equal(now) {
+		t.Errorf("«сейчас» = %v, want фиксированные часы %v", args[3], now)
+	}
+	if got, ok := args[4].(float64); !ok || got != DefaultLeaseTimeout.Seconds() {
+		t.Errorf("срок = %v, want дефолт %s в секундах", args[4], DefaultLeaseTimeout)
 	}
 }
 

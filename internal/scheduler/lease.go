@@ -73,13 +73,24 @@ const (
 // (совпадает с PK, ТЗ 6.1) даёт детерминированные пачки. Внешний WHERE
 // перепроверяет отбор на момент блокировки строки (гонки с воркерами и
 // вторым проходом).
+//
+// Порог аренды считается часами СЕРВЕРА БД: queued_at пишется серверным
+// now() (enqueueUpdate), расхождение часов процесса планировщика с часами
+// БД вперёд больше срока аренды возвращало бы в pending только что
+// поставленные домены (дубли работы), назад — задерживало возврат.
+// now() подставляется параметром только в тестах (фиксированные часы
+// LeaseOptions.Now); в бою параметр NULL — COALESCE берёт now() сервера.
+// Срок передан секундами через make_interval — интервал в одной точке
+// правды, без клиентской арифметики timestamp.
 const leaseUpdateSQL = "UPDATE domains AS d " +
 	"SET check_state = $1, queued_at = NULL " +
 	"FROM (SELECT zone_id, id FROM domains " +
-	"WHERE check_state = $2 AND status <> $3 AND queued_at < $4 " +
-	"ORDER BY zone_id, id LIMIT $5) AS b " +
+	"WHERE check_state = $2 AND status <> $3 " +
+	"AND queued_at < COALESCE($4::timestamptz, now()) - make_interval(secs => $5) " +
+	"ORDER BY zone_id, id LIMIT $6) AS b " +
 	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3 AND d.queued_at < $4"
+	"AND d.check_state = $2 AND d.status <> $3 " +
+	"AND d.queued_at < COALESCE($4::timestamptz, now()) - make_interval(secs => $5)"
 
 // LeaseOptions — параметры возврата; нулевые значения заменяются
 // дефолтами (withDefaults, стиль RecheckOptions/ingest.CleanupOptions).
@@ -94,8 +105,9 @@ type LeaseOptions struct {
 	// Ноль/отрицательное — Timeout/2 (см. DefaultLeaseInterval-комментарий
 	// в LeaseWatch).
 	Interval time.Duration
-	// Now — источник времени для порога now() − Timeout; nil — time.Now.
-	// Тесты подставляют фиксированные часы (стиль T-013/T-030).
+	// Now — фиксированные часы для тестов: подставляются в SQL параметром
+	// вместо now() сервера (nil в бою — порог считают часы БД,
+	// см. leaseUpdateSQL).
 	Now func() time.Time
 	// Log — логгер цикла LeaseWatch; nil — записи подавлены
 	// (slog.DiscardHandler). LeaseOnce не логирует — итог возвращается
@@ -133,25 +145,29 @@ type LeaseResult struct {
 // LeaseOnce выполняет один проход (ТЗ 5.3): до opts.BatchSize доменов
 // со check_state = queued и queued_at старше opts.Timeout (не deleted,
 // без результата) переводятся в check_state = pending одним оператором —
-// отметка аренды сбрасывается, остальные колонки не меняются. Повторный
-// проход безопасен (ТЗ 3.4): переведённые строки подзапрос больше не
-// выбирает.
+// отметка аренды сбрасывается, остальные колонки не меняются. Порог
+// считает сервер БД (see leaseUpdateSQL); повторный проход безопасен
+// (ТЗ 3.4): переведённые строки подзапрос больше не выбирает.
 func LeaseOnce(ctx context.Context, pool db.DB, opts LeaseOptions) (LeaseResult, error) {
 	if pool == nil {
 		return LeaseResult{}, errors.New("scheduler: возврат истёкших lease: пул не задан")
 	}
 	o := opts.withDefaults()
-	now := time.Now
+
+	// Часы процесса — только для тестов (фиксированное «сейчас»); в бою
+	// NULL — единственные часы это now() сервера БД.
+	var now *time.Time
 	if o.Now != nil {
-		now = o.Now
+		t := o.Now()
+		now = &t
 	}
-	cutoff := now().Add(-o.Timeout)
 
 	tag, err := pool.Exec(ctx, leaseUpdateSQL,
 		int16(model.CheckStatePending),
 		int16(model.CheckStateQueued),
 		int16(model.StatusDeleted),
-		cutoff,
+		now,
+		o.Timeout.Seconds(),
 		o.BatchSize,
 	)
 	if err != nil {
