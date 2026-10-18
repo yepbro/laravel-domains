@@ -213,6 +213,12 @@ cp -r rules /etc/crawler/rules                    # правила Laravel дл�
 - `postgres.dsn`, `redis.addr` — заменить примеры на локальные значения
   (или оставить как есть и задать точные в `crawler.env` — переменные
   окружения важнее YAML, docs/configuration.md);
+- `postgres.pool_size` — на один сервис, а бюджет ТЗ §6.3 (20–50) —
+  суммарный на все: значение примера (5) даёт 7 × 5 + `crawlerctl` (2) +
+  админ ≈ 40–45 при `max_connections=50` (3 слота резервирует
+  `superuser_reserved_connections`). Менять — только с пересчётом суммы;
+  сразу всем сервисам — `CRAWLER_POSTGRES_POOL_SIZE` в `crawler.env`
+  (docs/db.md, «Бюджет соединений»);
 - `ingest.dir: /var/lib/crawler/incoming`, `content.dir:
   /var/lib/crawler/content`, `content.zstd_dictionary:
   /var/lib/crawler/content/dict.zst`, `analyzer.rules_dir: /etc/crawler/rules`;
