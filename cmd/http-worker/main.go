@@ -133,11 +133,18 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}
 	defer func() { _ = store.Close() }()
 
+	// Фоновые циклы сервиса (наблюдатель диска, коллектор длин очередей,
+	// проход доработки рендера) живут до отмены ctx; их результаты
+	// забираются в bg после главного цикла — до defer-закрытий store,
+	// rdb и транспорта ниже (стиль cmd/scheduler): незаджойненная
+	// горутина могла трогать закрытые PackStore/Redis/Fetcher.
+	bg := make(chan error, 3)
+
 	// Контроль свободного места каталога контента (T-046, ТЗ 8):
 	// периодический наблюдатель горутиной (не зависит от цикла задач),
 	// Warn и событие при входе в паузу записи/восстановлении; завершается
 	// с отменой ctx.
-	go func() { _ = content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger}) }()
+	go func() { bg <- content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger}) }()
 
 	saver, err := httpworker.NewContentSaver(store, logger)
 	if err != nil {
@@ -170,7 +177,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// Длина потребляемого стрима q:http → crawler_queue_depth (T-077):
 	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
 	go func() {
-		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
+		bg <- metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamHTTP}, metrics.DefaultQueueCollectInterval, logger)
 	}()
 
@@ -186,7 +193,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// T-020/T-021): не зависит от цикла задач q:http, завершается
 	// отменой ctx.
 	go func() {
-		_ = httpworker.RequeueRenderPending(ctx, pool, store, renderQ, httpworker.RequeueOptions{Log: logger})
+		bg <- httpworker.RequeueRenderPending(ctx, pool, store, renderQ, httpworker.RequeueOptions{Log: logger})
 	}()
 
 	opts2 := httpworker.Options{
@@ -211,5 +218,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 
-	return httpworker.Run(ctx, q, w, opts2)
+	err = httpworker.Run(ctx, q, w, opts2)
+	// Главный цикл завершён отменой ctx — фоновые циклы видят ту же
+	// отмену и заканчиваются сами; дождаться их до defer-закрытий
+	// store/rdb/соединений транспорта (гонка времени жизни ресурсов).
+	<-bg
+	<-bg
+	<-bg
+	return err
 }
