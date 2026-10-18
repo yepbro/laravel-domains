@@ -726,6 +726,11 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		t.Error("цикл воркера не остановился после отмены ctx")
 	}
 
+	// Проверки после отмены — на собственном контексте: ctx теста
+	// уже отменен, его использование отдавало «context canceled».
+	postCtx, postCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer postCancel()
+
 	// Запись пометки сняла бит: flags больше не несёт http_published,
 	// статус/maska записаны честно (итог за HTTP-этапом — new).
 	for i, label := range labels {
@@ -734,7 +739,7 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 			flags  int16
 			mask   int64
 		)
-		if err := pool.QueryRow(ctx,
+		if err := pool.QueryRow(postCtx,
 			"SELECT status, flags, dns_mask FROM domains WHERE id = $1", ids[i],
 		).Scan(&status, &flags, &mask); err != nil {
 			t.Fatalf("домен %s: %v", label, err)
