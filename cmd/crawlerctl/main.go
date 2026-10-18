@@ -214,3 +214,16 @@ func flagTakesValue(fs *flag.FlagSet, a string) bool {
 	bf, ok := f.Value.(boolFlag)
 	return !ok || !bf.IsBoolFlag()
 }
+
+// flagExplicit — задан ли флаг явно в командной строке (fs.Visit обходит
+// только флаги, разобранные Parse). Различает «передали» и «дефолт» —
+// дефолт можно дополнить источником из конфигурации (test-rules).
+func flagExplicit(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
