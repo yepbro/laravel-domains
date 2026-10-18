@@ -9,6 +9,7 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -410,6 +411,59 @@ func TestPipelineDuplicate(t *testing.T) {
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/list.txt")) {
 		t.Error("дубль не перемещён в processed/")
+	}
+}
+
+// TestPipelineDuplicateCrossActionWarn — дубль по sha256 с другой
+// операцией (тот же список положили в delete/ после add/) по контракту
+// идемпотентности по содержимому не применяется (docs/incoming-files.md
+// §5; глобальный UNIQUE sha256 — docs/schema.md; приёмочный кейс 63da59c
+// «дубль sha256 delete-файла легитимен») — контракт не меняется, но
+// оператору подсвечивается Warn (ING-P2-5, неконтрактная часть).
+func TestPipelineDuplicateCrossActionWarn(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "example.com\n"
+	abs := pt.addFile(t, "com/add/list.txt", content)
+	sha := sha256.Sum256([]byte(content))
+	action := model.ActionDelete
+	path := "com/delete/list.txt"
+	processed := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	pt.files = newFakeFileStore(model.IngestFile{
+		ID: 7, Action: &action, Path: &path,
+		SHA256: sha[:], ProcessedAt: &processed,
+	})
+
+	var buf bytes.Buffer
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir:       pt.dir,
+		BatchSize: 10,
+		Log:       slog.New(slog.NewTextHandler(&buf, nil)),
+		Now:       func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.Kind != OutcomeDuplicate {
+		t.Fatalf("итог = %s, want duplicate (контракт дедупа не меняется)", out.Kind)
+	}
+	if len(pt.files.records) != 0 {
+		t.Error("дубль не должен писать второй отчёт")
+	}
+	log := buf.String()
+	for _, want := range []string{
+		"дубль по sha256 с другой операцией или зоной",
+		"action=add",
+		"first_action=delete",
+		"first_path=com/delete/list.txt",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("лог = %q, want запись с %q", log, want)
+		}
 	}
 }
 

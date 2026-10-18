@@ -238,6 +238,20 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		if derr := p.clearBatch(ctx, id); derr != nil {
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
+		// Дубль с другой операцией/зоной — по контракту идемпотентности
+		// по содержимому (docs/incoming-files.md §5: уникальный sha256,
+		// docs/schema.md) файл всё равно не применяется (в т.ч. «тот же
+		// список в delete/ после add/», 63da59c). Это может быть
+		// неожиданностью для оператора — подсвечиваем Warn (ING-P2-5).
+		if (known.Action != nil && *known.Action != f.Action) ||
+			(known.ZoneID != nil && *known.ZoneID != z.ID) {
+			p.log.Warn("дубль по sha256 с другой операцией или зоной — не применяется (идемпотентность по содержимому)",
+				"path", f.Path, "action", f.Action.String(), "zone_id", z.ID,
+				"first_path", derefString(known.Path),
+				"first_action", derefAction(known.Action),
+				"first_zone_id", derefInt16(known.ZoneID),
+				"first_processed_at", derefTime(known.ProcessedAt))
+		}
 		if _, merr := p.moveFile(DirProcessed, f.Path, abs); merr != nil {
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: merr}
 		}
@@ -496,4 +510,20 @@ func derefTime(t *time.Time) time.Time {
 		return time.Time{}
 	}
 	return *t
+}
+
+// derefAction — значение NULL-колонки журнала для лога (пустое имя).
+func derefAction(a *model.Action) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
+}
+
+// derefInt16 — значение NULL-колонки журнала для лога (ноль).
+func derefInt16(v *int16) int16 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
