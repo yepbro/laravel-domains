@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -93,8 +94,15 @@ type Options struct {
 }
 
 // errForcedExit — повторный сигнал завершения во время graceful shutdown:
-// Run завершает процесс немедленно, не дожидаясь OnRun и очистки ресурсов.
+// Run возвращает её вызывающему немедленно, не дожидаясь OnRun и очистки
+// ресурсов (HTTP-сервер метрик, пул) — main выходит с кодом 1, как и для
+// любой ошибки Run.
 var errForcedExit = errors.New("повторный сигнал завершения")
+
+// migrateUp — применение миграций при старте (internal/migrate.Up);
+// перемененная для подмены в тестах жизненного цикла (шов в духе
+// lockTimeout/connectTimeout в internal/migrate).
+var migrateUp = migrate.Up
 
 // newRegistry — реестр метрик сервиса: Options.Metrics, если main создал
 // его сам (приборы рабочей логики строятся до старта OnRun, T-077), иначе
@@ -124,8 +132,14 @@ func EnvOr(key, defaultVal string) string {
 //		os.Exit(1)
 //	}
 //
-// Повторный сигнал завершения во время graceful shutdown — немедленный
-// os.Exit(1) без ожидания OnRun.
+// Сигнал завершения во время применения миграций не убивает процесс
+// посреди миграции (иначе схема осталась бы dirty для всех сервисов):
+// отменяются только фазы ожидания, применяющаяся миграция дорабатывает,
+// затем сервис останавливается штатно (Run возвращает nil).
+//
+// Повторный сигнал завершения во время graceful shutdown — Run немедленно
+// возвращает ошибку принудительного выхода без ожидания OnRun и очистки
+// ресурсов; main выходит с кодом 1, как и для любой ошибки Run.
 func Run(opts Options) error {
 	if opts.Name == "" {
 		return errors.New("service: имя сервиса обязательно")
@@ -143,6 +157,22 @@ func Run(opts Options) error {
 	// через slog.Default пишут с контекстом имени.
 	slog.SetDefault(opts.Logger)
 
+	// Обработчики сигналов ставятся ДО миграций: дефолтная реакция на
+	// SIGTERM/SIGINT убила бы процесс посреди применения миграции, а
+	// golang-migrate помечает версию dirty до выполнения файла и снимает
+	// флаг только после успеха — следующий старт ВСЕХ сервисов упал бы
+	// на migrate.ErrDirty до ручного TRUNCATE schema_migrations. Сигнал
+	// во время миграций отменяет только фазы ожидания (подключение к БД,
+	// advisory-блокировка); применяющаяся миграция дорабатывает
+	// (golang-migrate не принимает контекст), затем сервис
+	// останавливается штатно, не запуская рабочую логику.
+	term := make(chan os.Signal, 1)
+	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(term)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+
 	// Схема БД применяется до старта HTTP-сервера: healthcheck отвечает
 	// только на актуальной схеме. Параллельный старт нескольких сервисов
 	// безопасен (advisory-блокировки в internal/migrate).
@@ -153,9 +183,36 @@ func Run(opts Options) error {
 		dsn = opts.Config.Postgres.DSN
 	}
 	if dsn != "" {
-		if err := migrate.Up(context.Background(), dsn); err != nil {
-			opts.Logger.Error("миграции", "err", err)
-			return err
+		// Отдельный канал для фазы миграций: term остаётся нетронутым
+		// для serve (сигнал доставляется во все зарегистрированные каналы).
+		migTerm := make(chan os.Signal, 1)
+		signal.Notify(migTerm, os.Interrupt, syscall.SIGTERM)
+		defer signal.Stop(migTerm)
+
+		migCtx, cancelMig := context.WithCancel(context.Background())
+		defer cancelMig()
+		var migSignalled atomic.Bool
+		migDone := make(chan struct{})
+		go func() {
+			select {
+			case <-migTerm:
+				// Флаг до cancelMig: миграция, вернувшаяся по отмене,
+				// уже видит его установленным — без гонки с проверкой ниже.
+				migSignalled.Store(true)
+				cancelMig()
+			case <-migDone:
+			}
+		}()
+		migErr := migrateUp(migCtx, dsn)
+		close(migDone)
+
+		if migSignalled.Load() {
+			opts.Logger.Info("сигнал завершения во время применения схемы — останавливаюсь после миграций")
+			return nil
+		}
+		if migErr != nil {
+			opts.Logger.Error("миграции", "err", migErr)
+			return migErr
 		}
 	}
 
@@ -181,11 +238,7 @@ func Run(opts Options) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	mux.HandleFunc("/healthz", healthzHandler(pool))
 	// /metrics — реестр Prometheus (internal/metrics): базовые метрики
 	// каркаса + коллекторы Go/runtime; метрики рабочей логики добавляются
 	// фабрикой реестра (Counter/Gauge/Histogram с автометкой service,
@@ -205,20 +258,9 @@ func Run(opts Options) error {
 		ErrorLog:          slog.NewLogLogger(opts.Logger.Handler(), slog.LevelError),
 	}
 
-	// Listen отделён от Serve: ошибка занятого адреса — до старта OnRun.
-	ln, err := net.Listen("tcp", opts.MetricsAddr)
-	if err != nil {
-		opts.Logger.Error("HTTP-сервер метрик", "addr", opts.MetricsAddr, "err", err)
-		return err
-	}
-
-	term := make(chan os.Signal, 1)
-	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(term)
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	defer signal.Stop(hup)
-
+	// Пул закрывается каркасом при graceful shutdown — последним, после
+	// завершения OnRun и остановки HTTP-сервера метрик, а также на путях
+	// ошибки после его создания (занятый адрес метрик ниже).
 	closePool := func() {}
 	if pool != nil {
 		closePool = func() {
@@ -227,12 +269,43 @@ func Run(opts Options) error {
 		}
 	}
 
+	// Listen отделён от Serve: ошибка занятого адреса — до старта OnRun.
+	ln, err := net.Listen("tcp", opts.MetricsAddr)
+	if err != nil {
+		opts.Logger.Error("HTTP-сервер метрик", "addr", opts.MetricsAddr, "err", err)
+		closePool() // пул уже создан — не оставлять его соединения
+		return err
+	}
+
 	err = serve(opts, srv, ln, closePool, term, hup)
 	if errors.Is(err, errForcedExit) {
+		// Раньше здесь был прямой os.Exit(1) — обход defer'ов и
+		// непроверяемость в тестах. Ошибка доезжает до main: его реакция
+		// на любую ошибку Run и так os.Exit(1), код выхода не меняется.
 		opts.Logger.Warn("повторный сигнал — принудительное завершение без ожидания остановки")
-		os.Exit(1)
 	}
 	return err
+}
+
+// healthzHandler — readiness-проба каркаса (её использует healthcheck
+// compose/systemd): сервис с пулом БД проверяет PostgreSQL коротким
+// Ping — недоступная БД видна оркестратору как 503/unhealthy, а не
+// «healthy» с бесконечными ошибками в логе воркера. Сервис без пула
+// (Options без OnDBPool/DSN) всегда готов: зависимостей нет.
+func healthzHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if pool != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+			defer cancel()
+			if err := pool.Ping(ctx); err != nil {
+				http.Error(w, "db unavailable", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	}
 }
 
 // serve — жизненный цикл после инициализации: HTTP-сервер метрик на ln и

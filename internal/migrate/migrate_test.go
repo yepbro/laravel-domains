@@ -4,11 +4,16 @@
 package migrate
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"io"
 	"io/fs"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -156,13 +161,65 @@ func TestUp_ConnectTimeout(t *testing.T) {
 	}
 }
 
+// TestOpenAndWait_ClosesDBOnError — на путях ошибки (недоступная БД,
+// отмена контекста) *sql.DB закрывается: фейковый драйвер фиксирует
+// Close коннектора (database/sql вызывает его при db.Close()).
+func TestOpenAndWait_ClosesDBOnError(t *testing.T) {
+	restore := withConnectTimeout(300 * time.Millisecond)
+	defer restore()
+	registerFailDriver()
+
+	prevDriver := sqlDriver
+	sqlDriver = "failmigrate"
+	defer func() { sqlDriver = prevDriver }()
+
+	_, err := openAndWait(t.Context(), "not-a-real-dsn")
+	if err == nil {
+		t.Fatal("openAndWait с всегда падающим драйвером должен вернуть ошибку")
+	}
+	if !failConnectorOf.closed.Load() {
+		t.Error("*sql.DB не закрыт на пути ошибки (утечка opener-горутины и соединений)")
+	}
+}
+
+// failConnector — коннектор, чей Connect всегда падает; Close помечает
+// закрытие пула вызывающим кодом.
+type failConnector struct {
+	closed atomic.Bool
+}
+
+func (c *failConnector) Connect(context.Context) (driver.Conn, error) {
+	return nil, errors.New("нет соединения")
+}
+
+func (c *failConnector) Driver() driver.Driver { return failDriver{} }
+
+func (c *failConnector) Close() error { c.closed.Store(true); return nil }
+
+type failDriver struct{}
+
+func (failDriver) Open(string) (driver.Conn, error) {
+	return nil, errors.New("нет соединения")
+}
+
+func (failDriver) OpenConnector(string) (driver.Connector, error) { return failConnectorOf, nil }
+
+var (
+	failDriverOnce  sync.Once
+	failConnectorOf = &failConnector{}
+)
+
+func registerFailDriver() {
+	failDriverOnce.Do(func() { sql.Register("failmigrate", failDriver{}) })
+}
+
 // TestRedactDSN — пароль не должен попадать в сообщения об ошибках.
 func TestRedactDSN(t *testing.T) {
 	cases := []struct {
 		name, dsn, want string
 	}{
 		{
-			"с паролем",
+			"пароль в userinfo",
 			"postgres://crawler:secret@172.28.100.2:5432/crawler?sslmode=disable",
 			"postgres://crawler@172.28.100.2:5432/crawler?sslmode=disable",
 		},
@@ -170,6 +227,21 @@ func TestRedactDSN(t *testing.T) {
 			"без пароля",
 			"postgres://crawler@localhost:5432/crawler",
 			"postgres://crawler@localhost:5432/crawler",
+		},
+		{
+			"пароль в query-строке (libpq-форма pgx)",
+			"postgres://crawler@172.28.100.2:5432/crawler?password=dev-only-crawler&sslmode=disable",
+			"postgres://crawler@172.28.100.2:5432/crawler?password=redacted&sslmode=disable",
+		},
+		{
+			"sslpassword в query-строке",
+			"postgres://crawler@localhost:5432/crawler?sslpassword=key&sslmode=verify-full",
+			"postgres://crawler@localhost:5432/crawler?sslmode=verify-full&sslpassword=redacted",
+		},
+		{
+			"пароль и в userinfo, и в query",
+			"postgres://crawler:secret@localhost:5432/crawler?password=dev-only-crawler",
+			"postgres://crawler@localhost:5432/crawler?password=redacted",
 		},
 		{
 			"мусор — не раскрываем",

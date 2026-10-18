@@ -85,6 +85,25 @@ func TestUpdate_SQLReturning(t *testing.T) {
 	}
 }
 
+// TestUpdate_MultipleWherePredicates — повторные Where накапливаются
+// (AND), а не перезаписывают друг друга: молчаливая потеря охраны
+// в пакетном UPDATE — порча данных.
+func TestUpdate_MultipleWherePredicates(t *testing.T) {
+	sql, _, err := Update("domains").
+		Key(Column{Name: "id", Type: "int8"}).
+		SetExpr("check_state = 1").
+		Where("t.check_state = 0").
+		Where("t.attempts < 3").
+		build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `WHERE t."id" = u."id" AND t.check_state = 0 AND t.attempts < 3`
+	if !strings.HasSuffix(sql, want) {
+		t.Errorf("SQL:\n got  %s\n want суффикс %s", sql, want)
+	}
+}
+
 func TestUpdate_SQLSchemaQualifiedTable(t *testing.T) {
 	sql, _, err := Update("public.domains").
 		Key(Column{Name: "id", Type: "int8"}).

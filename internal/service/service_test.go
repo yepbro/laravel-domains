@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"crawler/internal/config"
@@ -462,6 +464,182 @@ func TestServeOnRunPanic(t *testing.T) {
 func TestRunValidation(t *testing.T) {
 	if err := Run(Options{}); err == nil || !strings.Contains(err.Error(), "имя сервиса") {
 		t.Fatalf("Run без Name = %v, хочу ошибку об обязательном имени", err)
+	}
+}
+
+// TestHealthzHandler — /healthz отражает готовность зависимостей:
+// без пула БД (сервис без OnDBPool/DSN) — 200; с пулом на недоступной
+// БД — 503, healthcheck оркестратора видит падение PostgreSQL.
+func TestHealthzHandler(t *testing.T) {
+	rec := httptest.NewRecorder()
+	healthzHandler(nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
+		t.Errorf("без пула: %d %q, want 200 %q", rec.Code, rec.Body.String(), "ok\n")
+	}
+
+	// Пул на гарантированно закрытый порт: Ping внутри пробы падает
+	// быстрее секундного таймаута хендлера.
+	cfg, err := pgxpool.ParseConfig("postgres://nobody@127.0.0.1:1/crawler?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.ConnectTimeout = 300 * time.Millisecond
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rec = httptest.NewRecorder()
+	healthzHandler(pool).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("с недоступной БД: %d %q, want 503", rec.Code, rec.Body.String())
+	}
+}
+
+// withMigrateUp подменяет применение миграций (шов migrateUp) и
+// возвращает функцию восстановления.
+func withMigrateUp(f func(context.Context, string) error) func() {
+	old := migrateUp
+	migrateUp = f
+	return func() { migrateUp = old }
+}
+
+// TestRunSignalDuringMigrationWait — SIGTERM в фазе ожиданий миграций
+// (подключение к БД, advisory-блокировка) прерывает ожидание по
+// контексту и завершает сервис штатно: Run = nil, OnRun не запускался.
+// Обработчик обязан стоять раньше миграций: дефолтная реакция на сигнал
+// убила бы процесс здесь.
+func TestRunSignalDuringMigrationWait(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+
+	started := make(chan struct{})
+	restore := withMigrateUp(func(ctx context.Context, _ string) error {
+		close(started)
+		<-ctx.Done() // фаза ожидания: прерывается отменой migCtx
+		return ctx.Err()
+	})
+	defer restore()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Name:        "run-test",
+			PGDSN:       "postgres://crawler@127.0.0.1:1/crawler", // маршрутизируется в заглушку
+			MetricsAddr: "127.0.0.1:0",
+			Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
+			OnRun: func(context.Context) error {
+				t.Error("OnRun не должен запускаться: сигнал пришёл во время миграций")
+				return nil
+			},
+		})
+	}()
+
+	<-started
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v, хочу nil (штатная остановка по сигналу во время миграций)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run не завершился после SIGTERM во время миграций")
+	}
+}
+
+// TestRunSignalDuringMigrationApply — сигнал в фазе применения не
+// прерывает миграцию (golang-migrate не принимает контекст): она
+// дорабатывает, затем сервис останавливается штатно, не запуская
+// рабочую логику.
+func TestRunSignalDuringMigrationApply(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+
+	applied := make(chan struct{})
+	restore := withMigrateUp(func(context.Context, string) error {
+		if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+			t.Error(err)
+		}
+		time.Sleep(150 * time.Millisecond) // «применение» продолжается после сигнала
+		close(applied)
+		return nil
+	})
+	defer restore()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Name:        "run-test",
+			PGDSN:       "postgres://crawler@127.0.0.1:1/crawler",
+			MetricsAddr: "127.0.0.1:0",
+			Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
+			OnRun: func(context.Context) error {
+				t.Error("OnRun не должен запускаться: сигнал пришёл во время миграций")
+				return nil
+			},
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v, хочу nil (миграция доработана, штатная остановка)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run не завершился после SIGTERM во время применения миграций")
+	}
+	select { // миграция реально доработала после сигнала, а не до него
+	case <-applied:
+	default:
+		t.Error("миграция прервана сигналом (должна дорабатывать)")
+	}
+}
+
+// TestRunSecondSignalForcedExit — повторный сигнал в фазе ожидания OnRun
+// возвращает из Run ошибку принудительного выхода (раньше — os.Exit(1)
+// прямо в библиотеке: обход defer'ов, ветка не покрывалась тестами).
+func TestRunSecondSignalForcedExit(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+
+	started := make(chan struct{})
+	stopping := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Name:            "run-test",
+			MetricsAddr:     "127.0.0.1:0",
+			Logger:          newLogger(io.Discard, "run-test", slog.LevelError),
+			ShutdownTimeout: 10 * time.Second, // фазу ожидания прерывает второй сигнал
+			OnRun: func(ctx context.Context) error {
+				close(started)
+				<-ctx.Done()
+				close(stopping)
+				block := make(chan struct{}) // «зависает» в остановке
+				<-block
+				return nil
+			},
+		})
+	}()
+
+	<-started
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	<-stopping
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errForcedExit) {
+			t.Fatalf("Run = %v, хочу errForcedExit", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run не завершился после повторного сигнала (os.Exit в библиотеке?)")
 	}
 }
 

@@ -62,6 +62,18 @@ func TestHandler(t *testing.T) {
 	}
 }
 
+// buildMode — точка инъекции ldflags: подмена переменной меняет метку
+// crawler_build_info (боевая сборка -X ...buildMode=prod).
+func TestBuildInfoMode(t *testing.T) {
+	prev := buildMode
+	buildMode = "prod"
+	defer func() { buildMode = prev }()
+
+	if text := scrape(t, New("svc")); !strings.Contains(text, `crawler_build_info{mode="prod",service="svc"} 1`) {
+		t.Errorf("в /metrics нет crawler_build_info с инъекцированным mode:\n%s", text)
+	}
+}
+
 // Handler принимает и голый *prometheus.Registry (Gatherer), не только
 // реестр фабрики.
 func TestHandlerBareRegistry(t *testing.T) {

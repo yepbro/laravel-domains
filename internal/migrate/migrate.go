@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -31,6 +30,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/source"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 
+	"crawler/internal/db"
 	"crawler/migrations"
 
 	// Регистрация database/sql-драйвера "pgx/v5" (stdlib pgx).
@@ -52,6 +52,10 @@ var (
 
 // connectRetryInterval — пауза между попытками подключиться.
 const connectRetryInterval = time.Second
+
+// sqlDriver — имя database/sql-драйвера для подключений раннера
+// (переменная для подмены в тестах путей ошибки).
+var sqlDriver = "pgx/v5"
 
 // advisoryLockKey — ключ pg_advisory_lock раннера. Сессионная блокировка
 // на выделенном соединении сериализует не только применение миграций
@@ -107,8 +111,22 @@ func Up(ctx context.Context, dsn string) error {
 
 	m, err := migrate.NewWithInstance("iofs", src, "postgres", driver)
 	if err != nil {
+		// Драйвер уже держит выделенное соединение — закрываем, чтобы
+		// не протекать и на этом пути.
+		if cerr := driver.Close(); cerr != nil {
+			slog.Warn("миграции: закрытие драйвера", "err", cerr)
+		}
 		return fmt.Errorf("миграции: инициализация: %w", err)
 	}
+	// m.Close закрывает источник и драйвер: выделенное драйвером
+	// соединение возвращается пулу немедленно, а не живёт без владельца
+	// до сборщика мусора (db.Close закрывает только простаивающие
+	// соединения, in-use остаётся висеть).
+	defer func() {
+		if _, cerr := m.Close(); cerr != nil {
+			slog.Warn("миграции: закрытие раннера", "err", cerr)
+		}
+	}()
 	m.LockTimeout = lockTimeout
 
 	err = m.Up()
@@ -163,10 +181,18 @@ func newSource() (source.Driver, error) {
 // connectTimeout: на машине разработчика БД обычно уже healthy
 // (compose depends_on), вне compose старт может скрещиваться во времени.
 func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
-	db, err := sql.Open("pgx/v5", dsn)
+	db, err := sql.Open(sqlDriver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("миграции: разбор DSN: %w", err)
 	}
+	// На путях ошибки (таймаут, отмена) *sql.DB закрывается: иначе
+	// остаются фоновая opener-горутина и успевшие открыться соединения.
+	connected := false
+	defer func() {
+		if !connected {
+			_ = db.Close()
+		}
+	}()
 
 	deadline := time.Now().Add(connectTimeout)
 	for {
@@ -174,6 +200,7 @@ func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
 		err = db.PingContext(pingCtx)
 		cancel()
 		if err == nil {
+			connected = true
 			return db, nil
 		}
 		if time.Now().After(deadline) {
@@ -189,14 +216,9 @@ func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
 	}
 }
 
-// redactDSN скрывает пароль в сообщениях об ошибках.
+// redactDSN скрывает секреты DSN в сообщениях об ошибках (db.RedactDSN —
+// единая реализация с internal/db; fallback упоминает и env-источник DSN
+// раннера — APP_PG_DSN).
 func redactDSN(dsn string) string {
-	u, err := url.Parse(dsn)
-	if err != nil || u.User == nil {
-		return "см. postgres.dsn (конфигурация) / APP_PG_DSN"
-	}
-	// url.UserPassword кодирует символы маски, поэтому пароль просто
-	// отбрасывается: важно, чтобы он не попал в лог, а не как выглядит замена.
-	u.User = url.User(u.User.Username())
-	return u.String()
+	return db.RedactDSN(dsn, "см. postgres.dsn (конфигурация) / APP_PG_DSN")
 }

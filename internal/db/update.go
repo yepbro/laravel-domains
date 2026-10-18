@@ -46,7 +46,7 @@ type UpdateBuilder struct {
 	keys      []Column
 	assigns   []Column
 	exprs     []string
-	where     string
+	wheres    []string
 	returning []string
 }
 
@@ -73,9 +73,11 @@ func (b *UpdateBuilder) SetExpr(exprs ...string) *UpdateBuilder {
 }
 
 // Where добавляет предикат охраны (SQL-выражение над алиасами t и u),
-// объединяемый с соединением ключей по AND.
+// объединяемый с соединением ключей и предыдущими предикатами по AND
+// (повторные вызовы накапливаются, а не перезаписываются: потеря
+// охраны в пакетном UPDATE — порча данных, а не неудобство).
 func (b *UpdateBuilder) Where(pred string) *UpdateBuilder {
-	b.where = pred
+	b.wheres = append(b.wheres, pred)
 	return b
 }
 
@@ -137,13 +139,11 @@ func (b *UpdateBuilder) build() (string, []Column, error) {
 	}
 	set = append(set, b.exprs...)
 
-	where := make([]string, 0, len(b.keys)+1)
+	where := make([]string, 0, len(b.keys)+len(b.wheres))
 	for _, c := range b.keys {
 		where = append(where, fmt.Sprintf("t.%s = u.%s", quoteIdent(c.Name), quoteIdent(c.Name)))
 	}
-	if b.where != "" {
-		where = append(where, b.where)
-	}
+	where = append(where, b.wheres...)
 
 	sql := fmt.Sprintf("UPDATE %s AS t SET %s FROM unnest(%s) AS u(%s) WHERE %s",
 		quoteIdent(b.table), strings.Join(set, ", "),

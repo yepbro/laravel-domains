@@ -76,6 +76,8 @@ if err := service.Run(service.Options{
 `/healthz` и `/metrics` на `Options.MetricsAddr` (адрес `monitor` —
 `monitor.listen` из конфигурации, ТЗ 5.10, важнее `METRICS_ADDR`; адреса
 остальных сервисов — только `METRICS_ADDR`, dev-порты `:9101`…`:9106`).
+`/healthz` — readiness: сервис с пулом БД проверяет PostgreSQL коротким
+Ping (503 при недоступности), сервис без БД всегда отвечает 200.
 Prometheus скрейпит каждый сервис отдельно (dev-конфиг
 `deploy/docker/prometheus/prometheus.yml`, профиль `monitoring`):
 `monitor.listen` — адрес HTTP-эндпоинта самого сервиса monitor, а не
@@ -94,7 +96,9 @@ Prometheus скрейпит каждый сервис отдельно (dev-ко
 Реестр метрик — `metrics.New(name)` (T-076): собственный
 `*prometheus.Registry` на сервис (одноимённые метрики разных сервисов не
 конфликтуют) с метриками каркаса — `crawler_service_up{service}`,
-`crawler_build_info{service,mode}` — и коллекторами Go/runtime и
+`crawler_build_info{service,mode}` (mode: `dev-stub` — dev-сборки без
+инъекции, `prod` — боевые сборки через `-ldflags -X …buildMode=prod`)
+и коллекторами Go/runtime и
 процесса (uptime выводится из `process_start_time_seconds` в PromQL).
 
 Реестр — фабрика метрик рабочей логики: `Counter`/`Gauge`/`Histogram`

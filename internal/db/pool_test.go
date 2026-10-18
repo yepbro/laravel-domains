@@ -121,8 +121,30 @@ func TestOpen_UnreachableFailFast(t *testing.T) {
 }
 
 func TestRedactDSN(t *testing.T) {
-	if got := redactDSN(testDSN); strings.Contains(got, "secret") {
-		t.Errorf("redactDSN(%s) = %q, пароль не скрыт", testDSN, got)
+	cases := []struct {
+		name, dsn, want string
+	}{
+		{
+			"пароль в userinfo",
+			testDSN,
+			"postgres://crawler@127.0.0.1:5432/crawler?sslmode=disable",
+		},
+		{
+			"пароль в query-строке (libpq-форма pgx)",
+			"postgres://crawler@127.0.0.1:5432/crawler?password=qwerty&sslmode=disable",
+			"postgres://crawler@127.0.0.1:5432/crawler?password=redacted&sslmode=disable",
+		},
+		{
+			"sslpassword в query-строке, остальные параметры целы",
+			"postgres://crawler@127.0.0.1:5432/crawler?sslmode=disable&sslpassword=k&pool_max_conns=4",
+			// Encode() сортирует параметры по имени
+			"postgres://crawler@127.0.0.1:5432/crawler?pool_max_conns=4&sslmode=disable&sslpassword=redacted",
+		},
+	}
+	for _, c := range cases {
+		if got := redactDSN(c.dsn); got != c.want {
+			t.Errorf("%s: redactDSN = %q, want %q", c.name, got, c.want)
+		}
 	}
 	if got := redactDSN("postgres://localhost/db"); got != "см. postgres.dsn (конфигурация)" {
 		t.Errorf("redactDSN без пользователя = %q", got)
