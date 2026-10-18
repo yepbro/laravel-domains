@@ -10,10 +10,14 @@
 // (заголовок каждого пака дублирует его id): таблицы packs в ТЗ 6.1 нет,
 // миграция не вводится. Новейший пак — максимальный id в каталоге.
 //
-// Транзакционность записи (ТЗ 3.4): блок дописывается в пак, затем
-// фиксируется строка метаданных. Крах между шагами оставляет в паке
-// мусорный блок без строки — он невидим (Get идёт только по метаданным)
-// и вычищается компактификацией (T-045).
+// Транзакционность записи (ТЗ 3.4): блок дописывается в пак и
+// синхронизируется на диск (fsync) ДО фиксации строки метаданных. Крах
+// между шагами оставляет в паке мусорный блок без строки — он невидим
+// (Get идёт только по метаданным) и вычищается компактификацией
+// (T-045); обратное окно «строка durable, байтов нет» закрыто: при
+// потере питания записанная строка всегда имеет байты на диске
+// (PostgreSQL в боевом конфиге коммитит асинхронно — synchronous_commit
+// = off, dirty-страницы пака жили бы в кэше минуты).
 package content
 
 import (
@@ -407,6 +411,15 @@ func (s *PackStore) appendBlockLocked(block []byte) (int32, int64, error) {
 	if _, err := s.active.f.Write(buf); err != nil {
 		return 0, 0, wrapPackWriteErr(err, s.active.id)
 	}
+	// Блок обязан дожить до диска раньше строки метаданных (ТЗ 3.4,
+	// «спул → фиксация»): строку фиксирует appendAndMeta, не отпуская
+	// flock, — fsync внутри того же захвата закрывает окно «строка
+	// durable, байтов нет» при потере питания (повторный Put такой
+	// записи не чинит — дедуп видит живую строку). Запись контента —
+	// не горячий путь (docs/content.md): цена — один fsync на блок.
+	if err := s.active.f.Sync(); err != nil {
+		return 0, 0, wrapPackWriteErr(err, s.active.id)
+	}
 	s.active.size += recLen
 	return s.active.id, off, nil
 }
@@ -516,6 +529,17 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 			_ = f.Close()
 			return nil, wrapPackWriteErr(err, id)
 		}
+		// Заголовок и запись каталога о файле — на диск до любых строк
+		// метаданных этого пака: без синка каталога созданный файл может
+		// не пережить потерю питания вместе с первыми строками (C-1).
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return nil, wrapPackWriteErr(err, id)
+		}
+		if err := syncDir(s.opts.Dir); err != nil {
+			_ = f.Close()
+			return nil, wrapPackWriteErr(err, id)
+		}
 		return &packFile{id: id, f: f, size: packHeaderLen}, nil
 	}
 	got, err := readPackHeader(f)
@@ -620,6 +644,21 @@ func readPackBlock(dir string, packID int32, off int64, clen int32) ([]byte, err
 		return nil, fmt.Errorf("content: пак %d, смещение %d: %w", packID, off, err)
 	}
 	return buf, nil
+}
+
+// syncDir синхронизирует каталог: запись о создании/удалении файла
+// (заголовок нового пака, unlink компактификации) обязана дожить до
+// диска вместе с содержимым файла.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // wrapPackWriteErr классифицирует ошибки записи пака: кончившееся место
