@@ -51,6 +51,7 @@ var commands = map[string]commandFunc{
 	"seed":       cmdSeed,
 	"test-rules": cmdTestRules,
 	"near":       cmdNear,
+	"check":      cmdCheck,
 }
 
 // usageText — справка верхнего уровня: без аргументов, help, неизвестная
@@ -77,6 +78,9 @@ const usageText = `crawlerctl — CLI Domain Crawler
   near [--zone ИМЯ] [--min-score F]
                                  находки Laravel в серой зоне порога —
                                  материал калибровки правил (T-115)
+  check <домен>                  живая проверка домена конвейером:
+                                 DNS → HTTP (+рендер SPA) → анализ,
+                                 read-only (T-119)
 
 Команды dev-окружения:
   seed [--incoming DIR] [--scenarios FILE] [--bulk N]
