@@ -161,6 +161,52 @@ func TestMatchRuleMeta(t *testing.T) {
 	}
 }
 
+func TestMatchRuleEvidenceFromCappedInput(t *testing.T) {
+	lim := DefaultLimits()
+	longName := strings.Repeat("n", 100) // > evidenceNameBytes
+
+	// name-only: имя ужимается до 32 байт и внутри свидетельства
+	ev, ok := matchRule(bgCtx(), Rule{Target: TargetCookieName, Match: longName},
+		Page{Cookies: []Cookie{{Name: longName}}}, lim)
+	if !ok {
+		t.Fatal("точное совпадение по длинному имени")
+	}
+	if want := "cookie " + truncateUTF8(longName, evidenceNameBytes); ev != want {
+		t.Errorf("имя в свидетельстве не ужимается: %q, want %q", ev, want)
+	}
+	ev, ok = matchRule(bgCtx(), Rule{Target: TargetHeaderName, Match: longName},
+		Page{Headers: map[string][]string{longName: {"v"}}}, lim)
+	if !ok {
+		t.Fatal("точное совпадение по длинному имени заголовка")
+	}
+	if want := "header " + truncateUTF8(longName, evidenceNameBytes); ev != want {
+		t.Errorf("имя заголовка не ужимается: %q, want %q", ev, want)
+	}
+
+	// value: свидетельство строится из обрезанного MaxValueBytes значения
+	// (той же строкой, по которой шёл матчинг), а не из полного c.Value:
+	// значение длиннее лимита всё равно срабатывает по якорю в начале и
+	// даёт свидетельство в пределах окна обрезки.
+	huge := "eyJpdiI6" + strings.Repeat("z", lim.MaxValueBytes)
+	ev, ok = matchRule(bgCtx(), Rule{Target: TargetCookieValue, Regex: `^eyJpdiI6`},
+		Page{Cookies: []Cookie{{Name: "c", Value: huge}}}, lim)
+	if !ok {
+		t.Fatal("значение длиннее MaxValueBytes не сопоставлено по префиксу")
+	}
+	// окно обрезки: префикс формы + начало значения до лимита свидетельства
+	zCut := func(prefix string) string {
+		return prefix + strings.Repeat("z", lim.snippetCap()-len(prefix)) + "…"
+	}
+	if ev != zCut("cookie c=eyJpdiI6") {
+		t.Errorf("свидетельство значения: %q", ev)
+	}
+	if ev2, ok := matchRule(bgCtx(), Rule{Target: TargetHeaderValue, Regex: `^eyJpdiI6`},
+		Page{Headers: map[string][]string{"X-Long": {huge}}}, lim); !ok ||
+		ev2 != zCut("header X-Long: eyJpdiI6") {
+		t.Errorf("свидетельство значения заголовка: ok=%v %q", ok, ev2)
+	}
+}
+
 func TestMatchRuleSkipsBadRules(t *testing.T) {
 	page := Page{HTML: []byte("x"), Cookies: []Cookie{{Name: "a", Value: "b"}}}
 

@@ -145,7 +145,9 @@ func sortedHeaderNames(h map[string][]string) []string {
 // matchRule ищет первое совпадение правила на странице: cookie имя/значение
 // и заголовки — точное совпадение (match) или regex; html/meta — только
 // regex (ТЗ 5.8: «регулярное выражение по HTML»). Возвращает свидетельство
-// сработавшего совпадения. Порядок обхода детерминирован (см. evidence.go).
+// сработавшего совпадения — оно строится из тех же обрезанных лимитами
+// строк, по которым шёл матчинг (работа над свидетельством ограничена
+// MaxValueBytes, ТЗ §9). Порядок обхода детерминирован (см. evidence.go).
 func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool) {
 	if ctx.Err() != nil {
 		return "", false // бюджет исчерпан — правило не смотрится
@@ -167,8 +169,9 @@ func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool
 			if ctx.Err() != nil {
 				return "", false
 			}
-			if matches(lim.valueCap(c.Name)) {
-				return finalizeEvidence(evidenceCookieName(c.Name), lim), true
+			name := lim.valueCap(c.Name)
+			if matches(name) {
+				return finalizeEvidence(evidenceCookieName(name), lim), true
 			}
 		}
 	case TargetCookieValue:
@@ -176,8 +179,9 @@ func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool
 			if ctx.Err() != nil {
 				return "", false
 			}
-			if matches(lim.valueCap(c.Value)) {
-				return finalizeEvidence(evidenceCookieValue(c.Name, c.Value), lim), true
+			value := lim.valueCap(c.Value)
+			if matches(value) {
+				return finalizeEvidence(evidenceCookieValue(c.Name, value), lim), true
 			}
 		}
 	case TargetHeaderName:
@@ -185,8 +189,9 @@ func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool
 			if ctx.Err() != nil {
 				return "", false
 			}
-			if matches(lim.valueCap(name)) {
-				return finalizeEvidence(evidenceHeaderName(name), lim), true
+			capped := lim.valueCap(name)
+			if matches(capped) {
+				return finalizeEvidence(evidenceHeaderName(capped), lim), true
 			}
 		}
 	case TargetHeaderValue:
@@ -195,8 +200,9 @@ func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool
 				if ctx.Err() != nil {
 					return "", false
 				}
-				if matches(lim.valueCap(v)) {
-					return finalizeEvidence(evidenceHeaderValue(name, v), lim), true
+				value := lim.valueCap(v)
+				if matches(value) {
+					return finalizeEvidence(evidenceHeaderValue(name, value), lim), true
 				}
 			}
 		}
