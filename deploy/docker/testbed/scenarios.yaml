@@ -60,8 +60,8 @@ scenarios:
     expect: "адрес есть, порты закрыты → статус no_http"
 
   - name: tc-fallback
-    dns: {a_many: 60}
-    expect: "60 A-записей (round-robin 192.0.2.0/24): ответ >512 Б; UDP без EDNS0 → TC=1, повтор по TCP приносит полный набор"
+    dns: {a_many: 100}
+    expect: "100 A-записей (round-robin 192.0.2.0/24): ответ ~1.6 КБ > EDNS0-буфера 1232 Б (dnsclient рекламирует OPT 1232); UDP → TC=1, повтор по TCP приносит полный набор"
 
   # --- HTTP/HTTPS-сценарии ----------------------------------------------
   - name: http-only

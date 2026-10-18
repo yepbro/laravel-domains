@@ -42,9 +42,10 @@ import (
 const dnsBlackholeAddr = "172.28.100.250:53"
 
 // tcFallbackRecords — число A-записей сценария tc-fallback
-// (dns.a_many в scenarios.yaml): 60 записей ≈ 1 КиБ в сжатой упаковке —
-// ответ не помещается в UDP-датаграмму без EDNS0, unbound ставит TC=1.
-const tcFallbackRecords = 60
+// (dns.a_many в scenarios.yaml): 100 записей ≈ 1.6 КиБ в сжатой упаковке —
+// ответ не помещается и в EDNS0-буфер 1232 Б (dnsclient рекламирует
+// OPT RR), unbound ставит TC=1 и приносит полный набор по TCP.
+const tcFallbackRecords = 100
 
 // dnsEnv — клиент dnsclient к живому unbound стенда (unboundAddr из
 // env_test.go — адрес из dev-конфига). Таймаут попытки ужат до секунды:
