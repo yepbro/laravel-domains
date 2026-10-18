@@ -217,9 +217,13 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		if derr := p.clearBatch(ctx, id); derr != nil {
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
+		// Числитель/знаменатель — как в вердикте streamStage: отказы
+		// парсера (invalid_utf8, line_len) плюс отказы валидатора.
+		rejectedAll := int64(st.Rejected) + int64(vres.Rejected)
+		contentAll := int64(vres.Total) + int64(st.Rejected)
 		return p.failFile(abs, rep, fmt.Errorf(
 			"доля отклонённых строк %d из %d выше ingest.max_error_ratio (%g)",
-			vres.Rejected, vres.Total, p.opts.MaxErrorRatio))
+			rejectedAll, contentAll, p.opts.MaxErrorRatio))
 	}
 
 	// Идемпотентность (ТЗ 5.1): тот же файл (по содержимому — sha256,
@@ -293,8 +297,9 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 // поток r идёт в парсер (T-015), значимые строки валидируются (T-016) и
 // грузятся в staging (T-017) по мере разбора. Возвращает счётчики
 // парсера, итог валидации (Reasons — уже объединённые с построчными
-// отклонениями парсера) и число загруженных строк. Ошибка — сбой чтения
-// файла или загрузки; счётчики соответствуют отданному.
+// отклонениями парсера; Failed — по доле отказов валидатора и парсера
+// вместе) и число загруженных строк. Ошибка — сбой чтения файла или
+// загрузки; счётчики соответствуют отданному.
 //
 // Парсер толкающий (OnLine), Stage — тянущий (RowIter): связка —
 // горутина-производитель и буферизованный канал. Память ограничена
@@ -368,6 +373,16 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	}
 	res := v.Finish()
 	res.Reasons = mergeReasons(prejects, res.Reasons)
+	// Построчные отказы парсера (invalid_utf8, line_len) до v.Line не
+	// доходят и потому не в счётчиках Finish — досчитываем их в порог
+	// сами: доля ошибок считается по всем содержательным строкам файла
+	// (битый дамп — именно не-UTF-8, docs/incoming-files.md §4), иначе
+	// файл целиком из мусора (Data = 0) прошёл бы как успешный (ING-P1-2).
+	if total := res.Total + st.Rejected; total > 0 {
+		if rejected := res.Rejected + st.Rejected; float64(rejected)/float64(total) > p.opts.MaxErrorRatio {
+			res.Failed = true
+		}
+	}
 	return st, res, staged, nil
 }
 

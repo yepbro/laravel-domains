@@ -475,6 +475,76 @@ func TestPipelineErrorRatio(t *testing.T) {
 	}
 }
 
+// TestPipelineParserRejectsFailFile — построчные отказы парсера
+// (invalid_utf8, line_len) учитываются в пороге доли ошибок (T-016):
+// файл, чей мусор не дошёл до валидатора, всё равно ошибочен целиком
+// (битый дамп — именно не-UTF-8, docs/incoming-files.md §4), а не
+// «успешно применённая» пустая партия.
+func TestPipelineParserRejectsFailFile(t *testing.T) {
+	// 1 строка не-UTF-8 + 8 валидных: валидатор один 0/8 не роняет,
+	// объединённая доля 1/9 > 0.1 — файл ошибочен.
+	t.Run("мусор плюс валидные строки", func(t *testing.T) {
+		pt := newPipeTest(t)
+		var b strings.Builder
+		b.WriteString("\xff\xfe\n")
+		for i := 0; i < 8; i++ {
+			fmt.Fprintf(&b, "good%d.com\n", i)
+		}
+		abs := pt.addFile(t, "com/add/list.txt", b.String())
+
+		out, err := pt.pipe.Process(context.Background(), abs)
+		if err != nil {
+			t.Fatalf("Process: %v (ошибочный файл — не ошибка сервиса)", err)
+		}
+		if out.Kind != OutcomeFailed {
+			t.Fatalf("итог = %s, want failed", out.Kind)
+		}
+		if out.Err == nil || !strings.Contains(out.Err.Error(), "доля отклонённых строк 1 из 9 выше ingest.max_error_ratio (0.1)") {
+			t.Errorf("причина = %v, want объединённая доля 1 из 9", out.Err)
+		}
+		rep := out.Report
+		if rep.Rejected != 1 || rep.Accepted != 8 || rep.Reasons[ReasonUTF8] != 1 {
+			t.Errorf("счётчики = %+v, want rejected 1 (invalid_utf8), accepted 8", rep)
+		}
+		if len(pt.files.records) != 0 {
+			t.Error("отчёт ошибочного файла не пишется в журнал")
+		}
+		if !exists(t, filepath.Join(pt.dir, DirFailed, "com/add/list.txt")) {
+			t.Error("файл не перемещён в failed/")
+		}
+	})
+
+	// Файл целиком из не-UTF-8: парсер отверг каждую строку, валидатор
+	// не видел ни одной (total = 0) — без учёта отказов парсера доля
+	// считалась бы 0/0 и файл уезжал бы в processed/.
+	t.Run("файл целиком из не-UTF-8", func(t *testing.T) {
+		pt := newPipeTest(t)
+		abs := pt.addFile(t, "com/add/dump.txt", "\xff\xfe\xff\n\xff\xfe\n")
+
+		out, err := pt.pipe.Process(context.Background(), abs)
+		if err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		if out.Kind != OutcomeFailed {
+			t.Fatalf("итог = %s, want failed", out.Kind)
+		}
+		if out.Err == nil || !strings.Contains(out.Err.Error(), "доля отклонённых строк 2 из 2 выше ingest.max_error_ratio (0.1)") {
+			t.Errorf("причина = %v, want объединённая доля 2 из 2", out.Err)
+		}
+		if rep := out.Report; rep.Rejected != 2 || rep.Accepted != 0 {
+			t.Errorf("счётчики = %+v, want rejected 2, accepted 0", rep)
+		}
+		// Партия из нуля строк отброшена, применение не выполнялось.
+		want := []string{"exec:" + clearStageSQL, "exec:" + clearStageSQL}
+		if !reflect.DeepEqual(pt.pool.ops, want) {
+			t.Errorf("обращения = %v, want очистка → отбрасывание партии без COPY", pt.pool.ops)
+		}
+		if len(pt.files.records) != 0 {
+			t.Error("отчёт ошибочного файла не пишется в журнал")
+		}
+	})
+}
+
 // TestPipelineBadPath — структура пути не <зона>/add|delete/*.txt
 // (T-014): файл ошибочен, до БД не доходит, failed/ с лог-отчётом.
 func TestPipelineBadPath(t *testing.T) {
