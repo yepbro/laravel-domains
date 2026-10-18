@@ -497,6 +497,107 @@ func TestHealthzHandler(t *testing.T) {
 	}
 }
 
+// withMigrateUp подменяет применение миграций (шов migrateUp) и
+// возвращает функцию восстановления.
+func withMigrateUp(f func(context.Context, string) error) func() {
+	old := migrateUp
+	migrateUp = f
+	return func() { migrateUp = old }
+}
+
+// TestRunSignalDuringMigrationWait — SIGTERM в фазе ожиданий миграций
+// (подключение к БД, advisory-блокировка) прерывает ожидание по
+// контексту и завершает сервис штатно: Run = nil, OnRun не запускался.
+// Обработчик обязан стоять раньше миграций: дефолтная реакция на сигнал
+// убила бы процесс здесь.
+func TestRunSignalDuringMigrationWait(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+
+	started := make(chan struct{})
+	restore := withMigrateUp(func(ctx context.Context, _ string) error {
+		close(started)
+		<-ctx.Done() // фаза ожидания: прерывается отменой migCtx
+		return ctx.Err()
+	})
+	defer restore()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Name:        "run-test",
+			PGDSN:       "postgres://crawler@127.0.0.1:1/crawler", // маршрутизируется в заглушку
+			MetricsAddr: "127.0.0.1:0",
+			Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
+			OnRun: func(context.Context) error {
+				t.Error("OnRun не должен запускаться: сигнал пришёл во время миграций")
+				return nil
+			},
+		})
+	}()
+
+	<-started
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v, хочу nil (штатная остановка по сигналу во время миграций)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run не завершился после SIGTERM во время миграций")
+	}
+}
+
+// TestRunSignalDuringMigrationApply — сигнал в фазе применения не
+// прерывает миграцию (golang-migrate не принимает контекст): она
+// дорабатывает, затем сервис останавливается штатно, не запуская
+// рабочую логику.
+func TestRunSignalDuringMigrationApply(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+
+	applied := make(chan struct{})
+	restore := withMigrateUp(func(context.Context, string) error {
+		if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+			t.Error(err)
+		}
+		time.Sleep(150 * time.Millisecond) // «применение» продолжается после сигнала
+		close(applied)
+		return nil
+	})
+	defer restore()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Name:        "run-test",
+			PGDSN:       "postgres://crawler@127.0.0.1:1/crawler",
+			MetricsAddr: "127.0.0.1:0",
+			Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
+			OnRun: func(context.Context) error {
+				t.Error("OnRun не должен запускаться: сигнал пришёл во время миграций")
+				return nil
+			},
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v, хочу nil (миграция доработана, штатная остановка)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run не завершился после SIGTERM во время применения миграций")
+	}
+	select { // миграция реально доработала после сигнала, а не до него
+	case <-applied:
+	default:
+		t.Error("миграция прервана сигналом (должна дорабатывать)")
+	}
+}
+
 // TestNewRegistry — выбор реестра метрик: Options.Metrics (создан main-ом
 // под приборы рабочей логики, T-077) используется как есть, nil — каркас
 // строит собственный по имени сервиса.
