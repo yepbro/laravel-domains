@@ -1281,6 +1281,74 @@ func TestCompactOnceErrors(t *testing.T) {
 	}
 }
 
+// TestCompactOnceFullDiskSkipsLivePacks — пик места «старое + новое»
+// (C-17): на томе ниже порога паузы записи проход не начинает копировать
+// живые блоки (упёрся бы в ENOSPC на полпути), пак с живыми данными
+// откладывается с ошибкой прохода; пак без живых блоков обрабатывается
+// и на полном диске — удаление мусора освобождает место без копирования.
+func TestCompactOnceFullDiskSkipsLivePacks(t *testing.T) {
+	newStore := func(t *testing.T) (*PackStore, *compactFakePool, string) {
+		t.Helper()
+		st, pool := newCompactTestStore(t, func(o *PackOptions) { o.DiskFreePercent = 10 })
+		return st, pool, st.opts.Dir
+	}
+	fullDisk := func(st *PackStore) *fakeSpace {
+		fake := &fakeSpace{}
+		fake.set(1<<20, 100<<20) // 1% свободно — ниже порога 10%
+		st.stat = fake
+		return fake
+	}
+
+	// Пак с живыми блоками (доля живых ниже порога компактификации) —
+	// откладывается на полном диске, файл остаётся.
+	st, pool, dir := newStore(t)
+	ctx := context.Background()
+	offs := compactCraftPack(t, dir, 1, [][]byte{
+		bytes.Repeat([]byte("l"), 40),  // живой блок
+		bytes.Repeat([]byte("d"), 400), // мёртвый блок
+	})
+	compactCraftRow(t, pool, "живой контент полного диска", 1, offs[0], 40, 1)
+	compactCraftRow(t, pool, "мёртвый наполнитель", 1, offs[1], 400, 0)
+	compactCraftPack(t, dir, 2, nil) // пак 2 — новейший, пак 1 закрыт
+	fullDisk(st)
+
+	stats, err := CompactOnce(ctx, st, CompactOptions{})
+	if err == nil {
+		t.Fatal("CompactOnce ниже порога места: ожидалась ошибка отложенного пака")
+	}
+	if !strings.Contains(err.Error(), "отложена") {
+		t.Errorf("ошибка прохода не про отложенный пак: %v", err)
+	}
+	if stats.Compacted != 0 {
+		t.Errorf("Compacted = %d, want 0", stats.Compacted)
+	}
+	if got := compactPackSize(t, dir, 1); got == 0 {
+		t.Error("пак с живыми блоками тронут на полном диске")
+	}
+
+	// Пак из одного мусора — обрабатывается и на полном диске.
+	st2, pool2, dir2 := newStore(t)
+	fullDisk(st2)
+	h := HashOf([]byte("мёртвый контент полного диска"))
+	offs2 := compactCraftPack(t, dir2, 1, [][]byte{bytes.Repeat([]byte("d"), 30)})
+	compactCraftRow(t, pool2, "мёртвый контент полного диска", 1, offs2[0], 30, 0)
+	compactCraftPack(t, dir2, 2, nil)
+
+	stats2, err2 := CompactOnce(ctx, st2, CompactOptions{})
+	if err2 != nil {
+		t.Fatalf("CompactOnce пака без живых блоков на полном диске: %v", err2)
+	}
+	if stats2.Compacted != 1 {
+		t.Errorf("Compacted = %d, want 1 (мусор удаляется без копирования)", stats2.Compacted)
+	}
+	if got := compactPackSize(t, dir2, 1); got != 0 {
+		t.Error("пак без живых блоков не удалён на полном диске")
+	}
+	if _, ok := pool2.row(h); ok {
+		t.Error("мёртвая строка не удалена")
+	}
+}
+
 // TestCompactLoop — цикл: первый проход срабатывает сразу, ошибка
 // прохода не останавливает (Warn и retry тиком), отмена ctx — чистый nil.
 func TestCompactLoop(t *testing.T) {
