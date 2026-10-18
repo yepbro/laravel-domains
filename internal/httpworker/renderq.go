@@ -52,6 +52,10 @@
 //   - записи без собственного контента и без алиаса (контент не сохранён
 //     — лимит/переполнение диска, T-056) не переиздаются: вердикт взять
 //     неоткуда; их доработает регулярная перепроверка (T-030);
+//   - сбой чтения блока (транзиентный сбой хранилища, гонка с
+//     компактификацией) флаг домена НЕ снимает: проход повторит чтение
+//     на следующем тике — цена минуты повтора против потери SPA-задачи
+//     до перепроверки T-030 (месяцы);
 //   - наследование алиаса — по субдомену-оригиналу без варианта
 //     (alias_subdomain_id ссылается на субдомен, T-055): у оригинала с
 //     двумя вариантами разных сайтов наследуются оба — редкий случай,
@@ -318,8 +322,9 @@ type renderPendingRow struct {
 // при переполнении проход останавливается (Full), флаги сохранены. Для
 // домена — ключи SPA-записей (повторный вердикт по сохранённому
 // контенту) → публикация q:render → снятие флага. Пустой набор ключей —
-// флаг снимается без публикации (черновой флаг: контент недоступен или
-// страница перестала быть SPA).
+// флаг снимается без публикации (черновой флаг: страница перестала быть
+// SPA); нечитаемый контент флаг сохраняет до следующего прохода
+// (renderDomainKeys).
 func RequeueOnce(ctx context.Context, pool db.DB, contents RenderContent, render *RenderQueue, opts RequeueOptions) (RequeueResult, error) {
 	if pool == nil {
 		return RequeueResult{}, errors.New("httpworker: проход рендера: пул не задан")
@@ -357,7 +362,7 @@ func RequeueOnce(ctx context.Context, pool db.DB, contents RenderContent, render
 			return out, fmt.Errorf("httpworker: проход рендера: %w", err)
 		}
 		d := &domains[i]
-		keys, err := renderDomainKeys(ctx, pool, contents, d, o.Log)
+		keys, keep, err := renderDomainKeys(ctx, pool, contents, d, o.Log)
 		if err != nil {
 			return out, err
 		}
@@ -374,6 +379,12 @@ func RequeueOnce(ctx context.Context, pool db.DB, contents RenderContent, render
 				return out, fmt.Errorf("httpworker: проход рендера: домен %s: %w", d.name, err)
 			}
 			out.Published += len(keys)
+		}
+		if keep {
+			// Контент части записей не прочитан (транзиентный сбой):
+			// флаг сохраняется — следующий проход повторит домен;
+			// снятие сняло бы SPA-задачу до перепроверки T-030.
+			continue
 		}
 		// Снятие флага — после публикации (§3.4, порядок в шапке файла).
 		tag, err := pool.Exec(ctx, renderClearPendingSQL, d.zone, d.id)
@@ -414,13 +425,16 @@ func renderSelectPending(ctx context.Context, pool db.DB, limit int) ([]renderPe
 // (DetectSPA детерминирован — тот же вердикт, что при записи, T-057);
 // алиасы наследуют вердикт субдомена-оригинала; записи без контента и
 // без алиаса пропускаются (контент не сохранён, T-056 — доработает
-// перепроверка T-030). Ошибка чтения блока — не ошибка прохода: запись
-// пропускается с Warn (хранилище починится, флаг домена снимется по
-// остальным записям).
-func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d *renderPendingDomain, log *slog.Logger) ([]queue.Result, error) {
+// перепроверка T-030). Ошибка чтения блока — не ошибка прохода, но и не
+// повод снимать флаг: third возврат keep=true оставляет render_pending
+// (транзиентный сбой хранилища или гонка компактификации не должны
+// терять SPA-задачу до перепроверки T-030) — запись пропускается с Warn,
+// проход продолжается, следующий тик повторит домен; отмена ctx —
+// ошибка прохода.
+func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d *renderPendingDomain, log *slog.Logger) (keys []queue.Result, keep bool, err error) {
 	rows, err := pool.Query(ctx, renderPendingRowsSQL, d.zone, d.id)
 	if err != nil {
-		return nil, fmt.Errorf("httpworker: проход рендера: домен %s: записи: %w", d.name, err)
+		return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: записи: %w", d.name, err)
 	}
 	defer rows.Close()
 
@@ -433,19 +447,19 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 			aliasSub *int16
 		)
 		if err := rows.Scan(&r.subdomain, &variant, &hash, &aliasSub); err != nil {
-			return nil, fmt.Errorf("httpworker: проход рендера: домен %s: записи: чтение: %w", d.name, err)
+			return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: записи: чтение: %w", d.name, err)
 		}
 		r.variant, r.hash, r.aliasSub = model.Variant(variant), hash, aliasSub
 		recs = append(recs, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("httpworker: проход рендера: домен %s: записи: %w", d.name, err)
+		return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: записи: %w", d.name, err)
 	}
 
 	// Свои вердикты — по контенту; порядок ключей детерминирован
 	// (ORDER BY запроса), алиасы — после своих.
 	spa := make(map[int16]bool)
-	keys := make([]queue.Result, 0, len(recs))
+	keys = make([]queue.Result, 0, len(recs))
 	var aliases []renderPendingRow
 	for _, r := range recs {
 		if r.aliasSub != nil {
@@ -461,8 +475,14 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 		copy(h[:], r.hash)
 		body, err := contents.Get(ctx, h)
 		if err != nil {
-			log.Warn("проход рендера: контент записи недоступен — пропущена",
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: чтение контента: %w", d.name, err)
+			}
+			// Транзиентный сбой: флаг домена сохраняется (keep),
+			// следующий проход повторит чтение.
+			log.Warn("проход рендера: контент записи недоступен — домен останется с флагом",
 				"domain", d.name, "subdomain_id", r.subdomain, "err", err)
+			keep = true
 			continue
 		}
 		if httpfetch.DetectSPA(body).SPA {
@@ -487,7 +507,7 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 		}
 		return keys[i].Variant < keys[j].Variant
 	})
-	return keys, nil
+	return keys, keep, nil
 }
 
 // RequeueRenderPending — цикл проходов доработки рендера (§5.6
