@@ -103,9 +103,12 @@ type ContentStore interface {
 	Delete(ctx context.Context, hash content.Hash) error
 }
 
-// Renderer — шов рендера: удовлетворяется *render.Pool (T-061). Одна
-// задача — одна страница в свежем изолированном контексте; параллелизм
-// ограничен слотами самого пула (render.contexts, ТЗ 5.6).
+// Renderer — шов рендера: удовлетворяется *render.Manager (T-065 — боевая
+// сборка cmd/render-worker: живое поколение «браузер + пул», перезапуски
+// по страницам/памяти, реконнект и повтор задачи) и *render.Pool напрямую
+// (T-061 — интеграционные тесты). Одна задача — одна страница в свежем
+// изолированном контексте; параллелизм ограничен слотами самого пула
+// (render.contexts, ТЗ 5.6).
 type Renderer interface {
 	Run(ctx context.Context, task render.RenderTask) (render.RenderOutput, error)
 }
@@ -147,8 +150,8 @@ type Options struct {
 	// Alive — зонд браузера: false — очередь не читается (доставки
 	// остаются в стриме непрочитанными, а не в PEL без XACK — без
 	// клеймов запись в PEL зависает надолго). Ставится сборкой сервиса
-	// (browser.Alive, T-061); nil — зонд отключён. Перезапуск браузера —
-	// территория T-065, здесь только пауза потребления.
+	// (render.Manager.Alive, T-061/T-065: мёртвое поколение зонд
+	// перезапускает сам — реконнект); nil — зонд отключён.
 	Alive func() bool
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
@@ -456,7 +459,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 	sem := make(chan struct{}, o.Concurrency)
 	for {
 		if o.Alive != nil && !o.Alive() {
-			log.Warn("Chromium недоступен — q:render не читается (перезапуск — T-065)")
+			log.Warn("Chromium недоступен — q:render не читается (перезапуск — менеджер, T-065)")
 			wait(DefaultErrorWait)
 			if ctx.Err() != nil {
 				return nil // graceful shutdown

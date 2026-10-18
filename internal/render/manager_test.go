@@ -99,6 +99,78 @@ func TestManagerRunStartsBrowserOnce(t *testing.T) {
 	}
 }
 
+func TestManagerStart(t *testing.T) {
+	// Start поднимает первое поколение немедленно (боевая сборка падает на
+	// старте, а не перебирает попытки доставок); живое поколение — no-op.
+	b, _ := liveBrowser(1)
+	m, calls, _ := managerFor(t, managerOpts(), b)
+	if m.Browser() != nil {
+		t.Fatal("до Start поколения нет")
+	}
+	if err := m.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("стартов %d, хочу 1", got)
+	}
+	if m.Browser() != b {
+		t.Fatal("Start не поднял поколение")
+	}
+	if err := m.Start(); err != nil {
+		t.Fatalf("повторный Start: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("стартов %d, хочу 1 (живое поколение не трогается)", got)
+	}
+	m.Close()
+	if err := m.Start(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Start после Close: %v, хочу ErrClosed", err)
+	}
+}
+
+func TestManagerAlive(t *testing.T) {
+	// Зонд потребления: живое поколение — true без лишних стартов; после
+	// смерти поколения (рестарт Chromium хостом) зонд заменяет его сам —
+	// реконнект, пауза потребления не зависает навсегда.
+	b1, cancel1 := liveBrowser(1)
+	b2, _ := liveBrowser(1)
+	m, calls, _ := managerFor(t, managerOpts(), b1, b2)
+	if !m.Alive() {
+		t.Fatal("до старта зонд сам поднимает первое поколение (true)")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("стартов %d, хочу 1 (зонд стартовал первое поколение)", got)
+	}
+	for range 2 {
+		if !m.Alive() {
+			t.Fatal("живое поколение: Alive = true")
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("стартов %d, хочу 1 (живое поколение не перезапускается)", got)
+	}
+
+	cancel1() // хост перезапустил Chromium: соединение потеряно навсегда
+	if !m.Alive() {
+		t.Fatal("зонд обязан заменить мёртвое поколение (true)")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("стартов %d, хочу 2 (мертвое поколение заменено зондаом)", got)
+	}
+	if !m.Browser().Alive() {
+		t.Error("новое поколение живо")
+	}
+
+	// Пул первого поколения закрыт фоновым Close: задачи в него не идут.
+	if !m.Alive() {
+		t.Error("после замены зонд видит живое поколение")
+	}
+	m.Close()
+	if m.Alive() {
+		t.Error("после Close зонд false")
+	}
+}
+
 func TestManagerRestartOnPagesThreshold(t *testing.T) {
 	opts := managerOpts()
 	opts.RestartEveryPages = 1 // каждая успешная страница — порог

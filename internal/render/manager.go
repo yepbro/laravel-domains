@@ -70,7 +70,7 @@ func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 			}
 			return RenderOutput{}, err
 		}
-		out, err := p.Run(ctx, task)
+		out, err := runAcquired(ctx, p, task)
 		if err == nil {
 			return out, nil
 		}
@@ -81,10 +81,61 @@ func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 	}
 }
 
+// runAcquired выполняет задачу на пуле, удерживая взятый в acquire слот
+// поколения (wg.Done) до конца Pool.Run — см. обоснование в acquire.
+func runAcquired(ctx context.Context, p *Pool, task RenderTask) (RenderOutput, error) {
+	defer p.wg.Done()
+	return p.Run(ctx, task)
+}
+
+// Start запускает первое поколение немедленно, а не лениво первой задачей:
+// боевая сборка (cmd/render-worker) обязана упасть на старте при
+// недоступном Chromium (ошибка OnRun → код 1 → systemd Restart=on-failure),
+// а не молча перебирать попытки доставок q:render. На живом поколении —
+// no-op; после Close — ErrClosed.
+func (m *Manager) Start() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return ErrClosed
+	}
+	if reason, swap := m.swapReasonLocked(); swap {
+		return m.restartLocked(reason)
+	}
+	return nil
+}
+
+// Alive — зонд потребления воркера (renderworker.Options.Alive): живо ли
+// текущее поколение; мёртвое или отсутствующее заменяется прямо здесь
+// (restartLocked → новый StartBrowser), поэтому после потери соединения
+// или рестарта Chromium (host-юнит crawler-chromium.service,
+// Restart=on-failure) зонд сам восстанавливает поколение — пауза
+// потребления не зависает навсегда. Ошибка старта — false: потребление
+// остаётся на паузе (доставки не расходуют попытки, T-025), следующий
+// вызов зонда повторит старт.
+func (m *Manager) Alive() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return false
+	}
+	if reason, swap := m.swapReasonLocked(); swap {
+		return m.restartLocked(reason) == nil
+	}
+	return true
+}
+
 // acquire возвращает пул текущего живого поколения, при необходимости
 // меняя его (триггеры — swapReason). Конкурентные вызовы сериализуются
 // мьютексом: смена поколения одна; проверка порогов под ним же — RSS
 // читается раз в задачу (один проход /proc), не чаще.
+//
+// Взятый пул помечается в полёте (wg.Add) под тем же m.mu: retire
+// сменившегося поколения тоже под m.mu, значит смена поколения не может
+// проскочить между acquire и Pool.Run — а фоновый Close поколения никогда
+// не ждёт WaitGroup с нулевым счётчиком, пока у задачи есть acquired-слот
+// (Add из нуля параллельно Wait запрещён sync.WaitGroup). Слот снимается
+// в runAcquired после Pool.Run.
 func (m *Manager) acquire() (*Pool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -96,6 +147,7 @@ func (m *Manager) acquire() (*Pool, error) {
 			return nil, err
 		}
 	}
+	m.p.wg.Add(1)
 	return m.p, nil
 }
 
