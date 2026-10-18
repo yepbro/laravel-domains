@@ -1029,6 +1029,61 @@ func TestAnalyzer_NoRulesSet(t *testing.T) {
 	}
 }
 
+// anLateCancelCtx — контекст, отменяющийся между SELECT входа анализа и
+// применением правил (стиль countingCtx из engine_test): первое обращение
+// к Err() возвращает nil (SELECT проходит), дальше — отмена; Done-канал
+// уже закрыт, поэтому таймаут-обёртка внутри EvaluateCtx синхронно
+// наследует отмену — детерминированный Partial без реальных таймеров.
+type anLateCancelCtx struct {
+	calls int
+	done  chan struct{}
+}
+
+func (c *anLateCancelCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *anLateCancelCtx) Done() <-chan struct{}       { return c.done }
+func (c *anLateCancelCtx) Value(any) any               { return nil }
+
+func (c *anLateCancelCtx) Err() error {
+	c.calls++
+	if c.calls == 1 {
+		return nil
+	}
+	return context.Canceled
+}
+
+var anClosedChan = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+// TestAnalyzer_PartialResultNotRecorded — просмотр правил прерван
+// (EvalTimeout/отмена ctx, Result.Partial): усечённый результат не
+// записывается и не штампуется rules_version как полный; строка остаётся
+// устаревшей — переанализ (T-074) вернётся к ней.
+func TestAnalyzer_PartialResultNotRecorded(t *testing.T) {
+	f := newANFixture(t, anSet(1001), Options{})
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN"), nil) // контента нет
+
+	wrote, err := f.w.ProcessResult(&anLateCancelCtx{done: anClosedChan}, anTask)
+	if err != nil {
+		t.Fatalf("ProcessResult: %v", err)
+	}
+	if wrote {
+		t.Fatal("неполный результат не записывается")
+	}
+	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
+		t.Fatal("усечённые findings записаны как полные")
+	}
+	if f.pool.j.indexOf(anEvBegin) != -1 {
+		t.Fatal("для неполного результата транзакция не открывается")
+	}
+	row, _ := anResultSnapshot(f.pool, anKey)
+	if row.rulesVersion != nil {
+		t.Fatal("штамп rules_version на неполном результате ставить нельзя")
+	}
+}
+
 // TestAnalyzer_StaleRow — строка перезаписана другим эпизодом между
 // SELECT и UPDATE (перепроверка DELETE+INSERT, рендер сменил контент):
 // охрана content_hash → 0 строк → успех без записи; у нового эпизода

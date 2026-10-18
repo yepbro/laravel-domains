@@ -60,6 +60,9 @@ rules:
 	if diff(res.Score, wantScore) > 1e-9 {
 		t.Errorf("score = %v, want %v", res.Score, wantScore)
 	}
+	if res.Partial {
+		t.Error("полный просмотр не должен помечаться Partial")
+	}
 	// пересечение [9.19, ∞) и (-∞, 9.x] = [9.19, 9.x]
 	if res.VerMin != "9.19" || res.VerMax != "9.x" {
 		t.Errorf("версии = [%s, %s], want [9.19, 9.x]", res.VerMin, res.VerMax)

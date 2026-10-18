@@ -36,6 +36,10 @@ type Result struct {
 	VerMin   string
 	VerMax   string
 	Conflict bool // пересечение диапазонов версий пустое
+	// Partial — просмотр прерван по ctx (EvalTimeout/отмена): правила
+	// просмотрены не все, итог неполон. Потребитель, фиксирующий
+	// результат (воркер), не должен записывать его как полный (AN-09).
+	Partial bool
 }
 
 // metaTagRe вырезает meta-теги из HTML. Закрывающий «>» ищется вне
@@ -61,7 +65,8 @@ func (s *Set) Evaluate(page Page) Result {
 // (анализатор задаёт бюджет отмены shutdown/потребления, тесты — узкие
 // лимиты). Нулевые Limits целиком включают DefaultLimits; контекст
 // проверяется между правилами и между значениями cookie/заголовков; при
-// отмене просмотр прекращается, результат содержит сработавшее до отмены.
+// отмене просмотр прекращается, результат содержит сработавшее до отмены
+// и помечается Partial (полным его считать нельзя).
 func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
 	if lim == (Limits{}) {
 		lim = DefaultLimits()
@@ -77,7 +82,8 @@ func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
 	var matched []Rule
 	for _, r := range s.Rules {
 		if ctx.Err() != nil {
-			break // бюджет времени исчерпан — что нашли, то нашли
+			res.Partial = true
+			break // бюджет времени исчерпан — что нашли, то нашли (неполно)
 		}
 		ev, ok := matchRule(ctx, r, page, lim)
 		if !ok {

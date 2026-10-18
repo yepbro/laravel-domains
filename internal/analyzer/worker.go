@@ -297,6 +297,16 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		Cookies: row.cookies,
 		Headers: row.headers,
 	}, rules.Limits{}) // нулевые Limits → DefaultLimits (T-069)
+	if res.Partial {
+		// Бюджет времени исчерпан (EvalTimeout) или ctx отменён — правила
+		// просмотрены не все: усечённый результат нельзя записывать и
+		// штамповать rules_version как полный. Доставка подтверждается:
+		// строка остаётся устаревшей, переанализ (T-074) вернётся к ней
+		// (практически недостижимо при RE2 на ограниченном входе).
+		w.opt.log().Warn("анализ прерван до полного просмотра правил — findings не записаны, строка останется для переанализа",
+			"domain", name, "signals", len(res.Signals), "rules_version", set.Version)
+		return false, nil
+	}
 	isLaravel := res.IsLaravel(w.opt.MinScore)
 
 	signals, err := marshalSignals(res.Signals)
