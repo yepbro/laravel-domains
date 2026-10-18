@@ -649,6 +649,70 @@ func TestFetchGzipBomb(t *testing.T) {
 	}
 }
 
+// TestFetchGzipJustOverLimit: сжатое тело чуть больше лимита ведёт себя
+// как несжатое сверх лимита (TestFetchBodyLimitExactAndTruncated в
+// limits_test.go): обрезка по лимиту с Truncated и чтение без ошибки
+// (ТЗ 8 «данные частичны, статус получен»), а не ErrDecompressTooLarge,
+// который воркер прочёл бы как read-ошибку и погасил бы Available
+// живого сайта. Потолки распаковки и чтения равны (боевая сборка
+// NewOptions ставит оба из http.max_body_bytes).
+func TestFetchGzipJustOverLimit(t *testing.T) {
+	run := func(t *testing.T, size, limit int, wantTrunc bool) {
+		t.Helper()
+		srv, _ := encodingServer(t, gzipBytes(t, bytes.Repeat([]byte("z"), size)), map[string]string{
+			"Content-Encoding": "gzip",
+		})
+		f := NewFetcher(Options{
+			MaxBodyBytes: int64(limit),
+			Limits:       &LimitOptions{MaxBodyBytes: int64(limit)},
+		})
+		res := fetchFrom(t, f, srv.URL)
+		defer func() { _ = res.Body.Close() }()
+		b, readErr := io.ReadAll(res.Body)
+		if readErr != nil {
+			t.Fatalf("обрезка — не ошибка чтения: %v", readErr)
+		}
+		if len(b) != min(size, limit) {
+			t.Errorf("прочитано %d байт, ожидалось %d", len(b), min(size, limit))
+		}
+		if res.BodyLimiter == nil || !res.BodyLimiter.Truncated() == wantTrunc {
+			t.Errorf("признак обрезки: %v, ожидался %v", res.BodyLimiter.Truncated(), wantTrunc)
+		}
+	}
+	t.Run("ровно в лимит", func(t *testing.T) { run(t, 1000, 1000, false) })
+	t.Run("на байт больше", func(t *testing.T) { run(t, 1001, 1000, true) })
+	t.Run("заметно больше", func(t *testing.T) { run(t, 64<<10, 1000, true) })
+}
+
+// TestFetchGzipBombUnderLimiter: бомба при включённых лимитах T-049 —
+// данные частичны: тело читается до лимита без ошибки, признак
+// Truncated выставляется (дальше лимита+1 распаковка не идёт). Ошибка
+// ErrDecompressTooLarge остаётся защитой пути без лимитёра
+// (TestFetchGzipBomb).
+func TestFetchGzipBombUnderLimiter(t *testing.T) {
+	bomb := bytes.Repeat([]byte("A"), 1<<20)
+	srv, _ := encodingServer(t, gzipBytes(t, bomb), map[string]string{
+		"Content-Encoding": "gzip",
+	})
+	const limit = 64 << 10
+	f := NewFetcher(Options{
+		MaxBodyBytes: limit,
+		Limits:       &LimitOptions{MaxBodyBytes: limit},
+	})
+	res := fetchFrom(t, f, srv.URL)
+	defer func() { _ = res.Body.Close() }()
+	b, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		t.Fatalf("бомба под лимитёром — обрезка, не ошибка чтения: %v", readErr)
+	}
+	if len(b) != limit {
+		t.Errorf("прочитано %d байт, ожидался лимит %d", len(b), limit)
+	}
+	if !res.BodyLimiter.Truncated() {
+		t.Error("признак обрезки не выставлен")
+	}
+}
+
 // TestFetchGzipCharsetChain: сжатие + кодировка вместе: gzip поверх
 // windows-1251, заголовок объявляет charset — после Fetch и ToUTF8
 // потребитель видит русский UTF-8 (хэш дедупа и raw_len хранилища
