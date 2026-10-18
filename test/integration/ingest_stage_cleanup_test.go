@@ -49,6 +49,7 @@ func (e *ingestEnv) stageOrphanRows(t *testing.T, batchID []byte, zoneID int16, 
 // TestIngest_CleanupStaleBatches — старше порога удаляется, у порога
 // (но моложе) и свежая живут; повторный проход — no-op.
 func TestIngest_CleanupStaleBatches(t *testing.T) {
+	skipUnlessIntegration(t)
 	e := newIngestEnv(t)
 	ctx := context.Background()
 
