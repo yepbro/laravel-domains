@@ -107,8 +107,22 @@ func Up(ctx context.Context, dsn string) error {
 
 	m, err := migrate.NewWithInstance("iofs", src, "postgres", driver)
 	if err != nil {
+		// Драйвер уже держит выделенное соединение — закрываем, чтобы
+		// не протекать и на этом пути.
+		if cerr := driver.Close(); cerr != nil {
+			slog.Warn("миграции: закрытие драйвера", "err", cerr)
+		}
 		return fmt.Errorf("миграции: инициализация: %w", err)
 	}
+	// m.Close закрывает источник и драйвер: выделенное драйвером
+	// соединение возвращается пулу немедленно, а не живёт без владельца
+	// до сборщика мусора (db.Close закрывает только простаивающие
+	// соединения, in-use остаётся висеть).
+	defer func() {
+		if _, cerr := m.Close(); cerr != nil {
+			slog.Warn("миграции: закрытие раннера", "err", cerr)
+		}
+	}()
 	m.LockTimeout = lockTimeout
 
 	err = m.Up()
