@@ -151,7 +151,8 @@ func LoadDir(dir string) (*Set, error) {
 // validate проверяет набор целиком: непустоту, уникальность id, типы target,
 // применимость match/regex к цели, компилируемость и лимит длины regex
 // (MaxPatternBytes — граница входа едина для загрузчика и движка),
-// диапазон веса и корректность границ версий.
+// отбраковку паттернов, матчащих пустую строку, диапазон веса
+// и корректность границ версий.
 func (s *Set) validate() error {
 	if len(s.Rules) == 0 {
 		return fmt.Errorf("rules: набор правил пуст (нужен хотя бы один файл с rules:)")
@@ -181,8 +182,15 @@ func (s *Set) validate() error {
 				return fmt.Errorf("%s: regex длиннее лимита %d байт (MaxPatternBytes), задан %d байт",
 					where, max, len(r.Regex))
 			}
-			if _, err := regexp.Compile(r.Regex); err != nil {
+			re, err := regexp.Compile(r.Regex)
+			if err != nil {
 				return fmt.Errorf("%s: некорректный regex: %w", where, err)
+			}
+			// Паттерн вида ^ / x* / (?:) срабатывал бы на любом входе с
+			// пустым свидетельством — «правило-всегда-истина», незаметное
+			// по свидетельству (AN-07). Отбраковываем при загрузке.
+			if re.MatchString("") {
+				return fmt.Errorf("%s: regex матчит пустую строку — правило срабатывало бы на любом входе", where)
 			}
 		}
 		if r.VerMin != "" && parseVersion(r.VerMin) == nil {

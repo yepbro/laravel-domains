@@ -258,6 +258,27 @@ rules:
 `},
 		{"regex длиннее MaxPatternBytes", "rules:\n  - id: long_regex\n    target: html\n    regex: \"" +
 			strings.Repeat("a", DefaultLimits().MaxPatternBytes+1) + "\"\n    weight: 0.5\n"},
+		{"regex матчит пустую строку (якорь)", `
+rules:
+  - id: empty_anchor
+    target: html
+    regex: "^"
+    weight: 0.5
+`},
+		{"regex матчит пустую строку (звёздочка)", `
+rules:
+  - id: empty_star
+    target: html
+    regex: "x*"
+    weight: 0.5
+`},
+		{"regex матчит пустую строку (пустая группа)", `
+rules:
+  - id: empty_group
+    target: html
+    regex: "(?:)"
+    weight: 0.5
+`},
 		{"ver_min больше ver_max", `
 rules:
   - id: ver_swap
