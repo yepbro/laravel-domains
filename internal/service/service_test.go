@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -21,6 +22,7 @@ import (
 
 	"crawler/internal/config"
 	"crawler/internal/metrics"
+	"crawler/internal/migrate"
 )
 
 // ---- Логирование ----
@@ -599,10 +601,55 @@ func TestRunSignalDuringMigrationWait(t *testing.T) {
 	}
 }
 
-// TestRunSignalDuringMigrationApply — сигнал в фазе применения не
-// прерывает миграцию (golang-migrate не принимает контекст): она
-// дорабатывает, затем сервис останавливается штатно, не запуская
-// рабочую логику.
+// TestRunSignalDuringMigrationInterrupted — сигнал в фазе применения
+// прерывает миграцию на стороне PostgreSQL (T-112): migrate.Up возвращает
+// ErrInterrupted (миграция откатана, версия — последняя применённая),
+// сервис завершается штатно (nil), не запуская рабочую логику.
+func TestRunSignalDuringMigrationInterrupted(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+
+	started := make(chan struct{})
+	restore := withMigrateUp(func(ctx context.Context, _ string) error {
+		close(started)
+		<-ctx.Done() // «применение»: снято сигналом через pg_cancel_backend
+		return fmt.Errorf("%w: миграция 8 отменена и откатана: %w",
+			migrate.ErrInterrupted, errors.New("canceling statement due to user request"))
+	})
+	defer restore()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Name:        "run-test",
+			PGDSN:       "postgres://crawler@127.0.0.1:1/crawler",
+			MetricsAddr: "127.0.0.1:0",
+			Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
+			OnRun: func(context.Context) error {
+				t.Error("OnRun не должен запускаться: сигнал пришёл во время миграций")
+				return nil
+			},
+		})
+	}()
+
+	<-started
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v, хочу nil (миграция прервана и откатана — штатная остановка)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run не завершился после SIGTERM во время применения миграций")
+	}
+}
+
+// TestRunSignalDuringMigrationApply — запасной путь, когда снятие
+// применяющейся миграции невозможно (не-URL DSN, БД недоступна): миграция
+// дорабатывает до конца (C-04), затем сервис останавливается штатно,
+// не запуская рабочую логику.
 func TestRunSignalDuringMigrationApply(t *testing.T) {
 	prev := slog.Default()
 	defer slog.SetDefault(prev)

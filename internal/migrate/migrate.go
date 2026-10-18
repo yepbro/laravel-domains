@@ -13,6 +13,12 @@
 //     migrate и раннер тоже не конфликтуют;
 //   - повторный запуск на актуальной схеме не ошибка (migrate.ErrNoChange
 //     считается успехом) — hot reload (air) и рестарты безопасны;
+//   - сигнал завершения (отмена контекста) прерывает и применение:
+//     golang-migrate Up не принимает контекст, поэтому раннер сам снимает
+//     выполняющийся SQL запросом pg_cancel_backend (соединения раннера
+//     помечены уникальным application_name), недоведённый файл миграции
+//     откатывается PostgreSQL целиком, а версия схемы возвращается к
+//     последней применённой — повторный старт применяет её заново (T-112);
 //   - dirty-состояние (прерванная миграция) — ошибка с понятным текстом;
 //     восстановление: make psql → TRUNCATE schema_migrations (см. docs).
 package migrate
@@ -23,9 +29,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"os"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -48,6 +59,11 @@ var (
 	// connectTimeout — ожидание доступности PostgreSQL при старте
 	// (за пределами compose сервис может подняться раньше БД).
 	connectTimeout = 30 * time.Second
+	// cancelTimeout — бюджет на снятие применяющейся миграции по сигналу:
+	// pg_cancel_backend по собственным соединениям раннера через
+	// pg_stat_activity. Не уложились — отмена не состоялась, миграция
+	// дорабатывает до конца (поведение C-04).
+	cancelTimeout = 5 * time.Second
 )
 
 // connectRetryInterval — пауза между попытками подключиться.
@@ -69,16 +85,39 @@ const advisoryLockKey = 0x63726177 // "craw"
 // пока версия не подтверждена вручную.
 var ErrDirty = errors.New("миграции: схема в dirty-состоянии (прерванная миграция); выполните TRUNCATE schema_migrations или `migrate force <версия>` после разбора причины")
 
+// ErrInterrupted возвращается, когда применение прервано отменой контекста
+// (сигналом завершения): выполнявшийся SQL снят на стороне PostgreSQL,
+// недоведённый файл миграции откатился целиком, версия схемы возвращена к
+// последней применённой. Повторный старт применит прерванную миграцию
+// заново — это штатная быстрая остановка, а не сбой.
+var ErrInterrupted = errors.New("миграции: применение прервано сигналом завершения")
+
+// runnerAppPrefix — префикс application_name соединений раннера;
+// tagSeq делает метку уникальной на вызов Up: отмена миграции по сигналу
+// адресует строго собственные соединения и не трогает применяющую
+// миграцию другого экземпляра при параллельном старте сервисов.
+var (
+	runnerAppPrefix = "crawler-migrations"
+	tagSeq          atomic.Uint64
+)
+
 // Up применяет все встроенные миграции (up) до актуальной версии.
-// Блокирует вызывающего до завершения (включая ожидание БД и блокировки);
-// миграции применяются быстрее, чем истекает таймаут контекста, поэтому
-// ctx используется только на этапах подключения и ожидания блокировки.
+// Блокирует вызывающего до завершения (включая ожидание БД и блокировки).
+// Отмена ctx прерывает не только фазы ожидания, но и применение:
+// golang-migrate Up контекст не принимает, поэтому раннер снимает
+// выполняющийся SQL на стороне PostgreSQL (см. cancelApplying), после
+// чего возвращает ErrInterrupted — повторный старт доводит применение.
 func Up(ctx context.Context, dsn string) error {
 	if dsn == "" {
 		return errors.New("миграции: пустой DSN PostgreSQL")
 	}
 
-	db, err := openAndWait(ctx, dsn)
+	// Метка соединений: по ней pg_cancel_backend адресует только этот
+	// вызов Up. Не-URL DSN метку не получает — отмена применения
+	// недоступна, остаётся поведение C-04 (миграция дорабатывает).
+	tag := fmt.Sprintf("%s-%d-%d", runnerAppPrefix, os.Getpid(), tagSeq.Add(1))
+
+	db, err := openAndWait(ctx, withRunnerTag(dsn, tag))
 	if err != nil {
 		return err
 	}
@@ -129,7 +168,27 @@ func Up(ctx context.Context, dsn string) error {
 	}()
 	m.LockTimeout = lockTimeout
 
+	// Фазы подключения и advisory-блокировки выше прерываемы самим ctx;
+	// инициализация драйвера и m.Up — нет (golang-migrate не принимает
+	// контекст). Наблюдатель по отмене ctx снимает выполняющийся SQL
+	// запросом pg_cancel_backend — это прерывает и ожидание внутренней
+	// блокировки golang-migrate, и применяющуюся миграцию.
+	upDone := make(chan struct{})
+	watchDone := make(chan struct{})
+	var cancelled atomic.Bool
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ctx.Done():
+			cancelled.Store(cancelApplying(db, tag))
+		case <-upDone:
+		}
+	}()
+
 	err = m.Up()
+	close(upDone)
+	<-watchDone // отмена завершилась до разбора результата — без гонки с флагом
+
 	switch {
 	case err == nil:
 		version, _, verr := m.Version()
@@ -141,11 +200,103 @@ func Up(ctx context.Context, dsn string) error {
 	case errors.Is(err, migrate.ErrNoChange):
 		slog.Info("миграции: схема уже актуальна, применение не требуется")
 		return nil
+	case cancelled.Load():
+		return interrupted(driver, m, err)
 	case errors.As(err, new(migrate.ErrDirty)):
 		return ErrDirty
 	default:
 		return fmt.Errorf("миграции: применение: %w", err)
 	}
+}
+
+// interrupted оформляет результат прерванного отменой применения.
+//
+// Если отменено само тело миграции (драйвер помечает такую ошибку
+// «migration failed»), dirty-строка версии гарантированно принадлежит
+// этому прерванному применению: PostgreSQL выполняет файл миграции одним
+// запросом простого протокола — все инструкции в одной неявной транзакции,
+// отмена откатывает файл целиком. Раннер возвращает версию к предыдущей
+// применённой (семантика `migrate force <v−1>`), и повторный старт
+// применяет миграцию заново, а не упирается в dirty.
+//
+// Отмена в прочих фазах (ожидание внутренней блокировки golang-migrate,
+// инициализация драйвера) состояние схемы не меняла — сброс не нужен.
+func interrupted(driver database.Driver, m *migrate.Migrate, err error) error {
+	if !interruptedInRun(err) {
+		return fmt.Errorf("%w: применение остановлено до тела миграции, состояние схемы не менялось: %w", ErrInterrupted, err)
+	}
+
+	version, dirty, verr := m.Version()
+	if verr != nil || !dirty || version == 0 {
+		return fmt.Errorf("%w: состояние версии не удалось подтвердить: %w", ErrInterrupted, err)
+	}
+
+	prev := int(version) - 1
+	if prev == 0 {
+		prev = database.NilVersion // миграция была первой: версия — пустая таблица
+	}
+	if serr := driver.SetVersion(prev, false); serr != nil {
+		// Схема откатана (неявная транзакция), но строка версии осталась
+		// dirty: следующий старт упрётся в ErrDirty — направление
+		// восстановления то же, что и для любой прерванной миграции.
+		return fmt.Errorf("%w: миграция %d отменена и откатана, но версия не восстановлена (осталась dirty): %w; откат версии: %v",
+			ErrInterrupted, version, err, serr)
+	}
+	slog.Warn("миграции: применение прервано сигналом, миграция откатана, схема на предыдущей версии",
+		"interrupted_version", version, "rolled_back_to", prev)
+	return fmt.Errorf("%w: миграция %d отменена и откатана целиком, схема на версии %d, повторный старт применит её заново: %w",
+		ErrInterrupted, version, prev, err)
+}
+
+// interruptedInRun — ошибка Up из тела миграции: драйвер pgx помечает
+// сбой выполнения SQL меткой «migration failed» (для PgError — с текстом
+// сервера после метки, например «migration failed: canceling statement…»).
+// Только такая ошибка после нашей отмены означает, что dirty-строка
+// версии выставлена этим применением (SetVersion(v, true) — до выполнения
+// файла, снимается после).
+func interruptedInRun(err error) bool {
+	var dbErr database.Error
+	return errors.As(err, &dbErr) && strings.HasPrefix(dbErr.Err, "migration failed")
+}
+
+// cancelApplying снимает выполняющиеся SQL-запросы соединений этого
+// вызова Up (метка tag в pg_stat_activity): так прерывается применяющаяся
+// миграция — golang-migrate контекст не принимает, но PostgreSQL отменяет
+// запрос pg_cancel_backend, и файл миграции откатывается целиком.
+// Фильтр state = 'active' щадит простаивающие соединения раннера
+// (advisory-блокировка), а уникальная метка — применяющую миграцию
+// другого экземпляра и соединения сервисов. Возвращает true, только если
+// хотя бы один запрос реально отменён.
+func cancelApplying(db *sql.DB, tag string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), cancelTimeout)
+	defer cancel()
+	const query = `
+		SELECT count(*) FILTER (WHERE pg_cancel_backend(pid))
+		FROM pg_stat_activity
+		WHERE application_name = $1
+		  AND state = 'active'
+		  AND pid <> pg_backend_pid()`
+	var n int
+	if err := db.QueryRowContext(ctx, query, tag).Scan(&n); err != nil {
+		slog.Warn("миграции: снять применяющуюся миграцию не удалось — доработает до конца", "err", err)
+		return false
+	}
+	return n > 0
+}
+
+// withRunnerTag добавляет в URL-DSN метку application_name: соединения
+// раннера видны в pg_stat_activity и адресуемы для отмены при сигнале
+// завершения. Не-URL DSN возвращается без изменений — метки нет, отмена
+// применения недоступна (миграция дорабатывает, поведение C-04).
+func withRunnerTag(dsn, tag string) string {
+	u, err := url.Parse(dsn)
+	if err != nil || u.Scheme == "" || u.Opaque != "" {
+		return dsn
+	}
+	q := u.Query()
+	q.Set("application_name", tag)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // acquireAdvisoryLock ждёт pg_advisory_lock не дольше lockTimeout:

@@ -10,6 +10,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +19,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/migrate"
@@ -222,6 +225,166 @@ func TestMigrate_ConcurrentStart(t *testing.T) {
 	if version, ok := schemaVersion(t, dsn); !ok || version != latestEmbeddedVersion(t) {
 		t.Errorf("версия после гонки старта = %d (ok=%v), want %d", version, ok, latestEmbeddedVersion(t))
 	}
+}
+
+// TestMigrate_InterruptedMidApply — отмена контекста (сигнал завершения
+// сервиса) во время применения длительной миграции (T-112): выполнявшийся
+// SQL снимается на стороне PostgreSQL по метке раннера, недоведённая
+// миграция откатывается целиком (файл — одна неявная транзакция простого
+// протокола), версия возвращается к предыдущей — и повторный старт
+// доводит применение, не оставляя dirty.
+//
+// Длительная миграция моделируется детерминированно: применению 000008
+// (CREATE INDEX, снимается блокировкой записи) препятствует транзакция,
+// держащая ROW EXCLUSIVE на domains, — CREATE INDEX ждёт её освобождения.
+func TestMigrate_InterruptedMidApply(t *testing.T) {
+	skipUnlessIntegration(t)
+
+	dsn, cleanup := withTestSchema(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := migrate.Up(ctx, dsn); err != nil {
+		t.Fatalf("подготовка — полное применение: %v", err)
+	}
+
+	// Состояние «применено 7, предстоит 000008»: индексы 000008 снимаются
+	// её down-миграцией, версия возвращается к 7 (эквивалент force 7).
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	for _, stmt := range []string{
+		"DROP INDEX IF EXISTS domains_recheck_idx",
+		"DROP INDEX IF EXISTS domains_lease_idx",
+		"TRUNCATE schema_migrations",
+		"INSERT INTO schema_migrations (version, dirty) VALUES (7, false)",
+	} {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("подготовка версии 7 (%s): %v", stmt, err)
+		}
+	}
+
+	// Блокировщик: держит ROW EXCLUSIVE на domains — CREATE INDEX из 000008
+	// (нужен SHARE) висит до освобождения. Отдельное соединение без метки
+	// раннера: проверяет заодно, что отмена не трогает чужие запросы.
+	blocker, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("соединение блокировщика: %v", err)
+	}
+	defer func() { _ = blocker.Close(ctx) }()
+	if _, err := blocker.Exec(ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN блокировщика: %v", err)
+	}
+	defer func() { _, _ = blocker.Exec(ctx, "ROLLBACK") }()
+	if _, err := blocker.Exec(ctx, "LOCK TABLE domains IN ROW EXCLUSIVE MODE"); err != nil {
+		t.Fatalf("LOCK TABLE блокировщика: %v", err)
+	}
+
+	upCtx, cancelUp := context.WithCancel(ctx)
+	defer cancelUp()
+	upDone := make(chan error, 1)
+	go func() { upDone <- migrate.Up(upCtx, dsn) }()
+
+	// Миграция 000008 начала применяться: версия отмечена 8 dirty
+	// (golang-migrate ставит dirty до выполнения файла).
+	waitVersionState(t, dsn, 8, true)
+
+	cancelUp() // «сигнал завершения» во время применения
+	select {
+	case err := <-upDone:
+		if !errors.Is(err, migrate.ErrInterrupted) {
+			t.Fatalf("Up = %v, хочу migrate.ErrInterrupted", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Up не завершился после отмены — применяющаяся миграция не прервана")
+	}
+
+	// Недоведённая миграция откатана: версия 7 чистая, dirty нет,
+	// индексы 000008 не созданы (неявная транзакция откатила CREATE INDEX).
+	version, dirty := schemaVersionState(t, dsn)
+	if version != 7 || dirty {
+		t.Errorf("после прерывания: версия = %d dirty = %v, want 7 false (сброс к предыдущей)", version, dirty)
+	}
+	for _, idx := range []string{"domains_lease_idx", "domains_recheck_idx"} {
+		if indexExists(t, pool, idx) {
+			t.Errorf("индекс %s создан прерванной миграцией — файл не откатился целиком", idx)
+		}
+	}
+
+	// Повторный старт доводит применение до конца.
+	if _, err := blocker.Exec(ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("освобождение блокировщика: %v", err)
+	}
+	if err := migrate.Up(ctx, dsn); err != nil {
+		t.Fatalf("повторный старт: %v", err)
+	}
+	if version, dirty := schemaVersionState(t, dsn); version != 8 || dirty {
+		t.Errorf("после повторного старта: версия = %d dirty = %v, want 8 false", version, dirty)
+	}
+	for _, idx := range []string{"domains_lease_idx", "domains_recheck_idx"} {
+		if !indexExists(t, pool, idx) {
+			t.Errorf("индекс %s не создан повторным применением", idx)
+		}
+	}
+}
+
+// waitVersionState ждёт, пока schema_migrations примет указанное состояние
+// (применение миграции стартовало: версия помечена dirty), опрашивая
+// отдельным пулом — соединения раннера заняты применением.
+func waitVersionState(t *testing.T, dsn string, wantVersion int, wantDirty bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("подключение для опроса версии: %v", err)
+	}
+	defer pool.Close()
+	for {
+		var version int
+		var dirty bool
+		err := pool.QueryRow(ctx, "SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty)
+		if err == nil && version == wantVersion && dirty == wantDirty {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("версия не достигла %d dirty=%v: последняя ошибка опроса %v", wantVersion, wantDirty, err)
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+// schemaVersionState — текущая запись schema_migrations (версия и dirty).
+func schemaVersionState(t *testing.T, dsn string) (int, bool) {
+	t.Helper()
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("подключение: %v", err)
+	}
+	defer pool.Close()
+	var version int
+	var dirty bool
+	if err := pool.QueryRow(context.Background(),
+		"SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty); err != nil {
+		t.Fatalf("чтение schema_migrations: %v", err)
+	}
+	return version, dirty
+}
+
+// indexExists — индекс существует в текущей схеме DSN.
+func indexExists(t *testing.T, pool *pgxpool.Pool, name string) bool {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(),
+		"SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1)",
+		name,
+	).Scan(&exists); err != nil {
+		t.Fatalf("чтение pg_indexes (%s): %v", name, err)
+	}
+	return exists
 }
 
 // TestMigrate_EmbeddedSetMatchesRepo — встроенный в бинарник набор

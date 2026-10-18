@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"regexp"
@@ -16,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/golang-migrate/migrate/v4/database"
 
 	"crawler/migrations"
 )
@@ -252,6 +255,78 @@ func TestRedactDSN(t *testing.T) {
 	for _, c := range cases {
 		if got := redactDSN(c.dsn); got != c.want {
 			t.Errorf("%s: redactDSN = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestWithRunnerTag — метка application_name адресует соединения раннера
+// для отмены применяющейся миграции (T-112): URL-DSN получает метку с
+// сохранением остальных параметров, не-URL DSN проходит без изменений
+// (отмена недоступна — работает поведение C-04 «дорабатывает»).
+func TestWithRunnerTag(t *testing.T) {
+	const tag = "crawler-migrations-123-1"
+	cases := []struct {
+		name, dsn, want string
+	}{
+		{
+			"URL с параметрами",
+			"postgres://crawler:secret@127.0.0.1:5432/crawler?sslmode=disable",
+			"postgres://crawler:secret@127.0.0.1:5432/crawler?application_name=" + tag + "&sslmode=disable",
+		},
+		{
+			"application_name перезаписывается (раннер обязан быть отличим)",
+			"postgres://crawler@localhost:5432/crawler?application_name=custom",
+			"postgres://crawler@localhost:5432/crawler?application_name=" + tag,
+		},
+		{
+			"URL без параметров",
+			"postgres://crawler@localhost/crawler",
+			"postgres://crawler@localhost/crawler?application_name=" + tag,
+		},
+		{
+			"keyword-DSN — без метки",
+			"host=localhost port=5432 user=crawler",
+			"host=localhost port=5432 user=crawler",
+		},
+		{
+			"мусор — без метки",
+			"not a url at all",
+			"not a url at all",
+		},
+	}
+	for _, c := range cases {
+		if got := withRunnerTag(c.dsn, tag); got != c.want {
+			t.Errorf("%s: withRunnerTag = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestInterruptedInRun — якорь решения об откате версии (T-112): сброс
+// dirty-строки после отмены допустим только для ошибки из тела миграции
+// (драйвер pgx помечает её «migration failed») — тогда dirty-строка
+// гарантированно выставлена нашим прерванным применением.
+func TestInterruptedInRun(t *testing.T) {
+	inRun := database.Error{OrigErr: errors.New("57014"), Err: "migration failed"}
+	// Форма PgError: драйвер дописывает текст сервера после метки.
+	inRunMsg := database.Error{OrigErr: errors.New("57014"), Err: "migration failed: canceling statement due to user request"}
+	lockWait := database.Error{OrigErr: errors.New("57014"), Err: "try lock failed"}
+	setVersion := database.Error{OrigErr: errors.New("57014")}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"тело миграции", inRun, true},
+		{"тело миграции с текстом сервера", inRunMsg, true},
+		{"тело миграции, обёрнутая", fmt.Errorf("миграции: применение: %w", inRun), true},
+		{"ожидание внутренней блокировки", lockWait, false},
+		{"SetVersion без метки", setVersion, false},
+		{"посторонняя ошибка", errors.New("network"), false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := interruptedInRun(c.err); got != c.want {
+			t.Errorf("%s: interruptedInRun = %v, want %v", c.name, got, c.want)
 		}
 	}
 }
