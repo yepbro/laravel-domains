@@ -45,18 +45,15 @@ x-go-common: &go-common
     GOMODCACHE: /gomod
     GOCACHE: /gocache
     GOFLAGS: -mod=readonly
-    # Значения подставляются из .env; DSN/адреса — статические IP сети crawler_net.
+    # Значения подставляются из .env; DSN — статический IP сети crawler_net.
     # CRAWLER_CONFIG — путь к единому YAML (internal/config, ТЗ 5.10);
     # переменные CRAWLER_* переопределяют значения из него (docs/configuration.md).
+    # Только переменные, которые код действительно читает: адреса Redis и
+    # резолвера, пути каталогов сервисы берут из config.dev.yaml, а не из
+    # окружения (таблица envSpecs в internal/config).
     APP_PG_DSN: postgres://${APP_DB_USER:-crawler}:${APP_DB_PASSWORD:-dev-only-crawler}@172.28.100.2:5432/${POSTGRES_DB:-crawler}?sslmode=disable
-    APP_REDIS_ADDR: 172.28.100.3:6379
-    APP_RESOLVER: 172.28.100.10:53
     CRAWLER_CONFIG: /etc/crawler/config.yaml
     CRAWLER_HTTP_USER_AGENT: "${CRAWLER_USER_AGENT:-DomainCrawler/dev (+dev-environment; contact: dev@example.invalid)}"
-    APP_RULES_DIR: /etc/crawler/rules
-    APP_INCOMING_DIR: /data/incoming
-    APP_CONTENT_DIR: /data/content
-    CHROMIUM_WS_URL: ws://172.28.100.14:9222
   volumes:
     - .:/src                      # исходный код (bind, hot reload)
     - gomodcache:/gomod           # кэш Go-модулей (общий, именованный том)
@@ -519,6 +516,14 @@ services:
     <<: *go-common
     build: *go-build
     command: ["sleep", "infinity"]
+    environment:
+      # Поверх общих переменных — адрес CDP dev-chromium для live-тестов
+      # рендера (internal/render/*_live_test.go) и приёмочных тестов
+      # (accChromiumWS); тесты запускаются именно в tools (make test /
+      # make test-integration). Сервисам приложения не нужен: воркер берёт
+      # адрес из render.remote_url в config.dev.yaml.
+      <<: *go-common-env
+      CHROMIUM_WS_URL: ws://172.28.100.14:9222
     volumes:
       - .:/src
       - gomodcache:/gomod
