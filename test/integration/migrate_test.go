@@ -250,12 +250,18 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 
 	// Состояние «применено 7, предстоит 000008»: индексы 000008 снимаются
 	// её down-миграцией, версия возвращается к 7 (эквивалент force 7).
+	// Псевдо-откат обязан покрывать и миграции ПОСЛЕ 000008 (новые —
+	// дополнять сюда их down-эффектами), иначе повторный Up споткнётся
+	// в них: 000009 возвращает глобальный ключ ingest_files.sha256.
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pool.Close()
 	for _, stmt := range []string{
+		"DROP INDEX IF EXISTS ingest_files_sha256_idx",
+		"DROP INDEX IF EXISTS ingest_files_zone_id_action_sha256_key",
+		"ALTER TABLE ingest_files ADD CONSTRAINT ingest_files_sha256_key UNIQUE (sha256)",
 		"DROP INDEX IF EXISTS domains_recheck_idx",
 		"DROP INDEX IF EXISTS domains_lease_idx",
 		"TRUNCATE schema_migrations",
