@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -207,7 +208,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	rep.Accepted = int64(vres.Accepted)
 	rep.Reasons = vres.Reasons
 	if err != nil {
-		p.discard(ctx, id)
+		p.discard(id)
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: err}
 	}
 
@@ -217,9 +218,13 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		if derr := p.clearBatch(ctx, id); derr != nil {
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
+		// Числитель/знаменатель — как в вердикте streamStage: отказы
+		// парсера (invalid_utf8, line_len) плюс отказы валидатора.
+		rejectedAll := int64(st.Rejected) + int64(vres.Rejected)
+		contentAll := int64(vres.Total) + int64(st.Rejected)
 		return p.failFile(abs, rep, fmt.Errorf(
 			"доля отклонённых строк %d из %d выше ingest.max_error_ratio (%g)",
-			vres.Rejected, vres.Total, p.opts.MaxErrorRatio))
+			rejectedAll, contentAll, p.opts.MaxErrorRatio))
 	}
 
 	// Идемпотентность (ТЗ 5.1): тот же файл (по содержимому — sha256,
@@ -227,12 +232,26 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	known, err := p.files.FileBySHA256(ctx, rep.SHA256)
 	switch {
 	case err != nil && !errors.Is(err, ErrFileNotFound):
-		p.discard(ctx, id)
+		p.discard(id)
 		return Outcome{Kind: OutcomeLeft, Report: rep,
 			Err: fmt.Errorf("ingest: проверка дубля файла %s: %w", f.Path, err)}
 	case err == nil:
 		if derr := p.clearBatch(ctx, id); derr != nil {
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
+		}
+		// Дубль с другой операцией/зоной — по контракту идемпотентности
+		// по содержимому (docs/incoming-files.md §5: уникальный sha256,
+		// docs/schema.md) файл всё равно не применяется (в т.ч. «тот же
+		// список в delete/ после add/», 63da59c). Это может быть
+		// неожиданностью для оператора — подсвечиваем Warn (ING-P2-5).
+		if (known.Action != nil && *known.Action != f.Action) ||
+			(known.ZoneID != nil && *known.ZoneID != z.ID) {
+			p.log.Warn("дубль по sha256 с другой операцией или зоной — не применяется (идемпотентность по содержимому)",
+				"path", f.Path, "action", f.Action.String(), "zone_id", z.ID,
+				"first_path", derefString(known.Path),
+				"first_action", derefAction(known.Action),
+				"first_zone_id", derefInt16(known.ZoneID),
+				"first_processed_at", derefTime(known.ProcessedAt))
 		}
 		if _, merr := p.moveFile(DirProcessed, f.Path, abs); merr != nil {
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: merr}
@@ -251,7 +270,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	case model.ActionAdd:
 		res, aerr := ApplyAdd(ctx, p.pool, batch)
 		if aerr != nil {
-			p.discard(ctx, id)
+			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: aerr}
 		}
 		rep.Added = res.Inserted + res.Revived
@@ -260,7 +279,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	case model.ActionDelete:
 		res, derr := ApplyDelete(ctx, p.pool, batch)
 		if derr != nil {
-			p.discard(ctx, id)
+			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
 		rep.Deleted = res.Deleted
@@ -293,8 +312,9 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 // поток r идёт в парсер (T-015), значимые строки валидируются (T-016) и
 // грузятся в staging (T-017) по мере разбора. Возвращает счётчики
 // парсера, итог валидации (Reasons — уже объединённые с построчными
-// отклонениями парсера) и число загруженных строк. Ошибка — сбой чтения
-// файла или загрузки; счётчики соответствуют отданному.
+// отклонениями парсера; Failed — по доле отказов валидатора и парсера
+// вместе) и число загруженных строк. Ошибка — сбой чтения файла или
+// загрузки; счётчики соответствуют отданному.
 //
 // Парсер толкающий (OnLine), Stage — тянущий (RowIter): связка —
 // горутина-производитель и буферизованный канал. Память ограничена
@@ -309,6 +329,13 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	})
 	if err != nil {
 		return Stats{}, FileResult{}, 0, fmt.Errorf("ingest: файл %s: %w", f.Path, err)
+	}
+	// Построчные отказы парсера пишутся тем же rejected-логом, что и
+	// отказы валидатора (формат — Validator.reject): Reject.Text парсер
+	// уже обрезал (maxRejectText), nil-логгер — записи подавлены.
+	rejectLog := p.opts.RejectLog
+	if rejectLog == nil {
+		rejectLog = slog.New(slog.DiscardHandler)
 	}
 
 	rows := make(chan Row, stageChanSize)
@@ -336,6 +363,12 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 			},
 			OnReject: func(rj Reject) error {
 				prejects[rj.Reason]++
+				rejectLog.Warn("строка отклонена",
+					"file", f.Path,
+					"line", rj.Num,
+					"text", rj.Text,
+					"reason", string(rj.Reason),
+				)
 				return nil
 			},
 		})
@@ -368,6 +401,16 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	}
 	res := v.Finish()
 	res.Reasons = mergeReasons(prejects, res.Reasons)
+	// Построчные отказы парсера (invalid_utf8, line_len) до v.Line не
+	// доходят и потому не в счётчиках Finish — досчитываем их в порог
+	// сами: доля ошибок считается по всем содержательным строкам файла
+	// (битый дамп — именно не-UTF-8, docs/incoming-files.md §4), иначе
+	// файл целиком из мусора (Data = 0) прошёл бы как успешный (ING-P1-2).
+	if total := res.Total + st.Rejected; total > 0 {
+		if rejected := res.Rejected + st.Rejected; float64(rejected)/float64(total) > p.opts.MaxErrorRatio {
+			res.Failed = true
+		}
+	}
 	return st, res, staged, nil
 }
 
@@ -380,11 +423,21 @@ func (p *Pipeline) clearBatch(ctx context.Context, id BatchID) error {
 	return nil
 }
 
+// discardTimeout — запас на очистку партии после сбоя: отдельный
+// контекст с таймаутом, чтобы best-effort очистка не висела вечно.
+const discardTimeout = 5 * time.Second
+
 // discard — отбросить партию после инфраструктурного сбоя (best effort):
 // каждая попытка обработки берёт новый batch_id, строки неудачной партии
-// мертвы — чистим, чтобы staging не рос (T-017). Ошибка очистки не
-// затеняет основную: логируется.
-func (p *Pipeline) discard(ctx context.Context, id BatchID) {
+// мертвы — чистим, чтобы staging не рос (T-017). Вызывается и с уже
+// отменённым ctx (graceful shutdown в момент загрузки): очистка обязана
+// переживать отмену — иначе строки партии оставались бы в staging
+// навсегда (batch_id больше не встретится) и таблица росла от рестарта
+// к рестарту. Контекст — свой, с таймаутом; ошибка очистки не затеняет
+// основную: логируется.
+func (p *Pipeline) discard(id BatchID) {
+	ctx, cancel := context.WithTimeout(context.Background(), discardTimeout)
+	defer cancel()
 	if err := p.clearBatch(ctx, id); err != nil {
 		p.log.Warn("очистка отброшенной партии", "err", err)
 	}
@@ -392,13 +445,12 @@ func (p *Pipeline) discard(ctx context.Context, id BatchID) {
 
 // failFile — файл ошибочен: перемещение в failed/ и лог-отчёт рядом
 // (ТЗ 5.1). rel назначения — разобранный путь (зеркалит зону/операцию);
-// если путь не разобран, файл кладётся в failed/ по имени. Имя отчёта —
+// путь из неразобранного отчёта не доверяется (Process — публичный API,
+// абсолютный путь или «..» в компонентах filepath.Join вывел бы за
+// пределы failed/): файл кладётся по базовому имени. Имя отчёта —
 // <файл>.report.
 func (p *Pipeline) failFile(abs string, rep FileReport, reason error) Outcome {
-	rel := rep.Path
-	if rel == "" {
-		rel = filepath.Base(abs)
-	}
+	rel := archiveRel(rep.Path, abs)
 	dst, err := p.moveFile(DirFailed, rel, abs)
 	if err != nil {
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: err}
@@ -444,6 +496,20 @@ func (p *Pipeline) moveFile(archive, rel, abs string) (string, error) {
 	}
 }
 
+// archiveRel — безопасный относительный путь назначения внутри каталога
+// архива. Разобранный ParsePath путь безопасен по построению (path.Clean,
+// без «..» — T-014); неразобранный rep.Path не доверяется: абсолютный
+// путь или «..» в компонентах после filepath.Join выходили бы за пределы
+// processed/failed (ING-P3-1) — подставляется базовое имя файла.
+func archiveRel(rel, abs string) string {
+	if rel != "" && !path.IsAbs(rel) {
+		if c := path.Clean(rel); c != "." && c != ".." && !strings.HasPrefix(c, "../") {
+			return c
+		}
+	}
+	return filepath.Base(abs)
+}
+
 // derefString — значение NULL-колонки журнала для лога (пустая строка).
 func derefString(s *string) string {
 	if s == nil {
@@ -458,4 +524,20 @@ func derefTime(t *time.Time) time.Time {
 		return time.Time{}
 	}
 	return *t
+}
+
+// derefAction — значение NULL-колонки журнала для лога (пустое имя).
+func derefAction(a *model.Action) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
+}
+
+// derefInt16 — значение NULL-колонки журнала для лога (ноль).
+func derefInt16(v *int16) int16 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }

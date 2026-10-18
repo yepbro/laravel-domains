@@ -52,7 +52,7 @@ const (
 	// Сопоставимо с пачками планировщика (ТЗ 5.3: 1000–10 000): транзакция
 	// прохода остаётся короткой — блокировки строк subdomain_results
 	// удерживаются минимум времени, — а темп дренажа при интервале по
-	// умолчанию до 3,6 млн доменов в час.
+	// умолчанию (1000 доменов раз в минуту) — до 60 000 доменов в час.
 	DefaultCleanupBatch = 1000
 
 	// DefaultCleanupInterval — интервал проходов цикла CleanupDeleted.
@@ -64,7 +64,8 @@ const (
 // contentHashLen — размер content_hash → contents.hash: 16 байт, 128 бит
 // (ТЗ 6.1, 5.7). Проверяется при чтении RETURNING — дешёвый инвариант
 // против программных ошибок писателя результатов (T-056), как
-// MaxLabelLen в Stage.
+// MaxLabelLen в Stage. Неверная длина не роняет проход (poison pill,
+// ING-P2-4): строка уже удалена, refcount по ней не меняется.
 const contentHashLen = 16
 
 // SQL прохода. unnest-пачки — стиль пакетных UPDATE internal/db (ТЗ 6:
@@ -97,9 +98,12 @@ const (
 
 	// cleanupUpdateSQL — уменьшение refcount по агрегированным хэшам:
 	// один контент может ссылаться из многих удалённых результатов
-	// (дедупликация, ТЗ 5.7). refcount = 0 — не удаление строки: физически
+	// (дедупликация, ТЗ 5.7). GREATEST(..., 0) держит счётчик
+	// неотрицательным при рассинхронизации (CHECK в схеме нет): минус
+	// сломал бы инвариант «0 = мёртвый контент» для компактификации
+	// (T-042/T-045). refcount = 0 — не удаление строки: физически
 	// носитель чистит компактификация паков (этап 4, T-045).
-	cleanupUpdateSQL = "UPDATE contents SET refcount = refcount - h.n " +
+	cleanupUpdateSQL = "UPDATE contents SET refcount = GREATEST(refcount - h.n, 0) " +
 		"FROM unnest($1::bytea[], $2::int4[]) AS h(hash, n) " +
 		"WHERE contents.hash = h.hash"
 )
@@ -152,6 +156,10 @@ type CleanupResult struct {
 	Results int64
 	// Contents — строки contents с уменьшенным refcount (различные хэши).
 	Contents int64
+	// BadHashes — удалённые результаты с content_hash неверной длины
+	// (контракт contents — 16 октет, ТЗ 6.1): проход не роняется,
+	// refcount по ним не менялся; цикл CleanupDeleted помечает это Warn.
+	BadHashes int64
 }
 
 // cleanupKey — ключ домена: партиция + идентификатор, как PK domains.
@@ -267,9 +275,11 @@ func cleanupResults(ctx context.Context, tx pgx.Tx, zoneIDs []int16, domainIDs [
 		case hash == nil:
 			// Результат без контента (NULL content_hash) — ссылок не держит.
 		case len(hash) != contentHashLen:
-			return CleanupResult{}, nil, fmt.Errorf(
-				"ingest: очистка удалённых доменов: content_hash %x: %d октетов, ожидается %d (ТЗ 6.1)",
-				hash, len(hash), contentHashLen)
+			// Программная ошибка писателя результатов (T-056): строка уже
+			// удалена, ронять проход нельзя — один некорректный хэш блокировал
+			// бы очистку навсегда (кандидаты перевыбираются те же, ING-P2-4).
+			// Refcount по такой ссылке не трогаем, итог — BadHashes.
+			res.BadHashes++
 		default:
 			var h cleanupHash
 			copy(h[:], hash)
@@ -333,9 +343,17 @@ func CleanupDeleted(ctx context.Context, pool CleanupDB, opts CleanupOptions) er
 			// Отмена во время прохода — часть остановки, не тревога.
 		case err != nil:
 			log.Warn("проход очистки удалённых доменов", "err", err)
-		case res.Domains > 0:
-			log.Info("проход очистки удалённых доменов",
-				"domains", res.Domains, "results", res.Results, "contents", res.Contents)
+		default:
+			if res.BadHashes > 0 {
+				// Poison pill обезврежен (ING-P2-4): аномалия видна оператору,
+				// очистка продолжается.
+				log.Warn("удалены результаты с некорректным content_hash — refcount не менялся",
+					"bad_hashes", res.BadHashes)
+			}
+			if res.Domains > 0 {
+				log.Info("проход очистки удалённых доменов",
+					"domains", res.Domains, "results", res.Results, "contents", res.Contents)
+			}
 		}
 	}
 

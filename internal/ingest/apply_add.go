@@ -27,10 +27,13 @@ var (
 	// 000004), RowsAffected = число вставленных. Новые домены получают
 	// DEFAULT схемы: status = new, check_state = pending (ТЗ 6.2) — домен
 	// сразу в цикле проверок. is_idn вычисляется из метки (ТЗ 5.2 п. 9):
-	// staging флага не хранит, а метка — его единственный источник
-	// (ILIKE — префикс xn-- без учёта регистра, как idn.HasXNLabel).
+	// staging флага не хранит, а метка — его единственный источник.
+	// Условие — любая метка имени начинается с xn-- (метка бывает
+	// составной, ING-P1-1): первая ('xn--%') либо после точки
+	// ('%.xn--%') — эквивалент idn.HasXNLabel, ILIKE — без учёта
+	// регистра.
 	insertAddSQL = "INSERT INTO domains (zone_id, label, flags) " +
-		"SELECT s.zone_id, s.label, CASE WHEN s.label ILIKE 'xn--%' THEN " + fmt.Sprint(int16(model.FlagIDN)) + " ELSE 0 END " +
+		"SELECT s.zone_id, s.label, CASE WHEN s.label ILIKE 'xn--%' OR s.label ILIKE '%.xn--%' THEN " + fmt.Sprint(int16(model.FlagIDN)) + " ELSE 0 END " +
 		"FROM ingest_stage AS s " +
 		"WHERE s.batch_id = $1 AND s.action = $2 " +
 		"ON CONFLICT DO NOTHING"

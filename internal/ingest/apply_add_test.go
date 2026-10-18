@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"crawler/internal/db"
+	"crawler/internal/idn"
 	"crawler/internal/model"
 
 	"github.com/jackc/pgx/v5"
@@ -355,7 +356,7 @@ func TestApplyAdd_ContextCanceled(t *testing.T) {
 
 const (
 	wantAddInsertSQL = "INSERT INTO domains (zone_id, label, flags) " +
-		"SELECT s.zone_id, s.label, CASE WHEN s.label ILIKE 'xn--%' THEN 1 ELSE 0 END " +
+		"SELECT s.zone_id, s.label, CASE WHEN s.label ILIKE 'xn--%' OR s.label ILIKE '%.xn--%' THEN 1 ELSE 0 END " +
 		"FROM ingest_stage AS s " +
 		"WHERE s.batch_id = $1 AND s.action = $2 " +
 		"ON CONFLICT DO NOTHING"
@@ -398,5 +399,30 @@ func TestApplyAdd_SQLContract(t *testing.T) {
 	up := readMigration(t, "000001_init.up.sql")
 	if !strings.Contains(up, "UNIQUE (zone_id, label)") {
 		t.Error("в миграции 000001 нет UNIQUE (zone_id, label) — ON CONFLICT DO NOTHING нечему конфликтовать (ТЗ 5.1)")
+	}
+}
+
+// TestInsertAddIDNConditionEquivalent — условие is_idn в insertAddSQL
+// ('xn--%' OR '%.xn--%') эквивалентно idn.HasXNLabel (ТЗ 5.2 п. 9) на
+// простых и составных метках (ING-P1-1): «любая метка имени начинается
+// с xn--».
+func TestInsertAddIDNConditionEquivalent(t *testing.T) {
+	prefixFold := func(s, p string) bool {
+		return len(s) >= len(p) && strings.EqualFold(s[:len(p)], p)
+	}
+	ilike := func(label string) bool { // семантика 'xn--%' OR '%.xn--%'
+		return prefixFold(label, "xn--") ||
+			strings.Contains(strings.ToLower(label), ".xn--")
+	}
+	labels := []string{
+		"example", "xn--e1afmkfd",
+		"shop.xn--p1ai", "xn--p1ai.shop", // расходились до фикса
+		"xn--80aairftm.xn--p1ai", "sub.example", "sub.xn--e1afmkfd.example",
+		"XN--E1AFMKFD", "sub.XN--e1afmkfd",
+	}
+	for _, label := range labels {
+		if got, want := ilike(label), idn.HasXNLabel(label); got != want {
+			t.Errorf("условие is_idn(%q) = %v, want %v (idn.HasXNLabel)", label, got, want)
+		}
 	}
 }

@@ -303,9 +303,10 @@ func TestStage_BadRow(t *testing.T) {
 		want string // фрагмент ожидаемой ошибки
 	}{
 		{"пустая метка", Row{Label: "", LineNo: 1}, "пустая метка"},
-		{"метка с зоной", Row{Label: "example.com", LineNo: 1}, "без точек"},
 		{"не-ASCII метка", Row{Label: "пример", LineNo: 1}, "punycode"},
-		{"метка длиннее 63", Row{Label: strings.Repeat("a", 64), LineNo: 1}, "максимум 63"},
+		{"метка длиннее 63", Row{Label: strings.Repeat("a", 64), LineNo: 1}, "не длиннее 63"},
+		{"пустая часть составной метки", Row{Label: "sub..example", LineNo: 1}, "непустая"},
+		{"часть составной метки длиннее 63", Row{Label: "sub." + strings.Repeat("a", 64), LineNo: 1}, "не длиннее 63"},
 		{"номер строки 0", Row{Label: "example", LineNo: 0}, "с единицы"},
 		{"номер строки повторяется", Row{Label: "example", LineNo: 1}, "не растёт"},
 	}
@@ -326,6 +327,33 @@ func TestStage_BadRow(t *testing.T) {
 				t.Errorf("пачки = [%s], want [%s]", got, want)
 			}
 		})
+	}
+}
+
+// TestStage_CompositeLabel — составные метки (контракт internal/idn,
+// ТЗ 5.2; docs/incoming-files.md: «www2.example.crawl.test — ок»)
+// проходят в staging как есть: валидатор T-016 отдаёт их одной меткой
+// зоны пути, точки внутри допустимы.
+func TestStage_CompositeLabel(t *testing.T) {
+	f := &fakeDB{}
+	b := validBatch(t)
+	rows := []Row{
+		{Label: "sub.example", LineNo: 1},
+		{Label: "xn--80aairftm.xn--p1ai", LineNo: 2},
+		{Label: strings.Repeat("a", MaxLabelLen) + "." + strings.Repeat("b", MaxLabelLen), LineNo: 3},
+	}
+
+	staged, err := Stage(context.Background(), f, b, 10, (&rowsIter{rows: rows}).next)
+	if err != nil || staged != 3 {
+		t.Fatalf("(%d, %v), want (3, nil) — составные метки допустимы", staged, err)
+	}
+	if len(f.rows) != len(rows) {
+		t.Fatalf("строк в COPY %d, want %d", len(f.rows), len(rows))
+	}
+	for i, vals := range f.rows {
+		if got := vals[2].(string); got != rows[i].Label {
+			t.Errorf("метка[%d] = %q, want %q", i, got, rows[i].Label)
+		}
 	}
 }
 

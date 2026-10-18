@@ -9,6 +9,7 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -413,6 +414,59 @@ func TestPipelineDuplicate(t *testing.T) {
 	}
 }
 
+// TestPipelineDuplicateCrossActionWarn — дубль по sha256 с другой
+// операцией (тот же список положили в delete/ после add/) по контракту
+// идемпотентности по содержимому не применяется (docs/incoming-files.md
+// §5; глобальный UNIQUE sha256 — docs/schema.md; приёмочный кейс 63da59c
+// «дубль sha256 delete-файла легитимен») — контракт не меняется, но
+// оператору подсвечивается Warn (ING-P2-5, неконтрактная часть).
+func TestPipelineDuplicateCrossActionWarn(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "example.com\n"
+	abs := pt.addFile(t, "com/add/list.txt", content)
+	sha := sha256.Sum256([]byte(content))
+	action := model.ActionDelete
+	path := "com/delete/list.txt"
+	processed := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	pt.files = newFakeFileStore(model.IngestFile{
+		ID: 7, Action: &action, Path: &path,
+		SHA256: sha[:], ProcessedAt: &processed,
+	})
+
+	var buf bytes.Buffer
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir:       pt.dir,
+		BatchSize: 10,
+		Log:       slog.New(slog.NewTextHandler(&buf, nil)),
+		Now:       func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.Kind != OutcomeDuplicate {
+		t.Fatalf("итог = %s, want duplicate (контракт дедупа не меняется)", out.Kind)
+	}
+	if len(pt.files.records) != 0 {
+		t.Error("дубль не должен писать второй отчёт")
+	}
+	log := buf.String()
+	for _, want := range []string{
+		"дубль по sha256 с другой операцией или зоной",
+		"action=add",
+		"first_action=delete",
+		"first_path=com/delete/list.txt",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("лог = %q, want запись с %q", log, want)
+		}
+	}
+}
+
 // TestPipelineErrorRatio — доля отклонённых строк выше порога (T-016):
 // файл целиком ошибочен — применение не выполняется, файл → failed/
 // с лог-отчётом рядом, отчёт в ingest_files не пишется (хэш ошибочного
@@ -475,6 +529,76 @@ func TestPipelineErrorRatio(t *testing.T) {
 	}
 }
 
+// TestPipelineParserRejectsFailFile — построчные отказы парсера
+// (invalid_utf8, line_len) учитываются в пороге доли ошибок (T-016):
+// файл, чей мусор не дошёл до валидатора, всё равно ошибочен целиком
+// (битый дамп — именно не-UTF-8, docs/incoming-files.md §4), а не
+// «успешно применённая» пустая партия.
+func TestPipelineParserRejectsFailFile(t *testing.T) {
+	// 1 строка не-UTF-8 + 8 валидных: валидатор один 0/8 не роняет,
+	// объединённая доля 1/9 > 0.1 — файл ошибочен.
+	t.Run("мусор плюс валидные строки", func(t *testing.T) {
+		pt := newPipeTest(t)
+		var b strings.Builder
+		b.WriteString("\xff\xfe\n")
+		for i := 0; i < 8; i++ {
+			fmt.Fprintf(&b, "good%d.com\n", i)
+		}
+		abs := pt.addFile(t, "com/add/list.txt", b.String())
+
+		out, err := pt.pipe.Process(context.Background(), abs)
+		if err != nil {
+			t.Fatalf("Process: %v (ошибочный файл — не ошибка сервиса)", err)
+		}
+		if out.Kind != OutcomeFailed {
+			t.Fatalf("итог = %s, want failed", out.Kind)
+		}
+		if out.Err == nil || !strings.Contains(out.Err.Error(), "доля отклонённых строк 1 из 9 выше ingest.max_error_ratio (0.1)") {
+			t.Errorf("причина = %v, want объединённая доля 1 из 9", out.Err)
+		}
+		rep := out.Report
+		if rep.Rejected != 1 || rep.Accepted != 8 || rep.Reasons[ReasonUTF8] != 1 {
+			t.Errorf("счётчики = %+v, want rejected 1 (invalid_utf8), accepted 8", rep)
+		}
+		if len(pt.files.records) != 0 {
+			t.Error("отчёт ошибочного файла не пишется в журнал")
+		}
+		if !exists(t, filepath.Join(pt.dir, DirFailed, "com/add/list.txt")) {
+			t.Error("файл не перемещён в failed/")
+		}
+	})
+
+	// Файл целиком из не-UTF-8: парсер отверг каждую строку, валидатор
+	// не видел ни одной (total = 0) — без учёта отказов парсера доля
+	// считалась бы 0/0 и файл уезжал бы в processed/.
+	t.Run("файл целиком из не-UTF-8", func(t *testing.T) {
+		pt := newPipeTest(t)
+		abs := pt.addFile(t, "com/add/dump.txt", "\xff\xfe\xff\n\xff\xfe\n")
+
+		out, err := pt.pipe.Process(context.Background(), abs)
+		if err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		if out.Kind != OutcomeFailed {
+			t.Fatalf("итог = %s, want failed", out.Kind)
+		}
+		if out.Err == nil || !strings.Contains(out.Err.Error(), "доля отклонённых строк 2 из 2 выше ingest.max_error_ratio (0.1)") {
+			t.Errorf("причина = %v, want объединённая доля 2 из 2", out.Err)
+		}
+		if rep := out.Report; rep.Rejected != 2 || rep.Accepted != 0 {
+			t.Errorf("счётчики = %+v, want rejected 2, accepted 0", rep)
+		}
+		// Партия из нуля строк отброшена, применение не выполнялось.
+		want := []string{"exec:" + clearStageSQL, "exec:" + clearStageSQL}
+		if !reflect.DeepEqual(pt.pool.ops, want) {
+			t.Errorf("обращения = %v, want очистка → отбрасывание партии без COPY", pt.pool.ops)
+		}
+		if len(pt.files.records) != 0 {
+			t.Error("отчёт ошибочного файла не пишется в журнал")
+		}
+	})
+}
+
 // TestPipelineBadPath — структура пути не <зона>/add|delete/*.txt
 // (T-014): файл ошибочен, до БД не доходит, failed/ с лог-отчётом.
 func TestPipelineBadPath(t *testing.T) {
@@ -525,6 +649,41 @@ func TestPipelineBadZoneDir(t *testing.T) {
 	}
 	if !exists(t, filepath.Join(pt.dir, DirFailed, "не%зона/add/list.txt")) {
 		t.Error("файл не перемещён в failed/")
+	}
+}
+
+// TestPipelineFailFileOutsideIncoming — Process — публичный API: путь
+// вне incoming (rel с «..» после filepath.Rel, ParsePath его отвергает)
+// не должен выводить архив за пределы failed/ (ING-P3-1): назначение
+// санируется до базового имени файла.
+func TestPipelineFailFileOutsideIncoming(t *testing.T) {
+	pt := newPipeTest(t)
+	// Файл-сиблинг каталога incoming: rel = "../escape/com/list.txt".
+	abs := filepath.Join(filepath.Dir(pt.dir), "escape", "com", "list.txt")
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte("example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := pt.pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v (ошибочный файл — не ошибка сервиса)", err)
+	}
+	if out.Kind != OutcomeFailed {
+		t.Fatalf("итог = %s, want failed", out.Kind)
+	}
+	failed := filepath.Join(pt.dir, DirFailed, "list.txt")
+	if exists(t, abs) || !exists(t, failed) {
+		t.Fatalf("файл должен лежать в %s, исходный удалён", failed)
+	}
+	if !exists(t, failed+".report") {
+		t.Error("лог-отчёт не записан рядом с файлом")
+	}
+	// Архив не вышел за пределы failed/ (и не «провалился» в ../).
+	if exists(t, filepath.Join(pt.dir, "escape", "com", "list.txt")) {
+		t.Error("файл оказался снаружи failed/ — путь назначения не санирован")
 	}
 }
 
@@ -679,6 +838,13 @@ func TestPipelineContextCanceled(t *testing.T) {
 	if len(pt.files.records) != 0 {
 		t.Error("журнал не пишется при отмене")
 	}
+	// Партия очищена и после отмены ctx: discard чистит staging собственным
+	// контекстом (ING-P2-3) — строки не копятся в staging от рестарта к
+	// рестарту. (Очистка внутри Stage с отменённым ctx не дошла до БД —
+	// фейк, как pgx, отказывает до записи обращения.)
+	if len(pt.pool.ops) != 1 || pt.pool.ops[0] != "exec:"+clearStageSQL {
+		t.Errorf("обращения = %v, want одна очистка отброшенной партии", pt.pool.ops)
+	}
 }
 
 // TestPipelineMoveCollision — в архиве уже есть файл с тем же именем
@@ -777,6 +943,44 @@ func TestPipelineRejectLogPassed(t *testing.T) {
 		!strings.Contains(logged, "file=com/add/list.txt") ||
 		!strings.Contains(logged, "reason=wrong_zone") {
 		t.Errorf("rejected-лог = %q, want запись об отклонённой строке", logged)
+	}
+}
+
+// TestPipelineParserRejectLog — построчные отказы парсера пишутся в
+// rejected-лог тем же форматом, что и отказы валидатора (ТЗ 5.1,
+// docs/incoming-files.md §3, §7: invalid_utf8/line_len — причины лога,
+// обрезанная строка — в записи).
+func TestPipelineParserRejectLog(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "example.com\n\xff\xfe\n" + strings.Repeat("a", MaxLineLen+76) + "\n"
+	abs := pt.addFile(t, "com/add/list.txt", content)
+
+	var buf strings.Builder
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir:       pt.dir,
+		BatchSize: 10,
+		RejectLog: NewRejectedLogger(&buf, slog.LevelInfo),
+		Now:       func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipe.Process(context.Background(), abs); err != nil {
+		t.Fatal(err)
+	}
+	logged := buf.String()
+	for _, want := range []string{
+		"service=rejected",
+		"file=com/add/list.txt",
+		"line=2",
+		"reason=invalid_utf8",
+		"line=3",
+		"reason=line_len",
+		"text=" + strings.Repeat("a", maxRejectText), // обрезка парсера, байты
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("rejected-лог = %q, want запись с %q", logged, want)
+		}
 	}
 }
 
