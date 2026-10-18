@@ -307,31 +307,28 @@ func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, raw
 
 // Get возвращает контент по метаданным contents: блок (pack_id, off, len)
 // читается из пака и распаковывается. Мёртвые строки (refcount = 0) и
-// отсутствующие — ErrNotFound.
+// отсутствующие — ErrNotFound. Блок нечитаем при живой строке —
+// ErrCorrupted (см. store.go).
 func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, sqlMetaGet, hash[:])
+	packID, off, clen, rawLen, err := s.meta(ctx, hash)
 	if err != nil {
-		return nil, fmt.Errorf("content: метаданные %s: %w", hash, err)
+		return nil, err
 	}
-	defer rows.Close()
-	var packID int32
-	var off int64
-	var clen, rawLen int32
-	switch {
-	case rows.Next():
-		if err := rows.Scan(&packID, &off, &clen, &rawLen); err != nil {
-			return nil, fmt.Errorf("content: метаданные %s: %w", hash, err)
-		}
-	case rows.Err() != nil:
-		return nil, fmt.Errorf("content: метаданные %s: %w", hash, rows.Err())
-	default:
-		return nil, ErrNotFound
-	}
-
 	block, err := readPackBlock(s.opts.Dir, packID, off, clen)
+	if err != nil && errors.Is(err, fs.ErrNotExist) {
+		// Пака нет (ENOENT), хотя строка живая: файл удалён под
+		// компактификацией между чтением строки и открытием пака —
+		// строка уже переехала на новое место. Перечитываем метаданные
+		// (не более одного раза) и читаем по свежему размещению; без
+		// повтора читатель видел бы транзиентную ошибку на ровном месте.
+		if packID, off, clen, rawLen, err = s.meta(ctx, hash); err != nil {
+			return nil, err
+		}
+		block, err = readPackBlock(s.opts.Dir, packID, off, clen)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrCorrupted, hash, err)
 	}
@@ -344,6 +341,30 @@ func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 			ErrCorrupted, hash, packID, len(raw), rawLen)
 	}
 	return raw, nil
+}
+
+// meta — строка метаданных живого контента (sqlMetaGet): размещение
+// блока. Отсутствующий/мёртвый контент — ErrNotFound.
+func (s *PackStore) meta(ctx context.Context, hash Hash) (int32, int64, int32, int32, error) {
+	rows, err := s.pool.Query(ctx, sqlMetaGet, hash[:])
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("content: метаданные %s: %w", hash, err)
+	}
+	defer rows.Close()
+	var packID int32
+	var off int64
+	var clen, rawLen int32
+	switch {
+	case rows.Next():
+		if err := rows.Scan(&packID, &off, &clen, &rawLen); err != nil {
+			return 0, 0, 0, 0, fmt.Errorf("content: метаданные %s: %w", hash, err)
+		}
+	case rows.Err() != nil:
+		return 0, 0, 0, 0, fmt.Errorf("content: метаданные %s: %w", hash, rows.Err())
+	default:
+		return 0, 0, 0, 0, ErrNotFound
+	}
+	return packID, off, clen, rawLen, nil
 }
 
 // Delete снимает одну ссылку: refcount − 1, строка остаётся (при нуле —

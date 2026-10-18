@@ -471,6 +471,78 @@ func TestCompactCorruptBlock(t *testing.T) {
 	}
 }
 
+// TestGetRetryAfterCompaction — гонка Get ↔ компактификация: файл пака
+// удалён между чтением метаданных и открытием (строка уже переехала) —
+// Get перечитывает метаданные и отвечает контентом, а не ENOENT.
+func TestGetRetryAfterCompaction(t *testing.T) {
+	st, pool := newCompactTestStore(t, nil)
+	ctx := context.Background()
+	d := []byte("контент, чей пак уходит под компактификацией")
+	res, err := st.Put(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := pool.row(res.Hash)
+
+	// Компактификация переносит запись в пак 2 и удаляет старый файл.
+	raw1, err := os.ReadFile(filepath.Join(st.opts.Dir, packFileName(row.packID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := raw1[row.off-4 : row.off+int64(row.clen)]
+	hdr := packHeader{id: 2, maxSize: 1 << 20}
+	if err := os.WriteFile(filepath.Join(st.opts.Dir, packFileName(2)),
+		append(hdr.bytes(), rec...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(st.opts.Dir, packFileName(row.packID))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Пул гонки: первый sqlMetaGet возвращает старое размещение и лишь
+	// затем «перевозит» строку (как UPDATE под компактификацией).
+	rp := &getRacePool{compactFakePool: pool, hash: res.Hash,
+		newRow: packFakeRow{packID: 2, off: packHeaderLen + 4, clen: row.clen, rawLen: row.rawLen, refc: row.refc}}
+	st2, err := OpenPackStore(rp, PackOptions{Dir: st.opts.Dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close() //nolint:errcheck // тест закрывает при очистке
+
+	got, err := st2.Get(ctx, res.Hash)
+	if err != nil {
+		t.Fatalf("Get в гонке с компактификацией: %v", err)
+	}
+	if string(got) != string(d) {
+		t.Error("Get после переезда вернул чужие байты")
+	}
+	if !rp.moved {
+		t.Error("повторного чтения метаданных не было — гонка не смоделирована")
+	}
+}
+
+// getRacePool — compactFakePool, который на первом sqlMetaGet отдаёт
+// старое размещение строки и одновременно переводит её на новое (окно
+// гонки «SELECT → открытие файла» под компактификацией).
+type getRacePool struct {
+	*compactFakePool
+	hash   Hash
+	newRow packFakeRow
+	moved  bool
+}
+
+func (p *getRacePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	rows, err := p.packFakePool.Query(ctx, sql, args...)
+	if err == nil && sql == sqlMetaGet && !p.moved {
+		p.moved = true
+		p.mu.Lock()
+		nr := p.newRow
+		p.contents[p.hash] = &nr
+		p.mu.Unlock()
+	}
+	return rows, err
+}
+
 // TestCompactScanMixed — скан различает живые, мёртвые и мусорные блоки:
 // живая и мёртвая строки, блок краш-окна Put (без строки) и недописанный
 // хвост.
