@@ -106,10 +106,10 @@ func TestRun(t *testing.T) {
 		{name: "dict train два позиционных", args: []string{"dict", "train", "a.zst", "b.zst"}, code: exitUsage,
 			inErr: "укажите выходной файл"},
 		{name: "dict train несуществующие образцы", args: []string{"dict", "train", "d.zst", "--samples", "/nonexistent"},
-			code: exitError, inErr: "dict train:"},
+			code: exitError, inErr: "dict train: образцы /nonexistent:"},
 		{name: "dict train --help значением --samples — не справка, а путь образцов",
 			args: []string{"dict", "train", "d.zst", "--samples", "--help"},
-			code: exitError, inErr: "dict train:", noOut: "словарём сжатия zstd"},
+			code: exitError, inErr: "dict train: образцы --help:", noOut: "словарём сжатия zstd"},
 		{name: "dict train неизвестный флаг", args: []string{"dict", "train", "--nope", "d.zst"}, code: exitUsage,
 			inErr: "dict train: "},
 
