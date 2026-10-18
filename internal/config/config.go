@@ -53,6 +53,7 @@ type Config struct {
 	Analyzer   Analyzer  `yaml:"analyzer"`
 	Subdomains []string  `yaml:"subdomains"`
 	Monitor    Monitor   `yaml:"monitor"`
+	Web        Web       `yaml:"web"`
 	Log        Log       `yaml:"log"`
 }
 
@@ -233,6 +234,26 @@ type Monitor struct {
 	IngestMetricsURL string `yaml:"ingest_metrics_url"`
 }
 
+// Web — публичный сервис лендинга (этап 13, T-121; продуктовое
+// расширение вне основного ТЗ — перенос из larasites). Публичный
+// слушатель — собственный http.Server внутри OnRun: каркас service даёт
+// один порт на сервис и вешает туда /metrics (выставлять наружу нельзя),
+// поэтому MetricsAddr остаётся на loopback, а web.listen обслуживает
+// посетителя (прецедент управления жизненным циклом внутри OnRun —
+// клиенты воркеров).
+type Web struct {
+	// Listen — публичный адрес лендинга (host:port). Дефолт — loopback:
+	// публикация наружу — задача reverse-proxy с TLS (T-124).
+	Listen string `yaml:"listen"`
+	// RateLimit — лимит живых проверок формы на IP, запросов в минуту
+	// (зафиксированное решение этапа 13: 4/мин, как larasites).
+	RateLimit int `yaml:"rate_limit"`
+	// Timeout — потолок живой проверки формы (T-123): полный конвейер
+	// одного имени (DNS → HTTP → рендер SPA → анализ), ответ посетителю
+	// не позже потолка.
+	Timeout Duration `yaml:"timeout"`
+}
+
 // Log — уровень логирования сервисов (каркас internal/service). Расширение
 // к минимальному составу ТЗ 5.10: уровень нужен каркасу, а не отдельному
 // этапу, поэтому вынесен в свою секцию верхнего уровня.
@@ -347,6 +368,19 @@ func Default() *Config {
 			// 127.0.0.1:9101); docker-сети переопределяют именем сервиса
 			// (config.dev.yaml: http://ingest:9101/metrics).
 			IngestMetricsURL: "http://127.0.0.1:9101/metrics",
+		},
+		Web: Web{
+			// Loopback: публикация наружу — reverse-proxy с TLS (T-124),
+			// не сам сервис.
+			Listen: "127.0.0.1:8080",
+			// Зафиксированное решение этапа 13 — как троттлинг формы
+			// larasites: 4 проверки в минуту с одного IP.
+			RateLimit: 4,
+			// Полный конвейер одного имени: DNS-эпизод (секунды) + HTTP
+			// обеих схем (2 × http.total_timeout 20 с) + рендер SPA
+			// (render.timeout 25 с) + анализ (мгновения) — 60 с покрывает
+			// худший случай без вечного ожидания посетителя.
+			Timeout: Duration(60 * time.Second),
 		},
 		Log: Log{
 			Level: "info",
@@ -640,6 +674,20 @@ func (c *Config) Validate() error {
 			problems = append(problems, fmt.Sprintf(
 				"monitor.ingest_metrics_url: ожидается абсолютный http(s)-адрес, задано %q", c.Monitor.IngestMetricsURL))
 		}
+	}
+
+	// web (этап 13, T-121)
+	if err := checkHostPort(c.Web.Listen); err != nil {
+		problems = append(problems, fmt.Sprintf("web.listen: ожидается [host]:port, задано %q", c.Web.Listen))
+	}
+	// Минимум 1 — ноль означал бы неограниченную форму; потолок — от
+	// абсурда, не от эксплуатации.
+	if !inRange(c.Web.RateLimit, 1, 1000) {
+		problems = append(problems, rangeMsg("web.rate_limit", c.Web.RateLimit, 1, 1000)+" (проверок формы в минуту на IP)")
+	}
+	if c.Web.Timeout <= 0 || c.Web.Timeout > Duration(10*time.Minute) {
+		problems = append(problems, fmt.Sprintf("web.timeout: ожидается %s..%s, задано %s",
+			Duration(time.Second), Duration(10*time.Minute), c.Web.Timeout))
 	}
 
 	// log (расширение каркаса, T-012)

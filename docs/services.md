@@ -75,7 +75,7 @@ if err := service.Run(service.Options{
 ТЗ 5.9: HTTP-эндпоинт Prometheus на каждом сервисе. Каркас поднимает
 `/livez`, `/healthz` и `/metrics` на `Options.MetricsAddr` (адрес `monitor` —
 `monitor.listen` из конфигурации, ТЗ 5.10, важнее `METRICS_ADDR`; адреса
-остальных сервисов — только `METRICS_ADDR`, dev-порты `:9101`…`:9106`).
+остальных сервисов — только `METRICS_ADDR`, dev-порты `:9101`…`:9107`).
 Prometheus скрейпит каждый сервис отдельно (dev-конфиг
 `deploy/docker/prometheus/prometheus.yml`, профиль `monitoring`):
 `monitor.listen` — адрес HTTP-эндпоинта самого сервиса monitor, а не
@@ -90,6 +90,7 @@ Prometheus скрейпит каждый сервис отдельно (dev-ко
 | http-worker | `:9104` | `METRICS_ADDR` |
 | render-worker | `:9105` | `METRICS_ADDR` |
 | analyzer | `:9106` | `METRICS_ADDR` |
+| web | `127.0.0.1:9107` | `METRICS_ADDR` (loopback: лендинг публичен на `web.listen`, метрики — нет, ТЗ §9) |
 
 ### Пробы живости и готовности (T-110)
 
@@ -554,6 +555,20 @@ Warn при срабатывании, Info при снятии; «не изме�
 детали) в хук `AlertsOptions.OnPass`: лог + поле, собственный
 gauge-реестр в monitor не заводится — метрики алертов в Prometheus заведёт
 слой T-077 поверх `internal/metrics`, чтобы не дублировать реестры и метки.
+
+`web` (этап 13, T-121; продуктовое расширение вне основного ТЗ — перенос
+из larasites): публичный лендинг. Каркас — `cmd/web` (`config.Load` →
+`service.Run`, пул через `OnDBPool`, метрики/проб — loopback
+`127.0.0.1:9107`); публичный слушатель `web.listen` — собственный
+`http.Server` внутри OnRun с graceful stop по отмене ctx: каркас даёт
+один HTTP-порт на сервис и вешает туда `/metrics`, выставлять который
+наружу нельзя (ТЗ §9) — прецедент управления жизненным циклом внутри
+OnRun. Роуты: `GET /` — редирект на дефолтную локаль `/ru`,
+`GET /{ru|en}` — лендинг (T-122 наполняет), `POST /api/check-domain` —
+живая проверка из формы (T-123), `GET /healthz` — readiness ping
+PostgreSQL (503), статика. Шаблоны — `html/template` + `go:embed`
+(`internal/web/templates`), новых зависимостей нет. Конфигурация — секция
+`web` (`listen`/`rate_limit`/`timeout`, [`configuration.md`](configuration.md)).
 
 Подробности браузерного слоя (изоляция, блокировка ресурсов, ожидание,
 съём результата) — [`render.md`](render.md); live-проверки против

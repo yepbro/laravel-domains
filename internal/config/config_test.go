@@ -94,6 +94,9 @@ func TestDefault(t *testing.T) {
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
 		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 60 * time.Second},
 		{"monitor.ingest_metrics_url", c.Monitor.IngestMetricsURL, "http://127.0.0.1:9101/metrics"},
+		{"web.listen", c.Web.Listen, "127.0.0.1:8080"},
+		{"web.rate_limit", c.Web.RateLimit, 4},
+		{"web.timeout", c.Web.Timeout.D(), 60 * time.Second},
 		{"log.level", c.Log.Level, "info"},
 	}
 	for _, ch := range checks {
@@ -398,6 +401,9 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_MONITOR_LISTEN":                   ":9199",
 		"CRAWLER_MONITOR_ZONE_STATS_INTERVAL":      "45s",
 		"CRAWLER_MONITOR_INGEST_METRICS_URL":       "http://env-ingest:9101/metrics",
+		"CRAWLER_WEB_LISTEN":                       "127.0.0.1:8088",
+		"CRAWLER_WEB_RATE_LIMIT":                   "10",
+		"CRAWLER_WEB_TIMEOUT":                      "90s",
 		"CRAWLER_LOG_LEVEL":                        "debug",
 	})
 	type check struct {
@@ -457,6 +463,9 @@ func TestEnvOverrides(t *testing.T) {
 		{"monitor.listen", cfg.Monitor.Listen, ":9199"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 45 * time.Second},
 		{"monitor.ingest_metrics_url", cfg.Monitor.IngestMetricsURL, "http://env-ingest:9101/metrics"},
+		{"web.listen", cfg.Web.Listen, "127.0.0.1:8088"},
+		{"web.rate_limit", cfg.Web.RateLimit, 10},
+		{"web.timeout", cfg.Web.Timeout.D(), 90 * time.Second},
 		{"log.level", cfg.Log.Level, "debug"},
 	}
 	for _, ch := range checks {
@@ -711,6 +720,11 @@ func TestValidate(t *testing.T) {
 		{"zone_stats_interval 0", func(c *Config) { c.Monitor.ZoneStatsInterval = 0 }, "monitor.zone_stats_interval"},
 		{"ingest_metrics_url не адрес", func(c *Config) { c.Monitor.IngestMetricsURL = "ingest:9101" }, "monitor.ingest_metrics_url"},
 		{"ingest_metrics_url не http(s)", func(c *Config) { c.Monitor.IngestMetricsURL = "ftp://ingest:9101/metrics" }, "monitor.ingest_metrics_url"},
+		{"web.listen кривой", func(c *Config) { c.Web.Listen = "no-port" }, "web.listen"},
+		{"web.rate_limit 0", func(c *Config) { c.Web.RateLimit = 0 }, "web.rate_limit"},
+		{"web.rate_limit велик", func(c *Config) { c.Web.RateLimit = 1001 }, "web.rate_limit"},
+		{"web.timeout 0", func(c *Config) { c.Web.Timeout = 0 }, "web.timeout"},
+		{"web.timeout велик", func(c *Config) { c.Web.Timeout = Duration(11 * time.Minute) }, "web.timeout"},
 		{"log.level кривой", func(c *Config) { c.Log.Level = "verbose" }, "log.level"},
 	}
 	for _, tt := range tests {

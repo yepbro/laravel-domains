@@ -152,6 +152,9 @@ func envSpecs() []envSpec {
 		{"CRAWLER_MONITOR_LISTEN", setString(func(c *Config) *string { return &c.Monitor.Listen })},
 		{"CRAWLER_MONITOR_ZONE_STATS_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.ZoneStatsInterval })},
 		{"CRAWLER_MONITOR_INGEST_METRICS_URL", setString(func(c *Config) *string { return &c.Monitor.IngestMetricsURL })},
+		{"CRAWLER_WEB_LISTEN", setString(func(c *Config) *string { return &c.Web.Listen })},
+		{"CRAWLER_WEB_RATE_LIMIT", setInt(func(c *Config) *int { return &c.Web.RateLimit })},
+		{"CRAWLER_WEB_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Web.Timeout })},
 		{"CRAWLER_LOG_LEVEL", setString(func(c *Config) *string { return &c.Log.Level })},
 	}
 }
