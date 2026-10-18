@@ -101,6 +101,10 @@ type cleanupFakePool struct {
 	beginErr   error
 	commitErr  error
 
+	execs     []pipeExec // результаты Exec по очереди — зачистка осиротевших партий staging (T-098)
+	execI     int
+	execCalls []cleanupCall // Exec'ы через пул
+
 	queries []cleanupCall // SELECT'ы через пул
 	begins  int
 	txs     []*cleanupFakeTx
@@ -110,8 +114,29 @@ func (p *cleanupFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pg
 	return 0, errors.New("CopyFrom не должен вызываться")
 }
 
-func (p *cleanupFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
+// Exec обслуживает зачистку осиротевших партий (CleanupStaleBatches,
+// T-098): результат — по очереди, конец очереди — DELETE 0 (нечего
+// чистить). Вызов записывается до проверки ctx — как Query: после
+// cancel() цикл может начать ещё один проход (выбор ветви select
+// случаен), и не записанный Exec расшатывал бы соответствие «проходов
+// цикла = зачисток» в тестах. Сам CleanupOnce по пулу не Exec'ит —
+// это проверяют тесты прохода (execCalls пуст).
+func (p *cleanupFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.execCalls = append(p.execCalls, cleanupCall{sql: sql, args: args})
+	if err := ctx.Err(); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	i := p.execI
+	p.execI++
+	if i < len(p.execs) {
+		if p.execs[i].err != nil {
+			return pgconn.CommandTag{}, p.execs[i].err
+		}
+		return p.execs[i].tag, nil
+	}
+	return pgconn.NewCommandTag("DELETE 0"), nil
 }
 
 func (p *cleanupFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -242,6 +267,10 @@ const wantCleanupUpdate = "UPDATE contents SET refcount = GREATEST(refcount - h.
 	"FROM unnest($1::bytea[], $2::int4[]) AS h(hash, n) " +
 	"WHERE contents.hash = h.hash"
 
+// wantStaleStageSQL — контракт зачистки осиротевших партий (T-098):
+// диапазон по префиксу batch_id (StageTable.Sanitize — «ingest_stage»).
+const wantStaleStageSQL = "DELETE FROM \"ingest_stage\" WHERE batch_id < $1"
+
 // cleanupHash16 — 16-октетный content_hash с заданным первым байтом.
 func cleanupHash16(b byte) []byte {
 	h := make([]byte, contentHashLen)
@@ -331,6 +360,11 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 	}
 	if !tx.committed || tx.rolledBack {
 		t.Errorf("транзакция: committed=%v rolledBack=%v, want фиксация без отката", tx.committed, tx.rolledBack)
+	}
+	// Проход очистки доменов не пишет в пул напрямую: Exec — только
+	// канал зачистки осиротевших партий (T-098).
+	if len(pool.execCalls) != 0 {
+		t.Errorf("Exec'ы через пул = %v, want нет: CleanupOnce работает в транзакции", pool.execCalls)
 	}
 }
 
@@ -524,6 +558,110 @@ func TestCleanupOnceNilPool(t *testing.T) {
 	}
 }
 
+// --- CleanupStaleBatches (T-098) -----------------------------------------
+
+// TestCleanupStaleBatchesSQLAndArg — контракт зачистки: SQL-диапазон по
+// префиксу batch_id и точная граница «now − StaleBatchAge» (фиксированное
+// now делает аргумент детерминированным). Семантика «старая партия
+// удаляется, свежая живёт» диапазона против живой БД — интеграционные
+// тесты ingest; здесь — кодировка границы (TestBatchIDAgeOrdering).
+func TestCleanupStaleBatchesSQLAndArg(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	pool := &cleanupFakePool{execs: []pipeExec{{tag: pgconn.NewCommandTag("DELETE 7")}}}
+
+	rows, err := CleanupStaleBatches(context.Background(), pool, now)
+	if err != nil {
+		t.Fatalf("CleanupStaleBatches: %v", err)
+	}
+	if rows != 7 {
+		t.Errorf("удалено строк = %d, want 7 (из CommandTag)", rows)
+	}
+	if len(pool.execCalls) != 1 {
+		t.Fatalf("Exec'ов = %d, want 1", len(pool.execCalls))
+	}
+	call := pool.execCalls[0]
+	if call.sql != wantStaleStageSQL {
+		t.Errorf("SQL зачистки:\n%s\nwant:\n%s", call.sql, wantStaleStageSQL)
+	}
+	wantArg := batchIDBefore(now.Add(-StaleBatchAge))
+	if !reflect.DeepEqual(call.args, []any{wantArg[:]}) {
+		t.Errorf("граница зачистки = %x, want %x (batch_idBefore(now − %s))",
+			call.args[0], wantArg[:], StaleBatchAge)
+	}
+}
+
+// TestCleanupStaleBatchesNoop — пустой staging: DELETE 0 без ошибки,
+// лишних обращений нет.
+func TestCleanupStaleBatchesNoop(t *testing.T) {
+	pool := &cleanupFakePool{} // очередь Exec пуста — DELETE 0
+
+	rows, err := CleanupStaleBatches(context.Background(), pool, time.Now())
+	if err != nil {
+		t.Fatalf("CleanupStaleBatches: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("удалено строк = %d, want 0: чистить нечего", rows)
+	}
+	if len(pool.execCalls) != 1 || pool.begins != 0 {
+		t.Errorf("обращений = %v (транзакций %d), want один Exec без транзакции",
+			pool.execCalls, pool.begins)
+	}
+}
+
+func TestCleanupStaleBatchesErrors(t *testing.T) {
+	if _, err := CleanupStaleBatches(context.Background(), nil, time.Now()); err == nil ||
+		!strings.Contains(err.Error(), "пул не задан") {
+		t.Errorf("ошибка = %v, want «пул не задан»", err)
+	}
+
+	boom := &cleanupFakePool{execs: []pipeExec{{err: errors.New("бд недоступна")}}}
+	if _, err := CleanupStaleBatches(context.Background(), boom, time.Now()); err == nil ||
+		!strings.Contains(err.Error(), "ingest: зачистка осиротевших партий") ||
+		!strings.Contains(err.Error(), "бд недоступна") {
+		t.Errorf("ошибка = %v, want контекст зачистки и исходная ошибка", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceled := &cleanupFakePool{}
+	if _, err := CleanupStaleBatches(ctx, canceled, time.Now()); !errors.Is(err, context.Canceled) {
+		t.Errorf("ошибка = %v, want context.Canceled", err)
+	}
+
+	// Граница возраста до 1970 года — отказ до обращения к БД: uint64-переход
+	// границы делал бы зачистку срезающей весь staging (P1 раунда 3:
+	// проверяется именно now−StaleBatchAge, а не now — часы ровно на
+	// эпохе Unix дают отрицательную границу при положительном now).
+	preEpoch := &cleanupFakePool{}
+	if _, err := CleanupStaleBatches(context.Background(), preEpoch, time.Unix(0, 0)); err == nil ||
+		!strings.Contains(err.Error(), "до 1970 года") {
+		t.Errorf("ошибка = %v, want отказ «граница до 1970 года» для эпохи Unix", err)
+	}
+	if _, err := CleanupStaleBatches(context.Background(), preEpoch, time.Date(1969, 12, 31, 23, 0, 0, 0, time.UTC)); err == nil ||
+		!strings.Contains(err.Error(), "до 1970 года") {
+		t.Errorf("ошибка = %v, want отказ «граница до 1970 года»", err)
+	}
+	if len(preEpoch.execCalls) != 0 {
+		t.Errorf("Exec'ы = %v, want нет: отказ до обращения к БД", preEpoch.execCalls)
+	}
+
+	// Сутки спустя после эпохи граница положительна — зачистка работает
+	// даже с «сдвинутыми» часами (контракт не требует 2026 года).
+	epochPlus := &cleanupFakePool{execs: []pipeExec{{tag: pgconn.NewCommandTag("DELETE 2")}}}
+	now := time.Unix(2*86400+3600, 0) // 1970-01-03 01:00 UTC
+	rows, err := CleanupStaleBatches(context.Background(), epochPlus, now)
+	if err != nil {
+		t.Fatalf("CleanupStaleBatches(эпоха+2 суток): %v", err)
+	}
+	if rows != 2 {
+		t.Errorf("удалено строк = %d, want 2", rows)
+	}
+	wantArg := batchIDBefore(now.Add(-StaleBatchAge))
+	if want := []any{wantArg[:]}; !reflect.DeepEqual(epochPlus.execCalls[0].args, want) {
+		t.Errorf("граница = %x, want %x", epochPlus.execCalls[0].args[0], want[0])
+	}
+}
+
 // --- CleanupOptions ------------------------------------------------------
 
 func TestCleanupOptionsDefaults(t *testing.T) {
@@ -548,6 +686,9 @@ func TestCleanupOptionsDefaults(t *testing.T) {
 
 // TestCleanupDeletedLoop — первый проход сразу, ошибки прохода не
 // останавливают цикл, отмена ctx возвращает nil (контракт OnRun, T-012).
+// Теми же проходами идёт зачистка осиротевших партий staging (T-098):
+// первый проход удаляет строки (Warn с числом), второй — ошибка БД
+// (Warn, цикл жив), дальше — DELETE 0 без записей.
 func TestCleanupDeletedLoop(t *testing.T) {
 	var buf bytes.Buffer
 	logger := newCleanupTestLogger(&buf)
@@ -564,6 +705,12 @@ func TestCleanupDeletedLoop(t *testing.T) {
 			[]any{int16(1), int64(10), cleanupHash16(0xaa)},
 			[]any{int16(1), int64(10), make([]byte, 9)}, // poison pill: Warn, проход жив
 		)},
+		// Зачистка staging: проход 1 — 5 осиротевших строк, проход 2 —
+		// ошибка БД, дальше — DELETE 0 (очередь кончилась).
+		execs: []pipeExec{
+			{tag: pgconn.NewCommandTag("DELETE 5")},
+			{err: errors.New("бд недоступна")},
+		},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -594,6 +741,13 @@ func TestCleanupDeletedLoop(t *testing.T) {
 	if st.begins != 1 || st.commits != 1 {
 		t.Errorf("транзакций %d, коммитов %d, want 1 и 1: ошибочный и пустые проходы не открывают", st.begins, st.commits)
 	}
+	// Каждый проход — одна зачистка staging, ошибки её не прерывают.
+	pool.mu.Lock()
+	sweeps := len(pool.execCalls)
+	pool.mu.Unlock()
+	if sweeps != st.selects {
+		t.Errorf("зачисток staging = %d, want = проходам цикла (%d)", sweeps, st.selects)
+	}
 
 	log := buf.String()
 	for _, want := range []string{
@@ -602,6 +756,10 @@ func TestCleanupDeletedLoop(t *testing.T) {
 		"domains=1",                 // счётчики прохода
 		"некорректным content_hash", // poison pill — Warn (ING-P2-4)
 		"бд недоступна",             // ошибка второго прохода
+		"удалены осиротевшие строки staging", // зачистка: Warn с числом строк (T-098)
+		"rows=5",                               // счётчик зачистки
+		"older_than=" + StaleBatchAge.String(), // порог возраста
+		"зачистка осиротевших партий staging", // ошибка зачистки — Warn, цикл жив
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("лог не содержит %q:\n%s", want, log)

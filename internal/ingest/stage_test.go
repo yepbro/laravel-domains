@@ -6,7 +6,9 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -126,6 +129,7 @@ func ints(vs []int) []string {
 }
 
 func TestNewBatchID(t *testing.T) {
+	before := time.Now().UnixMicro()
 	id, err := NewBatchID()
 	if err != nil {
 		t.Fatal(err)
@@ -139,6 +143,58 @@ func TestNewBatchID(t *testing.T) {
 	}
 	if id == other {
 		t.Error("два NewBatchID совпали: идентификаторы партий должны быть уникальными")
+	}
+	// Префикс времени создания (T-098): микросекунды между вызовами.
+	got := int64(binary.BigEndian.Uint64(id[:batchTimeLen]))
+	after := time.Now().UnixMicro()
+	if got < before || got > after {
+		t.Errorf("время в batch_id = %d, want между %d и %d", got, before, after)
+	}
+}
+
+// TestBatchIDAgeOrdering — побайтовый порядок batch_id совпадает с
+// хронологией создания (T-098): партия старше границы зачистки под неё
+// попадает, партия на границе и моложе — нет. Семантика диапазона
+// «batch_id < границы» против живой БД — интеграционные тесты ingest.
+func TestBatchIDAgeOrdering(t *testing.T) {
+	base := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	cutoff := batchIDBefore(base.Add(StaleBatchAge))
+
+	old, err := newBatchIDAt(base) // создана на сутки раньше границы
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Compare(old[:], cutoff[:]) >= 0 {
+		t.Error("партия старше порога обязана попадать под зачистку: batch_id < границы")
+	}
+
+	fresh, err := newBatchIDAt(base.Add(StaleBatchAge)) // ровно на границе
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh == (BatchID{}) || bytes.Compare(fresh[:], cutoff[:]) <= 0 {
+		t.Error("партия на границе возраста не обязана удаляться: случайный хвост больше нулевого")
+	}
+
+	later, err := newBatchIDAt(base.Add(StaleBatchAge).Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Compare(later[:], cutoff[:]) <= 0 {
+		t.Error("партия моложе границы не должна удаляться")
+	}
+
+	// Уникальность внутри одной микросекунды — случайным хвостом.
+	sameA, err := newBatchIDAt(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameB, err := newBatchIDAt(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameA == sameB {
+		t.Error("идентификаторы одной микросекунды совпали: хвост обязан быть случайным")
 	}
 }
 

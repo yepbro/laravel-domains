@@ -224,8 +224,9 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 `OnRun` наблюдает `ingest.dir` через `internal/watch` и прогоняет готовые
 файлы через конвейер приёма `internal/ingest` (разбор пути → зона →
 разбор с sha256 → валидация → staging → применение → отчёт `ingest_files`
-→ архив `processed/`/`failed/`), плюс фоновая очистка удалённых доменов
-(CleanupDeleted, T-020); контракт файлов и отчёты — в
+→ архив `processed/`/`failed/`), плюс фоновые очистки — удалённых доменов
+(T-020) и осиротевших партий staging по возрасту `batch_id` (T-098),
+одним циклом CleanupDeleted; контракт файлов и отчёты — в
 [`incoming-files.md`](incoming-files.md). `scheduler` (этап 2,
 T-027…T-031): его `OnRun` держит главный цикл постановки пачек — выборка
 pending с чередованием зон (`DispatchBatch`, T-027) → перевод в `queued`
