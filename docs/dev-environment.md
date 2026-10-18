@@ -266,17 +266,18 @@ crawlerctl seed / test-rules             # dev-команды (make seed, make t
 Обучение словаря сжатия контента (ТЗ 5.7): `--samples` — файл или каталог
 с `*.html`/`*.htm` (по умолчанию `testdata/laravel-samples`; флаг можно
 повторять, образцы читаются до лимита корпуса 64 МиБ). Словарь записывается
-атомарно и подключается конфигурацией `content.zstd_dictionary`; страницы,
-сжатые прежним словарём, для чтения требуют прежний словарь. Пример
-(словарь — в каталоге данных dev-окружения):
+атомарно и подключается конфигурацией `content.zstd_dictionary`; при
+переобучении прежний словарь архивируется в реестр прежних словарей
+(`dict-<id>.zstd` рядом с новым файлом) — записанный им контент остаётся
+читаемым. Пример (словарь — в каталоге данных dev-окружения):
 
 ```
 docker compose run --rm -v "$(pwd)/var/content:/out tools \
     go run ./cmd/crawlerctl dict train /out/dict.zst --samples testdata/laravel-samples
 ```
 
-Полная процедура (когда переобучать, подключение, ограничение
-читаемости старых кадров) — [`runbooks.md`](runbooks.md) §1.
+Полная процедура (когда переобучать, подключение, реестр прежних
+словарей) — [`runbooks.md`](runbooks.md) §1.
 
 Через make: `make status`, `make domain NAME=example.crawl.test`,
 `make reanalyze`, `make seed`, `make test-rules`. Остальные команды —

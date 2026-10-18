@@ -1,4 +1,4 @@
-// Обучаемый словарь zstd (ТЗ 5.7, задача T-043).
+// Обучаемый словарь zstd (ТЗ 5.7, задача T-043; реестр прежних — T-103).
 //
 // Сжатие маленьких HTML-страниц (парковки, заглушки хостингов — основной
 // контент краулера) гораздо выгоднее с обученным словарём: типовой шаблон
@@ -6,11 +6,14 @@
 // реализация пакета klauspost/compress (zstd.BuildDict, есть с v1.18):
 // внешний бинарник `zstd --train` и новые зависимости не нужны. Словарь
 // переобучается по требованию командой crawlerctl dict train и кладётся
-// в файл по пути content.zstd_dictionary.
+// в файл по пути content.zstd_dictionary; прежний словарь при этом
+// архивируется в реестр (dict-<id>.zstd рядом с активным файлом) —
+// записанный контент остаётся читаемым (T-103).
 
 package content
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -331,28 +334,49 @@ func overlapsSegment(taken []trainEntry, off int) bool {
 
 // Активный словарь — один на процесс (путь из content.zstd_dictionary).
 // Смена словаря на лету не предусматривается: переобученный файл
-// подхватывается при следующей инициализации (SetDictFile), старый словарь
-// остаётся нужным для распаковки записей, сжатых им (T-042 зафиксирует
-// хранение dict_id в метаданных паков).
+// подхватывается при следующей инициализации (SetDictFile). Прежние
+// словари не теряются: crawlerctl dict train архивирует их в реестр
+// dict-<id>.zstd рядом с активным файлом (RetireDict), чтение блоков
+// с чужим процессу dictID до-регистрирует словарь из реестра лениво
+// и memoизирует его (T-103) — переобучение не делает записанный
+// контент нечитаемым.
 var (
 	dictMu  sync.RWMutex
 	activeD *Dict
+	// dictDir — каталог реестра прежних словарей: тот же, что у активного
+	// файла (задаётся SetDictFile). retiredD — memoизация загруженных из
+	// реестра словарей по dictID.
+	dictDir  string
+	retiredD map[uint32]*Dict
 )
 
 // SetDict устанавливает словарь для CompressWithDict/DecompressWithDict.
-// nil — отключает (сжатие без словаря).
+// nil — отключает (сжатие без словаря). Реестр прежних словарей не трогает:
+// его каталог определяется файлом конфигурации (SetDictFile).
 func SetDict(d *Dict) {
 	dictMu.Lock()
 	activeD = d
 	dictMu.Unlock()
 }
 
-// SetDictFile загружает словарь из файла (путь из content.zstd_dictionary).
-// Пустой путь или отсутствующий файл — не ошибка: возвращается false,
-// сервис работает без словаря (Compress/CompressWithDict одинаково падают
-// в каркасное сжатие); отсутствие отмечается в логе. Битый файл — ошибка:
-// молчаливое сжатие без словаря скрыло бы проблему конфигурации.
+// SetDictFile загружает словарь из файла (путь из content.zstd_dictionary)
+// и подключает реестр прежних словарей — каталогом реестра становится
+// каталог активного файла. Пустой путь или отсутствующий файл — не ошибка:
+// возвращается false, сервис работает без словаря (Compress/
+// CompressWithDict одинаково падают в каркасное сжатие); отсутствие
+// отмечается в логе, а реестр остаётся подключённым — блоки, сжатые
+// прежними словарями, читаются и без активного файла. Битый файл —
+// ошибка: молчаливое сжатие без словаря скрыло бы проблему конфигурации.
 func SetDictFile(path string, log *slog.Logger) (bool, error) {
+	// Смена пути — сброс реестра и memoизации; до возвращения из функции
+	// чтение по старому каталогу невозможно (dictDir уже новый).
+	dictMu.Lock()
+	dictDir = ""
+	if path != "" {
+		dictDir = filepath.Dir(path)
+	}
+	retiredD = nil
+	dictMu.Unlock()
 	if path == "" {
 		SetDict(nil)
 		return false, nil
@@ -381,13 +405,12 @@ func SetDictFile(path string, log *slog.Logger) (bool, error) {
 
 // WarnDictMismatch сверяет активный словарь пакета с dictID заголовка
 // новейшего пака каталога dir — диагностика при старте сервиса (T-043).
-// Декодер распаковывает кадры только зарегистрированным в процессе
-// словарём (SetDict/SetDictFile): после переобучения кадры, сжатые
-// прежним словарём, нечитаемы, и расхождение показывается оператору
-// сразу (Warn), а не списком ошибок чтения контента. Паков нет или
-// заголовок новейшего нечитаем — молча: это не расхождение словаря.
-// Реестра словарей в хранилище нет (docs/configuration.md) — Warn
-// призыв вручную вернуть прежний файл словаря.
+// Кадр прежнего словаря читается до-регистрацией из реестра (T-103):
+// расхождение с архивированным в реестр словарём — Info (читаемость
+// есть), Warn — только если прежний словарь и в реестре отсутствует
+// (кадры этого пака нечитаемы, текст называет порядок восстановления —
+// runbooks.md §1). Паков нет или заголовок новейшего нечитаем — молча:
+// это не расхождение словаря.
 func WarnDictMismatch(dir string, log *slog.Logger) {
 	if log == nil || dir == "" {
 		return
@@ -415,15 +438,29 @@ func WarnDictMismatch(dir string, log *slog.Logger) {
 		return
 	}
 	if id := activeDictID(); id != hdr.dictID {
-		log.Warn("словарь zstd не соответствует новейшему паку — кадры прежнего словаря нечитаемы (верните прежний файл словаря)",
-			"pack", max, "pack_dict_id", fmt.Sprintf("%08x", hdr.dictID), "active_dict_id", fmt.Sprintf("%08x", id))
+		packDict, actDict := fmt.Sprintf("%08x", hdr.dictID), fmt.Sprintf("%08x", id)
+		dictMu.RLock()
+		reg := dictDir
+		dictMu.RUnlock()
+		if reg != "" {
+			// Существование файла дешевле загрузки кодеков при старте:
+			// сама ленивая до-регистрация произойдёт при первом чтении.
+			if _, err := os.Stat(DictRegistryPath(reg, hdr.dictID)); err == nil {
+				log.Info("словарь zstd новее пака — кадры прежнего словаря читаются через реестр",
+					"pack", max, "pack_dict_id", packDict, "active_dict_id", actDict, "registry", reg)
+				return
+			}
+		}
+		log.Warn("словарь zstd не соответствует новейшему паку и не найден в реестре прежних словарей — кадры этого словаря нечитаемы (верните файл словаря в реестр, runbooks.md §1)",
+			"pack", max, "pack_dict_id", packDict, "active_dict_id", actDict)
 	}
 }
 
 // CompressWithDict сжимает src активным словарём пакета (SetDict /
 // SetDictFile); без установленного словаря — то же, что Compress:
-// запись контента не зависит от того, обучен ли уже словарь. Точка
-// подключения хранилища контента (T-042).
+// запись контента не зависит от того, обучен ли уже словарь. Запись
+// всегда идёт активным словарём — реестр прежних словарей в сжатии
+// не участвует.
 func CompressWithDict(src []byte) []byte {
 	dictMu.RLock()
 	d := activeD
@@ -435,13 +472,135 @@ func CompressWithDict(src []byte) []byte {
 }
 
 // DecompressWithDict распаковывает кадры, сжатые CompressWithDict
-// (активным словарём на момент сжатия) и Compress.
+// (активным словарём на момент сжатия) и Compress. Кадр, сжатый
+// прежним словарём (переобучение), до-регистрируется из реестра
+// прежних словарей — ленивая загрузка dict-<id>.zstd по dictID кадра
+// и memoизация (T-103). Словаря в реестре нет — ошибка с исходным
+// zstd.ErrUnknownDictionary и путём реестра в тексте.
 func DecompressWithDict(src []byte) ([]byte, error) {
 	dictMu.RLock()
 	d := activeD
 	dictMu.RUnlock()
-	if d == nil {
-		return Decompress(src)
+	var (
+		raw []byte
+		err error
+	)
+	if d != nil {
+		raw, err = d.Decompress(src)
+	} else {
+		raw, err = Decompress(src)
 	}
-	return d.Decompress(src)
+	if err == nil || !errors.Is(err, zstd.ErrUnknownDictionary) {
+		return raw, err
+	}
+	// Кадр словаря, не зарегистрированного в процессе: dictID — из
+	// заголовка кадра, словарь — из реестра прежних.
+	id := frameDictID(src)
+	if id == 0 || (d != nil && id == d.ID()) {
+		// Заголовок не разобрался или ID совпал с активным — это не
+		// чужой словарь, а повреждение кадра: исходная ошибка честнее.
+		return raw, err
+	}
+	rd, rerr := dictFromRegistry(id)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return rd.Decompress(src)
+}
+
+// DictRegistryPath — путь файла словаря id в реестре прежних словарей
+// каталога dir: реестр живёт рядом с активным файлом (каталог
+// content.zstd_dictionary), имя — по dictID словаря.
+func DictRegistryPath(dir string, id uint32) string {
+	return filepath.Join(dir, fmt.Sprintf("dict-%08x.zstd", id))
+}
+
+// RetireDict архивирует словарь в реестр прежних словарей каталога dir
+// (атомарная запись Save, T-103): crawlerctl dict train вызывает её до
+// записи нового активного файла — сбой оставляет прежний словарь
+// активным. Идемпотентна: файл того же ID перезаписывается тем же
+// содержимым.
+func RetireDict(d *Dict, dir string) error {
+	return d.Save(DictRegistryPath(dir, d.ID()))
+}
+
+// dictFromRegistry возвращает словарь dictID: сперва memoизация, затем
+// ленивая загрузка из реестра (каталог задаёт SetDictFile); загруженный
+// словарь запоминается на время жизни процесса — чтение старых паков
+// не ходит в ФС на каждый блок. Отрицательный результат не memoизируется:
+// файл, положенный в реестр на живом сервисе, подхватывается следующим
+// чтением без рестарта.
+func dictFromRegistry(id uint32) (*Dict, error) {
+	dictMu.RLock()
+	d := retiredD[id]
+	dir := dictDir
+	dictMu.RUnlock()
+	if d != nil {
+		return d, nil
+	}
+	if dir == "" {
+		return nil, fmt.Errorf("%w: %08x — реестр прежних словарей не подключён (каталог задаётся content.zstd_dictionary)",
+			zstd.ErrUnknownDictionary, id)
+	}
+	path := DictRegistryPath(dir, id)
+	d, err := LoadDict(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("%w: словарь %08x отсутствует в реестре (%s) — кадры этого словаря нечитаемы, верните файл в реестр (runbooks.md §1)",
+				zstd.ErrUnknownDictionary, id, path)
+		}
+		return nil, fmt.Errorf("%w: словарь %08x из реестра %s: %s",
+			zstd.ErrUnknownDictionary, id, path, err)
+	}
+	if d.ID() != id {
+		return nil, fmt.Errorf("%w: файл реестра %s содержит словарь %08x, кадр требует %08x (имя файла не соответствует содержимому)",
+			zstd.ErrUnknownDictionary, path, d.ID(), id)
+	}
+	dictMu.Lock()
+	if retiredD == nil {
+		retiredD = make(map[uint32]*Dict)
+	}
+	retiredD[id] = d
+	dictMu.Unlock()
+	return d, nil
+}
+
+// frameDictID извлекает ID словаря из заголовка кадра zstd (0 — кадр
+// без словаря или заголовок не разобрался: короткий обрыв, чужие байты).
+// Заголовок: magic, дескриптор кадра (биты 0x20 — Single_Segment,
+// 0x03 — размер Dictionary_ID), необязательный байт window-дескриптора
+// (без Single_Segment), затем сам ID размером 1/2/4 байта. Ошибкой не
+// сопровождается: вызывается после ошибки декодера — причину в итоге
+// называет он.
+func frameDictID(frame []byte) uint32 {
+	if len(frame) < 5 || binary.LittleEndian.Uint32(frame[:4]) != 0xFD2FB528 {
+		return 0
+	}
+	var size int
+	switch fhd := frame[4]; fhd & 3 {
+	case 1:
+		size = 1
+	case 2:
+		size = 2
+	case 3:
+		size = 4
+	}
+	if size == 0 {
+		return 0 // кадр без словаря
+	}
+	pos := 5
+	if frame[4]&0x20 == 0 {
+		pos++ // window-дескриптор присутствует без Single_Segment
+	}
+	if len(frame) < pos+size {
+		return 0
+	}
+	switch size {
+	case 1:
+		return uint32(frame[pos])
+	case 2:
+		return uint32(binary.LittleEndian.Uint16(frame[pos:]))
+	default:
+		return binary.LittleEndian.Uint32(frame[pos:])
+	}
 }

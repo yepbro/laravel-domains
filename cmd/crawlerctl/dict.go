@@ -4,15 +4,18 @@
 // сжатия — на усмотрение разработки). Обучение и переобучение — одно и то
 // же действие (train): файл словаря перезаписывается атомарно, сервисы
 // подхватывают его при следующем старте по пути content.zstd_dictionary.
-// Реализована полностью.
+// Прежний словарь при переобучении архивируется в реестр прежних словарей
+// (dict-<id>.zstd рядом с новым файлом, T-103) — записанный контент
+// остаётся читаемым. Реализована полностью.
 
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,8 +35,10 @@ const dictHelp = `crawlerctl dict — управление словарём сж
 каталог (обход рекурсивный); флаг можно повторять. По умолчанию образцы —
 testdata/laravel-samples. Переобучение — повторный запуск команды.
 
-Словарь подключается конфигурацией content.zstd_dictionary; страницы,
-сжатые прежним словарём, для чтения требуют прежний словарь.
+Словарь подключается конфигурацией content.zstd_dictionary. При
+переобучении прежний словарь автоматически архивируется в реестр прежних
+словарей (файл dict-<id>.zstd рядом с новым): записанные им паки
+остаются читаемыми.
 `
 
 // dictTrainSampleDefault — каталог образцов по умолчанию (как у test-rules):
@@ -138,6 +143,26 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 	out(stdout, "dict train: оценка сжатия корпуса %d байт: без словаря %d, со словарём %d\n",
 		evalBytes, plainSum, dictSum)
 
+	// Прежний словарь — в реестр прежних (T-103): до записи нового файла,
+	// сбой архивации оставляет прежний активным. Переобучение не делает
+	// записанный контент нечитаемым — прежний словарь читается ленивой
+	// до-регистрацией. Тот же ID (тот же корпус) — архивировать нечего.
+	if prev, err := content.LoadDict(outPath); err == nil {
+		if prev.ID() != d.ID() {
+			regPath := content.DictRegistryPath(filepath.Dir(outPath), prev.ID())
+			if err := content.RetireDict(prev, filepath.Dir(outPath)); err != nil {
+				return fmt.Errorf("dict train: архивация прежнего словаря %08x в %s: %w",
+					prev.ID(), regPath, err)
+			}
+			out(stdout, "dict train: прежний словарь ID %08x — в реестре: %s\n", prev.ID(), regPath)
+		}
+	} else if !errors.Is(err, iofs.ErrNotExist) {
+		// Прежний файл не словарь: читаемости старых паков он не даёт,
+		// новый запишется поверх — оператору знать.
+		out(stderr, "dict train: прежний файл %s не является словарём zstd (%v), архивация пропущена\n",
+			outPath, err)
+	}
+
 	if err := d.Save(outPath); err != nil {
 		return fmt.Errorf("dict train: %w", err)
 	}
@@ -164,7 +189,7 @@ func collectSampleFiles(paths []string) ([]string, error) {
 			}
 			continue
 		}
-		err = filepath.WalkDir(p, func(path string, d fs.DirEntry, err error) error {
+		err = filepath.WalkDir(p, func(path string, d iofs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}

@@ -151,12 +151,57 @@ func TestWarnDictMismatch(t *testing.T) {
 	t.Run("расхождение — Warn", func(t *testing.T) {
 		dir := t.TempDir()
 		compactCraftPack(t, dir, 1, nil) // новейший пак (dictID 0 в заголовке)
+		_, _ = SetDictFile("", nil)      // реестр не подключён — только активный словарь
 		SetDict(dict)                    // активный словарь с ненулевым ID
 		defer SetDict(nil)
 		buf, log := newBuf()
 		WarnDictMismatch(dir, log)
 		if !warned(buf) {
 			t.Errorf("расхождение не замечено: %s", buf.String())
+		}
+	})
+
+	t.Run("расхождение с реестром, файла нет — Warn", func(t *testing.T) {
+		packs, reg := t.TempDir(), t.TempDir()
+		newD, err := TrainDict(dictCorpusAlt(12, 2048), TrainOptions{DictSize: 16 << 10})
+		if err != nil {
+			t.Fatalf("TrainDict: %v", err)
+		}
+		dictCraftHeaderPack(t, packs, 1, dict.ID()) // пак прежнего словаря
+		if err := newD.Save(filepath.Join(reg, "dict.zst")); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = SetDictFile(filepath.Join(reg, "dict.zst"), nil) // реестр подключён, файла прежнего нет
+		defer func() { _, _ = SetDictFile("", nil) }()
+		buf, log := newBuf()
+		WarnDictMismatch(packs, log)
+		if !warned(buf) {
+			t.Errorf("расхождение без файла в реестре не замечено: %s", buf.String())
+		}
+	})
+
+	t.Run("прежний словарь в реестре — Info, не Warn", func(t *testing.T) {
+		packs, reg := t.TempDir(), t.TempDir()
+		newD, err := TrainDict(dictCorpusAlt(12, 2048), TrainOptions{DictSize: 16 << 10})
+		if err != nil {
+			t.Fatalf("TrainDict: %v", err)
+		}
+		dictCraftHeaderPack(t, packs, 1, dict.ID())
+		if err := dict.Save(DictRegistryPath(reg, dict.ID())); err != nil {
+			t.Fatal(err)
+		}
+		if err := newD.Save(filepath.Join(reg, "dict.zst")); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = SetDictFile(filepath.Join(reg, "dict.zst"), nil)
+		defer func() { _, _ = SetDictFile("", nil) }()
+		buf, log := newBuf()
+		WarnDictMismatch(packs, log)
+		if warned(buf) {
+			t.Errorf("ложный Warn при словаре в реестре: %s", buf.String())
+		}
+		if !strings.Contains(buf.String(), "через реестр") {
+			t.Errorf("читаемость через реестр не отражена в логе:\n%s", buf.String())
 		}
 	})
 

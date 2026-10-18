@@ -322,6 +322,106 @@ func dictTrainSamplePages(n int) []string {
 	return pages
 }
 
+// dictTrainSamplePagesAlt — второй шаблон (заглушка хостинга): другое
+// содержимое словаря — другой ID (сценарий переобучения, T-103).
+func dictTrainSamplePagesAlt(n int) []string {
+	pages := make([]string, n)
+	for i := range pages {
+		pages[i] = fmt.Sprintf(
+			"<!DOCTYPE html><html><head><title>suspended %d</title></head>"+
+				"<body><header class=\"hdr\">account suspended</header>"+
+				"<main><p>unique page text %d</p></main>"+
+				"<footer class=\"ftr\">support@hosting.invalid</footer>"+
+				"</body></html>", i, i)
+	}
+	return pages
+}
+
+// writeSampleDir — каталог с HTML-образцами страниц.
+func writeSampleDir(t *testing.T, dir string, pages []string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i, page := range pages {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("page%02d.html", i)), []byte(page), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestRunDictTrainRetiresPrevious — переобучение архивирует прежний
+// словарь в реестр (dict-<id>.zstd рядом с новым файлом): кадры,
+// сжатые прежним словарём, читаются после замены активного (T-103).
+func TestRunDictTrainRetiresPrevious(t *testing.T) {
+	dir := t.TempDir()
+	samplesA := filepath.Join(dir, "a")
+	samplesB := filepath.Join(dir, "b")
+	writeSampleDir(t, samplesA, dictTrainSamplePages(10))
+	writeSampleDir(t, samplesB, dictTrainSamplePagesAlt(10))
+	dictPath := filepath.Join(dir, "dict.zst")
+
+	// Первое обучение.
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"dict", "train", dictPath, "--samples", samplesA}, &stdout, &stderr); code != exitOK {
+		t.Fatalf("первый train: код = %d, stderr:\n%s", code, stderr.String())
+	}
+	first, err := content.NewDict(mustReadFile(t, dictPath))
+	if err != nil {
+		t.Fatalf("словарь первого train: %v", err)
+	}
+	// Кадр, сжатый первым словарём (контент «до переобучения»).
+	page := dictTrainSamplePages(101)[100]
+	frame := first.Compress([]byte(page))
+
+	// Переобучение: прежний словарь — в реестре.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"dict", "train", dictPath, "--samples", samplesB}, &stdout, &stderr); code != exitOK {
+		t.Fatalf("второй train: код = %d, stderr:\n%s", code, stderr.String())
+	}
+	outStr := stdout.String()
+	if !strings.Contains(outStr, "в реестре") || !strings.Contains(outStr, fmt.Sprintf("%08x", first.ID())) {
+		t.Errorf("stdout не сообщает об архивации прежнего словаря:\n%s", outStr)
+	}
+	regPath := content.DictRegistryPath(dir, first.ID())
+	retired, err := content.NewDict(mustReadFile(t, regPath))
+	if err != nil {
+		t.Fatalf("файл реестра %s: %v", regPath, err)
+	}
+	if retired.ID() != first.ID() {
+		t.Errorf("словарь в реестре ID %08x, хочу %08x", retired.ID(), first.ID())
+	}
+	second, err := content.NewDict(mustReadFile(t, dictPath))
+	if err != nil {
+		t.Fatalf("новый активный словарь: %v", err)
+	}
+	if second.ID() == first.ID() {
+		t.Fatal("переобучение не сменило ID словаря — тест ничего не проверяет")
+	}
+
+	// Прежний кадр читается после переобучения: реестр подключается тем
+	// же путём конфигурации, что и активный файл.
+	if ok, err := content.SetDictFile(dictPath, nil); err != nil || !ok {
+		t.Fatalf("SetDictFile: ok=%v err=%v", ok, err)
+	}
+	defer func() { _, _ = content.SetDictFile("", nil) }()
+	got, err := content.DecompressWithDict(frame)
+	if err != nil || !strings.Contains(string(got), "site 100") {
+		t.Errorf("кадр прежнего словаря после переобучения: err=%v, содержит=%q", err, string(got))
+	}
+}
+
+// mustReadFile — содержимое файла или фатальная ошибка теста.
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("чтение %s: %v", path, err)
+	}
+	return raw
+}
+
 // TestRunDictTrain — сквозной прогон команды: образцы → словарь в файле,
 // код 0; словарь валиден и распаковывается (content.NewDict).
 func TestRunDictTrain(t *testing.T) {
