@@ -167,10 +167,15 @@ T-087 (≤ 512M, под потолком MemoryMax).
 
 ```bash
 for svc in ingest scheduler dns-worker http-worker render-worker analyzer monitor crawlerctl; do
-    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "out/$svc" "./cmd/$svc"
+    CGO_ENABLED=0 go build -trimpath \
+      -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod" \
+      -o "out/$svc" "./cmd/$svc"
 done
 sudo install -D -t /opt/crawler/bin out/*
 ```
+
+`buildMode=prod` помечает боевые сборки в метрике `crawler_build_info`
+(метка `mode`); dev-сборки без `-X` остаются на `dev-stub`.
 
 Миграции схем зашиты в бинарники (`migrations/embed.go`, golang-migrate).
 

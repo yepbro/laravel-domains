@@ -26,7 +26,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/render-worker ./cmd/render-worker
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod" -o /out/render-worker ./cmd/render-worker
 
 FROM ${CHROMEDP_HEADLESS_IMAGE} AS render
 COPY --from=build /out/render-worker /usr/local/bin/render-worker

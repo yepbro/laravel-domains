@@ -96,7 +96,9 @@ Prometheus скрейпит каждый сервис отдельно (dev-ко
 Реестр метрик — `metrics.New(name)` (T-076): собственный
 `*prometheus.Registry` на сервис (одноимённые метрики разных сервисов не
 конфликтуют) с метриками каркаса — `crawler_service_up{service}`,
-`crawler_build_info{service,mode}` — и коллекторами Go/runtime и
+`crawler_build_info{service,mode}` (mode: `dev-stub` — dev-сборки без
+инъекции, `prod` — боевые сборки через `-ldflags -X …buildMode=prod`)
+и коллекторами Go/runtime и
 процесса (uptime выводится из `process_start_time_seconds` в PromQL).
 
 Реестр — фабрика метрик рабочей логики: `Counter`/`Gauge`/`Histogram`

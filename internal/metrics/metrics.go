@@ -52,6 +52,16 @@ const (
 	LabelState = "state"
 )
 
+// buildMode — значение метки mode метрики crawler_build_info. Боевые
+// сборки инъекцируют его линковщиком:
+//
+//	go build -ldflags "-X crawler/internal/metrics.buildMode=prod"
+//
+// (deploy/docker/Dockerfile.go, Dockerfile.render, docs/deploy.md §4.2).
+// Без инъекции — dev-сборка (go build / air / go test): каркас
+// разработки, значение по умолчанию сохранено, чтобы не ломать dev.
+var buildMode = "dev-stub"
+
 // Значения метки LabelStage — этапы конвейера (ТЗ 4.2, §7). Единые
 // значения фиксируются здесь, чтобы метрики всех сервисов агрегировались
 // в PromQL без нормализации.
@@ -98,9 +108,9 @@ func New(name string) *Registry {
 
 	build := reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_build_info",
-		Help: "Информация о сборке (режим dev-каркаса).",
+		Help: "Информация о сборке: mode — режим сборки (dev-stub — dev/тесты, prod — боевые сборки через -ldflags -X).",
 	}, "mode")
-	build.WithLabelValues("dev-stub").Set(1)
+	build.WithLabelValues(buildMode).Set(1)
 
 	return reg
 }

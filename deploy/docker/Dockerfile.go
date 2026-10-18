@@ -47,9 +47,11 @@ ENV PATH="/go/bin:${PATH}" \
 FROM base AS build
 COPY . .
 # Статические бинарники всех сервисов (ТЗ 6.1: CGO_ENABLED=0, -trimpath, -ldflags).
+# buildMode=prod честно помечает боевые сборки в crawler_build_info
+# (dev без -X остаётся dev-stub).
 RUN set -eux; \
     for cmd in ingest scheduler dns-worker http-worker render-worker analyzer monitor crawlerctl mockserver testbedgen; do \
-        CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/$cmd ./cmd/$cmd; \
+        CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod" -o /out/$cmd ./cmd/$cmd; \
     done
 
 # --------------------------------------------------------------------------
@@ -63,6 +65,7 @@ USER nonroot
 # Сборка mockserver — отдельная стадия: исходник ограничен stdlib, поэтому
 # правки остального модуля (включая тесты) не инвалидируют слой, а make
 # test-integration пересобирает образ быстро (--build на up тестбеда).
+# buildMode не инъекцируется: mockserver не линкует internal/metrics.
 FROM base AS mockserver-build
 COPY go.mod go.sum ./
 COPY cmd/mockserver/ cmd/mockserver/
