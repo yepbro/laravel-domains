@@ -118,6 +118,17 @@ type Options struct {
 	// Кэш — обёртка NewCachingResolver поверх резолвера этапа; «тот же
 	// резолвер» ТЗ 5.5 п. 2 — адаптер dnsclient соберёт wiring воркера.
 	Resolver Resolver
+	// BlockInternalAddrs — не подключаться к внутренним адресам
+	// (loopback, RFC1918/ULA, link-local, unspecified, multicast) на
+	// пути резолва хостов редиректов (SSRF-защита: недоверенный сайт
+	// может увести краулер на 127.0.0.1, 169.254.169.254 — cloud
+	// metadata — или адрес сети, где живут БД/Redis). Адреса DNS-этапа
+	// (выданные стартовому хосту задачей q:http) не фильтруются — это
+	// решение DNS-этапа. false — поведение прежнее: dev/testbed-стенды
+	// резолвят сценарии во внутренние сети (172.28.100.0/24);
+	// Internet-боевой эксплуатации рекомендуется включать
+	// (http.block_internal_addrs).
+	BlockInternalAddrs bool
 	// TLSClientConfig — конфигурация TLS-клиента. SNI и проверка
 	// сертификата выполняются по хосту URL (DialContext подключается к
 	// заранее резолвенному IP, не меняя целевой адрес). nil — обычная
@@ -148,6 +159,7 @@ func NewOptions(cfg config.HTTP) Options {
 		MaxBodyBytes:        cfg.MaxBodyBytes.B(),
 		UserAgent:           ua,
 		Limits:              &limits,
+		BlockInternalAddrs:  cfg.BlockInternalAddrs,
 	}
 }
 
@@ -541,18 +553,47 @@ func (f *Fetcher) dialContext(ctx context.Context, network, addr string) (net.Co
 
 // lookup возвращает адреса хоста: IP-литерал из URL редиректа — сам
 // по себе (резолверу имя не нужно), имя — через Resolver транспорта.
+// С Options.BlockInternalAddrs внутренние адреса отбраковываются
+// (SSRF-защита пути редиректов, см. Options): фильтр сидит здесь —
+// единственная воронка, через которую идут и литералы из Location,
+// и резолвы новых хостов; адреса DNS-этапа (FetchRequest.Addrs) в
+// воронку не попадают и не фильтруются.
 func (f *Fetcher) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
+	var addrs []netip.Addr
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return []netip.Addr{ip}, nil
+		addrs = []netip.Addr{ip}
+	} else {
+		var err error
+		addrs, err = f.res.LookupNetIP(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("httpfetch: резолв %q: %w", host, err)
+		}
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("httpfetch: резолв %q: пустой ответ", host)
+		}
 	}
-	addrs, err := f.res.LookupNetIP(ctx, host)
-	if err != nil {
-		return nil, fmt.Errorf("httpfetch: резолв %q: %w", host, err)
-	}
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("httpfetch: резолв %q: пустой ответ", host)
+	if f.opt.BlockInternalAddrs {
+		external := make([]netip.Addr, 0, len(addrs))
+		for _, a := range addrs {
+			if !addrIsInternal(a) {
+				external = append(external, a)
+			}
+		}
+		if len(external) == 0 {
+			return nil, fmt.Errorf("httpfetch: резолв %q: только внутренние адреса %v — заблокировано (SSRF, http.block_internal_addrs)", host, addrs)
+		}
+		addrs = external
 	}
 	return addrs, nil
+}
+
+// addrIsInternal — адрес внутреннего/специального диапазона, куда
+// Internet-краулеру хода нет: loopback, приватные (RFC1918 и ULA —
+// netip объединяет их в IsPrivate), link-local (включая cloud metadata
+// 169.254.169.254), unspecified и multicast.
+func addrIsInternal(a netip.Addr) bool {
+	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() ||
+		a.IsLinkLocalMulticast() || a.IsUnspecified() || a.IsMulticast()
 }
 
 // dialNet — продакшн-диал (поле dial — шов подмены в тестах): TCP

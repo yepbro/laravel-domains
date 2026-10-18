@@ -58,6 +58,7 @@ http:
   max_body_bytes: 2097152            # 2 MiB
   min_body_speed: 2048               # мин. скорость тела после первого байта, байт/с — тарпиты (ТЗ 5.5)
   max_rps: 1000                      # глобальный темп запросов (RPS); всплески до concurrency
+  block_internal_addrs: false        # SSRF: не ходить по редиректам на внутренние адреса (loopback/RFC1918/link-local); для Internet-боевой эксплуатации включить
   user_agent: "DomainCrawler/1.0 (+https://example.example/contact; admin@example.example)"  # честный UA с контактами — обязателен; подставьте реальные контакты оператора (ТЗ §9)
 
 render:

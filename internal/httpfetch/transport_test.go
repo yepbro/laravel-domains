@@ -515,6 +515,80 @@ func TestDialContextRedirectIPLiteral(t *testing.T) {
 	}
 }
 
+// --- SSRF-защита пути редиректов ---------------------------------------------
+
+// TestLookupBlocksInternalAddrs: Options.BlockInternalAddrs отбраковывает
+// в воронке lookup внутренние адреса — литералы из Location (SSRF:
+// loopback, RFC1918, cloud metadata) и адреса резолва; внешний адрес
+// смешанного ответа остаётся.
+func TestLookupBlocksInternalAddrs(t *testing.T) {
+	f := NewFetcher(Options{
+		BlockInternalAddrs: true,
+		Resolver: ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return []netip.Addr{
+				netip.MustParseAddr("192.0.2.10"),      // TEST-NET-1 — не внутренний
+				netip.MustParseAddr("10.0.0.5"),        // RFC1918
+				netip.MustParseAddr("169.254.169.254"), // cloud metadata
+			}, nil
+		}),
+	})
+
+	addrs, err := f.lookup(context.Background(), "mixed.example.net")
+	if err != nil {
+		t.Fatalf("резолв со внешним адресом: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0] != netip.MustParseAddr("192.0.2.10") {
+		t.Errorf("ожидался только внешний адрес, получено %v", addrs)
+	}
+
+	for _, host := range []string{"127.0.0.1", "10.0.0.5", "169.254.169.254", "::1", "fd00::1", "192.168.1.1"} {
+		if _, err := f.lookup(context.Background(), host); err == nil {
+			t.Errorf("внутренний литерал %q не заблокирован", host)
+		}
+	}
+	f2 := NewFetcher(Options{
+		BlockInternalAddrs: true,
+		Resolver: ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("172.16.0.1")}, nil
+		}),
+	})
+	if _, err := f2.lookup(context.Background(), "internal-only.example.net"); err == nil {
+		t.Error("ответ только с внутренними адресами не заблокирован")
+	}
+
+	// Флаг выключен — прежнее поведение: адреса проходят как есть.
+	f3 := NewFetcher(Options{
+		Resolver: ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("10.0.0.5")}, nil
+		}),
+	})
+	if addrs, err := f3.lookup(context.Background(), "legacy.example.net"); err != nil || len(addrs) != 1 {
+		t.Errorf("без флага внутренние адреса должны проходить: %v %v", addrs, err)
+	}
+}
+
+// TestFetchChainBlocksInternalRedirect: Location на внутренний адрес —
+// переход не выполняется (ошибка резолва, цепочка — выполненная часть);
+// адреса DNS-этапа стартового хоста фильтр не затрагивает.
+func TestFetchChainBlocksInternalRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://169.254.169.254/latest/meta-data/")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	// Стартовый запрос идёт по адресам DNS-этапа (петля!) — не фильтруется.
+	f := NewFetcher(Options{BlockInternalAddrs: true, Resolver: redirectResolverFail})
+	got, err := FetchChain(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "ssrf.example.net", "/start"), Addrs: loopbackAddr()})
+	if err == nil || !strings.Contains(err.Error(), "внутренние") {
+		t.Fatalf("ожидалась блокировка внутреннего адреса, получено: %v", err)
+	}
+	if len(got.Chain) != 1 {
+		t.Errorf("цепочка: %+v, ожидался 1 шаг (перехода нет)", got.Chain)
+	}
+}
+
 // --- таймауты слоёв ------------------------------------------------------------
 
 // stallServer — «тарпит»: обработчик отвечает только после закрытия
