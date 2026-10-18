@@ -749,6 +749,13 @@ func TestPipelineContextCanceled(t *testing.T) {
 	if len(pt.files.records) != 0 {
 		t.Error("журнал не пишется при отмене")
 	}
+	// Партия очищена и после отмены ctx: discard чистит staging собственным
+	// контекстом (ING-P2-3) — строки не копятся в staging от рестарта к
+	// рестарту. (Очистка внутри Stage с отменённым ctx не дошла до БД —
+	// фейк, как pgx, отказывает до записи обращения.)
+	if len(pt.pool.ops) != 1 || pt.pool.ops[0] != "exec:"+clearStageSQL {
+		t.Errorf("обращения = %v, want одна очистка отброшенной партии", pt.pool.ops)
+	}
 }
 
 // TestPipelineMoveCollision — в архиве уже есть файл с тем же именем

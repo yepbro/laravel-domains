@@ -207,7 +207,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	rep.Accepted = int64(vres.Accepted)
 	rep.Reasons = vres.Reasons
 	if err != nil {
-		p.discard(ctx, id)
+		p.discard(id)
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: err}
 	}
 
@@ -231,7 +231,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	known, err := p.files.FileBySHA256(ctx, rep.SHA256)
 	switch {
 	case err != nil && !errors.Is(err, ErrFileNotFound):
-		p.discard(ctx, id)
+		p.discard(id)
 		return Outcome{Kind: OutcomeLeft, Report: rep,
 			Err: fmt.Errorf("ingest: проверка дубля файла %s: %w", f.Path, err)}
 	case err == nil:
@@ -255,7 +255,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	case model.ActionAdd:
 		res, aerr := ApplyAdd(ctx, p.pool, batch)
 		if aerr != nil {
-			p.discard(ctx, id)
+			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: aerr}
 		}
 		rep.Added = res.Inserted + res.Revived
@@ -264,7 +264,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	case model.ActionDelete:
 		res, derr := ApplyDelete(ctx, p.pool, batch)
 		if derr != nil {
-			p.discard(ctx, id)
+			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
 		rep.Deleted = res.Deleted
@@ -408,11 +408,21 @@ func (p *Pipeline) clearBatch(ctx context.Context, id BatchID) error {
 	return nil
 }
 
+// discardTimeout — запас на очистку партии после сбоя: отдельный
+// контекст с таймаутом, чтобы best-effort очистка не висела вечно.
+const discardTimeout = 5 * time.Second
+
 // discard — отбросить партию после инфраструктурного сбоя (best effort):
 // каждая попытка обработки берёт новый batch_id, строки неудачной партии
-// мертвы — чистим, чтобы staging не рос (T-017). Ошибка очистки не
-// затеняет основную: логируется.
-func (p *Pipeline) discard(ctx context.Context, id BatchID) {
+// мертвы — чистим, чтобы staging не рос (T-017). Вызывается и с уже
+// отменённым ctx (graceful shutdown в момент загрузки): очистка обязана
+// переживать отмену — иначе строки партии оставались бы в staging
+// навсегда (batch_id больше не встретится) и таблица росла от рестарта
+// к рестарту. Контекст — свой, с таймаутом; ошибка очистки не затеняет
+// основную: логируется.
+func (p *Pipeline) discard(id BatchID) {
+	ctx, cancel := context.WithTimeout(context.Background(), discardTimeout)
+	defer cancel()
 	if err := p.clearBatch(ctx, id); err != nil {
 		p.log.Warn("очистка отброшенной партии", "err", err)
 	}
