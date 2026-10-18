@@ -36,10 +36,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	"crawler/internal/db"
 	"crawler/internal/idn"
@@ -302,7 +299,7 @@ func cmdRecheck(args []string, stdout, stderr io.Writer) error {
 		names = append(names, res.ASCII)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalCtx()
 	defer stop()
 
 	pool, err := openManagePool(ctx)

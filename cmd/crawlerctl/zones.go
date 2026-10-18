@@ -297,7 +297,8 @@ func zonesList(args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() > 0 {
 		return usagef("zones list: лишние аргументы %v (команда без аргументов)", fs.Args())
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("zones list: %w", err)
@@ -323,7 +324,8 @@ func zonesToggle(action string, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return usagef("zones %s: некорректное имя зоны %q: %v", action, fs.Arg(0), err)
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("zones %s %s: %w", action, zone, err)

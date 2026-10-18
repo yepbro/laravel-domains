@@ -14,11 +14,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -83,7 +80,7 @@ func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
 
 	// Одноразовый CLI: Ctrl-C/SIGTERM прерывают дренаж (опубликованное
 	// остаётся, at-least-once).
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalCtx()
 	defer stop()
 
 	poolOpts := db.NewOptions(cfg.Postgres)
@@ -609,7 +606,8 @@ func subdomainsList(args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() > 0 {
 		return usagef("subdomains list: лишние аргументы %v (команда без аргументов)", fs.Args())
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains list: %w", err)
@@ -633,7 +631,8 @@ func subdomainsAdd(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return usagef("subdomains add: %v", err)
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains add %s: %w", label, err)
@@ -653,7 +652,8 @@ func subdomainsDisable(args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() != 1 {
 		return usagef("укажите субдомен: crawlerctl subdomains disable www|бит")
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 	pool, err := openManagePool(ctx)
 	if err != nil {
 		return fmt.Errorf("subdomains disable %s: %w", fs.Arg(0), err)
@@ -693,7 +693,7 @@ func subdomainsRecheckCmd(args []string, stdout, stderr io.Writer) error {
 
 	// Одноразовый CLI: Ctrl-C/SIGTERM прерывают дренаж — переведённое
 	// остаётся (перевод идемпотентен), повтор команды продолжает.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalCtx()
 	defer stop()
 
 	pool, err := openManagePool(ctx)

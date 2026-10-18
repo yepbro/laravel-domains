@@ -15,12 +15,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 )
 
 // Коды возврата crawlerctl (полный контракт — в комментарии пакета).
@@ -139,6 +142,14 @@ func usagef(format string, a ...any) error {
 // (явное игнорирование — вместо подавления errcheck по всему пакету).
 func out(w io.Writer, format string, a ...any) {
 	_, _ = fmt.Fprintf(w, format, a...)
+}
+
+// signalCtx — отменяемый контекст одноразового CLI: Ctrl-C/SIGTERM
+// прерывают команду — активные запросы к БД завершаются отменой
+// контекста, а не разрывом соединения сигналом по умолчанию. Единый
+// хелпер всех команд (первым появился у reanalyze/recheck).
+func signalCtx() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
 
 // ---------------------------------------------------------------- флаги

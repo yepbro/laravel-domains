@@ -694,7 +694,8 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("domain: %w", err)
 	}
-	ctx := context.Background()
+	ctx, stop := signalCtx()
+	defer stop()
 
 	// CLI pool_size = 2 — бюджет соединений ТЗ 6.3 у сервисов (стиль
 	// manage.go, T-074).
