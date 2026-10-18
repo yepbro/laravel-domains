@@ -431,6 +431,7 @@ func TestSchema_TableColumns(t *testing.T) {
 			"id": "smallint", "name": "text", "name_unicode": "text",
 			"is_active": "boolean", "domains_total": "bigint",
 			"domains_checked": "bigint", "updated_at": "timestamp with time zone",
+			"domains_laravel": "bigint", // кэш Laravel-доменов зоны (T-120, лендинг)
 		}},
 		"subdomains": {relkind: "r", columns: map[string]string{
 			"id": "smallint", "label": "text", "enabled": "boolean",
@@ -441,6 +442,11 @@ func TestSchema_TableColumns(t *testing.T) {
 			"dns_mask": "bigint", "queued_at": "timestamp with time zone",
 			"last_checked_at": "date",
 			"temp_attempts":   "smallint", // T-031: счётчик повторов temp_error (миграция 000005)
+		}},
+		"web_checks": {relkind: "r", columns: map[string]string{ // T-120: лог формы лендинга
+			"id": "bigint", "domain": "text", "punycode_domain": "text",
+			"ip_address": "inet", "found": "boolean", "score": "real",
+			"duration_ms": "integer", "created_at": "timestamp with time zone",
 		}},
 	}
 	// Уникальные ключи справочников: зоны дедуплицируются по punycode-имени
@@ -688,12 +694,20 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 			"contents_pkey":         "(hash)",
 			"contents_pack_off_idx": "(pack_id, off)",
 		},
-		"laravel_domains":  {"laravel_domains_pkey": "(zone_id, domain_id)"},
+		"laravel_domains": {
+			"laravel_domains_pkey":           "(zone_id, domain_id)",
+			"laravel_domains_updated_at_idx": "(updated_at)", // «последние находки» лендинга (T-120)
+		},
 		"laravel_findings": {"laravel_findings_pkey": "(zone_id, domain_id, subdomain_id, variant)"},
 		"ingest_files": {
 			"ingest_files_pkey":                      "(id)",
 			"ingest_files_zone_id_action_sha256_key": "(zone_id, action, sha256)",
 			"ingest_files_sha256_idx":                "(sha256)",
+		},
+		"web_checks": { // лог формы лендинга (T-120)
+			"web_checks_pkey":           "(id)",
+			"web_checks_ip_created_idx": "(ip_address, created_at)",
+			"web_checks_created_idx":    "(created_at)",
 		},
 	}
 
@@ -718,7 +732,7 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 			}
 		}
 
-		if table == "ingest_files" || table == "contents" {
+		if table == "ingest_files" || table == "contents" || table == "web_checks" {
 			continue // обычные таблицы, дочерних индексов нет
 		}
 		for _, p := range leafPartitions(t, pool, table) {

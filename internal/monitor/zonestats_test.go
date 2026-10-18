@@ -90,15 +90,22 @@ func (p *zonestatsFakePool) calls() []zonestatsCall {
 const wantZoneStatsSQL = "UPDATE zones AS z " +
 	"SET domains_total = s.total, " +
 	"domains_checked = s.checked, " +
+	"domains_laravel = s.laravel, " +
 	"updated_at = $3 " +
 	"FROM (SELECT z2.id AS zone_id, " +
 	"COALESCE(c.total, 0) AS total, " +
-	"COALESCE(c.checked, 0) AS checked " +
-	"FROM zones AS z2 LEFT JOIN (" +
+	"COALESCE(c.checked, 0) AS checked, " +
+	"COALESCE(l.laravel, 0) AS laravel " +
+	"FROM zones AS z2 " +
+	"LEFT JOIN (" +
 	"SELECT zone_id, count(*) AS total, " +
 	"count(*) FILTER (WHERE check_state = $1) AS checked " +
 	"FROM domains WHERE status <> $2 GROUP BY zone_id" +
-	") AS c ON c.zone_id = z2.id) AS s " +
+	") AS c ON c.zone_id = z2.id " +
+	"LEFT JOIN (" +
+	"SELECT zone_id, count(*) AS laravel " +
+	"FROM laravel_domains GROUP BY zone_id" +
+	") AS l ON l.zone_id = z2.id) AS s " +
 	"WHERE z.id = s.zone_id"
 
 // zonestatsFixedClock — часы с фиксированным «сейчас» (updated_at прохода

@@ -267,6 +267,9 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		"DROP INDEX IF EXISTS domains_recheck_idx",
 		"DROP INDEX IF EXISTS domains_lease_idx",
 		"DROP TABLE IF EXISTS laravel_history",
+		"DROP TABLE IF EXISTS web_checks",
+		"DROP INDEX IF EXISTS laravel_domains_updated_at_idx",
+		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_laravel",
 		"TRUNCATE schema_migrations",
 		"INSERT INTO schema_migrations (version, dirty) VALUES (7, false)",
 	} {

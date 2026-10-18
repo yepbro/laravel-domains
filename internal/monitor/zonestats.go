@@ -21,9 +21,13 @@
 //     застывает на 100 % после первого; last_checked_at IS NOT NULL дал бы
 //     «когда-либо проверенные» — монотонную величину без спада на новом
 //     цикле. Оба счётчика считаются по одному базовому множеству
-//     (status <> deleted), иначе checked мог бы превысить total.
+//     (status <> deleted), иначе checked мог бы превысить total;
+//   - domains_laravel (T-120) — Laravel-домены зоны: строки laravel_domains
+//     уже прошли порог analyzer (§13.1), count(*) без порога; кэш читает
+//     лендинг этапа 13 (карточки, облако/таблица зон) и crawlerctl.
 //
-// Проход — один оператор UPDATE … FROM (агрегат domains GROUP BY zone_id):
+// Проход — один оператор UPDATE … FROM (агрегат domains GROUP BY zone_id +
+// агрегат laravel_domains GROUP BY zone_id, T-120):
 // пересчёт всех зон пакетно, без row-per-zone (ТЗ 5.9) и без счётчика на
 // каждую строку domains. GROUP BY по ключу партиционирования позволяет
 // PostgreSQL агрегировать по партициям (partitionwise aggregate);
@@ -57,23 +61,35 @@ import (
 const DefaultZoneStatsInterval = 60 * time.Second
 
 // zoneStatsSQL — один проход: обе колонки зон пересчитываются агрегатом
-// по domains. FILTER-вариант count — один проход по строкам считает оба
-// счётчика (вместо двух подзапросов/сканов). updated_at — момент
-// пересчёта (для наблюдения за живостью monitor, ТЗ 5.9 «остановка
-// прогресса»): таблица зон — маленький справочник, версии строк раз в
-// период не создают заметного bloat.
+// по domains, Laravel-счётчик — агрегатом по laravel_domains (T-120).
+// FILTER-вариант count — один проход по строкам считает оба счётчика
+// (вместо двух подзапросов/сканов). updated_at — момент пересчёта
+// (для наблюдения за живостью monitor, ТЗ 5.9 «остановка прогресса»):
+// таблица зон — маленький справочник, версии строк раз в период не
+// создают заметного bloat.
+//
+// domains_laravel (T-120): строки laravel_domains уже прошли порог
+// analyzer (§13.1 — таблицу пишут только уверенные срабатывания),
+// отдельный порог не нужен; LEFT JOIN обнуляет зоны без находок.
 const zoneStatsSQL = "UPDATE zones AS z " +
 	"SET domains_total = s.total, " +
 	"domains_checked = s.checked, " +
+	"domains_laravel = s.laravel, " +
 	"updated_at = $3 " +
 	"FROM (SELECT z2.id AS zone_id, " +
 	"COALESCE(c.total, 0) AS total, " +
-	"COALESCE(c.checked, 0) AS checked " +
-	"FROM zones AS z2 LEFT JOIN (" +
+	"COALESCE(c.checked, 0) AS checked, " +
+	"COALESCE(l.laravel, 0) AS laravel " +
+	"FROM zones AS z2 " +
+	"LEFT JOIN (" +
 	"SELECT zone_id, count(*) AS total, " +
 	"count(*) FILTER (WHERE check_state = $1) AS checked " +
 	"FROM domains WHERE status <> $2 GROUP BY zone_id" +
-	") AS c ON c.zone_id = z2.id) AS s " +
+	") AS c ON c.zone_id = z2.id " +
+	"LEFT JOIN (" +
+	"SELECT zone_id, count(*) AS laravel " +
+	"FROM laravel_domains GROUP BY zone_id" +
+	") AS l ON l.zone_id = z2.id) AS s " +
 	"WHERE z.id = s.zone_id"
 
 // ZoneStatsOptions — параметры пересчёта; нулевые значения заменяются

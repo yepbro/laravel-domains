@@ -1469,6 +1469,15 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Laravel-находки зоны A (T-120): одна строка laravel_domains — кэш
+	// domains_laravel того же прохода; строки уже прошли порог analyzer.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO laravel_domains (zone_id, domain_id, score, found_on_mask, rules_version, updated_at)
+		 VALUES ($1, $2, 0.9, 1, 1, now())`, zoneA, done[0],
+	); err != nil {
+		t.Fatal(err)
+	}
+
 	res, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
 		t.Fatalf("ZoneStatsOnce: %v", err)
@@ -1476,25 +1485,28 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 	if res.Zones != 2 {
 		t.Errorf("пересчитано зон: %d, хочу 2", res.Zones)
 	}
-	accZoneCounters := func(zone int16) (total, checked int32, updated bool) {
+	accZoneCounters := func(zone int16) (total, checked, laravel int32, updated bool) {
 		t.Helper()
 		var u *time.Time
 		if err := pool.QueryRow(ctx,
-			"SELECT domains_total, domains_checked, updated_at FROM zones WHERE id = $1", zone,
-		).Scan(&total, &checked, &u); err != nil {
+			"SELECT domains_total, domains_checked, domains_laravel, updated_at FROM zones WHERE id = $1", zone,
+		).Scan(&total, &checked, &laravel, &u); err != nil {
 			t.Fatal(err)
 		}
-		return total, checked, u != nil
+		return total, checked, laravel, u != nil
 	}
-	total, checked, updated := accZoneCounters(zoneA)
+	total, checked, laravel, updated := accZoneCounters(zoneA)
 	if total != 4 || checked != 2 {
 		t.Errorf("зона A: total/checked = %d/%d, хочу 4/2 (deleted вне знаменателя, queued не проверен)", total, checked)
+	}
+	if laravel != 1 {
+		t.Errorf("зона A: domains_laravel = %d, хочу 1 (тем же проходом, T-120)", laravel)
 	}
 	if !updated {
 		t.Error("updated_at не проставлен — алерт «остановка прогресса» (T-080) ослепнет")
 	}
-	if total, checked, _ := accZoneCounters(zoneB); total != 0 || checked != 0 {
-		t.Errorf("пустая зона: total/checked = %d/%d, хочу 0/0", total, checked)
+	if total, checked, laravel, _ := accZoneCounters(zoneB); total != 0 || checked != 0 || laravel != 0 {
+		t.Errorf("пустая зона: total/checked/laravel = %d/%d/%d, хочу 0/0/0", total, checked, laravel)
 	}
 
 	// Отображение: кэш сходится с прямым агрегатом (запрос crawlerctl
@@ -1526,7 +1538,7 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Fatal(err)
 	}
 	accWaitFor(t, "автоматическое обновление checked 2 → 3", 5*time.Second, func() bool {
-		_, checked, _ := accZoneCounters(zoneA)
+		_, checked, _, _ := accZoneCounters(zoneA)
 		return checked == 3
 	})
 	stop()

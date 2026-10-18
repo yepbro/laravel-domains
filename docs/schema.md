@@ -26,6 +26,7 @@
 | `laravel_findings` | срабатывания правил по каждому (домен, субдомен, вариант) | LIST по `zone_id` |
 | `laravel_history` | журнал детекции appeared/lost (T-118) | нет — только переходы, объём на порядки меньше findings |
 | `ingest_files` | журнал обработанных входных файлов с sha256 (идемпотентность) | нет — добавляется по строке на файл |
+| `web_checks` | лог ручных проверок из формы лендинга (T-120; пишет только cmd/web, T-123) | нет — объём ручных проверок мал |
 
 Принцип ТЗ §6 — партиционирование по `zone_id` — касается таблиц с колонкой
 `domain_id` (все строки зоны лежат в одной партиции; `zone_id` дублируется
@@ -102,7 +103,9 @@ partitioning columns». Это уточнение ТЗ §6/§6.1 при реал
 Текущий размер зоны — `zones.domains_total` (обновляет monitor, T-078:
 живые домены, `status <> deleted`) или прямой `count(*)` по партиции
 (все строки, включая удалённые — для оценки физического размера).
-Верхняя граница `hash_parts` — 1024.
+Верхняя граница `hash_parts` — 1024. Соседний кэш `zones.domains_laravel`
+(число Laravel-доменов зоны) обновляет тот же проход монитор-сервиса
+(T-120) — читают лендинг этапа 13 и `crawlerctl`.
 
 ### Поведение и блокировки
 
@@ -196,7 +199,8 @@ parameters for a partitioned table»). Поэтому `WITH (fillfactor = 85)` �
 | `domains` | `domains_pkey` (`zone_id, id`); `domains_zone_id_label_key` (`zone_id, label`); `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0`; `domains_lease_idx` (`queued_at, zone_id, id`) `WHERE check_state = 1`; `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` | поиск по имени (ТЗ 5.11), идемпотентность ingest (ТЗ 5.1), выборка pending планировщиком (ТЗ 5.3), возврат истёкших lease (T-029/T-104), суточная перепроверка (T-030/T-104) — см. раздел «Индексы фоновых проходов» |
 | `subdomain_results` | `subdomain_results_pkey` (`zone_id, domain_id, subdomain_id, variant`) | чтение результатов домена — по префиксу `(zone_id, domain_id)` первичного ключа; идемпотентная перезапись при перепроверке |
 | `contents` | `contents_pkey` (`hash`); `contents_pack_off_idx` (`pack_id, off`) | дедупликация и чтение метаданных по 16-байтному хэшу (ТЗ 5.7); запросы компактификации паков — фильтр по `pack_id` и порядок по `off` (T-096) |
-| `laravel_domains` | `laravel_domains_pkey` (`zone_id, domain_id`) | агрегат по домену; обновление при переанализе |
+| `laravel_domains` | `laravel_domains_pkey` (`zone_id, domain_id`), `laravel_domains_updated_at_idx` (`updated_at`, T-120) | агрегат по домену; обновление при переанализе; updated_at — «последние находки» лендинга без сортировки всей таблицы |
+| `laravel_history` | `laravel_history_pkey` (`id`), `laravel_history_changed_at_idx` (`changed_at`) | append-only журнал переходов (T-118); changed_at — «находки за 24 ч» лендинга (T-120) и суточная динамика |
 | `laravel_findings` | `laravel_findings_pkey` (`zone_id, domain_id, subdomain_id, variant`) | срабатывания по результату; чтение всех срабатываний домена — по префиксу ключа |
 | `ingest_files` | `ingest_files_pkey` (`id`); `ingest_files_zone_id_action_sha256_key` (`zone_id, action, sha256`) UNIQUE; `ingest_files_sha256_idx` (`sha256`) | дедуп точной повторной доставки — зона + действие + содержимое (T-113, миграция 000009); `sha256_idx` обслуживает проверку дубля конвейера по содержимому (запрос на каждый файл) |
 
