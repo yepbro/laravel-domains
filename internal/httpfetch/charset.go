@@ -152,36 +152,84 @@ func looksLikeZlib(hdr []byte) bool {
 		(int(cmf)*256+int(flg))%31 == 0
 }
 
+// decompressTailMargin — сколько распакованных байтов за потолком
+// читается для классификации хвоста: конец потока в пределах маржи —
+// честная обрезка (живой сайт чуть больше лимита), продолжение за
+// маржой — zip-бомба (ErrDecompressTooLarge, ТЗ 5.5/Т-051).
+const decompressTailMargin = 64 << 10
+
 // decompressCap — распакованный поток с потолком (защита от zip-бомб).
 // Close закрывает исходное сжатое тело; отдельного Close у brotli-ридера
 // нет, а у gzip он не трогает источник — достаточно одного src.Close.
 type decompressCap struct {
-	dec  io.Reader     // распакованный поток (gzip.Reader / brotli.Reader)
-	src  io.ReadCloser // сжатое тело ответа
-	left int64         // остаток потолка в байтах
+	dec      io.Reader     // распакованный поток (gzip.Reader / brotli.Reader)
+	src      io.ReadCloser // сжатое тело ответа
+	left     int64         // остаток потолка в байтах
+	tailDone bool          // хвост за потолком уже классифицирован
+	tailErr  error         // итог классификации хвоста (повторные чтения его повторяют)
 }
 
 func (c *decompressCap) Read(p []byte) (int, error) {
-	if c.left <= 0 {
-		// Потолок исчерпан: один пробный байт различает честный EOF
-		// (тело ровно в потолке — не ошибка) и продолжение потока
-		// (zip-бомба — ErrDecompressTooLarge).
-		var probe [1]byte
-		n, err := c.dec.Read(probe[:])
+	if c.left > 0 {
+		if int64(len(p)) > c.left {
+			p = p[:c.left]
+		}
+		n, err := c.dec.Read(p)
+		c.left -= int64(n)
+		return n, err
+	}
+	if len(p) == 0 {
+		return 0, nil // контракт io.Reader; классификация — при следующем чтении
+	}
+	if !c.tailDone {
+		c.tailDone = true
+		n, err := c.classifyTail(p)
 		if n > 0 {
-			return 0, ErrDecompressTooLarge
+			c.tailErr = io.EOF // первый байт хвоста отдан — дальше конец потока
+		} else {
+			c.tailErr = err
+		}
+		return n, c.tailErr
+	}
+	return 0, c.tailErr
+}
+
+// classifyTail — классификация хвоста за потолком (выполняется один раз):
+// EOF сразу — тело ровно в потолке (не ошибка); данные, конец которых
+// укладывается в decompressTailMargin, — обрезка: первый байт хвоста
+// копируется в p как признак «тело длиннее потолка» (BodyLimiter по нему
+// ставит Truncated, H-2), остальной хвост дочитывается и отбрасывается;
+// поток, продолжающийся за маржу, — zip-бомба: ErrDecompressTooLarge,
+// чтение останавливается, не расходуя бомбу дальше (Т-051).
+func (c *decompressCap) classifyTail(p []byte) (int, error) {
+	var buf [4096]byte
+	read := int64(0)
+	for read < decompressTailMargin {
+		n, err := c.dec.Read(buf[:])
+		read += int64(n)
+		if n > 0 {
+			p[0] = buf[0] // признак хвоста потребителю
+			for read < decompressTailMargin {
+				n2, err2 := c.dec.Read(buf[:])
+				read += int64(n2)
+				if err2 == io.EOF {
+					return 1, nil // конец в пределах маржи — обрезка
+				}
+				if err2 != nil {
+					return 1, err2 // хвост начался, но оборвался ошибкой сети
+				}
+			}
+			return 0, ErrDecompressTooLarge // поток продолжается — бомба
 		}
 		if err == io.EOF {
-			return 0, io.EOF
+			return 0, io.EOF // тело ровно в потолке
 		}
-		return 0, err
+		if err != nil {
+			return 0, err
+		}
+		// (0, nil) — допустимый редкий случай; продолжаем до маржи
 	}
-	if int64(len(p)) > c.left {
-		p = p[:c.left]
-	}
-	n, err := c.dec.Read(p)
-	c.left -= int64(n)
-	return n, err
+	return 0, ErrDecompressTooLarge
 }
 
 func (c *decompressCap) Close() error { return c.src.Close() }

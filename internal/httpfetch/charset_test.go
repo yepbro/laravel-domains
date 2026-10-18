@@ -758,10 +758,11 @@ func TestFetchGzipJustOverLimit(t *testing.T) {
 }
 
 // TestFetchGzipBombUnderLimiter: бомба при включённых лимитах T-049 —
-// данные частичны: тело читается до лимита без ошибки, признак
-// Truncated выставляется (дальше лимита+1 распаковка не идёт). Ошибка
-// ErrDecompressTooLarge остаётся защитой пути без лимитёра
-// (TestFetchGzipBomb).
+// ErrDecompressTooLarge (контракт T-051: страница-бомба — ошибка тела,
+// воркер не пишет записи и гасит Available); классификация хвоста не
+// расходует бомбу дальше лимита+decompressTailMargin, тело до лимита
+// доступно. Обрезка без ошибки — только хвост в пределах маржи
+// (TestFetchGzipJustOverLimit), не бомба.
 func TestFetchGzipBombUnderLimiter(t *testing.T) {
 	bomb := bytes.Repeat([]byte("A"), 1<<20)
 	srv, _ := encodingServer(t, gzipBytes(t, bomb), map[string]string{
@@ -775,14 +776,11 @@ func TestFetchGzipBombUnderLimiter(t *testing.T) {
 	res := fetchFrom(t, f, srv.URL)
 	defer func() { _ = res.Body.Close() }()
 	b, readErr := io.ReadAll(res.Body)
-	if readErr != nil {
-		t.Fatalf("бомба под лимитёром — обрезка, не ошибка чтения: %v", readErr)
+	if !errors.Is(readErr, ErrDecompressTooLarge) {
+		t.Fatalf("бомба = %v, want ErrDecompressTooLarge (T-051)", readErr)
 	}
 	if len(b) != limit {
 		t.Errorf("прочитано %d байт, ожидался лимит %d", len(b), limit)
-	}
-	if !res.BodyLimiter.Truncated() {
-		t.Error("признак обрезки не выставлен")
 	}
 }
 
