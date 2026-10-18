@@ -115,17 +115,26 @@ func LoadDir(dir string) (*Set, error) {
 		}
 		// Строгий разбор: опечатка в имени поля — ошибка, а не молчаливо
 		// отключённое правило (как и в конфигурации сервисов). Файл из
-		// одних комментариев пропускается (Decode → io.EOF).
+		// одних комментариев пропускается (первый Decode → io.EOF);
+		// многоокументный файл (---) читается целиком: правила второго
+		// документа не должны теряться молча (документы равноправны
+		// файлам — канонический порядок и хэш от разбиения не зависят).
 		dec := yaml.NewDecoder(bytes.NewReader(data))
 		dec.KnownFields(true)
-		var rf rulesFile
-		if err := dec.Decode(&rf); err != nil && !errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("rules: %s: %w", name, err)
+		for {
+			var rf rulesFile
+			err := dec.Decode(&rf)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("rules: %s: %w", name, err)
+			}
+			for i := range rf.Rules {
+				rf.Rules[i].ID = strings.TrimSpace(rf.Rules[i].ID)
+			}
+			set.Rules = append(set.Rules, rf.Rules...)
 		}
-		for i := range rf.Rules {
-			rf.Rules[i].ID = strings.TrimSpace(rf.Rules[i].ID)
-		}
-		set.Rules = append(set.Rules, rf.Rules...)
 	}
 
 	// Канонический порядок правил — по id: состав набора не зависит от

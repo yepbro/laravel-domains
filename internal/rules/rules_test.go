@@ -333,6 +333,33 @@ func TestLoadDirErrors(t *testing.T) {
 			t.Errorf("файл из комментариев должен пропускаться: %v", err)
 		}
 	})
+	t.Run("многодокументный файл читается целиком", func(t *testing.T) {
+		// Второй документ (---) не должен теряться молча: правила
+		// обоих документов входят в набор, версия совпадает с разбиением
+		// по файлам.
+		multi := writeRules(t, partA+"---\n"+partB)
+		set, err := LoadDir(multi)
+		if err != nil {
+			t.Fatalf("многодокументный файл: %v", err)
+		}
+		if len(set.Rules) != 2 || set.Rules[0].ID != "a_cookie" || set.Rules[1].ID != "b_html" {
+			t.Fatalf("правила второго документа потеряны: %+v", set.Rules)
+		}
+		split := writeRulesFiles(t, map[string]string{"b.yaml": partB, "a.yaml": partA})
+		other, err := LoadDir(split)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if set.Version != other.Version {
+			t.Errorf("версия зависит от разбиения на документы: %d != %d", set.Version, other.Version)
+		}
+	})
+	t.Run("опечатка во втором документе — ошибка", func(t *testing.T) {
+		body := partA + "---\nrules:\n  - id: typo2\n    target: html\n    regex: x\n    wight: 0.5\n"
+		if _, err := LoadDir(writeRules(t, body)); err == nil {
+			t.Error("строгий разбор обязан охватывать все документы файла")
+		}
+	})
 }
 
 // writeRulesFiles — каталог с несколькими yaml-файлами (порядок записей
