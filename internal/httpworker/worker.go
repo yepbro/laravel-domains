@@ -733,11 +733,14 @@ func workerHashBytes(h *content.Hash) []byte {
 	return b
 }
 
-// workerBodyHardLimit — страховочный потолок чтения тела в самом воркере:
-// с лимитами T-049 (Options.Limits — боевой сборщик включает их всегда)
-// тело уже обёрнуто BodyLimiter с потолком max_body_bytes; без лимитов
-// (изолированные сборки) неограниченное чтение раздувало бы память на
-// злонамеренном ответе (§9 — недоверенный контент).
+// workerBodyHardLimit — страховочный потолок чтения тела в самом воркере
+// на случай транспорта без лимитов T-049 (изолированные сборки и юнит-
+// тесты без Options.Limits): неограниченное чтение раздувало бы память
+// на злонамеренном ответе (§9 — недоверенный контент). С включёнными
+// лимитами (боевой сборщик NewOptions включает их всегда) тело уже
+// обёрнуто BodyLimiter с потолком http.max_body_bytes — сколь угодно
+// выше дефолта, — и чтение идёт под ним без собственного потолка
+// воркера: страховка не должна подменять настроенный лимит.
 const workerBodyHardLimit = httpfetch.DefaultLimitBodyBytes
 
 // checkScheme — одна проверка (субдомен × протокол, ТЗ 5.5 п. 1): кэш
@@ -807,19 +810,29 @@ func (w *Worker) checkScheme(
 		}
 	}
 
-	// Тело: читается целиком (потолок — BodyLimiter T-049 либо
-	// страховочный workerBodyHardLimit), закрывается всегда (общий
-	// таймаут запроса живёт до Close, T-047), приводится к UTF-8 (T-051);
-	// дальше нужны только хэш (T-054/T-055/T-056) и SPA-вердикт (T-057).
-	body, readErr := io.ReadAll(io.LimitReader(res.Body, workerBodyHardLimit+1))
+	// Тело: читается целиком, закрывается всегда (общий таймаут
+	// запроса живёт до Close, T-047), приводится к UTF-8 (T-051);
+	// дальше нужны только хэш (T-054/T-055/T-056) и SPA-вердикт
+	// (T-057). Потолок — BodyLimiter T-049, когда лимиты включены:
+	// чтение режется по http.max_body_bytes (признак — Truncated),
+	// анти-тарпит там же; без лимитёра — страховочный
+	// workerBodyHardLimit от недоверенного ответа.
+	var (
+		body      []byte
+		readErr   error
+		truncated bool
+	)
+	if res.BodyLimiter != nil {
+		body, readErr = io.ReadAll(res.Body)
+		truncated = res.BodyLimiter.Truncated()
+	} else {
+		body, readErr = io.ReadAll(io.LimitReader(res.Body, workerBodyHardLimit+1))
+		truncated = int64(len(body)) > workerBodyHardLimit
+		if truncated {
+			body = body[:workerBodyHardLimit]
+		}
+	}
 	closeErr := res.Body.Close()
-	truncated := int64(len(body)) > workerBodyHardLimit
-	if truncated {
-		body = body[:workerBodyHardLimit]
-	}
-	if res.BodyLimiter != nil && res.BodyLimiter.Truncated() {
-		truncated = true
-	}
 	if readErr == nil {
 		readErr = closeErr
 	}

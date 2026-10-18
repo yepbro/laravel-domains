@@ -3,8 +3,11 @@
 // загрузка»), варианты/алиасы сквозью, SPA-флаг, ошибки субдомена не роняют
 // домен, отмена ctx, smoke цикла Run, адаптер DNS-резолвера. Загрузка
 // подменяется сценарием (шов FetchFunc), очередь — фейком queue.Queue;
-// сети и Redis нет. Идентификаторы с префиксом worker* против коллизий
-// с соседними пакетами.
+// сети и Redis нет — за единственным исключением: настоящий
+// *httpfetch.BodyLimiter собирает только реальный транспорт, поэтому
+// TestWorkerBodyLimiterCeiling работает с loopback-сервером httptest.
+// Идентификаторы с префиксом worker* против коллизий с соседними
+// пакетами.
 
 package httpworker
 
@@ -15,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -24,6 +28,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"crawler/internal/content"
 	"crawler/internal/dnsclient"
 	"crawler/internal/httpfetch"
 	"crawler/internal/model"
@@ -439,6 +444,68 @@ func TestWorkerErrorsClassified(t *testing.T) {
 	if res.AnyTimeout() {
 		t.Error("таймаутов в задаче не было")
 	}
+}
+
+// TestWorkerBodyLimiterCeiling — потолок тела задаёт BodyLimiter T-049
+// (http.max_body_bytes), а не страховочная константа воркера: страница
+// 3 МиБ при потолке 4 МиБ читается целиком (страховка 2 МиБ резала бы
+// её с ложным ErrBody); страница 5 МиБ при потолке 4 МиБ режется
+// лимитёром. Только реальный транспорт: настоящий BodyLimiter не
+// построить сценарием шва FetchFunc — loopback-сервер httptest.
+func TestWorkerBodyLimiterCeiling(t *testing.T) {
+	caseRun := func(t *testing.T, serve, ceiling int64) (*SchemeCheck, []byte) {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, strings.Repeat("a", int(serve)))
+		}))
+		defer srv.Close()
+		u, err := url.Parse(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := httpfetch.NewFetcher(httpfetch.Options{
+			Limits: &httpfetch.LimitOptions{MaxBodyBytes: ceiling},
+		})
+		w, err := New(ChainFetch(f), Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+			ZoneID: 1, DomainID: 1, Name: u.Host,
+			Subdomains: []queue.HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"127.0.0.1"}}},
+		})
+		if err != nil {
+			t.Fatalf("ProcessDomain: %v", err)
+		}
+		// Тела проверок ProcessDomain отпускает после разметки алиасов
+		// (Body живёт у записи-оригинала) — ожидаемые байты сравниваются
+		// хэшем; целая страница дополнительно видна в теле записи.
+		wantLen := serve
+		if wantLen > ceiling {
+			wantLen = ceiling
+		}
+		return &res.Subdomains[0].HTTP, []byte(strings.Repeat("a", int(wantLen))) // сервер httptest — http
+	}
+	t.Run("3 МиБ при потолке 4 МиБ — целая", func(t *testing.T) {
+		check, want := caseRun(t, 3<<20, 4<<20)
+		if !check.Available || check.Truncated || check.ErrClass != ErrNone || check.ErrText != "" {
+			t.Fatalf("available=%v truncated=%v класс=%v текст=%q — страница ниже потолка читается целиком",
+				check.Available, check.Truncated, check.ErrClass, check.ErrText)
+		}
+		if check.ContentHash == nil || *check.ContentHash != content.HashOf(want) {
+			t.Error("хэш тела не совпадает с хэшем целой страницы (обрезка страховкой 2 МиБ?)")
+		}
+	})
+	t.Run("5 МиБ при потолке 4 МиБ — обрезка лимитёром", func(t *testing.T) {
+		check, want := caseRun(t, 5<<20, 4<<20)
+		if !check.Available || !check.Truncated || check.ErrClass != ErrBody {
+			t.Fatalf("available=%v truncated=%v класс=%v — обрезка настроенным max_body_bytes",
+				check.Available, check.Truncated, check.ErrClass)
+		}
+		if check.ContentHash == nil || *check.ContentHash != content.HashOf(want) {
+			t.Errorf("хэш тела не совпадает с хэшем обрезанной до потолка страницы (%d байт)", len(want))
+		}
+	})
 }
 
 // TestWorkerAllFailedNoHTTP — все субдомены ошибочны → записей нет («нет
