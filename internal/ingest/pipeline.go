@@ -216,6 +216,10 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		// Доля отказов выше порога (T-016): файл ошибочен целиком,
 		// строки не применяются — партия отбрасывается (ТЗ 5.1).
 		if derr := p.clearBatch(ctx, id); derr != nil {
+			// Очистка не прошла (в т.ч. отмена ctx при graceful
+			// shutdown): retry собственным контекстом — строки партии
+			// не должны оставаться в staging (batch_id не встретится).
+			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
 		// Числитель/знаменатель — как в вердикте streamStage: отказы
@@ -237,6 +241,10 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 			Err: fmt.Errorf("ingest: проверка дубля файла %s: %w", f.Path, err)}
 	case err == nil:
 		if derr := p.clearBatch(ctx, id); derr != nil {
+			// Дубль не применяется, но партия уже загружена: сбой
+			// очистки (в т.ч. отмена ctx) ретрается discard'ом — как в
+			// ветке порога ошибок выше.
+			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
 		// Дубль с другой операцией/зоной — по контракту идемпотентности
