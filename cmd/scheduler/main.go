@@ -75,9 +75,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// RedisQueue.Publish.
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
+		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
 		Log:       logger,
 	})
-	dnsq := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
+	dnsq := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+	}), gate)
 
 	bg := make(chan error, 4)
 	go func() {

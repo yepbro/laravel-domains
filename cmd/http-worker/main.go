@@ -154,9 +154,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	defer func() { _ = rdb.Close() }()
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
+		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
 		Log:       logger,
 	})
-	rawQ := queue.NewRedisQueue(rdb, queue.RedisOptions{})
+	rawQ := queue.NewRedisQueue(rdb, queue.RedisOptions{
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+	})
 	q := queue.NewWatermarkPublisher(rawQ, gate)
 
 	// Возврат зависших доставок q:http (T-025): RecoverLoop в воркере —
