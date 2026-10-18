@@ -162,7 +162,7 @@ func TestRedactDSN(t *testing.T) {
 		name, dsn, want string
 	}{
 		{
-			"с паролем",
+			"пароль в userinfo",
 			"postgres://crawler:secret@172.28.100.2:5432/crawler?sslmode=disable",
 			"postgres://crawler@172.28.100.2:5432/crawler?sslmode=disable",
 		},
@@ -170,6 +170,21 @@ func TestRedactDSN(t *testing.T) {
 			"без пароля",
 			"postgres://crawler@localhost:5432/crawler",
 			"postgres://crawler@localhost:5432/crawler",
+		},
+		{
+			"пароль в query-строке (libpq-форма pgx)",
+			"postgres://crawler@172.28.100.2:5432/crawler?password=dev-only-crawler&sslmode=disable",
+			"postgres://crawler@172.28.100.2:5432/crawler?password=redacted&sslmode=disable",
+		},
+		{
+			"sslpassword в query-строке",
+			"postgres://crawler@localhost:5432/crawler?sslpassword=key&sslmode=verify-full",
+			"postgres://crawler@localhost:5432/crawler?sslmode=verify-full&sslpassword=redacted",
+		},
+		{
+			"пароль и в userinfo, и в query",
+			"postgres://crawler:secret@localhost:5432/crawler?password=dev-only-crawler",
+			"postgres://crawler@localhost:5432/crawler?password=redacted",
 		},
 		{
 			"мусор — не раскрываем",

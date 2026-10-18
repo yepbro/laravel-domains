@@ -130,14 +130,40 @@ func defaultIfZero(v, def time.Duration) time.Duration {
 	return v
 }
 
-// redactDSN скрывает пароль в сообщениях об ошибках.
-func redactDSN(dsn string) string {
+// RedactDSN скрывает секреты строки подключения для сообщений об ошибках:
+// пароль из userinfo и параметры password/sslpassword из query-строки
+// (pgx/pgconn, как libpq, принимает их и в URL-query — parseURLQueryParams
+// переносит значения в настройки подключения). Неразбораемый DSN
+// заменяется сообщением fallback: не раскрываем даже структуру.
+// Единая реализация для internal/db и internal/migrate (раньше это были
+// две разошедшиеся копии — в одной query-пароль не вырезался).
+func RedactDSN(dsn, fallback string) string {
 	u, err := url.Parse(dsn)
 	if err != nil || u.User == nil {
-		return "см. postgres.dsn (конфигурация)"
+		return fallback
 	}
 	// url.UserPassword кодирует символы маски, поэтому пароль просто
 	// отбрасывается: важно, чтобы он не попал в лог, а не как выглядит замена.
 	u.User = url.User(u.User.Username())
+	// Секретные query-параметры маскируются (маска без спецсимволов —
+	// url.Values.Encode экранирует их); остальной запрос (sslmode,
+	// pool_max_conns, ...) сохраняется. RawQuery переписывается только
+	// при реальной замене — иначе Encode() переупорядочил бы параметры.
+	q := u.Query()
+	redacted := false
+	for _, k := range []string{"password", "sslpassword"} {
+		if q.Has(k) {
+			q.Set(k, "redacted")
+			redacted = true
+		}
+	}
+	if redacted {
+		u.RawQuery = q.Encode()
+	}
 	return u.String()
+}
+
+// redactDSN — RedactDSN с fallback-сообщением пакета db.
+func redactDSN(dsn string) string {
+	return RedactDSN(dsn, "см. postgres.dsn (конфигурация)")
 }

@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -31,6 +30,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/source"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 
+	"crawler/internal/db"
 	"crawler/migrations"
 
 	// Регистрация database/sql-драйвера "pgx/v5" (stdlib pgx).
@@ -203,14 +203,9 @@ func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
 	}
 }
 
-// redactDSN скрывает пароль в сообщениях об ошибках.
+// redactDSN скрывает секреты DSN в сообщениях об ошибках (db.RedactDSN —
+// единая реализация с internal/db; fallback упоминает и env-источник DSN
+// раннера — APP_PG_DSN).
 func redactDSN(dsn string) string {
-	u, err := url.Parse(dsn)
-	if err != nil || u.User == nil {
-		return "см. postgres.dsn (конфигурация) / APP_PG_DSN"
-	}
-	// url.UserPassword кодирует символы маски, поэтому пароль просто
-	// отбрасывается: важно, чтобы он не попал в лог, а не как выглядит замена.
-	u.User = url.User(u.User.Username())
-	return u.String()
+	return db.RedactDSN(dsn, "см. postgres.dsn (конфигурация) / APP_PG_DSN")
 }
