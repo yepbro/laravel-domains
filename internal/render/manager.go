@@ -158,19 +158,27 @@ func (m *Manager) acquire() (*Pool, error) {
 // гонки «поколение сменилось сразу после acquire»: закрытое поколение
 // заменяется, а ошибки ErrClosed не копятся до исчерпания попыток задачи.
 func (m *Manager) swapReasonLocked() (string, bool) {
-	switch {
-	case m.b == nil:
+	if m.b == nil {
 		return "первый старт", true
-	case !m.b.Alive():
+	}
+	if !m.b.Alive() {
 		return "браузер недоступен", true
-	case m.p == nil || m.p.closed.Load():
+	}
+	if m.p == nil || m.p.closed.Load() {
 		return "пул закрыт", true
-	case m.b.NeedsRestart():
+	}
+	if m.b.NeedsRestart() {
 		return fmt.Sprintf("порог страниц %d (отрендерено %d)",
 			m.b.opts.RestartEveryPages, m.b.Pages()), true
-	case m.b.OverMemory():
-		return fmt.Sprintf("порог памяти %d MiB (RSS %d MiB)",
-			m.b.opts.MemoryThreshold>>20, m.b.RSS()>>20), true
+	}
+	// Порог памяти: RSS читается одним проходом /proc — значение идёт и в
+	// проверку, и в сообщение (R-06); контроль отключён — /proc не читается
+	// вовсе. Неизвестный RSS (remote-режим) не триггерует.
+	if m.b.opts.MemoryThreshold > 0 {
+		if rss := m.b.RSS(); rss > 0 && rss >= m.b.opts.MemoryThreshold {
+			return fmt.Sprintf("порог памяти %d MiB (RSS %d MiB)",
+				m.b.opts.MemoryThreshold>>20, rss>>20), true
+		}
 	}
 	return "", false
 }
