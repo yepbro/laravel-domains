@@ -652,6 +652,41 @@ func TestPipelineBadZoneDir(t *testing.T) {
 	}
 }
 
+// TestPipelineFailFileOutsideIncoming — Process — публичный API: путь
+// вне incoming (rel с «..» после filepath.Rel, ParsePath его отвергает)
+// не должен выводить архив за пределы failed/ (ING-P3-1): назначение
+// санируется до базового имени файла.
+func TestPipelineFailFileOutsideIncoming(t *testing.T) {
+	pt := newPipeTest(t)
+	// Файл-сиблинг каталога incoming: rel = "../escape/com/list.txt".
+	abs := filepath.Join(filepath.Dir(pt.dir), "escape", "com", "list.txt")
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte("example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := pt.pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v (ошибочный файл — не ошибка сервиса)", err)
+	}
+	if out.Kind != OutcomeFailed {
+		t.Fatalf("итог = %s, want failed", out.Kind)
+	}
+	failed := filepath.Join(pt.dir, DirFailed, "list.txt")
+	if exists(t, abs) || !exists(t, failed) {
+		t.Fatalf("файл должен лежать в %s, исходный удалён", failed)
+	}
+	if !exists(t, failed+".report") {
+		t.Error("лог-отчёт не записан рядом с файлом")
+	}
+	// Архив не вышел за пределы failed/ (и не «провалился» в ../).
+	if exists(t, filepath.Join(pt.dir, "escape", "com", "list.txt")) {
+		t.Error("файл оказался снаружи failed/ — путь назначения не санирован")
+	}
+}
+
 // TestPipelineZoneDBError — сбой БД на этапе зоны: файл остаётся в
 // incoming (at-least-once, ТЗ 3.4), итог left, ошибка — вызывающему.
 func TestPipelineZoneDBError(t *testing.T) {

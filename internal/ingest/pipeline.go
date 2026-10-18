@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -444,13 +445,12 @@ func (p *Pipeline) discard(id BatchID) {
 
 // failFile — файл ошибочен: перемещение в failed/ и лог-отчёт рядом
 // (ТЗ 5.1). rel назначения — разобранный путь (зеркалит зону/операцию);
-// если путь не разобран, файл кладётся в failed/ по имени. Имя отчёта —
+// путь из неразобранного отчёта не доверяется (Process — публичный API,
+// абсолютный путь или «..» в компонентах filepath.Join вывел бы за
+// пределы failed/): файл кладётся по базовому имени. Имя отчёта —
 // <файл>.report.
 func (p *Pipeline) failFile(abs string, rep FileReport, reason error) Outcome {
-	rel := rep.Path
-	if rel == "" {
-		rel = filepath.Base(abs)
-	}
+	rel := archiveRel(rep.Path, abs)
 	dst, err := p.moveFile(DirFailed, rel, abs)
 	if err != nil {
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: err}
@@ -494,6 +494,20 @@ func (p *Pipeline) moveFile(archive, rel, abs string) (string, error) {
 		}
 		return target, nil
 	}
+}
+
+// archiveRel — безопасный относительный путь назначения внутри каталога
+// архива. Разобранный ParsePath путь безопасен по построению (path.Clean,
+// без «..» — T-014); неразобранный rep.Path не доверяется: абсолютный
+// путь или «..» в компонентах после filepath.Join выходили бы за пределы
+// processed/failed (ING-P3-1) — подставляется базовое имя файла.
+func archiveRel(rel, abs string) string {
+	if rel != "" && !path.IsAbs(rel) {
+		if c := path.Clean(rel); c != "." && c != ".." && !strings.HasPrefix(c, "../") {
+			return c
+		}
+	}
+	return filepath.Base(abs)
 }
 
 // derefString — значение NULL-колонки журнала для лога (пустая строка).
