@@ -61,3 +61,11 @@ func TestStartBrowserValidate(t *testing.T) {
 		t.Errorf("ошибка валидации не должна быть классифицирована: %v", err)
 	}
 }
+
+// TestBrowserCloseNil — Close терпим к nil, как Alive/RSS/OverMemory:
+// контракт «вызов на неинициализированный браузер безвреден» (R-05).
+func TestBrowserCloseNil(t *testing.T) {
+	var b *Browser
+	b.Close() // не паникует
+	b.Close() // повторный вызов безвреден
+}
