@@ -381,6 +381,51 @@ func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
 	}
 }
 
+// TestWorkerCacheHitKeepsErrorClass — обрезанная страница в кэше
+// отдаёт кэш-попаданию свой класс ошибки (ErrBody): один и тот же
+// контент не должен классифицироваться по-разному в зависимости от
+// попадания в кэш (запись-источник — error=body, запись кэша — NULL).
+func TestWorkerCacheHitKeepsErrorClass(t *testing.T) {
+	huge := strings.Repeat("a", int(workerBodyHardLimit)+128)
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		// Обе проверки апекса сводятся к обрезанной странице www
+		// (https — скачивание, http — сбой сети).
+		"trunc.test":         {status: 200, body: huge, final: "https://www.trunc.test/"},
+		"http://trunc.test/": {err: errors.New("connection refused")},
+	})
+	// PerDomain=1 — детерминированный порядок: https апекса наполняет
+	// кэш до старта https www (см. TestWorkerProcessDomain).
+	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
+	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+		ZoneID: 9, DomainID: 21, Name: "trunc.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(1, "www")},
+	})
+	if err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+	www := &res.Subdomains[1]
+	if !www.HTTPS.Cached || !www.HTTPS.Truncated {
+		t.Fatalf("https www — не кэш-итог обрезанной страницы: cached=%v truncated=%v",
+			www.HTTPS.Cached, www.HTTPS.Truncated)
+	}
+	if www.HTTPS.ErrClass != ErrBody || www.HTTPS.ErrText == "" {
+		t.Errorf("кэш-попадание потеряло класс ошибки обрезанной страницы: %v текст %q",
+			www.HTTPS.ErrClass, www.HTTPS.ErrText)
+	}
+	// Cached=true — сеть не трогалась вовсе (http-проверка www при
+	// сценарии-ошибке честно несёт ErrNetwork, не подменяясь кэшем).
+	if www.HTTP.ErrClass != ErrNetwork {
+		t.Errorf("http www: класс %v (ожидался ErrNetwork)", www.HTTP.ErrClass)
+	}
+	// Класс доходит и до записи кэш-источника.
+	if len(www.Records) == 0 {
+		t.Fatal("у www нет записей, хотя https-итог доступен")
+	}
+	if www.Records[0].ErrClass != ErrBody {
+		t.Errorf("запись кэш-источника: класс %v (ожидался ErrBody)", www.Records[0].ErrClass)
+	}
+}
+
 // --- ошибки и особые случаи ----------------------------------------------------
 
 // TestWorkerErrorsClassified — ошибки субдоменов (цикл редиректов, отказ

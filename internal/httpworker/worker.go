@@ -176,6 +176,9 @@ func workerCacheKey(u *url.URL) string {
 // вычислены при чтении; тело (UTF-8) удерживается до конца задачи — его
 // заберёт запись-оригинал для сохранения контента (Record.Body, T-056),
 // кэш-попадания делят те же байты (одна копия на скачанную страницу).
+// Класс/текст ошибки (ErrBody обрезанной страницы) переносится
+// кэш-попаданию: один и тот же контент классифицируется одинаково
+// независимо от того, скачала его проверка или взяла из кэша.
 type workerPage struct {
 	final     *url.URL
 	status    int
@@ -187,6 +190,8 @@ type workerPage struct {
 	charset   string
 	truncated bool
 	spa       *httpfetch.SPAVerdict
+	errClass  ErrorClass
+	errText   string
 }
 
 // workerURLCache — общий кэш задачи домена (ТЗ 5.5 п. 6 «внутри воркера
@@ -774,6 +779,12 @@ func (w *Worker) checkScheme(
 		check.Charset = page.charset
 		check.Body = page.body
 		check.SPA = page.spa
+		// Ошибка страницы (обрезка — ErrBody) переносится кэш-итогом:
+		// запись того же контента несёт тот же класс, что и у
+		// первоисточника (иначе subdomain_results.error расходился бы
+		// от попадания в кэш, метрики недосчитали бы ошибку).
+		check.ErrClass = page.errClass
+		check.ErrText = page.errText
 		return check
 	}
 
@@ -872,6 +883,8 @@ func (w *Worker) checkScheme(
 		charset:   check.Charset,
 		truncated: check.Truncated,
 		spa:       check.SPA,
+		errClass:  check.ErrClass,
+		errText:   check.ErrText,
 	})
 	return check
 }
