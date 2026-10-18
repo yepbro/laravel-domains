@@ -238,7 +238,7 @@ const wantCleanupDelete = "DELETE FROM subdomain_results r " +
 	"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id AND d.status = $3) " +
 	"RETURNING r.zone_id, r.domain_id, r.content_hash"
 
-const wantCleanupUpdate = "UPDATE contents SET refcount = refcount - h.n " +
+const wantCleanupUpdate = "UPDATE contents SET refcount = GREATEST(refcount - h.n, 0) " +
 	"FROM unnest($1::bytea[], $2::int4[]) AS h(hash, n) " +
 	"WHERE contents.hash = h.hash"
 
