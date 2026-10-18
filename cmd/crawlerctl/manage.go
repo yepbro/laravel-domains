@@ -405,7 +405,13 @@ func resolveSubdomainArg(ctx context.Context, pool db.DB, arg string) (subdomain
 			return s, found, err
 		}
 	}
+	// Диапазон 0..62 проверяется до поиска (ValidateSubdomainID, как в add):
+	// без проверки усечение int16(id) молча свело бы 65537 к биту 1 —
+	// disable выключил бы чужой субдомен вместо «не найден».
 	if id, perr := strconv.Atoi(strings.TrimSpace(arg)); perr == nil {
+		if err := model.ValidateSubdomainID(id); err != nil {
+			return subdomainRow{}, false, nil
+		}
 		return lookupSubdomainID(ctx, pool, int16(id))
 	}
 	return subdomainRow{}, false, nil
