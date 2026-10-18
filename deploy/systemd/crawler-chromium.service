@@ -34,9 +34,9 @@ ExecStart=/opt/crawler/chromium/headless-shell --remote-debugging-address=127.0.
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
-# ТЗ 3.2: бюджет Chromium ≈ 2 ГБ (2560M не нужен: воркер в отдельной cgroup,
-# это потолок только браузера; сопоставимо с MEM_CHROMIUM/MEM_RENDER
-# dev-окружения).
+# ТЗ 3.2: бюджет Chromium ≈ 2 ГБ (потолок выше бюджета не нужен: воркер
+# в отдельной cgroup, это потолок только браузера; сопоставимо
+# с MEM_CHROMIUM/MEM_RENDER dev-окружения).
 MemoryMax=2048M
 LimitNOFILE=65535
 UMask=0007
