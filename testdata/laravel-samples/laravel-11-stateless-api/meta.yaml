@@ -1,0 +1,16 @@
+is_laravel: true
+# T-116 (сверка с larasites): stateless API — api-субдомен Laravel 11 без
+# сессии на главной. Кука XSRF-TOKEN с шифрованным конвертом (EncryptCookies),
+# laravel_session нет; тело — 404 JSON без Laravel-специфичных ключей (ключ
+# message появится в T-117). Детекция — ровно пара кук: 0.25 + 0.5 → 0.625
+# (до калибровки — 0.5875, сайт выпадал из laravel_domains).
+score: 0.625          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
+calc_ver_min: ""      # вычисленный диапазон: ни одно из сработавших правил не задаёт границ
+calc_ver_max: ""
+conflict: false
+note: "Синтетический образец stateless-API (Laravel 11, api.поддомен): сессии нет, GET / — 404 JSON общего вида"
+source: synthetic
+obtained: 2026-10-19
+rules:
+  - cookie_xsrf_token
+  - cookie_encrypted_payload

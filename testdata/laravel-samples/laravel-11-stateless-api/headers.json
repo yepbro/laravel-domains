@@ -1,0 +1,6 @@
+{
+  "Content-Type": ["application/json"],
+  "Set-Cookie": [
+    "XSRF-TOKEN=eyJpdiI6dlE0YXJzR2VxOFo2b0k9%3D; expires=Mon, 19 Oct 2026 12:00:00 GMT; path=/; secure; samesite=lax"
+  ]
+}

@@ -207,7 +207,8 @@ func TestCorpusSamplesFullHistory(t *testing.T) {
 // тела не сохранить (ошибка до чтения тела, контент сверх лимита), пассивный
 // анализ по кукам обязан работать и на пустом контенте. htmlCap на nil-HTML
 // безопасен, HTML-правила (json_unauthenticated) не срабатывают, порог
-// достигается одними куками: 1 − 0.55·0.65·0.85·0.75 = 0.772 ≥ 0.6.
+// достигается одними куками: 1 − 0.5·0.65·0.85·0.75 = 0.793 ≥ 0.6
+// (вес cookie_encrypted_payload 0.5 — калибровка T-116).
 func TestCorpusJSONAPIEmptyHTML(t *testing.T) {
 	set := corpusSet(t)
 	page := corpusSampleByID(t, "laravel-9-json-api").Page()
@@ -224,7 +225,7 @@ func TestCorpusJSONAPIEmptyHTML(t *testing.T) {
 	if fired := corpusFired(res); !slices.Equal(fired, want) {
 		t.Fatalf("сработали %v, ожидались только куки %v", fired, want)
 	}
-	if wantScore := ScoreFixed([]float64{0.45, 0.35, 0.15, 0.25}); diff(res.Score, wantScore) > 1e-9 {
+	if wantScore := ScoreFixed([]float64{0.5, 0.35, 0.15, 0.25}); diff(res.Score, wantScore) > 1e-9 {
 		t.Errorf("score = %v, want %v (куки без JSON-признака)", res.Score, wantScore)
 	}
 	if !res.IsLaravel(DefaultMinScore) {
@@ -382,8 +383,10 @@ rules:
 	}
 
 	// Реальная пара cookie_xsrf_token (0.25) + cookie_encrypted_payload
-	// (0.45): 1 − 0.75·0.55 = 0.5875 — уверенного срабатывания нет,
-	// нужен третий признак.
+	// (0.5, калибровка T-116): 1 − 0.75·0.5 = 0.625 ≥ порога —
+	// stateless API (api-субдомен без сессии на главной) детектируется
+	// двумя куками; до калибровки (вес 0.45) пара давала 0.5875 и сайт
+	// выпадал из laravel_domains (дефект, найден сверкой с larasites).
 	set = evalSet(t, `
 rules:
   - id: a_xsrf
@@ -393,15 +396,45 @@ rules:
   - id: b_enc
     target: cookie_value
     regex: "^eyJpdiI6"
-    weight: 0.45
+    weight: 0.5
 `)
 	res = set.EvaluateCtx(context.Background(),
 		Page{Cookies: []Cookie{{Name: "XSRF-TOKEN", Value: "eyJpdiI6abc=="}}}, DefaultLimits())
-	if want := 1 - 0.75*0.55; diff(res.Score, want) > 1e-9 {
+	if want := 1 - 0.75*0.5; diff(res.Score, want) > 1e-9 {
 		t.Errorf("score = %v, want %v", res.Score, want)
 	}
+	if !res.IsLaravel(DefaultMinScore) {
+		t.Errorf("score %.4f обязан достигать порога %v (T-116: stateless API)", res.Score, DefaultMinScore)
+	}
+
+	// Ослабление не занесло шумовые пары (проверка T-116 по аналогии
+	// серой зоны): сочетания БЕЗ шифрованной куки остаются ниже порога —
+	// CodeIgniter-тройка ci_session (суффикс 0.15) + csrf-meta (0.2) +
+	// форма _token (0.25): 1 − 0.85·0.8·0.75 = 0.49.
+	set = evalSet(t, `
+rules:
+  - id: ci_sess
+    target: cookie_name
+    regex: '^[a-z0-9_\-]+_session$'
+    weight: 0.15
+  - id: csrf_meta
+    target: meta
+    regex: 'name=["'']csrf-token["'']'
+    weight: 0.2
+  - id: csrf_form
+    target: html
+    regex: '<input[^>]+name="_token"'
+    weight: 0.25
+`)
+	res = set.EvaluateCtx(context.Background(), Page{
+		HTML:    []byte(`<meta name="csrf-token" content="x"><input type="hidden" name="_token" value="y">`),
+		Cookies: []Cookie{{Name: "ci_session", Value: "aGVsbG8"}},
+	}, DefaultLimits())
+	if want := 1 - 0.85*0.8*0.75; diff(res.Score, want) > 1e-9 {
+		t.Errorf("score шумовой тройки = %v, want %v", res.Score, want)
+	}
 	if res.IsLaravel(DefaultMinScore) {
-		t.Errorf("score %.4f ниже порога %v", res.Score, DefaultMinScore)
+		t.Errorf("шумовая тройка без шифрованной куки: %.4f не должна достигать порога", res.Score)
 	}
 
 	// Вес 1 — уверенный признак закрывает score до единицы.
@@ -604,7 +637,7 @@ func TestCorpusHTMLTailLimit(t *testing.T) {
 		if fired := corpusFired(res); !slices.Equal(fired, want) {
 			t.Fatalf("сработали %v, ожидались только куки %v", fired, want)
 		}
-		if wantScore := ScoreFixed([]float64{0.45, 0.35, 0.15, 0.25}); diff(res.Score, wantScore) > 1e-9 {
+		if wantScore := ScoreFixed([]float64{0.5, 0.35, 0.15, 0.25}); diff(res.Score, wantScore) > 1e-9 {
 			t.Errorf("score = %v, want %v", res.Score, wantScore)
 		}
 		if !res.IsLaravel(DefaultMinScore) {

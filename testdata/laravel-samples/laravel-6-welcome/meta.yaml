@@ -1,7 +1,7 @@
 is_laravel: true
 ver_min: "6"          # реальная версия образца; вычисленный диапазон [5.3, 7.x]
 ver_max: "6.x"        # (welcome_classic 5.3–7.x + mix ver_max 9.x) должен его покрывать
-score: 0.952          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
+score: 0.957          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
 calc_ver_min: "5.3"   # вычисленный диапазон: max(ver_min) = 5.3 (welcome_classic)
 calc_ver_max: "7.x"   # min(ver_max): min(9.x у mix, 7.x у welcome_classic) = 7.x
 conflict: false
