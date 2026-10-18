@@ -175,10 +175,17 @@ func FetchChainOpts(ctx context.Context, f *Fetcher, req FetchRequest, opts Chai
 		}
 		chain = append(chain, RedirectStep{URL: cur.URL.String(), Status: res.StatusCode})
 
+		if max == 0 {
+			// Режим «не следовать» (T-006): первый ответ итоговый.
+			// До redirectNext — мета-скан не выполняется вовсе:
+			// без перехода чтение до 256 КБ тела на meta refresh —
+			// лишний I/O.
+			res.Body = &chainBody{rc: res.Body, cancel: cancelBudget}
+			return &ChainResult{Result: res, Chain: chain}, nil
+		}
 		next, follow := redirectNext(res)
-		if !follow || max == 0 {
-			// Конец цепочки: итог — этот ответ. max_redirects = 0 —
-			// режим «не следовать» (T-006): первый ответ итоговый.
+		if !follow {
+			// Конец цепочки: итог — этот ответ.
 			res.Body = &chainBody{rc: res.Body, cancel: cancelBudget}
 			return &ChainResult{Result: res, Chain: chain}, nil
 		}

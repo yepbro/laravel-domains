@@ -429,6 +429,29 @@ func TestFetchChainZeroLimit(t *testing.T) {
 	}
 }
 
+// TestFetchChainZeroLimitNoMetaScan: при max_redirects=0 мета-скан тела
+// не выполняется вовсе (тело не оборачивается redirectBody): без
+// переходов чтение до 256 КБ на meta refresh — лишний I/O.
+func TestFetchChainZeroLimitNoMetaScan(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprint(w, `<html><head><meta http-equiv="refresh" content="0; url=/after"></head><body>STAY</body></html>`)
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(Options{Resolver: redirectResolverFail})
+	got, err := FetchChainOpts(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "zero-noscan.example.net", "/page"), Addrs: loopbackAddr(),
+	}, ChainOptions{MaxRedirects: 0})
+	if err != nil {
+		t.Fatalf("FetchChainOpts: %v", err)
+	}
+	defer func() { _ = got.Result.Body.Close() }()
+	if _, wrapped := got.Result.Body.(*redirectBody); wrapped {
+		t.Error("при max_redirects=0 тело не должно сканироваться на meta refresh")
+	}
+}
+
 // --- meta refresh -------------------------------------------------------------
 
 // TestFetchChainMetaRefresh: разбор content мета-тега — обычный,
