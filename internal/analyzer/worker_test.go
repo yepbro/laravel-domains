@@ -1002,6 +1002,33 @@ func TestAnalyzer_RowMissing(t *testing.T) {
 	}
 }
 
+// TestAnalyzer_NoRulesSet — nil-снапшот SetSource (у Reloader не бывает;
+// защита для альтернативных реализаций, симметрия с ReanalyzeLoop):
+// пропуск без паники и без записи; строка без штампа вернётся
+// переанализом (T-074).
+func TestAnalyzer_NoRulesSet(t *testing.T) {
+	f := newANFixture(t, nil, Options{})
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN"), nil)
+
+	wrote, err := f.w.ProcessResult(context.Background(), anTask)
+	if err != nil {
+		t.Fatalf("ProcessResult: %v", err)
+	}
+	if wrote {
+		t.Fatal("без набора правил запись невозможна")
+	}
+	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
+		t.Fatal("findings записаны без набора правил")
+	}
+	if f.pool.j.indexOf(anEvBegin) != -1 {
+		t.Fatal("без набора правил транзакция не открывается")
+	}
+	row, _ := anResultSnapshot(f.pool, anKey)
+	if row.rulesVersion != nil {
+		t.Fatal("штамп без анализа ставить нельзя — переанализ вернётся к строке")
+	}
+}
+
 // TestAnalyzer_StaleRow — строка перезаписана другим эпизодом между
 // SELECT и UPDATE (перепроверка DELETE+INSERT, рендер сменил контент):
 // охрана content_hash → 0 строк → успех без записи; у нового эпизода

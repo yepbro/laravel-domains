@@ -132,6 +132,8 @@ type ContentGetter interface {
 // SetSource — текущий снапшот набора правил (ТЗ 5.8: перезагрузка по
 // SIGHUP без перезапуска). Удовлетворяется *rules.Reloader (T-068);
 // каждая доставка берёт актуальный набор — подписка на смену не нужна.
+// nil-снапшот (у Reloader не бывает) — доставка пропускается с Warn,
+// строка остаётся без штампа и вернётся переанализом (T-074).
 type SetSource interface {
 	Set() *rules.Set
 }
@@ -282,6 +284,14 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// работает с иммутабельным Set; смена набора посреди страницы
 	// невозможна, следующая доставка возьмёт свежий.
 	set := w.sets.Set()
+	if set == nil {
+		// Симметрично ReanalyzeLoop: nil-снапшот альтернативного SetSource —
+		// пропуск, не паника. Доставка подтверждается: без штампа версии
+		// строка остаётся устаревшей, переанализ (T-074) к ней вернётся.
+		w.opt.log().Warn("набор правил не загружен — анализ пропущен, строка останется для переанализа",
+			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID)
+		return false, nil
+	}
 	res := set.EvaluateCtx(ctx, rules.Page{
 		HTML:    html,
 		Cookies: row.cookies,
