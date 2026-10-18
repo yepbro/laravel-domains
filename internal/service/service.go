@@ -94,7 +94,9 @@ type Options struct {
 }
 
 // errForcedExit — повторный сигнал завершения во время graceful shutdown:
-// Run завершает процесс немедленно, не дожидаясь OnRun и очистки ресурсов.
+// Run возвращает её вызывающему немедленно, не дожидаясь OnRun и очистки
+// ресурсов (HTTP-сервер метрик, пул) — main выходит с кодом 1, как и для
+// любой ошибки Run.
 var errForcedExit = errors.New("повторный сигнал завершения")
 
 // migrateUp — применение миграций при старте (internal/migrate.Up);
@@ -135,8 +137,9 @@ func EnvOr(key, defaultVal string) string {
 // отменяются только фазы ожидания, применяющаяся миграция дорабатывает,
 // затем сервис останавливается штатно (Run возвращает nil).
 //
-// Повторный сигнал завершения во время graceful shutdown — немедленный
-// os.Exit(1) без ожидания OnRun.
+// Повторный сигнал завершения во время graceful shutdown — Run немедленно
+// возвращает ошибку принудительного выхода без ожидания OnRun и очистки
+// ресурсов; main выходит с кодом 1, как и для любой ошибки Run.
 func Run(opts Options) error {
 	if opts.Name == "" {
 		return errors.New("service: имя сервиса обязательно")
@@ -276,8 +279,10 @@ func Run(opts Options) error {
 
 	err = serve(opts, srv, ln, closePool, term, hup)
 	if errors.Is(err, errForcedExit) {
+		// Раньше здесь был прямой os.Exit(1) — обход defer'ов и
+		// непроверяемость в тестах. Ошибка доезжает до main: его реакция
+		// на любую ошибку Run и так os.Exit(1), код выхода не меняется.
 		opts.Logger.Warn("повторный сигнал — принудительное завершение без ожидания остановки")
-		os.Exit(1)
 	}
 	return err
 }

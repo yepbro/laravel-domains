@@ -598,6 +598,51 @@ func TestRunSignalDuringMigrationApply(t *testing.T) {
 	}
 }
 
+// TestRunSecondSignalForcedExit — повторный сигнал в фазе ожидания OnRun
+// возвращает из Run ошибку принудительного выхода (раньше — os.Exit(1)
+// прямо в библиотеке: обход defer'ов, ветка не покрывалась тестами).
+func TestRunSecondSignalForcedExit(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+
+	started := make(chan struct{})
+	stopping := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Name:            "run-test",
+			MetricsAddr:     "127.0.0.1:0",
+			Logger:          newLogger(io.Discard, "run-test", slog.LevelError),
+			ShutdownTimeout: 10 * time.Second, // фазу ожидания прерывает второй сигнал
+			OnRun: func(ctx context.Context) error {
+				close(started)
+				<-ctx.Done()
+				close(stopping)
+				block := make(chan struct{}) // «зависает» в остановке
+				<-block
+				return nil
+			},
+		})
+	}()
+
+	<-started
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	<-stopping
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errForcedExit) {
+			t.Fatalf("Run = %v, хочу errForcedExit", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run не завершился после повторного сигнала (os.Exit в библиотеке?)")
+	}
+}
+
 // TestNewRegistry — выбор реестра метрик: Options.Metrics (создан main-ом
 // под приборы рабочей логики, T-077) используется как есть, nil — каркас
 // строит собственный по имени сервиса.
