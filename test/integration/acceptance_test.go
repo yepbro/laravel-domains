@@ -1840,8 +1840,8 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 			t.Fatalf("findings = %d, хочу 1", len(findings))
 		}
 		first := dinfoMap(t, findings[0], "findings[0]")
-		if ok, _ := first["is_laravel"].(bool); !ok {
-			t.Error("уверенное срабатывание не помечено is_laravel")
+		if v, ok := first["is_laravel"].(bool); !ok || !v {
+			t.Errorf("уверенное срабатывание: is_laravel = %v (present=%v), хочу true", first["is_laravel"], ok)
 		}
 	})
 
