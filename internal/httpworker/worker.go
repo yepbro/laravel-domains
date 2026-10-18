@@ -1071,7 +1071,11 @@ func NewDNSLookup(resolve dnsclient.Resolver, ipv6 bool) *DNSLookup {
 // ipv6 — и AAAA; IP-литералы (Location вида http://192.0.2.1/) проходят
 // без обмена. CNAME разворачивает сам рекурсор (unbound, ТЗ 5.4) — в
 // ответе на A лежат и записи цели (RFC 1034 §4.3.2, T-037). Отрицание
-// (NXDOMAIN) и пустой ответ — ошибка: подключаться не к чему.
+// (NXDOMAIN) и пустой ответ — ошибка: подключаться не к чему. Сбой или
+// отказ одного типа не роняет резолв, если другой дал адреса:
+// транзиентный отказ AAAA не должен ломать подключение по рабочему A
+// (NODATA — не здесь: NOERROR без записей просто ничего не добавляет);
+// собранного нет вовсе — возвращается первая ошибка обмена.
 func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return []netip.Addr{ip}, nil
@@ -1080,14 +1084,23 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 	if d.ipv6 {
 		types = append(types, dns.TypeAAAA)
 	}
-	var out []netip.Addr
+	var (
+		out      []netip.Addr
+		firstErr error // первая ошибка обмена/отказа — итог, если адресов нет
+	)
 	for _, t := range types {
 		res, err := d.resolve.Exchange(ctx, dnsclient.Question{Name: host, Type: t})
-		if err != nil {
-			return nil, fmt.Errorf("httpworker: резолв %q %s: %w", host, dns.TypeToString[t], err)
+		switch {
+		case err != nil:
+			err = fmt.Errorf("httpworker: резолв %q %s: %w", host, dns.TypeToString[t], err)
+		case res.RCode != dnsclient.RCodeNOERROR:
+			err = fmt.Errorf("httpworker: резолв %q %s: %s", host, dns.TypeToString[t], res.RCode.String())
 		}
-		if res.RCode != dnsclient.RCodeNOERROR {
-			return nil, fmt.Errorf("httpworker: резолв %q %s: %s", host, dns.TypeToString[t], res.RCode.String())
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue // другой тип ещё может дать адреса
 		}
 		for _, rr := range res.RecordsOf(t) {
 			switch r := rr.(type) {
@@ -1103,6 +1116,9 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 		}
 	}
 	if len(out) == 0 {
+		if firstErr != nil {
+			return nil, firstErr
+		}
 		return nil, fmt.Errorf("httpworker: резолв %q: пустой ответ", host)
 	}
 	return out, nil

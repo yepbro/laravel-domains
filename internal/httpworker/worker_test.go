@@ -994,13 +994,16 @@ func workerAddr(t *testing.T, s string) netip.Addr {
 
 // workerFakeDNS — сценарный dnsclient.Resolver: отвечает на A/AAAA
 // заданными адресами; withCNAME подмешивает CNAME-запись в ответ A
-// (рекурсор отдаёт псевдоним и цель одним ответом).
+// (рекурсор отдаёт псевдоним и цель одним ответом); aErr/aaaaErr —
+// сбой обмена только по одному типу записи (транзиентный отказ AAAA).
 type workerFakeDNS struct {
 	mu        sync.Mutex
 	asks      []uint16
 	a, aaaa   []netip.Addr
 	rcode     dnsclient.RCode
 	err       error
+	aErr      error
+	aaaaErr   error
 	withCNAME bool
 }
 
@@ -1010,6 +1013,12 @@ func (d *workerFakeDNS) Exchange(_ context.Context, q dnsclient.Question) (*dnsc
 	d.asks = append(d.asks, q.Type)
 	if d.err != nil {
 		return nil, d.err
+	}
+	if q.Type == dns.TypeA && d.aErr != nil {
+		return nil, d.aErr
+	}
+	if q.Type == dns.TypeAAAA && d.aaaaErr != nil {
+		return nil, d.aaaaErr
 	}
 	res := &dnsclient.Result{RCode: d.rcode}
 	if d.withCNAME && q.Type == dns.TypeA {
@@ -1095,6 +1104,41 @@ func TestWorkerDNSLookup(t *testing.T) {
 		}
 		if len(d.asked()) != 0 {
 			t.Errorf("резолвер опрошен для IP-литерала: %v", d.asked())
+		}
+	})
+	t.Run("сбой AAAA не роняет резолв с живым A", func(t *testing.T) {
+		d := &workerFakeDNS{
+			a:       []netip.Addr{workerAddr(t, "192.0.2.10")},
+			aaaaErr: errors.New("servfail"),
+		}
+		got, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "mixed.example")
+		if err != nil {
+			t.Fatalf("LookupNetIP: %v (сбой AAAA при живом A — резолв работает)", err)
+		}
+		if len(got) != 1 || got[0].String() != "192.0.2.10" {
+			t.Errorf("адреса: %v (ожидался только A)", got)
+		}
+		if asked := d.asked(); len(asked) != 2 {
+			t.Errorf("вопросы: %v (оба типа опрошены)", asked)
+		}
+	})
+	t.Run("сбой A при живом AAAA — адреса AAAA", func(t *testing.T) {
+		d := &workerFakeDNS{
+			aErr: errors.New("servfail"),
+			aaaa: []netip.Addr{workerAddr(t, "2001:db8::2")},
+		}
+		got, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "v6.example")
+		if err != nil {
+			t.Fatalf("LookupNetIP: %v", err)
+		}
+		if len(got) != 1 || got[0].String() != "2001:db8::2" {
+			t.Errorf("адреса: %v (ожидался только AAAA)", got)
+		}
+	})
+	t.Run("оба типа упали — ошибка", func(t *testing.T) {
+		d := &workerFakeDNS{err: errors.New("сеть")}
+		if _, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "down2.example"); err == nil {
+			t.Error("резолв без единого ответа прошёл как успех")
 		}
 	})
 	t.Run("NXDOMAIN — ошибка", func(t *testing.T) {
