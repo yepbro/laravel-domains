@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"crawler/internal/config"
@@ -462,6 +464,36 @@ func TestServeOnRunPanic(t *testing.T) {
 func TestRunValidation(t *testing.T) {
 	if err := Run(Options{}); err == nil || !strings.Contains(err.Error(), "имя сервиса") {
 		t.Fatalf("Run без Name = %v, хочу ошибку об обязательном имени", err)
+	}
+}
+
+// TestHealthzHandler — /healthz отражает готовность зависимостей:
+// без пула БД (сервис без OnDBPool/DSN) — 200; с пулом на недоступной
+// БД — 503, healthcheck оркестратора видит падение PostgreSQL.
+func TestHealthzHandler(t *testing.T) {
+	rec := httptest.NewRecorder()
+	healthzHandler(nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
+		t.Errorf("без пула: %d %q, want 200 %q", rec.Code, rec.Body.String(), "ok\n")
+	}
+
+	// Пул на гарантированно закрытый порт: Ping внутри пробы падает
+	// быстрее секундного таймаута хендлера.
+	cfg, err := pgxpool.ParseConfig("postgres://nobody@127.0.0.1:1/crawler?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.ConnectTimeout = 300 * time.Millisecond
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rec = httptest.NewRecorder()
+	healthzHandler(pool).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("с недоступной БД: %d %q, want 503", rec.Code, rec.Body.String())
 	}
 }
 

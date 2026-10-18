@@ -181,11 +181,7 @@ func Run(opts Options) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	mux.HandleFunc("/healthz", healthzHandler(pool))
 	// /metrics — реестр Prometheus (internal/metrics): базовые метрики
 	// каркаса + коллекторы Go/runtime; метрики рабочей логики добавляются
 	// фабрикой реестра (Counter/Gauge/Histogram с автометкой service,
@@ -233,6 +229,27 @@ func Run(opts Options) error {
 		os.Exit(1)
 	}
 	return err
+}
+
+// healthzHandler — readiness-проба каркаса (её использует healthcheck
+// compose/systemd): сервис с пулом БД проверяет PostgreSQL коротким
+// Ping — недоступная БД видна оркестратору как 503/unhealthy, а не
+// «healthy» с бесконечными ошибками в логе воркера. Сервис без пула
+// (Options без OnDBPool/DSN) всегда готов: зависимостей нет.
+func healthzHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if pool != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+			defer cancel()
+			if err := pool.Ping(ctx); err != nil {
+				http.Error(w, "db unavailable", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	}
 }
 
 // serve — жизненный цикл после инициализации: HTTP-сервер метрик на ln и

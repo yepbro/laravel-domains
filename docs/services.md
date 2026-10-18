@@ -76,6 +76,8 @@ if err := service.Run(service.Options{
 `/healthz` и `/metrics` на `Options.MetricsAddr` (адрес `monitor` —
 `monitor.listen` из конфигурации, ТЗ 5.10, важнее `METRICS_ADDR`; адреса
 остальных сервисов — только `METRICS_ADDR`, dev-порты `:9101`…`:9106`).
+`/healthz` — readiness: сервис с пулом БД проверяет PostgreSQL коротким
+Ping (503 при недоступности), сервис без БД всегда отвечает 200.
 Prometheus скрейпит каждый сервис отдельно (dev-конфиг
 `deploy/docker/prometheus/prometheus.yml`, профиль `monitoring`):
 `monitor.listen` — адрес HTTP-эндпоинта самого сервиса monitor, а не
