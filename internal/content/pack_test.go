@@ -6,6 +6,7 @@
 package content
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -52,7 +53,10 @@ type packFakePool struct {
 	execSeq    int   // счётчик Exec для failOnExec
 	failOnExec int   // уронить Exec с этим порядковым номером (1-based)
 	execErr    error // чем уронить (по умолчанию общая ошибка БД)
-	queryErr   error
+
+	querySeq    int // счётчик Query для failOnQuery
+	failOnQuery int // уронить Query с этим порядковым номером (1-based)
+	queryErr    error
 }
 
 func newPackFakePool() *packFakePool {
@@ -96,18 +100,6 @@ func (p *packFakePool) Exec(ctx context.Context, sql string, args ...any) (pgcon
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		}
 		return pgconn.NewCommandTag("UPDATE 0"), nil
-	case sqlMetaPut:
-		if r := p.contents[h]; r != nil {
-			r.refc++ // ON CONFLICT: ссылка конкурента/мёртвой строки
-			r.packID, r.off = args[1].(int32), args[2].(int64)
-			r.clen, r.rawLen = args[3].(int32), args[4].(int32)
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		}
-		p.contents[h] = &packFakeRow{
-			packID: args[1].(int32), off: args[2].(int64),
-			clen: args[3].(int32), rawLen: args[4].(int32), refc: 1,
-		}
-		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case sqlMetaDelRef:
 		if r := p.contents[h]; r != nil && r.refc > 0 {
 			r.refc--
@@ -125,18 +117,42 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.querySeq++
+	if p.failOnQuery == p.querySeq {
+		err := p.queryErr
+		if err == nil {
+			err = errors.New("packFakePool: сбой БД")
+		}
+		return nil, err
+	}
 	if p.queryErr != nil {
 		return nil, p.queryErr
 	}
-	if sql != sqlMetaGet {
-		return nil, fmt.Errorf("packFakePool: неожидаемый SQL: %s", sql)
-	}
 	var h [HashLen]byte
 	copy(h[:], args[0].([]byte))
-	if r := p.contents[h]; r != nil && r.refc > 0 {
-		return &packRows{rows: [][]any{{r.packID, r.off, r.clen, r.rawLen}}}, nil
+	switch sql {
+	case sqlMetaPut:
+		// RETURNING (xmax = 0): вставка — true, конфликт
+		// (ON CONFLICT DO UPDATE) — false, как в PostgreSQL.
+		if r := p.contents[h]; r != nil {
+			r.refc++ // ON CONFLICT: ссылка конкурента/мёртвой строки
+			r.packID, r.off = args[1].(int32), args[2].(int64)
+			r.clen, r.rawLen = args[3].(int32), args[4].(int32)
+			return &packRows{rows: [][]any{{false}}}, nil
+		}
+		p.contents[h] = &packFakeRow{
+			packID: args[1].(int32), off: args[2].(int64),
+			clen: args[3].(int32), rawLen: args[4].(int32), refc: 1,
+		}
+		return &packRows{rows: [][]any{{true}}}, nil
+	case sqlMetaGet:
+		if r := p.contents[h]; r != nil && r.refc > 0 {
+			return &packRows{rows: [][]any{{r.packID, r.off, r.clen, r.rawLen}}}, nil
+		}
+		return &packRows{}, nil // pgx: ноль строк → ErrNoRows у вызывающего
+	default:
+		return nil, fmt.Errorf("packFakePool: неожидаемый SQL: %s", sql)
 	}
-	return &packRows{}, nil // pgx: ноль строк → ErrNoRows у вызывающего
 }
 
 // row — снимок строки contents для проверок (refcount, смещения).
@@ -243,7 +259,8 @@ const (
 		"VALUES ($1, $2, $3, $4, $5, 1) " +
 		"ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + 1, " +
 		"pack_id = EXCLUDED.pack_id, off = EXCLUDED.off, " +
-		"len = EXCLUDED.len, raw_len = EXCLUDED.raw_len"
+		"len = EXCLUDED.len, raw_len = EXCLUDED.raw_len " +
+		"RETURNING (xmax = 0) AS created"
 	wantSQLGet = "SELECT pack_id, off, len, raw_len FROM contents " +
 		"WHERE hash = $1 AND refcount > 0"
 	wantSQLDelRef = "UPDATE contents SET refcount = refcount - 1 " +
@@ -514,7 +531,7 @@ func TestPackCrashWindow(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
 	d := []byte("контент, чьи метаданные не закоммитятся")
-	pool.failOnExec = 2 // первый Exec (addRef) проходит, второй (метаданные) падает
+	pool.failOnQuery = 1 // первый Exec (addRef) проходит, фиксация метаданных (Query 1) падает
 
 	if _, err := st.Put(ctx, d); err == nil {
 		t.Fatal("Put с упавшей БД метаданных должен вернуть ошибку")
@@ -580,8 +597,8 @@ func TestPackDeadRowInvisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Конфликт с мёртвой строкой tag-ом неотличим от живой гонки —
-	// Created = false (зафиксировано в pack.go), но блок пишется свежий
+	// Конфликт с мёртвой строкой — ON CONFLICT DO UPDATE, не вставка:
+	// Created = false (RETURNING (xmax = 0)), хотя блок пишется свежий
 	// и размещение переводится на него.
 	if again.Created {
 		t.Error("Put после исчерпания ссылок: Created = true, want false (конфликт мёртвой строки)")
@@ -799,6 +816,82 @@ func TestPackClosed(t *testing.T) {
 	}
 }
 
+// TestPackStaleCacheSyncsToNewest — гранулярность mtime ФС: пак,
+// созданный другим процессом в пределах той же единицы mtime, не должен
+// остаться незамеченным — кэш реестра обязан перепроверяться, допись
+// идёт в новейший пак (инвариант T-042/T-045).
+func TestPackStaleCacheSyncsToNewest(t *testing.T) {
+	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
+	ctx := context.Background()
+	if _, err := st.Put(ctx, []byte("контент до появления нового пака")); err != nil {
+		t.Fatal(err)
+	}
+	// Второй Put перечитывает каталог (создание пака сменило mtime) —
+	// кэш фиксирует maxID 1.
+	if _, err := st.Put(ctx, []byte("контент для прогрева кэша")); err != nil {
+		t.Fatal(err)
+	}
+	if !st.dirCache.valid || st.dirCache.maxID != 1 {
+		t.Fatalf("кэш реестра после Put: %+v", st.dirCache)
+	}
+
+	// «Другой процесс» создал пак 2 в пределах гранулярности mtime:
+	// каталог восстанавливает прежнее время — кэш выглядит свежим.
+	mt := st.dirCache.modTime
+	compactCraftPack(t, st.opts.Dir, 2, nil)
+	if err := os.Chtimes(st.opts.Dir, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := st.Put(ctx, []byte("контент отстающего писателя"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, _ := pool.row(res.Hash); row.packID != 2 {
+		t.Errorf("допись при протухшем кэше ушла в пак %d, want 2 (новейший)", row.packID)
+	}
+	if !st.dirCache.valid || st.dirCache.maxID != 2 {
+		t.Errorf("кэш реестра не пересобран: %+v", st.dirCache)
+	}
+}
+
+// TestPackCreatePackClosesOnSize — несовместимое содержимое при создании
+// пака: ошибка, и открытый файл не утекает (fd закрыт — повторяющаяся
+// ротация по устаревшему кэшу не выест дескрипторы до EMFILE).
+func TestPackCreatePackClosesOnSize(t *testing.T) {
+	st, _ := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
+	// Пак 2 уже существует с содержимым сверх заголовка — createPackLocked
+	// обязан отказаться и закрыть открытый файл.
+	compactCraftPack(t, st.opts.Dir, 2, [][]byte{bytes.Repeat([]byte("x"), 32)})
+
+	openPacks := func() int {
+		t.Helper()
+		ents, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Skipf("/proc/self/fd недоступен: %v", err)
+		}
+		n := 0
+		for _, e := range ents {
+			if link, err := os.Readlink("/proc/self/fd/" + e.Name()); err == nil &&
+				strings.Contains(link, packFileName(2)) {
+				n++
+			}
+		}
+		return n
+	}
+	if before := openPacks(); before != 0 {
+		t.Fatalf("пак 2 уже открыт до вызова: %d fd", before)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := st.createPackLocked(2); err == nil {
+			t.Fatal("createPackLocked поверх непустого пака: ожидалась ошибка")
+		}
+		if n := openPacks(); n != 0 {
+			t.Fatalf("после ошибки createPackLocked открытых fd пака 2: %d, want 0 (утечка)", n)
+		}
+	}
+}
+
 // TestPackOpenValidation — параметры конструктора.
 func TestPackOpenValidation(t *testing.T) {
 	pool := newPackFakePool()
@@ -826,6 +919,88 @@ func TestPackOpenValidation(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, packLockFile)); err != nil {
 		t.Errorf("файл блокировки не создан: %v", err)
+	}
+}
+
+// TestParsePackHeaderHdrLen — заголовок будущей версии (hdrLen больше
+// полей v1) читается: v1 берёт первые 23 байта и не отвергает расширение
+// (документированная совместимость вперёд); укороченный hdrLen — порча.
+func TestParsePackHeaderHdrLen(t *testing.T) {
+	future := packHeader{id: 7, maxSize: 1 << 20, dictID: 0xABCD}
+	b := future.bytes()
+	// hdrLen = 40: поля v1 читаются, расширение игнорируется.
+	binary.LittleEndian.PutUint16(b[5:7], 40)
+	hdr, err := parsePackHeader(b)
+	if err != nil {
+		t.Fatalf("заголовок будущей версии отвергнут: %v", err)
+	}
+	if hdr.id != 7 || hdr.maxSize != 1<<20 || hdr.dictID != 0xABCD {
+		t.Errorf("поля v1 искажены: %+v", hdr)
+	}
+	// hdrLen меньше обязательных полей — нечитаем.
+	binary.LittleEndian.PutUint16(b[5:7], packHeaderLen-4)
+	if _, err := parsePackHeader(b); err == nil {
+		t.Error("укороченный hdrLen принят")
+	}
+}
+
+// TestPackIDFromNameCanonical — реестр паков принимает только
+// канонические имена pack-NNNNNN.pack (C-16): имя без паддинга — чужой
+// файл, а не второй файл того же pack_id; длинные id (≥ 7 цифр)
+// каноничны — packFileName не усекает разряды.
+func TestPackIDFromNameCanonical(t *testing.T) {
+	for _, ok := range []struct {
+		name string
+		id   int32
+	}{
+		{"pack-000001.pack", 1},
+		{"pack-123456.pack", 123456},
+		{"pack-1000000.pack", 1000000}, // 7 цифр: %06d не усекает
+	} {
+		if id, valid := packIDFromName(ok.name); !valid || id != ok.id {
+			t.Errorf("packIDFromName(%q) = %d, %v; want %d, true", ok.name, id, valid, ok.id)
+		}
+	}
+	for _, bad := range []string{
+		"pack-1.pack",       // без паддинга
+		"pack-0001.pack",    // короткий паддинг
+		"pack-0000001.pack", // длинный паддинг
+		"pack-000001.pack.bak",
+		"dict.zst",
+		".packs.lock",
+	} {
+		if _, valid := packIDFromName(bad); valid {
+			t.Errorf("packIDFromName(%q) принял чужое имя", bad)
+		}
+	}
+}
+
+// TestPackReadBlockBounds — readPackBlock сверяет размещение с файлом до
+// аллокации (C-14): повреждённая строка (len до 2 ГиБ или отрицательный,
+// смещение мимо файла) — ошибка, а не гигантский буфер и не паника.
+func TestPackReadBlockBounds(t *testing.T) {
+	dir := t.TempDir()
+	compactCraftPack(t, dir, 1, [][]byte{bytes.Repeat([]byte("block"), 8)})
+	const size = packHeaderLen + 4 + 40
+
+	for _, tc := range []struct {
+		name string
+		off  int64
+		clen int32
+	}{
+		{"len из повреждённой строки", packHeaderLen + 4, 1 << 30},
+		{"отрицательный len", packHeaderLen + 4, -1},
+		{"смещение мимо файла", size, 4},
+		{"блок длиннее файла", packHeaderLen + 4, 41},
+	} {
+		if _, err := readPackBlock(dir, 1, tc.off, tc.clen); err == nil {
+			t.Errorf("%s: readPackBlock принял (%d, %d)", tc.name, tc.off, tc.clen)
+		}
+	}
+	// Живое размещение читается как раньше.
+	block, err := readPackBlock(dir, 1, packHeaderLen+4, 40)
+	if err != nil || len(block) != 40 {
+		t.Errorf("чтение целого блока: %v, длина %d", err, len(block))
 	}
 }
 

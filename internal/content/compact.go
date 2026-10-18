@@ -17,7 +17,8 @@
 //     фиксируют строку метаданных, не отпуская flock (T-042, уточнено
 //     здесь), поэтому множество строк не-новейшего пака заморожено;
 //   - живые блоки переписываются в новейший пак обычным путём записи
-//     (appendBlock: мьютекс + flock, O_APPEND) — старый пак не трогается;
+//     (пачка appendBatch: мьютекс + flock, O_APPEND, один fsync на
+//     пачку — C-11) — старый пак не трогается;
 //   - транзакция (пачками, короткими — стиль T-020) переводит размещения
 //     живых строк на новые блоки и удаляет мёртвые строки пака. До
 //     коммита старый пак цел — краш оставляет скопированные блоки
@@ -98,12 +99,36 @@ const (
 		"WHERE contents.hash = h.hash AND contents.pack_id = $2 " +
 		"AND contents.refcount = 0"
 
+	// Финальная зачистка мёртвых строк пака перед удалением файла:
+	// строка, умершая между чтением и транзакцией правки, не попала ни
+	// в перенос (охрана refcount > 0), ни в удаление по списку пачки
+	// (читалась живой) — после unlink пака она осталась бы в contents
+	// навсегда, а следующий проход свой пак уже не найдёт. Здесь все
+	// строки пака мёртвые (живые перенесены пачками выше): охрана
+	// refcount = 0 не заденет воскрешённую — её размещение уже переведено
+	// на новейший пак (sqlMetaPut).
+	sqlCompactDeadPack = "DELETE FROM contents " +
+		"WHERE pack_id = $1 AND refcount = 0"
+
 	// Контроль перед удалением файла: живых строк для пака не осталось.
 	// Инвариант T-042/T-045 (строки появляются только под flock вместе с
 	// блоком, а блоки — только в новейший пак) делает ответ неизменным
 	// для не-новейшего пака; запрос — страховка от нарушений инварианта.
 	sqlCompactLive = "SELECT count(*) FROM contents " +
 		"WHERE pack_id = $1 AND refcount > 0"
+
+	// Число всех строк пака (живых и мёртвых) — различение «пустого»
+	// пака без заголовка (строк нет — файл-мусор) от повреждения
+	// (строки, указывающие в файл без заголовка).
+	sqlCompactAll = "SELECT count(*) FROM contents WHERE pack_id = $1"
+
+	// Пометка мёртвой строки с нечитаемым блоком (потеря/порча байтов):
+	// повторный Put её не чинит (дедуп видит живую строку), компактификация
+	// без пометки не смогла бы ни перенести блок, ни удалить пак — «ядовитый»
+	// пак вечно блокировал бы освобождение места. Охраны pack_id (строка
+	// не переехала) и refcount > 0 (уже мёртвая не нужна).
+	sqlCompactCorrupt = "UPDATE contents SET refcount = 0 " +
+		"WHERE hash = $1 AND pack_id = $2 AND refcount > 0"
 )
 
 // errCompactNewest — попытка компактифицировать новейший пак: он открыт
@@ -182,6 +207,10 @@ type CompactResult struct {
 	Tombstones   int64 // удалённые мёртвые строки contents
 	Removed      bool  // файл старого пака удалён
 	FreedBytes   int64 // освобождено места (размер удалённого файла)
+	// Corrupted — живые строки с нечитаемыми блоками: помечены мёртвыми,
+	// компактификация пака продолжена; расхождение целостности — в ошибке
+	// CompactPack (Warn прохода), детали — в её тексте.
+	Corrupted int64
 }
 
 // CompactStats — итог одного прохода CompactOnce.
@@ -206,8 +235,20 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 		return info, fmt.Errorf("content: скан пака %d: %w", packID, err)
 	}
 	if st.Size() < packHeaderLen {
-		return info, fmt.Errorf("content: скан пака %d: файл %d байт короче заголовка",
-			packID, st.Size())
+		// Файл короче заголовка (обрыв записи заголовка при сбое, C-7):
+		// ни одной целой записи в нём быть не может. Строк contents на
+		// такой пак не должно быть — «пустой» пак (доля живых 0) проход
+		// удалит вместо вечной ошибки скана; строки у пака — повреждение.
+		n, err := s.allContents(ctx, packID)
+		if err != nil {
+			return info, fmt.Errorf("content: скан пака %d: %w", packID, err)
+		}
+		if n > 0 {
+			return info, fmt.Errorf("content: скан пака %d: файл %d байт короче заголовка при %d строках contents",
+				packID, st.Size(), n)
+		}
+		info.Size = st.Size()
+		return info, nil
 	}
 	info.Size = st.Size()
 	info.DataBytes = st.Size() - packHeaderLen
@@ -335,6 +376,16 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		return CompactResult{}, fmt.Errorf("content: компактификация пака %d: %w", packID, err)
 	}
 	size := st.Size()
+	// Пак короче заголовка легитимен для удаления (скан C-7 видит его
+	// «пустым»): строк в нём быть не может (скан бы ошибся), flush
+	// пройдёт пустым, файл удалится. Явной ошибки здесь не нужно.
+	// Исходный пак открывается один раз на проход (C-11): блоки читаются
+	// ReadAt по смещениям — без open/close на каждый блок.
+	src, err := os.Open(path)
+	if err != nil {
+		return CompactResult{}, fmt.Errorf("content: компактификация пака %d: %w", packID, err)
+	}
+	defer func() { _ = src.Close() }() // только чтение
 
 	rows, err := s.pool.Query(ctx, sqlCompactRows, packID)
 	if err != nil {
@@ -344,12 +395,15 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 
 	res := CompactResult{PackID: packID}
 	var (
-		live []compactLiveRow
-		dead [][]byte
+		live    []compactLiveRow
+		dead    [][]byte
+		corrupt []error
 	)
 	// flush переписывает накопленную пачку живых блоков в новейший пак и
 	// фиксирует транзакцию. Сбой до Commit оставляет скопированные блоки
 	// мусором, строки не тронуты — повтор прохода переиграет пачку.
+	// Дописывание — одной пачкой под одним захватом мьютекса и flock
+	// и одним fsync (C-11); байты пачки — на диске до транзакции (C-1).
 	flush := func() error {
 		if len(live) == 0 && len(dead) == 0 {
 			return nil
@@ -357,20 +411,44 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		hashes := make([][]byte, 0, len(live))
 		packs := make([]int32, 0, len(live))
 		offs := make([]int64, 0, len(live))
-		for _, r := range live {
-			block, err := readPackBlock(s.opts.Dir, packID, r.off, r.clen)
+		var corruptHashes [][]byte
+		if len(live) > 0 {
+			batch, err := s.beginAppend()
 			if err != nil {
 				return err
 			}
-			newPack, newOff, err := s.appendBlock(block)
-			if err != nil {
+			for _, r := range live {
+				block, err := readPackBlockAt(src, size, packID, r.off, r.clen)
+				if err != nil {
+					// Блок недоступен: чтение и повторный Put этот
+					// контент не восстановят (дедуп видит живую строку).
+					// Строка помечается мёртвой в той же транзакции — пак
+					// остаётся компактифицируемым, место освобождается;
+					// расхождение целостности уходит в итог прохода
+					// (Warn цикла).
+					corrupt = append(corrupt, fmt.Errorf(
+						"content: компактификация пака %d: %x: блок нечитаем, строка помечена мёртвой: %w",
+						packID, r.hash, err))
+					corruptHashes = append(corruptHashes, r.hash[:])
+					res.Corrupted++
+					continue
+				}
+				newPack, newOff, err := batch.append(block)
+				if err != nil {
+					if ferr := batch.finish(); ferr != nil {
+						err = errors.Join(err, ferr)
+					}
+					return err
+				}
+				hashes = append(hashes, r.hash[:])
+				packs = append(packs, newPack)
+				offs = append(offs, newOff)
+				res.CopiedBlocks++
+				res.CopiedBytes += 4 + int64(r.clen)
+			}
+			if err := batch.finish(); err != nil {
 				return err
 			}
-			hashes = append(hashes, r.hash[:])
-			packs = append(packs, newPack)
-			offs = append(offs, newOff)
-			res.CopiedBlocks++
-			res.CopiedBytes += 4 + int64(r.clen)
 		}
 		tx, err := cdb.Begin(ctx)
 		if err != nil {
@@ -378,6 +456,16 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		}
 		// Откат безусловно: после Commit — no-op (стиль T-020).
 		defer func() { _ = tx.Rollback(ctx) }()
+		if len(corruptHashes) > 0 {
+			// До sqlCompactDead: помеченная строка удаляется той же
+			// транзакцией (охрана refcount = 0 после пометки сойдётся).
+			for _, hb := range corruptHashes {
+				if _, err := tx.Exec(ctx, sqlCompactCorrupt, hb, packID); err != nil {
+					return fmt.Errorf("content: компактификация пака %d: пометка нечитаемого блока: %w", packID, err)
+				}
+			}
+			dead = append(dead, corruptHashes...)
+		}
 		if len(hashes) > 0 {
 			if _, err := tx.Exec(ctx, sqlCompactMove, hashes, packs, offs, packID); err != nil {
 				return fmt.Errorf("content: компактификация пака %d: перенос размещений: %w", packID, err)
@@ -433,6 +521,13 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		return res, err
 	}
 
+	// Финальная зачистка мёртвых строк пака (C-13): см. sqlCompactDeadPack.
+	tag, err := s.pool.Exec(ctx, sqlCompactDeadPack, packID)
+	if err != nil {
+		return res, fmt.Errorf("content: компактификация пака %d: зачистка мёртвых строк: %w", packID, err)
+	}
+	res.Tombstones += tag.RowsAffected()
+
 	// Контроль перед удалением: живых строк для пака не осталось.
 	// Не-новейший пак новых строк не получает (T-042/T-045), запрос —
 	// страховка; выполняется до захвата блокировок, чтобы не держать
@@ -474,7 +569,9 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 	}
 	res.Removed = true
 	res.FreedBytes = size
-	return res, nil
+	// Пак скомпактифицирован и удалён; расхождения целостности
+	// (нечитаемые блоки) — в итоговой ошибке, проход их не теряет.
+	return res, errors.Join(corrupt...)
 }
 
 // checkNotNewest — предусловие компактификации: пак закрыт для записи.
@@ -519,6 +616,26 @@ func (s *PackStore) liveContents(ctx context.Context, packID int32) (int64, erro
 		}
 	case rows.Err() != nil:
 		return 0, fmt.Errorf("content: контроль живых строк пака %d: %w", packID, rows.Err())
+	}
+	return n, nil
+}
+
+// allContents — число всех строк (живых и мёртвых), указывающих в пак:
+// скан «пустого» пака без заголовка (C-7).
+func (s *PackStore) allContents(ctx context.Context, packID int32) (int64, error) {
+	rows, err := s.pool.Query(ctx, sqlCompactAll, packID)
+	if err != nil {
+		return 0, fmt.Errorf("content: контроль строк пака %d: %w", packID, err)
+	}
+	defer rows.Close()
+	var n int64
+	switch {
+	case rows.Next():
+		if err := rows.Scan(&n); err != nil {
+			return 0, fmt.Errorf("content: контроль строк пака %d: %w", packID, err)
+		}
+	case rows.Err() != nil:
+		return 0, fmt.Errorf("content: контроль строк пака %d: %w", packID, rows.Err())
 	}
 	return n, nil
 }
@@ -577,14 +694,35 @@ func CompactOnce(ctx context.Context, st *PackStore, opts CompactOptions) (Compa
 		if info.Ratio >= o.Threshold {
 			continue
 		}
-		res, err := st.CompactPack(ctx, id)
-		if err != nil {
-			errs = append(errs, err)
-			continue
+		if info.LiveBytes > 0 {
+			// Пик места «старое + новое» (C-17): копирование живых
+			// блоков занимает место поверх ещё не удалённого пака —
+			// на томе ниже порога паузы записи проход упирался бы
+			// в ENOSPC на полпути. Отложенный пак возьмёт следующий
+			// проход, когда место вернётся; пак без живых блоков
+			// ничего не копирует и обрабатывается на любом диске —
+			// удаление мусора и есть путь освобождения места.
+			if _, full, derr := st.diskFull(); derr != nil {
+				errs = append(errs, derr)
+				continue
+			} else if full {
+				errs = append(errs, fmt.Errorf(
+					"content: компактификация пака %d отложена: свободное место ниже порога, живые байты (%d) копировались бы поверх старого пака",
+					id, info.LiveBytes))
+				continue
+			}
 		}
+		res, err := st.CompactPack(ctx, id)
+		// Пак может быть скомпактифицирован и удалён даже при ошибке
+		// (расхождения целостности нечитаемых блоков собираются в неё) —
+		// освобождённое место и правка учитываются в любом случае.
 		if res.Removed {
 			stats.Compacted++
 			stats.FreedBytes += res.FreedBytes
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
 		}
 	}
 	return stats, errors.Join(errs...)

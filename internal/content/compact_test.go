@@ -44,7 +44,7 @@ var _ CompactDB = (*compactFakePool)(nil)
 // остальное (Put/Get/Delete) — во встроенный packFakePool.
 func (p *compactFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	switch sql {
-	case sqlCompactRows, sqlCompactLive:
+	case sqlCompactRows, sqlCompactLive, sqlCompactAll:
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		p.calls = append(p.calls, packCall{sql: sql, args: args})
@@ -55,10 +55,10 @@ func (p *compactFakePool) Query(ctx context.Context, sql string, args ...any) (p
 			return nil, p.queryErr
 		}
 		packID := args[0].(int32)
-		if sql == sqlCompactLive {
+		if sql == sqlCompactLive || sql == sqlCompactAll {
 			var n int64
 			for _, r := range p.contents {
-				if r.packID == packID && r.refc > 0 {
+				if r.packID == packID && (sql == sqlCompactAll || r.refc > 0) {
 					n++
 				}
 			}
@@ -96,6 +96,32 @@ func (p *compactFakePool) Begin(context.Context) (pgx.Tx, error) {
 	return &compactFakeTx{pool: p}, nil
 }
 
+// Exec — финальная зачистка мёртвых строк пака (sqlCompactDeadPack);
+// операторы Put/Get/Delete — во встроенном packFakePool.
+func (p *compactFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if sql != sqlCompactDeadPack {
+		return p.packFakePool.Exec(ctx, sql, args...)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, packCall{sql: sql, args: args})
+	if err := ctx.Err(); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	if p.queryErr != nil {
+		return pgconn.CommandTag{}, p.queryErr
+	}
+	packID := args[0].(int32)
+	var n int64
+	for h, r := range p.contents {
+		if r.packID == packID && r.refc == 0 {
+			delete(p.contents, h)
+			n++
+		}
+	}
+	return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n)), nil
+}
+
 // compactFakeMove — отложенное изменение размещения строки.
 type compactFakeMove struct {
 	h      [HashLen]byte
@@ -108,9 +134,10 @@ type compactFakeMove struct {
 type compactFakeTx struct {
 	pgx.Tx // остальные методы pgx.Tx проход не использует
 
-	pool  *compactFakePool
-	moves []compactFakeMove
-	deads [][HashLen]byte
+	pool     *compactFakePool
+	moves    []compactFakeMove
+	deads    [][HashLen]byte
+	corrupts [][HashLen]byte
 }
 
 func (t *compactFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -142,12 +169,29 @@ func (t *compactFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn
 		for _, hb := range hashes {
 			var h [HashLen]byte
 			copy(h[:], hb)
-			if r := t.pool.contents[h]; r != nil && r.packID == from && r.refc == 0 {
-				t.deads = append(t.deads, h)
-				n++
+			if r := t.pool.contents[h]; r != nil && r.packID == from {
+				// Охрана refcount = 0 оценивается в момент выполнения
+				// оператора (как в PostgreSQL): пометки мёртвыми из той
+				// же транзакции уже применились — sqlCompactCorrupt идёт
+				// в CompactPack раньше sqlCompactDead.
+				if r.refc == 0 || t.corruptPending(h) {
+					t.deads = append(t.deads, h)
+					n++
+				}
 			}
 		}
 		return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n)), nil
+	case sqlCompactCorrupt:
+		hb := args[0].([]byte)
+		from := args[1].(int32)
+		var h [HashLen]byte
+		copy(h[:], hb)
+		var n int64
+		if r := t.pool.contents[h]; r != nil && r.packID == from && r.refc > 0 {
+			t.corrupts = append(t.corrupts, h)
+			n = 1
+		}
+		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", n)), nil
 	default:
 		return pgconn.CommandTag{}, fmt.Errorf("compactFakeTx: неожидаемый SQL: %s", sql)
 	}
@@ -158,6 +202,11 @@ func (t *compactFakeTx) Commit(context.Context) error {
 	defer t.pool.mu.Unlock()
 	if t.pool.commitErr != nil {
 		return t.pool.commitErr
+	}
+	for _, h := range t.corrupts { // пометки мёртвыми — до удаления deads
+		if r := t.pool.contents[h]; r != nil {
+			r.refc = 0
+		}
 	}
 	for _, m := range t.moves {
 		if r := t.pool.contents[m.h]; r != nil {
@@ -174,6 +223,17 @@ func (t *compactFakeTx) Commit(context.Context) error {
 }
 
 func (t *compactFakeTx) Rollback(context.Context) error { return nil }
+
+// corruptPending — строка помечается мёртвой оператором sqlCompactCorrupt
+// этой же транзакции (применяются в Commit раньше deads).
+func (t *compactFakeTx) corruptPending(h [HashLen]byte) bool {
+	for _, c := range t.corrupts {
+		if c == h {
+			return true
+		}
+	}
+	return false
+}
 
 // --- общий конструктор и утилиты --------------------------------------------
 
@@ -265,18 +325,308 @@ const (
 		"AND contents.refcount = 0"
 	wantCompactLive = "SELECT count(*) FROM contents " +
 		"WHERE pack_id = $1 AND refcount > 0"
+	wantCompactAll      = "SELECT count(*) FROM contents WHERE pack_id = $1"
+	wantCompactDeadPack = "DELETE FROM contents " +
+		"WHERE pack_id = $1 AND refcount = 0"
 )
 
 // TestCompactSQLContract — точные тексты SQL против схемы contents
 // (миграция 000001: hash, pack_id, off, len, raw_len, refcount).
 func TestCompactSQLContract(t *testing.T) {
 	if sqlCompactRows != wantCompactRows || sqlCompactMove != wantCompactMove ||
-		sqlCompactDead != wantCompactDead || sqlCompactLive != wantCompactLive {
+		sqlCompactDead != wantCompactDead || sqlCompactLive != wantCompactLive ||
+		sqlCompactAll != wantCompactAll || sqlCompactDeadPack != wantCompactDeadPack {
 		t.Fatal("SQL компактификации изменился — обновите контракт и schema_test")
 	}
 }
 
 // --- скан --------------------------------------------------------------------
+
+// TestPackShortHeaderRecovered — пак с обрывом заголовка (1..22 байт):
+// писатель восстанавливает заголовок с нуля и пишет (краш-окно C-1/C-7
+// не должно заклинивать хранилище).
+func TestPackShortHeaderRecovered(t *testing.T) {
+	dir := t.TempDir()
+	pool := newPackFakePool()
+	// «Обрыв записи заголовка»: частичный файл без заголовка.
+	if err := os.WriteFile(filepath.Join(dir, packFileName(1)), []byte("CDPK\x01"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := OpenPackStore(pool, PackOptions{Dir: dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	ctx := context.Background()
+	d := []byte("контент в пак с обрывом заголовка")
+	if _, err := st.Put(ctx, d); err != nil {
+		t.Fatalf("Put в пак с обрывом заголовка: %v", err)
+	}
+	if got, err := st.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
+		t.Errorf("Get после восстановления заголовка: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, packFileName(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parsePackHeader(raw); err != nil {
+		t.Errorf("заголовок не восстановлен: %v", err)
+	}
+}
+
+// TestCompactShortPackSwept — не-новейший пак короче заголовка без строк
+// contents: скан видит «пустой» пак (доля живых 0), проход удаляет файл
+// вместо вечной ошибки; строки у такого пака — повреждение (ошибка).
+func TestCompactShortPackSwept(t *testing.T) {
+	dir := t.TempDir()
+	pool := &compactFakePool{packFakePool: newPackFakePool()}
+	// Пак 1 — обрыв заголовка (6 байт); пак 2 — новейший.
+	if err := os.WriteFile(filepath.Join(dir, packFileName(1)), []byte("CDPK\x01\x02"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	compactCraftPack(t, dir, 2, nil)
+
+	st, err := OpenPackStore(pool, PackOptions{Dir: dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	ctx := context.Background()
+
+	info, err := st.CompactScan(ctx, 1)
+	if err != nil {
+		t.Fatalf("скан пака без заголовка: %v", err)
+	}
+	if info.Ratio != 0 || info.LiveBytes != 0 {
+		t.Errorf("скан «пустого» пака: %+v, want нулевые живые байты", info)
+	}
+	stats, err := CompactOnce(ctx, st, CompactOptions{})
+	if err != nil {
+		t.Fatalf("CompactOnce: %v", err)
+	}
+	if stats.Compacted != 1 {
+		t.Errorf("итог прохода %+v, want 1 удалённый пак-пустышка", stats)
+	}
+	if got := compactPackSize(t, dir, 1); got != 0 {
+		t.Errorf("пак-пустышка не удалён: %d байт", got)
+	}
+
+	// Строки у пака без заголовка — повреждение: скан отказывает.
+	if err := os.WriteFile(filepath.Join(dir, packFileName(3)), []byte("CDPK\x01"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	compactCraftRow(t, pool, "orphan", 3, 0, 8, 1)
+	if _, err := st.CompactScan(ctx, 3); err == nil {
+		t.Error("скан пака без заголовка со строками: ожидалась ошибка")
+	}
+}
+
+// TestGetCorrupted — порча байтов блока при живой строке: Get отвечает
+// ErrCorrupted (отличимо от ErrNotFound и от ошибки БД).
+func TestGetCorrupted(t *testing.T) {
+	st, pool := newCompactTestStore(t, nil)
+	ctx := context.Background()
+	d := []byte("контент, чьи байты сейчас испортим")
+	res, err := st.Put(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := pool.row(res.Hash)
+	path := filepath.Join(st.opts.Dir, packFileName(row.packID))
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("\xFF\xFF\xFF\xFF"), row.off); err != nil { // затираем кадр zstd
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrCorrupted) {
+		t.Errorf("Get испорченного блока: %v, want ErrCorrupted", err)
+	}
+	if _, err := st.Get(ctx, HashOf([]byte("никогда не писали"))); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get отсутствующего: %v, want ErrNotFound", err)
+	}
+}
+
+// TestCompactCorruptBlock — нечитаемый при копировании блок (обрыв хвоста
+// файла) живой строки: строка помечается мёртвой, пак удаляется, живые
+// соседи переезжают, расхождение целостности — в ошибке прохода.
+func TestCompactCorruptBlock(t *testing.T) {
+	st, pool := newCompactTestStore(t, nil)
+	ctx := context.Background()
+	var hashes []Hash
+	for i := 0; i < 3; i++ {
+		d := []byte(strings.Repeat(fmt.Sprintf("<p>сосед %d для порчи</p>", i), 10))
+		res, err := st.Put(ctx, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hashes = append(hashes, res.Hash)
+	}
+	compactCraftPack(t, st.opts.Dir, 2, nil) // новейший
+
+	// Обрываем хвост пака: блок последней строки выходит за конец файла
+	// (краш записи/потеря хвоста), чтение его — ошибка I/O, не декодера.
+	row, _ := pool.row(hashes[2])
+	if err := os.Truncate(filepath.Join(st.opts.Dir, packFileName(row.packID)), row.off-2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Get(ctx, hashes[2]); !errors.Is(err, ErrCorrupted) {
+		t.Errorf("Get блока за концом файла: %v, want ErrCorrupted", err)
+	}
+
+	res, err := st.CompactPack(ctx, 1)
+	if err == nil {
+		t.Fatal("компактификация с нечитаемым блоком: ожидалась ошибка целостности")
+	}
+	if !strings.Contains(err.Error(), "блок нечитаем") {
+		t.Errorf("ошибка не называет нечитаемый блок: %v", err)
+	}
+	if !res.Removed || res.Corrupted != 1 || res.CopiedBlocks != 2 || res.Tombstones != 1 {
+		t.Errorf("итог %+v, want удалённый пак, 1 порченая и 2 переписанные строки", res)
+	}
+	// Порченая строка мертва (удалена компактификацией), соседи переехали.
+	if _, ok := pool.row(hashes[2]); ok {
+		t.Error("строка нечитаемого блока не помечена мёртвой")
+	}
+	for _, h := range []Hash{hashes[0], hashes[1]} {
+		if r, _ := pool.row(h); r.packID != 2 {
+			t.Errorf("живой сосед %s не переехал: %+v", h, r)
+		}
+	}
+}
+
+// TestGetRetryAfterCompaction — гонка Get ↔ компактификация: файл пака
+// удалён между чтением метаданных и открытием (строка уже переехала) —
+// Get перечитывает метаданные и отвечает контентом, а не ENOENT.
+func TestGetRetryAfterCompaction(t *testing.T) {
+	st, pool := newCompactTestStore(t, nil)
+	ctx := context.Background()
+	d := []byte("контент, чей пак уходит под компактификацией")
+	res, err := st.Put(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, _ := pool.row(res.Hash)
+
+	// Компактификация переносит запись в пак 2 и удаляет старый файл.
+	raw1, err := os.ReadFile(filepath.Join(st.opts.Dir, packFileName(row.packID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := raw1[row.off-4 : row.off+int64(row.clen)]
+	hdr := packHeader{id: 2, maxSize: 1 << 20}
+	if err := os.WriteFile(filepath.Join(st.opts.Dir, packFileName(2)),
+		append(hdr.bytes(), rec...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(st.opts.Dir, packFileName(row.packID))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Пул гонки: первый sqlMetaGet возвращает старое размещение и лишь
+	// затем «перевозит» строку (как UPDATE под компактификацией).
+	rp := &getRacePool{compactFakePool: pool, hash: res.Hash,
+		newRow: packFakeRow{packID: 2, off: packHeaderLen + 4, clen: row.clen, rawLen: row.rawLen, refc: row.refc}}
+	st2, err := OpenPackStore(rp, PackOptions{Dir: st.opts.Dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close() //nolint:errcheck // тест закрывает при очистке
+
+	got, err := st2.Get(ctx, res.Hash)
+	if err != nil {
+		t.Fatalf("Get в гонке с компактификацией: %v", err)
+	}
+	if string(got) != string(d) {
+		t.Error("Get после переезда вернул чужие байты")
+	}
+	if !rp.moved {
+		t.Error("повторного чтения метаданных не было — гонка не смоделирована")
+	}
+}
+
+// getRacePool — compactFakePool, который на первом sqlMetaGet отдаёт
+// старое размещение строки и одновременно переводит её на новое (окно
+// гонки «SELECT → открытие файла» под компактификацией).
+type getRacePool struct {
+	*compactFakePool
+	hash   Hash
+	newRow packFakeRow
+	moved  bool
+}
+
+func (p *getRacePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	rows, err := p.packFakePool.Query(ctx, sql, args...)
+	if err == nil && sql == sqlMetaGet && !p.moved {
+		p.moved = true
+		p.mu.Lock()
+		nr := p.newRow
+		p.contents[p.hash] = &nr
+		p.mu.Unlock()
+	}
+	return rows, err
+}
+
+// TestCompactOrphanDeadRowsSwept — строка, умершая между чтением строк
+// пака и транзакцией правки (C-13): перенос её пропускает (охрана
+// refcount > 0), пачечное удаление не видит (читалась живой). Финальная
+// зачистка мёртвых строк пака обязана удалить её до unlink файла —
+// иначе мёртвый указатель на несуществующий пак остаётся в contents
+// навсегда.
+func TestCompactOrphanDeadRowsSwept(t *testing.T) {
+	st, pool := newCompactTestStore(t, nil)
+	ctx := context.Background()
+	d := []byte("контент, чья ссылка умрёт во время прохода")
+	res, err := st.Put(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Пак 2 — новейший (закрывает пак 1 для записи и компактификации).
+	compactCraftPack(t, st.opts.Dir, 2, nil)
+
+	// Убить строку в момент выдачи строк пака: SELECT уже прочитал её
+	// живой, транзакция правки увидит refcount = 0 (как Delete между
+	// шагами).
+	dead := &killOnRowsPool{compactFakePool: pool, hash: res.Hash}
+	st2, err := OpenPackStore(dead, PackOptions{Dir: st.opts.Dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close() //nolint:errcheck // тест закрывает при очистке
+
+	if _, err := st2.CompactPack(ctx, 1); err != nil {
+		t.Fatalf("CompactPack: %v", err)
+	}
+	if compactPackSize(t, st.opts.Dir, 1) != 0 {
+		t.Error("файл пака 1 не удалён")
+	}
+	if _, ok := pool.row(res.Hash); ok {
+		t.Error("осиротевшая мёртвая строка осталась в contents (утечка строк C-13)")
+	}
+}
+
+// killOnRowsPool — компакт-пул, убивающий строку в момент выдачи строк
+// пака (имитация Delete между SELECT и транзакцией правки, C-13).
+type killOnRowsPool struct {
+	*compactFakePool
+	hash Hash
+}
+
+func (p *killOnRowsPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	rows, err := p.compactFakePool.Query(ctx, sql, args...)
+	if err == nil && sql == sqlCompactRows {
+		p.mu.Lock()
+		if r := p.contents[p.hash]; r != nil {
+			r.refc = 0
+		}
+		p.mu.Unlock()
+	}
+	return rows, err
+}
 
 // TestCompactScanMixed — скан различает живые, мёртвые и мусорные блоки:
 // живая и мёртвая строки, блок краш-окна Put (без строки) и недописанный
@@ -296,9 +646,10 @@ func TestCompactScanMixed(t *testing.T) {
 	if err := st.Delete(ctx, HashOf(dead)); err != nil {
 		t.Fatal(err)
 	}
-	// Третий Put: addRef (Exec 6) проходит, дописывание проходит,
-	// фиксация метаданных (Exec 7) падает — блок без строки.
-	pool.failOnExec = 7
+	// Третий Put: addRef (Exec) проходит, дописывание проходит,
+	// фиксация метаданных (Query 3 — после put live и put dead) падает —
+	// блок без строки.
+	pool.failOnQuery = 3
 	if _, err := st.Put(ctx, orphan); err == nil {
 		t.Fatal("Put с упавшей фиксацией метаданных должен вернуть ошибку")
 	}
@@ -927,6 +1278,74 @@ func TestCompactOnceErrors(t *testing.T) {
 	}
 	if row, ok := pool.row(hLive); !ok || row.packID != 2 {
 		t.Errorf("живая строка битого пака изменена: %+v", row)
+	}
+}
+
+// TestCompactOnceFullDiskSkipsLivePacks — пик места «старое + новое»
+// (C-17): на томе ниже порога паузы записи проход не начинает копировать
+// живые блоки (упёрся бы в ENOSPC на полпути), пак с живыми данными
+// откладывается с ошибкой прохода; пак без живых блоков обрабатывается
+// и на полном диске — удаление мусора освобождает место без копирования.
+func TestCompactOnceFullDiskSkipsLivePacks(t *testing.T) {
+	newStore := func(t *testing.T) (*PackStore, *compactFakePool, string) {
+		t.Helper()
+		st, pool := newCompactTestStore(t, func(o *PackOptions) { o.DiskFreePercent = 10 })
+		return st, pool, st.opts.Dir
+	}
+	fullDisk := func(st *PackStore) *fakeSpace {
+		fake := &fakeSpace{}
+		fake.set(1<<20, 100<<20) // 1% свободно — ниже порога 10%
+		st.stat = fake
+		return fake
+	}
+
+	// Пак с живыми блоками (доля живых ниже порога компактификации) —
+	// откладывается на полном диске, файл остаётся.
+	st, pool, dir := newStore(t)
+	ctx := context.Background()
+	offs := compactCraftPack(t, dir, 1, [][]byte{
+		bytes.Repeat([]byte("l"), 40),  // живой блок
+		bytes.Repeat([]byte("d"), 400), // мёртвый блок
+	})
+	compactCraftRow(t, pool, "живой контент полного диска", 1, offs[0], 40, 1)
+	compactCraftRow(t, pool, "мёртвый наполнитель", 1, offs[1], 400, 0)
+	compactCraftPack(t, dir, 2, nil) // пак 2 — новейший, пак 1 закрыт
+	fullDisk(st)
+
+	stats, err := CompactOnce(ctx, st, CompactOptions{})
+	if err == nil {
+		t.Fatal("CompactOnce ниже порога места: ожидалась ошибка отложенного пака")
+	}
+	if !strings.Contains(err.Error(), "отложена") {
+		t.Errorf("ошибка прохода не про отложенный пак: %v", err)
+	}
+	if stats.Compacted != 0 {
+		t.Errorf("Compacted = %d, want 0", stats.Compacted)
+	}
+	if got := compactPackSize(t, dir, 1); got == 0 {
+		t.Error("пак с живыми блоками тронут на полном диске")
+	}
+
+	// Пак из одного мусора — обрабатывается и на полном диске.
+	st2, pool2, dir2 := newStore(t)
+	fullDisk(st2)
+	h := HashOf([]byte("мёртвый контент полного диска"))
+	offs2 := compactCraftPack(t, dir2, 1, [][]byte{bytes.Repeat([]byte("d"), 30)})
+	compactCraftRow(t, pool2, "мёртвый контент полного диска", 1, offs2[0], 30, 0)
+	compactCraftPack(t, dir2, 2, nil)
+
+	stats2, err2 := CompactOnce(ctx, st2, CompactOptions{})
+	if err2 != nil {
+		t.Fatalf("CompactOnce пака без живых блоков на полном диске: %v", err2)
+	}
+	if stats2.Compacted != 1 {
+		t.Errorf("Compacted = %d, want 1 (мусор удаляется без копирования)", stats2.Compacted)
+	}
+	if got := compactPackSize(t, dir2, 1); got != 0 {
+		t.Error("пак без живых блоков не удалён на полном диске")
+	}
+	if _, ok := pool2.row(h); ok {
+		t.Error("мёртвая строка не удалена")
 	}
 }
 

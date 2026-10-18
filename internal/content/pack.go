@@ -10,10 +10,14 @@
 // (заголовок каждого пака дублирует его id): таблицы packs в ТЗ 6.1 нет,
 // миграция не вводится. Новейший пак — максимальный id в каталоге.
 //
-// Транзакционность записи (ТЗ 3.4): блок дописывается в пак, затем
-// фиксируется строка метаданных. Крах между шагами оставляет в паке
-// мусорный блок без строки — он невидим (Get идёт только по метаданным)
-// и вычищается компактификацией (T-045).
+// Транзакционность записи (ТЗ 3.4): блок дописывается в пак и
+// синхронизируется на диск (fsync) ДО фиксации строки метаданных. Крах
+// между шагами оставляет в паке мусорный блок без строки — он невидим
+// (Get идёт только по метаданным) и вычищается компактификацией
+// (T-045); обратное окно «строка durable, байтов нет» закрыто: при
+// потере питания записанная строка всегда имеет байты на диске
+// (PostgreSQL в боевом конфиге коммитит асинхронно — synchronous_commit
+// = off, dirty-страницы пака жили бы в кэше минуты).
 package content
 
 import (
@@ -21,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,8 +33,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"crawler/internal/db"
 )
@@ -73,12 +76,17 @@ const (
 	// добавляет ссылку, размещение переводится на только что дописанный
 	// блок (EXCLUDED — его байты гарантированно на месте, блок прежнего
 	// размещенерия мог быть скомпактифицирован), блок проигравшего —
-	// мусор для T-045.
+	// мусор для T-045. RETURNING (xmax = 0) — различение вставки и
+	// обновления: у вставленной строки xmax не установлен (0), у
+	// обновлённой конфликтником равен xid текущей транзакции; CommandTag
+	// на INSERT … ON CONFLICT DO UPDATE всегда «INSERT 0 1» и ветки не
+	// различает.
 	sqlMetaPut = "INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) " +
 		"VALUES ($1, $2, $3, $4, $5, 1) " +
 		"ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + 1, " +
 		"pack_id = EXCLUDED.pack_id, off = EXCLUDED.off, " +
-		"len = EXCLUDED.len, raw_len = EXCLUDED.raw_len"
+		"len = EXCLUDED.len, raw_len = EXCLUDED.raw_len " +
+		"RETURNING (xmax = 0) AS created"
 
 	// Метаданные для чтения: мёртвые строки (refcount = 0) невидимы —
 	// контракт Delete (T-041): после последней ссылки контент недоступен.
@@ -233,7 +241,7 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 	// удаляет старые паки под той же блокировкой. Комментарий о конфликтах
 	// INSERT — в appendAndMeta.
 	block := CompressWithDict(data)
-	tag, err = s.appendAndMeta(ctx, h, block, len(data))
+	created, err := s.appendAndMeta(ctx, h, block, len(data))
 	if err != nil {
 		// ENOSPC при физической записи — последняя линия обороны после
 		// порога (wrapPackWriteErr): тоже сигнал алерта (ТЗ 8).
@@ -242,7 +250,7 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 		}
 		return PutResult{}, err
 	}
-	return PutResult{Hash: h, Created: tag.Insert()}, nil
+	return PutResult{Hash: h, Created: created}, nil
 }
 
 // appendAndMeta дописывает блок в новейший пак и фиксирует строку
@@ -256,44 +264,99 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 // корректности межпроцессного протокола, запись контента не является
 // горячим путём (страницы приходят с сети медленнее коммита).
 //
-// INSERT-ветка sqlMetaPut — новый контент (Created), UPDATE-ветка
-// конфликта — конкурент успел раньше (блок этого вызова — мусор).
-// Конфликт с мёртвой строкой (refcount = 0) tag-ом неотличим: Created
-// остаётся false при фактически дописанном свежем блоке — редкий случай,
-// влияющий только на метрику доли дедупликации (ТЗ 11.4 п. 3);
-// размещение переводится на свежий блок (EXCLUDED), чтение корректно.
-func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, rawLen int) (pgconn.CommandTag, error) {
+// INSERT-ветка sqlMetaPut — новый контент; UPDATE-ветка конфликта —
+// конкурент успел раньше (блок этого вызова — мусор) или воскрешение
+// мёртвой строки (свежий блок дописан, размещение переведено на него).
+// Created берётся из RETURNING (xmax = 0): true — фактическая вставка,
+// false — обновление. Ветка воскрешения даёт false, хотя байты писались:
+// для метрики доли дедупликации (ТЗ 11.4 п. 3) это редкое расхождение,
+// зафиксированное в docs/content.md.
+func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, rawLen int) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return pgconn.CommandTag{}, errPackClosed
+		return false, errPackClosed
 	}
 	if err := flockDir(s.lock); err != nil {
-		return pgconn.CommandTag{}, err
+		return false, err
 	}
 	defer func() { unlockDir(s.lock) }()
 
 	packID, off, err := s.appendBlockLocked(block)
 	if err != nil {
-		return pgconn.CommandTag{}, err
+		return false, err
 	}
-	tag, err := s.pool.Exec(ctx, sqlMetaPut, h[:], packID, off, int32(len(block)), int32(rawLen))
+	// Блок обязан дожить до диска раньше строки метаданных (ТЗ 3.4,
+	// «спул → фиксация»): fsync в том же захвате flock закрывает окно
+	// «строка durable, байтов нет» при потере питания (повторный Put
+	// такой записи не чинит — дедуп видит живую строку). Запись контента
+	// — не горячий путь (docs/content.md): цена — один fsync на блок.
+	if err := s.syncActiveLocked(); err != nil {
+		return false, err
+	}
+	rows, err := s.pool.Query(ctx, sqlMetaPut, h[:], packID, off, int32(len(block)), int32(rawLen))
 	if err != nil {
-		return pgconn.CommandTag{}, fmt.Errorf("content: метаданные %s: %w", h, err)
+		return false, fmt.Errorf("content: метаданные %s: %w", h, err)
 	}
-	return tag, nil
+	defer rows.Close()
+	if !rows.Next() {
+		err := rows.Err()
+		if err == nil {
+			err = errors.New("upsert не вернул строки RETURNING")
+		}
+		return false, fmt.Errorf("content: метаданные %s: %w", h, err)
+	}
+	var created bool
+	if err := rows.Scan(&created); err != nil {
+		return false, fmt.Errorf("content: метаданные %s: %w", h, err)
+	}
+	return created, nil
 }
 
 // Get возвращает контент по метаданным contents: блок (pack_id, off, len)
 // читается из пака и распаковывается. Мёртвые строки (refcount = 0) и
-// отсутствующие — ErrNotFound.
+// отсутствующие — ErrNotFound. Блок нечитаем при живой строке —
+// ErrCorrupted (см. store.go).
 func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	packID, off, clen, rawLen, err := s.meta(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	block, err := readPackBlock(s.opts.Dir, packID, off, clen)
+	if err != nil && errors.Is(err, fs.ErrNotExist) {
+		// Пака нет (ENOENT), хотя строка живая: файл удалён под
+		// компактификацией между чтением строки и открытием пака —
+		// строка уже переехала на новое место. Перечитываем метаданные
+		// (не более одного раза) и читаем по свежему размещению; без
+		// повтора читатель видел бы транзиентную ошибку на ровном месте.
+		if packID, off, clen, rawLen, err = s.meta(ctx, hash); err != nil {
+			return nil, err
+		}
+		block, err = readPackBlock(s.opts.Dir, packID, off, clen)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrCorrupted, hash, err)
+	}
+	raw, err := DecompressWithDict(block)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: распаковка блока пака %d: %w", ErrCorrupted, hash, packID, err)
+	}
+	if int32(len(raw)) != rawLen {
+		return nil, fmt.Errorf("%w: %s: блок пака %d повреждён: распаковано %d байт, в метаданных %d",
+			ErrCorrupted, hash, packID, len(raw), rawLen)
+	}
+	return raw, nil
+}
+
+// meta — строка метаданных живого контента (sqlMetaGet): размещение
+// блока. Отсутствующий/мёртвый контент — ErrNotFound.
+func (s *PackStore) meta(ctx context.Context, hash Hash) (int32, int64, int32, int32, error) {
 	rows, err := s.pool.Query(ctx, sqlMetaGet, hash[:])
 	if err != nil {
-		return nil, fmt.Errorf("content: метаданные %s: %w", hash, err)
+		return 0, 0, 0, 0, fmt.Errorf("content: метаданные %s: %w", hash, err)
 	}
 	defer rows.Close()
 	var packID int32
@@ -302,27 +365,14 @@ func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 	switch {
 	case rows.Next():
 		if err := rows.Scan(&packID, &off, &clen, &rawLen); err != nil {
-			return nil, fmt.Errorf("content: метаданные %s: %w", hash, err)
+			return 0, 0, 0, 0, fmt.Errorf("content: метаданные %s: %w", hash, err)
 		}
 	case rows.Err() != nil:
-		return nil, fmt.Errorf("content: метаданные %s: %w", hash, rows.Err())
+		return 0, 0, 0, 0, fmt.Errorf("content: метаданные %s: %w", hash, rows.Err())
 	default:
-		return nil, ErrNotFound
+		return 0, 0, 0, 0, ErrNotFound
 	}
-
-	block, err := readPackBlock(s.opts.Dir, packID, off, clen)
-	if err != nil {
-		return nil, err
-	}
-	raw, err := DecompressWithDict(block)
-	if err != nil {
-		return nil, fmt.Errorf("content: %s: распаковка блока пака %d: %w", hash, packID, err)
-	}
-	if int32(len(raw)) != rawLen {
-		return nil, fmt.Errorf("content: %s: блок пака %d повреждён: распаковано %d байт, в метаданных %d",
-			hash, packID, len(raw), rawLen)
-	}
-	return raw, nil
+	return packID, off, clen, rawLen, nil
 }
 
 // Delete снимает одну ссылку: refcount − 1, строка остаётся (при нуле —
@@ -341,27 +391,53 @@ func (s *PackStore) Delete(ctx context.Context, hash Hash) error {
 	return nil
 }
 
-// appendBlock дописывает сжатый блок в новейший пак и возвращает
-// (pack_id, смещение блока). Один писатель в процессе — мьютекс,
-// между процессами — flock каталога: размер пака и номер новейшего
-// пересчитываются под блокировкой, поэтому смещения не конфликтуют.
-// Используется компактификацией (T-045); Put проходит через
-// appendAndMeta, удерживающий ту же блокировку до фиксации метаданных.
-func (s *PackStore) appendBlock(block []byte) (int32, int64, error) {
+// appendBatch — пачка дописываний под одним захватом мьютекса и flock
+// (C-11): компактификация дописывает тысячи блоков прохода —
+// переоткрытие файлов и пара flock-сисколлов на каждый блок бессмысленно
+// дорожают фоновую задачу, чья работа — жалеть диск. Один fsync на пачку
+// (finish) сохраняет инвариант C-1: байты — на диске до транзакции
+// переноса строк.
+type appendBatch struct {
+	s *PackStore
+}
+
+// beginAppend захватывает блокировки пачки. Используется компактификацией
+// (T-045); Put проходит через appendAndMeta, удерживающий ту же
+// блокировку до фиксации метаданных.
+func (s *PackStore) beginAppend() (*appendBatch, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
-		return 0, 0, errPackClosed
+		s.mu.Unlock()
+		return nil, errPackClosed
 	}
 	if err := flockDir(s.lock); err != nil {
-		return 0, 0, err
+		s.mu.Unlock()
+		return nil, err
 	}
-	defer func() { unlockDir(s.lock) }()
-	return s.appendBlockLocked(block)
+	return &appendBatch{s: s}, nil
+}
+
+// append дописывает блок в новейший пак (мьютекс и flock пачки уже
+// удерживаются). Ошибка дописывания — не фатальна для пачки: вызывающий
+// обязан завершить её finish.
+func (b *appendBatch) append(block []byte) (int32, int64, error) {
+	return b.s.appendBlockLocked(block)
+}
+
+// finish синхронизирует активный пак на диск (до фиксации строк — C-1)
+// и снимает блокировки пачки.
+func (b *appendBatch) finish() error {
+	err := b.s.syncActiveLocked()
+	unlockDir(b.s.lock)
+	b.s.mu.Unlock()
+	return err
 }
 
 // appendBlockLocked — ядро дописывания, вызывается под мьютексом и
-// flock. Активный пак синхронизируется с новейшим в каталоге: писатели
+// flock. fsync НЕ выполняет: пачка дописываний синхронизируется одним
+// syncActiveLocked (Put — до фиксации строки, компактификация — до
+// транзакции переноса; syncActiveLocked), ротация — closeActiveLocked.
+// Активный пак синхронизируется с новейшим в каталоге: писатели
 // дописывают ТОЛЬКО в новейший пак, все остальные закрыты для записи —
 // предусловие компактификации (T-045), удаляющей старые паки: множество
 // строк не-новейшего пака замораживается в момент появления следующего
@@ -411,6 +487,30 @@ func (s *PackStore) appendBlockLocked(block []byte) (int32, int64, error) {
 	return s.active.id, off, nil
 }
 
+// syncActiveLocked — fsync активного пака: байты дописанных блоков
+// обязаны дожить до диска ДО фиксации строк метаданных (C-1, ТЗ 3.4
+// «спул → фиксация»); вызывается под мьютексом и flock (Put — на каждый
+// блок, компактификация — один на пачку, C-11).
+func (s *PackStore) syncActiveLocked() error {
+	if s.active == nil {
+		return nil
+	}
+	if err := s.active.f.Sync(); err != nil {
+		return wrapPackWriteErr(err, s.active.id)
+	}
+	return nil
+}
+
+// closeActiveLocked закрывает активный пак: недописанные байты — на диск
+// до Close (ротация внутри пачки компактификации могла бы закрыть пак
+// с несинхронизированными блоками), иначе батч терял бы гарантию C-1.
+func (s *PackStore) closeActiveLocked() error {
+	if err := s.syncActiveLocked(); err != nil {
+		return err
+	}
+	return s.active.f.Close()
+}
+
 // packDirCache — кэш реестра паков: mtime каталога меняется при создании
 // и удалении pak-файлов, но не при дописывании в них, поэтому свежесть
 // кэша проверяется одним os.Stat вместо ReadDir на каждую запись.
@@ -421,9 +521,13 @@ type packDirCache struct {
 }
 
 // newestPackIDLocked — максимальный id пака в каталоге (0 — паков нет)
-// с кэшем по mtime каталога; вызывается под мьютексом. Каталог контента
-// локальный (ТЗ 5.7: NVMe), mtime наносекундный — событие создания или
-// удаления пака не проскочит незамеченным между двумя os.Stat.
+// с кэшем по mtime каталога; вызывается под мьютексом. Равенство mtime —
+// не доказательство отсутствия нового пака: ядро обновляет mtime по
+// грубому таймеру (1–4 мс, на части ФС грубее), создание пака другим
+// процессом может уложиться в ту же гранулярность. Поэтому при свежем
+// кэше проверяется существование следующего id (один stat дешевле
+// ReadDir): допись обязана идти только в новейший пак — предусловие
+// компактификации (T-045).
 func (s *PackStore) newestPackIDLocked() (int32, error) {
 	// stat до ReadDir: события между ними лишь лишний раз инвалидируют кэш.
 	st, err := os.Stat(s.opts.Dir)
@@ -434,7 +538,15 @@ func (s *PackStore) newestPackIDLocked() (int32, error) {
 		s.dirCache.valid = false // реестр паков менялся — пересобрать
 	}
 	if s.dirCache.valid {
-		return s.dirCache.maxID, nil
+		_, err := os.Stat(filepath.Join(s.opts.Dir, packFileName(s.dirCache.maxID+1)))
+		switch {
+		case err == nil:
+			s.dirCache.valid = false // найден пак новее кэша — пересобрать
+		case errors.Is(err, fs.ErrNotExist):
+			return s.dirCache.maxID, nil
+		default:
+			return 0, fmt.Errorf("content: каталог паков %s: %w", s.opts.Dir, err)
+		}
 	}
 	maxID, err := s.scanPackIDs()
 	if err != nil {
@@ -460,7 +572,10 @@ func (s *PackStore) rotateLocked(recLen int64) error {
 		if err != nil {
 			return err
 		}
-		_ = s.active.f.Close()
+		if err := s.closeActiveLocked(); err != nil {
+			_ = pf.f.Close()
+			return err
+		}
 		s.active = pf
 	}
 	if s.active.size <= packHeaderLen || s.active.size+recLen <= s.opts.PackSize {
@@ -471,20 +586,25 @@ func (s *PackStore) rotateLocked(recLen int64) error {
 		return err
 	}
 	s.dirCache.valid = false // создан новый пак — реестр изменился
-	_ = s.active.f.Close()
+	if err := s.closeActiveLocked(); err != nil {
+		_ = pf.f.Close()
+		return err
+	}
 	s.active = pf
 	return nil
 }
 
 // createPackLocked создаёт пак с заголовком. Файл может существовать
 // пустым (крах после create до записи заголовка) — заголовок дописывается;
-// несовместимое содержимое — ошибка.
+// несовместимое содержимое — ошибка (открытый файл закрывается: утечка
+// fd на каждом повторе ротации скормила бы процессу EMFILE).
 func (s *PackStore) createPackLocked(id int32) (*packFile, error) {
 	pf, err := s.openPackForWrite(id)
 	if err != nil {
 		return nil, err
 	}
 	if pf.size != packHeaderLen {
+		_ = pf.f.Close()
 		return nil, fmt.Errorf("content: пак %d: файл уже содержит %d байт, ожидался только заголовок",
 			id, pf.size)
 	}
@@ -508,11 +628,32 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 		return nil, fmt.Errorf("content: пак %d: %w", id, err)
 	}
 	hdr := packHeader{id: id, maxSize: s.opts.PackSize, dictID: activeDictID()}
-	if st.Size() == 0 {
-		// Пустой файл (только что создан либо крах до заголовка): конец
-		// файла — смещение 0, обычный Write и есть запись заголовка
-		// (WriteAt на O_APPEND-дескрипторе запрещён Go).
+	if st.Size() < packHeaderLen {
+		// Пустой файл (только что создан либо крах до заголовка) или
+		// обрыв записи заголовка при сбое питания/ENOSPC (C-7): записей
+		// в файле быть не может — хвост обрезается, заголовок пишется с
+		// нуля. Иначе «короткий» новейший пак заклинивает запись всего
+		// хранилища, а не-новейший — вечную ошибку скана. Конец файла —
+		// смещение 0, обычный Write и есть запись заголовка (WriteAt на
+		// O_APPEND-дескрипторе запрещён Go).
+		if st.Size() > 0 {
+			if err := f.Truncate(0); err != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("content: пак %d: %w", id, err)
+			}
+		}
 		if _, err := f.Write(hdr.bytes()); err != nil {
+			_ = f.Close()
+			return nil, wrapPackWriteErr(err, id)
+		}
+		// Заголовок и запись каталога о файле — на диск до любых строк
+		// метаданных этого пака: без синка каталога созданный файл может
+		// не пережить потерю питания вместе с первыми строками (C-1).
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return nil, wrapPackWriteErr(err, id)
+		}
+		if err := syncDir(s.opts.Dir); err != nil {
 			_ = f.Close()
 			return nil, wrapPackWriteErr(err, id)
 		}
@@ -552,7 +693,10 @@ func packFileName(id int32) string {
 }
 
 // packIDFromName разбирает имя пак-файла; чужие файлы (словарь, замок,
-// временные) отвергаются.
+// временные) отвергаются. Принимается только каноническое имя
+// pack-NNNNNN.pack (packFileName): «pack-1.pack» — чужой файл, иначе
+// один pack_id получил бы два файла (писатель создаёт каноничное имя
+// рядом с неканоничным), и удаление с ротацией путались бы между ними.
 func packIDFromName(name string) (int32, bool) {
 	const prefix, suffix = "pack-", ".pack"
 	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
@@ -561,6 +705,9 @@ func packIDFromName(name string) (int32, bool) {
 	n, err := strconv.Atoi(name[len(prefix) : len(name)-len(suffix)])
 	if err != nil || n < 1 || int64(n) > 1<<31-1 {
 		return 0, false
+	}
+	if name != packFileName(int32(n)) {
+		return 0, false // имя без паддинга — не наш пак
 	}
 	return int32(n), true
 }
@@ -586,9 +733,10 @@ func readPackHeader(f *os.File) (packHeader, error) {
 	return parsePackHeader(buf)
 }
 
-// parsePackHeader разбирает заголовок v1; hdrLen допускается больше
-// packHeaderLen (будущие версии дописывают поля в конец), но не больше
-// прочитанного буфера.
+// parsePackHeader разбирает заголовок v1: первые packHeaderLen байт с
+// полями v1. hdrLen допускается больше packHeaderLen — будущие версии
+// дописывают поля в конец, v1 их не читает (документировано в
+// docs/content.md); hdrLen меньше обязательных полей v1 — повреждение.
 func parsePackHeader(b []byte) (packHeader, error) {
 	bad := errors.New("заголовок пака нечитаем")
 	if len(b) < packHeaderLen || string(b[:len(packMagic)]) != packMagic {
@@ -597,8 +745,7 @@ func parsePackHeader(b []byte) (packHeader, error) {
 	if b[4] != packVersion {
 		return packHeader{}, fmt.Errorf("версия пака %d не поддерживается (поддерживается %d)", b[4], packVersion)
 	}
-	hdrLen := binary.LittleEndian.Uint16(b[5:7])
-	if int(hdrLen) < packHeaderLen || int(hdrLen) > len(b) {
+	if hdrLen := binary.LittleEndian.Uint16(b[5:7]); hdrLen < packHeaderLen {
 		return packHeader{}, bad
 	}
 	return packHeader{
@@ -608,18 +755,52 @@ func parsePackHeader(b []byte) (packHeader, error) {
 	}, nil
 }
 
-// readPackBlock читает clen байт блока из пака packID со смещения off.
+// readPackBlock открывает пак и читает clen байт блока со смещения off
+// (точечные чтения Get). Компактификация читает пак один раз на проход —
+// readPackBlockAt по открытому файлу (C-11).
 func readPackBlock(dir string, packID int32, off int64, clen int32) ([]byte, error) {
 	f, err := os.Open(filepath.Join(dir, packFileName(packID)))
 	if err != nil {
 		return nil, fmt.Errorf("content: пак %d: %w", packID, err)
 	}
 	defer func() { _ = f.Close() }() // только чтение
+	st, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("content: пак %d: %w", packID, err)
+	}
+	return readPackBlockAt(f, st.Size(), packID, off, clen)
+}
+
+// readPackBlockAt читает clen байт блока из открытого пака со смещения
+// off; size — размер файла для контроля размещения. Размещение сверяется
+// до аллокации: len приходит из БД (contents.len), повреждённая строка
+// не должна заказывать буфер до 2 ГиБ (C-14) — тот же контроль, что у
+// скана CompactScan.
+func readPackBlockAt(f *os.File, size int64, packID int32, off int64, clen int32) ([]byte, error) {
+	if clen < 0 || off < packHeaderLen+4 || off+int64(clen) > size {
+		return nil, fmt.Errorf("content: пак %d, смещение %d, длина %d: блок вне файла (%d байт)",
+			packID, off, clen, size)
+	}
 	buf := make([]byte, clen)
 	if _, err := f.ReadAt(buf, off); err != nil {
 		return nil, fmt.Errorf("content: пак %d, смещение %d: %w", packID, off, err)
 	}
 	return buf, nil
+}
+
+// syncDir синхронизирует каталог: запись о создании/удалении файла
+// (заголовок нового пака, unlink компактификации) обязана дожить до
+// диска вместе с содержимым файла.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // wrapPackWriteErr классифицирует ошибки записи пака: кончившееся место

@@ -110,7 +110,11 @@ func (d *Dict) Decompress(src []byte) ([]byte, error) {
 
 // Save записывает словарь в path атомарно (временный файл в том же
 // каталоге + rename): сервис, читающий файл при старте, не увидит
-// наполовину записанный словарь переобучения.
+// наполовину записанный словарь переобучения. Данные синхронизируются
+// до rename (Close записи на носитель не гарантирует), rename — запись
+// в каталоге, поэтому синхронизируется и каталог: иначе сбой питания
+// сразу после Save оставляет пустой/частичный словарь, а сервисы
+// отказываются стартовать на битом файле (T-043).
 func (d *Dict) Save(path string) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
@@ -123,6 +127,11 @@ func (d *Dict) Save(path string) error {
 		_ = os.Remove(name)
 		return fmt.Errorf("словарь: запись: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return fmt.Errorf("словарь: синхронизация: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(name)
 		return fmt.Errorf("словарь: запись: %w", err)
@@ -134,6 +143,12 @@ func (d *Dict) Save(path string) error {
 	if err := os.Rename(name, path); err != nil {
 		_ = os.Remove(name)
 		return fmt.Errorf("словарь: переименование: %w", err)
+	}
+	// Связь имени с файлом живёт в каталоге — best effort: сбой здесь
+	// редок, а словарь воспроизводим повторным обучением (train).
+	if dh, err := os.Open(dir); err == nil {
+		_ = dh.Sync()
+		_ = dh.Close()
 	}
 	return nil
 }
@@ -362,6 +377,47 @@ func SetDictFile(path string, log *slog.Logger) (bool, error) {
 		log.Info("словарь zstd загружен", "path", path, "id", d.ID(), "size", len(raw))
 	}
 	return true, nil
+}
+
+// WarnDictMismatch сверяет активный словарь пакета с dictID заголовка
+// новейшего пака каталога dir — диагностика при старте сервиса (T-043).
+// Декодер распаковывает кадры только зарегистрированным в процессе
+// словарём (SetDict/SetDictFile): после переобучения кадры, сжатые
+// прежним словарём, нечитаемы, и расхождение показывается оператору
+// сразу (Warn), а не списком ошибок чтения контента. Паков нет или
+// заголовок новейшего нечитаем — молча: это не расхождение словаря.
+// Реестра словарей в хранилище нет (docs/configuration.md) — Warn
+// призыв вручную вернуть прежний файл словаря.
+func WarnDictMismatch(dir string, log *slog.Logger) {
+	if log == nil || dir == "" {
+		return
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var max int32
+	for _, e := range ents {
+		if id, ok := packIDFromName(e.Name()); ok && id > max {
+			max = id
+		}
+	}
+	if max == 0 {
+		return // паков нет — сверять не с чем
+	}
+	f, err := os.Open(filepath.Join(dir, packFileName(max)))
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	hdr, err := readPackHeader(f)
+	if err != nil {
+		return
+	}
+	if id := activeDictID(); id != hdr.dictID {
+		log.Warn("словарь zstd не соответствует новейшему паку — кадры прежнего словаря нечитаемы (верните прежний файл словаря)",
+			"pack", max, "pack_dict_id", fmt.Sprintf("%08x", hdr.dictID), "active_dict_id", fmt.Sprintf("%08x", id))
+	}
 }
 
 // CompressWithDict сжимает src активным словарём пакета (SetDict /

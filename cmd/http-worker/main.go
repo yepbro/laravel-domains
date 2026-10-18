@@ -132,6 +132,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 	defer func() { _ = store.Close() }()
+	// Словарь против новейшего пака (T-043): переобучение делает кадры
+	// прежнего словаря нечитаемыми — расхождение видно сразу при старте.
+	content.WarnDictMismatch(store.Dir(), logger)
 
 	// Фоновые циклы сервиса (наблюдатель диска, коллектор длин очередей,
 	// проход доработки рендера) живут до отмены ctx; их результаты
@@ -145,6 +148,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// Warn и событие при входе в паузу записи/восстановлении; завершается
 	// с отменой ctx.
 	go func() { bg <- content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger}) }()
+
+	// Фоновая компактификация паков (T-045, ТЗ 5.7): единственный
+	// механизм физического освобождения места и удаления мёртвых строк
+	// contents — без неё ErrStoreFull не снимается никогда. Цикл один на
+	// хранилище — здесь, рядом с DiskWatchLoop (проходам не нужен
+	// параллелизм; одновременный запуск во втором писателе формально
+	// допустим, но бесполезен). Завершается с отменой ctx.
+	go func() { _ = content.CompactLoop(ctx, store, content.CompactOptions{Log: logger}) }()
 
 	saver, err := httpworker.NewContentSaver(store, logger)
 	if err != nil {

@@ -132,6 +132,56 @@ func TestTrainDictValidation(t *testing.T) {
 	}
 }
 
+// TestWarnDictMismatch — сверка активного словаря с новейшим паком:
+// расхождение — Warn, совпадение и пустой каталог — тишина.
+func TestWarnDictMismatch(t *testing.T) {
+	dict, err := TrainDict(dictCorpus(12, 2048), TrainOptions{DictSize: 16 << 10})
+	if err != nil {
+		t.Fatalf("TrainDict: %v", err)
+	}
+
+	newBuf := func() (*bytes.Buffer, *slog.Logger) {
+		buf := &bytes.Buffer{}
+		return buf, slog.New(slog.NewTextHandler(buf, nil))
+	}
+	warned := func(buf *bytes.Buffer) bool {
+		return strings.Contains(buf.String(), "не соответствует новейшему паку")
+	}
+
+	t.Run("расхождение — Warn", func(t *testing.T) {
+		dir := t.TempDir()
+		compactCraftPack(t, dir, 1, nil) // новейший пак (dictID 0 в заголовке)
+		SetDict(dict)                    // активный словарь с ненулевым ID
+		defer SetDict(nil)
+		buf, log := newBuf()
+		WarnDictMismatch(dir, log)
+		if !warned(buf) {
+			t.Errorf("расхождение не замечено: %s", buf.String())
+		}
+	})
+
+	t.Run("совпадение — тишина", func(t *testing.T) {
+		dir := t.TempDir()
+		compactCraftPack(t, dir, 1, nil)
+		SetDict(nil) // оба dictID нулевые
+		buf, log := newBuf()
+		WarnDictMismatch(dir, log)
+		if warned(buf) {
+			t.Errorf("ложный Warn при совпадении: %s", buf.String())
+		}
+	})
+
+	t.Run("паков нет — тишина", func(t *testing.T) {
+		SetDict(dict)
+		defer SetDict(nil)
+		buf, log := newBuf()
+		WarnDictMismatch(t.TempDir(), log)
+		if warned(buf) {
+			t.Errorf("Warn на пустом каталоге: %s", buf.String())
+		}
+	})
+}
+
 func TestDictSaveLoad(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "dict.zst")
