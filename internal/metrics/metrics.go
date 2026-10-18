@@ -50,6 +50,10 @@ const (
 	// (docs/services.md, docs/operations.md, ТЗ 5.9) — отдельное от
 	// LabelType: «type» уже занят типом ошибки/статусом домена.
 	LabelState = "state"
+	// LabelKind — разновидность ряда внутри одной метрики (например,
+	// effective/configured у потолков лимитёра DNS): значения локальны
+	// для метрики, в отличие от сквозных значений LabelStage/LabelQueue.
+	LabelKind = "kind"
 )
 
 // Значения метки LabelStage — этапы конвейера (ТЗ 4.2, §7). Единые

@@ -108,6 +108,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			[]string{queue.StreamDNS}, metrics.DefaultQueueCollectInterval, logger)
 	}()
 
+	// Состояние лимитёра DNS → gauges (T-035 → T-077): эффективные
+	// потолки после адаптива, доля таймаутов в окне, обмены в полёте —
+	// тихая деградация резолвера (снижение до пола) видна метрикой,
+	// а не только ростом temp_error (DNS-06).
+	go func() {
+		_ = dnsworker.CollectLimitLoop(ctx, reg, resolve.Stats, 0, logger)
+	}()
+
 	return dnsworker.Run(ctx, pool, q, resolve, dnsworker.Options{
 		Concurrency: cfg.DNS.Concurrency, // параллелизм эпизодов = dns.concurrency (ТЗ 5.10)
 		AskAAAA:     cfg.DNS.IPv6,        // AAAA отключаются конфигом без IPv6 (ТЗ 5.4)
