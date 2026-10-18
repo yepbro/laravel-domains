@@ -713,6 +713,34 @@ func TestFetchGzipBombUnderLimiter(t *testing.T) {
 	}
 }
 
+// TestFetchDecompressCeilingFollowsLimiter: потолок распаковки и лимит
+// чтения — одно число из одного источника: при включённых лимитах
+// T-049 это Limits.MaxBodyBytes, Options.MaxBodyBytes на распаковку не
+// влияет (два независимых поля в ручной сборке Options расходились —
+// распаковка резала тело по своему числу до лимитёра).
+func TestFetchDecompressCeilingFollowsLimiter(t *testing.T) {
+	page := bytes.Repeat([]byte("q"), 1000) // меньше лимита лимитёра
+	srv, _ := encodingServer(t, gzipBytes(t, page), map[string]string{
+		"Content-Encoding": "gzip",
+	})
+	f := NewFetcher(Options{
+		MaxBodyBytes: 500, // ловушка: не источник при включённых Limits
+		Limits:       &LimitOptions{MaxBodyBytes: 1500},
+	})
+	res := fetchFrom(t, f, srv.URL)
+	defer func() { _ = res.Body.Close() }()
+	b, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		t.Fatalf("тело меньше лимита — чтение без ошибки: %v", readErr)
+	}
+	if len(b) != len(page) {
+		t.Errorf("прочитано %d байт, ожидалось %d (потолок не из Limits.MaxBodyBytes)", len(b), len(page))
+	}
+	if res.BodyLimiter.Truncated() {
+		t.Error("тело меньше лимита помечено обрезкой")
+	}
+}
+
 // TestFetchGzipCharsetChain: сжатие + кодировка вместе: gzip поверх
 // windows-1251, заголовок объявляет charset — после Fetch и ToUTF8
 // потребитель видит русский UTF-8 (хэш дедупа и raw_len хранилища

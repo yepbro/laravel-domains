@@ -96,6 +96,9 @@ type Options struct {
 	// тела | 2 МБ», ТЗ 5.5). Применяет лимитёр T-049 (Options.Limits:
 	// обрезка с признаком BodyLimiter.Truncated); без лимитёра
 	// значение переносится из конфигурации к потребителю как есть.
+	// С включёнными Limits потолок тела один на транспорт и лимитёр —
+	// Limits.MaxBodyBytes (bodyCeiling), это поле на распаковку
+	// не влияет.
 	MaxBodyBytes int64
 	// Limits — лимиты и защита T-049 (таблица лимитов ТЗ 5.5): потолок
 	// тела, анти-тарпит, соединения на один IP, глобальные соединения
@@ -344,10 +347,27 @@ func (f *Fetcher) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// bodyCeiling — единый источник потолка тела для распаковки и лимита
+// чтения: при включённых лимитах T-049 — Limits.MaxBodyBytes (то же
+// число, по которому режет BodyLimiter), без лимитов — Options.MaxBodyBytes
+// либо дефолт таблицы лимитов. Два раздельных поля (Options и Limits)
+// в боевой сборке NewOptions заполняются одним cfg.MaxBodyBytes, но
+// ручная сборка Options расходилась — распаковка и чтение видели
+// разные потолки.
+func (f *Fetcher) bodyCeiling() int64 {
+	if f.lim != nil && f.lim.opt.MaxBodyBytes > 0 {
+		return f.lim.opt.MaxBodyBytes
+	}
+	if f.opt.MaxBodyBytes > 0 {
+		return f.opt.MaxBodyBytes
+	}
+	return defaultDecompressLimit
+}
+
 // decodeResponseBody распаковывает тело ответа по Content-Encoding с
 // потолком распакованного размера (защита от zip-бомб, ТЗ 5.5) и
 // вписывается в цепочку чтения: сеть → gunzip/brotli (потолок
-// MaxBodyBytes) → лимит читаемого тела T-049 → потребитель. Потолок
+// bodyCeiling) → лимит читаемого тела T-049 → потребитель. Потолок
 // равен лимиту тела: распакованный поток и есть тело, иначе чтение до
 // конца (хэш дедупа) раздуло бы бомбу до лимита, но гигабайтами
 // распаковки. С лимитёром T-049 потолок пропускает ещё один пробный
@@ -364,10 +384,7 @@ func (f *Fetcher) decodeResponseBody(resp *http.Response) error {
 	if ce == "" {
 		return nil // сжатия нет — тело как есть
 	}
-	limit := f.opt.MaxBodyBytes
-	if limit <= 0 {
-		limit = defaultDecompressLimit
-	}
+	limit := f.bodyCeiling()
 	if f.lim != nil {
 		// Выше распаковки стоит BodyLimiter: его пробный байт за
 		// пределом лимита проходит сквозь распаковку (см. комментарий
