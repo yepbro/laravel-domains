@@ -61,8 +61,10 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -177,7 +179,14 @@ func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error
 	}
 	groups, err := g.rdb.XInfoGroups(ctx, stream).Result()
 	if err != nil {
-		return 0, fmt.Errorf("queue: глубина %s: %w", stream, err)
+		// Стрима ещё нет — Redis отвечает ошибкой no such key (а не
+		// пустым списком): групп нет, глубина без доставок равна длине
+		// стрима, XLEN несуществующего ключа вернёт 0.
+		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
+			groups = nil
+		} else {
+			return 0, fmt.Errorf("queue: глубина %s: %w", stream, err)
+		}
 	}
 	if len(groups) == 0 {
 		n, err := g.rdb.XLen(ctx, stream).Result()

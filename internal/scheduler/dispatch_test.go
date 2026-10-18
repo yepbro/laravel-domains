@@ -382,7 +382,7 @@ const wantDispatchZonesSQL = "SELECT id, name FROM zones WHERE is_active"
 const wantDispatchZoneSQL = "SELECT d.zone_id, d.id, d.label " +
 	"FROM unnest($1::int2[], $2::int8[]) AS z(zone_id, after_id) " +
 	"JOIN LATERAL (" +
-	"SELECT dd.id, dd.label FROM domains AS dd " +
+	"SELECT dd.zone_id, dd.id, dd.label FROM domains AS dd " +
 	"WHERE dd.zone_id = z.zone_id AND dd.id > z.after_id " +
 	"AND dd.check_state = 0 AND dd.status <> 6 " +
 	"ORDER BY dd.id LIMIT $3" +

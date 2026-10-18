@@ -90,7 +90,7 @@ var dispatchZoneSQL = fmt.Sprintf(
 	"SELECT d.zone_id, d.id, d.label "+
 		"FROM unnest($1::int2[], $2::int8[]) AS z(zone_id, after_id) "+
 		"JOIN LATERAL ("+
-		"SELECT dd.id, dd.label FROM domains AS dd "+
+		"SELECT dd.zone_id, dd.id, dd.label FROM domains AS dd "+
 		"WHERE dd.zone_id = z.zone_id AND dd.id > z.after_id "+
 		"AND dd.check_state = %d AND dd.status <> %d "+
 		"ORDER BY dd.id LIMIT $3"+
