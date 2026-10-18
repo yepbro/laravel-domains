@@ -12,7 +12,9 @@ package httpfetch
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"errors"
 	"io"
 	"net/http"
@@ -360,6 +362,9 @@ func TestDecodeContentEncoding(t *testing.T) {
 		{"gzip", "gzip", func() []byte { return gzipBytes(t, plain) }},
 		{"gzip-регистр", " GZip ", func() []byte { return gzipBytes(t, plain) }},
 		{"br", "br", func() []byte { return brotliBytes(t, plain) }},
+		{"deflate-zlib", "deflate", func() []byte { return zlibBytes(t, plain) }},
+		{"deflate-регистр", " Deflate ", func() []byte { return zlibBytes(t, plain) }},
+		{"deflate-сырой", "deflate", func() []byte { return flateRawBytes(t, plain) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(tc.compressed())), tc.enc, 0)
@@ -375,14 +380,45 @@ func TestDecodeContentEncoding(t *testing.T) {
 	}
 }
 
-// TestDecodeContentEncodingUnsupported: deflate и составные значения —
-// ошибка (краулер рекламирует только gzip и br).
+// TestDecodeContentEncodingUnsupported: составные значения и экзотика —
+// ошибка (краулер рекламирует только gzip и br; одиночный deflate
+// принимается оборонительно — незапрошенным его отдают часть серверов).
 func TestDecodeContentEncodingUnsupported(t *testing.T) {
-	for _, ce := range []string{"deflate", "compress", "gzip, br", "zstd"} {
+	for _, ce := range []string{"compress", "gzip, br", "zstd", "br, gzip"} {
 		if _, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(nil)), ce, 0); err == nil {
 			t.Errorf("Content-Encoding %q: ожидалась ошибка", ce)
 		}
 	}
+}
+
+// zlibBytes — zlib-обёртка (RFC 1950) поверх deflate.
+func zlibBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatalf("zlib write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zlib close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// flateRawBytes — сырой deflate-поток (RFC 1951, без zlib-заголовка):
+// такую форму «Content-Encoding: deflate» отдают серверы, не читавшие
+// RFC 1950.
+func flateRawBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	fw, _ := flate.NewWriter(&buf, flate.DefaultCompression)
+	if _, err := fw.Write(b); err != nil {
+		t.Fatalf("flate write: %v", err)
+	}
+	if err := fw.Close(); err != nil {
+		t.Fatalf("flate close: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // TestDecodeContentEncodingBomb: распакованный поток сверх потолка —
@@ -618,14 +654,51 @@ func TestFetchGzipEmptyBody(t *testing.T) {
 // TestFetchUnsupportedEncoding: сервер прислал незапрашиваемое
 // Content-Encoding — честная ошибка, не сжатые байты телом.
 func TestFetchUnsupportedEncoding(t *testing.T) {
-	srv, _ := encodingServer(t, []byte{0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01}, map[string]string{
-		"Content-Encoding": "deflate",
+	srv, _ := encodingServer(t, []byte("x"), map[string]string{
+		"Content-Encoding": "compress",
 	})
 	f := NewFetcher(Options{})
 	u, _ := url.Parse(srv.URL)
 	_, err := f.Fetch(t.Context(), FetchRequest{URL: u, Addrs: loopbackAddr()})
 	if err == nil || !strings.Contains(err.Error(), "Content-Encoding") {
 		t.Fatalf("ожидалась ошибка Content-Encoding, получено %v", err)
+	}
+}
+
+// TestFetchDeflateRoundtrip: незапрошенный deflate (zlib-обёртка и
+// сырой поток — историческая двусмысленность серверов) распаковывается:
+// страница не проваливается ошибкой запроса, кодирующие заголовки
+// снимаются; Accept-Encoding по-прежнему рекламирует только gzip и br.
+func TestFetchDeflateRoundtrip(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{"zlib", zlibBytes(t, []byte("deflate-zlib-body")), "deflate-zlib-body"},
+		{"сырой-поток", flateRawBytes(t, []byte("deflate-raw-body")), "deflate-raw-body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, ae := encodingServer(t, tc.body, map[string]string{
+				"Content-Encoding": "deflate",
+			})
+			f := NewFetcher(Options{})
+			res := fetchFrom(t, f, srv.URL)
+			defer func() { _ = res.Body.Close() }()
+			b, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatalf("чтение: %v", err)
+			}
+			if string(b) != tc.want {
+				t.Errorf("тело: %q, ожидалось %q", b, tc.want)
+			}
+			if res.Header.Get("Content-Encoding") != "" {
+				t.Errorf("Content-Encoding не снят: %q", res.Header.Get("Content-Encoding"))
+			}
+			if ae.Get() != acceptEncoding {
+				t.Errorf("Accept-Encoding: %q, ожидался %q (deflate не рекламируем)", ae.Get(), acceptEncoding)
+			}
+		})
 	}
 }
 
