@@ -189,10 +189,22 @@ func accRulesDir(t *testing.T) string {
 	return "../../rules"
 }
 
-// accModifiedRulesDir — копия рабочего набора с правилом-пробой, которое
-// никогда не срабатывает: канонический хэш (Version) меняется, состав
-// срабатываний на образцах — нет (переанализ TestAccept04 проверяет
-// обновление правил без изменения выводов).
+// accModifiedRulesDir — копия рабочего набора с правилом-пробой,
+// срабатывающей ровно на одном образце конвейера (symfony-negative):
+// канонический хэш (Version) меняется, а reanalyze обязан переприменить
+// правила — у образца-мишени появляется срабатывание пробы и растёт
+// score, у остальных выводы прежние (TestAccept04).
+const (
+	// accProbeRule — id правила-пробы в копии набора.
+	accProbeRule = "t094_reanalyze_probe"
+	// accProbeSample — образец-мишень пробы: устойчивая подстрока его
+	// HTML не встречается в остальных образцах и правилах корпуса.
+	accProbeSample = "symfony-negative"
+	// accProbeWeight — вес пробы: заметен в score (noisy-OR), но не
+	// переводит слабый негатив через порог is_laravel 0.6.
+	accProbeWeight = 0.05
+)
+
 func accModifiedRulesDir(t *testing.T) string {
 	t.Helper()
 	src := accRulesDir(t)
@@ -214,11 +226,11 @@ func accModifiedRulesDir(t *testing.T) string {
 		}
 	}
 	probe := "rules:\n" +
-		"  - id: t094_no_fire_probe\n" +
-		"    description: приёмочная проба T-094 — никогда не срабатывает, меняет только версию набора\n" +
+		"  - id: " + accProbeRule + "\n" +
+		"    description: приёмочная проба T-094 — срабатывает на образце " + accProbeSample + ", доказывая переприменение правил после reanalyze\n" +
 		"    target: html\n" +
-		"    regex: '__t094_acceptance_no_fire__'\n" +
-		"    weight: 0.05\n"
+		"    regex: 'Hello Symfony!'\n" +
+		"    weight: " + fmt.Sprintf("%g", accProbeWeight) + "\n"
 	if err := os.WriteFile(filepath.Join(dst, "t094_probe.yaml"), []byte(probe), 0o644); err != nil {
 		t.Fatalf("правило-проба: %v", err)
 	}
@@ -1054,12 +1066,14 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 
 // TestAccept04_ReanalyzeNoRefetch — §11.4 п. 4: «…изменение правил +
 // reanalyze обновляет результаты без повторного скачивания». Анализ
-// рабочих образцов первым набором → правила меняются (версия набора
-// растёт, выводы — нет: проба не срабатывает) → ReanalyzeOnce публикует
-// q:analyze → воркер со вторым набором перезаписывает findings. Следы
-// повторного скачивания проверяются отсутствием: эпизоды HTTP не
-// запускаются, строки результатов не меняются (checked_at, content_hash),
-// хранилище не растёт.
+// рабочих образцов первым набором → правила меняются (добавляется проба,
+// срабатывающая на одном из образцов) → ReanalyzeOnce публикует
+// q:analyze → воркер со вторым набором перезаписывает findings: у
+// образца-мишени появляются срабатывание пробы и новый score (правила
+// реально переприменены, а не перештампована rules_version), у остальных
+// выводы прежние. Следы повторного скачивания проверяются отсутствием:
+// эпизоды HTTP не запускаются, строки результатов не меняются
+// (checked_at, content_hash), хранилище не растёт.
 func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newAccEnv(t)
@@ -1110,8 +1124,9 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	httpBefore := streamLen(t, env.rdb, queue.StreamHTTP)
 	renderBefore := streamLen(t, env.rdb, queue.StreamRender)
 
-	// Правила изменились: копия набора с никогда не срабатывающей пробой —
-	// канонический хэш (Version) другой, выводы на образцах прежние.
+	// Правила изменились: копия набора с пробой, срабатывающей на
+	// symfony-negative, — канонический хэш (Version) другой, у мишени
+	// должен появиться новый сигнал и вырасти score.
 	loader2, err := rules.NewReloader(accModifiedRulesDir(t), nil)
 	if err != nil {
 		t.Fatalf("изменённый набор правил: %v", err)
@@ -1139,7 +1154,11 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	// Воркер второго набора перепотребляет q:analyze.
 	accAnalyze(ctx, t, env, an2, len(labels))
 
-	// findings перезаписаны новой версией, выводы прежние (проба молчит).
+	// findings перезаписаны новой версией; правила реально переприменены:
+	// у образца-мишени пробы срабатывание появилось и score пересчитан
+	// (noisy-OR с весом пробы), у остальных выводы прежние. Заглушка
+	// «обновили только штамп rules_version, переиспользовав signals/score»
+	// здесь падает.
 	for _, l := range labels {
 		fs := accFindings(t, env.pool, zoneID, ids[l])
 		sample := accSampleByID(t, l)
@@ -1149,15 +1168,27 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 			t.Errorf("%s: findings после переанализа = %d строк, хочу 1", l, len(fs))
 			continue
 		}
-		if got := len(accFiredRules(t, fs[0].signals)); got != len(sample.Expect.Rules) {
-			t.Errorf("%s: срабатываний в signals = %d, хочу %d", l, got, len(sample.Expect.Rules))
+		fired := accFiredRules(t, fs[0].signals)
+		wantScore := *sample.Expect.Score
+		wantFired := len(sample.Expect.Rules)
+		if l == accProbeSample {
+			wantFired++
+			wantScore = 1 - (1-*sample.Expect.Score)*(1-accProbeWeight)
+			if !fired[accProbeRule] {
+				t.Errorf("%s: в signals нет пробы %s — правила не переприменены (перештамповка rules_version?)", l, accProbeRule)
+			}
+		} else if fired[accProbeRule] {
+			t.Errorf("%s: проба %s сработала вне образца-мишени %s", l, accProbeRule, accProbeSample)
+		}
+		if got := len(fired); got != wantFired {
+			t.Errorf("%s: срабатываний в signals = %d (%v), хочу %d", l, got, fired, wantFired)
 		}
 		for _, f := range fs {
 			if f.rulesVersion != v2 {
 				t.Errorf("%s: rules_version срабатывания = %d, хочу %d (новый набор)", l, f.rulesVersion, v2)
 			}
-			if math.Abs(float64(f.score)-*sample.Expect.Score) > accScoreTol {
-				t.Errorf("%s: score изменился: %.4f, хочу ≈%.3f (проба не срабатывает)", l, f.score, *sample.Expect.Score)
+			if math.Abs(float64(f.score)-wantScore) > accScoreTol {
+				t.Errorf("%s: score после переанализа = %.4f, хочу ≈%.3f", l, f.score, wantScore)
 			}
 		}
 	}
