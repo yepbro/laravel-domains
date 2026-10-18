@@ -315,6 +315,13 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	if err != nil {
 		return Stats{}, FileResult{}, 0, fmt.Errorf("ingest: файл %s: %w", f.Path, err)
 	}
+	// Построчные отказы парсера пишутся тем же rejected-логом, что и
+	// отказы валидатора (формат — Validator.reject): Reject.Text парсер
+	// уже обрезал (maxRejectText), nil-логгер — записи подавлены.
+	rejectLog := p.opts.RejectLog
+	if rejectLog == nil {
+		rejectLog = slog.New(slog.DiscardHandler)
+	}
 
 	rows := make(chan Row, stageChanSize)
 	stop := make(chan struct{})
@@ -341,6 +348,12 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 			},
 			OnReject: func(rj Reject) error {
 				prejects[rj.Reason]++
+				rejectLog.Warn("строка отклонена",
+					"file", f.Path,
+					"line", rj.Num,
+					"text", rj.Text,
+					"reason", string(rj.Reason),
+				)
 				return nil
 			},
 		})

@@ -850,6 +850,44 @@ func TestPipelineRejectLogPassed(t *testing.T) {
 	}
 }
 
+// TestPipelineParserRejectLog — построчные отказы парсера пишутся в
+// rejected-лог тем же форматом, что и отказы валидатора (ТЗ 5.1,
+// docs/incoming-files.md §3, §7: invalid_utf8/line_len — причины лога,
+// обрезанная строка — в записи).
+func TestPipelineParserRejectLog(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "example.com\n\xff\xfe\n" + strings.Repeat("a", MaxLineLen+76) + "\n"
+	abs := pt.addFile(t, "com/add/list.txt", content)
+
+	var buf strings.Builder
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir:       pt.dir,
+		BatchSize: 10,
+		RejectLog: NewRejectedLogger(&buf, slog.LevelInfo),
+		Now:       func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipe.Process(context.Background(), abs); err != nil {
+		t.Fatal(err)
+	}
+	logged := buf.String()
+	for _, want := range []string{
+		"service=rejected",
+		"file=com/add/list.txt",
+		"line=2",
+		"reason=invalid_utf8",
+		"line=3",
+		"reason=line_len",
+		"text=" + strings.Repeat("a", maxRejectText), // обрезка парсера, байты
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("rejected-лог = %q, want запись с %q", logged, want)
+		}
+	}
+}
+
 // TestNewPipelineValidation — обязательные зависимости и каталог.
 func TestNewPipelineValidation(t *testing.T) {
 	opts := PipelineOptions{Dir: "/tmp"}
