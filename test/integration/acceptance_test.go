@@ -1702,6 +1702,13 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	if len(got) != len(want) {
 		t.Fatalf("множество доменов изменилось: %v против %v — потеря данных", got, want)
 	}
+	// Состав, а не только размер: перевыбор чужих/дублей при том же
+	// размере — тоже потеря данных.
+	for id := range want {
+		if !got[id] {
+			t.Fatalf("домен %d потерян при переиздании: %v против %v", id, got, want)
+		}
+	}
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, batch2); err != nil {
 		t.Fatal(err)
 	}
