@@ -49,6 +49,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/network"
@@ -58,6 +59,42 @@ import (
 // extractDOMExpr — выражение съёма итогового DOM (ТЗ 5.6): outerHTML
 // корневого элемента — полное дерево после дорисовки JS.
 const extractDOMExpr = `document.documentElement.outerHTML`
+
+// extractDOMTruncated — признак обрезки сверхлимитного DOM (R-02):
+// HTML-комментарий в конце документа — анализатор (правила по HTML)
+// и оператор видят, что дерево снято не целиком.
+const extractDOMTruncated = "<!-- crawler: dom truncated -->"
+
+// extractDOMExprLimited — выражение съёма с потолком длины: тяжёлая или
+// враждебная страница (SPA-монстр, раздутый JS) не тянет через CDP строку
+// сверх лимита — обрезка происходит в самом браузере. substring считает
+// UTF-16 единицы, поэтому точный байтовый предел дожимается в Go
+// (truncateDOM).
+func extractDOMExprLimited(limit int) string {
+	if limit <= 0 {
+		return extractDOMExpr
+	}
+	return extractDOMExpr + fmt.Sprintf(".substring(0, %d)", limit)
+}
+
+// truncateDOM — жёсткий байтовый предел итогового DOM в памяти воркера:
+// при MemoryMax=128M и render.contexts=3 неограниченный DOM (плюс
+// transient-буфер chromedp и копии хэша/Put) выбивает cgroup-бюджет
+// OOM-kill'ом. Сверх лимита DOM обрезается и получает признак обрезки;
+// граница среза откатывается на начало многобайтного символа.
+func truncateDOM(dom string, limit int) string {
+	if limit <= 0 || len(dom) <= limit {
+		return dom
+	}
+	cut := limit - len(extractDOMTruncated)
+	for cut > 0 && !utf8.RuneStart(dom[cut]) {
+		cut-- // не рвать многобайтный символ посередине
+	}
+	if cut <= 0 {
+		return dom[:limit] // вырожденный лимит меньше признака обрезки
+	}
+	return dom[:cut] + extractDOMTruncated
+}
 
 // ExtractCookie — cookie итоговой страницы в формате колонки
 // subdomain_results.cookies (jsonb). Форма повторяет запись HTTP-этапа
@@ -181,14 +218,18 @@ type extractCDP struct {
 	dom func(ctx context.Context) (string, error)
 	// cookies — cookies хранилища контекста, применимые к URL.
 	cookies func(ctx context.Context, pageURL string) ([]*network.Cookie, error)
+	// domLimit — потолок длины DOM в байтах, 0 — без лимита: выражение
+	// съёма и truncateDOM (R-02).
+	domLimit int
 }
 
 // newExtractCDP — реальные команды CDP (выполняются над контекстом вкладки
-// сессии).
-func newExtractCDP() extractCDP {
+// сессии); domLimit — потолок итогового DOM (Options.MaxDOMBytes).
+func newExtractCDP(domLimit int) extractCDP {
 	return extractCDP{
+		domLimit: domLimit,
 		dom: func(ctx context.Context) (string, error) {
-			return chromedp.Run(ctx, chromedp.Evaluate[string](extractDOMExpr))
+			return chromedp.Run(ctx, chromedp.Evaluate[string](extractDOMExprLimited(domLimit)))
 		},
 		cookies: func(ctx context.Context, pageURL string) ([]*network.Cookie, error) {
 			var out []*network.Cookie
@@ -206,14 +247,15 @@ func newExtractCDP() extractCDP {
 
 // extractResult — финальный этап Session.Run (T-064): итоговый DOM и все
 // cookies итоговой страницы в out. DOM обязателен (без него результат не
-// нужен), cookies снимаются по FinalURL; для схем без cookie-хранилища
+// нужен) и ограничен потолком Options.MaxDOMBytes (обрезка с признаком,
+// R-02); cookies снимаются по FinalURL; для схем без cookie-хранилища
 // (data:, about:) набора не существует — шаг пропускается без ошибки.
 func (e extractCDP) extractResult(ctx context.Context, out *RenderOutput) error {
 	dom, err := e.dom(ctx)
 	if err != nil {
 		return fmt.Errorf("итоговый DOM (%s): %w", extractDOMExpr, err)
 	}
-	out.DOM = dom
+	out.DOM = truncateDOM(dom, e.domLimit)
 
 	if u, perr := url.Parse(out.FinalURL); perr == nil &&
 		(u.Scheme == "http" || u.Scheme == "https") {

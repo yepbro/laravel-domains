@@ -154,7 +154,9 @@ func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 		out.FinalURL, err = chromedp.Run(tctx, chromedp.Location())
 	}
 	if err == nil {
-		err = newExtractCDP().extractResult(tctx, &out) // T-064: DOM + cookies
+		// Потолок DOM ≤ 16 МиБ по конфигурации (content.max_store_bytes),
+		// int здесь всегда достаточен.
+		err = newExtractCDP(int(s.b.opts.MaxDOMBytes)).extractResult(tctx, &out) // T-064: DOM + cookies
 	}
 	if err == nil && resp != nil {
 		out.ResponseHeaders = extractResponseHeaders(resp.Headers) // T-064

@@ -262,7 +262,11 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, fmt.Errorf("renderworker: %s: пустой результат рендера (DOM %d байт, final_url %q)",
 			name, len(out.DOM), out.FinalURL)
 	}
-	newHash := content.HashOf([]byte(out.DOM))
+	// DOM — одной копией байтов (R-02): хэш и Put из одного среза, сам
+	// итоговый DOM уже ограничен рендером (render.Options.MaxDOMBytes);
+	// кратные полные копии строки не нужны.
+	dom := []byte(out.DOM)
+	newHash := content.HashOf(dom)
 
 	var oldHash content.Hash
 	hasOld := len(target.hash) == content.HashLen
@@ -280,7 +284,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// доставки исчерпаются и задача уйдёт в q:dead на ручной разбор
 	// (T-025) — оператору сигнал поднять content.max_store_bytes.
 	if !hasOld || newHash != oldHash {
-		if _, err := w.contents.Put(ctx, []byte(out.DOM)); err != nil {
+		if _, err := w.contents.Put(ctx, dom); err != nil {
 			return false, fmt.Errorf("renderworker: %s: сохранение DOM: %w", name, err)
 		}
 	}

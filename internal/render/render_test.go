@@ -48,6 +48,7 @@ func TestNewOptions(t *testing.T) {
 		RestartEveryPages: 500,
 		MemoryThreshold:   1536 << 20,
 		UserAgent:         "Crawler/1.0 (+https://example.example; admin@example.example)",
+		MaxDOMBytes:       cfg.Content.MaxStoreBytes.B(), // R-02: потолок DOM — лимит хранилища
 	}
 	if got != want {
 		t.Fatalf("NewOptions:\n got %+v\nwant %+v", got, want)
@@ -100,6 +101,7 @@ func TestOptionsValidate(t *testing.T) {
 		{"memory_threshold отрицательный", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: -1}, "memory_threshold"},
 		{"memory_threshold ниже минимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 1 << 20}, "memory_threshold"},
 		{"memory_threshold выше максимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 17 << 30}, "memory_threshold"},
+		{"max_dom_bytes отрицательный", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MaxDOMBytes: -1}, "max_dom_bytes"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

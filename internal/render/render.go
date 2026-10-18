@@ -125,11 +125,19 @@ type Options struct {
 	// SessionStartTimeout — таймаут создания изолированного контекста с
 	// вкладкой (0 — 15 с).
 	SessionStartTimeout time.Duration
+	// MaxDOMBytes — потолок итогового DOM в байтах (R-02, гигиена памяти
+	// воркера: render.contexts съёмов параллельно при MemoryMax=128M у
+	// systemd-профиля): DOM сверх лимита обрезается в самом браузере и
+	// получает признак обрезки (extract.go). 0 — без лимита. Источник в
+	// сборке — content.max_store_bytes: контент сверх лимита хранилище не
+	// принимает (ErrTooLarge), держать его в памяти бессмысленно.
+	MaxDOMBytes int64
 }
 
 // NewOptions собирает Options из конфигурации сервиса (ТЗ 5.10): секция
 // render плюс User-Agent HTTP-этапа (ТЗ §9 — единый идентифицируемый UA
-// краулера).
+// краулера) и потолок DOM из секции content (R-02: итоговый DOM не больше
+// того, что хранилище контента принимает).
 func NewOptions(cfg config.Config) Options {
 	return Options{
 		RemoteURL:         cfg.Render.RemoteURL,
@@ -138,6 +146,7 @@ func NewOptions(cfg config.Config) Options {
 		RestartEveryPages: cfg.Render.RestartEveryPages,
 		MemoryThreshold:   cfg.Render.RestartMemoryBytes.B(),
 		UserAgent:         cfg.HTTP.UserAgent,
+		MaxDOMBytes:       cfg.Content.MaxStoreBytes.B(),
 	}
 }
 
@@ -187,6 +196,10 @@ func (o Options) validate() error {
 		problems = append(problems, fmt.Sprintf(
 			"memory_threshold: ожидается 0 (отключено) или %d..%d байт, задано %d",
 			256<<20, 16<<30, o.MemoryThreshold))
+	}
+	if o.MaxDOMBytes < 0 {
+		problems = append(problems,
+			fmt.Sprintf("max_dom_bytes: ожидается 0 (без лимита) или положительное число, задано %d", o.MaxDOMBytes))
 	}
 	if len(problems) > 0 {
 		return errors.New("render: " + strings.Join(problems, "; "))
