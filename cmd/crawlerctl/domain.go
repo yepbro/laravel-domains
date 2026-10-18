@@ -639,7 +639,8 @@ func writeDomainContent(ctx context.Context, store domainContentStore, info doma
 	}
 	rawHash, err := hex.DecodeString(sel.ContentHash)
 	if err != nil || len(rawHash) != content.HashLen {
-		return fmt.Errorf("domain: некорректный content_hash %q в результате (субдомен %s, вариант %s)", sel.ContentHash, sel.Subdomain, model.Variant(sel.Variant))
+		return fmt.Errorf("domain: некорректный content_hash %q в результате (субдомен %s, вариант %s)",
+			sel.ContentHash, subLabel(sel.Subdomain), model.Variant(sel.Variant))
 	}
 	var hash content.Hash
 	copy(hash[:], rawHash)

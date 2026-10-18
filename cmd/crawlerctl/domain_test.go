@@ -863,11 +863,13 @@ func TestWriteDomainContent(t *testing.T) {
 	}
 
 	// Хэш из функции битый (не 16 байт hex) — ошибка данных, не паника.
+	// Апекс показывается меткой «(апекс)», а не пустой сырой строкой.
 	badHash := info
 	badHash.Results = []domainResult{{Subdomain: "", ContentHash: "abc", Rendered: true}}
 	if err := writeDomainContent(context.Background(), store, badHash, 0.6, &stdout, &stderr); err == nil ||
-		!strings.Contains(err.Error(), "некорректный content_hash") {
-		t.Errorf("err = %v, хочу «некорректный content_hash»", err)
+		!strings.Contains(err.Error(), "некорректный content_hash") ||
+		!strings.Contains(err.Error(), "(субдомен (апекс),") {
+		t.Errorf("err = %v, хочу «некорректный content_hash» с меткой (апекс)", err)
 	}
 
 	// Хранилище не нашло байты (ссылка есть, блока нет) — ошибка с хэшем.
