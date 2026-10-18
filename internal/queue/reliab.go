@@ -158,7 +158,11 @@ type Claimed struct {
 
 // Claim возвращает до n зависших записей стрима stream — прочитанных
 // группой group и не подтверждённых не менее minIdle (0 — ReliabOptions.
-// MinIdle), закрепляя их за потребителем consumer.
+// MinIdle), закрепляя их за потребителем consumer. Сканирование PEL
+// начинается с курсора start ("" или "0-0" — с начала); next в возврате —
+// курсор следующего сканирования ("0-0" — обход PEL завершён): вызывающий
+// цикл продолжает с него, не перечитывая пропущенные (ещё не
+// «созревшие» по MinIdle) записи с начала на каждом вызове.
 //
 // Выбор XAUTOCLAIM (а не XPENDING+XCLAIM): ТЗ 4.2 называет XAUTOCLAIM
 // прямо; go-redis v9 поддерживает его полностью. Одна атомарная команда
@@ -195,32 +199,38 @@ type Claimed struct {
 // эффектов, поэтому безопасно при гонках с другими восстановителями.
 //
 // Пустой результат без ошибки — зависших записей нет.
-func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, n int) ([]Claimed, error) {
+func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, n int, start string) ([]Claimed, string, error) {
 	if !knownStream(stream) {
-		return nil, fmt.Errorf("queue: неизвестный стрим %q", stream)
+		return nil, "", fmt.Errorf("queue: неизвестный стрим %q", stream)
 	}
 	if group == "" {
-		return nil, fmt.Errorf("queue: не задана группа потребителей стрима %s", stream)
+		return nil, "", fmt.Errorf("queue: не задана группа потребителей стрима %s", stream)
 	}
 	if consumer == "" {
-		return nil, fmt.Errorf("queue: не задано имя потребителя группы %s", group)
+		return nil, "", fmt.Errorf("queue: не задано имя потребителя группы %s", group)
 	}
 	if minIdle <= 0 {
 		minIdle = r.opt.MinIdle
 	}
 	if n < 1 {
-		return nil, fmt.Errorf("queue: размер пачки клейма %d < 1", n)
+		return nil, "", fmt.Errorf("queue: размер пачки клейма %d < 1", n)
 	}
-	msgs, _, err := r.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+	if start == "" {
+		start = "0-0"
+	}
+	msgs, next, err := r.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 		Stream:   stream,
 		Group:    group,
 		Consumer: consumer,
 		MinIdle:  minIdle,
-		Start:    "0-0", // с начала PEL: закреплённые записи получают новое время доставки и повторно не находятся
+		Start:    start, // курсор вызывающего цикла: продолжение обхода PEL, а не всегда с начала
 		Count:    int64(n),
 	}).Result()
 	if err != nil {
-		return nil, fmt.Errorf("queue: claim %s (группа %s): %w", stream, group, err)
+		return nil, "", fmt.Errorf("queue: claim %s (группа %s): %w", stream, group, err)
+	}
+	if next == "" {
+		next = "0-0" // обход PEL завершён — следующий с начала
 	}
 	out := make([]Claimed, 0, len(msgs))
 	var errs []error
@@ -258,11 +268,11 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 	}
 	if len(out) == 0 {
 		if len(errs) > 0 {
-			return nil, errors.Join(errs...)
+			return nil, next, errors.Join(errs...)
 		}
-		return nil, nil
+		return nil, next, nil
 	}
-	return out, errors.Join(errs...)
+	return out, next, errors.Join(errs...)
 }
 
 // Process — паттерн Processing поверх очереди слоя: клеймнутая Claim

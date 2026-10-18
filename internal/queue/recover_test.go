@@ -148,6 +148,7 @@ func TestRecoverLoopDrainsFullBatch(t *testing.T) {
 			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
 			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
 		},
+		claimNext: "1720-0", // курсор следующего сканирования из ответа
 		pendRes: map[string][]redis.XPendingExt{
 			"1718-0": {{ID: "1718-0", RetryCount: 1}},
 			"1719-0": {{ID: "1719-0", RetryCount: 1}},
@@ -163,6 +164,13 @@ func TestRecoverLoopDrainsFullBatch(t *testing.T) {
 	stop()
 	if first.ID != "1718-0" || second.ID != "1719-0" {
 		t.Errorf("дренаж: %+v затем %+v, хочу 1718-0 и 1719-0", first, second)
+	}
+	// Второй клейм продолжает с курсора первого, а не с начала PEL.
+	if len(fake.claims) < 2 {
+		t.Fatalf("клеймов %d, хочу ≥ 2", len(fake.claims))
+	}
+	if got := fake.claims[1].Start; got != "1720-0" {
+		t.Errorf("курсор второго клейма = %q, хочу 1720-0 (перенос между проходами)", got)
 	}
 	if !sameAcks(fake.acks, []ackCall{
 		{StreamDNS, "dns", []string{"1718-0"}},

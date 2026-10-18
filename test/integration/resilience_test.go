@@ -294,7 +294,7 @@ func TestResilience_ProcessingAckAfterDB(t *testing.T) {
 	// Клейм возвращает зависшую запись (attempts = 2: первая доставка +
 	// клейм), повторная обработка завершает цикл.
 	time.Sleep(50 * time.Millisecond) // простой записи превысил MinIdle
-	claimed, err := reliab.Claim(ctx, queue.StreamDNS, group, "w2", 30*time.Millisecond, 10)
+	claimed, _, err := reliab.Claim(ctx, queue.StreamDNS, group, "w2", 30*time.Millisecond, 10, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestResilience_WorkerDiesMidBatch(t *testing.T) {
 
 	// Проход восстановления: XAUTOCLAIM возвращает остаток пачки.
 	time.Sleep(50 * time.Millisecond)
-	claimed, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 30*time.Millisecond, total)
+	claimed, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 30*time.Millisecond, total, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -473,7 +473,7 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 	// (доставка + клейм №1 = 2, №2 = 3 — последняя разрешённая).
 	for round, wantAttempts := range []int{2, 3} {
 		time.Sleep(30 * time.Millisecond)
-		claimed, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total)
+		claimed, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0")
 		if err != nil {
 			t.Fatalf("клейм №%d: %v", round+1, err)
 		}
@@ -493,7 +493,7 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 	// Клейм №3: счётчик 4 > MaxAttempts 3 — записи не возвращаются,
 	// а переводятся в q:dead и подтверждаются в исходном стриме.
 	time.Sleep(30 * time.Millisecond)
-	if claimed, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total); err != nil {
+	if claimed, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0"); err != nil {
 		t.Fatalf("клейм №3: %v", err)
 	} else if len(claimed) != 0 {
 		t.Fatalf("клейм №3 вернул работу %+v, хочу перевод в q:dead", claimed)

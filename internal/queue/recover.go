@@ -99,12 +99,16 @@ func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, D
 	// паттерном Processing (результат в БД → XACK). Возвращает размер
 	// пачки клейма для решения «дренаж или тик». Частичный сбой Claim
 	// (счётчик одной записи) не отменяет валидную часть — она
-	// обрабатывается, ошибка логируется.
+	// обрабатывается, ошибка логируется. Курсор обхода PEL переносится
+	// между проходами: большой PEL перечитывается страницами, а не с
+	// начала на каждом тике (Q-07).
+	cursor := "0-0"
 	claim := func() int {
-		claimed, err := r.Claim(ctx, o.Stream, o.Group, o.Consumer, 0, o.Batch)
+		claimed, next, err := r.Claim(ctx, o.Stream, o.Group, o.Consumer, 0, o.Batch, cursor)
 		if err != nil && ctx.Err() == nil {
 			log.Warn("возврат зависших доставок: клейм", "err", err)
 		}
+		cursor = next
 		for _, c := range claimed {
 			if ctx.Err() != nil {
 				return len(claimed)
