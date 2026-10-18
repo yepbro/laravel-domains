@@ -53,6 +53,10 @@ var (
 // connectRetryInterval — пауза между попытками подключиться.
 const connectRetryInterval = time.Second
 
+// sqlDriver — имя database/sql-драйвера для подключений раннера
+// (переменная для подмены в тестах путей ошибки).
+var sqlDriver = "pgx/v5"
+
 // advisoryLockKey — ключ pg_advisory_lock раннера. Сессионная блокировка
 // на выделенном соединении сериализует не только применение миграций
 // (это умеет и сам golang-migrate), но и инициализацию драйвера —
@@ -177,10 +181,18 @@ func newSource() (source.Driver, error) {
 // connectTimeout: на машине разработчика БД обычно уже healthy
 // (compose depends_on), вне compose старт может скрещиваться во времени.
 func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
-	db, err := sql.Open("pgx/v5", dsn)
+	db, err := sql.Open(sqlDriver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("миграции: разбор DSN: %w", err)
 	}
+	// На путях ошибки (таймаут, отмена) *sql.DB закрывается: иначе
+	// остаются фоновая opener-горутина и успевшие открыться соединения.
+	connected := false
+	defer func() {
+		if !connected {
+			_ = db.Close()
+		}
+	}()
 
 	deadline := time.Now().Add(connectTimeout)
 	for {
@@ -188,6 +200,7 @@ func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
 		err = db.PingContext(pingCtx)
 		cancel()
 		if err == nil {
+			connected = true
 			return db, nil
 		}
 		if time.Now().After(deadline) {
