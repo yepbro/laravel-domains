@@ -139,6 +139,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// с отменой ctx.
 	go func() { _ = content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger}) }()
 
+	// Фоновая компактификация паков (T-045, ТЗ 5.7): единственный
+	// механизм физического освобождения места и удаления мёртвых строк
+	// contents — без неё ErrStoreFull не снимается никогда. Цикл один на
+	// хранилище — здесь, рядом с DiskWatchLoop (проходам не нужен
+	// параллелизм; одновременный запуск во втором писателе формально
+	// допустим, но бесполезен). Завершается с отменой ctx.
+	go func() { _ = content.CompactLoop(ctx, store, content.CompactOptions{Log: logger}) }()
+
 	saver, err := httpworker.NewContentSaver(store, logger)
 	if err != nil {
 		return err
