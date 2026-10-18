@@ -123,23 +123,60 @@ func main() {
 	}
 }
 
+// Границы параметров «злых» обработчиков. Прямые пути доступны из общей
+// сети стенда (172.28.100.0/24): один запрос не должен заказывать
+// гигабайтную аллокацию (?rate=) или удерживать горутину сутками (?delay=).
+// Штатным сценариям хватает значений много ниже (512 байт/с, 30 с).
+const (
+	// tarpitMaxRate — верхняя планка скорости тарпита, байт/с.
+	tarpitMaxRate = 1 << 20
+	// slowMaxDelay — верхняя планка задержки /slow.
+	slowMaxDelay = 10 * time.Minute
+)
+
+// tarpitRate — скорость тарпита из ?rate=: по умолчанию 512 байт/с (ниже
+// минимальной скорости 2 КБ/с из основного ТЗ), сверху ограничена
+// tarpitMaxRate — буфер куска аллоцируется по значению из запроса.
+func tarpitRate(raw string) int {
+	rate, _ := strconv.Atoi(raw)
+	if rate <= 0 {
+		return 512
+	}
+	if rate > tarpitMaxRate {
+		return tarpitMaxRate
+	}
+	return rate
+}
+
+// slowDelay — задержка /slow из ?delay=: по умолчанию 30 с, сверху
+// ограничена slowMaxDelay.
+func slowDelay(raw string) time.Duration {
+	delay, _ := time.ParseDuration(raw)
+	if delay <= 0 {
+		return 30 * time.Second
+	}
+	if delay > slowMaxDelay {
+		return slowMaxDelay
+	}
+	return delay
+}
+
 func registerRoutes(mux *http.ServeMux) {
-	// Медленный ответ: ждёт delay, потом отвечает (проверка header timeout).
+	// Медленный ответ: ждёт delay (с учётом отключения клиента), потом
+	// отвечает (проверка header timeout).
 	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
-		delay, _ := time.ParseDuration(r.URL.Query().Get("delay"))
-		if delay <= 0 {
-			delay = 30 * time.Second
+		delay := slowDelay(r.URL.Query().Get("delay"))
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done(): // клиент ушёл — горутину не держим
+			return
 		}
-		time.Sleep(delay)
 		writePage(w, "slow", "наконец-то")
 	})
 
 	// Тарпит: отдаёт тело со скоростью rate байт/с, бесконечно.
 	mux.HandleFunc("/tarpit", func(w http.ResponseWriter, r *http.Request) {
-		rate, _ := strconv.Atoi(r.URL.Query().Get("rate"))
-		if rate <= 0 {
-			rate = 512 // ниже минимальной скорости 2 КБ/с из основного ТЗ
-		}
+		rate := tarpitRate(r.URL.Query().Get("rate"))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Content-Length", "1073741824")
 		w.WriteHeader(http.StatusOK)
