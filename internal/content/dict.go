@@ -110,7 +110,11 @@ func (d *Dict) Decompress(src []byte) ([]byte, error) {
 
 // Save записывает словарь в path атомарно (временный файл в том же
 // каталоге + rename): сервис, читающий файл при старте, не увидит
-// наполовину записанный словарь переобучения.
+// наполовину записанный словарь переобучения. Данные синхронизируются
+// до rename (Close записи на носитель не гарантирует), rename — запись
+// в каталоге, поэтому синхронизируется и каталог: иначе сбой питания
+// сразу после Save оставляет пустой/частичный словарь, а сервисы
+// отказываются стартовать на битом файле (T-043).
 func (d *Dict) Save(path string) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
@@ -123,6 +127,11 @@ func (d *Dict) Save(path string) error {
 		_ = os.Remove(name)
 		return fmt.Errorf("словарь: запись: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return fmt.Errorf("словарь: синхронизация: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(name)
 		return fmt.Errorf("словарь: запись: %w", err)
@@ -134,6 +143,12 @@ func (d *Dict) Save(path string) error {
 	if err := os.Rename(name, path); err != nil {
 		_ = os.Remove(name)
 		return fmt.Errorf("словарь: переименование: %w", err)
+	}
+	// Связь имени с файлом живёт в каталоге — best effort: сбой здесь
+	// редок, а словарь воспроизводим повторным обучением (train).
+	if dh, err := os.Open(dir); err == nil {
+		_ = dh.Sync()
+		_ = dh.Close()
 	}
 	return nil
 }
