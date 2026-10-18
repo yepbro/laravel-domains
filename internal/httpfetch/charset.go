@@ -10,13 +10,15 @@
 //     charset (первые 1024 байта) → детект (валидный UTF-8, частотная
 //     оценка кириллицы) → умолчание windows-1252 (WHATWG).
 //
-// Цепочка чтения тела: сеть → gunzip/brotli (потолок MaxBodyBytes) →
-// [лимит читаемого тела T-049] → потребитель; приведение к UTF-8 —
-// поверх прочитанных байтов через ToUTF8 (потребитель всё равно
-// буферизует тело для хэша дедупа и хранения, потоковая замена ридера
-// выигрыша не даёт, а двойного чтения — добавляет). Всё ниже по
-// конвейеру (лимит T-049, хэш, raw_len хранилища T-042) видит уже
-// несжатые байты — распакованный поток и есть тело ответа.
+// Цепочка чтения тела: сеть → распаковка Content-Encoding (одна
+// кодировка или составная «gzip, br» — цепочка слоёв RFC 9110,
+// потолок MaxBodyBytes на каждый слой, T-100) → [лимит читаемого тела
+// T-049] → потребитель; приведение к UTF-8 — поверх прочитанных байтов
+// через ToUTF8 (потребитель всё равно буферизует тело для хэша дедупа
+// и хранения, потоковая замена ридера выигрыша не даёт, а двойного
+// чтения — добавляет). Всё ниже по конвейеру (лимит T-049, хэш,
+// raw_len хранилища T-042) видит уже несжатые байты — распакованный
+// поток и есть тело ответа.
 package httpfetch
 
 import (
@@ -86,42 +88,104 @@ var ErrDecompressTooLarge = errors.New("httpfetch: распакованное т
 
 // --- сжатие: Accept-Encoding и распаковка с потолком ------------------------
 
+// parseContentCodings разбирает значение Content-Encoding в список
+// кодировок: RFC 9110 перечисляет их через запятую в порядке применения
+// сервером (первая — внутренний слой, последняя — внешний), регистр и
+// пробелы вокруг имён не значимы. Пустое значение — пустой список (нет
+// кодировки). Пустой элемент («gzip,,br», «gzip,») или кодировка вне
+// {gzip, x-gzip, br, deflate, identity} — ошибка: сломанному серверу
+// честный отказ, а не молчаливая выдача сжатых байтов телом.
+func parseContentCodings(contentEncoding string) ([]string, error) {
+	if strings.TrimSpace(contentEncoding) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(contentEncoding, ",")
+	codings := make([]string, 0, len(parts))
+	for _, part := range parts {
+		c := strings.ToLower(strings.TrimSpace(part))
+		switch c {
+		case "gzip", "x-gzip", "br", "deflate", "identity":
+			codings = append(codings, c)
+		default:
+			return nil, fmt.Errorf("httpfetch: неподдерживаемое Content-Encoding %q (ожидается gzip/br/deflate/identity)", contentEncoding)
+		}
+	}
+	return codings, nil
+}
+
+// identityOnlyContentEncoding — сводится ли значение Content-Encoding
+// к identity/пусто (одиночное «identity» или составное «identity,
+// identity»): тело не преобразовано, кодирующие заголовки остаются
+// правдивыми — снимать их (decodeResponseBody) не нужно.
+func identityOnlyContentEncoding(ce string) bool {
+	for _, part := range strings.Split(ce, ",") {
+		switch strings.ToLower(strings.TrimSpace(part)) {
+		case "", "identity":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // decodeContentEncoding оборачивает сжатое тело по значению
-// Content-Encoding (gzip, br, deflate, identity/пустое) читателем с
-// потолком распакованного размера limit (<= 0 — defaultDecompressLimit).
-// deflate краулер не рекламирует (Accept-Encoding: gzip, br), но часть
-// серверов отдаёт его незапрошенным — поток принимается оборонительно:
-// zlib-обёртка (RFC 1950) или сырой deflate (RFC 1951), форма различается
-// по заголовку. Составные кодировки («gzip, br») — ошибка: транспорт
-// их не запрашивает, сервер, приславший составное значение, сломан, и
-// молча отдать потребителю сжатые байты как тело — хуже честного
-// отказа. Возвращает читатель, закрывающий исходное тело.
+// Content-Encoding (gzip и алиас x-gzip, br, deflate, identity/пусто)
+// читателем с потолком распакованного размера limit (<= 0 —
+// defaultDecompressLimit). deflate краулер не рекламирует
+// (Accept-Encoding: gzip, br), но часть серверов отдаёт его
+// незапрошенным — поток принимается оборонительно: zlib-обёртка
+// (RFC 1950) или сырой deflate (RFC 1951), форма различается по
+// заголовку. Составные значения («gzip, br», T-100) распаковываются
+// цепочкой слоёв по RFC 9110: кодировки применяются сервером в порядке
+// перечисления, поэтому последняя в списке образует внешний слой, и
+// цепочка строится от неё к первой. Потолок limit — на каждый слой, а
+// не произведение: суммарная работа распаковки одного ответа ограничена
+// числом слоёв × (limit + decompressTailMargin) — каждый слой ограничен
+// как единственный, защита от бомб не слабеет. Классификация хвоста
+// (обрезка против ErrDecompressTooLarge) выполняется итоговым слоем по
+// последнему декодированному потоку — семантика однослойных кодировок
+// не меняется. Accept-Encoding составные значения по-прежнему не
+// рекламирует — значение приходит только от сломанного сервера и
+// обрабатывается оборонительно, как одиночный deflate. Возвращает
+// читатель, закрывающий исходное тело (цепочка Close каскадом до него).
 func decodeContentEncoding(rc io.ReadCloser, contentEncoding string, limit int64) (io.ReadCloser, error) {
 	if limit <= 0 {
 		limit = defaultDecompressLimit
 	}
-	switch ce := strings.ToLower(strings.TrimSpace(contentEncoding)); ce {
-	case "", "identity":
-		return rc, nil
-	case "gzip":
-		// gzip.NewReader читает заголовок немедленно: пустое сжатое
-		// тело возвращает io.EOF — это не ошибка, тело просто пустое.
-		gz, err := gzip.NewReader(rc)
-		if err == io.EOF {
-			return rc, nil
-		}
-		if err != nil {
-			return nil, fmt.Errorf("httpfetch: битый gzip-заголовок тела: %w", err)
-		}
-		return &decompressCap{dec: gz, src: rc, left: limit}, nil
-	case "br":
-		// brotli.NewReader заголовок валидирует лениво, при чтении.
-		return &decompressCap{dec: brotli.NewReader(rc), src: rc, left: limit}, nil
-	case "deflate":
-		return &decompressCap{dec: newDeflateReader(rc), src: rc, left: limit}, nil
-	default:
-		return nil, fmt.Errorf("httpfetch: неподдерживаемое Content-Encoding %q (ожидается gzip/br/deflate/identity)", contentEncoding)
+	codings, err := parseContentCodings(contentEncoding)
+	if err != nil {
+		return nil, err
 	}
+	// Строим от внешнего слоя (последняя кодировка) к внутреннему
+	// (первая): каждый читатель снимает один слой, decompressCap поверх
+	// ставит потолок limit. identity слоя не строит (пустая операция);
+	// цепочка из одних identity или пустой список возвращают тело как
+	// есть.
+	var cur = rc // io.ReadCloser — статический тип из параметра
+	for i := len(codings) - 1; i >= 0; i-- {
+		switch codings[i] {
+		case "identity":
+			continue
+		case "gzip", "x-gzip":
+			// gzip.NewReader читает заголовок немедленно: пустое сжатое
+			// тело возвращает io.EOF — это не ошибка, тело просто пустое
+			// (слой ниже уже отдал всё — возвращаем его как есть).
+			gz, err := gzip.NewReader(cur)
+			if err == io.EOF {
+				return cur, nil
+			}
+			if err != nil {
+				return nil, fmt.Errorf("httpfetch: битый gzip-заголовок тела: %w", err)
+			}
+			cur = &decompressCap{dec: gz, src: cur, left: limit}
+		case "br":
+			// brotli.NewReader заголовок валидирует лениво, при чтении.
+			cur = &decompressCap{dec: brotli.NewReader(cur), src: cur, left: limit}
+		case "deflate":
+			cur = &decompressCap{dec: newDeflateReader(cur), src: cur, left: limit}
+		}
+	}
+	return cur, nil
 }
 
 // newDeflateReader — читатель deflate-потока: zlib-обёртка (RFC 1950)
@@ -159,8 +223,11 @@ func looksLikeZlib(hdr []byte) bool {
 const decompressTailMargin = 64 << 10
 
 // decompressCap — распакованный поток с потолком (защита от zip-бомб).
-// Close закрывает исходное сжатое тело; отдельного Close у brotli-ридера
-// нет, а у gzip он не трогает источник — достаточно одного src.Close.
+// В составной упаковке (T-100) экземпляры стоят на каждый слой: src
+// тогда — decompressCap слоя ниже, Close каскадом доходит до тела
+// ответа, закрывая каждый слой ровно один раз. Отдельного Close у
+// brotli-ридера нет, а у gzip он не трогает источник — достаточно
+// одного src.Close.
 type decompressCap struct {
 	dec      io.Reader     // распакованный поток (gzip.Reader / brotli.Reader)
 	src      io.ReadCloser // сжатое тело ответа

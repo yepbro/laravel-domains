@@ -1,10 +1,11 @@
-// Тесты кодировок и сжатия (T-051, ТЗ 5.5). Два блока:
+// Тесты кодировок и сжатия (T-051, T-100, ТЗ 5.5). Два блока:
 //
 //   - ToUTF8: приоритеты определения (BOM → заголовок → meta → детект →
 //     умолчание), замена невалидных последовательностей, пустое тело;
-//   - сжатие: decodeContentEncoding (gzip/br/identity/битые значения,
-//     потолок против zip-бомб, закрытие источника) и сквозной путь
-//     Fetch/RoundTrip — Accept-Encoding доходит до сервера, тело
+//   - сжатие: decodeContentEncoding (gzip/br/deflate/identity, битые
+//     значения, составные значения — цепочка слоёв RFC 9110 с потолком
+//     на слой, потолок против zip-бомб, закрытие источника) и сквозной
+//     путь Fetch/RoundTrip — Accept-Encoding доходит до сервера, тело
 //     распаковывается, кодирующие заголовки снимаются, цепочка
 //     «сжатие + кодировка» работает вместе.
 
@@ -361,6 +362,7 @@ func TestDecodeContentEncoding(t *testing.T) {
 	}{
 		{"gzip", "gzip", func() []byte { return gzipBytes(t, plain) }},
 		{"gzip-регистр", " GZip ", func() []byte { return gzipBytes(t, plain) }},
+		{"x-gzip-алиас", "x-gzip", func() []byte { return gzipBytes(t, plain) }},
 		{"br", "br", func() []byte { return brotliBytes(t, plain) }},
 		{"deflate-zlib", "deflate", func() []byte { return zlibBytes(t, plain) }},
 		{"deflate-регистр", " Deflate ", func() []byte { return zlibBytes(t, plain) }},
@@ -380,14 +382,79 @@ func TestDecodeContentEncoding(t *testing.T) {
 	}
 }
 
-// TestDecodeContentEncodingUnsupported: составные значения и экзотика —
-// ошибка (краулер рекламирует только gzip и br; одиночный deflate
-// принимается оборонительно — незапрошенным его отдают часть серверов).
+// TestDecodeContentEncodingUnsupported: экзотика и битые составные
+// значения — ошибка (краулер рекламирует только gzip и br; одиночный
+// deflate и корректные составные значения принимаются оборонительно —
+// незапрошенно их присылает сломанный сервер, пустой или неизвестный
+// элемент в составе разобрать нельзя).
 func TestDecodeContentEncodingUnsupported(t *testing.T) {
-	for _, ce := range []string{"compress", "gzip, br", "zstd", "br, gzip"} {
+	for _, ce := range []string{
+		"compress", "zstd", "*", "gzip, zstd", "zstd, gzip",
+		"gzip,,br", "gzip,", ",br", "br,,",
+	} {
 		if _, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(nil)), ce, 0); err == nil {
 			t.Errorf("Content-Encoding %q: ожидалась ошибка", ce)
 		}
+	}
+}
+
+// TestDecodeContentEncodingLayered: составные Content-Encoding (T-100,
+// остаток H-10) — цепочка распаковки в порядке RFC 9110: кодировки
+// применяются сервером в порядке перечисления, последняя в списке
+// образует внешний слой («gzip, br» = сервер сжал gzip, затем поверх
+// br — тело br(gzip(data))). identity в составе — пустая операция,
+// слоя не строит; потолок на каждый слой обычные тела не режет.
+func TestDecodeContentEncodingLayered(t *testing.T) {
+	plain := []byte(ruSample)
+	for _, tc := range []struct {
+		name string
+		enc  string
+		body []byte
+	}{
+		{"gzip-затем-br", "gzip, br", brotliBytes(t, gzipBytes(t, plain))},
+		{"br-затем-gzip", "br, gzip", gzipBytes(t, brotliBytes(t, plain))},
+		{"gzip-в-gzip", "gzip, gzip", gzipBytes(t, gzipBytes(t, plain))},
+		{"deflate-внешний", "gzip, deflate", zlibBytes(t, gzipBytes(t, plain))},
+		{"deflate-внешний-сырой", "br, deflate", flateRawBytes(t, brotliBytes(t, plain))},
+		{"deflate-внутренний", "deflate, gzip", gzipBytes(t, zlibBytes(t, plain))},
+		{"identity-в-середине", "gzip, identity, br", brotliBytes(t, gzipBytes(t, plain))},
+		{"identity-внутри", "identity, gzip", gzipBytes(t, plain)},
+		{"x-gzip-в-составе", "x-gzip, br", brotliBytes(t, gzipBytes(t, plain))},
+		{"регистр-и-пробелы", " GZip , BR ", brotliBytes(t, gzipBytes(t, plain))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(tc.body)), tc.enc, 0)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			b, err := io.ReadAll(got)
+			if err != nil || !bytes.Equal(b, plain) {
+				t.Errorf("%s: длина=%d err=%v", tc.name, len(b), err)
+			}
+			_ = got.Close()
+		})
+	}
+}
+
+// TestDecodeContentEncodingLayeredBomb: сжатое-в-сжатом сверх потолка —
+// ErrDecompressTooLarge, байты до потолка доступны (контракт T-051
+// сохраняется в цепочке: итоговый слой останавливается на
+// limit + decompressTailMargin, промежуточные слои ограничены тем же
+// потолком на слой — суммарная защита от бомб не слабеет).
+func TestDecodeContentEncodingLayeredBomb(t *testing.T) {
+	bomb := bytes.Repeat([]byte("A"), 1<<20)
+	got, err := decodeContentEncoding(
+		io.NopCloser(bytes.NewReader(brotliBytes(t, gzipBytes(t, bomb)))), "gzip, br", 4096)
+	if err != nil {
+		t.Fatalf("обёртка бомбы: %v", err)
+	}
+	defer func() { _ = got.Close() }()
+	b, err := io.ReadAll(got)
+	if !errors.Is(err, ErrDecompressTooLarge) {
+		t.Fatalf("ожидался ErrDecompressTooLarge, получено err=%v (прочитано %d)", err, len(b))
+	}
+	if len(b) != 4096 {
+		t.Errorf("до потолка должно читаться ровно 4096, прочитано %d", len(b))
 	}
 }
 
@@ -635,6 +702,61 @@ func TestFetchIdentityKeepsHeaders(t *testing.T) {
 	}
 }
 
+// TestFetchMultiLineContentEncoding: списочный Content-Encoding,
+// разнесённый на несколько строк (RFC 9110 §5.3 — эквивалент списка
+// через запятую), собирается в одно значение: «gzip» + «br» двумя
+// строками читается как составная упаковка (Get взял бы только первую
+// строку и споткнулся о заголовок второго слоя; P2 ревью T-100).
+func TestFetchMultiLineContentEncoding(t *testing.T) {
+	plain := "<html><body>" + ruSample + "</body></html>"
+	body := brotliBytes(t, gzipBytes(t, []byte(plain)))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Content-Encoding", "gzip")
+		w.Header().Add("Content-Encoding", "br")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	f := NewFetcher(Options{})
+	res := fetchFrom(t, f, srv.URL)
+	defer func() { _ = res.Body.Close() }()
+
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("чтение: %v", err)
+	}
+	if string(b) != plain {
+		t.Errorf("тело: %q", b)
+	}
+	if v := res.Header.Get("Content-Encoding"); v != "" {
+		t.Errorf("Content-Encoding не снят: %q", v)
+	}
+}
+
+// TestFetchIdentityCompositeKeepsHeaders: составное значение из одних
+// identity не преобразует тело — кодирующие заголовки остаются правдой
+// и не снимаются (как у одиночного identity; P3 ревью T-100).
+func TestFetchIdentityCompositeKeepsHeaders(t *testing.T) {
+	body := []byte("plain-identity")
+	srv, _ := encodingServer(t, body, map[string]string{
+		"Content-Encoding": "identity, identity",
+		"Content-Type":     "text/plain",
+		"Content-Length":   strconv.Itoa(len(body)),
+	})
+	f := NewFetcher(Options{})
+	res := fetchFrom(t, f, srv.URL)
+	defer func() { _ = res.Body.Close() }()
+	b, _ := io.ReadAll(res.Body)
+	if !bytes.Equal(b, body) {
+		t.Errorf("тело: %q", b)
+	}
+	if v := res.Header.Get("Content-Encoding"); v != "identity, identity" {
+		t.Errorf("Content-Encoding искажён: %q", v)
+	}
+	if v := res.Header.Get("Content-Length"); v != strconv.Itoa(len(body)) {
+		t.Errorf("Content-Length искажён: %q", v)
+	}
+}
+
 // TestFetchGzipEmptyBody: Content-Encoding: gzip с пустым телом — не
 // ошибка (gzip.NewReader вернёт EOF), читается пустота.
 func TestFetchGzipEmptyBody(t *testing.T) {
@@ -722,6 +844,33 @@ func TestFetchGzipBomb(t *testing.T) {
 	}
 }
 
+// runBodyLimitCase — общий прогон кейса «тело vs лимит» (encodingServer
+// + Fetch + проверки обрезки): используется однослойным gzip и составной
+// упаковкой (T-100) — семантика обрезки едина, классификация хвоста идёт
+// по итоговому декодированному потоку.
+func runBodyLimitCase(t *testing.T, ce string, wrap func([]byte) []byte, size, limit int, wantTrunc bool) {
+	t.Helper()
+	srv, _ := encodingServer(t, wrap(bytes.Repeat([]byte("z"), size)), map[string]string{
+		"Content-Encoding": ce,
+	})
+	f := NewFetcher(Options{
+		MaxBodyBytes: int64(limit),
+		Limits:       &LimitOptions{MaxBodyBytes: int64(limit)},
+	})
+	res := fetchFrom(t, f, srv.URL)
+	defer func() { _ = res.Body.Close() }()
+	b, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		t.Fatalf("обрезка — не ошибка чтения: %v", readErr)
+	}
+	if len(b) != min(size, limit) {
+		t.Errorf("прочитано %d байт, ожидалось %d", len(b), min(size, limit))
+	}
+	if res.BodyLimiter == nil || !res.BodyLimiter.Truncated() == wantTrunc {
+		t.Errorf("признак обрезки: %v, ожидался %v", res.BodyLimiter.Truncated(), wantTrunc)
+	}
+}
+
 // TestFetchGzipJustOverLimit: сжатое тело чуть больше лимита ведёт себя
 // как несжатое сверх лимита (TestFetchBodyLimitExactAndTruncated в
 // limits_test.go): обрезка по лимиту с Truncated и чтение без ошибки
@@ -732,25 +881,24 @@ func TestFetchGzipBomb(t *testing.T) {
 func TestFetchGzipJustOverLimit(t *testing.T) {
 	run := func(t *testing.T, size, limit int, wantTrunc bool) {
 		t.Helper()
-		srv, _ := encodingServer(t, gzipBytes(t, bytes.Repeat([]byte("z"), size)), map[string]string{
-			"Content-Encoding": "gzip",
-		})
-		f := NewFetcher(Options{
-			MaxBodyBytes: int64(limit),
-			Limits:       &LimitOptions{MaxBodyBytes: int64(limit)},
-		})
-		res := fetchFrom(t, f, srv.URL)
-		defer func() { _ = res.Body.Close() }()
-		b, readErr := io.ReadAll(res.Body)
-		if readErr != nil {
-			t.Fatalf("обрезка — не ошибка чтения: %v", readErr)
-		}
-		if len(b) != min(size, limit) {
-			t.Errorf("прочитано %d байт, ожидалось %d", len(b), min(size, limit))
-		}
-		if res.BodyLimiter == nil || !res.BodyLimiter.Truncated() == wantTrunc {
-			t.Errorf("признак обрезки: %v, ожидался %v", res.BodyLimiter.Truncated(), wantTrunc)
-		}
+		runBodyLimitCase(t, "gzip", func(b []byte) []byte { return gzipBytes(t, b) }, size, limit, wantTrunc)
+	}
+	t.Run("ровно в лимит", func(t *testing.T) { run(t, 1000, 1000, false) })
+	t.Run("на байт больше", func(t *testing.T) { run(t, 1001, 1000, true) })
+	t.Run("заметно больше", func(t *testing.T) { run(t, 64<<10, 1000, true) })
+}
+
+// TestFetchLayeredJustOverLimit: составная упаковка «чуть больше
+// лимита» — как однослойная (TestFetchGzipJustOverLimit): обрезка с
+// Truncated и чтение без ошибки; классификация хвоста проходит по
+// итоговому (последнему декодированному) потоку — семантика H-2 не
+// меняется от числа слоёв.
+func TestFetchLayeredJustOverLimit(t *testing.T) {
+	run := func(t *testing.T, size, limit int, wantTrunc bool) {
+		t.Helper()
+		runBodyLimitCase(t, "gzip, br", func(b []byte) []byte {
+			return brotliBytes(t, gzipBytes(t, b))
+		}, size, limit, wantTrunc)
 	}
 	t.Run("ровно в лимит", func(t *testing.T) { run(t, 1000, 1000, false) })
 	t.Run("на байт больше", func(t *testing.T) { run(t, 1001, 1000, true) })
@@ -767,6 +915,65 @@ func TestFetchGzipBombUnderLimiter(t *testing.T) {
 	bomb := bytes.Repeat([]byte("A"), 1<<20)
 	srv, _ := encodingServer(t, gzipBytes(t, bomb), map[string]string{
 		"Content-Encoding": "gzip",
+	})
+	const limit = 64 << 10
+	f := NewFetcher(Options{
+		MaxBodyBytes: limit,
+		Limits:       &LimitOptions{MaxBodyBytes: limit},
+	})
+	res := fetchFrom(t, f, srv.URL)
+	defer func() { _ = res.Body.Close() }()
+	b, readErr := io.ReadAll(res.Body)
+	if !errors.Is(readErr, ErrDecompressTooLarge) {
+		t.Fatalf("бомба = %v, want ErrDecompressTooLarge (T-051)", readErr)
+	}
+	if len(b) != limit {
+		t.Errorf("прочитано %d байт, ожидался лимит %d", len(b), limit)
+	}
+}
+
+// TestFetchLayeredRoundtrip: составное Content-Encoding сквозным путём —
+// тело распаковывается цепочкой слоёв (RFC 9110: последняя кодировка в
+// списке — внешний слой), кодирующие заголовки сняты; Accept-Encoding
+// по-прежнему рекламирует только gzip и br — составные значения не
+// запрашиваем, их присылает сломанный сервер.
+func TestFetchLayeredRoundtrip(t *testing.T) {
+	plain := "<html><body>" + ruSample + "</body></html>"
+	body := brotliBytes(t, gzipBytes(t, []byte(plain))) // «gzip, br»
+	srv, ae := encodingServer(t, body, map[string]string{
+		"Content-Encoding": "gzip, br",
+		"Content-Type":     "text/html",
+	})
+	f := NewFetcher(Options{})
+	res := fetchFrom(t, f, srv.URL)
+	defer func() { _ = res.Body.Close() }()
+
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("чтение: %v", err)
+	}
+	if string(b) != plain {
+		t.Errorf("тело: %q", b)
+	}
+	if v := res.Header.Get("Content-Encoding"); v != "" {
+		t.Errorf("Content-Encoding не снят: %q", v)
+	}
+	if v := res.Header.Get("Content-Length"); v != "" {
+		t.Errorf("Content-Length не снят: %q", v)
+	}
+	if ae.Get() != acceptEncoding {
+		t.Errorf("Accept-Encoding: %q, ожидался %q (составные не рекламируем)", ae.Get(), acceptEncoding)
+	}
+}
+
+// TestFetchLayeredBombUnderLimiter: бомба в составной упаковке при
+// включённых лимитах T-049 — ErrDecompressTooLarge, тело до лимита
+// доступно (контракт T-051 не зависит от числа слоёв: потолок на
+// каждый слой один и тот же bodyCeiling).
+func TestFetchLayeredBombUnderLimiter(t *testing.T) {
+	bomb := bytes.Repeat([]byte("A"), 1<<20)
+	srv, _ := encodingServer(t, brotliBytes(t, gzipBytes(t, bomb)), map[string]string{
+		"Content-Encoding": "gzip, br",
 	})
 	const limit = 64 << 10
 	f := NewFetcher(Options{
