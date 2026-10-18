@@ -315,7 +315,10 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
   задерживает DNS/HTTP-этапы.
 - хосты редиректов резолвятся «через тот же резолвер» (ТЗ 5.5 п. 2):
   `dnsclient` с лимитами T-035 → адаптер `httpworker.NewDNSLookup` →
-  кэш `CachingResolver` (T-047); TLS — `InsecureSkipVerify` с сохранением
+  кэш `CachingResolver` (T-047); A и AAAA опрашиваются параллельно с
+  общим ctx — латентность резолва max(A, AAAA), не сумма, сбой/отказ
+  одного типа не роняет резолв при живом другом, итог стабилен:
+  адреса A, затем AAAA (T-101); TLS — `InsecureSkipVerify` с сохранением
   атрибутов сертификата (`TLSInfo`, T-050).
 
 `render-worker` (этап 6, T-067): его `OnRun` поднимает менеджер

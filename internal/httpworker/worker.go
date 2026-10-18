@@ -1115,14 +1115,20 @@ func NewDNSLookup(resolve dnsclient.Resolver, ipv6 bool) *DNSLookup {
 }
 
 // LookupNetIP резолвит хост для подключения (httpfetch.Resolver): A, при
-// ipv6 — и AAAA; IP-литералы (Location вида http://192.0.2.1/) проходят
-// без обмена. CNAME разворачивает сам рекурсор (unbound, ТЗ 5.4) — в
-// ответе на A лежат и записи цели (RFC 1034 §4.3.2, T-037). Отрицание
-// (NXDOMAIN) и пустой ответ — ошибка: подключаться не к чему. Сбой или
-// отказ одного типа не роняет резолв, если другой дал адреса:
-// транзиентный отказ AAAA не должен ломать подключение по рабочему A
-// (NODATA — не здесь: NOERROR без записей просто ничего не добавляет);
-// собранного нет вовсе — возвращается первая ошибка обмена.
+// ipv6 — и AAAA, опрос типов ОДНОВРЕМЕННЫЙ (T-101: резолв хоста
+// редиректа сидит в критическом пути подключения цепочки T-048 —
+// латентность max(A, AAAA), не сумма); IP-литералы (Location вида
+// http://192.0.2.1/) проходят без обмена. CNAME разворачивает сам
+// рекурсор (unbound, ТЗ 5.4) — в ответе на A лежат и записи цели
+// (RFC 1034 §4.3.2, T-037). Отрицание (NXDOMAIN) и пустой ответ —
+// ошибка: подключаться не к чему. Сбой или отказ одного типа не роняет
+// резолв, если другой дал адреса: транзиентный отказ AAAA не должен
+// ломать подключение по рабочему A (NODATA — не здесь: NOERROR без
+// записей просто ничего не добавляет); собранного нет вовсе —
+// возвращается первая по порядку типов ошибка обмена (A раньше AAAA —
+// детерминизм выбора, как при прежнем последовательном опросе).
+// Отмена ctx — общая для обоих обменов: Exchange получает тот же ctx,
+// отменённый резолв возвращается его ошибкой.
 func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return []netip.Addr{ip}, nil
@@ -1131,36 +1137,39 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 	if d.ipv6 {
 		types = append(types, dns.TypeAAAA)
 	}
+	// Обмены идут параллельно с общим ctx, но собираются по порядку
+	// types — итог стабилен: адреса A, за ними AAAA, независимо от того,
+	// какой тип ответил раньше (транспорт T-047 видит тот же порядок,
+	// что и при последовательном опросе). Горутины пишут в разные
+	// ячейки answers — гонки нет; WaitGroup, а не errgroup: ошибки
+	// типов не отменяют соседа (семантика HW-07), ошибка — не сигнал.
+	answers := make([]workerDNSAnswer, len(types))
+	if len(types) == 1 {
+		// dns.ipv6=false — один обмен, без горутин: параллелить нечего.
+		answers[0] = d.lookupType(ctx, host, types[0])
+	} else {
+		var wg sync.WaitGroup
+		for i, t := range types {
+			wg.Add(1)
+			go func(i int, t uint16) {
+				defer wg.Done()
+				answers[i] = d.lookupType(ctx, host, t)
+			}(i, t)
+		}
+		wg.Wait()
+	}
 	var (
 		out      []netip.Addr
-		firstErr error // первая ошибка обмена/отказа — итог, если адресов нет
+		firstErr error // первая по порядку типов ошибка — итог, если адресов нет
 	)
-	for _, t := range types {
-		res, err := d.resolve.Exchange(ctx, dnsclient.Question{Name: host, Type: t})
-		switch {
-		case err != nil:
-			err = fmt.Errorf("httpworker: резолв %q %s: %w", host, dns.TypeToString[t], err)
-		case res.RCode != dnsclient.RCodeNOERROR:
-			err = fmt.Errorf("httpworker: резолв %q %s: %s", host, dns.TypeToString[t], res.RCode.String())
-		}
-		if err != nil {
+	for i := range answers {
+		if answers[i].err != nil {
 			if firstErr == nil {
-				firstErr = err
+				firstErr = answers[i].err
 			}
 			continue // другой тип ещё может дать адреса
 		}
-		for _, rr := range res.RecordsOf(t) {
-			switch r := rr.(type) {
-			case *dns.A:
-				if addr, ok := netip.AddrFromSlice(r.A.To4()); ok {
-					out = append(out, addr)
-				}
-			case *dns.AAAA:
-				if addr, ok := netip.AddrFromSlice(r.AAAA.To16()); ok {
-					out = append(out, addr.Unmap())
-				}
-			}
-		}
+		out = append(out, answers[i].addrs...)
 	}
 	if len(out) == 0 {
 		if firstErr != nil {
@@ -1169,4 +1178,37 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 		return nil, fmt.Errorf("httpworker: резолв %q: пустой ответ", host)
 	}
 	return out, nil
+}
+
+// workerDNSAnswer — итог одного обмена A/AAAA: адреса этого типа или
+// ошибка (сбой обмена, отказ RCode); пустые адреса без ошибки — NOERROR
+// без записей (NODATA), резолву они ничего не добавляют.
+type workerDNSAnswer struct {
+	addrs []netip.Addr
+	err   error
+}
+
+// lookupType — один обмен по типу записи (общий ctx с соседним типом).
+func (d *DNSLookup) lookupType(ctx context.Context, host string, t uint16) workerDNSAnswer {
+	res, err := d.resolve.Exchange(ctx, dnsclient.Question{Name: host, Type: t})
+	switch {
+	case err != nil:
+		return workerDNSAnswer{err: fmt.Errorf("httpworker: резолв %q %s: %w", host, dns.TypeToString[t], err)}
+	case res.RCode != dnsclient.RCodeNOERROR:
+		return workerDNSAnswer{err: fmt.Errorf("httpworker: резолв %q %s: %s", host, dns.TypeToString[t], res.RCode.String())}
+	}
+	var addrs []netip.Addr
+	for _, rr := range res.RecordsOf(t) {
+		switch r := rr.(type) {
+		case *dns.A:
+			if addr, ok := netip.AddrFromSlice(r.A.To4()); ok {
+				addrs = append(addrs, addr)
+			}
+		case *dns.AAAA:
+			if addr, ok := netip.AddrFromSlice(r.AAAA.To16()); ok {
+				addrs = append(addrs, addr.Unmap())
+			}
+		}
+	}
+	return workerDNSAnswer{addrs: addrs}
 }

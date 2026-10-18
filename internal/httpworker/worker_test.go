@@ -1150,6 +1150,89 @@ func (d *workerFakeDNS) asked() []uint16 {
 	return append([]uint16(nil), d.asks...)
 }
 
+// workerSlowDNS — резолвер с задержкой ответа по типам (T-101): обмен
+// A/AAAA «едёт» aDelay/aaaaDelay, моменты входа/выхода каждого обмена
+// записываются — по перекрытию интервалов тест доказывает параллельность
+// опроса без точной зависимости от общего времени. Сон — вне мьютекса:
+// параллельные горутины не сериализуются замком.
+type workerSlowDNS struct {
+	mu                sync.Mutex
+	entered, exited   map[uint16]time.Time
+	aDelay, aaaaDelay time.Duration
+	a, aaaa           []netip.Addr
+}
+
+func (d *workerSlowDNS) Exchange(ctx context.Context, q dnsclient.Question) (*dnsclient.Result, error) {
+	delay := d.aDelay
+	addrs := d.a
+	if q.Type == dns.TypeAAAA {
+		delay = d.aaaaDelay
+		addrs = d.aaaa
+	}
+	enter := time.Now()
+	if err := sleepCtx(ctx, delay); err != nil {
+		return nil, err
+	}
+	exit := time.Now()
+	d.mu.Lock()
+	if d.entered == nil {
+		d.entered = make(map[uint16]time.Time)
+		d.exited = make(map[uint16]time.Time)
+	}
+	d.entered[q.Type] = enter
+	d.exited[q.Type] = exit
+	d.mu.Unlock()
+	res := &dnsclient.Result{RCode: dnsclient.RCodeNOERROR}
+	for _, a := range addrs {
+		if q.Type == dns.TypeA {
+			res.Answer = append(res.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: q.Name + ".", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+				A:   a.AsSlice(),
+			})
+		} else {
+			res.Answer = append(res.Answer, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: q.Name + ".", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+				AAAA: a.AsSlice(),
+			})
+		}
+	}
+	return res, nil
+}
+
+// workerBlockDNS — резолвер, не отвечающий до отмены ctx (тест отмены
+// T-101): оба параллельных обмена обязаны вернуться ошибкой контекста,
+// а не ждать таймауты резолвера.
+type workerBlockDNS struct {
+	mu   sync.Mutex
+	asks int
+}
+
+func (d *workerBlockDNS) Exchange(ctx context.Context, q dnsclient.Question) (*dnsclient.Result, error) {
+	d.mu.Lock()
+	d.asks++
+	d.mu.Unlock()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (d *workerBlockDNS) asked() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.asks
+}
+
+// sleepCtx — сон с выходом по отмене ctx (хелпер сценарных резолверов).
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 func TestWorkerDNSLookup(t *testing.T) {
 	t.Run("A и AAAA при ipv6", func(t *testing.T) {
 		d := &workerFakeDNS{
@@ -1161,10 +1244,14 @@ func TestWorkerDNSLookup(t *testing.T) {
 			t.Fatalf("LookupNetIP: %v", err)
 		}
 		if len(got) != 2 || got[0].String() != "192.0.2.10" || got[1].String() != "2001:db8::1" {
-			t.Errorf("адреса: %v", got)
+			t.Errorf("адреса: %v (порядок стабилен: A, затем AAAA — T-101)", got)
 		}
-		if asked := d.asked(); len(asked) != 2 || asked[0] != dns.TypeA || asked[1] != dns.TypeAAAA {
-			t.Errorf("вопросы: %v", asked)
+		// Опрос параллельный (T-101): порядок прибытия вопросов к
+		// резолверу недетерминирован — проверяются оба типа как
+		// множество, а не последовательность (два разных из двух
+		// возможных = ровно A и AAAA).
+		if asked := d.asked(); len(asked) != 2 || asked[0] == asked[1] {
+			t.Errorf("вопросы: %v (ожидались A и AAAA в любом порядке)", asked)
 		}
 	})
 	t.Run("только A без ipv6", func(t *testing.T) {
@@ -1254,6 +1341,86 @@ func TestWorkerDNSLookup(t *testing.T) {
 		d := &workerFakeDNS{err: errors.New("сеть")}
 		if _, err := NewDNSLookup(d, false).LookupNetIP(context.Background(), "down.example"); err == nil {
 			t.Error("сбой резолвера принят как успех")
+		}
+	})
+	t.Run("отказ обоих — первая по порядку типов ошибка (A)", func(t *testing.T) {
+		d := &workerFakeDNS{
+			aErr:    errors.New("a-servfail"),
+			aaaaErr: errors.New("aaaa-servfail"),
+		}
+		_, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "both-down.example")
+		if err == nil {
+			t.Fatal("резолв без единого ответа прошёл как успех")
+		}
+		if !strings.Contains(err.Error(), "a-servfail") {
+			t.Errorf("ошибка: %v (детерминизм T-101 — ошибка A, ранняя по порядку типов, а не прибывшая первой)", err)
+		}
+	})
+	t.Run("параллельный опрос — латентность max, не сумма", func(t *testing.T) {
+		// Медленный A + быстрый AAAA: при последовательном опросе
+		// интервалы обменов не пересекаются и сумма задержек съедается
+		// целиком; параллельный — обмены перекрываются, общее время ≈
+		// времени медленного типа. Перекрытие проверяется по moments
+		// входа/выхода (сна вне мьютекса фейка), а не по общему времени
+		// — момент надёжнее замера.
+		const (
+			aDelay    = 180 * time.Millisecond
+			aaaaDelay = 40 * time.Millisecond
+		)
+		d := &workerSlowDNS{
+			aDelay:    aDelay,
+			aaaaDelay: aaaaDelay,
+			a:         []netip.Addr{workerAddr(t, "192.0.2.20")},
+			aaaa:      []netip.Addr{workerAddr(t, "2001:db8::20")},
+		}
+		start := time.Now()
+		got, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "slow-a.example")
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("LookupNetIP: %v", err)
+		}
+		// Порядок итога стабилен независимо от завершения: A первым,
+		// хоть он и отвечал дольше.
+		if len(got) != 2 || got[0].String() != "192.0.2.20" || got[1].String() != "2001:db8::20" {
+			t.Errorf("адреса: %v (порядок A, затем AAAA — как при последовательном опросе)", got)
+		}
+		// AAAA спросили, пока A ещё был в полёте — обмены параллельны.
+		if !(d.entered[dns.TypeAAAA].Before(d.exited[dns.TypeA])) {
+			t.Errorf("обмены не перекрываются: A [%v..%v], AAAA [%v..%v] — опрос последовательный",
+				d.entered[dns.TypeA], d.exited[dns.TypeA], d.entered[dns.TypeAAAA], d.exited[dns.TypeAAAA])
+		}
+		// Общее время ≈ max(A, AAAA), не сумма: не быстрее медленного
+		// типа (он обязан завершиться) и с запасом ниже суммы.
+		if elapsed < aDelay {
+			t.Errorf("время %v < задержки медленного типа %v — быстрый ответ не ждёт медленного соседа... или фейка", elapsed, aDelay)
+		}
+		if sum := aDelay + aaaaDelay; elapsed >= sum {
+			t.Errorf("время %v ≥ суммы задержек %v — опрос последовательный", elapsed, sum)
+		}
+	})
+	t.Run("отмена ctx — оба обмена отменяются", func(t *testing.T) {
+		d := &workerBlockDNS{}
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(60 * time.Millisecond)
+			cancel()
+		}()
+		start := time.Now()
+		_, err := NewDNSLookup(d, true).LookupNetIP(ctx, "block.example")
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("отменённый резолв прошёл как успех")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("ошибка: %v (ожидалась отмена ctx, завёрнутая в сбой обмена)", err)
+		}
+		if n := d.asked(); n != 2 {
+			t.Errorf("обменов %d — опрошены оба типа с общим ctx", n)
+		}
+		// Возврат — по отмене, а не по чужому таймауту: с запасом ниже
+		// секунды против секунд таймаутов dnsclient (T-035).
+		if elapsed > time.Second {
+			t.Errorf("время %v — резолв не отменился сразу", elapsed)
 		}
 	})
 }
