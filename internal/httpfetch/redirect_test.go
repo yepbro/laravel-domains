@@ -1031,10 +1031,12 @@ func TestFetchChainBudget(t *testing.T) {
 	})
 
 	t.Run("бюджет копится по хопам", func(t *testing.T) {
-		// Каждый хоп укладывается в свои таймауты (200 мс < 5 с), но
-		// три хопа не влезают в бюджет 500 мс: третий не начинается.
+		// Каждый хоп укладывается в свои таймауты (400 мс < 5 с), но
+		// три хопа не влезают в бюджет 1 с: третий прерывается на
+		// середине. Поля допуска по 200 мс в обе стороны — устойчиво
+		// к джиттеру под нагрузкой прогона.
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(400 * time.Millisecond)
 			w.Header().Set("Location", r.URL.Path+"x")
 			w.WriteHeader(http.StatusFound)
 		}))
@@ -1043,7 +1045,7 @@ func TestFetchChainBudget(t *testing.T) {
 		f := NewFetcher(Options{HeaderTimeout: 5 * time.Second, TotalTimeout: 5 * time.Second})
 		got, err := FetchChainOpts(context.Background(), f, FetchRequest{
 			URL: redirectReqURL(srv.URL, "slowchain.example.net", "/a"), Addrs: loopbackAddr(),
-		}, ChainOptions{MaxRedirects: 5, TotalTimeout: 500 * time.Millisecond})
+		}, ChainOptions{MaxRedirects: 3, TotalTimeout: 1 * time.Second})
 		if err == nil || !IsTimeout(err) {
 			t.Fatalf("ожидался таймаут бюджета цепочки, получено: %v", err)
 		}
