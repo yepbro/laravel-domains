@@ -78,17 +78,33 @@ func TestMessageWireFormat(t *testing.T) {
 			`{"task_id":"t4","zone_id":3,"domain_id":42,"subdomain_id":0,"variant":0}`,
 		},
 		{
-			"q:dead",
+			"q:dead пачки",
 			Dead{
 				TaskID:   "t1",
 				Stream:   StreamDNS,
 				EntryID:  "1718-0",
 				Attempts: 3,
-				Reason:   "dns-worker: write result: timeout",
-				Payload:  json.RawMessage(`{"task_id":"t1","domains":[]}`),
+				Reason:   "исчерпан лимит попыток 3: доставок без подтверждения — 4",
+				Domains:  5000,
 			},
 			`{"task_id":"t1","stream":"q:dns","entry_id":"1718-0","attempts":3,` +
-				`"reason":"dns-worker: write result: timeout","payload":{"task_id":"t1","domains":[]}}`,
+				`"reason":"исчерпан лимит попыток 3: доставок без подтверждения — 4","domains":5000}`,
+		},
+		{
+			"q:dead штучной задачи",
+			Dead{
+				TaskID:      "t2",
+				Stream:      StreamRender,
+				EntryID:     "1719-0",
+				Attempts:    4,
+				ZoneID:      3,
+				DomainID:    42,
+				SubdomainID: 1,
+				Variant:     model.VariantHTTP,
+				Name:        "www.example.com",
+			},
+			`{"task_id":"t2","stream":"q:render","entry_id":"1719-0","attempts":4,` +
+				`"zone_id":3,"domain_id":42,"subdomain_id":1,"variant":1,"name":"www.example.com"}`,
 		},
 	}
 	for _, c := range cases {
@@ -124,7 +140,7 @@ func TestMessageRoundtrip(t *testing.T) {
 	result := Result{TaskID: "rt3", ZoneID: 7, DomainID: 1000000, SubdomainID: 2, Variant: model.VariantMain, Name: "xn--e1afmkfd.xn--p1ai"}
 	dead := Dead{
 		TaskID: "rt4", Stream: StreamHTTP, EntryID: "1-1", Attempts: 2,
-		Payload: json.RawMessage(`{"task_id":"rt4"}`),
+		ZoneID: 7, DomainID: 1000000, Name: "xn--e1afmkfd.xn--p1ai",
 	}
 
 	cases := []struct {
@@ -283,11 +299,25 @@ func TestDecodeBadData(t *testing.T) {
 			func(d Delivery) error { _, err := Decode[Result](d); return err },
 		},
 		{
-			"attempts 0", StreamDead, `{"task_id":"t1","stream":"q:dns","entry_id":"1-0","attempts":0,"payload":{}}`, "attempts",
+			"attempts 0", StreamDead, `{"task_id":"t1","stream":"q:dns","entry_id":"1-0","attempts":0,"domains":5}`, "attempts",
 			func(d Delivery) error { _, err := Decode[Dead](d); return err },
 		},
 		{
-			"пустой payload", StreamDead, `{"task_id":"t1","stream":"q:dns","entry_id":"1-0","attempts":1}`, "payload",
+			"кривой вариант", StreamDead, `{"task_id":"t1","stream":"q:render","entry_id":"1-0","attempts":1,"variant":7}`, "вариант",
+			func(d Delivery) error { _, err := Decode[Dead](d); return err },
+		},
+		{
+			"имя длиннее 253", StreamDead,
+			`{"task_id":"t1","stream":"q:http","entry_id":"1-0","attempts":1,"name":"` + strings.Repeat("a", 254) + `"}`, "имя длиннее",
+			func(d Delivery) error { _, err := Decode[Dead](d); return err },
+		},
+		{
+			"отрицательный размер пачки", StreamDead, `{"task_id":"t1","stream":"q:dns","entry_id":"1-0","attempts":1,"domains":-1}`, "пачки",
+			func(d Delivery) error { _, err := Decode[Dead](d); return err },
+		},
+		{
+			"бит субдомена вне диапазона", StreamDead,
+			`{"task_id":"t1","stream":"q:render","entry_id":"1-0","attempts":1,"subdomain_id":63}`, "вне диапазона",
 			func(d Delivery) error { _, err := Decode[Dead](d); return err },
 		},
 	}
@@ -342,13 +372,18 @@ func TestValidateMessages(t *testing.T) {
 		},
 		{"результат ок", Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantHTTP}, ""},
 		{"результат с кривым вариантом", Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.Variant(5)}, "вариант"},
-		{"dead ок", Dead{TaskID: "t", Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1, Payload: json.RawMessage(`{}`)}, ""},
-		{"dead без task_id", Dead{Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1, Payload: json.RawMessage(`{}`)}, "task_id"},
-		{"dead из q:dead", Dead{TaskID: "t", Stream: StreamDead, EntryID: "1-0", Attempts: 1, Payload: json.RawMessage(`{}`)}, "стрим-источник"},
+		{"dead ок", Dead{TaskID: "t", Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1}, ""},
+		{"dead без task_id", Dead{Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1}, "task_id"},
+		{"dead из q:dead", Dead{TaskID: "t", Stream: StreamDead, EntryID: "1-0", Attempts: 1}, "стрим-источник"},
 		{
-			"dead с битым payload",
+			"dead с битым payload старой записи",
 			Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, Payload: json.RawMessage(`{`)},
 			"payload",
+		},
+		{
+			"dead кривой вариант",
+			Dead{TaskID: "t", Stream: StreamRender, EntryID: "1-0", Attempts: 1, Variant: model.Variant(5)},
+			"вариант",
 		},
 	}
 	for _, c := range cases {
@@ -364,5 +399,67 @@ func TestValidateMessages(t *testing.T) {
 				t.Errorf("validate(%T) = %v, хочу ошибку с %q", c.msg, err, c.wantErr)
 			}
 		})
+	}
+}
+
+// TestDeadSubjectOf (T-105) — выжимка идентификаторов предмета задачи
+// из тела исходного сообщения: пачка q:dns — размер (список не
+// переносится), штучные задачи — домен, q:render/q:analyze — ключ
+// строки subdomain_results; неразбирающееся тело оставляет поля
+// нулевыми — перенос в q:dead не падает на чужом формате.
+func TestDeadSubjectOf(t *testing.T) {
+	cases := []struct {
+		name    string
+		stream  string
+		payload string
+		want    Dead
+	}{
+		{
+			"пачка q:dns",
+			StreamDNS,
+			`{"task_id":"t1","domains":[{"zone_id":1,"domain_id":1,"name":"a.test"},{"zone_id":2,"domain_id":2,"name":"b.test"},{"zone_id":1,"domain_id":3,"name":"c.test"}]}`,
+			Dead{Domains: 3},
+		},
+		{"q:http", StreamHTTP,
+			`{"task_id":"t2","zone_id":3,"domain_id":42,"name":"example.com","subdomains":[]}`,
+			Dead{ZoneID: 3, DomainID: 42, Name: "example.com"}},
+		{"q:render основной вариант", StreamRender,
+			`{"task_id":"t3","zone_id":3,"domain_id":42,"subdomain_id":0,"variant":0,"name":"example.com"}`,
+			Dead{ZoneID: 3, DomainID: 42, Name: "example.com"}},
+		{"q:analyze http-вариант", StreamAnalyze,
+			`{"task_id":"t4","zone_id":3,"domain_id":42,"subdomain_id":1,"variant":1,"name":"www.example.com"}`,
+			Dead{ZoneID: 3, DomainID: 42, SubdomainID: 1, Variant: model.VariantHTTP, Name: "www.example.com"}},
+		{"q:dns без пачки", StreamDNS, `{"task_id":"t5"}`, Dead{}},
+		{"чужой формат", StreamHTTP, `{"no":"format"}`, Dead{}},
+		{"мусор", StreamDNS, `не JSON`, Dead{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var d Dead
+			deadSubjectOf(&d, c.stream, []byte(c.payload))
+			if !reflect.DeepEqual(d, c.want) {
+				t.Errorf("deadSubjectOf:\n получил  %+v\n хочу     %+v", d, c.want)
+			}
+		})
+	}
+}
+
+// TestDecodeDeadLegacyPayload — записи q:dead до T-105 несли payload
+// исходного сообщения: поле сохранено (omitempty) для чтения истории —
+// Decode старых записей работает, новые payload не публикуют (bury,
+// TestReliabClaimDeadByteGuard).
+func TestDecodeDeadLegacyPayload(t *testing.T) {
+	legacy := `{"task_id":"t1","stream":"q:dns","entry_id":"1-0","attempts":4,` +
+		`"reason":"исчерпан лимит попыток 3: доставок без подтверждения — 4",` +
+		`"payload":{"task_id":"t1","domains":[{"zone_id":1,"domain_id":1,"name":"a.test"}]}}`
+	dead, err := Decode[Dead](Delivery{Stream: StreamDead, ID: "2-0", Payload: []byte(legacy)})
+	if err != nil {
+		t.Fatalf("старая запись q:dead не декодируется: %v", err)
+	}
+	if dead.TaskID != "t1" || dead.Stream != StreamDNS || dead.EntryID != "1-0" || dead.Attempts != 4 {
+		t.Errorf("поля старой записи: %+v", dead)
+	}
+	if len(dead.Payload) == 0 || !json.Valid(dead.Payload) {
+		t.Errorf("payload старой записи не прочитан: %q", dead.Payload)
 	}
 }

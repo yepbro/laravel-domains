@@ -470,8 +470,9 @@ func TestResilience_WorkerDiesMidBatch(t *testing.T) {
 // в q:dead (ТЗ 4.2, T-025): запись, которую никто не подтверждает, при
 // каждом клейме наращивает deliveries-счётчик PEL; попытки MaxAttempts
 // (3 по умолчанию) — ещё в работу, следующая — Dead (task_id, исходный
-// стрим/запись, attempts, payload без изменений) и XACK исходной: запись
-// покидает pending. Все task_id переживают цикл — живы в q:dead.
+// стрим/запись, attempts, идентификаторы предмета без payload — T-105)
+// и XACK исходной: запись покидает pending. Все task_id переживают
+// цикл — живы в q:dead.
 func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 	skipUnlessIntegration(t)
 	rdb := resilienceRedisEnv(t)
@@ -483,27 +484,23 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 	const group = "resil-render"
 	const total = 3
 
-	wantTasks := make(map[string]bool, total)
+	wantRes := make(map[string]queue.Result, total)
 	for i := 0; i < total; i++ {
-		task := fmt.Sprintf("t-dead-%02d", i+1)
-		wantTasks[task] = true
-		if _, err := q.Publish(ctx, queue.StreamRender, queue.Result{
-			TaskID:      task,
+		res := queue.Result{
+			TaskID:      fmt.Sprintf("t-dead-%02d", i+1),
 			ZoneID:      9,
 			DomainID:    int64(200 + i),
 			SubdomainID: 1,
 			Name:        fmt.Sprintf("dead%02d.resil.test", i+1),
-		}); err != nil {
-			t.Fatalf("публикация %s: %v", task, err)
+		}
+		wantRes[res.TaskID] = res
+		if _, err := q.Publish(ctx, queue.StreamRender, res); err != nil {
+			t.Fatalf("публикация %s: %v", res.TaskID, err)
 		}
 	}
 	batch := consumeTasks(t, q, queue.StreamRender, group, "w1", 10)
 	if len(batch) != total {
 		t.Fatalf("потреблено задач: %d, хочу %d", len(batch), total)
-	}
-	origPayload := make(map[string][]byte, total)
-	for _, d := range batch {
-		origPayload[d.ID] = d.Payload
 	}
 
 	// Воркер пал, не подтвердив ничего. «Восстановители» тоже падают:
@@ -545,8 +542,11 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 		t.Fatalf("записей в q:dead: %d, хочу %d", n, total)
 	}
 
-	// Ручной разбор q:dead: формат Dead сохраняет task_id, источник,
-	// attempts и исходный payload без изменений (T-024/T-025).
+	// Ручной разбор q:dead (T-024/T-025/T-105): формат Dead сохраняет
+	// task_id, источник, attempts и идентификаторы предмета задачи —
+	// ключ строки subdomain_results (зона/домен/субдомен/вариант/имя);
+	// payload исходного сообщения записи не несут (байтовая защита:
+	// пачки q:dns до ~250 КБ × потолок 10 000 ≈ 2,5 ГБ — см. T-105).
 	deadMsgs := consumeTasks(t, q, queue.StreamDead, "resil-dead", "operator", 10)
 	if len(deadMsgs) != total {
 		t.Fatalf("прочитано из q:dead: %d, хочу %d", len(deadMsgs), total)
@@ -557,16 +557,23 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("декодирование Dead: %v", err)
 		}
-		if !wantTasks[dead.TaskID] || seen[dead.TaskID] {
+		res, ok := wantRes[dead.TaskID]
+		if !ok || seen[dead.TaskID] {
 			t.Errorf("Dead.task_id = %q — вне исходной пачки или дубль", dead.TaskID)
+			continue
 		}
 		seen[dead.TaskID] = true
 		if dead.Stream != queue.StreamRender {
 			t.Errorf("Dead.stream = %q, хочу %q", dead.Stream, queue.StreamRender)
 		}
-		if string(dead.Payload) != string(origPayload[dead.EntryID]) {
-			t.Errorf("Dead.payload записи %s изменён:\n получил %s\n хочу   %s",
-				dead.EntryID, dead.Payload, origPayload[dead.EntryID])
+		if dead.ZoneID != res.ZoneID || dead.DomainID != res.DomainID ||
+			dead.SubdomainID != res.SubdomainID || dead.Variant != res.Variant || dead.Name != res.Name {
+			t.Errorf("Dead записи %s: идентификаторы %+v, хочу предмет задачи %+v",
+				dead.EntryID, dead, res)
+		}
+		if len(dead.Payload) != 0 {
+			t.Errorf("Dead.payload записи %s перенесён (T-105 — записи без payload): %d байт",
+				dead.EntryID, len(dead.Payload))
 		}
 		if dead.Attempts != 4 {
 			t.Errorf("Dead.attempts = %d, хочу 4 (доставка + 3 клейма)", dead.Attempts)

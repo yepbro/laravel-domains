@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -196,8 +197,9 @@ func TestReliabClaimMinIdleDefault(t *testing.T) {
 }
 
 // TestReliabClaimDead — запись, чей счётчик выше лимита, не возвращается,
-// а переносится в q:dead (Dead с исходным payload) и подтверждается в
-// исходном стриме.
+// а переносится в q:dead (Dead с идентификаторами предмета задачи,
+// выжатыми из тела, без payload — T-105) и подтверждается в исходном
+// стриме.
 func TestReliabClaimDead(t *testing.T) {
 	origPayload := `{"task_id":"t1","zone_id":3,"domain_id":42,"name":"example.com"}`
 	fake := &fakeClaimRedis{
@@ -238,13 +240,132 @@ func TestReliabClaimDead(t *testing.T) {
 		EntryID:  "1718-0",
 		Attempts: 4,
 		Reason:   "исчерпан лимит попыток 3: доставок без подтверждения — 4",
-		Payload:  json.RawMessage(origPayload),
+		ZoneID:   3,
+		DomainID: 42,
+		Name:     "example.com",
 	}
 	if !reflect.DeepEqual(dead, wantDead) {
 		t.Errorf("Dead:\n получил  %+v\n хочу     %+v", dead, wantDead)
 	}
 
 	// Исходная запись покидает pending: XACK из стрима-источника.
+	if want := []ackCall{{StreamRender, "render", []string{"1718-0"}}}; !reflect.DeepEqual(fake.acks, want) {
+		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
+	}
+}
+
+// TestReliabClaimDeadByteGuard (T-105) — запись q:dead не раздувается
+// payload исходной задачи: пачка q:dns (~250 КБ worst-case) переносится
+// идентификаторами (task_id, стрим, запись, размер пачки), байты записи —
+// сотни, а не сотни тысяч. Потолок 10 000 записей с payload пачек давал
+// worst-case ~2,5 ГБ против бюджета Redis 0,5 ГБ (docs/redis.md §3);
+// идентификаторов хватает оператору для разбора (docs/runbooks.md §2).
+func TestReliabClaimDeadByteGuard(t *testing.T) {
+	big := DNSBatch{TaskID: "big", Domains: make([]DNSDomain, 2000)}
+	for i := range big.Domains {
+		big.Domains[i] = DNSDomain{
+			ZoneID:   int16(i%3 + 1), // пачка многозонная (T-027)
+			DomainID: int64(i + 1),
+			Name:     fmt.Sprintf("domain%04d.example.com", i),
+		}
+	}
+	payload, err := json.Marshal(big)
+	if err != nil {
+		t.Fatalf("сериализация пачки: %v", err)
+	}
+	if len(payload) < 100_000 { // ~70 Б на домен с JSON-обвязкой
+		t.Fatalf("пачка неожиданно мала: %d байт — тест не про worst-case", len(payload))
+	}
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: payload}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // лимит 3 исчерпан
+		},
+	}
+
+	got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+		context.Background(), StreamDNS, "dns", "recover-1", time.Minute, 5, "0-0")
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("исчерпавшая попытки запись возвращена в работу: %+v", got)
+	}
+	if len(fake.adds) != 1 || fake.adds[0].Stream != StreamDead {
+		t.Fatalf("Dead не опубликован: %+v", fake.adds)
+	}
+	data := fake.adds[0].Values.(map[string]any)[fieldData].([]byte)
+	if bound := 512; len(data) > bound {
+		t.Errorf("запись q:dead %d байт > %d — payload исходной задачи перенесён (T-105):\n%s",
+			len(data), bound, data)
+	}
+
+	dead, err := Decode[Dead](Delivery{Stream: StreamDead, ID: fake.adds[0].ID, Payload: data})
+	if err != nil {
+		t.Fatalf("поле data не декодируется как Dead: %v\n%s", err, data)
+	}
+	// Идентификаторы для операторского разбора на месте, payload нет.
+	if dead.TaskID != "big" || dead.Stream != StreamDNS || dead.EntryID != "1718-0" || dead.Attempts != 9 {
+		t.Errorf("идентификаторы записи q:dead: %+v", dead)
+	}
+	if dead.Domains != len(big.Domains) {
+		t.Errorf("размер пачки в записи: %d, хочу %d", dead.Domains, len(big.Domains))
+	}
+	if len(dead.Payload) != 0 {
+		t.Errorf("payload перенесён в q:dead: %d байт", len(dead.Payload))
+	}
+
+	// Исходная запись покидает pending: XACK из стрима-источника.
+	if want := []ackCall{{StreamDNS, "dns", []string{"1718-0"}}}; !reflect.DeepEqual(fake.acks, want) {
+		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
+	}
+}
+
+// TestReliabClaimDeadPoisonBody (T-105, P2 ревью) — выжимка из чужого
+// тела не должна делать запись q:dead невалидной: иначе Publish отклонил
+// бы Dead, XACK не состоялся бы, и «ядовитая» задача навсегда застряла
+// бы в pending вместо карантина. Идентификаторы отбрасываются, перенос
+// идёт: task_id/стрим/запись/попытки/причина всегда достаточны разбору.
+func TestReliabClaimDeadPoisonBody(t *testing.T) {
+	poison := `{"task_id":"t1","zone_id":3,"domain_id":42,"subdomain_id":1,"variant":5,"name":"` +
+		strings.Repeat("a", 254) + `"}` // вариант вне 0/1, имя длиннее 253
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: []byte(poison)}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // лимит 3 исчерпан
+		},
+	}
+
+	got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+		context.Background(), StreamRender, "render", "recover-1", time.Minute, 5, "0-0")
+	if err != nil {
+		t.Fatalf("Claim: %v — перенос не должен падать на чужом теле", err)
+	}
+	if got != nil {
+		t.Fatalf("исчерпавшая попытки запись возвращена в работу: %+v", got)
+	}
+	if len(fake.adds) != 1 || fake.adds[0].Stream != StreamDead {
+		t.Fatalf("Dead не опубликован: %+v", fake.adds)
+	}
+	data := fake.adds[0].Values.(map[string]any)[fieldData].([]byte)
+	dead, err := Decode[Dead](Delivery{Stream: StreamDead, ID: fake.adds[0].ID, Payload: data})
+	if err != nil {
+		t.Fatalf("поле data не декодируется как Dead: %v\n%s", err, data)
+	}
+	want := Dead{
+		TaskID:   "t1",
+		Stream:   StreamRender,
+		EntryID:  "1718-0",
+		Attempts: 9,
+		Reason:   "исчерпан лимит попыток 3: доставок без подтверждения — 9",
+	}
+	if !reflect.DeepEqual(dead, want) {
+		t.Errorf("Dead с чужим телом:\n получил  %+v\n хочу     %+v (без идентификаторов предмета)", dead, want)
+	}
 	if want := []ackCall{{StreamRender, "render", []string{"1718-0"}}}; !reflect.DeepEqual(fake.acks, want) {
 		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
 	}

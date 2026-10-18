@@ -193,15 +193,34 @@ func (r Result) validate() error {
 // Dead — сообщение q:dead: задача, исчерпавшая число попыток (ТЗ 4.2),
 // для ручного разбора. Продюсер — T-025 (счётчик попыток и перевод
 // в q:dead); формат зафиксирован здесь заранее, чтобы эволюция доставки
-// не меняла контракт стрима. Payload — исходное сообщение без изменений
-// (сырой JSON поля data), задача опознаётся по task_id.
+// не меняла контракт стрима. Записи несут идентификаторы предмета
+// задачи, а не исходное сообщение (T-105): payload пачек q:dns до
+// ~250 КБ при потолке 10 000 записей давал worst-case ~2,5 ГБ против
+// бюджета Redis ≤ 0,5 ГБ (ТЗ 3.2, docs/redis.md §3), а ручному разбору
+// хватает идентификаторов (docs/runbooks.md §2: домен — name/domain_id,
+// ключ строки — zone/domain/subdomain/variant; домены пачки q:dns
+// переиздаст lease-проход планировщика). Payload сохранено только для
+// чтения старых записей (до T-105) — новые его не публикуют.
 type Dead struct {
-	TaskID   string          `json:"task_id"`          // task_id исходной задачи
-	Stream   string          `json:"stream"`           // стрим-источник
-	EntryID  string          `json:"entry_id"`         // запись-источник
-	Attempts int             `json:"attempts"`         // число попыток доставки
-	Reason   string          `json:"reason,omitempty"` // последняя ошибка
-	Payload  json.RawMessage `json:"payload"`          // исходное сообщение
+	TaskID   string `json:"task_id"`          // task_id исходной задачи
+	Stream   string `json:"stream"`           // стрим-источник
+	EntryID  string `json:"entry_id"`         // запись-источник
+	Attempts int    `json:"attempts"`         // число попыток доставки
+	Reason   string `json:"reason,omitempty"` // причина исчерпания попыток
+
+	// Идентификаторы предмета задачи (T-105) — выжимка исходного
+	// сообщения (deadSubjectOf). Опциональны: перенос в q:dead не обязан
+	// падать на тело, не разбирающееся как сообщение стрима.
+	ZoneID      int16         `json:"zone_id,omitempty"`      // штучные задачи: зона домена
+	DomainID    int64         `json:"domain_id,omitempty"`    // штучные задачи: домен
+	SubdomainID int16         `json:"subdomain_id,omitempty"` // q:render/q:analyze: ключ строки
+	Variant     model.Variant `json:"variant,omitempty"`      // q:render/q:analyze: 0 опускается (основной)
+	Name        string        `json:"name,omitempty"`         // имя домена, punycode
+	Domains     int           `json:"domains,omitempty"`      // q:dns: размер пачки
+
+	// Payload — исходное сообщение записи до T-105; новыми записями не
+	// публикуется, читается для истории разбора и разбором игнорируется.
+	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
 // Streams — стрим мёртвых задач.
@@ -222,10 +241,60 @@ func (d Dead) validate() error {
 	if d.Attempts < 1 {
 		return fmt.Errorf("queue: q:dead: attempts %d < 1", d.Attempts)
 	}
-	if len(d.Payload) == 0 || !json.Valid(d.Payload) {
-		return fmt.Errorf("queue: q:dead: payload — исходное сообщение (JSON), задано %d байт", len(d.Payload))
+	// Идентификаторы предмета (T-105) опциональны (deadSubjectOf —
+	// best-effort), заданные обязаны быть допустимыми.
+	if d.ZoneID < 0 || d.DomainID < 0 {
+		return fmt.Errorf("queue: q:dead: идентификаторы домена %d/%d отрицательны", d.ZoneID, d.DomainID)
+	}
+	if d.Domains < 0 {
+		return fmt.Errorf("queue: q:dead: размер пачки %d < 0", d.Domains)
+	}
+	if len(d.Name) > maxNameLen {
+		return fmt.Errorf("queue: q:dead: имя длиннее %d октетов", maxNameLen)
+	}
+	if !d.Variant.Valid() {
+		return fmt.Errorf("queue: q:dead: вариант %d (0 основной, 1 http)", d.Variant)
+	}
+	if err := model.ValidateSubdomainID(int(d.SubdomainID)); err != nil {
+		return fmt.Errorf("queue: q:dead: %w", err)
+	}
+	if len(d.Payload) > 0 && !json.Valid(d.Payload) {
+		return fmt.Errorf("queue: q:dead: payload — исходное сообщение старой записи (JSON), задано %d байт", len(d.Payload))
 	}
 	return nil
+}
+
+// deadSubjectOf выжимает из тела исходного сообщения идентификаторы
+// предмета задачи в запись Dead (T-105): q:dns — размер пачки (список
+// доменов не переносится — до ~250 КБ на запись, см. Dead), q:http —
+// домен, q:render/q:analyze — ключ строки subdomain_results.
+// Best-effort: тело, не разбирающееся как сообщение стрима, оставляет
+// поля нулевыми; разобравшееся, но чужое (недопустимые значения) bury
+// откатывает к записи без идентификаторов — перенос в q:dead не падает
+// и не застревает ни на каком теле с task_id.
+func deadSubjectOf(d *Dead, stream string, payload []byte) {
+	switch stream {
+	case StreamDNS:
+		// Элементы пачки не читаются — только их число: []struct{}
+		// разбирает массив, не аллоцируя имена и идентификаторы.
+		var m struct {
+			Domains []struct{} `json:"domains"`
+		}
+		if json.Unmarshal(payload, &m) == nil {
+			d.Domains = len(m.Domains)
+		}
+	case StreamHTTP:
+		var m HTTPTask
+		if json.Unmarshal(payload, &m) == nil {
+			d.ZoneID, d.DomainID, d.Name = m.ZoneID, m.DomainID, m.Name
+		}
+	case StreamRender, StreamAnalyze:
+		var m Result
+		if json.Unmarshal(payload, &m) == nil {
+			d.ZoneID, d.DomainID = m.ZoneID, m.DomainID
+			d.SubdomainID, d.Variant, d.Name = m.SubdomainID, m.Variant, m.Name
+		}
+	}
 }
 
 // NewTaskID генерирует уникальный идентификатор задачи: 16 случайных
