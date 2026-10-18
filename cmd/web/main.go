@@ -54,7 +54,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	if pool == nil {
 		return errors.New("web: пул БД не получен (postgres.dsn обязателен)")
 	}
-	srv, err := web.New(pool, web.Options{Log: logger})
+	srv, err := web.New(pool, cfg, web.Options{Log: logger})
 	if err != nil {
 		return err
 	}

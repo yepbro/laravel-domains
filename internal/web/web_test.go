@@ -19,6 +19,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"crawler/internal/config"
 )
 
 // --- фейковый пул ------------------------------------------------------------
@@ -34,6 +36,7 @@ type webSeed struct {
 	table      [][]any // (name, unicode, checked, laravel)
 	latest     [][]any // (name, mask, ver_min, ver_max, updated)
 	subdomains [][]any // (id, label)
+	domainInfo []byte  // ответ domain_info(text) или nil (домен неизвестен)
 }
 
 // fakeDB — Pinger + Querier с живой семантикой SQL данных лендинга.
@@ -75,6 +78,11 @@ func (d *fakeDB) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, err
 		return webRowsOf(d.seed.latest), nil
 	case subdomainsSQL:
 		return webRowsOf(d.seed.subdomains), nil
+	case "SELECT domain_info($1::text)":
+		if d.seed.domainInfo == nil {
+			return webRowsOf(nil), nil // NULL — домен неизвестен
+		}
+		return webRowsOf([][]any{{d.seed.domainInfo}}), nil
 	default:
 		return nil, fmt.Errorf("fakeDB: неожидаемый SQL: %s", sql)
 	}
@@ -119,6 +127,8 @@ func (r *webRows) Scan(dest ...any) error {
 			*dst = row[i].(string)
 		case *time.Time:
 			*dst = row[i].(time.Time)
+		case *[]byte:
+			*dst = row[i].([]byte)
 		default:
 			return fmt.Errorf("webRows: приёмник[%d] %T", i, d)
 		}
@@ -153,7 +163,9 @@ func seedLanding() webSeed {
 
 func newTestServer(t *testing.T, db DB) *Server {
 	t.Helper()
-	s, err := New(db, Options{})
+	cfg := config.Default()
+	cfg.Web.RateLimit = 100 // тесты маршрутизации не упираются в лимит
+	s, err := New(db, cfg, Options{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -164,8 +176,12 @@ func newTestServer(t *testing.T, db DB) *Server {
 
 // TestNewNilDB — без БД сервис не собирается.
 func TestNewNilDB(t *testing.T) {
-	if _, err := New(nil, Options{}); err == nil {
+	cfg := config.Default()
+	if _, err := New(nil, cfg, Options{}); err == nil {
 		t.Fatal("New(nil) = nil error, хочу ошибку")
+	}
+	if _, err := New(&fakeDB{}, nil, Options{}); err == nil {
+		t.Fatal("New(nil cfg) = nil error, хочу ошибку")
 	}
 }
 

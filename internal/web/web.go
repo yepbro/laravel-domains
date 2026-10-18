@@ -38,6 +38,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"crawler/internal/checker"
+	"crawler/internal/config"
 )
 
 // Pinger — readiness-часть зависимости БД.
@@ -72,9 +75,15 @@ type Options struct {
 
 // Server — публичный HTTP-сервер лендинга.
 type Server struct {
-	db  DB
-	opt Options
-	tpl *template.Template
+	db      DB
+	opt     Options
+	tpl     *template.Template
+	cfg     *config.Config
+	limiter *tokenBucketLimiter
+
+	// liveCheck — шов живой проверки (T-123): production — checker.Run;
+	// тесты подменяют фейком без сети (в стиле ContentGetter воркеров).
+	liveCheck checker.LiveFunc
 }
 
 // landingVM — данные рендера лендинга: локаль, список локалей,
@@ -105,12 +114,16 @@ func (v landingVM) ToJSON(s string) template.HTML {
 	return template.HTML(b)
 }
 
-// New собирает сервер: db — пул БД (ping + данные страницы). Шаблон
-// парсится один раз: локаль приходит данными (landingVM), словарь —
-// метод рендера.
-func New(db DB, opts Options) (*Server, error) {
+// New собирает сервер: db — пул БД (ping + данные страницы + журнал
+// формы). cfg — конфигурация секции web (рейт-лимит, timeout живой
+// проверки, T-123). Шаблон парсится один раз: локаль приходит данными
+// (landingVM), словарь — метод рендера.
+func New(db DB, cfg *config.Config, opts Options) (*Server, error) {
 	if db == nil {
 		return nil, errors.New("web: пул БД не задан (postgres.dsn обязателен)")
+	}
+	if cfg == nil {
+		return nil, errors.New("web: конфигурация не задана")
 	}
 	tpl, err := template.ParseFS(templates, "templates/landing.html")
 	if err != nil {
@@ -119,7 +132,14 @@ func New(db DB, opts Options) (*Server, error) {
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
-	return &Server{db: db, opt: opts, tpl: tpl}, nil
+	return &Server{
+		db:        db,
+		opt:       opts,
+		tpl:       tpl,
+		cfg:       cfg,
+		limiter:   newLimiter(cfg.Web.RateLimit, time.Minute),
+		liveCheck: checker.Run,
+	}, nil
 }
 
 //go:embed templates
@@ -132,7 +152,7 @@ var staticFS embed.FS
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
-	mux.HandleFunc("POST /api/check-domain", s.handleCheckDomain)
+	mux.HandleFunc("POST /api/check-domain", s.handleCheckDomainLive)
 	// GET на API-эндпоинт перехватывался бы префиксом лендинга (GET /)
 	// с вводящим в заблуждение 404 — честный 405 без раскрытия деталей.
 	mux.HandleFunc("GET /api/check-domain", func(w http.ResponseWriter, _ *http.Request) {
@@ -233,12 +253,8 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	http.StripPrefix("/static/", http.FileServer(http.FS(sub))).ServeHTTP(w, r)
 }
 
-// handleCheckDomain — POST /api/check-domain: живая проверка домена из
-// формы (T-123: гибрид сохранённых данных и живого конвейера). До T-123
-// — честная заглушка 501 (зависимости формы ещё не собраны).
-func (s *Server) handleCheckDomain(w http.ResponseWriter, _ *http.Request) {
-	http.Error(w, "not implemented yet (T-123)", http.StatusNotImplemented)
-}
+// handleCheckDomain удалён (T-123): форму обслуживает
+// handleCheckDomainLive (api.go) — гибрид stored/live с рейт-лимитом.
 
 // handleHealthz — readiness: ping PostgreSQL с коротким таймаутом
 // (посетитель не ждёт восстановления БД дольше секунды — 503 быстрее).
