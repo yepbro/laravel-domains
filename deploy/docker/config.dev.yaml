@@ -6,6 +6,9 @@
 postgres:
   # Полный DSN собирается из APP_PG_DSN (env), здесь — форма по умолчанию.
   dsn: "postgres://crawler:crawler@172.28.100.2:5432/crawler?sslmode=disable"
+  # 20 — dev-масштаб: max_connections=130 (postgresql.dev.conf — стек сервисов
+  # + параллельные прогоны тестов). Боевой бюджет (max_connections=50) —
+  # 5 на сервис: config.example.yaml, docs/db.md «Бюджет соединений».
   pool_size: 20
 
 redis:

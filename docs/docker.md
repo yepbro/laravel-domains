@@ -187,8 +187,12 @@ dc build --no-cache unbound   # пересобрать без кэша (если
 `make build-runtime` проверяет только сборку образов. Полный боевой
 контейнер рендера поднимается профилем `runtime` — сервис `render`
 (`crawler/render:local`): render-worker + собственный Chromium в одном
-контейнере (`Dockerfile.render`, `USER nobody`), с фиксированными
-ресурсными требованиями ТЗ §3.2/§9/§10.1 (T-065):
+контейнере (`Dockerfile.render`; в образе `USER nobody`, в compose
+запуск переопределён на `user: ${DEV_UID:-1000}:${DEV_GID:-1000}` —
+воркер пишет пак-контент в host-bind `./var/content`, принадлежащий
+`DEV_UID`, без ручного `chown`; непривилегированный не-root запуск
+сохраняется — ТЗ §9/§10.1), с фиксированными ресурсными требованиями
+ТЗ §3.2/§9/§10.1 (T-065):
 
 ```bash
 dc --profile runtime up -d render   # поднимет и зависимости (postgres, redis)
@@ -200,8 +204,9 @@ dc --profile runtime stop render    # остановить
   `mem_limit` — docker-аналог cgroup `MemoryMax` из ТЗ 10.1: OOM-killer
   не затрагивает PostgreSQL и остальные сервисы.
 - `shm_size: 1gb`, `init: true` — как dev-сервису chromium (ТЗ 4.3).
-- `cap_drop: ALL`, `no-new-privileges`, пользователь `nobody` в образе —
-  непривилегированный запуск рендера недоверенных страниц (ТЗ §9).
+- `cap_drop: ALL`, `no-new-privileges`, непривилегированный пользователь
+  (в образе `nobody`, в compose — `DEV_UID`/`DEV_GID` под запись в
+  host-bind `var/content`) — рендер недоверенных страниц без root (ТЗ §9).
 - перезапуск Chromium каждые N страниц и по порогу RSS — изнутри воркера
   (`render.restart_every_pages`, `render.restart_memory_bytes`; конфиг —
   `deploy/docker/config.render.yaml`, `remote_url` пуст — боевой режим),

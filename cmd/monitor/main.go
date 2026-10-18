@@ -30,18 +30,25 @@ func main() {
 		log.Fatalf("[monitor] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("monitor", cfg)
-	// Адрес мониторинга — monitor.listen из конфигурации (ТЗ 5.10);
-	// METRICS_ADDR из окружения важнее (адреса метрик остальных сервисов
-	// задаются только переменной, ТЗ 5.9).
+	// Адрес мониторинга — monitor.listen из конфигурации (ТЗ 5.10):
+	// важнее METRICS_ADDR — docs/services.md (приоритет приведён к
+	// документации; прежде переменная ошибочно побеждала конфиг).
+	// METRICS_ADDR — страховка при пустом monitor.listen (на практике не
+	// пуст: Default/Validate); адреса метрик остальных сервисов задаются
+	// только переменной (ТЗ 5.9).
 	//
 	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
 	// готов до старта OnRun: postgres.dsn обязателен (config.Validate).
+	listen := cfg.Monitor.Listen
+	if listen == "" {
+		listen = service.EnvOr("METRICS_ADDR", ":9100")
+	}
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "monitor",
 		Config:      cfg,
 		Logger:      logger,
-		MetricsAddr: service.EnvOr("METRICS_ADDR", cfg.Monitor.Listen),
+		MetricsAddr: listen,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
 		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool) },
 	}); err != nil {

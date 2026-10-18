@@ -38,13 +38,19 @@ cgroup, systemd перезапускает юнит, остальные серв
 
 | Юнит | MemoryMax | Строка бюджета ТЗ 3.2 |
 |---|---|---|
-| `postgresql@.service` + drop-in | **2560M** | PostgreSQL ≈ 2,5 ГБ |
-| `redis-server.service` + drop-in | **512M** | Redis ≤ 0,5 ГБ |
+| `postgresql@.service` + drop-in | **3072M** (бюджет ≈ 2,5 ГБ + запас на пики обслуживания) | PostgreSQL ≈ 2,5 ГБ |
+| `redis-server.service` + drop-in | **640M** (maxmemory 512mb + ~128 МБ служебных, docs/redis.md §7) | Redis ≤ 0,5 ГБ |
 | `unbound.service` + drop-in | **700M** | Unbound ≈ 0,7 ГБ |
 | `crawler-*.service` (7 юнитов) | **1280M суммарно** | Go-сервисы ≈ 1,3 ГБ |
 | `crawler-chromium.service` | **2048M** | Chromium ≈ 2 ГБ |
 
-Итого 7100M из 8192M: остаток ≈ 1 ГБ — ОС и page cache (ТЗ 3.2).
+Итого 7740M из 8192M. Потолки — не резервация: MemoryMax выше плановой
+строки бюджета там, где над внутренним лимитом живут служебные памяти
+процесса или пики обслуживания — Redis (maxmemory 512mb + ~128 МБ,
+eviction раньше OOM — docs/redis.md §7), PostgreSQL (work_mem/maintenance/
+autovacuum поверх shared_buffers — docs/db.md, «Память»); штатно инстансы
+живут в строках бюджета, остаток ≈ 0,5 ГБ и незаполненность потолков —
+ОС и page cache (ТЗ 3.2).
 
 Раскладка строки «Go-сервисы ≈ 1,3 ГБ» по семи юнитам:
 
@@ -213,13 +219,21 @@ cp -r rules /etc/crawler/rules                    # правила Laravel дл�
 - `postgres.dsn`, `redis.addr` — заменить примеры на локальные значения
   (или оставить как есть и задать точные в `crawler.env` — переменные
   окружения важнее YAML, docs/configuration.md);
+- `postgres.pool_size` — на один сервис, а бюджет ТЗ §6.3 (20–50) —
+  суммарный на все: значение примера (5) даёт 7 × 5 + `crawlerctl` (2) +
+  админ ≈ 40–45 при `max_connections=50` (3 слота резервирует
+  `superuser_reserved_connections`). Менять — только с пересчётом суммы;
+  сразу всем сервисам — `CRAWLER_POSTGRES_POOL_SIZE` в `crawler.env`
+  (docs/db.md, «Бюджет соединений»);
 - `ingest.dir: /var/lib/crawler/incoming`, `content.dir:
   /var/lib/crawler/content`, `content.zstd_dictionary:
   /var/lib/crawler/content/dict.zst`, `analyzer.rules_dir: /etc/crawler/rules`;
 - `render.remote_url: "ws://127.0.0.1:9222"` — внешний браузер-юнит
   (в примере пусто = собственный процесс воркера, это режим docker-runtime);
-- `monitor.listen: "127.0.0.1:9100"` — не `:9100` из примера: на боевой
-  интерфейс метрики не выставляются (ТЗ §9); остальные сервисы слушают
+- `monitor.listen` — в примере уже `127.0.0.1:9100`: метрики не
+  выставляются на боевой интерфейс (ТЗ §9); юнит monitor дополнительно
+  фиксирует loopback переменной `CRAWLER_MONITOR_LISTEN` (окружение важнее
+  YAML — страховка от config.yaml без правок), остальные сервисы слушают
   loopback через `METRICS_ADDR` в юнитах (127.0.0.1:9101…9106);
 - `http.user_agent` — реальные контакты оператора (если не задан в env);
 - `dns.ipv6: true` — если у сервера есть IPv6 (в docker-сети его нет).
@@ -300,7 +314,8 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
 ## 6. Границы комплекта (смежные задачи этапа 9)
 
 - **T-086** — тюнинг postgresql-конфига под NVMe (docs/db.md): аллокации
-  сервера обязаны вписываться в `MemoryMax=2560M` drop-in'а.
+  сервера обязаны вписываться в `MemoryMax=3G` drop-in'а (включая пики
+  обслуживания — work_mem/maintenance/autovacuum поверх shared_buffers).
 - **T-087** — конфиг redis: `maxmemory` ≤ 512M и eviction — под потолком
   drop-in'а (eviction раньше OOM).
 - **T-088** — sysctl ядра (`ip_local_port_range`, `tcp_tw_reuse`,

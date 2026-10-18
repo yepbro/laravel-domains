@@ -9,7 +9,11 @@
 
 postgres:
   dsn: "postgres://crawler:PASSWORD@127.0.0.1:5432/crawler?sslmode=disable"
-  pool_size: 20                      # рекомендация ТЗ: суммарно 20–50 на все сервисы
+  # pool_size задаётся НА ОДИН сервис, а рекомендация ТЗ (20–50) — бюджет
+  # СУММАРНО на все: 7 сервисов × 5 + crawlerctl (2) + админ ≈ 40–45 при
+  # max_connections=50 (3 слота резервирует superuser) — docs/db.md,
+  # «Бюджет соединений». Менять — только с пересчётом суммы.
+  pool_size: 5
 
 redis:
   addr: "127.0.0.1:6379"
@@ -94,7 +98,9 @@ subdomains:                          # начальное наполнение �
   - "app"
 
 monitor:
-  listen: ":9100"
+  # Loopback: метрики/healthz не выставляются на внешние интерфейсы (ТЗ §9);
+  # «:9100» (все интерфейсы) — только внутри docker-сети (config.dev.yaml).
+  listen: "127.0.0.1:9100"
   zone_stats_interval: "60s"         # пересчёт счётчиков зон и цикл алертов, 30–60 с
 
 log:
