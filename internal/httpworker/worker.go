@@ -39,6 +39,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -460,6 +461,26 @@ const (
 	// XAUTOCLAIM (T-025).
 	DefaultErrorWait = 30 * time.Second
 )
+
+// workerFailWaitBase — стартовая пауза предохранителя рабочего цикла
+// (Run): окно доставок, целиком оставшееся без XACK (систематический
+// сбой обработки — Options.OnResult/БД), приостанавливает чтение q:http
+// с удвоением паузы до DefaultErrorWait. Без паузы цикл продолжал бы
+// черпать задачи: каждая доставка жгла попытку (XAUTOCLAIM после
+// DefaultClaimMinIdle, T-025) и уносила её в q:dead. Переменная, а не
+// константа: юнит-тесты сжимают паузу, не выжидая секунды.
+var workerFailWaitBase = time.Second
+
+// workerFailBackoff — пауза после streak подряд целиком не
+// подтверждённых окон: удвоение от workerFailWaitBase, потолок
+// DefaultErrorWait (сдвиг ограничен — переполнение Duration).
+func workerFailBackoff(streak int) time.Duration {
+	d := workerFailWaitBase << min(streak-1, 5)
+	if d > DefaultErrorWait {
+		d = DefaultErrorWait
+	}
+	return d
+}
 
 // Options — параметры воркера; нулевые значения заменяются дефолтами
 // (withDefaults, стиль dnsworker.Options).
@@ -914,7 +935,9 @@ func (w *Worker) checkScheme(
 // возвращает nil — контракт OnRun каркаса (T-012: начатые задачи дорабатывают
 // или возвращаются очереди повторной доставкой). Ошибка чтения или обработки
 // не останавливает цикл: логируется (Warn), неподтверждённая доставка
-// вернётся XAUTOCLAIM (ТЗ 4.2).
+// вернётся XAUTOCLAIM (ТЗ 4.2); окно, целиком оставшееся без подтверждений,
+// выдерживает паузу-предохранитель (workerFailWaitBase) — черпать новые
+// задачи при лежащей обработке бессмысленно, попытки доставок сгорают.
 func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	if q == nil {
 		return errors.New("httpworker: цикл воркера: очередь не задана")
@@ -939,6 +962,8 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	}
 
 	sem := make(chan struct{}, o.Concurrency)
+	var failed atomic.Int64 // доставки окна без подтверждения
+	failStreak := 0         // подряд целиком не подтверждённых окон
 	for {
 		deliveries, err := q.Consume(ctx, queue.StreamHTTP, o.Group, o.Consumer, o.Consume)
 		if err != nil {
@@ -954,6 +979,7 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 		// доставка — один домен (ТЗ 4.2), параллелизм этапа — именно
 		// здесь (у dns-worker домены параллелятся внутри пачки).
 		var wg sync.WaitGroup
+		failed.Store(0)
 		for _, d := range deliveries {
 			if ctx.Err() != nil {
 				break // не начатые доставки окна не подтверждены
@@ -966,15 +992,28 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 				err := queue.Processing(ctx, q, o.Group, d, func(c context.Context, del queue.Delivery) error {
 					return w.processDelivery(c, del, o)
 				})
-				if err != nil && ctx.Err() == nil {
-					log.Warn("задача q:http не подтверждена — вернётся повторной доставкой",
-						"entry", d.ID, "err", err)
+				if err != nil {
+					failed.Add(1)
+					if ctx.Err() == nil {
+						log.Warn("задача q:http не подтверждена — вернётся повторной доставкой",
+							"entry", d.ID, "err", err)
+					}
 				}
 			}(d)
 		}
 		wg.Wait()
 		if ctx.Err() != nil {
 			return nil // остановка: окно доработано или возвращено очереди
+		}
+		// Предохранитель (workerFailWaitBase): окно целиком без
+		// подтверждений — систематический сбой обработки, пауза перед
+		// следующим чтением; окно с хоть одним подтверждением счётчик
+		// сбрасывает.
+		if n := failed.Load(); n > 0 && int(n) == len(deliveries) {
+			failStreak++
+			wait(workerFailBackoff(failStreak))
+		} else {
+			failStreak = 0
 		}
 	}
 }

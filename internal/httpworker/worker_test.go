@@ -909,6 +909,77 @@ func TestWorkerRunOnResultError(t *testing.T) {
 	}
 }
 
+// TestWorkerRunBackoffOnFailures — предохранитель рабочего цикла: окно,
+// целиком не подтверждённое из-за сбоя OnResult (БД), выдерживает паузу
+// перед следующим чтением q:http (иначе — горячий цикл, пережигающий
+// попытки доставок), пауза растёт с каждым таким окном, окно с успехом
+// её сбрасывает; подтверждений при этом нет (at-least-once, ТЗ 3.4).
+func TestWorkerRunBackoffOnFailures(t *testing.T) {
+	// Пауза сжата: секунды в юнит-тесте не ждать.
+	old := workerFailWaitBase
+	workerFailWaitBase = 250 * time.Millisecond
+	t.Cleanup(func() { workerFailWaitBase = old })
+
+	body := "<html>" + strings.Repeat("страница для теста предохранителя цикла ", 30) + "</html>"
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"backoff.test":         {status: 200, body: body},
+		"http://backoff.test/": {status: 200, body: body},
+	})
+	w := workerWorker(t, fetch, nil)
+	q := &workerFakeQueue{deliveries: []queue.Delivery{
+		workerDelivery(t, queue.HTTPTask{ZoneID: 10, DomainID: 51, Name: "backoff.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
+		workerDelivery(t, queue.HTTPTask{ZoneID: 10, DomainID: 52, Name: "backoff.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
+	}}
+	opts := Options{OnResult: func(context.Context, *DomainResult) error {
+		return errors.New("БД недоступна")
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	// Первое чтение — сразу; момент его наблюдения стартовая точка
+	// паузы (окно обрабатывается мгновенно, обе доставки падают).
+	deadline := time.After(5 * time.Second)
+	for q.consumeCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("первое чтение не состоялось")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	firstSeen := time.Now()
+
+	// Повторное чтение — после паузы предохранителя, но не вечностью:
+	// цикл обязан продолжить (счётчик ошибок не блокирует навсегда).
+	for q.consumeCount() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("второе чтение не состоялось — предохранитель не отпустил цикл")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	if elapsed := time.Since(firstSeen); elapsed < 200*time.Millisecond {
+		t.Errorf("повторное чтение через %v — пауза предохранителя не сработала", elapsed)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	if q.ackedCount() != 0 {
+		t.Errorf("подтверждений %d при падающем OnResult", q.ackedCount())
+	}
+}
+
 // --- адаптер DNS-резолвера (ТЗ 5.5 п. 2) ---------------------------------------
 
 // workerAddr — парсинг адреса сценария (падение — ошибка теста).
