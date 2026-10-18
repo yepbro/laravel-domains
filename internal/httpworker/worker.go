@@ -197,18 +197,19 @@ func workerSchemeDefaultPort(scheme string) string {
 // кэш-попаданию: один и тот же контент классифицируется одинаково
 // независимо от того, скачала его проверка или взяла из кэша.
 type workerPage struct {
-	final     *url.URL
-	status    int
-	header    http.Header
-	cookies   []*http.Cookie
-	tls       *httpfetch.TLSInfo
-	hash      *content.Hash
-	body      []byte
-	charset   string
-	truncated bool
-	spa       *httpfetch.SPAVerdict
-	errClass  ErrorClass
-	errText   string
+	final      *url.URL
+	status     int
+	header     http.Header
+	cookies    []*http.Cookie
+	tls        *httpfetch.TLSInfo
+	hash       *content.Hash
+	body       []byte
+	charset    string
+	truncated  bool
+	responseMS int
+	spa        *httpfetch.SPAVerdict
+	errClass   ErrorClass
+	errText    string
 }
 
 // workerURLCache — общий кэш задачи домена (ТЗ 5.5 п. 6 «внутри воркера
@@ -257,7 +258,10 @@ type SchemeCheck struct {
 	Available bool
 	// Cached — итог взят из кэша итоговых URL без сети (ТЗ 5.5 п. 6):
 	// стартовый URL этой проверки совпал с итоговым URL другой проверки
-	// задачи (классика bare→www). ResponseMs такого итога — 0.
+	// задачи (классика bare→www). Сеть не трогалась, но время ответа
+	// первоисточника (до его заголовков) переносится в ResponseMS —
+	// запись-оригинал алиас-класса несёт реальное время ответа страницы;
+	// метрики времени ответа кэш-попадания по-прежнему не наблюдают.
 	Cached bool
 	// FinalURL — итоговый URL (страница в конце цепочки, ТЗ 5.5 п. 4);
 	// nil при ошибке загрузки.
@@ -274,7 +278,9 @@ type SchemeCheck struct {
 	// и кэш-попаданий http-проверок (не ошибка, §8).
 	TLS *httpfetch.TLSInfo
 	// ResponseMS — время до заголовков итогового ответа, мс (Elapsed
-	// последнего Fetch цепочки, ТЗ 5.5 п. 7 «время ответа»).
+	// последнего Fetch цепочки, ТЗ 5.5 п. 7 «время ответа»). Кэш-
+	// попадание переносит измерение первоисточника (его Elapsed):
+	// 0 — только у ошибок загрузки (заголовков не было).
 	ResponseMS int
 	// Redirects — цепочка редиректов (T-048): URL и статус каждого шага,
 	// последний элемент — итоговая страница. При ошибке — выполненная
@@ -811,6 +817,7 @@ func (w *Worker) checkScheme(
 		check.Cookies = page.cookies
 		check.TLS = page.tls
 		check.Redirects = []httpfetch.RedirectStep{{URL: start.String(), Status: page.status}}
+		check.ResponseMS = page.responseMS
 		check.ContentHash = page.hash
 		check.Truncated = page.truncated
 		check.Charset = page.charset
@@ -910,18 +917,19 @@ func (w *Worker) checkScheme(
 	// Итоговый URL — в кэш задачи: следующие проверки, начинающиеся на
 	// нём (www после редиректа bare), страницы повторно не скачивают.
 	cache.put(workerCacheKey(res.FinalURL), &workerPage{
-		final:     res.FinalURL,
-		status:    check.Status,
-		header:    check.Header,
-		cookies:   check.Cookies,
-		tls:       check.TLS,
-		hash:      check.ContentHash,
-		body:      check.Body,
-		charset:   check.Charset,
-		truncated: check.Truncated,
-		spa:       check.SPA,
-		errClass:  check.ErrClass,
-		errText:   check.ErrText,
+		final:      res.FinalURL,
+		status:     check.Status,
+		header:     check.Header,
+		cookies:    check.Cookies,
+		tls:        check.TLS,
+		hash:       check.ContentHash,
+		body:       check.Body,
+		charset:    check.Charset,
+		truncated:  check.Truncated,
+		responseMS: check.ResponseMS,
+		spa:        check.SPA,
+		errClass:   check.ErrClass,
+		errText:    check.ErrText,
 	})
 	return check
 }

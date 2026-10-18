@@ -54,10 +54,11 @@ type workerPageScript struct {
 	body      string
 	final     string // итоговый URL; "" — как запрошенный
 	steps     []httpfetch.RedirectStep
-	err       error    // транспортная ошибка вместо ответа
-	tooMany   bool     // ErrTooManyRedirects (Result nil, Chain — steps)
-	blockCtx  bool     // ждать отмены ctx (тест отмены)
-	setCookie []string // значения Set-Cookie, если header не задан
+	err       error         // транспортная ошибка вместо ответа
+	tooMany   bool          // ErrTooManyRedirects (Result nil, Chain — steps)
+	blockCtx  bool          // ждать отмены ctx (тест отмены)
+	setCookie []string      // значения Set-Cookie, если header не задан
+	elapsed   time.Duration // Elapsed итогового Fetch (ResponseMS проверки)
 }
 
 // workerFetchLog — журнал вызовов фейка: какие URL реально ушли «в сеть».
@@ -130,6 +131,7 @@ func workerFakeFetch(script map[string]*workerPageScript) (FetchFunc, *workerFet
 			Header:     h,
 			Body:       io.NopCloser(strings.NewReader(p.body)),
 			FinalURL:   fu,
+			Elapsed:    p.elapsed,
 		}
 		chain := append([]httpfetch.RedirectStep(nil), p.steps...)
 		chain = append(chain, httpfetch.RedirectStep{URL: final, Status: p.status})
@@ -437,6 +439,48 @@ func TestWorkerCacheHitKeepsErrorClass(t *testing.T) {
 	}
 	if www.Records[0].ErrClass != ErrBody {
 		t.Errorf("запись кэш-источника: класс %v (ожидался ErrBody)", www.Records[0].ErrClass)
+	}
+}
+
+// TestWorkerCacheHitResponseMS — кэш-попадание переносит измеренное
+// первоисточником время ответа: кэш-итог часто становится записью-
+// оригиналом алиас-класса (bare→www), её response_ms не должен быть
+// нулём при живом измерении. Метрики кэш-попадания по-прежнему не
+// наблюдают (Cached).
+func TestWorkerCacheHitResponseMS(t *testing.T) {
+	body := "<html>" + strings.Repeat("страница для теста времени ответа кэша ", 30) + "</html>"
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"rt.test": {status: 200, body: body, final: "https://www.rt.test/", elapsed: 150 * time.Millisecond},
+		// http-проверка апекса — другой итог (не кэш), своё время.
+		"http://rt.test/": {status: 200, body: body, final: "http://old.rt.test/", elapsed: 40 * time.Millisecond},
+	})
+	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
+	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+		ZoneID: 12, DomainID: 31, Name: "rt.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(1, "www")},
+	})
+	if err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+	bare, www := &res.Subdomains[0], &res.Subdomains[1]
+	if !www.HTTPS.Cached {
+		t.Fatal("https www — не кэш-итог (порядок проверок сломан)")
+	}
+	if got := www.HTTPS.ResponseMS; got != 150 {
+		t.Errorf("ResponseMS кэш-попадания: %d, ожидалось измерение первоисточника 150", got)
+	}
+	if got := bare.HTTPS.ResponseMS; got != 150 {
+		t.Errorf("ResponseMS первоисточника: %d, ожидалось 150", got)
+	}
+	if got := bare.HTTP.ResponseMS; got != 40 {
+		t.Errorf("ResponseMS собственной (некэшовой) проверки: %d, ожидалось 40", got)
+	}
+	// Запись кэш-источника несёт время ответа в subdomain_results.
+	if len(www.Records) == 0 {
+		t.Fatal("у www нет записей")
+	}
+	if got := www.Records[0].ResponseMS; got != 150 {
+		t.Errorf("ResponseMS записи кэш-источника: %d, ожидалось 150", got)
 	}
 }
 
