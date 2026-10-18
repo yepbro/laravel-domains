@@ -490,7 +490,11 @@ func TestIngest_DeleteMarksDeleted(t *testing.T) {
 	}
 
 	// Не перечисленные в файле домены не тронуты.
-	if d, _ := env.domain(t, "crawl.test", "shop"); d.status != int16(model.StatusNew) {
+	d, ok = env.domain(t, "crawl.test", "shop")
+	if !ok {
+		t.Fatal("домен shop исчез из БД — delete не удаляет строки (ТЗ 13.1)")
+	}
+	if d.status != int16(model.StatusNew) {
 		t.Errorf("shop: status = %d, want new (в delete-файле не упомянут)", d.status)
 	}
 	if n := env.countOf(t, "domains"); n != 2 {

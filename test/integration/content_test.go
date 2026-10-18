@@ -193,7 +193,10 @@ func TestContent_Roundtrip(t *testing.T) {
 			if err != nil || !bytes.Equal(got, page) {
 				t.Fatalf("Get(%d): %v, совпадение=%v", i, err, bytes.Equal(got, page))
 			}
-			row, _ := contentRowByHash(t, pool, res.Hash)
+			row, ok := contentRowByHash(t, pool, res.Hash)
+			if !ok {
+				t.Fatalf("строка contents для %s не появилась", res.Hash)
+			}
 			withDict = append(withDict, row)
 		}
 		// Словарь обязан помогать: блок страницы общего шаблона заметно
@@ -251,7 +254,10 @@ func TestContent_DedupAndRefcount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("первый Put: %v", err)
 	}
-	row, _ := contentRowByHash(t, pool, first.Hash)
+	row, ok := contentRowByHash(t, pool, first.Hash)
+	if !ok {
+		t.Fatalf("строка contents для %s не появилась", first.Hash)
+	}
 	sizeBefore := row.clen
 
 	dup, err := st.Put(ctx, append([]byte(nil), page...)) // независимая копия байтов
@@ -300,7 +306,7 @@ func TestContent_DedupAndRefcount(t *testing.T) {
 	if res.Hash != first.Hash {
 		t.Fatalf("хэш воскресшего контента изменился: %s", res.Hash)
 	}
-	row, ok := contentRowByHash(t, pool, first.Hash)
+	row, ok = contentRowByHash(t, pool, first.Hash)
 	if !ok || row.refc != 1 {
 		t.Errorf("воскрешение: строка %+v (found=%v), want refcount 1", row, ok)
 	}
@@ -327,8 +333,14 @@ func TestContent_SwapRef(t *testing.T) {
 		if err := st.SwapRef(ctx, a.Hash, b.Hash); err != nil {
 			t.Fatalf("SwapRef A→B: %v", err)
 		}
-		rowA, _ := contentRowByHash(t, pool, a.Hash)
-		rowB, _ := contentRowByHash(t, pool, b.Hash)
+		rowA, ok := contentRowByHash(t, pool, a.Hash)
+		if !ok {
+			t.Fatal("строка старого контента A исчезла после свопа")
+		}
+		rowB, ok := contentRowByHash(t, pool, b.Hash)
+		if !ok {
+			t.Fatal("строка нового контента B не записана")
+		}
 		if rowA.refc != 0 || rowB.refc != 2 {
 			t.Errorf("refcount после свопа: A=%d (want 0), B=%d (want 2)", rowA.refc, rowB.refc)
 		}
@@ -348,7 +360,10 @@ func TestContent_SwapRef(t *testing.T) {
 		if err := st.SwapRef(ctx, noHash, c.Hash); err != nil {
 			t.Fatalf("SwapRef 0→C: %v", err)
 		}
-		rowC, _ := contentRowByHash(t, pool, c.Hash)
+		rowC, ok := contentRowByHash(t, pool, c.Hash)
+		if !ok {
+			t.Fatalf("строка contents для %s не появилась", c.Hash)
+		}
 		if rowC.refc != 2 {
 			t.Errorf("refcount C после 0→C = %d, want 2", rowC.refc)
 		}
@@ -358,18 +373,27 @@ func TestContent_SwapRef(t *testing.T) {
 		if err := st.SwapRef(ctx, b.Hash, noHash); err != nil {
 			t.Fatalf("SwapRef B→0: %v", err)
 		}
-		rowB, _ := contentRowByHash(t, pool, b.Hash)
+		rowB, ok := contentRowByHash(t, pool, b.Hash)
+		if !ok {
+			t.Fatal("строка контента B исчезла после свопа B→0")
+		}
 		if rowB.refc != 1 {
 			t.Errorf("refcount B после B→0 = %d, want 1", rowB.refc)
 		}
 	})
 
 	t.Run("контент не сменился — no-op", func(t *testing.T) {
-		before, _ := contentRowByHash(t, pool, b.Hash)
+		before, ok := contentRowByHash(t, pool, b.Hash)
+		if !ok {
+			t.Fatal("строка контента B исчезла до no-op свопа")
+		}
 		if err := st.SwapRef(ctx, b.Hash, b.Hash); err != nil {
 			t.Fatalf("SwapRef B→B: %v", err)
 		}
-		after, _ := contentRowByHash(t, pool, b.Hash)
+		after, ok := contentRowByHash(t, pool, b.Hash)
+		if !ok {
+			t.Fatal("строка контента B исчезла после no-op свопа")
+		}
 		if before.refc != after.refc {
 			t.Errorf("no-op своп изменил refcount: %d → %d", before.refc, after.refc)
 		}
@@ -381,7 +405,10 @@ func TestContent_SwapRef(t *testing.T) {
 		if !errors.Is(err, content.ErrRefIntegrity) {
 			t.Fatalf("SwapRef на незаписанный контент: %v, want ErrRefIntegrity", err)
 		}
-		rowB, _ := contentRowByHash(t, pool, b.Hash)
+		rowB, ok := contentRowByHash(t, pool, b.Hash)
+		if !ok {
+			t.Fatal("строка контента B исчезла при откаченном свопе")
+		}
 		if rowB.refc != 1 {
 			t.Errorf("откаченный своп изменил refcount B: %d, want 1", rowB.refc)
 		}
@@ -427,7 +454,10 @@ func TestContent_PackRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Put после ротации: %v", err)
 	}
-	row, _ := contentRowByHash(t, pool, res.Hash)
+	row, ok := contentRowByHash(t, pool, res.Hash)
+	if !ok {
+		t.Fatalf("строка contents для %s не появилась", res.Hash)
+	}
 	if row.packID != ids[len(ids)-1] {
 		t.Errorf("новая запись попала в пак %d, want новейший %d", row.packID, ids[len(ids)-1])
 	}
@@ -515,7 +545,10 @@ func TestContent_Compaction(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Put(%d): %v", j, err)
 			}
-			row, _ := contentRowByHash(t, pool2, res.Hash)
+			row, ok := contentRowByHash(t, pool2, res.Hash)
+			if !ok {
+				t.Fatalf("строка contents для %s не появилась", res.Hash)
+			}
 			if row.packID == 1 {
 				keep = append(keep, res.Hash)
 			}
