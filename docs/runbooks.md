@@ -125,7 +125,7 @@ XREVRANGE q:dead + - COUNT 10 # свежие
 - `payload` — исходное сообщение: имена доменов читаются прямо,
   для `q:render`/`q:analyze` ключ — `(zone_id, domain_id,
   subdomain_id, variant)`;
-- MAXLEN стрима — 100 000 (история ограничена).
+- MAXLEN стрима — 10 000 (история ограничена; потолок по байтовому бюджету Redis, см. docs/redis.md §3).
 
 ### 2.2. Найти причину
 
