@@ -57,6 +57,9 @@ type packFakePool struct {
 	querySeq    int // счётчик Query для failOnQuery
 	failOnQuery int // уронить Query с этим порядковым номером (1-based)
 	queryErr    error
+
+	failSQL string // SQL, который обязан упасть failSQLCount раз (краш-окна пачки, T-102)
+	failN   int
 }
 
 func newPackFakePool() *packFakePool {
@@ -128,10 +131,14 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 	if p.queryErr != nil {
 		return nil, p.queryErr
 	}
-	var h [HashLen]byte
-	copy(h[:], args[0].([]byte))
+	if p.failSQL != "" && sql == p.failSQL && p.failN > 0 {
+		p.failN--
+		return nil, errors.New("packFakePool: сбой пачки")
+	}
 	switch sql {
 	case sqlMetaPut:
+		var h [HashLen]byte
+		copy(h[:], args[0].([]byte))
 		// RETURNING (xmax = 0): вставка — true, конфликт
 		// (ON CONFLICT DO UPDATE) — false, как в PostgreSQL.
 		if r := p.contents[h]; r != nil {
@@ -145,7 +152,48 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 			clen: args[3].(int32), rawLen: args[4].(int32), refc: 1,
 		}
 		return &packRows{rows: [][]any{{true}}}, nil
+	case sqlMetaAddRefBatch:
+		// Дедуп-пачка (T-102): +1 каждому живому хэшу, RETURNING по нему.
+		var rows [][]any
+		for _, hb := range args[0].([][]byte) {
+			var h [HashLen]byte
+			copy(h[:], hb)
+			if r := p.contents[h]; r != nil && r.refc > 0 {
+				r.refc++
+				rows = append(rows, []any{h[:]})
+			}
+		}
+		return &packRows{rows: rows}, nil
+	case sqlMetaPutBatch:
+		// Пакетный upsert (T-102): строки по unnest-массивам; конфликт —
+		// refcount += n и перенос размещения; RETURNING hash, (xmax = 0).
+		hashes := args[0].([][]byte)
+		packs := args[1].([]int32)
+		offs := args[2].([]int64)
+		clens := args[3].([]int32)
+		rawLens := args[4].([]int32)
+		counts := args[5].([]int32)
+		rows := make([][]any, 0, len(hashes))
+		for i, hb := range hashes {
+			var h [HashLen]byte
+			copy(h[:], hb)
+			if r := p.contents[h]; r != nil {
+				r.refc += counts[i]
+				r.packID, r.off = packs[i], offs[i]
+				r.clen, r.rawLen = clens[i], rawLens[i]
+				rows = append(rows, []any{h[:], false})
+				continue
+			}
+			p.contents[h] = &packFakeRow{
+				packID: packs[i], off: offs[i], clen: clens[i],
+				rawLen: rawLens[i], refc: counts[i],
+			}
+			rows = append(rows, []any{h[:], true})
+		}
+		return &packRows{rows: rows}, nil
 	case sqlMetaGet:
+		var h [HashLen]byte
+		copy(h[:], args[0].([]byte))
 		if r := p.contents[h]; r != nil && r.refc > 0 {
 			return &packRows{rows: [][]any{{r.packID, r.off, r.clen, r.rawLen}}}, nil
 		}

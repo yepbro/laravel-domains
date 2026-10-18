@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -494,6 +495,178 @@ func TestStoreSaveErrors(t *testing.T) {
 	t.Run("nil-результат", func(t *testing.T) {
 		if err := storeSaver(t, newStoreFake(), &bytes.Buffer{}).Save(context.Background(), nil); err != nil {
 			t.Fatalf("Save(nil): %v", err)
+		}
+	})
+}
+
+// --- групповая фиксация доставки (T-102) ----------------------------------------
+
+// batchStoreFake — storeFake с групповой фиксацией: PutBatch пишет
+// элементы пачкой (та же семантика дедупа/refcount) и помнит вызовы;
+// batchErr — сбой пачки целиком, batchErrs — по-элементные отказы
+// (индекс → ошибка), badBatchHash — нарушение контракта HashOf.
+type batchStoreFake struct {
+	*storeFake
+	batches     [][][]byte
+	batchErr    error
+	batchErrs   map[int]error
+	badBatch    bool
+	badBatchMsg string // подстановка чужого хэша в результат
+}
+
+func (f *batchStoreFake) PutBatch(ctx context.Context, items [][]byte) ([]content.PutResult, []error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.batches = append(f.batches, items)
+	if f.batchErr != nil {
+		return nil, nil, f.batchErr
+	}
+	results := make([]content.PutResult, len(items))
+	errs := make([]error, len(items))
+	for i, data := range items {
+		if err := f.batchErrs[i]; err != nil {
+			errs[i] = err
+			continue
+		}
+		h := content.HashOf(data)
+		if f.refs[h] > 0 {
+			f.refs[h]++
+			results[i] = content.PutResult{Hash: h}
+			continue
+		}
+		f.blocks[h] = append([]byte(nil), data...)
+		f.refs[h] = 1
+		f.writes++
+		results[i] = content.PutResult{Hash: h, Created: true}
+	}
+	if f.badBatch {
+		results[0].Hash = content.HashOf([]byte(f.badBatchMsg))
+	}
+	return results, errs, nil
+}
+
+// storeBatchResult — результат с сохраняемыми записями (тела bodies).
+func storeBatchResult(name string, bodies ...string) (*DomainResult, []content.Hash) {
+	res := &DomainResult{ZoneID: 1, DomainID: 1, Name: name,
+		Subdomains: []SubdomainResult{{SubdomainID: 0, Label: "", Hostname: name}}}
+	hashes := make([]content.Hash, len(bodies))
+	for i, b := range bodies {
+		h := content.HashOf([]byte(b))
+		hashes[i] = h
+		res.Subdomains[0].Records = append(res.Subdomains[0].Records, Record{
+			Variant: model.VariantMain, Scheme: model.SchemeHTTPS,
+			FinalURL:    fmt.Sprintf("https://%s/%d", name, i),
+			ContentHash: &h, Body: []byte(b), StoreContent: true,
+		})
+	}
+	return res, hashes
+}
+
+// TestStoreSaveBatch — доставка с несколькими сохраняемыми записями
+// фиксируется одной пачкой (T-102): PutBatch вызван один раз со всеми
+// телами в порядке записей, построчный Put не используется, записи
+// получают хэши и отпускают тела.
+func TestStoreSaveBatch(t *testing.T) {
+	res, hashes := storeBatchResult("batch.test", "тело раз", "тело два", "тело три")
+	st := &batchStoreFake{storeFake: newStoreFake()}
+	if err := storeSaver(t, st, &bytes.Buffer{}).Save(context.Background(), res); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if len(st.batches) != 1 || len(st.batches[0]) != 3 {
+		t.Fatalf("PutBatch: вызовов %d, элементов %d — want 1 пачка из 3", len(st.batches), len(st.batches[0]))
+	}
+	for i, b := range []string{"тело раз", "тело два", "тело три"} {
+		if string(st.batches[0][i]) != b {
+			t.Errorf("элемент пачки %d: тело не совпало (пачка в порядке записей)", i)
+		}
+	}
+	if puts, _, _ := st.snapshot(); puts != 0 {
+		t.Errorf("построчных Put: %d, want 0 (доставка фиксируется пачкой)", puts)
+	}
+	_, writes, refs := st.snapshot()
+	if writes != 3 {
+		t.Errorf("новых блоков: %d, want 3", writes)
+	}
+	for i, rec := range res.Subdomains[0].Records {
+		if rec.ContentHash == nil || rec.ContentNotStored {
+			t.Fatalf("запись %d: hash=%v not_stored=%v", i, rec.ContentHash, rec.ContentNotStored)
+		}
+		if *rec.ContentHash != hashes[i] {
+			t.Errorf("запись %d: хэш записи ≠ HashOf(тела)", i)
+		}
+		if rec.Body != nil {
+			t.Errorf("запись %d удерживает тело после Save", i)
+		}
+		if refs[hashes[i]] != 1 {
+			t.Errorf("запись %d: ссылок %d, want 1", i, refs[hashes[i]])
+		}
+	}
+}
+
+// TestStoreSaveBatchPerItemErrors — по-элементные отказы пачки:
+// ErrTooLarge и ErrStoreFull роняют только свою запись (content_hash =
+// NULL, ContentNotStored), остальные сохранены, Save не ошибается,
+// Warn про переполнение — в логе.
+func TestStoreSaveBatchPerItemErrors(t *testing.T) {
+	res, hashes := storeBatchResult("mixed.test", "нормальное тело", "сверхлимитное тело", "тело в полный диск")
+	st := &batchStoreFake{storeFake: newStoreFake()}
+	st.batchErrs = map[int]error{
+		1: fmt.Errorf("%w: 100500 байт", content.ErrTooLarge),
+		2: content.ErrStoreFull,
+	}
+	var logBuf bytes.Buffer
+	if err := storeSaver(t, st, &logBuf).Save(context.Background(), res); err != nil {
+		t.Fatalf("Save с по-элементными отказами: %v", err)
+	}
+	rec := res.Subdomains[0].Records
+	if rec[0].ContentHash == nil || rec[0].ContentNotStored || rec[0].Body != nil {
+		t.Errorf("здоровая запись: hash=%v not_stored=%v body=%v", rec[0].ContentHash, rec[0].ContentNotStored, rec[0].Body)
+	}
+	for i := 1; i <= 2; i++ {
+		if rec[i].ContentHash != nil || !rec[i].ContentNotStored {
+			t.Errorf("запись %d: hash=%v not_stored=%v — want nil/true", i, rec[i].ContentHash, rec[i].ContentNotStored)
+		}
+	}
+	if _, writes, refs := st.snapshot(); writes != 1 || refs[hashes[0]] != 1 {
+		t.Errorf("сохранена только здоровая запись: блоков %d, ссылок %d", writes, refs[hashes[0]])
+	}
+	if !strings.Contains(logBuf.String(), "переполнено") {
+		t.Errorf("Warn про переполнение отсутствует в логе: %q", logBuf.String())
+	}
+}
+
+// TestStoreSaveBatchErrors — сбой пачки целиком, чужой хэш результата и
+// отмена ctx — ошибка Save (доставка без XACK вернётся повторной
+// доставкой, ТЗ 3.4).
+func TestStoreSaveBatchErrors(t *testing.T) {
+	t.Run("сбой пачки", func(t *testing.T) {
+		res, _ := storeBatchResult("boom-batch.test", "тело")
+		st := &batchStoreFake{storeFake: newStoreFake()}
+		st.batchErr = errors.New("БД недоступна")
+		err := storeSaver(t, st, &bytes.Buffer{}).Save(context.Background(), res)
+		if err == nil || !strings.Contains(err.Error(), "сохранение контента") {
+			t.Fatalf("Save при сбое пачки: %v", err)
+		}
+	})
+	t.Run("чужой хэш пачки", func(t *testing.T) {
+		res, _ := storeBatchResult("hash-batch.test", "тело")
+		st := &batchStoreFake{storeFake: newStoreFake()}
+		st.badBatch, st.badBatchMsg = true, "чужой хэш пачки"
+		err := storeSaver(t, st, &bytes.Buffer{}).Save(context.Background(), res)
+		if err == nil || !strings.Contains(err.Error(), "HashOf") {
+			t.Fatalf("Save при чужом хэше пачки: %v", err)
+		}
+	})
+	t.Run("отмена ctx", func(t *testing.T) {
+		res, _ := storeBatchResult("cancel-batch.test", "тело")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := storeSaver(t, &batchStoreFake{storeFake: newStoreFake()}, &bytes.Buffer{}).Save(ctx, res)
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("Save при отмене: %v", err)
 		}
 	})
 }

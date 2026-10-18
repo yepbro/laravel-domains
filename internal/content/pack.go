@@ -150,8 +150,19 @@ var _ ContentStore = (*PackStore)(nil)
 // packFile — открытый на дописывание пак.
 type packFile struct {
 	id   int32
-	f    *os.File
+	f    packWriter
 	size int64 // актуализируется stat'ом под блокировкой
+}
+
+// packWriter — файл пака, как он нужен писателю: реальный *os.File или
+// подстановка тестов (обёртка с подсчётом fsync групповой фиксации,
+// T-102; стиль SpaceChecker в disk.go).
+type packWriter interface {
+	Write(p []byte) (int, error)
+	ReadAt(p []byte, off int64) (int, error)
+	Stat() (fs.FileInfo, error)
+	Sync() error
+	Close() error
 }
 
 // packHeader — метаданные пак-файла (v1).
