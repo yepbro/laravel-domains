@@ -163,6 +163,30 @@ func (c *limitGatedClock) Sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// limitCountingClock — реальные часы со счётчиком вызовов Sleep: резервирование
+// токена обязано давать ровно один sleep на ждущего (поллинг «проснуться и
+// пересчитать» плодил бы десятки пробуждений на пачку).
+type limitCountingClock struct {
+	sleeps atomic.Int64
+}
+
+func (c *limitCountingClock) clock() limitClock {
+	return limitClock{
+		now: time.Now,
+		sleep: func(ctx context.Context, d time.Duration) error {
+			c.sleeps.Add(1)
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-t.C:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+}
+
 // newTestLimit — лимитёр над фейком с фальшивыми часами.
 func newTestLimit(t *testing.T, modify func(*LimitOptions), clock limitClock, next Resolver) *LimitResolver {
 	t.Helper()
@@ -400,6 +424,66 @@ func TestLimitBucketRateChange(t *testing.T) {
 	}
 	if sleeps := fc.slept(); !equalDurations(sleeps, []time.Duration{500 * time.Millisecond}) {
 		t.Fatalf("паузы: %v, want [500ms]", sleeps)
+	}
+}
+
+// TestLimitBucketSingleWakePerToken — резервирование вместо поллинга:
+// очередь ждущих расходится по персональным меткам, каждый ждущий спит
+// один раз. Поллинг будил бы всех к каждому токену: при 9 ждущих и темпе
+// 100 QPS — 45 пауз вместо 9 (DNS-01).
+func TestLimitBucketSingleWakePerToken(t *testing.T) {
+	cc := &limitCountingClock{}
+	b := newLimitBucket(100, 1, cc.clock()) // burst 1: один сразу, ждут все прочие
+	const total = 10
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := b.take(context.Background()); err != nil {
+				t.Errorf("take: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := cc.sleeps.Load(); n != total-1 {
+		t.Fatalf("пауз %d, want %d (по одной на ждущего — шторма пробуждений нет)", n, total-1)
+	}
+	// Последний ждущий встал в очередь ~сразу после старта: его метка —
+	// 9/100 с. Реальные таймеры спят не меньше запроса, нижняя граница
+	// надёжна.
+	if since := time.Since(start); since < 9*10*time.Millisecond {
+		t.Fatalf("итоговое время %s < 90 мс — темп очереди не выдержан", since)
+	}
+}
+
+// TestLimitBucketUnreserve — отмена ждущего возвращает резерв: отменённое
+// ожидание не оставляет долг, удлиняющий ожидание очереди за ним.
+func TestLimitBucketUnreserve(t *testing.T) {
+	fc := newLimitManualClock()
+	b := newLimitBucket(1, 1, fc.clock())
+
+	if _, ok := b.reserve(); !ok {
+		t.Fatal("первый токен обязан пройти без ожидания")
+	}
+	wait, ok := b.reserve() // баланс −1: ждём 1 с
+	if ok || wait != time.Second {
+		t.Fatalf("reserve = (%v, %v), want (1s, false)", wait, ok)
+	}
+	b.unreserve() // отмена ждущего: долг снят
+	wait, ok = b.reserve()
+	if ok || wait != time.Second {
+		t.Fatalf("reserve после unreserve = (%v, %v), want (1s, false) — долг не накопился", wait, ok)
+	}
+
+	// Долг двух ждущих без отмены — третий метки дальше: 3 с, не 2 с.
+	b.unreserve()
+	_, _ = b.reserve()
+	_, _ = b.reserve()
+	wait, ok = b.reserve()
+	if ok || wait != 3*time.Second {
+		t.Fatalf("reserve третьего в очереди = (%v, %v), want (3s, false)", wait, ok)
 	}
 }
 
