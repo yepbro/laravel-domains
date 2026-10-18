@@ -32,9 +32,10 @@
 // WHERE перепроверяет условия отбора на актуальной версии строки —
 // гонка с delete-файлом (T-019) или вторым проходом не переведёт
 // строку, изменившую состояние между выборкой и блокировкой (как
-// охрана статуса в cleanupDeleteSQL, T-020). Подзапрос каждый раз
-// сканирует с начала таблицы: ценой лишних чтений проход не хранит
-// позицию — внешнего состояния нет, сбой и рестарт ничего не теряют.
+// охрана статуса в cleanupDeleteSQL, T-020). Подзапрос идёт по
+// частичному индексу domains_recheck_idx с самых старых done-строк
+// (миграция 000008, T-104): пачки дренажа линейны, а проход не хранит
+// позиции — внешнего состояния нет, сбой и рестарт ничего не теряют.
 package scheduler
 
 import (
@@ -69,22 +70,39 @@ const (
 
 // recheckUpdateSQL — один проход: пачка созревших доменов (check_state
 // = done, last_checked_at старше порога, не deleted) переводится в
-// pending без смены статуса результата. LIMIT в подзапросе — пачка;
-// ORDER BY по ключу домена (совпадает с PK, ТЗ 6.1) даёт
-// детерминированные пачки. Сравнение date < timestamptz — неявный
-// привод даты к моменту: гранулярность колонки — день (ТЗ 6.1),
-// «старше интервала» выполняется с точностью до дня. Внешний WHERE
-// перепроверяет ВСЕ условия отбора на актуальной версии строки —
-// включая возраст last_checked_at (симметрия с lease.go: гонка со
-// свежей записью результата между выборкой и блокировкой не переведёт
-// заново проверенный домен).
-const recheckUpdateSQL = "UPDATE domains AS d " +
-	"SET check_state = $1, queued_at = NULL " +
-	"FROM (SELECT zone_id, id FROM domains " +
-	"WHERE check_state = $2 AND status <> $3 AND last_checked_at < $4 " +
-	"ORDER BY zone_id, id LIMIT $5) AS b " +
-	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3 AND d.last_checked_at < $4"
+// pending без смены статуса результата. LIMIT в подзапросе — пачка.
+// Сравнение date < timestamptz — кросс-типовой оператор btree-opfamily
+// datetime: индекс по last_checked_at применим и к параметру-порогу
+// timestamptz, гранулярность колонки — день (ТЗ 6.1), «старше интервала»
+// выполняется с точностью до дня. Внешний WHERE перепроверяет ВСЕ условия
+// отбора на актуальной версии строки — включая возраст last_checked_at
+// (симметрия с lease.go: гонка со свежей записью результата между
+// выборкой и блокировкой не переведёт заново проверенный домен).
+//
+// Коды check_state/status вшиты в текст литералами через model.* — коды
+// схемы, а не данные (стиль dispatch.go): параметр в предикате частичного
+// индекса планировщик не доказывает, generic-план подготовленного
+// выражения (pgx кеширует их) терял бы пригодность domains_recheck_idx
+// (миграция 000008, T-104).
+//
+// ORDER BY (last_checked_at, zone_id, id) совпадает с ключом
+// domains_recheck_idx: скан читает с самых старых done-строк ровно
+// созревший префикс и останавливается по LIMIT. Пачки дренажа
+// детерминированы (уникальный доменный ключ в хвосте сортировки),
+// перевод идёт от самых давно проверенных; переведённые строки покидают
+// индекс, следующая пачка продолжается с места остановки — дренаж линеен
+// и не перечитывает несозревшее множество (внешнего состояния нет,
+// сбой и рестарт ничего не теряют, ТЗ 3.4).
+var recheckUpdateSQL = fmt.Sprintf(
+	"UPDATE domains AS d "+
+		"SET check_state = $1, queued_at = NULL "+
+		"FROM (SELECT zone_id, id FROM domains "+
+		"WHERE check_state = %d AND status <> %d AND last_checked_at < $2 "+
+		"ORDER BY last_checked_at, zone_id, id LIMIT $3) AS b "+
+		"WHERE d.zone_id = b.zone_id AND d.id = b.id "+
+		"AND d.check_state = %d AND d.status <> %d AND d.last_checked_at < $2",
+	int16(model.CheckStateDone), int16(model.StatusDeleted),
+	int16(model.CheckStateDone), int16(model.StatusDeleted))
 
 // RecheckOptions — параметры перепроверки; нулевые значения заменяются
 // дефолтами (withDefaults, стиль ingest.CleanupOptions).
@@ -146,8 +164,6 @@ func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckR
 
 	tag, err := pool.Exec(ctx, recheckUpdateSQL,
 		int16(model.CheckStatePending),
-		int16(model.CheckStateDone),
-		int16(model.StatusDeleted),
 		cutoff,
 		o.BatchSize,
 	)

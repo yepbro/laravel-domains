@@ -69,10 +69,23 @@ const (
 // leaseUpdateSQL — один проход: пачка доменов с истёкшей арендой
 // (check_state = queued, queued_at старше порога, не deleted) переводится
 // в pending, отметка аренды сбрасывается — у pending нет lease (инвариант
-// T-018/T-030). LIMIT в подзапросе — пачка; ORDER BY по ключу домена
-// (совпадает с PK, ТЗ 6.1) даёт детерминированные пачки. Внешний WHERE
-// перепроверяет отбор на момент блокировки строки (гонки с воркерами и
-// вторым проходом).
+// T-018/T-030). LIMIT в подзапросе — пачка. Внешний WHERE перепроверяет
+// отбор на момент блокировки строки (гонки с воркерами и вторым
+// проходом).
+//
+// Коды check_state/status вшиты в текст литералами через model.* — коды
+// схемы, а не данные (стиль dispatch.go): параметр в предикате частичного
+// индекса планировщик не доказывает, generic-план подготовленного
+// выражения (pgx кеширует их) терял бы пригодность domains_lease_idx
+// (миграция 000008, T-104).
+//
+// ORDER BY (queued_at, zone_id, id) совпадает с ключом domains_lease_idx:
+// скан читает с начала индекса только истёкшие аренды и останавливается
+// на первой неистёкшей; пачки дренажа детерминированы (уникальный
+// доменный ключ в хвосте сортировки) и линейны — переведённые строки
+// покидают индекс, следующая пачка продолжается с места остановки, без
+// перечитывания пропускаемого множества. Самые старые аренды
+// возвращаются первыми.
 //
 // Порог аренды считается часами СЕРВЕРА БД: queued_at пишется серверным
 // now() (enqueueUpdate), расхождение часов процесса планировщика с часами
@@ -82,15 +95,18 @@ const (
 // LeaseOptions.Now); в бою параметр NULL — COALESCE берёт now() сервера.
 // Срок передан секундами через make_interval — интервал в одной точке
 // правды, без клиентской арифметики timestamp.
-const leaseUpdateSQL = "UPDATE domains AS d " +
-	"SET check_state = $1, queued_at = NULL " +
-	"FROM (SELECT zone_id, id FROM domains " +
-	"WHERE check_state = $2 AND status <> $3 " +
-	"AND queued_at < COALESCE($4::timestamptz, now()) - make_interval(secs => $5) " +
-	"ORDER BY zone_id, id LIMIT $6) AS b " +
-	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3 " +
-	"AND d.queued_at < COALESCE($4::timestamptz, now()) - make_interval(secs => $5)"
+var leaseUpdateSQL = fmt.Sprintf(
+	"UPDATE domains AS d "+
+		"SET check_state = $1, queued_at = NULL "+
+		"FROM (SELECT zone_id, id FROM domains "+
+		"WHERE check_state = %d AND status <> %d "+
+		"AND queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3) "+
+		"ORDER BY queued_at, zone_id, id LIMIT $4) AS b "+
+		"WHERE d.zone_id = b.zone_id AND d.id = b.id "+
+		"AND d.check_state = %d AND d.status <> %d "+
+		"AND d.queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3)",
+	int16(model.CheckStateQueued), int16(model.StatusDeleted),
+	int16(model.CheckStateQueued), int16(model.StatusDeleted))
 
 // LeaseOptions — параметры возврата; нулевые значения заменяются
 // дефолтами (withDefaults, стиль RecheckOptions/ingest.CleanupOptions).
@@ -164,8 +180,6 @@ func LeaseOnce(ctx context.Context, pool db.DB, opts LeaseOptions) (LeaseResult,
 
 	tag, err := pool.Exec(ctx, leaseUpdateSQL,
 		int16(model.CheckStatePending),
-		int16(model.CheckStateQueued),
-		int16(model.StatusDeleted),
 		now,
 		o.Timeout.Seconds(),
 		o.BatchSize,
@@ -187,11 +201,10 @@ func LeaseOnce(ctx context.Context, pool db.DB, opts LeaseOptions) (LeaseResult,
 // shutdown, ТЗ 3.4).
 //
 // Интервал проверок — lease/2 (а не фикс): баланс «скорость возврата vs
-// нагрузка». Проход ищет queued-строки, индекса по check_state = 1 нет
-// (частичный индекс — только pending, миграция 000001; индексация — вне
-// задачи), поэтому частота обязана масштабироваться со сроком аренды:
-// фикс при lease 30 мин давал бы десятки проходов за срок ради выигрыша
-// в минуты возврата, а при коротком настраиваемом lease и вовсе
+// нагрузка». Проход с индексом domains_lease_idx (T-104) стоит столько,
+// сколько в нём зависших доменов (штатно единицы строк), но фикс при
+// lease 30 мин всё равно давал бы десятки холостых проходов за срок ради
+// выигрыша в минуты возврата, а при коротком настраиваемом lease и вовсе
 // «переспал» бы сам срок. Половина срока — две проверки за аренду:
 // истёкший lease обнаруживается не позже чем через полсрока после
 // истечения, всего домен зависнет не дольше чем на полтора срока.

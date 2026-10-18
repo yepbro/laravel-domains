@@ -56,7 +56,7 @@ type Domain struct {
 	Flags         Flags      `db:"flags"`           // бит 0 is_idn, бит 1 render_pending
 	DNSMask       DNSMask    `db:"dns_mask"`        // резолвящиеся субдомены
 	QueuedAt      *time.Time `db:"queued_at"`       // lease постановки в очередь
-	LastCheckedAt *time.Time `db:"last_checked_at"` // date; не индексируется (HOT-апдейты)
+	LastCheckedAt *time.Time `db:"last_checked_at"` // date; индексируется частично (domains_recheck_idx, T-104)
 	// TempAttempts — число назначенных подряд повторных проверок
 	// temp_error (T-031, миграция 000005): наращивает планировщик при
 	// назначении повтора, сбрасывается при итоговом статусе и успешной

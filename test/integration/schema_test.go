@@ -1,10 +1,13 @@
 // Интеграционные контракты схемы (ТЗ 6, 6.1):
 //
 //   - T-003, таблицы zones/subdomains/domains: партиционирование LIST по
-//     zone_id, fillfactor = 85 у каждой листовой партиции, частичный индекс
-//     планировщика domains_pending_idx, sequence domain_id_seq,
-//     HOT-совместимость — часто обновляемые колонки не входят ни в один
-//     индекс (минимум индексов, last_checked_at без индекса);
+//     zone_id, fillfactor = 85 у каждой листовой партиции, частичные
+//     индексы проходов планировщика по check_state — выборка pending
+//     (domains_pending_idx), возврат lease (domains_lease_idx) и
+//     перепроверка (domains_recheck_idx, T-104), sequence domain_id_seq,
+//     HOT-совместимость — массово обновляемые колонки не входят ни в один
+//     индекс, кроме возраста lease/recheck в ключах (меняется только
+//     вместе с check_state);
 //   - T-004, таблицы subdomain_results/contents/laravel_domains/
 //     laravel_findings/ingest_files: партиционирование таблиц с domain_id,
 //     fillfactor = 85 листьев subdomain_results (частые перезаписи
@@ -229,11 +232,16 @@ func TestSchema_DomainsPartitioning(t *testing.T) {
 	}
 }
 
-// TestSchema_DomainsIndexes — на domains ровно три индекса («минимум
+// TestSchema_DomainsIndexes — на domains ровно пять индексов («минимум
 // индексов», ТЗ 6): первичный ключ, уникальный (zone_id, label) для поиска
-// по имени (ТЗ 5.11) и частичный domains_pending_idx для выборки pending
-// планировщиком (ТЗ 5.3). У каждой листовой партиции — прикреплённые
-// дочерние индексы всех индексов родителя.
+// по имени (ТЗ 5.11) и три частичных по check_state для проходов
+// планировщика (ТЗ 5.3): выборка pending (domains_pending_idx, 000001),
+// возврат истёкших lease (domains_lease_idx, T-104) и суточная
+// перепроверка (domains_recheck_idx, T-104). Ключи фоновых индексов
+// начинаются с колонки возраста (queued_at / last_checked_at) и
+// завершаются доменным ключом — ORDER BY проходов совпадает с ключом,
+// скан читает только нужный префикс. У каждой листовой партиции —
+// прикреплённые дочерние индексы всех индексов родителя.
 func TestSchema_DomainsIndexes(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -243,6 +251,8 @@ func TestSchema_DomainsIndexes(t *testing.T) {
 		"domains_pkey":              true,
 		"domains_zone_id_label_key": true,
 		"domains_pending_idx":       true,
+		"domains_lease_idx":         true,
+		"domains_recheck_idx":       true,
 	}
 	got := make(map[string]bool, len(indexes))
 	for _, ix := range indexes {
@@ -259,20 +269,30 @@ func TestSchema_DomainsIndexes(t *testing.T) {
 		}
 	}
 
-	var pending *tableIndex
-	for i := range indexes {
-		if indexes[i].name == "domains_pending_idx" {
-			pending = &indexes[i]
+	// Частичные индексы проходов: предикат — только check_state,
+	// ключ — колонка возраста + доменный ключ (T-104, миграция 000008;
+	// pending — 000001).
+	wantPartial := map[string]struct{ key, pred string }{
+		"domains_pending_idx": {"(zone_id, id)", "check_state = 0"},
+		"domains_lease_idx":   {"(queued_at, zone_id, id)", "check_state = 1"},
+		"domains_recheck_idx": {"(last_checked_at, zone_id, id)", "check_state = 2"},
+	}
+	for name, w := range wantPartial {
+		var ix *tableIndex
+		for i := range indexes {
+			if indexes[i].name == name {
+				ix = &indexes[i]
+			}
 		}
-	}
-	if pending == nil {
-		t.Fatal("domains_pending_idx не найден")
-	}
-	if !strings.Contains(pending.pred, "check_state = 0") {
-		t.Errorf("domains_pending_idx: предикат = %q, want \"check_state = 0\"", pending.pred)
-	}
-	if key, _, _ := strings.Cut(pending.def, " WHERE "); !strings.Contains(key, "(zone_id, id)") {
-		t.Errorf("domains_pending_idx: ключ = %q, want (zone_id, id)", key)
+		if ix == nil {
+			t.Fatalf("%s не найден", name)
+		}
+		if key, _, _ := strings.Cut(ix.def, " WHERE "); !strings.Contains(key, w.key) {
+			t.Errorf("%s: ключ = %q, want %s", name, key, w.key)
+		}
+		if !strings.Contains(ix.pred, w.pred) {
+			t.Errorf("%s: предикат = %q, want %q", name, ix.pred, w.pred)
+		}
 	}
 
 	for _, p := range leafPartitions(t, pool, "domains") {
@@ -335,36 +355,60 @@ func TestSchema_DomainIDSequence(t *testing.T) {
 	}
 }
 
-// TestSchema_DomainsHOTColumns — обновляемые при проверке колонки (status,
-// flags, dns_mask, queued_at, last_checked_at) не входят ни в один индекс:
-// массовые апдейты результатов остаются HOT, а fillfactor = 85 оставляет
-// место под новые версии строк на той же странице (ТЗ 6). Исключение из
-// HOT — смены check_state: колонка входит в предикат domains_pending_idx,
-// что неустранимо при требуемом ТЗ частичном индексе (§ 5.3).
+// TestSchema_DomainsHOTColumns — обновляемые при проверке колонки не
+// входят ни в один индекс, кроме заранее принятых компромиссов (ТЗ 6):
+// massовые апдейты остаются HOT, а fillfactor = 85 оставляет место под
+// новые версии строк на той же странице. Два компромисса:
+//
+//   - check_state — в предикатах трёх частичных индексов проходов
+//     (pending/lease/recheck): смены состояний всегда non-HOT —
+//     неустранимо при требуемых ТЗ §5.3 частичных индексах;
+//   - queued_at / last_checked_at — в ключах lease/recheck-индексов
+//     (T-104): их апдейты non-HOT, однако все писатели меняют эти
+//     колонки ТОЛЬКО вместе с check_state (enqueue, возврат lease,
+//     перепроверка, результат воркера dns/http, воскрешение add-файлом) —
+//     переходы уже non-HOT, новых non-HOT апдейтов индексы не создают.
+//
+// status остаётся вне любых индексов: массовые смены статуса без смены
+// check_state (delete-файлы, фиксация итогового статуса temp_error)
+// сохраняют HOT — поэтому retry-проход индекса не имеет.
 func TestSchema_DomainsHOTColumns(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 
-	hotColumns := []string{"status", "flags", "dns_mask", "queued_at", "last_checked_at", "temp_attempts"}
+	hotColumns := []string{"status", "flags", "dns_mask", "temp_attempts"}
+	// Колонки возраста — только в ключе своего индекса прохода.
+	ageColumns := map[string]string{
+		"queued_at":       "domains_lease_idx",
+		"last_checked_at": "domains_recheck_idx",
+	}
 	for _, ix := range tableIndexes(t, pool, "domains") {
 		for _, col := range hotColumns {
 			if containsWord(ix.def, col) {
 				t.Errorf("индекс %s ссылается на часто обновляемую колонку %s: её апдейты перестают быть HOT", ix.name, col)
 			}
 		}
-		if ix.name != "domains_pending_idx" && containsWord(ix.def, "check_state") {
-			t.Errorf("индекс %s ссылается на check_state: допустимо только в предикате domains_pending_idx", ix.name)
+		for col, allowed := range ageColumns {
+			if ix.name != allowed && containsWord(ix.def, col) {
+				t.Errorf("индекс %s ссылается на колонку %s: допустима только в ключе %s", ix.name, col, allowed)
+			}
+		}
+		if containsWord(ix.def, "check_state") &&
+			ix.name != "domains_pending_idx" && ix.name != "domains_lease_idx" && ix.name != "domains_recheck_idx" {
+			t.Errorf("индекс %s ссылается на check_state: допустимо только в предикатах индексов проходов", ix.name)
 		}
 	}
 
-	// В самом domains_pending_idx check_state — только предикат, не ключ.
+	// В частичных индексах проходов check_state — только предикат, не ключ:
+	// индексация смен состояний делала бы их non-HOT даже там, где фильтра
+	// по состоянию достаточно.
 	for _, ix := range tableIndexes(t, pool, "domains") {
-		if ix.name != "domains_pending_idx" {
-			continue
-		}
-		key, _, _ := strings.Cut(ix.def, " WHERE ")
-		if containsWord(key, "check_state") {
-			t.Errorf("domains_pending_idx: check_state в ключе (%s): индексируемые смены состояния всегда non-HOT", key)
+		switch ix.name {
+		case "domains_pending_idx", "domains_lease_idx", "domains_recheck_idx":
+			key, _, _ := strings.Cut(ix.def, " WHERE ")
+			if containsWord(key, "check_state") {
+				t.Errorf("%s: check_state в ключе (%s): индексируемые смены состояния всегда non-HOT", ix.name, key)
+			}
 		}
 	}
 }

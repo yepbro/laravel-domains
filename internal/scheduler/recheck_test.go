@@ -90,10 +90,10 @@ func (p *recheckFakePool) calls() []recheckCall {
 const wantRecheckUpdate = "UPDATE domains AS d " +
 	"SET check_state = $1, queued_at = NULL " +
 	"FROM (SELECT zone_id, id FROM domains " +
-	"WHERE check_state = $2 AND status <> $3 AND last_checked_at < $4 " +
-	"ORDER BY zone_id, id LIMIT $5) AS b " +
+	"WHERE check_state = 2 AND status <> 6 AND last_checked_at < $2 " +
+	"ORDER BY last_checked_at, zone_id, id LIMIT $3) AS b " +
 	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3 AND d.last_checked_at < $4"
+	"AND d.check_state = 2 AND d.status <> 6 AND d.last_checked_at < $2"
 
 // recheckFixedClock — часы с фиксированным «сейчас» (порог прохода
 // воспроизводим до наносекунды).
@@ -129,8 +129,6 @@ func TestRecheckOnceSQL(t *testing.T) {
 	}
 	wantArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
-		int16(model.CheckStateDone),    // отбор: готовые
-		int16(model.StatusDeleted),     // отбор: удалённые не перепроверяются
 		now.Add(-2190 * time.Hour),     // граница now() − interval
 		7000,                           // LIMIT пачки
 	}
@@ -154,11 +152,11 @@ func TestRecheckOnceDefaults(t *testing.T) {
 	}
 
 	args := pool.calls()[0].args
-	if args[4] != DefaultRecheckBatch {
-		t.Errorf("LIMIT = %v, want дефолт %d", args[4], DefaultRecheckBatch)
+	if args[2] != DefaultRecheckBatch {
+		t.Errorf("LIMIT = %v, want дефолт %d", args[2], DefaultRecheckBatch)
 	}
-	if got, ok := args[3].(time.Time); !ok || !got.Equal(now.Add(-DefaultRecheckInterval)) {
-		t.Errorf("порог = %v, want %v (now − дефолт %s)", args[3], now.Add(-DefaultRecheckInterval), DefaultRecheckInterval)
+	if got, ok := args[1].(time.Time); !ok || !got.Equal(now.Add(-DefaultRecheckInterval)) {
+		t.Errorf("порог = %v, want %v (now − дефолт %s)", args[1], now.Add(-DefaultRecheckInterval), DefaultRecheckInterval)
 	}
 }
 

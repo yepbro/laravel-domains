@@ -90,12 +90,12 @@ func (p *leaseFakePool) calls() []leaseCall {
 const wantLeaseUpdate = "UPDATE domains AS d " +
 	"SET check_state = $1, queued_at = NULL " +
 	"FROM (SELECT zone_id, id FROM domains " +
-	"WHERE check_state = $2 AND status <> $3 " +
-	"AND queued_at < COALESCE($4::timestamptz, now()) - make_interval(secs => $5) " +
-	"ORDER BY zone_id, id LIMIT $6) AS b " +
+	"WHERE check_state = 1 AND status <> 6 " +
+	"AND queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3) " +
+	"ORDER BY queued_at, zone_id, id LIMIT $4) AS b " +
 	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3 " +
-	"AND d.queued_at < COALESCE($4::timestamptz, now()) - make_interval(secs => $5)"
+	"AND d.check_state = 1 AND d.status <> 6 " +
+	"AND d.queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3)"
 
 // leaseFixedClock — часы с фиксированным «сейчас» (порог прохода
 // воспроизводим до наносекунды).
@@ -132,8 +132,6 @@ func TestLeaseOnceSQL(t *testing.T) {
 	}
 	wantArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
-		int16(model.CheckStateQueued),  // отбор: в аренде
-		int16(model.StatusDeleted),     // отбор: удалённые вне цикла
 		&now,                           // «сейчас» тестовых часов (в бою NULL → now() БД)
 		(15 * time.Minute).Seconds(),   // срок аренды — make_interval
 		8000,                           // LIMIT пачки
@@ -155,11 +153,11 @@ func TestLeaseOnceClockIsServer(t *testing.T) {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
 	args := pool.calls()[0].args
-	if got, ok := args[3].(*time.Time); !ok || got != nil {
-		t.Errorf("«сейчас» = %v (%T), want nil *time.Time — часы сервера БД", args[3], args[3])
+	if got, ok := args[1].(*time.Time); !ok || got != nil {
+		t.Errorf("«сейчас» = %v (%T), want nil *time.Time — часы сервера БД", args[1], args[1])
 	}
-	if got, ok := args[4].(float64); !ok || got != (30*time.Minute).Seconds() {
-		t.Errorf("срок = %v, want %v секунд дефолта", args[4], (30 * time.Minute).Seconds())
+	if got, ok := args[2].(float64); !ok || got != (30*time.Minute).Seconds() {
+		t.Errorf("срок = %v, want %v секунд дефолта", args[2], (30 * time.Minute).Seconds())
 	}
 }
 
@@ -175,14 +173,14 @@ func TestLeaseOnceDefaults(t *testing.T) {
 	}
 
 	args := pool.calls()[0].args
-	if args[5] != DefaultLeaseBatch {
-		t.Errorf("LIMIT = %v, want дефолт %d", args[5], DefaultLeaseBatch)
+	if args[3] != DefaultLeaseBatch {
+		t.Errorf("LIMIT = %v, want дефолт %d", args[3], DefaultLeaseBatch)
 	}
-	if got, ok := args[3].(*time.Time); !ok || !got.Equal(now) {
-		t.Errorf("«сейчас» = %v, want фиксированные часы %v", args[3], now)
+	if got, ok := args[1].(*time.Time); !ok || !got.Equal(now) {
+		t.Errorf("«сейчас» = %v, want фиксированные часы %v", args[1], now)
 	}
-	if got, ok := args[4].(float64); !ok || got != DefaultLeaseTimeout.Seconds() {
-		t.Errorf("срок = %v, want дефолт %s в секундах", args[4], DefaultLeaseTimeout)
+	if got, ok := args[2].(float64); !ok || got != DefaultLeaseTimeout.Seconds() {
+		t.Errorf("срок = %v, want дефолт %s в секундах", args[2], DefaultLeaseTimeout)
 	}
 }
 

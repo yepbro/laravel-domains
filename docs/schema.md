@@ -3,8 +3,9 @@
 Решения по схеме (задачи T-003 — `zones`, `subdomains`, `domains`; T-004 —
 `subdomain_results`, `contents`, `laravel_domains`, `laravel_findings`,
 `ingest_files`; T-005 — субпартиционирование крупных зон; T-031 — колонка
-`domains.temp_attempts`; T-082 — SQL-функция `domain_info`). Механизм
-применения миграций — в [`migrations.md`](migrations.md).
+`domains.temp_attempts`; T-082 — SQL-функция `domain_info`; T-104 —
+частичные индексы фоновых проходов `domains_lease_idx`/`domains_recheck_idx`).
+Механизм применения миграций — в [`migrations.md`](migrations.md).
 
 Контракт схемы закреплён интеграционными тестами
 `test/integration/schema_test.go` и
@@ -191,7 +192,7 @@ parameters for a partitioned table»). Поэтому `WITH (fillfactor = 85)` �
 
 | Таблица | Индексы | Назначение |
 |---|---|---|
-| `domains` | `domains_pkey` (`zone_id, id`); `domains_zone_id_label_key` (`zone_id, label`); `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0` | поиск по имени (ТЗ 5.11), идемпотентность ingest (ТЗ 5.1), выборка pending планировщиком (ТЗ 5.3) |
+| `domains` | `domains_pkey` (`zone_id, id`); `domains_zone_id_label_key` (`zone_id, label`); `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0`; `domains_lease_idx` (`queued_at, zone_id, id`) `WHERE check_state = 1`; `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` | поиск по имени (ТЗ 5.11), идемпотентность ingest (ТЗ 5.1), выборка pending планировщиком (ТЗ 5.3), возврат истёкших lease (T-029/T-104), суточная перепроверка (T-030/T-104) — см. раздел «Индексы фоновых проходов» |
 | `subdomain_results` | `subdomain_results_pkey` (`zone_id, domain_id, subdomain_id, variant`) | чтение результатов домена — по префиксу `(zone_id, domain_id)` первичного ключа; идемпотентная перезапись при перепроверке |
 | `contents` | `contents_pkey` (`hash`); `contents_pack_off_idx` (`pack_id, off`) | дедупликация и чтение метаданных по 16-байтному хэшу (ТЗ 5.7); запросы компактификации паков — фильтр по `pack_id` и порядок по `off` (T-096) |
 | `laravel_domains` | `laravel_domains_pkey` (`zone_id, domain_id`) | агрегат по домену; обновление при переанализе |
@@ -218,6 +219,57 @@ T-096): это не индекс «под будущую выборку», а п
 родителя (проверяется тестом — число индексов листа равно числу индексов
 родителя).
 
+## Индексы фоновых проходов планировщика (T-104)
+
+Миграция 000007 (отложенная находка S-04): до неё индексировалась только
+выборка pending — возврат истёкших lease (T-029, каждые lease/2 ≈ 15 мин) и
+суточная перепроверка (T-030) делали полный seq scan по таблице (до 350 млн
+строк), а дренаж перепроверки пачками перечитывал пропускаемое несозревшее
+множество — квадратично. Карта «запрос → индекс»:
+
+| Проход | Предикат прохода | Индекс |
+|---|---|---|
+| выборка pending (T-027) | `check_state = 0`, не deleted, ORDER BY `(zone_id, id)` | `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0` |
+| возврат lease (T-029) | `check_state = 1`, не deleted, `queued_at < now() − lease`, ORDER BY `(queued_at, zone_id, id)` | `domains_lease_idx` (`queued_at, zone_id, id`) `WHERE check_state = 1` |
+| перепроверка (T-030) | `check_state = 2`, не deleted, `last_checked_at < now() − interval`, ORDER BY `(last_checked_at, zone_id, id)` | `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` |
+| повтор temp_error (T-031) | `status = temp_error AND check_state = 2`, `last_checked_at < now() − retry_after` | **нет** — см. ниже |
+| коллектор backlog (T-077) | `status <> deleted` GROUP BY `check_state` | **нет** — агрегат по всей таблице, частичным индексом не сводится |
+
+Свойства формы ключей:
+
+- **колонка возраста первой** — диапазонный скан читает только нужный
+  префикс: lease — с начала индекса до первой неистёкшей аренды (штатно
+  0–сотни строк), recheck — с самых старых done-строк до лимита пачки;
+- **доменный ключ в хвосте** (`zone_id, id`) — ORDER BY прохода совпадает
+  с ключом индекса: без сортировки, детерминированные пачки и ранний
+  останов LIMIT; ключи читаются из индекса без обращения к куче (куча —
+  только фильтр `status <> deleted`);
+- **линейный дренаж пачками**: переведённые строки покидают индекс
+  (больше не удовлетворяют предикату `check_state`), следующая пачка
+  продолжается с места остановки — внешнего состояния нет (ТЗ 3.4), а
+  пропускаемое множество не перечитывается;
+- **литералы кодов в SQL**: `check_state`/`status` вшиты в текст запросов
+  через `model.*` (стиль dispatch.go) — параметр в предикате частичного
+  индекса планировщик не доказывает, generic-план подготовленного
+  выражения (pgx кеширует их) терял бы индекс. Сравнение
+  `last_checked_at < $параметр-timestamptz` работает напрямую:
+  кросс-типовой оператор `date < timestamptz` входит в btree-opfamily
+  datetime;
+- **размер**: `domains_lease_idx` ограничен множеством «в работе»
+  (выборка → lease), `domains_recheck_idx` покрывает все done-строки
+  (~26 байт на домен) — цена суточной перепроверки корпуса в сотни
+  миллионов строк.
+
+**Повторные проверки temp_error (T-031) — без индекса сознательно.**
+Предикат прохода сводится к `status = temp_error`, а любой индекс с
+`status` в ключе или предикате ломал бы HOT массовых апдейтов статуса без
+смены `check_state`: применение delete-файлов (T-019, `status → deleted`)
+и фиксация итогового статуса после исчерпания попыток (T-031,
+`status → delegated_no_address`). `domains_recheck_idx` не выручает: окно
+24 ч покрывает почти все done-строки, скан по возрасту читал бы их целиком
+ради редких temp_error. Проход остаётся seq scan с часовым интервалом;
+после дренажа множество кандидатов пусто до созревания новых temp_error.
+
 ## sequence domain_id_seq
 
 `domains.id` получает значения из единой sequence `domain_id_seq`
@@ -235,17 +287,31 @@ T-096): это не индекс «под будущую выборку», а п
 HOT (без записи в индексы), пока обновляемая колонка не входит ни в один
 индекс — ни в ключ, ни в предикат:
 
-- `status`, `flags`, `dns_mask`, `queued_at`, `last_checked_at`,
-  `temp_attempts` **не входят ни в один индекс** — массовые апдейты
-  результатов HOT; `last_checked_at` не индексируется явно по ТЗ §6.
-  Проверено эмпирически по `pg_stat_user_tables` (`n_tup_hot_upd` растёт)
-  и закреплено тестом `TestSchema_DomainsHOTColumns`.
-- `check_state` входит в предикат `domains_pending_idx` — смены состояния
-  `pending → queued → done` всегда non-HOT. Это неустранимый компромисс
-  самого ТЗ: индекс выборки pending (§5.3) обязан фильтровать по
-  `check_state`. Такой апдейт кладёт новую версию строки (fillfactor = 85
-  оставляет место) и добавляет записи во все три индекса; на частоту смен
-  состояний (две на цикл проверки домена) это влияние ограничено.
+- `status`, `flags`, `dns_mask`, `temp_attempts` **не входят ни в один
+  индекс** — массовые апдейты результатов и счётчика попыток HOT; статус
+  сознательно не индексируется: его меняют без смены `check_state`
+  delete-файлы (T-019) и фиксация итогового статуса temp_error (T-031),
+  а индекс делал бы эти массовые апдейты non-HOT (поэтому retry-проход
+  индекса не имеет, T-104).
+- `check_state` входит в предикаты трёх частичных индексов проходов
+  (`domains_pending_idx`, `domains_lease_idx`, `domains_recheck_idx`) —
+  смены состояния `pending → queued → done` всегда non-HOT. Это
+  неустранимый компромисс самого ТЗ: индексы выборки/возврата/перепроверки
+  (§5.3) обязаны фильтровать по `check_state`. Такой апдейт кладёт новую
+  версию строки (fillfactor = 85 оставляет место) и добавляет записи в
+  индексы, которым новая версия удовлетворяет; на частоту смен состояний
+  (две на цикл проверки домена) это влияние ограничено.
+- `queued_at`, `last_checked_at` входят в ключи `domains_lease_idx` и
+  `domains_recheck_idx` (T-104) — их апдейты non-HOT, **но все писатели
+  меняют эти колонки только вместе с `check_state`**: постановка в
+  очередь (pending→queued + `queued_at = now()`), возврат lease и
+  перепроверка (→pending + `queued_at = NULL`), результат воркера
+  dns/http (→done + `queued_at = NULL, last_checked_at = now()`),
+  воскрешение add-файлом (T-018, →pending + `queued_at = NULL`). Эти
+  переходы уже non-HOT из-за `check_state` в предикатах — новые индексы
+  не добавили ни одного non-HOT апдейта (закреплено тестом
+  `TestSchema_DomainsHOTColumns`: колонки возраста допустимы только
+  в ключе своего индекса).
 - `subdomain_results` при перезаписи результата обновляет только
   неиндексированные колонки (индекс — сам первичный ключ, который не
   меняется) — апдейты HOT при наличии места на странице (fillfactor = 85).
