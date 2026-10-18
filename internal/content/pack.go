@@ -552,10 +552,20 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 		return nil, fmt.Errorf("content: пак %d: %w", id, err)
 	}
 	hdr := packHeader{id: id, maxSize: s.opts.PackSize, dictID: activeDictID()}
-	if st.Size() == 0 {
-		// Пустой файл (только что создан либо крах до заголовка): конец
-		// файла — смещение 0, обычный Write и есть запись заголовка
-		// (WriteAt на O_APPEND-дескрипторе запрещён Go).
+	if st.Size() < packHeaderLen {
+		// Пустой файл (только что создан либо крах до заголовка) или
+		// обрыв записи заголовка при сбое питания/ENOSPC (C-7): записей
+		// в файле быть не может — хвост обрезается, заголовок пишется с
+		// нуля. Иначе «короткий» новейший пак заклинивает запись всего
+		// хранилища, а не-новейший — вечную ошибку скана. Конец файла —
+		// смещение 0, обычный Write и есть запись заголовка (WriteAt на
+		// O_APPEND-дескрипторе запрещён Go).
+		if st.Size() > 0 {
+			if err := f.Truncate(0); err != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("content: пак %d: %w", id, err)
+			}
+		}
 		if _, err := f.Write(hdr.bytes()); err != nil {
 			_ = f.Close()
 			return nil, wrapPackWriteErr(err, id)

@@ -44,7 +44,7 @@ var _ CompactDB = (*compactFakePool)(nil)
 // остальное (Put/Get/Delete) — во встроенный packFakePool.
 func (p *compactFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	switch sql {
-	case sqlCompactRows, sqlCompactLive:
+	case sqlCompactRows, sqlCompactLive, sqlCompactAll:
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		p.calls = append(p.calls, packCall{sql: sql, args: args})
@@ -55,10 +55,10 @@ func (p *compactFakePool) Query(ctx context.Context, sql string, args ...any) (p
 			return nil, p.queryErr
 		}
 		packID := args[0].(int32)
-		if sql == sqlCompactLive {
+		if sql == sqlCompactLive || sql == sqlCompactAll {
 			var n int64
 			for _, r := range p.contents {
-				if r.packID == packID && r.refc > 0 {
+				if r.packID == packID && (sql == sqlCompactAll || r.refc > 0) {
 					n++
 				}
 			}
@@ -265,18 +265,99 @@ const (
 		"AND contents.refcount = 0"
 	wantCompactLive = "SELECT count(*) FROM contents " +
 		"WHERE pack_id = $1 AND refcount > 0"
+	wantCompactAll = "SELECT count(*) FROM contents WHERE pack_id = $1"
 )
 
 // TestCompactSQLContract — точные тексты SQL против схемы contents
 // (миграция 000001: hash, pack_id, off, len, raw_len, refcount).
 func TestCompactSQLContract(t *testing.T) {
 	if sqlCompactRows != wantCompactRows || sqlCompactMove != wantCompactMove ||
-		sqlCompactDead != wantCompactDead || sqlCompactLive != wantCompactLive {
+		sqlCompactDead != wantCompactDead || sqlCompactLive != wantCompactLive ||
+		sqlCompactAll != wantCompactAll {
 		t.Fatal("SQL компактификации изменился — обновите контракт и schema_test")
 	}
 }
 
 // --- скан --------------------------------------------------------------------
+
+// TestPackShortHeaderRecovered — пак с обрывом заголовка (1..22 байт):
+// писатель восстанавливает заголовок с нуля и пишет (краш-окно C-1/C-7
+// не должно заклинивать хранилище).
+func TestPackShortHeaderRecovered(t *testing.T) {
+	dir := t.TempDir()
+	pool := newPackFakePool()
+	// «Обрыв записи заголовка»: частичный файл без заголовка.
+	if err := os.WriteFile(filepath.Join(dir, packFileName(1)), []byte("CDPK\x01"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := OpenPackStore(pool, PackOptions{Dir: dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	ctx := context.Background()
+	d := []byte("контент в пак с обрывом заголовка")
+	if _, err := st.Put(ctx, d); err != nil {
+		t.Fatalf("Put в пак с обрывом заголовка: %v", err)
+	}
+	if got, err := st.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
+		t.Errorf("Get после восстановления заголовка: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, packFileName(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parsePackHeader(raw); err != nil {
+		t.Errorf("заголовок не восстановлен: %v", err)
+	}
+}
+
+// TestCompactShortPackSwept — не-новейший пак короче заголовка без строк
+// contents: скан видит «пустой» пак (доля живых 0), проход удаляет файл
+// вместо вечной ошибки; строки у такого пака — повреждение (ошибка).
+func TestCompactShortPackSwept(t *testing.T) {
+	dir := t.TempDir()
+	pool := &compactFakePool{packFakePool: newPackFakePool()}
+	// Пак 1 — обрыв заголовка (6 байт); пак 2 — новейший.
+	if err := os.WriteFile(filepath.Join(dir, packFileName(1)), []byte("CDPK\x01\x02"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	compactCraftPack(t, dir, 2, nil)
+
+	st, err := OpenPackStore(pool, PackOptions{Dir: dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	ctx := context.Background()
+
+	info, err := st.CompactScan(ctx, 1)
+	if err != nil {
+		t.Fatalf("скан пака без заголовка: %v", err)
+	}
+	if info.Ratio != 0 || info.LiveBytes != 0 {
+		t.Errorf("скан «пустого» пака: %+v, want нулевые живые байты", info)
+	}
+	stats, err := CompactOnce(ctx, st, CompactOptions{})
+	if err != nil {
+		t.Fatalf("CompactOnce: %v", err)
+	}
+	if stats.Compacted != 1 {
+		t.Errorf("итог прохода %+v, want 1 удалённый пак-пустышка", stats)
+	}
+	if got := compactPackSize(t, dir, 1); got != 0 {
+		t.Errorf("пак-пустышка не удалён: %d байт", got)
+	}
+
+	// Строки у пака без заголовка — повреждение: скан отказывает.
+	if err := os.WriteFile(filepath.Join(dir, packFileName(3)), []byte("CDPK\x01"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	compactCraftRow(t, pool, "orphan", 3, 0, 8, 1)
+	if _, err := st.CompactScan(ctx, 3); err == nil {
+		t.Error("скан пака без заголовка со строками: ожидалась ошибка")
+	}
+}
 
 // TestCompactScanMixed — скан различает живые, мёртвые и мусорные блоки:
 // живая и мёртвая строки, блок краш-окна Put (без строки) и недописанный

@@ -104,6 +104,11 @@ const (
 	// для не-новейшего пака; запрос — страховка от нарушений инварианта.
 	sqlCompactLive = "SELECT count(*) FROM contents " +
 		"WHERE pack_id = $1 AND refcount > 0"
+
+	// Число всех строк пака (живых и мёртвых) — различение «пустого»
+	// пака без заголовка (строк нет — файл-мусор) от повреждения
+	// (строки, указывающие в файл без заголовка).
+	sqlCompactAll = "SELECT count(*) FROM contents WHERE pack_id = $1"
 )
 
 // errCompactNewest — попытка компактифицировать новейший пак: он открыт
@@ -206,8 +211,20 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 		return info, fmt.Errorf("content: скан пака %d: %w", packID, err)
 	}
 	if st.Size() < packHeaderLen {
-		return info, fmt.Errorf("content: скан пака %d: файл %d байт короче заголовка",
-			packID, st.Size())
+		// Файл короче заголовка (обрыв записи заголовка при сбое, C-7):
+		// ни одной целой записи в нём быть не может. Строк contents на
+		// Строк contents на такой пак не должно быть — «пустой» пак (доля живых 0) проход
+		// удалит вместо вечной ошибки скана; строки у пака — повреждение.
+		n, err := s.allContents(ctx, packID)
+		if err != nil {
+			return info, fmt.Errorf("content: скан пака %d: %w", packID, err)
+		}
+		if n > 0 {
+			return info, fmt.Errorf("content: скан пака %d: файл %d байт короче заголовка при %d строках contents",
+				packID, st.Size(), n)
+		}
+		info.Size = st.Size()
+		return info, nil
 	}
 	info.Size = st.Size()
 	info.DataBytes = st.Size() - packHeaderLen
@@ -519,6 +536,26 @@ func (s *PackStore) liveContents(ctx context.Context, packID int32) (int64, erro
 		}
 	case rows.Err() != nil:
 		return 0, fmt.Errorf("content: контроль живых строк пака %d: %w", packID, rows.Err())
+	}
+	return n, nil
+}
+
+// allContents — число всех строк (живых и мёртвых), указывающих в пак:
+// скан «пустого» пака без заголовка (C-7).
+func (s *PackStore) allContents(ctx context.Context, packID int32) (int64, error) {
+	rows, err := s.pool.Query(ctx, sqlCompactAll, packID)
+	if err != nil {
+		return 0, fmt.Errorf("content: контроль строк пака %d: %w", packID, err)
+	}
+	defer rows.Close()
+	var n int64
+	switch {
+	case rows.Next():
+		if err := rows.Scan(&n); err != nil {
+			return 0, fmt.Errorf("content: контроль строк пака %d: %w", packID, err)
+		}
+	case rows.Err() != nil:
+		return 0, fmt.Errorf("content: контроль строк пака %d: %w", packID, rows.Err())
 	}
 	return n, nil
 }
