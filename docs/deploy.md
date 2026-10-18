@@ -227,8 +227,10 @@ cp -r rules /etc/crawler/rules                    # правила Laravel дл�
   /var/lib/crawler/content/dict.zst`, `analyzer.rules_dir: /etc/crawler/rules`;
 - `render.remote_url: "ws://127.0.0.1:9222"` — внешний браузер-юнит
   (в примере пусто = собственный процесс воркера, это режим docker-runtime);
-- `monitor.listen: "127.0.0.1:9100"` — не `:9100` из примера: на боевой
-  интерфейс метрики не выставляются (ТЗ §9); остальные сервисы слушают
+- `monitor.listen` — в примере уже `127.0.0.1:9100`: метрики не
+  выставляются на боевой интерфейс (ТЗ §9); юнит monitor дополнительно
+  фиксирует loopback переменной `CRAWLER_MONITOR_LISTEN` (окружение важнее
+  YAML — страховка от config.yaml без правок), остальные сервисы слушают
   loopback через `METRICS_ADDR` в юнитах (127.0.0.1:9101…9106);
 - `http.user_agent` — реальные контакты оператора (если не задан в env);
 - `dns.ipv6: true` — если у сервера есть IPv6 (в docker-сети его нет).
