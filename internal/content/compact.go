@@ -98,6 +98,17 @@ const (
 		"WHERE contents.hash = h.hash AND contents.pack_id = $2 " +
 		"AND contents.refcount = 0"
 
+	// Финальная зачистка мёртвых строк пака перед удалением файла:
+	// строка, умершая между чтением и транзакцией правки, не попала ни
+	// в перенос (охрана refcount > 0), ни в удаление по списку пачки
+	// (читалась живой) — после unlink пака она осталась бы в contents
+	// навсегда, а следующий проход свой пак уже не найдёт. Здесь все
+	// строки пака мёртвые (живые перенесены пачками выше): охрана
+	// refcount = 0 не заденет воскрешённую — её размещение уже переведено
+	// на новейший пак (sqlMetaPut).
+	sqlCompactDeadPack = "DELETE FROM contents " +
+		"WHERE pack_id = $1 AND refcount = 0"
+
 	// Контроль перед удалением файла: живых строк для пака не осталось.
 	// Инвариант T-042/T-045 (строки появляются только под flock вместе с
 	// блоком, а блоки — только в новейший пак) делает ответ неизменным
@@ -483,6 +494,13 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 	if err := flush(); err != nil {
 		return res, err
 	}
+
+	// Финальная зачистка мёртвых строк пака (C-13): см. sqlCompactDeadPack.
+	tag, err := s.pool.Exec(ctx, sqlCompactDeadPack, packID)
+	if err != nil {
+		return res, fmt.Errorf("content: компактификация пака %d: зачистка мёртвых строк: %w", packID, err)
+	}
+	res.Tombstones += tag.RowsAffected()
 
 	// Контроль перед удалением: живых строк для пака не осталось.
 	// Не-новейший пак новых строк не получает (T-042/T-045), запрос —

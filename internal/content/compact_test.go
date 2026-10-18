@@ -96,6 +96,32 @@ func (p *compactFakePool) Begin(context.Context) (pgx.Tx, error) {
 	return &compactFakeTx{pool: p}, nil
 }
 
+// Exec — финальная зачистка мёртвых строк пака (sqlCompactDeadPack);
+// операторы Put/Get/Delete — во встроенном packFakePool.
+func (p *compactFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if sql != sqlCompactDeadPack {
+		return p.packFakePool.Exec(ctx, sql, args...)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, packCall{sql: sql, args: args})
+	if err := ctx.Err(); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	if p.queryErr != nil {
+		return pgconn.CommandTag{}, p.queryErr
+	}
+	packID := args[0].(int32)
+	var n int64
+	for h, r := range p.contents {
+		if r.packID == packID && r.refc == 0 {
+			delete(p.contents, h)
+			n++
+		}
+	}
+	return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n)), nil
+}
+
 // compactFakeMove — отложенное изменение размещения строки.
 type compactFakeMove struct {
 	h      [HashLen]byte
@@ -299,7 +325,9 @@ const (
 		"AND contents.refcount = 0"
 	wantCompactLive = "SELECT count(*) FROM contents " +
 		"WHERE pack_id = $1 AND refcount > 0"
-	wantCompactAll = "SELECT count(*) FROM contents WHERE pack_id = $1"
+	wantCompactAll      = "SELECT count(*) FROM contents WHERE pack_id = $1"
+	wantCompactDeadPack = "DELETE FROM contents " +
+		"WHERE pack_id = $1 AND refcount = 0"
 )
 
 // TestCompactSQLContract — точные тексты SQL против схемы contents
@@ -307,7 +335,7 @@ const (
 func TestCompactSQLContract(t *testing.T) {
 	if sqlCompactRows != wantCompactRows || sqlCompactMove != wantCompactMove ||
 		sqlCompactDead != wantCompactDead || sqlCompactLive != wantCompactLive ||
-		sqlCompactAll != wantCompactAll {
+		sqlCompactAll != wantCompactAll || sqlCompactDeadPack != wantCompactDeadPack {
 		t.Fatal("SQL компактификации изменился — обновите контракт и schema_test")
 	}
 }
@@ -538,6 +566,63 @@ func (p *getRacePool) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		p.mu.Lock()
 		nr := p.newRow
 		p.contents[p.hash] = &nr
+		p.mu.Unlock()
+	}
+	return rows, err
+}
+
+// TestCompactOrphanDeadRowsSwept — строка, умершая между чтением строк
+// пака и транзакцией правки (C-13): перенос её пропускает (охрана
+// refcount > 0), пачечное удаление не видит (читалась живой). Финальная
+// зачистка мёртвых строк пака обязана удалить её до unlink файла —
+// иначе мёртвый указатель на несуществующий пак остаётся в contents
+// навсегда.
+func TestCompactOrphanDeadRowsSwept(t *testing.T) {
+	st, pool := newCompactTestStore(t, nil)
+	ctx := context.Background()
+	d := []byte("контент, чья ссылка умрёт во время прохода")
+	res, err := st.Put(ctx, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Пак 2 — новейший (закрывает пак 1 для записи и компактификации).
+	compactCraftPack(t, st.opts.Dir, 2, nil)
+
+	// Убить строку в момент выдачи строк пака: SELECT уже прочитал её
+	// живой, транзакция правки увидит refcount = 0 (как Delete между
+	// шагами).
+	dead := &killOnRowsPool{compactFakePool: pool, hash: res.Hash}
+	st2, err := OpenPackStore(dead, PackOptions{Dir: st.opts.Dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close() //nolint:errcheck // тест закрывает при очистке
+
+	if _, err := st2.CompactPack(ctx, 1); err != nil {
+		t.Fatalf("CompactPack: %v", err)
+	}
+	if compactPackSize(t, st.opts.Dir, 1) != 0 {
+		t.Error("файл пака 1 не удалён")
+	}
+	if _, ok := pool.row(res.Hash); ok {
+		t.Error("осиротевшая мёртвая строка осталась в contents (утечка строк C-13)")
+	}
+}
+
+// killOnRowsPool — компакт-пул, убивающий строку в момент выдачи строк
+// пака (имитация Delete между SELECT и транзакцией правки, C-13).
+type killOnRowsPool struct {
+	*compactFakePool
+	hash Hash
+}
+
+func (p *killOnRowsPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	rows, err := p.compactFakePool.Query(ctx, sql, args...)
+	if err == nil && sql == sqlCompactRows {
+		p.mu.Lock()
+		if r := p.contents[p.hash]; r != nil {
+			r.refc = 0
+		}
 		p.mu.Unlock()
 	}
 	return rows, err
