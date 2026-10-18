@@ -443,6 +443,69 @@ func TestManagerCloseWaitsInflight(t *testing.T) {
 	}
 }
 
+func TestManagerCloseRejectsTasksWhileDraining(t *testing.T) {
+	// R-07: пока Close дорабатывает задачи поколения (Pool.Close ждёт wg),
+	// новые задачи получают ErrClosed сразу, а не ждут дрена — мьютекс
+	// не держится на всё ожидание.
+	m := NewManager(context.Background(), managerOpts())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	m.newBrowser = func(context.Context, Options) (*Browser, error) {
+		b, _ := liveBrowser(1)
+		return b, nil
+	}
+	m.newPool = func(b *Browser) *Pool {
+		return poolOver(b, func(context.Context, RenderTask) (RenderOutput, error) {
+			close(started)
+			<-release
+			return RenderOutput{}, nil
+		})
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := m.Run(context.Background(), RenderTask{URL: "u"})
+		runDone <- err
+	}()
+	<-started
+
+	closed := make(chan struct{})
+	go func() {
+		m.Close()
+		close(closed)
+	}()
+	// Close входит в дрен (критическая секция короткая), задача держит его.
+	select {
+	case <-closed:
+		t.Fatal("Close не должен завершиться до конца задач поколения")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := m.Run(context.Background(), RenderTask{URL: "u2"})
+		errCh <- err
+	}()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("ошибка %v, хочу ErrClosed сразу, без ожидания дрена", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("новая задача блокируется на дрена Close (мьютекс удерживается?)")
+	}
+
+	close(release)
+	if err := <-runDone; err != nil {
+		t.Fatalf("задача в полёте: %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close не завершился после задач")
+	}
+}
+
 func TestManagerParallelStress(t *testing.T) {
 	// Каждая успешная страница достигает порог: задачи постоянно меняют
 	// поколение, ждут слоты, попадают в закрываемые пулы — все обязаны
