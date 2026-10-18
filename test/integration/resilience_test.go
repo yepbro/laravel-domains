@@ -118,6 +118,43 @@ func pendingCount(t *testing.T, rdb *redis.Client, stream, group string) int {
 	return len(res)
 }
 
+// waitPendingIdle — детерминированное ожидание «состаривания» зависших
+// записей группы: опрос XPENDING EXTENDED (чтение без побочных эффектов
+// — счётчик доставок и потребитель не меняются), пока простой каждой из
+// n записей не превысит minIdle. К моменту возврата XAUTOCLAIM с этим
+// minIdle обязан вернуть записи. Слепой Sleep над MinIdle давал запас
+// 10–20 мс и флакал на нагруженном раннере: съеденный планировщиком сон
+// оставлял записи «недозревшими», Claim возвращал 0 — ложное падение.
+func waitPendingIdle(t *testing.T, rdb *redis.Client, stream, group string, n int, minIdle time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		res, err := rdb.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+			Stream: stream,
+			Group:  group,
+			Start:  "-",
+			End:    "+",
+			Count:  1000,
+		}).Result()
+		if err != nil {
+			t.Fatalf("XPENDING %s/%s: %v", stream, group, err)
+		}
+		ready := 0
+		for _, p := range res {
+			if p.Idle > minIdle {
+				ready++
+			}
+		}
+		if ready >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("записи %s/%s не состарились до %s за 5с (готово %d из %d)", stream, group, minIdle, ready, n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // entryIDs — идентификаторы всех записей стрима (XRANGE).
 func entryIDs(t *testing.T, rdb *redis.Client, stream string) []string {
 	t.Helper()
@@ -293,7 +330,7 @@ func TestResilience_ProcessingAckAfterDB(t *testing.T) {
 
 	// Клейм возвращает зависшую запись (attempts = 2: первая доставка +
 	// клейм), повторная обработка завершает цикл.
-	time.Sleep(50 * time.Millisecond) // простой записи превысил MinIdle
+	waitPendingIdle(t, rdb, queue.StreamDNS, group, 1, 30*time.Millisecond)
 	claimed, _, err := reliab.Claim(ctx, queue.StreamDNS, group, "w2", 30*time.Millisecond, 10, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -372,8 +409,9 @@ func TestResilience_WorkerDiesMidBatch(t *testing.T) {
 		t.Fatalf("новый потребитель получил %d чужих записей, хочу 0", len(got))
 	}
 
-	// Проход восстановления: XAUTOCLAIM возвращает остаток пачки.
-	time.Sleep(50 * time.Millisecond)
+	// Проход восстановления: XAUTOCLAIM возвращает остаток пачки
+	// (2 из 6 подтверждены выше).
+	waitPendingIdle(t, rdb, queue.StreamHTTP, group, total-2, 30*time.Millisecond)
 	claimed, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 30*time.Millisecond, total, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -472,7 +510,9 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 	// каждый проход клейма возвращает записи в работу, счётчик растёт
 	// (доставка + клейм №1 = 2, №2 = 3 — последняя разрешённая).
 	for round, wantAttempts := range []int{2, 3} {
-		time.Sleep(30 * time.Millisecond)
+		// Клейм предыдущего раунда закрепил записи за «recoverителем»
+		// и сбросил им простой — состаривание ждётся заново.
+		waitPendingIdle(t, rdb, queue.StreamRender, group, total, 20*time.Millisecond)
 		claimed, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0")
 		if err != nil {
 			t.Fatalf("клейм №%d: %v", round+1, err)
@@ -492,7 +532,7 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 
 	// Клейм №3: счётчик 4 > MaxAttempts 3 — записи не возвращаются,
 	// а переводятся в q:dead и подтверждаются в исходном стриме.
-	time.Sleep(30 * time.Millisecond)
+	waitPendingIdle(t, rdb, queue.StreamRender, group, total, 20*time.Millisecond)
 	if claimed, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0"); err != nil {
 		t.Fatalf("клейм №3: %v", err)
 	} else if len(claimed) != 0 {
@@ -813,10 +853,14 @@ func TestResilience_MaxLenTrims(t *testing.T) {
 
 	// MAXLEN ~ обрезает с точностью до узла списка записей: длина
 	// около порога, но заведомо ограничена — не растёт с публикациями.
+	// Перелёт до одного макроузла listpack (~30–40 таких сообщений
+	// в узле 4 КБ; на живом стенде после 300 публикаций длина 57),
+	// потолок maxLen*2 отсекает «обрезки нет» (там было бы 300)
+	// с запасом на размер узла.
 	n := streamLen(t, rdb, queue.StreamAnalyze)
-	if n < 1 || n > maxLen+100 {
+	if n < 1 || n > maxLen*2 {
 		t.Fatalf("длина q:analyze после %d публикаций: %d, хочу 1..%d (MAXLEN ~ %d, запас — один макроузел списка записей)",
-			published, n, maxLen+100, maxLen)
+			published, n, maxLen*2, maxLen)
 	}
 
 	// Старые записи усечены: самая ранняя запись стрима новее первой
