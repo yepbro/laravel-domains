@@ -279,6 +279,24 @@ func TestDir_MissingDirCreated(t *testing.T) {
 	}
 }
 
+// TestDir_HiddenRootWatched — скрытый ingest.dir (/data/.incoming) —
+// валидная конфигурация (config.Validate требует лишь непустоту):
+// скрытость корня не отключает наблюдение (ING-P3-4); скрытые
+// подкаталоги внутри корня по-прежнему игнорируются.
+func TestDir_HiddenRootWatched(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".incoming")
+	files := start(t, dir, nil)
+
+	name := filepath.Join(dir, "crawl.test", "add", "seed.txt")
+	writeFile(t, name, "example.com\n")
+	if f := waitFor(t, files); f.Path != name {
+		t.Errorf("выдан путь %q, want %q (скрытый корень наблюдается)", f.Path, name)
+	}
+
+	writeFile(t, filepath.Join(dir, ".hidden", "add", "x.txt"), "x")
+	expectEmpty(t, files, 3*testScan)
+}
+
 func TestDir_RequiresDir(t *testing.T) {
 	if _, err := Dir(context.Background(), Options{}); err == nil {
 		t.Error("ожидалась ошибка при пустом Options.Dir")
