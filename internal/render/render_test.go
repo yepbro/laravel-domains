@@ -48,6 +48,7 @@ func TestNewOptions(t *testing.T) {
 		RestartEveryPages: 500,
 		MemoryThreshold:   1536 << 20,
 		UserAgent:         "Crawler/1.0 (+https://example.example; admin@example.example)",
+		MaxDOMBytes:       cfg.Content.MaxStoreBytes.B(), // R-02: потолок DOM — лимит хранилища
 	}
 	if got != want {
 		t.Fatalf("NewOptions:\n got %+v\nwant %+v", got, want)
@@ -100,6 +101,7 @@ func TestOptionsValidate(t *testing.T) {
 		{"memory_threshold отрицательный", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: -1}, "memory_threshold"},
 		{"memory_threshold ниже минимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 1 << 20}, "memory_threshold"},
 		{"memory_threshold выше максимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 17 << 30}, "memory_threshold"},
+		{"max_dom_bytes отрицательный", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MaxDOMBytes: -1}, "max_dom_bytes"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,5 +118,32 @@ func TestOptionsValidate(t *testing.T) {
 	off := Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}
 	if err := off.validate(); err != nil {
 		t.Fatalf("нулевой порог памяти должен быть допустим: %v", err)
+	}
+}
+
+// TestValidateTaskURL — схема задачи рендера (R-09): открываются только
+// http/https; file:/data: браузер принял бы, а съём DOM унёс бы содержимое
+// локального ресурса в хранилище контента.
+func TestValidateTaskURL(t *testing.T) {
+	for _, u := range []string{
+		"http://example.com/", "https://example.com/deep/path?q=1",
+		"https://spa.example:8443/",
+	} {
+		if err := validateTaskURL(u); err != nil {
+			t.Errorf("%s: неожиданная ошибка: %v", u, err)
+		}
+	}
+	for _, u := range []string{
+		"file:///etc/passwd", "data:text/html,<html>", "ftp://example.com/",
+		"chrome://version", "about:blank", "", "not a url", "/relative/path",
+	} {
+		err := validateTaskURL(u)
+		if err == nil {
+			t.Errorf("%s: ожидалась ошибка схемы", u)
+			continue
+		}
+		if ClassOf(err) != ClassTask {
+			t.Errorf("%s: класс %v, хочу task (повторная доставка уровня очереди)", u, ClassOf(err))
+		}
 	}
 }

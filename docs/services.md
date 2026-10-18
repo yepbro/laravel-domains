@@ -314,10 +314,11 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
   кэш `CachingResolver` (T-047); TLS — `InsecureSkipVerify` с сохранением
   атрибутов сертификата (`TLSInfo`, T-050).
 
-`render-worker` (этап 6, T-067): его `OnRun` запускает
-Chromium (`render.StartBrowser` — внешний по `render.remote_url` или
-собственный процесс, T-061) с пулом изолированных контекстов
-(`render.NewPool`), хранилище контента (то же, что у http-worker:
+`render-worker` (этап 6, T-067): его `OnRun` поднимает менеджер
+поколений Chromium (`render.NewManager` + `Manager.Start` — внешний по
+`render.remote_url` или собственный процесс, T-061; перезапуски по
+страницам/памяти и замена мёртвого поколения — T-065), хранилище
+контента (то же, что у http-worker:
 `OpenPackStore` + словарь zstd + `DiskWatchLoop`, T-042/T-043/T-046) и
 цикл `renderworker.Run` (`internal/renderworker`):
 
@@ -344,9 +345,10 @@ Chromium (`render.StartBrowser` — внешний по `render.remote_url` ил
   перезаписывает контент и refcount (баланс T-058); гонка с перепроверкой
   закрыта оптимистической охраной UPDATE по `content_hash` — изменившаяся
   строка не перезаписывается, ссылка `Put` снимается;
-- недоступный Chromium (зонд `browser.Alive`) — пауза потребления
-  (доставки остаются в стриме, не в PEL); перезапуск браузера каждые N
-  страниц и по памяти — T-065.
+- недоступный Chromium (зонд `Manager.Alive`) — пауза потребления
+  (доставки остаются в стриме, не в PEL); мёртвое поколение зонд
+  перезапускает сам (реконнект после рестарта Chromium), перезапуск
+  браузера каждые N страниц и по памяти — T-065.
 
 `analyzer` (этап 7, T-071): его `OnRun` выполняет цикл
 `analyzer.Run` (`internal/analyzer`; подробный конвейер — в

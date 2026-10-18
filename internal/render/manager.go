@@ -70,7 +70,7 @@ func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 			}
 			return RenderOutput{}, err
 		}
-		out, err := p.Run(ctx, task)
+		out, err := runAcquired(ctx, p, task)
 		if err == nil {
 			return out, nil
 		}
@@ -81,10 +81,61 @@ func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 	}
 }
 
+// runAcquired выполняет задачу на пуле, удерживая взятый в acquire слот
+// поколения (wg.Done) до конца Pool.Run — см. обоснование в acquire.
+func runAcquired(ctx context.Context, p *Pool, task RenderTask) (RenderOutput, error) {
+	defer p.wg.Done()
+	return p.Run(ctx, task)
+}
+
+// Start запускает первое поколение немедленно, а не лениво первой задачей:
+// боевая сборка (cmd/render-worker) обязана упасть на старте при
+// недоступном Chromium (ошибка OnRun → код 1 → systemd Restart=on-failure),
+// а не молча перебирать попытки доставок q:render. На живом поколении —
+// no-op; после Close — ErrClosed.
+func (m *Manager) Start() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return ErrClosed
+	}
+	if reason, swap := m.swapReasonLocked(); swap {
+		return m.restartLocked(reason)
+	}
+	return nil
+}
+
+// Alive — зонд потребления воркера (renderworker.Options.Alive): живо ли
+// текущее поколение; мёртвое или отсутствующее заменяется прямо здесь
+// (restartLocked → новый StartBrowser), поэтому после потери соединения
+// или рестарта Chromium (host-юнит crawler-chromium.service,
+// Restart=on-failure) зонд сам восстанавливает поколение — пауза
+// потребления не зависает навсегда. Ошибка старта — false: потребление
+// остаётся на паузе (доставки не расходуют попытки, T-025), следующий
+// вызов зонда повторит старт.
+func (m *Manager) Alive() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return false
+	}
+	if reason, swap := m.swapReasonLocked(); swap {
+		return m.restartLocked(reason) == nil
+	}
+	return true
+}
+
 // acquire возвращает пул текущего живого поколения, при необходимости
 // меняя его (триггеры — swapReason). Конкурентные вызовы сериализуются
 // мьютексом: смена поколения одна; проверка порогов под ним же — RSS
 // читается раз в задачу (один проход /proc), не чаще.
+//
+// Взятый пул помечается в полёте (wg.Add) под тем же m.mu: retire
+// сменившегося поколения тоже под m.mu, значит смена поколения не может
+// проскочить между acquire и Pool.Run — а фоновый Close поколения никогда
+// не ждёт WaitGroup с нулевым счётчиком, пока у задачи есть acquired-слот
+// (Add из нуля параллельно Wait запрещён sync.WaitGroup). Слот снимается
+// в runAcquired после Pool.Run.
 func (m *Manager) acquire() (*Pool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -96,6 +147,7 @@ func (m *Manager) acquire() (*Pool, error) {
 			return nil, err
 		}
 	}
+	m.p.wg.Add(1)
 	return m.p, nil
 }
 
@@ -106,19 +158,27 @@ func (m *Manager) acquire() (*Pool, error) {
 // гонки «поколение сменилось сразу после acquire»: закрытое поколение
 // заменяется, а ошибки ErrClosed не копятся до исчерпания попыток задачи.
 func (m *Manager) swapReasonLocked() (string, bool) {
-	switch {
-	case m.b == nil:
+	if m.b == nil {
 		return "первый старт", true
-	case !m.b.Alive():
+	}
+	if !m.b.Alive() {
 		return "браузер недоступен", true
-	case m.p == nil || m.p.closed.Load():
+	}
+	if m.p == nil || m.p.closed.Load() {
 		return "пул закрыт", true
-	case m.b.NeedsRestart():
+	}
+	if m.b.NeedsRestart() {
 		return fmt.Sprintf("порог страниц %d (отрендерено %d)",
 			m.b.opts.RestartEveryPages, m.b.Pages()), true
-	case m.b.OverMemory():
-		return fmt.Sprintf("порог памяти %d MiB (RSS %d MiB)",
-			m.b.opts.MemoryThreshold>>20, m.b.RSS()>>20), true
+	}
+	// Порог памяти: RSS читается одним проходом /proc — значение идёт и в
+	// проверку, и в сообщение (R-06); контроль отключён — /proc не читается
+	// вовсе. Неизвестный RSS (remote-режим) не триггерует.
+	if m.b.opts.MemoryThreshold > 0 {
+		if rss := m.b.RSS(); rss > 0 && rss >= m.b.opts.MemoryThreshold {
+			return fmt.Sprintf("порог памяти %d MiB (RSS %d MiB)",
+				m.b.opts.MemoryThreshold>>20, rss>>20), true
+		}
 	}
 	return "", false
 }
@@ -131,6 +191,13 @@ func (m *Manager) swapReasonLocked() (string, bool) {
 // (задача уходит наверх, следующая попытка Run повторит старт), при этом
 // прежний пул всё равно уходит на закрытие: его браузер мёртв или исчерпал
 // порог.
+//
+// Старт браузера идёт под m.mu — осознанно (R-07): пока стартует новое
+// поколение, живого поколения нет, конкурентным задачам нечего приобретать
+// — их ожидание на мьютексе эквивалентно ожиданию поколения, и вынос старта
+// за критическую секцию (single-flight) ничего бы не сэкономил, добавив
+// гонки установки поколения. Верхняя граница — Options.DialTimeout
+// (remote) или чтение адреса процесса (local).
 func (m *Manager) restartLocked(reason string) error {
 	old := m.p
 	if old != nil {
@@ -166,18 +233,26 @@ func (m *Manager) mode() string {
 
 // Close останавливает менеджер: новые задачи отклоняются (ErrClosed →
 // повторная доставка), текущее поколение дорабатывается (graceful, ТЗ 3.4)
-// и останавливается вместе с браузером. Фоновые закрытия прошлых поколений
-// завершаются независимо; их браузеры гасятся и отменой контекста
-// жизненного цикла. Повторный вызов безвреден.
+// и останавливается вместе с браузером. Под мьютексом — только перевод в
+// closed и открепление поколения: долгий дрен задач поколения (до
+// Options.Timeout) не блокирует acquire, зонд Alive и Browser() — новые
+// задачи получают ErrClosed сразу, не ожидая дрена (R-07). Если Close
+// попадает на идущий перезапуск, он ждёт мьютекс до конца старта (до
+// Options.DialTimeout): старт поколения короткоживущий, а браузер этого
+// ещё не созданного поколения погасит отмена контекста жизненного цикла.
+// Фоновые закрытия прошлых поколений завершаются независимо. Повторный
+// вызов безвреден.
 func (m *Manager) Close() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !m.closed.CompareAndSwap(false, true) {
+		m.mu.Unlock()
 		return
 	}
-	if m.p != nil {
-		m.p.Close()
-		m.b, m.p = nil, nil
+	p := m.p
+	m.b, m.p = nil, nil
+	m.mu.Unlock()
+	if p != nil {
+		p.Close() // вне m.mu: дорабатывает задачи и гасит браузер
 	}
 }
 

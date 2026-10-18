@@ -110,10 +110,17 @@ func (s *Session) start(ctx context.Context) error {
 // Отмена и дедлайн вызывающего ctx привносятся AfterFunc: останавливают
 // действия задачи, не трогая профиль.
 //
+// Схема URL проверяется до любых команд CDP (validateTaskURL, R-09):
+// file:/data: браузер открыл бы, а съём DOM унёс бы содержимое локального
+// ресурса в хранилище контента.
+//
 // Блокировка изображений/шрифтов/медиа (T-062, ТЗ 5.6) включается здесь,
 // до перехода (startBlock, перед waitSubscribe): перехват видит запросы
 // страницы с первого. Этапы — chromedp.Run/Do над s.Context().
 func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
+	if err := validateTaskURL(task.URL); err != nil {
+		return RenderOutput{}, err
+	}
 	tctx, stop := context.WithTimeout(s.ctx, s.b.opts.Timeout)
 	defer stop()
 	stopCaller := context.AfterFunc(ctx, stop)
@@ -154,7 +161,9 @@ func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 		out.FinalURL, err = chromedp.Run(tctx, chromedp.Location())
 	}
 	if err == nil {
-		err = newExtractCDP().extractResult(tctx, &out) // T-064: DOM + cookies
+		// Потолок DOM ≤ 16 МиБ по конфигурации (content.max_store_bytes),
+		// int здесь всегда достаточен.
+		err = newExtractCDP(int(s.b.opts.MaxDOMBytes)).extractResult(tctx, &out) // T-064: DOM + cookies
 	}
 	if err == nil && resp != nil {
 		out.ResponseHeaders = extractResponseHeaders(resp.Headers) // T-064

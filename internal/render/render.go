@@ -49,9 +49,11 @@ import (
 
 // RenderTask — одна задача рендера: открыть страницу и снять результат.
 //
-// URL приходит из результата HTTP-этапа (сообщение q:render, T-066) и здесь
-// дополнительно не валидируется: формальный контроль входа — уровень
-// воркера, некорректный адрес отвергнёт сам браузер (chromedp.ErrPageLoad).
+// URL приходит из результата HTTP-этапа (сообщение q:render, T-066); схема
+// контролируется перед переходом (validateTaskURL): рендер открывает только
+// http/https, прочие адреса (file:, data:, ftp:) отвергаются классом task —
+// браузер открыл бы и локальный файл (R-09). Формальный контроль входа —
+// уровень воркера, остальное отвергает сам браузер (chromedp.ErrPageLoad).
 type RenderTask struct {
 	URL string
 }
@@ -125,11 +127,19 @@ type Options struct {
 	// SessionStartTimeout — таймаут создания изолированного контекста с
 	// вкладкой (0 — 15 с).
 	SessionStartTimeout time.Duration
+	// MaxDOMBytes — потолок итогового DOM в байтах (R-02, гигиена памяти
+	// воркера: render.contexts съёмов параллельно при MemoryMax=128M у
+	// systemd-профиля): DOM сверх лимита обрезается в самом браузере и
+	// получает признак обрезки (extract.go). 0 — без лимита. Источник в
+	// сборке — content.max_store_bytes: контент сверх лимита хранилище не
+	// принимает (ErrTooLarge), держать его в памяти бессмысленно.
+	MaxDOMBytes int64
 }
 
 // NewOptions собирает Options из конфигурации сервиса (ТЗ 5.10): секция
 // render плюс User-Agent HTTP-этапа (ТЗ §9 — единый идентифицируемый UA
-// краулера).
+// краулера) и потолок DOM из секции content (R-02: итоговый DOM не больше
+// того, что хранилище контента принимает).
 func NewOptions(cfg config.Config) Options {
 	return Options{
 		RemoteURL:         cfg.Render.RemoteURL,
@@ -138,6 +148,7 @@ func NewOptions(cfg config.Config) Options {
 		RestartEveryPages: cfg.Render.RestartEveryPages,
 		MemoryThreshold:   cfg.Render.RestartMemoryBytes.B(),
 		UserAgent:         cfg.HTTP.UserAgent,
+		MaxDOMBytes:       cfg.Content.MaxStoreBytes.B(),
 	}
 }
 
@@ -188,8 +199,28 @@ func (o Options) validate() error {
 			"memory_threshold: ожидается 0 (отключено) или %d..%d байт, задано %d",
 			256<<20, 16<<30, o.MemoryThreshold))
 	}
+	if o.MaxDOMBytes < 0 {
+		problems = append(problems,
+			fmt.Sprintf("max_dom_bytes: ожидается 0 (без лимита) или положительное число, задано %d", o.MaxDOMBytes))
+	}
 	if len(problems) > 0 {
 		return errors.New("render: " + strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// validateTaskURL — контроль схемы задачи рендера: открываются только
+// http/https. URL приходит из subdomain_results.final_url — в штатном
+// потоке это адрес из HTTP-редиректов, но при аномалии пайплайна или
+// компрометации БД он может нести file:///data: — браузер открыл бы
+// локальный файл, а съём DOM унёс бы его содержимое в хранилище контента
+// (R-09). Отказ — класс task: страница не рендерится, повторная доставка
+// уровня очереди (T-066).
+func validateTaskURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return &Error{Class: ClassTask, URL: raw,
+			Err: fmt.Errorf("рендер открывает только http/https, задано %q", raw)}
 	}
 	return nil
 }

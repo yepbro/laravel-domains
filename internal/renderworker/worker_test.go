@@ -434,8 +434,9 @@ func (s *rwFakeStore) deletesSnapshot() []content.Hash {
 type rwFakeRenderer struct {
 	j *rwJournal
 
-	output render.RenderOutput
-	err    error
+	output  render.RenderOutput
+	err     error
+	panicOn string // URL задач, на которых Run паникует (тест R-04)
 
 	mu    sync.Mutex
 	tasks []render.RenderTask
@@ -450,6 +451,9 @@ func (r *rwFakeRenderer) Run(ctx context.Context, task render.RenderTask) (rende
 	r.j.record(rwEvRender)
 	if err := ctx.Err(); err != nil {
 		return render.RenderOutput{}, err
+	}
+	if r.panicOn != "" && task.URL == r.panicOn {
+		panic("фейк рендера: паника в задаче " + task.URL)
 	}
 	if r.err != nil {
 		return render.RenderOutput{}, r.err
@@ -1229,6 +1233,60 @@ func TestRenderWorker_RunBrowserDead(t *testing.T) {
 	}
 	if tasks := f.renderer.tasksSnapshot(); len(tasks) != 0 {
 		t.Errorf("рендер не должен запускаться: %+v", tasks)
+	}
+}
+
+// TestRenderWorker_RunPanicRecovered — паника обработки одной доставки
+// (рендер/ProcessResult) не роняет процесс (инвариант каркаса, R-04):
+// паникующая запись не подтверждается, соседние доставки окна
+// дорабатываются и подтверждаются.
+func TestRenderWorker_RunPanicRecovered(t *testing.T) {
+	f := newRWFixture(t)
+	// Две строки: рендер первой паникует (как CDP посреди страницы),
+	// вторая — обычная доставка того же окна.
+	f.pool.seedRow(rwKey, "https://spa.example/", nil)
+	key2 := rwRowKey{zone: rwKey.zone, domain: rwKey.domain, subdomain: 2, variant: 0}
+	f.pool.seedRow(key2, "https://two.example/", nil)
+	f.renderer.panicOn = "https://spa.example/"
+	f.renderer.output = rwOutput("<html>dom</html>")
+
+	task2 := queue.Result{ZoneID: key2.zone, DomainID: key2.domain, SubdomainID: key2.subdomain, Variant: 0, Name: "two.example"}
+	payload2, err := json.Marshal(task2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.pool.j.ackNotify = make(chan struct{}, 4)
+	f.q.deliveries = []queue.Delivery{rwDelivery("e1"),
+		{Stream: queue.StreamRender, ID: "e2", Payload: payload2}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, f.w, Options{}) }()
+
+	// e2 обязан доработать и подтвердиться, несмотря на панику e1.
+	select {
+	case <-f.pool.j.ackNotify:
+	case <-time.After(5 * time.Second):
+		t.Fatal("XACK здоровой доставки не наступил (паника убила цикл?)")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	acked := f.q.ackedSnapshot()
+	if len(acked) != 1 || acked[0] != "e2" {
+		t.Errorf("XACK = %v, нужен только e2 (паникующая e1 — без XACK)", acked)
+	}
+	if !rwRowSnapshot(f.pool, key2).rendered {
+		t.Error("здоровая доставка не записана")
+	}
+	if rwRowSnapshot(f.pool, rwKey).rendered {
+		t.Error("паникующая доставка не должна записывать строку")
 	}
 }
 

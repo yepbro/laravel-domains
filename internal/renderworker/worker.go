@@ -42,6 +42,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -103,9 +104,12 @@ type ContentStore interface {
 	Delete(ctx context.Context, hash content.Hash) error
 }
 
-// Renderer — шов рендера: удовлетворяется *render.Pool (T-061). Одна
-// задача — одна страница в свежем изолированном контексте; параллелизм
-// ограничен слотами самого пула (render.contexts, ТЗ 5.6).
+// Renderer — шов рендера: удовлетворяется *render.Manager (T-065 — боевая
+// сборка cmd/render-worker: живое поколение «браузер + пул», перезапуски
+// по страницам/памяти, реконнект и повтор задачи) и *render.Pool напрямую
+// (T-061 — интеграционные тесты). Одна задача — одна страница в свежем
+// изолированном контексте; параллелизм ограничен слотами самого пула
+// (render.contexts, ТЗ 5.6).
 type Renderer interface {
 	Run(ctx context.Context, task render.RenderTask) (render.RenderOutput, error)
 }
@@ -147,8 +151,8 @@ type Options struct {
 	// Alive — зонд браузера: false — очередь не читается (доставки
 	// остаются в стриме непрочитанными, а не в PEL без XACK — без
 	// клеймов запись в PEL зависает надолго). Ставится сборкой сервиса
-	// (browser.Alive, T-061); nil — зонд отключён. Перезапуск браузера —
-	// территория T-065, здесь только пауза потребления.
+	// (render.Manager.Alive, T-061/T-065: мёртвое поколение зонд
+	// перезапускает сам — реконнект); nil — зонд отключён.
 	Alive func() bool
 	// Recover — слой возврата зависших доставок (Reliab, T-025): Run
 	// поднимает фоновый RecoverLoop (XAUTOCLAIM → та же обработка →
@@ -264,7 +268,11 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, fmt.Errorf("renderworker: %s: пустой результат рендера (DOM %d байт, final_url %q)",
 			name, len(out.DOM), out.FinalURL)
 	}
-	newHash := content.HashOf([]byte(out.DOM))
+	// DOM — одной копией байтов (R-02): хэш и Put из одного среза, сам
+	// итоговый DOM уже ограничен рендером (render.Options.MaxDOMBytes);
+	// кратные полные копии строки не нужны.
+	dom := []byte(out.DOM)
+	newHash := content.HashOf(dom)
 
 	var oldHash content.Hash
 	hasOld := len(target.hash) == content.HashLen
@@ -282,7 +290,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// доставки исчерпаются и задача уйдёт в q:dead на ручной разбор
 	// (T-025) — оператору сигнал поднять content.max_store_bytes.
 	if !hasOld || newHash != oldHash {
-		if _, err := w.contents.Put(ctx, []byte(out.DOM)); err != nil {
+		if _, err := w.contents.Put(ctx, dom); err != nil {
 			return false, fmt.Errorf("renderworker: %s: сохранение DOM: %w", name, err)
 		}
 	}
@@ -480,7 +488,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 	sem := make(chan struct{}, o.Concurrency)
 	for {
 		if o.Alive != nil && !o.Alive() {
-			log.Warn("Chromium недоступен — q:render не читается (перезапуск — T-065)")
+			log.Warn("Chromium недоступен — q:render не читается (перезапуск — менеджер, T-065)")
 			wait(DefaultErrorWait)
 			if ctx.Err() != nil {
 				return nil // graceful shutdown
@@ -508,6 +516,17 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 			go func(d queue.Delivery) {
 				defer wg.Done()
 				defer func() { <-sem }()
+				// Паника доставки не должна ронять процесс без лога и
+				// очистки — тот же инвариант, что у горутины OnRun
+				// (internal/service): panic → Error-лог, доставка без
+				// XACK вернётся повторной доставкой (XAUTOCLAIM, T-025);
+				// in-flight соседей и graceful shutdown сохраняются.
+				defer func() {
+					if r := recover(); r != nil {
+						log.Error("паника обработки доставки q:render",
+							"entry", d.ID, "panic", r, "stack", string(debug.Stack()))
+					}
+				}()
 				err := queue.Processing(ctx, w.q, o.Group, d, w.processDelivery)
 				if err != nil && ctx.Err() == nil {
 					log.Warn("задача q:render не подтверждена — вернётся повторной доставкой",

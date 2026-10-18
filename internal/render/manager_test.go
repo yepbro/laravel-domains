@@ -99,6 +99,78 @@ func TestManagerRunStartsBrowserOnce(t *testing.T) {
 	}
 }
 
+func TestManagerStart(t *testing.T) {
+	// Start поднимает первое поколение немедленно (боевая сборка падает на
+	// старте, а не перебирает попытки доставок); живое поколение — no-op.
+	b, _ := liveBrowser(1)
+	m, calls, _ := managerFor(t, managerOpts(), b)
+	if m.Browser() != nil {
+		t.Fatal("до Start поколения нет")
+	}
+	if err := m.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("стартов %d, хочу 1", got)
+	}
+	if m.Browser() != b {
+		t.Fatal("Start не поднял поколение")
+	}
+	if err := m.Start(); err != nil {
+		t.Fatalf("повторный Start: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("стартов %d, хочу 1 (живое поколение не трогается)", got)
+	}
+	m.Close()
+	if err := m.Start(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Start после Close: %v, хочу ErrClosed", err)
+	}
+}
+
+func TestManagerAlive(t *testing.T) {
+	// Зонд потребления: живое поколение — true без лишних стартов; после
+	// смерти поколения (рестарт Chromium хостом) зонд заменяет его сам —
+	// реконнект, пауза потребления не зависает навсегда.
+	b1, cancel1 := liveBrowser(1)
+	b2, _ := liveBrowser(1)
+	m, calls, _ := managerFor(t, managerOpts(), b1, b2)
+	if !m.Alive() {
+		t.Fatal("до старта зонд сам поднимает первое поколение (true)")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("стартов %d, хочу 1 (зонд стартовал первое поколение)", got)
+	}
+	for range 2 {
+		if !m.Alive() {
+			t.Fatal("живое поколение: Alive = true")
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("стартов %d, хочу 1 (живое поколение не перезапускается)", got)
+	}
+
+	cancel1() // хост перезапустил Chromium: соединение потеряно навсегда
+	if !m.Alive() {
+		t.Fatal("зонд обязан заменить мёртвое поколение (true)")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("стартов %d, хочу 2 (мертвое поколение заменено зондаом)", got)
+	}
+	if !m.Browser().Alive() {
+		t.Error("новое поколение живо")
+	}
+
+	// Пул первого поколения закрыт фоновым Close: задачи в него не идут.
+	if !m.Alive() {
+		t.Error("после замены зонд видит живое поколение")
+	}
+	m.Close()
+	if m.Alive() {
+		t.Error("после Close зонд false")
+	}
+}
+
 func TestManagerRestartOnPagesThreshold(t *testing.T) {
 	opts := managerOpts()
 	opts.RestartEveryPages = 1 // каждая успешная страница — порог
@@ -358,6 +430,69 @@ func TestManagerCloseWaitsInflight(t *testing.T) {
 	case <-closed:
 		t.Fatal("Close не дождался задачи в полёте")
 	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-runDone; err != nil {
+		t.Fatalf("задача в полёте: %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close не завершился после задач")
+	}
+}
+
+func TestManagerCloseRejectsTasksWhileDraining(t *testing.T) {
+	// R-07: пока Close дорабатывает задачи поколения (Pool.Close ждёт wg),
+	// новые задачи получают ErrClosed сразу, а не ждут дрена — мьютекс
+	// не держится на всё ожидание.
+	m := NewManager(context.Background(), managerOpts())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	m.newBrowser = func(context.Context, Options) (*Browser, error) {
+		b, _ := liveBrowser(1)
+		return b, nil
+	}
+	m.newPool = func(b *Browser) *Pool {
+		return poolOver(b, func(context.Context, RenderTask) (RenderOutput, error) {
+			close(started)
+			<-release
+			return RenderOutput{}, nil
+		})
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := m.Run(context.Background(), RenderTask{URL: "u"})
+		runDone <- err
+	}()
+	<-started
+
+	closed := make(chan struct{})
+	go func() {
+		m.Close()
+		close(closed)
+	}()
+	// Close входит в дрен (критическая секция короткая), задача держит его.
+	select {
+	case <-closed:
+		t.Fatal("Close не должен завершиться до конца задач поколения")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := m.Run(context.Background(), RenderTask{URL: "u2"})
+		errCh <- err
+	}()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("ошибка %v, хочу ErrClosed сразу, без ожидания дрена", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("новая задача блокируется на дрена Close (мьютекс удерживается?)")
 	}
 
 	close(release)
