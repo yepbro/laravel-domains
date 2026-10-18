@@ -255,19 +255,23 @@ func Run(opts Options) error {
 		ErrorLog:          slog.NewLogLogger(opts.Logger.Handler(), slog.LevelError),
 	}
 
-	// Listen отделён от Serve: ошибка занятого адреса — до старта OnRun.
-	ln, err := net.Listen("tcp", opts.MetricsAddr)
-	if err != nil {
-		opts.Logger.Error("HTTP-сервер метрик", "addr", opts.MetricsAddr, "err", err)
-		return err
-	}
-
+	// Пул закрывается каркасом при graceful shutdown — последним, после
+	// завершения OnRun и остановки HTTP-сервера метрик, а также на путях
+	// ошибки после его создания (занятый адрес метрик ниже).
 	closePool := func() {}
 	if pool != nil {
 		closePool = func() {
 			pool.Close()
 			opts.Logger.Info("пул PostgreSQL закрыт")
 		}
+	}
+
+	// Listen отделён от Serve: ошибка занятого адреса — до старта OnRun.
+	ln, err := net.Listen("tcp", opts.MetricsAddr)
+	if err != nil {
+		opts.Logger.Error("HTTP-сервер метрик", "addr", opts.MetricsAddr, "err", err)
+		closePool() // пул уже создан — не оставлять его соединения
+		return err
 	}
 
 	err = serve(opts, srv, ln, closePool, term, hup)
