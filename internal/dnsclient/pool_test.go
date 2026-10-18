@@ -214,6 +214,15 @@ func TestUDPPoolDiscardReplacedLazily(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Close() })
 
+	// Считаем наборы после стартового eager-набора (DNS-08): рядом со
+	// свободным сокетом Get не открывает новый.
+	var dials atomic.Int32
+	old := p.dial
+	p.dial = func(ctx context.Context) (*net.UDPConn, error) {
+		dials.Add(1)
+		return old(ctx)
+	}
+
 	c1, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -221,22 +230,29 @@ func TestUDPPoolDiscardReplacedLazily(t *testing.T) {
 	p.Discard(c1)
 	assertConnClosed(t, c1)
 
-	// Счётчик освободил место: следующий Get набирает новый сокет,
-	// а не ждает вечно свободный.
+	// Место освободилось, но в канале лежит свободный eager-сокет —
+	// Get отдаёт его, а не набирает замещающий.
 	c2, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("get после discard: %v", err)
 	}
 	if c2 == c1 {
-		t.Fatal("после Discard должен открыться новый сокет")
+		t.Fatal("списанный сокет не выдаётся повторно")
 	}
-	// Второй eager-сокет всё ещё в пуле — следующий Get отдаёт его.
+	if n := dials.Load(); n != 0 {
+		t.Fatalf("наборов %d рядом со свободным сокетом, want 0", n)
+	}
+
+	// Канал пуст, место есть — теперь Get лениво набирает замещающий.
 	c3, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if c3 == c1 || c3 == c2 {
-		t.Fatal("ожидался остававшийся свободным eager-сокет")
+		t.Fatal("ожидался замещающий (новый) сокет")
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("наборов %d, want 1 (ленивый замещающий)", n)
 	}
 	p.Put(c2)
 	p.Put(c3)
