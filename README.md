@@ -31,7 +31,7 @@ make test-integration  # проверка окружения на testbed
 | [`docs/dev-environment.md`](docs/dev-environment.md) | dev-окружение: профили compose, testbed, CLI `crawlerctl`, отладка, диагностика |
 | [`docs/docker.md`](docs/docker.md) | шпаргалка Docker: запуск/остановка, команды в контейнерах, тома, диагностика |
 | [`docs/configuration.md`](docs/configuration.md) | конфигурация: единый YAML + переменные окружения, приоритеты, валидация (пример — `config.example.yaml`) |
-| [`docs/incoming-files.md`](docs/incoming-files.md) | контракт входных файлов `incoming/<зона>/add\|delete/*.txt` |
+| [`docs/incoming-files.md`](docs/incoming-files.md) | контракт входных файлов `incoming/<зона>/add\|delete/*.txt`: валидация, отчёты, дедуп доставки (undo тем же списком) |
 | [`docs/services.md`](docs/services.md) | каркас Go-сервисов: жизненный цикл, логирование, метрики и алерты |
 | [`docs/migrations.md`](docs/migrations.md) | миграции PostgreSQL (применение при старте сервисов, создание новых) |
 | [`docs/schema.md`](docs/schema.md) | схема PostgreSQL (`zones`, `subdomains`, `domains`, `subdomain_results`, `contents`, `laravel_*`, `ingest_files`): партиционирование, fillfactor, индексы, HOT-апдейты, `domain_info` |

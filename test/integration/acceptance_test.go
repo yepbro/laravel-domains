@@ -580,17 +580,25 @@ func accWaitFor(t *testing.T, what string, deadline time.Duration, ready func() 
 // доменов (без дублей зон в unicode/punycode формах)». Полный критерий
 // одним сценарием через реальный конвейер ingest: add-файл в unicode-
 // каталоге IDN-зоны, второй add в punycode-каталоге той же зоны (дубля
-// зоны нет), delete-файл и возврат add-файлом (детали — ingest_test).
+// зоны нет), delete-файл и возврат add-файлом тем же списком, undo
+// первого add-файла тем же списком из delete/ (контракт дедупа T-113 —
+// совпадение zone+sha256 при другом действии не дубль; детали —
+// ingest_test).
 func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
 
+	// Первый add-файл сценария: его список в конце отменяется тем же
+	// списком из delete/ (undo, T-113). Содержимое поделено переменной,
+	// а не копией литерала — «тот же список» байт-точен по построению.
+	firstAdd := fileContent(
+		"# приёмка §11.4 п. 1",
+		accIDNLabelU+"."+accIDNZoneUni, // сайт.проверка.test
+		"магазин."+accIDNZoneUni,       // второй IDN-домен
+	)
+
 	t.Run("add в unicode-каталоге IDN-зоны", func(t *testing.T) {
-		out := env.process(t, filepath.Join(accIDNZoneUni, "add", "unicode-form.txt"), fileContent(
-			"# приёмка §11.4 п. 1",
-			accIDNLabelU+"."+accIDNZoneUni, // сайт.проверка.test
-			"магазин."+accIDNZoneUni,       // второй IDN-домен
-		))
+		out := env.process(t, filepath.Join(accIDNZoneUni, "add", "unicode-form.txt"), firstAdd)
 		if out.Kind != ingest.OutcomeApplied {
 			t.Fatalf("итог файла = %q, хочу applied", out.Kind)
 		}
@@ -655,10 +663,11 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 		}
 	})
 
-	t.Run("delete и возврат add-файлом", func(t *testing.T) {
-		out := env.process(t, filepath.Join(accIDNZoneUni, "delete", "gone.txt"), fileContent(
-			accIDNLabelU+"."+accIDNZoneUni,
-		))
+	t.Run("delete и возврат add-файлом тем же списком", func(t *testing.T) {
+		gone := fileContent(
+			accIDNLabelU + "." + accIDNZoneUni, // сайт.проверка.test
+		)
+		out := env.process(t, filepath.Join(accIDNZoneUni, "delete", "gone.txt"), gone)
 		if out.Kind != ingest.OutcomeApplied {
 			t.Fatalf("итог delete = %q, хочу applied", out.Kind)
 		}
@@ -673,15 +682,18 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 			t.Errorf("статус после delete = %d, хочу deleted", d.status)
 		}
 
-		revive := env.process(t, filepath.Join(accIDNZoneUni, "add", "revive.txt"), fileContent(
-			accIDNLabel+"."+accIDNZone, // punycode-форма того же домена: другой sha256, чем у delete-файла
-			"возврат."+accIDNZoneUni,   // новый домен — Added=1
-		))
+		// Возврат тем же списком байт-в-байт (тот же sha256, что у
+		// delete-файла): действие другое — точной повторной доставки
+		// нет, файл применяется (дедуп (zone_id, action, sha256),
+		// T-113). До T-113 глобальный ключ по одному sha256 вынуждал
+		// revive-файл уникальное содержимое (63da59c) — пиннинг снят,
+		// то же содержимое другим действием легитимно.
+		revive := env.process(t, filepath.Join(accIDNZoneUni, "add", "revive.txt"), gone)
 		if revive.Kind != ingest.OutcomeApplied {
-			t.Fatalf("итог возврата = %q, хочу applied", revive.Kind)
+			t.Fatalf("итог возврата = %q, хочу applied (T-113: дубль sha256 delete-файла — не дубль доставки)", revive.Kind)
 		}
-		if revive.Report.Revived != 1 || revive.Report.Added != 2 {
-			t.Errorf("возврат: added=%d revived=%d, хочу 2/1 (Added включает Revived — контракт T-021)", revive.Report.Added, revive.Report.Revived)
+		if revive.Report.Revived != 1 || revive.Report.Added != 1 {
+			t.Errorf("возврат: added=%d revived=%d, хочу 1/1 (Added включает Revived — контракт T-021)", revive.Report.Added, revive.Report.Revived)
 		}
 		d, _ = env.domain(t, accIDNZone, accIDNLabel)
 		if d.status != int16(model.StatusNew) || d.checkState != int16(model.CheckStatePending) {
@@ -689,6 +701,40 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 		}
 		if d.queuedAt != nil {
 			t.Errorf("после возврата queued_at = %v, хочу NULL (снова в цикле проверок)", *d.queuedAt)
+		}
+	})
+
+	t.Run("undo тем же списком из delete/ — отменяет первый add-файл", func(t *testing.T) {
+		// Тот же список байт-в-байт, что и первый add-файл сценария
+		// (unicode-form.txt): действие другое — точной повторной
+		// доставки нет, файл ОБРАБАТЫВАЕТСЯ и удаляет домены списка
+		// (контракт T-113; глобальный дедуп по одному sha256 skip-нул
+		// бы его как дубль — семантика до T-113).
+		undo := env.process(t, filepath.Join(accIDNZoneUni, "delete", "undo.txt"), firstAdd)
+		if undo.Kind != ingest.OutcomeApplied {
+			t.Fatalf("тот же список из delete/: итог = %q, хочу applied (T-113: другое действие — не дубль)", undo.Kind)
+		}
+		if undo.Report.Deleted != 2 {
+			t.Errorf("undo: deleted=%d, хочу 2 (оба домена первого add-файла)", undo.Report.Deleted)
+		}
+		for _, label := range []string{accIDNLabel, "xn--80aairftm"} {
+			if d, ok := env.domain(t, accIDNZone, label); !ok || d.status != int16(model.StatusDeleted) {
+				t.Errorf("после undo: домен %s = %+v, хочу deleted (остался в БД, §13.1)", label, d)
+			}
+		}
+
+		// Журнал: каждая доставка — своя строка; два содержимого
+		// сценария доставлены дважды разными действиями (gone/revive,
+		// unicode-form/undo) плюс одиночный punycode-файл — 5 строк,
+		// 3 содержимых: уникальной остаётся тройка
+		// (zone_id, action, sha256), не sha256 (T-113).
+		var total, contents int
+		if err := env.pool.QueryRow(context.Background(),
+			"SELECT count(*), count(DISTINCT sha256) FROM ingest_files").Scan(&total, &contents); err != nil {
+			t.Fatal(err)
+		}
+		if total != 5 || contents != 3 {
+			t.Errorf("ingest_files: строк %d, содержим %d, хочу 5/3 (строка на доставку, не на содержимое; дублей точной доставки в сценарии нет)", total, contents)
 		}
 	})
 }
