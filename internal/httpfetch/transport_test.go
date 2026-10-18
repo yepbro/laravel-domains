@@ -258,10 +258,20 @@ func TestDialAddrsCancelAfterWinner(t *testing.T) {
 	if cancelled == 0 {
 		t.Fatal("гонка не выполнилась: ни одного выхода по отмене")
 	}
+	// Закрытие проигравших/победителя отмены асинхронно: attempt-горутина
+	// последней итерации может закрывать соединение уже после возврата
+	// dialAddrs. ждём дренажа, а не фиксируем мгновенный срез.
+	deadline := time.Now().Add(2 * time.Second)
 	mu.Lock()
-	defer mu.Unlock()
-	if closed != created {
-		t.Errorf("закрыто %d из %d соединений — утечка победителя по отмене ctx", closed, created)
+	for closed != created && time.Now().Before(deadline) {
+		mu.Unlock()
+		time.Sleep(time.Millisecond)
+		mu.Lock()
+	}
+	c, d := closed, created
+	mu.Unlock()
+	if c != d {
+		t.Errorf("закрыто %d из %d соединений — утечка победителя по отмене ctx", c, d)
 	}
 }
 
