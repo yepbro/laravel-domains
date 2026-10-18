@@ -403,6 +403,37 @@ func TestExchangeQuestionFqdnPassthrough(t *testing.T) {
 	}
 }
 
+// TestExchangeEDNS0 — запрос несёт OPT RR (RFC 6891) с advertised
+// размером DefaultEDNS0UDPSize и без DO-бита: большие ответы приходят
+// целиком по UDP, а не с TC=1 и TCP-fallback в каждой попытке (DNS-07).
+func TestExchangeEDNS0(t *testing.T) {
+	c, calls := newFakeClient(t, nil, func(_ context.Context, m *dns.Msg, _ bool) (*dns.Msg, error) {
+		return makeReply(m, dns.RcodeSuccess, aRR("example.com.", "192.0.2.1")), nil
+	})
+	if _, err := c.Exchange(context.Background(), Question{Name: "example.com", Type: dns.TypeA}); err != nil {
+		t.Fatalf("Exchange: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("вызовов транспорта: %d, want 1", len(*calls))
+	}
+	var opt *dns.OPT
+	for _, rr := range (*calls)[0].m.Extra {
+		if o, ok := rr.(*dns.OPT); ok {
+			opt = o
+			break
+		}
+	}
+	if opt == nil {
+		t.Fatal("запрос без OPT RR — EDNS0 не запрашивается")
+	}
+	if opt.UDPSize() != DefaultEDNS0UDPSize {
+		t.Fatalf("OPT UDPSize = %d, want %d", opt.UDPSize(), DefaultEDNS0UDPSize)
+	}
+	if opt.Do() {
+		t.Fatal("DO-бит не выставляется: DNSSEC не запрашивается")
+	}
+}
+
 // --- конфигурация -----------------------------------------------------------
 
 func TestOptionsDefaultsAndValidation(t *testing.T) {
