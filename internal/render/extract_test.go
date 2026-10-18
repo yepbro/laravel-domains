@@ -200,14 +200,22 @@ func TestExtractResponseHeaders(t *testing.T) {
 		"Content-Type":   []string{"text/html; charset=utf-8"},
 		"X-Powered-By":   []string{"PHP/8.3"},
 		"Content-Length": []string{"1234"},
-		"Set-Cookie":     []string{"a=1, b=2"},
+		// Многозначные заголовки — поэлементно, как у HTTP-этапа (T-058):
+		// склейка ", " необратима (запятые в Expires cookie).
+		"Set-Cookie": []string{"a=1", "b=2"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("размер %d, хочу %d: %+v", len(got), len(want), got)
 	}
 	for k, vs := range want {
-		if g := got.Get(k); g != vs[0] {
-			t.Errorf("%s = %q, хочу %q", k, g, vs[0])
+		g := got[k]
+		if len(g) != len(vs) {
+			t.Fatalf("%s = %v, хочу %v", k, g, vs)
+		}
+		for i := range vs {
+			if g[i] != vs[i] {
+				t.Errorf("%s[%d] = %q, хочу %q", k, i, g[i], vs[i])
+			}
 		}
 	}
 }

@@ -47,7 +47,6 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -176,21 +175,40 @@ func extractCookiesFromCDP(cs []*network.Cookie) []ExtractCookie {
 // http.Header: единый контракт с HTTP-этапом (subdomain_results.headers,
 // T-058 — канонические имена ключей, значения списком). CDP отдаёт
 // заголовки объектом имя→значение (значения почти всегда строки, числа
-// редки); повторявшиеся заголовки браузер к этому моменту объединяет в одну
-// строку — так и записывается.
+// редки); повторявшиеся заголовки (в первую очередь Set-Cookie) приходят
+// массивом — массив сохраняется поэлементно, как у HTTP-этапа: склейка
+// через запятую необратима (значения cookie содержат запятые —
+// Expires=Wed, 21 Oct 2025 07:28:00 GMT) и расходится с формой jsonb,
+// которую читает анализатор (map[string][]string, T-058/T-069).
 func extractResponseHeaders(h network.Headers) http.Header {
 	if len(h) == 0 {
 		return nil
 	}
 	out := make(http.Header, len(h))
 	for k, v := range h {
-		out[textproto.CanonicalMIMEHeaderKey(k)] = []string{extractHeaderString(v)}
+		out[textproto.CanonicalMIMEHeaderKey(k)] = extractHeaderValues(v)
+	}
+	return out
+}
+
+// extractHeaderValues — значения заголовка из CDP списком: одиночное
+// значение (string/число) — срез из одного элемента, массив — поэлементно
+// (контракт «значения списком» T-058; рендер повторяет запись HTTP-этапа,
+// где повторяющиеся заголовки — отдельные элементы).
+func extractHeaderValues(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return []string{extractHeaderString(v)}
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		out = append(out, extractHeaderString(item))
 	}
 	return out
 }
 
 // extractHeaderString — значение заголовка из CDP в строку (json-декодер
-// даёт string/float64/[]any).
+// даёт string/float64; прочие формы CDP не отдаёт — запасной Sprintf).
 func extractHeaderString(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -200,12 +218,6 @@ func extractHeaderString(v any) string {
 			return strconv.FormatInt(int64(x), 10)
 		}
 		return strconv.FormatFloat(x, 'g', -1, 64)
-	case []any:
-		parts := make([]string, 0, len(x))
-		for _, item := range x {
-			parts = append(parts, extractHeaderString(item))
-		}
-		return strings.Join(parts, ", ")
 	default:
 		return fmt.Sprintf("%v", x)
 	}
