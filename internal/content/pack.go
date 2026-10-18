@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -450,9 +451,13 @@ type packDirCache struct {
 }
 
 // newestPackIDLocked — максимальный id пака в каталоге (0 — паков нет)
-// с кэшем по mtime каталога; вызывается под мьютексом. Каталог контента
-// локальный (ТЗ 5.7: NVMe), mtime наносекундный — событие создания или
-// удаления пака не проскочит незамеченным между двумя os.Stat.
+// с кэшем по mtime каталога; вызывается под мьютексом. Равенство mtime —
+// не доказательство отсутствия нового пака: ядро обновляет mtime по
+// грубому таймеру (1–4 мс, на части ФС грубее), создание пака другим
+// процессом может уложиться в ту же гранулярность. Поэтому при свежем
+// кэше проверяется существование следующего id (один stat дешевле
+// ReadDir): допись обязана идти только в новейший пак — предусловие
+// компактификации (T-045).
 func (s *PackStore) newestPackIDLocked() (int32, error) {
 	// stat до ReadDir: события между ними лишь лишний раз инвалидируют кэш.
 	st, err := os.Stat(s.opts.Dir)
@@ -463,7 +468,15 @@ func (s *PackStore) newestPackIDLocked() (int32, error) {
 		s.dirCache.valid = false // реестр паков менялся — пересобрать
 	}
 	if s.dirCache.valid {
-		return s.dirCache.maxID, nil
+		_, err := os.Stat(filepath.Join(s.opts.Dir, packFileName(s.dirCache.maxID+1)))
+		switch {
+		case err == nil:
+			s.dirCache.valid = false // найден пак новее кэша — пересобрать
+		case errors.Is(err, fs.ErrNotExist):
+			return s.dirCache.maxID, nil
+		default:
+			return 0, fmt.Errorf("content: каталог паков %s: %w", s.opts.Dir, err)
+		}
 	}
 	maxID, err := s.scanPackIDs()
 	if err != nil {

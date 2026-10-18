@@ -816,6 +816,45 @@ func TestPackClosed(t *testing.T) {
 	}
 }
 
+// TestPackStaleCacheSyncsToNewest — гранулярность mtime ФС: пак,
+// созданный другим процессом в пределах той же единицы mtime, не должен
+// остаться незамеченным — кэш реестра обязан перепроверяться, допись
+// идёт в новейший пак (инвариант T-042/T-045).
+func TestPackStaleCacheSyncsToNewest(t *testing.T) {
+	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
+	ctx := context.Background()
+	if _, err := st.Put(ctx, []byte("контент до появления нового пака")); err != nil {
+		t.Fatal(err)
+	}
+	// Второй Put перечитывает каталог (создание пака сменило mtime) —
+	// кэш фиксирует maxID 1.
+	if _, err := st.Put(ctx, []byte("контент для прогрева кэша")); err != nil {
+		t.Fatal(err)
+	}
+	if !st.dirCache.valid || st.dirCache.maxID != 1 {
+		t.Fatalf("кэш реестра после Put: %+v", st.dirCache)
+	}
+
+	// «Другой процесс» создал пак 2 в пределах гранулярности mtime:
+	// каталог восстанавливает прежнее время — кэш выглядит свежим.
+	mt := st.dirCache.modTime
+	compactCraftPack(t, st.opts.Dir, 2, nil)
+	if err := os.Chtimes(st.opts.Dir, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := st.Put(ctx, []byte("контент отстающего писателя"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, _ := pool.row(res.Hash); row.packID != 2 {
+		t.Errorf("допись при протухшем кэше ушла в пак %d, want 2 (новейший)", row.packID)
+	}
+	if !st.dirCache.valid || st.dirCache.maxID != 2 {
+		t.Errorf("кэш реестра не пересобран: %+v", st.dirCache)
+	}
+}
+
 // TestPackCreatePackClosesOnSize — несовместимое содержимое при создании
 // пака: ошибка, и открытый файл не утекает (fd закрыт — повторяющаяся
 // ротация по устаревшему кэшу не выест дескрипторы до EMFILE).
