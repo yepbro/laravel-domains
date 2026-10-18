@@ -140,8 +140,9 @@ func LoadDir(dir string) (*Set, error) {
 }
 
 // validate проверяет набор целиком: непустоту, уникальность id, типы target,
-// применимость match/regex к цели, компилируемость regex, диапазон веса
-// и корректность границ версий.
+// применимость match/regex к цели, компилируемость и лимит длины regex
+// (MaxPatternBytes — граница входа едина для загрузчика и движка),
+// диапазон веса и корректность границ версий.
 func (s *Set) validate() error {
 	if len(s.Rules) == 0 {
 		return fmt.Errorf("rules: набор правил пуст (нужен хотя бы один файл с rules:)")
@@ -167,6 +168,10 @@ func (s *Set) validate() error {
 			return fmt.Errorf("%s: weight должен быть числом в (0, 1], задан %v", where, r.Weight)
 		}
 		if r.Regex != "" {
+			if max := DefaultLimits().MaxPatternBytes; len(r.Regex) > max {
+				return fmt.Errorf("%s: regex длиннее лимита %d байт (MaxPatternBytes), задан %d байт",
+					where, max, len(r.Regex))
+			}
 			if _, err := regexp.Compile(r.Regex); err != nil {
 				return fmt.Errorf("%s: некорректный regex: %w", where, err)
 			}

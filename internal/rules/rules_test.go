@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -255,6 +256,8 @@ rules:
     regex: "["
     weight: 0.5
 `},
+		{"regex длиннее MaxPatternBytes", "rules:\n  - id: long_regex\n    target: html\n    regex: \"" +
+			strings.Repeat("a", DefaultLimits().MaxPatternBytes+1) + "\"\n    weight: 0.5\n"},
 		{"ver_min больше ver_max", `
 rules:
   - id: ver_swap
