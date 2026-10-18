@@ -475,8 +475,8 @@ func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 		widths := make([]int, len(head))
 		for _, row := range rows {
 			for i, c := range row {
-				if len(c) > widths[i] {
-					widths[i] = len(c)
+				if w := cellWidth(c); w > widths[i] {
+					widths[i] = w
 				}
 			}
 		}

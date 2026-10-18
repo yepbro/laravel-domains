@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 )
 
 // Коды возврата crawlerctl (полный контракт — в комментарии пакета).
@@ -143,6 +144,13 @@ func usagef(format string, a ...any) error {
 func out(w io.Writer, format string, a ...any) {
 	_, _ = fmt.Fprintf(w, format, a...)
 }
+
+// cellWidth — ширина ячейки моноширинной таблицы в рунах: fmt паддит
+// %s по рунам, а кириллические заголовки и значения («субдомен»,
+// «(апекс)», «—») шире в байтах — ширина по len() раздувала бы колонки
+// на разницу байты−руны. Полноширинные CJK-символы шире одной клетки —
+// в выводе CLI их нет.
+func cellWidth(s string) int { return utf8.RuneCountInString(s) }
 
 // signalCtx — отменяемый контекст одноразового CLI: Ctrl-C/SIGTERM
 // прерывают команду — активные запросы к БД завершаются отменой

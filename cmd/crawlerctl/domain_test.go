@@ -669,6 +669,20 @@ func TestWriteDomainText(t *testing.T) {
 			apiLine = line
 		}
 	}
+
+	// Ширины колонок — в рунах (CLI-11): «субдомен» (7 рун, 14 байт) —
+	// самая широкая ячейка колонки, за ней сразу разделитель, а не байтовый
+	// запас; строки данных паддятся к той же ширине (www → 3 + 4 пробела).
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "субдомен ") {
+			if !strings.HasPrefix(line, "субдомен вар.") {
+				t.Errorf("заголовок таблицы с байтовым паддингом: %q", line)
+			}
+		}
+	}
+	if !strings.Contains(got, "\nwww      main ") {
+		t.Errorf("строка www не выровнена по рунам («субдомен» = 8 рун: 8−3=5 пробелов + разделитель):\n%q", wwwLine)
+	}
 	for _, cell := range []string{"main", "https", "200", "DOM", "—", "2026-10-16 09:00", "https://laravel-11.crawl.test/"} {
 		if !strings.Contains(apexLine, cell) {
 			t.Errorf("строка апекса без %q: %q", cell, apexLine)

@@ -333,8 +333,8 @@ func writeStatusTable(w io.Writer, zones []zoneStats, tot statusTotals, thr thro
 	widths := make([]int, len(head))
 	for _, r := range rows {
 		for i, c := range r {
-			if len(c) > widths[i] {
-				widths[i] = len(c)
+			if w := cellWidth(c); w > widths[i] {
+				widths[i] = w
 			}
 		}
 	}

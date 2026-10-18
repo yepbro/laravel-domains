@@ -208,8 +208,8 @@ func zonesListRun(ctx context.Context, pool db.DB, stdout io.Writer) error {
 	widths := make([]int, len(head))
 	for _, r := range rows {
 		for i, c := range r {
-			if len(c) > widths[i] {
-				widths[i] = len(c)
+			if w := cellWidth(c); w > widths[i] {
+				widths[i] = w
 			}
 		}
 	}
