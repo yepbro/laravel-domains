@@ -958,6 +958,78 @@ func TestFetchChainContextCancel(t *testing.T) {
 	}
 }
 
+// --- бюджет цепочки -------------------------------------------------------
+
+// TestFetchChainBudget: общий бюджет цепочки (ChainOptions.TotalTimeout)
+// ограничивает все хопы вместе, а не по одному: молчащий хоп и цепочка
+// медленных хопов прерываются тайм-классифицированной ошибкой (temp_error
+// у потребителя, ТЗ 6.2), не занимая слот воркера минуты.
+func TestFetchChainBudget(t *testing.T) {
+	t.Run("молчаливый хоп прерывается бюджетом", func(t *testing.T) {
+		stall := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/start" {
+				w.Header().Set("Location", "/final")
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+			select {
+			case <-stall:
+			case <-time.After(5 * time.Second):
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer func() {
+			select {
+			case <-stall:
+			default:
+				close(stall)
+			}
+			srv.Close()
+		}()
+
+		// Слои хопа не срабатывают (5 с), прервать запрос обязан
+		// именно бюджет цепочки.
+		f := NewFetcher(Options{HeaderTimeout: 5 * time.Second, TotalTimeout: 5 * time.Second})
+		start := time.Now()
+		got, err := FetchChainOpts(context.Background(), f, FetchRequest{
+			URL: redirectReqURL(srv.URL, "budget.example.net", "/start"), Addrs: loopbackAddr(),
+		}, ChainOptions{MaxRedirects: 3, TotalTimeout: 250 * time.Millisecond})
+		elapsed := time.Since(start)
+		if err == nil || !IsTimeout(err) {
+			t.Fatalf("ожидался таймаут бюджета цепочки, получено: %v", err)
+		}
+		if elapsed >= 2*time.Second {
+			t.Errorf("бюджет сработал поздно: %s", elapsed)
+		}
+		if len(got.Chain) != 1 {
+			t.Errorf("цепочка: %+v, ожидался 1 шаг до таймаута", got.Chain)
+		}
+	})
+
+	t.Run("бюджет копится по хопам", func(t *testing.T) {
+		// Каждый хоп укладывается в свои таймауты (200 мс < 5 с), но
+		// три хопа не влезают в бюджет 500 мс: третий не начинается.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(200 * time.Millisecond)
+			w.Header().Set("Location", r.URL.Path+"x")
+			w.WriteHeader(http.StatusFound)
+		}))
+		defer srv.Close()
+
+		f := NewFetcher(Options{HeaderTimeout: 5 * time.Second, TotalTimeout: 5 * time.Second})
+		got, err := FetchChainOpts(context.Background(), f, FetchRequest{
+			URL: redirectReqURL(srv.URL, "slowchain.example.net", "/a"), Addrs: loopbackAddr(),
+		}, ChainOptions{MaxRedirects: 5, TotalTimeout: 500 * time.Millisecond})
+		if err == nil || !IsTimeout(err) {
+			t.Fatalf("ожидался таймаут бюджета цепочки, получено: %v", err)
+		}
+		if len(got.Chain) != 2 {
+			t.Errorf("цепочка: %d шагов, ожидались 2 (третий хоп за бюджетом)", len(got.Chain))
+		}
+	})
+}
+
 // --- IP-литералы в переходах ----------------------------------------------
 
 // TestRedirectResolveIPLiteral: IP-литералы в Location проходят как
