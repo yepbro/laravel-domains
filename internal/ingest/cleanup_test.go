@@ -378,28 +378,67 @@ func TestCleanupOnceRepeatPasses(t *testing.T) {
 	}
 }
 
-// TestCleanupOnceBadHash — content_hash не 16 октетов ломает контракт
-// contents (ТЗ 6.1): проход откатывается, refcount не трогается.
+// TestCleanupOnceBadHash — content_hash не 16 октетов (контракт contents,
+// ТЗ 6.1) не роняет проход (poison pill, ING-P2-4): строка уже удалена,
+// refcount по ней не меняется, транзакция фиксируется, аномалия видна в
+// CleanupResult.BadHashes.
 func TestCleanupOnceBadHash(t *testing.T) {
-	pool := &cleanupFakePool{
-		selects: []*cleanupFakeRows{cleanupRows([]any{int16(1), int64(10)})},
-		deletes: []*cleanupFakeRows{cleanupRows([]any{int16(1), int64(10), make([]byte, 15)})},
-	}
+	t.Run("мусорный хэш рядом с корректным", func(t *testing.T) {
+		pool := &cleanupFakePool{
+			selects: []*cleanupFakeRows{cleanupRows([]any{int16(1), int64(10)})},
+			deletes: []*cleanupFakeRows{cleanupRows(
+				[]any{int16(1), int64(10), make([]byte, 15)},
+				[]any{int16(1), int64(10), cleanupHash16(0xaa)},
+			)},
+		}
 
-	_, err := CleanupOnce(context.Background(), pool, CleanupOptions{})
-	if err == nil {
-		t.Fatal("ожидалась ошибка контракта content_hash")
-	}
-	if !strings.Contains(err.Error(), "content_hash") || !strings.Contains(err.Error(), "ожидается 16") {
-		t.Errorf("сообщение = %q, want про content_hash и ожидаемые 16 октетов", err)
-	}
-	tx := pool.txs[0]
-	if len(tx.calls) != 1 {
-		t.Errorf("вызовов в транзакции = %d, want 1: UPDATE не выполняется", len(tx.calls))
-	}
-	if tx.committed || !tx.rolledBack {
-		t.Errorf("транзакция: committed=%v rolledBack=%v, want откат", tx.committed, tx.rolledBack)
-	}
+		res, err := CleanupOnce(context.Background(), pool, CleanupOptions{})
+		if err != nil {
+			t.Fatalf("CleanupOnce: %v, want проход без ошибки", err)
+		}
+		if res.BadHashes != 1 || res.Domains != 1 || res.Results != 2 || res.Contents != 1 {
+			t.Errorf("итог = %+v, want bad_hashes 1, domains 1, results 2, contents 1", res)
+		}
+		tx := pool.txs[0]
+		if len(tx.calls) != 2 {
+			t.Fatalf("вызовов в транзакции %d, want 2 (DELETE + UPDATE по корректному хэшу)", len(tx.calls))
+		}
+		if want := []any{[][]byte{cleanupHash16(0xaa)}, []int32{1}}; !reflect.DeepEqual(tx.calls[1].args, want) {
+			t.Errorf("аргументы refcount = %v, want только корректный хэш", tx.calls[1].args)
+		}
+		if !tx.committed || tx.rolledBack {
+			t.Errorf("транзакция: committed=%v rolledBack=%v, want фиксация без отката", tx.committed, tx.rolledBack)
+		}
+	})
+	t.Run("все хэши некорректны — проход продолжается", func(t *testing.T) {
+		pool := &cleanupFakePool{
+			selects: []*cleanupFakeRows{cleanupRows(
+				[]any{int16(1), int64(10)},
+				[]any{int16(2), int64(20)},
+			)},
+			deletes: []*cleanupFakeRows{cleanupRows(
+				[]any{int16(1), int64(10), make([]byte, 3)},
+				[]any{int16(2), int64(20), nil},
+			)},
+		}
+
+		res, err := CleanupOnce(context.Background(), pool, CleanupOptions{})
+		if err != nil {
+			t.Fatalf("CleanupOnce: %v, want проход без ошибки", err)
+		}
+		if res.BadHashes != 1 || res.Domains != 2 || res.Contents != 0 {
+			t.Errorf("итог = %+v, want bad_hashes 1, domains 2, contents 0", res)
+		}
+		// Ссылок для refcount нет — UPDATE не выполняется, но проход
+		// фиксируется: домены вычищены, следующие проходы их не выберут.
+		tx := pool.txs[0]
+		if len(tx.calls) != 1 {
+			t.Fatalf("вызовов в транзакции %d, want 1 (только DELETE)", len(tx.calls))
+		}
+		if !tx.committed {
+			t.Error("транзакция не зафиксирована — кандидаты выберутся снова")
+		}
+	})
 }
 
 func TestCleanupOnceErrors(t *testing.T) {
@@ -523,6 +562,7 @@ func TestCleanupDeletedLoop(t *testing.T) {
 		selectErrs: []error{nil, errors.New("бд недоступна")},
 		deletes: []*cleanupFakeRows{cleanupRows(
 			[]any{int16(1), int64(10), cleanupHash16(0xaa)},
+			[]any{int16(1), int64(10), make([]byte, 9)}, // poison pill: Warn, проход жив
 		)},
 	}
 
@@ -559,8 +599,9 @@ func TestCleanupDeletedLoop(t *testing.T) {
 	for _, want := range []string{
 		"фоновая очистка удалённых доменов", // старт
 		"проход очистки удалённых доменов",  // итог первого прохода
-		"domains=1",     // счётчики прохода
-		"бд недоступна", // ошибка второго прохода
+		"domains=1",                 // счётчики прохода
+		"некорректным content_hash", // poison pill — Warn (ING-P2-4)
+		"бд недоступна",             // ошибка второго прохода
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("лог не содержит %q:\n%s", want, log)
