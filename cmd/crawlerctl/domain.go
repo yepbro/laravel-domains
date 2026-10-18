@@ -721,10 +721,13 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 		// Читатель хранилища контента без записи — стиль analyzer
 		// (T-071): тот же словарь zstd и PackStore, что у пишущих этапов
 		// (иначе распаковка чужих блоков невозможна), лимиты Put не нужны.
+		// ReadOnly: чтение не создаёт каталог и файл блокировки — работает
+		// и без прав на запись в content.dir, опечатка в каталоге не
+		// создаёт посторонних путей (runbook: проверка чтения контента).
 		if _, err := content.SetDictFile(cfg.Content.ZstdDictionary, slog.New(slog.NewTextHandler(stderr, nil))); err != nil {
 			return fmt.Errorf("domain: %w", err)
 		}
-		store, err := content.OpenPackStore(pool, content.PackOptions{Dir: cfg.Content.Dir})
+		store, err := content.OpenPackStore(pool, content.PackOptions{Dir: cfg.Content.Dir, ReadOnly: true})
 		if err != nil {
 			return fmt.Errorf("domain: %w", err)
 		}

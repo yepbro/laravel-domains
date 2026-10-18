@@ -61,6 +61,11 @@ const (
 // в контракт ContentStore не входит.
 var errPackClosed = errors.New("content: хранилище паков закрыто")
 
+// errReadOnly — запись в хранилище, открытое с PackOptions.ReadOnly:
+// читатель без записи (crawlerctl domain --content) не должен менять ни
+// ФС, ни метаданные; программная ошибка вызывающего.
+var errReadOnly = errors.New("content: хранилище паков открыто только для чтения")
+
 // SQL метаданных contents (ТЗ 6.1). Точные тексты закреплены тестами
 // (pack_test.go, стиль ingest-тестов на фейковом pgx-пуле).
 const (
@@ -114,6 +119,13 @@ type PackOptions struct {
 	// OnStoreFull — хук алерта T-080: типизированные события «место
 	// ниже порога» от Put, ENOSPC и DiskWatchLoop. nil — не задан.
 	OnStoreFull OnStoreFullFunc
+	// ReadOnly — открыть хранилище только для чтения (читатели без
+	// записи: crawlerctl domain --content): каталог и файл блокировки
+	// не создаются — работают даже без прав на запись в content.dir,
+	// опечатка в каталоге не создаёт посторонних путей; Put/Delete/
+	// beginAppend отказывают errReadOnly, Get читает по имеющимся пакам
+	// и метаданным.
+	ReadOnly bool
 }
 
 // PackStore — ContentStore на пак-файлах: блоки в pack-NNNNNN.pack,
@@ -152,7 +164,8 @@ type packHeader struct {
 // OpenPackStore открывает хранилище в opts.Dir: каталог создаётся,
 // файл блокировки — тоже (fail-fast на неустройчивом к записи каталоге);
 // сами паки сканируются лениво при первой записи. pool — pgx-пул
-// (internal/db), где живут строки contents.
+// (internal/db), где живут строки contents. PackOptions.ReadOnly открывает
+// читателя: без создания каталога и замка (см. поле).
 func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 	if pool == nil {
 		return nil, errors.New("content: пул БД не задан")
@@ -168,6 +181,19 @@ func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 	}
 	if opts.MaxStoreBytes < 0 {
 		return nil, fmt.Errorf("content: max_store_bytes %d отрицателен", opts.MaxStoreBytes)
+	}
+	if opts.ReadOnly {
+		// Читателю каталог и замок не нужны: ФС не меняется, права на
+		// запись не требуются. Отсутствующий каталог — ошибка: опечатка
+		// в content.dir не должна молча выглядеть пустым хранилищем.
+		st, err := os.Stat(opts.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("content: каталог паков %s: %w", opts.Dir, err)
+		}
+		if !st.IsDir() {
+			return nil, fmt.Errorf("content: каталог паков %s: не каталог", opts.Dir)
+		}
+		return &PackStore{pool: pool, opts: opts, stat: OSStatfs{}}, nil
 	}
 	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("content: каталог паков %s: %w", opts.Dir, err)
@@ -198,8 +224,11 @@ func (s *PackStore) Close() error {
 		}
 		s.active = nil
 	}
-	if cerr := s.lock.Close(); cerr != nil && err == nil {
-		err = cerr
+	// У хранилища из ReadOnly замка нет (s.lock == nil).
+	if s.lock != nil {
+		if cerr := s.lock.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
 	}
 	return err
 }
@@ -211,6 +240,9 @@ func (s *PackStore) Close() error {
 func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 	if err := ctx.Err(); err != nil {
 		return PutResult{}, err
+	}
+	if s.opts.ReadOnly {
+		return PutResult{}, errReadOnly
 	}
 	if s.opts.MaxStoreBytes > 0 && int64(len(data)) > s.opts.MaxStoreBytes {
 		return PutResult{}, fmt.Errorf("%w: %d байт при лимите %d",
@@ -381,6 +413,9 @@ func (s *PackStore) Delete(ctx context.Context, hash Hash) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if s.opts.ReadOnly {
+		return errReadOnly
+	}
 	tag, err := s.pool.Exec(ctx, sqlMetaDelRef, hash[:])
 	if err != nil {
 		return fmt.Errorf("content: метаданные %s: %w", hash, err)
@@ -409,6 +444,10 @@ func (s *PackStore) beginAppend() (*appendBatch, error) {
 	if s.closed {
 		s.mu.Unlock()
 		return nil, errPackClosed
+	}
+	if s.opts.ReadOnly {
+		s.mu.Unlock()
+		return nil, errReadOnly
 	}
 	if err := flockDir(s.lock); err != nil {
 		s.mu.Unlock()
