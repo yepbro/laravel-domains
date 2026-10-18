@@ -640,6 +640,140 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 	}
 }
 
+// TestDNSWorker_InvalidDomainStatus — терминальный диагноз ядовитой
+// строки (T-109, остаток DNS-03): домен с пустым именем в пачке q:dns
+// фиксируется как invalid + done (вместо вечного цикла queued →
+// lease-возврат → dispatch), доставка подтверждается (не q:dead), и
+// перепроверка recheck строку не возвращает (фильтр статуса в отборе).
+func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	rdb := resilienceRedisEnv(t)
+	resolve := dnsEnv(t)
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Мусорная строка: label валиден для вставки, но имя в сообщении
+	// пачки пробельное — как порченая строка domains (DNS-03).
+	ids := insertPendingDomains(t, pool, "crawl.test", []string{"poison"})
+	if len(ids) != 1 {
+		t.Fatalf("вставлено доменов: %d, хочу 1", len(ids))
+	}
+	var zoneID int16
+	if err := pool.QueryRow(ctx, "SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
+		t.Fatalf("зона crawl.test: %v", err)
+	}
+
+	if _, err := q.Publish(ctx, queue.StreamDNS, queue.DNSBatch{Domains: []queue.DNSDomain{
+		{ZoneID: zoneID, DomainID: ids[0], Name: "   "},
+	}}); err != nil {
+		t.Fatalf("публикация q:dns: %v", err)
+	}
+
+	const group = "it-dns-invalid"
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- dnsworker.Run(ctx, pool, q, resolve, dnsworker.Options{
+			Group: group, Consumer: "it-invalid-1",
+			Concurrency: 1, Consume: 1,
+		})
+	}()
+
+	// Диагноз записан: строка уходит в done (lease завершён), а не
+	// остаётся queued для бесконечного переиздания.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var state int16
+		if err := pool.QueryRow(ctx,
+			"SELECT check_state FROM domains WHERE id = $1", ids[0],
+		).Scan(&state); err != nil {
+			t.Fatalf("чтение домена: %v", err)
+		}
+		if model.CheckState(state) == model.CheckStateDone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ядовитый домен не получил терминальный диагноз за 15 с")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var (
+		status   model.Status
+		queuedAt *time.Time
+	)
+	if err := pool.QueryRow(ctx,
+		"SELECT status, queued_at FROM domains WHERE id = $1", ids[0],
+	).Scan(&status, &queuedAt); err != nil {
+		t.Fatalf("чтение диагноза: %v", err)
+	}
+	if status != model.StatusInvalid {
+		t.Errorf("статус = %s, хочу invalid (терминальный диагноз T-109)", status)
+	}
+	if queuedAt != nil {
+		t.Error("queued_at не сброшен — lease не завершён диагнозом")
+	}
+
+	// Доставка подтверждена после записи, не карантином.
+	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 0 {
+		t.Errorf("неподтверждённых q:dns: %d, хочу 0", n)
+	}
+	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
+		t.Errorf("записей в q:dead: %d, хочу 0 (диагноз — не карантин)", n)
+	}
+
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("Run после отмены ctx: %v, хочу nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("цикл воркера не остановился после отмены ctx")
+	}
+
+	// Перепроверка не возвращает invalid: обе строки состарены в
+	// 2000-01-01 — контрольная temp_error переводится в pending,
+	// ядовитая остаётся done (фильтр статуса в отборе recheck).
+	// ctx воркера уже отменён — операции проверки идут своим фоном.
+	ageCtx := context.Background()
+	if _, err := pool.Exec(ageCtx, "UPDATE domains SET last_checked_at = DATE '2000-01-01'"); err != nil {
+		t.Fatalf("старение строк: %v", err)
+	}
+	if _, err := pool.Exec(ageCtx,
+		fmt.Sprintf("INSERT INTO domains (zone_id, label, status, check_state, last_checked_at) "+
+			"VALUES ($1, 'control', %d, %d, DATE '2000-01-01')",
+			int16(model.StatusTempError), int16(model.CheckStateDone)),
+		zoneID); err != nil {
+		t.Fatalf("вставка контрольного домена: %v", err)
+	}
+	res, err := scheduler.RecheckOnce(ageCtx, pool, scheduler.RecheckOptions{})
+	if err != nil {
+		t.Fatalf("RecheckOnce: %v", err)
+	}
+	if res.Domains != 1 {
+		t.Errorf("RecheckOnce перевёл %d доменов, хочу 1 (только контрольный)", res.Domains)
+	}
+	var poisonState, controlState int16
+	if err := pool.QueryRow(ageCtx,
+		"SELECT check_state FROM domains WHERE id = $1", ids[0]).Scan(&poisonState); err != nil {
+		t.Fatalf("чтение ядовитого: %v", err)
+	}
+	if err := pool.QueryRow(ageCtx,
+		"SELECT check_state FROM domains WHERE label = 'control' AND zone_id = $1", zoneID).Scan(&controlState); err != nil {
+		t.Fatalf("чтение контрольного: %v", err)
+	}
+	if model.CheckState(poisonState) != model.CheckStateDone {
+		t.Errorf("ядовитый: check_state = %s, хочу done (recheck не возвращает invalid)",
+			model.CheckState(poisonState))
+	}
+	if model.CheckState(controlState) != model.CheckStatePending {
+		t.Errorf("контрольный: check_state = %s, хочу pending (обычные done-строки возвращаются)",
+			model.CheckState(controlState))
+	}
+}
+
 // TestDNSWorker_RedeliveryPublishedMarker — семантика повтора пачки со
 // staging-пометкой http_published (T-108, DNS-04): домены, чья задача
 // q:http была опубликована предыдущей попыткой (сбой записи результата

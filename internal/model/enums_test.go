@@ -23,6 +23,7 @@ func TestStatusCodes(t *testing.T) {
 		{4, "alive"},
 		{5, "temp_error"},
 		{6, "deleted"},
+		{7, "invalid"}, // диагностический, T-109
 	}
 	if len(Statuses) != len(want) {
 		t.Fatalf("Statuses: %d статусов, want %d (все статусы ТЗ 6.2)", len(Statuses), len(want))
@@ -45,7 +46,7 @@ func TestStatusCodes(t *testing.T) {
 }
 
 func TestStatusStringUnknown(t *testing.T) {
-	for _, code := range []int16{-1, 7, 100} {
+	for _, code := range []int16{-1, 8, 100} {
 		if got, want := Status(code).String(), "Status("+itoa(code)+")"; got != want {
 			t.Errorf("Status(%d).String() = %q, want %q", code, got, want)
 		}
@@ -53,7 +54,7 @@ func TestStatusStringUnknown(t *testing.T) {
 }
 
 func TestStatusValidInvalid(t *testing.T) {
-	for _, code := range []int16{-1, 7, 42} {
+	for _, code := range []int16{-1, 8, 42} {
 		if Status(code).Valid() {
 			t.Errorf("Status(%d).Valid() = true, want false (код вне ТЗ 6.2)", code)
 		}

@@ -243,7 +243,7 @@ T-096): это не индекс «под будущую выборку», а п
 |---|---|---|
 | выборка pending (T-027) | `check_state = 0`, не deleted, ORDER BY `(zone_id, id)` | `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0` |
 | возврат lease (T-029) | `check_state = 1`, не deleted, `queued_at < now() − lease`, ORDER BY `(queued_at, zone_id, id)` | `domains_lease_idx` (`queued_at, zone_id, id`) `WHERE check_state = 1` |
-| перепроверка (T-030) | `check_state = 2`, не deleted, `last_checked_at < now() − interval`, ORDER BY `(last_checked_at, zone_id, id)` | `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` |
+| перепроверка (T-030) | `check_state = 2`, не deleted, не invalid, `last_checked_at < now() − interval`, ORDER BY `(last_checked_at, zone_id, id)` | `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` |
 | повтор temp_error (T-031) | `status = temp_error AND check_state = 2`, `last_checked_at < now() − retry_after` | **нет** — см. ниже |
 | коллектор backlog (T-077) | `status <> deleted` GROUP BY `check_state` | **нет** — агрегат по всей таблице, частичным индексом не сводится |
 
@@ -255,7 +255,7 @@ T-096): это не индекс «под будущую выборку», а п
 - **доменный ключ в хвосте** (`zone_id, id`) — ORDER BY прохода совпадает
   с ключом индекса: без сортировки, детерминированные пачки и ранний
   останов LIMIT; ключи читаются из индекса без обращения к куче (куча —
-  только фильтр `status <> deleted`);
+  только фильтр по `status`: не deleted, для recheck ещё и не invalid);
 - **линейный дренаж пачками**: переведённые строки покидают индекс
   (больше не удовлетворяют предикату `check_state`), следующая пачка
   продолжается с места остановки — внешнего состояния нет (ТЗ 3.4), а
@@ -399,7 +399,7 @@ HOT (без записи в индексы), пока обновляемая к�
 
 | Тип | Колонка | Значения |
 |---|---|---|
-| `model.Status` | `domains.status` | 0 `new`, 1 `not_delegated`, 2 `delegated_no_address`, 3 `no_http`, 4 `alive`, 5 `temp_error`, 6 `deleted` (ТЗ 6.2); имена и `ParseStatus` для разбора |
+| `model.Status` | `domains.status` | 0 `new`, 1 `not_delegated`, 2 `delegated_no_address`, 3 `no_http`, 4 `alive`, 5 `temp_error`, 6 `deleted` (ТЗ 6.2), 7 `invalid` (диагностический: ядовитая строка, проверка невозможна — T-109; расширение §6.2, перепроверка такие строки не возвращает); имена и `ParseStatus` для разбора |
 | `model.CheckState` | `domains.check_state` | 0 `pending`, 1 `queued`, 2 `done` |
 | `model.Flags` | `domains.flags` | бит 0 `is_idn` (ТЗ 5.2 п. 9 — метка содержит `xn--`), бит 1 `render_pending` (ТЗ 5.6), бит 2 `http_published` — staging-пометка «задача q:http эпизода опубликована, результат не записан» (T-108: повторная доставка пачки q:dns не дублирует публикацию; снимается записью результата и постановкой планировщика); методы `Set`/`Clear`/`Test` |
 | `model.DNSMask` | `domains.dns_mask`, `laravel_domains.found_on_mask` | бит № = `subdomains.id`, биты 0..62 (максимум 63 субдомена, ТЗ 5.10); `Set`/`Unset`/`Test`/`IDs`/`Count` |
@@ -492,3 +492,8 @@ DSN). Вызывающий не может подменить таблицы ч�
 тестовым данным (включая сортировку findings и расшифровки масок),
 отделение зоны самым длинным суффиксом и `NULL` для неизвестных
 домена/зоны. Down-миграция — `DROP FUNCTION IF EXISTS domain_info(text)`.
+
+Миграция `000010_domain_info_invalid_status` (T-109) добавила в CASE
+расшифровки `status_name` ветку кода 7 (`invalid` — диагностический
+статус ядовитой строки) полным `CREATE OR REPLACE` тела 000006: для
+кодов 0..6 ответ не изменился.

@@ -90,10 +90,10 @@ func (p *recheckFakePool) calls() []recheckCall {
 const wantRecheckUpdate = "UPDATE domains AS d " +
 	"SET check_state = $1, queued_at = NULL " +
 	"FROM (SELECT zone_id, id FROM domains " +
-	"WHERE check_state = 2 AND status <> 6 AND last_checked_at < $2 " +
+	"WHERE check_state = 2 AND status <> 6 AND status <> 7 AND last_checked_at < $2 " +
 	"ORDER BY last_checked_at, zone_id, id LIMIT $3) AS b " +
 	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = 2 AND d.status <> 6 AND d.last_checked_at < $2"
+	"AND d.check_state = 2 AND d.status <> 6 AND d.status <> 7 AND d.last_checked_at < $2"
 
 // recheckFixedClock — часы с фиксированным «сейчас» (порог прохода
 // воспроизводим до наносекунды).

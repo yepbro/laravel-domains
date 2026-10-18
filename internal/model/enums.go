@@ -6,9 +6,10 @@ import (
 )
 
 // Status — статус домена, колонка domains.status (smallint, ТЗ 6.2).
-// Коды 0..6 зафиксированы схемой и тестом. ТЗ 6.2 допускает дополнительные
-// статусы (например, parked): новая константа расширяет Statuses и таблицу
-// statusNames следующим кодом по порядку.
+// Коды 0..6 зафиксированы схемой и тестом; код 7 — диагностический
+// invalid (T-109). ТЗ 6.2 допускает дополнительные статусы (например,
+// parked): новая константа расширяет Statuses и таблицу statusNames
+// следующим кодом по порядку.
 type Status int16
 
 // Статусы домена (ТЗ 6.2). Комментарии — значения из таблицы §6.2.
@@ -31,6 +32,17 @@ const (
 	// StatusDeleted — удалён из зарегистрированных по файлу удаления
 	// (ТЗ 5.1, 13.1).
 	StatusDeleted Status = 6
+	// StatusInvalid — диагностический терминальный статус ядовитой
+	// строки (T-109, остаток DNS-03): проверка невозможна — имя пустое
+	// или пробельное (мусорная/порченая строка domains), повтор эпизода
+	// исход не изменит. Не факт о домене: ставится DNS-этапом вместо
+	// вечного цикла queued→lease→dispatch; перепроверка (recheck) такие
+	// строки не возвращает — выход один: ручной разбор (правка имени или
+	// удаление строки). Код 7 — расширение таблицы §6.2, допущенное ТЗ:
+	// прецедент «семь статусов» (ТЗ 13.1, retry.go T-031) осознанно
+	// переигран: temp_error породил бы ложные повторы с финализацией в
+	// delegated_no_address — обман о домене, а не диагностика.
+	StatusInvalid Status = 7
 )
 
 // Statuses — все статусы по возрастанию кодов (итерация, вывод в CLI).
@@ -42,9 +54,11 @@ var Statuses = []Status{
 	StatusAlive,
 	StatusTempError,
 	StatusDeleted,
+	StatusInvalid,
 }
 
-// statusNames — имена статусов ровно из таблицы ТЗ 6.2.
+// statusNames — имена статусов: 0..6 — ровно из таблицы ТЗ 6.2,
+// 7 — диагностический invalid (T-109, расширение §6.2).
 var statusNames = map[Status]string{
 	StatusNew:                "new",
 	StatusNotDelegated:       "not_delegated",
@@ -53,6 +67,7 @@ var statusNames = map[Status]string{
 	StatusAlive:              "alive",
 	StatusTempError:          "temp_error",
 	StatusDeleted:            "deleted",
+	StatusInvalid:            "invalid",
 }
 
 // statusByName — обратное соответствие для ParseStatus.

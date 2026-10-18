@@ -161,6 +161,24 @@ var (
 		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d AND t.check_state <> %d",
 			int16(model.StatusDeleted), int16(model.CheckStateDone))
 
+	// resultInvalidSQL — терминальный диагноз ядовитой строки (T-109,
+	// остаток DNS-03): статус invalid для домена, чья проверка
+	// невозможна детерминированно (пустое имя, ErrEmptyDomain). Запись
+	// завершает lease и выводит строку из бесконечного цикла queued →
+	// lease-возврат → dispatch: перепроверка (recheck, T-030) invalid не
+	// возвращает — строки не переиздаются. dns_mask не пишется: маска —
+	// факт DNS-эпизода, которого у мусорной строки нет; temp_attempts
+	// сбрасывается (повторов не будет); бит http_published снимается —
+	// done-строка чиста от staging-пометки (T-108). Охраны — как у
+	// записи результата: deleted не перезаписывается (§13.1), повторная
+	// доставка уже зафиксированного диагноза идемпотентна (ТЗ 3.4).
+	resultInvalidSQL = "UPDATE domains AS t " +
+		fmt.Sprintf("SET status = %d::int2, temp_attempts = 0, ", int16(model.StatusInvalid)) +
+		fmt.Sprintf("flags = (t.flags & %d)::int2, ", int16(^int16(model.FlagHTTPPublished))) +
+		fmt.Sprintf("check_state = %d, queued_at = NULL, last_checked_at = now() ", int16(model.CheckStateDone)) +
+		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d AND t.check_state <> %d",
+			int16(model.StatusDeleted), int16(model.CheckStateDone))
+
 	// resultPendingSQL — фильтр актуальности пачки q:dns: остаются домены
 	// ещё не записанные (check_state <> done — повторная доставка,
 	// идемпотентность) и не удалённые (§13.1); flags — staging-пометка
@@ -345,6 +363,25 @@ func MarkHTTPPublished(ctx context.Context, pool db.DB, zoneID int16, domainID i
 	tag, err := pool.Exec(ctx, resultMarkPublishedSQL, zoneID, domainID)
 	if err != nil {
 		return false, fmt.Errorf("dnsworker: пометка публикации домена %d/%d: %w", zoneID, domainID, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// RecordInvalid фиксирует терминальный диагноз ядовитой строки — статус
+// invalid (T-109): домен, чья проверка невозможна детерминированно
+// (пустое имя, ErrEmptyDomain), покидает цикл переиздания вместо
+// бесконечного lease-возврата. Оператор resultInvalidSQL с охранами
+// актуальности: удалённый домен не перезаписывается (§13.1), повторная
+// доставка зафиксированного диагноза — no-op (идемпотентность, ТЗ 3.4).
+// Возвращает false, когда охраны отсекли строку (done/deleted) — это
+// успех, а не ошибка.
+func RecordInvalid(ctx context.Context, pool db.DB, zoneID int16, domainID int64) (bool, error) {
+	if pool == nil {
+		return false, errors.New("dnsworker: диагноз invalid: пул не задан")
+	}
+	tag, err := pool.Exec(ctx, resultInvalidSQL, zoneID, domainID)
+	if err != nil {
+		return false, fmt.Errorf("dnsworker: диагноз invalid домена %d/%d: %w", zoneID, domainID, err)
 	}
 	return tag.RowsAffected() > 0, nil
 }
@@ -770,11 +807,15 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 // доставка не лечит (DNS-03): пустой или целиком отключённый/кривой
 // справочник субдоменов — конфигурация, а не яд (пачка подтверждается с
 // Warn, домены вернёт lease-проход T-029/T-030 после починки справочника
-// — повторами до q:dead очередь замусоривалась бы каждой пачкой);
-// домен с пустым именем — мусорная строка (Warn по домену, строка
-// остаётся queued для разбора оператором). Транспортные сбои (БД/Redis)
-// и порченое сообщение (Decode) — по-прежнему ошибка без XACK: их
-// повторная доставка лечит (T-025).
+// — повторами до q:dead очередь замусоривалась бы каждой пачкой, а
+// терминальный статус заморозил бы домены навсегда: они исправны и
+// обязаны обработаться после починки); домен с пустым именем — мусорная
+// строка (T-109): фиксируется терминальный диагноз invalid
+// (RecordInvalid), Warn по домену и продолжение — остальные домены пачки
+// обрабатываются, доставка подтверждается; строка выводится из цикла
+// переиздания (recheck invalid не возвращает). Транспортные сбои
+// (БД/Redis) и порченое сообщение (Decode) — по-прежнему ошибка без
+// XACK: их повторная доставка лечит (T-025).
 func processBatch(
 	ctx context.Context,
 	pool db.DB,
@@ -857,12 +898,29 @@ func processBatch(
 				met.Episode(time.Since(start))
 			case errors.Is(err, ErrEmptyDomain):
 				// Ядовитый домен: детерминированная ошибка, повтор
-				// доставки не изменит исход. Warn и продолжение:
-				// остальные домены пачки обрабатываются, доставка
-				// подтверждается; строка остаётся queued — lease-проход
-				// вернёт её после чистки мусора.
-				log.Warn("домен с пустым именем — пропущен без записи",
-					"entry", del.ID, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
+				// доставки не изменит исход — терминальный диагноз invalid
+				// (T-109) вместо вечного цикла queued→lease→dispatch.
+				// Warn и продолжение: остальные домены пачки обрабатываются,
+				// доставка подтверждается. Сбой записи диагноза — ошибка
+				// эпизода (без XACK): повторная доставка доиграет фиксацию.
+				recorded, rerr := RecordInvalid(ctx, pool, dom.ZoneID, dom.DomainID)
+				switch {
+				case rerr != nil:
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("домен %s: %w", dom.Name, rerr)
+					}
+					mu.Unlock()
+				case recorded:
+					met.DomainStatus(model.StatusInvalid)
+					log.Warn("домен с пустым именем — зафиксирован диагноз invalid, строка выведена из цикла переиздания",
+						"entry", del.ID, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
+				default:
+					// Охраны отсекли (deleted/уже done) — повторная доставка
+					// или конкурентный delete: штатно.
+					log.Debug("диагноз invalid не записан — домен удалён или уже done",
+						"entry", del.ID, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
+				}
 			default:
 				mu.Lock()
 				if firstErr == nil {

@@ -1,9 +1,10 @@
 // Приборы DNS-этапа (T-077, ТЗ 5.9): пропускная способность (счётчик
 // завершённых эпизодов и гистограмма их длительностей) и финальные
 // статусы доменов терминальных веток DNS (not_delegated /
-// delegated_no_address / temp_error, §6.2/§7). Статусы ветки «есть
-// адреса» не пишутся (итог за HTTP-этапом) — их считает http-worker тем
-// же счётчиком crawler_domain_status_total. Ошибки обменов отдельным
+// delegated_no_address / temp_error / invalid, §6.2/§7). Статусы ветки
+// «есть адреса» не пишутся (итог за HTTP-этапом) — их считает http-worker
+// тем же счётчиком crawler_domain_status_total. invalid — диагностика
+// ядовитой строки (T-109), не факт о домене. Ошибки обменов отдельным
 // счётчиком не типизируются: DNS-этап не классифицирует сбои резолвера
 // (транспорт после ретраев и любые коды ответа сводятся к temp_error,
 // T-036) — счётчик статусов и есть честная типизация итога; типизация
@@ -54,7 +55,7 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		}, metrics.LabelStage).WithLabelValues(metrics.StageDNS),
 		statuses: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_domain_status_total",
-			Help: "Финальные статусы доменов по итогам эпизодов (ТЗ 6.2): DNS-этап — not_delegated/delegated_no_address/temp_error, HTTP-этап — alive/no_http/temp_error.",
+			Help: "Финальные статусы доменов по итогам эпизодов (ТЗ 6.2): DNS-этап — not_delegated/delegated_no_address/temp_error/invalid (диагноз ядовитой строки, T-109), HTTP-этап — alive/no_http/temp_error.",
 		}, metrics.LabelType),
 	}
 }
@@ -72,9 +73,9 @@ func (m *Metrics) Episode(d time.Duration) {
 }
 
 // DomainStatus — домен получил терминальный статус DNS-этапа
-// (not_delegated/delegated_no_address/temp_error, §6.2): +1 в счётчик
-// статусов. Статус живого домена (есть адреса) не пишется — итог за
-// HTTP-этапом (T-039, §7).
+// (not_delegated/delegated_no_address/temp_error, §6.2; invalid —
+// диагноз ядовитой строки, T-109): +1 в счётчик статусов. Статус живого
+// домена (есть адреса) не пишется — итог за HTTP-этапом (T-039, §7).
 func (m *Metrics) DomainStatus(status model.Status) {
 	if m == nil {
 		return

@@ -70,7 +70,16 @@ const (
 
 // recheckUpdateSQL — один проход: пачка созревших доменов (check_state
 // = done, last_checked_at старше порога, не deleted) переводится в
-// pending без смены статуса результата. LIMIT в подзапросе — пачка.
+// pending без смены статуса результата. invalid (диагноз ядовитой
+// строки, T-109) в отборе исключён: единственный штатный путь возврата
+// строки в конвейер после терминального диагноза — этот проход, без
+// фильтра ядовитые строки циклились бы вечно (DNS-03). dispatch/lease
+// фильтр не расширяют: lease видит только queued (запись диагноза
+// ставит done), а invalid+pending (окно гонки recheck↔записи диагноза)
+// без фильтра dispatch переиздаётся один раз и диагноз фиксируется
+// заново — самозаживление; с фильтром dispatch такая строка зависла бы
+// в pending навсегда, вне всех фоновых проходов.
+// LIMIT в подзапросе — пачка.
 // Сравнение date < timestamptz — кросс-типовой оператор btree-opfamily
 // datetime: индекс по last_checked_at применим и к параметру-порогу
 // timestamptz, гранулярность колонки — день (ТЗ 6.1), «старше интервала»
@@ -83,7 +92,9 @@ const (
 // схемы, а не данные (стиль dispatch.go): параметр в предикате частичного
 // индекса планировщик не доказывает, generic-план подготовленного
 // выражения (pgx кеширует их) терял бы пригодность domains_recheck_idx
-// (миграция 000008, T-104).
+// (миграция 000008, T-104); дополнительный предикат по status сужает
+// отбор, не расширяя требование к частичному индексу — пригодность
+// сохраняется (status в индекс не входит, HOT-апдейты не затронуты).
 //
 // ORDER BY (last_checked_at, zone_id, id) совпадает с ключом
 // domains_recheck_idx: скан читает с самых старых done-строк ровно
@@ -97,12 +108,12 @@ var recheckUpdateSQL = fmt.Sprintf(
 	"UPDATE domains AS d "+
 		"SET check_state = $1, queued_at = NULL "+
 		"FROM (SELECT zone_id, id FROM domains "+
-		"WHERE check_state = %d AND status <> %d AND last_checked_at < $2 "+
+		"WHERE check_state = %d AND status <> %d AND status <> %d AND last_checked_at < $2 "+
 		"ORDER BY last_checked_at, zone_id, id LIMIT $3) AS b "+
 		"WHERE d.zone_id = b.zone_id AND d.id = b.id "+
-		"AND d.check_state = %d AND d.status <> %d AND d.last_checked_at < $2",
-	int16(model.CheckStateDone), int16(model.StatusDeleted),
-	int16(model.CheckStateDone), int16(model.StatusDeleted))
+		"AND d.check_state = %d AND d.status <> %d AND d.status <> %d AND d.last_checked_at < $2",
+	int16(model.CheckStateDone), int16(model.StatusDeleted), int16(model.StatusInvalid),
+	int16(model.CheckStateDone), int16(model.StatusDeleted), int16(model.StatusInvalid))
 
 // RecheckOptions — параметры перепроверки; нулевые значения заменяются
 // дефолтами (withDefaults, стиль ingest.CleanupOptions).

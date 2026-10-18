@@ -176,7 +176,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_stage_tasks_total` | counter | `stage` | dns-worker (`dns`), http-worker (`http`), render-worker (`render`), analyzer (`analyze`) | завершённая задача этапа: домен (dns, http) или запись субдомен×вариант (render, analyze) |
 | `crawler_stage_seconds` | histogram | `stage` | те же четыре | длительность той же задачи (корзины свои по этапу) |
 | `crawler_stage_errors_total` | counter | `stage`, `type` | http-worker (`timeout`/`redirects`/`tls`/`body`/`network` — классы ErrorClass, §8), render-worker (`task`/`context`/`browser` — классы render.Class) | каждая ошибочная проверка протокола / неподтверждённая доставка рендера |
-| `crawler_domain_status_total` | counter | `type` | dns-worker (`not_delegated`/`delegated_no_address`/`temp_error`), http-worker (`alive`/`no_http`/`temp_error`) | финальный статус домена терминальной ветки эпизода (ТЗ 6.2) |
+| `crawler_domain_status_total` | counter | `type` | dns-worker (`not_delegated`/`delegated_no_address`/`temp_error`/`invalid` — диагноз ядовитой строки, T-109), http-worker (`alive`/`no_http`/`temp_error`) | финальный статус домена терминальной ветки эпизода (ТЗ 6.2) |
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
@@ -241,7 +241,8 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
 «перевод → публикация» и гарантии — комментарии
 `internal/scheduler/enqueue.go`), — фоновые циклы возврата доменов с
 истёкшим lease (`LeaseWatch`, T-029), суточной перепроверки
-(`RecheckDaily`, T-030) и повторных проверок `temp_error`
+(`RecheckDaily`, T-030 — не возвращает ядовитые строки `invalid`,
+T-109) и повторных проверок `temp_error`
 (`RetryTempErrors`, T-031). Рядом с ними — коллектор глубины backlog
 `BacklogLoop` (T-077): gauge `crawler_backlog_domains{pending|queued}`
 из БД раз в 30 с.
@@ -286,6 +287,13 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
   тем же оператором снимается бит `http_published` (T-108);
   охраны `status <> deleted` (§13.1) и `check_state <> done`
   (идемпотентность);
+- домен с пустым/пробельным именем в пачке — ядовитая строка
+  (`ErrEmptyDomain`, мусорная/порченая строка `domains`): терминальный
+  диагноз `invalid` (T-109) отдельным UPDATE (`check_state = done`,
+  lease завершён) + Warn; остальные домены пачки обрабатываются,
+  доставка подтверждается. Перепроверка (T-030) `invalid` не возвращает
+  — строка не циклится `queued → lease → dispatch` бесконечно, разбор —
+  ручной (runbook 2.4);
 - обмены — цепь `dnsclient.FallbackResolver` (локальный `Client`
   с пулом UDP-сокетов, T-034, + резервные клиенты `dns.fallback_resolvers`,
   переключение при транспортном отказе, T-107) под `LimitResolver`

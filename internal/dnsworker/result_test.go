@@ -1604,9 +1604,11 @@ func TestResultProcessBatchDictStates(t *testing.T) {
 }
 
 // TestResultProcessBatchPoisonDomain — домен с пустым именем
-// (детерминированная ошибка эпизода) не роняет пачку: Warn и пропуск —
-// строка остаётся queued, остальные домены обрабатываются, доставка
-// подтверждается.
+// (детерминированная ошибка эпизода) не роняет пачку: терминальный
+// диагноз invalid (T-109) — отдельный оператор по ядовитой строке,
+// остальные домены обрабатываются штатно, доставка подтверждается.
+// Эпизоды параллельны (Concurrency 2): порядок операторов недетерминирован
+// — записи сверяются по domain_id.
 func TestResultProcessBatchPoisonDomain(t *testing.T) {
 	j := &resultJournal{}
 	pool := &resultFakePool{j: j, subdomains: resultSubs()}
@@ -1623,15 +1625,96 @@ func TestResultProcessBatchPoisonDomain(t *testing.T) {
 		t.Fatalf("processBatch = %v, want nil (ядовитый домен не роняет пачку)", err)
 	}
 	execs := pool.resultPoolExecs()
-	if len(execs) != 2 || execs[0].sql != resultMarkPublishedSQL || execs[1].sql != resultUpdateKeepStatusSQL {
-		t.Fatalf("записи = %+v, want пометка + запись одного здорового домена", execs)
+	if len(execs) != 3 {
+		t.Fatalf("записи = %+v, want 3: пометка + запись здорового, диагноз ядовитого", execs)
 	}
-	if execs[0].args[1].(int64) != 11 || execs[1].args[1].(int64) != 11 {
-		t.Fatalf("записи = %+v, want домен 11 (ядовитый пропущен)", execs)
+	byDomain := map[int64][]resultExec{}
+	for _, e := range execs {
+		byDomain[e.args[1].(int64)] = append(byDomain[e.args[1].(int64)], e)
+	}
+	healthy := byDomain[11]
+	if len(healthy) != 2 || healthy[0].sql != resultMarkPublishedSQL || healthy[1].sql != resultUpdateKeepStatusSQL {
+		t.Fatalf("записи домена 11 = %+v, want пометка + запись (порядок «публикация → запись»)", healthy)
+	}
+	poison := byDomain[12]
+	if len(poison) != 1 || poison[0].sql != resultInvalidSQL {
+		t.Fatalf("записи домена 12 = %+v, want один оператор диагноза invalid", poison)
+	}
+	if poison[0].args[0].(int16) != 3 {
+		t.Errorf("аргументы диагноза = %v, want zone_id 3 литералом", poison[0].args)
 	}
 	if got := len(resolve.resultCalls()); got == 0 {
 		t.Fatal("здоровый домен не обработан")
 	}
+}
+
+// TestResultProcessBatchPoisonDomainRecordError — сбой записи диагноза
+// invalid — ошибка эпизода: пачка не подтверждается (без XACK), повторная
+// доставка доиграет фиксацию ( идемпотентность охран T-109).
+func TestResultProcessBatchPoisonDomainRecordError(t *testing.T) {
+	j := &resultJournal{}
+	pool := &resultFakePool{j: j, subdomains: resultSubs()}
+	pool.execErr = errors.New("бд недоступна")
+	q := &resultFakeQueue{j: j}
+	resolve := resultNewResolver()
+
+	err := processBatch(context.Background(), pool, q, resolve,
+		resultDelivery("9-3", "task-11",
+			queue.DNSDomain{ZoneID: 3, DomainID: 12, Name: "   "}),
+		Options{Concurrency: 1}, nil, slog.New(slog.DiscardHandler))
+	if err == nil || !strings.Contains(err.Error(), "диагноз invalid") {
+		t.Fatalf("processBatch = %v, want ошибка записи диагноза invalid", err)
+	}
+}
+
+// TestResultRecordInvalid — оператор диагноза ядовитой строки: точный
+// SQL-текст и параметры, охраны (UPDATE 0 — успех), ошибки.
+func TestResultRecordInvalid(t *testing.T) {
+	t.Run("оператор с литералом invalid и охранами", func(t *testing.T) {
+		pool := &resultFakePool{j: &resultJournal{}}
+		recorded, err := RecordInvalid(context.Background(), pool, 3, 12)
+		if err != nil || !recorded {
+			t.Fatalf("RecordInvalid = (%v, %v), want (true, nil)", recorded, err)
+		}
+		execs := pool.resultPoolExecs()
+		if len(execs) != 1 {
+			t.Fatalf("Exec вызовов %d, want 1", len(execs))
+		}
+		if execs[0].sql != resultInvalidSQL {
+			t.Errorf("SQL = %q, want resultInvalidSQL", execs[0].sql)
+		}
+		wantArgs := []any{int16(3), int64(12)}
+		if !reflect.DeepEqual(execs[0].args, wantArgs) {
+			t.Errorf("args = %v, want %v", execs[0].args, wantArgs)
+		}
+	})
+
+	t.Run("охраны отсекли строку — успех без записи", func(t *testing.T) {
+		pool := &resultFakePool{j: &resultJournal{}, execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0")}}
+		recorded, err := RecordInvalid(context.Background(), pool, 3, 12)
+		if err != nil {
+			t.Fatalf("RecordInvalid: %v", err)
+		}
+		if recorded {
+			t.Error("recorded = true, want false (уже done или deleted)")
+		}
+	})
+
+	t.Run("ошибка БД — ошибка записи", func(t *testing.T) {
+		pool := &resultFakePool{j: &resultJournal{}, execErr: errors.New("бд недоступна")}
+		_, err := RecordInvalid(context.Background(), pool, 3, 12)
+		if err == nil || !strings.Contains(err.Error(), "диагноз invalid домена 3/12") ||
+			!errors.Is(err, pool.execErr) {
+			t.Fatalf("ошибка = %v, want «диагноз invalid домена 3/12: бд недоступна»", err)
+		}
+	})
+
+	t.Run("пул не задан", func(t *testing.T) {
+		if _, err := RecordInvalid(context.Background(), nil, 1, 1); err == nil ||
+			!strings.Contains(err.Error(), "пул не задан") {
+			t.Fatalf("ошибка = %v, want «пул не задан»", err)
+		}
+	})
 }
 
 // --- smoke цикла Run ---------------------------------------------------------
