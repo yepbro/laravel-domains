@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,11 +54,16 @@ type RedisOptions struct {
 // создаётся лениво при первом чтении стрима: XGROUP CREATE c MKSTREAM
 // (стрим создаётся пустым) и стартовым идентификатором "0" — первые
 // потребители получают и записи, опубликованные до их запуска; ответ
-// BUSYGROUP (группу уже создал другой воркер) — не ошибка.
+// BUSYGROUP (группу уже создал другой воркер) — не ошибка. При потере
+// группы (NOGROUP: удалили группу/стрим, рестарт Redis без персистентности)
+// группа пересоздаётся с последнего прочитанного этим экземпляром id —
+// не с "0": переигрывать до миллиона уже обработанных записей стрима
+// (MAXLEN штучных стримов) не нужно, дубли с другими экземплярами
+// ограничены их окном чтения и гасятся идемпотентностью (ТЗ 3.4).
 type RedisQueue struct {
 	rdb    redisStreams
 	opt    RedisOptions
-	groups sync.Map // "stream|group" → группа создана
+	groups sync.Map // "stream|group" → последний прочитанный id ("0" — с начала; группа создана)
 }
 
 // NewRedisQueue строит очередь поверх клиента go-redis (NewClient или
@@ -122,7 +128,7 @@ func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string
 	if n < 1 {
 		return nil, fmt.Errorf("queue: размер пачки %d < 1", n)
 	}
-	if err := q.ensureGroup(ctx, stream, group); err != nil {
+	if err := q.ensureGroup(ctx, stream, group, "0"); err != nil {
 		return nil, err
 	}
 	read := &redis.XReadGroupArgs{
@@ -135,11 +141,19 @@ func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string
 	res, err := q.rdb.XReadGroup(ctx, read).Result()
 	if isNoGroup(err) {
 		// Потеря Redis при живых воркерах (ТЗ 3.4): группа исчезла вместе
-		// со стримом, а кэш созданных групп устарел. Пересоздаём группу
-		// и читаем повторно — потребитель продолжает работу без
-		// рестарта процесса; задачи переиздаст планировщик по lease.
+		// со стримом, а кэш созданных групп устарел. Пересоздаём группу —
+		// с последнего прочитанного этим экземпляром id (не с "0":
+		// история до него уже обработана, переигрывать её лавиной
+		// дублирующей работы не нужно, недостающее переиздаст планировщик
+		// по lease) — и читаем повторно: потребитель продолжает работу
+		// без рестарта процесса.
+		last, _ := q.groups.Load(groupKey(stream, group))
+		start, _ := last.(string)
+		if start == "" {
+			start = "0" // ни одного чтения — как первое создание
+		}
 		q.groups.Delete(groupKey(stream, group))
-		if err := q.ensureGroup(ctx, stream, group); err != nil {
+		if err := q.ensureGroup(ctx, stream, group, start); err != nil {
 			return nil, err
 		}
 		res, err = q.rdb.XReadGroup(ctx, read).Result()
@@ -159,6 +173,7 @@ func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string
 				Payload: payloadBytes(m.Values),
 			})
 		}
+		q.trackProgress(stream, group, xs.Messages)
 	}
 	return out, nil
 }
@@ -177,20 +192,80 @@ func (q *RedisQueue) Ack(ctx context.Context, stream, group string, ids ...strin
 }
 
 // ensureGroup создаёт группу потребителей при первом обращении
-// (XGROUP CREATE … MKSTREAM, старт с "0"); повторные создания группы
+// (XGROUP CREATE … MKSTREAM): start — идентификатор, с которого группа
+// доставляет записи ("0" — с начала: первое создание получает и записи,
+// опубликованные до запуска потребителей; последний прочитанный id —
+// восстановление после NOGROUP, см. Consume). Повторные создания группы
 // (BUSYGROUP от другого воркера) — не ошибка. Созданные группы
 // запоминаются, чтобы не тратить круг обращения на каждый Consume.
-func (q *RedisQueue) ensureGroup(ctx context.Context, stream, group string) error {
+func (q *RedisQueue) ensureGroup(ctx context.Context, stream, group, start string) error {
 	key := groupKey(stream, group)
 	if _, ok := q.groups.Load(key); ok {
 		return nil
 	}
-	err := q.rdb.XGroupCreateMkStream(ctx, stream, group, "0").Err()
+	err := q.rdb.XGroupCreateMkStream(ctx, stream, group, start).Err()
 	if err != nil && !isBusyGroup(err) {
 		return fmt.Errorf("queue: создать группу %s в %s: %w", group, stream, err)
 	}
-	q.groups.Store(key, struct{}{})
+	q.groups.Store(key, start)
 	return nil
+}
+
+// trackProgress запоминает последний прочитанный id группы — стартовая
+// точка пересоздания группы после NOGROUP (см. Consume). Идентификаторы
+// записей растут (ms-seq), сравнение числовое: лексикографический
+// порядок "999-0" > "1000-0" ошибочен. Ошибки парсинга тихо пропускаются:
+// прогресс — оптимизация восстановления, а не инвариант.
+func (q *RedisQueue) trackProgress(stream, group string, msgs []redis.XMessage) {
+	if len(msgs) == 0 {
+		return
+	}
+	key := groupKey(stream, group)
+	last, _ := q.groups.LoadOrStore(key, "0")
+	cur, _ := last.(string)
+	if cur == "" || cur == "0" {
+		cur = "0-0" // стартовые отметки — в форме ms-seq для сравнения
+	}
+	for _, m := range msgs {
+		if streamIDGreater(m.ID, cur) {
+			cur = m.ID
+		}
+	}
+	if cur != last {
+		q.groups.Store(key, cur)
+	}
+}
+
+// streamIDGreater сравнивает идентификаторы записей стрима "ms-seq"
+// численно по частям.
+func streamIDGreater(a, b string) bool {
+	ams, aseq, err := splitStreamID(a)
+	if err != nil {
+		return false
+	}
+	bms, bseq, err := splitStreamID(b)
+	if err != nil {
+		return false
+	}
+	if ams != bms {
+		return ams > bms
+	}
+	return aseq > bseq
+}
+
+// splitStreamID разбирает "ms-seq" в пару int64.
+func splitStreamID(id string) (ms, seq int64, err error) {
+	s1, s2, ok := strings.Cut(id, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("queue: идентификатор записи %q не вида ms-seq", id)
+	}
+	if ms, err = strconv.ParseInt(s1, 10, 64); err != nil {
+		return 0, 0, err
+	}
+	if seq, err = strconv.ParseInt(s2, 10, 64); err != nil {
+		return 0, 0, err
+	}
+	return ms, seq, nil
 }
 
 // payloadBytes достаёт поле data из значений записи: go-redis возвращает

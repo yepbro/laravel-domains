@@ -287,6 +287,43 @@ func TestRedisQueueConsumeGroupLost(t *testing.T) {
 	}
 }
 
+// TestRedisQueueConsumeGroupLostAtProgress — NOGROUP после успешно
+// прочитанных записей: группа пересоздаётся с последнего прочитанного id,
+// а не с "0" — переигрывать обработанную историю стрима (до MAXLEN
+// записей) лавиной дублей не нужно (Q-06).
+func TestRedisQueueConsumeGroupLostAtProgress(t *testing.T) {
+	fake := &fakeRedis{
+		readRes: []redis.XStream{{
+			Stream: StreamDNS,
+			Messages: []redis.XMessage{
+				{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+				{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+			},
+		}},
+		readErrs: []error{
+			nil, // первое чтение: две записи (прогресс — 1719-0)
+			errors.New("NOGROUP No such consumer group 'dns' for key name 'q:dns'"),
+			redis.Nil, // повторное чтение: новых записей нет
+		},
+	}
+	q := NewRedisQueue(fake, RedisOptions{})
+
+	if got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 10); err != nil || len(got) != 2 {
+		t.Fatalf("первое чтение: (%v, %v)", got, err)
+	}
+	// «Потеря» группы: пересоздание с прогресса первого чтения.
+	if got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 10); err != nil || got != nil {
+		t.Fatalf("чтение после потери: (%v, %v), хочу (nil, nil)", got, err)
+	}
+	want := []string{
+		StreamDNS + " dns 0",      // первое создание — с начала стрима
+		StreamDNS + " dns 1719-0", // восстановление — с последнего прочитанного
+	}
+	if !reflect.DeepEqual(fake.creates, want) {
+		t.Errorf("XGROUP CREATE: %v, хочу %v", fake.creates, want)
+	}
+}
+
 func TestRedisQueueConsumeErrors(t *testing.T) {
 	ctx := context.Background()
 
