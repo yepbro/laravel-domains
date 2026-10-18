@@ -622,7 +622,10 @@ func TestSchema_ResultsTablesColumns(t *testing.T) {
 
 // TestSchema_ResultsTablesIndexes — «минимум индексов» (ТЗ 6): на таблицах
 // T-004 только первичные ключи — выборки по домену идут по префиксу
-// (zone_id, domain_id) составных ключей, — плюс уникальный ingest_files.sha256.
+// (zone_id, domain_id) составных ключей, — плюс уникальный ingest_files.sha256
+// и индекс компактификации contents_pack_off_idx (pack_id, off) для фоновых
+// запросов CompactLoop по паку с сортировкой по смещению (T-096, INFRA-05;
+// refcount в ключ не входит — апдейты счётчика остаются HOT).
 // Индексы под будущие выборки (например, laravel_domains по score — этап 8,
 // ТЗ 5.11) сознательно не добавляются: состав зафиксирован этим контрактом.
 func TestSchema_ResultsTablesIndexes(t *testing.T) {
@@ -632,9 +635,12 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 	// таблица → имя индекса → ожидаемый ключ.
 	want := map[string]map[string]string{
 		"subdomain_results": {"subdomain_results_pkey": "(zone_id, domain_id, subdomain_id, variant)"},
-		"contents":          {"contents_pkey": "(hash)"},
-		"laravel_domains":   {"laravel_domains_pkey": "(zone_id, domain_id)"},
-		"laravel_findings":  {"laravel_findings_pkey": "(zone_id, domain_id, subdomain_id, variant)"},
+		"contents": {
+			"contents_pkey":         "(hash)",
+			"contents_pack_off_idx": "(pack_id, off)",
+		},
+		"laravel_domains":  {"laravel_domains_pkey": "(zone_id, domain_id)"},
+		"laravel_findings": {"laravel_findings_pkey": "(zone_id, domain_id, subdomain_id, variant)"},
 		"ingest_files": {
 			"ingest_files_pkey":       "(id)",
 			"ingest_files_sha256_key": "(sha256)",
