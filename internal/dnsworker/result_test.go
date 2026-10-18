@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
@@ -703,6 +704,44 @@ func TestResultDecideEpisode(t *testing.T) {
 			wantTemp: true,
 		},
 		{
+			// DNS-02: дефект зоны — не сбой резолвера: цикл CNAME на www
+			// постоянен, повторы T-031 ничего не изменят — «адресов нет».
+			name: "адресов нет, цикл CNAME субдомена — delegated_no_address",
+			apex: noAddress,
+			rep: &SubdomReport{Results: []SubdomResult{
+				{ID: 0, Label: "", RCode: dnsclient.RCodeNOERROR},
+				{ID: 1, Label: "www",
+					Err: fmt.Errorf("%w: www.example.net. → cdn.example.net.", ErrSubdomCNAMELoop)},
+			}},
+			wantSet: true,
+			wantSt:  model.StatusDelegatedNoAddress,
+		},
+		{
+			name: "адресов нет, глубина CNAME субдомена — delegated_no_address",
+			apex: noAddress,
+			rep: &SubdomReport{Results: []SubdomResult{
+				{ID: 0, Label: "", RCode: dnsclient.RCodeNOERROR},
+				{ID: 1, Label: "www",
+					Err: fmt.Errorf("%w: 10 переходов от www.example.net.", ErrSubdomCNAMEDepth)},
+			}},
+			wantSet: true,
+			wantSt:  model.StatusDelegatedNoAddress,
+		},
+		{
+			// Транспортный сбой рядом с дефектом зоны всё же temp:
+			// «адресов нет» по молчащему резолверу не выводится.
+			name: "адресов нет, цикл CNAME и транспорт — temp_error",
+			apex: noAddress,
+			rep: &SubdomReport{Results: []SubdomResult{
+				{ID: 0, Label: "",
+					Err: fmt.Errorf("%w: a.example.net. → b.example.net.", ErrSubdomCNAMELoop)},
+				{ID: 1, Label: "www", Err: errResultNet},
+			}},
+			wantSet:  true,
+			wantSt:   model.StatusTempError,
+			wantTemp: true,
+		},
+		{
 			name: "адреса есть несмотря на сбой одного субдомена — частичный итог",
 			apex: delegated,
 			rep: &SubdomReport{Mask: mustMask(t, 0), Results: []SubdomResult{
@@ -714,6 +753,21 @@ func TestResultDecideEpisode(t *testing.T) {
 				{SubdomainID: 0, Label: "", Addrs: []string{"192.0.2.10"}},
 			},
 			wantTemp: true,
+		},
+		{
+			// DNS-02: дефект зоны у субдомена без адресов не портит итог
+			// нашедшим адреса и не помечает эпизод temp.
+			name: "адреса есть, у другого субдомена цикл CNAME — без temp",
+			apex: delegated,
+			rep: &SubdomReport{Mask: mustMask(t, 0), Results: []SubdomResult{
+				{ID: 0, Label: "", A: apexAddrs("192.0.2.10")},
+				{ID: 1, Label: "www",
+					Err: fmt.Errorf("%w: www.example.net. → cdn.example.net.", ErrSubdomCNAMELoop)},
+			}},
+			wantMask: mustMask(t, 0),
+			wantSubs: []queue.HTTPSubdomain{
+				{SubdomainID: 0, Label: "", Addrs: []string{"192.0.2.10"}},
+			},
 		},
 		{
 			name: "nxdomain субдомена — не сбой (RFC 8020)",
@@ -1214,8 +1268,8 @@ func TestResultLoadSubdomains(t *testing.T) {
 	t.Run("пустой справочник — ошибка", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}}
 		_, err := LoadSubdomains(context.Background(), pool)
-		if err == nil || !strings.Contains(err.Error(), "справочник subdomains пуст") {
-			t.Fatalf("ошибка = %v, want «справочник subdomains пуст»", err)
+		if err == nil || !errors.Is(err, ErrSubdomainsEmpty) {
+			t.Fatalf("ошибка = %v, want ErrSubdomainsEmpty", err)
 		}
 	})
 
@@ -1257,6 +1311,77 @@ func TestResultRunValidation(t *testing.T) {
 	if err := Run(context.Background(), &resultFakePool{j: &resultJournal{}}, &resultFakeQueue{j: &resultJournal{}}, nil, opts); err == nil ||
 		!strings.Contains(err.Error(), "резолвер не задан") {
 		t.Fatalf("ошибка = %v, want «резолвер не задан»", err)
+	}
+}
+
+// --- детерминированные состояния пачки (DNS-03) ----------------------------
+
+// TestResultProcessBatchDictStates — пустой, целиком отключённый или
+// кривой справочник subdomains — конфигурация, а не яд: пачка
+// подтверждается без эпизодов, повторная доставка её не крутит.
+func TestResultProcessBatchDictStates(t *testing.T) {
+	dom := queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}
+	cases := []struct {
+		name string
+		subs []model.Subdomain
+	}{
+		{"пустой справочник", nil},
+		{"все субдомены отключены", []model.Subdomain{
+			{ID: 0, Label: "", Enabled: false},
+			{ID: 1, Label: "www", Enabled: false},
+		}},
+		{"кривая строка справочника", []model.Subdomain{
+			{ID: 0, Label: "", Enabled: true},
+			{ID: 99, Label: "bad", Enabled: true}, // id вне 0..62
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			j := &resultJournal{}
+			pool := &resultFakePool{j: j, subdomains: tc.subs}
+			q := &resultFakeQueue{j: j}
+			resolve := resultNewResolver()
+			err := processBatch(context.Background(), pool, q, resolve,
+				resultDelivery("9-1", "task-9", dom), Options{Concurrency: 1},
+				nil, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("processBatch = %v, want nil (пачка подтверждается с Warn)", err)
+			}
+			if got := len(resolve.resultCalls()); got != 0 {
+				t.Errorf("обменов %d, want 0 (эпизоды не стартуют)", got)
+			}
+			if n := j.count(resultEvExec) + j.count(resultEvPublish); n != 0 {
+				t.Errorf("записей+публикаций = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestResultProcessBatchPoisonDomain — домен с пустым именем
+// (детерминированная ошибка эпизода) не роняет пачку: Warn и пропуск —
+// строка остаётся queued, остальные домены обрабатываются, доставка
+// подтверждается.
+func TestResultProcessBatchPoisonDomain(t *testing.T) {
+	j := &resultJournal{}
+	pool := &resultFakePool{j: j, subdomains: resultSubs()}
+	q := &resultFakeQueue{j: j}
+	resolve := resultNewResolver()
+	resultSetDelegated(resolve, "example.com")
+
+	err := processBatch(context.Background(), pool, q, resolve,
+		resultDelivery("9-2", "task-10",
+			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"},
+			queue.DNSDomain{ZoneID: 3, DomainID: 12, Name: "   "}),
+		Options{Concurrency: 2}, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("processBatch = %v, want nil (ядовитый домен не роняет пачку)", err)
+	}
+	execs := pool.resultPoolExecs()
+	if len(execs) != 1 || execs[0].args[1].(int64) != 11 {
+		t.Fatalf("записи = %+v, want одна — только здоровый домен", execs)
+	}
+	if got := len(resolve.resultCalls()); got == 0 {
+		t.Fatal("здоровый домен не обработан")
 	}
 }
 

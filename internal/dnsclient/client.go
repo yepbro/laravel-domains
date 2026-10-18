@@ -48,6 +48,14 @@ const (
 	// DefaultRetryDelay — пауза между попытками: даёт резолверу
 	// разгрести очередь/восстановиться, не разбирая ошибку немедленно.
 	DefaultRetryDelay = 200 * time.Millisecond
+
+	// DefaultEDNS0UDPSize — advertised размер UDP-буфера в OPT RR
+	// (RFC 6891, EDNS0): 1232 байта — безопасный размер DNS flag day
+	// 2020 (влезает в транзитный MTU 1280 без фрагментации). Без OPT
+	// резолвер обязан укладываться в исторические 512 байт и режет
+	// всё крупнее до TC=1 — такой ответ в каждой попытке уходил бы в
+	// дорогой TCP-fallback (DNS-07).
+	DefaultEDNS0UDPSize = 1232
 )
 
 // DefaultRetries — повторы сверх первой попытки (итого до 3 обменов).
@@ -266,9 +274,15 @@ type Client struct {
 	exchange exchangeFunc
 }
 
-// NewClient создаёт клиента и заранее открывает пул UDP-сокетов
-// (fail-fast: недоступный адрес резолвера — ошибка старта, а не первого
-// запроса). Контекст ограничивает открытие сокетов.
+// NewClient создаёт клиента и заранее открывает пул UDP-сокетов.
+// fail-fast старта ограничен самим адресом: ошибка набора (кривой адрес,
+// порт, маршрут) — ошибка создания пула на старте; доступность самого
+// резолвера UDP connect не проверяет (пакетов не шлёт) — мёртвый сервер
+// проявляется в первом же обмене (ECONNREFUSED/таймаут → temp_error)
+// и виден в метриках лимитёра (crawler_dns_limit_timeout_ratio, DNS-06),
+// а не ошибкой старта. Стартовая синтетическая проба и переход на
+// dns.fallback_resolvers — политика T-035, в бэклоге (DNS-12).
+// Контекст ограничивает открытие сокетов.
 func NewClient(ctx context.Context, opts Options) (*Client, error) {
 	opts = opts.withDefaults()
 	if err := opts.validate(); err != nil {
@@ -303,6 +317,12 @@ func (c *Client) Exchange(ctx context.Context, q Question) (*Result, error) {
 	}
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(q.Name), q.Type) // Id и RD выставляет SetQuestion
+	// EDNS0 (RFC 6891): OPT RR с advertised размером DefaultEDNS0UDPSize —
+	// резолвер отвечает до 1232 байт по UDP, длинные CNAME-цепочки и
+	// большие RRset не уходят на TC=1/TCP-fallback в каждой попытке.
+	// DO не выставляется: DNSSEC не запрашивается (ТЗ 5.4 не требует);
+	// OPT придёт в Additional ответа и на разбор Answer/Ns не влияет.
+	msg.SetEdns0(DefaultEDNS0UDPSize, false)
 	if _, err := msg.Pack(); err != nil {
 		// Ошибка упаковки детерминирована (длина/символы имени) —
 		// ретраи не изменят исход.

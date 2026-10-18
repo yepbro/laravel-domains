@@ -43,6 +43,12 @@ import (
 	"crawler/internal/model"
 )
 
+// ErrEmptyDomain — пустое/пробельное имя домена в пачке q:dns (мусорная
+// или порченая строка domains). Ошибка детерминирована: повторная
+// доставка не изменит исход, поэтому цикл воркера фиксирует её Warn-ом
+// по домену, не роняя пачку (DNS-03).
+var ErrEmptyDomain = errors.New("dnsworker: пустое имя домена — апекс обязателен")
+
 // ApexStatus — ветка классификации ответа апекса (ТЗ 5.4 п. 1, §6.2, §7).
 // Имена веток, совпадающих со статусами домена ТЗ 6.2, — имена статусов;
 // ApexDelegated — промежуточный итог (финальный статус ставит HTTP-этап).
@@ -216,7 +222,7 @@ func CheckApex(ctx context.Context, r dnsclient.Resolver, domain string) (*ApexR
 func apexFQDN(domain string) (string, error) {
 	name := dns.Fqdn(strings.TrimSpace(domain))
 	if name == "." {
-		return "", errors.New("dnsworker: пустое имя домена — апекс обязателен")
+		return "", ErrEmptyDomain
 	}
 	return name, nil
 }

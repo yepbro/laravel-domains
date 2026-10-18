@@ -163,6 +163,30 @@ func (c *limitGatedClock) Sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// limitCountingClock — реальные часы со счётчиком вызовов Sleep: резервирование
+// токена обязано давать ровно один sleep на ждущего (поллинг «проснуться и
+// пересчитать» плодил бы десятки пробуждений на пачку).
+type limitCountingClock struct {
+	sleeps atomic.Int64
+}
+
+func (c *limitCountingClock) clock() limitClock {
+	return limitClock{
+		now: time.Now,
+		sleep: func(ctx context.Context, d time.Duration) error {
+			c.sleeps.Add(1)
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-t.C:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+}
+
 // newTestLimit — лимитёр над фейком с фальшивыми часами.
 func newTestLimit(t *testing.T, modify func(*LimitOptions), clock limitClock, next Resolver) *LimitResolver {
 	t.Helper()
@@ -403,6 +427,124 @@ func TestLimitBucketRateChange(t *testing.T) {
 	}
 }
 
+// TestLimitBucketSingleWakePerToken — резервирование вместо поллинга:
+// очередь ждущих расходится по персональным меткам, каждый ждущий спит
+// один раз. Поллинг будил бы всех к каждому токену: при 9 ждущих и темпе
+// 100 QPS — 45 пауз вместо 9 (DNS-01).
+func TestLimitBucketSingleWakePerToken(t *testing.T) {
+	cc := &limitCountingClock{}
+	b := newLimitBucket(100, 1, cc.clock()) // burst 1: один сразу, ждут все прочие
+	const total = 10
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := b.take(context.Background()); err != nil {
+				t.Errorf("take: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := cc.sleeps.Load(); n != total-1 {
+		t.Fatalf("пауз %d, want %d (по одной на ждущего — шторма пробуждений нет)", n, total-1)
+	}
+	// Последний ждущий встал в очередь ~сразу после старта: его метка —
+	// 9/100 с. Реальные таймеры спят не меньше запроса, нижняя граница
+	// надёжна.
+	if since := time.Since(start); since < 9*10*time.Millisecond {
+		t.Fatalf("итоговое время %s < 90 мс — темп очереди не выдержан", since)
+	}
+}
+
+// TestLimitBucketUnreserve — отмена ждущего возвращает резерв: отменённое
+// ожидание не оставляет долг, удлиняющий ожидание очереди за ним.
+func TestLimitBucketUnreserve(t *testing.T) {
+	fc := newLimitManualClock()
+	b := newLimitBucket(1, 1, fc.clock())
+
+	if _, ok := b.reserve(); !ok {
+		t.Fatal("первый токен обязан пройти без ожидания")
+	}
+	wait, ok := b.reserve() // баланс −1: ждём 1 с
+	if ok || wait != time.Second {
+		t.Fatalf("reserve = (%v, %v), want (1s, false)", wait, ok)
+	}
+	b.unreserve() // отмена ждущего: долг снят
+	wait, ok = b.reserve()
+	if ok || wait != time.Second {
+		t.Fatalf("reserve после unreserve = (%v, %v), want (1s, false) — долг не накопился", wait, ok)
+	}
+
+	// Долг двух ждущих без отмены — третий метки дальше: 3 с, не 2 с.
+	b.unreserve()
+	_, _ = b.reserve()
+	_, _ = b.reserve()
+	wait, ok = b.reserve()
+	if ok || wait != 3*time.Second {
+		t.Fatalf("reserve третьего в очереди = (%v, %v), want (3s, false)", wait, ok)
+	}
+}
+
+// TestLimitBucketBurstCappedByQPS — типовой тюнинг слабого резолвера
+// (max_qps ≪ concurrency): начальная ёмкость не выше секунды темпа —
+// «полная волна» слотов не уходит залпом секунд бюджета (DNS-10).
+func TestLimitBucketBurstCappedByQPS(t *testing.T) {
+	fc := newLimitManualClock()
+	b := newLimitBucket(50, 2000, fc.clock()) // темп 50/с, затрошено 2000
+	took := 0
+	for i := 0; i < 60; i++ {
+		if _, ok := b.reserve(); ok {
+			took++
+		} else {
+			break
+		}
+	}
+	if took != 50 {
+		t.Fatalf("мгновенно взято %d токенов, want 50 (секунда темпа, не 2000)", took)
+	}
+}
+
+// TestLimitBucketBurstFollowsRate — ёмкость следует за темпом адаптива:
+// после снижения всплеск ограничен секундой нового темпа (и накопленные
+// токены подрезаны), восстановление темпа возвращает ёмкость до исходной
+// (DNS-10).
+func TestLimitBucketBurstFollowsRate(t *testing.T) {
+	fc := newLimitManualClock()
+	b := newLimitBucket(1000, 100, fc.clock())
+
+	// Ведро полно (100), темп упали на два порядка.
+	fc.advance(time.Second)
+	b.setRate(10)
+	took := 0
+	for i := 0; i < 12; i++ {
+		if _, ok := b.reserve(); ok {
+			took++
+		} else {
+			break
+		}
+	}
+	if took != 10 {
+		t.Fatalf("мгновенно взято %d токенов после снижения, want 10 (секунда нового темпа)", took)
+	}
+
+	// Темп восстановлен — ёмкость вернулась к исходной.
+	b.setRate(1000)
+	fc.advance(time.Second)
+	took = 0
+	for i := 0; i < 102; i++ {
+		if _, ok := b.reserve(); ok {
+			took++
+		} else {
+			break
+		}
+	}
+	if took != 100 {
+		t.Fatalf("мгновенно взято %d токенов после восстановления, want 100", took)
+	}
+}
+
 // --- декоратор: семафор ----------------------------------------------------------
 
 func TestLimitResolverConcurrency(t *testing.T) {
@@ -606,6 +748,43 @@ func TestLimitResolverAdaptiveIgnoresOtherErrors(t *testing.T) {
 	}
 	if st := r.Stats(); st.Concurrency != 100 || st.QPS != 100 || st.Errors != 20 {
 		t.Fatalf("не-таймаутные ошибки: %+v", st)
+	}
+}
+
+// TestLimitAdaptiveAppliesUnderLock — применение изменившихся лимитов
+// происходит под мьютексом адаптива (DNS-11): параллельные наблюдения
+// окна не могут наложить устаревший больший лимит последним. Детектор —
+// TryLock из apply: под блокировкой записи он обязан отказывать.
+func TestLimitAdaptiveAppliesUnderLock(t *testing.T) {
+	a := newLimitAdaptive(LimitOptions{
+		Concurrency: 100, MaxQPS: 100, AdaptiveWindow: 2,
+		AdaptiveHighRatio: 0.5, AdaptiveLowRatio: 0.01,
+		AdaptiveDownFactor: 0.5, AdaptiveUpFactor: 1.25,
+		AdaptiveFloorDivisor: 100,
+	}.withDefaults())
+
+	applied, inLock := 0, true
+	apply := func(conc int, qps float64) {
+		applied++
+		if a.mu.TryLock() {
+			a.mu.Unlock()
+			inLock = false // применено вне блокировки адаптива
+		}
+	}
+
+	a.record(true, apply) // окно ещё не заполнено — изменений нет
+	if applied != 0 {
+		t.Fatalf("применений до заполнения окна: %d, want 0", applied)
+	}
+	a.record(true, apply) // окно заполнено таймаутами: снижение ×0.5
+	if applied != 1 {
+		t.Fatalf("применений: %d, want 1", applied)
+	}
+	if !inLock {
+		t.Fatal("лимиты применены вне блокировки адаптива")
+	}
+	if conc, _, _, _, _, _, _ := a.snapshot(); conc != 50 {
+		t.Fatalf("conc = %d, want 50 (первое снижение)", conc)
 	}
 }
 

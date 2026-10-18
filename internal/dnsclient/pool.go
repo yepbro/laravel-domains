@@ -37,6 +37,9 @@ type UDPPool struct {
 	addr string
 	size int
 	free chan *net.UDPConn
+	// done закрывается в Close: ждущие Get просыпаются с ErrPoolClosed,
+	// не дожидаясь дедлайна собственного ctx (DNS-09).
+	done chan struct{}
 
 	mu     sync.Mutex
 	live   int // открытые сокеты: свободные + выданные + набираемые
@@ -46,9 +49,13 @@ type UDPPool struct {
 	dial func(ctx context.Context) (*net.UDPConn, error)
 }
 
-// NewUDPPool создаёт пул и заранее открывает все size сокетов
-// (fail-fast: недоступный адрес — ошибка создания пула, а не первого
-// запроса). Контекст ограничивает открытие.
+// NewUDPPool создаёт пул и заранее открывает все size сокетов: ошибка
+// набора (кривой адрес/порт, нет маршрута) — ошибка создания пула на
+// старте, а не первого запроса. Доступность резолвера connect не
+// проверяет (UDP connect пакетов не шлёт): мёртвый сервер звучит в
+// первом обмене — ECONNREFUSED от подключённого сокета (ICMP port
+// unreachable) либо таймаут; см. NewClient о стартовой пробе (DNS-12).
+// Контекст ограничивает открытие.
 func NewUDPPool(ctx context.Context, addr string, size int) (*UDPPool, error) {
 	if size < 1 {
 		return nil, fmt.Errorf("dnsclient: размер пула UDP-сокетов %d: ожидается ≥ 1", size)
@@ -60,6 +67,7 @@ func NewUDPPool(ctx context.Context, addr string, size int) (*UDPPool, error) {
 		addr: addr,
 		size: size,
 		free: make(chan *net.UDPConn, size),
+		done: make(chan struct{}),
 	}
 	p.dial = p.dialUDP
 	for i := 0; i < size; i++ {
@@ -102,8 +110,19 @@ func (p *UDPPool) Get(ctx context.Context) (*net.UDPConn, error) {
 		return nil, ErrPoolClosed
 	}
 	if p.live < p.size {
-		// Место есть (после Discard или неудачного набора): набор
-		// нового сокета, счётчик занимает место заранее, чтобы
+		// Место есть (после Discard или неудачного набора), но счётчик
+		// live в этих состояниях не обязан отражать фактическое число
+		// живых сокетов (инвариант live == свободные + выданные не
+		// восстанавливается) — сначала свободный сокет из канала, и
+		// только при пустом канале набор нового: иначе Get открывал бы
+		// лишний сокет рядом с лежащим свободным (DNS-08).
+		select {
+		case conn := <-p.free:
+			p.mu.Unlock()
+			return conn, nil
+		default:
+		}
+		// Набор нового сокета: счётчик занимает место заранее, чтобы
 		// параллельные Get не перебрали размер пула.
 		p.live++
 		p.mu.Unlock()
@@ -121,6 +140,8 @@ func (p *UDPPool) Get(ctx context.Context) (*net.UDPConn, error) {
 	select {
 	case conn := <-p.free:
 		return conn, nil
+	case <-p.done:
+		return nil, ErrPoolClosed
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -163,8 +184,11 @@ func (p *UDPPool) Discard(conn *net.UDPConn) {
 	p.mu.Unlock()
 }
 
-// Close закрывает свободные сокеты; выданные закроются при их возврате
-// (Put в закрытый пул закрывает сокет). Повторный Close — no-op.
+// Close закрывает свободные сокеты и будит ждущих Get (done →
+// ErrPoolClosed — без этого ждущий освобождался только дедлайном
+// собственного ctx, а с context.Background висел бы вечно); выданные
+// сокеты закроются при их возврате (Put в закрытый пул закрывает сокет).
+// Повторный Close — no-op.
 func (p *UDPPool) Close() error {
 	p.mu.Lock()
 	if p.closed {
@@ -173,6 +197,7 @@ func (p *UDPPool) Close() error {
 	}
 	p.closed = true
 	p.mu.Unlock()
+	close(p.done) // будит ждущих Get — сокетов в закрытом пуле больше нет
 	for {
 		select {
 		case conn := <-p.free:

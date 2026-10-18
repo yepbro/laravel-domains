@@ -96,7 +96,10 @@ type LimitOptions struct {
 	// Burst — ёмкость токен-ведра: сколько обменов разрешено подряд без
 	// ожидания (короткие всплески конвейера). По умолчанию равен
 	// Concurrency — «полная волна» всех слотов разом; больше бессмысленно:
-	// одновременно летит не больше Concurrency обменов.
+	// одновременно летит не больше Concurrency обменов. Эффективная
+	// ёмкость дополнительно ограничивается секундой темпа (см.
+	// newLimitBucket): всплеск дольше секунды бюджета max_qps —
+	// перегрузка резолвера, а не всплеск (DNS-10).
 	Burst int
 	// DisableAAAA — отвечать на AAAA-вопросы локальным пустым NOERROR
 	// без похода в резолвер. Ставится из dns.ipv6=false (NewLimitOptions):
@@ -323,71 +326,123 @@ func (s *limitSemaphore) wake() {
 // метки времени и даёт ту же жёсткость. Токен-ведро держит средний темп
 // max_qps и допускает короткий всплеск до burst — ровно режим «пачка
 // уходит сразу, дальше темп выравнивается».
+//
+// Ожидание токена — резервирование, а не поллинг: нехватка списывается с
+// баланса сразу (баланс уходит в минус — это долг перед ведром), момент
+// своей выдачи ждущий вычисляет один раз под мьютексом и спит до него
+// без пробуждений. Поллинг «проснуться к токену всем и пересчитать паузу»
+// стоил бы ~N пробуждений на каждый выданный токен (N — очередь ждущих,
+// до concurrency=2000): при 10000 QPS — миллионы пустых таймеров в
+// секунду плюс джиттер выдачи (свежепришедший перехватывает токен у
+// разбуженного).
 type limitBucket struct {
-	mu     sync.Mutex
-	clock  limitClock
-	rate   float64 // токенов в секунду (эффективный QPS)
-	burst  float64 // ёмкость ведра
-	tokens float64
-	last   time.Time // момент последнего начисления
+	mu       sync.Mutex
+	clock    limitClock
+	rate     float64 // токенов в секунду (эффективный QPS)
+	burst    float64 // текущая ёмкость ведра (следует за темпом, ≤ maxBurst)
+	maxBurst float64 // исходная ёмкость (потолок восстановления)
+	tokens   float64
+	last     time.Time // момент последнего начисления
 }
 
-// newLimitBucket создаёт полное ведро (burst токенов): плановая волна
-// старта конвейера уходит без ожидания.
+// newLimitBucket создаёт полное ведро (ёмкость токенов): плановая волна
+// старта конвейера уходит без ожидания. Ёмкость не выше секундного
+// бюджета темпа: при типовом тюнинге слабого резолвера
+// (max_qps ≪ concurrency) «полная волна» слотов — секунды обмена залпом
+// мимо настроенного темпа (DNS-10).
 func newLimitBucket(qps float64, burst int, clock limitClock) *limitBucket {
+	cap := math.Min(float64(burst), qps)
+	if cap < 1 {
+		cap = 1
+	}
 	return &limitBucket{
-		clock:  clock,
-		rate:   qps,
-		burst:  float64(burst),
-		tokens: float64(burst),
-		last:   clock.now(),
+		clock:    clock,
+		rate:     qps,
+		burst:    cap,
+		maxBurst: cap,
+		tokens:   cap,
+		last:     clock.now(),
 	}
 }
 
-// take забирает токен; при пустом ведре ждёт начисления следующего или
-// отмены ctx (ожидающий токен не занимает его навсегда — семафор
-// возвращается вызывающим по ошибке).
+// take забирает токен; при пустом ведре ждёт начисления «своего» токена
+// или отмены ctx (ожидающий токен не занимает его навсегда — семафор
+// возвращается вызывающим по ошибке). Момент выдачи резервируется до
+// ожидания (см. комментарий limitBucket): каждый ждущий спит ровно до
+// своей метки и просыпается один раз. Отмена возвращает резерв —
+// отменённое ожидание не тратит пропускную способность и не удлиняет
+// ожидание очереди за ним.
 func (b *limitBucket) take(ctx context.Context) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		wait, ok := b.tryTake()
-		if ok {
-			return nil
-		}
-		if err := b.clock.sleep(ctx, wait); err != nil {
-			return err
-		}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	wait, ok := b.reserve()
+	if ok {
+		return nil
+	}
+	if err := b.clock.sleep(ctx, wait); err != nil {
+		b.unreserve()
+		return err
+	}
+	// К пробуждению собственный долг погашен начислением (момент выдачи
+	// вычислен под мьютексом по балансу с учётом всех предыдущих
+	// резервов): ждущий проходит без повторной проверки общего баланса —
+	// в нём остались долги очереди за ним, и такая проверка отправила бы
+	// его в конец общего ожидания, ссыпая пачку в один всплеск. Темп,
+	// сниженный адаптивом за время ожидания, даёт одноразовый допуск
+	// одному ждущему — дешевле, чем повторные пробуждения.
+	return nil
 }
 
-// tryTake забирает токен без ожидания; при нехватке возвращает время до
-// следующего токена.
-func (b *limitBucket) tryTake() (time.Duration, bool) {
+// reserve списывает токен без ожидания: при нехватке баланс уходит в
+// минус (резерв будущего начисления); ok=false — токена нет, wait —
+// время до начисления «своего» токена по текущему темпу (учтены резервы
+// всех вставших в очередь раньше — выдача в порядке прихода, без
+// перехвата токена свежепришедшим).
+func (b *limitBucket) reserve() (time.Duration, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.refill()
-	if b.tokens >= 1 {
-		b.tokens--
+	b.tokens--
+	if b.tokens >= 0 {
 		return 0, true
 	}
-	// (1 − tokens)/rate секунд до целого токена; минимум 1 нс — защита
-	// от нулевого ожидания на округлении (иначе цикл take крутился бы
+	// (−tokens)/rate секунд до начисления «своего» токена; минимум 1 нс —
+	// защита от нулевого ожидания на округлении (иначе take крутился бы
 	// вхолостую).
-	wait := time.Duration((1 - b.tokens) / b.rate * float64(time.Second))
+	wait := time.Duration(-b.tokens / b.rate * float64(time.Second))
 	if wait < 1 {
 		wait = 1
 	}
 	return wait, false
 }
 
-// setRate меняет темп (адаптив): сначала начисляет токены по старому темпу.
+// unreserve возвращает резерв отменённого ожидания: баланс растёт на
+// один токен (не выше ёмкости ведра) — отмена не оставляет долг, который
+// иначе удлинял бы ожидание очереди за отменённым.
+func (b *limitBucket) unreserve() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refill()
+	b.tokens = math.Min(b.burst, b.tokens+1)
+}
+
+// setRate меняет темп (адаптив): сначала начисляет токены по старому
+// темпу. Ёмкость следует за темпом — не выше исходной (maxBurst):
+// всплеск после простоя обязан вписываться в секундный бюджет
+// действующего QPS, иначе накопленный до снижения burst уходил бы
+// залпом мимо сниженного темпа (DNS-10); накопленные токены подрезаются
+// до новой ёмкости. Восстановление темпа возвращает ёмкость до исходной.
 func (b *limitBucket) setRate(qps float64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.refill()
 	b.rate = qps
+	b.burst = math.Min(b.maxBurst, qps)
+	if b.burst < 1 {
+		b.burst = 1
+	}
+	b.tokens = math.Min(b.tokens, b.burst)
 }
 
 // refill начисляет токены по прошедшему времени; вызывающий держит b.mu.
@@ -461,9 +516,14 @@ func newLimitAdaptive(o LimitOptions) *limitAdaptive {
 	}
 }
 
-// record добавляет исход обмена и возвращает эффективные лимиты; changed —
-// лимиты изменились (вызывающему достаточно применить их только тогда).
-func (a *limitAdaptive) record(timedOut bool) (conc int, qps float64, changed bool) {
+// record добавляет исход обмена и возвращает эффективные лимиты.
+// Изменившиеся лимиты применяются колбэком apply под тем же мьютексом
+// (DNS-11): применение вне блокировки позволяло параллельным
+// наблюдателям окна наложить значения в произвольном порядке —
+// устаревший больший лимит ложился последним и на один шаг возвращал
+// нагрузку резолверу в момент аварии. Порядок блокировок
+// a.mu → семафор/ведро обратных путей не имеет: те об адаптиве не знают.
+func (a *limitAdaptive) record(timedOut bool, apply func(conc int, qps float64)) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -487,7 +547,7 @@ func (a *limitAdaptive) record(timedOut bool) (conc int, qps float64, changed bo
 		a.filled = true
 	}
 	if !a.filled {
-		return a.conc, a.qps, false
+		return
 	}
 
 	ratio := float64(a.timeouts) / float64(a.total)
@@ -498,7 +558,9 @@ func (a *limitAdaptive) record(timedOut bool) (conc int, qps float64, changed bo
 		newQPS := math.Max(a.minQPS, a.qps*a.down)
 		if newConc != a.conc || newQPS != a.qps {
 			a.conc, a.qps = newConc, newQPS
-			changed = true
+			if apply != nil {
+				apply(a.conc, a.qps)
+			}
 		}
 	case ratio <= a.low && (a.conc < a.baseConc || a.qps < a.baseQPS):
 		// Восстановление: вверх с округлением к большему (ceil даёт рост
@@ -507,10 +569,11 @@ func (a *limitAdaptive) record(timedOut bool) (conc int, qps float64, changed bo
 		newQPS := math.Min(a.baseQPS, a.qps*a.up)
 		if newConc != a.conc || newQPS != a.qps {
 			a.conc, a.qps = newConc, newQPS
-			changed = true
+			if apply != nil {
+				apply(a.conc, a.qps)
+			}
 		}
 	}
-	return a.conc, a.qps, changed
 }
 
 // snapshot возвращает текущее состояние (Stats): эффективные и базовые
@@ -607,8 +670,9 @@ func (r *LimitResolver) Exchange(ctx context.Context, q Question) (*Result, erro
 	return res, err
 }
 
-// observe учитывает исход обмена: счётчики и адаптив; при изменении
-// эффективных лимитов применяет их к семафору и ведру.
+// observe учитывает исход обмена: счётчики и адаптив; изменившиеся
+// эффективные лимиты применяются к семафору и ведру под блокировкой
+// адаптива (см. limitAdaptive.record — DNS-11).
 func (r *LimitResolver) observe(err error) {
 	r.exchanges.Add(1)
 	timedOut := IsTimeout(err)
@@ -619,11 +683,10 @@ func (r *LimitResolver) observe(err error) {
 			r.errors.Add(1)
 		}
 	}
-	conc, qps, changed := r.adaptive.record(timedOut)
-	if changed {
+	r.adaptive.record(timedOut, func(conc int, qps float64) {
 		r.sem.setMax(conc)
 		r.bucket.setRate(qps)
-	}
+	})
 }
 
 // Stats возвращает снимок состояния (точки для мониторинга T-077:

@@ -32,7 +32,11 @@
 //     каждому субдомену отдельно; потерянное имя покроет регулярная
 //     перепроверка T-030), без адресов — temp_error: классифицировать
 //     «нет адресов» по молчащему резолверу нельзя (ложный терминальный
-//     статус), повтор T-031 перепроверит эпизод.
+//     статус), повтор T-031 перепроверит эпизод. Дефекты самой зоны —
+//     цикл и превышение глубины CNAME (ErrSubdomCNAMELoop/Depth) — сбоям
+//     не ровня: резолвер ответил, сломано у домена; итог субдомена
+//     «адресов нет» без temp_error (sentinel-ошибки разбираются
+//     errors.Is, T-037).
 //
 // Порядок «публикация q:http → запись done» (§3.4, в духе T-028:
 // PostgreSQL — источник истины, done — точка фиксации эпизода):
@@ -40,8 +44,16 @@
 //   - задача q:http публикуется ДО перевода домена в done. Сбой записи
 //     после публикации оставляет домен queued и доставку q:dns без XACK
 //     (Processing, T-025): повторная доставка повторит эпизод целиком —
-//     публикация q:http повторится (ограниченный дубль: попытки доставки
-//     исчерпываются через q:dead), но задача не теряется;
+//     публикация q:http повторится, но задача не теряется. Дубль
+//     ограничен, но небесплатен (DNS-04): попыток доставки до q:dead —
+//     redis.max_attempts (T-025), поэтому цена одного сбоя — до
+//     max_attempts × |пачка| повторных DNS-эпизодов и дублей q:http по
+//     доменам, опубликовавшим задачу до сбоя записи (сбой одного домена
+//     или один сбой БД размножается на пачку; дубль задачи — полная
+//     повторная HTTP-проверка, охраны done на стороне q:http нет).
+//     Единица повтора — доставка, а не домен: сузить её без новой
+//     промежуточной записи в БД (staging-пометка публикации, T-004)
+//     нельзя, а обращать порядок — терять задачи (ниже);
 //   - обратный порядок (done → публикация) при сбое публикации оставил бы
 //     домен done без задачи q:http — HTTP-этап никогда не начнётся, а
 //     повторная доставка не чинит: фильтр актуальности (resultPendingSQL)
@@ -127,6 +139,13 @@ var (
 	subdomainsSelectSQL = "SELECT id, label, enabled FROM subdomains ORDER BY id"
 )
 
+// ErrSubdomainsEmpty — справочник subdomains пуст (сбой миграции/чистка):
+// состояние детерминировано, повторная доставка его не лечит — цикл
+// воркера подтверждает пачку с Warn (домены вернёт lease-проход
+// T-029/T-030 после починки справочника), а не крутит повторы до q:dead
+// (DNS-03).
+var ErrSubdomainsEmpty = errors.New("dnsworker: справочник subdomains пуст — нужен хотя бы апекс (ТЗ 5.10)")
+
 // EpisodeResult — решение DNS-эпизода одного домена: что писать в
 // domains и что публиковать в q:http (ТЗ 5.4 пп. 4–5, §7). Строится
 // чистой функцией DecideEpisode из результатов T-036/037/038.
@@ -184,8 +203,17 @@ func DecideEpisode(apex *ApexResult, rep *SubdomReport, wild WildcardResult) (Ep
 	for _, r := range rep.Results {
 		// Сбой резолвера: транспорт (Err) либо код вне {NOERROR, NXDOMAIN}
 		// — NXDOMAIN субдомена авторитетен (имени нет, RFC 8020),
-		// в том числе CNAME→NXDOMAIN (T-037).
-		if r.Err != nil || (r.RCode != dnsclient.RCodeNOERROR && r.RCode != dnsclient.RCodeNXDOMAIN) {
+		// в том числе CNAME→NXDOMAIN (T-037). Дефекты цепочки CNAME
+		// (ErrSubdomCNAMELoop/Depth, sentinel-ошибки T-037) — не сбой
+		// резолвера: резолвер ответил исправно, зона сломана постоянно —
+		// повтор эпизода не изменит исход, итог субдомена «адресов нет»,
+		// а не temp_error (три полных повтора T-031 здесь — лишняя работа
+		// и шумный статус).
+		if r.Err != nil {
+			if !errors.Is(r.Err, ErrSubdomCNAMELoop) && !errors.Is(r.Err, ErrSubdomCNAMEDepth) {
+				temp = true
+			}
+		} else if r.RCode != dnsclient.RCodeNOERROR && r.RCode != dnsclient.RCodeNXDOMAIN {
 			temp = true
 		}
 		if !r.HasAddrs() || wild.IsWildcard(r.ID) {
@@ -268,9 +296,11 @@ func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 // ProcessDomain — DNS-эпизод одного домена целиком (ТЗ 5.4, §7): апекс
 // (T-036) → субдомены и wildcard-детект (T-037/T-038, только для ветвей
 // делегирования) → решение (DecideEpisode) → публикация q:http → запись
-// результата (RecordEpisode). Порядок «публикация → запись» — в комментарии
-// файла; ошибка любого шага — ошибка эпизода: домен остаётся без записи,
-// доставка q:dns не подтверждается и повторится (Processing, T-025).
+// результата (RecordEpisode). Порядок «публикация → запись» и цена
+// повтора при сбое записи — в комментарии файла (до max_attempts ×
+// |пачка|); ошибка любого шага — ошибка эпизода: домен остаётся без
+// записи, доставка q:dns не подтверждается и повторится (Processing,
+// T-025).
 //
 // dom — домен пачки q:dns (T-024); subs — справочник subdomains (все
 // строки; отключённые пропускает CheckSubdomains); askAAAA — dns.ipv6
@@ -414,7 +444,7 @@ func LoadSubdomains(ctx context.Context, pool db.DB) ([]model.Subdomain, error) 
 		return nil, fmt.Errorf("dnsworker: справочник субдоменов: %w", err)
 	}
 	if len(subs) == 0 {
-		return nil, errors.New("dnsworker: справочник subdomains пуст — нужен хотя бы апекс (ТЗ 5.10)")
+		return nil, ErrSubdomainsEmpty
 	}
 	return subs, nil
 }
@@ -636,6 +666,16 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 // Завершённые эпизоды идут в приборы met (T-077): счётчик задач этапа,
 // гистограмма длительностей (статусы терминальных веток считает
 // ProcessDomain после записи).
+//
+// Не ронывают доставку детерминированные состояния, которые повторная
+// доставка не лечит (DNS-03): пустой или целиком отключённый/кривой
+// справочник субдоменов — конфигурация, а не яд (пачка подтверждается с
+// Warn, домены вернёт lease-проход T-029/T-030 после починки справочника
+// — повторами до q:dead очередь замусоривалась бы каждой пачкой);
+// домен с пустым именем — мусорная строка (Warn по домену, строка
+// остаётся queued для разбора оператором). Транспортные сбои (БД/Redis)
+// и порченое сообщение (Decode) — по-прежнему ошибка без XACK: их
+// повторная доставка лечит (T-025).
 func processBatch(
 	ctx context.Context,
 	pool db.DB,
@@ -654,7 +694,26 @@ func processBatch(
 	}
 	subs, err := LoadSubdomains(ctx, pool)
 	if err != nil {
+		if errors.Is(err, ErrSubdomainsEmpty) {
+			log.Warn("справочник subdomains пуст — пачка q:dns подтверждена без обработки",
+				"entry", del.ID, "batch", len(batch.Domains), "err", err)
+			return nil
+		}
 		return err
+	}
+	enabled, err := filterEnabledSubdomains(subs)
+	if err != nil || len(enabled) == 0 {
+		// Кривые строки или все субдомены отключены (штатная операция
+		// crawlerctl subdomains disable) — конфигурация: повтор доставки
+		// не изменит исход.
+		if err != nil {
+			log.Warn("справочник subdomains некорректен — пачка q:dns подтверждена без обработки",
+				"entry", del.ID, "batch", len(batch.Domains), "err", err)
+		} else {
+			log.Warn("нет включённых субдоменов — пачка q:dns подтверждена без обработки",
+				"entry", del.ID, "batch", len(batch.Domains))
+		}
+		return nil
 	}
 	pending, err := PendingDomains(ctx, pool, batch.Domains)
 	if err != nil {
@@ -692,11 +751,20 @@ func processBatch(
 			defer func() { <-sem }()
 			start := time.Now()
 			err := ProcessDomain(ctx, pool, q, resolve, dom, subs, o.AskAAAA, met, log)
-			if err == nil {
+			switch {
+			case err == nil:
 				// Эпизод завершён — пропускная способность и
 				// длительность этапа (T-077, ТЗ 5.9).
 				met.Episode(time.Since(start))
-			} else {
+			case errors.Is(err, ErrEmptyDomain):
+				// Ядовитый домен: детерминированная ошибка, повтор
+				// доставки не изменит исход. Warn и продолжение:
+				// остальные домены пачки обрабатываются, доставка
+				// подтверждается; строка остаётся queued — lease-проход
+				// вернёт её после чистки мусора.
+				log.Warn("домен с пустым именем — пропущен без записи",
+					"entry", del.ID, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
+			default:
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = fmt.Errorf("домен %s: %w", dom.Name, err)
