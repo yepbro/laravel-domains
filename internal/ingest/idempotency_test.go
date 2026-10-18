@@ -121,8 +121,10 @@ func TestPipelineDuplicateClearFailureDiscards(t *testing.T) {
 	sha := sha256.Sum256([]byte(content))
 	processed := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
 	path := "com/add/list.txt"
+	zone, action := int16(1), model.ActionAdd
 	pt.files = newFakeFileStore(model.IngestFile{
-		ID: 5, Path: &path, SHA256: sha[:], ProcessedAt: &processed,
+		ID: 5, ZoneID: &zone, Action: &action, Path: &path,
+		SHA256: sha[:], ProcessedAt: &processed,
 	})
 
 	boom := errors.New("очистка партии не прошла")

@@ -24,29 +24,28 @@ import (
 // --- фейковый FileStore ---------------------------------------------------
 
 // fakeFileStore — память-журнал ingest_files с протоколом вызовов.
+// Строки с одним sha256 (разные зона/действие — сценарии T-113)
+// возвращаются в порядке добавления.
 type fakeFileStore struct {
-	known   map[string]model.IngestFile
-	bySAErr error // ошибка FileBySHA256, если задана
+	known   map[string][]model.IngestFile
+	bySAErr error // ошибка FilesBySHA256, если задана
 	records []FileRecord
 	recErr  error // ошибка RecordFile, если задана
 }
 
 func newFakeFileStore(known ...model.IngestFile) *fakeFileStore {
-	f := &fakeFileStore{known: make(map[string]model.IngestFile, len(known))}
+	f := &fakeFileStore{known: make(map[string][]model.IngestFile, len(known))}
 	for _, k := range known {
-		f.known[string(k.SHA256)] = k
+		f.known[string(k.SHA256)] = append(f.known[string(k.SHA256)], k)
 	}
 	return f
 }
 
-func (f *fakeFileStore) FileBySHA256(_ context.Context, sha []byte) (model.IngestFile, error) {
+func (f *fakeFileStore) FilesBySHA256(_ context.Context, sha []byte) ([]model.IngestFile, error) {
 	if f.bySAErr != nil {
-		return model.IngestFile{}, f.bySAErr
+		return nil, f.bySAErr
 	}
-	if m, ok := f.known[string(sha)]; ok {
-		return m, nil
-	}
-	return model.IngestFile{}, ErrFileNotFound
+	return f.known[string(sha)], nil // nil = содержимое не обрабатывалось
 }
 
 func (f *fakeFileStore) RecordFile(_ context.Context, rec FileRecord) error {
@@ -164,33 +163,42 @@ func (p *fakeFilePool) Query(_ context.Context, sql string, args ...any) (pgx.Ro
 // --- SQLFileStore ---------------------------------------------------------
 
 const wantFileSelect = "SELECT id, zone_id, action, path, sha256, lines_total, added, existed, deleted, rejected, processed_at " +
-	"FROM ingest_files WHERE sha256 = $1"
+	"FROM ingest_files WHERE sha256 = $1 ORDER BY id"
 
 const wantFileInsert = "INSERT INTO ingest_files " +
 	"(zone_id, action, path, sha256, lines_total, added, existed, deleted, rejected, processed_at) " +
 	"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
 
-func TestSQLFileBySHA256(t *testing.T) {
+// TestSQLFilesBySHA256 — все строки журнала с данным содержимым
+// (T-113: одно содержимое может доставляться в разных зоне/действии —
+// точная повторная доставка ищется конвейером по тройке).
+func TestSQLFilesBySHA256(t *testing.T) {
 	when := time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC)
 	action := model.ActionAdd
 	path := "com/add/list.txt"
 	sha := []byte{1, 2, 3}
-	pool := &fakeFilePool{results: []*fileRows{{rows: [][]any{{
-		int64(9), int16(7), action, path, sha,
-		int64(100), int64(60), int64(30), nil, int64(10), when,
-	}}}}}
+	pool := &fakeFilePool{results: []*fileRows{{rows: [][]any{
+		{int64(9), int16(7), action, path, sha,
+			int64(100), int64(60), int64(30), nil, int64(10), when},
+		{int64(11), int16(7), model.ActionDelete, "com/delete/x.txt", sha,
+			int64(100), nil, nil, int64(60), int64(10), when},
+	}}}}
 	store := NewFileStore(pool)
 
-	f, err := store.FileBySHA256(context.Background(), sha)
+	fs, err := store.FilesBySHA256(context.Background(), sha)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pool.queries) != 1 || pool.queries[0].sql != wantFileSelect {
-		t.Errorf("SQL = %v, want SELECT … WHERE sha256 = $1", pool.queries)
+		t.Errorf("SQL = %v, want SELECT … WHERE sha256 = $1 ORDER BY id", pool.queries)
 	}
 	if !reflect.DeepEqual(pool.queries[0].args, []any{sha}) {
 		t.Errorf("аргументы = %v, want [sha256]", pool.queries[0].args)
 	}
+	if len(fs) != 2 {
+		t.Fatalf("строк журнала = %d, want 2 (add и undo-delete одного содержимого)", len(fs))
+	}
+	f := fs[0]
 	if f.ID != 9 || f.ZoneID == nil || *f.ZoneID != 7 ||
 		f.Action == nil || *f.Action != model.ActionAdd ||
 		f.Path == nil || *f.Path != path ||
@@ -203,14 +211,20 @@ func TestSQLFileBySHA256(t *testing.T) {
 		f.ProcessedAt == nil || !f.ProcessedAt.Equal(when) {
 		t.Errorf("строка журнала = %+v, want как есть из ingest_files", f)
 	}
+	if d := fs[1]; d.ID != 11 || d.Action == nil || *d.Action != model.ActionDelete {
+		t.Errorf("вторая строка журнала = %+v, want undo-delete того же sha256", d)
+	}
 }
 
-func TestSQLFileBySHA256NotFound(t *testing.T) {
+// TestSQLFilesBySHA256None — содержимое не обрабатывалось: пустой срез
+// без ошибки (не обрабатывалось — не ошибка хранилища).
+func TestSQLFilesBySHA256None(t *testing.T) {
 	pool := &fakeFilePool{results: []*fileRows{{}}}
 	store := NewFileStore(pool)
 
-	if _, err := store.FileBySHA256(context.Background(), []byte{9}); !errors.Is(err, ErrFileNotFound) {
-		t.Errorf("ошибка = %v, want ErrFileNotFound", err)
+	fs, err := store.FilesBySHA256(context.Background(), []byte{9})
+	if err != nil || len(fs) != 0 {
+		t.Errorf("результат = %v, %v; want пустой срез без ошибки", fs, err)
 	}
 }
 
@@ -249,7 +263,8 @@ func TestSQLRecordFile(t *testing.T) {
 }
 
 // TestSQLRecordFileBadSHA — отчёт без полного sha256 — ошибка до БД:
-// битый хэш сломал бы идемпотентность (ingest_files.sha256 UNIQUE).
+// битый хэш сломал бы идемпотентность (уникальная тройка
+// (zone_id, action, sha256), T-113).
 func TestSQLRecordFileBadSHA(t *testing.T) {
 	pool := &fakeFilePool{}
 	store := NewFileStore(pool)
@@ -270,7 +285,7 @@ func TestSQLFileStoreErrors(t *testing.T) {
 
 	pool := &fakeFilePool{queryErr: boom}
 	store := NewFileStore(pool)
-	_, err := store.FileBySHA256(context.Background(), []byte{1})
+	_, err := store.FilesBySHA256(context.Background(), []byte{1})
 	if err == nil || !strings.Contains(err.Error(), "db: ingest_files: поиск по sha256:") || !errors.Is(err, boom) {
 		t.Errorf("ошибка поиска = %v, want обёрнутая", err)
 	}

@@ -6,9 +6,10 @@
 // staging (T-017) → применение add/delete (T-018/T-019) → отчёт в
 // ingest_files (report.go) → перемещение файла в processed/ или failed/.
 //
-// Идемпотентность (ТЗ 3.4, 5.1): защита от повторной обработки —
-// уникальный sha256 в ingest_files; конвейер проверяет хэш после
-// загрузки staging (хэш известен только к концу чтения) и до применения.
+// Идемпотентность (ТЗ 3.4, 5.1; T-113): защита от повторной обработки —
+// точная повторная доставка, совпадение (зона, действие, sha256) в
+// ingest_files; конвейер проверяет хэш после загрузки staging (хэш
+// известен только к концу чтения) и до применения.
 // Классы исходов и решение «файл остаётся или уходит в архив» — Outcome.
 package ingest
 
@@ -76,7 +77,8 @@ type PipelineOptions struct {
 
 // Pipeline — сквозная обработка готового входного файла (ТЗ 5.1) из
 // готовых ступеней T-014…T-020. Самостоятельного состояния между файлами
-// не держит: идемпотентность — по sha256 в ingest_files, а не в памяти.
+// не держит: идемпотентность — по тройке (зона, действие, sha256) в
+// ingest_files, а не в памяти.
 type Pipeline struct {
 	zones ZoneStore
 	files FileStore
@@ -119,9 +121,10 @@ const (
 	// OutcomeApplied — файл применён к БД, отчёт записан в ingest_files,
 	// файл перемещён в processed/.
 	OutcomeApplied OutcomeKind = "applied"
-	// OutcomeDuplicate — тот же sha256 уже в журнале ingest_files
-	// (ТЗ 5.1: повторная обработка того же файла безопасна): загрузка
-	// отброшена, файл перемещён в processed/ без нового отчёта.
+	// OutcomeDuplicate — точная повторная доставка: та же тройка
+	// (зона, действие, sha256) уже в журнале ingest_files (ТЗ 5.1,
+	// T-113): загрузка отброшена, файл перемещён в processed/ без
+	// нового отчёта.
 	OutcomeDuplicate OutcomeKind = "duplicate"
 	// OutcomeFailed — файл ошибочен по своей сути (структура пути,
 	// имя зоны, доля отказов выше порога): перемещён в failed/ с
@@ -231,15 +234,37 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 			rejectedAll, contentAll, p.opts.MaxErrorRatio))
 	}
 
-	// Идемпотентность (ТЗ 5.1): тот же файл (по содержимому — sha256,
-	// а не по пути) уже обработан — повторно не применяется.
-	known, err := p.files.FileBySHA256(ctx, rep.SHA256)
-	switch {
-	case err != nil && !errors.Is(err, ErrFileNotFound):
+	// Идемпотентность (ТЗ 5.1; T-113): пропускается только точная
+	// повторная доставка — совпадение (зона, действие, sha256).
+	// Дубль с другим действием (undo тем же списком: add/, затем
+	// delete/) и дубль в другой зоне обрабатываются: безвредность
+	// повторного применения гарантируют операции над доменами (T-097).
+	known, err := p.files.FilesBySHA256(ctx, rep.SHA256)
+	if err != nil {
 		p.discard(id)
 		return Outcome{Kind: OutcomeLeft, Report: rep,
 			Err: fmt.Errorf("ingest: проверка дубля файла %s: %w", f.Path, err)}
-	case err == nil:
+	}
+	var dup, crossZone, crossAction *model.IngestFile
+	for i := range known {
+		k := &known[i]
+		sameZone := k.ZoneID != nil && *k.ZoneID == z.ID
+		sameAction := k.Action != nil && *k.Action == f.Action
+		switch {
+		case sameZone && sameAction:
+			dup = k // точная повторная доставка
+		case sameAction:
+			if crossZone == nil {
+				crossZone = k // то же действие в другой зоне
+			}
+		default:
+			if crossAction == nil {
+				crossAction = k // другое действие, зона любая
+			}
+		}
+	}
+
+	if dup != nil {
 		if derr := p.clearBatch(ctx, id); derr != nil {
 			// Дубль не применяется, но партия уже загружена: сбой
 			// очистки (в т.ч. отмена ctx) ретрается discard'ом — как в
@@ -247,28 +272,33 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
-		// Дубль с другой операцией/зоной — по контракту идемпотентности
-		// по содержимому (docs/incoming-files.md §5: уникальный sha256,
-		// docs/schema.md) файл всё равно не применяется (в т.ч. «тот же
-		// список в delete/ после add/», 63da59c). Это может быть
-		// неожиданностью для оператора — подсвечиваем Warn (ING-P2-5).
-		if (known.Action != nil && *known.Action != f.Action) ||
-			(known.ZoneID != nil && *known.ZoneID != z.ID) {
-			p.log.Warn("дубль по sha256 с другой операцией или зоной — не применяется (идемпотентность по содержимому)",
-				"path", f.Path, "action", f.Action.String(), "zone_id", z.ID,
-				"first_path", derefString(known.Path),
-				"first_action", derefAction(known.Action),
-				"first_zone_id", derefInt16(known.ZoneID),
-				"first_processed_at", derefTime(known.ProcessedAt))
-		}
 		if _, merr := p.moveFile(DirProcessed, f.Path, abs); merr != nil {
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: merr}
 		}
-		p.log.Info("файл уже обработан (дубль по sha256) — перемещён в processed",
+		p.log.Info("файл уже обработан (дубль — та же зона, действие и sha256) — перемещён в processed",
 			"path", f.Path, "sha256", fmt.Sprintf("%x", rep.SHA256),
-			"first_path", derefString(known.Path),
-			"first_processed_at", derefTime(known.ProcessedAt))
+			"first_path", derefString(dup.Path),
+			"first_processed_at", derefTime(dup.ProcessedAt))
 		return Outcome{Kind: OutcomeDuplicate, Report: rep}
+	}
+
+	// Точной повторной доставки нет — файл применяется. То же
+	// содержимое уже доставлялось иначе: повторная обработка в другой
+	// зоне при том же действии легитимна (домены той зоны первая
+	// доставка не трогала), но оператору полезно её видеть (Warn,
+	// ING-P2-5); другое действие — плановый undo (Info).
+	if crossZone != nil {
+		p.log.Warn("дубль по sha256 в другой зоне при том же действии — обрабатывается",
+			"path", f.Path, "action", f.Action.String(), "zone_id", z.ID,
+			"first_path", derefString(crossZone.Path),
+			"first_zone_id", derefInt16(crossZone.ZoneID),
+			"first_processed_at", derefTime(crossZone.ProcessedAt))
+	} else if crossAction != nil {
+		p.log.Info("то же содержимое уже доставлялось другим действием — обрабатывается (undo)",
+			"path", f.Path, "action", f.Action.String(), "zone_id", z.ID,
+			"first_path", derefString(crossAction.Path),
+			"first_action", derefAction(crossAction.Action),
+			"first_processed_at", derefTime(crossAction.ProcessedAt))
 	}
 
 	// Применение по действию файла (ТЗ 5.1): add → ApplyAdd,
@@ -295,8 +325,9 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	}
 
 	// Отчёт — после обработки файла (ТЗ 5.1: «после обработки файла
-	// пишется отчёт»). Уникальность sha256 — второй рубеж защиты от
-	// дублей: конкурентный отчёт отвергается схемой (sqlFileRecord).
+	// пишется отчёт»). Уникальность (zone_id, action, sha256) — второй
+	// рубеж защиты от дублей: конкурентный отчёт отвергается схемой
+	// (sqlFileRecord).
 	if rerr := p.files.RecordFile(ctx, rep.record(p.now())); rerr != nil {
 		return Outcome{Kind: OutcomeLeft, Report: rep,
 			Err: fmt.Errorf("ingest: отчёт файла %s: %w", f.Path, rerr)}

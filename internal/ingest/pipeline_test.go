@@ -2,7 +2,9 @@
 // ZoneStore (zones_test.go), FileStore (report_test.go) и pgx-пул с
 // заготовленными результатами Stage/ApplyAdd/ApplyDelete; файлы — во
 // временных каталогах (t.TempDir). Сценарии: удачный add, удачный
-// delete, дубль sha256 (файл не применяется повторно), порог ошибок →
+// delete, дубль — точная повторная доставка (T-113: та же зона, действие
+// и sha256 — не применяется повторно), то же содержимое другой зоной/
+// действием — обработка (undo), порог ошибок →
 // failed/ с лог-отчётом, битая структура пути → failed/, инфраструктурный
 // сбой → файл остаётся в incoming (at-least-once, ТЗ 3.4), коллизия имён
 // в архиве. Реальное поведение против БД — интеграционные тесты (T-023).
@@ -366,19 +368,34 @@ func TestPipelineDelete(t *testing.T) {
 	}
 }
 
-// TestPipelineDuplicate — тот же sha256 уже в журнале (ТЗ 5.1: повторная
-// обработка того же файла безопасна): партия отброшена, применение не
-// выполняется, отчёт не дублируется, файл уходит в processed/.
+// TestPipelineDuplicate — точная повторная доставка (T-113): та же
+// тройка (зона, действие, sha256) уже в журнале (в том числе среди
+// других доставок того же содержимого — точное совпадение побеждает):
+// партия отброшена, применение не выполняется, отчёт не дублируется,
+// файл уходит в processed/.
 func TestPipelineDuplicate(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\n"
 	abs := pt.addFile(t, "com/add/list.txt", content)
 	sha := sha256.Sum256([]byte(content))
 	processed := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
-	path := "com/add/list.txt"
-	pt.files = newFakeFileStore(model.IngestFile{
-		ID: 5, Path: &path, SHA256: sha[:], ProcessedAt: &processed,
-	})
+	zone, otherZone := int16(1), int16(9)
+	add, del := model.ActionAdd, model.ActionDelete
+	path, otherPath, undoPath := "com/add/list.txt", "net/add/list.txt", "com/delete/x.txt"
+	pt.files = newFakeFileStore(
+		model.IngestFile{ // другое действие, та же зона (undo)
+			ID: 6, ZoneID: &zone, Action: &del, Path: &undoPath,
+			SHA256: sha[:], ProcessedAt: &processed,
+		},
+		model.IngestFile{ // точная повторная доставка
+			ID: 5, ZoneID: &zone, Action: &add, Path: &path,
+			SHA256: sha[:], ProcessedAt: &processed,
+		},
+		model.IngestFile{ // то же действие, другая зона
+			ID: 7, ZoneID: &otherZone, Action: &add, Path: &otherPath,
+			SHA256: sha[:], ProcessedAt: &processed,
+		},
+	)
 	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
 		Dir: pt.dir, BatchSize: 10, Now: func() time.Time { return pt.now },
 	})
@@ -414,24 +431,31 @@ func TestPipelineDuplicate(t *testing.T) {
 	}
 }
 
-// TestPipelineDuplicateCrossActionWarn — дубль по sha256 с другой
-// операцией (тот же список положили в delete/ после add/) по контракту
-// идемпотентности по содержимому не применяется (docs/incoming-files.md
-// §5; глобальный UNIQUE sha256 — docs/schema.md; приёмочный кейс 63da59c
-// «дубль sha256 delete-файла легитимен») — контракт не меняется, но
+// TestPipelineDuplicateOtherZoneWarn — дубль по sha256 в другой зоне при
+// том же действии (T-113): точной повторной доставки нет, файл
+// применяется (домены этой зоны первая доставка не трогала) — но
 // оператору подсвечивается Warn (ING-P2-5, неконтрактная часть).
-func TestPipelineDuplicateCrossActionWarn(t *testing.T) {
+func TestPipelineDuplicateOtherZoneWarn(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\n"
 	abs := pt.addFile(t, "com/add/list.txt", content)
 	sha := sha256.Sum256([]byte(content))
-	action := model.ActionDelete
-	path := "com/delete/list.txt"
+	zone := int16(9)
+	action := model.ActionAdd
+	path := "net/add/list.txt"
 	processed := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
 	pt.files = newFakeFileStore(model.IngestFile{
-		ID: 7, Action: &action, Path: &path,
+		ID: 7, ZoneID: &zone, Action: &action, Path: &path,
 		SHA256: sha[:], ProcessedAt: &processed,
 	})
+
+	pt.pool.execs = []pipeExec{
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
+		{tag: pgconn.NewCommandTag("INSERT 1")}, // example
+		{tag: pgconn.NewCommandTag("UPDATE 0")}, // возвращать некого
+		{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
+	}
+	pt.pool.uniques = 1
 
 	var buf bytes.Buffer
 	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
@@ -448,22 +472,80 @@ func TestPipelineDuplicateCrossActionWarn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process: %v", err)
 	}
-	if out.Kind != OutcomeDuplicate {
-		t.Fatalf("итог = %s, want duplicate (контракт дедупа не меняется)", out.Kind)
+	if out.Kind != OutcomeApplied {
+		t.Fatalf("итог = %s, want applied (другая зона — не дубль, T-113)", out.Kind)
 	}
-	if len(pt.files.records) != 0 {
-		t.Error("дубль не должен писать второй отчёт")
+	if len(pt.files.records) != 1 {
+		t.Error("повторная обработка в другой зоне пишет свой отчёт")
 	}
 	log := buf.String()
 	for _, want := range []string{
-		"дубль по sha256 с другой операцией или зоной",
-		"action=add",
-		"first_action=delete",
-		"first_path=com/delete/list.txt",
+		"дубль по sha256 в другой зоне при том же действии",
+		"zone_id=1",
+		"first_zone_id=9",
+		"first_path=net/add/list.txt",
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("лог = %q, want запись с %q", log, want)
 		}
+	}
+}
+
+// TestPipelineUndoSameContentApplied — undo тем же списком (T-113):
+// то же содержимое доставлено в delete/ после add/ — действие другое,
+// точной повторной доставки нет, файл обрабатывается: домены
+// удаляются, отчёт в журнале. Переопределяет пиннинг T-097
+// (TestIngest_SameContentCrossActionSkipped, контракт дедупа сменила
+// T-113).
+func TestPipelineUndoSameContentApplied(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "example.com\n"
+	abs := pt.addFile(t, "com/delete/x.txt", content)
+	sha := sha256.Sum256([]byte(content))
+	zone := int16(1)
+	action := model.ActionAdd
+	path := "com/add/list.txt"
+	processed := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	pt.files = newFakeFileStore(model.IngestFile{
+		ID: 7, ZoneID: &zone, Action: &action, Path: &path,
+		SHA256: sha[:], ProcessedAt: &processed,
+	})
+
+	pt.pool.execs = []pipeExec{
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
+		{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
+	}
+	pt.pool.delDeleted = 1
+
+	var buf bytes.Buffer
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir:       pt.dir,
+		BatchSize: 10,
+		Log:       slog.New(slog.NewTextHandler(&buf, nil)),
+		Now:       func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.Kind != OutcomeApplied {
+		t.Fatalf("итог = %s, want applied (другое действие — не дубль, undo)", out.Kind)
+	}
+	if out.Report.Deleted != 1 {
+		t.Errorf("undo: deleted = %d, want 1", out.Report.Deleted)
+	}
+	if len(pt.files.records) != 1 || pt.files.records[0].Action != model.ActionDelete {
+		t.Errorf("журнал = %+v, want строка delete для undo-файла", pt.files.records)
+	}
+	if !strings.Contains(buf.String(), "уже доставлялось другим действием") {
+		t.Errorf("лог = %q, want Info об undo (ранее — Warn о пропуске, ING-P2-5)", buf.String())
+	}
+	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/delete/x.txt")) {
+		t.Error("undo-файл не перемещён в processed/")
 	}
 }
 

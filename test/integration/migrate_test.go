@@ -313,15 +313,18 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		}
 	}
 
-	// Повторный старт доводит применение до конца.
+	// Повторный старт доводит применение до конца: 000008 и всё, что за
+	// ней в наборе (последняя версия набора, а не конкретный номер —
+	// набор растёт с новыми миграциями).
 	if _, err := blocker.Exec(ctx, "ROLLBACK"); err != nil {
 		t.Fatalf("освобождение блокировщика: %v", err)
 	}
 	if err := migrate.Up(ctx, dsn); err != nil {
 		t.Fatalf("повторный старт: %v", err)
 	}
-	if version, dirty := schemaVersionState(t, dsn); version != 8 || dirty {
-		t.Errorf("после повторного старта: версия = %d dirty = %v, want 8 false", version, dirty)
+	latest := int(latestEmbeddedVersion(t))
+	if version, dirty := schemaVersionState(t, dsn); version != latest || dirty {
+		t.Errorf("после повторного старта: версия = %d dirty = %v, want %d false", version, dirty, latest)
 	}
 	for _, idx := range []string{"domains_lease_idx", "domains_recheck_idx"} {
 		if !indexExists(t, pool, idx) {

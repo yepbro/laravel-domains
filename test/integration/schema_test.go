@@ -502,8 +502,9 @@ func assertColumnTypes(t *testing.T, pool *pgxpool.Pool, table string, want map[
 	}
 }
 
-// assertUniqueIndex проверяет, что на таблице есть уникальный индекс по колонке.
-func assertUniqueIndex(t *testing.T, pool *pgxpool.Pool, table, column string) {
+// assertUniqueIndex проверяет, что на таблице есть уникальный индекс
+// с данным ключом (колонка или список через запятую).
+func assertUniqueIndex(t *testing.T, pool *pgxpool.Pool, table, key string) {
 	t.Helper()
 
 	rows, err := pool.Query(context.Background(), `
@@ -524,7 +525,7 @@ func assertUniqueIndex(t *testing.T, pool *pgxpool.Pool, table, column string) {
 		if err := rows.Scan(&def); err != nil {
 			t.Fatalf("чтение индекса %s: %v", table, err)
 		}
-		if key, _, _ := strings.Cut(def, " WHERE "); strings.Contains(key, "("+column+")") {
+		if head, _, _ := strings.Cut(def, " WHERE "); strings.Contains(head, "("+key+")") {
 			found = true
 		}
 	}
@@ -532,7 +533,7 @@ func assertUniqueIndex(t *testing.T, pool *pgxpool.Pool, table, column string) {
 		t.Fatalf("итерация индексов %s: %v", table, err)
 	}
 	if !found {
-		t.Errorf("%s: нет уникального индекса по колонке %s", table, column)
+		t.Errorf("%s: нет уникального индекса по ключу %s", table, key)
 	}
 }
 
@@ -660,14 +661,18 @@ func TestSchema_ResultsTablesColumns(t *testing.T) {
 		assertNotNull(t, pool, table, w.notNull)
 	}
 
-	// Идемпотентность ingest: файл опознаётся по sha256 (ТЗ 5.1).
-	assertUniqueIndex(t, pool, "ingest_files", "sha256")
+	// Идемпотентность ingest: дедуп — точная повторная доставка
+	// (zone_id, action, sha256) — уникальный ключ T-113 (миграция 000009).
+	assertUniqueIndex(t, pool, "ingest_files", "zone_id, action, sha256")
 }
 
 // TestSchema_ResultsTablesIndexes — «минимум индексов» (ТЗ 6): на таблицах
 // T-004 только первичные ключи — выборки по домену идут по префиксу
-// (zone_id, domain_id) составных ключей, — плюс уникальный ingest_files.sha256
-// и индекс компактификации contents_pack_off_idx (pack_id, off) для фоновых
+// (zone_id, domain_id) составных ключей, — плюс уникальный
+// ingest_files (zone_id, action, sha256) с обслуживающим
+// ingest_files_sha256_idx (T-113: дедуп точной повторной доставки и
+// запрос конвейера по содержимому) и индекс компактификации
+// contents_pack_off_idx (pack_id, off) для фоновых
 // запросов CompactLoop по паку с сортировкой по смещению (T-096, INFRA-05;
 // refcount в ключ не входит — апдейты счётчика остаются HOT).
 // Индексы под будущие выборки (например, laravel_domains по score — этап 8,
@@ -686,8 +691,9 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 		"laravel_domains":  {"laravel_domains_pkey": "(zone_id, domain_id)"},
 		"laravel_findings": {"laravel_findings_pkey": "(zone_id, domain_id, subdomain_id, variant)"},
 		"ingest_files": {
-			"ingest_files_pkey":       "(id)",
-			"ingest_files_sha256_key": "(sha256)",
+			"ingest_files_pkey":                      "(id)",
+			"ingest_files_zone_id_action_sha256_key": "(zone_id, action, sha256)",
+			"ingest_files_sha256_idx":                "(sha256)",
 		},
 	}
 
@@ -725,7 +731,9 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 
 // TestSchema_ResultsIdempotency — запись результатов идемпотентна (ТЗ 3.4):
 // повторная вставка строки с тем же ключом отбивается первичным ключом,
-// для ingest_files — уникальным sha256 даже при другом пути файла (ТЗ 5.1);
+// для ingest_files — уникальной тройкой (zone_id, action, sha256) даже
+// при другом пути файла (T-113, ТЗ 5.1); то же содержимое другим
+// действием (undo) или в другой зоне записывается отдельной строкой;
 // применяются defaults эскиза (variant/alias_kind/rendered, refcount).
 // Внешних ключей на domains нет — минимум индексов (ТЗ 6), целостность
 // ссылок (zone_id, domain_id) обеспечивает код записи.
@@ -796,8 +804,10 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 		INSERT INTO laravel_findings (zone_id, domain_id, subdomain_id, variant, score, signals, is_laravel, rules_version)
 		VALUES (1, 10, 0, 0, 1, '[]', true, 1)`)
 
-	// ingest_files: отчёт по обработанному файлу; дубль sha256 — другой
-	// путь, тот же контент файла — отбивается уникальным индексом.
+	// ingest_files: отчёт по обработанному файлу; точная повторная
+	// доставка — та же зона, действие и sha256 (другой путь не помогает)
+	// — отбивается уникальным ключом T-113; то же содержимое другим
+	// действием (undo) или в другой зоне — отдельные легитимные строки.
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO ingest_files (zone_id, action, path, sha256, lines_total, added, existed, deleted, rejected)
 		VALUES (1, 1, 'incoming/com/add/a.txt', '\x0102', 100, 90, 5, 0, 5)`,
@@ -807,6 +817,17 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 	dupInsert("ingest_files", `
 		INSERT INTO ingest_files (zone_id, action, path, sha256)
 		VALUES (1, 1, 'processed/com/add/a.txt', '\x0102')`)
+	for _, d := range []struct{ zone, action int16 }{
+		{1, 2}, // undo тем же списком: то же содержимое из delete/
+		{2, 1}, // повторная доставка в другой зоне
+	} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO ingest_files (zone_id, action, path, sha256)
+			VALUES ($1, $2, 'com/add/b.txt', '\x0102')`, d.zone, d.action); err != nil {
+			t.Errorf("ingest_files: то же содержимое (zone=%d, action=%d) обязано записываться отдельно: %v",
+				d.zone, d.action, err)
+		}
+	}
 }
 
 // ---------------------------------------------------------------- T-082: domain_info

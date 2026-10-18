@@ -1,8 +1,10 @@
 // Учёт обработанных файлов в ingest_files (T-021; ТЗ 5.1, 6.1): запись
 // отчёта (sha256, действие, счётчики строк и применения) и защита от
-// повторной обработки того же файла по уникальному sha256. Доступ к БД —
-// через маленький интерфейс FileStore (юнит-тесты — на фейке, стиль
-// ZoneStore из T-014), SQL-реализация SQLFileStore — поверх internal/db.
+// повторной обработки того же файла по уникальной тройке
+// (zone_id, action, sha256) — точной повторной доставки (T-113).
+// Доступ к БД — через маленький интерфейс FileStore (юнит-тесты — на
+// фейке, стиль ZoneStore из T-014), SQL-реализация SQLFileStore —
+// поверх internal/db.
 //
 // Здесь же — текстовый лог-отчёт об обработке файла (renderReport):
 // рядом с файлом в failed/ (ТЗ 5.1: «файлы с ошибкой (с лог-отчётом
@@ -14,7 +16,6 @@ package ingest
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -26,25 +27,24 @@ import (
 	"crawler/internal/model"
 )
 
-// ErrFileNotFound — в журнале ingest_files нет файла с таким sha256:
-// файл ещё не обрабатывался. Возвращается FileStore.FileBySHA256;
-// для конвейера это разрешение обрабатывать (Pipeline, T-021).
-var ErrFileNotFound = errors.New("ingest: файла с таким sha256 нет в журнале ingest_files")
-
 // FileStore — журнал обработанных файлов ingest_files (ТЗ 5.1, 6.1),
 // необходимый конвейеру приёма: защита от повторной обработки того же
 // файла и запись отчёта. Интерфейс маленький намеренно (как ZoneStore,
 // T-014): юнит-тесты конвейера обходятся фейком, SQL-реализация
 // подменяема.
 type FileStore interface {
-	// FileBySHA256 возвращает строку журнала по хэшу содержимого файла.
-	// Отсутствие — ErrFileNotFound (файл не обрабатывался), прочее —
-	// ошибка хранилища.
-	FileBySHA256(ctx context.Context, sha []byte) (model.IngestFile, error)
+	// FilesBySHA256 возвращает все строки журнала с данным sha256
+	// (любые зона и действие, от ранней к поздней): конвейер ищет
+	// среди них точную повторную доставку — совпадение
+	// (zone_id, action, sha256), уникальный ключ T-113, — и
+	// подсвечивает то же содержимое, доставлявшееся иначе (другая
+	// зона, другое действие). Пустой срез — содержимое не
+	// обрабатывалось, прочее — ошибка хранилища.
+	FilesBySHA256(ctx context.Context, sha []byte) ([]model.IngestFile, error)
 
 	// RecordFile пишет отчёт обработанного файла (счётчики применения).
-	// Хэш обязан быть уникален (ingest_files.sha256 UNIQUE, ТЗ 6.1):
-	// дубль — ошибка хранилища.
+	// Тройка (zone_id, action, sha256) уникальна (миграция 000009):
+	// конкурентный отчёт того же файла — ошибка хранилища.
 	RecordFile(ctx context.Context, rec FileRecord) error
 }
 
@@ -69,12 +69,16 @@ type FileRecord struct {
 const ingestFileColumns = "id, zone_id, action, path, sha256, lines_total, added, existed, deleted, rejected, processed_at"
 
 const (
-	sqlFileBySHA = "SELECT " + ingestFileColumns + " FROM ingest_files WHERE sha256 = $1"
+	// От ранней к поздней (ORDER BY id): классификация доставок в
+	// конвейере детерминирована, ссылки «первая доставка» — ранняя.
+	// Обслуживается ingest_files_sha256_idx (миграция 000009).
+	sqlFilesBySHA = "SELECT " + ingestFileColumns + " FROM ingest_files WHERE sha256 = $1 ORDER BY id"
 
 	// Простой INSERT, без ON CONFLICT: конкурентный отчёт того же файла
-	// (второй экземпляр сервиса) отвергается уникальным sha256 — схеме
-	// виднее, обрабатывался ли файл; подавлять конфликт молча значило бы
-	// потерять счётчики одной из попыток.
+	// (второй экземпляр сервиса) отвергается уникальной тройкой
+	// (zone_id, action, sha256) — схеме виднее, обрабатывался ли файл;
+	// подавлять конфликт молча значило бы потерять счётчики одной из
+	// попыток.
 	sqlFileRecord = "INSERT INTO ingest_files " +
 		"(zone_id, action, path, sha256, lines_total, added, existed, deleted, rejected, processed_at) " +
 		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
@@ -93,20 +97,18 @@ func NewFileStore(pool db.DB) *SQLFileStore {
 	return &SQLFileStore{pool: pool}
 }
 
-// FileBySHA256 ищет журнал по хэшу файла; отсутствие — ErrFileNotFound.
-func (s *SQLFileStore) FileBySHA256(ctx context.Context, sha []byte) (model.IngestFile, error) {
-	rows, err := s.pool.Query(ctx, sqlFileBySHA, sha)
+// FilesBySHA256 — все строки журнала с данным содержимым, от ранней к
+// поздней; пустой срез — содержимое не обрабатывалось.
+func (s *SQLFileStore) FilesBySHA256(ctx context.Context, sha []byte) ([]model.IngestFile, error) {
+	rows, err := s.pool.Query(ctx, sqlFilesBySHA, sha)
 	if err != nil {
-		return model.IngestFile{}, fmt.Errorf("db: ingest_files: поиск по sha256: %w", err)
+		return nil, fmt.Errorf("db: ingest_files: поиск по sha256: %w", err)
 	}
-	f, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[model.IngestFile])
-	if errors.Is(err, pgx.ErrNoRows) {
-		return model.IngestFile{}, ErrFileNotFound
-	}
+	fs, err := pgx.CollectRows(rows, pgx.RowToStructByName[model.IngestFile])
 	if err != nil {
-		return model.IngestFile{}, fmt.Errorf("db: ingest_files: поиск по sha256: %w", err)
+		return nil, fmt.Errorf("db: ingest_files: поиск по sha256: %w", err)
 	}
-	return f, nil
+	return fs, nil
 }
 
 // RecordFile пишет отчёт обработанного файла.

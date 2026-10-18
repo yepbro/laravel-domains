@@ -215,13 +215,13 @@ func TestIngest_ReviveCycleIdempotent(t *testing.T) {
 	env.assertStateUnchanged(t, afterDelete, 5)
 }
 
-// TestIngest_SameContentCrossActionSkipped — граница текущего контракта
-// (закреплена до смены T-113): дедуп глобален по sha256 — тот же список
-// из delete/ после add/ распознаётся как дубль и не применяется, домены
-// не тронуты. Ослабление ключа до (zone_id, action, sha256) — задача
-// T-113; этот тест фиксирует present-поведение и будет переопределён
-// вместе с ним (см. также Warn в конвейере, ING-P2-5).
-func TestIngest_SameContentCrossActionSkipped(t *testing.T) {
+// TestIngest_SameContentCrossActionApplied — undo тем же списком (T-113;
+// переопределяет пиннинг T-097 «граница контракта дедупа»): дедуп
+// ослаблен до точной повторной доставки (zone_id, action, sha256) —
+// тот же список из delete/ после add/ ТЕПЕРЬ обрабатывается: домены
+// удаляются, журнал пополняется строкой delete. Последующая точная
+// повторная доставка add-файла тем же содержимым — дубль (skip).
+func TestIngest_SameContentCrossActionApplied(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
 
@@ -229,15 +229,33 @@ func TestIngest_SameContentCrossActionSkipped(t *testing.T) {
 	if out := env.process(t, "crawl.test/add/list.txt", content); out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("add: итог = %q, want applied", out.Kind)
 	}
-	afterAdd := env.domainSnapshot(t)
 
-	// undo тем же списком: пока контракт дедупа по содержимому — дубль.
+	// undo тем же списком: действие другое — точной повторной доставки
+	// нет, файл применяется, домены удаляются.
 	out := env.process(t, "crawl.test/delete/list.txt", content)
-	if out.Kind != ingest.OutcomeDuplicate {
-		t.Fatalf("тот же список из delete/: итог = %q, want duplicate (контракт до T-113)", out.Kind)
+	if out.Kind != ingest.OutcomeApplied {
+		t.Fatalf("тот же список из delete/: итог = %q, want applied (T-113: другое действие — не дубль)", out.Kind)
 	}
-	// Домены не тронуты, журнал не пополнился.
-	env.assertStateUnchanged(t, afterAdd, 1)
+	if out.Report.Deleted != 2 {
+		t.Errorf("undo: deleted = %d, want 2 (оба домена списка)", out.Report.Deleted)
+	}
+	for _, label := range []string{"example", "shop"} {
+		if d, ok := env.domain(t, "crawl.test", label); !ok || d.status != int16(model.StatusDeleted) {
+			t.Errorf("после undo: домен %s = %+v, want status deleted", label, d)
+		}
+	}
+	if n := env.countOf(t, "ingest_files"); n != 2 {
+		t.Errorf("записей в ingest_files = %d, want 2 (add и undo-delete)", n)
+	}
+
+	// Точная повторная доставка add-файла тем же содержимым — дубль:
+	// применение не выполняется, журнал не растёт.
+	if out := env.process(t, "crawl.test/add/list.txt", content); out.Kind != ingest.OutcomeDuplicate {
+		t.Fatalf("повторный add тем же содержимым: итог = %q, want duplicate", out.Kind)
+	}
+	if n := env.countOf(t, "ingest_files"); n != 2 {
+		t.Errorf("записей в ingest_files = %d, want 2 (дубль не отчётится)", n)
+	}
 }
 
 // TestIngest_CleanupIdempotent — фоновая очистка удалённых доменов
