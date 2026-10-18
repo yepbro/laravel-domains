@@ -50,6 +50,7 @@ var commands = map[string]commandFunc{
 	"dict":       cmdDict,
 	"seed":       cmdSeed,
 	"test-rules": cmdTestRules,
+	"near":       cmdNear,
 }
 
 // usageText — справка верхнего уровня: без аргументов, help, неизвестная
@@ -71,6 +72,11 @@ const usageText = `crawlerctl — CLI Domain Crawler
   dict train <файл> [--samples ПУТЬ]…
                                 обучение/переобучение словаря сжатия zstd
                                 по HTML-образцам (ТЗ 5.7)
+
+Команды разбора:
+  near [--zone ИМЯ] [--min-score F]
+                                 находки Laravel в серой зоне порога —
+                                 материал калибровки правил (T-115)
 
 Команды dev-окружения:
   seed [--incoming DIR] [--scenarios FILE] [--bulk N]

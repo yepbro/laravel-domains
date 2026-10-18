@@ -177,6 +177,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_stage_seconds` | histogram | `stage` | те же четыре | длительность той же задачи (корзины свои по этапу) |
 | `crawler_stage_errors_total` | counter | `stage`, `type` | http-worker (`timeout`/`redirects`/`tls`/`body`/`network` — классы ErrorClass, §8), render-worker (`task`/`context`/`browser` — классы render.Class) | каждая ошибочная проверка протокола / неподтверждённая доставка рендера |
 | `crawler_domain_status_total` | counter | `type` | dns-worker (`not_delegated`/`delegated_no_address`/`temp_error`/`invalid` — диагноз ядовитой строки, T-109), http-worker (`alive`/`no_http`/`temp_error`) | финальный статус домена терминальной ветки эпизода (ТЗ 6.2) |
+| `crawler_laravel_near_findings` | gauge | — | monitor (T-115) | находки Laravel в серой зоне порога `[min_score/2, min_score)` — материал калибровки правил |
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
@@ -471,6 +472,17 @@ T-109) и повторных проверок `temp_error`
   размера партиций (`docs/schema.md`). Прогресс зон наблюдается алертами
   monitor (T-080, цикл ниже); счётчики очередей/backlog/этапов конвейера
   собирают сами сервисы (таблица выше, T-077).
+
+Третий цикл того же сервиса — счётчик серой зоны Laravel-детекции
+(`internal/monitor/nearstats.go`, T-115): gauge
+`crawler_laravel_near_findings` — текущее число `laravel_findings` с
+`analyzer.laravel_min_score/2 ≤ score < min_score` («почти-срабатывания»:
+признаки есть, порог не пройден). Период — 1 ч (не 30–60 с пересчёта
+зон): проход — агрегат по большим партициям `laravel_findings`, а
+материал калибровки правил не требует минутной свежести; разбор тех же
+строк поимённо — `crawlerctl near`. Стабильная серая зона — норма
+(слабые признаки частых не-Laravel стеков), всплеск после смены правил —
+сигнал деградации точности (материал T-116/T-117).
 
 Второй цикл того же сервиса — оценка алертов минимального набора ТЗ 5.9
 (`internal/monitor/alerts.go`, T-080; ТЗ 8, ТЗ 10.3), период — тот же

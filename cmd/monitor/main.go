@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/config"
+	"crawler/internal/metrics"
 	"crawler/internal/monitor"
 	"crawler/internal/queue"
 	"crawler/internal/service"
@@ -44,14 +45,19 @@ func main() {
 	if listen == "" {
 		listen = service.EnvOr("METRICS_ADDR", ":9100")
 	}
+	// Реестр метрик (T-115): gauge серой зоны Laravel-находок
+	// (crawler_laravel_near_findings) регистрируется до старта OnRun,
+	// каркас отдаёт тот же реестр через /metrics (стиль cmd/analyzer).
+	reg := metrics.New("monitor")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "monitor",
 		Config:      cfg,
 		Logger:      logger,
 		MetricsAddr: listen,
+		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool) },
+		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}
@@ -62,7 +68,7 @@ func main() {
 // алерт остановки прогресса читает zones.updated_at, который пишет именно
 // фоновый цикл. Оба завершаются отменой ctx (graceful shutdown, ТЗ 3.4);
 // после своего цикла забираем результат фонового (стиль cmd/scheduler).
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) error {
+func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("monitor: пул БД не получен (postgres.dsn обязателен)")
 	}
@@ -85,10 +91,19 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	bg := make(chan error, 1)
+	// Фоновые циклы: пересчёт счётчиков зон (T-078) и gauge серой зоны
+	// Laravel-находок (T-115) — оба периодические проходы по БД,
+	// завершаются отменой ctx.
+	bg := make(chan error, 2)
 	go func() {
 		bg <- monitor.ZoneStatsLoop(ctx, pool, monitor.ZoneStatsOptions{
 			Interval: cfg.Monitor.ZoneStatsInterval.D(),
+			Log:      logger,
+		})
+	}()
+	go func() {
+		bg <- monitor.NearStatsLoop(ctx, pool, reg, monitor.NearStatsOptions{
+			MinScore: cfg.Analyzer.LaravelMinScore,
 			Log:      logger,
 		})
 	}()
@@ -115,13 +130,15 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		DiskFreePercent:   cfg.Content.DiskFreePercent,
 		Log:               logger,
 	})
-	// Свой цикл закончился — отменяем фоновый до ожидания результата
-	// (отмена идемпотентна и при уже остановленном цикле). Его сбой не
-	// прячем за nil алертов — забираем результат.
+	// Свой цикл закончился — отменяем фоновые до ожидания результатов
+	// (отмена идемпотентна и при уже остановленных циклах). Их сбой не
+	// прячем за nil алертов — забираем результаты.
 	cancel()
-	bgErr := <-bg
-	if err == nil {
-		err = bgErr
+	for i := 0; i < 2; i++ {
+		bgErr := <-bg
+		if err == nil {
+			err = bgErr
+		}
 	}
 	return err
 }

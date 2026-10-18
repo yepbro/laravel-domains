@@ -141,6 +141,8 @@ SELECT * FROM schema_migrations;   -- version, dirty = false
 - `crawler_queue_depth{queue}` — глубина очередей `q:*` (backlog групп потребления);
 - `crawler_backlog_domains{state}` — pending/queued по БД;
 - `crawler_domain_status_total{type}` — статусы доменов;
+- `crawler_laravel_near_findings` — находки Laravel в серой зоне порога
+  (материал калибровки правил, T-115);
 - `crawler_service_up{service}` — живость (включая полную смерть
   процесса).
 
@@ -207,6 +209,7 @@ make logs SERVICE=monitor | grep -i warn      # dev
 
 ```bash
 crawlerctl status                  # зоны, очереди, q:dead, ETA
+crawlerctl near                    # серая зона Laravel-детекции (T-115)
 # алерты и ошибки:
 journalctl -t crawler-monitor -p warning --since -1d   # бой
 systemctl --failed                 # юниты в failed (StartLimit)

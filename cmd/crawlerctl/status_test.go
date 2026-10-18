@@ -176,7 +176,7 @@ func (p *statusPool) zoneRows() pgx.Rows {
 }
 
 // statusRows — pgx.Rows с заготовленными строками (Scan позиционный,
-// типы int16/string/bool/int64/float64).
+// типы int16/string/bool/int64/float32/float64/[]byte).
 type statusRows struct {
 	rows [][]any
 	i    int
@@ -220,8 +220,12 @@ func (r *statusRows) Scan(dest ...any) error {
 			*dst = v.(bool)
 		case *int64:
 			*dst = v.(int64)
+		case *float32:
+			*dst = v.(float32)
 		case *float64:
 			*dst = v.(float64)
+		case *[]byte:
+			*dst = v.([]byte)
 		default:
 			return fmt.Errorf("statusRows: приёмник %T не поддерживается", d)
 		}
