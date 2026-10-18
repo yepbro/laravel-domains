@@ -18,7 +18,7 @@ redis:
   # задач q:http/q:render/q:analyze, 100 000 q:dead)
   maxlen: 0
   max_attempts: 3                   # доставок задачи до перевода в q:dead (ТЗ 4.2)
-  claim_min_idle: "5m"              # простой pending-записи до возврата клеймом XAUTOCLAIM
+  claim_min_idle: "10m"             # простой pending-записи до возврата клеймом XAUTOCLAIM (окно удержания воркера)
 
 ingest:
   dir: "/data/incoming"              # наблюдаемая папка: <зона>/add|delete/*.txt

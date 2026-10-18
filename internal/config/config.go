@@ -225,8 +225,10 @@ func Default() *Config {
 			// Пределы по стримам — из queue.DefaultStreamMaxLen (T-025).
 			MaxLen:      0,
 			MaxAttempts: 3, // ТЗ 4.2: по умолчанию 3
-			// С запасом над таймаутами этапов (ТЗ 5.5/5.6: секунды).
-			ClaimMinIdle: Duration(5 * time.Minute),
+			// Больше худшего окна удержания доставок живым воркером
+			// (рендер: 16 записей × 25 с при contexts = 1 ≈ 6,7 мин,
+			// см. queue.DefaultClaimMinIdle).
+			ClaimMinIdle: Duration(10 * time.Minute),
 		},
 		Ingest: Ingest{
 			Dir:           "/data/incoming",
