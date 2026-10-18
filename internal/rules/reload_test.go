@@ -133,6 +133,54 @@ func TestReloaderHandleSIGHUP(t *testing.T) {
 	}
 }
 
+// TestReloaderReloadClearsCompileCache — кэш компиляции не переживает
+// смену набора: паттерны ушедших правил (и кэшированные ошибки) не
+// накапливаются весь срок жизни процесса; неизменившийся набор кэш
+// не трогает.
+func TestReloaderReloadClearsCompileCache(t *testing.T) {
+	const probe = `CACHE-PROBE-V1-` // уникальный паттерн, кроме этого теста не встречается
+	dir := writeRules(t, `
+rules:
+  - id: r_html
+    target: html
+    regex: "`+probe+`"
+    weight: 0.3
+`)
+	r, err := NewReloader(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := compileCache.Load(probe); ok {
+		t.Fatalf("кэш загрязнён до теста: %s", probe)
+	}
+	r.Set().Evaluate(Page{HTML: []byte("x " + probe)}) // компиляция и кэширование
+	if _, ok := compileCache.Load(probe); !ok {
+		t.Fatal("паттерн не попал в кэш компиляции")
+	}
+
+	// Тот же набор (no-op по версии) — кэш не чистится.
+	if err := r.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := compileCache.Load(probe); !ok {
+		t.Fatal("no-op перезагрузка не должна чистить кэш")
+	}
+
+	rewriteRules(t, dir, `
+rules:
+  - id: r_html
+    target: html
+    regex: "OTHER"
+    weight: 0.4
+`)
+	if err := r.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := compileCache.Load(probe); ok {
+		t.Error("смена rules_version должна очищать кэш компиляции")
+	}
+}
+
 func TestReloaderReloadSameSetIsNoop(t *testing.T) {
 	dir := writeRules(t, reloadRules)
 	r, err := NewReloader(dir, nil)

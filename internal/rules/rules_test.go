@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -58,6 +59,9 @@ rules:
 	wantScore := ScoreFixed([]float64{0.25, 0.45, 0.15, 0.15})
 	if diff(res.Score, wantScore) > 1e-9 {
 		t.Errorf("score = %v, want %v", res.Score, wantScore)
+	}
+	if res.Partial {
+		t.Error("полный просмотр не должен помечаться Partial")
 	}
 	// пересечение [9.19, ∞) и (-∞, 9.x] = [9.19, 9.x]
 	if res.VerMin != "9.19" || res.VerMax != "9.x" {
@@ -116,6 +120,35 @@ rules:
 	}
 }
 
+// TestEvaluateMatchValueRules — контракт «match по значению cookie/
+// заголовка поддерживается» (движок matchRule + docs/analyzer.md
+// «Цели и режимы матчинга»): валидатор загрузчика не бракует такие
+// правила, набор грузится и срабатывает.
+func TestEvaluateMatchValueRules(t *testing.T) {
+	dir := writeRules(t, `
+rules:
+  - id: cookie_exact
+    target: cookie_value
+    match: "exact-value"
+    weight: 0.3
+  - id: header_exact
+    target: header_value
+    match: "PHP/8.2.8"
+    weight: 0.4
+`)
+	set, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("правила с match по значениям обязаны загружаться: %v", err)
+	}
+	res := set.Evaluate(Page{
+		Cookies: []Cookie{{Name: "c", Value: "exact-value"}},
+		Headers: map[string][]string{"X-Powered-By": {"PHP/8.2.8"}},
+	})
+	if len(res.Signals) != 2 {
+		t.Fatalf("сработало %d правил, want 2: %+v", len(res.Signals), res.Signals)
+	}
+}
+
 func TestLoadDirValidation(t *testing.T) {
 	valid := `
 rules:
@@ -127,6 +160,14 @@ rules:
     target: header_name
     regex: "^X-"
     weight: 0.2
+  - id: ok_match_value
+    target: cookie_value
+    match: "eyJpdiI6"
+    weight: 0.3
+  - id: ok_match_header_value
+    target: header_value
+    match: "PHP/8.2.8"
+    weight: 0.3
   - id: ok_ver_eq
     target: html
     regex: "MARKER"
@@ -197,20 +238,6 @@ rules:
     target: cookie_name
     weight: 0.5
 `},
-		{"cookie_value без regex", `
-rules:
-  - id: cv_match
-    target: cookie_value
-    match: "value"
-    weight: 0.5
-`},
-		{"header_value без regex", `
-rules:
-  - id: hv_match
-    target: header_value
-    match: "value"
-    weight: 0.5
-`},
 		{"html без regex", `
 rules:
   - id: html_match
@@ -230,6 +257,29 @@ rules:
   - id: bad_regex
     target: html
     regex: "["
+    weight: 0.5
+`},
+		{"regex длиннее MaxPatternBytes", "rules:\n  - id: long_regex\n    target: html\n    regex: \"" +
+			strings.Repeat("a", DefaultLimits().MaxPatternBytes+1) + "\"\n    weight: 0.5\n"},
+		{"regex матчит пустую строку (якорь)", `
+rules:
+  - id: empty_anchor
+    target: html
+    regex: "^"
+    weight: 0.5
+`},
+		{"regex матчит пустую строку (звёздочка)", `
+rules:
+  - id: empty_star
+    target: html
+    regex: "x*"
+    weight: 0.5
+`},
+		{"regex матчит пустую строку (пустая группа)", `
+rules:
+  - id: empty_group
+    target: html
+    regex: "(?:)"
     weight: 0.5
 `},
 		{"ver_min больше ver_max", `
@@ -305,6 +355,33 @@ func TestLoadDirErrors(t *testing.T) {
 		}
 		if _, err := LoadDir(dir); err != nil {
 			t.Errorf("файл из комментариев должен пропускаться: %v", err)
+		}
+	})
+	t.Run("многодокументный файл читается целиком", func(t *testing.T) {
+		// Второй документ (---) не должен теряться молча: правила
+		// обоих документов входят в набор, версия совпадает с разбиением
+		// по файлам.
+		multi := writeRules(t, partA+"---\n"+partB)
+		set, err := LoadDir(multi)
+		if err != nil {
+			t.Fatalf("многодокументный файл: %v", err)
+		}
+		if len(set.Rules) != 2 || set.Rules[0].ID != "a_cookie" || set.Rules[1].ID != "b_html" {
+			t.Fatalf("правила второго документа потеряны: %+v", set.Rules)
+		}
+		split := writeRulesFiles(t, map[string]string{"b.yaml": partB, "a.yaml": partA})
+		other, err := LoadDir(split)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if set.Version != other.Version {
+			t.Errorf("версия зависит от разбиения на документы: %d != %d", set.Version, other.Version)
+		}
+	})
+	t.Run("опечатка во втором документе — ошибка", func(t *testing.T) {
+		body := partA + "---\nrules:\n  - id: typo2\n    target: html\n    regex: x\n    wight: 0.5\n"
+		if _, err := LoadDir(writeRules(t, body)); err == nil {
+			t.Error("строгий разбор обязан охватывать все документы файла")
 		}
 	})
 }

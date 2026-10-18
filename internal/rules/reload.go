@@ -89,6 +89,11 @@ func (r *Reloader) Reload() error {
 	}
 	r.mu.Unlock()
 
+	// Кэш компиляции живёт вместе с набором: чистится по смене
+	// rules_version — записи паттернов ушедших правил (и осевшие
+	// ошибки компиляции битых редакций) не копятся процессом.
+	resetCompileCache()
+
 	r.logger.Info("набор правил перезагружен",
 		"rules_dir", r.dir, "rules", len(set.Rules),
 		"rules_version", set.Version, "prev_version", old.Version)

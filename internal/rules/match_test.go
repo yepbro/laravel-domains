@@ -159,6 +159,72 @@ func TestMatchRuleMeta(t *testing.T) {
 	if ok {
 		t.Error("meta + match не должен срабатывать")
 	}
+
+	// «>» внутри кавычек значения атрибута не обрывает тег (AN-08):
+	// regex по имени после значения с «>» срабатывает, свидетельство —
+	// весь тег целиком
+	quoted := Page{HTML: []byte(`<meta content="a>b" name="csrf-token">`)}
+	ev, ok = matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `csrf-token`}, quoted, DefaultLimits())
+	if !ok || ev != `<meta content="a>b" name="csrf-token">` {
+		t.Errorf("meta с «>» в кавычках: ok=%v ev=%q", ok, ev)
+	}
+	// одинарные кавычки — та же семантика
+	ev, ok = matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `csrf-token`},
+		Page{HTML: []byte(`<meta content='a>b' name='csrf-token'>`)}, DefaultLimits())
+	if !ok || ev != `<meta content='a>b' name='csrf-token'>` {
+		t.Errorf("meta с «>» в одинарных кавычках: ok=%v ev=%q", ok, ev)
+	}
+	// незакрытая кавычка — тег не выделяется вовсе (не обрыв по «>»)
+	if _, ok := matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `unterminated`},
+		Page{HTML: []byte(`<meta content="unterminated>`)}, DefaultLimits()); ok {
+		t.Error("незакрытая кавычка не должна давать усечённый meta-тег")
+	}
+}
+
+func TestMatchRuleEvidenceFromCappedInput(t *testing.T) {
+	lim := DefaultLimits()
+	longName := strings.Repeat("n", 100) // > evidenceNameBytes
+
+	// name-only: имя ужимается до 32 байт и внутри свидетельства
+	ev, ok := matchRule(bgCtx(), Rule{Target: TargetCookieName, Match: longName},
+		Page{Cookies: []Cookie{{Name: longName}}}, lim)
+	if !ok {
+		t.Fatal("точное совпадение по длинному имени")
+	}
+	if want := "cookie " + truncateUTF8(longName, evidenceNameBytes); ev != want {
+		t.Errorf("имя в свидетельстве не ужимается: %q, want %q", ev, want)
+	}
+	ev, ok = matchRule(bgCtx(), Rule{Target: TargetHeaderName, Match: longName},
+		Page{Headers: map[string][]string{longName: {"v"}}}, lim)
+	if !ok {
+		t.Fatal("точное совпадение по длинному имени заголовка")
+	}
+	if want := "header " + truncateUTF8(longName, evidenceNameBytes); ev != want {
+		t.Errorf("имя заголовка не ужимается: %q, want %q", ev, want)
+	}
+
+	// value: свидетельство строится из обрезанного MaxValueBytes значения
+	// (той же строкой, по которой шёл матчинг), а не из полного c.Value:
+	// значение длиннее лимита всё равно срабатывает по якорю в начале и
+	// даёт свидетельство в пределах окна обрезки.
+	huge := "eyJpdiI6" + strings.Repeat("z", lim.MaxValueBytes)
+	ev, ok = matchRule(bgCtx(), Rule{Target: TargetCookieValue, Regex: `^eyJpdiI6`},
+		Page{Cookies: []Cookie{{Name: "c", Value: huge}}}, lim)
+	if !ok {
+		t.Fatal("значение длиннее MaxValueBytes не сопоставлено по префиксу")
+	}
+	// окно обрезки: префикс формы + начало значения до лимита свидетельства
+	zCut := func(prefix string) string {
+		return prefix + strings.Repeat("z", lim.snippetCap()-len(prefix)) + "…"
+	}
+	if ev != zCut("cookie c=eyJpdiI6") {
+		t.Errorf("свидетельство значения: %q", ev)
+	}
+	if ev2, ok := matchRule(bgCtx(), Rule{Target: TargetHeaderValue, Regex: `^eyJpdiI6`},
+		Page{Headers: map[string][]string{"X-Long": {huge}}}, lim); !ok ||
+		ev2 != zCut("header X-Long: eyJpdiI6") {
+		t.Errorf("свидетельство значения заголовка: ok=%v %q", ok, ev2)
+	}
 }
 
 func TestMatchRuleSkipsBadRules(t *testing.T) {

@@ -13,6 +13,8 @@ import (
 
 // evidenceNameBytes — лимит имени cookie/заголовка внутри свидетельства:
 // чтобы враждебно длинное имя не вытеснило значение из окна обрезки.
+// Применяется ко всем evidence-формам с именем — name-only тоже
+// (docs/analyzer.md «Свидетельства»).
 const evidenceNameBytes = 32
 
 // evidence-форматы по целям (стабильный контракт, T-070+ пишет их в jsonb):
@@ -29,7 +31,7 @@ const evidenceNameBytes = 32
 // заголовков сортируются — обход map в Go недетерминирован, а результат
 // переанализа обязан быть воспроизводимым).
 func evidenceCookieName(name string) string {
-	return "cookie " + name
+	return "cookie " + capName(name)
 }
 
 func evidenceCookieValue(name, value string) string {
@@ -37,7 +39,7 @@ func evidenceCookieValue(name, value string) string {
 }
 
 func evidenceHeaderName(name string) string {
-	return "header " + name
+	return "header " + capName(name)
 }
 
 func evidenceHeaderValue(name, value string) string {

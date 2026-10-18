@@ -132,6 +132,8 @@ type ContentGetter interface {
 // SetSource — текущий снапшот набора правил (ТЗ 5.8: перезагрузка по
 // SIGHUP без перезапуска). Удовлетворяется *rules.Reloader (T-068);
 // каждая доставка берёт актуальный набор — подписка на смену не нужна.
+// nil-снапшот (у Reloader не бывает) — доставка пропускается с Warn,
+// строка остаётся без штампа и вернётся переанализом (T-074).
 type SetSource interface {
 	Set() *rules.Set
 }
@@ -287,11 +289,29 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// работает с иммутабельным Set; смена набора посреди страницы
 	// невозможна, следующая доставка возьмёт свежий.
 	set := w.sets.Set()
+	if set == nil {
+		// Симметрично ReanalyzeLoop: nil-снапшот альтернативного SetSource —
+		// пропуск, не паника. Доставка подтверждается: без штампа версии
+		// строка остаётся устаревшей, переанализ (T-074) к ней вернётся.
+		w.opt.log().Warn("набор правил не загружен — анализ пропущен, строка останется для переанализа",
+			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID)
+		return false, nil
+	}
 	res := set.EvaluateCtx(ctx, rules.Page{
 		HTML:    html,
 		Cookies: row.cookies,
 		Headers: row.headers,
 	}, rules.Limits{}) // нулевые Limits → DefaultLimits (T-069)
+	if res.Partial {
+		// Бюджет времени исчерпан (EvalTimeout) или ctx отменён — правила
+		// просмотрены не все: усечённый результат нельзя записывать и
+		// штамповать rules_version как полный. Доставка подтверждается:
+		// строка остаётся устаревшей, переанализ (T-074) вернётся к ней
+		// (практически недостижимо при RE2 на ограниченном входе).
+		w.opt.log().Warn("анализ прерван до полного просмотра правил — findings не записаны, строка останется для переанализа",
+			"domain", name, "signals", len(res.Signals), "rules_version", set.Version)
+		return false, nil
+	}
 	isLaravel := res.IsLaravel(w.opt.MinScore)
 
 	signals, err := marshalSignals(res.Signals)

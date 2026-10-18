@@ -155,12 +155,16 @@ rules:
 
 	// бюджет: r1 и r2 проходят по две проверки ctx (цикл EvaluateCtx +
 	// вход matchRule), на r3 — отмена; сработавшие до отмены сохранены
+	// и помечены Partial (полным итог считать нельзя, AN-09)
 	res := set.EvaluateCtx(&countingCtx{left: 4}, Page{HTML: []byte("MARK MARK MARK")}, lim)
 	if len(res.Signals) != 2 || res.Signals[1].Rule != "r2" {
 		t.Fatalf("ожидались r1,r2 до отмены, получено %+v", res.Signals)
 	}
 	if res.Score == 0 {
 		t.Error("score должен учитывать сработавшее до отмены")
+	}
+	if !res.Partial {
+		t.Error("прерванный просмотр обязан помечаться Partial")
 	}
 }
 
@@ -177,6 +181,9 @@ rules:
 	res := set.EvaluateCtx(ctx, Page{HTML: []byte("MARK")}, DefaultLimits())
 	if len(res.Signals) != 0 || res.Score != 0 {
 		t.Errorf("отменённый контекст: ожидался пустой результат, получено %+v", res)
+	}
+	if !res.Partial {
+		t.Error("отменённый контекст: результат неполон (Partial)")
 	}
 }
 
