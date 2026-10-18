@@ -588,6 +588,7 @@ func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string
 
 	var mu sync.Mutex
 	won := false
+	gaveUp := false // вызывающий ушёл по отмене: победитель больше не нужен
 	var winner net.Conn
 	failed := 0
 	var lastErr error
@@ -597,7 +598,7 @@ func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string
 		conn, err := f.dialLimited(stop, addrs[i], port)
 		mu.Lock()
 		defer mu.Unlock()
-		if won {
+		if won || gaveUp {
 			if conn != nil {
 				_ = conn.Close() // гонка проиграна уже после успеха
 			}
@@ -644,6 +645,18 @@ func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string
 				}
 			}
 		case <-ctx.Done():
+			// Отмена может выиграть select уже после победы попытки:
+			// установленное соединение (со слотами лимитов limitConn)
+			// обязано освобождаться здесь, а не утекать с проигравшим
+			// выходом. Опоздавшие попытки видит флаг gaveUp.
+			mu.Lock()
+			gaveUp = true
+			conn := winner
+			winner = nil
+			mu.Unlock()
+			if conn != nil {
+				_ = conn.Close()
+			}
 			return nil, ctx.Err()
 		}
 	}

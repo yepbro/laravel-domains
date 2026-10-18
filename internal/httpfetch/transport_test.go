@@ -211,6 +211,71 @@ func TestDialAddrsConnectTimeout(t *testing.T) {
 	}
 }
 
+// TestDialAddrsCancelAfterWinner: отмена ctx в момент победы попытки —
+// select может взять ветку отмены уже после того, как попытка положила
+// соединение в winner. Проигравший выход обязан закрыть это соединение
+// (вместе со слотами лимитов limitConn), а не утекать: слоты глобального
+// семафора GC не собирает, накопившись, они останавливают транспорт.
+func TestDialAddrsCancelAfterWinner(t *testing.T) {
+	var mu sync.Mutex
+	created, closed := 0, 0
+	newConn := func() net.Conn {
+		c1, _ := net.Pipe()
+		mu.Lock()
+		created++
+		mu.Unlock()
+		return &closeCountingConn{Conn: c1, onClose: func() {
+			mu.Lock()
+			closed++
+			mu.Unlock()
+		}}
+	}
+	f, _ := newTestFetcher(t, Options{
+		ConnectTimeout: 2 * time.Second,
+		FallbackDelay:  time.Hour, // второй адрес не стартует — в гонке одна попытка
+	}, func(ctx context.Context, addr netip.Addr, port string) (net.Conn, error) {
+		<-ctx.Done() // «победа» прибывает вместе с отменой — окно утечки
+		return newConn(), nil
+	})
+
+	addrs := []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")}
+	cancelled := 0
+	for i := 0; i < 64; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Millisecond, cancel)
+		conn, err := f.dialAddrs(ctx, addrs, "80")
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				cancel()
+				t.Fatalf("ожидалась ошибка отмены, получено: %v", err)
+			}
+			cancelled++
+			continue
+		}
+		_ = conn.Close() // победитель отдан вызывающему — закрывает он
+		cancel()
+	}
+	if cancelled == 0 {
+		t.Fatal("гонка не выполнилась: ни одного выхода по отмене")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if closed != created {
+		t.Errorf("закрыто %d из %d соединений — утечка победителя по отмене ctx", closed, created)
+	}
+}
+
+// closeCountingConn — соединение с подсчётом Close (утечки по отмене).
+type closeCountingConn struct {
+	net.Conn
+	onClose func()
+}
+
+func (c *closeCountingConn) Close() error {
+	c.onClose()
+	return c.Conn.Close()
+}
+
 // TestDialAddrsEmptyAndSingle — границы списка адресов.
 func TestDialAddrsEmptyAndSingle(t *testing.T) {
 	f := NewFetcher(Options{})
