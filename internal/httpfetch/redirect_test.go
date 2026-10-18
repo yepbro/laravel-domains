@@ -692,6 +692,67 @@ func TestFetchChainMetaRefreshSelfURL(t *testing.T) {
 	}
 }
 
+// TestFetchChainMetaRefreshUnfollowableURLKeepsBody: мета-скан нашёл url,
+// по которому нельзя идти (чужая схема — redirectResolve даёт false), —
+// ответ остаётся итоговым, и прочитанный сканом префикс тела обязан
+// вернуться потребителю: контент/хэш не должны видеть «дыру» или пустоту
+// на месте первых килобайт страницы.
+func TestFetchChainMetaRefreshUnfollowableURLKeepsBody(t *testing.T) {
+	want := fmt.Sprintf(
+		`<html><head><meta http-equiv="refresh" content="0; url=ftp://elsewhere.example/"></head><body>%s</body></html>`,
+		strings.Repeat("page-body ", 8<<10)) // ~80 КиБ: заведомо больше чанков скана
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprint(w, want)
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(Options{Resolver: redirectResolverFail})
+	got, err := FetchChain(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "meta-unfollow.example.net", "/page"), Addrs: loopbackAddr()})
+	if err != nil {
+		t.Fatalf("FetchChain: %v", err)
+	}
+	if body := redirectReadBody(t, got); body != want {
+		t.Errorf("итоговое тело: %d байт, ожидалось %d (префикс мета-скана потерян)", len(body), len(want))
+	}
+	if len(got.Chain) != 1 {
+		t.Errorf("цепочка: %+v, ожидался 1 шаг (перехода нет)", got.Chain)
+	}
+}
+
+// TestFetchChainMetaRefreshZeroLimitKeepsBody: валидный meta refresh при
+// MaxRedirects 0 — «не следовать» (T-006): итог — первый ответ, и его
+// тело возвращается целиком, хотя скан уже прочёл начало.
+func TestFetchChainMetaRefreshZeroLimitKeepsBody(t *testing.T) {
+	want := `<html><head><meta http-equiv="refresh" content="0; url=/after"></head><body>ZERO-STAY</body></html>`
+	var lands atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/after" {
+			lands.Add(1)
+			_, _ = fmt.Fprint(w, "AFTER")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprint(w, want)
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(Options{Resolver: redirectResolverFail})
+	got, err := FetchChainOpts(context.Background(), f, FetchRequest{
+		URL: redirectReqURL(srv.URL, "meta-zero.example.net", "/page"), Addrs: loopbackAddr(),
+	}, ChainOptions{MaxRedirects: 0})
+	if err != nil {
+		t.Fatalf("FetchChainOpts: %v", err)
+	}
+	if body := redirectReadBody(t, got); body != want {
+		t.Errorf("итоговое тело: %q, ожидалось исходное (%d байт)", body, len(want))
+	}
+	if n := lands.Load(); n != 0 {
+		t.Errorf("MaxRedirects 0: выполнено переходов %d", n)
+	}
+}
+
 // --- хосты переходов ----------------------------------------------------------
 
 // TestFetchChainUnicodeHostInLocation: unicode-хост в Location приводится

@@ -283,6 +283,14 @@ func redirectScanMeta(res *FetchResult) (string, bool) {
 			var stop bool
 			pos, raw, stop = redirectScanBuffer(buf.Bytes(), pos)
 			if raw != "" {
+				// Переход найден, но может не состояться: url чужой
+				// схемы (redirectResolve вернёт false) или режим
+				// «не следовать» у вызывающего. Прочитанный сканом
+				// префикс возвращается потребителю обёрткой — итог
+				// без перехода не теряет байтов и в этом пути.
+				if buf.Len() > 0 {
+					res.Body = &redirectBody{prefix: bytes.NewReader(buf.Bytes()), rc: res.Body}
+				}
 				return raw, true // переход: тело закроет вызывающий
 			}
 			if stop {
