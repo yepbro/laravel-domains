@@ -3,7 +3,7 @@
 // crawlerctl status (T-079, ТЗ 5.9): сводка по зонам, очередям, скорости
 // и ожидаемому времени завершения первого цикла проверок. Источники —
 // PostgreSQL (счётчики zones + агрегаты domains + окна темпа) и Redis
-// (длины стримов, XLEN); всё читается разово, без состояния.
+// (глубина стримов — backlog групп потребления); всё читается разово, без состояния.
 //
 // Что измеримо из БД (решения зафиксированы, остальное — честно не
 // показывается, ТЗ 5.9 «скорость… ожидаемое время завершения цикла»):
@@ -170,7 +170,7 @@ func fetchThroughput(ctx context.Context, pool db.DB) (throughput, error) {
 
 // ---------------------------------------------------------------- очереди
 
-// streamLener — длины стримов (XLEN); *queue.BackpressureGate (T-026)
+// streamLener — глубина стримов; *queue.BackpressureGate (T-026)
 // удовлетворяет интерфейсу. Отдельный интерфейс, а не go-redis напрямую:
 // тесты подменяют фейком, транспорт заменяем (ТЗ 4.2).
 type streamLener interface {
@@ -182,7 +182,7 @@ var statusStreams = []string{
 	queue.StreamDNS, queue.StreamHTTP, queue.StreamRender, queue.StreamAnalyze, queue.StreamDead,
 }
 
-// fetchQueueLens собирает длины очередей (XLEN). Ошибка любого стрима
+// fetchQueueLens собирает глубину очередей. Ошибка любого стрима
 // останавливает сбор: Redis один, повторные обращения к недоступному
 // серверу бессмысленны.
 func fetchQueueLens(ctx context.Context, lenner streamLener) (map[string]int64, error) {
@@ -353,7 +353,7 @@ func writeStatusTable(w io.Writer, zones []zoneStats, tot statusTotals, thr thro
 		out(w, "%s\n", b.String())
 	}
 
-	out(w, "\nочереди (XLEN): ")
+	out(w, "\nочереди (глубина): ")
 	if lens == nil {
 		out(w, "н/д (Redis недоступен)\n")
 	} else {
@@ -498,7 +498,7 @@ func cmdStatus(args []string, stdout, stderr io.Writer) error {
 	tot := computeTotals(zones)
 	rates := computeRates(thr, tot.Pending, tot.Queued)
 
-	// Длины очередей — XLEN через гейт backpressure (T-026): узкий API
+	// Глубина очередей — через гейт backpressure (T-026): узкий API
 	// Len над go-redis; порог гейта здесь не участвует. Недоступный Redis
 	// не прячет сводку по БД: печатаем с «н/д», завершаемся кодом 1.
 	rdb := queue.NewClient(cfg.Redis.Addr)

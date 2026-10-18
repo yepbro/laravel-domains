@@ -125,7 +125,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}()
 
 	// Длина потребляемого стрима q:analyze → crawler_queue_depth (T-077):
-	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
 	go func() {
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamAnalyze}, metrics.DefaultQueueCollectInterval, logger)

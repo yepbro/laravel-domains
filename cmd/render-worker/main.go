@@ -130,7 +130,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
 
 	// Длина потребляемого стрима q:render → crawler_queue_depth (T-077):
-	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
 	go func() {
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamRender}, metrics.DefaultQueueCollectInterval, logger)

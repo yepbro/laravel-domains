@@ -137,7 +137,7 @@ SELECT * FROM schema_migrations;   -- version, dirty = false
 
 - `crawler_stage_tasks_total{stage}` / `crawler_stage_seconds` —
   пропускная способность этапов dns/http/render/analyze;
-- `crawler_queue_depth{queue}` — длины стримов `q:*`;
+- `crawler_queue_depth{queue}` — глубина очередей `q:*` (backlog групп потребления);
 - `crawler_backlog_domains{state}` — pending/queued по БД;
 - `crawler_domain_status_total{type}` — статусы доменов;
 - `crawler_service_up{service}` — живость (включая полную смерть

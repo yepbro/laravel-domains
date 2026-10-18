@@ -159,7 +159,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	rawQ := queue.NewRedisQueue(rdb, queue.RedisOptions{})
 	q := queue.NewWatermarkPublisher(rawQ, gate)
 
-	// Очередь рендера: неблокирующая проверка ёмкости (XLEN через гейт
+	// Очередь рендера: неблокирующая проверка ёмкости (глубина через гейт
 	// T-026, общий порог scheduler.queue_high_watermark) + публикация
 	// без ожидания ёмкости.
 	renderQ, err := httpworker.NewRenderQueue(rawQ, gate, int64(cfg.Scheduler.QueueHighWatermark), logger)
@@ -168,7 +168,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}
 
 	// Длина потребляемого стрима q:http → crawler_queue_depth (T-077):
-	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
 	go func() {
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamHTTP}, metrics.DefaultQueueCollectInterval, logger)

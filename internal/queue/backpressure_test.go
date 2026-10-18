@@ -1,9 +1,11 @@
 // Тесты backpressure-гейта (T-026) без живого Redis (стиль redisq_test.go):
-// фейк расширяет fakeRedis командой XLEN — то же узкое окно redisLen, что
-// и у *redis.Client. Проверяются маппинг XLEN, границы порога (ниже/
-// ровно/выше), ожидание с повтором через интервал, пачечная публикация
-// с проверкой перед каждым сообщением, отмена ctx, ошибки XLEN,
-// q:dead и отключённый гейт. Реальная семантика XLEN — интеграционные
+// фейк расширяет fakeRedis окном глубины redisDepth — XINFO GROUPS (lag и
+// pending групп) и XLEN (запас «групп нет»). Проверяются суммирование
+// глубины (lag + pending, неопределённый lag, отсутствие групп → XLEN),
+// границы порога (ниже/ровно/выше), ограничение порога половиной MAXLEN
+// стрима, ожидание с повтором через интервал, пачечная публикация с
+// проверкой перед каждым сообщением, отмена ctx, ошибки чтения, q:dead и
+// отключённый гейт. Реальная семантика XINFO GROUPS — интеграционные
 // тесты T-032.
 
 package queue
@@ -22,29 +24,42 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// fakeBackpressure — fakeRedis (redisq_test.go) плюс XLEN: vals — длины
-// стрима по очереди (последняя повторяется — «стрим полон»), log —
-// порядок обращений к Redis (xlen до xadd — сам предмет проверки).
+// fakeBackpressure — fakeRedis (redisq_test.go) плюс окно глубины:
+// seq — ответы XINFO GROUPS по очереди проверок (последний повторяется;
+// nil-элемент — групп нет: глубина читается XLEN, поле xlen), log —
+// порядок обращений к Redis (глубина до xadd — сам предмет проверки).
 type fakeBackpressure struct {
 	*fakeRedis
-	vals    []int64
-	xlenErr error
+	seq       [][]redis.XInfoGroup
+	groupsErr error
+	xlen      int64
+	xlenErr   error
 
-	lens []string // ключи XLEN
-	log  []string // порядок команд: "xlen:<стрим>" / "xadd:<стрим>"
+	infos []string // ключи XINFO GROUPS
+	xlens []string // ключи XLEN
+	log   []string // порядок команд: "xinfo:<стрим>" / "xlen:<стрим>" / "xadd:<стрим>"
+}
+
+func (f *fakeBackpressure) XInfoGroups(ctx context.Context, key string) *redis.XInfoGroupsCmd {
+	f.infos = append(f.infos, key)
+	f.log = append(f.log, "xinfo:"+key)
+	groups := []redis.XInfoGroup{}
+	if len(f.seq) > 0 {
+		groups = f.seq[0]
+		if len(f.seq) > 1 {
+			f.seq = f.seq[1:]
+		}
+	}
+	cmd := redis.NewXInfoGroupsCmd(ctx, key)
+	cmd.SetVal(groups)
+	cmd.SetErr(f.groupsErr)
+	return cmd
 }
 
 func (f *fakeBackpressure) XLen(ctx context.Context, key string) *redis.IntCmd {
-	f.lens = append(f.lens, key)
+	f.xlens = append(f.xlens, key)
 	f.log = append(f.log, "xlen:"+key)
-	var v int64
-	if len(f.vals) > 0 {
-		v = f.vals[0]
-		if len(f.vals) > 1 {
-			f.vals = f.vals[1:]
-		}
-	}
-	return redis.NewIntResult(v, f.xlenErr)
+	return redis.NewIntResult(f.xlen, f.xlenErr)
 }
 
 func (f *fakeBackpressure) XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd {
@@ -53,18 +68,24 @@ func (f *fakeBackpressure) XAdd(ctx context.Context, a *redis.XAddArgs) *redis.S
 }
 
 // Компиляционные проверки: фейк взаимозаменяем с реальным клиентом
-// в окне XLEN и в окне очереди, обёртка — полноценная Queue.
+// в окне глубины и в окне очереди, обёртка — полноценная Queue.
 var (
-	_ redisLen     = (*redis.Client)(nil)
-	_ redisLen     = (*fakeBackpressure)(nil)
+	_ redisDepth   = (*redis.Client)(nil)
+	_ redisDepth   = (*fakeBackpressure)(nil)
 	_ redisStreams = (*fakeBackpressure)(nil)
 	_ Queue        = (*WatermarkPublisher)(nil)
 )
 
+// grp — ответ XINFO GROUPS с одной группой (lag, pending).
+func grp(lag, pending int64) []redis.XInfoGroup {
+	return []redis.XInfoGroup{{Name: "g", Lag: lag, Pending: pending}}
+}
+
 // newFakeBackpressure — фейк с инициализированной очередью и
-// заготовленными длинами стрима.
-func newFakeBackpressure(vals ...int64) *fakeBackpressure {
-	return &fakeBackpressure{fakeRedis: &fakeRedis{}, vals: vals}
+// заготовленной последовательностью ответов глубины (последний
+// повторяется; nil — групп нет).
+func newFakeBackpressure(seq ...[]redis.XInfoGroup) *fakeBackpressure {
+	return &fakeBackpressure{fakeRedis: &fakeRedis{}, seq: seq}
 }
 
 // newTestGate — гейт над фейком: порог watermark, интервал повтора 1 мс.
@@ -73,7 +94,7 @@ func newTestGate(f *fakeBackpressure, watermark int64) *BackpressureGate {
 }
 
 // newTestPublisher — обёртка RedisQueue над тем же фейком: гейт с порогом
-// 100 против длин из f.vals.
+// 100 против глубин из f.seq.
 func newTestPublisher(f *fakeBackpressure) *WatermarkPublisher {
 	return NewWatermarkPublisher(NewRedisQueue(f, RedisOptions{}), newTestGate(f, 100))
 }
@@ -84,18 +105,44 @@ func dnsBatch() DNSBatch {
 }
 
 func TestBackpressureLen(t *testing.T) {
-	fake := newFakeBackpressure(42)
+	// Глубина группы — lag плюс неподтверждённые; групп несколько —
+	// суммируются (у рабочих стримов группа одна, обобщённо — все).
+	fake := newFakeBackpressure(
+		[]redis.XInfoGroup{{Name: "a", Lag: 30, Pending: 12}, {Name: "b", Lag: 7, Pending: 3}},
+	)
 	gate := NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 
 	n, err := gate.Len(context.Background(), StreamHTTP)
 	if err != nil {
 		t.Fatalf("Len: %v", err)
 	}
-	if n != 42 {
-		t.Errorf("Len = %d, хочу 42 (значение XLEN)", n)
+	if n != 52 {
+		t.Errorf("Len = %d, хочу 52 (lag 30+7 + pending 12+3)", n)
 	}
-	if want := []string{StreamHTTP}; !reflect.DeepEqual(fake.lens, want) {
-		t.Errorf("XLEN ключи: %v, хочу %v", fake.lens, want)
+	if want := []string{StreamHTTP}; !reflect.DeepEqual(fake.infos, want) {
+		t.Errorf("XINFO GROUPS ключи: %v, хочу %v", fake.infos, want)
+	}
+	if len(fake.xlens) != 0 {
+		t.Errorf("XLEN не нужен при живых группах: %v", fake.xlens)
+	}
+
+	// lag неопределён (−1: обрезка срезала недоставленное) — считается
+	// только pending.
+	fake = newFakeBackpressure(grp(-1, 8))
+	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
+	if n, err := gate.Len(context.Background(), StreamHTTP); err != nil || n != 8 {
+		t.Errorf("Len при неопределённом lag: (%d, %v), хочу (8, nil)", n, err)
+	}
+
+	// Групп нет — ни одна запись не доставлена: глубина равна XLEN.
+	fake = newFakeBackpressure(nil)
+	fake.xlen = 34
+	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
+	if n, err := gate.Len(context.Background(), StreamHTTP); err != nil || n != 34 {
+		t.Errorf("Len без групп: (%d, %v), хочу XLEN (34, nil)", n, err)
+	}
+	if want := []string{StreamHTTP}; !reflect.DeepEqual(fake.xlens, want) {
+		t.Errorf("XLEN ключи: %v, хочу %v", fake.xlens, want)
 	}
 
 	if _, err := gate.Len(context.Background(), "q:typo"); err == nil ||
@@ -110,49 +157,91 @@ func TestBackpressureLen(t *testing.T) {
 	}
 }
 
+// TestBackpressureWatermarkCappedByMaxLen — эффективный порог стрима не
+// выше половины его предела MAXLEN: гейт обязан срабатывать до обрезки.
+// Для q:dns настроенные 100 000 записей недостижимы (MAXLEN 10 000) —
+// порог ограничивается 5 000, гейт становится рабочим.
+func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
+	// q:dns: MAXLEN по политике 10 000 → порог 5 000.
+	fake := newFakeBackpressure(grp(4999, 0))
+	gate := newTestGate(fake, 100000)
+	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
+		t.Fatalf("AwaitCapacity ниже ограниченного порога: %v", err)
+	}
+
+	fake = newFakeBackpressure(grp(5000, 0), grp(4999, 0))
+	gate = newTestGate(fake, 100000)
+	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
+		t.Fatalf("AwaitCapacity q:dns: %v", err)
+	}
+	if len(fake.infos) != 2 {
+		t.Errorf("проверок %d, хочу 2 (5 000 ≥ порог 5 000 — гейт закрыт): %v", len(fake.infos), fake.infos)
+	}
+
+	// Штучный стрим: MAXLEN 1 000 000, половина выше порога — порог
+	// не ограничивается (100 000).
+	fake = newFakeBackpressure(grp(99999, 0))
+	gate = newTestGate(fake, 100000)
+	if err := gate.AwaitCapacity(context.Background(), StreamHTTP); err != nil {
+		t.Fatalf("AwaitCapacity ниже порога 100 000: %v", err)
+	}
+
+	// Явный предел из опций (redis.maxlen, Q-03) ограничивает и его.
+	fake = newFakeBackpressure(grp(2000, 0), grp(1999, 0))
+	gate = NewBackpressureGate(fake, BackpressureOptions{
+		Watermark: 100000, MaxLen: 4000, Interval: time.Millisecond,
+	})
+	if err := gate.AwaitCapacity(context.Background(), StreamHTTP); err != nil {
+		t.Fatalf("AwaitCapacity с явным MaxLen: %v", err)
+	}
+	if len(fake.infos) != 2 {
+		t.Errorf("проверок %d, хочу 2 (порог ограничен 2 000): %v", len(fake.infos), fake.infos)
+	}
+}
+
 func TestBackpressureGateBelowWatermark(t *testing.T) {
-	fake := newFakeBackpressure(99)
+	fake := newFakeBackpressure(grp(99, 0))
 	gate := newTestGate(fake, 100)
 
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
 		t.Fatalf("AwaitCapacity ниже порога: %v", err)
 	}
-	if want := []string{StreamDNS}; !reflect.DeepEqual(fake.lens, want) {
-		t.Errorf("XLEN: %d вызовов (%v), хочу 1 — ниже порога проходит сразу", len(fake.lens), fake.lens)
+	if want := []string{StreamDNS}; !reflect.DeepEqual(fake.infos, want) {
+		t.Errorf("XINFO GROUPS: %d вызовов (%v), хочу 1 — ниже порога проходит сразу", len(fake.infos), fake.infos)
 	}
 }
 
 func TestBackpressureGateAtWatermark(t *testing.T) {
-	// len == watermark — «строго ниже порога» не выполнено: гейт закрыт,
-	// публикация ждёт, пока длина не опустится (99 < 100).
-	fake := newFakeBackpressure(100, 100, 99)
+	// depth == watermark — «строго ниже порога» не выполнено: гейт закрыт,
+	// публикация ждёт, пока глубина не опустится (99 < 100).
+	fake := newFakeBackpressure(grp(100, 0), grp(100, 0), grp(99, 0))
 	gate := newTestGate(fake, 100)
 
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
 		t.Fatalf("AwaitCapacity на пороге: %v", err)
 	}
-	if len(fake.lens) != 3 {
-		t.Errorf("XLEN вызовов %d, хочу 3 (два отказа, третий ниже порога): %v", len(fake.lens), fake.lens)
+	if len(fake.infos) != 3 {
+		t.Errorf("проверок %d, хочу 3 (два отказа, третья ниже порога): %v", len(fake.infos), fake.infos)
 	}
 }
 
 func TestBackpressureGateAboveWatermark(t *testing.T) {
-	fake := newFakeBackpressure(150, 7)
+	fake := newFakeBackpressure(grp(150, 0), grp(7, 0))
 	gate := newTestGate(fake, 100)
 
 	if err := gate.AwaitCapacity(context.Background(), StreamRender); err != nil {
 		t.Fatalf("AwaitCapacity выше порога: %v", err)
 	}
-	if len(fake.lens) != 2 {
-		t.Errorf("XLEN вызовов %d, хочу 2 (ожидание и повтор): %v", len(fake.lens), fake.lens)
+	if len(fake.infos) != 2 {
+		t.Errorf("проверок %d, хочу 2 (ожидание и повтор): %v", len(fake.infos), fake.infos)
 	}
 }
 
 func TestBackpressureGateRetriesOverInterval(t *testing.T) {
-	// Гейт закрыт (5 ≥ 1 всё время): повторные XLEN идут с интервалом;
+	// Гейт закрыт (5 ≥ 1 всё время): повторные проверки идут с интервалом;
 	// ctx истекает в ожидании — ошибка контекста. За 100 мс при интервале
 	// 40 мс обязано случиться не меньше двух проверок.
-	fake := newFakeBackpressure(5)
+	fake := newFakeBackpressure(grp(5, 0))
 	gate := NewBackpressureGate(fake, BackpressureOptions{Watermark: 1, Interval: 40 * time.Millisecond})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -168,15 +257,15 @@ func TestBackpressureGateRetriesOverInterval(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
 		t.Errorf("вышел раньше двух интервалов ожидания: %s", elapsed)
 	}
-	if len(fake.lens) < 2 {
-		t.Errorf("XLEN вызовов %d, хочу ≥ 2 (повторы через интервал): %v", len(fake.lens), fake.lens)
+	if len(fake.infos) < 2 {
+		t.Errorf("проверок %d, хочу ≥ 2 (повторы через интервал): %v", len(fake.infos), fake.infos)
 	}
 }
 
 func TestBackpressureGateCanceledContext(t *testing.T) {
 	// Отмена до вызова: первая проверка, затем выход по ctx без ожидания
 	// интервала (чистый выход, ТЗ 3.4).
-	fake := newFakeBackpressure(100)
+	fake := newFakeBackpressure(grp(100, 0))
 	gate := NewBackpressureGate(fake, BackpressureOptions{Watermark: 10, Interval: time.Minute})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -185,58 +274,58 @@ func TestBackpressureGateCanceledContext(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("ошибка: %v, хочу context.Canceled", err)
 	}
-	if len(fake.lens) != 1 {
-		t.Errorf("XLEN вызовов %d, хочу 1", len(fake.lens))
+	if len(fake.infos) != 1 {
+		t.Errorf("проверок %d, хочу 1", len(fake.infos))
 	}
 }
 
-func TestBackpressureGateXLenError(t *testing.T) {
+func TestBackpressureGateDepthError(t *testing.T) {
 	fake := &fakeBackpressure{
 		fakeRedis: &fakeRedis{},
-		xlenErr:   errors.New("ERR connection refused"),
+		groupsErr: errors.New("ERR connection refused"),
 	}
 	gate := newTestGate(fake, 10)
 
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err == nil ||
-		!strings.Contains(err.Error(), "длина") {
-		t.Errorf("ошибка XLEN не возвращена: %v", err)
+		!strings.Contains(err.Error(), "глубина") {
+		t.Errorf("ошибка чтения глубины не возвращена: %v", err)
 	}
-	if len(fake.lens) != 1 {
-		t.Errorf("XLEN вызовов %d, хочу 1 — ошибку гейт не ретраит", len(fake.lens))
+	if len(fake.infos) != 1 {
+		t.Errorf("проверок %d, хочу 1 — ошибку гейт не ретраит", len(fake.infos))
 	}
 }
 
 func TestBackpressureGateUngated(t *testing.T) {
 	// Отключённый гейт, q:dead и чужой стрим — без обращения к Redis.
-	fake := newFakeBackpressure(1000)
+	fake := newFakeBackpressure(grp(1000, 0))
 	disabled := NewBackpressureGate(fake, BackpressureOptions{Watermark: 0})
 	if err := disabled.AwaitCapacity(context.Background(), StreamDNS); err != nil {
 		t.Errorf("отключённый гейт: %v", err)
 	}
-	if len(fake.lens) != 0 {
-		t.Errorf("отключённый гейт полез в Redis: %v", fake.lens)
+	if len(fake.infos)+len(fake.xlens) != 0 {
+		t.Errorf("отключённый гейт полез в Redis: %v %v", fake.infos, fake.xlens)
 	}
 
 	gate := newTestGate(fake, 10)
 	if err := gate.AwaitCapacity(context.Background(), StreamDead); err != nil {
 		t.Errorf("q:dead: %v", err)
 	}
-	if len(fake.lens) != 0 {
-		t.Errorf("q:dead не должен гейтироваться: %v", fake.lens)
+	if len(fake.infos)+len(fake.xlens) != 0 {
+		t.Errorf("q:dead не должен гейтироваться: %v %v", fake.infos, fake.xlens)
 	}
 
 	if err := gate.AwaitCapacity(context.Background(), "q:typo"); err == nil ||
 		!strings.Contains(err.Error(), "неизвестный стрим") {
 		t.Errorf("чужой стрим: %v", err)
 	}
-	if len(fake.lens) != 0 {
-		t.Errorf("чужой стрим не должен проверяться: %v", fake.lens)
+	if len(fake.infos)+len(fake.xlens) != 0 {
+		t.Errorf("чужой стрим не должен проверяться: %v %v", fake.infos, fake.xlens)
 	}
 }
 
 func TestBackpressureGateLogsWait(t *testing.T) {
 	var buf bytes.Buffer
-	fake := newFakeBackpressure(100, 50)
+	fake := newFakeBackpressure(grp(100, 0), grp(50, 0))
 	gate := NewBackpressureGate(fake, BackpressureOptions{
 		Watermark: 100,
 		Interval:  time.Millisecond,
@@ -256,7 +345,7 @@ func TestBackpressureGateLogsWait(t *testing.T) {
 }
 
 func TestWatermarkPublisherPublish(t *testing.T) {
-	fake := newFakeBackpressure(99)
+	fake := newFakeBackpressure(grp(99, 0))
 	fake.addID = "1718-0"
 	pub := newTestPublisher(fake)
 
@@ -267,7 +356,7 @@ func TestWatermarkPublisherPublish(t *testing.T) {
 	if id != "1718-0" {
 		t.Errorf("Publish вернул %q, хочу %q", id, fake.addID)
 	}
-	want := []string{"xlen:" + StreamDNS, "xadd:" + StreamDNS}
+	want := []string{"xinfo:" + StreamDNS, "xadd:" + StreamDNS}
 	if !reflect.DeepEqual(fake.log, want) {
 		t.Errorf("порядок команд: %v, хочу %v (ёмкость — затем публикация)", fake.log, want)
 	}
@@ -277,14 +366,14 @@ func TestWatermarkPublisherPublish(t *testing.T) {
 }
 
 func TestWatermarkPublisherWaitsThenPublishes(t *testing.T) {
-	fake := newFakeBackpressure(100, 3)
+	fake := newFakeBackpressure(grp(100, 0), grp(3, 0))
 	fake.addID = "1719-0"
 	pub := newTestPublisher(fake)
 
 	if _, err := pub.Publish(context.Background(), StreamDNS, dnsBatch()); err != nil {
 		t.Fatalf("Publish после ожидания: %v", err)
 	}
-	want := []string{"xlen:" + StreamDNS, "xlen:" + StreamDNS, "xadd:" + StreamDNS}
+	want := []string{"xinfo:" + StreamDNS, "xinfo:" + StreamDNS, "xadd:" + StreamDNS}
 	if !reflect.DeepEqual(fake.log, want) {
 		t.Errorf("порядок команд: %v, хочу %v (публикация только после ёмкости)", fake.log, want)
 	}
@@ -295,7 +384,7 @@ func TestWatermarkPublisherChecksBeforeEveryBatch(t *testing.T) {
 	// пачка, ТЗ 4.2) своя проверка ёмкости — «публикует новые задачи
 	// только если длина очереди ниже порога» (ТЗ 5.3), а не один раз
 	// перед серией.
-	fake := newFakeBackpressure(7) // последняя повторяется
+	fake := newFakeBackpressure(grp(7, 0)) // последний ответ повторяется
 	fake.addID = "1720-0"
 	pub := newTestPublisher(fake)
 
@@ -304,7 +393,7 @@ func TestWatermarkPublisherChecksBeforeEveryBatch(t *testing.T) {
 		if _, err := pub.Publish(context.Background(), StreamDNS, dnsBatch()); err != nil {
 			t.Fatalf("Publish пачки №%d: %v", i+1, err)
 		}
-		want = append(want, "xlen:"+StreamDNS, "xadd:"+StreamDNS)
+		want = append(want, "xinfo:"+StreamDNS, "xadd:"+StreamDNS)
 	}
 	if !reflect.DeepEqual(fake.log, want) {
 		t.Errorf("порядок команд:\n получил  %v\n хочу     %v", fake.log, want)
@@ -315,7 +404,7 @@ func TestWatermarkPublisherChecksBeforeEveryBatch(t *testing.T) {
 }
 
 func TestWatermarkPublisherDeadNotGated(t *testing.T) {
-	fake := newFakeBackpressure(1000)
+	fake := newFakeBackpressure(grp(1000, 0))
 	fake.addID = "1721-0"
 	pub := newTestPublisher(fake)
 
@@ -329,8 +418,8 @@ func TestWatermarkPublisherDeadNotGated(t *testing.T) {
 	if _, err := pub.Publish(context.Background(), StreamDead, msg); err != nil {
 		t.Fatalf("Publish в q:dead: %v", err)
 	}
-	if len(fake.lens) != 0 {
-		t.Errorf("q:dead не должен гейтироваться, XLEN: %v", fake.lens)
+	if len(fake.infos)+len(fake.xlens) != 0 {
+		t.Errorf("q:dead не должен гейтироваться: %v %v", fake.infos, fake.xlens)
 	}
 	if len(fake.adds) != 1 {
 		t.Errorf("XADD в q:dead: %+v", fake.adds)
@@ -343,12 +432,11 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	// Ошибка гейта — публикация не доходит до XADD.
 	fake := &fakeBackpressure{
 		fakeRedis: &fakeRedis{},
-		vals:      []int64{5},
-		xlenErr:   errors.New("ERR connection refused"),
+		groupsErr: errors.New("ERR connection refused"),
 	}
 	pub := newTestPublisher(fake)
 	if _, err := pub.Publish(ctx, StreamDNS, dnsBatch()); err == nil ||
-		!strings.Contains(err.Error(), "длина") {
+		!strings.Contains(err.Error(), "глубина") {
 		t.Errorf("ошибка гейта: %v", err)
 	}
 	if len(fake.adds) != 0 {
@@ -356,7 +444,7 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	}
 
 	// Отмена ctx в гейте — чистый выход без публикации.
-	fake = newFakeBackpressure(100)
+	fake = newFakeBackpressure(grp(100, 0))
 	pub = newTestPublisher(fake)
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
@@ -370,7 +458,7 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	// Ошибка самой публикации — после пройденного гейта.
 	fake = &fakeBackpressure{
 		fakeRedis: &fakeRedis{addErr: errors.New("connection refused")},
-		vals:      []int64{5},
+		seq:       [][]redis.XInfoGroup{grp(5, 0)},
 	}
 	pub = newTestPublisher(fake)
 	if _, err := pub.Publish(ctx, StreamDNS, dnsBatch()); err == nil {
@@ -378,7 +466,7 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	}
 
 	// Невалидное сообщение — ошибка обёрнутой очереди (гейт пройден).
-	fake = newFakeBackpressure(5)
+	fake = newFakeBackpressure(grp(5, 0))
 	pub = newTestPublisher(fake)
 	if _, err := pub.Publish(ctx, StreamDNS, DNSBatch{}); err == nil {
 		t.Error("невалидное сообщение опубликовано")
@@ -388,7 +476,7 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	}
 
 	// Обёртка без гейта — явная ошибка: контроль потока не теряется молча.
-	fake = newFakeBackpressure(5)
+	fake = newFakeBackpressure(grp(5, 0))
 	pub = NewWatermarkPublisher(NewRedisQueue(fake, RedisOptions{}), nil)
 	if _, err := pub.Publish(ctx, StreamDNS, dnsBatch()); err == nil ||
 		!strings.Contains(err.Error(), "гейт") {
@@ -409,8 +497,8 @@ func TestWatermarkPublisherPassthrough(t *testing.T) {
 	if err := pub.Ack(context.Background(), StreamDNS, "dns", "1718-0"); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
-	if len(fake.lens) != 0 {
-		t.Errorf("Consume/Ack не должны звать XLEN: %v", fake.lens)
+	if len(fake.infos)+len(fake.xlens) != 0 {
+		t.Errorf("Consume/Ack не должны мерить глубину: %v %v", fake.infos, fake.xlens)
 	}
 	if want := []ackCall{{StreamDNS, "dns", []string{"1718-0"}}}; !reflect.DeepEqual(fake.acks, want) {
 		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)

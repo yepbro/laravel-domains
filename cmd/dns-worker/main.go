@@ -61,7 +61,7 @@ func main() {
 // run — рабочая логика dns-worker: клиент DNS (пул сокетов fail-fast —
 // недоступный резолвер ошибка старта, T-034) под лимитами T-035, цикл
 // воркера dnsworker.Run с приборами этапа (T-077) и коллектор длины
-// q:dns (метрика длин очередей, ТЗ 5.9: XLEN стрима, который потребляет
+// q:dns (метрика глубины очередей, ТЗ 5.9: backlog стрима, который потребляет
 // этот воркер). Завершение — отмена ctx (graceful shutdown,
 // ТЗ 3.4): начатые эпизоды дорабатывают или возвращаются очереди
 // повторной доставкой (Processing, T-025).
@@ -91,7 +91,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{}), gate)
 
 	// Длина потребляемого стрима q:dns → crawler_queue_depth (T-077):
-	// источник XLEN — гейт (тот же клиент Redis), завершается отменой ctx.
+	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
 	go func() {
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamDNS}, metrics.DefaultQueueCollectInterval, logger)

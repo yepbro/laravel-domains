@@ -295,7 +295,7 @@ punycode/unicode); без флага — все зоны. Версия набо�
 `domains_total`/`domains_checked` из таблицы `zones`, их обновляет сервис
 monitor, T-078, плюс живой агрегат `domains` по `check_state`: pending без
 учёта `deleted` — удалённые домены планировщик не выбирает, queued, done),
-длины очередей `q:dns`/`q:http`/`q:render`/`q:analyze`/`q:dead` (XLEN),
+глубина очередей `q:dns`/`q:http`/`q:render`/`q:analyze`/`q:dead` (backlog групп потребления),
 скорость и ETA завершения первого цикла: `(pending + queued) / скорость`.
 Скорость доменов — средняя с начала суток (`last_checked_at` имеет точность
 дня, часового окна нет; короче 10 минут окно не используется — сразу после

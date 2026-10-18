@@ -7,9 +7,10 @@
 //     (SQL по domains.last_checked_at/статусам; temp_error — исход DNS-этапа
 //     после исчерпания ретраев, ТЗ 5.4; NXDOMAIN → not_delegated — валидный
 //     результат, не ошибка);
-//   - переполнение очередей — XLEN рабочих стримов q:dns/q:http/q:render/
-//     q:analyze против scheduler.queue_high_watermark (порог backpressure,
-//     ТЗ 4.2/5.3; q:dead гейтом не ограничивается — см. шапку
+//   - переполнение очередей — глубина рабочих стримов q:dns/q:http/
+//     q:render/q:analyze (backlog групп потребления) против
+//     scheduler.queue_high_watermark (порог backpressure, ТЗ 4.2/5.3;
+//     q:dead гейтом не ограничивается — см. шапку
 //     internal/queue/backpressure.go — и не проверяется);
 //   - остановка прогресса — zones.updated_at (пишет ZoneStatsLoop, T-078)
 //     старше N периодов пересчёта: живой monitor метит свою работу сам;
@@ -78,7 +79,7 @@ const (
 // Имена алертов — метка в логах и снапшоте прохода.
 const (
 	AlertDNSErrors     = "dns_temp_error_share" // доля temp_error за сутки
-	AlertQueueOverflow = "queue_overflow"       // XLEN у порога гейта
+	AlertQueueOverflow = "queue_overflow"       // глубина очереди у порога гейта
 	AlertProgressStall = "progress_stall"       // zones.updated_at устарел
 	AlertDiskFree      = "disk_free"            // место каталога контента
 	AlertNVMeWear      = "nvme_wear"            // SMART percentage_used
@@ -128,9 +129,9 @@ const (
 
 	// AlertQueueRecoverFactor — снятие алерта очередей ниже 90 % порога.
 	// Гейт мягкий (между проверкой и публикацией другие продюсеры
-	// добавляют записи, T-026): длины в коридоре 90–100 % порога
-	// дребезжали бы Warn. Срабатывание — ровно на пороге гейта
-	// (len ≥ watermark): алерт виден одновременно с приостановкой
+	// добавляют записи, T-026): глубина в коридоре 90–100 % порога
+	// дребезжала бы Warn. Срабатывание — ровно на пороге гейта
+	// (depth ≥ watermark): алерт виден одновременно с приостановкой
 	// публикации.
 	AlertQueueRecoverFactor = 0.9
 
@@ -379,13 +380,14 @@ func parseHealthLog(page []byte) (percent int, unitsWritten uint64, err error) {
 
 // ------------------------------------------------------------------- алерты
 
-// StreamLener — длины стримов (XLEN); *queue.BackpressureGate (T-026)
+// StreamLener — глубина стримов; *queue.BackpressureGate (T-026)
 // удовлетворяет интерфейсу — тот же узкий API над go-redis, что у
 // планировщика и crawlerctl status (T-079). Отдельный интерфейс, а не
 // go-redis: тесты подменяют фейком, транспорт заменяем (ТЗ 4.2).
 type StreamLener interface {
-	// Len возвращает длину стрима (число всех записей, включая
-	// доставленные и не подтверждённые XACK).
+	// Len возвращает глубину стрима: непрочитанный группой потребителей
+	// остаток плюс неподтверждённые доставки (backlog, см.
+	// BackpressureGate.Len).
 	Len(ctx context.Context, stream string) (int64, error)
 }
 
@@ -419,10 +421,16 @@ type AlertsOptions struct {
 	// прогресса (AlertStallFactor × интервал); 0 —
 	// DefaultZoneStatsInterval.
 	ZoneStatsInterval time.Duration
-	// QueueWatermark — порог длин стримов
+	// QueueWatermark — порог глубины стримов
 	// (scheduler.queue_high_watermark); ≤ 0 — алерт очередей «не
-	// измеряется» (валидация конфига требует ≥ 1).
+	// измеряется» (валидация конфига требует ≥ 1). Эффективный порог
+	// стрима ограничивается половиной его предела MAXLEN — как у гейта
+	// backpressure (queue.StreamWatermark, T-026).
 	QueueWatermark int64
+	// QueueMaxLen — предел длины стримов MAXLEN (зеркалит redis.maxlen;
+	// 0 — пределы по стримам политики T-025): нужен для эффективного
+	// порога стрима (см. QueueWatermark).
+	QueueMaxLen int64
 	// ContentDir — каталог контента (content.dir); "" — алерт места «не
 	// измеряется».
 	ContentDir string
@@ -642,8 +650,8 @@ func (a *Alerts) evalDNS(ctx context.Context, prev string) verdict {
 	return verdict{status: AlertStatusOK, detail: detail}
 }
 
-// evalQueues — XLEN рабочих стримов против порога гейта. Срабатывание —
-// len ≥ watermark у любого стрима (в тот же момент гейт закрывает
+// evalQueues — глубина рабочих стримов против порога гейта. Срабатывание —
+// depth ≥ эффективного порога стрима (в тот же момент гейт закрывает
 // публикацию); снятие — все стримы ниже 90 % порога.
 func (a *Alerts) evalQueues(ctx context.Context, prev string) verdict {
 	if a.deps.Redis == nil {
@@ -659,19 +667,25 @@ func (a *Alerts) evalQueues(ctx context.Context, prev string) verdict {
 	for _, s := range alertStreams {
 		n, err := a.deps.Redis.Len(ctx, s)
 		if err != nil {
-			return verdict{err: fmt.Errorf("monitor: длина %s: %w", s, err)}
+			return verdict{err: fmt.Errorf("monitor: глубина %s: %w", s, err)}
 		}
 		lens[s] = n
 	}
-	recoverAt := int64(float64(a.opts.QueueWatermark) * AlertQueueRecoverFactor)
+	// Порог — по стриму, как у гейта (T-026): для q:dns настроенные
+	// 100 000 записей ограничиваются половиной его MAXLEN 10 000.
+	wm := make(map[string]int64, len(alertStreams))
+	for _, s := range alertStreams {
+		wm[s] = queue.StreamWatermark(a.opts.QueueWatermark, a.opts.QueueMaxLen, s)
+	}
 	var hot, hold []string
 	for _, s := range alertStreams {
 		n := lens[s]
+		recoverAt := int64(float64(wm[s]) * AlertQueueRecoverFactor)
 		switch {
-		case n >= a.opts.QueueWatermark:
-			hot = append(hot, fmt.Sprintf("%s=%d", s, n))
+		case n >= wm[s]:
+			hot = append(hot, fmt.Sprintf("%s=%d (порог %d)", s, n, wm[s]))
 		case prev == AlertStatusFiring && n >= recoverAt:
-			hold = append(hold, fmt.Sprintf("%s=%d", s, n))
+			hold = append(hold, fmt.Sprintf("%s=%d (порог %d)", s, n, wm[s]))
 		}
 	}
 	if len(hot) > 0 || len(hold) > 0 {
@@ -681,10 +695,10 @@ func (a *Alerts) evalQueues(ctx context.Context, prev string) verdict {
 		}
 		return verdict{
 			status: AlertStatusFiring,
-			detail: fmt.Sprintf("%s ≥ порога %d", strings.Join(at, ", "), a.opts.QueueWatermark),
+			detail: strings.Join(at, ", ") + " — глубина у порога",
 		}
 	}
-	// Деталь «ok» — максимальная длина среди рабочих стримов; стартовое
+	// Деталь «ok» — максимальная глубина среди рабочих стримов; стартовое
 	// значение — первый стрим: при всех нулях (простаивающие очереди)
 	// деталь называет стрим, а не пустую строку.
 	maxStream, maxLen := alertStreams[0], lens[alertStreams[0]]
@@ -695,7 +709,7 @@ func (a *Alerts) evalQueues(ctx context.Context, prev string) verdict {
 	}
 	return verdict{
 		status: AlertStatusOK,
-		detail: fmt.Sprintf("макс %s=%d из порога %d", maxStream, maxLen, a.opts.QueueWatermark),
+		detail: fmt.Sprintf("макс %s=%d", maxStream, maxLen),
 	}
 }
 
