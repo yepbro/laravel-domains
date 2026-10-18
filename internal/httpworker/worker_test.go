@@ -3,8 +3,11 @@
 // загрузка»), варианты/алиасы сквозью, SPA-флаг, ошибки субдомена не роняют
 // домен, отмена ctx, smoke цикла Run, адаптер DNS-резолвера. Загрузка
 // подменяется сценарием (шов FetchFunc), очередь — фейком queue.Queue;
-// сети и Redis нет. Идентификаторы с префиксом worker* против коллизий
-// с соседними пакетами.
+// сети и Redis нет — за единственным исключением: настоящий
+// *httpfetch.BodyLimiter собирает только реальный транспорт, поэтому
+// TestWorkerBodyLimiterCeiling работает с loopback-сервером httptest.
+// Идентификаторы с префиксом worker* против коллизий с соседними
+// пакетами.
 
 package httpworker
 
@@ -15,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -24,6 +28,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"crawler/internal/content"
 	"crawler/internal/dnsclient"
 	"crawler/internal/httpfetch"
 	"crawler/internal/model"
@@ -49,10 +54,11 @@ type workerPageScript struct {
 	body      string
 	final     string // итоговый URL; "" — как запрошенный
 	steps     []httpfetch.RedirectStep
-	err       error    // транспортная ошибка вместо ответа
-	tooMany   bool     // ErrTooManyRedirects (Result nil, Chain — steps)
-	blockCtx  bool     // ждать отмены ctx (тест отмены)
-	setCookie []string // значения Set-Cookie, если header не задан
+	err       error         // транспортная ошибка вместо ответа
+	tooMany   bool          // ErrTooManyRedirects (Result nil, Chain — steps)
+	blockCtx  bool          // ждать отмены ctx (тест отмены)
+	setCookie []string      // значения Set-Cookie, если header не задан
+	elapsed   time.Duration // Elapsed итогового Fetch (ResponseMS проверки)
 }
 
 // workerFetchLog — журнал вызовов фейка: какие URL реально ушли «в сеть».
@@ -125,6 +131,7 @@ func workerFakeFetch(script map[string]*workerPageScript) (FetchFunc, *workerFet
 			Header:     h,
 			Body:       io.NopCloser(strings.NewReader(p.body)),
 			FinalURL:   fu,
+			Elapsed:    p.elapsed,
 		}
 		chain := append([]httpfetch.RedirectStep(nil), p.steps...)
 		chain = append(chain, httpfetch.RedirectStep{URL: final, Status: p.status})
@@ -285,7 +292,8 @@ func TestWorkerProcessDomain(t *testing.T) {
 }
 
 // TestWorkerCacheKey — нормализация ключа кэша: схема+хост+путь; query,
-// фрагмент и порт не входят, регистр хоста не важен (критерий T-054).
+// фрагмент и дефолтные порты схем (80/443) не входят, нестандартный порт
+// различает ключи, регистр хоста не важен (критерий T-054).
 func TestWorkerCacheKey(t *testing.T) {
 	base, err := url.Parse("https://www.example.com/some/path")
 	if err != nil {
@@ -306,11 +314,24 @@ func TestWorkerCacheKey(t *testing.T) {
 			t.Errorf("ключ %q ≠ ключу базы", raw)
 		}
 	}
+	httpBase, err := url.Parse("http://www.example.com/some/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse("http://www.example.com:80/some/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workerCacheKey(u) != workerCacheKey(httpBase) {
+		t.Error("ключ с явным дефолтным портом :80 ≠ ключу без порта")
+	}
 	for _, raw := range []string{
-		"http://www.example.com/some/path",  // другая схема
-		"https://old.example.com/some/path", // другой хост
-		"https://www.example.com/other",     // другой путь
-		"https://www.example.com",           // пустой путь — корень «/»
+		"http://www.example.com/some/path",          // другая схема
+		"https://old.example.com/some/path",         // другой хост
+		"https://www.example.com/other",             // другой путь
+		"https://www.example.com",                   // пустой путь — корень «/»
+		"https://www.example.com:8443/some/path",    // нестандартный порт — другой сервис
+		"https://www.example.com:444/some/path?q=1", // порт не глушится query
 	} {
 		u, err := url.Parse(raw)
 		if err != nil {
@@ -373,6 +394,93 @@ func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
 	}
 	if got := log.countHost("park.bare.test"); got != 3 { // 1 (http первой) + https + http второй
 		t.Errorf("обращений к park после второй задачи: %d, ожидалось 3", got)
+	}
+}
+
+// TestWorkerCacheHitKeepsErrorClass — обрезанная страница в кэше
+// отдаёт кэш-попаданию свой класс ошибки (ErrBody): один и тот же
+// контент не должен классифицироваться по-разному в зависимости от
+// попадания в кэш (запись-источник — error=body, запись кэша — NULL).
+func TestWorkerCacheHitKeepsErrorClass(t *testing.T) {
+	huge := strings.Repeat("a", int(workerBodyHardLimit)+128)
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		// Обе проверки апекса сводятся к обрезанной странице www
+		// (https — скачивание, http — сбой сети).
+		"trunc.test":         {status: 200, body: huge, final: "https://www.trunc.test/"},
+		"http://trunc.test/": {err: errors.New("connection refused")},
+	})
+	// PerDomain=1 — детерминированный порядок: https апекса наполняет
+	// кэш до старта https www (см. TestWorkerProcessDomain).
+	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
+	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+		ZoneID: 9, DomainID: 21, Name: "trunc.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(1, "www")},
+	})
+	if err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+	www := &res.Subdomains[1]
+	if !www.HTTPS.Cached || !www.HTTPS.Truncated {
+		t.Fatalf("https www — не кэш-итог обрезанной страницы: cached=%v truncated=%v",
+			www.HTTPS.Cached, www.HTTPS.Truncated)
+	}
+	if www.HTTPS.ErrClass != ErrBody || www.HTTPS.ErrText == "" {
+		t.Errorf("кэш-попадание потеряло класс ошибки обрезанной страницы: %v текст %q",
+			www.HTTPS.ErrClass, www.HTTPS.ErrText)
+	}
+	// Cached=true — сеть не трогалась вовсе (http-проверка www при
+	// сценарии-ошибке честно несёт ErrNetwork, не подменяясь кэшем).
+	if www.HTTP.ErrClass != ErrNetwork {
+		t.Errorf("http www: класс %v (ожидался ErrNetwork)", www.HTTP.ErrClass)
+	}
+	// Класс доходит и до записи кэш-источника.
+	if len(www.Records) == 0 {
+		t.Fatal("у www нет записей, хотя https-итог доступен")
+	}
+	if www.Records[0].ErrClass != ErrBody {
+		t.Errorf("запись кэш-источника: класс %v (ожидался ErrBody)", www.Records[0].ErrClass)
+	}
+}
+
+// TestWorkerCacheHitResponseMS — кэш-попадание переносит измеренное
+// первоисточником время ответа: кэш-итог часто становится записью-
+// оригиналом алиас-класса (bare→www), её response_ms не должен быть
+// нулём при живом измерении. Метрики кэш-попадания по-прежнему не
+// наблюдают (Cached).
+func TestWorkerCacheHitResponseMS(t *testing.T) {
+	body := "<html>" + strings.Repeat("страница для теста времени ответа кэша ", 30) + "</html>"
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"rt.test": {status: 200, body: body, final: "https://www.rt.test/", elapsed: 150 * time.Millisecond},
+		// http-проверка апекса — другой итог (не кэш), своё время.
+		"http://rt.test/": {status: 200, body: body, final: "http://old.rt.test/", elapsed: 40 * time.Millisecond},
+	})
+	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
+	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+		ZoneID: 12, DomainID: 31, Name: "rt.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(1, "www")},
+	})
+	if err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+	bare, www := &res.Subdomains[0], &res.Subdomains[1]
+	if !www.HTTPS.Cached {
+		t.Fatal("https www — не кэш-итог (порядок проверок сломан)")
+	}
+	if got := www.HTTPS.ResponseMS; got != 150 {
+		t.Errorf("ResponseMS кэш-попадания: %d, ожидалось измерение первоисточника 150", got)
+	}
+	if got := bare.HTTPS.ResponseMS; got != 150 {
+		t.Errorf("ResponseMS первоисточника: %d, ожидалось 150", got)
+	}
+	if got := bare.HTTP.ResponseMS; got != 40 {
+		t.Errorf("ResponseMS собственной (некэшовой) проверки: %d, ожидалось 40", got)
+	}
+	// Запись кэш-источника несёт время ответа в subdomain_results.
+	if len(www.Records) == 0 {
+		t.Fatal("у www нет записей")
+	}
+	if got := www.Records[0].ResponseMS; got != 150 {
+		t.Errorf("ResponseMS записи кэш-источника: %d, ожидалось 150", got)
 	}
 }
 
@@ -439,6 +547,68 @@ func TestWorkerErrorsClassified(t *testing.T) {
 	if res.AnyTimeout() {
 		t.Error("таймаутов в задаче не было")
 	}
+}
+
+// TestWorkerBodyLimiterCeiling — потолок тела задаёт BodyLimiter T-049
+// (http.max_body_bytes), а не страховочная константа воркера: страница
+// 3 МиБ при потолке 4 МиБ читается целиком (страховка 2 МиБ резала бы
+// её с ложным ErrBody); страница 5 МиБ при потолке 4 МиБ режется
+// лимитёром. Только реальный транспорт: настоящий BodyLimiter не
+// построить сценарием шва FetchFunc — loopback-сервер httptest.
+func TestWorkerBodyLimiterCeiling(t *testing.T) {
+	caseRun := func(t *testing.T, serve, ceiling int64) (*SchemeCheck, []byte) {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, strings.Repeat("a", int(serve)))
+		}))
+		defer srv.Close()
+		u, err := url.Parse(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := httpfetch.NewFetcher(httpfetch.Options{
+			Limits: &httpfetch.LimitOptions{MaxBodyBytes: ceiling},
+		})
+		w, err := New(ChainFetch(f), Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+			ZoneID: 1, DomainID: 1, Name: u.Host,
+			Subdomains: []queue.HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"127.0.0.1"}}},
+		})
+		if err != nil {
+			t.Fatalf("ProcessDomain: %v", err)
+		}
+		// Тела проверок ProcessDomain отпускает после разметки алиасов
+		// (Body живёт у записи-оригинала) — ожидаемые байты сравниваются
+		// хэшем; целая страница дополнительно видна в теле записи.
+		wantLen := serve
+		if wantLen > ceiling {
+			wantLen = ceiling
+		}
+		return &res.Subdomains[0].HTTP, []byte(strings.Repeat("a", int(wantLen))) // сервер httptest — http
+	}
+	t.Run("3 МиБ при потолке 4 МиБ — целая", func(t *testing.T) {
+		check, want := caseRun(t, 3<<20, 4<<20)
+		if !check.Available || check.Truncated || check.ErrClass != ErrNone || check.ErrText != "" {
+			t.Fatalf("available=%v truncated=%v класс=%v текст=%q — страница ниже потолка читается целиком",
+				check.Available, check.Truncated, check.ErrClass, check.ErrText)
+		}
+		if check.ContentHash == nil || *check.ContentHash != content.HashOf(want) {
+			t.Error("хэш тела не совпадает с хэшем целой страницы (обрезка страховкой 2 МиБ?)")
+		}
+	})
+	t.Run("5 МиБ при потолке 4 МиБ — обрезка лимитёром", func(t *testing.T) {
+		check, want := caseRun(t, 5<<20, 4<<20)
+		if !check.Available || !check.Truncated || check.ErrClass != ErrBody {
+			t.Fatalf("available=%v truncated=%v класс=%v — обрезка настроенным max_body_bytes",
+				check.Available, check.Truncated, check.ErrClass)
+		}
+		if check.ContentHash == nil || *check.ContentHash != content.HashOf(want) {
+			t.Errorf("хэш тела не совпадает с хэшем обрезанной до потолка страницы (%d байт)", len(want))
+		}
+	})
 }
 
 // TestWorkerAllFailedNoHTTP — все субдомены ошибочны → записей нет («нет
@@ -783,6 +953,130 @@ func TestWorkerRunOnResultError(t *testing.T) {
 	}
 }
 
+// TestWorkerRunBackoffOnFailures — предохранитель рабочего цикла: окно,
+// целиком не подтверждённое из-за сбоя OnResult (БД), выдерживает паузу
+// перед следующим чтением q:http (иначе — горячий цикл, пережигающий
+// попытки доставок), пауза растёт с каждым таким окном, окно с успехом
+// её сбрасывает; подтверждений при этом нет (at-least-once, ТЗ 3.4).
+func TestWorkerRunBackoffOnFailures(t *testing.T) {
+	// Пауза сжата: секунды в юнит-тесте не ждать.
+	old := workerFailWaitBase
+	workerFailWaitBase = 250 * time.Millisecond
+	t.Cleanup(func() { workerFailWaitBase = old })
+
+	body := "<html>" + strings.Repeat("страница для теста предохранителя цикла ", 30) + "</html>"
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"backoff.test":         {status: 200, body: body},
+		"http://backoff.test/": {status: 200, body: body},
+	})
+	w := workerWorker(t, fetch, nil)
+	q := &workerFakeQueue{deliveries: []queue.Delivery{
+		workerDelivery(t, queue.HTTPTask{ZoneID: 10, DomainID: 51, Name: "backoff.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
+		workerDelivery(t, queue.HTTPTask{ZoneID: 10, DomainID: 52, Name: "backoff.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
+	}}
+	opts := Options{OnResult: func(context.Context, *DomainResult) error {
+		return errors.New("БД недоступна")
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	// Первое чтение — сразу; момент его наблюдения стартовая точка
+	// паузы (окно обрабатывается мгновенно, обе доставки падают).
+	deadline := time.After(5 * time.Second)
+	for q.consumeCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("первое чтение не состоялось")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	firstSeen := time.Now()
+
+	// Повторное чтение — после паузы предохранителя, но не вечностью:
+	// цикл обязан продолжить (счётчик ошибок не блокирует навсегда).
+	for q.consumeCount() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("второе чтение не состоялось — предохранитель не отпустил цикл")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	if elapsed := time.Since(firstSeen); elapsed < 200*time.Millisecond {
+		t.Errorf("повторное чтение через %v — пауза предохранителя не сработала", elapsed)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	if q.ackedCount() != 0 {
+		t.Errorf("подтверждений %d при падающем OnResult", q.ackedCount())
+	}
+}
+
+// TestWorkerRunCancelWhileWaitingSlot — отмена ctx во время ожидания слота
+// семафора не запускает доставку с уже отменённым ctx: окно из двух задач
+// при Concurrency=1, первая блокируется в сети до отмены — вторая обязана
+// остаться не начатой (её хост не читается из сети), окно возвращается
+// очереди повторной доставкой.
+func TestWorkerRunCancelWhileWaitingSlot(t *testing.T) {
+	fetch, log := workerFakeFetch(map[string]*workerPageScript{
+		"block.test": {blockCtx: true},
+		"next.test":  {status: 200, body: "<html>страница второй доставки окна</html>"},
+	})
+	w := workerWorker(t, fetch, nil)
+	q := &workerFakeQueue{deliveries: []queue.Delivery{
+		workerDelivery(t, queue.HTTPTask{ZoneID: 11, DomainID: 61, Name: "block.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
+		workerDelivery(t, queue.HTTPTask{ZoneID: 11, DomainID: 62, Name: "next.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
+	}}
+	// Concurrency — параметр цикла Run (семафор окна), не воркера.
+	opts := Options{Concurrency: 1}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	// Первая доставка ушла в сеть (держит единственный слот) — отменяем:
+	// вторая в этот момент ждёт семафор.
+	deadline := time.After(5 * time.Second)
+	for log.countHost("block.test") == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("первая доставка не дошла до сети")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	if got := log.countHost("next.test"); got != 0 {
+		t.Errorf("доставка запущена после отмены ctx: обращений к next.test %d", got)
+	}
+	if q.ackedCount() != 0 {
+		t.Errorf("подтверждений %d — окно обязано вернуться очереди", q.ackedCount())
+	}
+}
+
 // --- адаптер DNS-резолвера (ТЗ 5.5 п. 2) ---------------------------------------
 
 // workerAddr — парсинг адреса сценария (падение — ошибка теста).
@@ -797,13 +1091,16 @@ func workerAddr(t *testing.T, s string) netip.Addr {
 
 // workerFakeDNS — сценарный dnsclient.Resolver: отвечает на A/AAAA
 // заданными адресами; withCNAME подмешивает CNAME-запись в ответ A
-// (рекурсор отдаёт псевдоним и цель одним ответом).
+// (рекурсор отдаёт псевдоним и цель одним ответом); aErr/aaaaErr —
+// сбой обмена только по одному типу записи (транзиентный отказ AAAA).
 type workerFakeDNS struct {
 	mu        sync.Mutex
 	asks      []uint16
 	a, aaaa   []netip.Addr
 	rcode     dnsclient.RCode
 	err       error
+	aErr      error
+	aaaaErr   error
 	withCNAME bool
 }
 
@@ -813,6 +1110,12 @@ func (d *workerFakeDNS) Exchange(_ context.Context, q dnsclient.Question) (*dnsc
 	d.asks = append(d.asks, q.Type)
 	if d.err != nil {
 		return nil, d.err
+	}
+	if q.Type == dns.TypeA && d.aErr != nil {
+		return nil, d.aErr
+	}
+	if q.Type == dns.TypeAAAA && d.aaaaErr != nil {
+		return nil, d.aaaaErr
 	}
 	res := &dnsclient.Result{RCode: d.rcode}
 	if d.withCNAME && q.Type == dns.TypeA {
@@ -898,6 +1201,41 @@ func TestWorkerDNSLookup(t *testing.T) {
 		}
 		if len(d.asked()) != 0 {
 			t.Errorf("резолвер опрошен для IP-литерала: %v", d.asked())
+		}
+	})
+	t.Run("сбой AAAA не роняет резолв с живым A", func(t *testing.T) {
+		d := &workerFakeDNS{
+			a:       []netip.Addr{workerAddr(t, "192.0.2.10")},
+			aaaaErr: errors.New("servfail"),
+		}
+		got, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "mixed.example")
+		if err != nil {
+			t.Fatalf("LookupNetIP: %v (сбой AAAA при живом A — резолв работает)", err)
+		}
+		if len(got) != 1 || got[0].String() != "192.0.2.10" {
+			t.Errorf("адреса: %v (ожидался только A)", got)
+		}
+		if asked := d.asked(); len(asked) != 2 {
+			t.Errorf("вопросы: %v (оба типа опрошены)", asked)
+		}
+	})
+	t.Run("сбой A при живом AAAA — адреса AAAA", func(t *testing.T) {
+		d := &workerFakeDNS{
+			aErr: errors.New("servfail"),
+			aaaa: []netip.Addr{workerAddr(t, "2001:db8::2")},
+		}
+		got, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "v6.example")
+		if err != nil {
+			t.Fatalf("LookupNetIP: %v", err)
+		}
+		if len(got) != 1 || got[0].String() != "2001:db8::2" {
+			t.Errorf("адреса: %v (ожидался только AAAA)", got)
+		}
+	})
+	t.Run("оба типа упали — ошибка", func(t *testing.T) {
+		d := &workerFakeDNS{err: errors.New("сеть")}
+		if _, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "down2.example"); err == nil {
+			t.Error("резолв без единого ответа прошёл как успех")
 		}
 	})
 	t.Run("NXDOMAIN — ошибка", func(t *testing.T) {

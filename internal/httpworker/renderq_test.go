@@ -1312,7 +1312,9 @@ func TestRequeueOnceNoSPA(t *testing.T) {
 }
 
 // TestRequeueOnceContentError — недоступный блок: запись пропускается
-// (Warn), проход продолжается, флаг снимается.
+// (Warn), проход продолжается без ошибки, но флаг домена СОХРАНЯЕТСЯ:
+// транзиентный сбой чтения не должен терять SPA-задачу до перепроверки
+// T-030 — следующий тик прохода повторит домен.
 func TestRequeueOnceContentError(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, _, _, rq := renderqPassKit(t, 0)
@@ -1324,8 +1326,36 @@ func TestRequeueOnceContentError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequeueOnce: %v (ошибка чтения — не ошибка прохода)", err)
 	}
-	if res.Published != 0 || res.Cleared != 1 {
-		t.Fatalf("итог %+v, ожидался published=0 cleared=1", res)
+	if res.Published != 0 || res.Cleared != 0 {
+		t.Fatalf("итог %+v, ожидался published=0 cleared=0 (флаг сохранён)", res)
+	}
+	if !pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("флаг снят при нечитаемом контенте — SPA-задача потеряна до T-030")
+	}
+}
+
+// TestRequeueOnceContentErrorPartial — сбой чтения одной записи не мешает
+// остальным: читаемая SPA-запись публикуется, но флаг домена держится,
+// пока не прочитаны все (следующий проход доберёт нечитаемую).
+func TestRequeueOnceContentErrorPartial(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	hDead := content.HashOf([]byte("блок, который не читается"))
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	body.bodies[hSPA] = renderqSPABody
+	body.errOn[hDead] = errors.New("pack: блок не читается")
+	pool.seedDomain(5, 13, "mix", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 13, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
+	pool.seedRow(5, 13, 1, model.VariantMain, hDead[:], nil, false, "https://down.example/")
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Published != 1 || res.Cleared != 0 {
+		t.Fatalf("итог %+v, ожидался published=1 cleared=0 (флаг при нечитаемой записи сохранён)", res)
+	}
+	if !pool.domains[renderqDomKey{zone: 5, id: 13}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("флаг снят, хотя одна запись не прочитана")
 	}
 }
 

@@ -39,6 +39,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -151,16 +152,18 @@ func workerClassifyError(err error) ErrorClass {
 
 // --- кэш «итоговый URL → результат» (ТЗ 5.5 п. 6) --------------------------
 
-// workerCacheKey — ключ кэша итоговых URL: схема + хост (без порта, нижний
+// workerCacheKey — ключ кэша итоговых URL: схема + хост (нижний
 // регистр — punycode гарантирует цепочка T-048) + путь (пустой — корень
 // «/»). Согласован с критерием вариантов T-054 (NewVariantInput): query и
 // фрагмент НЕ входят — счётчиковые параметры (?i=1, ?i=2, …) не разваливают
 // дедупликацию одной страницы, а реальное различие контента при одном пути
 // ловит хэш. Схема входит: http и https одного адреса — разные скачивания,
 // подмена результата http-проверки https-страницей фабриковала бы
-// доступность протокола, который реально не проверялся. Порт не входит,
-// как в критерии вариантов: стандартный и нестандартный порт одного хоста
-// — один сайт.
+// доступность протокола, который реально не проверялся. Явно указанный
+// нестандартный порт входит по той же причине: страница host:8443 —
+// ответ другого сервиса, кэш-попадание подменяло бы результат проверки
+// порта по умолчанию контентом непроверенного порта; дефолтные порты
+// схем (80/443) нормализуются away — явный :443 у https тот же адрес.
 func workerCacheKey(u *url.URL) string {
 	if u == nil {
 		return ""
@@ -169,24 +172,44 @@ func workerCacheKey(u *url.URL) string {
 	if path == "" {
 		path = "/"
 	}
-	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Hostname()) + path
+	host := strings.ToLower(u.Hostname())
+	if p := u.Port(); p != "" && p != workerSchemeDefaultPort(u.Scheme) {
+		host += ":" + p
+	}
+	return strings.ToLower(u.Scheme) + "://" + host + path
+}
+
+// workerSchemeDefaultPort — дефолтный порт схемы (нормализация ключа:
+// явный :443 у https — тот же адрес, что и без порта); прочие схемы в
+// конвейере не встречаются — дефолта нет.
+func workerSchemeDefaultPort(scheme string) string {
+	if strings.ToLower(scheme) == "https" {
+		return "443"
+	}
+	return "80"
 }
 
 // workerPage — скачанная страница (итог цепочки) в кэше: хэш и SPA-вердикт
 // вычислены при чтении; тело (UTF-8) удерживается до конца задачи — его
 // заберёт запись-оригинал для сохранения контента (Record.Body, T-056),
 // кэш-попадания делят те же байты (одна копия на скачанную страницу).
+// Класс/текст ошибки (ErrBody обрезанной страницы) переносится
+// кэш-попаданию: один и тот же контент классифицируется одинаково
+// независимо от того, скачала его проверка или взяла из кэша.
 type workerPage struct {
-	final     *url.URL
-	status    int
-	header    http.Header
-	cookies   []*http.Cookie
-	tls       *httpfetch.TLSInfo
-	hash      *content.Hash
-	body      []byte
-	charset   string
-	truncated bool
-	spa       *httpfetch.SPAVerdict
+	final      *url.URL
+	status     int
+	header     http.Header
+	cookies    []*http.Cookie
+	tls        *httpfetch.TLSInfo
+	hash       *content.Hash
+	body       []byte
+	charset    string
+	truncated  bool
+	responseMS int
+	spa        *httpfetch.SPAVerdict
+	errClass   ErrorClass
+	errText    string
 }
 
 // workerURLCache — общий кэш задачи домена (ТЗ 5.5 п. 6 «внутри воркера
@@ -235,7 +258,10 @@ type SchemeCheck struct {
 	Available bool
 	// Cached — итог взят из кэша итоговых URL без сети (ТЗ 5.5 п. 6):
 	// стартовый URL этой проверки совпал с итоговым URL другой проверки
-	// задачи (классика bare→www). ResponseMs такого итога — 0.
+	// задачи (классика bare→www). Сеть не трогалась, но время ответа
+	// первоисточника (до его заголовков) переносится в ResponseMS —
+	// запись-оригинал алиас-класса несёт реальное время ответа страницы;
+	// метрики времени ответа кэш-попадания по-прежнему не наблюдают.
 	Cached bool
 	// FinalURL — итоговый URL (страница в конце цепочки, ТЗ 5.5 п. 4);
 	// nil при ошибке загрузки.
@@ -252,7 +278,9 @@ type SchemeCheck struct {
 	// и кэш-попаданий http-проверок (не ошибка, §8).
 	TLS *httpfetch.TLSInfo
 	// ResponseMS — время до заголовков итогового ответа, мс (Elapsed
-	// последнего Fetch цепочки, ТЗ 5.5 п. 7 «время ответа»).
+	// последнего Fetch цепочки, ТЗ 5.5 п. 7 «время ответа»). Кэш-
+	// попадание переносит измерение первоисточника (его Elapsed):
+	// 0 — только у ошибок загрузки (заголовков не было).
 	ResponseMS int
 	// Redirects — цепочка редиректов (T-048): URL и статус каждого шага,
 	// последний элемент — итоговая страница. При ошибке — выполненная
@@ -439,6 +467,26 @@ const (
 	// XAUTOCLAIM (T-025).
 	DefaultErrorWait = 30 * time.Second
 )
+
+// workerFailWaitBase — стартовая пауза предохранителя рабочего цикла
+// (Run): окно доставок, целиком оставшееся без XACK (систематический
+// сбой обработки — Options.OnResult/БД), приостанавливает чтение q:http
+// с удвоением паузы до DefaultErrorWait. Без паузы цикл продолжал бы
+// черпать задачи: каждая доставка жгла попытку (XAUTOCLAIM после
+// DefaultClaimMinIdle, T-025) и уносила её в q:dead. Переменная, а не
+// константа: юнит-тесты сжимают паузу, не выжидая секунды.
+var workerFailWaitBase = time.Second
+
+// workerFailBackoff — пауза после streak подряд целиком не
+// подтверждённых окон: удвоение от workerFailWaitBase, потолок
+// DefaultErrorWait (сдвиг ограничен — переполнение Duration).
+func workerFailBackoff(streak int) time.Duration {
+	d := workerFailWaitBase << min(streak-1, 5)
+	if d > DefaultErrorWait {
+		d = DefaultErrorWait
+	}
+	return d
+}
 
 // Options — параметры воркера; нулевые значения заменяются дефолтами
 // (withDefaults, стиль dnsworker.Options).
@@ -733,11 +781,14 @@ func workerHashBytes(h *content.Hash) []byte {
 	return b
 }
 
-// workerBodyHardLimit — страховочный потолок чтения тела в самом воркере:
-// с лимитами T-049 (Options.Limits — боевой сборщик включает их всегда)
-// тело уже обёрнуто BodyLimiter с потолком max_body_bytes; без лимитов
-// (изолированные сборки) неограниченное чтение раздувало бы память на
-// злонамеренном ответе (§9 — недоверенный контент).
+// workerBodyHardLimit — страховочный потолок чтения тела в самом воркере
+// на случай транспорта без лимитов T-049 (изолированные сборки и юнит-
+// тесты без Options.Limits): неограниченное чтение раздувало бы память
+// на злонамеренном ответе (§9 — недоверенный контент). С включёнными
+// лимитами (боевой сборщик NewOptions включает их всегда) тело уже
+// обёрнуто BodyLimiter с потолком http.max_body_bytes — сколь угодно
+// выше дефолта, — и чтение идёт под ним без собственного потолка
+// воркера: страховка не должна подменять настроенный лимит.
 const workerBodyHardLimit = httpfetch.DefaultLimitBodyBytes
 
 // checkScheme — одна проверка (субдомен × протокол, ТЗ 5.5 п. 1): кэш
@@ -766,11 +817,18 @@ func (w *Worker) checkScheme(
 		check.Cookies = page.cookies
 		check.TLS = page.tls
 		check.Redirects = []httpfetch.RedirectStep{{URL: start.String(), Status: page.status}}
+		check.ResponseMS = page.responseMS
 		check.ContentHash = page.hash
 		check.Truncated = page.truncated
 		check.Charset = page.charset
 		check.Body = page.body
 		check.SPA = page.spa
+		// Ошибка страницы (обрезка — ErrBody) переносится кэш-итогом:
+		// запись того же контента несёт тот же класс, что и у
+		// первоисточника (иначе subdomain_results.error расходился бы
+		// от попадания в кэш, метрики недосчитали бы ошибку).
+		check.ErrClass = page.errClass
+		check.ErrText = page.errText
 		return check
 	}
 
@@ -807,19 +865,29 @@ func (w *Worker) checkScheme(
 		}
 	}
 
-	// Тело: читается целиком (потолок — BodyLimiter T-049 либо
-	// страховочный workerBodyHardLimit), закрывается всегда (общий
-	// таймаут запроса живёт до Close, T-047), приводится к UTF-8 (T-051);
-	// дальше нужны только хэш (T-054/T-055/T-056) и SPA-вердикт (T-057).
-	body, readErr := io.ReadAll(io.LimitReader(res.Body, workerBodyHardLimit+1))
+	// Тело: читается целиком, закрывается всегда (общий таймаут
+	// запроса живёт до Close, T-047), приводится к UTF-8 (T-051);
+	// дальше нужны только хэш (T-054/T-055/T-056) и SPA-вердикт
+	// (T-057). Потолок — BodyLimiter T-049, когда лимиты включены:
+	// чтение режется по http.max_body_bytes (признак — Truncated),
+	// анти-тарпит там же; без лимитёра — страховочный
+	// workerBodyHardLimit от недоверенного ответа.
+	var (
+		body      []byte
+		readErr   error
+		truncated bool
+	)
+	if res.BodyLimiter != nil {
+		body, readErr = io.ReadAll(res.Body)
+		truncated = res.BodyLimiter.Truncated()
+	} else {
+		body, readErr = io.ReadAll(io.LimitReader(res.Body, workerBodyHardLimit+1))
+		truncated = int64(len(body)) > workerBodyHardLimit
+		if truncated {
+			body = body[:workerBodyHardLimit]
+		}
+	}
 	closeErr := res.Body.Close()
-	truncated := int64(len(body)) > workerBodyHardLimit
-	if truncated {
-		body = body[:workerBodyHardLimit]
-	}
-	if res.BodyLimiter != nil && res.BodyLimiter.Truncated() {
-		truncated = true
-	}
 	if readErr == nil {
 		readErr = closeErr
 	}
@@ -849,16 +917,19 @@ func (w *Worker) checkScheme(
 	// Итоговый URL — в кэш задачи: следующие проверки, начинающиеся на
 	// нём (www после редиректа bare), страницы повторно не скачивают.
 	cache.put(workerCacheKey(res.FinalURL), &workerPage{
-		final:     res.FinalURL,
-		status:    check.Status,
-		header:    check.Header,
-		cookies:   check.Cookies,
-		tls:       check.TLS,
-		hash:      check.ContentHash,
-		body:      check.Body,
-		charset:   check.Charset,
-		truncated: check.Truncated,
-		spa:       check.SPA,
+		final:      res.FinalURL,
+		status:     check.Status,
+		header:     check.Header,
+		cookies:    check.Cookies,
+		tls:        check.TLS,
+		hash:       check.ContentHash,
+		body:       check.Body,
+		charset:    check.Charset,
+		truncated:  check.Truncated,
+		responseMS: check.ResponseMS,
+		spa:        check.SPA,
+		errClass:   check.ErrClass,
+		errText:    check.ErrText,
 	})
 	return check
 }
@@ -872,7 +943,9 @@ func (w *Worker) checkScheme(
 // возвращает nil — контракт OnRun каркаса (T-012: начатые задачи дорабатывают
 // или возвращаются очереди повторной доставкой). Ошибка чтения или обработки
 // не останавливает цикл: логируется (Warn), неподтверждённая доставка
-// вернётся XAUTOCLAIM (ТЗ 4.2).
+// вернётся XAUTOCLAIM (ТЗ 4.2); окно, целиком оставшееся без подтверждений,
+// выдерживает паузу-предохранитель (workerFailWaitBase) — черпать новые
+// задачи при лежащей обработке бессмысленно, попытки доставок сгорают.
 func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	if q == nil {
 		return errors.New("httpworker: цикл воркера: очередь не задана")
@@ -897,6 +970,8 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	}
 
 	sem := make(chan struct{}, o.Concurrency)
+	var failed atomic.Int64 // доставки окна без подтверждения
+	failStreak := 0         // подряд целиком не подтверждённых окон
 	for {
 		deliveries, err := q.Consume(ctx, queue.StreamHTTP, o.Group, o.Consumer, o.Consume)
 		if err != nil {
@@ -912,11 +987,25 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 		// доставка — один домен (ТЗ 4.2), параллелизм этапа — именно
 		// здесь (у dns-worker домены параллелятся внутри пачки).
 		var wg sync.WaitGroup
+		failed.Store(0)
+	window: // метка выхода из окна по отмене (select семафора ниже)
 		for _, d := range deliveries {
 			if ctx.Err() != nil {
 				break // не начатые доставки окна не подтверждены
 			}
-			sem <- struct{}{}
+			// Слот семафора — с выходом по отмене: отмена ctx во время
+			// ожидания слота не должна запускать доставку с уже
+			// отменённым ctx (выбор канала select недетерминирован,
+			// поэтому отмена проверяется и после получения слота).
+			select {
+			case <-ctx.Done():
+				break window
+			case sem <- struct{}{}:
+			}
+			if ctx.Err() != nil {
+				<-sem
+				break window
+			}
 			wg.Add(1)
 			go func(d queue.Delivery) {
 				defer wg.Done()
@@ -924,15 +1013,28 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 				err := queue.Processing(ctx, q, o.Group, d, func(c context.Context, del queue.Delivery) error {
 					return w.processDelivery(c, del, o)
 				})
-				if err != nil && ctx.Err() == nil {
-					log.Warn("задача q:http не подтверждена — вернётся повторной доставкой",
-						"entry", d.ID, "err", err)
+				if err != nil {
+					failed.Add(1)
+					if ctx.Err() == nil {
+						log.Warn("задача q:http не подтверждена — вернётся повторной доставкой",
+							"entry", d.ID, "err", err)
+					}
 				}
 			}(d)
 		}
 		wg.Wait()
 		if ctx.Err() != nil {
 			return nil // остановка: окно доработано или возвращено очереди
+		}
+		// Предохранитель (workerFailWaitBase): окно целиком без
+		// подтверждений — систематический сбой обработки, пауза перед
+		// следующим чтением; окно с хоть одним подтверждением счётчик
+		// сбрасывает.
+		if n := failed.Load(); n > 0 && int(n) == len(deliveries) {
+			failStreak++
+			wait(workerFailBackoff(failStreak))
+		} else {
+			failStreak = 0
 		}
 	}
 }
@@ -990,7 +1092,11 @@ func NewDNSLookup(resolve dnsclient.Resolver, ipv6 bool) *DNSLookup {
 // ipv6 — и AAAA; IP-литералы (Location вида http://192.0.2.1/) проходят
 // без обмена. CNAME разворачивает сам рекурсор (unbound, ТЗ 5.4) — в
 // ответе на A лежат и записи цели (RFC 1034 §4.3.2, T-037). Отрицание
-// (NXDOMAIN) и пустой ответ — ошибка: подключаться не к чему.
+// (NXDOMAIN) и пустой ответ — ошибка: подключаться не к чему. Сбой или
+// отказ одного типа не роняет резолв, если другой дал адреса:
+// транзиентный отказ AAAA не должен ломать подключение по рабочему A
+// (NODATA — не здесь: NOERROR без записей просто ничего не добавляет);
+// собранного нет вовсе — возвращается первая ошибка обмена.
 func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return []netip.Addr{ip}, nil
@@ -999,14 +1105,23 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 	if d.ipv6 {
 		types = append(types, dns.TypeAAAA)
 	}
-	var out []netip.Addr
+	var (
+		out      []netip.Addr
+		firstErr error // первая ошибка обмена/отказа — итог, если адресов нет
+	)
 	for _, t := range types {
 		res, err := d.resolve.Exchange(ctx, dnsclient.Question{Name: host, Type: t})
-		if err != nil {
-			return nil, fmt.Errorf("httpworker: резолв %q %s: %w", host, dns.TypeToString[t], err)
+		switch {
+		case err != nil:
+			err = fmt.Errorf("httpworker: резолв %q %s: %w", host, dns.TypeToString[t], err)
+		case res.RCode != dnsclient.RCodeNOERROR:
+			err = fmt.Errorf("httpworker: резолв %q %s: %s", host, dns.TypeToString[t], res.RCode.String())
 		}
-		if res.RCode != dnsclient.RCodeNOERROR {
-			return nil, fmt.Errorf("httpworker: резолв %q %s: %s", host, dns.TypeToString[t], res.RCode.String())
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue // другой тип ещё может дать адреса
 		}
 		for _, rr := range res.RecordsOf(t) {
 			switch r := rr.(type) {
@@ -1022,6 +1137,9 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 		}
 	}
 	if len(out) == 0 {
+		if firstErr != nil {
+			return nil, firstErr
+		}
 		return nil, fmt.Errorf("httpworker: резолв %q: пустой ответ", host)
 	}
 	return out, nil
