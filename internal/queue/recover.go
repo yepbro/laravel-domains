@@ -97,15 +97,13 @@ func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, D
 
 	// claim — один проход: клейм пачки и обработка каждой записи
 	// паттерном Processing (результат в БД → XACK). Возвращает размер
-	// пачки клейма для решения «дренаж или тик».
+	// пачки клейма для решения «дренаж или тик». Частичный сбой Claim
+	// (счётчик одной записи) не отменяет валидную часть — она
+	// обрабатывается, ошибка логируется.
 	claim := func() int {
 		claimed, err := r.Claim(ctx, o.Stream, o.Group, o.Consumer, 0, o.Batch)
-		if err != nil {
-			// Отмена во время клейма — часть остановки, не тревога.
-			if ctx.Err() == nil {
-				log.Warn("возврат зависших доставок: клейм", "err", err)
-			}
-			return 0
+		if err != nil && ctx.Err() == nil {
+			log.Warn("возврат зависших доставок: клейм", "err", err)
 		}
 		for _, c := range claimed {
 			if ctx.Err() != nil {

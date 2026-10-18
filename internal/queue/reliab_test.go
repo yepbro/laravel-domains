@@ -29,9 +29,10 @@ type fakeClaimRedis struct {
 	claimNext string // курсор следующего сканирования из ответа
 	claimErr  error
 
-	pends   []redis.XPendingExtArgs
-	pendRes map[string][]redis.XPendingExt // ответ XPENDING по Start-идентификатору
-	pendErr error
+	pends      []redis.XPendingExtArgs
+	pendRes    map[string][]redis.XPendingExt // ответ XPENDING по Start-идентификатору
+	pendErr    error
+	pendOneErr map[string]error // ошибка XPENDING по конкретному Start-идентификатору
 }
 
 func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
@@ -57,6 +58,11 @@ func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs
 func (f *fakeClaimRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd {
 	f.pends = append(f.pends, *a)
 	cmd := redis.NewXPendingExtCmd(ctx, "xpending")
+	if err, ok := f.pendOneErr[a.Start]; ok {
+		cmd.SetVal(nil)
+		cmd.SetErr(err)
+		return cmd
+	}
 	cmd.SetVal(f.pendRes[a.Start])
 	cmd.SetErr(f.pendErr)
 	return cmd
@@ -411,6 +417,41 @@ func TestReliabClaimEmpty(t *testing.T) {
 	}
 	if len(fake.pends) != 0 {
 		t.Errorf("XPENDING без клейм не нужен: %+v", fake.pends)
+	}
+}
+
+// TestReliabClaimPartialError — сбой XPENDING одной записи не рушит
+// пачку: записи с известным счётчиком возвращаются, ошибки собраны
+// в возврат (Q-04: XAUTOCLAIM уже закрепил записи — терять пачку на
+// сбое одной проверки значило бы лишний MinIdle простоя всем).
+func TestReliabClaimPartialError(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 2}},
+			// "1719-0" — счётчик недоступен (сбой чтения по записи).
+		},
+		pendOneErr: map[string]error{
+			"1719-0": errors.New("ERR connection refused"),
+		},
+	}
+
+	got, err := newTestReliab(fake, ReliabOptions{}).Claim(
+		context.Background(), StreamHTTP, "http", "recover-1", time.Minute, 5)
+	if err == nil || !contains(err, "счётчик доставок") || !contains(err, "1719-0") {
+		t.Fatalf("частичный сбой: err = %v, want ошибки счётчика записи 1719-0", err)
+	}
+	want := []Claimed{
+		{Delivery{StreamHTTP, "1718-0", []byte(`{"task_id":"t1"}`)}, 2},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("валидная часть:\n получил  %+v\n хочу     %+v", got, want)
+	}
+	if len(fake.acks) != 0 || len(fake.adds) != 0 {
+		t.Errorf("клейм не подтверждает и не хоронит: %+v %+v", fake.acks, fake.adds)
 	}
 }
 

@@ -8,6 +8,7 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -183,6 +184,16 @@ type Claimed struct {
 // pending и даст дубль в q:dead на следующем проходе — поток q:dead редок
 // и разбирается вручную, дубль предпочтительнее потери (ТЗ 3.4).
 //
+// Ошибка XPENDING одной записи не рушит пачку: XAUTOCLAIM уже закрепил
+// записи за потребителем и сбросил им idle — потеря всей пачки на сбое
+// одной проверки означала бы ещё один MinIdle простоя для записей,
+// счётчик которых известен. Ошибки собираются в возврат (errors.Join),
+// валидная часть отдаётся; запись с неизвестным счётчиком остаётся
+// закреплённой и вернётся следующим клеймом после нового MinIdle.
+// Счётчик читается XPENDING EXTENDED по каждой вернувшейся записи
+// (диапазон id..id: XAUTOCLAIM его не возвращает); чтение без побочных
+// эффектов, поэтому безопасно при гонках с другими восстановителями.
+//
 // Пустой результат без ошибки — зависших записей нет.
 func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, n int) ([]Claimed, error) {
 	if !knownStream(stream) {
@@ -212,6 +223,7 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 		return nil, fmt.Errorf("queue: claim %s (группа %s): %w", stream, group, err)
 	}
 	out := make([]Claimed, 0, len(msgs))
+	var errs []error
 	for _, m := range msgs {
 		d := Delivery{Stream: stream, ID: m.ID, Payload: payloadBytes(m.Values)}
 		if len(d.Payload) == 0 {
@@ -227,7 +239,8 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 			Count:  1,
 		}).Result()
 		if err != nil {
-			return nil, fmt.Errorf("queue: счётчик доставок записи %s (%s): %w", m.ID, stream, err)
+			errs = append(errs, fmt.Errorf("queue: счётчик доставок записи %s (%s): %w", m.ID, stream, err))
+			continue
 		}
 		if len(pending) == 0 {
 			// Запись покинула PEL между командами (подтверждена тем, кто
@@ -237,16 +250,19 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 		attempts := int(pending[0].RetryCount)
 		if attempts > r.opt.MaxAttempts {
 			if err := r.bury(ctx, group, d, attempts); err != nil {
-				return nil, err
+				errs = append(errs, err)
 			}
 			continue
 		}
 		out = append(out, Claimed{Delivery: d, Attempts: attempts})
 	}
 	if len(out) == 0 {
+		if len(errs) > 0 {
+			return nil, errors.Join(errs...)
+		}
 		return nil, nil
 	}
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 // Process — паттерн Processing поверх очереди слоя: клеймнутая Claim
