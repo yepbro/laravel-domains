@@ -39,12 +39,15 @@ cgroup, systemd перезапускает юнит, остальные серв
 | Юнит | MemoryMax | Строка бюджета ТЗ 3.2 |
 |---|---|---|
 | `postgresql@.service` + drop-in | **2560M** | PostgreSQL ≈ 2,5 ГБ |
-| `redis-server.service` + drop-in | **512M** | Redis ≤ 0,5 ГБ |
+| `redis-server.service` + drop-in | **640M** (maxmemory 512mb + ~128 МБ служебных, docs/redis.md §7) | Redis ≤ 0,5 ГБ |
 | `unbound.service` + drop-in | **700M** | Unbound ≈ 0,7 ГБ |
 | `crawler-*.service` (7 юнитов) | **1280M суммарно** | Go-сервисы ≈ 1,3 ГБ |
 | `crawler-chromium.service` | **2048M** | Chromium ≈ 2 ГБ |
 
-Итого 7100M из 8192M: остаток ≈ 1 ГБ — ОС и page cache (ТЗ 3.2).
+Итого 7230M из 8192M: остаток ≈ 1 ГБ — ОС и page cache (ТЗ 3.2). Потолки —
+не резервация: MemoryMax выше плановой строки бюджета там, где над
+внутренним лимитом нужны служебные памяти процесса (Redis — §7
+docs/redis.md: maxmemory 512mb + ~128 МБ, eviction раньше OOM).
 
 Раскладка строки «Go-сервисы ≈ 1,3 ГБ» по семи юнитам:
 
