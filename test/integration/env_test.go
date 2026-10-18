@@ -161,7 +161,9 @@ func TestDNS_TestbedScenarios(t *testing.T) {
 	})
 }
 
-// Критерий приёмки 5: сервисы не резолвят внешние домены в режиме testbed.
+// Изоляция стенда (ТЗ 11.2): сервисы не резолвят внешние домены
+// в режиме testbed (критерий приёмки 5 — таблицы laravel_*,
+// TestAccept05; этот тест — про изоляцию DNS).
 func TestDNS_NoInternetInTestbed(t *testing.T) {
 	skipUnlessIntegration(t)
 	for _, name := range []string{"example.com", "google.com", "ya.ru"} {
