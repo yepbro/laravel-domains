@@ -64,9 +64,17 @@ const enqueueMaxNameLen = 253
 // (ТЗ 6.1). Присваивания — общие выражения пачки: check_state литералом
 // кода модели (коды схемы, а не данные — стиль dispatchZoneSQL),
 // queued_at = now() — время сервера БД (без расхождения часов клиентов)
-// и единый момент начала lease всей пачки. Охрана t.check_state = pending
-// перепроверяет состояние на момент блокировки строки; RETURNING — ключи
-// фактически переведённых строк: публикация строится ровно по ним.
+// и единый момент начала lease всей пачки; flags = (t.flags & ~бита
+// http_published)::int2 — staging-пометка публикации q:http (T-108)
+// снимается в точке входа в новый эпизод: постановка — единственный
+// переход pending → queued, через неё проходит любой возврат строки
+// в работу (lease T-029, воскрешение T-018, перепроверка T-030/T-031,
+// crawlerctl recheck) — свежий эпизод всегда начинается с чистого бита,
+// иначе пометка прошлого эпизода подавила бы его публикацию (потеря
+// задачи q:http). Знаковая маска ~бита и ::int2 — smallint-арифметика PG
+// (стиль renderq.go T-066). Охрана t.check_state = pending перепроверяет
+// состояние на момент блокировки строки; RETURNING — ключи фактически
+// переведённых строк: публикация строится ровно по ним.
 var enqueueUpdate = db.Update("domains").
 	Key(
 		db.Column{Name: "zone_id", Type: "int2"},
@@ -75,6 +83,7 @@ var enqueueUpdate = db.Update("domains").
 	SetExpr(
 		fmt.Sprintf("check_state = %d", int16(model.CheckStateQueued)),
 		"queued_at = now()",
+		fmt.Sprintf("flags = (t.flags & %d)::int2", int16(^int16(model.FlagHTTPPublished))),
 	).
 	Where(fmt.Sprintf("t.check_state = %d", int16(model.CheckStatePending))).
 	Returning("t.zone_id", "t.id")

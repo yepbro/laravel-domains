@@ -43,22 +43,38 @@
 //
 //   - задача q:http публикуется ДО перевода домена в done. Сбой записи
 //     после публикации оставляет домен queued и доставку q:dns без XACK
-//     (Processing, T-025): повторная доставка повторит эпизод целиком —
-//     публикация q:http повторится, но задача не теряется. Дубль
-//     ограничен, но небесплатен (DNS-04): попыток доставки до q:dead —
-//     redis.max_attempts (T-025), поэтому цена одного сбоя — до
-//     max_attempts × |пачка| повторных DNS-эпизодов и дублей q:http по
-//     доменам, опубликовавшим задачу до сбоя записи (сбой одного домена
-//     или один сбой БД размножается на пачку; дубль задачи — полная
-//     повторная HTTP-проверка, охраны done на стороне q:http нет).
-//     Единица повтора — доставка, а не домен: сузить её без новой
-//     промежуточной записи в БД (staging-пометка публикации, T-004)
-//     нельзя, а обращать порядок — терять задачи (ниже);
-//   - обратный порядок (done → публикация) при сбое публикации оставил бы
-//     домен done без задачи q:http — HTTP-этап никогда не начнётся, а
-//     повторная доставка не чинит: фильтр актуальности (resultPendingSQL)
-//     отбрасывает done-строки как уже обработанные. Восстановление было
-//     бы только регулярной перепроверкой T-030 (полгода);
+//     (Processing, T-025): повторная доставка повторит эпизод, но задача
+//     не теряется. Обратный порядок при сбое публикации оставлял бы
+//     домен done без задачи q:http навсегда (HTTP-этап не начнётся,
+//     фильтр актуальности отбрасывает done-строки, чинила бы только
+//     перепроверка T-030 — полгода) — отвергнут ревью DNS-04 и
+//     перепроверен для Q-02: RecoverLoop возвращает только зависшие
+//     доставки, состояние строки ему не изменить;
+//   - единица повтора сужена до домена (DNS-04, T-108): сразу после
+//     успешной публикации q:http эпизод ставит staging-пометку
+//     http_published (бит 2 domains.flags, модель model.Flags — как
+//     render_pending T-066; без миграции: ТЗ 6.1 оставляет биты flags
+//     открытыми, «…»). Повторная доставка пачки читает бит фильтром
+//     актуальности и НЕ публикует q:http повторно — только доходит до
+//     записи (DNS-эпизод повторяется: результат не хранился нигде,
+//     §3.5, а задачи q:http на стороне потребителя дедупликации не
+//     имеет — дубль = полная повторная HTTP-проверка). До T-108 один
+//     сбой записи стоил до redis.max_attempts × |пачка| повторных
+//     эпизодов и дублей q:http по опубликовавшим доменам; теперь дубль
+//     возможен только в окне между XADD и постановкой бита (краш воркера
+//     или отказ БД в одном UPDATE) и в межэпизодных гонках lease
+//     (существовали и до T-108);
+//   - снятие бита: записью результата (тот же UPDATE — done ⇒ бит чист)
+//     и постановкой планировщика (pending → queued, T-028: каждый
+//     новый эпизод начинается с чистого бита — единая точка сброса
+//     закрывает и lease-возврат T-029, и воскрешение T-018, и
+//     перепроверку T-030 без правки каждого прохода). На done/pending
+//     строке бит может остаться выставленным до следующей постановки —
+//     читает его только фильтр пачки (done отсечён), значения вне
+//     эпизода бит не имеет;
+//   - постановка бита — non-fatal: отказ UPDATE после публикации не
+//     роняет эпизод (запись результата важнее), повторная доставка в
+//     этом случае публикует дубль — цена окна, а не потеря;
 //   - из инварианта «done ⇒ задача опубликована» фильтр актуальности
 //     выводит идемпотентность: повторная доставка пачки обрабатывает
 //     только недоработанные домены (не done и не deleted), уже
@@ -106,12 +122,18 @@ import (
 //
 // queued_at = NULL завершает lease вместе с эпизодом: ненулевая отметка
 // остаётся только у queued-строк (инвариант T-018/T-029/T-030).
+//
+// flags: оба оператора снимают бит http_published (T-108) — done-строка
+// всегда чиста от staging-пометки; прочие биты (is_idn, render_pending)
+// сохраняются знаковой маской ~бита (побитовые операторы PG повышают
+// smallint до int — возврат ::int2, стиль renderq.go T-066).
 var (
 	// resultUpdateStatusSQL — терминальный статус DNS-эпизода
 	// (not_delegated / temp_error / delegated_no_address).
 	resultUpdateStatusSQL = "UPDATE domains AS t " +
 		"SET dns_mask = $3::int8, status = $4::int2, " +
 		fmt.Sprintf("temp_attempts = CASE WHEN $4::int2 = %d THEN t.temp_attempts ELSE 0 END, ", int16(model.StatusTempError)) +
+		fmt.Sprintf("flags = (t.flags & %d)::int2, ", int16(^int16(model.FlagHTTPPublished))) +
 		fmt.Sprintf("check_state = %d, queued_at = NULL, last_checked_at = now() ", int16(model.CheckStateDone)) +
 		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d AND t.check_state <> %d",
 			int16(model.StatusDeleted), int16(model.CheckStateDone))
@@ -121,15 +143,31 @@ var (
 	// успешен.
 	resultUpdateKeepStatusSQL = "UPDATE domains AS t " +
 		"SET dns_mask = $3::int8, temp_attempts = 0, " +
+		fmt.Sprintf("flags = (t.flags & %d)::int2, ", int16(^int16(model.FlagHTTPPublished))) +
 		fmt.Sprintf("check_state = %d, queued_at = NULL, last_checked_at = now() ", int16(model.CheckStateDone)) +
+		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d AND t.check_state <> %d",
+			int16(model.StatusDeleted), int16(model.CheckStateDone))
+
+	// resultMarkPublishedSQL — staging-пометка публикации q:http (T-108,
+	// DNS-04): бит http_published ставится сразу после успешного XADD и
+	// до записи результата — повторная доставка пачки по биту отличит
+	// «опубликовано, не записано» от «не доходило» и не станет публиковать
+	// дубль. Охраны — как у записи результата: done-строка пометки не
+	// получает (эпизод уже зафиксирован), deleted — вне цикла (§13.1);
+	// строки в pending (lease вернул посреди эпизода) помечаются — задача
+	// опубликована независимо от аренды. OR сохраняет прочие биты flags.
+	resultMarkPublishedSQL = "UPDATE domains AS t " +
+		fmt.Sprintf("SET flags = (t.flags | %d)::int2 ", int16(model.FlagHTTPPublished)) +
 		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d AND t.check_state <> %d",
 			int16(model.StatusDeleted), int16(model.CheckStateDone))
 
 	// resultPendingSQL — фильтр актуальности пачки q:dns: остаются домены
 	// ещё не записанные (check_state <> done — повторная доставка,
-	// идемпотентность) и не удалённые (§13.1). unnest WITH ORDINALITY
-	// сохраняет порядок пачки (чередование зон T-027) детерминированным.
-	resultPendingSQL = "SELECT u.zone_id, u.id " +
+	// идемпотентность) и не удалённые (§13.1); flags — staging-пометка
+	// публикации q:http (T-108): бит говорит повторной доставке пропустить
+	// публикацию. unnest WITH ORDINALITY сохраняет порядок пачки
+	// (чередование зон T-027) детерминированным.
+	resultPendingSQL = "SELECT u.zone_id, u.id, d.flags " +
 		"FROM unnest($1::int2[], $2::int8[]) WITH ORDINALITY AS u(zone_id, id, ord) " +
 		"JOIN domains AS d ON d.zone_id = u.zone_id AND d.id = u.id " +
 		fmt.Sprintf("WHERE d.status <> %d AND d.check_state <> %d ", int16(model.StatusDeleted), int16(model.CheckStateDone)) +
@@ -268,8 +306,10 @@ func resultCNAME(c string) string {
 // п. 4) одним оператором UPDATE с охраной актуальности: удалённый во
 // время проверки домен не перезаписывается (§13.1), уже записанный
 // результат повторная доставка не трогает (идемпотентность, ТЗ 3.4 —
-// XACK только после записи, T-025). Возвращает false, когда охраны
-// отсекли строку (done/deleted) — это успех, а не ошибка.
+// XACK только после записи, T-025); тем же оператором снимается бит
+// http_published (T-108): done — точка, где staging-пометка публикации
+// выполнила своё назначение. Возвращает false, когда охраны отсекли
+// строку (done/deleted) — это успех, а не ошибка.
 func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64, res EpisodeResult) (bool, error) {
 	if pool == nil {
 		return false, errors.New("dnsworker: запись результата: пул не задан")
@@ -293,25 +333,44 @@ func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 	return tag.RowsAffected() > 0, nil
 }
 
+// MarkHTTPPublished ставит бит http_published — staging-пометку «задача
+// q:http этого эпизода опубликована» (T-108). Вызывается строго после
+// успешной публикации и до записи результата: повторная доставка пачки
+// по биту пропустит публикацию (нет дубля q:http) и доидёт до записи.
+// Возвращает false, когда охраны отсекли строку (done/deleted) — успех.
+func MarkHTTPPublished(ctx context.Context, pool db.DB, zoneID int16, domainID int64) (bool, error) {
+	if pool == nil {
+		return false, errors.New("dnsworker: пометка публикации: пул не задан")
+	}
+	tag, err := pool.Exec(ctx, resultMarkPublishedSQL, zoneID, domainID)
+	if err != nil {
+		return false, fmt.Errorf("dnsworker: пометка публикации домена %d/%d: %w", zoneID, domainID, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // ProcessDomain — DNS-эпизод одного домена целиком (ТЗ 5.4, §7): апекс
 // (T-036) → субдомены и wildcard-детект (T-037/T-038, только для ветвей
 // делегирования) → решение (DecideEpisode) → публикация q:http → запись
 // результата (RecordEpisode). Порядок «публикация → запись» и цена
-// повтора при сбое записи — в комментарии файла (до max_attempts ×
-// |пачка|); ошибка любого шага — ошибка эпизода: домен остаётся без
-// записи, доставка q:dns не подтверждается и повторится (Processing,
-// T-025).
+// повтора при сбое записи — в комментарии файла; ошибка любого шага —
+// ошибка эпизода: домен остаётся без записи, доставка q:dns не
+// подтверждается и повторится (Processing, T-025).
 //
-// dom — домен пачки q:dns (T-024); subs — справочник subdomains (все
-// строки; отключённые пропускает CheckSubdomains); askAAAA — dns.ipv6
-// (ТЗ 5.4: AAAA отключаются конфигом без IPv6); met — приборы этапа
-// (T-077; nil — изолированные сборки без метрик); log — nil подавляет записи.
+// dom — домен пачки q:dns с состоянием staging-пометки (PendingDomain,
+// фильтр T-108): dom.HTTPPublished = true означает, что предыдущая
+// попытка доставки успела опубликовать задачу q:http — публикация
+// пропускается (дубль не создаётся), эпизод доходит до записи;
+// subs — справочник subdomains (все строки; отключённые пропускает
+// CheckSubdomains); askAAAA — dns.ipv6 (ТЗ 5.4: AAAA отключаются
+// конфигом без IPv6); met — приборы этапа (T-077; nil — изолированные
+// сборки без метрик); log — nil подавляет записи.
 func ProcessDomain(
 	ctx context.Context,
 	pool db.DB,
 	q queue.Queue,
 	resolve dnsclient.Resolver,
-	dom queue.DNSDomain,
+	dom PendingDomain,
 	subs []model.Subdomain,
 	askAAAA bool,
 	met *Metrics,
@@ -366,7 +425,15 @@ func ProcessDomain(
 
 	// Сначала публикация q:http, затем запись done (порядок — в
 	// комментарии файла): сбой записи вернёт эпизод повторной доставкой.
-	if res.HasHTTPTask() {
+	// Повторная доставка эпизода с уже опубликованной задачей (бит
+	// http_published, T-108) публикацию пропускает — доходит до записи.
+	switch {
+	case !res.HasHTTPTask():
+		// Терминальная ветка — публиковать нечего.
+	case dom.HTTPPublished:
+		log.Debug("q:http уже опубликована предыдущей попыткой — публикация пропущена",
+			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
+	default:
 		task := queue.HTTPTask{
 			ZoneID:     dom.ZoneID,
 			DomainID:   dom.DomainID,
@@ -375,6 +442,19 @@ func ProcessDomain(
 		}
 		if _, err := q.Publish(ctx, queue.StreamHTTP, task); err != nil {
 			return fmt.Errorf("dnsworker: домен %s: публикация q:http: %w", dom.Name, err)
+		}
+		// Staging-пометка (T-108): failsafe окна «опубликовано, не
+		// записано». Non-fatal: отказ пометки не роняет эпизод — запись
+		// результата важнее; плата — возможный дубль q:http на повторной
+		// доставке (ограничен попытками, ТЗ 3.4), не потеря.
+		marked, merr := MarkHTTPPublished(ctx, pool, dom.ZoneID, dom.DomainID)
+		switch {
+		case merr != nil:
+			log.Warn("пометка http_published не записана — повторная доставка может опубликовать дубль q:http",
+				"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID, "err", merr)
+		case !marked:
+			log.Debug("пометка http_published не поставлена — домен удалён или уже done",
+				"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 		}
 	}
 
@@ -455,13 +535,25 @@ type resultKey struct {
 	id   int64
 }
 
+// PendingDomain — домен пачки q:dns, ждущий обработки, с состоянием
+// staging-пометки публикации (T-108): HTTPPublished = бит http_published
+// строки — предыдущая попытка доставки успела опубликовать задачу q:http,
+// повтор публикацию пропускает (ProcessDomain) и доходит до записи.
+type PendingDomain struct {
+	queue.DNSDomain
+	HTTPPublished bool
+}
+
 // PendingDomains фильтрует пачку q:dns по актуальности строк (один
 // SELECT, unnest-пачка — стиль §3.5): остаются домены, чей результат ещё
-// не записан (check_state <> done) и которые не удалены (§13.1). Повторная
-// доставка пачки (Processing, T-025) обрабатывает только их — без
-// повторных DNS-обменов и дубликатов q:http; пустой результат — пачка уже
-// отработана, доставка просто подтверждается.
-func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([]queue.DNSDomain, error) {
+// не записан (check_state <> done) и которые не удалены (§13.1), вместе с
+// битом http_published (T-108) — маркером «задача q:http этого эпизода
+// уже опубликована». Повторная доставка пачки (Processing, T-025)
+// обрабатывает только их — без дубликатов q:http (опубликованные
+// домены перезаписываются без публикации) и без повторной работы по
+// записанным; пустой результат — пачка уже отработана, доставка просто
+// подтверждается.
+func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([]PendingDomain, error) {
 	if pool == nil {
 		return nil, errors.New("dnsworker: фильтр пачки: пул не задан")
 	}
@@ -483,14 +575,20 @@ func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([
 	}
 	defer rows.Close()
 
-	pending := make([]queue.DNSDomain, 0, len(batch))
+	pending := make([]PendingDomain, 0, len(batch))
 	for rows.Next() {
-		var k resultKey
-		if err := rows.Scan(&k.zone, &k.id); err != nil {
+		var (
+			k     resultKey
+			flags int16
+		)
+		if err := rows.Scan(&k.zone, &k.id, &flags); err != nil {
 			return nil, fmt.Errorf("dnsworker: фильтр пачки: чтение: %w", err)
 		}
 		if d, ok := byKey[k]; ok {
-			pending = append(pending, d) // ORDER BY u.ord — порядок пачки
+			pending = append(pending, PendingDomain{
+				DNSDomain:     d, // ORDER BY u.ord — порядок пачки
+				HTTPPublished: model.Flags(flags).IsHTTPPublished(),
+			})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -661,8 +759,9 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 // справочник субдоменов → фильтр актуальности (PendingDomains) → эпизоды
 // доменов параллельно до Concurrency (dns.concurrency, ТЗ 5.10). Ошибка
 // любого эпизода — ошибка всей доставки (без XACK): повторная доставка
-// прогонит пачку заново, фильтр отсечёт уже записанные домены —
-// повторяется только недоработанное (идемпотентность, ТЗ 3.4).
+// прогонит пачку заново, фильтр отсечёт уже записанные домены, а бит
+// http_published (T-108) исключит дубликаты публикации — повторяется
+// только недоработанное (идемпотентность, ТЗ 3.4).
 // Завершённые эпизоды идут в приборы met (T-077): счётчик задач этапа,
 // гистограмма длительностей (статусы терминальных веток считает
 // ProcessDomain после записи).
@@ -746,7 +845,7 @@ func processBatch(
 		}
 		sem <- struct{}{}
 		wg.Add(1)
-		go func(dom queue.DNSDomain) {
+		go func(dom PendingDomain) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			start := time.Now()

@@ -565,16 +565,18 @@ func TestEnqueueBatch_ContextCanceled(t *testing.T) {
 // ------------------------------------------------------------ контракт SQL
 
 const wantEnqueueUpdateSQL = `UPDATE "domains" AS t ` +
-	`SET check_state = 1, queued_at = now() ` +
+	`SET check_state = 1, queued_at = now(), flags = (t.flags & -5)::int2 ` +
 	`FROM unnest($1::int2[], $2::int8[]) AS u("zone_id", "id") ` +
 	`WHERE t."zone_id" = u."zone_id" AND t."id" = u."id" AND t.check_state = 0 ` +
 	`RETURNING t.zone_id, t.id`
 
 // TestEnqueue_SQLContract — точный текст перевода: ключи по PK domains,
 // check_state литералом кода queued, queued_at = now() (сервер БД, единый
-// момент lease пачки), охрана pending, RETURNING ключей фактически
-// переведённых строк. Литералы связаны с кодами модели и схемой миграции
-// 000001 (queued_at, PK).
+// момент lease пачки), снятие бита http_published (T-108: постановка —
+// единая точка входа в новый эпизод, бит прошлого эпизода не должен
+// подавлять публикацию свежего), охрана pending, RETURNING ключей
+// фактически переведённых строк. Литералы связаны с кодами модели и
+// схемой миграции 000001 (queued_at, PK).
 func TestEnqueue_SQLContract(t *testing.T) {
 	pool := &enqueueFakePool{}
 	if _, err := EnqueueBatch(context.Background(), pool, &enqueueFakeQueue{}, enqueueBatch3()[:1]); err != nil {
@@ -586,10 +588,15 @@ func TestEnqueue_SQLContract(t *testing.T) {
 	}
 
 	// Литералы текста обязаны следовать за кодами модели (ТЗ 6.1): при
-	// изменении кодов тест ловит рассинхронизацию.
+	// изменении кодов тест ловит рассинхронизацию; маска снятия бита —
+	// знаковое ~int16(FlagHTTPPublished) (T-108).
 	if int16(model.CheckStateQueued) != 1 || int16(model.CheckStatePending) != 0 {
 		t.Errorf("коды модели изменились (pending=%d queued=%d): обновите литералы в wantEnqueueUpdateSQL",
 			int16(model.CheckStatePending), int16(model.CheckStateQueued))
+	}
+	if int16(^int16(model.FlagHTTPPublished)) != -5 {
+		t.Errorf("маска снятия http_published = %d, want -5: обновите литералы в wantEnqueueUpdateSQL",
+			int16(^int16(model.FlagHTTPPublished)))
 	}
 
 	up := dispatchReadMigration(t, "000001_init.up.sql")

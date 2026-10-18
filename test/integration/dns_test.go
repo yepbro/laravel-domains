@@ -32,6 +32,7 @@ import (
 	"crawler/internal/dnsworker"
 	"crawler/internal/model"
 	"crawler/internal/queue"
+	"crawler/internal/scheduler"
 )
 
 // dnsBlackholeAddr — адрес чёрной дыры стенда (network.blackhole_ip,
@@ -636,5 +637,186 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Error("цикл воркера не остановился после отмены ctx")
+	}
+}
+
+// TestDNSWorker_RedeliveryPublishedMarker — семантика повтора пачки со
+// staging-пометкой http_published (T-108, DNS-04): домены, чья задача
+// q:http была опубликована предыдущей попыткой (сбой записи результата
+// после публикации — бит стоит), повторная доставка доводит до записи
+// БЕЗ дубликата q:http; done снимает бит. Эмуляция сбоя: публикации и
+// пометка выполнены руками (воркер «умер» между XADD и записью), пачка
+// q:dns доставляется заново.
+func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	rdb := resilienceRedisEnv(t)
+	resolve := dnsEnv(t)
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Два делегированных домена стенда (A у апекса и www — задачи q:http).
+	labels := []string{"same-site", "alias-target"}
+	ids := insertPendingDomains(t, pool, "crawl.test", labels)
+	var zoneID int16
+	if err := pool.QueryRow(ctx, "SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
+		t.Fatalf("зона crawl.test: %v", err)
+	}
+
+	// «Прошлая попытка»: опубликовала q:http по обоим доменам и поставила
+	// пометку, но не записала результат (краш между XADD и UPDATE-done).
+	for i, label := range labels {
+		name := label + ".crawl.test"
+		if _, err := q.Publish(ctx, queue.StreamHTTP, queue.HTTPTask{
+			ZoneID: zoneID, DomainID: ids[i], Name: name,
+			Subdomains: []queue.HTTPSubdomain{{SubdomainID: 0, Label: "", Addrs: []string{testwebIP}}},
+		}); err != nil {
+			t.Fatalf("публикация q:http (%s): %v", name, err)
+		}
+		if _, err := pool.Exec(ctx,
+			fmt.Sprintf("UPDATE domains SET flags = flags | %d, check_state = %d WHERE id = $1",
+				int16(model.FlagHTTPPublished), int16(model.CheckStateQueued)),
+			ids[i]); err != nil {
+			t.Fatalf("пометка http_published (%s): %v", label, err)
+		}
+	}
+
+	// Повторная доставка той же пачки (вернул бы XAUTOCLAIM, T-025).
+	if _, err := q.Publish(ctx, queue.StreamDNS, queue.DNSBatch{Domains: []queue.DNSDomain{
+		{ZoneID: zoneID, DomainID: ids[0], Name: "same-site.crawl.test"},
+		{ZoneID: zoneID, DomainID: ids[1], Name: "alias-target.crawl.test"},
+	}}); err != nil {
+		t.Fatalf("публикация q:dns: %v", err)
+	}
+
+	const group = "it-dns-marker"
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- dnsworker.Run(ctx, pool, q, resolve, dnsworker.Options{
+			Group: group, Consumer: "it-marker-1", Concurrency: 2, Consume: 1, AskAAAA: true,
+		})
+	}()
+
+	// Оба домена записаны (done) — повтор довёл эпизоды до записи.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var done int
+		if err := pool.QueryRow(ctx,
+			fmt.Sprintf("SELECT count(*) FROM domains WHERE check_state = %d", int16(model.CheckStateDone)),
+		).Scan(&done); err != nil {
+			t.Fatalf("подсчёт done: %v", err)
+		}
+		if done == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("домены не записаны за 15 с — повтор пачки не дообработан")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("Run после отмены ctx: %v, хочу nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("цикл воркера не остановился после отмены ctx")
+	}
+
+	// Запись пометки сняла бит: flags больше не несёт http_published,
+	// статус/maska записаны честно (итог за HTTP-этапом — new).
+	for i, label := range labels {
+		var (
+			status model.Status
+			flags  int16
+			mask   int64
+		)
+		if err := pool.QueryRow(ctx,
+			"SELECT status, flags, dns_mask FROM domains WHERE id = $1", ids[i],
+		).Scan(&status, &flags, &mask); err != nil {
+			t.Fatalf("домен %s: %v", label, err)
+		}
+		if model.Flags(flags).IsHTTPPublished() {
+			t.Errorf("%s: бит http_published не снят записью результата", label)
+		}
+		if status != model.StatusNew || mask != 0b11 {
+			t.Errorf("%s: status=%s mask=%b, хочу new и биты 0,1 (апекс+www)", label, status, mask)
+		}
+	}
+
+	// Дублей q:http нет: в стриме ровно две записи «прошлой попытки» —
+	// повтор домены с битом не публиковал. (Записи читаются группой без
+	// подтверждения — чтение не меняет PEL теста.)
+	httpMsgs := consumeTasks(t, q, queue.StreamHTTP, "it-http-marker", "op", 10)
+	if len(httpMsgs) != 2 {
+		t.Fatalf("записей в q:http: %d, хочу 2 (повтор не публикует дублей)", len(httpMsgs))
+	}
+	seen := map[string]int{}
+	for _, m := range httpMsgs {
+		task, err := queue.Decode[queue.HTTPTask](m)
+		if err != nil {
+			t.Fatalf("декодирование q:http: %v", err)
+		}
+		seen[task.Name]++
+	}
+	for _, name := range []string{"same-site.crawl.test", "alias-target.crawl.test"} {
+		if seen[name] != 1 {
+			t.Errorf("задач q:http для %s: %d, хочу ровно одну", name, seen[name])
+		}
+	}
+
+	// Доставка q:dns подтверждена после записи (Processing, T-025).
+	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 0 {
+		t.Errorf("неподтверждённых q:dns: %d, хочу 0", n)
+	}
+}
+
+// TestDNSWorker_EnqueueClearsMarker — постановка планировщика (T-028)
+// снимает бит http_published (T-108): возврат строки в работу (lease,
+// воскрешение, перепроверка) проходит через pending → queued, и свежий
+// эпизод обязан начинаться с чистого бита — иначе пометка прошлого
+// эпизода подавила бы публикацию его задачи (потеря q:http).
+func TestDNSWorker_EnqueueClearsMarker(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	rdb := resilienceRedisEnv(t)
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ids := insertPendingDomains(t, pool, "crawl.test", []string{"same-site"})
+	var zoneID int16
+	if err := pool.QueryRow(ctx, "SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
+		t.Fatalf("зона crawl.test: %v", err)
+	}
+	// Домен вернулся в pending с неснятым битом (крайний путь сбоя:
+	// запись так и не состоялась, lease перевёл строку в pending).
+	if _, err := pool.Exec(ctx,
+		fmt.Sprintf("UPDATE domains SET flags = flags | %d WHERE id = $1",
+			int16(model.FlagHTTPPublished)),
+		ids[0]); err != nil {
+		t.Fatalf("пометка http_published: %v", err)
+	}
+
+	res, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
+		{ZoneID: zoneID, DomainID: ids[0], Name: "same-site.crawl.test"},
+	})
+	if err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+	if res.Queued != 1 || res.Published != 1 {
+		t.Fatalf("EnqueueBatch = %+v, хочу queued=published=1", res)
+	}
+
+	var flags int16
+	if err := pool.QueryRow(ctx, "SELECT flags FROM domains WHERE id = $1", ids[0]).Scan(&flags); err != nil {
+		t.Fatalf("чтение flags: %v", err)
+	}
+	if model.Flags(flags).IsHTTPPublished() {
+		t.Error("бит http_published пережил постановку — свежий эпизод начнётся с подавленной публикацией")
 	}
 }

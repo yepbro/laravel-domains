@@ -5,14 +5,19 @@ package model
 
 import "testing"
 
-// TestFlagsBitsMatchSchema — биты ровно как в комментарии миграции 000001:
-// бит 0 is_idn, бит 1 render_pending.
+// TestFlagsBitsMatchSchema — биты зафиксированы: бит 0 is_idn и бит 1
+// render_pending — комментарий миграции 000001; бит 2 http_published —
+// T-108 (модель и docs/schema.md; миграций не требует — колонка flags
+// изначально допускает дополнительные биты, ТЗ 6.1 «…»).
 func TestFlagsBitsMatchSchema(t *testing.T) {
 	if FlagIDN != 1 {
 		t.Errorf("FlagIDN = %d, want 1 (бит 0)", int16(FlagIDN))
 	}
 	if FlagRenderPending != 2 {
 		t.Errorf("FlagRenderPending = %d, want 2 (бит 1)", int16(FlagRenderPending))
+	}
+	if FlagHTTPPublished != 4 {
+		t.Errorf("FlagHTTPPublished = %d, want 4 (бит 2, T-108)", int16(FlagHTTPPublished))
 	}
 }
 
@@ -68,13 +73,21 @@ func TestFlagsTestAnyOf(t *testing.T) {
 func TestFlagsNamedHelpers(t *testing.T) {
 	var f Flags
 	f.Set(FlagIDN)
-	if !f.IsIDN() || f.IsRenderPending() {
-		t.Errorf("IsIDN/IsRenderPending = %v/%v, want true/false", f.IsIDN(), f.IsRenderPending())
+	if !f.IsIDN() || f.IsRenderPending() || f.IsHTTPPublished() {
+		t.Errorf("IsIDN/IsRenderPending/IsHTTPPublished = %v/%v/%v, want true/false/false",
+			f.IsIDN(), f.IsRenderPending(), f.IsHTTPPublished())
 	}
 	f.Set(FlagRenderPending)
 	f.Clear(FlagIDN)
-	if f.IsIDN() || !f.IsRenderPending() {
-		t.Errorf("IsIDN/IsRenderPending = %v/%v, want false/true", f.IsIDN(), f.IsRenderPending())
+	if f.IsIDN() || !f.IsRenderPending() || f.IsHTTPPublished() {
+		t.Errorf("IsIDN/IsRenderPending/IsHTTPPublished = %v/%v/%v, want false/true/false",
+			f.IsIDN(), f.IsRenderPending(), f.IsHTTPPublished())
+	}
+	f.Set(FlagHTTPPublished)
+	f.Clear(FlagRenderPending)
+	if f.IsRenderPending() || !f.IsHTTPPublished() {
+		t.Errorf("IsRenderPending/IsHTTPPublished = %v/%v, want false/true",
+			f.IsRenderPending(), f.IsHTTPPublished())
 	}
 }
 
@@ -87,8 +100,11 @@ func TestFlagsString(t *testing.T) {
 		{FlagIDN, "is_idn"},
 		{FlagRenderPending, "render_pending"},
 		{FlagIDN | FlagRenderPending, "is_idn|render_pending"},
-		{Flags(1 << 2), "0x4"},                      // неизвестный бит — остаток hex
-		{FlagIDN | Flags(1<<3|1<<4), "is_idn|0x18"}, // именованный + неизвестные
+		{FlagHTTPPublished, "http_published"},
+		{FlagIDN | FlagHTTPPublished, "is_idn|http_published"},
+		{FlagIDN | FlagRenderPending | FlagHTTPPublished, "is_idn|render_pending|http_published"},
+		{Flags(1 << 3), "0x8"},                      // неизвестный бит — остаток hex
+		{FlagIDN | Flags(1<<4|1<<5), "is_idn|0x30"}, // именованный + неизвестные
 	}
 	for _, tc := range cases {
 		if got := tc.f.String(); got != tc.want {

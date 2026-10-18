@@ -180,9 +180,9 @@ type resultFakePool struct {
 	subdomains []model.Subdomain // ответ справочника
 	subsErr    error             // ошибка чтения справочника
 
-	// pending — заготовленные строки фильтра (пары zone_id, id); nil —
-	// «зеркало»: актуальны все ключи пачки.
-	pending     [][2]any
+	// pending — заготовленные строки фильтра (зона, id, flags); nil —
+	// «зеркало»: актуальны все ключи пачки с чистым битом http_published.
+	pending     [][3]any
 	pendingErr  error
 	pendScanErr error
 
@@ -252,20 +252,21 @@ func (p *resultFakePool) Query(ctx context.Context, sql string, args ...any) (pg
 		if p.pendingErr != nil {
 			return nil, p.pendingErr
 		}
-		var pairs [][2]any
+		var rows3 [][3]any
 		if p.pending != nil {
-			pairs = p.pending
+			rows3 = p.pending
 		} else {
-			// Зеркало: актуальны все ключи пачки (args: []int2, []int8).
+			// Зеркало: актуальны все ключи пачки (args: []int2, []int8),
+			// бит http_published чист (домен ещё не публиковал).
 			zones := args[0].([]int16)
 			ids := args[1].([]int64)
 			for i := range zones {
-				pairs = append(pairs, [2]any{zones[i], ids[i]})
+				rows3 = append(rows3, [3]any{zones[i], ids[i], int16(0)})
 			}
 		}
-		rows := make([][]any, len(pairs))
-		for i, pr := range pairs {
-			rows[i] = []any{pr[0], pr[1]}
+		rows := make([][]any, len(rows3))
+		for i, pr := range rows3 {
+			rows[i] = []any{pr[0], pr[1], pr[2]}
 		}
 		out := resultFakeRowsOf(rows...)
 		out.scanErr = p.pendScanErr
@@ -565,11 +566,13 @@ func resultWaitAck(j *resultJournal, timeout time.Duration) bool {
 
 // TestResultSQLContract фиксирует точные тексты операторов записи (стиль
 // dispatch_test: ожидание собирается независимо от прод-кода, литералы —
-// коды схемы ТЗ 6.1/6.2: done = 2, temp_error = 5, deleted = 6).
+// коды схемы ТЗ 6.1/6.2: done = 2, temp_error = 5, deleted = 6; бит
+// http_published = 4, маска снятия — знаковое ~4 = −5, T-108).
 func TestResultSQLContract(t *testing.T) {
 	wantStatus := "UPDATE domains AS t " +
 		"SET dns_mask = $3::int8, status = $4::int2, " +
 		"temp_attempts = CASE WHEN $4::int2 = 5 THEN t.temp_attempts ELSE 0 END, " +
+		"flags = (t.flags & -5)::int2, " +
 		"check_state = 2, queued_at = NULL, last_checked_at = now() " +
 		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> 6 AND t.check_state <> 2"
 	if resultUpdateStatusSQL != wantStatus {
@@ -578,13 +581,21 @@ func TestResultSQLContract(t *testing.T) {
 
 	wantKeep := "UPDATE domains AS t " +
 		"SET dns_mask = $3::int8, temp_attempts = 0, " +
+		"flags = (t.flags & -5)::int2, " +
 		"check_state = 2, queued_at = NULL, last_checked_at = now() " +
 		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> 6 AND t.check_state <> 2"
 	if resultUpdateKeepStatusSQL != wantKeep {
 		t.Errorf("resultUpdateKeepStatusSQL = %q,\nwant %q", resultUpdateKeepStatusSQL, wantKeep)
 	}
 
-	wantPending := "SELECT u.zone_id, u.id " +
+	wantMark := "UPDATE domains AS t " +
+		"SET flags = (t.flags | 4)::int2 " +
+		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> 6 AND t.check_state <> 2"
+	if resultMarkPublishedSQL != wantMark {
+		t.Errorf("resultMarkPublishedSQL = %q,\nwant %q", resultMarkPublishedSQL, wantMark)
+	}
+
+	wantPending := "SELECT u.zone_id, u.id, d.flags " +
 		"FROM unnest($1::int2[], $2::int8[]) WITH ORDINALITY AS u(zone_id, id, ord) " +
 		"JOIN domains AS d ON d.zone_id = u.zone_id AND d.id = u.id " +
 		"WHERE d.status <> 6 AND d.check_state <> 2 " +
@@ -595,6 +606,13 @@ func TestResultSQLContract(t *testing.T) {
 
 	if want := "SELECT id, label, enabled FROM subdomains ORDER BY id"; subdomainsSelectSQL != want {
 		t.Errorf("subdomainsSelectSQL = %q, want %q", subdomainsSelectSQL, want)
+	}
+
+	// Литералы текста обязаны следовать за кодами модели: при изменении
+	// кодов/бит тест ловит рассинхронизацию (биты flags — ТЗ 6.1 «…»).
+	if int16(model.FlagHTTPPublished) != 4 || int16(^int16(model.FlagHTTPPublished)) != -5 {
+		t.Errorf("бит http_published = %d, маска снятия = %d: обновите литералы wantStatus/wantKeep/wantMark",
+			int16(model.FlagHTTPPublished), int16(^int16(model.FlagHTTPPublished)))
 	}
 }
 
@@ -946,24 +964,31 @@ func TestResultProcessDomainWithAddrs(t *testing.T) {
 	resolve.setAnswer("cdn.example.com", dns.TypeAAAA,
 		resultReply(dnsclient.RCodeNOERROR, apexAAAARR("cdn.example.com.", "2001:db8::2")))
 
-	dom := queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}
+	dom := PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}}
 	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), true, nil, nil); err != nil {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
 
-	// Порядок: публикация q:http строго раньше записи (комментарий файла).
+	// Порядок: публикация q:http → пометка http_published → запись
+	// (комментарий файла): индекс публикации строго меньше первого Exec.
 	if pi, ei := j.indexOf(resultEvPublish, queue.StreamHTTP), j.indexOf(resultEvExec, ""); pi < 0 || ei < 0 || pi > ei {
-		t.Fatalf("порядок нарушен: publish=%d exec=%d (нужна публикация до записи)", pi, ei)
+		t.Fatalf("порядок нарушен: publish=%d exec=%d (нужна публикация до пометки/записи)", pi, ei)
 	}
-	if n := j.count(resultEvExec); n != 1 {
-		t.Fatalf("Exec вызовов %d, want 1", n)
+	if n := j.count(resultEvExec); n != 2 {
+		t.Fatalf("Exec вызовов %d, want 2 (пометка http_published + запись)", n)
 	}
 	execs := pool.resultPoolExecs()
-	if execs[0].sql != resultUpdateKeepStatusSQL {
-		t.Errorf("SQL записи = %q, want resultUpdateKeepStatusSQL", execs[0].sql)
+	if execs[0].sql != resultMarkPublishedSQL {
+		t.Errorf("SQL №1 = %q, want resultMarkPublishedSQL", execs[0].sql)
 	}
-	if !reflect.DeepEqual(execs[0].args, []any{int16(3), int64(11), int64(mustMask(t, 0, 1))}) {
-		t.Errorf("args записи = %v", execs[0].args)
+	if !reflect.DeepEqual(execs[0].args, []any{int16(3), int64(11)}) {
+		t.Errorf("args пометки = %v, want [3 11]", execs[0].args)
+	}
+	if execs[1].sql != resultUpdateKeepStatusSQL {
+		t.Errorf("SQL записи = %q, want resultUpdateKeepStatusSQL", execs[1].sql)
+	}
+	if !reflect.DeepEqual(execs[1].args, []any{int16(3), int64(11), int64(mustMask(t, 0, 1))}) {
+		t.Errorf("args записи = %v", execs[1].args)
 	}
 
 	publishes := q.resultPublishes()
@@ -1000,7 +1025,7 @@ func TestResultProcessDomainNXDOMAIN(t *testing.T) {
 	resolve := resultNewResolver()
 	resultSetNXDOMAIN(resolve, "gone.example.com")
 
-	dom := queue.DNSDomain{ZoneID: 3, DomainID: 12, Name: "gone.example.com"}
+	dom := PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 12, Name: "gone.example.com"}}
 	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), true, nil, nil); err != nil {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
@@ -1033,7 +1058,7 @@ func TestResultProcessDomainWildcard(t *testing.T) {
 		resultSetWildcardZone(resolve, "parked.example.com")
 
 		if err := ProcessDomain(context.Background(), pool, q, resolve,
-			queue.DNSDomain{ZoneID: 5, DomainID: 21, Name: "parked.example.com"},
+			PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 5, DomainID: 21, Name: "parked.example.com"}},
 			resultSubs(), false, nil, nil); err != nil {
 			t.Fatalf("ProcessDomain: %v", err)
 		}
@@ -1047,9 +1072,12 @@ func TestResultProcessDomainWildcard(t *testing.T) {
 			t.Fatalf("субдомены задачи = %+v, want только апекс (admin — wildcard, www без адресов)", subs)
 		}
 		execs := pool.resultPoolExecs()
-		if !reflect.DeepEqual(execs[0].args,
+		if len(execs) != 2 || execs[0].sql != resultMarkPublishedSQL {
+			t.Fatalf("execs = %+v, want пометка http_published + запись", execs)
+		}
+		if !reflect.DeepEqual(execs[1].args,
 			[]any{int16(5), int64(21), int64(mustMask(t, 0, 2))}) {
-			t.Errorf("args записи = %v, want маска с битами апекса и admin", execs[0].args)
+			t.Errorf("args записи = %v, want маску с битами апекса и admin", execs[1].args)
 		}
 	})
 
@@ -1063,7 +1091,7 @@ func TestResultProcessDomainWildcard(t *testing.T) {
 		resolve.setWild("flaky.example.com", resultAnswer{err: errResultNet})
 
 		if err := ProcessDomain(context.Background(), pool, q, resolve,
-			queue.DNSDomain{ZoneID: 5, DomainID: 22, Name: "flaky.example.com"},
+			PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 5, DomainID: 22, Name: "flaky.example.com"}},
 			resultSubs(), false, nil, nil); err != nil {
 			t.Fatalf("ProcessDomain: %v (политика T-038 — продолжить)", err)
 		}
@@ -1071,8 +1099,8 @@ func TestResultProcessDomainWildcard(t *testing.T) {
 		if len(publishes) != 1 || len(publishes[0].task.Subdomains) != 2 {
 			t.Fatalf("субдомены задачи = %+v, want апекс и www без фильтрации", publishes)
 		}
-		if n := j.count(resultEvExec); n != 1 {
-			t.Errorf("Exec вызовов %d, want 1", n)
+		if n := j.count(resultEvExec); n != 2 {
+			t.Errorf("Exec вызовов %d, want 2 (пометка http_published + запись)", n)
 		}
 	})
 }
@@ -1090,7 +1118,8 @@ func TestResultProcessDomainErrors(t *testing.T) {
 		resultSetDelegated(resolve, "example.com")
 
 		err := ProcessDomain(context.Background(), pool, q, resolve,
-			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil, nil)
+			PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}},
+			resultSubs(), false, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "публикация q:http") {
 			t.Fatalf("ошибка = %v, want «публикация q:http»", err)
 		}
@@ -1107,7 +1136,8 @@ func TestResultProcessDomainErrors(t *testing.T) {
 		resultSetDelegated(resolve, "example.com")
 
 		err := ProcessDomain(context.Background(), pool, q, resolve,
-			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil, nil)
+			PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}},
+			resultSubs(), false, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "запись результата") {
 			t.Fatalf("ошибка = %v, want «запись результата»", err)
 		}
@@ -1126,7 +1156,8 @@ func TestResultProcessDomainErrors(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		err := ProcessDomain(ctx, pool, q, resolve,
-			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil, nil)
+			PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}},
+			resultSubs(), false, nil, nil)
 		if err == nil || !errors.Is(err, context.Canceled) {
 			t.Fatalf("ошибка = %v, want context.Canceled", err)
 		}
@@ -1152,7 +1183,8 @@ func TestResultProcessDomainErrors(t *testing.T) {
 		}
 
 		err := ProcessDomain(ctx, pool, q, resolve,
-			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}, resultSubs(), false, nil, nil)
+			PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}},
+			resultSubs(), false, nil, nil)
 		if err == nil || !errors.Is(err, context.Canceled) {
 			t.Fatalf("ошибка = %v, want context.Canceled", err)
 		}
@@ -1163,7 +1195,7 @@ func TestResultProcessDomainErrors(t *testing.T) {
 
 	t.Run("очередь не задана", func(t *testing.T) {
 		err := ProcessDomain(context.Background(), &resultFakePool{j: &resultJournal{}}, nil,
-			resultNewResolver(), queue.DNSDomain{ZoneID: 1, DomainID: 1, Name: "example.com"},
+			resultNewResolver(), PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 1, DomainID: 1, Name: "example.com"}},
 			resultSubs(), false, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "очередь не задана") {
 			t.Fatalf("ошибка = %v, want «очередь не задана»", err)
@@ -1171,10 +1203,196 @@ func TestResultProcessDomainErrors(t *testing.T) {
 	})
 }
 
+// --- staging-пометка публикации q:http (T-108) --------------------------------
+
+// TestResultMarkHTTPPublished — пометка после публикации: точный SQL
+// (OR бита с сохранением прочих), охраны done/deleted, ошибки, отмена.
+func TestResultMarkHTTPPublished(t *testing.T) {
+	t.Run("ставит бит одним UPDATE", func(t *testing.T) {
+		pool := &resultFakePool{j: &resultJournal{}}
+		marked, err := MarkHTTPPublished(context.Background(), pool, 7, 42)
+		if err != nil || !marked {
+			t.Fatalf("MarkHTTPPublished = (%v, %v), want (true, nil)", marked, err)
+		}
+		execs := pool.resultPoolExecs()
+		if len(execs) != 1 || execs[0].sql != resultMarkPublishedSQL {
+			t.Fatalf("execs = %+v, want один resultMarkPublishedSQL", execs)
+		}
+		if !reflect.DeepEqual(execs[0].args, []any{int16(7), int64(42)}) {
+			t.Errorf("args = %v, want [7 42]", execs[0].args)
+		}
+	})
+
+	t.Run("охраны отсекли строку — успех без бита", func(t *testing.T) {
+		pool := &resultFakePool{j: &resultJournal{},
+			execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0")}}
+		marked, err := MarkHTTPPublished(context.Background(), pool, 7, 42)
+		if err != nil {
+			t.Fatalf("MarkHTTPPublished: %v", err)
+		}
+		if marked {
+			t.Error("marked = true, want false (done/deleted)")
+		}
+	})
+
+	t.Run("ошибка БД", func(t *testing.T) {
+		pool := &resultFakePool{j: &resultJournal{}, execErr: errors.New("бд недоступна")}
+		_, err := MarkHTTPPublished(context.Background(), pool, 7, 42)
+		if err == nil || !strings.Contains(err.Error(), "пометка публикации домена 7/42") {
+			t.Fatalf("ошибка = %v, want «пометка публикации домена 7/42»", err)
+		}
+	})
+
+	t.Run("пул не задан", func(t *testing.T) {
+		if _, err := MarkHTTPPublished(context.Background(), nil, 1, 1); err == nil ||
+			!strings.Contains(err.Error(), "пул не задан") {
+			t.Fatalf("ошибка = %v, want «пул не задан»", err)
+		}
+	})
+
+	t.Run("отмена ctx", func(t *testing.T) {
+		pool := &resultFakePool{j: &resultJournal{}}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := MarkHTTPPublished(ctx, pool, 7, 42); err == nil {
+			t.Fatal("отменённый ctx = nil, want ошибка контекста")
+		}
+	})
+}
+
+// TestResultProcessDomainPublishedSkip — повторная доставка эпизода с
+// опубликованной задачей (бит http_published стоит): публикация
+// пропускается (нет дубля q:http), пометка не повторяется, эпизод доходит
+// до записи — домен получает done (T-108).
+func TestResultProcessDomainPublishedSkip(t *testing.T) {
+	j := &resultJournal{}
+	pool := &resultFakePool{j: j}
+	q := &resultFakeQueue{j: j}
+	resolve := resultNewResolver()
+	resultSetDelegated(resolve, "example.com")
+
+	dom := PendingDomain{
+		DNSDomain:     queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"},
+		HTTPPublished: true, // предыдущая попытка опубликовала, запись не прошла
+	}
+	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), false, nil, nil); err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+
+	if n := j.count(resultEvPublish); n != 0 {
+		t.Errorf("публикаций %d, want 0 (задача уже опубликована — дубль исключён)", n)
+	}
+	execs := pool.resultPoolExecs()
+	if len(execs) != 1 || execs[0].sql != resultUpdateKeepStatusSQL {
+		t.Fatalf("execs = %+v, want одна запись без повторной пометки", execs)
+	}
+	if !reflect.DeepEqual(execs[0].args, []any{int16(3), int64(11), int64(mustMask(t, 0, 1))}) {
+		t.Errorf("args записи = %v", execs[0].args)
+	}
+}
+
+// TestResultProcessDomainMarkFailure — сбой UPDATE пометки после успешной
+// публикации — non-fatal (T-108): эпизод завершается записью, плата —
+// возможный дубль q:http на повторной доставке, не потеря.
+func TestResultProcessDomainMarkFailure(t *testing.T) {
+	j := &resultJournal{}
+	// Первый Exec (пометка) падает, запись (второй) — проходит.
+	pool := &resultFakePool{j: j, execErrs: []error{errors.New("бд моргнула"), nil}}
+	q := &resultFakeQueue{j: j}
+	resolve := resultNewResolver()
+	resultSetDelegated(resolve, "example.com")
+
+	dom := PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}}
+	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), false, nil, nil); err != nil {
+		t.Fatalf("ProcessDomain: %v, want nil (пометка non-fatal)", err)
+	}
+	if n := j.count(resultEvPublish); n != 1 {
+		t.Errorf("публикаций %d, want 1", n)
+	}
+	execs := pool.resultPoolExecs()
+	if len(execs) != 2 || execs[0].sql != resultMarkPublishedSQL || execs[1].sql != resultUpdateKeepStatusSQL {
+		t.Fatalf("execs = %+v, want упавшая пометка + запись", execs)
+	}
+}
+
+// TestResultProcessBatchRedeliveryPartial — сценарий T-108 целиком:
+// первая попытка пачки из трёх делегированных доменов — первый записан,
+// у двух остальных запись упала после публикации (пометка стоит);
+// повторная доставка — записанный отсечён фильтром, опубликованные
+// доводятся до записи БЕЗ повторной публикации (дублей q:http нет),
+// доставка подтверждается (XACK-семантика Processing не меняется).
+func TestResultProcessBatchRedeliveryPartial(t *testing.T) {
+	newDelivery := func() queue.Delivery {
+		return resultDelivery("7-1", "task-7",
+			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "a.example.com"},
+			queue.DNSDomain{ZoneID: 3, DomainID: 12, Name: "b.example.com"},
+			queue.DNSDomain{ZoneID: 3, DomainID: 13, Name: "c.example.com"})
+	}
+
+	// Попытка 1: Concurrency 1 — детерминированный порядок Exec:
+	// a: пометка(0), запись(1); b: пометка(2), запись(3) — сбой;
+	// c: пометка(4), запись(5) — сбой.
+	j := &resultJournal{}
+	q := &resultFakeQueue{j: j}
+	resolve := resultNewResolver()
+	resultSetDelegated(resolve, "a.example.com")
+	resultSetDelegated(resolve, "b.example.com")
+	resultSetDelegated(resolve, "c.example.com")
+
+	dbDown := errors.New("бд моргнула")
+	pool1 := &resultFakePool{j: j, subdomains: resultSubs(),
+		execErrs: []error{nil, nil, nil, dbDown, nil, dbDown}}
+	err := processBatch(context.Background(), pool1, q, resolve, newDelivery(),
+		Options{Concurrency: 1}, nil, slog.New(slog.DiscardHandler))
+	if err == nil || !errors.Is(err, dbDown) {
+		t.Fatalf("processBatch (попытка 1) = %v, want ошибка записи", err)
+	}
+	if got := len(q.resultPublishes()); got != 3 {
+		t.Fatalf("публикаций после попытки 1 = %d, want 3 (по одной на домен)", got)
+	}
+
+	// Повторная доставка: a записан (done — фильтр отсекает), b и c —
+	// не записаны с битом http_published (публикация была). Запись БД
+	// восстановлена.
+	pool2 := &resultFakePool{j: j, subdomains: resultSubs(), pending: [][3]any{
+		{int16(3), int64(12), int16(model.FlagHTTPPublished)},
+		{int16(3), int64(13), int16(model.FlagHTTPPublished)},
+	}}
+	if err := processBatch(context.Background(), pool2, q, resolve, newDelivery(),
+		Options{Concurrency: 1}, nil, slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatalf("processBatch (повторная доставка) = %v, want nil", err)
+	}
+
+	publishes := q.resultPublishes()
+	if len(publishes) != 3 {
+		t.Fatalf("публикаций всего = %d, want 3 — повторная доставка дублей не создаёт", len(publishes))
+	}
+	perDomain := map[int64]int{}
+	for _, p := range publishes {
+		perDomain[p.task.DomainID]++
+	}
+	for _, id := range []int64{11, 12, 13} {
+		if perDomain[id] != 1 {
+			t.Errorf("домен %d: публикаций %d, want ровно одна", id, perDomain[id])
+		}
+	}
+
+	// Повтор сделал только записи (без пометок — бит уже стоит).
+	execs := pool2.resultPoolExecs()
+	if len(execs) != 2 {
+		t.Fatalf("Exec повторной доставки = %d, want 2 (только записи)", len(execs))
+	}
+	for _, e := range execs {
+		if e.sql != resultUpdateKeepStatusSQL {
+			t.Errorf("SQL повтора = %q, want resultUpdateKeepStatusSQL (без пометки)", e.sql)
+		}
+	}
+}
+
 // --- PendingDomains / LoadSubdomains ---------------------------------------
 
 func TestResultPendingDomains(t *testing.T) {
-	t.Run("зеркало — все ключи пачки в её порядке", func(t *testing.T) {
+	t.Run("зеркало — все ключи пачки в её порядке, бит чист", func(t *testing.T) {
 		j := &resultJournal{}
 		pool := &resultFakePool{j: j}
 		batch := []queue.DNSDomain{
@@ -1186,8 +1404,13 @@ func TestResultPendingDomains(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PendingDomains: %v", err)
 		}
-		if !reflect.DeepEqual(out, batch) {
-			t.Errorf("итог = %+v, want вся пачка в порядке", out)
+		want := []PendingDomain{
+			{DNSDomain: batch[0]},
+			{DNSDomain: batch[1]},
+			{DNSDomain: batch[2]},
+		}
+		if !reflect.DeepEqual(out, want) {
+			t.Errorf("итог = %+v, want вся пачка в порядке без пометки", out)
 		}
 		ev := j.snapshot()
 		if len(ev) != 1 || ev[0].kind != resultEvQueryPend {
@@ -1202,18 +1425,41 @@ func TestResultPendingDomains(t *testing.T) {
 		}
 	})
 
-	t.Run("заготовленный фильтр — только недоработанные", func(t *testing.T) {
-		pool := &resultFakePool{j: &resultJournal{}, pending: [][2]any{{int16(3), int64(12)}}}
+	t.Run("заготовленный фильтр — только недоработанные, с битом публикации", func(t *testing.T) {
+		// a: done — отсечён; b: не записан, бит стоит (опубликован);
+		// c: не записан, бит чист (не доходил до публикации).
+		pool := &resultFakePool{j: &resultJournal{}, pending: [][3]any{
+			{int16(3), int64(12), int16(model.FlagHTTPPublished)},
+			{int16(3), int64(13), int16(0)},
+		}}
 		out, err := PendingDomains(context.Background(), pool, []queue.DNSDomain{
 			{ZoneID: 3, DomainID: 11, Name: "a.example.com"},
 			{ZoneID: 3, DomainID: 12, Name: "b.example.com"},
+			{ZoneID: 3, DomainID: 13, Name: "c.example.com"},
 		})
 		if err != nil {
 			t.Fatalf("PendingDomains: %v", err)
 		}
-		want := []queue.DNSDomain{{ZoneID: 3, DomainID: 12, Name: "b.example.com"}}
+		want := []PendingDomain{
+			{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 12, Name: "b.example.com"}, HTTPPublished: true},
+			{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 13, Name: "c.example.com"}},
+		}
 		if !reflect.DeepEqual(out, want) {
-			t.Errorf("итог = %+v, want %+v (имя восстанавливается из пачки)", out, want)
+			t.Errorf("итог = %+v, want %+v (имя из пачки, бит из flags)", out, want)
+		}
+	})
+
+	t.Run("чужие биты flags не читаются как http_published", func(t *testing.T) {
+		pool := &resultFakePool{j: &resultJournal{}, pending: [][3]any{
+			{int16(3), int64(11), int16(model.FlagIDN | model.FlagRenderPending)},
+		}}
+		out, err := PendingDomains(context.Background(), pool,
+			[]queue.DNSDomain{{ZoneID: 3, DomainID: 11, Name: "a.example.com"}})
+		if err != nil {
+			t.Fatalf("PendingDomains: %v", err)
+		}
+		if len(out) != 1 || out[0].HTTPPublished {
+			t.Errorf("итог = %+v, want один домен без пометки публикации", out)
 		}
 	})
 
@@ -1377,8 +1623,11 @@ func TestResultProcessBatchPoisonDomain(t *testing.T) {
 		t.Fatalf("processBatch = %v, want nil (ядовитый домен не роняет пачку)", err)
 	}
 	execs := pool.resultPoolExecs()
-	if len(execs) != 1 || execs[0].args[1].(int64) != 11 {
-		t.Fatalf("записи = %+v, want одна — только здоровый домен", execs)
+	if len(execs) != 2 || execs[0].sql != resultMarkPublishedSQL || execs[1].sql != resultUpdateKeepStatusSQL {
+		t.Fatalf("записи = %+v, want пометка + запись одного здорового домена", execs)
+	}
+	if execs[0].args[1].(int64) != 11 || execs[1].args[1].(int64) != 11 {
+		t.Fatalf("записи = %+v, want домен 11 (ядовитый пропущен)", execs)
 	}
 	if got := len(resolve.resultCalls()); got == 0 {
 		t.Fatal("здоровый домен не обработан")
@@ -1421,24 +1670,31 @@ func TestResultRunSmoke(t *testing.T) {
 		t.Fatal("Run не завершился после отмены ctx")
 	}
 
-	// Публикация — только домену с адресами; запись — обоим.
+	// Публикация — только домену с адресами; запись — обоим; пометка —
+	// только опубликованному (example.com).
 	publishes := q.resultPublishes()
 	if len(publishes) != 1 || publishes[0].task.DomainID != 11 ||
 		publishes[0].task.Name != "example.com" {
 		t.Fatalf("публикации = %+v, want одна q:http для example.com", publishes)
 	}
 	execs := pool.resultPoolExecs()
-	if len(execs) != 2 {
-		t.Fatalf("записей %d, want 2", len(execs))
+	if len(execs) != 3 {
+		t.Fatalf("записей %d, want 3 (пометка + запись example.com, запись gone)", len(execs))
 	}
-	byDomain := map[int64]resultExec{}
+	records := map[int64]resultExec{}
 	for _, e := range execs {
-		byDomain[e.args[1].(int64)] = e
+		if e.sql == resultMarkPublishedSQL {
+			if e.args[1].(int64) != 11 {
+				t.Errorf("пометка http_published = %+v, want домен 11", e.args)
+			}
+			continue
+		}
+		records[e.args[1].(int64)] = e
 	}
-	if sql := byDomain[11].sql; sql != resultUpdateKeepStatusSQL {
+	if sql := records[11].sql; sql != resultUpdateKeepStatusSQL {
 		t.Errorf("example.com: SQL = %q, want без status (адреса есть)", sql)
 	}
-	if sql := byDomain[12].sql; sql != resultUpdateStatusSQL {
+	if sql := records[12].sql; sql != resultUpdateStatusSQL {
 		t.Errorf("gone.example.com: SQL = %q, want со status (not_delegated)", sql)
 	}
 	acks := q.resultAcks()
@@ -1453,7 +1709,7 @@ func TestResultRunSmoke(t *testing.T) {
 // q:http, доставка подтверждается.
 func TestResultRunIdempotentRedelivery(t *testing.T) {
 	j := &resultJournal{ackNotify: make(chan struct{}, 4)}
-	pool := &resultFakePool{j: j, subdomains: resultSubs(), pending: [][2]any{}} // всё done/deleted
+	pool := &resultFakePool{j: j, subdomains: resultSubs(), pending: [][3]any{}} // всё done/deleted
 	q := &resultFakeQueue{j: j, deliveries: []queue.Delivery{
 		resultDelivery("2-1", "task-2",
 			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}),
