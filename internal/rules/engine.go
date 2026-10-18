@@ -90,8 +90,19 @@ func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
 // перезагружаются по SIGHUP без перезапуска, Evaluate зовут параллельные
 // горутины воркера): без кэша каждая страница платила бы компиляцию каждого
 // правила. Ошибки компиляции кэшируются тоже — некорректный паттерн не
-// перекомпилируется на каждом вызове.
+// перекомпилируется на каждом вызове. Время жизни кэша — текущий набор:
+// смена rules_version очищает его (resetCompileCache из Reloader.Reload),
+// записи ушедших паттернов и осевшие ошибки не накапливаются весь срок
+// жизни процесса.
 var compileCache sync.Map // string → compileResult
+
+// resetCompileCache очищает кэш компиляции при смене набора правил:
+// паттерны (и кэшированные ошибки компиляции) не живут дольше набора,
+// их породившего. Безопасна при параллельных Evaluate — конкурентный
+// compileCached по промаху просто перекомпилирует паттерн.
+func resetCompileCache() {
+	compileCache.Clear()
+}
 
 type compileResult struct {
 	re  *regexp.Regexp
