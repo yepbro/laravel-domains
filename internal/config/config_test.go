@@ -721,6 +721,8 @@ func TestValidate(t *testing.T) {
 		{"ingest_metrics_url не адрес", func(c *Config) { c.Monitor.IngestMetricsURL = "ingest:9101" }, "monitor.ingest_metrics_url"},
 		{"ingest_metrics_url не http(s)", func(c *Config) { c.Monitor.IngestMetricsURL = "ftp://ingest:9101/metrics" }, "monitor.ingest_metrics_url"},
 		{"web.listen кривой", func(c *Config) { c.Web.Listen = "no-port" }, "web.listen"},
+		{"web.listen относительный путь", func(c *Config) { c.Web.Listen = "web.sock" }, "web.listen"},
+		{"web.listen путь сокета длинный", func(c *Config) { c.Web.Listen = "/" + strings.Repeat("s", 101) }, "web.listen"},
 		{"web.rate_limit 0", func(c *Config) { c.Web.RateLimit = 0 }, "web.rate_limit"},
 		{"web.rate_limit велик", func(c *Config) { c.Web.RateLimit = 1001 }, "web.rate_limit"},
 		{"web.timeout 0", func(c *Config) { c.Web.Timeout = 0 }, "web.timeout"},
@@ -750,6 +752,7 @@ func TestValidate(t *testing.T) {
 	c.Render.RestartMemoryBytes = 0                                                    // контроль памяти отключён — допустимо
 	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)
 	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // границы весов
+	c.Web.Listen = "/run/crawler-web/web.sock"                                         // unix-сокет — вариант публичного входа web (T-124)
 	c.Subdomains = make([]string, maxSubdomains)
 	for i := range c.Subdomains {
 		c.Subdomains[i] = fmt.Sprintf("s%d", i)

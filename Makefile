@@ -21,7 +21,26 @@ ALPINE_VERSION ?= $(shell sed -n 's/^ALPINE_VERSION=\(.*\)/\1/p' .env 2>/dev/nul
 PG_ADMIN_USER  ?= $(shell sed -n 's/^POSTGRES_ADMIN_USER=\(.*\)/\1/p' .env 2>/dev/null)
 PG_DB          ?= $(shell sed -n 's/^POSTGRES_DB=\(.*\)/\1/p' .env 2>/dev/null)
 
-BUILD_ARGS := --build-arg GO_VERSION=$(GO_VERSION) --build-arg ALPINE_VERSION=$(ALPINE_VERSION)
+# Standalone-CLI Tailwind v4 — стадия css Dockerfile.go и make web-css
+# (бандл лендинга, T-124); дефолт — как ARG в Dockerfile, .env может
+# поднять. Архитектура хоста выбирает musl-сборку CLI (x64 | arm64).
+TAILWINDCSS_VERSION ?= $(or $(shell sed -n 's/^TAILWINDCSS_VERSION=\(.*\)/\1/p' .env 2>/dev/null),v4.3.3)
+UNAME_M := $(shell uname -m)
+ifeq ($(findstring aarch64,$(UNAME_M)),aarch64)
+TAILWIND_ARCH ?= arm64
+else ifeq ($(filter x86_64 amd64,$(UNAME_M)),)
+TAILWIND_ARCH ?= unsupported
+else
+TAILWIND_ARCH ?= x64
+endif
+# Владелец генерата web-css на bind-mount — разработчик (как сервисы app).
+DEV_UID := $(or $(shell sed -n 's/^DEV_UID=\(.*\)/\1/p' .env 2>/dev/null),1000)
+DEV_GID := $(or $(shell sed -n 's/^DEV_GID=\(.*\)/\1/p' .env 2>/dev/null),1000)
+
+TAILWINDCSS_URL := https://github.com/tailwindlabs/tailwindcss/releases/download/$(TAILWINDCSS_VERSION)/tailwindcss-linux-$(TAILWIND_ARCH)-musl
+
+BUILD_ARGS := --build-arg GO_VERSION=$(GO_VERSION) --build-arg ALPINE_VERSION=$(ALPINE_VERSION) \
+	--build-arg TAILWINDCSS_VERSION=$(TAILWINDCSS_VERSION)
 
 # Версия/ревизия боевых образов для метрик crawler_build_info (T-111):
 # .git исключён .dockerignore, значения вычисляются на вызывающей машине
@@ -116,6 +135,25 @@ build-runtime: ## Собрать боевые образы (runtime + render) д
 		--target runtime -t crawler/runtime:check .
 	docker build $(BUILD_ARGS) $(VERSION_ARGS) -f deploy/docker/Dockerfile.render \
 		--target render -t crawler/render:check .
+
+# Бандл Tailwind лендинга (T-124): исходник internal/web/static/app.src.css →
+# app.css (go:embed, собирается в бинарь). В git хранится placeholder — после
+# правок шаблона/исходника CSS запустите цель для dev-просмотра; сборка боевых
+# образов собирает CSS сама (стадия css Dockerfile.go), node не нужен.
+.PHONY: web-css
+web-css: ## Собрать CSS лендинга (Tailwind v4: app.src.css → static/app.css)
+	$(check_env)
+	@test "$(TAILWIND_ARCH)" = "x64" || test "$(TAILWIND_ARCH)" = "arm64" || { \
+	  echo "ОШИБКА: нет musl-сборки tailwindcss под $(shell uname -m) (x86_64/aarch64)."; exit 1; }
+	docker run --rm -v $(CURDIR):/src \
+	  -w /src/internal/web/static alpine:$(ALPINE_VERSION) sh -eu -c '\
+	  apk add --no-cache libstdc++ libgcc >/dev/null \
+	  && wget -q -O /tmp/tailwindcss $(TAILWINDCSS_URL) \
+	  && chmod +x /tmp/tailwindcss \
+	  && /tmp/tailwindcss -i app.src.css -o app.css --minify \
+	  && chown $(DEV_UID):$(DEV_GID) app.css'
+	@echo 'internal/web/static/app.css собран (генерат).'
+	@echo 'Вернуть placeholder перед коммитом: git checkout -- internal/web/static/app.css'
 
 GO_PKGS := ./cmd/... ./internal/... ./migrations/... ./test/... ./deploy/postgres
 

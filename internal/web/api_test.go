@@ -80,6 +80,37 @@ func TestRateLimit(t *testing.T) {
 	}
 }
 
+// TestClientIP — адрес посетителя за reverse-proxy (T-124): X-Real-IP
+// доверяется только от loopback-пира (все соединения nginx) и только
+// валидному IP; снаружи и с чужого адреса заголовок игнорируется —
+// подделка не расходует чужой бакет рейт-лимита.
+func TestClientIP(t *testing.T) {
+	req := func(remote, real string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/api/check-domain", nil)
+		r.RemoteAddr = remote
+		if real != "" {
+			r.Header.Set("X-Real-IP", real)
+		}
+		return r
+	}
+	for _, tt := range []struct {
+		name           string
+		remote, realIP string
+		want           string
+	}{
+		{"прямой адрес без заголовка", "203.0.113.7:44321", "", "203.0.113.7"},
+		{"nginx loopback + X-Real-IP", "127.0.0.1:51234", "198.51.100.9", "198.51.100.9"},
+		{"nginx ipv6-loopback + X-Real-IP", "[::1]:51234", "198.51.100.9", "198.51.100.9"},
+		{"loopback + мусорный заголовок", "127.0.0.1:51234", "not-an-ip", "127.0.0.1"},
+		{"loopback + заголовок с портом", "127.0.0.1:51234", "198.51.100.9:443", "127.0.0.1"},
+		{"чужой адрес + подделка заголовка", "203.0.113.7:44321", "198.51.100.9", "203.0.113.7"},
+	} {
+		if got := clientIP(req(tt.remote, tt.realIP)); got != tt.want {
+			t.Errorf("%s: clientIP = %q, хочу %q", tt.name, got, tt.want)
+		}
+	}
+}
+
 // TestCheckDomainE2E — фейковый чекер: 200 + JSON с found/score/записями,
 // запись web_checks, повторные запросы в пределах лимита.
 func TestCheckDomainE2E(t *testing.T) {

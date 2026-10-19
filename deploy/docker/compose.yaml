@@ -373,6 +373,32 @@ services:
         condition: service_healthy
     profiles: ["app"]
 
+  web:
+    # Публичный лендинг (этап 13, T-124) — единственный сервис с портом
+    # наружу: в dev публикуется на loopback хоста (127.0.0.1:WEB_PORT,
+    # web.listen в config.dev.yaml слушает 8080 в контейнере); боевой
+    # вход — reverse-proxy с TLS (deploy/nginx/, docs/deploy.md).
+    # METRICS_ADDR разворачивает метрики на интерфейсы docker-сети для
+    # Prometheus (наружу порт не публикуется — ТЗ §9); дефолт кода/юнита —
+    # loopback 127.0.0.1:9107.
+    <<: [*go-common, *app-dns]
+    build: *go-build
+    command: ["./deploy/docker/scripts/air-entrypoint.sh"]
+    environment:
+      <<: *go-common-env
+      SERVICE: web
+      METRICS_PORT: "9107"
+      METRICS_ADDR: ":9107"
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8081}:8080"
+    mem_limit: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles: ["app"]
+
   chromium:
     # Headless Chromium для render-worker (CDP на :9222).
     # shm_size вместо --disable-dev-shm-usage; init — уборка zombie (ТЗ 4.3).

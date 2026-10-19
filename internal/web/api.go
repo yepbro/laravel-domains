@@ -252,12 +252,23 @@ func (s *Server) recordCheck(ctx context.Context, punycode string, found bool, s
 	}
 }
 
-// clientIP — адрес клиента без прокси-заголовков (reverse-proxy T-124
-// пробрасывает адрес согласно своей конфигурации; из коробки — RemoteAddr).
+// clientIP — адрес клиента для рейт-лимита и журнала web_checks.
+// За reverse-proxy (T-124) все соединения приходят с loopback nginx —
+// тогда адрес посетителя несёт X-Real-IP (образец nginx перезаписывает
+// его значением $remote_addr — подделать снаружи нельзя, а сам сервис
+// слушает loopback, прямых соединений с визитором нет). Заголовку
+// доверяем только от loopback-пира и только валидному IP; иначе —
+// RemoteAddr (подделка заголовка снаружи и с чужих адресов не
+// расходует чужой бакет).
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if pip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); pip != nil {
+			return pip.String()
+		}
 	}
 	return host
 }

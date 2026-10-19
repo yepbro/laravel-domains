@@ -19,6 +19,8 @@
 //     форма, SEO canonical/hreflang/OG/Twitter);
 //   - POST /api/check-domain — живая проверка (T-123, заглушка 501);
 //   - GET /healthz     — readiness: ping PostgreSQL (503 при отказе);
+//   - GET /robots.txt  — статика из embed (T-124);
+//   - GET /sitemap.xml — минимальный sitemap локалей (T-124);
 //   - GET /static/*    — статика лендинга (go:embed; app.css —
 //     генерат Tailwind, placeholder до make web-css/T-124).
 package web
@@ -27,6 +29,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html/template"
@@ -34,6 +37,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -158,6 +162,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/check-domain", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
+	// Точные маршруты корня выигрывают у catch-all лендинга (GET /).
+	mux.HandleFunc("GET /robots.txt", s.handleRobots)
+	mux.HandleFunc("GET /sitemap.xml", s.handleSitemap)
 	mux.HandleFunc("GET /static/", s.handleStatic)
 	mux.HandleFunc("GET /{$}", s.handleRoot)
 	mux.HandleFunc("GET /", s.handleLanding)
@@ -167,10 +174,33 @@ func (s *Server) Handler() http.Handler {
 // Run — жизненный цикл: слушатель web.listen, graceful stop по отмене
 // ctx (бюджет остановки каркаса — 10 с: Shutdown с меньшим окном,
 // начатые ответы дорабатывают). Вызывается из OnRun cmd/web.
+//
+// Адрес — [host]:port (TCP) или абсолютный путь (unix-сокет — вариант
+// деплоя за nginx без занятия TCP-порта, T-124; валидация конфига
+// различает форму). Осиротевший файл сокета (крах/SIGKILL прошлой
+// серии — defer уже не отработает) снимается до Listen, иначе рестарт
+// по Restart=on-failure циклился бы на address already in use до
+// StartLimitBurst; удаляется и после штатной остановки.
 func (s *Server) Run(ctx context.Context, listen string) error {
-	ln, err := net.Listen("tcp", listen)
+	network := "tcp"
+	if strings.HasPrefix(listen, "/") {
+		network = "unix"
+	}
+	if network == "unix" {
+		// Путь принадлежит сервису (RuntimeDirectory юнита / t.TempDir в
+		// тестах) — снятие чужого живого сокета не сценарий.
+		if err := os.Remove(listen); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("web: старый сокет %s: %w", listen, err)
+		}
+	}
+	ln, err := net.Listen(network, listen)
 	if err != nil {
 		return fmt.Errorf("web: слушатель %s: %w", listen, err)
+	}
+	if network == "unix" {
+		// Ошибка удаления файла сокета не повод ронять результат Run —
+		// перезапуск всё равно перезапишет/подскажет оператору.
+		defer func() { _ = os.Remove(listen) }()
 	}
 	srv := &http.Server{
 		Handler:           s.Handler(),
@@ -267,4 +297,50 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
+}
+
+// handleRobots — GET /robots.txt: статика из embed (T-124). Индексируются
+// страницы локалей и статика; API формы проверки и healthz ботам закрыты.
+// Строки Sitemap нет: адрес публикации в конфигурации не хранится,
+// /sitemap.xml находится по стандартному пути.
+func (s *Server) handleRobots(w http.ResponseWriter, r *http.Request) {
+	b, err := staticFS.ReadFile("static/robots.txt")
+	if err != nil {
+		// embed — файл в бинаре; отсутствие это ошибка сборки.
+		s.opt.Log.Error("robots.txt отсутствует в embed", "err", err)
+		http.Error(w, "temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(b)
+}
+
+// handleSitemap — GET /sitemap.xml: минимальный sitemap — только
+// статические страницы-локали (T-124), доменных страниц у лендинга нет.
+// <loc> обязан быть абсолютным URL, а адрес публикации в конфигурации
+// не хранится — схема и хост берутся из запроса (за reverse-proxy их
+// передаёт nginx: X-Forwarded-Proto, Host), поэтому sitemap собирается
+// на запрос, а не лежит статикой.
+func (s *Server) handleSitemap(w http.ResponseWriter, r *http.Request) {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	// За reverse-proxy соединение к сервису всегда http: реальную схему
+	// клиента несёт X-Forwarded-Proto (может быть списком — берём первую).
+	// Чужие значения заголовка игнорируем: <loc> ограничен web-адресами.
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		first, _, _ := strings.Cut(proto, ",")
+		switch strings.ToLower(strings.TrimSpace(first)) {
+		case "http", "https":
+			scheme = strings.TrimSpace(first)
+		}
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	_, _ = fmt.Fprint(w, xml.Header, `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`+"\n")
+	for _, loc := range Locales {
+		url := template.HTMLEscapeString(fmt.Sprintf("%s://%s/%s", scheme, r.Host, loc))
+		_, _ = fmt.Fprintf(w, "\t<url>\n\t\t<loc>%s</loc>\n\t\t<changefreq>daily</changefreq>\n\t\t<priority>1.0</priority>\n\t</url>\n", url)
+	}
+	_, _ = fmt.Fprint(w, "</urlset>\n")
 }

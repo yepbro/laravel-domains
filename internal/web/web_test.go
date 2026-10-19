@@ -8,9 +8,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -349,5 +352,145 @@ func TestRunGracefulStop(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("сервер не остановился после отмены ctx")
+	}
+}
+
+// TestRunUnixSocket — listen абсолютным путём = unix-сокет (вариант
+// деплоя за nginx без TCP-порта, T-124): сервер отвечает, чистая
+// остановка убирает файл сокета. Осиротевший файл (крах прошлой серии —
+// SIGKILL, defer не отработал) снимается до Listen: иначе рестарт по
+// Restart=on-failure циклился бы на address already in use.
+func TestRunUnixSocket(t *testing.T) {
+	srv := newTestServer(t, &fakeDB{seed: seedLanding()})
+	sock := filepath.Join(t.TempDir(), "web.sock")
+
+	// «Осиротевший» сокет прошлой серии: обычный файл на пути Listen.
+	if err := os.WriteFile(sock, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx, sock) }()
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", sock)
+		},
+	}}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, err := client.Get("http://unix/healthz")
+		if err == nil {
+			_ = resp.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("unix-сокет не поднялся за 2 с")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run(unix) после отмены: %v, хочу nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("unix-сокет не остановился после отмены ctx")
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Errorf("файл сокета %s не убран после остановки (stat err: %v)", sock, err)
+	}
+}
+
+// TestRobotsSitemap — служебные файлы поисковых роботов у корня (T-124):
+// robots.txt — статика из embed; sitemap.xml — минимальный набор
+// локалей с абсолютным URL из запроса (схему за reverse-proxy передаёт
+// X-Forwarded-Proto); POST на маршруты — 405.
+func TestRobotsSitemap(t *testing.T) {
+	srv := newTestServer(t, &fakeDB{seed: seedLanding()})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/robots.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("robots.txt = %d, хочу 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("robots.txt Content-Type = %q, хочу text/plain", ct)
+	}
+	for _, want := range []string{"User-agent: *", "Disallow: /api/"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("robots.txt не содержит %q", want)
+		}
+	}
+
+	// sitemap: URL обеих локалей с хостом запроса; ничего лишнего.
+	resp, err = http.Get(ts.URL + "/sitemap.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("sitemap.xml = %d, хочу 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/xml; charset=utf-8" {
+		t.Errorf("sitemap.xml Content-Type = %q, хочу application/xml", ct)
+	}
+	s := string(body)
+	if !strings.Contains(s, `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`) {
+		t.Errorf("sitemap.xml без схемы sitemap 0.9:\n%s", s)
+	}
+	for _, locale := range Locales {
+		if !strings.Contains(s, "<loc>"+ts.URL+"/"+locale+"</loc>") {
+			t.Errorf("sitemap.xml без URL локали /%s:\n%s", locale, s)
+		}
+	}
+	if n := strings.Count(s, "<loc>"); n != len(Locales) {
+		t.Errorf("sitemap.xml содержит %d URL, хочу %d (только локали):\n%s", n, len(Locales), s)
+	}
+
+	// За reverse-proxy схему передаёт X-Forwarded-Proto (публичный вход
+	// — TLS), Host берётся из запроса. Чужое значение заголовка
+	// игнорируется (остаётся схема соединения).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sitemap.xml", nil)
+	req.Host = "crawler.example.com"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("sitemap.xml за прокси = %d, хочу 200", rec.Code)
+	}
+	if want := "<loc>https://crawler.example.com/ru</loc>"; !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("sitemap.xml за прокси без %q:\n%s", want, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/sitemap.xml", nil)
+	req.Host = "crawler.example.com"
+	req.Header.Set("X-Forwarded-Proto", "javascript") // мусор — не web-схема
+	srv.Handler().ServeHTTP(rec, req)
+	if want := "<loc>http://crawler.example.com/ru</loc>"; !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("sitemap.xml с мусорной схемой без %q:\n%s", want, rec.Body.String())
+	}
+
+	// Маршруты GET-only: POST отдаётся mux-ом как 405.
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/robots.txt", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST /robots.txt = %d, хочу 405", resp.StatusCode)
 	}
 }

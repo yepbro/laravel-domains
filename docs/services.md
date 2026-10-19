@@ -218,7 +218,8 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 
 ## Рабочая логика сервисов
 
-Все семь сервисов реализованы и подключаются через `OnRun`/`OnDBPool`
+Все семь конвейерных сервисов (плюс публичный `web` этапа 13 — ниже)
+реализованы и подключаются через `OnRun`/`OnDBPool`
 (сервис без `OnRun` тоже валиден: `/livez`, `/healthz` и `/metrics`
 подняты, он
 живёт до SIGTERM/SIGINT и корректно останавливается — каркас не требует
@@ -572,11 +573,28 @@ count-up, облако зон топ-50 с лог-масштабом и колл
 SEO canonical/hreflang/OG/Twitter, счётчик Яндекс.Метрики), данные —
 кэши T-120 + laravel_history («находки за 24 ч», T-118), `POST
 /api/check-domain` — живая проверка из формы (T-123), `GET /healthz` —
-readiness ping PostgreSQL (503), `GET /static/*` — статика (go:embed;
-`app.css` — генерат Tailwind `make web-css`, в git placeholder).
-Шаблоны — `html/template` + `go:embed`, новых зависимостей нет.
+readiness ping PostgreSQL (503), `GET /robots.txt` и
+`GET /sitemap.xml` — служебные файлы поисковых роботов (T-124:
+robots — статика из embed, sitemap — минимальный набор локалей,
+абсолютные URL собираются из запроса — адрес публикации в конфиге
+не хранится), `GET /static/*` — статика (go:embed). Шаблоны —
+`html/template` + `go:embed`, новых зависимостей нет.
+
+CSS лендинга — Tailwind v4 без node: исходник
+`internal/web/static/app.src.css` (классы сканируются `@source`-ом
+шаблона), собранный бандл в git не хранится (там placeholder —
+свежий клон даёт страницу без стилей, не 500). Сборка: стадия `css`
+в `deploy/docker/Dockerfile.go` (alpine + standalone-CLI tailwindcss,
+версия — `TAILWINDCSS_VERSION` в `.env`; генерат подменяет placeholder
+в build-стадии до `go build` — go:embed встраивает настоящий CSS) или
+`make web-css` для dev-просмотра (одноразовый docker run).
+
 Конфигурация — секция `web` (`listen`/`rate_limit`/`timeout`,
-[`configuration.md`](configuration.md)).
+[`configuration.md`](configuration.md)). Развёртывание (T-124):
+dev — compose-сервис `web` профиля app (порт лендинга публикуется на
+`127.0.0.1` хоста, `WEB_PORT`); бой — юнит `crawler-web.service`
+(docs/deploy.md) за reverse-proxy с TLS (первый образец —
+`deploy/nginx/`).
 
 Подробности браузерного слоя (изоляция, блокировка ресурсов, ожидание,
 съём результата) — [`render.md`](render.md); live-проверки против

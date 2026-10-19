@@ -120,7 +120,7 @@ SELECT * FROM schema_migrations;   -- version, dirty = false
 | Где | Команда |
 |---|---|
 | dev | `make logs SERVICE=<имя>`; `dc logs -f --tail=100 <сервис>` ([`docker.md`](docker.md) §2) |
-| бой, сервисы | `journalctl -t crawler-<сервис> -f` (SyslogIdentifier; имена — `crawler-ingest`, `crawler-scheduler`, `crawler-dns-worker`, `crawler-http-worker`, `crawler-render-worker`, `crawler-analyzer`, `crawler-monitor`) |
+| бой, сервисы | `journalctl -t crawler-<сервис> -f` (SyslogIdentifier; имена — `crawler-ingest`, `crawler-scheduler`, `crawler-dns-worker`, `crawler-http-worker`, `crawler-render-worker`, `crawler-analyzer`, `crawler-monitor`, `crawler-web`) |
 | бой, пакеты ОС | `journalctl -u postgresql -u redis-server -u unbound` |
 | SMART | `journalctl -t smartd -p warning` ([`disks.md`](disks.md) §6) |
 

@@ -62,7 +62,7 @@ make clean                   # остановить и удалить тома (
 |---|---|
 | (по умолчанию) | `postgres`, `redis`, `unbound` |
 | `testbed` | `coredns`, `testweb` (Caddy), `mockserver` |
-| `app` | Go-сервисы (`ingest` … `monitor`, `render-worker`) + `chromium` |
+| `app` | Go-сервисы (`ingest` … `monitor`, `render-worker`) + публичный лендинг `web` (http://127.0.0.1:8081) + `chromium` |
 
 Миграции PostgreSQL отдельного сервиса не имеют: каждый Go-сервис применяет
 их сам при старте (см. [`migrations.md`](migrations.md)).
@@ -86,6 +86,14 @@ make test-integration# интеграционные тесты окружени�
 docker compose --project-directory . -f deploy/docker/compose.yaml --env-file .env \
   --profile monitoring --profile tools up -d
 ```
+
+Стили лендинга (Tailwind v4) собираются в бинарь через go:embed: в git
+лежит placeholder, для dev-просмотра с настоящими стилями соберите бандл
+один раз после правок шаблона/исходника — `make web-css` (одноразовый
+контейнер, node не нужен; боевая docker-сборка делает это сама — стадия
+`css` в Dockerfile.go). Цель пишет генерат в отслеживаемый путь
+`internal/web/static/app.css` — перед коммитом верните placeholder:
+`git checkout -- internal/web/static/app.css`.
 
 ### Режим internet (осторожно)
 
@@ -400,9 +408,9 @@ make debug SERVICE=dns-worker
 Для постоянного запуска сервиса под отладчиком скопируйте
 `deploy/docker/compose.override.example.yaml` → `compose.override.yaml`.
 
-Метрики: каждый сервис отдаёт `/metrics` на своём порту (9100–9106), см.
-`deploy/docker/prometheus/prometheus.yml`. UI Prometheus — после включения
-профиля `monitoring`, http://127.0.0.1:9090/targets.
+Метрики: каждый сервис отдаёт `/metrics` на своём порту (9100–9107, web —
+9107), см. `deploy/docker/prometheus/prometheus.yml`. UI Prometheus — после
+включения профиля `monitoring`, http://127.0.0.1:9090/targets.
 
 БД и очереди:
 

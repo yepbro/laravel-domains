@@ -20,6 +20,9 @@ make test        # модульные тесты
 make test-integration  # проверка окружения на testbed
 ```
 
+Лендинг (профиль app) после старта — http://127.0.0.1:8081 (порт `WEB_PORT`
+в `.env`, публикуется только на loopback).
+
 ## Документация
 
 Карта документации (та же таблица с пояснениями «когда читать» — в
@@ -69,10 +72,11 @@ make test-integration  # проверка окружения на testbed
 
 | Каталог | Назначение |
 |---|---|
-| `cmd/` | Go-сервисы (ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, crawlerctl) и утилиты testbed (mockserver, testbedgen) |
-| `internal/` | Общий код: каркас сервисов (`service`, [docs/services.md](docs/services.md)), конфигурация (`config`), доступ к PostgreSQL — пул и массовая запись (`db`), модель домена — статусы, флаги, маски субдоменов (`model`), нормализация имён — punycode/UTS-46, публичные суффиксы (`idn`), метрики Prometheus (`metrics`), миграции при старте (`migrate`), приём файлов — наблюдение и конвейер ingest (`watch`, `ingest`), планировщик — выборка/постановка/lease/перепроверки (`scheduler`), очереди Redis Streams (`queue`), DNS-клиент с лимитами (`dnsclient`) и цикл q:dns (`dnsworker`), HTTP-транспорт с лимитами и редиректами (`httpfetch`) и цикл q:http (`httpworker`), хранилище контента (`content`, [docs/content.md](docs/content.md)), рендер (`render`, [docs/render.md](docs/render.md)) и цикл q:render (`renderworker`), движок правил Laravel и цикл q:analyze (`rules`, `analyzer`, [docs/analyzer.md](docs/analyzer.md)), счётчики зон и алерты (`monitor`) |
+| `cmd/` | Go-сервисы (ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, web — публичный лендинг, crawlerctl) и утилиты testbed (mockserver, testbedgen) |
+| `internal/` | Общий код: каркас сервисов (`service`, [docs/services.md](docs/services.md)), конфигурация (`config`), доступ к PostgreSQL — пул и массовая запись (`db`), модель домена — статусы, флаги, маски субдоменов (`model`), нормализация имён — punycode/UTS-46, публичные суффиксы (`idn`), метрики Prometheus (`metrics`), миграции при старте (`migrate`), приём файлов — наблюдение и конвейер ingest (`watch`, `ingest`), планировщик — выборка/постановка/lease/перепроверки (`scheduler`), очереди Redis Streams (`queue`), DNS-клиент с лимитами (`dnsclient`) и цикл q:dns (`dnsworker`), HTTP-транспорт с лимитами и редиректами (`httpfetch`) и цикл q:http (`httpworker`), хранилище контента (`content`, [docs/content.md](docs/content.md)), рендер (`render`, [docs/render.md](docs/render.md)) и цикл q:render (`renderworker`), движок правил Laravel и цикл q:analyze (`rules`, `analyzer`, [docs/analyzer.md](docs/analyzer.md)), счётчики зон и алерты (`monitor`), публичный лендинг — i18n, форма проверки, Tailwind-статика (`web`) |
 | `deploy/docker/` | Compose-окружение, Dockerfile'ы, конфиги, testbed |
 | `deploy/systemd/` | Боевой деплой на целевом сервере: systemd-юниты сервисов, drop-in'ы бюджета пакетов ОС, окружение ([docs/deploy.md](docs/deploy.md)) |
+| `deploy/nginx/` | Образец публичной точки входа: reverse-proxy с TLS перед лендингом `web` ([docs/deploy.md](docs/deploy.md) §6) |
 | `deploy/sysctl/` | Тюнинг ядра боевого сервера (ТЗ §10.2): `99-crawler.conf` для `/etc/sysctl.d` + инструкция применения; расчёты — [docs/os-tuning.md](docs/os-tuning.md) |
 | `deploy/smartd/` | Мониторинг SMART/TBW NVMe (ТЗ §10.3): конфиг smartd, обработчик предупреждений в syslog/journald, udev-правило и drop-in доступа алерта monitor к `/dev/nvme*`; расчёты — [docs/disks.md](docs/disks.md) |
 | `migrations/` | Миграции PostgreSQL (golang-migrate): встраиваются в бинарники и применяются сервисами при старте |

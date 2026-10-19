@@ -1,0 +1,8 @@
+# robots.txt лендинга Domain Crawler (T-124): индексируются страницы
+# локалей и статика; API формы проверки и служебный healthz ботам
+# не нужны. Sitemap — /sitemap.xml (маршрут собирает абсолютные URL
+# локалей из запроса; отдельной строки Sitemap в robots нет, т.к. адрес
+# публикации в конфиге не хранится — см. internal/web/web.go).
+User-agent: *
+Disallow: /api/
+Disallow: /healthz

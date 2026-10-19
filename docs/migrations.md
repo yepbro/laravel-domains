@@ -13,7 +13,7 @@
 | Подключение к запуску | `internal/service` | DSN из конфигурации (`Options.Config`, ТЗ 5.10) или `Options.PGDSN` → `migrate.Up` до старта HTTP-сервера метрик |
 
 Все долгоживущие сервисы (ingest, scheduler, dns-worker, http-worker,
-render-worker, analyzer, monitor) применяют миграции при старте: healthcheck
+render-worker, analyzer, monitor, web) применяют миграции при старте: healthcheck
 начинает отвечать только на актуальной схеме. `crawlerctl` миграции не применяет
 — это CLI: схему к его запуску гарантируют сервисы (БД-команды `status`,
 `domain`, `zones`, `subdomains`, `reanalyze`, `recheck` рассчитывают на

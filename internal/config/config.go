@@ -242,8 +242,9 @@ type Monitor struct {
 // посетителя (прецедент управления жизненным циклом внутри OnRun —
 // клиенты воркеров).
 type Web struct {
-	// Listen — публичный адрес лендинга (host:port). Дефолт — loopback:
-	// публикация наружу — задача reverse-proxy с TLS (T-124).
+	// Listen — публичный адрес лендинга: [host]:port или абсолютный путь
+	// unix-сокета (вариант деплоя за nginx, T-124). Дефолт — loopback:
+	// публикация наружу — reverse-proxy с TLS (deploy/nginx/).
 	Listen string `yaml:"listen"`
 	// RateLimit — лимит живых проверок формы на IP, запросов в минуту
 	// (зафиксированное решение этапа 13: 4/мин, как larasites).
@@ -677,8 +678,16 @@ func (c *Config) Validate() error {
 	}
 
 	// web (этап 13, T-121)
+	// listen — [host]:port (TCP) или абсолютный путь unix-сокета
+	// (вариант деплоя за nginx, T-124): Run различает форму по «/».
 	if err := checkHostPort(c.Web.Listen); err != nil {
-		problems = append(problems, fmt.Sprintf("web.listen: ожидается [host]:port, задано %q", c.Web.Listen))
+		if !strings.HasPrefix(c.Web.Listen, "/") {
+			problems = append(problems, fmt.Sprintf("web.listen: ожидается [host]:port или абсолютный путь unix-сокета, задано %q", c.Web.Listen))
+		} else if len(c.Web.Listen) > 100 {
+			// Потолок sockaddr_un.sun_path — 108 байт: длинный путь упал
+			// бы при Listen уже на запуске, валидация даёт ошибку конфига.
+			problems = append(problems, fmt.Sprintf("web.listen: путь unix-сокета длиннее 100 байт, задано %q", c.Web.Listen))
+		}
 	}
 	// Минимум 1 — ноль означал бы неограниченную форму; потолок — от
 	// абсурда, не от эксплуатации.

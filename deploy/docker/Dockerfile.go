@@ -1,7 +1,9 @@
 # Multi-stage образ Go-сервисов Domain Crawler.
 #
 #   dev         — toolchain + air + delve + golangci-lint + migrate (hot reload)
-#   build       — статическая сборка всех cmd/*
+#   css         — alpine + standalone-CLI tailwindcss v4: бандл лендинга
+#   build       — статическая сборка всех cmd/* (CSS из стадии css подменяет
+#                 placeholder до go build — go:embed встраивает собранный файл)
 #   runtime     — минимальный образ (distroless), для проверки боевой сборки
 #   mockserver  — alpine + бинарник mockserver (нужен wget для healthcheck)
 #
@@ -44,6 +46,36 @@ ENV PATH="/go/bin:${PATH}" \
 # чтобы bind-mount'ы принадлежали разработчику (ТЗ 7.4).
 
 # --------------------------------------------------------------------------
+# Стадия css — бандл Tailwind лендинга (T-122/T-124): standalone-CLI
+# tailwindcss v4 собирает internal/web/static/app.css из исходника
+# app.src.css (классы разметки сканируются @source-ом шаблона). Node не
+# появляется ни в сборке проекта, ни в рантайме; собранный бандл в git
+# не хранится (там placeholder) — стадия подменяет его в build до go
+# build, поэтому go:embed встраивает настоящий CSS.
+FROM alpine:${ALPINE_VERSION} AS css
+ARG TAILWINDCSS_VERSION=v4.3.3
+# Автоматический ARG платформы: у CLI отдельные musl-сборки под x64/arm64.
+ARG TARGETARCH
+# CLI собран Bun под musl, но динамически линкуется к C++-рантайму —
+# libstdc++/libgcc это закрывают (сотни килобайт, живут только в стадии
+# css, в рантайм-образ не попадают).
+RUN apk add --no-cache libstdc++ libgcc
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) arch=x64 ;; \
+        arm64) arch=arm64 ;; \
+        *) echo "css: неподдерживаемая архитектура ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    wget -q -O /usr/local/bin/tailwindcss \
+        "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWINDCSS_VERSION}/tailwindcss-linux-${arch}-musl" \
+    && chmod +x /usr/local/bin/tailwindcss
+WORKDIR /src/internal/web/static
+# Только исходник CSS и @source-шаблон: правки Go-кода не инвалидируют слой.
+COPY internal/web/static/app.src.css ./
+COPY internal/web/templates/landing.html ../templates/
+RUN /usr/local/bin/tailwindcss -i app.src.css -o /out/app.css --minify
+
+# --------------------------------------------------------------------------
 FROM base AS build
 # Версия/ревизия для crawler_build_info (T-111): .git исключён из контекста
 # сборки (.dockerignore), поэтому значения вычисляет вызывающая сторона
@@ -52,12 +84,15 @@ FROM base AS build
 ARG BUILD_VERSION=unknown
 ARG BUILD_REVISION=unknown
 COPY . .
+# Бандл Tailwind из стадии css заменяет placeholder (см. шапку): go:embed
+# static в internal/web заберёт собранный CSS, а не заглушку из git.
+COPY --from=css /out/app.css internal/web/static/app.css
 # Статические бинарники всех сервисов (ТЗ 6.1: CGO_ENABLED=0, -trimpath, -ldflags).
 # buildMode=prod честно помечает боевые сборки в crawler_build_info
 # (dev без -X остаётся dev-stub); buildVersion/buildRevision — git-тег/хеш
 # сборки (T-111).
 RUN set -eux; \
-    for cmd in ingest scheduler dns-worker http-worker render-worker analyzer monitor crawlerctl mockserver testbedgen; do \
+    for cmd in ingest scheduler dns-worker http-worker render-worker analyzer monitor web crawlerctl mockserver testbedgen; do \
         CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod -X crawler/internal/metrics.buildVersion=${BUILD_VERSION} -X crawler/internal/metrics.buildRevision=${BUILD_REVISION}" -o /out/$cmd ./cmd/$cmd; \
     done
 

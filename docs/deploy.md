@@ -20,7 +20,7 @@ dev-окружение (hot reload, testbed, инструменты) и не я�
 | Слой | Боевой (systemd) | Dev (docker compose) |
 |---|---|---|
 | PostgreSQL, Redis, Unbound | пакеты ОС + drop-in'ы бюджета (`deploy/systemd/*.service.d`) | контейнеры compose |
-| Go-сервисы (7 шт.) | статические бинарники `/opt/crawler/bin`, юниты `crawler-*.service` | образ `crawler/go-dev:local` + air |
+| Go-сервисы (8 шт.: 7 конвейерных + web) | статические бинарники `/opt/crawler/bin`, юниты `crawler-*.service` | образ `crawler/go-dev:local` + air |
 | Chromium | дистрибутив headless-shell в `/opt/crawler/chromium`, юнит `crawler-chromium.service` | образ `chromedp/headless-shell` (dev-профиль app) |
 | `crawlerctl` | CLI в `/opt/crawler/bin`, без юнита | контейнер tools |
 
@@ -41,10 +41,13 @@ cgroup, systemd перезапускает юнит, остальные серв
 | `postgresql@.service` + drop-in | **3072M** (бюджет ≈ 2,5 ГБ + запас на пики обслуживания) | PostgreSQL ≈ 2,5 ГБ |
 | `redis-server.service` + drop-in | **640M** (maxmemory 512mb + ~128 МБ служебных, docs/redis.md §7) | Redis ≤ 0,5 ГБ |
 | `unbound.service` + drop-in | **700M** | Unbound ≈ 0,7 ГБ |
-| `crawler-*.service` (7 юнитов) | **1280M суммарно** | Go-сервисы ≈ 1,3 ГБ |
+| `crawler-*.service` (8 юнитов) | **1536M суммарно** | Go-сервисы ≈ 1,3 ГБ (7 конвейерных) + web этапа 13 |
 | `crawler-chromium.service` | **2048M** | Chromium ≈ 2 ГБ |
 
-Итого 7740M из 8192M. Потолки — не резервация: MemoryMax выше плановой
+Итого 7996M из 8192M (строка «Go-сервисы ≈ 1,3 ГБ» ТЗ покрывала семь
+конвейерных юнитов — 1280M; публичный `web` лендинга — продуктовое
+расширение этапа 13 вне основного ТЗ — добавляет свою строку 256M).
+Потолки — не резервация: MemoryMax выше плановой
 строки бюджета там, где над внутренним лимитом живут служебные памяти
 процесса или пики обслуживания — Redis (maxmemory 512mb + ~128 МБ,
 eviction раньше OOM — docs/redis.md §7), PostgreSQL (work_mem/maintenance/
@@ -52,12 +55,13 @@ autovacuum поверх shared_buffers — docs/db.md, «Память»); шта
 живут в строках бюджета, остаток ≈ 0,5 ГБ и незаполненность потолков —
 ОС и page cache (ТЗ 3.2).
 
-Раскладка строки «Go-сервисы ≈ 1,3 ГБ» по семи юнитам:
+Раскладка строки «Go-сервисы ≈ 1,3 ГБ» по восьми юнитам:
 
 | Юнит | MemoryMax |
 |---|---|
 | `crawler-http-worker.service` | 384M |
 | `crawler-dns-worker.service` | 256M |
+| `crawler-web.service` | 256M |
 | `crawler-ingest.service` | 128M |
 | `crawler-scheduler.service` | 128M |
 | `crawler-render-worker.service` | 128M |
@@ -70,6 +74,10 @@ autovacuum поверх shared_buffers — docs/db.md, «Память»); шта
   контента; 384m — паритет с dev-профилем app;
 - **dns-worker — 256M**: пул 2000 UDP-сокетов (`dns.udp_pool_size`) и буферы
   обменов, TTL-кэш редиректных резолвов (T-047);
+- **web — 256M** (этап 13, вне строки ТЗ): кроме лёгкой работы с БД живые
+  проверки формы гонят полный конвейер checker (T-123: DNS → HTTP с телами
+  страниц до `http.max_body_bytes` → рендер SPA → анализ) — сетевые буферы
+  одного доменного эпизода, паритет с dev-профилем app;
 - **ingest / scheduler / analyzer / monitor / render-worker — по 128M**:
   пакетная работа с БД без больших буферов (потоковый разбор файлов,
   SQL-пачки, разбор уже сжатого контента постранично, счётчики);
@@ -172,10 +180,16 @@ T-087 (≤ 512M, под потолком MemoryMax).
 "-s -w"`. На машине с Go (или в контейнере tools: `make shell`):
 
 ```bash
+# Бандл Tailwind лендинга (T-124): go:embed вбирает internal/web/static/
+# app.css; в git там placeholder, без этого шага лендинг встанет без
+# стилей. Собирается одноразовым контейнером (node не нужен); боевая
+# docker-сборка делает это сама (стадия css Dockerfile.go).
+make web-css
+
 version="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
 revision="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 mkdir -p out
-for svc in ingest scheduler dns-worker http-worker render-worker analyzer monitor crawlerctl; do
+for svc in ingest scheduler dns-worker http-worker render-worker analyzer monitor web crawlerctl; do
     CGO_ENABLED=0 go build -trimpath \
       -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod -X crawler/internal/metrics.buildVersion=$version -X crawler/internal/metrics.buildRevision=$revision" \
       -o "out/$svc" "./cmd/$svc"
@@ -209,7 +223,7 @@ git подставляется `unknown`. Dev-сборки без `-X` оста�
 
 ```bash
 groupadd -r crawler
-for s in ingest scheduler dns-worker http-worker render-worker analyzer monitor chromium; do
+for s in ingest scheduler dns-worker http-worker render-worker analyzer monitor web chromium; do
     useradd -r -g crawler -d /var/lib/crawler -s /usr/sbin/nologin "crawler-$s"
 done
 install -d -o root -g crawler -m 0755 /var/lib/crawler
@@ -235,8 +249,8 @@ cp -r rules /etc/crawler/rules                    # правила Laravel дл�
   (или оставить как есть и задать точные в `crawler.env` — переменные
   окружения важнее YAML, docs/configuration.md);
 - `postgres.pool_size` — на один сервис, а бюджет ТЗ §6.3 (20–50) —
-  суммарный на все: значение примера (5) даёт 7 × 5 + `crawlerctl` (2) +
-  админ ≈ 40–45 при `max_connections=50` (3 слота резервирует
+  суммарный на все: значение примера (5) даёт 8 × 5 + `crawlerctl` (2) +
+  админ ≈ 43–45 при `max_connections=50` (3 слота резервирует
   `superuser_reserved_connections`). Менять — только с пересчётом суммы;
   сразу всем сервисам — `CRAWLER_POSTGRES_POOL_SIZE` в `crawler.env`
   (docs/db.md, «Бюджет соединений»);
@@ -249,7 +263,10 @@ cp -r rules /etc/crawler/rules                    # правила Laravel дл�
   выставляются на боевой интерфейс (ТЗ §9); юнит monitor дополнительно
   фиксирует loopback переменной `CRAWLER_MONITOR_LISTEN` (окружение важнее
   YAML — страховка от config.yaml без правок), остальные сервисы слушают
-  loopback через `METRICS_ADDR` в юнитах (127.0.0.1:9101…9106);
+  loopback через `METRICS_ADDR` в юнитах (127.0.0.1:9101…9107);
+- `web.listen` — публичный адрес лендинга: дефолт loopback
+  `127.0.0.1:8080` (рядом с nginx — §6 ниже), смена на unix-сокет —
+  абсолютным путём в значении;
 - `http.user_agent` — реальные контакты оператора (если не задан в env);
 - `dns.ipv6: true` — если у сервера есть IPv6 (в docker-сети его нет).
 
@@ -261,7 +278,7 @@ systemctl daemon-reload
 systemctl enable --now crawler.target \
     crawler-chromium.service crawler-ingest.service crawler-scheduler.service \
     crawler-dns-worker.service crawler-http-worker.service crawler-render-worker.service \
-    crawler-analyzer.service crawler-monitor.service
+    crawler-analyzer.service crawler-monitor.service crawler-web.service
 ```
 
 Инфраструктура включается пакетами: `systemctl enable --now postgresql
@@ -318,16 +335,32 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
   прогона без OOM — критерий приёмки ТЗ 11.4 п. 7 (задача T-093): журнал
   ядра `journalctl -k --grep 'oom'` должен быть пуст, рестарты юнитов —
   по счётчику `NRestarts`.
-- **Метрики**: `127.0.0.1:9100…9106/metrics` (monitor — 9100). Скрейпит
-  установленный на сервере Prometheus (его юнит — инфраструктура оператора,
-  вне комплекта; конфиг джобов — как
+- **Метрики**: `127.0.0.1:9100…9107/metrics` (monitor — 9100, web —
+  9107). Скрейпит установленный на сервере Prometheus (его юнит —
+  инфраструктура оператора, вне комплекта; конфиг джобов — как
   `deploy/docker/prometheus/prometheus.yml`, адреса хостовые).
+- **Лендинг**: единственный публичный URL системы — через reverse-proxy
+  с TLS (`curl -fsS https://<домен>/healthz` за nginx, §6 ниже);
+  напрямую сервис отвечает на loopback `curl -fsS 127.0.0.1:8080/healthz`.
 - **SMART/TBW накопителя**: предупреждения smartd и алерта monitor — в
   journald (`journalctl -t smartd -p warning`), живые показания —
   `smartctl -H -A /dev/nvme0` (percentage_used, TBW). Детали —
   [`disks.md`](disks.md) «Мониторинг SMART и TBW».
 
-## 6. Границы комплекта (смежные задачи этапа 9)
+## 6. Публичный вход лендинга: nginx + TLS (T-124)
+
+Лендинг (`crawler-web.service`) слушает loopback (`web.listen`, дефолт
+`127.0.0.1:8080`) — наружу систему публикует reverse-proxy,
+терминирующий TLS. Первый образец входа —
+[`deploy/nginx/`](../deploy/nginx/) (`crawler.example.conf` + README:
+установка, заголовки, схема для sitemap.xml, вариант unix-сокета вместо
+TCP — `CRAWLER_WEB_LISTEN=/run/crawler-web/web.sock` в `crawler.env`).
+Через прокси наружу идёт только лендинг: метрики и пробы web
+(`127.0.0.1:9107`) не публикуются (ТЗ §9). HTTP→HTTPS, ACME-проверки
+certbot и заголовки безопасности — в образце; правки под конкретный
+домен — по месту деплоя.
+
+## 7. Границы комплекта (смежные задачи этапа 9)
 
 - **T-086** — тюнинг postgresql-конфига под NVMe (docs/db.md): аллокации
   сервера обязаны вписываться в `MemoryMax=3G` drop-in'а (включая пики

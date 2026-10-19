@@ -1,0 +1,64 @@
+# Domain Crawler — web: публичный лендинг (этап 13, T-121…T-124).
+# web.listen — единственный публичный порт системы: наружу сервис
+# публикует reverse-proxy с TLS (первый образец — deploy/nginx/),
+# сам держит loopback (дефолт конфига 127.0.0.1:8080). Метрики и пробы
+# — METRICS_ADDR на loopback (127.0.0.1:9107, как 9101…9106 у остальных
+# юнитов): наружу не выставляется ничего, кроме лендинга (ТЗ §9).
+# MemoryMax — строка бюджета «Go-сервисы» (ТЗ 3.2), раскладка —
+# docs/deploy.md: живые проверки формы гонят полный конвейер checker
+# (T-123: DNS → HTTP с телами страниц → рендер → анализ), поэтому 256M,
+# а не 128M «лёгких» юнитов без сетевых буферов.
+# Вариант unix-сокета вместо TCP (по месту деплоя): CRAWLER_WEB_LISTEN=
+# /run/crawler-web/web.sock в crawler.env + proxy_pass
+# http://unix:/run/crawler-web/web.sock в nginx — RuntimeDirectory ниже
+# создаёт каталог в /run (ProtectSystem=strict остальное запрещает).
+
+[Unit]
+Description=Domain Crawler — web (публичный лендинг)
+PartOf=crawler.target
+# Комментарий о After/Wants без Requires — crawler-ingest.service.
+# crawler-chromium — только порядок: живой проверке формы нужен CDP
+# (render.remote_url), без браузера лендинг и stored-данные работают.
+After=network-online.target crawler-chromium.service postgresql.service redis-server.service unbound.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-web
+Group=crawler
+EnvironmentFile=/etc/crawler/crawler.env
+# Loopback-страховка адреса метрик: env важнее YAML (см. шапку юнита).
+Environment=METRICS_ADDR=127.0.0.1:9107
+# Публичный адрес не фиксируется: web.listen из конфига (loopback под
+# nginx); смена — CRAWLER_WEB_LISTEN в crawler.env (TCP или unix-сокет).
+RuntimeDirectory=crawler-web
+WorkingDirectory=/var/lib/crawler
+SyslogIdentifier=crawler-web
+ExecStart=/opt/crawler/bin/web
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+MemoryMax=256M
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target

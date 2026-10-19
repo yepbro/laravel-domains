@@ -54,6 +54,12 @@ scrape_configs:
         port: 9106
         type: A
 
+  - job_name: web
+    dns_sd_configs:
+      - names: ["web"]
+        port: 9107
+        type: A
+
   - job_name: mockserver
     dns_sd_configs:
       - names: ["mockserver"]
