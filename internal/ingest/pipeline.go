@@ -5,6 +5,9 @@
 // (ТЗ 3.5) → валидация строк с rejected-логом (T-016) → загрузка в
 // staging (T-017) → применение add/delete (T-018/T-019) → отчёт в
 // ingest_files (report.go) → перемещение файла в processed/ или failed/.
+// Архивы (.zip/.tar/.tar.gz/.tgz/.gz) ветвятся по расширению на
+// потоковую распаковку — archive.go (T-133): члены проходят те же
+// Parse/Validator/Stage, единица учёта — архив.
 //
 // Идемпотентность (ТЗ 3.4, 5.1; T-113): защита от повторной обработки —
 // точная повторная доставка, совпадение (зона, действие, sha256) в
@@ -63,8 +66,15 @@ type PipelineOptions struct {
 	// BatchSize — строк на пачку COPY в staging (ingest.batch_size).
 	BatchSize int
 	// MaxErrorRatio — порог доли отклонённых строк файла
-	// (ingest.max_error_ratio); 0 — DefaultMaxErrorRatio.
+	// (ingest.max_error_ratio); 0 — DefaultMaxErrorRatio. Для архивов
+	// действует на член (T-133): член выше порога роняет архив целиком.
 	MaxErrorRatio float64
+	// ArchiveMaxUncompressed — потолок суммарного несжатого объёма членов
+	// архива (ingest.archive_max_uncompressed, T-133); 0 — дефолт.
+	ArchiveMaxUncompressed int64
+	// ArchiveMaxFiles — потолок числа записей архива
+	// (ingest.archive_max_files, T-133); 0 — дефолт.
+	ArchiveMaxFiles int
 	// RejectLog — логгер rejected (NewRejectedLogger, T-016); nil —
 	// записи подавлены (счётчики ведутся всё равно).
 	RejectLog *slog.Logger
@@ -102,6 +112,12 @@ func NewPipeline(zones ZoneStore, files FileStore, pool db.DB, opts PipelineOpti
 	}
 	if opts.MaxErrorRatio == 0 {
 		opts.MaxErrorRatio = DefaultMaxErrorRatio
+	}
+	if opts.ArchiveMaxUncompressed <= 0 {
+		opts.ArchiveMaxUncompressed = DefaultArchiveMaxUncompressed
+	}
+	if opts.ArchiveMaxFiles <= 0 {
+		opts.ArchiveMaxFiles = DefaultArchiveMaxFiles
 	}
 	log := opts.Log
 	if log == nil {
@@ -202,15 +218,43 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	// Один проход по файлу (ТЗ 3.5): байты одновременно идут в sha256
 	// (TeeReader) и в парсер; валидные строки грузятся в staging по мере
 	// разбора. Хэш известен к концу чтения — проверка дубля ниже.
+	// Архивы (T-133) ветвятся по расширению: tar/gz — тот же единственный
+	// проход (TeeReader под распаковщиками), zip — проход хэша плюс чтение
+	// членов по смещениям (ReaderAt: формат с произвольным доступом).
 	h := sha256.New()
-	st, vres, _, err := p.streamStage(ctx, io.TeeReader(fh, h), f, batch)
-	rep.SHA256 = h.Sum(nil)
+	var (
+		st   Stats
+		vres FileResult
+		arch archiveResult
+	)
+	if kind := archiveKindOf(f.Path); kind == archiveNone {
+		st, vres, _, err = p.streamStage(ctx, io.TeeReader(fh, h), f, batch)
+		rep.SHA256 = h.Sum(nil)
+	} else {
+		arch, err = p.streamArchive(ctx, fh, f, kind, batch)
+		st, vres = arch.Stats, arch.Result
+		rep.SHA256 = arch.SHA256
+		rep.Members = arch.Members
+	}
 	rep.LinesTotal = int64(st.Total)
 	rep.Skipped = int64(st.Skipped)
 	rep.Rejected = int64(st.Rejected + vres.Rejected)
 	rep.Accepted = int64(vres.Accepted)
 	rep.Reasons = vres.Reasons
 	if err != nil {
+		if errors.Is(err, errArchiveRejected) {
+			// Архив ошибочен по своей сути (битый, лимиты, член выше
+			// порога — T-133): как txt-файл с долей отказов выше порога —
+			// строки не применяются, партия отбрасывается (ТЗ 5.1),
+			// архив целиком в failed/ с лог-отчётом; частично принятые
+			// строки не применялись, повторная подача идемпотентна
+			// (ON CONFLICT DO NOTHING, ТЗ 5.1).
+			if derr := p.clearBatch(ctx, id); derr != nil {
+				p.discard(id)
+				return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
+			}
+			return p.failFile(abs, rep, err)
+		}
 		p.discard(id)
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: err}
 	}
@@ -355,10 +399,8 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 // вместе) и число загруженных строк. Ошибка — сбой чтения файла или
 // загрузки; счётчики соответствуют отданному.
 //
-// Парсер толкающий (OnLine), Stage — тянущий (RowIter): связка —
-// горутина-производитель и буферизованный канал. Память ограничена
-// stageChanSize и пачкой COPY (ТЗ 3.5); при ошибке загрузки потребитель
-// закрывает stop, производитель завершается без утечки.
+// Парсер толкающий (OnLine), Stage — тянущий (RowIter); связка —
+// stageStream (горутина-производитель и буферизованный канал).
 func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch Batch) (Stats, FileResult, int64, error) {
 	v, err := NewValidator(ValidatorOptions{
 		File:          f.Path,
@@ -377,15 +419,11 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 		rejectLog = slog.New(slog.DiscardHandler)
 	}
 
-	rows := make(chan Row, stageChanSize)
-	stop := make(chan struct{})
-	done := make(chan error, 1)
-
 	var (
 		st       Stats
 		prejects = make(map[Reason]int) // построчные отклонения парсера
 	)
-	go func() {
+	staged, serr, perr := p.stageStream(ctx, batch, func(emit func(Row) error) error {
 		var perr error
 		st, perr = Parse(r, Options{
 			OnLine: func(l Line) error {
@@ -393,12 +431,7 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 				if !ok {
 					return nil // отклонение учтено валидатором (rejected-лог)
 				}
-				select {
-				case rows <- Row{Label: e.Label, LineNo: int64(l.Num)}:
-					return nil
-				case <-stop:
-					return errStopped
-				}
+				return emit(Row{Label: e.Label, LineNo: int64(l.Num)})
 			},
 			OnReject: func(rj Reject) error {
 				prejects[rj.Reason]++
@@ -411,26 +444,8 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 				return nil
 			},
 		})
-		close(rows)
-		done <- perr
-	}()
-
-	staged, serr := Stage(ctx, p.pool, batch, p.opts.BatchSize, func() (Row, error) {
-		select {
-		case row, ok := <-rows:
-			if !ok {
-				return Row{}, io.EOF
-			}
-			return row, nil
-		case <-ctx.Done():
-			return Row{}, ctx.Err()
-		}
+		return perr
 	})
-
-	// Производитель закончил (или остановлен): после done счётчики st,
-	// prejects и валидатор принадлежат потребителю.
-	close(stop)
-	perr := <-done
 
 	if serr != nil {
 		return st, FileResult{}, staged, serr
@@ -445,12 +460,55 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	// сами: доля ошибок считается по всем содержательным строкам файла
 	// (битый дамп — именно не-UTF-8, docs/incoming-files.md §4), иначе
 	// файл целиком из мусора (Data = 0) прошёл бы как успешный (ING-P1-2).
-	if total := res.Total + st.Rejected; total > 0 {
-		if rejected := res.Rejected + st.Rejected; float64(rejected)/float64(total) > p.opts.MaxErrorRatio {
-			res.Failed = true
-		}
-	}
+	res.Failed = overErrorRatio(p.opts.MaxErrorRatio, res.Total, res.Rejected, st.Rejected)
 	return st, res, staged, nil
+}
+
+// stageStream — связка производителя строк и загрузки staging (ТЗ 3.5):
+// produce толкает валидные строки через emit, Stage тянет их из
+// буферизованного канала пачками COPY. Память ограничена stageChanSize и
+// размером пачки; при ошибке загрузки потребитель закрывает stop,
+// производитель завершается без утечки. Возвращает ошибки загрузки и
+// производителя раздельно: остановленный потребителем производитель
+// (errStopped) — не ошибка, cause — в stageErr. Счётчики производителя
+// остаются его замыканиям (после возврата горутина закончена — чтение
+// безопасно).
+func (p *Pipeline) stageStream(ctx context.Context, batch Batch, produce func(emit func(Row) error) error) (staged int64, stageErr, produceErr error) {
+	rows := make(chan Row, stageChanSize)
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		done <- produce(func(r Row) error {
+			select {
+			case rows <- r:
+				return nil
+			case <-stop:
+				return errStopped
+			}
+		})
+		close(rows)
+	}()
+
+	staged, serr := Stage(ctx, p.pool, batch, p.opts.BatchSize, func() (Row, error) {
+		select {
+		case row, ok := <-rows:
+			if !ok {
+				return Row{}, io.EOF
+			}
+			return row, nil
+		case <-ctx.Done():
+			return Row{}, ctx.Err()
+		}
+	})
+
+	close(stop)
+	perr := <-done
+
+	if serr != nil {
+		return staged, serr, nil
+	}
+	return staged, nil, perr
 }
 
 // clearBatch — очистка партии в staging; ошибка оборачивается контекстом

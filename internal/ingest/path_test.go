@@ -31,6 +31,13 @@ func TestParsePathValid(t *testing.T) {
 		{name: "точки в имени файла", path: "com/add/2026.10.17.txt", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/2026.10.17.txt"},
 		{name: "очистка разделителей", path: "com//add/./list.txt", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/list.txt"},
 		{name: "хвостовой слэш", path: "com/add/list.txt/", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/list.txt"},
+		// Архивы поддерживаемых форматов (T-133) — имена как у txt.
+		{name: "zip", path: "com/add/zone.zip", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/zone.zip"},
+		{name: "tar", path: "net/delete/plain.tar", zone: "net", uni: "net", action: model.ActionDelete, clean: "net/delete/plain.tar"},
+		{name: "tar.gz", path: "com/add/wrapped.tar.gz", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/wrapped.tar.gz"},
+		{name: "tgz", path: "com/add/short.tgz", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/short.tgz"},
+		{name: "gz", path: "com/add/list.gz", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/list.gz"},
+		{name: "архив в верхнем регистре", path: "com/add/ZONE.ZIP", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/ZONE.ZIP"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -93,6 +100,9 @@ func TestParsePathErrors(t *testing.T) {
 		{name: "без расширения", path: "com/add/list", kind: ErrPathNotTXT},
 		{name: "другое расширение", path: "com/add/list.csv", kind: ErrPathNotTXT},
 		{name: "временное имя", path: "com/add/list.txt.part", kind: ErrPathNotTXT},
+		{name: "неподдерживаемый архив rar", path: "com/add/zone.rar", kind: ErrPathNotTXT},
+		{name: "неподдерживаемый архив 7z", path: "com/add/zone.7z", kind: ErrPathNotTXT},
+		{name: "архив под временным именем", path: "com/add/zone.zip.part", kind: ErrPathNotTXT},
 		{name: "битая punycode-метка зоны", path: "xn--/add/list.txt", kind: ErrPathZone},
 		{name: "запрещённый символ в зоне", path: "не%зона/add/list.txt", kind: ErrPathZone},
 	}
@@ -137,7 +147,7 @@ func TestParsePathZoneErrorUnwrap(t *testing.T) {
 
 func TestPathErrorMessages(t *testing.T) {
 	_, err := ParsePath("com/patch/list.txt")
-	want := `ingest: структура пути не <зона>/add|delete/*.txt: "com/patch/list.txt"`
+	want := `ingest: структура пути не <зона>/add|delete/<файл>: "com/patch/list.txt"`
 	if err == nil || err.Error() != want {
 		t.Errorf("Error() = %v, want %s", err, want)
 	}

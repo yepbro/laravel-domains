@@ -93,6 +93,17 @@ type Ingest struct {
 	// при превышении файл целиком считается ошибочным (failed/, T-021).
 	// Доля 0..1; расширение к минимальному составу ТЗ 5.10.
 	MaxErrorRatio float64 `yaml:"max_error_ratio"`
+	// ArchiveMaxUncompressed — потолок суммарного несжатого объёма членов
+	// входного архива (T-133, защита от zip-бомб): для zip проверяется до
+	// чтения по заголовку UncompressedSize64, для tar/gz — счётчиком по
+	// потоку. Расширение к минимальному составу ТЗ 5.10.
+	ArchiveMaxUncompressed ByteSize `yaml:"archive_max_uncompressed"`
+	// ArchiveMaxFiles — потолок числа записей входного архива (T-133):
+	// превышение — архив целиком в failed/; для zip проверяется по
+	// центральному каталогу (он читается в память — число записей и есть
+	// предел расходов), для tar — по потоку. Расширение к минимальному
+	// составу ТЗ 5.10.
+	ArchiveMaxFiles int `yaml:"archive_max_files"`
 }
 
 // Scheduler — планировщик проверок (ТЗ 5.3).
@@ -314,6 +325,11 @@ func Default() *Config {
 			// Единичный мусор файлу не вредит, а файл не в той зоне
 			// или битый дамп дают долю ошибок ~1 (T-016).
 			MaxErrorRatio: 0.1,
+			// Несжатая зона .com ≈ 1,5 ГБ — потолок с запасом на рост
+			// и склейки, без чрезмерного окна для zip-бомб (T-133).
+			ArchiveMaxUncompressed: ByteSize(8 << 30),
+			// Реальные дампы зон — единицы файлов (T-133).
+			ArchiveMaxFiles: 1000,
 		},
 		Scheduler: Scheduler{
 			RecheckInterval:     Duration(4380 * time.Hour), // ≈ 6 месяцев
@@ -527,6 +543,16 @@ func (c *Config) Validate() error {
 	}
 	if c.Ingest.MaxErrorRatio <= 0 || c.Ingest.MaxErrorRatio > 1 {
 		problems = append(problems, fmt.Sprintf("ingest.max_error_ratio: ожидается (0, 1], задано %v", c.Ingest.MaxErrorRatio))
+	}
+	// Лимиты архивов (T-133) нельзя отключить нулём: защита от zip-бомб
+	// обязательна; верхняя граница — от опечаток, не от эксплуатации.
+	if c.Ingest.ArchiveMaxUncompressed <= 0 || c.Ingest.ArchiveMaxUncompressed > 1<<40 {
+		problems = append(problems, fmt.Sprintf(
+			"ingest.archive_max_uncompressed: ожидается %s..%s, задано %s (потолок суммарного несжатого объёма членов архива)",
+			ByteSize(1), ByteSize(1<<40), c.Ingest.ArchiveMaxUncompressed))
+	}
+	if !inRange(c.Ingest.ArchiveMaxFiles, 1, 1000000) {
+		problems = append(problems, rangeMsg("ingest.archive_max_files", c.Ingest.ArchiveMaxFiles, 1, 1000000))
 	}
 
 	// scheduler

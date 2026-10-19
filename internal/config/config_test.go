@@ -54,6 +54,8 @@ func TestDefault(t *testing.T) {
 		{"ingest.stable_seconds", c.Ingest.StableSeconds, 10},
 		{"ingest.scan_interval", c.Ingest.ScanInterval.D(), 30 * time.Second},
 		{"ingest.max_error_ratio", c.Ingest.MaxErrorRatio, 0.1},
+		{"ingest.archive_max_uncompressed", c.Ingest.ArchiveMaxUncompressed.B(), int64(8 << 30)},
+		{"ingest.archive_max_files", c.Ingest.ArchiveMaxFiles, 1000},
 		{"scheduler.recheck_interval", c.Scheduler.RecheckInterval.D(), 4380 * time.Hour},
 		{"scheduler.batch_size", c.Scheduler.BatchSize, 5000},
 		{"scheduler.queue_high_watermark", c.Scheduler.QueueHighWatermark, 100000},
@@ -141,6 +143,8 @@ ingest:
   stable_seconds: 30
   scan_interval: "45s"
   max_error_ratio: 0.05
+  archive_max_uncompressed: "2GiB"
+  archive_max_files: 500
 scheduler:
   recheck_interval: "8760h"
   batch_size: 2000
@@ -224,6 +228,8 @@ log:
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 30},
 		{"ingest.scan_interval", cfg.Ingest.ScanInterval.D(), 45 * time.Second},
 		{"ingest.max_error_ratio", cfg.Ingest.MaxErrorRatio, 0.05},
+		{"ingest.archive_max_uncompressed", cfg.Ingest.ArchiveMaxUncompressed.B(), int64(2 << 30)},
+		{"ingest.archive_max_files", cfg.Ingest.ArchiveMaxFiles, 500},
 		{"scheduler.recheck_interval", cfg.Scheduler.RecheckInterval.D(), 8760 * time.Hour},
 		{"scheduler.batch_size", cfg.Scheduler.BatchSize, 2000},
 		{"scheduler.queue_high_watermark", cfg.Scheduler.QueueHighWatermark, 50000},
@@ -384,6 +390,8 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_INGEST_STABLE_SECONDS":            "25",
 		"CRAWLER_INGEST_SCAN_INTERVAL":             "90s",
 		"CRAWLER_INGEST_MAX_ERROR_RATIO":           "0.25",
+		"CRAWLER_INGEST_ARCHIVE_MAX_UNCOMPRESSED":  "4GiB",
+		"CRAWLER_INGEST_ARCHIVE_MAX_FILES":         "77",
 		"CRAWLER_SCHEDULER_RECHECK_INTERVAL":       "2190h",
 		"CRAWLER_SCHEDULER_BATCH_SIZE":             "7777",
 		"CRAWLER_SCHEDULER_QUEUE_HIGH_WATERMARK":   "4242",
@@ -453,6 +461,8 @@ func TestEnvOverrides(t *testing.T) {
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 25},
 		{"ingest.scan_interval", cfg.Ingest.ScanInterval.D(), 90 * time.Second},
 		{"ingest.max_error_ratio", cfg.Ingest.MaxErrorRatio, 0.25},
+		{"ingest.archive_max_uncompressed", cfg.Ingest.ArchiveMaxUncompressed.B(), int64(4 << 30)},
+		{"ingest.archive_max_files", cfg.Ingest.ArchiveMaxFiles, 77},
 		{"scheduler.recheck_interval", cfg.Scheduler.RecheckInterval.D(), 2190 * time.Hour},
 		{"scheduler.batch_size", cfg.Scheduler.BatchSize, 7777},
 		{"scheduler.queue_high_watermark", cfg.Scheduler.QueueHighWatermark, 4242},
@@ -533,6 +543,8 @@ func TestEnvBadValues(t *testing.T) {
 		{map[string]string{"CRAWLER_CONTENT_PACK_SIZE": "big"}, "CRAWLER_CONTENT_PACK_SIZE"},
 		{map[string]string{"CRAWLER_ANALYZER_LARAVEL_MIN_SCORE": "x"}, "CRAWLER_ANALYZER_LARAVEL_MIN_SCORE"},
 		{map[string]string{"CRAWLER_INGEST_MAX_ERROR_RATIO": "много"}, "CRAWLER_INGEST_MAX_ERROR_RATIO"},
+		{map[string]string{"CRAWLER_INGEST_ARCHIVE_MAX_UNCOMPRESSED": "огромно"}, "CRAWLER_INGEST_ARCHIVE_MAX_UNCOMPRESSED"},
+		{map[string]string{"CRAWLER_INGEST_ARCHIVE_MAX_FILES": "много"}, "CRAWLER_INGEST_ARCHIVE_MAX_FILES"},
 		{map[string]string{"CRAWLER_LOG_LEVEL": "verbose"}, "log.level"},
 		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
 		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com=много"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
@@ -705,6 +717,10 @@ func TestValidate(t *testing.T) {
 		{"max_error_ratio 0", func(c *Config) { c.Ingest.MaxErrorRatio = 0 }, "ingest.max_error_ratio"},
 		{"max_error_ratio отрицательный", func(c *Config) { c.Ingest.MaxErrorRatio = -0.1 }, "ingest.max_error_ratio"},
 		{"max_error_ratio больше 1", func(c *Config) { c.Ingest.MaxErrorRatio = 1.5 }, "ingest.max_error_ratio"},
+		{"archive_max_uncompressed 0", func(c *Config) { c.Ingest.ArchiveMaxUncompressed = 0 }, "ingest.archive_max_uncompressed"},
+		{"archive_max_uncompressed велик", func(c *Config) { c.Ingest.ArchiveMaxUncompressed = ByteSize(2 << 40) }, "ingest.archive_max_uncompressed"},
+		{"archive_max_files 0", func(c *Config) { c.Ingest.ArchiveMaxFiles = 0 }, "ingest.archive_max_files"},
+		{"archive_max_files велик", func(c *Config) { c.Ingest.ArchiveMaxFiles = 1000001 }, "ingest.archive_max_files"},
 		{"recheck_interval 0", func(c *Config) { c.Scheduler.RecheckInterval = 0 }, "scheduler.recheck_interval"},
 		{"batch scheduler 0", func(c *Config) { c.Scheduler.BatchSize = 0 }, "scheduler.batch_size"},
 		{"batch scheduler меньше 1000", func(c *Config) { c.Scheduler.BatchSize = 999 }, "scheduler.batch_size"},

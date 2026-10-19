@@ -141,7 +141,8 @@ migrations/              миграции golang-migrate: встраиваютс
                         применяются сервисами при старте (make migrate-new)
 rules/                   правила Laravel (YAML), перезагрузка: make rules-reload
 testdata/laravel-samples/  образцы страниц (index.html, headers.json, cookies.json, meta.yaml)
-var/incoming/            наблюдаемая папка ingest: <зона>/add/*.txt, <зона>/delete/*.txt
+var/incoming/            наблюдаемая папка ingest: <зона>/add|delete/*.txt и архивы
+                         (.zip/.tar/.tar.gz/.tgz/.gz — docs/incoming-files.md §9)
 var/incoming/processed/  архив обработанных файлов (структура зоны/операции сохраняется)
 var/incoming/failed/     ошибочные файлы с лог-отчётом *.report рядом
 var/content/             хранилище контента (dev)
@@ -158,7 +159,8 @@ tmp/                     артефакты hot-reload (air)
 
 Сервис `ingest` наблюдает `var/incoming/` (fsnotify + периодический обход,
 стабильность размера/mtime) и прогоняет каждый готовый файл через
-конвейер: разбор пути `<зона>/add|delete/*.txt` → зона (создаётся
+конвейер: разбор пути `<зона>/add|delete/*.txt` или архива (T-133 —
+распаковка потоковая, члены проходят те же ступени) → зона (создаётся
 автоматически при первом файле) → один проход по файлу (построчный
 разбор и sha256 одновременно) → валидация строк (невалидные — в лог
 `rejected` с причиной, атрибут `service=rejected` в stderr сервиса) →

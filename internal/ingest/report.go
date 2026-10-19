@@ -156,6 +156,10 @@ type FileReport struct {
 	// Reasons — отклонения в разрезе причин (Reason), для лог-отчёта.
 	Reasons map[Reason]int
 
+	// Members — членов архива обработано (T-133); у txt-файлов 0.
+	// Колонки в схеме нет — только лог-отчёт и записи лога сервиса.
+	Members int
+
 	// Применение (после ApplyAdd/ApplyDelete; нули, если не дошло).
 	Added    int64 // add: Inserted + Revived
 	Revived  int64 // add: возвращено из deleted — часть Added
@@ -205,6 +209,9 @@ func renderReport(rep FileReport, verdict string) string {
 	fmt.Fprintf(&b, "итог: %s\n", verdict)
 
 	fmt.Fprintf(&b, "строк: %d\n", rep.LinesTotal)
+	if rep.Members > 0 {
+		fmt.Fprintf(&b, "членов архива: %d\n", rep.Members)
+	}
 	fmt.Fprintf(&b, "  пропущено (пустые и комментарии): %d\n", rep.Skipped)
 	fmt.Fprintf(&b, "  отклонено: %d\n", rep.Rejected)
 	for _, r := range sortedReasons(rep.Reasons) {

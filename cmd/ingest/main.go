@@ -72,6 +72,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			Dir:           cfg.Ingest.Dir,
 			BatchSize:     cfg.Ingest.BatchSize,
 			MaxErrorRatio: cfg.Ingest.MaxErrorRatio,
+			// Лимиты архивов (T-133): несжатый объём и число записей.
+			ArchiveMaxUncompressed: cfg.Ingest.ArchiveMaxUncompressed.B(),
+			ArchiveMaxFiles:        cfg.Ingest.ArchiveMaxFiles,
 			// Лог rejected — в общий stderr сервиса (ТЗ 5.10 пути не
 			// задаёт): записи отличимы атрибутом service=rejected (T-016).
 			RejectLog: ingest.NewRejectedLogger(os.Stderr, slog.LevelInfo),

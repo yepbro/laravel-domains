@@ -27,11 +27,16 @@ redis:
   claim_min_idle: "10m"             # простой pending-записи до возврата клеймом XAUTOCLAIM (окно удержания воркера)
 
 ingest:
-  dir: "/data/incoming"              # наблюдаемая папка: <зона>/add|delete/*.txt
+  dir: "/data/incoming"              # наблюдаемая папка: <зона>/add|delete/*.txt и архивы
   batch_size: 50000                  # строк на одну пачку COPY
   stable_seconds: 10                 # размер/mtime файла должны быть стабильны
   scan_interval: "30s"               # полный обход папки как страховка fsnotify
   max_error_ratio: 0.1               # доля отклонённых строк, выше которой файл ошибочен
+  # Лимиты приёма архивов (.zip/.tar/.tar.gz/.tgz/.gz, T-133) — защита от
+  # zip-бомб; превышение — архив целиком в failed/ с лог-отчётом.
+  archive_max_uncompressed: "8GiB"   # потолок суммарного несжатого объёма членов
+                                     # (несжатая зона .com ≈ 1,5 ГБ — с запасом)
+  archive_max_files: 1000            # потолок числа записей архива
 
 scheduler:
   recheck_interval: "4380h"          # ≈ 6 месяцев (done → pending)

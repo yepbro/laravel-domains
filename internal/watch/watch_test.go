@@ -139,6 +139,67 @@ func TestDir_TmpPartHiddenIgnored(t *testing.T) {
 	}
 }
 
+// TestDir_ArchiveExtensions — архивы поддерживаемых форматов (T-133)
+// отслеживаются наравне с *.txt: те же правила готовности; неподдерживаемые
+// форматы, временные и скрытые имена не выдаются.
+func TestDir_ArchiveExtensions(t *testing.T) {
+	dir := t.TempDir()
+	files := start(t, dir, nil)
+
+	sub := filepath.Join(dir, "crawl.test", "add")
+	want := []string{"a.zip", "b.tar", "c.tar.gz", "d.tgz", "e.gz", "F.ZIP"}
+	for _, name := range want {
+		writeFile(t, filepath.Join(sub, name), "example.com\n")
+	}
+	writeFile(t, filepath.Join(sub, "g.rar"), "x")     // не поддерживается
+	writeFile(t, filepath.Join(sub, "h.7z"), "x")      // не поддерживается
+	writeFile(t, filepath.Join(sub, "i.zip.tmp"), "x") // временное имя
+	writeFile(t, filepath.Join(sub, ".j.zip"), "x")    // скрытое
+
+	got := make(map[string]bool, len(want))
+	for range want {
+		f := waitFor(t, files)
+		got[filepath.Base(f.Path)] = true
+	}
+	for _, name := range want {
+		if !got[name] {
+			t.Errorf("архив %s не выдан (выданы %v)", name, got)
+		}
+	}
+	// Ничего лишнего (rar/7z/tmp/скрытые).
+	expectEmpty(t, files, 3*testScan)
+}
+
+// TestDir_GrowingArchiveNotDeliveredUntilQuiet — дозаписываемый архив
+// (T-133) не выдаётся до окна стабильности: те же правила готовности,
+// что и у txt.
+func TestDir_GrowingArchiveNotDeliveredUntilQuiet(t *testing.T) {
+	dir := t.TempDir()
+	files := start(t, dir, nil)
+
+	name := filepath.Join(dir, "crawl.test", "add", "growing.gz")
+	writeFile(t, name, "example.com\n")
+
+	stop := time.After(360 * time.Millisecond)
+	for {
+		select {
+		case <-stop:
+		default:
+			f, err := os.OpenFile(name, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = f.WriteString("example.com\n")
+			_ = f.Close()
+			time.Sleep(30 * time.Millisecond)
+			continue
+		}
+		break
+	}
+	expectEmpty(t, files, testQuiet) // запись только что шла — выдачи быть не должно
+	waitFor(t, files)                // после затишья архив готов
+}
+
 func TestDir_ScanPicksPreExistingFile(t *testing.T) {
 	dir := t.TempDir()
 	// Файл существует до старта наблюдателя: событий fsnotify нет,

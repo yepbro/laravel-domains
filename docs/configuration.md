@@ -114,6 +114,8 @@ PostgreSQL, ТЗ 3.4). Явный предел — 1000..100000000.
 | `stable_seconds` | `CRAWLER_INGEST_STABLE_SECONDS` | секунды | `10` |
 | `scan_interval` | `CRAWLER_INGEST_SCAN_INTERVAL` | длительность | `30s` |
 | `max_error_ratio` | `CRAWLER_INGEST_MAX_ERROR_RATIO` | число | `0.1`, диапазон (0, 1] |
+| `archive_max_uncompressed` | `CRAWLER_INGEST_ARCHIVE_MAX_UNCOMPRESSED` | размер | `8GiB`, диапазон 1B..1TiB |
+| `archive_max_files` | `CRAWLER_INGEST_ARCHIVE_MAX_FILES` | целое | `1000`, диапазон 1..1000000 |
 
 `dir` — наблюдаемая папка (создаётся при отсутствии). `stable_seconds` —
 сколько размер и mtime файла должны быть неизменны, чтобы ingest взял его
@@ -127,7 +129,22 @@ fsnotify (T-013): подхватывает файлы, существовавш�
 чужие зоны и слишком длинные строки отклоняются в лог `rejected` с
 причиной и не роняют файл — ошибочным его делает только доля отказов
 строго выше порога (по умолчанию 10%: единичный мусор прощается, файл не
-в той зоне или битый дамп дают долю, близкую к 1).
+в той зоне или битый дамп дают долю, близкую к 1). Для архивов (T-133)
+порог действует на член: любой член с долей отказов выше порога роняет
+архив целиком.
+
+`archive_max_uncompressed` и `archive_max_files` — лимиты приёма архивов
+`.zip`/`.tar`/`.tar.gz`/`.tgz`/`.gz` (T-133), защита от zip-бомб;
+нулевым значением защита не отключается. `archive_max_uncompressed` —
+потолок суммарного несжатого объёма: для tar/gz считается по всему
+распакованному потоку (заголовки tar включительно — бомба метаданными
+ловится), для zip — по заголовку `UncompressedSize64` до чтения члена и
+фактическим чтением (заголовок может лгать). `archive_max_files` —
+потолок числа записей, включая каталоги и пропускаемый мусор (у zip —
+по центральному каталогу до чтения членов, у tar — по потоку).
+Превышение любого лимита, как и битый архив, — архив целиком в
+`failed/` с лог-отчётом. Семантика приёма архивов —
+[`incoming-files.md`](incoming-files.md) §9.
 
 ### `scheduler` (ТЗ 5.3)
 
@@ -607,7 +624,8 @@ dashboard-secret` (пароль — аргумент или stdin; справк�
 - `content.pack_size` 1 MiB..8 GiB, `max_store_bytes` 1 байт..16 MiB,
   `disk_free_percent` в (0, 95];
 - `analyzer.laravel_min_score` в (0, 1];
-- `ingest.max_error_ratio` в (0, 1];
+- `ingest.max_error_ratio` в (0, 1]; `ingest.archive_max_uncompressed`
+  1 байт..1 TiB, `ingest.archive_max_files` 1..1000000;
 - `subdomains`: 1..63 записи, метки в нижнем регистре без точек, без повторов;
 - пути (`ingest.dir`, `content.dir`, `analyzer.rules_dir`) непустые;
 - `log.level` — одно из `debug`/`info`/`warn`/`error`.

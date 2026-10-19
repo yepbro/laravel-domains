@@ -788,7 +788,7 @@ func TestPipelineBadPath(t *testing.T) {
 		t.Fatalf("файл не перемещён в %s", failed)
 	}
 	report := readFile(t, failed+".report")
-	if !strings.Contains(report, "итог: ошибочен — ingest: структура пути не <зона>/add|delete/*.txt") {
+	if !strings.Contains(report, "итог: ошибочен — ingest: структура пути не <зона>/add|delete/<файл>") {
 		t.Errorf("лог-отчёт без причины:\n%s", report)
 	}
 }

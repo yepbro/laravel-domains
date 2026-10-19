@@ -6,7 +6,8 @@
 // первые ступени:
 //
 //   - ParsePath (path.go): разбор пути готового файла относительно incoming
-//     по схеме <зона>/add|delete/*.txt — нормализованная зона и действие
+//     по схеме <зона>/add|delete/<файл> (*.txt или архив поддерживаемого
+//     формата — T-133) — нормализованная зона и действие
 //     файла; имя каталога зоны в unicode или punycode нормализуется в одну
 //     зону — дублей зон в двух формах не возникает (ТЗ 5.1, 11.4 п. 1);
 //   - EnsureZone (zones.go): зона ищется по punycode-имени, отсутствующая
@@ -33,12 +34,14 @@ import (
 type PathErrorKind string
 
 const (
-	// ErrPathStructure — путь не вида <зона>/add|delete/*.txt: нет каталога
+	// ErrPathStructure — путь не вида <зона>/add|delete/<файл>: нет каталога
 	// add|delete (или он не в нижнем регистре), лишняя вложенность, абсолютный
 	// путь либо выход за пределы incoming.
 	ErrPathStructure PathErrorKind = "structure"
-	// ErrPathNotTXT — имя файла не *.txt: по ТЗ 5.1 готовность файла —
-	// появление имени *.txt (временные *.tmp/*.part наблюдатель не выдаёт).
+	// ErrPathNotTXT — имя файла не *.txt и не архив поддерживаемого
+	// формата (.zip/.tar/.tar.gz/.tgz/.gz — T-133): по ТЗ 5.1 готовность
+	// файла — появление отслеживаемого имени (временные *.tmp/*.part
+	// наблюдатель не выдаёт).
 	ErrPathNotTXT PathErrorKind = "not_txt"
 	// ErrPathZone — имя каталога зоны не нормализуется (ТЗ 5.2 п. 6);
 	// причина — *idn.Error, доступна через errors.As/Unwrap.
@@ -47,8 +50,8 @@ const (
 
 // pathKindDescriptions — тексты классов для Error() и String().
 var pathKindDescriptions = map[PathErrorKind]string{
-	ErrPathStructure: "структура пути не <зона>/add|delete/*.txt",
-	ErrPathNotTXT:    "имя файла не *.txt",
+	ErrPathStructure: "структура пути не <зона>/add|delete/<файл>",
+	ErrPathNotTXT:    "имя файла не *.txt и не архив поддерживаемого формата",
 	ErrPathZone:      "невалидное имя каталога зоны",
 }
 
@@ -109,7 +112,8 @@ type File struct {
 }
 
 // ParsePath разбирает путь готового файла относительно incoming:
-// <зона>/add|delete/*.txt → нормализованная зона и действие (ТЗ 5.1).
+// <зона>/add|delete/<файл> → нормализованная зона и действие (ТЗ 5.1;
+// файл — *.txt или архив поддерживаемого формата, T-133).
 //
 // Правила:
 //
@@ -118,9 +122,10 @@ type File struct {
 //   - имя каталога операции — строго «add» или «delete» в нижнем регистре:
 //     структура каталогов ТЗ 5.1 фиксирована, а регистр файловой системы
 //     Linux точен — иное имя это другая структура, а не вариант записи;
-//   - имя файла — *.txt без учёта регистра, как фильтр готовности
-//     наблюдателя (internal/watch, ТЗ 5.1): всё, что он выдаёт, приём
-//     разбирает одинаково; иначе — ErrPathNotTXT;
+//   - имя файла — *.txt или архив поддерживаемого формата (.zip, .tar,
+//     .tar.gz, .tgz, .gz — T-133), без учёта регистра, как фильтр
+//     готовности наблюдателя (internal/watch, ТЗ 5.1): всё, что он
+//     выдаёт, приём разбирает одинаково; иначе — ErrPathNotTXT;
 //   - имя каталога зоны нормализуется idn.NormalizeZone (составные зоны
 //     co.uk допустимы, принадлежность PSL не требуется — ТЗ 5.2 п. 6);
 //     ошибка нормализации — ErrPathZone с причиной *idn.Error;
@@ -151,8 +156,10 @@ func ParsePath(rel string) (File, error) {
 	}
 
 	// path.Ext даёт хвост от последней точки; готовность по ТЗ 5.1 —
-	// имя *.txt, регистр не важен (равно фильтру наблюдателя).
-	if !strings.EqualFold(path.Ext(name), ".txt") {
+	// имя *.txt, регистр не важен (равно фильтру наблюдателя), или архив
+	// поддерживаемого формата (.zip, .tar, .tar.gz, .tgz, .gz — T-133):
+	// всё, что выдаёт наблюдатель, приём разбирает одинаково.
+	if !fileNameAccepted(name) {
 		return File{}, &PathError{Kind: ErrPathNotTXT, Path: rel}
 	}
 
@@ -168,4 +175,11 @@ func ParsePath(rel string) (File, error) {
 		Action:      action,
 		Path:        p,
 	}, nil
+}
+
+// fileNameAccepted — имя входного файла: *.txt или архив поддерживаемого
+// формата (T-133), без учёта регистра — зеркалит фильтр готовности
+// наблюдателя (internal/watch.wantFile): приём разбирает всё выданное им.
+func fileNameAccepted(name string) bool {
+	return strings.EqualFold(path.Ext(name), ".txt") || isArchiveName(name)
 }
