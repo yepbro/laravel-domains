@@ -114,6 +114,16 @@ func TestRun(t *testing.T) {
 		{name: "dict train неизвестный флаг", args: []string{"dict", "train", "--nope", "d.zst"}, code: exitUsage,
 			inErr: "dict train: "},
 
+		// dashboard-secret — генерация хэша пароля дашборда (ТЗД §7.3):
+		// работает без инфраструктуры; функциональные тесты и раундтрип —
+		// TestRunDashboardSecret* в dashboardsecret_test.go.
+		{name: "dashboard-secret пустой аргумент", args: []string{"dashboard-secret", ""}, code: exitUsage, inErr: "пустой пароль"},
+		{name: "dashboard-secret два аргумента", args: []string{"dashboard-secret", "a", "b"}, code: exitUsage, inErr: "лишние аргументы"},
+		{name: "dashboard-secret неизвестный флаг", args: []string{"dashboard-secret", "--nope"}, code: exitUsage,
+			inErr: "dashboard-secret: "},
+		{name: "dashboard-secret --help", args: []string{"dashboard-secret", "--help"}, code: exitOK,
+			inOut: "истории shell"},
+
 		// dev-команды: роутинг и справка (функциональные тесты — у самих команд).
 		{name: "seed --help", args: []string{"seed", "--help"}, code: exitOK, inOut: "crawlerctl seed"},
 		{name: "seed несуществующий сценарий", args: []string{"seed", "--scenarios", "/nonexistent/scenarios.yaml"},

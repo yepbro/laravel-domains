@@ -54,6 +54,7 @@ type Config struct {
 	Subdomains []string  `yaml:"subdomains"`
 	Monitor    Monitor   `yaml:"monitor"`
 	Web        Web       `yaml:"web"`
+	Dashboard  Dashboard `yaml:"dashboard"`
 	Log        Log       `yaml:"log"`
 }
 
@@ -262,6 +263,31 @@ type Log struct {
 	Level string `yaml:"level"` // debug | info | warn | error
 }
 
+// Dashboard — операторский веб-дашборд конвейера (ТЗД §8.1; этап 15,
+// T-127). Username/PasswordHash общим Validate не проверяются:
+// обязательность кредов — проверка запуска cmd/dashboard (ТЗД §7.7),
+// иначе требование коснулось бы всех сервисов проекта.
+type Dashboard struct {
+	// Listen — публичный адрес дашборда ([host]:port): страницы и API
+	// (ТЗД §4.2). Дефолт — loopback: публикация наружу — reverse-proxy
+	// с TLS (ТЗД §9.1), не сам сервис.
+	Listen string `yaml:"listen"`
+	// Refresh — период фоновой сборки снимков состояния (ТЗД §4.4),
+	// коридор 1s..5m (ТЗД §8.3).
+	Refresh Duration `yaml:"refresh"`
+	// Username — логин оператора (HTTP Basic, ТЗД §7.1).
+	Username string `yaml:"username"`
+	// PasswordHash — хэш пароля формата ТЗД §7.2 (генерация —
+	// crawlerctl dashboard-secret, разбор/сверка — internal/dashboard/
+	// auth); открытый пароль в конфиге и окружении запрещён.
+	PasswordHash string `yaml:"password_hash"`
+	// Probes — пробы живости сервисов конвейера для секции здоровья
+	// (ТЗД §4.3, §5.8): имя → базовый URL метрик сервиса (каркас
+	// internal/service отдаёт /livez на METRICS_ADDR; в docker-сети —
+	// http://<имя-сервиса>:<порт>). nil/пустая карта — секция «н/д».
+	Probes map[string]string `yaml:"probes"`
+}
+
 // Default возвращает конфигурацию со значениями по умолчанию из ТЗ 5.10
 // (кроме postgres.dsn: он обязан быть задан в YAML или окружении).
 func Default() *Config {
@@ -383,6 +409,20 @@ func Default() *Config {
 			// худший случай без вечного ожидания посетителя.
 			Timeout: Duration(60 * time.Second),
 		},
+		Dashboard: Dashboard{
+			// Loopback: публикация наружу — reverse-proxy с TLS
+			// (ТЗД §9.1), не сам сервис.
+			Listen: "127.0.0.1:8090",
+			// «Сейчас» операторской сводки (ТЗД §6.4: автообновление
+			// фронта ~5 с) без лишней нагрузки на БД (ТЗД §4.4).
+			Refresh: Duration(5 * time.Second),
+			// Креды не заданы: обязательность проверяет cmd/dashboard
+			// на старте (ТЗД §7.7), не общий Validate.
+			Username:     "",
+			PasswordHash: "",
+			// Пробы не заданы — секция здоровья «н/д» (ТЗД §5.8).
+			Probes: nil,
+		},
 		Log: Log{
 			Level: "info",
 		},
@@ -410,6 +450,24 @@ func (c *Config) normalize() {
 			w[strings.ToLower(strings.TrimSpace(name))] = c.Scheduler.ZoneWeights[name]
 		}
 		c.Scheduler.ZoneWeights = w
+	}
+	// Ключи проб дашборда — имена сервисов в нижнем регистре без пробелов
+	// (как имена в docker-сети и заголовок секции здоровья); значения —
+	// URL проб с обрезанными краевыми пробелами. Карта пересобирается по
+	// возрастанию ключей: столкновение после приведения («Mon» и «mon» в
+	// одном YAML) разрешается детерминированно — побеждает
+	// лексикографически больший ключ (как у весов зон).
+	if len(c.Dashboard.Probes) > 0 {
+		names := make([]string, 0, len(c.Dashboard.Probes))
+		for name := range c.Dashboard.Probes {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		p := make(map[string]string, len(names))
+		for _, name := range names {
+			p[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(c.Dashboard.Probes[name])
+		}
+		c.Dashboard.Probes = p
 	}
 }
 
@@ -699,6 +757,30 @@ func (c *Config) Validate() error {
 			Duration(time.Second), Duration(10*time.Minute), c.Web.Timeout))
 	}
 
+	// dashboard (ТЗД §8.1/§8.3, T-127). Username/PasswordHash общим
+	// Validate не проверяются: обязательность кредов — проверка запуска
+	// cmd/dashboard (ТЗД §7.7), иначе требование коснулось бы всех
+	// сервисов проекта; сам формат password_hash разбирает
+	// internal/dashboard/auth на старте дашборда.
+	if err := checkHostPort(c.Dashboard.Listen); err != nil {
+		problems = append(problems, fmt.Sprintf("dashboard.listen: ожидается [host]:port, задано %q", c.Dashboard.Listen))
+	}
+	if c.Dashboard.Refresh < Duration(time.Second) || c.Dashboard.Refresh > Duration(5*time.Minute) {
+		problems = append(problems, fmt.Sprintf("dashboard.refresh: ожидается %s..%s, задано %s",
+			Duration(time.Second), Duration(5*time.Minute), c.Dashboard.Refresh))
+	}
+	for _, name := range sortedStringKeys(c.Dashboard.Probes) {
+		if name == "" {
+			problems = append(problems, "dashboard.probes: имя пробы не может быть пустым")
+			continue
+		}
+		u, err := url.Parse(c.Dashboard.Probes[name])
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			problems = append(problems, fmt.Sprintf(
+				"dashboard.probes: %s=%q — ожидается абсолютный http(s)-адрес (базовый URL метрик сервиса, ТЗД §8.3)", name, c.Dashboard.Probes[name]))
+		}
+	}
+
 	// log (расширение каркаса, T-012)
 	switch c.Log.Level {
 	case "", "debug", "info", "warn", "error": // "" — конфиг без Default()
@@ -731,6 +813,16 @@ func inRange(v, lo, hi int) bool { return v >= lo && v <= hi }
 // sortedKeys — ключи карты по возрастанию (детерминированный порядок
 // сообщений валидации; Go-карты не упорядочены).
 func sortedKeys(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sortedStringKeys — то же для карт строковых значений (пробы дашборда).
+func sortedStringKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

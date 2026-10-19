@@ -97,6 +97,10 @@ func TestDefault(t *testing.T) {
 		{"web.listen", c.Web.Listen, "127.0.0.1:8080"},
 		{"web.rate_limit", c.Web.RateLimit, 4},
 		{"web.timeout", c.Web.Timeout.D(), 60 * time.Second},
+		{"dashboard.listen", c.Dashboard.Listen, "127.0.0.1:8090"},
+		{"dashboard.refresh", c.Dashboard.Refresh.D(), 5 * time.Second},
+		{"dashboard.username", c.Dashboard.Username, ""},
+		{"dashboard.password_hash", c.Dashboard.PasswordHash, ""},
 		{"log.level", c.Log.Level, "info"},
 	}
 	for _, ch := range checks {
@@ -109,6 +113,9 @@ func TestDefault(t *testing.T) {
 	}
 	if len(c.Scheduler.ZoneWeights) != 0 {
 		t.Errorf("scheduler.zone_weights: по умолчанию пуст (равные веса, ТЗ 5.3 «опционально»), получено %v", c.Scheduler.ZoneWeights)
+	}
+	if len(c.Dashboard.Probes) != 0 {
+		t.Errorf("dashboard.probes: по умолчанию пуст (пробы не заданы, ТЗД §8.1), получено %v", c.Dashboard.Probes)
 	}
 
 	// Все значения по умолчанию проходят валидацию после задания dsn.
@@ -188,6 +195,14 @@ subdomains:
 monitor:
   listen: "127.0.0.1:9110"
   zone_stats_interval: "30s"
+dashboard:
+  listen: "127.0.0.1:8190"
+  refresh: "15s"
+  username: "operator"
+  password_hash: "pbkdf2-sha256$600000$q6urq6urq6urq6urq6urqw==$q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="
+  probes:
+    dns-worker: "http://10.0.0.2:9102"
+    http-worker: "http://10.0.0.3:9103"
 log:
   level: "warn"
 `, nil)
@@ -248,6 +263,11 @@ log:
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.75},
 		{"monitor.listen", cfg.Monitor.Listen, "127.0.0.1:9110"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 30 * time.Second},
+		{"dashboard.listen", cfg.Dashboard.Listen, "127.0.0.1:8190"},
+		{"dashboard.refresh", cfg.Dashboard.Refresh.D(), 15 * time.Second},
+		{"dashboard.username", cfg.Dashboard.Username, "operator"},
+		{"dashboard.password_hash", cfg.Dashboard.PasswordHash,
+			"pbkdf2-sha256$600000$q6urq6urq6urq6urq6urqw==$q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="},
 		{"log.level", cfg.Log.Level, "warn"},
 	}
 	for _, ch := range checks {
@@ -260,6 +280,9 @@ log:
 	}
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 3 || w["com"] != 5 || w["co.uk"] != 3 || w["xn--p1ai"] != 2 {
 		t.Errorf("scheduler.zone_weights: ожидается map[com:5 co.uk:3 xn--p1ai:2], получено %v", w)
+	}
+	if p := cfg.Dashboard.Probes; len(p) != 2 || p["dns-worker"] != "http://10.0.0.2:9102" || p["http-worker"] != "http://10.0.0.3:9103" {
+		t.Errorf("dashboard.probes: ожидается map[dns-worker:http://10.0.0.2:9102 http-worker:http://10.0.0.3:9103], получено %v", p)
 	}
 }
 
@@ -297,6 +320,8 @@ func TestLoadYAMLErrors(t *testing.T) {
 		{"не тот тип", "http:\n  concurrency: \"много\"\n", "unmarshal"},
 		{"веса не карта", "scheduler:\n  zone_weights: [1, 2]\n", "unmarshal"},
 		{"вес не число", "scheduler:\n  zone_weights:\n    com: много\n", "unmarshal"},
+		{"пробы не карта", "dashboard:\n  probes: [1]\n", "unmarshal"},
+		{"проба не строка", "dashboard:\n  probes:\n    mon: [1]\n", "unmarshal"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -404,6 +429,11 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_WEB_LISTEN":                       "127.0.0.1:8088",
 		"CRAWLER_WEB_RATE_LIMIT":                   "10",
 		"CRAWLER_WEB_TIMEOUT":                      "90s",
+		"CRAWLER_DASHBOARD_LISTEN":                 "127.0.0.1:8191",
+		"CRAWLER_DASHBOARD_REFRESH_INTERVAL":       "30s",
+		"CRAWLER_DASHBOARD_USERNAME":               "envop",
+		"CRAWLER_DASHBOARD_PASSWORD_HASH":          "pbkdf2-sha256$1000$c2FsdA==$a2V5",
+		"CRAWLER_DASHBOARD_PROBES":                 "Mon=http://mon:9100, api=http://api:9104",
 		"CRAWLER_LOG_LEVEL":                        "debug",
 	})
 	type check struct {
@@ -466,6 +496,10 @@ func TestEnvOverrides(t *testing.T) {
 		{"web.listen", cfg.Web.Listen, "127.0.0.1:8088"},
 		{"web.rate_limit", cfg.Web.RateLimit, 10},
 		{"web.timeout", cfg.Web.Timeout.D(), 90 * time.Second},
+		{"dashboard.listen", cfg.Dashboard.Listen, "127.0.0.1:8191"},
+		{"dashboard.refresh", cfg.Dashboard.Refresh.D(), 30 * time.Second},
+		{"dashboard.username", cfg.Dashboard.Username, "envop"},
+		{"dashboard.password_hash", cfg.Dashboard.PasswordHash, "pbkdf2-sha256$1000$c2FsdA==$a2V5"},
 		{"log.level", cfg.Log.Level, "debug"},
 	}
 	for _, ch := range checks {
@@ -480,6 +514,11 @@ func TestEnvOverrides(t *testing.T) {
 	// Карта весов зон из env: ключи приводятся к нижнему регистру.
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 2 || w["org"] != 7 || w["xn--p1ai"] != 2 {
 		t.Errorf("scheduler.zone_weights: ожидается map[org:7 xn--p1ai:2], получено %v", w)
+	}
+	// Карта проб из env: ключи приводятся к нижнему регистру, края
+	// значений обрезаются.
+	if p := cfg.Dashboard.Probes; len(p) != 2 || p["mon"] != "http://mon:9100" || p["api"] != "http://api:9104" {
+		t.Errorf("dashboard.probes: ожидается map[api:http://api:9104 mon:http://mon:9100], получено %v", p)
 	}
 }
 
@@ -497,6 +536,8 @@ func TestEnvBadValues(t *testing.T) {
 		{map[string]string{"CRAWLER_LOG_LEVEL": "verbose"}, "log.level"},
 		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
 		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com=много"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
+		{map[string]string{"CRAWLER_DASHBOARD_PROBES": "mon"}, "CRAWLER_DASHBOARD_PROBES"},
+		{map[string]string{"CRAWLER_DASHBOARD_REFRESH_INTERVAL": "5"}, "CRAWLER_DASHBOARD_REFRESH_INTERVAL"},
 	}
 	for _, tt := range tests {
 		env := validDSN()
@@ -526,10 +567,15 @@ scheduler:
   zone_weights:
     com: 5
     org: 2
+dashboard:
+  probes:
+    mon: "http://yaml-mon:9100"
+    api: "http://yaml-api:9100"
 `, map[string]string{
 		"CRAWLER_HTTP_TOTAL_TIMEOUT":     "40s",
 		"CRAWLER_HTTP_HEADER_TIMEOUT":    "",
 		"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "net=9",
+		"CRAWLER_DASHBOARD_PROBES":       "live=http://env-live:9100",
 	})
 	if cfg.HTTP.TotalTimeout.D() != 40*time.Second {
 		t.Errorf("env > yaml: ожидается 40s, получено %s", cfg.HTTP.TotalTimeout)
@@ -546,6 +592,11 @@ scheduler:
 	// Карта весов из env заменяет карту из YAML целиком (как списки).
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 1 || w["net"] != 9 {
 		t.Errorf("scheduler.zone_weights: ожидается map[net:9] (замена целиком), получено %v", w)
+	}
+	// Карта проб из env заменяет карту из YAML целиком (как списки
+	// и веса зон).
+	if p := cfg.Dashboard.Probes; len(p) != 1 || p["live"] != "http://env-live:9100" {
+		t.Errorf("dashboard.probes: ожидается map[live:http://env-live:9100] (замена целиком), получено %v", p)
 	}
 }
 
@@ -727,6 +778,13 @@ func TestValidate(t *testing.T) {
 		{"web.rate_limit велик", func(c *Config) { c.Web.RateLimit = 1001 }, "web.rate_limit"},
 		{"web.timeout 0", func(c *Config) { c.Web.Timeout = 0 }, "web.timeout"},
 		{"web.timeout велик", func(c *Config) { c.Web.Timeout = Duration(11 * time.Minute) }, "web.timeout"},
+		{"dashboard.listen кривой", func(c *Config) { c.Dashboard.Listen = "8090" }, "dashboard.listen"},
+		{"dashboard.refresh 0", func(c *Config) { c.Dashboard.Refresh = 0 }, "dashboard.refresh"},
+		{"dashboard.refresh менее секунды", func(c *Config) { c.Dashboard.Refresh = Duration(500 * time.Millisecond) }, "dashboard.refresh"},
+		{"dashboard.refresh более 5 минут", func(c *Config) { c.Dashboard.Refresh = Duration(6 * time.Minute) }, "dashboard.refresh"},
+		{"проба не абсолютный URL", func(c *Config) { c.Dashboard.Probes = map[string]string{"mon": "mon:9100"} }, "dashboard.probes"},
+		{"проба не http(s)", func(c *Config) { c.Dashboard.Probes = map[string]string{"mon": "ftp://mon:9100"} }, "dashboard.probes"},
+		{"имя пробы пустое", func(c *Config) { c.Dashboard.Probes = map[string]string{"": "http://mon:9100"} }, "dashboard.probes"},
 		{"log.level кривой", func(c *Config) { c.Log.Level = "verbose" }, "log.level"},
 	}
 	for _, tt := range tests {
@@ -753,6 +811,8 @@ func TestValidate(t *testing.T) {
 	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)
 	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // границы весов
 	c.Web.Listen = "/run/crawler-web/web.sock"                                         // unix-сокет — вариант публичного входа web (T-124)
+	c.Dashboard.Refresh = Duration(5 * time.Minute)                                    // верхняя граница периода снимков (ТЗД §8.3)
+	c.Dashboard.Probes = map[string]string{"dns-worker": "http://dns-worker:9102"}     // проба живости (ТЗД §5.8)
 	c.Subdomains = make([]string, maxSubdomains)
 	for i := range c.Subdomains {
 		c.Subdomains[i] = fmt.Sprintf("s%d", i)
@@ -760,9 +820,10 @@ func TestValidate(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Errorf("граничные значения должны быть валидны: %v", err)
 	}
-	c.Scheduler.BatchSize = 1000 // нижняя граница пачек планировщика (ТЗ 5.3)
+	c.Scheduler.BatchSize = 1000                // нижняя граница пачек планировщика (ТЗ 5.3)
+	c.Dashboard.Refresh = Duration(time.Second) // нижняя граница периода снимков (ТЗД §8.3)
 	if err := c.Validate(); err != nil {
-		t.Errorf("нижняя граница scheduler.batch_size должна быть валидна: %v", err)
+		t.Errorf("нижние границы должны быть валидны: %v", err)
 	}
 }
 
@@ -796,6 +857,28 @@ func TestZoneWeightsNormalize(t *testing.T) {
 		cfg := mustLoad(t, yaml, validDSN())
 		if w := cfg.Scheduler.ZoneWeights; len(w) != 1 || w["com"] != 2 {
 			t.Errorf("%q: после normalize: ожидается map[com:2], получено %v", yaml, w)
+		}
+	}
+}
+
+// Ключи проб дашборда приводятся к нижнему регистру без пробелов, края
+// URL обрезаются (normalize): имена сервисов — как в docker-сети и
+// заголовке секции здоровья дашборда.
+func TestDashboardProbesNormalize(t *testing.T) {
+	cfg := mustLoad(t, "dashboard:\n  probes:\n    \" DNS-Worker \": \" http://dns:9102 \"\n    mon: \"http://mon:9100\"\n", validDSN())
+	if p := cfg.Dashboard.Probes; len(p) != 2 || p["dns-worker"] != "http://dns:9102" || p["mon"] != "http://mon:9100" {
+		t.Errorf("dashboard.probes после normalize: ожидается map[dns-worker:http://dns:9102 mon:http://mon:9100], получено %v", p)
+	}
+	// Столкновение после приведения («Mon» и «mon») разрешается
+	// детерминированно — побеждает лексикографически больший ключ
+	// (как у весов зон), независимо от порядка в YAML.
+	for _, yaml := range []string{
+		"dashboard:\n  probes:\n    Mon: \"http://a:1\"\n    mon: \"http://b:1\"\n",
+		"dashboard:\n  probes:\n    mon: \"http://b:1\"\n    Mon: \"http://a:1\"\n",
+	} {
+		cfg := mustLoad(t, yaml, validDSN())
+		if p := cfg.Dashboard.Probes; len(p) != 1 || p["mon"] != "http://b:1" {
+			t.Errorf("%q: после normalize: ожидается map[mon:http://b:1], получено %v", yaml, p)
 		}
 	}
 }

@@ -273,6 +273,11 @@ crawlerctl recheck <домен> [домен …]     # принудительн�
 crawlerctl dict train <файл> [--samples ПУТЬ]…
                                          # обучение/переобучение словаря
                                          # сжатия zstd (ТЗ 5.7)
+crawlerctl dashboard-secret [ПАРОЛЬ]     # хэш пароля операторского
+                                          # дашборда (dashboard.password_hash,
+                                          # ТЗД §7.2); пароль — аргумент
+                                          # или stdin (аргумент остаётся
+                                          # в истории shell)
 crawlerctl seed / test-rules             # dev-команды (make seed, make test-rules)
 ```
 

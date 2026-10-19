@@ -41,17 +41,18 @@ type commandFunc func(args []string, stdout, stderr io.Writer) error
 
 // commands — таблица команд: роутинг в run и список в usageText.
 var commands = map[string]commandFunc{
-	"status":     cmdStatus,
-	"domain":     cmdDomain,
-	"subdomains": cmdSubdomains,
-	"zones":      cmdZones,
-	"reanalyze":  cmdReanalyze,
-	"recheck":    cmdRecheck,
-	"dict":       cmdDict,
-	"seed":       cmdSeed,
-	"test-rules": cmdTestRules,
-	"near":       cmdNear,
-	"check":      cmdCheck,
+	"status":           cmdStatus,
+	"domain":           cmdDomain,
+	"subdomains":       cmdSubdomains,
+	"zones":            cmdZones,
+	"reanalyze":        cmdReanalyze,
+	"recheck":          cmdRecheck,
+	"dict":             cmdDict,
+	"dashboard-secret": cmdDashboardSecret,
+	"seed":             cmdSeed,
+	"test-rules":       cmdTestRules,
+	"near":             cmdNear,
+	"check":            cmdCheck,
 }
 
 // usageText — справка верхнего уровня: без аргументов, help, неизвестная
@@ -74,6 +75,9 @@ const usageText = `crawlerctl — CLI Domain Crawler
   dict train <файл> [--samples ПУТЬ]…
                                 обучение/переобучение словаря сжатия zstd
                                 по HTML-образцам (ТЗ 5.7)
+  dashboard-secret [ПАРОЛЬ]     хэш пароля операторского дашборда
+                                (dashboard.password_hash, дашборд ТЗД);
+                                пароль — аргумент или stdin
 
 Команды разбора:
   near [--zone ИМЯ] [--min-score F]

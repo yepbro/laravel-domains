@@ -513,6 +513,50 @@ config.dev.yaml), на боевом хосте — loopback ingest по `METRICS
 одного имени (DNS → HTTP → рендер SPA → анализ, T-119/T-123), ответ
 посетителю приходит не позже потолка.
 
+### `dashboard` (дашборд, ТЗД §8.1)
+
+| YAML | Переменная | Тип | По умолчанию |
+|---|---|---|---|
+| `listen` | `CRAWLER_DASHBOARD_LISTEN` | [host]:port | `127.0.0.1:8090` |
+| `refresh` | `CRAWLER_DASHBOARD_REFRESH_INTERVAL` | длительность | `5s` (коридор 1s–5m) |
+| `username` | `CRAWLER_DASHBOARD_USERNAME` | строка | `""` |
+| `password_hash` | `CRAWLER_DASHBOARD_PASSWORD_HASH` | строка формата ТЗД §7.2 | `""` |
+| `probes` | `CRAWLER_DASHBOARD_PROBES` | карта имя=url | — |
+
+`listen` — публичный адрес операторского дашборда: страницы и API
+(ТЗД §4.2). Дефолт — loopback: публикация наружу — reverse-proxy с TLS
+(ТЗД §9.1), не сам сервис; метрики и пробы дашборда — на `METRICS_ADDR`
+(`127.0.0.1:9108`). `refresh` — период фоновой сборки снимков состояния
+(ТЗД §4.4), коридор 1s–5m (ТЗД §8.3): быстрее — лишняя нагрузка на БД
+(числа меняются медленнее), медленнее — портит живость сводки; нагрузка
+не зависит от числа открытых вкладок (браузер получает кэшированный
+снимок).
+
+`username`/`password_hash` — креды оператора (HTTP Basic, ТЗД §7.1).
+Общий `config.Validate` их **не проверяет**: обязательность проверяет
+при старте только `cmd/dashboard` (ТЗД §7.7) — иначе требование
+коснулось бы всех сервисов проекта. `password_hash` — строка формата
+ТЗД §7.2:
+
+```
+pbkdf2-sha256$<итерации>$<соль base64>$<ключ base64>
+```
+
+PBKDF2-HMAC-SHA256, соль ≥16 байт, ключ 32 байта; итерации читаются из
+строки, генерация — 600 000 (OWASP). Генерация — `crawlerctl
+dashboard-secret` (пароль — аргумент или stdin; справка предупреждает
+про историю shell); открытый пароль в конфигурации и окружении
+запрещён. Разбор и сверка — пакет `internal/dashboard/auth` (использует
+и `cmd/dashboard`, T-128).
+
+`probes` — пробы живости сервисов конвейера для секции здоровья
+(ТЗД §4.3, §5.8): имя → базовый URL метрик сервиса (каркас
+`internal/service` отдаёт `/livez` на METRICS_ADDR; в docker-сети —
+`http://<имя-сервиса>:<порт>`). Значение — абсолютный http(s)-адрес,
+имена приводятся к нижнему регистру; пустая карта — секция здоровья
+«н/д». Переменная заменяет карту из YAML целиком, элементы через
+запятую: `CRAWLER_DASHBOARD_PROBES="dns-worker=http://dns-worker:9102,http-worker=http://http-worker:9103"`.
+
 ### `log` (каркас сервисов)
 
 | YAML | Переменная | Тип | По умолчанию |
@@ -528,11 +572,11 @@ config.dev.yaml), на боевом хосте — loopback ingest по `METRICS
 Проверяется всё сразу, ошибка перечисляет проблемы вида `секция.поле: что не так`:
 
 - `postgres.dsn` непуст; `pool_size` 1..100;
-- `redis.addr`, `dns.resolvers`, `dns.fallback_resolvers`, `monitor.listen` —
-  корректные `host:port` (порт 1..65535); резолверы — хотя бы один;
-  `monitor.ingest_metrics_url` (если задан) — абсолютный http(s)-адрес;
-  `web.listen` — `host:port` или абсолютный путь unix-сокета ≤100 байт
-  (вариант деплоя за nginx, T-124);
+- `redis.addr`, `dns.resolvers`, `dns.fallback_resolvers`, `monitor.listen`,
+  `dashboard.listen` — корректные `host:port` (порт 1..65535); резолверы —
+  хотя бы один; `monitor.ingest_metrics_url` (если задан) — абсолютный
+  http(s)-адрес; `web.listen` — `host:port` или абсолютный путь unix-сокета
+  ≤100 байт (вариант деплоя за nginx, T-124);
   `redis.maxlen` — 0 или 1000..100000000, `redis.max_attempts` 1..100,
   `redis.claim_min_idle` положительна;
 - все таймауты/интервалы положительны; `ingest.batch_size` 1..1000000,
@@ -540,7 +584,10 @@ config.dev.yaml), на боевом хосте — loopback ingest по `METRICS
   `scheduler.batch_size` 1000..10000 (ТЗ 5.3), `queue_high_watermark` ≥ 1,
   `temp_error_max_retries` 1..100; `scheduler.zone_weights` — ключи
   (punycode-имена зон, приведённые к нижнему регистру) синтаксически
-  корректны, веса 1..1000;
+  корректны, веса 1..1000; `dashboard.refresh` 1s..5m; `dashboard.probes` —
+  непустые имена, абсолютные http(s)-URL (ТЗД §8.3); `dashboard.username`/
+  `dashboard.password_hash` общим `Validate` не проверяются —
+  обязательность кредов проверяет `cmd/dashboard` на старте (ТЗД §7.7);
 - `dns.concurrency`/`http.concurrency` 1..100000, `dns.max_qps` 1..1000000,
   `http.per_ip_limit` 1..64, `http.max_redirects` 0..100, `http.max_rps`
   1..1000000, `max_body_bytes`/`min_body_speed` > 0;

@@ -155,6 +155,11 @@ func envSpecs() []envSpec {
 		{"CRAWLER_WEB_LISTEN", setString(func(c *Config) *string { return &c.Web.Listen })},
 		{"CRAWLER_WEB_RATE_LIMIT", setInt(func(c *Config) *int { return &c.Web.RateLimit })},
 		{"CRAWLER_WEB_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Web.Timeout })},
+		{"CRAWLER_DASHBOARD_LISTEN", setString(func(c *Config) *string { return &c.Dashboard.Listen })},
+		{"CRAWLER_DASHBOARD_REFRESH_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Dashboard.Refresh })},
+		{"CRAWLER_DASHBOARD_USERNAME", setString(func(c *Config) *string { return &c.Dashboard.Username })},
+		{"CRAWLER_DASHBOARD_PASSWORD_HASH", setString(func(c *Config) *string { return &c.Dashboard.PasswordHash })},
+		{"CRAWLER_DASHBOARD_PROBES", setStringMap(func(c *Config) *map[string]string { return &c.Dashboard.Probes })},
 		{"CRAWLER_LOG_LEVEL", setString(func(c *Config) *string { return &c.Log.Level })},
 	}
 }
@@ -277,6 +282,34 @@ func setZoneWeights(get func(*Config) *map[string]int) func(*Config, string) err
 				return fmt.Errorf("вес зоны %s: ожидается целое число, получено %q", strings.TrimSpace(name), weight)
 			}
 			m[strings.ToLower(strings.TrimSpace(name))] = n
+		}
+		*get(c) = m
+		return nil
+	}
+}
+
+// setStringMap разбирает карту «имя = значение» через запятую
+// (mon=http://m:9101, api=http://a:9100) — по образцу весов зон
+// (T-106); значение целиком заменяет карту из YAML, имя приводится к
+// нижнему регистру, края значений обрезаются, пустые элементы (хвостовая
+// запятая) пропускаются, форму значений проверяет валидация. Разрез по
+// первому «=»: «=» в значении после него допустим (URL с запросом);
+// запятую значение содержать не может (разделитель элементов, то же
+// ограничение, что у весов зон) — базовые URL метрик запятых не
+// содержат.
+func setStringMap(get func(*Config) *map[string]string) func(*Config, string) error {
+	return func(c *Config, v string) error {
+		m := make(map[string]string)
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			name, val, ok := strings.Cut(part, "=")
+			if !ok {
+				return fmt.Errorf("ожидается карта «имя=значение» через запятую (mon=http://m:9101), получено %q", part)
+			}
+			m[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(val)
 		}
 		*get(c) = m
 		return nil
