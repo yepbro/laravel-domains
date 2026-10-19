@@ -1,0 +1,69 @@
+name: mutation
+
+# Мутационное тестирование (go-mutesting) — тяжёлая проверка, в CI
+# каждого пуша не входит: ночной прогон по master + ручной запуск.
+# Порог и охват настраиваются входами; отчёты — в artifact рана.
+on:
+  workflow_dispatch:
+    inputs:
+      pkgs:
+        description: 'Охват: ./-шаблоны пакетов через пробел (пусто — default из Makefile)'
+        required: false
+        default: ''
+      min_score:
+        description: 'Минимальный mutation score (0..1)'
+        required: false
+        default: '0.50'
+      timeout:
+        description: 'Таймаут go test на мутанта, сек'
+        required: false
+        default: '60'
+  schedule:
+    - cron: '30 2 * * *'  # ночью по UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mutate:
+    name: mutation testing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      # Как в ci.yml: те же compose-файлы + кэш слоёв type=gha
+      COMPOSE: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Подготовить .env
+        run: cp .env.example .env
+
+      # Достаточно tools-образа (dev stage): линт/тесты здесь не гоняются,
+      # инфраструктура не нужна — юнит-тесты мутационного охвата герметичны.
+      - name: Собрать tools-образ (с кэшем слоёв)
+        run: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env build tools
+
+      - name: Мутационное тестирование
+        run: |
+          if [ -n "${{ inputs.pkgs }}" ]; then
+            export MUTATE_PKGS="${{ inputs.pkgs }}"
+          fi
+          make mutate COMPOSE="$COMPOSE" \
+            MUTATION_MIN_SCORE="${{ inputs.min_score || '0.50' }}" \
+            MUTATE_TIMEOUT="${{ inputs.timeout || '60' }}"
+
+      # Отчёты полезны и при падении (разбор выживших), и при успехе
+      # (динамика score); mutate.log дублирует консоль рана.
+      - name: Выгрузить отчёты в artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-report-${{ github.run_id }}
+          retention-days: 14
+          path: var/mutation/

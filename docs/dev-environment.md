@@ -78,6 +78,7 @@ make test            # модульные тесты (в контейнере, G
 make lint            # golangci-lint
 make test-rules      # правила Laravel по корпусу testdata/laravel-samples
 make test-integration# интеграционные тесты окружения на testbed
+make mutate          # мутационное тестирование (тяжёлое; mutation-testing.md)
 ```
 
 Мониторинг и инструменты поднимаются по требованию:

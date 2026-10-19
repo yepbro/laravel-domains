@@ -20,6 +20,7 @@
 | [`redis.md`](redis.md) | очередь задач и конфигурация Redis | очереди |
 | [`content.md`](content.md) / [`render.md`](render.md) / [`analyzer.md`](analyzer.md) | хранилище контента, рендер, анализатор | этапы конвейера |
 | [`runbooks.md`](runbooks.md) | процедуры: словарь zstd, `q:dead`, переанализ | по необходимости |
+| [`mutation-testing.md`](mutation-testing.md) | мутационное тестирование: `make mutate`, пороги, отчёты | качество тестов |
 | [`deploy.md`](deploy.md) | боевой деплой systemd: юниты, бюджет памяти | установка на сервер |
 | [`disks.md`](disks.md) / [`os-tuning.md`](os-tuning.md) | тома и SMART, sysctl боевого сервера | подготовка сервера |
 

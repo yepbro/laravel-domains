@@ -44,6 +44,7 @@ make test-integration  # проверка окружения на testbed
 | [`docs/render.md`](docs/render.md) | рендер: Chromium, изолированные контексты, ожидание готовности, съём DOM/cookies |
 | [`docs/analyzer.md`](docs/analyzer.md) | движок правил Laravel: цели (cookie/заголовки/HTML/meta), свидетельства срабатываний, переанализ |
 | [`docs/runbooks.md`](docs/runbooks.md) | процедурные инструкции: переобучение словаря zstd, разбор `q:dead`, переанализ |
+| [`docs/mutation-testing.md`](docs/mutation-testing.md) | мутационное тестирование go-mutesting: охват и пороги `make mutate`, отчёты, гашение ложных мутантов, ночной CI-прогон |
 | [`docs/deploy.md`](docs/deploy.md) | боевой деплой systemd: юниты, бюджет памяти, установка |
 | [`docs/disks.md`](docs/disks.md) | диски боевого сервера: тома PostgreSQL и контента, SMART/TBW (ТЗ §10.3) |
 | [`docs/os-tuning.md`](docs/os-tuning.md) | тюнинг ОС боевого сервера: sysctl — эфемерные порты, TIME_WAIT, nofile, conntrack, UDP-буферы DNS (ТЗ §10.2) |
@@ -63,6 +64,12 @@ make test-integration  # проверка окружения на testbed
 Статус — бейджем в шапке; при падении логи всех сервисов выгружаются в artifact
 рана. Обновления GitHub Actions и Go-зависимостей поднимает Dependabot
 ([`.github/dependabot.yml`](.github/dependabot.yml)).
+
+Мутационное тестирование в основной CI не входит (тяжёлая проверка):
+ночью по `master` и вручную его гоняет отдельный workflow
+[`.github/workflows/mutation.yml`](.github/workflows/mutation.yml)
+(`make mutate` с порогом score, отчёты — в artifact;
+[`docs/mutation-testing.md`](docs/mutation-testing.md)).
 
 ## Структура
 

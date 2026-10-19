@@ -31,6 +31,7 @@ x-go-build: &go-build
     DELVE_VERSION: ${DELVE_VERSION:-v1.27.2}
     GOLANGCI_LINT_VERSION: ${GOLANGCI_LINT_VERSION:-v2.14.0}
     MIGRATE_VERSION: ${MIGRATE_VERSION:-v4.20.1}
+    GO_MUTESTING_VERSION: ${GO_MUTESTING_VERSION:-v0.0.0-20251226130216-48d0401f00fb}
 
 x-go-common: &go-common
   image: crawler/go-dev:local

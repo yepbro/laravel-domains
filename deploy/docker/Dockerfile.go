@@ -31,11 +31,16 @@ ARG AIR_VERSION=v1.67.4
 ARG DELVE_VERSION=v1.27.2
 ARG GOLANGCI_LINT_VERSION=v2.14.0
 ARG MIGRATE_VERSION=v4.20.1
+# go-mutesting — форк avito-tech одноимённого инструмента zimmski
+# (апстрим мёртв и несовместим с современными тулчейнами); версия пинится
+# в .env (GO_MUTESTING_VERSION), make mutate — docs/mutation-testing.md.
+ARG GO_MUTESTING_VERSION=v0.0.0-20251226130216-48d0401f00fb
 RUN apk add --no-cache build-base git ca-certificates tzdata \
  && go install github.com/air-verse/air@${AIR_VERSION} \
  && go install github.com/go-delve/delve/cmd/dlv@${DELVE_VERSION} \
  && go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION} \
- && go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@${MIGRATE_VERSION}
+ && go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@${MIGRATE_VERSION} \
+ && go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@${GO_MUTESTING_VERSION}
 # Рантайм-кэши в именованных томах (compose); 1777 — чтобы том был доступен
 # любому UID разработчика (user задаётся в compose).
 RUN mkdir -p /gomod /gocache && chmod 1777 /gomod /gocache

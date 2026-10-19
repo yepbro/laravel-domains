@@ -145,8 +145,8 @@ Dev-окружение — Docker (Go на хосте не нужен). Стру
 - Фиксы по итогам массового ревью — ветка `fix-<slug>` и worktree
   `~/worktrees/laravel-domains/fix-<slug>` (см. «Массовое код-ревью
   и фиксы»); правила работы в нём те же.
-- В worktree разрешены только `make test` / `make lint` / `make fmt` с
-  `COMPOSE_PROJECT_NAME=crawler`; `make up/down/clean/test-integration`
+- В worktree разрешены только `make test` / `make lint` / `make fmt` /
+  `make mutate` с `COMPOSE_PROJECT_NAME=crawler`; `make up/down/clean/test-integration`
   и другие цели, меняющие основной docker-стек, запрещены.
 
 ### Линейная история master
@@ -235,6 +235,7 @@ T-номера. Ревью — по необходимости, по схеме 
 
 - `make up` / `make down` / `make ps` — окружение.
 - `make test` — юнит-тесты; `make test-integration` — интеграционные.
+- `make mutate` — мутационное тестирование (тяжёлое; docs/mutation-testing.md).
 - `make lint`, `make fmt` — линтер и форматирование.
 - `make logs SERVICE=<имя>` — логи сервиса.
 - Полный список: `make help`.

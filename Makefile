@@ -182,6 +182,35 @@ test-integration: ## Интеграционные тесты окружения 
 	$(COMPOSE) run --rm -e CRAWLER_INTEGRATION=1 tools \
 		go test ./test/integration -count=1 -v -timeout 10m
 
+# --------------------------------------------------------------- мутационное тестирование
+# Как читать отчёты, гейтить порог и помечать ложных мутантов —
+# docs/mutation-testing.md.
+
+# Охват по умолчанию — «логическое ядро»: пакеты бизнес-логики с
+# герметичными и быстрыми юнит-тестами (без сети/БД/Chromium). Полный
+# прогон долог (~1.5–2 ч: тысячи мутантов, каждому — go test пакета);
+# config и web не включены: там сотни мутантов по yaml-биндингу и
+# i18n-обвязке при низком сигнале. Точечный запуск любого пакета:
+#   make mutate PKGS='./internal/httpfetch/...'
+PKGS ?= ./internal/analyzer/... \
+	./internal/dashboard/... ./internal/idn/... ./internal/model/... \
+	./internal/monitor/... ./internal/queue/... ./internal/render/... \
+	./internal/rules/... ./internal/scheduler/... ./internal/status/...
+# Таймаут go test на одного мутанта, секунд (компиляция + тест пакета)
+MUTATE_TIMEOUT ?= 60
+# Порог mutation score 0..1: ниже — ненулевой код выхода (гейт CI;
+# локально 0 = только отчёт)
+MUTATION_MIN_SCORE ?= 0
+
+.PHONY: mutate
+mutate: ## Мутационное тестирование go-mutesting (отчёт var/mutation/)
+	$(check_env)
+	$(COMPOSE) run --rm \
+		-e MUTATE_PKGS='$(PKGS)' \
+		-e MUTATE_TIMEOUT='$(MUTATE_TIMEOUT)' \
+		-e MUTATION_MIN_SCORE='$(MUTATION_MIN_SCORE)' \
+		tools sh deploy/docker/scripts/mutate.sh
+
 .PHONY: lint
 lint: ## golangci-lint (в контейнере)
 	$(check_env)
