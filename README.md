@@ -21,7 +21,9 @@ make test-integration  # проверка окружения на testbed
 ```
 
 Лендинг (профиль app) после старта — http://127.0.0.1:8081 (порт `WEB_PORT`
-в `.env`, публикуется только на loopback).
+в `.env`, публикуется только на loopback). Операторский дашборд конвейера —
+http://127.0.0.1:8090 (порт `DASHBOARD_PORT`; вход admin/admin — dev-креды,
+см. [`docs/dev-environment.md`](docs/dev-environment.md)).
 
 ## Документация
 

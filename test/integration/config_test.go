@@ -5,10 +5,12 @@ package integration
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
 	"crawler/internal/config"
+	"crawler/internal/dashboard"
 )
 
 func TestConfigDevEnvironment(t *testing.T) {
@@ -51,6 +53,35 @@ func TestConfigDevEnvironment(t *testing.T) {
 	}
 	if fileCfg.Redis.Addr != "172.28.100.3:6379" || fileCfg.Monitor.Listen != ":9100" {
 		t.Errorf("config.dev.yaml: неожиданные значения: redis=%q monitor=%q", fileCfg.Redis.Addr, fileCfg.Monitor.Listen)
+	}
+
+	// Секция dashboard (T-131): listen — docker-сеть (наружу публикует
+	// compose-сервис dashboard на 127.0.0.1:DASHBOARD_PORT хоста), креды —
+	// dev admin/admin (docs/dev-environment.md), пробы — имена
+	// compose-сервисов с их METRICS_PORT (METRICS_ADDR=:91xx в compose —
+	// тот же адрес, что скрейпит Prometheus).
+	if fileCfg.Dashboard.Listen != ":8090" {
+		t.Errorf("dashboard.listen: ожидается :8090 (интерфейсы docker-сети), получено %q", fileCfg.Dashboard.Listen)
+	}
+	if fileCfg.Dashboard.Username != "admin" {
+		t.Errorf("dashboard.username: dev-креда admin, получено %q", fileCfg.Dashboard.Username)
+	}
+	if creds, err := dashboard.ParseCredentials(fileCfg); err != nil {
+		t.Errorf("dashboard.password_hash (формат ТЗД §7.2): %v", err)
+	} else if !creds.Verify("admin") {
+		t.Errorf("dashboard.password_hash: dev-пароль admin не проходит сверку (перегенерируйте хэш, docs/dev-environment.md)")
+	}
+	wantProbes := map[string]string{
+		"ingest":        "http://ingest:9101",
+		"scheduler":     "http://scheduler:9102",
+		"dns-worker":    "http://dns-worker:9103",
+		"http-worker":   "http://http-worker:9104",
+		"render-worker": "http://render-worker:9105",
+		"analyzer":      "http://analyzer:9106",
+		"monitor":       "http://monitor:9100",
+	}
+	if !reflect.DeepEqual(fileCfg.Dashboard.Probes, wantProbes) {
+		t.Errorf("dashboard.probes: ожидается карта compose-сервисов с их METRICS_PORT %v, получено %v", wantProbes, fileCfg.Dashboard.Probes)
 	}
 
 	// Пример из репозитория валиден целиком (config.example.yaml, T-006).

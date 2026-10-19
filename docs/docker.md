@@ -293,8 +293,10 @@ dc events                         # поток событий (restart, oom и �
 
 Порты на хосте (только `127.0.0.1`): `5432` PostgreSQL, `6379` Redis,
 `9090` Prometheus, `8080` Adminer, `5540` Redis Insight, `8088`/`8443`
-testweb HTTP/HTTPS, `8081` лендинг web (единственный «публичный» сервис
-профиля app, `WEB_PORT` в `.env`). Метрики сервисов: `9100`–`9107`
+testweb HTTP/HTTPS, `8081` лендинг web (`WEB_PORT` в `.env`), `8090`
+операторский дашборд dashboard (`DASHBOARD_PORT`; вход по паролю —
+dev-креды в config.dev.yaml, см. [`dev-environment.md`](dev-environment.md)).
+Метрики сервисов: `9100`–`9108`
 (только внутри сети).
 
 Имена сервисов (`postgres`, `redis`, …) резолвятся Docker-DNS из любого

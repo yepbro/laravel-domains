@@ -83,5 +83,30 @@ web:
   # (systemd-деплой, deploy/nginx/).
   listen: ":8080"
 
+dashboard:
+  # dev: дашборд слушает все интерфейсы контейнера (:8090 — внутри
+  # docker-сети), наружу порт публикует compose-сервис dashboard на
+  # 127.0.0.1 хоста (DASHBOARD_PORT); дефолт конфига — loopback под
+  # reverse-proxy с TLS (systemd-деплой, docs/deploy.md §6).
+  listen: ":8090"
+  # Dev-креды оператора: admin/admin — ТОЛЬКО dev-окружение
+  # (docs/dev-environment.md, «Дашборд»). Перегенерация хэша:
+  #   printf 'admin' | docker compose --project-directory . \
+  #     -f deploy/docker/compose.yaml --env-file .env \
+  #     run --rm -T tools go run ./cmd/crawlerctl dashboard-secret
+  username: admin
+  password_hash: "pbkdf2-sha256$600000$U4QVNdJGZODPI4hlFGHoNw==$lwv+2vxJN7K3ZQIuEueR0KDOfBrNkQIXccDg3EAWEdo="
+  # Пробы живости сервисов конвейера для секции здоровья (ТЗД §5.8):
+  # имена compose-сервисов и их METRICS_PORT в docker-сети
+  # (METRICS_ADDR=:91xx в compose — тот же адрес, что скрейпит Prometheus).
+  probes:
+    ingest: "http://ingest:9101"
+    scheduler: "http://scheduler:9102"
+    dns-worker: "http://dns-worker:9103"
+    http-worker: "http://http-worker:9104"
+    render-worker: "http://render-worker:9105"
+    analyzer: "http://analyzer:9106"
+    monitor: "http://monitor:9100"
+
 log:
   level: "info"                    # dev: info, для отладки воркеров — debug

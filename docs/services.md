@@ -75,7 +75,7 @@ if err := service.Run(service.Options{
 ТЗ 5.9: HTTP-эндпоинт Prometheus на каждом сервисе. Каркас поднимает
 `/livez`, `/healthz` и `/metrics` на `Options.MetricsAddr` (адрес `monitor` —
 `monitor.listen` из конфигурации, ТЗ 5.10, важнее `METRICS_ADDR`; адреса
-остальных сервисов — только `METRICS_ADDR`, dev-порты `:9101`…`:9107`).
+остальных сервисов — только `METRICS_ADDR`, dev-порты `:9101`…`:9108`).
 Prometheus скрейпит каждый сервис отдельно (dev-конфиг
 `deploy/docker/prometheus/prometheus.yml`, профиль `monitoring`):
 `monitor.listen` — адрес HTTP-эндпоинта самого сервиса monitor, а не
@@ -721,6 +721,15 @@ Laravel-находок — домен, зона, score, диапазон вер�
 страницы: `fetch` не показывает браузерный Basic-диалог, а повторный
 запрос самого документа получает `WWW-Authenticate` — браузер предлагает
 повторный вход или молча переотправляет кэшированные креды (§6.4).
-Развёртывание (compose, systemd, Prometheus) — T-131.
+Развёртывание (T-131, ТЗД §11): dev — compose-сервис `dashboard`
+профиля app (клон go-common: `SERVICE=dashboard`, `METRICS_PORT=9108`,
+`METRICS_ADDR=:9108` в docker-сети для Prometheus; порт публикуется на
+`127.0.0.1:8090` хоста — `DASHBOARD_PORT`; `mem_limit` 256m; креды и
+пробы — секция `dashboard` в `deploy/docker/config.dev.yaml`,
+dev-пароль — docs/dev-environment.md); бой — юнит
+`crawler-dashboard.service` (User=`crawler-dashboard`, Group=`crawler`,
+`CRAWLER_DASHBOARD_LISTEN=127.0.0.1:8090`, `MemoryMax=128M`,
+docs/deploy.md) за reverse-proxy с TLS (ТЗД §9.1); Prometheus — job
+`dashboard` на :9108 (`deploy/docker/prometheus/prometheus.yml`).
 Конфигурация — секция `dashboard`
 ([`configuration.md`](configuration.md)).

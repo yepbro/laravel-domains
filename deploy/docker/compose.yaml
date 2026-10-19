@@ -375,10 +375,11 @@ services:
     profiles: ["app"]
 
   web:
-    # Публичный лендинг (этап 13, T-124) — единственный сервис с портом
-    # наружу: в dev публикуется на loopback хоста (127.0.0.1:WEB_PORT,
-    # web.listen в config.dev.yaml слушает 8080 в контейнере); боевой
-    # вход — reverse-proxy с TLS (deploy/nginx/, docs/deploy.md).
+    # Публичный лендинг (этап 13, T-124): в dev публикуется на loopback
+    # хоста (127.0.0.1:WEB_PORT, web.listen в config.dev.yaml слушает
+    # 8080 в контейнере) — как и операторский дашборд (сервис
+    # dashboard ниже, DASHBOARD_PORT); боевой вход — reverse-proxy
+    # с TLS (deploy/nginx/, docs/deploy.md).
     # METRICS_ADDR разворачивает метрики на интерфейсы docker-сети для
     # Prometheus (наружу порт не публикуется — ТЗ §9); дефолт кода/юнита —
     # loopback 127.0.0.1:9107.
@@ -392,6 +393,34 @@ services:
       METRICS_ADDR: ":9107"
     ports:
       - "127.0.0.1:${WEB_PORT:-8081}:8080"
+    mem_limit: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles: ["app"]
+
+  dashboard:
+    # Операторский дашборд конвейера (этап 15, ТЗД; T-128…T-131): единая
+    # страница состояния с доступом по паролю (HTTP Basic, креды — секция
+    # dashboard в config.dev.yaml), строго read-only. В dev публикуется
+    # на loopback хоста (127.0.0.1:DASHBOARD_PORT, dashboard.listen в
+    # config.dev.yaml слушает 8090 в контейнере); боевой вход — loopback
+    # за reverse-proxy с TLS (схема web/T-124, docs/deploy.md §6).
+    # METRICS_ADDR разворачивает метрики на интерфейсы docker-сети для
+    # Prometheus (наружу порт не публикуется — ТЗ §9); дефолт кода/юнита —
+    # loopback 127.0.0.1:9108 (следующий за web:9107).
+    <<: [*go-common, *app-dns]
+    build: *go-build
+    command: ["./deploy/docker/scripts/air-entrypoint.sh"]
+    environment:
+      <<: *go-common-env
+      SERVICE: dashboard
+      METRICS_PORT: "9108"
+      METRICS_ADDR: ":9108"
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-8090}:8090"
     mem_limit: 256m
     depends_on:
       postgres:

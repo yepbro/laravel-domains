@@ -97,7 +97,7 @@ COPY --from=css /out/app.css internal/web/static/app.css
 # (dev без -X остаётся dev-stub); buildVersion/buildRevision — git-тег/хеш
 # сборки (T-111).
 RUN set -eux; \
-    for cmd in ingest scheduler dns-worker http-worker render-worker analyzer monitor web crawlerctl mockserver testbedgen; do \
+    for cmd in ingest scheduler dns-worker http-worker render-worker analyzer monitor web dashboard crawlerctl mockserver testbedgen; do \
         CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod -X crawler/internal/metrics.buildVersion=${BUILD_VERSION} -X crawler/internal/metrics.buildRevision=${BUILD_REVISION}" -o /out/$cmd ./cmd/$cmd; \
     done
 

@@ -10,9 +10,10 @@
 postgres:
   dsn: "postgres://crawler:PASSWORD@127.0.0.1:5432/crawler?sslmode=disable"
   # pool_size задаётся НА ОДИН сервис, а рекомендация ТЗ (20–50) — бюджет
-  # СУММАРНО на все: 7 сервисов × 5 + crawlerctl (2) + админ ≈ 40–45 при
-  # max_connections=50 (3 слота резервирует superuser) — docs/db.md,
-  # «Бюджет соединений». Менять — только с пересчётом суммы.
+  # СУММАРНО на все: 8 сервисов × 5 + dashboard (2 — задаёт его юнит;
+  # глобальная переменная ниже его переопределит) + crawlerctl (2) +
+  # админ ≈ 44–46 при max_connections=50 (3 слота резервирует superuser)
+  # — docs/db.md, «Бюджет соединений». Менять — только с пересчётом суммы.
   pool_size: 5
 
 redis:
@@ -117,11 +118,12 @@ monitor:
   ingest_metrics_url: "http://127.0.0.1:9101/metrics"
 
 web:
-  # Публичный лендинг (этап 13, T-121): единственный публичный порт
-  # системы — наружу публикует reverse-proxy с TLS (deploy/nginx/ —
+  # Публичный лендинг (этап 13, T-121): публичный порт системы для
+  # посетителей — наружу публикует reverse-proxy с TLS (deploy/nginx/ —
   # первый образец, T-124), сам сервис держит loopback; метрики web —
   # на METRICS_ADDR (127.0.0.1:9107). listen — [host]:port или
   # абсолютный путь unix-сокета (вариант деплоя за nginx).
+  # Операторский дашборд — отдельный слушатель dashboard.listen (ТЗД).
   listen: "127.0.0.1:8080"
   rate_limit: 4                      # живых проверок формы с IP в минуту (T-123)
   timeout: "60s"                     # потолок живой проверки: DNS→HTTP→рендер→анализ
@@ -139,11 +141,13 @@ dashboard:
   # username: "admin"
   # password_hash: "pbkdf2-sha256$600000$…$…"
   # Пробы живости сервисов для секции здоровья (ТЗД §5.8): имя → базовый
-  # URL метрик (каркас отдаёт /livez); в docker-сети — имя сервиса и его
-  # METRICS_PORT. Пустая карта — секция «н/д».
+  # URL метрик (каркас отдаёт /livez); в systemd-деплое — loopback-адреса
+  # метрик юнитов (полный список — docs/deploy.md), в docker-сети — имя
+  # сервиса и его METRICS_PORT (deploy/docker/config.dev.yaml).
+  # Пустая карта — секция «н/д».
   # probes:
-  #   dns-worker: "http://dns-worker:9102"
-  #   http-worker: "http://http-worker:9103"
+  #   dns-worker: "http://127.0.0.1:9103"
+  #   http-worker: "http://127.0.0.1:9104"
 
 log:
   level: "info"                      # уровень логирования сервисов: debug|info|warn|error

@@ -62,7 +62,7 @@ make clean                   # остановить и удалить тома (
 |---|---|
 | (по умолчанию) | `postgres`, `redis`, `unbound` |
 | `testbed` | `coredns`, `testweb` (Caddy), `mockserver` |
-| `app` | Go-сервисы (`ingest` … `monitor`, `render-worker`) + публичный лендинг `web` (http://127.0.0.1:8081) + `chromium` |
+| `app` | Go-сервисы (`ingest` … `monitor`, `render-worker`) + публичный лендинг `web` (http://127.0.0.1:8081) + операторский дашборд `dashboard` (http://127.0.0.1:8090, креды dev — admin/admin) + `chromium` |
 
 Миграции PostgreSQL отдельного сервиса не имеют: каждый Go-сервис применяет
 их сам при старте (см. [`migrations.md`](migrations.md)).
@@ -95,6 +95,27 @@ docker compose --project-directory . -f deploy/docker/compose.yaml --env-file .e
 `css` в Dockerfile.go). Цель пишет генерат в отслеживаемый путь
 `internal/web/static/app.css` — перед коммитом верните placeholder:
 `git checkout -- internal/web/static/app.css`.
+
+### Дашборд: dev-креды и перегенерация хэша
+
+Операторский дашборд (compose-сервис `dashboard` профиля app, ТЗД)
+публикуется на http://127.0.0.1:8090 (`DASHBOARD_PORT` в `.env`) и
+требует входа: dev-креды — **admin / admin** (только dev-окружение;
+в бою — `dashboard.username`/`password_hash`, docs/deploy.md §4.5).
+Хэш лежит в секции `dashboard` файла `deploy/docker/config.dev.yaml`;
+перегенерация при смене dev-пароля (stdin — пароль не остаётся в
+истории shell):
+
+```bash
+printf 'admin' | docker compose --project-directory . \
+    -f deploy/docker/compose.yaml --env-file .env \
+    run --rm -T tools go run ./cmd/crawlerctl dashboard-secret
+```
+
+Полученную строку `pbkdf2-sha256$…` подставьте в `password_hash` (и
+обновите комментарий с паролем); после рестарта сервиса
+(`docker compose … restart dashboard`) новые креды действуют, все
+cookie-сессии инвалидируются (ключ HMAC — производный ключ KDF, ТЗД §7.5).
 
 ### Режим internet (осторожно)
 
@@ -457,9 +478,10 @@ make debug SERVICE=dns-worker
 Для постоянного запуска сервиса под отладчиком скопируйте
 `deploy/docker/compose.override.example.yaml` → `compose.override.yaml`.
 
-Метрики: каждый сервис отдаёт `/metrics` на своём порту (9100–9107, web —
-9107), см. `deploy/docker/prometheus/prometheus.yml`. UI Prometheus — после
-включения профиля `monitoring`, http://127.0.0.1:9090/targets.
+Метрики: каждый сервис отдаёт `/metrics` на своём порту (9100–9108, web —
+9107, dashboard — 9108), см. `deploy/docker/prometheus/prometheus.yml`. UI
+Prometheus — после включения профиля `monitoring`,
+http://127.0.0.1:9090/targets.
 
 БД и очереди:
 

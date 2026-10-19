@@ -16,6 +16,7 @@ Wants=crawler-render-worker.service
 Wants=crawler-analyzer.service
 Wants=crawler-monitor.service
 Wants=crawler-web.service
+Wants=crawler-dashboard.service
 After=network-online.target
 
 [Install]

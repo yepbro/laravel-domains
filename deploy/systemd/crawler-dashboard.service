@@ -1,0 +1,73 @@
+# Domain Crawler — dashboard: операторский веб-дашборд конвейера (ТЗД,
+# этап 15). Read-only сводка «одним взглядом» с доступом по паролю
+# (HTTP Basic); creds — dashboard.username/password_hash в config.yaml
+# (генерация — crawlerctl dashboard-secret, docs/deploy.md §4.5).
+# dashboard.listen — публичный адрес: как у лендинга, держит loopback
+# (127.0.0.1:8090), наружу публикует reverse-proxy с TLS — креды Basic
+# нельзя передавать открытым текстом (ТЗД §9.1; схема web/T-124,
+# docs/deploy.md §6). Environment ниже — страховка loopback публичного
+# слушателя (переменная окружения важнее YAML — docs/configuration.md),
+# даже если config.yaml скопирован из примера без правок; метрики и
+# пробы — METRICS_ADDR на loopback 127.0.0.1:9108 (как 9101…9107 у
+# остальных юнитов): наружу не выставляются (ТЗ §9).
+# MemoryMax — строка бюджета «Go-сервисы» (ТЗ 3.2), раскладка —
+# docs/deploy.md: дашборд — лёгкий читатель БД/Redis (агрегаты гоняет
+# SQL-движок), 128M, как monitor.
+# Пул БД — 2 соединения через Environment (окружение важнее YAML):
+# девятый сервис по 5 из примера конфига не влезает в бюджет
+# max_connections=50 (9 × 5 + crawlerctl 2 + админ ≈ 48 > 47 доступных);
+# сборка снимка — один последовательный цикл, второй слот — ping
+# /healthz (бюджет — docs/db.md, «Соединения»). Глобальная переменная
+# CRAWLER_POSTGRES_POOL_SIZE в crawler.env переопределит и это значение
+# (EnvironmentFile важнее Environment юнита) — включая её, пересчитайте
+# сумму бюджета.
+
+[Unit]
+Description=Domain Crawler — dashboard (операторский дашборд конвейера)
+PartOf=crawler.target
+# Комментарий о After/Wants без Requires — crawler-ingest.service.
+After=network-online.target postgresql.service redis-server.service unbound.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-dashboard
+Group=crawler
+EnvironmentFile=/etc/crawler/crawler.env
+# Loopback-страховки адресов: env важнее YAML (см. шапку юнита).
+# Публичный слушатель дашборда и его метрики — оба только loopback.
+Environment=CRAWLER_DASHBOARD_LISTEN=127.0.0.1:8090
+Environment=METRICS_ADDR=127.0.0.1:9108
+# Пул БД меньше примера конфига — бюджет max_connections=50 (шапка).
+# Внимание: EnvironmentFile (crawler.env) переопределяет Environment.
+Environment=CRAWLER_POSTGRES_POOL_SIZE=2
+WorkingDirectory=/var/lib/crawler
+SyslogIdentifier=crawler-dashboard
+ExecStart=/opt/crawler/bin/dashboard
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+MemoryMax=128M
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target
