@@ -239,6 +239,12 @@ func (d Dead) validate() error {
 		return fmt.Errorf("queue: q:dead: пустой task_id")
 	}
 	switch d.Stream {
+	// Тело ветки пустое (валидные стримы проверять нечего): branch/case
+	// подменяет его на noop-EmptyStmt, печать которого идентична
+	// оригиналу, — мутант с пустым диффом, тестом не убить; подавление
+	// генерации — альтернатива блэклисту чексумм (docs/mutation-testing.md §4).
+	// Снять аннотацию, если у ветки появится тело.
+	// mutator-disable-next-line branch/case
 	case StreamDNS, StreamHTTP, StreamRender, StreamAnalyze:
 	default:
 		return fmt.Errorf("queue: q:dead: стрим-источник %q не является рабочим стримом задач", d.Stream)

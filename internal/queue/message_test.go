@@ -170,10 +170,24 @@ func TestMessageRoundtrip(t *testing.T) {
 }
 
 // TestMarshalFillsTaskID — пустой task_id заменяется новым при
-// сериализации (значение и у значений, и у указателей).
+// сериализации: у всех четырёх форматов и у значений, и у указателей.
+// Значение мутируется в копии (вызывающий не видит), указатель — в
+// объекте вызывающего; тест смотрит только JSON — идентификатор в
+// записи новый в обоих случаях.
 func TestMarshalFillsTaskID(t *testing.T) {
-	valid := DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}
-	for _, msg := range []Message{valid, &valid} {
+	domains := []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}
+	subdomains := []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}
+	msgs := []Message{
+		DNSBatch{Domains: domains},
+		&DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}},
+		HTTPTask{ZoneID: 1, DomainID: 1, Name: "a.test", Subdomains: subdomains},
+		&HTTPTask{ZoneID: 1, DomainID: 1, Name: "a.test", Subdomains: []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}},
+		Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain},
+		&Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain},
+		Dead{Stream: StreamDNS, EntryID: "1-0", Attempts: 1},
+		&Dead{Stream: StreamDNS, EntryID: "1-0", Attempts: 1},
+	}
+	for _, msg := range msgs {
 		data, err := marshalMessage(msg)
 		if err != nil {
 			t.Fatalf("marshalMessage(%T): %v", msg, err)
@@ -185,7 +199,7 @@ func TestMarshalFillsTaskID(t *testing.T) {
 			t.Fatalf("разбор %s: %v", data, err)
 		}
 		if len(probe.TaskID) != 32 {
-			t.Errorf("%T: task_id %q — ожидается 32 hex-символа (NewTaskID)", msg, probe.TaskID)
+			t.Errorf("%T: task_id %q — ожидается новый идентификатор NewTaskID (32 символа; hex-алфавит — TestNewTaskID)", msg, probe.TaskID)
 		}
 	}
 }
@@ -350,6 +364,27 @@ func TestDecodeWrongStream(t *testing.T) {
 	}
 }
 
+// TestDecodeEmptyPayload — запись без поля data отвергается ошибкой
+// «без поля data» с именем стрима и записи (а не ошибкой разбора пустого
+// JSON, которой мутант проверки длины payload подменяет её).
+func TestDecodeEmptyPayload(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload []byte
+	}{
+		{"nil", nil},
+		{"пустой срез", []byte{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Decode[Result](Delivery{Stream: StreamRender, ID: "9-9", Payload: c.payload})
+			if err == nil || !strings.Contains(err.Error(), "q:render: запись 9-9 без поля data") {
+				t.Errorf("Decode(payload %q) = %v, хочу ошибку «q:render: запись 9-9 без поля data»", c.name, err)
+			}
+		})
+	}
+}
+
 // TestValidateMessages — проверка значений перед публикацией (Publish
 // вызывает validate до обращения к Redis).
 func TestValidateMessages(t *testing.T) {
@@ -385,6 +420,35 @@ func TestValidateMessages(t *testing.T) {
 			Dead{TaskID: "t", Stream: StreamRender, EntryID: "1-0", Attempts: 1, Variant: model.Variant(5)},
 			"вариант",
 		},
+		// Границы идентификаторов «≤ 0»: ноль недопустим так же, как
+		// отрицательные (мутанты «< 0» и «≤ -1» пропускали бы его).
+		// Каждый случай портит ровно одно поле — остальное валидно,
+		// чтобы ошибка называла именно его.
+		{
+			"http zone_id 0",
+			HTTPTask{ZoneID: 0, DomainID: 1, Name: "a.test", Subdomains: []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}},
+			"zone_id 0 ≤ 0",
+		},
+		{
+			"http domain_id 0",
+			HTTPTask{ZoneID: 1, DomainID: 0, Name: "a.test", Subdomains: []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}},
+			"domain_id 0 ≤ 0",
+		},
+		{"результат zone_id 0", Result{ZoneID: 0, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain}, "zone_id 0 ≤ 0"},
+		{"результат domain_id 0", Result{ZoneID: 1, DomainID: 0, SubdomainID: 0, Variant: model.VariantMain}, "domain_id 0 ≤ 0"},
+		// Бит 63 маски знаковый — единственная невалидность сообщения.
+		{"результат бит 63", Result{ZoneID: 1, DomainID: 1, SubdomainID: 63, Variant: model.VariantMain}, "вне диапазона"},
+		{
+			"результат имя длиннее 253",
+			Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain, Name: strings.Repeat("a", 254)},
+			"имя длиннее 253",
+		},
+		{"dead пустой entry_id", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "", Attempts: 1}, "пустой entry_id"},
+		// Идентификаторы предмета q:dead опциональны, но заданный
+		// обязан быть неотрицательным: -1 — ошибка (0 — допустим,
+		// «не задан», см. «dead ок» выше).
+		{"dead zone_id -1", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, ZoneID: -1}, "отрицательны"},
+		{"dead domain_id -1", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, DomainID: -1}, "отрицательны"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -399,6 +463,116 @@ func TestValidateMessages(t *testing.T) {
 				t.Errorf("validate(%T) = %v, хочу ошибку с %q", c.msg, err, c.wantErr)
 			}
 		})
+	}
+}
+
+// TestValidateDNSBatchItemNumber — номер домена в ошибке пачки: счёт
+// с единицы (i+1); невалидный ВТОРОЙ элемент даёт «№2» — мутанты
+// i-1/i+0/i+2 напечатали бы №0/№1/№3.
+func TestValidateDNSBatchItemNumber(t *testing.T) {
+	cases := []struct {
+		name    string
+		second  DNSDomain
+		wantErr string
+	}{
+		{"zone_id", DNSDomain{ZoneID: 0, DomainID: 1, Name: "b.test"}, "домен №2: zone_id 0 ≤ 0"},
+		{"domain_id", DNSDomain{ZoneID: 1, DomainID: 0, Name: "b.test"}, "домен №2: domain_id 0 ≤ 0"},
+		{"имя", DNSDomain{ZoneID: 1, DomainID: 1, Name: ""}, "домен №2: пустое имя"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			first := DNSDomain{ZoneID: 1, DomainID: 1, Name: "a.test"}
+			err := DNSBatch{Domains: []DNSDomain{first, c.second}}.validate()
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("validate = %v, хочу ошибку с %q", err, c.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateHTTPTaskSubdomainItemNumber — номер субдомена в ошибке
+// задачи q:http (счёт с единицы): невалидный ВТОРОЙ субдомен даёт «№2»
+// по каждой проверке цикла; тексты содержат и лимиты-литералы
+// (63 октета метки, 253 октета CNAME).
+func TestValidateHTTPTaskSubdomainItemNumber(t *testing.T) {
+	cases := []struct {
+		name     string
+		second   HTTPSubdomain
+		wantErrs []string
+	}{
+		{
+			"бит субдомена вне диапазона",
+			HTTPSubdomain{SubdomainID: 63, Label: "x", Addrs: []string{"192.0.2.1"}},
+			[]string{"субдомен №2"},
+		},
+		{
+			"метка длиннее 63",
+			HTTPSubdomain{SubdomainID: 1, Label: strings.Repeat("a", 64), Addrs: []string{"192.0.2.1"}},
+			[]string{"субдомен №2: метка", "до 63 октетов"},
+		},
+		{
+			"нет адресов",
+			HTTPSubdomain{SubdomainID: 1, Label: "x"},
+			[]string{"субдомен №2: нет адресов"},
+		},
+		{
+			"кривой адрес",
+			HTTPSubdomain{SubdomainID: 1, Label: "x", Addrs: []string{"не IP"}},
+			[]string{"субдомен №2: адрес"},
+		},
+		{
+			"CNAME длиннее 253",
+			HTTPSubdomain{SubdomainID: 1, Label: "x", Addrs: []string{"192.0.2.1"}, CNAME: strings.Repeat("c", 254)},
+			[]string{"субдомен №2: CNAME длиннее 253"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			first := HTTPSubdomain{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}
+			task := HTTPTask{
+				ZoneID: 1, DomainID: 1, Name: "a.test",
+				Subdomains: []HTTPSubdomain{first, c.second},
+			}
+			err := task.validate()
+			if err == nil {
+				t.Fatalf("validate: декодировано без ошибки, хочу ошибку с %v", c.wantErrs)
+			}
+			for _, want := range c.wantErrs {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("ошибка %q не содержит %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateExactLimits — граничные длины ТЗ 5.2 (п. 4): лимиты
+// включающие — метка ровно 63 октета и имена/CNAME ровно 253 октета
+// валидны во всех форматах, где проверяются. Запредельные длины —
+// в TestValidateMessages и TestValidateHTTPTaskSubdomainItemNumber.
+func TestValidateExactLimits(t *testing.T) {
+	name253 := strings.Repeat("a", 253)
+	if err := (DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: name253}}}).validate(); err != nil {
+		t.Errorf("имя 253 октета (q:dns): %v", err)
+	}
+	task := HTTPTask{
+		ZoneID: 1, DomainID: 1, Name: name253,
+		Subdomains: []HTTPSubdomain{{
+			SubdomainID: 1,
+			Label:       strings.Repeat("l", 63),
+			Addrs:       []string{"192.0.2.1"},
+			CNAME:       strings.Repeat("c", 253),
+		}},
+	}
+	if err := task.validate(); err != nil {
+		t.Errorf("метка 63 и CNAME 253 октета (q:http): %v", err)
+	}
+	if err := (Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain, Name: name253}).validate(); err != nil {
+		t.Errorf("имя 253 октета (результат): %v", err)
+	}
+	dead := Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, Name: name253}
+	if err := dead.validate(); err != nil {
+		t.Errorf("имя 253 октета (q:dead): %v", err)
 	}
 }
 
