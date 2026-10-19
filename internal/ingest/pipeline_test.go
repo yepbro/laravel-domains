@@ -368,6 +368,89 @@ func TestPipelineDelete(t *testing.T) {
 	}
 }
 
+// TestPipelineExtractLines — смешанные строки файла (T-132): извлечённые
+// домены грузятся в staging и применяются, строки без домена — отклонения
+// no_domain (rejected-лог + разрез Reasons отчёта), счётчики прежние
+// (added/rejected, новых полей нет).
+func TestPipelineExtractLines(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "xxx.com 2029-11-11 TIMEWEB\n" + // пример заказчика
+		"https://shop.com/page\n" + // URL с путём
+		"plain.com\n" +
+		"нет домена тут\n" // no_domain
+	abs := pt.addFile(t, "com/add/list.txt", content)
+	sha := sha256.Sum256([]byte(content))
+
+	var buf strings.Builder
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir:           pt.dir,
+		BatchSize:     10,
+		MaxErrorRatio: 0.5, // 1 отклонение из 4 — файл не роняется
+		RejectLog:     NewRejectedLogger(&buf, slog.LevelInfo),
+		Now:           func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt.pool.execs = []pipeExec{
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
+		{tag: pgconn.NewCommandTag("INSERT 3")}, // xxx, shop, plain
+		{tag: pgconn.NewCommandTag("UPDATE 0")}, // возвращать некого
+		{tag: pgconn.NewCommandTag("DELETE 4")}, // очистка после применения
+	}
+	pt.pool.uniques = 3
+
+	out, err := pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.Kind != OutcomeApplied {
+		t.Fatalf("итог = %s, want applied", out.Kind)
+	}
+	rep := out.Report
+	if rep.LinesTotal != 4 || rep.Accepted != 3 || rep.Rejected != 1 || rep.Added != 3 {
+		t.Errorf("счётчики = %+v, want 4 строки, 3 валидных/добавлено, 1 отклонение", rep)
+	}
+	if rep.Reasons[ReasonNoDomain] != 1 || len(rep.Reasons) != 1 {
+		t.Errorf("Reasons = %+v, want ровно no_domain: 1", rep.Reasons)
+	}
+	if !reflect.DeepEqual(rep.SHA256, sha[:]) {
+		t.Errorf("sha256 = %x, want хэш содержимого", rep.SHA256)
+	}
+	if len(pt.files.records) != 1 || pt.files.records[0].Rejected != 1 || pt.files.records[0].Added != 3 {
+		t.Errorf("журнал = %+v, want rejected 1, added 3", pt.files.records)
+	}
+	// В staging ушли три извлечённых домена (не исходные строки).
+	want := []string{
+		"exec:" + clearStageSQL,
+		"copy:3",
+		"exec:" + insertAddSQL,
+		"exec:" + reviveAddSQL,
+		"query:" + countAddSQL,
+		"exec:" + clearStageSQL,
+	}
+	if !reflect.DeepEqual(pt.pool.ops, want) {
+		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
+			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
+	}
+	// Строка без домена — в rejected-логе с исходным текстом и причиной
+	// (текст с пробелами slog заключает в кавычки).
+	logged := buf.String()
+	for _, wantFrag := range []string{
+		"file=com/add/list.txt",
+		"line=4",
+		`text="нет домена тут"`,
+		"reason=no_domain",
+	} {
+		if !strings.Contains(logged, wantFrag) {
+			t.Errorf("rejected-лог = %q, want запись с %q", logged, wantFrag)
+		}
+	}
+	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/list.txt")) {
+		t.Error("файл не перемещён в processed/")
+	}
+}
+
 // TestPipelineDuplicate — точная повторная доставка (T-113): та же
 // тройка (зона, действие, sha256) уже в журнале (в том числе среди
 // других доставок того же содержимого — точное совпадение побеждает):

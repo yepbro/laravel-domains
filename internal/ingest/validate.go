@@ -9,6 +9,13 @@
 // строка, причина); единичные плохие строки не делают файл ошибочным — его
 // роняет только доля ошибок выше ingest.max_error_ratio.
 //
+// T-132 (этап 16, расширение ТЗ 5.1): перед валидацией стоит шаг
+// извлечения (extract.go) — строка с разделителями (пробел, запятая,
+// точка с запятой) или токен-URL разбирается на кандидаты, первый
+// прошедший полный конвейер становится записью строки, ни один не
+// прошёл — ReasonNoDomain. Одиночная строка без схемы идёт прежним
+// путём без изменений.
+//
 // Парсинг файла (пустые строки, комментарии, CRLF/BOM) — T-015; разбор пути
 // и нормализация каталога зоны — T-014; загрузка валидных строк в БД — T-017;
 // перемещение в processed/failed и отчёт ingest_files — T-021.
@@ -49,6 +56,10 @@ const (
 	ReasonNoLabel Reason = "no_label"
 	// ReasonWrongZone — домен не из зоны пути (ТЗ 5.2 п. 6).
 	ReasonWrongZone Reason = "wrong_zone"
+	// ReasonNoDomain — в строке с посторонними данными (T-132) не
+	// найден домен: кандидатов нет (ни один токен не содержит точки)
+	// или ни один не прошёл конвейер валидации.
+	ReasonNoDomain Reason = "no_domain"
 )
 
 // reasonDescriptions — тексты причин для String (стиль idn.ErrorKind).
@@ -59,6 +70,7 @@ var reasonDescriptions = map[Reason]string{
 	ReasonNameLen:   "имя длиннее 253 символов",
 	ReasonNoLabel:   "нет метки перед зоной",
 	ReasonWrongZone: "домен не из зоны пути",
+	ReasonNoDomain:  "домен в строке не найден",
 }
 
 // String возвращает текст причины (стиль model.Status.String).
@@ -146,24 +158,51 @@ func NewValidator(opts ValidatorOptions) (*Validator, error) {
 // парсер T-015, они сюда не попадают). Валидная строка — домен зоны пути
 // (ok = true, причина пуста); невалидная — причина отклонения: строка
 // пишется в лог rejected и учитывается в счётчиках.
+//
+// T-132: строка с разделителями (пробел, запятая, точка с запятой) или
+// токен-URL разбирается на кандидатов (extract.go): они просматриваются
+// слева направо через полный конвейер, первый прошедший становится
+// записью строки, ни один не прошёл — ReasonNoDomain. Одиночная строка
+// без схемы идёт прежним путём — причины не изменились.
 func (v *Validator) Line(n int, line string) (Entry, Reason, bool) {
 	v.total++
-	res, err := idn.Normalize(line)
+	if cands, extract := extractCandidates(line); extract {
+		for _, cand := range cands {
+			if e, _, valid := checkName(cand, v.zone); valid {
+				v.accepted++
+				return e, "", true
+			}
+		}
+		v.reject(n, line, ReasonNoDomain)
+		return Entry{}, ReasonNoDomain, false
+	}
+	e, reason, ok := checkName(line, v.zone)
+	if !ok {
+		v.reject(n, line, reason)
+		return Entry{}, reason, false
+	}
+	v.accepted++
+	return e, "", true
+}
+
+// checkName пропускает полное имя домена через конвейер валидации
+// (idn.Normalize + domainLabel со сверкой зоны пути, ТЗ 5.2 пп. 1–6):
+// общий путь прежней проверки одиночной строки и кандидатов извлечения
+// (T-132). Счётчики и лог rejected — на вызывающей стороне (Line).
+func checkName(name, zone string) (Entry, Reason, bool) {
+	res, err := idn.Normalize(name)
 	if err != nil {
 		reason := ReasonInvalid
 		if kind, ok := idn.KindOf(err); ok {
 			reason = Reason(kind)
 		}
-		v.reject(n, line, reason)
 		return Entry{}, reason, false
 	}
-	label, reason := domainLabel(res, v.zone)
+	label, reason := domainLabel(res, zone)
 	if reason != "" {
-		v.reject(n, line, reason)
 		return Entry{}, reason, false
 	}
-	v.accepted++
-	return Entry{Zone: v.zone, Label: label, IsIDN: idn.HasXNLabel(label)}, "", true
+	return Entry{Zone: zone, Label: label, IsIDN: idn.HasXNLabel(label)}, "", true
 }
 
 // domainLabel выделяет метку домена зоны пути из нормализованного имени
