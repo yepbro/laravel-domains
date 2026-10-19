@@ -53,7 +53,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   (`Avail/Total * bs`), выбор худшего износа (`wears[1:]`, `>` vs `>=`),
   `humanBytes`-цепочка, дефолты опций (`Interval <= 0` vs `<= 1` и т.п.),
   `w.i = (w.i+1) % len(deltas)`.
-- **T-M02** [новая] — `internal/monitor/{badhashes,nearstats,historystats,
+- **T-M02** [в работе] — `internal/monitor/{badhashes,nearstats,historystats,
   zonestats}.go` (72 выживших). Дайджест:
   `var/mutation/escaped/T-M02-monitor-stats.txt`.
   Границы окон и лимитов (`badHashesBodyLimit = 4<<20`, таймауты зондов),
