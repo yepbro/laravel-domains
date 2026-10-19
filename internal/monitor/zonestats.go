@@ -173,6 +173,11 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, opts ZoneStatsOptions) error
 	pass := func() {
 		res, err := ZoneStatsOnce(ctx, pool, o)
 		switch {
+		// Тело ветки пустое (только комментарий): branch/case подменяет
+		// его на noop-EmptyStmt, печать которого идентична оригиналу, —
+		// мутант с пустым диффом, тестом не убить; подавление генерации —
+		// единственная альтернатива блэклисту чексумм (§4).
+		// mutator-disable-next-line branch/case
 		case err != nil && ctx.Err() != nil:
 			// Отмена во время прохода — часть остановки, не тревога.
 		case err != nil:

@@ -10,6 +10,7 @@ package monitor
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -230,14 +231,21 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 		t.Errorf("счётчик = %d, want 42", got)
 	}
 
+	// Некорректный URL (управляющий символ) — ошибка сборки запроса до
+	// сети; значение ошибки — строго 0 (не ±1).
+	got, err = (IngestBadHashes{URL: "http://ingest:9101/\n"}).BadHashes(context.Background())
+	if err == nil || got != 0 {
+		t.Errorf("ошибка URL: (%d, %v), want (0, ошибка)", got, err)
+	}
+
 	// Отсутствие метрики (старый ingest) — ошибка источника с именем.
 	noMetric := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("crawler_service_up{service=\"ingest\"} 1\n"))
 	}))
 	defer noMetric.Close()
-	if _, err := (IngestBadHashes{URL: noMetric.URL}).BadHashes(context.Background()); err == nil ||
-		!strings.Contains(err.Error(), badHashesMetricName) {
-		t.Errorf("нет метрики: ошибка = %v, want с именем метрики", err)
+	if n, err := (IngestBadHashes{URL: noMetric.URL}).BadHashes(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), badHashesMetricName) || n != 0 {
+		t.Errorf("нет метрики: (%d, %v), want (0, ошибка с именем метрики)", n, err)
 	}
 
 	// Не-200 — ошибка со статусом.
@@ -245,17 +253,17 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer bad.Close()
-	if _, err := (IngestBadHashes{URL: bad.URL}).BadHashes(context.Background()); err == nil ||
-		!strings.Contains(err.Error(), "503") {
-		t.Errorf("статус 503: ошибка = %v, want со статусом", err)
+	if n, err := (IngestBadHashes{URL: bad.URL}).BadHashes(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "503") || n != 0 {
+		t.Errorf("статус 503: (%d, %v), want (0, ошибка со статусом)", n, err)
 	}
 
 	// Недоступный сервер — ошибка транспорта.
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	url := dead.URL
 	dead.Close()
-	if _, err := (IngestBadHashes{URL: url}).BadHashes(context.Background()); err == nil {
-		t.Error("закрытый сервер: ошибки нет")
+	if n, err := (IngestBadHashes{URL: url}).BadHashes(context.Background()); err == nil || n != 0 {
+		t.Errorf("закрытый сервер: (%d, %v), want (0, ошибка)", n, err)
 	}
 
 	// Отмена ctx — ошибка контекста, не зависание.
@@ -263,6 +271,47 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 	cancel()
 	if _, err := (IngestBadHashes{URL: srv.URL}).BadHashes(ctx); !errors.Is(err, context.Canceled) {
 		t.Errorf("отмена ctx: ошибка = %v, want context.Canceled", err)
+	}
+}
+
+// roundTripFunc — транспорт с фиксированным ответом, без сети.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// closeTrackingBody — тело ответа с отметкой Close.
+type closeTrackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *closeTrackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+// TestIngestBadHashesClosesBody — тело ответа закрывается после разбора:
+// единственный ресурс метода, утечка держала бы соединения ingest.
+func TestIngestBadHashesClosesBody(t *testing.T) {
+	body := &closeTrackingBody{Reader: strings.NewReader(
+		"crawler_ingest_bad_hashes_total{service=\"ingest\"} 42\n")}
+	cl := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       body,
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	got, err := (IngestBadHashes{URL: "http://ingest:9101/metrics", Client: cl}).BadHashes(context.Background())
+	if err != nil {
+		t.Fatalf("BadHashes: %v", err)
+	}
+	if got != 42 {
+		t.Errorf("счётчик = %d, want 42", got)
+	}
+	if !body.closed {
+		t.Error("тело ответа не закрыто")
 	}
 }
 
@@ -274,21 +323,22 @@ func TestParseBadHashesExposition(t *testing.T) {
 		body    string
 		want    int64
 		wantErr string // «» — успех
+		wantHas string // значение-нарушитель в тексте ошибки («» — не важно)
 	}{
 		{
 			"ряд с метками",
 			"crawler_ingest_bad_hashes_total{service=\"ingest\"} 42\n",
-			42, "",
+			42, "", "",
 		},
 		{
 			"научная запись",
 			"crawler_ingest_bad_hashes_total 1.7e+06\n",
-			1700000, "",
+			1700000, "", "",
 		},
 		{
-			"шамп времени после значения игнорируется",
+			"штамп времени после значения игнорируется",
 			"crawler_ingest_bad_hashes_total{service=\"ingest\"} 7 1697760000000\n",
-			7, "",
+			7, "", "",
 		},
 		{
 			"соседние метрики и HELP/TYPE мимо",
@@ -297,12 +347,19 @@ func TestParseBadHashesExposition(t *testing.T) {
 				"crawler_stage_tasks_total{service=\"dns-worker\",stage=\"dns\"} 3\n" +
 				"# TYPE crawler_ingest_bad_hashes_total counter\n" +
 				"crawler_ingest_bad_hashes_total{service=\"ingest\"} 5\n",
-			5, "",
+			5, "", "",
 		},
-		{"метрики нет", "crawler_service_up 1\n", 0, "отсутствует"},
-		{"значение не число", "crawler_ingest_bad_hashes_total abc\n", 0, "не счётчик"},
-		{"отрицательное значение", "crawler_ingest_bad_hashes_total -3\n", 0, "не счётчик"},
-		{"префикс чужого имени", "crawler_ingest_bad_hashes_total_extra 9\n", 0, "отсутствует"},
+		// Ноль — валидный счётчик (рестарт ingest): граница «v < 0»
+		// включающая, отрицательные и не-числа — ошибка с названием
+		// значения-нарушителя.
+		{"нулевое значение", "crawler_ingest_bad_hashes_total 0\n", 0, "", ""},
+		{"минус один", "crawler_ingest_bad_hashes_total -1\n", 0, "не счётчик", "-1"},
+		{"имя без значения", "crawler_ingest_bad_hashes_total\n", 0, "отсутствует", ""},
+		{"комментарий во втором поле", "crawler_ingest_bad_hashes_total #42\n", 0, "не счётчик", "#42"},
+		{"метрики нет", "crawler_service_up 1\n", 0, "отсутствует", ""},
+		{"значение не число", "crawler_ingest_bad_hashes_total abc\n", 0, "не счётчик", "abc"},
+		{"отрицательное значение", "crawler_ingest_bad_hashes_total -3\n", 0, "не счётчик", "-3"},
+		{"префикс чужого имени", "crawler_ingest_bad_hashes_total_extra 9\n", 0, "отсутствует", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -310,6 +367,12 @@ func TestParseBadHashesExposition(t *testing.T) {
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("ошибка = %v, want содержит %q", err, tt.wantErr)
+				}
+				if got != 0 {
+					t.Fatalf("значение при ошибке = %d, want 0", got)
+				}
+				if tt.wantHas != "" && !strings.Contains(err.Error(), tt.wantHas) {
+					t.Errorf("текст ошибки %q не называет значение-нарушитель %q", err.Error(), tt.wantHas)
 				}
 				return
 			}
@@ -320,5 +383,72 @@ func TestParseBadHashesExposition(t *testing.T) {
 				t.Errorf("значение = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// failReader — читатель с неисправимой ошибкой (обрыв транспорта во
+// время чтения тела /metrics).
+type failReader struct{ err error }
+
+func (r *failReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestParseBadHashesExpositionReadError — ошибка чтения тела всплывает из
+// Scanner: «чтение экспозиции» с исходной причиной и нулевое значение.
+func TestParseBadHashesExpositionReadError(t *testing.T) {
+	got, err := parseBadHashesExposition(&failReader{err: errors.New("сброс соединения")})
+	if err == nil ||
+		!strings.Contains(err.Error(), "чтение экспозиции") ||
+		!strings.Contains(err.Error(), "сброс соединения") {
+		t.Fatalf("ошибка = %v, want «чтение экспозиции» с причиной", err)
+	}
+	if got != 0 {
+		t.Errorf("значение = %d, want 0 при ошибке", got)
+	}
+}
+
+// TestParseBadHashesExpositionBodyLimit — потолок чтения тела: метрика
+// последней строкой ровно на границе badHashesBodyLimit читается (лимит
+// включающий), за пределами — отрезается («метрика отсутствует»).
+// Сам лимит pinned литералом 4<<20: константа в проверке мутировала бы
+// вместе с мутантом и «следовала» за ним (T-M01, alerts).
+func TestParseBadHashesExpositionBodyLimit(t *testing.T) {
+	if badHashesBodyLimit != 4<<20 {
+		t.Fatalf("badHashesBodyLimit = %d, want 4<<20 (4 МиБ)", badHashesBodyLimit)
+	}
+	const filler = "crawler_service_up{service=\"ingest\"} 1\n"
+	const metric = "crawler_ingest_bad_hashes_total{service=\"ingest\"} 42\n"
+
+	// Ровно на лимите: filler-строки, добивка точной длины и метрика
+	// последней строкой — общий размер badHashesBodyLimit.
+	var b strings.Builder
+	for b.Len()+len(filler)+len(metric) <= badHashesBodyLimit {
+		b.WriteString(filler)
+	}
+	rest := badHashesBodyLimit - b.Len() - len(metric)
+	switch {
+	case rest == 1:
+		b.WriteString("\n") // пустая строка — тоже мимо парсера
+	case rest >= 2:
+		b.WriteString("#" + strings.Repeat("x", rest-2) + "\n")
+	}
+	b.WriteString(metric)
+	if b.Len() != badHashesBodyLimit {
+		t.Fatalf("тело на границе = %d байт, want %d", b.Len(), badHashesBodyLimit)
+	}
+	got, err := parseBadHashesExposition(strings.NewReader(b.String()))
+	if err != nil || got != 42 {
+		t.Fatalf("на границе лимита: (%d, %v), want (42, nil)", got, err)
+	}
+
+	// За лимитом: метрика в хвосте за badHashesBodyLimit — не читается.
+	var over strings.Builder
+	for over.Len()+len(filler) <= badHashesBodyLimit {
+		over.WriteString(filler)
+	}
+	over.WriteString(filler) // хвост за лимитом
+	over.WriteString(metric)
+	if _, err := parseBadHashesExposition(strings.NewReader(over.String())); err == nil ||
+		!strings.Contains(err.Error(), "отсутствует") {
+		t.Fatalf("за лимитом: %v, want «метрика отсутствует»", err)
 	}
 }

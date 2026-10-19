@@ -110,6 +110,12 @@ func NewNearGauge(reg *metrics.Registry) *prometheus.GaugeVec {
 	})
 }
 
+// mutator-disable-regexp log\.Info\("цикл statement/remove
+// mutator-disable-regexp log\.Debug\("проход statement/remove
+// Обоснование: служебные записи цикла серой зоны (старт Info, итог
+// успешного прохода Debug) — поведение счётчика не меняют, гасятся по
+// docs/mutation-testing.md §4 (логирование не тестируется).
+
 // NearStatsLoop — периодический цикл пересчёта: NearStatsOnce по ticker,
 // значение — в gauge. Первый проход — сразу при старте (свежее значение
 // после простоя/рестарта, стиль ZoneStatsLoop); ошибка прохода
@@ -133,6 +139,11 @@ func NearStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 	pass := func() {
 		n, err := NearStatsOnce(ctx, pool, o.MinScore)
 		switch {
+		// Тело ветки пустое (только комментарий): branch/case подменяет
+		// его на noop-EmptyStmt, печать которого идентична оригиналу, —
+		// мутант с пустым диффом, тестом не убить; подавление генерации —
+		// единственная альтернатива блэклисту чексумм (§4).
+		// mutator-disable-next-line branch/case
 		case err != nil && ctx.Err() != nil:
 			// Отмена во время прохода — часть остановки, не тревога.
 		case err != nil:

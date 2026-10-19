@@ -230,8 +230,14 @@ func TestZoneStatsOnceNilPool(t *testing.T) {
 // --- ZoneStatsOptions ------------------------------------------------------
 
 // TestZoneStatsOptionsDefaults — нулевые и отрицательные значения —
-// дефолт; заданные не затираются, Now передаётся как есть.
+// дефолт; заданные не затираются, Now передаётся как есть. Дефолт
+// pinned литералом 60s: константа в проверке мутировала бы вместе с
+// мутантом и «следовала» за ним (T-M01, alerts); граница «≤ 0» —
+// положительный наносекундный интервал дефолтом не заменяется.
 func TestZoneStatsOptionsDefaults(t *testing.T) {
+	if DefaultZoneStatsInterval != 60*time.Second {
+		t.Errorf("DefaultZoneStatsInterval = %v, want 60s (верх коридора ТЗ 5.9)", DefaultZoneStatsInterval)
+	}
 	got := (ZoneStatsOptions{}).withDefaults()
 	if got.Interval != DefaultZoneStatsInterval {
 		t.Errorf("Interval = %v, want дефолт %v", got.Interval, DefaultZoneStatsInterval)
@@ -239,6 +245,10 @@ func TestZoneStatsOptionsDefaults(t *testing.T) {
 	got = (ZoneStatsOptions{Interval: -time.Second}).withDefaults()
 	if got.Interval != DefaultZoneStatsInterval {
 		t.Errorf("Interval = %v после отрицательного, want дефолт %v", got.Interval, DefaultZoneStatsInterval)
+	}
+	got = (ZoneStatsOptions{Interval: time.Nanosecond}).withDefaults()
+	if got.Interval != time.Nanosecond {
+		t.Errorf("Interval = %v после 1нс, want 1нс (заменяется только ≤ 0)", got.Interval)
 	}
 
 	now := func() time.Time { return time.Unix(0, 0) }
@@ -364,5 +374,38 @@ func TestZoneStatsLoopNilPool(t *testing.T) {
 	err := ZoneStatsLoop(context.Background(), nil, ZoneStatsOptions{})
 	if err == nil || !strings.Contains(err.Error(), "пул не задан") {
 		t.Errorf("ошибка = %v, want «пул не задан»", err)
+	}
+}
+
+// TestZoneStatsLoopPassDuringCancel — успешный проход под уже отменённым
+// ctx (фейк не смотрит на отмену) — штатный итог Debug, а не тишина
+// ветки «отмена во время прохода»: отмена классифицирует только ошибки.
+func TestZoneStatsLoopPassDuringCancel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+
+	pool := &zonestatsFakePool{tags: []int64{9}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- ZoneStatsLoop(ctx, pool, ZoneStatsOptions{Log: logger}) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ZoneStatsLoop: %v, want nil при отмене", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("цикл не завершился после отмены ctx")
+	}
+	log := buf.String()
+	if !strings.Contains(log, "zones=9") {
+		t.Errorf("успешный проход под отменой не зафиксирован:\n%s", log)
+	}
+	if strings.Contains(log, "level=WARN") {
+		t.Errorf("успешный проход под отменой дал Warn:\n%s", log)
 	}
 }

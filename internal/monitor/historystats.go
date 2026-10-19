@@ -103,6 +103,12 @@ func NewHistoryGauges(reg *metrics.Registry) (appeared, lost *prometheus.GaugeVe
 	return appeared, lost
 }
 
+// mutator-disable-regexp log\.Info\("цикл statement/remove
+// mutator-disable-regexp log\.Debug\("проход statement/remove
+// Обоснование: служебные записи цикла истории (старт Info, итог
+// успешного прохода Debug) — поведение счётчиков не меняют, гасятся по
+// docs/mutation-testing.md §4 (логирование не тестируется).
+
 // HistoryStatsLoop — периодический цикл: HistoryStatsOnce по ticker,
 // значения — в пару gauge. Первый проход — сразу при старте (свежие
 // значения после простоя/рестарта); ошибка прохода прерывает только его
@@ -111,6 +117,12 @@ func NewHistoryGauges(reg *metrics.Registry) (appeared, lost *prometheus.GaugeVe
 // nil gauge/пула — no-op (стиль NearStatsLoop).
 func HistoryStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts HistoryStatsOptions) error {
 	appearedG, lostG := NewHistoryGauges(reg)
+	// Пара gauge рождается и гибнет вместе: NewHistoryGauges возвращает
+	// (nil, nil) при nil-реестре или два живых указателя — условия
+	// appearedG == nil и lostG == nil неотделимы ни на одном входе,
+	// мутанты-близнецы `false ||` эквивалентны (дубль — страховка
+	// будущих правок конструктора).
+	// mutator-disable-next-line expression/remove
 	if appearedG == nil || lostG == nil || pool == nil {
 		return nil
 	}
@@ -125,6 +137,11 @@ func HistoryStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, op
 	pass := func() {
 		st, err := HistoryStatsOnce(ctx, pool)
 		switch {
+		// Тело ветки пустое (только комментарий): branch/case подменяет
+		// его на noop-EmptyStmt, печать которого идентична оригиналу, —
+		// мутант с пустым диффом, тестом не убить; подавление генерации —
+		// единственная альтернатива блэклисту чексумм (§4).
+		// mutator-disable-next-line branch/case
 		case err != nil && ctx.Err() != nil:
 			// Отмена во время прохода — часть остановки, не тревога.
 		case err != nil:

@@ -49,6 +49,13 @@ var _ BadHashesSource = IngestBadHashes{}
 
 // ingestProbeTimeout — бюджет одного чтения: цикл алертов живёт своим
 // периодом (60 с), зонд не должен его задерживать отвалом сети.
+//
+// Точное значение бюджета различимо только паузой в секунды против
+// зависшего сервера (4/5/6 с, а 5/time.Second даёт Timeout 0 — «без
+// таймаута», что отличается от 5 с лишь там же) — противоречит
+// герметичности юнит-тестов пакета (docs/mutation-testing.md §4):
+// значение — настроечный бюджет, а не логика.
+// mutator-disable-next-line arithmetic/base, numbers/decrementer, numbers/incrementer
 const ingestProbeTimeout = 5 * time.Second
 
 // BadHashes читает текущее значение счётчика из экспозиции ingest.
@@ -80,6 +87,12 @@ func parseBadHashesExposition(r io.Reader) (int64, error) {
 	sc := bufio.NewScanner(io.LimitReader(r, badHashesBodyLimit))
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
+		// Пропуск #-строк эквивалентен последующему сравнению имени: Cut
+		// от поля с '#' даёт имя с '#', не равное метрике, — входов,
+		// различающих мутанта `|| false`, нет. Близнец `false ||`
+		// (снятие проверки длины) закрыт таблицей («имя без значения» —
+		// паника индекса), но аннотация действует на строку целиком.
+		// mutator-disable-next-line expression/remove
 		if len(fields) < 2 || strings.HasPrefix(fields[0], "#") {
 			continue
 		}
@@ -87,6 +100,10 @@ func parseBadHashesExposition(r io.Reader) (int64, error) {
 		if name != badHashesMetricName {
 			continue
 		}
+		// ParseFloat различает только bitSize=32 (округление во float32);
+		// 63 и 65 ведут себя как 64 на любом входе (strconv/atof.go) —
+		// эквивалентные мутанты.
+		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 		v, err := strconv.ParseFloat(fields[1], 64)
 		if err != nil || v < 0 {
 			return 0, fmt.Errorf("monitor: %s: значение %q не счётчик", badHashesMetricName, fields[1])
