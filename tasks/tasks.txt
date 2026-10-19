@@ -40,7 +40,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
 
 ## Задачи
 
-- **T-M01** [новая] — `internal/monitor/alerts.go` (117 выживших; score
+- **T-M01** [в работе] — `internal/monitor/alerts.go` (117 выживших; score
   пакета 0.59 — худший после dashboard). Дайджест:
   `var/mutation/escaped/T-M01-monitor-alerts.txt`.
   NVMe-посредник (L274–L403, ~55 мутантов: ioctl, struct layout, unsafe)
