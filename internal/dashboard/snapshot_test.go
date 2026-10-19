@@ -431,6 +431,51 @@ func TestCollectOnceRedisDegradation(t *testing.T) {
 	}
 }
 
+// hangLenner — StreamLener, зависающий до отмены ctx: модель dial к
+// остановленному контейнеру Redis (endpoint сети сохраняется, RST нет).
+type hangLenner struct{}
+
+func (hangLenner) Len(ctx context.Context, _ string) (int64, error) {
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+
+// TestCollectOnceRedisHang — зависший Redis (dial к остановленному
+// контейнеру без RST): Len уважает ctx, но не возвращается сам — бюджет
+// queueFetchTimeout обязан разрубить ожидание, секция очередей
+// деградирует, остальные секции и публикация снимка живут (§5.9).
+// Сценарий живой приёмки T-131 §12.3: остановка Redis → «н/д» за ~2
+// цикла refresh, а не десятки секунд таймаутов go-redis.
+func TestCollectOnceRedisHang(t *testing.T) {
+	old := queueFetchTimeout
+	queueFetchTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { queueFetchTimeout = old })
+
+	pool := healthyPool()
+	// hangLenner — вместо XLEN просто ждёт отмены ctx (модель dial,
+	// который висит: остановленный контейнер не отдаёт RST).
+	hang := hangLenner{}
+	coll := newSnapCollector(t, pool, hang, nil)
+
+	done := make(chan *Snapshot, 1)
+	go func() { done <- coll.CollectOnce(context.Background()) }()
+
+	select {
+	case snap := <-done:
+		if snap.Queues != nil {
+			t.Error("queues не null при зависшем Redis")
+		}
+		if _, ok := snap.Errors["queues"]; !ok {
+			t.Errorf("errors без причины очередей: %v", snap.Errors)
+		}
+		if len(snap.Errors) != 1 || snap.Totals == nil || snap.Zones == nil || snap.Laravel == nil {
+			t.Errorf("зависший Redis задел чужие секции: %v (tot=%v zones=%v)", snap.Errors, snap.Totals, snap.Zones)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CollectOnce не вернулся: бюджет queueFetchTimeout не разрубает зависший Redis")
+	}
+}
+
 // TestCollectOnceNilLenner — конструктор без lenner: секция очередей
 // деградирована каждый проход (клиент Redis не обязателен сборщику).
 func TestCollectOnceNilLenner(t *testing.T) {

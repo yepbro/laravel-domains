@@ -57,6 +57,16 @@ const DefaultRefreshInterval = 5 * time.Second
 // probeTimeout — бюджет одной пробы /livez (ТЗД §5.8: 2 с).
 const probeTimeout = 2 * time.Second
 
+// queueFetchTimeout — бюджет секции очередей (§5.4). Остановленный
+// контейнер Redis не отдаёт RST (сетевой endpoint сохраняется за
+// остановленным контейнером), поэтому dial до таймаутов go-redis по
+// умолчанию (DialTimeout 5 с × ретраи) висит десятки секунд и блокирует
+// цикл сборки целиком — деградация «н/д» (§5.9) не наступает за
+// разумные ~2 цикла refresh. Бюджет режет зависший опрос стримов:
+// секция деградирует, остальные собираются. Переменная (не const) —
+// чтобы юнит-тесты не ждали реальные секунды.
+var queueFetchTimeout = 2 * time.Second
+
 // probeBodyLimit — сколько тела пробы вычитать до закрытия (connection
 // reuse; /livez каркаса — байты «ok»).
 const probeBodyLimit = 4 << 10
@@ -207,8 +217,12 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 		snap.Rates = &r
 	}
 
-	// Очереди (§5.4): nil-карта → null в JSON.
-	lens, err := status.FetchQueueLens(ctx, c.lens)
+	// Очереди (§5.4): nil-карта → null в JSON. Отдельный бюджет
+	// queueFetchTimeout — см. комментарий у переменной: зависший опрос
+	// Redis не должен блокировать цикл сборки и остальные секции.
+	qctx, cancel := context.WithTimeout(ctx, queueFetchTimeout)
+	lens, err := status.FetchQueueLens(qctx, c.lens)
+	cancel()
 	if err != nil {
 		snap.Errors["queues"] = err.Error()
 	} else {
