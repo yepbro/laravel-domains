@@ -13,7 +13,7 @@ on:
       min_score:
         description: 'Минимальный mutation score (0..1)'
         required: false
-        default: '0.50'
+        default: '0.60'
       timeout:
         description: 'Таймаут go test на мутанта, сек'
         required: false
@@ -55,7 +55,7 @@ jobs:
             export MUTATE_PKGS="${{ inputs.pkgs }}"
           fi
           make mutate COMPOSE="$COMPOSE" \
-            MUTATION_MIN_SCORE="${{ inputs.min_score || '0.50' }}" \
+            MUTATION_MIN_SCORE="${{ inputs.min_score || '0.60' }}" \
             MUTATE_TIMEOUT="${{ inputs.timeout || '60' }}"
 
       # Отчёты полезны и при падении (разбор выживших), и при успехе
