@@ -1,182 +1,32 @@
-// Юнит-тесты crawlerctl status (T-079, ТЗ 5.9) на фейковых пуле (db.DB)
-// и клиенте XLEN — без БД и Redis. Проверяются точный SQL-текст выборок
-// (контракт, стиль reanalyze_test.go) и живая семантика фейка: агрегат
-// domains по check_state с исключением deleted из pending, LEFT JOIN зон
-// без доменов, сортировка по имени; окно темпа и защита от деления на
-// ноль в computeRates (короткое окно, нулевая скорость, пустой цикл,
-// минимальная ETA); формат таблицы и JSON (null для «н/д»); ошибки Redis
-// не прячут сводку, а завершают команду кодом 1. Поведение против живых
-// PostgreSQL/Redis — dev-окружение (make status).
+// Юнит-тесты вывода crawlerctl status (T-079, ТЗ 5.9): формат таблицы и
+// JSON (null для «н/д»), роутинг/коды и справка. SQL-контракты, семантика
+// агрегатов и расчёты — тесты пакета internal/status (T-126, ТЗД §4.5);
+// поведение против живых PostgreSQL/Redis — dev-окружение (make status).
 package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
-	"reflect"
-	"sort"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"crawler/internal/db"
-	"crawler/internal/model"
+	"crawler/internal/status"
 )
 
-// --- SQL-контракты ----------------------------------------------------------
-
-// wantZoneStatsSQL / wantThroughputSQL — ожидаемый текст запросов; фейк
-// сопоставляет SQL точно, неожидаемый запрос валит тест громко.
-const wantZoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_unicode, " +
-	"z.is_active, z.domains_total, z.domains_checked, " +
-	"count(d.id) FILTER (WHERE d.check_state = 0 AND d.status <> 6) AS pending, " +
-	"count(d.id) FILTER (WHERE d.check_state = 1) AS queued, " +
-	"count(d.id) FILTER (WHERE d.check_state = 2) AS done " +
-	"FROM zones AS z LEFT JOIN domains AS d ON d.zone_id = z.id " +
-	"GROUP BY z.id ORDER BY z.name"
-
-const wantThroughputSQL = "SELECT " +
-	"(SELECT count(*) FROM domains WHERE last_checked_at = current_date) AS done_today, " +
-	"extract(epoch FROM (now() - date_trunc('day', now())))::float8 AS elapsed_sec, " +
-	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour') AS results_hour, " +
-	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour' AND rendered) AS rendered_hour"
-
-// --- фейковый пул (db.DB) ----------------------------------------------------
-
-// statusZoneSeed — зона в фейке: счётчики и атрибуты отображения.
-type statusZoneSeed struct {
-	id      int16
-	name    string
-	unicode string
-	active  bool
-	total   int64
-	checked int64
-	hasUni  bool // name_unicode не NULL (в SQL — coalesce в '')
-}
-
-// statusDomSeed — домен для агрегата check_state.
-type statusDomSeed struct {
-	zone  int16
-	state model.CheckState
-	stats model.Status
-}
-
-// statusPool — db.DB без БД: живая семантика zoneStatsSQL (GROUP BY зоны,
-// pending без deleted, queued/done без фильтра статуса, LEFT JOIN — зона
-// без доменов остаётся, ORDER BY name) и throughputSQL (готовые значения).
-type statusPool struct {
-	zones   []statusZoneSeed
-	domains []statusDomSeed
-	thr     throughput
-
-	mu        sync.Mutex
-	queryErr  error
-	queries   []string
-	execCalls int
-}
-
-var _ db.DB = (*statusPool)(nil)
-
-func newStatusPool() *statusPool {
-	return &statusPool{}
-}
-
-func (p *statusPool) seedZone(id int16, name string, active bool, total, checked int64) {
-	p.zones = append(p.zones, statusZoneSeed{id: id, name: name, active: active, total: total, checked: checked})
-}
-
-// seedZoneUnicode — зона с непустым name_unicode (NULL vs значение).
-func (p *statusPool) seedZoneUnicode(id int16, name, unicode string, active bool, total, checked int64) {
-	p.zones = append(p.zones, statusZoneSeed{id: id, name: name, unicode: unicode, active: active, total: total, checked: checked, hasUni: true})
-}
-
-func (p *statusPool) seedDomain(zone int16, state model.CheckState, stats model.Status) {
-	p.domains = append(p.domains, statusDomSeed{zone: zone, state: state, stats: stats})
-}
-
-func (p *statusPool) setQueryErr(err error) {
-	p.mu.Lock()
-	p.queryErr = err
-	p.mu.Unlock()
-}
-
-func (p *statusPool) calls() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]string(nil), p.queries...)
-}
-
-func (p *statusPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("statusPool: CopyFrom не должен вызываться")
-}
-
-func (p *statusPool) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	p.mu.Lock()
-	p.execCalls++
-	p.mu.Unlock()
-	return pgconn.CommandTag{}, fmt.Errorf("statusPool: неожидаемый Exec: %s", sql)
-}
-
-func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.queries = append(p.queries, sql)
-	if p.queryErr != nil {
-		return nil, p.queryErr
-	}
-	switch sql {
-	case zoneStatsSQL:
-		return p.zoneRows(), nil
-	case throughputSQL:
-		return statusRowsOf([]any{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour}), nil
-	default:
-		return nil, fmt.Errorf("statusPool: неожидаемый SQL Query: %s", sql)
-	}
-}
-
-// zoneRows применяет семантику zoneStatsSQL к сидам.
-func (p *statusPool) zoneRows() pgx.Rows {
-	pending := make(map[int16]int64)
-	queued := make(map[int16]int64)
-	done := make(map[int16]int64)
-	for _, d := range p.domains {
-		switch d.state {
-		case model.CheckStatePending:
-			if d.stats != model.StatusDeleted { // status <> deleted
-				pending[d.zone]++
-			}
-		case model.CheckStateQueued:
-			queued[d.zone]++ // без фильтра статуса: домен в работе
-		case model.CheckStateDone:
-			done[d.zone]++
-		}
-	}
-	sorted := append([]statusZoneSeed(nil), p.zones...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].name < sorted[j].name })
-	rows := make([][]any, len(sorted))
-	for i, z := range sorted {
-		uni := ""
-		if z.hasUni {
-			uni = z.unicode // coalesce(name_unicode, '')
-		}
-		rows[i] = []any{z.id, z.name, uni, z.active, z.total, z.checked,
-			pending[z.id], queued[z.id], done[z.id]}
-	}
-	return statusRowsOf(rows...)
-}
+// --- общий фейк pgx.Rows -------------------------------------------------------
 
 // statusRows — pgx.Rows с заготовленными строками (Scan позиционный,
-// типы int16/string/bool/int64/float32/float64/[]byte).
+// типы int16/string/bool/int64/float32/float64/[]byte). Общий фейк
+// тестов команд crawlerctl (zones, subdomains, near, recheck, …);
+// родился со status (T-079), логика ушла в internal/status (T-126) —
+// фейк остаётся здесь, у тестов CLI.
 type statusRows struct {
 	rows [][]any
 	i    int
@@ -233,256 +83,7 @@ func (r *statusRows) Scan(dest ...any) error {
 	return nil
 }
 
-// --- фейковый XLEN -----------------------------------------------------------
-
-// statusLenner — streamLener: длины по стримам (или сбой любой длины),
-// фиксирует порядок опроса.
-type statusLenner struct {
-	lens  map[string]int64
-	err   error
-	mu    sync.Mutex
-	calls []string
-}
-
-func (l *statusLenner) Len(_ context.Context, stream string) (int64, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.calls = append(l.calls, stream)
-	if l.err != nil {
-		return 0, l.err
-	}
-	return l.lens[stream], nil
-}
-
-func (l *statusLenner) order() []string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return append([]string(nil), l.calls...)
-}
-
-// --- SQL и семантика выборок ---------------------------------------------------
-
-func TestStatusSQLContract(t *testing.T) {
-	if zoneStatsSQL != wantZoneStatsSQL {
-		t.Errorf("zoneStatsSQL:\n%s\nwant:\n%s", zoneStatsSQL, wantZoneStatsSQL)
-	}
-	if throughputSQL != wantThroughputSQL {
-		t.Errorf("throughputSQL:\n%s\nwant:\n%s", throughputSQL, wantThroughputSQL)
-	}
-}
-
-// TestFetchZoneStats — агрегат по зонам: pending без deleted, queued/done
-// без фильтра статуса, зона без доменов (LEFT JOIN) в сводке, сортировка
-// по имени, unicode и флаг активности дочитываются.
-func TestFetchZoneStats(t *testing.T) {
-	pool := newStatusPool()
-	pool.seedZoneUnicode(2, "com", "com", true, 1000, 400)
-	pool.seedZone(1, "crawl.test", true, 100, 40)
-	pool.seedZone(3, "empty.test", false, 0, 0) // LEFT JOIN: доменов нет
-
-	pool.seedDomain(1, model.CheckStatePending, model.StatusNew)
-	pool.seedDomain(1, model.CheckStatePending, model.StatusNew)
-	pool.seedDomain(1, model.CheckStatePending, model.StatusDeleted) // не ждёт проверки
-	pool.seedDomain(1, model.CheckStateQueued, model.StatusNew)
-	pool.seedDomain(1, model.CheckStateQueued, model.StatusDeleted) // в работе
-	pool.seedDomain(1, model.CheckStateDone, model.StatusAlive)
-	pool.seedDomain(2, model.CheckStateDone, model.StatusNotDelegated)
-
-	zones, err := fetchZoneStats(context.Background(), pool)
-	if err != nil {
-		t.Fatalf("fetchZoneStats: %v", err)
-	}
-	if calls := pool.calls(); len(calls) != 1 || calls[0] != wantZoneStatsSQL {
-		t.Fatalf("запросы = %q, хочу один zoneStatsSQL", calls)
-	}
-	want := []zoneStats{
-		{ID: 2, Name: "com", NameUnicode: "com", IsActive: true, DomainsTotal: 1000, DomainsChecked: 400, Done: 1},
-		{ID: 1, Name: "crawl.test", IsActive: true, DomainsTotal: 100, DomainsChecked: 40,
-			Pending: 2, Queued: 2, Done: 1},
-		{ID: 3, Name: "empty.test", IsActive: false},
-	}
-	if !reflect.DeepEqual(zones, want) {
-		t.Errorf("zones =\n%+v\nwant\n%+v", zones, want)
-	}
-}
-
-// TestFetchZoneStatsEmpty — зон нет: пустой результат без ошибки.
-func TestFetchZoneStatsEmpty(t *testing.T) {
-	zones, err := fetchZoneStats(context.Background(), newStatusPool())
-	if err != nil {
-		t.Fatalf("fetchZoneStats: %v", err)
-	}
-	if len(zones) != 0 {
-		t.Errorf("zones = %+v, хочу пусто", zones)
-	}
-}
-
-// TestFetchThroughput — одна строка замеров; типы колонок (int64/float64).
-func TestFetchThroughput(t *testing.T) {
-	pool := newStatusPool()
-	pool.thr = throughput{DoneToday: 2279, ElapsedSec: 3720.5, ResultsHour: 6132, RenderedHour: 1025}
-
-	thr, err := fetchThroughput(context.Background(), pool)
-	if err != nil {
-		t.Fatalf("fetchThroughput: %v", err)
-	}
-	if calls := pool.calls(); len(calls) != 1 || calls[0] != wantThroughputSQL {
-		t.Fatalf("запросы = %q, хочу один throughputSQL", calls)
-	}
-	if thr != pool.thr {
-		t.Errorf("thr = %+v, want %+v", thr, pool.thr)
-	}
-}
-
-// TestStatusFetchErrors — ошибки пула возвращаются с контекстом команды;
-// nil-пул — ошибка, а не паника.
-func TestStatusFetchErrors(t *testing.T) {
-	boom := errors.New("boom")
-	pool := newStatusPool()
-	pool.setQueryErr(boom)
-	if _, err := fetchZoneStats(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: зоны:") {
-		t.Errorf("fetchZoneStats err = %v, хочу контекст «status: зоны:»", err)
-	}
-	if _, err := fetchThroughput(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: темп:") {
-		t.Errorf("fetchThroughput err = %v, хочу контекст «status: темп:»", err)
-	}
-	if _, err := fetchZoneStats(context.Background(), nil); err == nil {
-		t.Error("fetchZoneStats(nil) = nil, хочу ошибку")
-	}
-	if _, err := fetchThroughput(context.Background(), nil); err == nil {
-		t.Error("fetchThroughput(nil) = nil, хочу ошибку")
-	}
-}
-
-// --- очереди -------------------------------------------------------------------
-
-// TestFetchQueueLens — все рабочие стримы в порядке ТЗ 4.2; ошибка
-// останавливает сбор (Redis один); nil-клиент — ошибка.
-func TestFetchQueueLens(t *testing.T) {
-	lens := map[string]int64{"q:dns": 5, "q:http": 0, "q:render": 12, "q:analyze": 3, "q:dead": 1}
-	lenner := &statusLenner{lens: lens}
-	got, err := fetchQueueLens(context.Background(), lenner)
-	if err != nil {
-		t.Fatalf("fetchQueueLens: %v", err)
-	}
-	if !reflect.DeepEqual(got, lens) {
-		t.Errorf("lens = %v, want %v", got, lens)
-	}
-	if order := lenner.order(); !reflect.DeepEqual(order, statusStreams) {
-		t.Errorf("порядок опроса = %v, want %v", order, statusStreams)
-	}
-	if want := []string{"q:dns", "q:http", "q:render", "q:analyze", "q:dead"}; !reflect.DeepEqual(statusStreams, want) {
-		t.Errorf("statusStreams = %v, want %v (все стримы ТЗ 4.2)", statusStreams, want)
-	}
-
-	_, err = fetchQueueLens(context.Background(), &statusLenner{err: errors.New("connection refused")})
-	if err == nil {
-		t.Error("ошибка XLEN потеряна")
-	}
-	if _, err := fetchQueueLens(context.Background(), nil); err == nil {
-		t.Error("fetchQueueLens(nil) = nil, хочу ошибку")
-	}
-}
-
-// --- расчёты ---------------------------------------------------------------------
-
-func TestComputeTotals(t *testing.T) {
-	zones := []zoneStats{
-		{DomainsTotal: 100, DomainsChecked: 40, Pending: 60, Queued: 1, Done: 39},
-		{DomainsTotal: 1000, DomainsChecked: 400, Pending: 500, Queued: 5, Done: 495},
-	}
-	want := statusTotals{DomainsTotal: 1100, DomainsChecked: 440, Pending: 560, Queued: 6, Done: 534}
-	if got := computeTotals(zones); got != want {
-		t.Errorf("computeTotals = %+v, want %+v", got, want)
-	}
-	if got := computeTotals(nil); got != (statusTotals{}) {
-		t.Errorf("computeTotals(nil) = %+v, хочу нули", got)
-	}
-}
-
-// TestComputeRates — защита от деления на ноль и коротких окон: скорость
-// доменов только при окне ≥ minSpeedWindowSec; ETA — при известной
-// ненулевой скорости (или пустом цикле), округление и минимум 1с.
-func TestComputeRates(t *testing.T) {
-	// Рабочий случай: 3600 проверок за час → 1/с; остаток 90 → ETA 90с.
-	r := computeRates(throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600}, 60, 30)
-	if !r.DomainsKnown || r.DomainsPerSec != 1 {
-		t.Errorf("скорость доменов = %v (%v), хочу 1 (известна)", r.DomainsPerSec, r.DomainsKnown)
-	}
-	if r.ResultsPerSec != 2 || r.RenderPerSec != 1 {
-		t.Errorf("скорости часа = %v/%v, хочу 2/1", r.ResultsPerSec, r.RenderPerSec)
-	}
-	if r.Remaining != 90 {
-		t.Errorf("остаток = %d, хочу 90", r.Remaining)
-	}
-	if !r.ETAKnown || r.ETASec != 90 {
-		t.Errorf("ETA = %d (%v), хочу 90 (известна)", r.ETASec, r.ETAKnown)
-	}
-
-	// Окно короче минимума: скорости доменов и ETA нет, часовые считаются.
-	r = computeRates(throughput{ElapsedSec: minSpeedWindowSec - 1, ResultsHour: 3600}, 10, 0)
-	if r.DomainsKnown || r.DomainsPerSec != 0 {
-		t.Errorf("короткое окно: Known=%v speed=%v, хочу неизвестную", r.DomainsKnown, r.DomainsPerSec)
-	}
-	if r.ETAKnown {
-		t.Error("короткое окно: ETA известна, хочу н/д")
-	}
-	if r.ResultsPerSec != 1 {
-		t.Errorf("результаты/с = %v, хочу 1 (окно фиксированное)", r.ResultsPerSec)
-	}
-
-	// Граница окна ровно на минимуме — скорость известна.
-	if r := computeRates(throughput{DoneToday: minSpeedWindowSec, ElapsedSec: minSpeedWindowSec}, 1, 0); !r.DomainsKnown {
-		t.Error("окно = minSpeedWindowSec: скорость должна быть известна")
-	}
-
-	// Скорость 0 (за окно ни одной проверки): ETA н/д, не паника.
-	r = computeRates(throughput{DoneToday: 0, ElapsedSec: 7200}, 5, 0)
-	if !r.DomainsKnown || r.DomainsPerSec != 0 {
-		t.Errorf("нулевые проверки: Known=%v speed=%v, хочу известную 0", r.DomainsKnown, r.DomainsPerSec)
-	}
-	if r.ETAKnown {
-		t.Error("скорость 0: ETA не должна быть известна (деление на ноль)")
-	}
-
-	// Пустой цикл: ETA 0 даже без скорости.
-	r = computeRates(throughput{ElapsedSec: 1}, 0, 0)
-	if !r.ETAKnown || r.ETASec != 0 {
-		t.Errorf("пустой цикл: ETA = %d (%v), хочу 0 (известна)", r.ETASec, r.ETAKnown)
-	}
-
-	// Округление вверх/вниз и минимум: 100/3 = 33.3 → 33; 1/3 = 0.3 → 1.
-	if r := computeRates(throughput{DoneToday: 3000, ElapsedSec: 1000}, 100, 0); r.ETASec != 33 {
-		t.Errorf("ETA 100/3 = %d, хочу 33", r.ETASec)
-	}
-	if r := computeRates(throughput{DoneToday: 3000, ElapsedSec: 1000}, 1, 0); r.ETASec != 1 {
-		t.Errorf("ETA 1/3 = %d, хочу минимум 1", r.ETASec)
-	}
-}
-
-// TestFormatDuration — округлые интервалы: секунды/минуты/часы/дни.
-func TestFormatDuration(t *testing.T) {
-	cases := []struct {
-		sec  int64
-		want string
-	}{
-		{0, "0с"},
-		{45, "45с"},
-		{59, "59с"},
-		{60, "1м"},
-		{90, "2м"},    // округление к минуте
-		{3599, "60м"}, // 59м59с → 60м
-		{3600, "1ч 00м"},
-		{19200, "5ч 20м"},
-		{86400, "1д 0ч"},
-		{275400, "3д 4ч"},
-	}
-	for _, tc := range cases {
-		if got := formatDuration(tc.sec); got != tc.want {
-			t.Errorf("formatDuration(%d) = %q, want %q", tc.sec, got, tc.want)
-		}
-	}
-}
+// --- вывод ------------------------------------------------------------------------
 
 // TestPercentMark — доля проверенных; пустая зона — «—».
 func TestPercentMark(t *testing.T) {
@@ -502,20 +103,18 @@ func TestPercentMark(t *testing.T) {
 	}
 }
 
-// --- вывод ------------------------------------------------------------------------
-
 // statusTestSnapshot — согласованный набор данных для тестов вывода:
 // две зоны (одна без доменов), замеры и скорости из TestComputeRates.
-func statusTestSnapshot() (zones []zoneStats, tot statusTotals, thr throughput, rates statusRates) {
-	zones = []zoneStats{
+func statusTestSnapshot() (zones []status.ZoneStats, tot status.Totals, thr status.Throughput, rates status.Rates) {
+	zones = []status.ZoneStats{
 		{ID: 1, Name: "crawl.test", IsActive: true, DomainsTotal: 100, DomainsChecked: 40, Pending: 60, Queued: 2, Done: 38},
 		// Зона без доменов (LEFT JOIN): счётчик monitor остался от прошлого
 		// наполнения — в итог он всё равно входит.
 		{ID: 3, Name: "empty.test", IsActive: false, DomainsTotal: 10, DomainsChecked: 0},
 	}
-	tot = computeTotals(zones)
-	thr = throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600}
-	rates = computeRates(thr, tot.Pending, tot.Queued) // 1 дом./с → ETA 62с
+	tot = status.ComputeTotals(zones)
+	thr = status.Throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600}
+	rates = status.ComputeRates(thr, tot.Pending, tot.Queued) // 1 дом./с → ETA 62с
 	return zones, tot, thr, rates
 }
 
@@ -564,7 +163,7 @@ func TestWriteStatusTable(t *testing.T) {
 // по БД печатается; пустой цикл помечается завершённым.
 func TestWriteStatusTableDegraded(t *testing.T) {
 	_, tot, thr, _ := statusTestSnapshot()
-	rates := computeRates(thr, 0, 0) // цикл пуст
+	rates := status.ComputeRates(thr, 0, 0) // цикл пуст
 
 	var b bytes.Buffer
 	writeStatusTable(&b, nil, tot, thr, rates, nil)
@@ -581,10 +180,10 @@ func TestWriteStatusTableDegraded(t *testing.T) {
 	}
 
 	// Короткое окно суток — скорость и ETA честно «н/д».
-	thr = throughput{ElapsedSec: 300, ResultsHour: 0}
-	rates = computeRates(thr, 10, 0)
+	thr = status.Throughput{ElapsedSec: 300, ResultsHour: 0}
+	rates = status.ComputeRates(thr, 10, 0)
 	b.Reset()
-	writeStatusTable(&b, nil, statusTotals{}, thr, rates, nil)
+	writeStatusTable(&b, nil, status.Totals{}, thr, rates, nil)
 	got = b.String()
 	for _, want := range []string{
 		"н/д   (окно с начала суток короче 10м)",
@@ -665,9 +264,9 @@ func TestWriteStatusJSON(t *testing.T) {
 	// Деградация: короткое окно + недоступный Redis → null-поля, остаток
 	// без ETA; json при этом валиден.
 	b.Reset()
-	thr = throughput{ElapsedSec: 300}
-	rates = computeRates(thr, 10, 0)
-	if err := writeStatusJSON(&b, nil, statusTotals{}, thr, rates, nil); err != nil {
+	thr = status.Throughput{ElapsedSec: 300}
+	rates = status.ComputeRates(thr, 10, 0)
+	if err := writeStatusJSON(&b, nil, status.Totals{}, thr, rates, nil); err != nil {
 		t.Fatalf("writeStatusJSON: %v", err)
 	}
 	var deg struct {
@@ -695,8 +294,6 @@ func TestWriteStatusJSON(t *testing.T) {
 		t.Errorf("remaining = %d, хочу 10", deg.Rates.Remaining)
 	}
 }
-
-// jsonUnmarshalStrict удалён: тесты используют json.Unmarshal напрямую.
 
 // --- роутинг/коды -------------------------------------------------------------------
 
@@ -735,7 +332,7 @@ func TestRunStatus(t *testing.T) {
 // TestStatusHelpMentionsStreams — справка перечисляет все стримы и ETA
 // (содержание целиком проверяет TestRunHelpPerCommand в main_test.go).
 func TestStatusHelpMentionsStreams(t *testing.T) {
-	for _, s := range statusStreams {
+	for _, s := range status.Streams {
 		if !strings.Contains(statusHelp, s) {
 			t.Errorf("statusHelp не упоминает стрим %q", s)
 		}

@@ -78,7 +78,7 @@ const zonesHelp = `crawlerctl zones — управление зонами про
 // ---------------------------------------------------------------- SQL
 
 // zonesSelectSQL — весь справочник зон по возрастанию имени (стиль
-// zoneStatsSQL, T-079): name — punycode (каноническая форма), coalesce
+// zoneStatsSQL из internal/status, T-079): name — punycode (каноническая форма), coalesce
 // даёт пустую строку вместо NULL у ASCII-зон (name_unicode хранится
 // только для отображения и отличающихся от name, ТЗ 5.2 п. 7).
 const zonesSelectSQL = "SELECT id, name, coalesce(name_unicode, '') AS name_unicode, " +
