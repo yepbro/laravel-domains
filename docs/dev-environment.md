@@ -203,7 +203,7 @@ deleted, `delete` — перевод в deleted) → отчёт в таблиц�
 | бесконечный редирект | `infinite-redirect` (+`cycle-redirect`) | mockserver `/redirect/infinite`, `/redirect/cycle/a` |
 | гигантское тело | `huge-body` | mockserver `/huge`: Content-Length 1 ГиБ |
 | SPA-страница | `spa-shell` | testweb: `#root` + `<noscript>` + JS-кука/контент |
-| страницы Laravel разных версий | `<id>.crawl.test` для 13 образцов `testdata/laravel-samples` | testweb: статика + `headers.json` (куки `XSRF-TOKEN`/`*_session`, `Content-Type` и пр.), версии 5.8–12, стеки mix/vite/inertia/livewire + 5 негативов |
+| страницы Laravel разных версий | `<id>.crawl.test` для 17 образцов `testdata/laravel-samples` | testweb: статика + `headers.json` (куки `XSRF-TOKEN`/`*_session`/CMS-имена `__Secure-october_session`/`winter_session`, `Content-Type` и пр.), версии 5.8–12, стеки mix/vite/inertia/livewire, stateless-API/404-JSON/CMS-куки + 5 негативов |
 
 Сверх обязательного списка стенд также эмулирует: SERVFAIL и таймаут DNS
 (`servfail`, `dns-timeout`), NODATA у делегированного (`delegated-no-address`),

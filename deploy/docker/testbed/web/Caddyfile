@@ -479,6 +479,22 @@ https://laravel-9-json-api.crawl.test {
     import sample_laravel-9-json-api
 }
 
+(sample_october-cms) {
+    header +Content-Type "text/html; charset=UTF-8"
+    header +Set-Cookie "__Secure-october_session=eyJpdiI6T2N0b2JlckNNUzoxNjp7fQ%3D%3D; path=/; secure; httponly; samesite=lax"
+    root * /srv/samples/october-cms
+    file_server
+}
+
+http://october-cms.crawl.test {
+    import sample_october-cms
+}
+
+https://october-cms.crawl.test {
+    tls internal
+    import sample_october-cms
+}
+
 (sample_parking-negative) {
     header +Content-Type "text/html; charset=utf-8"
     header +Server "nginx"
@@ -524,6 +540,22 @@ http://symfony-negative.crawl.test {
 https://symfony-negative.crawl.test {
     tls internal
     import sample_symfony-negative
+}
+
+(sample_winter-cms) {
+    header +Content-Type "text/html; charset=UTF-8"
+    header +Set-Cookie "winter_session=eyJpdiI6V0ludGVyQ01TOjE2Ont9; path=/; httponly; samesite=lax"
+    root * /srv/samples/winter-cms
+    file_server
+}
+
+http://winter-cms.crawl.test {
+    import sample_winter-cms
+}
+
+https://winter-cms.crawl.test {
+    tls internal
+    import sample_winter-cms
 }
 
 (sample_wordpress-negative) {

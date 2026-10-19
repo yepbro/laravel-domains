@@ -286,11 +286,113 @@ func TestCorpusJSONMessageKey(t *testing.T) {
 	}
 }
 
-// TestCorpusNegativesWeakSignals — негативные образцы (ТЗ §13.3: «в том
-// числе на других фреймворках, использующих похожие признаки»): is_laravel
-// обязана быть false, и тест разбирает, какими слабыми срабатываниями
-// ограничивается движок и почему они ниже порога.
+// TestCorpusCMSSession — правило cookie_cms_session (T-134, сверка с
+// larasites): CMS на Laravel ставят собственные имена сессии (october/
+// winter/bagisto — проверено по исходникам CMS), которые до правила ловил
+// только генерический суффикс *_session — пара «CMS-кука + шифро-конверт»
+// без XSRF-TOKEN давала 0.15 + 0.5 = 0.575 < 0.6 (пропуск, не закрытый
+// калибровкой T-116). Вес 0.35 — уровень laravel_session (имена
+// Laravel-экосистемны, в отличие от суффикса, совпадающего с ci_session):
+// 0.35 + 0.5 → 0.675 ≥ 0.6; двойной учёт с суффиксом консистентен с
+// поведением laravel_session (совпадает с обоими). Префиксы __Secure-/
+// __Host- (October ≥1.1 ставит автоматически на https) учтены и в
+// cms-правиле, и в суффиксе *_session.
+func TestCorpusCMSSession(t *testing.T) {
+	set := corpusSet(t)
 
+	// Образцы корпуса: October (префикс __Secure- — https-эпизод October
+	// ≥1.1) и Winter (стоковое имя), оба без XSRF-TOKEN — детекция куками:
+	// ровно три правила, шумовых HTML-признаков нет.
+	for _, id := range []string{"october-cms", "winter-cms"} {
+		res := set.EvaluateCtx(context.Background(), corpusSampleByID(t, id).Page(), DefaultLimits())
+		want := []string{"cookie_cms_session", "cookie_encrypted_payload", "cookie_session_suffix"}
+		if fired := corpusFired(res); !slices.Equal(fired, want) {
+			t.Errorf("%s: сработали %v, ожидались %v", id, fired, want)
+		}
+		if wantScore := ScoreFixed([]float64{0.35, 0.15, 0.5}); diff(res.Score, wantScore) > 1e-9 {
+			t.Errorf("%s: score = %v, want %v (0.35+0.15+0.5)", id, res.Score, wantScore)
+		}
+		if !res.IsLaravel(DefaultMinScore) {
+			t.Errorf("%s: score %.3f ≥ порога — пропуск T-134 закрыт", id, res.Score)
+		}
+	}
+
+	// Состав списка — только имена, проверяемые по исходникам: матчатся
+	// october/winter/bagisto с префиксами __Secure-/__Host- и без.
+	fires := func(name string) bool {
+		t.Helper()
+		res := set.EvaluateCtx(context.Background(),
+			Page{Cookies: []Cookie{{Name: name, Value: "plain"}}}, DefaultLimits())
+		return slices.Contains(corpusFired(res), "cookie_cms_session")
+	}
+	for _, name := range []string{
+		"october_session", "winter_session", "bagisto_session",
+		"__Secure-october_session", "__Host-winter_session", "__Secure-bagisto_session",
+	} {
+		if !fires(name) {
+			t.Errorf("кука %s: правило cookie_cms_session должно срабатывать", name)
+		}
+	}
+	// Не матчатся: подтверждённых имён нет (botble/pyrocms/asgard — состав
+	// не расширен непроверяемыми), генерические имена и огранки паттерна —
+	// якоря, постфиксы, чужая форма (статamic оставляет laravel_session).
+	for _, name := range []string{
+		"ci_session", "myapp_session", "laravel_session",
+		"botble_session", "pyrocms_session", "asgard_session",
+		"october_sessions",         // постфиксный хвост
+		"foo_october_session",      // имя приложения перед cms-именем
+		"october-session",          // дефис вместо подчёркивания
+		"__secure-october_session", // префикс регистрозависим (RFC 6265bis)
+	} {
+		if fires(name) {
+			t.Errorf("кука %s: правило cookie_cms_session срабатывать не должно", name)
+		}
+	}
+
+	// laravel_session — эталон консистентности двойного учёта: совпадает
+	// с cookie_laravel_session и суффиксом, но не с cms-правилом.
+	res := set.EvaluateCtx(context.Background(),
+		Page{Cookies: []Cookie{{Name: "laravel_session", Value: "plain"}}}, DefaultLimits())
+	if fired := corpusFired(res); !slices.Equal(fired, []string{"cookie_laravel_session", "cookie_session_suffix"}) {
+		t.Errorf("laravel_session: сработали %v, ожидались cookie_laravel_session и cookie_session_suffix", fired)
+	}
+
+	// Правка суффикса *_session под префиксы: __Secure-myapp_session (произвольное
+	// имя, как в тесте larasites myapp_session) матчится суффиксом — 0.15;
+	// __Secure-october_session — обоими правилами (двойной учёт).
+	res = set.EvaluateCtx(context.Background(),
+		Page{Cookies: []Cookie{{Name: "__Secure-myapp_session", Value: "plain"}}}, DefaultLimits())
+	if fired := corpusFired(res); !slices.Equal(fired, []string{"cookie_session_suffix"}) {
+		t.Errorf("__Secure-myapp_session: сработали %v, ожидался только cookie_session_suffix", fired)
+	}
+	if diff(res.Score, 0.15) > 1e-9 || res.IsLaravel(DefaultMinScore) {
+		t.Errorf("__Secure-myapp_session: score %.3f — суффикс один ниже порога", res.Score)
+	}
+
+	// Серая зона (контроль T-115: новые пары не заносят шум):
+	//
+	//   - CMS-имя без конверта: 0.35 + 0.15 = 0.4475 < 0.6 (EncryptCookies
+	//     отключён/кука от прокси) — находка в findings, но не laravel_domains;
+	//   - ближайший негатив к новой паре: ci_session + конверт — 0.15 + 0.5 =
+	//     0.575 < 0.6 (ci_session не входит в cms-список, суффиксу конверт
+	//     безразличен — тот же класс пропуска для не-CMS имён остался ниже
+	//     порога сознательно: без экосистемного имени конверт слабее).
+	res = set.EvaluateCtx(context.Background(),
+		Page{Cookies: []Cookie{{Name: "october_session", Value: "plain"}}}, DefaultLimits())
+	if want := 1 - 0.65*0.85; diff(res.Score, want) > 1e-9 || res.IsLaravel(DefaultMinScore) {
+		t.Errorf("CMS-имя без конверта: score %.4f, want %v, ниже порога", res.Score, want)
+	}
+	res = set.EvaluateCtx(context.Background(),
+		Page{Cookies: []Cookie{{Name: "ci_session", Value: "eyJpdiI6Y2k6MTY6e30="}}}, DefaultLimits())
+	if fired := corpusFired(res); !slices.Equal(fired, []string{"cookie_encrypted_payload", "cookie_session_suffix"}) {
+		t.Fatalf("ci_session с конвертом: сработали %v, ожидались cookie_encrypted_payload и cookie_session_suffix", fired)
+	}
+	if want := 1 - 0.85*0.5; diff(res.Score, want) > 1e-9 || res.IsLaravel(DefaultMinScore) {
+		t.Errorf("ci_session с конвертом: score %.4f, want %v — ниже порога", res.Score, want)
+	}
+}
+
+// TestCorpusNegativesWeakSignals — негативные образцы (ТЗ §13.3: «в том
 // числе на других фреймворках, использующих похожие признаки»): is_laravel
 // обязана быть false, и тест разбирает, какими слабыми срабатываниями
 // ограничивается движок и почему они ниже порога.
@@ -463,12 +565,14 @@ rules:
 	// Ослабление не занесло шумовые пары (проверка T-116 по аналогии
 	// серой зоны): сочетания БЕЗ шифрованной куки остаются ниже порога —
 	// CodeIgniter-тройка ci_session (суффикс 0.15) + csrf-meta (0.2) +
-	// форма _token (0.25): 1 − 0.85·0.8·0.75 = 0.49.
+	// форма _token (0.25): 1 − 0.85·0.8·0.75 = 0.49. Суффикс — копия
+	// рабочего правила (с префиксами __Secure-/__Host- от T-134): кука
+	// с префиксом ловится тем же весом и порог не меняет.
 	set = evalSet(t, `
 rules:
   - id: ci_sess
     target: cookie_name
-    regex: '^[a-z0-9_\-]+_session$'
+    regex: '^(?:__Secure-|__Host-)?[a-z0-9_\-]+_session$'
     weight: 0.15
   - id: csrf_meta
     target: meta
@@ -479,15 +583,21 @@ rules:
     regex: '<input[^>]+name="_token"'
     weight: 0.25
 `)
-	res = set.EvaluateCtx(context.Background(), Page{
+	ciPage := Page{
 		HTML:    []byte(`<meta name="csrf-token" content="x"><input type="hidden" name="_token" value="y">`),
 		Cookies: []Cookie{{Name: "ci_session", Value: "aGVsbG8"}},
-	}, DefaultLimits())
+	}
+	res = set.EvaluateCtx(context.Background(), ciPage, DefaultLimits())
 	if want := 1 - 0.85*0.8*0.75; diff(res.Score, want) > 1e-9 {
 		t.Errorf("score шумовой тройки = %v, want %v", res.Score, want)
 	}
 	if res.IsLaravel(DefaultMinScore) {
 		t.Errorf("шумовая тройка без шифрованной куки: %.4f не должна достигать порога", res.Score)
+	}
+	ciPage.Cookies[0].Name = "__Secure-ci_session"
+	res = set.EvaluateCtx(context.Background(), ciPage, DefaultLimits())
+	if want := 1 - 0.85*0.8*0.75; diff(res.Score, want) > 1e-9 {
+		t.Errorf("score тройки с __Secure-ci_session = %v, want %v (префикс вес не меняет)", res.Score, want)
 	}
 
 	// Вес 1 — уверенный признак закрывает score до единицы.

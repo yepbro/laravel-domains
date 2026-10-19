@@ -1,0 +1,19 @@
+is_laravel: true
+# T-134: страница Winter CMS (форк October, имя сессии по умолчанию —
+# winter_session, str_slug(APP_NAME,'winter').'_session', без префикса:
+# https-эпизод гипотетический, как у стоковой установки). Значение шифрует
+# EncryptCookies (конверт eyJpdiI6), XSRF-TOKEN нет — до правила
+# cookie_cms_session давало 0.15+0.5 = 0.575 < 0.6 (пропуск); теперь
+# cookie_cms_session (0.35) + конверт (0.5) = 0.675 >= 0.6, suffix-дубль
+# (0.15, консистентно с laravel_session) доводит noisy-OR до 0.724.
+score: 0.724          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
+calc_ver_min: ""      # вычисленный диапазон: ни одно из сработавших правил не задаёт границ
+calc_ver_max: ""
+conflict: false
+note: "Синтетический образец Winter CMS: кука winter_session с шифрованным конвертом, XSRF-TOKEN нет"
+source: synthetic
+obtained: 2026-10-19
+rules:
+  - cookie_cms_session
+  - cookie_encrypted_payload
+  - cookie_session_suffix

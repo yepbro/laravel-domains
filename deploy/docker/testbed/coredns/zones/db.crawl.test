@@ -36,6 +36,7 @@ laravel-6-welcome IN A 172.28.100.12
 laravel-8-mix IN A 172.28.100.12
 laravel-9-json-api IN A 172.28.100.12
 meta-refresh IN A 172.28.100.12
+october-cms IN A 172.28.100.12
 parked-1 IN A 172.28.100.12
 parked-2 IN A 172.28.100.12
 parking-negative IN A 172.28.100.12
@@ -153,6 +154,7 @@ tls-self-signed IN A 172.28.100.13
 tls-wrong-san IN A 172.28.100.13
 truncated IN A 172.28.100.13
 wildcard IN A 172.28.100.12
+winter-cms IN A 172.28.100.12
 wordpress-negative IN A 172.28.100.12
 www-to-bare IN A 172.28.100.12
 www.alias-target IN A 172.28.100.12

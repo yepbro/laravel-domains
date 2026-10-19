@@ -1,0 +1,20 @@
+is_laravel: true
+# T-134: страница October CMS (демо-тема, https-эпизод). Имя сессии —
+# october_session (config/session.php), October >=1.1 автоматически ставит
+# префикс __Secure- на https; значение шифрует EncryptCookies (конверт
+# eyJpdiI6). XSRF-TOKEN нет — до правила cookie_cms_session пару «имя CMS +
+# конверт» ловил только генерический суффикс *_session (0.15): 0.15+0.5 =
+# 0.575 < 0.6 — пропуск. Теперь cookie_cms_session (0.35) + конверт (0.5)
+# дают 0.675 >= 0.6; suffix-дубль (0.15, консистентно с laravel_session)
+# доводит noisy-OR до 0.724.
+score: 0.724          # точные ожидания движка: noisy-OR весов правил из rules (±0.001)
+calc_ver_min: ""      # вычисленный диапазон: ни одно из сработавших правил не задаёт границ
+calc_ver_max: ""
+conflict: false
+note: "Синтетический образец October CMS: кука __Secure-october_session с шифрованным конвертом, XSRF-TOKEN нет"
+source: synthetic
+obtained: 2026-10-19
+rules:
+  - cookie_cms_session
+  - cookie_encrypted_payload
+  - cookie_session_suffix
