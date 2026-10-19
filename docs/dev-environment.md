@@ -278,6 +278,20 @@ crawlerctl dashboard-secret [ПАРОЛЬ]     # хэш пароля опера�
                                           # ТЗД §7.2); пароль — аргумент
                                           # или stdin (аргумент остаётся
                                           # в истории shell)
+crawlerctl near [--zone ИМЯ] [--min-score F]
+                                          # находки Laravel в серой зоне
+                                          # порога — материал калибровки
+                                          # правил (T-115); порог по
+                                          # умолчанию — analyzer.laravel_min_score
+crawlerctl check <домен>                  # живая проверка домена конвейером
+                                          # (T-119): DNS → HTTP (+рендер
+                                          # SPA) → анализ; read-only —
+                                          # ничего не пишет в БД и не
+                                          # публикует в очереди (единственное
+                                          # чтение — справочник субдоменов),
+                                          # результат — только в stdout;
+                                          # поставить домен на настоящий
+                                          # цикл с записью в БД — recheck
 crawlerctl seed / test-rules             # dev-команды (make seed, make test-rules)
 ```
 

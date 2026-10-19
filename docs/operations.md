@@ -212,6 +212,9 @@ make logs SERVICE=monitor | grep -i warn      # dev
 ```bash
 crawlerctl status                  # зоны, очереди, q:dead, ETA
 crawlerctl near                    # серая зона Laravel-детекции (T-115)
+crawlerctl check <домен>           # разбор спорного домена «на живую»
+                                   # (T-119): read-only — без записи в БД
+                                   # и очередях; для записи — recheck
 # алерты и ошибки:
 journalctl -t crawler-monitor -p warning --since -1d   # бой
 systemctl --failed                 # юниты в failed (StartLimit)
