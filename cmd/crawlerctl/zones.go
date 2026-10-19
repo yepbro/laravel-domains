@@ -1,8 +1,10 @@
 // ---------------------------------------------------------------- zones
 //
 // crawlerctl zones (T-084, ТЗ 4.1, 5.3): управление зонами проверки —
-// list/enable/disable флага zones.is_active. Зона — справочная строка
-// (создаёт ingest при первом файле, ТЗ 5.1); is_active — участие зоны
+// list/enable/disable флага zones.is_active и sync — наполнение
+// справочника из реестра IANA (T-125, zonessync.go). Зона — справочная
+// строка (создаёт ingest при первом файле, ТЗ 5.1, или zones sync);
+// is_active — участие зоны
 // в выборке планировщика: DispatchBatch (T-027) джойнит зоны с условием
 // z.is_active, поэтому выключенная зона не выбирается вовсе — её домены
 // остаются pending и ждут включения (datafix не нужен: enable возвращает
@@ -37,6 +39,7 @@ const zonesHelp = `crawlerctl zones — управление зонами про
   crawlerctl zones list
   crawlerctl zones enable <зона>
   crawlerctl zones disable <зона>
+  crawlerctl zones sync [--file ПУТЬ] [--url URL] [--deactivate-missing]
 
 Зона — имя в любой форме (unicode/punycode, регистр, точка на конце),
 как каталог incoming/<зона>; в БД хранится punycode (ТЗ 5.2).
@@ -52,9 +55,24 @@ const zonesHelp = `crawlerctl zones — управление зонами про
                       планировщик не выбирает домены зоны; сами домены,
                       их состояния и результаты не меняются (ТЗ 13.1),
                       приём файлов зоны работает как прежде
+  sync [--file ПУТЬ] [--url URL] [--deactivate-missing]
+                      наполнить справочник зон из среза реестра корневой
+                      зоны IANA (tlds-alpha-by-domain.txt, ~1460 TLD,
+                      IDN уже в punycode). Новые зоны добавляются
+                      включёнными (is_active = true — как автосоздание
+                      ingest'ом, ТЗ 5.1), существующие строки не меняются
+                      (is_active — владение оператора, счётчики —
+                      monitor), повторный запуск ничего не меняет.
+                      Источник: --url (по умолчанию data.iana.org) или
+                      заранее скачанный файл --file (офлайн-режим, прод
+                      без исходящего интернета). --deactivate-missing
+                      дополнительно выключает зоны БД, отсутствующие
+                      в срезе (retired TLD), с их списком в отчёте.
+                      Это справочник имён TLD, а не источник доменов:
+                      домены — только через ingest (var/incoming)
 
-Коды возврата: 0 — успех, 1 — ошибка (неизвестная зона, БД), 2 —
-использование.
+Коды возврата: 0 — успех, 1 — ошибка (неизвестная зона, БД, источник
+среза, мусорная строка), 2 — использование.
 `
 
 // ---------------------------------------------------------------- SQL
@@ -270,10 +288,11 @@ func zonesToggleRun(ctx context.Context, pool db.DB, action string, name string,
 
 // ---------------------------------------------------------------- команды
 
-// cmdZones — роутинг действий зон: list / enable / disable.
+// cmdZones — роутинг действий зон: list / enable / disable / sync
+// (sync — T-125, zonessync.go).
 func cmdZones(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usagef("укажите действие: crawlerctl zones list|enable|disable")
+		return usagef("укажите действие: crawlerctl zones list|enable|disable|sync")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
@@ -281,11 +300,13 @@ func cmdZones(args []string, stdout, stderr io.Writer) error {
 		return zonesList(rest, stdout, stderr)
 	case "enable", "disable":
 		return zonesToggle(action, rest, stdout, stderr)
+	case "sync":
+		return zonesSync(rest, stdout, stderr)
 	case "-h", "--help", "help":
 		out(stdout, "%s", zonesHelp)
 		return flag.ErrHelp
 	default:
-		return usagef("неизвестное действие %q (допустимы: list, enable, disable)", action)
+		return usagef("неизвестное действие %q (допустимы: list, enable, disable, sync)", action)
 	}
 }
 

@@ -66,7 +66,8 @@ const usageText = `crawlerctl — CLI Domain Crawler
   subdomains list|add|disable|recheck
                                  управление проверяемыми субдоменами
                                  (T-083)
-  zones list|enable|disable     управление зонами (T-084)
+  zones list|enable|disable|sync  управление зонами (T-084), наполнение
+                                  справочника из реестра IANA (T-125)
   reanalyze [--zone ИМЯ]        переанализ результатов по новым правилам (T-074)
   recheck <домен> [домен …]     принудительная постановка домена на
                                 проверку (T-084)
