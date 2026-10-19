@@ -255,10 +255,11 @@ func TestSessionCookie(t *testing.T) {
 	rec := doReq(h, http.MethodGet, "/", "10.0.0.4:4444", authed())
 	valid := sessionCookie(t, rec)
 
-	// (1) Валидная: без Basic — заглушка /api/status отдаёт 503 (не 401):
-	// KDF не выполняется вовсе, роут за авторизацией пройден.
+	// (1) Валидная: без Basic — /api/status отдаёт 503 (не 401):
+	// KDF не выполняется вовсе, роут за авторизацией пройден (сервер
+	// без источника снимков — семантика §5.9).
 	if good := doReqCookie(h, http.MethodGet, "/api/status", "10.0.0.4:4445", valid); good.Code != http.StatusServiceUnavailable {
-		t.Fatalf("валидная cookie: статус = %d, хочу 503 (заглушка до T-129, не 401)", good.Code)
+		t.Fatalf("валидная cookie: статус = %d, хочу 503 (нет источника снимков, не 401)", good.Code)
 	}
 
 	// (2) Тамперена подпись.
@@ -411,19 +412,21 @@ func TestBruteForceSuccessResets(t *testing.T) {
 
 // --- роуты, методы, заголовки (§6.1–6.3) ----------------------------------------
 
-// TestRoutes — заглушки каркаса: / — страница-плейсхолдер, /api/status —
-// 503 + no-store (§5.9/§6.2), /assets/* — 404 до T-130, неизвестный
-// путь — 404; всё за авторизацией.
+// TestRoutes — каркас поверх фронта T-130: / — страница дашборда
+// (assets/page.html), /api/status без источника снимков — 503 +
+// no-store (§5.9/§6.2), /assets/* — 404 на неизвестный файл (известные
+// имена — сами файлы, assets_test.go), неизвестный путь — 404;
+// всё за авторизацией.
 func TestRoutes(t *testing.T) {
 	h := newTestServer(t, nil).Handler()
 
 	rec := doReq(h, http.MethodGet, "/", "10.0.0.9:9999", authed())
 	if rec.Code != http.StatusOK {
-		t.Errorf("GET / = %d, хочу 200 (заглушка до T-130)", rec.Code)
+		t.Errorf("GET / = %d, хочу 200 (страница T-130)", rec.Code)
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "Дашборд Domain Crawler") {
-		t.Errorf("GET /: не HTML-плейсхолдер:\n%s", body)
+		t.Errorf("GET /: не страница дашборда:\n%s", body)
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
 		t.Errorf("GET /: Content-Type = %q, хочу text/html", ct)
@@ -431,7 +434,7 @@ func TestRoutes(t *testing.T) {
 
 	rec = doReq(h, http.MethodGet, "/api/status", "10.0.0.9:9999", authed())
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("GET /api/status = %d, хочу 503 (заглушка до T-129, §5.9)", rec.Code)
+		t.Errorf("GET /api/status = %d, хочу 503 (снимок ещё не собран, §5.9)", rec.Code)
 	}
 	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
 		t.Errorf("Cache-Control = %q, хочу no-store (§6.2)", cc)
@@ -441,7 +444,7 @@ func TestRoutes(t *testing.T) {
 	}
 
 	if rec = doReq(h, http.MethodGet, "/assets/app.css", "10.0.0.9:9999", authed()); rec.Code != http.StatusNotFound {
-		t.Errorf("GET /assets/* = %d, хочу 404 (статика — T-130)", rec.Code)
+		t.Errorf("GET /assets/app.css = %d, хочу 404 (файла в embed нет)", rec.Code)
 	}
 	if rec = doReq(h, http.MethodGet, "/nope", "10.0.0.9:9999", authed()); rec.Code != http.StatusNotFound {
 		t.Errorf("GET /nope = %d, хочу 404", rec.Code)
@@ -484,6 +487,7 @@ func TestSecurityHeaders(t *testing.T) {
 		{"healthz", http.MethodGet, "/healthz", nil},
 		{"robots", http.MethodGet, "/robots.txt", nil},
 		{"страница", http.MethodGet, "/", authed()},
+		{"статика", http.MethodGet, "/assets/style.css", authed()},
 		{"без кредов", http.MethodGet, "/", nil},
 	} {
 		rec := doReq(h, tc.method, tc.path, "10.0.0.11:1111", tc.header)

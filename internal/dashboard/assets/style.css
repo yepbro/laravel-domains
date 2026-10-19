@@ -1,0 +1,326 @@
+/*
+ * style.css — стили операторского дашборда (ТЗД §6.5, T-130):
+ * тёмная «консоль», системные шрифты (внешних нет — ТЗД §3.2.2),
+ * табличные цифры для счётчиков. Без сборки: только этот файл,
+ * подключается страницей /assets/style.css (CSP style-src 'self', §6.3).
+ */
+
+:root {
+    --bg: #0e1116;
+    --panel: #151b23;
+    --panel-2: #1d2530;
+    --border: #2a3341;
+    --row-line: #202836;
+    --text: #d7dde7;
+    --muted: #8b96a5;
+    --accent: #f97316;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; padding: 0; }
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+/* ---------------------------------------------------------------- шапка */
+
+.topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 12px 20px;
+    background: rgba(14, 17, 22, 0.92);
+    border-bottom: 1px solid var(--border);
+}
+
+.topbar-title h1 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.topbar-title .hint { white-space: nowrap; }
+
+.topbar-status {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+
+.hint {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.conn { font-size: 12px; white-space: nowrap; }
+.conn::before {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: baseline;
+}
+.conn-ok { color: var(--ok); }
+.conn-ok::before { background: var(--ok); }
+.conn-wait { color: var(--warn); }
+.conn-wait::before { background: var(--warn); }
+.conn-err { color: var(--err); }
+.conn-err::before { background: var(--err); }
+
+.notice {
+    margin: 12px 20px 0;
+    padding: 10px 14px;
+    border: 1px solid var(--warn);
+    border-radius: 8px;
+    color: var(--warn);
+}
+
+/* ---------------------------------------------------------------- каркас */
+
+main { display: block; }
+
+section {
+    margin: 16px 20px;
+    padding: 14px 16px 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+
+section h2 {
+    margin: 0 0 10px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.footer {
+    margin: 24px 20px 20px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+/* ---------------------------------------------------------------- карточки */
+
+.cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin: 16px 20px;
+    padding: 0;
+    background: none;
+    border: none;
+}
+
+.card {
+    min-width: 0;
+    padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+
+.card-label {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.card-value {
+    margin-top: 2px;
+    font-size: 26px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.card-sub {
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+/* прогресс-бары: ширина .bar-fill задаётся из app.js через CSSOM
+   (el.style.width) — CSP style-src 'self' инлайн-стили не пускает,
+   а присвоение свойства CSP не блокирует */
+
+.bar {
+    height: 6px;
+    margin-top: 8px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--panel-2);
+}
+
+.bar-sm { height: 5px; margin: 6px 0 4px; }
+
+.bar-fill {
+    height: 100%;
+    width: 0;
+    background: var(--accent);
+    border-radius: inherit;
+}
+
+.pct {
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------- спарклайны */
+
+.spark {
+    display: block;
+    width: 100%;
+    height: 28px;
+    margin-top: 8px;
+}
+
+.spark-row { height: 20px; margin-top: 0; }
+
+.spark polyline {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1.5;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+    vector-effect: non-scaling-stroke;
+}
+
+/* ---------------------------------------------------------------- таблицы */
+
+.tbl-wrap { overflow-x: auto; }
+
+.tbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-variant-numeric: tabular-nums;
+}
+
+.tbl th {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 500;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.tbl td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--row-line);
+    white-space: nowrap;
+}
+
+.tbl tbody tr:last-child td { border-bottom: none; }
+
+.tbl .num { text-align: right; }
+
+.th-spark { width: 34%; }
+.th-progress { min-width: 140px; }
+
+.nd { color: var(--muted); }
+
+.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+}
+
+.hint-time { color: var(--muted); }
+
+/* ---------------------------------------------------------------- очереди (§5.4) */
+
+tr.q-warn td { background: rgba(210, 153, 34, 0.08); }
+tr.q-over td { background: rgba(248, 81, 73, 0.10); }
+
+.q-dead-nonzero { color: var(--err); font-weight: 600; }
+
+/* ---------------------------------------------------------------- зоны (§5.3) */
+
+.badge {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 12px;
+}
+
+.badge-on { background: rgba(63, 185, 80, 0.15); color: var(--ok); }
+.badge-off { background: rgba(139, 150, 165, 0.15); color: var(--muted); }
+
+/* ------------------------------------------------- статусы доменов (§5.5) */
+
+.statusbar {
+    display: flex;
+    height: 14px;
+    border-radius: 7px;
+    overflow: hidden;
+    background: var(--panel-2);
+}
+
+.statusbar .seg { height: 100%; min-width: 0; }
+
+.legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    margin-top: 10px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.legend .swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    margin-right: 6px;
+    vertical-align: -1px;
+}
+
+/* ------------------------------------------------------ чипы здоровья (§5.8) */
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--panel-2);
+}
+
+.chip .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--ok);
+}
+
+.chip.down { border-color: rgba(248, 81, 73, 0.5); }
+.chip.down .dot { background: var(--err); }
+
+/* ---------------------------------------------------------------- адаптив */
+
+@media (max-width: 720px) {
+    .cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 12px; }
+    section { margin: 12px; }
+    .topbar { padding: 10px 12px; }
+}

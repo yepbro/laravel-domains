@@ -4,8 +4,8 @@
 // с graceful stop по отмене ctx (прецедент жизненного цикла —
 // internal/web, T-121), авторизация Basic + cookie-сессия и защита от
 // подбора (ТЗД §7). Сборка снимков /api/status — T-129 (snapshot.go —
-// данные, collector.go — фоновый цикл), фронт — T-130, развёртывание —
-// T-131.
+// данные, collector.go — фоновый цикл), фронт — assets.go (T-130),
+// развёртывание — T-131.
 //
 // Каркас internal/service даёт один порт HTTP на сервис и вешает туда
 // /metrics с пробными эндпоинтами — выставлять его наружу нельзя
@@ -15,8 +15,8 @@
 //
 // Роуты (ТЗД §6.1):
 //
-//   - GET /            → HTML-страница дашборда (заглушка до T-130);
-//   - GET /assets/*    — статика фронта (заглушка до T-130);
+//   - GET /            → HTML-страница дашборда (assets/page.html);
+//   - GET /assets/*    — статика фронта из embed (app.js, style.css);
 //   - GET /api/status  — JSON последнего снимка (T-129): до первого
 //     успешного сбора — 503 (ТЗД §5.9);
 //   - GET /healthz     — readiness: ping PostgreSQL (503 при отказе);
@@ -208,30 +208,8 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 	}
 }
 
-// handleIndex — GET /: заглушка каркаса до фронта (T-130) — минимальная
-// страница-плейсхолдер за авторизацией (приёмка ТЗД §12 «порт
-// запрашивает пароль» работает уже на каркасе; браузер после входа
-// видит осмысленную страницу, а не пустоту). Данные снимка — /api/status
-// (T-129). Разметка дашборда — T-130.
-func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, `<!doctype html>
-<html lang="ru">
-<head><meta charset="utf-8"><title>Дашборд Domain Crawler</title></head>
-<body>
-<h1>Дашборд Domain Crawler</h1>
-<p>Интерфейс дашборда — T-130; данные снимка конвейера — <code>GET /api/status</code>.</p>
-</body>
-</html>
-`)
-}
-
-// handleAssets — GET /assets/*: статику фронта (js/css из go:embed)
-// отдаст T-130; до него маршрут зарегистрирован за авторизацией
-// (ТЗД §6.1) и честно отвечает 404 — файлов ещё нет.
-func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request) {
-	http.NotFound(w, r)
-}
+// handleIndex и handleAssets (страница и статика из embed) — assets.go
+// (T-130).
 
 // handleAPIStatus — GET /api/status: JSON последнего снимка (ТЗД §6.2):
 // секции зон/итогов/темпа/скоростей — как crawlerctl status --json

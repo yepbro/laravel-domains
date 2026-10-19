@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<!-- Период опроса /api/status в секундах (ТЗД §6.4 «каждые ~5 с»);
+     может отличаться от dashboard.refresh сервера: фронт показывает
+     последний готовый снимок, а не ждёт своей сборки. -->
+<meta name="dashboard-refresh" content="5">
+<title>Дашборд Domain Crawler</title>
+<link rel="stylesheet" href="/assets/style.css">
+<script src="/assets/app.js" defer></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-title">
+    <h1>Дашборд Domain Crawler</h1>
+    <span class="hint">опрос каждые <span id="refresh-secs">5</span> с · только наблюдение</span>
+  </div>
+  <div class="topbar-status">
+    <span id="conn" class="conn conn-wait">запуск…</span>
+    <span id="built-at" class="hint">снимок: н/д</span>
+  </div>
+</header>
+
+<noscript>
+  <div class="notice">Для работы дашборда нужен JavaScript: автообновление,
+  спарклайны и обработка повторного входа выполняются в браузере (ТЗД §6.4).</div>
+</noscript>
+
+<main>
+
+<!-- §5.1–5.2: сводка и скорость. Значения расставляет app.js из /api/status,
+     «н/д» — до первого снимка и для деградировавших секций (§5.9). -->
+<section class="cards" aria-label="Сводка конвейера">
+  <div class="card">
+    <div class="card-label">Всего доменов</div>
+    <div class="card-value" id="v-total">н/д</div>
+    <div class="card-sub">по всем зонам</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Проверено</div>
+    <div class="card-value" id="v-checked">н/д</div>
+    <div class="card-sub" id="v-checked-sub">—</div>
+    <div class="bar"><div class="bar-fill" id="bar-checked"></div></div>
+  </div>
+  <div class="card">
+    <div class="card-label">В работе</div>
+    <div class="card-value" id="v-inwork">н/д</div>
+    <div class="card-sub">pending + queued</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Дом./с</div>
+    <div class="card-value" id="v-dps">н/д</div>
+    <div class="card-sub">окно суток</div>
+    <svg class="spark" id="spark-dps" viewBox="0 0 120 28" preserveAspectRatio="none"
+         role="img" aria-label="спарклайн доменов в секунду"><polyline vector-effect="non-scaling-stroke"/></svg>
+  </div>
+  <div class="card">
+    <div class="card-label">HTTP-рез./с</div>
+    <div class="card-value" id="v-rps">н/д</div>
+    <div class="card-sub">окно часа</div>
+    <svg class="spark" id="spark-rps" viewBox="0 0 120 28" preserveAspectRatio="none"
+         role="img" aria-label="спарклайн HTTP-результатов в секунду"><polyline vector-effect="non-scaling-stroke"/></svg>
+  </div>
+  <div class="card">
+    <div class="card-label">Ренд./с</div>
+    <div class="card-value" id="v-renders">н/д</div>
+    <div class="card-sub">окно часа</div>
+    <svg class="spark" id="spark-renders" viewBox="0 0 120 28" preserveAspectRatio="none"
+         role="img" aria-label="спарклайн рендеров в секунду"><polyline vector-effect="non-scaling-stroke"/></svg>
+  </div>
+  <div class="card">
+    <div class="card-label">ETA цикла</div>
+    <div class="card-value" id="v-eta">н/д</div>
+    <div class="card-sub" id="v-eta-sub">остаток первого цикла: н/д</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Laravel-находок</div>
+    <div class="card-value" id="v-laravel">н/д</div>
+    <div class="card-sub" id="v-laravel-sub">за 24 ч: н/д</div>
+  </div>
+</section>
+
+<!-- §5.4: пять стримов; подсветка приближения суммы рабочих глубин
+     к watermark и ненулевого q:dead — app.js. -->
+<section>
+  <h2>Очереди <span class="hint" id="queue-hint"></span></h2>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Стрим</th>
+          <th class="num">Глубина</th>
+          <th class="th-spark">История (окно ~10 мин)</th>
+        </tr>
+      </thead>
+      <tbody id="queues-body">
+        <tr><td colspan="3" class="nd">н/д</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- §5.3: зоны с прогресс-барами; punycode — имя, unicode — подсказка. -->
+<section>
+  <h2>Зоны</h2>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Зона</th>
+          <th>Активность</th>
+          <th class="num">Всего</th>
+          <th class="num">Проверено</th>
+          <th class="th-progress">Прогресс</th>
+          <th class="num">pending</th>
+          <th class="num">queued</th>
+          <th class="num">done</th>
+        </tr>
+      </thead>
+      <tbody id="zones-body">
+        <tr><td colspan="8" class="nd">н/д</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- §5.5: полоса-легенда распределения статусов со счётчиками. -->
+<section>
+  <h2>Статусы доменов</h2>
+  <div class="statusbar" id="statusbar"></div>
+  <div class="legend" id="statuslegend"></div>
+</section>
+
+<!-- §5.6: последние Laravel-находки. -->
+<section>
+  <h2>Последние находки Laravel</h2>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Домен</th>
+          <th>Зона</th>
+          <th class="num">score</th>
+          <th>Версии</th>
+          <th>Обновлён</th>
+        </tr>
+      </thead>
+      <tbody id="laravel-body">
+        <tr><td colspan="5" class="nd">н/д</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- §5.7: последние ingest-файлы. -->
+<section>
+  <h2>Последние ingest-файлы</h2>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Файл</th>
+          <th>Действие</th>
+          <th class="num">Строк</th>
+          <th class="num">Добавлено</th>
+          <th class="num">Уже было</th>
+          <th class="num">Удалено</th>
+          <th class="num">Отклонено</th>
+          <th>Обработан</th>
+        </tr>
+      </thead>
+      <tbody id="ingest-body">
+        <tr><td colspan="8" class="nd">н/д</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- §5.8: чипы здоровья сервисов (dashboard.probes). -->
+<section>
+  <h2>Здоровье сервисов</h2>
+  <div class="chips" id="health"><span class="nd">н/д</span></div>
+</section>
+
+</main>
+
+<footer class="footer">Domain Crawler — внутренний операторский дашборд,
+данные read-only из снимка конвейера; исторические графики — в Prometheus.</footer>
+
+</body>
+</html>
