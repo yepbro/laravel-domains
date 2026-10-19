@@ -99,6 +99,58 @@ func TestAlertsBadHashesThreshold(t *testing.T) {
 	t.Fatal("алерт не снят после старения окна без новых мусорных строк")
 }
 
+// TestBadHashesWindow — размер кольца дельт: окно ровно 15 значений —
+// всплеск удерживается суммой до вытеснения последней (15-й) нулевой
+// дельтой. Размер pinned литералом в начале: граница из константы
+// мутировалась бы вместе с тестом и «следовала» за мутантом. Шаг записи
+// отдельно не фиксируется: любой взаимно простой с длиной шаг даёт то же
+// множество последних дельт (см. аннотацию в push).
+func TestBadHashesWindow(t *testing.T) {
+	if AlertBadHashesWindow != 15 {
+		t.Fatalf("AlertBadHashesWindow = %d, want 15 (окно 15 минут)", AlertBadHashesWindow)
+	}
+	w := &badHashesWindow{}
+	if sum := w.push(0); sum != 0 {
+		t.Fatalf("первое наблюдение (база): сумма = %d, want 0", sum)
+	}
+	if sum := w.push(10); sum != 10 {
+		t.Fatalf("всплеск +10: сумма = %d, want 10", sum)
+	}
+	// Окно 15: всплеск держится, пока 14 последующих дельт не вытеснили
+	// его из кольца (без роста счётчика дельты нулевые).
+	for i := 1; i <= AlertBadHashesWindow-1; i++ {
+		if sum := w.push(10); sum != 10 {
+			t.Fatalf("после %d нулевых дельт: сумма = %d, want 10 (окно ещё держит)", i, sum)
+		}
+	}
+	// 15-я нулевая дельта перезаписывает ячейку всплеска — сумма 0.
+	if sum := w.push(10); sum != 0 {
+		t.Fatalf("окно освободилось: сумма = %d, want 0", sum)
+	}
+}
+
+// TestAlertsBadHashesExactThreshold — сумма ровно AlertBadHashesThreshold —
+// уже всплеск (≥, не «строго больше»); деталь называет окно — 15 проходов
+// дефолтного интервала 60с = 15 минут.
+func TestAlertsBadHashesExactThreshold(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	src := &fakeBadHashes{}
+	env.deps.BadHashes = src
+
+	src.set(0)
+	snapshotOf(t, env.Pass(context.Background()), AlertBadHashes) // база
+	src.set(10)                                                   // одна дельта ровно 10
+	s := snapshotOf(t, env.Pass(context.Background()), AlertBadHashes)
+	if s.Status != AlertStatusFiring {
+		t.Fatalf("сумма ровно 10: статус = %s (%s), want firing", s.Status, s.Detail)
+	}
+	for _, want := range []string{"15m0s", "10"} { // окно 15 × 60с, порог
+		if !strings.Contains(s.Detail, want) {
+			t.Errorf("detail %q не содержит %s", s.Detail, want)
+		}
+	}
+}
+
 // TestAlertsBadHashesRestart — рестарт ingest обнуляет счётчик: убывание
 // даёт нулевую дельту, ложного всплеска нет (счётчик считается заново).
 func TestAlertsBadHashesRestart(t *testing.T) {

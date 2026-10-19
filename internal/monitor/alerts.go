@@ -270,14 +270,25 @@ func (w OSWear) Wear(ctx context.Context) ([]NVMeWear, error) {
 		return nil, err
 	}
 	sysfs := w.SysFS
+	// Дефолт «/sys» живёт только на боевом хосте: юнит-тесты всегда задают
+	// SysFS каталогом, а чтение настоящего /sys негерметично (набор
+	// устройств зависит от железа).
+	// mutator-disable-next-line branch/if
 	if sysfs == "" {
+		// mutator-disable-next-line statement/remove
 		sysfs = "/sys"
 	}
 	devfs := w.DevFS
+	// Дефолт «/dev» — как у sysfs выше.
+	// mutator-disable-next-line branch/if
 	if devfs == "" {
+		// mutator-disable-next-line statement/remove
 		devfs = "/dev"
 	}
 	names, err := filepath.Glob(filepath.Join(sysfs, "class", "nvme", "nvme*"))
+	// Glob с фиксированным валидным шаблоном ошибок не возвращает (только
+	// malformed pattern) — ветка недостижима, тестом не убить.
+	// mutator-disable-next-line branch/if
 	if err != nil {
 		return nil, fmt.Errorf("NVMe: обзор %s: %w", sysfs, err)
 	}
@@ -347,12 +358,19 @@ type nvmeAdminCmd struct {
 }
 
 // compile-time: размер структуры договаривается с константой ioctl-номера
-// (номер кодирует size=72).
+// (номер кодирует size=72). Мутант [2]struct{}{} тоже компилируется и
+// поведением не наблюдаем — compile-time проверка.
+// mutator-disable-next-line numbers/incrementer
 var _ = [1]struct{}{}[unsafe.Sizeof(nvmeAdminCmd{})-nvmeAdminCmdSize]
 
 // wearOf читает износ одного устройства: открывает char-узел контроллера
 // /dev/nvmeX (O_RDWR — ioctl admin требует записи) и забирает страницу
 // health одним NVME_IOCTL_ADMIN_CMD. Декодирование — parseHealthLog.
+//
+// mutator-disable-func — аппаратный passthrough: ioctl к /dev/nvme*
+// исполняется только на боевом хосте; в CI-контейнере устройство не
+// проброшено (юнит-тесты доходят лишь до отказа открытия, а значения
+// возврата при ошибке игнорирует единственный вызывающий).
 func wearOf(devPath string) (percent int, unitsWritten uint64, err error) {
 	// O_RDWR: ioctl admin-команды требуют доступа на запись к узлу —
 	// контейнер без проброса устройства получит EPERM/ENOENT (деградация).
@@ -400,6 +418,13 @@ func parseHealthLog(page []byte) (percent int, unitsWritten uint64, err error) {
 	if len(page) < nvmeHealthLogSize {
 		return 0, 0, fmt.Errorf("NVMe: страница health короче %d байт: %d", nvmeHealthLogSize, len(page))
 	}
+	// Эквивалентен только мутант конца среза page[48:57]: Uint64 читает
+	// первые 8 байт, девятый не влияет. Аннотация действует на строку
+	// целиком и заодно подавляет killable-мутанты page[5]→[6] и
+	// page[49:56] — оба остаются закрытыми утверждениями
+	// TestParseHealthLog; точечный инструмент (блэклист чексумм) отвергнут
+	// как хрупкий (docs/mutation-testing.md §4).
+	// mutator-disable-next-line numbers/incrementer
 	return int(page[5]), binary.LittleEndian.Uint64(page[48:56]), nil
 }
 
@@ -563,6 +588,8 @@ func (w *badHashesWindow) push(cur int64) int64 {
 	var d int64
 	if !w.seen {
 		w.seen = true // база: накопленное до старта мониторинга не считается
+		// Эквивалентный мутант: при cur == prev обе ветви дают дельту 0.
+		// mutator-disable-next-line expression/comparison
 	} else if cur > w.prev {
 		d = cur - w.prev
 	}
@@ -571,6 +598,10 @@ func (w *badHashesWindow) push(cur int64) int64 {
 		w.deltas = make([]int64, AlertBadHashesWindow)
 	}
 	w.deltas[w.i] = d
+	// Эквивалентный мутант шага +2: 2 взаимно просто с длиной окна 15 —
+	// кольцо в обоих случаях содержит последние 15 дельт, сумма окна
+	// неотличима тестом.
+	// mutator-disable-next-line numbers/incrementer
 	w.i = (w.i + 1) % len(w.deltas)
 	var sum int64
 	for _, d := range w.deltas {
@@ -623,6 +654,11 @@ func (a *Alerts) evaluators() []alertEval {
 		{AlertBadHashes, a.evalBadHashes},
 	}
 }
+
+// mutator-disable-regexp a\.log\.Debug\("проход statement/remove
+// mutator-disable-regexp a\.log\.Info\("цикл statement/remove
+// Обоснование: служебные записи цикла (итог прохода Debug, старт Info) —
+// поведение алертов не меняют, гасятся по docs/mutation-testing.md §4.
 
 // Pass выполняет один проход: оценивает все алерты (ошибка источника
 // одного не останавливает остальные), логирует переходы, отдаёт снапшот
@@ -778,6 +814,9 @@ func (a *Alerts) evalQueues(ctx context.Context, prev string) verdict {
 	// значение — первый стрим: при всех нулях (простаивающие очереди)
 	// деталь называет стрим, а не пустую строку.
 	maxStream, maxLen := alertStreams[0], lens[alertStreams[0]]
+	// Эквивалентный мутант alertStreams[0:]: первый элемент не превосходит
+	// сам себя (старт максимума), итог не меняется.
+	// mutator-disable-next-line numbers/decrementer
 	for _, s := range alertStreams[1:] {
 		if lens[s] > maxLen {
 			maxStream, maxLen = s, lens[s]
@@ -881,6 +920,9 @@ func (a *Alerts) evalWear(ctx context.Context, _ string) verdict {
 	// Худший по износу; старт — первое устройство, а не нулевое значение:
 	// новый накопитель (0 %) оставил бы пустое имя в детали.
 	worst := wears[0]
+	// Эквивалентный мутант wears[0:]: первый элемент не превосходит сам
+	// себя (старт максимума), итог не меняется.
+	// mutator-disable-next-line numbers/decrementer
 	for _, w := range wears[1:] {
 		if w.PercentUsed > worst.PercentUsed {
 			worst = w

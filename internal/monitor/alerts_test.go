@@ -1,10 +1,13 @@
 // Юнит-тесты алертов мониторинга (T-080, ТЗ 5.9, 8, 10.3) на фейковых
 // источниках: пул pgx (доля temp_error, zones.updated_at), XLEN стримов,
 // statfs каталога контента, износ NVMe. Покрыты: контракты SQL, пороги и
-// гистерезис, минимум выборки, деградация SMART в контейнере (без Warn и
-// без ложного срабатывания), ошибки источников (Warn, цикл живёт),
-// фронтовые записи лога, хук OnPass, цикл AlertsLoop. Реальное чтение
-// SMART — за устройствами, поведение против живой БД — test/integration.
+// гистерезис на точных границах (включение/снятие, минимум выборки,
+// фактор остановки, окно мусорных хешей, формат байтов), деградации
+// источников всех форм (ошибка запроса, пустой ответ, ошибка чтения,
+// ошибка итерации — Warn, цикл живёт), деградация SMART в контейнере
+// (без Warn и без ложного срабатывания), фронтовые записи лога, хук
+// OnPass, цикл AlertsLoop. Реальное чтение SMART — за устройствами,
+// поведение против живой БД — test/integration.
 package monitor
 
 import (
@@ -50,6 +53,12 @@ type alertsPool struct {
 	shareErrs []error
 	freshErrs []error
 
+	// Деградации формы ответа: без строк (rows.Next ложен), строка с
+	// нечитаемыми типами (ошибка Scan), ошибка итерации (rows.Err).
+	shareEmpty, shareBadRow    bool
+	freshEmpty, freshBadRow    bool
+	shareRowsErr, freshRowsErr error
+
 	queries []zonestatsCall // переиспользован: sql + args
 }
 
@@ -70,22 +79,34 @@ func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Row
 		if err := popErr(&p.shareErrs); err != nil {
 			return nil, err
 		}
+		if p.shareEmpty {
+			return &alertRows{err: p.shareRowsErr}, nil
+		}
+		if p.shareBadRow {
+			return &alertRows{rows: [][]any{{"байты", "байты"}}, err: p.shareRowsErr}, nil
+		}
 		s := alertShare{}
 		if len(p.share) > 0 {
 			s = p.share[0]
 			p.share = p.share[1:]
 		}
-		return alertRowsOf([]any{s.temp, s.total}), nil
+		return &alertRows{rows: [][]any{{s.temp, s.total}}, err: p.shareRowsErr}, nil
 	case zoneFreshSQL:
 		if err := popErr(&p.freshErrs); err != nil {
 			return nil, err
+		}
+		if p.freshEmpty {
+			return &alertRows{err: p.freshRowsErr}, nil
+		}
+		if p.freshBadRow {
+			return &alertRows{rows: [][]any{{"байты"}}, err: p.freshRowsErr}, nil
 		}
 		t := sql.NullTime{}
 		if len(p.fresh) > 0 {
 			t = p.fresh[0]
 			p.fresh = p.fresh[1:]
 		}
-		return alertRowsOf([]any{t}), nil
+		return &alertRows{rows: [][]any{{t}}, err: p.freshRowsErr}, nil
 	default:
 		return nil, fmt.Errorf("alertsPool: неожидаемый SQL Query: %s", sqlQ)
 	}
@@ -111,16 +132,15 @@ func (p *alertsPool) calls() []zonestatsCall {
 
 // alertRows — pgx.Rows с заготовленными строками (Scan позиционный; типы
 // int64/sql.NullTime — всё, что читают алерты). Стиль statusRows
-// (cmd/crawlerctl/status_test.go).
+// (cmd/crawlerctl/status_test.go). err — ответ rows.Err (nil по умолчанию).
 type alertRows struct {
 	rows [][]any
 	i    int
+	err  error
 }
 
-func alertRowsOf(rows ...[]any) *alertRows { return &alertRows{rows: rows} }
-
 func (r *alertRows) Close()                                       {}
-func (r *alertRows) Err() error                                   { return nil }
+func (r *alertRows) Err() error                                   { return r.err }
 func (r *alertRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (r *alertRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *alertRows) Values() ([]any, error)                       { return r.rows[r.i-1], nil }
@@ -348,6 +368,7 @@ func TestAlertsDNSHysteresis(t *testing.T) {
 	}{
 		{alertShare{300, 1000}, AlertStatusFiring}, // 30.0 % — включение
 		{alertShare{250, 1000}, AlertStatusFiring}, // 25.0 % — коридор гистерезиса
+		{alertShare{200, 1000}, AlertStatusFiring}, // ровно 20.0 % — удержание (граница снятия)
 		{alertShare{199, 1000}, AlertStatusOK},     // 19.9 % — снятие
 		{alertShare{250, 1000}, AlertStatusOK},     // 25 % без сработавшего алерта — не включается
 	}
@@ -365,7 +386,8 @@ func TestAlertsDNSHysteresis(t *testing.T) {
 }
 
 // TestAlertsDNSMinSamples — пустое окно (меньше 100 проверок за сутки):
-// доля не показательна — «не измеряется», не срабатывание.
+// доля не показательна — «не измеряется», не срабатывание. Ровно 100 —
+// уже показательна: граница строгая (меньше, не «не больше»).
 func TestAlertsDNSMinSamples(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	env.pool.share = []alertShare{{temp: 2, total: 50}}
@@ -376,6 +398,13 @@ func TestAlertsDNSMinSamples(t *testing.T) {
 	}
 	if !strings.Contains(s.Detail, "50") || !strings.Contains(s.Detail, "100") {
 		t.Errorf("detail %q без чисел выборки", s.Detail)
+	}
+
+	// Ровно порог выборки — доля считается (0 из 100 — корректный ноль).
+	env.pool.share = []alertShare{{temp: 0, total: 100}}
+	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "из 100") {
+		t.Errorf("ровно 100 проверок: статус = %s (%s), want ok с долей по 100", s.Status, s.Detail)
 	}
 }
 
@@ -390,6 +419,9 @@ func TestAlertsDNSSourceError(t *testing.T) {
 	if s.Status != AlertStatusNotMeasured {
 		t.Fatalf("статус = %s, want not_measured", s.Status)
 	}
+	if !strings.Contains(s.Detail, "бд недоступна") {
+		t.Errorf("detail = %q, want причина ошибки источника", s.Detail)
+	}
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "бд недоступна") {
 		t.Errorf("ошибка источника без Warn:\n%s", env.buf.String())
 	}
@@ -397,6 +429,36 @@ func TestAlertsDNSSourceError(t *testing.T) {
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
 	if s.Status != AlertStatusOK {
 		t.Errorf("после ошибки статус = %s, want ok (цикл живёт)", s.Status)
+	}
+}
+
+// TestAlertsDNSSourceErrors — деградации формы ответа: пустой результат
+// (нет строк), нечитаемая строка (ошибка Scan), ошибка итерации (rows.Err)
+// — ошибки источника с Warn и причиной в detail, не молчаливое «мало
+// данных» по нулям.
+func TestAlertsDNSSourceErrors(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	env.pool.shareEmpty = true
+	s := snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "пустой ответ") {
+		t.Errorf("пустой ответ: статус = %s (%s), want not_measured «пустой ответ»", s.Status, s.Detail)
+	}
+	if !strings.Contains(env.buf.String(), "level=WARN") {
+		t.Errorf("пустой ответ без Warn:\n%s", env.buf.String())
+	}
+
+	env = newAlertsTestEnv(t, nil)
+	env.pool.shareBadRow = true
+	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "чтение") {
+		t.Errorf("ошибка Scan: статус = %s (%s), want not_measured «чтение»", s.Status, s.Detail)
+	}
+
+	env = newAlertsTestEnv(t, nil)
+	env.pool.shareRowsErr = errors.New("соединение сброшено")
+	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "соединение сброшено") {
+		t.Errorf("rows.Err: статус = %s (%s), want not_measured с ошибкой итерации", s.Status, s.Detail)
 	}
 }
 
@@ -417,6 +479,7 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 		{map[string]int64{queue.StreamDNS: 999}, AlertStatusOK},      // ниже порога
 		{map[string]int64{queue.StreamDNS: 1000}, AlertStatusFiring}, // порог гейта
 		{map[string]int64{queue.StreamHTTP: 950}, AlertStatusFiring}, // коридор гистерезиса
+		{map[string]int64{queue.StreamHTTP: 900}, AlertStatusFiring}, // ровно 90 % порога — удержание
 		{map[string]int64{queue.StreamHTTP: 899}, AlertStatusOK},     // ниже 90 %
 	}
 	for i, s := range steps {
@@ -425,9 +488,26 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 		if got.Status != s.want {
 			t.Errorf("шаг %d (%v): статус = %s (%s), want %s", i, s.lens, got.Status, got.Detail, s.want)
 		}
+		// Коридор гистерезиса (нет горячего стрима): деталь называет
+		// удерживающий стрим и глубину, а не пустую строку порога.
+		if i == 3 && !strings.Contains(got.Detail, "q:http=950") {
+			t.Errorf("коридор гистерезиса: detail = %q, want q:http=950", got.Detail)
+		}
 		if i == 0 && !strings.Contains(got.Detail, "q:dns=0") {
 			t.Errorf("пустые очереди: detail = %q, want макс q:dns=0 (имя стрима, не пустота)", got.Detail)
 		}
+	}
+
+	// Деталь «ok» — максимум среди рабочих стримов: обновление в цикле
+	// (лидер не первый стрим) и стартовое значение (лидер первый стрим
+	// читается из карты, а не нулём соседа).
+	env.lener.lens = map[string]int64{queue.StreamDNS: 3}
+	if s := snapshotOf(t, env.Pass(ctx), AlertQueueOverflow); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "макс q:dns=3") {
+		t.Errorf("максимум q:dns: %s (%s), want ok макс q:dns=3", s.Status, s.Detail)
+	}
+	env.lener.lens = map[string]int64{queue.StreamHTTP: 5}
+	if s := snapshotOf(t, env.Pass(ctx), AlertQueueOverflow); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "макс q:http=5") {
+		t.Errorf("максимум q:http: %s (%s), want ok макс q:http=5", s.Status, s.Detail)
 	}
 
 	for _, s := range env.lener.streams() {
@@ -455,6 +535,13 @@ func TestAlertsQueuesNotConfigured(t *testing.T) {
 	env.deps.Redis = nil
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertQueueOverflow); s.Status != AlertStatusNotMeasured {
 		t.Errorf("без Redis: статус = %s, want not_measured", s.Status)
+	}
+
+	// Порог 1 — минимальный валидный watermark (стрим длиной 1), а не
+	// «не задан»: алерт измеряется.
+	env = newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 1 })
+	if s := snapshotOf(t, env.Pass(context.Background()), AlertQueueOverflow); s.Status != AlertStatusOK {
+		t.Errorf("watermark 1: статус = %s (%s), want ok — порог валиден", s.Status, s.Detail)
 	}
 }
 
@@ -488,6 +575,19 @@ func TestAlertsStallThreshold(t *testing.T) {
 		t.Errorf("60с: статус = %s (%s), want ok", s.Status, s.Detail)
 	}
 
+	// Между 4 и 5 периодами (250с при пороге 5×60с) — ок: фиксирует
+	// фактор порога, а не «какой-то из соседних».
+	env.pool.fresh = []sql.NullTime{{Time: now.Add(-250 * time.Second), Valid: true}}
+	if s := snapshotOf(t, env.Pass(ctx), AlertProgressStall); s.Status != AlertStatusOK {
+		t.Errorf("250с: статус = %s (%s), want ok (порог 5, не 4 периода)", s.Status, s.Detail)
+	}
+
+	// Ровно порог (300с = 5 × 60с) — ещё не остановка: строго больше.
+	env.pool.fresh = []sql.NullTime{{Time: now.Add(-5 * time.Minute), Valid: true}}
+	if s := snapshotOf(t, env.Pass(ctx), AlertProgressStall); s.Status != AlertStatusOK {
+		t.Errorf("ровно 300с: статус = %s (%s), want ok", s.Status, s.Detail)
+	}
+
 	env.pool.fresh = []sql.NullTime{{Time: now.Add(-301 * time.Second), Valid: true}}
 	s := snapshotOf(t, env.Pass(ctx), AlertProgressStall)
 	if s.Status != AlertStatusFiring {
@@ -502,6 +602,42 @@ func TestAlertsStallThreshold(t *testing.T) {
 	env.pool.fresh = []sql.NullTime{{}}
 	if s := snapshotOf(t, env.Pass(ctx), AlertProgressStall); s.Status != AlertStatusNotMeasured {
 		t.Errorf("без зон: статус = %s, want not_measured", s.Status)
+	}
+}
+
+// TestAlertsStallSourceErrors — деградации источника свежести: ошибка
+// запроса, пустой ответ, нечитаемая строка, ошибка итерации — Warn и
+// «не измеряется» с причиной, цикл алертов жив.
+func TestAlertsStallSourceErrors(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	env.pool.freshErrs = []error{errors.New("бд недоступна")}
+	s := snapshotOf(t, env.Pass(context.Background()), AlertProgressStall)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "бд недоступна") {
+		t.Errorf("ошибка запроса: статус = %s (%s), want not_measured с ошибкой", s.Status, s.Detail)
+	}
+	if !strings.Contains(env.buf.String(), "level=WARN") {
+		t.Errorf("ошибка запроса без Warn:\n%s", env.buf.String())
+	}
+
+	env = newAlertsTestEnv(t, nil)
+	env.pool.freshEmpty = true
+	s = snapshotOf(t, env.Pass(context.Background()), AlertProgressStall)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "пустой ответ") {
+		t.Errorf("пустой ответ: статус = %s (%s), want not_measured «пустой ответ»", s.Status, s.Detail)
+	}
+
+	env = newAlertsTestEnv(t, nil)
+	env.pool.freshBadRow = true
+	s = snapshotOf(t, env.Pass(context.Background()), AlertProgressStall)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "чтение") {
+		t.Errorf("ошибка Scan: статус = %s (%s), want not_measured «чтение»", s.Status, s.Detail)
+	}
+
+	env = newAlertsTestEnv(t, nil)
+	env.pool.freshRowsErr = errors.New("соединение сброшено")
+	s = snapshotOf(t, env.Pass(context.Background()), AlertProgressStall)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "соединение сброшено") {
+		t.Errorf("rows.Err: статус = %s (%s), want not_measured с ошибкой итерации", s.Status, s.Detail)
 	}
 }
 
@@ -537,6 +673,20 @@ func TestAlertsDiskThreshold(t *testing.T) {
 	env.space.stat = SpaceStat{Avail: 5 << 30, Total: 100 << 30} // ровно порог — не меньше
 	if s := snapshotOf(t, env.Pass(ctx), AlertDiskFree); s.Status != AlertStatusOK {
 		t.Errorf("ровно порог: статус = %s (%s), want ok", s.Status, s.Detail)
+	}
+
+	// Порог 1 % — минимальный валидный контроль, не «выключен».
+	env = newAlertsTestEnv(t, func(o *AlertsOptions) { o.DiskFreePercent = 1 })
+	if s := snapshotOf(t, env.Pass(ctx), AlertDiskFree); s.Status != AlertStatusOK {
+		t.Errorf("порог 1%%: статус = %s (%s), want ok — контроль включён", s.Status, s.Detail)
+	}
+
+	// Множитель 100: свободно 100 из 10100 байт — 0.99… % < 1 — алерт;
+	// 101·Avail/Total дало бы ровно 1.0 % и сняло алерт.
+	env = newAlertsTestEnv(t, func(o *AlertsOptions) { o.DiskFreePercent = 1 })
+	env.space.stat = SpaceStat{Avail: 100, Total: 10100}
+	if s := snapshotOf(t, env.Pass(ctx), AlertDiskFree); s.Status != AlertStatusFiring {
+		t.Errorf("100 из 10100 байт: статус = %s (%s), want firing (0.99%% < 1%%)", s.Status, s.Detail)
 	}
 }
 
@@ -602,6 +752,25 @@ func TestAlertsNVMeWear(t *testing.T) {
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "nvme0") || !strings.Contains(s.Detail, "0%") {
 		t.Errorf("0%%: статус = %s (%s), want ok с именем nvme0", s.Status, s.Detail)
 	}
+
+	// Пустой список (источник жив, устройств нет) — «не измеряется»,
+	// не паника на первом элементе.
+	env.wear.wears = nil
+	s = snapshotOf(t, env.Pass(context.Background()), AlertNVMeWear)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "не найдены") {
+		t.Errorf("без устройств: статус = %s (%s), want not_measured", s.Status, s.Detail)
+	}
+
+	// Равный износ двух устройств: худший — первое (замена строго на
+	// «больше», не «не меньше»).
+	env.wear.wears = []NVMeWear{
+		{Device: "nvme0", PercentUsed: 50},
+		{Device: "nvme1", PercentUsed: 50},
+	}
+	s = snapshotOf(t, env.Pass(context.Background()), AlertNVMeWear)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "nvme0: использовано 50%") {
+		t.Errorf("равный износ: %s (%s), want ok по первому nvme0", s.Status, s.Detail)
+	}
 }
 
 // TestAlertsNVMeDegradationQuiet — SMART недоступен (контейнер): «не
@@ -630,11 +799,20 @@ func TestAlertsTransitionsLogging(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 
-	// Три прохода: срабатывание, снятие, устойчивое «ok» (тихий).
-	env.pool.share = []alertShare{{temp: 500, total: 1000}, {temp: 0, total: 1000}, {temp: 0, total: 1000}}
+	// Четыре прохода: срабатывание, устойчивое срабатывание (тихо),
+	// снятие, устойчивое «ok» (тихо).
+	env.pool.share = []alertShare{{temp: 500, total: 1000}, {temp: 500, total: 1000}, {temp: 0, total: 1000}, {temp: 0, total: 1000}}
 	env.Pass(ctx) // срабатывание
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "АЛЕРТ: рост доли ошибок DNS") {
 		t.Errorf("срабатывание без Warn-записи:\n%s", env.buf.String())
+	}
+
+	// Устойчивое срабатывание — тихо: сигнал фронтовой, повторный Warn
+	// в том же состоянии не пишется.
+	beforeHold := env.buf.String()
+	env.Pass(ctx)
+	if delta := env.buf.String()[len(beforeHold):]; strings.Contains(delta, "level=WARN") || strings.Contains(delta, "АЛЕРТ") {
+		t.Errorf("устойчивое срабатывание повторило Warn:\n%s", delta)
 	}
 
 	env.Pass(ctx) // снятие
@@ -702,15 +880,29 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 	}
 }
 
-// TestAlertsOptionsDefaults — нулевые периоды — дефолты; NewAlerts
-// подставляет реализации ОС для пустых Space/Wear и дефолтные часы.
+// TestAlertsOptionsDefaults — нулевые и отрицательные периоды — дефолты;
+// единичные (1нс) — валидные значения, не затираются (граница «≤ 0»);
+// NewAlerts подставляет реализации ОС для пустых Space/Wear и дефолтные
+// часы.
 func TestAlertsOptionsDefaults(t *testing.T) {
 	o := (AlertsOptions{}).withDefaults()
-	if o.Interval != DefaultAlertsInterval {
-		t.Errorf("Interval = %v, want %v", o.Interval, DefaultAlertsInterval)
+	// Литерал 60s, а не DefaultAlertsInterval: сравнение с константой
+	// мутируется вместе с ней (59/61 с должны ловиться здесь).
+	if o.Interval != 60*time.Second {
+		t.Errorf("Interval = %v, want 60s", o.Interval)
 	}
 	if o.ZoneStatsInterval != DefaultZoneStatsInterval {
 		t.Errorf("ZoneStatsInterval = %v, want %v", o.ZoneStatsInterval, DefaultZoneStatsInterval)
+	}
+
+	neg := AlertsOptions{Interval: -time.Second, ZoneStatsInterval: -time.Second}.withDefaults()
+	if neg.Interval != 60*time.Second || neg.ZoneStatsInterval != DefaultZoneStatsInterval {
+		t.Errorf("отрицательные периоды: %+v, want дефолты", neg)
+	}
+
+	one := AlertsOptions{Interval: 1, ZoneStatsInterval: 1}.withDefaults()
+	if one.Interval != 1 || one.ZoneStatsInterval != 1 {
+		t.Errorf("единичные периоды затёрты: %+v, want как заданы", one)
 	}
 
 	got := AlertsOptions{Interval: 30 * time.Second, ZoneStatsInterval: 45 * time.Second}.withDefaults()
@@ -732,15 +924,17 @@ func TestAlertsOptionsDefaults(t *testing.T) {
 
 // --- источники ОС ---------------------------------------------------------------
 
-// TestOSStatfsSpace — реальный statfs временного каталога: ёмкость видна;
-// несуществующий каталог — ошибка (не паника).
+// TestOSStatfsSpace — реальный statfs временного каталога: ёмкость видна
+// в байтах (умножение блоков на Bsize — деление давало бы доли мегабайта
+// даже на многогигабайтных томах CI); несуществующий каталог — ошибка
+// (не паника).
 func TestOSStatfsSpace(t *testing.T) {
 	sp, err := OSStatfs{}.Space(t.TempDir())
 	if err != nil {
 		t.Fatalf("Space: %v", err)
 	}
-	if sp.Total == 0 || sp.Avail == 0 {
-		t.Errorf("статистика пустая: %+v", sp)
+	if sp.Total < 1<<20 || sp.Avail < 1<<20 {
+		t.Errorf("статистика без умножения на Bsize (блоки вместо байт): %+v", sp)
 	}
 	if _, err := (OSStatfs{}).Space(filepath.Join(t.TempDir(), "нет-такого")); err == nil {
 		t.Error("несуществующий каталог: ошибки нет")
@@ -765,8 +959,12 @@ func TestParseHealthLog(t *testing.T) {
 	if units != 195_312_500 {
 		t.Errorf("data units written = %d, want 195312500 (байты 48–63 LE)", units)
 	}
-	if tbw := nvmeTBW(NVMeWear{DataUnitsWritten: units}); tbw < 99.9 || tbw > 100.1 {
-		t.Errorf("TBW = %.1f, want ≈100 ТБ", tbw)
+	// ТБ ровно 100.0: произведение и деление точны в float64 (195312500 ×
+	// 512000 = 1e14 < 2^53, частное 100 представимо точно) — мутации
+	// коэффициентов (±1 на единицу записи, ±1 на триллион) ловятся
+	// точным равенством.
+	if tbw := nvmeTBW(NVMeWear{DataUnitsWritten: units}); tbw != 100 {
+		t.Errorf("TBW = %v, want ровно 100 ТБ", tbw)
 	}
 
 	// Новый накопитель: нулевой износ декодируется как есть.
@@ -782,8 +980,26 @@ func TestParseHealthLog(t *testing.T) {
 		t.Errorf("износ >100%% = %d, want 253", percent)
 	}
 
-	if _, _, err := parseHealthLog(page[:nvmeHealthLogSize-1]); err == nil {
+	// Размер страницы фиксирован протоколом — 512 байт: литералы (не
+	// константа — она мутируется вместе с проверкой): 512 разбирается,
+	// 511 — уже короткая страница.
+	full := make([]byte, 512)
+	full[5] = 7
+	binary.LittleEndian.PutUint64(full[48:56], 9)
+	if percent, u, err := parseHealthLog(full); err != nil || percent != 7 || u != 9 {
+		t.Errorf("страница 512 байт: (%d, %d, %v), want (7, 9, nil)", percent, u, err)
+	}
+	if _, _, err := parseHealthLog(make([]byte, 511)); err == nil {
+		t.Error("страница 511 байт: ошибки нет, want короткая страница")
+	}
+
+	// Короткий буфер — ошибка и нулевые значения возврата.
+	pct, u, err := parseHealthLog(page[:nvmeHealthLogSize-1])
+	if err == nil {
 		t.Error("короткий буфер: ошибки нет")
+	}
+	if pct != 0 || u != 0 {
+		t.Errorf("короткий буфер: (%d, %d), want нули при ошибке", pct, u)
 	}
 }
 
@@ -806,6 +1022,16 @@ func TestOSWearDegradation(t *testing.T) {
 	_, err = OSWear{SysFS: root, DevFS: filepath.Join(root, "dev")}.Wear(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "SMART недоступен") || !strings.Contains(err.Error(), "nvme0") {
 		t.Errorf("недоступный /dev: ошибка = %v, want деградация с nvme0", err)
+	}
+
+	// Несколько контроллеров: обзор всех (ошибка одного не останавливает
+	// цикл) — причина называет каждое устройство.
+	if err := os.MkdirAll(filepath.Join(root, "class", "nvme", "nvme1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = OSWear{SysFS: root, DevFS: filepath.Join(root, "dev")}.Wear(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "nvme0") || !strings.Contains(err.Error(), "nvme1") {
+		t.Errorf("два недоступных контроллера: ошибка = %v, want причина с nvme0 и nvme1", err)
 	}
 
 	// Отмена ctx — ошибка контекста до обращения к устройствам.
@@ -881,9 +1107,75 @@ func TestAlertsLoopCancelDuringPass(t *testing.T) {
 	}
 }
 
+// TestAlertsLoopFirstPassImmediate — первый проход выполняется сразу при
+// старте, не ждёт тика: интервал цикла — час, единственный способ увидеть
+// OnPass за секунды теста — стартовый проход.
+func TestAlertsLoopFirstPassImmediate(t *testing.T) {
+	passed := make(chan struct{}, 1)
+	env := newAlertsTestEnv(t, func(o *AlertsOptions) {
+		o.Interval = time.Hour
+		o.OnPass = func(AlertsResult) {
+			select {
+			case passed <- struct{}{}:
+			default:
+			}
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- AlertsLoop(ctx, AlertsDeps{
+			Pool: env.pool, Redis: env.lener, Space: env.space, Wear: env.wear,
+		}, env.opts)
+	}()
+
+	select {
+	case <-passed: // стартовый проход — сразу
+	case <-time.After(5 * time.Second):
+		t.Fatal("первый проход не выполнен при старте (цикл ждёт тика)")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("AlertsLoop: %v, want nil при отмене ctx", err)
+	}
+}
+
 func TestAlertsLoopNilPool(t *testing.T) {
 	err := AlertsLoop(context.Background(), AlertsDeps{}, AlertsOptions{})
 	if err == nil || !strings.Contains(err.Error(), "пул БД не задан") {
 		t.Errorf("ошибка = %v, want «пул БД не задан»", err)
+	}
+}
+
+// TestAlertBytes — границы ступеней форматирования: ровно 1<<30/1<<20/1<<10
+// попадают в старшую ступень (границы включающие), минус байт — в младшую;
+// половинные и полуторные значения фиксируют делитель каждой ступени.
+func TestAlertBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		n    uint64
+		want string
+	}{
+		{"ноль", 0, "0B"},
+		{"байты", 1, "1B"},
+		{"килобайт без кибибайта", 1023, "1023B"},
+		{"ровно кибибайт", 1 << 10, "1.0KiB"},
+		{"полтора кибибайта", 1536, "1.5KiB"},
+		{"кибибайт до мибибайта", 1<<20 - 1, "1024.0KiB"},
+		{"ровно мибибайт", 1 << 20, "1.0MiB"},
+		{"полтора мибибайта", 3 << 19, "1.5MiB"},
+		{"мибибайт до гибибайта", 1<<30 - 1, "1024.0MiB"},
+		{"ровно гибибайт", 1 << 30, "1.0GiB"},
+		{"полтора гибибайта", 3 << 29, "1.5GiB"},
+		{"много гибибайт", 5 << 30, "5.0GiB"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := alertBytes(tt.n); got != tt.want {
+				t.Errorf("alertBytes(%d) = %q, want %q", tt.n, got, tt.want)
+			}
+		})
 	}
 }
