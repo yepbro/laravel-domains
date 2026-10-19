@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"strconv"
 	"strings"
 
@@ -146,69 +145,10 @@ func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, 
 
 // writeStatusJSON — машинный вывод (стиль domain --json): те же данные,
 // что в таблице; «н/д» — null (скорость без окна, ETA без скорости,
-// очереди без Redis).
+// очереди без Redis). Wire-формат — status.BuildSummaryJSON (ТЗД §6.2,
+// T-129): тот же контракт полей отдаёт /api/status дашборда.
 func writeStatusJSON(w io.Writer, zones []status.ZoneStats, tot status.Totals, thr status.Throughput, rates status.Rates, lens map[string]int64) error {
-	type zoneJSON struct {
-		Name           string `json:"name"`
-		NameUnicode    string `json:"name_unicode,omitempty"`
-		Active         bool   `json:"active"`
-		DomainsTotal   int64  `json:"domains_total"`
-		DomainsChecked int64  `json:"domains_checked"`
-		Pending        int64  `json:"pending"`
-		Queued         int64  `json:"queued"`
-		Done           int64  `json:"done"`
-	}
-	type totalsJSON struct {
-		DomainsTotal   int64 `json:"domains_total"`
-		DomainsChecked int64 `json:"domains_checked"`
-		Pending        int64 `json:"pending"`
-		Queued         int64 `json:"queued"`
-		Done           int64 `json:"done"`
-	}
-	type throughputJSON struct {
-		DoneToday    int64   `json:"done_today"`
-		ElapsedSec   float64 `json:"elapsed_sec"`
-		ResultsHour  int64   `json:"results_hour"`
-		RenderedHour int64   `json:"rendered_hour"`
-	}
-	type ratesJSON struct {
-		DomainsPerSec *float64 `json:"domains_per_sec"`
-		ResultsPerSec float64  `json:"results_per_sec"`
-		RendersPerSec float64  `json:"renders_per_sec"`
-		Remaining     int64    `json:"remaining"`
-		ETASec        *int64   `json:"eta_sec"`
-	}
-	round3 := func(v float64) *float64 {
-		r := math.Round(v*1000) / 1000
-		return &r
-	}
-	var doc struct {
-		Zones      []zoneJSON       `json:"zones"`
-		Totals     totalsJSON       `json:"totals"`
-		Queues     map[string]int64 `json:"queues"`
-		Throughput throughputJSON   `json:"throughput"`
-		Rates      ratesJSON        `json:"rates"`
-	}
-	doc.Zones = make([]zoneJSON, 0, len(zones))
-	for _, z := range zones {
-		doc.Zones = append(doc.Zones, zoneJSON{
-			Name: z.Name, NameUnicode: z.NameUnicode, Active: z.IsActive,
-			DomainsTotal: z.DomainsTotal, DomainsChecked: z.DomainsChecked,
-			Pending: z.Pending, Queued: z.Queued, Done: z.Done,
-		})
-	}
-	doc.Totals = totalsJSON(tot)
-	doc.Queues = lens // nil → null (Redis недоступен)
-	doc.Throughput = throughputJSON(thr)
-	doc.Rates = ratesJSON{ResultsPerSec: math.Round(rates.ResultsPerSec*1000) / 1000,
-		RendersPerSec: math.Round(rates.RenderPerSec*1000) / 1000, Remaining: rates.Remaining}
-	if rates.DomainsKnown {
-		doc.Rates.DomainsPerSec = round3(rates.DomainsPerSec)
-	}
-	if rates.ETAKnown {
-		eta := rates.ETASec
-		doc.Rates.ETASec = &eta
-	}
+	doc := status.BuildSummaryJSON(zones, tot, thr, rates, lens)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	return enc.Encode(doc)

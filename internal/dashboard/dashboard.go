@@ -3,8 +3,9 @@
 // (ТЗД §1.3). Каркас T-128 — публичный http.Server на dashboard.listen
 // с graceful stop по отмене ctx (прецедент жизненного цикла —
 // internal/web, T-121), авторизация Basic + cookie-сессия и защита от
-// подбора (ТЗД §7). Сборка снимков /api/status — T-129, фронт — T-130,
-// развёртывание — T-131.
+// подбора (ТЗД §7). Сборка снимков /api/status — T-129 (snapshot.go —
+// данные, collector.go — фоновый цикл), фронт — T-130, развёртывание —
+// T-131.
 //
 // Каркас internal/service даёт один порт HTTP на сервис и вешает туда
 // /metrics с пробными эндпоинтами — выставлять его наружу нельзя
@@ -16,7 +17,8 @@
 //
 //   - GET /            → HTML-страница дашборда (заглушка до T-130);
 //   - GET /assets/*    — статика фронта (заглушка до T-130);
-//   - GET /api/status  — JSON снимка (заглушка 503 до T-129, §5.9);
+//   - GET /api/status  — JSON последнего снимка (T-129): до первого
+//     успешного сбора — 503 (ТЗД §5.9);
 //   - GET /healthz     — readiness: ping PostgreSQL (503 при отказе);
 //   - GET /livez       — liveness;
 //   - GET /robots.txt  — `Disallow: /` (внутренний сервис).
@@ -27,7 +29,9 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,9 +45,8 @@ import (
 	"crawler/internal/dashboard/auth"
 )
 
-// Pinger — readiness-зависимость БД (*pgxpool.Pool удовлетворяет).
-// Данные снимков соберёт T-129; в каркасе пул нужен пробе /healthz
-// (ТЗД §6.1).
+// Pinger — readiness-зависимость БД (*pgxpool.Pool удовлетворяет): пул
+// нужен пробе /healthz (ТЗД §6.1) и сборщику снимков (collector.go).
 type Pinger interface {
 	Ping(ctx context.Context) error
 }
@@ -55,11 +58,16 @@ type Options struct {
 	// Now — часы: выдача/проверка cookie-сессий (§7.5) и окно защиты от
 	// подбора (§7.6); nil — time.Now. Шов тестов.
 	Now func() time.Time
+	// Snapshots — источник снимков /api/status (цикл сборки T-129,
+	// *Collector); nil — снимков нет: 503 «snapshot_not_ready» (семантика
+	// §5.9 до первого сбора — прецедент заглушки T-128).
+	Snapshots SnapshotSource
 }
 
 // Server — публичный HTTP-сервер дашборда.
 type Server struct {
 	db       Pinger
+	snaps    SnapshotSource
 	opt      Options
 	username string
 	hash     auth.PasswordHash
@@ -114,6 +122,7 @@ func New(db Pinger, cfg *config.Config, opts Options) (*Server, error) {
 	}
 	return &Server{
 		db:       db,
+		snaps:    opts.Snapshots,
 		opt:      opts,
 		username: cfg.Dashboard.Username,
 		hash:     hash,
@@ -202,7 +211,8 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 // handleIndex — GET /: заглушка каркаса до фронта (T-130) — минимальная
 // страница-плейсхолдер за авторизацией (приёмка ТЗД §12 «порт
 // запрашивает пароль» работает уже на каркасе; браузер после входа
-// видит осмысленную страницу, а не пустоту). Разметка дашборда — T-130.
+// видит осмысленную страницу, а не пустоту). Данные снимка — /api/status
+// (T-129). Разметка дашборда — T-130.
 func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, `<!doctype html>
@@ -210,7 +220,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 <head><meta charset="utf-8"><title>Дашборд Domain Crawler</title></head>
 <body>
 <h1>Дашборд Domain Crawler</h1>
-<p>Каркас дашборда (T-128): интерфейс — T-130, данные <code>/api/status</code> — T-129.</p>
+<p>Интерфейс дашборда — T-130; данные снимка конвейера — <code>GET /api/status</code>.</p>
 </body>
 </html>
 `)
@@ -223,15 +233,36 @@ func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// handleAPIStatus — GET /api/status: заглушка до сборщика снимков
-// (T-129) с той же семантикой, что «до первого успешного сбора»
-// (ТЗД §5.9): 503, тело — JSON-ошибка; Cache-Control: no-store
-// (ТЗД §6.2) — периодический опрос не кэширует отказ.
+// handleAPIStatus — GET /api/status: JSON последнего снимка (ТЗД §6.2):
+// секции зон/итогов/темпа/скоростей — как crawlerctl status --json
+// (status.SummaryJSON, T-129), плюс статусы/Laravel/ingest/здоровье и
+// карта ошибок секций; null для недоступных значений. До первого
+// успешного сбора — 503 (ТЗД §5.9); Cache-Control: no-store —
+// периодический опрос не кэширует ни снимок, ни отказ.
 func (s *Server) handleAPIStatus(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusServiceUnavailable)
-	_, _ = io.WriteString(w, `{"error":"snapshot_not_ready"}`+"\n")
+	var snap *Snapshot
+	if s.snaps != nil {
+		snap = s.snaps.Current()
+	}
+	if snap == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":"snapshot_not_ready"}`+"\n")
+		return
+	}
+	// Снимок публикуется атомарной заменой целиком — маршалинг
+	// консистентен одному моменту сборки; EscapeHTML off — стиль CLI.
+	// Кодирование в буфер: ошибка (гипотетический NaN из real-колонок)
+	// не должна отдавать частичный JSON со статусом 200.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(snap); err != nil {
+		http.Error(w, "snapshot encode failed", http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(buf.Bytes())
 }
 
 // handleHealthz — readiness без авторизации (ТЗД §6.1): ping PostgreSQL

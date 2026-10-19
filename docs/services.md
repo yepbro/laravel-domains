@@ -186,6 +186,8 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: lag + pending; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026) |
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) раз в 30 с (`scheduler.BacklogLoop`) |
+| `crawler_dashboard_snapshots_total` | counter | `result` | dashboard (`ok`/`error`, ТЗД §10) | каждый проход цикла сборки снимков: `error` — проход с деградированными секциями (снимок публикуется, причины — Warn в логе и карта `errors` /api/status) |
+| `crawler_dashboard_snapshot_seconds` | histogram | — | dashboard | длительность того же прохода (корзины 50 мс…~3 мин: проход — полные агрегаты `internal/status`) |
 
 Решения (зафиксированы):
 
@@ -615,11 +617,11 @@ Read 10 с, Write 15 с, Idle 60 с). Стартовая проверка кре
 креды не проверяет (иначе требование коснулось бы всех сервисов).
 
 Роуты (ТЗД §6.1): `GET /` (страница), `GET /assets/*` (статика) и
-`GET /api/status` (JSON снимка) — за авторизацией (до T-129/T-130 —
-заглушки: страница-плейсхолдер, 404 и 503 `snapshot_not_ready`
-соответственно); `GET /healthz` (ping PostgreSQL, 503 при сбое),
-`GET /livez`, `GET /robots.txt` (`Disallow: /` — внутренний сервис) —
-без авторизации. Не GET/HEAD — 405; все ответы несут
+`GET /api/status` (JSON последнего снимка, T-129; до первого успешного
+сбора — 503 `snapshot_not_ready`, §5.9) — за авторизацией (страница и
+статика — заглушки до T-130); `GET /healthz` (ping PostgreSQL, 503 при
+сбое), `GET /livez`, `GET /robots.txt` (`Disallow: /` — внутренний
+сервис) — без авторизации. Не GET/HEAD — 405; все ответы несут
 `X-Content-Type-Options: nosniff` и CSP ТЗД §6.3.
 
 Авторизация (ТЗД §7, T-128): HTTP Basic — имя constant-time, пароль —
@@ -638,8 +640,57 @@ cookie-сессия `<expiry>.<HMAC-SHA256(expiry, производный клю
 адрес клиента несёт `X-Real-IP` (доверие — только от loopback-пира,
 как у формы лендинга T-123).
 
-Сборщик снимков (фоновый цикл `dashboard.refresh`, секции §5, метрики
-§10) — T-129; фронт (страница, автообновление ~5 с, спарклайны) —
+Сборщик снимков (T-129, ТЗД §4.3–4.4): фоновый цикл
+`dashboard.Collector.Loop` (`internal/dashboard/collector.go`) рядом с
+публичным слушателем в `OnRun` — первый сбор сразу при старте, далее с
+периодом `dashboard.refresh` (коридор 1 с…5 мин, дефолт 5 с); снимок
+атомарно заменяет предыдущий (`atomic.Pointer`), `/api/status` отдаёт
+последний готовый — нагрузка на БД фиксирована частотой refresh и не
+зависит от числа вкладок (ТЗД §3.2.3). До первого **успешного** сбора —
+прохода, в котором жив каркас сводки (зоны/итоги, §5.1) — `/api/status`
+отвечает 503 `snapshot_not_ready` (§5.9). Иерархия готовности — как у
+`crawlerctl status`: Redis, лежащий с самого старта, не прячет сводку
+по БД (очереди «н/д» обслуживаются с первого прохода — приёмка §12.3
+работает и для рестарта при уже лежащем Redis), лежащая БД держит 503
+и метрику `result=error` до восстановления. Позже деградированные
+снимки обслуживаются: замена атомарная, отказ секции не роняет выдачу.
+
+Цена прохода — полные агрегаты `internal/status` (те же, что платит
+`crawlerctl status` на каждый запуск: проход `domains`, окна
+`subdomain_results`; распределение статусов и счётчик Laravel — тоже
+агрегаты без индексов по `status`; «последние ingest-файлы» — top-N
+сортировка журнала без индекса по `processed_at`): частоту задаёт
+`dashboard.refresh`, и на большом корпусе период поднимают
+(до 5 минут), а не смиряются с нагрузкой дефолтных 5 с.
+
+Секции снимка (§5): зоны/итоги/темп/скорости/ETA и глубины стримов —
+общая библиотека `internal/status` (те же SQL и расчёты, что у
+`crawlerctl status`, T-126; Redis — `BackpressureGate.Len`, как monitor;
+клиент Redis сервис создаёт сам по секции `redis` конфигурации — как
+`cmd/monitor`); распределение `domains` по `status` (§5.5),
+Laravel-находки — всего/за 24 ч/последние 10 с JOIN зон по индексу
+`laravel_domains_updated_at_idx` (§5.6) и последние 10 `ingest_files`
+(§5.7) — тоже `internal/status` (один источник SQL сводки, §4.5).
+JSON-форма `/api/status` (§6.2): общие секции — канонический
+wire-контракт `status.SummaryJSON` (его же отдаёт `crawlerctl status
+--json` — поля не расходятся), плюс `statuses`/`laravel`/`ingest`/
+`health`/`errors`/`built_at` и `queue_watermark` (порог
+`scheduler.queue_high_watermark` для подсветки очередей, §5.4);
+недоступные значения — `null`, причины — в карте `errors`;
+`Cache-Control: no-store`.
+
+Деградация (§5.9): секции собираются независимо — ошибка БД, Redis или
+пробы не роняет остальные; метка `result=error` у
+`crawler_dashboard_snapshots_total` и Warn с картой причин поднимают
+шум, цикл живёт. Пробы `/livez` (§5.8) из `dashboard.probes` идут
+параллельно горутинами с таймаутом 2 с (errgroup не использован —
+`golang.org/x/sync` в go.mod косвенная, новых зависимостей ТЗД §3.2.1
+не вводит); недоступный/медленный сервис — данные (`up:false` с
+причиной), а не ошибка секции; пустая карта проб — секция «н/д».
+
+Метрики собственного сервиса (§10): `crawler_dashboard_snapshots_total{result}`
+и `crawler_dashboard_snapshot_seconds` — реестр создаёт `cmd/dashboard`
+(таблица выше). Фронт (страница, автообновление ~5 с, спарклайны) —
 T-130; развёртывание (compose, systemd, Prometheus) — T-131.
 Конфигурация — секция `dashboard`
 ([`configuration.md`](configuration.md)).

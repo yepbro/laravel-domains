@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -45,6 +46,22 @@ const wantThroughputSQL = "SELECT " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour') AS results_hour, " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour' AND rendered) AS rendered_hour"
 
+const wantDomainStatusSQL = "SELECT status, count(*) FROM domains GROUP BY status ORDER BY status"
+
+const wantLaravelTotalsSQL = "SELECT count(*), " +
+	"count(*) FILTER (WHERE updated_at >= now() - interval '24 hours') " +
+	"FROM laravel_domains"
+
+const wantLaravelRecentSQL = "SELECT d.label || '.' || z.name AS domain, z.name AS zone, " +
+	"ld.score, ld.ver_min, ld.ver_max, ld.updated_at " +
+	"FROM laravel_domains AS ld " +
+	"JOIN domains AS d ON d.zone_id = ld.zone_id AND d.id = ld.domain_id " +
+	"JOIN zones AS z ON z.id = ld.zone_id " +
+	"ORDER BY ld.updated_at DESC LIMIT 10"
+
+const wantIngestRecentSQL = "SELECT path, action, lines_total, added, existed, deleted, rejected, processed_at " +
+	"FROM ingest_files ORDER BY processed_at DESC NULLS LAST, id DESC LIMIT 10"
+
 // --- фейковый пул (db.DB) ----------------------------------------------------
 
 // statusZoneSeed — зона в фейке: счётчики и атрибуты отображения.
@@ -65,13 +82,51 @@ type statusDomSeed struct {
 	stats model.Status
 }
 
+// statusStatusSeed — строка агрегата распределения статусов (§5.5).
+type statusStatusSeed struct {
+	code  int16
+	count int64
+}
+
+// statusLaravelSeed — строка laravel_domains для секции Laravel (§5.6):
+// label домена и его зона — JOIN выборки последних находок.
+type statusLaravelSeed struct {
+	zone      int16
+	domain    int64
+	label     string
+	score     float32
+	verMin    *string
+	verMax    *string
+	updatedAt time.Time
+}
+
+// statusIngestSeed — строка ingest_files (§5.7); указатели — NULL-колонки
+// схемы (журнал пишет полными строками, NULL легален для ручных вставок).
+type statusIngestSeed struct {
+	id          int64
+	path        *string
+	action      *int16
+	lines       *int64
+	added       *int64
+	existed     *int64
+	deleted     *int64
+	rejected    *int64
+	processedAt *time.Time
+}
+
 // statusPool — db.DB без БД: живая семантика zoneStatsSQL (GROUP BY зоны,
 // pending без deleted, queued/done без фильтра статуса, LEFT JOIN — зона
-// без доменов остаётся, ORDER BY name) и throughputSQL (готовые значения).
+// без доменов остаётся, ORDER BY name), throughputSQL (готовые значения)
+// и секций дашборда (§5.5–5.7): распределение статусов, счётчики/окно
+// Laravel по часам фейка, сортировка последних находок и ingest-файлов.
 type statusPool struct {
-	zones   []statusZoneSeed
-	domains []statusDomSeed
-	thr     Throughput
+	zones       []statusZoneSeed
+	domains     []statusDomSeed
+	thr         Throughput
+	domStatuses []statusStatusSeed
+	laravel     []statusLaravelSeed
+	ingest      []statusIngestSeed
+	now         time.Time // часы сервера БД для окон laravelTotalsSQL
 
 	mu        sync.Mutex
 	queryErr  error
@@ -82,7 +137,7 @@ type statusPool struct {
 var _ db.DB = (*statusPool)(nil)
 
 func newStatusPool() *statusPool {
-	return &statusPool{}
+	return &statusPool{now: time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)}
 }
 
 func (p *statusPool) seedZone(id int16, name string, active bool, total, checked int64) {
@@ -136,6 +191,24 @@ func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows,
 		return p.zoneRows(), nil
 	case throughputSQL:
 		return statusRowsOf([]any{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour}), nil
+	case domainStatusSQL:
+		rows := make([][]any, len(p.domStatuses))
+		for i, s := range p.domStatuses {
+			rows[i] = []any{s.code, s.count}
+		}
+		return statusRowsOf(rows...), nil
+	case laravelTotalsSQL:
+		var last24h int64
+		for _, l := range p.laravel {
+			if !l.updatedAt.Before(p.now.Add(-24 * time.Hour)) {
+				last24h++
+			}
+		}
+		return statusRowsOf([]any{int64(len(p.laravel)), last24h}), nil
+	case laravelRecentSQL:
+		return p.laravelRows(), nil
+	case ingestRecentSQL:
+		return p.ingestRows(), nil
 	default:
 		return nil, fmt.Errorf("statusPool: неожидаемый SQL Query: %s", sql)
 	}
@@ -172,10 +245,58 @@ func (p *statusPool) zoneRows() pgx.Rows {
 	return statusRowsOf(rows...)
 }
 
+// laravelRows применяет семантику laravelRecentSQL: JOIN домена и зоны по
+// ключу строки, сортировка по updated_at DESC, LIMIT 10.
+func (p *statusPool) laravelRows() pgx.Rows {
+	names := make(map[int16]string, len(p.zones))
+	for _, z := range p.zones {
+		names[z.id] = z.name
+	}
+	sorted := append([]statusLaravelSeed(nil), p.laravel...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].updatedAt.After(sorted[j].updatedAt) })
+	if len(sorted) > 10 {
+		sorted = sorted[:10]
+	}
+	rows := make([][]any, len(sorted))
+	for i, l := range sorted {
+		rows[i] = []any{l.label + "." + names[l.zone], names[l.zone],
+			l.score, l.verMin, l.verMax, l.updatedAt}
+	}
+	return statusRowsOf(rows...)
+}
+
+// ingestRows применяет семантику ingestRecentSQL: processed_at DESC
+// (NULL последними), id DESC внутри одной секунды, LIMIT 10.
+func (p *statusPool) ingestRows() pgx.Rows {
+	sorted := append([]statusIngestSeed(nil), p.ingest...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		pi, pj := sorted[i].processedAt, sorted[j].processedAt
+		switch {
+		case pi == nil && pj != nil:
+			return false // NULLS LAST
+		case pi != nil && pj == nil:
+			return true
+		case pi != nil && pj != nil && !pi.Equal(*pj):
+			return pi.After(*pj)
+		default:
+			return sorted[i].id > sorted[j].id
+		}
+	})
+	if len(sorted) > 10 {
+		sorted = sorted[:10]
+	}
+	rows := make([][]any, len(sorted))
+	for i, s := range sorted {
+		rows[i] = []any{s.path, s.action, s.lines, s.added, s.existed, s.deleted, s.rejected, s.processedAt}
+	}
+	return statusRowsOf(rows...)
+}
+
 // statusRows — pgx.Rows с заготовленными строками (Scan позиционный,
-// типы int16/string/bool/int64/float32/float64/[]byte). Копия общего
-// фейка тестов CLI (cmd/crawlerctl): тест-файлы разных пакетов не
-// импортируют друг друга.
+// типы int16/string/bool/int64/float32/float64/[]byte и указатели для
+// NULL-колонок — одинарные значения и двойные для разворота NULL).
+// Копия общего фейка тестов CLI (cmd/crawlerctl): тест-файлы разных
+// пакетов не импортируют друг друга.
 type statusRows struct {
 	rows [][]any
 	i    int
@@ -225,11 +346,31 @@ func (r *statusRows) Scan(dest ...any) error {
 			*dst = v.(float64)
 		case *[]byte:
 			*dst = v.([]byte)
+		case *time.Time:
+			*dst = v.(time.Time)
+		case **string:
+			assignPtr(dst, v)
+		case **int16:
+			assignPtr(dst, v)
+		case **int64:
+			assignPtr(dst, v)
+		case **time.Time:
+			assignPtr(dst, v)
 		default:
 			return fmt.Errorf("statusRows: приёмник %T не поддерживается", d)
 		}
 	}
 	return nil
+}
+
+// assignPtr — разворот NULL-колонок: значение-указатель из строки фейка
+// (nil — NULL) в приёмник-указатель-на-указатель pgx.
+func assignPtr[T any](dst **T, v any) {
+	if p, ok := v.(*T); ok {
+		*dst = p
+		return
+	}
+	*dst = nil
 }
 
 // --- фейковый XLEN -----------------------------------------------------------
@@ -267,6 +408,18 @@ func TestStatusSQLContract(t *testing.T) {
 	}
 	if throughputSQL != wantThroughputSQL {
 		t.Errorf("throughputSQL:\n%s\nwant:\n%s", throughputSQL, wantThroughputSQL)
+	}
+	if domainStatusSQL != wantDomainStatusSQL {
+		t.Errorf("domainStatusSQL:\n%s\nwant:\n%s", domainStatusSQL, wantDomainStatusSQL)
+	}
+	if laravelTotalsSQL != wantLaravelTotalsSQL {
+		t.Errorf("laravelTotalsSQL:\n%s\nwant:\n%s", laravelTotalsSQL, wantLaravelTotalsSQL)
+	}
+	if laravelRecentSQL != wantLaravelRecentSQL {
+		t.Errorf("laravelRecentSQL:\n%s\nwant:\n%s", laravelRecentSQL, wantLaravelRecentSQL)
+	}
+	if ingestRecentSQL != wantIngestRecentSQL {
+		t.Errorf("ingestRecentSQL:\n%s\nwant:\n%s", ingestRecentSQL, wantIngestRecentSQL)
 	}
 }
 
@@ -380,6 +533,179 @@ func TestFetchQueueLens(t *testing.T) {
 	}
 	if _, err := FetchQueueLens(context.Background(), nil); err == nil {
 		t.Error("FetchQueueLens(nil) = nil, хочу ошибку")
+	}
+}
+
+// --- секции дашборда (ТЗД §5.5–5.7) ----------------------------------------------
+
+// strPtr — указатель строки (NULL-колонки сидов).
+func strPtr(s string) *string { return &s }
+
+// int16Ptr/int64Ptr — указатели чисел (NULL-колонки сидов ingest).
+func int16Ptr(v int16) *int16 { return &v }
+
+func int64Ptr(v int64) *int64 { return &v }
+
+// TestFetchDomainStatuses — распределение по именам ТЗ 6.2: все статусы
+// model.Statuses с нулями (полная легенда), счётчики по кодам,
+// неизвестный код — Status(N); ошибки и nil-пул.
+func TestFetchDomainStatuses(t *testing.T) {
+	pool := newStatusPool()
+	pool.domStatuses = []statusStatusSeed{
+		{int16(model.StatusNew), 1000},
+		{int16(model.StatusAlive), 40},
+		{int16(model.StatusDeleted), 3},
+		{9, 1}, // код вне таблицы ТЗ 6.2 — честное имя, не потеря
+	}
+	got, err := FetchDomainStatuses(context.Background(), pool)
+	if err != nil {
+		t.Fatalf("FetchDomainStatuses: %v", err)
+	}
+	if calls := pool.calls(); len(calls) != 1 || calls[0] != wantDomainStatusSQL {
+		t.Fatalf("запросы = %q, хочу один domainStatusSQL", calls)
+	}
+	want := map[string]int64{
+		"new": 1000, "not_delegated": 0, "delegated_no_address": 0, "no_http": 0,
+		"alive": 40, "temp_error": 0, "deleted": 3, "invalid": 0, "Status(9)": 1,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("statuses = %v\nwant %v", got, want)
+	}
+
+	// Пустая таблица — легенда из нулей, не пустая карта.
+	got, err = FetchDomainStatuses(context.Background(), newStatusPool())
+	if err != nil {
+		t.Fatalf("FetchDomainStatuses (пусто): %v", err)
+	}
+	if len(got) != len(model.Statuses) {
+		t.Fatalf("пустая таблица: %d статусов, хочу легенду %d", len(got), len(model.Statuses))
+	}
+	for name, n := range got {
+		if n != 0 {
+			t.Errorf("статус %s = %d, хочу 0", name, n)
+		}
+	}
+
+	// Ошибки пула и nil-пул.
+	pool = newStatusPool()
+	pool.setQueryErr(errors.New("boom"))
+	if _, err := FetchDomainStatuses(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: статусы:") {
+		t.Errorf("ошибка пула = %v, хочу контекст «status: статусы:»", err)
+	}
+	if _, err := FetchDomainStatuses(context.Background(), nil); err == nil {
+		t.Error("FetchDomainStatuses(nil) = nil, хочу ошибку")
+	}
+}
+
+// TestFetchLaravelStats — счётчики (всего и окно 24 ч по updated_at),
+// последние находки: домен label.зона через JOIN, сортировка updated_at
+// DESC, LIMIT 10, ver_min/ver_max NULL → пустые строки.
+func TestFetchLaravelStats(t *testing.T) {
+	pool := newStatusPool()
+	pool.seedZone(1, "crawl.test", true, 0, 0)
+	fresh := pool.now.Add(-2 * time.Hour)
+	stale := pool.now.Add(-30 * time.Hour)
+	pool.laravel = []statusLaravelSeed{
+		{zone: 1, domain: 2, label: "old", score: 0.7, updatedAt: stale},
+		{zone: 1, domain: 1, label: "shop", score: 0.9, verMin: strPtr("9.19"), verMax: strPtr("11"), updatedAt: fresh},
+		{zone: 1, domain: 3, label: "mid", score: 0.8, verMin: strPtr("10"), updatedAt: pool.now.Add(-25 * time.Hour)},
+	}
+	st, err := FetchLaravelStats(context.Background(), pool)
+	if err != nil {
+		t.Fatalf("FetchLaravelStats: %v", err)
+	}
+	if calls := pool.calls(); !reflect.DeepEqual(calls, []string{wantLaravelTotalsSQL, wantLaravelRecentSQL}) {
+		t.Fatalf("запросы = %q, хочу [laravelTotalsSQL laravelRecentSQL]", calls)
+	}
+	if st.Total != 3 || st.Last24h != 1 {
+		t.Errorf("счётчики = %d/%d, хочу 3/1 (окно 24 ч по updated_at)", st.Total, st.Last24h)
+	}
+	want := []LaravelRecent{
+		{Domain: "shop.crawl.test", Zone: "crawl.test", Score: 0.9, VerMin: "9.19", VerMax: "11", UpdatedAt: fresh},
+		{Domain: "mid.crawl.test", Zone: "crawl.test", Score: 0.8, VerMin: "10", UpdatedAt: pool.now.Add(-25 * time.Hour)},
+		{Domain: "old.crawl.test", Zone: "crawl.test", Score: 0.7, UpdatedAt: stale},
+	}
+	if !reflect.DeepEqual(st.Recent, want) {
+		t.Errorf("recent =\n%+v\nwant\n%+v", st.Recent, want)
+	}
+
+	// Пустая таблица: нули и пустой срез последних (не nil — секция жива).
+	st, err = FetchLaravelStats(context.Background(), newStatusPool())
+	if err != nil {
+		t.Fatalf("FetchLaravelStats (пусто): %v", err)
+	}
+	if st.Total != 0 || st.Last24h != 0 || len(st.Recent) != 0 {
+		t.Errorf("пустая таблица: %+v, хочу нули и пустой recent", st)
+	}
+
+	// Ошибка любого из двух запросов — ошибка секции целиком.
+	pool = newStatusPool()
+	pool.seedZone(1, "crawl.test", true, 0, 0)
+	pool.laravel = []statusLaravelSeed{{zone: 1, domain: 1, label: "shop", updatedAt: fresh}}
+	pool.setQueryErr(errors.New("boom"))
+	if _, err := FetchLaravelStats(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: laravel:") {
+		t.Errorf("ошибка пула = %v, хочу контекст «status: laravel:»", err)
+	}
+	if _, err := FetchLaravelStats(context.Background(), nil); err == nil {
+		t.Error("FetchLaravelStats(nil) = nil, хочу ошибку")
+	}
+}
+
+// TestFetchIngestReports — последние файлы: processed_at DESC (NULL
+// последними), id DESC при равенстве, LIMIT 10; действия add/delete
+// по модельным именам, NULL-колонки — нулевые значения.
+func TestFetchIngestReports(t *testing.T) {
+	pool := newStatusPool()
+	at := func(h time.Duration) *time.Time {
+		t := pool.now.Add(-h * time.Hour)
+		return &t
+	}
+	pool.ingest = []statusIngestSeed{
+		// NULL processed_at — «последним», несмотря на большой id.
+		{id: 77},
+		{id: 3, path: strPtr("crawl.test/add/three.txt"), action: int16Ptr(int16(model.ActionAdd)),
+			lines: int64Ptr(30), added: int64Ptr(28), existed: int64Ptr(2), rejected: int64Ptr(0), processedAt: at(1)},
+		// Та же секунда, что id 3 — порядок по id DESC.
+		{id: 5, path: strPtr("crawl.test/delete/five.txt"), action: int16Ptr(int16(model.ActionDelete)),
+			lines: int64Ptr(50), deleted: int64Ptr(49), rejected: int64Ptr(1), processedAt: at(1)},
+		{id: 4, path: strPtr("crawl.test/add/four.txt"), action: int16Ptr(int16(model.ActionAdd)),
+			lines: int64Ptr(10), added: int64Ptr(10), processedAt: at(5)},
+	}
+	got, err := FetchIngestReports(context.Background(), pool)
+	if err != nil {
+		t.Fatalf("FetchIngestReports: %v", err)
+	}
+	if calls := pool.calls(); len(calls) != 1 || calls[0] != wantIngestRecentSQL {
+		t.Fatalf("запросы = %q, хочу один ingestRecentSQL", calls)
+	}
+	want := []IngestReport{
+		{Path: "crawl.test/delete/five.txt", Action: "delete", LinesTotal: 50, Deleted: 49, Rejected: 1, ProcessedAt: *at(1)},
+		{Path: "crawl.test/add/three.txt", Action: "add", LinesTotal: 30, Added: 28, Existed: 2, ProcessedAt: *at(1)},
+		{Path: "crawl.test/add/four.txt", Action: "add", LinesTotal: 10, Added: 10, ProcessedAt: *at(5)},
+		{}, // NULL processed_at — последняя строка, колонки развёрнуты в нули
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("reports =\n%+v\nwant\n%+v", got, want)
+	}
+
+	// Код действия вне таблицы ТЗ 6.1 — имя Action(N), не паника.
+	pool2 := newStatusPool()
+	pool2.ingest = []statusIngestSeed{{id: 1, action: int16Ptr(7), processedAt: at(1)}}
+	got, err = FetchIngestReports(context.Background(), pool2)
+	if err != nil {
+		t.Fatalf("FetchIngestReports (чужой код): %v", err)
+	}
+	if len(got) != 1 || got[0].Action != "Action(7)" {
+		t.Errorf("чужой код действия: %+v, хочу Action(7)", got)
+	}
+
+	pool3 := newStatusPool()
+	pool3.setQueryErr(errors.New("boom"))
+	if _, err := FetchIngestReports(context.Background(), pool3); err == nil || !strings.Contains(err.Error(), "status: ingest:") {
+		t.Errorf("ошибка пула = %v, хочу контекст «status: ingest:»", err)
+	}
+	if _, err := FetchIngestReports(context.Background(), nil); err == nil {
+		t.Error("FetchIngestReports(nil) = nil, хочу ошибку")
 	}
 }
 

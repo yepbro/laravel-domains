@@ -7,7 +7,10 @@
 // Источники — PostgreSQL (счётчики zones + агрегаты domains + окна
 // темпа) и Redis (глубина стримов — backlog групп потребления); всё
 // читается разово, без состояния. Пакет не знает про вывод: таблица/JSON
-// остаются в CLI, снимки — в дашборде.
+// остаются в CLI, снимки — в дашборде. Секции дашборда без аналога в CLI
+// (распределение статусов, Laravel-находки, журнал ingest — ТЗД §5.5–5.7)
+// живут здесь же: SQL сводки — один источник правды, а деградация секций
+// и снимок целиком — сборка дашборда (ТЗД §4.4, §5.9).
 //
 // Что измеримо из БД (решения зафиксированы, остальное — честно не
 // показывается, ТЗ 5.9 «скорость… ожидаемое время завершения цикла»):
@@ -41,6 +44,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
 	"crawler/internal/db"
 	"crawler/internal/model"
@@ -75,6 +79,40 @@ const throughputSQL = "SELECT " +
 	"extract(epoch FROM (now() - date_trunc('day', now())))::float8 AS elapsed_sec, " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour') AS results_hour, " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour' AND rendered) AS rendered_hour"
+
+// domainStatusSQL — распределение domains по статусам (ТЗД §5.5):
+// единственный агрегат секции, ORDER BY status — детерминированный
+// порядок строк (имена и полнота легенды — в FetchDomainStatuses).
+const domainStatusSQL = "SELECT status, count(*) FROM domains GROUP BY status ORDER BY status"
+
+// laravelTotalsSQL — счётчики Laravel-находок (ТЗД §5.6) одним проходом
+// laravel_domains: всего и обновлённых за 24 часа (updated_at — момент
+// последнего пересчёта агрегата, ТЗ 5.8). Окно 24 часа — то же, что у
+// «находок за 24 ч» лендинга (T-118/T-120), но по laravel_domains —
+// ТЗД §5.6 явно называет эту таблицу: секция показывает живой агрегат,
+// а не журнал переходов.
+const laravelTotalsSQL = "SELECT count(*), " +
+	"count(*) FILTER (WHERE updated_at >= now() - interval '24 hours') " +
+	"FROM laravel_domains"
+
+// laravelRecentSQL — последние находки (ТЗД §5.6): домен собирается из
+// label и зоны (JOIN по ключу laravel_domains), сортировка и LIMIT — по
+// индексу laravel_domains_updated_at_idx (T-120). ver_min/ver_max
+// NULL-able (диапазон мог не определиться) — FetchLaravelStats
+// разворачивает в пустые строки.
+const laravelRecentSQL = "SELECT d.label || '.' || z.name AS domain, z.name AS zone, " +
+	"ld.score, ld.ver_min, ld.ver_max, ld.updated_at " +
+	"FROM laravel_domains AS ld " +
+	"JOIN domains AS d ON d.zone_id = ld.zone_id AND d.id = ld.domain_id " +
+	"JOIN zones AS z ON z.id = ld.zone_id " +
+	"ORDER BY ld.updated_at DESC LIMIT 10"
+
+// ingestRecentSQL — последние обработанные файлы (ТЗД §5.7). NULLS LAST
+// обязателен: DESC в PostgreSQL по умолчанию поднимает NULL первыми —
+// строка без processed_at (схема допускает) не должна возглавлять
+// «последние»; id DESC — детерминированный порядок внутри одной секунды.
+const ingestRecentSQL = "SELECT path, action, lines_total, added, existed, deleted, rejected, processed_at " +
+	"FROM ingest_files ORDER BY processed_at DESC NULLS LAST, id DESC LIMIT 10"
 
 // ---------------------------------------------------------------- данные
 
@@ -146,6 +184,199 @@ func FetchThroughput(ctx context.Context, pool db.DB) (Throughput, error) {
 		return Throughput{}, fmt.Errorf("status: темп: %w", err)
 	}
 	return t, nil
+}
+
+// ---------------------------------------------------------------- данные секций дашборда (ТЗД §5.5–5.7)
+
+// LaravelRecent — строка «последние находки» (ТЗД §5.6): домен, зона,
+// score, диапазон версий (пустая строка — NULL: диапазон не определён),
+// момент обновления.
+type LaravelRecent struct {
+	Domain    string
+	Zone      string
+	Score     float32
+	VerMin    string // "" — NULL
+	VerMax    string // "" — NULL
+	UpdatedAt time.Time
+}
+
+// LaravelStats — секция Laravel-находок (ТЗД §5.6): всего, за 24 часа,
+// последние 10.
+type LaravelStats struct {
+	Total   int64
+	Last24h int64
+	Recent  []LaravelRecent // пустой срез — находок нет (не ошибка)
+}
+
+// IngestReport — строка «последние ingest-файлы» (ТЗД §5.7): файл,
+// действие («add»/«delete» по model.Action; код вне таблицы ТЗ 6.1 —
+// имя «Action(N)», NULL — пусто), счётчики строк и момент обработки.
+type IngestReport struct {
+	Path        string // "" — NULL
+	Action      string
+	LinesTotal  int64
+	Added       int64
+	Existed     int64
+	Deleted     int64
+	Rejected    int64
+	ProcessedAt time.Time // zero — NULL
+}
+
+// FetchDomainStatuses — распределение domains по статусам (ТЗД §5.5).
+// Ключи — имена по ТЗ 6.2 основного ТЗ (model.Statuses); статусы без
+// строк входят с нулём — полная легенда для отображения без знания
+// таблицы на клиенте; неизвестный код схемы — под именем Status(N).
+func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, error) {
+	if pool == nil {
+		return nil, errors.New("status: статусы: пул не задан")
+	}
+	rows, err := pool.Query(ctx, domainStatusSQL)
+	if err != nil {
+		return nil, fmt.Errorf("status: статусы: %w", err)
+	}
+	defer rows.Close()
+	counts := make(map[string]int64, len(model.Statuses))
+	for _, s := range model.Statuses {
+		counts[s.String()] = 0
+	}
+	for rows.Next() {
+		var code int16
+		var n int64
+		if err := rows.Scan(&code, &n); err != nil {
+			return nil, fmt.Errorf("status: статусы: чтение: %w", err)
+		}
+		counts[model.Status(code).String()] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("status: статусы: %w", err)
+	}
+	return counts, nil
+}
+
+// FetchLaravelStats собирает секцию Laravel-находок (ТЗД §5.6): счётчики
+// одним проходом laravel_domains, последние 10 — отдельным запросом с
+// JOIN (индекс T-120). Ошибка любого запроса — ошибка секции целиком
+// (вызывающий кладёт null, ТЗД §5.9). Первый result set закрывается ДО
+// второго запроса (стиль web.FetchLandingData): скалярный SELECT не
+// дочитывается до конца сам — удержание set'а занимало бы соединение
+// пула на всё время второго запроса (при pool_size=1 — дедлок).
+func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
+	if pool == nil {
+		return LaravelStats{}, errors.New("status: laravel: пул не задан")
+	}
+	var st LaravelStats
+	rows, err := pool.Query(ctx, laravelTotalsSQL)
+	if err != nil {
+		return LaravelStats{}, fmt.Errorf("status: laravel: %w", err)
+	}
+	if !rows.Next() {
+		// Пустой набор скалярного агрегата — аномалия: различаем ошибку
+		// уровня строк (реальная причина ценнее синтетической) и честное
+		// «пусто».
+		err := rows.Err()
+		rows.Close()
+		if err != nil {
+			return LaravelStats{}, fmt.Errorf("status: laravel: %w", err)
+		}
+		return LaravelStats{}, errors.New("status: laravel: пустой ответ агрегата")
+	}
+	if err := rows.Scan(&st.Total, &st.Last24h); err != nil {
+		rows.Close()
+		return LaravelStats{}, fmt.Errorf("status: laravel: чтение: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return LaravelStats{}, fmt.Errorf("status: laravel: %w", err)
+	}
+	rows.Close()
+
+	rows, err = pool.Query(ctx, laravelRecentSQL)
+	if err != nil {
+		return LaravelStats{}, fmt.Errorf("status: laravel: последние: %w", err)
+	}
+	defer rows.Close()
+	st.Recent = make([]LaravelRecent, 0, 10)
+	for rows.Next() {
+		var (
+			it      LaravelRecent
+			verMin  *string
+			verMax  *string
+			updated time.Time
+		)
+		if err := rows.Scan(&it.Domain, &it.Zone, &it.Score, &verMin, &verMax, &updated); err != nil {
+			return LaravelStats{}, fmt.Errorf("status: laravel: последние: чтение: %w", err)
+		}
+		if verMin != nil {
+			it.VerMin = *verMin
+		}
+		if verMax != nil {
+			it.VerMax = *verMax
+		}
+		it.UpdatedAt = updated
+		st.Recent = append(st.Recent, it)
+	}
+	if err := rows.Err(); err != nil {
+		return LaravelStats{}, fmt.Errorf("status: laravel: последние: %w", err)
+	}
+	return st, nil
+}
+
+// FetchIngestReports — последние 10 записей журнала ingest_files
+// (ТЗД §5.7). NULL-колонки схемы (path/action/счётчики/processed_at)
+// разворачиваются в нулевые значения — журнал пишет конвейер всегда
+// полными строками (internal/ingest RecordFile), NULL легален только
+// для вручную вставленных строк.
+func FetchIngestReports(ctx context.Context, pool db.DB) ([]IngestReport, error) {
+	if pool == nil {
+		return nil, errors.New("status: ingest: пул не задан")
+	}
+	rows, err := pool.Query(ctx, ingestRecentSQL)
+	if err != nil {
+		return nil, fmt.Errorf("status: ingest: %w", err)
+	}
+	defer rows.Close()
+	out := make([]IngestReport, 0, 10)
+	for rows.Next() {
+		var (
+			it        IngestReport
+			path      *string
+			action    *int16
+			lines     *int64
+			added     *int64
+			existed   *int64
+			deleted   *int64
+			rejected  *int64
+			processed *time.Time
+		)
+		if err := rows.Scan(&path, &action, &lines, &added, &existed, &deleted,
+			&rejected, &processed); err != nil {
+			return nil, fmt.Errorf("status: ingest: чтение: %w", err)
+		}
+		if path != nil {
+			it.Path = *path
+		}
+		if action != nil {
+			it.Action = model.Action(*action).String()
+		}
+		it.LinesTotal, it.Added, it.Existed = derefInt64(lines), derefInt64(added), derefInt64(existed)
+		it.Deleted, it.Rejected = derefInt64(deleted), derefInt64(rejected)
+		if processed != nil {
+			it.ProcessedAt = *processed
+		}
+		out = append(out, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("status: ingest: %w", err)
+	}
+	return out, nil
+}
+
+// derefInt64 — значение указателя или 0 (NULL-счётчик ingest_files).
+func derefInt64(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 // ---------------------------------------------------------------- очереди
