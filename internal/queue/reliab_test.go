@@ -83,6 +83,12 @@ func newTestReliab(fake *fakeClaimRedis, opt ReliabOptions) *Reliab {
 }
 
 func TestNewReliabDefaults(t *testing.T) {
+	if DefaultMaxAttempts != 3 {
+		t.Errorf("DefaultMaxAttempts = %d, хочу 3 (ТЗ 4.2; литерал — пин константы)", DefaultMaxAttempts)
+	}
+	if DefaultClaimMinIdle != 10*time.Minute {
+		t.Errorf("DefaultClaimMinIdle = %s, хочу 10m (литерал — пин константы)", DefaultClaimMinIdle)
+	}
 	r := newTestReliab(&fakeClaimRedis{}, ReliabOptions{})
 	if r.opt.MaxAttempts != DefaultMaxAttempts {
 		t.Errorf("MaxAttempts: %d, хочу %d", r.opt.MaxAttempts, DefaultMaxAttempts)
@@ -90,8 +96,13 @@ func TestNewReliabDefaults(t *testing.T) {
 	if r.opt.MinIdle != DefaultClaimMinIdle {
 		t.Errorf("MinIdle: %s, хочу %s", r.opt.MinIdle, DefaultClaimMinIdle)
 	}
-	if DefaultMaxAttempts != 3 {
-		t.Errorf("DefaultMaxAttempts = %d, хочу 3 (ТЗ 4.2)", DefaultMaxAttempts)
+	// Единичные значения валидны и не заменяются дефолтами.
+	r = newTestReliab(&fakeClaimRedis{}, ReliabOptions{MaxAttempts: 1, MinIdle: time.Nanosecond})
+	if r.opt.MaxAttempts != 1 {
+		t.Errorf("MaxAttempts = %d, хочу 1 (одна попытка — валидная настройка)", r.opt.MaxAttempts)
+	}
+	if r.opt.MinIdle != time.Nanosecond {
+		t.Errorf("MinIdle = %s, хочу 1нс (положительный простой валиден)", r.opt.MinIdle)
 	}
 }
 
@@ -175,7 +186,8 @@ func TestReliabClaim(t *testing.T) {
 }
 
 // TestReliabClaimMinIdleDefault — minIdle 0 заменяется опцией, опция 0 —
-// значением по умолчанию.
+// значением по умолчанию; пустой старт нормализуется в "0-0", явный
+// минимальный minIdle не заменяется.
 func TestReliabClaimMinIdleDefault(t *testing.T) {
 	fake := &fakeClaimRedis{}
 	r := newTestReliab(fake, ReliabOptions{})
@@ -185,6 +197,9 @@ func TestReliabClaimMinIdleDefault(t *testing.T) {
 	if got := fake.claims[0].MinIdle; got != DefaultClaimMinIdle {
 		t.Errorf("MinIdle: %s, хочу %s", got, DefaultClaimMinIdle)
 	}
+	if got := fake.claims[0].Start; got != "0-0" {
+		t.Errorf("Start: %q, хочу 0-0 (пустой старт — с начала PEL)", got)
+	}
 
 	fake = &fakeClaimRedis{}
 	r = newTestReliab(fake, ReliabOptions{MinIdle: 2 * time.Minute})
@@ -193,6 +208,16 @@ func TestReliabClaimMinIdleDefault(t *testing.T) {
 	}
 	if got := fake.claims[0].MinIdle; got != 2*time.Minute {
 		t.Errorf("MinIdle: %s, хочу 2m из опции", got)
+	}
+
+	// Явный minIdle 1нс валиден и не подменяется опцией слоя.
+	fake = &fakeClaimRedis{}
+	r = newTestReliab(fake, ReliabOptions{MinIdle: time.Hour})
+	if _, _, err := r.Claim(context.Background(), StreamDNS, "dns", "recover-1", time.Nanosecond, 1, ""); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if got := fake.claims[0].MinIdle; got != time.Nanosecond {
+		t.Errorf("MinIdle: %s, хочу 1нс (положительный явный minIdle валиден)", got)
 	}
 }
 
@@ -526,13 +551,14 @@ func TestReliabClaimErrors(t *testing.T) {
 	}
 
 	// Запись вне форматов пакета (без task_id) не переводится в q:dead
-	// молча — ошибка для разбора оператором.
+	// молча — ошибка ветки bury для разбора оператором (точная подстрока
+	// отличает её от ошибки валидации Dead в публикации).
 	fake = &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"no_task":"id"}`}}},
 		pendRes:   map[string][]redis.XPendingExt{"1-0": {{ID: "1-0", RetryCount: 9}}},
 	}
 	if _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil ||
-		!contains(err, "task_id") {
+		!contains(err, "разберите вручную") {
 		t.Errorf("запись без task_id: %v", err)
 	}
 	if len(fake.adds) != 0 || len(fake.acks) != 0 {
@@ -540,16 +566,91 @@ func TestReliabClaimErrors(t *testing.T) {
 	}
 }
 
-// TestReliabClaimEmpty — зависших записей нет: пустой результат без ошибки.
+// TestReliabClaimEmpty — зависших записей нет: пустой результат без
+// ошибки, курсор следующего прохода — с начала PEL.
 func TestReliabClaimEmpty(t *testing.T) {
 	fake := &fakeClaimRedis{}
-	got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+	got, next, err := newTestReliab(fake, ReliabOptions{}).Claim(
 		context.Background(), StreamAnalyze, "analyzer", "recover-1", time.Minute, 5, "0-0")
 	if err != nil || got != nil {
 		t.Errorf("пустой claim: (%v, %v), хочу (nil, nil)", got, err)
 	}
+	if next != "0-0" {
+		t.Errorf("next пустого обхода = %q, хочу 0-0 (обзор PEL завершён — с начала)", next)
+	}
 	if len(fake.pends) != 0 {
 		t.Errorf("XPENDING без клейм не нужен: %+v", fake.pends)
+	}
+}
+
+// TestReliabClaimContinuesAfterSpecial — специальная запись в начале
+// пачки (сбой счётчика, уход из PEL, исчерпание попыток) не обрывает
+// обход: валидные записи следом возвращаются в работу.
+func TestReliabClaimContinuesAfterSpecial(t *testing.T) {
+	msgs := []redis.XMessage{
+		{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+		{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+	}
+	cases := []struct {
+		name     string
+		pendRes  map[string][]redis.XPendingExt
+		pendErr  map[string]error
+		wantErr  string // подстрока ошибки по первой записи ("" — без ошибки)
+		wantBury bool   // первая запись переводится в q:dead
+	}{
+		{
+			name: "сбой счётчика первой записи",
+			pendRes: map[string][]redis.XPendingExt{
+				"1719-0": {{ID: "1719-0", RetryCount: 2}},
+			},
+			pendErr: map[string]error{"1718-0": errors.New("ERR connection refused")},
+			wantErr: "счётчик доставок",
+		},
+		{
+			name: "первая покинула PEL",
+			pendRes: map[string][]redis.XPendingExt{
+				"1718-0": nil, // подтверждена между командами
+				"1719-0": {{ID: "1719-0", RetryCount: 2}},
+			},
+		},
+		{
+			name: "первая исчерпала попытки",
+			pendRes: map[string][]redis.XPendingExt{
+				"1718-0": {{ID: "1718-0", RetryCount: 9}}, // лимит 3 исчерпан
+				"1719-0": {{ID: "1719-0", RetryCount: 2}},
+			},
+			wantBury: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeClaimRedis{claimMsgs: msgs, pendRes: c.pendRes, pendOneErr: c.pendErr}
+			got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+				context.Background(), StreamHTTP, "http", "recover-1", time.Minute, 5, "0-0")
+
+			want := []Claimed{
+				{Delivery{StreamHTTP, "1719-0", []byte(`{"task_id":"t2"}`)}, 2},
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("Claim после специальной записи:\n получил  %+v\n хочу     %+v", got, want)
+			}
+			if c.wantErr != "" && (err == nil || !contains(err, c.wantErr)) {
+				t.Errorf("ожидалась ошибка %q, получено: %v", c.wantErr, err)
+			}
+			if c.wantErr == "" && err != nil {
+				t.Errorf("ожидалось отсутствие ошибки, получено: %v", err)
+			}
+			if c.wantBury {
+				if len(fake.adds) != 1 || fake.adds[0].Stream != StreamDead {
+					t.Errorf("первая запись не перенесена в q:dead: %+v", fake.adds)
+				}
+				if want := []ackCall{{StreamHTTP, "http", []string{"1718-0"}}}; !reflect.DeepEqual(fake.acks, want) {
+					t.Errorf("XACK перенесённой записи: %+v, хочу %+v", fake.acks, want)
+				}
+			} else if len(fake.adds) != 0 || len(fake.acks) != 0 {
+				t.Errorf("специальная запись не должна публиковаться и подтверждаться: %+v %+v", fake.adds, fake.acks)
+			}
+		})
 	}
 }
 

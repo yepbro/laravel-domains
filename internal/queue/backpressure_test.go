@@ -104,6 +104,72 @@ func dnsBatch() DNSBatch {
 	return DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}
 }
 
+// TestNewBackpressureGateIntervalDefault — интервал повтора: 0
+// и отрицательные — DefaultBackpressureInterval, положительное
+// наносекундное ожидание валидно и не заменяется.
+func TestNewBackpressureGateIntervalDefault(t *testing.T) {
+	for _, interval := range []time.Duration{0, -time.Second} {
+		g := NewBackpressureGate(nil, BackpressureOptions{Watermark: 1, Interval: interval})
+		if g.opt.Interval != DefaultBackpressureInterval {
+			t.Errorf("Interval %s не заменён дефолтом: %s", interval, g.opt.Interval)
+		}
+	}
+	g := NewBackpressureGate(nil, BackpressureOptions{Watermark: 1, Interval: time.Nanosecond})
+	if g.opt.Interval != time.Nanosecond {
+		t.Errorf("Interval 1нс заменён дефолтом: %s, хочу 1нс (положительный интервал валиден)", g.opt.Interval)
+	}
+}
+
+// TestBackpressureStreamMaxLen — предел стрима: 0 и отрицательные
+// MaxLen — политика DefaultStreamMaxLen, явный предел 1 — валиден
+// и не подменяется политикой.
+func TestBackpressureStreamMaxLen(t *testing.T) {
+	g := NewBackpressureGate(nil, BackpressureOptions{})
+	if got := g.streamMaxLen(StreamDNS); got != 10_000 {
+		t.Errorf("streamMaxLen без MaxLen = %d, хочу 10000 (политика q:dns)", got)
+	}
+	if got := g.streamMaxLen(StreamHTTP); got != 1_000_000 {
+		t.Errorf("streamMaxLen без MaxLen = %d, хочу 1000000 (политика штучных стримов)", got)
+	}
+	g = NewBackpressureGate(nil, BackpressureOptions{MaxLen: 1})
+	if got := g.streamMaxLen(StreamHTTP); got != 1 {
+		t.Errorf("streamMaxLen при MaxLen=1 = %d, хочу 1 (явный предел валиден)", got)
+	}
+	g = NewBackpressureGate(nil, BackpressureOptions{MaxLen: -7})
+	if got := g.streamMaxLen(StreamHTTP); got != 1_000_000 {
+		t.Errorf("streamMaxLen при отрицательном MaxLen = %d, хочу 1000000 (политика)", got)
+	}
+}
+
+// TestStreamWatermark — эффективный порог: ≤0 отключает гейт (0),
+// maxLen ≤ 0 — предел политики стрима, порог — минимум watermark
+// и половины предела.
+func TestStreamWatermark(t *testing.T) {
+	cases := []struct {
+		name      string
+		watermark int64
+		maxLen    int64
+		stream    string
+		want      int64
+	}{
+		{"нулевый watermark отключает", 0, 1000, StreamHTTP, 0},
+		{"отрицательный watermark отключает", -5, 1000, StreamHTTP, 0},
+		{"предел политики q:dns", 100_000, 0, StreamDNS, 5_000},
+		{"предел политики штучных", 600_000, 0, StreamHTTP, 500_000},
+		{"явный предел 1 — порог 0", 100_000, 1, StreamDNS, 0},
+		{"минимум — watermark", 7, 100, StreamHTTP, 7},
+		{"минимум — половина предела", 200, 100, StreamHTTP, 50},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := StreamWatermark(c.watermark, c.maxLen, c.stream); got != c.want {
+				t.Errorf("StreamWatermark(%d, %d, %s) = %d, хочу %d",
+					c.watermark, c.maxLen, c.stream, got, c.want)
+			}
+		})
+	}
+}
+
 func TestBackpressureLen(t *testing.T) {
 	// Глубина группы — lag плюс неподтверждённые; групп несколько —
 	// суммируются (у рабочих стримов группа одна, обобщённо — все).
@@ -145,15 +211,59 @@ func TestBackpressureLen(t *testing.T) {
 		t.Errorf("XLEN ключи: %v, хочу %v", fake.xlens, want)
 	}
 
-	if _, err := gate.Len(context.Background(), "q:typo"); err == nil ||
+	// Стрима ещё нет (redis.Nil / «no such key») — групп нет: глубина
+	// без доставок равна XLEN, значение XINFO GROUPS при ошибке
+	// не используется.
+	for name, groupsErr := range map[string]error{
+		"redis.Nil":   redis.Nil,
+		"no such key": errors.New("ERR no such key"),
+	} {
+		fake = &fakeBackpressure{
+			fakeRedis: &fakeRedis{},
+			seq:       [][]redis.XInfoGroup{grp(5, 7)}, // val при err не используется
+			groupsErr: groupsErr,
+			xlen:      34,
+		}
+		gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
+		n, err := gate.Len(context.Background(), StreamHTTP)
+		if err != nil || n != 34 {
+			t.Errorf("Len несуществующего стрима (%s): (%d, %v), хочу XLEN (34, nil)", name, n, err)
+		}
+		if want := []string{StreamHTTP}; !reflect.DeepEqual(fake.xlens, want) {
+			t.Errorf("Len несуществующего стрима (%s): XLEN ключи %v, хочу %v", name, fake.xlens, want)
+		}
+	}
+
+	// Ошибки — нулевая глубина и точный текст.
+	if n, err := gate.Len(context.Background(), "q:typo"); err == nil || n != 0 ||
 		!strings.Contains(err.Error(), "неизвестный стрим") {
-		t.Errorf("Len чужого стрима: %v", err)
+		t.Errorf("Len чужого стрима: (%d, %v), хочу (0, неизвестный стрим)", n, err)
 	}
 
 	gate = NewBackpressureGate(nil, BackpressureOptions{Watermark: 100})
-	if _, err := gate.Len(context.Background(), StreamDNS); err == nil ||
+	if n, err := gate.Len(context.Background(), StreamDNS); err == nil || n != 0 ||
 		!strings.Contains(err.Error(), "клиент Redis не задан") {
-		t.Errorf("Len без клиента: %v", err)
+		t.Errorf("Len без клиента: (%d, %v), хочу (0, клиент не задан)", n, err)
+	}
+
+	fake = &fakeBackpressure{
+		fakeRedis: &fakeRedis{},
+		groupsErr: errors.New("ERR connection refused"),
+	}
+	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
+	if n, err := gate.Len(context.Background(), StreamDNS); err == nil || n != 0 ||
+		!strings.Contains(err.Error(), "глубина") {
+		t.Errorf("Len при недоступном Redis: (%d, %v), хочу (0, ошибка глубины)", n, err)
+	}
+
+	// Ошибка XLEN при отсутствии групп возвращается (гейт не гадает
+	// о глубине несуществующего ключа).
+	fake = newFakeBackpressure(nil)
+	fake.xlenErr = errors.New("ERR connection refused")
+	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
+	if n, err := gate.Len(context.Background(), StreamDNS); err == nil || n != 0 ||
+		!strings.Contains(err.Error(), "групп нет") {
+		t.Errorf("Len с ошибкой XLEN: (%d, %v), хочу (0, ошибка XLEN)", n, err)
 	}
 }
 
@@ -324,8 +434,10 @@ func TestBackpressureGateUngated(t *testing.T) {
 }
 
 func TestBackpressureGateLogsWait(t *testing.T) {
+	// Два закрытых прохода (100 и 100 на пороге 100) — запись о
+	// приостановке одна: лог не спамится на каждый повтор.
 	var buf bytes.Buffer
-	fake := newFakeBackpressure(grp(100, 0), grp(50, 0))
+	fake := newFakeBackpressure(grp(100, 0), grp(100, 0), grp(50, 0))
 	gate := NewBackpressureGate(fake, BackpressureOptions{
 		Watermark: 100,
 		Interval:  time.Millisecond,
@@ -334,6 +446,9 @@ func TestBackpressureGateLogsWait(t *testing.T) {
 
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
 		t.Fatalf("AwaitCapacity: %v", err)
+	}
+	if len(fake.infos) != 3 {
+		t.Fatalf("проверок %d, хочу 3 (два отказа, третья ниже порога): %v", len(fake.infos), fake.infos)
 	}
 	out := buf.String()
 	if !strings.Contains(out, StreamDNS) || !strings.Contains(out, "100") {

@@ -155,6 +155,12 @@ func (g *BackpressureGate) watermarkFor(stream string) int64 {
 // (алерт переполнения очередей, T-080): порог алерта совпадает с порогом
 // гейта по каждому стриму. watermark ≤ 0 — 0 (гейт отключён).
 func StreamWatermark(watermark, maxLen int64, stream string) int64 {
+	// Эквивалентные мутанты (T-M04): `<= 0` → `< 0`/`<= -1` неотличимы —
+	// watermark 0 без раннего возврата даёт min(0, maxLen/2) = 0 (maxLen
+	// после замены ≤ 0 — положительный предел политики), отрицательные
+	// возвращаются нулём в обеих ветках. `<= 1` (numbers/incrementer)
+	// отличим тестом на watermark 1 и не гасится.
+	// mutator-disable-next-line expression/comparison, numbers/decrementer
 	if watermark <= 0 {
 		return 0
 	}
@@ -197,6 +203,11 @@ func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error
 	}
 	var depth int64
 	for _, grp := range groups {
+		// Эквивалентные мутанты (T-M04): `>= 0` → `> 0`/`>= 1` отличаются
+		// только при Lag == 0 — прибавка нуля сумму не меняет. `>= -1`
+		// (numbers/decrementer) отличим при Lag == −1 (неопределён) и
+		// не гасится.
+		// mutator-disable-next-line expression/comparison, numbers/incrementer
 		if grp.Lag >= 0 { // −1 — неопределён (обрезка недоставленного)
 			depth += grp.Lag
 		}

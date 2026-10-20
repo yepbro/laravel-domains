@@ -248,6 +248,9 @@ func streamIDGreater(a, b string) bool {
 		return false
 	}
 	if ams != bms {
+		// Эквивалентный мутант (T-M04): `>` → `>=` неотличим — ветка
+		// достижима только при ams != bms, где сравнения совпадают.
+		// mutator-disable-next-line expression/comparison
 		return ams > bms
 	}
 	return aseq > bseq

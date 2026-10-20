@@ -271,6 +271,11 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 		out = append(out, Claimed{Delivery: d, Attempts: attempts})
 	}
 	if len(out) == 0 {
+		// Эквивалентные мутанты (T-M04): `> 0` → `>= 0`/`> -1` неотличимы —
+		// errors.Join() без ошибок возвращает nil, ветка при пустых errs
+		// совпадает с падением в return ниже. `> 1` (numbers/incrementer)
+		// отличим одиночной ошибкой и не гасится.
+		// mutator-disable-next-line expression/comparison, numbers/decrementer
 		if len(errs) > 0 {
 			return nil, next, errors.Join(errs...)
 		}
@@ -335,6 +340,11 @@ func taskIDOf(payload []byte) string {
 	var env struct {
 		TaskID string `json:"task_id"`
 	}
+	// Эквивалентный мутант (T-M04): вырезание return из ветки ошибки
+	// неотличимо — Unmarshal при ошибке не заполняет поля (синтаксис
+	// всего ввода проверяется до декодирования, сбой типа поле не
+	// пишет), env.TaskID и так "".
+	// mutator-disable-next-line branch/if
 	if err := json.Unmarshal(payload, &env); err != nil {
 		return ""
 	}

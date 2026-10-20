@@ -104,6 +104,10 @@ func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, D
 	// начала на каждом тике (Q-07).
 	cursor := "0-0"
 	claim := func() int {
+		// Эквивалентный мутант (T-M04): minIdle 0 → −1 неотличим — Claim
+		// заменяет любое неположительное значение опцией слоя. Единицу
+		// (numbers/incrementer) отличим тестом по MinIdle XAUTOCLAIM.
+		// mutator-disable-next-line numbers/decrementer
 		claimed, next, err := r.Claim(ctx, o.Stream, o.Group, o.Consumer, 0, o.Batch, cursor)
 		if err != nil && ctx.Err() == nil {
 			log.Warn("возврат зависших доставок: клейм", "err", err)
