@@ -153,11 +153,21 @@ func BacklogLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts Ba
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	// Мутант логирования (T-M06): стартовый Info не меняет наблюдаемого
+	// поведения цикла — гасится по §4 docs/mutation-testing.md
+	// (логирование не тестируется).
+	// mutator-disable-next-line statement/remove
 	log.Info("цикл глубины backlog", "interval", o.Interval.String())
 
 	pass := func() {
 		res, err := BacklogOnce(ctx, pool, gauge)
 		switch {
+		// Тело ветки пустое (только комментарий): branch/case подменяет
+		// его на noop-EmptyStmt с идентичной печатью — мутант с пустым
+		// диффом, тестом не убить; подавление генерации — единственная
+		// альтернатива блэклисту чексумм (§4 docs/mutation-testing.md;
+		// прецедент — monitor/zonestats.go, T-M01).
+		// mutator-disable-next-line branch/case
 		case err != nil && ctx.Err() != nil:
 			// Отмена во время прохода — часть остановки, не тревога.
 		case err != nil:

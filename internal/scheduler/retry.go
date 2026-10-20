@@ -310,6 +310,10 @@ func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
 	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16) (int, error) {
 	rows, err := tx.Query(ctx, sql, zoneIDs, domainIDs, set, guardStatus, guardState)
 	if err != nil {
+		// Эквивалентные мутанты (T-M06): сдвиг возвращаемого счётчика
+		// (0 → −1/1) ненаблюдаем — RetryOnce при err != nil отбрасывает
+		// результат (RetryResult{}, err) и значение никто не читает.
+		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
 	}
 	defer rows.Close()
@@ -319,11 +323,19 @@ func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
 		var zoneID int16
 		var id int64
 		if err := rows.Scan(&zoneID, &id); err != nil {
+			// Эквивалентные мутанты (T-M06): счётчик при ошибке Scan не
+			// читается вызывателем (см. выше), ветка return закрыта тестом
+			// TestRetryOnceRowsErrors.
+			// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 			return 0, fmt.Errorf("scheduler: повторные проверки temp_error: %s: чтение ключей: %w", kind, err)
 		}
 		n++
 	}
 	if err := rows.Err(); err != nil {
+		// Эквивалентные мутанты (T-M06): счётчик при ошибке rows.Err() не
+		// читается вызывателем (см. выше), ветка return закрыта тестом
+		// TestRetryOnceRowsErrors.
+		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
 	}
 	return n, nil

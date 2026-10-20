@@ -255,6 +255,12 @@ func TestLeaseOnceNilPool(t *testing.T) {
 // --- LeaseOptions ---------------------------------------------------------
 
 func TestLeaseOptionsDefaults(t *testing.T) {
+	// Дефолт пачки пинится литералом ТЗ 5.3 (коридор 1000–10 000):
+	// сравнение с самой константой мутации не замечает.
+	if DefaultLeaseBatch != 5000 {
+		t.Errorf("DefaultLeaseBatch = %d, want 5000", DefaultLeaseBatch)
+	}
+
 	// Нулевые и отрицательные значения — дефолты; интервал цикла —
 	// половина срока аренды (баланс «скорость возврата vs нагрузка»,
 	// см. LeaseWatch), в том числе от дефолтного срока.
@@ -284,6 +290,17 @@ func TestLeaseOptionsDefaults(t *testing.T) {
 	// положительный интервал.
 	if got := (LeaseOptions{Timeout: time.Nanosecond}).withDefaults(); got.Interval <= 0 {
 		t.Errorf("Interval = %v при Timeout=1ns, want > 0", got.Interval)
+	}
+
+	// Границы замен: 1 нс и 1 — положительные значения, не дефолты.
+	if got := (LeaseOptions{Timeout: time.Nanosecond, BatchSize: 1}).withDefaults(); got.Timeout != time.Nanosecond || got.BatchSize != 1 {
+		t.Errorf("withDefaults(Timeout=1нс, BatchSize=1) = %+v, want без замены", got)
+	}
+	// Интервал 1 нс проверяется при Timeout 4 нс: подмена дефолтом дала
+	// бы 2 нс (Timeout/2), а вырожденный Timeout 1 нс совпадает с
+	// внутренним минимумом тикера и подмену не выявляет.
+	if got := (LeaseOptions{Timeout: 4 * time.Nanosecond, Interval: time.Nanosecond}).withDefaults(); got.Interval != time.Nanosecond {
+		t.Errorf("Interval 1нс = %v, want без замены", got.Interval)
 	}
 
 	// Заданные значения не затираются, Now передаётся как есть.
@@ -409,6 +426,45 @@ func TestLeaseWatchCancelDuringDrain(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("отмена во время дренажа — Warn:\n%s", buf.String())
+	}
+}
+
+// TestLeaseWatchDrainTotals — Info-итог дренажа: положительная сумма
+// логируется (ровно 1 — тоже положительная), нулевая — нет. Дренаж
+// выполняется при уже отменённом ctx: фейк ошибок не возвращает, отмена
+// не мешает проходам — итог обязан быть подведён.
+func TestLeaseWatchDrainTotals(t *testing.T) {
+	tests := []struct {
+		name string
+		tags []int64
+		want string // подстрока Info-итога дренажа; "" — итог не логируется
+	}{
+		{"неполная пачка из одного", []int64{1}, "domains=1"},
+		{"нулевой дренаж", []int64{0}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			pool := &leaseFakePool{tags: tt.tags}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel() // стартовый дренаж синхронен и от тика не зависит
+			done := make(chan error, 1)
+			go func() { done <- LeaseWatch(ctx, pool, LeaseOptions{Log: logger}) }()
+
+			if err := <-done; err != nil {
+				t.Fatalf("LeaseWatch: %v, want nil", err)
+			}
+			log := buf.String()
+			if tt.want == "" {
+				if strings.Contains(log, "дренаж возврата истёкших lease") {
+					t.Errorf("нулевой дренаж подводит итог:\n%s", log)
+				}
+			} else if !strings.Contains(log, tt.want) {
+				t.Errorf("лог не содержит %q:\n%s", tt.want, log)
+			}
+		})
 	}
 }
 

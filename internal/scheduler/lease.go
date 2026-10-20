@@ -145,6 +145,11 @@ func (o LeaseOptions) withDefaults() LeaseOptions {
 		// Timeout ≤ 1 нс делением даёт 0 — тикеру нужен положительный
 		// интервал, поэтому минимум 1 нс.
 		o.Interval = o.Timeout / 2
+		// Эквивалентный мутант (T-M06): `o.Interval <= 1` ведёт себя как
+		// `<= 0` — после деления на 2 здесь не бывает значений из (0, 1 нс)
+		// кроме ровно 1 нс (Timeout 2–3 нс), а тело присваивает те же
+		// 1 нс (no-op); значения ≥ 2 нс обе границы пропускают.
+		// mutator-disable-next-line numbers/incrementer
 		if o.Interval <= 0 {
 			o.Interval = time.Nanosecond
 		}

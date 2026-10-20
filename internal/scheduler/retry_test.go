@@ -559,6 +559,11 @@ func TestRetryOnceErrors(t *testing.T) {
 				if tx.committed {
 					t.Errorf("транзакция закоммичена при ошибке %q", tt.name)
 				}
+				// Отложенный откат обязан сработать: прерванный проход
+				// не оставляет половинчатых изменений (ТЗ 3.4).
+				if !tx.rolledBack {
+					t.Errorf("транзакция не откачена при ошибке %q", tt.name)
+				}
 			}
 		})
 	}
@@ -585,6 +590,55 @@ func TestRetryOnceCtxCanceled(t *testing.T) {
 	}
 }
 
+// TestRetryOnceRowsErrors — ошибки чтения строк на обоих шагах прохода:
+// Scan кандидатов и ключей RETURNING (лишняя колонка ломает позиционный
+// Scan), rows.Err после исчерпания строк — точные контексты сообщений,
+// исходная ошибка проксируется (errors.Is).
+func TestRetryOnceRowsErrors(t *testing.T) {
+	// Scan кандидатов: вторая строка с двумя колонками вместо трёх.
+	scanPool := &retryFakePool{selects: []*retryFakeRows{retryRows(
+		[]any{int16(1), int64(10), int16(0)},
+		[]any{int16(2), int64(20)},
+	)}}
+	if _, err := RetryOnce(context.Background(), scanPool, RetryOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "чтение кандидатов") {
+		t.Errorf("ошибка Scan кандидатов = %v, want «чтение кандидатов»", err)
+	}
+
+	// rows.Err после чтения кандидатов.
+	boom := errors.New("бд недоступна")
+	candRows := retryRows([]any{int16(1), int64(10), int16(0)})
+	candRows.err = boom
+	candPool := &retryFakePool{selects: []*retryFakeRows{candRows}}
+	_, err := RetryOnce(context.Background(), candPool, RetryOptions{})
+	if err == nil || !strings.Contains(err.Error(), "выборка кандидатов") || !errors.Is(err, boom) {
+		t.Errorf("ошибка rows.Err кандидатов = %v, want «выборка кандидатов» и исходная", err)
+	}
+
+	// Scan ключей RETURNING: вторая строка с одной колонкой вместо двух.
+	keyScanPool := &retryFakePool{
+		selects:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
+		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10)}, []any{int16(2)})},
+	}
+	if _, err := RetryOnce(context.Background(), keyScanPool, RetryOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "чтение ключей") {
+		t.Errorf("ошибка Scan ключей = %v, want «чтение ключей»", err)
+	}
+
+	// rows.Err после чтения ключей RETURNING.
+	keyRows := retryRows([]any{int16(1), int64(10)})
+	keyRows.err = boom
+	keyPool := &retryFakePool{
+		selects:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
+		requeues: []*retryFakeRows{keyRows},
+	}
+	_, err = RetryOnce(context.Background(), keyPool, RetryOptions{})
+	if err == nil || !strings.Contains(err.Error(), "назначение повтора") || !errors.Is(err, boom) {
+		t.Errorf("ошибка rows.Err обновления = %v, want «назначение повтора» и исходная", err)
+	}
+}
+
+// TestRetryOnceNilPool — пул обязан быть задан.
 func TestRetryOnceNilPool(t *testing.T) {
 	if _, err := RetryOnce(context.Background(), nil, RetryOptions{}); err == nil ||
 		!strings.Contains(err.Error(), "пул не задан") {
@@ -595,6 +649,15 @@ func TestRetryOnceNilPool(t *testing.T) {
 // --- RetryOptions ----------------------------------------------------------
 
 func TestRetryOptionsDefaults(t *testing.T) {
+	// Дефолты пинятся литералами ТЗ 5.3: окно повтора 24 часа, пачка
+	// 1000 — сравнение с самой константой мутации не замечает.
+	if DefaultRetryAfter != 24*time.Hour {
+		t.Errorf("DefaultRetryAfter = %v, want 24ч", DefaultRetryAfter)
+	}
+	if DefaultRetryBatch != 1000 {
+		t.Errorf("DefaultRetryBatch = %d, want 1000", DefaultRetryBatch)
+	}
+
 	got := RetryOptions{}.withDefaults()
 	want := RetryOptions{
 		RetryAfter: DefaultRetryAfter,
@@ -618,6 +681,15 @@ func TestRetryOptionsDefaults(t *testing.T) {
 	}.withDefaults()
 	if set.RetryAfter != time.Hour || set.MaxRetries != 5 || set.BatchSize != 7 || set.Interval != 9*time.Hour {
 		t.Errorf("withDefaults затирает заданные значения: %+v", set)
+	}
+
+	// Границы замен: 1 нс — положительное значение, дефолтом не
+	// заменяется (окно и интервал — независимо друг от друга).
+	if got := (RetryOptions{RetryAfter: time.Nanosecond}).withDefaults().RetryAfter; got != time.Nanosecond {
+		t.Errorf("RetryAfter 1нс = %v, want без замены", got)
+	}
+	if got := (RetryOptions{Interval: time.Nanosecond}).withDefaults().Interval; got != time.Nanosecond {
+		t.Errorf("Interval 1нс = %v, want без замены", got)
 	}
 }
 
@@ -727,6 +799,143 @@ func TestRetryTempErrorsDrain(t *testing.T) {
 	st := pool.stats()
 	if st.begins != 2 || st.commits != 2 {
 		t.Errorf("транзакций %d, коммитов %d, want 2 и 2 (обе пачки в одном дренаже)", st.begins, st.commits)
+	}
+}
+
+// TestRetryTempErrorsDrainTotals — дренаж суммирует результаты пачек:
+// Info-итог — накопленная сумма всех пачек (включая ровно 1), нулевой
+// дренаж итога не логирует. Дренаж выполняется при уже отменённом ctx:
+// фейк ошибок не возвращает, отмена не мешает проходам — итог обязан
+// быть подведён.
+func TestRetryTempErrorsDrainTotals(t *testing.T) {
+	tests := []struct {
+		name      string
+		selects   []*retryFakeRows
+		requeues  []*retryFakeRows
+		finalizes []*retryFakeRows
+		opts      RetryOptions
+		want      string // подстрока Info-итога дренажа; "" — итог не логируется
+	}{
+		{
+			name: "две полные пачки повторов — сумма 2",
+			selects: []*retryFakeRows{
+				retryRows([]any{int16(1), int64(10), int16(0)}),
+				retryRows([]any{int16(2), int64(20), int16(0)}),
+			},
+			requeues: []*retryFakeRows{
+				retryRows([]any{int16(1), int64(10)}),
+				retryRows([]any{int16(2), int64(20)}),
+			},
+			opts: RetryOptions{BatchSize: 1},
+			want: "requeued=2",
+		},
+		{
+			name: "две полные пачки итогов — сумма 2",
+			selects: []*retryFakeRows{
+				retryRows([]any{int16(1), int64(10), int16(3)}),
+				retryRows([]any{int16(2), int64(20), int16(3)}),
+			},
+			finalizes: []*retryFakeRows{
+				retryRows([]any{int16(1), int64(10)}),
+				retryRows([]any{int16(2), int64(20)}),
+			},
+			opts: RetryOptions{BatchSize: 1},
+			want: "finalized=2",
+		},
+		{
+			name:      "одна полная пачка итогов — сумма 1",
+			selects:   []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(3)})},
+			finalizes: []*retryFakeRows{retryRows([]any{int16(1), int64(10)})},
+			opts:      RetryOptions{BatchSize: 1},
+			want:      "finalized=1",
+		},
+		{
+			name: "пустой дренаж — без итога",
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			pool := &retryFakePool{
+				selects:   tt.selects,
+				requeues:  tt.requeues,
+				finalizes: tt.finalizes,
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel() // стартовый дренаж синхронен и от тика не зависит
+			done := make(chan error, 1)
+			opts := tt.opts
+			opts.Log = logger
+			go func() { done <- RetryTempErrors(ctx, pool, opts) }()
+
+			if err := <-done; err != nil {
+				t.Fatalf("RetryTempErrors: %v, want nil", err)
+			}
+			log := buf.String()
+			if tt.want == "" {
+				if strings.Contains(log, "дренаж повторных проверок temp_error") {
+					t.Errorf("нулевой дренаж подводит итог:\n%s", log)
+				}
+			} else if !strings.Contains(log, tt.want) {
+				t.Errorf("лог не содержит %q:\n%s", tt.want, log)
+			}
+		})
+	}
+}
+
+// TestRetryTempErrorsCancelDuringDrain — отмена ctx во время дренажа —
+// часть остановки: без Warn и без Info-итога (незавершённый дренаж не
+// подводит черту), чистый nil (контракт OnRun, T-012).
+func TestRetryTempErrorsCancelDuringDrain(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	// Пачка 1 — полная (продолжение дренажа), пачка 2 — отмена ctx.
+	pool := &retryFakePool{
+		selects: []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
+		requeues: []*retryFakeRows{
+			retryRows([]any{int16(1), int64(10)}),
+		},
+		selectErrs: []error{nil, context.Canceled},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- RetryTempErrors(ctx, pool, RetryOptions{BatchSize: 1, Log: logger})
+	}()
+
+	if err := <-done; err != nil {
+		t.Fatalf("RetryTempErrors: %v, want nil при отмене ctx", err)
+	}
+	log := buf.String()
+	if strings.Contains(log, "level=WARN") || strings.Contains(log, "requeued=") {
+		t.Errorf("отмена во время дренажа — не тревога и не итог:\n%s", log)
+	}
+}
+
+// TestRetryTempErrorsNilLog — nil-логгер заменяется заглушкой: стартовая
+// запись и записи цикла уходят в slog.DiscardHandler, не паникуя на
+// nil-приёмнике.
+func TestRetryTempErrorsNilLog(t *testing.T) {
+	pool := &retryFakePool{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // стартовый дренаж пуст, сразу чистый выход
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("паника при Log=nil: %v", r)
+		}
+	}()
+	if err := RetryTempErrors(ctx, pool, RetryOptions{}); err != nil {
+		t.Fatalf("RetryTempErrors: %v, want nil", err)
+	}
+	if st := pool.stats(); st.selects != 1 {
+		t.Errorf("SELECT'ов = %d, want 1: стартовый дренаж выполнен", st.selects)
 	}
 }
 

@@ -241,11 +241,27 @@ func recheckCheckDefaults(t *testing.T, got RecheckOptions, wantInterval time.Du
 }
 
 func TestRecheckOptionsDefaults(t *testing.T) {
+	// Дефолты пинятся литералами ТЗ (3.3: 6 месяцев; 5.3: пачки, сутки):
+	// сравнение с самой константой мутации не замечает.
+	if DefaultRecheckInterval != 4380*time.Hour {
+		t.Errorf("DefaultRecheckInterval = %v, want 4380ч (≈6 месяцев)", DefaultRecheckInterval)
+	}
+	if DefaultRecheckBatch != 5000 {
+		t.Errorf("DefaultRecheckBatch = %d, want 5000", DefaultRecheckBatch)
+	}
+	if DefaultRecheckSchedule != 24*time.Hour {
+		t.Errorf("DefaultRecheckSchedule = %v, want сутки", DefaultRecheckSchedule)
+	}
+
 	// Нулевые и отрицательные значения — дефолты.
 	recheckCheckDefaults(t, (RecheckOptions{}).withDefaults(),
 		DefaultRecheckInterval, DefaultRecheckBatch, DefaultRecheckSchedule)
 	recheckCheckDefaults(t, (RecheckOptions{Interval: -time.Hour, BatchSize: -1, Schedule: -time.Minute}).withDefaults(),
 		DefaultRecheckInterval, DefaultRecheckBatch, DefaultRecheckSchedule)
+
+	// Границы замен: 1 нс и 1 — положительные значения, не дефолты.
+	recheckCheckDefaults(t, (RecheckOptions{Interval: time.Nanosecond, BatchSize: 1, Schedule: time.Nanosecond}).withDefaults(),
+		time.Nanosecond, 1, time.Nanosecond)
 
 	// Заданные значения не затираются, Now передаётся как есть.
 	now := func() time.Time { return time.Unix(0, 0) }
@@ -366,6 +382,45 @@ func TestRecheckDailyCancelDuringDrain(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("отмена во время дренажа — Warn:\n%s", buf.String())
+	}
+}
+
+// TestRecheckDailyDrainTotals — Info-итог дренажа: положительная сумма
+// логируется (ровно 1 — тоже положительная), нулевая — нет. Дренаж
+// выполняется при уже отменённом ctx: фейк ошибок не возвращает, отмена
+// не мешает проходам — итог обязан быть подведён.
+func TestRecheckDailyDrainTotals(t *testing.T) {
+	tests := []struct {
+		name string
+		tags []int64
+		want string // подстрока Info-итога дренажа; "" — итог не логируется
+	}{
+		{"неполная пачка из одного", []int64{1}, "domains=1"},
+		{"нулевой дренаж", []int64{0}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			pool := &recheckFakePool{tags: tt.tags}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel() // стартовый дренаж синхронен и от тика не зависит
+			done := make(chan error, 1)
+			go func() { done <- RecheckDaily(ctx, pool, RecheckOptions{Log: logger}) }()
+
+			if err := <-done; err != nil {
+				t.Fatalf("RecheckDaily: %v, want nil", err)
+			}
+			log := buf.String()
+			if tt.want == "" {
+				if strings.Contains(log, "суточный дренаж перепроверки доменов") {
+					t.Errorf("нулевой дренаж подводит итог:\n%s", log)
+				}
+			} else if !strings.Contains(log, tt.want) {
+				t.Errorf("лог не содержит %q:\n%s", tt.want, log)
+			}
+		})
 	}
 }
 
