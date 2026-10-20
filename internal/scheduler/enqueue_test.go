@@ -441,6 +441,57 @@ func TestEnqueueBatch_EmptyBatch(t *testing.T) {
 	}
 }
 
+// TestEnqueueBatch_ValidationNumbers — номер домена в сообщении ошибки —
+// 1-based: невалидная вторая строка пачки именуется «домен №2».
+func TestEnqueueBatch_ValidationNumbers(t *testing.T) {
+	valid := DispatchRow{ZoneID: 1, DomainID: 1, Name: "ok.example.com"}
+	cases := []struct {
+		name string
+		row  DispatchRow
+		want string
+	}{
+		{"зона 0", DispatchRow{DomainID: 2, Name: "b.example.com"}, "домен №2: zone_id 0 ≤ 0"},
+		{"домен 0", DispatchRow{ZoneID: 2, Name: "b.example.com"}, "домен №2: domain_id 0 ≤ 0"},
+		{"пустое имя", DispatchRow{ZoneID: 1, DomainID: 2}, "домен №2: пустое имя"},
+		{"длинное имя", DispatchRow{ZoneID: 1, DomainID: 2, Name: strings.Repeat("a", 254)}, "домен №2: имя длиннее 253 октетов"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := &enqueueFakePool{}
+			_, err := EnqueueBatch(context.Background(), pool, &enqueueFakeQueue{}, []DispatchRow{valid, tc.row})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want сообщение с %q (номер строки — 1-based)", err, tc.want)
+			}
+			if calls := pool.enqueuePoolCalls(); len(calls) != 0 {
+				t.Errorf("невалидная пачка дошла до БД: %v", calls)
+			}
+		})
+	}
+}
+
+// TestEnqueueBatch_NameLenBoundary — имя ровно в 253 октета (лимит ТЗ 5.2
+// п. 4) валидно: граница строгая, 253 проходит (254 — нет, таблица выше).
+func TestEnqueueBatch_NameLenBoundary(t *testing.T) {
+	name := strings.Repeat("a", 249) + ".com"
+	if len(name) != enqueueMaxNameLen {
+		t.Fatalf("имя-граница = %d октетов, want %d", len(name), enqueueMaxNameLen)
+	}
+	pool := &enqueueFakePool{}
+	q := &enqueueFakeQueue{}
+
+	res, err := EnqueueBatch(context.Background(), pool, q, []DispatchRow{{ZoneID: 1, DomainID: 7, Name: name}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != (EnqueueResult{Queued: 1, Published: 1, Skipped: 0}) {
+		t.Errorf("итог = %+v, want {Queued:1 Published:1 Skipped:0}", res)
+	}
+	pubs := q.enqueueQueuePublishes()
+	if len(pubs) != 1 || len(pubs[0].msg.Domains) != 1 || pubs[0].msg.Domains[0].Name != name {
+		t.Errorf("публикации = %+v, want одна с именем-границей", pubs)
+	}
+}
+
 // TestEnqueueBatch_Validation — nil пула/очереди и недопустимые строки
 // отвергаются до обращения к БД: публикация q:dns отвергла бы такие
 // значения, а перевод к этому моменту уже был бы зафиксирован.
@@ -608,6 +659,51 @@ func TestEnqueue_SQLContract(t *testing.T) {
 	// Ключи пачки — PK таблицы: UPDATE адресует строки парой (zone_id, id).
 	if !strings.Contains(up, "PRIMARY KEY (zone_id, id)") {
 		t.Error("в миграции 000001 нет PK domains (zone_id, id) — ключи перевода обязаны совпадать с ним")
+	}
+}
+
+// TestEnqueueDefaults — дефолты цикла пин литералами (ТЗ 5.10 и
+// комментарии констант): рассинхрон заметен тестом, а не ревью.
+func TestEnqueueDefaults(t *testing.T) {
+	if DefaultEnqueueBatch != 5000 {
+		t.Errorf("DefaultEnqueueBatch = %d, want 5000 (зеркалит дефолт scheduler.batch_size)", DefaultEnqueueBatch)
+	}
+	if DefaultEnqueueInterval != time.Second {
+		t.Errorf("DefaultEnqueueInterval = %v, want 1s", DefaultEnqueueInterval)
+	}
+	if DefaultEnqueueIdleWait != 30*time.Second {
+		t.Errorf("DefaultEnqueueIdleWait = %v, want 30s", DefaultEnqueueIdleWait)
+	}
+}
+
+// TestEnqueueOptionsWithDefaults — withDefaults заменяет только
+// неположительные значения: BatchSize = 1 и паузы в 1нс валидны (остаются
+// как есть), ноль и отрицательные — дефолты.
+func TestEnqueueOptionsWithDefaults(t *testing.T) {
+	cases := []struct {
+		name         string
+		in           EnqueueOptions
+		wantBatch    int
+		wantInterval time.Duration
+		wantIdleWait time.Duration
+	}{
+		{"нулевые", EnqueueOptions{}, DefaultEnqueueBatch, DefaultEnqueueInterval, DefaultEnqueueIdleWait},
+		{"отрицательные", EnqueueOptions{BatchSize: -5, Interval: -time.Second, IdleWait: -time.Minute},
+			DefaultEnqueueBatch, DefaultEnqueueInterval, DefaultEnqueueIdleWait},
+		{"пачка 1 валидна", EnqueueOptions{BatchSize: 1}, 1, DefaultEnqueueInterval, DefaultEnqueueIdleWait},
+		{"интервал 1нс валиден", EnqueueOptions{Interval: 1}, DefaultEnqueueBatch, 1, DefaultEnqueueIdleWait},
+		{"ожидание 1нс валидно", EnqueueOptions{IdleWait: 1}, DefaultEnqueueBatch, DefaultEnqueueInterval, 1},
+		{"явные значения", EnqueueOptions{BatchSize: 10, Interval: time.Minute, IdleWait: 5 * time.Second},
+			10, time.Minute, 5 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.in.withDefaults()
+			if got.BatchSize != tc.wantBatch || got.Interval != tc.wantInterval || got.IdleWait != tc.wantIdleWait {
+				t.Errorf("withDefaults() = {BatchSize:%d Interval:%v IdleWait:%v}, want {%d %v %v}",
+					got.BatchSize, got.Interval, got.IdleWait, tc.wantBatch, tc.wantInterval, tc.wantIdleWait)
+			}
+		})
 	}
 }
 
@@ -799,5 +895,154 @@ func TestEnqueueLoop_Validation(t *testing.T) {
 	}
 	if err := EnqueueLoop(context.Background(), &enqueueFakePool{}, nil, EnqueueOptions{}); err == nil || !strings.Contains(err.Error(), "очередь не задана") {
 		t.Errorf("nil очередь: err = %v, want «очередь не задана»", err)
+	}
+}
+
+// TestEnqueueLoop_DispatchErrorWaits — после ошибки выборки цикл уходит в
+// паузу IdleWait, а не молотит БД холостыми кругами: до отмены — ровно
+// одна попытка.
+func TestEnqueueLoop_DispatchErrorWaits(t *testing.T) {
+	pool := &enqueueFakePool{
+		zones:       [][]any{{int16(1), "example.com"}},
+		dispatchErr: errors.New("база моргнула"),
+		notify:      make(chan struct{}, 8),
+	}
+	q := &enqueueFakeQueue{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := enqueueLoopRun(ctx, pool, q, EnqueueOptions{Interval: time.Hour, IdleWait: time.Hour})
+	enqueueWaitSignal(t, pool.notify, "неудачная выборка")
+	time.Sleep(100 * time.Millisecond) // цикл в паузе IdleWait; без неё — поток запросов
+
+	if calls := pool.enqueuePoolCalls(); len(calls) != 1 || calls[0].kind != enqueueKindZones {
+		t.Fatalf("обращения = %v, want одна попытка выборки (пауза IdleWait после ошибки)", calls)
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("цикл вернул %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("цикл не остановился по отмене ctx")
+	}
+	if pubs := q.enqueueQueuePublishes(); len(pubs) != 0 {
+		t.Errorf("публикаций %d, want 0", len(pubs))
+	}
+}
+
+// TestEnqueueLoop_EmptyBatchWaitsStrict — пустая пачка — именно ожидание
+// пополнения IdleWait, а не прогон постановки пустой пачки с паузой
+// Interval: до отмены — одна выборка, холостого цикла нет.
+func TestEnqueueLoop_EmptyBatchWaitsStrict(t *testing.T) {
+	pool := &enqueueFakePool{notify: make(chan struct{}, 8)} // pending пуст
+	q := &enqueueFakeQueue{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := enqueueLoopRun(ctx, pool, q, EnqueueOptions{Interval: time.Millisecond, IdleWait: time.Hour})
+	enqueueWaitSignal(t, pool.notify, "пустая выборка")
+	time.Sleep(100 * time.Millisecond)
+
+	if calls := pool.enqueuePoolCalls(); len(calls) != 1 || calls[0].kind != enqueueKindZones {
+		t.Fatalf("обращения = %v, want одна выборка (пустая пачка ждёт пополнения)", calls)
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("цикл вернул %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("цикл не остановился по отмене ctx")
+	}
+	if pubs := q.enqueueQueuePublishes(); len(pubs) != 0 {
+		t.Errorf("публикаций %d, want 0", len(pubs))
+	}
+}
+
+// TestEnqueueLoop_SingleRowBatchEnqueued — пачка из одного домена — не
+// «пустая»: перевод и публикация выполняются.
+func TestEnqueueLoop_SingleRowBatchEnqueued(t *testing.T) {
+	pool := &enqueueFakePool{
+		zones: [][]any{{int16(1), "example.com"}},
+		dispatches: []*enqueueFakeRows{enqueueFakeRowsOf(
+			[]any{int16(1), int64(101), "a"},
+		)},
+		notify: make(chan struct{}, 8),
+	}
+	q := &enqueueFakeQueue{notify: make(chan struct{}, 8)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := enqueueLoopRun(ctx, pool, q, EnqueueOptions{Interval: time.Hour, IdleWait: time.Hour})
+	enqueueWaitFor(t, 5*time.Second, func() bool {
+		return len(q.enqueueQueuePublishes()) >= 1
+	}, "публикация пачки из одного домена")
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("цикл вернул %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("цикл не остановился по отмене ctx")
+	}
+	pubs := q.enqueueQueuePublishes()
+	if len(pubs) != 1 || len(pubs[0].msg.Domains) != 1 ||
+		pubs[0].msg.Domains[0] != (queue.DNSDomain{ZoneID: 1, DomainID: 101, Name: "a.example.com"}) {
+		t.Errorf("публикации = %+v, want один домен a.example.com", pubs)
+	}
+}
+
+// TestEnqueueLoop_EnqueueErrorWaits — после ошибки постановки (перевод
+// сорвался) цикл уходит в паузу IdleWait: до отмены — один полный круг
+// (зоны, выборка, перевод) без новых обращений.
+func TestEnqueueLoop_EnqueueErrorWaits(t *testing.T) {
+	pool := &enqueueFakePool{
+		zones: [][]any{{int16(1), "example.com"}},
+		dispatches: []*enqueueFakeRows{enqueueFakeRowsOf(
+			[]any{int16(1), int64(101), "a"},
+			[]any{int16(2), int64(201), "b"},
+		)},
+		updateErr: errors.New("update сорвался"),
+		notify:    make(chan struct{}, 16),
+	}
+	q := &enqueueFakeQueue{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := enqueueLoopRun(ctx, pool, q, EnqueueOptions{Interval: time.Millisecond, IdleWait: time.Hour})
+	enqueueWaitSignal(t, pool.notify, "зоны")
+	enqueueWaitSignal(t, pool.notify, "выборка")
+	enqueueWaitSignal(t, pool.notify, "перевод (неудачный)")
+	time.Sleep(100 * time.Millisecond)
+
+	calls := pool.enqueuePoolCalls()
+	wantKinds := []enqueueCallKind{enqueueKindZones, enqueueKindDispatch, enqueueKindUpdate}
+	if len(calls) != len(wantKinds) {
+		t.Fatalf("обращений = %d (%v), want %d: после ошибки постановки — пауза IdleWait", len(calls), calls, len(wantKinds))
+	}
+	for i, kind := range wantKinds {
+		if calls[i].kind != kind {
+			t.Fatalf("обращение[%d] = %s, want %s", i, calls[i].kind, kind)
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("цикл вернул %v, want nil (ошибка шага не останавливает сервис)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("цикл не остановился по отмене ctx")
+	}
+	if pubs := q.enqueueQueuePublishes(); len(pubs) != 0 {
+		t.Errorf("публикаций %d, want 0", len(pubs))
 	}
 }

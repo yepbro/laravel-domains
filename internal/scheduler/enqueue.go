@@ -275,6 +275,12 @@ func (o EnqueueOptions) withDefaults() EnqueueOptions {
 // lease T-029). Гейт backpressure подключается обёрткой очереди в сборке
 // сервиса (queue.WatermarkPublisher, T-026) — цикл публикует через
 // интерфейс Queue и гейта не знает.
+//
+// Мутанты логирования (T-M05): Warn шагов цикла и Debug итога пачки не
+// меняют наблюдаемого поведения (ошибки уже учтены wait/continue) —
+// гасятся по docs/mutation-testing.md §4 (логирование не тестируется).
+// mutator-disable-regexp log\.Warn\("цикл statement/remove
+// mutator-disable-regexp log\.Debug\("пачка statement/remove
 func EnqueueLoop(ctx context.Context, pool db.DB, q queue.Queue, opts EnqueueOptions) error {
 	if pool == nil {
 		return errors.New("scheduler: цикл постановки: пул не задан")
@@ -323,6 +329,11 @@ func EnqueueLoop(ctx context.Context, pool db.DB, q queue.Queue, opts EnqueueOpt
 
 		res, err := EnqueueBatch(ctx, pool, q, batch)
 		if err != nil {
+			// Эквивалентный мутант (T-M05): без этого return цикл
+			// завершается следующим витком — wait прерывается ctx.Done,
+			// DispatchBatch по отменённому ctx вернёт ошибку, выход там
+			// тоже nil (контракт OnRun); отличие — лишний Warn.
+			// mutator-disable-next-line branch/if
 			if ctx.Err() != nil {
 				return nil
 			}

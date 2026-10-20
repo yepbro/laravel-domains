@@ -78,6 +78,11 @@ import (
 // раунд — отдельный запрос, но только по «голодным» зонам с keyset; чаще
 // двух раундов не бывает (равные доли исчерпываются первым раундом),
 // предел страхует патологические веса.
+// Эквивалентные мутанты (T-M05): 3 и 5 неотличимы от 4 — тело цикла
+// выполняется не более 2 раз: раунд 2 требует «голодную» зону (n == quota)
+// при неполной пачке, а с раунда 1 quota = Limit и такие n заполняют пачку
+// до Limit (break). Наблюдаемое число запросов одно и то же.
+// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 const dispatchMaxRounds = 4
 
 // dispatchZonesSQL — активные зоны (малый справочник, без агрегатов):
@@ -164,19 +169,42 @@ func DispatchBatch(ctx context.Context, pool db.DB, q DispatchQuery) ([]Dispatch
 
 	// Квота зоны на раунд — верхняя оценка её доли в пачке (см. шапку).
 	weights := q.ZoneWeights
+	// Эквивалентный мутант (T-M05): maxW := 0 ≡ 1 — зоны здесь непусты
+	// (ранний возврат выше), а каждый нормализованный вес ≥ 1, первый же
+	// проход цикла выставит maxW ≥ 1.
+	// mutator-disable-next-line numbers/decrementer
 	sumW, maxW := 0, 1
 	for _, z := range zones {
 		w := weights[z.id]
+		// Эквивалентные мутанты (T-M05): `w <= 1` и `w < 2` не меняют
+		// поведение — значения карты ≥ 1 (dispatchValidate), отсутствующая
+		// зона даёт 0: обе границы превращают 0 → 1 и присваивают w = 1
+		// то же значение (no-op). `w < 0` (decrementer) отличим — сумма
+		// нулевых весов даст деление на ноль — и не гасится.
+		// mutator-disable-next-line expression/comparison, numbers/incrementer
 		if w < 1 {
 			w = 1
 		}
 		sumW += w
+		// Эквивалентный мутант (T-M05): `w >= maxW` при w == maxW
+		// присваивает maxW то же значение — итог (максимум весов) тот же.
+		// mutator-disable-next-line expression/comparison
 		if w > maxW {
 			maxW = w
 		}
 	}
 	quota := (q.Limit*maxW + sumW - 1) / sumW // ceil(L × maxW / ΣW)
+	// Эквивалентные мутанты (T-M05): quota ≥ 1 всегда — L ≥ 1 (валидация),
+	// maxW ≥ 1 и sumW ≥ maxW (максимум — один из весов), числитель
+	// L×maxW + sumW − 1 ≥ sumW, целочисленное деление даёт ≥ 1; ветка —
+	// защитная, недостижима (включая вырезание тела branch/if — no-op
+	// присваивание).
+	// mutator-disable-next-line expression/comparison, numbers/decrementer, numbers/incrementer, branch/if
 	if quota < 1 {
+		// Эквивалентные мутанты (T-M05): тело недостижимой ветки (см. if
+		// выше) — в том числе вырезание присваивания (statement/remove:
+		// no-op `_ = quota`) и числовые сдвиги.
+		// mutator-disable-next-line numbers/decrementer, numbers/incrementer, statement/remove
 		quota = 1
 	}
 	quota++
@@ -185,11 +213,19 @@ func DispatchBatch(ctx context.Context, pool db.DB, q DispatchQuery) ([]Dispatch
 	// квоту: возможно, обрезаны LIMIT), keyset от последнего id зоны.
 	var merged []dispatchPick
 	pending := zones // зоны раунда
+	// Эквивалентные мутанты (T-M05): счётчик round в теле не используется,
+	// а тело выполняется не более 2 раз (см. dispatchMaxRounds), поэтому
+	// `round <= …`, старт с −1 или 1 дают те же выполнения.
+	// mutator-disable-next-line expression/comparison, numbers/decrementer, numbers/incrementer
 	for round := 0; round < dispatchMaxRounds; round++ {
 		ids := make([]any, len(pending))
 		afters := make([]any, len(pending))
 		for i, z := range pending {
 			after := int64(0) // с головы очереди зоны
+			// Эквивалентный мутант (T-M05): `n > 1` ≡ `n > 0` — в раунде 0
+			// z.rows пуст, с раунда 1 pending — только «голодные» зоны,
+			// у каждой ровно quota ≥ 2 строк; длина 1 не встречается.
+			// mutator-disable-next-line numbers/incrementer
 			if n := len(z.rows); n > 0 {
 				after = z.rows[n-1].domainID
 			}
@@ -203,6 +239,13 @@ func DispatchBatch(ctx context.Context, pool db.DB, q DispatchQuery) ([]Dispatch
 		starving := make([]*dispatchZone, 0, len(pending))
 		for _, z := range pending {
 			n := len(picked[z.id])
+			// Эквивалентные мутанты (T-M05): `n == -1` невыполним (len ≥ 0),
+			// а провал continue для n == 0 безразличен: append пустого среза
+			// — no-op, n == quota ложно (quota ≥ 1 > 0 = n); то же — вырезание
+			// тела if (branch/if): no-op вместо continue.
+			// Замена continue на break не эквивалентна — закрывается тестом
+			// RefillStopsAtExhaustedZone.
+			// mutator-disable-next-line numbers/decrementer, branch/if
 			if n == 0 {
 				continue
 			}
@@ -307,6 +350,10 @@ func ResolveZoneWeights(ctx context.Context, pool db.DB, byName map[string]int) 
 	if err := rows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("scheduler: веса зон: справочник зон: %w", err)
 	}
+	// Эквивалентный мутант (T-M05): unknown = nil вместо пустого среза —
+	// при rest без имён; вызывающий (cmd/scheduler) читает только len и
+	// strings.Join под guard len > 0, пустое и nil неразличимы.
+	// mutator-disable-next-line statement/remove
 	unknown = make([]string, 0, len(rest))
 	for name := range rest {
 		unknown = append(unknown, name)
@@ -339,6 +386,10 @@ func dispatchPickZones(ctx context.Context, pool db.DB, zoneIDs, afters []any, l
 	}
 	for z := range picked {
 		ps := picked[z]
+		// Эквивалентный мутант (T-M05): `<=` отличается от `<` только на
+		// равных domainID внутри зоны — их не бывает: id — часть PK domains
+		// (миграция 000001), LATERAL-выборка строк не повторяет.
+		// mutator-disable-next-line expression/comparison
 		sort.Slice(ps, func(i, j int) bool { return ps[i].domainID < ps[j].domainID })
 	}
 	return picked, nil
@@ -361,6 +412,12 @@ func dispatchMerge(zones []*dispatchZone, weights map[int16]int, limit int) []di
 			continue
 		}
 		w := float64(weights[z.id])
+		// Эквивалентные мутанты (T-M05): `w <= 1`/`w < 2` не меняют
+		// поведение — значения карты ≥ 1 (валидация), отсутствующая зона
+		// даёт 0 → 1, а w = 1 присваивается повторно (no-op). `w < 0`
+		// (decrementer) отличим — ключ 0.5/0 = +Inf ломает порядок —
+		// и не гасится.
+		// mutator-disable-next-line expression/comparison, numbers/incrementer
 		if w < 1 {
 			w = 1
 		}
@@ -372,8 +429,17 @@ func dispatchMerge(zones []*dispatchZone, weights map[int16]int, limit int) []di
 	for len(out) < limit && len(heads) > 0 {
 		// Минимальный ключ; равные — меньший zone_id (детерминизм).
 		best := 0
+		// Эквивалентный мутант (T-M05): старт i = 0 сравнивает голову с
+		// собой (ключи и zone.id равны) — выбор best не меняется.
+		// mutator-disable-next-line numbers/decrementer
 		for i := 1; i < len(heads); i++ {
 			h, b := heads[i], heads[best]
+			// Эквивалентный мутант (T-M05): `<=` на zone.id отличается от
+			// `<` только при равных id — головы суть разные зоны, id
+			// различны. Аннотация строки гасит и убиваемые мутанты других
+			// сравнений строки (trade-off §4 docs/mutation-testing.md:
+			// разнос по строкам — правка продуктового кода).
+			// mutator-disable-next-line expression/comparison
 			if h.key < b.key || (h.key == b.key && h.zone.id < b.zone.id) {
 				best = i
 			}
@@ -386,6 +452,10 @@ func dispatchMerge(zones []*dispatchZone, weights map[int16]int, limit int) []di
 			continue
 		}
 		w := float64(weights[h.zone.id])
+		// Эквивалентные мутанты (T-M05): `w <= 1`/`w < 2` — как в первом
+		// нормализующем if выше; `w < 0` (decrementer) отличим (ключ +Inf)
+		// и не гасится.
+		// mutator-disable-next-line expression/comparison, numbers/incrementer
 		if w < 1 {
 			w = 1
 		}
