@@ -85,7 +85,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   `continue`→`break`. enqueue: границы `len(Name) > 253`, дефолты
   (`DefaultEnqueueBatch/IdleWait/Interval`, `<= 0` vs `< 0`), тексты
   ошибок с `i+1`.
-- **T-M06** [новая] — `internal/scheduler/{retry,backlog,recheck,lease}.go`
+- **T-M06** [в работе] — `internal/scheduler/{retry,backlog,recheck,lease}.go`
   (66 выживших). Дайджест:
   `var/mutation/escaped/T-M06-scheduler-cycles.txt`.
   Пороги повторов и экспоненты бэкоффа (±1 на константах и степенях),
