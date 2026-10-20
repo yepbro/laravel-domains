@@ -68,7 +68,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   `i-1/i+0/i+2` — таблица с ошибкой во втором элементе пачки),
   `m.TaskID = NewTaskID()` при пустом (генерация на десериализации),
   `len(d.Payload) == 0`.
-- **T-M04** [в работе] — `internal/queue/{redisq,backpressure,recover,
+- **T-M04** [сделана] — `internal/queue/{redisq,backpressure,recover,
   reliab}.go` (96 выживших). Дайджест:
   `var/mutation/escaped/T-M04-queue-streams.txt`.
   redisq: `parseID` ms/seq (разрядность 64, base 10, не-число, порядок
