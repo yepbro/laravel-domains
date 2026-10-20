@@ -86,6 +86,42 @@ func TestOptionsValidate(t *testing.T) {
 		t.Fatalf("локальный режим отклонён: %v", err)
 	}
 
+	// Разрешённые схемы remote_url: ws/wss/http/https — вырезание любой
+	// из проверок принимало бы её схему за неразрешённую.
+	for _, scheme := range []string{"ws", "wss", "http", "https"} {
+		remote := valid
+		remote.RemoteURL = scheme + "://chromium:9222"
+		if err := remote.validate(); err != nil {
+			t.Errorf("remote_url %s:// отклонён: %v", scheme, err)
+		}
+	}
+
+	// Границы contexts: ровно 1 и ровно 16.
+	for _, n := range []int{1, 16} {
+		bound := valid
+		bound.Contexts = n
+		if err := bound.validate(); err != nil {
+			t.Errorf("contexts = %d отклонён: %v", n, err)
+		}
+	}
+
+	// Граница timeout: 1 нс — положительная длительность.
+	nano := valid
+	nano.Timeout = 1
+	if err := nano.validate(); err != nil {
+		t.Errorf("timeout = 1 нс отклонён: %v", err)
+	}
+
+	// Границы порога памяти: ровно минимум (256 MiB) и ровно максимум
+	// (16 GiB) — контроль включён, но ещё в допустимом диапазоне.
+	for _, threshold := range []int64{256 << 20, 16 << 30} {
+		bound := valid
+		bound.MemoryThreshold = threshold
+		if err := bound.validate(); err != nil {
+			t.Errorf("memory_threshold = %d отклонён: %v", threshold, err)
+		}
+	}
+
 	cases := []struct {
 		name  string
 		opts  Options
@@ -100,6 +136,7 @@ func TestOptionsValidate(t *testing.T) {
 		{"restart_every_pages 0", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 0}, "restart_every_pages"},
 		{"memory_threshold отрицательный", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: -1}, "memory_threshold"},
 		{"memory_threshold ниже минимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 1 << 20}, "memory_threshold"},
+		{"memory_threshold ниже минимума на границу", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 255 << 20}, "memory_threshold"},
 		{"memory_threshold выше максимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 17 << 30}, "memory_threshold"},
 		{"max_dom_bytes отрицательный", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MaxDOMBytes: -1}, "max_dom_bytes"},
 	}
@@ -113,6 +150,16 @@ func TestOptionsValidate(t *testing.T) {
 				t.Fatalf("ошибка не называет поле %s: %v", tc.field, err)
 			}
 		})
+	}
+	// Текст ошибки порога памяти пинит границы диапазона литералами:
+	// 256<<20 = 268435456, 16<<30 = 17179869184 (мутанты сдвигов и ±1
+	// аргументов формата меняли бы числа в сообщении).
+	low := valid
+	low.MemoryThreshold = 1 << 20
+	err := low.validate()
+	if err == nil || !strings.Contains(err.Error(),
+		"memory_threshold: ожидается 0 (отключено) или 268435456..17179869184 байт, задано 1048576") {
+		t.Fatalf("текст ошибки порога памяти: %v", err)
 	}
 	// 0 — контроль памяти отключён (remote-режим и малые машины), не ошибка.
 	off := Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}
@@ -136,6 +183,7 @@ func TestValidateTaskURL(t *testing.T) {
 	for _, u := range []string{
 		"file:///etc/passwd", "data:text/html,<html>", "ftp://example.com/",
 		"chrome://version", "about:blank", "", "not a url", "/relative/path",
+		"http://", "https://",
 	} {
 		err := validateTaskURL(u)
 		if err == nil {

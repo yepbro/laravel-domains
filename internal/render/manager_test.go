@@ -318,6 +318,12 @@ func TestManagerBoundedRestarts(t *testing.T) {
 	if ClassOf(err) != ClassBrowser {
 		t.Fatalf("класс %v (%v), хочу browser", ClassOf(err), err)
 	}
+	// Пин литерала (мутанты ±1 константы): попытка + ровно 2 перезапуска.
+	// Сравнение попыток с 1+maxRestartsPerTask маскировало бы мутацию —
+	// ожидание менялось бы вместе с константой.
+	if maxRestartsPerTask != 2 {
+		t.Fatalf("maxRestartsPerTask = %d, хочу 2", maxRestartsPerTask)
+	}
 	if got := sessions.Load(); got != 1+maxRestartsPerTask {
 		t.Errorf("попыток %d, хочу %d (попытка + перезапуски)", got, 1+maxRestartsPerTask)
 	}
@@ -360,6 +366,25 @@ func TestManagerClosed(t *testing.T) {
 		t.Errorf("стартов после Close: %d", got)
 	}
 	m.Close() // повторный вызов безвреден
+	// И не завешивает менеджер: мьютекс освобождён, задачи по-прежнему
+	// получают ErrClosed сразу. Вырезание Unlock оставляло бы мьютекс
+	// захваченным (Run вис) — проверяем с таймаутом, а не до упора.
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := m.Run(context.Background(), RenderTask{URL: "u2"})
+		errCh <- err
+	}()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("ошибка после повторного Close: %v, хочу ErrClosed", err)
+		}
+		if ClassOf(err) != ClassTask {
+			t.Errorf("класс %v, хочу task", ClassOf(err))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run завис после повторного Close: мьютекс не освобождён")
+	}
 }
 
 func TestManagerRunRetryOnClosedPool(t *testing.T) {
@@ -548,4 +573,290 @@ func TestManagerParallelStress(t *testing.T) {
 		t.Errorf("стартов %d, хочу перезапусков+1 = %d", got, want)
 	}
 	m.Close()
+}
+
+// wiredBrowser — браузер с подключённой отменой контекста: остановку
+// видно через Alive (стиль TestPoolCloseStopsBrowser), в отличие от
+// liveBrowser, чей Close не отменяет контекст.
+func wiredBrowser(contexts int) (*Browser, context.CancelFunc) {
+	b := testBrowser(contexts)
+	ctx, cancel := context.WithCancel(context.Background())
+	b.ctx, b.cancel = ctx, cancel
+	return b, cancel
+}
+
+func TestManagerDefaultFactories(t *testing.T) {
+	// Фабрики NewManager: newBrowser = StartBrowser, newPool = NewPool.
+	// Вырезание первого — nil-вызов на первом старте (паника), второго —
+	// паника после успешного старта браузера; оба наблюдаемы без подмен.
+	t.Run("newBrowser — StartBrowser", func(t *testing.T) {
+		// Герметичный отказ старта: закрытый порт, соединение
+		// отказывается мгновенно (TestStartBrowserRemoteUnreachable).
+		opts := managerOpts()
+		opts.RemoteURL = "ws://127.0.0.1:1"
+		opts.DialTimeout = 500 * time.Millisecond
+		m := NewManager(context.Background(), opts)
+		err := m.Start()
+		var e *Error
+		if !errors.As(err, &e) || e.Class != ClassBrowser {
+			t.Fatalf("хочу ошибку класса browser от StartBrowser, получено: %v", err)
+		}
+		m.Close()
+	})
+	t.Run("newPool — NewPool", func(t *testing.T) {
+		// Браузер фейком, пул — настоящий: вырезание присвоения
+		// оставляет nil-фабрику — паника на первом старте. Запуск задач
+		// через настоящий пул не нужен: сессии требуют живой chromedp-
+		// контекст, создания пула достаточно.
+		m := NewManager(context.Background(), managerOpts())
+		b, _ := liveBrowser(1)
+		m.newBrowser = func(context.Context, Options) (*Browser, error) {
+			return b, nil
+		}
+		if err := m.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if m.Browser() != b {
+			t.Fatal("Start не поднял поколение с настоящим NewPool")
+		}
+		m.Close()
+	})
+}
+
+func TestManagerRunReturnsBrowserErrorAfterClose(t *testing.T) {
+	// Закрытие менеджера посреди задачи: ошибка браузера уходит наверх
+	// как есть, а не подменяется ErrClosed повторного acquire (ветка
+	// m.closed.Load() в решении о повторе Run).
+	m := NewManager(context.Background(), managerOpts())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	m.newBrowser = func(context.Context, Options) (*Browser, error) {
+		b, _ := liveBrowser(1)
+		return b, nil
+	}
+	m.newPool = func(b *Browser) *Pool {
+		return poolOver(b, func(context.Context, RenderTask) (RenderOutput, error) {
+			close(started)
+			<-release
+			return RenderOutput{}, &Error{Class: ClassBrowser, Err: ErrBrowserDead}
+		})
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := m.Run(context.Background(), RenderTask{URL: "u"})
+		runDone <- err
+	}()
+	<-started
+
+	closed := make(chan struct{})
+	go func() {
+		m.Close()
+		close(closed)
+	}()
+	// Дождаться критической секции Close (closed установлен, поколение
+	// откреплено) до освобождения задачи — детерминизм проверяемой ветки.
+	deadline := time.Now().Add(5 * time.Second)
+	for m.Browser() != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("Close не вошёл в критическую секцию")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+
+	err := <-runDone
+	if ClassOf(err) != ClassBrowser {
+		t.Fatalf("класс %v (%v), хочу browser: ошибка задачи не подменяется ErrClosed", ClassOf(err), err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close не завершился после задачи")
+	}
+}
+
+func TestManagerRunNoRetryOnTaskError(t *testing.T) {
+	// Ошибка страницы — обычный результат этапа: менеджер не повторяет
+	// задачу и не перезапускает браузер (повторная доставка — уровень
+	// очереди, T-066).
+	b, _ := liveBrowser(1)
+	m := NewManager(context.Background(), managerOpts())
+	boom := &Error{Class: ClassTask, Err: errors.New("страница не загрузилась")}
+	var runs atomic.Int32
+	m.newBrowser = func(context.Context, Options) (*Browser, error) { return b, nil }
+	m.newPool = func(b *Browser) *Pool {
+		return poolOver(b, func(context.Context, RenderTask) (RenderOutput, error) {
+			runs.Add(1)
+			return RenderOutput{}, boom
+		})
+	}
+
+	_, err := m.Run(context.Background(), RenderTask{URL: "u"})
+	if !errors.Is(err, boom) {
+		t.Fatalf("ошибка %v, хочу исходную ошибку страницы", err)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Errorf("выполнений задачи %d, хочу 1 (ошибка страницы — без повторов менеджера)", got)
+	}
+	if got := m.Restarts(); got != 0 {
+		t.Errorf("перезапусков %d, хочу 0", got)
+	}
+}
+
+func TestManagerAliveAfterCloseNoRestart(t *testing.T) {
+	// После Close зонд окончательно мёртв: false без попытки поднять
+	// новое поколение (проверка closed идёт раньше решения о смене;
+	// фабрика здесь не исчерпывается — успех рестарта виден).
+	m := NewManager(context.Background(), managerOpts())
+	var calls atomic.Int32
+	m.newBrowser = func(context.Context, Options) (*Browser, error) {
+		calls.Add(1)
+		b, _ := liveBrowser(1)
+		return b, nil
+	}
+	m.newPool = func(b *Browser) *Pool { return poolOver(b, nil) }
+
+	if !m.Alive() {
+		t.Fatal("зонд поднял первое поколение (true)")
+	}
+	m.Close()
+	if m.Alive() {
+		t.Error("после Close зонд false")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("стартов %d, хочу 1 (закрытый менеджер не поднимает поколения)", got)
+	}
+}
+
+func TestManagerAcquireSwapsMissingPool(t *testing.T) {
+	// Страховка nil-пула: браузер поколения есть, пула нет — acquire
+	// меняет поколение («пул закрыт»), а не падает. Осиротевший браузер
+	// при этом не гасится (old == nil — закрывать нечего): состояние
+	// недостижимо штатными путями (b и p ставятся вместе под m.mu),
+	// guard защищает от паники, а не от утечки.
+	m := NewManager(context.Background(), managerOpts())
+	b1, _ := liveBrowser(1)
+	m.b = b1 // пул не подложен — рассинхрон поколений
+	var calls atomic.Int32
+	m.newBrowser = func(context.Context, Options) (*Browser, error) {
+		calls.Add(1)
+		b, _ := liveBrowser(1)
+		return b, nil
+	}
+	m.newPool = func(b *Browser) *Pool { return poolOver(b, nil) }
+
+	if _, err := m.Run(context.Background(), RenderTask{URL: "u"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("стартов %d, хочу 1 (поколение без пула заменено)", got)
+	}
+}
+
+func TestManagerMemoryRestartBoundaries(t *testing.T) {
+	// Границы контроля памяти: порог ровно 0 — контроль отключён; порог
+	// выше живого RSS — не достигнут. Оба без перезапуска при
+	// положительном RSS процесса (второй кейс закрепляет и погашенный по
+	// гранулярности аннотации trade-off §4 — вырезание правой половины
+	// условия в swapReasonLocked: `rss > 0 && true` перезапускало бы
+	// браузер после каждой задачи).
+	probe, _ := liveBrowser(1)
+	probe.rootPID = os.Getpid()
+	if probe.RSS() <= 0 {
+		t.Skip("RSS недоступен (нет /proc)")
+	}
+	above := probe.RSS() + 1<<30 // заведомо выше RSS живого дерева
+	newCase := func(t *testing.T, threshold int64) {
+		t.Helper()
+		b1, _ := liveBrowser(1)
+		b1.rootPID = os.Getpid()
+		b1.opts.MemoryThreshold = threshold
+		b2, _ := liveBrowser(1)
+		m, calls, _ := managerFor(t, managerOpts(), b1, b2)
+
+		for range 2 {
+			if _, err := m.Run(context.Background(), RenderTask{URL: "u"}); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+		}
+		if got := calls.Load(); got != 1 {
+			t.Errorf("стартов %d, хочу 1 (порог %d не триггерует перезапуск)", got, threshold)
+		}
+		if got := m.Restarts(); got != 0 {
+			t.Errorf("перезапусков %d, хочу 0", got)
+		}
+	}
+	t.Run("нулевой порог — контроль отключён", func(t *testing.T) { newCase(t, 0) })
+	t.Run("порог выше живого RSS", func(t *testing.T) { newCase(t, above) })
+}
+
+func TestManagerRestartFailureDetachesGeneration(t *testing.T) {
+	// Неудачный перезапуск открепляет старое поколение сразу:
+	// Browser() nil, без ссылки на мёртвый браузер; старт не
+	// откладывается — следующая задача пробует снова.
+	b1, cancel1 := liveBrowser(1)
+	m, calls, _ := managerFor(t, managerOpts(), b1) // второй старт — ошибка
+
+	if _, err := m.Run(context.Background(), RenderTask{URL: "u1"}); err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+	if m.Browser() != b1 {
+		t.Fatal("живое поколение не закреплено")
+	}
+	cancel1() // браузер поколения умер
+	_, err := m.Run(context.Background(), RenderTask{URL: "u2"})
+	if ClassOf(err) != ClassBrowser {
+		t.Fatalf("ошибка перезапуска: класс %v (%v), хочу browser", ClassOf(err), err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("стартов %d, хочу 2", got)
+	}
+	if m.Browser() != nil {
+		t.Error("после неудачного перезапуска поколение откреплено (Browser nil)")
+	}
+}
+
+func TestManagerRestartClosesOldGeneration(t *testing.T) {
+	// Старое поколение уходит на фоновое закрытие при смене — и при
+	// удачной, и при неудачном старте нового: браузер поколения гасится
+	// (отмена контекста), а не остаётся висеть.
+	run := func(t *testing.T, restartFails bool) {
+		opts := managerOpts() // порог страниц — в opts браузеров ниже:
+		// NeedsRestart читает именно b.opts, опции менеджера фабрика
+		// подменённых браузеров не использует.
+		b1, _ := wiredBrowser(1)
+		b1.opts.RestartEveryPages = 1
+		browsers := []*Browser{b1}
+		if !restartFails {
+			b2, _ := wiredBrowser(1)
+			b2.opts.RestartEveryPages = 1
+			browsers = append(browsers, b2)
+		}
+		m, calls, _ := managerFor(t, opts, browsers...)
+
+		if _, err := m.Run(context.Background(), RenderTask{URL: "u1"}); err != nil {
+			t.Fatalf("Run 1: %v", err)
+		}
+		_, err := m.Run(context.Background(), RenderTask{URL: "u2"}) // порог страниц
+		if restartFails && ClassOf(err) != ClassBrowser {
+			t.Fatalf("Run 2: %v, хочу ошибку класса browser", err)
+		}
+		if !restartFails && err != nil {
+			t.Fatalf("Run 2: %v", err)
+		}
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("стартов %d, хочу 2", got)
+		}
+		// Фоновое закрытие старого поколения — дождаться отмены.
+		deadline := time.Now().Add(2 * time.Second)
+		for b1.Alive() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if b1.Alive() {
+			t.Error("браузер старого поколения не остановлен при смене поколения")
+		}
+	}
+	t.Run("удачная смена", func(t *testing.T) { run(t, false) })
+	t.Run("неудачный старт нового", func(t *testing.T) { run(t, true) })
 }

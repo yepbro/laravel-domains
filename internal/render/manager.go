@@ -71,6 +71,12 @@ func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 			return RenderOutput{}, err
 		}
 		out, err := runAcquired(ctx, p, task)
+		// Эквивалентный мутант (T-M08): вырезание тела if при err == nil
+		// проваливается в следующий if, где третья дизъюнкция заведомо
+		// истинна (ClassOf(nil) = ClassTask != ClassBrowser, а
+		// errors.Is(nil, ErrClosed) = false) — возвращаются те же
+		// (out, nil) с err == nil.
+		// mutator-disable-next-line branch/if
 		if err == nil {
 			return out, nil
 		}
@@ -158,6 +164,12 @@ func (m *Manager) acquire() (*Pool, error) {
 // гонки «поколение сменилось сразу после acquire»: закрытое поколение
 // заменяется, а ошибки ErrClosed не копятся до исчерпания попыток задачи.
 func (m *Manager) swapReasonLocked() (string, bool) {
+	// Эквивалентный мутант (T-M08): вырезание тела if с m.b == nil
+	// проваливается в !m.b.Alive() — nil-guard Alive возвращает false,
+	// решение о смене поколения то же (true); отличается только
+	// строка-причина, а она уходит исключительно в текст slog.Info
+	// перезапуска (логирование, §4 docs/mutation-testing.md).
+	// mutator-disable-next-line branch/if
 	if m.b == nil {
 		return "первый старт", true
 	}
@@ -175,8 +187,30 @@ func (m *Manager) swapReasonLocked() (string, bool) {
 	// проверку, и в сообщение (R-06); контроль отключён — /proc не читается
 	// вовсе. Неизвестный RSS (remote-режим) не триггерует.
 	if m.b.opts.MemoryThreshold > 0 {
+		// Эквивалентны только мутанты левой половины условия (T-M08; тот
+		// же вывод, что у Browser.OverMemory в browser.go): при пороге
+		// >= 1 (guard выше) `rss > 0` неотличимо от `>= 0`/`> -1`/`true`
+		// — rss == 0 и rss == -1 отбрасываются правой половиной (0/-1 >=
+		// порог неверно), rss == 1 недостижим (RSS из /proc кратен
+		// странице). Строчная гранулярность аннотации гасит и двух
+		// убиваемых мутантов правой половины — trade-off §4
+		// docs/mutation-testing.md: вырезание `rss >= порог` (осталось
+		// бы `rss > 0` — перезапуск при любом положительном RSS) и
+		// границу `>= -> >` (равенство RSS == порогу через живой /proc
+		// недетерминированно). Вырезание правой половины закреплено
+		// TestManagerMemoryRestartBoundaries (порог выше живого RSS —
+		// без перезапуска); граница `>= -> >` детерминированного
+		// прикрытия не имеет вовсе (равенство RSS == порогу через живой
+		// /proc недостижимо) — из тестов она закрыта только для копии
+		// выражения в Browser.OverMemory (TestBrowserOverMemory,
+		// SIGSTOP-фиксация RSS).
+		// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer, numbers/incrementer
 		if rss := m.b.RSS(); rss > 0 && rss >= m.b.opts.MemoryThreshold {
 			return fmt.Sprintf("порог памяти %d MiB (RSS %d MiB)",
+				// Логирование (§4 docs/mutation-testing.md): сдвиги и ±1
+				// аргументов меняют только текст сообщения о причине
+				// перезапуска, не решение о нём.
+				// mutator-disable-next-line arithmetic/bitwise, numbers/decrementer, numbers/incrementer
 				m.b.opts.MemoryThreshold>>20, rss>>20), true
 		}
 	}
@@ -214,17 +248,25 @@ func (m *Manager) restartLocked(reason string) error {
 	m.b = b
 	m.p = m.newPool(b)
 	if old == nil {
+		// Логирование запуска chromium (§4 docs/mutation-testing.md).
+		// mutator-disable-next-line statement/remove
 		slog.Info("chromium запущен", "mode", m.mode(), "pid", b.rootPID)
 		return nil
 	}
 	n := m.restarts.Add(1)
 	go old.Close()
+	// Логирование перезапуска chromium (§4 docs/mutation-testing.md).
+	// mutator-disable-next-line statement/remove
 	slog.Info("chromium перезапущен", "reason", reason,
 		"restarts", n, "pid", b.rootPID)
 	return nil
 }
 
 func (m *Manager) mode() string {
+	// Мутант ветки меняет только текст лога запуска (remote назвался бы
+	// локальным): mode() потребляется лишь slog.Info в restartLocked —
+	// логирование, §4 docs/mutation-testing.md.
+	// mutator-disable-next-line branch/if
 	if m.opts.RemoteURL != "" {
 		return "remote " + m.opts.RemoteURL
 	}
@@ -244,6 +286,13 @@ func (m *Manager) mode() string {
 // вызов безвреден.
 func (m *Manager) Close() {
 	m.mu.Lock()
+	// Эквивалентный мутант (T-M08): проваливание из неудачного CAS
+	// исполняет хвост Close — p := m.p всегда nil (первый Close открепил
+	// поколение, новое после closed не поднимается), повторные
+	// открепление и Unlock ниже дают тот же результат. statement/remove
+	// той же строки не гасим: вырезание именно Unlock вешает мьютекс —
+	// убито тестом (Run после повторного Close).
+	// mutator-disable-next-line branch/if
 	if !m.closed.CompareAndSwap(false, true) {
 		m.mu.Unlock()
 		return
