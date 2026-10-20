@@ -100,7 +100,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   как принято в тестах пакета; запуск браузера в мутационном прогоне
   недетерминирован — ложные гасить по политике. proc: ожидание сигналов
   процесса, retry-паузы (фейковые часы). pool: границы пула.
-- **T-M08** [в работе] — `internal/render/{manager,render}.go`
+- **T-M08** [сделана] — `internal/render/{manager,render}.go`
   (60 выживших). Дайджест:
   `var/mutation/escaped/T-M08-render-manager.txt`.
   manager: переходы состояний воркеров, счётчики. render: маски
