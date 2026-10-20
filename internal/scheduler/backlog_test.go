@@ -130,6 +130,30 @@ func (p *backlogFakePool) callsCount() int {
 	return len(p.calls)
 }
 
+// syncBuf — bytes.Buffer под замком: slog пишет из горутины цикла, а
+// тест читает лог ДО её завершения (ожидание Warn вживую) — без
+// синхронизации это гонка.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuf) contains(s string) bool {
+	return strings.Contains(b.String(), s)
+}
+
 // --- ожидаемый SQL-текст (контракт) ---------------------------------------
 
 const wantBacklogSQL = "SELECT check_state, count(*) FROM domains " +
@@ -406,8 +430,8 @@ func TestBacklogLoopImmediateFirstPass(t *testing.T) {
 // TestBacklogLoopLogging — записи цикла: успешный проход — Debug,
 // сбой прохода при живом ctx — Warn с исходной ошибкой.
 func TestBacklogLoopLogging(t *testing.T) {
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	slogBuf := &syncBuf{}
+	logger := slog.New(slog.NewTextHandler(slogBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{}
@@ -436,13 +460,18 @@ func TestBacklogLoopLogging(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	// Сбойный проход при живом ctx — Warn; ждём второго вызова.
+	// Сбойный проход при живом ctx — Warn. Гонка первого варианта:
+	// ожидание числа вызовов/ошибочных вызовов НЕ гарантирует, что Warn
+	// уже записан — cancel() встраивался между возвратом hook и выбором
+	// ветки switch (тихая ветка «отмена во время прохода»), Warn терялся
+	// (флак ~1/20). Детерминизм: ждём сам Warn в логе (syncBuf под
+	// замком), запись Warn строго раньше нашей cancel.
 	pool.setHook(func() (pgx.Rows, error) { return nil, errors.New("бд недоступна") })
 	deadline = time.Now().Add(2 * time.Second)
-	for pool.callsCount() < 2 {
+	for !slogBuf.contains("бд недоступна") {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("сбойный проход не выполнен")
+			t.Fatalf("сбойный проход не выполнен или Warn не записан:\n%s", slogBuf)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -457,7 +486,7 @@ func TestBacklogLoopLogging(t *testing.T) {
 		t.Fatal("BacklogLoop не завершился после отмены ctx")
 	}
 
-	log := buf.String()
+	log := slogBuf.String()
 	for _, want := range []string{
 		"level=DEBUG", // итог успешного прохода
 		"level=WARN",  // сбой прохода не убил цикл
