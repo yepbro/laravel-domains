@@ -106,7 +106,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   manager: переходы состояний воркеров, счётчики. render: маски
   разрешённых доменов/путей (битовые сдвиги `<<`, `>` vs `>=` на
   индексах), лимиты размеров (±1).
-- **T-M09** [новая] — `internal/render/{extract,block,wait}.go`
+- **T-M09** [в работе] — `internal/render/{extract,block,wait}.go`
   (46 выживших). Дайджест:
   `var/mutation/escaped/T-M09-render-extract.txt`.
   extract: пороги извлечения (число вхождений, длины фрагментов —
