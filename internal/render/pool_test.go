@@ -3,9 +3,12 @@ package render
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -303,6 +306,47 @@ func TestPoolWaitCanceled(t *testing.T) {
 	<-done
 }
 
+// TestPoolNoRetryAfterRetire — закрытый пул не повторяет даже контекстную
+// ошибку: поколение уже выводится из работы, повтор — дело нового поколения.
+func TestPoolNoRetryAfterRetire(t *testing.T) {
+	b := testBrowser(1)
+	p := NewPool(b)
+	rec := &recorder{}
+	p.newSession = func(ctx context.Context) (renderSession, error) {
+		s, err := rec.factory(ctx)
+		if err != nil {
+			return nil, err
+		}
+		fs := s.(*fakeSession)
+		fs.run = func(context.Context, RenderTask) (RenderOutput, error) {
+			p.retire() // поколение сменилось по ходу первой попытки
+			return RenderOutput{}, ctxErr(ClassContext)
+		}
+		return s, nil
+	}
+	_, err := p.Run(context.Background(), RenderTask{URL: "u"})
+	if ClassOf(err) != ClassContext {
+		t.Fatalf("класс %v (%v), хочу context", ClassOf(err), err)
+	}
+	if got := len(rec.sessions); got != 1 {
+		t.Errorf("создано сессий %d, хочу 1 (retired пул не повторяет)", got)
+	}
+}
+
+// TestPoolCloseStopsBrowser — Close пула останавливает и браузер поколения
+// (cancel), а не только слоты: следующее поколение стартует чистым.
+func TestPoolCloseStopsBrowser(t *testing.T) {
+	b := testBrowser(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.ctx, b.cancel = ctx, cancel
+	p := NewPool(b)
+	p.Close()
+	if b.Alive() {
+		t.Error("браузер не остановлен Close пула")
+	}
+}
+
 func TestPoolClosed(t *testing.T) {
 	b := testBrowser(1)
 	p := NewPool(b)
@@ -448,26 +492,44 @@ func TestBrowserRSSUnknown(t *testing.T) {
 	if b.OverMemory() {
 		t.Error("неизвестный RSS не должен триггерить перезапуск")
 	}
-	if (*Browser)(nil).OverMemory() {
+	var nilB *Browser
+	if nilB.OverMemory() {
 		t.Error("nil-браузер не должен триггерить перезапуск")
+	}
+	if got := nilB.RSS(); got != -1 {
+		t.Errorf("RSS(nil) = %d, хочу -1", got)
+	}
+	// rootPID 1 валиден (граница «не определён» — ровно 0): дерево pid 1
+	// в контейнере непусто.
+	if _, err := os.Stat("/proc"); err == nil {
+		b1 := testBrowser(1)
+		b1.rootPID = 1
+		if got := b1.RSS(); got <= 0 {
+			t.Errorf("RSS(pid 1) = %d, хочу > 0", got)
+		}
 	}
 }
 
 func TestBrowserOverMemory(t *testing.T) {
-	// RSS живого процесса с стабильной памятью: спящий потомок теста
-	// (RSS самого теста «дышит» между чтениями — сравнения флакают).
+	// RSS живого процесса с замороженной памятью: спящий потомок
+	// останавливается (SIGSTOP) — память между чтениями не «дышит»
+	// (RSS самого теста меняется — точные сравнения флакают), граница
+	// порога проверяется на равенстве. Страницы потомка faulted-in
+	// асинхронно (sleep контейнера — busybox): SIGSTOP сразу после
+	// Start заморозил бы нулевой RSS — сперва прогрев до ненулевого.
+	b := testBrowser(1)
 	cmd := exec.Command("sleep", "5")
 	if err := cmd.Start(); err != nil {
 		t.Skipf("sleep не запустился: %v", err)
 	}
 	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
-
-	b := testBrowser(1)
 	b.rootPID = cmd.Process.Pid
+
 	var rss int64
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if rss = b.RSS(); rss > 0 {
+		if r := b.RSS(); r > 0 {
+			rss = r
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -475,9 +537,29 @@ func TestBrowserOverMemory(t *testing.T) {
 	if rss <= 0 {
 		t.Skip("RSS недоступен (нет /proc)")
 	}
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Skipf("SIGSTOP не удался: %v", err)
+	}
+	// Заморозили — дождаться стабильного значения (два подряд
+	// одинаковых чтения) на случай последних проживлённых страниц.
+	stable := time.Now().Add(2 * time.Second)
+	for time.Now().Before(stable) {
+		r := b.RSS()
+		if r == rss {
+			break
+		}
+		if r > 0 {
+			rss = r
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	b.opts.MemoryThreshold = rss // ровно порог — превышен (>=)
 	if !b.OverMemory() {
 		t.Error("RSS равен порогу: перезапуск должен срабатывать")
+	}
+	b.opts.MemoryThreshold = 1 // байт: любая живая память — превышение
+	if !b.OverMemory() {
+		t.Error("минимальный порог 1 байт: положительный RSS — превышение")
 	}
 	b.opts.MemoryThreshold = rss + 1<<30 // заведомо выше живого RSS
 	if b.OverMemory() {
@@ -487,4 +569,27 @@ func TestBrowserOverMemory(t *testing.T) {
 	if b.OverMemory() {
 		t.Error("нулевой порог отключает контроль")
 	}
+
+	// RSS == 0 (корень исчез из снимка) — не превышение.
+	if pid := missingPID(); pid != 0 {
+		b.rootPID = pid
+		b.opts.MemoryThreshold = 1
+		if got := b.RSS(); got != 0 {
+			t.Fatalf("RSS исчезнувшего корня = %d, хочу 0", got)
+		}
+		if b.OverMemory() {
+			t.Error("нулевой RSS не должен триггерить перезапуск")
+		}
+	}
+}
+
+// missingPID — числовой pid, отсутствующий в /proc (0, если не нашёлся):
+// RSS такого корня — 0 (снимок есть, корня в нём нет).
+func missingPID() int {
+	for p := 1 << 18; p < 1<<18+4096; p++ {
+		if _, err := os.Stat("/proc/" + strconv.Itoa(p)); err != nil {
+			return p
+		}
+	}
+	return 0
 }

@@ -28,7 +28,15 @@ func procTreeRSS(root int) int64 {
 		return -1
 	}
 	procs, err := readProcStats()
+	// Мутанты ветки (T-M07): отказ чтения /proc в CI недостижим —
+	// контейнер всегда имеет читаемый /proc (TestProcTreeRSSSelf и
+	// TestReadProcStatsSkipsNonNumeric читают его), скрыть или
+	// отмонтировать его из теста нельзя. Вырезание return (branch/if)
+	// — та же недостижимая ветка. Значение -1 — контракт «неизвестно»,
+	// закреплён тестами через rootPID <= 0 выше.
+	// mutator-disable-next-line branch/if
 	if err != nil {
+		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 		return -1
 	}
 	return treeRSS(procs, root)
@@ -40,6 +48,10 @@ func procTreeRSS(root int) int64 {
 // незначимы (проверка — раз в задачу, ТЗ 5.6).
 func readProcStats() (map[int]procStat, error) {
 	entries, err := os.ReadDir("/proc")
+	// Недостижимо в CI (T-M07): /proc в контейнере всегда листируется;
+	// отказ ReadDir требует скрытого/отмонтированного /proc. Вырезание
+	// return (branch/if) — та же недостижимая ветка.
+	// mutator-disable-next-line branch/if
 	if err != nil {
 		return nil, err
 	}
@@ -47,16 +59,37 @@ func readProcStats() (map[int]procStat, error) {
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
+			// Мутант loop/break эквивалентен (T-M07): os.ReadDir отдаёт
+			// записи отсортированными по имени, а нечисловые записи /proc
+			// («acpi», «bus», «cmdline»…) алфавитные и идут после всех
+			// pid — break на первой нечисловой равен continue (дальше
+			// pid уже нет). Сам пропуск закреплён тестом
+			// TestReadProcStatsSkipsNonNumeric.
+			// mutator-disable-next-line loop/break
 			continue // нечисловое имя — не процесс
 		}
 		data, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		// Вырезание continue (branch/if) эквивалентно (T-M07): без
+		// continue падение на parseProcStat(data) с data == nil безопасно —
+		// пустая строка отвергается разбором (LastIndex = -1), запись
+		// не добавляется. loop/break недетерминирован: срабатывание
+		// требует смерти процесса между листингом и чтением — гонка,
+		// управляемо не воспроизводится в CI.
+		// mutator-disable-next-line branch/if
 		if err != nil {
+			// mutator-disable-next-line loop/break
 			continue // процесс ушёл между листингом и чтением
 		}
 		if st, ok := parseProcStat(data); ok {
 			procs[pid] = st
 		}
 	}
+	// Недостижимо в CI (T-M07): пустой снимок требует, чтобы в /proc
+	// не было ни одного читаемого процесса — сам тестовый процесс
+	// всегда виден; ровно один (мутант `== 1`) в контейнере go test
+	// тоже недостижим (минимум PID 1 и сам тестовый бинарник).
+	// Вырезание return (branch/if) — та же недостижимая ветка.
+	// mutator-disable-next-line numbers/decrementer, numbers/incrementer, branch/if
 	if len(procs) == 0 {
 		return nil, os.ErrNotExist
 	}
@@ -69,6 +102,13 @@ func readProcStats() (map[int]procStat, error) {
 func parseProcStat(data []byte) (procStat, bool) {
 	s := string(data)
 	i := strings.LastIndexByte(s, ')')
+	// Эквивалентные мутанты (T-M07): `i+2 >= len(s)` и `i+3 > len(s)`
+	// отличаются от оригинала только при i+2 == len(s) — и там обе ветви
+	// дают отказ (Fields(s[len:]) пуст → < 22 полей). Аннотации попутно
+	// гасят убиваемых `i <= 0` и `i < 1` (')' первым символом) — trade-off
+	// строчных аннотаций (§4 docs/mutation-testing.md); поведение закреплено
+	// TestParseProcStat.
+	// mutator-disable-next-line expression/comparison, numbers/incrementer
 	if i < 0 || i+2 > len(s) {
 		return procStat{}, false
 	}
@@ -103,11 +143,24 @@ func treeRSS(procs map[int]procStat, root int) int64 {
 		queue = queue[1:]
 		st, ok := procs[pid]
 		if !ok {
+			// loop/break эквивалентен (T-M07): !ok возможен только для
+			// корня — первого элемента очереди (потомки попадают в неё
+			// лишь из children, построенного по ключам снимка); после
+			// извлечения корня очередь пуста, break и continue неразличимы.
+			// Сам пропуск (в т. ч. с потомками корня в снимке) закреплён
+			// TestTreeRSS.
+			// mutator-disable-next-line loop/break
 			continue
 		}
 		total += st.rss
 		for _, c := range children[pid] {
 			if !seen[c] {
+				// Эквивалентный мутант (T-M07): каждый pid входит ровно
+				// в один список children (ppid единственный); повторно в
+				// очередь может попасть только корень, а он отмечен при
+				// инициализации (seen = {root: true}) — вырезание
+				// маркировки ненаблюдаемо.
+				// mutator-disable-next-line statement/remove
 				seen[c] = true
 				queue = append(queue, c)
 			}

@@ -62,6 +62,13 @@ type Browser struct {
 // Ошибка подключения — *Error класса ClassBrowser: воркер может повторять
 // старт (T-065/T-066), не разбирая тексты ошибок.
 func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
+	// Мутант ненаблюдаем в CI (T-M07): производные таймауты
+	// (DialTimeout/SessionStartTimeout) видны только у успешно
+	// стартовавшего браузера (b.opts сессий, таймаут remote-диала);
+	// герметичные старты падают раньше — connection refused мгновенен,
+	// локального бинарка нет. Живой Chromium — live-тесты за
+	// CRAWLER_RENDER_TEST=1, в мутационный прогон не входят.
+	// mutator-disable-next-line statement/remove
 	opts = opts.withDefaults()
 	if err := opts.validate(); err != nil {
 		return nil, err
@@ -102,7 +109,14 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 	// local — таймаут чтения адреса от процесса (20 с в chromedp);
 	// внешняя граница — отмена ctx вызывающим.
 	if err := chromedp.Do(bctx); err != nil {
+		// Отмены при неудачной инициализации — гигиена ресурсов chromedp
+		// (горутины/соединения/процесс); герметичные отказы старта
+		// (connection refused, fork/exec несуществующего бинарка) ничего
+		// не успевают создать — эффект отмен ненаблюдаем без
+		// полуподнятого браузера, который в CI не воспроизводится (T-M07).
+		// mutator-disable-next-line statement/remove
 		cancel()
+		// mutator-disable-next-line statement/remove
 		cancelAlloc()
 		return nil, &Error{
 			Class: ClassBrowser,
@@ -114,13 +128,29 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 	// контроля памяти (T-065). chromedp отдаёт его явно (Browser.Process
 	// задокументирован как раз для сбора метрик процесса); в remote-режиме
 	// процесса рядом нет — контроль памяти отключён (RSS = -1).
+	//
+	// Блок ниже исполняется только после успешной инициализации локального
+	// Chromium (chromedp.Do выше), т. е. с живым процессом браузера — в CI
+	// старт всегда падает, а live-тесты за CRAWLER_RENDER_TEST=1 в
+	// мутационный прогон не входят (прецедент — NVMe, T-M01). Мутанты
+	// блока гасятся: nil-половки проверки FromContext после успешного Do
+	// (expression/remove), вырезание условия Process() и присвоения
+	// rootPID из реального процесса (branch/if на строке if,
+	// statement/remove на операторе); граница «не определён» 0 против
+	// -1/1 (numbers) меняет лишь Warn — rootPID остаётся 0 и RSS как был
+	// -1; сам Warn — логирование (§4 docs/mutation-testing.md).
 	if opts.RemoteURL == "" {
+		// mutator-disable-next-line expression/remove
 		if c := chromedp.FromContext(bctx); c != nil && c.Browser != nil {
+			// mutator-disable-next-line branch/if
 			if p := c.Browser.Process(); p != nil {
+				// mutator-disable-next-line statement/remove
 				b.rootPID = p.Pid
 			}
 		}
+		// mutator-disable-next-line numbers/decrementer, numbers/incrementer, branch/if
 		if b.rootPID == 0 {
+			// mutator-disable-next-line statement/remove
 			slog.Warn("процесс Chromium не определён: перезапуск по памяти отключён")
 		}
 	}
@@ -162,6 +192,14 @@ func (b *Browser) NeedsRestart() bool {
 // (браузер в чужом контейнере, там потолок держит mem_limit контейнера)
 // или /proc недоступен.
 func (b *Browser) RSS() int64 {
+	// Эквивалентные мутанты (T-M07): `rootPID < 0` и `<= -1` при
+	// rootPID == 0 ведут в procTreeRSS, чей собственный guard root <= 0
+	// возвращает то же -1; вырезание `rootPID <= 0` (expression/remove)
+	// эквивалентно по той же причине (nil-половина остаётся) и попутно
+	// гасит убиваемого «b == nil → false» — trade-off строчных аннотаций
+	// (§4 docs/mutation-testing.md, прецедент T-M02); nil-приёмник и
+	// валидный pid 1 закреплены тестами (TestBrowserRSSUnknown).
+	// mutator-disable-next-line expression/comparison, numbers/decrementer, expression/remove
 	if b == nil || b.rootPID <= 0 {
 		return -1
 	}
@@ -178,6 +216,14 @@ func (b *Browser) OverMemory() bool {
 		return false
 	}
 	rss := b.RSS()
+	// Эквивалентные мутанты (T-M07): при threshold >= 1 (guard выше) все
+	// варианты левой половины (`>= 0`, `true`, `> -1`, `> 1`) неотличимы
+	// от `rss > 0`: rss == 0 и rss == -1 отбрасываются правой половиной
+	// (0/-1 >= threshold неверно), а rss == 1 недостижим — RSS с /proc
+	// кратен странице (>= 4096). Аннотация expression/comparison попутно
+	// гасит и границу `>= → >` справа (trade-off §4); сама граница «RSS
+	// равен порогу — превышение» закреплена TestBrowserOverMemory.
+	// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer, numbers/incrementer
 	return rss > 0 && rss >= b.opts.MemoryThreshold
 }
 

@@ -85,6 +85,10 @@ func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 		return out, nil
 	}
 	if ClassOf(err) == ClassContext && !p.closed.Load() {
+		// Мутант логирования (T-M07): Warn повтора не меняет наблюдаемого
+		// поведения — гасится по §4 docs/mutation-testing.md
+		// (логирование не тестируется).
+		// mutator-disable-next-line statement/remove
 		slog.Warn("контекст рендера умер, повтор задачи на новом контексте",
 			"url", task.URL, "err", err.Error())
 		if out, err = p.attempt(ctx, task); err == nil {

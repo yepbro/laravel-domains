@@ -113,6 +113,16 @@ func TestClassifyCtx(t *testing.T) {
 		}
 	})
 
+	t.Run("сессия без контекста", func(t *testing.T) {
+		// Сессия, не дошедшая до создания вкладки (ctx nil): nil-guard
+		// классификации обязан пропустить её в зонд, а не упасть.
+		b, _ := livePair()
+		s := &Session{b: b}
+		if got := ClassOf(b.classifyCtx(err, "u", s)); got != ClassContext {
+			t.Errorf("класс %v, хочу context (зонд отвергает)", got)
+		}
+	})
+
 	t.Run("сессии нет (создание контекста)", func(t *testing.T) {
 		b, _ := livePair()
 		if got := ClassOf(b.classifyCtx(err, "u", nil)); got != ClassContext {
