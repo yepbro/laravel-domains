@@ -116,7 +116,16 @@ func blockRespond(ctx context.Context, sess cdp.Session, ev fetch.EventRequestPa
 		_, err = cdp.Call(ctx, sess, fetch.ContinueRequest,
 			fetch.ContinueRequestParams{RequestID: ev.RequestID})
 	}
+	// Логирование (§4 docs/mutation-testing.md): Debug-запись о неудачном
+	// ответе не влияет на судьбу запроса (fail-open самой blockRespond);
+	// мутанты ветки и вырезания оператора меняют только текст отладочного
+	// лога. Аннотации две: branch/if мутатор заходит на узле IfStmt (гасится
+	// на строке if), statement/remove — через BlockStmt тела и гасится на
+	// строке оператора; оба дают неразличимый дифф (noop тела), одного
+	// гашения мало — второй генератор выживает.
+	// mutator-disable-next-line branch/if
 	if err != nil {
+		// mutator-disable-next-line statement/remove
 		slog.Debug("рендер: ответ на перехваченный запрос не прошёл",
 			"type", ev.ResourceType.String(), "err", err.Error())
 	}

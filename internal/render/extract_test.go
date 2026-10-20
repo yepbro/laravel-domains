@@ -69,6 +69,20 @@ func TestExtractCookieFields(t *testing.T) {
 			in:   network.Cookie{Name: "a"},
 			want: ExtractCookie{Name: "a"},
 		},
+		{
+			// Session-флаг перевешивает положительный срок: expires не
+			// ставится и при заполненном поле.
+			name: "session-cookie со сроком — без expires",
+			in:   network.Cookie{Name: "a", Value: "1", Session: true, Expires: 1792567680},
+			want: ExtractCookie{Name: "a", Value: "1"},
+		},
+		{
+			// Минимальный положительный срок: секунда Unix читается в RFC
+			// 3339 (граница «> 0» — включая единицу).
+			name: "срок 1 — 1970-01-01T00:00:01Z",
+			in:   network.Cookie{Name: "a", Value: "1", Expires: 1},
+			want: ExtractCookie{Name: "a", Value: "1", Expires: "1970-01-01T00:00:01Z"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,6 +117,19 @@ func TestExtractCookiesFromCDP(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("позиция %d: got %+v, want %+v", i, got[i], want[i])
 		}
+	}
+
+	// Полный дубль ключа сортировки (name+domain+path) с разными
+	// значениями: финальное сравнение Path получает равные строки — строгий
+	// `<` оставляет пару в исходном порядке (sort.Slice на двух элементах —
+	// insertion sort, Less(1,0) вызывается ровно раз и при false не меняет
+	// места); нестрогий `<=` менял бы элементы местами.
+	got = extractCookiesFromCDP([]*network.Cookie{
+		{Name: "a", Domain: ".example.com", Path: "/", Value: "второй"},
+		{Name: "a", Domain: ".example.com", Path: "/", Value: "первый"},
+	})
+	if len(got) != 2 || got[0].Value != "второй" || got[1].Value != "первый" {
+		t.Errorf("порядок равных ключей: %+v", got)
 	}
 }
 
@@ -143,6 +170,14 @@ func TestExtractDOMExprLimited(t *testing.T) {
 	if got := extractDOMExprLimited(0); got != extractDOMExpr {
 		t.Errorf("лимит 0: %q, хочу базовое выражение %q", got, extractDOMExpr)
 	}
+	if got := extractDOMExprLimited(-5); got != extractDOMExpr {
+		t.Errorf("отрицательный лимит: %q, хочу базовое выражение %q", got, extractDOMExpr)
+	}
+	// Граница: лимит 1 — минимальный валидный потолок (не деградирует в
+	// безлимитное выражение).
+	if got := extractDOMExprLimited(1); got != extractDOMExpr+".substring(0, 1)" {
+		t.Errorf("лимит 1: %q, хочу %q", got, extractDOMExpr+".substring(0, 1)")
+	}
 	got := extractDOMExprLimited(2048)
 	want := extractDOMExpr + ".substring(0, 2048)"
 	if got != want {
@@ -182,6 +217,45 @@ func TestTruncateDOM(t *testing.T) {
 	}
 }
 
+// TestTruncateDOMBoundaries — граничные случаи жёсткого предела: длина ровно
+// в лимите, минимальный валидный лимит, лимит ровно в длину признака
+// обрезки (31) и на байт больше (32), откат границы к нулю по невалидному
+// UTF-8. Каждый случай пинит точное значение среза.
+func TestTruncateDOMBoundaries(t *testing.T) {
+	// Длина ровно в лимите — без изменений (строгая граница <=).
+	if got := truncateDOM(strings.Repeat("a", 50), 50); got != strings.Repeat("a", 50) {
+		t.Errorf("ровно в лимите: %q, хочу без изменений", got)
+	}
+	// Лимит 1 — минимальный валидный потолок (меньше признака обрезки):
+	// вырожденный срез dom[:1].
+	if got := truncateDOM("abc", 1); got != "a" {
+		t.Errorf("лимит 1: %q, хочу %q", got, "a")
+	}
+	// Лимит 31 — ровно длина признака: cut = 0, вырожденный возврат dom[:31]
+	// без признака.
+	if got := truncateDOM(strings.Repeat("a", 100), 31); got != strings.Repeat("a", 31) {
+		t.Errorf("лимит 31: %q, хочу %q", got, strings.Repeat("a", 31))
+	}
+	// Лимит 32 над однобайтовой строкой: cut = 1 попадает на начало
+	// символа — срез дом[:1] с признаком обрезки.
+	if got := truncateDOM(strings.Repeat("a", 100), 32); got != "a"+extractDOMTruncated {
+		t.Errorf("лимит 32: %q, хочу %q", got, "a"+extractDOMTruncated)
+	}
+	// Лимит 32, dom[1] — байт-продолжение: граница откатывается к началу
+	// руны (cut до 0) — вырожденный возврат dom[:32] целиком, без признака.
+	dom := "a\x80" + strings.Repeat("a", 99)
+	if got := truncateDOM(dom, 32); got != dom[:32] {
+		t.Errorf("лимит 32 с продолжением на dom[1]: %q, хочу %q", got, dom[:32])
+	}
+	// Невалидный UTF-8 из одних байтов-продолжений: откат границы доходит
+	// до нуля — вырожденный возврат dom[:50]; обращение за границу
+	// (dom[-1]) недопустимо.
+	bad := strings.Repeat("\x80", 100)
+	if got := truncateDOM(bad, 50); got != bad[:50] {
+		t.Errorf("невалидный UTF-8: %q, хочу %q", got, bad[:50])
+	}
+}
+
 func TestExtractResponseHeaders(t *testing.T) {
 	if got := extractResponseHeaders(nil); got != nil {
 		t.Fatalf("nil-заголовки: %+v, хочу nil", got)
@@ -195,6 +269,12 @@ func TestExtractResponseHeaders(t *testing.T) {
 		"X-Powered-By":   "PHP/8.3",
 		"content-length": float64(1234),
 		"set-cookie":     []any{"a=1", "b=2"},
+		// Большое целое во float64: FormatInt-ветка (целое значение) обязана
+		// давать десятичную запись, а не экспоненциальную «1e+18» FormatFloat.
+		"x-big-int": float64(1e18),
+		// Дробное значение — ветка FormatFloat: кратчайшая запись «1.25»
+		// (не целочисленное округление, не экспонента).
+		"x-fraction": float64(1.25),
 	})
 	want := http.Header{
 		"Content-Type":   []string{"text/html; charset=utf-8"},
@@ -203,6 +283,8 @@ func TestExtractResponseHeaders(t *testing.T) {
 		// Многозначные заголовки — поэлементно, как у HTTP-этапа (T-058):
 		// склейка ", " необратима (запятые в Expires cookie).
 		"Set-Cookie": []string{"a=1", "b=2"},
+		"X-Big-Int":  []string{"1000000000000000000"},
+		"X-Fraction": []string{"1.25"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("размер %d, хочу %d: %+v", len(got), len(want), got)
@@ -340,6 +422,21 @@ func TestExtractResult(t *testing.T) {
 			if out.Cookies != nil {
 				t.Errorf("%s: cookies %+v, хочу nil", final, out.Cookies)
 			}
+		}
+	})
+
+	t.Run("http-схема — cookies запрашиваются", func(t *testing.T) {
+		// Обе разрешённые схемы ведут в cookie-хранилище: не только https.
+		f := &fakeExtractCDP{cookies: []*network.Cookie{{Name: "h", Value: "1"}}}
+		out := RenderOutput{FinalURL: "http://example.com/page"}
+		if err := f.cdp().extractResult(context.Background(), &out); err != nil {
+			t.Fatalf("extractResult: %v", err)
+		}
+		if !f.cookieSeen {
+			t.Fatal("cookies не запрошены для http-схемы")
+		}
+		if len(out.Cookies) != 1 || out.Cookies[0] != (ExtractCookie{Name: "h", Value: "1"}) {
+			t.Fatalf("cookies %+v", out.Cookies)
 		}
 	})
 }

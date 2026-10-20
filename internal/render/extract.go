@@ -86,6 +86,15 @@ func truncateDOM(dom string, limit int) string {
 		return dom
 	}
 	cut := limit - len(extractDOMTruncated)
+	// Эквивалентные мутанты строки цикла (T-M09): `cut >= 0` и `cut > -1`
+	// отличаются от `cut > 0` только итерацией при cut == 0 — в ней
+	// проверяется !utf8.RuneStart(dom[0]); для валидного UTF-8 dom[0] —
+	// начало руны, цикл выходит с тем же cut == 0; для невалидного
+	// (dom[0] — байт-продолжение) cut уходит в -1, и ветка cut <= 0 ниже
+	// возвращает то же dom[:limit]. Инкрементер (`cut > 1`) и вырезание
+	// левой половины (`true` — с невалидным UTF-8 уходит в dom[-1]) не
+	// гасим: убиты граничными случаями TestTruncateDOMBoundaries.
+	// mutator-disable-next-line expression/comparison, numbers/decrementer
 	for cut > 0 && !utf8.RuneStart(dom[cut]) {
 		cut-- // не рвать многобайтный символ посередине
 	}
@@ -143,6 +152,11 @@ func extractCookieFields(c *network.Cookie) ExtractCookie {
 		SameSite: extractSameSite(c.SameSite),
 	}
 	if !c.Session && c.Expires > 0 {
+		// Эквивалентный мутант (T-M09): наносекунды в time.Unix ненаблюдаемы
+		// — RFC 3339 секундной гранулярности их отбрасывает (Unix(sec, 0) и
+		// Unix(sec, 1) форматируются одинаково). Граница `Expires > 0`,
+		// вырезание `!c.Session` и секунды закреплены TestExtractCookieFields.
+		// mutator-disable-next-line numbers/incrementer
 		ec.Expires = time.Unix(int64(c.Expires), 0).UTC().Format(time.RFC3339)
 	}
 	return ec
@@ -161,9 +175,18 @@ func extractCookiesFromCDP(cs []*network.Cookie) []ExtractCookie {
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Name != out[j].Name {
+			// Эквивалентный мутант (T-M09): строка достигается только при
+			// разных Name (guard неравенства выше) — для разных строк `<` и
+			// `<=` неразличимы. Финальная тройка (Path ниже) не гасится:
+			// равные пути у неразличимых cookie закреплены тестом
+			// TestExtractCookiesFromCDP.
+			// mutator-disable-next-line expression/comparison
 			return out[i].Name < out[j].Name
 		}
 		if out[i].Domain != out[j].Domain {
+			// Эквивалентный мутант (T-M09): тот же аргумент — guard
+			// неравенства Domain выше оставляет только разные строки.
+			// mutator-disable-next-line expression/comparison
 			return out[i].Domain < out[j].Domain
 		}
 		return out[i].Path < out[j].Path
@@ -217,6 +240,16 @@ func extractHeaderString(v any) string {
 		if x == float64(int64(x)) {
 			return strconv.FormatInt(int64(x), 10)
 		}
+		// Эквивалентный мутант (T-M09): точность -2, как и -1, отрицательна
+		// — реализация Go трактует любую отрицательную точность как
+		// кратчайшую запись (ftoa.go: shortest := prec < 0; документация
+		// strconv специально оговаривает только -1). Гранулярность строки
+		// гасит и инкрементер bitSize 64 → 65 (паника illegal bitSize) —
+		// trade-off §4 docs/mutation-testing.md: класс дефекта прикрыт
+		// декрементером 64 → 63, который не гасится и убит дробным
+		// значением в TestExtractResponseHeaders (вместе с точностью
+		// -1 → 0: «1» вместо «1.25»).
+		// mutator-disable-next-line numbers/incrementer
 		return strconv.FormatFloat(x, 'g', -1, 64)
 	default:
 		return fmt.Sprintf("%v", x)

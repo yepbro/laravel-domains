@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/chromedp/cdproto"
 	"github.com/chromedp/cdproto/cdp/jsonv2"
 	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 )
 
 // fakeCDPSession — сессия CDP для тестов блокировки: помнит команды
@@ -21,12 +24,17 @@ type fakeCDPSession struct {
 	mu    sync.Mutex
 	calls []fakeCDPCall
 	fail  map[string]error
+	// gate — необязательные шлюзы по методам: Call ждёт закрытия канала
+	// (см. комментарий в Call).
+	gate map[string]chan struct{}
 }
 
-// fakeCDPCall — выполненная команда: метод и параметры как есть.
+// fakeCDPCall — выполненная команда: метод и параметры как есть, дедлайн
+// контекста вызова (нулевой — вызов без дедлайна).
 type fakeCDPCall struct {
-	Method string
-	Params any
+	Method   string
+	Params   any
+	Deadline time.Time
 }
 
 func (f *fakeCDPSession) Call(ctx context.Context, method string, params, _ any) error {
@@ -36,10 +44,21 @@ func (f *fakeCDPSession) Call(ctx context.Context, method string, params, _ any)
 	default:
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, fakeCDPCall{Method: method, Params: params})
+	call := fakeCDPCall{Method: method, Params: params}
+	if dl, ok := ctx.Deadline(); ok {
+		call.Deadline = dl
+	}
+	f.calls = append(f.calls, call)
+	f.mu.Unlock()
 	if err, ok := f.fail[method]; ok {
 		return err
+	}
+	// gate — управляемая блокировка: Call с методом из gate не возвращается,
+	// пока шлюз не закроют — безусловно, вопреки отмене контекста: тесту
+	// нужна задержка слушателя ровно внутри blockRespond (отмена контекста
+	// слушателя и есть штатный путь выхода, его и проверяем).
+	if g, ok := f.gate[method]; ok {
+		<-g
 	}
 	return nil
 }
@@ -258,6 +277,32 @@ func TestBlockRespond(t *testing.T) {
 	})
 }
 
+// TestBlockDisable — выключение перехвата: одна команда Fetch.disable под
+// собственным коротким таймаутом blockDisableTimeout (обычный вызов CDP —
+// миллисекунды, дольше ждать незачем), ошибка best-effort не возвращается.
+func TestBlockDisable(t *testing.T) {
+	t.Run("команда и таймаут", func(t *testing.T) {
+		fake := &fakeCDPSession{}
+		blockDisable(context.Background(), fake)
+		calls := fake.callsOf()
+		if len(calls) != 1 || calls[0].Method != "Fetch.disable" {
+			t.Fatalf("команды %v, хочу одну Fetch.disable", calls)
+		}
+		rem := time.Until(calls[0].Deadline)
+		if rem <= 1500*time.Millisecond || rem > 2500*time.Millisecond {
+			t.Errorf("таймаут Fetch.disable: осталось %s, хочу ≈2 с (границы 1.5–2.5 с)", rem)
+		}
+	})
+
+	t.Run("ошибка проглатывается", func(t *testing.T) {
+		fake := &fakeCDPSession{fail: map[string]error{"Fetch.disable": errors.New("вкладка умерла")}}
+		blockDisable(context.Background(), fake) // не паникует
+		if fake.countOf("Fetch.disable") != 1 {
+			t.Error("команда Fetch.disable не выполнена")
+		}
+	})
+}
+
 // pumpEvents — итератор событий в духе cdp.Events: значения из канала,
 // ошибка при отмене ctx (терминально), конец при закрытии канала. Даёт
 // тесту контроль над потоком событий без реальной подписки CDP; ctx
@@ -354,6 +399,11 @@ func TestBlockPumpCtxDone(t *testing.T) {
 	if fake.countOf("Fetch.disable") != 0 {
 		t.Error("отмена контекста не должна звать disable (сессию закрывает пул)")
 	}
+	// Ошибка итератора не проваливается в blockRespond: нулевое событие
+	// ошибки не получает ответа (не было бы и лишнего continueRequest).
+	if got := fake.countOf("Fetch.continueRequest"); got != 0 {
+		t.Errorf("после отмены отвечено на нулевое событие: continueRequest %d, хочу 0", got)
+	}
 }
 
 // TestBlockPumpEventsClosed — закрытие канала событий при живом контексте
@@ -371,6 +421,59 @@ func TestBlockPumpEventsClosed(t *testing.T) {
 	stop() // после выхода насоса возвращает сразу
 }
 
+// TestBlockPumpEventError — ошибка потока событий при живом контексте
+// (неразбираемое событие — yield ошибки терминален, контекст не отменен):
+// насос выходит молча — без ответа на нулевое событие и без fail-open
+// disable (жизненный цикл перехвата держит startBlock, а не мусор в
+// потоке). Детерминизм — синхронность yield: тело итерации насоса
+// отрабатывает ДО возврата из yield, поэтому зонд yieldDone гарантирует,
+// что ответ мутанта был бы записан в фейк при ещё живом контексте.
+func TestBlockPumpEventError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake := &fakeCDPSession{}
+	probe := &errPumpProbe{
+		entered:   make(chan struct{}),
+		yieldDone: make(chan struct{}),
+	}
+	stop := blockPump(ctx, probe.events(errors.New("событие не разбирается")), fake)
+
+	select {
+	case <-probe.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("насос не вошёл в итератор событий")
+	}
+	select {
+	case <-probe.yieldDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("итерация ошибки не завершена (тело насоса не отработало)")
+	}
+	stop()
+	if calls := fake.callsOf(); len(calls) != 0 {
+		t.Fatalf("команды %v, хочу ноль: ошибка потока не отвечает на "+
+			"событие и не выключает перехват", calls)
+	}
+}
+
+// errPumpProbe — итератор в духе cdp.Events: одна терминальная ошибка при
+// живом контексте (как decoding-ошибка полезной нагрузки) с зондами
+// синхронности — entered при входе в итератор, yieldDone по возврату из
+// yield (тело итерации потребителя к этому моменту отработало).
+type errPumpProbe struct {
+	entered   chan struct{}
+	yieldDone chan struct{}
+}
+
+func (p *errPumpProbe) events(err error) func(context.Context) iter.Seq2[fetch.EventRequestPaused, error] {
+	return func(context.Context) iter.Seq2[fetch.EventRequestPaused, error] {
+		return func(yield func(fetch.EventRequestPaused, error) bool) {
+			close(p.entered)
+			yield(fetch.EventRequestPaused{}, err)
+			close(p.yieldDone)
+		}
+	}
+}
+
 // TestBlockPumpRespondError — ошибка ответа не останавливает насос:
 // следующие события обрабатываются (fail-open не нужен, страница жива).
 func TestBlockPumpRespondError(t *testing.T) {
@@ -385,4 +488,129 @@ func TestBlockPumpRespondError(t *testing.T) {
 	waitFor(t, func() bool { return len(fake.callsOf()) >= 2 }) // обе попытки
 
 	stop()
+}
+
+// TestBlockPumpStopWaitsForListener — stop дожидается выхода слушателя
+// (контракт blockPump: «горутина не переживает вызов»): пока насос сидит в
+// blockRespond за шлюзом, stop не возвращается; после освобождения —
+// возвращается быстро.
+func TestBlockPumpStopWaitsForListener(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan fetch.EventRequestPaused)
+	gate := make(chan struct{})
+	fake := &fakeCDPSession{gate: map[string]chan struct{}{"Fetch.continueRequest": gate}}
+	stop := blockPump(ctx, pumpEvents(events), fake)
+
+	// Слушатель вошёл в blockRespond и ждёт освобождения шлюза: команда
+	// записана в журнал до ожидания.
+	events <- fetch.EventRequestPaused{RequestID: "gated", ResourceType: network.ResourceTypeScript}
+	waitFor(t, func() bool { return len(fake.callsOf()) == 1 })
+
+	stopped := make(chan struct{})
+	go func() {
+		stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("stop вернулся до выхода слушателя из blockRespond")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(gate) // отпустить blockRespond — насос завершается по отмене
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop не дождался выхода слушателя после освобождения шлюза")
+	}
+}
+
+// TestStartBlock — включение блокировки в конвейере сессии: отказы контекста
+// вкладки и Fetch.enable, штатный stop (гасит слушателя и выключает
+// перехват). События перехвата подаются через fakeCDP — in-memory транспорт
+// chromedp (cdpfake_test.go), живой браузер не нужен.
+func TestStartBlock(t *testing.T) {
+	t.Run("контекст сессии — не chromedp", func(t *testing.T) {
+		s := &Session{ctx: context.Background()}
+		_, err := s.startBlock(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "контекст вкладки не инициализирован") {
+			t.Fatalf("ошибка %v, хочу «контекст вкладки не инициализирован»", err)
+		}
+	})
+
+	t.Run("chromedp-контекст без вкладки", func(t *testing.T) {
+		tr := newFakeCDP()
+		allocCtx, cancelAlloc := chromedp.NewAllocatorContext(
+			context.Background(), &fakeCDPAllocator{tr: tr})
+		defer cancelAlloc()
+		sctx, cancel := chromedp.NewContext(allocCtx) // без Do: Target не создан
+		defer cancel()
+		s := &Session{ctx: sctx}
+		_, err := s.startBlock(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "контекст вкладки не инициализирован") {
+			t.Fatalf("ошибка %v, хочу «контекст вкладки не инициализирован»", err)
+		}
+	})
+
+	t.Run("ошибка Fetch.enable", func(t *testing.T) {
+		ctx, tr := newFakeCDPContext(t)
+		tr.setError("Fetch.enable", &cdproto.Error{Code: -32000, Message: "домен Fetch сломан"})
+		s := &Session{ctx: ctx}
+		_, err := s.startBlock(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "включение перехвата Fetch") {
+			t.Fatalf("ошибка %v, хочу wrap «включение перехвата Fetch»", err)
+		}
+		if !strings.Contains(err.Error(), "домен Fetch сломан") {
+			t.Errorf("исходная ошибка не пробита: %v", err)
+		}
+		// Слушатель погашен ещё на пути ошибки: события перехвата не
+		// получают ответов (мутант вырезания stopListen оставил бы насос
+		// живым — событие получило бы failRequest/continueRequest).
+		tr.fireSession("Fetch.requestPaused",
+			`{"requestId":"late","resourceType":"Image"}`)
+		assertNoNewCDPCalls(t, tr, "Fetch.requestPaused-после-ошибки")
+	})
+
+	t.Run("stop гасит слушателя и выключает перехват", func(t *testing.T) {
+		ctx, tr := newFakeCDPContext(t)
+		s := &Session{ctx: ctx}
+		stop, err := s.startBlock(context.Background())
+		if err != nil {
+			t.Fatalf("startBlock: %v", err)
+		}
+		if tr.countOf("Fetch.enable") != 1 {
+			t.Fatalf("Fetch.enable выполнен %d раз, хочу 1", tr.countOf("Fetch.enable"))
+		}
+
+		// Событие перехвата получает ответ: слушатель работает.
+		tr.fireSession("Fetch.requestPaused",
+			`{"requestId":"img-1","resourceType":"Image"}`)
+		waitFor(t, func() bool { return tr.countOf("Fetch.failRequest") == 1 })
+
+		stop()
+		waitFor(t, func() bool { return tr.countOf("Fetch.disable") == 1 })
+
+		// После stop события не отвечаются (слушатель погашен) и новых
+		// команд нет.
+		tr.fireSession("Fetch.requestPaused",
+			`{"requestId":"late","resourceType":"Media"}`)
+		assertNoNewCDPCalls(t, tr, "Fetch.requestPaused-после-stop")
+	})
+}
+
+// assertNoNewCDPCalls — негативная проверка: с момента вызова новые команды
+// через транспорт не проходят (окно 100 мс — порядок запаса против
+// микросекунд цепочки доставки; в стиле пакета — негативные паузы
+// TestWaitLoopStaleRequestsDrained).
+func assertNoNewCDPCalls(t *testing.T, tr *fakeCDP, what string) {
+	t.Helper()
+	before := len(tr.callsOf())
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) && len(tr.callsOf()) == before {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(tr.callsOf()); got != before {
+		t.Errorf("%s: прошли новые команды %+v", what, tr.callsOf()[before:])
+	}
 }

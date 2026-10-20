@@ -9,10 +9,13 @@ package render
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/chromedp/cdproto"
 )
 
 // fakeWaitTimer — таймер на фейковых часах: срабатывает только явным fire()
@@ -384,4 +387,163 @@ func TestWaitLoopOverallDeadline(t *testing.T) {
 	if r.out.Quiet {
 		t.Fatalf("исход %+v: окно не подтверждено", r.out)
 	}
+}
+
+// TestWaitSubscribe — подписки и насосы waitSubscribe против in-memory
+// транспорта chromedp (cdpfake_test.go; живой браузер не нужен): событие
+// загрузки закрывает load однократно, сетевые запросы сигнализируются в
+// reqs с буфером ровно waitReqsBuffer, отказ Network.enable возвращается
+// ошибкой, отмена контекста не порождает ни закрытия load, ни ложного
+// сигнала reqs.
+func TestWaitSubscribe(t *testing.T) {
+	t.Run("событие загрузки закрывает load однократно", func(t *testing.T) {
+		ctx, tr := newFakeCDPContext(t)
+		wctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		evs, err := waitSubscribe(wctx)
+		if err != nil {
+			t.Fatalf("waitSubscribe: %v", err)
+		}
+		tr.fireSession("Page.loadEventFired", `{}`)
+		select {
+		case <-evs.load:
+		case <-time.After(2 * time.Second):
+			t.Fatal("событие загрузки не закрыло канал load")
+		}
+		// Повторное событие — без паники повторного close (sync.Once).
+		tr.fireSession("Page.loadEventFired", `{}`)
+		select {
+		case <-evs.load:
+		case <-time.After(50 * time.Millisecond):
+		}
+	})
+
+	t.Run("сетевой запрос сигнализируется в reqs", func(t *testing.T) {
+		ctx, tr := newFakeCDPContext(t)
+		wctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		evs, err := waitSubscribe(wctx)
+		if err != nil {
+			t.Fatalf("waitSubscribe: %v", err)
+		}
+		tr.fireSession("Network.requestWillBeSent", `{"requestId":"r-1"}`)
+		select {
+		case <-evs.reqs:
+		case <-time.After(2 * time.Second):
+			t.Fatal("сетевой запрос не сигнализирован в reqs")
+		}
+	})
+
+	t.Run("отказ Network.enable — ошибка подписки", func(t *testing.T) {
+		ctx, tr := newFakeCDPContext(t)
+		tr.setError("Network.enable", &cdproto.Error{Code: -32000, Message: "сеть недоступна"})
+		wctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		_, err := waitSubscribe(wctx)
+		if err == nil || !strings.Contains(err.Error(), "сеть недоступна") {
+			t.Fatalf("ошибка %v, хочу отказ Network.enable", err)
+		}
+	})
+
+	t.Run("отмена контекста тихо останавливает насосы", func(t *testing.T) {
+		ctx, _ := newFakeCDPContext(t)
+		wctx, cancel := context.WithCancel(ctx)
+		evs, err := waitSubscribe(wctx)
+		if err != nil {
+			t.Fatalf("waitSubscribe: %v", err)
+		}
+		cancel()
+		// Ошибка итератора — терминальная: насосы выходят молча, без
+		// закрытия load и без ложного сигнала reqs.
+		select {
+		case <-evs.load:
+			t.Fatal("отмена контекста закрыла канал load")
+		case <-time.After(100 * time.Millisecond):
+		}
+		n := 0
+		draining := true
+		for draining {
+			select {
+			case <-evs.reqs:
+				n++
+			default:
+				draining = false
+			}
+		}
+		if n != 0 {
+			t.Errorf("отмена контекста дала %d ложных сигналов reqs, хочу 0", n)
+		}
+	})
+}
+
+// TestWaitSubscribeReqsBuffer — буфер канала reqs вмещает ровно 64 сигнала
+// (waitReqsBuffer): насос не блокирует поток событий вкладки, лишние
+// сигналы слипаются (один и тот же сброс окна затишья). Литералы 64/65
+// запиновы сознательно: символ waitReqsBuffer в тесте следовал бы за
+// мутантом константы и ничего бы не отличал. Детерминизм: 65 событий с
+// интервалом (каждое успевает пройти цепочку доставки до следующего),
+// затем положительное ожидание заполнения буфера до 64 и ещё один
+// интервал — 65-е событие к этому моменту обработано (у оригинала
+// слипнуто, у мутанта 65 — влезло); слив фиксирует итог.
+func TestWaitSubscribeReqsBuffer(t *testing.T) {
+	ctx, tr := newFakeCDPContext(t)
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	evs, err := waitSubscribe(wctx)
+	if err != nil {
+		t.Fatalf("waitSubscribe: %v", err)
+	}
+	for i := 0; i < 65; i++ {
+		tr.fireSession("Network.requestWillBeSent", `{"requestId":"r"}`)
+		time.Sleep(2 * time.Millisecond)
+	}
+	// Буфер наполнился (64 у оригинала и мутанта alike)…
+	deadline := time.Now().Add(2 * time.Second)
+	for len(evs.reqs) < 64 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(evs.reqs) < 64 {
+		t.Fatalf("буфер reqs не наполнился: %d сигналов из 64", len(evs.reqs))
+	}
+	// …и последнему событию дан тот же интервал, что и между событиями:
+	// у оригинала его посылка слипнута (буфер полон), у мутанта 65 — влезла.
+	time.Sleep(50 * time.Millisecond)
+
+	n := 0
+	draining := true
+	for draining {
+		select {
+		case <-evs.reqs:
+			n++
+		default:
+			draining = false
+		}
+	}
+	if n != 64 {
+		t.Errorf("буфер reqs вместил %d сигналов, хочу ровно 64 (65-й слипнут)", n)
+	}
+}
+
+// TestWaitRealTimer — обёртка реального таймера: Reset перезапускает отсчёт
+// (срабатывание переносится на новый срок), Stop гасит несработавший.
+// Реальное время — миллисекунды, без пауз ожидания фаз.
+func TestWaitRealTimer(t *testing.T) {
+	t.Run("Reset перезапускает отсчёт", func(t *testing.T) {
+		timer := waitRealTimerFactory(10 * time.Second)
+		timer.Reset(10 * time.Millisecond)
+		select {
+		case <-timer.C():
+		case <-time.After(2 * time.Second):
+			t.Fatal("после Reset таймер не сработал по новому сроку")
+		}
+	})
+	t.Run("Stop гасит несработавший", func(t *testing.T) {
+		timer := waitRealTimerFactory(50 * time.Millisecond)
+		timer.Stop()
+		select {
+		case <-timer.C():
+			t.Fatal("таймер сработал после Stop")
+		case <-time.After(300 * time.Millisecond):
+		}
+	})
 }
