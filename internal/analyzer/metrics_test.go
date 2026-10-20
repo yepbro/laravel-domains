@@ -6,6 +6,7 @@ package analyzer
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -105,4 +106,45 @@ func TestMetricsProcessDelivery(t *testing.T) {
 	if got := anMetricValue(t, reg, "crawler_stage_seconds", stage); got != 1 {
 		t.Errorf("crawler_stage_seconds (count) = %v, want 1", got)
 	}
+}
+
+// TestMetricsBuckets — корзины гистограммы длительностей зарегистрированы
+// ровно заданным списком (литерал — пин против мутантов ±1/сдвигов
+// элементов analyzeSecondsBuckets, T-M10). Prometheus-клиент не отдаёт
+// +Inf в GetBucket — тест дописывает его сам, сравнивая полный список
+// границ.
+func TestMetricsBuckets(t *testing.T) {
+	reg := metrics.New("analyzer")
+	NewMetrics(reg)
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	want := []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, math.Inf(1)}
+	for _, mf := range families {
+		if mf.GetName() != "crawler_stage_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			buckets := m.GetHistogram().GetBucket()
+			// +Inf живёт в sample_count, dto-корзины его не содержат —
+			// дописываем сами для полного сравнения границ.
+			got := make([]float64, 0, len(buckets)+1)
+			for _, b := range buckets {
+				got = append(got, b.GetUpperBound())
+			}
+			got = append(got, math.Inf(1))
+			if len(got) != len(want) {
+				t.Fatalf("корзины = %v, want %v", got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("корзина[%d] = %v, want %v (весь список: %v)", i, got[i], want[i], got)
+				}
+			}
+			return
+		}
+	}
+	t.Fatal("серия crawler_stage_seconds не найдена в реестре")
 }

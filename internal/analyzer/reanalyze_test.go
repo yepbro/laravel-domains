@@ -123,11 +123,17 @@ type reanRow struct {
 // domains/zones, IS DISTINCT FROM, status <> deleted, фильтр зоны,
 // курсор row-value >, ORDER BY по ключу, LIMIT) и поиска зоны по имени;
 // SQL сопоставляется ТОЧНО (неожидаемый — ошибка, тест падает громко).
+// Поля *ScanErr/*RowsErr — инъекции сбоев Scan/Err строк (T-M10).
 type reanPool struct {
 	zones      map[int16]string
 	zoneByName map[string]int16
 	domains    map[reanDomKey]*reanDomain
 	rows       []reanRow
+
+	selectScanErr error
+	selectRowsErr error
+	zoneScanErr   error
+	zoneRowsErr   error
 
 	mu       sync.Mutex
 	queryErr error // настраиваемый сбой любой выборки
@@ -217,9 +223,9 @@ func (p *reanPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 		}
 		id, found := p.zoneByName[name]
 		if !found {
-			return reanRowsOf(), nil // пустой ответ
+			return &reanRows{err: p.zoneRowsErr}, nil // пустой ответ (с инъекцией Err)
 		}
-		return reanRowsOf([]any{id}), nil
+		return &reanRows{rows: [][]any{{id}}, scanErr: p.zoneScanErr, err: p.zoneRowsErr}, nil
 	default:
 		return nil, fmt.Errorf("reanPool: неожидаемый SQL Query: %s", sql)
 	}
@@ -295,7 +301,9 @@ func (p *reanPool) selectRows(args []any) (pgx.Rows, error) {
 		d := p.domains[reanDomKey{zone: r.key.zone, id: r.key.domain}]
 		rows[i] = []any{r.key.zone, r.key.domain, r.key.sub, int16(r.key.variant), d.label + "." + p.zones[r.key.zone]}
 	}
-	return reanRowsOf(rows...), nil
+	out := reanRowsOf(rows...)
+	out.scanErr, out.err = p.selectScanErr, p.selectRowsErr
+	return out, nil
 }
 
 // reanKeyGreater — row-value сравнение ключей «>» (лексикографическое,
@@ -314,16 +322,18 @@ func reanKeyGreater(a, b resultKey) bool {
 }
 
 // reanRows — pgx.Rows с заготовленными строками (Scan — позиционный,
-// типы int16/int64/string).
+// типы int16/int64/string); scanErr/err — инъекции сбоев Scan/Err (T-M10).
 type reanRows struct {
-	rows [][]any
-	i    int
+	rows    [][]any
+	i       int
+	scanErr error
+	err     error
 }
 
 func reanRowsOf(rows ...[]any) *reanRows { return &reanRows{rows: rows} }
 
 func (r *reanRows) Close()                                       {}
-func (r *reanRows) Err() error                                   { return nil }
+func (r *reanRows) Err() error                                   { return r.err }
 func (r *reanRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (r *reanRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *reanRows) Values() ([]any, error)                       { return r.rows[r.i-1], nil }
@@ -340,6 +350,9 @@ func (r *reanRows) Next() bool {
 }
 
 func (r *reanRows) Scan(dest ...any) error {
+	if r.scanErr != nil {
+		return r.scanErr
+	}
 	if r.i == 0 || r.i > len(r.rows) {
 		return errors.New("reanRows: Scan без Next")
 	}
@@ -591,14 +604,16 @@ func TestReanalyzeOnceEmpty(t *testing.T) {
 	}
 }
 
-// TestReanalyzeOnceDefaults — нулевые опции: пачка DefaultReanalyzeBatch.
+// TestReanalyzeOnceDefaults — нулевые опции: пачка DefaultReanalyzeBatch
+// (литерал 5000 — пин против мутантов ±1 константы, T-M10: сравнение
+// с символом константы менялось бы вместе с мутантом).
 func TestReanalyzeOnceDefaults(t *testing.T) {
 	pool := newReanPool()
 	if _, err := ReanalyzeOnce(context.Background(), pool, &reanQueue{}, 1, nil, ReanalyzeOptions{}); err != nil {
 		t.Fatalf("ReanalyzeOnce: %v", err)
 	}
-	if got := pool.calls()[0].args[7]; got != DefaultReanalyzeBatch {
-		t.Errorf("LIMIT = %v, want дефолт %d", got, DefaultReanalyzeBatch)
+	if got := pool.calls()[0].args[7]; got != 5000 {
+		t.Errorf("LIMIT = %v, want дефолт 5000", got)
 	}
 }
 
@@ -708,7 +723,8 @@ func TestReanalyzeIdempotent(t *testing.T) {
 // --- ошибки и отмена -------------------------------------------------------
 
 // TestReanalyzePublishError — сбой публикации посреди пачки: ошибка
-// обёрнута с именем домена, итог содержит опубликованное до сбоя.
+// обёрнута с именем домена и позицией записи (пин «запись N/M» против
+// мутантов i±1, T-M10), итог содержит опубликованное до сбоя.
 func TestReanalyzePublishError(t *testing.T) {
 	pool := newReanPool()
 	pool.seedZone(1, "test")
@@ -721,12 +737,31 @@ func TestReanalyzePublishError(t *testing.T) {
 	res, err := ReanalyzeOnce(context.Background(), pool, q, 1, nil, ReanalyzeOptions{})
 	if err == nil ||
 		!strings.Contains(err.Error(), "analyzer: переанализ: публикация q:analyze") ||
+		!strings.Contains(err.Error(), "запись 2/2") ||
 		!strings.Contains(err.Error(), "d2.test") ||
 		!strings.Contains(err.Error(), "redis ушёл") {
-		t.Errorf("ошибка = %v, want контекст публикации, домен и причина", err)
+		t.Errorf("ошибка = %v, want контекст публикации, позицию 2/2, домен и причину", err)
 	}
 	if res.Selected != 2 || res.Published != 1 {
 		t.Errorf("итог = %+v, want 2/1 (до сбоя)", res)
+	}
+
+	// Дренаж не глотает ошибку публикации своей пачки (собственный
+	// return, отличимый от прохода Once; мутант вырезания, T-M10):
+	// ошибка наружу, опубликованное до сбоя — в итоге.
+	drainPool := newReanPool()
+	drainPool.seedZone(1, "test")
+	for i := int64(1); i <= 2; i++ {
+		drainPool.seedDomain(1, i, fmt.Sprintf("d%d", i), model.StatusAlive)
+		drainPool.seedRow(1, i, 0, model.VariantMain, nil)
+	}
+	drainRes, err := ReanalyzeDrain(context.Background(), drainPool,
+		&reanQueue{errs: []error{nil, errors.New("redis ушёл")}}, 1, nil, ReanalyzeOptions{})
+	if err == nil || !strings.Contains(err.Error(), "redis ушёл") {
+		t.Errorf("дренаж: ошибка = %v, want причину публикации (не глотается)", err)
+	}
+	if drainRes.Selected != 2 || drainRes.Published != 1 {
+		t.Errorf("дренаж: итог = %+v, want 2/1 (до сбоя)", drainRes)
 	}
 }
 
@@ -742,14 +777,56 @@ func TestReanalyzeSelectError(t *testing.T) {
 		t.Errorf("ошибка = %v, want контекст выборки и исходная ошибка", err)
 	}
 
+	// Дренаж не глотает ошибку выборки (мутант вырезания return, T-M10):
+	// итог «как есть», ошибка наружу.
+	pool2 := newReanPool()
+	pool2.setQueryErr(errors.New("бд недоступна"))
+	if _, err := ReanalyzeDrain(context.Background(), pool2, &reanQueue{}, 1, nil, ReanalyzeOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "analyzer: переанализ: выборка") {
+		t.Errorf("дренаж: ошибка = %v, want контекст выборки (не глотается)", err)
+	}
+
 	pool.setQueryErr(context.Canceled)
 	if _, err := ReanalyzeOnce(context.Background(), pool, &reanQueue{}, 1, nil, ReanalyzeOptions{}); !errors.Is(err, context.Canceled) {
 		t.Errorf("ошибка = %v, want context.Canceled", err)
 	}
 }
 
+// TestReanalyzeRowErrors — сбои Scan и Err строк выборки: ошибки обёрнуты
+// контекстом «чтение» (мутанты вырезания return, T-M10), публикаций нет.
+func TestReanalyzeRowErrors(t *testing.T) {
+	seed := func() *reanPool {
+		pool := newReanPool()
+		pool.seedZone(1, "test")
+		pool.seedDomain(1, 1, "a", model.StatusAlive)
+		pool.seedRow(1, 1, 0, model.VariantMain, nil)
+		return pool
+	}
+	pool := seed()
+	pool.selectScanErr = errors.New("скан-бум")
+	q := &reanQueue{}
+	if _, err := ReanalyzeOnce(context.Background(), pool, q, 1, nil, ReanalyzeOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "analyzer: переанализ: выборка: чтение: скан-бум") {
+		t.Errorf("Scan: ошибка = %v, want «выборка: чтение: скан-бум»", err)
+	}
+	if n := q.count(); n != 0 {
+		t.Errorf("публикаций при сбое Scan = %d, want 0", n)
+	}
+
+	pool = seed()
+	pool.selectRowsErr = errors.New("строк-бум")
+	if _, err := ReanalyzeOnce(context.Background(), pool, q, 1, nil, ReanalyzeOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "analyzer: переанализ: выборка: строк-бум") {
+		t.Errorf("Err: ошибка = %v, want «выборка: строк-бум» (без «чтение»)", err)
+	}
+	if n := q.count(); n != 0 {
+		t.Errorf("публикаций при сбое Err = %d, want 0", n)
+	}
+}
+
 // TestReanalyzeDrainCancel — отмена ctx между пачками: чистый выход с
-// ошибкой контекста, опубликованное остаётся в итоге.
+// ошибкой контекста (без двойной обёртки «выборка» — пин текста против
+// мутанта вырезания return, T-M10), опубликованное остаётся в итоге.
 func TestReanalyzeDrainCancel(t *testing.T) {
 	pool := newReanPool()
 	pool.seedZone(1, "test")
@@ -765,18 +842,30 @@ func TestReanalyzeDrainCancel(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("ошибка = %v, want context.Canceled", err)
 	}
+	if err != nil && err.Error() != "analyzer: переанализ: context canceled" {
+		t.Errorf("ошибка = %q, want точная обёртка «analyzer: переанализ: context canceled»", err)
+	}
 	if res.Published != 0 {
 		t.Errorf("итог = %+v, want без публикаций", res)
 	}
 }
 
-// TestReanalyzeNilArgs — nil-зависимости отклоняются с понятной ошибкой.
+// TestReanalyzeNilArgs — nil-зависимости отклоняются с понятной ошибкой
+// (все три входа: разовый проход, дренаж, цикл).
 func TestReanalyzeNilArgs(t *testing.T) {
 	for _, check := range []struct {
 		name string
 		call func() error
 		want string
 	}{
+		{"проход без пула", func() error {
+			_, err := ReanalyzeOnce(context.Background(), nil, &reanQueue{}, 1, nil, ReanalyzeOptions{})
+			return err
+		}, "пул не задан"},
+		{"проход без очереди", func() error {
+			_, err := ReanalyzeOnce(context.Background(), newReanPool(), nil, 1, nil, ReanalyzeOptions{})
+			return err
+		}, "очередь не задана"},
 		{"дренаж без пула", func() error {
 			_, err := ReanalyzeDrain(context.Background(), nil, &reanQueue{}, 1, nil, ReanalyzeOptions{})
 			return err
@@ -784,6 +873,12 @@ func TestReanalyzeNilArgs(t *testing.T) {
 		{"дренаж без очереди", func() error {
 			_, err := ReanalyzeDrain(context.Background(), newReanPool(), nil, 1, nil, ReanalyzeOptions{})
 			return err
+		}, "очередь не задана"},
+		{"цикл без пула", func() error {
+			return ReanalyzeLoop(context.Background(), nil, &reanQueue{}, newReanSource(1), ReanalyzeOptions{})
+		}, "пул не задан"},
+		{"цикл без очереди", func() error {
+			return ReanalyzeLoop(context.Background(), newReanPool(), nil, newReanSource(1), ReanalyzeOptions{})
 		}, "очередь не задана"},
 		{"цикл без источника правил", func() error {
 			return ReanalyzeLoop(context.Background(), newReanPool(), &reanQueue{}, nil, ReanalyzeOptions{})
@@ -812,6 +907,12 @@ func TestReanalyzeOptionsDefaults(t *testing.T) {
 	if keep.Interval != time.Minute || keep.BatchSize != 10 {
 		t.Errorf("withDefaults затирает заданные значения: %v/%v", keep.Interval, keep.BatchSize)
 	}
+	// Единичные значения валидны и не заменяются дефолтами (граница
+	// «<= 0 → <= 1», T-M10): 1 нс и 1 строка — рабочие настройки.
+	unit := ReanalyzeOptions{Interval: 1, BatchSize: 1}.withDefaults()
+	if unit.Interval != 1 || unit.BatchSize != 1 {
+		t.Errorf("withDefaults(единичные) = %v/%v, want 1/1", unit.Interval, unit.BatchSize)
+	}
 }
 
 // --- ZoneIDByName ----------------------------------------------------------
@@ -832,20 +933,52 @@ func TestZoneIDByName(t *testing.T) {
 		t.Errorf("константа разошлась с контрактом теста")
 	}
 
-	if _, found, err := ZoneIDByName(context.Background(), pool, "nope.test"); err != nil || found {
-		t.Errorf("несуществующая зона = %v, %v; want false, nil", found, err)
+	// Зоны нет: id ровно 0 и found=false (мутанты «return 0» → ±1, T-M10).
+	id, found, err = ZoneIDByName(context.Background(), pool, "nope.test")
+	if err != nil || found || id != 0 {
+		t.Errorf("несуществующая зона = %d, %v, %v; want 0, false, nil", id, found, err)
 	}
 
 	fail := newReanPool()
 	fail.setQueryErr(errors.New("бд недоступна"))
-	if _, _, err := ZoneIDByName(context.Background(), fail, "x.test"); err == nil ||
-		!strings.Contains(err.Error(), "analyzer: зона по имени") {
+	id, _, err = ZoneIDByName(context.Background(), fail, "x.test")
+	if err == nil || !strings.Contains(err.Error(), "analyzer: зона по имени") {
 		t.Errorf("ошибка = %v, want контекст задачи", err)
 	}
+	if id != 0 {
+		t.Errorf("id при ошибке = %d, want 0 (мутанты «return 0» → ±1, T-M10)", id)
+	}
 
-	if _, _, err := ZoneIDByName(context.Background(), nil, "x.test"); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
+	// Сбой Scan найденной зоны: ошибка «чтение», found=false, id=0
+	// (мутанты вырезания return и «return 0» → ±1, T-M10).
+	scan := newReanPool()
+	scan.seedZone(3, "crawl.test")
+	scan.zoneScanErr = errors.New("скан-бум")
+	id, found, err = ZoneIDByName(context.Background(), scan, "crawl.test")
+	if err == nil || !strings.Contains(err.Error(), "analyzer: зона по имени: чтение: скан-бум") {
+		t.Errorf("Scan: ошибка = %v, want «зона по имени: чтение: скан-бум»", err)
+	}
+	if found || id != 0 {
+		t.Errorf("Scan: id/found = %d, %v; want 0, false", id, found)
+	}
+
+	// Сбой Err строк пустой выборки: ошибка контекста задачи, id=0.
+	rows := newReanPool()
+	rows.zoneRowsErr = errors.New("строк-бум")
+	id, found, err = ZoneIDByName(context.Background(), rows, "x.test")
+	if err == nil || !strings.Contains(err.Error(), "analyzer: зона по имени: строк-бум") {
+		t.Errorf("Err: ошибка = %v, want «зона по имени: строк-бум»", err)
+	}
+	if found || id != 0 {
+		t.Errorf("Err: id/found = %d, %v; want 0, false", id, found)
+	}
+
+	id, _, err = ZoneIDByName(context.Background(), nil, "x.test")
+	if err == nil || !strings.Contains(err.Error(), "пул не задан") {
 		t.Errorf("ошибка = %v, want «пул не задан»", err)
+	}
+	if id != 0 {
+		t.Errorf("id без пула = %d, want 0", id)
 	}
 }
 
@@ -864,7 +997,10 @@ func reanWait(t *testing.T, what string, cond func() bool) {
 }
 
 // TestReanalyzeLoopImmediateDrain — стартовый дренаж выполняется сразу:
-// устаревшее за простоем публикуется до первого тика.
+// устаревшее за простоем публикуется до первого тика. Без Options.Log:
+// nil-логгер обязан заменяться заглушкой — Info «проход переанализа»
+// по публикации дренажа на nil-указателе паниковал бы (мутант вырезания
+// подстановки Discard, T-M10).
 func TestReanalyzeLoopImmediateDrain(t *testing.T) {
 	pool := newReanPool()
 	pool.seedZone(1, "test")
@@ -1021,6 +1157,116 @@ func TestReanalyzeLoopNilSet(t *testing.T) {
 	})
 	if n := q.count(); n != 0 {
 		t.Errorf("публикаций = %d, want 0 без набора", n)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("ReanalyzeLoop: %v, want nil при отмене ctx", err)
+	}
+}
+
+// TestReanalyzeLoopPassInfo — порог Info «проход переанализа» по итогам
+// дренажа: пустой проход молчит, проход с публикациями пишет итог
+// (мутанты «Published > 0» ±/вырезание и удаление самого Info, T-M10).
+// Вторая выборка доказывает завершение первого прохода (дренажи
+// последовательны), к моменту проверки лог уже решён.
+func TestReanalyzeLoopPassInfo(t *testing.T) {
+	t.Run("пустой проход молчит", func(t *testing.T) {
+		var buf reanBuf
+		pool := newReanPool() // пусто: дренаж без публикаций
+		q := &reanQueue{}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- ReanalyzeLoop(ctx, pool, q, newReanSource(1), ReanalyzeOptions{
+				Interval: 2 * time.Millisecond,
+				Log:      slog.New(slog.NewTextHandler(&buf, nil)),
+			})
+		}()
+
+		reanWait(t, "второй проход", func() bool { return pool.queryCount() >= 2 })
+		if strings.Contains(buf.String(), `msg="проход переанализа"`) {
+			t.Errorf("Info о пустом проходе записан:\n%s", buf.String())
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatalf("ReanalyzeLoop: %v", err)
+		}
+	})
+
+	t.Run("проход с публикациями пишет Info", func(t *testing.T) {
+		var buf reanBuf
+		pool := newReanPool()
+		pool.seedZone(1, "test")
+		pool.seedDomain(1, 1, "a", model.StatusAlive)
+		pool.seedRow(1, 1, 0, model.VariantMain, nil)
+		q := &reanQueue{}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- ReanalyzeLoop(ctx, pool, q, newReanSource(1), ReanalyzeOptions{
+				Interval: 2 * time.Millisecond,
+				Log:      slog.New(slog.NewTextHandler(&buf, nil)),
+			})
+		}()
+
+		reanWait(t, "второй проход", func() bool { return pool.queryCount() >= 2 })
+		if log := buf.String(); !strings.Contains(log, `msg="проход переанализа"`) || !strings.Contains(log, "published=1") {
+			t.Errorf("Info о проходе с публикацией не записан:\n%s", log)
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatalf("ReanalyzeLoop: %v", err)
+		}
+	})
+}
+
+// TestReanalyzeLoopClosedSets — закрытый канал подписки не зацикливает
+// select: ветка гасится (sets = nil), цикл продолжает жить по тикеру и
+// выходит только отменой. Убивает мутант вырезания ветки целиком (тот
+// льёт поток drain/логов «внеочередного переанализа» по закрытому
+// каналу); continue → break в select эквивалентен и погашен аннотацией
+// в reanalyze.go. Пустой пул: корректный цикл после закрытия не делает
+// ни выборки, ни записи в лог.
+func TestReanalyzeLoopClosedSets(t *testing.T) {
+	var buf reanBuf
+	pool := newReanPool()
+	q := &reanQueue{}
+	src := newReanSource(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- ReanalyzeLoop(ctx, pool, q, src, ReanalyzeOptions{
+			Interval: time.Hour, // тик не наступит: после закрытия циклу нечего делать
+			Log:      slog.New(slog.NewTextHandler(&buf, nil)),
+		})
+	}()
+
+	reanWait(t, "стартовый дренаж", func() bool { return pool.queryCount() >= 1 })
+	if !strings.Contains(buf.String(), "цикл переанализа запущен") {
+		t.Errorf("Info запуска не записан:\n%s", buf.String())
+	}
+	close(src.next) // Reloader ушёл, не отменив подписку
+
+	// Окно 100 мс: мутанты успевают себя проявить (горячий цикл с
+	// drain на каждую итерацию или мгновенный выход из цикла).
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("цикл завершился по закрытому каналу: %v", err)
+	default:
+	}
+	if strings.Contains(buf.String(), "внеочередной переанализ") {
+		t.Errorf("закрытый канал трактован как смена набора:\n%s", buf.String())
+	}
+	if n := pool.queryCount(); n != 1 {
+		t.Fatalf("выборок после закрытия канала = %d, want 1 (без внеочередных проходов)", n)
 	}
 
 	cancel()

@@ -589,7 +589,18 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 
 		var wg sync.WaitGroup
 		for _, d := range deliveries {
+			// Эквивалентный мутант (T-M10): вырезание break запускает
+			// оставшиеся доставки окна и после отмены ctx, но их обработка
+			// целиком падает на отменённом контексте (SELECT/транзакция/XACK
+			// отклоняют ctx и у драйверов, и у фейков) без записей в БД и без
+			// подтверждения — запись остаётся в pending, как и при невызове;
+			// Warn погашен условием ctx.Err() == nil ниже.
+			// mutator-disable-next-line branch/if
 			if ctx.Err() != nil {
+				// Эквивалентный мутант (T-M10): break → continue проходит
+				// остаток окна, не запуская доставки, и выходит на
+				// пост-проверку ctx за wg.Wait — то же состояние и возврат nil.
+				// mutator-disable-next-line loop/break
 				break // не начатые доставки окна не подтверждены
 			}
 			sem <- struct{}{}

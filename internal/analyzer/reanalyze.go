@@ -331,7 +331,20 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 			return nil
 		case set, ok := <-sets:
 			if !ok {
+				// Эквивалентный мутант (T-M10): вырезание sets = nil
+				// оставляет в select закрытый канал — он по-прежнему
+				// немедленно готов, ok=false и continue вращают цикл
+				// вхолостую без drain и логов, состояние и дальнейшие
+				// развилки те же (различие только в нагрузке CPU —
+				// детерминированно не наблюдаемо). Вырезание ветки
+				// целиком закрыто тестом TestReanalyzeLoopClosedSets
+				// (поток drain/логов по закрытому каналу).
+				// mutator-disable-next-line statement/remove
 				sets = nil // закрытый канал не должен зациклить select
+				// Эквивалентный мутант (T-M10): continue → break лишь
+				// выходит из select — цикл for продолжает следующей
+				// итерацией, а тело ветки и так исчерпано: неразличимо.
+				// mutator-disable-next-line loop/break
 				continue
 			}
 			log.Info("смена набора правил — внеочередной переанализ",

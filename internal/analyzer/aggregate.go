@@ -165,6 +165,15 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 		if err != nil {
 			return fmt.Errorf("удаление строки домена: %w", err)
 		}
+		// Эквивалентные мутанты (T-M10): RowsAffected у DELETE — 0 или 1,
+		// а existed читается под advisory-блокировкой ДО удаления
+		// (laravel_domains пишут только пересчёты, они сериализованы) —
+		// existed=true ⟺ DELETE затронет 1: ослабление «> 0» до «>= 0» /
+		// «> -1» и вырезание existed различимы лишь при RowsAffected == 0
+		// ∧ existed — недостижимо. Строчная гранулярность гасит и убиваемое
+		// вырезание fresh — оно прикрыто TestAggregate_History (переанализ
+		// не пишет историю); trade-off §4 docs/mutation-testing.md.
+		// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer
 		if tag.RowsAffected() > 0 && fresh && existed {
 			// Строка была и исчезла — lost (только свежий эпизод, T-118).
 			if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, false); err != nil {
@@ -227,6 +236,13 @@ func scanAggregate(rows pgx.Rows) (domainAggregate, error) {
 		if err := rows.Scan(&r.subdomainID, &r.score, &r.verMin, &r.verMax); err != nil {
 			return domainAggregate{}, err
 		}
+		// Эквивалентный мутант (T-M10): «>» → «>=» отличается только
+		// переприсвоением равного score (значение и тип те же); ±0.0
+		// в данных этапа не возникает — score срабатываний считается
+		// ScoreRules как noisy-OR из весов [0, 1]. Вырезание guard'а
+		// «findings == 0» и «== -1» закрыты тестом (отрицательный
+		// мусорный score первой строки).
+		// mutator-disable-next-line expression/comparison
 		if agg.findings == 0 || r.score > agg.score {
 			agg.score = r.score
 		}
@@ -252,12 +268,25 @@ func scanAggregate(rows pgx.Rows) (domainAggregate, error) {
 	if err := rows.Err(); err != nil {
 		return domainAggregate{}, err
 	}
+	// Эквивалентные мутанты (T-M10): на пустом входе цикл не выполнялся
+	// ни разу — haveMin/haveMax и unbounded* ложны, хвост функции не
+	// меняет агрегат; ранний возврат и проваливание сквозь него дают
+	// одинаковый результат («== -1» и вырезание return — одна ветка).
+	// mutator-disable-next-line numbers/decrementer, branch/if
 	if agg.findings == 0 {
 		return agg, nil
 	}
+	// Эквивалентный мутант (T-M10): «haveMin → true» различим только при
+	// haveMin=false ∧ unboundedMin=false — на непустом входе каждая строка
+	// выставляет хотя бы один из флагов, а пустой отсечён возвратом выше.
+	// mutator-disable-next-line expression/remove
 	if haveMin && !unboundedMin {
 		agg.verMin = &minStr
 	}
+	// Эквивалентный мутант (T-M10): симметрично verMin — «haveMax → true»
+	// различим только при haveMax=false ∧ unboundedMax=false, что на
+	// непустом входе недостижимо.
+	// mutator-disable-next-line expression/remove
 	if haveMax && !unboundedMax {
 		agg.verMax = &maxStr
 	}

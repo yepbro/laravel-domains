@@ -49,7 +49,8 @@ type anDomain struct {
 // срабатывания (is_laravel) домена в порядке PK — детерминированно, как
 // лист партиции PostgreSQL; собственные записи транзакции (findings этой
 // доставки) видны — Exec фейка меняет состояние напрямую, Rollback
-// восстанавливает снапшот.
+// восстанавливает снапшот. Инъекции aggScanErr/aggRowsErr и onClose —
+// мутационные тесты T-M10 (сбой Scan/Err строк, контроль Close).
 func (t *anFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -81,18 +82,26 @@ func (t *anFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 		rows = append(rows, []any{k.subdomain, f.score, f.verMin, f.verMax})
 	}
 	t.pool.j.record(anEvAggSelect)
-	return &anAggRows{rows: rows}, nil
+	return &anAggRows{rows: rows, scanErr: t.pool.aggScanErr, err: t.pool.aggRowsErr,
+		onClose: func() { t.pool.j.record(anEvAggClose) }}, nil
 }
 
 // anAggRows — pgx.Rows с уверенными срабатываниями домена (subdomain_id,
-// score, ver_min, ver_max).
+// score, ver_min, ver_max); scanErr/err/onClose — инъекции T-M10.
 type anAggRows struct {
-	rows [][]any
-	i    int
+	rows    [][]any
+	i       int
+	scanErr error
+	err     error
+	onClose func()
 }
 
-func (r *anAggRows) Close()                        {}
-func (r *anAggRows) Err() error                    { return nil }
+func (r *anAggRows) Close() {
+	if r.onClose != nil {
+		r.onClose()
+	}
+}
+func (r *anAggRows) Err() error                    { return r.err }
 func (r *anAggRows) CommandTag() pgconn.CommandTag { return pgconn.CommandTag{} }
 func (r *anAggRows) FieldDescriptions() []pgconn.FieldDescription {
 	return nil
@@ -107,6 +116,9 @@ func (r *anAggRows) Next() bool {
 }
 
 func (r *anAggRows) Scan(dest ...any) error {
+	if r.scanErr != nil {
+		return r.scanErr
+	}
 	if r.i == 0 || r.i > len(r.rows) || len(dest) != 4 {
 		return fmt.Errorf("anAggRows: Scan без Next или приёмников %d (нужно 4)", len(dest))
 	}
@@ -260,6 +272,22 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 				foundOnMask: mustMask(t, 1)},
 		},
 		{
+			name: "численно равные границы соседних строк — первая по PK (min и max)",
+			rows: [][]any{
+				{int16(1), float32(0.7), anStr("9.19"), anStr("9.19.0")},
+				{int16(2), float32(0.6), anStr("9.19.0"), anStr("9.19")},
+			},
+			want: domainAggregate{score: 0.7, verMin: anStr("9.19"), verMax: anStr("9.19.0"),
+				foundOnMask: mustMask(t, 1, 2)},
+		},
+		{
+			name: "отрицательный score (мусор в БД) — первая строка задаёт максимум",
+			rows: [][]any{
+				{int16(1), float32(-0.5), nil, nil},
+			},
+			want: domainAggregate{score: -0.5, foundOnMask: mustMask(t, 1)},
+		},
+		{
 			name: "варианты одного субдомена схлопываются в бит; бит 62 допустим",
 			rows: [][]any{
 				{int16(5), float32(0.61), anStr("10"), anStr("11")},
@@ -338,10 +366,13 @@ func TestAggregate_ThroughWorker(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 
-	// Порядок: findings → блокировка → чтение → агрегат → фиксация.
+	// Порядок: findings → блокировка → чтение → агрегат → фиксация;
+	// строки агрегации закрываются после чтения (мутант вырезания
+	// rows.Close, T-M10).
 	for _, pair := range [][2]anEventKind{
 		{anEvUpsert, anEvLock}, {anEvLock, anEvAggSelect},
-		{anEvAggSelect, anEvAggUpsert}, {anEvAggUpsert, anEvCommit},
+		{anEvAggSelect, anEvAggClose}, {anEvAggClose, anEvAggUpsert},
+		{anEvAggUpsert, anEvCommit},
 	} {
 		if f.pool.j.indexOf(pair[0]) > f.pool.j.indexOf(pair[1]) {
 			t.Fatalf("порядок %v после %v нарушен: %v", pair[1], pair[0], f.pool.j.snapshot())
@@ -469,7 +500,10 @@ func TestAggregate_DomainDeleted(t *testing.T) {
 }
 
 // TestAggregate_Errors — сбой каждого шага агрегации: ошибка доставки
-// (без XACK), состояние откатывается — findings и строка домена.
+// (без XACK), состояние откатывается — findings и строка домена;
+// want — точная подстрока обёртки (пины текстов против мутантов
+// вырезания return, T-M10), fresh — доставка свежего эпизода HTTP
+// (ветки истории appeared/lost, T-118).
 func TestAggregate_Errors(t *testing.T) {
 	seed := func(t *testing.T) *anFixture {
 		f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
@@ -481,30 +515,57 @@ func TestAggregate_Errors(t *testing.T) {
 		return f
 	}
 	cases := []struct {
-		name string
-		inj  func(f *anFixture)
+		name   string
+		inj    func(f *anFixture)
+		want   string
+		fresh  bool
+		hadRow bool // была ли строка домена до сбоя (appeared-ветка стартует без неё)
 	}{
-		{"блокировка домена", func(f *anFixture) { f.pool.lockErr = errors.New("lock boom") }},
-		{"чтение срабатываний", func(f *anFixture) { f.pool.aggSelectErr = errors.New("select boom") }},
-		{"запись строки домена", func(f *anFixture) { f.pool.aggUpsertErr = errors.New("agg boom") }},
+		{"блокировка домена", func(f *anFixture) { f.pool.lockErr = errors.New("lock boom") }, "", false, true},
+		{"чтение срабатываний", func(f *anFixture) { f.pool.aggSelectErr = errors.New("select boom") }, "", false, true},
+		{"чтение срабатываний (Scan строк)", func(f *anFixture) { f.pool.aggScanErr = errors.New("scan boom") },
+			"чтение срабатываний", false, true},
+		{"чтение срабатываний (Err строк)", func(f *anFixture) { f.pool.aggRowsErr = errors.New("rows boom") },
+			"чтение срабатываний", false, true},
+		{"мусорный субдомен в findings", func(f *anFixture) {
+			anSeedFinding(f.pool, anRowKey{3, 42, 63, 0}, 0.7, nil, nil, true)
+		}, "чтение срабатываний", false, true},
+		{"чтение строки домена", func(f *anFixture) { f.pool.existsErr = errors.New("exists boom") },
+			"чтение строки домена", false, true},
+		{"запись строки домена", func(f *anFixture) { f.pool.aggUpsertErr = errors.New("agg boom") },
+			"запись строки домена: agg boom", false, true},
+		{"запись строки домена: RowsAffected", func(f *anFixture) { f.pool.aggUpsertRowsAff = 2 },
+			"запись строки домена: затронуто 2 строк", false, true},
 		{"удаление строки домена", func(f *anFixture) {
 			// Итог доставки без срабатываний → ветка удаления.
 			f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil)
 			f.pool.aggUpsertErr = errors.New("не должен вызываться")
 			f.pool.aggDeleteErr = errors.New("agg del boom")
-		}},
-		{"фиксация", func(f *anFixture) { f.pool.commitErr = errors.New("commit boom") }},
+		}, "", false, true},
+		{"запись истории (lost)", func(f *anFixture) {
+			f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil) // признаков нет
+			f.pool.aggHistErr = errors.New("hist boom")
+		}, "запись истории (lost)", true, true},
+		{"запись истории (appeared)", func(f *anFixture) {
+			delete(f.pool.domains, anDomainKey{anKey.zone, anKey.domain}) // строки не было
+			f.pool.aggHistErr = errors.New("hist boom")
+		}, "запись истории (appeared)", true, false},
+		{"фиксация", func(f *anFixture) { f.pool.commitErr = errors.New("commit boom") }, "", false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := seed(t)
 			tc.inj(f)
-			if _, err := f.w.ProcessResult(context.Background(), anTask); err == nil {
+			task := anTask
+			task.Fresh = tc.fresh
+			if _, err := f.w.ProcessResult(context.Background(), task); err == nil {
 				t.Fatal("ожидана ошибка доставки")
+			} else if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ошибка = %v, нужна подстрока %q", err, tc.want)
 			}
-			// Откат: прежняя строка домена цела, новых нет.
+			// Откат: прежнее состояние строки домена сохранилось.
 			row, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain)
-			if !ok || row.rulesVersion != 999 {
+			if tc.hadRow != ok || (ok && row.rulesVersion != 999) {
 				t.Fatalf("строка домена изменилась при сбое: %+v (ok=%v)", row, ok)
 			}
 			if _, ok := anFindingSnapshot(f.pool, anKey); ok {
