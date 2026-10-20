@@ -75,7 +75,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   `>` против `>=` при равных ms), `DefaultRedisBlock`, `BUSYGROUP`,
   `start = "0"`, пустые msgs. backpressure/recover/reliab: пороги
   включения/выключения (`>` vs `>=`, ±1), окно оценки, счётчики.
-- **T-M05** [в работе] — `internal/scheduler/{dispatch,enqueue}.go`
+- **T-M05** [сделана] — `internal/scheduler/{dispatch,enqueue}.go`
   (92 выживших). Дайджест:
   `var/mutation/escaped/T-M05-scheduler-dispatch.txt`.
   dispatch: взвешенный round-robin — `key = (rn-0.5)/w` (порядок выбора
