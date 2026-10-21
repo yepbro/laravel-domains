@@ -137,7 +137,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   уверенности — граница 0.6 из ТЗ §13.1), порядок правил (`loop/break`).
   rules/engine: ветки применения правил, `expression/remove` на
   условиях. reload: логгирование — по политике гашения.
-- **T-M13** [в работе] — `internal/status/status.go` + `internal/idn/idn.go`
+- **T-M13** [сделана] — `internal/status/status.go` + `internal/idn/idn.go`
   + `internal/model/{dnsmask,enums,flags}.go` (56 выживших). Дайджест:
   `var/mutation/escaped/T-M13-status-idn-model.txt`.
   status: ветки `rows.Err()`/`rows.Close()` (ошибка после чтения —
