@@ -130,7 +130,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   выборки, ветки ошибок. auth/secret: сравнение времени сравнения
   (timing), длина секрета (±1), границы base64. assets: иммутабельность
   кэша. snapshot: ветка ошибки.
-- **T-M12** [в работе] — `internal/rules/{rules,score,engine,reload}.go`
+- **T-M12** [сделана] — `internal/rules/{rules,score,engine,reload}.go`
   (60 выживших). Дайджест:
   `var/mutation/escaped/T-M12-rules.txt`.
   score: веса правил (±1 на константах, `>=` vs `>` на порогах
