@@ -236,6 +236,42 @@ func TestHasXNLabel(t *testing.T) {
 	}
 }
 
+// TestIsNumericZone — контракт isNumericZone прямыми вызовами: функция
+// неэкспортируемая, а случай zone == "" через Normalize недостижим
+// (publicsuffix.PublicSuffix непустому ASCII-входу всегда отдаёт
+// непустой суффикс — комментарий перед проверкой zone == "" там),
+// поэтому поведение пустой зоны фиксируется здесь, а не через
+// публичный API.
+func TestIsNumericZone(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		// Пустая зона зоной не является: мутант idn.go.8 (branch/if)
+		// вырезает return false для zone == "", после чего цикл по
+		// Split("", ".") = [""] не срабатывает и функция доходит до
+		// return true. Через Normalize ветка недостижима — контракт
+		// фиксируется прямым вызовом.
+		{"", false},
+		// Числовые зоны — таких TLD не существует (IANA); правило «*»
+		// publicsuffix отдаёт их как есть.
+		{"1999", true},       // голый числовой TLD
+		{"18.06.1999", true}, // дата выгрузки регистратора
+		{"1.2.3.4", true},    // IPv4-литерал
+		{"0", true},
+		// Буквенные зоны — не числовые; числовая метка в буквенной
+		// зоне (123.com) — обычное имя, не числовая зона.
+		{"123.com", false},
+		{"com", false},
+		{"co.uk", false},
+	}
+	for _, tc := range tests {
+		if got := isNumericZone(tc.in); got != tc.want {
+			t.Errorf("isNumericZone(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestError — структура типизированной ошибки: класс, имя, причина,
 // оборачивание (rejected-лог T-016 обернёт её в свою ошибку).
 func TestError(t *testing.T) {
