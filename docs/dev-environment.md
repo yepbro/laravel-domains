@@ -52,6 +52,8 @@ make redis-cli               # консоль Redis
 make shell                   # оболочка в tools-контейнере (Go-тулчейн)
 make down                    # остановить (тома сохранятся)
 make clean                   # остановить и удалить тома (с подтверждением)
+make reset-internet          # полный сброс (тома, var/content, отчёты
+                             # ingest) + старт с реальным DNS
 ```
 
 ## 2. Профили и типовые сценарии

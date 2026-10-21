@@ -94,6 +94,18 @@ up-internet: ## Включить реальную рекурсию DNS (треб
 	@echo 'User-Agent краулера должен содержать пометку dev (CRAWLER_USER_AGENT в .env).'
 	@echo 'Возврат в изолированный режим: make up'
 
+.PHONY: reset-internet
+reset-internet: ## Полный сброс среды и старт с реальным DNS (ALLOW_INTERNET=1)
+	$(check_env)
+	@grep -q '^ALLOW_INTERNET=1' .env || { echo \
+	  'ОТКАЗ: выход в интернет включается явно (сброс отменён).';\
+	  echo 'Добавьте в .env:  ALLOW_INTERNET=1'; exit 1; }
+	$(MAKE) clean FORCE=1
+	rm -rf var/content/* var/incoming/processed/* var/incoming/failed/*
+	$(MAKE) mod-download
+	$(MAKE) warm-cache
+	$(MAKE) up-internet
+
 .PHONY: down
 down: ## Остановить окружение (тома сохраняются)
 	$(check_env)
@@ -284,6 +296,12 @@ db-reset: ## Полное пересоздание БД и томов проек
 	$(check_env)
 	@echo 'Это то же самое, что make clean + make up (удаление томов, включая кэши).'
 	$(MAKE) clean
+	# После clean общий gomodcache пуст, а сервисы приложения качать модули
+	# не могут (DNS — только герметичный unbound): прогреваем из tools.
+	$(MAKE) mod-download
+	# Холодный gocache: параллельные air-сборки восьми сервисов не влезают
+	# в память (лимиты 256m) — прогреваем кэш одной компиляцией в tools.
+	$(MAKE) warm-cache
 	$(MAKE) up
 
 # --------------------------------------------------------------- testbed
