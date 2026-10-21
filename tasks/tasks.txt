@@ -121,7 +121,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   aggregate: границы объединения диапазонов версий (NULL-границы, min/max
   по компонентам), `scanAggregate`. reanalyze: дефолты batch/interval,
   ошибки пул/очередь. metrics — по политике.
-- **T-M11** [в работе] — `internal/dashboard/{dashboard,assets,snapshot}.go`
+- **T-M11** [сделана] — `internal/dashboard/{dashboard,assets,snapshot}.go`
   + `internal/dashboard/auth/secret.go` (49 выживших; score пакета 0.50 —
   худший в охвате). Дайджест:
   `var/mutation/escaped/T-M11-dashboard.txt`.
