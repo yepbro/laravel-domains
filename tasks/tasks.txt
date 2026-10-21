@@ -112,7 +112,7 @@ docs/mutation-testing.md и подъём порога ночного CI.
   extract: пороги извлечения (число вхождений, длины фрагментов —
   границы ровно-на-пороге). block: лимиты блокировок. wait: циклы
   ожидания (`range_break`, снятие ожидания).
-- **T-M10** [в работе] — `internal/analyzer/{worker,reanalyze,aggregate,
+- **T-M10** [сделана] — `internal/analyzer/{worker,reanalyze,aggregate,
   metrics}.go` (97 выживших). Дайджест:
   `var/mutation/escaped/T-M10-analyzer.txt`.
   worker: дефолты `DefaultConcurrency/Consume/ErrorWait` (`<= 0` vs
