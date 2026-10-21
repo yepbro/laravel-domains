@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -716,6 +717,58 @@ func TestAPIStatusSnapshot(t *testing.T) {
 	rec = doReq(srv.Handler(), http.MethodGet, "/api/status", "10.0.0.20:2021", authed())
 	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "snapshot_not_ready") {
 		t.Errorf("без снимка: %d %s, хочу 503 snapshot_not_ready", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRFC3339Zero — форматирование моментов снимка: zero-время (NULL
+// колонки схемы) — пустая строка («0001-01-01…» в интерфейсе — шум),
+// ненулевое — RFC3339 в UTC независимо от зоны входа.
+func TestRFC3339Zero(t *testing.T) {
+	if got := rfc3339Zero(time.Time{}); got != "" {
+		t.Errorf("rfc3339Zero(zero) = %q, хочу пустую строку (NULL processed_at — пусто)", got)
+	}
+	plus3 := time.FixedZone("utc+3", 3*60*60)
+	tm := time.Date(2026, 10, 19, 9, 0, 0, 0, plus3)
+	if got, want := rfc3339Zero(tm), "2026-10-19T06:00:00Z"; got != want {
+		t.Errorf("rfc3339Zero(%v) = %q, хочу %q (приведение к UTC)", tm, got, want)
+	}
+}
+
+// TestAPIStatusNoEscapeHTML — «&» в данных снимка не экранируется
+// (SetEscapeHTML false — стиль CLI crawlerctl status): домен с
+// амперсандом приходит в исходном виде, без \u0026.
+func TestAPIStatusNoEscapeHTML(t *testing.T) {
+	srv := newTestServer(t, func(o *Options) {
+		o.Snapshots = staticSource{&Snapshot{Laravel: &LaravelJSON{
+			Recent: []LaravelItemJSON{{Domain: "shop&co.crawl.test"}},
+		}}}
+	})
+	rec := doReq(srv.Handler(), http.MethodGet, "/api/status", "10.0.0.21:2121", authed())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/status = %d (тело: %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "shop&co.crawl.test") || strings.Contains(body, `\u0026`) {
+		t.Errorf("«&» домена экранирован — должен приходить как есть (стиль CLI):\n%s", body)
+	}
+}
+
+// TestAPIStatusEncodeError — ошибка кодирования снимка (NaN в real-поле —
+// гипотеза комментария хендлера): 500 с диагнозом, а не 200 с частичным
+// JSON — буфер не отдаётся.
+func TestAPIStatusEncodeError(t *testing.T) {
+	srv := newTestServer(t, func(o *Options) {
+		o.Snapshots = staticSource{&Snapshot{Laravel: &LaravelJSON{
+			Recent: []LaravelItemJSON{{Domain: "nan.crawl.test", Score: float32(math.NaN())}},
+		}}}
+	})
+	rec := doReq(srv.Handler(), http.MethodGet, "/api/status", "10.0.0.21:2122", authed())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("NaN в снимке: статус = %d, хочу 500 (частичный JSON со 200 недопустим; тело: %s)",
+			rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "snapshot encode failed") {
+		t.Errorf("тело = %q, хочу диагноз snapshot encode failed", rec.Body.String())
 	}
 }
 

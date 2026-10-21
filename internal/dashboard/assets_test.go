@@ -7,7 +7,9 @@
 package dashboard
 
 import (
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -116,5 +118,28 @@ func TestAssets(t *testing.T) {
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("GET %s = %d, хочу 404 (файл вне карты отдачи)", path, rec.Code)
 		}
+	}
+}
+
+// TestServeAssetMissing — артефакт вне embed (ошибка сборки, а не
+// запроса): честный 500 «asset unavailable» и Error в лог с именем
+// артефакта. Белый ящик: через /assets/* ветку не достичь — имена
+// фильтруются картой assetTypes (404 раньше), поэтому serveAsset
+// вызывается напрямую с именем, которого нет в embed.
+func TestServeAssetMissing(t *testing.T) {
+	var logs syncBuf
+	srv := newTestServer(t, func(o *Options) { o.Log = slog.New(slog.NewTextHandler(&logs, nil)) })
+
+	rec := httptest.NewRecorder()
+	srv.serveAsset(rec, "missing.bin", "text/plain; charset=utf-8")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("serveAsset(нет в embed) = %d, хочу 500", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "asset unavailable") {
+		t.Errorf("тело = %q, хочу диагноз asset unavailable", rec.Body.String())
+	}
+	if s := logs.String(); !strings.Contains(s, "артефакт фронта отсутствует в embed") || !strings.Contains(s, "missing.bin") {
+		t.Errorf("Error без имени артефакта:\n%s", s)
 	}
 }

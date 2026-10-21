@@ -47,10 +47,21 @@ func Generate(password string, iterations int) (string, error) {
 		iterations = DefaultIterations
 	}
 	salt := make([]byte, MinSaltLen)
+	// Ветка недостижима (T-M11): crypto/rand.Read в Go ≥ 1.24 не
+	// возвращает ошибок — «never returns an error, and always fills b
+	// entirely» (документация stdlib); отказ источника энтропии —
+	// фатальный краш процесса, а не ошибка Generate.
+	// mutator-disable-next-line branch/if
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("соль: %w", err)
 	}
 	key, err := pbkdf2.Key(sha256.New, password, salt, iterations, KeyLen)
+	// Ветка недостижима (T-M11): pbkdf2.Key ошибается только при
+	// keyLength вне [1, (2^32-1)×h.Size()] либо в FIPS-only-сборке
+	// (GOEXPERIMENT=fips140 — проектом не используется, и даже в ней
+	// соль 16 байт и ключ 32 байта проходят ограничения), а keyLength
+	// здесь — константа KeyLen=32; итерации к этому моменту уже ≥ 1.
+	// mutator-disable-next-line branch/if
 	if err != nil {
 		return "", fmt.Errorf("pbkdf2: %w", err)
 	}
@@ -115,6 +126,14 @@ func (h PasswordHash) Derive(password string) ([]byte, error) {
 // недостижима) — не совпадение.
 func (h PasswordHash) Verify(password string) bool {
 	key, err := h.Derive(password)
+	// Ветка недостижима (T-M11): Derive = pbkdf2.Key с keyLength =
+	// константе KeyLen=32 — условия ошибок stdlib (keyLength ≤ 0 или
+	// слишком длинный) невозможны при любом значении h в обычной
+	// сборке; единственное исключение — FIPS-only-сборка
+	// (GOEXPERIMENT=fips140, проектом не используется) с вручную
+	// сконструированной солью < 16 байт — продовый путь через Parse
+	// исключён (Parse требует соль ≥ MinSaltLen).
+	// mutator-disable-next-line branch/if
 	if err != nil {
 		return false
 	}

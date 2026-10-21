@@ -120,12 +120,12 @@ func TestParseErrors(t *testing.T) {
 		{"без схемы", "1000$" + salt + "$" + key, "pbkdf2-sha256"},
 		{"мало компонент", Scheme + "$1000$" + salt, "pbkdf2-sha256"},
 		{"много компонент", valid + "$лишняя", "pbkdf2-sha256"},
-		{"итерации не число", strings.Replace(valid, "$1000$", "$много$", 1), "итерации"},
+		{"итерации не число", strings.Replace(valid, "$1000$", "$много$", 1), `получено "много"`},
 		{"итерации ноль", strings.Replace(valid, "$1000$", "$0$", 1), "итерации"},
 		{"итерации отрицательные", strings.Replace(valid, "$1000$", "$-1$", 1), "итерации"},
-		{"соль не base64", strings.Replace(valid, salt, "не-base64!", 1), "соль"},
+		{"соль не base64", strings.Replace(valid, salt, "не-base64!", 1), "соль: base64"},
 		{"соль короче 16 байт", strings.Replace(valid, salt, b64([]byte("short-salt")), 1), "соль"},
-		{"ключ не base64", strings.Replace(valid, key, "??", 1), "ключ"},
+		{"ключ не base64", strings.Replace(valid, key, "??", 1), "ключ: base64"},
 		{"ключ 31 байт", strings.Replace(valid, key, b64(bytes.Repeat([]byte{1}, 31)), 1), "ключ"},
 		{"ключ 33 байта", strings.Replace(valid, key, b64(bytes.Repeat([]byte{1}, 33)), 1), "ключ"},
 	}
@@ -188,4 +188,86 @@ func mustParse(t *testing.T, s string) PasswordHash {
 		t.Fatalf("Parse(%q): %v", s, err)
 	}
 	return ph
+}
+
+// --- границы параметров (ТЗД §7.2: соль ≥ 16, итерации ≥ 1) ------------------
+
+// TestGenerateSaltLen — соль генерации ровно 16 байт, литералом: символ
+// MinSaltLen следовал бы за мутантом константы и не фиксировал бы длину.
+func TestGenerateSaltLen(t *testing.T) {
+	hash, err := Generate("пароль", fastIterations)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	salt, err := base64.StdEncoding.DecodeString(strings.Split(hash, "$")[2])
+	if err != nil {
+		t.Fatalf("соль %q: %v", strings.Split(hash, "$")[2], err)
+	}
+	if len(salt) != 16 {
+		t.Errorf("соль генерации = %d байт, хочу ровно 16 (ТЗД §7.2)", len(salt))
+	}
+}
+
+// TestParseSaltBounds — граница минимума соли при разборе: ровно 16 байт —
+// валидна, 15 — отказ с порогом в тексте. Литералы 16/15 держат мутанты
+// MinSaltLen±1 (символ константы в тесте следовал бы за мутантом).
+func TestParseSaltBounds(t *testing.T) {
+	key := b64(bytes.Repeat([]byte{0xAB}, 32))
+	exact := Scheme + "$1000$" + b64(bytes.Repeat([]byte{0xC1}, 16)) + "$" + key
+	if _, err := Parse(exact); err != nil {
+		t.Errorf("соль ровно 16 байт: Parse: %v — минимум достижим (ТЗД §7.2 «≥ 16»)", err)
+	}
+	short := Scheme + "$1000$" + b64(bytes.Repeat([]byte{0xC1}, 15)) + "$" + key
+	if _, err := Parse(short); err == nil || !strings.Contains(err.Error(), "минимум 16 байт, получено 15") {
+		t.Errorf("соль 15 байт: err = %v, хочу «минимум 16 байт, получено 15»", err)
+	}
+}
+
+// TestGenerateOneIteration — итерации 1: уже положительное целое, дефолт
+// не включается (граница «<= 0» против «<= 1»); сверка с одной итерацией
+// работает.
+func TestGenerateOneIteration(t *testing.T) {
+	hash, err := Generate("пароль", 1)
+	if err != nil {
+		t.Fatalf("Generate(пароль, 1): %v", err)
+	}
+	ph := mustParse(t, hash)
+	if ph.Iterations != 1 {
+		t.Errorf("итерации = %d, хочу 1 — положительное значение не заменяется дефолтом", ph.Iterations)
+	}
+	if !ph.Verify("пароль") {
+		t.Error("Verify(свой пароль) = false при 1 итерации, хочу true")
+	}
+}
+
+// TestParseIterationBounds — границы итераций при разборе: ровно 1 —
+// валидно (мутанты «< 1» → «<= 1»/«< 2»); переполнение Atoi — отказ
+// (вырезание «err != nil» пропускало бы зажатый к MaxInt64 интервал);
+// текст ошибки называет компоненту итераций (мутанты parts[1] → parts[0]
+// и parts[2]).
+func TestParseIterationBounds(t *testing.T) {
+	salt := b64(bytes.Repeat([]byte{0xC1}, 16))
+	key := b64(bytes.Repeat([]byte{0xAB}, 32))
+
+	if _, err := Parse(Scheme + "$1$" + salt + "$" + key); err != nil {
+		t.Errorf("итерации ровно 1: Parse: %v — положительное целое валидно", err)
+	}
+	if big, err := Parse(Scheme + "$99999999999999999999$" + salt + "$" + key); err == nil {
+		t.Fatalf("переполнение итераций: Parse = %+v, хочу ошибку", big)
+	} else if !strings.Contains(err.Error(), "итерации") {
+		t.Errorf("переполнение: ошибка %q не указывает на итерации", err)
+	}
+	if _, err := Parse(Scheme + "$двадцать$" + salt + "$" + key); err == nil ||
+		!strings.Contains(err.Error(), `получено "двадцать"`) {
+		t.Errorf("итерации не число: err = %v, хочу текст с получено \"двадцать\"", err)
+	}
+}
+
+// TestVerifyZeroHash — нулевой PasswordHash (сконструирован вне Parse)
+// никогда не сверяется: вырожденная деривация не совпадает с пустым
+// ключом (subtle сравнивает длины — 32 против 0).
+func TestVerifyZeroHash(t *testing.T) {
+	if (PasswordHash{}).Verify("пароль") {
+		t.Error("Verify на нулевом хэше = true, хочу false")
+	}
 }

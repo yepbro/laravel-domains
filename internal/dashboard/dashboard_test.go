@@ -12,8 +12,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,6 +50,26 @@ func (c *fakeClock) Now() time.Time { return c.now }
 type fakePinger struct{ err error }
 
 func (p fakePinger) Ping(context.Context) error { return p.err }
+
+// syncBuf — bytes.Buffer под замком: slog пишет из горутины жизненного
+// цикла Run, а тест читает лог — без синхронизации это гонка. По образцу
+// scheduler/backlog_test.go (T-M06).
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // newTestServer — сервер с типовыми кредами; мутаторы настраивают
 // Options (часы, логгер).
@@ -105,40 +127,44 @@ func sessionCookie(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
 // --- стартовая проверка кредов (§7.7) -----------------------------------------
 
 // TestNewCredentials — пустые username/password_hash и неразборимый
-// хэш отказывают сборке сервера (вызов cmd/dashboard до service.Run
-// использует ту же ParseCredentials — запуск падает до слушателей).
+// хэш отказывают сборке сервера с точным диагнозом (вызов cmd/dashboard
+// до service.Run использует ту же ParseCredentials — запуск падает до
+// слушателей; тексты — контракт оператора).
 func TestNewCredentials(t *testing.T) {
 	valid := fastHash(t, testPassword)
 	for _, tc := range []struct {
-		name string
-		user string
-		hash string
+		name    string
+		user    string
+		hash    string
+		wantErr string
 	}{
-		{"пустое имя", "", valid},
-		{"пустой хэш", testUser, ""},
-		{"обе пустые", "", ""},
-		{"имя с двоеточием", "op:erator", valid}, // Basic режет по первому «:» — вход был бы невозможен
-		{"мусор вместо хэша", testUser, " plaintext "},
-		{"хэш без схемы", testUser, "sha256$1000$c2FsdA==$a2V5"},
-		{"хэш короткой солью", testUser, "pbkdf2-sha256$1000$c2FsdA==$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="},
-		{"хэш коротким ключом", testUser, "pbkdf2-sha256$1000$MDEyMzQ1Njc4OWFiY2RlZg==$a2V5"},
-		{"хэш нулевыми итерациями", testUser, "pbkdf2-sha256$0$MDEyMzQ1Njc4OWFiY2RlZg==$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="},
+		{"пустое имя", "", valid, "username пуст"},
+		{"пустой хэш", testUser, "", "password_hash пуст"},
+		{"обе пустые", "", "", "username пуст"},                        // первая проверка — имя
+		{"имя с двоеточием", "op:erator", valid, "не может содержать"}, // Basic режет по первому «:» — вход был бы невозможен
+		{"мусор вместо хэша", testUser, " plaintext ", "password_hash: "},
+		{"хэш без схемы", testUser, "sha256$1000$c2FsdA==$a2V5", "password_hash: "},
+		{"хэш короткой солью", testUser, "pbkdf2-sha256$1000$c2FsdA==$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "password_hash: "},
+		{"хэш коротким ключом", testUser, "pbkdf2-sha256$1000$MDEyMzQ1Njc4OWFiY2RlZg==$a2V5", "password_hash: "},
+		{"хэш нулевыми итерациями", testUser, "pbkdf2-sha256$0$MDEyMzQ1Njc4OWFiY2RlZg==$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "password_hash: "},
 	} {
 		cfg := config.Default()
 		cfg.Dashboard.Username, cfg.Dashboard.PasswordHash = tc.user, tc.hash
-		if _, err := New(fakePinger{}, cfg, Options{}); err == nil {
-			t.Errorf("%s: New = nil error, хочу ошибку", tc.name)
+		if _, err := New(fakePinger{}, cfg, Options{}); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("%s: New = %v, хочу ошибку с %q", tc.name, err, tc.wantErr)
 		}
 	}
-	if _, err := New(nil, config.Default(), Options{}); err == nil {
-		t.Error("New(nil db) = nil error, хочу ошибку")
-	}
-	if _, err := New(fakePinger{}, nil, Options{}); err == nil {
-		t.Error("New(nil cfg) = nil error, хочу ошибку")
-	}
-	// Валидные креды собираются.
+	// Без пула БД сервер бессмыслен (креды валидны — проверка доходит
+	// именно до пула, а не до разбора кредов).
 	cfg := config.Default()
 	cfg.Dashboard.Username, cfg.Dashboard.PasswordHash = testUser, valid
+	if _, err := New(nil, cfg, Options{}); err == nil || !strings.Contains(err.Error(), "пул БД не задан") {
+		t.Errorf("New(nil db, валидные креды) = %v, хочу «пул БД не задан»", err)
+	}
+	if _, err := New(fakePinger{}, nil, Options{}); err == nil || !strings.Contains(err.Error(), "конфигурация не задана") {
+		t.Errorf("New(nil cfg) = %v, хочу «конфигурация не задана»", err)
+	}
+	// Валидные креды собираются.
 	if _, err := New(fakePinger{}, cfg, Options{}); err != nil {
 		t.Errorf("New(валидные креды): %v", err)
 	}
@@ -503,7 +529,8 @@ func TestSecurityHeaders(t *testing.T) {
 // --- служебные роуты без авторизации (§6.1) --------------------------------------
 
 // TestServiceRoutes — healthz (ping/отказ), livez, robots.txt без
-// Authorization.
+// Authorization: точные Content-Type текстовых проб и тело livez —
+// контракт проб каркаса (k8s/мониторинг читают их буквально).
 func TestServiceRoutes(t *testing.T) {
 	h := newTestServer(t, nil).Handler()
 
@@ -511,10 +538,16 @@ func TestServiceRoutes(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ok") {
 		t.Errorf("healthz = %d %q, хочу 200 ok", rec.Code, rec.Body.String())
 	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("healthz: Content-Type = %q, хочу text/plain; charset=utf-8", ct)
+	}
 
 	rec = doReq(h, http.MethodGet, "/livez", "10.0.0.12:1212", nil)
-	if rec.Code != http.StatusOK {
-		t.Errorf("livez = %d, хочу 200", rec.Code)
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Errorf("livez = %d %q, хочу 200 с телом ok", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("livez: Content-Type = %q, хочу text/plain; charset=utf-8", ct)
 	}
 
 	rec = doReq(h, http.MethodGet, "/robots.txt", "10.0.0.12:1212", nil)
@@ -523,6 +556,9 @@ func TestServiceRoutes(t *testing.T) {
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "User-agent: *") || !strings.Contains(body, "Disallow: /") {
 		t.Errorf("robots.txt без полного disallow:\n%s", body)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("robots.txt: Content-Type = %q, хочу text/plain; charset=utf-8", ct)
 	}
 
 	// healthz при недоступной БД — 503.
@@ -568,9 +604,13 @@ func TestClientIP(t *testing.T) {
 // --- жизненный цикл ---------------------------------------------------------------
 
 // TestRunGracefulStop — Run слушает dashboard.listen, отменённый ctx
-// останавливает сервер чистым nil в окне остановки.
+// останавливает сервер чистым nil в окне остановки; старт фиксируется
+// в логе со слушателем (наблюдаемость запуска оператором), а горутина
+// Serve завершается после возврата Run — буфер канала done (ёмкость 1)
+// даёт отправке доработать, счётчик горутин возвращается к базе.
 func TestRunGracefulStop(t *testing.T) {
-	srv := newTestServer(t, nil)
+	var logs syncBuf
+	srv := newTestServer(t, func(o *Options) { o.Log = slog.New(slog.NewTextHandler(&logs, nil)) })
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -581,11 +621,15 @@ func TestRunGracefulStop(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	base := runtime.NumGoroutine() // до Run: всё, что он поднимет, должно уйти
 	go func() { done <- srv.Run(ctx, addr) }()
 
+	// Проба готовности — клиент с коротким таймаутом: зависший Get не
+	// должен блокировать дедлайн ожидания между итерациями.
+	probe := &http.Client{Timeout: 200 * time.Millisecond}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		resp, err := http.Get("http://" + addr + "/livez")
+		resp, err := probe.Get("http://" + addr + "/livez")
 		if err == nil {
 			_ = resp.Body.Close()
 			break
@@ -596,6 +640,7 @@ func TestRunGracefulStop(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	probe.CloseIdleConnections()
 
 	cancel()
 	select {
@@ -605,5 +650,30 @@ func TestRunGracefulStop(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("сервер не остановился после отмены ctx")
+	}
+	if s := logs.String(); !strings.Contains(s, "публичный сервис дашборда запущен") || !strings.Contains(s, addr) {
+		t.Errorf("лог запуска без слушателя %s:\n%s", addr, s)
+	}
+	gDeadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > base {
+		if time.Now().After(gDeadline) {
+			t.Errorf("горутины Run не завершились после остановки: база %d, сейчас %d (ёмкость done=0 оставила бы Serve висеть)", base, runtime.NumGoroutine())
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestRunListenError — невалидный адрес (порт вне 0–65535): Run отказывает
+// до старта сервера, ошибка называет слушателя — оператор видит адрес
+// конфигурации, а не голый отказ net.Listen.
+func TestRunListenError(t *testing.T) {
+	srv := newTestServer(t, nil)
+	err := srv.Run(context.Background(), "127.0.0.1:99999")
+	if err == nil {
+		t.Fatal("Run(порт 99999) = nil, хочу ошибку слушателя")
+	}
+	if !strings.Contains(err.Error(), "слушатель") || !strings.Contains(err.Error(), "127.0.0.1:99999") {
+		t.Errorf("ошибка без адреса слушателя: %v", err)
 	}
 }

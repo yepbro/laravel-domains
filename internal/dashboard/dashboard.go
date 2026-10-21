@@ -174,17 +174,44 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 	}
 	srv := &http.Server{
 		Handler: s.Handler(),
-		// Таймауты сервера (ТЗД §6.3).
+		// Таймауты сервера (ТЗД §6.3): значения 5/10/15/60 с закреплены
+		// ТЗД и наблюдаются только поведением соединения во времени
+		// (медленный клиент обрезается через N секунд) — различение
+		// 4/5/6 с, а тем более отключения таймаута (5/time.Second = 0)
+		// требует реальных пауз в секунды, несовместимых с герметичными
+		// тестами (T-M11).
+		// mutator-disable-next-line arithmetic/base, numbers/decrementer, numbers/incrementer
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// mutator-disable-next-line arithmetic/base, numbers/decrementer, numbers/incrementer
+		ReadTimeout: 10 * time.Second,
+		// mutator-disable-next-line arithmetic/base, numbers/decrementer, numbers/incrementer
+		WriteTimeout: 15 * time.Second,
+		// mutator-disable-next-line arithmetic/base, numbers/decrementer, numbers/incrementer
+		IdleTimeout: 60 * time.Second,
 	}
+	// Ёмкость 2 эквивалентна 1 (T-M11): горутина Serve делает ровно одну
+	// отправку, получатель — единственный select в Run; при ёмкости ≥ 1
+	// отправка никогда не блокируется, дальше канала никто не читает.
+	// Ёмкость 0 не эквивалентна (отправитель висел бы после возврата
+	// Run — утечка) и закрыта тестом: TestRunGracefulStop ждёт возврата
+	// счётчика горутин к базе.
+	// mutator-disable-next-line numbers/incrementer
 	done := make(chan error, 1)
 	go func() {
 		err := srv.Serve(ln)
 		// Serve закрывает слушатель сам; ErrServerClosed — штатный выход
 		// после Shutdown, не ошибка.
+		//
+		// Гасим (T-M11): «err != nil» → «true» эквивалентен — Serve
+		// всегда возвращает не-nil ошибку (контракт net/http). Ветка
+		// ошибки Serve недостижима герметично: вернуть ошибку может
+		// только нетемпоральный сбой Accept (слушатель закрыт мимо
+		// Shutdown; временные сбои вроде EMFILE Serve ретраит сам),
+		// а слушатель создан и закрыт внутри Run и тесту не доступен;
+		// ErrServerClosed бывает только после Shutdown, который Run
+		// вызывает уже после выбора ctx.Done — отправка ошибки в done
+		// после возврата Run ненаблюдаема.
+		// mutator-disable-next-line expression/remove, branch/if
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			done <- fmt.Errorf("dashboard: сервер %s: %w", listen, err)
 			return
@@ -199,8 +226,18 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 	case <-ctx.Done():
 		// Graceful shutdown (ТЗ 3.4): начатые ответы дорабатывают в окне
 		// меньше бюджета остановки каркаса.
+		// Бюджет 8 с наблюдаем только ошибкой Shutdown при ответах,
+		// не завершившихся дольше бюджета, — требует реальной активной
+		// связи и паузы 7–8 с, несовместимой с герметичными тестами;
+		// вариант 8/time.Second = 0 (бюджет истёк мгновенно) отличим
+		// только такой же паузой (T-M11).
+		// mutator-disable-next-line arithmetic/base, numbers/decrementer, numbers/incrementer
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
+		// Ошибка Shutdown — только истечение бюджета при висящем
+		// ответе: в CI недостижима (см. комментарий к бюджету выше,
+		// T-M11).
+		// mutator-disable-next-line branch/if
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("dashboard: остановка: %w", err)
 		}
@@ -253,6 +290,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	// Эквивалентный мутант (T-M11): при записи тела без Content-Type
+	// Go сам определяет тип (http.DetectContentType) — для «ok» это тот
+	// же text/plain; charset=utf-8; явный Set лишь фиксирует контракт
+	// пробы заранее.
+	// mutator-disable-next-line statement/remove
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
 }
@@ -261,6 +303,9 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // HTTP-цикл живы; зависимости сознательно не проверяются — семантика
 // пробы каркаса internal/service.
 func (s *Server) handleLivez(w http.ResponseWriter, _ *http.Request) {
+	// Эквивалентный мутант (T-M11): сниффинг «ok» даёт тот же
+	// text/plain; charset=utf-8 (см. handleHealthz).
+	// mutator-disable-next-line statement/remove
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
 }
@@ -268,6 +313,9 @@ func (s *Server) handleLivez(w http.ResponseWriter, _ *http.Request) {
 // handleRobots — GET /robots.txt без авторизации (ТЗД §6.1): дашборд —
 // внутренний сервис, полный disallow.
 func (s *Server) handleRobots(w http.ResponseWriter, _ *http.Request) {
+	// Эквивалентный мутант (T-M11): сниффинг тела robots даёт тот же
+	// text/plain; charset=utf-8 (см. handleHealthz).
+	// mutator-disable-next-line statement/remove
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = io.WriteString(w, "User-agent: *\nDisallow: /\n")
 }
