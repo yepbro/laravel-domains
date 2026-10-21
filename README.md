@@ -25,6 +25,10 @@ make test-integration  # проверка окружения на testbed
 http://127.0.0.1:8090 (порт `DASHBOARD_PORT`; вход admin/admin — dev-креды,
 см. [`docs/dev-environment.md`](docs/dev-environment.md)).
 
+Живая проверка одного домена с хоста (DNS → HTTP/рендер → анализ Laravel,
+read-only): `make check DOMAIN=example.com` — для testbed-доменов добавьте
+`RESOLVER=172.28.100.10:53` (см. [`docs/dev-environment.md`](docs/dev-environment.md) §6).
+
 ## Документация
 
 Карта документации (та же таблица с пояснениями «когда читать» — в

@@ -336,6 +336,10 @@ docker compose run --rm -v "$(pwd)/var/content:/out tools \
 словарей) — [`runbooks.md`](runbooks.md) §1.
 
 Через make: `make status`, `make domain NAME=example.crawl.test`,
+`make check DOMAIN=example.com` (живая проверка реального домена с хоста:
+DNS-запросы идут через встроенный резолвер Docker → резолверы хоста, правила —
+из `/rules`; для testbed-доменов `make check DOMAIN=x.crawl.test
+RESOLVER=172.28.100.10:53` — unbound testbed наружу не форвардит),
 `make reanalyze`, `make seed`, `make test-rules`. Остальные команды —
 `docker compose run --rm tools go run ./cmd/crawlerctl <команда>`
 (см. `make shell`).
