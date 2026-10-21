@@ -391,6 +391,12 @@ services:
       SERVICE: web
       METRICS_PORT: "9107"
       METRICS_ADDR: ":9107"
+      # Форма лендинга (T-123): живая проверка реальных доменов в dev.
+      # Testbed-unbound герметичен — на всё вне тестовых зон отвечает
+      # SERVFAIL, чекер эскалирует на публичные dns.fallback_resolvers
+      # (internal/checker/resolve.go). Массовый конвейер (dns-worker)
+      # этого env не получает — герметичность краула не меняется.
+      CRAWLER_DNS_FALLBACK_RESOLVERS: "1.1.1.1:53,9.9.9.9:53"
     ports:
       - "127.0.0.1:${WEB_PORT:-8081}:8080"
     mem_limit: 256m

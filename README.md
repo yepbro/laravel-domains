@@ -26,8 +26,13 @@ http://127.0.0.1:8090 (порт `DASHBOARD_PORT`; вход admin/admin — dev-�
 см. [`docs/dev-environment.md`](docs/dev-environment.md)).
 
 Живая проверка одного домена с хоста (DNS → HTTP/рендер → анализ Laravel,
-read-only): `make check DOMAIN=example.com` — для testbed-доменов добавьте
-`RESOLVER=172.28.100.10:53` (см. [`docs/dev-environment.md`](docs/dev-environment.md) §6).
+read-only): `make check DOMAIN=example.com` — работает и для реальных
+доменов, и для testbed (`*.crawl.test`): первичный резолвер — unbound
+testbed, при SERVFAIL/REFUSED чекер эскалирует на публичные fallback-резолверы
+(`internal/checker/resolve.go`). Форма лендинга
+(`POST /api/check-domain`) проверяет реальные домены так же — сервис web
+в dev получает публичные `CRAWLER_DNS_FALLBACK_RESOLVERS` (см.
+[`docs/dev-environment.md`](docs/dev-environment.md) §6).
 
 ## Документация
 

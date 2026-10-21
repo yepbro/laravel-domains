@@ -15,10 +15,12 @@ NAME ?=
 DOMAIN ?=
 N ?= 1000000
 FORCE ?= 0
-# Резолвер для make check: по умолчанию встроенный DNS Docker (форвардит на
-# резолверы хоста — реальные домены); для testbed-доменов (*.crawl.test) —
-# RESOLVER=172.28.100.10:53 (unbound testbed).
-RESOLVER ?= 127.0.0.11:53
+# Резолверы для make check: первичный — unbound testbed (тестовые зоны),
+# резервы — публичные: чекер эскалирует на них при SERVFAIL/REFUSED
+# (internal/checker/resolve.go), поэтому одна команда проверяет и
+# testbed-домены (*.crawl.test), и реальные.
+RESOLVER ?= 172.28.100.10:53
+FALLBACK ?= 1.1.1.1:53,9.9.9.9:53
 
 # Перенные из .env, нужные самому Makefile
 GO_VERSION     ?= $(shell sed -n 's/^GO_VERSION=\(.*\)/\1/p' .env 2>/dev/null)
@@ -334,9 +336,10 @@ domain: ## Информация о домене: make domain NAME=laravel-11-vit
 .PHONY: check
 check: ## Живая проверка домена: make check DOMAIN=example.com
 	$(check_env)
-	@test -n "$(DOMAIN)" || { echo 'Использование: make check DOMAIN=example.com [RESOLVER=172.28.100.10:53]'; exit 1; }
+	@test -n "$(DOMAIN)" || { echo 'Использование: make check DOMAIN=example.com'; exit 1; }
 	$(COMPOSE) run --rm \
 		-e CRAWLER_DNS_RESOLVERS=$(RESOLVER) \
+		-e CRAWLER_DNS_FALLBACK_RESOLVERS=$(FALLBACK) \
 		-e CRAWLER_ANALYZER_RULES_DIR=/rules \
 		tools go run ./cmd/crawlerctl check "$(DOMAIN)"
 

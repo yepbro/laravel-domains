@@ -336,13 +336,22 @@ docker compose run --rm -v "$(pwd)/var/content:/out tools \
 словарей) — [`runbooks.md`](runbooks.md) §1.
 
 Через make: `make status`, `make domain NAME=example.crawl.test`,
-`make check DOMAIN=example.com` (живая проверка реального домена с хоста:
-DNS-запросы идут через встроенный резолвер Docker → резолверы хоста, правила —
-из `/rules`; для testbed-доменов `make check DOMAIN=x.crawl.test
-RESOLVER=172.28.100.10:53` — unbound testbed наружу не форвардит),
+`make check DOMAIN=example.com` (живая проверка любого домена с хоста:
+первичный резолвер — unbound testbed, при SERVFAIL/REFUSED (всё вне
+тестовых зон — так отвечает герметичный unbound) чекер эскалирует на
+публичные резервы `FALLBACK ?= 1.1.1.1:53,9.9.9.9:53`; поэтому одна
+команда проверяет и `*.crawl.test`, и реальные домены — переключение
+`RESOLVER` не нужно),
 `make reanalyze`, `make seed`, `make test-rules`. Остальные команды —
 `docker compose run --rm tools go run ./cmd/crawlerctl <команда>`
 (см. `make shell`).
+
+Форма лендинга (`POST /api/check-domain`, T-123) использует тот же
+конвейер и в dev проверяет реальные домены: сервису web compose
+прописывает публичные `CRAWLER_DNS_FALLBACK_RESOLVERS`, чекер
+эскалирует на них при отказе unbound (семантика — «единичный ручной
+вопрос», не массовый конвейер: dns-worker fallback-ов не получает,
+герметичность краула не меняется).
 
 `reanalyze` (T-074, ТЗ 5.8): находит `subdomain_results` с устаревшим
 `rules_version` (NULL — никогда не анализированные) и пачками ставит их

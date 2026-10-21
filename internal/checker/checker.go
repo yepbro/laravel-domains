@@ -98,14 +98,16 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 		return nil, fmt.Errorf("checker: %w", err)
 	}
 
-	// DNS-этап как библиотека: локальный клиент T-034 под лимитами T-035
-	// (цепь резервов для одного имени избыточна).
-	client, err := dnsclient.NewClient(ctx, dnsclient.NewOptions(cfg.DNS))
+	// DNS-этап как библиотека: цепь ручной проверки (resolve.go) под
+	// лимитами T-035 — лимит параллелизма и токен QPS берутся один раз
+	// на весь проход цепи (как LimitResolver(FallbackResolver(…)) у
+	// dns-worker).
+	chain, closeChain, err := newResolverChain(ctx, cfg.DNS)
 	if err != nil {
 		return nil, fmt.Errorf("checker: %w", err)
 	}
-	defer func() { _ = client.Close() }()
-	resolve, err := dnsclient.NewLimitResolver(client, dnsclient.NewLimitOptions(cfg.DNS))
+	defer func() { _ = closeChain() }()
+	resolve, err := dnsclient.NewLimitResolver(chain, dnsclient.NewLimitOptions(cfg.DNS))
 	if err != nil {
 		return nil, fmt.Errorf("checker: %w", err)
 	}
