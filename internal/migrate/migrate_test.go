@@ -186,12 +186,15 @@ func TestOpenAndWait_ClosesDBOnError(t *testing.T) {
 }
 
 // failConnector — коннектор, чей Connect всегда падает; Close помечает
-// закрытие пула вызывающим кодом.
+// закрытие пула вызывающим кодом, connects считает попытки соединения
+// (каждая попытка cancelApplying обращается к БД минимум раз).
 type failConnector struct {
-	closed atomic.Bool
+	closed   atomic.Bool
+	connects atomic.Int64
 }
 
 func (c *failConnector) Connect(context.Context) (driver.Conn, error) {
+	c.connects.Add(1)
 	return nil, errors.New("нет соединения")
 }
 
@@ -331,6 +334,74 @@ func TestInterruptedInRun(t *testing.T) {
 	}
 }
 
+// TestCancelApplying_RetriesUntilBudget — отмена применения не сдаётся
+// после первой неудачной попытки: одиночный запрос pg_cancel_backend
+// может попасть в зазор между пометкой dirty и началом файла миграции
+// (соединение раннера ещё idle — фильтру state='active' не соответствует)
+// или не выполниться. Фейковый драйвер считает попытки: после исчерпания
+// бюджета cancelApplying возвращает false, попыток больше одной.
+func TestCancelApplying_RetriesUntilBudget(t *testing.T) {
+	restore := withCancelTimeout(300 * time.Millisecond)
+	defer restore()
+	registerFailDriver()
+
+	prevDriver := sqlDriver
+	sqlDriver = "failmigrate"
+	defer func() { sqlDriver = prevDriver }()
+
+	db, err := sql.Open(sqlDriver, "not-a-real-dsn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	done := make(chan struct{}) // не закрывается: бюджет — единственный выход
+	before := failConnectorOf.connects.Load()
+	start := time.Now()
+	if cancelApplying(db, "crawler-migrations-test", done) {
+		t.Fatal("cancelApplying без БД не может отменить запрос")
+	}
+	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+		t.Errorf("cancelApplying завершился за %s — раньше бюджета отмены", elapsed)
+	}
+	if attempts := failConnectorOf.connects.Load() - before; attempts < 2 {
+		t.Errorf("cancelApplying сдался после первой попытки (попыток соединения: %d), а должен повторять", attempts)
+	}
+}
+
+// TestCancelApplying_StopsWhenUpDone — отмена прекращается, как только
+// завершилось само применение (upDone закрыт): дальше отменять нечего,
+// даже если бюджет не исчерпан и попытки не удаются.
+func TestCancelApplying_StopsWhenUpDone(t *testing.T) {
+	restore := withCancelTimeout(10 * time.Second) // бюджет большой: выход только по done
+	defer restore()
+	registerFailDriver()
+
+	prevDriver := sqlDriver
+	sqlDriver = "failmigrate"
+	defer func() { sqlDriver = prevDriver }()
+
+	db, err := sql.Open(sqlDriver, "not-a-real-dsn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	done := make(chan struct{})
+	close(done)
+	before := failConnectorOf.connects.Load()
+	start := time.Now()
+	if cancelApplying(db, "crawler-migrations-test", done) {
+		t.Fatal("cancelApplying без БД не может отменить запрос")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("cancelApplying вышел по done за %s — заметно дольше одной попытки", elapsed)
+	}
+	if attempts := failConnectorOf.connects.Load() - before; attempts != 0 {
+		t.Errorf("cancelApplying сделал %d попыток после завершения применения — должен выйти сразу", attempts)
+	}
+}
+
 func parseVersion(t *testing.T, s string) uint {
 	t.Helper()
 	var v uint
@@ -349,4 +420,12 @@ func withConnectTimeout(d time.Duration) func() {
 	old := connectTimeout
 	connectTimeout = d
 	return func() { connectTimeout = old }
+}
+
+// withCancelTimeout подменяет бюджет отмены применения для теста
+// и возвращает функцию восстановления.
+func withCancelTimeout(d time.Duration) func() {
+	old := cancelTimeout
+	cancelTimeout = d
+	return func() { cancelTimeout = old }
 }

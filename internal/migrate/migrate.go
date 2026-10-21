@@ -16,9 +16,11 @@
 //   - сигнал завершения (отмена контекста) прерывает и применение:
 //     golang-migrate Up не принимает контекст, поэтому раннер сам снимает
 //     выполняющийся SQL запросом pg_cancel_backend (соединения раннера
-//     помечены уникальным application_name), недоведённый файл миграции
-//     откатывается PostgreSQL целиком, а версия схемы возвращается к
-//     последней применённой — повторный старт применяет её заново (T-112);
+//     помечены уникальным application_name; попытки повторяются, чтобы
+//     не промахнуться по зазору между пометкой dirty и началом файла),
+//     недоведённый файл миграции откатывается PostgreSQL целиком, а
+//     версия схемы возвращается к последней применённой — повторный
+//     старт применяет её заново (T-112);
 //   - dirty-состояние (прерванная миграция) — ошибка с понятным текстом;
 //     восстановление: make psql → TRUNCATE schema_migrations (см. docs).
 package migrate
@@ -59,15 +61,23 @@ var (
 	// connectTimeout — ожидание доступности PostgreSQL при старте
 	// (за пределами compose сервис может подняться раньше БД).
 	connectTimeout = 30 * time.Second
-	// cancelTimeout — бюджет на снятие применяющейся миграции по сигналу:
-	// pg_cancel_backend по собственным соединениям раннера через
-	// pg_stat_activity. Не уложились — отмена не состоялась, миграция
-	// дорабатывает до конца (поведение C-04).
+	// cancelTimeout — общий бюджет на снятие применяющейся миграции по
+	// сигналу: pg_cancel_backend по собственным соединениям раннера через
+	// pg_stat_activity, повторными попытками (одиночный запрос может
+	// попасть в зазор, когда файл миграции ещё не начал выполняться).
+	// Не уложились — отмена не состоялась, миграция дорабатывает до
+	// конца (поведение C-04).
 	cancelTimeout = 5 * time.Second
 )
 
 // connectRetryInterval — пауза между попытками подключиться.
 const connectRetryInterval = time.Second
+
+// cancelRetryInterval — пауза между попытками снять применяющуюся
+// миграцию (см. cancelApplying): закрывает зазор, в котором предыдущий
+// шаг раннера (пометка dirty-версии) уже завершился, а файл миграции
+// ещё не начал выполняться — соединение в этот момент idle.
+const cancelRetryInterval = 50 * time.Millisecond
 
 // sqlDriver — имя database/sql-драйвера для подключений раннера
 // (переменная для подмены в тестах путей ошибки).
@@ -172,7 +182,10 @@ func Up(ctx context.Context, dsn string) error {
 	// инициализация драйвера и m.Up — нет (golang-migrate не принимает
 	// контекст). Наблюдатель по отмене ctx снимает выполняющийся SQL
 	// запросом pg_cancel_backend — это прерывает и ожидание внутренней
-	// блокировки golang-migrate, и применяющуюся миграцию.
+	// блокировки golang-migrate, и применяющуюся миграцию. Снятие
+	// повторяется до успеха, конца применения или бюджета: одиночный
+	// запрос мог попасть в зазор между пометкой dirty и началом файла,
+	// когда соединение раннера ещё не active (T-112).
 	upDone := make(chan struct{})
 	watchDone := make(chan struct{})
 	var cancelled atomic.Bool
@@ -180,7 +193,7 @@ func Up(ctx context.Context, dsn string) error {
 		defer close(watchDone)
 		select {
 		case <-ctx.Done():
-			cancelled.Store(cancelApplying(db, tag))
+			cancelled.Store(cancelApplying(db, tag, upDone))
 		case <-upDone:
 		}
 	}()
@@ -265,23 +278,52 @@ func interruptedInRun(err error) bool {
 // запрос pg_cancel_backend, и файл миграции откатывается целиком.
 // Фильтр state = 'active' щадит простаивающие соединения раннера
 // (advisory-блокировка), а уникальная метка — применяющую миграцию
-// другого экземпляра и соединения сервисов. Возвращает true, только если
-// хотя бы один запрос реально отменён.
-func cancelApplying(db *sql.DB, tag string) bool {
+// другого экземпляра и соединения сервисов.
+//
+// Одиночный запрос может промахнуться: между пометкой dirty и началом
+// файла миграции (SetVersion и Run у драйвера — разные обращения к
+// одному соединению) оно ещё idle и фильтру не соответствует. Поэтому
+// попытки повторяются, пока не отменён хотя бы один запрос, не
+// завершилось само применение (done) или не исчерпан бюджет
+// cancelTimeout. Возвращает true, только если хотя бы один запрос
+// реально отменён.
+func cancelApplying(db *sql.DB, tag string, done <-chan struct{}) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), cancelTimeout)
 	defer cancel()
-	const query = `
-		SELECT count(*) FILTER (WHERE pg_cancel_backend(pid))
-		FROM pg_stat_activity
-		WHERE application_name = $1
-		  AND state = 'active'
-		  AND pid <> pg_backend_pid()`
-	var n int
-	if err := db.QueryRowContext(ctx, query, tag).Scan(&n); err != nil {
-		slog.Warn("миграции: снять применяющуюся миграцию не удалось — доработает до конца", "err", err)
-		return false
+	ticker := time.NewTicker(cancelRetryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done: // применение уже завершилось — отменять нечего
+			return false
+		default:
+		}
+		const query = `
+			SELECT count(*) FILTER (WHERE pg_cancel_backend(pid))
+			FROM pg_stat_activity
+			WHERE application_name = $1
+			  AND state = 'active'
+			  AND pid <> pg_backend_pid()`
+		var n int
+		if err := db.QueryRowContext(ctx, query, tag).Scan(&n); err != nil {
+			if ctx.Err() == nil {
+				slog.Warn("миграции: попытка снять применяющуюся миграцию не удалась, повторю", "err", err)
+			}
+		} else if n > 0 {
+			return true
+		}
+		// n == 0 — активных запросов нет: миграция ещё не начала
+		// выполняться (зазор после пометки dirty) или уже завершилась;
+		// молча повторяем до отмены, конца применения или бюджета.
+		select {
+		case <-ctx.Done():
+			slog.Warn("миграции: снять применяющуюся миграцию не удалось — доработает до конца", "tag", tag)
+			return false
+		case <-done:
+			return false
+		case <-ticker.C:
+		}
 	}
-	return n > 0
 }
 
 // withRunnerTag добавляет в URL-DSN метку application_name: соединения
