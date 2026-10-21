@@ -392,7 +392,7 @@ func (a *archiveTotals) add(st Stats, res FileResult, prejects map[Reason]int) {
 // ingest.max_error_ratio — архив ошибочен), счётчики суммируются по
 // обработанным членам; строки всех членов идут в одну партию со
 // сквозной нумерацией (уникальность line_no, T-017).
-func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind archiveKind, batch Batch) (archiveResult, error) {
+func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind archiveKind, batch Batch, zoneIDs map[string]int16) (archiveResult, error) {
 	h := sha256.New()
 	budget := &archiveBudget{left: p.opts.ArchiveMaxUncompressed, limit: p.opts.ArchiveMaxUncompressed, arch: f.Path}
 
@@ -488,7 +488,7 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 					if !ok {
 						return nil // отклонение учтено валидатором (rejected-лог)
 					}
-					return emit(Row{Label: e.Label, LineNo: lineOff + int64(l.Num)})
+					return p.emitRow(ctx, zoneIDs, emit, e, lineOff+int64(l.Num))
 				},
 				OnReject: func(rj Reject) error {
 					prejects[rj.Reason]++

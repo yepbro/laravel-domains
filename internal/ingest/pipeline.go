@@ -193,20 +193,27 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	}
 	rep := FileReport{Zone: f.Zone, Action: f.Action, Path: f.Path}
 
-	// Зона находится или создаётся автоматически при первом файле
-	// (ТЗ 5.1; EnsureZone, T-014). Сбой — инфраструктурный: файл
-	// остаётся (at-least-once, ТЗ 3.4).
-	z, err := EnsureZone(ctx, p.zones, f.Zone)
-	if err != nil {
-		return Outcome{Kind: OutcomeLeft, Report: rep, Err: err}
+	// Зона зона-каталога находится или создаётся автоматически при первом
+	// файле (ТЗ 5.1; EnsureZone, T-014) и сразу согревает кэш зон строк.
+	// Зона-less файл (f.Zone == "") зон upfront не знает: зоны создаются
+	// лениво по первым строкам (emitRow), кэш — на файл. Сбой —
+	// инфраструктурный: файл остаётся (at-least-once, ТЗ 3.4).
+	zoneIDs := make(map[string]int16)
+	if f.Zone != "" {
+		z, zerr := EnsureZone(ctx, p.zones, f.Zone)
+		if zerr != nil {
+			return Outcome{Kind: OutcomeLeft, Report: rep, Err: zerr}
+		}
+		rep.ZoneID = z.ID
+		zoneIDs[f.Zone] = z.ID
 	}
-	rep.ZoneID = z.ID
+	zoneID := rep.ZoneID // 0 — зона-less файл (отчёт: zone_id NULL)
 
 	id, err := NewBatchID()
 	if err != nil {
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: err}
 	}
-	batch := Batch{ID: id, ZoneID: z.ID, Action: f.Action}
+	batch := Batch{ID: id, ZoneID: zoneID, Action: f.Action}
 
 	fh, err := os.Open(abs)
 	if err != nil {
@@ -228,10 +235,10 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		arch archiveResult
 	)
 	if kind := archiveKindOf(f.Path); kind == archiveNone {
-		st, vres, _, err = p.streamStage(ctx, io.TeeReader(fh, h), f, batch)
+		st, vres, _, err = p.streamStage(ctx, io.TeeReader(fh, h), f, batch, zoneIDs)
 		rep.SHA256 = h.Sum(nil)
 	} else {
-		arch, err = p.streamArchive(ctx, fh, f, kind, batch)
+		arch, err = p.streamArchive(ctx, fh, f, kind, batch, zoneIDs)
 		st, vres = arch.Stats, arch.Result
 		rep.SHA256 = arch.SHA256
 		rep.Members = arch.Members
@@ -279,7 +286,8 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	}
 
 	// Идемпотентность (ТЗ 5.1; T-113): пропускается только точная
-	// повторная доставка — совпадение (зона, действие, sha256).
+	// повторная доставка — совпадение (зона, действие, sha256); у
+	// зона-less файла «зона» журнала — NULL (зон у файла нет).
 	// Дубль с другим действием (undo тем же списком: add/, затем
 	// delete/) и дубль в другой зоне обрабатываются: безвредность
 	// повторного применения гарантируют операции над доменами (T-097).
@@ -292,7 +300,8 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	var dup, crossZone, crossAction *model.IngestFile
 	for i := range known {
 		k := &known[i]
-		sameZone := k.ZoneID != nil && *k.ZoneID == z.ID
+		sameZone := (zoneID != 0 && k.ZoneID != nil && *k.ZoneID == zoneID) ||
+			(zoneID == 0 && k.ZoneID == nil)
 		sameAction := k.Action != nil && *k.Action == f.Action
 		switch {
 		case sameZone && sameAction:
@@ -333,13 +342,13 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	// ING-P2-5); другое действие — плановый undo (Info).
 	if crossZone != nil {
 		p.log.Warn("дубль по sha256 в другой зоне при том же действии — обрабатывается",
-			"path", f.Path, "action", f.Action.String(), "zone_id", z.ID,
+			"path", f.Path, "action", f.Action.String(), "zone_id", zoneID,
 			"first_path", derefString(crossZone.Path),
 			"first_zone_id", derefInt16(crossZone.ZoneID),
 			"first_processed_at", derefTime(crossZone.ProcessedAt))
 	} else if crossAction != nil {
 		p.log.Info("то же содержимое уже доставлялось другим действием — обрабатывается (undo)",
-			"path", f.Path, "action", f.Action.String(), "zone_id", z.ID,
+			"path", f.Path, "action", f.Action.String(), "zone_id", zoneID,
 			"first_path", derefString(crossAction.Path),
 			"first_action", derefAction(crossAction.Action),
 			"first_processed_at", derefTime(crossAction.ProcessedAt))
@@ -384,11 +393,31 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	}
 
 	p.log.Info("файл обработан",
-		"path", f.Path, "zone", f.Zone, "action", f.Action.String(),
+		"path", f.Path, "zone", f.Zone, "zones", len(zoneIDs),
+		"action", f.Action.String(),
 		"lines", rep.LinesTotal, "added", rep.Added, "revived", rep.Revived,
 		"existed", rep.Existed, "deleted", rep.Deleted, "not_found", rep.NotFound,
 		"rejected", rep.Rejected, "sha256", fmt.Sprintf("%x", rep.SHA256))
 	return Outcome{Kind: OutcomeApplied, Report: rep}
+}
+
+// emitRow — строка файла в строку staging: зона записи (Entry.Zone — зона
+// пути либо, у зона-less файла, выведенная из имени) резолвится в zones.id
+// через кэш файла; отсутствующая зона создаётся автоматически (EnsureZone,
+// ТЗ 5.1) — по первой строке зона-less файла или первой строке новой зоны.
+// Кэш держит одну размороженную EnsureZone-проверку на зону файла:
+// файл зона-каталога — один entry, зона-less — по числу зон файла.
+func (p *Pipeline) emitRow(ctx context.Context, cache map[string]int16, emit func(Row) error, e Entry, lineNo int64) error {
+	id, ok := cache[e.Zone]
+	if !ok {
+		z, err := EnsureZone(ctx, p.zones, e.Zone)
+		if err != nil {
+			return fmt.Errorf("ingest: зона строки %s: %w", e.Zone, err)
+		}
+		id = z.ID
+		cache[e.Zone] = id
+	}
+	return emit(Row{ZoneID: id, Label: e.Label, LineNo: lineNo})
 }
 
 // streamStage — один проход по файлу (повторного чтения нет, ТЗ 3.5):
@@ -401,7 +430,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 //
 // Парсер толкающий (OnLine), Stage — тянущий (RowIter); связка —
 // stageStream (горутина-производитель и буферизованный канал).
-func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch Batch) (Stats, FileResult, int64, error) {
+func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch Batch, zoneIDs map[string]int16) (Stats, FileResult, int64, error) {
 	v, err := NewValidator(ValidatorOptions{
 		File:          f.Path,
 		Zone:          f.Zone,
@@ -431,7 +460,7 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 				if !ok {
 					return nil // отклонение учтено валидатором (rejected-лог)
 				}
-				return emit(Row{Label: e.Label, LineNo: int64(l.Num)})
+				return p.emitRow(ctx, zoneIDs, emit, e, int64(l.Num))
 			},
 			OnReject: func(rj Reject) error {
 				prejects[rj.Reason]++

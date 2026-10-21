@@ -9,6 +9,11 @@
 // строка, причина); единичные плохие строки не делают файл ошибочным — его
 // роняет только доля ошибок выше ingest.max_error_ratio.
 //
+// Зона-less файл (add|delete/<файл>): зона каждой строки выводится
+// из самого имени — publicsuffix-зона нормализованного результата
+// (idn.Result.Zone, ТЗ 5.2 п. 5); сверки с зоной пути нет (её не задано),
+// wrong_zone невозможна, зоны в одном файле смешиваются.
+//
 // T-132 (этап 16, расширение ТЗ 5.1): перед валидацией стоит шаг
 // извлечения (extract.go) — строка с разделителями (пробел, запятая,
 // точка с запятой) или токен-URL разбирается на кандидаты, первый
@@ -81,11 +86,13 @@ func (r Reason) String() string {
 	return string(r)
 }
 
-// Entry — валидная строка файла: домен зоны пути в форме для загрузки
-// в БД (T-017): zone_id ищется по Zone, Label — колонка domains.label,
+// Entry — валидная строка файла: домен в форме для загрузки в БД
+// (T-017): zone_id ищется по Zone, Label — колонка domains.label,
 // IsIDN — бит is_idn в domains.flags (model.FlagIDN).
 type Entry struct {
-	// Zone — зона пути в ASCII-форме (общая для всех строк файла).
+	// Zone — зона строки в ASCII-форме: зона пути (общая для всех строк
+	// зона-каталога) либо — у зона-less файла — зона, выведенная из
+	// самого имени по списку publicsuffix (ТЗ 5.2 п. 5).
 	Zone string
 	// Label — метка домена: имя без зоны; может быть составной
 	// («магазин.рф.co.uk» в зоне co.uk — контракт internal/idn,
@@ -102,6 +109,8 @@ type ValidatorOptions struct {
 	// Zone — зона из пути файла (incoming/<зона>/add|delete, T-014).
 	// Уже нормализована в ASCII (T-014); unicode-форма или верхний
 	// регистр не ошибочны — нормализуется ещё раз (идемпотентно).
+	// Пустая строка — зона-less файл (add|delete/<файл>): зоны строк
+	// выводятся из имён, сверки с зоной пути нет.
 	Zone string
 	// MaxErrorRatio — порог доли отклонённых строк: при превышении файл
 	// целиком считается ошибочным (ingest.max_error_ratio). 0 — дефолт
@@ -128,10 +137,16 @@ type Validator struct {
 // NewValidator подготавливает валидацию файла: зона нормализуется тем же
 // конвейером, что и строки (ТЗ 5.2 п. 6: «зона тоже нормализуется тем же
 // способом»), поэтому каталог зоны в unicode и punycode даёт одну зону.
+// Пустая зона — зона-less файл: сверка зоны не выполняется, зона каждой
+// строки выводится из имени (idn.Result.Zone).
 func NewValidator(opts ValidatorOptions) (*Validator, error) {
-	zone, err := idn.NormalizeZone(opts.Zone)
-	if err != nil {
-		return nil, fmt.Errorf("ingest: зона файла %s: %w", opts.File, err)
+	zone := ""
+	if opts.Zone != "" {
+		var err error
+		zone, err = idn.NormalizeZone(opts.Zone)
+		if err != nil {
+			return nil, fmt.Errorf("ingest: зона файла %s: %w", opts.File, err)
+		}
 	}
 	ratio := opts.MaxErrorRatio
 	if ratio == 0 {
@@ -189,6 +204,8 @@ func (v *Validator) Line(n int, line string) (Entry, Reason, bool) {
 // (idn.Normalize + domainLabel со сверкой зоны пути, ТЗ 5.2 пп. 1–6):
 // общий путь прежней проверки одиночной строки и кандидатов извлечения
 // (T-132). Счётчики и лог rejected — на вызывающей стороне (Line).
+// Зона-less файл (zone == ""): зона и метка берутся из нормализованного
+// имени напрямую (publicsuffix-отделение, ТЗ 5.2 п. 5) — сверять не с чем.
 func checkName(name, zone string) (Entry, Reason, bool) {
 	res, err := idn.Normalize(name)
 	if err != nil {
@@ -197,6 +214,9 @@ func checkName(name, zone string) (Entry, Reason, bool) {
 			reason = Reason(kind)
 		}
 		return Entry{}, reason, false
+	}
+	if zone == "" {
+		return Entry{Zone: res.Zone, Label: res.Label, IsIDN: idn.HasXNLabel(res.Label)}, "", true
 	}
 	label, reason := domainLabel(res, zone)
 	if reason != "" {

@@ -9,7 +9,10 @@
 //     по схеме <зона>/add|delete/<файл> (*.txt или архив поддерживаемого
 //     формата — T-133) — нормализованная зона и действие
 //     файла; имя каталога зоны в unicode или punycode нормализуется в одну
-//     зону — дублей зон в двух формах не возникает (ТЗ 5.1, 11.4 п. 1);
+//     зону — дублей зон в двух формах не возникает (ТЗ 5.1, 11.4 п. 1).
+//     Вторая схема — add|delete/<файл> без каталога зоны: зона-less файл
+//     может смешивать зоны, зона каждой строки выводится из самого имени
+//     (internal/idn по списку publicsuffix, validate.go);
 //   - EnsureZone (zones.go): зона ищется по punycode-имени, отсутствующая
 //     создаётся автоматически при первом файле с is_active = true (ТЗ 5.1).
 //
@@ -34,9 +37,10 @@ import (
 type PathErrorKind string
 
 const (
-	// ErrPathStructure — путь не вида <зона>/add|delete/<файл>: нет каталога
-	// add|delete (или он не в нижнем регистре), лишняя вложенность, абсолютный
-	// путь либо выход за пределы incoming.
+	// ErrPathStructure — путь не вида <зона>/add|delete/<файл> и не вида
+	// add|delete/<файл>: нет каталога add|delete (или он не в нижнем
+	// регистре), лишняя вложенность, абсолютный путь либо выход за
+	// пределы incoming.
 	ErrPathStructure PathErrorKind = "structure"
 	// ErrPathNotTXT — имя файла не *.txt и не архив поддерживаемого
 	// формата (.zip/.tar/.tar.gz/.tgz/.gz — T-133): по ТЗ 5.1 готовность
@@ -50,7 +54,7 @@ const (
 
 // pathKindDescriptions — тексты классов для Error() и String().
 var pathKindDescriptions = map[PathErrorKind]string{
-	ErrPathStructure: "структура пути не <зона>/add|delete/<файл>",
+	ErrPathStructure: "структура пути не <зона>/add|delete/<файл> и не add|delete/<файл>",
 	ErrPathNotTXT:    "имя файла не *.txt и не архив поддерживаемого формата",
 	ErrPathZone:      "невалидное имя каталога зоны",
 }
@@ -92,15 +96,17 @@ func PathKindOf(err error) (PathErrorKind, bool) {
 }
 
 // File — путь входного файла, разобранный по схеме ТЗ 5.1
-// <зона>/add|delete/*.txt.
+// <зона>/add|delete/*.txt или зоне-less add|delete/<файл>.
 type File struct {
 	// Zone — нормализованная зона в ASCII-форме (punycode, ТЗ 5.2 п. 6):
 	// ключ поиска zones.name; unicode- и punycode-имя каталога дают одно
-	// значение (ТЗ 11.4 п. 1).
+	// значение (ТЗ 11.4 п. 1). Пустая строка — зона-less файл
+	// (add|delete/<файл> без каталога зоны): зоны строк выводятся из
+	// самих имён (validate.go), файл может смешивать зоны.
 	Zone string
 	// ZoneUnicode — unicode-форма зоны для отображения (ТЗ 5.2 п. 7):
 	// значение zones.name_unicode при создании зоны; для ASCII-зоны
-	// совпадает с Zone.
+	// совпадает с Zone. У зоны-less файла — пустая.
 	ZoneUnicode string
 	// Action — действие файла: add — добавить или обновить домены,
 	// delete — удалить (ТЗ 5.1; model.Action, колонка ingest_files.action).
@@ -113,12 +119,15 @@ type File struct {
 
 // ParsePath разбирает путь готового файла относительно incoming:
 // <зона>/add|delete/<файл> → нормализованная зона и действие (ТЗ 5.1;
-// файл — *.txt или архив поддерживаемого формата, T-133).
+// файл — *.txt или архив поддерживаемого формата, T-133); либо
+// add|delete/<файл> → зона-less файл (Zone = "": зоны строк выводятся
+// из имён, смешанные зоны в одном файле допустимы).
 //
 // Правила:
 //
-//   - ровно три компонента: каталог зоны, каталог операции, имя файла;
-//     лишняя вложенность и отсутствие add/delete — ErrPathStructure;
+//   - два или ровно три компонента: [каталог зоны,] каталог операции,
+//     имя файла; лишняя вложенность и отсутствие add/delete —
+//     ErrPathStructure;
 //   - имя каталога операции — строго «add» или «delete» в нижнем регистре:
 //     структура каталогов ТЗ 5.1 фиксирована, а регистр файловой системы
 //     Linux точен — иное имя это другая структура, а не вариант записи;
@@ -140,10 +149,15 @@ func ParsePath(rel string) (File, error) {
 	}
 
 	parts := strings.Split(p, "/")
-	if len(parts) != 3 {
+	var zoneDir, opDir, name string
+	switch len(parts) {
+	case 3: // <зона>/add|delete/<файл> — ТЗ 5.1
+		zoneDir, opDir, name = parts[0], parts[1], parts[2]
+	case 2: // add|delete/<файл> — зона-less, зоны строк из имён
+		opDir, name = parts[0], parts[1]
+	default:
 		return File{}, &PathError{Kind: ErrPathStructure, Path: rel}
 	}
-	zoneDir, opDir, name := parts[0], parts[1], parts[2]
 
 	var action model.Action
 	switch opDir {
@@ -161,6 +175,12 @@ func ParsePath(rel string) (File, error) {
 	// всё, что выдаёт наблюдатель, приём разбирает одинаково.
 	if !fileNameAccepted(name) {
 		return File{}, &PathError{Kind: ErrPathNotTXT, Path: rel}
+	}
+
+	// Зона-less файл — без каталога зоны: File.Zone = "", зоны строк
+	// выводятся из имён валидатором (validate.go).
+	if zoneDir == "" {
+		return File{Action: action, Path: p}, nil
 	}
 
 	// Зона тоже нормализуется тем же способом, что и домен (ТЗ 5.2 п. 6):

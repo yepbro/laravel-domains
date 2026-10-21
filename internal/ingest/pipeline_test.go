@@ -46,9 +46,10 @@ type pipeExec struct {
 // известные SQL ApplyAdd/ApplyDelete. Как реальный pgx, отказывается
 // работать с отменённым контекстом.
 type pipePool struct {
-	ops     []string // протокол: "exec:<sql>", "query:<sql>", "copy:<n>"
-	copies  []int64  // размеры пачек COPY по очереди
-	copyErr error
+	ops      []string // протокол: "exec:<sql>", "query:<sql>", "copy:<n>"
+	copies   []int64  // размеры пачек COPY по очереди
+	copyVals [][]any  // строки всех пачек COPY (значения колонок)
+	copyErr  error
 
 	execs []pipeExec // результаты Exec по очереди (конец — нулевой тег)
 	execI int
@@ -66,9 +67,11 @@ func (p *pipePool) CopyFrom(ctx context.Context, _ pgx.Identifier, _ []string, s
 	}
 	var n int64
 	for src.Next() {
-		if _, err := src.Values(); err != nil {
+		vals, err := src.Values()
+		if err != nil {
 			return n, err
 		}
+		p.copyVals = append(p.copyVals, vals)
 		n++
 	}
 	if err := src.Err(); err != nil {
@@ -311,6 +314,120 @@ func TestPipelineAdd(t *testing.T) {
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/list.txt")) {
 		t.Error("файл не перемещён в processed/com/add/list.txt")
+	}
+}
+
+// TestPipelineZonelessAdd — зона-less файл (add/<файл>): зоны создаются
+// лениво по первым строкам, строки staging несут зону каждую, отчёт —
+// с zone_id NULL (ZoneID 0), файл уходит в processed/add/.
+func TestPipelineZonelessAdd(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "example.com\nfoo.ru\nbar.com\n"
+	abs := pt.addFile(t, "add/list.txt", content)
+	sha := sha256.Sum256([]byte(content))
+
+	pt.pool.execs = []pipeExec{
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
+		{tag: pgconn.NewCommandTag("INSERT 3")}, // новые: все три домена
+		{tag: pgconn.NewCommandTag("UPDATE 0")}, // возврата из deleted нет
+		{tag: pgconn.NewCommandTag("DELETE 3")}, // очистка после применения
+	}
+	pt.pool.uniques = 3
+
+	out, err := pt.pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.Kind != OutcomeApplied {
+		t.Fatalf("итог = %s, want applied", out.Kind)
+	}
+
+	rep := out.Report
+	if rep.Zone != "" || rep.ZoneID != 0 || rep.Action != model.ActionAdd {
+		t.Errorf("файл отчёта = %+v, want зона \"\" (id 0), действие add", rep)
+	}
+	if rep.LinesTotal != 3 || rep.Accepted != 3 || rep.Rejected != 0 {
+		t.Errorf("счётчики строк = %+v, want 3/3/0", rep)
+	}
+	if rep.Added != 3 {
+		t.Errorf("добавлено = %d, want 3", rep.Added)
+	}
+	if !reflect.DeepEqual(rep.SHA256, sha[:]) {
+		t.Errorf("sha256 = %x, want хэш содержимого %x", rep.SHA256, sha)
+	}
+
+	// Зоны созданы лениво по первым строкам: com (первая строка), ru.
+	wantCalls := []string{"byName:com", "create:com", "byName:ru", "create:ru"}
+	if !reflect.DeepEqual(pt.zones.calls, wantCalls) {
+		t.Errorf("обращения к зонам = %v, want %v (кэш: com повторно не ищется)", pt.zones.calls, wantCalls)
+	}
+
+	// Строки COPY несут зону каждая: example→com(1), foo→ru(2), bar→com(1).
+	wantZone := []int16{1, 2, 1}
+	if len(pt.pool.copyVals) != len(wantZone) {
+		t.Fatalf("строк COPY = %d, want %d", len(pt.pool.copyVals), len(wantZone))
+	}
+	for i, vals := range pt.pool.copyVals {
+		if z, ok := vals[1].(int16); !ok || z != wantZone[i] {
+			t.Errorf("строка COPY %d: zone_id = %v, want %d", i, vals[1], wantZone[i])
+		}
+	}
+
+	// Отчёт в журнале: зона-less файл пишет ZoneID 0 (NULL в БД).
+	if len(pt.files.records) != 1 {
+		t.Fatalf("записей в журнале = %d, want 1", len(pt.files.records))
+	}
+	rec := pt.files.records[0]
+	if rec.ZoneID != 0 || rec.Path != "add/list.txt" || rec.Added != 3 {
+		t.Errorf("запись журнала = %+v, want ZoneID 0, путь add/list.txt, added 3", rec)
+	}
+
+	// Файл уходит в processed/ с сохранением структуры (без каталога зоны).
+	if exists(t, abs) {
+		t.Error("файл остался в incoming")
+	}
+	if !exists(t, filepath.Join(pt.dir, DirProcessed, "add/list.txt")) {
+		t.Error("файл не перемещён в processed/add/list.txt")
+	}
+}
+
+// TestPipelineZonelessDuplicate — точная повторная доставка зона-less
+// файла: совпадение (NULL-зона, действие, sha256) — не применяется,
+// перемещается в processed без нового отчёта (T-113).
+func TestPipelineZonelessDuplicate(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "example.com\nfoo.ru\n"
+	abs := pt.addFile(t, "add/list.txt", content)
+	sha := sha256.Sum256([]byte(content))
+	processed := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	add := model.ActionAdd
+	path := "add/first.txt"
+	pt.files = newFakeFileStore(
+		model.IngestFile{ // прежняя доставка того же содержимого — тоже зона-less
+			ID: 5, ZoneID: nil, Action: &add, Path: &path,
+			SHA256: sha[:], ProcessedAt: &processed,
+		},
+	)
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir: pt.dir, BatchSize: 10, Now: func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt.pipe = pipe
+
+	out, err := pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.Kind != OutcomeDuplicate {
+		t.Fatalf("итог = %s, want duplicate", out.Kind)
+	}
+	if len(pt.files.records) != 0 {
+		t.Errorf("записей в журнале = %d, want 0 (дубль не пишет отчёт)", len(pt.files.records))
+	}
+	if !exists(t, filepath.Join(pt.dir, DirProcessed, "add/list.txt")) {
+		t.Error("дубль не перемещён в processed/")
 	}
 }
 

@@ -280,7 +280,6 @@ func TestStage_Validation(t *testing.T) {
 		batchSize int
 	}{
 		{"нулевой идентификатор", Batch{ZoneID: 1, Action: model.ActionAdd}, 10},
-		{"зона 0", Batch{ID: id, ZoneID: 0, Action: model.ActionAdd}, 10},
 		{"отрицательная зона", Batch{ID: id, ZoneID: -2, Action: model.ActionDelete}, 10},
 		{"операция 0", Batch{ID: id, ZoneID: 1, Action: 0}, 10},
 		{"неизвестная операция", Batch{ID: id, ZoneID: 1, Action: model.Action(3)}, 10},
@@ -591,4 +590,58 @@ func colNames(cols []stageColumn) []string {
 		names[i] = c.name
 	}
 	return names
+}
+
+// TestStageRowZone — зона строки COPY: Row.ZoneID (зона-less файл) с
+// откатом на ZoneID партии (файл зона-каталога); без зоны ни в строке,
+// ни в партии — ошибка rowIter, строка в БД не попадает.
+func TestStageRowZone(t *testing.T) {
+	id, err := NewBatchID()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Зона-less партия: каждая строка несёт свою зону.
+	f := &fakeDB{}
+	rows := []Row{
+		{Label: "example", ZoneID: 7, LineNo: 1},
+		{Label: "foo", ZoneID: 8, LineNo: 2},
+		{Label: "bar", ZoneID: 7, LineNo: 3},
+	}
+	if _, err := Stage(context.Background(), f, Batch{ID: id, Action: model.ActionAdd}, 10, (&rowsIter{rows: rows}).next); err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	wantZone := []any{int16(7), int16(8), int16(7)}
+	if len(f.rows) != len(wantZone) {
+		t.Fatalf("строк в staging = %d, want %d", len(f.rows), len(wantZone))
+	}
+	for i, r := range f.rows {
+		if r[1] != wantZone[i] {
+			t.Errorf("строка %d: zone_id = %v, want %v", i, r[1], wantZone[i])
+		}
+	}
+
+	// Файл зона-каталога: ZoneID строки нулевая — зона партии.
+	f2 := &fakeDB{}
+	rows2 := []Row{{Label: "example", LineNo: 1}, {Label: "foo", LineNo: 2}}
+	if _, err := Stage(context.Background(), f2, Batch{ID: id, ZoneID: 5, Action: model.ActionAdd}, 10, (&rowsIter{rows: rows2}).next); err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	for i, r := range f2.rows {
+		if r[1] != any(int16(5)) {
+			t.Errorf("строка %d: zone_id = %v, want 5 (из партии)", i, r[1])
+		}
+	}
+
+	// Зона не определена нигде: ошибка rowIter — пачка COPY не доходит
+	// до БД целиком (транзакция пачки, ТЗ 3.5).
+	f3 := &fakeDB{}
+	bad := []Row{{Label: "example", ZoneID: 9, LineNo: 1}, {Label: "foo", LineNo: 2}}
+	_, err = Stage(context.Background(), f3, Batch{ID: id, Action: model.ActionAdd}, 10, (&rowsIter{rows: bad}).next)
+	if err == nil || !strings.Contains(err.Error(), "зона строки не определена") {
+		t.Fatalf("Stage = %v, want «зона строки не определена»", err)
+	}
+	if len(f3.rows) != 0 {
+		t.Errorf("в staging оказалось строк: %d, want 0 (пачка отменена)", len(f3.rows))
+	}
 }

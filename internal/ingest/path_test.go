@@ -38,6 +38,13 @@ func TestParsePathValid(t *testing.T) {
 		{name: "tgz", path: "com/add/short.tgz", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/short.tgz"},
 		{name: "gz", path: "com/add/list.gz", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/list.gz"},
 		{name: "архив в верхнем регистре", path: "com/add/ZONE.ZIP", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/ZONE.ZIP"},
+		// Зона-less файлы (add|delete/<файл>): зоны строк выводятся из
+		// имён (validate.go), файл может смешивать зоны.
+		{name: "зона-less add", path: "add/list.txt", zone: "", uni: "", action: model.ActionAdd, clean: "add/list.txt"},
+		{name: "зона-less delete", path: "delete/old.txt", zone: "", uni: "", action: model.ActionDelete, clean: "delete/old.txt"},
+		{name: "зона-less .TXT", path: "add/LIST.TXT", zone: "", uni: "", action: model.ActionAdd, clean: "add/LIST.TXT"},
+		{name: "зона-less архив", path: "add/zone.zip", zone: "", uni: "", action: model.ActionAdd, clean: "add/zone.zip"},
+		{name: "зона-less очистка разделителей", path: "add//./list.txt", zone: "", uni: "", action: model.ActionAdd, clean: "add/list.txt"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,6 +97,12 @@ func TestParsePathErrors(t *testing.T) {
 		{name: "пустой путь", path: "", kind: ErrPathStructure},
 		{name: "только файл, без зоны", path: "list.txt", kind: ErrPathStructure},
 		{name: "нет add/delete", path: "com/list.txt", kind: ErrPathStructure},
+		{name: "зона-less без add/delete", path: "patch/list.txt", kind: ErrPathStructure},
+		{name: "зона-less операция в верхнем регистре", path: "Add/list.txt", kind: ErrPathStructure},
+		{name: "зона-less лишняя вложенность", path: "add/sub/list.txt", kind: ErrPathStructure},
+		{name: "зона-less каталог операции вместо файла", path: "add/", kind: ErrPathStructure},
+		{name: "зона-less без расширения", path: "add/list", kind: ErrPathNotTXT},
+		{name: "зона-less другое расширение", path: "add/list.csv", kind: ErrPathNotTXT},
 		{name: "неизвестный каталог операции", path: "com/patch/list.txt", kind: ErrPathStructure},
 		{name: "операция в верхнем регистре", path: "com/Add/list.txt", kind: ErrPathStructure},
 		{name: "лишняя вложенность", path: "com/add/sub/list.txt", kind: ErrPathStructure},
@@ -147,7 +160,7 @@ func TestParsePathZoneErrorUnwrap(t *testing.T) {
 
 func TestPathErrorMessages(t *testing.T) {
 	_, err := ParsePath("com/patch/list.txt")
-	want := `ingest: структура пути не <зона>/add|delete/<файл>: "com/patch/list.txt"`
+	want := `ingest: структура пути не <зона>/add|delete/<файл> и не add|delete/<файл>: "com/patch/list.txt"`
 	if err == nil || err.Error() != want {
 		t.Errorf("Error() = %v, want %s", err, want)
 	}

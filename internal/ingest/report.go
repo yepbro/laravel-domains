@@ -111,14 +111,21 @@ func (s *SQLFileStore) FilesBySHA256(ctx context.Context, sha []byte) ([]model.I
 	return fs, nil
 }
 
-// RecordFile пишет отчёт обработанного файла.
+// RecordFile пишет отчёт обработанного файла. Зона-less файл пишет
+// zone_id = NULL (зон у файла нет — они у строк); NULL в уникальной
+// тройке (zone_id, action, sha256) не конфликтует (миграция 000009),
+// защиту от точной повторной доставки выполняет конвейер.
 func (s *SQLFileStore) RecordFile(ctx context.Context, rec FileRecord) error {
 	if len(rec.SHA256) != sha256.Size {
 		return fmt.Errorf("ingest: отчёт файла %s: sha256 — %d октетов, ожидается %d",
 			rec.Path, len(rec.SHA256), sha256.Size)
 	}
+	var zoneID any // nil → NULL: зона-less файл (add|delete/<файл>)
+	if rec.ZoneID > 0 {
+		zoneID = rec.ZoneID
+	}
 	if _, err := s.pool.Exec(ctx, sqlFileRecord,
-		rec.ZoneID, int16(rec.Action), rec.Path, rec.SHA256,
+		zoneID, int16(rec.Action), rec.Path, rec.SHA256,
 		rec.LinesTotal, rec.Added, rec.Existed, rec.Deleted, rec.Rejected,
 		rec.ProcessedAt,
 	); err != nil {
@@ -134,10 +141,11 @@ func (s *SQLFileStore) RecordFile(ctx context.Context, rec FileRecord) error {
 // в лог-отчёте и записях лога сервиса.
 type FileReport struct {
 	// Zone — punycode-зона пути файла (в БД — ZoneID; для лог-отчёта).
-	// Пуста, если путь не разобран (ошибочные файлы тоже получают
-	// лог-отчёт).
+	// Пуста у зона-less файла (add|delete/<файл>: зоны строк — из имён)
+	// и если путь не разобран (ошибочные файлы тоже получают лог-отчёт).
 	Zone string
-	// ZoneID — идентификатор zones.id; 0, если путь не разобран.
+	// ZoneID — идентификатор zones.id; 0 — зона-less файл или путь
+	// не разобран (в журнале — NULL).
 	ZoneID int16
 	// Action — действие файла (1 add, 2 delete); 0 при неразобранном пути.
 	Action model.Action
@@ -199,6 +207,8 @@ func renderReport(rep FileReport, verdict string) string {
 	fmt.Fprintf(&b, "файл: %s\n", rep.Path)
 	if rep.Zone != "" {
 		fmt.Fprintf(&b, "зона: %s (id %d)\n", rep.Zone, rep.ZoneID)
+	} else if rep.Action.Valid() {
+		b.WriteString("зона: по именам строк (файл без каталога зоны)\n")
 	} else {
 		b.WriteString("зона: — (путь не разобран)\n")
 	}

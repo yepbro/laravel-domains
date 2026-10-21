@@ -80,23 +80,28 @@ func batchIDBefore(t time.Time) BatchID {
 }
 
 // Batch — партия: загрузка строк одного входного файла в staging.
-// Все строки файла принадлежат одной зоне и несут одну операцию (ТЗ 5.1:
-// путь <зона>/add|delete/*.txt или архив зоны каталога, T-133), поэтому
-// зона и операция задаются на партии
-// и пишутся в каждую строку: применение (T-018/T-019) читает всё нужное из
+// Строки зона-каталога принадлежат одной зоне (ТЗ 5.1: путь
+// <зона>/add|delete/*.txt), и зона задаётся на партии; строки зона-less
+// файла (add|delete/<файл>) несут зону каждая (Row.ZoneID — выведена из
+// имени, T-014/validate), ZoneID партии остаётся нулём. Операция у файла
+// одна, поэтому действие задаётся на партии
+// и пишется в каждую строку: применение (T-018/T-019) читает всё нужное из
 // самой строки staging без побочных справочников.
 type Batch struct {
 	ID     BatchID      // идентификатор партии (NewBatchID)
-	ZoneID int16        // зона файла (zones.id)
+	ZoneID int16        // зона файла (zones.id); 0 — зона-less файл
 	Action model.Action // 1 add, 2 delete (ТЗ 5.1)
 }
 
 // Row — валидированная строка входного файла (проверка имён — T-016):
 // метка домена без зоны в punycode (ТЗ 5.2; может быть составной —
 // «магазин.рф.co.uk» в зоне co.uk даёт «xn--80aairftm.xn--p1ai»,
-// контракт internal/idn) и её позиция в файле.
+// контракт internal/idn) и её позиция в файле. У зона-less файла строка
+// несёт и свою зону (ZoneID — zones.id, EnsureZone конвейера); у файла
+// зона-каталога ZoneID нулевой — зона берётся из партии.
 type Row struct {
 	Label  string
+	ZoneID int16 // зоны.id строки; 0 — из Batch.ZoneID
 	LineNo int64 // номер строки в исходном файле, с единицы
 }
 
@@ -138,8 +143,8 @@ func Stage(ctx context.Context, pool db.DB, b Batch, batchSize int, next RowIter
 	if b.ID == (BatchID{}) {
 		return 0, errors.New("ingest: партия без идентификатора (ingest.NewBatchID)")
 	}
-	if b.ZoneID < 1 {
-		return 0, fmt.Errorf("ingest: зона партии %d: ожидается идентификатор zones.id (>= 1)", b.ZoneID)
+	if b.ZoneID < 0 {
+		return 0, fmt.Errorf("ingest: зона партии %d: ожидается идентификатор zones.id (>= 1) либо 0 (зона-less файл)", b.ZoneID)
 	}
 	if !b.Action.Valid() {
 		return 0, fmt.Errorf("ingest: операция партии %d: ожидается 1 add / 2 delete (ТЗ 5.1)", int16(b.Action))
@@ -186,7 +191,8 @@ func ClearBatch(ctx context.Context, pool db.DB, id BatchID) (int64, error) {
 // составной бывает (контракт internal/idn — точки допустимы), но каждая
 // её часть непустая и не длиннее MaxLabelLen (ТЗ 5.2 п. 4); номер строки
 // с единицы и строго растёт — уникальность (batch_id, line_no) внутри
-// партии до БД.
+// партии до БД. Зона строки — Row.ZoneID (зона-less файл), при нулевой —
+// ZoneID партии (файл зона-каталога); обязана быть zones.id >= 1.
 func (b Batch) rowIter(next RowIter) db.RowIter {
 	var lastLine int64
 	return func() ([]any, error) {
@@ -206,8 +212,15 @@ func (b Batch) rowIter(next RowIter) db.RowIter {
 		case row.LineNo <= lastLine:
 			return nil, fmt.Errorf("ingest: номер строки %d не растёт (предыдущий %d): строки партии уникальны по line_no", row.LineNo, lastLine)
 		}
+		zone := row.ZoneID
+		if zone == 0 {
+			zone = b.ZoneID
+		}
+		if zone < 1 {
+			return nil, fmt.Errorf("ingest: строка %d: зона строки не определена: ожидается zones.id (>= 1) в строке или партии", row.LineNo)
+		}
 		lastLine = row.LineNo
-		return []any{b.ID[:], b.ZoneID, row.Label, int16(b.Action), row.LineNo}, nil
+		return []any{b.ID[:], zone, row.Label, int16(b.Action), row.LineNo}, nil
 	}
 }
 

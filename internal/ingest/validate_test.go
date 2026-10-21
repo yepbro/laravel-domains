@@ -255,3 +255,53 @@ func TestNewValidator(t *testing.T) {
 		}
 	})
 }
+
+// TestValidatorZoneless — зона-less файл (Zone == ""): зоны строк
+// выводятся из самих имён (publicsuffix, ТЗ 5.2 п. 5), файл смешивает
+// зоны, wrong_zone невозможна. Тестовые зоны PSL не знает: example.crawl.test
+// относится к зоне test с составной меткой — для testbed пользоваться
+// зона-каталогами.
+func TestValidatorZoneless(t *testing.T) {
+	v, err := NewValidator(ValidatorOptions{File: "add/list.txt", MaxErrorRatio: 0.5})
+	if err != nil {
+		t.Fatalf("NewValidator: %v", err)
+	}
+	cases := []struct {
+		line  string
+		zone  string
+		label string
+	}{
+		{"example.com", "com", "example"},
+		{"shop.co.uk", "co.uk", "shop"},
+		{"FOO.RU.", "ru", "foo"},
+		{"example.crawl.test", "test", "example.crawl"},
+	}
+	for i, tc := range cases {
+		e, reason, ok := v.Line(i+1, tc.line)
+		if !ok {
+			t.Fatalf("Line(%d, %q) отклонена: %s", i+1, tc.line, reason)
+		}
+		if e.Zone != tc.zone || e.Label != tc.label {
+			t.Errorf("Line(%q) = зона %q метка %q, want %q/%q", tc.line, e.Zone, e.Label, tc.zone, tc.label)
+		}
+	}
+	// IDN-метка: флаг по punycode-метке.
+	e, _, ok := v.Line(len(cases)+1, "тест.рф")
+	if !ok || e.Zone != "xn--p1ai" || !e.IsIDN || !strings.HasPrefix(e.Label, "xn--") {
+		t.Errorf("IDN-строка = %+v ok=%v, want зона xn--p1ai, IsIDN, punycode-метка", e, ok)
+	}
+
+	// Само имя PSL-зоны — метки нет: отклонение no_label.
+	if _, reason, ok := v.Line(len(cases)+2, "com"); ok || reason != ReasonNoLabel {
+		t.Errorf("строка \"com\" = ok=%v причина %s, want no_label", ok, reason)
+	}
+	// Посторонние данные без домена — no_domain (T-132).
+	if _, reason, ok := v.Line(len(cases)+3, "hello world"); ok || reason != ReasonNoDomain {
+		t.Errorf("строка без домена = ok=%v причина %s, want no_domain", ok, reason)
+	}
+
+	res := v.Finish()
+	if res.Accepted != len(cases)+1 || res.Rejected != 2 || res.Failed {
+		t.Errorf("Finish = %+v, want принято %d, отклонено 2, не failed", res, len(cases)+1)
+	}
+}
