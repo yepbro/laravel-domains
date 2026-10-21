@@ -22,7 +22,8 @@
 //   - GET /robots.txt  — статика из embed (T-124);
 //   - GET /sitemap.xml — минимальный sitemap локалей (T-124);
 //   - GET /static/*    — статика лендинга (go:embed; app.css —
-//     генерат Tailwind, placeholder до make web-css/T-124).
+//     генерат Tailwind, в git не хранится — make web-css/стадия css
+//     Dockerfile.go, T-124).
 package web
 
 import (
@@ -278,8 +279,8 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// app.css — генерат Tailwind (make web-css / стадия css Dockerfile,
-	// T-124); в git — placeholder, чтобы go:embed не падал на свежем
-	// клоне (страница откроется без стилей, не 500).
+	// T-124); в git не хранится (.gitignore): на свежем клоне файла
+	// нет — /static/app.css ответит 404 (страница без стилей, не 500).
 	http.StripPrefix("/static/", http.FileServer(http.FS(sub))).ServeHTTP(w, r)
 }
 

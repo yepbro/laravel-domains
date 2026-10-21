@@ -137,9 +137,10 @@ build-runtime: ## Собрать боевые образы (runtime + render) д
 		--target render -t crawler/render:check .
 
 # Бандл Tailwind лендинга (T-124): исходник internal/web/static/app.src.css →
-# app.css (go:embed, собирается в бинарь). В git хранится placeholder — после
-# правок шаблона/исходника CSS запустите цель для dev-просмотра; сборка боевых
-# образов собирает CSS сама (стадия css Dockerfile.go), node не нужен.
+# app.css (go:embed, собирается в бинарь). Генерат в git не хранится
+# (.gitignore) — после правок шаблона/исходника CSS запустите цель для
+# dev-просмотра; сборка боевых образов собирает CSS сама (стадия css
+# Dockerfile.go), node не нужен.
 .PHONY: web-css
 web-css: ## Собрать CSS лендинга (Tailwind v4: app.src.css → static/app.css)
 	$(check_env)
@@ -152,8 +153,9 @@ web-css: ## Собрать CSS лендинга (Tailwind v4: app.src.css → st
 	  && chmod +x /tmp/tailwindcss \
 	  && /tmp/tailwindcss -i app.src.css -o app.css --minify \
 	  && chown $(DEV_UID):$(DEV_GID) app.css'
-	@echo 'internal/web/static/app.css собран (генерат).'
-	@echo 'Вернуть placeholder перед коммитом: git checkout -- internal/web/static/app.css'
+	@echo 'internal/web/static/app.css собран (генерат, в git не хранится).'
+	@echo 'Применение в dev: перезапустите сервис web — air следит только за .go:'
+	@echo '  docker restart crawler-web-1'
 
 GO_PKGS := ./cmd/... ./internal/... ./migrations/... ./test/... ./deploy/postgres
 

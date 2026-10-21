@@ -185,9 +185,9 @@ T-087 (≤ 512M, под потолком MemoryMax).
 
 ```bash
 # Бандл Tailwind лендинга (T-124): go:embed вбирает internal/web/static/
-# app.css; в git там placeholder, без этого шага лендинг встанет без
-# стилей. Собирается одноразовым контейнером (node не нужен); боевая
-# docker-сборка делает это сама (стадия css Dockerfile.go).
+# app.css; в git он не хранится (.gitignore), без этого шага лендинг
+# встанет без стилей. Собирается одноразовым контейнером (node не
+# нужен); боевая docker-сборка делает это сама (стадия css Dockerfile.go).
 make web-css
 
 version="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"

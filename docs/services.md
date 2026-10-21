@@ -585,11 +585,11 @@ robots — статика из embed, sitemap — минимальный наб�
 
 CSS лендинга — Tailwind v4 без node: исходник
 `internal/web/static/app.src.css` (классы сканируются `@source`-ом
-шаблона), собранный бандл в git не хранится (там placeholder —
-свежий клон даёт страницу без стилей, не 500). Сборка: стадия `css`
+шаблона), собранный бандл в git не хранится (`.gitignore` — свежий
+клон даёт страницу без стилей, не 500). Сборка: стадия `css`
 в `deploy/docker/Dockerfile.go` (alpine + standalone-CLI tailwindcss,
-версия — `TAILWINDCSS_VERSION` в `.env`; генерат подменяет placeholder
-в build-стадии до `go build` — go:embed встраивает настоящий CSS) или
+версия — `TAILWINDCSS_VERSION` в `.env`; генерат кладётся в
+build-стадии до `go build` — go:embed встраивает настоящий CSS) или
 `make web-css` для dev-просмотра (одноразовый docker run).
 
 Конфигурация — секция `web` (`listen`/`rate_limit`/`timeout`,

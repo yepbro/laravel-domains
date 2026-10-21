@@ -3,8 +3,8 @@
  * шаблонов (@source), утилиты Tailwind — по умолчанию. Сборка — стадия
  * css Dockerfile.go (T-124) или make web-css для dev (standalone-CLI
  * tailwindcss v4 через одноразовый docker run); собранный бандл
- * internal/web/static/app.css в git НЕ хранится (placeholder держит
- * go:embed/сборку зелёными — свежий клон даёт страницу без стилей).
+ * internal/web/static/app.css в git не хранится (.gitignore) — свежий
+ * клон даёт страницу без стилей (404 на /static/app.css, не ошибку).
  */
 @import "tailwindcss";
 

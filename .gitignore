@@ -7,6 +7,10 @@
 
 # Артефакты сборки Go
 /bin/
+
+# Генерат Tailwind лендинга (make web-css / стадия css Dockerfile.go):
+# в бинарь встраивается go:embed-ом, в git не хранится
+internal/web/static/app.css
 *.test
 *.out
 coverage.*

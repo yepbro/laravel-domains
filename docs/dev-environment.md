@@ -88,13 +88,13 @@ docker compose --project-directory . -f deploy/docker/compose.yaml --env-file .e
   --profile monitoring --profile tools up -d
 ```
 
-Стили лендинга (Tailwind v4) собираются в бинарь через go:embed: в git
-лежит placeholder, для dev-просмотра с настоящими стилями соберите бандл
-один раз после правок шаблона/исходника — `make web-css` (одноразовый
-контейнер, node не нужен; боевая docker-сборка делает это сама — стадия
-`css` в Dockerfile.go). Цель пишет генерат в отслеживаемый путь
-`internal/web/static/app.css` — перед коммитом верните placeholder:
-`git checkout -- internal/web/static/app.css`.
+Стили лендинга (Tailwind v4) собираются в бинарь через go:embed:
+`internal/web/static/app.css` — генерат и в git не хранится
+(`.gitignore`). Для dev-просмотра с настоящими стилями соберите бандл
+после правок шаблона/исходника — `make web-css` (одноразовый контейнер,
+node не нужен; боевая docker-сборка делает это сама — стадия `css`
+в Dockerfile.go) — и перезапустите сервис web: air следит только за
+`.go`, на CSS сам не пересоберётся (`docker restart crawler-web-1`).
 
 ### Дашборд: dev-креды и перегенерация хэша
 
