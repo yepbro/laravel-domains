@@ -310,7 +310,8 @@ rules-reload: ## SIGHUP анализатору — перезагрузить п
 .PHONY: reanalyze
 reanalyze: ## Запустить переанализ результатов (crawlerctl)
 	$(check_env)
-	$(COMPOSE) run --rm tools go run ./cmd/crawlerctl reanalyze
+	$(COMPOSE) run --rm -e CRAWLER_ANALYZER_RULES_DIR=/rules \
+		tools go run ./cmd/crawlerctl reanalyze
 
 # --------------------------------------------------------------- отладка / CLI
 
