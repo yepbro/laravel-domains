@@ -94,7 +94,17 @@ func ScoreFixed(weights []float64) float64 {
 type version []float64
 
 func parseVersion(s string) version {
+	// Эквивалентный мутант (T-M12): обрезка всей строки избыточна —
+	// каждый компонент отдельно обрезается strings.TrimSpace ниже, а
+	// пробельное начало/конец строки — это начало первого и конец
+	// последнего компонента.
+	// mutator-disable-next-line statement/remove
 	s = strings.TrimSpace(s)
+	// Эквивалентный мутант (T-M12): без раннего возврата пустая строка
+	// расщепляется на [""], ParseFloat("") даёт ErrSyntax — тот же
+	// итоговый nil. Аннотация стоит на строке if, а не тела: якорь
+	// branch/if — оператор if (урок контрольного прогона T-M10).
+	// mutator-disable-next-line branch/if
 	if s == "" {
 		return nil
 	}
@@ -103,9 +113,18 @@ func parseVersion(s string) version {
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "x" || p == "*" {
+			// Эквивалентные мутанты (T-M12): math.Inf возвращает +Inf при
+			// любом знаке ≥ 0 — Inf(0) и Inf(2) тот же +Inf, что и Inf(1)
+			// (документация stdlib).
+			// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 			out = append(out, math.Inf(1))
 			continue
 		}
+		// Эквивалентные мутанты (T-M12): strconv.ParseFloat различает
+		// только bitSize 32 (отдельная ветка разбора), прочие значения
+		// идут путём 64 — 63 и 65 ведут себя как 64, включая ErrRange
+		// на «1e400» (проверено эмпирически).
+		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 		n, err := strconv.ParseFloat(p, 64)
 		if err != nil {
 			return nil // некорректная версия игнорируется
@@ -116,6 +135,12 @@ func parseVersion(s string) version {
 }
 
 func (v version) less(o version) bool {
+	// Эквивалентные мутанты (T-M12): дополнительная итерация при
+	// i == len сравнивает два отсутствующих компонента (0 и 0) — они
+	// равны, цикл выходит без результата; итог тот же. Вырезание левого
+	// операнда OR убиваемо — хвост приёмника с отрицательной компонентой
+	// виден только полным перебором (TestVersionCompare, «9.-1»).
+	// mutator-disable-next-line expression/comparison
 	for i := 0; i < len(v) || i < len(o); i++ {
 		var a, b float64
 		if i < len(v) {
@@ -125,6 +150,10 @@ func (v version) less(o version) bool {
 			b = o[i]
 		}
 		if a != b {
+			// Эквивалентный мутант (T-M12): ветка исполняется только при
+			// a != b, где «a <= b» ≡ «a < b»; NaN-компоненты дают false в
+			// обоих вариантах (несравнимость).
+			// mutator-disable-next-line expression/comparison
 			return a < b
 		}
 	}

@@ -203,6 +203,80 @@ rules:
 	}
 }
 
+// TestEvaluateCtxNanoBudget — положительный EvalTimeout любого размера
+// (здесь 1 нс) обязан включать обёртку WithTimeout: к моменту расчёта
+// задержки в WithDeadline дедлайн уже прошёл (между time.Now().Add и
+// time.Until — сотни нс), контекст отменяется синхронно (ветка dur <= 0),
+// и просмотр прерывается с Partial на первой же проверке — детерминированно,
+// без гонки с таймером. Мутант «> 1» пропускает обёртку: бюджет 1 нс
+// трактовался бы как отключённый, просмотр дошёл бы до конца без Partial.
+func TestEvaluateCtxNanoBudget(t *testing.T) {
+	set := &Set{Rules: []Rule{
+		{ID: "r1", Target: TargetHTML, Regex: "MARK", Weight: 0.1},
+		{ID: "r2", Target: TargetHTML, Regex: "MARK", Weight: 0.1},
+		{ID: "r3", Target: TargetHTML, Regex: "MARK", Weight: 0.1},
+	}}
+	lim := DefaultLimits()
+	lim.EvalTimeout = 1 // нс
+	res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("MARK")}, lim)
+	if !res.Partial {
+		t.Error("бюджет 1 нс должен прерывать просмотр (Partial)")
+	}
+}
+
+// TestMatchRuleCtxStopsMidScan — отмена между элементами: бюджет ctx
+// проверяется и на входе matchRule, и в каждом переборе (куки, имена и
+// значения заголовков, meta-теги); совпадающий элемент ПОСЛЕ исчерпания
+// бюджета не смотрится. countingCtx: вход + первый элемент исчерпывают
+// запас, второй (совпадающий) уже под отменой.
+func TestMatchRuleCtxStopsMidScan(t *testing.T) {
+	t.Run("cookie_name", func(t *testing.T) {
+		page := Page{Cookies: []Cookie{{Name: "a"}, {Name: "hit"}}}
+		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetCookieName, Match: "hit"}, page, DefaultLimits()); ok {
+			t.Error("перебор cookies обязан остановиться до совпадающей куки")
+		}
+	})
+	t.Run("cookie_value", func(t *testing.T) {
+		page := Page{Cookies: []Cookie{{Name: "a", Value: "1"}, {Name: "b", Value: "hit"}}}
+		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetCookieValue, Match: "hit"}, page, DefaultLimits()); ok {
+			t.Error("перебор значений cookies обязан остановиться до совпадающего")
+		}
+	})
+	t.Run("header_name", func(t *testing.T) {
+		page := Page{Headers: map[string][]string{"A": {"1"}, "B": {"2"}}}
+		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetHeaderName, Match: "B"}, page, DefaultLimits()); ok {
+			t.Error("перебор имён заголовков обязан остановиться до совпадающего")
+		}
+	})
+	t.Run("header_value", func(t *testing.T) {
+		page := Page{Headers: map[string][]string{"H": {"1", "hit"}}}
+		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetHeaderValue, Match: "hit"}, page, DefaultLimits()); ok {
+			t.Error("перебор значений заголовка обязан остановиться до совпадающего")
+		}
+	})
+	t.Run("meta", func(t *testing.T) {
+		page := Page{HTML: []byte(`x<meta a="1"><meta b="1">`)}
+		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetMeta, Regex: `b=`}, page, DefaultLimits()); ok {
+			t.Error("скан meta-тегов обязан остановиться до совпадающего тега")
+		}
+	})
+}
+
+// TestMatchRuleMetaAdvance — скользящий поиск meta сдвигает позицию за
+// конец просмотренного тега: третий тег находится и становится
+// свидетельством. Мутант «pos = loc[1]» (без накопления смещения)
+// зацикливается на первых двух тегах — тест умирает по таймауту мутанта.
+func TestMatchRuleMetaAdvance(t *testing.T) {
+	page := Page{HTML: []byte(`xx<meta a="1"><meta b="1"><meta c="1">`)}
+	ev, ok := matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `c="1"`}, page, DefaultLimits())
+	if !ok {
+		t.Fatal("третий meta-тег должен найтись")
+	}
+	if ev != `<meta c="1">` {
+		t.Errorf("свидетельство = %q, want третий тег", ev)
+	}
+}
+
 func TestEvaluateEmptyPage(t *testing.T) {
 	set := evalSet(t, `
 rules:

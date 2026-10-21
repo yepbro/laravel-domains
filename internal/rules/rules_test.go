@@ -1,9 +1,12 @@
 package rules
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -299,6 +302,22 @@ rules:
     weight: 0.5
     ver_min: "девять"
 `},
+		{"некорректный ver_max", `
+rules:
+  - id: ver_bad_max
+    target: html
+    regex: "x"
+    weight: 0.5
+    ver_max: "ten"
+`},
+		{"опечатка в постороннем поле (строгий разбор)", `
+rules:
+  - id: typo_descr
+    target: html
+    regex: "x"
+    weight: 0.5
+    descrption: "опечатка"
+`},
 		{"пустой набор", `
 rules: []
 `},
@@ -327,8 +346,9 @@ rules:
 
 func TestLoadDirErrors(t *testing.T) {
 	t.Run("несуществующий каталог", func(t *testing.T) {
-		if _, err := LoadDir(filepath.Join(t.TempDir(), "нет-такого")); err == nil {
-			t.Error("ожидалась ошибка чтения каталога")
+		_, err := LoadDir(filepath.Join(t.TempDir(), "нет-такого"))
+		if err == nil || !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("err = %v, хочу обёртку ошибки os.ReadDir (открытие каталога)", err)
 		}
 	})
 	t.Run("каталог без yaml", func(t *testing.T) {
@@ -336,8 +356,68 @@ func TestLoadDirErrors(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := LoadDir(dir); err == nil {
-			t.Error("ожидалась ошибка «нет yaml-файлов»")
+		_, err := LoadDir(dir)
+		if err == nil || !strings.Contains(err.Error(), "нет yaml-файлов") {
+			t.Errorf("err = %v, хочу точный текст «нет yaml-файлов» (не «набор правил пуст»)", err)
+		}
+	})
+	t.Run("подкаталог с yaml-расширением пропускается", func(t *testing.T) {
+		// каталог — не файл правил: расширение имени не должно тащить его
+		// в набор (чтение каталога как файла падает)
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "pkg.yaml"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "rules.yaml"),
+			[]byte("rules:\n  - id: r\n    target: html\n    regex: x\n    weight: 0.5\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		set, err := LoadDir(dir)
+		if err != nil {
+			t.Fatalf("подкаталог с расширением .yaml должен пропускаться: %v", err)
+		}
+		if len(set.Rules) != 1 || set.Rules[0].ID != "r" {
+			t.Errorf("набор = %+v, want одно правило r", set.Rules)
+		}
+	})
+	t.Run("каталог среди записей не прерывает подбор файлов", func(t *testing.T) {
+		// «0sub.dir» сортируется раньше yaml-файлов: преждевременный выход
+		// из перебора записей терял бы все файлы правил
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "0sub.dir"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "a.yaml"), []byte(partA), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadDir(dir); err != nil {
+			t.Fatalf("каталог в начале перечня не должен ломать загрузку: %v", err)
+		}
+	})
+	t.Run("битый symlink — ошибка загрузки", func(t *testing.T) {
+		// запись с расширением .yaml, но ReadFile падает: молчаливая
+		// потеря файла правил недопустима (EOF на пустых данных выглядел
+		// бы как «файл без правил»)
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "rules.yaml"),
+			[]byte("rules:\n  - id: r\n    target: html\n    regex: x\n    weight: 0.5\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("нет-такой-цели", filepath.Join(dir, "broken.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadDir(dir)
+		if err == nil || !strings.Contains(err.Error(), "broken.yaml") {
+			t.Errorf("err = %v, хочу ошибку чтения broken.yaml", err)
+		}
+	})
+	t.Run(".yml загружается наравне с .yaml", func(t *testing.T) {
+		set, err := LoadDir(writeRulesFiles(t, map[string]string{"rules.yml": partA}))
+		if err != nil {
+			t.Fatalf(".yml должен загружаться так же, как .yaml: %v", err)
+		}
+		if len(set.Rules) != 1 {
+			t.Errorf("правила из .yml потеряны: %+v", set.Rules)
 		}
 	})
 	t.Run("битый yaml", func(t *testing.T) {
@@ -525,5 +605,152 @@ func TestCanonicalHashDisambiguation(t *testing.T) {
 	b := []Rule{{ID: "a", Target: "b\x00c"}}
 	if canonicalHash(a) == canonicalHash(b) {
 		t.Error("разные наборы дали одинаковый канонический хэш")
+	}
+	// Разделитель «:» без префикса длины неоднозначен: поток «:a::b» —
+	// это поля («a», «:b») или («a:», «b»)?
+	c := []Rule{{ID: "a", Target: ":b"}}
+	d := []Rule{{ID: "a:", Target: "b"}}
+	if canonicalHash(c) == canonicalHash(d) {
+		t.Error("кодирование без длин допускает сдвиг границы поля")
+	}
+	// Префикс длины без «:» неоднозначен на значениях из цифр: конкатенация
+	// полей «1», «AAAAAAAAA», «», «9BBBBBBBBB0», … читается и как первое
+	// поле «9AAAAAAAAA0» (длина 11) со сдвигом остальных — байтовые потоки
+	// без «:» совпадают, с «:» — различаются.
+	e := []Rule{{ID: "1", Target: "AAAAAAAAA", Regex: "9BBBBBBBBB0", Weight: 0.5}}
+	f := []Rule{{ID: "9AAAAAAAAA0", Target: "1", Match: "BBBBBBBBB", Weight: 0.5}}
+	if canonicalHash(e) == canonicalHash(f) {
+		t.Error("кодирование без разделителя допускает сдвиг границы поля")
+	}
+}
+
+// TestCanonicalHashFieldCoverage — в rules_version входит каждое поле,
+// меняющее поведение детекции: правка любого из них обязана менять хэш
+// (вырезание writeField любого поля делало бы разные наборы неразличимыми).
+func TestCanonicalHashFieldCoverage(t *testing.T) {
+	base := Rule{ID: "r1", Target: "html", Regex: "MARK", Weight: 0.5, VerMin: "9", VerMax: "11"}
+	variants := map[string]Rule{
+		"id":      {ID: "r2", Target: "html", Regex: "MARK", Weight: 0.5, VerMin: "9", VerMax: "11"},
+		"target":  {ID: "r1", Target: "meta", Regex: "MARK", Weight: 0.5, VerMin: "9", VerMax: "11"},
+		"match":   {ID: "r1", Target: "html", Match: "X", Regex: "MARK", Weight: 0.5, VerMin: "9", VerMax: "11"},
+		"regex":   {ID: "r1", Target: "html", Regex: "OTHER", Weight: 0.5, VerMin: "9", VerMax: "11"},
+		"weight":  {ID: "r1", Target: "html", Regex: "MARK", Weight: 0.75, VerMin: "9", VerMax: "11"},
+		"ver_min": {ID: "r1", Target: "html", Regex: "MARK", Weight: 0.5, VerMin: "10", VerMax: "11"},
+		"ver_max": {ID: "r1", Target: "html", Regex: "MARK", Weight: 0.5, VerMin: "9", VerMax: "10.x"},
+	}
+	baseHash := canonicalHash([]Rule{base})
+	for name, r := range variants {
+		if canonicalHash([]Rule{r}) == baseHash {
+			t.Errorf("правка %s не меняет rules_version", name)
+		}
+	}
+}
+
+// TestCanonicalHashWeightPrecision — вес пишется в rules_version
+// shortest-записью (prec −1): 0.26 и 0.27 — разные правила. При prec 0
+// («одна значащая цифра», мутант decrementer) обе форматировались бы в
+// «0.3» и наборы становились неразличимы.
+func TestCanonicalHashWeightPrecision(t *testing.T) {
+	light := []Rule{{ID: "w", Weight: 0.26}}
+	heavy := []Rule{{ID: "w", Weight: 0.27}}
+	if canonicalHash(light) == canonicalHash(heavy) {
+		t.Error("веса 0.26 и 0.27 дают один rules_version (формат weight не shortest)")
+	}
+}
+
+// TestLoadDirNegativeVersionComponents — отрицательный числовой
+// компонент версии ("-1") формально проходит parseVersion; без второй
+// границы диапазон не конфликтует сам с собой: сравнение с отсутствующей
+// левой границей (vmin == nil) вычисляться не должно.
+func TestLoadDirNegativeVersionComponents(t *testing.T) {
+	if _, err := LoadDir(writeRules(t, `
+rules:
+  - id: neg_ver_max
+    target: html
+    regex: "x"
+    weight: 0.5
+    ver_max: "-1"
+`)); err != nil {
+		t.Errorf("ver_max без ver_min не конфликтует ни с чем: %v", err)
+	}
+}
+
+// TestLoadDirPatternBoundary — граница лимита длины regex: паттерн ровно
+// в MaxPatternBytes байт валиден (на байт длиннее — ошибка, см. таблицу
+// TestLoadDirValidation); мутант «>=» отвергал бы ровно-в-лимите.
+func TestLoadDirPatternBoundary(t *testing.T) {
+	body := "rules:\n  - id: exact\n    target: html\n    regex: \"" +
+		strings.Repeat("a", DefaultLimits().MaxPatternBytes) + "\"\n    weight: 0.5\n"
+	if _, err := LoadDir(writeRules(t, body)); err != nil {
+		t.Errorf("паттерн ровно в MaxPatternBytes валиден: %v", err)
+	}
+}
+
+// TestLoadDirTrimsIDs — пробелы вокруг id обрезаются у каждого правила:
+// непрокрученная обрезка оставляла бы второе и далее правила с «  id  ».
+func TestLoadDirTrimsIDs(t *testing.T) {
+	set, err := LoadDir(writeRules(t, `
+rules:
+  - id: first
+    target: html
+    regex: "x"
+    weight: 0.5
+  - id: "  padded  "
+    target: html
+    regex: "y"
+    weight: 0.5
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set.Rules) != 2 || set.Rules[0].ID != "first" || set.Rules[1].ID != "padded" {
+		t.Errorf("id не обрезаны: %+v", set.Rules)
+	}
+}
+
+// TestLoadDirDuplicateIDReported — при повторе id с дополнительной ошибкой
+// во втором правиле сообщается именно повтор: компаратор канонической
+// сортировки строгий, порядок равных id стабилен (insertion sort), и
+// невалидное правило не выскакивает на первое место, подменяя диагноз
+// «повтор id» собственной ошибкой.
+func TestLoadDirDuplicateIDReported(t *testing.T) {
+	_, err := LoadDir(writeRules(t, `
+rules:
+  - id: dup
+    target: html
+    regex: "x"
+    weight: 0.5
+  - id: dup
+    target: bogus
+    regex: "x"
+    weight: 0.5
+`))
+	if err == nil || !strings.Contains(err.Error(), "повтор id") {
+		t.Errorf("err = %v, хочу диагноз повтора id (не ошибку второго правила)", err)
+	}
+}
+
+// TestTargetNamesDeterministic — список допустимых target для сообщений
+// об ошибке: полный и строго отсортированный (порядок итерации map
+// случаен — сортировка делает текст детерминированным). Цикл покрывает
+// случайное совпадение порядка итерации с отсортированным.
+func TestTargetNamesDeterministic(t *testing.T) {
+	want := []string{"cookie_name", "cookie_value", "header_name", "header_value", "html", "meta"}
+	for range 50 {
+		if got := targetNames(); !slices.Equal(got, want) {
+			t.Fatalf("targetNames() = %v, want %v", got, want)
+		}
+	}
+	// Текст ошибки валидации называет полный список допустимых целей.
+	_, err := LoadDir(writeRules(t, `
+rules:
+  - id: bad_target
+    target: body
+    regex: "x"
+    weight: 0.5
+`))
+	if err == nil || !strings.Contains(err.Error(),
+		"(допустимы cookie_name, cookie_value, header_name, header_value, html, meta)") {
+		t.Errorf("err = %v, хочу полный список допустимых target", err)
 	}
 }

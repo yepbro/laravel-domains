@@ -241,14 +241,34 @@ func TestMatchRuleSkipsBadRules(t *testing.T) {
 		t.Error("паттерн сверх лимита не должен срабатывать")
 	}
 
+	// слишком длинный паттерн, который СОШЁЛСЯ бы: лимит отсекает его до
+	// компиляции — раздутый паттерн не должен матчиться даже при совпадении
+	longMatch := strings.Repeat("a", DefaultLimits().MaxPatternBytes+1)
+	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHTML, Regex: longMatch},
+		Page{HTML: []byte(strings.Repeat("a", 5000))}, DefaultLimits()); ok {
+		t.Error("паттерн сверх лимита не должен срабатывать даже при совпадении")
+	}
+
+	// match + некорректный regex: правило испорчено целиком, деградация
+	// до частичного применения (одно лишь точное совпадение) недопустима
+	if _, ok := matchRule(bgCtx(), Rule{Target: TargetCookieName, Match: "XSRF-TOKEN", Regex: `[unclosed`},
+		Page{Cookies: []Cookie{{Name: "XSRF-TOKEN"}}}, DefaultLimits()); ok {
+		t.Error("правило с некорректным regex не должно срабатывать по match")
+	}
+
 	// неизвестная цель — без паники и без срабатывания
 	if _, ok := matchRule(bgCtx(), Rule{Target: "body", Regex: "x"}, page, DefaultLimits()); ok {
 		t.Error("неизвестная цель не должна срабатывать")
 	}
 
-	// правило без match и regex — просто не матчится
+	// правило без match и regex — просто не матчится; по cookie-целям
+	// проверяется и ветка nil-regex в matches (html-цель её не зовёт)
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHTML}, page, DefaultLimits()); ok {
 		t.Error("пустое правило не должно срабатывать")
+	}
+	if _, ok := matchRule(bgCtx(), Rule{Target: TargetCookieName},
+		Page{Cookies: []Cookie{{Name: "a"}}}, DefaultLimits()); ok {
+		t.Error("пустое правило не должно срабатывать по cookie-цели")
 	}
 }
 

@@ -83,6 +83,12 @@ func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
 	for _, r := range s.Rules {
 		if ctx.Err() != nil {
 			res.Partial = true
+			// Эквивалентный мутант (T-M12): продолжение цикла после
+			// отмены безрезультатно — matchRule отвергает каждое правило
+			// по тому же ctx на входе, новые сигналы не появляются, отмена
+			// контекста необратима; итоговый Result идентичен (различие
+			// только в лишних итерациях).
+			// mutator-disable-next-line loop/break
 			break // бюджет времени исчерпан — что нашли, то нашли (неполно)
 		}
 		ev, ok := matchRule(ctx, r, page, lim)
@@ -232,6 +238,10 @@ func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool
 			// предыдущего тега
 			html := lim.htmlCap(page.HTML)
 			pos := 0
+			// Эквивалентный мутант (T-M12): итерация при pos == len(html)
+			// ищет по пустому срезу — FindIndex возвращает nil, цикл
+			// выходит тем же break'ом.
+			// mutator-disable-next-line expression/comparison
 			for pos < len(html) {
 				if ctx.Err() != nil {
 					return "", false

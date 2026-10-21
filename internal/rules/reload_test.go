@@ -6,9 +6,12 @@
 package rules
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +37,68 @@ func rewriteRules(t *testing.T, dir, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "rules.yaml"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// syncBuf — bytes.Buffer под замком: хендлер slog пишет синхронно, но
+// буфер читает тест после вызовов (паттерн T-M06).
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+// TestReloaderLogging — журнал жизненного цикла релоадера: начальная
+// загрузка, no-op перезагрузка, замена набора (с prev_version) и
+// сохранение прежнего набора при ошибке. Логи — наблюдаемое поведение
+// при эксплуатации (make logs), фиксируются текстовым хендлером.
+func TestReloaderLogging(t *testing.T) {
+	var logs syncBuf
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	dir := writeRules(t, reloadRules)
+	r, err := NewReloader(dir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := logs.String(); !strings.Contains(s, `msg="набор правил загружен"`) ||
+		!strings.Contains(s, "rules=1") || !strings.Contains(s, "rules_version=") {
+		t.Errorf("лог начальной загрузки неполон:\n%s", s)
+	}
+
+	if err := r.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if s := logs.String(); !strings.Contains(s, `msg="набор правил не изменился"`) {
+		t.Errorf("лог no-op перезагрузки отсутствует:\n%s", s)
+	}
+
+	rewriteRules(t, dir, reloadRulesV2)
+	if err := r.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if s := logs.String(); !strings.Contains(s, `msg="набор правил перезагружен"`) ||
+		!strings.Contains(s, "prev_version=") {
+		t.Errorf("лог замены набора неполон (нужен prev_version):\n%s", s)
+	}
+
+	rewriteRules(t, dir, "rules: [\n")
+	if err := r.Reload(); err == nil {
+		t.Fatal("ожидалась ошибка перезагрузки")
+	}
+	if s := logs.String(); !strings.Contains(s, "перезагрузка правил не удалась") {
+		t.Errorf("лог ошибки перезагрузки отсутствует:\n%s", s)
 	}
 }
 

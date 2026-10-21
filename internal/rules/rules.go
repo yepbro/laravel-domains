@@ -102,6 +102,11 @@ func LoadDir(dir string) (*Set, error) {
 			names = append(names, e.Name())
 		}
 	}
+	// Эквивалентный мутант (T-M12): os.ReadDir возвращает записи,
+	// отсортированные по имени (контракт stdlib), поэтому sort.Strings
+	// по уже отсортированному names ничего не меняет; сортировка остаётся
+	// защитой на случай смены способа чтения каталога.
+	// mutator-disable-next-line statement/remove
 	sort.Strings(names)
 	if len(names) == 0 {
 		return nil, fmt.Errorf("rules: в каталоге %s нет yaml-файлов", dir)
@@ -138,7 +143,10 @@ func LoadDir(dir string) (*Set, error) {
 	}
 
 	// Канонический порядок правил — по id: состав набора не зависит от
-	// разбиения на файлы и порядка внутри них.
+	// разбиения на файлы и порядка внутри них. Компаратор строгий («<»):
+	// при равных id порядок равных стабилен (insertion sort для малых n),
+	// поэтому повтор идентифицируется по второй записи — см.
+	// TestLoadDirDuplicateIDReported.
 	sort.Slice(set.Rules, func(i, j int) bool { return set.Rules[i].ID < set.Rules[j].ID })
 
 	if err := set.validate(); err != nil {
@@ -241,9 +249,24 @@ func canonicalHash(rules []Rule) int32 {
 		writeField(r.Match)
 		writeField(r.Regex)
 		// Каноническая запись вещественного: shortest round-trip, stable.
+		// Эквивалентный мутант (T-M12): prec −2 ведёт себя как −1 — в
+		// strconv «shortest»-режим активируется при prec < 0 (проверено
+		// на весах 1e−5…1: строки совпадают). Гасим только incrementer;
+		// decrementer (prec 0 — одна значащая цифра: 0.26 и 0.27 обе
+		// «0.3») убит тестом TestCanonicalHashWeightPrecision.
+		// mutator-disable-next-line numbers/incrementer
 		writeField(strconv.FormatFloat(r.Weight, 'g', -1, 64))
 		writeField(r.VerMin)
 		writeField(r.VerMax)
+		// Эквивалентный мутант (T-M12): разделитель правил избыточен для
+		// контракта версии — кодирование «длина:значение» саморазделимо:
+		// разбор слева направо детерминирован (цифры до первого «:» —
+		// длина, за ними ровно N байт значения), правило — всегда 7 полей,
+		// поэтому конкатенация без «;» декодируется единственным образом.
+		// Контракт rules_version — только равенство одинаковых наборов и
+		// неравенство разных (переанализ по смене); абсолютное значение
+		// нигде не пиннуто и не интерпретируется, его изменение ненаблюдаемо.
+		// mutator-disable-next-line statement/remove
 		b.WriteByte(';')
 	}
 	h := fnv.New32a()
