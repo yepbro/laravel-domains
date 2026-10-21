@@ -393,8 +393,8 @@ func TestWaitLoopOverallDeadline(t *testing.T) {
 // транспорта chromedp (cdpfake_test.go; живой браузер не нужен): событие
 // загрузки закрывает load однократно, сетевые запросы сигнализируются в
 // reqs с буфером ровно waitReqsBuffer, отказ Network.enable возвращается
-// ошибкой, отмена контекста не порождает ни закрытия load, ни ложного
-// сигнала reqs.
+// ошибкой, отмена контекста и ошибка декодирования события не порождают
+// ни закрытия load, ни ложного сигнала reqs.
 func TestWaitSubscribe(t *testing.T) {
 	t.Run("событие загрузки закрывает load однократно", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
@@ -455,10 +455,28 @@ func TestWaitSubscribe(t *testing.T) {
 		cancel()
 		// Ошибка итератора — терминальная: насосы выходят молча, без
 		// закрытия load и без ложного сигнала reqs.
+		//
+		// Окно негативной проверки — щедрое (1 с, не 100 мс). Мутант
+		// wait.go.6 (branch/if, checksum bf3a81de80cc2c57e11a60cf904c367c)
+		// вырезает return при err != nil и проваливается в close(evs.load)
+		// — если ошибка итератора вообще доставлена, закрытие приходит за
+		// микросекунды, но под CPU-нагрузкой мутационного прогона
+		// (сотни идущих подряд go test) планировщик может задержать
+		// доставку за пределы короткого окна. 1 с × ~455 мутантов пакета
+		// ≈ +8 мин к мутационному прогону render — приемлемая плата.
+		//
+		// Важно: эта проверка — лишь страховка, kill мутантов wait.go.6/.7
+		// держит смежный субтест с ошибкой декодирования ниже. Отмена ctx —
+		// в принципе гонка в teardown chromedp (v0.21.0): endingSession
+		// закрывает канал подписки через context.AfterFunc, и select
+		// итератора cdp.Events видит обе готовые ветки — ctx.Done()
+		// (yield ошибки) и закрытый канал (тихий выход без ошибки); выбор
+		// случаен, поэтому здесь мутант убивается лишь с вероятностью ~50–90%
+		// (замерено: 35/40 на тихой машине), каким бы ни было окно.
 		select {
 		case <-evs.load:
 			t.Fatal("отмена контекста закрыла канал load")
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(1 * time.Second):
 		}
 		n := 0
 		draining := true
@@ -472,6 +490,49 @@ func TestWaitSubscribe(t *testing.T) {
 		}
 		if n != 0 {
 			t.Errorf("отмена контекста дала %d ложных сигналов reqs, хочу 0", n)
+		}
+	})
+
+	t.Run("ошибка декодирования события останавливает насосы", func(t *testing.T) {
+		ctx, tr := newFakeCDPContext(t)
+		wctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		evs, err := waitSubscribe(wctx)
+		if err != nil {
+			t.Fatalf("waitSubscribe: %v", err)
+		}
+		// Полезная нагрузка, не декодируемая в тип события: итератор
+		// cdp.Events сам yields ошибку декодирования (jsonv2.Unmarshal) и
+		// завершает итерацию — терминальная ошибка насосов, как и отмена
+		// ctx, но БЕЗ гонки teardown: подписка жива, канал не закрыт, у
+		// select итератора одна готовая ветка. Поэтому kill здесь
+		// детерминирован и не зависит от планировщика:
+		//
+		//   - оригинал: if err != nil → return — насосы молча выходят;
+		//   - мутанты wait.go.6/.7 (вырезанный return): проваливаются в
+		//     тело цикла — close(evs.load) / ложный сигнал reqs.
+		//
+		// Проверка негативная (у оригинала — тишина), окно 1 с: реакция
+		// мутантов приходит in-memory за микросекунды после fireSession.
+		tr.fireSession("Page.loadEventFired", `[1]`)
+		tr.fireSession("Network.requestWillBeSent", `[1]`)
+		select {
+		case <-evs.load:
+			t.Fatal("ошибка декодирования закрыла канал load")
+		case <-time.After(1 * time.Second):
+		}
+		n := 0
+		draining := true
+		for draining {
+			select {
+			case <-evs.reqs:
+				n++
+			default:
+				draining = false
+			}
+		}
+		if n != 0 {
+			t.Errorf("ошибка декодирования дала %d ложных сигналов reqs, хочу 0", n)
 		}
 	})
 }
