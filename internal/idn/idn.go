@@ -154,6 +154,14 @@ func Normalize(name string) (Result, error) {
 	// метка: у example.co.uk зона co.uk.
 	zone, _ := publicsuffix.PublicSuffix(ascii)
 	label := strings.TrimSuffix(strings.TrimSuffix(ascii, zone), ".")
+	// zone == "" недостижимо: normalizeASCII гарантирует непустой ASCII
+	// без пустых меток и завершающих точек, а publicsuffix таким входам
+	// всегда отдаёт непустой суффикс (правило «*» — последняя метка);
+	// проверка — защита от будущих изменений PSL, мутант «zone == "" →
+	// false» эквивалентен. Аннотация на строке глушит и убиваемую
+	// половину label == "" (тест «com»): trade-off гранулярности,
+	// docs/mutation-testing.md §4.
+	// mutator-disable-next-line expression/remove
 	if zone == "" || label == "" {
 		return Result{}, newErr(ErrNoLabel, name, nil)
 	}
@@ -209,6 +217,13 @@ func normalizeASCII(name string) (string, error) {
 	// декодируется в пустоту — поведение golang.org/x/net v0.61) и не
 	// проверяет длины — контролируем сами (ТЗ 5.2 пп. 3–4); поведение
 	// закреплено тестами (TestNormalizeInvalid), здесь — страховка.
+	// Ветка достижима входом «xn--» (Lookup декодирует его в пустоту,
+	// ToASCII("xn--") = "", nil) и входом из полностью игнорируемых
+	// маппингом символов (BOM/U+00AD/U+200B/U+2060): в обоих случаях
+	// ascii == "" и Split("", ".") ниже даёт [""] — следующая проверка
+	// отвечает той же ошибкой «пустая метка» с теми же Kind/Name/
+	// причиной, мутант вырезания return эквивалентен.
+	// mutator-disable-next-line branch/if
 	if ascii == "" {
 		return "", newErr(ErrInvalid, name, errors.New("пустая метка"))
 	}
@@ -235,10 +250,19 @@ func normalizeASCII(name string) (string, error) {
 // ZWNJ/ZWJ (U+200C/U+200D) проходят только по контекстным правилам
 // (CONTEXTJ), U+180E — disallowed; корпус — corpus_test.go (T-010).
 func cleanup(name string) string {
+	// Быстрый путь — чистая оптимизация: IndexFunc для имени без пробелов
+	// отвечает -1, «< 0 → < -1» переводит безпробельное имя на медленный
+	// путь, который фильтрует только пробелы (их нет) и применяет тот же
+	// TrimRight(ToLower) — результат неотличим; вырезание return — то же
+	// самое в обратную сторону (branch/if ключуется строкой if). Grow —
+	// подсказка ёмкости, на результате не сказывается. Три эквивалентных
+	// мутанта.
+	// mutator-disable-next-line numbers/decrementer, branch/if
 	if strings.IndexFunc(name, unicode.IsSpace) < 0 {
 		return strings.TrimRight(strings.ToLower(name), ".")
 	}
 	var b strings.Builder
+	// mutator-disable-next-line statement/remove
 	b.Grow(len(name))
 	for _, r := range name {
 		if !unicode.IsSpace(r) {

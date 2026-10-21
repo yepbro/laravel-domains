@@ -90,6 +90,27 @@ func TestDNSMaskLimits(t *testing.T) {
 	}
 }
 
+// TestDNSMaskErrorValue — при ошибке конструктор возвращает нулевую
+// маску (конвенция нулевого значения; мутанты ±1 давали бы -1/1).
+func TestDNSMaskErrorValue(t *testing.T) {
+	m, err := NewDNSMask(63)
+	if err == nil {
+		t.Fatal("NewDNSMask(63): want ошибка")
+	}
+	if m != 0 {
+		t.Errorf("NewDNSMask(63) = %d, want 0 при ошибке", int64(m))
+	}
+}
+
+// TestDNSMaskTestOutsideRange — недопустимый номер не установлен даже у
+// всеединичной (отрицательной) маски: бита 63 не существует, проверка
+// диапазона в Test отсекает его до обращения к маске.
+func TestDNSMaskTestOutsideRange(t *testing.T) {
+	if DNSMask(-1).Test(63) {
+		t.Error("DNSMask(-1).Test(63) = true, want false (63 вне 0..62)")
+	}
+}
+
 // TestDNSMaskAtomicOnError — ошибка в любом номере не меняет маску
 // (проверка всех номеров до применения).
 func TestDNSMaskAtomicOnError(t *testing.T) {

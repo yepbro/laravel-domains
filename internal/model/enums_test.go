@@ -96,6 +96,20 @@ func TestParseStatusErrors(t *testing.T) {
 	}
 }
 
+// TestParseErrorZeroCode — при ошибке разбора возвращается нулевой код
+// (конвенция нулевого значения Go). Для Scheme пин содержателен: 0 —
+// невалидный код, мутант ±1 давал бы валидный SchemeHTTP(1) — ядовито
+// при игнорировании err вызывающим; для Status 0 — валидный new,
+// пин фиксирует только конвенцию (вызывающий обязан проверять err).
+func TestParseErrorZeroCode(t *testing.T) {
+	if got, err := ParseStatus("nope"); err == nil || got != 0 {
+		t.Errorf("ParseStatus(ошибка) = %d, %v, want 0 и ошибка", int16(got), err)
+	}
+	if got, err := ParseScheme("ftp"); err == nil || got != 0 {
+		t.Errorf("ParseScheme(ошибка) = %d, %v, want 0 и ошибка", int16(got), err)
+	}
+}
+
 func TestCheckState(t *testing.T) {
 	want := []struct {
 		code int16

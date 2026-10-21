@@ -25,7 +25,10 @@ type Flags int16
 
 // Биты Flags.
 const (
-	// FlagIDN — бит 0: is_idn (ТЗ 5.2 п. 9).
+	// FlagIDN — бит 0: is_idn (ТЗ 5.2 п. 9). Сдвиг на ноль в обе стороны
+	// равен 1 (1<<0 == 1>>0) — битовый мутант строки эквивалентен,
+	// значение бита пинит TestFlagsBitsMatchSchema.
+	// mutator-disable-next-line arithmetic/bitwise
 	FlagIDN Flags = 1 << 0
 	// FlagRenderPending — бит 1: render_pending (ТЗ 5.6).
 	FlagRenderPending Flags = 1 << 1

@@ -474,6 +474,11 @@ func ComputeRates(t Throughput, pending, queued int64) Rates {
 		r.DomainsPerSec = float64(t.DoneToday) / t.ElapsedSec
 		if r.Remaining > 0 && r.DomainsPerSec > 0 {
 			r.ETASec = int64(math.Round(float64(r.Remaining) / r.DomainsPerSec))
+			// Кламп «минимум 1с»: до строки ETASec = Round(остаток/
+			// скорость) ≥ 0 при положительных операндах; ноль и единица
+			// дают 1, большее не меняется — «< 1» и «<= 1»/«< 2»
+			// неразличимы ни на одном достижимом значении.
+			// mutator-disable-next-line expression/comparison, numbers/incrementer
 			if r.ETASec < 1 {
 				r.ETASec = 1
 			}

@@ -78,6 +78,10 @@ func (m DNSMask) Test(id int) bool {
 // маски в терминах subdomains.id.
 func (m DNSMask) IDs() []int {
 	ids := make([]int, 0, MaxSubdomains)
+	// Границы итерации избыточны для результата: недопустимые номера
+	// (-1, 63) Test отсекает проверкой диапазона (false), лишние итерации
+	// цикла ничего не добавляют в ids — оба мутанта строки эквивалентны.
+	// mutator-disable-next-line expression/comparison, numbers/decrementer
 	for id := 0; id < MaxSubdomains; id++ {
 		if m.Test(id) {
 			ids = append(ids, id)

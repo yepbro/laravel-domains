@@ -114,6 +114,17 @@ type statusIngestSeed struct {
 	processedAt *time.Time
 }
 
+// statusGlitch — деградация формы ответа одного запроса (стиль фейков
+// monitor, T-M01/T-M02): ошибка самого Query, пустой набор строк (Next
+// сразу ложен), нечитаемая колонка первой строки (ошибка Scan), ошибка
+// итерации (rows.Err).
+type statusGlitch struct {
+	queryErr error
+	empty    bool
+	badRow   bool
+	rowsErr  error
+}
+
 // statusPool — db.DB без БД: живая семантика zoneStatsSQL (GROUP BY зоны,
 // pending без deleted, queued/done без фильтра статуса, LEFT JOIN — зона
 // без доменов остаётся, ORDER BY name), throughputSQL (готовые значения)
@@ -128,10 +139,14 @@ type statusPool struct {
 	ingest      []statusIngestSeed
 	now         time.Time // часы сервера БД для окон laravelTotalsSQL
 
+	// glitches — деградации ответов по тексту запроса.
+	glitches map[string]statusGlitch
+
 	mu        sync.Mutex
 	queryErr  error
 	queries   []string
 	execCalls int
+	closes    int // сколько раз закрыты set'ы строк (rows.Close)
 }
 
 var _ db.DB = (*statusPool)(nil)
@@ -156,6 +171,33 @@ func (p *statusPool) seedDomain(zone int16, state model.CheckState, stats model.
 func (p *statusPool) setQueryErr(err error) {
 	p.mu.Lock()
 	p.queryErr = err
+	p.mu.Unlock()
+}
+
+// setGlitch — включить деградацию ответа конкретного запроса.
+func (p *statusPool) setGlitch(sql string, g statusGlitch) {
+	p.mu.Lock()
+	if p.glitches == nil {
+		p.glitches = make(map[string]statusGlitch)
+	}
+	p.glitches[sql] = g
+	p.mu.Unlock()
+}
+
+// closeCount — сколько раз закрыты set'ы строк: FetchLaravelStats
+// закрывает первый set ДО второго запроса (без defer) — Close каждого
+// пути наблюдаем через счётчик.
+func (p *statusPool) closeCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closes
+}
+
+// bumpClose — счётчик Close из statusRows (вызывается вне замка Query:
+// set закрывает вызывающий после возврата Query).
+func (p *statusPool) bumpClose() {
+	p.mu.Lock()
+	p.closes++
 	p.mu.Unlock()
 }
 
@@ -186,17 +228,20 @@ func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows,
 	if p.queryErr != nil {
 		return nil, p.queryErr
 	}
+	if g := p.glitches[sql]; g.queryErr != nil {
+		return nil, g.queryErr
+	}
 	switch sql {
 	case zoneStatsSQL:
-		return p.zoneRows(), nil
+		return p.decorate(sql, p.zoneRowsData()), nil
 	case throughputSQL:
-		return statusRowsOf([]any{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour}), nil
+		return p.decorate(sql, [][]any{{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour}}), nil
 	case domainStatusSQL:
 		rows := make([][]any, len(p.domStatuses))
 		for i, s := range p.domStatuses {
 			rows[i] = []any{s.code, s.count}
 		}
-		return statusRowsOf(rows...), nil
+		return p.decorate(sql, rows), nil
 	case laravelTotalsSQL:
 		var last24h int64
 		for _, l := range p.laravel {
@@ -204,18 +249,48 @@ func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows,
 				last24h++
 			}
 		}
-		return statusRowsOf([]any{int64(len(p.laravel)), last24h}), nil
+		return p.decorate(sql, [][]any{{int64(len(p.laravel)), last24h}}), nil
 	case laravelRecentSQL:
-		return p.laravelRows(), nil
+		// Модель pool_size=1: второй запрос при открытом первом set
+		// занял бы единственное соединение (дедлок, комментарий
+		// FetchLaravelStats) — фейк требует, чтобы первый set был закрыт
+		// ДО второго запроса: порядок, а не только сумма Close.
+		if p.closes != 1 {
+			return nil, fmt.Errorf("statusPool: laravelRecentSQL при %d закрытых set'ах, want 1 (первый set закрывается до второго запроса)", p.closes)
+		}
+		return p.decorate(sql, p.laravelRowsData()), nil
 	case ingestRecentSQL:
-		return p.ingestRows(), nil
+		return p.decorate(sql, p.ingestRowsData()), nil
 	default:
 		return nil, fmt.Errorf("statusPool: неожидаемый SQL Query: %s", sql)
 	}
 }
 
-// zoneRows применяет семантику zoneStatsSQL к сидам.
-func (p *statusPool) zoneRows() pgx.Rows {
+// statusBadColumn — маркер нечитаемой колонки: Scan фейка отвечает
+// ошибкой (как pgx на несовместимый тип приёмника).
+type statusBadColumn struct{}
+
+// decorate собирает statusRows запроса с его деградацией: empty — набор
+// без строк (Next сразу ложен), badRow — первая строка с нечитаемой
+// колонкой (ошибка Scan), rowsErr — ошибка итерации; Close считается
+// в пул (наблюдаемость закрытия set'а).
+func (p *statusPool) decorate(sql string, rows [][]any) *statusRows {
+	r := &statusRows{rows: rows, onClose: p.bumpClose}
+	g := p.glitches[sql]
+	if g.empty {
+		r.rows = nil
+	}
+	if g.badRow && len(r.rows) > 0 {
+		row := append([]any(nil), r.rows[0]...)
+		row[0] = statusBadColumn{}
+		r.rows[0] = row
+	}
+	r.err = g.rowsErr
+	return r
+}
+
+// zoneRowsData применяет семантику zoneStatsSQL к сидам.
+func (p *statusPool) zoneRowsData() [][]any {
 	pending := make(map[int16]int64)
 	queued := make(map[int16]int64)
 	done := make(map[int16]int64)
@@ -242,12 +317,12 @@ func (p *statusPool) zoneRows() pgx.Rows {
 		rows[i] = []any{z.id, z.name, uni, z.active, z.total, z.checked,
 			pending[z.id], queued[z.id], done[z.id]}
 	}
-	return statusRowsOf(rows...)
+	return rows
 }
 
-// laravelRows применяет семантику laravelRecentSQL: JOIN домена и зоны по
-// ключу строки, сортировка по updated_at DESC, LIMIT 10.
-func (p *statusPool) laravelRows() pgx.Rows {
+// laravelRowsData применяет семантику laravelRecentSQL: JOIN домена и
+// зоны по ключу строки, сортировка по updated_at DESC, LIMIT 10.
+func (p *statusPool) laravelRowsData() [][]any {
 	names := make(map[int16]string, len(p.zones))
 	for _, z := range p.zones {
 		names[z.id] = z.name
@@ -262,12 +337,12 @@ func (p *statusPool) laravelRows() pgx.Rows {
 		rows[i] = []any{l.label + "." + names[l.zone], names[l.zone],
 			l.score, l.verMin, l.verMax, l.updatedAt}
 	}
-	return statusRowsOf(rows...)
+	return rows
 }
 
-// ingestRows применяет семантику ingestRecentSQL: processed_at DESC
+// ingestRowsData применяет семантику ingestRecentSQL: processed_at DESC
 // (NULL последними), id DESC внутри одной секунды, LIMIT 10.
-func (p *statusPool) ingestRows() pgx.Rows {
+func (p *statusPool) ingestRowsData() [][]any {
 	sorted := append([]statusIngestSeed(nil), p.ingest...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		pi, pj := sorted[i].processedAt, sorted[j].processedAt
@@ -289,23 +364,29 @@ func (p *statusPool) ingestRows() pgx.Rows {
 	for i, s := range sorted {
 		rows[i] = []any{s.path, s.action, s.lines, s.added, s.existed, s.deleted, s.rejected, s.processedAt}
 	}
-	return statusRowsOf(rows...)
+	return rows
 }
 
 // statusRows — pgx.Rows с заготовленными строками (Scan позиционный,
 // типы int16/string/bool/int64/float32/float64/[]byte и указатели для
 // NULL-колонок — одинарные значения и двойные для разворота NULL).
+// Счётчик Close считает вызовы Close (не состояние соединения): явные
+// закрытия set'ов наблюдаются по одному на каждый путь выхода.
 // Копия общего фейка тестов CLI (cmd/crawlerctl): тест-файлы разных
 // пакетов не импортируют друг друга.
 type statusRows struct {
-	rows [][]any
-	i    int
+	rows    [][]any
+	i       int
+	err     error  // ответ Err — деградация итерации
+	onClose func() // счётчик Close пула
 }
 
-func statusRowsOf(rows ...[]any) *statusRows { return &statusRows{rows: rows} }
-
-func (r *statusRows) Close()                                       {}
-func (r *statusRows) Err() error                                   { return nil }
+func (r *statusRows) Close() {
+	if r.onClose != nil {
+		r.onClose()
+	}
+}
+func (r *statusRows) Err() error                                   { return r.err }
 func (r *statusRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (r *statusRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *statusRows) Values() ([]any, error)                       { return r.rows[r.i-1], nil }
@@ -331,6 +412,9 @@ func (r *statusRows) Scan(dest ...any) error {
 	}
 	for i, d := range dest {
 		v := row[i]
+		if _, bad := v.(statusBadColumn); bad {
+			return fmt.Errorf("statusRows: колонка %d нечитаема", i)
+		}
 		switch dst := d.(type) {
 		case *int16:
 			*dst = v.(int16)
@@ -506,6 +590,55 @@ func TestStatusFetchErrors(t *testing.T) {
 	}
 }
 
+// TestFetchRowDegradations — деградации формы ответа на уровне строк
+// (стиль фейков monitor): нечитаемая колонка — ошибка Scan с контекстом
+// «чтение», ошибка итерации (rows.Err) — ошибка выборки целиком с
+// исходным текстом; пустой скалярный агрегат темпа — «пустой ответ»,
+// а не «чтение» (мутанты вырезания return глотали бы ошибку или
+// подменяли её текст).
+func TestFetchRowDegradations(t *testing.T) {
+	cases := []struct {
+		name    string
+		sql     string
+		glitch  statusGlitch
+		wantErr string
+	}{
+		{"зоны: нечитаемая строка", zoneStatsSQL, statusGlitch{badRow: true}, "status: зоны: чтение:"},
+		{"зоны: ошибка итерации", zoneStatsSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: зоны: соединение сброшено"},
+		{"темп: пустой ответ", throughputSQL, statusGlitch{empty: true}, "status: темп: пустой ответ"},
+		{"темп: нечитаемая строка", throughputSQL, statusGlitch{badRow: true}, "status: темп: чтение:"},
+		{"темп: ошибка итерации", throughputSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: темп: соединение сброшено"},
+		{"статусы: нечитаемая строка", domainStatusSQL, statusGlitch{badRow: true}, "status: статусы: чтение:"},
+		{"статусы: ошибка итерации", domainStatusSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: статусы: соединение сброшено"},
+		{"ingest: нечитаемая строка", ingestRecentSQL, statusGlitch{badRow: true}, "status: ingest: чтение:"},
+		{"ingest: ошибка итерации", ingestRecentSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: ingest: соединение сброшено"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newStatusPool()
+			pool.seedZone(1, "crawl.test", true, 1, 0)
+			pool.seedDomain(1, model.CheckStatePending, model.StatusNew)
+			pool.domStatuses = []statusStatusSeed{{int16(model.StatusNew), 1}}
+			pool.ingest = []statusIngestSeed{{id: 1}}
+			pool.setGlitch(tc.sql, tc.glitch)
+			var err error
+			switch tc.sql {
+			case zoneStatsSQL:
+				_, err = FetchZoneStats(context.Background(), pool)
+			case throughputSQL:
+				_, err = FetchThroughput(context.Background(), pool)
+			case domainStatusSQL:
+				_, err = FetchDomainStatuses(context.Background(), pool)
+			case ingestRecentSQL:
+				_, err = FetchIngestReports(context.Background(), pool)
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ошибка = %v, want содержит %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // --- очереди -------------------------------------------------------------------
 
 // TestFetchQueueLens — все рабочие стримы в порядке ТЗ 4.2; ошибка
@@ -617,6 +750,12 @@ func TestFetchLaravelStats(t *testing.T) {
 	if calls := pool.calls(); !reflect.DeepEqual(calls, []string{wantLaravelTotalsSQL, wantLaravelRecentSQL}) {
 		t.Fatalf("запросы = %q, хочу [laravelTotalsSQL laravelRecentSQL]", calls)
 	}
+	// Первый set закрывается ДО второго запроса, второй — defer: ровно
+	// два Close на успешном проходе (удержание set'а занимало бы
+	// соединение пула — комментарий FetchLaravelStats).
+	if n := pool.closeCount(); n != 2 {
+		t.Errorf("закрытий set'ов = %d, want 2 (агрегат до второго запроса + последние через defer)", n)
+	}
 	if st.Total != 3 || st.Last24h != 1 {
 		t.Errorf("счётчики = %d/%d, хочу 3/1 (окно 24 ч по updated_at)", st.Total, st.Last24h)
 	}
@@ -648,6 +787,83 @@ func TestFetchLaravelStats(t *testing.T) {
 	}
 	if _, err := FetchLaravelStats(context.Background(), nil); err == nil {
 		t.Error("FetchLaravelStats(nil) = nil, хочу ошибку")
+	}
+}
+
+// TestFetchLaravelStatsDegradations — деградации обоих запросов секции:
+// пустой агрегат различает rows-ошибку (реальная причина ценнее
+// синтетической) и честное «пусто»; первый set закрывается ДО второго
+// запроса (без defer) — Close каждого пути выхода виден счётчиком
+// фейка (мутанты вырезания rows.Close глотали бы закрытие set'а,
+// вырезание return — ошибку целиком).
+func TestFetchLaravelStatsDegradations(t *testing.T) {
+	seeded := func(glitches map[string]statusGlitch) *statusPool {
+		pool := newStatusPool()
+		pool.seedZone(1, "crawl.test", true, 0, 0)
+		pool.laravel = []statusLaravelSeed{{zone: 1, domain: 1, label: "shop", updatedAt: pool.now}}
+		for sql, g := range glitches {
+			pool.setGlitch(sql, g)
+		}
+		return pool
+	}
+	ctx := context.Background()
+
+	// Пустой агрегат без rows-ошибки — честное «пусто».
+	pool := seeded(map[string]statusGlitch{laravelTotalsSQL: {empty: true}})
+	_, err := FetchLaravelStats(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: пустой ответ агрегата") {
+		t.Fatalf("пустой агрегат: ошибка = %v, want «пустой ответ агрегата»", err)
+	}
+	if n := pool.closeCount(); n != 1 {
+		t.Errorf("пустой агрегат: Close = %d, want 1 (set закрыт до синтетической ошибки)", n)
+	}
+
+	// Пустой агрегат с rows-ошибкой — ошибка уровня строк ценнее.
+	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {empty: true, rowsErr: errors.New("соединение сброшено")}})
+	_, err = FetchLaravelStats(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: соединение сброшено") {
+		t.Fatalf("пустой агрегат с rows-ошибкой: ошибка = %v, want причину уровня строк", err)
+	}
+
+	// Нечитаемая строка агрегата: set закрывается до возврата ошибки.
+	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {badRow: true}})
+	_, err = FetchLaravelStats(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: чтение:") {
+		t.Fatalf("нечитаемая строка агрегата: ошибка = %v, want «чтение»", err)
+	}
+	if n := pool.closeCount(); n != 1 {
+		t.Errorf("нечитаемая строка агрегата: Close = %d, want 1", n)
+	}
+
+	// Ошибка итерации агрегата — после успешного Scan, set закрыт.
+	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {rowsErr: errors.New("соединение сброшено")}})
+	_, err = FetchLaravelStats(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: соединение сброшено") {
+		t.Fatalf("ошибка итерации агрегата: ошибка = %v, want причину уровня строк", err)
+	}
+	if n := pool.closeCount(); n != 1 {
+		t.Errorf("ошибка итерации агрегата: Close = %d, want 1", n)
+	}
+
+	// Ошибка второго запроса — контекст «последние».
+	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {queryErr: errors.New("бд недоступна")}})
+	_, err = FetchLaravelStats(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: последние: бд недоступна") {
+		t.Fatalf("ошибка второго запроса: ошибка = %v, want «последние»", err)
+	}
+
+	// Нечитаемая строка последних находок.
+	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {badRow: true}})
+	_, err = FetchLaravelStats(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: последние: чтение:") {
+		t.Fatalf("нечитаемая строка последних: ошибка = %v, want «чтение»", err)
+	}
+
+	// Ошибка итерации последних находок.
+	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {rowsErr: errors.New("соединение сброшено")}})
+	_, err = FetchLaravelStats(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: последние: соединение сброшено") {
+		t.Fatalf("ошибка итерации последних: ошибка = %v, want причину уровня строк", err)
 	}
 }
 
@@ -776,12 +992,31 @@ func TestComputeRates(t *testing.T) {
 		t.Errorf("пустой цикл: ETA = %d (%v), хочу 0 (известна)", r.ETASec, r.ETAKnown)
 	}
 
+	// Пустой цикл при известной ненулевой скорости: ETA остаётся 0 —
+	// ветка расчёта требует положительный остаток, кламп «минимум 1с»
+	// на нулевом остатке не действует (мутант «> 0 → >= 0» поднял бы 1).
+	r = ComputeRates(Throughput{DoneToday: 600, ElapsedSec: 600}, 0, 0)
+	if !r.DomainsKnown || r.DomainsPerSec != 1 {
+		t.Errorf("пустой цикл при скорости: Known=%v speed=%v, хочу известную 1", r.DomainsKnown, r.DomainsPerSec)
+	}
+	if !r.ETAKnown || r.ETASec != 0 {
+		t.Errorf("пустой цикл при скорости: ETA = %d (%v), хочу 0 (известна)", r.ETASec, r.ETAKnown)
+	}
+
 	// Округление вверх/вниз и минимум: 100/3 = 33.3 → 33; 1/3 = 0.3 → 1.
 	if r := ComputeRates(Throughput{DoneToday: 3000, ElapsedSec: 1000}, 100, 0); r.ETASec != 33 {
 		t.Errorf("ETA 100/3 = %d, хочу 33", r.ETASec)
 	}
 	if r := ComputeRates(Throughput{DoneToday: 3000, ElapsedSec: 1000}, 1, 0); r.ETASec != 1 {
 		t.Errorf("ETA 1/3 = %d, хочу минимум 1", r.ETASec)
+	}
+}
+
+// TestMinSpeedWindowSec — лимит окна пин литералом: адаптивные проверки
+// TestComputeRates используют константу и мутанта ±1 не замечают.
+func TestMinSpeedWindowSec(t *testing.T) {
+	if MinSpeedWindowSec != 600 {
+		t.Errorf("MinSpeedWindowSec = %d, want 600 (10 минут, ТЗ 3.3)", MinSpeedWindowSec)
 	}
 }
 
@@ -795,11 +1030,19 @@ func TestFormatDuration(t *testing.T) {
 		{45, "45с"},
 		{59, "59с"},
 		{60, "1м"},
+		{89, "1м"},    // (89+30)/60 = 1: граница округления к минуте
 		{90, "2м"},    // округление к минуте
 		{3599, "60м"}, // 59м59с → 60м
 		{3600, "1ч 00м"},
+		{5370, "1ч 29м"}, // 1ч29м30с: минуты от остатка, не от полного числа
+		{7199, "1ч 59м"}, // 1ч59м59с: час — полные 3600-секундные блоки
 		{19200, "5ч 20м"},
+		{86399, "23ч 59м"}, // край ветки часов: сутки ещё не начались
 		{86400, "1д 0ч"},
+		{89999, "1д 0ч"},   // 1д 0ч59м59с: час от остатка суток
+		{93599, "1д 1ч"},   // 1д 1ч59м59с
+		{93600, "1д 2ч"},   // ровно 1д 2ч
+		{172799, "1д 23ч"}, // 1д 23ч59м59с: край перед «2д»
 		{275400, "3д 4ч"},
 	}
 	for _, tc := range cases {

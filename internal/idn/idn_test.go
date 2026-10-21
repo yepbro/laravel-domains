@@ -199,6 +199,7 @@ func TestToUnicode(t *testing.T) {
 		{"xn--bcher-kva.com", "bücher.com"},
 		{"example.com", "example.com"}, // без punycode — как есть
 		{"!!!garbage", "!!!garbage"},   // ошибка декодирования — вход
+		{"xn--", "xn--"},               // пустой результат декодирования — вход, не пустая строка
 		{"", ""},                       // пустая строка — пустой ответ
 	}
 	for _, tc := range tests {
@@ -217,6 +218,7 @@ func TestHasXNLabel(t *testing.T) {
 		{"example.com", false},
 		{"XN--BCHER-KVA.com", true},     // регистр не важен
 		{"axn--foo.example.com", false}, // префикс не в начале метки
+		{"xn--", true},                  // метка ровно «xn--»: префикс совпадает целиком
 		{"", false},
 	}
 	for _, tc := range tests {
@@ -248,6 +250,17 @@ func TestError(t *testing.T) {
 	}
 	if msg := e.Error(); !strings.Contains(msg, "невалидное имя домена") || !strings.Contains(msg, "xn--bcher--kva.com") {
 		t.Errorf("Error() = %q, want класс и имя", msg)
+	}
+
+	// Формат Error() — точные строки, с причиной и без (мутант
+	// вырезания return терял бы причину, оставляя формат «: %v»).
+	withCause := &Error{Kind: ErrNameLen, Name: "x", Err: errors.New("причина")}
+	if got, want := withCause.Error(), `idn: имя длиннее 253 символов: "x": причина`; got != want {
+		t.Errorf("Error() с причиной = %q, want %q", got, want)
+	}
+	withoutCause := &Error{Kind: ErrEmpty, Name: "y"}
+	if got, want := withoutCause.Error(), `idn: пустое имя: "y"`; got != want {
+		t.Errorf("Error() без причины = %q, want %q", got, want)
 	}
 
 	// Класс извлекается из обёрнутой ошибки (fmt.Errorf %w).
@@ -296,5 +309,31 @@ func TestErrorNameTruncated(t *testing.T) {
 	}
 	if e.Name != boundary {
 		t.Errorf("Name обрезано: %d рун, want %d без обрезки", len([]rune(e.Name)), maxErrNameLen)
+	}
+
+	// Границы обрезки — литералами (проверки выше адаптивны через
+	// константу и мутанта ±1 не замечают): ровно 255 рун не режется,
+	// 256 — 255 рун + «…».
+	exactly := strings.Repeat("р", 255)
+	_, err = Normalize(exactly)
+	if err == nil {
+		t.Fatal("Normalize(255 р): нет ошибки")
+	}
+	if !errors.As(err, &e) {
+		t.Fatalf("ошибка %v не *idn.Error", err)
+	}
+	if e.Name != exactly {
+		t.Errorf("имя ровно в лимите обрезано: %d рун, want 255", len([]rune(e.Name)))
+	}
+	over := strings.Repeat("р", 256)
+	_, err = Normalize(over)
+	if err == nil {
+		t.Fatal("Normalize(256 р): нет ошибки")
+	}
+	if !errors.As(err, &e) {
+		t.Fatalf("ошибка %v не *idn.Error", err)
+	}
+	if want := strings.Repeat("р", 255) + "…"; e.Name != want {
+		t.Errorf("имя над лимитом = %d рун, want 255 рун + «…»", len([]rune(e.Name)))
 	}
 }
