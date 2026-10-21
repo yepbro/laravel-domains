@@ -245,7 +245,10 @@ fmt: ## gofmt + go vet (в контейнере)
 .PHONY: mod-download
 mod-download: ## Докачать Go-модули в общий кэш (нужен интернет; tools его имеет)
 	$(check_env)
-	$(COMPOSE) run --rm tools go mod download all
+	@# Без all: качаем только модули, нужные для сборки пакетов проекта.
+	@# go mod download all скачал бы весь транзитивный граф (migrate требует
+	@# драйверы всех СУБД) и дописал бы их h1-хэши в go.sum (~350 строк шума).
+	$(COMPOSE) run --rm tools go mod download
 
 # --------------------------------------------------------------- БД
 # Сервисы применяют миграции автоматически при старте (internal/migrate);
