@@ -11,6 +11,8 @@
 //   - длины в ASCII-форме: метка ≤ 63, полное имя ≤ 253 (п. 4);
 //   - отделение зоны по списку публичных суффиксов publicsuffix (п. 5):
 //     составные зоны (co.uk) не режутся по последней точке;
+//   - числовая зона отвергается: TLD из одних цифр не существует (IANA),
+//     иначе через вывод зоны прошли бы даты выгрузок и IPv4-литералы;
 //   - признак is_idn — метка имени содержит xn-- (п. 9): бит 0
 //     domains.flags (model.FlagIDN, ТЗ 5.2 п. 9).
 //
@@ -56,15 +58,22 @@ const (
 	// ErrNoLabel — нет метки перед зоной: имя само — публичный суффикс
 	// (com, co.uk), домена из него не получается.
 	ErrNoLabel ErrorKind = "no_label"
+	// ErrNumericZone — публичный суффикс имени состоит только из цифр:
+	// числовых TLD не существует (IANA), а правило «*» publicsuffix
+	// отдаёт неизвестный числовой TLD как есть — без этой проверки
+	// через вывод зоны проходят даты выгрузок («18.06.1999» → зона
+	// 1999) и IPv4-литералы («1.2.3.4» → зона 4).
+	ErrNumericZone ErrorKind = "numeric_zone"
 )
 
 // kindDescriptions — тексты классов для Error() и String().
 var kindDescriptions = map[ErrorKind]string{
-	ErrEmpty:    "пустое имя",
-	ErrInvalid:  "невалидное имя домена",
-	ErrLabelLen: "метка длиннее 63 символов",
-	ErrNameLen:  "имя длиннее 253 символов",
-	ErrNoLabel:  "нет метки перед зоной",
+	ErrEmpty:       "пустое имя",
+	ErrInvalid:     "невалидное имя домена",
+	ErrLabelLen:    "метка длиннее 63 символов",
+	ErrNameLen:     "имя длиннее 253 символов",
+	ErrNoLabel:     "нет метки перед зоной",
+	ErrNumericZone: "числовая зона — таких TLD не существует",
 }
 
 // String возвращает текст класса (стиль model.Status.String).
@@ -153,6 +162,13 @@ func Normalize(name string) (Result, error) {
 	// п. 5: зона — публичный суффикс по publicsuffix, а не последняя
 	// метка: у example.co.uk зона co.uk.
 	zone, _ := publicsuffix.PublicSuffix(ascii)
+	// Числовая зона — не домен: даты выгрузок («18.06.1999») и
+	// IPv4-литералы («1.2.3.4») проходят UTS-46, а правило «*» PSL
+	// достраивает их до «зоны» из цифр — числовых TLD не существует
+	// (IANA). Числовая метка в буквенной зоне (123.com) — обычное имя.
+	if isNumericZone(zone) {
+		return Result{}, newErr(ErrNumericZone, name, nil)
+	}
 	label := strings.TrimSuffix(strings.TrimSuffix(ascii, zone), ".")
 	// zone == "" недостижимо: normalizeASCII гарантирует непустой ASCII
 	// без пустых меток и завершающих точек, а publicsuffix таким входам
@@ -172,6 +188,23 @@ func Normalize(name string) (Result, error) {
 		Label:   label,
 		IsIDN:   HasXNLabel(label),
 	}, nil
+}
+
+// isNumericZone — все метки зоны состоят только из цифр ASCII: числовых
+// TLD не существует (IANA), а правило «*» publicsuffix отдаёт неизвестный
+// числовый TLD как есть (зона «1999» у даты выгрузки, «4» у IPv4-литерала),
+// поэтому вывод зоны по PSL обязан такие суффиксы отвергать. Числовая метка
+// в буквенной зоне (123.com) зоной не является и имени не мешает.
+func isNumericZone(zone string) bool {
+	if zone == "" {
+		return false
+	}
+	for _, label := range strings.Split(zone, ".") {
+		if strings.Trim(label, "0123456789") != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // NormalizeZone нормализует имя зоны — каталог incoming/<зона> (ТЗ 5.1)

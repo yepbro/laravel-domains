@@ -41,6 +41,9 @@ func TestNormalizeValid(t *testing.T) {
 		{name: "foo.github.io", ascii: "foo.github.io", uni: "foo.github.io", zone: "github.io", label: "foo"},
 		// Граница п. 4: метка ровно 63 октета — валидна.
 		{name: strings.Repeat("a", 63) + ".com", ascii: strings.Repeat("a", 63) + ".com", uni: strings.Repeat("a", 63) + ".com", zone: "com", label: strings.Repeat("a", 63)},
+		// Числовая метка в буквенной зоне — обычное имя: числовых TLD нет,
+		// но зона здесь буквенная (мешает только числовая зона).
+		{name: "123.com", ascii: "123.com", uni: "123.com", zone: "com", label: "123"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -93,6 +96,11 @@ func TestNormalizeInvalid(t *testing.T) {
 		{"com", ErrNoLabel},
 		{"co.uk", ErrNoLabel},
 		{"github.io", ErrNoLabel}, // частный суффикс PSL
+		// п. 5: числовая зона — таких TLD не существует (правило «*» PSL
+		// отдаёт неизвестный числовой TLD как есть).
+		{"18.06.1999", ErrNumericZone}, // дата выгрузки регистратора
+		{"1.2.3.4", ErrNumericZone},    // IPv4-литерал
+		{"1999", ErrNumericZone},       // голый числовой TLD
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

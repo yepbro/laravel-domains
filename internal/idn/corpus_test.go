@@ -263,10 +263,6 @@ func TestNormalizeZonesPSL(t *testing.T) {
 		{"example.com.au", Result{"example.com.au", "example.com.au", "com.au", "example", false}},
 		{"a.b.example.com.au", Result{"a.b.example.com.au", "a.b.example.com.au", "com.au", "a.b.example", false}},
 		{"foo.appspot.com", Result{"foo.appspot.com", "foo.appspot.com", "appspot.com", "foo", false}},
-		// Метки вне диапазона IPv4 — это не IP (publicsuffix проверяет
-		// netip.ParseAddr), а имя с неизвестным TLD «666»: зона — последняя
-		// метка по правилу «*».
-		{"999.888.777.666", Result{"999.888.777.666", "999.888.777.666", "666", "999.888.777", false}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertNormalize(t, tc.name, tc.want)
@@ -279,13 +275,20 @@ func TestNormalizeZonesPSL(t *testing.T) {
 		{"com.au", ErrNoLabel},      // сам ICANN-суффикс
 		{"appspot.com", ErrNoLabel}, // сам частный суффикс PSL
 		// IP-литерал: publicsuffix распознаёт адрес (netip.ParseAddr) и
-		// возвращает его целиком как «суффикс» — метки нет. Для incoming-строк
-		// это правильно: IP — не домен зоны. Хосты из Location — отдельно,
-		// HostToASCII пропускает IP (ТЗ 5.2 п. 8).
-		{"192.0.2.1", ErrNoLabel},    // IPv4-литерал
-		{"8.8.8.8", ErrNoLabel},      // IPv4-литерал
-		{"москва", ErrNoLabel},       // сам публичный суффикс — TLD москва
-		{"xn--80adxhks", ErrNoLabel}, // TLD москва в punycode
+		// возвращает его целиком как «суффикс» — числовая зона, таких TLD
+		// не существует. Для incoming-строк это правильно: IP — не домен
+		// зоны. Хосты из Location — отдельно, HostToASCII пропускает IP
+		// (ТЗ 5.2 п. 8).
+		{"192.0.2.1", ErrNumericZone}, // IPv4-литерал
+		{"8.8.8.8", ErrNumericZone},   // IPv4-литерал
+		// Числовые «зоны» — не домены: TLD из цифр не существует (IANA),
+		// а правило «*» PSL отдаёт неизвестный числовый TLD как есть.
+		// Метки вне диапазона IPv4 — даже не адрес (netip.ParseAddr),
+		// но и не имя: числовая зона отклоняется.
+		{"999.888.777.666", ErrNumericZone},
+		{"18.06.1999", ErrNumericZone}, // дата выгрузки регистратора
+		{"москва", ErrNoLabel},         // сам публичный суффикс — TLD москва
+		{"xn--80adxhks", ErrNoLabel},   // TLD москва в punycode
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertNormalizeError(t, tc.name, tc.kind)

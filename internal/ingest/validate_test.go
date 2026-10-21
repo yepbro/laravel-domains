@@ -305,3 +305,38 @@ func TestValidatorZoneless(t *testing.T) {
 		t.Errorf("Finish = %+v, want принято %d, отклонено 2, не failed", res, len(cases)+1)
 	}
 }
+
+// TestValidatorZonelessNumericZone — числовая зона из PSL-вывода — не домен
+// (регрессия дампа .SU: кандидат-дата «18.06.1999» проходила валидацию,
+// выводилась в фиктивную зону 1999 и применялась как домен-дата). Дата и
+// IPv4-литерал отклоняются (numeric_zone), числовая метка в буквенной зоне
+// валидна, строка выгрузки с датой целиком — no_domain: имя-кандидат — сам
+// публичный суффикс (no_label), даты — numeric_zone.
+func TestValidatorZonelessNumericZone(t *testing.T) {
+	v, err := NewValidator(ValidatorOptions{File: "add/list.txt", MaxErrorRatio: 1})
+	if err != nil {
+		t.Fatalf("NewValidator: %v", err)
+	}
+	if _, reason, ok := v.Line(1, "18.06.1999"); ok || reason != ReasonNumericZone {
+		t.Errorf("строка-дата = ok=%v причина %s, want numeric_zone", ok, reason)
+	}
+	if _, reason, ok := v.Line(2, "1.2.3.4"); ok || reason != ReasonNumericZone {
+		t.Errorf("IPv4-литерал = ok=%v причина %s, want numeric_zone", ok, reason)
+	}
+	if e, _, ok := v.Line(3, "123.com"); !ok || e.Zone != "com" || e.Label != "123" {
+		t.Errorf("числовая метка в буквенной зоне = %+v ok=%v, want com/123", e, ok)
+	}
+	// Строка дампа .SU: sochi.su — сам публичный суффикс (no_label),
+	// даты полей — numeric_zone; ни один кандидат не прошёл — no_domain.
+	const line = "SOCHI.SU\tRUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1"
+	if _, reason, ok := v.Line(4, line); ok || reason != ReasonNoDomain {
+		t.Errorf("строка дампа = ok=%v причина %s, want no_domain", ok, reason)
+	}
+	res := v.Finish()
+	if res.Accepted != 1 || res.Rejected != 3 || res.Failed {
+		t.Errorf("Finish = %+v, want принято 1, отклонено 3, не failed", res)
+	}
+	if res.Reasons[ReasonNumericZone] != 2 || res.Reasons[ReasonNoDomain] != 1 || len(res.Reasons) != 2 {
+		t.Errorf("Reasons = %+v, want numeric_zone: 2, no_domain: 1", res.Reasons)
+	}
+}

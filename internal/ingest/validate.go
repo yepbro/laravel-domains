@@ -12,7 +12,9 @@
 // Зона-less файл (add|delete/<файл>): зона каждой строки выводится
 // из самого имени — publicsuffix-зона нормализованного результата
 // (idn.Result.Zone, ТЗ 5.2 п. 5); сверки с зоной пути нет (её не задано),
-// wrong_zone невозможна, зоны в одном файле смешиваются.
+// wrong_zone невозможна, зоны в одном файле смешиваются. Числовые
+// суффиксы (даты выгрузок, IPv4-литералы) зоной не становятся —
+// отклонение numeric_zone (idn.ErrNumericZone).
 //
 // T-132 (этап 16, расширение ТЗ 5.1): перед валидацией стоит шаг
 // извлечения (extract.go) — строка с разделителями (пробел, запятая,
@@ -59,6 +61,11 @@ const (
 	ReasonNameLen Reason = "name_len"
 	// ReasonNoLabel — метки перед зоной нет: имя само — зона.
 	ReasonNoLabel Reason = "no_label"
+	// ReasonNumericZone — публичный суффикс имени состоит только из цифр
+	// (класс idn.ErrNumericZone): числовых TLD не существует — даты
+	// выгрузок («18.06.1999») и IPv4-литералы («1.2.3.4») не проходят
+	// вывод зоны, фиктивных числовых зон не возникает.
+	ReasonNumericZone Reason = "numeric_zone"
 	// ReasonWrongZone — домен не из зоны пути (ТЗ 5.2 п. 6).
 	ReasonWrongZone Reason = "wrong_zone"
 	// ReasonNoDomain — в строке с посторонними данными (T-132) не
@@ -69,13 +76,14 @@ const (
 
 // reasonDescriptions — тексты причин для String (стиль idn.ErrorKind).
 var reasonDescriptions = map[Reason]string{
-	ReasonEmpty:     "пустое имя",
-	ReasonInvalid:   "невалидное имя домена",
-	ReasonLabelLen:  "метка длиннее 63 символов",
-	ReasonNameLen:   "имя длиннее 253 символов",
-	ReasonNoLabel:   "нет метки перед зоной",
-	ReasonWrongZone: "домен не из зоны пути",
-	ReasonNoDomain:  "домен в строке не найден",
+	ReasonEmpty:       "пустое имя",
+	ReasonInvalid:     "невалидное имя домена",
+	ReasonLabelLen:    "метка длиннее 63 символов",
+	ReasonNameLen:     "имя длиннее 253 символов",
+	ReasonNoLabel:     "нет метки перед зоной",
+	ReasonNumericZone: "числовая зона — таких TLD не существует",
+	ReasonWrongZone:   "домен не из зоны пути",
+	ReasonNoDomain:    "домен в строке не найден",
 }
 
 // String возвращает текст причины (стиль model.Status.String).

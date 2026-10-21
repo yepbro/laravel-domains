@@ -391,6 +391,67 @@ func TestPipelineZonelessAdd(t *testing.T) {
 	}
 }
 
+// TestPipelineZonelessNumericZone — фиктивные числовые зоны не возникают:
+// в зона-less файле строки-даты (кандидаты извлечения T-132 из полей
+// выгрузки) отклоняются, зона не выводится и не создаётся (регрессия
+// дампа .SU: строка «SOCHI.SU <регистратор> <дата>…» применялась как домен
+// «18.06.1999» с автоматической зоной 1999).
+func TestPipelineZonelessNumericZone(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "0-0.SU\tARDIS-SU\t17.11.2015\t17.11.2026\t20.12.2026\t1\n" +
+		"SOCHI.SU\tRUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1\n"
+	abs := pt.addFile(t, "add/su_dump.txt", content)
+
+	pt.pool.execs = []pipeExec{
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
+		{tag: pgconn.NewCommandTag("INSERT 1")}, // только 0-0.su
+		{tag: pgconn.NewCommandTag("UPDATE 0")}, // возвращать некого
+		{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
+	}
+	pt.pool.uniques = 1
+
+	// Половина строк отклонена — дефолтного порога 10% хватило бы
+	// «уронить» файл; здесь проверяется применение, а не порог.
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir:           pt.dir,
+		BatchSize:     10,
+		MaxErrorRatio: 0.5, // 1 отклонение из 2 — файл не роняется (строго выше)
+		Now:           func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.Kind != OutcomeApplied {
+		t.Fatalf("итог = %s, want applied", out.Kind)
+	}
+	rep := out.Report
+	if rep.LinesTotal != 2 || rep.Accepted != 1 || rep.Rejected != 1 || rep.Added != 1 {
+		t.Errorf("счётчики = %+v, want 2 строки, 1 валидная/добавлено, 1 отклонение", rep)
+	}
+	if rep.Reasons[ReasonNoDomain] != 1 || len(rep.Reasons) != 1 {
+		t.Errorf("Reasons = %+v, want ровно no_domain: 1", rep.Reasons)
+	}
+
+	// Единственная зона файла — su: фиктивная «1999» не создаётся.
+	if want := []string{"byName:su", "create:su"}; !reflect.DeepEqual(pt.zones.calls, want) {
+		t.Errorf("обращения к зонам = %v, want %v", pt.zones.calls, want)
+	}
+	// В staging ушла одна строка — домен su, не дата.
+	if len(pt.pool.copyVals) != 1 {
+		t.Fatalf("строк COPY = %d, want 1", len(pt.pool.copyVals))
+	}
+	if vals := pt.pool.copyVals[0]; vals[2] != "0-0" {
+		t.Errorf("метка COPY = %v, want 0-0 (не дата)", vals[2])
+	}
+	if !exists(t, filepath.Join(pt.dir, DirProcessed, "add/su_dump.txt")) {
+		t.Error("файл не перемещён в processed/")
+	}
+}
+
 // TestPipelineZonelessDuplicate — точная повторная доставка зона-less
 // файла: совпадение (NULL-зона, действие, sha256) — не применяется,
 // перемещается в processed без нового отчёта (T-113).
