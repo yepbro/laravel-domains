@@ -147,6 +147,25 @@ make reset-internet
 (`make mutate` с порогом score, отчёты — в artifact;
 [`docs/mutation-testing.md`](docs/mutation-testing.md)).
 
+## Боевой сервер
+
+Прод-развёртывание (T-135) — systemd-юниты, детали в
+[`docs/deploy.md`](docs/deploy.md), обновление — CI/CD
+([`docs/ci-cd.md`](docs/ci-cd.md)).
+
+| Параметр | Значение |
+|---|---|
+| IP | `155.212.174.88` (VDS 18561438, IXcellerate — Москва, `pulpirzvk.fvds.ru`) |
+| ОС | Ubuntu 24.04.5 LTS (ядро 6.8) |
+| CPU / RAM / диск | 4 vCPU / 8 ГБ / NVMe 80 ГБ |
+| Деплой | нативный systemd: 9 Go-сервисов + crawlerctl + Chromium, PostgreSQL 16 / Redis 7 / Unbound — пакеты ОС |
+
+Публичные входы (TLS — Let's Encrypt, nginx):
+
+- Лендинг EN: <https://sites.laravel.city> (основные/www-имена редиректятся)
+- Лендинг RU: <https://sites.laracity.ru>
+- Операторский дашборд: <https://dashboard.laracity.ru> (HTTP Basic; креды — у оператора, в конфигурации сервера)
+
 ## Структура
 
 Соответствует приложению А основного ТЗ; пакеты `internal/` наполняются
