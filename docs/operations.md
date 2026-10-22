@@ -59,13 +59,16 @@
    [`disks.md`](disks.md) §4.
 2. **Пакеты ОС** — `postgresql redis-server unbound smartmontools` +
    drop-in'ы бюджета памяти + роль/БД приложения + конфиг unbound:
-   [`deploy.md`](deploy.md) §4.1.
+   [`deploy.md`](deploy.md) §4.1 (зависимости Chromium headless-shell —
+   отдельный список там же, §4.3, ставятся на шаге 4).
 3. **Sysctl** — `deploy/sysctl/99-crawler.conf` в `/etc/sysctl.d`
    (порты/TIME_WAIT/conntrack/UDP-буферы):
    [`os-tuning.md`](os-tuning.md), `deploy/sysctl/README.md`.
 4. **Бинарники** — статические сборки в `/opt/crawler/bin` и Chromium
-   headless-shell в `/opt/crawler/chromium`: [`deploy.md`](deploy.md)
-   §4.2–4.3.
+   headless-shell в `/opt/crawler/chromium` с пакетами его зависимостей
+   (`libnspr4 libnss3 fontconfig` + шрифты: без шрифтового стека Skia
+   роняет браузер FATAL на части страниц — краш-луп до start-limit):
+   [`deploy.md`](deploy.md) §4.2–4.3.
 5. **Пользователи и каталоги** — `crawler-<сервис>` в группе `crawler`,
    рабочие каталоги с правами: [`deploy.md`](deploy.md) §4.4.
 6. **Конфигурация** — `/etc/crawler/config.yaml` (обязательные правки
@@ -78,8 +81,11 @@
 8. **Мониторинг SMART** — `deploy/smartd/`: [`deploy.md`](deploy.md)
    §4.8, [`disks.md`](disks.md) §6.
 9. **Проверка**: `systemctl list-units 'crawler-*'` (все active),
-   `curl -fsS 127.0.0.1:9100…9106/healthz`,
-   `/opt/crawler/bin/crawlerctl status`.
+   `curl -fsS 127.0.0.1:9100…9108/healthz`,
+   `/opt/crawler/bin/crawlerctl status`; шрифтовой стек —
+   `fc-list | grep -q . && echo "fonts ok" || echo "FONTS MISSING"`
+   (FONTS MISSING — шрифтов нет, рендер краш-лупом уйдёт в start-limit;
+   [`deploy.md`](deploy.md) §4.3).
 10. **Подать домены** — файлы в `/var/lib/crawler/incoming/`
     (контракт — [`incoming-files.md`](incoming-files.md)).
 

@@ -147,6 +147,9 @@ dev-сервиса chromium, docs/docker.md §6).
 apt install postgresql redis-server unbound smartmontools
 ```
 
+Зависимости Chromium headless-shell (`libnspr4 libnss3 fontconfig` +
+шрифты) — отдельным списком при его установке: §4.3 ниже.
+
 Drop-in'ы бюджета (копируются каталогами — имя каталога = имя юнита):
 
 ```bash
@@ -222,6 +225,33 @@ git подставляется `unknown`. Dev-сборки без `-X` оста�
 пакет/каталог вместо пакета ОС: версия браузера согласована с chromedp-стеком
 воркера, а Ubuntu-пакет chromium — snap-обёртка, непригодная для headless-CDP
 без user-data-dir ухищрений.
+
+На хост переносится только бинарь, а рассчитан он на окружение образа —
+после распаковки дистрибутива установите недостающие библиотеки и
+шрифтовой стек (до первого старта юнита, §4.6):
+
+```bash
+apt install libnspr4 libnss3 fontconfig fonts-liberation fonts-dejavu-core
+# библиотеки бинаря: libs ok — разрешаются; LIBS MISSING — not found/сбой ldd:
+ldd /opt/crawler/chromium/headless-shell 2>&1 \
+  | grep -E 'not found|No such file|not a dynamic' \
+  && echo "LIBS MISSING" || echo "libs ok"
+# шрифтовой стек: fonts ok — виден; FONTS MISSING — шрифтов нет:
+fc-list | grep -q . && echo "fonts ok" || echo "FONTS MISSING"
+```
+
+- `libnspr4 libnss3` — обязательные библиотеки для запуска бинаря (ставились
+  при физическом деплое T-135, до T-140 в этом списке отсутствовали);
+- `fontconfig fonts-liberation fonts-dejavu-core` — шрифтовой стек Skia:
+  без fontconfig часть страниц (требующих шрифтового стека) роняет
+  Chromium FATAL `SkFontMgr_FontConfigInterface: Not implemented`
+  (SIGTRAP) → краш-луп до start-limit (10 рестартов за 5 минут, §5) →
+  юнит failed, q:render копит попытки. В dev дефект невидим — fontconfig
+  и шрифты уже внутри образа `chromedp/headless-shell`, на голом хосте
+  их нет. Инцидент боевого замера T-092 и операционное исправление —
+  [`load-measurements.md`](load-measurements.md) §4; юнит, уже ушедший
+  в failed, после установки пакетов поднимается руками: `systemctl
+  reset-failed crawler-chromium && systemctl start crawler-chromium` (§5).
 
 ### 4.4. Пользователи и каталоги
 
