@@ -1,0 +1,86 @@
+name: deploy
+
+# CD-конвейер (T-135): деплой боевого сервера 155.212.174.88 после зелёного
+# ci на master. Запускается workflow_run по завершении ci (деплоится ровно
+# тот SHA, что протестирован) или вручную workflow_dispatch.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: build · upload · restart · healthz
+    # Только успех ci на push в master (или ручной запуск)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'master')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SSH_HOST: root@155.212.174.88
+      SSH_OPTS: -o UserKnownHostsFile=known_hosts.txt -o ConnectTimeout=15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # workflow_run: коммит, который проверял ci (git checkout по SHA)
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Подготовить .env (версия Tailwind/Alpine для web-css)
+        run: cp .env.example .env
+
+      - name: Собрать CSS лендинга (go:embed, deploy.md §4.2)
+        run: make web-css
+
+      - name: Собрать статические бинарники
+        run: |
+          version="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+          revision="$(git rev-parse --short HEAD)"
+          mkdir -p out
+          for svc in ingest scheduler dns-worker http-worker render-worker analyzer monitor web dashboard crawlerctl; do
+            CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X crawler/internal/metrics.buildMode=prod -X crawler/internal/metrics.buildVersion=$version -X crawler/internal/metrics.buildRevision=$revision" \
+              -o "out/$svc" "./cmd/$svc"
+          done
+          echo "version=$version revision=$revision" >> "$GITHUB_STEP_SUMMARY"
+          tar -C out -czf binaries.tar.gz .
+
+      - name: Настроить SSH
+        run: |
+          install -m 600 /dev/null id_ed25519
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > id_ed25519
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}" > known_hosts.txt
+
+      - name: Загрузить и установить
+        run: |
+          scp $SSH_OPTS -i id_ed25519 binaries.tar.gz "$SSH_HOST:/tmp/crawler-deploy.tar.gz"
+          ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s' -- < deploy/deploy-install.sh
+
+      - name: Проверить живость (healthz всех сервисов)
+        run: |
+          ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s' -- < deploy/deploy-healthcheck.sh
+
+      # При падении любой проверки после установки — откат на предыдущие
+      # бинарники (делает deploy-install.sh через trap) и красный ран.
+      - name: Диагностика (при падении)
+        if: failure()
+        run: |
+          ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" \
+            "systemctl list-units 'crawler-*' --no-legend; journalctl -t 'crawler-*' --no-pager -n 50" \
+            || true

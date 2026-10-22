@@ -121,6 +121,7 @@ make reset-internet
 | [`docs/runbooks.md`](docs/runbooks.md) | процедурные инструкции: переобучение словаря zstd, разбор `q:dead`, переанализ |
 | [`docs/mutation-testing.md`](docs/mutation-testing.md) | мутационное тестирование go-mutesting: охват и пороги `make mutate`, отчёты, гашение ложных мутантов, ночной CI-прогон |
 | [`docs/deploy.md`](docs/deploy.md) | боевой деплой systemd: юниты, бюджет памяти, установка |
+| [`docs/ci-cd.md`](docs/ci-cd.md) | непрерывный деплой: GitHub Actions после зелёного CI, откат, секреты |
 | [`docs/disks.md`](docs/disks.md) | диски боевого сервера: тома PostgreSQL и контента, SMART/TBW (ТЗ §10.3) |
 | [`docs/os-tuning.md`](docs/os-tuning.md) | тюнинг ОС боевого сервера: sysctl — эфемерные порты, TIME_WAIT, nofile, conntrack, UDP-буферы DNS (ТЗ §10.2) |
 

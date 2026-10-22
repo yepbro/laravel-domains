@@ -209,7 +209,11 @@ func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("content: каталог паков %s: %w", opts.Dir, err)
 	}
-	lock, err := os.OpenFile(filepath.Join(opts.Dir, packLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	// 0o660: lock и паки открывают на запись несколько юнитов группы
+	// crawler (http-worker, render-worker, analyzer — flock; docs/deploy.md
+	// §3, «права на пак-файлы 0660»); 0644 у первого создателя отрезало бы
+	// запись остальным в systemd-деплое (отдельный пользователь на сервис).
+	lock, err := os.OpenFile(filepath.Join(opts.Dir, packLockFile), os.O_CREATE|os.O_RDWR, 0o660)
 	if err != nil {
 		return nil, fmt.Errorf("content: файл блокировки %s: %w", filepath.Join(opts.Dir, packLockFile), err)
 	}
@@ -668,7 +672,9 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 	path := filepath.Join(s.opts.Dir, packFileName(id))
 	// O_APPEND: дописывание всегда в конец файла независимо от позиции
 	// fd — размер другого процесса не искажает запись.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	// 0o660 — см. блокировку выше: активный пак дописывают юниты-писатели
+	// группы crawler (docs/deploy.md §3).
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o660)
 	if err != nil {
 		return nil, fmt.Errorf("content: пак %d: %w", id, err)
 	}

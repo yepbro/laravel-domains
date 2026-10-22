@@ -32,7 +32,12 @@ UMask=0007
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-# Контент читает из хранилища (RO под strict), ничего не пишет.
+# Хранилище контента: читает паки, но берёт и общий flock .packs.lock
+# (O_RDWR — защита от ротации во время чтения, internal/content) — каталог
+# обязан быть доступен на запись группе crawler (T-135: без этого юнит
+# падал permission denied на открытии lock).
+ReadWritePaths=/var/lib/crawler/content
+# Правила читает из /etc/crawler/rules (RO под strict), ничего не пишет.
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
