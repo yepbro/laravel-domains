@@ -28,6 +28,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"crawler/internal/config"
 	"crawler/internal/content"
 	"crawler/internal/dnsclient"
 	"crawler/internal/httpfetch"
@@ -953,61 +954,108 @@ func TestWorkerRunOnResultError(t *testing.T) {
 	}
 }
 
-// TestWorkerRunBackoffOnFailures — предохранитель рабочего цикла: окно,
-// целиком не подтверждённое из-за сбоя OnResult (БД), выдерживает паузу
-// перед следующим чтением q:http (иначе — горячий цикл, пережигающий
-// попытки доставок), пауза растёт с каждым таким окном, окно с успехом
-// её сбрасывает; подтверждений при этом нет (at-least-once, ТЗ 3.4).
+// workerPoisonQueue — бесконечный источник ядовитых доставок: каждое
+// чтение немедленно возвращает одну невалидную запись (Decode в
+// processDelivery падает, доставка остаётся без XACK). Скорость чтений
+// ограничивает только предохранитель цикла — идеальный измеритель его
+// работы без таймингов обработки.
+type workerPoisonQueue struct {
+	mu       sync.Mutex
+	consumes int
+	acked    []string
+}
+
+func (q *workerPoisonQueue) Publish(context.Context, string, queue.Message) (string, error) {
+	return "", nil
+}
+
+func (q *workerPoisonQueue) Consume(_ context.Context, _, _, _ string, n int) ([]queue.Delivery, error) {
+	if n < 1 {
+		n = 1
+	}
+	out := make([]queue.Delivery, n)
+	for i := range out {
+		out[i] = queue.Delivery{Stream: queue.StreamHTTP, ID: fmt.Sprintf("poison-%d", i), Payload: []byte("{")}
+	}
+	q.mu.Lock()
+	q.consumes++
+	q.mu.Unlock()
+	return out, nil
+}
+
+func (q *workerPoisonQueue) Ack(_ context.Context, _, _ string, ids ...string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.acked = append(q.acked, ids...)
+	return nil
+}
+
+func (q *workerPoisonQueue) consumeCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.consumes
+}
+
+func (q *workerPoisonQueue) ackedCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.acked)
+}
+
+// TestWorkerRunBackoffOnFailures — предохранитель скользящего цикла
+// (T-139): при систематическом сбое обработки (каждая доставка падает —
+// здесь ядовитые записи) чтение q:http приостанавливается с удвоением
+// паузы, иначе цикл пережигал бы попытки доставок (XAUTOCLAIM → q:dead,
+// T-025) в горячем режиме; чтения при этом продолжаются — счётчик не
+// блокирует цикл навсегда. Пауза сжата до 100 мс: секунды в юнит-тесте
+// не ждать, границы взяты с многократным запасом против джиттера CI.
 func TestWorkerRunBackoffOnFailures(t *testing.T) {
-	// Пауза сжата: секунды в юнит-тесте не ждать.
 	old := workerFailWaitBase
-	workerFailWaitBase = 250 * time.Millisecond
+	workerFailWaitBase = 100 * time.Millisecond
 	t.Cleanup(func() { workerFailWaitBase = old })
 
-	body := "<html>" + strings.Repeat("страница для теста предохранителя цикла ", 30) + "</html>"
-	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
-		"backoff.test":         {status: 200, body: body},
-		"http://backoff.test/": {status: 200, body: body},
-	})
-	w := workerWorker(t, fetch, nil)
-	q := &workerFakeQueue{deliveries: []queue.Delivery{
-		workerDelivery(t, queue.HTTPTask{ZoneID: 10, DomainID: 51, Name: "backoff.test",
-			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
-		workerDelivery(t, queue.HTTPTask{ZoneID: 10, DomainID: 52, Name: "backoff.test",
-			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
-	}}
-	opts := Options{OnResult: func(context.Context, *DomainResult) error {
-		return errors.New("БД недоступна")
-	}}
+	// Пул и пачка чтения минимальны: порог предохранителя — Consume
+	// подряд неудач (1), конвейер чтения не глубже пары доставок. Шов
+	// загрузки не вызывается (декод падает раньше), но New требует его.
+	dummyFetch, _ := workerFakeFetch(nil)
+	w := workerWorker(t, dummyFetch, nil)
+	q := &workerPoisonQueue{}
+	opts := Options{Concurrency: 1, Consume: 1}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, q, w, opts) }()
 
-	// Первое чтение — сразу; момент его наблюдения стартовая точка
-	// паузы (окно обрабатывается мгновенно, обе доставки падают).
+	// Первые чтения уходят до срабатывания счётчика (регистрация неудач
+	// асинхронна) — окно в 450 мс покрывает их с запасом; дальше паузы
+	// 100/200/400 мс душат темп чтений до единиц.
 	deadline := time.After(5 * time.Second)
-	for q.consumeCount() == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("первое чтение не состоялось")
-		case <-time.After(2 * time.Millisecond):
+	waitCount := func(n int) int {
+		for {
+			got := q.consumeCount()
+			if got >= n {
+				return got
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("чтений %d, ждалось ≥%d — предохранитель заблокировал цикл", got, n)
+			case <-time.After(2 * time.Millisecond):
+			}
 		}
 	}
-	firstSeen := time.Now()
+	waitCount(1)
+	time.Sleep(450 * time.Millisecond)
+	first := q.consumeCount()
+	if first > 10 {
+		t.Errorf("чтений %d за 450 мс — предохранитель не душит темп (ждалось ≤10)", first)
+	}
 
-	// Повторное чтение — после паузы предохранителя, но не вечностью:
-	// цикл обязан продолжить (счётчик ошибок не блокирует навсегда).
-	for q.consumeCount() < 2 {
-		select {
-		case <-deadline:
-			t.Fatal("второе чтение не состоялось — предохранитель не отпустил цикл")
-		case <-time.After(2 * time.Millisecond):
-		}
-	}
-	if elapsed := time.Since(firstSeen); elapsed < 200*time.Millisecond {
-		t.Errorf("повторное чтение через %v — пауза предохранителя не сработала", elapsed)
+	// Паузы удваиваются: следующий интервал добавляет считанные чтения,
+	// а не десятки. Рост между двумя замерами — не более пары чтений.
+	time.Sleep(450 * time.Millisecond)
+	if grew := q.consumeCount() - first; grew > 2 {
+		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией неудач", grew)
 	}
 
 	cancel()
@@ -1020,7 +1068,175 @@ func TestWorkerRunBackoffOnFailures(t *testing.T) {
 		t.Fatal("Run не завершился после отмены ctx")
 	}
 	if q.ackedCount() != 0 {
-		t.Errorf("подтверждений %d при падающем OnResult", q.ackedCount())
+		t.Errorf("подтверждений %d при ядовитых доставках", q.ackedCount())
+	}
+}
+
+// TestWorkerRunSlidingConsumption — суть T-139: чтение q:http не ждёт
+// завершения пачки целиком. Первая доставка окна блокируется в сети до
+// отмены ctx (хвост длительностей — тарпит до total_timeout); при
+// барьере окна (до T-139) wg.Wait держал бы цикл на ней — хвостовые
+// доставки пачки и следующее чтение не начинались. Скользящее
+// потребление обязано подтвердить все быстрые доставки, пока
+// блокирующая в полёте: слоты освобождаются завершившимися задачами,
+// читатель двигается дальше.
+func TestWorkerRunSlidingConsumption(t *testing.T) {
+	fetch, log := workerFakeFetch(map[string]*workerPageScript{
+		"block.test": {blockCtx: true},
+		"f1.test":    {status: 200, body: "<html>страница 1 скользящего потребления</html>"},
+		"f2.test":    {status: 200, body: "<html>страница 2 скользящего потребления</html>"},
+		"f3.test":    {status: 200, body: "<html>страница 3 скользящего потребления</html>"},
+		"f4.test":    {status: 200, body: "<html>страница 4 скользящего потребления</html>"},
+	})
+	w := workerWorker(t, fetch, nil)
+	task := func(id int64, name string) queue.Delivery {
+		return workerDelivery(t, queue.HTTPTask{ZoneID: 20, DomainID: id, Name: name,
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}})
+	}
+	q := &workerFakeQueue{deliveries: []queue.Delivery{
+		task(71, "block.test"), task(72, "f1.test"), task(73, "f2.test"),
+		task(74, "f3.test"), task(75, "f4.test"),
+	}}
+	opts := Options{Concurrency: 2, Consume: 4}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	// Блокирующая доставка ушла в сеть и держит слот — быстрые
+	// дорабатывают и подтверждаются мимо неё.
+	deadline := time.After(5 * time.Second)
+	for log.countHost("block.test") == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("блокирующая доставка не дошла до сети")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	for q.ackedCount() < 4 {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatalf("скользящее потребление не подхватило хвост пачки: подтверждено %d из 4 быстрых", q.ackedCount())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	// Блокирующая доставка не подтверждена — вернётся повторной
+	// доставкой (at-least-once, ТЗ 3.4), быстрые подтверждены ровно
+	// по одному разу.
+	if got := q.ackedCount(); got != 4 {
+		t.Errorf("подтверждений %d, ожидалось 4 (блокирующая — без XACK)", got)
+	}
+}
+
+// TestWorkerRunCancelKeepsBufferUnacked — гарантия скользящего буфера
+// (T-139, ревью P3-3): прочитанные вперёд, но не начатые доставки (слоты
+// заняты блокирующимися задачами) при отмене ctx НЕ запускаются и НЕ
+// подтверждаются — вместе с текущими пачками читателя они остаются в
+// pending стрима и возвращаются клеймом XAUTOCLAIM (at-least-once,
+// ТЗ 3.4). Заодно — потолок слотов: третья и четвёртая задачи не
+// стартуют, пока обе блокирующиеся держат Concurrency=2.
+func TestWorkerRunCancelKeepsBufferUnacked(t *testing.T) {
+	fetch, log := workerFakeFetch(map[string]*workerPageScript{
+		"block1.test": {blockCtx: true},
+		"block2.test": {blockCtx: true},
+		"buf1.test":   {status: 200, body: "<html>буферная доставка 1</html>"},
+		"buf2.test":   {status: 200, body: "<html>буферная доставка 2</html>"},
+	})
+	w := workerWorker(t, fetch, nil)
+	task := func(id int64, name string) queue.Delivery {
+		return workerDelivery(t, queue.HTTPTask{ZoneID: 21, DomainID: id, Name: name,
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}})
+	}
+	// Пачка больше параллелизма: buf1/buf2 прочитаны читателем вперёд
+	// (буфер + пачка в руке), но слотов для них нет, пока блокирующиеся
+	// задачи держат оба.
+	q := &workerFakeQueue{deliveries: []queue.Delivery{
+		task(81, "block1.test"), task(82, "block2.test"),
+		task(83, "buf1.test"), task(84, "buf2.test"),
+	}}
+	opts := Options{Concurrency: 2, Consume: 4}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	// Обе блокирующиеся задачи в сети (держат слоты), буферные обязаны
+	// остаться не начатыми — не обращаясь к сети, сколько бы цикл ни
+	// работал.
+	deadline := time.After(5 * time.Second)
+	for log.countHost("block1.test") == 0 || log.countHost("block2.test") == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("блокирующиеся доставки не дошли до сети")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	time.Sleep(50 * time.Millisecond) // цикл успевает прочитать пачку и упереться в слоты
+
+	if got := log.countHost("buf1.test") + log.countHost("buf2.test"); got != 0 {
+		t.Errorf("буферные доставки запущены при занятых слотах: обращений %d", got)
+	}
+	if q.ackedCount() != 0 {
+		t.Errorf("подтверждений %d до отмены — не должно быть", q.ackedCount())
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	if got := log.countHost("buf1.test") + log.countHost("buf2.test"); got != 0 {
+		t.Errorf("буферные доставки запущены после отмены: обращений %d", got)
+	}
+	if q.ackedCount() != 0 {
+		t.Errorf("подтверждений %d — не начатые доставки обязаны вернуться очереди", q.ackedCount())
+	}
+}
+
+// TestWorkerOptionsDefaults — дефолты задачного параллелизма (T-139)
+// воркера и конфигурации совпадают: боевая сборка (cmd/http-worker)
+// передаёт http.task_* в Options, изолированные сборки берут
+// withDefaults — расхождение молча меняло бы поведение боевого
+// экземпляра против документации.
+func TestWorkerOptionsDefaults(t *testing.T) {
+	o := Options{}.withDefaults()
+	if o.Concurrency != DefaultConcurrency || o.Consume != DefaultConsume || o.PerDomain != DefaultPerDomain {
+		t.Errorf("withDefaults: concurrency=%d consume=%d per_domain=%d, дефолты %d/%d/%d",
+			o.Concurrency, o.Consume, o.PerDomain, DefaultConcurrency, DefaultConsume, DefaultPerDomain)
+	}
+	cfg := config.Default()
+	if cfg.HTTP.TaskConcurrency != DefaultConcurrency {
+		t.Errorf("http.task_concurrency=%d расходится с DefaultConcurrency=%d", cfg.HTTP.TaskConcurrency, DefaultConcurrency)
+	}
+	if cfg.HTTP.TaskConsume != DefaultConsume {
+		t.Errorf("http.task_consume=%d расходится с DefaultConsume=%d", cfg.HTTP.TaskConsume, DefaultConsume)
+	}
+	if cfg.HTTP.TaskPerDomain != DefaultPerDomain {
+		t.Errorf("http.task_per_domain=%d расходится с DefaultPerDomain=%d", cfg.HTTP.TaskPerDomain, DefaultPerDomain)
+	}
+	// Явные значения не перетираются дефолтами.
+	o = Options{Concurrency: 3, Consume: 2, PerDomain: 1}.withDefaults()
+	if o.Concurrency != 3 || o.Consume != 2 || o.PerDomain != 1 {
+		t.Errorf("withDefaults перетёр явные значения: %+v", o)
 	}
 }
 

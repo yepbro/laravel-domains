@@ -81,6 +81,9 @@ func TestDefault(t *testing.T) {
 		{"http.max_redirects", c.HTTP.MaxRedirects, 8},
 		{"http.max_body_bytes", c.HTTP.MaxBodyBytes.B(), int64(2 << 20)},
 		{"http.user_agent", c.HTTP.UserAgent != "", true},
+		{"http.task_concurrency", c.HTTP.TaskConcurrency, 256},
+		{"http.task_consume", c.HTTP.TaskConsume, 16},
+		{"http.task_per_domain", c.HTTP.TaskPerDomain, 8},
 		{"render.remote_url", c.Render.RemoteURL, ""},
 		{"render.contexts", c.Render.Contexts, 3},
 		{"render.timeout", c.Render.Timeout.D(), 25 * time.Second},
@@ -177,6 +180,9 @@ http:
   max_redirects: 5
   max_body_bytes: 1048576
   user_agent: "TestCrawler/2.0 (contact: test@example.invalid)"
+  task_concurrency: 128
+  task_consume: 8
+  task_per_domain: 6
 render:
   remote_url: "ws://10.0.0.9:9222"
   contexts: 4
@@ -255,6 +261,9 @@ log:
 		{"http.max_redirects", cfg.HTTP.MaxRedirects, 5},
 		{"http.max_body_bytes", cfg.HTTP.MaxBodyBytes.B(), int64(1048576)},
 		{"http.user_agent", cfg.HTTP.UserAgent, "TestCrawler/2.0 (contact: test@example.invalid)"},
+		{"http.task_concurrency", cfg.HTTP.TaskConcurrency, 128},
+		{"http.task_consume", cfg.HTTP.TaskConsume, 8},
+		{"http.task_per_domain", cfg.HTTP.TaskPerDomain, 6},
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 4},
 		{"render.timeout", cfg.Render.Timeout.D(), 40 * time.Second},
@@ -418,6 +427,9 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_HTTP_MAX_REDIRECTS":               "3",
 		"CRAWLER_HTTP_MAX_BODY_BYTES":              "4MiB",
 		"CRAWLER_HTTP_USER_AGENT":                  "EnvCrawler/1.0 (contact: env@example.invalid)",
+		"CRAWLER_HTTP_TASK_CONCURRENCY":            "96",
+		"CRAWLER_HTTP_TASK_CONSUME":                "32",
+		"CRAWLER_HTTP_TASK_PER_DOMAIN":             "4",
 		"CRAWLER_RENDER_REMOTE_URL":                "ws://10.0.0.9:9222",
 		"CRAWLER_RENDER_CONTEXTS":                  "2",
 		"CRAWLER_RENDER_TIMEOUT":                   "11s",
@@ -488,6 +500,9 @@ func TestEnvOverrides(t *testing.T) {
 		{"http.max_redirects", cfg.HTTP.MaxRedirects, 3},
 		{"http.max_body_bytes", cfg.HTTP.MaxBodyBytes.B(), int64(4 << 20)},
 		{"http.user_agent", cfg.HTTP.UserAgent, "EnvCrawler/1.0 (contact: env@example.invalid)"},
+		{"http.task_concurrency", cfg.HTTP.TaskConcurrency, 96},
+		{"http.task_consume", cfg.HTTP.TaskConsume, 32},
+		{"http.task_per_domain", cfg.HTTP.TaskPerDomain, 4},
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 2},
 		{"render.timeout", cfg.Render.Timeout.D(), 11 * time.Second},
@@ -756,6 +771,12 @@ func TestValidate(t *testing.T) {
 		{"total_timeout отрицательный", func(c *Config) { c.HTTP.TotalTimeout = Duration(-time.Second) }, "http.total_timeout"},
 		{"max_redirects -1", func(c *Config) { c.HTTP.MaxRedirects = -1 }, "http.max_redirects"},
 		{"max_body_bytes 0", func(c *Config) { c.HTTP.MaxBodyBytes = 0 }, "http.max_body_bytes"},
+		{"task_concurrency 0", func(c *Config) { c.HTTP.TaskConcurrency = 0 }, "http.task_concurrency"},
+		{"task_concurrency велик", func(c *Config) { c.HTTP.TaskConcurrency = 10001 }, "http.task_concurrency"},
+		{"task_consume 0", func(c *Config) { c.HTTP.TaskConsume = 0 }, "http.task_consume"},
+		{"task_consume велик", func(c *Config) { c.HTTP.TaskConsume = 1001 }, "http.task_consume"},
+		{"task_per_domain 0", func(c *Config) { c.HTTP.TaskPerDomain = 0 }, "http.task_per_domain"},
+		{"task_per_domain велик", func(c *Config) { c.HTTP.TaskPerDomain = 127 }, "http.task_per_domain"},
 		{"user_agent пуст", func(c *Config) { c.HTTP.UserAgent = "" }, "http.user_agent"},
 		{"remote_url кривой", func(c *Config) { c.Render.RemoteURL = "not-url" }, "render.remote_url"},
 		{"contexts 0", func(c *Config) { c.Render.Contexts = 0 }, "render.contexts"},
@@ -822,6 +843,9 @@ func TestValidate(t *testing.T) {
 	c := valid()
 	c.Analyzer.LaravelMinScore = 1
 	c.HTTP.MaxRedirects = 0
+	c.HTTP.TaskConcurrency = 10000 // верхняя граница задачного параллелизма (T-139)
+	c.HTTP.TaskConsume = 1000      // верхняя граница пачки чтения
+	c.HTTP.TaskPerDomain = 126     // верхняя граница пула задачи: 2 × 63 субдомена (§5.10)
 	c.Ingest.MaxErrorRatio = 1
 	c.Render.RestartMemoryBytes = 0                                                    // контроль памяти отключён — допустимо
 	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)

@@ -24,7 +24,9 @@
 // в ContentStore — ContentSaver (store.go, T-056), после него байты
 // отбрасываются. Потолок тела — max_body_bytes (2 МиБ, ТЗ 5.5), страниц
 // в задаче не больше 2 × субдомены ≤ 126 (§5.10) — память задачи
-// ограничена; DefaultConcurrency учитывает её при выборе окна задач.
+// ограничена; DefaultConcurrency учитывает её: задачи в полёте держат
+// тела записей-оригиналов, их суммарный бюджет — задачный параллелизм
+// (T-139, дефолты по замерам T-092).
 package httpworker
 
 import (
@@ -445,10 +447,31 @@ const (
 	// Масштабирование нагрузки — инстансами (ТЗ 4.1 «масштабируется
 	// количеством горутин и процессов»), потолок поднимается
 	// Options.Concurrency.
-	DefaultConcurrency = 64
+	//
+	// Число — по замерам T-092 (docs/load-measurements.md §3, T-139):
+	// средняя задача домена 1.67 с → потолок скользящего потребления
+	// ≈ Concurrency/1.67с; 256 ≈ 150 дом/с — цель ТЗ §3.3 (первый цикл
+	// 350 млн за недели, т.е. ≥100 дом/с) с запасом ×1.5 на деградацию
+	// латентности от per-IP очередей (парковочные IP до 8% задач головы
+	// очереди: per_ip_limit=4 держит подключения, задачи ждут семафора
+	// в пределах total_timeout, слоты не освобождаются мгновенно —
+	// head-of-line парковок съедает десятки слотов, барьер окна на таком
+	// хвосте и резал этап до ≈2 дом/с). 256 × PerDomain 8 = 2048 ≈
+	// http.concurrency 2000: окно задач заполняет транспортный бюджет,
+	// не превышая. В памяти 256 задач держат типично десятки MiB тел
+	// (по замеру ≈29 KiB сохранённого контента на домен, §7) — потолок
+	// каждого тела остаётся max_body_bytes (BodyLimiter T-049). Боевой
+	// экземпляр берёт значение из конфига http.task_concurrency
+	// (cmd/http-worker), дефолт здесь — тот же, для изолированных
+	// сборок и тестов.
+	DefaultConcurrency = 256
 
-	// DefaultConsume — записей q:http за одно чтение: меньше
-	// DefaultConcurrency (окно чтения не глубже окна обработки).
+	// DefaultConsume — записей q:http за одно чтение: размер пачки
+	// XREADGROUP и буфера предвыборки скользящего потребления (T-139) —
+	// чтение идёт вперёд обработки не глубже пары пачек (текущая в руке
+	// читателя + буфер), следующее чтение происходит при освобождении
+	// слотов задач (диспетчер забирает доставку из буфера, только когда
+	// есть слот), окно чтения параллелизм не ограничивает.
 	DefaultConsume = 16
 
 	// DefaultPerDomain — параллельных проверок внутри задачи домена
@@ -469,17 +492,20 @@ const (
 )
 
 // workerFailWaitBase — стартовая пауза предохранителя рабочего цикла
-// (Run): окно доставок, целиком оставшееся без XACK (систематический
-// сбой обработки — Options.OnResult/БД), приостанавливает чтение q:http
-// с удвоением паузы до DefaultErrorWait. Без паузы цикл продолжал бы
-// черпать задачи: каждая доставка жгла попытку (XAUTOCLAIM после
+// (Run): доставки, подряд оставшиеся без XACK числом в целую пачку
+// чтения (Consume, T-139) при систематическом сбое обработки —
+// Options.OnResult/БД, — приостанавливают чтение q:http с удвоением
+// паузы до DefaultErrorWait. Без паузы цикл продолжал бы черпать
+// задачи: каждая доставка жгла попытку (XAUTOCLAIM после
 // DefaultClaimMinIdle, T-025) и уносила её в q:dead. Переменная, а не
 // константа: юнит-тесты сжимают паузу, не выжидая секунды.
 var workerFailWaitBase = time.Second
 
-// workerFailBackoff — пауза после streak подряд целиком не
-// подтверждённых окон: удвоение от workerFailWaitBase, потолок
-// DefaultErrorWait (сдвиг ограничен — переполнение Duration).
+// workerFailBackoff — пауза после streak подряд выдержанных пауз
+// предохранителя (серия нарастает, пока читатель не увидит ни одного
+// успеха — счётчик неудач обнуляется подтверждённой доставкой):
+// удвоение от workerFailWaitBase, потолок DefaultErrorWait (сдвиг
+// ограничен — переполнение Duration).
 func workerFailBackoff(streak int) time.Duration {
 	d := workerFailWaitBase << min(streak-1, 5)
 	if d > DefaultErrorWait {
@@ -489,19 +515,24 @@ func workerFailBackoff(streak int) time.Duration {
 }
 
 // Options — параметры воркера; нулевые значения заменяются дефолтами
-// (withDefaults, стиль dnsworker.Options).
+// (withDefaults, стиль dnsworker.Options). Боевая сборка (cmd/http-worker)
+// берёт Concurrency/Consume/PerDomain из конфигурации http.task_*
+// (internal/config, T-139); здесь те же дефолты — для изолированных
+// сборок и тестов.
 type Options struct {
 	// Concurrency — одновременных задач q:http в цикле Run; 0 —
-	// DefaultConcurrency.
+	// DefaultConcurrency. Конфиг: http.task_concurrency.
 	Concurrency int
-	// Consume — записей q:http за одно чтение; 0 — DefaultConsume.
+	// Consume — записей q:http за одно чтение (пачка XREADGROUP и буфер
+	// предвыборки скользящего потребления, T-139); 0 — DefaultConsume.
+	// Конфиг: http.task_consume.
 	Consume int
 	// Group — группа потребителей q:http; "" — DefaultGroup.
 	Group string
 	// Consumer — имя потребителя группы; "" — "http-worker-<pid>".
 	Consumer string
 	// PerDomain — параллельных проверок (субдомен × протокол) внутри
-	// задачи домена; 0 — DefaultPerDomain.
+	// задачи домена; 0 — DefaultPerDomain. Конфиг: http.task_per_domain.
 	PerDomain int
 	// MaxRedirects — лимит цепочки редиректов (http.max_redirects,
 	// T-048): 0 — не следовать вовсе; отрицательные значения — дефолт
@@ -942,15 +973,22 @@ func (w *Worker) checkScheme(
 // --- рабочий цикл ------------------------------------------------------------
 
 // Run — рабочий цикл http-worker (ТЗ 4.2, §5.5): читает задачи q:http
-// группой потребителей окном Consume и обрабатывает доставки параллельно
+// группой потребителей пачками Consume и обрабатывает доставки параллельно
 // до Concurrency доменов, каждую — паттерном Processing (T-025): обработка
-// (ProcessDomain + Options.OnResult) → XACK. Работает до отмены ctx и
-// возвращает nil — контракт OnRun каркаса (T-012: начатые задачи дорабатывают
-// или возвращаются очереди повторной доставкой). Ошибка чтения или обработки
-// не останавливает цикл: логируется (Warn), неподтверждённая доставка
-// вернётся XAUTOCLAIM (ТЗ 4.2); окно, целиком оставшееся без подтверждений,
-// выдерживает паузу-предохранитель (workerFailWaitBase) — черпать новые
-// задачи при лежащей обработке бессмысленно, попытки доставок сгорают.
+// (ProcessDomain + Options.OnResult) → XACK. Потребление скользящее
+// (T-139): следующее чтение происходит при освобождении слотов задач
+// (чтение идёт вперёд обработки не глубже пары пачек Consume), цикл не
+// ждёт завершения пачки целиком — барьер окна на хвосте длительностей
+// (тарпиты до total_timeout, 20–25 с) удерживал пропускную способность
+// этапа на уровне ≈2 дом/с при простаивающем транспорте (замер T-092).
+// Работает до отмены ctx и возвращает nil — контракт OnRun каркаса
+// (T-012: начатые задачи дорабатывают или возвращаются очереди повторной
+// доставкой). Ошибка чтения или обработки не останавливает цикл:
+// логируется (Warn), неподтверждённая доставка вернётся XAUTOCLAIM
+// (ТЗ 4.2); Consume доставок подряд без единого подтверждения —
+// систематический сбой обработки — выдерживает паузу-предохранитель
+// (workerFailWaitBase): черпать новые задачи при лежащей обработке
+// бессмысленно, попытки доставок сгорают.
 func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	if q == nil {
 		return errors.New("httpworker: цикл воркера: очередь не задана")
@@ -996,73 +1034,111 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	}
 
 	sem := make(chan struct{}, o.Concurrency)
-	var failed atomic.Int64 // доставки окна без подтверждения
-	failStreak := 0         // подряд целиком не подтверждённых окон
-	for {
-		deliveries, err := q.Consume(ctx, queue.StreamHTTP, o.Group, o.Consumer, o.Consume)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil // graceful shutdown
-			}
-			log.Warn("цикл http-worker: чтение q:http", "err", err)
-			wait(DefaultErrorWait)
-			continue
-		}
-
-		// Окно доставок обрабатывается параллельно до Concurrency;
-		// доставка — один домен (ТЗ 4.2), параллелизм этапа — именно
-		// здесь (у dns-worker домены параллелятся внутри пачки).
-		var wg sync.WaitGroup
-		failed.Store(0)
-	window: // метка выхода из окна по отмене (select семафора ниже)
-		for _, d := range deliveries {
-			if ctx.Err() != nil {
-				break // не начатые доставки окна не подтверждены
-			}
-			// Слот семафора — с выходом по отмене: отмена ctx во время
-			// ожидания слота не должна запускать доставку с уже
-			// отменённым ctx (выбор канала select недетерминирован,
-			// поэтому отмена проверяется и после получения слота).
-			select {
-			case <-ctx.Done():
-				break window
-			case sem <- struct{}{}:
-			}
-			if ctx.Err() != nil {
-				<-sem
-				break window
-			}
-			wg.Add(1)
-			go func(d queue.Delivery) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				err := queue.Processing(ctx, q, o.Group, d, func(c context.Context, del queue.Delivery) error {
-					return w.processDelivery(c, del, o)
-				})
-				if err != nil {
-					failed.Add(1)
-					if ctx.Err() == nil {
-						log.Warn("задача q:http не подтверждена — вернётся повторной доставкой",
-							"entry", d.ID, "err", err)
-					}
+	// Скользящее потребление (T-139): читатель держит впереди обработки
+	// не больше пары пачек Consume доставок (текущая пачка в руке +
+	// буфер pending), диспетчер ниже занимает слот семафора на время
+	// одной доставки и сразу берёт следующую — завершение задачи
+	// освобождает слот и двигает чтение, никто не ждёт пачку целиком.
+	// Прочитанные, но не начатые доставки (буфер полон, слоты заняты
+	// хвостом длительностей) на отмене ctx остаются без XACK и
+	// возвращаются очереди клеймом XAUTOCLAIM — как и не начатые
+	// доставки окна прежде (at-least-once, ТЗ 3.4).
+	pending := make(chan queue.Delivery, o.Consume)
+	var failed atomic.Int64 // доставок подряд без подтверждения
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		failStreak := 0 // подряд выдержанных пауз предохранителя
+		for {
+			// Предохранитель (workerFailWaitBase): доставки, подряд
+			// оставшиеся без подтверждения числом в целую пачку чтения
+			// (Consume) без единого успеха — систематический сбой
+			// обработки (Options.OnResult/БД); пауза с удвоением до
+			// DefaultErrorWait. Подтверждённая доставка обнуляет счётчик
+			// неудач сразу, серия пауз сбрасывается на следующей
+			// итерации читателя, увидевшей счётчик нулевым.
+			if n := failed.Load(); n == 0 {
+				failStreak = 0
+			} else if int(n) >= o.Consume {
+				if ctx.Err() != nil {
+					return // graceful shutdown: паузы не было и не будет
 				}
-			}(d)
+				failStreak++
+				pause := workerFailBackoff(failStreak)
+				// Наблюдаемость простоя (ревью T-139): пауза до
+				// DefaultErrorWait останавливает чтение всего этапа —
+				// Warn с серией и числом неудач (частота ограничена
+				// удвоением паузы, не чаще ~2/мин на серии).
+				log.Warn("пауза предохранителя чтения q:http: доставки падают подряд",
+					"failed", n, "streak", failStreak, "wait", pause.String())
+				wait(pause)
+				if ctx.Err() != nil {
+					return // graceful shutdown: wait вышел по отмене
+				}
+			}
+			deliveries, err := q.Consume(ctx, queue.StreamHTTP, o.Group, o.Consumer, o.Consume)
+			if err != nil {
+				if ctx.Err() != nil {
+					return // graceful shutdown
+				}
+				log.Warn("цикл http-worker: чтение q:http", "err", err)
+				wait(DefaultErrorWait)
+				continue
+			}
+			for _, d := range deliveries {
+				select {
+				case pending <- d:
+				case <-ctx.Done():
+					return // буферные доставки без XACK вернёт XAUTOCLAIM
+				}
+			}
 		}
-		wg.Wait()
+	}()
+
+	// Диспетчер: ждёт свободный слот (или отмену) и запускает доставку.
+	// Слот семафора — с выходом по отмене: отмена ctx во время ожидания
+	// слота не должна запускать доставку с уже отменённым ctx (выбор
+	// канала select недетерминирован, поэтому отмена проверяется и после
+	// получения слота).
+	var wg sync.WaitGroup
+dispatch:
+	for {
+		var d queue.Delivery
+		select {
+		case <-ctx.Done():
+			break dispatch // доставки буфера не начаты — без XACK
+		case d = <-pending:
+		}
+		select {
+		case <-ctx.Done():
+			break dispatch
+		case sem <- struct{}{}:
+		}
 		if ctx.Err() != nil {
-			return nil // остановка: окно доработано или возвращено очереди
+			<-sem
+			break dispatch
 		}
-		// Предохранитель (workerFailWaitBase): окно целиком без
-		// подтверждений — систематический сбой обработки, пауза перед
-		// следующим чтением; окно с хоть одним подтверждением счётчик
-		// сбрасывает.
-		if n := failed.Load(); n > 0 && int(n) == len(deliveries) {
-			failStreak++
-			wait(workerFailBackoff(failStreak))
-		} else {
-			failStreak = 0
-		}
+		wg.Add(1)
+		go func(d queue.Delivery) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := queue.Processing(ctx, q, o.Group, d, func(c context.Context, del queue.Delivery) error {
+				return w.processDelivery(c, del, o)
+			})
+			if err != nil {
+				failed.Add(1)
+				if ctx.Err() == nil {
+					log.Warn("задача q:http не подтверждена — вернётся повторной доставкой",
+						"entry", d.ID, "err", err)
+				}
+			} else {
+				failed.Store(0)
+			}
+		}(d)
 	}
+	wg.Wait()    // начатые доставки дорабатывают (graceful stop, ТЗ 3.4)
+	<-readerDone // читатель завершается той же отменой ctx (Consume/wait)
+	return nil
 }
 
 // processDelivery обрабатывает одну доставку q:http. Подтверждение (XACK)

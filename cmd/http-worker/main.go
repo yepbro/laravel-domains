@@ -220,6 +220,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}()
 
 	opts2 := httpworker.Options{
+		// Задачный параллелизм цикла Run (T-139): скользящее потребление
+		// q:http, значения — http.task_* из конфига (дефолты по замерам
+		// T-092; транспортные потолки — http.concurrency/per_ip_limit/
+		// max_rps выше, в httpfetch.NewOptions).
+		Concurrency:  cfg.HTTP.TaskConcurrency,
+		Consume:      cfg.HTTP.TaskConsume,
+		PerDomain:    cfg.HTTP.TaskPerDomain,
 		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — не следовать (T-006/T-048)
 		Recover:      rel,                   // возврат зависших задач q:http (T-025)
 		Metrics:      reg,                   // приборы этапа: задачи, ошибки, статусы, время ответа, rendered (T-077)
