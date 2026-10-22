@@ -347,7 +347,10 @@ func (s CharsetSource) String() string {
 type CharsetResult struct {
 	// UTF8 — тело в UTF-8. Некорректные последовательности заменяются
 	// U+FFFD (RuneError), а не ошибкой. Для уже-UTF-8 тела байты могут
-	// разделять память с входом ToUTF8 (быстрый путь без копии).
+	// разделять память с входом ToUTF8 (быстрый путь без копии). Пустое
+	// тело — пустой не-nil слайс: пустой ответ валиден, а nil вниз по
+	// конвейеру означал бы «тела нет» и лишил бы запись content_hash
+	// (T-138).
 	UTF8 []byte
 	// Charset — каноническое имя исходной кодировки (WHATWG: "utf-8",
 	// "windows-1251", "koi8-r", …); "" только для пустого тела.
@@ -370,7 +373,14 @@ type CharsetResult struct {
 // нераспознанное — windows-1252, невалидные последовательности — U+FFFD.
 func ToUTF8(h http.Header, body []byte) CharsetResult {
 	if len(body) == 0 {
-		return CharsetResult{Source: CharsetNone}
+		// Пустое тело — валидное тело (T-138): UTF8 — пустой, но не
+		// nil слайс. nil ниже по конвейеру читается как «тела нет
+		// вовсе» (предохранитель ContentSaver гасит content_hash),
+		// а пустой ответ (200/400/404/500 с Content-Length: 0)
+		// обязан дойти до Put с хэшем пустых байтов: HashOf(nil) ==
+		// HashOf([]byte{}), дедуп и классы эквивалентности пустых
+		// страниц работают как у любого контента.
+		return CharsetResult{UTF8: []byte{}, Source: CharsetNone}
 	}
 
 	// BOM перекрывает всё (WHATWG): у сервера была последняя попытка
@@ -447,10 +457,23 @@ func decodeAs(enc encoding.Encoding, name string, src CharsetSource, body []byte
 		// Декодеры x/text заменяют невалидные байты на U+FFFD без
 		// ошибки; сюда ведут только обрывы последовательностей
 		// (нечётная длина UTF-16 и т.п.) — сохраняем готовый префикс
-		// и ставим U+FFFD на месте обрыва.
+		// и ставим U+FFFD на месте обрыва (дописанные байты — не nil).
 		return CharsetResult{UTF8: append(out, "\uFFFD"...), Charset: name, Source: src}
 	}
-	return CharsetResult{UTF8: out, Charset: name, Source: src}
+	return CharsetResult{UTF8: emptyIfNil(out), Charset: name, Source: src}
+}
+
+// emptyIfNil — нормализация пустого декодированного выхода в не-nil
+// слайс: тело из одного UTF-16 BOM декодируется в ноль байтов, и будущая
+// версия x/text может отдать такой выход nil-ом (текущая возвращает
+// make-буфер). Пустое тело — валидное тело, nil ниже по конвейеру
+// означает «тела нет» (T-138) — контракт ToUTF8 не держится на детали
+// реализации библиотеки.
+func emptyIfNil(b []byte) []byte {
+	if b == nil {
+		return []byte{}
+	}
+	return b
 }
 
 // sanitizeUTF8 — замена некорректных последовательностей на U+FFFD

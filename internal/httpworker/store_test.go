@@ -4,8 +4,9 @@
 // false, refcount), ErrStoreFull/ErrTooLarge — результат живой с nil-хэшем
 // и признаком «контент не сохранён», обрезанное тело не сохраняется вовсе,
 // отмена ctx и прочие ошибки — ошибка Save (повторная доставка),
-// интеграция OnResult → store в цикле Run. Идентификаторы с префиксом
-// store* против коллизий с соседними файлами пакета.
+// интеграция OnResult → store в цикле Run; пустое тело (T-138) — валидный
+// контент с живым хэшем, в том числе с кэша итоговых URL. Идентификаторы с
+// префиксом store* против коллизий с соседними файлами пакета.
 
 package httpworker
 
@@ -744,5 +745,204 @@ func TestStoreOnResultIntegration(t *testing.T) {
 	}
 	if q.ackedCount() != 1 {
 		t.Errorf("подтверждений %d, ожидалось 1", q.ackedCount())
+	}
+}
+
+// --- пустое тело — валидный контент (T-138) -----------------------------------
+
+// TestStoreEmptyBodyKeepsHash — пустое тело ответа (Content-Length: 0) —
+// валидный контент с валидным хэшем: пустые 200 и 400/404/500 дают записи
+// с живым HashOf пустых байтов, тела (пустые, не nil) доходят до
+// сохранения, все пустые страницы разных доменов — один блок дедупликации
+// (§8). Оба пути ContentSaver: построчный Put и пачка PutBatch
+// (продакшн-хранилище — content.BatchStore). До T-138 ToUTF8 отдавал nil,
+// предохранитель «тело записи недоступно» гасил content_hash у ~4% задач —
+// парковок и пустых страниц ошибок.
+func TestStoreEmptyBodyKeepsHash(t *testing.T) {
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"empty-200.test": {status: 200},
+		"empty-400.test": {status: 400},
+		"empty-404.test": {status: 404},
+		"empty-500.test": {status: 500},
+	})
+	w := workerWorker(t, fetch, nil)
+	domains := []string{"empty-200.test", "empty-400.test", "empty-404.test", "empty-500.test"}
+
+	// Хэш пустых байтов один у всех пустых страниц — HashOf(nil) ==
+	// HashOf([]byte{}) (контракт T-041), классы эквивалентности пустых
+	// страниц строятся по нему же.
+	emptyHash := content.HashOf(nil)
+
+	// process — свежие результаты доменов: Save мутирует записи (тела
+	// отпускаются), каждая ветка хранилища прогоняет свой проход.
+	process := func(t *testing.T) []*DomainResult {
+		t.Helper()
+		results := make([]*DomainResult, len(domains))
+		for i, name := range domains {
+			res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+				ZoneID: 1, DomainID: int64(i + 1), Name: name,
+				Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")},
+			})
+			if err != nil {
+				t.Fatalf("ProcessDomain(%s): %v", name, err)
+			}
+			if len(res.Subdomains[0].Records) != 1 {
+				t.Fatalf("%s: записей %d, ожидалась 1 (оба протокола — один пустой сайт)", name, len(res.Subdomains[0].Records))
+			}
+			rec := &res.Subdomains[0].Records[0]
+			if rec.HTTPStatus < 200 || rec.ErrClass != ErrNone {
+				t.Fatalf("%s: сломан сценарий — статус %d, ошибка %v", name, rec.HTTPStatus, rec.ErrClass)
+			}
+			if rec.ContentHash == nil || *rec.ContentHash != emptyHash {
+				t.Fatalf("%s: хэш записи %v, ожидался хэш пустого тела %s", name, rec.ContentHash, emptyHash)
+			}
+			if rec.Body == nil {
+				t.Fatalf("%s: тело записи nil — пустое тело обязано быть валидным (T-138)", name)
+			}
+			results[i] = res
+		}
+		return results
+	}
+
+	for _, tc := range []struct {
+		name string
+		boot func() (content.ContentStore, *storeFake, *batchStoreFake)
+	}{
+		{"построчный Put", func() (content.ContentStore, *storeFake, *batchStoreFake) {
+			st := newStoreFake()
+			return st, st, nil
+		}},
+		{"пачка PutBatch", func() (content.ContentStore, *storeFake, *batchStoreFake) {
+			st := newStoreFake()
+			b := &batchStoreFake{storeFake: st}
+			return b, st, b
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, st, batch := tc.boot()
+			results := process(t)
+			var logBuf bytes.Buffer
+			saver := storeSaver(t, store, &logBuf)
+			for _, res := range results {
+				if err := saver.Save(context.Background(), res); err != nil {
+					t.Fatalf("Save(%s): %v", res.Name, err)
+				}
+			}
+			if strings.Contains(logBuf.String(), "тело записи недоступно") {
+				t.Errorf("предохранитель погасил пустое тело:\n%s", logBuf.String())
+			}
+
+			// Пустое тело доходит до хранилища каждого домена (Put или
+			// элемент пачки), блок один на все пустые страницы.
+			puts, writes, refs := st.snapshot()
+			if batch == nil {
+				if puts != len(results) {
+					t.Fatalf("Put: вызовов %d, ожидалось %d", puts, len(results))
+				}
+			} else {
+				if len(batch.batches) != len(results) {
+					t.Fatalf("пачек %d, ожидалось %d (по одной на доставку)", len(batch.batches), len(results))
+				}
+				for i, items := range batch.batches {
+					if len(items) != 1 || len(items[0]) != 0 {
+						t.Fatalf("пачка %d: %d элементов, длина первого %d — ожидалось одно пустое тело", i, len(items), len(items[0]))
+					}
+				}
+			}
+			if writes != 1 {
+				t.Fatalf("новых блоков %d, ожидался 1 (пустые страницы — один блок)", writes)
+			}
+			if refs[emptyHash] != len(results) {
+				t.Errorf("refcount пустого блока: %d, ожидался %d", refs[emptyHash], len(results))
+			}
+			for _, res := range results {
+				rec := &res.Subdomains[0].Records[0]
+				if rec.ContentHash == nil || rec.ContentNotStored {
+					t.Errorf("%s: после Save hash=%v not_stored=%v — ссылка на контент потеряна", res.Name, rec.ContentHash, rec.ContentNotStored)
+				}
+				if rec.Body != nil {
+					t.Errorf("%s: тело удерживается после Save", res.Name)
+				}
+			}
+			if got, err := st.Get(context.Background(), emptyHash); err != nil || len(got) != 0 {
+				t.Errorf("Get пустого блока: %v, байтов %d (ожидалось 0)", err, len(got))
+			}
+		})
+	}
+}
+
+// TestStoreEmptyBodyCachePath — кэш итоговых URL (§5.5 п. 6) с пустой
+// страницей: кэш-итог несёт пустое тело как валидное (не nil, T-138),
+// запись кэш-попадания становится оригиналом класса (T-055) и сохраняется
+// Put-ом — content_hash не гасится ни у кэш-записи, ни у алиаса-соседа.
+func TestStoreEmptyBodyCachePath(t *testing.T) {
+	old := storePageBody("old")
+	fetch, log := workerFakeFetch(map[string]*workerPageScript{
+		"example.com": { // обе проверки bare: редирект на пустую www
+			status: 301, final: "https://www.example.com/",
+			steps: []httpfetch.RedirectStep{{URL: "https://example.com/", Status: 301}},
+		},
+		"https://www.example.com/": {status: 200}, // пустая страница
+		"http://www.example.com/": { // другой сайт — вариант 1
+			status: 200, body: old, final: "http://old.example.com/",
+			steps: []httpfetch.RedirectStep{{URL: "http://www.example.com/", Status: 301}},
+		},
+	})
+	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
+	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+		ZoneID: 1, DomainID: 7, Name: "example.com",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(1, "www")},
+	})
+	if err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+
+	// Кэш-попадание: пустая страница www-https скачана один раз
+	// (проверкой bare), сети от www-https нет.
+	if n := log.countHost("www.example.com"); n != 1 {
+		t.Fatalf("скачиваний www: %d, ожидалось 1 (https — из кэша итоговых URL)", n)
+	}
+	bare, www := &res.Subdomains[0], &res.Subdomains[1]
+	if len(bare.Records) != 1 || len(www.Records) != 2 {
+		t.Fatalf("записей: bare %d, www %d — ожидались 1 и 2", len(bare.Records), len(www.Records))
+	}
+	// Оригинал класса (www v0, кэш-запись) несёт пустое тело для Save.
+	wwwHome := &www.Records[0]
+	if wwwHome.ContentHash == nil || *wwwHome.ContentHash != content.HashOf(nil) {
+		t.Fatalf("кэш-запись: hash=%v, ожидался хэш пустого тела", wwwHome.ContentHash)
+	}
+	if wwwHome.Body == nil {
+		t.Fatal("кэш-запись: тело nil — кэш-итог обязан нести пустое тело (T-138)")
+	}
+
+	st := newStoreFake()
+	var logBuf bytes.Buffer
+	if err := storeSaver(t, st, &logBuf).Save(context.Background(), res); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if strings.Contains(logBuf.String(), "тело записи недоступно") {
+		t.Errorf("предохранитель погасил пустое тело кэш-записи:\n%s", logBuf.String())
+	}
+
+	// Два блока — пустая страница (оригинал класса bare+www) и старый
+	// сайт; хэш пустого тела жив у оригинала, алиас ссылается через
+	// alias_subdomain_id.
+	puts, writes, refs := st.snapshot()
+	emptyHash, oldHash := content.HashOf(nil), content.HashOf([]byte(old))
+	if puts != 2 || writes != 2 {
+		t.Fatalf("Put: вызовов %d, новых блоков %d — ожидалось 2 и 2", puts, writes)
+	}
+	if refs[emptyHash] != 1 || refs[oldHash] != 1 {
+		t.Errorf("refcount: пустой %d, старый %d — ожидались 1 и 1", refs[emptyHash], refs[oldHash])
+	}
+	if wwwHome.ContentHash == nil || *wwwHome.ContentHash != emptyHash || wwwHome.ContentNotStored {
+		t.Errorf("оригинал после Save: hash=%v not_stored=%v", wwwHome.ContentHash, wwwHome.ContentNotStored)
+	}
+	if bare.Records[0].ContentHash != nil || bare.Records[0].ContentNotStored {
+		t.Errorf("алиас: hash=%v not_stored=%v — контент класса у оригинала",
+			bare.Records[0].ContentHash, bare.Records[0].ContentNotStored)
+	}
+	if got, err := st.Get(context.Background(), emptyHash); err != nil || len(got) != 0 {
+		t.Errorf("Get пустого блока: %v, байтов %d (ожидалось 0)", err, len(got))
 	}
 }

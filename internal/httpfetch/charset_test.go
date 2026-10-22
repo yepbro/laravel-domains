@@ -115,11 +115,43 @@ func headerOf(contentType string) http.Header {
 
 // --- ToUTF8: определение кодировки ------------------------------------------
 
-// TestToUTF8EmptyBody: пустое тело — пустой результат без кодировки.
+// TestToUTF8EmptyBody: пустое тело — валидное тело (T-138): пустой, но
+// не nil UTF8-слайс (nil ниже по конвейеру — «тела нет», ContentSaver
+// гасит content_hash) без кодировки, каким бы ни был вход — nil или
+// пустой слайс.
 func TestToUTF8EmptyBody(t *testing.T) {
-	got := ToUTF8(headerOf("text/html; charset=windows-1251"), nil)
-	if len(got.UTF8) != 0 || got.Charset != "" || got.Source != CharsetNone {
-		t.Fatalf("пустое тело: получили %+v, ожидались нули", got)
+	for name, body := range map[string][]byte{"nil": nil, "пустой слайс": {}} {
+		got := ToUTF8(headerOf("text/html; charset=windows-1251"), body)
+		if got.UTF8 == nil || len(got.UTF8) != 0 {
+			t.Fatalf("%s: UTF8=%#v, ожидался пустой не-nil слайс", name, got.UTF8)
+		}
+		if got.Charset != "" || got.Source != CharsetNone {
+			t.Fatalf("%s: получили %+v, ожидались пустой charset и CharsetNone", name, got)
+		}
+	}
+}
+
+// TestToUTF8BOMOnlyBody: тело из одного BOM декодируется в ноль байтов —
+// результат обязан остаться валидным пустым телом (не nil, T-138): UTF-8
+// BOM снимается срезом, UTF-16 — декодером с UseBOM, пустой выход
+// нормализуется emptyIfNil.
+func TestToUTF8BOMOnlyBody(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    []byte
+		charset string
+	}{
+		{"utf-8 bom", []byte{0xEF, 0xBB, 0xBF}, "utf-8"},
+		{"utf-16le bom", []byte{0xFF, 0xFE}, "utf-16le"},
+		{"utf-16be bom", []byte{0xFE, 0xFF}, "utf-16be"},
+	} {
+		got := ToUTF8(headerOf("text/html"), tc.body)
+		if got.UTF8 == nil || len(got.UTF8) != 0 {
+			t.Fatalf("%s: UTF8=%#v, ожидался пустой не-nil слайс", tc.name, got.UTF8)
+		}
+		if got.Charset != tc.charset || got.Source != CharsetBOM {
+			t.Fatalf("%s: charset=%q source=%v, ожидались %q/bom", tc.name, got.Charset, got.Source, tc.charset)
+		}
 	}
 }
 
