@@ -349,8 +349,11 @@ func Default() *Config {
 			MaxLen:      0,
 			MaxAttempts: 3, // ТЗ 4.2: по умолчанию 3
 			// Больше худшего окна удержания доставок живым воркером
-			// (рендер: 16 записей × 25 с при contexts = 1 ≈ 6,7 мин,
-			// см. queue.DefaultClaimMinIdle).
+			// (рендер, скользящее потребление T-142: предвыборка до
+			// 2 пачек +Concurrency ≈ 36 записей; при дефолтных
+			// contexts=4/timeout=25 с хвост ждёт ≤ ~3,8 мин; при
+			// contexts=1 — до ~13,8 мин, порог поднимают вместе с
+			// понижением contexts, см. queue.DefaultClaimMinIdle).
 			ClaimMinIdle: Duration(10 * time.Minute),
 		},
 		Ingest: Ingest{
@@ -430,8 +433,21 @@ func Default() *Config {
 			TaskPerDomain: 8,
 		},
 		Render: Render{
-			RemoteURL:         "",
-			Contexts:          3,
+			RemoteURL: "",
+			// Верхняя граница рекомендации ТЗ 5.6 (2–4): потолок рендера
+			// contexts/5.1 с (замер T-092 §4) — 4 ≈ 0.78 стр/с против
+			// 0.59 при 3. Бюджет: пик RSS Chromium при contexts=3 —
+			// 1024 MiB (T-092 §6) при пороге перезапуска 1536 MiB и
+			// cgroup 2 ГБ (ТЗ 3.2); +1 контекст = +1 страница в полёте
+			// (память растёт сублинейно — базовый процесс общий),
+			// разрастание ограничено контролем RSS раз в задачу
+			// (T-065), жёсткий потолок — MemoryMax. Юнит самого
+			// render-worker держит DOM в полёте ≤ Concurrency ×
+			// max_store_bytes (≈8 МиБ + transient-копии) — на фоне
+			// MemoryMax 128M (T-092 §6: max 128 MiB у потолка)
+			// контроль — повторный замер после деплоя, рядом с RSS
+			// Chromium.
+			Contexts:          4,
 			Timeout:           Duration(25 * time.Second),
 			RestartEveryPages: 500,
 			// 1,5 ГиБ = 75 % бюджета Chromium ≈ 2 ГБ (ТЗ 3.2, cgroup

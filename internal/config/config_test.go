@@ -85,7 +85,7 @@ func TestDefault(t *testing.T) {
 		{"http.task_consume", c.HTTP.TaskConsume, 16},
 		{"http.task_per_domain", c.HTTP.TaskPerDomain, 8},
 		{"render.remote_url", c.Render.RemoteURL, ""},
-		{"render.contexts", c.Render.Contexts, 3},
+		{"render.contexts", c.Render.Contexts, 4},
 		{"render.timeout", c.Render.Timeout.D(), 25 * time.Second},
 		{"render.restart_every_pages", c.Render.RestartEveryPages, 500},
 		{"render.restart_memory_bytes", c.Render.RestartMemoryBytes.B(), int64(1536 << 20)},

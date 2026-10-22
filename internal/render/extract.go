@@ -77,7 +77,7 @@ func extractDOMExprLimited(limit int) string {
 }
 
 // truncateDOM — жёсткий байтовый предел итогового DOM в памяти воркера:
-// при MemoryMax=128M и render.contexts=3 неограниченный DOM (плюс
+// при MemoryMax=128M и render.contexts=4 неограниченный DOM (плюс
 // transient-буфер chromedp и копии хэша/Put) выбивает cgroup-бюджет
 // OOM-kill'ом. Сверх лимита DOM обрезается и получает признак обрезки;
 // граница среза откатывается на начало многобайтного символа.

@@ -31,7 +31,9 @@
 // Флаг render_pending (T-066) render-worker не трогает: владелец флага —
 // HTTP-этап, его проход доработки снимает бит после публикации q:render;
 // рендер меняет только строку результата (§7 — домен уже done, рендер
-// асинхронное дополнение).
+// асинхронное дополнение). Потребление q:render — скользящее (T-142,
+// образец T-139): чтение при освобождении слота доставки, без барьера
+// окна пачки.
 package renderworker
 
 import (
@@ -44,6 +46,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -123,11 +126,19 @@ const (
 	// DefaultConcurrency — доставок q:render в работе одновременно.
 	// Выше render.contexts не ускоряет сам рендер (слоты пула — узкое
 	// горло этапа, ТЗ 5.6), но перекрывает его БД-часть (Put, транзакция,
-	// публикация) — берём по верхней границе рекомендованных контекстов.
+	// публикация) — берём по верхней границе рекомендованных контекстов
+	// (дефолт render.contexts после T-142 — та же четвёрка). Боевая
+	// сборка передаёт max(DefaultConcurrency, render.contexts): слоты
+	// пула не должны простаивать при contexts > 4 (cmd/render-worker).
 	DefaultConcurrency = 4
 
-	// DefaultConsume — записей q:render за одно чтение: окно чтения не
-	// глубже запаса обработки (стиль httpworker).
+	// DefaultConsume — записей q:render за одно чтение: размер пачки
+	// XREADGROUP и буфера предвыборки скользящего потребления (T-142,
+	// образец T-139) — чтение идёт вперёд обработки не глубже пары пачек
+	// (текущая в руке читателя + буфер), следующее чтение происходит при
+	// освобождении слотов доставок, окно чтения параллелизм не
+	// ограничивает; столько же доставок подряд без подтверждения — порог
+	// предохранителя паузы (renderFailWaitBase ниже).
 	DefaultConsume = 16
 
 	// DefaultErrorWait — пауза после ошибок Redis и при недоступном
@@ -439,17 +450,54 @@ func renderHeadersJSON(h http.Header) (*string, error) {
 
 // --- рабочий цикл ------------------------------------------------------------
 
+// renderFailWaitBase — стартовая пауза предохранителя рабочего цикла
+// (Run): доставки, подряд оставшиеся без XACK числом в целую пачку чтения
+// (Consume) при систематическом сбое обработки — рендер/БД/публикация, —
+// приостанавливают чтение q:render с удвоением паузы до DefaultErrorWait
+// (образец — workerFailWaitBase httpworker, T-139). Без паузы цикл
+// продолжал бы черпать задачи: каждая доставка жгла попытку (XAUTOCLAIM
+// после DefaultClaimMinIdle, T-025) и уносила её в q:dead. Переменная, а
+// не константа: юнит-тесты сжимают паузу, не выжидая секунды.
+var renderFailWaitBase = time.Second
+
+// renderFailBackoff — пауза после streak подряд выдержанных пауз
+// предохранителя (серия нарастает, пока читатель не увидит ни одного
+// успеха — счётчик неудач обнуляется подтверждённой доставкой):
+// удвоение от renderFailWaitBase, потолок DefaultErrorWait (сдвиг
+// ограничен — переполнение Duration). streak < 1 ограничивается до 1 —
+// отрицательный сдвиг Duration паникует (ревью T-142).
+func renderFailBackoff(streak int) time.Duration {
+	if streak < 1 {
+		streak = 1
+	}
+	d := renderFailWaitBase << min(streak-1, 5)
+	if d > DefaultErrorWait {
+		d = DefaultErrorWait
+	}
+	return d
+}
+
 // Run — рабочий цикл render-worker (ТЗ 4.2, §5.6, §7): читает задачи
-// q:render группой потребителей окном Consume и обрабатывает доставки
+// q:render группой потребителей пачками Consume и обрабатывает доставки
 // параллельно до Concurrency, каждую — паттерном Processing (T-025):
-// рендер → запись в БД → публикация q:analyze → XACK. Живость браузера
-// (Options.Alive) проверяется перед каждым чтением: недоступный Chromium —
-// пауза потребления, доставки остаются в стриме непрочитанными (не в PEL),
-// перезапуск браузера — T-065. Работает до отмены ctx и возвращает nil —
-// контракт OnRun каркаса (T-012; начатые задачи дорабатывают или
-// возвращаются очереди повторной доставкой, ТЗ 3.4). Ошибка чтения или
-// обработки не останавливает цикл: логируется (Warn), неподтверждённая
-// доставка вернётся XAUTOCLAIM (ТЗ 4.2).
+// рендер → запись в БД → публикация q:analyze → XACK. Потребление
+// скользящее (T-142, образец T-139 httpworker): следующее чтение
+// происходит при освобождении слотов доставок (чтение идёт вперёд
+// обработки не глубже пары пачек Consume), цикл не ждёт завершения
+// пачки целиком — барьер окна на хвосте длительностей (страницы до
+// render.timeout, 20–25 с) держал бы слоты праздными и резал потолок
+// этапа поверх узкого горла Chromium (замер T-092 §4: 5.1 с/страница).
+// Живость браузера (Options.Alive) проверяется перед каждым чтением:
+// недоступный Chromium — пауза потребления, доставки остаются в стриме
+// непрочитанными (не в PEL), перезапуск браузера — T-065. Работает до
+// отмены ctx и возвращает nil — контракт OnRun каркаса (T-012; начатые
+// задачи дорабатывают или возвращаются очереди повторной доставкой,
+// ТЗ 3.4). Ошибка чтения или обработки не останавливает цикл:
+// логируется (Warn), неподтверждённая доставка вернётся XAUTOCLAIM
+// (ТЗ 4.2); Consume доставок подряд без единого подтверждения —
+// систематический сбой обработки — выдерживает паузу-предохранитель
+// (renderFailWaitBase): черпать новые задачи при лежащей обработке
+// бессмысленно, попытки доставок сгорают.
 func Run(ctx context.Context, w *Worker, opts Options) error {
 	if w == nil {
 		return errors.New("renderworker: цикл воркера: воркер не задан")
@@ -489,59 +537,146 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 	}
 
 	sem := make(chan struct{}, o.Concurrency)
+	// Скользящее потребление (T-142, образец T-139): читатель держит
+	// впереди обработки не больше пары пачек Consume доставок (текущая
+	// пачка в руке + буфер pending), диспетчер ниже занимает слот
+	// семафора на время одной доставки и сразу берёт следующую —
+	// завершение задачи освобождает слот и двигает чтение, никто не
+	// ждёт пачку целиком. Прочитанные, но не начатые доставки (буфер
+	// полон, слоты заняты хвостом длительностей) на отмене ctx остаются
+	// без XACK и возвращаются очереди клеймом XAUTOCLAIM — как и не
+	// начатые доставки окна прежде (at-least-once, ТЗ 3.4).
+	//
+	// Окно удержания доставок живым воркером (прочитано и не
+	// подтверждено) — до 2×Consume + Concurrency ≈ 36 записей: оно
+	// обязано укладываться в redis.claim_min_idle с запасом (иначе
+	// клейм перехватывает живую работу); при дефолтных contexts=4 и
+	// render.timeout=25 с хвост ожидает ≤ ~3,8 мин против порога
+	// 10 мин, при contexts=1 окно растёт до ~13,8 мин — поднимайте
+	// claim_min_idle вместе с понижением render.contexts (ревью T-142).
+	pending := make(chan queue.Delivery, o.Consume)
+	var failed atomic.Int64 // доставок подряд без подтверждения
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		failStreak := 0 // подряд выдержанных пауз предохранителя
+		for {
+			// Живость браузера — перед каждым чтением: мёртвый Chromium
+			// задачи не принимает, новые чтения прекращаются — не
+			// прочитанные доставки остаются в стриме (не в PEL — клеймы
+			// не жгут попытки, T-025); уже прочитанные в буфер
+			// предвыборки дорабатываются диспетчером и при неудаче
+			// осядут в PEL до клейма — как и окно прежнего барьерного
+			// цикла, поведение не хуже. Поколение зонды менеджера
+			// заменяют сами (реконнект, T-065).
+			if o.Alive != nil && !o.Alive() {
+				log.Warn("Chromium недоступен — q:render не читается (перезапуск — менеджер, T-065)")
+				wait(DefaultErrorWait)
+				if ctx.Err() != nil {
+					return // graceful shutdown
+				}
+				continue
+			}
+			// Предохранитель (renderFailWaitBase): доставки, подряд
+			// оставшиеся без подтверждения числом в целую пачку чтения
+			// (Consume) без единого успеха — систематический сбой
+			// обработки (рендер/БД/публикация); пауза с удвоением до
+			// DefaultErrorWait. Подтверждённая доставка обнуляет счётчик
+			// неудач сразу, серия пауз сбрасывается на следующей
+			// итерации читателя, увидевшей счётчик нулевым.
+			if n := failed.Load(); n == 0 {
+				failStreak = 0
+			} else if int(n) >= o.Consume {
+				if ctx.Err() != nil {
+					return // graceful shutdown: паузы не было и не будет
+				}
+				failStreak++
+				pause := renderFailBackoff(failStreak)
+				// Наблюдаемость простоя: пауза останавливает чтение
+				// этапа — Warn с серией и числом неудач (частота
+				// ограничена удвоением паузы, не чаще ~2/мин на серии).
+				log.Warn("пауза предохранителя чтения q:render: доставки падают подряд",
+					"failed", n, "streak", failStreak, "wait", pause.String())
+				wait(pause)
+				if ctx.Err() != nil {
+					return // graceful shutdown: wait вышел по отмене
+				}
+			}
+			deliveries, err := w.q.Consume(ctx, queue.StreamRender, o.Group, o.Consumer, o.Consume)
+			if err != nil {
+				if ctx.Err() != nil {
+					return // graceful shutdown
+				}
+				log.Warn("цикл render-worker: чтение q:render", "err", err)
+				wait(DefaultErrorWait)
+				continue
+			}
+			for _, d := range deliveries {
+				select {
+				case pending <- d:
+				case <-ctx.Done():
+					return // буферные доставки без XACK вернёт XAUTOCLAIM
+				}
+			}
+		}
+	}()
+
+	// Диспетчер: ждёт свободный слот (или отмену) и запускает доставку.
+	// Слот семафора — с выходом по отмене: отмена ctx во время ожидания
+	// слота не должна запускать доставку с уже отменённым ctx (выбор
+	// канала select недетерминирован, поэтому отмена проверяется и после
+	// получения слота).
+	var wg sync.WaitGroup
+dispatch:
 	for {
-		if o.Alive != nil && !o.Alive() {
-			log.Warn("Chromium недоступен — q:render не читается (перезапуск — менеджер, T-065)")
-			wait(DefaultErrorWait)
-			if ctx.Err() != nil {
-				return nil // graceful shutdown
-			}
-			continue
+		var d queue.Delivery
+		select {
+		case <-ctx.Done():
+			break dispatch // доставки буфера не начаты — без XACK
+		case d = <-pending:
 		}
-
-		deliveries, err := w.q.Consume(ctx, queue.StreamRender, o.Group, o.Consumer, o.Consume)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil // graceful shutdown
-			}
-			log.Warn("цикл render-worker: чтение q:render", "err", err)
-			wait(DefaultErrorWait)
-			continue
+		select {
+		case <-ctx.Done():
+			break dispatch
+		case sem <- struct{}{}:
 		}
-
-		var wg sync.WaitGroup
-		for _, d := range deliveries {
-			if ctx.Err() != nil {
-				break // не начатые доставки окна не подтверждены
-			}
-			sem <- struct{}{}
-			wg.Add(1)
-			go func(d queue.Delivery) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				// Паника доставки не должна ронять процесс без лога и
-				// очистки — тот же инвариант, что у горутины OnRun
-				// (internal/service): panic → Error-лог, доставка без
-				// XACK вернётся повторной доставкой (XAUTOCLAIM, T-025);
-				// in-flight соседей и graceful shutdown сохраняются.
-				defer func() {
-					if r := recover(); r != nil {
-						log.Error("паника обработки доставки q:render",
-							"entry", d.ID, "panic", r, "stack", string(debug.Stack()))
-					}
-				}()
-				err := queue.Processing(ctx, w.q, o.Group, d, w.processDelivery)
-				if err != nil && ctx.Err() == nil {
+		if ctx.Err() != nil {
+			<-sem
+			break dispatch
+		}
+		wg.Add(1)
+		go func(d queue.Delivery) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// Паника доставки не должна ронять процесс без лога и
+			// очистки — тот же инвариант, что у горутины OnRun
+			// (internal/service): panic → Error-лог, доставка без
+			// XACK вернётся повторной доставкой (XAUTOCLAIM, T-025);
+			// in-flight соседей и graceful shutdown сохраняются.
+			// Для предохранителя паника — та же неподтверждённая
+			// доставка: серия паник пережигала бы попытки без паузы.
+			defer func() {
+				if r := recover(); r != nil {
+					failed.Add(1)
+					log.Error("паника обработки доставки q:render",
+						"entry", d.ID, "panic", r, "stack", string(debug.Stack()))
+				}
+			}()
+			err := queue.Processing(ctx, w.q, o.Group, d, w.processDelivery)
+			if err != nil {
+				failed.Add(1)
+				if ctx.Err() == nil {
 					log.Warn("задача q:render не подтверждена — вернётся повторной доставкой",
 						"entry", d.ID, "err", err)
 				}
-			}(d)
-		}
-		wg.Wait()
-		if ctx.Err() != nil {
-			return nil // остановка: окно доработано или возвращено очереди
-		}
+			} else {
+				failed.Store(0)
+			}
+		}(d)
 	}
+	wg.Wait()    // начатые доставки дорабатывают (graceful stop, ТЗ 3.4)
+	<-readerDone // читатель завершается той же отменой ctx (Consume/wait)
+	return nil
 }
 
 // processDelivery обрабатывает одну доставку q:render: декодирование

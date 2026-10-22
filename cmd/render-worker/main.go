@@ -166,6 +166,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// только пауза потребления, пока старт не удастся: доставки
 		// остаются в стриме, не в PEL, и не расходуют попытки.
 		Alive: manager.Alive,
+		// Доставок в работе — не меньше слотов пула: без этого
+		// render.contexts > 4 не ускорял бы этап (параллелизм цикла
+		// остался бы 4, лишние слоты пула простаивали; ревью T-142).
+		Concurrency: max(renderworker.DefaultConcurrency, cfg.Render.Contexts),
 	}
 	w, err := renderworker.New(pool, q, store, manager, opts)
 	if err != nil {

@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"crawler/internal/config"
 	"crawler/internal/content"
 	"crawler/internal/queue"
 	"crawler/internal/render"
@@ -437,6 +438,10 @@ type rwFakeRenderer struct {
 	output  render.RenderOutput
 	err     error
 	panicOn string // URL задач, на которых Run паникует (тест R-04)
+	// blockOn — URL задач, висящих в рендере до отмены ctx («страница-
+	// тарпит» до render.timeout): держит слот доставки — для тестов
+	// скользящего потребления (T-142).
+	blockOn map[string]bool
 
 	mu    sync.Mutex
 	tasks []render.RenderTask
@@ -455,6 +460,10 @@ func (r *rwFakeRenderer) Run(ctx context.Context, task render.RenderTask) (rende
 	if r.panicOn != "" && task.URL == r.panicOn {
 		panic("фейк рендера: паника в задаче " + task.URL)
 	}
+	if r.blockOn[task.URL] {
+		<-ctx.Done() // слот занят до отмены — хвост длительностей этапа
+		return render.RenderOutput{}, ctx.Err()
+	}
 	if r.err != nil {
 		return render.RenderOutput{}, r.err
 	}
@@ -467,6 +476,20 @@ func (r *rwFakeRenderer) tasksSnapshot() []render.RenderTask {
 	out := make([]render.RenderTask, len(r.tasks))
 	copy(out, r.tasks)
 	return out
+}
+
+// tasksCountURL — сколько раз рендер получил задачу с этим URL
+// (0 — доставка не начиналась: слоты заняты).
+func (r *rwFakeRenderer) tasksCountURL(url string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, t := range r.tasks {
+		if t.URL == url {
+			n++
+		}
+	}
+	return n
 }
 
 // --- фейковая очередь --------------------------------------------------------
@@ -618,6 +641,21 @@ func rwDelivery(id string) queue.Delivery {
 	payload, err := json.Marshal(rwTask)
 	if err != nil {
 		panic(err)
+	}
+	return queue.Delivery{Stream: queue.StreamRender, ID: id, Payload: payload}
+}
+
+// rwKeyDelivery — валидная доставка с Result-ключом произвольной строки
+// (variant 0, как у строк тестов цикла; T-142).
+func rwKeyDelivery(t *testing.T, id string, key rwRowKey, name string) queue.Delivery {
+	t.Helper()
+	task := queue.Result{
+		ZoneID: key.zone, DomainID: key.domain,
+		SubdomainID: key.subdomain, Variant: 0, Name: name,
+	}
+	payload, err := json.Marshal(task)
+	if err != nil {
+		t.Fatal(err)
 	}
 	return queue.Delivery{Stream: queue.StreamRender, ID: id, Payload: payload}
 }
@@ -1263,6 +1301,13 @@ func TestRenderWorker_RunPanicRecovered(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, f.w, Options{}) }()
 
+	// e1 обязан дойти до рендера ДО отмены (ревью T-142, P2-4): отмена
+	// сразу после XACK соседа оставляла панику недетерминированной —
+	// доставка могла не стартовать вовсе (ctx уже отменён), recover-ветка
+	// не выполнялась. Дошедшая до рендера с живым ctx доставка паникует
+	// неизбежно (между записью задачи и panicOn только проверка ctx).
+	rwWaitURL(t, f.renderer, "https://spa.example/")
+
 	// e2 обязан доработать и подтвердиться, несмотря на панику e1.
 	select {
 	case <-f.pool.j.ackNotify:
@@ -1294,5 +1339,482 @@ func TestRenderWorker_RunPanicRecovered(t *testing.T) {
 func TestRenderWorker_RunValidation(t *testing.T) {
 	if err := Run(context.Background(), nil, Options{}); err == nil {
 		t.Fatal("Run должен отклонять nil-воркер")
+	}
+}
+
+// TestRenderWorker_RunCancelWhileWaitingSlot — отмена ctx во время
+// ожидания слота семафора не запускает доставку с уже отменённым ctx
+// (порт TestWorkerRunCancelWhileWaitingSlot httpworker, T-139; ревью
+// T-142, P3-2 r2): окно из двух задач при Concurrency=1, первая висит в
+// рендере до отмены — вторая обязана остаться не начатой (её URL не
+// доходит до рендера), окно возвращается очереди повторной доставкой.
+func TestRenderWorker_RunCancelWhileWaitingSlot(t *testing.T) {
+	s := rwSlidingSetup(t, 1, 1) // блокирующая держит единственный слот
+	f := s.f
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, f.w, Options{Concurrency: 1, Consume: 2}) }()
+
+	// Блокирующая доставка в рендере (держит слот) — отменяем: быстрая
+	// в этот момент ждёт семафор.
+	rwWaitURL(t, f.renderer, s.blockURLs[0])
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	if n := f.renderer.tasksCountURL(s.bufURLs[0]); n != 0 {
+		t.Errorf("доставка запущена после отмены ctx: рендер вызван %d раз", n)
+	}
+	if acks := len(f.q.ackedSnapshot()); acks != 0 {
+		t.Errorf("подтверждений %d — окно обязано вернуться очереди", acks)
+	}
+}
+
+// TestRenderWorker_OptionsDefaults — дефолты цикла воркера и
+// конфигурации согласованы (образец TestWorkerOptionsDefaults T-139;
+// ревью T-142, P3-1 r2): DefaultConcurrency — верхняя граница
+// рекомендованных контекстов, дефолт render.contexts равен ей, расхождение
+// молча меняло бы поведение боевого экземпляра (max(4, contexts)) против
+// документации.
+func TestRenderWorker_OptionsDefaults(t *testing.T) {
+	o := Options{}.withDefaults()
+	if o.Concurrency != DefaultConcurrency || o.Consume != DefaultConsume {
+		t.Errorf("withDefaults: concurrency=%d consume=%d, дефолты %d/%d",
+			o.Concurrency, o.Consume, DefaultConcurrency, DefaultConsume)
+	}
+	cfg := config.Default()
+	if cfg.Render.Contexts != DefaultConcurrency {
+		t.Errorf("render.contexts=%d расходится с DefaultConcurrency=%d (боевая сборка берёт max)",
+			cfg.Render.Contexts, DefaultConcurrency)
+	}
+}
+
+// --- скользящее потребление цикла (T-142) ------------------------------------
+
+// rwSlidingFixture — строки и доставки тестов скользящего потребления:
+// ключи с разными subdomain_id, у каждой строки свой итоговый URL.
+type rwSlidingFixture struct {
+	f         *rwFixture
+	blockKeys []rwRowKey
+	blockURLs []string
+	bufKeys   []rwRowKey
+	bufURLs   []string
+}
+
+// rwSlidingSetup — N блокирующихся строк («страницы-тарпиты», держат
+// слоты до отмены ctx) и M быстрых; доставки — сначала блокирующиеся,
+// потом быстрые (хвост пачки — как в барьерном окне до T-142).
+func rwSlidingSetup(t *testing.T, blocks, fasts int) *rwSlidingFixture {
+	t.Helper()
+	f := newRWFixture(t)
+	f.renderer.output = rwOutput("<html>dom</html>")
+	f.renderer.blockOn = make(map[string]bool)
+	s := &rwSlidingFixture{f: f}
+	var deliveries []queue.Delivery
+	for i := 0; i < blocks; i++ {
+		key := rwRowKey{zone: rwKey.zone, domain: rwKey.domain, subdomain: int16(10 + i), variant: 0}
+		url := fmt.Sprintf("https://block%d.example/", i)
+		f.pool.seedRow(key, url, nil)
+		s.blockKeys = append(s.blockKeys, key)
+		s.blockURLs = append(s.blockURLs, url)
+		f.renderer.blockOn[url] = true
+		deliveries = append(deliveries, rwKeyDelivery(t, fmt.Sprintf("b%d", i), key, "slide.example"))
+	}
+	for i := 0; i < fasts; i++ {
+		key := rwRowKey{zone: rwKey.zone, domain: rwKey.domain, subdomain: int16(20 + i), variant: 0}
+		url := fmt.Sprintf("https://fast%d.example/", i)
+		f.pool.seedRow(key, url, nil)
+		s.bufKeys = append(s.bufKeys, key)
+		s.bufURLs = append(s.bufURLs, url)
+		deliveries = append(deliveries, rwKeyDelivery(t, fmt.Sprintf("f%d", i), key, "slide.example"))
+	}
+	f.q.deliveries = deliveries
+	return s
+}
+
+// rwWaitURL — ждёт, пока рендер получит задачу с URL.
+func rwWaitURL(t *testing.T, r *rwFakeRenderer, url string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for r.tasksCountURL(url) == 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("доставка %s не дошла до рендера", url)
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// rwStopLoop — отмена ctx и ожидание чистого nil от Run.
+func rwStopLoop(t *testing.T, cancel context.CancelFunc, done <-chan error) {
+	t.Helper()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+}
+
+// TestRenderWorker_RunSlidingConsumption — суть T-142: чтение q:render не
+// ждёт завершения пачки целиком. Первая доставка окна висит в рендере до
+// отмены ctx (хвост длительностей — страница до render.timeout); при
+// барьере окна (до T-142) wg.Wait держал бы цикл на ней — хвостовые
+// доставки пачки и следующее чтение не начинались. Скользящее потребление
+// обязано подтвердить все быстрые доставки, пока блокирующая в полёте:
+// слоты освобождаются завершившимися задачами, читатель двигается дальше.
+func TestRenderWorker_RunSlidingConsumption(t *testing.T) {
+	s := rwSlidingSetup(t, 1, 4) // блокирующая + 4 быстрых
+	f := s.f
+	f.pool.j.ackNotify = make(chan struct{}, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, f.w, Options{Concurrency: 2, Consume: 4}) }()
+
+	// Блокирующая доставка в рендере и держит слот — быстрые дорабатывают
+	// и подтверждаются мимо неё (пачка 4: b0 + f0..f2, чтение f3 —
+	// следующей пачкой, возможной только при скользящем потреблении).
+	rwWaitURL(t, f.renderer, s.blockURLs[0])
+	deadline := time.After(5 * time.Second)
+	for acks := 0; acks < 4; {
+		select {
+		case <-f.pool.j.ackNotify:
+			acks++
+		case <-deadline:
+			cancel()
+			t.Fatalf("скользящее потребление не подхватило хвост: подтверждено %d из 4 быстрых", acks)
+		}
+	}
+
+	rwStopLoop(t, cancel, done)
+	// Блокирующая доставка не подтверждена — вернётся повторной
+	// доставкой (at-least-once, ТЗ 3.4), быстрые подтверждены.
+	acked := f.q.ackedSnapshot()
+	if len(acked) != 4 {
+		t.Fatalf("XACK = %v, нужны 4 быстрые (блокирующая — без XACK)", acked)
+	}
+	got := make(map[string]bool, len(acked))
+	for _, id := range acked {
+		got[id] = true
+	}
+	for _, id := range []string{"f0", "f1", "f2", "f3"} {
+		if !got[id] {
+			t.Errorf("XACK = %v, нет быстрой %s", acked, id)
+		}
+	}
+	for i, key := range s.bufKeys {
+		if !rwRowSnapshot(f.pool, key).rendered {
+			t.Errorf("быстрая доставка f%d не записана", i)
+		}
+	}
+}
+
+// TestRenderWorker_RunCancelKeepsBufferUnacked — гарантия скользящего
+// буфера (T-142, по образцу httpworker T-139): прочитанные вперёд, но не
+// начатые доставки (слоты заняты блокирующимися задачами) при отмене ctx
+// НЕ запускаются и НЕ подтверждаются — вместе с текущими пачками читателя
+// они остаются в pending стрима и возвращаются клеймом XAUTOCLAIM
+// (at-least-once, ТЗ 3.4). Синхронизация — по факту предвыборки (второе
+// чтение состоялось, пока первая пачка ещё в работе): барьерный цикл до
+// T-142 вторую пачку не читал вовсе — ожидание чтений и есть
+// регрессионная часть (ревью T-142, P2-3), Sleep по времени не нужен.
+func TestRenderWorker_RunCancelKeepsBufferUnacked(t *testing.T) {
+	s := rwSlidingSetup(t, 2, 4) // обе блокирующие держат слоты
+	f := s.f
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	// Consume=4: пачка 1 = [b0, b1, f0, f1], пачка 2 = [f2, f3] —
+	// читатель обязан прочитать обе, пока b0/b1 держат оба слота.
+	go func() { done <- Run(ctx, f.w, Options{Concurrency: 2, Consume: 4}) }()
+
+	// Обе блокирующиеся в рендере (держат слоты).
+	for _, url := range s.blockURLs {
+		rwWaitURL(t, f.renderer, url)
+	}
+	// Предвыборка: вторая пачка прочитана до завершения первой —
+	// буфер f2/f3 реально существует (на барьерном цикле чтений
+	// осталось бы 1 и ожидание здесь падало).
+	deadline := time.After(5 * time.Second)
+	for f.q.consumesCount() < 2 {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatalf("предвыборка не состоялась: чтений %d, нужно ≥2 (хвост окна обязан читаться до завершения первой пачки)", f.q.consumesCount())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+
+	// Быстрые прочитаны вперёд, но обязаны остаться не начатыми —
+	// не доходя до рендера, сколько бы цикл ни работал.
+	for i, url := range s.bufURLs {
+		if n := f.renderer.tasksCountURL(url); n != 0 {
+			t.Errorf("буферная доставка f%d запущена при занятых слотах: рендер вызван %d раз", i, n)
+		}
+	}
+	if acks := len(f.q.ackedSnapshot()); acks != 0 {
+		t.Errorf("подтверждений %d до отмены — не должно быть", acks)
+	}
+
+	rwStopLoop(t, cancel, done)
+	for i, url := range s.bufURLs {
+		if n := f.renderer.tasksCountURL(url); n != 0 {
+			t.Errorf("буферная доставка f%d запущена после отмены: рендер вызван %d раз", i, n)
+		}
+	}
+	if acks := len(f.q.ackedSnapshot()); acks != 0 {
+		t.Errorf("подтверждений %d — не начатые доставки обязаны вернуться очереди", acks)
+	}
+}
+
+// rwPoisonQueue — бесконечный источник ядовитых доставок: каждое чтение
+// немедленно возвращает пачку невалидных записей (Decode в
+// processDelivery падает, доставка остаётся без XACK). Скорость чтений
+// ограничивает только предохранитель цикла — идеальный измеритель его
+// работы без таймингов обработки (образец — workerPoisonQueue httpworker).
+type rwPoisonQueue struct {
+	mu       sync.Mutex
+	consumes int
+	acked    []string
+}
+
+func (q *rwPoisonQueue) Publish(context.Context, string, queue.Message) (string, error) {
+	return "", nil
+}
+
+func (q *rwPoisonQueue) Consume(_ context.Context, _, _, _ string, n int) ([]queue.Delivery, error) {
+	if n < 1 {
+		n = 1
+	}
+	out := make([]queue.Delivery, n)
+	for i := range out {
+		out[i] = queue.Delivery{Stream: queue.StreamRender, ID: fmt.Sprintf("poison-%d", i), Payload: []byte("{")}
+	}
+	q.mu.Lock()
+	q.consumes++
+	q.mu.Unlock()
+	return out, nil
+}
+
+func (q *rwPoisonQueue) Ack(_ context.Context, _, _ string, ids ...string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.acked = append(q.acked, ids...)
+	return nil
+}
+
+func (q *rwPoisonQueue) consumeCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.consumes
+}
+
+func (q *rwPoisonQueue) ackedCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.acked)
+}
+
+// TestRenderWorker_RunBackoffOnFailures — предохранитель скользящего
+// цикла (T-142): при систематическом сбое обработки (каждая доставка
+// падает — здесь ядовитые записи) чтение q:render приостанавливается с
+// удвоением паузы, иначе цикл пережигал бы попытки доставок (XAUTOCLAIM →
+// q:dead, T-025) в горячем режиме; чтения при этом продолжаются — счётчик
+// не блокирует цикл навсегда. Пауза сжата до 100 мс: секунды в юнит-тесте
+// не ждать, границы взяты с многократным запасом против джиттера CI.
+func TestRenderWorker_RunBackoffOnFailures(t *testing.T) {
+	old := renderFailWaitBase
+	renderFailWaitBase = 100 * time.Millisecond
+	t.Cleanup(func() { renderFailWaitBase = old })
+
+	// Пачка чтения минимальна: порог предохранителя — Consume подряд
+	// неудач (1), конвейер чтения не глубже пары доставок.
+	f := newRWFixture(t)
+	q := &rwPoisonQueue{}
+	w, err := New(f.pool, q, f.store, f.renderer, Options{Concurrency: 1, Consume: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, w, Options{Concurrency: 1, Consume: 1}) }()
+
+	// Первые чтения уходят до срабатывания счётчика (регистрация неудач
+	// асинхронна) — окно в 450 мс покрывает их с запасом; дальше паузы
+	// 100/200/400 мс душат темп чтений до единиц.
+	deadline := time.After(5 * time.Second)
+	waitCount := func(n int) int {
+		for {
+			got := q.consumeCount()
+			if got >= n {
+				return got
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("чтений %d, ждалось ≥%d — предохранитель заблокировал цикл", got, n)
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}
+	waitCount(1)
+	time.Sleep(450 * time.Millisecond)
+	first := q.consumeCount()
+	if first > 10 {
+		t.Errorf("чтений %d за 450 мс — предохранитель не душит темп (ждалось ≤10)", first)
+	}
+
+	// Паузы удваиваются: следующий интервал добавляет считанные чтения,
+	// а не десятки. Рост между двумя замерами — не более пары чтений.
+	time.Sleep(450 * time.Millisecond)
+	if grew := q.consumeCount() - first; grew > 2 {
+		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией неудач", grew)
+	}
+
+	rwStopLoop(t, cancel, done)
+	if q.ackedCount() != 0 {
+		t.Errorf("подтверждений %d при ядовитых доставках", q.ackedCount())
+	}
+	if tasks := f.renderer.tasksSnapshot(); len(tasks) != 0 {
+		t.Errorf("рендер не должен запускаться: %+v", tasks)
+	}
+}
+
+// rwPanicQueue — бесконечный источник валидных доставок паникующего
+// ключа: Decode проходит, строка есть, рендер паникует (recover в цикле,
+// ревью T-142 P2-4) — доставки без XACK; скорость чтений душит
+// предохранитель, паники учтены счётчиком failed как неудачи.
+type rwPanicQueue struct {
+	payload []byte // Result паникующего ключа (rwKey)
+
+	mu       sync.Mutex
+	consumes int
+}
+
+func (q *rwPanicQueue) Publish(context.Context, string, queue.Message) (string, error) {
+	return "", nil // до публикации паникующая доставка не доходит
+}
+
+func (q *rwPanicQueue) Consume(_ context.Context, _, _, _ string, n int) ([]queue.Delivery, error) {
+	if n < 1 {
+		n = 1
+	}
+	out := make([]queue.Delivery, n)
+	for i := range out {
+		out[i] = queue.Delivery{Stream: queue.StreamRender, ID: fmt.Sprintf("panic-%d", i), Payload: q.payload}
+	}
+	q.mu.Lock()
+	q.consumes++
+	q.mu.Unlock()
+	return out, nil
+}
+
+func (q *rwPanicQueue) Ack(context.Context, string, string, ...string) error {
+	panic("rwPanicQueue: Ack недостижим — паникующие доставки не подтверждаются")
+}
+
+func (q *rwPanicQueue) consumeCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.consumes
+}
+
+// TestRenderWorker_RunPanicBackoff — паники в счётчике предохранителя
+// (T-142): серия паникующих доставок без единого подтверждения — та же
+// серия неудач, что и ошибки обработки: чтение q:render душится паузой
+// с удвоением (без учёта паник цикл пережигал бы попытки доставок на
+// полном ходу), процесс не падает.
+func TestRenderWorker_RunPanicBackoff(t *testing.T) {
+	old := renderFailWaitBase
+	renderFailWaitBase = 100 * time.Millisecond
+	t.Cleanup(func() { renderFailWaitBase = old })
+
+	f := newRWFixture(t)
+	f.pool.seedRow(rwKey, "https://spa.example/", nil)
+	f.renderer.panicOn = "https://spa.example/"
+	q := &rwPanicQueue{payload: rwDelivery("p").Payload}
+	w, err := New(f.pool, q, f.store, f.renderer, Options{Concurrency: 1, Consume: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, w, Options{Concurrency: 1, Consume: 1}) }()
+
+	// Паника случилась (доставка дошла до рендера), чтения душатся —
+	// те же границы, что у TestRenderWorker_RunBackoffOnFailures.
+	rwWaitURL(t, f.renderer, "https://spa.example/")
+	deadline := time.After(5 * time.Second)
+	waitCount := func(n int) int {
+		for {
+			got := q.consumeCount()
+			if got >= n {
+				return got
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("чтений %d, ждалось ≥%d — предохранитель заблокировал цикл", got, n)
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}
+	waitCount(1)
+	time.Sleep(450 * time.Millisecond)
+	first := q.consumeCount()
+	if first > 10 {
+		t.Errorf("чтений %d за 450 мс — паники не душат темп (ждалось ≤10)", first)
+	}
+	time.Sleep(450 * time.Millisecond)
+	if grew := q.consumeCount() - first; grew > 2 {
+		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией паник", grew)
+	}
+
+	rwStopLoop(t, cancel, done)
+	if n := f.renderer.tasksCountURL("https://spa.example/"); n == 0 {
+		t.Error("паникующая доставка не дошла до рендера — тест ничего не проверил")
+	}
+}
+
+// TestRenderFailBackoff — ряд пауз предохранителя: удвоение от базы,
+// потолок DefaultErrorWait, clamp отрицательной серии (ревью T-142,
+// P3-5: streak < 1 не должен паниковать сдвигом).
+func TestRenderFailBackoff(t *testing.T) {
+	old := renderFailWaitBase
+	renderFailWaitBase = time.Second
+	t.Cleanup(func() { renderFailWaitBase = old })
+
+	for _, c := range []struct {
+		streak int
+		want   time.Duration
+	}{
+		{-3, time.Second},
+		{0, time.Second},
+		{1, time.Second},
+		{2, 2 * time.Second},
+		{3, 4 * time.Second},
+		{5, 16 * time.Second},
+		{6, 30 * time.Second},   // 32 с выше потолка DefaultErrorWait
+		{100, 30 * time.Second}, // серия не растёт выше потолка
+	} {
+		if got := renderFailBackoff(c.streak); got != c.want {
+			t.Errorf("renderFailBackoff(%d) = %s, хочу %s", c.streak, got, c.want)
+		}
 	}
 }
