@@ -34,8 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # workflow_run: коммит, который проверял ci (git checkout по SHA)
+          # Полная история и теги: git describe (версия деплоя — в
+          # бинарниках и извещении) ищет ближайший тег обходом истории,
+          # которого нет в shallow-клоне с depth 1.
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-go@v6
         with:
@@ -43,12 +47,15 @@ jobs:
           cache: false
 
       - name: Подготовить .env (версия Tailwind/Alpine для web-css)
+        id: env
         run: cp .env.example .env
 
       - name: Собрать CSS лендинга (go:embed, deploy.md §4.2)
+        id: web-css
         run: make web-css
 
       - name: Собрать статические бинарники
+        id: build
         run: |
           version="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
           revision="$(git rev-parse --short HEAD)"
@@ -59,28 +66,119 @@ jobs:
               -o "out/$svc" "./cmd/$svc"
           done
           echo "version=$version revision=$revision" >> "$GITHUB_STEP_SUMMARY"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           tar -C out -czf binaries.tar.gz .
 
       - name: Настроить SSH
+        id: ssh
         run: |
           install -m 600 /dev/null id_ed25519
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > id_ed25519
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}" > known_hosts.txt
 
-      - name: Загрузить и установить
-        run: |
-          scp $SSH_OPTS -i id_ed25519 binaries.tar.gz "$SSH_HOST:/tmp/crawler-deploy.tar.gz"
-          ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s' -- < deploy/deploy-install.sh
+      # scp и установка — отдельные шаги, чтобы извещение Telegram честно
+      # отделяло провал до начала установки (отката нет) от провала
+      # установки (откат): см. шаг «Извещение Telegram» ниже.
+      - name: Загрузить бинарники (scp)
+        id: upload
+        run: scp $SSH_OPTS -i id_ed25519 binaries.tar.gz "$SSH_HOST:/tmp/crawler-deploy.tar.gz"
 
+      # Откат — trap в deploy-install.sh: активен от systemctl stop до
+      # успешного старта, поэтому провал этого шага = на сервере
+      # предыдущая версия (bin.prev). Исключение — rc=255 (транспорт ssh:
+      # связь потеряна; удалённый скрипт мог дойти до любого места):
+      # состояние сервера неизвестно, извещение говорит об этом честно.
+      - name: Установить на сервер
+        id: install
+        run: |
+          set +e
+          ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s' -- < deploy/deploy-install.sh
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      # Healthcheck сам по себе отката НЕ делает (набор к этому моменту
+      # установлен и trap снят): при провале сервер остаётся на новой
+      # версии, нужен ручной откат (docs/ci-cd.md) — извещение ниже
+      # отражает это явно.
       - name: Проверить живость (healthz всех сервисов)
+        id: healthcheck
         run: |
           ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s' -- < deploy/deploy-healthcheck.sh
 
-      # При падении любой проверки после установки — откат на предыдущие
-      # бинарники (делает deploy-install.sh через trap) и красный ран.
+      # Диагностика при провале (после установки сервер либо откачен
+      # trap'ом install-шага, либо — при провале healthcheck — остался
+      # на новой версии; детали — в извещении Telegram ниже).
       - name: Диагностика (при падении)
         if: failure()
         run: |
           ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" \
             "systemctl list-units 'crawler-*' --no-legend; journalctl -t 'crawler-*' --no-pager -n 50" \
             || true
+
+      # Извещение Telegram (ТЗ §10.4): успех и провал деплоя — одно
+      # сообщение на ран; ручной workflow_dispatch — штатный деплой,
+      # тоже извещается (в отличие от ручных прогонов ci). Отменённый
+      # ран (job.status=cancelled, включая таймаут job'а) извещается как
+      # неуспешный: состояние сервера в этот момент может быть любым.
+      # Версия — из шага сборки (тот же git describe, что в бинарниках),
+      # с пересчётом по чекауту, если шаг не успел; до сборки версии
+      # нет — строка опускается. Факт отката — по семантике
+      # deploy-install.sh: провал установки → откат на bin.prev выполнен
+      # (rc=255 или отмена → состояние неизвестно); провал healthcheck →
+      # отката не было, на сервере осталась новая версия; провал до
+      # установки → строки про откат нет. Сбой отправки не красит ран:
+      # continue-on-error.
+      - name: Извещение Telegram
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          status=fail
+          event="Деплой не успешен"
+          if [ "$JOB_STATUS" = success ]; then
+            status=ok
+            event="Деплой успешен"
+          elif [ "$JOB_STATUS" = cancelled ]; then
+            event="Деплой не успешен (ран отменён)"
+          fi
+          # Имена шагов ниже синхронизировать с name: шагов выше.
+          # pick: failure|cancelled → запомнить имя шага (отменённый
+          # in-flight шаг — тоже виновник).
+          pick() {
+            case "$1" in failure|cancelled) step="$2"; return 0 ;; *) return 1 ;; esac
+          }
+          step="вне основных шагов деплоя (см. лог рана)"
+          rollback=""
+          if pick "${{ steps.web-css.outcome }}" "Собрать CSS лендинга (go:embed, deploy.md §4.2)"; then :
+          elif pick "${{ steps.build.outcome }}" "Собрать статические бинарники"; then :
+          elif pick "${{ steps.ssh.outcome }}" "Настроить SSH"; then :
+          elif pick "${{ steps.upload.outcome }}" "Загрузить бинарники (scp)"; then :
+          elif pick "${{ steps.install.outcome }}" "Установить на сервер"; then
+            if [ "${{ steps.install.outcome }}" = cancelled ] || [ "${{ steps.install.outputs.rc }}" = 255 ]; then
+              rollback=unknown
+            else
+              rollback=performed
+            fi
+          elif pick "${{ steps.healthcheck.outcome }}" "Проверить живость (healthz всех сервисов)"; then
+            rollback=not-performed
+          fi
+          version="${{ steps.build.outputs.version }}"
+          if [ -z "$version" ] && [ "${{ steps.web-css.outcome }}" = success ]; then
+            version="$(git describe --tags --always 2>/dev/null || true)"
+          fi
+          args=(--status "$status" --workflow deploy --event "$event")
+          if [ "$status" != ok ]; then
+            args+=(--step "$step")
+          fi
+          if [ -n "$version" ]; then
+            args+=(--version "$version")
+          fi
+          if [ -n "$rollback" ]; then
+            args+=(--rollback "$rollback")
+          fi
+          deploy/telegram-notify.sh "${args[@]}"

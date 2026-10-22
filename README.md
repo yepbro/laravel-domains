@@ -121,7 +121,7 @@ make reset-internet
 | [`docs/runbooks.md`](docs/runbooks.md) | процедурные инструкции: переобучение словаря zstd, разбор `q:dead`, переанализ |
 | [`docs/mutation-testing.md`](docs/mutation-testing.md) | мутационное тестирование go-mutesting: охват и пороги `make mutate`, отчёты, гашение ложных мутантов, ночной CI-прогон |
 | [`docs/deploy.md`](docs/deploy.md) | боевой деплой systemd: юниты, бюджет памяти, установка |
-| [`docs/ci-cd.md`](docs/ci-cd.md) | непрерывный деплой: GitHub Actions после зелёного CI, откат, секреты |
+| [`docs/ci-cd.md`](docs/ci-cd.md) | непрерывный деплой: GitHub Actions после зелёного CI, откат, секреты, извещения Telegram |
 | [`docs/disks.md`](docs/disks.md) | диски боевого сервера: тома PostgreSQL и контента, SMART/TBW (ТЗ §10.3) |
 | [`docs/os-tuning.md`](docs/os-tuning.md) | тюнинг ОС боевого сервера: sysctl — эфемерные порты, TIME_WAIT, nofile, conntrack, UDP-буферы DNS (ТЗ §10.2) |
 
@@ -140,6 +140,10 @@ make reset-internet
 Статус — бейджем в шапке; при падении логи всех сервисов выгружаются в artifact
 рана. Обновления GitHub Actions и Go-зависимостей поднимает Dependabot
 ([`.github/dependabot.yml`](.github/dependabot.yml)).
+
+Извещения о событиях конвейера (ошибки сборки/линта и тестов в ci,
+результаты деплоев) отправляются Telegram-ботом в группу проекта —
+ТЗ §10.4, детали в [`docs/ci-cd.md`](docs/ci-cd.md).
 
 Мутационное тестирование в основной CI не входит (тяжёлая проверка):
 ночью по `master` и вручную его гоняет отдельный workflow

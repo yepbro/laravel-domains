@@ -29,7 +29,12 @@ jobs:
       # Те же compose-файлы, что и локально, + кэш слоёв type=gha
       COMPOSE: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env
     steps:
+      # depth 2: в PR-ранах HEAD — merge-commit, а для извещения нужен
+      # head-коммит ветки PR (родитель merge-коммита); depth 1 его не
+      # содержит.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
 
       # Сборка всех образов (dev-образ с golangci-lint/delve/air + mockserver
       # с полной компиляцией + unbound) с кэшем BuildKit и загрузкой в docker
@@ -49,6 +54,7 @@ jobs:
         run: cp .env.example .env
 
       - name: Сборка образов (с кэшем слоёв)
+        id: build
         run: make build COMPOSE="$COMPOSE"
 
       # Образы уже загружены в docker daemon, слои выгружены в кэш GHA —
@@ -62,18 +68,23 @@ jobs:
           df -h /
 
       - name: Линт (golangci-lint)
+        id: lint
         run: make lint COMPOSE="$COMPOSE"
 
       - name: Модульные тесты
+        id: test
         run: make test COMPOSE="$COMPOSE"
 
       - name: Правила Laravel по корпусу образцов
+        id: test-rules
         run: make test-rules COMPOSE="$COMPOSE"
 
       - name: Интеграционные тесты на testbed
+        id: test-integration
         run: make test-integration COMPOSE="$COMPOSE"
 
       - name: Проверка боевых образов (runtime + render)
+        id: build-runtime
         run: make build-runtime
 
       # Диагностика при падении: состояние и логи всех сервисов — в artifact
@@ -94,3 +105,43 @@ jobs:
           name: ci-logs-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 7
           path: ci-logs/
+
+      # Извещение Telegram (ТЗ §10.4): одно сообщение на провал рана ci.
+      # Категория — по первому провалившемуся шагу (шаги до него зелёные,
+      # после — skipped): сборка образов/линт/боевые образы → «Ошибка в
+      # коде», тесты → «Ошибка тестов»; прочие провалы (диагностика,
+      # подготовка окружения) → фолбэк «Ошибка конвейера CI» — события
+      # нет в таблице §10.4, но молчать о красном ране хуже (решение
+      # зафиксировано в коммите T-136). Ручные запуски ci молчат —
+      # §10.4: ручные прогоны извещений не порождают. Сбой отправки не
+      # красит ран: continue-on-error + guard секретов в скрипте
+      # (PR из форков). Успешные ci-раны не извещаются (§10.4).
+      - name: Извещение Telegram
+        if: failure() && github.event_name != 'workflow_dispatch'
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # Имена шагов в категориях синхронизировать с name: шагов выше.
+          event="Ошибка конвейера CI"
+          step="вне шагов сборки и тестов (см. лог рана)"
+          if [ "${{ steps.build.outcome }}" = failure ]; then
+            event="Ошибка в коде"; step="Сборка образов (с кэшем слоёв)"
+          elif [ "${{ steps.lint.outcome }}" = failure ]; then
+            event="Ошибка в коде"; step="Линт (golangci-lint)"
+          elif [ "${{ steps.test.outcome }}" = failure ]; then
+            event="Ошибка тестов"; step="Модульные тесты"
+          elif [ "${{ steps.test-rules.outcome }}" = failure ]; then
+            event="Ошибка тестов"; step="Правила Laravel по корпусу образцов"
+          elif [ "${{ steps.test-integration.outcome }}" = failure ]; then
+            event="Ошибка тестов"; step="Интеграционные тесты на testbed"
+          elif [ "${{ steps.build-runtime.outcome }}" = failure ]; then
+            event="Ошибка в коде"; step="Проверка боевых образов (runtime + render)"
+          fi
+          # В PR-ранах HEAD — merge-commit: виновный коммит = head ветки PR.
+          args=(--status fail --event "$event" --workflow ci --step "$step")
+          if [ -n "${{ github.event.pull_request.head.sha }}" ]; then
+            args+=(--sha "${{ github.event.pull_request.head.sha }}")
+          fi
+          deploy/telegram-notify.sh "${args[@]}"
