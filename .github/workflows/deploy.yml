@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: build · upload · restart · healthz
+    name: build · upload · restart · healthz · rollback
     # Только успех ci на push в master (или ручной запуск)
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -83,11 +83,14 @@ jobs:
         id: upload
         run: scp $SSH_OPTS -i id_ed25519 binaries.tar.gz "$SSH_HOST:/tmp/crawler-deploy.tar.gz"
 
-      # Откат — trap в deploy-install.sh: активен от systemctl stop до
-      # успешного старта, поэтому провал этого шага = на сервере
-      # предыдущая версия (bin.prev). Исключение — rc=255 (транспорт ssh:
-      # связь потеряна; удалённый скрипт мог дойти до любого места):
-      # состояние сервера неизвестно, извещение говорит об этом честно.
+      # Откат — trap в deploy-install.sh: активен после успешной остановки
+      # набора до успешного старта. Исход отражён в коде выхода (см. шапку
+      # deploy-install.sh): провал этого шага = trap-откат выполнен, а
+      # особые коды (T-137): 4 — нет архива, 7 — сбой подготовки бэкапа
+      # (bin не тронут, набор перезапущен), 3/8 — состояние юнитов
+      # требует проверки, 5 — откат выполнен, но набор не весь, 6 — откат
+      # не удался, 255 (транспорт ssh: удалённый скрипт мог дойти до
+      # любого места) — состояние сервера неизвестно.
       - name: Установить на сервер
         id: install
         run: |
@@ -98,23 +101,71 @@ jobs:
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           exit "$rc"
 
-      # Healthcheck сам по себе отката НЕ делает (набор к этому моменту
-      # установлен и trap снят): при провале сервер остаётся на новой
-      # версии, нужен ручной откат (docs/ci-cd.md) — извещение ниже
-      # отражает это явно.
+      # Healthcheck только проверяет (T-135); откат по его провалу —
+      # следующий шаг (T-137, ТЗ §10.4 «healthcheck с автоматическим
+      # откатом»). rc шага различает провал проверки (1) от транспорта
+      # ssh (255) и сбоя разбора скрипта (2): последние — состояние
+      # сервера неизвестно, деструктивный откат не запускается.
       - name: Проверить живость (healthz всех сервисов)
         id: healthcheck
         run: |
+          set +e
           ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s' -- < deploy/deploy-healthcheck.sh
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
-      # Диагностика при провале (после установки сервер либо откачен
-      # trap'ом install-шага, либо — при провале healthcheck — остался
-      # на новой версии; детали — в извещении Telegram ниже).
+      # Автоматический откат по провалу healthcheck (T-137, ТЗ §10.4):
+      # stop → восстановление /opt/crawler/bin.prev → start (со сбросом
+      # start-limit юнитов). Только провал healthcheck: провал install
+      # уже откачен trap'ом самого install-шага, более ранние шаги
+      # (сборка, scp) сервера не касаются. Идёт ДО диагностики: быстрый
+      # возврат рабочей версии важнее сбора логов (логи новой версии
+      # остаются в journalctl). Коды deploy-rollback.sh → result для
+      # извещения ниже; rc=255 (транспорт ssh) и rc=2 (bash не выполнил
+      # скрипт) → unknown — состояние сервера неизвестно. Шаг красит ран
+      # при неполном успехе (юниты не все active / откат не удался):
+      # pick() в извещении называет healthcheck — корень провала,
+      # детали отката — в строке «Откат: …».
+      - name: Откат (при провале healthcheck)
+        id: rollback
+        # Только подтверждённый провал проверки (rc=1): 255 (транспорт
+        # ssh) и 2 (сбой разбора скрипта) означают, что проверка не
+        # завершилась — состояние неизвестно, откат не запускается
+        # (извещение «откат неизвестен»).
+        if: failure() && steps.healthcheck.outcome == 'failure' && steps.healthcheck.outputs.rc == '1'
+        run: |
+          set +e
+          ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s' -- < deploy/deploy-rollback.sh
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          case "$rc" in
+            0)   result=performed;           note='откат выполнен, все юниты active' ;;
+            1)   result=performed-degraded;  note='откат выполнен, но не все юниты active' ;;
+            3)   result=failed;              note='откат не удался — требуется оператор' ;;
+            4)   result=nothing-to-rollback; note='bin.prev отсутствует — откатывать нечего' ;;
+            255) result=unknown;             note='ssh-транспорт (rc=255) — состояние сервера неизвестно' ;;
+            2)   result=unknown;             note='скрипт не выполнился (bash rc=2) — состояние сервера неизвестно' ;;
+            *)   result=failed;              note="неожидаемый код $rc" ;;
+          esac
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "rollback: $note"
+          case "$result" in
+            performed|nothing-to-rollback) exit 0 ;;
+            *) exit 1 ;;
+          esac
+
+      # Диагностика при провале — ПОСЛЕ отката (приоритет возврата рабочей
+      # версии; логи упавшей новой версии остаются в journalctl). Сервер
+      # либо откачен (trap install-шага или шаг rollback), либо откат
+      # не удался/невозможен — детали в извещении Telegram ниже.
       - name: Диагностика (при падении)
         if: failure()
         run: |
           ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" \
-            "systemctl list-units 'crawler-*' --no-legend; journalctl -t 'crawler-*' --no-pager -n 50" \
+            "systemctl list-units 'crawler-*' --no-legend; journalctl -u 'crawler-*' --no-pager --since '-30 min' -n 200" \
             || true
 
       # Извещение Telegram (ТЗ §10.4): успех и провал деплоя — одно
@@ -124,10 +175,14 @@ jobs:
       # неуспешный: состояние сервера в этот момент может быть любым.
       # Версия — из шага сборки (тот же git describe, что в бинарниках),
       # с пересчётом по чекауту, если шаг не успел; до сборки версии
-      # нет — строка опускается. Факт отката — по семантике
-      # deploy-install.sh: провал установки → откат на bin.prev выполнен
-      # (rc=255 или отмена → состояние неизвестно); провал healthcheck →
-      # отката не было, на сервере осталась новая версия; провал до
+      # нет — строка опускается. Факт отката (T-137) — по кодам шагов:
+      # установка: 4/7 — сервер/bin не тронуты (строки про откат нет),
+      # 3 и 255, отмена — неизвестно, 5 — trap-откат выполнен, но набор
+      # не весь, 6 — trap-откат не удался, прочее — trap-откат выполнен;
+      # healthcheck: результат шага rollback выше — выполнен / выполнен,
+      # но не все юниты active / откатывать нечего (bin.prev нет) /
+      # не удался / неизвестно (шаг не завершился или healthcheck не
+      # завершился сам — отмена рана, потеря связи, rc=255/2). Провал до
       # установки → строки про откат нет. Сбой отправки не красит ран:
       # continue-on-error.
       - name: Извещение Telegram
@@ -159,13 +214,37 @@ jobs:
           elif pick "${{ steps.ssh.outcome }}" "Настроить SSH"; then :
           elif pick "${{ steps.upload.outcome }}" "Загрузить бинарники (scp)"; then :
           elif pick "${{ steps.install.outcome }}" "Установить на сервер"; then
-            if [ "${{ steps.install.outcome }}" = cancelled ] || [ "${{ steps.install.outputs.rc }}" = 255 ]; then
+            # Коды deploy-install.sh (T-137): 4 — нет архива и 7 — сбой
+            # подготовки бэкапа (bin не тронут, набор перезапущен) →
+            # строки про откат нет; 3 — не остановился набор, 255 —
+            # транспорт ssh, 8 — не поднял остановленный набор →
+            # состояние требует проверки; 5 — trap-откат выполнен, но
+            # набор не весь; 6 — trap-откат не удался; прочие (включая 2:
+            # его дают и bash при сбое разбора, и tar при битом архиве) —
+            # сбой внутри установки: trap откатил на bin.prev.
+            if [ "${{ steps.install.outcome }}" = cancelled ]; then
               rollback=unknown
             else
-              rollback=performed
+              case "${{ steps.install.outputs.rc }}" in
+                255|3|8)           rollback=unknown ;;
+                4|7)               rollback='' ;;
+                5)                 rollback=performed-degraded ;;
+                6)                 rollback=failed ;;
+                *)                 rollback=performed ;;
+              esac
             fi
           elif pick "${{ steps.healthcheck.outcome }}" "Проверить живость (healthz всех сервисов)"; then
-            rollback=not-performed
+            # Провал healthcheck → откат шагом rollback выше (T-137;
+            # запускается только при подтверждённом провале проверки
+            # rc=1). result пуст — откат не запускался/не завершился
+            # (отмена рана, потеря связи, rc=255/2) → неизвестно.
+            case "${{ steps.rollback.outputs.result }}" in
+              performed)           rollback=performed ;;
+              performed-degraded)  rollback=performed-degraded ;;
+              nothing-to-rollback) rollback=nothing-to-rollback ;;
+              failed)              rollback=failed ;;
+              *)                   rollback=unknown ;;
+            esac
           fi
           version="${{ steps.build.outputs.version }}"
           if [ -z "$version" ] && [ "${{ steps.web-css.outcome }}" = success ]; then

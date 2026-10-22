@@ -351,6 +351,18 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
   crawler-…`). Это защита от бесконечного цикла падений (например, недоступен
   PostgreSQL), а не от штатных сбоев: разовый crash-рестарт в предел не
   попадает (сбрасывается временем).
+- **Откат версии** (последний успешный деплой — `/opt/crawler/bin.prev`):
+  `deploy/deploy-rollback.sh` — stop → восстановление `bin.prev` → start →
+  проверка юнитов; его же автоматически запускает конвейер при провале
+  healthcheck ([`ci-cd.md`](ci-cd.md)). Возвращаются только бинарники:
+  схема БД остаётся на версии нового релиза, релиз с миграцией откатом не
+  восстанавливается ([`operations.md`](operations.md) §4.1). Вручную — по
+  SSH из чекаута репозитория (`ssh root@<сервер> 'bash -s' -- <
+  deploy/deploy-rollback.sh`); на сервере скрипт не хранится — при
+  недоступности чекаута те же шаги руками: `systemctl stop
+  crawler.target && rm -rf /opt/crawler/bin && cp -a
+  /opt/crawler/bin.prev /opt/crawler/bin && systemctl start
+  crawler.target`.
 - **Зависимости**: юниты приказаны `After=` инфраструктуре, но без
   `Requires=`/остановочной связки — падение и рестарт PostgreSQL/Redis не
   останавливает воркеры (пул pgx переподключается сам; очередь — Redis

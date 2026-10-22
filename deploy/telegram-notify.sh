@@ -18,8 +18,8 @@
 #   deploy/telegram-notify.sh --status ok|fail --event "Деплой успешен" \
 #       --workflow deploy [--step "Установить на сервер"] \
 #       [--version "$(git describe --tags --always)"] \
-#       [--rollback performed|not-performed|unknown] [--sha <SHA>] \
-#       [--dry-run]
+#       [--rollback performed|performed-degraded|nothing-to-rollback|failed|unknown] \
+#       [--sha <SHA>] [--dry-run]
 #
 # Коммит и ссылка на ран берутся из чекаута и GITHUB_*-переменных раннера
 # (--sha переопределяет коммит — для PR-ранов, где HEAD это merge-commit);
@@ -30,7 +30,8 @@ usage() {
     cat >&2 <<'EOF'
 использование: telegram-notify.sh --status ok|fail --event ТИП --workflow ИМЯ
                          [--step ШАГ] [--version ВЕРСИЯ] [--sha SHA]
-                         [--rollback performed|not-performed|unknown] [--dry-run]
+                         [--rollback performed|performed-degraded|nothing-to-rollback|failed|unknown]
+                         [--dry-run]
 EOF
     exit 2
 }
@@ -59,8 +60,8 @@ case "$status" in
     *) echo "telegram-notify: --status должен быть ok или fail" >&2; exit 2 ;;
 esac
 case "$rollback" in
-    performed|not-performed|unknown|'') ;;
-    *) echo "telegram-notify: --rollback должен быть performed, not-performed или unknown" >&2; exit 2 ;;
+    performed|performed-degraded|nothing-to-rollback|failed|unknown|'') ;;
+    *) echo "telegram-notify: --rollback должен быть performed, performed-degraded, nothing-to-rollback, failed или unknown" >&2; exit 2 ;;
 esac
 
 # Guard секретов: без токена/чата извещений нет — выход 0, ран не красится
@@ -116,9 +117,11 @@ fi
 
 rollback_line=''
 case "$rollback" in
-    performed)     rollback_line='Откат: выполнен на предыдущую версию (bin.prev)' ;;
-    not-performed) rollback_line='Откат: не выполнен — на сервере осталась новая версия' ;;
-    unknown)       rollback_line='Откат: неизвестен — установка прервана (связь потеряна или ран отменён); проверьте /opt/crawler/bin и systemctl status crawler.target' ;;
+    performed)           rollback_line='Откат: выполнен на предыдущую версию (bin.prev)' ;;
+    performed-degraded)  rollback_line='Откат: выполнен на предыдущую версию (bin.prev), но не все юниты active — требуется оператор' ;;
+    nothing-to-rollback) rollback_line='Откат: не выполнен — предыдущей версии нет (bin.prev отсутствует, первый деплой); на сервере осталась новая версия' ;;
+    failed)              rollback_line='Откат: не удался — состояние сервера требует проверки оператора (диагностика в логе рана)' ;;
+    unknown)             rollback_line='Откат: неизвестен — работа с сервером не доведена до конца (потеря связи, отмена рана или сбой остановки набора); проверьте /opt/crawler/bin и systemctl status crawler.target' ;;
 esac
 
 commit_line="Коммит: $short_sha"
