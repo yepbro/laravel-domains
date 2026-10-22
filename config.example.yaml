@@ -19,12 +19,15 @@ postgres:
 redis:
   addr: "127.0.0.1:6379"
   # maxlen — явный предел длины всех стримов (XADD MAXLEN ~);
-  # 0 — пределы по стримам по умолчанию (10 000 пачек q:dns, 1 млн штучных
-  # задач q:http/q:render/q:analyze, 10 000 q:dead — записи без payload,
-  # байтовый потолок единицы МБ)
+  # 0 — пределы по стримам по умолчанию, пересчитаны по замерам T-141
+  # под бюджет Redis ≤ 0,5 ГБ (docs/redis.md §3.1): q:dns 250 пачек
+  # (запись ≈ 64 КиБ на 1000 доменов, замер), штучные
+  # q:http/q:render/q:analyze 150 000 (записи 0,3–0,7 КиБ), q:dead
+  # 10 000 (записи без payload, байтовый потолок единицы МБ)
   maxlen: 0
   max_attempts: 3                   # доставок задачи до перевода в q:dead (ТЗ 4.2)
   claim_min_idle: "10m"             # простой pending-записи до возврата клеймом XAUTOCLAIM (окно удержания воркера)
+  trim_interval: "1m"               # период XTRIM MINID: освобождение подтверждённого префикса стримов (T-141; 1s..24h)
 
 ingest:
   dir: "/data/incoming"              # наблюдаемая папка: <зона>/add|delete/*.txt и архивы
@@ -40,7 +43,7 @@ ingest:
 
 scheduler:
   recheck_interval: "4380h"          # ≈ 6 месяцев (done → pending)
-  batch_size: 5000                   # рекомендация ТЗ: 1000–10000
+  batch_size: 1000                  # норматив ТЗ 1000–10000; 1000 = замеренная пачка ≈ 64 КиБ (бюджет Redis, T-141)
   queue_high_watermark: 100000       # backpressure: выше порога задачи не публикуются
   lease: "30m"                       # срок аренды queued-домена
   temp_error_retry_after: "24h"      # повтор temp_error

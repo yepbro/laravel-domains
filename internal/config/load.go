@@ -102,6 +102,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_REDIS_MAXLEN", setInt(func(c *Config) *int { return &c.Redis.MaxLen })},
 		{"CRAWLER_REDIS_MAX_ATTEMPTS", setInt(func(c *Config) *int { return &c.Redis.MaxAttempts })},
 		{"CRAWLER_REDIS_CLAIM_MIN_IDLE", setDuration(func(c *Config) *Duration { return &c.Redis.ClaimMinIdle })},
+		{"CRAWLER_REDIS_TRIM_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Redis.TrimInterval })},
 		{"CRAWLER_INGEST_DIR", setString(func(c *Config) *string { return &c.Ingest.Dir })},
 		{"CRAWLER_INGEST_BATCH_SIZE", setInt(func(c *Config) *int { return &c.Ingest.BatchSize })},
 		{"CRAWLER_INGEST_STABLE_SECONDS", setInt(func(c *Config) *int { return &c.Ingest.StableSeconds })},

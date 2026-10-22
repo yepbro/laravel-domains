@@ -32,6 +32,16 @@ const maxSubdomains = 63
 // потолок, отсекающий мусор вместо контактов.
 const maxUserAgentLen = 512
 
+// Границы нормативной вилки пачек планировщика (ТЗ 5.3: «пачками
+// (по умолчанию 1000–10 000)»). Неэкспортированные константы — единый
+// источник для валидации и пин-теста бюджетного инварианта стримов
+// (TestSchedulerBatchFitsStreamBudget): потолок q:dns пропорционален
+// пачке, и расширение вилки обязано перепроверять бюджет.
+const (
+	minSchedulerBatchSize = 1000
+	maxSchedulerBatchSize = 10000
+)
+
 // DefaultUserAgent — честный User-Agent HTTP-этапа по умолчанию (ТЗ 5.5,
 // §9). Контакты — заглушки на зарезервированных домене и адресе
 // (RFC 2606, зона .example): реальных владельцев краулера ими не
@@ -77,6 +87,16 @@ type Redis struct {
 	// ClaimMinIdle — минимальный простой зависшей (pending без XACK)
 	// записи до возврата в работу клеймом XAUTOCLAIM (T-025).
 	ClaimMinIdle Duration `yaml:"claim_min_idle"`
+	// TrimInterval — период освобождения подтверждённого префикса
+	// стримов (T-141, ТЗ 4.2 «Дополнение 2026-10-23»): XACK не удаляет
+	// записи из стрима, и подтверждённая история копилась бы до потолка
+	// MAXLEN, переполняя бюджет Redis (ТЗ 3.2 — инцидент T-093).
+	// Цикл планировщика (queue.TrimLoop) раз в период делает XTRIM MINID
+	// по старейшей записи, обязанной остаться (старейшая pending группы;
+	// при пустом pending — last-delivered-id): удаляется только
+	// доставленное и подтверждённое. Стоимость прохода — три команды
+	// Redis на стрим.
+	TrimInterval Duration `yaml:"trim_interval"`
 }
 
 // Ingest — приём файлов доменов (ТЗ 5.1).
@@ -355,6 +375,9 @@ func Default() *Config {
 			// contexts=1 — до ~13,8 мин, порог поднимают вместе с
 			// понижением contexts, см. queue.DefaultClaimMinIdle).
 			ClaimMinIdle: Duration(10 * time.Minute),
+			// Минута — единицы процентов бюджета Redis между проходами
+			// при текущих темпах этапов (queue.DefaultTrimInterval).
+			TrimInterval: Duration(time.Minute),
 		},
 		Ingest: Ingest{
 			Dir:           "/data/incoming",
@@ -371,8 +394,15 @@ func Default() *Config {
 			ArchiveMaxFiles: 1000,
 		},
 		Scheduler: Scheduler{
-			RecheckInterval:     Duration(4380 * time.Hour), // ≈ 6 месяцев
-			BatchSize:           5000,
+			RecheckInterval: Duration(4380 * time.Hour), // ≈ 6 месяцев
+			// Нижняя нормативная граница ТЗ 5.3 (1000–10000) и размер
+			// замеренной записи q:dns ≈ 64 КиБ (T-141): пачка — единица
+			// повторной обработки при возврате зависшей доставки
+			// (XAUTOCLAIM возвращает пачку целиком) и повторной выборки
+			// по lease, меньшая пачка — меньшее окно повтора; потолки
+			// памяти стримов согласованы с этой величиной
+			// (queue.DefaultStreamMaxLen, docs/redis.md §3.1).
+			BatchSize:           1000,
 			QueueHighWatermark:  100000,
 			Lease:               Duration(30 * time.Minute),
 			TempErrorRetryAfter: Duration(24 * time.Hour),
@@ -594,6 +624,13 @@ func (c *Config) Validate() error {
 	if c.Redis.ClaimMinIdle <= 0 {
 		problems = append(problems, nonPositiveDur("redis.claim_min_idle", c.Redis.ClaimMinIdle))
 	}
+	// Коридор осмысленных значений: чаще секунды — холостые проходы по
+	// четырём стримам, реже суток — история копится до потолка MAXLEN
+	// (защита всё равно есть, но теряется смысл механизма).
+	if c.Redis.TrimInterval < Duration(time.Second) || c.Redis.TrimInterval > Duration(24*time.Hour) {
+		problems = append(problems, fmt.Sprintf("redis.trim_interval: ожидается %s..%s, задано %s",
+			Duration(time.Second), Duration(24*time.Hour), c.Redis.TrimInterval))
+	}
 
 	// ingest
 	if c.Ingest.Dir == "" {
@@ -629,9 +666,15 @@ func (c *Config) Validate() error {
 	}
 	// ТЗ 5.3: пачки планировщика 1000–10000 — границы нормативные
 	// (T-027), не рекомендация: пачка задаёт память выборки (ТЗ 3.5) и
-	// размер сообщений q:dns.
-	if !inRange(c.Scheduler.BatchSize, 1000, 10000) {
-		problems = append(problems, rangeMsg("scheduler.batch_size", c.Scheduler.BatchSize, 1000, 10000)+" (ТЗ 5.3)")
+	// размер сообщений q:dns. Потолки стримов против бюджета Redis
+	// (T-141, ТЗ 3.2) согласованы для всей вилки (константы
+	// min/maxSchedulerBatchSize): инвариант «сумма потолков ≤ бюджета»
+	// пин-тестом TestSchedulerBatchFitsStreamBudget (config_test.go) —
+	// срабатывает при изменении констант политики или границ вилки.
+	// Явный redis.maxlen — сознательный выход из политики: его
+	// арифметику держит оператор (арифметика — docs/redis.md §3.1).
+	if !inRange(c.Scheduler.BatchSize, minSchedulerBatchSize, maxSchedulerBatchSize) {
+		problems = append(problems, rangeMsg("scheduler.batch_size", c.Scheduler.BatchSize, minSchedulerBatchSize, maxSchedulerBatchSize)+" (ТЗ 5.3)")
 	}
 	if c.Scheduler.QueueHighWatermark < 1 {
 		problems = append(problems, "scheduler.queue_high_watermark: ожидается положительное число, задано "+strconv.Itoa(c.Scheduler.QueueHighWatermark))
@@ -645,6 +688,7 @@ func (c *Config) Validate() error {
 	if !inRange(c.Scheduler.TempErrorMaxRetries, 1, 100) {
 		problems = append(problems, rangeMsg("scheduler.temp_error_max_retries", c.Scheduler.TempErrorMaxRetries, 1, 100)+"; минимум 1 — temp_error по определению требует повтор (ТЗ 6.2)")
 	}
+	// Потолки стримов (T-141) — см. комментарий у batch_size.
 	// Веса зон (ТЗ 5.3, T-106): ключи по возрастанию — детерминированный
 	// список проблем. Имя, которого нет в справочнике zones, — не ошибка
 	// конфигурации (зоны создаёт ingest первым файлом, ТЗ 5.1):

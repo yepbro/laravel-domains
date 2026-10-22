@@ -22,7 +22,7 @@ ingest:
 
 scheduler:
   recheck_interval: "4380h"          # ~6 месяцев
-  batch_size: 5000
+  batch_size: 1000                   # ≈64 КиБ запись q:dns — бюджет Redis (T-141)
   queue_high_watermark: 100000
   lease: "30m"
   temp_error_retry_after: "24h"

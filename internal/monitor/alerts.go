@@ -784,7 +784,8 @@ func (a *Alerts) evalQueues(ctx context.Context, prev string) verdict {
 		lens[s] = n
 	}
 	// Порог — по стриму, как у гейта (T-026): для q:dns настроенные
-	// 100 000 записей ограничиваются половиной его MAXLEN 10 000.
+	// 100 000 записей ограничиваются половиной его MAXLEN по политике
+	// (DefaultStreamMaxLen, T-141: 125 пачек).
 	wm := make(map[string]int64, len(alertStreams))
 	for _, s := range alertStreams {
 		wm[s] = queue.StreamWatermark(a.opts.QueueWatermark, a.opts.QueueMaxLen, s)

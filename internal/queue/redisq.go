@@ -287,14 +287,15 @@ func payloadBytes(values map[string]any) []byte {
 // groupKey — ключ кэша созданных групп.
 func groupKey(stream, group string) string { return stream + "|" + group }
 
-// knownStream сообщает, что имя — один из рабочих стримов очереди (ТЗ 4.2).
+// knownStream сообщает, что имя — один из рабочих стримов очереди
+// (ТЗ 4.2): список имён — allStreams (queue.go), единственный источник.
 func knownStream(stream string) bool {
-	switch stream {
-	case StreamDNS, StreamHTTP, StreamRender, StreamAnalyze, StreamDead:
-		return true
-	default:
-		return false
+	for _, s := range allStreams {
+		if s == stream {
+			return true
+		}
 	}
+	return false
 }
 
 // isBusyGroup распознаёт ответ BUSYGROUP — группа уже существует.

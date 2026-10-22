@@ -106,6 +106,38 @@ func TestNewReliabDefaults(t *testing.T) {
 	}
 }
 
+// TestStreamPolicyFitsBudget — инвариант бюджета стримов (T-141, ТЗ 3.2):
+// сумма аварийных потолков политики MAXLEN обязана укладываться в бюджет
+// Redis ≤ 512 МиБ (с запасом на служебную память) даже при большой
+// пачке q:dns — при noeviction потолок выше бюджета означал бы отказ
+// записи (OOM) раньше обрезки, как в инциденте T-093. Литерал пачки
+// здесь — верх нормативной вилки ТЗ 5.3; связка с фактической границей
+// валидации конфигурации — пин-тестом
+// config.TestSchedulerBatchFitsStreamBudget (config_test.go), который
+// считает от maxSchedulerBatchSize. Дефолт (пачка 1000): q:dns
+// 250 × 1000 × 66 Б ≈ 16 МиБ + 3 × 103 МиБ + 2 МиБ ≈ 327 МиБ; худший
+// случай (пачка 10 000) ≈ 467 МиБ — оба ниже предела 480 МиБ.
+func TestStreamPolicyFitsBudget(t *testing.T) {
+	const (
+		worstBatch  = 10_000 // верх нормативной вилки ТЗ 5.3
+		streamLimit = 480 << 20
+	)
+	total := DefaultStreamMaxLen(StreamDNS)*worstBatch*DNSStreamBytesPerDomain +
+		3*DefaultStreamMaxLen(StreamHTTP)*UnitStreamBytesWorst +
+		DefaultStreamMaxLen(StreamDead)*DeadStreamBytesWorst
+	if total > streamLimit {
+		t.Errorf("сумма потолков стримов при пачке %d ≈ %d МиБ > %d МиБ — бюджет Redis 512 МиБ (ТЗ 3.2) пробит: пересогласуйте defaultMaxLen* / scheduler.batch_size (docs/redis.md §3.1)",
+			worstBatch, total>>20, streamLimit>>20)
+	}
+	// Дефолтная пачка — на порядок свободнее: проконтролировать запас.
+	def := DefaultStreamMaxLen(StreamDNS)*1000*DNSStreamBytesPerDomain +
+		3*DefaultStreamMaxLen(StreamHTTP)*UnitStreamBytesWorst +
+		DefaultStreamMaxLen(StreamDead)*DeadStreamBytesWorst
+	if def > 400<<20 {
+		t.Errorf("сумма потолков при дефолтной пачке ≈ %d МиБ — съедает запас бюджета (межобрезочный остаток TrimLoop, служебная память)", def>>20)
+	}
+}
+
 // TestReliabClaim — аргументы XAUTOCLAIM и XPENDING, возврат записей с их
 // счётчиками попыток.
 func TestReliabClaim(t *testing.T) {

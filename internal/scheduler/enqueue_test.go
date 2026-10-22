@@ -665,8 +665,8 @@ func TestEnqueue_SQLContract(t *testing.T) {
 // TestEnqueueDefaults — дефолты цикла пин литералами (ТЗ 5.10 и
 // комментарии констант): рассинхрон заметен тестом, а не ревью.
 func TestEnqueueDefaults(t *testing.T) {
-	if DefaultEnqueueBatch != 5000 {
-		t.Errorf("DefaultEnqueueBatch = %d, want 5000 (зеркалит дефолт scheduler.batch_size)", DefaultEnqueueBatch)
+	if DefaultEnqueueBatch != 1000 {
+		t.Errorf("DefaultEnqueueBatch = %d, want 1000 (зеркалит дефолт scheduler.batch_size, T-141)", DefaultEnqueueBatch)
 	}
 	if DefaultEnqueueInterval != time.Second {
 		t.Errorf("DefaultEnqueueInterval = %v, want 1s", DefaultEnqueueInterval)

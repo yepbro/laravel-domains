@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"crawler/internal/queue"
 )
 
 // loadFrom собирает конфигурацию из YAML-текста и карты окружения
@@ -49,6 +51,7 @@ func TestDefault(t *testing.T) {
 		{"redis.maxlen", c.Redis.MaxLen, 0},
 		{"redis.max_attempts", c.Redis.MaxAttempts, 3},
 		{"redis.claim_min_idle", c.Redis.ClaimMinIdle.D(), 10 * time.Minute},
+		{"redis.trim_interval", c.Redis.TrimInterval.D(), time.Minute},
 		{"ingest.dir", c.Ingest.Dir, "/data/incoming"},
 		{"ingest.batch_size", c.Ingest.BatchSize, 50000},
 		{"ingest.stable_seconds", c.Ingest.StableSeconds, 10},
@@ -57,7 +60,7 @@ func TestDefault(t *testing.T) {
 		{"ingest.archive_max_uncompressed", c.Ingest.ArchiveMaxUncompressed.B(), int64(8 << 30)},
 		{"ingest.archive_max_files", c.Ingest.ArchiveMaxFiles, 1000},
 		{"scheduler.recheck_interval", c.Scheduler.RecheckInterval.D(), 4380 * time.Hour},
-		{"scheduler.batch_size", c.Scheduler.BatchSize, 5000},
+		{"scheduler.batch_size", c.Scheduler.BatchSize, 1000},
 		{"scheduler.queue_high_watermark", c.Scheduler.QueueHighWatermark, 100000},
 		{"scheduler.lease", c.Scheduler.Lease.D(), 30 * time.Minute},
 		{"scheduler.temp_error_retry_after", c.Scheduler.TempErrorRetryAfter.D(), 24 * time.Hour},
@@ -140,6 +143,7 @@ redis:
   maxlen: 250000
   max_attempts: 5
   claim_min_idle: "90s"
+  trim_interval: "3m"
 ingest:
   dir: "/srv/incoming"
   batch_size: 10000
@@ -229,6 +233,7 @@ log:
 		{"redis.maxlen", cfg.Redis.MaxLen, 250000},
 		{"redis.max_attempts", cfg.Redis.MaxAttempts, 5},
 		{"redis.claim_min_idle", cfg.Redis.ClaimMinIdle.D(), 90 * time.Second},
+		{"redis.trim_interval", cfg.Redis.TrimInterval.D(), 3 * time.Minute},
 		{"ingest.dir", cfg.Ingest.Dir, "/srv/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 10000},
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 30},
@@ -394,6 +399,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_REDIS_MAXLEN":                     "300000",
 		"CRAWLER_REDIS_MAX_ATTEMPTS":               "6",
 		"CRAWLER_REDIS_CLAIM_MIN_IDLE":             "2m",
+		"CRAWLER_REDIS_TRIM_INTERVAL":              "45s",
 		"CRAWLER_INGEST_DIR":                       "/env/incoming",
 		"CRAWLER_INGEST_BATCH_SIZE":                "1234",
 		"CRAWLER_INGEST_STABLE_SECONDS":            "25",
@@ -468,6 +474,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"redis.maxlen", cfg.Redis.MaxLen, 300000},
 		{"redis.max_attempts", cfg.Redis.MaxAttempts, 6},
 		{"redis.claim_min_idle", cfg.Redis.ClaimMinIdle.D(), 2 * time.Minute},
+		{"redis.trim_interval", cfg.Redis.TrimInterval.D(), 45 * time.Second},
 		{"ingest.dir", cfg.Ingest.Dir, "/env/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 1234},
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 25},
@@ -704,6 +711,26 @@ func TestEmptyYAMLFile(t *testing.T) {
 	}
 }
 
+// TestSchedulerBatchFitsStreamBudget — бюджетный инвариант стримов для
+// всей нормативной вилки пачек планировщика (T-141, ТЗ 3.2/5.3): потолок
+// q:dns пропорционален batch_size, и сумма потолков политики обязана
+// укладываться в бюджет Redis ≤ 512 МиБ даже при верхней границе вилки
+// (худший случай) — при noeviction потолок выше бюджета означал бы
+// отказ записи (OOM) раньше обрезки (инцидент T-093). Пин-тест
+// привязан к фактической границе валидации (maxSchedulerBatchSize):
+// расширение вилки обязано перепроверять бюджет (арифметика —
+// docs/redis.md §3.1; константы политики — queue.DefaultStreamMaxLen).
+func TestSchedulerBatchFitsStreamBudget(t *testing.T) {
+	const streamLimit = 480 << 20 // 512 МиБ ТЗ 3.2 − запас на служебную память
+	total := queue.DefaultStreamMaxLen(queue.StreamDNS)*int64(maxSchedulerBatchSize)*queue.DNSStreamBytesPerDomain +
+		3*queue.DefaultStreamMaxLen(queue.StreamHTTP)*queue.UnitStreamBytesWorst +
+		queue.DefaultStreamMaxLen(queue.StreamDead)*queue.DeadStreamBytesWorst
+	if total > streamLimit {
+		t.Errorf("сумма потолков стримов при пачке %d ≈ %d МиБ > %d МиБ — бюджет Redis 512 МиБ (ТЗ 3.2) пробит: пересогласуйте queue.DefaultStreamMaxLen / вилку scheduler.batch_size (docs/redis.md §3.1)",
+			maxSchedulerBatchSize, total>>20, streamLimit>>20)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	valid := func() *Config {
 		c := Default()
@@ -724,6 +751,9 @@ func TestValidate(t *testing.T) {
 		{"redis.max_attempts 0", func(c *Config) { c.Redis.MaxAttempts = 0 }, "redis.max_attempts"},
 		{"redis.max_attempts велик", func(c *Config) { c.Redis.MaxAttempts = 101 }, "redis.max_attempts"},
 		{"claim_min_idle 0", func(c *Config) { c.Redis.ClaimMinIdle = 0 }, "redis.claim_min_idle"},
+		{"trim_interval 0", func(c *Config) { c.Redis.TrimInterval = 0 }, "redis.trim_interval"},
+		{"trim_interval меньше секунды", func(c *Config) { c.Redis.TrimInterval = Duration(10 * time.Millisecond) }, "redis.trim_interval"},
+		{"trim_interval больше суток", func(c *Config) { c.Redis.TrimInterval = Duration(25 * time.Hour) }, "redis.trim_interval"},
 		{"ingest.dir пуст", func(c *Config) { c.Ingest.Dir = "" }, "ingest.dir"},
 		{"batch_size 0", func(c *Config) { c.Ingest.BatchSize = 0 }, "ingest.batch_size"},
 		{"stable_seconds 0", func(c *Config) { c.Ingest.StableSeconds = 0 }, "ingest.stable_seconds"},

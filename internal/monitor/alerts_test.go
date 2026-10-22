@@ -476,8 +476,8 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 		want string
 	}{
 		{map[string]int64{}, AlertStatusOK},                          // пустые очереди: detail называет стрим, не «»
-		{map[string]int64{queue.StreamDNS: 999}, AlertStatusOK},      // ниже порога
-		{map[string]int64{queue.StreamDNS: 1000}, AlertStatusFiring}, // порог гейта
+		{map[string]int64{queue.StreamDNS: 124}, AlertStatusOK},      // ниже порога q:dns (ограничен MAXLEN/2 = 125, T-141)
+		{map[string]int64{queue.StreamDNS: 125}, AlertStatusFiring},  // порог гейта q:dns
 		{map[string]int64{queue.StreamHTTP: 950}, AlertStatusFiring}, // коридор гистерезиса
 		{map[string]int64{queue.StreamHTTP: 900}, AlertStatusFiring}, // ровно 90 % порога — удержание
 		{map[string]int64{queue.StreamHTTP: 899}, AlertStatusOK},     // ниже 90 %

@@ -125,19 +125,19 @@ func TestNewBackpressureGateIntervalDefault(t *testing.T) {
 // и не подменяется политикой.
 func TestBackpressureStreamMaxLen(t *testing.T) {
 	g := NewBackpressureGate(nil, BackpressureOptions{})
-	if got := g.streamMaxLen(StreamDNS); got != 10_000 {
-		t.Errorf("streamMaxLen без MaxLen = %d, хочу 10000 (политика q:dns)", got)
+	if got := g.streamMaxLen(StreamDNS); got != 250 {
+		t.Errorf("streamMaxLen без MaxLen = %d, хочу 250 (политика q:dns, T-141)", got)
 	}
-	if got := g.streamMaxLen(StreamHTTP); got != 1_000_000 {
-		t.Errorf("streamMaxLen без MaxLen = %d, хочу 1000000 (политика штучных стримов)", got)
+	if got := g.streamMaxLen(StreamHTTP); got != 150_000 {
+		t.Errorf("streamMaxLen без MaxLen = %d, хочу 150000 (политика штучных стримов, T-141)", got)
 	}
 	g = NewBackpressureGate(nil, BackpressureOptions{MaxLen: 1})
 	if got := g.streamMaxLen(StreamHTTP); got != 1 {
 		t.Errorf("streamMaxLen при MaxLen=1 = %d, хочу 1 (явный предел валиден)", got)
 	}
 	g = NewBackpressureGate(nil, BackpressureOptions{MaxLen: -7})
-	if got := g.streamMaxLen(StreamHTTP); got != 1_000_000 {
-		t.Errorf("streamMaxLen при отрицательном MaxLen = %d, хочу 1000000 (политика)", got)
+	if got := g.streamMaxLen(StreamHTTP); got != 150_000 {
+		t.Errorf("streamMaxLen при отрицательном MaxLen = %d, хочу 150000 (политика)", got)
 	}
 }
 
@@ -154,8 +154,8 @@ func TestStreamWatermark(t *testing.T) {
 	}{
 		{"нулевый watermark отключает", 0, 1000, StreamHTTP, 0},
 		{"отрицательный watermark отключает", -5, 1000, StreamHTTP, 0},
-		{"предел политики q:dns", 100_000, 0, StreamDNS, 5_000},
-		{"предел политики штучных", 600_000, 0, StreamHTTP, 500_000},
+		{"предел политики q:dns", 100_000, 0, StreamDNS, 125},
+		{"предел политики штучных", 600_000, 0, StreamHTTP, 75_000},
 		{"явный предел 1 — порог 0", 100_000, 1, StreamDNS, 0},
 		{"минимум — watermark", 7, 100, StreamHTTP, 7},
 		{"минимум — половина предела", 200, 100, StreamHTTP, 50},
@@ -269,34 +269,54 @@ func TestBackpressureLen(t *testing.T) {
 
 // TestBackpressureWatermarkCappedByMaxLen — эффективный порог стрима не
 // выше половины его предела MAXLEN: гейт обязан срабатывать до обрезки.
-// Для q:dns настроенные 100 000 записей недостижимы (MAXLEN 10 000) —
-// порог ограничивается 5 000, гейт становится рабочим.
+// Для q:dns настроенные 100 000 записей недостижимы (MAXLEN 250, T-141) —
+// порог ограничивается 125, гейт становится рабочим; у штучных стримов
+// половина предела политики (150 000 / 2 = 75 000) ниже watermark —
+// порог тоже ограничивается.
 func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
-	// q:dns: MAXLEN по политике 10 000 → порог 5 000.
-	fake := newFakeBackpressure(grp(4999, 0))
+	// q:dns: MAXLEN по политике 250 → порог 125.
+	fake := newFakeBackpressure(grp(124, 0))
 	gate := newTestGate(fake, 100000)
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
 		t.Fatalf("AwaitCapacity ниже ограниченного порога: %v", err)
 	}
 
-	fake = newFakeBackpressure(grp(5000, 0), grp(4999, 0))
+	fake = newFakeBackpressure(grp(125, 0), grp(124, 0))
 	gate = newTestGate(fake, 100000)
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
 		t.Fatalf("AwaitCapacity q:dns: %v", err)
 	}
 	if len(fake.infos) != 2 {
-		t.Errorf("проверок %d, хочу 2 (5 000 ≥ порог 5 000 — гейт закрыт): %v", len(fake.infos), fake.infos)
+		t.Errorf("проверок %d, хочу 2 (125 ≥ порог 125 — гейт закрыт): %v", len(fake.infos), fake.infos)
 	}
 
-	// Штучный стрим: MAXLEN 1 000 000, половина выше порога — порог
-	// не ограничивается (100 000).
-	fake = newFakeBackpressure(grp(99999, 0))
+	// Штучный стрим: половина предела политики (150 000 / 2) ниже
+	// watermark 100 000 — порог ограничивается 75 000.
+	fake = newFakeBackpressure(grp(74_999, 0))
 	gate = newTestGate(fake, 100000)
+	if err := gate.AwaitCapacity(context.Background(), StreamHTTP); err != nil {
+		t.Fatalf("AwaitCapacity ниже порога 75 000: %v", err)
+	}
+	fake = newFakeBackpressure(grp(75_000, 0), grp(74_999, 0))
+	gate = newTestGate(fake, 100000)
+	if err := gate.AwaitCapacity(context.Background(), StreamHTTP); err != nil {
+		t.Fatalf("AwaitCapacity штучного стрима: %v", err)
+	}
+	if len(fake.infos) != 2 {
+		t.Errorf("проверок %d, хочу 2 (75 000 ≥ порог 75 000 — гейт закрыт): %v", len(fake.infos), fake.infos)
+	}
+
+	// Явный предел из опций (redis.maxlen, Q-03) с половиной выше
+	// watermark — порог не ограничивается (100 000).
+	fake = newFakeBackpressure(grp(99_999, 0))
+	gate = NewBackpressureGate(fake, BackpressureOptions{
+		Watermark: 100000, MaxLen: 400000, Interval: time.Millisecond,
+	})
 	if err := gate.AwaitCapacity(context.Background(), StreamHTTP); err != nil {
 		t.Fatalf("AwaitCapacity ниже порога 100 000: %v", err)
 	}
 
-	// Явный предел из опций (redis.maxlen, Q-03) ограничивает и его.
+	// Явный предел из опций ограничивает и его.
 	fake = newFakeBackpressure(grp(2000, 0), grp(1999, 0))
 	gate = NewBackpressureGate(fake, BackpressureOptions{
 		Watermark: 100000, MaxLen: 4000, Interval: time.Millisecond,

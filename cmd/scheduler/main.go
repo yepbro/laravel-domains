@@ -61,9 +61,14 @@ func main() {
 // и фоновые циклы перепроверок (T-030/T-031) горутинами в том же OnRun —
 // они возвращают домены в pending, главный цикл подберёт их следующей
 // пачкой; рядом — коллектор глубины backlog (T-077, ТЗ 5.9): gauge
-// pending/queued из БД, живёт у владельца состояний domains. Завершение —
-// отмена ctx (graceful shutdown, ТЗ 3.4): цикл дорабатывает текущую
-// пачку, фоновые — текущий проход, все возвращают nil.
+// pending/queued из БД, живёт у владельца состояний domains, — и цикл
+// освобождения подтверждённого префикса стримов (queue.TrimLoop, T-141:
+// XACK не удаляет записи из стримов, XTRIM MINID по старейшей
+// неподтверждённой записи группы не даёт истории копиться до потолка
+// MAXLEN и бюджета Redis, ТЗ 3.2; scheduler — одиночный хозяин стримов
+// очередей, цикл дёшев: три команды на стрим раз в redis.trim_interval).
+// Завершение — отмена ctx (graceful shutdown, ТЗ 3.4): цикл дорабатывает
+// текущую пачку, фоновые — текущий проход, все возвращают nil.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("scheduler: пул БД не получен (postgres.dsn обязателен)")
@@ -100,7 +105,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			"zones", strings.Join(unknownZones, ", "))
 	}
 
-	bg := make(chan error, 4)
+	bg := make(chan error, 5)
 	go func() {
 		bg <- scheduler.RecheckDaily(ctx, pool, scheduler.RecheckOptions{
 			Interval: cfg.Scheduler.RecheckInterval.D(),
@@ -123,6 +128,16 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	go func() {
 		bg <- scheduler.BacklogLoop(ctx, pool, reg, scheduler.BacklogOptions{Log: logger})
 	}()
+	// Освобождение подтверждённого префикса стримов (T-141, ТЗ 4.2
+	// «Дополнение 2026-10-23»): XTRIM MINID по старейшей записи, обязанной
+	// остаться, — рядом с остальными циклами-дворниками планировщика.
+	go func() {
+		bg <- queue.TrimLoop(ctx, rdb, queue.TrimOptions{
+			Interval: cfg.Redis.TrimInterval.D(),
+			MaxLen:   int64(cfg.Redis.MaxLen), // предел для сигнала застрявшего префикса
+			Log:      logger,
+		})
+	}()
 
 	// Главный цикл живёт до отмены ctx; после него фоновые циклы уже
 	// завершаются по той же отмене — забираем их результаты.
@@ -131,6 +146,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		ZoneWeights: zoneWeights,
 		Log:         logger,
 	})
+	<-bg
 	<-bg
 	<-bg
 	<-bg

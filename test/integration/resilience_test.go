@@ -22,7 +22,12 @@
 //     блокируется до освобождения ёмкости, отмена контекста — чистый
 //     выход (graceful shutdown, ТЗ 3.4);
 //   - MAXLEN (T-025): публикация сверх предела обрезает стрим — длина
-//     не растёт с числом публикаций, старые записи уходят.
+//     не растёт с числом публикаций, старые записи уходят;
+//   - освобождение подтверждённого префикса (T-141): после «публикация →
+//     потребление → XACK» TrimOnce возвращает длину стрима к граничной
+//     записи, память ключа не растёт с числом обработанных; зависшие
+//     PEL-записи и недоставленный хвост не теряются, стрим без группы
+//     обрезкой не ломается.
 //
 // Имена стримов — боевые константы queue.Stream*: транспорт queue
 // принимает только известные стримы (knownStream), псевдонимы потребовали
@@ -825,6 +830,176 @@ func TestResilience_BackpressureGate(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("отмена контекста не прервала ожидание гейта")
+	}
+}
+
+// TestResilience_TrimConfirmedPrefix — освобождение подтверждённого
+// префикса стрима (T-141, ТЗ 4.2 «Дополнение 2026-10-23»): XACK убирает
+// запись из PEL группы, но не из стрима — TrimOnce (XTRIM MINID по
+// старейшей записи, обязанной остаться) возвращает длину к граничной
+// записи, а память ключа не растёт с числом обработанных. Необработанные
+// задачи (недоставленный хвост) и зависшие PEL-записи не теряются;
+// стрим без группы (q:dead) обрезкой не ломается.
+func TestResilience_TrimConfirmedPrefix(t *testing.T) {
+	skipUnlessIntegration(t)
+	rdb := resilienceRedisEnv(t)
+	// Явный большой MAXLEN — проверяется освобождение префикса, а не
+	// потолок обрезки XADD.
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{MaxLen: 100000, Block: 150 * time.Millisecond})
+	ctx := context.Background()
+	const group = "resil-an"
+
+	task := func(i int) queue.Result {
+		return queue.Result{
+			TaskID:      fmt.Sprintf("t-trim-%05d", i),
+			ZoneID:      4,
+			DomainID:    int64(i + 1),
+			SubdomainID: 0,
+		}
+	}
+
+	// Раунды «публикация → потребление → XACK → TrimOnce»: без
+	// освобождения подтверждённая история копится до MAXLEN и бюджета
+	// Redis (инцидент T-093) — с TrimOnce длина возвращается к ~0
+	// (остаётся граничная запись last-delivered-id: MINID нестрогий),
+	// память ключа не растёт от раунда к раунду.
+	const perRound = 400
+	const rounds = 5
+	firstMem := int64(0)
+	for r := 0; r < rounds; r++ {
+		for i := 0; i < perRound; i++ {
+			if _, err := q.Publish(ctx, queue.StreamAnalyze, task(r*perRound+i)); err != nil {
+				t.Fatalf("раунд %d: публикация №%d: %v", r+1, i+1, err)
+			}
+		}
+		batch := consumeTasks(t, q, queue.StreamAnalyze, group, "w1", perRound)
+		if len(batch) != perRound {
+			t.Fatalf("раунд %d: потреблено %d, хочу %d", r+1, len(batch), perRound)
+		}
+		ids := make([]string, len(batch))
+		for i, d := range batch {
+			ids[i] = d.ID
+		}
+		if err := q.Ack(ctx, queue.StreamAnalyze, group, ids...); err != nil {
+			t.Fatalf("раунд %d: XACK: %v", r+1, err)
+		}
+		// XACK освобождает только PEL: история в стриме копится —
+		// это и есть предмет фикса (после первого раунда — все записи).
+		if n := streamLen(t, rdb, queue.StreamAnalyze); n < int64(perRound) {
+			t.Fatalf("раунд %d: после XACK в стриме %d записей < %d — история не копится?",
+				r+1, n, perRound)
+		}
+		trimmed, _, err := queue.TrimOnce(ctx, rdb, queue.TrimOptions{Streams: []string{queue.StreamAnalyze}})
+		if err != nil {
+			t.Fatalf("раунд %d: TrimOnce: %v", r+1, err)
+		}
+		if trimmed == 0 {
+			t.Fatalf("раунд %d: TrimOnce не удалил ни одной записи", r+1)
+		}
+		if n := streamLen(t, rdb, queue.StreamAnalyze); n != 1 {
+			t.Fatalf("раунд %d: после TrimOnce в стриме %d записей, хочу 1 (граничная last-delivered-id, всё подтверждено)",
+				r+1, n)
+		}
+		mem, err := rdb.MemoryUsage(ctx, queue.StreamAnalyze).Result()
+		if err != nil {
+			t.Fatalf("раунд %d: MEMORY USAGE: %v", r+1, err)
+		}
+		if r == 0 {
+			firstMem = mem
+		}
+		// Память ключа после раунда — метаданные пустого стрима и группы:
+		// не растёт с числом обработанных записей (2000 к последнему
+		// раунду против 400 к первому).
+		if grown := mem - firstMem; grown > 4096 {
+			t.Fatalf("память ключа растёт с числом обработанных: %d → %d байт (+%d)",
+				firstMem, mem, grown)
+		}
+	}
+	if mem, _ := rdb.MemoryUsage(ctx, queue.StreamAnalyze).Result(); mem > 16*1024 {
+		t.Errorf("память «пустого» стрима после %d обработанных записей: %d байт, хочу ≤ 16 КиБ",
+			rounds*perRound, mem)
+	}
+
+	// Зависшие PEL-записи не теряются: обрезка до старейшей pending,
+	// сами pending остаются в стриме и в PEL (вернутся клеймом).
+	const hungTotal = 6
+	for i := 0; i < hungTotal; i++ {
+		if _, err := q.Publish(ctx, queue.StreamRender, task(10000+i)); err != nil {
+			t.Fatalf("публикация зависающей %d: %v", i+1, err)
+		}
+	}
+	hung := consumeTasks(t, q, queue.StreamRender, "resil-render", "w1", hungTotal)
+	if len(hung) != hungTotal {
+		t.Fatalf("потреблено зависающих: %d, хочу %d", len(hung), hungTotal)
+	}
+	if err := q.Ack(ctx, queue.StreamRender, "resil-render", hung[0].ID, hung[1].ID, hung[2].ID); err != nil {
+		t.Fatalf("XACK подтверждённого префикса: %v", err)
+	}
+	if _, _, err := queue.TrimOnce(ctx, rdb, queue.TrimOptions{Streams: []string{queue.StreamRender}}); err != nil {
+		t.Fatalf("TrimOnce с зависшими: %v", err)
+	}
+	if n := streamLen(t, rdb, queue.StreamRender); n != hungTotal-3 {
+		t.Fatalf("после TrimOnce в стриме %d записей, хочу %d (подтверждённые удалены, зависшие остались)",
+			n, hungTotal-3)
+	}
+	if n := pendingCount(t, rdb, queue.StreamRender, "resil-render"); n != hungTotal-3 {
+		t.Fatalf("зависших в PEL: %d, хочу %d (обрезка PEL не трогает)", n, hungTotal-3)
+	}
+	left := entryIDs(t, rdb, queue.StreamRender)
+	for i, d := range hung[3:] {
+		if left[i] != d.ID {
+			t.Errorf("запись %s потеряна/смещена (в стриме %s)", d.ID, left[i])
+		}
+	}
+
+	// Недоставленный хвост не теряется: точка — last-delivered-id,
+	// записи выше остаются и доносятся потребителю.
+	for i := 0; i < 5; i++ {
+		if _, err := q.Publish(ctx, queue.StreamHTTP, queue.HTTPTask{
+			TaskID:     fmt.Sprintf("t-trim-tail-%02d", i),
+			ZoneID:     5,
+			DomainID:   int64(300 + i),
+			Name:       fmt.Sprintf("tail%02d.resil.test", i),
+			Subdomains: []queue.HTTPSubdomain{{Addrs: []string{"192.0.2.1"}}},
+		}); err != nil {
+			t.Fatalf("публикация хвоста %d: %v", i+1, err)
+		}
+	}
+	head := consumeTasks(t, q, queue.StreamHTTP, "resil-http", "w1", 3)
+	if len(head) != 3 {
+		t.Fatalf("потреблено записей хвоста: %d, хочу 3", len(head))
+	}
+	if err := q.Ack(ctx, queue.StreamHTTP, "resil-http", head[0].ID, head[1].ID, head[2].ID); err != nil {
+		t.Fatalf("XACK головы: %v", err)
+	}
+	if _, _, err := queue.TrimOnce(ctx, rdb, queue.TrimOptions{Streams: []string{queue.StreamHTTP}}); err != nil {
+		t.Fatalf("TrimOnce с недоставленным хвостом: %v", err)
+	}
+	if n := streamLen(t, rdb, queue.StreamHTTP); n != 3 {
+		t.Fatalf("после TrimOnce в стриме %d записей, хочу 3 (граница + 2 недоставленных)", n)
+	}
+	rest := consumeTasks(t, q, queue.StreamHTTP, "resil-http", "w2", 5)
+	if len(rest) != 2 {
+		t.Fatalf("недоставленный хвост после обрезки: %d записей, хочу 2", len(rest))
+	}
+
+	// Стрим без группы (q:dead: ручной разбор, consumer groups нет) —
+	// TrimOnce его пропускает без ошибки, записи не трогает.
+	for i := 0; i < 3; i++ {
+		if _, err := q.Publish(ctx, queue.StreamDead, queue.Dead{
+			TaskID:   fmt.Sprintf("t-trim-dead-%02d", i),
+			Stream:   queue.StreamAnalyze,
+			EntryID:  fmt.Sprintf("%d-1", 1700000000000+i),
+			Attempts: 4,
+		}); err != nil {
+			t.Fatalf("публикация в q:dead %d: %v", i+1, err)
+		}
+	}
+	if _, _, err := queue.TrimOnce(ctx, rdb, queue.TrimOptions{Streams: []string{queue.StreamDead}}); err != nil {
+		t.Fatalf("TrimOnce по стриму без группы: %v", err)
+	}
+	if n := streamLen(t, rdb, queue.StreamDead); n != 3 {
+		t.Fatalf("записей в q:dead после TrimOnce: %d, хочу 3 (без группы стрим не освобождается)", n)
 	}
 }
 

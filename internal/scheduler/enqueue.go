@@ -218,7 +218,7 @@ const (
 	// DefaultEnqueueBatch — размер пачки выборки: зеркалит дефолт
 	// scheduler.batch_size (ТЗ 5.10); рабочее значение цикл получает из
 	// конфига.
-	DefaultEnqueueBatch = 5000
+	DefaultEnqueueBatch = 1000
 
 	// DefaultEnqueueInterval — пауза между пачками. Единственный на
 	// данный момент ограничитель темпа наполнения q:dns: гейт
