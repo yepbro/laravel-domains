@@ -185,6 +185,10 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
+| `crawler_content_retention_rows_total` / `_refs_total` / `_contents_total` / `_freed_bytes_total` | counter | — | http-worker (T-166) | итог каждого прохода RetentionLoop (хук `RetentionOptions.OnPass`): строки `subdomain_results`, очищенные от контента/jsonb, срезанные ссылки `content_hash`, удалённые строки `contents` и их сжатые байты (место физически возвращает компактификация паков T-045 — сходимость видно по `disk_avail`); останов роста при работающем цикле = candidates кончились (плато) |
+| `crawler_content_retention_skips_total` | counter | — | http-worker (T-166) | пропуски прохода по интерлоку: глубина q:analyze у порога `content.retention_analyze_watermark` — анализатор не успевает, тела и headers/cookies ещё нужны; рост = анализ отстаёт, диск продолжает расти |
+| `crawler_content_retention_pass_seconds` / `crawler_content_retention_passes_total{result}` | histogram / counter | `result` | http-worker (T-166) | длительность и число проходов retention (`ok` — дренаж выполнен, `skipped` — интерлок; алерт по `rate(passes{result="skipped"})`) |
+| `crawler_content_retention_bad_hashes_total` / `crawler_content_retention_missing_refs_total` | counter | — | http-worker (T-166) | аномалии учёта: срезанные ссылки с хэшем неверной длины / без строки `contents`; в норме не растут вовсе — рост = ошибка писателя (T-056) или расхождение refcount (T-044) |
 | `crawler_unit_oom_events` | gauge | `unit`, `kind` | monitor (T-145) | проход алертов (60 с): счётчики memory.events cgroup v2 юнитов `crawler-*.service` (kind=oom/oom_kill); обнуляются пересозданием cgroup на рестарте юнита — gauge, не counter; рост = события OOM (алерт unit_oom) |
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: lag + pending; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`) |
@@ -401,6 +405,16 @@ T-109) и повторных проверок `temp_error`
   публикация `Result`-ключей и снятие флага (порядок «публикация →
   снятие» — at-least-once §3.4); переполнение рендера не роняет и не
   задерживает DNS/HTTP-этапы.
+- тем же `OnRun` запускается цикл retention контента
+  (`content.RetentionLoop`, T-166, горутиной рядом с компактификацией
+  T-045, раз в час `content.retention_interval`): записи
+  `subdomain_results` старше `content.retention`, не Laravel-находки и
+  не ждущие рендера теряют `content_hash` и тяжёлые jsonb одной
+  транзакцией с уменьшением `contents.refcount` (паспорт строки
+  остаётся); интерлок — глубина `q:analyze` у порога (гейт T-026):
+  анализатор не успевает — проход пропускается (метрики
+  `crawler_content_retention_*`); механика и критерии —
+  [`content.md`](content.md) «Retention контента и трим не-находок».
 - хосты редиректов резолвятся «через тот же резолвер» (ТЗ 5.5 п. 2):
   `dnsclient` с лимитами T-035 → адаптер `httpworker.NewDNSLookup` →
   кэш `CachingResolver` (T-047); A и AAAA опрашиваются параллельно с

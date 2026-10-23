@@ -226,6 +226,36 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		bg <- httpworker.RequeueRenderPending(ctx, pool, store, renderQ, httpworker.RequeueOptions{Log: logger})
 	}()
 
+	// Retention контента и трим jsonb не-находок (T-166, ТЗ 5.7: контент
+	// хранится, пока нужно переприменять правила; решение оператора
+	// 2026-10-23 — диск без новых мощностей): записи старше
+	// content.retention, не Laravel-находки и не ждущие рендера теряют
+	// content_hash (−1 contents.refcount той же транзакцией, нулевые
+	// строки удаляются) и тяжёлые jsonb; паспорт строки остаётся для
+	// domain_info и дашборда. Интерлок — глубина q:analyze (гейт T-026):
+	// анализатор не успевает — тела ещё нужны, проход пропускается;
+	// порог 0 в конфиге — общий scheduler.queue_high_watermark (тем же
+	// критерием «строго ниже порога» работает гейт публикации q:analyze).
+	// Цикл здесь же, где компактификация: purge лишь готовит мёртвые
+	// блоки, место возвращает её часовой проход; второму владельцу он не
+	// нужен (охраны делают параллельный запуск безопасным, но
+	// бесполезным). Завершается отменой ctx.
+	retentionWatermark := int64(cfg.Content.RetentionAnalyzeWatermark)
+	if retentionWatermark <= 0 {
+		retentionWatermark = int64(cfg.Scheduler.QueueHighWatermark)
+	}
+	go func() {
+		_ = content.RetentionLoop(ctx, pool, content.RetentionOptions{
+			Retention:        cfg.Content.Retention.D(),
+			Interval:         cfg.Content.RetentionInterval.D(),
+			BatchSize:        cfg.Content.RetentionBatch,
+			Depth:            analyzeDepth{gate: gate},
+			AnalyzeWatermark: retentionWatermark,
+			Log:              logger,
+			OnPass:           content.NewRetentionMetrics(reg).Observe,
+		})
+	}()
+
 	opts2 := httpworker.Options{
 		// Задачный параллелизм цикла Run (T-139): скользящее потребление
 		// q:http, значения — http.task_* из конфига (дефолты по замерам
@@ -269,4 +299,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	<-bg
 	<-bg
 	return err
+}
+
+// analyzeDepth — глубина q:analyze для интерлока retention (T-166):
+// адаптер гейта backpressure (T-026) к узкому интерфейсу
+// content.RetentionDepth — пакет контента не знает Redis-специфики
+// гейта (стиль RenderLen, renderq.go).
+type analyzeDepth struct{ gate *queue.BackpressureGate }
+
+func (a analyzeDepth) AnalyzeDepth(ctx context.Context) (int64, error) {
+	return a.gate.Len(ctx, queue.StreamAnalyze)
 }

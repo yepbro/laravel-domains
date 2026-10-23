@@ -146,6 +146,17 @@ content:
   zstd_dictionary: "/data/content/dict.zst"   # crawlerctl dict train; пусто — без словаря
   disk_free_percent: 5               # порог свободного места каталога контента, %:
                                      # ниже — пауза записи контента + алерт (ТЗ 8)
+  # Retention контента и трим jsonb не-находок (T-166): записи старше окна,
+  # не Laravel-находки и не ждущие рендера теряют content_hash и тяжёлые
+  # jsonb; паспорт строки остаётся (docs/content.md). Стационарный объём
+  # контента = суточный приток × окно (при 20 GiB/сут 6 ч ≈ 5 GiB).
+  retention: "6h"                    # окно жизни контента не-находок; 0 — выключено
+  retention_interval: "1h"           # период проходов цикла (место возвращает
+                                     # часовая компактификация паков T-045)
+  retention_batch: 10000             # строк в пачке-транзакции; вилка 10–50 тыс.
+  retention_analyze_watermark: 0     # порог интерлока: глубина q:analyze ≥ порога —
+                                     # анализатор не успевает, проход пропускается;
+                                     # 0 — общий scheduler.queue_high_watermark
 
 analyzer:
   rules_dir: "/etc/crawler/rules"    # YAML-правила Laravel (ТЗ 5.8)

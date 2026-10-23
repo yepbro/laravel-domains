@@ -310,6 +310,31 @@ type Content struct {
 	// настраиваемого порога ТЗ 8 («порог настраивается»): доля свободного
 	// места, %.
 	DiskFreePercent float64 `yaml:"disk_free_percent"`
+	// Retention — окно жизни контента и jsonb не-находок (T-166; ТЗ 5.7
+	// «контент хранится не менее времени, пока нужно переприменять
+	// правила», решение оператора 2026-10-23: диск без новых мощностей):
+	// записи subdomain_results старше окна, не Laravel-находки и не ждущие
+	// рендера теряют content_hash и headers/cookies/tls/redirects/addrs/
+	// cname → NULL; паспорт строки остаётся всегда. Стационарный объём
+	// контента = суточный приток × окно (20 GiB/сут: 6 ч ≈ 5 GiB, 48 ч
+	// съели бы весь том). 0 — retention выключен. Расширение к
+	// минимальному составу ТЗ 5.10.
+	Retention Duration `yaml:"retention"`
+	// RetentionInterval — период проходов цикла RetentionLoop (T-166);
+	// место контенту возвращает часовая компактификация паков (T-045),
+	// retention её «кормит» — чаще часа незачем.
+	RetentionInterval Duration `yaml:"retention_interval"`
+	// RetentionBatch — строк в одной пачке-транзакции retention
+	// (T-166): короткие транзакции и HOT-апдейты (fillfactor 85,
+	// миграция 000002); рабочая вилка 10–50 тыс. по постановке.
+	RetentionBatch int `yaml:"retention_batch"`
+	// RetentionAnalyzeWatermark — порог интерлока retention: глубина
+	// q:analyze (backlog группы потребления) ≥ порога — анализатор не
+	// успевает, тела и headers/cookies ещё нужны, проход пропускается.
+	// 0 — общий порог scheduler.queue_high_watermark (тем же критерием
+	// «строго ниже порога» работает гейт публикации q:analyze, T-026);
+	// интерлок выключается явным большим значением на свой страх.
+	RetentionAnalyzeWatermark int `yaml:"retention_analyze_watermark"`
 }
 
 // Analyzer — анализатор Laravel (ТЗ 5.8).
@@ -547,6 +572,22 @@ func Default() *Config {
 			// данных (место хватает и на компактификацию, и на журналы);
 			// валидация не даёт выключить контроль нулём.
 			DiskFreePercent: 5,
+			// Окно жизни контента не-находок (T-166, замеры §12
+			// docs/load-measurements.md): 6 ч ≈ 5 GiB стационарно при
+			// притоке 20 GiB/сут — влезает в том без расширения, лаги
+			// потребителей (анализ — минуты, рендер-очередь — часы)
+			// перекрываются с запасом; обоснование — docs/content.md
+			// «Retention контента и трим не-находок».
+			Retention: Duration(6 * time.Hour),
+			// Час, как компактификация паков (T-045): место возвращает её
+			// проход, retention лишь готовит мёртвые блоки.
+			RetentionInterval: Duration(time.Hour),
+			// Нижняя граница вилки постановки (10–50 тыс.): ~13 пачек
+			// в часовом проходе дренируют приток ≈3 млн строк/сут.
+			RetentionBatch: 10000,
+			// 0 — общий порог scheduler.queue_high_watermark (интерлок
+			// тем же критерием, что гейт публикации q:analyze, T-026).
+			RetentionAnalyzeWatermark: 0,
 		},
 		Analyzer: Analyzer{
 			RulesDir:        "/etc/crawler/rules",
@@ -933,6 +974,35 @@ func (c *Config) Validate() error {
 	// паузу записи, > 95 останавливал бы запись на заведомо живом томе.
 	if c.Content.DiskFreePercent <= 0 || c.Content.DiskFreePercent > 95 {
 		problems = append(problems, fmt.Sprintf("content.disk_free_percent: ожидается (0, 95], задано %v", c.Content.DiskFreePercent))
+	}
+	// Retention (T-166): 0 — выключено; коридор 1m..30d: окно меньше
+	// минуты тонет в латентности потребителей (анализ — секунды), больше
+	// 30 суток — не retention, а архив (для него оператор поднимает
+	// отдельные мощности, решение 2026-10-23). Минутная граница заодно
+	// держит формат interval PostgreSQL свободным от микросекундных
+	// компонент Duration.String() («µs» в interval-синтаксисе сервера).
+	if r := c.Content.Retention; r != 0 && (r < Duration(time.Minute) || r > Duration(720*time.Hour)) {
+		problems = append(problems, fmt.Sprintf("content.retention: ожидается 0 (выключено) или %s..%s, задано %s",
+			Duration(time.Minute), Duration(720*time.Hour), r))
+	}
+	// Период проходов: чаще минуты — лишние сканы старения (пачка и так
+	// до 50 тыс. строк), реже суток — окно плавает сутками.
+	if c.Content.RetentionInterval < Duration(time.Minute) || c.Content.RetentionInterval > Duration(24*time.Hour) {
+		problems = append(problems, fmt.Sprintf("content.retention_interval: ожидается %s..%s, задано %s",
+			Duration(time.Minute), Duration(24*time.Hour), c.Content.RetentionInterval))
+	}
+	// Пачка: 1000 — не тонуть в раунд-триппах при притоке ≈3 млн
+	// строк/сут, 100 тыс. — потолок вилки постановки × 2 (транзакция
+	// держит блокировки строк пачки, гипертрофить её ни к чему).
+	if !inRange(c.Content.RetentionBatch, 1000, 100000) {
+		problems = append(problems, rangeMsg("content.retention_batch", c.Content.RetentionBatch, 1000, 100000)+" (рабочая вилка 10–50 тыс., T-166)")
+	}
+	// Порог интерлока: 0 — общий порог scheduler.queue_high_watermark;
+	// положительное значение не выше потолка стримов (10⁸ — граница
+	// валидации redis.maxlen, тот же порядок).
+	if w := c.Content.RetentionAnalyzeWatermark; w != 0 && !inRange(w, 1, 100000000) {
+		problems = append(problems, fmt.Sprintf("content.retention_analyze_watermark: ожидается 0 (порог scheduler.queue_high_watermark) или %d..%d, задано %d",
+			1, 100000000, w))
 	}
 
 	// analyzer

@@ -115,7 +115,7 @@ make reset-internet
 | [`docs/schema.md`](docs/schema.md) | схема PostgreSQL (`zones`, `subdomains`, `domains`, `subdomain_results`, `contents`, `laravel_*`, `ingest_files`): партиционирование, fillfactor, индексы, HOT-апдейты, `domain_info` |
 | [`docs/db.md`](docs/db.md) | слой БД: пул `pgx` (бюджет 20–50 соединений), потокочный `COPY` пачками, пакетные `UPDATE … FROM unnest(...)`; тюнинг боевого PostgreSQL |
 | [`docs/redis.md`](docs/redis.md) | Redis как транспорт очередей: dev/бой, бюджет памяти, `noeviction`, отказ от персистентности |
-| [`docs/content.md`](docs/content.md) | хранилище контента: пак-файлы, словарь zstd, дедупликация, компактификация, порог диска |
+| [`docs/content.md`](docs/content.md) | хранилище контента: пак-файлы, словарь zstd, дедупликация, компактификация, retention не-находок, порог диска |
 | [`docs/render.md`](docs/render.md) | рендер: Chromium, изолированные контексты, ожидание готовности, съём DOM/cookies |
 | [`docs/analyzer.md`](docs/analyzer.md) | движок правил Laravel: цели (cookie/заголовки/HTML/meta), свидетельства срабатываний, переанализ |
 | [`docs/runbooks.md`](docs/runbooks.md) | процедурные инструкции: переобучение словаря zstd, разбор `q:dead`, переанализ |

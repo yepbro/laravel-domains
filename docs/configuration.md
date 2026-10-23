@@ -531,6 +531,10 @@ anon ≈855 MiB, MemoryMax юнита 900M, T-143). `task_consume` — ещё и
 | `max_store_bytes` | `CRAWLER_CONTENT_MAX_STORE_BYTES` | размер | `2097152` (рекомендация: 1–2 МБ) |
 | `zstd_dictionary` | `CRAWLER_CONTENT_ZSTD_DICTIONARY` | путь | `/data/content/dict.zst` (пусто — без словаря) |
 | `disk_free_percent` | `CRAWLER_CONTENT_DISK_FREE_PERCENT` | число | `5`, диапазон (0, 95] |
+| `retention` | `CRAWLER_CONTENT_RETENTION` | длительность | `6h`, диапазон 1m..30d, `0` — выключено |
+| `retention_interval` | `CRAWLER_CONTENT_RETENTION_INTERVAL` | длительность | `1h`, диапазон 1m..24h |
+| `retention_batch` | `CRAWLER_CONTENT_RETENTION_BATCH` | число | `10000`, диапазон 1000..100000 (рабочая вилка 10–50 тыс.) |
+| `retention_analyze_watermark` | `CRAWLER_CONTENT_RETENTION_ANALYZE_WATERMARK` | число | `0` (общий порог `scheduler.queue_high_watermark`), явное значение 1..10⁸ |
 
 Словарь обучается командой `crawlerctl dict train <файл> [--samples ПУТЬ]…`
 (dev-окружение — `docs/dev-environment.md` §6); отсутствующий файл — не
@@ -550,6 +554,23 @@ anon ≈855 MiB, MemoryMax юнита 900M, T-143). `task_consume` — ещё и
 файл блокировки `.packs.lock`, словарь): формат, ротация по `pack_size`,
 метаданные `contents` и лимиты (включая реакцию на переполнение диска по
 `disk_free_percent`, ТЗ 8) — [`docs/content.md`](content.md).
+
+`retention` и параметры цикла — окно жизни контента не-находок (T-166;
+решение оператора 2026-10-23: диск без новых мощностей): записи
+`subdomain_results` старше окна, не Laravel-находки и не ждущие рендера
+теряют `content_hash` (со ссылкой `contents.refcount − 1` той же
+транзакцией, нулевые строки удаляются) и тяжёлые jsonb; паспорт строки
+остаётся всегда — `domain_info` и дашборд живы. Стационарный объём
+контента = суточный приток × окно (при 20 GiB/сут: 6 ч ≈ 5 GiB, 48 ч
+съели бы весь том). Интерлок `retention_analyze_watermark`: глубина
+q:analyze у порога — анализатор не успевает, тела и headers/cookies ещё
+нужны, проход цикла пропускается; 0 — общий порог
+`scheduler.queue_high_watermark` (тем же критерием «строго ниже порога»
+работает гейт публикации q:analyze). Механика, критерии отбора,
+зафиксированные отступления (переанализ не-находок — на recheck) и
+метрики — [`docs/content.md`](content.md) «Retention контента и трим
+не-находок (T-166)». Цикл запускает http-worker; `0` — retention
+выключен, цикл не поднимается.
 
 ### `analyzer` (ТЗ 5.8)
 
@@ -782,7 +803,9 @@ dashboard-secret` (пароль — аргумент или stdin; справк�
   `timeout_attempts` 1..100 и ≤ `redis.max_attempts` (T-148),
   `remote_url` (если задан) — корректный URL;
 - `content.pack_size` 1 MiB..8 GiB, `max_store_bytes` 1 байт..16 MiB,
-  `disk_free_percent` в (0, 95];
+  `disk_free_percent` в (0, 95]; `retention` 0 или 1m..30d,
+  `retention_interval` 1m..24h, `retention_batch` 1000..100000,
+  `retention_analyze_watermark` 0 или 1..10⁸ (T-166);
 - `analyzer.laravel_min_score` в (0, 1];
 - `ingest.max_error_ratio` в (0, 1]; `ingest.archive_max_uncompressed`
   1 байт..1 TiB, `ingest.archive_max_files` 1..1000000;
