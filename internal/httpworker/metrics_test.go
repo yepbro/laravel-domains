@@ -72,6 +72,7 @@ func TestMetricsNilSafe(t *testing.T) {
 	m.BodyHeld(1 << 20)
 	m.BodyHeld(-(1 << 20))
 	m.BodySize(4096)
+	m.PerIPWait(time.Second)
 }
 
 // TestMetricsSlotBody — приборы памяти слота (T-163): занятость слота
@@ -107,6 +108,47 @@ func TestMetricsSlotBody(t *testing.T) {
 	m.BodySize(20000)
 	if got := httpMetricValue(t, reg, "crawler_http_body_bytes", nil); got != 2 {
 		t.Errorf("crawler_http_body_bytes (count) = %v, want 2", got)
+	}
+}
+
+// TestMetricsPerIPWait — гистограмма ожидания per-IP семафора (T-165):
+// наблюдения ложатся в счётчик, корзина le=2 (граница критерия
+// «доля ожиданий > 2 с < 5%») отдает кумулятив ниже общего счётчика —
+// доля читается по корзинам без отдельного счётчика.
+func TestMetricsPerIPWait(t *testing.T) {
+	reg := metrics.New("http-worker")
+	m := NewMetrics(reg)
+
+	m.PerIPWait(150 * time.Millisecond)
+	m.PerIPWait(3 * time.Second)
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	var count, le2 uint64
+	found := false
+	for _, mf := range families {
+		if mf.GetName() != "crawler_http_per_ip_wait_seconds" {
+			continue
+		}
+		found = true
+		h := mf.GetMetric()[0].GetHistogram()
+		count = h.GetSampleCount()
+		for _, b := range h.GetBucket() {
+			if b.GetUpperBound() == 2 {
+				le2 = b.GetCumulativeCount()
+			}
+		}
+	}
+	if !found {
+		t.Fatal("crawler_http_per_ip_wait_seconds не экспортирована")
+	}
+	if count != 2 {
+		t.Errorf("crawler_http_per_ip_wait_seconds (count) = %d, want 2", count)
+	}
+	if le2 != 1 {
+		t.Errorf("корзина le=2 = %d, want 1 (ожидание 3 с лежит выше границы)", le2)
 	}
 }
 

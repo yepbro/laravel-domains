@@ -142,6 +142,9 @@ func TestDefault(t *testing.T) {
 	if len(c.Scheduler.ZoneWeights) != 0 {
 		t.Errorf("scheduler.zone_weights: по умолчанию пуст (равные веса, ТЗ 5.3 «опционально»), получено %v", c.Scheduler.ZoneWeights)
 	}
+	if len(c.HTTP.PerIPOverrides) != 0 {
+		t.Errorf("http.per_ip_overrides: по умолчанию пуст (один per_ip_limit на все IP, T-165), получено %v", c.HTTP.PerIPOverrides)
+	}
 	if len(c.Dashboard.Probes) != 0 {
 		t.Errorf("dashboard.probes: по умолчанию пуст (пробы не заданы, ТЗД §8.1), получено %v", c.Dashboard.Probes)
 	}
@@ -201,6 +204,9 @@ dns:
 http:
   concurrency: 1500
   per_ip_limit: 3
+  per_ip_overrides:
+    "195.208.0.0/16": 12
+    "2a02:6b8::/32": 8
   connect_timeout: "3s"
   tls_handshake_timeout: "4s"
   header_timeout: "7s"
@@ -362,6 +368,10 @@ log:
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 3 || w["com"] != 5 || w["co.uk"] != 3 || w["xn--p1ai"] != 2 {
 		t.Errorf("scheduler.zone_weights: ожидается map[com:5 co.uk:3 xn--p1ai:2], получено %v", w)
 	}
+	// Префиксы парковщиков (T-165): карта CIDR → лимит как есть.
+	if o := cfg.HTTP.PerIPOverrides; len(o) != 2 || o["195.208.0.0/16"] != 12 || o["2a02:6b8::/32"] != 8 {
+		t.Errorf("http.per_ip_overrides: ожидается map[195.208.0.0/16:12 2a02:6b8::/32:8], получено %v", o)
+	}
 	if p := cfg.Dashboard.Probes; len(p) != 2 || p["dns-worker"] != "http://10.0.0.2:9102" || p["http-worker"] != "http://10.0.0.3:9103" {
 		t.Errorf("dashboard.probes: ожидается map[dns-worker:http://10.0.0.2:9102 http-worker:http://10.0.0.3:9103], получено %v", p)
 	}
@@ -503,6 +513,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_HTTP_TASK_PER_DOMAIN":                "4",
 		"CRAWLER_HTTP_DEAD_HOST_CUTOFF":               "false",
 		"CRAWLER_HTTP_MEM_LIMIT":                      "512MiB",
+		"CRAWLER_HTTP_PER_IP_OVERRIDES":               "195.209.0.0/16=9, 2a02:7b8::/32=6",
 		"CRAWLER_RENDER_REMOTE_URL":                   "ws://10.0.0.9:9222",
 		"CRAWLER_RENDER_CONTEXTS":                     "2",
 		"CRAWLER_RENDER_TIMEOUT":                      "11s",
@@ -648,6 +659,11 @@ func TestEnvOverrides(t *testing.T) {
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 2 || w["org"] != 7 || w["xn--p1ai"] != 2 {
 		t.Errorf("scheduler.zone_weights: ожидается map[org:7 xn--p1ai:2], получено %v", w)
 	}
+	// Карта override-лимитов per-IP из env (T-165): CIDR нормализуется
+	// маскированием, значение целиком заменяет карту из YAML.
+	if o := cfg.HTTP.PerIPOverrides; len(o) != 2 || o["195.209.0.0/16"] != 9 || o["2a02:7b8::/32"] != 6 {
+		t.Errorf("http.per_ip_overrides: ожидается map[195.209.0.0/16:9 2a02:7b8::/32:6], получено %v", o)
+	}
 	// Карта проб из env: ключи приводятся к нижнему регистру, края
 	// значений обрезаются.
 	if p := cfg.Dashboard.Probes; len(p) != 2 || p["mon"] != "http://mon:9100" || p["api"] != "http://api:9104" {
@@ -671,6 +687,8 @@ func TestEnvBadValues(t *testing.T) {
 		{map[string]string{"CRAWLER_LOG_LEVEL": "verbose"}, "log.level"},
 		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
 		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com=много"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
+		{map[string]string{"CRAWLER_HTTP_PER_IP_OVERRIDES": "195.208.0.0/16"}, "CRAWLER_HTTP_PER_IP_OVERRIDES"},
+		{map[string]string{"CRAWLER_HTTP_PER_IP_OVERRIDES": "195.208.0.0/16=много"}, "CRAWLER_HTTP_PER_IP_OVERRIDES"},
 		{map[string]string{"CRAWLER_DASHBOARD_PROBES": "mon"}, "CRAWLER_DASHBOARD_PROBES"},
 		{map[string]string{"CRAWLER_DASHBOARD_REFRESH_INTERVAL": "5"}, "CRAWLER_DASHBOARD_REFRESH_INTERVAL"},
 	}
@@ -907,6 +925,12 @@ func TestValidate(t *testing.T) {
 		{"dns udp_pool_size 0", func(c *Config) { c.DNS.UDPPoolSize = 0 }, "dns.udp_pool_size"},
 		{"http concurrency 0", func(c *Config) { c.HTTP.Concurrency = 0 }, "http.concurrency"},
 		{"per_ip_limit 0", func(c *Config) { c.HTTP.PerIPLimit = 0 }, "http.per_ip_limit"},
+		{"per-IP override не CIDR", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0.1/16": 8} }, "http.per_ip_overrides"},
+		{"per-IP override лимит 0", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0/16": 0} }, "http.per_ip_overrides"},
+		{"per-IP override лимит велик", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0/16": 65} }, "http.per_ip_overrides"},
+		{"per-IP override дубль сети", func(c *Config) {
+			c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0/16": 8, "195.208.9.9/16": 12}
+		}, "http.per_ip_overrides"},
 		{"connect_timeout 0", func(c *Config) { c.HTTP.ConnectTimeout = 0 }, "http.connect_timeout"},
 		{"tls_handshake_timeout 0", func(c *Config) { c.HTTP.TLSHandshakeTimeout = 0 }, "http.tls_handshake_timeout"},
 		{"header_timeout 0", func(c *Config) { c.HTTP.HeaderTimeout = 0 }, "http.header_timeout"},

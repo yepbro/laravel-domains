@@ -15,6 +15,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
@@ -217,9 +218,29 @@ type DNS struct {
 
 // HTTP — параметры HTTP-этапа (ТЗ 5.5, таблица лимитов).
 type HTTP struct {
-	Concurrency    int      `yaml:"concurrency"`
-	PerIPLimit     int      `yaml:"per_ip_limit"`
-	ConnectTimeout Duration `yaml:"connect_timeout"`
+	Concurrency int `yaml:"concurrency"`
+	PerIPLimit  int `yaml:"per_ip_limit"`
+	// PerIPOverrides — повышенные (или пониженные) лимиты per-IP для
+	// префиксов парковщиков (T-165, часть 2b): карта «CIDR → лимит»,
+	// ключ — IPv4/IPv6-префикс («195.208.0.0/16»), значение — лимит
+	// соединений на один IP этого префикса вместо per_ip_limit.
+	// Матчинг диалимого IP — по самому длинному совпавшему префиксу
+	// (longest-prefix, детерминированно: одна сеть не может быть
+	// перечислена дважды — валидация отклоняет дубли после маскирования;
+	// префиксы IPv4 и IPv6 не пересекаются, netip сравнивает их по
+	// семействам). Пустая карта (умолчание) — поведение прежнее: один
+	// per_ip_limit на все IP. Диапазон лимита — как у per_ip_limit
+	// (1..64); фактический параллелизм всё равно ограничен глобальным
+	// потолком http.concurrency. Назначение: в com/xyz-смеси миллионы
+	// доменов живут на IP парковщиков — per_ip_limit 4 при FIFO-очереди
+	// семафора растягивает задачи к 20 с (head-of-line, находка T-092
+	// §3); повышенный лимит для выявленных замером префиксов парковщиков
+	// разгружает очередь, не поднимая планку для прочих хостов.
+	// Наблюдаемость для решения «какие префиксы и на сколько» —
+	// гистограмма crawler_http_per_ip_wait_seconds (:9104, T-165 часть 1).
+	// Расширение к минимальному составу ТЗ 5.10.
+	PerIPOverrides map[string]int `yaml:"per_ip_overrides"`
+	ConnectTimeout Duration       `yaml:"connect_timeout"`
 	// TLSHandshakeTimeout — таймаут TLS-рукопожатия (5 с из таблицы
 	// лимитов ТЗ 5.5). В минимальном составе ТЗ 5.10 поля нет — как и
 	// других таймаутов таблицы, все они «настраиваются» по ТЗ 5.5.
@@ -1034,6 +1055,28 @@ func (c *Config) Validate() error {
 	}
 	if !inRange(c.HTTP.PerIPLimit, 1, 64) {
 		problems = append(problems, rangeMsg("http.per_ip_limit", c.HTTP.PerIPLimit, 1, 64)+"; рекомендация ТЗ: 3–4")
+	}
+	// Префиксы парковщиков (T-165): ключ обязан быть разбираемым CIDR
+	// (IPv4/IPv6), лимит — в диапазоне per_ip_limit; одна сеть не может
+	// быть перечислена дважды — маскированные «195.208.0.0/16» и
+	// «195.208.9.9/16» это одна сеть, дубль делал бы выбор лимита
+	// неоднозначным (longest-prefix не различает равную длину).
+	seenNets := make(map[string]struct{}, len(c.HTTP.PerIPOverrides))
+	for cidr, limit := range c.HTTP.PerIPOverrides {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("http.per_ip_overrides: ключ %q — ожидается CIDR IPv4/IPv6 (например 195.208.0.0/16)", cidr))
+			continue
+		}
+		if !inRange(limit, 1, 64) {
+			problems = append(problems, rangeMsg("http.per_ip_overrides["+cidr+"]", limit, 1, 64)+"; диапазон как у http.per_ip_limit")
+		}
+		masked := prefix.Masked().String()
+		if _, dup := seenNets[masked]; dup {
+			problems = append(problems, fmt.Sprintf("http.per_ip_overrides: сеть %s перечислена дважды (после маскирования CIDR)", masked))
+			continue
+		}
+		seenNets[masked] = struct{}{}
 	}
 	if c.HTTP.ConnectTimeout <= 0 {
 		problems = append(problems, nonPositiveDur("http.connect_timeout", c.HTTP.ConnectTimeout))

@@ -123,8 +123,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// подставляет дефолтный честный UA (T-052); резолв хостов редиректов —
 	// тем же резолвером DNS-этапа с кэшем (ТЗ 5.5 п. 2, CachingResolver
 	// T-047, адаптер httpworker.DNSLookup); InsecureSkipVerify — ТЗ 5.5
-	// п. 3.
+	// п. 3. Ожидание слота per-IP семафора — в гистограмму :9104 (T-165):
+	// NewMetrics идемпотентен (T-076), воркер ниже делит те же коллекторы.
 	opts := httpfetch.NewOptions(cfg.HTTP)
+	opts.Limits.OnPerIPWait = httpworker.NewMetrics(reg).PerIPWait
 	opts.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	opts.Resolver = httpfetch.NewCachingResolver(
 		httpworker.NewDNSLookup(resolve, cfg.DNS.IPv6), httpfetch.CacheOptions{})

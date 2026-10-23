@@ -18,7 +18,9 @@
 //   - соединения на один IP («одновременных соединений на один IP |
 //     3–4»): семафор-карта по диалимому IP (адрес DNS-этапа или резолва
 //     редиректа, не хост URL) — limitIPMap; ожидающие стоят в очереди
-//     с отменой ctx;
+//     с отменой ctx. Префиксам парковщиков — повышенный лимит
+//     (PerIPOverrides, T-165), ожидание очереди наблюдаемо
+//     (OnPerIPWait, T-165 — гистограмма :9104);
 //   - глобальное число соединений и темп запросов («ограничение
 //     исходящей нагрузки по глобальному числу соединений и RPS»):
 //     счётный семафор на всё соединение и токен-ведро на запрос —
@@ -47,6 +49,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 	"time"
 
@@ -85,6 +88,17 @@ const (
 	DefaultLimitRPS = 1000
 )
 
+// PerIPOverride — лимит per-IP семафора для префикса (T-165, часть 2b):
+// соединения с IP внутри Prefix идут с Limit одновременных вместо
+// PerIPConns. Источник — карта «CIDR → лимит» конфигурации
+// (http.per_ip_overrides, префиксы парковщиков); эффективный лимит IP —
+// по самому длинному совпавшему префиксу. Override может быть и ниже
+// дефолта (мягкий хостер) — семантика едина.
+type PerIPOverride struct {
+	Prefix netip.Prefix
+	Limit  int
+}
+
 // LimitOptions — параметры лимитов T-049. Нулевые значения заменяются
 // дефолтами (withDefaults, стиль Options: «0 — значение по умолчанию»).
 type LimitOptions struct {
@@ -102,6 +116,13 @@ type LimitOptions struct {
 	// PerIPConns — одновременных соединений на один диалимый IP
 	// (http.per_ip_limit).
 	PerIPConns int
+	// PerIPOverrides — override-лимиты per-IP по префиксам парковщиков
+	// (T-165, http.per_ip_overrides): IP внутри префикса получает лимит
+	// префикса вместо PerIPConns — самый длинный совпавший префикс
+	// (longest-prefix; одна сеть дважды не валидна — конфигурация
+	// отклоняет дубли после маскирования). Пусто — один лимит на все IP
+	// (прежнее поведение).
+	PerIPOverrides []PerIPOverride
 	// GlobalConns — глобальный потолок одновременных соединений
 	// (http.concurrency).
 	GlobalConns int
@@ -112,19 +133,68 @@ type LimitOptions struct {
 	// волна» всех воркеров разом; больше бессмысленно: одновременно
 	// летит не больше соединений.
 	Burst int
+	// OnPerIPWait — наблюдение ожидания слота per-IP семафора (T-165,
+	// часть 1): вызывается после каждой успешной выдачи слота с чистым
+	// временем ожидания в очереди (свободный слот — микросекунды).
+	// Отменённое ctx ожидание наблюдением не становится — его уже
+	// учитывает классификация ошибки этапа. nil — без наблюдений
+	// (транспорт вне http-worker: CLI, изолированные тесты). Подключает
+	// сборка сервиса к гистограмме crawler_http_per_ip_wait_seconds
+	// (:9104) — доля ожиданий > 2 с читается по корзинам (критерий
+	// T-165: < 5 % на смеси боя).
+	OnPerIPWait func(wait time.Duration)
 }
 
 // NewLimitOptions собирает лимиты из секции http: потолок тела и
 // per-IP есть с T-006, скорость тела и RPS — поля T-049; глобальный
-// потолок соединений — http.concurrency.
+// потолок соединений — http.concurrency; префиксы парковщиков (карта
+// «CIDR → лимит») — T-165. Ошибка разбора карты невозможна после
+// config.Validate (Load отклоняет конфиг); при ручной сборке мусорная
+// запись отключает overrides целиком — безопаснее молчаливого
+// частичного применения: все IP остаются на PerIPLimit.
 func NewLimitOptions(cfg config.HTTP) LimitOptions {
-	return LimitOptions{
-		MaxBodyBytes: cfg.MaxBodyBytes.B(),
-		MinBodySpeed: cfg.MinBodySpeed.B(),
-		PerIPConns:   cfg.PerIPLimit,
-		GlobalConns:  cfg.Concurrency,
-		MaxRPS:       cfg.MaxRPS,
+	overrides, err := parsePerIPOverrides(cfg.PerIPOverrides)
+	if err != nil {
+		overrides = nil
 	}
+	return LimitOptions{
+		MaxBodyBytes:   cfg.MaxBodyBytes.B(),
+		MinBodySpeed:   cfg.MinBodySpeed.B(),
+		PerIPConns:     cfg.PerIPLimit,
+		PerIPOverrides: overrides,
+		GlobalConns:    cfg.Concurrency,
+		MaxRPS:         cfg.MaxRPS,
+	}
+}
+
+// parsePerIPOverrides разбирает карту «CIDR → лимит» (формат
+// http.per_ip_overrides): CIDR IPv4/IPv6, лимит ≥ 1, одна сеть (после
+// маскирования) не встречается дважды — дубль делал бы выбор лимита
+// неоднозначным (longest-prefix не различает равную длину). Порядок
+// результата не определён (карта) — сортировку делает newLimitState.
+func parsePerIPOverrides(m map[string]int) ([]PerIPOverride, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(m))
+	out := make([]PerIPOverride, 0, len(m))
+	for cidr, limit := range m {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("httpfetch: per-IP override %q: ожидается CIDR IPv4/IPv6", cidr)
+		}
+		if limit < 1 {
+			return nil, fmt.Errorf("httpfetch: per-IP override %s: лимит %d меньше 1", prefix, limit)
+		}
+		masked := prefix.Masked()
+		key := masked.String()
+		if _, dup := seen[key]; dup {
+			return nil, fmt.Errorf("httpfetch: per-IP override: сеть %s перечислена дважды", key)
+		}
+		seen[key] = struct{}{}
+		out = append(out, PerIPOverride{Prefix: masked, Limit: limit})
+	}
+	return out, nil
 }
 
 // withDefaults заменяет нулевые и отрицательные значения дефолтами.
@@ -164,15 +234,27 @@ type limitState struct {
 }
 
 // newLimitState строит состояние из опций (вызывающий уже подставил
-// дефолты).
+// дефолты). Override-префиксы per-IP (T-165) сортируются по убыванию
+// длины: limitFor берёт первый совпавший — это и есть самый длинный
+// (longest-prefix); равные длины не пересекаются после запрета дублей
+// сетей (parsePerIPOverrides/валидация конфигурации), порядок внутри
+// одной длины сохраняется стабильной сортировкой (детерминизм и для
+// вручную собранных списков).
 func newLimitState(opt LimitOptions) *limitState {
+	overrides := make([]PerIPOverride, len(opt.PerIPOverrides))
+	copy(overrides, opt.PerIPOverrides)
+	sort.SliceStable(overrides, func(i, j int) bool {
+		return overrides[i].Prefix.Bits() > overrides[j].Prefix.Bits()
+	})
 	return &limitState{
 		opt:    opt,
 		global: make(chan struct{}, opt.GlobalConns),
 		rps:    newLimitBucket(float64(opt.MaxRPS), opt.Burst),
 		ips: limitIPMap{
-			limit:   opt.PerIPConns,
-			entries: make(map[netip.Addr]*limitIPEntry),
+			limit:     opt.PerIPConns,
+			overrides: overrides,
+			onWait:    opt.OnPerIPWait,
+			entries:   make(map[netip.Addr]*limitIPEntry),
 		},
 	}
 }
@@ -218,10 +300,16 @@ func limitChanRelease(ch chan struct{}) { <-ch }
 // создаётся по требованию и удаляется, когда её никто не держит и
 // никто не ждёт (refs) — карта не растёт с числом проверенных IP,
 // размер ограничен активностью (конкурентностью) транспорта.
+//
+// Override-префиксы (T-165): запись создаётся с лимитом префикса,
+// содержащего IP (limitFor, longest-prefix), вместо общего limit —
+// ожидание очереди к парковочным IP наблюдаемо (onWait, T-165 часть 1).
 type limitIPMap struct {
-	limit   int
-	mu      sync.Mutex
-	entries map[netip.Addr]*limitIPEntry
+	limit     int
+	overrides []PerIPOverride // убывание длины префикса (newLimitState)
+	onWait    func(wait time.Duration)
+	mu        sync.Mutex
+	entries   map[netip.Addr]*limitIPEntry
 }
 
 // limitIPEntry — семафор одного IP и счётчик интересантов (держащих
@@ -232,21 +320,43 @@ type limitIPEntry struct {
 	refs int
 }
 
+// limitFor — эффективный лимит соединений для IP (T-165): лимит самого
+// длинного префикса, содержащего IP, иначе общий m.limit. Диалимый
+// адрес размапливается (Unmap): IPv4-в-IPv6 адрес семантически IPv4,
+// префиксы IPv4 должны матчиться; префиксы разных семейств не
+// пересекаются (netip.Contains между семьями — false), поэтому перебор
+// до первого совпадения в порядке убывания длины однозначен.
+func (m *limitIPMap) limitFor(ip netip.Addr) int {
+	a := ip.Unmap()
+	for _, o := range m.overrides {
+		if o.Prefix.Contains(a) {
+			return o.Limit
+		}
+	}
+	return m.limit
+}
+
 // acquire занимает слот соединения с IP; при исчерпании — очередь до
 // освобождения или отмены ctx. Возвращаемая функция потокобезопасна и
-// идемпотентна (повторный вызов ничего не портит).
+// идемпотентна (повторный вызов ничего не портит). Ожидание в очереди
+// (включая мгновенное) наблюдается onWait после успешной выдачи слота
+// (T-165): отменённое ожидание наблюдением не становится.
 func (m *limitIPMap) acquire(ctx context.Context, ip netip.Addr) (func(), error) {
 	m.mu.Lock()
 	e, ok := m.entries[ip]
 	if !ok {
-		e = &limitIPEntry{sem: make(chan struct{}, m.limit)}
+		e = &limitIPEntry{sem: make(chan struct{}, m.limitFor(ip))}
 		m.entries[ip] = e
 	}
 	e.refs++
 	m.mu.Unlock()
 
+	start := time.Now()
 	select {
 	case e.sem <- struct{}{}:
+		if m.onWait != nil {
+			m.onWait(time.Since(start))
+		}
 		var once sync.Once
 		return func() {
 			once.Do(func() {

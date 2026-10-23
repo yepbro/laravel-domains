@@ -19,6 +19,13 @@
 // cmd/http-worker, debug.SetMemoryLimit): GC удерживает anon ниже
 // MemoryHigh юнита, не отдавая память reclaim-штормам ядра (фаталы
 // T-157 случились именно на границе потолков cgroup).
+//
+// Ожидание per-IP семафора (T-165): head-of-line парковочных IP
+// (per_ip_limit при FIFO-очереди растягивает задачи к 20 с, находка
+// T-092 §3) сделано измеримым — гистограмма ожидания слота
+// crawler_http_per_ip_wait_seconds (наблюдения подставляет сборка
+// сервиса как httpfetch.LimitOptions.OnPerIPWait); доля ожиданий > 2 с —
+// критерий активации мер против head-of-line (< 5 % — норма).
 package httpworker
 
 import (
@@ -37,28 +44,34 @@ import (
 // от долей секунды до десятков секунд на «молчащие» домены с таймаутами.
 // Размер тела (T-163) — от пустых страниц парковок до потолка
 // max_body_bytes (2 МиБ): корзины степеней четвёрки, хвост обрезан
-// лимитом чтения тела.
+// лимитом чтения тела. Ожидание per-IP семафора (T-165) — от
+// микросекунд свободного слота до хвоста total_timeout (~20 с):
+// корзина le=2 выделена границей — доля ожиданий > 2 с (критерий
+// T-165: < 5 % на смеси боя) читается напрямую как
+// 1 − rate(…_bucket{le="2"})/rate(…_count).
 var (
-	httpResponseBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
-	httpSecondsBuckets  = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
-	httpBodyBuckets     = []float64{1 << 10, 4 << 10, 16 << 10, 64 << 10, 256 << 10, 512 << 10, 1 << 20, 2 << 20}
+	httpResponseBuckets  = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
+	httpSecondsBuckets   = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
+	httpBodyBuckets      = []float64{1 << 10, 4 << 10, 16 << 10, 64 << 10, 256 << 10, 512 << 10, 1 << 20, 2 << 20}
+	httpPerIPWaitBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30}
 )
 
 // Metrics — приборы HTTP-этапа; строится NewMetrics из реестра сервиса,
 // nil — все методы no-op (изолированные сборки). Потокобезопасен:
 // задачи идут параллельно, приборы prometheus синхронизированы.
 type Metrics struct {
-	tasks    prometheus.Counter     // crawler_stage_tasks_total{stage="http"}
-	seconds  prometheus.Observer    // crawler_stage_seconds{stage="http"}
-	errors   *prometheus.CounterVec // crawler_stage_errors_total{stage,type}
-	statuses *prometheus.CounterVec // crawler_domain_status_total{type}
-	response prometheus.Observer    // crawler_http_response_seconds
-	rendered *prometheus.CounterVec // crawler_render_records_total{rendered}
-	slots    prometheus.Gauge       // crawler_http_tasks_inflight (T-163)
-	bodyHold prometheus.Gauge       // crawler_http_body_bytes_inflight (T-163)
-	bodySize prometheus.Observer    // crawler_http_body_bytes (T-163)
-	cutoff   prometheus.Counter     // crawler_http_dead_host_cutoff_tasks_total (T-164)
-	cutSkip  prometheus.Counter     // crawler_http_dead_host_cutoff_skipped_checks_total (T-164)
+	tasks     prometheus.Counter     // crawler_stage_tasks_total{stage="http"}
+	seconds   prometheus.Observer    // crawler_stage_seconds{stage="http"}
+	errors    *prometheus.CounterVec // crawler_stage_errors_total{stage,type}
+	statuses  *prometheus.CounterVec // crawler_domain_status_total{type}
+	response  prometheus.Observer    // crawler_http_response_seconds
+	rendered  *prometheus.CounterVec // crawler_render_records_total{rendered}
+	slots     prometheus.Gauge       // crawler_http_tasks_inflight (T-163)
+	bodyHold  prometheus.Gauge       // crawler_http_body_bytes_inflight (T-163)
+	bodySize  prometheus.Observer    // crawler_http_body_bytes (T-163)
+	perIPWait prometheus.Observer    // crawler_http_per_ip_wait_seconds (T-165)
+	cutoff    prometheus.Counter     // crawler_http_dead_host_cutoff_tasks_total (T-164)
+	cutSkip   prometheus.Counter     // crawler_http_dead_host_cutoff_skipped_checks_total (T-164)
 }
 
 // NewMetrics регистрирует приборы HTTP-этапа в реестре reg (каррированные
@@ -107,6 +120,11 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 			Name:    "crawler_http_body_bytes",
 			Help:    "Размеры прочитанных тел итоговых страниц (байт): смесь, определяющая пик транзитных буферов слота (T-163); хвост обрезан http.max_body_bytes.",
 			Buckets: httpBodyBuckets,
+		}).WithLabelValues(),
+		perIPWait: reg.MustHistogram(prometheus.HistogramOpts{
+			Name:    "crawler_http_per_ip_wait_seconds",
+			Help:    "Ожидание слота per-IP семафора соединений перед установкой соединения (T-165): каждое успешное взятие слота, включая мгновенное. Доля ожиданий > 2 с (критерий T-165: < 5% на смеси боя) — 1 − rate(…_bucket{le=\"2\"})/rate(…_count); корзина le=2 — граница критерия. Диал — единица наблюдения: задача домена делает несколько подключений (субдомены × протоколы × ходы цепочки).",
+			Buckets: httpPerIPWaitBuckets,
 		}).WithLabelValues(),
 		cutoff: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_http_dead_host_cutoff_tasks_total",
@@ -197,4 +215,14 @@ func (m *Metrics) BodySize(n int) {
 		return
 	}
 	m.bodySize.Observe(float64(n))
+}
+
+// PerIPWait — ожидание слота per-IP семафора (T-165): наблюдение
+// гистограммы после каждой успешной выдачи слота; подключается сборка
+// сервиса (cmd/http-worker) как httpfetch.LimitOptions.OnPerIPWait.
+func (m *Metrics) PerIPWait(wait time.Duration) {
+	if m == nil {
+		return
+	}
+	m.perIPWait.Observe(wait.Seconds())
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -133,6 +134,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_DNS_UDP_POOL_SIZE", setInt(func(c *Config) *int { return &c.DNS.UDPPoolSize })},
 		{"CRAWLER_HTTP_CONCURRENCY", setInt(func(c *Config) *int { return &c.HTTP.Concurrency })},
 		{"CRAWLER_HTTP_PER_IP_LIMIT", setInt(func(c *Config) *int { return &c.HTTP.PerIPLimit })},
+		{"CRAWLER_HTTP_PER_IP_OVERRIDES", setPerIPOverrides(func(c *Config) *map[string]int { return &c.HTTP.PerIPOverrides })},
 		{"CRAWLER_HTTP_CONNECT_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.HTTP.ConnectTimeout })},
 		{"CRAWLER_HTTP_TLS_HANDSHAKE_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.HTTP.TLSHandshakeTimeout })},
 		{"CRAWLER_HTTP_HEADER_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.HTTP.HeaderTimeout })},
@@ -308,6 +310,40 @@ func setZoneWeights(get func(*Config) *map[string]int) func(*Config, string) err
 				return fmt.Errorf("вес зоны %s: ожидается целое число, получено %q", strings.TrimSpace(name), weight)
 			}
 			m[strings.ToLower(strings.TrimSpace(name))] = n
+		}
+		*get(c) = m
+		return nil
+	}
+}
+
+// setPerIPOverrides разбирает карту «CIDR = лимит» через запятую
+// (195.208.0.0/16=12, 2a02:0000::/32=8) — по образцу весов зон
+// (T-106); значение целиком заменяет карту из YAML. Ключ
+// нормализуется маскированным каноническим CIDR (netip): «195.208.9.9/16»
+// и «195.208.0.0/16» — одна сеть; пустые элементы (хвостовая запятая)
+// пропускаются. Разбираемость CIDR и диапазон лимита проверяет
+// валидация; CIDR не содержит «=» и «,» — разделители однозначны.
+func setPerIPOverrides(get func(*Config) *map[string]int) func(*Config, string) error {
+	return func(c *Config, v string) error {
+		m := make(map[string]int)
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			cidr, limit, ok := strings.Cut(part, "=")
+			if !ok {
+				return fmt.Errorf("ожидается карта «CIDR=лимит» через запятую (195.208.0.0/16=12), получено %q", part)
+			}
+			prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
+			if err != nil {
+				return fmt.Errorf("лимит per-IP %s: ожидается CIDR IPv4/IPv6, получено %q", strings.TrimSpace(cidr), cidr)
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(limit))
+			if err != nil {
+				return fmt.Errorf("лимит per-IP %s: ожидается целое число, получено %q", strings.TrimSpace(cidr), limit)
+			}
+			m[prefix.Masked().String()] = n
 		}
 		*get(c) = m
 		return nil

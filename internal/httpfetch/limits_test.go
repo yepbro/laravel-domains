@@ -2,7 +2,8 @@
 //
 //   - чистые единичные: математика дедлайна анти-тарпита, токен-ведро
 //     (темп), семафоры per-IP и глобальный (очередь, отмена, очистка
-//     карты), опции из конфигурации и дефолты;
+//     карты), опции из конфигурации и дефолты; override-лимиты per-IP
+//     по префиксам и наблюдение ожидания слота (T-165);
 //   - httptest-серверы на петле: потолок тела (ровно в лимит / сверх —
 //     truncated, в т.ч. chunked), тарпит тела (нарушение скорости после
 //     первого байта), темп без ложных срабатываний, лимит соединений
@@ -39,6 +40,7 @@ func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 	cfg := config.HTTP{
 		Concurrency:    777,
 		PerIPLimit:     3,
+		PerIPOverrides: map[string]int{"195.208.9.9/16": 12},
 		MaxBodyBytes:   config.ByteSize(3 << 20),
 		MinBodySpeed:   config.ByteSize(4096),
 		MaxRPS:         500,
@@ -50,6 +52,19 @@ func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 	if lo.MaxBodyBytes != 3<<20 || lo.MinBodySpeed != 4096 || lo.PerIPConns != 3 ||
 		lo.GlobalConns != 777 || lo.MaxRPS != 500 {
 		t.Errorf("перенос из секции http: %+v", lo)
+	}
+	// Карта префиксов (T-165) разбирается в override-лимиты
+	// (нормализация маскированием); мусор в ручной сборке отключает
+	// список целиком (валидный путь отсекает мусор раньше).
+	if len(lo.PerIPOverrides) != 1 {
+		t.Fatalf("override-лимиты: %v, want один префикс", lo.PerIPOverrides)
+	}
+	if o := lo.PerIPOverrides[0]; o.Prefix.String() != "195.208.0.0/16" || o.Limit != 12 {
+		t.Errorf("override = %s:%d, want 195.208.0.0/16:12", o.Prefix, o.Limit)
+	}
+	bad := NewLimitOptions(config.HTTP{PerIPLimit: 3, PerIPOverrides: map[string]int{"мусор": 8}})
+	if bad.PerIPOverrides != nil {
+		t.Errorf("мусорная карта: %v, want nil (отключение целиком)", bad.PerIPOverrides)
 	}
 
 	// NewOptions включает лимиты всегда (бойовый транспорт — с лимитами).
@@ -345,6 +360,239 @@ func TestLimitStateAcquireDial(t *testing.T) {
 		t.Fatal("очередь соединений не пробудилась")
 	}
 	r2()
+}
+
+// --- override-лимиты per-IP и наблюдение ожидания (T-165) ---------------------
+
+// TestParsePerIPOverrides: разбор карты «CIDR → лимит» — нормализация
+// маскированием («195.208.9.9/16» — сеть 195.208.0.0/16), IPv4 и IPv6;
+// ошибки: мусорный CIDR, лимит < 1, дубль сети после маскирования.
+func TestParsePerIPOverrides(t *testing.T) {
+	overrides, err := parsePerIPOverrides(map[string]int{
+		"195.208.9.9/16": 12,
+		"2a02:6b8::/32":  8,
+		"192.0.2.0/24":   2,
+	})
+	if err != nil {
+		t.Fatalf("разбор карты: %v", err)
+	}
+	want := map[string]int{"195.208.0.0/16": 12, "2a02:6b8::/32": 8, "192.0.2.0/24": 2}
+	if len(overrides) != len(want) {
+		t.Fatalf("ожидалось %d override, получено %v", len(want), overrides)
+	}
+	for _, o := range overrides {
+		if o.Limit != want[o.Prefix.String()] {
+			t.Errorf("override %s = %d, want %d", o.Prefix, o.Limit, want[o.Prefix.String()])
+		}
+	}
+
+	for name, m := range map[string]map[string]int{
+		"мусорный CIDR":  {"195.208.0.0.1/16": 8},
+		"лимит меньше 1": {"195.208.0.0/16": 0},
+		"дубль сети":     {"195.208.0.0/16": 8, "195.208.9.9/16": 12},
+	} {
+		if _, err := parsePerIPOverrides(m); err == nil {
+			t.Errorf("%s: ожидалась ошибка разбора", name)
+		}
+	}
+	if got, err := parsePerIPOverrides(nil); err != nil || got != nil {
+		t.Errorf("пустая карта: %v, %v — ожидалось nil, nil", got, err)
+	}
+}
+
+// TestLimitIPMapLimitFor: эффективный лимит IP — самый длинный совпавший
+// префикс (longest-prefix, независимо от порядка карты), вне префиксов —
+// общий; IPv4-в-IPv6 размапливается, семейства не пересекаются.
+func TestLimitIPMapLimitFor(t *testing.T) {
+	overrides, err := parsePerIPOverrides(map[string]int{
+		"195.208.0.0/16": 5,
+		"195.208.7.0/24": 3,
+		"2a02:6b8::/32":  4,
+	})
+	if err != nil {
+		t.Fatalf("разбор: %v", err)
+	}
+	st := newLimitState(LimitOptions{
+		PerIPConns: 2, PerIPOverrides: overrides,
+		MaxBodyBytes: 1024, MinBodySpeed: 1024, MinSpeedWindow: time.Second,
+	})
+
+	for _, tc := range []struct {
+		ip   string
+		want int
+	}{
+		{"195.208.7.1", 3},        // /24 длиннее /16
+		{"195.208.9.9", 5},        // /16
+		{"195.209.0.1", 2},        // вне префиксов — общий
+		{"2a02:6b8::1", 4},        // IPv6-префикс
+		{"2001:db8::1", 2},        // IPv6 вне
+		{"::ffff:195.208.7.1", 3}, // IPv4-в-IPv6 — Unmap, семантически IPv4
+	} {
+		if got := st.ips.limitFor(netip.MustParseAddr(tc.ip)); got != tc.want {
+			t.Errorf("limitFor(%s) = %d, want %d", tc.ip, got, tc.want)
+		}
+	}
+}
+
+// TestLimitIPMapOverrideCapacity: семафор IP внутри префикса держит лимит
+// префикса (пятое соединение ждёт), IP вне — общий лимит (третье ждёт).
+func TestLimitIPMapOverrideCapacity(t *testing.T) {
+	st := newLimitState(LimitOptions{
+		PerIPConns: 2, GlobalConns: 64, MaxRPS: 1000, Burst: 64,
+		PerIPOverrides: []PerIPOverride{{Prefix: netip.MustParsePrefix("195.208.0.0/16"), Limit: 4}},
+		MaxBodyBytes:   1024, MinBodySpeed: 1024, MinSpeedWindow: time.Second,
+	})
+	ctx := context.Background()
+
+	// IP парковщика: 4 слота лимита префикса.
+	park := netip.MustParseAddr("195.208.0.1")
+	parkRel := make([]func(), 0, 4)
+	for i := 0; i < 4; i++ {
+		r, err := st.ips.acquire(ctx, park)
+		if err != nil {
+			t.Fatalf("слот %d в префиксе: %v", i+1, err)
+		}
+		parkRel = append(parkRel, r)
+	}
+	parkQueued := make(chan func(), 1)
+	go func() {
+		rel, err := st.ips.acquire(ctx, park)
+		if err != nil {
+			t.Errorf("пятое соединение префикса: %v", err)
+			rel = func() {}
+		}
+		parkQueued <- rel
+	}()
+	select {
+	case <-parkQueued:
+		t.Fatal("пятый слот префикса взят при лимите 4")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Обычный IP: общий лимит 2.
+	plain := netip.MustParseAddr("192.0.2.7")
+	r1, err := st.ips.acquire(ctx, plain)
+	if err != nil {
+		t.Fatalf("слот 1 вне префикса: %v", err)
+	}
+	r2, err := st.ips.acquire(ctx, plain)
+	if err != nil {
+		t.Fatalf("слот 2 вне префикса: %v", err)
+	}
+	plainQueued := make(chan func(), 1)
+	go func() {
+		rel, err := st.ips.acquire(ctx, plain)
+		if err != nil {
+			t.Errorf("третье соединение вне префикса: %v", err)
+			rel = func() {}
+		}
+		plainQueued <- rel
+	}()
+	select {
+	case <-plainQueued:
+		t.Fatal("третий слот вне префикса взят при общем лимите 2")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Освобождение будит соответствующую очередь (перекрёстно молчат).
+	parkRel[0]()
+	select {
+	case rel := <-parkQueued:
+		rel()
+	case <-time.After(time.Second):
+		t.Fatal("очередь префикса не пробудилась")
+	}
+	r1()
+	select {
+	case rel := <-plainQueued:
+		rel()
+	case <-time.After(time.Second):
+		t.Fatal("очередь вне префикса не пробудилась")
+	}
+	for _, r := range parkRel[1:] {
+		r()
+	}
+	r2()
+}
+
+// TestLimitIPMapWaitObserved: ожидание слота наблюдается onWait после
+// выдачи (мгновенный слот — тоже, ≈0), отменённое ожидание наблюдением
+// не становится; ждущий под держателем получает ненулевое ожидание.
+func TestLimitIPMapWaitObserved(t *testing.T) {
+	var mu sync.Mutex
+	waits := make([]time.Duration, 0, 2)
+	m := limitIPMap{
+		limit:   1,
+		onWait:  func(d time.Duration) { mu.Lock(); waits = append(waits, d); mu.Unlock() },
+		entries: make(map[netip.Addr]*limitIPEntry),
+	}
+	ip := netip.MustParseAddr("192.0.2.1")
+	ctx := context.Background()
+
+	r1, err := m.acquire(ctx, ip)
+	if err != nil {
+		t.Fatalf("слот 1: %v", err)
+	}
+
+	// Ждущий под держателем: не возвращается, пока слот занят.
+	got := make(chan func(), 1)
+	go func() {
+		rel, err := m.acquire(ctx, ip)
+		if err != nil {
+			t.Errorf("ждущий: %v", err)
+			rel = func() {}
+		}
+		got <- rel
+	}()
+	select {
+	case <-got:
+		t.Fatal("второй слот взят при полном потолке")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Отменённое ожидание наблюдением не становится (классификацию
+	// ошибки этапа делает потребитель).
+	cctx, cancel := context.WithCancel(ctx)
+	cancelled := make(chan error, 1)
+	go func() {
+		_, err := m.acquire(cctx, ip)
+		cancelled <- err
+	}()
+	cancel()
+	select {
+	case err := <-cancelled:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("отмена очереди: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("отмена не разбудила ждущего")
+	}
+	mu.Lock()
+	n := len(waits)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("после отмены наблюдений %d, want 1 (только мгновенный слот)", n)
+	}
+
+	// Выдача будится освобождением; ожидание очереди наблюдено.
+	r1()
+	select {
+	case rel := <-got:
+		rel()
+	case <-time.After(time.Second):
+		t.Fatal("очередь не пробудилась освобождением")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(waits) != 2 {
+		t.Fatalf("наблюдений %d, want 2", len(waits))
+	}
+	if waits[1] < 20*time.Millisecond {
+		t.Errorf("ожидание очереди %s, want ≥20ms (ждущий стоял ≥100ms)", waits[1])
+	}
+	if waits[0] >= waits[1] {
+		t.Errorf("мгновенный слот %s не меньше ожидания очереди %s", waits[0], waits[1])
+	}
 }
 
 // holdServer — сервер, обработчики которого живут до release: занятые

@@ -183,6 +183,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_laravel_appeared_total` / `crawler_laravel_lost_total` | gauge | — | monitor (T-118) | кумулятивные появления/исчезновения строк `laravel_domains` (журнал `laravel_history`, свежие эпизоды HTTP); монотонны — counter-семантика |
 | `crawler_redis_memory_bytes` | gauge | `kind` | monitor (T-154) | тот же проход, что `crawler_redis_memory_ratio`: `kind=used` — `used_memory`, `kind=max` — `maxmemory` (0 — потолка нет) из `INFO memory` |
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
+| `crawler_http_per_ip_wait_seconds` | histogram | — | http-worker (T-165) | каждое успешное взятие слота per-IP семафора соединений с чистым временем ожидания очереди (мгновенный слот — микросекунды; отменённые ожидания не наблюдаются — их считает классификация ошибок); единица — диал (задача делает несколько подключений); корзина `le="2"` — граница критерия head-of-line парковочных IP: доля ожиданий > 2 с = `1 − rate(…_bucket{le="2"})/rate(…_count)`, норма < 5 % на смеси боя; материал для `http.per_ip_overrides` |
 | `crawler_http_dead_host_cutoff_tasks_total` | counter | — | http-worker (T-164) | задачи q:http, завершённые dead-host cutoff: apex и www упали на connect-фазе (connection refused/connect-таймаут, оба протокола), остальные субдомены не проверялись; контроль критерия mean задачи ≤ 7 с — `crawler_stage_seconds{stage="http"}` |
 | `crawler_http_dead_host_cutoff_skipped_checks_total` | counter | — | http-worker (T-164) | проверки (субдомен × протокол), не выполненные из-за cutoff, — сэкономленный пул задачи; ошибками этапа не считаются (`crawler_stage_errors_total` серии `cutoff` не имеет); доля ложных cutoff (<1 %, критерий) меряется контрольной выборкой по биту `dead_host_cutoff` в `domains.flags` |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
@@ -362,7 +363,12 @@ T-161, замер §12: на 47 млн строк проход 17+ с кажды
   транспорте с лимитами (T-049), параллельно внутри задачи пулом 8
   проверок (`http.task_per_domain`; субдомены одного домена живут на
   одних и тех же IP — реальный параллелизм подключения к одному IP уже
-  ограничен per-IP семафором 3–4, ТЗ 5.5);
+  ограничен per-IP семафором 3–4, ТЗ 5.5); префиксы парковщиков могут
+  получать повышенный лимит (`http.per_ip_overrides`, T-165:
+  longest-prefix, наблюдаемость ожидания — метрикой ниже), head-of-line
+  парковочных IP (находка T-092 §3) виден по гистограмме
+  `crawler_http_per_ip_wait_seconds` — доля ожиданий > 2 с (корзина
+  `le="2"`) против критерия < 5 % на смеси боя;
 - dead-host cutoff (T-164, `http.dead_host_cutoff`): при включённом
   флаге проверки идут двумя волнами — apex и www первыми, и если оба
   упали на connect-фазе (connection refused или connect-таймаут по
