@@ -202,7 +202,7 @@ T-162.
   q:analyze fresh), XTRIM q:dead MAXLEN 0. Остаточный источник смертей:
   ERR_CONNECTION_REFUSED (~5/мин) и ERR_CERT_DATE_INVALID — вне
   cert-класса задачи, кандидат на расширение списка постоянных.
-- **T-160** [новая] — P1-5, потолки памяти резолвера и dns-worker
+- **T-160** [в работе] — P1-5, потолки памяти резолвера и dns-worker
   (замер §12: unbound 733.9/734.0 MiB при MemoryMax 700M — 1.19 млн
   reclaim-событий, кэш вырос с 452 MiB (§6) на ≈47 млн имён;
   dns-worker периодически у 256 MiB; MemAvailable 2.6 GiB — запас
