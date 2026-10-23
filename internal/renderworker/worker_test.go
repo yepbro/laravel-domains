@@ -1381,10 +1381,13 @@ func TestRenderWorker_RunCancelWhileWaitingSlot(t *testing.T) {
 
 // TestRenderWorker_OptionsDefaults — дефолты цикла воркера и
 // конфигурации согласованы (образец TestWorkerOptionsDefaults T-139;
-// ревью T-142, P3-1 r2): DefaultConcurrency — верхняя граница
-// рекомендованных контекстов, дефолт render.contexts равен ей, расхождение
-// молча меняло бы поведение боевого экземпляра (max(4, contexts)) против
-// документации.
+// ревью T-142, P3-1 r2): DefaultConcurrency — пол параллелизма доставок
+// изолированных сборок (верхняя граница рекомендации ТЗ 5.6), боевая
+// сборка передаёт max(DefaultConcurrency, render.contexts). T-169 поднял
+// дефолт render.contexts (8) выше пола: инвариант — пол не выше
+// дефолтных контекстов (равенство max — документированному
+// параллелизму), расхождение вниз молча меняло бы поведение боевого
+// экземпляра против документации.
 func TestRenderWorker_OptionsDefaults(t *testing.T) {
 	o := Options{}.withDefaults()
 	if o.Concurrency != DefaultConcurrency || o.Consume != DefaultConsume {
@@ -1392,8 +1395,8 @@ func TestRenderWorker_OptionsDefaults(t *testing.T) {
 			o.Concurrency, o.Consume, DefaultConcurrency, DefaultConsume)
 	}
 	cfg := config.Default()
-	if cfg.Render.Contexts != DefaultConcurrency {
-		t.Errorf("render.contexts=%d расходится с DefaultConcurrency=%d (боевая сборка берёт max)",
+	if cfg.Render.Contexts < DefaultConcurrency {
+		t.Errorf("render.contexts=%d ниже DefaultConcurrency=%d: max() боевой сборки превысил бы слоты пула",
 			cfg.Render.Contexts, DefaultConcurrency)
 	}
 	if cfg.Render.TimeoutAttempts != DefaultTimeoutAttempts {

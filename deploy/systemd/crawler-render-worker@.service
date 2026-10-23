@@ -1,0 +1,92 @@
+# Domain Crawler — render-worker, второй и следующие экземпляры
+# (юнит-шаблон, ступень 3 T-169; первый экземпляр — одиночный юнит
+# crawler-render-worker.service, метрики 9105). Тот же бинарник и та же
+# группа потребителей q:render: консьюмерские группы масштабируют
+# воркеров горизонтально (ТЗ 4.2), имя консьюмера — per-process
+# (render-worker-<pid>, internal/renderworker.Options), экземпляры не
+# конфликтуют ни в XREADGROUP (доставки делятся между консьюмерами
+# группы), ни в клеймах XAUTOCLAIM (живой воркер подтверждает раньше
+# redis.claim_min_idle), хранилище контента общее для пишущих юнитов
+# (http-worker, render-worker — координация через БД, ТЗ 5.7).
+# Оправдан, когда contexts 8 (ступень 1) и timeout по гистограмме
+# (ступень 2) не дренируют q:render: лаг не убывает ≥1,5 тыс./ч при
+# PSI CPU some < 95% — порядок ступеней и контроль — docs/deploy.md §2.2.
+#
+# Имя экземпляра = порт метрик: crawler-render-worker@9109.service
+# слушает METRICS_ADDR 127.0.0.1:9109 (9101–9108 заняты комплектом,
+# следующие свободны с 9109; метрики — только loopback, ТЗ §9).
+# METRICS_ADDR нельзя задавать в общем /etc/crawler/crawler.env —
+# EnvironmentFile переопределяет Environment юнита и столкнёт порты
+# экземпляров.
+#
+# Своя cgroup: потолок 256M и CPUWeight 300 — отдельно от первого
+# экземпляра (строка бюджета добавляется к сумме §2 deploy.md).
+#
+# Chromium: по умолчанию общий с первым воркером (render.remote_url из
+# crawler.env → ws://127.0.0.1:9222) — CDP-браузер держит много
+# консьюмеров, бюджет памяти юнита chromium один на всех. При насыщении
+# одного Chromium (RSS у порога render.restart_memory_bytes /
+# MemoryCurrent юнита у 2048M, стационарный потолок скорости) — второй
+# инстанс chromium на :9223: per-instance файл
+# /etc/crawler/render-worker@<порт>.env (необязательный, позже общего
+# crawler.env — переопределяет) с
+# CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223; юнит chromium — копия
+# crawler-chromium.service с портом 9223 и отдельным user-data-dir
+# (например /var/lib/crawler/chromium2), своя cgroup ≈2 ГБ (ТЗ 3.2 —
+# отдельная строка бюджета; на сервере 8 ГБ — только по замеру
+# свободной памяти, MemAvailable §12 load-measurements.md).
+# Логи экземпляра: journalctl -t crawler-render-worker@<порт>.
+
+[Unit]
+Description=Domain Crawler — render-worker, экземпляр @%i (порт метрик)
+PartOf=crawler.target
+# Комментарий о After/Wants без Requires — crawler-ingest.service.
+After=network-online.target crawler-chromium.service postgresql.service redis-server.service unbound.service
+Wants=network-online.target crawler-chromium.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-render-worker
+Group=crawler
+EnvironmentFile=/etc/crawler/crawler.env
+# Per-instance переопределения (позже общего crawler.env — важнее):
+# CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223 при втором Chromium.
+EnvironmentFile=-/etc/crawler/render-worker@%i.env
+# Порт метрик — шаблонный параметр: имя экземпляра = порт (9109+,
+# 9101–9108 заняты; шапка юнита о конфликте с crawler.env).
+Environment=METRICS_ADDR=127.0.0.1:%i
+WorkingDirectory=/var/lib/crawler
+ExecStart=/opt/crawler/bin/render-worker
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+MemoryMax=256M
+# CPU-приоритет (T-158): как у первого экземпляра — этап конвейера, не
+# узкое место; тяжёлый CPU рендера — в chromium (отдельная cgroup на
+# дефолте 100, замер §12: chromium 140%): приоритет связки задаёт воркер.
+CPUWeight=300
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Заменяет HTML на DOM в общем с http-worker хранилище контента.
+ReadWritePaths=/var/lib/crawler/content
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target

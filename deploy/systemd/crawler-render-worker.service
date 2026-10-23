@@ -31,7 +31,14 @@ ExecStart=/opt/crawler/bin/render-worker
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
-MemoryMax=128M
+MemoryMax=256M
+# 256M (T-169, было 128M): DOM в полёте ≤ render.contexts ×
+# content.max_store_bytes (8 × 2 МиБ + transient-копии сериализации) и
+# буферы pgx/очереди — замер T-092 §6 упирался в потолок 128 MiB
+# (23/116/128) уже при 4 контекстах, к 23.10 — 117–128 МБ + swap
+# (дефицит слот-времени, стиль T-160); 8 контекстов (T-169) умножают
+# окно DOM вдвое. Контроль после деплоя: memory.events oom=0, NRestarts
+# 0 (бюджет — docs/deploy.md §2).
 # CPU-приоритет (T-158): этап конвейера, но не узкое место; вес 300 —
 # между критическим путём (1000) и обвязкой (50). Тяжёлый CPU рендера
 # живёт в chromium — отдельной cgroup на дефолте 100 (замер §12:

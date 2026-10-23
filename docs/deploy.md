@@ -41,10 +41,10 @@ cgroup, systemd перезапускает юнит, остальные серв
 | `postgresql@.service` + drop-in | **3072M** (бюджет ≈ 2,5 ГБ + запас на пики обслуживания) | PostgreSQL ≈ 2,5 ГБ |
 | `redis-server.service` + drop-in | **640M** (maxmemory 512mb + ~128 МБ служебных, docs/redis.md §7) | Redis ≤ 0,5 ГБ |
 | `unbound.service` + drop-in | **800M** (бюджет ≈ 0,7 ГБ + рост кэша на ≈47 млн имён: 733.9 MiB у старого потолка 700M, §12; +100M из MemAvailable 2.6 GiB) | Unbound ≈ 0,7 ГБ |
-| `crawler-*.service` (9 юнитов) | **2308M суммарно** | Go-сервисы ≈ 1,3 ГБ (7 конвейерных) + web этапа 13 + dashboard этапа 15 |
+| `crawler-*.service` (9 юнитов) | **2436M суммарно** (второй экземпляр render-worker@ добавляет свой 256M — §2.2) | Go-сервисы ≈ 1,3 ГБ (7 конвейерных) + web этапа 13 + dashboard этапа 15 |
 | `crawler-chromium.service` | **2048M** | Chromium ≈ 2 ГБ |
 
-Итого потолки 8868M при 8192M RAM — суммарно выше объёма памяти, и это
+Итого потолки 8996M при 8192M RAM — суммарно выше объёма памяти, и это
 допустимо: потолок — не резервация, одновременного касания всех потолков
 не бывает (по средним замеров §6/§11 весь набор ≈ 5.1–5.2 GiB, с пиком
 Chromium — ≈ 6 GiB; подъём T-160 — unbound +100M, dns-worker +128M —
@@ -66,16 +66,16 @@ shared_buffers — docs/db.md, «Память»), http-worker (тела в по�
 
 Потолки девяти юнитов Go-сервисов (строка «Go-сервисы ≈ 1,3 ГБ»
 исполняется фактическим потреблением ≈ 1.0–1.15 GiB, а не суммой
-потолков 2308M):
+потолков 2436M):
 
 | Юнит | MemoryMax |
 |---|---|
 | `crawler-http-worker.service` | 900M |
 | `crawler-dns-worker.service` | 384M |
 | `crawler-web.service` | 256M |
+| `crawler-render-worker.service` | 256M |
 | `crawler-ingest.service` | 128M |
 | `crawler-scheduler.service` | 128M |
-| `crawler-render-worker.service` | 128M |
 | `crawler-analyzer.service` | 128M |
 | `crawler-monitor.service` | 128M |
 | `crawler-dashboard.service` | 128M |
@@ -113,10 +113,17 @@ shared_buffers — docs/db.md, «Память»), http-worker (тела в по�
   проверки формы гонят полный конвейер checker (T-123: DNS → HTTP с телами
   страниц до `http.max_body_bytes` → рендер SPA → анализ) — сетевые буферы
   одного доменного эпизода, паритет с dev-профилем app;
-- **ingest / scheduler / analyzer / monitor / render-worker / dashboard —
-  по 128M**: пакетная работа с БД без больших буферов (потоковый разбор
+- **render-worker — 256M** (T-169, было 128M): только Go-часть (Chromium —
+  в отдельной cgroup), но DOM в полёте ≤ `render.contexts` ×
+  `content.max_store_bytes` (8 × 2 МиБ + transient-копии сериализации) и
+  буферы pgx/очереди: замер T-092 §6 упирался в потолок 128 MiB
+  (23/116/128) уже при 4 контекстах, к 23.10 — 117–128 МБ + swap
+  (дефицит слот-времени, подъём в стиле T-160); дефолт `render.contexts`
+  8 (T-169) умножает окно DOM вдвое — потолок 256M, контроль после
+  деплоя: `memory.events oom=0`, NRestarts 0;
+- **ingest / scheduler / analyzer / monitor / dashboard — по 128M**:
+  пакетная работа с БД без больших буферов (потоковый разбор
   файлов, SQL-пачки, разбор уже сжатого контента постранично, счётчики);
-  render-worker — только Go-часть: Chromium у него в отдельной cgroup;
   dashboard — read-only читатель БД/Redis (агрегаты считает SQL-движок,
   в памяти — только снимок и HTML/JSON-артефакты embed);
 - `crawlerctl` — CLI без юнита (ТЗ 4.1), запускается оператором эпизодически
@@ -154,6 +161,25 @@ load-measurements.md §3): единственный источник — фай�
 обоих юнитов, MemoryCurrent unbound < MemoryMax с запасом ≥ 50 MiB,
 median длительности DNS-задач в гистограммах 9103 не деградирует,
 `recursion.time.median` (`unbound-control stats`) не растёт.
+
+Применение T-169 на живом сервере (render-worker 128 → 256M) — вместе
+со ступенью 1 (операционно `render.contexts 4 → 8` в
+`/etc/crawler/config.yaml` — явное значение в конфиге перебивает
+дефолты кода, §5 п. 2; замер комплектом T-092 до/после, 30–60 мин
+стационара):
+
+```bash
+systemctl set-property crawler-render-worker.service MemoryMax=256M
+```
+
+После деплоя — синхронизировать юнит по §5 (п. 1) и снять drop-in
+(`systemctl revert` + `daemon-reload` + `restart`). Критерий ступени 1
+(T-169): лаг q:render убывает ≥1,5 тыс./ч, PSI CPU some < 95 %,
+chromium RSS ниже порога `render.restart_memory_bytes` (1536 MiB —
+MemoryCurrent юнита chromium), гистограммы и память 9105, `q:dead` без
+роста, NRestarts 0; повторный замер после CPUWeight рендера (T-158) —
+ёмкость против приоритета. Ступени 2–3 — configuration.md (`render`,
+`timeout`) и §2.2 ниже.
 
 ### 2.1. CPU-приоритеты: CPUWeight/CPUQuota (T-158)
 
@@ -214,6 +240,58 @@ systemctl show crawler-analyzer -p CPUQuotaPerSecUSec  # 1s 500ms (= 150%)
 load-measurements.md §10): PSI CPU some в стационаре < 80%, NRestarts
 юнитов 0, скорость HTTP не падает при фоновых проходах анализатора и
 пересчётах зон.
+
+### 2.2. Второй экземпляр render-worker (ступень 3 T-169)
+
+Юнит-шаблон [`deploy/systemd/crawler-render-worker@.service`](../deploy/systemd/crawler-render-worker@.service)
+поднимает второй и следующие экземпляры render-worker — ступень 3
+разгона дренажа q:render (постановка T-169), **после** ступени 1
+(`render.contexts 8` + MemoryMax 256M) и при недостатке ступени 2
+(`render.timeout` 25 → 15–20 с только по гистограмме —
+configuration.md, `render`): второй воркер оправдан, когда лаг q:render
+не убывает ≥1,5 тыс./ч при PSI CPU some < 95 % и гейте у watermark —
+значит, слоты/процессор первого воркера и его Chromium исчерпаны.
+
+Механика: тот же бинарник, та же группа потребителей `render-worker`
+(ТЗ 4.2 — консьюмерские группы масштабируют воркеров горизонтально);
+имя консьюмера per-process (`render-worker-<pid>`) — экземпляры не
+конфликтуют ни в XREADGROUP (доставки делятся между консьюмерами), ни
+в клеймах XAUTOCLAIM (живой воркер подтверждает раньше
+`redis.claim_min_idle`), пишут в общее хранилище контента (координация
+через БД — как http-worker с render-worker, ТЗ 5.7).
+
+- **Метрики**: имя экземпляра = порт: `crawler-render-worker@9109` →
+  `METRICS_ADDR=127.0.0.1:9109` (9101–9108 заняты комплектом, следующие
+  свободны с 9109). `METRICS_ADDR` нельзя задавать в общем
+  `/etc/crawler/crawler.env` — EnvironmentFile переопределяет
+  `Environment` юнита и столкнёт порты всех экземпляров;
+- **память**: свой потолок 256M на экземпляр (cgroup отдельная от
+  первого), сумма §2 растёт на 256M; контроль — `memory.events oom=0`,
+  NRestarts 0, гистограммы 9105/9109;
+- **второй Chromium (:9223)** — только при насыщении первого
+  (MemoryCurrent юнита chromium у 2048M / стационарный потолок скорости
+  при свободных слотах): per-instance файл
+  `/etc/crawler/render-worker@9109.env` с
+  `CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223` (шаблон подключает
+  его позже общего crawler.env — переопределяет), юнит chromium — копия
+  `crawler-chromium.service` с портом 9223 и отдельным user-data-dir
+  (например `/var/lib/crawler/chromium2`); его cgroup ≈2 ГБ — отдельная
+  строка бюджета ТЗ 3.2, на сервере 8 ГБ — только по замеру свободной
+  памяти (MemAvailable, §12).
+
+Запуск и контроль:
+
+```bash
+systemctl enable --now crawler-render-worker@9109.service
+curl -fsS 127.0.0.1:9109/livez              # живость второго экземпляра
+journalctl -t crawler-render-worker@9109 -f # логи экземпляра
+```
+
+Откат — `systemctl disable --now crawler-render-worker@9109`: доставки
+экземпляра вернутся клеймом первому (окно удержания ≪
+`redis.claim_min_idle`). Копируется шаблон общим порядком установки
+(§4.6, `cp deploy/systemd/crawler*.service` — маска захватывает и
+шаблон).
 
 ## 3. Пользователи: статические, по одному на сервис
 
@@ -550,7 +628,8 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
      `cp deploy/systemd/<юнит> /etc/systemd/system/ && systemctl
      daemon-reload && systemctl restart <юнит>` (пример: MemoryMax=900M,
      T-143; MemoryHigh=850M, T-145; CPUWeight/CPUQuota, T-158 — §2.1;
-     MemoryMax unbound 800M / dns-worker 384M, T-160 — §2);
+     MemoryMax unbound 800M / dns-worker 384M, T-160 — §2;
+     MemoryMax render-worker 256M / contexts 8, T-169 — §2);
      временные `systemctl set-property` drop-in'и
      (`/etc/systemd/system.control/`) удалить, чтобы юнит-файл
      был единственным источником;
@@ -591,9 +670,11 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
   ядра `journalctl -k --grep 'oom'` должен быть пуст, рестарты юнитов —
   по счётчику `NRestarts`.
 - **Метрики**: `127.0.0.1:9100…9108/metrics` (monitor — 9100, web —
-  9107, dashboard — 9108). Скрейпит установленный на сервере Prometheus
-  (его юнит — инфраструктура оператора, вне комплекта; конфиг джобов — как
-  `deploy/docker/prometheus/prometheus.yml`, адреса хостовые).
+  9107, dashboard — 9108; второй+ экземпляр render-worker — 9109 и
+  далее по имени экземпляра, §2.2). Скрейпит установленный на сервере
+  Prometheus (его юнит — инфраструктура оператора, вне комплекта; конфиг
+  джобов — как `deploy/docker/prometheus/prometheus.yml`, адреса
+  хостовые).
 - **Дашборд**: операторская сводка конвейера — напрямую на loopback
   `curl -fsS -u <username>:<пароль> http://127.0.0.1:8090/api/status`
   (Basic-креды из `dashboard.username`/`password_hash`; числа сходятся с
