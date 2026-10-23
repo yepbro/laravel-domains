@@ -3,6 +3,8 @@ package render
 import (
 	"errors"
 	"fmt"
+
+	"github.com/chromedp/chromedp"
 )
 
 // Class — класс ошибки рендера; определяет реакцию на сбой (ТЗ 5.6, §8):
@@ -68,6 +70,23 @@ func ClassOf(err error) Class {
 		return e.Class
 	}
 	return ClassTask
+}
+
+// LoadErrorCode — код ошибки загрузки страницы из цепочки ошибки: текст
+// браузера из net/base/net_error_list.h (например net::ERR_NAME_NOT_RESOLVED
+// или net::ERR_CERT_AUTHORITY_INVALID), которым chromedp маркирует сбой
+// навигации (тип LoadError, errors.Is с ErrPageLoad; classifyCtx относит
+// его к классу task). Пустая строка — ошибки загрузки страницы в цепочке
+// нет. Код — поле LoadError.ErrorText, а не подстрока текста ошибки:
+// точное сравнение стабильно против формата сообщений библиотеки.
+// Потребитель — политика постоянных ошибок сертификата хоста
+// (renderworker, T-159): сам код решения не принимает.
+func LoadErrorCode(err error) string {
+	var le *chromedp.LoadError
+	if errors.As(err, &le) {
+		return le.ErrorText
+	}
+	return ""
 }
 
 // ErrClosed — пул или браузер остановлены, задача не выполнялась.

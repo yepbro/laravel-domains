@@ -43,6 +43,14 @@
 // рендера: итог — сырой HTML HTTP-фазы (rendered = false), публикация
 // q:analyze, XACK — работа не выпадает в q:dead, q:dead остаётся
 // инфраструктурным ошибкам (БД, браузер, публикация; runbooks §2).
+//
+// Политика постоянных ошибок сертификата хоста (T-159):
+// ERR_CERT_AUTHORITY_INVALID / ERR_CERT_COMMON_NAME_INVALID — постоянные
+// свойства хоста (сертификат не издан доверенным ЦС / не покрывает имя),
+// ретрай бессмысленен. Cert-класс финализируется как тарпит, но с первой
+// же доставки (без тарпит-лимита): итог — сырой HTML HTTP-фазы,
+// публикация q:analyze, XACK; суточный прирост q:dead от cert-класса
+// нулевой, очередь q:render не копит попытки cert-хостов.
 package renderworker
 
 import (
@@ -54,6 +62,7 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -312,6 +321,54 @@ func isPageTimeout(err error) bool {
 	return render.ClassOf(err) == render.ClassTask && errors.Is(err, context.DeadlineExceeded)
 }
 
+// certErrorCodes — сетевые коды Chromium (net/base/net_error_list.h),
+// означающие постоянную ошибку TLS-сертификата хоста: свойство самого
+// хоста, а не сети или инфраструктуры. Список закрыт намеренно (T-159):
+// ERR_CONNECTION_REFUSED и прочие сетевые коды не входят (отказ
+// соединения может быть временным — хост поднимется), время-зависимые
+// коды сертификата (ERR_CERT_DATE_INVALID — просрочен/ещё не действует)
+// — тоже: постоянство не строгое. Расширение списка — только с
+// обоснованием детерминированности и тестом на код.
+var certErrorCodes = []string{
+	// Сертификат не издан доверенным центром сертификации: самоподписан
+	// или неизвестный корень — замена сертификата на стороне хоста.
+	"net::ERR_CERT_AUTHORITY_INVALID",
+	// Сертификат не покрывает имя хоста (CN/SAN не совпадают) — ошибка
+	// конфигурации сертификата хоста.
+	"net::ERR_CERT_COMMON_NAME_INVALID",
+}
+
+// isCertError — признак постоянной ошибки сертификата хоста (T-159):
+// класс task (свойство страницы — так classifyCtx маркирует сбои загрузки
+// net::ERR_*, а не умерший контекст/браузер, где повтор осмыслен) и код
+// ошибки загрузки из certErrorCodes. Время-зависимые и сетевые коды мимо:
+// до исчерпания детерминированности они — повторимые ошибки.
+func isCertError(err error) bool {
+	if render.ClassOf(err) != render.ClassTask {
+		return false
+	}
+	return slices.Contains(certErrorCodes, render.LoadErrorCode(err))
+}
+
+// certError — маркер постоянной ошибки сертификата хоста (T-159): ошибка
+// рендера класса task, чья причина — отказ Chromium грузить страницу из-за
+// сертификата хоста (isCertError: код net::ERR_CERT_* из certErrorCodes в
+// цепочке). Свойство постоянное: сертификат не издан доверенным ЦС или не
+// покрывает имя хоста — повтор на новом контексте (и вообще до смены
+// сертификата самим хостом) даст тот же исход, а каждая попытка жгла бы
+// слот рендера и общий лимит доставок redis.max_attempts до q:dead (замер
+// §12: ~27% попыток рендера — cert-ошибки, каждая до 4 доставок; 366
+// записей q:dead «исчерпан лимит попыток 3»). Обёртка не меняет текст
+// ошибки (Error/Unwrap — исходной) и служит только меткой:
+// processDelivery по ней финализирует запись без рендера с первой же
+// доставки — ждать попыток, в отличие от тарпитов T-148, незачем.
+type certError struct {
+	err error
+}
+
+func (e *certError) Error() string { return e.err.Error() }
+func (e *certError) Unwrap() error { return e.err }
+
 // ProcessResult обрабатывает одну задачу q:render (§5.6, §7): рендер
 // итогового URL строки, DOM в хранилище, атомарная замена ссылки и
 // rendered = true, публикация q:analyze после фиксации. Возвращает false
@@ -341,9 +398,13 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		// Ошибка страницы (таймаут, net::ERR_*) или браузера — повторная
 		// доставка уровнем очереди (класс task) / ожидание или будущий
 		// перезапуск (класс browser, T-065); частичного результата по ТЗ §8
-		// не бывает (T-063). Таймаут страницы дополнительно маркируется
-		// tarpitError (T-148): processDelivery по маркеру и номеру доставки
-		// решает — повторить или финализировать запись без рендера.
+		// не бывает (T-063). Постоянная ошибка сертификата хоста
+		// маркируется certError (T-159), таймаут страницы — tarpitError
+		// (T-148): processDelivery по маркерам решает — финализировать
+		// запись без рендера или повторить доставкой.
+		if isCertError(err) {
+			return false, fmt.Errorf("renderworker: %s: рендер: %w", name, &certError{err: err})
+		}
 		if isPageTimeout(err) {
 			return false, fmt.Errorf("renderworker: %s: рендер: %w", name, &tarpitError{err: err})
 		}
@@ -822,10 +883,15 @@ dispatch:
 // на одну попытку раньше; для настоящих тарпитов (таймаут на каждой
 // доставке) счёт совпадает точно.
 //
+// Постоянные ошибки сертификата хоста (T-159, certError) финализируются
+// с первой же доставки — независимо от номера и тарпит-лимита: свойство
+// хоста не меняется между попытками, ожидание бессмысленно.
+//
 // Успешная обработка идёт в приборы этапа (T-077): счётчик задач и
 // длительность, rendered=true при записанном DOM; ошибка — в счётчик
 // классов рендера (доставка вернётся повторной доставкой, ТЗ 3.4),
-// финализация без рендера — в crawler_render_tarpit_finalized_total.
+// финализация без рендера — в crawler_render_tarpit_finalized_total /
+// crawler_render_cert_finalized_total.
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attempts int) error {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
@@ -834,6 +900,22 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 	start := time.Now()
 	rendered, err := w.ProcessResult(ctx, task)
 	if err != nil {
+		var ce *certError
+		if errors.As(err, &ce) {
+			// Cert-класс финализируется с первой же доставки (T-159): ошибка
+			// сертификата — постоянное свойство хоста, ожидание попыток
+			// (тарпит-лимит T-148 даёт странице шанс в изменившихся условиях —
+			// здесь шанса нет) только жгло бы доставки к q:dead. Итог — сырой
+			// HTML HTTP-фазы, конвейер продолжается анализом (q:analyze),
+			// доставка подтверждается.
+			if ferr := w.finalizeCertError(ctx, task, ce); ferr != nil {
+				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+			}
+			w.met.Task(time.Since(start))
+			w.met.Error(render.ClassTask)
+			w.met.CertFinalized()
+			return nil
+		}
 		var tp *tarpitError
 		if errors.As(err, &tp) && attempts >= w.opt.TimeoutAttempts {
 			// Лимит таймаутов исчерпан (T-148): запись финализируется без
@@ -895,6 +977,50 @@ func (w *Worker) finalizeSkipRender(ctx context.Context, task queue.Result, caus
 	w.opt.log().Warn("рендер-тарпит: запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
 		"domain", renderLogName(task, target.finalURL), "final_url", target.finalURL,
 		"attempts", attempts, "timeout_attempts", w.opt.TimeoutAttempts,
+		"err", cause.Error())
+	return nil
+}
+
+// finalizeCertError — финализация записи без рендера по постоянной ошибке
+// сертификата хоста (T-159, зафиксированное решение): рендер этого URL
+// невозможен до смены сертификата самим хостом, ретраи бессмысленны и
+// пережигали бы общий лимит доставок до q:dead (замер §12). Итог записи —
+// сырой HTML HTTP-фазы (rendered = false — признак «рендера не было» по
+// схеме subdomain_results; отдельной колонки для исхода рендера нет, а
+// error принадлежит HTTP-проверке — ErrorClass T-058, перезапись лгала бы
+// о ней; HTTP-результат домена уже сохранён, ТЗ §8 — некорректный
+// сертификат загрузке не мешает, InsecureSkipVerify). Запись уходит
+// в q:analyze тем же ключом (Fresh=true — доработка текущего эпизода,
+// как у успешного рендера): конвейер доводит её анализом сырого HTML,
+// работа не теряется. Хост не заносится ни в какой список навсегда:
+// следующий эпизод перепроверки (T-030) опубликует новую задачу q:render —
+// с исправленным сертификатом рендер пройдёт. Доставка подтверждается
+// (nil вызывающему processDelivery) — в q:dead запись не попадает.
+//
+// Механика и идемпотентность — как у finalizeSkipRender (T-148): строки
+// нет (перепроверка перезаписала) или у неё нет итогового URL — штатный
+// отказ без публикации. Публикация q:analyze идёт до XACK: сбой — ошибка,
+// доставка вернётся и финализация повторится (дубликат публикации
+// ограничен попытками, анализатор идемпотентен по ключу).
+func (w *Worker) finalizeCertError(ctx context.Context, task queue.Result, cause *certError) error {
+	target, found, err := w.selectTarget(ctx, task)
+	if err != nil {
+		return fmt.Errorf("финализация без рендера: чтение строки результата: %w", err)
+	}
+	if !found || target.finalURL == "" {
+		// Рендерить/анализировать нечего: строки нет или она ушла из-под
+		// задачи (перепроверка) — успех без публикации.
+		w.opt.log().Debug("финализация без рендера не требуется — строки нет или без итогового URL",
+			"zone_id", task.ZoneID, "domain_id", task.DomainID,
+			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
+		return nil
+	}
+	task.Fresh = true
+	if _, err := w.q.Publish(ctx, queue.StreamAnalyze, task); err != nil {
+		return fmt.Errorf("финализация без рендера: публикация q:analyze: %w", err)
+	}
+	w.opt.log().Warn("рендер невозможен: постоянная ошибка сертификата хоста — запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
+		"domain", renderLogName(task, target.finalURL), "final_url", target.finalURL,
 		"err", cause.Error())
 	return nil
 }

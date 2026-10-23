@@ -65,6 +65,8 @@ func TestMetricsNilSafe(t *testing.T) {
 	m.Task(time.Second)       // no-op, не паникует
 	m.Rendered()              // no-op
 	m.Error(render.ClassTask) // no-op
+	m.TarpitFinalized()       // no-op (T-148)
+	m.CertFinalized()         // no-op (T-159)
 }
 
 func TestMetricsMethods(t *testing.T) {
@@ -77,6 +79,8 @@ func TestMetricsMethods(t *testing.T) {
 	m.Error(render.ClassTask)
 	m.Error(render.ClassTask)
 	m.Error(render.ClassBrowser)
+	m.TarpitFinalized()
+	m.CertFinalized()
 
 	stage := map[string]string{"stage": metrics.StageRender}
 	if got := rwMetricValue(t, reg, "crawler_stage_tasks_total", stage); got != 2 {
@@ -87,6 +91,12 @@ func TestMetricsMethods(t *testing.T) {
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true"}); got != 1 {
 		t.Errorf("crawler_render_records_total{rendered=\"true\"} = %v, want 1", got)
+	}
+	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", nil); got != 1 {
+		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 1", got)
+	}
+	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 1 {
+		t.Errorf("crawler_render_cert_finalized_total = %v, want 1", got)
 	}
 	for typ, want := range map[string]float64{
 		render.ClassTask.String():    2,

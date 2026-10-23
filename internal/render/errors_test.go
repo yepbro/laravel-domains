@@ -55,6 +55,37 @@ func TestErrorFormatUnwrapClassOf(t *testing.T) {
 	}
 }
 
+// TestLoadErrorCode — код ошибки загрузки страницы читается из цепочки
+// структурно (поле chromedp.LoadError.ErrorText, не разбор текста ошибки;
+// потребитель — политика cert-класса renderworker, T-159): прямо, через
+// обёртку render.Error и fmt.Errorf; без LoadError в цепочке — пусто.
+func TestLoadErrorCode(t *testing.T) {
+	loadErr := &chromedp.LoadError{ErrorText: "net::ERR_CERT_AUTHORITY_INVALID"}
+
+	if got := LoadErrorCode(loadErr); got != "net::ERR_CERT_AUTHORITY_INVALID" {
+		t.Errorf("LoadErrorCode(LoadError) = %q", got)
+	}
+	// Боевой путь: classifyCtx оборачивает сбой навигации в render.Error.
+	e := &Error{Class: ClassTask, URL: "https://a.example/", Err: loadErr}
+	if got := LoadErrorCode(e); got != "net::ERR_CERT_AUTHORITY_INVALID" {
+		t.Errorf("LoadErrorCode(render.Error) = %q", got)
+	}
+	// Произвольные обёртки %w — как у воркера поверх render.Error.
+	if got := LoadErrorCode(fmt.Errorf("renderworker: рендер: %w", e)); got != "net::ERR_CERT_AUTHORITY_INVALID" {
+		t.Errorf("LoadErrorCode через обёртки = %q", got)
+	}
+	for name, err := range map[string]error{
+		"без ошибки":            nil,
+		"не ошибка загрузки":    errors.New("таймаут страницы"),
+		"маркер загрузки":       chromedp.ErrPageLoad,
+		"ошибка другого класса": &Error{Class: ClassBrowser, Err: errors.New("canceled")},
+	} {
+		if got := LoadErrorCode(err); got != "" {
+			t.Errorf("LoadErrorCode(%s) = %q, хочу пусто", name, got)
+		}
+	}
+}
+
 // livePair — браузер и сессия с живыми (не отменёнными) контекстами для
 // классификации; без реального Chromium (классификация ходит только по
 // состоянию контекстов и зонду, зонд подменяется probeFn).

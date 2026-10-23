@@ -4,7 +4,8 @@
 // страницы, контекста или перезапуск браузера), доля рендера — ветка
 // rendered=true счётчика crawler_render_records_total (ветку false
 // наращивает HTTP-этап после записи результата; доля — отношением rate
-// в PromQL) и тарпит-финализации без рендера (T-148).
+// в PromQL), тарпит-финализации без рендера (T-148) и финализации по
+// постоянной ошибке сертификата хоста (T-159).
 package renderworker
 
 import (
@@ -32,6 +33,7 @@ type Metrics struct {
 	errors   *prometheus.CounterVec // crawler_stage_errors_total{stage,type}
 	rendered prometheus.Counter     // crawler_render_records_total{rendered="true"}
 	tarpits  prometheus.Counter     // crawler_render_tarpit_finalized_total (T-148)
+	certs    prometheus.Counter     // crawler_render_cert_finalized_total (T-159)
 }
 
 // NewMetrics регистрирует приборы этапа в реестре reg (каррированные по
@@ -61,6 +63,10 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		tarpits: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_tarpit_finalized_total",
 			Help: "Записи, финализированные без рендера после исчерпания render.timeout_attempts (T-148): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze; рост — доля таймаут-тарпитов на рендере.",
+		}).WithLabelValues(),
+		certs: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_render_cert_finalized_total",
+			Help: "Записи, финализированные без рендера по постоянной ошибке TLS-сертификата хоста — net::ERR_CERT_AUTHORITY_INVALID / net::ERR_CERT_COMMON_NAME_INVALID (T-159): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze, в q:dead cert-класс не попадает.",
 		}).WithLabelValues(),
 	}
 }
@@ -92,6 +98,17 @@ func (m *Metrics) TarpitFinalized() {
 		return
 	}
 	m.tarpits.Inc()
+}
+
+// CertFinalized — запись финализирована без рендера по постоянной ошибке
+// сертификата хоста (T-159): +1 в счётчик cert-финализаций — материал
+// критерия «суточный прирост q:dead от cert-класса = 0» (рост счётчика
+// при нулевом приросте q:dead — политика работает).
+func (m *Metrics) CertFinalized() {
+	if m == nil {
+		return
+	}
+	m.certs.Inc()
 }
 
 // Error — задача рендера не подтверждена (вернётся повторной доставкой):
