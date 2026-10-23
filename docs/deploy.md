@@ -424,7 +424,9 @@ install -m 0644 deploy/nrd/crawler-nrd.cron /etc/cron.d/crawler-nrd
   запись `СБОЙ: …` в `journalctl -t crawler-nrd-fetch`, повтор —
   следующими сутками. День хранится 90 дней, пропущенный запуск
   восстанавливается вручную: `/usr/local/bin/crawler-fetch-nrd` или
-  `CRAWLER_NRD_DAY=<дата> …` за любой день в глубину. Успех — строка
+  `CRAWLER_NRD_DAY=<дата> …` за любой день в глубину; массовая доливка
+  истории/пропусков — `deploy/nrd/backfill-nrd.sh` (все закрытые дни
+  раньше `NRD_BEFORE` по manifest.json, идемпотентен). Успех — строка
   `OK: день … закрыт` с `sha256` байтов `.gz`, совпадающим с journal-полем
   `ingest_files`. Повторная доставка того же дня — дубль по `sha256`,
   не обрабатывается (`incoming-files.md` §5).
