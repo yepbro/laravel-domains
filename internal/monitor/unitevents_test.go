@@ -156,6 +156,7 @@ func TestAlertsUnitOOMEpisode(t *testing.T) {
 // стиль зонда ingest); плюс источник не задан и пустой список юнитов.
 func TestAlertsUnitOOMDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil) // UnitEvents не задан
+	env.deps.UnitEvents = nil       // явное отсутствие источника (T-162 дал env здоровый по умолчанию)
 	s := snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "источник не задан") {
 		t.Errorf("без источника: %s (%s), want not_measured «источник не задан»", s.Status, s.Detail)
@@ -238,34 +239,37 @@ func TestParseSystemctlShow(t *testing.T) {
 
 // --- разбор memory.events --------------------------------------------------------
 
-// TestParseMemoryEvents — oom/oom_kill из полного файла, чужие ключи и
-// отсутствующие строки — мимо/нули, нечисловое значение — ошибка.
+// TestParseMemoryEvents — oom/oom_kill/high из полного файла, чужие ключи
+// и отсутствующие строки — мимо/нули, нечисловое значение — ошибка.
 func TestParseMemoryEvents(t *testing.T) {
-	oom, kill, err := parseMemoryEvents("low 0\nhigh 42\nmax 7\noom 3\noom_kill 1\noom_group 0\n")
-	if err != nil || oom != 3 || kill != 1 {
-		t.Errorf("полный файл = (%d, %d, %v), want (3, 1, nil)", oom, kill, err)
+	ev, err := parseMemoryEvents("low 0\nhigh 42\nmax 7\noom 3\noom_kill 1\noom_group 0\n")
+	if err != nil || ev.OOM != 3 || ev.OOMKill != 1 || ev.High != 42 {
+		t.Errorf("полный файл = (%d, %d, %d, %v), want (3, 1, 42, nil)", ev.OOM, ev.OOMKill, ev.High, err)
 	}
 
-	oom, kill, err = parseMemoryEvents("low 5\nhigh 1\n")
-	if err != nil || oom != 0 || kill != 0 {
-		t.Errorf("без oom-строк = (%d, %d, %v), want нули без ошибки", oom, kill, err)
+	ev, err = parseMemoryEvents("low 5\nmax 1\n")
+	if err != nil || ev.OOM != 0 || ev.OOMKill != 0 || ev.High != 0 {
+		t.Errorf("без oom/high-строк = (%d, %d, %d, %v), want нули без ошибки", ev.OOM, ev.OOMKill, ev.High, err)
 	}
 
-	oom, kill, err = parseMemoryEvents("")
-	if err != nil || oom != 0 || kill != 0 {
-		t.Errorf("пустой файл = (%d, %d, %v), want нули без ошибки", oom, kill, err)
+	ev, err = parseMemoryEvents("")
+	if err != nil || ev.OOM != 0 || ev.OOMKill != 0 || ev.High != 0 {
+		t.Errorf("пустой файл = (%d, %d, %d, %v), want нули без ошибки", ev.OOM, ev.OOMKill, ev.High, err)
 	}
 
 	// Строка без пробела — не ключ-значение, мимо.
-	if _, _, err := parseMemoryEvents("oomkill\n"); err != nil {
+	if _, err := parseMemoryEvents("oomkill\n"); err != nil {
 		t.Errorf("строка без значения: ошибка = %v, want пропуск", err)
 	}
 
-	if oom, _, err := parseMemoryEvents("oom -1\n"); err == nil || oom != 0 {
-		t.Errorf("нечисловое oom: (%d, %v), want ошибка и нуль", oom, err)
+	if ev, err := parseMemoryEvents("oom -1\n"); err == nil || ev.OOM != 0 {
+		t.Errorf("нечисловое oom: (%d, %v), want ошибка и нуль", ev.OOM, err)
 	}
-	if _, kill, err := parseMemoryEvents("oom_kill x\n"); err == nil || kill != 0 {
-		t.Errorf("нечисловое oom_kill: (%d, %v), want ошибка и нуль", kill, err)
+	if ev, err := parseMemoryEvents("oom_kill x\n"); err == nil || ev.OOMKill != 0 {
+		t.Errorf("нечисловое oom_kill: (%d, %v), want ошибка и нуль", ev.OOMKill, err)
+	}
+	if ev, err := parseMemoryEvents("high y\n"); err == nil || ev.High != 0 {
+		t.Errorf("нечисловое high: (%d, %v), want ошибка и нуль (алерт memory_high, T-162)", ev.High, err)
 	}
 }
 
@@ -306,8 +310,9 @@ func fakeCgroup(t *testing.T, root, unit, events string) {
 }
 
 // TestOSUnitEvents — systemctl show даёт юниты и NRestarts, memory.events
-// — oom/oom_kill; юнит без cgroup — нули событий памяти (остановлен,
-// рестарты учтены NRestarts).
+// — oom/oom_kill/high (high — троттлинг MemoryHigh, алерт memory_high
+// T-162); юнит без cgroup — нули событий памяти (остановлен, рестарты
+// учтены NRestarts).
 func TestOSUnitEvents(t *testing.T) {
 	root := t.TempDir()
 	cg := filepath.Join(root, "cg")
@@ -329,7 +334,7 @@ func TestOSUnitEvents(t *testing.T) {
 		t.Fatalf("юнитов = %d, want 3: %+v", len(units), units)
 	}
 	want := []UnitEvents{
-		{Unit: "crawler-http-worker.service", OOM: 3, OOMKill: 1, NRestarts: 2},
+		{Unit: "crawler-http-worker.service", OOM: 3, OOMKill: 1, High: 12, NRestarts: 2},
 		{Unit: "crawler-analyzer.service"},
 		{Unit: "crawler-monitor.service", NRestarts: 1},
 	}

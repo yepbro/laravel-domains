@@ -29,6 +29,8 @@ import (
 type UnitEventsMetrics struct {
 	// events — crawler_unit_oom_events{unit,kind}: oom/oom_kill.
 	events *prometheus.GaugeVec
+	// memHigh — crawler_unit_memory_high_events{unit}: memory.events high.
+	memHigh *prometheus.GaugeVec
 	// restarts — crawler_unit_restarts{unit}: NRestarts.
 	restarts *prometheus.GaugeVec
 	// src — исходный источник (обязателен).
@@ -51,6 +53,10 @@ func NewUnitEventsMetrics(reg *metrics.Registry, src UnitEventsSource) *UnitEven
 		Name: "crawler_unit_oom_events",
 		Help: "Счётчики memory.events cgroup v2 юнитов crawler (T-145): kind=oom — срабатывания OOM-killer, kind=oom_kill — убитые процессы; обнуляются пересозданием cgroup на рестарте юнита (gauge, не counter). Рост — события OOM, алерт unit_oom монитора.",
 	}, metrics.LabelUnit, metrics.LabelKind)
+	m.memHigh = reg.MustGauge(prometheus.GaugeOpts{
+		Name: "crawler_unit_memory_high_events",
+		Help: "Счётчик memory.events high юнитов crawler (T-162): попадания за мягкий потолок MemoryHigh (троттлинг reclaim'ом); накапливается за жизнь cgroup (gauge, не counter). Рост между проходами алертов — устойчивый троттлинг, алерт memory_high (предвестник фаталов T-157 у http-worker).",
+	}, metrics.LabelUnit)
 	m.restarts = reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_unit_restarts",
 		Help: "NRestarts systemd-юнитов crawler (T-145): крэш-рестарты с последнего старта/reset-failed; обнуляются сбросом состояния юнита (gauge, не counter). Рост — падения юнитов, алерт unit_oom монитора.",
@@ -70,6 +76,7 @@ func (m *UnitEventsMetrics) UnitEvents(ctx context.Context) ([]UnitEvents, error
 		for _, u := range list {
 			m.events.WithLabelValues(u.Unit, unitEventOOM).Set(float64(u.OOM))
 			m.events.WithLabelValues(u.Unit, unitEventOOMKill).Set(float64(u.OOMKill))
+			m.memHigh.WithLabelValues(u.Unit).Set(float64(u.High))
 			m.restarts.WithLabelValues(u.Unit).Set(float64(u.NRestarts))
 		}
 	}

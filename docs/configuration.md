@@ -721,6 +721,14 @@ rules:
 | `listen` | `CRAWLER_MONITOR_LISTEN` | [host]:port | `:9100` |
 | `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `5m` (коридор 30s..1h; T-161) |
 | `ingest_metrics_url` | `CRAWLER_MONITOR_INGEST_METRICS_URL` | http(s)-URL | `http://127.0.0.1:9101/metrics` |
+| `alerts.telegram` | `CRAWLER_MONITOR_ALERTS_TELEGRAM` | bool | `true` (T-162) |
+| `alerts.telegram_script` | `CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT` | путь | `/opt/crawler/bin/telegram-notify.sh` |
+| `alerts.disk_free_min_bytes` | `CRAWLER_MONITOR_ALERTS_DISK_FREE_MIN_BYTES` | размер | `15GiB` |
+| `alerts.disk_free_crit_bytes` | `CRAWLER_MONITOR_ALERTS_DISK_FREE_CRIT_BYTES` | размер | `10GiB` |
+| `alerts.queue_freeze_window` | `CRAWLER_MONITOR_ALERTS_QUEUE_FREEZE_WINDOW` | длительность | `15m` (коридор 1m..6h) |
+| `alerts.psi_cpu_percent` | `CRAWLER_MONITOR_ALERTS_PSI_CPU_PERCENT` | число 0–100 | `90` |
+| `alerts.psi_cpu_window` | `CRAWLER_MONITOR_ALERTS_PSI_CPU_WINDOW` | длительность | `30m` (коридор 1m..6h) |
+| `alerts.mem_high_passes` | `CRAWLER_MONITOR_ALERTS_MEM_HIGH_PASSES` | целое 1..10 | `2` |
 
 `listen` — адрес HTTP-эндпоинта самого сервиса monitor (`/livez` +
 `/healthz` + `/metrics`, его собственные метрики): у каждого сервиса
@@ -742,9 +750,11 @@ status`, лендинг и партиционирование — пятимин
 Коридор 30s..1h; значения 30–60 с коридора ТЗ 5.9 остаются доступными
 для малых корпусов. Проходы не наслаиваются (single-flight, T-161):
 проход дольше интервала сбрасывает накопившийся тик ticker'а, Warn и
-счётчик `crawler_zonestats_skipped_ticks_total` поднимают шум. Новых полей под пороги алертов нет: порог очередей —
-`scheduler.queue_high_watermark`, порог места — `content.disk_free_percent`
-(тот же, что пауза записи контента, ТЗ 8), остальные пороги — константы
+счётчик `crawler_zonestats_skipped_ticks_total` поднимают шум. Пороги
+первых алертов остались при своих полях: порог очередей —
+`scheduler.queue_high_watermark`, порог места (процент) —
+`content.disk_free_percent` (тот же, что пауза записи контента, ТЗ 8);
+пороги алертов T-162 — секция `alerts` ниже, остальные — константы
 `internal/monitor` с обоснованием (набор и числа —
 [`services.md`](services.md)).
 `ingest_metrics_url` — адрес `/metrics` сервиса ingest для зонда алерта
@@ -753,6 +763,36 @@ status`, лендинг и партиционирование — пятимин
 config.dev.yaml), на боевом хосте — loopback ingest по `METRICS_ADDR`
 юнита. Пустая строка — алерт «не измеряется» (зонд не поднимается);
 значение обязано быть абсолютным http(s)-адресом.
+
+`alerts` (T-162) — недостающие пороги ТЗ 5.9 (замер §12: все P0 того
+периода найдены вручную) и доставка алертов оператору; семантика
+алертов — [`services.md`](services.md), настройка доставки —
+[`operations.md`](operations.md) §4.3.
+
+- `telegram` — доставка переходов алертов (срабатывание 🚨 / снятие ✅,
+  один эпизод = два сообщения, дубли дебаунсятся) в Telegram тем же
+  ботом и группой, что извещения CI/CD (ТЗ §10.4). Включена по
+  умолчанию: решение фактически принимают секреты и скрипт на хосте —
+  нет `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` в EnvironmentFile юнита
+  (секреты не в YAML) или скрипта `telegram_script` — доставка тихо
+  выключена, алерты остаются Warn в журнале monitor;
+- `telegram_script` — путь `telegram-notify.sh` на сервере; деплой
+  ставит только бинарники, скрипт копирует оператор
+  ([`operations.md`](operations.md) §4.3);
+- `disk_free_min_bytes` / `disk_free_crit_bytes` — абсолютный минимум
+  свободного места каталога контента (алерты `disk_free_min` Warn /
+  `disk_free_crit` эскалация): процентный порог на томе 79 ГБ поздний
+  (10 % = 8 ГБ ≈ 5 ч до заполнения при ≈36 GiB/сут, замер §12);
+  крит всегда меньше минимума (валидация);
+- `queue_freeze_window` — окно неподвижности last-delivered-id группы
+  стрима при глубине > 0 (алерт `queue_frozen`, сигнатура отравленной
+  задачи T-159);
+- `psi_cpu_percent` + `psi_cpu_window` — порог PSI CPU some avg300 и
+  окно устойчивости (алерт `psi_cpu`; ядро без PSI — «не измеряется»);
+- `mem_high_passes` — проходов алертов подряд с ростом счётчика
+  memory.events high юнита (алерт `memory_high`, троттлинг MemoryHigh
+  http-worker — предвестник фаталов T-157; 2 × 5 мин = 10 мин
+  устойчивого давления).
 
 ### `web` (этап 13, T-121)
 
@@ -871,6 +911,10 @@ dashboard-secret` (пароль — аргумент или stdin; справк�
   `scheduler.batch_size` 1000..10000 (ТЗ 5.3), `queue_high_watermark` ≥ 1,
   `temp_error_max_retries` 1..100; `scheduler.backlog_interval` 30s..1h
   (T-161), `monitor.zone_stats_interval` 30s..1h (T-161);
+  `monitor.alerts.disk_free_crit_bytes` < `disk_free_min_bytes`,
+  `monitor.alerts.queue_freeze_window`/`psi_cpu_window` 1m..6h,
+  `psi_cpu_percent` (0, 100], `mem_high_passes` 1..10,
+  `telegram_script` непуст при `telegram: true` (T-162);
   `scheduler.zone_weights` — ключи
   (punycode-имена зон, приведённые к нижнему регистру) синтаксически
   корректны, веса 1..1000; `dashboard.refresh` 1s..5m;

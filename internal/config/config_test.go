@@ -111,6 +111,14 @@ func TestDefault(t *testing.T) {
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
 		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 5 * time.Minute},
 		{"monitor.ingest_metrics_url", c.Monitor.IngestMetricsURL, "http://127.0.0.1:9101/metrics"},
+		{"monitor.alerts.telegram", c.Monitor.Alerts.Telegram, true},
+		{"monitor.alerts.telegram_script", c.Monitor.Alerts.TelegramScript, "/opt/crawler/bin/telegram-notify.sh"},
+		{"monitor.alerts.disk_free_min_bytes", c.Monitor.Alerts.DiskFreeMinBytes.B(), int64(15 << 30)},
+		{"monitor.alerts.disk_free_crit_bytes", c.Monitor.Alerts.DiskFreeCritBytes.B(), int64(10 << 30)},
+		{"monitor.alerts.queue_freeze_window", c.Monitor.Alerts.QueueFreeze.D(), 15 * time.Minute},
+		{"monitor.alerts.psi_cpu_percent", c.Monitor.Alerts.PSICPUPercent, 90.0},
+		{"monitor.alerts.psi_cpu_window", c.Monitor.Alerts.PSIWindow.D(), 30 * time.Minute},
+		{"monitor.alerts.mem_high_passes", c.Monitor.Alerts.MemHighPasses, 2},
 		{"web.listen", c.Web.Listen, "127.0.0.1:8080"},
 		{"web.rate_limit", c.Web.RateLimit, 4},
 		{"web.timeout", c.Web.Timeout.D(), 60 * time.Second},
@@ -228,6 +236,15 @@ subdomains:
 monitor:
   listen: "127.0.0.1:9110"
   zone_stats_interval: "30s"
+  alerts:
+    telegram: false
+    telegram_script: "/srv/telegram-notify.sh"
+    disk_free_min_bytes: "20GiB"
+    disk_free_crit_bytes: "18GiB"
+    queue_freeze_window: "20m"
+    psi_cpu_percent: 85.5
+    psi_cpu_window: "45m"
+    mem_high_passes: 3
 dashboard:
   listen: "127.0.0.1:8190"
   refresh: "15s"
@@ -312,6 +329,14 @@ log:
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.75},
 		{"monitor.listen", cfg.Monitor.Listen, "127.0.0.1:9110"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 30 * time.Second},
+		{"monitor.alerts.telegram", cfg.Monitor.Alerts.Telegram, false},
+		{"monitor.alerts.telegram_script", cfg.Monitor.Alerts.TelegramScript, "/srv/telegram-notify.sh"},
+		{"monitor.alerts.disk_free_min_bytes", cfg.Monitor.Alerts.DiskFreeMinBytes.B(), int64(20 << 30)},
+		{"monitor.alerts.disk_free_crit_bytes", cfg.Monitor.Alerts.DiskFreeCritBytes.B(), int64(18 << 30)},
+		{"monitor.alerts.queue_freeze_window", cfg.Monitor.Alerts.QueueFreeze.D(), 20 * time.Minute},
+		{"monitor.alerts.psi_cpu_percent", cfg.Monitor.Alerts.PSICPUPercent, 85.5},
+		{"monitor.alerts.psi_cpu_window", cfg.Monitor.Alerts.PSIWindow.D(), 45 * time.Minute},
+		{"monitor.alerts.mem_high_passes", cfg.Monitor.Alerts.MemHighPasses, 3},
 		{"dashboard.listen", cfg.Dashboard.Listen, "127.0.0.1:8190"},
 		{"dashboard.refresh", cfg.Dashboard.Refresh.D(), 15 * time.Second},
 		{"dashboard.status_cache_ttl", cfg.Dashboard.StatusCacheTTL.D(), 2 * time.Minute},
@@ -491,6 +516,14 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_MONITOR_LISTEN":                      ":9199",
 		"CRAWLER_MONITOR_ZONE_STATS_INTERVAL":         "45s",
 		"CRAWLER_MONITOR_INGEST_METRICS_URL":          "http://env-ingest:9101/metrics",
+		"CRAWLER_MONITOR_ALERTS_TELEGRAM":             "false",
+		"CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT":      "/env/telegram-notify.sh",
+		"CRAWLER_MONITOR_ALERTS_DISK_FREE_MIN_BYTES":  "17GiB",
+		"CRAWLER_MONITOR_ALERTS_DISK_FREE_CRIT_BYTES": "9GiB",
+		"CRAWLER_MONITOR_ALERTS_QUEUE_FREEZE_WINDOW":  "12m",
+		"CRAWLER_MONITOR_ALERTS_PSI_CPU_PERCENT":      "88",
+		"CRAWLER_MONITOR_ALERTS_PSI_CPU_WINDOW":       "25m",
+		"CRAWLER_MONITOR_ALERTS_MEM_HIGH_PASSES":      "4",
 		"CRAWLER_WEB_LISTEN":                          "127.0.0.1:8088",
 		"CRAWLER_WEB_RATE_LIMIT":                      "10",
 		"CRAWLER_WEB_TIMEOUT":                         "90s",
@@ -574,6 +607,14 @@ func TestEnvOverrides(t *testing.T) {
 		{"monitor.listen", cfg.Monitor.Listen, ":9199"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 45 * time.Second},
 		{"monitor.ingest_metrics_url", cfg.Monitor.IngestMetricsURL, "http://env-ingest:9101/metrics"},
+		{"monitor.alerts.telegram", cfg.Monitor.Alerts.Telegram, false},
+		{"monitor.alerts.telegram_script", cfg.Monitor.Alerts.TelegramScript, "/env/telegram-notify.sh"},
+		{"monitor.alerts.disk_free_min_bytes", cfg.Monitor.Alerts.DiskFreeMinBytes.B(), int64(17 << 30)},
+		{"monitor.alerts.disk_free_crit_bytes", cfg.Monitor.Alerts.DiskFreeCritBytes.B(), int64(9 << 30)},
+		{"monitor.alerts.queue_freeze_window", cfg.Monitor.Alerts.QueueFreeze.D(), 12 * time.Minute},
+		{"monitor.alerts.psi_cpu_percent", cfg.Monitor.Alerts.PSICPUPercent, 88.0},
+		{"monitor.alerts.psi_cpu_window", cfg.Monitor.Alerts.PSIWindow.D(), 25 * time.Minute},
+		{"monitor.alerts.mem_high_passes", cfg.Monitor.Alerts.MemHighPasses, 4},
 		{"web.listen", cfg.Web.Listen, "127.0.0.1:8088"},
 		{"web.rate_limit", cfg.Web.RateLimit, 10},
 		{"web.timeout", cfg.Web.Timeout.D(), 90 * time.Second},
@@ -913,6 +954,26 @@ func TestValidate(t *testing.T) {
 		{"zone_stats_interval больше часа", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(2 * time.Hour) }, "monitor.zone_stats_interval"},
 		{"ingest_metrics_url не адрес", func(c *Config) { c.Monitor.IngestMetricsURL = "ingest:9101" }, "monitor.ingest_metrics_url"},
 		{"ingest_metrics_url не http(s)", func(c *Config) { c.Monitor.IngestMetricsURL = "ftp://ingest:9101/metrics" }, "monitor.ingest_metrics_url"},
+		{"alerts crit ≥ min", func(c *Config) {
+			c.Monitor.Alerts.DiskFreeCritBytes = c.Monitor.Alerts.DiskFreeMinBytes
+		}, "monitor.alerts.disk_free_crit_bytes"},
+		{"alerts queue_freeze коротко", func(c *Config) {
+			c.Monitor.Alerts.QueueFreeze = Duration(30 * time.Second)
+		}, "monitor.alerts.queue_freeze_window"},
+		{"alerts queue_freeze длинно", func(c *Config) {
+			c.Monitor.Alerts.QueueFreeze = Duration(7 * time.Hour)
+		}, "monitor.alerts.queue_freeze_window"},
+		{"alerts psi_cpu_percent 0", func(c *Config) { c.Monitor.Alerts.PSICPUPercent = 0 }, "monitor.alerts.psi_cpu_percent"},
+		{"alerts psi_cpu_percent >100", func(c *Config) { c.Monitor.Alerts.PSICPUPercent = 100.1 }, "monitor.alerts.psi_cpu_percent"},
+		{"alerts psi_cpu_window коротко", func(c *Config) {
+			c.Monitor.Alerts.PSIWindow = Duration(10 * time.Second)
+		}, "monitor.alerts.psi_cpu_window"},
+		{"alerts psi_cpu_window длинно", func(c *Config) {
+			c.Monitor.Alerts.PSIWindow = Duration(12 * time.Hour)
+		}, "monitor.alerts.psi_cpu_window"},
+		{"alerts mem_high_passes 0", func(c *Config) { c.Monitor.Alerts.MemHighPasses = 0 }, "monitor.alerts.mem_high_passes"},
+		{"alerts mem_high_passes велик", func(c *Config) { c.Monitor.Alerts.MemHighPasses = 11 }, "monitor.alerts.mem_high_passes"},
+		{"alerts telegram без скрипта", func(c *Config) { c.Monitor.Alerts.TelegramScript = "" }, "monitor.alerts.telegram_script"},
 		{"web.listen кривой", func(c *Config) { c.Web.Listen = "no-port" }, "web.listen"},
 		{"web.listen относительный путь", func(c *Config) { c.Web.Listen = "web.sock" }, "web.listen"},
 		{"web.listen путь сокета длинный", func(c *Config) { c.Web.Listen = "/" + strings.Repeat("s", 101) }, "web.listen"},

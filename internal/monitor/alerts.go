@@ -40,7 +40,32 @@
 //     (RedisMemorySource, реализация RedisInfo — redismem.go): при
 //     noeviction (ТЗ 3.2) заполнение maxmemory — прокси-метрика
 //     предстоящих OOM-отказов записи, прямого счётчика отказов INFO
-//     не отдаёт.
+//     не отдаёт;
+//   - абсолютный минимум места на диске (T-162) — свободные байты
+//     каталога контента против monitor.alerts.disk_free_min_bytes
+//     (Warn) и disk_free_crit_bytes (эскалация отдельным алертом):
+//     процентный порог на большом томе поздний — 10 % от 79 ГБ = 8 ГБ
+//     ≈ 5 ч до заполнения при темпе ≈36 GiB/сут (замер §12);
+//   - троттлинг MemoryHigh (T-162) — рост счётчика memory.events high
+//     юнита между проходами (источник — тот же UnitEventsSource, что у
+//     unit_oom): предвестник фаталов http-worker (T-157) до OOM-kill;
+//   - замороженная очередь (T-162) — last-delivered-id группы рабочего
+//     стрима не движется ≥ monitor.alerts.queue_freeze_window при
+//     глубине > 0 (StreamGroupsSource, реализация RedisStreamGroups —
+//     streamgroups.go): сигнатура отравленной задачи T-159 — запись
+//     валит потребителя, XREADGROUP не читает, очередь стоит;
+//   - PSI CPU (T-162) — some avg300 /proc/pressure/cpu выше
+//     monitor.alerts.psi_cpu_percent устойчиво monitor.alerts.
+//     psi_cpu_window (PSISource, реализация OSPSI — psi.go): голод
+//     планировщика, на котором тонут все этапы разом (замер §12:
+//     some 91–95 % в пиках; T-158 дал monitor'у вес CPU 50 против
+//     1000 — собственные проходы голод не приближают).
+//
+// Доставка (T-162): переходы алертов (срабатывание/снятие) уходят
+// оператору в Telegram — хук AlertsOptions.OnPass (TelegramNotifier,
+// notify.go) зовёт exec deploy/telegram-notify.sh --message с дебаунсом
+// «только изменение состояния»; без секретов/скрипта доставка выключена,
+// сигнал остаётся Warn в журнале (ТЗ 10.4 — тот же канал, что у CI/CD).
 //
 // Сигнал фронтовой (на переходах, стиль DiskWatchLoop в internal/content):
 // Warn при срабатывании, Info при снятии, Debug когда алерт неприменим
@@ -59,6 +84,11 @@
 // зеркалирует порог паузы Put без зазора: алерт виден
 // ровно тогда, когда запись контента остановлена; остановка прогресса и
 // износ меняются только событиями, не порогом — гистерезис не нужен.
+// Новые алерты T-162 гасятся устойчивостью вместо гистерезиса:
+// memory_high — серия проходов с ростом счётчика, queue_frozen — окно
+// неподвижности last-delivered-id при ненулевой глубине, psi_cpu — окно
+// удержания avg300 выше порога (сам avg300 сглаживает 5 минут);
+// абсолютные минимумы диска — без зазора, как процентный.
 //
 // Экспорт состояния — снапшот прохода AlertsResult в хук
 // AlertsOptions.OnPass (решение: лог + поле). Собственный gauge-реестр
@@ -110,6 +140,11 @@ const (
 	AlertUnitOOM       = "unit_oom"             // OOM/рестарты юнитов crawler (T-145)
 	AlertQueueDead     = "queue_dead"           // неразобранный q:dead (T-154)
 	AlertRedisMemory   = "redis_memory"         // память Redis у maxmemory (T-154)
+	AlertDiskMin       = "disk_free_min"        // абсолютный минимум места, Warn (T-162)
+	AlertDiskCrit      = "disk_free_crit"       // эскалация абсолютного минимума (T-162)
+	AlertMemHigh       = "memory_high"          // троттлинг MemoryHigh (T-162)
+	AlertQueueFreeze   = "queue_frozen"         // замороженная очередь (T-162)
+	AlertPSICPU        = "psi_cpu"              // PSI CPU some (T-162)
 )
 
 // alertDescs — человекочитаемые описания алертов для записей лога.
@@ -123,6 +158,11 @@ var alertDescs = map[string]string{
 	AlertUnitOOM:       "OOM-убийства и крэш-рестарты юнитов crawler",
 	AlertQueueDead:     "мертвые задачи в q:dead не разбираются",
 	AlertRedisMemory:   "память Redis у порога maxmemory",
+	AlertDiskMin:       "свободное место ниже абсолютного минимума",
+	AlertDiskCrit:      "свободное место ниже порога эскалации",
+	AlertMemHigh:       "троттлинг MemoryHigh юнита (устойчивый рост reclaim-событий)",
+	AlertQueueFreeze:   "замороженная очередь: группа не читает стрим",
+	AlertPSICPU:        "голод CPU (PSI some) устойчиво выше порога",
 }
 
 // Пороги оценки. Числа ТЗ не задаёт; переиспользуются существующие пороги
@@ -213,6 +253,45 @@ const (
 	// резко (XTRIM/Drain), доля в коридоре 75–80 % не дребезжала бы Warn
 	// у порога.
 	AlertRedisMemRecoverRatio = 0.75
+
+	// DefaultDiskFreeMinBytes — абсолютный минимум свободного места
+	// каталога контента (T-162): 15 GiB Warn. Процентный порог
+	// content.disk_free_percent на томе 79 ГБ поздний: 10 % = 8 ГБ ≈ 5 ч
+	// до заполнения при темпе записи ≈36 GiB/сут (замер §12) — минимум
+	// в байтах даёт оператору запас на разбор (освобождение
+	// компактификацией — часы, docs/disks.md).
+	DefaultDiskFreeMinBytes = int64(15 << 30)
+
+	// DefaultDiskFreeCritBytes — эскалация абсолютного минимума (T-162):
+	// 10 GiB — отдельный алерт disk_free_crit; на темпе 36 GiB/сут это
+	// ≈6,5 ч до заполнения — время ещё есть, но действовать надо сейчас.
+	DefaultDiskFreeCritBytes = int64(10 << 30)
+
+	// DefaultQueueFreezeWindow — окно неподвижности last-delivered-id
+	// группы стрима при глубине > 0 (T-162): 15 минут. Яд T-159 валит
+	// потребителя на первой же записи — активный разбор (живая группа)
+	// двигает last-delivered-id каждые секунды, 15 мин без движения при
+	// ненулевой глубине — потребителя нет; короче — ложные срабатывания
+	// на паузах между пачками, длиннее — теряется половина шага
+	// «перезапусти потребителя и посмотри логи».
+	DefaultQueueFreezeWindow = 15 * time.Minute
+
+	// DefaultPSICPUPercent — порог PSI CPU some avg300 (T-162): 90 %.
+	// Замер §12: рабочий голод планировщика — some 91–95 %; ниже 90 %
+	// — утилизация без очереди (норма для CPU-bound конвейера).
+	DefaultPSICPUPercent = 90.0
+
+	// DefaultPSIWindow — окно устойчивости PSI (T-162): 30 мин. avg300
+	// само сглаживает 5 минут, окно требует устойчивый голод — разовые
+	// шпильки (деплой, разбор ретро-пачек) алертом не считаются.
+	DefaultPSIWindow = 30 * time.Minute
+
+	// DefaultMemHighMinPasses — проходов алертов подряд с ростом счётчика
+	// memory.events high (T-162): 2 × 5 мин = 10 мин устойчивого
+	// троттлинга. Единичный всплеск reclaim — штатная работа MemoryHigh
+	// (850M у http-worker, T-145): мягкий потолок и должен придавливать
+	// пики; устойчивый рост — предвестник фаталов T-157.
+	DefaultMemHighMinPasses = 2
 )
 
 // dnsShareSQL — числитель и знаменатель доли temp_error одним проходом по
@@ -536,6 +615,13 @@ type AlertsDeps struct {
 	// cmd/monitor (RedisInfo того же клиента, что у гейта глубин,
 	// обёрнутая в метрики NewRedisMemoryMetrics).
 	RedisMemory RedisMemorySource
+	// StreamGroups — группы рабочих стримов для алерта замороженной
+	// очереди (T-162); nil — алерт «не измеряется». Источником командует
+	// cmd/monitor (RedisStreamGroups того же клиента, что у гейта).
+	StreamGroups StreamGroupsSource
+	// PSI — давление CPU /proc/pressure/cpu (T-162); nil — OSPSI
+	// (чистое чтение файла, как OSStatfs/OSWear).
+	PSI PSISource
 }
 
 // AlertsOptions — параметры оценки; нулевые значения заменяются
@@ -565,6 +651,29 @@ type AlertsOptions struct {
 	// (content.disk_free_percent); ≤ 0 — контроль выключен, алерт «не
 	// измеряется».
 	DiskFreePercent float64
+	// DiskFreeMinBytes — абсолютный минимум свободного места каталога
+	// контента, Warn (monitor.alerts.disk_free_min_bytes, T-162);
+	// ≤ 0 — DefaultDiskFreeMinBytes (выключения нет: абсолютный минимум
+	// — страховка процентного порога, отключать её незачем).
+	DiskFreeMinBytes int64
+	// DiskFreeCritBytes — эскалация абсолютного минимума, отдельный
+	// алерт (monitor.alerts.disk_free_crit_bytes, T-162); ≤ 0 —
+	// DefaultDiskFreeCritBytes.
+	DiskFreeCritBytes int64
+	// QueueFreeze — окно неподвижности last-delivered-id группы при
+	// глубине > 0 (monitor.alerts.queue_freeze_window, T-162);
+	// ≤ 0 — DefaultQueueFreezeWindow.
+	QueueFreeze time.Duration
+	// PSICPUPercent — порог PSI CPU some avg300, %
+	// (monitor.alerts.psi_cpu_percent, T-162); ≤ 0 — DefaultPSICPUPercent.
+	PSICPUPercent float64
+	// PSIWindow — окно устойчивости PSI выше порога
+	// (monitor.alerts.psi_cpu_window, T-162); ≤ 0 — DefaultPSIWindow.
+	PSIWindow time.Duration
+	// MemHighMinPasses — проходов подряд с ростом счётчика
+	// memory.events high до срабатывания memory_high
+	// (monitor.alerts.mem_high_passes, T-162); ≤ 0 — DefaultMemHighMinPasses.
+	MemHighMinPasses int
 	// Now — источник времени (возраст zones.updated_at); nil — time.Now.
 	Now func() time.Time
 	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
@@ -575,7 +684,7 @@ type AlertsOptions struct {
 	OnPass func(AlertsResult)
 }
 
-// withDefaults заменяет неположительные периоды дефолтами (Now/Log
+// withDefaults заменяет неположительные периоды и пороги дефолтами (Now/Log
 // проверяются отдельно: функций/указателей — nil).
 func (o AlertsOptions) withDefaults() AlertsOptions {
 	if o.Interval <= 0 {
@@ -583,6 +692,24 @@ func (o AlertsOptions) withDefaults() AlertsOptions {
 	}
 	if o.ZoneStatsInterval <= 0 {
 		o.ZoneStatsInterval = DefaultZoneStatsInterval
+	}
+	if o.DiskFreeMinBytes <= 0 {
+		o.DiskFreeMinBytes = DefaultDiskFreeMinBytes
+	}
+	if o.DiskFreeCritBytes <= 0 {
+		o.DiskFreeCritBytes = DefaultDiskFreeCritBytes
+	}
+	if o.QueueFreeze <= 0 {
+		o.QueueFreeze = DefaultQueueFreezeWindow
+	}
+	if o.PSICPUPercent <= 0 {
+		o.PSICPUPercent = DefaultPSICPUPercent
+	}
+	if o.PSIWindow <= 0 {
+		o.PSIWindow = DefaultPSIWindow
+	}
+	if o.MemHighMinPasses <= 0 {
+		o.MemHighMinPasses = DefaultMemHighMinPasses
 	}
 	return o
 }
@@ -673,6 +800,26 @@ func (w *badHashesWindow) push(cur int64) int64 {
 	return sum
 }
 
+// memHighTrack — память трекинга троттлинга MemoryHigh одного юнита
+// (T-162): прошлый счётчик memory.events high и серия проходов подряд с
+// его ростом. Ростом считается только увеличение: рестарт юнита
+// пересоздаёт cgroup и обнуляет счётчик — убыль начинает новую серию без
+// ложного всплеска (стиль badHashesWindow).
+type memHighTrack struct {
+	prev   uint64
+	streak int
+	seen   bool
+}
+
+// freezeTrack — память трекинга замороженной группы стрима (T-162):
+// последний замеченный last-delivered-id и момент, с которого он стоит.
+// since живёт только при глубине > 0 — простой пустой очереди не
+// накапливает «время без доставок» (см. evalQueueFreeze).
+type freezeTrack struct {
+	lastID string
+	since  time.Time
+}
+
 // Alerts — оценка алертов с памятью состояний между проходами
 // (гистерезис, фронтовые записи лога только на переходах).
 type Alerts struct {
@@ -687,10 +834,20 @@ type Alerts struct {
 	// смерть; обнуляется пустым q:dead, ошибка источника не сбрасывает
 	// (неизвестное наблюдение — не нулевое).
 	deadStreak int
+	// memHigh — трекинг memory.events high по юнитам (T-162), ключ — имя
+	// юнита. Размер ограничен числом юнитов crawler (шаблон
+	// unitEventsPattern); исчезнувшие юниты чистит evalMemHigh.
+	memHigh map[string]memHighTrack
+	// frozen — трекинг last-delivered-id по группам стримов (T-162),
+	// ключ «стрим/группа». Записи живы только при глубине > 0.
+	frozen map[string]freezeTrack
+	// psiHot — момент первого наблюдения PSI выше порога (T-162);
+	// нулевое время — давления нет, окно устойчивости не тикает.
+	psiHot time.Time
 }
 
 // NewAlerts строит оценщик: нормализует опции (дефолты периодов), источники
-// Space/Wear (nil → реализации ОС) и готовит память состояний.
+// Space/Wear/PSI (nil → реализации ОС) и готовит память состояний.
 func NewAlerts(deps AlertsDeps, opts AlertsOptions) *Alerts {
 	o := opts.withDefaults()
 	log := o.Log
@@ -707,7 +864,15 @@ func NewAlerts(deps AlertsDeps, opts AlertsOptions) *Alerts {
 	if deps.Wear == nil {
 		deps.Wear = OSWear{}
 	}
-	return &Alerts{deps: deps, opts: o, log: log, now: now, state: make(map[string]string)}
+	if deps.PSI == nil {
+		deps.PSI = OSPSI{}
+	}
+	return &Alerts{
+		deps: deps, opts: o, log: log, now: now,
+		state:   make(map[string]string),
+		memHigh: make(map[string]memHighTrack),
+		frozen:  make(map[string]freezeTrack),
+	}
 }
 
 // evaluators — проверки прохода в фиксированном порядке (порядок
@@ -718,11 +883,16 @@ func (a *Alerts) evaluators() []alertEval {
 		{AlertQueueOverflow, a.evalQueues},
 		{AlertProgressStall, a.evalStall},
 		{AlertDiskFree, a.evalDisk},
+		{AlertDiskMin, a.evalDiskMin},
+		{AlertDiskCrit, a.evalDiskCrit},
 		{AlertNVMeWear, a.evalWear},
 		{AlertBadHashes, a.evalBadHashes},
 		{AlertUnitOOM, a.evalUnitOOM},
+		{AlertMemHigh, a.evalMemHigh},
 		{AlertQueueDead, a.evalDead},
+		{AlertQueueFreeze, a.evalQueueFreeze},
 		{AlertRedisMemory, a.evalRedisMemory},
+		{AlertPSICPU, a.evalPSICPU},
 	}
 }
 
@@ -977,6 +1147,61 @@ func (a *Alerts) evalDisk(_ context.Context, _ string) verdict {
 	return verdict{status: AlertStatusOK, detail: detail}
 }
 
+// evalDiskMin / evalDiskCrit — абсолютный минимум свободного места
+// каталога контента (T-162): Warn при Avail < disk_free_min_bytes (15 GiB)
+// и эскалация отдельным алертом при < disk_free_crit_bytes (10 GiB).
+// Процентный порог (content.disk_free_percent) на большом томе поздний:
+// 10 % от 79 ГБ — это 8 ГБ ≈ 5 ч до заполнения при темпе ≈36 GiB/сут
+// (замер §12); абсолютный минимум даёт запас на разбор независимо от
+// размера тома. Гистерезиса нет, как у процентного: место при инциденте
+// убывает монотонно (~1,5 ГБ/ч) — дребезг у порога нечему двигать;
+// срабатывание строгое (<), восстановление при возврате к порогу.
+// Эскалация — второй алерт, а не «уровень» первого: каждое состояние
+// видно своей парой сообщений срабатывание/снятие (дебаунс notify.go)
+// и своей строкой в журнале, иерархия Warn→усиление читается по имени.
+func (a *Alerts) evalDiskMin(_ context.Context, _ string) verdict {
+	return a.evalDiskBytes(a.opts.DiskFreeMinBytes)
+}
+
+func (a *Alerts) evalDiskCrit(_ context.Context, _ string) verdict {
+	return a.evalDiskBytes(a.opts.DiskFreeCritBytes)
+}
+
+// evalDiskBytes — общая проверка абсолютного порога: тот же снимок
+// statfs, что у процентного алерта (две копии сисколла на проход дешевле
+// связывания алертов общим кэшем). Порог ≥ ёмкости тома неприменим:
+// свободное место никогда не достигнет минимума (dev-том 10 ГБ против
+// 15 GiB) — вечное срабатывание было бы ложным, малые тома остаются
+// под крылом процентного порога.
+func (a *Alerts) evalDiskBytes(threshold int64) verdict {
+	if a.opts.ContentDir == "" {
+		return verdict{status: AlertStatusNotMeasured, detail: "каталог контента не задан"}
+	}
+	sp, err := a.deps.Space.Space(a.opts.ContentDir)
+	if err != nil {
+		return verdict{err: fmt.Errorf("monitor: свободное место %s: %w", a.opts.ContentDir, err)}
+	}
+	if sp.Total == 0 {
+		return verdict{
+			status: AlertStatusNotMeasured,
+			detail: "файловая система не сообщает ёмкость (total=0)",
+		}
+	}
+	if threshold >= int64(sp.Total) {
+		return verdict{
+			status: AlertStatusNotMeasured,
+			detail: fmt.Sprintf("минимум %s ≥ ёмкости тома %s — порог неприменим, малый том под крылом процентного",
+				alertBytes(uint64(threshold)), alertBytes(sp.Total)),
+		}
+	}
+	detail := fmt.Sprintf("свободно %s из %s, порог %s",
+		alertBytes(sp.Avail), alertBytes(sp.Total), alertBytes(uint64(threshold)))
+	if int64(sp.Avail) < threshold {
+		return verdict{status: AlertStatusFiring, detail: detail}
+	}
+	return verdict{status: AlertStatusOK, detail: detail}
+}
+
 // evalWear — износ NVMe по health-логу: алерт при percentage_used ≥
 // AlertNVMeWearPercent любого устройства. Недоступность SMART — ожидаемое
 // состояние контейнера: verdict без err (Debug, не Warn) — деградация
@@ -1105,6 +1330,66 @@ func (a *Alerts) evalUnitOOM(ctx context.Context, _ string) verdict {
 	}
 }
 
+// evalMemHigh — троттлинг MemoryHigh (T-162): счётчик memory.events high
+// юнита растёт от прохода к проходу (каждое попадание за мягкий потолок —
+// принудительный reclaim/задержка). Порог — не значение, а скорость:
+// счётчик накапливается за жизнь cgroup (http-worker с MemoryHigh=850M
+// набирает >100 тыс. за сутки), осмыслен только рост. Устойчивость — рост
+// MemHighMinPasses проходов подряд (2 × 5 мин = 10 мин): одиночный
+// всплеск — штатная работа мягкого потолка, устойчивый троттлинг —
+// предвестник фаталов http-worker (T-157: рестарты по памяти до
+// OOM-kill) и запрос потолка выше (docs/deploy.md §2). Снятие — первый
+// проход без роста: гистерезис не нужен, событие снятия и есть «рост
+// прекратился», дребезг у нуля серии невозможен (серия целая).
+// Источник и деградации — те же, что у unit_oom: errNoSystemd (dev)
+// тихо «не измеряется», прочие ошибки — Warn.
+func (a *Alerts) evalMemHigh(ctx context.Context, _ string) verdict {
+	if a.deps.UnitEvents == nil {
+		return verdict{status: AlertStatusNotMeasured, detail: "источник не задан"}
+	}
+	units, err := a.deps.UnitEvents.UnitEvents(ctx)
+	if err != nil {
+		if errors.Is(err, errNoSystemd) {
+			return verdict{status: AlertStatusNotMeasured, detail: err.Error()}
+		}
+		return verdict{err: err}
+	}
+	seen := make(map[string]bool, len(units))
+	var hot []string
+	for _, u := range units {
+		seen[u.Unit] = true
+		tr := a.memHigh[u.Unit]
+		grew := int64(0)
+		if tr.seen && u.High > tr.prev {
+			tr.streak++
+			grew = int64(u.High - tr.prev)
+		} else {
+			tr.streak = 0
+		}
+		tr.seen, tr.prev = true, u.High
+		a.memHigh[u.Unit] = tr
+		if tr.streak >= a.opts.MemHighMinPasses {
+			hot = append(hot, fmt.Sprintf("%s: +%d за проход, серия %d", u.Unit, grew, tr.streak))
+		}
+	}
+	for name := range a.memHigh { // юнит исчез (переименован/выгружен) — не копить
+		if !seen[name] {
+			delete(a.memHigh, name)
+		}
+	}
+	if len(hot) > 0 {
+		return verdict{
+			status: AlertStatusFiring,
+			detail: strings.Join(hot, ", ") + " — устойчивый троттлинг MemoryHigh (reclaim), предвестник фаталов (T-157)",
+		}
+	}
+	return verdict{
+		status: AlertStatusOK,
+		detail: fmt.Sprintf("роста троттлинга MemoryHigh нет (%d юнитов, порог — рост %d проходов подряд)",
+			len(units), a.opts.MemHighMinPasses),
+	}
+}
+
 // evalDead — устойчиво ненулевая глубина q:dead (T-154): карантин без
 // потребителей (ручной разбор, ТЗ 4.2), Len читает XLEN, покидают записи
 // карантин только разбором оператора (XTRIM/runbooks §2) — глубина и есть
@@ -1135,6 +1420,75 @@ func (a *Alerts) evalDead(ctx context.Context, prev string) verdict {
 		return verdict{status: AlertStatusFiring, detail: detail + " — разбор: runbooks §2"}
 	}
 	return verdict{status: AlertStatusOK, detail: detail}
+}
+
+// evalQueueFreeze — замороженная очередь (T-162): last-delivered-id
+// группы рабочего стрима не движется ≥ queue_freeze_window при глубине
+// > 0. Живой потребитель двигает last-delivered-id каждым XREADGROUP
+// (пачки в секунды — ТЗ 3.3); стоящий ID при непустом backlog — записи
+// не доставляются вовсе: потребитель мёртв или валится на первой записи
+// (яд T-159), lease-восстановление не поднимает. Согласована с
+// BackpressureGate.Len о глубине (кламп T-168 в источнике):
+// застрявший фантомный лаг инцидента 22–23.10 сам по себе не «глубина»,
+// но замороженные доставки там были — алерт ловит и этот класс простоев.
+//
+// Трекинг: запись группы живёт только при Depth > 0 (пустая очередь не
+// должна копить «время без доставок» — иначе час простоя + первая
+// нечитаемая запись дали бы мгновенное ложное срабатывание); движение ID
+// обновляет момент; первое наблюдение (нет записи) — база с текущего
+// момента: после рестарта monitor алерт сработает не раньше окна, а не
+// ретроспективно. Ошибка источника память не трогает — восстановление
+// чтения доедет по фактическому ID. Снятие — первый проход, где группы
+// ни одна не заморожена (глубина ушла в ноль или доставки пошли):
+// гистерезис не нужен, окно 15 мин — естественный фильтр дребезга.
+func (a *Alerts) evalQueueFreeze(ctx context.Context, _ string) verdict {
+	if a.deps.StreamGroups == nil {
+		return verdict{status: AlertStatusNotMeasured, detail: "источник не задан"}
+	}
+	groups, err := a.deps.StreamGroups.StreamGroups(ctx)
+	if err != nil {
+		return verdict{err: err}
+	}
+	now := a.now()
+	seen := make(map[string]bool, len(groups))
+	var frozen []string
+	var moving int
+	for _, g := range groups {
+		key := g.Stream + "/" + g.Group
+		seen[key] = true
+		if g.Depth <= 0 {
+			delete(a.frozen, key) // работа кончилась — копить нечего
+			moving++
+			continue
+		}
+		tr, ok := a.frozen[key]
+		if !ok || g.LastDeliveredID != tr.lastID {
+			a.frozen[key] = freezeTrack{lastID: g.LastDeliveredID, since: now}
+			moving++
+			continue
+		}
+		idle := now.Sub(tr.since)
+		if idle >= a.opts.QueueFreeze {
+			frozen = append(frozen, fmt.Sprintf("%s/%s: доставки нет %s при глубине %d (последний ID %s)",
+				g.Stream, g.Group, idle.Round(time.Second), g.Depth, g.LastDeliveredID))
+		}
+	}
+	for key := range a.frozen { // группа исчезла (стрим удалён) — не копить
+		if !seen[key] {
+			delete(a.frozen, key)
+		}
+	}
+	if len(frozen) > 0 {
+		return verdict{
+			status: AlertStatusFiring,
+			detail: strings.Join(frozen, "; ") + " — потребитель не читает: лог юнита-воркера и q:dead (яд T-159), перезапуск воркера",
+		}
+	}
+	return verdict{
+		status: AlertStatusOK,
+		detail: fmt.Sprintf("групп с движением/без backlog — %d из %d (окно %s)",
+			moving, len(groups), a.opts.QueueFreeze),
+	}
 }
 
 // evalRedisMemory — доля памяти Redis used_memory/maxmemory из INFO
@@ -1168,6 +1522,53 @@ func (a *Alerts) evalRedisMemory(ctx context.Context, prev string) verdict {
 		return verdict{
 			status: AlertStatusFiring,
 			detail: detail + " — при noeviction у порога отказы записи (OOM command not allowed)",
+		}
+	}
+	return verdict{status: AlertStatusOK, detail: detail}
+}
+
+// evalPSICPU — голод CPU по PSI some avg300 (T-162): выше порога
+// psi_cpu_percent (90 %) устойчиво psi_cpu_window (30 мин) — срабатывание.
+// Метрика — some (задержка хотя бы одной задачи), не full и не load
+// average: утилизация 100 % без очереди — норма CPU-bound конвейера, а
+// вот some ≈90+ % — этапы ждут CPU втроём-вчетвером (замер §12), тонут
+// все разом (T-158 поэтому понизил вес monitor'у). Устойчивость —
+// первый проход выше порога стартует окно psiHot, срабатывание при
+// его закрытии; avg300 сам сглаживает 5 минут, окно отбрасывает разовые
+// шпильки (деплой, ретро-пачки). Гистерезис не нужен: чтобы «снять»,
+// avg300 должен опуститься к порогу после 30+ минут выше — это
+// фактическое восстановление, а не дребезг; сброс окна при кратком
+// провале — консервативнее удержания (шпилька не продлевает алерт).
+// Ядро без PSI — errNoPSI, тихая деградация (как SMART в контейнере).
+func (a *Alerts) evalPSICPU(ctx context.Context, _ string) verdict {
+	st, err := a.deps.PSI.PSI(ctx)
+	if err != nil {
+		if errors.Is(err, errNoPSI) {
+			return verdict{status: AlertStatusNotMeasured, detail: err.Error()}
+		}
+		return verdict{err: fmt.Errorf("monitor: PSI CPU: %w", err)}
+	}
+	now := a.now()
+	over := st.Avg300 > a.opts.PSICPUPercent
+	switch {
+	case !over:
+		a.psiHot = time.Time{}
+	case a.psiHot.IsZero():
+		a.psiHot = now
+	}
+	detail := fmt.Sprintf("some avg10=%.2f%% avg60=%.2f%% avg300=%.2f%%, порог %.0f%% (окно %s)",
+		st.Avg10, st.Avg60, st.Avg300, a.opts.PSICPUPercent, a.opts.PSIWindow)
+	if over {
+		held := now.Sub(a.psiHot)
+		if held >= a.opts.PSIWindow {
+			return verdict{
+				status: AlertStatusFiring,
+				detail: detail + fmt.Sprintf(" — выше порога уже %s", held.Round(time.Second)),
+			}
+		}
+		return verdict{
+			status: AlertStatusOK,
+			detail: detail + fmt.Sprintf(" — выше порога %s из окна, накопление", held.Round(time.Second)),
 		}
 	}
 	return verdict{status: AlertStatusOK, detail: detail}

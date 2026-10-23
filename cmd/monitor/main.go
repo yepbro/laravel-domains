@@ -7,8 +7,12 @@
 // износ NVMe (SMART), всплеск мусорных content_hash очистки ingest
 // (T-099, зонд /metrics), OOM и рестарты юнитов crawler (T-145,
 // systemctl + cgroup v2), неразобранный q:dead и память Redis (T-154,
-// XLEN + INFO memory). Каркас — internal/service: миграции, пул БД
-// (OnDBPool), пробы /livez + /healthz, /metrics, graceful shutdown (ТЗ 3.4).
+// XLEN + INFO memory); недостающие пороги T-162 — абсолютный минимум
+// диска (Warn/эскалация), троттлинг MemoryHigh, замороженная очередь
+// (last-delivered-id), PSI CPU; переходы алертов доставляются в
+// Telegram (TelegramNotifier → telegram-notify.sh --message).
+// Каркас — internal/service: миграции, пул БД (OnDBPool), пробы /livez +
+// /healthz, /metrics, graceful shutdown (ТЗ 3.4).
 package main
 
 import (
@@ -146,13 +150,32 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}
 	// События юнитов (T-145): systemctl show + cgroup v2 memory.events
 	// (unitevents.go), обёрнуты в метрики — одно чтение на проход питает
-	// и алерт, и gauge crawler_unit_oom_events/crawler_unit_restarts.
-	// В dev-контейнере без systemd источник деградирует тихо (как SMART).
+	// алерты unit_oom и memory_high (T-162: рост счётчика high) и gauge
+	// crawler_unit_oom_events/crawler_unit_memory_high_events/
+	// crawler_unit_restarts. В dev-контейнере без systemd источник
+	// деградирует тихо (как SMART).
 	deps.UnitEvents = monitor.NewUnitEventsMetrics(reg, monitor.OSUnitEvents{})
 	// Память Redis (T-154): INFO memory того же клиента, что у гейта,
 	// обёрнута в метрики — одно чтение питает алерт redis_memory и gauge
 	// crawler_redis_memory_ratio/_bytes.
 	deps.RedisMemory = monitor.NewRedisMemoryMetrics(reg, monitor.RedisInfo{RDB: rdb})
+	// Группы стримов для алерта замороженной очереди (T-162): XINFO
+	// GROUPS + XLEN того же клиента (last-delivered-id и глубина группы
+	// с клампом T-168); стрим без групп — пустой вклад.
+	deps.StreamGroups = monitor.RedisStreamGroups{RDB: rdb}
+	// PSI CPU (T-162): /proc/pressure/cpu хоста, обёрнуто в метрики —
+	// gauge crawler_psi_cpu_some_percent и алерт psi_cpu одним чтением;
+	// ядро без PSI деградирует тихо.
+	deps.PSI = monitor.NewPSIMetrics(reg, monitor.OSPSI{})
+	// Доставка алертов в Telegram (T-162): переходы состояний уходят
+	// exec-ом telegram-notify.sh --message; секреты берёт из окружения
+	// юнита (EnvironmentFile /etc/crawler/crawler.env), нет секретов или
+	// скрипта — доставка выключена, алерты остаются Warn в журнале.
+	telegram := monitor.NewTelegramNotifier(monitor.TelegramOptions{
+		Enabled: cfg.Monitor.Alerts.Telegram,
+		Script:  cfg.Monitor.Alerts.TelegramScript,
+		Log:     logger,
+	})
 	err := monitor.AlertsLoop(ctx, deps, monitor.AlertsOptions{
 		Interval:          cfg.Monitor.ZoneStatsInterval.D(),
 		ZoneStatsInterval: cfg.Monitor.ZoneStatsInterval.D(),
@@ -160,7 +183,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		QueueMaxLen:       int64(cfg.Redis.MaxLen),
 		ContentDir:        cfg.Content.Dir,
 		DiskFreePercent:   cfg.Content.DiskFreePercent,
+		DiskFreeMinBytes:  cfg.Monitor.Alerts.DiskFreeMinBytes.B(),
+		DiskFreeCritBytes: cfg.Monitor.Alerts.DiskFreeCritBytes.B(),
+		QueueFreeze:       cfg.Monitor.Alerts.QueueFreeze.D(),
+		PSICPUPercent:     cfg.Monitor.Alerts.PSICPUPercent,
+		PSIWindow:         cfg.Monitor.Alerts.PSIWindow.D(),
+		MemHighMinPasses:  cfg.Monitor.Alerts.MemHighPasses,
 		Log:               logger,
+		OnPass:            telegram.OnPass,
 	})
 	// Свой цикл закончился — отменяем фоновые до ожидания результатов
 	// (отмена идемпотентна и при уже остановленных циклах). Их сбой не

@@ -187,11 +187,14 @@ Prometheus оператора, конфиг джобов по образцу
 
 **Алерты** минимального набора ТЗ 5.9 оценивает сервис monitor циклом
 `monitor.zone_stats_interval` (по умолчанию 5 мин — T-161): доля ошибок DNS, переполнение
-очередей, остановка прогресса, нехватка места на диске, износ NVMe,
+очередей, остановка прогресса, нехватка места на диске (процент и
+абсолютный минимум с эскалацией, T-162), износ NVMe,
 всплеск мусорных `content_hash` при очистке удалённых доменов (T-099),
 OOM-убийства и крэш-рестарты юнитов crawler (T-145), неразобранный
-`q:dead` и память Redis (T-154). Сигнал фронтовой
-(на переходах): **Warn в лог/journald monitor** —
+`q:dead` и память Redis (T-154), троттлинг MemoryHigh, замороженная
+очередь и PSI CPU (T-162). Сигнал фронтовой
+(на переходах): **Warn в лог/journald monitor** и, при включённой
+доставке, **сообщение Telegram** (ниже) —
 
 ```bash
 journalctl -t crawler-monitor -p warning      # бой
@@ -199,9 +202,42 @@ make logs SERVICE=monitor | grep -i warn      # dev
 ```
 
 пороги и обоснование — [`services.md`](services.md) (разделы об
-алертах), место на диске — `content.disk_free_percent`
-([`content.md`](content.md) «Лимиты и переполнение диска»), SMART —
+алертах), место на диске — `content.disk_free_percent` и
+`monitor.alerts.disk_free_*_bytes` ([`content.md`](content.md) «Лимиты
+и переполнение диска», [`configuration.md`](configuration.md)), SMART —
 [`disks.md`](disks.md) §6.
+
+**Доставка алертов в Telegram** (T-162): сработавшие и снятые алерты
+приходят сообщениями в ту же выделенную группу, что и извещения CI/CD
+(ТЗ §10.4) — «🚨 Алерт …» при срабатывании и «✅ Восстановлено …» при
+снятии; дубли дебаунсятся (один эпизод = два сообщения), журнал monitor
+не флудит. Включена по умолчанию (`monitor.alerts.telegram`), фактически
+работает при двух условиях:
+
+1. Секреты в `/etc/crawler/crawler.env` (EnvironmentFile юнита monitor,
+   образец — `deploy/systemd/crawler.env.example`):
+
+   ```
+   TELEGRAM_BOT_TOKEN=<токен @BotFather>
+   TELEGRAM_CHAT_ID=<id выделенной группы>
+   ```
+
+   нет любого — доставка выключена (запись в журнале monitor при старте),
+   алерты остаются Warn в journald — как шаг CI молчит без секретов;
+2. Скрипт отправки на хосте: `deploy/telegram-notify.sh` →
+   `/opt/crawler/bin/telegram-notify.sh` (деплой-архив везёт только
+   бинарники, скрипт копируется один раз при настройке):
+
+   ```bash
+   scp deploy/telegram-notify.sh root@<сервер>:/opt/crawler/bin/
+   ssh root@<сервер> 'chown root:crawler /opt/crawler/bin/telegram-notify.sh && chmod 0755 /opt/crawler/bin/telegram-notify.sh'
+   ```
+
+   скрипту нужны `bash`, `curl` и `jq` на сервере; путь переопределяется
+   `monitor.alerts.telegram_script`. Проверка без отправки:
+   `TELEGRAM_BOT_TOKEN=x TELEGRAM_CHAT_ID=y /opt/crawler/bin/telegram-notify.sh --message "тест" --dry-run`.
+
+После правок `crawler.env` — `systemctl restart crawler-monitor`.
 
 **Мусорные `content_hash`** (`ingest_bad_hashes`): счётчик
 `crawler_ingest_bad_hashes_total` сервиса ingest (удалённые очисткой
@@ -259,9 +295,30 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # тома
   устойчивой глубины, T-154; темп смертей —
   `crawler_queue_dead_buried_total`) — разбрать:
   [`runbooks.md`](runbooks.md) §2.
-- **Том контента близок к порогу** (`content.disk_free_percent`, 5%) —
-  запись контента встала на паузу (алерт disk_free): освободить место
-  (компактификация идёт сама), расширить том ([`disks.md`](disks.md)).
+- **Замороженная очередь** (алерт `queue_frozen`, T-162:
+  last-delivered-id группы не движется ≥ 15 мин при глубине > 0 —
+  потребитель не читает стрим, сигнатура яда T-159): лог воркера
+  стрима из детали (`journalctl -t crawler-http-worker` и т.п.),
+  перезапуск воркера; записи, валящие потребителя, уходят в `q:dead`
+  после рестартов — разбирать по runbooks §2.
+- **Троттлинг MemoryHigh** (алерт `memory_high`, T-162: счётчик
+  memory.events high юнита растёт ≥ 2 проходов подряд — устойчивый
+  reclaim под мягким потолком, предвестник фаталов T-157): проверить
+  `systemctl status crawler-http-worker` (Memory: у потолка
+  MemoryHigh=850M) и лог юнита; повторяющийся троттлинг — повод
+  пересмотреть бюджет ([`deploy.md`](deploy.md) §2), метрика —
+  `crawler_unit_memory_high_events`.
+- **Голод CPU** (алерт `psi_cpu`, T-162: PSI some avg300 > 90 %
+  устойчиво 30 мин — тонут все этапы разом): `cat /proc/pressure/cpu`,
+  топ потребителей (`ps aux --sort=-%cpu`), сверить с конкурентами на
+  сервере (агрегаты postgres, компактификация); метрика —
+  `crawler_psi_cpu_some_percent`.
+- **Том контента близок к порогу** (`content.disk_free_percent`, 5%;
+  абсолютные минимумы T-162 — `monitor.alerts.disk_free_min_bytes`
+  15 GiB Warn / `disk_free_crit_bytes` 10 GiB эскалация) —
+  запись контента встала на паузу (алерты disk_free/disk_free_min):
+  освободить место (компактификация идёт сама), расширить том
+  ([`disks.md`](disks.md)).
 - **OOM/рестарты юнитов** — алерт `unit_oom` (T-145): один Warn на
   эпизод — `oom`/`oom_kill` (memory.events cgroup юнита) или `NRestarts`
   > 0. Сброс эпизода: `systemctl reset-failed` (или новый старт) обнуляет

@@ -1,5 +1,8 @@
 // Источник контроля OOM и рестартов юнитов crawler (T-145, ТЗ 5.9):
-// счётчики memory.events cgroup v2 (oom/oom_kill) и NRestarts systemd.
+// счётчики memory.events cgroup v2 (oom/oom_kill/high) и NRestarts systemd.
+// oom/oom_kill/NRestarts питают алерт unit_oom, рост счётчика high между
+// проходами — алерт троттлинга MemoryHigh (memory_high, T-162: предвестник
+// фаталов http-worker T-157 — оба читают один снимок источника).
 // Потолки памяти юнитов заданы MemoryMax (T-085/T-143; soft MemoryHigh
 // http-worker — тем же T-145), но потолок — страховка, а не гарантия:
 // OOM-kill или крэш-рестарт — незапланированный простой конвейера
@@ -78,6 +81,13 @@ type UnitEvents struct {
 	OOM uint64
 	// OOMKill — memory.events oom_kill: убитые OOM-killer'ом процессы.
 	OOMKill uint64
+	// High — memory.events high: число попаданий за мягкий потолок
+	// MemoryHigh — каждый — принудительный reclaim/задержки (троттлинг).
+	// Абсолютное значение накапливается за жизнь cgroup (http-worker с
+	// MemoryHigh=850M набирает >100 тыс. за сутки — deploy/systemd/
+	// crawler-http-worker.service): событие алерта memory_high — рост
+	// счётчика между проходами, не само значение (T-162).
+	High uint64
 	// NRestarts — systemctl NRestarts: крэш-рестарты с последнего
 	// старта/сброса состояния юнита (reset-failed/stop).
 	NRestarts uint64
@@ -197,13 +207,13 @@ func (s OSUnitEvents) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 	}
 	var errs []string
 	for i := range units {
-		oom, kill, err := readMemoryEvents(filepath.Join(
+		ev, err := readMemoryEvents(filepath.Join(
 			cgroupFS, "system.slice", units[i].Unit, "memory.events"))
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", units[i].Unit, err))
 			continue
 		}
-		units[i].OOM, units[i].OOMKill = oom, kill
+		units[i].OOM, units[i].OOMKill, units[i].High = ev.OOM, ev.OOMKill, ev.High
 	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("monitor: юниты: memory.events: %s", strings.Join(errs, "; "))
@@ -249,27 +259,36 @@ func parseSystemctlShow(out string) []UnitEvents {
 	return units
 }
 
-// readMemoryEvents читает oom/oom_kill одного юнита из memory.events.
+// memoryEvents — счётчики файла memory.events, нужные алертам:
+// oom/oom_kill (unit_oom, T-145) и high (memory_high, T-162).
+type memoryEvents struct {
+	OOM     uint64
+	OOMKill uint64
+	High    uint64
+}
+
+// readMemoryEvents читает oom/oom_kill/high одного юнита из memory.events.
 // Файла нет (юнит без cgroup — остановлен) — нули: счётчики живут в
 // cgroup и пересозданием обнуляются, рестарт такой юнит уже учёл в
 // NRestarts.
-func readMemoryEvents(path string) (oom, oomKill uint64, err error) {
+func readMemoryEvents(path string) (memoryEvents, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return 0, 0, nil
+		return memoryEvents{}, nil
 	}
 	if err != nil {
-		return 0, 0, err
+		return memoryEvents{}, err
 	}
 	return parseMemoryEvents(string(b))
 }
 
 // parseMemoryEvents разбирает файл memory.events: строки «ключ значение»
-// (low/high/max/oom/oom_kill/oom_group); для алерта нужны oom/oom_kill,
-// остальные ключи пропускаются, отсутствующие — нули. Значение не число
-// — ошибка (формат фиксирован ядром, кривой файл — не молчать). Выделен
-// чистой функцией для табличного теста.
-func parseMemoryEvents(data string) (oom, oomKill uint64, err error) {
+// (low/high/max/oom/oom_kill/oom_group); для алертов нужны oom/oom_kill/
+// high, остальные ключи пропускаются, отсутствующие — нули. Значение не
+// число — ошибка (формат фиксирован ядром, кривой файл — не молчать).
+// Выделен чистой функцией для табличного теста.
+func parseMemoryEvents(data string) (memoryEvents, error) {
+	var ev memoryEvents
 	for _, line := range strings.Split(data, "\n") {
 		key, val, ok := strings.Cut(line, " ")
 		if !ok {
@@ -278,17 +297,19 @@ func parseMemoryEvents(data string) (oom, oomKill uint64, err error) {
 		var dst *uint64
 		switch key {
 		case "oom":
-			dst = &oom
+			dst = &ev.OOM
 		case "oom_kill":
-			dst = &oomKill
+			dst = &ev.OOMKill
+		case "high":
+			dst = &ev.High
 		default:
 			continue
 		}
 		n, perr := strconv.ParseUint(val, 10, 64)
 		if perr != nil {
-			return 0, 0, fmt.Errorf("monitor: memory.events: %q: значение %q не число", key, val)
+			return memoryEvents{}, fmt.Errorf("monitor: memory.events: %q: значение %q не число", key, val)
 		}
 		*dst = n
 	}
-	return oom, oomKill, nil
+	return ev, nil
 }

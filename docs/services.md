@@ -193,7 +193,9 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_content_retention_deferred_total` | counter | `stream` | http-worker (T-166/T-167) | записи, исключённые из чистки: сообщения ждут потребителей стрима (`q:render` — рендер SPA, `q:analyze` — анализ; запись может ждать оба — считается в каждом); растёт при застое очередей — сигнал дренировать потребителей (runbooks §5.2) |
 | `crawler_content_retention_pass_seconds` / `crawler_content_retention_passes_total{result}` | histogram / counter | `result` | http-worker (T-166) | длительность и число проходов retention (`ok` — дренаж выполнен, `skipped` — интерлок, `skipped_pending` — ошибка чтения защиты; алерты по `rate(passes{result="skipped"})` и `rate(passes{result="skipped_pending"})`) |
 | `crawler_content_retention_bad_hashes_total` / `crawler_content_retention_missing_refs_total` | counter | — | http-worker (T-166) | аномалии учёта: срезанные ссылки с хэшем неверной длины / без строки `contents`; в норме не растут вовсе — рост = ошибка писателя (T-056) или расхождение refcount (T-044) |
-| `crawler_unit_oom_events` | gauge | `unit`, `kind` | monitor (T-145) | проход алертов (60 с): счётчики memory.events cgroup v2 юнитов `crawler-*.service` (kind=oom/oom_kill); обнуляются пересозданием cgroup на рестарте юнита — gauge, не counter; рост = события OOM (алерт unit_oom) |
+| `crawler_unit_oom_events` | gauge | `unit`, `kind` | monitor (T-145) | проход алертов (5 мин): счётчики memory.events cgroup v2 юнитов `crawler-*.service` (kind=oom/oom_kill); обнуляются пересозданием cgroup на рестарте юнита — gauge, не counter; рост = события OOM (алерт unit_oom) |
+| `crawler_unit_memory_high_events` | gauge | `unit` | monitor (T-162) | тот же проход, что unit_oom: счётчик memory.events high (попадания за мягкий потолок MemoryHigh — троттлинг reclaim'ом); накапливается за жизнь cgroup, осмыслен рост — алерт `memory_high` при росте ≥2 проходов подряд (T-162: предвестник фаталов http-worker, T-157) |
+| `crawler_psi_cpu_some_percent` | gauge | `kind` | monitor (T-162) | проход алертов: some-доля времени задержки CPU из `/proc/pressure/cpu` хоста (kind=avg10/avg60/avg300); устойчивый avg300 >90 % — голод планировщика (алерт `psi_cpu`, T-162), ядро без PSI — ряда нет |
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`) |
 | `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод записи в q:dead (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
@@ -685,14 +687,73 @@ counter-семантикой корректен для `rate()`/`increase()`; п
   прямого счётчика отказов `INFO` не отдаёт — доля с запасом 20 %
   (межобрезочные остатки TrimLoop, фрагментация, буферы) — прокси
   предстоящих отказов. `maxmemory` 0 (потолка нет) — «не измеряется»:
-  отношение не определено.
+  отношение не определено;
+- **абсолютный минимум места на диске** (T-162) — свободные байты
+  каталога контента против `monitor.alerts.disk_free_min_bytes`
+  (15 GiB, Warn) и `disk_free_crit_bytes` (10 GiB, эскалация отдельным
+  алертом `disk_free_crit`): процентный порог
+  `content.disk_free_percent` на большом томе поздний — 10 % от 79 ГБ
+  это 8 ГБ ≈ 5 ч до заполнения при темпе ≈36 GiB/сут (замер §12),
+  абсолютный минимум даёт запас на разбор независимо от размера тома.
+  Срабатывание строгое (<), гистерезиса нет — место при инциденте
+  убывает монотонно, дребезг у порога нечему двигать (как у
+  процентного);
+- **троттлинг MemoryHigh** (T-162, алерт `memory_high`) — рост счётчика
+  `memory.events high` юнита между проходами (источник — тот же
+  `systemctl show` + cgroup v2, что у unit_oom; обёртка зеркалит
+  `crawler_unit_memory_high_events`): каждое попадание за мягкий
+  потолок — принудительный reclaim/задержка, счётчик накапливается за
+  жизнь cgroup (http-worker с MemoryHigh=850M набирает >100 тыс. за
+  сутки) — порог не значение, а рост. Устойчивость — рост
+  `monitor.alerts.mem_high_passes` проходов подряд (2 × 5 мин = 10 мин):
+  одиночный всплеск — штатная работа мягкого потолка, устойчивый
+  троттлинг — предвестник фаталов http-worker (T-157: рестарты по памяти
+  до OOM-kill) и запрос пересмотра бюджета (deploy.md §2). Снятие —
+  первый проход без роста;
+- **замороженная очередь** (T-162, алерт `queue_frozen`) —
+  last-delivered-id группы рабочего стрима не движется
+  ≥ `monitor.alerts.queue_freeze_window` (15 мин) при глубине > 0:
+  живой потребитель двигает ID каждым XREADGROUP (пачки в секунды,
+  ТЗ 3.3), стоящий ID при непустом backlog — записи не доставляются
+  вовсе: потребитель мёртв или валится на первой записи (яд T-159).
+  Источник — XINFO GROUPS + XLEN того же клиента (`RedisStreamGroups`),
+  глубина группы — формула гейта (`min(lag, XLEN)` + pending, кламп
+  T-168): застрявший фантомный лаг инцидента 22–23.10 (гейт закрыт
+  15,5 ч при 40,3 млн pending) этот алерт поймал бы сам фактом
+  остановки доставок. Ошибка источника память трекинга не трогает;
+  первая запись группы живёт только при глубине > 0 — простой пустой
+  очереди «время без доставок» не копит;
+- **PSI CPU** (T-162, алерт `psi_cpu`) — some avg300 из
+  `/proc/pressure/cpu` хоста (источник `OSPSI`, обёртка зеркалит
+  `crawler_psi_cpu_some_percent`) выше
+  `monitor.alerts.psi_cpu_percent` (90 %) устойчиво
+  `monitor.alerts.psi_cpu_window` (30 мин): some — задержка хотя бы
+  одной задачи (утилизация 100 % без очереди — норма CPU-bound
+  конвейера), замер §12 — рабочий голод планировщика 91–95 %, на
+  котором тонут все этапы разом (T-158 понизил вес CPU monitor'а —
+  собственные проходы голод не приближают). Окно отбрасывает разовые
+  шпильки (деплой, ретро-пачки); ядро без PSI — тихое
+  «не измеряется» (как SMART в контейнере).
+
+Доставка алертов оператору (T-162, ТЗ 5.9/10.4): переходы состояний
+(срабатывание/снятие) уходят в Telegram тем же ботом и группой, что
+извещения CI/CD — monitor зовёт exec `telegram-notify.sh --message`
+(хук `AlertsOptions.OnPass`, `TelegramNotifier` в notify.go), секреты
+`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` читает из EnvironmentFile
+юнита. Дебаунс — эпизод алерта доставляется ровно двумя сообщениями:
+🚨 при первом срабатывании, «✅ Восстановлено» при снятии; повторные
+проходы, возврат в firing после перерыва источника и первый проход
+(рестарт monitor) — тишина. Нет секретов или скрипта — доставка
+выключена, алерты остаются Warn в journald (настройка — operations.md
+§4.3, скрипт — ci-cd.md §«Извещения Telegram»).
 
 Сигнал фронтовой (на переходах, стиль `DiskWatchLoop` в internal/content):
 Warn при срабатывании, Info при снятии; «не измеряется» — Debug. Ошибки
-источников (БД, Redis, statfs, зонд ingest) — Warn каждого прохода, цикл
-живёт; исключение — источники, чья недоступность ожидаема в части
-окружений (SMART без `/dev/nvme*` в контейнере, события юнитов systemd
-в dev-контейнере, T-145) — тихая деградация «не измеряется». Состояние
+источников (БД, Redis, statfs, зонд ingest, группы стримов) — Warn
+каждого прохода, цикл живёт; исключение — источники, чья недоступность
+ожидаема в части окружений (SMART без `/dev/nvme*` в контейнере,
+события юнитов systemd в dev-контейнере, T-145; PSI на ядре без
+CONFIG_PSI, T-162) — тихая деградация «не измеряется». Состояние
 прохода — снапшот `AlertsResult` (ок/сработал/не измеряется +
 детали) в хук `AlertsOptions.OnPass`: лог + поле, собственный
 gauge-реестр в monitor не заводится — метрики алертов в Prometheus заведёт

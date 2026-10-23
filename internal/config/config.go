@@ -366,6 +366,47 @@ type Monitor struct {
 	// зондом раз в период алертов. Тот же адрес, что скрейпит Prometheus;
 	// пустая строка — алерт «не измеряется».
 	IngestMetricsURL string `yaml:"ingest_metrics_url"`
+	// Alerts — недостающие пороги ТЗ 5.9 и доставка алертов оператору
+	// (T-162, замер §12: все P0 того периода найдены вручную).
+	Alerts Alerts `yaml:"alerts"`
+}
+
+// Alerts — секция monitor.alerts (T-162): пороги новых алертов и
+// включение Telegram-доставки. Пороги первых алертов (DNS, очереди,
+// прогресс, процент диска) остаются при своих полях — очередь у
+// scheduler.queue_high_watermark, процент у content.disk_free_percent
+// (меньше поверхности, каждый порог живёт там, где его механизм).
+type Alerts struct {
+	// Telegram — включение доставки переходов алертов (срабатывание/
+	// снятие) в Telegram через deploy/telegram-notify.sh (ТЗ 10.4 — тот
+	// же бот и группа, что у извещений CI/CD). Секреты не здесь, а в
+	// EnvironmentFile юнита (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID,
+	// deploy/systemd/crawler.env.example): нет любого — доставка
+	// выключена, алерты остаются Warn в журнале monitor.
+	Telegram bool `yaml:"telegram"`
+	// TelegramScript — путь telegram-notify.sh на хосте: деплой ставит
+	// только бинарники, скрипт копирует оператор при настройке доставки
+	// (docs/operations.md §4.3).
+	TelegramScript string `yaml:"telegram_script"`
+	// DiskFreeMinBytes — абсолютный минимум свободного места каталога
+	// контента, Warn (алерт disk_free_min): процентный порог
+	// content.disk_free_percent на большом томе поздний — 10 % от 79 ГБ
+	// ≈ 5 ч до заполнения при темпе ≈36 GiB/сут (замер §12).
+	DiskFreeMinBytes ByteSize `yaml:"disk_free_min_bytes"`
+	// DiskFreeCritBytes — эскалация минимума, отдельный алерт
+	// disk_free_crit: действовать надо сразу, запас — часы.
+	DiskFreeCritBytes ByteSize `yaml:"disk_free_crit_bytes"`
+	// QueueFreeze — окно неподвижности last-delivered-id группы рабочего
+	// стрима при глубине > 0 (алерт queue_frozen, сигнатура яда T-159).
+	QueueFreeze Duration `yaml:"queue_freeze_window"`
+	// PSICPUPercent — порог PSI CPU some avg300, % (алерт psi_cpu).
+	PSICPUPercent float64 `yaml:"psi_cpu_percent"`
+	// PSIWindow — окно устойчивости PSI выше порога.
+	PSIWindow Duration `yaml:"psi_cpu_window"`
+	// MemHighPasses — проходов алертов подряд с ростом счётчика
+	// memory.events high юнита (алерт memory_high, троттлинг MemoryHigh
+	// http-worker — предвестник фаталов T-157).
+	MemHighPasses int `yaml:"mem_high_passes"`
 }
 
 // Web — публичный сервис лендинга (этап 13, T-121; продуктовое
@@ -653,6 +694,27 @@ func Default() *Config {
 			// 127.0.0.1:9101); docker-сети переопределяют именем сервиса
 			// (config.dev.yaml: http://ingest:9101/metrics).
 			IngestMetricsURL: "http://127.0.0.1:9101/metrics",
+			Alerts: Alerts{
+				// Включена по умолчанию: решение о доставке принимают
+				// секреты/скрипт на хосте (нет любого — тихо выключена),
+				// а не молчание конфига — оператор журналы не читает
+				// (мотивация T-162).
+				Telegram: true,
+				// Деплой-архив несёт только бинарники; скрипт ложится в
+				// /opt/crawler/bin руками при настройке доставки
+				// (docs/operations.md §4.3) — путь боевого стандарта.
+				TelegramScript: "/opt/crawler/bin/telegram-notify.sh",
+				// 15 GiB Warn / 10 GiB эскалация: 10 % от тома 79 ГБ —
+				// поздний процентный порог (≈5 ч до заполнения при
+				// ≈36 GiB/сут, замер §12); обоснования — internal/monitor
+				// DefaultDiskFreeMinBytes/CritBytes.
+				DiskFreeMinBytes:  ByteSize(15 << 30),
+				DiskFreeCritBytes: ByteSize(10 << 30),
+				QueueFreeze:       Duration(15 * time.Minute),
+				PSICPUPercent:     90,
+				PSIWindow:         Duration(30 * time.Minute),
+				MemHighPasses:     2,
+			},
 		},
 		Web: Web{
 			// Loopback: публикация наружу — reverse-proxy с TLS (T-124),
@@ -1114,6 +1176,40 @@ func (c *Config) Validate() error {
 			problems = append(problems, fmt.Sprintf(
 				"monitor.ingest_metrics_url: ожидается абсолютный http(s)-адрес, задано %q", c.Monitor.IngestMetricsURL))
 		}
+	}
+
+	// monitor.alerts (T-162): пороги новых алертов и доставка Telegram.
+	// Эскалация обязана быть ниже Warn-минимума, иначе она недостижима;
+	// окна устойчивости — не меньше периода цикла (коридор
+	// zone_stats_interval 30с..1ч: нижняя граница 1м отсекает и
+	// секундные настройки, и срабатывание за один проход), не больше
+	// смены вахты оператора (6ч) — дольше молчащий алерт никто не ждёт.
+	if c.Monitor.Alerts.DiskFreeCritBytes >= c.Monitor.Alerts.DiskFreeMinBytes {
+		problems = append(problems, fmt.Sprintf(
+			"monitor.alerts.disk_free_crit_bytes: эскалация (%s) ожидается меньше минимума disk_free_min_bytes (%s)",
+			c.Monitor.Alerts.DiskFreeCritBytes, c.Monitor.Alerts.DiskFreeMinBytes))
+	}
+	if c.Monitor.Alerts.QueueFreeze < Duration(time.Minute) || c.Monitor.Alerts.QueueFreeze > Duration(6*time.Hour) {
+		problems = append(problems, fmt.Sprintf("monitor.alerts.queue_freeze_window: ожидается %s..%s, задано %s",
+			Duration(time.Minute), Duration(6*time.Hour), c.Monitor.Alerts.QueueFreeze))
+	}
+	if c.Monitor.Alerts.PSICPUPercent <= 0 || c.Monitor.Alerts.PSICPUPercent > 100 {
+		problems = append(problems, fmt.Sprintf(
+			"monitor.alerts.psi_cpu_percent: ожидается 0–100 (доля %%), задано %v",
+			c.Monitor.Alerts.PSICPUPercent))
+	}
+	if c.Monitor.Alerts.PSIWindow < Duration(time.Minute) || c.Monitor.Alerts.PSIWindow > Duration(6*time.Hour) {
+		problems = append(problems, fmt.Sprintf("monitor.alerts.psi_cpu_window: ожидается %s..%s, задано %s",
+			Duration(time.Minute), Duration(6*time.Hour), c.Monitor.Alerts.PSIWindow))
+	}
+	if c.Monitor.Alerts.MemHighPasses < 1 || c.Monitor.Alerts.MemHighPasses > 10 {
+		problems = append(problems, fmt.Sprintf(
+			"monitor.alerts.mem_high_passes: ожидается 1..10 проходов, задано %d",
+			c.Monitor.Alerts.MemHighPasses))
+	}
+	if c.Monitor.Alerts.Telegram && c.Monitor.Alerts.TelegramScript == "" {
+		problems = append(problems,
+			"monitor.alerts.telegram_script: путь telegram-notify.sh обязателен при включённой доставке (monitor.alerts.telegram)")
 	}
 
 	// web (этап 13, T-121)

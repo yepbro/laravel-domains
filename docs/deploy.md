@@ -522,6 +522,13 @@ cp -r rules /etc/crawler/rules                    # правила Laravel дл�
 - `http.user_agent` — реальные контакты оператора (если не задан в env);
 - `dns.ipv6: true` — если у сервера есть IPv6 (в docker-сети его нет).
 
+Необязательная настройка после первого запуска — доставка алертов
+monitor в Telegram (T-162): секреты `TELEGRAM_BOT_TOKEN`/
+`TELEGRAM_CHAT_ID` в `/etc/crawler/crawler.env` и скрипт
+`deploy/telegram-notify.sh` в `/opt/crawler/bin/` (деплой-архив везёт
+только бинарники) — пошагово в [`operations.md`](operations.md) §4.3;
+без них алерты остаются Warn в journald monitor.
+
 ### 4.6. Юниты и запуск
 
 ```bash

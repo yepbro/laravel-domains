@@ -8,6 +8,10 @@
 # (METRICS_ADDR=127.0.0.1:9101…9108 в их юнитах). /dev/nvme* (SMART,
 # ТЗ 10.3) отдаётся группе nvme-smart (udev-правило и drop-in —
 # deploy/smartd/, T-089): без него алерт износа честно «не измеряется».
+# Доставка алертов в Telegram (T-162) читает TELEGRAM_BOT_TOKEN/
+# TELEGRAM_CHAT_ID из EnvironmentFile ниже (monitor звёт exec
+# /opt/crawler/bin/telegram-notify.sh — docs/operations.md §4.3); без
+# секретов доставка выключена, алерты остаются Warn в journald.
 
 [Unit]
 Description=Domain Crawler — monitor (прогресс, метрики, алерты)
