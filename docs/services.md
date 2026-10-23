@@ -184,6 +184,8 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
+| `crawler_unit_oom_events` | gauge | `unit`, `kind` | monitor (T-145) | проход алертов (60 с): счётчики memory.events cgroup v2 юнитов `crawler-*.service` (kind=oom/oom_kill); обнуляются пересозданием cgroup на рестарте юнита — gauge, не counter; рост = события OOM (алерт unit_oom) |
+| `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: lag + pending; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026) |
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) раз в 30 с (`scheduler.BacklogLoop`) |
 | `crawler_dashboard_snapshots_total` | counter | `result` | dashboard (`ok`/`error`, ТЗД §10) | каждый проход цикла сборки снимков: `error` — проход с деградированными секциями (снимок публикуется, причины — Warn в логе и карта `errors` /api/status) |
@@ -582,12 +584,34 @@ counter-семантикой корректен для `rate()`/`increase()`; п
   мусорной ссылке не менялся, ING-P2-4); снятие — старением окна без
   продолжения потока. Ошибка зонда (ingest остановлен, метрики нет) —
   «не измеряется» с Warn: смерть самого ingest видна по
-  `crawler_service_up`, не этим алертом.
+  `crawler_service_up`, не этим алертом;
+- **OOM и рестарты юнитов crawler** (T-145) — счётчики memory.events
+  cgroup v2 (`oom`/`oom_kill`) и `NRestarts` всех юнитов
+  `crawler-*.service`: событие — незапланированный простой конвейера
+  (ТЗ 3.4) и симптом невыполнения бюджета памяти юнита
+  ([`deploy.md`](deploy.md) §2; мягкий потолок MemoryHigh http-worker —
+  тот же T-145). Срабатывание при любом событии, один Warn на эпизод;
+  эпизод — от события до сброса состояния юнита: `systemctl
+  reset-failed`/новый старт обнуляет NRestarts (у живого юнита oom/
+  oom_kill держатся до пересоздания cgroup перезапуском), деплой
+  сбрасывает всё сам (stop → reset-failed → start, deploy-install.sh).
+  Источник — `systemctl show 'crawler-*.service' -p Id -p NRestarts`
+  (свойства менеджера читаются непривилегированно) + прямое чтение
+  `/sys/fs/cgroup/system.slice/<юнит>/memory.events` (файлы cgroup
+  world-readable, systemd не экспортирует их как D-Bus-свойства);
+  обёртка источника зеркалит снимок в метрики
+  `crawler_unit_oom_events`/`crawler_unit_restarts`. Ошибки источника
+  делятся на классы: окружение без systemd (dev-контейнер) — тихое
+  «не измеряется» (как SMART), боевой отказ (systemd/D-Bus/cgroupfs
+  сломан) — Warn каждого прохода.
 
 Сигнал фронтовой (на переходах, стиль `DiskWatchLoop` в internal/content):
 Warn при срабатывании, Info при снятии; «не измеряется» — Debug. Ошибки
 источников (БД, Redis, statfs, зонд ingest) — Warn каждого прохода, цикл
-живёт. Состояние прохода — снапшот `AlertsResult` (ок/сработал/не измеряется +
+живёт; исключение — источники, чья недоступность ожидаема в части
+окружений (SMART без `/dev/nvme*` в контейнере, события юнитов systemd
+в dev-контейнере, T-145) — тихая деградация «не измеряется». Состояние
+прохода — снапшот `AlertsResult` (ок/сработал/не измеряется +
 детали) в хук `AlertsOptions.OnPass`: лог + поле, собственный
 gauge-реестр в monitor не заводится — метрики алертов в Prometheus заведёт
 слой T-077 поверх `internal/metrics`, чтобы не дублировать реестры и метки.

@@ -5,7 +5,8 @@
 // (internal/monitor.AlertsLoop, T-080): доля ошибок DNS, переполнение
 // очередей, остановка прогресса, свободное место каталога контента,
 // износ NVMe (SMART), всплеск мусорных content_hash очистки ingest
-// (T-099, зонд /metrics). Каркас — internal/service: миграции, пул БД
+// (T-099, зонд /metrics), OOM и рестарты юнитов crawler (T-145,
+// systemctl + cgroup v2). Каркас — internal/service: миграции, пул БД
 // (OnDBPool), пробы /livez + /healthz, /metrics, graceful shutdown (ТЗ 3.4).
 package main
 
@@ -126,6 +127,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	if cfg.Monitor.IngestMetricsURL != "" {
 		deps.BadHashes = monitor.IngestBadHashes{URL: cfg.Monitor.IngestMetricsURL}
 	}
+	// События юнитов (T-145): systemctl show + cgroup v2 memory.events
+	// (unitevents.go), обёрнуты в метрики — одно чтение на проход питает
+	// и алерт, и gauge crawler_unit_oom_events/crawler_unit_restarts.
+	// В dev-контейнере без systemd источник деградирует тихо (как SMART).
+	deps.UnitEvents = monitor.NewUnitEventsMetrics(reg, monitor.OSUnitEvents{})
 	err := monitor.AlertsLoop(ctx, deps, monitor.AlertsOptions{
 		Interval:          cfg.Monitor.ZoneStatsInterval.D(),
 		ZoneStatsInterval: cfg.Monitor.ZoneStatsInterval.D(),

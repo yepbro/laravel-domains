@@ -185,8 +185,9 @@ Prometheus оператора, конфиг джобов по образцу
 **Алерты** минимального набора ТЗ 5.9 оценивает сервис monitor циклом
 `monitor.zone_stats_interval` (60 с): доля ошибок DNS, переполнение
 очередей, остановка прогресса, нехватка места на диске, износ NVMe,
-всплеск мусорных `content_hash` при очистке удалённых доменов (T-099).
-Сигнал фронтовой (на переходах): **Warn в лог/journald monitor** —
+всплеск мусорных `content_hash` при очистке удалённых доменов (T-099),
+OOM-убийства и крэш-рестарты юнитов crawler (T-145). Сигнал фронтовой
+(на переходах): **Warn в лог/journald monitor** —
 
 ```bash
 journalctl -t crawler-monitor -p warning      # бой
@@ -246,6 +247,7 @@ journalctl -t crawler-nrd-fetch --since -1d            # доставка NRD-ф
                                                        # (deploy.md §4.9:
                                                        # OK ежедневно, СБОЙ — вручную)
 systemctl --failed                 # юниты в failed (StartLimit)
+systemctl show 'crawler-*.service' -p Id -p NRestarts   # OOM/рестарты юнитов (алерт unit_oom, T-145)
 df -h /var/lib/crawler/content /var/lib/postgresql    # тома
 ```
 
@@ -254,10 +256,24 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # тома
 - **Том контента близок к порогу** (`content.disk_free_percent`, 5%) —
   запись контента встала на паузу (алерт disk_free): освободить место
   (компактификация идёт сама), расширить том ([`disks.md`](disks.md)).
+- **OOM/рестарты юнитов** — алерт `unit_oom` (T-145): один Warn на
+  эпизод — `oom`/`oom_kill` (memory.events cgroup юнита) или `NRestarts`
+  > 0. Сброс эпизода: `systemctl reset-failed` (или новый старт) обнуляет
+  NRestarts, но счётчики `oom`/`oom_kill` живого юнита держатся до
+  пересоздания cgroup — перезапуска юнита; деплой сбрасывает всё сам
+  (stop → `reset-failed` → start в deploy-install.sh), вручную —
+  `systemctl restart crawler-<сервис>`. Метрики —
+  `crawler_unit_oom_events{unit,kind}` / `crawler_unit_restarts{unit}`
+  ([`services.md`](services.md)); источник — `systemctl show` + чтение
+  cgroup v2, в dev-контейнере алерт «не измеряется». Событие — симптом
+  невыполнения бюджета памяти (http-worker — MemoryHigh/MemoryMax,
+  [`deploy.md`](deploy.md) §2): разбирать по `journalctl -k --grep oom`
+  и логу юнита.
 - **Память**: `systemctl status crawler-<сервис>` показывает `Memory:`;
-  потолок — `systemctl show -p MemoryMax`. Суточный прогон без OOM —
+  потолок — `systemctl show -p MemoryMax` (http-worker — и мягкий
+  `-p MemoryHigh`, T-145). Суточный прогон без OOM —
   критерий ТЗ 11.4 п. 7 (T-093): `journalctl -k --grep oom` пуст,
-  рестарты — по `NRestarts`.
+  рестарты — по `NRestarts` (бьёт алерт unit_oom, T-145).
 - **SMART/TBW** — `smartctl -H -A /dev/nvme0`, предупреждения smartd:
   [`disks.md`](disks.md) §6.
 - **Отказоустойчивость**: падение PostgreSQL/Redis не останавливает

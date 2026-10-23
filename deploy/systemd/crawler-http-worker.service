@@ -36,6 +36,19 @@ ExecStart=/opt/crawler/bin/http-worker
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
+# Мягкий потолок (T-145): выше 850M ядро возвращает память reclaim'ом
+# (троттлинг аллокаций), не дожидаясь hard-лимита 900M и OOM-kill.
+# Замер сэмплером — MemoryCurrent cgroup (anon + page cache): 192 слота
+# стабильно 860–893 MiB (пропитка волны 21, oom=0). Слотовая
+# составляющая ≈3.34 MiB/слот (замер §11 тем же сэмплером) ≈ 640 MiB —
+# остальное page cache пишущего контент-стора: reclaim под MemoryHigh
+# режет в первую очередь его (безболезненно), а не живые слоты. Рост
+# выше 850 сверх кеша — перегрев (стартовый пик: раскатка на 256 давила
+# healthz, §11 — 834–873 MiB): троттлинг даёт GC/scavenger время
+# вернуть память за 50 MiB до OOM-kill слотов. Рост memory.events `high`
+# в рабочей зоне — норма; `oom`/`oom_kill` и NRestarts — нет: их видит
+# алерт unit_oom (internal/monitor/unitevents.go, T-145).
+MemoryHigh=850M
 MemoryMax=900M
 # http.concurrency 2000 — по соединению на проверку; nofile как в
 # dev-окружении, sysctl (ip_local_port_range, conntrack) — T-088.

@@ -54,6 +54,10 @@ const (
 	// effective/configured у потолков лимитёра DNS): значения локальны
 	// для метрики, в отличие от сквозных значений LabelStage/LabelQueue.
 	LabelKind = "kind"
+	// LabelUnit — имя systemd-юнита (crawler-http-worker.service) для
+	// метрик событий юнитов монитора (T-145): системный контур, а не
+	// этап конвейера — отдельное имя от LabelService.
+	LabelUnit = "unit"
 )
 
 // buildMode — значение метки mode метрики crawler_build_info. Боевые

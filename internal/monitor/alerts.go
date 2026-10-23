@@ -24,7 +24,12 @@
 //     crawler_ingest_bad_hashes_total в экспозиции /metrics сервиса
 //     ingest (BadHashesSource, реализация IngestBadHashes — badhashes.go):
 //     рост счётчика — ошибка писателя результатов (T-056), данные не
-//     теряются (refcount по мусорной ссылке не менялся, ING-P2-4).
+//     теряются (refcount по мусорной ссылке не менялся, ING-P2-4);
+//   - OOM и рестарты юнитов crawler (T-145) — счётчики memory.events
+//     (oom/oom_kill) cgroup v2 и NRestarts systemd (UnitEventsSource,
+//     реализация OSUnitEvents — unitevents.go): событие — незапланированный
+//     простой конвейера и симптом невыполнения бюджета памяти (ТЗ 3.4,
+//     docs/deploy.md §2).
 //
 // Сигнал фронтовой (на переходах, стиль DiskWatchLoop в internal/content):
 // Warn при срабатывании, Info при снятии, Debug когда алерт неприменим
@@ -89,6 +94,7 @@ const (
 	AlertDiskFree      = "disk_free"            // место каталога контента
 	AlertNVMeWear      = "nvme_wear"            // SMART percentage_used
 	AlertBadHashes     = "ingest_bad_hashes"    // всплеск мусорных content_hash
+	AlertUnitOOM       = "unit_oom"             // OOM/рестарты юнитов crawler (T-145)
 )
 
 // alertDescs — человекочитаемые описания алертов для записей лога.
@@ -99,6 +105,7 @@ var alertDescs = map[string]string{
 	AlertDiskFree:      "нехватка места на диске",
 	AlertNVMeWear:      "износ NVMe (SMART)",
 	AlertBadHashes:     "мусорные content_hash при очистке удалённых доменов",
+	AlertUnitOOM:       "OOM-убийства и крэш-рестарты юнитов crawler",
 }
 
 // Пороги оценки. Числа ТЗ не задаёт; переиспользуются существующие пороги
@@ -473,6 +480,13 @@ type AlertsDeps struct {
 	// BadHashes — счётчик мусорных content_hash очистки ingest (T-099);
 	// nil — алерт «не измеряется».
 	BadHashes BadHashesSource
+	// UnitEvents — OOM/рестарты юнитов crawler (T-145); nil — алерт
+	// «не измеряется». Дефолтной реализации ОС нет (в отличие от
+	// Space/Wear): OSUnitEvents делает exec systemctl и читает хостовый
+	// cgroupfs — в юнит-тестах пакета это недопустимо, источником
+	// командует cmd/monitor (OSUnitEvents, обёрнутая в метрики
+	// NewUnitEventsMetrics).
+	UnitEvents UnitEventsSource
 }
 
 // AlertsOptions — параметры оценки; нулевые значения заменяются
@@ -652,6 +666,7 @@ func (a *Alerts) evaluators() []alertEval {
 		{AlertDiskFree, a.evalDisk},
 		{AlertNVMeWear, a.evalWear},
 		{AlertBadHashes, a.evalBadHashes},
+		{AlertUnitOOM, a.evalUnitOOM},
 	}
 }
 
@@ -982,6 +997,56 @@ func (a *Alerts) evalBadHashes(ctx context.Context, _ string) verdict {
 		}
 	}
 	return verdict{status: AlertStatusOK, detail: detail}
+}
+
+// evalUnitOOM — события юнитов crawler (T-145): срабатывание, пока у
+// любого юнита есть oom/oom_kill (memory.events) или NRestarts > 0.
+// Счётчики монотонны внутри жизни cgroup/юнита — гистерезис не нужен
+// (стиль износа NVMe): эпизод тянется от первого события до сброса
+// состояния юнита — перезапуска (деплой сбрасывает сам: stop →
+// reset-failed → start в deploy-install.sh; reset-failed/старт обнуляет
+// NRestarts, пересозданная cgroup забирает oom/oom_kill с собой). Один
+// Warn на эпизод даёт фронтовая механика transition. Ошибка источника
+// класса errNoSystemd (dev-контейнер) — тихое «не измеряется», как у
+// SMART: окружение без systemd — норма dev, а не авария; прочие ошибки
+// (боевой хост, systemd/cgroupfs сломан) — Warn каждого прохода, стиль
+// остальных источников (зонд ingest).
+func (a *Alerts) evalUnitOOM(ctx context.Context, _ string) verdict {
+	if a.deps.UnitEvents == nil {
+		return verdict{status: AlertStatusNotMeasured, detail: "источник не задан"}
+	}
+	units, err := a.deps.UnitEvents.UnitEvents(ctx)
+	if err != nil {
+		if errors.Is(err, errNoSystemd) {
+			return verdict{status: AlertStatusNotMeasured, detail: err.Error()}
+		}
+		// Без повторного «monitor: юниты:» — источник уже ставит префикс.
+		return verdict{err: err}
+	}
+	if len(units) == 0 {
+		return verdict{
+			status: AlertStatusNotMeasured,
+			detail: "юниты " + unitEventsPattern + " не найдены",
+		}
+	}
+	var hot []string
+	for _, u := range units {
+		if !u.hot() {
+			continue
+		}
+		hot = append(hot, fmt.Sprintf("%s: oom=%d oom_kill=%d рестартов=%d",
+			u.Unit, u.OOM, u.OOMKill, u.NRestarts))
+	}
+	if len(hot) > 0 {
+		return verdict{
+			status: AlertStatusFiring,
+			detail: strings.Join(hot, ", ") + " — эпизод до перезапуска юнита (NRestarts — reset-failed, oom/oom_kill — новая cgroup)",
+		}
+	}
+	return verdict{
+		status: AlertStatusOK,
+		detail: fmt.Sprintf("OOM и рестартов нет (%d юнитов)", len(units)),
+	}
 }
 
 // AlertsLoop — периодический цикл оценки алертов (стиль ZoneStatsLoop):
