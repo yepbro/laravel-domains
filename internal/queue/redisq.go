@@ -26,6 +26,18 @@ const fieldData = "data"
 // «пустых» пробуждений мала относительно времени обработки пачки.
 const DefaultRedisBlock = 2 * time.Second
 
+// DefaultPublishRetries — дополнительные попытки XADD при инфраструктурном
+// сбое Redis (T-152): результат уже вычислен, короткая серия повторов
+// закрывает секундные флапы соединения и пограничные OOM-моменты, не
+// отдавая доставку в круг клейм (каждый клейм — +1 попытки к q:dead).
+const DefaultPublishRetries = 2
+
+// DefaultPublishRetryPause — пауза перед первой повторной попыткой XADD
+// (удвоение на каждую следующую, сдвиг ограничен — переполнение Duration):
+// 250 мс + 500 мс ≈ 0,75 с худший случай поверх публикации — ничто против
+// времени обработки задачи любого этапа (секунды).
+const DefaultPublishRetryPause = 250 * time.Millisecond
+
 // redisStreams — окно в go-redis: только команды стримов, нужные
 // очереди. *redis.Client (queue.NewClient) и *redis.ClusterClient
 // удовлетворяют интерфейсу; тесты подменяют фейком — cmd-результаты
@@ -48,6 +60,15 @@ type RedisOptions struct {
 	// стриме, поэтому режим «не обрезать» не предусмотрен — источник
 	// истины PostgreSQL, усечение восстановимо по lease, ТЗ 3.4).
 	MaxLen int64
+	// PublishRetries — дополнительные попытки XADD при инфраструктурном
+	// сбое Redis (T-152, InfraError); 0 и меньше — DefaultPublishRetries.
+	// Ошибки значений/сериализации не повторяются: повтор дал бы тот же
+	// ответ.
+	PublishRetries int
+	// PublishRetryPause — пауза перед первой повторной попыткой XADD
+	// (удвоение на каждую следующую); 0 и меньше —
+	// DefaultPublishRetryPause.
+	PublishRetryPause time.Duration
 }
 
 // RedisQueue — реализация Queue на Redis Streams. Группа потребителей
@@ -72,6 +93,12 @@ func NewRedisQueue(rdb redisStreams, opt RedisOptions) *RedisQueue {
 	if opt.Block <= 0 {
 		opt.Block = DefaultRedisBlock
 	}
+	if opt.PublishRetries <= 0 {
+		opt.PublishRetries = DefaultPublishRetries
+	}
+	if opt.PublishRetryPause <= 0 {
+		opt.PublishRetryPause = DefaultPublishRetryPause
+	}
 	return &RedisQueue{rdb: rdb, opt: opt}
 }
 
@@ -80,7 +107,9 @@ func NewRedisQueue(rdb redisStreams, opt RedisOptions) *RedisQueue {
 // приблизительным пределом MAXLEN ~ (ТЗ 4.2): явным из RedisOptions.MaxLen
 // или пределом стрима по политике T-025 (DefaultStreamMaxLen). Стрим обязан
 // соответствовать типу сообщения, значения проходят проверку до записи
-// (ошибка — сообщение не публикуется).
+// (ошибка — сообщение не публикуется). Инфраструктурный сбой XADD
+// (OOM/соединение, T-152) повторяется PublishRetries раз с удвоением
+// паузы; устойчивая недоступность — InfraError.
 func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (string, error) {
 	if !knownStream(stream) {
 		return "", fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamAnalyze, StreamDead)", stream)
@@ -106,7 +135,35 @@ func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (s
 	args.MaxLen = maxLen
 	args.Approx = true // MAXLEN ~: обрезка без точного подсчёта (T-025)
 	id, err := q.rdb.XAdd(ctx, args).Result()
+	if err != nil && infraCause(err) {
+		// Инфраструктурный сбой (T-152): результат уже вычислен —
+		// короткая серия повторов XADD с удвоением паузы закрывает
+		// флапы соединения и пограничные OOM-моменты, не отдавая
+		// доставку в круг клейм (каждый клейм — +1 попытки к q:dead,
+		// инцидент 22.10). Не-инфраструктурные ошибки не повторяются:
+		// повтор дал бы тот же ответ.
+		for attempt := 1; err != nil && attempt <= q.opt.PublishRetries && ctx.Err() == nil; attempt++ {
+			pause := q.opt.PublishRetryPause << min(attempt-1, 5)
+			select {
+			case <-ctx.Done():
+			case <-time.After(pause):
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			id, err = q.rdb.XAdd(ctx, args).Result()
+			if err != nil && !infraCause(err) {
+				break
+			}
+		}
+	}
 	if err != nil {
+		if infraCause(err) {
+			// Устойчивая недоступность записи: маркер InfraError —
+			// воркеры по нему останавливают чтение, RecoverLoop не
+			// клеймит (T-152); XACK нет — публикация не состоялась.
+			return "", &InfraError{Op: "publish в " + stream, Err: err}
+		}
 		return "", fmt.Errorf("queue: publish в %s: %w", stream, err)
 	}
 	return id, nil
@@ -186,6 +243,13 @@ func (q *RedisQueue) Ack(ctx context.Context, stream, group string, ids ...strin
 		return nil
 	}
 	if err := q.rdb.XAck(ctx, stream, group, ids...).Err(); err != nil {
+		if infraCause(err) {
+			// Инфраструктурный сбой (T-152): результат уже записан,
+			// запись осталась в pending и вернётся повторной доставкой
+			// (идемпотентность, ТЗ 3.4); маркер даёт воркеру понять,
+			// что это не ошибка обработки.
+			return &InfraError{Op: fmt.Sprintf("ack %s (группа %s)", stream, group), Err: err}
+		}
 		return fmt.Errorf("queue: ack %s (группа %s): %w", stream, group, err)
 	}
 	return nil

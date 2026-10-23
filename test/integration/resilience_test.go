@@ -43,6 +43,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1054,5 +1056,218 @@ func TestResilience_MaxLenTrims(t *testing.T) {
 	if oldest[0].ID <= first {
 		t.Errorf("самая ранняя запись %s не новее первой опубликованной %s — обрезки не было",
 			oldest[0].ID, first)
+	}
+}
+
+// --- OOM Redis не сжигает попытки (T-152) -------------------------------------
+
+// oomGuard — управление maxmemory тестового Redis для сценария OOM
+// (T-152): сохраняет исходные maxmemory/maxmemory-policy (CONFIG GET),
+// enterOOM опускает потолок ниже текущего used_memory — все записи
+// отвергаются «OOM command not allowed» (политика принудительно
+// noeviction, как в бою — docs/redis.md §4); release возвращает исходные
+// настройки. release регистрируется в t.Cleanup СТРОГО до первого
+// изменения: настройки возвращаются и при падении теста. Окно держится
+// минимумом времени: maxmemory сервера глобален для всех БД инстанса.
+type oomGuard struct {
+	t        *testing.T
+	rdb      *redis.Client
+	maxmem   string
+	policy   string
+	released bool
+}
+
+func newOOMGuard(t *testing.T, rdb *redis.Client) *oomGuard {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	maxmem, err := rdb.ConfigGet(ctx, "maxmemory").Result()
+	if err != nil {
+		t.Fatalf("CONFIG GET maxmemory: %v", err)
+	}
+	policy, err := rdb.ConfigGet(ctx, "maxmemory-policy").Result()
+	if err != nil {
+		t.Fatalf("CONFIG GET maxmemory-policy: %v", err)
+	}
+	g := &oomGuard{t: t, rdb: rdb, maxmem: maxmem["maxmemory"], policy: policy["maxmemory-policy"]}
+	t.Cleanup(g.release)
+	return g
+}
+
+// usedMemory — текущее потребление памяти сервера (INFO memory).
+func (g *oomGuard) usedMemory() int64 {
+	g.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	info, err := g.rdb.Info(ctx, "memory").Result()
+	if err != nil {
+		g.t.Fatalf("INFO memory: %v", err)
+	}
+	for _, line := range strings.Split(info, "\r\n") {
+		if v, ok := strings.CutPrefix(line, "used_memory:"); ok {
+			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			if err != nil {
+				g.t.Fatalf("used_memory %q: %v", v, err)
+			}
+			return n
+		}
+	}
+	g.t.Fatal("INFO memory без поля used_memory")
+	return 0
+}
+
+func (g *oomGuard) configSet(param, value string) {
+	g.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := g.rdb.ConfigSet(ctx, param, value).Err(); err != nil {
+		g.t.Fatalf("CONFIG SET %s %s: %v", param, value, err)
+	}
+}
+
+// enterOOM опускает потолок памяти ниже текущего потребления: записи
+// (SET/XADD) отвергаются OOM, чтения работают. Пропускает тест, если
+// отказ записи сымитировать не удалось (права CONFIG/окружение).
+func (g *oomGuard) enterOOM() {
+	g.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	g.configSet("maxmemory-policy", "noeviction")
+	cap := g.usedMemory() - 64*1024
+	if cap < 1 {
+		cap = 1
+	}
+	g.configSet("maxmemory", strconv.FormatInt(cap, 10))
+	if err := g.rdb.Set(ctx, "t152-oom-precondition", 1, time.Second).Err(); err == nil {
+		g.release()
+		g.t.Skipf("SET прошёл под потолком %d — OOM не сымитирован, сценарий не воспроизводим", cap)
+	}
+}
+
+// release возвращает исходные настройки; безопасна при повторном вызове
+// (t.Cleanup + явный вызов тестом).
+func (g *oomGuard) release() {
+	if g.released {
+		return
+	}
+	g.released = true
+	g.configSet("maxmemory", g.maxmem)
+	g.configSet("maxmemory-policy", g.policy)
+}
+
+// pendingExt — сводка PEL группы со счётчиками доставок (RetryCount) —
+// как XPENDING из runbooks §2.6.
+func pendingExt(t *testing.T, rdb *redis.Client, stream, group string) []redis.XPendingExt {
+	t.Helper()
+	res, err := rdb.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+		Stream: stream, Group: group, Start: "-", End: "+", Count: 1000,
+	}).Result()
+	if err != nil {
+		t.Fatalf("XPENDING %s/%s: %v", stream, group, err)
+	}
+	return res
+}
+
+// TestResilience_OOMDoesNotBurnAttempts — OOM Redis не сжигает попытки
+// задач (T-152; пост-мортем load-measurements.md §11.1, рецепт —
+// runbooks §2.6): публикации результатов (XADD) падают «OOM command not
+// allowed», доставки остаются без XACK — счётчик доставок PEL (XPENDING
+// RetryCount) не растёт: RecoverLoop не клеймит без шанса записать
+// результат (гейт записи по пробе). Память освобождена (в инциденте —
+// дренаж легаси-q:dns) — задачи доводятся клеймом до публикации
+// результата и XACK, q:dead пуст.
+func TestResilience_OOMDoesNotBurnAttempts(t *testing.T) {
+	skipUnlessIntegration(t)
+	rdb := resilienceRedisEnv(t)
+	// Повторы XADD короткие: здесь проверяются гейт и доводка, а не
+	// пауза повтора (последняя — TestPublishRetriesInfra).
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{
+		Block:             150 * time.Millisecond,
+		PublishRetries:    1,
+		PublishRetryPause: time.Millisecond,
+	})
+	reliab := queue.NewReliab(rdb, q, queue.ReliabOptions{MinIdle: 30 * time.Millisecond})
+	ctx := context.Background()
+	const group = "resil-oom"
+	const total = 3
+
+	// Пачка q:render — как рендер-когорта инцидента; опубликована и
+	// потреблена до OOM-окна (первая доставка: RetryCount = 1).
+	for i := 0; i < total; i++ {
+		if _, err := q.Publish(ctx, queue.StreamRender, queue.Result{
+			TaskID:      fmt.Sprintf("t-oom-%02d", i+1),
+			ZoneID:      11,
+			DomainID:    int64(400 + i),
+			SubdomainID: 0,
+		}); err != nil {
+			t.Fatalf("публикация %d: %v", i+1, err)
+		}
+	}
+	batch := consumeTasks(t, q, queue.StreamRender, group, "w1", total)
+	if len(batch) != total {
+		t.Fatalf("потреблено задач: %d, хочу %d", len(batch), total)
+	}
+
+	// Обработчик — модель воркера инцидента: обработка исправна,
+	// результат публикуется в q:analyze; публикация и есть сбой.
+	process := func(c context.Context, d queue.Delivery) error {
+		res, err := queue.Decode[queue.Result](d)
+		if err != nil {
+			return err
+		}
+		res.TaskID += "-done"
+		_, err = q.Publish(c, queue.StreamAnalyze, res)
+		return err
+	}
+
+	// OOM-окно и цикл возврата зависших: без гейта клеймил бы по кругу.
+	guard := newOOMGuard(t, rdb)
+	guard.enterOOM()
+	loopCtx, cancelLoop := context.WithCancel(ctx)
+	defer cancelLoop()
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		_ = queue.RecoverLoop(loopCtx, reliab, process, queue.RecoverOptions{
+			Stream: queue.StreamRender, Group: group, Consumer: "recover",
+			Batch: total, Interval: 100 * time.Millisecond,
+		})
+	}()
+
+	// Несколько тиков цикла (700 мс ≥ 6 интервалов): проба записи падает
+	// — клейма нет, счётчик доставок стабилен на первой доставке.
+	time.Sleep(700 * time.Millisecond)
+	pending := pendingExt(t, rdb, queue.StreamRender, group)
+	if len(pending) != total {
+		t.Fatalf("записей в PEL: %d, хочу %d", len(pending), total)
+	}
+	for _, p := range pending {
+		if p.RetryCount != 1 {
+			t.Errorf("запись %s: доставок %d, хочу 1 — клеймы при недоступной записи жгут попытки (T-152)",
+				p.ID, p.RetryCount)
+		}
+	}
+	if n := streamLen(t, rdb, queue.StreamAnalyze); n != 0 {
+		t.Errorf("публикаций q:analyze при OOM: %d, хочу 0", n)
+	}
+
+	// Память освобождена: записи проходят — клейм возвращает доставки,
+	// обработка доводит их до XACK (публикация + подтверждение).
+	guard.release()
+	deadline := time.Now().Add(10 * time.Second)
+	for pendingCount(t, rdb, queue.StreamRender, group) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("после освобождения памяти PEL не опустел: %d записей",
+				pendingCount(t, rdb, queue.StreamRender, group))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancelLoop()
+	<-loopDone
+	if n := streamLen(t, rdb, queue.StreamAnalyze); n != total {
+		t.Errorf("результатов в q:analyze: %d, хочу %d (обработка исправна, умерла только публикация)", n, total)
+	}
+	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
+		t.Errorf("записей в q:dead: %d, хочу 0 (T-152: OOM не сжигает попытки)", n)
 	}
 }

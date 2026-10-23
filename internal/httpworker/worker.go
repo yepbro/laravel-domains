@@ -1122,7 +1122,11 @@ func workerReadBody(res *httpfetch.FetchResult) ([]byte, error) {
 // (ТЗ 4.2); Consume доставок подряд без единого подтверждения —
 // систематический сбой обработки — выдерживает паузу-предохранитель
 // (workerFailWaitBase): черпать новые задачи при лежащей обработке
-// бессмысленно, попытки доставок сгорают.
+// бессмысленно, попытки доставок сгорают. Инфраструктурный сбой
+// публикации (InfraError: OOM Redis/соединение, T-152) останавливает
+// чтение сразу и до восстановления записи (Reliab.Writable): публикации
+// всё равно падают, а обработки без шанса записать результат только
+// копят pending.
 func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	if q == nil {
 		return errors.New("httpworker: цикл воркера: очередь не задана")
@@ -1182,11 +1186,41 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	// доставки окна прежде (at-least-once, ТЗ 3.4).
 	pending := make(chan queue.Delivery, o.Consume)
 	var failed atomic.Int64 // доставок подряд без подтверждения
+	// infraDown — устойчивая инфраструктурная ошибка публикации
+	// (OOM/соединение Redis, T-152): чтение q:http приостанавливается
+	// до восстановления записи (Reliab.Writable) — Redis всё равно
+	// отвергает XADD результатов, новые доставки только копились бы
+	// в pending без шанса опубликоваться.
+	var infraDown atomic.Bool
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
-		failStreak := 0 // подряд выдержанных пауз предохранителя
+		failStreak := 0  // подряд выдержанных пауз предохранителя
+		infraStreak := 0 // подряд выдержанных пауз инфраструктуры
 		for {
+			// Пауза потребления при устойчивой InfraError публикации
+			// (T-152): пока проба записи падает — чтение не ведётся
+			// (предохранитель ниже считал бы те же неудачи дольше и
+			// читал бы пачки между паузами). Проба — один SET; после
+			// восстановления записи чтение возобновляется немедленно.
+			if infraDown.Load() {
+				if o.Recover != nil && !o.Recover.Writable(ctx) {
+					infraStreak++
+					pause := workerFailBackoff(infraStreak)
+					log.Warn("пауза чтения q:http: публикация результатов падает об инфраструктуру Redis (OOM/соединение) — новые доставки не читаются (T-152)",
+						"streak", infraStreak, "wait", pause.String())
+					wait(pause)
+					if ctx.Err() != nil {
+						return // graceful shutdown: wait вышел по отмене
+					}
+					continue
+				}
+				infraDown.Store(false)
+				infraStreak = 0
+				if o.Recover != nil {
+					log.Info("запись в Redis восстановлена — чтение q:http возобновляется")
+				}
+			}
 			// Предохранитель (workerFailWaitBase): доставки, подряд
 			// оставшиеся без подтверждения числом в целую пачку чтения
 			// (Consume) без единого успеха — систематический сбой
@@ -1264,12 +1298,20 @@ dispatch:
 			})
 			if err != nil {
 				failed.Add(1)
+				if queue.IsInfra(err) {
+					// Инфраструктурный сбой публикации (T-152):
+					// чтение останавливает ветка infraDown читателя.
+					infraDown.Store(true)
+				}
 				if ctx.Err() == nil {
 					log.Warn("задача q:http не подтверждена — вернётся повторной доставкой",
 						"entry", d.ID, "err", err)
 				}
 			} else {
 				failed.Store(0)
+				// Успех означает состоявшуюся публикацию результата —
+				// записи Redis доступна, пауза снимается досрочно.
+				infraDown.Store(false)
 			}
 		}(d)
 	}

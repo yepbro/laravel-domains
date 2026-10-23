@@ -24,6 +24,11 @@ type fakeRedis struct {
 	adds   []redis.XAddArgs
 	addID  string
 	addErr error
+	// addErrs — ошибки XADD по вызовам подряд (очередь); пусто —
+	// постоянная addErr. Нужно сценариям повторов публикации при
+	// инфраструктурном сбое (T-152): первые вызовы падают OOM,
+	// следующий проходит.
+	addErrs []error
 
 	creates   []string // "stream group start" на каждый вызов
 	createErr error
@@ -53,7 +58,12 @@ type ackCall struct {
 
 func (f *fakeRedis) XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd {
 	f.adds = append(f.adds, *a)
-	return redis.NewStringResult(f.addID, f.addErr)
+	err := f.addErr
+	if len(f.addErrs) > 0 {
+		err = f.addErrs[0]
+		f.addErrs = f.addErrs[1:]
+	}
+	return redis.NewStringResult(f.addID, err)
 }
 
 func (f *fakeRedis) XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd {

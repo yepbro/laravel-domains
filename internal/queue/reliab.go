@@ -178,6 +178,29 @@ type claimStreams interface {
 	XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd
 }
 
+// writeProbe — окно go-redis для пробы записи (T-152): SET короткоживущего
+// ключа. Отдельный от claimStreams интерфейс: проба опциональна (клиенты
+// боевых сборок умеют, фейки юнит-тестов — нет, Reliab.Writable тогда
+// отвечает true и гейт клейма выключен — поведение до T-152).
+type writeProbe interface {
+	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd
+}
+
+// Параметры пробы записи (T-152).
+const (
+	// WriteProbeKey — ключ пробы доступности записи: SET с TTL, один
+	// на инстанс Redis (значение не важно); TTL сам убирает ключ
+	// остановившихся сервисов. noeviction-ответ на SET — тот же отказ,
+	// что встретит XADD результата: проба честнее «прочитать ошибку
+	// предыдущего шага» — не расходует ни попыток доставок, ни вызовов
+	// обработчика.
+	WriteProbeKey = "crawler:queue:write-probe"
+	// writeProbeTTL — время жизни ключа пробы: с запасом больше
+	// максимального redis.recover_interval (1 ч, конфигурация) — ключ
+	// живёт, пока его обновляет живой RecoverLoop.
+	writeProbeTTL = 2 * time.Hour
+)
+
 // ReliabOptions — параметры возврата зависших записей (T-025).
 type ReliabOptions struct {
 	// MaxAttempts — максимум доставок задачи (первая + клеймы) до
@@ -205,16 +228,19 @@ type ReliabOptions struct {
 // работу, пока не исчерпан лимит попыток; исчерпавшие лимит публикуются
 // в q:dead (Dead) и подтверждаются в исходном стриме, покидая pending.
 type Reliab struct {
-	rdb claimStreams // XAUTOCLAIM + XPENDING
-	q   Queue        // публикация Dead и XACK исходных записей
-	opt ReliabOptions
+	rdb   claimStreams // XAUTOCLAIM + XPENDING
+	q     Queue        // публикация Dead и XACK исходных записей
+	opt   ReliabOptions
+	probe writeProbe // SET-проба записи (T-152); nil — проба недоступна, гейт выключен
 }
 
 // NewReliab строит слой надёжности поверх очереди q и клиента rdb — это
 // должен быть один и тот же Redis (Dead публикуется и подтверждается через
 // Queue, клейм и счётчик — напрямую): например NewReliab(rdb,
 // NewRedisQueue(rdb, RedisOptions{}), opt). Нулевые значения опций
-// заменяются значениями по умолчанию.
+// заменяются значениями по умолчанию. Клиент, умеющий SET (боевые
+// *redis.Client / *redis.ClusterClient), получает пробу записи
+// (Writable, T-152).
 func NewReliab(rdb claimStreams, q Queue, opt ReliabOptions) *Reliab {
 	if opt.MaxAttempts <= 0 {
 		opt.MaxAttempts = DefaultMaxAttempts
@@ -222,7 +248,25 @@ func NewReliab(rdb claimStreams, q Queue, opt ReliabOptions) *Reliab {
 	if opt.MinIdle <= 0 {
 		opt.MinIdle = DefaultClaimMinIdle
 	}
-	return &Reliab{rdb: rdb, q: q, opt: opt}
+	r := &Reliab{rdb: rdb, q: q, opt: opt}
+	if p, ok := rdb.(writeProbe); ok {
+		r.probe = p
+	}
+	return r
+}
+
+// Writable — проба доступности Redis на запись (T-152): SET короткоживущего
+// ключа WriteProbeKey. false — запись невозможна (OOM noeviction, обрыв
+// соединения): клеймить зависшие доставки бессмысленно — обработка их
+// вернётся той же ошибкой публикации, а каждый клейм расходует попытку
+// доставки к q:dead (корень инцидента 22–23.10, §11.1). Проба стоит один
+// SET и не трогает PEL. true также при неподдерживаемой пробе (клиент без
+// SET — фейки юнит-тестов): гейт выключен, поведение до T-152.
+func (r *Reliab) Writable(ctx context.Context) bool {
+	if r.probe == nil {
+		return true
+	}
+	return r.probe.Set(ctx, WriteProbeKey, 1, writeProbeTTL).Err() == nil
 }
 
 // Claimed — зависшая запись, возвращённая в работу (Reliab.Claim).

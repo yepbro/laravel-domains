@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/redis/go-redis/v9"
 
 	"crawler/internal/config"
 	"crawler/internal/content"
@@ -1153,6 +1154,178 @@ func TestWorkerRunBackoffOnFailures(t *testing.T) {
 	}
 	if q.ackedCount() != 0 {
 		t.Errorf("подтверждений %d при ядовитых доставках", q.ackedCount())
+	}
+}
+
+// workerInfraQueue — бесконечный источник валидных задач q:http (T-152):
+// каждое чтение возвращает одну доставку, обработка доходит до
+// Options.OnResult (в этом тесте — падает InfraError, модель OOM
+// публикации результата). Скорость чтений ограничивает только
+// инфраструктурная пауза цикла — измеритель её работы.
+type workerInfraQueue struct {
+	mu       sync.Mutex
+	consumes int
+	acked    int
+}
+
+func (q *workerInfraQueue) Publish(context.Context, string, queue.Message) (string, error) {
+	return "", nil
+}
+
+func (q *workerInfraQueue) Consume(_ context.Context, _, _, _ string, n int) ([]queue.Delivery, error) {
+	if n < 1 {
+		n = 1
+	}
+	payload, err := json.Marshal(queue.HTTPTask{
+		TaskID: "t-infra", ZoneID: 30, DomainID: 1, Name: "infra.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")},
+	})
+	if err != nil {
+		panic(err)
+	}
+	out := make([]queue.Delivery, n)
+	for i := range out {
+		out[i] = queue.Delivery{Stream: queue.StreamHTTP, ID: fmt.Sprintf("infra-%d", i), Payload: payload}
+	}
+	q.mu.Lock()
+	q.consumes++
+	q.mu.Unlock()
+	return out, nil
+}
+
+func (q *workerInfraQueue) Ack(_ context.Context, _, _ string, _ ...string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.acked++
+	return nil
+}
+
+func (q *workerInfraQueue) consumeCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.consumes
+}
+
+func (q *workerInfraQueue) ackedCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.acked
+}
+
+// workerProbeRedis — клиент SET/XAUTOCLAIM/XPENDING для пробы записи
+// Reliab.Writable (T-152): переключаемая ошибка SET; клейм всегда пуст
+// (гейт и не должен пускать его дальше).
+type workerProbeRedis struct {
+	mu     sync.Mutex
+	setErr error
+}
+
+func (f *workerProbeRedis) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd {
+	f.mu.Lock()
+	err := f.setErr
+	f.mu.Unlock()
+	return redis.NewStatusResult("OK", err)
+}
+
+func (f *workerProbeRedis) setProbeErr(err error) {
+	f.mu.Lock()
+	f.setErr = err
+	f.mu.Unlock()
+}
+
+func (f *workerProbeRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
+	cmd := redis.NewXAutoClaimCmd(ctx, "xautoclaim")
+	cmd.SetVal(nil, "0-0")
+	return cmd
+}
+
+func (f *workerProbeRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd {
+	return redis.NewXPendingExtCmd(ctx, "xpending")
+}
+
+// TestWorkerRunInfraPause — пауза потребления при устойчивой InfraError
+// публикации (T-152): ошибка публикации результата (OOM Redis) — не
+// ошибка обработки, черпать новые доставки бессмысленно: чтение q:http
+// останавливается до восстановления записи (Reliab.Writable), после
+// восстановления — возобновляется и доводит доставки до XACK.
+func TestWorkerRunInfraPause(t *testing.T) {
+	old := workerFailWaitBase
+	workerFailWaitBase = 5 * time.Millisecond
+	t.Cleanup(func() { workerFailWaitBase = old })
+
+	infraErr := &queue.InfraError{
+		Op:  "publish в q:analyze",
+		Err: errors.New("OOM command not allowed when used memory > 'maxmemory'"),
+	}
+	var failMu sync.Mutex
+	failPublish := true
+	onResult := func(context.Context, *DomainResult) error {
+		failMu.Lock()
+		defer failMu.Unlock()
+		if failPublish {
+			return infraErr
+		}
+		return nil
+	}
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"infra.test": {status: 200, body: "<html>страница инфраструктурной паузы</html>"},
+	})
+	// OnResult задан в опциях Run (не New): цикл передаёт свои opts
+	// в processDelivery — как сборка cmd/http-worker.
+	w := workerWorker(t, fetch, nil)
+
+	q := &workerInfraQueue{}
+	probe := &workerProbeRedis{}
+	probe.setProbeErr(errors.New("OOM command not allowed when used memory > 'maxmemory'"))
+	reliab := queue.NewReliab(probe, q, queue.ReliabOptions{MinIdle: time.Hour, MaxAttempts: 3})
+	opts := Options{Concurrency: 1, Consume: 1, Recover: reliab, OnResult: onResult}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	// OOM-окно: первая пачка прочитана, её публикация упала — чтение
+	// останавливается пробой (без паузы чтения были бы сотнями за окно).
+	deadline := time.After(5 * time.Second)
+	for q.consumeCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("первое чтение q:http не состоялось")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := q.consumeCount(); n > 6 {
+		t.Errorf("чтений %d за 300 мс инфраструктурной паузы — чтение не остановлено (ждалось ≤6)", n)
+	}
+	if q.ackedCount() != 0 {
+		t.Errorf("подтверждений %d при падающей публикации", q.ackedCount())
+	}
+
+	// Запись восстановлена (дренаж памяти в инциденте): чтение
+	// возобновляется, доставки доводятся до XACK.
+	probe.setProbeErr(nil)
+	failMu.Lock()
+	failPublish = false
+	failMu.Unlock()
+	for q.ackedCount() < 2 {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatalf("после восстановления записи подтверждено %d, хочу ≥2", q.ackedCount())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
 	}
 }
 

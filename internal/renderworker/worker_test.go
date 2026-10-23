@@ -25,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/redis/go-redis/v9"
 
 	"crawler/internal/config"
 	"crawler/internal/content"
@@ -1794,6 +1795,160 @@ func TestRenderWorker_RunPanicBackoff(t *testing.T) {
 	if n := f.renderer.tasksCountURL("https://spa.example/"); n == 0 {
 		t.Error("паникующая доставка не дошла до рендера — тест ничего не проверил")
 	}
+}
+
+// rwInfraQueue — бесконечный источник валидных доставок q:render с
+// переключаемой ошибкой публикации q:analyze (T-152): в режиме OOM
+// Publish возвращает InfraError — модель ошибки записи результата,
+// обработка доставки падает уже после записи в БД.
+type rwInfraQueue struct {
+	mu       sync.Mutex
+	consumes int
+	acked    int
+	publish  error
+}
+
+func (q *rwInfraQueue) setPublishErr(err error) {
+	q.mu.Lock()
+	q.publish = err
+	q.mu.Unlock()
+}
+
+func (q *rwInfraQueue) Publish(context.Context, string, queue.Message) (string, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return "", q.publish
+}
+
+func (q *rwInfraQueue) Consume(_ context.Context, _, _, _ string, n int) ([]queue.Delivery, error) {
+	if n < 1 {
+		n = 1
+	}
+	out := make([]queue.Delivery, n)
+	for i := range out {
+		out[i] = rwDelivery(fmt.Sprintf("infra-%d", i))
+	}
+	q.mu.Lock()
+	q.consumes++
+	q.mu.Unlock()
+	return out, nil
+}
+
+func (q *rwInfraQueue) Ack(_ context.Context, _, _ string, _ ...string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.acked++
+	return nil
+}
+
+func (q *rwInfraQueue) consumeCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.consumes
+}
+
+func (q *rwInfraQueue) ackedCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.acked
+}
+
+// rwProbeRedis — клиент SET/XAUTOCLAIM/XPENDING для пробы записи
+// Reliab.Writable (T-152): переключаемая ошибка SET, клейм всегда пуст.
+type rwProbeRedis struct {
+	mu     sync.Mutex
+	setErr error
+}
+
+func (f *rwProbeRedis) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd {
+	f.mu.Lock()
+	err := f.setErr
+	f.mu.Unlock()
+	return redis.NewStatusResult("OK", err)
+}
+
+func (f *rwProbeRedis) setProbeErr(err error) {
+	f.mu.Lock()
+	f.setErr = err
+	f.mu.Unlock()
+}
+
+func (f *rwProbeRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
+	cmd := redis.NewXAutoClaimCmd(ctx, "xautoclaim")
+	cmd.SetVal(nil, "0-0")
+	return cmd
+}
+
+func (f *rwProbeRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd {
+	return redis.NewXPendingExtCmd(ctx, "xpending")
+}
+
+// TestRenderWorker_RunInfraPause — пауза потребления при устойчивой
+// InfraError публикации (T-152, образец — httpworker): ошибка публикации
+// q:analyze (OOM Redis) — не ошибка рендера, чтение q:render
+// останавливается до восстановления записи (Reliab.Writable), после
+// восстановления — возобновляется и доводит доставки до XACK.
+func TestRenderWorker_RunInfraPause(t *testing.T) {
+	old := renderFailWaitBase
+	renderFailWaitBase = 5 * time.Millisecond
+	t.Cleanup(func() { renderFailWaitBase = old })
+
+	f := newRWFixture(t)
+	raw := rwTestHash(1)
+	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+	f.renderer.output = rwOutput("<html><body>infra pause</body></html>")
+
+	q := &rwInfraQueue{}
+	q.setPublishErr(&queue.InfraError{
+		Op:  "publish в q:analyze",
+		Err: errors.New("OOM command not allowed when used memory > 'maxmemory'"),
+	})
+	probe := &rwProbeRedis{}
+	probe.setProbeErr(errors.New("OOM command not allowed when used memory > 'maxmemory'"))
+	reliab := queue.NewReliab(probe, q, queue.ReliabOptions{MinIdle: time.Hour, MaxAttempts: 3})
+	w, err := New(f.pool, q, f.store, f.renderer, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	opts := Options{Concurrency: 1, Consume: 1, Recover: reliab}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, w, opts) }()
+
+	// OOM-окно: первая пачка прочитана, публикация упала — чтение
+	// останавливается пробой записи.
+	deadline := time.After(5 * time.Second)
+	for q.consumeCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("первое чтение q:render не состоялось")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := q.consumeCount(); n > 6 {
+		t.Errorf("чтений %d за 300 мс инфраструктурной паузы — чтение не остановлено (ждалось ≤6)", n)
+	}
+	if q.ackedCount() != 0 {
+		t.Errorf("подтверждений %d при падающей публикации", q.ackedCount())
+	}
+
+	// Запись восстановлена: чтение возобновляется, доставки доводятся
+	// до XACK.
+	probe.setProbeErr(nil)
+	q.setPublishErr(nil)
+	for q.ackedCount() < 2 {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatalf("после восстановления записи подтверждено %d, хочу ≥2", q.ackedCount())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+
+	rwStopLoop(t, cancel, done)
 }
 
 // TestRenderFailBackoff — ряд пауз предохранителя: удвоение от базы,
