@@ -40,15 +40,17 @@ cgroup, systemd перезапускает юнит, остальные серв
 |---|---|---|
 | `postgresql@.service` + drop-in | **3072M** (бюджет ≈ 2,5 ГБ + запас на пики обслуживания) | PostgreSQL ≈ 2,5 ГБ |
 | `redis-server.service` + drop-in | **640M** (maxmemory 512mb + ~128 МБ служебных, docs/redis.md §7) | Redis ≤ 0,5 ГБ |
-| `unbound.service` + drop-in | **700M** | Unbound ≈ 0,7 ГБ |
-| `crawler-*.service` (9 юнитов) | **2180M суммарно** | Go-сервисы ≈ 1,3 ГБ (7 конвейерных) + web этапа 13 + dashboard этапа 15 |
+| `unbound.service` + drop-in | **800M** (бюджет ≈ 0,7 ГБ + рост кэша на ≈47 млн имён: 733.9 MiB у старого потолка 700M, §12; +100M из MemAvailable 2.6 GiB) | Unbound ≈ 0,7 ГБ |
+| `crawler-*.service` (9 юнитов) | **2308M суммарно** | Go-сервисы ≈ 1,3 ГБ (7 конвейерных) + web этапа 13 + dashboard этапа 15 |
 | `crawler-chromium.service` | **2048M** | Chromium ≈ 2 ГБ |
 
-Итого потолки 8640M при 8192M RAM — суммарно выше объёма памяти, и это
+Итого потолки 8868M при 8192M RAM — суммарно выше объёма памяти, и это
 допустимо: потолок — не резервация, одновременного касания всех потолков
 не бывает (по средним замеров §6/§11 весь набор ≈ 5.1–5.2 GiB, с пиком
-Chromium — ≈ 6 GiB; PostgreSQL у потолка 3 GiB держит page cache,
-отдаваемый при давлении; разделение OOM по cgroup — вводный абзац этого
+Chromium — ≈ 6 GiB; подъём T-160 — unbound +100M, dns-worker +128M —
+взят из фактического запаса MemAvailable 2.6 GiB замера §12;
+PostgreSQL у потолка 3 GiB держит page cache, отдаваемый при давлении;
+разделение OOM по cgroup — вводный абзац этого
 раздела, ТЗ 10.1, — сохраняется). Строка «Go-сервисы ≈ 1,3 ГБ» ТЗ
 покрывала семь конвейерных юнитов; публичный `web` лендинга — продуктовое
 расширение этапа 13 вне основного ТЗ — добавляет свою строку 256M,
@@ -64,12 +66,12 @@ shared_buffers — docs/db.md, «Память»), http-worker (тела в по�
 
 Потолки девяти юнитов Go-сервисов (строка «Go-сервисы ≈ 1,3 ГБ»
 исполняется фактическим потреблением ≈ 1.0–1.15 GiB, а не суммой
-потолков 2180M):
+потолков 2308M):
 
 | Юнит | MemoryMax |
 |---|---|
 | `crawler-http-worker.service` | 900M |
-| `crawler-dns-worker.service` | 256M |
+| `crawler-dns-worker.service` | 384M |
 | `crawler-web.service` | 256M |
 | `crawler-ingest.service` | 128M |
 | `crawler-scheduler.service` | 128M |
@@ -102,8 +104,11 @@ shared_buffers — docs/db.md, «Память»), http-worker (тела в по�
   ≈ 1.2 GiB. Резерв снижения потолка и возврата к 256 — стриминг тел
   в content-store до завершения задачи (T-163: уменьшение пиковой
   памяти слота, не реализовано);
-- **dns-worker — 256M**: пул 2000 UDP-сокетов (`dns.udp_pool_size`) и буферы
-  обменов, TTL-кэш редиректных резолвов (T-047);
+- **dns-worker — 384M**: пул 2000 UDP-сокетов (`dns.udp_pool_size`) и
+  буферы обменов, TTL-кэш редиректных резолвов (T-047). Потолок поднят
+  256M → 384M по замеру §12 (T-160): на ≈47 млн доменов и глубоком q:dns
+  воркер периодически упирался в 256 MiB (в §6 на смеси ru/rf/su max был
+  141 MiB), запас — из MemAvailable 2.6 GiB;
 - **web — 256M** (этап 13, вне строки ТЗ): кроме лёгкой работы с БД живые
   проверки формы гонят полный конвейер checker (T-123: DNS → HTTP с телами
   страниц до `http.max_body_bytes` → рендер SPA → анализ) — сетевые буферы
@@ -131,6 +136,24 @@ Chromium отдельным юнитом, а не процессом ворке�
 перезапуск по числу страниц/RSS изнутри воркера (T-065) невозможен для
 чужого процесса — потолок и перезапуск держит юнит (аналогия mem_limit
 dev-сервиса chromium, docs/docker.md §6).
+
+Применение T-160 на живом сервере (unbound 700 → 800M, dns-worker
+256 → 384M) — **до деплоя**, по образцу §2.1 (T-158): значения те же,
+что в drop-in'е/юните, действуют сразу, персистентный drop-in пишется в
+`/etc/systemd/system.control/`:
+
+```bash
+systemctl set-property unbound.service MemoryMax=800M
+systemctl set-property crawler-dns-worker.service MemoryMax=384M
+```
+
+После деплоя — синхронизировать drop-in/юнит по §5 (п. 1) и снять
+персистентные set-property drop-in'ы (`systemctl revert <юнит>` +
+`daemon-reload` + `restart` — как в §2.1, образец T-143,
+load-measurements.md §3): единственный источник — файлы комплекта. Критерий T-160: `memory.events oom=0` у
+обоих юнитов, MemoryCurrent unbound < MemoryMax с запасом ≥ 50 MiB,
+median длительности DNS-задач в гистограммах 9103 не деградирует,
+`recursion.time.median` (`unbound-control stats`) не растёт.
 
 ### 2.1. CPU-приоритеты: CPUWeight/CPUQuota (T-158)
 
@@ -526,7 +549,8 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
   1. до/сразу после деплоя синхронизировать изменённые юниты:
      `cp deploy/systemd/<юнит> /etc/systemd/system/ && systemctl
      daemon-reload && systemctl restart <юнит>` (пример: MemoryMax=900M,
-     T-143; MemoryHigh=850M, T-145; CPUWeight/CPUQuota, T-158 — §2.1);
+     T-143; MemoryHigh=850M, T-145; CPUWeight/CPUQuota, T-158 — §2.1;
+     MemoryMax unbound 800M / dns-worker 384M, T-160 — §2);
      временные `systemctl set-property` drop-in'и
      (`/etc/systemd/system.control/`) удалить, чтобы юнит-файл
      был единственным источником;

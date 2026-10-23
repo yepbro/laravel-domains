@@ -1,7 +1,11 @@
 # Domain Crawler — dns-worker: DNS-проверка апекса и субдоменов (ТЗ 5.4).
 # MemoryMax — строка бюджета «Go-сервисы ≈ 1,3 ГБ» (ТЗ 3.2), раскладка —
-# docs/deploy.md: dns-worker единственный из «лёгких» держит пул UDP-сокетов
-# (dns.udp_pool_size 2000) и буферы обменов.
+# docs/deploy.md §2 (сумма потолков девяти юнитов — 2308M): dns-worker
+# единственный из «лёгких» держит пул UDP-сокетов (dns.udp_pool_size
+# 2000) + буферы обменов + TTL-кэш резолвов. Потолок поднят 256M → 384M
+# по замеру §12 (T-160): на ≈47 млн доменов воркер периодически упирался
+# в 256 MiB (в §6 на смеси ru/rf/su max был 141 MiB), запас — из
+# MemAvailable 2.6 GiB.
 
 [Unit]
 Description=Domain Crawler — dns-worker (DNS-проверка)
@@ -24,7 +28,7 @@ ExecStart=/opt/crawler/bin/dns-worker
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
-MemoryMax=256M
+MemoryMax=384M
 # CPU-приоритет (T-158): критический путь конвейера — питает q:http
 # (в замере §12 при PSI some 91–95% проверка получала ~90% одного ядра
 # против postgres 177% + chromium 140% + analyzer 66%). Вес 1000 как у

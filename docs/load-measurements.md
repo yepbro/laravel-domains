@@ -372,7 +372,8 @@ postgres 177%, chromium 140%, analyzer 66%, dns-worker 26%, http-worker
   q:dead +366 «исчерпан лимит попыток 3».
 - **Потолки резолвера (P1, T-160)**: unbound 733.9/734.0 MiB при
   MemoryMax 700M (1.19 млн reclaim-событий; в §6 было 452 MiB),
-  dns-worker упирается в 256 MiB. Redis в норме 53/512 MiB (меры
+  dns-worker упирается в 256 MiB; MemAvailable 2.6 GiB — запас есть.
+  Redis в норме 53/512 MiB (меры
   T-141/T-149 держат).
 - **Агрегаты мониторинга (P1, T-161)**: проход GROUP BY дольше
   интервала цикла — наслоение нагрузки PG.
