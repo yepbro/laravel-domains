@@ -88,6 +88,9 @@
    [`deploy.md`](deploy.md) §4.3).
 10. **Подать домены** — файлы в `/var/lib/crawler/incoming/`
     (контракт — [`incoming-files.md`](incoming-files.md)).
+11. **Входящий фид NRD** (опционально) — cron-выгрузка списка новых
+    доменов smet.cz в `incoming/add/` ежедневно в 19:17 UTC:
+    [`deploy/nrd/`](../deploy/nrd/), [`deploy.md`](deploy.md) §4.9.
 
 Раскладка памяти (MemoryMax по юнитам) и обоснование — [`deploy.md`](deploy.md) §2.
 
@@ -239,6 +242,9 @@ crawlerctl check <домен>           # разбор спорного доме
                                    # и очередях; для записи — recheck
 # алерты и ошибки:
 journalctl -t crawler-monitor -p warning --since -1d   # бой
+journalctl -t crawler-nrd-fetch --since -1d            # доставка NRD-фида
+                                                       # (deploy.md §4.9:
+                                                       # OK ежедневно, СБОЙ — вручную)
 systemctl --failed                 # юниты в failed (StartLimit)
 df -h /var/lib/crawler/content /var/lib/postgresql    # тома
 ```

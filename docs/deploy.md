@@ -387,6 +387,46 @@ syslog/journald и доступ алерту износа сервиса monitor
 [`deploy/smartd/README.md`](../deploy/smartd/README.md); обоснование,
 оценка TBW от нагрузки и связь слоёв — [`disks.md`](disks.md).
 
+### 4.9. Входящий фид NRD smet.cz (cron)
+
+Комплект [`deploy/nrd/`](../deploy/nrd/): ежесуточная автоматическая
+подача списка новых доменов (NRD) `https://smet.cz/nrd/data/today.txt`
+(~8 МиБ, ~5·10⁵ доменов разных зон) в наблюдаемую папку ingest. Cron
+запускает скрипт в **19:17 UTC**, тот скачивает файл в
+`<ingest.dir>/add/nrd-<дата UTC>.txt` по контракту доставки
+([`incoming-files.md`](incoming-files.md) §2: временно имя `*.part`,
+наблюдателем игнорируется, + атомарное переименование в `*.txt`).
+Список **зона-less**: зоны выводятся из самих доменов и создаются
+автоматически (`incoming-files.md` §1) — разбивки по каталогам зон
+не требуется.
+
+```bash
+install -m 0755 deploy/nrd/fetch-nrd.sh /usr/local/bin/crawler-fetch-nrd
+install -m 0644 deploy/nrd/crawler-nrd.cron /etc/cron.d/crawler-nrd
+```
+
+Нюансы (подробно — [`deploy/nrd/README.md`](../deploy/nrd/README.md)):
+
+- **cron не умеет часовой пояс**: в `crawler-nrd.cron` часы переведены
+  в местное время сервера (Europe/Moscow, UTC+3 → 22:17); при смене
+  зоны сервера (`timedatectl`) пересчитать обратно в 19:17 UTC.
+  Файлы `/etc/cron.d` на сервере исполняет `systemd-cron` (классический
+  демон cron не установлен): таймер виден как
+  `systemctl list-timers 'cron-*'` → `cron-crawler-nrd-root-0.timer`;
+- **свежесть среза**: источник обновляется ежедневно вечером UTC
+  (~20:19 UTC на момент настройки), выгрузка в 19:17 UTC забирает срез
+  предыдущих суток — между запусками ровно одно обновление источника,
+  каждый день новый `sha256`, дублей по дедупу `ingest_files` нет;
+- **отказы** (сеть/HTTP, пустой файл): файл не ставится вовсе,
+  запись `СБОЙ: …` в `journalctl -t crawler-nrd-fetch`, повтор —
+  следующими сутками; источник хранит только `today.txt`, пропущенный
+  день невосполним — после длительного сбоя запустить
+  `/usr/local/bin/crawler-fetch-nrd` вручную. Успех — строка `OK: …`
+  с `sha256`, совпадающим с journal-полем `ingest_files`.
+
+Шаг — конфигурация оператора (как юниты и nginx, [`ci-cd.md`](ci-cd.md)):
+конвейер деплоя его не ставит и не обновляет.
+
 ## 5. Эксплуатация
 
 ```bash
