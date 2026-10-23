@@ -109,6 +109,16 @@ type Redis struct {
 	// доставленное и подтверждённое. Стоимость прохода — три команды
 	// Redis на стрим.
 	TrimInterval Duration `yaml:"trim_interval"`
+	// ConsumerIdle — порог неактивности консьюмера группы для чистки
+	// (T-155): после рестартов воркеров их консьюмеры (имена с pid)
+	// остаются в группах навсегда; цикл планировщика
+	// (queue.CleanupConsumersLoop, период — тот же TrimInterval)
+	// удаляет XGROUP DELCONSUMER строго пустых (pending = 0) и
+	// неактивных дольше порога. Порог — защита консьюмеров живых
+	// воркеров под нагрузкой: удаление пустого неактивного безвредно
+	// (имя пересоздаётся первым чтением с записями). Диапазон
+	// 1m..720h (30 дней).
+	ConsumerIdle Duration `yaml:"consumer_idle"`
 }
 
 // Ingest — приём файлов доменов (ТЗ 5.1).
@@ -405,6 +415,10 @@ func Default() *Config {
 			// Минута — единицы процентов бюджета Redis между проходами
 			// при текущих темпах этапов (queue.DefaultTrimInterval).
 			TrimInterval: Duration(time.Minute),
+			// 2 ч — с запасом поверх затишья между доставками активного
+			// этапа (секунды) и короче междеплойного интервала
+			// (queue.DefaultConsumerIdle, T-155).
+			ConsumerIdle: Duration(2 * time.Hour),
 		},
 		Ingest: Ingest{
 			Dir:           "/data/incoming",
@@ -682,6 +696,15 @@ func (c *Config) Validate() error {
 	if c.Redis.TrimInterval < Duration(time.Second) || c.Redis.TrimInterval > Duration(24*time.Hour) {
 		problems = append(problems, fmt.Sprintf("redis.trim_interval: ожидается %s..%s, задано %s",
 			Duration(time.Second), Duration(24*time.Hour), c.Redis.TrimInterval))
+	}
+	// Гигиена консьюмеров (T-155): порог меньше минуты вычищал бы
+	// консьюмеров живых воркеров между чтениями пустого стрима (XREADGROUP
+	// без записей idle консьюмера не обновляет) — холостой churn
+	// пересоздания; больше 30 дней — мёртвые копятся быстрее деплоев,
+	// механизму нет смысла.
+	if c.Redis.ConsumerIdle < Duration(time.Minute) || c.Redis.ConsumerIdle > Duration(720*time.Hour) {
+		problems = append(problems, fmt.Sprintf("redis.consumer_idle: ожидается %s..%s, задано %s",
+			Duration(time.Minute), Duration(720*time.Hour), c.Redis.ConsumerIdle))
 	}
 
 	// ingest

@@ -80,6 +80,7 @@ docs/deploy.md §4.5). Соединения открываются лениво.
 | `recover_batch` | `CRAWLER_REDIS_RECOVER_BATCH` | целое | `64` |
 | `recover_interval` | `CRAWLER_REDIS_RECOVER_INTERVAL` | длительность | `30s` |
 | `trim_interval` | `CRAWLER_REDIS_TRIM_INTERVAL` | длительность | `1m` |
+| `consumer_idle` | `CRAWLER_REDIS_CONSUMER_IDLE` | длительность | `2h` |
 
 `maxlen` — явный предел длины всех стримов при публикации (`XADD MAXLEN ~`,
 усечение приблизительное, без точного подсчёта). `0` — пределы по стримам из
@@ -152,6 +153,28 @@ PostgreSQL, ТЗ 3.4). Между проходами копится не бол�
 подтверждённых записей (единицы МиБ при текущих темпах этапов),
 стоимость прохода — три команды Redis на стрим; диапазон 1s..24h.
 Подробности и арифметика бюджета — [`redis.md`](redis.md) §3.
+
+`consumer_idle` — порог неактивности консьюмера группы для чистки
+(T-155): каждое чтение `XREADGROUP` закрепляет записи за консьюмером
+(имя — процесс воркера с pid), и после рестартов (деплои, падения,
+OOM) консьюмеры остаются в группах навсегда — 4 деплоя волны 21 оставили
+11 мёртвых в `q:render` и 13 в `q:http` ([`operations.md`](operations.md)
+§5). Цикл планировщика (`queue.CleanupConsumersLoop`, период — тот же
+`trim_interval`: проход дёшев, отдельный темп не операционный) удаляет
+`XGROUP DELCONSUMER` **строго пустых** (pending = 0) и неактивных
+дольше порога. Консьюмеры с pending ≠ 0 не трогаются никогда:
+`DELCONSUMER` удаляет консьюмера вместе с его PEL-записями —
+недоставка навсегда (штучные задачи `q:http`/`q:render`/`q:analyze`
+не восстанавливаются lease, только клеймом `XAUTOCLAIM` из PEL);
+висящий pending мёртвого консьюмера клейму не мешает и разбирается
+`recover_batch`/`recover_interval`. Перед удалением пустота PEL
+перепроверяется `XPENDING` (гонка «затаившийся воркер получил доставку
+между `XINFO CONSUMERS` и `DELCONSUMER`»); унесённый всё же PEL
+детектируется ответом `DELCONSUMER` и логируется Warn. Порог 2 ч —
+с запасом поверх затишья между доставками активного этапа (секунды);
+живой консьюмер пустого стрима может простаивать дольше (`XREADGROUP`
+без записей idle не обновляет), но его удаление безвредно — имя
+пересоздаётся первым чтением с записями. Диапазон 1m..30d.
 
 Конфигурация самого Redis (dev/бой: `maxmemory`, `noeviction`, отказ от
 персистентности) — [`redis.md`](redis.md).
@@ -733,7 +756,8 @@ dashboard-secret` (пароль — аргумент или stdin; справк�
   ≤100 байт (вариант деплоя за nginx, T-124);
   `redis.maxlen` — 0 или 1000..100000000, `redis.max_attempts` 1..100,
   `redis.claim_min_idle` положительна, `redis.recover_batch` 1..1000,
-  `redis.recover_interval` 1s..1h, `redis.trim_interval` 1s..24h;
+  `redis.recover_interval` 1s..1h, `redis.trim_interval` 1s..24h,
+  `redis.consumer_idle` 1m..30d;
 - все таймауты/интервалы положительны; `ingest.batch_size` 1..1000000,
   `ingest.stable_seconds` 1..3600, `ingest.scan_interval` 10ms..1h,
   `scheduler.batch_size` 1000..10000 (ТЗ 5.3), `queue_high_watermark` ≥ 1,

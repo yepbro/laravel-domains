@@ -54,6 +54,7 @@ func TestDefault(t *testing.T) {
 		{"redis.recover_batch", c.Redis.RecoverBatch, 64},
 		{"redis.recover_interval", c.Redis.RecoverInterval.D(), 30 * time.Second},
 		{"redis.trim_interval", c.Redis.TrimInterval.D(), time.Minute},
+		{"redis.consumer_idle", c.Redis.ConsumerIdle.D(), 2 * time.Hour},
 		{"ingest.dir", c.Ingest.Dir, "/data/incoming"},
 		{"ingest.batch_size", c.Ingest.BatchSize, 50000},
 		{"ingest.stable_seconds", c.Ingest.StableSeconds, 10},
@@ -149,6 +150,7 @@ redis:
   recover_batch: 128
   recover_interval: "20s"
   trim_interval: "3m"
+  consumer_idle: "90m"
 ingest:
   dir: "/srv/incoming"
   batch_size: 10000
@@ -242,6 +244,7 @@ log:
 		{"redis.recover_batch", cfg.Redis.RecoverBatch, 128},
 		{"redis.recover_interval", cfg.Redis.RecoverInterval.D(), 20 * time.Second},
 		{"redis.trim_interval", cfg.Redis.TrimInterval.D(), 3 * time.Minute},
+		{"redis.consumer_idle", cfg.Redis.ConsumerIdle.D(), 90 * time.Minute},
 		{"ingest.dir", cfg.Ingest.Dir, "/srv/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 10000},
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 30},
@@ -411,6 +414,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_REDIS_RECOVER_BATCH":              "96",
 		"CRAWLER_REDIS_RECOVER_INTERVAL":           "15s",
 		"CRAWLER_REDIS_TRIM_INTERVAL":              "45s",
+		"CRAWLER_REDIS_CONSUMER_IDLE":              "40m",
 		"CRAWLER_INGEST_DIR":                       "/env/incoming",
 		"CRAWLER_INGEST_BATCH_SIZE":                "1234",
 		"CRAWLER_INGEST_STABLE_SECONDS":            "25",
@@ -489,6 +493,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"redis.recover_batch", cfg.Redis.RecoverBatch, 96},
 		{"redis.recover_interval", cfg.Redis.RecoverInterval.D(), 15 * time.Second},
 		{"redis.trim_interval", cfg.Redis.TrimInterval.D(), 45 * time.Second},
+		{"redis.consumer_idle", cfg.Redis.ConsumerIdle.D(), 40 * time.Minute},
 		{"ingest.dir", cfg.Ingest.Dir, "/env/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 1234},
 		{"ingest.stable_seconds", cfg.Ingest.StableSeconds, 25},
@@ -774,6 +779,9 @@ func TestValidate(t *testing.T) {
 		{"trim_interval 0", func(c *Config) { c.Redis.TrimInterval = 0 }, "redis.trim_interval"},
 		{"trim_interval меньше секунды", func(c *Config) { c.Redis.TrimInterval = Duration(10 * time.Millisecond) }, "redis.trim_interval"},
 		{"trim_interval больше суток", func(c *Config) { c.Redis.TrimInterval = Duration(25 * time.Hour) }, "redis.trim_interval"},
+		{"consumer_idle 0", func(c *Config) { c.Redis.ConsumerIdle = 0 }, "redis.consumer_idle"},
+		{"consumer_idle меньше минуты", func(c *Config) { c.Redis.ConsumerIdle = Duration(10 * time.Second) }, "redis.consumer_idle"},
+		{"consumer_idle больше 30 дней", func(c *Config) { c.Redis.ConsumerIdle = Duration(721 * time.Hour) }, "redis.consumer_idle"},
 		{"ingest.dir пуст", func(c *Config) { c.Ingest.Dir = "" }, "ingest.dir"},
 		{"batch_size 0", func(c *Config) { c.Ingest.BatchSize = 0 }, "ingest.batch_size"},
 		{"stable_seconds 0", func(c *Config) { c.Ingest.StableSeconds = 0 }, "ingest.stable_seconds"},

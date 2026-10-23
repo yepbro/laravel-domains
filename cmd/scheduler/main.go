@@ -61,12 +61,17 @@ func main() {
 // и фоновые циклы перепроверок (T-030/T-031) горутинами в том же OnRun —
 // они возвращают домены в pending, главный цикл подберёт их следующей
 // пачкой; рядом — коллектор глубины backlog (T-077, ТЗ 5.9): gauge
-// pending/queued из БД, живёт у владельца состояний domains, — и цикл
+// pending/queued из БД, живёт у владельца состояний domains, — цикл
 // освобождения подтверждённого префикса стримов (queue.TrimLoop, T-141:
 // XACK не удаляет записи из стримов, XTRIM MINID по старейшей
 // неподтверждённой записи группы не даёт истории копиться до потолка
 // MAXLEN и бюджета Redis, ТЗ 3.2; scheduler — одиночный хозяин стримов
-// очередей, цикл дёшев: три команды на стрим раз в redis.trim_interval).
+// очередей, цикл дёшев: три команды на стрим раз в redis.trim_interval)
+// и цикл гигиены консьюмеров групп (queue.CleanupConsumersLoop, T-155:
+// после рестартов воркеров их pid-консьюмеры остаются в группах
+// навсегда; строго пустые (pending = 0) и неактивные дольше
+// redis.consumer_idle удаляются XGROUP DELCONSUMER — те же дворники
+// стримов тем же темпом trim_interval).
 // Завершение — отмена ctx (graceful shutdown, ТЗ 3.4): цикл дорабатывает
 // текущую пачку, фоновые — текущий проход, все возвращают nil.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
@@ -105,7 +110,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			"zones", strings.Join(unknownZones, ", "))
 	}
 
-	bg := make(chan error, 5)
+	bg := make(chan error, 6)
 	go func() {
 		bg <- scheduler.RecheckDaily(ctx, pool, scheduler.RecheckOptions{
 			Interval: cfg.Scheduler.RecheckInterval.D(),
@@ -138,6 +143,18 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			Log:      logger,
 		})
 	}()
+	// Гигиена консьюмеров групп (T-155): строго пустые (pending = 0 —
+	// DELCONSUMER с pending теряет PEL навсегда) и неактивные дольше
+	// redis.consumer_idle pid-консьюмеры мёртвых после рестартов воркеров
+	// вычищаются тем же темпом дворников, что и освобождение префикса
+	// (redis.trim_interval).
+	go func() {
+		bg <- queue.CleanupConsumersLoop(ctx, rdb, queue.ConsumerOptions{
+			Interval: cfg.Redis.TrimInterval.D(),
+			Idle:     cfg.Redis.ConsumerIdle.D(),
+			Log:      logger,
+		})
+	}()
 
 	// Главный цикл живёт до отмены ctx; после него фоновые циклы уже
 	// завершаются по той же отмене — забираем их результаты.
@@ -146,6 +163,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		ZoneWeights: zoneWeights,
 		Log:         logger,
 	})
+	<-bg
 	<-bg
 	<-bg
 	<-bg
