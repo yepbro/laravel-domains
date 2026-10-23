@@ -50,6 +50,10 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 MemoryMax=128M
+# CPU-приоритет (T-158): обвязка — read-only читатель БД/Redis
+# (агрегаты считает SQL-движок); при CPU-голоде (§12) конвейер важнее,
+# вес 50 против 1000 у критического пути.
+CPUWeight=50
 LimitNOFILE=65535
 UMask=0007
 # --- Изоляция (ТЗ §9/§10.1) ---

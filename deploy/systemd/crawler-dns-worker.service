@@ -25,6 +25,12 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 MemoryMax=256M
+# CPU-приоритет (T-158): критический путь конвейера — питает q:http
+# (в замере §12 при PSI some 91–95% проверка получала ~90% одного ядра
+# против postgres 177% + chromium 140% + analyzer 66%). Вес 1000 как у
+# http-worker: DNS-этап не должен отставать от HTTP, иначе конвейер
+# душится сверху (backpressure q:http, load-measurements §3).
+CPUWeight=1000
 # 2000 сокетов пула UDP + TTL-кэш резолвера: nofile как в dev-окружении
 # (deploy/docker/compose.yaml), sysctl-потолки — T-088.
 LimitNOFILE=65535

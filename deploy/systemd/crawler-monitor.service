@@ -32,6 +32,11 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 MemoryMax=128M
+# CPU-приоритет (T-158): обвязка — агрегаты мониторинга по 47 млн строк
+# (BacklogLoop GROUP BY каждые 30 с + ZoneStats, §12) не должны
+# отнимать CPU у конвейера (PSI some 91–95%). Вес 50 против 1000 у
+# критического пути; замедление сводки при голоде — размен штатный.
+CPUWeight=50
 LimitNOFILE=65535
 UMask=0007
 # --- Изоляция (ТЗ §9/§10.1) ---

@@ -54,6 +54,13 @@ TimeoutStopSec=30s
 # алерт unit_oom (internal/monitor/unitevents.go, T-145).
 MemoryHigh=850M
 MemoryMax=900M
+# CPU-приоритет (T-158): критический путь конвейера. Замер §12: PSI CPU
+# some 91–95%, load 25/4 vCPU — postgres (177%), chromium (140%) и
+# analyzer (66%) отбирали CPU у проверки: http-worker получал ~90%
+# одного ядра. Вес 1000 против дефолта 100 отдаёт спорный CPU узкому
+# месту конвейера (HTTP-этап — load-measurements §3); вес — не потолок,
+# действует только при конкуренции.
+CPUWeight=1000
 # http.concurrency 2000 — по соединению на проверку; nofile как в
 # dev-окружении, sysctl (ip_local_port_range, conntrack) — T-088.
 LimitNOFILE=65535

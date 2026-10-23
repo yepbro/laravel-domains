@@ -132,6 +132,66 @@ Chromium отдельным юнитом, а не процессом ворке�
 чужого процесса — потолок и перезапуск держит юнит (аналогия mem_limit
 dev-сервиса chromium, docs/docker.md §6).
 
+### 2.1. CPU-приоритеты: CPUWeight/CPUQuota (T-158)
+
+Сервер один (4 vCPU, ТЗ 3.1), расширение недоступно (замер §12), поэтому
+CPU перераспределяется между юнитами относительными весами `CPUWeight`
+(cgroup v2, диапазон 1–10000, дефолт 100). Вес — не потолок: он действует
+только при конкуренции за CPU, применяется на лету и не требует рестарта
+юнита. Повод — контрольный замер 2026-10-23
+([`load-measurements.md`](load-measurements.md) §12): PSI CPU some
+91–95%, load 25/4 vCPU; CPU в стационаре распределялся не в пользу
+проверки — postgres 177%, chromium 140%, analyzer 66% против ~90% одного
+ядра у http-worker (агрегаты мониторинга, рендер-яд и фоновый анализ
+отбирали CPU у конвейера). ТЗ: §3.2, §10.
+
+| Юнит | CPUWeight | CPUQuota | Обоснование |
+|---|---|---|---|
+| `crawler-http-worker.service` | **1000** | — | критический путь: HTTP-этап — узкое место конвейера (load-measurements §3) |
+| `crawler-dns-worker.service` | **1000** | — | критический путь: питает q:http, не должен отставать от HTTP (backpressure) |
+| `crawler-render-worker.service` | **300** | — | этап конвейера, не узкое место; тяжёлый CPU рендера — в chromium (см. ниже) |
+| `crawler-analyzer.service` | **200** | **150%** | фоновый анализ не отбирает CPU у проверки: квота не режет текущие 66% (§12), ограничивает всплески фоновых проходов |
+| `crawler-monitor.service` | **50** | — | обвязка: агрегаты по 47 млн строк (BacklogLoop/ZoneStats, §12) — не конкурент конвейеру |
+| `crawler-web.service` | **50** | — | обвязка: лендинг, живые проверки формы — разовые эпизоды |
+| `crawler-dashboard.service` | **50** | — | обвязка: read-only читатель БД/Redis (агрегаты — SQL-движок) |
+| `crawler-ingest.service`, `crawler-scheduler.service` | 100 (дефолт) | — | CPU-лёгкие постановщики: в замере §12 их CPU незначим |
+| `crawler-chromium.service` | 100 (дефолт) | — | приоритет связки рендера задаёт render-worker (300); дефолт 100 при весах 1000 у http/dns уже десятикратно понижает относительный приоритет браузера (140% CPU, §12) |
+
+Инфраструктура (postgresql/redis/unbound) не приоритизирована: их CPU
+обслуживает сам конвейер (запись результатов, очереди, резолвы) —
+понижение веса душило бы этапы; веса конвейера 1000 при их дефолте 100
+решают конкуренцию в пользу проверки без правок чужих юнитов.
+
+Применение на живом сервере — **до деплоя** (значения те же, что в
+юнитах; действуют сразу, персистентный drop-in в
+`/etc/systemd/system.control/`):
+
+```bash
+systemctl set-property crawler-http-worker.service CPUWeight=1000
+systemctl set-property crawler-dns-worker.service CPUWeight=1000
+systemctl set-property crawler-render-worker.service CPUWeight=300
+systemctl set-property crawler-analyzer.service CPUWeight=200 CPUQuota=150%
+systemctl set-property crawler-monitor.service CPUWeight=50
+systemctl set-property crawler-web.service CPUWeight=50
+systemctl set-property crawler-dashboard.service CPUWeight=50
+```
+
+После деплоя (юниты несут те же значения): синхронизировать файлы юнитов
+по §5 («Обновление версий», п. 1) и снять персистентные drop-in'ы по
+образцу T-143 (load-measurements.md §3): `systemctl revert <юнит>` +
+`daemon-reload` + `restart` — иначе drop-in продолжает перекрывать
+юнит-файл; единственный источник — юнит-файл. Проверка:
+
+```bash
+systemctl show crawler-http-worker -p CPUWeight        # 1000
+systemctl show crawler-analyzer -p CPUQuotaPerSecUSec  # 1s 500ms (= 150%)
+```
+
+Критерий приёмки (замер комплектом T-092 до/после —
+load-measurements.md §10): PSI CPU some в стационаре < 80%, NRestarts
+юнитов 0, скорость HTTP не падает при фоновых проходах анализатора и
+пересчётах зон.
+
 ## 3. Пользователи: статические, по одному на сервис
 
 ТЗ §10.1 требует отдельных пользователей на сервис. Решение — **статические
@@ -466,8 +526,9 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
   1. до/сразу после деплоя синхронизировать изменённые юниты:
      `cp deploy/systemd/<юнит> /etc/systemd/system/ && systemctl
      daemon-reload && systemctl restart <юнит>` (пример: MemoryMax=900M,
-     T-143; MemoryHigh=850M, T-145); временные `systemctl set-property`
-     drop-in'и (`/etc/systemd/system.control/`) удалить, чтобы юнит-файл
+     T-143; MemoryHigh=850M, T-145; CPUWeight/CPUQuota, T-158 — §2.1);
+     временные `systemctl set-property` drop-in'и
+     (`/etc/systemd/system.control/`) удалить, чтобы юнит-файл
      был единственным источником;
   2. сверить `/etc/crawler/config.yaml` с новыми дефолтами: **явные
      значения в конфиге перебивают дефолты кода** (инцидент 22–23.10.2026:
