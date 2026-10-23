@@ -90,6 +90,7 @@ func TestDefault(t *testing.T) {
 		{"render.remote_url", c.Render.RemoteURL, ""},
 		{"render.contexts", c.Render.Contexts, 4},
 		{"render.timeout", c.Render.Timeout.D(), 25 * time.Second},
+		{"render.timeout_attempts", c.Render.TimeoutAttempts, 2},
 		{"render.restart_every_pages", c.Render.RestartEveryPages, 500},
 		{"render.restart_memory_bytes", c.Render.RestartMemoryBytes.B(), int64(1536 << 20)},
 		{"content.dir", c.Content.Dir, "/data/content"},
@@ -191,6 +192,7 @@ render:
   remote_url: "ws://10.0.0.9:9222"
   contexts: 4
   timeout: "40s"
+  timeout_attempts: 3
   restart_every_pages: 200
   restart_memory_bytes: "1GiB"
 content:
@@ -272,6 +274,7 @@ log:
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 4},
 		{"render.timeout", cfg.Render.Timeout.D(), 40 * time.Second},
+		{"render.timeout_attempts", cfg.Render.TimeoutAttempts, 3},
 		{"render.restart_every_pages", cfg.Render.RestartEveryPages, 200},
 		{"render.restart_memory_bytes", cfg.Render.RestartMemoryBytes.B(), int64(1 << 30)},
 		{"content.dir", cfg.Content.Dir, "/srv/content"},
@@ -439,6 +442,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_RENDER_REMOTE_URL":                "ws://10.0.0.9:9222",
 		"CRAWLER_RENDER_CONTEXTS":                  "2",
 		"CRAWLER_RENDER_TIMEOUT":                   "11s",
+		"CRAWLER_RENDER_TIMEOUT_ATTEMPTS":          "5",
 		"CRAWLER_RENDER_RESTART_EVERY_PAGES":       "99",
 		"CRAWLER_RENDER_RESTART_MEMORY_BYTES":      "768MiB",
 		"CRAWLER_CONTENT_DIR":                      "/env/content",
@@ -513,6 +517,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 2},
 		{"render.timeout", cfg.Render.Timeout.D(), 11 * time.Second},
+		{"render.timeout_attempts", cfg.Render.TimeoutAttempts, 5},
 		{"render.restart_every_pages", cfg.Render.RestartEveryPages, 99},
 		{"render.restart_memory_bytes", cfg.Render.RestartMemoryBytes.B(), int64(768 << 20)},
 		{"content.dir", cfg.Content.Dir, "/env/content"},
@@ -811,6 +816,9 @@ func TestValidate(t *testing.T) {
 		{"remote_url кривой", func(c *Config) { c.Render.RemoteURL = "not-url" }, "render.remote_url"},
 		{"contexts 0", func(c *Config) { c.Render.Contexts = 0 }, "render.contexts"},
 		{"render.timeout 0", func(c *Config) { c.Render.Timeout = 0 }, "render.timeout"},
+		{"timeout_attempts 0", func(c *Config) { c.Render.TimeoutAttempts = 0 }, "render.timeout_attempts"},
+		{"timeout_attempts велик", func(c *Config) { c.Render.TimeoutAttempts = 101 }, "render.timeout_attempts"},
+		{"timeout_attempts выше max_attempts", func(c *Config) { c.Render.TimeoutAttempts = c.Redis.MaxAttempts + 1 }, "render.timeout_attempts"},
 		{"restart_every_pages 0", func(c *Config) { c.Render.RestartEveryPages = 0 }, "render.restart_every_pages"},
 		{"restart_memory_bytes мал", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(1 << 20) }, "render.restart_memory_bytes"},
 		{"restart_memory_bytes велик", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(17 << 30) }, "render.restart_memory_bytes"},

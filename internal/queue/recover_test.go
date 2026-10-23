@@ -406,3 +406,117 @@ func TestRecoverOptionsDefaults(t *testing.T) {
 		t.Errorf("Interval = %s, хочу 1нс (положительный интервал валиден)", o.Interval)
 	}
 }
+
+// --- обработчик с номером попытки доставки (T-148) ---------------------------
+
+// TestProcessingAttempt — паттерн Processing для обработчика с номером
+// попытки: число доставляется как есть, успешная обработка → XACK, ошибка
+// → без XACK (повторная доставка), nil-обработчик — ошибка.
+func TestProcessingAttempt(t *testing.T) {
+	fake := &fakeClaimRedis{}
+	r := newTestReliab(fake, ReliabOptions{})
+	d := Delivery{Stream: StreamRender, ID: "1-1", Payload: []byte(`{"task_id":"t1"}`)}
+
+	var got int
+	err := r.ProcessAttempt(context.Background(), "render-worker", d, 3,
+		func(_ context.Context, _ Delivery, attempts int) error {
+			got = attempts
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("ProcessAttempt: %v", err)
+	}
+	if got != 3 {
+		t.Errorf("обработчик видел attempts=%d, хочу 3 (счётчик доставок PEL)", got)
+	}
+	if want := []ackCall{{StreamRender, "render-worker", []string{"1-1"}}}; !sameAcks(fake.acks, want) {
+		t.Errorf("XACK после успешной обработки: %+v, хочу %+v", fake.acks, want)
+	}
+
+	// Ошибка обработки — без XACK, номер попытки не теряется в сообщении.
+	fake2 := &fakeClaimRedis{}
+	r2 := newTestReliab(fake2, ReliabOptions{})
+	err = r2.ProcessAttempt(context.Background(), "render-worker", d, 2,
+		func(context.Context, Delivery, int) error { return errors.New("таймаут") })
+	if err == nil || !strings.Contains(err.Error(), "таймаут") {
+		t.Fatalf("ошибка обработки: %v", err)
+	}
+	if len(fake2.acks) != 0 {
+		t.Errorf("XACK при ошибке: %+v", fake2.acks)
+	}
+
+	// nil-обработчик — ошибка до Redis.
+	if err := ProcessingAttempt(context.Background(), NewRedisQueue(&fakeClaimRedis{}, RedisOptions{}), "g", d, 1, nil); err == nil {
+		t.Error("nil обработчик: ожидалась ошибка")
+	}
+}
+
+// TestRecoverLoopAttempt — RecoverLoopAttempt передаёт обработчику
+// Claimed.Attempts (счётчик доставок PEL записи): обработчик видит,
+// какая это по счёту доставка, без собственного состояния.
+func TestRecoverLoopAttempt(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 2}},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type rec struct {
+		id       string
+		attempts int
+	}
+	got := make(chan rec, 1)
+	done := make(chan error, 1)
+	r := newTestReliab(fake, ReliabOptions{MinIdle: time.Minute})
+	go func() {
+		done <- RecoverLoopAttempt(ctx, r, func(_ context.Context, d Delivery, attempts int) error {
+			got <- rec{d.ID, attempts}
+			return nil
+		}, RecoverOptions{Stream: StreamRender, Group: "render-worker", Consumer: "c", Batch: 4, Interval: time.Hour})
+	}()
+
+	select {
+	case g := <-got:
+		if g.id != "1718-0" || g.attempts != 2 {
+			t.Errorf("обработчик видел (%s, попытка %d), хочу (1718-0, 2)", g.id, g.attempts)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("обработка клеймнутой доставки не началась")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RecoverLoopAttempt после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RecoverLoopAttempt не остановился по отмене ctx")
+	}
+	if want := []ackCall{{StreamRender, "render-worker", []string{"1718-0"}}}; !sameAcks(fake.acks, want) {
+		t.Errorf("XACK после обработки: %+v, хочу %+v", fake.acks, want)
+	}
+}
+
+// TestRecoverLoopAttemptValidation — nil обработчика RecoverLoopAttempt
+// отклоняет до старта; RecoverLoop (адаптер) — по-прежнему тоже.
+func TestRecoverLoopAttemptValidation(t *testing.T) {
+	fake := &fakeClaimRedis{}
+	r := newTestReliab(fake, ReliabOptions{})
+	if err := RecoverLoopAttempt(context.Background(), r, nil, RecoverOptions{
+		Stream: StreamRender, Group: "g", Consumer: "c",
+	}); err == nil || !contains(err, "обработчик") {
+		t.Errorf("nil обработчик RecoverLoopAttempt: %v", err)
+	}
+	if err := RecoverLoop(context.Background(), r, nil, RecoverOptions{
+		Stream: StreamRender, Group: "g", Consumer: "c",
+	}); err == nil || !contains(err, "обработчик") {
+		t.Errorf("nil обработчик RecoverLoop: %v", err)
+	}
+	if len(fake.claims) != 0 {
+		t.Errorf("Redis вызван с плохими аргументами: %+v", fake.claims)
+	}
+}

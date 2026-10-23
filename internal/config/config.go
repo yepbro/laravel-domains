@@ -263,6 +263,7 @@ type Render struct {
 	RemoteURL         string   `yaml:"remote_url"`
 	Contexts          int      `yaml:"contexts"`
 	Timeout           Duration `yaml:"timeout"`
+	TimeoutAttempts   int      `yaml:"timeout_attempts"`
 	RestartEveryPages int      `yaml:"restart_every_pages"`
 	// RestartMemoryBytes — порог перезапуска браузера по памяти (ТЗ 5.6
 	// «при превышении порога памяти»): суммарный RSS процессов Chromium
@@ -482,8 +483,18 @@ func Default() *Config {
 			// MemoryMax 128M (T-092 §6: max 128 MiB у потолка)
 			// контроль — повторный замер после деплоя, рядом с RSS
 			// Chromium.
-			Contexts:          4,
-			Timeout:           Duration(25 * time.Second),
+			Contexts: 4,
+			Timeout:  Duration(25 * time.Second),
+			// Тарпит-бюджет (T-148): 2 доставки из 3 (redis.max_attempts)
+			// могут завершиться таймаутом страницы, тарпит на следующей —
+			// запись финализируется без рендера: работа не теряется в
+			// q:dead, слоты не заняты сутками. Первая попытка может
+			// таймаутнуться от затора (замер 2026-10-23: 0.34 стр/с, слоты
+			// в таймаутах) — повтор через redis.claim_min_idle даёт
+			// странице шанс в изменившихся условиях, дальше повтор
+			// предсказуем. Инцидент 2026-10-23: 5507 dead-записей q:render
+			// «исчерпан лимит попыток 3» за часы — все таймауты.
+			TimeoutAttempts:   2,
 			RestartEveryPages: 500,
 			// 1,5 ГиБ = 75 % бюджета Chromium ≈ 2 ГБ (ТЗ 3.2, cgroup
 			// MemoryMax ≈ 2 ГБ): перезапуск — до cgroup-OOM; запас — на
@@ -821,6 +832,20 @@ func (c *Config) Validate() error {
 	}
 	if c.Render.Timeout <= 0 {
 		problems = append(problems, nonPositiveDur("render.timeout", c.Render.Timeout))
+	}
+	// Тарпит-лимит (T-148): минимум 1 — ноль означал бы финализацию до
+	// первой попытки; потолок — от опечаток. Выше redis.max_attempts
+	// бессмыслен: запись умирала бы в q:dead по общему лимиту до
+	// финализации без рендера (footgun инцидента 2026-10-23 — задача
+	// как раз про непотерянные тарпиты), поэтому превышение — ошибка
+	// конфигурации, а не молчаливый откат к старому поведению.
+	if !inRange(c.Render.TimeoutAttempts, 1, 100) {
+		problems = append(problems, rangeMsg("render.timeout_attempts", c.Render.TimeoutAttempts, 1, 100))
+	}
+	if c.Render.TimeoutAttempts > c.Redis.MaxAttempts {
+		problems = append(problems, fmt.Sprintf(
+			"render.timeout_attempts: %d > redis.max_attempts %d — тарпит ушёл бы в q:dead до финализации без рендера (T-148); поднимите redis.max_attempts или снизьте render.timeout_attempts",
+			c.Render.TimeoutAttempts, c.Redis.MaxAttempts))
 	}
 	if !inRange(c.Render.RestartEveryPages, 1, 1000000) {
 		problems = append(problems, rangeMsg("render.restart_every_pages", c.Render.RestartEveryPages, 1, 1000000))

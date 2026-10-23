@@ -145,7 +145,24 @@ func Processing(ctx context.Context, q Queue, group string, d Delivery, process 
 	if process == nil {
 		return fmt.Errorf("queue: Processing записи %s стрима %s: не задан обработчик", d.ID, d.Stream)
 	}
-	if err := process(ctx, d); err != nil {
+	return ProcessingAttempt(ctx, q, group, d, 1, func(c context.Context, del Delivery, _ int) error {
+		return process(c, del)
+	})
+}
+
+// ProcessingAttempt — паттерн Processing для обработчика, которому нужен
+// номер попытки доставки (T-148): попытка — счётчик доставок записи в PEL
+// группы (первое чтение XREADGROUP = 1, каждый клейм XAUTOCLAIM +1,
+// Claimed.Attempts). Семантика подтверждения та же, что у Processing:
+// Ack только после безошибочного возврата process, ошибка — без XACK
+// (повторная доставка); классификация ошибок по счётчику — дело
+// обработчика (политика таймаутов рендера, T-148), обёртка только
+// доставляет число. Обработчик nil — ошибка (стиль Processing).
+func ProcessingAttempt(ctx context.Context, q Queue, group string, d Delivery, attempts int, process func(context.Context, Delivery, int) error) error {
+	if process == nil {
+		return fmt.Errorf("queue: Processing записи %s стрима %s: не задан обработчик", d.ID, d.Stream)
+	}
+	if err := process(ctx, d, attempts); err != nil {
 		return fmt.Errorf("queue: запись %s стрима %s не подтверждена (без XACK, вернётся повторной доставкой): %w", d.ID, d.Stream, err)
 	}
 	return q.Ack(ctx, d.Stream, group, d.ID)
@@ -342,6 +359,13 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 // повтор безопасным.
 func (r *Reliab) Process(ctx context.Context, group string, d Delivery, process func(context.Context, Delivery) error) error {
 	return Processing(ctx, r.q, group, d, process)
+}
+
+// ProcessAttempt — Process для обработчика с номером попытки доставки
+// (T-148): RecoverLoopAttempt передаёт Claimed.Attempts, обработчик
+// воркера решает по счётчику политику ошибок (таймаут-тарпиты рендера).
+func (r *Reliab) ProcessAttempt(ctx context.Context, group string, d Delivery, attempts int, process func(context.Context, Delivery, int) error) error {
+	return ProcessingAttempt(ctx, r.q, group, d, attempts, process)
 }
 
 // bury переводит запись, исчерпавшую лимит попыток, в q:dead и

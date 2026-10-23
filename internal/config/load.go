@@ -145,6 +145,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_RENDER_REMOTE_URL", setString(func(c *Config) *string { return &c.Render.RemoteURL })},
 		{"CRAWLER_RENDER_CONTEXTS", setInt(func(c *Config) *int { return &c.Render.Contexts })},
 		{"CRAWLER_RENDER_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Render.Timeout })},
+		{"CRAWLER_RENDER_TIMEOUT_ATTEMPTS", setInt(func(c *Config) *int { return &c.Render.TimeoutAttempts })},
 		{"CRAWLER_RENDER_RESTART_EVERY_PAGES", setInt(func(c *Config) *int { return &c.Render.RestartEveryPages })},
 		{"CRAWLER_RENDER_RESTART_MEMORY_BYTES", setSize(func(c *Config) *ByteSize { return &c.Render.RestartMemoryBytes })},
 		{"CRAWLER_CONTENT_DIR", setString(func(c *Config) *string { return &c.Content.Dir })},

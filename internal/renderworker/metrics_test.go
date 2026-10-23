@@ -118,7 +118,7 @@ func TestMetricsProcessDelivery(t *testing.T) {
 		raw := rwTestHash(1)
 		pool.seedRow(rwKey, "https://spa.example/", &raw)
 
-		if err := w.processDelivery(context.Background(), rwDelivery("e1")); err != nil {
+		if err := w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
 			t.Fatalf("processDelivery: %v", err)
 		}
 		stage := map[string]string{"stage": metrics.StageRender}
@@ -145,7 +145,7 @@ func TestMetricsProcessDelivery(t *testing.T) {
 		}
 		pool.seedRow(rwKey, "https://spa.example/", nil)
 
-		if err := w.processDelivery(context.Background(), rwDelivery("e2")); err == nil {
+		if err := w.processDelivery(context.Background(), rwDelivery("e2"), 1); err == nil {
 			t.Fatal("processDelivery ошибочного рендера = nil, want ошибка")
 		}
 		stage := map[string]string{"stage": metrics.StageRender}

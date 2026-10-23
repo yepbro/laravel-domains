@@ -1395,6 +1395,10 @@ func TestRenderWorker_OptionsDefaults(t *testing.T) {
 		t.Errorf("render.contexts=%d расходится с DefaultConcurrency=%d (боевая сборка берёт max)",
 			cfg.Render.Contexts, DefaultConcurrency)
 	}
+	if cfg.Render.TimeoutAttempts != DefaultTimeoutAttempts {
+		t.Errorf("render.timeout_attempts=%d расходится с DefaultTimeoutAttempts=%d (боевая сборка передаёт поле воркеру)",
+			cfg.Render.TimeoutAttempts, DefaultTimeoutAttempts)
+	}
 }
 
 // --- скользящее потребление цикла (T-142) ------------------------------------

@@ -80,6 +80,22 @@ func (o RecoverOptions) withDefaults() RecoverOptions {
 // возвращает nil — graceful shutdown (ТЗ 3.4): начатая обработка
 // дорабатывает или остаётся неподтверждённой.
 func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, Delivery) error, opt RecoverOptions) error {
+	if process == nil {
+		return errors.New("queue: цикл возврата зависших: обработчик не задан")
+	}
+	return RecoverLoopAttempt(ctx, r, func(c context.Context, d Delivery, _ int) error {
+		return process(c, d)
+	}, opt)
+}
+
+// RecoverLoopAttempt — RecoverLoop для обработчика с номером попытки
+// доставки (T-148): каждой клеймнутой записи передаётся Claimed.Attempts
+// (счётчик доставок PEL: первое чтение группы + каждый клейм; свежей
+// доставке соответствовал бы 1). Обработчик видит, какая это по счёту
+// доставка, и применяет раздельную политику ошибок (таймаут-тарпит против
+// повторимой, T-148), не храня состояние между доставками: счётчик живёт
+// в Redis и переживает рестарты воркеров.
+func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Context, Delivery, int) error, opt RecoverOptions) error {
 	if r == nil {
 		return errors.New("queue: цикл возврата зависших: слой надёжности не задан (NewReliab)")
 	}
@@ -117,7 +133,7 @@ func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, D
 			if ctx.Err() != nil {
 				return len(claimed)
 			}
-			if err := r.Process(ctx, o.Group, c.Delivery, process); err != nil && ctx.Err() == nil {
+			if err := r.ProcessAttempt(ctx, o.Group, c.Delivery, c.Attempts, process); err != nil && ctx.Err() == nil {
 				log.Warn("зависшая доставка не подтверждена — вернётся клеймом",
 					"entry", c.ID, "attempts", c.Attempts, "err", err)
 			}

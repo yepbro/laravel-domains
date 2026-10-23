@@ -170,6 +170,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// render.contexts > 4 не ускорял бы этап (параллелизм цикла
 		// остался бы 4, лишние слоты пула простаивали; ревью T-142).
 		Concurrency: max(renderworker.DefaultConcurrency, cfg.Render.Contexts),
+		// Тарпит-бюджет (T-148): таймауты страницы не жгут общий лимит
+		// доставок — после render.timeout_attempts таймаутов запись
+		// финализируется без рендера (сырой HTML + q:analyze), не q:dead.
+		TimeoutAttempts: cfg.Render.TimeoutAttempts,
 	}
 	w, err := renderworker.New(pool, q, store, manager, opts)
 	if err != nil {

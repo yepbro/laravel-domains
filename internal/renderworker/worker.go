@@ -34,6 +34,15 @@
 // асинхронное дополнение). Потребление q:render — скользящее (T-142,
 // образец T-139): чтение при освобождении слота доставки, без барьера
 // окна пачки.
+//
+// Политика таймаутов (T-148): таймаут страницы (render.timeout) —
+// предсказуемый тарпит, а не случайная ошибка. Пока номер доставки
+// (счётчик PEL, ProcessingAttempt/RecoverLoopAttempt) не достиг
+// Options.TimeoutAttempts (render.timeout_attempts), тарпит живёт общим
+// путём повторных доставок; на исчерпании запись финализируется без
+// рендера: итог — сырой HTML HTTP-фазы (rendered = false), публикация
+// q:analyze, XACK — работа не выпадает в q:dead, q:dead остаётся
+// инфраструктурным ошибкам (БД, браузер, публикация; runbooks §2).
 package renderworker
 
 import (
@@ -141,6 +150,18 @@ const (
 	// предохранителя паузы (renderFailWaitBase ниже).
 	DefaultConsume = 16
 
+	// DefaultTimeoutAttempts — попыток доставки, которые задача q:render
+	// может завершить таймаутом страницы (render.timeout), прежде чем
+	// запись финализируется без рендера (T-148): таймаут — предсказуемое
+	// свойство тяжёлой страницы, а не случайная ошибка, жечь на нём общий
+	// лимит redis.max_attempts (3 доставки → q:dead) — терять работу.
+	// Вторая попытка после claim_min_idle (10 мин) даёт странице шанс
+	// в изменившихся условиях (первая может таймаутнуться от затора —
+	// замер 2026-10-23: слоты заняты таймаутами, 0.34 стр/с), дальше
+	// повтор предсказуем. 2 из 3 доставок — тарпит-бюджет меньше общего,
+	// q:dead остаётся инфраструктурным ошибкам (БД, браузер, публикация).
+	DefaultTimeoutAttempts = 2
+
 	// DefaultErrorWait — пауза после ошибок Redis и при недоступном
 	// браузере (стиль httpworker.DefaultErrorWait): холостые круги не
 	// греют логи, неподтверждённые доставки вернёт XAUTOCLAIM (T-025).
@@ -170,6 +191,16 @@ type Options struct {
 	// XACK) с теми же Group/Consumer/Batch; nil — восстановления нет
 	// (изолированные сборки и тесты без Redis-специфики).
 	Recover *queue.Reliab
+	// TimeoutAttempts — сколько доставок задачи могут завершиться
+	// таймаутом страницы (render.timeout, предсказуемый тарпит), прежде
+	// чем запись финализируется без рендера — итогом остаётся сырой HTML
+	// HTTP-фазы, запись уходит в q:analyze, доставка подтверждается
+	// (T-148). Счётчик — номер доставки из PEL (ProcessingAttempt):
+	// состояния в воркере нет, рестарты и горизонтальное масштабирование
+	// семантику не меняют. Обязан быть ≤ redis.max_attempts — иначе
+	// тарпит умер бы в q:dead до финализации (проверяет config.Validate).
+	// 0 — DefaultTimeoutAttempts.
+	TimeoutAttempts int
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
@@ -190,6 +221,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.Consumer == "" {
 		o.Consumer = fmt.Sprintf("render-worker-%d", os.Getpid())
+	}
+	if o.TimeoutAttempts <= 0 {
+		o.TimeoutAttempts = DefaultTimeoutAttempts
 	}
 	return o
 }
@@ -240,6 +274,33 @@ type renderTarget struct {
 	hash     []byte // nil — контента нет (NULL content_hash, T-056)
 }
 
+// tarpitError — маркер таймаут-тарпита (T-148): ошибка рендера класса
+// task, чья причина — истечение общего таймаута страницы render.timeout
+// (session.wrap: «таймаут страницы …» → context.DeadlineExceeded в
+// цепочке). Такой таймаут — предсказуемое свойство тяжёлой страницы:
+// повтор на новом контексте почти наверняка даст тот же исход, а каждая
+// попытка стоит слоту полный таймаут (замер 2026-10-23: слоты заняты
+// таймаутами, эффективная скорость этапа 0.34 стр/с). Обёртка не меняет
+// текст ошибки (Error/Unwrap — исходной) и служит только меткой:
+// processDelivery выбирает по ней финализацию записи без рендера вместо
+// пережигания попыток доставки до q:dead.
+type tarpitError struct {
+	err error
+}
+
+func (e *tarpitError) Error() string { return e.err.Error() }
+func (e *tarpitError) Unwrap() error { return e.err }
+
+// isPageTimeout — признак таймаута страницы: класс task (повтор на новом
+// контексте бессмысленен) и context.DeadlineExceeded в цепочке — так
+// помечает истечение render.timeout сам рендер (session.wrap). Отмена
+// вызывающего контекста (graceful shutdown → context.Canceled) тарпитом
+// не считается: это инфраструктурное событие, доставка вернётся
+// повторной доставкой после рестарта.
+func isPageTimeout(err error) bool {
+	return render.ClassOf(err) == render.ClassTask && errors.Is(err, context.DeadlineExceeded)
+}
+
 // ProcessResult обрабатывает одну задачу q:render (§5.6, §7): рендер
 // итогового URL строки, DOM в хранилище, атомарная замена ссылки и
 // rendered = true, публикация q:analyze после фиксации. Возвращает false
@@ -269,7 +330,12 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		// Ошибка страницы (таймаут, net::ERR_*) или браузера — повторная
 		// доставка уровнем очереди (класс task) / ожидание или будущий
 		// перезапуск (класс browser, T-065); частичного результата по ТЗ §8
-		// не бывает (T-063).
+		// не бывает (T-063). Таймаут страницы дополнительно маркируется
+		// tarpitError (T-148): processDelivery по маркеру и номеру доставки
+		// решает — повторить или финализировать запись без рендера.
+		if isPageTimeout(err) {
+			return false, fmt.Errorf("renderworker: %s: рендер: %w", name, &tarpitError{err: err})
+		}
 		return false, fmt.Errorf("renderworker: %s: рендер: %w", name, err)
 	}
 	if out.DOM == "" || out.FinalURL == "" {
@@ -519,13 +585,15 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 
 	// Возврат зависших доставок (T-025): фоновый RecoverLoop от имени
 	// того же потребителя — клейм XAUTOCLAIM и та же обработка задач.
-	// Живёт до отмены ctx; Run дожидается его выхода (начатая задача
-	// дорабатывает или остаётся неподтверждённой, ТЗ 3.4).
+	// RecoverLoopAttempt (T-148): обработчик получает номер доставки
+	// (Claimed.Attempts) для политики таймаутов. Живёт до отмены ctx;
+	// Run дожидается его выхода (начатая задача дорабатывает или остаётся
+	// неподтверждённой, ТЗ 3.4).
 	if o.Recover != nil {
 		recDone := make(chan struct{})
 		go func() {
 			defer close(recDone)
-			_ = queue.RecoverLoop(ctx, o.Recover, w.processDelivery, queue.RecoverOptions{
+			_ = queue.RecoverLoopAttempt(ctx, o.Recover, w.processDelivery, queue.RecoverOptions{
 				Stream:   queue.StreamRender,
 				Group:    o.Group,
 				Consumer: o.Consumer,
@@ -662,7 +730,9 @@ dispatch:
 						"entry", d.ID, "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
-			err := queue.Processing(ctx, w.q, o.Group, d, w.processDelivery)
+			// Свежая доставка XREADGROUP — первая по счётчику PEL: attempts=1
+			// (T-148, политика таймаутов в processDelivery).
+			err := queue.ProcessingAttempt(ctx, w.q, o.Group, d, 1, w.processDelivery)
 			if err != nil {
 				failed.Add(1)
 				if ctx.Err() == nil {
@@ -680,14 +750,30 @@ dispatch:
 }
 
 // processDelivery обрабатывает одну доставку q:render: декодирование
-// Result-ключа и замена контента. Подтверждение (XACK) выполняет
-// Processing после nil-возврата — «XACK только после записи результата в
-// БД» (ТЗ 4.2); ядовитая запись (вне формата T-024) возвращается ошибкой —
-// очередь исчерпает попытки и унесёт её в q:dead (T-025). Успешная
-// обработка идёт в приборы этапа (T-077): счётчик задач и длительность,
-// rendered=true при записанном DOM; ошибка — в счётчик классов рендера
-// (доставка вернётся повторной доставкой, ТЗ 3.4).
-func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery) error {
+// Result-ключа и замена контента. attempts — номер доставки по счётчику
+// PEL (1 — свежая XREADGROUP, Claimed.Attempts — клейм; ProcessingAttempt/
+// RecoverLoopAttempt, T-148). Подтверждение (XACK) выполняет Processing
+// после nil-возврата — «XACK только после записи результата в БД»
+// (ТЗ 4.2); ядовитая запись (вне формата T-024) возвращается ошибкой —
+// очередь исчерпает попытки и унесёт её в q:dead (T-025).
+//
+// Политика таймаутов (T-148): таймаут страницы (render.timeout,
+// tarpitError) — предсказуемый тарпит, а не случайная ошибка: пока номер
+// доставки не достиг TimeoutAttempts, доставка возвращается ошибкой как
+// любая повторимая (без XACK → клейм → новая попытка), на исчерпании —
+// запись финализируется без рендера (finalizeSkipRender) и доставка
+// подтверждается: работа не выпадает из конвейера в q:dead, q:dead
+// остаётся настоящим инфраструктурным ошибкам (БД, браузер, публикация).
+// Аппроксимация: номер доставки ≥ числа таймаутов этой задачи — смешанная
+// последовательность (инфраструктурный сбой, затем таймаут) финализирует
+// на одну попытку раньше; для настоящих тарпитов (таймаут на каждой
+// доставке) счёт совпадает точно.
+//
+// Успешная обработка идёт в приборы этапа (T-077): счётчик задач и
+// длительность, rendered=true при записанном DOM; ошибка — в счётчик
+// классов рендера (доставка вернётся повторной доставкой, ТЗ 3.4),
+// финализация без рендера — в crawler_render_tarpit_finalized_total.
+func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attempts int) error {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
 		return fmt.Errorf("renderworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
@@ -695,6 +781,19 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery) error 
 	start := time.Now()
 	rendered, err := w.ProcessResult(ctx, task)
 	if err != nil {
+		var tp *tarpitError
+		if errors.As(err, &tp) && attempts >= w.opt.TimeoutAttempts {
+			// Лимит таймаутов исчерпан (T-148): запись финализируется без
+			// рендера — итог сырой HTML HTTP-фазы, конвейер продолжается
+			// анализом (q:analyze), доставка подтверждается.
+			if ferr := w.finalizeSkipRender(ctx, task, tp, attempts); ferr != nil {
+				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+			}
+			w.met.Task(time.Since(start))
+			w.met.Error(render.ClassTask)
+			w.met.TarpitFinalized()
+			return nil
+		}
 		w.met.Error(render.ClassOf(err))
 		return fmt.Errorf("renderworker: домен %s: замена контента: %w", task.Name, err)
 	}
@@ -702,5 +801,47 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery) error 
 	if rendered {
 		w.met.Rendered()
 	}
+	return nil
+}
+
+// finalizeSkipRender — финализация записи без рендера (T-148,
+// зафиксированное решение): страница раз за разом не укладывается в
+// render.timeout, рендерные попытки исчерпаны — итогом записи остаётся
+// сырой HTML HTTP-фазы (rendered = false — признак «рендера не было»
+// по схеме subdomain_results; отдельной колонки нет), запись уходит
+// в q:analyze тем же ключом (Fresh=true — доработка текущего эпизода,
+// как у успешного рендера): конвейер доводит её анализом, работа не
+// теряется. Доставка подтверждается (nil вызывающему processDelivery) —
+// в q:dead запись не попадает.
+//
+// Строки нет (перепроверка перезаписала) или у неё нет итогового URL —
+// штатный отказ без публикации (как ProcessResult). Публикация q:analyze
+// идёт до XACK: сбой — ошибка, доставка вернётся и финализация
+// повторится (дубликат публикации ограничен попытками, анализатор
+// идемпотентен по ключу — тот же паттерн, что у рендера после сбоя
+// публикации). Уже отрендеренная конкурентной доставкой строка
+// анализируется повторно — дубль анализа тем же контентом безвреден
+// (at-least-once, ТЗ 3.4).
+func (w *Worker) finalizeSkipRender(ctx context.Context, task queue.Result, cause *tarpitError, attempts int) error {
+	target, found, err := w.selectTarget(ctx, task)
+	if err != nil {
+		return fmt.Errorf("финализация без рендера: чтение строки результата: %w", err)
+	}
+	if !found || target.finalURL == "" {
+		// Рендерить/анализировать нечего: строки нет или она ушла из-под
+		// задачи (перепроверка) — успех без публикации.
+		w.opt.log().Debug("финализация без рендера не требуется — строки нет или без итогового URL",
+			"zone_id", task.ZoneID, "domain_id", task.DomainID,
+			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
+		return nil
+	}
+	task.Fresh = true
+	if _, err := w.q.Publish(ctx, queue.StreamAnalyze, task); err != nil {
+		return fmt.Errorf("финализация без рендера: публикация q:analyze: %w", err)
+	}
+	w.opt.log().Warn("рендер-тарпит: запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
+		"domain", renderLogName(task, target.finalURL), "final_url", target.finalURL,
+		"attempts", attempts, "timeout_attempts", w.opt.TimeoutAttempts,
+		"err", cause.Error())
 	return nil
 }
