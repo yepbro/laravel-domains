@@ -318,7 +318,17 @@ services:
       <<: *go-common-env
       SERVICE: http-worker
       METRICS_PORT: "9104"
-    mem_limit: 384m
+    # Самый тяжёлый Go-сервис: слоты задач q:http (http.task_concurrency,
+    # дефолт 256 — config.dev.yaml задачный параллелизм не понижает)
+    # удерживают тела страниц до 2 МиБ до конца задачи домена
+    # (дедупликация алиасов): замер ≈3.34 MiB anon/слот → avg ≈855 MiB
+    # на 256 слотах (docs/load-measurements.md §11, T-143; окно 12 мин,
+    # стартовый пик выше — сутки наблюдения T-093 условие закрытия).
+    # Прежние 384m вмещали лишь 128 слотов (anon ≈380 из 384 MiB) — на
+    # дефолтных 256 OOM контейнера. Паритет с MemoryMax=900M боевого
+    # юнита (deploy/systemd/crawler-http-worker.service); снижать только
+    # вместе с http.task_concurrency.
+    mem_limit: 900m
     depends_on:
       postgres:
         condition: service_healthy
