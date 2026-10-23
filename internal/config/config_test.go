@@ -87,7 +87,7 @@ func TestDefault(t *testing.T) {
 		{"http.max_redirects", c.HTTP.MaxRedirects, 8},
 		{"http.max_body_bytes", c.HTTP.MaxBodyBytes.B(), int64(2 << 20)},
 		{"http.user_agent", c.HTTP.UserAgent != "", true},
-		{"http.task_concurrency", c.HTTP.TaskConcurrency, 256},
+		{"http.task_concurrency", c.HTTP.TaskConcurrency, 192},
 		{"http.task_consume", c.HTTP.TaskConsume, 16},
 		{"http.task_per_domain", c.HTTP.TaskPerDomain, 8},
 		{"render.remote_url", c.Render.RemoteURL, ""},
