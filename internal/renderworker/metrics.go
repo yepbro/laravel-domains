@@ -4,8 +4,9 @@
 // страницы, контекста или перезапуск браузера), доля рендера — ветка
 // rendered=true счётчика crawler_render_records_total (ветку false
 // наращивает HTTP-этап после записи результата; доля — отношением rate
-// в PromQL), тарпит-финализации без рендера (T-148) и финализации по
-// постоянной ошибке сертификата хоста (T-159).
+// в PromQL), тарпит-финализации без рендера (T-148), финализации по
+// постоянной ошибке сертификата хоста (T-159) и финализации ошибки
+// класса задачи на последней попытке с меткой причины (T-172).
 package renderworker
 
 import (
@@ -34,6 +35,7 @@ type Metrics struct {
 	rendered prometheus.Counter     // crawler_render_records_total{rendered="true"}
 	tarpits  prometheus.Counter     // crawler_render_tarpit_finalized_total (T-148)
 	certs    prometheus.Counter     // crawler_render_cert_finalized_total (T-159)
+	tasksFin *prometheus.CounterVec // crawler_render_task_finalized_total{reason} (T-172)
 }
 
 // NewMetrics регистрирует приборы этапа в реестре reg (каррированные по
@@ -68,6 +70,10 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 			Name: "crawler_render_cert_finalized_total",
 			Help: "Записи, финализированные без рендера по постоянной ошибке TLS-сертификата хоста — net::ERR_CERT_AUTHORITY_INVALID / net::ERR_CERT_COMMON_NAME_INVALID (T-159): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze, в q:dead cert-класс не попадает.",
 		}).WithLabelValues(),
+		tasksFin: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_render_task_finalized_total",
+			Help: "Записи, финализированные без рендера по ошибке класса задачи рендера на последней доставке (T-172): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze, в q:dead не попадает. Метка reason — код net::ERR_* (например net::ERR_CONNECTION_REFUSED), timeout или other: состав того, что раньше уносило записи в q:dead.",
+		}, "reason"),
 	}
 }
 
@@ -109,6 +115,18 @@ func (m *Metrics) CertFinalized() {
 		return
 	}
 	m.certs.Inc()
+}
+
+// TaskFinalized — запись финализирована без рендера по ошибке класса
+// задачи на последней доставке (T-172): +1 в счётчик финализаций с
+// меткой причины (код net::ERR_* / timeout / other) — материал критерия
+// «суточный прирост q:dead от q:render = 0» и видимости состава причин
+// (что именно доезжало до q:dead прежде).
+func (m *Metrics) TaskFinalized(reason string) {
+	if m == nil {
+		return
+	}
+	m.tasksFin.WithLabelValues(reason).Inc()
 }
 
 // Error — задача рендера не подтверждена (вернётся повторной доставкой):

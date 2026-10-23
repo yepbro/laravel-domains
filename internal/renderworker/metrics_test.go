@@ -67,6 +67,7 @@ func TestMetricsNilSafe(t *testing.T) {
 	m.Error(render.ClassTask) // no-op
 	m.TarpitFinalized()       // no-op (T-148)
 	m.CertFinalized()         // no-op (T-159)
+	m.TaskFinalized("other")  // no-op (T-172)
 }
 
 func TestMetricsMethods(t *testing.T) {
@@ -81,6 +82,9 @@ func TestMetricsMethods(t *testing.T) {
 	m.Error(render.ClassBrowser)
 	m.TarpitFinalized()
 	m.CertFinalized()
+	m.TaskFinalized("net::ERR_CONNECTION_REFUSED")
+	m.TaskFinalized("net::ERR_CONNECTION_REFUSED")
+	m.TaskFinalized("other")
 
 	stage := map[string]string{"stage": metrics.StageRender}
 	if got := rwMetricValue(t, reg, "crawler_stage_tasks_total", stage); got != 2 {
@@ -97,6 +101,15 @@ func TestMetricsMethods(t *testing.T) {
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 1 {
 		t.Errorf("crawler_render_cert_finalized_total = %v, want 1", got)
+	}
+	for reason, want := range map[string]float64{
+		"net::ERR_CONNECTION_REFUSED": 2,
+		"other":                       1,
+		"net::ERR_NAME_NOT_RESOLVED":  -1,
+	} {
+		if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", map[string]string{"reason": reason}); got != want {
+			t.Errorf("crawler_render_task_finalized_total{reason=%s} = %v, want %v", reason, got, want)
+		}
 	}
 	for typ, want := range map[string]float64{
 		render.ClassTask.String():    2,

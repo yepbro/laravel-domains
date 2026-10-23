@@ -183,6 +183,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// доставок — после render.timeout_attempts таймаутов запись
 		// финализируется без рендера (сырой HTML + q:analyze), не q:dead.
 		TimeoutAttempts: cfg.Render.TimeoutAttempts,
+		// Последняя попытка × класс задачи (T-172): ошибка рендера класса
+		// task на доставке № redis.max_attempts финализирует запись без
+		// рендера вместо q:dead — то же значение, что у Reliab выше
+		// (граница захоронения), чтобы политика успевала до перевода.
+		MaxAttempts: cfg.Redis.MaxAttempts,
 	}
 	w, err := renderworker.New(pool, q, store, manager, opts)
 	if err != nil {

@@ -1,6 +1,9 @@
-// Юнит-тесты политики постоянных ошибок сертификата хоста (T-159):
-// ERR_CERT_AUTHORITY_INVALID / ERR_CERT_COMMON_NAME_INVALID — свойство
-// хоста, а не сети или инфраструктуры, ретрай бессмысленен. Cert-класс
+// Юнит-тесты политики постоянных ошибок сертификата хоста (T-159,
+// расширение T-172): ERR_CERT_AUTHORITY_INVALID /
+// ERR_CERT_COMMON_NAME_INVALID — свойства хоста, а не сети или
+// инфраструктуры, ретрай бессмысленен; ERR_CERT_DATE_INVALID добавлен по
+// замеру T-172 (0 успешных ретраев из 321 первых неудач за сутки — окно
+// продления сертификата много шире окна ретраев). Cert-класс
 // финализируется без рендера с первой же доставки (без тарпит-лимита
 // T-148, которому лимит даёт странице шанс в изменившихся условиях):
 // итог — сырой HTML HTTP-фазы (rendered = false), публикация q:analyze,
@@ -168,8 +171,9 @@ func TestRenderWorker_CertFinalizePublishError(t *testing.T) {
 
 // TestRenderWorker_CertNotClassified — прежний путь сохраняется для
 // ошибок вне cert-класса (ошибка без XACK → повторная доставка →
-// redis.max_attempts → q:dead, T-025): сетевые и время-зависимые коды
-// (refused может быть временным, просрочка — не строго постоянна),
+// redis.max_attempts → q:dead, T-025): сетевые коды (refused может быть
+// временным — восстановление наблюдается, замер T-172: 6.6% ретраев
+// успешны; на последней доставке их финализирует политика T-172),
 // обычные net::ERR_*, ошибки других классов. Проверка на любой попытке:
 // финализация — только cert-класс.
 func TestRenderWorker_CertNotClassified(t *testing.T) {
@@ -179,7 +183,6 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 	}{
 		{"отказ соединения (может быть временным)", rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")},
 		{"резолв (может быть временным)", rwCertErr("https://spa.example/", "net::ERR_NAME_NOT_RESOLVED")},
-		{"просроченный сертификат (время-зависимый)", rwCertErr("https://spa.example/", "net::ERR_CERT_DATE_INVALID")},
 		{"код сертификата в чужом классе (контекст умер)", &render.Error{
 			Class: render.ClassContext, URL: "https://spa.example/",
 			Err: &chromedp.LoadError{ErrorText: "net::ERR_CERT_AUTHORITY_INVALID"}}},
@@ -195,9 +198,11 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 			f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 			f.renderer.err = c.err
 
-			// Номер доставки выше любых лимитов: не-cert ошибки не
-			// финализируются никогда.
-			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 3, f.w.processDelivery)
+			// Номер доставки ниже последней (MaxAttempts 3): не-cert
+			// ошибки не финализируются cert-политикой никогда — путь
+			// повторной доставки прежний (что с ними на последней
+			// доставке — политика T-172, taskfinal_test.go).
+			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 2, f.w.processDelivery)
 			if err == nil {
 				t.Fatal("ошибка вне cert-класса обязана возвращаться (путь q:dead прежний)")
 			}
@@ -212,6 +217,26 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 			}
 		})
 	}
+
+	// Код сертификата в чужом классе не финализируется и на последней
+	// доставке: контекстный класс — инфраструктура (T-172 финализирует
+	// только класс task).
+	t.Run("код сертификата в чужом классе на последней доставке", func(t *testing.T) {
+		f := newRWFixture(t)
+		raw := rwTestHash(1)
+		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+		f.renderer.err = &render.Error{
+			Class: render.ClassContext, URL: "https://spa.example/",
+			Err: &chromedp.LoadError{ErrorText: "net::ERR_CERT_AUTHORITY_INVALID"}}
+
+		err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 3, f.w.processDelivery)
+		if err == nil {
+			t.Fatal("ошибка чужого класса обязана возвращаться и на последней доставке")
+		}
+		if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
+			t.Errorf("публикаций быть не должно: %+v", pubs)
+		}
+	})
 
 	// Таймаут страницы остаётся территорией T-148: cert-распознавание
 	// (ProcessResult проверяет его первым) не должно глотать таймауты —
