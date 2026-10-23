@@ -51,6 +51,13 @@
 // у T-066): чистить «наугад» дороже, чем отложить проход. Порог 0 —
 // интерлок выключен.
 //
+// Точная защита по непотреблённым сообщениям (retentionpending.go): флаг
+// render_pending не покрывает записи, чьи сообщения УЖЕ опубликованы в
+// q:render/q:analyze (публикация состоялась — флага нет), а интерлок не
+// видит застарелых сообщений при глубине ниже порога; перед проходом
+// ключи непотреблённых сообщений вычитываются из стримов, и записи,
+// ожидающие потребителей, исключаются из пачек дренажа.
+//
 // Пачки и дренаж: выборка кандидатов — курсорная пагинация по PK
 // (row-value >, стиль переанализа T-074) — не пересматривает
 // пройденное; каждая пачка — короткая транзакция (стиль T-020).
@@ -84,6 +91,7 @@ import (
 
 	"crawler/internal/db"
 	"crawler/internal/model"
+	"crawler/internal/queue"
 )
 
 // Дефолты цикла (ТЗ 13.2: значения по умолчанию уточняются замерами;
@@ -221,6 +229,12 @@ type RetentionOptions struct {
 	// AnalyzeWatermark — порог интерлока: глубина q:analyze ≥ порога —
 	// пропуск прохода/пачки; ≤ 0 — интерлок выключен.
 	AnalyzeWatermark int64
+	// Pending — источник непотреблённых ключей q:render/q:analyze (точная
+	// защита записей, ожидающих очередей, — retentionpending.go); nil —
+	// защита выключена (изолированные сборки, юнит-тесты критериев
+	// отбора). В отличие от интерлока порога не имеет: исключаются ровно
+	// те записи, на которые указывают живые сообщения стримов.
+	Pending RetentionPending
 	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 	// OnPass — хук итога успешного прохода: снапшот RetentionStats и
@@ -269,8 +283,22 @@ type RetentionStats struct {
 	// Skipped — проход остановлен интерлоком: глубина q:analyze у порога
 	// (анализатор не успевает, тела ещё нужны); данные не тронуты.
 	Skipped bool
+	// SkippedPending — проход остановлен ошибкой чтения непотреблённых
+	// ключей q:render/q:analyze (снимок до прохода или обновление при
+	// длинном дренаже): консервативный пропуск — записи очередей не
+	// тронуты, пачки до ошибки зафиксированы (пачки атомарны сами по
+	// себе); итог уходит в OnPass — Warn в цикле и метрика
+	// crawler_content_retention_pending_errors_total.
+	SkippedPending bool
 	// Depth — глубина q:analyze в момент остановки (для лога).
 	Depth int64
+	// Deferred — записи-кандидаты, исключённые из чистки прохода: их
+	// сообщения ждут потребителей стримов (ключ — стрим: q:render либо
+	// q:analyze; запись публикуется в оба — считается в каждом, кто
+	// держит). Растёт при застое очередей — материал алерта рядом со
+	// skips_total (retentionmetrics.go: crawler_content_retention_
+	// deferred_total{stream}).
+	Deferred map[string]int64
 }
 
 // add суммирует итог пачки в накопитель прохода.
@@ -282,6 +310,14 @@ func (s *RetentionStats) add(o RetentionStats) {
 	s.Batches += o.Batches
 	s.BadHashes += o.BadHashes
 	s.Missing += o.Missing
+	if len(o.Deferred) > 0 {
+		if s.Deferred == nil {
+			s.Deferred = make(map[string]int64, len(o.Deferred))
+		}
+		for k, v := range o.Deferred {
+			s.Deferred[k] += v
+		}
+	}
 }
 
 // retentionKey — ключ строки subdomain_results (PK, ТЗ 6.1) и курсор
@@ -301,15 +337,29 @@ type retentionCandidate struct {
 }
 
 // RetentionOnce — один проход: дренаж старения пачками по BatchSize до
-// исчерпания множества, остановки интерлоком или отмены ctx. Идемпотентен
-// (ТЗ 3.4): очищенные строки выпадают из отбора, пачки атомарны.
+// исчерпания множества, остановки интерлоком, ошибки защиты очередей или
+// отмены ctx. Идемпотентен (ТЗ 3.4): очищенные строки выпадают из отбора,
+// пачки атомарны. Записи, чьи сообщения ждут q:render/q:analyze,
+// исключаются из пачек по снимку непотреблённых ключей (retentionpending.go):
+// снимок берётся до прохода и обновляется каждые
+// DefaultRetentionPendingRefresh выборок длинного дренажа; ошибка чтения
+// стримов — консервативный пропуск остатка прохода (SkippedPending).
 func RetentionOnce(ctx context.Context, pool RetentionDB, opts RetentionOptions) (RetentionStats, error) {
 	if pool == nil {
 		return RetentionStats{}, errors.New("content: retention: пул не задан")
 	}
 	o := opts.withDefaults()
 	var out RetentionStats
+	// Снимок защиты — лениво, ПОСЛЕ первой проверки интерлока: интерлок
+	// «анализатор не успевает» закрывает и q:analyze, и q:render шире
+	// снимка — гонять тяжёлый XRANGE ради тут же выброшенного прохода
+	// незачем; кроме того, таймаут чтения зависшего стрима при закрытом
+	// интерлоке дал бы ложный SkippedPending вместо честного Skipped.
+	// Ошибка чтения — не ошибка прохода, а его отмена (данные не тронуты):
+	// см. шапку retentionpending.go.
+	var pending *retentionPendingSets
 	after := retentionKey{} // нулевой ключ меньше любого реального (zone_id ≥ 1)
+	selects := 0            // выборок пачек с момента снимка (обновление длинного дренажа)
 	for {
 		if err := ctx.Err(); err != nil {
 			return out, fmt.Errorf("content: retention: %w", err)
@@ -326,6 +376,19 @@ func RetentionOnce(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 			out.Depth = n
 			return out, nil
 		}
+		// Первый снимок — после интерлока, до первой выборки: чистка
+		// начинается только когда известно, какие записи ждут очередей.
+		if o.Pending != nil && pending == nil {
+			p, err := retentionPendingSnapshot(ctx, o.Pending)
+			if err != nil {
+				if ctx.Err() != nil {
+					return out, fmt.Errorf("content: retention: снимок очередей: %w", ctx.Err())
+				}
+				out.SkippedPending = true
+				return out, nil
+			}
+			pending = p
+		}
 
 		batch, err := retentionSelect(ctx, pool, o, after)
 		if err != nil {
@@ -334,14 +397,36 @@ func RetentionOnce(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 		if len(batch) == 0 {
 			return out, nil // множество исчерпано
 		}
-		st, err := retentionPurge(ctx, pool, o, batch)
-		if err != nil {
-			return out, err
+		selects++
+		// Курсор и решение об исчерпании — по исходной выборке: исключённые
+		// защитой записи этим проходом пропускаются (курсор за ними) и
+		// вернутся следующим — чистка только не-ожидающих.
+		last, full := batch[len(batch)-1].key, len(batch) >= o.BatchSize
+		batch = pending.deferBatch(batch, &out)
+		if len(batch) > 0 {
+			st, err := retentionPurge(ctx, pool, o, batch)
+			if err != nil {
+				return out, err
+			}
+			out.add(st)
 		}
-		out.add(st)
-		after = batch[len(batch)-1].key
-		if len(batch) < o.BatchSize {
+		after = last
+		if !full {
 			return out, nil // неполная пачка — дренаж исчерпан
+		}
+		// Длинный дренаж: снимок устарел (гонка переиздания T-066) —
+		// перечитать дешевле, чем допустить окно; обновление покрывает
+		// только будущие пачки, пройденное не пересматривается.
+		if o.Pending != nil && selects >= DefaultRetentionPendingRefresh {
+			p, err := retentionPendingSnapshot(ctx, o.Pending)
+			if err != nil {
+				if ctx.Err() != nil {
+					return out, fmt.Errorf("content: retention: снимок очередей: %w", ctx.Err())
+				}
+				out.SkippedPending = true
+				return out, nil
+			}
+			pending, selects = p, 0
 		}
 	}
 }
@@ -564,7 +649,8 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 		"retention", o.Retention.String(),
 		"interval", o.Interval.String(),
 		"batch", o.BatchSize,
-		"analyze_watermark", o.AnalyzeWatermark)
+		"analyze_watermark", o.AnalyzeWatermark,
+		"queue_guard", o.Pending != nil)
 
 	pass := func() {
 		start := time.Now()
@@ -581,6 +667,21 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 			// по метрике пропусков (retentionmetrics.go).
 			log.Warn("проход retention контента пропущен: глубина q:analyze у порога",
 				"depth", stats.Depth, "watermark", o.AnalyzeWatermark)
+		}
+		if stats.SkippedPending {
+			// Защита очередей: чтение непотреблённых q:render/q:analyze не
+			// удалось — записи, ожидающие потребителей, не тронуты; алерт
+			// по метрике crawler_content_retention_pending_errors_total.
+			// rows_done — пачки, зафиксированные до точки ошибки (пропуск
+			// касается остатка прохода, сделанное остаётся в БД).
+			log.Warn("проход retention контента пропущен: ошибка чтения q:render/q:analyze",
+				"rows_done", stats.Rows)
+		}
+		if n := stats.Deferred[queue.StreamRender]; n > 0 {
+			log.Warn("retention: записи ожидают q:render — не тронуты", "deferred", n)
+		}
+		if n := stats.Deferred[queue.StreamAnalyze]; n > 0 {
+			log.Warn("retention: записи ожидают q:analyze — не тронуты", "deferred", n)
 		}
 		if stats.BadHashes > 0 || stats.Missing > 0 {
 			log.Warn("retention: аномалии учёта контента",

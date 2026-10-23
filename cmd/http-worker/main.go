@@ -29,12 +29,17 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"crawler/internal/config"
 	"crawler/internal/content"
@@ -236,6 +241,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// анализатор не успевает — тела ещё нужны, проход пропускается;
 	// порог 0 в конфиге — общий scheduler.queue_high_watermark (тем же
 	// критерием «строго ниже порога» работает гейт публикации q:analyze).
+	// Точная защита (T-166/T-167): записи, чьи сообщения ещё не потреблены
+	// q:render/q:analyze, исключаются из пачек по снимку стримов —
+	// retentionPending ниже, тем же Redis-клиентом, что и гейт.
 	// Цикл здесь же, где компактификация: purge лишь готовит мёртвые
 	// блоки, место возвращает её часовой проход; второму владельцу он не
 	// нужен (охраны делают параллельный запуск безопасным, но
@@ -250,6 +258,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			Interval:         cfg.Content.RetentionInterval.D(),
 			BatchSize:        cfg.Content.RetentionBatch,
 			Depth:            analyzeDepth{gate: gate},
+			Pending:          retentionPending{rdb: rdb},
 			AnalyzeWatermark: retentionWatermark,
 			Log:              logger,
 			OnPass:           content.NewRetentionMetrics(reg).Observe,
@@ -309,4 +318,151 @@ type analyzeDepth struct{ gate *queue.BackpressureGate }
 
 func (a analyzeDepth) AnalyzeDepth(ctx context.Context) (int64, error) {
 	return a.gate.Len(ctx, queue.StreamAnalyze)
+}
+
+// retentionPendingRedis — окно в go-redis для чтения непотреблённого
+// хвоста стрима: XINFO GROUPS (last-delivered-id групп) и XRANGE.
+// Узкое, как redisDepth гейта (T-026): *redis.Client удовлетворяет,
+// юнит-тест (main_test.go) подменяет фейком; внутренний интерфейс
+// пакета internal/queue не расширяется — там параллельные задачи.
+type retentionPendingRedis interface {
+	XInfoGroups(ctx context.Context, key string) *redis.XInfoGroupsCmd
+	XRangeN(ctx context.Context, key, start, stop string, count int64) *redis.XMessageSliceCmd
+}
+
+// compile-time: клиент очереди — источник защиты retention.
+var _ retentionPendingRedis = (*redis.Client)(nil)
+
+// Константы чтения хвоста стрима.
+const (
+	// pendingFieldData — единственное поле записи стрима: JSON сообщения
+	// (fieldData redisq.go; литерал здесь — поле не экспортировано,
+	// дублируется с комментарием-якорем).
+	pendingFieldData = "data"
+
+	// pendingScanBatch — записей в одном XRANGE: хвост при застое —
+	// десятки тысяч (лаг q:render ≈99 тыс., runbooks §5), пагинация
+	// держит пиковый слайс умеренным; итоговое множество ключей всё
+	// равно вмещает весь хвост — цена точной защиты.
+	pendingScanBatch = 1000
+)
+
+// retentionPending — ключи записей, чьи сообщения ждут потребителей,
+// для точной защиты retention (content.RetentionPending, T-166/T-167):
+// адаптер над Redis-клиентом гейта (тем же клиентом читает глубину
+// BackpressureGate.Len — одна точка правды о стримах). Читает
+// недоставленный группе хвост: XRANGE от last-delivered-id группы
+// (эксклюзивно, «(id») до '+'. XREADGROUP ">" запрещён — он доставил бы
+// записи в pending группы и сдвинул last-delivered-id, сломав реального
+// потребителя. Групп у стрима нет — недоставлено всё содержимое: XRANGE
+// с начала (та же семантика, что «глубина = XLEN» у гейта). Сообщения
+// разбираются как queue.Result (формат T-024 — публикация record.go и
+// renderSPAResults); чужое тело пропускается: в стрим очереди пишет
+// только marshalMessage (валидированные форматы).
+type retentionPending struct {
+	rdb retentionPendingRedis
+}
+
+func (p retentionPending) PendingKeys(ctx context.Context, stream string) (map[content.RetentionPendingKey]struct{}, error) {
+	keys := make(map[content.RetentionPendingKey]struct{})
+	groups, err := p.rdb.XInfoGroups(ctx, stream).Result()
+	if err != nil {
+		// Стрима нет — «no such key» (не пустой список), как у гейта:
+		// ни публикаций, ни групп — ждать потребителей нечего.
+		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
+			return keys, nil
+		}
+		return nil, fmt.Errorf("http-worker: защита retention: группы %s: %w", stream, err)
+	}
+	if len(groups) == 0 {
+		if err := scanPendingKeys(ctx, p.rdb, stream, "-", keys); err != nil {
+			return nil, err
+		}
+		return keys, nil
+	}
+	// Хвост, недоставленный хоть одной группе, — от минимального
+	// last-delivered-id: интервал каждой группы — (её id, +∞), объединение
+	// интервалов с разными краями — интервал от минимума; один XRANGE
+	// вместо по группе (в бою группа одна — вырожденный случай).
+	minID := ""
+	for _, g := range groups {
+		if minID == "" || pendingIDLess(g.LastDeliveredID, minID) {
+			minID = g.LastDeliveredID
+		}
+	}
+	// Эксклюзивный нижний край "(" + id: записи строго после
+	// last-delivered-id; у только что созданной группы id "0-0" —
+	// весь стрим.
+	if err := scanPendingKeys(ctx, p.rdb, stream, "("+minID, keys); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+// pendingIDLess — сравнение идентификаторов записей стрима "ms-seq"
+// численно по частям: лексикографическое сравнение ошибочно ("999-0"
+// больше "1000-0" — то же замечание у trackProgress, redisq.go;
+// LastDeliveredID новой группы "0-0" короче реальных id).
+func pendingIDLess(a, b string) bool {
+	ams, aseq, aerr := splitPendingID(a)
+	bms, bseq, berr := splitPendingID(b)
+	if aerr != nil || berr != nil {
+		return a < b // неразбираемые — лексикографически: детерминизм важнее точности
+	}
+	if ams != bms {
+		return ams < bms
+	}
+	return aseq < bseq
+}
+
+// splitPendingID разбирает "ms-seq" в пару int64.
+func splitPendingID(id string) (ms, seq int64, err error) {
+	s1, s2, ok := strings.Cut(id, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("http-worker: защита retention: идентификатор записи %q не вида ms-seq", id)
+	}
+	if ms, err = strconv.ParseInt(s1, 10, 64); err != nil {
+		return 0, 0, err
+	}
+	if seq, err = strconv.ParseInt(s2, 10, 64); err != nil {
+		return 0, 0, err
+	}
+	return ms, seq, nil
+}
+
+// scanPendingKeys дочитывает хвост стрима от start (включительно) до '+'
+// пачками pendingScanBatch, разбирая поле data в ключ записи.
+func scanPendingKeys(ctx context.Context, rdb retentionPendingRedis, stream, start string, keys map[content.RetentionPendingKey]struct{}) error {
+	for {
+		msgs, err := rdb.XRangeN(ctx, stream, start, "+", pendingScanBatch).Result()
+		if err != nil {
+			return fmt.Errorf("http-worker: защита retention: xrange %s: %w", stream, err)
+		}
+		for _, m := range msgs {
+			var raw []byte
+			switch v := m.Values[pendingFieldData].(type) {
+			case string:
+				raw = []byte(v)
+			case []byte:
+				raw = v
+			default:
+				continue // поля data нет — не сообщение очереди
+			}
+			var r queue.Result
+			if json.Unmarshal(raw, &r) != nil {
+				continue // чужое тело: стримы очереди пишет только marshalMessage
+			}
+			if r.ZoneID <= 0 || r.DomainID <= 0 {
+				continue // нулевые идентификаторы — не Result (validate требует ≥ 1)
+			}
+			keys[content.RetentionPendingKey{
+				Zone: r.ZoneID, Domain: r.DomainID,
+				Sub: r.SubdomainID, Variant: int16(r.Variant),
+			}] = struct{}{}
+		}
+		if int64(len(msgs)) < pendingScanBatch {
+			return nil // хвост прочитан целиком
+		}
+		start = "(" + msgs[len(msgs)-1].ID // следующая страница — после последней
+	}
 }

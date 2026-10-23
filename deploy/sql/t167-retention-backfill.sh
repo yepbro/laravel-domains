@@ -16,9 +16,15 @@
 #
 # Отличия кампании от штатного цикла (постановка T-167): батчи уменьшены
 # под CPU-голодом (T-158 не закрыт), между пачками пауза, перед пачкой —
-# ворота: PSI CPU some avg10 (по умолчанию 95%) и глубины q:render/q:analyze
-# (XLEN как грубая верхняя граница; точная глубина — сводка crawlerctl
-# status). Ворота ждут, а не роняют скрипт.
+# ворота: PSI CPU some avg10 (по умолчанию 95%), глубины q:render/q:analyze
+# двумя уровнями — грубый XLEN (верхняя граница, по умолчанию 100 тыс.) и
+# точный лаг групп потребления (XINFO GROUPS → lag, Redis 7+; недоставленный
+# хвост — именно он держит записи от чистки у цикла T-166, фикс окна
+# q:render/q:analyze). Ворота ждут, а не роняют скрипт.
+#
+# При застое q:render (лаг сильно выше порога — как 23.10, ≈99 тыс.)
+# лаг-ворота не отпустят: скрипт честно остановится по таймауту ворот —
+# дренаж стрима (T-159) вперед, чистка ждущих рендера записей недопустима.
 #
 # Запуск на боевом сервере (runbook §5.3): из чекаута репозитория либо
 #   ssh root@155.212.174.88 'bash -s' -- < deploy/sql/t167-retention-backfill.sh
@@ -33,7 +39,9 @@ pause="${T167_PAUSE:-5}"               # пауза между пачками, �
 max_batches="${T167_MAX_BATCHES:-1000}" # страховка: 1000 x 2000 = 2 млн строк
 psi_max="${T167_PSI_MAX:-95}"          # ворота: PSI CPU some avg10, %
 queue_max="${T167_QUEUE_MAX:-100000}"  # ворота: XLEN q:render/q:analyze
-                                      # (как scheduler.queue_high_watermark)
+                                      # (грубая верхняя граница глубины)
+render_lag_max="${T167_RENDER_LAG:-1000}"   # ворота: лаг группы q:render
+analyze_lag_max="${T167_ANALYZE_LAG:-1000}" # ворота: лаг группы q:analyze
 gate_max_wait="${T167_GATE_MAX_WAIT:-3600}" # столько ворота ждут до остановки, с
 
 PSQL=(psql -X --no-psqlrc -v ON_ERROR_STOP=1 -Atq)
@@ -45,7 +53,7 @@ fail() { echo "ОШИБКА: $*" >&2; exit 2; }
 # алфавиты закрыты заранее (интервал — буквы/цифры/разделители, без
 # кавычек; остальное — только цифры).
 [[ "$retention" =~ ^[0-9A-Za-z_[:space:]:.,-]+$ ]] || fail "T167_RETENTION: недопустимые символы: $retention"
-for v in "$batch" "$pause" "$max_batches" "$psi_max" "$queue_max" "$gate_max_wait"; do
+for v in "$batch" "$pause" "$max_batches" "$psi_max" "$queue_max" "$render_lag_max" "$analyze_lag_max" "$gate_max_wait"; do
     [[ "$v" =~ ^[0-9]+$ ]] || fail "ожидается целое число: $v"
 done
 
@@ -79,22 +87,59 @@ psi_wait() {
     return 0
 }
 
-# queue_wait — ворота лагов стримов: рост q:render/q:analyze сверх порога
-# значит «конвейер захлёбывается» (для q:analyze это тот же интерлок, что
-# у цикла T-166). redis-cli недоступен — ворота пропущены (сводка глубин
-# остаётся на операторе: crawlerctl status).
+# lag_of — лаг стрима: максимум по группам потребления (XINFO GROUPS →
+# поле lag, Redis 7+; в бою у рабочего стрима одна группа). lag = nil
+# (обрезка срезала недоставленное либо Redis < 7) — лаг недоступен,
+# ответ "unknown": точные ворота по нему невозможны, остаются XLEN.
+# Групп у стрима нет — недоставлено всё содержимое: лаг = XLEN (та же
+# семантика, что глубина гейта T-026 — BackpressureGate.Len).
+lag_of() {
+    local out
+    out=$(redis-cli --raw XINFO GROUPS "$1" 2>/dev/null) || return 1
+    if [[ -z "$out" ]]; then
+        redis-cli --raw XLEN "$1" 2>/dev/null || echo 0
+        return
+    fi
+    # m == "" — лаг ещё не встречался числом (инициализация отдельной
+    # проверкой: в awk неинициализированная m в сравнении $2+0 > m равна
+    # нулю, и лаг 0 — здоровая очередь — не присвоился бы).
+    paste -d' ' - - <<<"$out" \
+        | awk '$1 == "lag" && $2 ~ /^[0-9]+$/ { if (m == "" || $2+0 > m) m = $2+0 }
+               END { print (m == "" ? "unknown" : m) }'
+}
+
+# queue_wait — ворота стримов, два уровня: XLEN (грубая верхняя граница
+# глубины) и лаг групп (точный недоставленный хвост — именно он держит
+# записи от чистки у цикла T-166: фикс окна q:render/q:analyze). Дефолт
+# порогов лага 1000: приток q:analyze ≈35 сообщ/с (замер §12, 3 млн/сут)
+# — 1000 ≈ полминуты, «потребители практически успевают»; глубже —
+# кампании не место, пусть сначала разберут хвост. redis-cli нет —
+# ворота пропущены (сводка глубин остаётся на операторе: crawlerctl
+# status).
 redis_missing=0
+lag_missing=0
 queue_wait() {
-    local s n
+    local s n lag max
     if ! command -v redis-cli >/dev/null 2>&1; then
         (( redis_missing )) || { echo "WARN: redis-cli не найден — ворота очередей пропущены"; redis_missing=1; }
         return 0
     fi
     for s in q:render q:analyze; do
         n=$(redis-cli --raw XLEN "$s" 2>/dev/null || echo 0)
-        [[ "$n" =~ ^[0-9]+$ ]] || continue
-        if (( n >= queue_max )); then
+        if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= queue_max )); then
             echo "WAIT: XLEN $s = $n >= $queue_max — пауза"
+            return 1
+        fi
+        max=$render_lag_max
+        [[ "$s" == q:analyze ]] && max=$analyze_lag_max
+        lag=$(lag_of "$s") || continue
+        if [[ "$lag" == unknown ]]; then
+            (( lag_missing )) || { echo "WARN: лаг $s недоступен (nil либо Redis < 7) — лаг-ворота пропущены, действует XLEN"; lag_missing=1; }
+            continue
+        fi
+        [[ "$lag" =~ ^[0-9]+$ ]] || continue
+        if (( lag >= max )); then
+            echo "WAIT: лаг $s = $lag >= $max — пауза (записи, ждущие потребителя, не трогаем)"
             return 1
         fi
     done
@@ -213,7 +258,7 @@ SQL
 }
 
 echo "T-167 путь Б: batch=$batch retention='$retention' pause=${pause}s max_batches=$max_batches"
-echo "ворота: PSI some avg10 <= ${psi_max}%, XLEN q:render/q:analyze < $queue_max, ожидание ворот <= ${gate_max_wait}s"
+echo "ворота: PSI some avg10 <= ${psi_max}%, XLEN q:render/q:analyze < $queue_max, лаг q:render < $render_lag_max / q:analyze < $analyze_lag_max, ожидание ворот <= ${gate_max_wait}s"
 
 cz=0 cd=0 cs=0 cv=0
 batches=0

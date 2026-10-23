@@ -1,6 +1,8 @@
 // Юнит-тесты метрик цикла retention (T-166): накопление итогов проходов
 // в счётчики (строки/ссылки/contents/байты), пропуски интерлока меткой
-// passes{result}, аномалии учёта, no-op без реестра, идемпотентность
+// passes{result}, ошибки чтения защиты очередей (passes{skipped_pending}
+// + pending_errors), исключённые защитой записи по стримам
+// (deferred{stream}), аномалии учёта, no-op без реестра, идемпотентность
 // конструктора (T-076).
 package content
 
@@ -120,7 +122,8 @@ func TestRetentionMetricsObserve(t *testing.T) {
 		t.Errorf("skips = %v, want 0", got)
 	}
 
-	// Пропуск интерлока: счётчики работы не растут, skips и метка skipped.
+	// Пропуск интерлока: счётчики работы не растут (работы не было),
+	// skips и метка skipped.
 	m.Observe(RetentionStats{Skipped: true, Depth: 150}, time.Second)
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 15 {
 		t.Errorf("rows после пропуска = %v, want прежние 15", got)
@@ -130,6 +133,47 @@ func TestRetentionMetricsObserve(t *testing.T) {
 	}
 	if got := retentionCounterByLabels(t, reg, "crawler_content_retention_passes_total", map[string]string{"result": "skipped"}); got != 1 {
 		t.Errorf("passes{skipped} = %v, want 1", got)
+	}
+
+	// Пропуск посреди дренажа НЕ теряет сделанной работы (fix ревью:
+	// пачки-то зафиксированы в БД): интерлок после части пачек —
+	// счётчики работы зачитываются и в пропущенном проходе.
+	m.Observe(RetentionStats{Skipped: true, Depth: 150, Rows: 7, Refs: 7, Contents: 5, FreedBytes: 1000}, time.Second)
+	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 22 {
+		t.Errorf("rows = %v, want 22 (15 + 7 из пропущенного посреди дренажа)", got)
+	}
+	if got := retentionCounterValue(t, reg, "crawler_content_retention_contents_total"); got != 15 {
+		t.Errorf("contents = %v, want 15 (10 + 5)", got)
+	}
+
+	// Пропуск по ошибке чтения стримов защиты (T-166/T-167): отдельная
+	// метка passes{skipped_pending} и счётчик ошибок; skips интерлока
+	// не растёт — причины разные, алерты раздельные.
+	m.Observe(RetentionStats{SkippedPending: true}, time.Second)
+	if got := retentionCounterValue(t, reg, "crawler_content_retention_pending_errors_total"); got != 1 {
+		t.Errorf("pending_errors = %v, want 1", got)
+	}
+	if got := retentionCounterByLabels(t, reg, "crawler_content_retention_passes_total", map[string]string{"result": "skipped_pending"}); got != 1 {
+		t.Errorf("passes{skipped_pending} = %v, want 1", got)
+	}
+	if got := retentionCounterValue(t, reg, "crawler_content_retention_skips_total"); got != 2 {
+		t.Errorf("skips = %v, want прежние 2 (интерлок ни при чём)", got)
+	}
+
+	// Исключённые защитой записи — по стримам: запись, ждущая оба стрима,
+	// считается в каждом; работающие счётчики не трогают.
+	m.Observe(RetentionStats{
+		Rows:     2,
+		Deferred: map[string]int64{"q:render": 1, "q:analyze": 2},
+	}, time.Second)
+	if got := retentionCounterByLabels(t, reg, "crawler_content_retention_deferred_total", map[string]string{"stream": "q:render"}); got != 1 {
+		t.Errorf("deferred{q:render} = %v, want 1", got)
+	}
+	if got := retentionCounterByLabels(t, reg, "crawler_content_retention_deferred_total", map[string]string{"stream": "q:analyze"}); got != 2 {
+		t.Errorf("deferred{q:analyze} = %v, want 2", got)
+	}
+	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 24 {
+		t.Errorf("rows = %v, want 24 (чистка шла вместе с исключениями)", got)
 	}
 }
 

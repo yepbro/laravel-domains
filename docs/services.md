@@ -189,7 +189,9 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
 | `crawler_content_retention_rows_total` / `_refs_total` / `_contents_total` / `_freed_bytes_total` | counter | — | http-worker (T-166) | итог каждого прохода RetentionLoop (хук `RetentionOptions.OnPass`): строки `subdomain_results`, очищенные от контента/jsonb, срезанные ссылки `content_hash`, удалённые строки `contents` и их сжатые байты (место физически возвращает компактификация паков T-045 — сходимость видно по `disk_avail`); останов роста при работающем цикле = candidates кончились (плато) |
 | `crawler_content_retention_skips_total` | counter | — | http-worker (T-166) | пропуски прохода по интерлоку: глубина q:analyze у порога `content.retention_analyze_watermark` — анализатор не успевает, тела и headers/cookies ещё нужны; рост = анализ отстаёт, диск продолжает расти |
-| `crawler_content_retention_pass_seconds` / `crawler_content_retention_passes_total{result}` | histogram / counter | `result` | http-worker (T-166) | длительность и число проходов retention (`ok` — дренаж выполнен, `skipped` — интерлок; алерт по `rate(passes{result="skipped"})`) |
+| `crawler_content_retention_pending_errors_total` | counter | — | http-worker (T-166/T-167) | пропуски прохода по ошибке чтения непотреблённых ключей q:render/q:analyze (консервативно — записи очередей не тронуты); рост = защита не может прочитать стримы, разбираться сразу: без неё окно чистки ждущих записей открыто |
+| `crawler_content_retention_deferred_total` | counter | `stream` | http-worker (T-166/T-167) | записи, исключённые из чистки: сообщения ждут потребителей стрима (`q:render` — рендер SPA, `q:analyze` — анализ; запись может ждать оба — считается в каждом); растёт при застое очередей — сигнал дренировать потребителей (runbooks §5.2) |
+| `crawler_content_retention_pass_seconds` / `crawler_content_retention_passes_total{result}` | histogram / counter | `result` | http-worker (T-166) | длительность и число проходов retention (`ok` — дренаж выполнен, `skipped` — интерлок, `skipped_pending` — ошибка чтения защиты; алерты по `rate(passes{result="skipped"})` и `rate(passes{result="skipped_pending"})`) |
 | `crawler_content_retention_bad_hashes_total` / `crawler_content_retention_missing_refs_total` | counter | — | http-worker (T-166) | аномалии учёта: срезанные ссылки с хэшем неверной длины / без строки `contents`; в норме не растут вовсе — рост = ошибка писателя (T-056) или расхождение refcount (T-044) |
 | `crawler_unit_oom_events` | gauge | `unit`, `kind` | monitor (T-145) | проход алертов (60 с): счётчики memory.events cgroup v2 юнитов `crawler-*.service` (kind=oom/oom_kill); обнуляются пересозданием cgroup на рестарте юнита — gauge, не counter; рост = события OOM (алерт unit_oom) |
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
@@ -417,8 +419,11 @@ T-109) и повторных проверок `temp_error`
   не ждущие рендера теряют `content_hash` и тяжёлые jsonb одной
   транзакцией с уменьшением `contents.refcount` (паспорт строки
   остаётся); интерлок — глубина `q:analyze` у порога (гейт T-026):
-  анализатор не успевает — проход пропускается (метрики
-  `crawler_content_retention_*`); механика и критерии —
+  анализатор не успевает — проход пропускается; точная защита —
+  записи, чьи сообщения ещё не потреблены `q:render`/`q:analyze`,
+  исключаются из пачек по снимку стримов (адаптер над Redis-клиентом
+  гейта, fix T-166/T-167; метрики `crawler_content_retention_*`);
+  механика и критерии —
   [`content.md`](content.md) «Retention контента и трим не-находок».
 - хосты редиректов резолвятся «через тот же резолвер» (ТЗ 5.5 п. 2):
   `dnsclient` с лимитами T-035 → адаптер `httpworker.NewDNSLookup` →
