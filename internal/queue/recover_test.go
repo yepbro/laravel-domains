@@ -2,8 +2,8 @@
 // Redis: фейк reliab_test.go (одноразовый клейм — как живой PEL, idle
 // сбрасывается). Проверяются клейм → обработка → XACK, ядовитая обработка
 // без подтверждения, дренаж полной пачки без ожидания тика, перевод
-// исчерпавших попытки в q:dead (обработчик не зовётся), дефолты опций,
-// чистый выход по отмене ctx.
+// исчерпавших попытки в q:dead (обработчик не зовётся), темп обхода
+// batch/interval (T-153), дефолты опций, чистый выход по отмене ctx.
 
 package queue
 
@@ -392,8 +392,14 @@ func TestRecoverLoopValidation(t *testing.T) {
 // не замечает), единичные значения не заменяются.
 func TestRecoverOptionsDefaults(t *testing.T) {
 	o := RecoverOptions{}.withDefaults()
-	if o.Batch != 16 {
-		t.Errorf("Batch = %d, хочу 16 (DefaultRecoverBatch, литерал — пин константы)", o.Batch)
+	if DefaultRecoverBatch != 64 {
+		t.Errorf("DefaultRecoverBatch = %d, хочу 64 (T-153: темп обхода PEL; литерал — пин константы)", DefaultRecoverBatch)
+	}
+	if DefaultRecoverInterval != 30*time.Second {
+		t.Errorf("DefaultRecoverInterval = %s, хочу 30s (литерал — пин константы)", DefaultRecoverInterval)
+	}
+	if o.Batch != 64 {
+		t.Errorf("Batch = %d, хочу 64 (DefaultRecoverBatch, литерал — пин константы)", o.Batch)
 	}
 	if o.Interval != 30*time.Second {
 		t.Errorf("Interval = %s, хочу 30s (DefaultRecoverInterval, литерал — пин константы)", o.Interval)
@@ -518,5 +524,91 @@ func TestRecoverLoopAttemptValidation(t *testing.T) {
 	}
 	if len(fake.claims) != 0 {
 		t.Errorf("Redis вызван с плохими аргументами: %+v", fake.claims)
+	}
+}
+
+// pacingClaimRedis — fakeClaimRedis с потокобезопасным наблюдением
+// клеймов: цикл клеймит в своей горутине, тест темпа читает счётчик
+// на лету (T-153), не останавливая цикл (стиль наблюдения — как канал
+// processed runRecoverLoop, а не после stop). Встроенный протокол
+// claims трогает только горутина цикла — тест читает лишь поля под
+// мьютексом.
+type pacingClaimRedis struct {
+	fakeClaimRedis
+	mu     sync.Mutex
+	nclaim int
+	count  int64 // Count последнего XAUTOCLAIM (пачка из опций)
+}
+
+func (f *pacingClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
+	f.mu.Lock()
+	f.nclaim++
+	f.count = a.Count
+	f.mu.Unlock()
+	return f.fakeClaimRedis.XAutoClaim(ctx, a)
+}
+
+func (f *pacingClaimRedis) claims() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nclaim
+}
+
+// batch — фактическая пачка клейма (Count XAUTOCLAIM из опций).
+func (f *pacingClaimRedis) batch() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.count
+}
+
+// TestRecoverLoopIntervalPaces — темп обхода (T-153): неполная пачка —
+// следующий клейм не раньше Interval (тик), полная — дренируется без
+// паузы (TestRecoverLoopDrainsFullBatch). Цикл собирается вручную, а не
+// runRecoverLoop: хелпер типизирован под *fakeClaimRedis, а наблюдение
+// клеймов на лету требует переопределения XAutoClaim (pacing-фейк).
+func TestRecoverLoopIntervalPaces(t *testing.T) {
+	fake := &pacingClaimRedis{fakeClaimRedis: fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 1}},
+		},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	processed := make(chan Delivery, 2)
+	done := make(chan error, 1)
+	r := NewReliab(fake, NewRedisQueue(fake, RedisOptions{}), ReliabOptions{MinIdle: time.Minute})
+	go func() {
+		done <- RecoverLoop(ctx, r, func(_ context.Context, d Delivery) error {
+			processed <- d
+			return nil
+		}, RecoverOptions{
+			Stream: StreamHTTP, Group: "http", Consumer: "recover-1",
+			Batch: 2, Interval: 120 * time.Millisecond,
+		})
+	}()
+	stop := func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("RecoverLoop не остановился по отмене ctx")
+		}
+	}
+	defer stop()
+
+	waitProcessed(t, processed) // первая пачка: 1 запись < Batch 2 → тик
+	// Пачка из опций применена к первому клейму (Count = Batch).
+	if c := fake.batch(); c != 2 {
+		t.Errorf("XAUTOCLAIM Count = %d, хочу 2 (Batch из опций)", c)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if n := fake.claims(); n != 1 {
+		t.Errorf("клеймов до тика: %d, хочу 1 (неполная пачка ждёт Interval, не клейм сразу)", n)
+	}
+	time.Sleep(400 * time.Millisecond) // > 2 тиков по 120 мс
+	if n := fake.claims(); n < 2 {
+		t.Errorf("клеймов после тиков: %d, хочу ≥ 2 (тик задаёт темп, обход не прекращается)", n)
 	}
 }

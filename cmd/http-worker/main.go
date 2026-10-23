@@ -183,7 +183,8 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Возврат зависших доставок q:http (T-025): RecoverLoop в воркере —
 	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
-	// — секция redis (max_attempts, claim_min_idle).
+	// и темпа — секция redis (max_attempts, claim_min_idle,
+	// recover_batch, recover_interval — T-153).
 	rel := queue.NewReliab(rdb, rawQ, queue.ReliabOptions{
 		MaxAttempts: cfg.Redis.MaxAttempts,
 		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
@@ -229,8 +230,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		PerDomain:    cfg.HTTP.TaskPerDomain,
 		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — не следовать (T-006/T-048)
 		Recover:      rel,                   // возврат зависших задач q:http (T-025)
-		Metrics:      reg,                   // приборы этапа: задачи, ошибки, статусы, время ответа, rendered (T-077)
-		Log:          logger,
+		// Темп возврата зависших (T-153): пачка/интервал клейма —
+		// redis.recover_*.
+		RecoverBatch:    cfg.Redis.RecoverBatch,
+		RecoverInterval: cfg.Redis.RecoverInterval.D(),
+		Metrics:         reg, // приборы этапа: задачи, ошибки, статусы, время ответа, rendered (T-077)
+		Log:             logger,
 		// Цепочка OnResult (внутри обработки задачи, до XACK, ТЗ 4.2):
 		// сохранение контента (T-056) → запись subdomain_results со свопом
 		// ссылок contents (T-058/T-044) → публикация q:analyze (T-058,

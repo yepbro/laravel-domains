@@ -677,9 +677,18 @@ type Options struct {
 	AskAAAA bool
 	// Recover — слой возврата зависших доставок (Reliab, T-025): Run
 	// поднимает фоновый RecoverLoop (XAUTOCLAIM → та же обработка →
-	// XACK) с теми же Group/Consumer/Batch; nil — восстановления нет
+	// XACK) с теми же Group/Consumer; nil — восстановления нет
 	// (изолированные сборки и тесты без Redis-специфики).
 	Recover *queue.Reliab
+	// RecoverBatch — пачка клейма RecoverLoop за проход; 0 — дефолт
+	// очереди (queue.DefaultRecoverBatch). Боевая сборка передаёт
+	// redis.recover_batch (T-153): темп возврата зависших — настраиваемая
+	// величина очереди, а не окно потребления этапа.
+	RecoverBatch int
+	// RecoverInterval — период опроса зависших записей RecoverLoop;
+	// 0 — дефолт очереди (queue.DefaultRecoverInterval). Конфиг —
+	// redis.recover_interval (T-153).
+	RecoverInterval time.Duration
 	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него Run
 	// строит приборы этапа (NewMetrics — счётчик эпизодов, гистограмма
 	// длительностей, счётчик финальных статусов); nil — без метрик
@@ -756,7 +765,10 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 				Stream:   queue.StreamDNS,
 				Group:    o.Group,
 				Consumer: o.Consumer,
-				Batch:    o.Consume,
+				// Темп обхода PEL — очередь, не этап (redis.recover_*,
+				// T-153); нули — дефолты очереди.
+				Batch:    o.RecoverBatch,
+				Interval: o.RecoverInterval,
 				Log:      log,
 			})
 		}()

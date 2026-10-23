@@ -51,6 +51,8 @@ func TestDefault(t *testing.T) {
 		{"redis.maxlen", c.Redis.MaxLen, 0},
 		{"redis.max_attempts", c.Redis.MaxAttempts, 3},
 		{"redis.claim_min_idle", c.Redis.ClaimMinIdle.D(), 10 * time.Minute},
+		{"redis.recover_batch", c.Redis.RecoverBatch, 64},
+		{"redis.recover_interval", c.Redis.RecoverInterval.D(), 30 * time.Second},
 		{"redis.trim_interval", c.Redis.TrimInterval.D(), time.Minute},
 		{"ingest.dir", c.Ingest.Dir, "/data/incoming"},
 		{"ingest.batch_size", c.Ingest.BatchSize, 50000},
@@ -144,6 +146,8 @@ redis:
   maxlen: 250000
   max_attempts: 5
   claim_min_idle: "90s"
+  recover_batch: 128
+  recover_interval: "20s"
   trim_interval: "3m"
 ingest:
   dir: "/srv/incoming"
@@ -235,6 +239,8 @@ log:
 		{"redis.maxlen", cfg.Redis.MaxLen, 250000},
 		{"redis.max_attempts", cfg.Redis.MaxAttempts, 5},
 		{"redis.claim_min_idle", cfg.Redis.ClaimMinIdle.D(), 90 * time.Second},
+		{"redis.recover_batch", cfg.Redis.RecoverBatch, 128},
+		{"redis.recover_interval", cfg.Redis.RecoverInterval.D(), 20 * time.Second},
 		{"redis.trim_interval", cfg.Redis.TrimInterval.D(), 3 * time.Minute},
 		{"ingest.dir", cfg.Ingest.Dir, "/srv/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 10000},
@@ -402,6 +408,8 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_REDIS_MAXLEN":                     "300000",
 		"CRAWLER_REDIS_MAX_ATTEMPTS":               "6",
 		"CRAWLER_REDIS_CLAIM_MIN_IDLE":             "2m",
+		"CRAWLER_REDIS_RECOVER_BATCH":              "96",
+		"CRAWLER_REDIS_RECOVER_INTERVAL":           "15s",
 		"CRAWLER_REDIS_TRIM_INTERVAL":              "45s",
 		"CRAWLER_INGEST_DIR":                       "/env/incoming",
 		"CRAWLER_INGEST_BATCH_SIZE":                "1234",
@@ -478,6 +486,8 @@ func TestEnvOverrides(t *testing.T) {
 		{"redis.maxlen", cfg.Redis.MaxLen, 300000},
 		{"redis.max_attempts", cfg.Redis.MaxAttempts, 6},
 		{"redis.claim_min_idle", cfg.Redis.ClaimMinIdle.D(), 2 * time.Minute},
+		{"redis.recover_batch", cfg.Redis.RecoverBatch, 96},
+		{"redis.recover_interval", cfg.Redis.RecoverInterval.D(), 15 * time.Second},
 		{"redis.trim_interval", cfg.Redis.TrimInterval.D(), 45 * time.Second},
 		{"ingest.dir", cfg.Ingest.Dir, "/env/incoming"},
 		{"ingest.batch_size", cfg.Ingest.BatchSize, 1234},
@@ -756,6 +766,11 @@ func TestValidate(t *testing.T) {
 		{"redis.max_attempts 0", func(c *Config) { c.Redis.MaxAttempts = 0 }, "redis.max_attempts"},
 		{"redis.max_attempts велик", func(c *Config) { c.Redis.MaxAttempts = 101 }, "redis.max_attempts"},
 		{"claim_min_idle 0", func(c *Config) { c.Redis.ClaimMinIdle = 0 }, "redis.claim_min_idle"},
+		{"recover_batch 0", func(c *Config) { c.Redis.RecoverBatch = 0 }, "redis.recover_batch"},
+		{"recover_batch велик", func(c *Config) { c.Redis.RecoverBatch = 1001 }, "redis.recover_batch"},
+		{"recover_interval 0", func(c *Config) { c.Redis.RecoverInterval = 0 }, "redis.recover_interval"},
+		{"recover_interval меньше секунды", func(c *Config) { c.Redis.RecoverInterval = Duration(10 * time.Millisecond) }, "redis.recover_interval"},
+		{"recover_interval больше часа", func(c *Config) { c.Redis.RecoverInterval = Duration(90 * time.Minute) }, "redis.recover_interval"},
 		{"trim_interval 0", func(c *Config) { c.Redis.TrimInterval = 0 }, "redis.trim_interval"},
 		{"trim_interval меньше секунды", func(c *Config) { c.Redis.TrimInterval = Duration(10 * time.Millisecond) }, "redis.trim_interval"},
 		{"trim_interval больше суток", func(c *Config) { c.Redis.TrimInterval = Duration(25 * time.Hour) }, "redis.trim_interval"},

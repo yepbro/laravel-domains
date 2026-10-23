@@ -87,6 +87,18 @@ type Redis struct {
 	// ClaimMinIdle — минимальный простой зависшей (pending без XACK)
 	// записи до возврата в работу клеймом XAUTOCLAIM (T-025).
 	ClaimMinIdle Duration `yaml:"claim_min_idle"`
+	// RecoverBatch — пачка клейма XAUTOCLAIM за один проход RecoverLoop
+	// (T-153): темп возврата зависших записей в работу — batch/interval
+	// за проход; задаёт время самовосстановления после инцидентов
+	// (≈ размер PEL / (batch/interval)). Вместе с пачкой соблюдается
+	// инвариант «время последовательного обхода пачки (худшая запись
+	// этапа × batch) < claim_min_idle», иначе хвост пачки перклеймивается
+	// соседними воркерами и жжёт попытки — расчёт в docs/configuration.md
+	// (раздел redis).
+	RecoverBatch int `yaml:"recover_batch"`
+	// RecoverInterval — период опроса зависших записей RecoverLoop при
+	// неполной пачке (T-153); полная пачка дренируется без паузы.
+	RecoverInterval Duration `yaml:"recover_interval"`
 	// TrimInterval — период освобождения подтверждённого префикса
 	// стримов (T-141, ТЗ 4.2 «Дополнение 2026-10-23»): XACK не удаляет
 	// записи из стрима, и подтверждённая история копилась бы до потолка
@@ -380,6 +392,16 @@ func Default() *Config {
 			// contexts=1 — до ~13,8 мин, порог поднимают вместе с
 			// понижением contexts, см. queue.DefaultClaimMinIdle).
 			ClaimMinIdle: Duration(10 * time.Minute),
+			// Темп возврата зависших (T-153): 64 за проход — нижняя грань
+			// поднятой пачки, согласованная с инвариантом «обход пачки
+			// < claim_min_idle»: типовая запись рендера ~5 с × 64 ≈ 5,3 мин
+			// < 10 мин (запас ×1,9); 128 типовым случаем уже не укладывается
+			// (≈10,7 мин). Обоснование и цена повтора — queue.
+			// DefaultRecoverBatch (синхронный дефолт очереди).
+			RecoverBatch: 64,
+			// 30 с — латентность возврата MinIdle + до одного интервала
+			// (queue.DefaultRecoverInterval, синхронный дефолт очереди).
+			RecoverInterval: Duration(30 * time.Second),
 			// Минута — единицы процентов бюджета Redis между проходами
 			// при текущих темпах этапов (queue.DefaultTrimInterval).
 			TrimInterval: Duration(time.Minute),
@@ -639,6 +661,20 @@ func (c *Config) Validate() error {
 	}
 	if c.Redis.ClaimMinIdle <= 0 {
 		problems = append(problems, nonPositiveDur("redis.claim_min_idle", c.Redis.ClaimMinIdle))
+	}
+	// Темп возврата зависших (T-153): минимум 1 — клейм за проход;
+	// потолок 1000 — от опечаток (реальный потолок — инвариант
+	// «batch × худшее время записи < claim_min_idle», он арифметический,
+	// а не диапазонный — см. docs/configuration.md, раздел redis).
+	if !inRange(c.Redis.RecoverBatch, 1, 1000) {
+		problems = append(problems, rangeMsg("redis.recover_batch", c.Redis.RecoverBatch, 1, 1000))
+	}
+	// Чаще секунды — холостые проходы по четырём стримам (как у
+	// trim_interval); реже часа — обход PEL после инцидента затягивается
+	// на сутки (5К записей / 64 за проход × 1 ч ≈ 78 ч).
+	if c.Redis.RecoverInterval < Duration(time.Second) || c.Redis.RecoverInterval > Duration(time.Hour) {
+		problems = append(problems, fmt.Sprintf("redis.recover_interval: ожидается %s..%s, задано %s",
+			Duration(time.Second), Duration(time.Hour), c.Redis.RecoverInterval))
 	}
 	// Коридор осмысленных значений: чаще секунды — холостые проходы по
 	// четырём стримам, реже суток — история копится до потолка MAXLEN

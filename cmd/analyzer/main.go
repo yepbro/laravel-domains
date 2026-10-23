@@ -115,7 +115,8 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Возврат зависших доставок q:analyze (T-025): RecoverLoop в воркере —
 	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
-	// — секция redis (max_attempts, claim_min_idle).
+	// и темпа — секция redis (max_attempts, claim_min_idle,
+	// recover_batch, recover_interval — T-153).
 	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
 		MaxAttempts: cfg.Redis.MaxAttempts,
 		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
@@ -151,8 +152,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	opts := analyzer.Options{
 		MinScore: cfg.Analyzer.LaravelMinScore,
 		Recover:  rel, // возврат зависших задач q:analyze (T-025)
-		Metrics:  reg, // приборы этапа: задачи и длительности (T-077)
-		Log:      logger,
+		// Темп возврата зависших (T-153): пачка/интервал клейма —
+		// redis.recover_*.
+		RecoverBatch:    cfg.Redis.RecoverBatch,
+		RecoverInterval: cfg.Redis.RecoverInterval.D(),
+		Metrics:         reg, // приборы этапа: задачи и длительности (T-077)
+		Log:             logger,
 	}
 	w, err := analyzer.New(pool, q, store, reloader, opts)
 	if err != nil {

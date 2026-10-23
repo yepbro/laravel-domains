@@ -142,7 +142,8 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Возврат зависших доставок q:render (T-025): RecoverLoop в воркере —
 	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
-	// — секция redis (max_attempts, claim_min_idle).
+	// и темпа — секция redis (max_attempts, claim_min_idle,
+	// recover_batch, recover_interval — T-153).
 	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
 		MaxAttempts: cfg.Redis.MaxAttempts,
 		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
@@ -159,8 +160,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// их для ProcessResult, цикл Run берёт те же Group/Consume/Alive.
 	opts := renderworker.Options{
 		Recover: rel, // возврат зависших задач q:render (T-025)
-		Metrics: reg, // приборы этапа: задачи, длительности, ошибки классов, rendered (T-077)
-		Log:     logger,
+		// Темп возврата зависших (T-153): пачка/интервал клейма —
+		// redis.recover_*; инвариант с claim_min_idle (рендер — самый
+		// медленный последовательный обход) — docs/configuration.md.
+		RecoverBatch:    cfg.Redis.RecoverBatch,
+		RecoverInterval: cfg.Redis.RecoverInterval.D(),
+		Metrics:         reg, // приборы этапа: задачи, длительности, ошибки классов, rendered (T-077)
+		Log:             logger,
 		// Зонд браузера: мёртвое поколение менеджер заменяет прямо в зонде
 		// (Manager.Alive, T-065 — реконнект после потери Chromium), здесь —
 		// только пауза потребления, пока старт не удастся: доставки

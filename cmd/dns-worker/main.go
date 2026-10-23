@@ -144,7 +144,8 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Возврат зависших доставок q:dns (T-025): RecoverLoop в воркере —
 	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
-	// — секция redis (max_attempts, claim_min_idle).
+	// и темпа — секция redis (max_attempts, claim_min_idle,
+	// recover_batch, recover_interval — T-153).
 	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
 		MaxAttempts: cfg.Redis.MaxAttempts,
 		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
@@ -178,7 +179,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		Concurrency: cfg.DNS.Concurrency, // параллелизм эпизодов = dns.concurrency (ТЗ 5.10)
 		AskAAAA:     cfg.DNS.IPv6,        // AAAA отключаются конфигом без IPv6 (ТЗ 5.4)
 		Recover:     rel,                 // возврат зависших пачек q:dns (T-025)
-		Metrics:     reg,                 // приборы этапа: эпизоды, длительности, статусы (T-077)
-		Log:         logger,
+		// Темп возврата зависших (T-153): пачка/интервал клейма —
+		// redis.recover_*.
+		RecoverBatch:    cfg.Redis.RecoverBatch,
+		RecoverInterval: cfg.Redis.RecoverInterval.D(),
+		Metrics:         reg, // приборы этапа: эпизоды, длительности, статусы (T-077)
+		Log:             logger,
 	})
 }
