@@ -2,15 +2,21 @@
 # Ежедневная выгрузка списка новых доменов (NRD) smet.cz в наблюдаемую
 # папку ingest: deploy/nrd/README.md, docs/deploy.md §4.9.
 #
-# Источник https://smet.cz/nrd/data/today.txt обновляется ежедневно
-# (~20:19 UTC); запуск в 19:17 UTC забирает срез предыдущих суток —
-# между двумя запусками ровно один срез, дублей по sha256 не бывает.
+# Источник публикует дни immutable-файлами /nrd/data/daily/<дата>.txt[.gz]
+# («файл дня растёт до закрытия дня, затем не меняется»; справка —
+# https://smet.cz/nrd/). Берём **закрытый** день — файл вчерашней (UTC)
+# даты: на момент запуска 20:33 UTC следующего дня он закрыт (генерация
+# источника ~20:10–20:19 UTC, запас > 20 ч) и больше не изменится. Файл
+# текущего дня до ~20:19 UTC отсутствует (404), а сразу после публикации
+# ещё растёт — гарантию полного дня не даёт, не используется. Справка
+# источника сама рекомендует забирать только закрытые дни.
 #
-# Файл зона-less (домены разных зон в одном списке): кладётся в
-# <incoming>/add/, зоны строк выводятся из самих доменов
-# (docs/incoming-files.md §1). Доставка — по контракту «Готовность
-# файла» (§2): запись под временным именем *.part (наблюдатель его
-# игнорирует) + атомарное переименование в *.txt.
+# Формат .txt.gz (~2,6 МиБ вместо ~8 МиБ): ingest принимает .gz-архивы
+# (docs/incoming-files.md §9: .gz — один член). Список зона-less —
+# кладётся в <incoming>/add/, зоны строк выводятся из самих доменов
+# (§1). Доставка — по контракту «Готовность файла» (§2): запись под
+# временным именем *.part (наблюдатель его игнорирует) + атомарное
+# переименование в *.txt.gz.
 #
 # Вызов: cron /etc/cron.d/crawler-nrd (root) или вручную. Пути
 # переопределяются окружением — тестируемость без root и /var/lib.
@@ -18,11 +24,13 @@
 # запуска и писем cron).
 set -euo pipefail
 
-url="https://smet.cz/nrd/data/today.txt"
+base="${CRAWLER_NRD_BASE:-https://smet.cz/nrd/data/daily}"
+day="${CRAWLER_NRD_DAY:-$(date -u -d yesterday +%F)}"
 incoming="${CRAWLER_NRD_INCOMING:-/var/lib/crawler/incoming}"
 owner="${CRAWLER_NRD_OWNER:-crawler-ingest}"
 group="${CRAWLER_NRD_GROUP:-crawler}"
 
+url="$base/$day.txt.gz"
 tag="crawler-nrd-fetch"
 log() {
     logger -t "$tag" -- "$*" 2>/dev/null || true
@@ -30,15 +38,15 @@ log() {
 }
 
 dest_dir="$incoming/add"
-dest="$dest_dir/nrd-$(date -u +%F).txt"
+dest="$dest_dir/nrd-$day.txt.gz"
 part="$dest.part"
 
 mkdir -p "$dest_dir"
 # прибраться за прерванными загрузками прошлых суток (старше 24 ч)
-find "$dest_dir" -maxdepth 1 -type f -name 'nrd-*.txt.part' -mmin +1440 -print -delete || true
+find "$dest_dir" -maxdepth 1 -type f -name 'nrd-*.part' -mmin +1440 -print -delete || true
 
 # --fail: HTTP 4xx/5xx — ошибка, а не HTML-страница в файл;
-# --retry: повторные попытки на обрывы и 5xx Cloudflare.
+# --retry: повторные попытки на обрывы и 5xx CDN.
 if ! curl -fsS --connect-timeout 30 --max-time 300 --retry 3 --retry-delay 15 \
         -o "$part" "$url"; then
     rm -f "$part"
@@ -46,9 +54,11 @@ if ! curl -fsS --connect-timeout 30 --max-time 300 --retry 3 --retry-delay 15 \
     exit 1
 fi
 
-if [ ! -s "$part" ]; then
+# санитарные проверки: непустой файл и gzip-магика 1f 8b — отсекают
+# HTML-заглушку с HTTP 200 и пустой/обрезанный ответ
+if [ ! -s "$part" ] || [ "$(od -An -N2 -tx1 "$part" | tr -d ' \n')" != "1f8b" ]; then
     rm -f "$part"
-    log "СБОЙ: $url вернул пустой файл"
+    log "СБОЙ: $url вернул не gzip-файл (пустой/битый)"
     exit 1
 fi
 
@@ -58,10 +68,9 @@ fi
 chown "$owner:$group" "$part" 2>/dev/null || true
 chmod 0640 "$part" 2>/dev/null || true
 
-# атомарно: наблюдатель видит только завершённый *.txt
+# атомарно: наблюдатель видит только завершённый *.txt.gz
 mv -f "$part" "$dest"
 
 size="$(wc -c <"$dest")"
-lines="$(wc -l <"$dest")"
 sha="$(sha256sum "$dest" | cut -d' ' -f1)"
-log "OK: $url -> $dest ($size байт, $lines строк, sha256 $sha); обработает crawler-ingest"
+log "OK: день $day закрыт, $url -> $dest ($size байт, sha256 $sha); обработает crawler-ingest"

@@ -89,7 +89,7 @@
 10. **Подать домены** — файлы в `/var/lib/crawler/incoming/`
     (контракт — [`incoming-files.md`](incoming-files.md)).
 11. **Входящий фид NRD** (опционально) — cron-выгрузка списка новых
-    доменов smet.cz в `incoming/add/` ежедневно в 19:17 UTC:
+    доменов smet.cz в `incoming/add/` ежедневно в 20:33 UTC:
     [`deploy/nrd/`](../deploy/nrd/), [`deploy.md`](deploy.md) §4.9.
 
 Раскладка памяти (MemoryMax по юнитам) и обоснование — [`deploy.md`](deploy.md) §2.

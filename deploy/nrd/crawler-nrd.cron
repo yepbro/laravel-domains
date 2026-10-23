@@ -1,9 +1,9 @@
 # Ежедневная выгрузка списка новых доменов (NRD) smet.cz в incoming/
 # ingest — deploy/nrd/README.md, docs/deploy.md §4.9.
 #
-# Время: 19:17 UTC. Ниже — часы МЕСТНОГО времени сервера: cron не умеет
-# per-file TZ, зона сервера Europe/Moscow (UTC+3) => 22:17. При смене
-# зоны сервера (timedatectl) пересчитайте часы строки обратно в 19:17 UTC.
+# Время: 20:33 UTC. Ниже — часы МЕСТНОГО времени сервера: cron не умеет
+# per-file TZ, зона сервера Europe/Moscow (UTC+3) => 23:33. При смене
+# зоны сервера (timedatectl) пересчитайте часы строки обратно в 20:33 UTC.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-17 22 * * * root /usr/local/bin/crawler-fetch-nrd
+33 23 * * * root /usr/local/bin/crawler-fetch-nrd
