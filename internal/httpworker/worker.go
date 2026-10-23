@@ -28,6 +28,14 @@
 // чьей-либо строкой subdomain_results (свёрнутый вариант, проигравший
 // класс алиасов, повторное скачивание того же контента), отпускает
 // ссылку Delete; ставшая — переносится в строку записи (T-056).
+//
+// Память слота наблюдаема (T-163): занятые слоты, байты тел в обработке
+// и распределение размеров тел экспортируются в /metrics (метрики
+// crawler_http_tasks_inflight / crawler_http_body_bytes_inflight /
+// crawler_http_body_bytes) — сэмплер считает «память юнита / слот» для
+// критерия возврата task_concurrency 256; мягкий потолок кучи
+// http.mem_limit (cmd/http-worker) удерживает anon ниже MemoryHigh
+// юнита вместо reclaim-штормов ядра.
 package httpworker
 
 import (
@@ -501,10 +509,13 @@ const (
 	// §3/§11): сутки на 256 слотах — два фатала юнита
 	// (load-measurements.md §12: 05:48 OOM-kill, 09:17 выход на пик
 	// 900.5 MiB = MemoryMax; MemoryHigh 850M — 120 095
-	// reclaim-событий) при ≈3.3 MiB anon на слот; 192 устойчивы
-	// (пропитка этапа 22: 860–893 MiB, oom=0, NRestarts=0), скорость
-	// ≈17–19 дом/с. Временно до T-163 (стриминг тел — снижение
-	// пиковой памяти слота), после — вернуть 256 по замеру.
+	// reclaim-событий) при ≈3.3 MiB anon на слот (тела удерживались до
+	// конца задачи — до раннего Put T-147); 192 устойчивы (пропитка
+	// волны 21: 860–893 MiB, oom=0, NRestarts=0), скорость ≈17–19 дом/с.
+	// T-163 закрыл остаток профиля (метрики замера слота + мягкий
+	// потолок кучи http.mem_limit против reclaim-штормов MemoryHigh);
+	// возврат 256 — по замеру сэмплером после деплоя (критерий
+	// ≤1.5 MiB/слот и сутки без троттлинга MemoryHigh), не кодом.
 	DefaultConcurrency = 192
 
 	// DefaultConsume — записей q:http за одно чтение: размер пачки
@@ -1002,8 +1013,26 @@ func (w *Worker) checkScheme(
 		check.ErrText = "тело обрезано потолком max_body_bytes (данные частичны)"
 	}
 
+	// Окно удержания тела (T-163): от завершения чтения до конца
+	// обработки (UTF-8 → хэш → SPA → ранний Put) байты живут в слоте —
+	// это транзитная составляющая памяти слота, её видит gauge
+	// crawler_http_body_bytes_inflight (замер критерия сэмплером);
+	// прочитанный размер — в гистограмму смеси (обрезанные тела входят
+	// как есть: потолок режет и их). Размер фиксируется до выхода из
+	// области видимости body (ниже body = nil).
+	held := int64(len(body))
+	w.met.BodyHeld(held)
+	defer func() { w.met.BodyHeld(-held) }()
+	w.met.BodySize(len(body))
+
 	cs := httpfetch.ToUTF8(res.Header, body)
 	check.Charset = cs.Charset
+	// Исходные байты тела больше не нужны (T-163): при декодировании
+	// не-UTF-8 кодировки ToUTF8 вернула копию — сырые байты освобождаются
+	// здесь, до хэша/SPA/Put; быстрый путь без копии делит слайс с
+	// cs.UTF8, присваивание ничего не меняет. Учёт удержания выше ведётся
+	// по зафиксированному held, а не по слайсу.
+	body = nil
 	hash := content.HashOf(cs.UTF8)
 	check.ContentHash = &hash
 	spa := httpfetch.DetectSPA(cs.UTF8)
@@ -1330,6 +1359,11 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, o Opti
 		// исчерпает попытки и унесёт её в q:dead (T-025).
 		return fmt.Errorf("httpworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
 	}
+	// Слот занят до конца обработки (T-163): обе точки входа (диспетчер
+	// Run и клеймы RecoverLoop) идут через здесь — gauge занятости
+	// совпадает с множеством задач, держащих память юнита.
+	w.met.SlotEnter()
+	defer w.met.SlotLeave()
 	start := time.Now()
 	res, err := w.ProcessDomain(ctx, task)
 	if err != nil {

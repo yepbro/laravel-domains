@@ -330,8 +330,14 @@ Put освобождает байты сразу после чтения; в з�
 заголовки, цепочки и вердикты, читаемые тела ограничены
 `http.task_per_domain` × `max_body_bytes` (буфер чтения
 предвыделяется по Content-Length без Content-Encoding — без удвоений
-`io.ReadAll`). Потолок тела — `max_body_bytes` (2 МиБ), страниц в
-задаче ≤ 2 × субдомены ≤ 126 (§5.10).
+`io.ReadAll`; исходные байты не-UTF-8 тел освобождаются сразу после
+декодирования, до хэша/SPA/Put — T-163). Потолок тела —
+`max_body_bytes` (2 МиБ), страниц в задаче ≤ 2 × субдомены ≤ 126
+(§5.10). Замер критерия ≤1.5 MiB/слот (T-163): anon юнита /
+`crawler_http_tasks_inflight`, пики транзитных буферов —
+`crawler_http_body_bytes_inflight`, смесь — гистограмма
+`crawler_http_body_bytes` (/metrics http-worker, 9104); мягкий потолок
+кучи `http.mem_limit` держит anon ниже MemoryHigh юнита.
 
 ## Замена контента рендером (T-067)
 

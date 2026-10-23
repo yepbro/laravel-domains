@@ -146,6 +146,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_HTTP_TASK_CONCURRENCY", setInt(func(c *Config) *int { return &c.HTTP.TaskConcurrency })},
 		{"CRAWLER_HTTP_TASK_CONSUME", setInt(func(c *Config) *int { return &c.HTTP.TaskConsume })},
 		{"CRAWLER_HTTP_TASK_PER_DOMAIN", setInt(func(c *Config) *int { return &c.HTTP.TaskPerDomain })},
+		{"CRAWLER_HTTP_MEM_LIMIT", setSize(func(c *Config) *ByteSize { return &c.HTTP.MemLimit })},
 		{"CRAWLER_RENDER_REMOTE_URL", setString(func(c *Config) *string { return &c.Render.RemoteURL })},
 		{"CRAWLER_RENDER_CONTEXTS", setInt(func(c *Config) *int { return &c.Render.Contexts })},
 		{"CRAWLER_RENDER_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Render.Timeout })},

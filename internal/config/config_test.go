@@ -91,6 +91,7 @@ func TestDefault(t *testing.T) {
 		{"http.task_concurrency", c.HTTP.TaskConcurrency, 192},
 		{"http.task_consume", c.HTTP.TaskConsume, 16},
 		{"http.task_per_domain", c.HTTP.TaskPerDomain, 8},
+		{"http.mem_limit", c.HTTP.MemLimit.B(), int64(768 << 20)},
 		{"render.remote_url", c.Render.RemoteURL, ""},
 		{"render.contexts", c.Render.Contexts, 8},
 		{"render.timeout", c.Render.Timeout.D(), 25 * time.Second},
@@ -209,6 +210,7 @@ http:
   task_concurrency: 128
   task_consume: 8
   task_per_domain: 6
+  mem_limit: "768MiB"
 render:
   remote_url: "ws://10.0.0.9:9222"
   contexts: 4
@@ -310,6 +312,7 @@ log:
 		{"http.task_concurrency", cfg.HTTP.TaskConcurrency, 128},
 		{"http.task_consume", cfg.HTTP.TaskConsume, 8},
 		{"http.task_per_domain", cfg.HTTP.TaskPerDomain, 6},
+		{"http.mem_limit", cfg.HTTP.MemLimit.B(), int64(768 << 20)},
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 4},
 		{"render.timeout", cfg.Render.Timeout.D(), 40 * time.Second},
@@ -495,6 +498,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_HTTP_TASK_CONCURRENCY":               "96",
 		"CRAWLER_HTTP_TASK_CONSUME":                   "32",
 		"CRAWLER_HTTP_TASK_PER_DOMAIN":                "4",
+		"CRAWLER_HTTP_MEM_LIMIT":                      "512MiB",
 		"CRAWLER_RENDER_REMOTE_URL":                   "ws://10.0.0.9:9222",
 		"CRAWLER_RENDER_CONTEXTS":                     "2",
 		"CRAWLER_RENDER_TIMEOUT":                      "11s",
@@ -587,6 +591,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"http.task_concurrency", cfg.HTTP.TaskConcurrency, 96},
 		{"http.task_consume", cfg.HTTP.TaskConsume, 32},
 		{"http.task_per_domain", cfg.HTTP.TaskPerDomain, 4},
+		{"http.mem_limit", cfg.HTTP.MemLimit.B(), int64(512 << 20)},
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 2},
 		{"render.timeout", cfg.Render.Timeout.D(), 11 * time.Second},
@@ -909,6 +914,8 @@ func TestValidate(t *testing.T) {
 		{"task_consume велик", func(c *Config) { c.HTTP.TaskConsume = 1001 }, "http.task_consume"},
 		{"task_per_domain 0", func(c *Config) { c.HTTP.TaskPerDomain = 0 }, "http.task_per_domain"},
 		{"task_per_domain велик", func(c *Config) { c.HTTP.TaskPerDomain = 127 }, "http.task_per_domain"},
+		{"mem_limit мал", func(c *Config) { c.HTTP.MemLimit = ByteSize(1 << 20) }, "http.mem_limit"},
+		{"mem_limit велик", func(c *Config) { c.HTTP.MemLimit = ByteSize(17 << 30) }, "http.mem_limit"},
 		{"user_agent пуст", func(c *Config) { c.HTTP.UserAgent = "" }, "http.user_agent"},
 		{"remote_url кривой", func(c *Config) { c.Render.RemoteURL = "not-url" }, "render.remote_url"},
 		{"contexts 0", func(c *Config) { c.Render.Contexts = 0 }, "render.contexts"},
@@ -1011,9 +1018,10 @@ func TestValidate(t *testing.T) {
 	c := valid()
 	c.Analyzer.LaravelMinScore = 1
 	c.HTTP.MaxRedirects = 0
-	c.HTTP.TaskConcurrency = 10000 // верхняя граница задачного параллелизма (T-139)
-	c.HTTP.TaskConsume = 1000      // верхняя граница пачки чтения
-	c.HTTP.TaskPerDomain = 126     // верхняя граница пула задачи: 2 × 63 субдомена (§5.10)
+	c.HTTP.TaskConcurrency = 10000       // верхняя граница задачного параллелизма (T-139)
+	c.HTTP.TaskConsume = 1000            // верхняя граница пачки чтения
+	c.HTTP.TaskPerDomain = 126           // верхняя граница пула задачи: 2 × 63 субдомена (§5.10)
+	c.HTTP.MemLimit = ByteSize(16 << 30) // верхняя граница мягкого потолка кучи (T-163)
 	c.Ingest.MaxErrorRatio = 1
 	c.Render.RestartMemoryBytes = 0                                                    // контроль памяти отключён — допустимо
 	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)
@@ -1033,6 +1041,7 @@ func TestValidate(t *testing.T) {
 	c.Scheduler.BacklogInterval = Duration(30 * time.Second) // нижняя граница периода backlog (T-161)
 	c.Monitor.ZoneStatsInterval = Duration(30 * time.Second) // нижняя граница коридора ТЗ 5.9
 	c.Dashboard.StatusCacheTTL = Duration(5 * time.Minute)   // верхняя граница коридора T-161
+	c.HTTP.MemLimit = 0                                      // мягкий потолок кучи выключен — допустимо (T-163)
 	if err := c.Validate(); err != nil {
 		t.Errorf("нижние границы должны быть валидны: %v", err)
 	}

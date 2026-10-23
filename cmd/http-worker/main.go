@@ -35,6 +35,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -58,6 +59,18 @@ func main() {
 		log.Fatalf("[http-worker] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("http-worker", cfg)
+
+	// Мягкий потолок памяти Go-рантайма (T-163, http.mem_limit): GC
+	// удерживает кучу ниже порога сам, не доводя anon до MemoryHigh/
+	// MemoryMax юнита — reclaim-штормы ядра и OOM-kill дороже лишних
+	// циклов GC (фаталы T-157: 120 095 событий MemoryHigh, пик
+	// 900.5 MiB = MemoryMax). Ставится до рабочих аллокаций; page cache
+	// записи паков в учёт рантайма не входит — потолок ниже MemoryHigh
+	// с запасом (дефолт 768 MiB против 850M/900M). 0 — выключено.
+	if limit := cfg.HTTP.MemLimit; limit > 0 {
+		debug.SetMemoryLimit(limit.B())
+		logger.Info("мягкий потолок памяти Go-рантайма", "limit", limit.String())
+	}
 
 	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
 	// готов до старта OnRun: postgres.dsn обязателен (config.Validate);

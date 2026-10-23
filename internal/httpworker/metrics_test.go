@@ -67,6 +67,47 @@ func TestMetricsNilSafe(t *testing.T) {
 	var m *Metrics
 	m.Episode(&DomainResult{Name: "x"}, time.Second) // no-op, не паникует
 	m.Episode(nil, time.Second)                      // защита прямых вызовов
+	m.SlotEnter()
+	m.SlotLeave()
+	m.BodyHeld(1 << 20)
+	m.BodyHeld(-(1 << 20))
+	m.BodySize(4096)
+}
+
+// TestMetricsSlotBody — приборы памяти слота (T-163): занятость слота
+// парой вход/выход, транзитные байты тел сходимой парой ±n, размер
+// тела — наблюдение гистограммы. Пары обязаны сводить gauges к нулю —
+// иначе сэмплер намерил бы утечку там, где её нет.
+func TestMetricsSlotBody(t *testing.T) {
+	reg := metrics.New("http-worker")
+	m := NewMetrics(reg)
+
+	m.SlotEnter()
+	m.SlotEnter()
+	if got := httpMetricValue(t, reg, "crawler_http_tasks_inflight", nil); got != 2 {
+		t.Errorf("crawler_http_tasks_inflight = %v, want 2", got)
+	}
+	m.SlotLeave()
+	m.SlotLeave()
+	if got := httpMetricValue(t, reg, "crawler_http_tasks_inflight", nil); got != 0 {
+		t.Errorf("crawler_http_tasks_inflight после выходов = %v, want 0", got)
+	}
+
+	m.BodyHeld(65536)
+	m.BodyHeld(4096)
+	if got := httpMetricValue(t, reg, "crawler_http_body_bytes_inflight", nil); got != 69632 {
+		t.Errorf("crawler_http_body_bytes_inflight = %v, want 69632", got)
+	}
+	m.BodyHeld(-69632)
+	if got := httpMetricValue(t, reg, "crawler_http_body_bytes_inflight", nil); got != 0 {
+		t.Errorf("crawler_http_body_bytes_inflight после выхода окна = %v, want 0", got)
+	}
+
+	m.BodySize(20000)
+	m.BodySize(20000)
+	if got := httpMetricValue(t, reg, "crawler_http_body_bytes", nil); got != 2 {
+		t.Errorf("crawler_http_body_bytes (count) = %v, want 2", got)
+	}
 }
 
 // TestMetricsEpisode — один эпизод: две проверки с ошибками разных
@@ -202,5 +243,74 @@ func TestMetricsRunSmoke(t *testing.T) {
 	// ответа.
 	if got := httpMetricValue(t, reg, "crawler_http_response_seconds", nil); got != 2 {
 		t.Errorf("crawler_http_response_seconds (count) = %v, want 2", got)
+	}
+}
+
+// TestMetricsSlotMemoryRun — приборы памяти слота (T-163) в типовом
+// пути цикла: во время обработки (OnResult вызывается внутри
+// processDelivery — детерминированная точка) занят ровно один слот,
+// транзитные байты тел уже освобены (окно удержания закрывается в
+// checkScheme до возврата); после завершения цикла слоты и байты
+// сходятся к нулю, прочитанные тела — в гистограмме смеси (обе проверки
+// протоколов читают тело, кэш итоговых URL на разные схемы не
+// распространяется).
+func TestMetricsSlotMemoryRun(t *testing.T) {
+	body := "<html>" + strings.Repeat("страница для замера памяти слота ", 30) + "</html>"
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"mem.test": {status: 200, body: body},
+	})
+	reg := metrics.New("http-worker")
+	w := workerWorker(t, fetch, func(o *Options) { o.Metrics = reg })
+	q := &workerFakeQueue{deliveries: []queue.Delivery{workerDelivery(t, queue.HTTPTask{
+		TaskID: "task-1", ZoneID: 5, DomainID: 42, Name: "mem.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")},
+	})}}
+
+	var inSlots, inBodyHeld float64
+	opts := Options{OnResult: func(_ context.Context, res *DomainResult) error {
+		inSlots = httpMetricValue(t, reg, "crawler_http_tasks_inflight", nil)
+		inBodyHeld = httpMetricValue(t, reg, "crawler_http_body_bytes_inflight", nil)
+		return nil
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, q, w, opts)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if q.ackedCount() > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+
+	if inSlots != 1 {
+		t.Errorf("crawler_http_tasks_inflight внутри обработки = %v, want 1", inSlots)
+	}
+	// Тела прочитаны и отпущены до OnResult (ранний Put T-147): окно
+	// удержания закрыто в checkScheme.
+	if inBodyHeld != 0 {
+		t.Errorf("crawler_http_body_bytes_inflight внутри OnResult = %v, want 0 (тела уже отпущены)", inBodyHeld)
+	}
+	if got := httpMetricValue(t, reg, "crawler_http_tasks_inflight", nil); got != 0 {
+		t.Errorf("crawler_http_tasks_inflight после обработки = %v, want 0", got)
+	}
+	if got := httpMetricValue(t, reg, "crawler_http_body_bytes_inflight", nil); got != 0 {
+		t.Errorf("crawler_http_body_bytes_inflight после обработки = %v, want 0", got)
+	}
+	if got := httpMetricValue(t, reg, "crawler_http_body_bytes", nil); got != 2 {
+		t.Errorf("crawler_http_body_bytes (count) = %v, want 2 (https и http)", got)
 	}
 }
