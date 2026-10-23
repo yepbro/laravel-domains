@@ -140,12 +140,17 @@ func workerFakeFetch(script map[string]*workerPageScript) (FetchFunc, *workerFet
 	}, log
 }
 
-// workerWorker — сборка воркера над сценарием.
+// workerWorker — сборка воркера над сценарием. Хранилище по умолчанию —
+// фейк (раннее сохранение тел T-147 обязательно; конкретный фейк —
+// newStoreFake из store_test.go, тем же пакетом).
 func workerWorker(t *testing.T, fetch FetchFunc, mutate func(*Options)) *Worker {
 	t.Helper()
 	opt := Options{}
 	if mutate != nil {
 		mutate(&opt)
+	}
+	if opt.Store == nil {
+		opt.Store = newStoreFake()
 	}
 	w, err := New(fetch, opt)
 	if err != nil {
@@ -570,7 +575,7 @@ func TestWorkerBodyLimiterCeiling(t *testing.T) {
 		f := httpfetch.NewFetcher(httpfetch.Options{
 			Limits: &httpfetch.LimitOptions{MaxBodyBytes: ceiling},
 		})
-		w, err := New(ChainFetch(f), Options{})
+		w, err := New(ChainFetch(f), Options{Store: newStoreFake()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -581,9 +586,8 @@ func TestWorkerBodyLimiterCeiling(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ProcessDomain: %v", err)
 		}
-		// Тела проверок ProcessDomain отпускает после разметки алиасов
-		// (Body живёт у записи-оригинала) — ожидаемые байты сравниваются
-		// хэшем; целая страница дополнительно видна в теле записи.
+		// Тела ProcessDomain не удерживает (ранний Put T-147) —
+		// ожидаемые байты сравниваются хэшем.
 		wantLen := serve
 		if wantLen > ceiling {
 			wantLen = ceiling
@@ -610,6 +614,76 @@ func TestWorkerBodyLimiterCeiling(t *testing.T) {
 			t.Errorf("хэш тела не совпадает с хэшем обрезанной до потолка страницы (%d байт)", len(want))
 		}
 	})
+}
+
+// TestWorkerReadBody — предвыделение буфера чтения тела по Content-Length
+// (T-147): байты читаются целиком одним буфером, Content-Length без
+// Content-Encoding задаёт ёмкость (враньё сервера в обе стороны не
+// ломает чтение), сжатый ответ и отсутствие заголовка — обычный путь,
+// страховочный потолок без BodyLimiter режет чтение (workerBodyHardLimit).
+func TestWorkerReadBody(t *testing.T) {
+	mkRes := func(cl string, ce string, body string, limiter *httpfetch.BodyLimiter) *httpfetch.FetchResult {
+		h := http.Header{}
+		if cl != "" {
+			h.Set("Content-Length", cl)
+		}
+		if ce != "" {
+			h.Set("Content-Encoding", ce)
+		}
+		return &httpfetch.FetchResult{
+			Header:      h,
+			Body:        io.NopCloser(strings.NewReader(body)),
+			BodyLimiter: limiter,
+		}
+	}
+	cases := []struct {
+		name   string
+		cl     string
+		ce     string
+		body   string
+		want   string
+		maxCap int // потолок ёмкости буфера (0 — не проверять): одно
+		// выделение по Content-Length плюс служебный slack ReadFrom
+		// (minRead 512), без удвоений io.ReadAll
+	}{
+		{"Content-Length честен", "9", "", "123456789", "123456789", 9 + 512},
+		{"сервер недослал", "100", "", "коротко", "коротко", 100 + 512},
+		{"тело 64 КиБ одним буфером", "65536", "", strings.Repeat("z", 65536), strings.Repeat("z", 65536), 65536 + 512},
+		{"сервер переслал", "2", "", "длиннее заявленного", "длиннее заявленного", 0},
+		{"без Content-Length", "", "", "чанкованный ответ", "чанкованный ответ", 0},
+		{"сжатый ответ", "4", "gzip", "распакованные байты", "распакованные байты", 0},
+		{"кривой Content-Length", "много", "", "тело", "тело", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := workerReadBody(mkRes(c.cl, c.ce, c.body, nil))
+			if err != nil {
+				t.Fatalf("workerReadBody: %v", err)
+			}
+			if string(got) != c.want {
+				t.Errorf("тело %q, ожидалось %q", got, c.want)
+			}
+			if c.maxCap > 0 && cap(got) > c.maxCap {
+				t.Errorf("ёмкость буфера %d — выше выделения по Content-Length+%d (удвоения ReadAll?)", cap(got), 512)
+			}
+		})
+	}
+	// Гигантский Content-Length не резервирует гигабайт — потолок
+	// предвыделения workerPreallocMax, чтение идёт дальше ростом буфера.
+	res := mkRes("1073741824", "", strings.Repeat("x", 128), nil)
+	got, err := workerReadBody(res)
+	if err != nil || len(got) != 128 {
+		t.Fatalf("гигантский Content-Length: байтов %d, ошибка %v", len(got), err)
+	}
+	// Без BodyLimiter чтение ограничено страховочным потолком воркера.
+	big := strings.Repeat("y", int(workerBodyHardLimit)+64)
+	got, err = workerReadBody(mkRes("", "", big, nil))
+	if err != nil {
+		t.Fatalf("workerReadBody без лимитёра: %v", err)
+	}
+	if int64(len(got)) != workerBodyHardLimit+1 {
+		t.Errorf("прочитано %d байт, ожидалось %d (LimitReader потолка+1)", len(got), workerBodyHardLimit+1)
+	}
 }
 
 // TestWorkerAllFailedNoHTTP — все субдомены ошибочны → записей нет («нет
@@ -779,6 +853,16 @@ func TestWorkerTaskValidation(t *testing.T) {
 	}
 	if _, err := New(nil, Options{}); err == nil {
 		t.Error("New без шва загрузки прошёл")
+	}
+	if _, err := New(workerFakeFetchNoop(), Options{}); err == nil {
+		t.Error("New без хранилища контента прошёл (ранний Put T-147 обязателен)")
+	}
+}
+
+// workerFakeFetchNoop — минимальный шов загрузки для проверок конструктора.
+func workerFakeFetchNoop() FetchFunc {
+	return func(context.Context, httpfetch.FetchRequest, httpfetch.ChainOptions) (*httpfetch.ChainResult, error) {
+		return nil, errors.New("нет сценария")
 	}
 }
 

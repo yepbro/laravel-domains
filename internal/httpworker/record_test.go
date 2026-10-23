@@ -1219,6 +1219,7 @@ func TestRecordOnResultSmoke(t *testing.T) {
 		_, err := recorder.RecordAndPublish(c, res)
 		return err
 	}}
+	opts.Store = st // ранние Put — в тот же фейк, что и сверка Save (T-147)
 	w, err := New(fetch, opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1278,6 +1279,7 @@ func TestRecordOnResultPublishErrorNoAck(t *testing.T) {
 		_, err := recorder.RecordAndPublish(c, res)
 		return err
 	}}
+	opts.Store = newStoreFake() // ранние Put T-147 — свежий фейк (Save в цепочке нет)
 	w, err := New(fetch, opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)

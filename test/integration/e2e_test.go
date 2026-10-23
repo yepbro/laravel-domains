@@ -146,6 +146,7 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 	})
 	hworker, err := httpworker.New(httpworker.ChainFetch(fetcher), httpworker.Options{
 		MaxRedirects: httpfetch.DefaultMaxRedirects,
+		Store:        store,
 	})
 	if err != nil {
 		t.Fatal(err)

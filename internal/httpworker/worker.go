@@ -17,16 +17,17 @@
 // SPA-записям и флаг render_pending при переполнении очереди рендера —
 // renderq.go (T-066), вызывается из Recorder.
 //
-// Тела страниц (UTF-8, T-051) удерживаются в памяти до конца задачи
-// домена: в фазе проверок — по одному экземпляру на скачанную страницу
-// (кэш итоговых URL), после разметки алиасов — только у записей-
-// оригиналов (Record.Body, StoreContent от T-055); сохранение контента
-// в ContentStore — ContentSaver (store.go, T-056), после него байты
-// отбрасываются. Потолок тела — max_body_bytes (2 МиБ, ТЗ 5.5), страниц
-// в задаче не больше 2 × субдомены ≤ 126 (§5.10) — память задачи
-// ограничена; DefaultConcurrency учитывает её: задачи в полёте держат
-// тела записей-оригиналов, их суммарный бюджет — задачный параллелизм
-// (T-139, дефолты по замерам T-092).
+// Тела страниц (UTF-8, T-051) в памяти не удерживаются (T-147): тело
+// читается с потолком, от него вычисляются хэш (критерий вариантов
+// T-054 и алиасов T-055 — сравнение всегда по хэшам) и SPA-вердикт
+// (T-057), затем немедленно сохраняется в ContentStore (Options.Store,
+// Put по хэшу) и отбрасывается — слот задачи не держит тела дольше
+// получения + Put (память слота: только метаданные и PerDomain
+// буферов читаемых тел). Ссылки, добавленные ранними Put, сверяются с
+// записями результата в ContentSaver (store.go): страница, не ставшая
+// чьей-либо строкой subdomain_results (свёрнутый вариант, проигравший
+// класс алиасов, повторное скачивание того же контента), отпускает
+// ссылку Delete; ставшая — переносится в строку записи (T-056).
 package httpworker
 
 import (
@@ -39,6 +40,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -192,12 +194,12 @@ func workerSchemeDefaultPort(scheme string) string {
 }
 
 // workerPage — скачанная страница (итог цепочки) в кэше: хэш и SPA-вердикт
-// вычислены при чтении; тело (UTF-8) удерживается до конца задачи — его
-// заберёт запись-оригинал для сохранения контента (Record.Body, T-056),
-// кэш-попадания делят те же байты (одна копия на скачанную страницу).
-// Класс/текст ошибки (ErrBody обрезанной страницы) переносится
-// кэш-попаданию: один и тот же контент классифицируется одинаково
-// независимо от того, скачала его проверка или взяла из кэша.
+// вычислены при чтении, тело сохранено ранним Put (T-147) и в памяти не
+// живёт — кэш-попадания делят хэш и признаки страницы, байты лежат в
+// хранилище (ContentStore.Get по хэшу). Класс/текст ошибки (ErrBody
+// обрезанной страницы) переносится кэш-попаданию: один и тот же контент
+// классифицируется одинаково независимо от того, скачала его проверка
+// или взяла из кэша.
 type workerPage struct {
 	final      *url.URL
 	status     int
@@ -205,7 +207,7 @@ type workerPage struct {
 	cookies    []*http.Cookie
 	tls        *httpfetch.TLSInfo
 	hash       *content.Hash
-	body       []byte
+	stored     bool // ранний Put прошёл: ссылка в хранилище ждёт строку записи (T-147)
 	charset    string
 	truncated  bool
 	responseMS int
@@ -214,15 +216,27 @@ type workerPage struct {
 	errText    string
 }
 
+// workerPut — вход реестра ранних Put задачи (T-147): хэш сохранённой
+// страницы и факт записи новых байтов (для доли дедупликации, ТЗ 11.4
+// п. 3). Реестр собирается в кэше задачи (workerURLCache) по мере
+// скачиваний и передаётся в DomainResult: ContentSaver.Save сверяет его
+// с записями — ссылки, не ставшие строками, снимаются Delete.
+type workerPut struct {
+	hash    content.Hash
+	created bool
+}
+
 // workerURLCache — общий кэш задачи домена (ТЗ 5.5 п. 6 «внутри воркера
-// для задачи домена»): итоговые URL всех завершённых проверок. Живёт одну
-// задачу: алиасы — свойство пары субдоменов одного домена, между доменами
-// итоговые URL не пересекаются (внешние парковки не считаются — повторное
-// использование чужого тела подменяло бы TLS/заголовки чужого соединения).
-// Потокобезопасен: проверки субдоменов идут параллельно.
+// для задачи домена»): итоговые URL всех завершённых проверок и реестр
+// ранних Put (T-147). Живёт одну задачу: алиасы — свойство пары
+// субдоменов одного домена, между доменами итоговые URL не пересекаются
+// (внешние парковки не считаются — повторное использование чужого тела
+// подменяло бы TLS/заголовки чужого соединения). Потокобезопасен:
+// проверки субдоменов идут параллельно.
 type workerURLCache struct {
 	mu    sync.Mutex
 	pages map[string]*workerPage
+	puts  []workerPut // ранние Put задачи в порядке скачиваний (T-147)
 }
 
 func workerNewURLCache() *workerURLCache {
@@ -244,6 +258,23 @@ func (c *workerURLCache) put(key string, p *workerPage) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pages[key] = p
+}
+
+// addPut дописывает успешный ранний Put в реестр задачи (T-147).
+func (c *workerURLCache) addPut(h content.Hash, created bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.puts = append(c.puts, workerPut{hash: h, created: created})
+}
+
+// takePuts возвращает накопленный реестр ранних Put (вызывается один раз
+// в конце задачи — ProcessDomain переносит его в DomainResult).
+func (c *workerURLCache) takePuts() []workerPut {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	puts := c.puts
+	c.puts = nil
+	return puts
 }
 
 // --- результат домена -------------------------------------------------------
@@ -298,13 +329,14 @@ type SchemeCheck struct {
 	Truncated bool
 	// Charset — каноническое имя кодировки ответа (ToUTF8, T-051).
 	Charset string
-	// Body — тело итоговой страницы в UTF-8 (T-051): те же байты, от
-	// которых вычислен ContentHash (content.HashOf). Удерживается до
-	// конца задачи домена — запись-оригинал (StoreContent, T-055)
-	// переносит его в Record.Body для сохранения в хранилище (T-056);
-	// после разметки алиасов проверки без оригинальных записей тело
-	// отпускают. nil — тела нет (ошибка загрузки, обрыв чтения).
-	Body []byte
+	// ContentStored — тело страницы сохранено ранним Put в ContentStore
+	// (T-147): хэш проверки — живая ссылка хранилища, кандидат на
+	// content_hash записи. false — обрезанное тело (не сохраняется
+	// вовсе), переполнение диска или лимит max_store_bytes (пауза
+	// записи контента, ТЗ 8: результат домена не роняется). Само тело
+	// в памяти не удерживается (T-147): байты — в хранилище, Get по
+	// хэшу; пустое тело — валидный сохранённый контент (T-138).
+	ContentStored bool
 	// SPA — вердикт эвристики по телу (DetectSPA, T-057); nil при ошибке
 	// загрузки. Публикацию q:render по нему делает рендер-конвейер
 	// T-066 (renderq.go) в цепочке записи результата — при переполнении
@@ -314,6 +346,13 @@ type SchemeCheck struct {
 	// при Available=true). ErrText — исходный текст для логов и разбора.
 	ErrClass ErrorClass
 	ErrText  string
+	// storeErr — сбой раннего Put, не являющийся паузой записи контента
+	// (T-147): странице не сопоставить ни «сохранено», ни «пропущено» —
+	// эпизод честно падает (ProcessDomain возвращает ошибку, повторная
+	// доставка, ТЗ 3.4). Поле внутреннее: заполняется checkScheme,
+	// читается ProcessDomain; кэш-попадания его не наследуют (ошибка
+	// относится к своей попытке записи).
+	storeErr error
 }
 
 // Record — сохраняемая запись субдомен-результата после вариант-логики и
@@ -347,12 +386,15 @@ type Record struct {
 	Truncated   bool
 	Charset     string
 	SPA         *httpfetch.SPAVerdict
-	// Body — тело проверки-источника в UTF-8 (те же байты, от которых
-	// вычислен ContentHash): заполняется у записей-оригиналов с хэшем
-	// без обрезки — ContentSaver (T-056) пишет его в ContentStore.Put
-	// и отбрасывает. nil — тело записи не положено (алиас, обрезанное
-	// тело, контента нет) либо сохранение уже выполнено.
-	Body []byte
+	// ContentStored — тело проверки-источника сохранено ранним Put
+	// (T-147): у записей-оригиналов с хэшем без обрезки ссылка из Put
+	// становится ссылкой строки subdomain_results (ContentSaver,
+	// T-056). false у оригинала — контент не сохранён (переполнение
+	// диска, лимит max_store_bytes): запись живёт с content_hash = nil
+	// и ContentNotStored. Тело в записи не хранится (T-147) — байты
+	// доступны хранилищем по хэшу; пустое тело — валидный контент
+	// (T-138).
+	ContentStored bool
 	// ContentNotStored — тело получено (хэш вычислен), но контент НЕ
 	// сохранён: переполнение диска (ErrStoreFull, ТЗ 8), лимит
 	// max_store_bytes (ТЗ 5.5) или обрезка тела потолком max_body_bytes.
@@ -401,6 +443,10 @@ type DomainResult struct {
 	Name     string
 	// Subdomains — порядок задачи q:http.
 	Subdomains []SubdomainResult
+	// puts — реестр ранних Put задачи (T-147, не для потребителя):
+	// заполняется ProcessDomain, ContentSaver.Save сверяет его с
+	// записями — ссылки, не ставшие строками, снимаются Delete.
+	puts []workerPut
 }
 
 // RecordCount — число записей результата (субдомен × вариант).
@@ -441,12 +487,12 @@ const (
 	// экземпляр в цикле Run. Скромное число против http.concurrency=2000:
 	// глобальный потолок соединений и RPS держит транспорт (T-049,
 	// Options.Limits — семафор GlobalConns), задачи лишь заполняют его;
-	// каждая задача держит в памяти результат домена — заголовки, хэши
-	// и до сохранения контента (T-056) тела записей-оригиналов (≤ 2 МиБ
-	// каждое, оригиналов ≤ записей ≤ 126) — типичная задача единицы МБ.
-	// Масштабирование нагрузки — инстансами (ТЗ 4.1 «масштабируется
-	// количеством горутин и процессов»), потолок поднимается
-	// Options.Concurrency.
+	// каждая задача держит в памяти результат домена — заголовки, хэши и
+	// метаданные (тела страниц не удерживаются: ранний Put T-147),
+	// читаемые тела ограничены PerDomain × max_body_bytes — типичная
+	// задача единицы МиБ. Масштабирование нагрузки — инстансами (ТЗ 4.1
+	// «масштабируется количеством горутин и процессов»), потолок
+	// поднимается Options.Concurrency.
 	//
 	// Число — по замерам T-092 (docs/load-measurements.md §3, T-139):
 	// средняя задача домена 1.67 с → потолок скользящего потребления
@@ -534,6 +580,14 @@ type Options struct {
 	// PerDomain — параллельных проверок (субдомен × протокол) внутри
 	// задачи домена; 0 — DefaultPerDomain. Конфиг: http.task_per_domain.
 	PerDomain int
+	// Store — хранилище контента для раннего сохранения тел (T-147):
+	// каждая скачанная страница уходит в Put по хэшу сразу по получении
+	// и не удерживается в памяти слота (дедупликация алиасов идёт по
+	// хэшам, T-055). Продакшн — *content.PackStore (тот же, что у
+	// ContentSaver); nil — ошибка: без раннего Put тела записей
+	// копились бы в памяти до конца задачи (≈3.34 МиБ/слот, замер
+	// T-092 §11) — тихий откат оптимизации хуже явного отказа старта.
+	Store content.ContentStore
 	// MaxRedirects — лимит цепочки редиректов (http.max_redirects,
 	// T-048): 0 — не следовать вовсе; отрицательные значения — дефолт
 	// таблицы лимитов ТЗ 5.5 (httpfetch.DefaultMaxRedirects).
@@ -609,6 +663,9 @@ type Worker struct {
 func New(fetch FetchFunc, opts Options) (*Worker, error) {
 	if fetch == nil {
 		return nil, errors.New("httpworker: шов загрузки не задан (ChainFetch)")
+	}
+	if opts.Store == nil {
+		return nil, errors.New("httpworker: хранилище контента не задано (раннее сохранение тел, T-147)")
 	}
 	return &Worker{fetch: fetch, opt: opts.withDefaults(), met: NewMetrics(opts.Metrics)}, nil
 }
@@ -722,6 +779,21 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 		return nil, fmt.Errorf("httpworker: домен %s: отмена: %w", task.Name, err)
 	}
 
+	// Сбой раннего Put, не являющийся паузой записи контента (ошибка
+	// БД/ФС, отмена), роняет задачу (T-147): контент ссылки не получил,
+	// молчание уронило бы его до перепроверки T-030 (месяцы); повторная
+	// доставка переиграет эпизод целиком (ТЗ 3.4). Ссылки Put-ов этой
+	// попытки, не снятые сверкой ContentSaver, остаются — утечка в
+	// безопасную сторону (тот же класс, что крах между Put и фиксацией
+	// строки у SwapRef, T-044).
+	for i := range res.Subdomains {
+		for _, c := range []*SchemeCheck{&res.Subdomains[i].HTTPS, &res.Subdomains[i].HTTP} {
+			if c.storeErr != nil {
+				return nil, fmt.Errorf("httpworker: домен %s: сохранение контента: %w", task.Name, c.storeErr)
+			}
+		}
+	}
+
 	// Вариант-логика (T-054) по каждому субдомену; алиасы (T-055) — по
 	// всем записям домена сразу (классы эквивалентности склеивают
 	// субдомены, §5.5 п. 6). Указатели записей берутся из уже собранного
@@ -746,25 +818,26 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 				src = &sub.HTTP
 			}
 			recs = append(recs, Record{
-				Variant:     vr.Variant,
-				Scheme:      vr.Scheme,
-				SubdomainID: sub.SubdomainID,
-				Label:       sub.Label,
-				FinalURL:    src.FinalURL.String(),
-				Host:        src.FinalURL.Hostname(),
-				Path:        src.FinalURL.Path,
-				HTTPStatus:  src.Status,
-				Header:      src.Header,
-				Cookies:     src.Cookies,
-				TLS:         src.TLS,
-				ResponseMS:  src.ResponseMS,
-				Redirects:   src.Redirects,
-				ContentHash: src.ContentHash,
-				Truncated:   src.Truncated,
-				Charset:     src.Charset,
-				SPA:         src.SPA,
-				ErrClass:    src.ErrClass,
-				AliasKind:   model.AliasNone,
+				Variant:       vr.Variant,
+				Scheme:        vr.Scheme,
+				SubdomainID:   sub.SubdomainID,
+				Label:         sub.Label,
+				FinalURL:      src.FinalURL.String(),
+				Host:          src.FinalURL.Hostname(),
+				Path:          src.FinalURL.Path,
+				HTTPStatus:    src.Status,
+				Header:        src.Header,
+				Cookies:       src.Cookies,
+				TLS:           src.TLS,
+				ResponseMS:    src.ResponseMS,
+				Redirects:     src.Redirects,
+				ContentHash:   src.ContentHash,
+				Truncated:     src.Truncated,
+				Charset:       src.Charset,
+				SPA:           src.SPA,
+				ContentStored: src.ContentStored,
+				ErrClass:      src.ErrClass,
+				AliasKind:     model.AliasNone,
 			})
 		}
 		sub.Records = recs
@@ -791,27 +864,11 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 		rec.StoreContent = ar.StoreContent
 	}
 
-	// Тела оригиналов (T-056): запись-оригинал класса несёт тело для
-	// сохранения в ContentStore (ContentSaver.Save); алиасы, записи без
-	// контента и обрезанные тела (хэш усечённых байт врал бы при дедупе,
-	// частичность уже отмечена Truncated, T-049) тела не получают. После
-	// разметки тела проверок отпускаются — Record.Body остаётся
-	// единственным владельцем, в памяти только тела оригиналов.
-	for i := range res.Subdomains {
-		sub := &res.Subdomains[i]
-		for j := range sub.Records {
-			r := &sub.Records[j]
-			if r.StoreContent && r.ContentHash != nil && !r.Truncated {
-				src := &sub.HTTPS
-				if r.Scheme == model.SchemeHTTP {
-					src = &sub.HTTP
-				}
-				r.Body = src.Body
-			}
-		}
-		sub.HTTPS.Body = nil
-		sub.HTTP.Body = nil
-	}
+	// Реестр ранних Put (T-147) — в результат: ContentSaver.Save сверит
+	// его с записями (ссылки, не ставшие строками, снимутся Delete).
+	// Тела проверок и записей к этому моменту в памяти уже нет (T-147):
+	// ранний Put освободил их при получении.
+	res.puts = cache.takePuts()
 	return res, nil
 }
 
@@ -866,7 +923,7 @@ func (w *Worker) checkScheme(
 		check.ContentHash = page.hash
 		check.Truncated = page.truncated
 		check.Charset = page.charset
-		check.Body = page.body
+		check.ContentStored = page.stored
 		check.SPA = page.spa
 		// Ошибка страницы (обрезка — ErrBody) переносится кэш-итогом:
 		// запись того же контента несёт тот же класс, что и у
@@ -922,11 +979,10 @@ func (w *Worker) checkScheme(
 		readErr   error
 		truncated bool
 	)
+	body, readErr = workerReadBody(res)
 	if res.BodyLimiter != nil {
-		body, readErr = io.ReadAll(res.Body)
 		truncated = res.BodyLimiter.Truncated()
 	} else {
-		body, readErr = io.ReadAll(io.LimitReader(res.Body, workerBodyHardLimit+1))
 		truncated = int64(len(body)) > workerBodyHardLimit
 		if truncated {
 			body = body[:workerBodyHardLimit]
@@ -955,9 +1011,37 @@ func (w *Worker) checkScheme(
 	check.Charset = cs.Charset
 	hash := content.HashOf(cs.UTF8)
 	check.ContentHash = &hash
-	check.Body = cs.UTF8
 	spa := httpfetch.DetectSPA(cs.UTF8)
 	check.SPA = &spa
+
+	// Раннее сохранение тела (T-147): байты уходят в хранилище сразу
+	// по получении — дедупликация алиасов (T-055) идёт по хэшам, слот
+	// не удерживает тела до конца задачи. Обрезанное тело не
+	// сохраняется вовсе (хэш усечённых байт врал бы при дедупе,
+	// T-049); ErrStoreFull/ErrTooLarge — пауза записи контента (ТЗ 8):
+	// страница помечается несохранённой, результат домена не роняется;
+	// прочие ошибки — storeErr, эпизод упадёт в ProcessDomain.
+	if !truncated {
+		pr, err := w.opt.Store.Put(ctx, cs.UTF8)
+		switch {
+		case err == nil:
+			if pr.Hash != hash {
+				check.storeErr = fmt.Errorf("хранилище вернуло хэш %s, воркер вычислил %s (контракт HashOf, T-041)",
+					pr.Hash, hash)
+				return check
+			}
+			check.ContentStored = true
+			cache.addPut(hash, pr.Created)
+		case errors.Is(err, content.ErrStoreFull), errors.Is(err, content.ErrTooLarge):
+			// Контент не сохранён, запись результата живёт с
+			// content_hash = nil (нормализует ContentSaver, ТЗ 8).
+			w.opt.log().Warn("контент страницы не сохранён — запись будет без content_hash",
+				"url", res.FinalURL.String(), "err", err.Error())
+		default:
+			check.storeErr = err
+			return check
+		}
+	}
 
 	// Итоговый URL — в кэш задачи: следующие проверки, начинающиеся на
 	// нём (www после редиректа bare), страницы повторно не скачивают.
@@ -968,7 +1052,7 @@ func (w *Worker) checkScheme(
 		cookies:    check.Cookies,
 		tls:        check.TLS,
 		hash:       check.ContentHash,
-		body:       check.Body,
+		stored:     check.ContentStored,
 		charset:    check.Charset,
 		truncated:  check.Truncated,
 		responseMS: check.ResponseMS,
@@ -977,6 +1061,47 @@ func (w *Worker) checkScheme(
 		errText:    check.ErrText,
 	})
 	return check
+}
+
+// workerPreallocMax — потолок предвыделения буфера чтения тела по
+// Content-Length (T-147): враньё сервера (гигабайтный Content-Length) не
+// резервирует гигабайт — такие тела читаются обычным ростом буфера.
+const workerPreallocMax = workerBodyHardLimit
+
+// workerReadBody читает тело ответа одним буфером с предвыделением по
+// Content-Length (T-147): io.ReadAll растит буфер от 512 байт удвоением
+// — на телах в десятки–сотни КиБ это два-три поколения копий на страницу
+// (× PerDomain одновременных проверок × Concurrency слотов — транзитный
+// мусор GC, входивший в пик памяти слота). Content-Length честен только
+// без Content-Encoding (транспорт T-048/ТЗ 5.5 отдаёт уже распакованный
+// поток, заголовок описывает сжатые байты): в этом случае буфер
+// выделяется ровно по заявленному размеру и наполняется io.ReadFull;
+// недосланное и пересланное сервером, сжатые ответы и кривой/отсутствующий
+// заголовок — обычное чтение с ростом. Без BodyLimiter чтение ограничено
+// страховочным потолком воркера (workerBodyHardLimit) — предвыделение
+// его не подменяет.
+func workerReadBody(res *httpfetch.FetchResult) ([]byte, error) {
+	rc := io.Reader(res.Body)
+	if res.BodyLimiter == nil {
+		rc = io.LimitReader(res.Body, workerBodyHardLimit+1)
+	}
+	if res.Header.Get("Content-Encoding") == "" {
+		if n, err := strconv.ParseInt(res.Header.Get("Content-Length"), 10, 64); err == nil && n > 0 && n <= workerPreallocMax {
+			buf := make([]byte, n)
+			r, err := io.ReadFull(rc, buf)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				return nil, err
+			}
+			// Хвост за заявленным размером (сервер наврал в большую
+			// сторону) дочитывается ростом; у честного ответа пусто.
+			extra, err := io.ReadAll(rc)
+			if err != nil {
+				return nil, err
+			}
+			return append(buf[:r], extra...), nil
+		}
+	}
+	return io.ReadAll(rc)
 }
 
 // --- рабочий цикл ------------------------------------------------------------

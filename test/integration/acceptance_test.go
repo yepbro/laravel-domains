@@ -142,6 +142,7 @@ func newAccEnv(t *testing.T) *accEnv {
 	})
 	hworker, err := httpworker.New(httpworker.ChainFetch(fetcher), httpworker.Options{
 		MaxRedirects: httpfetch.DefaultMaxRedirects,
+		Store:        store,
 	})
 	if err != nil {
 		t.Fatal(err)

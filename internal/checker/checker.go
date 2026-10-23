@@ -15,9 +15,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"crawler/internal/config"
+	"crawler/internal/content"
 	"crawler/internal/db"
 	"crawler/internal/dnsclient"
 	"crawler/internal/dnsworker"
@@ -158,8 +160,14 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 	fetcher := httpfetch.NewFetcher(opts)
 	defer fetcher.CloseIdleConnections()
 
+	// Живой проверке некуда (и незачем) писать боевой контент: воркер
+	// с T-147 сохраняет тела ранним Put и требует ContentStore — одноразовое
+	// хранилище в памяти принимает страницы, анализ читает их обратно по
+	// хэшу записи (render для SPA подменит HTML своим DOM ниже).
+	mem := newCheckerStore()
 	worker, err := httpworker.New(httpworker.ChainFetch(fetcher), httpworker.Options{
 		MaxRedirects: cfg.HTTP.MaxRedirects,
+		Store:        mem,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("checker: %w", err)
@@ -223,7 +231,7 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 			}
 
 			page := rules.Page{
-				HTML:    rec.Body,
+				HTML:    mem.body(rec.ContentHash),
 				Cookies: ruleCookies(rec.Cookies),
 				Headers: map[string][]string(rec.Header),
 			}
@@ -278,4 +286,75 @@ func ruleCookies(cs []*http.Cookie) []rules.Cookie {
 		out = append(out, rules.Cookie{Name: c.Name, Value: c.Value})
 	}
 	return out
+}
+
+// checkerStore — одноразовое хранилище контента живой проверки в памяти
+// (T-147): http-worker сохраняет тела страниц ранним Put и работает без
+// удержания байтов в памяти, живой проверке некуда (и незачем) писать
+// боевые паки — страницы одной проверки оседают здесь и читаются назад
+// по хэшу записи для пассивного анализа (рендер SPA подменит HTML своим
+// DOM). Реализует content.ContentStore (Put/Get/Delete, контракт
+// T-041: дедуп по хэшу, Created, refcount); память ограничена задачей
+// одного домена (страниц ≤ 2 × субдомены, тело ≤ max_body_bytes).
+type checkerStore struct {
+	mu     sync.Mutex
+	blocks map[content.Hash][]byte
+	refs   map[content.Hash]int
+}
+
+func newCheckerStore() *checkerStore {
+	return &checkerStore{
+		blocks: make(map[content.Hash][]byte),
+		refs:   make(map[content.Hash]int),
+	}
+}
+
+func (s *checkerStore) Put(_ context.Context, data []byte) (content.PutResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h := content.HashOf(data)
+	if s.refs[h] > 0 {
+		s.refs[h]++
+		return content.PutResult{Hash: h}, nil
+	}
+	s.blocks[h] = append([]byte(nil), data...)
+	s.refs[h] = 1
+	return content.PutResult{Hash: h, Created: true}, nil
+}
+
+func (s *checkerStore) Get(_ context.Context, h content.Hash) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.refs[h] <= 0 {
+		return nil, content.ErrNotFound
+	}
+	return append([]byte(nil), s.blocks[h]...), nil
+}
+
+func (s *checkerStore) Delete(_ context.Context, h content.Hash) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.refs[h] <= 0 {
+		return content.ErrNotFound
+	}
+	s.refs[h]--
+	if s.refs[h] == 0 {
+		delete(s.blocks, h)
+	}
+	return nil
+}
+
+// body возвращает тело по хэшу записи (nil — контента нет: обрезка,
+// несохранённая страница, алиас без ссылки). Для живой проверки контент
+// алиаса доступен как собственный (класс T-055 един) — правила видят
+// реальные байты страницы записи.
+func (s *checkerStore) body(h *content.Hash) []byte {
+	if h == nil {
+		return nil
+	}
+	b, err := s.Get(context.Background(), *h)
+	if err != nil {
+		return nil
+	}
+	return b
 }

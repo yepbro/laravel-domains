@@ -1,54 +1,61 @@
-// Сохранение контента результата домена в ContentStore (T-056; ТЗ 5.5
-// п. 8, §5.7, §8, §11.4 п. 3). Новый файл — правки worker.go точечные
-// (Record.Body у оригиналов); точка вызова — Options.OnResult в сборке
-// сервиса (cmd/http-worker): сохранение идёт внутри обработки задачи,
-// до XACK и до записи результата (Recorder, T-058; ТЗ 4.2).
+// Сверка контента результата домена с хранилищем (T-056/T-147; ТЗ 5.5
+// п. 8, §5.7, §8, §11.4 п. 3). Тела страниц сохраняются РАННИМ Put —
+// воркер кладёт каждую скачанную страницу в ContentStore сразу по
+// получении (worker.go checkScheme, T-147) и не удерживает байты в
+// памяти слота; дедупликация алиасов (T-055) идёт по хэшам. ContentSaver
+// вызывается в Options.OnResult (сборка cmd/http-worker) до записи
+// результата (Recorder, T-058) и XACK (ТЗ 4.2) и решает судьбу ссылок
+// ранних Put:
 //
-// Дедупликация парковок и заглушек — двухуровневая (§8 «естественная
-// дедупликация по хэшу»):
+//   - запись-оригинал класса (StoreContent, T-055) с несокращённым
+//     телом и прошедшим Put наследует ссылку: content_hash записи —
+//     это ссылка из Put, строка subdomain_results вступает во владение
+//     (refcount не меняется; своп при перезаписи снимет, T-044/T-058);
+//   - ссылки, не ставшие чьей-либо строкой, отпускаются Delete:
+//     свёрнутые вариант-логикой проверки (оба протокола — один сайт),
+//     проигравшие классы алиасов (контент хранится один раз, ТЗ 5.5
+//     п. 6), повторные скачивания одного контента. Без свертки
+//     refcount систематически рос бы — ранний Put не знает, кем
+//     станут его страницы;
+//   - алиасы собственной ссылки не получают: content_hash
+//     нормализуется в nil (контент класса доступен через
+//     alias_subdomain_id оригинала, T-055);
+//   - обрезанное тело (Truncated, T-049) раннего Put не получало —
+//     хэш снимается, ставится ContentNotStored;
+//   - страницы, чей Put не прошёл (ErrStoreFull — пауза записи
+//     контента, ТЗ 8/T-046; ErrTooLarge — лимит max_store_bytes),
+//     помечены воркером ContentStored=false: запись живёт с
+//     content_hash = nil и ContentNotStored — результат домена НЕ
+//     роняется (§8: пауза записи контента, не результатов; повторная
+//     проверка домена recheck T-030 скачает и сохранит). Warn пишет
+//     воркер при получении ответа.
 //
-//   - уровень задачи домена (T-053/T-055): общий кэш «итоговый URL →
-//     результат» не скачивает одну страницу дважды, а DetectAliases
-//     собирает записи с одинаковым итоговым URL или одинаковым хэшем
-//     контента в класс эквивалентности — контент класса сохраняется
-//     один раз, у записи-оригинала (Record.StoreContent = true);
-//   - уровень хранилища (T-041/T-042): ContentStore.Put дедуплицирует
-//     по хэшу — одинаковые страницы разных доменов (парковки) лежат
-//     одним блоком, refcount растёт, новые байты не пишутся
-//     (Created = false, метрика доли дедупликации ТЗ 11.4 п. 3).
+// Дедупликация остаётся двухуровневой (§8): уровень задачи — кэш
+// итоговых URL и классы DetectAliases (сравнение по хэшам), уровень
+// хранилища — Put/PutBatch по хэшу (T-041/T-042): одинаковые страницы
+// разных доменов лежат одним блоком, refcount растёт, новые байты не
+// пишутся (Created = false, метрика доли дедупликации ТЗ 11.4 п. 3 —
+// статистику created Save берёт из реестра ранних Put).
 //
 // Хэш — один и тот же источник: воркер вычисляет content.HashOf над
-// UTF-8-нормализованным телом (T-051), Record.Body несёт те же байты,
-// Put обязан вернуть HashOf(data) (контракт T-041) — совпадение
-// проверяется после каждого Put.
+// UTF-8-нормализованным телом (T-051), ранний Put получает те же байты,
+// и воркер сверяет HashOf(data) с возвратом Put (контракт T-041) до
+// отбрасывания тела — рассинхронизация роняет задачу сразу (T-147).
 //
-// Хранилище с групповой фиксацией (content.BatchStore, T-102) сохраняет
-// все тела одной доставки пачкой: один fsync и один пакетный INSERT
-// метаданных вместо по-блочных; обычное хранилище — построчный Put с той
-// же семантикой исходов на запись.
+// Цена раннего Put против пачки T-102: по одному fsync и INSERT на
+// скачанную страницу вместо пачки на доставку. Принята сознательно
+// (T-147): буферизация тел до конца задачи ради групповой фиксации и
+// держала ≈3.34 МиБ/слот (замер T-092 §11) — память слота дороже
+// лишних fsync (SSD держит тысячи в секунду; замер после деплоя —
+// docs/load-measurements.md). PutBatch остаётся контрактом BatchStore
+// (T-102) для потребителей, сохраняющих несколько контентов сразу.
 //
-// Поведение при переполнении диска (ErrStoreFull, ТЗ 8 «сервисы
-// приостанавливают запись контента», T-046) и при превышении лимита
-// max_store_bytes (ErrTooLarge, ТЗ 5.5): контент НЕ сохраняется, но
-// результат домена НЕ роняется — запись живёт с content_hash = NULL и
-// признаком Record.ContentNotStored (§8: пауза записи контента, не
-// результатов). content_hash в subdomain_results — ссылка на contents
-// (§6.1): без блока в хранилище строки нет, а ссылка без счётчика
-// ломала бы учёт (SwapRef T-044, фоновая очистка T-020) — хэш
-// сохраняется в записи только вместе с контентом. Повторная проверка
-// домена (recheck, T-030) скачает страницу снова и сохранит контент.
-//
-// Обрезанное потолком max_body_bytes тело (Record.Truncated, T-049)
-// не сохраняется вовсе и не даёт хэша для хранения: хэш усечённых
-// байт врал бы при дедупликации (парковка-«префикс» склеилась бы с
-// целой страницей другого домена); частичность данных уже отмечена
-// Truncated/ErrBody (T-049/T-053).
-//
-// At-least-once (ТЗ 3.4): повторная доставка задачи переиграет и
-// сохранение — повторный Put тех же байтов добавит ссылку (Created =
-// false, новых байтов нет). Лишняя ссылка без записи результата —
-// утечка места в безопасную сторону (тот же выбор, что у SwapRef
-// T-044): блок остаётся живым, данные не теряются.
+// At-least-once (ТЗ 3.4): повторная доставка задачи переигрывает и
+// скачивания, и ранние Put (дедуп: +1 без новых байтов), и сверку.
+// Ссылки попытки, не дошедшей до Save (крах процесса, сбой Put, отмена
+// ctx), остаются без строки — утечка места в безопасную сторону (тот
+// же выбор, что у SwapRef T-044): блок остаётся живым, данные не
+// теряются.
 
 package httpworker
 
@@ -61,11 +68,11 @@ import (
 	"crawler/internal/content"
 )
 
-// ContentSaver — сохранение контента записей результата домена в
-// ContentStore (T-056). Подключается сборкой сервиса в Options.OnResult
-// (хук вызывается в цикле Run до XACK, T-053): первым звеном цепочки —
-// перед записью результата (Recorder, T-058), чтобы новые content_hash
-// уже имели +1 refcount от Put к свопу ссылок:
+// ContentSaver — сверка контента записей результата домена с хранилищем
+// (T-056/T-147). Подключается сборкой сервиса в Options.OnResult (хук
+// вызывается в цикле Run до XACK, T-053) первым звеном цепочки — перед
+// записью результата (Recorder, T-058): к моменту строки ссылки ранних
+// Put уже распределены (владение — у строк, лишние — сняты):
 //
 //	saver, err := httpworker.NewContentSaver(store, logger)
 //	…
@@ -77,7 +84,7 @@ import (
 //		return err
 //	}
 //
-// Ошибка Save (кроме пропусков ниже) — ошибка OnResult: доставка не
+// Ошибка Save (кроме пропусков выше) — ошибка OnResult: доставка не
 // подтверждается и вернётся повторной доставкой (ТЗ 3.4) — так же
 // поведёт себя запись результата (Recorder, T-058) при сбое БД.
 //
@@ -88,9 +95,9 @@ type ContentSaver struct {
 	log   *slog.Logger
 }
 
-// NewContentSaver строит сохранатель поверх хранилища контента
-// (продакшн — *content.PackStore, T-042; nil — ошибка: тихое
-// «сохранение в никуда» теряло бы контент незаметно).
+// NewContentSaver строит сверку контента поверх хранилища (продакшн —
+// *content.PackStore, T-042; nil — ошибка: тихое «сохранение в никуда»
+// теряло бы контент незаметно).
 func NewContentSaver(store content.ContentStore, log *slog.Logger) (*ContentSaver, error) {
 	if store == nil {
 		return nil, errors.New("httpworker: сохранение контента: хранилище не задано")
@@ -101,39 +108,37 @@ func NewContentSaver(store content.ContentStore, log *slog.Logger) (*ContentSave
 	return &ContentSaver{store: store, log: log}, nil
 }
 
-// Save обходит записи результата домена и сохраняет контент оригиналов
-// (StoreContent = true, ТЗ 5.5 п. 6 «контент хранится один раз»):
+// Save распределяет ссылки ранних Put задачи (T-147) по записям
+// результата домена:
 //
 //   - записи-алиасы контент не хранят — собственной ссылки в contents у
 //     них нет, ContentHash нормализуется в nil (контент класса доступен
 //     через alias_subdomain_id записи-оригинала, T-055);
-//   - обрезанное тело (Truncated) — контент не сохраняется, хэш снимается,
-//     ставится ContentNotStored (см. комментарий файла);
-//   - ErrStoreFull/ErrTooLarge от хранилища — контент не сохраняется, запись
-//     живёт с content_hash = nil и ContentNotStored, Warn в лог; результат
-//     домена не роняется (ТЗ 8);
-//   - успех — ContentHash записи остаётся ссылкой на сохранённый блок
-//     (сверка с PutResult.Hash), тело отбрасывается (Body = nil);
-//   - прочие ошибки хранилища и отмена ctx — возврат ошибки: эпизод не
+//   - обрезанное тело (Truncated) и тело без прошедшего Put — контент
+//     не сохранён, хэш снимается, ставится ContentNotStored (см.
+//     комментарий файла); Warn о причине написал воркер при получении;
+//   - оригинал с несокращённым сохранённым телом остаётся с хэшем —
+//     ссылка его раннего Put становится ссылкой строки;
+//   - ссылки ранних Put, на которые не вышло ни одной записи, снимаются
+//     Delete (сверка реестра DomainResult.puts);
+//   - записи, ссылающиеся на хэш без раннего Put, — рассинхронизация
+//     воркера и хранилища: ссылка без счётчика ломала бы учёт
+//     (SwapRefTx T-044, ErrRefIntegrity) — громкая ошибка, доставка без
+//     XACK (ТЗ 3.4);
+//   - отмена ctx и прочие ошибки Delete — ошибка Save: эпизод не
 //     завершён, повторная доставка переиграет его целиком (ТЗ 3.4).
 //
-// Хранилище с групповой фиксацией (content.BatchStore, T-102) сохраняет
-// все тела результата одной пачкой — один fsync и один пакетный INSERT
-// метаданных на доставку вместо по-блочных; обычное хранилище —
-// построчным Put (путь до T-102, семантика та же).
-//
 // Идемпотентность вызова не требуется (одна доставка — один вызов);
-// повторная доставка задачи просто повторит сохранение (см. комментарий
-// файла про лишние ссылки).
+// повторная доставка задачи просто повторит скачивания, Put-ы и сверку.
 func (s *ContentSaver) Save(ctx context.Context, res *DomainResult) error {
 	if res == nil {
 		return nil // не бывает (processDelivery); защита прямых вызовов
 	}
 	var stats saveStats
-	// Проход 1 — фильтрация: алиасы, обрезка и недоступные тела не
-	// попадают в сохранение; для остальных собираются ссылки на записи
-	// и их тела (пачка доставки, T-102).
-	var recs []*Record
+	claims := make(map[content.Hash]int, len(res.puts))
+
+	// Проход 1 — нормализация записей: кому из них достанется ссылка
+	// раннего Put (учёт требований — claims по хэшам).
 	for i := range res.Subdomains {
 		for j := range res.Subdomains[i].Records {
 			r := &res.Subdomains[i].Records[j]
@@ -148,114 +153,80 @@ func (s *ContentSaver) Save(ctx context.Context, res *DomainResult) error {
 				continue
 			}
 			if r.Truncated {
-				// Хэш усечённых байт врал бы при дедупликации — не
-				// сохраняется и не хэшируется для хранения.
+				// Раннего Put не было (T-049): хэш усечённых байт
+				// врал бы при дедупликации — не хранится.
 				stats.truncated++
 				r.ContentHash, r.ContentNotStored = nil, true
 				continue
 			}
-			if r.Body == nil {
-				// Невозможно по построению ProcessDomain (StoreContent,
-				// хэш и необрезанное тело ⇒ Body); защита от
-				// рассинхронизации слоёв — запись не роняем.
-				s.log.Warn("контент не сохранён: тело записи недоступно",
-					"domain", res.Name, "subdomain", r.Label,
-					"subdomain_id", r.SubdomainID, "variant", r.Variant)
+			if !r.ContentStored {
+				// Ранний Put не прошёл: ErrStoreFull (пауза записи
+				// контента, ТЗ 8/T-046) или ErrTooLarge (лимит
+				// max_store_bytes, ТЗ 5.5) — Warn у воркера; ссылку
+				// записи не давать.
+				stats.unstored++
 				r.ContentHash, r.ContentNotStored = nil, true
 				continue
 			}
-			recs = append(recs, r)
+			claims[*r.ContentHash]++
 		}
 	}
 
-	// Проход 2 — сохранение: пачкой (T-102) или построчно.
-	if len(recs) > 0 {
-		if err := s.saveRecords(ctx, res.Name, recs, &stats); err != nil {
-			return err
+	// Проход 2 — сверка реестра ранних Put (в порядке скачиваний):
+	// заявленная записью ссылка достаётся ей, остальные снимаются.
+	for i := range res.puts {
+		p := &res.puts[i]
+		if claims[p.hash] > 0 {
+			claims[p.hash]--
+			stats.stored++
+			if p.created {
+				stats.created++
+			}
+			continue
+		}
+		stats.released++
+		if err := s.store.Delete(ctx, p.hash); err != nil {
+			if errors.Is(err, content.ErrNotFound) {
+				// Ссылку уже снял кто-то другой (гонка повторной
+				// доставки той же задачи, T-025): счётчик целостности
+				// не ломаем, Warn для разбора — блок мог остаться жив
+				// другими ссылками.
+				s.log.Warn("снятие ссылки раннего Put: ссылки уже нет (гонка повторной доставки?)",
+					"domain", res.Name, "hash", p.hash.String())
+				continue
+			}
+			return fmt.Errorf("httpworker: домен %s: снятие ссылки несохранённого контента %s: %w",
+				res.Name, p.hash, err)
 		}
 	}
 
-	if stats.full > 0 {
-		s.log.Warn("контент не сохранён: хранилище переполнено (ErrStoreFull) — запись контента на паузе; повторная проверка домена сохранит страницы",
-			"domain", res.Name, "records", stats.full)
+	// Остались незакрытые требования — записи ссылаются на хэш без
+	// раннего Put: построение результата рассинхронизировано с
+	// хранилищем, ссылка без счётчика уронила бы учёт при первом же
+	// свопе (T-044). Лучше громкий сбой доставки, чем молчаливая порча.
+	for h, n := range claims {
+		if n > 0 {
+			return fmt.Errorf("httpworker: домен %s: записи требуют %s ×%d без раннего Put (рассинхронизация воркера и хранилища)",
+				res.Name, h, n)
+		}
 	}
-	if stats.tooLarge > 0 {
-		s.log.Warn("контент не сохранён: тело сверх лимита max_store_bytes",
-			"domain", res.Name, "records", stats.tooLarge)
+
+	if stats.unstored > 0 {
+		s.log.Warn("контент части записей не сохранён (пауза записи контента/лимит; Warn о причине — при получении страниц)",
+			"domain", res.Name, "records", stats.unstored)
 	}
-	if stats.stored+stats.full+stats.tooLarge+stats.truncated > 0 {
+	if stats.stored+stats.released+stats.unstored+stats.truncated > 0 {
 		s.log.Debug("контент результата домена",
 			"domain", res.Name, "stored", stats.stored, "created", stats.created,
-			"skipped_full", stats.full, "skipped_large", stats.tooLarge, "skipped_truncated", stats.truncated)
+			"released", stats.released, "skipped_unstored", stats.unstored, "skipped_truncated", stats.truncated)
 	}
 	return nil
 }
 
-// saveStats — счётчики исходов сохранения одной доставки.
+// saveStats — счётчики исходов сверки одной доставки: stored — ссылки,
+// ставшие записями; created — из них записавшие новые байты (доля
+// дедупликации, ТЗ 11.4 п. 3); released — снятые лишние; unstored и
+// truncated — записи без контента (пауза/лимит/обрезка).
 type saveStats struct {
-	stored, created, full, tooLarge, truncated int
-}
-
-// saveRecords сохраняет тела записей: пачкой групповой фиксации, если
-// хранилище её поддерживает (content.BatchStore, T-102), иначе построчным
-// Put. Тела берутся из r.Body записей (пачка ссылается на них без копий).
-func (s *ContentSaver) saveRecords(ctx context.Context, domain string, recs []*Record, stats *saveStats) error {
-	if batcher, ok := s.store.(content.BatchStore); ok {
-		items := make([][]byte, len(recs))
-		for i, r := range recs {
-			items[i] = r.Body
-		}
-		results, errs, err := batcher.PutBatch(ctx, items)
-		if err != nil {
-			return fmt.Errorf("httpworker: домен %s: сохранение контента: %w", domain, err)
-		}
-		for i, r := range recs {
-			if err := s.applyResult(domain, r, results[i], errs[i], stats); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	for _, r := range recs {
-		pr, err := s.store.Put(ctx, r.Body)
-		if err := s.applyResult(domain, r, pr, err, stats); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// applyResult разбирает итог сохранения одной записи (общий для
-// построчного Put и пачки): сверка хэша с контрактом HashOf (T-041),
-// счётчики, отбрасывание тела либо признак ContentNotStored. Ошибки не
-// из веток ErrStoreFull/ErrTooLarge роняют Save (повторная доставка,
-// ТЗ 3.4).
-func (s *ContentSaver) applyResult(domain string, r *Record, pr content.PutResult, err error, stats *saveStats) error {
-	switch {
-	case err == nil:
-		if pr.Hash != *r.ContentHash {
-			return fmt.Errorf("httpworker: домен %s: хранилище вернуло хэш %s, воркер вычислил %s (контракт HashOf, T-041)",
-				domain, pr.Hash, *r.ContentHash)
-		}
-		stats.stored++
-		if pr.Created {
-			stats.created++
-		}
-		r.Body = nil // байты больше не нужны: хэш записи ссылается на блок
-	case errors.Is(err, content.ErrStoreFull):
-		// Пауза записи контента (ТЗ 8, T-046): результат живёт
-		// без контента, повторная проверка сохранит.
-		stats.full++
-		r.ContentHash, r.ContentNotStored, r.Body = nil, true, nil
-	case errors.Is(err, content.ErrTooLarge):
-		// Тело сверх лимита max_store_bytes (ТЗ 5.5) — отвергнуто
-		// хранилищем целиком.
-		stats.tooLarge++
-		r.ContentHash, r.ContentNotStored, r.Body = nil, true, nil
-	default:
-		// Отмена ctx или сбой хранилища/БД: эпизод не завершён,
-		// без XACK — повторная доставка (ТЗ 3.4).
-		return fmt.Errorf("httpworker: домен %s: сохранение контента: %w", domain, err)
-	}
-	return nil
+	stored, created, released, unstored, truncated int
 }

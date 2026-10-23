@@ -373,6 +373,7 @@ func httpWorkerSetup(t *testing.T, mutate func(*httpfetch.Options)) *httpWorkerE
 	// «не следовать» (T-053), а не дефолт.
 	w, err := httpworker.New(httpworker.ChainFetch(fetcher), httpworker.Options{
 		MaxRedirects: httpfetch.DefaultMaxRedirects,
+		Store:        store,
 	})
 	if err != nil {
 		t.Fatal(err)
