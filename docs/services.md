@@ -181,12 +181,15 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_domain_status_total` | counter | `type` | dns-worker (`not_delegated`/`delegated_no_address`/`temp_error`/`invalid` — диагноз ядовитой строки, T-109), http-worker (`alive`/`no_http`/`temp_error`) | финальный статус домена терминальной ветки эпизода (ТЗ 6.2) |
 | `crawler_laravel_near_findings` | gauge | — | monitor (T-115) | находки Laravel в серой зоне порога `[min_score/2, min_score)` — материал калибровки правил |
 | `crawler_laravel_appeared_total` / `crawler_laravel_lost_total` | gauge | — | monitor (T-118) | кумулятивные появления/исчезновения строк `laravel_domains` (журнал `laravel_history`, свежие эпизоды HTTP); монотонны — counter-семантика |
+| `crawler_redis_memory_bytes` | gauge | `kind` | monitor (T-154) | тот же проход, что `crawler_redis_memory_ratio`: `kind=used` — `used_memory`, `kind=max` — `maxmemory` (0 — потолка нет) из `INFO memory` |
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
 | `crawler_unit_oom_events` | gauge | `unit`, `kind` | monitor (T-145) | проход алертов (60 с): счётчики memory.events cgroup v2 юнитов `crawler-*.service` (kind=oom/oom_kill); обнуляются пересозданием cgroup на рестарте юнита — gauge, не counter; рост = события OOM (алерт unit_oom) |
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
-| `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: lag + pending; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026) |
+| `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: lag + pending; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`) |
+| `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод записи в q:dead (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
+| `crawler_redis_memory_ratio` | gauge | — | monitor (T-154) | проход алертов: `used_memory/maxmemory` из `INFO memory` (обёртка источника `monitor.NewRedisMemoryMetrics`); при noeviction — прокси-метрика предстоящих OOM-отказов записи (алерт `redis_memory` при ≥ 0.8); `maxmemory` не задан — ряд не пишется |
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) раз в 30 с (`scheduler.BacklogLoop`) |
 | `crawler_dashboard_snapshots_total` | counter | `result` | dashboard (`ok`/`error`, ТЗД §10) | каждый проход цикла сборки снимков: `error` — проход с деградированными секциями (снимок публикуется, причины — Warn в логе и карта `errors` /api/status) |
 | `crawler_dashboard_snapshot_seconds` | histogram | — | dashboard | длительность того же прохода (корзины 50 мс…~3 мин: проход — полные агрегаты `internal/status`) |
@@ -198,9 +201,13 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
   каждого сервиса уже есть), а привязка к потребителю гарантирует
   «очередь читается ⇔ глубина публикуется». XLEN для этого не годится:
   он считает и подтверждённую историю до обрезки MAXLEN.
-  `q:dead` потребителя не имеет (ручной разбор, ТЗ 4.2) — его глубину
-  показывает `crawlerctl status` (T-079), метрика появится вместе
-  с потребителем.
+  `q:dead` потребителя не имеет (ручной разбор, ТЗ 4.2) — с T-154 его
+  глубину публикует сам monitor (XLEN через ту же обёртку гейта,
+  `NewDeadDepthMetrics`, только ряд `queue="q:dead"`: дубль рабочих
+  стримов из monitor удваивал бы ряды воркеров в PromQL), сверяясь с
+  подсветкой дашборда (T-126/T-144) и алертом `queue_dead`;
+  до появления наблюдателя глубину показывал только `crawlerctl
+  status` (T-079).
 - **Глубина backlog** (pending/queued из БД) — в scheduler: он владелец
   состояний `domains` (постановка T-028, возврат lease T-029,
   перепроверки T-030/T-031), пул БД и периодический цикл уже его.
@@ -609,7 +616,30 @@ counter-семантикой корректен для `rate()`/`increase()`; п
   `crawler_unit_oom_events`/`crawler_unit_restarts`. Ошибки источника
   делятся на классы: окружение без systemd (dev-контейнер) — тихое
   «не измеряется» (как SMART), боевой отказ (systemd/D-Bus/cgroupfs
-  сломан) — Warn каждого прохода.
+  сломан) — Warn каждого прохода;
+- **неразобранный q:dead** (T-154) — глубина карантина ненулевая
+  3 прохода подряд (≈3 мин): «устойчиво ненулевой», а не миг единичной
+  смерти — при живом разборе единичная смерть штатна; сработавший
+  алерт держит любая ненулевая глубина, снятие — пустой карантин
+  (разбор + XTRIM, runbooks §2). Источник глубины — тот же гейт, что у
+  алерта очередей: потребителей у `q:dead` нет, Len читает XLEN;
+  обёртка `NewDeadDepthMetrics` заодно зеркалит её в
+  `crawler_queue_depth{queue="q:dead"}`. Согласован с подсветкой q:dead
+  дашборда (T-126/T-144: глубина > 0) и счётчиком смертей
+  `crawler_queue_dead_buried_total`: счётчик — темп (rate) смертей,
+  глубина — сток; эпизод 22.10 (5507 смертей,
+  docs/load-measurements.md §11.1) растянулся клеймом на часы — сток
+  держит сигнал всё это время, темп виден ретроспективно;
+- **память Redis** (T-154) — `used_memory/maxmemory` из `INFO memory`
+  (источник `RedisInfo` того же клиента, что у гейта глубин; обёртка
+  `NewRedisMemoryMetrics` зеркалит `crawler_redis_memory_ratio`/
+  `_bytes`) ≥ 80 % — срабатывание, < 75 % — снятие (гистерезис):
+  при noeviction (политика бюджета, ТЗ 3.2) заполнение maxmemory —
+  отказ записи XADD («OOM command not allowed», инциденты T-093/22.10),
+  прямого счётчика отказов `INFO` не отдаёт — доля с запасом 20 %
+  (межобрезочные остатки TrimLoop, фрагментация, буферы) — прокси
+  предстоящих отказов. `maxmemory` 0 (потолка нет) — «не измеряется»:
+  отношение не определено.
 
 Сигнал фронтовой (на переходах, стиль `DiskWatchLoop` в internal/content):
 Warn при срабатывании, Info при снятии; «не измеряется» — Debug. Ошибки

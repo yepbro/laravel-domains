@@ -246,11 +246,12 @@ func (f *fakeWear) Wear(context.Context) ([]NVMeWear, error) {
 // доля 0 %, зоны свежие, очереди пустые, места достаточно, износ мал.
 type alertsTestEnv struct {
 	*Alerts
-	pool  *alertsPool
-	lener *fakeLener
-	space *fakeSpace
-	wear  *fakeWear
-	buf   *bytes.Buffer
+	pool     *alertsPool
+	lener    *fakeLener
+	space    *fakeSpace
+	wear     *fakeWear
+	redisMem *fakeRedisMem
+	buf      *bytes.Buffer
 }
 
 // alertsFixedClock — те же фиксированные часы, что у тестов zonestats.
@@ -289,6 +290,7 @@ func newAlertsTestEnv(t *testing.T, mod func(o *AlertsOptions)) *alertsTestEnv {
 	lener := &fakeLener{lens: map[string]int64{}}
 	space := &fakeSpace{stat: SpaceStat{Avail: 100 << 30, Total: 200 << 30}}
 	wear := &fakeWear{wears: []NVMeWear{{Device: "nvme0", PercentUsed: 10}}}
+	redisMem := &fakeRedisMem{mem: RedisMemory{UsedBytes: 100 << 20, MaxBytes: 512 << 20, Policy: "noeviction"}}
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -305,8 +307,9 @@ func newAlertsTestEnv(t *testing.T, mod func(o *AlertsOptions)) *alertsTestEnv {
 		mod(&opts)
 	}
 	return &alertsTestEnv{
-		Alerts: NewAlerts(AlertsDeps{Pool: pool, Redis: lener, Space: space, Wear: wear}, opts),
-		pool:   pool, lener: lener, space: space, wear: wear, buf: &buf,
+		Alerts: NewAlerts(AlertsDeps{Pool: pool, Redis: lener, Space: space, Wear: wear,
+			RedisMemory: redisMem}, opts),
+		pool: pool, lener: lener, space: space, wear: wear, redisMem: redisMem, buf: &buf,
 	}
 }
 
@@ -465,11 +468,12 @@ func TestAlertsDNSSourceErrors(t *testing.T) {
 // --- переполнение очередей ---------------------------------------------------
 
 // TestAlertsQueuesThresholds — срабатывание на пороге гейта (len ≥
-// watermark), удержание до 90 % порога, снятие ниже; стримы — только
-// рабочие, q:dead гейтом не ограничивается и не опрашивается.
+// watermark), удержание до 90 % порога, снятие ниже; стримы алерта
+// очередей — только рабочие, q:dead не опрашивается им (глубину
+// карантина читает отдельный алерт queue_dead, T-154).
 func TestAlertsQueuesThresholds(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	env.lener.lens[queue.StreamDead] = 1 << 40 // никогда не опрашивается
+	env.lener.lens[queue.StreamDead] = 1 << 40 // алертом очередей не учитывается
 	ctx := context.Background()
 	steps := []struct {
 		lens map[string]int64
@@ -510,10 +514,17 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 		t.Errorf("максимум q:http: %s (%s), want ok макс q:http=5", s.Status, s.Detail)
 	}
 
+	// Алерт очередей не опрашивает q:dead даже при огромной глубине
+	// карантина: опросы q:dead в протоколе — только алерт queue_dead
+	// (проверяется отдельно в TestAlertsDeadEpisode).
+	deadPolls := 0
 	for _, s := range env.lener.streams() {
 		if s == queue.StreamDead {
-			t.Error("q:dead опрошен алертом очередей")
+			deadPolls++
 		}
+	}
+	if deadPolls == 0 {
+		t.Error("алерт queue_dead не опрашивает q:dead (протокол пуст)")
 	}
 	// detail сработавшего шага называет стрим и длину.
 	env.lener.lens = map[string]int64{queue.StreamRender: 4242}
@@ -557,6 +568,186 @@ func TestAlertsQueuesSourceError(t *testing.T) {
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "connection refused") {
 		t.Errorf("ошибка Redis без Warn:\n%s", env.buf.String())
+	}
+}
+
+// --- неразобранный q:dead (T-154) ----------------------------------------------
+
+// TestAlertsDeadEpisode — эпизод queue_dead: срабатывание на третьем
+// проходе с ненулевой глубиной (не на первом — «устойчиво ненулевой»),
+// удержание любой ненулевой глубиной, снятие пустым q:dead; один Warn
+// на эпизод; алерт читает именно q:dead.
+func TestAlertsDeadEpisode(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	ctx := context.Background()
+
+	steps := []struct {
+		dead int64
+		want string
+	}{
+		{0, AlertStatusOK},     // пустой карантин
+		{5, AlertStatusOK},     // первая смерть — наблюдение 1/3
+		{5, AlertStatusOK},     // 2/3
+		{5, AlertStatusFiring}, // 3/3 — устойчиво ненулевой
+		{1, AlertStatusFiring}, // удержание: любая ненулевая глубина
+		{0, AlertStatusOK},     // разбор (XTRIM) — снятие
+		{7, AlertStatusOK},     // новая смерть после снятия — новый эпизод, 1/3
+	}
+	for i, s := range steps {
+		env.lener.lens = map[string]int64{queue.StreamDead: s.dead}
+		got := snapshotOf(t, env.Pass(ctx), AlertQueueDead)
+		if got.Status != s.want {
+			t.Errorf("шаг %d (q:dead=%d): статус = %s (%s), want %s", i, s.dead, got.Status, got.Detail, s.want)
+		}
+	}
+	// Detail с глубиной и счётчиком проходов (сверка с bury-счётчиком):
+	// после шагов выше серия — 1 наблюдение, этот проход — второй.
+	env.lener.lens = map[string]int64{queue.StreamDead: 12}
+	got := snapshotOf(t, env.Pass(ctx), AlertQueueDead)
+	for _, want := range []string{"q:dead=12", "2/3", "crawler_queue_dead_buried_total"} {
+		if !strings.Contains(got.Detail, want) {
+			t.Errorf("detail %q не содержит %q", got.Detail, want)
+		}
+	}
+
+	// Один Warn на эпизод: срабатывание Warn «АЛЕРТ», устойчивое
+	// срабатывание и снятие после — без повторного Warn.
+	env = newAlertsTestEnv(t, nil)
+	for range 3 {
+		env.lener.lens = map[string]int64{queue.StreamDead: 9}
+		env.Pass(ctx)
+	}
+	if n := strings.Count(env.buf.String(), "АЛЕРТ: мертвые задачи в q:dead"); n != 1 {
+		t.Errorf("Warn срабатывания = %d, want 1:\n%s", n, env.buf.String())
+	}
+	env.lener.lens = map[string]int64{queue.StreamDead: 9}
+	if got := snapshotOf(t, env.Pass(ctx), AlertQueueDead); got.Status != AlertStatusFiring {
+		t.Fatalf("устойчивое срабатывание: %s, want firing", got.Status)
+	}
+	before := env.buf.String()
+	env.lener.lens = map[string]int64{}
+	s := snapshotOf(t, env.Pass(ctx), AlertQueueDead)
+	if s.Status != AlertStatusOK {
+		t.Fatalf("пустой карантин: %s, want ok", s.Status)
+	}
+	if delta := env.buf.String()[len(before):]; strings.Contains(delta, "level=WARN") {
+		t.Errorf("снятие дало Warn:\n%s", delta)
+	} else if !strings.Contains(delta, "level=INFO") || !strings.Contains(delta, "алерт снят") {
+		t.Errorf("снятие без Info:\n%s", delta)
+	}
+}
+
+// TestAlertsDeadDegradation — без Redis и при ошибке чтения queue_dead
+// «не измеряется» (ошибка — с Warn); серия наблюдений не сбрасывается
+// ошибкой: неизвестное наблюдение — не нулевое.
+func TestAlertsDeadDegradation(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	env.deps.Redis = nil
+	if s := snapshotOf(t, env.Pass(context.Background()), AlertQueueDead); s.Status != AlertStatusNotMeasured {
+		t.Errorf("без Redis: статус = %s, want not_measured", s.Status)
+	}
+
+	ctx := context.Background()
+	env = newAlertsTestEnv(t, nil)
+	env.lener.lens = map[string]int64{queue.StreamDead: 4}
+	// Ошибок — на все чтения прохода: алерт очередей читает 4 рабочих
+	// стрима до q:dead (evaluators), каждой своей ошибки не хватит.
+	env.lener.errs = []error{
+		errors.New("connection refused"), errors.New("connection refused"),
+		errors.New("connection refused"), errors.New("connection refused"),
+		errors.New("connection refused"),
+	}
+	s := snapshotOf(t, env.Pass(ctx), AlertQueueDead)
+	if s.Status != AlertStatusNotMeasured {
+		t.Fatalf("ошибка чтения: статус = %s, want not_measured", s.Status)
+	}
+	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "connection refused") {
+		t.Errorf("ошибка чтения q:dead без Warn:\n%s", env.buf.String())
+	}
+
+	// Ошибка между наблюдениями не обнуляет серию: два наблюдения,
+	// сбой посередине, третье живое — срабатывание (наблюдений 3 из 3).
+	env.lener.errs = nil
+	if s := snapshotOf(t, env.Pass(ctx), AlertQueueDead); s.Status != AlertStatusOK {
+		t.Fatalf("первое живое наблюдение: %s, want ok (1/3)", s.Status)
+	}
+	if s := snapshotOf(t, env.Pass(ctx), AlertQueueDead); s.Status != AlertStatusOK {
+		t.Fatalf("второе живое наблюдение: %s, want ok (2/3)", s.Status)
+	}
+	env.lener.errs = []error{
+		errors.New("connection refused"), errors.New("connection refused"),
+		errors.New("connection refused"), errors.New("connection refused"),
+		errors.New("connection refused"),
+	}
+	if s := snapshotOf(t, env.Pass(ctx), AlertQueueDead); s.Status != AlertStatusNotMeasured {
+		t.Fatalf("сбой посередине серии: %s, want not_measured", s.Status)
+	}
+	env.lener.errs = nil
+	if s := snapshotOf(t, env.Pass(ctx), AlertQueueDead); s.Status != AlertStatusFiring {
+		t.Fatalf("третье наблюдение после сбоя: %s, want firing (серия сохранена)", s.Status)
+	}
+}
+
+// --- память Redis (T-154) --------------------------------------------------------
+
+// TestAlertsRedisMemoryThreshold — порог 80 % (ровно — срабатывание),
+// коридор гистерезиса 75–80 % (удержание сработавшего), ниже 75 % —
+// снятие; после снятия коридор не включает алерт заново.
+func TestAlertsRedisMemoryThreshold(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	ctx := context.Background()
+	const max = int64(1000)
+	steps := []struct {
+		used int64
+		want string
+	}{
+		{799, AlertStatusOK},     // 79.9 % — ниже порога
+		{800, AlertStatusFiring}, // ровно 80 % — срабатывание
+		{760, AlertStatusFiring}, // 76 % — коридор гистерезиса
+		{750, AlertStatusFiring}, // ровно 75 % — удержание (граница)
+		{749, AlertStatusOK},     // 74.9 % — снятие
+		{760, AlertStatusOK},     // коридор без сработавшего — не включается
+	}
+	for i, s := range steps {
+		env.redisMem.mem = RedisMemory{UsedBytes: s.used, MaxBytes: max, Policy: "noeviction"}
+		got := snapshotOf(t, env.Pass(ctx), AlertRedisMemory)
+		if got.Status != s.want {
+			t.Errorf("шаг %d (used %d из %d): статус = %s (%s), want %s", i, s.used, max, got.Status, got.Detail, s.want)
+		}
+	}
+	// Detail с абсолютами, долей и политикой.
+	env.redisMem.mem = RedisMemory{UsedBytes: 800, MaxBytes: 1000, Policy: "noeviction"}
+	if s := snapshotOf(t, env.Pass(ctx), AlertRedisMemory); s.Status != AlertStatusFiring ||
+		!strings.Contains(s.Detail, "80.0%") || !strings.Contains(s.Detail, "noeviction") {
+		t.Errorf("detail = %q (%s), want firing с долей 80.0%% и политикой", s.Detail, s.Status)
+	}
+}
+
+// TestAlertsRedisMemoryDegradation — без источника и при maxmemory 0
+// (без потолка) алерт «не измеряется»; ошибка источника — «не
+// измеряется» с Warn, цикл живёт.
+func TestAlertsRedisMemoryDegradation(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	env.deps.RedisMemory = nil
+	if s := snapshotOf(t, env.Pass(context.Background()), AlertRedisMemory); s.Status != AlertStatusNotMeasured {
+		t.Errorf("без источника: статус = %s, want not_measured", s.Status)
+	}
+
+	env = newAlertsTestEnv(t, nil)
+	env.redisMem.mem = RedisMemory{UsedBytes: 1 << 20, MaxBytes: 0, Policy: "noeviction"}
+	s := snapshotOf(t, env.Pass(context.Background()), AlertRedisMemory)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "maxmemory=0") {
+		t.Errorf("maxmemory 0: %s (%s), want not_measured «без потолка»", s.Status, s.Detail)
+	}
+
+	env = newAlertsTestEnv(t, nil)
+	env.redisMem.errs = []error{errors.New("connection refused")}
+	s = snapshotOf(t, env.Pass(context.Background()), AlertRedisMemory)
+	if s.Status != AlertStatusNotMeasured {
+		t.Fatalf("ошибка INFO: статус = %s, want not_measured", s.Status)
+	}
+	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "connection refused") {
+		t.Errorf("ошибка INFO без Warn:\n%s", env.buf.String())
 	}
 }
 
@@ -846,7 +1037,7 @@ func TestAlertsTransitionsLogging(t *testing.T) {
 	}
 }
 
-// TestAlertsOnPassSnapshot — хук получает снапшот всех семи алертов
+// TestAlertsOnPassSnapshot — хук получает снапшот всех девяти алертов
 // в фиксированном порядке; Firing() отбирает сработавшие.
 func TestAlertsOnPassSnapshot(t *testing.T) {
 	var mu sync.Mutex
@@ -866,7 +1057,8 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 	if len(passes) != 1 {
 		t.Fatalf("OnPass вызовов = %d, want 1", len(passes))
 	}
-	wantNames := []string{AlertDNSErrors, AlertQueueOverflow, AlertProgressStall, AlertDiskFree, AlertNVMeWear, AlertBadHashes, AlertUnitOOM}
+	wantNames := []string{AlertDNSErrors, AlertQueueOverflow, AlertProgressStall, AlertDiskFree,
+		AlertNVMeWear, AlertBadHashes, AlertUnitOOM, AlertQueueDead, AlertRedisMemory}
 	if len(res.Alerts) != len(wantNames) {
 		t.Fatalf("алертов в снапшоте = %d, want %d", len(res.Alerts), len(wantNames))
 	}

@@ -186,6 +186,14 @@ type ReliabOptions struct {
 	// MinIdle — минимальный простой pending-записи до клейма, когда Claim
 	// вызван с minIdle 0; 0 — DefaultClaimMinIdle.
 	MinIdle time.Duration
+	// OnBury — хук завершённого перевода записи в q:dead (T-154):
+	// вызывается после успешной публикации Dead и XACK исходной записи —
+	// ровно на факте смерти задачи, с именем стрима-источника.
+	// Монтируют сервисы (счётчик смертей crawler_queue_dead_buried_total,
+	// metrics.NewDeadBuriedHook): пакет очереди метрик не знает — стиль
+	// queue-метрик кодовой базы (шов-функция, как LenFunc коллектора
+	// глубин T-077). nil — перевод молчалив (как до T-154).
+	OnBury func(stream string)
 }
 
 // Reliab — возврат зависших записей Redis Streams со счётчиком попыток
@@ -375,7 +383,10 @@ func (r *Reliab) ProcessAttempt(ctx context.Context, group string, d Delivery, a
 // защита T-105 (см. Dead); Reason фиксирует причину — зависание без
 // подтверждения (воркеры ошибки обработки очереди не сообщают, ТЗ 4.2,
 // поэтому «последняя ошибка» сводится к факту исчерпания). Публикация
-// Dead идёт до XACK (см. Claim).
+// Dead идёт до XACK (см. Claim). Завершённый перевод (Dead опубликован,
+// исходная запись подтверждена) отмечается хуком OnBury — наблюдаемость
+// смертей (T-154: bury был молчалив, 5507 смертей инцидента 22.10
+// прошли без единого алерта).
 func (r *Reliab) bury(ctx context.Context, group string, d Delivery, attempts int) error {
 	taskID := taskIDOf(d.Payload)
 	if taskID == "" {
@@ -404,6 +415,9 @@ func (r *Reliab) bury(ctx context.Context, group string, d Delivery, attempts in
 	}
 	if err := r.q.Ack(ctx, d.Stream, group, d.ID); err != nil {
 		return fmt.Errorf("queue: подтверждение перенесённой в q:dead записи %s стрима %s: %w", d.ID, d.Stream, err)
+	}
+	if r.opt.OnBury != nil {
+		r.opt.OnBury(d.Stream)
 	}
 	return nil
 }

@@ -6,7 +6,8 @@
 // очередей, остановка прогресса, свободное место каталога контента,
 // износ NVMe (SMART), всплеск мусорных content_hash очистки ingest
 // (T-099, зонд /metrics), OOM и рестарты юнитов crawler (T-145,
-// systemctl + cgroup v2). Каркас — internal/service: миграции, пул БД
+// systemctl + cgroup v2), неразобранный q:dead и память Redis (T-154,
+// XLEN + INFO memory). Каркас — internal/service: миграции, пул БД
 // (OnDBPool), пробы /livez + /healthz, /metrics, graceful shutdown (ТЗ 3.4).
 package main
 
@@ -119,11 +120,17 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// считается в тех же периодах; отдельного поля конфигурации под
 	// период алертов не заводим.
 	//
+	// Глубина q:dead (T-154) — через тот же гейт обёрткой
+	// NewDeadDepthMetrics: Len(q:dead) зеркалится в
+	// crawler_queue_depth{queue="q:dead"} (monitor — назначенный
+	// наблюдатель карантина, потребителей у него нет), рабочие стримы
+	// идут транзитом — их глубину публикуют сами воркеры (T-077).
+	//
 	// Источник мусорных content_hash (T-099) — зонд экспозиции /metrics
 	// сервиса ingest: счётчик растёт в процессе ingest, монитор читает
 	// его тем же адресом, что скрейпит Prometheus. Пустой адрес — алерт
 	// «не измеряется» (тихо), а не Warn зондом на каждый проход.
-	deps := monitor.AlertsDeps{Pool: pool, Redis: gate}
+	deps := monitor.AlertsDeps{Pool: pool, Redis: monitor.NewDeadDepthMetrics(reg, gate)}
 	if cfg.Monitor.IngestMetricsURL != "" {
 		deps.BadHashes = monitor.IngestBadHashes{URL: cfg.Monitor.IngestMetricsURL}
 	}
@@ -132,6 +139,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// и алерт, и gauge crawler_unit_oom_events/crawler_unit_restarts.
 	// В dev-контейнере без systemd источник деградирует тихо (как SMART).
 	deps.UnitEvents = monitor.NewUnitEventsMetrics(reg, monitor.OSUnitEvents{})
+	// Память Redis (T-154): INFO memory того же клиента, что у гейта,
+	// обёрнута в метрики — одно чтение питает алерт redis_memory и gauge
+	// crawler_redis_memory_ratio/_bytes.
+	deps.RedisMemory = monitor.NewRedisMemoryMetrics(reg, monitor.RedisInfo{RDB: rdb})
 	err := monitor.AlertsLoop(ctx, deps, monitor.AlertsOptions{
 		Interval:          cfg.Monitor.ZoneStatsInterval.D(),
 		ZoneStatsInterval: cfg.Monitor.ZoneStatsInterval.D(),

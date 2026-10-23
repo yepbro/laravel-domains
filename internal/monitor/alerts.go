@@ -30,6 +30,17 @@
 //     реализация OSUnitEvents — unitevents.go): событие — незапланированный
 //     простой конвейера и симптом невыполнения бюджета памяти (ТЗ 3.4,
 //     docs/deploy.md §2).
+//   - неразобранный q:dead (T-154) — глубина карантина (XLEN через тот
+//     же StreamLener: групп потребителей у q:dead нет) устойчиво
+//     ненулевая; сверяется со счётчиком смертей
+//     crawler_queue_dead_buried_total (metrics/dead.go) — глубина
+//     (сток) держит сигнал, который темп (rate) растягивает медленным
+//     клеймом на часы (пост-мортем docs/load-measurements.md §11.1);
+//   - память Redis (T-154) — used_memory/maxmemory из INFO memory
+//     (RedisMemorySource, реализация RedisInfo — redismem.go): при
+//     noeviction (ТЗ 3.2) заполнение maxmemory — прокси-метрика
+//     предстоящих OOM-отказов записи, прямого счётчика отказов INFO
+//     не отдаёт.
 //
 // Сигнал фронтовой (на переходах, стиль DiskWatchLoop в internal/content):
 // Warn при срабатывании, Info при снятии, Debug когда алерт неприменим
@@ -42,8 +53,10 @@
 // smartd.
 //
 // Гистерезис — у алертов с дребезгом у порога: доля ошибок DNS (включение
-// 30 % / снятие 20 %) и очереди (включение на пороге гейта / снятие ниже
-// 90 % порога). Диск зеркалирует порог паузы Put без зазора: алерт виден
+// 30 % / снятие 20 %), очереди (включение на пороге гейта / снятие ниже
+// 90 % порога) и память Redis (80 % / 75 %, T-154); q:dead гасится
+// устойчивостью (3 прохода) и снимается пустым карантином (T-154). Диск
+// зеркалирует порог паузы Put без зазора: алерт виден
 // ровно тогда, когда запись контента остановлена; остановка прогресса и
 // износ меняются только событиями, не порогом — гистерезис не нужен.
 //
@@ -95,6 +108,8 @@ const (
 	AlertNVMeWear      = "nvme_wear"            // SMART percentage_used
 	AlertBadHashes     = "ingest_bad_hashes"    // всплеск мусорных content_hash
 	AlertUnitOOM       = "unit_oom"             // OOM/рестарты юнитов crawler (T-145)
+	AlertQueueDead     = "queue_dead"           // неразобранный q:dead (T-154)
+	AlertRedisMemory   = "redis_memory"         // память Redis у maxmemory (T-154)
 )
 
 // alertDescs — человекочитаемые описания алертов для записей лога.
@@ -106,6 +121,8 @@ var alertDescs = map[string]string{
 	AlertNVMeWear:      "износ NVMe (SMART)",
 	AlertBadHashes:     "мусорные content_hash при очистке удалённых доменов",
 	AlertUnitOOM:       "OOM-убийства и крэш-рестарты юнитов crawler",
+	AlertQueueDead:     "мертвые задачи в q:dead не разбираются",
+	AlertRedisMemory:   "память Redis у порога maxmemory",
 }
 
 // Пороги оценки. Числа ТЗ не задаёт; переиспользуются существующие пороги
@@ -170,6 +187,29 @@ const (
 	// против дребезга гистерезис не нужен — сумма окна убывает только
 	// старением дельт, у порога она держится лишь при продолжении потока.
 	AlertBadHashesWindow = 15
+
+	// AlertDeadMinPasses — проходов алертов с ненулевой глубиной q:dead
+	// до срабатывания queue_dead (T-154): 3 × 60 с ≈ 3 минуты. «Устойчиво
+	// ненулевой», а не «любая смерть»: карантин не опустошается сам
+	// (только разбор оператора, ТЗ 4.2), и единичная смерть при живом
+	// разборе — штатная работа q:dead, не авария; в то же время 3 минуты
+	// несопоставимы с инцидентным масштабом (5507 смертей за вечер,
+	// пост-мортем §11.1) — сигнал опаздывает максимум на один проход.
+	AlertDeadMinPasses = 3
+
+	// AlertRedisMemFireRatio — доля used_memory/maxmemory, включающая
+	// redis_memory (T-154): 80 %. При noeviction (ТЗ 3.2) заполнение
+	// maxmemory — отказ записи XADD; 20 % запаса — межобрезочные остатки
+	// TrimLoop (подтверждённый префикс до обрезки), фрагментация и буферы
+	// клиентов, растущие быстрее обрезки (инцидент 22.10: 620 МиБ данных
+	// при потолке 900 МиБ уже отказывал публикации).
+	AlertRedisMemFireRatio = 0.80
+
+	// AlertRedisMemRecoverRatio — снятие redis_memory ниже 75 %:
+	// гистерезис 5 п.п. — память ползёт (остатки/фрагментация) и падает
+	// резко (XTRIM/Drain), доля в коридоре 75–80 % не дребезжала бы Warn
+	// у порога.
+	AlertRedisMemRecoverRatio = 0.75
 )
 
 // dnsShareSQL — числитель и знаменатель доли temp_error одним проходом по
@@ -487,6 +527,11 @@ type AlertsDeps struct {
 	// командует cmd/monitor (OSUnitEvents, обёрнутая в метрики
 	// NewUnitEventsMetrics).
 	UnitEvents UnitEventsSource
+	// RedisMemory — used_memory/maxmemory из INFO memory (T-154);
+	// nil — алерт redis_memory «не измеряется». Источником командует
+	// cmd/monitor (RedisInfo того же клиента, что у гейта глубин,
+	// обёрнутая в метрики NewRedisMemoryMetrics).
+	RedisMemory RedisMemorySource
 }
 
 // AlertsOptions — параметры оценки; нулевые значения заменяются
@@ -633,6 +678,11 @@ type Alerts struct {
 	now     func() time.Time
 	state   map[string]string
 	badHash badHashesWindow // окно всплеска мусорных content_hash (T-099)
+	// deadStreak — проходов подряд с ненулевой глубиной q:dead (T-154):
+	// «устойчиво ненулевой» вместо мгновенного срабатывания на первую
+	// смерть; обнуляется пустым q:dead, ошибка источника не сбрасывает
+	// (неизвестное наблюдение — не нулевое).
+	deadStreak int
 }
 
 // NewAlerts строит оценщик: нормализует опции (дефолты периодов), источники
@@ -667,6 +717,8 @@ func (a *Alerts) evaluators() []alertEval {
 		{AlertNVMeWear, a.evalWear},
 		{AlertBadHashes, a.evalBadHashes},
 		{AlertUnitOOM, a.evalUnitOOM},
+		{AlertQueueDead, a.evalDead},
+		{AlertRedisMemory, a.evalRedisMemory},
 	}
 }
 
@@ -1047,6 +1099,74 @@ func (a *Alerts) evalUnitOOM(ctx context.Context, _ string) verdict {
 		status: AlertStatusOK,
 		detail: fmt.Sprintf("OOM и рестартов нет (%d юнитов)", len(units)),
 	}
+}
+
+// evalDead — устойчиво ненулевая глубина q:dead (T-154): карантин без
+// потребителей (ручной разбор, ТЗ 4.2), Len читает XLEN, покидают записи
+// карантин только разбором оператора (XTRIM/runbooks §2) — глубина и есть
+// «неразобранный остаток». Срабатывание — глубина > 0 AlertDeadMinPasses
+// проходов подряд; сработавший алерт держит любая ненулевая глубина
+// (гистерезис: эпизод от третьего прохода до разбора), снятие — пустой
+// q:dead. Отдельный контроль роста не нужен: рост — частный случай
+// устойчивой ненулевости, а дифференциация «растёт/стоит» дребезжала бы
+// на подвижном XTRIM разбора. Источник — тот же Redis, что у алерта
+// очередей (StreamLener), сверка со счётчиком смертей — темп
+// crawler_queue_dead_buried_total (T-154) объясняет, откуда сток.
+func (a *Alerts) evalDead(ctx context.Context, prev string) verdict {
+	if a.deps.Redis == nil {
+		return verdict{status: AlertStatusNotMeasured, detail: "Redis не задан"}
+	}
+	n, err := a.deps.Redis.Len(ctx, queue.StreamDead)
+	if err != nil {
+		return verdict{err: fmt.Errorf("monitor: глубина q:dead: %w", err)}
+	}
+	if n > 0 {
+		a.deadStreak++
+	} else {
+		a.deadStreak = 0
+	}
+	detail := fmt.Sprintf("глубина q:dead=%d, ненулевых проходов подряд %d/%d; темп смертей — crawler_queue_dead_buried_total",
+		n, a.deadStreak, AlertDeadMinPasses)
+	if a.deadStreak >= AlertDeadMinPasses || (prev == AlertStatusFiring && n > 0) {
+		return verdict{status: AlertStatusFiring, detail: detail + " — разбор: runbooks §2"}
+	}
+	return verdict{status: AlertStatusOK, detail: detail}
+}
+
+// evalRedisMemory — доля памяти Redis used_memory/maxmemory из INFO
+// memory (T-154): включение ≥ AlertRedisMemFireRatio (80 %), удержание
+// сработавшего до AlertRedisMemRecoverRatio (75 %) — гистерезис против
+// дребезга у порога (память ползёт межобрезочными остатками TrimLoop
+// и падает резко после XTRIM). При noeviction (политика бюджета ТЗ 3.2)
+// заполнение maxmemory — отказ записи XADD: прямого счётчика отказов
+// INFO не отдаёт, доля — прокси-метрика с запасом на буферы/фрагментацию
+// (инцидент 22.10: OOM-отказы публикаций при 620 из 900 МиБ).
+// maxmemory 0 (без потолка) — «не измеряется»: отношение не определено,
+// отказов записи по maxmemory не бывает.
+func (a *Alerts) evalRedisMemory(ctx context.Context, prev string) verdict {
+	if a.deps.RedisMemory == nil {
+		return verdict{status: AlertStatusNotMeasured, detail: "источник не задан"}
+	}
+	m, err := a.deps.RedisMemory.RedisMemory(ctx)
+	if err != nil {
+		return verdict{err: fmt.Errorf("monitor: память Redis: %w", err)}
+	}
+	if m.MaxBytes <= 0 {
+		return verdict{
+			status: AlertStatusNotMeasured,
+			detail: fmt.Sprintf("maxmemory=%d — потолка нет, доля не определена", m.MaxBytes),
+		}
+	}
+	share := float64(m.UsedBytes) / float64(m.MaxBytes)
+	detail := fmt.Sprintf("used_memory %s из %s maxmemory (%.1f%%), политика %s",
+		alertBytes(uint64(m.UsedBytes)), alertBytes(uint64(m.MaxBytes)), 100*share, m.Policy)
+	if share >= AlertRedisMemFireRatio || (prev == AlertStatusFiring && share >= AlertRedisMemRecoverRatio) {
+		return verdict{
+			status: AlertStatusFiring,
+			detail: detail + " — при noeviction у порога отказы записи (OOM command not allowed)",
+		}
+	}
+	return verdict{status: AlertStatusOK, detail: detail}
 }
 
 // AlertsLoop — периодический цикл оценки алертов (стиль ZoneStatsLoop):

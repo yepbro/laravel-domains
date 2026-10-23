@@ -143,10 +143,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// Возврат зависших доставок q:render (T-025): RecoverLoop в воркере —
 	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
 	// и темпа — секция redis (max_attempts, claim_min_idle,
-	// recover_batch, recover_interval — T-153).
+	// recover_batch, recover_interval — T-153). OnBury — счётчик смертей
+	// crawler_queue_dead_buried_total (T-154): bury молчаливым быть не
+	// должно (пост-мортем 22.10).
 	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
 		MaxAttempts: cfg.Redis.MaxAttempts,
 		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
+		OnBury:      metrics.NewDeadBuriedHook(reg),
 	})
 
 	// Длина потребляемого стрима q:render → crawler_queue_depth (T-077):

@@ -164,6 +164,8 @@ SELECT * FROM schema_migrations;   -- version, dirty = false
 - `crawler_stage_tasks_total{stage}` / `crawler_stage_seconds` —
   пропускная способность этапов dns/http/render/analyze;
 - `crawler_queue_depth{queue}` — глубина очередей `q:*` (backlog групп потребления);
+- `crawler_queue_dead_buried_total{queue}` / `crawler_redis_memory_ratio` —
+  смерти задач (переводы в q:dead, T-154) и заполнение `maxmemory` Redis;
 - `crawler_backlog_domains{state}` — pending/queued по БД;
 - `crawler_domain_status_total{type}` — статусы доменов;
 - `crawler_laravel_near_findings` — находки Laravel в серой зоне порога
@@ -186,7 +188,8 @@ Prometheus оператора, конфиг джобов по образцу
 `monitor.zone_stats_interval` (60 с): доля ошибок DNS, переполнение
 очередей, остановка прогресса, нехватка места на диске, износ NVMe,
 всплеск мусорных `content_hash` при очистке удалённых доменов (T-099),
-OOM-убийства и крэш-рестарты юнитов crawler (T-145). Сигнал фронтовой
+OOM-убийства и крэш-рестарты юнитов crawler (T-145), неразобранный
+`q:dead` и память Redis (T-154). Сигнал фронтовой
 (на переходах): **Warn в лог/journald monitor** —
 
 ```bash
@@ -251,7 +254,9 @@ systemctl show 'crawler-*.service' -p Id -p NRestarts   # OOM/рестарты �
 df -h /var/lib/crawler/content /var/lib/postgresql    # тома
 ```
 
-- **`q:dead` не пуст или растёт** — разбрать:
+- **`q:dead` не пуст или растёт** (алерт `queue_dead` бьёт на 3 прохода
+  устойчивой глубины, T-154; темп смертей —
+  `crawler_queue_dead_buried_total`) — разбрать:
   [`runbooks.md`](runbooks.md) §2.
 - **Том контента близок к порогу** (`content.disk_free_percent`, 5%) —
   запись контента встала на паузу (алерт disk_free): освободить место
@@ -274,6 +279,10 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # тома
   `-p MemoryHigh`, T-145). Суточный прогон без OOM —
   критерий ТЗ 11.4 п. 7 (T-093): `journalctl -k --grep oom` пуст,
   рестарты — по `NRestarts` (бьёт алерт unit_oom, T-145).
+- **Память Redis** — `crawler_redis_memory_ratio` (алерт `redis_memory`
+  при ≥ 80 % `maxmemory`, T-154; при noeviction — предупреждение
+  отказов записи): сверить `redis-cli INFO memory`, разбор —
+  [`redis.md`](redis.md).
 - **SMART/TBW** — `smartctl -H -A /dev/nvme0`, предупреждения smartd:
   [`disks.md`](disks.md) §6.
 - **Отказоустойчивость**: падение PostgreSQL/Redis не останавливает

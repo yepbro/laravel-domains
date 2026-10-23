@@ -721,6 +721,103 @@ func TestReliabClaimPartialError(t *testing.T) {
 	}
 }
 
+// TestReliabClaimDeadOnBury (T-154) — хук OnBury зовётся на завершённый
+// перевод (Dead опубликован и исходная запись подтверждена) с именем
+// стрима-источника; записи в работе и незавершённые переводы (сбой
+// публикации Dead, сбой XACK, запись без task_id) хук не трогают.
+func TestReliabClaimDeadOnBury(t *testing.T) {
+	var buried []string
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}, // ещё в работу
+			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}}, // смерть
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 2}},
+			"1719-0": {{ID: "1719-0", RetryCount: 9}}, // лимит 3 исчерпан
+		},
+	}
+	r := NewReliab(fake, NewRedisQueue(fake, RedisOptions{}), ReliabOptions{
+		OnBury: func(stream string) { buried = append(buried, stream) },
+	})
+
+	if _, _, err := r.Claim(context.Background(), StreamHTTP, "http", "recover-1", time.Minute, 5, "0-0"); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if want := []string{StreamHTTP}; !reflect.DeepEqual(buried, want) {
+		t.Errorf("OnBury: %v, хочу ровно один вызов с именем стрима-источника %q", buried, StreamHTTP)
+	}
+
+	// Сбой публикации Dead — перевода не было (запись в pending,
+	// повторится на следующем проходе): хук молчит.
+	fake = &fakeClaimRedis{
+		fakeRedis: fakeRedis{addErr: errors.New("connection refused")},
+		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
+		pendRes:   map[string][]redis.XPendingExt{"1-0": {{ID: "1-0", RetryCount: 9}}},
+	}
+	buried = nil
+	if _, _, err := NewReliab(fake, NewRedisQueue(fake, RedisOptions{}), ReliabOptions{
+		OnBury: func(stream string) { buried = append(buried, stream) },
+	}).Claim(context.Background(), StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil {
+		t.Fatal("сбой публикации Dead: ожидалась ошибка")
+	}
+	if len(buried) != 0 {
+		t.Errorf("OnBury при сбое публикации Dead: %v, хочу пусто", buried)
+	}
+
+	// Сбой XACK — Dead опубликован, но исходная запись не покинула pending
+	// (перевод повторится, дав дубль в q:dead): смерти ещё нет, хук молчит.
+	fake = &fakeClaimRedis{
+		fakeRedis: fakeRedis{ackErr: errors.New("connection refused")},
+		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
+		pendRes:   map[string][]redis.XPendingExt{"1-0": {{ID: "1-0", RetryCount: 9}}},
+	}
+	buried = nil
+	if _, _, err := NewReliab(fake, NewRedisQueue(fake, RedisOptions{}), ReliabOptions{
+		OnBury: func(stream string) { buried = append(buried, stream) },
+	}).Claim(context.Background(), StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil {
+		t.Fatal("сбой XACK: ожидалась ошибка")
+	}
+	if len(fake.adds) != 1 {
+		t.Fatalf("Dead должен быть опубликован до XACK: %+v", fake.adds)
+	}
+	if len(buried) != 0 {
+		t.Errorf("OnBury при сбое XACK: %v, хочу пусто (перевод не завершён)", buried)
+	}
+
+	// Запись без task_id — в q:dead не переводится вовсе.
+	fake = &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"no_task":"id"}`}}},
+		pendRes:   map[string][]redis.XPendingExt{"1-0": {{ID: "1-0", RetryCount: 9}}},
+	}
+	buried = nil
+	if _, _, err := NewReliab(fake, NewRedisQueue(fake, RedisOptions{}), ReliabOptions{
+		OnBury: func(stream string) { buried = append(buried, stream) },
+	}).Claim(context.Background(), StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil {
+		t.Fatal("запись без task_id: ожидалась ошибка разбора")
+	}
+	if len(buried) != 0 {
+		t.Errorf("OnBury неформатной записи: %v, хочу пусто", buried)
+	}
+}
+
+// TestReliabClaimDeadNoHook — nil-хук (изолированные сборки и тесты без
+// реестра): bury работает как раньше, без паники.
+func TestReliabClaimDeadNoHook(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
+		pendRes:   map[string][]redis.XPendingExt{"1-0": {{ID: "1-0", RetryCount: 9}}},
+	}
+	got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+		context.Background(), StreamAnalyze, "analyzer", "recover-1", time.Minute, 1, "0-0")
+	if err != nil || got != nil {
+		t.Fatalf("bury без хука: (%v, %v), хочу (nil, nil) — тихий перевод", got, err)
+	}
+	if len(fake.adds) != 1 || len(fake.acks) != 1 {
+		t.Errorf("перевод без хука не завершён: %+v %+v", fake.adds, fake.acks)
+	}
+}
+
 // TestProcessing — XACK только после успешной обработки и записи в БД.
 func TestProcessing(t *testing.T) {
 	ctx := context.Background()
