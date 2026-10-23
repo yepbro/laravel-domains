@@ -215,7 +215,7 @@ T-162.
   MemoryCurrent unbound < MemoryMax с запасом ≥ 50 MiB,
   recursion.time.median не растёт (unbound-control stats). ТЗ: §3.2,
   §5.4.
-- **T-161** [в работе] — P1-6, агрегаты мониторинга по 47 млн строк
+- **T-161** [сделана] — P1-6, агрегаты мониторинга по 47 млн строк
   (замер §12: `GROUP BY check_state` — scheduler.BacklogLoop каждые
   30 с, проход 17+ с с parallel workers; `UPDATE zones` — monitor.
   ZoneStatsLoop; `SELECT z.id…count` — internal/status для
