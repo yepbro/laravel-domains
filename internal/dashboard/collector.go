@@ -8,6 +8,9 @@
 //
 //   - PostgreSQL — секции internal/status (зоны/темп — те же SQL, что у
 //     crawlerctl status, T-126; статусы/Laravel/ingest — §5.5–5.7);
+//     тяжёлые проходы domains (зоны/темп/статусы) идут через TTL-кэш
+//     status.Cache (T-161): в окне dashboard.status_cache_ttl проходы
+//     refresh не платят полный агрегат, лёгкие секции остаются живыми;
 //   - Redis — глубина пяти стримов через тот же узкий API Len
 //     (BackpressureGate, ТЗД §4.3.2): клиент собирает cmd/dashboard по
 //     конфигу redis — как cmd/monitor; порог гейта не участвует (только
@@ -55,6 +58,12 @@ import (
 // дефолт dashboard.refresh, ТЗД §8.1).
 const DefaultRefreshInterval = 5 * time.Second
 
+// DefaultStatusCacheTTL — TTL кэша тяжёлых агрегатов при нулевом
+// StatusCacheTTL (зеркалит дефолт dashboard.status_cache_ttl, T-161):
+// нижняя граница коридора постановки 1–5 мин — при дефолтном refresh 5 с
+// один полный проход domains в минуту вместо двенадцати.
+const DefaultStatusCacheTTL = time.Minute
+
 // probeTimeout — бюджет одной пробы /livez (ТЗД §5.8: 2 с).
 const probeTimeout = 2 * time.Second
 
@@ -84,6 +93,13 @@ type CollectorOptions struct {
 	// Interval — период цикла (DefaultRefreshInterval); рабочее значение —
 	// dashboard.refresh из конфига.
 	Interval time.Duration
+	// StatusCacheTTL — TTL кэша тяжёлых агрегатов status
+	// (DefaultStatusCacheTTL); рабочее значение —
+	// dashboard.status_cache_ttl из конфига. 0 внутри TTL — секции
+	// зон/темпа/статусов собираются кэшем без обращения к БД (T-161,
+	// замер §12: полные проходы domains каждые refresh — большая статья
+	// CPU postgres), по истечении — одна выборка на секцию.
+	StatusCacheTTL time.Duration
 	// Probes — имя → базовый URL метрик сервиса (dashboard.probes): проба
 	// идёт на base + "/livez" (каркас internal/service, ТЗД §4.3.3).
 	// nil/пусто — секция здоровья «н/д» (Health = nil, не ошибка).
@@ -116,6 +132,9 @@ func (o CollectorOptions) withDefaults() CollectorOptions {
 	if o.Interval <= 0 {
 		o.Interval = DefaultRefreshInterval
 	}
+	if o.StatusCacheTTL <= 0 {
+		o.StatusCacheTTL = DefaultStatusCacheTTL
+	}
 	if o.Log == nil {
 		o.Log = slog.New(slog.DiscardHandler)
 	}
@@ -134,6 +153,7 @@ type Collector struct {
 	opt     CollectorOptions
 	client  *http.Client
 	metrics *collectorMetrics
+	cache   *status.Cache
 
 	snap  atomic.Pointer[Snapshot]
 	ready atomic.Bool
@@ -148,6 +168,9 @@ func NewCollector(pool db.DB, lens status.StreamLener, cfg config.Dashboard, opt
 	}
 	if cfg.Refresh.D() > 0 && opts.Interval == 0 {
 		opts.Interval = cfg.Refresh.D()
+	}
+	if cfg.StatusCacheTTL.D() > 0 && opts.StatusCacheTTL == 0 {
+		opts.StatusCacheTTL = cfg.StatusCacheTTL.D()
 	}
 	if opts.Probes == nil {
 		opts.Probes = cfg.Probes
@@ -170,6 +193,9 @@ func NewCollector(pool db.DB, lens status.StreamLener, cfg config.Dashboard, opt
 		opt:     o,
 		client:  client,
 		metrics: newCollectorMetrics(o.Metrics),
+		// Кэш тяжёлых агрегатов (T-161): экземпляр на процесс сборщика —
+		// один и тот же для всех проходов Loop.
+		cache: status.NewCache(status.CacheOptions{TTL: o.StatusCacheTTL}),
 	}, nil
 }
 
@@ -195,9 +221,13 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 
 	// Зоны (§5.1/§5.3) → зоны + итоги; вход скоростей (pending+queued).
 	// SummaryJSON встроена в Snapshot — поля присваиваются напрямую.
+	// Тяжёлые секции (T-161) идут через TTL-кэш status.Cache: в окне
+	// TTL проходы refresh переиспользуют последний ответ БД — ошибка
+	// кэша и есть ошибка выборки (не кэшируется, деградация секции
+	// остаётся видимой), отменённый ctx — как без кэша.
 	var tot status.Totals
 	zonesOK := false
-	zones, err := status.FetchZoneStats(ctx, c.pool)
+	zones, err := c.cache.ZoneStats(ctx, c.pool)
 	if err != nil {
 		snap.Errors["zones"] = err.Error()
 	} else {
@@ -211,7 +241,7 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 	// Темп (§5.2).
 	var thr status.Throughput
 	thrOK := false
-	thr, err = status.FetchThroughput(ctx, c.pool)
+	thr, err = c.cache.Throughput(ctx, c.pool)
 	if err != nil {
 		snap.Errors["throughput"] = err.Error()
 	} else {
@@ -239,8 +269,8 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 		snap.Queues = lens
 	}
 
-	// Статусы доменов (§5.5).
-	if snap.Statuses, err = status.FetchDomainStatuses(ctx, c.pool); err != nil {
+	// Статусы доменов (§5.5) — тоже проход domains, кэш (T-161).
+	if snap.Statuses, err = c.cache.DomainStatuses(ctx, c.pool); err != nil {
 		snap.Statuses = nil
 		snap.Errors["statuses"] = err.Error()
 	}

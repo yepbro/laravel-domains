@@ -68,6 +68,7 @@ func TestDefault(t *testing.T) {
 		{"scheduler.lease", c.Scheduler.Lease.D(), 30 * time.Minute},
 		{"scheduler.temp_error_retry_after", c.Scheduler.TempErrorRetryAfter.D(), 24 * time.Hour},
 		{"scheduler.temp_error_max_retries", c.Scheduler.TempErrorMaxRetries, 3},
+		{"scheduler.backlog_interval", c.Scheduler.BacklogInterval.D(), 5 * time.Minute},
 		{"dns.resolvers", strings.Join(c.DNS.Resolvers, ","), "127.0.0.1:53"},
 		{"dns.fallback_resolvers", strings.Join(c.DNS.FallbackResolvers, ","), "1.1.1.1:53,9.9.9.9:53"},
 		{"dns.concurrency", c.DNS.Concurrency, 2000},
@@ -108,13 +109,14 @@ func TestDefault(t *testing.T) {
 		{"analyzer.rules_dir", c.Analyzer.RulesDir, "/etc/crawler/rules"},
 		{"analyzer.laravel_min_score", c.Analyzer.LaravelMinScore, 0.6},
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
-		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 60 * time.Second},
+		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 5 * time.Minute},
 		{"monitor.ingest_metrics_url", c.Monitor.IngestMetricsURL, "http://127.0.0.1:9101/metrics"},
 		{"web.listen", c.Web.Listen, "127.0.0.1:8080"},
 		{"web.rate_limit", c.Web.RateLimit, 4},
 		{"web.timeout", c.Web.Timeout.D(), 60 * time.Second},
 		{"dashboard.listen", c.Dashboard.Listen, "127.0.0.1:8090"},
 		{"dashboard.refresh", c.Dashboard.Refresh.D(), 5 * time.Second},
+		{"dashboard.status_cache_ttl", c.Dashboard.StatusCacheTTL.D(), time.Minute},
 		{"dashboard.username", c.Dashboard.Username, ""},
 		{"dashboard.password_hash", c.Dashboard.PasswordHash, ""},
 		{"log.level", c.Log.Level, "info"},
@@ -170,6 +172,7 @@ scheduler:
   lease: "45m"
   temp_error_retry_after: "12h"
   temp_error_max_retries: 5
+  backlog_interval: "90s"
   zone_weights:
     com: 5
     co.uk: 3
@@ -228,6 +231,7 @@ monitor:
 dashboard:
   listen: "127.0.0.1:8190"
   refresh: "15s"
+  status_cache_ttl: "2m"
   username: "operator"
   password_hash: "pbkdf2-sha256$600000$q6urq6urq6urq6urq6urqw==$q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="
   probes:
@@ -266,6 +270,7 @@ log:
 		{"scheduler.lease", cfg.Scheduler.Lease.D(), 45 * time.Minute},
 		{"scheduler.temp_error_retry_after", cfg.Scheduler.TempErrorRetryAfter.D(), 12 * time.Hour},
 		{"scheduler.temp_error_max_retries", cfg.Scheduler.TempErrorMaxRetries, 5},
+		{"scheduler.backlog_interval", cfg.Scheduler.BacklogInterval.D(), 90 * time.Second},
 		{"dns.resolvers", strings.Join(cfg.DNS.Resolvers, ";"), "10.0.0.2:53;10.0.0.3:53"},
 		{"dns.fallback_resolvers", strings.Join(cfg.DNS.FallbackResolvers, ";"), "8.8.8.8:53"},
 		{"dns.concurrency", cfg.DNS.Concurrency, 500},
@@ -309,6 +314,7 @@ log:
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 30 * time.Second},
 		{"dashboard.listen", cfg.Dashboard.Listen, "127.0.0.1:8190"},
 		{"dashboard.refresh", cfg.Dashboard.Refresh.D(), 15 * time.Second},
+		{"dashboard.status_cache_ttl", cfg.Dashboard.StatusCacheTTL.D(), 2 * time.Minute},
 		{"dashboard.username", cfg.Dashboard.Username, "operator"},
 		{"dashboard.password_hash", cfg.Dashboard.PasswordHash,
 			"pbkdf2-sha256$600000$q6urq6urq6urq6urq6urqw==$q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="},
@@ -435,6 +441,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_INGEST_ARCHIVE_MAX_UNCOMPRESSED":     "4GiB",
 		"CRAWLER_INGEST_ARCHIVE_MAX_FILES":            "77",
 		"CRAWLER_SCHEDULER_RECHECK_INTERVAL":          "2190h",
+		"CRAWLER_SCHEDULER_BACKLOG_INTERVAL":          "75s",
 		"CRAWLER_SCHEDULER_BATCH_SIZE":                "7777",
 		"CRAWLER_SCHEDULER_QUEUE_HIGH_WATERMARK":      "4242",
 		"CRAWLER_SCHEDULER_LEASE":                     "15m",
@@ -489,6 +496,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_WEB_TIMEOUT":                         "90s",
 		"CRAWLER_DASHBOARD_LISTEN":                    "127.0.0.1:8191",
 		"CRAWLER_DASHBOARD_REFRESH_INTERVAL":          "30s",
+		"CRAWLER_DASHBOARD_STATUS_CACHE_TTL":          "3m",
 		"CRAWLER_DASHBOARD_USERNAME":                  "envop",
 		"CRAWLER_DASHBOARD_PASSWORD_HASH":             "pbkdf2-sha256$1000$c2FsdA==$a2V5",
 		"CRAWLER_DASHBOARD_PROBES":                    "Mon=http://mon:9100, api=http://api:9104",
@@ -523,6 +531,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"scheduler.lease", cfg.Scheduler.Lease.D(), 15 * time.Minute},
 		{"scheduler.temp_error_retry_after", cfg.Scheduler.TempErrorRetryAfter.D(), 6 * time.Hour},
 		{"scheduler.temp_error_max_retries", cfg.Scheduler.TempErrorMaxRetries, 9},
+		{"scheduler.backlog_interval", cfg.Scheduler.BacklogInterval.D(), 75 * time.Second},
 		{"dns.resolvers", strings.Join(cfg.DNS.Resolvers, ";"), "10.0.0.2:53;10.0.0.3:53"},
 		{"dns.fallback_resolvers", strings.Join(cfg.DNS.FallbackResolvers, ";"), "8.8.8.8:53"},
 		{"dns.concurrency", cfg.DNS.Concurrency, 321},
@@ -570,6 +579,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"web.timeout", cfg.Web.Timeout.D(), 90 * time.Second},
 		{"dashboard.listen", cfg.Dashboard.Listen, "127.0.0.1:8191"},
 		{"dashboard.refresh", cfg.Dashboard.Refresh.D(), 30 * time.Second},
+		{"dashboard.status_cache_ttl", cfg.Dashboard.StatusCacheTTL.D(), 3 * time.Minute},
 		{"dashboard.username", cfg.Dashboard.Username, "envop"},
 		{"dashboard.password_hash", cfg.Dashboard.PasswordHash, "pbkdf2-sha256$1000$c2FsdA==$a2V5"},
 		{"log.level", cfg.Log.Level, "debug"},
@@ -815,6 +825,9 @@ func TestValidate(t *testing.T) {
 		{"archive_max_files 0", func(c *Config) { c.Ingest.ArchiveMaxFiles = 0 }, "ingest.archive_max_files"},
 		{"archive_max_files велик", func(c *Config) { c.Ingest.ArchiveMaxFiles = 1000001 }, "ingest.archive_max_files"},
 		{"recheck_interval 0", func(c *Config) { c.Scheduler.RecheckInterval = 0 }, "scheduler.recheck_interval"},
+		{"backlog_interval 0", func(c *Config) { c.Scheduler.BacklogInterval = 0 }, "scheduler.backlog_interval"},
+		{"backlog_interval меньше 30с", func(c *Config) { c.Scheduler.BacklogInterval = Duration(10 * time.Second) }, "scheduler.backlog_interval"},
+		{"backlog_interval больше часа", func(c *Config) { c.Scheduler.BacklogInterval = Duration(90 * time.Minute) }, "scheduler.backlog_interval"},
 		{"batch scheduler 0", func(c *Config) { c.Scheduler.BatchSize = 0 }, "scheduler.batch_size"},
 		{"batch scheduler меньше 1000", func(c *Config) { c.Scheduler.BatchSize = 999 }, "scheduler.batch_size"},
 		{"batch scheduler больше 10000", func(c *Config) { c.Scheduler.BatchSize = 10001 }, "scheduler.batch_size"},
@@ -896,6 +909,8 @@ func TestValidate(t *testing.T) {
 		{"subdomain повтор", func(c *Config) { c.Subdomains = []string{"", "www", "www"} }, "subdomains"},
 		{"listen кривой", func(c *Config) { c.Monitor.Listen = "abc" }, "monitor.listen"},
 		{"zone_stats_interval 0", func(c *Config) { c.Monitor.ZoneStatsInterval = 0 }, "monitor.zone_stats_interval"},
+		{"zone_stats_interval меньше 30с", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(10 * time.Second) }, "monitor.zone_stats_interval"},
+		{"zone_stats_interval больше часа", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(2 * time.Hour) }, "monitor.zone_stats_interval"},
 		{"ingest_metrics_url не адрес", func(c *Config) { c.Monitor.IngestMetricsURL = "ingest:9101" }, "monitor.ingest_metrics_url"},
 		{"ingest_metrics_url не http(s)", func(c *Config) { c.Monitor.IngestMetricsURL = "ftp://ingest:9101/metrics" }, "monitor.ingest_metrics_url"},
 		{"web.listen кривой", func(c *Config) { c.Web.Listen = "no-port" }, "web.listen"},
@@ -909,6 +924,8 @@ func TestValidate(t *testing.T) {
 		{"dashboard.refresh 0", func(c *Config) { c.Dashboard.Refresh = 0 }, "dashboard.refresh"},
 		{"dashboard.refresh менее секунды", func(c *Config) { c.Dashboard.Refresh = Duration(500 * time.Millisecond) }, "dashboard.refresh"},
 		{"dashboard.refresh более 5 минут", func(c *Config) { c.Dashboard.Refresh = Duration(6 * time.Minute) }, "dashboard.refresh"},
+		{"status_cache_ttl меньше минуты", func(c *Config) { c.Dashboard.StatusCacheTTL = Duration(30 * time.Second) }, "dashboard.status_cache_ttl"},
+		{"status_cache_ttl больше 5 минут", func(c *Config) { c.Dashboard.StatusCacheTTL = Duration(6 * time.Minute) }, "dashboard.status_cache_ttl"},
 		{"проба не абсолютный URL", func(c *Config) { c.Dashboard.Probes = map[string]string{"mon": "mon:9100"} }, "dashboard.probes"},
 		{"проба не http(s)", func(c *Config) { c.Dashboard.Probes = map[string]string{"mon": "ftp://mon:9100"} }, "dashboard.probes"},
 		{"имя пробы пустое", func(c *Config) { c.Dashboard.Probes = map[string]string{"": "http://mon:9100"} }, "dashboard.probes"},
@@ -950,8 +967,11 @@ func TestValidate(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Errorf("граничные значения должны быть валидны: %v", err)
 	}
-	c.Scheduler.BatchSize = 1000                // нижняя граница пачек планировщика (ТЗ 5.3)
-	c.Dashboard.Refresh = Duration(time.Second) // нижняя граница периода снимков (ТЗД §8.3)
+	c.Scheduler.BatchSize = 1000                             // нижняя граница пачек планировщика (ТЗ 5.3)
+	c.Dashboard.Refresh = Duration(time.Second)              // нижняя граница периода снимков (ТЗД §8.3)
+	c.Scheduler.BacklogInterval = Duration(30 * time.Second) // нижняя граница периода backlog (T-161)
+	c.Monitor.ZoneStatsInterval = Duration(30 * time.Second) // нижняя граница коридора ТЗ 5.9
+	c.Dashboard.StatusCacheTTL = Duration(5 * time.Minute)   // верхняя граница коридора T-161
 	if err := c.Validate(); err != nil {
 		t.Errorf("нижние границы должны быть валидны: %v", err)
 	}

@@ -131,7 +131,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		})
 	}()
 	go func() {
-		bg <- scheduler.BacklogLoop(ctx, pool, reg, scheduler.BacklogOptions{Log: logger})
+		// Период — scheduler.backlog_interval (T-161: дефолт 5 мин,
+		// замер §12; 30 с коридора ТЗ 5.9 доступны конфигом).
+		bg <- scheduler.BacklogLoop(ctx, pool, reg, scheduler.BacklogOptions{
+			Interval: cfg.Scheduler.BacklogInterval.D(),
+			Log:      logger,
+		})
 	}()
 	// Освобождение подтверждённого префикса стримов (T-141, ТЗ 4.2
 	// «Дополнение 2026-10-23»): XTRIM MINID по старейшей записи, обязанной

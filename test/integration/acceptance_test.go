@@ -1530,7 +1530,7 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 	loopCtx, stop := context.WithCancel(ctx)
 	loopDone := make(chan error, 1)
 	go func() {
-		loopDone <- monitor.ZoneStatsLoop(loopCtx, pool, monitor.ZoneStatsOptions{Interval: 100 * time.Millisecond})
+		loopDone <- monitor.ZoneStatsLoop(loopCtx, pool, nil, monitor.ZoneStatsOptions{Interval: 100 * time.Millisecond})
 	}()
 	if _, err := pool.Exec(ctx, fmt.Sprintf(
 		`UPDATE domains SET check_state = %d WHERE zone_id = $1 AND label = 'p1'`,

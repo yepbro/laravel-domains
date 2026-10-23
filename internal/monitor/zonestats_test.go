@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 )
 
@@ -35,11 +36,13 @@ type zonestatsCall struct {
 // zonestatsFakePool — db.DB без БД: очередь результатов Exec (число
 // обновлённых зон) и ошибок, протокол вызовов. Всё под замком: цикл
 // ZoneStatsLoop работает в горутине, тест ожидает прогресс по
-// счётчикам.
+// счётчикам. delay — пауза каждого Exec (медленный проход для
+// single-flight теста T-161).
 type zonestatsFakePool struct {
 	mu       sync.Mutex
 	tags     []int64 // очередь RowsAffected (кончилась — 0: пустой набор)
 	execErrs []error // очередь ошибок Exec (nil — вызов без ошибки)
+	delay    time.Duration
 
 	execs []zonestatsCall
 }
@@ -53,6 +56,11 @@ func (p *zonestatsFakePool) Query(context.Context, string, ...any) (pgx.Rows, er
 }
 
 func (p *zonestatsFakePool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	// Пауза вне замка: имитация долгого агрегата не должна держать
+	// замок, пока тест читает протокол.
+	if d := p.delaySnapshot(); d > 0 {
+		time.Sleep(d)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.execs = append(p.execs, zonestatsCall{sql: sql, args: args})
@@ -76,6 +84,20 @@ func (p *zonestatsFakePool) stats() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.execs)
+}
+
+// delaySnapshot — текущая пауза Exec под замком.
+func (p *zonestatsFakePool) delaySnapshot() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.delay
+}
+
+// setDelay меняет паузу Exec (сценарий медленного прохода).
+func (p *zonestatsFakePool) setDelay(d time.Duration) {
+	p.mu.Lock()
+	p.delay = d
+	p.mu.Unlock()
 }
 
 // calls — снимок протокола вызовов под замком.
@@ -231,12 +253,12 @@ func TestZoneStatsOnceNilPool(t *testing.T) {
 
 // TestZoneStatsOptionsDefaults — нулевые и отрицательные значения —
 // дефолт; заданные не затираются, Now передаётся как есть. Дефолт
-// pinned литералом 60s: константа в проверке мутировала бы вместе с
+// pinned литералом 5m: константа в проверке мутировала бы вместе с
 // мутантом и «следовала» за ним (T-M01, alerts); граница «≤ 0» —
 // положительный наносекундный интервал дефолтом не заменяется.
 func TestZoneStatsOptionsDefaults(t *testing.T) {
-	if DefaultZoneStatsInterval != 60*time.Second {
-		t.Errorf("DefaultZoneStatsInterval = %v, want 60s (верх коридора ТЗ 5.9)", DefaultZoneStatsInterval)
+	if DefaultZoneStatsInterval != 5*time.Minute {
+		t.Errorf("DefaultZoneStatsInterval = %v, want 5m (T-161, замер §12)", DefaultZoneStatsInterval)
 	}
 	got := (ZoneStatsOptions{}).withDefaults()
 	if got.Interval != DefaultZoneStatsInterval {
@@ -272,7 +294,7 @@ func TestZoneStatsLoopImmediatePass(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- ZoneStatsLoop(ctx, pool, ZoneStatsOptions{
+		done <- ZoneStatsLoop(ctx, pool, nil, ZoneStatsOptions{
 			Interval: time.Hour, // тик не наступит: только стартовый проход
 		})
 	}()
@@ -315,7 +337,7 @@ func TestZoneStatsLoopTicker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- ZoneStatsLoop(ctx, pool, ZoneStatsOptions{
+		done <- ZoneStatsLoop(ctx, pool, nil, ZoneStatsOptions{
 			Interval: 2 * time.Millisecond,
 			Log:      logger,
 		})
@@ -360,7 +382,7 @@ func TestZoneStatsLoopCancelDuringPass(t *testing.T) {
 	cancel() // отменён до старта: первый же оператор прохода провалится
 
 	done := make(chan error, 1)
-	go func() { done <- ZoneStatsLoop(ctx, pool, ZoneStatsOptions{Log: logger}) }()
+	go func() { done <- ZoneStatsLoop(ctx, pool, nil, ZoneStatsOptions{Log: logger}) }()
 
 	if err := <-done; err != nil {
 		t.Fatalf("ZoneStatsLoop: %v, want nil при отмене ctx", err)
@@ -371,7 +393,7 @@ func TestZoneStatsLoopCancelDuringPass(t *testing.T) {
 }
 
 func TestZoneStatsLoopNilPool(t *testing.T) {
-	err := ZoneStatsLoop(context.Background(), nil, ZoneStatsOptions{})
+	err := ZoneStatsLoop(context.Background(), nil, nil, ZoneStatsOptions{})
 	if err == nil || !strings.Contains(err.Error(), "пул не задан") {
 		t.Errorf("ошибка = %v, want «пул не задан»", err)
 	}
@@ -391,7 +413,7 @@ func TestZoneStatsLoopPassDuringCancel(t *testing.T) {
 	cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- ZoneStatsLoop(ctx, pool, ZoneStatsOptions{Log: logger}) }()
+	go func() { done <- ZoneStatsLoop(ctx, pool, nil, ZoneStatsOptions{Log: logger}) }()
 
 	select {
 	case err := <-done:
@@ -407,5 +429,169 @@ func TestZoneStatsLoopPassDuringCancel(t *testing.T) {
 	}
 	if strings.Contains(log, "level=WARN") {
 		t.Errorf("успешный проход под отменой дал Warn:\n%s", log)
+	}
+}
+
+// --- single-flight (T-161) --------------------------------------------------
+
+// zonestatsSyncBuf — bytes.Buffer под замком: цикл пишет лог в своей
+// горутине, тест читает его до завершения цикла (ожидание Warn вживую).
+type zonestatsSyncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *zonestatsSyncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *zonestatsSyncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *zonestatsSyncBuf) contains(s string) bool {
+	return strings.Contains(b.String(), s)
+}
+
+// zonestatsSkippedValue — текущее значение счётчика
+// crawler_zonestats_skipped_ticks_total из реестра.
+func zonestatsSkippedValue(t *testing.T, reg *metrics.Registry) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != "crawler_zonestats_skipped_ticks_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			return m.GetCounter().GetValue()
+		}
+	}
+	return 0
+}
+
+// zonestatsHistogramSamples — число наблюдений crawler_zonestats_pass_seconds
+// (каждый проход обязан попасть в гистограмму).
+func zonestatsHistogramSamples(t *testing.T, reg *metrics.Registry) uint64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != "crawler_zonestats_pass_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			return m.GetHistogram().GetSampleCount()
+		}
+	}
+	return 0
+}
+
+// TestZoneStatsLoopSingleFlight — проход дольше интервала (рост таблицы,
+// замер §12): накопившийся тик не запускает новый проход сразу за
+// медленным — Warn «дольше интервала», счётчик пропусков, гистограмма
+// длительности; следующий проход — по следующему тику, цикл живёт.
+//
+// Раскладка без реальных секунд ожидания: интервал 50 мс, медленный
+// стартовый проход 120 мс (тик 50 мс буферизуется, тик 100 мс тонет —
+// канал тикера ёмкостью 1, тик 150 мс ещё не наступил к моменту дренажа
+// в 120 мс): дренаж снимает тик без гонки на границе, проход 2 — не
+// раньше 150 мс.
+func TestZoneStatsLoopSingleFlight(t *testing.T) {
+	slogBuf := &zonestatsSyncBuf{}
+	logger := slog.New(slog.NewTextHandler(slogBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	reg := metrics.New("monitor")
+	pool := &zonestatsFakePool{tags: []int64{3, 3, 3, 3, 3, 3}}
+	pool.setDelay(120 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ZoneStatsLoop(ctx, pool, reg, ZoneStatsOptions{
+			Interval: 50 * time.Millisecond,
+			Log:      logger,
+		})
+	}()
+
+	// Warn приходит в конце медленного прохода (после дренажа тика).
+	deadline := time.Now().Add(2 * time.Second)
+	for !slogBuf.contains("дольше интервала") {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("медленный проход не зафиксирован:\n%s", slogBuf)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := zonestatsSkippedValue(t, reg); got != 1 {
+		t.Errorf("skipped_ticks = %v, want 1", got)
+	}
+	// Момент наблюдения Warn — до тика 150 мс: второй проход ещё не
+	// мог начаться (единственный buffered-тик снят дренажом).
+	if n := pool.stats(); n != 1 {
+		t.Errorf("операторов = %d после дренажа, want 1 (тип пропущен)", n)
+	}
+
+	// Проход 2 быстрый: обычный режим восстанавливается, цикл живёт.
+	pool.setDelay(0)
+	deadline = time.Now().Add(2 * time.Second)
+	for pool.stats() < 2 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("проход после пропуска не начался: %d", pool.stats())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := zonestatsSkippedValue(t, reg); got != 1 {
+		t.Errorf("skipped_ticks = %v после быстрого прохода, want 1", got)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ZoneStatsLoop: %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ZoneStatsLoop не завершился после отмены ctx")
+	}
+	if got := zonestatsHistogramSamples(t, reg); got < 2 {
+		t.Errorf("наблюдений гистограммы = %d, want ≥ 2 (по одному на проход)", got)
+	}
+}
+
+// TestZoneStatsLoopNilRegistry — цикл без реестра жив: смысл цикла —
+// UPDATE счётчиков, метрики — наблюдаемость (T-161).
+func TestZoneStatsLoopNilRegistry(t *testing.T) {
+	pool := &zonestatsFakePool{tags: []int64{7}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- ZoneStatsLoop(ctx, pool, nil, ZoneStatsOptions{
+			Interval: time.Hour, // тик не наступит: только стартовый проход
+		})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for pool.stats() < 1 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("стартовый проход не выполнен без реестра")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("ZoneStatsLoop: %v, want nil без реестра", err)
 	}
 }

@@ -32,7 +32,8 @@
 // каждую строку domains. GROUP BY по ключу партиционирования позволяет
 // PostgreSQL агрегировать по партициям (partitionwise aggregate);
 // последовательный проход по domains — заявленная ТЗ цена кэширующих
-// счётчиков раз в 30–60 с. LEFT JOIN от zones: зона без живых доменов
+// счётчиков раз в monitor.zone_stats_interval (по умолчанию 5 мин,
+// T-161). LEFT JOIN от zones: зона без живых доменов
 // (например, последняя удалена) отсутствует в агрегате и получает нули —
 // INNER JOIN оставил бы её счётчики застывшими. Снимок одного оператора
 // даёт согласованные total/checked на один момент.
@@ -49,16 +50,25 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"crawler/internal/db"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 )
 
-// DefaultZoneStatsInterval — период цикла пересчёта: 60 с, верхняя граница
-// коридора ТЗ 5.9 «раз в 30–60 секунд» (меньше нагрузка на БД при тех же
-// гарантиях свежести). Зеркалит дефолт monitor.zone_stats_interval
-// (internal/config, T-006); рабочее значение цикл получает из конфига —
-// стиль DefaultRecheckInterval (internal/scheduler).
-const DefaultZoneStatsInterval = 60 * time.Second
+// DefaultZoneStatsInterval — период цикла пересчёта: 5 минут. Исходные
+// 60 с (верх коридора ТЗ 5.9 «раз в 30–60 секунд») рассчитаны на малый
+// корпус: замер §12 docs/load-measurements.md (47 млн строк) —
+// UPDATE-агрегат в тройке главных статей CPU postgres (вместе с
+// BacklogLoop и агрегатами status), счётчики зон читают crawlerctl
+// status, лендинг и партиционирование — пятиминутная свежесть
+// достаточна (постановка T-161). Коридор ТЗ остаётся доступным конфигом
+// monitor.zone_stats_interval; тот же период у цикла алертов
+// (DefaultAlertsInterval) — порог остановки прогресса
+// AlertStallFactor × интервал растёт пропорционально (25 мин на
+// дефолте).
+const DefaultZoneStatsInterval = 5 * time.Minute
 
 // zoneStatsSQL — один проход: обе колонки зон пересчитываются агрегатом
 // по domains, Laravel-счётчик — агрегатом по laravel_domains (T-120).
@@ -150,15 +160,24 @@ func ZoneStatsOnce(ctx context.Context, pool db.DB, opts ZoneStatsOptions) (Zone
 	return ZoneStatsResult{Zones: tag.RowsAffected()}, nil
 }
 
-// ZoneStatsLoop — периодический цикл пересчёта (ТЗ 5.9: раз в 30–60 с):
-// ZoneStatsOnce по ticker, первый проход — сразу при старте (свежие
-// счётчики после простоя/рестарта, стиль scheduler.RecheckDaily, T-030),
-// а не ждёт тика. Ошибка прохода прерывает только его: логируется Warn,
-// цикл живёт (контракт OnRun, T-012) — очередной проход повторит по
+// ZoneStatsLoop — периодический цикл пересчёта (ТЗ 5.9): ZoneStatsOnce
+// по ticker, первый проход — сразу при старте (свежие счётчики после
+// простоя/рестарта, стиль scheduler.RecheckDaily, T-030), а не ждёт
+// тика. Ошибка прохода прерывает только его: логируется Warn, цикл
+// живёт (контракт OnRun, T-012) — очередной проход повторит по
 // актуальному состоянию. Отмена ctx — чистый выход с nil (graceful
 // shutdown, ТЗ 3.4). Итог прохода — Debug, а не Info: проход успешен
-// всегда, когда жива БД, Info каждые 30–60 с был бы шумом.
-func ZoneStatsLoop(ctx context.Context, pool db.DB, opts ZoneStatsOptions) error {
+// всегда, когда жива БД, Info каждые несколько минут был бы шумом.
+//
+// Single-flight (T-161): проходы выполняются в горутине самого цикла —
+// новый проход структурно не может начаться, пока не завершился
+// предыдущий; проход дольше интервала (рост таблицы, замер §12)
+// сбрасывает накопившийся тик ticker'а (иначе новый проход стартовал бы
+// сразу за медленным — непрерывный UPDATE-агрегат), Warn и счётчик
+// crawler_zonestats_skipped_ticks_total поднимают шум. reg — реестр
+// метрик сервиса (метрики прохода; nil — цикл без метрик, пересчёт
+// живёт: смысл цикла — UPDATE, а не приборы).
+func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts ZoneStatsOptions) error {
 	if pool == nil {
 		return errors.New("monitor: пересчёт счётчиков зон: пул не задан")
 	}
@@ -167,10 +186,16 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, opts ZoneStatsOptions) error
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	m := newZoneStatsLoopMetrics(reg)
 	log.Info("цикл пересчёта счётчиков зон",
 		"interval", o.Interval.String())
 
+	// Тикер до стартового прохода: тики отсчитываются от старта цикла,
+	// дренаж накопившегося тика в pass видит один и тот же тикер.
+	ticker := time.NewTicker(o.Interval)
+	defer ticker.Stop()
 	pass := func() {
+		started := time.Now()
 		res, err := ZoneStatsOnce(ctx, pool, o)
 		switch {
 		// Тело ветки пустое (только комментарий): branch/case подменяет
@@ -185,11 +210,24 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, opts ZoneStatsOptions) error
 		default:
 			log.Debug("проход пересчёта счётчиков зон", "zones", res.Zones)
 		}
+		took := time.Since(started)
+		m.observe(took.Seconds())
+		if took > o.Interval {
+			// Single-flight: сбросить тик, накопившийся за медленный
+			// проход, — иначе новый проход стартовал бы сразу за этим
+			// (select/default — тика может и не быть: Warn честен
+			// по длительности, дренаж в этом случае no-op).
+			select {
+			case <-ticker.C:
+			default:
+			}
+			log.Warn("проход пересчёта счётчиков зон дольше интервала — накопившийся тик пропущен",
+				"took", took.String(), "interval", o.Interval.String())
+			m.skip()
+		}
 	}
 
 	pass()
-	ticker := time.NewTicker(o.Interval)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -198,4 +236,49 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, opts ZoneStatsOptions) error
 			pass()
 		}
 	}
+}
+
+// zoneStatsLoopMetrics — приборы цикла пересчёта (T-161): длительность
+// прохода и счётчик пропущенных тиков; nil-приёмник — no-op (цикл без
+// реестра, стиль scheduler.backlogLoopMetrics).
+type zoneStatsLoopMetrics struct {
+	seconds prometheus.ObserverVec
+	skipped *prometheus.CounterVec
+}
+
+// newZoneStatsLoopMetrics — приборы в реестре reg (nil — nil). Корзины —
+// экспонента 0.5 с…~8.5 мин: проход — UPDATE-агрегат по всем доменам
+// (замер §12 — десятки секунд на 47 млн строк), дефолтные корзины
+// Prometheus (потолок 10 с) малы.
+func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
+	if reg == nil {
+		return nil
+	}
+	return &zoneStatsLoopMetrics{
+		seconds: reg.MustHistogram(prometheus.HistogramOpts{
+			Name:    "crawler_zonestats_pass_seconds",
+			Help:    "Длительность прохода пересчёта счётчиков зон (UPDATE-агрегат domains GROUP BY zone_id, T-078).",
+			Buckets: prometheus.ExponentialBuckets(0.5, 2, 11),
+		}),
+		skipped: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_zonestats_skipped_ticks_total",
+			Help: "Пропущенные тики цикла пересчёта зон: проход длился дольше интервала, накопившийся тик не запускает новый проход (single-flight, T-161).",
+		}),
+	}
+}
+
+// observe — фиксация длительности прохода; nil — no-op.
+func (m *zoneStatsLoopMetrics) observe(seconds float64) {
+	if m == nil {
+		return
+	}
+	m.seconds.WithLabelValues().Observe(seconds)
+}
+
+// skip — пропуск тика; nil — no-op.
+func (m *zoneStatsLoopMetrics) skip() {
+	if m == nil {
+		return
+	}
+	m.skipped.WithLabelValues().Inc()
 }

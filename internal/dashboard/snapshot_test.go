@@ -494,6 +494,72 @@ func TestCollectOnceNilLenner(t *testing.T) {
 	}
 }
 
+// countSQLCalls — сколько раз пул видел SQL с подстрокой what.
+func countSQLCalls(calls []string, what string) int {
+	n := 0
+	for _, q := range calls {
+		if strings.Contains(q, what) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestCollectOnceStatusCache — TTL-кэш тяжёлых агрегатов (T-161): в
+// окне TTL проходы refresh не повторяют полные проходы domains
+// (зоны/темп/статусы — одна выборка на окно), лёгкие секции остаются
+// живыми; по истечении TTL — перечёт.
+func TestCollectOnceStatusCache(t *testing.T) {
+	pool := healthyPool()
+	coll := newSnapCollector(t, pool, &fakeLenner{}, func(o *CollectorOptions) {
+		o.StatusCacheTTL = 50 * time.Millisecond // окно хватает на несколько проходов
+	})
+	ctx := context.Background()
+
+	snap1 := coll.CollectOnce(ctx)
+	if snap1.Totals == nil || len(snap1.Errors) != 0 {
+		t.Fatalf("первый проход: totals=%v errors=%v", snap1.Totals, snap1.Errors)
+	}
+	snap2 := coll.CollectOnce(ctx)
+	if snap2.Totals == nil || len(snap2.Errors) != 0 {
+		t.Fatalf("второй проход (из кэша): totals=%v errors=%v", snap2.Totals, snap2.Errors)
+	}
+	if snap2.Totals.DomainsTotal != snap1.Totals.DomainsTotal {
+		t.Errorf("итоги из кэша = %v, want %v", snap2.Totals.DomainsTotal, snap1.Totals.DomainsTotal)
+	}
+
+	// Тяжёлые секции — одна выборка на окно TTL, лёгкие — каждый проход.
+	calls := pool.calls()
+	if n := countSQLCalls(calls, "FROM zones AS z LEFT JOIN"); n != 1 {
+		t.Errorf("выборок зон = %d, want 1 (кэш в окне TTL)", n)
+	}
+	if n := countSQLCalls(calls, "AS done_today"); n != 1 {
+		t.Errorf("выборок темпа = %d, want 1 (кэш в окне TTL)", n)
+	}
+	if n := countSQLCalls(calls, "GROUP BY status"); n != 1 {
+		t.Errorf("выборок статусов = %d, want 1 (кэш в окне TTL)", n)
+	}
+	if n := countSQLCalls(calls, "ORDER BY ld.updated_at"); n != 2 {
+		t.Errorf("выборок последних находок = %d, want 2 (лёгкая секция без кэша)", n)
+	}
+	if n := countSQLCalls(calls, "FROM ingest_files"); n != 2 {
+		t.Errorf("выборок журнала ingest = %d, want 2 (лёгкая секция без кэша)", n)
+	}
+
+	// По истечении TTL тяжёлые секции пересчитываются.
+	time.Sleep(80 * time.Millisecond)
+	if snap3 := coll.CollectOnce(ctx); snap3.Totals == nil || len(snap3.Errors) != 0 {
+		t.Fatalf("проход после TTL: totals=%v errors=%v", snap3.Totals, snap3.Errors)
+	}
+	calls = pool.calls()
+	if n := countSQLCalls(calls, "FROM zones AS z LEFT JOIN"); n != 2 {
+		t.Errorf("выборок зон после TTL = %d, want 2 (перечёт)", n)
+	}
+	if n := countSQLCalls(calls, "AS done_today"); n != 2 {
+		t.Errorf("выборок темпа после TTL = %d, want 2 (перечёт)", n)
+	}
+}
+
 // TestNewCollectorNilPool — без пула БД сборщик бессмыслен: ошибка.
 func TestNewCollectorNilPool(t *testing.T) {
 	if _, err := NewCollector(nil, nil, config.Default().Dashboard, CollectorOptions{}); err == nil {
@@ -785,10 +851,15 @@ func TestAPIStatusEncodeError(t *testing.T) {
 
 // TestCollectorLoop — первый сбор сразу (готовность при живом каркасе
 // сводки), период — Interval, снимок атомарно заменяется (новые данные
-// следующего прохода).
+// следующего прохода). TTL кэша статуса — миллисекунда: каждые тик и
+// перечёт тяжёлых секций успевают протухнуть (кэш T-161 не затягивает
+// подмену данных между проходами).
 func TestCollectorLoop(t *testing.T) {
 	pool := healthyPool()
-	coll := newSnapCollector(t, pool, &fakeLenner{}, func(o *CollectorOptions) { o.Interval = 20 * time.Millisecond })
+	coll := newSnapCollector(t, pool, &fakeLenner{}, func(o *CollectorOptions) {
+		o.Interval = 20 * time.Millisecond
+		o.StatusCacheTTL = time.Millisecond
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- coll.Loop(ctx) }()

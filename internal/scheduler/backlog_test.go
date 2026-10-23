@@ -269,13 +269,14 @@ func TestBacklogOnceErrors(t *testing.T) {
 }
 
 func TestBacklogOptionsDefaults(t *testing.T) {
-	// Дефолт пинится литералом ТЗ 5.9 (коридор 30–60 с, нижняя граница):
-	// сравнение с самой константой мутации не замечает.
-	if DefaultBacklogInterval != 30*time.Second {
-		t.Errorf("DefaultBacklogInterval = %v, want 30с", DefaultBacklogInterval)
+	// Дефолт пинится литералом (T-161, замер §12: мутация константы
+	// не должна незамеченной менять дефолт): сравнение с самой
+	// константой мутации не замечает.
+	if DefaultBacklogInterval != 5*time.Minute {
+		t.Errorf("DefaultBacklogInterval = %v, want 5m", DefaultBacklogInterval)
 	}
-	if got := (BacklogOptions{}).withDefaults().Interval; got != 30*time.Second {
-		t.Errorf("Interval = %v, want 30с", got)
+	if got := (BacklogOptions{}).withDefaults().Interval; got != 5*time.Minute {
+		t.Errorf("Interval = %v, want 5m", got)
 	}
 	if got := (BacklogOptions{Interval: time.Second}).withDefaults().Interval; got != time.Second {
 		t.Errorf("кастомный Interval затёрт: %v", got)
@@ -536,5 +537,178 @@ func TestBacklogLoopValidation(t *testing.T) {
 	if err := BacklogLoop(context.Background(), pool, nil, BacklogOptions{}); err == nil ||
 		err.Error() != "scheduler: цикл backlog: реестр метрик не задан" {
 		t.Fatalf("nil-реестр = %v, want ошибка", err)
+	}
+}
+
+// --- single-flight (T-161) --------------------------------------------------
+
+// backlogSkippedValue — текущее значение счётчика
+// crawler_backlog_skipped_ticks_total из реестра.
+func backlogSkippedValue(t *testing.T, reg *metrics.Registry) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != "crawler_backlog_skipped_ticks_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			return m.GetCounter().GetValue()
+		}
+	}
+	return 0
+}
+
+// backlogHistogramSamples — число наблюдений crawler_backlog_pass_seconds
+// (каждый проход обязан попасть в гистограмму).
+func backlogHistogramSamples(t *testing.T, reg *metrics.Registry) uint64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != "crawler_backlog_pass_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			return m.GetHistogram().GetSampleCount()
+		}
+	}
+	return 0
+}
+
+// TestBacklogLoopSingleFlight — проход дольше интервала (замер §12:
+// агрегат по 47 млн строк): накопившийся тик не запускает новый проход
+// сразу за медленным — Warn «дольше интервала», счётчик пропусков,
+// гистограмма длительности; следующий проход — по следующему тику,
+// цикл живёт.
+//
+// Раскладка без реальных секунд ожидания: интервал 50 мс, медленный
+// стартовый проход 120 мс (тик 50 мс буферизуется, тик 100 мс тонет —
+// канал тикера ёмкостью 1, тик 150 мс ещё не наступил к моменту дренажа
+// в 120 мс): дренаж снимает тик без гонки на границе, проход 2 — не
+// раньше 150 мс.
+func TestBacklogLoopSingleFlight(t *testing.T) {
+	slogBuf := &syncBuf{}
+	logger := slog.New(slog.NewTextHandler(slogBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	reg := metrics.New("scheduler")
+	pool := &backlogFakePool{}
+	pool.setHook(func() (pgx.Rows, error) {
+		time.Sleep(120 * time.Millisecond) // медленный агрегат (замер §12)
+		return backlogRows(
+			[]any{int16(model.CheckStatePending), int64(3)},
+			[]any{int16(model.CheckStateQueued), int64(4)},
+		), nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- BacklogLoop(ctx, pool, reg, BacklogOptions{
+			Interval: 50 * time.Millisecond,
+			Log:      logger,
+		})
+	}()
+
+	// Warn приходит в конце медленного прохода (после дренажа тика).
+	deadline := time.Now().Add(2 * time.Second)
+	for !slogBuf.contains("дольше интервала") {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("медленный проход не зафиксирован:\n%s", slogBuf)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := backlogSkippedValue(t, reg); got != 1 {
+		t.Errorf("skipped_ticks = %v, want 1", got)
+	}
+	// Момент наблюдения Warn — до тика 150 мс: второй проход ещё не
+	// мог начаться (единственный buffered-тик снят дренажом).
+	if n := pool.callsCount(); n != 1 {
+		t.Errorf("проходов = %d после дренажа, want 1 (тик пропущен)", n)
+	}
+
+	// Проход 2 быстрый: обычный режим восстанавливается, цикл живёт.
+	pool.setHook(func() (pgx.Rows, error) {
+		return backlogRows(
+			[]any{int16(model.CheckStatePending), int64(5)},
+			[]any{int16(model.CheckStateQueued), int64(6)},
+		), nil
+	})
+	deadline = time.Now().Add(2 * time.Second)
+	for pool.callsCount() < 2 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("проход после пропуска не начался: %d", pool.callsCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := backlogSkippedValue(t, reg); got != 1 {
+		t.Errorf("skipped_ticks = %v после быстрого прохода, want 1", got)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("BacklogLoop: %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BacklogLoop не завершился после отмены ctx")
+	}
+	if got := backlogHistogramSamples(t, reg); got < 2 {
+		t.Errorf("наблюдений гистограммы = %d, want ≥ 2 (по одному на проход)", got)
+	}
+}
+
+// TestBacklogLoopFastPassNoSkip — проход короче интервала не_warn'ит и
+// не двигает счётчик пропусков: single-flight касается только хвоста
+// «проход дольше интервала».
+func TestBacklogLoopFastPassNoSkip(t *testing.T) {
+	reg := metrics.New("scheduler")
+	pool := &backlogFakePool{}
+	pool.setHook(func() (pgx.Rows, error) {
+		return backlogRows(
+			[]any{int16(model.CheckStatePending), int64(3)},
+			[]any{int16(model.CheckStateQueued), int64(4)},
+		), nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- BacklogLoop(ctx, pool, reg, BacklogOptions{
+			Interval: 20 * time.Millisecond, // запас против CI-задержек прохода
+			Log:      slog.New(slog.DiscardHandler),
+		})
+	}()
+
+	// Несколько быстрых проходов.
+	deadline := time.Now().Add(2 * time.Second)
+	for pool.callsCount() < 3 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("проходы не идут")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("BacklogLoop: %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BacklogLoop не завершился после отмены ctx")
+	}
+	if got := backlogSkippedValue(t, reg); got != 0 {
+		t.Errorf("skipped_ticks = %v, want 0 (быстрые проходы не пропускаются)", got)
+	}
+	if got := backlogHistogramSamples(t, reg); got < 3 {
+		t.Errorf("наблюдений гистограммы = %d, want ≥ 3", got)
 	}
 }

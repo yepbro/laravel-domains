@@ -832,15 +832,15 @@ func TestAlertsStallSourceErrors(t *testing.T) {
 	}
 }
 
-// TestAlertsStallDefaultInterval — нулевой ZoneStatsInterval — дефолт 60 с
-// (DefaultZoneStatsInterval): порог 5 минут, а не ноль.
+// TestAlertsStallDefaultInterval — нулевой ZoneStatsInterval — дефолт
+// (DefaultZoneStatsInterval, 5 минут): порог 25 минут, а не ноль.
 func TestAlertsStallDefaultInterval(t *testing.T) {
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.ZoneStatsInterval = 0 })
 	now, _ := alertsFixedClock()
 	env.pool.fresh = []sql.NullTime{{Time: now.Add(-4 * time.Minute), Valid: true}}
 
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertProgressStall); s.Status != AlertStatusOK {
-		t.Errorf("4мин при дефолтных 5×60с: статус = %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("4мин при дефолтных 5×5м: статус = %s (%s), want ok", s.Status, s.Detail)
 	}
 }
 
@@ -1078,17 +1078,17 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 // часы.
 func TestAlertsOptionsDefaults(t *testing.T) {
 	o := (AlertsOptions{}).withDefaults()
-	// Литерал 60s, а не DefaultAlertsInterval: сравнение с константой
-	// мутируется вместе с ней (59/61 с должны ловиться здесь).
-	if o.Interval != 60*time.Second {
-		t.Errorf("Interval = %v, want 60s", o.Interval)
+	// Литерал 5m, а не DefaultAlertsInterval: сравнение с константой
+	// мутируется вместе с ней (дренаж порога должны ловиться здесь).
+	if o.Interval != 5*time.Minute {
+		t.Errorf("Interval = %v, want 5m", o.Interval)
 	}
 	if o.ZoneStatsInterval != DefaultZoneStatsInterval {
 		t.Errorf("ZoneStatsInterval = %v, want %v", o.ZoneStatsInterval, DefaultZoneStatsInterval)
 	}
 
 	neg := AlertsOptions{Interval: -time.Second, ZoneStatsInterval: -time.Second}.withDefaults()
-	if neg.Interval != 60*time.Second || neg.ZoneStatsInterval != DefaultZoneStatsInterval {
+	if neg.Interval != 5*time.Minute || neg.ZoneStatsInterval != DefaultZoneStatsInterval {
 		t.Errorf("отрицательные периоды: %+v, want дефолты", neg)
 	}
 

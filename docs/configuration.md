@@ -230,6 +230,7 @@ fsnotify (T-013): подхватывает файлы, существовавш�
 | `lease` | `CRAWLER_SCHEDULER_LEASE` | длительность | `30m` |
 | `temp_error_retry_after` | `CRAWLER_SCHEDULER_TEMP_ERROR_RETRY_AFTER` | длительность | `24h` |
 | `temp_error_max_retries` | `CRAWLER_SCHEDULER_TEMP_ERROR_MAX_RETRIES` | целое | `3` (максимум повторов `temp_error` подряд, далее итоговый статус; ТЗ 5.3: N) |
+| `backlog_interval` | `CRAWLER_SCHEDULER_BACKLOG_INTERVAL` | длительность | `5m` (коридор 30s..1h; T-161) |
 | `zone_weights` | `CRAWLER_SCHEDULER_ZONE_WEIGHTS` | карта имя=вес | — (все веса 1, равный круговой порядок) |
 
 `recheck_interval` — минимальный возраст последней проверки
@@ -237,6 +238,20 @@ fsnotify (T-013): подхватывает файлы, существовавш�
 очередь: суточный проход планировщика переводит его `check_state` из
 `done` в `pending` (ТЗ 5.3; повторная проверка — не чаще этого интервала,
 ТЗ 11.4 п. 8). Сам суточный ритм прохода конфигом не настраивается.
+
+`backlog_interval` — период коллектора глубины backlog
+(`scheduler.BacklogLoop`, T-077): gauge `crawler_backlog_domains` из
+`GROUP BY check_state` по всем живым доменам. Дефолт 5 минут (T-161):
+исходные 30 с нижней границы коридора ТЗ 5.9 (30–60 с) рассчитаны на
+малый корпус — на 47 млн строк (замер §12
+[`load-measurements.md`](load-measurements.md)) проход занимает 17+ с и
+вместе с пересчётом зон и агрегатами status составляет большую часть
+CPU postgres; gauge глубины на дашборде допускает пятиминутную
+свежесть. Коридор 30s..1h: чаще 30 с — полные проходы `domains` без
+индекса (T-104) дороже самой метрики, реже часа — глубина перестаёт
+быть наблюдаемой величиной. Проходы не наслаиваются (single-flight):
+проход дольше интервала сбрасывает накопившийся тик ticker'а, Warn и
+счётчик `crawler_backlog_skipped_ticks_total` поднимают шум (T-161).
 
 `queue_high_watermark` — порог backpressure (ТЗ 4.2, 5.3): единый для всех
 рабочих стримов (`q:dns`, `q:http`, `q:render`, `q:analyze`). Продюсер —
@@ -671,7 +686,7 @@ rules:
 | YAML | Переменная | Тип | По умолчанию |
 |---|---|---|---|
 | `listen` | `CRAWLER_MONITOR_LISTEN` | [host]:port | `:9100` |
-| `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `60s` (рекомендация: 30–60 с) |
+| `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `5m` (коридор 30s..1h; T-161) |
 | `ingest_metrics_url` | `CRAWLER_MONITOR_INGEST_METRICS_URL` | http(s)-URL | `http://127.0.0.1:9101/metrics` |
 
 `listen` — адрес HTTP-эндпоинта самого сервиса monitor (`/livez` +
@@ -684,7 +699,17 @@ Prometheus скрейпит их по отдельности, агрегации
 минимального набора ТЗ 5.9 (T-080: доля ошибок DNS, переполнение очередей,
 остановка прогресса — порог считается в периодах этого поля, место на
 диске, износ NVMe, всплеск мусорных `content_hash` — окно тоже в периодах
-этого поля; OOM/рестарты юнитов — T-145, без порогов: события бинарны). Новых полей под пороги алертов нет: порог очередей —
+этого поля; OOM/рестарты юнитов — T-145, без порогов: события бинарны).
+Дефолт 5 минут (T-161): исходные 60 с верхней границы коридора ТЗ 5.9
+(30–60 с) рассчитаны на малый корпус — на 47 млн строк (замер §12
+[`load-measurements.md`](load-measurements.md)) UPDATE-агрегат входит в
+тройку главных статей CPU postgres, а счётчики зон читают `crawlerctl
+status`, лендинг и партиционирование — пятиминутная свежесть достаточна;
+порог остановки прогресса 5 × интервал растёт пропорционально (25 мин).
+Коридор 30s..1h; значения 30–60 с коридора ТЗ 5.9 остаются доступными
+для малых корпусов. Проходы не наслаиваются (single-flight, T-161):
+проход дольше интервала сбрасывает накопившийся тик ticker'а, Warn и
+счётчик `crawler_zonestats_skipped_ticks_total` поднимают шум. Новых полей под пороги алертов нет: порог очередей —
 `scheduler.queue_high_watermark`, порог места — `content.disk_free_percent`
 (тот же, что пауза записи контента, ТЗ 8), остальные пороги — константы
 `internal/monitor` с обоснованием (набор и числа —
@@ -728,6 +753,7 @@ config.dev.yaml), на боевом хосте — loopback ingest по `METRICS
 |---|---|---|---|
 | `listen` | `CRAWLER_DASHBOARD_LISTEN` | [host]:port | `127.0.0.1:8090` |
 | `refresh` | `CRAWLER_DASHBOARD_REFRESH_INTERVAL` | длительность | `5s` (коридор 1s–5m) |
+| `status_cache_ttl` | `CRAWLER_DASHBOARD_STATUS_CACHE_TTL` | длительность | `1m` (коридор 1m–5m; T-161) |
 | `username` | `CRAWLER_DASHBOARD_USERNAME` | строка | `""` |
 | `password_hash` | `CRAWLER_DASHBOARD_PASSWORD_HASH` | строка формата ТЗД §7.2 | `""` |
 | `probes` | `CRAWLER_DASHBOARD_PROBES` | карта имя=url | — |
@@ -740,6 +766,20 @@ config.dev.yaml), на боевом хосте — loopback ingest по `METRICS
 (числа меняются медленнее), медленнее — портит живость сводки; нагрузка
 не зависит от числа открытых вкладок (браузер получает кэшированный
 снимок).
+
+`status_cache_ttl` — TTL кэша тяжёлых агрегатов сводки (T-161, замер §12
+[`load-measurements.md`](load-measurements.md)): зоны с живым агрегатом
+`check_state`, темп и распределение статусов — полные проходы `domains`;
+в окне TTL проходы `refresh` переиспользуют последний ответ (`status.Cache`
+общего пакета `internal/status`), по истечении — одна выборка на секцию,
+ошибки не кэшируются (деградация секции остаётся видимой). Лёгкие секции
+(последние находки по индексу, журнал ingest) идут мимо кэша каждый
+проход. Коридор 1m..5m (постановка T-161): меньше минуты кэш не спасает
+на дефолтном `refresh` 5 с, больше 5 минут — сводка теряет оперативность.
+`crawlerctl status` кэшем не пользуется: разовая диагностика ценит
+свежие данные, отдельный процесс попаданий не даёт; лендинг `web`
+сводку `internal/status` не читает (его данные — кэш-счётчики зон,
+дёшевы по построению, T-122).
 
 `username`/`password_hash` — креды оператора (HTTP Basic, ТЗД §7.1).
 Общий `config.Validate` их **не проверяет**: обязательность проверяет
@@ -796,9 +836,12 @@ dashboard-secret` (пароль — аргумент или stdin; справк�
 - все таймауты/интервалы положительны; `ingest.batch_size` 1..1000000,
   `ingest.stable_seconds` 1..3600, `ingest.scan_interval` 10ms..1h,
   `scheduler.batch_size` 1000..10000 (ТЗ 5.3), `queue_high_watermark` ≥ 1,
-  `temp_error_max_retries` 1..100; `scheduler.zone_weights` — ключи
+  `temp_error_max_retries` 1..100; `scheduler.backlog_interval` 30s..1h
+  (T-161), `monitor.zone_stats_interval` 30s..1h (T-161);
+  `scheduler.zone_weights` — ключи
   (punycode-имена зон, приведённые к нижнему регистру) синтаксически
-  корректны, веса 1..1000; `dashboard.refresh` 1s..5m; `dashboard.probes` —
+  корректны, веса 1..1000; `dashboard.refresh` 1s..5m;
+  `dashboard.status_cache_ttl` 1m..5m (T-161); `dashboard.probes` —
   непустые имена, абсолютные http(s)-URL (ТЗД §8.3); `dashboard.username`/
   `dashboard.password_hash` общим `Validate` не проверяются —
   обязательность кредов проверяет `cmd/dashboard` на старте (ТЗД §7.7);

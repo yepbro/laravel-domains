@@ -198,7 +198,9 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`) |
 | `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод записи в q:dead (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
 | `crawler_redis_memory_ratio` | gauge | — | monitor (T-154) | проход алертов: `used_memory/maxmemory` из `INFO memory` (обёртка источника `monitor.NewRedisMemoryMetrics`); при noeviction — прокси-метрика предстоящих OOM-отказов записи (алерт `redis_memory` при ≥ 0.8); `maxmemory` не задан — ряд не пишется |
-| `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) раз в 30 с (`scheduler.BacklogLoop`) |
+| `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) с периодом `scheduler.backlog_interval` (по умолчанию 5 мин, T-161; был 30 с) — `scheduler.BacklogLoop` |
+| `crawler_backlog_pass_seconds` / `crawler_backlog_skipped_ticks_total` | histogram / counter | — | scheduler (T-161) | каждый проход агрегата backlog: длительность (корзины 0.5с…~8.5 мин — замер §12: 17+ с на 47 млн строк) и пропущенные тики single-flight (проход дольше интервала — накопившийся тик не запускает новый проход, Warn в журнале); рост пропусков — таблица растёт быстрее интервала, поднимать `scheduler.backlog_interval` |
+| `crawler_zonestats_pass_seconds` / `crawler_zonestats_skipped_ticks_total` | histogram / counter | — | monitor (T-161) | каждый проход пересчёта зон T-078: длительность и пропущенные тики single-flight (та же механика, что у backlog) |
 | `crawler_dashboard_snapshots_total` | counter | `result` | dashboard (`ok`/`error`, ТЗД §10) | каждый проход цикла сборки снимков: `error` — проход с деградированными секциями (снимок публикуется, причины — Warn в логе и карта `errors` /api/status) |
 | `crawler_dashboard_snapshot_seconds` | histogram | — | dashboard | длительность того же прохода (корзины 50 мс…~3 мин: проход — полные агрегаты `internal/status`) |
 
@@ -271,7 +273,13 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
 T-109) и повторных проверок `temp_error`
 (`RetryTempErrors`, T-031). Рядом с ними — коллектор глубины backlog
 `BacklogLoop` (T-077): gauge `crawler_backlog_domains{pending|queued}`
-из БД раз в 30 с.
+из БД с периодом `scheduler.backlog_interval` (по умолчанию 5 мин —
+T-161, замер §12: на 47 млн строк проход 17+ с каждые 30 с входил в
+большую часть CPU postgres; коридор 30с..1ч). Проходы single-flight
+(T-161): выполняются в горутине цикла — новый не начинается, пока не
+завершился предыдущий, а проход дольше интервала сбрасывает
+накопившийся тик ticker'а (иначе агрегат молол бы БД непрерывно), Warn и
+`crawler_backlog_skipped_ticks_total` поднимают шум.
 
 `dns-worker` (этап 3, T-036…T-039): его `OnRun` выполняет
 цикл `dnsworker.Run` (`internal/dnsworker/result.go`):
@@ -529,12 +537,20 @@ T-092 §4: ≈5.1 с/страница → 4 контекста ≈ 0.8 стр/с
 `monitor.ZoneStatsLoop` (`internal/monitor/zonestats.go`):
 
 - периодический пакетный пересчёт кэширующих счётчиков прогресса зон
-  `zones.domains_total` / `zones.domains_checked` (ТЗ 5.9: раз в 30–60 с,
-  период — `monitor.zone_stats_interval`, по умолчанию 60 с): одним
+  `zones.domains_total` / `zones.domains_checked` (ТЗ 5.9, период —
+  `monitor.zone_stats_interval`, по умолчанию 5 минут — T-161, замер §12:
+  исходные 60 с верхней границы коридора ТЗ 5.9 «30–60 с» рассчитаны на
+  малый корпус, а UPDATE-агрегат по 47 млн строк входил в большую часть
+  CPU postgres): одним
   оператором `UPDATE … FROM (агрегат domains GROUP BY zone_id …)` по всем
   зонам сразу, без row-per-zone и без счётчика на каждую строку domains;
   GROUP BY по ключу партиционирования позволяет агрегировать по партициям,
   LEFT JOIN от зон обнуляет счётчики зон без живых доменов;
+- проходы single-flight (T-161): в горутине цикла новый проход не
+  начинается, пока не завершился предыдущий, а проход дольше интервала
+  (рост таблицы) сбрасывает накопившийся тик ticker'а — Warn,
+  `crawler_zonestats_pass_seconds` и
+  `crawler_zonestats_skipped_ticks_total` поднимают шум;
 - семантика (ТЗ 11.4 п. 6 «всего / проверено»): `domains_total` — живые
   домены зоны (`status <> deleted`, ТЗ 13.1), `domains_checked` —
   проверенные в текущем цикле (`check_state = done`, ТЗ 6.1): возрастная
@@ -597,8 +613,9 @@ counter-семантикой корректен для `rate()`/`increase()`; п
   публикации); снятие ниже 90 % порога (гистерезис против дребезга
   длин у порога);
 - **остановка прогресса** — `zones.updated_at` (пишет `ZoneStatsLoop`)
-  старше 5 × `zone_stats_interval`: проход по 350 млн строк — минуты,
-  единичный пропуск периода — не авария. Оговорка самоконтроля: метку
+  старше 5 × `zone_stats_interval` (25 мин на дефолтных 5 мин): проход
+  по десяткам млн строк — минуты, единичный пропуск периода — не авария.
+  Оговорка самоконтроля: метку
   пишет сам monitor — полная смерть процесса видна по метрике
   `crawler_service_up` каркаса (T-012), а не этим алертом;
 - **нехватка места на диске** — statfs каталога `content.dir` против
@@ -778,9 +795,15 @@ cookie-сессия `<expiry>.<HMAC-SHA256(expiry, производный клю
 `crawlerctl status` на каждый запуск: проход `domains`, окна
 `subdomain_results`; распределение статусов и счётчик Laravel — тоже
 агрегаты без индексов по `status`; «последние ingest-файлы» — top-N
-сортировка журнала без индекса по `processed_at`): частоту задаёт
-`dashboard.refresh`, и на большом корпусе период поднимают
-(до 5 минут), а не смиряются с нагрузкой дефолтных 5 с.
+сортировка журнала без индекса по `processed_at`). Тяжёлые секции
+(зоны, темп, статусы) проходят через TTL-кэш `status.Cache` (T-161,
+`dashboard.status_cache_ttl`, по умолчанию 60 с — коридор 1–5 мин):
+в окне TTL проходы `refresh` переиспользуют последний ответ БД, полный
+проход `domains` — не чаще раза за период; ошибки не кэшируются —
+деградация секции остаётся видимой. Лёгкие секции (последние находки
+по индексу, журнал ingest) кэш обходит. На большом корпусе период
+`refresh` всё равно поднимают (до 5 минут) — кэш снимает повторные
+полные проходы, но не цену первого.
 
 Секции снимка (§5): зоны/итоги/темп/скорости/ETA и глубины стримов —
 общая библиотека `internal/status` (те же SQL и расчёты, что у

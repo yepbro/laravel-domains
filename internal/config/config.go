@@ -155,6 +155,19 @@ type Scheduler struct {
 	QueueHighWatermark  int      `yaml:"queue_high_watermark"`
 	Lease               Duration `yaml:"lease"`
 	TempErrorRetryAfter Duration `yaml:"temp_error_retry_after"`
+	// BacklogInterval — период цикла коллектора глубины backlog
+	// (scheduler.BacklogLoop, T-077): gauge crawler_backlog_domains из
+	// GROUP BY check_state по всем живым доменам. Дефолт 5 минут
+	// (T-161): исходные 30 с коридора ТЗ 5.9 (30–60 с) рассчитаны на
+	// малый корпус — на 47 млн строк (замер §12
+	// docs/load-measurements.md) проход 17+ с каждые 30 с вместе с
+	// пересчётом зон и агрегатами status — большая часть CPU postgres;
+	// gauge глубины на дашборде допускает пятиминутную свежесть.
+	// Коридор валидации 30с..1ч: меньше 30 с — агрегат чаще, чем
+	// допускает ТЗ 5.9, больше часа — глубина перестаёт быть наблюдаемой
+	// величиной. Расширение к минимальному составу ТЗ 5.10: новое поле
+	// внутри секции scheduler.
+	BacklogInterval Duration `yaml:"backlog_interval"`
 	// TempErrorMaxRetries — максимум повторных проверок temp_error подряд
 	// (ТЗ 5.3: «не более N раз подряд»); после исчерпания домен получает
 	// итоговый статус по результату последней проверки (T-031). ТЗ число
@@ -395,6 +408,13 @@ type Dashboard struct {
 	// Refresh — период фоновой сборки снимков состояния (ТЗД §4.4),
 	// коридор 1s..5m (ТЗД §8.3).
 	Refresh Duration `yaml:"refresh"`
+	// StatusCacheTTL — TTL кэша тяжёлых агрегатов status (зоны/темп/
+	// статусы — полные проходы domains, T-161): в окне TTL проходы
+	// refresh переиспользуют последний ответ БД, по истечении — одна
+	// выборка на секцию. Коридор 1m..5m (постановка T-161): меньше
+	// минуты кэш не спасает на дефолтном refresh 5 с, больше 5 минут —
+	// сводка теряет оперативность (числа конвейера меняются секундами).
+	StatusCacheTTL Duration `yaml:"status_cache_ttl"`
 	// Username — логин оператора (HTTP Basic, ТЗД §7.1).
 	Username string `yaml:"username"`
 	// PasswordHash — хэш пароля формата ТЗД §7.2 (генерация —
@@ -474,6 +494,11 @@ func Default() *Config {
 			Lease:               Duration(30 * time.Minute),
 			TempErrorRetryAfter: Duration(24 * time.Hour),
 			TempErrorMaxRetries: 3,
+			// 5 минут (T-161, замер §12): проход GROUP BY по 47 млн строк
+			// 17+ с каждые 30 с — одна из трёх главных статей CPU
+			// postgres; gauge дашборда допускает пятиминутную свежесть
+			// (обоснование — internal/scheduler/backlog.go).
+			BacklogInterval: Duration(5 * time.Minute),
 			// Веса зон не заданы — равный круговой порядок (ТЗ 5.3:
 			// «опционально»).
 			ZoneWeights: nil,
@@ -599,8 +624,14 @@ func Default() *Config {
 		// Начальное наполнение таблицы subdomains; "" — апекс домена.
 		Subdomains: []string{"", "www", "admin", "crm", "api", "app"},
 		Monitor: Monitor{
-			Listen:            ":9100",
-			ZoneStatsInterval: Duration(60 * time.Second),
+			Listen: ":9100",
+			// 5 минут (T-161, замер §12): UPDATE-агрегат по 47 млн строк
+			// каждые 60 с — одна из трёх главных статей CPU postgres;
+			// счётчики зон читают status/лендинг/партиционирование —
+			// пятиминутная свежесть достаточна (обоснование —
+			// internal/monitor/zonestats.go). Тот же период у цикла
+			// алертов (порог остановки прогресса 5× интервал = 25 мин).
+			ZoneStatsInterval: Duration(5 * time.Minute),
 			// Loopback ingest по METRICS_ADDR (systemd-юниты привязывают
 			// 127.0.0.1:9101); docker-сети переопределяют именем сервиса
 			// (config.dev.yaml: http://ingest:9101/metrics).
@@ -626,6 +657,10 @@ func Default() *Config {
 			// «Сейчас» операторской сводки (ТЗД §6.4: автообновление
 			// фронта ~5 с) без лишней нагрузки на БД (ТЗД §4.4).
 			Refresh: Duration(5 * time.Second),
+			// Нижняя граница коридора T-161 (1–5 мин): при refresh 5 с —
+			// один полный проход domains в минуту вместо двенадцати
+			// (обоснование — internal/status/cache.go).
+			StatusCacheTTL: Duration(time.Minute),
 			// Креды не заданы: обязательность проверяет cmd/dashboard
 			// на старте (ТЗД §7.7), не общий Validate.
 			Username:     "",
@@ -782,6 +817,16 @@ func (c *Config) Validate() error {
 	// scheduler
 	if c.Scheduler.RecheckInterval <= 0 {
 		problems = append(problems, nonPositiveDur("scheduler.recheck_interval", c.Scheduler.RecheckInterval))
+	}
+	// Период коллектора глубины backlog (T-161): коридор 30с..1ч —
+	// нижняя граница коридора ТЗ 5.9 (чаще — агрегат по всей domains
+	// без индекса, T-104, дороже самой метрики), верхняя — от
+	// абсурда: глубина старее часа перестаёт быть наблюдаемой
+	// величиной (алерт остановки прогресса — zones.updated_at, не этот
+	// gauge).
+	if c.Scheduler.BacklogInterval < Duration(30*time.Second) || c.Scheduler.BacklogInterval > Duration(time.Hour) {
+		problems = append(problems, fmt.Sprintf("scheduler.backlog_interval: ожидается %s..%s, задано %s (период gauge глубины backlog, T-161)",
+			Duration(30*time.Second), Duration(time.Hour), c.Scheduler.BacklogInterval))
 	}
 	// ТЗ 5.3: пачки планировщика 1000–10000 — границы нормативные
 	// (T-027), не рекомендация: пачка задаёт память выборки (ТЗ 3.5) и
@@ -1038,8 +1083,13 @@ func (c *Config) Validate() error {
 	if err := checkHostPort(c.Monitor.Listen); err != nil {
 		problems = append(problems, fmt.Sprintf("monitor.listen: ожидается [host]:port, задано %q", c.Monitor.Listen))
 	}
-	if c.Monitor.ZoneStatsInterval <= 0 {
-		problems = append(problems, nonPositiveDur("monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval))
+	// Период пересчёта зон и цикла алертов (T-161 поднял дефолт 60с→5м,
+	// замер §12): коридор 30с..1ч — нижняя граница коридора ТЗ 5.9
+	// (чаще — UPDATE-агрегат по всей domains), верхняя ограничивает и
+	// алерты (остановка прогресса: 5 × интервал, 25 мин на дефолте).
+	if c.Monitor.ZoneStatsInterval < Duration(30*time.Second) || c.Monitor.ZoneStatsInterval > Duration(time.Hour) {
+		problems = append(problems, fmt.Sprintf("monitor.zone_stats_interval: ожидается %s..%s, задано %s",
+			Duration(30*time.Second), Duration(time.Hour), c.Monitor.ZoneStatsInterval))
 	}
 	if c.Monitor.IngestMetricsURL != "" {
 		if u, err := url.Parse(c.Monitor.IngestMetricsURL); err != nil ||
@@ -1082,6 +1132,13 @@ func (c *Config) Validate() error {
 	if c.Dashboard.Refresh < Duration(time.Second) || c.Dashboard.Refresh > Duration(5*time.Minute) {
 		problems = append(problems, fmt.Sprintf("dashboard.refresh: ожидается %s..%s, задано %s",
 			Duration(time.Second), Duration(5*time.Minute), c.Dashboard.Refresh))
+	}
+	// TTL кэша тяжёлых агрегатов (T-161): коридор постановки 1–5 мин —
+	// меньше минуты кэш не спасает на дефолтном refresh 5 с, больше
+	// 5 минут — сводка теряет оперативность.
+	if c.Dashboard.StatusCacheTTL < Duration(time.Minute) || c.Dashboard.StatusCacheTTL > Duration(5*time.Minute) {
+		problems = append(problems, fmt.Sprintf("dashboard.status_cache_ttl: ожидается %s..%s, задано %s",
+			Duration(time.Minute), Duration(5*time.Minute), c.Dashboard.StatusCacheTTL))
 	}
 	for _, name := range sortedStringKeys(c.Dashboard.Probes) {
 		if name == "" {

@@ -93,12 +93,15 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Фоновые циклы: пересчёт счётчиков зон (T-078), gauge серой зоны
-	// Laravel-находок (T-115) и счётчики истории детекции appeared/lost
-	// (T-118) — все периодические проходы по БД, завершаются отменой ctx.
+	// Фоновые циклы: пересчёт счётчиков зон (T-078; период —
+	// monitor.zone_stats_interval, T-161 поднял дефолт до 5 мин по замеру
+	// §12; реестр — метрики длительности прохода и пропусков тиков),
+	// gauge серой зоны Laravel-находок (T-115) и счётчики истории
+	// детекции appeared/lost (T-118) — все периодические проходы по БД,
+	// завершаются отменой ctx.
 	bg := make(chan error, 3)
 	go func() {
-		bg <- monitor.ZoneStatsLoop(ctx, pool, monitor.ZoneStatsOptions{
+		bg <- monitor.ZoneStatsLoop(ctx, pool, reg, monitor.ZoneStatsOptions{
 			Interval: cfg.Monitor.ZoneStatsInterval.D(),
 			Log:      logger,
 		})
