@@ -191,7 +191,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_content_retention_bad_hashes_total` / `crawler_content_retention_missing_refs_total` | counter | — | http-worker (T-166) | аномалии учёта: срезанные ссылки с хэшем неверной длины / без строки `contents`; в норме не растут вовсе — рост = ошибка писателя (T-056) или расхождение refcount (T-044) |
 | `crawler_unit_oom_events` | gauge | `unit`, `kind` | monitor (T-145) | проход алертов (60 с): счётчики memory.events cgroup v2 юнитов `crawler-*.service` (kind=oom/oom_kill); обнуляются пересозданием cgroup на рестарте юнита — gauge, не counter; рост = события OOM (алерт unit_oom) |
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
-| `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: lag + pending; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`) |
+| `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`) |
 | `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод записи в q:dead (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
 | `crawler_redis_memory_ratio` | gauge | — | monitor (T-154) | проход алертов: `used_memory/maxmemory` из `INFO memory` (обёртка источника `monitor.NewRedisMemoryMetrics`); при noeviction — прокси-метрика предстоящих OOM-отказов записи (алерт `redis_memory` при ≥ 0.8); `maxmemory` не задан — ряд не пишется |
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) раз в 30 с (`scheduler.BacklogLoop`) |
@@ -201,10 +201,12 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 Решения (зафиксированы):
 
 - **Глубина очередей** живёт у потребителей стрима: backlog группы
-  потребления (XINFO GROUPS через гейт backpressure, клиент Redis у
-  каждого сервиса уже есть), а привязка к потребителю гарантирует
-  «очередь читается ⇔ глубина публикуется». XLEN для этого не годится:
-  он считает и подтверждённую историю до обрезки MAXLEN.
+  потребления (XINFO GROUPS + XLEN через гейт backpressure, клиент Redis
+  у каждого сервиса уже есть; лаг группы ограничен длиной стрима —
+  кламп против фантомного лага Redis 7.0.x после обрезки недоставленного,
+  T-168), а привязка к потребителю гарантирует «очередь читается ⇔
+  глубина публикуется». «Сырой» XLEN для этого не годится: он считает и
+  подтверждённую историю до обрезки MAXLEN.
   `q:dead` потребителя не имеет (ручной разбор, ТЗ 4.2) — с T-154 его
   глубину публикует сам monitor (XLEN через ту же обёртку гейта,
   `NewDeadDepthMetrics`, только ряд `queue="q:dead"`: дубль рабочих
@@ -389,8 +391,9 @@ T-109) и повторных проверок `temp_error`
   `q:analyze` по `Result`-сообщению на запись (§5.5 п. 9) под гейтом
   backpressure; публикация `q:render` по SPA-записям (T-066,
   `renderq.go`) — неблокирующая: ёмкость стрима проверяется до
-  транзакции одним чтением глубины (`BackpressureGate.Len`: `lag` +
-  `pending` групп, XLEN — пока групп нет; общий порог
+  транзакции одним чтением глубины (`BackpressureGate.Len`:
+  `min(lag, XLEN)` + `pending` групп — кламп фантомного лага T-168,
+  XLEN — пока групп нет; общий порог
   `scheduler.queue_high_watermark` без клампа, T-026),
   свободно — публикация сразу после фиксации мимо гейта, переполнение —
   флаг `render_pending` той же транзакцией результата, эпизод
@@ -570,7 +573,8 @@ counter-семантикой корректен для `rate()`/`increase()`; п
   при доле ≥ 30 %, снятие ниже 20 % (гистерезис); при < 100 проверках
   в окне доля — шум пустого окна, алерт «не измеряется»;
 - **переполнение очередей** — глубина рабочих стримов `q:dns`/`q:http`/
-  `q:render`/`q:analyze` (backlog групп: `lag` + `pending`,
+  `q:render`/`q:analyze` (backlog групп: `min(lag, XLEN)` + `pending` —
+  лаг ограничен длиной стрима, кламп фантомного лага T-168;
   `BackpressureGate.Len`; `q:dead` гейтом не ограничивается и не
   проверяется) против эффективного порога стрима —
   `queue.StreamWatermark(scheduler.queue_high_watermark, redis.maxlen,

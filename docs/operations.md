@@ -163,7 +163,8 @@ SELECT * FROM schema_migrations;   -- version, dirty = false
 
 - `crawler_stage_tasks_total{stage}` / `crawler_stage_seconds` —
   пропускная способность этапов dns/http/render/analyze;
-- `crawler_queue_depth{queue}` — глубина очередей `q:*` (backlog групп потребления);
+- `crawler_queue_depth{queue}` — глубина очередей `q:*` (backlog групп
+  потребления; лаг ограничен длиной стрима — кламп фантома T-168);
 - `crawler_queue_dead_buried_total{queue}` / `crawler_redis_memory_ratio` —
   смерти задач (переводы в q:dead, T-154) и заполнение `maxmemory` Redis;
 - `crawler_backlog_domains{state}` — pending/queued по БД;

@@ -146,7 +146,8 @@ func (o TrimOptions) streamMaxLen(stream string) int64 {
 // всем стримам и список застрявших стримов — длина (XLEN) выше трёх
 // четвертей предела при живых группах: подтверждённый префикс растёт,
 // а точка не двигается (сигнал оператору — TrimLoop логирует Warn;
-// глубина lag+pending такое не видит: backlog групп у нуля).
+// глубина гейта (min(lag, XLEN) + pending, T-168) такое не видит:
+// backlog групп у нуля).
 // Ошибка одного стрима не отменяет остальные (стиль Reliab.Claim):
 // ошибки собираются в возврат (errors.Join), валидная часть отрабатывает —
 // следующий проход повторит сбойный.
@@ -262,7 +263,8 @@ func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOpt
 // до потолков MAXLEN. Застрявший стрим (длина у потолка при живых
 // группах — точка обрезки заморожена, см. TrimOnce) сигнализируется
 // Warn один раз за эпизод: подтверждённый префикс не виден глубине
-// lag+pending, и без сигнала молчаливый рост повторил бы T-093.
+// гейта (min(lag, XLEN) + pending — backlog групп у нуля, T-168), и без
+// сигнала молчаливый рост повторил бы T-093.
 // Работает до отмены ctx и возвращает nil — контракт OnRun каркаса
 // (T-012, graceful shutdown, ТЗ 3.4).
 func TrimLoop(ctx context.Context, rdb trimStreams, opt TrimOptions) error {

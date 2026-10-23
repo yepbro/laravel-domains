@@ -21,6 +21,12 @@
 //   - backpressure (T-026): ниже порога публикация проходит, на пороге
 //     блокируется до освобождения ёмкости, отмена контекста — чистый
 //     выход (graceful shutdown, ТЗ 3.4);
+//   - фантомный лаг после обрезки недоставленного (T-168): XTRIM MAXLEN
+//     ниже позиции группы оставляет в XINFO GROUPS положительный lag
+//     (Redis 7.0.x не вычитает срезанное — фантом прода; 7.4+
+//     корректирует сам), гейт меряет реальный бэклог — min(lag, XLEN) +
+//     pending — и публикация проходит; застывший счётчик прода
+//     воспроизводится явно (XGROUP … ENTRIESREAD);
 //   - MAXLEN (T-025): публикация сверх предела обрезает стрим — длина
 //     не растёт с числом публикаций, старые записи уходят;
 //   - освобождение подтверждённого префикса (T-141): после «публикация →
@@ -832,6 +838,144 @@ func TestResilience_BackpressureGate(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("отмена контекста не прервала ожидание гейта")
+	}
+}
+
+// TestResilience_BackpressureTrimmedLag — фантомный лаг после обрезки
+// недоставленного (T-168): lag группы (entries_added − entries_read,
+// Redis ≥ 7.0) не вычитает записи, срезанные XTRIM'ом/XDEL'ем
+// недоставленными — гейт обязан мерить реальный бэклог (записи, живущие
+// в стриме), а не счётчик сервера. Инцидент 22–23.10.2026 (прод,
+// Redis 7.0.15): после дренажа T-149 (XTRIM q:dns MAXLEN 125) лаг
+// dns-worker застыл на 1753 при XLEN 1 — эффективный порог гейта q:dns
+// 125 закрыт вечно, планировщик молчал ~15,5 ч при 40,3 млн pending.
+// Здесь на живом Redis проверяются обе стороны: семантика сервера после
+// XTRIM недоставленного (7.0.x держит фантомный lag > XLEN, 7.4+
+// корректирует сам — глубина гейта от версии не зависит) и защита от
+// застывшего счётчика — состояние прода воспроизводится явно (XGROUP …
+// ENTRIESREAD ниже реальности, тот же стейт, что дренаж оставил на
+// 7.0.15).
+func TestResilience_BackpressureTrimmedLag(t *testing.T) {
+	skipUnlessIntegration(t)
+	rdb := resilienceRedisEnv(t)
+	// Явный большой MAXLEN: обрезка здесь — вручную (XTRIM MAXLEN, как
+	// дренаж T-149), а не потолок XADD.
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{MaxLen: 100000, Block: 150 * time.Millisecond})
+	ctx := context.Background()
+	const group = "resil-t168"
+	const total, keep = 30, 5
+	// Водяной знак между реальным бэклогом (keep) и фантомным лагом
+	// (total): «сырой» лаг держал бы гейт закрытым вечно, клампнутая
+	// глубина открывает публикацию.
+	const watermark = int64(10)
+	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
+		Watermark: watermark,
+		Interval:  50 * time.Millisecond,
+	})
+	pub := queue.NewWatermarkPublisher(q, gate)
+
+	task := func(i int) queue.Result {
+		return queue.Result{
+			TaskID:      fmt.Sprintf("t-tlag-%05d", i),
+			ZoneID:      6,
+			DomainID:    int64(i + 1),
+			SubdomainID: 0,
+		}
+	}
+
+	// Семантика сервера: XADD total → XTRIM MAXLEN keep срезает
+	// недоставленное (группа ничего не читала) → XINFO GROUPS отдаёт
+	// положительный лаг: Redis 7.0.x не вычитает срезанное (lag 30 при
+	// XLEN 5 — фантом), 7.4+ корректирует сам (lag 5). Гейт в обоих
+	// случаях видит одно и то же: min(lag, XLEN) = 5.
+	if err := rdb.XGroupCreateMkStream(ctx, queue.StreamAnalyze, group, "0").Err(); err != nil {
+		t.Fatalf("XGROUP CREATE: %v", err)
+	}
+	for i := 0; i < total; i++ {
+		if _, err := q.Publish(ctx, queue.StreamAnalyze, task(i)); err != nil {
+			t.Fatalf("публикация №%d: %v", i+1, err)
+		}
+	}
+	if err := rdb.XTrimMaxLen(ctx, queue.StreamAnalyze, keep).Err(); err != nil {
+		t.Fatalf("XTRIM MAXLEN %d: %v", keep, err)
+	}
+	xlen := streamLen(t, rdb, queue.StreamAnalyze)
+	if xlen != keep {
+		t.Fatalf("XLEN после XTRIM: %d, хочу %d", xlen, keep)
+	}
+	groups, err := rdb.XInfoGroups(ctx, queue.StreamAnalyze).Result()
+	if err != nil {
+		t.Fatalf("XINFO GROUPS: %v", err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("групп у стрима: %d, хочу 1", len(groups))
+	}
+	if groups[0].Lag <= 0 {
+		t.Fatalf("лаг группы после XTRIM недоставленного: %d, хочу положительный (срезанное недоставленное сервер либо держит в счётчике, либо скорректировал — но не NULL)", groups[0].Lag)
+	}
+	n, err := gate.Len(ctx, queue.StreamAnalyze)
+	if err != nil {
+		t.Fatalf("Len после XTRIM: %v", err)
+	}
+	// Группа на "0": все оставшиеся записи не доставлены — реальный
+	// бэклог равен XLEN, кламп гарантирует его на любой версии сервера.
+	if n != keep {
+		t.Fatalf("глубина после XTRIM: %d, хочу %d (min(lag %d, XLEN %d) + pending 0)",
+			n, keep, groups[0].Lag, xlen)
+	}
+	if _, err := pub.Publish(ctx, queue.StreamAnalyze, task(total)); err != nil {
+		t.Fatalf("публикация после XTRIM недоставленного: %v", err)
+	}
+
+	// Прод-состояние 7.0.15 — застывший счётчик entries-read: лаг
+	// кратно выше длины стрима. На 7.4 XTRIM корректирует лаг сам,
+	// поэтому счётчик задаётся явно (XGROUP CREATE … ENTRIESREAD 0 —
+	// Redis ≥ 7.0; go-redis v9.23 не умеет аргумент, сырая команда).
+	// Группа ставится на первую запись стрима: позиция валидна, лаг
+	// считается от счётчика — «сырая» глубина ≥ watermark закрыла бы
+	// гейт навсегда, кламп открывает публикацию.
+	if err := rdb.Del(ctx, queue.StreamAnalyze).Err(); err != nil {
+		t.Fatalf("очистка стрима: %v", err)
+	}
+	for i := 0; i < total; i++ {
+		if _, err := q.Publish(ctx, queue.StreamAnalyze, task(100+i)); err != nil {
+			t.Fatalf("публикация (застывший счётчик) №%d: %v", i+1, err)
+		}
+	}
+	if err := rdb.XTrimMaxLen(ctx, queue.StreamAnalyze, keep).Err(); err != nil {
+		t.Fatalf("XTRIM MAXLEN (застывший счётчик): %v", err)
+	}
+	ids := entryIDs(t, rdb, queue.StreamAnalyze)
+	if len(ids) != keep {
+		t.Fatalf("записей после XTRIM (застывший счётчик): %d, хочу %d", len(ids), keep)
+	}
+	if err := rdb.Do(ctx, "XGROUP", "CREATE", queue.StreamAnalyze, group+"-stuck",
+		ids[0], "ENTRIESREAD", "0").Err(); err != nil {
+		t.Fatalf("XGROUP CREATE ENTRIESREAD: %v", err)
+	}
+	groups, err = rdb.XInfoGroups(ctx, queue.StreamAnalyze).Result()
+	if err != nil {
+		t.Fatalf("XINFO GROUPS (застывший счётчик): %v", err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("групп у стрима после пересоздания: %d, хочу 1", len(groups))
+	}
+	if lag := groups[0].Lag; lag < watermark {
+		t.Fatalf("лаг группы %d ниже watermark %d — фантом не воспроизведён (сырой лаг обязан закрывать гейт)", lag, watermark)
+	}
+	n, err = gate.Len(ctx, queue.StreamAnalyze)
+	if err != nil {
+		t.Fatalf("Len (застывший счётчик): %v", err)
+	}
+	if n != keep {
+		t.Fatalf("глубина с застывшим счётчиком: %d, хочу %d (кламп min(lag %d, XLEN %d))",
+			n, keep, groups[0].Lag, keep)
+	}
+	if _, err := pub.Publish(ctx, queue.StreamAnalyze, task(200)); err != nil {
+		t.Fatalf("публикация с застывшим счётчиком: %v", err)
+	}
+	if n := streamLen(t, rdb, queue.StreamAnalyze); n != keep+1 {
+		t.Fatalf("XLEN после публикации: %d, хочу %d", n, keep+1)
 	}
 }
 
