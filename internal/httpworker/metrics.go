@@ -57,6 +57,8 @@ type Metrics struct {
 	slots    prometheus.Gauge       // crawler_http_tasks_inflight (T-163)
 	bodyHold prometheus.Gauge       // crawler_http_body_bytes_inflight (T-163)
 	bodySize prometheus.Observer    // crawler_http_body_bytes (T-163)
+	cutoff   prometheus.Counter     // crawler_http_dead_host_cutoff_tasks_total (T-164)
+	cutSkip  prometheus.Counter     // crawler_http_dead_host_cutoff_skipped_checks_total (T-164)
 }
 
 // NewMetrics регистрирует приборы HTTP-этапа в реестре reg (каррированные
@@ -106,6 +108,14 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 			Help:    "Размеры прочитанных тел итоговых страниц (байт): смесь, определяющая пик транзитных буферов слота (T-163); хвост обрезан http.max_body_bytes.",
 			Buckets: httpBodyBuckets,
 		}).WithLabelValues(),
+		cutoff: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_http_dead_host_cutoff_tasks_total",
+			Help: "Задачи q:http, завершённые dead-host cutoff (T-164): apex и www упали на connect-фазе (connection refused/connect-таймаут, оба протокола), остальные субдомены не проверялись; записи — по §8, домен несёт бит dead_host_cutoff. Контроль критерия mean задачи ≤ 7 с — crawler_stage_seconds{stage=\"http\"}.",
+		}).WithLabelValues(),
+		cutSkip: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_http_dead_host_cutoff_skipped_checks_total",
+			Help: "Проверки (субдомен × протокол), не выполненные из-за dead-host cutoff (T-164), — сэкономленный пул задачи. Доля ложных cutoff (<1%, критерий T-164) меряется контрольной выборкой по битам dead_host_cutoff в domains.flags.",
+		}).WithLabelValues(),
 	}
 }
 
@@ -116,6 +126,10 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 // ТЗ 5.9). Кэш-попадания (Cached) временем ответа не наблюдаются — сеть
 // не трогалась (ResponseMS кэша — перенесённое измерение первоисточника);
 // суб-миллисекундные ответы честно ложатся в нижнюю корзину.
+// Dead-host cutoff (T-164): задача с признаком Cutoff — в отдельный
+// счётчик, пропущенные проверки (класс ErrCutoff) — в счётчик
+// сэкономленных проверок; ошибками этапа они не считаются — проверка
+// не выполнялась.
 func (m *Metrics) Episode(res *DomainResult, d time.Duration) {
 	if m == nil || res == nil {
 		return
@@ -124,9 +138,16 @@ func (m *Metrics) Episode(res *DomainResult, d time.Duration) {
 	m.seconds.Observe(d.Seconds())
 	m.statuses.WithLabelValues(recordStatus(res).String()).Inc()
 	m.rendered.WithLabelValues("false").Add(float64(res.RecordCount()))
+	if res.Cutoff {
+		m.cutoff.Inc()
+	}
 	for i := range res.Subdomains {
 		sub := &res.Subdomains[i]
 		for _, check := range []SchemeCheck{sub.HTTPS, sub.HTTP} {
+			if check.ErrClass == ErrCutoff {
+				m.cutSkip.Inc()
+				continue
+			}
 			if check.ErrClass != ErrNone {
 				m.errors.WithLabelValues(metrics.StageHTTP, check.ErrClass.String()).Inc()
 			}

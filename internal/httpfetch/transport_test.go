@@ -21,9 +21,11 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -785,6 +787,9 @@ func TestFetchConnectionRefused(t *testing.T) {
 	if IsTimeout(err) {
 		t.Errorf("отказ соединения (RST) не таймаут: %v", err)
 	}
+	if !IsConnectFailure(err) {
+		t.Errorf("отказ соединения (RST) не распознан как отказ connect-фазы (T-164): %v", err)
+	}
 	if !strings.Contains(err.Error(), "gone.example.net") {
 		t.Errorf("ошибка без контекста запроса: %v", err)
 	}
@@ -855,6 +860,63 @@ func TestIsTimeout(t *testing.T) {
 	}
 	if IsTimeout(nil) {
 		t.Error("nil — не таймаут")
+	}
+}
+
+// dialRefusedErr — ошибка connect-фазы реального диала: RST на SYN.
+func dialRefusedErr() error {
+	return &net.OpError{
+		Op: "dial", Net: "tcp",
+		Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1).To4(), Port: 80},
+		Err:  &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED},
+	}
+}
+
+// dialTimeoutErr — connect-таймаут реального диала: дедлайн попытки.
+func dialTimeoutErr() error {
+	return &net.OpError{
+		Op: "dial", Net: "tcp",
+		Addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1).To4(), Port: 443},
+		Err:  os.ErrDeadlineExceeded,
+	}
+}
+
+// TestIsConnectFailure — распознавание отказов connect-фазы (dead-host
+// cutoff, T-164): только dial-OpError с ECONNREFUSED или таймаутом;
+// прочие слои и обёртки цепочки — нет.
+func TestIsConnectFailure(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"refused", dialRefusedErr(), true},
+		{"connect-таймаут (дедлайн диала)", dialTimeoutErr(), true},
+		{"connect-таймаут (ETIMEDOUT)", &net.OpError{
+			Op: "dial", Net: "tcp",
+			Addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 2).To4(), Port: 80},
+			Err:  &os.SyscallError{Syscall: "connect", Err: syscall.ETIMEDOUT},
+		}, true},
+		{"обёртка Fetch", fmt.Errorf("httpfetch: GET https://x.example/: %w", dialRefusedErr()), true},
+		{"обёртка гонки адресов", fmt.Errorf("httpfetch: недоступны все 2 адресов: %w", dialTimeoutErr()), true},
+		{"отмена в фазе диала", &net.OpError{
+			Op: "dial", Net: "tcp",
+			Addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 3).To4(), Port: 80},
+			Err:  context.Canceled,
+		}, false},
+		{"refused на чтении (соединение было)", &net.OpError{
+			Op: "read", Net: "tcp",
+			Addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 4).To4(), Port: 80},
+			Err:  &os.SyscallError{Syscall: "read", Err: syscall.ECONNREFUSED},
+		}, false},
+		{"таймаут без диала (заголовки/общий)", context.DeadlineExceeded, false},
+		{"обычная ошибка", errors.New("connection refused (текстом)"), false},
+	}
+	for _, tc := range cases {
+		if got := IsConnectFailure(tc.err); got != tc.want {
+			t.Errorf("%s: IsConnectFailure = %v, want %v (%v)", tc.name, got, tc.want, tc.err)
+		}
 	}
 }
 

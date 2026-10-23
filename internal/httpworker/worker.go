@@ -36,6 +36,13 @@
 // критерия возврата task_concurrency 256; мягкий потолок кучи
 // http.mem_limit (cmd/http-worker) удерживает anon ниже MemoryHigh
 // юнита вместо reclaim-штормов ядра.
+//
+// Dead-host cutoff (T-164): apex и www, не прошедшие connect-фазу
+// (connection refused или connect-таймаут по обоим протоколам),
+// завершают задачу без проверки остальных субдоменов — мёртвые хосты
+// массовых зон перестают жечь слоты таймаутным хвостом (замер
+// docs/load-measurements.md §12: mean 11.5 с при транспорте
+// 0.54 с/запрос). Конфиг — http.dead_host_cutoff.
 package httpworker
 
 import (
@@ -114,6 +121,16 @@ const (
 	// полёте (результат такой проверки всё равно отбрасывается — см.
 	// ProcessDomain).
 	ErrNetwork ErrorClass = 5
+	// ErrCutoff — проверка не выполнялась: задача завершена dead-host
+	// cutoff (T-164) — apex и www упали на connect-фазе (отказ или
+	// connect-таймаут соединения по обоим протоколам), остальные
+	// субдомены не проверялись. Класс ставится только синтетическим
+	// проверкам пропущенных субдоменов (workerSkipSubdomain): это не
+	// ошибка сети и не итог проверки — в subdomain_results класс не
+	// попадает (пропущенный субдомен записей не создаёт, §8), temp_error
+	// не даёт (IsTemp false — повтор эпизода решают таймауты apex/www,
+	// а не cutoff).
+	ErrCutoff ErrorClass = 6
 )
 
 // String возвращает имя класса для логов.
@@ -131,6 +148,8 @@ func (c ErrorClass) String() string {
 		return "body"
 	case ErrNetwork:
 		return "network"
+	case ErrCutoff:
+		return "cutoff"
 	default:
 		return fmt.Sprintf("ErrorClass(%d)", int16(c))
 	}
@@ -354,6 +373,14 @@ type SchemeCheck struct {
 	// при Available=true). ErrText — исходный текст для логов и разбора.
 	ErrClass ErrorClass
 	ErrText  string
+	// DeadDial — проверка упала на connect-фазе стартового хоста:
+	// connection refused или connect-таймаут до первого ответа цепочки
+	// (httpfetch.IsConnectFailure; выполненная часть редиректов пуста —
+	// сбой на первом запросе к своему хосту, не на хопе редиректа,
+	// T-164). Сигнатура dead-host cutoff: соединения с хостом нет на
+	// уровне TCP — не сбой после установки (TLS, заголовки, тело — там
+	// соединение уже было). Доступной проверке не бывает.
+	DeadDial bool
 	// storeErr — сбой раннего Put, не являющийся паузой записи контента
 	// (T-147): странице не сопоставить ни «сохранено», ни «пропущено» —
 	// эпизод честно падает (ProcessDomain возвращает ошибку, повторная
@@ -451,6 +478,15 @@ type DomainResult struct {
 	Name     string
 	// Subdomains — порядок задачи q:http.
 	Subdomains []SubdomainResult
+	// Cutoff — задача завершена dead-host cutoff (T-164): apex и www
+	// упали на connect-фазу по обоим протоколам, прочие субдомены не
+	// проверялись (их синтетические проверки — класс ErrCutoff; записей
+	// нет, §8). Наблюдаемость: бит dead_host_cutoff в domains.flags
+	// (запись результата T-058), счётчики
+	// crawler_http_dead_host_cutoff_* (metrics.go) и лог воркера — по
+	// ним строится контрольная выборка ложных cutoff-ов (критерий T-164:
+	// доля < 1%, повторная полная проверка cutoff-доменов).
+	Cutoff bool
 	// puts — реестр ранних Put задачи (T-147, не для потребителя):
 	// заполняется ProcessDomain, ContentSaver.Save сверяет его с
 	// записями — ссылки, не ставшие строками, снимаются Delete.
@@ -586,6 +622,16 @@ type Options struct {
 	// PerDomain — параллельных проверок (субдомен × протокол) внутри
 	// задачи домена; 0 — DefaultPerDomain. Конфиг: http.task_per_domain.
 	PerDomain int
+	// DeadHostCutoff — dead-host cutoff (T-164): apex и www, не прошедшие
+	// connect-фазу (connection refused или connect-таймаут — оба
+	// протокола), завершают задачу без проверки остальных субдоменов:
+	// мёртвые хосты массовых зон перестают жечь слоты таймаутным хвостом
+	// (замер §12: mean 11.5 с при транспорте 0.54 с/запрос, 60% задач в
+	// бакете 10–30 с). Записи пропущенных субдоменов — по §8 («нет
+	// ответа»: записей нет), их проверки — синтетический класс ErrCutoff.
+	// false — прежнее поведение: все субдомены задачи проверяются.
+	// Конфиг: http.dead_host_cutoff.
+	DeadHostCutoff bool
 	// Store — хранилище контента для раннего сохранения тел (T-147):
 	// каждая скачанная страница уходит в Put по хэшу сразу по получении
 	// и не удерживается в памяти слота (дедупликация алиасов идёт по
@@ -730,6 +776,10 @@ func workerPrepareTask(task queue.HTTPTask) ([]workerSub, error) {
 // ProcessDomain обрабатывает задачу q:http целиком (ТЗ 5.5 пп. 1, 6, §7):
 // проверки субдоменов по обоим протоколам параллельно (пул PerDomain) с
 // общим кэшем итоговых URL → вариант-логика (T-054) → алиасы (T-055).
+// При включённом dead-host cutoff (Options.DeadHostCutoff, T-164) проверки
+// идут двумя волнами: apex и www — первая волна, мёртвая connect-фаза
+// обоих по обоим протоколам (DeadDial) завершает задачу без проверки
+// остальных субдоменов (записи — по §8, наблюдаемость — Cutoff/ErrCutoff).
 // Ошибки отдельных проверок остаются в их результатах и не роняют домен
 // (§8); ошибка возврата — только негодная задача или отмена ctx (эпизод не
 // завершён, доставка q:http не подтверждается и повторится, ТЗ 3.4).
@@ -752,7 +802,10 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 	// поля SubdomainResult — разные ячейки памяти, гонки нет.
 	sem := make(chan struct{}, w.opt.PerDomain)
 	var wg sync.WaitGroup
-	for i, sub := range subs {
+	// launch — запускает проверки субдомена задачи (https и http) в пуле;
+	// единственная точка запуска — работает и одной волной (cutoff
+	// выключен), и двумя (голова apex/www → хвост, T-164).
+	launch := func(i int, sub workerSub) {
 		res.Subdomains[i] = SubdomainResult{
 			SubdomainID: sub.id,
 			Label:       sub.label,
@@ -776,7 +829,36 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 			*dst = *w.checkScheme(ctx, sub.host, sub.addrs, model.SchemeHTTP, cache)
 		}(&res.Subdomains[i].HTTP, sub)
 	}
-	wg.Wait()
+
+	if w.opt.DeadHostCutoff {
+		// Две волны (T-164): apex и www летят первыми — их итог решает,
+		// проверять ли остальных. Мёртвая connect-фаза обоих по обоим
+		// протоколам — сигнатура мёртвого хоста: остальные субдомены не
+		// проверяются, задача завершается с имеющимся результатом.
+		head, rest := workerCutoffSplit(subs)
+		for _, i := range head {
+			launch(i, subs[i])
+		}
+		wg.Wait()
+		if workerDeadHostHead(res, head) && len(rest) > 0 {
+			res.Cutoff = true
+			for _, i := range rest {
+				workerSkipSubdomain(&res.Subdomains[i], subs[i])
+			}
+			w.opt.log().Info("dead-host cutoff: apex и www не прошли connect-фазу — субдомены не проверяются",
+				"domain", task.Name, "skipped_subdomains", len(rest), "skipped_checks", 2*len(rest))
+		} else {
+			for _, i := range rest {
+				launch(i, subs[i])
+			}
+			wg.Wait()
+		}
+	} else {
+		for i := range subs {
+			launch(i, subs[i])
+		}
+		wg.Wait()
+	}
 
 	// Отмена/дедлайн — эпизод не завершён: результат с провалившимися
 	// проверками выглядел бы «веб молчит» и дал бы ложный no_http;
@@ -878,6 +960,74 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 	return res, nil
 }
 
+// workerCutoffHeadLabel — головной субдомен dead-host cutoff (T-164):
+// апекс (метка "") и www — главные имена сайта. Регистр DNS незначим —
+// сравнение без учёта регистра (метки задачи уже нижний регистр, сверка
+// страхует прямые вызовы ProcessDomain).
+func workerCutoffHeadLabel(label string) bool {
+	return label == "" || strings.EqualFold(label, "www")
+}
+
+// workerCutoffSplit делит субдомены задачи на голову (апекс и www) и
+// хвост (остальные) для dead-host cutoff (T-164): голова проверяется
+// первой волной пула, хвост — второй либо не проверяется вовсе.
+// Порядок внутри частей — порядок задачи q:http.
+func workerCutoffSplit(subs []workerSub) (head, rest []int) {
+	head = make([]int, 0, 2)
+	for i := range subs {
+		if workerCutoffHeadLabel(subs[i].label) {
+			head = append(head, i)
+		}
+	}
+	rest = make([]int, 0, len(subs)-len(head))
+	for i := range subs {
+		if !workerCutoffHeadLabel(subs[i].label) {
+			rest = append(rest, i)
+		}
+	}
+	return head, rest
+}
+
+// workerDeadHostHead — сигнатура мёртвого хоста (T-164): в задаче есть
+// ОБА головных имени (ровно два — дубли меток задача не содержит) и
+// каждая проверка головы (https и http) завершилась отказом connect-фазы
+// (DeadDial): оба главных хоста TCP-мёртвы по обоим протоколам — жечь
+// слоты задачи на остальных субдоменах бессмысленно. Любой итог кроме
+// мёртвого диала (живая проверка, TLS-сбой, таймаут заголовков/общий,
+// лимит редиректов) снимает сигнатуру — домен проверяется целиком.
+func workerDeadHostHead(res *DomainResult, head []int) bool {
+	if len(head) != 2 {
+		return false // нет пары апекс+www — сигнатура не собрана
+	}
+	for _, i := range head {
+		sub := &res.Subdomains[i]
+		if !sub.HTTPS.DeadDial || !sub.HTTP.DeadDial {
+			return false
+		}
+	}
+	return true
+}
+
+// workerSkipSubdomain заполняет результат субдомена, не проверявшегося
+// из-за dead-host cutoff (T-164): заголовок задачи (идентичность,
+// адреса DNS-этапа) сохраняется, проверки — синтетические класса
+// ErrCutoff (наблюдаемость: Episode считает пропущенные проверки
+// отдельным счётчиком, текст — причина), записей нет — в точности как у
+// субдомена, чьи проверки прошли и промолчали (§8: оба протокола
+// недоступны → записей нет; вклад в статус домена — решает агрегатор
+// T-058 по выполненным проверкам apex/www).
+func workerSkipSubdomain(dst *SubdomainResult, sub workerSub) {
+	const note = "dead-host cutoff (T-164): apex и www не прошли connect-фазу — субдомен не проверялся"
+	dst.SubdomainID = sub.id
+	dst.Label = sub.label
+	dst.Hostname = sub.host
+	dst.Addrs = sub.addrs
+	dst.CNAME = sub.cname
+	dst.HTTPS = SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrCutoff, ErrText: note}
+	dst.HTTP = SchemeCheck{Scheme: model.SchemeHTTP, ErrClass: ErrCutoff, ErrText: note}
+	dst.Records = nil
+}
+
 // workerHashBytes — хэш как срез для AliasInput.ContentHash (nil — без
 // контента, контракт T-055); копия — запись в результате остаётся владыкой.
 func workerHashBytes(h *content.Hash) []byte {
@@ -947,6 +1097,12 @@ func (w *Worker) checkScheme(
 		if chain != nil {
 			check.Redirects = chain.Chain // выполненная часть (T-048)
 		}
+		// Мёртвый connect стартового хоста (T-164): отказ connect-фазы И
+		// ни одного завершённого хода цепочки — до TCP не дошёл первый
+		// запрос к своему хосту. Отказ диала хоста редиректа (выполненная
+		// часть не пуста) сигнатурой не считается: стартовый хост отвечал,
+		// пала цель перехода.
+		check.DeadDial = len(check.Redirects) == 0 && httpfetch.IsConnectFailure(err)
 		return check
 	}
 	if chain == nil || chain.Result == nil {

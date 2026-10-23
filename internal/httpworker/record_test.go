@@ -119,6 +119,8 @@ type recordFakeDomain struct {
 	queuedAt     *time.Time
 	lastChecked  bool
 	tempAttempts int16
+	cutoff       bool // бит dead_host_cutoff последнего эпизода (T-164)
+	flags        model.Flags
 }
 
 // recordFakeRow — строка subdomain_results: колонки INSERT-пачки.
@@ -265,6 +267,7 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		zone := args[0].(int16)
 		id := args[1].(int64)
 		status := model.Status(args[2].(int16))
+		cutoff := args[3].(bool) // бит dead_host_cutoff (T-164)
 		key := recordDomainKey{zone: zone, id: id}
 		d, ok := t.pool.domains[key]
 		if !ok || d.status == model.StatusDeleted {
@@ -279,6 +282,14 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		} else {
 			d.tempAttempts = 0
 		}
+		// CASE flags из recordDomainSQL (T-164): cutoff-эпизод ставит
+		// бит, обычный снимает; прочие биты не трогает.
+		if cutoff {
+			d.flags.Set(model.FlagDeadHostCutoff)
+		} else {
+			d.flags.Clear(model.FlagDeadHostCutoff)
+		}
+		d.cutoff = d.flags.IsDeadHostCutoff()
 		t.j.record(recordEvDomains)
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	case recordInsertSQL:
@@ -870,6 +881,47 @@ func TestRecordStatuses(t *testing.T) {
 			t.Fatalf("публикаций %d — публиковать нечего", got)
 		}
 	})
+}
+
+// TestRecordCutoffFlag — бит dead_host_cutoff последнего эпизода (T-164):
+// cutoff-результат ставит бит, обычный снимает (контрольная выборка ложных
+// cutoff-ов выбирает домены по маске бита); прочие биты не затрагиваются.
+func TestRecordCutoffFlag(t *testing.T) {
+	pool := newRecordFakePool()
+	key := recordDomainKey{zone: 7, id: 92}
+	dom := pool.recordSeedDomain(key.zone, key.id, model.StatusNew, 0)
+	dom.flags.Set(model.FlagRenderPending) // чужой бит обязан уцелеть
+	q := &recordFakeQueue{j: pool.j}
+
+	cut := recordSilentResult(false)
+	cut.Cutoff = true
+	if _, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), cut); err != nil {
+		t.Fatalf("RecordAndPublish (cutoff): %v", err)
+	}
+	if !dom.cutoff || !dom.flags.IsDeadHostCutoff() {
+		t.Fatalf("после cutoff-эпизода бит dead_host_cutoff не стоит: flags=%s", dom.flags)
+	}
+	if !dom.flags.IsRenderPending() {
+		t.Fatalf("CASE flags снял чужой бит render_pending: flags=%s", dom.flags)
+	}
+
+	// Обычный эпизод (полная проверка при перепроверке T-030) снимает бит.
+	full := recordSilentResult(false)
+	if _, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), full); err != nil {
+		t.Fatalf("RecordAndPublish (полный эпизод): %v", err)
+	}
+	if dom.cutoff || dom.flags.IsDeadHostCutoff() {
+		t.Fatalf("после полного эпизода бит dead_host_cutoff стоит: flags=%s", dom.flags)
+	}
+	if !dom.flags.IsRenderPending() {
+		t.Fatalf("CASE flags снял чужой бит render_pending: flags=%s", dom.flags)
+	}
+
+	// SQL-контракт: бит и маска — литералами модели.
+	if !strings.Contains(recordDomainSQL, fmt.Sprintf("(t.flags | %d)::int2", int16(model.FlagDeadHostCutoff))) ||
+		!strings.Contains(recordDomainSQL, fmt.Sprintf("(t.flags & %d)::int2", int16(^int16(model.FlagDeadHostCutoff)))) {
+		t.Fatalf("recordDomainSQL без CASE битa dead_host_cutoff (T-164):\n%s", recordDomainSQL)
+	}
 }
 
 // --- охрана deleted (§8/§13.1) ----------------------------------------------

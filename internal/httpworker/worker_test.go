@@ -13,16 +13,20 @@ package httpworker
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -710,6 +714,288 @@ func TestWorkerAllFailedNoHTTP(t *testing.T) {
 	}
 	if !res.AnyTimeout() {
 		t.Error("таймаут-класс не виден в агрегате")
+	}
+}
+
+// --- dead-host cutoff (T-164) --------------------------------------------------
+
+// workerDialRefusedErr — ошибка connect-фазы в том виде, в каком её отдаёт
+// реальный диал net.Dialer (IsConnectFailure различает по
+// *net.OpError{Op:"dial"}): RST на SYN — порт закрыт.
+func workerDialRefusedErr() error {
+	return &net.OpError{
+		Op: "dial", Net: "tcp",
+		Addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 10).To4(), Port: 80},
+		Err:  &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED},
+	}
+}
+
+// workerDialTimeoutErr — connect-таймаут реального диала: дедлайн попытки
+// (poll.ErrDeadlineExceeded, net.Error с Timeout()).
+func workerDialTimeoutErr() error {
+	return &net.OpError{
+		Op: "dial", Net: "tcp",
+		Addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 11).To4(), Port: 443},
+		Err:  os.ErrDeadlineExceeded,
+	}
+}
+
+// workerDeadDialScript — сценарий «мёртвая голова»: apex и www — отказ
+// connect-фазы на обоих протоколах; alive — живая страница для субдомена,
+// который cutoff обязан оставить без проверки.
+func workerDeadDialScript(deadErr func() error, alive string) map[string]*workerPageScript {
+	if deadErr == nil {
+		deadErr = workerDialRefusedErr
+	}
+	script := map[string]*workerPageScript{}
+	for _, host := range []string{"example.net", "www.example.net"} {
+		script[host] = &workerPageScript{err: deadErr()}
+	}
+	if alive != "" {
+		script[alive] = &workerPageScript{status: 200, body: "<html>живой субдомен с обычным текстом страницы</html>"}
+	}
+	return script
+}
+
+// TestWorkerDeadHostCutoff — сигнатура мёртвого хоста (оба головных имени
+// упали на connect-фазе по обоим протоколам) завершает задачу без проверки
+// остальных субдоменов: их сети не касаются, проверки — синтетический
+// ErrCutoff (наблюдаемость), записей нет (§8), домен — no_http; вариант с
+// connect-таймаутами сохраняет temp_error-семантику (AnyTimeout).
+func TestWorkerDeadHostCutoff(t *testing.T) {
+	t.Run("refused — no_http", func(t *testing.T) {
+		fetch, log := workerFakeFetch(workerDeadDialScript(nil, "blog.example.net"))
+		w := workerWorker(t, fetch, func(o *Options) { o.DeadHostCutoff = true })
+		res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+			ZoneID: 4, DomainID: 21, Name: "example.net",
+			Subdomains: []queue.HTTPSubdomain{
+				workerSubMsg(0, ""), workerSubMsg(1, "www"),
+				workerSubMsg(3, "blog"), workerSubMsg(4, "shop"),
+			},
+		})
+		if err != nil {
+			t.Fatalf("ProcessDomain: %v", err)
+		}
+		if !res.Cutoff {
+			t.Fatal("cutoff не сработал: оба головных хоста TCP-мёртвы")
+		}
+		// Сеть: только голова (4 проверки), хвост не проверялся.
+		for host, want := range map[string]int{
+			"example.net": 2, "www.example.net": 2,
+			"blog.example.net": 0, "shop.example.net": 0,
+		} {
+			if got := log.countHost(host); got != want {
+				t.Errorf("загрузок %s: %d, ожидалось %d", host, got, want)
+			}
+		}
+		// Голова: настоящий класс ошибки (refused — network) + признак
+		// мёртвого диала.
+		for i := 0; i < 2; i++ {
+			sub := &res.Subdomains[i]
+			for _, c := range []SchemeCheck{sub.HTTPS, sub.HTTP} {
+				if c.Available || c.DeadDial != true || c.ErrClass != ErrNetwork {
+					t.Errorf("голова %q %v: available=%v deadDial=%v класс=%v, ожидалось false/true/network",
+						sub.Hostname, c.Scheme, c.Available, c.DeadDial, c.ErrClass)
+				}
+			}
+		}
+		// Хвост: синтетические ErrCutoff, идентичность и адреса DNS-этапа
+		// сохранены, записей нет (§8).
+		for i := 2; i < len(res.Subdomains); i++ {
+			sub := &res.Subdomains[i]
+			if sub.SubdomainID == 0 || sub.Hostname == "" || len(sub.Addrs) == 0 {
+				t.Fatalf("хвост #%d: идентичность потеряна: %+v", i, sub)
+			}
+			for _, c := range []SchemeCheck{sub.HTTPS, sub.HTTP} {
+				if c.ErrClass != ErrCutoff || c.ErrText == "" || c.Available || c.DeadDial {
+					t.Errorf("хвост %q %v: класс=%v available=%v deadDial=%v, ожидался cutoff/false/false",
+						sub.Hostname, c.Scheme, c.ErrClass, c.Available, c.DeadDial)
+				}
+			}
+			if len(sub.Records) != 0 {
+				t.Errorf("хвост %q: записи пропущенного субдомена: %d", sub.Hostname, len(sub.Records))
+			}
+		}
+		if res.HasRecords() {
+			t.Error("записи у целиком мёртвого домена")
+		}
+		if res.AnyTimeout() {
+			t.Error("refused — не таймаут, temp_error быть не должно")
+		}
+	})
+
+	t.Run("connect-таймауты — temp_error-семантика сохранена", func(t *testing.T) {
+		fetch, _ := workerFakeFetch(workerDeadDialScript(workerDialTimeoutErr, "blog.example.net"))
+		w := workerWorker(t, fetch, func(o *Options) { o.DeadHostCutoff = true })
+		res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+			ZoneID: 4, DomainID: 22, Name: "example.net",
+			Subdomains: []queue.HTTPSubdomain{
+				workerSubMsg(0, ""), workerSubMsg(1, "www"), workerSubMsg(3, "blog"),
+			},
+		})
+		if err != nil {
+			t.Fatalf("ProcessDomain: %v", err)
+		}
+		if !res.Cutoff || res.HasRecords() {
+			t.Fatalf("cutoff=%v записей=%d, ожидалось true/0", res.Cutoff, res.RecordCount())
+		}
+		apex := &res.Subdomains[0]
+		if apex.HTTPS.ErrClass != ErrTimeout || !apex.HTTPS.DeadDial {
+			t.Errorf("apex https: класс=%v deadDial=%v, ожидался timeout/true",
+				apex.HTTPS.ErrClass, apex.HTTPS.DeadDial)
+		}
+		// Таймауты выполненных проверок решают повтор эпизода (T-031),
+		// ErrCutoff хвоста temp_error не даёт.
+		if !res.AnyTimeout() {
+			t.Error("connect-таймауты головы не видны в AnyTimeout (temp_error)")
+		}
+	})
+}
+
+// TestWorkerDeadHostCutoffStrict — сигнатура строгая: любой итог головы
+// кроме мёртвого диала (живая проверка, TLS-сбой после connect, таймаут
+// заголовков, падение хоста редиректа) или отсутствие www в задаче —
+// домен проверается целиком, хвост сеть видит.
+func TestWorkerDeadHostCutoffStrict(t *testing.T) {
+	alive := "<html>страница живого апекса с достаточным текстом</html>"
+	cases := []struct {
+		name   string
+		script map[string]*workerPageScript
+		// heads: если true — проверяется и то, что признак DeadDial не
+		// ставится чужим классам (см. ветку редиректа).
+		checkApexDeadDialFalse bool
+	}{
+		{
+			name: "apex https жив — www мёртв не сигнатура",
+			script: func() map[string]*workerPageScript {
+				s := workerDeadDialScript(nil, "blog.example.net")
+				s["example.net"] = &workerPageScript{status: 200, body: alive}
+				return s
+			}(),
+		},
+		{
+			name: "TLS-сбой после connect — соединение было",
+			script: func() map[string]*workerPageScript {
+				s := workerDeadDialScript(nil, "blog.example.net")
+				s["https://example.net/"] = &workerPageScript{err: x509.UnknownAuthorityError{}}
+				return s
+			}(),
+			checkApexDeadDialFalse: true,
+		},
+		{
+			name: "таймаут заголовков — connect прошёл",
+			script: func() map[string]*workerPageScript {
+				s := workerDeadDialScript(nil, "blog.example.net")
+				s["example.net"] = &workerPageScript{err: workerTimeoutErr{}}
+				return s
+			}(),
+			checkApexDeadDialFalse: true,
+		},
+		{
+			name: "падение хоста редиректа — выполненная часть цепочки не пуста",
+			script: func() map[string]*workerPageScript {
+				s := workerDeadDialScript(nil, "blog.example.net")
+				// apex https ответил 301 и вёл на мёртвый хост: сбой
+				// диала — цель перехода, не стартовый хост.
+				s["https://example.net/"] = &workerPageScript{
+					err:   workerDialRefusedErr(),
+					steps: []httpfetch.RedirectStep{{URL: "https://example.net/", Status: 301}},
+				}
+				return s
+			}(),
+			checkApexDeadDialFalse: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fetch, log := workerFakeFetch(tc.script)
+			w := workerWorker(t, fetch, func(o *Options) { o.DeadHostCutoff = true })
+			res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+				ZoneID: 4, DomainID: 23, Name: "example.net",
+				Subdomains: []queue.HTTPSubdomain{
+					workerSubMsg(0, ""), workerSubMsg(1, "www"), workerSubMsg(3, "blog"),
+				},
+			})
+			if err != nil {
+				t.Fatalf("ProcessDomain: %v", err)
+			}
+			if res.Cutoff {
+				t.Error("cutoff сработал без полной сигнатуры")
+			}
+			if got := log.countHost("blog.example.net"); got != 2 {
+				t.Errorf("загрузок blog: %d, ожидалось 2 — хвост обязан проверяться", got)
+			}
+			if tc.checkApexDeadDialFalse && res.Subdomains[0].HTTPS.DeadDial {
+				t.Error("DeadDial у проверки, чей сбой не connect-фаза стартового хоста")
+			}
+		})
+	}
+
+	t.Run("www нет в задаче — сигнатура не собрана", func(t *testing.T) {
+		script := workerDeadDialScript(nil, "blog.example.net")
+		delete(script, "www.example.net")
+		fetch, log := workerFakeFetch(script)
+		w := workerWorker(t, fetch, func(o *Options) { o.DeadHostCutoff = true })
+		res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+			ZoneID: 4, DomainID: 24, Name: "example.net",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(3, "blog")},
+		})
+		if err != nil {
+			t.Fatalf("ProcessDomain: %v", err)
+		}
+		if res.Cutoff {
+			t.Error("cutoff без www в задаче")
+		}
+		if got := log.countHost("blog.example.net"); got != 2 {
+			t.Errorf("загрузок blog: %d, ожидалось 2", got)
+		}
+	})
+}
+
+// TestWorkerDeadHostCutoffDisabled — выключенный флаг: прежнее поведение,
+// мёртрые apex+www не мешают проверке остальных субдоменов.
+func TestWorkerDeadHostCutoffDisabled(t *testing.T) {
+	fetch, log := workerFakeFetch(workerDeadDialScript(nil, "blog.example.net"))
+	w := workerWorker(t, fetch, nil) // DeadHostCutoff не задан — выключен
+	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+		ZoneID: 4, DomainID: 25, Name: "example.net",
+		Subdomains: []queue.HTTPSubdomain{
+			workerSubMsg(0, ""), workerSubMsg(1, "www"), workerSubMsg(3, "blog"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+	if res.Cutoff {
+		t.Error("cutoff при выключенном флаге")
+	}
+	if got := log.countHost("blog.example.net"); got != 2 {
+		t.Errorf("загрузок blog: %d, ожидалось 2 (проверка как раньше)", got)
+	}
+	blog := &res.Subdomains[2]
+	if !blog.HTTPS.Available || blog.HTTPS.ErrClass != ErrNone || len(blog.Records) != 1 {
+		t.Errorf("blog: available=%v класс=%v записей=%d — живой субдомен обязан проверяться",
+			blog.HTTPS.Available, blog.HTTPS.ErrClass, len(blog.Records))
+	}
+}
+
+// TestWorkerDeadHostCutoffEmptyTail — задача из одних apex+www: проверять
+// нечего, cutoff не срабатывает (экономии нет — признак честно не ставится).
+func TestWorkerDeadHostCutoffEmptyTail(t *testing.T) {
+	fetch, log := workerFakeFetch(workerDeadDialScript(nil, ""))
+	w := workerWorker(t, fetch, func(o *Options) { o.DeadHostCutoff = true })
+	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+		ZoneID: 4, DomainID: 26, Name: "example.net",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(1, "www")},
+	})
+	if err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+	if res.Cutoff {
+		t.Error("cutoff без хвоста — экономить нечего")
+	}
+	if got := log.countHost("example.net") + log.countHost("www.example.net"); got != 4 {
+		t.Errorf("загрузок головы: %d, ожидалось 4", got)
 	}
 }
 

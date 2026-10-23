@@ -183,6 +183,8 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_laravel_appeared_total` / `crawler_laravel_lost_total` | gauge | — | monitor (T-118) | кумулятивные появления/исчезновения строк `laravel_domains` (журнал `laravel_history`, свежие эпизоды HTTP); монотонны — counter-семантика |
 | `crawler_redis_memory_bytes` | gauge | `kind` | monitor (T-154) | тот же проход, что `crawler_redis_memory_ratio`: `kind=used` — `used_memory`, `kind=max` — `maxmemory` (0 — потолка нет) из `INFO memory` |
 | `crawler_http_response_seconds` | histogram | — | http-worker | каждая доступная некэшированная проверка: время до заголовков итоговой страницы (ResponseMS, ТЗ 5.5 п. 7); кэш-попадания сети не касаются |
+| `crawler_http_dead_host_cutoff_tasks_total` | counter | — | http-worker (T-164) | задачи q:http, завершённые dead-host cutoff: apex и www упали на connect-фазе (connection refused/connect-таймаут, оба протокола), остальные субдомены не проверялись; контроль критерия mean задачи ≤ 7 с — `crawler_stage_seconds{stage="http"}` |
+| `crawler_http_dead_host_cutoff_skipped_checks_total` | counter | — | http-worker (T-164) | проверки (субдомен × протокол), не выполненные из-за cutoff, — сэкономленный пул задачи; ошибками этапа не считаются (`crawler_stage_errors_total` серии `cutoff` не имеет); доля ложных cutoff (<1 %, критерий) меряется контрольной выборкой по биту `dead_host_cutoff` в `domains.flags` |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
 | `crawler_render_tarpit_finalized_total` | counter | — | render-worker (T-148) | запись финализирована без рендера по исчерпании `render.timeout_attempts`: итог — сырой HTML HTTP-фазы, публикация q:analyze, XACK (в q:dead тарпиты не попадают); рост — доля таймаут-тарпитов на рендере |
 | `crawler_render_cert_finalized_total` | counter | — | render-worker (T-159) | запись финализирована без рендера по постоянной ошибке TLS-сертификата хоста (`net::ERR_CERT_AUTHORITY_INVALID`/`ERR_CERT_COMMON_NAME_INVALID`, с T-172 и `ERR_CERT_DATE_INVALID` — замер: 0 успешных ретраев из 321), с первой доставки: cert-класс не жжёт попытки доставок и не попадает в q:dead; рост при нулевом приросте q:dead — политика работает |
@@ -361,6 +363,22 @@ T-161, замер §12: на 47 млн строк проход 17+ с кажды
   проверок (`http.task_per_domain`; субдомены одного домена живут на
   одних и тех же IP — реальный параллелизм подключения к одному IP уже
   ограничен per-IP семафором 3–4, ТЗ 5.5);
+- dead-host cutoff (T-164, `http.dead_host_cutoff`): при включённом
+  флаге проверки идут двумя волнами — apex и www первыми, и если оба
+  упали на connect-фазе (connection refused или connect-таймаут по
+  обоим протоколам — таймауты именно connect, не TLS/заголовки/общий;
+  падение хоста редиректа не считается), остальные субдомены задачи не
+  проверяются: записи — по §8 («нет ответа»: записей нет), статус
+  домена решают выполненные проверки головы (refused → `no_http`,
+  connect-таймауты → `temp_error` с перепроверкой T-031 — транзиентный
+  ложный cutoff самозалечивается). Наблюдаемость: бит
+  `dead_host_cutoff` в `domains.flags` (ставится/снимается записью
+  результата последнего эпизода), счётчики
+  `crawler_http_dead_host_cutoff_tasks_total` /
+  `crawler_http_dead_host_cutoff_skipped_checks_total` и запись в
+  журнале — контрольная выборка ложных cutoff (повторная полная
+  проверка cutoff-доменов, критерий < 1 %) берётся по ним; выключенный
+  флаг — одна волна пула, прежнее поведение;
 - общий кэш «итоговый URL → результат» в пределах задачи домена
   (ТЗ 5.5 п. 6): итоговый URL каждой завершённой проверки кладётся в
   кэш, стартовый URL каждой следующей сверяется с ним — bare→www после

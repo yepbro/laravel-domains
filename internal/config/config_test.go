@@ -91,6 +91,7 @@ func TestDefault(t *testing.T) {
 		{"http.task_concurrency", c.HTTP.TaskConcurrency, 192},
 		{"http.task_consume", c.HTTP.TaskConsume, 16},
 		{"http.task_per_domain", c.HTTP.TaskPerDomain, 8},
+		{"http.dead_host_cutoff", c.HTTP.DeadHostCutoff, true},
 		{"http.mem_limit", c.HTTP.MemLimit.B(), int64(768 << 20)},
 		{"render.remote_url", c.Render.RemoteURL, ""},
 		{"render.contexts", c.Render.Contexts, 8},
@@ -210,6 +211,7 @@ http:
   task_concurrency: 128
   task_consume: 8
   task_per_domain: 6
+  dead_host_cutoff: false
   mem_limit: "768MiB"
 render:
   remote_url: "ws://10.0.0.9:9222"
@@ -312,6 +314,7 @@ log:
 		{"http.task_concurrency", cfg.HTTP.TaskConcurrency, 128},
 		{"http.task_consume", cfg.HTTP.TaskConsume, 8},
 		{"http.task_per_domain", cfg.HTTP.TaskPerDomain, 6},
+		{"http.dead_host_cutoff", cfg.HTTP.DeadHostCutoff, false},
 		{"http.mem_limit", cfg.HTTP.MemLimit.B(), int64(768 << 20)},
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 4},
@@ -498,6 +501,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_HTTP_TASK_CONCURRENCY":               "96",
 		"CRAWLER_HTTP_TASK_CONSUME":                   "32",
 		"CRAWLER_HTTP_TASK_PER_DOMAIN":                "4",
+		"CRAWLER_HTTP_DEAD_HOST_CUTOFF":               "false",
 		"CRAWLER_HTTP_MEM_LIMIT":                      "512MiB",
 		"CRAWLER_RENDER_REMOTE_URL":                   "ws://10.0.0.9:9222",
 		"CRAWLER_RENDER_CONTEXTS":                     "2",
@@ -591,6 +595,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"http.task_concurrency", cfg.HTTP.TaskConcurrency, 96},
 		{"http.task_consume", cfg.HTTP.TaskConsume, 32},
 		{"http.task_per_domain", cfg.HTTP.TaskPerDomain, 4},
+		{"http.dead_host_cutoff", cfg.HTTP.DeadHostCutoff, false},
 		{"http.mem_limit", cfg.HTTP.MemLimit.B(), int64(512 << 20)},
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 2},

@@ -171,6 +171,53 @@ func TestMetricsEpisode(t *testing.T) {
 	}
 }
 
+// TestMetricsEpisodeCutoff — приборы dead-host cutoff (T-164): задача с
+// признаком Cutoff инкрементирует счётчик cutoff-задач, синтетические
+// ErrCutoff — счётчик сэкономленных проверок; ошибками этапа пропущенные
+// проверки не считаются (серии type=cutoff у crawler_stage_errors_total
+// нет), выполненные проверки головы считаются как обычно.
+func TestMetricsEpisodeCutoff(t *testing.T) {
+	reg := metrics.New("http-worker")
+	m := NewMetrics(reg)
+
+	res := &DomainResult{
+		ZoneID: 4, DomainID: 21, Name: "example.net", Cutoff: true,
+		Subdomains: []SubdomainResult{
+			{
+				SubdomainID: 0, Label: "",
+				HTTPS: SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrNetwork, DeadDial: true},
+				HTTP:  SchemeCheck{Scheme: model.SchemeHTTP, ErrClass: ErrNetwork, DeadDial: true},
+			},
+			{
+				SubdomainID: 1, Label: "www",
+				HTTPS: SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrNetwork, DeadDial: true},
+				HTTP:  SchemeCheck{Scheme: model.SchemeHTTP, ErrClass: ErrNetwork, DeadDial: true},
+			},
+			{
+				SubdomainID: 3, Label: "blog", Hostname: "blog.example.net",
+				HTTPS: SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrCutoff},
+				HTTP:  SchemeCheck{Scheme: model.SchemeHTTP, ErrClass: ErrCutoff},
+			},
+		},
+	}
+	m.Episode(res, 2*time.Second)
+
+	if got := httpMetricValue(t, reg, "crawler_http_dead_host_cutoff_tasks_total", nil); got != 1 {
+		t.Errorf("crawler_http_dead_host_cutoff_tasks_total = %v, want 1", got)
+	}
+	if got := httpMetricValue(t, reg, "crawler_http_dead_host_cutoff_skipped_checks_total", nil); got != 2 {
+		t.Errorf("crawler_http_dead_host_cutoff_skipped_checks_total = %v, want 2", got)
+	}
+	cutLabels := map[string]string{"stage": metrics.StageHTTP, "type": ErrCutoff.String()}
+	if got := httpMetricValue(t, reg, "crawler_stage_errors_total", cutLabels); got != -1 {
+		t.Errorf("crawler_stage_errors_total{type=cutoff} = %v, want серия отсутствует (проверка не выполнялась)", got)
+	}
+	netLabels := map[string]string{"stage": metrics.StageHTTP, "type": ErrNetwork.String()}
+	if got := httpMetricValue(t, reg, "crawler_stage_errors_total", netLabels); got != 4 {
+		t.Errorf("crawler_stage_errors_total{type=network} = %v, want 4 (проверки головы)", got)
+	}
+}
+
 // TestMetricsRunSmoke — приборы инкрементируются типовым путём цикла:
 // доставка q:http → проверки → OnResult → Episode (до XACK).
 func TestMetricsRunSmoke(t *testing.T) {

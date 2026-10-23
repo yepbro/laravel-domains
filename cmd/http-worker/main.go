@@ -287,8 +287,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		Consume:      cfg.HTTP.TaskConsume,
 		PerDomain:    cfg.HTTP.TaskPerDomain,
 		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — не следовать (T-006/T-048)
-		Store:        store,                 // раннее сохранение тел страниц (T-147)
-		Recover:      rel,                   // возврат зависших задач q:http (T-025)
+		// Dead-host cutoff (T-164): мёртвые apex+www не жгут слоты
+		// задачи на субдоменах — http.dead_host_cutoff.
+		DeadHostCutoff: cfg.HTTP.DeadHostCutoff,
+		Store:          store, // раннее сохранение тел страниц (T-147)
+		Recover:        rel,   // возврат зависших задач q:http (T-025)
 		// Темп возврата зависших (T-153): пачка/интервал клейма —
 		// redis.recover_*.
 		RecoverBatch:    cfg.Redis.RecoverBatch,

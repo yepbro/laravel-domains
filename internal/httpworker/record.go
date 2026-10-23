@@ -97,15 +97,23 @@ import (
 var (
 	// recordDomainSQL — итоговый статус эпизода HTTP (alive/no_http/
 	// temp_error, §7), done, сброс lease и счётчика повторов (контракт
-	// T-031). Охрана status <> deleted — §8/§13.1; UPDATE первым шагом
-	// транзакции блокирует строку домена: конкурентные записи эпизода
+	// T-031), бит dead_host_cutoff последнего эпизода (T-164). Охрана
+	// status <> deleted — §8/§13.1; UPDATE первым шагом транзакции
+	// блокирует строку домена: конкурентные записи эпизода
 	// сериализуются, решение об удалении принимается на актуальной
 	// версии строки. Охраны check_state <> done нет — повторная доставка
 	// перезаписывает результат (комментарий файла).
 	recordDomainSQL = "UPDATE domains AS t " +
 		"SET status = $3::int2, " +
 		fmt.Sprintf("temp_attempts = CASE WHEN $3::int2 = %d THEN t.temp_attempts ELSE 0 END, ", int16(model.StatusTempError)) +
-		fmt.Sprintf("check_state = %d, queued_at = NULL, last_checked_at = now() ", int16(model.CheckStateDone)) +
+		fmt.Sprintf("check_state = %d, queued_at = NULL, last_checked_at = now(), ", int16(model.CheckStateDone)) +
+		// Бит dead_host_cutoff (T-164) — признак ПОСЛЕДНЕГО эпизода:
+		// cutoff-эпизод ставит (контрольная выборка ложных cutoff-ов
+		// выбирает домены по маске бита), обычный снимает. Побитовые
+		// операторы PostgreSQL повышают smallint до int — возврат
+		// ::int2 (стиль renderq.go), маска снятия — знаковый ~бита.
+		fmt.Sprintf("flags = CASE WHEN $4::bool THEN (t.flags | %d)::int2 ELSE (t.flags & %d)::int2 END ",
+			int16(model.FlagDeadHostCutoff), int16(^int16(model.FlagDeadHostCutoff))) +
 		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d", int16(model.StatusDeleted))
 
 	// recordDeleteSQL — перезапись результата (§3.5): удаляются все строки
@@ -241,8 +249,9 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Итог домена первым шагом: блокирует строку и решает судьбу записи
-	// (удалённому домену результат не пишется, §8).
-	tag, err := tx.Exec(ctx, recordDomainSQL, res.ZoneID, res.DomainID, int16(status))
+	// (удалённому домену результат не пишется, §8). Четвёртый параметр —
+	// бит dead_host_cutoff последнего эпизода (T-164).
+	tag, err := tx.Exec(ctx, recordDomainSQL, res.ZoneID, res.DomainID, int16(status), res.Cutoff)
 	if err != nil {
 		return false, fmt.Errorf("httpworker: домен %s: запись результата: статус: %w", res.Name, err)
 	}
@@ -319,7 +328,7 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 
 	r.log.Debug("HTTP-результат записан",
 		"domain", res.Name, "status", status.String(), "records", len(batch.zone),
-		"swapped_refs", len(oldHashes),
+		"swapped_refs", len(oldHashes), "cutoff", res.Cutoff,
 		"render_pending", renderPending, "q_render", len(renderKeys))
 	return true, nil
 }

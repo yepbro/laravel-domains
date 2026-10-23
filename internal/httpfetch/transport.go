@@ -52,6 +52,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"crawler/internal/config"
@@ -503,6 +504,26 @@ func IsTimeout(err error) bool {
 		return ne.Timeout()
 	}
 	return errors.Is(err, context.DeadlineExceeded)
+}
+
+// IsConnectFailure классифицирует ошибку загрузки как отказ connect-фазы —
+// установки TCP-соединения (dead-host cutoff, T-164): connection refused
+// (RST на SYN — порт закрыт) или connect-таймаут (SYN без ответа, включая
+// дедлайн контекста запроса, наступивший в фазе диала). Прочие ошибки
+// диала (network unreachable и т. п.) — чаще свойство маршрута краулера,
+// а не хоста, в строгую сигнатуру мёртвого хоста не входят. Не является
+// connect-фазой: TLS-рукопожатие (IsTLSCertError), ожидание заголовков,
+// чтение тела, общий таймаут после установки соединения, резолв хостов
+// редиректа, отказ лимитов (RPS, слоты соединений) — у таких ошибок нет
+// *net.OpError{Op:"dial"} в цепочке. Ошибки диала хостов редиректов от
+// отказа стартового хоста различает потребитель по выполненной части
+// цепочки (T-048: у сбоя первого хода она пуста).
+func IsConnectFailure(err error) bool {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Op != "dial" {
+		return false
+	}
+	return errors.Is(opErr.Err, syscall.ECONNREFUSED) || opErr.Timeout()
 }
 
 // addrsKey — тип ключа ctx для адресов DNS-этапа (не строка: коллизии

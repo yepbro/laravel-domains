@@ -7,8 +7,9 @@ import "testing"
 
 // TestFlagsBitsMatchSchema — биты зафиксированы: бит 0 is_idn и бит 1
 // render_pending — комментарий миграции 000001; бит 2 http_published —
-// T-108 (модель и docs/schema.md; миграций не требует — колонка flags
-// изначально допускает дополнительные биты, ТЗ 6.1 «…»).
+// T-108, бит 3 dead_host_cutoff — T-164 (модель и docs/schema.md;
+// миграций не требует — колонка flags изначально допускает
+// дополнительные биты, ТЗ 6.1 «…»).
 func TestFlagsBitsMatchSchema(t *testing.T) {
 	if FlagIDN != 1 {
 		t.Errorf("FlagIDN = %d, want 1 (бит 0)", int16(FlagIDN))
@@ -18,6 +19,9 @@ func TestFlagsBitsMatchSchema(t *testing.T) {
 	}
 	if FlagHTTPPublished != 4 {
 		t.Errorf("FlagHTTPPublished = %d, want 4 (бит 2, T-108)", int16(FlagHTTPPublished))
+	}
+	if FlagDeadHostCutoff != 8 {
+		t.Errorf("FlagDeadHostCutoff = %d, want 8 (бит 3, T-164)", int16(FlagDeadHostCutoff))
 	}
 }
 
@@ -73,21 +77,27 @@ func TestFlagsTestAnyOf(t *testing.T) {
 func TestFlagsNamedHelpers(t *testing.T) {
 	var f Flags
 	f.Set(FlagIDN)
-	if !f.IsIDN() || f.IsRenderPending() || f.IsHTTPPublished() {
-		t.Errorf("IsIDN/IsRenderPending/IsHTTPPublished = %v/%v/%v, want true/false/false",
-			f.IsIDN(), f.IsRenderPending(), f.IsHTTPPublished())
+	if !f.IsIDN() || f.IsRenderPending() || f.IsHTTPPublished() || f.IsDeadHostCutoff() {
+		t.Errorf("IsIDN/IsRenderPending/IsHTTPPublished/IsDeadHostCutoff = %v/%v/%v/%v, want true/false/false/false",
+			f.IsIDN(), f.IsRenderPending(), f.IsHTTPPublished(), f.IsDeadHostCutoff())
 	}
 	f.Set(FlagRenderPending)
 	f.Clear(FlagIDN)
-	if f.IsIDN() || !f.IsRenderPending() || f.IsHTTPPublished() {
-		t.Errorf("IsIDN/IsRenderPending/IsHTTPPublished = %v/%v/%v, want false/true/false",
-			f.IsIDN(), f.IsRenderPending(), f.IsHTTPPublished())
+	if f.IsIDN() || !f.IsRenderPending() || f.IsHTTPPublished() || f.IsDeadHostCutoff() {
+		t.Errorf("IsIDN/IsRenderPending/IsHTTPPublished/IsDeadHostCutoff = %v/%v/%v/%v, want false/true/false/false",
+			f.IsIDN(), f.IsRenderPending(), f.IsHTTPPublished(), f.IsDeadHostCutoff())
 	}
 	f.Set(FlagHTTPPublished)
 	f.Clear(FlagRenderPending)
-	if f.IsRenderPending() || !f.IsHTTPPublished() {
-		t.Errorf("IsRenderPending/IsHTTPPublished = %v/%v, want false/true",
-			f.IsRenderPending(), f.IsHTTPPublished())
+	if f.IsRenderPending() || !f.IsHTTPPublished() || f.IsDeadHostCutoff() {
+		t.Errorf("IsRenderPending/IsHTTPPublished/IsDeadHostCutoff = %v/%v/%v, want false/true/false",
+			f.IsRenderPending(), f.IsHTTPPublished(), f.IsDeadHostCutoff())
+	}
+	f.Set(FlagDeadHostCutoff)
+	f.Clear(FlagHTTPPublished)
+	if f.IsHTTPPublished() || !f.IsDeadHostCutoff() {
+		t.Errorf("IsHTTPPublished/IsDeadHostCutoff = %v/%v, want false/true",
+			f.IsHTTPPublished(), f.IsDeadHostCutoff())
 	}
 }
 
@@ -103,8 +113,10 @@ func TestFlagsString(t *testing.T) {
 		{FlagHTTPPublished, "http_published"},
 		{FlagIDN | FlagHTTPPublished, "is_idn|http_published"},
 		{FlagIDN | FlagRenderPending | FlagHTTPPublished, "is_idn|render_pending|http_published"},
-		{Flags(1 << 3), "0x8"},                      // неизвестный бит — остаток hex
-		{FlagIDN | Flags(1<<4|1<<5), "is_idn|0x30"}, // именованный + неизвестные
+		{FlagDeadHostCutoff, "dead_host_cutoff"},
+		{FlagIDN | FlagDeadHostCutoff, "is_idn|dead_host_cutoff"},
+		{Flags(1 << 4), "0x10"},                     // неизвестный бит — остаток hex
+		{FlagIDN | Flags(1<<5|1<<6), "is_idn|0x60"}, // именованный + неизвестные
 	}
 	for _, tc := range cases {
 		if got := tc.f.String(); got != tc.want {
