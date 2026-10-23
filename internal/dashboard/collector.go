@@ -47,6 +47,7 @@ import (
 	"crawler/internal/config"
 	"crawler/internal/db"
 	"crawler/internal/metrics"
+	"crawler/internal/queue"
 	"crawler/internal/status"
 )
 
@@ -87,9 +88,18 @@ type CollectorOptions struct {
 	// идёт на base + "/livez" (каркас internal/service, ТЗД §4.3.3).
 	// nil/пусто — секция здоровья «н/д» (Health = nil, не ошибка).
 	Probes map[string]string
-	// QueueWatermark — порог backpressure scheduler.queue_high_watermark
-	// для подсветки очередей (§5.4); 0 — не настроен (гейт отключён).
+	// QueueWatermark — порог backpressure scheduler.queue_high_watermark:
+	// база эффективных порогов подсветки очередей (§5.4); ≤ 0 — гейт
+	// отключён (все пороги 0, подсветки нет). Эффективный порог стрима —
+	// queue.StreamWatermark(Watermark, MaxLen, стрим): не выше половины
+	// предела MAXLEN стрима — тот же единый расчёт, что у гейта
+	// публикации (T-026) и алерта переполнения очередей монитора
+	// (T-080).
 	QueueWatermark int64
+	// QueueMaxLen — предел длины стримов MAXLEN (зеркалит redis.maxlen;
+	// 0 — пределы по стримам политики T-025): нужен для эффективного
+	// порога стрима (см. QueueWatermark).
+	QueueMaxLen int64
 	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 	// Metrics — реестр сервиса (метрики §10); nil — без метрик (шов
@@ -178,9 +188,9 @@ func (c *Collector) Current() *Snapshot {
 func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 	now := c.opt.Now()
 	snap := &Snapshot{
-		Errors:         map[string]string{},
-		BuiltAt:        rfc3339(now),
-		QueueWatermark: c.opt.QueueWatermark, // §5.4: подсветка порога — данные, не секция
+		Errors:          map[string]string{},
+		BuiltAt:         rfc3339(now),
+		QueueWatermarks: c.queueWatermarks(), // §5.4: пороги подсветки — данные, не секция
 	}
 
 	// Зоны (§5.1/§5.3) → зоны + итоги; вход скоростей (pending+queued).
@@ -271,6 +281,27 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 	// секция «н/д» (null), не ошибка.
 	snap.Health = c.probeAll(ctx)
 	return snap
+}
+
+// queueWatermarks — эффективные пороги backpressure рабочих стримов для
+// подсветки очередей (§5.4): queue.StreamWatermark по каждому стриму
+// без q:dead (гейтом не ограничивается — backpressure.go). Тот же
+// единый расчёт, что у гейта публикации (T-026) и алерта переполнения
+// очередей монитора (T-080, T-144): порог стрима не выше половины его
+// предела MAXLEN — после T-141 это разные числа для разных стримов
+// (q:dns — 125 пачек, штучные — 75 000 при дефолтах), поэтому сумма
+// глубин против одного порога больше не осмысленна. Пересчитывается на
+// каждом проходе — снимок честен к текущим значениям опций.
+// Watermark ≤ 0 — все пороги 0 (гейт отключён).
+func (c *Collector) queueWatermarks() map[string]int64 {
+	wm := make(map[string]int64, len(status.Streams))
+	for _, s := range status.Streams {
+		if s == queue.StreamDead {
+			continue
+		}
+		wm[s] = queue.StreamWatermark(c.opt.QueueWatermark, c.opt.QueueMaxLen, s)
+	}
+	return wm
 }
 
 // probeAll — пробы всех сервисов параллельно (§5.8), ответ отсортирован

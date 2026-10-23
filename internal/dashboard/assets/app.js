@@ -58,8 +58,10 @@
     var STREAM_DEAD = 'q:dead';
     var STREAMS = ['q:dns', 'q:http', 'q:render', 'q:analyze', STREAM_DEAD];
 
-    // Порог подсветки очередей: сумма рабочих стримов считается
-    // приближающейся к watermark от 90 % (§5.4 «при приближении»).
+    // Порог подсветки очередей: глубина рабочего стрима считается
+    // приближающейся к его эффективному watermark от 90 % (§5.4
+    // «при приближении»). Пороги приходят в queue_watermarks снимка —
+    // по стриму, с клампом по MAXLEN (как у алерта монитора).
     var WATERMARK_WARN = 0.9;
 
     var SVG_NS = 'http://www.w3.org/2000/svg';
@@ -101,6 +103,16 @@
     function fmtInt(v) {
         if (!num(v)) return ND;
         return v.toLocaleString('ru-RU');
+    }
+
+    // pluRu — форма русского множественного числа (1 пачка, 2 пачки,
+    // 5 пачек): подсказка порогов называет единицу глубины q:dns.
+    function pluRu(n, one, few, many) {
+        var m10 = n % 10;
+        var m100 = n % 100;
+        if (m10 === 1 && m100 !== 11) return one;
+        if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+        return many;
     }
 
     // fmtRate — скорость: крупная — целым, мелкая — до трёх знаков.
@@ -281,9 +293,32 @@
         body.textContent = '';
 
         var queues = snap.queues;
+
+        // Эффективные пороги backpressure — по стриму (queue_watermarks:
+        // кламп по MAXLEN, единый расчёт с гейтом и алертом монитора).
+        // Сумма глубин против одного порога не осмысленна: пороги
+        // стримов различаются, а единицы глубин тоже (q:dns — пачки).
+        // Подсказка — данные конфигурации: видна оператору и при «н/д»
+        // глубин (деградации секции очередей).
+        var watermarks = snap.queue_watermarks || {};
+        var wmParts = [];
+        STREAMS.forEach(function (s) {
+            if (s === STREAM_DEAD) return;
+            var wm = watermarks[s] || 0;
+            if (wm > 0) {
+                // q:dns считается пачками, штучные стримы — записями.
+                wmParts.push(s + ' ' + fmtInt(wm) +
+                    (s === 'q:dns' ? ' ' + pluRu(wm, 'пачка', 'пачки', 'пачек') : ''));
+            }
+        });
+        if (hint) {
+            hint.textContent = wmParts.length
+                ? 'пороги backpressure: ' + wmParts.join(' · ')
+                : '';
+        }
+
         if (!queues) {
             ndRow(body, 3, errTitle(snap, 'queues'));
-            if (hint) hint.textContent = '';
             return;
         }
 
@@ -292,32 +327,23 @@
             if (streams.indexOf(s) < 0) streams.push(s); // новые стримы не теряем
         });
 
-        // Сумма рабочих стримов: q:dead гейтом backpressure не управляется
-        // (мертвые задачи — разбор оператора, не отставание конвейера).
-        var workSum = 0;
-        streams.forEach(function (s) {
-            if (s !== STREAM_DEAD) workSum += queues[s] || 0;
-        });
-
-        var watermark = snap.queue_watermark || 0;
-        if (hint) {
-            hint.textContent = watermark > 0
-                ? 'порог backpressure: ' + fmtInt(watermark) +
-                    ' · сумма рабочих стримов: ' + fmtInt(workSum)
-                : '';
-        }
-
         streams.forEach(function (s) {
             var depth = queues[s] || 0;
             var series = hist.queues[s] || (hist.queues[s] = []);
             pushSeries(series, depth);
 
             var row = el('tr');
-            if (watermark > 0 && s !== STREAM_DEAD) {
-                if (workSum >= watermark) {
-                    row.className = 'q-over'; // у порога: backpressure вот-вот
-                } else if (workSum >= WATERMARK_WARN * watermark) {
-                    row.className = 'q-warn'; // приближение (≥90 %)
+            if (s !== STREAM_DEAD) {
+                // Подсветка — по своему порогу каждого рабочего стрима
+                // (q:dead гейтом не управляется: мёртвые задачи — разбор
+                // оператора, не отставание конвейера).
+                var wm = watermarks[s] || 0;
+                if (wm > 0) {
+                    if (depth >= wm) {
+                        row.className = 'q-over'; // у порога: backpressure вот-вот
+                    } else if (depth >= WATERMARK_WARN * wm) {
+                        row.className = 'q-warn'; // приближение (≥90 %)
+                    }
                 }
             }
 

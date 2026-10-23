@@ -136,9 +136,11 @@ func TestDashboard_Snapshot(t *testing.T) {
 	cfg := config.Default()
 	coll, err := dashboard.NewCollector(pool, gate, cfg.Dashboard, dashboard.CollectorOptions{
 		Probes: map[string]string{"alive": alive.URL, "dead": deadURL},
-		// Порог подсветки очередей — как в cmd/dashboard: NewCollector не
-		// читает секцию scheduler сам (§5.4).
+		// Пороги подсветки очередей — как в cmd/dashboard: NewCollector
+		// не читает секции scheduler/redis сам (§5.4); MaxLen — для
+		// эффективного порога стрима (кламп по MAXLEN).
 		QueueWatermark: int64(cfg.Scheduler.QueueHighWatermark),
+		QueueMaxLen:    int64(cfg.Redis.MaxLen),
 	})
 	if err != nil {
 		t.Fatalf("NewCollector: %v", err)
@@ -188,10 +190,12 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Errorf("rates = %+v, хочу remaining 2 (pending+queued)", snap.Rates)
 	}
 
-	// §5.4: глубины стримов и порог подсветки (значение по умолчанию
-	// конфигурации — 100000).
-	if snap.QueueWatermark != 100000 {
-		t.Errorf("queue_watermark = %d, хочу 100000 (дефолт конфигурации)", snap.QueueWatermark)
+	// §5.4: глубины стримов и эффективные пороги подсветки — кламп по
+	// половине MAXLEN стрима (T-141; дефолты конфигурации: watermark
+	// 100 000 → q:dns 125 пачек, штучные 75 000), как у алерта монитора.
+	if snap.QueueWatermarks["q:dns"] != 125 || snap.QueueWatermarks["q:http"] != 75000 {
+		t.Errorf("queue_watermarks = %v, хочу q:dns 125 / q:http 75000 (эффективные пороги дефолтов)",
+			snap.QueueWatermarks)
 	}
 	if got := snap.Queues["q:http"]; got != 2 {
 		t.Errorf("q:http = %d, хочу 2 (XLEN без групп)", got)
@@ -279,7 +283,7 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Fatalf("ответ не JSON: %v", err)
 	}
 	for _, key := range []string{"zones", "totals", "queues", "throughput", "rates",
-		"statuses", "laravel", "ingest", "health", "errors", "built_at", "queue_watermark"} {
+		"statuses", "laravel", "ingest", "health", "errors", "built_at", "queue_watermarks"} {
 		if _, ok := doc[key]; !ok {
 			t.Errorf("ответ без секции %q (§6.2)", key)
 		}

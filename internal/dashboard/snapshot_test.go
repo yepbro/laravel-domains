@@ -344,9 +344,16 @@ func TestCollectOnceSections(t *testing.T) {
 	if snap.Ingest == nil || len(snap.Ingest) != 1 || snap.Ingest[0].Action != "add" {
 		t.Errorf("ingest = %+v", snap.Ingest)
 	}
-	// §5.4: порог подсветки очередей — из конфигурации, не секция.
-	if snap.QueueWatermark != 0 {
-		t.Errorf("queue_watermark = %d, хочу 0 (не настроен в опциях)", snap.QueueWatermark)
+	// §5.4: пороги подсветки очередей — из конфигурации, не секция;
+	// гейт не настроен — эффективные пороги рабочих стримов 0.
+	if len(snap.QueueWatermarks) != len(status.Streams)-1 {
+		t.Errorf("queue_watermarks = %v, хочу %d рабочих стримов (без q:dead)",
+			snap.QueueWatermarks, len(status.Streams)-1)
+	}
+	for s, wm := range snap.QueueWatermarks {
+		if wm != 0 {
+			t.Errorf("queue_watermarks[%s] = %d, хочу 0 (гейт не настроен)", s, wm)
+		}
 	}
 	// Пробы не заданы — секция «н/д» без ошибки.
 	if snap.Health != nil {
@@ -620,7 +627,7 @@ func TestProbeTimeout(t *testing.T) {
 func TestSnapshotJSONForm(t *testing.T) {
 	coll := newSnapCollector(t, healthyPool(), &fakeLenner{}, func(o *CollectorOptions) {
 		o.Probes = map[string]string{"mon": "http://127.0.0.1:9100"}
-		o.QueueWatermark = 100000
+		o.QueueWatermark = 100000 // дефолт конфигурации
 	})
 	snap := coll.CollectOnce(context.Background())
 	b, err := json.Marshal(snap)
@@ -633,7 +640,7 @@ func TestSnapshotJSONForm(t *testing.T) {
 	}
 	// Точный набор ключей: 5 секций CLI + секции дашборда + built_at.
 	wantKeys := []string{"zones", "totals", "queues", "throughput", "rates",
-		"statuses", "laravel", "ingest", "health", "errors", "built_at", "queue_watermark"}
+		"statuses", "laravel", "ingest", "health", "errors", "built_at", "queue_watermarks"}
 	if len(doc) != len(wantKeys) {
 		t.Errorf("ключи = %d (%v), хочу %d", len(doc), docKeys(doc), len(wantKeys))
 	}
@@ -642,8 +649,10 @@ func TestSnapshotJSONForm(t *testing.T) {
 			t.Errorf("JSON без ключа %q: %s", k, b)
 		}
 	}
-	if string(doc["queue_watermark"]) != "100000" {
-		t.Errorf("queue_watermark = %s, хочу 100000 (§5.4)", doc["queue_watermark"])
+	// §5.4: эффективные пороги по стримам — кламп по половине MAXLEN
+	// (T-141: q:dns — 125 пачек, штучные — 75 000 при дефолтах).
+	if want := `{"q:analyze":75000,"q:dns":125,"q:http":75000,"q:render":75000}`; string(doc["queue_watermarks"]) != want {
+		t.Errorf("queue_watermarks = %s, хочу %s (§5.4, эффективные пороги T-141)", doc["queue_watermarks"], want)
 	}
 	// Порядок ключей — секции CLI первыми (embedded SummaryJSON).
 	if got := string(b); !strings.HasPrefix(got, `{"zones":`) {

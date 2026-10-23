@@ -85,6 +85,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		Log:            logger,
 		Metrics:        reg,
 		QueueWatermark: int64(cfg.Scheduler.QueueHighWatermark), // подсветка очередей, §5.4
+		QueueMaxLen:    int64(cfg.Redis.MaxLen),                 // эффективный порог: кламп по MAXLEN, как у гейта и монитора
 	})
 	if err != nil {
 		return err
