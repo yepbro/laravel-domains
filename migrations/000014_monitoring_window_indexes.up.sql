@@ -1,0 +1,62 @@
+-- T-171: индексы окон мониторинга — суточный/часовой срез вместо
+-- полного прохода таблиц (T-078/T-080/T-126/ТЗД §4.4).
+--
+-- Постоянные потребители-агрегаты (замер боем 23–24.10, pg_stat_statements
+-- за 2,7 сут) перечитывают таблицы целиком на каждый проход:
+--
+--   - done_today (status.throughputSQL — дашборд каждые ~23 с,
+--     crawlerctl status): count(*) FROM domains WHERE last_checked_at
+--     = current_date — seq scan 41,8 млн строк, mean 3,3 с, ≈9,3 ч
+--     времени БД за окно;
+--   - доля temp_error (monitor/alerts.go dnsShareSQL, каждые 60 с):
+--     count(*) FILTER (WHERE status = $1) FROM domains WHERE
+--     last_checked_at >= current_date — тот же seq scan, mean 7,4 с,
+--     ≈4,4 ч;
+--   - результаты за час (throughputSQL: results_hour / rendered_hour):
+--     count(*) FROM subdomain_results WHERE checked_at >= now() -
+--     interval '1 hour' — seq scan 2,6 млн строк ×2 на каждый снимок.
+--
+-- Частичный domains_recheck_idx (T-104) окнам не подходит: предикат
+-- check_state = 2 в запросах не доказать (done_today — проверки, а не
+-- домены: строка сегодняшней проверки может быть уже не done), окно
+-- покрывает почти все done-строки.
+--
+-- domains_last_checked_idx (last_checked_at)
+--
+--   Диапазонный скан текущих суток: ключ — сама колонка окна, растёт
+--   слева направо, «сегодня» — правый край. count(*) по одному индексу
+--   — index-only scan; доля temp_error дополнительно фильтрует status
+--   по куче (сегодняшние страницы — самые горячие, в shared_buffers).
+--
+--   HOT: last_checked_at уже в ключе domains_recheck_idx (T-104), и все
+--   писатели меняют её ТОЛЬКО вместе с check_state (результат
+--   dns/http-воркера: check_state = done + last_checked_at = now(),
+--   internal/dnsworker/result.go, internal/httpworker/record.go) —
+--   переходы уже non-HOT, новых non-HOT апдейтов индекс не создаёт,
+--   только ещё одну запись в том же переходе (класс recheck-индекса).
+--   Закреплено тестом TestSchema_DomainsHOTColumns (age-колонки).
+--
+--   Размер: ~26 байт × число проверенных доменов (≈1 ГиБ на корпусе
+--   41,8 млн) — цена мгновенных окон мониторинга против ~13,7 ч
+--   времени БД за каждые 2,7 сут боевого цикла.
+--
+-- subdomain_results_checked_idx (checked_at)
+--
+--   Часовое окно результатов/рендеров: диапазонный скан правого края.
+--   checked_at пишет INSERT (строки результатов неизменяемы; DELETE —
+--   только очистка deleted и retention T-166) — обслуживания апдейтов
+--   нет, записи добавляются в правый лист монотонно (timestamptz
+--   now()): цена INSERT'а — одна appending-запись. Размер ~24 байта ×
+--   число живых результатов (≈60 МиБ на 2,6 млн).
+--
+-- Оба индекса создаются на партиционированных родителях: существующие
+-- и будущие партиции получают дочерние индексы автоматически. CREATE
+-- INDEX CONCURRENTLY на родителе PG16 не поддерживает — применять в
+-- окно обслуживания (построение domains_last_checked_idx на корпусе
+-- десятков миллионов строк занимает минуты).
+
+CREATE INDEX domains_last_checked_idx
+    ON domains (last_checked_at);
+
+CREATE INDEX subdomain_results_checked_idx
+    ON subdomain_results (checked_at);

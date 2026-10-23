@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/config"
+	"crawler/internal/db"
 	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/scheduler"
@@ -51,7 +52,13 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9102"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
+		// Агрегатный коллектор backlog (T-077) не разбирает параллельные
+		// воркеры (T-171): путь постановки пачек — индексные сканы
+		// domains_pending_idx без параллельных планов, сессионный SET
+		// его не замедляет, а seq-проходы (backlog, retry temp_error)
+		// перестают забирать все ядра у конвейера.
+		DBAfterConnect: db.NoParallelGather,
+		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}

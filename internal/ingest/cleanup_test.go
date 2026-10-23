@@ -21,6 +21,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"crawler/internal/model"
 )
 
 // --- фейковый пул с транзакциями -----------------------------------------
@@ -249,19 +251,27 @@ func (t *cleanupFakeTx) Rollback(context.Context) error {
 var _ CleanupDB = (*cleanupFakePool)(nil)
 
 // --- ожидаемые SQL-тексты (контракт) -------------------------------------
+//
+// Код статуса deleted вшит в текст литералом (T-170: предикат частичного
+// индекса domains_deleted_idx планировщик доказывает только по литералу),
+// параметры — только данные пачки.
 
-const wantCleanupSelect = "SELECT d.zone_id, d.id FROM domains d " +
-	"WHERE d.status = $1 " +
-	"AND EXISTS (SELECT 1 FROM subdomain_results r " +
-	"WHERE r.zone_id = d.zone_id AND r.domain_id = d.id) " +
-	"ORDER BY d.zone_id, d.id LIMIT $2"
+var wantCleanupSelect = fmt.Sprintf(
+	"SELECT d.zone_id, d.id FROM domains d "+
+		"WHERE d.status = %d "+
+		"AND EXISTS (SELECT 1 FROM subdomain_results r "+
+		"WHERE r.zone_id = d.zone_id AND r.domain_id = d.id) "+
+		"ORDER BY d.zone_id, d.id LIMIT $1",
+	int16(model.StatusDeleted))
 
-const wantCleanupDelete = "DELETE FROM subdomain_results r " +
-	"USING unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
-	"WHERE r.zone_id = k.zone_id AND r.domain_id = k.domain_id " +
-	"AND EXISTS (SELECT 1 FROM domains d " +
-	"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id AND d.status = $3) " +
-	"RETURNING r.zone_id, r.domain_id, r.content_hash"
+var wantCleanupDelete = fmt.Sprintf(
+	"DELETE FROM subdomain_results r "+
+		"USING unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) "+
+		"WHERE r.zone_id = k.zone_id AND r.domain_id = k.domain_id "+
+		"AND EXISTS (SELECT 1 FROM domains d "+
+		"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id AND d.status = %d) "+
+		"RETURNING r.zone_id, r.domain_id, r.content_hash",
+	int16(model.StatusDeleted))
 
 const wantCleanupUpdate = "UPDATE contents SET refcount = GREATEST(refcount - h.n, 0) " +
 	"FROM unnest($1::bytea[], $2::int4[]) AS h(hash, n) " +
@@ -327,8 +337,8 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 	if pool.queries[0].sql != wantCleanupSelect {
 		t.Errorf("SQL выборки:\n%s\nwant:\n%s", pool.queries[0].sql, wantCleanupSelect)
 	}
-	if want := []any{int16(6), 7}; !reflect.DeepEqual(pool.queries[0].args, want) {
-		t.Errorf("аргументы выборки = %v, want %v (status deleted, лимит пачки)", pool.queries[0].args, want)
+	if want := []any{7}; !reflect.DeepEqual(pool.queries[0].args, want) {
+		t.Errorf("аргументы выборки = %v, want %v (лимит пачки; статус deleted — литерал в SQL, T-170)", pool.queries[0].args, want)
 	}
 
 	// Транзакция: удаление результатов + уменьшение refcount.
@@ -342,8 +352,8 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 	if tx.calls[0].sql != wantCleanupDelete {
 		t.Errorf("SQL удаления:\n%s\nwant:\n%s", tx.calls[0].sql, wantCleanupDelete)
 	}
-	if want := []any{[]int16{1, 1, 2}, []int64{10, 11, 20}, int16(6)}; !reflect.DeepEqual(tx.calls[0].args, want) {
-		t.Errorf("аргументы удаления = %v, want %v", tx.calls[0].args, want)
+	if want := []any{[]int16{1, 1, 2}, []int64{10, 11, 20}}; !reflect.DeepEqual(tx.calls[0].args, want) {
+		t.Errorf("аргументы удаления = %v, want %v (статус deleted — литерал в SQL, T-170)", tx.calls[0].args, want)
 	}
 	if tx.calls[1].sql != wantCleanupUpdate {
 		t.Errorf("SQL refcount:\n%s\nwant:\n%s", tx.calls[1].sql, wantCleanupUpdate)
@@ -375,7 +385,7 @@ func TestCleanupOnceDefaultBatch(t *testing.T) {
 	if _, err := CleanupOnce(context.Background(), pool, CleanupOptions{}); err != nil {
 		t.Fatalf("CleanupOnce: %v", err)
 	}
-	got := pool.queries[0].args[1]
+	got := pool.queries[0].args[0]
 	if got != DefaultCleanupBatch {
 		t.Errorf("лимит пачки = %v, want дефолт %d", got, DefaultCleanupBatch)
 	}

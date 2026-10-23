@@ -254,13 +254,18 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	// дополнять сюда их down-эффектами), иначе повторный Up споткнётся
 	// в них: 000009 возвращает глобальный ключ ingest_files.sha256,
 	// 000011 снимает таблицу laravel_history (000010 — CREATE OR REPLACE
-	// функции, повторное применение безопасно без подготовки).
+	// функции, повторное применение безопасно без подготовки), 0013/0014
+	// снимают частичный индекс deleted-доменов и индексы окон
+	// мониторинга (T-170/T-171).
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pool.Close()
 	for _, stmt := range []string{
+		"DROP INDEX IF EXISTS subdomain_results_checked_idx",
+		"DROP INDEX IF EXISTS domains_last_checked_idx",
+		"DROP INDEX IF EXISTS domains_deleted_idx",
 		"DROP INDEX IF EXISTS ingest_files_sha256_idx",
 		"DROP INDEX IF EXISTS ingest_files_zone_id_action_sha256_key",
 		"ALTER TABLE ingest_files ADD CONSTRAINT ingest_files_sha256_key UNIQUE (sha256)",

@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/config"
+	"crawler/internal/db"
 	"crawler/internal/metrics"
 	"crawler/internal/monitor"
 	"crawler/internal/queue"
@@ -59,7 +60,13 @@ func main() {
 		MetricsAddr: listen,
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
+		// Пересчёт счётчиков зон и окна алертов — агрегаты по всей
+		// domains (T-171): без параллельных воркеров проход не
+		// забирает все ядра у конвейера; свежесть счётчиков в
+		// десятки секунд достаточна (порог алерта остановки
+		// прогресса — 5 периодов пересчёта).
+		DBAfterConnect: db.NoParallelGather,
+		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}

@@ -22,6 +22,7 @@ import (
 
 	"crawler/internal/config"
 	"crawler/internal/dashboard"
+	"crawler/internal/db"
 	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/service"
@@ -59,7 +60,12 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", "127.0.0.1:9108"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
+		// Сборка снимков — секундные агрегаты по domains (T-171; тяжёлые
+		// секции дополнительно кэшируются TTL, T-161): без параллельных
+		// воркеров проходы не забирают все ядра у конвейера; свежесть
+		// снимка оператору достаточна (частота — dashboard.refresh/TTL).
+		DBAfterConnect: db.NoParallelGather,
+		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}

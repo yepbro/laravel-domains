@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/config"
@@ -45,6 +46,36 @@ const (
 // здесь граница жёстче и защищает вызовы мимо конфига.
 const MaxPoolSize = 100
 
+// AfterConnectFunc — хук настройки нового соединения пула (пробрасывается
+// в pgxpool.Config.AfterConnect): выполняется один раз на каждое
+// открываемое соединение (включая переоткрытия по MaxConnLifetime),
+// до первого использования. Сбой хука — ошибка открытия соединения.
+type AfterConnectFunc func(ctx context.Context, conn *pgx.Conn) error
+
+// noParallelGatherSQL — отключение параллельных воркеров запросов сессии.
+const noParallelGatherSQL = "SET max_parallel_workers_per_gather = 0"
+
+// NoParallelGather — AfterConnect-хук мониторинговых сервисов (T-171):
+// сессионный SET max_parallel_workers_per_gather = 0 — агрегатные проходы
+// (пересчёт зон, окна сводки, backlog) не разбирают параллельные воркеры
+// PostgreSQL и не забирают сразу все ядра поделимого CPU у конвейера
+// краулера (боевой инцидент 23–24.10: 4 ядра, load 21–23, каждый
+// параллельный агрегат занимал 3 ядра). Суммарная работа сессии та же,
+// wall-время прохода растёт — мониторингу свежесть в десятки секунд не
+// критична (порог алерта остановки прогресса — 5 периодов пересчёта зон),
+// а воркеры и транспорт получают равные доли CPU вместо всплесков.
+//
+// Применимо только к пулам мониторинга (monitor, dashboard, коллекторы
+// метрик): путь OLTP-воркеров (выборка/запись пачек по индексам) не
+// использует параллельные планы, но фоновые seq-проходы того же сервиса
+// замедляются — решения по каждому сервису принимаются осознанно.
+func NoParallelGather(ctx context.Context, conn *pgx.Conn) error {
+	if _, err := conn.Exec(ctx, noParallelGatherSQL); err != nil {
+		return fmt.Errorf("db: %s: %w", noParallelGatherSQL, err)
+	}
+	return nil
+}
+
 // Options — параметры пула подключений. Нулевые длительности и PoolSize
 // заменяются значениями по умолчанию; DSN обязателен.
 type Options struct {
@@ -65,6 +96,11 @@ type Options struct {
 	HealthCheckPeriod time.Duration
 	// ConnectTimeout — установка одного соединения. По умолчанию 10s.
 	ConnectTimeout time.Duration
+	// AfterConnect — настройка каждого нового соединения (nil — нет):
+	// см. AfterConnectFunc. Значение применяется и к переоткрытиям
+	// по MaxConnLifetime — SET-подобные настройки сессии переживают
+	// пересборку соединений.
+	AfterConnect AfterConnectFunc
 }
 
 // NewOptions собирает параметры пула из секции postgres конфигурации
@@ -99,6 +135,7 @@ func buildPoolConfig(opts Options) (*pgxpool.Config, error) {
 	cfg.MaxConnIdleTime = defaultIfZero(opts.MaxConnIdleTime, DefaultMaxConnIdleTime)
 	cfg.HealthCheckPeriod = defaultIfZero(opts.HealthCheckPeriod, DefaultHealthCheckPeriod)
 	cfg.ConnConfig.ConnectTimeout = defaultIfZero(opts.ConnectTimeout, DefaultConnectTimeout)
+	cfg.AfterConnect = opts.AfterConnect
 	return cfg, nil
 }
 

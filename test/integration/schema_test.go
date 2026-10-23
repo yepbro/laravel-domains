@@ -4,10 +4,14 @@
 //     zone_id, fillfactor = 85 у каждой листовой партиции, частичные
 //     индексы проходов планировщика по check_state — выборка pending
 //     (domains_pending_idx), возврат lease (domains_lease_idx) и
-//     перепроверка (domains_recheck_idx, T-104), sequence domain_id_seq,
-//     HOT-совместимость — массово обновляемые колонки не входят ни в один
-//     индекс, кроме возраста lease/recheck в ключах (меняется только
-//     вместе с check_state);
+//     перепроверка (domains_recheck_idx, T-104), частичный индекс
+//     deleted-доменов очистки ingest (domains_deleted_idx, T-170), окно
+//     мониторинга по last_checked_at (domains_last_checked_idx, T-171),
+//     sequence domain_id_seq, HOT-совместимость — массово обновляемые
+//     колонки не входят ни в один индекс, кроме возраста lease/recheck
+//     и окна мониторинга в ключах (меняется только вместе с check_state)
+//     и status в предикате deleted-индекса (строки вне deleted в индекс
+//     не попадают);
 //   - T-004, таблицы subdomain_results/contents/laravel_domains/
 //     laravel_findings/ingest_files: партиционирование таблиц с domain_id,
 //     fillfactor = 85 листьев subdomain_results (частые перезаписи
@@ -24,6 +28,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -232,16 +237,19 @@ func TestSchema_DomainsPartitioning(t *testing.T) {
 	}
 }
 
-// TestSchema_DomainsIndexes — на domains ровно пять индексов («минимум
+// TestSchema_DomainsIndexes — на domains ровно семь индексов («минимум
 // индексов», ТЗ 6): первичный ключ, уникальный (zone_id, label) для поиска
-// по имени (ТЗ 5.11) и три частичных по check_state для проходов
+// по имени (ТЗ 5.11), три частичных по check_state для проходов
 // планировщика (ТЗ 5.3): выборка pending (domains_pending_idx, 000001),
 // возврат истёкших lease (domains_lease_idx, T-104) и суточная
-// перепроверка (domains_recheck_idx, T-104). Ключи фоновых индексов
-// начинаются с колонки возраста (queued_at / last_checked_at) и
-// завершаются доменным ключом — ORDER BY проходов совпадает с ключом,
-// скан читает только нужный префикс. У каждой листовой партиции —
-// прикреплённые дочерние индексы всех индексов родителя.
+// перепроверка (domains_recheck_idx, T-104), частичный deleted-доменов
+// очистки ingest (domains_deleted_idx, T-170, 0013) и окно мониторинга
+// по last_checked_at (domains_last_checked_idx, T-171, 0014). Ключи
+// фоновых индексов начинаются с колонки возраста (queued_at /
+// last_checked_at) и завершаются доменным ключом — ORDER BY проходов
+// совпадает с ключом, скан читает только нужный префикс. У каждой
+// листовой партиции — прикреплённые дочерние индексы всех индексов
+// родителя.
 func TestSchema_DomainsIndexes(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -253,6 +261,8 @@ func TestSchema_DomainsIndexes(t *testing.T) {
 		"domains_pending_idx":       true,
 		"domains_lease_idx":         true,
 		"domains_recheck_idx":       true,
+		"domains_deleted_idx":       true,
+		"domains_last_checked_idx":  true,
 	}
 	got := make(map[string]bool, len(indexes))
 	for _, ix := range indexes {
@@ -276,6 +286,7 @@ func TestSchema_DomainsIndexes(t *testing.T) {
 		"domains_pending_idx": {"(zone_id, id)", "check_state = 0"},
 		"domains_lease_idx":   {"(queued_at, zone_id, id)", "check_state = 1"},
 		"domains_recheck_idx": {"(last_checked_at, zone_id, id)", "check_state = 2"},
+		"domains_deleted_idx": {"(zone_id, id)", "status = 6"},
 	}
 	for name, w := range wantPartial {
 		var ix *tableIndex
@@ -358,29 +369,34 @@ func TestSchema_DomainIDSequence(t *testing.T) {
 // TestSchema_DomainsHOTColumns — обновляемые при проверке колонки не
 // входят ни в один индекс, кроме заранее принятых компромиссов (ТЗ 6):
 // massовые апдейты остаются HOT, а fillfactor = 85 оставляет место под
-// новые версии строк на той же странице. Два компромисса:
+// новые версии строк на той же странице. Три компромисса:
 //
 //   - check_state — в предикатах трёх частичных индексов проходов
 //     (pending/lease/recheck): смены состояний всегда non-HOT —
 //     неустранимо при требуемых ТЗ §5.3 частичных индексах;
 //   - queued_at / last_checked_at — в ключах lease/recheck-индексов
-//     (T-104): их апдейты non-HOT, однако все писатели меняют эти
-//     колонки ТОЛЬКО вместе с check_state (enqueue, возврат lease,
-//     перепроверка, результат воркера dns/http, воскрешение add-файлом) —
-//     переходы уже non-HOT, новых non-HOT апдейтов индексы не создают.
-//
-// status остаётся вне любых индексов: массовые смены статуса без смены
-// check_state (delete-файлы, фиксация итогового статуса temp_error)
-// сохраняют HOT — поэтому retry-проход индекса не имеет.
+//     (T-104) и last_checked_at ещё в ключе доменного окна мониторинга
+//     domains_last_checked_idx (T-171): их апдейты non-HOT, однако все
+//     писатели меняют эти колонки ТОЛЬКО вместе с check_state
+//     (enqueue, возврат lease, перепроверка, результат воркера dns/http,
+//     воскрешение add-файлом) — переходы уже non-HOT, новых non-HOT
+//     апдейтов индексы не создают;
+//   - status — в предикате (не ключе!) частичного индекса deleted-
+//     доменов domains_deleted_idx (T-170): в индексе живут только
+//     строки status = deleted, non-HOT становятся лишь переходы с
+//     участием deleted (применение delete-файлов T-019, воскрешение
+//     T-018) — редкие события реестра; массовые апдейты
+//     статуса-результата и фиксация итогового статуса temp_error
+//     (T-031) строк в индексе не имеют и остаются HOT.
 func TestSchema_DomainsHOTColumns(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 
-	hotColumns := []string{"status", "flags", "dns_mask", "temp_attempts"}
-	// Колонки возраста — только в ключе своего индекса прохода.
-	ageColumns := map[string]string{
-		"queued_at":       "domains_lease_idx",
-		"last_checked_at": "domains_recheck_idx",
+	hotColumns := []string{"flags", "dns_mask", "temp_attempts"}
+	// Колонки возраста — только в ключах своих индексов проходов/окон.
+	ageColumns := map[string][]string{
+		"queued_at":       {"domains_lease_idx"},
+		"last_checked_at": {"domains_recheck_idx", "domains_last_checked_idx"},
 	}
 	for _, ix := range tableIndexes(t, pool, "domains") {
 		for _, col := range hotColumns {
@@ -388,9 +404,22 @@ func TestSchema_DomainsHOTColumns(t *testing.T) {
 				t.Errorf("индекс %s ссылается на часто обновляемую колонку %s: её апдейты перестают быть HOT", ix.name, col)
 			}
 		}
+		// status — только предикат (не ключ) domains_deleted_idx (T-170):
+		// строки вне deleted в индекс не попадают, массовые смены
+		// статуса остаются HOT.
+		if containsWord(ix.def, "status") {
+			if ix.name != "domains_deleted_idx" {
+				t.Errorf("индекс %s ссылается на колонку status: допустима только в предикате domains_deleted_idx (T-170)", ix.name)
+			} else {
+				key, _, _ := strings.Cut(ix.def, " WHERE ")
+				if containsWord(key, "status") {
+					t.Errorf("domains_deleted_idx: status в ключе (%s): индексация смен статуса всегда non-HOT", key)
+				}
+			}
+		}
 		for col, allowed := range ageColumns {
-			if ix.name != allowed && containsWord(ix.def, col) {
-				t.Errorf("индекс %s ссылается на колонку %s: допустима только в ключе %s", ix.name, col, allowed)
+			if !slices.Contains(allowed, ix.name) && containsWord(ix.def, col) {
+				t.Errorf("индекс %s ссылается на колонку %s: допустима только в ключах %v", ix.name, col, allowed)
 			}
 		}
 		if containsWord(ix.def, "check_state") &&
@@ -677,10 +706,13 @@ func TestSchema_ResultsTablesColumns(t *testing.T) {
 // (zone_id, domain_id) составных ключей, — плюс уникальный
 // ingest_files (zone_id, action, sha256) с обслуживающим
 // ingest_files_sha256_idx (T-113: дедуп точной повторной доставки и
-// запрос конвейера по содержимому) и индекс компактификации
+// запрос конвейера по содержимому), индекс компактификации
 // contents_pack_off_idx (pack_id, off) для фоновых
 // запросов CompactLoop по паку с сортировкой по смещению (T-096, INFRA-05;
-// refcount в ключ не входит — апдейты счётчика остаются HOT).
+// refcount в ключ не входит — апдейты счётчика остаются HOT) и окно
+// мониторинга subdomain_results_checked_idx (checked_at) — часовые
+// счётчики темпа сводки (T-171; checked_at пишется только INSERT'ом,
+// HOT-картина не меняется).
 // Индексы под будущие выборки (например, laravel_domains по score — этап 8,
 // ТЗ 5.11) сознательно не добавляются: состав зафиксирован этим контрактом.
 func TestSchema_ResultsTablesIndexes(t *testing.T) {
@@ -689,7 +721,10 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 
 	// таблица → имя индекса → ожидаемый ключ.
 	want := map[string]map[string]string{
-		"subdomain_results": {"subdomain_results_pkey": "(zone_id, domain_id, subdomain_id, variant)"},
+		"subdomain_results": {
+			"subdomain_results_pkey":        "(zone_id, domain_id, subdomain_id, variant)",
+			"subdomain_results_checked_idx": "(checked_at)",
+		},
 		"contents": {
 			"contents_pkey":         "(hash)",
 			"contents_pack_off_idx": "(pack_id, off)",

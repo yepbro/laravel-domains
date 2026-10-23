@@ -66,6 +66,11 @@ type Options struct {
 	// завершения OnRun и остановки HTTP-сервера метрик. nil — сервису пул
 	// не нужен (текущие заглушки): соединения не открываются.
 	OnDBPool func(pool *pgxpool.Pool)
+	// DBAfterConnect — настройка каждого соединения пула БД
+	// (db.AfterConnectFunc, T-171): nil — по умолчанию. Используется
+	// мониторинговыми сервисами (db.NoParallelGather) — агрегатные
+	// проходы не разбирают параллельные воркеры PostgreSQL.
+	DBAfterConnect db.AfterConnectFunc
 	// OnRun — рабочая логика сервиса (воркеры этапов 2+): вызывается после
 	// полной инициализации (миграции, пул, HTTP метрик). Полученный
 	// контекст отменяется при SIGTERM/SIGINT — по отмене воркер дорабатывает
@@ -240,7 +245,7 @@ func Run(opts Options) error {
 			poolSize = opts.Config.Postgres.PoolSize
 		}
 		openCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		p, err := db.Open(openCtx, db.Options{DSN: dsn, PoolSize: poolSize})
+		p, err := db.Open(openCtx, db.Options{DSN: dsn, PoolSize: poolSize, AfterConnect: opts.DBAfterConnect})
 		cancel()
 		if err != nil {
 			opts.Logger.Error("пул PostgreSQL", "err", err)

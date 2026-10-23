@@ -331,9 +331,10 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 
 		// Цикл detach/attach не дублирует индексы на DEFAULT.
 		// domains: PK + unique(zone_id,label) + domains_pending_idx +
-		// 2 частичных миграции 000008 (T-104: lease/recheck) —
+		// 2 частичных миграции 000008 (T-104: lease/recheck) +
+		// domains_deleted_idx (T-170) + domains_last_checked_idx (T-171) —
 		// партиция-наследник родительских индексов.
-		for table, want := range map[string]int{"domains": 5, "subdomain_results": 1} {
+		for table, want := range map[string]int{"domains": 7, "subdomain_results": 2} {
 			for _, p := range tablePartitions(t, pool, table) {
 				if p.name != table+"_default" {
 					continue

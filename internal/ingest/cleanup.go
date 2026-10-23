@@ -17,11 +17,17 @@
 // оставшиеся результаты. Кандидат прохода — deleted-домен, у которого
 // ещё есть строки subdomain_results (EXISTS); вычищенный домен не
 // выбирается вовсе, повторные проходы не делают лишней работы, а сбой
-// или рестарт ничего не теряют — внешнего состояния нет. Индекса по
-// status в domains нет сознательно («минимум индексов», ТЗ 6): проход
-// читает таблицу доменов фильтром; если доля удалённых станет велика,
-// решение — частичный индекс WHERE status = 6 (миграция, отдельная
-// задача), схему здесь не меняем.
+// или рестарт ничего не теряют — внешнего состояния нет. Выборка
+// кандидатов обслуживается частичным индексом domains_deleted_idx
+// (миграция 0013, T-170): (zone_id, id) WHERE status = 6 — ключ
+// совпадает с PK и ORDER BY выборки (пачки без сортировки, ранний
+// останов LIMIT), а пока deleted-доменов нет, проход не читает таблицу
+// доменов вовсе (боевой замер 23–24.10: без индекса планировщик
+// перебирал все subdomain_results — 17 с CPU БД на проход вхолостую).
+// Код статуса вшит в текст SQL литералом через model.StatusDeleted
+// (стиль scheduler/dispatch.go): параметр в предикате частичного
+// индекса планировщик не доказывает, generic-план подготовленного
+// выражения терял бы индекс.
 //
 // Тот же цикл зачищает осиротевшие партии ingest_stage (T-098, страховка
 // ING-P2-3): строки партии, чей конвейер умер без discard (kill -9
@@ -77,31 +83,6 @@ const contentHashLen = 16
 // SQL прохода. unnest-пачки — стиль пакетных UPDATE internal/db (ТЗ 6:
 // «запись пачками … UPDATE … FROM unnest(...)»).
 const (
-	// cleanupSelectSQL — кандидаты: deleted-домены с оставшимися
-	// результатами. EXISTS — та самая «пометка»: вычищенные не выбираются.
-	// ORDER BY по ключу домена — детерминированные пачки без сортировки
-	// (совпадает с PK, ТЗ 6.1).
-	cleanupSelectSQL = "SELECT d.zone_id, d.id FROM domains d " +
-		"WHERE d.status = $1 " +
-		"AND EXISTS (SELECT 1 FROM subdomain_results r " +
-		"WHERE r.zone_id = d.zone_id AND r.domain_id = d.id) " +
-		"ORDER BY d.zone_id, d.id LIMIT $2"
-
-	// cleanupDeleteSQL — удаление результатов пачки доменов. Охрана
-	// EXISTS по domains.status — от гонки с применением add-файла
-	// (T-018): домен, воскрешённый из deleted в new/pending между
-	// выборкой кандидатов и удалением, результаты сохраняет (ТЗ 5.1:
-	// вернувшийся домен «не меняется»); домен, удалённый заново, пройдёт
-	// цикл ещё раз. RETURNING отдаёт только фактически удалённые строки —
-	// уменьшение refcount ниже строго по ним: вторая параллельная очистка,
-	// удалившая те же строки раньше, refcount повторно не уменьшит.
-	cleanupDeleteSQL = "DELETE FROM subdomain_results r " +
-		"USING unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
-		"WHERE r.zone_id = k.zone_id AND r.domain_id = k.domain_id " +
-		"AND EXISTS (SELECT 1 FROM domains d " +
-		"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id AND d.status = $3) " +
-		"RETURNING r.zone_id, r.domain_id, r.content_hash"
-
 	// cleanupUpdateSQL — уменьшение refcount по агрегированным хэшам:
 	// один контент может ссылаться из многих удалённых результатов
 	// (дедупликация, ТЗ 5.7). GREATEST(..., 0) держит счётчик
@@ -113,6 +94,40 @@ const (
 		"FROM unnest($1::bytea[], $2::int4[]) AS h(hash, n) " +
 		"WHERE contents.hash = h.hash"
 )
+
+// cleanupSelectSQL — кандидаты: deleted-домены с оставшимися
+// результатами. EXISTS — та самая «пометка»: вычищенные не выбираются.
+// ORDER BY по ключу домена — детерминированные пачки без сортировки
+// (совпадает с PK и ключом domains_deleted_idx, ТЗ 6.1/T-170). Код
+// статуса — литерал в тексте (fmt.Sprintf через model, стиль
+// dispatch.go): предикат частичного индекса планировщик доказывает
+// только по литералу.
+var cleanupSelectSQL = fmt.Sprintf(
+	"SELECT d.zone_id, d.id FROM domains d "+
+		"WHERE d.status = %d "+
+		"AND EXISTS (SELECT 1 FROM subdomain_results r "+
+		"WHERE r.zone_id = d.zone_id AND r.domain_id = d.id) "+
+		"ORDER BY d.zone_id, d.id LIMIT $1",
+	int16(model.StatusDeleted))
+
+// cleanupDeleteSQL — удаление результатов пачки доменов. Охрана
+// EXISTS по domains.status — от гонки с применением add-файла
+// (T-018): домен, воскрешённый из deleted в new/pending между
+// выборкой кандидатов и удалением, результаты сохраняет (ТЗ 5.1:
+// вернувшийся домен «не меняется»); домен, удалённый заново, пройдёт
+// цикл ещё раз. RETURNING отдаёт только фактически удалённые строки —
+// уменьшение refcount ниже строго по ним: вторая параллельная очистка,
+// удалившая те же строки раньше, refcount повторно не уменьшит.
+// Литерал статуса — доказательство предиката domains_deleted_idx
+// (T-170): охрана — проба индекса, не чтение таблицы.
+var cleanupDeleteSQL = fmt.Sprintf(
+	"DELETE FROM subdomain_results r "+
+		"USING unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) "+
+		"WHERE r.zone_id = k.zone_id AND r.domain_id = k.domain_id "+
+		"AND EXISTS (SELECT 1 FROM domains d "+
+		"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id AND d.status = %d) "+
+		"RETURNING r.zone_id, r.domain_id, r.content_hash",
+	int16(model.StatusDeleted))
 
 // staleStageSQL — зачистка осиротевших партий staging (T-098): диапазон
 // batch_id меньше границы «сейчас − StaleBatchAge» — скан по ведущей
@@ -242,7 +257,7 @@ func CleanupOnce(ctx context.Context, pool CleanupDB, opts CleanupOptions) (Clea
 // результатами (cleanupSelectSQL): параллельные массивы ключей зон и
 // доменов для unnest-пачки DELETE.
 func cleanupCandidates(ctx context.Context, pool CleanupDB, limit int) ([]int16, []int64, error) {
-	rows, err := pool.Query(ctx, cleanupSelectSQL, int16(model.StatusDeleted), limit)
+	rows, err := pool.Query(ctx, cleanupSelectSQL, limit)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ingest: очистка удалённых доменов: выборка кандидатов: %w", err)
 	}
@@ -271,7 +286,7 @@ func cleanupCandidates(ctx context.Context, pool CleanupDB, limit int) ([]int16,
 // (cleanupDeleteSQL) и возвращает счётчики прохода вместе с числом
 // удалённых ссылок на каждый хэш контента.
 func cleanupResults(ctx context.Context, tx pgx.Tx, zoneIDs []int16, domainIDs []int64) (CleanupResult, map[cleanupHash]int32, error) {
-	rows, err := tx.Query(ctx, cleanupDeleteSQL, zoneIDs, domainIDs, int16(model.StatusDeleted))
+	rows, err := tx.Query(ctx, cleanupDeleteSQL, zoneIDs, domainIDs)
 	if err != nil {
 		return CleanupResult{}, nil, fmt.Errorf("ingest: очистка удалённых доменов: удаление результатов: %w", err)
 	}
