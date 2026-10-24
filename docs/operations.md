@@ -503,3 +503,28 @@ Telegram и Actions).
 - Возврат: `systemctl start crawler-scheduler` после q:render → 0 —
   EnqueueLoop возьмёт накопленный pending (гейт T-026 ограничит
   q:dns 125 пачками), TrimLoop подрежет накопленную историю за проход.
+
+### 2026-10-24 — деплой T-177 (медленные запросы PG): конфиг, грант, проверка
+
+- Деплой `103171b`–`e85bc61` прошёл штатно (ci 11м47с → deploy 5м51с,
+  healthz зелёные, извещение Telegram доставлено — прокси работает).
+- PostgreSQL: `/etc/postgresql/16/main/crawler-postgresql.conf` заменён
+  версией из репо (перед заменой сверен md5 со старой репочной —
+  серверных правок не было; бэкап `.bak-t177` рядом), `systemctl
+  reload` — `SHOW log_min_duration_statement` = 3s без рестарта;
+  `GRANT pg_read_all_stats TO crawler` — тексты чужих сессий в
+  pg_stat_activity открыты.
+- Проверка (12:50–12:55 MSK): цикл monitor поднялся («цикл медленных
+  запросов» interval=10s порог=3s), gauge `crawler_pg_slow_queries` и
+  счётчик `{app}` в /metrics; 11 событий за 5 минут, 0 ошибок
+  Telegram-доставки. Реальные находки сразу: LATERAL-скан
+  RequeueRenderPending (~10 с, scheduler), агрегаты dashboard/crawlerctl
+  status (5–12 с), пачки http-worker — рендер-долг этапа 25 виден в
+  Telegram без ручного SQL (цель T-175 частично закрыта сигналом).
+- Наблюдение оператору: на текущем голоде CPU (PSI ~80–90 %) штатные
+  агрегаты регулярно превышают 3 с — темп сообщений ~2/мин. Если
+  тонет — поднять `monitor.slow_query_min_duration` (например, до
+  10–15 с; коридор до 1h) или выключить цикл интервалом 0; полный
+  след остаётся в журнале сервера независимо.
+- Откат: вернуть `.bak-t177` + reload; `REVOKE pg_read_all_stats FROM
+  crawler`; бинарники — деплой предыдущей версии (bin.prev).
