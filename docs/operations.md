@@ -476,3 +476,30 @@ Telegram и Actions).
   ошибок отправки нет, отчёты ходят в группу.
 - Откат: убрать `https_proxy` из `crawler.env` + restart monitor;
   на VPS — `systemctl disable --now tinyproxy && apt purge tinyproxy`.
+
+### 2026-10-24 — морозка притока: остановка scheduler для дренажа q:render
+
+- Причина: бэклог q:render ~119 тыс. записей (118 681 на момент
+  остановки) — приток сравнялся с дренажём, лаг у watermark 100К
+  не таял (паттерн config.go T-142). Решение — заморозить приток,
+  дать очереди рассосаться (прецедент морозки 2026-10-22).
+- Действие 10:26:37 MSK: `systemctl stop crawler-scheduler` — чистый
+  graceful shutdown (текущая пачка доработана, пул БД закрыт,
+  exit 0). Юнит остался enabled (ребут вернёт — сознательно);
+  конвейер (dns/http/render/analyzer/monitor) не трогали.
+- Контроль через 2 ч: q:dns (сток 122 пачки у watermark 125) и
+  q:http дренированы до нуля (lag 0, pending 0), докатившаяся волна
+  переработана http-этапом; живой остаток q:render ≈100 тыс.
+  (lag 94 765 + pending 5 222) при нулевом притоке — чистый
+  монотонный дренаж ~29–34 записи/с (T-092), ETA ~1 ч; q:analyze
+  поспевает за рендером (lag 0).
+- Нюанс остановленного scheduler (все циклы — в одном сервисе,
+  cmd/scheduler/main.go): TrimLoop не подрезает подтверждённую
+  историю — XLEN стримов растёт (q:http 41 тыс., q:analyze 81 тыс.
+  на момент проверки), потолки MAXLEN T-025 держат бюджет; LeaseWatch
+  стоит — зависшие queued вернёт первый lease-проход после старта.
+  На паузе XLEN — не показатель глубины, смотреть лаги групп
+  (`XINFO GROUPS` / `crawler_queue_depth` воркеров).
+- Возврат: `systemctl start crawler-scheduler` после q:render → 0 —
+  EnqueueLoop возьмёт накопленный pending (гейт T-026 ограничит
+  q:dns 125 пачками), TrimLoop подрежет накопленную историю за проход.
