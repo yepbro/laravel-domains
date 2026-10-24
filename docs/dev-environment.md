@@ -492,6 +492,11 @@ make debug SERVICE=dns-worker
 # затем в IDE подключиться к 127.0.0.1:2345
 ```
 
+`make debug` запускает одноразовый run-контейнер сервиса с его статическим
+адресом в crawler_net (план адресов — [`docker.md`](docker.md) §8):
+предварительно остановите штатный контейнер сервиса
+(`docker compose … stop <сервис>`), иначе run-контейнер не получит адрес.
+
 Для постоянного запуска сервиса под отладчиком скопируйте
 `deploy/docker/compose.override.example.yaml` → `compose.override.yaml`.
 

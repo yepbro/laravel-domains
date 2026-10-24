@@ -10,11 +10,35 @@
 #   runtime        render — боевой render-контейнер (Dockerfile.render)
 #   tools          adminer, redis-insight, tools (запускаются по требованию)
 #
-# Сеть crawler_net использует статические адреса:
-#   postgres 172.28.100.2, redis 172.28.100.3, unbound 172.28.100.10, coredns 172.28.100.11,
-#   testweb 172.28.100.12, mockserver 172.28.100.13, chromium 172.28.100.14,
-#   render (профиль runtime) 172.28.100.15,
-#   172.28.100.250 — «чёрная дыра» (адрес без слушателя для сценариев закрытых портов).
+# Сеть crawler_net (172.28.100.0/24) — детерминированные адреса (T-180):
+# ipv4_address задан всем долгоживущим сервисам. Динамический аллокатор
+# Docker не резервирует адреса остановленных контейнеров, и стартующий
+# динамический сервис занимал чужой адрес — владелец падал «Address
+# already in use» (инциденты 2026-10-23/24 — tasks/tasks.md, этап 28).
+# План адресов по классам (таблица с профилями — docs/docker.md §8):
+#   инфраструктура: postgres 172.28.100.2, redis 172.28.100.3, unbound 172.28.100.10
+#   testbed:        coredns 172.28.100.11, testweb 172.28.100.12, mockserver 172.28.100.13
+#   app:            chromium 172.28.100.14; monitor 172.28.100.20, ingest 172.28.100.21,
+#                   scheduler 172.28.100.22, dns-worker 172.28.100.23, http-worker 172.28.100.24,
+#                   render-worker 172.28.100.25, analyzer 172.28.100.26, web 172.28.100.27,
+#                   dashboard 172.28.100.28 — адрес .2k = порт метрик 910k; .29 — резерв
+#   runtime:        render 172.28.100.15
+#   monitoring:     prometheus 172.28.100.30
+#   tools:          adminer 172.28.100.31, redis-insight 172.28.100.32 (далее свободно)
+#   172.28.100.250 — «чёрная дыра» (адрес без слушателя для сценариев
+#   закрытых портов) — не занимается ни одним сервисом.
+# Адреса инфраструктуры/testbed/chromium/render неизменны исторически и
+# менять их нельзя — они зафиксированы у потребителей: testbedgen печёт
+# .12 в DNS-зоны (cmd/testbedgen/main.go Network.TestwebIP), live-тесты
+# рендера ходят на ws://172.28.100.14:9222, DSN .2 — config.dev.yaml
+# и тесты миграций.
+# Исключение — run-контейнер tools: адрес НЕ задаётся (см. комментарий
+# у сервиса tools). Остаточный риск: живой одноразовый run-контейнер
+# (make test/lint/debug, docker compose run) может динамически занять
+# адрес остановленного статического сервиса — аллокатор выдаёт свободные
+# адреса с младших — и владелец не стартанёт «Address already in use»
+# до завершения run-контейнера; окно ограничено его временем жизни и
+# самозалечивается (--rm).
 # Приложениям адреса инфраструктуры выдаются через переменные окружения,
 # а DNS всех сервисов приложения указывает на unbound (см. 7.2 ТЗ).
 
@@ -251,6 +275,8 @@ services:
 
   # ==========================================================================
   # Приложения проекта (profile: app)
+  # Статические адреса .20–.28: адрес .2k = порт метрик 910k (план — шапка
+  # файла, docs/docker.md §8); .29 — резерв под новый сервис app.
   # ==========================================================================
 
   ingest:
@@ -276,6 +302,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.21
     profiles: ["app"]
 
   scheduler:
@@ -292,6 +321,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.22
     profiles: ["app"]
 
   dns-worker:
@@ -308,6 +340,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.23
     profiles: ["app"]
 
   http-worker:
@@ -335,6 +370,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.24
     profiles: ["app"]
 
   render-worker:
@@ -351,6 +389,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.25
     profiles: ["app"]
 
   analyzer:
@@ -367,6 +408,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.26
     profiles: ["app"]
 
   monitor:
@@ -383,6 +427,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.20
     profiles: ["app"]
 
   web:
@@ -416,6 +463,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.27
     profiles: ["app"]
 
   dashboard:
@@ -444,6 +494,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.28
     profiles: ["app"]
 
   chromium:
@@ -543,7 +596,8 @@ services:
     ports:
       - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     networks:
-      - crawler_net
+      crawler_net:
+        ipv4_address: 172.28.100.30
     mem_limit: 256m
     restart: unless-stopped
     healthcheck:
@@ -565,7 +619,8 @@ services:
     ports:
       - "127.0.0.1:${ADMINER_PORT:-8080}:8080"
     networks:
-      - crawler_net
+      crawler_net:
+        ipv4_address: 172.28.100.31
     mem_limit: 128m
     restart: unless-stopped
     depends_on:
@@ -581,7 +636,8 @@ services:
     ports:
       - "127.0.0.1:${REDIS_INSIGHT_PORT:-5540}:5540"
     networks:
-      - crawler_net
+      crawler_net:
+        ipv4_address: 172.28.100.32
     mem_limit: 512m
     restart: unless-stopped
     depends_on:
@@ -593,6 +649,19 @@ services:
     # Контейнер с Go-тулчейном, crawlerctl, migrate, lint.
     # У него НЕ переопределён DNS (нужен proxy.golang.org для новых модулей),
     # поэтому новые зависимости качаются отсюда: make mod-download.
+    #
+    # Статический адрес НЕ задаётся — единственное исключение плана адресов
+    # (T-180): прогоны make test / lint / debug и docker compose run — это
+    # ОДНОРАЗОВЫЕ run-контейнеры, запускаемые параллельно из основного
+    # дерева и worktree'ов с COMPOSE_PROJECT_NAME=crawler, т.е. в ту же сеть
+    # crawler_net; общий статический адрес конфликтовал бы между ними
+    # («Address already in use»). Остаточный риск: живой run-контейнер может
+    # динамически занять адрес остановленного статического сервиса (аллокатор
+    # выдаёт свободные адреса с младших) — владелец не стартанёт до его
+    # завершения; окно ограничено временем жизни run-контейнера и
+    # самозалечивается (--rm). Аналогично make debug SERVICE=<app-сервис>:
+    # перед запуском остановите штатный контейнер сервиса (dc stop <svc>),
+    # иначе run-контейнер не получит его статический адрес.
     <<: *go-common
     build: *go-build
     command: ["sleep", "infinity"]
