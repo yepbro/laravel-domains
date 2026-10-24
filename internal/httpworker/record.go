@@ -265,16 +265,28 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 
 	// Флаг render_pending — той же транзакцией (T-066, §5.6): решение
 	// относится к этому результату (переполнение q:render в момент
-	// записи), сбой фиксации откатывает и строки, и флаг; строка уже
-	// заблокирована UPDATE выше — RowsAffected обязан быть 1.
+	// записи), сбой фиксации откатывает и строки, и флаг. Охрана бита
+	// (T-175): RowsAffected 1 — реальный переход 0→1 (счётчик долга +1
+	// здесь же, той же транзакцией, renderBumpDebtCounter), 0 — флаг уже
+	// стоит (повторная доставка эпизода, пока проход доработки не
+	// снял): семантика OR идемпотентна, счётчик наращивается только на
+	// переходы. Домен заблокирован UPDATE выше — ноль у SET бывает
+	// только от уже стоящего бита; отсутствие строки счётчика — отдельная
+	// ошибка шага ниже, откатывающая транзакцию целиком.
+	// Сдвиг счётчика выполняется последним оператором перед фиксацией
+	// (bumpDebt ниже): строка счётчика — единая точка сериализации всех
+	// флажащих транзакций (ревью T-175, P3-4), держать её блокировку
+	// всю тяжёлую часть (DELETE/своп ссылок/INSERT) незачем.
+	bumpDebt := false
 	if renderPending {
 		tag, err := tx.Exec(ctx, renderSetPendingSQL, res.ZoneID, res.DomainID)
 		if err != nil {
 			return false, fmt.Errorf("httpworker: домен %s: флаг render_pending: %w", res.Name, err)
 		}
-		if tag.RowsAffected() != 1 {
+		if tag.RowsAffected() > 1 {
 			return false, fmt.Errorf("httpworker: домен %s: флаг render_pending: затронуто %d строк", res.Name, tag.RowsAffected())
 		}
+		bumpDebt = tag.RowsAffected() == 1
 	}
 
 	// Перезапись (§3.5): старые строки домена уходят целиком, их ссылки
@@ -297,6 +309,13 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		}
 		if int(tag.RowsAffected()) != len(batch.zone) {
 			return false, fmt.Errorf("httpworker: домен %s: вставлено %d строк из %d", res.Name, tag.RowsAffected(), len(batch.zone))
+		}
+	}
+	// Счётчик долга — последним шагом транзакции (та же фиксация, §3.4:
+	// откат откатывает пару; окно блокировки строки счётчика — минимум).
+	if bumpDebt {
+		if err := renderBumpDebtCounter(ctx, tx, 1); err != nil {
+			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

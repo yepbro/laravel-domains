@@ -292,7 +292,8 @@ func TestFormatLoadReport_Deltas(t *testing.T) {
 		queue.StreamRender: {Len: 116320, Read: 0},
 	}
 
-	r := formatLoadReport(st, &busy, &io, procCPU, queues, rates, true, prevQueues, nil)
+	debt := RenderDebt{Flags: 443000, Lag: 99120}
+	r := formatLoadReport(st, &busy, &io, procCPU, queues, rates, true, prevQueues, nil, &debt)
 	for _, want := range []string{
 		"CPU 98% (io 0%)",
 		"PSI 92% [5м 90%]",
@@ -302,6 +303,7 @@ func TestFormatLoadReport_Deltas(t *testing.T) {
 		"PSI mem 8% / full 2%",
 		"q:dns 121 (±0, 3.5/с)",
 		"q:render 115120 (−1200, 2.0/с)",
+		"📬 Рендер-долг: флаги 443000 + лаг 99120 = 542120",
 	} {
 		if !strings.Contains(r, want) {
 			t.Errorf("отчёт не содержит %q:\n%s", want, r)
@@ -321,14 +323,22 @@ func TestFormatLoadReport_Degraded(t *testing.T) {
 		MemTotal: 8 << 30, MemAvailable: 4 << 30,
 		Procs: map[string]ProcAgg{"a": {RSS: 1 << 30}},
 	}
-	r := formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, nil)
-	for _, want := range []string{"CPU н/д", "Топ CPU: н/д", "📬 Очереди: н/д", "📀 Диск: н/д"} {
+	r := formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, nil, nil)
+	for _, want := range []string{"CPU н/д", "Топ CPU: н/д", "📬 Очереди: н/д", "📀 Диск: н/д", "📬 Рендер-долг: н/д"} {
 		if !strings.Contains(r, want) {
 			t.Errorf("деградированный отчёт не содержит %q:\n%s", want, r)
 		}
 	}
 	if strings.Contains(r, "PSI") {
 		t.Errorf("PSI попал в отчёт без данных:\n%s", r)
+	}
+
+	// Источник долга независим от очередей (ревью T-175, P3-1): при
+	// недоступных очередях строка долга всё равно печатается.
+	debt := RenderDebt{Flags: 443000, Lag: 99120}
+	r = formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, nil, &debt)
+	if !strings.Contains(r, "📬 Рендер-долг: флаги 443000 + лаг 99120 = 542120") {
+		t.Errorf("долг не напечатан при н/д очередях:\n%s", r)
 	}
 }
 

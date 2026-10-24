@@ -837,6 +837,7 @@ rules:
 | `load_report_interval` | `CRAWLER_MONITOR_LOAD_REPORT_INTERVAL` | длительность | `10m` (0 — выключен; коридор 1m..1h; T-173) |
 | `slow_query_interval` | `CRAWLER_MONITOR_SLOW_QUERY_INTERVAL` | длительность | `10s` (0 — выключен; коридор 5s..10m; T-177) |
 | `slow_query_min_duration` | `CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION` | длительность | `3s` (0 — дефолт; коридор 1s..1h; T-177) |
+| `render_debt_interval` | `CRAWLER_MONITOR_RENDER_DEBT_INTERVAL` | длительность | `5m` (коридор 30s..1h; T-175) |
 | `ingest_metrics_url` | `CRAWLER_MONITOR_INGEST_METRICS_URL` | http(s)-URL | `http://127.0.0.1:9101/metrics` |
 | `alerts.telegram` | `CRAWLER_MONITOR_ALERTS_TELEGRAM` | bool | `true` (T-162) |
 | `alerts.telegram_script` | `CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT` | путь | `/opt/crawler/bin/telegram-notify.sh` |
@@ -846,6 +847,8 @@ rules:
 | `alerts.psi_cpu_percent` | `CRAWLER_MONITOR_ALERTS_PSI_CPU_PERCENT` | число 0–100 | `90` |
 | `alerts.psi_cpu_window` | `CRAWLER_MONITOR_ALERTS_PSI_CPU_WINDOW` | длительность | `30m` (коридор 1m..6h) |
 | `alerts.mem_high_passes` | `CRAWLER_MONITOR_ALERTS_MEM_HIGH_PASSES` | целое 1..10 | `2` |
+| `alerts.render_debt_domains` | `CRAWLER_MONITOR_ALERTS_RENDER_DEBT_DOMAINS` | целое 1..100000000 | `50000` (T-175) |
+| `alerts.render_debt_passes` | `CRAWLER_MONITOR_ALERTS_RENDER_DEBT_PASSES` | целое 1..10 | `2` (T-175) |
 
 `listen` — адрес HTTP-эндпоинта самого сервиса monitor (`/livez` +
 `/healthz` + `/metrics`, его собственные метрики): у каждого сервиса
@@ -908,6 +911,21 @@ pid: текст» (обрезка 160 символов; полный текст 
 метриками `crawler_pg_slow_queries` / `crawler_pg_slow_queries_total`
 (метка `app`). `slow_query_interval: 0` — выключить (коридор 5s..10m),
 `slow_query_min_duration` — коридор 1s..1h, `0` — дефолт цикла.
+`render_debt_interval` — период цикла рендер-долга (T-175; алерт
+`render_debt` оценивается проходом алертов по `zone_stats_interval`,
+это поле задаёт только свежесть gauge и сводки): раз в период
+monitor читает счётчик доменов с флагом `render_pending`
+(`crawler_counters`, миграция 000015 — значение ведут переходы бита, а
+не периодический пересчёт: счёт по битовой маске — seq scan 41,8 млн
+строк) и лаг стрима `q:render`, пишет gauge
+`crawler_render_pending_domains` (флаги; лаг — уже
+`crawler_queue_depth{queue="q:render"}`) и строку сводки в журнал
+(Debug — журнал не флудит); та же цифра — строкой «Рендер-долг» в отчёте
+нагрузки (T-173) и данными алерта `render_debt`. Проход — точечный
+Lookup по PK и XLEN (миллисекунды), период выбирает свежесть gauge, а не
+стоимость: долг — медленная величина (дренаж `q:render` ≈1–2 стр/с,
+замер §12), 5 минут — как пересчёт зон; коридор 30s..1h — по образцу
+`zone_stats_interval`.
 
 `alerts` (T-162) — недостающие пороги ТЗ 5.9 (замер §12: все P0 того
 периода найдены вручную) и доставка алертов оператору; семантика
@@ -938,7 +956,16 @@ pid: текст» (обрезка 160 символов; полный текст 
 - `mem_high_passes` — проходов алертов подряд с ростом счётчика
   memory.events high юнита (алерт `memory_high`, троттлинг MemoryHigh
   http-worker — предвестник фаталов T-157; 2 × 5 мин = 10 мин
-  устойчивого давления).
+  устойчивого давления);
+- `render_debt_domains` + `render_debt_passes` — порог рендер-долга
+  (флаги `render_pending` + лаг `q:render`) и серия растущих проходов
+  до срабатывания алерта `render_debt` (T-175): долг выше порога И
+  растёт — приток SPA обгоняет дренаж (алерт `queue_frozen` не ловит
+  накопление: доставки идут); 50 тыс. — ниже долга морозки 24.10
+  (443 тыс.), выше фона локальных переполнений. Сработавший алерт
+  снимается только дренажем ниже 90 % порога (гистерезис: колебания
+  лага при стационарном долге не качают эпизод), проходы серии — период
+  цикла алертов (`zone_stats_interval`).
 
 ### `web` (этап 13, T-121)
 

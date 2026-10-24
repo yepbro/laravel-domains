@@ -59,7 +59,14 @@
 //     psi_cpu_window (PSISource, реализация OSPSI — psi.go): голод
 //     планировщика, на котором тонут все этапы разом (замер §12:
 //     some 91–95 % в пиках; T-158 дал monitor'у вес CPU 50 против
-//     1000 — собственные проходы голод не приближают).
+//     1000 — собственные проходы голод не приближают);
+//   - накопление рендер-долга (T-175) — флаги render_pending
+//     (счётчик crawler_counters, миграция 000015) + лаг q:render
+//     (renderdebt.go) выше monitor.alerts.render_debt_domains И растёт
+//     monitor.alerts.render_debt_passes проходов подряд: очередь
+//     переполнена и приток обгоняет дренаж — алерт T-162
+//     «замороженная очередь» такой случай не ловит (доставки идут),
+//     долг 443 тыс. (морозка 24.10) нашли ручным SQL.
 //
 // Доставка (T-162): переходы алертов (срабатывание/снятие) уходят
 // оператору в Telegram — хук AlertsOptions.OnPass (TelegramNotifier,
@@ -145,6 +152,7 @@ const (
 	AlertMemHigh       = "memory_high"          // троттлинг MemoryHigh (T-162)
 	AlertQueueFreeze   = "queue_frozen"         // замороженная очередь (T-162)
 	AlertPSICPU        = "psi_cpu"              // PSI CPU some (T-162)
+	AlertRenderDebt    = "render_debt"          // накопление рендер-долга (T-175)
 )
 
 // alertDescs — человекочитаемые описания алертов для записей лога.
@@ -163,6 +171,7 @@ var alertDescs = map[string]string{
 	AlertMemHigh:       "троттлинг MemoryHigh юнита (устойчивый рост reclaim-событий)",
 	AlertQueueFreeze:   "замороженная очередь: группа не читает стрим",
 	AlertPSICPU:        "голод CPU (PSI some) устойчиво выше порога",
+	AlertRenderDebt:    "накопление рендер-долга: приток SPA обгоняет дренаж q:render",
 }
 
 // Пороги оценки. Числа ТЗ не задаёт; переиспользуются существующие пороги
@@ -292,6 +301,26 @@ const (
 	// (850M у http-worker, T-145): мягкий потолок и должен придавливать
 	// пики; устойчивый рост — предвестник фаталов T-157.
 	DefaultMemHighMinPasses = 2
+
+	// DefaultRenderDebtDomains — порог рендер-долга, включающий алерт
+	// при росте (T-175): 50 тыс. доменов. Ориентир — фактический долг
+	// морозки 24.10 (443 тыс. флагов + лаг q:render, найден ручным SQL)
+	// на порядок выше порога, а здоровый фон — тысячи (локальное
+	// переполнение при волне SPA гасится проходом доработки за минуты):
+	// 50 тыс. — это сутки стагнации дренажа при темпе притока волны
+	// (~0,6 дом/с), уверенное накопление, а не шум фона. Выше порога без
+	// роста алерт не включается — стагнация видна строкой долга отчёта
+	// нагрузки (T-173), алерт — про накопление.
+	DefaultRenderDebtDomains = 50000
+
+	// DefaultRenderDebtPasses — проходов алертов подряд с ростом долга
+	// до срабатывания render_debt (T-175): 2 × 5 мин = 10 мин
+	// непрерывного роста (по образцу mem_high_passes). Разовый скачок
+	// (волна SPA против замороженного дренажа на минуту) — штатное
+	// переполнение с флагами, проход доработки разбирает его сам;
+	// устойчивый рост — переполнение стало стационарным, оператору
+	// пора решать (контексты рендера, приток планировщика).
+	DefaultRenderDebtPasses = 2
 )
 
 // dnsShareSQL — числитель и знаменатель доли temp_error одним проходом по
@@ -674,6 +703,14 @@ type AlertsOptions struct {
 	// memory.events high до срабатывания memory_high
 	// (monitor.alerts.mem_high_passes, T-162); ≤ 0 — DefaultMemHighMinPasses.
 	MemHighMinPasses int
+	// RenderDebtDomains — порог рендер-долга (флаги + лаг q:render),
+	// включающий алерт при росте (monitor.alerts.render_debt_domains,
+	// T-175); ≤ 0 — DefaultRenderDebtDomains.
+	RenderDebtDomains int64
+	// RenderDebtPasses — проходов подряд с ростом долга до срабатывания
+	// render_debt (monitor.alerts.render_debt_passes, T-175); ≤ 0 —
+	// DefaultRenderDebtPasses.
+	RenderDebtPasses int
 	// Now — источник времени (возраст zones.updated_at); nil — time.Now.
 	Now func() time.Time
 	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
@@ -710,6 +747,12 @@ func (o AlertsOptions) withDefaults() AlertsOptions {
 	}
 	if o.MemHighMinPasses <= 0 {
 		o.MemHighMinPasses = DefaultMemHighMinPasses
+	}
+	if o.RenderDebtDomains <= 0 {
+		o.RenderDebtDomains = DefaultRenderDebtDomains
+	}
+	if o.RenderDebtPasses <= 0 {
+		o.RenderDebtPasses = DefaultRenderDebtPasses
 	}
 	return o
 }
@@ -820,6 +863,23 @@ type freezeTrack struct {
 	since  time.Time
 }
 
+// renderDebtTrack — память трекинга рендер-долга (T-175): прошлый
+// снимок, серия проходов подряд с ростом (стиль memHighTrack) и защёлка
+// сработавшего эпизода. Рост — строго увеличение Total: дренаж и приток
+// плещутся вокруг константы — стагнация, а не накопление, серию не
+// копит. Защёлка firing переживает «не измеряется» (сбой источника
+// состояние алерта перезаписывает, ревью T-175 раунд 2, P2-1):
+// удержание обязано опираться на неё, а не на прошлый статус — иначе
+// короткий сбой БД/Redis посреди эпизода давал бы ложное ✅
+// «Восстановлено» при долге выше порога снятия; сбрасывает защёлку
+// только фактический дренаж ниже порога.
+type renderDebtTrack struct {
+	prev   int64
+	streak int
+	seen   bool
+	firing bool
+}
+
 // Alerts — оценка алертов с памятью состояний между проходами
 // (гистерезис, фронтовые записи лога только на переходах).
 type Alerts struct {
@@ -844,6 +904,9 @@ type Alerts struct {
 	// psiHot — момент первого наблюдения PSI выше порога (T-162);
 	// нулевое время — давления нет, окно устойчивости не тикает.
 	psiHot time.Time
+	// renderDebt — трекинг роста рендер-долга (T-175): прошлый снимок и
+	// серия растущих проходов.
+	renderDebt renderDebtTrack
 }
 
 // NewAlerts строит оценщик: нормализует опции (дефолты периодов), источники
@@ -893,6 +956,7 @@ func (a *Alerts) evaluators() []alertEval {
 		{AlertQueueFreeze, a.evalQueueFreeze},
 		{AlertRedisMemory, a.evalRedisMemory},
 		{AlertPSICPU, a.evalPSICPU},
+		{AlertRenderDebt, a.evalRenderDebt},
 	}
 }
 
@@ -1572,6 +1636,83 @@ func (a *Alerts) evalPSICPU(ctx context.Context, _ string) verdict {
 		}
 	}
 	return verdict{status: AlertStatusOK, detail: detail}
+}
+
+// evalRenderDebt — накопление рендер-долга (T-175): срабатывание —
+// долг (флаги render_pending по счётчику crawler_counters + лаг q:render,
+// renderdebt.go) выше monitor.alerts.render_debt_domains И растёт
+// render_debt_passes проходов подряд (серия положительных дельт,
+// стиль evalMemHigh). Снятие — дренаж долга ниже 90 % порога: долг —
+// УРОВЕНЬ (флаги + лаг), а не монотонный счётчик, лаг q:render
+// колеблется на сотни-тысячи за проход при дренаже ~1–2 стр/с — снятие
+// «по не-росту» качало бы эпизод 🚨/✅ каждые несколько проходов на
+// стационарном высоком долге (ревью T-175, P2-1). Поэтому рост — только
+// триггер (стагнация без серии роста не будит оператора — она видна
+// строкой «Рендер-долг» отчёта нагрузки T-173 и gauge), уровень —
+// удержание и снятие (гистерезис 90 % против дребезга у порога, стиль
+// очередей AlertQueueRecoverFactor; ceil, чтобы малые пороги не теряли
+// зазор — при пороге 1 снятие < 1 достигается нулём, ревью раунд 2
+// P3-3). Удержание опирается на защёлку трекинга, а не прошлый статус:
+// «не измеряется» (сбой источника) состояние алерта перезаписывает, а
+// эпизод не рвёт (ревью раунд 2, P2-1). Первый проход — база (рост
+// неизвестен). Порог, а не только рост: здоровый фон — тысячи флагов
+// локальных переполнений, алертом считается именно накопление в
+// масштабе суток дренажа. Источники — те же пул БД и гейт глубин, что у
+// остальных алертов (счётчик — точечный Lookup, лаг — XLEN той же
+// семантики, что queue_overflow): ошибка любого — «не измеряется» с
+// Warn, память трекинга не трогается (восстановление доедет по
+// фактическому долгу). Отсутствие строки счётчика (ручная правка
+// таблицы, runbooks §6) — ошибка с Warn, а не тихий ноль: gauge долга
+// не должен лгать.
+func (a *Alerts) evalRenderDebt(ctx context.Context, _ string) verdict {
+	if a.deps.Redis == nil {
+		return verdict{status: AlertStatusNotMeasured, detail: "Redis не задан"}
+	}
+	d, err := renderDebtOf(ctx, a.deps.Pool, a.deps.Redis)
+	if err != nil {
+		return verdict{err: err}
+	}
+	tr := a.renderDebt
+	var delta int64
+	if tr.seen && d.Total() > tr.prev {
+		tr.streak++
+		delta = d.Total() - tr.prev
+	} else {
+		tr.streak = 0
+	}
+	tr.seen, tr.prev = true, d.Total()
+
+	// Порог снятия — 90 % порога срабатывания, целочисленный ceil:
+	// гистерезис против дребезга у порога (ревью T-175, P2-1), коридор
+	// ≥ 1 при любом допустимом пороге (минимум 1) — сработавший алерт
+	// всегда достижим для снятия (ревью раунд 2, P3-3); при 50 тыс.
+	// снятие — ниже 45 тыс.
+	recoverAt := (a.opts.RenderDebtDomains*9 + 9) / 10
+	detail := fmt.Sprintf("рендер-долг: %s, порог %d (снятие < %d), серия роста %d/%d проходов (+%d за проход)",
+		d.String(), a.opts.RenderDebtDomains, recoverAt, tr.streak, a.opts.RenderDebtPasses, delta)
+	var v verdict
+	switch {
+	case d.Total() > a.opts.RenderDebtDomains && tr.streak >= a.opts.RenderDebtPasses:
+		tr.firing = true
+		v = verdict{
+			status: AlertStatusFiring,
+			detail: detail + " — накопление: приток SPA обгоняет дренаж (render.contexts / приток планировщика, разбор — docs/runbooks.md)",
+		}
+	case tr.firing && d.Total() >= recoverAt:
+		// Удержание сработавшего: колебания лага при стационарном долге
+		// (серия роста сброшена, уровень выше порога снятия) — эпизод
+		// живёт до фактического дренажа. Защёлка, а не прошлый статус:
+		// сбой источника («не измеряется») эпизод не закрывает.
+		v = verdict{
+			status: AlertStatusFiring,
+			detail: detail + " — долг держится выше порога снятия (уровень — строка «Рендер-долг» отчёта нагрузки)",
+		}
+	default:
+		tr.firing = false
+		v = verdict{status: AlertStatusOK, detail: detail}
+	}
+	a.renderDebt = tr
+	return v
 }
 
 // AlertsLoop — периодический цикл оценки алертов (стиль ZoneStatsLoop):

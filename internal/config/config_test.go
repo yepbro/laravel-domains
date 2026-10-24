@@ -124,6 +124,9 @@ func TestDefault(t *testing.T) {
 		{"monitor.alerts.psi_cpu_percent", c.Monitor.Alerts.PSICPUPercent, 90.0},
 		{"monitor.alerts.psi_cpu_window", c.Monitor.Alerts.PSIWindow.D(), 30 * time.Minute},
 		{"monitor.alerts.mem_high_passes", c.Monitor.Alerts.MemHighPasses, 2},
+		{"monitor.render_debt_interval", c.Monitor.RenderDebtInterval.D(), 5 * time.Minute},
+		{"monitor.alerts.render_debt_domains", c.Monitor.Alerts.RenderDebtDomains, int64(50000)},
+		{"monitor.alerts.render_debt_passes", c.Monitor.Alerts.RenderDebtPasses, 2},
 		{"web.listen", c.Web.Listen, "127.0.0.1:8080"},
 		{"web.rate_limit", c.Web.RateLimit, 4},
 		{"web.timeout", c.Web.Timeout.D(), 60 * time.Second},
@@ -252,6 +255,7 @@ monitor:
   zone_stats_interval: "30s"
   slow_query_interval: "15s"
   slow_query_min_duration: "5s"
+  render_debt_interval: "2m"
   alerts:
     telegram: false
     telegram_script: "/srv/telegram-notify.sh"
@@ -261,6 +265,8 @@ monitor:
     psi_cpu_percent: 85.5
     psi_cpu_window: "45m"
     mem_high_passes: 3
+    render_debt_domains: 123456
+    render_debt_passes: 3
 dashboard:
   listen: "127.0.0.1:8190"
   refresh: "15s"
@@ -358,6 +364,9 @@ log:
 		{"monitor.alerts.psi_cpu_percent", cfg.Monitor.Alerts.PSICPUPercent, 85.5},
 		{"monitor.alerts.psi_cpu_window", cfg.Monitor.Alerts.PSIWindow.D(), 45 * time.Minute},
 		{"monitor.alerts.mem_high_passes", cfg.Monitor.Alerts.MemHighPasses, 3},
+		{"monitor.render_debt_interval", cfg.Monitor.RenderDebtInterval.D(), 2 * time.Minute},
+		{"monitor.alerts.render_debt_domains", cfg.Monitor.Alerts.RenderDebtDomains, int64(123456)},
+		{"monitor.alerts.render_debt_passes", cfg.Monitor.Alerts.RenderDebtPasses, 3},
 		{"dashboard.listen", cfg.Dashboard.Listen, "127.0.0.1:8190"},
 		{"dashboard.refresh", cfg.Dashboard.Refresh.D(), 15 * time.Second},
 		{"dashboard.status_cache_ttl", cfg.Dashboard.StatusCacheTTL.D(), 2 * time.Minute},
@@ -555,6 +564,9 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_MONITOR_ALERTS_PSI_CPU_PERCENT":      "88",
 		"CRAWLER_MONITOR_ALERTS_PSI_CPU_WINDOW":       "25m",
 		"CRAWLER_MONITOR_ALERTS_MEM_HIGH_PASSES":      "4",
+		"CRAWLER_MONITOR_RENDER_DEBT_INTERVAL":        "90s",
+		"CRAWLER_MONITOR_ALERTS_RENDER_DEBT_DOMAINS":  "654321",
+		"CRAWLER_MONITOR_ALERTS_RENDER_DEBT_PASSES":   "3",
 		"CRAWLER_WEB_LISTEN":                          "127.0.0.1:8088",
 		"CRAWLER_WEB_RATE_LIMIT":                      "10",
 		"CRAWLER_WEB_TIMEOUT":                         "90s",
@@ -651,6 +663,9 @@ func TestEnvOverrides(t *testing.T) {
 		{"monitor.alerts.psi_cpu_percent", cfg.Monitor.Alerts.PSICPUPercent, 88.0},
 		{"monitor.alerts.psi_cpu_window", cfg.Monitor.Alerts.PSIWindow.D(), 25 * time.Minute},
 		{"monitor.alerts.mem_high_passes", cfg.Monitor.Alerts.MemHighPasses, 4},
+		{"monitor.render_debt_interval", cfg.Monitor.RenderDebtInterval.D(), 90 * time.Second},
+		{"monitor.alerts.render_debt_domains", cfg.Monitor.Alerts.RenderDebtDomains, int64(654321)},
+		{"monitor.alerts.render_debt_passes", cfg.Monitor.Alerts.RenderDebtPasses, 3},
 		{"web.listen", cfg.Web.Listen, "127.0.0.1:8088"},
 		{"web.rate_limit", cfg.Web.RateLimit, 10},
 		{"web.timeout", cfg.Web.Timeout.D(), 90 * time.Second},
@@ -1034,6 +1049,13 @@ func TestValidate(t *testing.T) {
 		}, "monitor.alerts.psi_cpu_window"},
 		{"alerts mem_high_passes 0", func(c *Config) { c.Monitor.Alerts.MemHighPasses = 0 }, "monitor.alerts.mem_high_passes"},
 		{"alerts mem_high_passes велик", func(c *Config) { c.Monitor.Alerts.MemHighPasses = 11 }, "monitor.alerts.mem_high_passes"},
+		{"render_debt_interval 0", func(c *Config) { c.Monitor.RenderDebtInterval = 0 }, "monitor.render_debt_interval"},
+		{"render_debt_interval меньше 30с", func(c *Config) { c.Monitor.RenderDebtInterval = Duration(10 * time.Second) }, "monitor.render_debt_interval"},
+		{"render_debt_interval больше часа", func(c *Config) { c.Monitor.RenderDebtInterval = Duration(2 * time.Hour) }, "monitor.render_debt_interval"},
+		{"alerts render_debt_domains 0", func(c *Config) { c.Monitor.Alerts.RenderDebtDomains = 0 }, "monitor.alerts.render_debt_domains"},
+		{"alerts render_debt_domains сверх корпуса", func(c *Config) { c.Monitor.Alerts.RenderDebtDomains = 100000001 }, "monitor.alerts.render_debt_domains"},
+		{"alerts render_debt_passes 0", func(c *Config) { c.Monitor.Alerts.RenderDebtPasses = 0 }, "monitor.alerts.render_debt_passes"},
+		{"alerts render_debt_passes велик", func(c *Config) { c.Monitor.Alerts.RenderDebtPasses = 11 }, "monitor.alerts.render_debt_passes"},
 		{"alerts telegram без скрипта", func(c *Config) { c.Monitor.Alerts.TelegramScript = "" }, "monitor.alerts.telegram_script"},
 		{"web.listen кривой", func(c *Config) { c.Web.Listen = "no-port" }, "web.listen"},
 		{"web.listen относительный путь", func(c *Config) { c.Web.Listen = "web.sock" }, "web.listen"},

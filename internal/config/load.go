@@ -176,6 +176,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_MONITOR_LOAD_REPORT_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.LoadReportInterval })},
 		{"CRAWLER_MONITOR_SLOW_QUERY_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.SlowQueryInterval })},
 		{"CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION", setDuration(func(c *Config) *Duration { return &c.Monitor.SlowQueryMinDuration })},
+		{"CRAWLER_MONITOR_RENDER_DEBT_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.RenderDebtInterval })},
 		{"CRAWLER_MONITOR_INGEST_METRICS_URL", setString(func(c *Config) *string { return &c.Monitor.IngestMetricsURL })},
 		{"CRAWLER_MONITOR_ALERTS_TELEGRAM", setBool(func(c *Config) *bool { return &c.Monitor.Alerts.Telegram })},
 		{"CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT", setString(func(c *Config) *string { return &c.Monitor.Alerts.TelegramScript })},
@@ -185,6 +186,8 @@ func envSpecs() []envSpec {
 		{"CRAWLER_MONITOR_ALERTS_PSI_CPU_PERCENT", setFloat(func(c *Config) *float64 { return &c.Monitor.Alerts.PSICPUPercent })},
 		{"CRAWLER_MONITOR_ALERTS_PSI_CPU_WINDOW", setDuration(func(c *Config) *Duration { return &c.Monitor.Alerts.PSIWindow })},
 		{"CRAWLER_MONITOR_ALERTS_MEM_HIGH_PASSES", setInt(func(c *Config) *int { return &c.Monitor.Alerts.MemHighPasses })},
+		{"CRAWLER_MONITOR_ALERTS_RENDER_DEBT_DOMAINS", setInt64(func(c *Config) *int64 { return &c.Monitor.Alerts.RenderDebtDomains })},
+		{"CRAWLER_MONITOR_ALERTS_RENDER_DEBT_PASSES", setInt(func(c *Config) *int { return &c.Monitor.Alerts.RenderDebtPasses })},
 		{"CRAWLER_WEB_LISTEN", setString(func(c *Config) *string { return &c.Web.Listen })},
 		{"CRAWLER_WEB_RATE_LIMIT", setInt(func(c *Config) *int { return &c.Web.RateLimit })},
 		{"CRAWLER_WEB_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Web.Timeout })},
@@ -227,6 +230,17 @@ func setString(get func(*Config) *string) func(*Config, string) error {
 func setInt(get func(*Config) *int) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return fmt.Errorf("ожидается целое число, получено %q", v)
+		}
+		*get(c) = n
+		return nil
+	}
+}
+
+func setInt64(get func(*Config) *int64) func(*Config, string) error {
+	return func(c *Config, v string) error {
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 		if err != nil {
 			return fmt.Errorf("ожидается целое число, получено %q", v)
 		}

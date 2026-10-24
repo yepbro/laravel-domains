@@ -49,15 +49,19 @@ type alertsPool struct {
 	mu    sync.Mutex
 	share []alertShare   // очередь ответов dnsShareSQL (кончилась — нули)
 	fresh []sql.NullTime // очередь ответов zoneFreshSQL (кончилась — нулевая)
+	debt  []int64        // очередь ответов renderDebtFlagsSQL (кончилась — нули)
 
 	shareErrs []error
 	freshErrs []error
+	debtErrs  []error
 
 	// Деградации формы ответа: без строк (rows.Next ложен), строка с
 	// нечитаемыми типами (ошибка Scan), ошибка итерации (rows.Err).
 	shareEmpty, shareBadRow    bool
 	freshEmpty, freshBadRow    bool
+	debtEmpty, debtBadRow      bool
 	shareRowsErr, freshRowsErr error
+	debtRowsErr                error
 
 	queries []zonestatsCall // переиспользован: sql + args
 }
@@ -107,6 +111,22 @@ func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Row
 			p.fresh = p.fresh[1:]
 		}
 		return &alertRows{rows: [][]any{{t}}, err: p.freshRowsErr}, nil
+	case renderDebtFlagsSQL:
+		if err := popErr(&p.debtErrs); err != nil {
+			return nil, err
+		}
+		if p.debtEmpty {
+			return &alertRows{err: p.debtRowsErr}, nil
+		}
+		if p.debtBadRow {
+			return &alertRows{rows: [][]any{{"байты"}}, err: p.debtRowsErr}, nil
+		}
+		var v int64
+		if len(p.debt) > 0 {
+			v = p.debt[0]
+			p.debt = p.debt[1:]
+		}
+		return &alertRows{rows: [][]any{{v}}, err: p.debtRowsErr}, nil
 	default:
 		return nil, fmt.Errorf("alertsPool: неожидаемый SQL Query: %s", sqlQ)
 	}
@@ -1101,7 +1121,7 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 	}
 	wantNames := []string{AlertDNSErrors, AlertQueueOverflow, AlertProgressStall, AlertDiskFree,
 		AlertDiskMin, AlertDiskCrit, AlertNVMeWear, AlertBadHashes, AlertUnitOOM, AlertMemHigh,
-		AlertQueueDead, AlertQueueFreeze, AlertRedisMemory, AlertPSICPU}
+		AlertQueueDead, AlertQueueFreeze, AlertRedisMemory, AlertPSICPU, AlertRenderDebt}
 	if len(res.Alerts) != len(wantNames) {
 		t.Fatalf("алертов в снапшоте = %d, want %d", len(res.Alerts), len(wantNames))
 	}
@@ -1639,6 +1659,286 @@ func TestAlertsPSIDegradation(t *testing.T) {
 	}
 	if !strings.Contains(env2.buf.String(), "level=WARN") {
 		t.Errorf("ошибка чтения без Warn:\n%s", env2.buf.String())
+	}
+}
+
+// --- накопление рендер-долга (T-175) ---------------------------------------------
+
+// setRenderDebt — заготовка долга прохода: счётчик флагов в пуле, лаг
+// q:render в ленере (очереди ответов выстраиваются по проходам).
+func setRenderDebt(env *alertsTestEnv, flags, lag int64) {
+	env.pool.debt = append(env.pool.debt, flags)
+	env.lener.lens[queue.StreamRender] = lag
+}
+
+// TestAlertsRenderDebtGrowth — срабатывание на долге выше порога И
+// росте N проходов подряд; сработавший алерт ДЕРЖИТСЯ пока долг выше
+// 90 % порога (стагнация и колебания лага не качают эпизод 🚨/✅),
+// снятие — дренажом ниже порога снятия; первый проход — база.
+func TestAlertsRenderDebtGrowth(t *testing.T) {
+	env := newAlertsTestEnv(t, func(o *AlertsOptions) {
+		o.RenderDebtDomains = 50000
+		o.RenderDebtPasses = 2
+	})
+	ctx := context.Background()
+
+	// База: долг уже выше порога, но роста ещё нет.
+	setRenderDebt(env, 443000, 99000)
+	s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	if s.Status != AlertStatusOK {
+		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
+	}
+	if !strings.Contains(s.Detail, "флаги 443000 + лаг 99000 = 542000") {
+		t.Errorf("detail = %q, want сводка долга одной строкой", s.Detail)
+	}
+	if !strings.Contains(s.Detail, "снятие < 45000") {
+		t.Errorf("detail = %q, want порог снятия (гистерезис 90%%)", s.Detail)
+	}
+	// Растёт один проход — серии мало.
+	setRenderDebt(env, 445000, 99000)
+	s = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
+		t.Fatalf("один проход роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	}
+	// Второй проход роста — срабатывание.
+	setRenderDebt(env, 447000, 100000)
+	s = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	if s.Status != AlertStatusFiring {
+		t.Fatalf("второй проход роста: %s (%s), want firing", s.Status, s.Detail)
+	}
+	for _, want := range []string{"547000", "+3000", "накопление"} {
+		if !strings.Contains(s.Detail, want) {
+			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+		}
+	}
+	// Стагнация (рост прекратился) — алерт ДЕРЖИТСЯ: снятие «по
+	// не-росту» качало бы эпизод на колебаниях лага (ревью T-175, P2-1).
+	setRenderDebt(env, 447000, 100000)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+		t.Errorf("стагнация: %s (%s), want firing (удержание выше порога снятия)", s.Status, s.Detail)
+	}
+	// Колебания лага вокруг стационарного высокого долга — тоже
+	// удержание, не снятие.
+	setRenderDebt(env, 446500, 100300)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+		t.Errorf("колебание лага: %s (%s), want firing (удержание)", s.Status, s.Detail)
+	}
+	// Дренаж ниже порога снятия (90 % от 50 тыс.) — снятие; коридор
+	// гистерезиса (45000..50000) держал бы эпизод.
+	setRenderDebt(env, 44680, 300)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+		t.Errorf("ниже порога снятия: %s (%s), want ok", s.Status, s.Detail)
+	}
+	// В коридоре гистерезиса (без сработавшего алерта) — ok: порог
+	// срабатывания строгий.
+	setRenderDebt(env, 44680, 400)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+		t.Errorf("коридор гистерезиса без алерта: %s (%s), want ok", s.Status, s.Detail)
+	}
+	// Повторное накопление: серия сброшена не-ростом, два прохода роста
+	// выше порога — оба прохода проверяются (первый — серии ещё мало).
+	setRenderDebt(env, 44650, 0)
+	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt) // streak 0
+	setRenderDebt(env, 49800, 600)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
+		t.Errorf("первый проход повторного роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	}
+	setRenderDebt(env, 49900, 800)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+		t.Errorf("второй проход повторного роста: %s (%s), want firing", s.Status, s.Detail)
+	}
+	// Коридор удержания (45–50 тыс. при сработавшем алерте): снятие
+	// «ниже порога срабатывания» не выстреливает — держит до 45 тыс.
+	setRenderDebt(env, 30000, 18000)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+		t.Errorf("коридор удержания 48000: %s (%s), want firing (снятие < 45000, не < 50000)", s.Status, s.Detail)
+	}
+	// Снятие — только дренажем ниже порога снятия (90 % от 50 тыс.);
+	// 40 тыс. < 45 тыс. — восстановление.
+	setRenderDebt(env, 20000, 20000)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+		t.Errorf("ниже порога снятия: %s (%s), want ok", s.Status, s.Detail)
+	}
+}
+
+// TestAlertsRenderDebtJitter — дрожание уровня выше порога без
+// накопления (серия положительных дельт не набирается) — ложного
+// срабатывания нет; уже сработавший алерт дрожание не снимает (нет
+// ложных «восстановлений») — сценарий ревью T-175 P2-1.
+func TestAlertsRenderDebtJitter(t *testing.T) {
+	env := newAlertsTestEnv(t, func(o *AlertsOptions) {
+		o.RenderDebtDomains = 50000
+		o.RenderDebtPasses = 2
+	})
+	ctx := context.Background()
+
+	// Две положительные дельты подряд не набираются — алерт молчит.
+	for _, d := range []RenderDebt{
+		{Flags: 60000}, {Flags: 60050}, {Flags: 59980},
+		{Flags: 60040}, {Flags: 60020},
+	} {
+		setRenderDebt(env, d.Flags, d.Lag)
+		if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+			t.Fatalf("дрожание без серии роста: %s (%s), want ok", s.Status, s.Detail)
+		}
+	}
+
+	// Сработавший (двумя проходами роста) алерт дрожание не снимает:
+	// 60000 → 60100 → 60200 (firing) → 60150 → 60180 → 60120 — все выше
+	// порога снятия, эпизод один.
+	setRenderDebt(env, 60000, 0)
+	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	setRenderDebt(env, 60100, 0)
+	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	setRenderDebt(env, 60200, 0)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+		t.Fatalf("рост двумя проходами: %s (%s), want firing", s.Status, s.Detail)
+	}
+	for _, flags := range []int64{60150, 60180, 60120} {
+		setRenderDebt(env, flags, 0)
+		s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+		if s.Status != AlertStatusFiring {
+			t.Errorf("дрожание @%d: %s (%s), want firing (снятие — только дренаж)", flags, s.Status, s.Detail)
+		}
+	}
+}
+
+// TestAlertsRenderDebtBoundary — порог строгий (>): долг равен порогу
+// не срабатывает даже при росте; порог+1 — срабатывает при готовой
+// серии. Рост ниже порога серию копит (пересечение порога после
+// устойчивого роста — то же накопление).
+func TestAlertsRenderDebtBoundary(t *testing.T) {
+	env := newAlertsTestEnv(t, func(o *AlertsOptions) {
+		o.RenderDebtDomains = 100000
+		o.RenderDebtPasses = 2
+	})
+	ctx := context.Background()
+
+	setRenderDebt(env, 99000, 0)
+	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt) // база
+	setRenderDebt(env, 100000, 0)                     // == порогу: рост есть, порога нет
+	s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	if s.Status != AlertStatusOK {
+		t.Fatalf("долг == порогу: %s (%s), want ok (строгое сравнение)", s.Status, s.Detail)
+	}
+	setRenderDebt(env, 100001, 0) // порог+1 при серии роста 2
+	s = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	if s.Status != AlertStatusFiring {
+		t.Fatalf("порог+1 с серией 2: %s (%s), want firing", s.Status, s.Detail)
+	}
+}
+
+// TestAlertsRenderDebtDegradation — Redis не задан / ошибка счётчика /
+// строка счётчика отсутствует (ручная правка) / ошибка XLEN — «не
+// измеряется» с Warn; память трекинга ошибкой не трогается (восстанов
+// доедет по фактическому долгу).
+func TestAlertsRenderDebtDegradation(t *testing.T) {
+	// Redis не задан — как у алертов очередей.
+	env := newAlertsTestEnv(t, nil)
+	a := NewAlerts(AlertsDeps{Pool: env.pool}, env.opts)
+	if s := snapshotOf(t, a.Pass(context.Background()), AlertRenderDebt); s.Status != AlertStatusNotMeasured {
+		t.Errorf("Redis не задан: %s, want not_measured", s.Status)
+	}
+
+	// Ошибка запроса счётчика — Warn.
+	env2 := newAlertsTestEnv(t, nil)
+	env2.pool.debtErrs = []error{errors.New("бд недоступна")}
+	s := snapshotOf(t, env2.Pass(context.Background()), AlertRenderDebt)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "бд недоступна") {
+		t.Errorf("ошибка счётчика: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+	}
+	if !strings.Contains(env2.buf.String(), "level=WARN") {
+		t.Errorf("ошибка счётчика без Warn:\n%s", env2.buf.String())
+	}
+
+	// Строки счётчика нет (миграция не applied / ручная правка) — ошибка,
+	// не тихий ноль: gauge долга не должен лгать.
+	env3 := newAlertsTestEnv(t, nil)
+	env3.pool.debtEmpty = true
+	s = snapshotOf(t, env3.Pass(context.Background()), AlertRenderDebt)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "render_pending") {
+		t.Errorf("строки счётчика нет: %s (%s), want not_measured про строку", s.Status, s.Detail)
+	}
+
+	// Ошибка XLEN — Warn. До рендер-долга Len зовут ещё 5 раз (4 стрима
+	// алерта очередей + q:dead) — ошибка ставится шестой в очереди.
+	env4 := newAlertsTestEnv(t, nil)
+	env4.lener.errs = []error{nil, nil, nil, nil, nil, errors.New("redis: xlen")}
+	s = snapshotOf(t, env4.Pass(context.Background()), AlertRenderDebt)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "q:render") {
+		t.Errorf("ошибка XLEN: %s (%s), want not_measured про q:render", s.Status, s.Detail)
+	}
+	if !strings.Contains(env4.buf.String(), "level=WARN") {
+		t.Errorf("ошибка XLEN без Warn:\n%s", env4.buf.String())
+	}
+
+	// Память трекинга переживает ошибку: после сбоя рост считается от
+	// последнего успешного снимка.
+	env5 := newAlertsTestEnv(t, func(o *AlertsOptions) { o.RenderDebtPasses = 2 })
+	setRenderDebt(env5, 60000, 0)
+	_ = snapshotOf(t, env5.Pass(context.Background()), AlertRenderDebt) // база: prev=60000
+	env5.pool.debtErrs = []error{errors.New("бд недоступна")}
+	_ = snapshotOf(t, env5.Pass(context.Background()), AlertRenderDebt) // сбой: память не тронута
+	setRenderDebt(env5, 61000, 0)
+	if s := snapshotOf(t, env5.Pass(context.Background()), AlertRenderDebt); s.Status != AlertStatusOK ||
+		!strings.Contains(s.Detail, "серия роста 1/2") {
+		t.Errorf("рост после сбоя: %s (%s), want ok с серией 1/2 от последнего снимка", s.Status, s.Detail)
+	}
+
+	// Сработавший эпизод переживает сбой источника: удержание опирается
+	// на защёлку трекинга, а не прошлый статус («не измеряется»
+	// перезаписывает состояние, но не рвёт эпизод) — ревью раунд 2, P2-1.
+	env6 := newAlertsTestEnv(t, func(o *AlertsOptions) { o.RenderDebtPasses = 2 })
+	ctx6 := context.Background()
+	setRenderDebt(env6, 60000, 0)
+	_ = snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt) // база
+	setRenderDebt(env6, 61000, 0)
+	_ = snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt) // рост
+	setRenderDebt(env6, 62000, 0)
+	if s := snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt); s.Status != AlertStatusFiring {
+		t.Fatalf("до сбоя: %s (%s), want firing", s.Status, s.Detail)
+	}
+	env6.pool.debtErrs = []error{errors.New("бд недоступна")}
+	if s := snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt); s.Status != AlertStatusNotMeasured {
+		t.Fatalf("сбой источника: %s, want not_measured", s.Status)
+	}
+	setRenderDebt(env6, 61500, 0) // колебание вокруг того же долга, выше порога снятия
+	if s := snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt); s.Status != AlertStatusFiring {
+		t.Errorf("после сбоя, долг 61500: %s (%s), want firing (удержание пережило сбой — без ложного «восстановлено»)", s.Status, s.Detail)
+	}
+	setRenderDebt(env6, 20000, 0) // дренаж ниже порога снятия
+	if s := snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt); s.Status != AlertStatusOK {
+		t.Errorf("дренаж после сбоя: %s (%s), want ok (эпизод закрыт честно)", s.Status, s.Detail)
+	}
+}
+
+// TestAlertsRenderDebtTinyThreshold — порог 1 (край коридора конфига):
+// порог снятия — ceil(90 %) = 1, снятие достижимо нулевым долгом
+// (ревью раунд 2, P3-3: усечение int64(0.9) = 0 залипало бы алерт).
+func TestAlertsRenderDebtTinyThreshold(t *testing.T) {
+	env := newAlertsTestEnv(t, func(o *AlertsOptions) {
+		o.RenderDebtDomains = 1
+		o.RenderDebtPasses = 1
+	})
+	ctx := context.Background()
+
+	setRenderDebt(env, 0, 0)
+	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt) // база
+	setRenderDebt(env, 2, 0)                          // рост +2, выше порога 1
+	s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	if s.Status != AlertStatusFiring {
+		t.Fatalf("порог 1: %s (%s), want firing", s.Status, s.Detail)
+	}
+	if !strings.Contains(s.Detail, "снятие < 1") {
+		t.Errorf("detail = %q, want «снятие < 1» (ceil 90%% от 1)", s.Detail)
+	}
+	setRenderDebt(env, 1, 0) // ровно порог снятия — удержание
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+		t.Errorf("долг 1 при пороге снятия 1: %s, want firing (удержание)", s.Status)
+	}
+	setRenderDebt(env, 0, 0) // ноль — снятие
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+		t.Errorf("нулевой долг: %s (%s), want ok (снятие достижимо)", s.Status, s.Detail)
 	}
 }
 

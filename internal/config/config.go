@@ -448,6 +448,12 @@ type Monitor struct {
 	// postgresql.conf), одна граница «патология» в журнале сервера и в
 	// Telegram. 0 — дефолт цикла.
 	SlowQueryMinDuration Duration `yaml:"slow_query_min_duration"`
+	// RenderDebtInterval — период цикла рендер-долга (T-175): gauge
+	// crawler_render_pending_domains + строка сводки в журнал; проход —
+	// точечный Lookup счётчика и XLEN q:render (миллисекунды). Алерт
+	// render_debt ходит проходом алертов (zone_stats_interval), это поле
+	// его частоту не задаёт.
+	RenderDebtInterval Duration `yaml:"render_debt_interval"`
 	// IngestMetricsURL — адрес /metrics сервиса ingest (T-099): алерт
 	// мусорных content_hash очистки читает счётчик из экспозиции ingest
 	// зондом раз в период алертов. Тот же адрес, что скрейпит Prometheus;
@@ -494,6 +500,14 @@ type Alerts struct {
 	// memory.events high юнита (алерт memory_high, троттлинг MemoryHigh
 	// http-worker — предвестник фаталов T-157).
 	MemHighPasses int `yaml:"mem_high_passes"`
+	// RenderDebtDomains — порог рендер-долга (флаги render_pending +
+	// лаг q:render), включающий алерт render_debt при росте (T-175):
+	// 50 тыс. — ниже долга морозки 24.10 (443 тыс.), выше здорового
+	// фона локальных переполнений (тысячи).
+	RenderDebtDomains int64 `yaml:"render_debt_domains"`
+	// RenderDebtPasses — проходов алертов подряд с ростом долга до
+	// срабатывания render_debt (T-175; по образцу mem_high_passes).
+	RenderDebtPasses int `yaml:"render_debt_passes"`
 }
 
 // Web — публичный сервис лендинга (этап 13, T-121; продуктовое
@@ -801,6 +815,13 @@ func Default() *Config {
 			// log_min_duration_statement.
 			SlowQueryInterval:    Duration(10 * time.Second),
 			SlowQueryMinDuration: Duration(3 * time.Second),
+			// Рендер-долг (T-175): 5 минут — как пересчёт зон; проход
+			// дешёвый (Lookup + XLEN), период выбирает свежесть gauge —
+			// долг меняется темпом дренажа (~1 стр/с), быстрее
+			// пятиминутного окна не двигается; коридор — по образцу
+			// zone_stats_interval. Алерт render_debt оценивается проходом
+			// алертов (zone_stats_interval), не этим полем.
+			RenderDebtInterval: Duration(5 * time.Minute),
 			// Loopback ingest по METRICS_ADDR (systemd-юниты привязывают
 			// 127.0.0.1:9101); docker-сети переопределяют именем сервиса
 			// (config.dev.yaml: http://ingest:9101/metrics).
@@ -826,6 +847,11 @@ func Default() *Config {
 				PSICPUPercent:     90,
 				PSIWindow:         Duration(30 * time.Minute),
 				MemHighPasses:     2,
+				// Долг морозки 24.10 — 443 тыс.: порог на порядок ниже,
+				// фон локальных переполнений — тысячи (обоснование —
+				// internal/monitor DefaultRenderDebtDomains).
+				RenderDebtDomains: 50000,
+				RenderDebtPasses:  2,
 			},
 		},
 		Web: Web{
@@ -1346,6 +1372,14 @@ func (c *Config) Validate() error {
 		problems = append(problems, fmt.Sprintf("monitor.slow_query_min_duration: ожидается 0 (дефолт) или %s..%s, задано %s",
 			Duration(time.Second), Duration(time.Hour), c.Monitor.SlowQueryMinDuration))
 	}
+	// Рендер-долг (T-175): проход дешевле любого разумного периода,
+	// границы — как у zone_stats_interval (свежесть gauge; короче 30 с
+	// опрашивать нечего, дольше часа gauge отстаёт от сводки отчёта
+	// нагрузки 10 мин).
+	if c.Monitor.RenderDebtInterval < Duration(30*time.Second) || c.Monitor.RenderDebtInterval > Duration(time.Hour) {
+		problems = append(problems, fmt.Sprintf("monitor.render_debt_interval: ожидается %s..%s, задано %s",
+			Duration(30*time.Second), Duration(time.Hour), c.Monitor.RenderDebtInterval))
+	}
 	if c.Monitor.IngestMetricsURL != "" {
 		if u, err := url.Parse(c.Monitor.IngestMetricsURL); err != nil ||
 			(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -1382,6 +1416,19 @@ func (c *Config) Validate() error {
 		problems = append(problems, fmt.Sprintf(
 			"monitor.alerts.mem_high_passes: ожидается 1..10 проходов, задано %d",
 			c.Monitor.Alerts.MemHighPasses))
+	}
+	// Рендер-долг (T-175): порог в доменах — 1..100 млн (верхняя грань
+	// больше корпуса 41,8 млн: порог выше долга не срабатывает никогда —
+	// защита от опечатки в количестве нулей), серия роста — как
+	// mem_high_passes.
+	if dd := c.Monitor.Alerts.RenderDebtDomains; dd < 1 || dd > 100000000 {
+		problems = append(problems, fmt.Sprintf(
+			"monitor.alerts.render_debt_domains: ожидается 1..100000000 доменов, задано %d", dd))
+	}
+	if c.Monitor.Alerts.RenderDebtPasses < 1 || c.Monitor.Alerts.RenderDebtPasses > 10 {
+		problems = append(problems, fmt.Sprintf(
+			"monitor.alerts.render_debt_passes: ожидается 1..10 проходов, задано %d",
+			c.Monitor.Alerts.RenderDebtPasses))
 	}
 	if c.Monitor.Alerts.Telegram && c.Monitor.Alerts.TelegramScript == "" {
 		problems = append(problems,

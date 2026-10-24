@@ -52,7 +52,9 @@
 // alias_subdomain_id NOT NULL) наследуют вердикт субдомена-оригинала —
 // класс эквивалентности T-055 един по определению (один итоговый URL
 // или один контент), вердикты внутри класса совпадают. Порядок внутри
-// домена — «публикация q:render → снятие флага» (§3.4, в духе T-039:
+// домена — «публикация q:render → снятие флага» (переходы бита ведут
+// счётчик рендер-долга одной транзакцией с битом, T-175; §3.4, в духе
+// T-039:
 // сбой после публикации оставит флаг — повтор прохода опубликует снова,
 // дубликаты ограничены и гасятся идемпотентностью потребителя по ключу;
 // обратный порядок терял бы задачи навсегда — снятый флаг вернуть
@@ -88,6 +90,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"crawler/internal/content"
 	"crawler/internal/db"
 	"crawler/internal/httpfetch"
@@ -114,14 +118,25 @@ const (
 
 // SQL прохода и флага. Коды схемы — литералами (стиль T-039); бит
 // render_pending — 2, маска снятия — 0xFFFD (все биты, кроме него).
+// T-175: переходы бита ведут инкрементальный счётчик рендер-долга
+// crawler_counters['render_pending'] — ±1 в той же транзакции, что и
+// переход (наблюдаемость долга без seq scan по 41,8 млн строк;
+// частичный индекс по flags отвергнут — ломает HOT, docs/schema.md
+// «HOT-апдейты», обоснование — миграция 000015).
 var (
 	// renderSetPendingSQL — флаг render_pending в транзакции записи
 	// результата (T-066): бит 1 через OR — is_idn (бит 0) и прочие биты
 	// сохраняются; колонка domains.flags — smallint, побитовые операторы
 	// PostgreSQL повышают smallint до int — возврат через ::int2.
+	// Охрана бита (T-175): семантика OR не меняется (повторная установка
+	// бита — тот же результат), но RowsAffected становится индикатором
+	// РЕАЛЬНОГО перехода 0→1 — по нему счётчик долга наращивается ровно
+	// на переходы, а не на каждую повторную доставку с уже стоящим
+	// флагом (зеркально охране снятия ниже).
 	renderSetPendingSQL = "UPDATE domains AS t " +
 		"SET flags = (t.flags | " + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + ")::int2 " +
-		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8"
+		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 " +
+		"AND (t.flags & " + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + ") = 0"
 
 	// renderPendingDomainsSQL — пачка доменов, ждущих доработки рендера:
 	// бит render_pending выставлен, домен не удалён (§13.1 — вне цикла
@@ -157,6 +172,19 @@ var (
 		"SET flags = (t.flags & " + fmt.Sprintf("%d", int16(^int16(model.FlagRenderPending))) + ")::int2 " +
 		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 " +
 		"AND (t.flags & " + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + ") <> 0"
+
+	// renderCounterDeltaSQL — сдвиг счётчика рендер-долга (T-175):
+	// crawler_counters['render_pending'] ±1 В ТОЙ ЖЕ ТРАНЗАКЦИИ, что и
+	// переход бита (§3.4: бит и счётчик не расходятся — откат откатывает
+	// оба). Дельта — параметр (int8: +1 постановка флага в записи
+	// результата, −1 снятие проходом доработки), имя строки — литерал
+	// (стиль T-039). RowsAffected 0 — строки нет (возможна только ручная
+	// правка таблицы, runbooks §6): ошибка вызывающего откатывает
+	// транзакцию целиком — молчаливый рассинхрон счётчика недопустим,
+	// долг обязан быть виден честно (постановка T-175).
+	renderCounterDeltaSQL = "UPDATE crawler_counters AS c " +
+		"SET value = c.value + $1::int8 " +
+		"WHERE c.name = 'render_pending'"
 )
 
 // RenderLen — источник глубины стрима: удовлетворяется
@@ -335,11 +363,13 @@ type renderPendingRow struct {
 // q:render проверяется до выборки и перед публикацией каждого домена —
 // при переполнении проход останавливается (Full), флаги сохранены. Для
 // домена — ключи SPA-записей (повторный вердикт по сохранённому
-// контенту) → публикация q:render → снятие флага. Пустой набор ключей —
-// флаг снимается без публикации (черновой флаг: страница перестала быть
-// SPA); нечитаемый контент флаг сохраняет до следующего прохода
-// (renderDomainKeys).
-func RequeueOnce(ctx context.Context, pool db.DB, contents RenderContent, render *RenderQueue, opts RequeueOptions) (RequeueResult, error) {
+// контенту) → публикация q:render → снятие флага со счётчиком долга
+// одной транзакцией (T-175). Пустой набор ключей — флаг снимается без
+// публикации (черновой флаг: страница перестала быть SPA); нечитаемый
+// контент флаг сохраняет до следующего прохода (renderDomainKeys).
+// Пул с транзакциями (RecordDB): снятие бита и декремент счётчика
+// рендер-долга обязаны фиксироваться вместе (§3.4, T-175).
+func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, opts RequeueOptions) (RequeueResult, error) {
 	if pool == nil {
 		return RequeueResult{}, errors.New("httpworker: проход рендера: пул не задан")
 	}
@@ -401,16 +431,66 @@ func RequeueOnce(ctx context.Context, pool db.DB, contents RenderContent, render
 			// снятие сняло бы SPA-задачу до перепроверки T-030.
 			continue
 		}
-		// Снятие флага — после публикации (§3.4, порядок в шапке файла).
-		tag, err := pool.Exec(ctx, renderClearPendingSQL, d.zone, d.id)
+		// Снятие флага — после публикации (§3.4, порядок в шапке файла),
+		// со счётчиком долга одной транзакцией (T-175).
+		cleared, err := renderClearPendingTx(ctx, pool, d.zone, d.id)
 		if err != nil {
 			return out, fmt.Errorf("httpworker: проход рендера: домен %s: снятие флага: %w", d.name, err)
 		}
-		if tag.RowsAffected() > 0 {
+		if cleared > 0 {
 			out.Cleared++
 		}
 	}
 	return out, nil
+}
+
+// renderClearPendingTx — снятие флага render_pending и декремент счётчика
+// рендер-долга одной транзакцией (T-175): возвращает RowsAffected снятия
+// (> 0 — бит был и снят, счётчик −1; 0 — бита уже не было (охрана бита:
+// конкурентное снятие вторым экземпляром прохода), счётчик не тронут).
+// Сбой любого шага откатывает пару целиком — бит и счётчик не
+// расходятся; повторная попытка (следующий тик прохода / повторная
+// доставка) выполнит пару заново.
+func renderClearPendingTx(ctx context.Context, pool RecordDB, zone int16, id int64) (int64, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("httpworker: транзакция снятия: %w", err)
+	}
+	// Откат безусловно: после Commit — no-op (стиль T-044).
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, renderClearPendingSQL, zone, id)
+	if err != nil {
+		return 0, err
+	}
+	if tag.RowsAffected() > 0 {
+		if err := renderBumpDebtCounter(ctx, tx, -1); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("httpworker: фиксация снятия: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// renderBumpDebtCounter — сдвиг счётчика рендер-долга в ОТКРЫТОЙ
+// транзакции перехода бита render_pending (T-175): delta ±1. Возврат с
+// ошибкой откатывает транзакцию вызывающего — бит и счётчик меняются
+// только вместе (§3.4). RowsAffected != 1 — строки 'render_pending' нет
+// (создаёт и бэкфиллит миграция 000015; пропасть может только при ручной
+// правке таблицы, runbooks §6): молчаливый рассинхрон сделал бы gauge
+// долга ложью — ошибка громче.
+func renderBumpDebtCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
+	tag, err := tx.Exec(ctx, renderCounterDeltaSQL, delta)
+	if err != nil {
+		return fmt.Errorf("счётчик рендер-долга: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("счётчик рендер-долга: затронуто %d строк (строка 'render_pending' обязательна, миграция 000015)",
+			tag.RowsAffected())
+	}
+	return nil
 }
 
 // renderSelectPending выбирает пачку доменов с флагом render_pending.
@@ -533,7 +613,7 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 // проход продолжит с того же места — снятое не снимается дважды,
 // неопубликованное сохраняет флаг. Отмена ctx — чистый nil (graceful
 // shutdown, §3.4).
-func RequeueRenderPending(ctx context.Context, pool db.DB, contents RenderContent, render *RenderQueue, opts RequeueOptions) error {
+func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, opts RequeueOptions) error {
 	if pool == nil {
 		return errors.New("httpworker: проход рендера: пул не задан")
 	}

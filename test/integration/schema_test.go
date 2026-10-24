@@ -477,6 +477,9 @@ func TestSchema_TableColumns(t *testing.T) {
 			"ip_address": "inet", "found": "boolean", "score": "real",
 			"duration_ms": "integer", "created_at": "timestamp with time zone",
 		}},
+		"crawler_counters": {relkind: "r", columns: map[string]string{ // T-175: счётчики переходов
+			"name": "text", "value": "bigint",
+		}},
 	}
 	// Уникальные ключи справочников: зоны дедуплицируются по punycode-имени
 	// (ТЗ 5.2), субдомены — по метке.
@@ -876,6 +879,126 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 			t.Errorf("ingest_files: то же содержимое (zone=%d, action=%d) обязано записываться отдельно: %v",
 				d.zone, d.action, err)
 		}
+	}
+}
+
+// TestSchema_RenderDebtCounter — счётчик рендер-долга (T-175, миграция
+// 000015): строка render_pending создаётся бэкфиллом (пустая схема —
+// ноль), PK name бракует дубли, переходы бита render_pending (SQL —
+// литералы internal/httpworker/renderq.go, стиль T-039; форма закреплена
+// TestRenderSQLContract) работают на живом PostgreSQL контрактом:
+// охрана бита делает RowsAffected индикатором перехода (SET 0→1, CLEAR
+// 1→0, повтор — 0), прочие биты сохраняются, сдвиг счётчика требует
+// строки по имени.
+func TestSchema_RenderDebtCounter(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	ctx := context.Background()
+
+	// Бэкфилл миграции создал строку; пустая схема — ноль.
+	var n int64
+	if err := pool.QueryRow(ctx,
+		"SELECT value FROM crawler_counters WHERE name = 'render_pending'",
+	).Scan(&n); err != nil {
+		t.Fatalf("строка счётчика: %v (бэкфилл миграции 000015)", err)
+	}
+	if n != 0 {
+		t.Errorf("счётчик пустой схемы = %d, want 0", n)
+	}
+	// PK по name — дубли бракуются.
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO crawler_counters (name, value) VALUES ('render_pending', 1)"); err == nil ||
+		!strings.Contains(err.Error(), "duplicate key") {
+		t.Errorf("повторная строка render_pending: err = %v, want duplicate key", err)
+	}
+
+	// Домен с битом is_idn (флаг render_pending ставится поверх, снятие
+	// его сохраняет).
+	var id int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO domains (zone_id, label, flags) VALUES (1, 'render-debt', 1) RETURNING id`,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert domains: %v", err)
+	}
+
+	// SET с охраной бита (renderSetPendingSQL): переход 0→1 — одна
+	// строка, повторная установка — ноль (индикатор перехода, T-175).
+	setSQL := "UPDATE domains AS t SET flags = (t.flags | 2)::int2 " +
+		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND (t.flags & 2) = 0"
+	tag, err := pool.Exec(ctx, setSQL, int16(1), id)
+	if err != nil {
+		t.Fatalf("set render_pending: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Errorf("переход 0→1: RowsAffected = %d, want 1", tag.RowsAffected())
+	}
+	tag, err = pool.Exec(ctx, setSQL, int16(1), id)
+	if err != nil {
+		t.Fatalf("повторный set render_pending: %v", err)
+	}
+	if tag.RowsAffected() != 0 {
+		t.Errorf("повторная установка: RowsAffected = %d, want 0 (охрана бита)", tag.RowsAffected())
+	}
+
+	// Сдвиг счётчика (renderCounterDeltaSQL): строка есть — UPDATE 1,
+	// значение меняется; чужое имя — ноль строк.
+	bumpSQL := "UPDATE crawler_counters AS c SET value = c.value + $1::int8 " +
+		"WHERE c.name = 'render_pending'"
+	tag, err = pool.Exec(ctx, bumpSQL, int64(1))
+	if err != nil {
+		t.Fatalf("сдвиг счётчика: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Errorf("сдвиг счётчика: RowsAffected = %d, want 1", tag.RowsAffected())
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT value FROM crawler_counters WHERE name = 'render_pending'",
+	).Scan(&n); err != nil || n != 1 {
+		t.Errorf("счётчик после +1 = %d (err=%v), want 1", n, err)
+	}
+	tag, err = pool.Exec(ctx,
+		"UPDATE crawler_counters AS c SET value = c.value + $1::int8 WHERE c.name = 'nope'", int64(1))
+	if err != nil {
+		t.Fatalf("сдвиг несуществующей строки: %v", err)
+	}
+	if tag.RowsAffected() != 0 {
+		t.Errorf("сдвиг несуществующей строки: RowsAffected = %d, want 0", tag.RowsAffected())
+	}
+
+	// CLEAR с охраной бита (renderClearPendingSQL): 1→0 — одна строка,
+	// повтор — ноль; is_idn сохраняется.
+	clearSQL := "UPDATE domains AS t SET flags = (t.flags & -3)::int2 " +
+		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND (t.flags & 2) <> 0"
+	tag, err = pool.Exec(ctx, clearSQL, int16(1), id)
+	if err != nil {
+		t.Fatalf("clear render_pending: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Errorf("переход 1→0: RowsAffected = %d, want 1", tag.RowsAffected())
+	}
+	tag, err = pool.Exec(ctx, clearSQL, int16(1), id)
+	if err != nil {
+		t.Fatalf("повторный clear render_pending: %v", err)
+	}
+	if tag.RowsAffected() != 0 {
+		t.Errorf("повторное снятие: RowsAffected = %d, want 0 (охрана бита)", tag.RowsAffected())
+	}
+	var flags int16
+	if err := pool.QueryRow(ctx, "SELECT flags FROM domains WHERE id = $1", id).Scan(&flags); err != nil {
+		t.Fatal(err)
+	}
+	if flags != 1 {
+		t.Errorf("flags после снятия = %d, want 1 (is_idn сохранён)", flags)
+	}
+
+	// Декремент возвращает счётчик к нулю.
+	if tag, err = pool.Exec(ctx, bumpSQL, int64(-1)); err != nil || tag.RowsAffected() != 1 {
+		t.Errorf("декремент: tag=%v err=%v, want UPDATE 1", tag.RowsAffected(), err)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT value FROM crawler_counters WHERE name = 'render_pending'",
+	).Scan(&n); err != nil || n != 0 {
+		t.Errorf("счётчик после −1 = %d (err=%v), want 0", n, err)
 	}
 }
 

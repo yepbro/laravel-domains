@@ -18,7 +18,8 @@
 //     тома; SpaceChecker алертов disk_free_*, alerts.go);
 //   - очереди: XLEN рабочих стримов и темп потребления — дельта
 //     entries-read групп XINFO GROUPS (Redis 7+; ядро < 7 — темп «н/д»,
-//     размеры честны).
+//     размеры честны) и рендер-долг одной строкой (T-175: флаги
+//     render_pending + лаг q:render, renderdebt.go).
 //
 // Первый проход после старта — база: утилизация и темпы «н/д» (дельт
 // нет), размеры (RAM, диск, очереди, топ RSS) полноценны. Деградация
@@ -574,6 +575,9 @@ type LoadReportOptions struct {
 	Notify func(text string)
 	// Queues — источник состояния стримов; nil — секция очередей «н/д».
 	Queues QueueSource
+	// RenderDebt — источник рендер-долга (renderdebt.go, T-175); строка
+	// долга в секции очередей; nil — строка «н/д».
+	RenderDebt RenderDebtSource
 	// Space — источник места каталогов (SpaceChecker алертов disk_free_*,
 	// alerts.go); nil — секция диска «н/д».
 	Space SpaceChecker
@@ -668,6 +672,20 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 			}
 		}
 
+		// Рендер-долг (T-175): флаги render_pending + лаг q:render —
+		// той же строкой, что сводка цикла и деталь алерта
+		// (renderDebtOf). Сбой источника роняет только строку («н/д»).
+		var debt *RenderDebt
+		if opts.RenderDebt != nil {
+			if d, err := opts.RenderDebt.RenderDebt(ctx); err != nil {
+				if ctx.Err() == nil {
+					log.Warn("снимок рендер-долга", "err", err)
+				}
+			} else {
+				debt = &d
+			}
+		}
+
 		// Диск: statfs каталогов (SpaceChecker алертов).
 		var disks []DiskLine
 		if opts.Space != nil {
@@ -685,7 +703,7 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 
 		gauges.observe(st, busyP, userP, sysP, ioP)
 
-		report := formatLoadReport(st, busyP, ioP, procCPU, queues, rates, prev.started, prev.queues, disks)
+		report := formatLoadReport(st, busyP, ioP, procCPU, queues, rates, prev.started, prev.queues, disks, debt)
 		log.Info("отчёт нагрузки", "report", strings.ReplaceAll(report, "\n", " | "))
 		if opts.Notify != nil {
 			opts.Notify(report)
@@ -720,7 +738,7 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 // процессов: 1.0 = одно ядро целиком (масштаб htop).
 func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]float64,
 	queues map[string]QueueStat, rates map[string]float64, prevStarted bool,
-	prevQueues map[string]QueueStat, disks []DiskLine) string {
+	prevQueues map[string]QueueStat, disks []DiskLine, debt *RenderDebt) string {
 	var b strings.Builder
 	b.WriteString("📊 Нагрузка: CPU ")
 	if busy != nil {
@@ -817,6 +835,16 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 				b.WriteString(")")
 			}
 		}
+	}
+	// Рендер-долг (T-175): работа, ждущая рендера, — флаги
+	// render_pending + непотреблённый остаток q:render. Строка печатается
+	// и при недоступных очередях (ревью T-175, P3-1: источник долга
+	// независим — очередь могла слечь, а долг измерен); «н/д» — когда
+	// источник долга сам недоступен/не задан.
+	if debt == nil {
+		b.WriteString("\n📬 Рендер-долг: н/д")
+	} else {
+		fmt.Fprintf(&b, "\n📬 Рендер-долг: %s", debt.String())
 	}
 	return b.String()
 }

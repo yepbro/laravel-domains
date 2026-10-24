@@ -23,7 +23,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"crawler/internal/content"
-	"crawler/internal/db"
 	"crawler/internal/httpfetch"
 	"crawler/internal/model"
 	"crawler/internal/queue"
@@ -193,7 +192,7 @@ func (c *renderqContent) Get(ctx context.Context, hash content.Hash) ([]byte, er
 	return body, nil
 }
 
-// --- фейковый пул прохода (db.DB): domains/zones/subdomain_results -----------
+// --- фейковый пул прохода (RecordDB): domains/zones/subdomain_results --------
 
 // renderqDomKey — ключ строки domains в фейке прохода.
 type renderqDomKey struct {
@@ -218,19 +217,24 @@ type renderqRow struct {
 	finalURL  string // "" — NULL (фильтр final_url IS NOT NULL)
 }
 
-// renderqPool — db.DB прохода без БД: живая семантика фильтров SQL
+// renderqPool — RecordDB прохода без БД: живая семантика фильтров SQL
 // (флаг render_pending, status <> deleted, rendered = false,
-// final_url IS NOT NULL), смена флага с охраной бита; SQL сопоставляется
-// ТОЧНО (неожидаемый — ошибка, тест падает громко).
+// final_url IS NOT NULL), смена флага с охраной бита и счётчик долга
+// crawler_counters (T-175: строка render_pending, ±1 в транзакции
+// снятия — как в живом RequeueOnce); SQL сопоставляется ТОЧНО
+// (неожидаемый — ошибка, тест падает громко). RecordDB, а не db.DB
+// (T-175): проход снимает флаг транзакцией со счётчиком.
 type renderqPool struct {
 	j *renderqJournal
 
-	zones   map[int16]string
-	domains map[renderqDomKey]*renderqDomain
-	rows    map[renderqDomKey][]renderqRow
+	zones    map[int16]string
+	domains  map[renderqDomKey]*renderqDomain
+	rows     map[renderqDomKey][]renderqRow
+	counters map[string]int64 // T-175: crawler_counters ('render_pending')
 
-	queryErrs  map[string]error
-	beforeHook func() // вызывается перед первым Exec (симуляция гонок)
+	queryErrs    map[string]error
+	beforeHook   func() // вызывается перед первым Exec транзакции снятия (симуляция гонок)
+	counterNoRow bool   // строка счётчика отсутствует (UPDATE 0 — ошибка вызывающего)
 
 	mu       sync.Mutex
 	queries  int
@@ -238,7 +242,7 @@ type renderqPool struct {
 	clearTag int64 // RowsAffected снятия флага (0 — честный ответ)
 }
 
-var _ db.DB = (*renderqPool)(nil)
+var _ RecordDB = (*renderqPool)(nil)
 
 func newRenderqPool() *renderqPool {
 	return &renderqPool{
@@ -246,6 +250,7 @@ func newRenderqPool() *renderqPool {
 		zones:     make(map[int16]string),
 		domains:   make(map[renderqDomKey]*renderqDomain),
 		rows:      make(map[renderqDomKey][]renderqRow),
+		counters:  map[string]int64{"render_pending": 0},
 		queryErrs: make(map[string]error),
 	}
 }
@@ -253,6 +258,12 @@ func newRenderqPool() *renderqPool {
 func (p *renderqPool) seedDomain(zone int16, id int64, label string, flags model.Flags, status model.Status) *renderqDomain {
 	d := &renderqDomain{flags: flags, status: status, label: label}
 	p.domains[renderqDomKey{zone: zone, id: id}] = d
+	// Инвариант счётчика (T-175): он равен числу строк с битом — как
+	// бэкфилл миграции 000015 (без фильтра по status: удалённый с битом
+	// домен в счётчике остаётся, снимает бит только проход доработки).
+	if flags.Test(model.FlagRenderPending) {
+		p.counters["render_pending"]++
+	}
 	return d
 }
 
@@ -265,41 +276,115 @@ func (p *renderqPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.Co
 	return 0, errors.New("renderqPool: CopyFrom не должен вызываться")
 }
 
-func (p *renderqPool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (p *renderqPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, errors.New("renderqPool: Exec вне транзакции не должен вызываться (снятие — транзакцией, T-175)")
+}
+
+// Begin — снапшот доменов и счётчика (стиль renderqRecPool): откат
+// возвращает оба, фиксация оставляет изменения.
+func (p *renderqPool) Begin(ctx context.Context) (pgx.Tx, error) {
 	if err := ctx.Err(); err != nil {
-		return pgconn.CommandTag{}, err
+		return nil, err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.beforeHook != nil {
-		p.beforeHook()
-		p.beforeHook = nil
+	snapDomains := make(map[renderqDomKey]*renderqDomain, len(p.domains))
+	for k, v := range p.domains {
+		c := *v
+		snapDomains[k] = &c
 	}
-	if err := p.queryErrs[sql]; err != nil {
+	snapCounters := make(map[string]int64, len(p.counters))
+	for k, v := range p.counters {
+		snapCounters[k] = v
+	}
+	p.j.record("begin")
+	return &renderqTx{
+		pool: p, j: p.j,
+		snapDomains: snapDomains, snapCounters: snapCounters,
+	}, nil
+}
+
+// renderqTx — транзакция фейка прохода: снятие флага и сдвиг счётчика
+// долга (T-175), откат возвращает снапшот.
+type renderqTx struct {
+	pgx.Tx
+
+	pool         *renderqPool
+	j            *renderqJournal
+	snapDomains  map[renderqDomKey]*renderqDomain
+	snapCounters map[string]int64
+	committed    bool
+}
+
+func (t *renderqTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if err := ctx.Err(); err != nil {
 		return pgconn.CommandTag{}, err
 	}
-	if sql != renderClearPendingSQL {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	if t.pool.beforeHook != nil {
+		t.pool.beforeHook()
+		t.pool.beforeHook = nil
+	}
+	if err := t.pool.queryErrs[sql]; err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	switch sql {
+	case renderClearPendingSQL:
+		if len(args) != 2 {
+			return pgconn.CommandTag{}, fmt.Errorf("renderqPool: снятие флага: параметров %d, нужно 2", len(args))
+		}
+		zone, okZ := args[0].(int16)
+		id, okI := args[1].(int64)
+		if !okZ || !okI {
+			return pgconn.CommandTag{}, fmt.Errorf("renderqPool: снятие флага: параметры %T/%T, нужно int16/int64", args[0], args[1])
+		}
+		t.pool.clears++
+		d, ok := t.pool.domains[renderqDomKey{zone: zone, id: id}]
+		if !ok || !d.flags.Test(model.FlagRenderPending) {
+			return pgconn.NewCommandTag("UPDATE 0"), nil // охрана бита
+		}
+		d.flags.Clear(model.FlagRenderPending)
+		t.j.record("clear")
+		if t.pool.clearTag != 0 {
+			return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", t.pool.clearTag)), nil
+		}
+		return pgconn.NewCommandTag("UPDATE 1"), nil
+	case renderCounterDeltaSQL:
+		if len(args) != 1 {
+			return pgconn.CommandTag{}, fmt.Errorf("renderqPool: счётчик: параметров %d, нужно 1", len(args))
+		}
+		delta, ok := args[0].(int64)
+		if !ok {
+			return pgconn.CommandTag{}, fmt.Errorf("renderqPool: счётчик: параметр %T, нужно int64", args[0])
+		}
+		if t.pool.counterNoRow {
+			return pgconn.NewCommandTag("UPDATE 0"), nil // строки нет (ручная правка)
+		}
+		t.pool.counters["render_pending"] += delta
+		t.j.record("debtcount")
+		return pgconn.NewCommandTag("UPDATE 1"), nil
+	default:
 		return pgconn.CommandTag{}, fmt.Errorf("renderqPool: неожидаемый SQL Exec: %s", sql)
 	}
-	if len(args) != 2 {
-		return pgconn.CommandTag{}, fmt.Errorf("renderqPool: снятие флага: параметров %d, нужно 2", len(args))
+}
+
+func (t *renderqTx) Commit(context.Context) error {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	t.committed = true
+	t.j.record("commit")
+	return nil
+}
+
+func (t *renderqTx) Rollback(context.Context) error {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	if t.committed {
+		return nil
 	}
-	zone, okZ := args[0].(int16)
-	id, okI := args[1].(int64)
-	if !okZ || !okI {
-		return pgconn.CommandTag{}, fmt.Errorf("renderqPool: снятие флага: параметры %T/%T, нужно int16/int64", args[0], args[1])
-	}
-	p.clears++
-	d, ok := p.domains[renderqDomKey{zone: zone, id: id}]
-	if !ok || !d.flags.Test(model.FlagRenderPending) {
-		return pgconn.NewCommandTag("UPDATE 0"), nil // охрана бита
-	}
-	d.flags.Clear(model.FlagRenderPending)
-	p.j.record("clear")
-	if p.clearTag != 0 {
-		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", p.clearTag)), nil
-	}
-	return pgconn.NewCommandTag("UPDATE 1"), nil
+	t.pool.domains, t.pool.counters = t.snapDomains, t.snapCounters
+	return nil
 }
 
 func (p *renderqPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -482,14 +567,16 @@ type renderqRecDomain struct {
 type renderqRecPool struct {
 	j *renderqJournal
 
-	domains map[recordDomainKey]*renderqRecDomain
-	rows    map[recordDomainKey][]recordFakeRow
-	refc    map[content.Hash]int32
+	domains  map[recordDomainKey]*renderqRecDomain
+	rows     map[recordDomainKey][]recordFakeRow
+	refc     map[content.Hash]int32
+	counters map[string]int64 // T-175: crawler_counters ('render_pending')
 
-	failExec  map[string]error
-	deleteErr error
-	commitErr error
-	beginErr  error
+	failExec     map[string]error
+	counterNoRow bool // строки счётчика нет (UPDATE 0 — ошибка записи)
+	deleteErr    error
+	commitErr    error
+	beginErr     error
 
 	mu sync.Mutex
 }
@@ -502,6 +589,7 @@ func newRenderqRecPool() *renderqRecPool {
 		domains:  make(map[recordDomainKey]*renderqRecDomain),
 		rows:     make(map[recordDomainKey][]recordFakeRow),
 		refc:     make(map[content.Hash]int32),
+		counters: map[string]int64{"render_pending": 0}, // строка миграции 000015
 		failExec: make(map[string]error),
 	}
 }
@@ -511,6 +599,11 @@ func (p *renderqRecPool) seedDomain(zone int16, id int64, status model.Status, f
 	now := time.Now()
 	d.queuedAt = &now
 	p.domains[recordDomainKey{zone: zone, id: id}] = d
+	// Инвариант счётчика (T-175): равен числу строк с битом (бэкфилл
+	// миграции 000015).
+	if flags.Test(model.FlagRenderPending) {
+		p.counters["render_pending"]++
+	}
 	return d
 }
 
@@ -548,22 +641,28 @@ func (p *renderqRecPool) Begin(ctx context.Context) (pgx.Tx, error) {
 	for k, v := range p.refc {
 		snapRefc[k] = v
 	}
+	snapCounters := make(map[string]int64, len(p.counters))
+	for k, v := range p.counters {
+		snapCounters[k] = v
+	}
 	p.j.record("begin")
 	return &renderqRecTx{
 		pool: p, j: p.j,
 		snapDomains: snapDomains, snapRows: snapRows, snapRefc: snapRefc,
+		snapCounters: snapCounters,
 	}, nil
 }
 
 type renderqRecTx struct {
 	pgx.Tx
 
-	pool        *renderqRecPool
-	j           *renderqJournal
-	snapDomains map[recordDomainKey]*renderqRecDomain
-	snapRows    map[recordDomainKey][]recordFakeRow
-	snapRefc    map[content.Hash]int32
-	committed   bool
+	pool         *renderqRecPool
+	j            *renderqJournal
+	snapDomains  map[recordDomainKey]*renderqRecDomain
+	snapRows     map[recordDomainKey][]recordFakeRow
+	snapRefc     map[content.Hash]int32
+	snapCounters map[string]int64
+	committed    bool
 }
 
 func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -606,8 +705,27 @@ func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		if !ok {
 			return pgconn.NewCommandTag("UPDATE 0"), nil
 		}
+		// Охрана бита (T-175): RowsAffected — индикатор перехода 0→1,
+		// повторная установка (флаг уже стоит) переходом не считается.
+		if d.flags.Test(model.FlagRenderPending) {
+			return pgconn.NewCommandTag("UPDATE 0"), nil
+		}
 		d.flags.Set(model.FlagRenderPending)
 		t.j.record("setflag")
+		return pgconn.NewCommandTag("UPDATE 1"), nil
+	case renderCounterDeltaSQL:
+		if len(args) != 1 {
+			return pgconn.CommandTag{}, fmt.Errorf("renderqRecPool: счётчик: параметров %d, нужно 1", len(args))
+		}
+		delta, ok := args[0].(int64)
+		if !ok {
+			return pgconn.CommandTag{}, fmt.Errorf("renderqRecPool: счётчик: параметр %T, нужно int64", args[0])
+		}
+		if t.pool.counterNoRow {
+			return pgconn.NewCommandTag("UPDATE 0"), nil // строки нет (ручная правка)
+		}
+		t.pool.counters["render_pending"] += delta
+		t.j.record("debtcount")
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	case recordInsertSQL:
 		if len(args) != 18 {
@@ -712,6 +830,7 @@ func (t *renderqRecTx) Rollback(context.Context) error {
 		return nil
 	}
 	t.pool.domains, t.pool.rows, t.pool.refc = t.snapDomains, t.snapRows, t.snapRefc
+	t.pool.counters = t.snapCounters
 	return nil
 }
 
@@ -1012,9 +1131,19 @@ func TestRecorderRenderOverflowFlags(t *testing.T) {
 	}
 
 	// Флаг — внутри транзакции: после UPDATE статуса, до фиксации.
+	// Сдвиг счётчика — последним оператором до Commit (T-175: окно
+	// блокировки строки счётчика минимально), +1 ровно на переход.
 	dom, set, commit := pool.j.indexOf("domains"), pool.j.indexOf("setflag"), pool.j.indexOf("commit")
 	if dom < 0 || set < dom || commit < set {
 		t.Fatalf("порядок нарушен: domains=%d setflag=%d commit=%d", dom, set, commit)
+	}
+	insert, debt := pool.j.indexOf("insert"), pool.j.indexOf("debtcount")
+	if insert < set || debt < insert || commit < debt {
+		t.Fatalf("порядок нарушен: setflag=%d insert=%d debtcount=%d commit=%d (сдвиг счётчика — после INSERT, до Commit)",
+			set, insert, debt, commit)
+	}
+	if got := pool.counters["render_pending"]; got != 1 {
+		t.Fatalf("счётчик долга = %d, ожидался 1 (ровно один переход)", got)
 	}
 	f := pool.domains[recordDomainKey{zone: 5, id: 11}].flags
 	if !f.Test(model.FlagRenderPending) || !f.Test(model.FlagIDN) {
@@ -1140,6 +1269,86 @@ func TestRecorderRenderSetFlagFailure(t *testing.T) {
 	}
 	if len(pool.rows[recordDomainKey{zone: 5, id: 11}]) != 0 {
 		t.Fatal("строки вставлены при откатившейся транзакции")
+	}
+}
+
+// TestRecorderRenderFlagAlreadySet — охрана бита в SET (T-175): повторная
+// доставка эпизода при уже стоящем флаге — RowsAffected 0 без ошибки
+// (семантика OR идемпотентна), счётчик долга не наращивается: только
+// реальные переходы 0→1.
+func TestRecorderRenderFlagAlreadySet(t *testing.T) {
+	pool := newRenderqRecPool()
+	pool.seedDomain(5, 11, model.StatusNew, model.FlagRenderPending) // бит уже стоит
+	q := &renderqQueue{j: pool.j}
+	ln := &renderqLen{seq: []int64{100}} // переполнение — флаг ставится снова
+	res, _, _ := renderqResult()
+
+	ok, err := renderqRecorder(t, pool, q, ln).RecordAndPublish(context.Background(), res)
+	if err != nil || !ok {
+		t.Fatalf("RecordAndPublish: ok=%v err=%v (повторная установка бита — не ошибка)", ok, err)
+	}
+	if c := pool.j.count("setflag"); c != 0 {
+		t.Fatalf("переходов setflag %d, ожидался 0 (бит уже стоял)", c)
+	}
+	if c := pool.j.count("debtcount"); c != 0 {
+		t.Fatalf("сдвигов счётчика %d, ожидался 0 (перехода не было)", c)
+	}
+	if got := pool.counters["render_pending"]; got != 1 {
+		t.Fatalf("счётчик = %d, ожидался 1 (только сид)", got)
+	}
+}
+
+// TestRecorderRenderCounterAtomic — счётчик долга в ТОЙ ЖЕ транзакции,
+// что и флаг (T-175, §3.4): сбой сдвига счётчика откатывает транзакцию
+// целиком — ни строк, ни флага, ни счётчика.
+func TestRecorderRenderCounterAtomic(t *testing.T) {
+	pool := newRenderqRecPool()
+	pool.seedDomain(5, 11, model.StatusNew, 0)
+	pool.failExec[renderCounterDeltaSQL] = errors.New("sql: счётчик")
+	q := &renderqQueue{j: pool.j}
+	ln := &renderqLen{seq: []int64{100}}
+	res, _, _ := renderqResult()
+
+	ok, err := renderqRecorder(t, pool, q, ln).RecordAndPublish(context.Background(), res)
+	if err == nil || ok {
+		t.Fatalf("RecordAndPublish: ok=%v err=%v, ожидалась ошибка (счётчик обязан фиксироваться с флагом)", ok, err)
+	}
+	if c := pool.j.count("commit"); c != 0 {
+		t.Fatalf("транзакция зафиксирована при сбое счётчика (%d)", c)
+	}
+	dom := pool.domains[recordDomainKey{zone: 5, id: 11}]
+	if dom.flags != 0 {
+		t.Fatalf("flags=%s — откат не вернул бит", dom.flags)
+	}
+	if got := pool.counters["render_pending"]; got != 0 {
+		t.Fatalf("счётчик = %d — откат не вернул счётчик", got)
+	}
+	if len(pool.rows[recordDomainKey{zone: 5, id: 11}]) != 0 {
+		t.Fatal("строки вставлены при откатившейся транзакции")
+	}
+}
+
+// TestRecorderRenderCounterMissingRow — строки 'render_pending' в
+// crawler_counters нет (возможна только ручная правка, runbooks §6):
+// ошибка откатывает транзакцию — молчаливый рассинхрон счётчика долга
+// недопустим, gauge не должен лгать.
+func TestRecorderRenderCounterMissingRow(t *testing.T) {
+	pool := newRenderqRecPool()
+	pool.seedDomain(5, 11, model.StatusNew, 0)
+	pool.counterNoRow = true
+	q := &renderqQueue{j: pool.j}
+	ln := &renderqLen{seq: []int64{100}}
+	res, _, _ := renderqResult()
+
+	ok, err := renderqRecorder(t, pool, q, ln).RecordAndPublish(context.Background(), res)
+	if err == nil || ok {
+		t.Fatalf("RecordAndPublish: ok=%v err=%v, ожидалась ошибка отсутствия строки счётчика", ok, err)
+	}
+	if c := pool.j.count("commit"); c != 0 {
+		t.Fatalf("транзакция зафиксирована без строки счётчика (%d)", c)
+	}
+	if pool.domains[recordDomainKey{zone: 5, id: 11}].flags != 0 {
+		t.Fatal("флаг поставлен без счётчика — рассинхрон")
 	}
 }
 
@@ -1400,6 +1609,93 @@ func TestRequeueOnceClearRace(t *testing.T) {
 	}
 }
 
+// TestRequeueOnceCounterInvariant — снятие флага декрементирует счётчик
+// долга той же транзакцией (T-175): после прохода счётчик равен числу
+// строк с битом (инвариант бэкфилла миграции 000015); домен с
+// нечитаемым контентом (флаг сохранён) и удалённый (вне цикла) в
+// счётчике остаются.
+func TestRequeueOnceCounterInvariant(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	hDead := content.HashOf([]byte("блок, который не читается"))
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	body.bodies[hSPA] = renderqSPABody
+	body.errOn[hDead] = errors.New("pack: блок не читается")
+
+	// Доработан (снятие −1), оставлен (контент не читается), удалён с
+	// битом (вне цикла — бит и счётчик держат).
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
+	pool.seedDomain(5, 12, "stuck", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 12, 0, model.VariantMain, hDead[:], nil, false, "https://down.example/")
+	pool.seedDomain(5, 13, "gone", model.FlagRenderPending, model.StatusDeleted)
+	if got := pool.counters["render_pending"]; got != 3 {
+		t.Fatalf("сид счётчика = %d, ожидался 3", got)
+	}
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Cleared != 1 {
+		t.Fatalf("итог %+v, ожидался cleared=1", res)
+	}
+	// Инвариант: счётчик == число строк с битом (включая удалённую —
+	// бэкфилл миграции фильтра по status не имеет).
+	want := int64(0)
+	for _, d := range pool.domains {
+		if d.flags.Test(model.FlagRenderPending) {
+			want++
+		}
+	}
+	if got := pool.counters["render_pending"]; got != want {
+		t.Fatalf("счётчик = %d, число строк с битом = %d (рассинхрон)", got, want)
+	}
+	if want != 2 {
+		t.Fatalf("строк с битом после прохода = %d, ожидалось 2 (stuck+gone)", want)
+	}
+}
+
+// TestRequeueOnceCounterFailure — сбой сдвига счётчика откатывает и
+// снятие флага (одна транзакция, T-175): проход возвращает ошибку,
+// домен остаётся с битом и в счётчике — следующий тик повторит пару.
+func TestRequeueOnceCounterFailure(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
+	pool.queryErrs[renderCounterDeltaSQL] = errors.New("sql: счётчик")
+
+	if _, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{}); err == nil {
+		t.Fatal("сбой счётчика не возвращён ошибкой прохода")
+	}
+	dom := pool.domains[renderqDomKey{zone: 5, id: 11}]
+	if !dom.flags.Test(model.FlagRenderPending) {
+		t.Fatal("флаг снят без счётчика — рассинхрон (откат обязан вернуть бит)")
+	}
+	if got := pool.counters["render_pending"]; got != 1 {
+		t.Fatalf("счётчик = %d, ожидался 1 (откат вернул)", got)
+	}
+}
+
+// TestRequeueOnceCounterMissingRow — строки счётчика нет (ручная
+// правка): ошибка, флаг не снят — пара бит+счётчик не расходится.
+func TestRequeueOnceCounterMissingRow(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
+	pool.counterNoRow = true
+
+	if _, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{}); err == nil {
+		t.Fatal("отсутствие строки счётчика не возвращено ошибкой")
+	}
+	if !pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("флаг снят при отсутствующей строке счётчика — рассинхрон")
+	}
+}
+
 // TestRequeueOnceErrors — ошибки выборки/снятия возвращаются вызывающему
 // (цикл.Warn), флаг домена остаётся.
 func TestRequeueOnceErrors(t *testing.T) {
@@ -1506,8 +1802,9 @@ func TestRequeueRenderPendingLoop(t *testing.T) {
 // SQL-контракта record_test.go).
 func TestRenderSQLContract(t *testing.T) {
 	if !strings.Contains(renderSetPendingSQL, "SET flags = (t.flags | 2)::int2") ||
-		!strings.Contains(renderSetPendingSQL, "WHERE t.zone_id = $1::int2 AND t.id = $2::int8") {
-		t.Fatalf("renderSetPendingSQL разошёлся с контрактом §6.1/T-008:\n%s", renderSetPendingSQL)
+		!strings.Contains(renderSetPendingSQL, "WHERE t.zone_id = $1::int2 AND t.id = $2::int8") ||
+		!strings.Contains(renderSetPendingSQL, "AND (t.flags & 2) = 0") {
+		t.Fatalf("renderSetPendingSQL разошёлся с контрактом §6.1/T-008/T-175:\n%s", renderSetPendingSQL)
 	}
 	if !strings.Contains(renderPendingDomainsSQL, "(d.flags & 2) <> 0") ||
 		!strings.Contains(renderPendingDomainsSQL, "d.status <> 6") ||
@@ -1522,5 +1819,9 @@ func TestRenderSQLContract(t *testing.T) {
 	if !strings.Contains(renderClearPendingSQL, "(t.flags & -3)::int2") ||
 		!strings.Contains(renderClearPendingSQL, "(t.flags & 2) <> 0") {
 		t.Fatalf("renderClearPendingSQL разошёлся с контрактом T-008:\n%s", renderClearPendingSQL)
+	}
+	if !strings.Contains(renderCounterDeltaSQL, "SET value = c.value + $1::int8") ||
+		!strings.Contains(renderCounterDeltaSQL, "WHERE c.name = 'render_pending'") {
+		t.Fatalf("renderCounterDeltaSQL разошёлся с контрактом T-175:\n%s", renderCounterDeltaSQL)
 	}
 }

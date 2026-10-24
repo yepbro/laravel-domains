@@ -3,8 +3,9 @@
 Пошаговые инструкции для оператора: переобучение словаря сжатия,
 разбор очереди мёртвых задач `q:dead`, переанализ результатов по новым
 правилам, разбор отказа резолвера DNS, разовая очистка накопленного
-контента и трима jsonb (кампания T-167). Общая эксплуатация (запуск,
-логи, метрики, обновление) — [`operations.md`](operations.md);
+контента и трима jsonb (кампания T-167), ручные операции с битом
+`render_pending` (счётчик рендер-долга T-175). Общая эксплуатация
+(запуск, логи, метрики, обновление) — [`operations.md`](operations.md);
 справочник CLI — [`dev-environment.md`](dev-environment.md) §6.
 
 ## 1. Переобучение словаря сжатия zstd
@@ -329,23 +330,41 @@ HTTP-фазы (запись уходит в `q:analyze`), `q:dead` растёт 
    (каждую минуту, с проверкой ёмкости `q:render`) сам переиздаст
    SPA-записи домена (детерминированный повторный вердикт по сохранённому
    контенту: `rendered = false AND final_url IS NOT NULL`) и снимет флаг.
-   Список доменов — из идентификаторов dead-записей:
+   Список доменов — из идентификаторов dead-записей. Флаг ставится
+   атомарно со счётчиком рендер-долга (инвариант §6: проход доработки
+   снимет бит с декрементом — установка без инкремента уводила бы
+   счётчик в минус):
 
    ```bash
-   # SQL выставления флага render_pending по всем q:render dead-записям
+   # SQL выставления флага render_pending (+счётчик) по всем q:render dead-записям
    redis-cli --raw XRANGE q:dead - + \
      | grep '^{' \
      | jq -r 'select(.stream == "q:render") | "(\(.zone_id),\(.domain_id))"' \
      | sort -u \
      | paste -sd, \
-     | sed 's/^/UPDATE domains AS d SET flags = (d.flags | 2)::int2 FROM (VALUES /; s/$/) AS k(zone_id, domain_id) WHERE (d.zone_id, d.id) = (k.zone_id, k.domain_id);/' \
+     | sed 's#^#WITH flagged AS (UPDATE domains AS d SET flags = (d.flags | 2)::int2 FROM (VALUES #; s#$#) AS k(zone_id, domain_id) WHERE (d.zone_id, d.id) = (k.zone_id, k.domain_id) AND (d.flags \& 2) = 0 RETURNING 1)#' \
      > /tmp/opencode/requeue-render.sql
-   psql "$CRAWLER_PG_DSN" -f /tmp/opencode/requeue-render.sql
+   printf "UPDATE crawler_counters SET value = value + (SELECT count(*) FROM flagged) WHERE name = 'render_pending';\n" \
+     >> /tmp/opencode/requeue-render.sql
+   psql "$CRAWLER_PG_DSN" -1 -f /tmp/opencode/requeue-render.sql
    ```
 
-   (типы значений в VALUES приводит сам PostgreSQL; dev — `make psql`;
-   одиночный домен — точечно
-   `UPDATE domains SET flags = (flags | 2)::int2 WHERE zone_id = $1 AND id = $2;`
+   (типы значений в VALUES приводит сам PostgreSQL; `psql -1` — оба
+   оператора одной транзакцией; `UPDATE 0` у второго оператора — строки
+   счётчика нет, см. §6 симптом; dev — `make psql`; одиночный домен —
+   точечно, тем же инвариантом §6:
+
+   ```sql
+   WITH flagged AS (
+       UPDATE domains SET flags = (flags | 2)::int2
+       WHERE zone_id = $1 AND id = $2 AND (flags & 2) = 0
+       RETURNING 1
+   )
+   UPDATE crawler_counters
+   SET value = value + (SELECT count(*) FROM flagged)
+   WHERE name = 'render_pending';
+   ```
+
    или полный новый эпизод `crawlerctl recheck <домен>`)
 4. **Финализировать без рендера** (альтернатива для записей, которым
    рендер не нужен, или когда очередь разбирают без волны рендеров):
@@ -1033,3 +1052,83 @@ PSI, метрики: путь Б не двигает `crawler_content_retention_
 
 После кампании: вернуть `content.retention_batch`, если меняли (§5.2),
 и зафиксировать работы в журнале ([`operations.md`](operations.md) §5).
+
+## 6. Ручные операции с битом render_pending (T-175)
+
+Бит `render_pending` (бит 1 `domains.flags`) и счётчик рендер-долга
+`crawler_counters['render_pending']` (миграция 000015) связаны
+инвариантом: **счётчик = число строк с битом** (без фильтра по статусу).
+Переходы бита в коде ведут пару атомарно (±1 в той же транзакции,
+internal/httpworker/renderq.go), поэтому **любая ручная правка бита
+обязана править счётчик в той же транзакции** — иначе gauge
+`crawler_render_pending_domains`, строка «Рендер-долг» отчёта нагрузки и
+алерт `render_debt` начинают лгать (а отсутствие строки счётчика
+останавливает запись результатов с флагом — воркер честно падает на
+отсутствии строки, это защита от молчаливой лжи).
+
+Ручная правка — парой «бит + счётчик» в ОДНОМ операторе, сдвиг привязан
+к ФАКТУ перехода (безусловный `±1` при уже стоящем/снятом бите — охрана
+дала 0 строк — разводил бы счётчик). Снятие бита (пример: контент домена
+безвозвратно потерян):
+
+```sql
+WITH cleared AS (
+    UPDATE domains SET flags = flags & -3
+    WHERE zone_id = $1 AND id = $2 AND (flags & 2) <> 0
+    RETURNING 1
+)
+UPDATE crawler_counters
+SET value = value - (SELECT count(*) FROM cleared)
+WHERE name = 'render_pending'
+RETURNING value;  -- пусто = строки счётчика нет (симптом ниже)
+```
+
+Установка бита (возврат доменов в доработку — готовый шаблон для списка
+из dead-записей в §2.5):
+
+```sql
+WITH flagged AS (
+    UPDATE domains SET flags = (flags | 2)::int2
+    WHERE zone_id = $1 AND id = $2 AND (flags & 2) = 0
+    RETURNING 1
+)
+UPDATE crawler_counters
+SET value = value + (SELECT count(*) FROM flagged)
+WHERE name = 'render_pending'
+RETURNING value;
+```
+
+`UPDATE ... RETURNING` показывает фактическое значение счётчика;
+пустой результат второго UPDATE (0 строк) — строки
+`crawler_counters['render_pending']` нет, см. симптом ниже: флаг при
+этом уже поставлен/снят (первый CTE исполняется всегда), счётчик
+остался — восстановить строку и свериться.
+
+Симптом пропавшей/сломанной строки счётчика: шквал ошибок записи
+результата «счётчик рендер-долга: затронуто 0 строк» у http-worker при
+переполненной `q:render` (каждая флажащая транзакция откатывается) и
+алерт `render_debt` в «не измеряется» — восстановить строку (миграция
+000015 или руками `INSERT ... VALUES ('render_pending', <фактический
+count>)`), затем сверка ниже.
+
+Сверка после любых сомнительных операций (однократный seq scan — делать
+в окно, на корпусе 41,8 млн строк это десятки секунд):
+
+```sql
+-- одна строка: drift = 0 — сошлось; -1 — строки счётчика нет
+-- (NULL без COALESCE не сравнивается с 0 и случай «строки нет» не виден)
+SELECT COALESCE((SELECT value FROM crawler_counters WHERE name = 'render_pending'), -1)
+     - (SELECT count(*) FROM domains WHERE (flags & 2) <> 0) AS drift;
+```
+
+`drift <> 0` — выровнять руками (UPDATE счётчика до фактического
+count(*)). Удалять/переименовывать строку `'render_pending'` нельзя:
+миграция создаёт её один раз, писатели результатов ждут её на каждом
+переходе бита.
+
+Возврат накопленного долга в работу — штатный проход доработки
+(`RequeueRenderPending` цикла http-worker): он снимает флаги со счётчиком
+сам, ручного участия не требует; заморозка/разморозка притока
+планировщика на дренаж `q:render` счётчика не касается (бит ставят только
+результаты HTTP-эпизодов при переполнении очереди рендера).
+
