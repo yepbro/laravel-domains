@@ -67,6 +67,11 @@ jobs:
           done
           echo "version=$version revision=$revision" >> "$GITHUB_STEP_SUMMARY"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Скрипт Telegram-извещений едет с набором (T-162/T-173):
+          # monitor ждёт его в /opt/crawler/bin (alerts.telegram_script);
+          # ручная установка не переживает деплой — install пересоздаёт
+          # каталог из архива. install chmod 0755 гарантирует бит запуска.
+          cp deploy/telegram-notify.sh out/telegram-notify.sh
           tar -C out -czf binaries.tar.gz .
 
       - name: Настроить SSH

@@ -117,13 +117,13 @@ func TestOSLoad_Fixtures(t *testing.T) {
 		t.Errorf("swap total/free = %d/%d", st.SwapTotal, st.SwapFree)
 	}
 
-	// Процессы: агрегаты по имени — headless-shell слит, кривое имя
-	// postgres с пробелами/скобками разобрано целиком.
+	// Процессы: агрегаты по имени — headless-shell слит (2 процесса),
+	// кривое имя postgres с пробелами/скобками разобрано целиком.
 	if got := st.Procs["monitor"].Ticks; got != 400 {
 		t.Errorf("monitor тики = %d, want 400", got)
 	}
-	if got := st.Procs["headless-shell"].Ticks; got != 2000 {
-		t.Errorf("headless-shell тики = %d, want 2000", got)
+	if got := st.Procs["headless-shell"]; got.Ticks != 2000 || got.Count != 2 {
+		t.Errorf("headless-shell = %+v, want тики 2000, процессов 2", got)
 	}
 	if got := st.Procs["postgres: 1[2] writer"].Ticks; got != 1000 {
 		t.Errorf("postgres тики = %d, want 1000", got)
@@ -252,10 +252,10 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 	}
 	r := reports[0]
 	for _, want := range []string{
-		"📊 Нагрузка: CPU н/д",          // дельты нет — база
-		"🧮 Топ CPU: н/д",               // темпы процессов — тоже дельта
-		"headless-shell",               // топ RSS полноценен сразу
-		"💾 RAM: занято 5.4 из 7.6 ГиБ", // 7973728−2359296 КиБ
+		"📊 Нагрузка: CPU н/д",           // дельты нет — база
+		"🧮 Топ CPU: н/д",                // темпы процессов — тоже дельта
+		"headless-shell 2.0ГиБ (2 пр.)", // топ памяти полноценен сразу
+		"💾 RAM: занято 5.4 из 7.6 ГиБ",  // 7973728−2359296 КиБ
 		"swap 198 МиБ",
 		"📀 Диск /var/lib/crawler/content: свободно 44 из 79 ГиБ (56%)",
 		"📬 Очереди: q:dns 121 · q:render 116320", // размеры без дельт
@@ -298,7 +298,7 @@ func TestFormatLoadReport_Deltas(t *testing.T) {
 		"PSI 92% [5м 90%]",
 		"load 24.8/22.0/20.7 из 4 ядер",
 		"Топ CPU: postgres 1.9я, headless-shell 1.1я, http-worker 0.5я, analyzer 0.3я",
-		"Топ RSS: headless-shell",
+		"Топ память: headless-shell 2.0ГиБ (2 пр.)",
 		"PSI mem 8% / full 2%",
 		"q:dns 121 (±0, 3.5/с)",
 		"q:render 115120 (−1200, 2.0/с)",

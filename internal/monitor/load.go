@@ -92,8 +92,14 @@ type LoadStat struct {
 type ProcAgg struct {
 	// Ticks — сумма тиков CPU (utime+stime) процессов имени.
 	Ticks uint64
-	// RSS — суммарный резидентный размер, байты.
+	// RSS — суммарный резидентный размер, байты. Общая память считается
+	// в каждом процессе (у 30 бэкендов postgres — разделяемые буферы
+	// тридцать раз): в отчёте рядом печатается Count, «сумма» читается
+	// с оговоркой; PSS недоступен — smaps_rollup чужих uid монитор
+	// (не-root) не читает.
 	RSS uint64
+	// Count — процессы имени (для отчёта).
+	Count int
 }
 
 // CPUStat — счётчики тиков CPU (/proc/stat): busy-доля прохода считается
@@ -334,6 +340,7 @@ func readProcs(root string) (map[string]ProcAgg, error) {
 		agg := procs[comm]
 		agg.Ticks += ticks
 		agg.RSS += rss
+		agg.Count++
 		procs[comm] = agg
 	}
 	return procs, nil
@@ -739,7 +746,7 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 		}
 	}
 
-	b.WriteString("\n🧮 Топ RSS: ")
+	b.WriteString("\n🧮 Топ память: ")
 	if top := topByRSS(st.Procs); len(top) == 0 {
 		b.WriteString("н/д")
 	} else {
@@ -747,7 +754,13 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			fmt.Fprintf(&b, "%s %.1fГиБ", it.name, gib(uint64(it.value)))
+			// Сумма RSS c оговоркой: общие страницы считаются в каждом
+			// процессе — число процессов печатается рядом (у postgres
+			// и chromium их десятки), пик/process смотрится htop'ом.
+			fmt.Fprintf(&b, "%s %s", it.name, fmtMem(uint64(it.value)))
+			if it.count > 1 {
+				fmt.Fprintf(&b, " (%d пр.)", it.count)
+			}
 		}
 	}
 
@@ -808,10 +821,12 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 	return b.String()
 }
 
-// topItem — строка топа: value — доля ядра (CPU) или байты (RSS).
+// topItem — строка топа: value — доля ядра (CPU) или байты (память);
+// count — процессы имени (аннотация топа памяти).
 type topItem struct {
 	name  string
 	value float64
+	count int
 }
 
 // topByCPU — topProcs имён по доле ядра, шум ниже minProcCPUShare не
@@ -822,19 +837,19 @@ func topByCPU(m map[string]float64) []topItem {
 		if v < minProcCPUShare {
 			continue
 		}
-		items = append(items, topItem{name, v})
+		items = append(items, topItem{name: name, value: v})
 	}
 	return sortTop(items)
 }
 
-// topByRSS — topProcs имён по суммарному RSS.
+// topByRSS — topProcs имён по суммарному RSS (с числом процессов).
 func topByRSS(m map[string]ProcAgg) []topItem {
 	items := make([]topItem, 0, len(m))
 	for name, agg := range m {
 		if agg.RSS == 0 {
 			continue
 		}
-		items = append(items, topItem{name, float64(agg.RSS)})
+		items = append(items, topItem{name, float64(agg.RSS), agg.Count})
 	}
 	return sortTop(items)
 }
@@ -860,6 +875,16 @@ func sortTop(items []topItem) []topItem {
 // gib/mib — байты в гиби-/мебибайты для отчёта.
 func gib(b uint64) float64 { return float64(b) / (1 << 30) }
 func mib(b uint64) float64 { return float64(b) / (1 << 20) }
+
+// fmtMem — человекочитаемый размер для топа памяти: от 1 ГиБ — дробные
+// ГиБ, меньше — целые МиБ (процессы меньше гигабайта частыми «0.0ГиБ»
+// не мазать).
+func fmtMem(b uint64) string {
+	if b >= 1<<30 {
+		return fmt.Sprintf("%.1fГиБ", gib(b))
+	}
+	return fmt.Sprintf("%.0fМиБ", mib(b))
+}
 
 // round — округление к целому % (отчёт оператору, не метрика).
 func round(v float64) int {
