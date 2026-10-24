@@ -187,11 +187,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}
 
 	// Очередь: потребление q:http и публикация q:analyze — под гейтом
-	// backpressure (T-026: порог единый для рабочих стримов; Consume/Ack
-	// проходят прозрачно, как у dns-worker). Публикация q:render идёт
-	// мимо WatermarkPublisher, через ту же RedisQueue (T-066, §5.6):
-	// ожидание ёмкости задержало бы XACK задачи q:http — при переполнении
-	// домен получает флаг render_pending вместо публикации (renderq.go).
+	// backpressure (T-026: порог общий для гейтируемых стримов;
+	// Consume/Ack проходят прозрачно, как у dns-worker). Публикация
+	// q:render идёт мимо WatermarkPublisher, через ту же RedisQueue
+	// (T-066, §5.6): ожидание ёмкости задержало бы XACK задачи q:http —
+	// при переполнении домен получает флаг render_pending вместо
+	// публикации (renderq.go; порог ёмкости —
+	// render.queue_high_watermark, T-174, ниже).
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
@@ -217,9 +219,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	})
 
 	// Очередь рендера: неблокирующая проверка ёмкости (глубина через гейт
-	// T-026, общий порог scheduler.queue_high_watermark) + публикация
-	// без ожидания ёмкости.
-	renderQ, err := httpworker.NewRenderQueue(rawQ, gate, int64(cfg.Scheduler.QueueHighWatermark), logger)
+	// T-026) + публикация без ожидания ёмкости. Порог ёмкости —
+	// отдельный render.queue_high_watermark (T-174, renderQueueWatermark
+	// ниже): общий scheduler.queue_high_watermark держал ворота
+	// открытыми при лаге 98,4 тыс. из 100 тыс. (равновесие 24.10,
+	// этап 25 tasks.md) — приток равнялся потреблению, дренаж долга
+	// нулевой.
+	renderQ, err := httpworker.NewRenderQueue(rawQ, gate, renderQueueWatermark(cfg), logger)
 	if err != nil {
 		return err
 	}
@@ -326,6 +332,28 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	<-bg
 	<-bg
 	return err
+}
+
+// renderQueueWatermark — эффективный порог ёмкости q:render (T-174):
+// render.queue_high_watermark, 0 — общий scheduler.queue_high_watermark
+// (семантика content.retention_analyze_watermark в run выше); затем
+// кламп min(watermark, MAXLEN/2) — queue.StreamWatermark, тот же
+// единый расчёт, что у гейта публикации (T-026) и порогов стримов:
+// ворота обязаны закрываться ДО обрезки MAXLEN — обрезка удаляет
+// записи независимо от прочтения, и порог выше предела превращал бы
+// мягкое регулирование в молчаливую потерю недоставленных рендер-задач
+// (флага render_pending у них нет — публикация прошла). На дефолтах
+// кламп не активен: 10 тыс. < 75 тыс. = DefaultStreamMaxLen(q:render)/2
+// (T-025); при явном 0 ограничивает общий порог 100 тыс. до 75 тыс. —
+// прежняя проводка T-066 сравнивала сырое значение, и ворота
+// оставались открытыми при лаге 98,4 тыс. (равновесие 24.10) даже там,
+// где гейт публикации по клампу уже закрылся бы.
+func renderQueueWatermark(cfg *config.Config) int64 {
+	wm := int64(cfg.Render.QueueHighWatermark)
+	if wm <= 0 {
+		wm = int64(cfg.Scheduler.QueueHighWatermark)
+	}
+	return queue.StreamWatermark(wm, int64(cfg.Redis.MaxLen), queue.StreamRender)
 }
 
 // analyzeDepth — глубина q:analyze для интерлока retention (T-166):

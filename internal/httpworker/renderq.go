@@ -31,9 +31,17 @@
 //     рендера от потери; настоящая недоступность Redis всё равно вернёт
 //     доставку на публикации q:analyze (T-058).
 //
-// Порог — общий scheduler.queue_high_watermark: ТЗ 5.10 отдельного
-// render-порога не заводит, T-026 зафиксировал единый порог рабочих
-// стримов (q:render в их числе).
+// Порог — отдельный render.queue_high_watermark (T-174; расширение
+// ТЗ 5.10): общий scheduler.queue_high_watermark (T-026) при клампе
+// T-168 (min(lag, XLEN)+pending) держал ворота открытыми при лаге
+// 98,4 тыс. из 100 тыс. — приток равнялся потреблению, дренаж долга
+// нулевой (равновесие 24.10, этап 25 tasks.md). Дефолт 10 тыс. ≈ 2 ч
+// буфера потребления (замер 24.10: ≈5,1 тыс. задач/ч) закрывает
+// ворота на текущем долге и возвращает гистерезис «дренируем —
+// впускаем»; 0 — общий порог. Эффективное значение (кламп
+// min(watermark, MAXLEN/2), как у гейта T-026 — ворота обязаны
+// закрываться до обрезки) считает проводка cmd/http-worker
+// (renderQueueWatermark): сюда приходит готовое к сравнению число.
 //
 // Проход доработки (§5.6 «дорабатываются позже»): фоновый цикл
 // RequeueRenderPending (стиль суточной перепроверки T-030 и очистки
@@ -179,9 +187,12 @@ type RenderQueue struct {
 }
 
 // NewRenderQueue строит очередь рендера поверх «сырой» очереди (без
-// гейта backpressure) и источника глубины стримов; watermark — общий
-// порог scheduler.queue_high_watermark (T-026). nil-зависимости —
-// ошибка: тихая потеря публикаций незаметна для оператора.
+// гейта backpressure) и источника глубины стримов; watermark — порог
+// ёмкости q:render render.queue_high_watermark (T-174; 0 — общий
+// scheduler.queue_high_watermark; эффективное значение с клампом
+// MAXLEN/2 считает проводка cmd/http-worker — сюда приходит готовое
+// к сравнению число). nil-зависимости — ошибка: тихая потеря
+// публикаций незаметна для оператора.
 func NewRenderQueue(q queue.Queue, lenner RenderLen, watermark int64, log *slog.Logger) (*RenderQueue, error) {
 	if q == nil {
 		return nil, errors.New("httpworker: очередь рендера: очередь не задана")
@@ -196,9 +207,10 @@ func NewRenderQueue(q queue.Queue, lenner RenderLen, watermark int64, log *slog.
 }
 
 // HasCapacity — неблокирующая проверка ёмкости q:render: true, когда
-// глубина стрима строго ниже порога (depth == watermark — уже
-// переполнение, ТЗ 4.2). Watermark ≤ 0 отключает проверку (семантика
-// T-026) — ёмкость есть всегда, без обращения к Redis.
+// глубина стрима строго ниже порога render.queue_high_watermark
+// (T-174; depth == watermark — уже переполнение, ТЗ 4.2). Watermark ≤ 0
+// отключает проверку (семантика T-026) — ёмкость есть всегда, без
+// обращения к Redis.
 func (rq *RenderQueue) HasCapacity(ctx context.Context) (bool, error) {
 	if rq.watermark <= 0 {
 		return true, nil

@@ -131,8 +131,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
-	// Публикация q:http — под гейтом backpressure (T-026: порог единый
-	// для рабочих стримов); потребление q:dns и XACK проходят прозрачно.
+	// Публикация q:http — под гейтом backpressure (T-026: порог общий
+	// для гейтируемых стримов; ворота ёмкости q:render — отдельные,
+	// render.queue_high_watermark, T-174); потребление q:dns и XACK
+	// проходят прозрачно.
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
 		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)

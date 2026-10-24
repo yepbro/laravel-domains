@@ -361,6 +361,27 @@ type Render struct {
 	// 0 — контроль отключён; в remote-режиме (dev) RSS недоступен и
 	// контроль не работает (потолок держит mem_limit контейнера).
 	RestartMemoryBytes ByteSize `yaml:"restart_memory_bytes"`
+	// QueueHighWatermark — порог ёмкости очереди рендера q:render
+	// (T-174; ворота публикации T-066 — HasCapacity в RenderQueue):
+	// глубина стрима (backlog группы потребления, кламп T-168) ≥ порога —
+	// новые SPA-задачи не публикуются, домены получают флаг
+	// render_pending той же транзакцией и дорабатываются проходом позже
+	// (задачи не теряются). Отдельный порог, а не общий
+	// scheduler.queue_high_watermark: при клампе T-168
+	// (min(lag, XLEN)+pending) общий порог 100 тыс. держал ворота
+	// открытыми при лаге 98,4 тыс. из 100 тыс. — приток равнялся
+	// потреблению (равновесие 24.10, этап 25 tasks.md), дренаж долга
+	// нулевой. Дефолт 10 тыс. — ≈2 ч буфера потребления (замер 24.10:
+	// ≈5,1 тыс. задач/ч): закрывает ворота на текущем долге (лаг
+	// 98,4 тыс. + 344,5 тыс. флагов render_pending) и возвращает
+	// гистерезис «дренируем — впускаем»; заведомо ниже половины предела
+	// MAXLEN q:render (75 тыс., T-025) — кламп порога не активен.
+	// 0 — общий scheduler.queue_high_watermark (семантика
+	// content.retention_analyze_watermark); эффективное значение с
+	// клампом min(watermark, MAXLEN/2) — как у гейта публикации T-026 —
+	// считает проводка cmd/http-worker. Расширение к минимальному
+	// составу ТЗ 5.10.
+	QueueHighWatermark int `yaml:"queue_high_watermark"`
 }
 
 // Content — хранилище контента (ТЗ 5.7).
@@ -724,6 +745,10 @@ func Default() *Config {
 			// Chromium (:9223) и второй воркер (deploy.md §2.2), не
 			// подъём порога.
 			RestartMemoryBytes: ByteSize(1536 << 20),
+			// Ворота ёмкости q:render (T-174): ≈2 ч буфера потребления
+			// (замер 24.10: ≈5,1 тыс. задач/ч) — обоснование у поля
+			// QueueHighWatermark.
+			QueueHighWatermark: 10000,
 		},
 		Content: Content{
 			Dir:            "/data/content",
@@ -1201,6 +1226,16 @@ func (c *Config) Validate() error {
 	if t := c.Render.RestartMemoryBytes; t != 0 && (t < 256<<20 || t > 16<<30) {
 		problems = append(problems, fmt.Sprintf("render.restart_memory_bytes: ожидается 0 (отключено) или %s..%s, задано %s",
 			ByteSize(256<<20), ByteSize(16<<30), t))
+	}
+	// Ворота ёмкости q:render (T-174): 0 — общий порог
+	// scheduler.queue_high_watermark; положительное значение не выше
+	// потолка стримов (10⁸ — граница валидации redis.maxlen, тот же
+	// порядок, что у content.retention_analyze_watermark). Кламп по
+	// MAXLEN делает проводка (не здесь — предел зависит от
+	// redis.maxlen стрима).
+	if w := c.Render.QueueHighWatermark; w != 0 && !inRange(w, 1, 100000000) {
+		problems = append(problems, fmt.Sprintf("render.queue_high_watermark: ожидается 0 (порог scheduler.queue_high_watermark) или %d..%d, задано %d",
+			1, 100000000, w))
 	}
 
 	// content

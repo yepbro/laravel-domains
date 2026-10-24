@@ -4,6 +4,9 @@
 // internal/queue): нижний край XRANGE — last-delivered-id группы
 // эксклюзивно, отсутствие групп — весь стрим с начала, отсутствие
 // стрима — пустое множество, пагинация хвоста, ошибки, чужие тела.
+// Здесь же — эффективный порог ёмкости q:render (renderQueueWatermark,
+// T-174): фолбэк «0 — общий scheduler.queue_high_watermark» и кламп
+// MAXLEN/2 (queue.StreamWatermark).
 package main
 
 import (
@@ -14,7 +17,9 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"crawler/internal/config"
 	"crawler/internal/content"
+	"crawler/internal/queue"
 )
 
 // fakePendingRedis — окно адаптера с заготовками: groups — ответ XINFO
@@ -245,5 +250,60 @@ func TestPendingKeys_ForeignPayload(t *testing.T) {
 	}
 	if _, ok := keys[wantKey(1, 10, 0, 0)]; !ok {
 		t.Error("валидное сообщение потерялось среди чужих тел")
+	}
+}
+
+// TestRenderQueueWatermark — эффективный порог ёмкости q:render
+// (renderQueueWatermark, T-174): фолбэк «0 — общий
+// scheduler.queue_high_watermark» (семантика retention_analyze_watermark)
+// и кламп min(watermark, MAXLEN/2) тем же единым расчётом
+// queue.StreamWatermark, что у гейта публикации (T-026): ворота обязаны
+// закрываться до обрезки MAXLEN — порог выше предела молча терял бы
+// недоставленные рендер-задачи обрезкой (флага render_pending у них нет,
+// публикация прошла).
+func TestRenderQueueWatermark(t *testing.T) {
+	cases := []struct {
+		name      string
+		render    int
+		scheduler int
+		redisLen  int
+		want      int64
+	}{
+		// Дефолты конфигурации: 10 тыс. < 75 тыс. (половина
+		// DefaultStreamMaxLen(q:render) = 150 тыс., T-025) — кламп
+		// не активен, ворота срабатывают на настроенном значении.
+		{"дефолт: кламп не активен", 10000, 100000, 0, 10000},
+		{"явное значение ниже клампа", 7000, 100000, 0, 7000},
+		// 0 — общий порог; кламп ограничивает его до 75 тыс.: сырое
+		// сравнение T-066 (без клампа) держало ворота открытыми при
+		// лаге 98,4 тыс. из 100 тыс. — равновесие 24.10.
+		{"0 — общий порог с клампом", 0, 100000, 0, 75000},
+		{"явное значение выше клампа ограничивается", 200000, 100000, 0, 75000},
+		// Явный redis.maxlen режет потолок клампа для всех случаев.
+		{"0 — общий при явном redis.maxlen", 0, 100000, 10000, 5000},
+		{"явное при явном redis.maxlen", 10000, 100000, 10000, 5000},
+		// Отрицательные (мимо валидации) — StreamWatermark даёт 0:
+		// гейт отключён, документированная семантика ≤ 0.
+		{"отрицательные — гейт отключён", -5, 0, 0, 0},
+	}
+	for _, tc := range cases {
+		cfg := &config.Config{}
+		cfg.Render.QueueHighWatermark = tc.render
+		cfg.Scheduler.QueueHighWatermark = tc.scheduler
+		cfg.Redis.MaxLen = tc.redisLen
+		if got := renderQueueWatermark(cfg); got != tc.want {
+			t.Errorf("%s: renderQueueWatermark = %d, хочу %d", tc.name, got, tc.want)
+		}
+	}
+
+	// Инвариант дефолта (критерий задачи): порог не выше половины
+	// предела MAXLEN q:render — иначе кламп резал бы его молча, а
+	// ворота при глубине у предела не успевали закрываться до обрезки.
+	def := renderQueueWatermark(config.Default())
+	if def != 10000 {
+		t.Errorf("дефолт эффективного порога q:render = %d, хочу 10000 (T-174)", def)
+	}
+	if half := queue.DefaultStreamMaxLen(queue.StreamRender) / 2; def > half {
+		t.Errorf("дефолт %d выше DefaultStreamMaxLen(q:render)/2 = %d — ворота не сработают до обрезки", def, half)
 	}
 }

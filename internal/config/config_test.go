@@ -99,6 +99,7 @@ func TestDefault(t *testing.T) {
 		{"render.timeout_attempts", c.Render.TimeoutAttempts, 2},
 		{"render.restart_every_pages", c.Render.RestartEveryPages, 500},
 		{"render.restart_memory_bytes", c.Render.RestartMemoryBytes.B(), int64(1536 << 20)},
+		{"render.queue_high_watermark", c.Render.QueueHighWatermark, 10000},
 		{"content.dir", c.Content.Dir, "/data/content"},
 		{"content.pack_size", c.Content.PackSize.B(), int64(512 << 20)},
 		{"content.max_store_bytes", c.Content.MaxStoreBytes.B(), int64(2 << 20)},
@@ -228,6 +229,7 @@ render:
   timeout_attempts: 3
   restart_every_pages: 200
   restart_memory_bytes: "1GiB"
+  queue_high_watermark: 7000
 content:
   dir: "/srv/content"
   pack_size: "1GiB"
@@ -332,6 +334,7 @@ log:
 		{"render.timeout_attempts", cfg.Render.TimeoutAttempts, 3},
 		{"render.restart_every_pages", cfg.Render.RestartEveryPages, 200},
 		{"render.restart_memory_bytes", cfg.Render.RestartMemoryBytes.B(), int64(1 << 30)},
+		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
 		{"content.dir", cfg.Content.Dir, "/srv/content"},
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(1 << 30)},
 		{"content.max_store_bytes", cfg.Content.MaxStoreBytes.B(), int64(1 << 20)},
@@ -526,6 +529,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_RENDER_TIMEOUT_ATTEMPTS":             "5",
 		"CRAWLER_RENDER_RESTART_EVERY_PAGES":          "99",
 		"CRAWLER_RENDER_RESTART_MEMORY_BYTES":         "768MiB",
+		"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK":         "7000",
 		"CRAWLER_CONTENT_DIR":                         "/env/content",
 		"CRAWLER_CONTENT_PACK_SIZE":                   "256MB",
 		"CRAWLER_CONTENT_MAX_STORE_BYTES":             "512KiB",
@@ -622,6 +626,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"render.timeout_attempts", cfg.Render.TimeoutAttempts, 5},
 		{"render.restart_every_pages", cfg.Render.RestartEveryPages, 99},
 		{"render.restart_memory_bytes", cfg.Render.RestartMemoryBytes.B(), int64(768 << 20)},
+		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
 		{"content.dir", cfg.Content.Dir, "/env/content"},
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(256 * 1000 * 1000)},
 		{"content.max_store_bytes", cfg.Content.MaxStoreBytes.B(), int64(512 << 10)},
@@ -965,6 +970,8 @@ func TestValidate(t *testing.T) {
 		{"restart_every_pages 0", func(c *Config) { c.Render.RestartEveryPages = 0 }, "render.restart_every_pages"},
 		{"restart_memory_bytes мал", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(1 << 20) }, "render.restart_memory_bytes"},
 		{"restart_memory_bytes велик", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(17 << 30) }, "render.restart_memory_bytes"},
+		{"render.queue_high_watermark отрицательный", func(c *Config) { c.Render.QueueHighWatermark = -1 }, "render.queue_high_watermark"},
+		{"render.queue_high_watermark сверхпотолка", func(c *Config) { c.Render.QueueHighWatermark = 100000001 }, "render.queue_high_watermark"},
 		{"content.dir пуст", func(c *Config) { c.Content.Dir = "" }, "content.dir"},
 		{"pack_size мал", func(c *Config) { c.Content.PackSize = 1 }, "content.pack_size"},
 		{"pack_size велик", func(c *Config) { c.Content.PackSize = ByteSize(16 << 30) }, "content.pack_size"},
@@ -1071,6 +1078,7 @@ func TestValidate(t *testing.T) {
 	c.HTTP.MemLimit = ByteSize(16 << 30) // верхняя граница мягкого потолка кучи (T-163)
 	c.Ingest.MaxErrorRatio = 1
 	c.Render.RestartMemoryBytes = 0                                                    // контроль памяти отключён — допустимо
+	c.Render.QueueHighWatermark = 100000000                                            // верхняя граница порога ёмкости q:render (T-174)
 	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)
 	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // границы весов
 	c.Web.Listen = "/run/crawler-web/web.sock"                                         // unix-сокет — вариант публичного входа web (T-124)
@@ -1091,8 +1099,13 @@ func TestValidate(t *testing.T) {
 	c.Monitor.ZoneStatsInterval = Duration(30 * time.Second) // нижняя граница коридора ТЗ 5.9
 	c.Dashboard.StatusCacheTTL = Duration(5 * time.Minute)   // верхняя граница коридора T-161
 	c.HTTP.MemLimit = 0                                      // мягкий потолок кучи выключен — допустимо (T-163)
+	c.Render.QueueHighWatermark = 1                          // нижняя граница явного порога q:render (T-174)
 	if err := c.Validate(); err != nil {
 		t.Errorf("нижние границы должны быть валидны: %v", err)
+	}
+	c.Render.QueueHighWatermark = 0 // 0 — общий scheduler.queue_high_watermark, фолбэк (T-174)
+	if err := c.Validate(); err != nil {
+		t.Errorf("порог 0 (общий) должен быть валиден: %v", err)
 	}
 }
 

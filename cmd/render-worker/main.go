@@ -126,9 +126,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	go func() { _ = content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger}) }()
 
 	// Очередь: потребление q:render и XACK проходят прозрачно, публикация
-	// q:analyze — под гейтом backpressure (T-026: порог единый для
-	// рабочих стримов; как у dns-worker с q:http и http-worker с
-	// q:analyze).
+	// q:analyze — под гейтом backpressure (T-026: порог общий для
+	// гейтируемых стримов; как у dns-worker с q:http и http-worker с
+	// q:analyze; ворота ёмкости q:render — отдельные,
+	// render.queue_high_watermark, T-174).
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
