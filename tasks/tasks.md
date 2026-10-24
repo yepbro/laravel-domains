@@ -945,7 +945,7 @@ deploy/docker/compose.yaml): postgres .2, redis .3, unbound .10, coredns
 ingest, scheduler, dns-worker, http-worker, render-worker, analyzer,
 monitor, web, dashboard, prometheus, adminer, redis-insight, tools.
 
-- **T-180** [новая] — P2, статические `ipv4_address` всем долгоживущим
+- **T-180** [сделана] — P2, статические `ipv4_address` всем долгоживущим
   сервисам crawler_net в deploy/docker/compose.yaml: адресный план по
   классам (инфраструктура/testbed — как есть, приложение и
   наблюдение/утилиты — компактные диапазоны, например .20–.29 и .30+)
