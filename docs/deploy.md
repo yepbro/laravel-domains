@@ -340,8 +340,13 @@ journalctl -t crawler-render-worker@9109 -f # логи экземпляра
 ### 4.1. Пакеты ОС
 
 ```bash
-apt install postgresql redis-server unbound smartmontools
+apt install postgresql redis-server unbound smartmontools jq
 ```
+
+`jq` нужен скрипту Telegram-доставки monitor (`/opt/crawler/bin/
+telegram-notify.sh`, T-162/T-173: алерты и отчёты нагрузки — сборка
+JSON-сообщения и маскировка секрета в логе; без него отправка молча
+падает exit 127 — замер 24.10 на боевой установке).
 
 Зависимости Chromium headless-shell (`libnspr4 libnss3 fontconfig` +
 шрифты) — отдельным списком при его установке: §4.3 ниже.
@@ -528,11 +533,20 @@ cp -r rules /etc/crawler/rules                    # правила Laravel дл�
 - `dns.ipv6: true` — если у сервера есть IPv6 (в docker-сети его нет).
 
 Необязательная настройка после первого запуска — доставка алертов
-monitor в Telegram (T-162): секреты `TELEGRAM_BOT_TOKEN`/
-`TELEGRAM_CHAT_ID` в `/etc/crawler/crawler.env` и скрипт
-`deploy/telegram-notify.sh` в `/opt/crawler/bin/` (деплой-архив везёт
-только бинарники) — пошагово в [`operations.md`](operations.md) §4.3;
-без них алерты остаются Warn в journald monitor.
+monitor и отчётов нагрузки в Telegram (T-162/T-173): **обязательны оба
+секрета `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`** (тот же бот и группа,
+что у извещений CI/CD) в `/etc/crawler/crawler.env` — образец и где
+брать значения: `deploy/systemd/crawler.env.example`; доставить можно
+ops-workflow'ем `ops-telegram-env` (Actions → Run workflow: значения
+живут в секретах репозитория GitHub и оттуда не читаются — CI
+единственный держатель, workflow дописывает их в env-файл и
+перезапускает monitor). Скрипт отправки `telegram-notify.sh` едет в
+деплой-архиве вместе с бинарниками (deploy.yml кладёт
+`deploy/telegram-notify.sh` в архив, install распаковывает его в
+`/opt/crawler/bin` и chmod 0755) — отдельной установки не требует;
+скрипту нужен пакет `jq` (§4.1). Пошагово —
+[`operations.md`](operations.md) §4.3; без секретов алерты и отчёты
+остаются Warn/Info в journald monitor.
 
 ### 4.6. Юниты и запуск
 

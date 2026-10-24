@@ -869,9 +869,10 @@ Telegram той же доставкой, что алерты (`alerts.telegram` 
   нет `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` в EnvironmentFile юнита
   (секреты не в YAML) или скрипта `telegram_script` — доставка тихо
   выключена, алерты остаются Warn в журнале monitor;
-- `telegram_script` — путь `telegram-notify.sh` на сервере; деплой
-  ставит только бинарники, скрипт копирует оператор
-  ([`operations.md`](operations.md) §4.3);
+- `telegram_script` — путь `telegram-notify.sh` на сервере; скрипт едет
+  в деплой-архиве вместе с бинарниками (deploy.yml → `/opt/crawler/bin`,
+  отдельной установки не требует — [`operations.md`](operations.md)
+  §4.3);
 - `disk_free_min_bytes` / `disk_free_crit_bytes` — абсолютный минимум
   свободного места каталога контента (алерты `disk_free_min` Warn /
   `disk_free_crit` эскалация): процентный порог на томе 79 ГБ поздний

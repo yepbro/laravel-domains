@@ -222,20 +222,27 @@ make logs SERVICE=monitor | grep -i warn      # dev
    TELEGRAM_CHAT_ID=<id выделенной группы>
    ```
 
-   нет любого — доставка выключена (запись в журнале monitor при старте),
-   алерты остаются Warn в journald — как шаг CI молчит без секретов;
-2. Скрипт отправки на хосте: `deploy/telegram-notify.sh` →
-   `/opt/crawler/bin/telegram-notify.sh` (деплой-архив везёт только
-   бинарники, скрипт копируется один раз при настройке):
+   **обязательны оба**: нет любого — доставка выключена (запись в журнале
+   monitor при старте), алерты остаются Warn в journald — как шаг CI
+   молчит без секретов. Значения живут в секретах репозитория GitHub
+   (`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` — те же, что у извещений
+   CI/CD) и оттуда не читаются (write-only), поэтому доставка на сервер —
+   либо ops-workflow **`ops-telegram-env`** (Actions → Run workflow:
+   SSH-ключом деплоя дописывает/заменяет оба ключа в env-файле, сохраняет
+   права root:crawler 640 и перезапускает monitor — скрипт
+   `deploy/telegram-env.sh`), либо вручную редактором на сервере;
+2. Скрипт отправки на хосте: `/opt/crawler/bin/telegram-notify.sh` —
+   **едет в деплой-архиве вместе с бинарниками** (deploy.yml копирует
+   `deploy/telegram-notify.sh` в архив, install распаковывает его в
+   `/opt/crawler/bin` и chmod 0755): отдельной установки не требует и
+   переживает деплой. Ручное копирование не нужно (историческая
+   установка «один раз scp» стиралась первым же деплоем — install
+   пересоздаёт каталог из архива).
 
-   ```bash
-   scp deploy/telegram-notify.sh root@<сервер>:/opt/crawler/bin/
-   ssh root@<сервер> 'chown root:crawler /opt/crawler/bin/telegram-notify.sh && chmod 0755 /opt/crawler/bin/telegram-notify.sh'
-   ```
-
-   скрипту нужны `bash`, `curl` и `jq` на сервере; путь переопределяется
-   `monitor.alerts.telegram_script`. Проверка без отправки:
-   `TELEGRAM_BOT_TOKEN=x TELEGRAM_CHAT_ID=y /opt/crawler/bin/telegram-notify.sh --message "тест" --dry-run`.
+   скрипту нужны `bash`, `curl` и `jq` на сервере (`jq` — список пакетов
+   [`deploy.md`](deploy.md) §4.1; без него отправка падает exit 127);
+   путь переопределяется `monitor.alerts.telegram_script`. Проверка без
+   отправки: `TELEGRAM_BOT_TOKEN=x TELEGRAM_CHAT_ID=y /opt/crawler/bin/telegram-notify.sh --message "тест" --dry-run`.
 
 После правок `crawler.env` — `systemctl restart crawler-monitor`.
 

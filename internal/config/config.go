@@ -440,9 +440,9 @@ type Alerts struct {
 	// deploy/systemd/crawler.env.example): нет любого — доставка
 	// выключена, алерты остаются Warn в журнале monitor.
 	Telegram bool `yaml:"telegram"`
-	// TelegramScript — путь telegram-notify.sh на хосте: деплой ставит
-	// только бинарники, скрипт копирует оператор при настройке доставки
-	// (docs/operations.md §4.3).
+	// TelegramScript — путь telegram-notify.sh на хосте: скрипт едет
+	// в деплой-архиве вместе с бинарниками (deploy.yml → /opt/crawler/bin,
+	// отдельной установки не требует — docs/operations.md §4.3).
 	TelegramScript string `yaml:"telegram_script"`
 	// DiskFreeMinBytes — абсолютный минимум свободного места каталога
 	// контента, Warn (алерт disk_free_min): процентный порог
@@ -770,9 +770,10 @@ func Default() *Config {
 				// а не молчание конфига — оператор журналы не читает
 				// (мотивация T-162).
 				Telegram: true,
-				// Деплой-архив несёт только бинарники; скрипт ложится в
-				// /opt/crawler/bin руками при настройке доставки
-				// (docs/operations.md §4.3) — путь боевого стандарта.
+				// Скрипт едет в деплой-архиве вместе с бинарниками
+				// (deploy.yml: deploy/telegram-notify.sh → /opt/crawler/bin,
+				// install chmod 0755) — путь боевого стандарта, отдельной
+				// установки не требует (docs/operations.md §4.3).
 				TelegramScript: "/opt/crawler/bin/telegram-notify.sh",
 				// 15 GiB Warn / 10 GiB эскалация: 10 % от тома 79 ГБ —
 				// поздний процентный порог (≈5 ч до заполнения при
