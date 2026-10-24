@@ -802,6 +802,7 @@ rules:
 |---|---|---|---|
 | `listen` | `CRAWLER_MONITOR_LISTEN` | [host]:port | `:9100` |
 | `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `5m` (коридор 30s..1h; T-161) |
+| `load_report_interval` | `CRAWLER_MONITOR_LOAD_REPORT_INTERVAL` | длительность | `10m` (0 — выключен; коридор 1m..1h; T-173) |
 | `ingest_metrics_url` | `CRAWLER_MONITOR_INGEST_METRICS_URL` | http(s)-URL | `http://127.0.0.1:9101/metrics` |
 | `alerts.telegram` | `CRAWLER_MONITOR_ALERTS_TELEGRAM` | bool | `true` (T-162) |
 | `alerts.telegram_script` | `CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT` | путь | `/opt/crawler/bin/telegram-notify.sh` |
@@ -845,6 +846,16 @@ status`, лендинг и партиционирование — пятимин
 config.dev.yaml), на боевом хосте — loopback ingest по `METRICS_ADDR`
 юнита. Пустая строка — алерт «не измеряется» (зонд не поднимается);
 значение обязано быть абсолютным http(s)-адресом.
+`load_report_interval` — период отчёта системной нагрузки оператору
+(T-173): снимок `/proc` (утилизация и PSI CPU, load average, RAM/swap и
+PSI памяти, топ процессов по CPU и RSS — агрегаты по имени, «htop»-вид),
+свободное место каталога контента (statfs) и глубина очередей `q:*` с
+темпом потребления (дельта entries-read за окно). Доставляется в
+Telegram той же доставкой, что алерты (`alerts.telegram` — секреты и
+скрипт одни), дублируется строкой Info в журнал monitor и gauge
+`crawler_os_*` в `/metrics`. Первый проход после старта — база:
+утилизация и темпы «н/д», размеры полноценны. Дефолт 10 минут (144
+сообщения/сутки не тонут алерты), `0` — выключить; коридор 1m..1h.
 
 `alerts` (T-162) — недостающие пороги ТЗ 5.9 (замер §12: все P0 того
 периода найдены вручную) и доставка алертов оператору; семантика

@@ -413,6 +413,10 @@ type Analyzer struct {
 type Monitor struct {
 	Listen            string   `yaml:"listen"`
 	ZoneStatsInterval Duration `yaml:"zone_stats_interval"`
+	// LoadReportInterval — период отчёта системной нагрузки оператору
+	// (T-173): снимок CPU/памяти/процессов/диска/очередей уходит в
+	// Telegram (monitor.alerts.telegram) и журнал; 0 — цикл выключен.
+	LoadReportInterval Duration `yaml:"load_report_interval"`
 	// IngestMetricsURL — адрес /metrics сервиса ingest (T-099): алерт
 	// мусорных content_hash очистки читает счётчик из экспозиции ingest
 	// зондом раз в период алертов. Тот же адрес, что скрейпит Prometheus;
@@ -752,6 +756,10 @@ func Default() *Config {
 			// internal/monitor/zonestats.go). Тот же период у цикла
 			// алертов (порог остановки прогресса 5× интервал = 25 мин).
 			ZoneStatsInterval: Duration(5 * time.Minute),
+			// Отчёт нагрузки T-173: 10 минут — окно ловит эпизоды голода
+			// CPU/памяти (десятки минут), 144 сообщения/сутки не тонут
+			// алерты в группе; 0 — выключить (коридор Validate).
+			LoadReportInterval: Duration(10 * time.Minute),
 			// Loopback ingest по METRICS_ADDR (systemd-юниты привязывают
 			// 127.0.0.1:9101); docker-сети переопределяют именем сервиса
 			// (config.dev.yaml: http://ingest:9101/metrics).
@@ -1262,6 +1270,13 @@ func (c *Config) Validate() error {
 	if c.Monitor.ZoneStatsInterval < Duration(30*time.Second) || c.Monitor.ZoneStatsInterval > Duration(time.Hour) {
 		problems = append(problems, fmt.Sprintf("monitor.zone_stats_interval: ожидается %s..%s, задано %s",
 			Duration(30*time.Second), Duration(time.Hour), c.Monitor.ZoneStatsInterval))
+	}
+	// Отчёт нагрузки (T-173): 0 — выключен; иначе коридор 1м..1ч —
+	// чаще — спам группе оператора, реже — окно шире эпизодов голода.
+	if lr := c.Monitor.LoadReportInterval; lr != 0 &&
+		(lr < Duration(time.Minute) || lr > Duration(time.Hour)) {
+		problems = append(problems, fmt.Sprintf("monitor.load_report_interval: ожидается 0 (выключен) или %s..%s, задано %s",
+			Duration(time.Minute), Duration(time.Hour), lr))
 	}
 	if c.Monitor.IngestMetricsURL != "" {
 		if u, err := url.Parse(c.Monitor.IngestMetricsURL); err != nil ||

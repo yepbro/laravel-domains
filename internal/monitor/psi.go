@@ -87,9 +87,16 @@ func (s OSPSI) PSI(ctx context.Context) (PSIStat, error) {
 // ошибка: формат фиксирован ядром, кривой файл — не молчать (стиль
 // parseMemoryEvents). Выделена чистой функцией для табличного теста.
 func parsePSI(data string) (PSIStat, error) {
+	return parsePSIKind(data, "some")
+}
+
+// parsePSIKind — parsePSI с заданным видом строки PSI (some/full): полная
+// строка давления памяти /proc/pressure/memory содержит обе — some ждёт
+// «хотя бы одна задача», full — «все задачи» (отчёт нагрузки T-173).
+func parsePSIKind(data, kind string) (PSIStat, error) {
 	for _, line := range strings.Split(data, "\n") {
-		kind, rest, ok := strings.Cut(strings.TrimSpace(line), " ")
-		if !ok || kind != "some" {
+		prefix, rest, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || prefix != kind {
 			continue
 		}
 		fields := make(map[string]string)
@@ -119,5 +126,5 @@ func parsePSI(data string) (PSIStat, error) {
 		}
 		return st, nil
 	}
-	return PSIStat{}, errors.New("monitor: PSI: строка some отсутствует")
+	return PSIStat{}, fmt.Errorf("monitor: PSI: строка %s отсутствует", kind)
 }

@@ -109,8 +109,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// §12; реестр — метрики длительности прохода и пропусков тиков),
 	// gauge серой зоны Laravel-находок (T-115) и счётчики истории
 	// детекции appeared/lost (T-118) — все периодические проходы по БД,
-	// завершаются отменой ctx.
-	bg := make(chan error, 3)
+	// завершаются отменой ctx. Четвёртый цикл — отчёт системной
+	// нагрузки (T-173), подключается ниже — после сборки Telegram-доставки.
+	bg := make(chan error, 4)
 	go func() {
 		bg <- monitor.ZoneStatsLoop(ctx, pool, reg, monitor.ZoneStatsOptions{
 			Interval: cfg.Monitor.ZoneStatsInterval.D(),
@@ -176,6 +177,25 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		Script:  cfg.Monitor.Alerts.TelegramScript,
 		Log:     logger,
 	})
+
+	// Отчёт системной нагрузки оператору (T-173): раз в
+	// monitor.load_report_interval — снимок /proc (система + топ
+	// процессов «htop»-видом), места каталога контента и очередей с
+	// темпами потребления — в Telegram той же доставкой, что алерты
+	// (нет секретов/скрипта — только журнал и gauge crawler_os_*).
+	// Период 0 — цикл выключен (LoadReportLoop молча выйдет).
+	go func() {
+		bg <- monitor.LoadReportLoop(ctx, monitor.OSLoad{}, monitor.LoadReportOptions{
+			Interval: cfg.Monitor.LoadReportInterval.D(),
+			Log:      logger,
+			Metrics:  reg,
+			Notify:   telegram.Send,
+			Queues:   monitor.RedisQueues{RDB: rdb},
+			Space:    monitor.OSStatfs{},
+			Dirs:     []string{cfg.Content.Dir},
+		})
+	}()
+
 	err := monitor.AlertsLoop(ctx, deps, monitor.AlertsOptions{
 		Interval:          cfg.Monitor.ZoneStatsInterval.D(),
 		ZoneStatsInterval: cfg.Monitor.ZoneStatsInterval.D(),
@@ -196,7 +216,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// (отмена идемпотентна и при уже остановленных циклах). Их сбой не
 	// прячем за nil алертов — забираем результаты.
 	cancel()
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		bgErr := <-bg
 		if err == nil {
 			err = bgErr
