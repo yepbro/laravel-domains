@@ -83,8 +83,8 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 	// (10,2,1) — только q:analyze; чистые кандидаты seed — (10,0,0)
 	// и rendered-запись домена 40.
 	pool.results = append(pool.results,
-		retentionRow{key: retentionRowKey{zone: 1, domain: 10, sub: 1, variant: 0}, checkedAt: old, hash: retentionHash16(0x11), jsonb: true},
-		retentionRow{key: retentionRowKey{zone: 1, domain: 10, sub: 2, variant: 1}, checkedAt: old, hash: retentionHash16(0x22), jsonb: true},
+		retentionRow{key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}, checkedAt: old, hash: retentionHash16(0x11), jsonb: true},
+		retentionRow{key: retentionKey{zone: 1, domain: 10, sub: 2, variant: 1}, checkedAt: old, hash: retentionHash16(0x22), jsonb: true},
 	)
 	pool.contents[retentionHash(0x11)] = retentionFakeContent{refc: 1, clen: 1000}
 	pool.contents[retentionHash(0x22)] = retentionFakeContent{refc: 1, clen: 1000}
@@ -110,7 +110,7 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 	}
 	// Записи, ждущие очередей, не тронуты: контент и jsonb на месте,
 	// refcount живых строк не менялся.
-	for _, key := range []retentionRowKey{
+	for _, key := range []retentionKey{
 		{zone: 1, domain: 10, sub: 1, variant: 0},
 		{zone: 1, domain: 10, sub: 2, variant: 1},
 	} {
@@ -155,7 +155,7 @@ func TestRetentionOnce_PendingAllExcluded(t *testing.T) {
 	if pool.begins != 0 {
 		t.Fatalf("транзакций = %d, want 0 (чистить нечего)", pool.begins)
 	}
-	if r := pool.row(retentionRowKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil || !r.jsonb {
+	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil || !r.jsonb {
 		t.Fatalf("ждущая запись тронута: %+v", r)
 	}
 }
@@ -172,7 +172,7 @@ func TestRetentionOnce_PendingRefresh(t *testing.T) {
 	var rows []retentionRow
 	for sub := int16(0); sub < 26; sub++ {
 		rows = append(rows, retentionRow{
-			key:       retentionRowKey{zone: 1, domain: 10, sub: sub, variant: 0},
+			key:       retentionKey{zone: 1, domain: 10, sub: sub, variant: 0},
 			checkedAt: old, hash: retentionHash16(byte(sub)), jsonb: true,
 		})
 		pool.contents[retentionHash(byte(sub))] = retentionFakeContent{refc: 1, clen: 100}
@@ -198,11 +198,11 @@ func TestRetentionOnce_PendingRefresh(t *testing.T) {
 		t.Fatalf("Rows = %d, want 24 (исключены sub=0 и sub=25)", stats.Rows)
 	}
 	for _, sub := range []int16{0, 25} {
-		if r := pool.row(retentionRowKey{zone: 1, domain: 10, sub: sub, variant: 0}); r.hash == nil || !r.jsonb {
+		if r := pool.row(retentionKey{zone: 1, domain: 10, sub: sub, variant: 0}); r.hash == nil || !r.jsonb {
 			t.Errorf("запись sub=%d, защищённая обновлением снимка, очищена", sub)
 		}
 	}
-	if r := pool.row(retentionRowKey{zone: 1, domain: 10, sub: 12, variant: 0}); r.hash != nil {
+	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 12, variant: 0}); r.hash != nil {
 		t.Errorf("запись sub=12 без защиты не очищена")
 	}
 	p := opts.Pending.(*fakePending)
@@ -273,7 +273,7 @@ func TestRetentionOnce_PendingRefreshError(t *testing.T) {
 	var rows []retentionRow
 	for sub := int16(0); sub < 26; sub++ {
 		rows = append(rows, retentionRow{
-			key:       retentionRowKey{zone: 1, domain: 10, sub: sub, variant: 0},
+			key:       retentionKey{zone: 1, domain: 10, sub: sub, variant: 0},
 			checkedAt: old, hash: retentionHash16(byte(sub)), jsonb: true,
 		})
 		pool.contents[retentionHash(byte(sub))] = retentionFakeContent{refc: 1, clen: 100}
@@ -293,7 +293,7 @@ func TestRetentionOnce_PendingRefreshError(t *testing.T) {
 	}
 	// 25-я запись (sub=24) чистилась, 26-я (sub=25) не тронута — проход
 	// остановлен до её пачки.
-	if r := pool.row(retentionRowKey{zone: 1, domain: 10, sub: 25, variant: 0}); r.hash == nil {
+	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 25, variant: 0}); r.hash == nil {
 		t.Error("запись после точки ошибки очищена — остаток обязан ждать следующего прохода")
 	}
 }

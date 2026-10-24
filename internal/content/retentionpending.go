@@ -129,34 +129,55 @@ func (p *retentionPendingSets) key(k retentionKey) RetentionPendingKey {
 	return RetentionPendingKey{Zone: k.zone, Domain: k.domain, Sub: k.sub, Variant: k.variant}
 }
 
+// waiting — ждёт ли ключ потребителей хоть одного стрима снимка:
+// единый критерий исключения — им пользуется и deferBatch (фильтрация
+// пачки), и сбор списка ретраев защиты очередей (T-185,
+// retentiondrain.go).
+func (p *retentionPendingSets) waiting(k retentionKey) bool {
+	if p == nil {
+		return false // защита выключена — ждущих нет
+	}
+	key := p.key(k)
+	for _, s := range retentionPendingStreams {
+		if _, ok := p.sets[s][key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// countDeferred — учёт исключённой записи по стримам-держателям (запись
+// публикуется в q:render и q:analyze одновременно — держателей может
+// быть два, наблюдаемость «кто держит» важнее единичности счёта).
+func (p *retentionPendingSets) countDeferred(k retentionKey, st *RetentionStats) {
+	key := p.key(k)
+	for _, s := range retentionPendingStreams {
+		if _, ok := p.sets[s][key]; !ok {
+			continue
+		}
+		if st.Deferred == nil {
+			st.Deferred = make(map[string]int64, len(retentionPendingStreams))
+		}
+		st.Deferred[s]++
+	}
+}
+
 // deferBatch исключает из пачки кандидатов записи, чьи ключи есть в
-// снимке: их сообщения ждут потребителей — контент и jsonb ещё нужны
-// («до rendered не удалять», T-166). Каждое исключение считается в
-// stats.Deferred по каждому стриму, где ключ ждёт (запись публикуется в
-// q:render и q:analyze одновременно — держателей может быть два,
-// наблюдаемость «кто держит» важнее единичности счёта). Фильтрация
-// на месте: пачка после вызова вызывающему не нужна, аллокация второй
-// пачки в дренаже лишняя.
+// снимке (критерий — waiting): их сообщения ждут потребителей — контент
+// и jsonb ещё нужны («до rendered не удалять», T-166); каждое исключение
+// считается в stats.Deferred. Фильтрация на месте: пачка после вызова
+// вызывающему не нужна, аллокация второй пачки в дренаже лишняя.
 func (p *retentionPendingSets) deferBatch(batch []retentionCandidate, st *RetentionStats) []retentionCandidate {
 	if p == nil {
 		return batch // защита выключена — пачка без изменений
 	}
 	kept := batch[:0]
 	for _, c := range batch {
-		waiting := false
-		for _, s := range retentionPendingStreams {
-			if _, ok := p.sets[s][p.key(c.key)]; !ok {
-				continue
-			}
-			waiting = true
-			if st.Deferred == nil {
-				st.Deferred = make(map[string]int64, len(retentionPendingStreams))
-			}
-			st.Deferred[s]++
+		if p.waiting(c.key) {
+			p.countDeferred(c.key, st)
+			continue
 		}
-		if !waiting {
-			kept = append(kept, c)
-		}
+		kept = append(kept, c)
 	}
 	return kept
 }

@@ -58,13 +58,21 @@
 // ключи непотреблённых сообщений вычитываются из стримов, и записи,
 // ожидающие потребителей, исключаются из пачек дренажа.
 //
-// Пачки и дренаж: выборка кандидатов — курсорная пагинация по PK
-// (row-value >, стиль переанализа T-074) — не пересматривает
-// пройденное; каждая пачка — короткая транзакция (стиль T-020).
-// Повторный проход безопасен: очищенные записи выпадают из отбора
-// (content_hash и jsonb уже NULL), охраны UPDATE отсеивают гонки с
-// перезаписью (recheck T-030 пишет fresh checked_at и новый контент —
-// двойная проверка checked_at и content_hash IS NOT DISTINCT FROM).
+// Пачки и дренаж: выборка кандидатов — курсорная пагинация по времени
+// (checked_at, PK) > курсор (T-185): границы checked_at обслуживает
+// индекс subdomain_results_checked_idx (T-171), каждая пачка — короткая
+// транзакция (стиль T-020). Курсор цикла переживает проходы: строка
+// посещается один раз за жизнь (очищенная остаётся позади курсора,
+// перепроверённая DELETE+INSERT с fresh checked_at входит в дренаж
+// заново, когда состарится), цена прохода ∝ притоку, а не размеру
+// таблицы. Взамен упразднённых полных кругов — явные ограниченные
+// ретраи (retentiondrain.go): bounded-список ключей защиты очередей с
+// точечными предложениями и catch-up-круг по обнулению счётчика
+// рендер-долга. Повторный проход безопасен: очищенные записи выпадают
+// из отбора (content_hash и jsonb уже NULL), охраны UPDATE отсеивают
+// гонки с перезаписью (recheck T-030 пишет fresh checked_at и новый
+// контент — двойная проверка checked_at и content_hash IS NOT
+// DISTINCT FROM).
 //
 // Зафиксированные отступления (согласованы с заказчиком, T-166):
 // переанализ не-находок новыми правилами невозможен (применение — на
@@ -127,21 +135,77 @@ const (
 var (
 	// retentionSelectSQL — пачка кандидатов: есть что чистить (живой
 	// content_hash или jsonb), запись остарела, не ждёт рендера, домен
-	// жив и не находка. Курсор row-value > по PK — пагинация дренажа
-	// (стиль T-074); ORDER BY по тому же ключу — детерминированные пачки.
-	retentionSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, r.content_hash " +
+	// жив и не находка. Курсор row-value > по (checked_at, PK) —
+	// пагинация дренажа по времени (T-185, была по PK): обе границы
+	// checked_at — условия индекса subdomain_results_checked_idx (T-171),
+	// нижнюю планировщик PG16 выводит из row-value сам (проверено
+	// EXPLAIN: Index Cond checked_at >= $2 AND checked_at < now()-$1) —
+	// скан обязан читать только окно старения впереди курсора, а не
+	// heap всей истории (диагноз запроса №13 журнала медленных 24.10);
+	// ORDER BY по тому же ключу — детерминированные пачки: узкое окно
+	// устойчивого дренажа собирает Incremental Sort поверх порядка
+	// индекса, широкий (catch-up-круг с нуля) — Sort среза (замер
+	// EXPLAIN 24.10, PG 16.15). checked_at в списке колонок — курсор
+	// следующей пачки.
+	retentionSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, r.content_hash, r.checked_at " +
 		"FROM subdomain_results AS r " +
 		"JOIN domains AS d ON d.zone_id = r.zone_id AND d.id = r.domain_id " +
 		"WHERE r.checked_at < now() - $1::interval " +
+		"AND (r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant) " +
+		"> ($2::timestamptz, $3::int2, $4::int8, $5::int2, $6::int2) " +
 		"AND (r.content_hash IS NOT NULL OR r.headers IS NOT NULL OR r.cookies IS NOT NULL " +
 		"OR r.tls IS NOT NULL OR r.redirects IS NOT NULL OR r.addrs IS NOT NULL OR r.cname IS NOT NULL) " +
 		fmt.Sprintf("AND (r.rendered OR (d.flags & %d) = 0) ", int16(model.FlagRenderPending)) +
 		fmt.Sprintf("AND d.status <> %d ", int16(model.StatusDeleted)) +
 		"AND NOT EXISTS (SELECT 1 FROM laravel_domains AS ld " +
 		"WHERE ld.zone_id = r.zone_id AND ld.domain_id = r.domain_id) " +
-		"AND (r.zone_id, r.domain_id, r.subdomain_id, r.variant) > ($2::int2, $3::int8, $4::int2, $5::int2) " +
-		"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
-		"LIMIT $6"
+		"ORDER BY r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
+		"LIMIT $7"
+
+	// retentionProbeSQL — точечное предложение ретраев защиты очередей
+	// (T-185): ключи, отложенные снимком q:render/q:analyze, лежат позади
+	// курсора и не вернутся полным кругом (круги упразднены) — следующий
+	// проход предлагает их зондом по PK с фильтрами отбора выборки, но
+	// без курсора. Точечность плана закреплена JOIN LATERAL LIMIT 1
+	// (ревью T-185, P2-1): простой unnest-join при длинном списке (застой
+	// очередей — а список тогда длинный, лимит 100 тыс.) планировщик
+	// перевыбирает в hash join + seq scan по всей остаревшей истории —
+	// дорожка, убираемая задачей; LATERAL держит Index Scan по PK на
+	// каждый ключ при любом объёме списка (проверено EXPLAIN на PG16),
+	// стиль закрепления формы плана — как SET LOCAL у выборки T-181.
+	// Ключи, переставшие быть кандидатами (защита ушла и очистка прошла
+	// иным механизмом, перезапись recheck с fresh checked_at, находка,
+	// рендер-ожидание — его догонит catch-up-круг по счётчику долга),
+	// зонд не возвращает — ключ выпадает из списка (retentiondrain.go).
+	retentionProbeSQL = "SELECT k.zone_id, k.domain_id, k.subdomain_id, k.variant, r.content_hash " +
+		"FROM unnest($1::int2[], $2::int8[], $3::int2[], $4::int2[]) " +
+		"AS k(zone_id, domain_id, subdomain_id, variant) " +
+		"JOIN LATERAL (" +
+		"SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, r.content_hash " +
+		"FROM subdomain_results AS r " +
+		"JOIN domains AS d ON d.zone_id = r.zone_id AND d.id = r.domain_id " +
+		"WHERE r.zone_id = k.zone_id AND r.domain_id = k.domain_id " +
+		"AND r.subdomain_id = k.subdomain_id AND r.variant = k.variant " +
+		"AND r.checked_at < now() - $5::interval " +
+		"AND (r.content_hash IS NOT NULL OR r.headers IS NOT NULL OR r.cookies IS NOT NULL " +
+		"OR r.tls IS NOT NULL OR r.redirects IS NOT NULL OR r.addrs IS NOT NULL OR r.cname IS NOT NULL) " +
+		fmt.Sprintf("AND (r.rendered OR (d.flags & %d) = 0) ", int16(model.FlagRenderPending)) +
+		fmt.Sprintf("AND d.status <> %d ", int16(model.StatusDeleted)) +
+		"AND NOT EXISTS (SELECT 1 FROM laravel_domains AS ld " +
+		"WHERE ld.zone_id = r.zone_id AND ld.domain_id = r.domain_id) " +
+		"LIMIT 1) AS r ON true"
+
+	// retentionDebtSQL — точечное чтение счётчика рендер-долга
+	// crawler_counters['render_pending'] (T-175) в начале каждого
+	// прохода (T-185): переход счётчика в 0 — момент снятия всей
+	// рендер-защиты разом, цикл планирует catch-up-круг с нулевого
+	// курсора. Текст — тот же точечный SELECT, что guard прохода
+	// доработки renderDebtCounterSQL (T-181, internal/httpworker/
+	// renderq.go): хелпер не экспортирован, литерал дублируется с
+	// якорем (стиль pendingFieldData в cmd/http-worker/main.go);
+	// контракт счётчика (миграция 000015, переходы бита ведут пару ±1)
+	// не меняется — retention только читает.
+	retentionDebtSQL = "SELECT value FROM crawler_counters WHERE name = 'render_pending'"
 
 	// retentionPurgeSQL — чистка пачки: ссылка на контент и jsonb → NULL
 	// одной командой (одна версия строки — один HOT-апдейт вместо двух).
@@ -320,8 +384,9 @@ func (s *RetentionStats) add(o RetentionStats) {
 	}
 }
 
-// retentionKey — ключ строки subdomain_results (PK, ТЗ 6.1) и курсор
-// пагинации дренажа (стиль resultKey T-074).
+// retentionKey — ключ строки subdomain_results (PK, ТЗ 6.1): хвост
+// курсора пагинации дренажа (детерминизм внутри одинаковых checked_at) и
+// единица списка ретраев защиты очередей (T-185).
 type retentionKey struct {
 	zone    int16
 	domain  int64
@@ -329,106 +394,59 @@ type retentionKey struct {
 	variant int16
 }
 
-// retentionCandidate — строка пачки: ключ и прочитанный content_hash
-// (nil — у записи только jsonb, ссылки нет).
-type retentionCandidate struct {
-	key  retentionKey
-	hash []byte
+// less — лексикографический порядок ключа (row-value, ТЗ 6.1):
+// детерминизм пачек и сортировка ключей ретраев для воспроизводимых
+// зондов.
+func (k retentionKey) less(b retentionKey) bool {
+	if k.zone != b.zone {
+		return k.zone < b.zone
+	}
+	if k.domain != b.domain {
+		return k.domain < b.domain
+	}
+	if k.sub != b.sub {
+		return k.sub < b.sub
+	}
+	return k.variant < b.variant
 }
 
-// RetentionOnce — один проход: дренаж старения пачками по BatchSize до
-// исчерпания множества, остановки интерлоком, ошибки защиты очередей или
-// отмены ctx. Идемпотентен (ТЗ 3.4): очищенные строки выпадают из отбора,
-// пачки атомарны. Записи, чьи сообщения ждут q:render/q:analyze,
+// retentionCursor — курсор дренажа по времени (T-185): последняя
+// посещённая строка, переживающая проходы цикла (retentiondrain.go).
+// Время ведёт — строки стареют в порядке checked_at; PK детерминирует
+// порядок внутри одинаковых отметок (now() стабильна в транзакции
+// записи — пачки строк делят отметку, T-058). Нулевое значение — «с
+// начала» (catch-up-круг: старт процесса, снятие рендер-долга,
+// переполнение списка ретраев, fallback-сутки); time.Time{} меньше
+// любого реального checked_at.
+type retentionCursor struct {
+	checkedAt time.Time
+	key       retentionKey
+}
+
+// retentionCandidate — строка пачки: ключ, прочитанный content_hash
+// (nil — у записи только jsonb, ссылки нет) и отметка checked_at —
+// курсор следующей пачки (T-185).
+type retentionCandidate struct {
+	key       retentionKey
+	hash      []byte
+	checkedAt time.Time
+}
+
+// RetentionOnce — один проход с нулевого курсора (catch-up-круг):
+// дренаж старения пачками по BatchSize до исчерпания множества,
+// остановки интерлоком, ошибки защиты очередей или отмены ctx.
+// Идемпотентен (ТЗ 3.4): очищенные строки выпадают из отбора, пачки
+// атомарны. Записи, чьи сообщения ждут q:render/q:analyze,
 // исключаются из пачек по снимку непотреблённых ключей (retentionpending.go):
 // снимок берётся до прохода и обновляется каждые
 // DefaultRetentionPendingRefresh выборок длинного дренажа; ошибка чтения
 // стримов — консервативный пропуск остатка прохода (SkippedPending).
+// Разовый проход без состояния цикла (курсор/ретраи живут в
+// retentionState, retentiondrain.go): runbooks T-167 путь А и
+// изолированные сборки; RetentionLoop зовёт retentionPass с общим
+// состоянием — его проходы продолжают друг друга.
 func RetentionOnce(ctx context.Context, pool RetentionDB, opts RetentionOptions) (RetentionStats, error) {
-	if pool == nil {
-		return RetentionStats{}, errors.New("content: retention: пул не задан")
-	}
-	o := opts.withDefaults()
-	var out RetentionStats
-	// Снимок защиты — лениво, ПОСЛЕ первой проверки интерлока: интерлок
-	// «анализатор не успевает» закрывает и q:analyze, и q:render шире
-	// снимка — гонять тяжёлый XRANGE ради тут же выброшенного прохода
-	// незачем; кроме того, таймаут чтения зависшего стрима при закрытом
-	// интерлоке дал бы ложный SkippedPending вместо честного Skipped.
-	// Ошибка чтения — не ошибка прохода, а его отмена (данные не тронуты):
-	// см. шапку retentionpending.go.
-	var pending *retentionPendingSets
-	after := retentionKey{} // нулевой ключ меньше любого реального (zone_id ≥ 1)
-	selects := 0            // выборок пачек с момента снимка (обновление длинного дренажа)
-	for {
-		if err := ctx.Err(); err != nil {
-			return out, fmt.Errorf("content: retention: %w", err)
-		}
-		// Интерлок: анализатор не успевает — тела и headers/cookies
-		// записей очереди ещё нужны; проверяется на каждой пачке —
-		// длинный дренаж видит свежую глубину.
-		n, blocked, err := retentionBlocked(ctx, o)
-		if err != nil {
-			return out, fmt.Errorf("content: retention: интерлок q:analyze: %w", err)
-		}
-		if blocked {
-			out.Skipped = true
-			out.Depth = n
-			return out, nil
-		}
-		// Первый снимок — после интерлока, до первой выборки: чистка
-		// начинается только когда известно, какие записи ждут очередей.
-		if o.Pending != nil && pending == nil {
-			p, err := retentionPendingSnapshot(ctx, o.Pending)
-			if err != nil {
-				if ctx.Err() != nil {
-					return out, fmt.Errorf("content: retention: снимок очередей: %w", ctx.Err())
-				}
-				out.SkippedPending = true
-				return out, nil
-			}
-			pending = p
-		}
-
-		batch, err := retentionSelect(ctx, pool, o, after)
-		if err != nil {
-			return out, err
-		}
-		if len(batch) == 0 {
-			return out, nil // множество исчерпано
-		}
-		selects++
-		// Курсор и решение об исчерпании — по исходной выборке: исключённые
-		// защитой записи этим проходом пропускаются (курсор за ними) и
-		// вернутся следующим — чистка только не-ожидающих.
-		last, full := batch[len(batch)-1].key, len(batch) >= o.BatchSize
-		batch = pending.deferBatch(batch, &out)
-		if len(batch) > 0 {
-			st, err := retentionPurge(ctx, pool, o, batch)
-			if err != nil {
-				return out, err
-			}
-			out.add(st)
-		}
-		after = last
-		if !full {
-			return out, nil // неполная пачка — дренаж исчерпан
-		}
-		// Длинный дренаж: снимок устарел (гонка переиздания T-066) —
-		// перечитать дешевле, чем допустить окно; обновление покрывает
-		// только будущие пачки, пройденное не пересматривается.
-		if o.Pending != nil && selects >= DefaultRetentionPendingRefresh {
-			p, err := retentionPendingSnapshot(ctx, o.Pending)
-			if err != nil {
-				if ctx.Err() != nil {
-					return out, fmt.Errorf("content: retention: снимок очередей: %w", ctx.Err())
-				}
-				out.SkippedPending = true
-				return out, nil
-			}
-			pending, selects = p, 0
-		}
-	}
+	return retentionPass(ctx, pool, opts, &retentionState{})
 }
 
 // retentionBlocked — вердикт интерлока: глубина q:analyze ≥ порога.
@@ -448,10 +466,10 @@ func retentionBlocked(ctx context.Context, o RetentionOptions) (int64, bool, err
 
 // retentionSelect — пачка кандидатов после курсора after
 // (retentionSelectSQL).
-func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, after retentionKey) ([]retentionCandidate, error) {
+func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, after retentionCursor) ([]retentionCandidate, error) {
 	rows, err := pool.Query(ctx, retentionSelectSQL,
 		o.Retention.String(),
-		after.zone, after.domain, after.sub, after.variant,
+		after.checkedAt, after.key.zone, after.key.domain, after.key.sub, after.key.variant,
 		o.BatchSize,
 	)
 	if err != nil {
@@ -465,7 +483,7 @@ func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, 
 			c       retentionCandidate
 			variant int16
 		)
-		if err := rows.Scan(&c.key.zone, &c.key.domain, &c.key.sub, &variant, &c.hash); err != nil {
+		if err := rows.Scan(&c.key.zone, &c.key.domain, &c.key.sub, &variant, &c.hash, &c.checkedAt); err != nil {
 			return nil, fmt.Errorf("content: retention: выборка кандидатов: чтение: %w", err)
 		}
 		c.key.variant = variant
@@ -473,6 +491,46 @@ func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, 
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("content: retention: выборка кандидатов: %w", err)
+	}
+	return out, nil
+}
+
+// retentionProbe — точечный зонд ключей ретраев (retentionProbeSQL):
+// возвращает всё ещё кандидатов очистки среди предложенных ключей.
+// Ключи сортируются — детерминированные аргументы (стиль
+// cleanupRefcounts T-020); checkedAt не читается — зонд курсор не
+// двигает, его строки чистятся по месту.
+func retentionProbe(ctx context.Context, pool RetentionDB, o RetentionOptions, keys []retentionKey) ([]retentionCandidate, error) {
+	sort.Slice(keys, func(i, j int) bool { return keys[i].less(keys[j]) })
+	zones := make([]int16, len(keys))
+	domains := make([]int64, len(keys))
+	subs := make([]int16, len(keys))
+	variants := make([]int16, len(keys))
+	for i, k := range keys {
+		zones[i], domains[i], subs[i], variants[i] = k.zone, k.domain, k.sub, k.variant
+	}
+	rows, err := pool.Query(ctx, retentionProbeSQL,
+		zones, domains, subs, variants, o.Retention.String(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("content: retention: зонд ретраев: %w", err)
+	}
+	defer rows.Close()
+
+	var out []retentionCandidate
+	for rows.Next() {
+		var (
+			c       retentionCandidate
+			variant int16
+		)
+		if err := rows.Scan(&c.key.zone, &c.key.domain, &c.key.sub, &variant, &c.hash); err != nil {
+			return nil, fmt.Errorf("content: retention: зонд ретраев: чтение: %w", err)
+		}
+		c.key.variant = variant
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("content: retention: зонд ретраев: %w", err)
 	}
 	return out, nil
 }
@@ -625,13 +683,18 @@ func compareHash(a, b Hash) int {
 	return 0
 }
 
-// RetentionLoop — фоновый цикл retention (T-166): проходы RetentionOnce
+// RetentionLoop — фоновый цикл retention (T-166): проходы retentionPass
 // по ticker (первый — сразу: дренаж накопленного за простоем — стиль
 // CompactLoop/CleanupDeleted) до отмены ctx, возврат nil — контракт
-// OnRun каркаса сервисов (T-012). Retention = 0 — retention выключен:
-// цикл не поднимается вовсе (Info в лог). Ошибка прохода не
-// останавливает цикл: Warn, очередной проход повторит — проходы
-// идемпотентны (ТЗ 3.4).
+// OnRun каркаса сервисов (T-012). Состояние проходов (retentionState,
+// T-185) — курсор дренажа по времени и список ретраев — переживает
+// проходы: строка посещается один раз за жизнь, часовой проход
+// продолжает с места остановки (стоимость ∝ притоку, не размеру
+// таблицы); runbook-точки входа см. retentiondrain.go. Retention = 0 —
+// retention выключен: цикл не поднимается вовсе (Info в лог). Ошибка
+// прохода не останавливает цикл: Warn, очередной проход повторит —
+// проходы идемпотентны (ТЗ 3.4). Состояние трогает только цикл
+// (одна горутина тикера) — блокировки не нужны.
 func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions) error {
 	if pool == nil {
 		return errors.New("content: retention: пул не задан")
@@ -650,11 +713,13 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 		"interval", o.Interval.String(),
 		"batch", o.BatchSize,
 		"analyze_watermark", o.AnalyzeWatermark,
-		"queue_guard", o.Pending != nil)
+		"queue_guard", o.Pending != nil,
+		"retry_limit", DefaultRetentionRetryLimit)
 
+	state := &retentionState{}
 	pass := func() {
 		start := time.Now()
-		stats, err := RetentionOnce(ctx, pool, o)
+		stats, err := retentionPass(ctx, pool, o, state)
 		if err != nil {
 			// Отмена во время прохода — часть остановки, не тревога.
 			if ctx.Err() == nil {

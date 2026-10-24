@@ -90,18 +90,10 @@ func (r *retentionRows) RawValues() [][]byte { return nil }
 func (r *retentionRows) Conn() *pgx.Conn      { return nil }
 func (r *retentionRows) TypeMap() *pgtype.Map { return nil }
 
-// retentionRowKey — ключ строки subdomain_results (PK, ТЗ 6.1).
-type retentionRowKey struct {
-	zone    int16
-	domain  int64
-	sub     int16
-	variant int16
-}
-
 // retentionRow — строка subdomain_results: возраст, ссылка на контент,
 // признак наличия тяжёлых jsonb (любая из колонок) и rendered.
 type retentionRow struct {
-	key       retentionRowKey
+	key       retentionKey
 	checkedAt time.Time
 	hash      []byte // nil — ссылки нет (T-056)
 	jsonb     bool   // есть headers/cookies/tls/redirects/addrs/cname
@@ -138,6 +130,7 @@ type retentionFakePool struct {
 	domains  map[retentionDomKey]retentionFakeDomain
 	laravel  map[retentionDomKey]bool
 	contents map[Hash]retentionFakeContent
+	counters map[string]int64 // crawler_counters (T-175); nil-значения не поддерживаются — нет строки = нет ключа
 
 	selectErr error
 	beginErr  error
@@ -145,12 +138,14 @@ type retentionFakePool struct {
 	decrefErr error
 	deleteErr error
 	commitErr error
+	debtErr   error // отказ чтения счётчика рендер-долга
 
 	// onSelect — хук между выборкой и чисткой (гонки перезаписи): вызывается
 	// после отбора кандидатов, до возврата строк.
 	onSelect func()
 
-	queries   []retentionCall // SELECT'ы через пул
+	queries   []retentionCall // SELECT'ы дренажа/зонда через пул (без чтения счётчика)
+	debtReads int             // обращения к счётчику рендер-долга
 	txCalls   []retentionCall // операторы через транзакции
 	begins    int
 	commits   int
@@ -163,6 +158,9 @@ func newRetentionFakePool(now time.Time) *retentionFakePool {
 		domains:  make(map[retentionDomKey]retentionFakeDomain),
 		laravel:  make(map[retentionDomKey]bool),
 		contents: make(map[Hash]retentionFakeContent),
+		// Строка счётчика есть (миграция 000015): ноль долга — дефолт
+		// боевой БД после деплоя T-175.
+		counters: map[string]int64{"render_pending": 0},
 	}
 }
 
@@ -188,7 +186,7 @@ func (p *retentionFakePool) cutoff(interval string) time.Time {
 	return p.now.Add(-d)
 }
 
-func (p *retentionFakePool) row(key retentionRowKey) *retentionRow {
+func (p *retentionFakePool) row(key retentionKey) *retentionRow {
 	for i := range p.results {
 		if p.results[i].key == key {
 			return &p.results[i]
@@ -222,76 +220,113 @@ func (p *retentionFakePool) candidate(r *retentionRow, cutoff time.Time) bool {
 	return true
 }
 
-// Query обслуживает выборку кандидатов: фильтры, курсор row-value >,
-// порядок PK, LIMIT.
+// Query обслуживает чтения пула: счётчик рендер-долга (точечная строка),
+// выборку кандидатов (фильтры, курсор row-value > по (checked_at, PK),
+// порядок тот же, LIMIT) и зонд ретраев (PK = ANY ключей, фильтры
+// отбора без курсора).
 func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.queries = append(p.queries, retentionCall{sql: sql, args: args})
-	if sql != retentionSelectSQL {
+	switch sql {
+	case retentionDebtSQL:
+		p.debtReads++
+		if p.debtErr != nil {
+			return nil, p.debtErr
+		}
+		n, ok := p.counters["render_pending"]
+		if !ok {
+			return retentionResultRows(), nil // строки счётчика нет
+		}
+		return retentionResultRows([]any{n}), nil
+
+	case retentionSelectSQL:
+		p.queries = append(p.queries, retentionCall{sql: sql, args: args})
+		if p.selectErr != nil {
+			return nil, p.selectErr
+		}
+		cutoff := p.cutoff(args[0].(string))
+		after := retentionCursor{
+			checkedAt: args[1].(time.Time),
+			key: retentionKey{
+				zone:    args[2].(int16),
+				domain:  args[3].(int64),
+				sub:     args[4].(int16),
+				variant: args[5].(int16),
+			},
+		}
+		limit := args[6].(int)
+
+		var sel []*retentionRow
+		for i := range p.results {
+			r := &p.results[i]
+			if !p.candidate(r, cutoff) {
+				continue
+			}
+			if !retentionRowAfter(r, after) {
+				continue
+			}
+			sel = append(sel, r)
+		}
+		// ORDER BY (checked_at, PK) — детерминированные пачки (T-185).
+		sorted := make([]*retentionRow, len(sel))
+		copy(sorted, sel)
+		for i := 1; i < len(sorted); i++ {
+			for j := i; j > 0 && retentionRowLess(sorted[j], sorted[j-1]); j-- {
+				sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+			}
+		}
+		if len(sorted) > limit {
+			sorted = sorted[:limit]
+		}
+		// Снимок SELECT материализуется ДО хука: перезапись в окне гонки
+		// меняет строки после чтения (как в реальном конвейере recheck).
+		rows := make([][]any, len(sorted))
+		for i, r := range sorted {
+			rows[i] = []any{r.key.zone, r.key.domain, r.key.sub, r.key.variant, r.hash, r.checkedAt}
+		}
+		if p.onSelect != nil {
+			p.onSelect() // гонка перезаписи между выборкой и чисткой
+		}
+		return retentionResultRows(rows...), nil
+
+	case retentionProbeSQL:
+		p.queries = append(p.queries, retentionCall{sql: sql, args: args})
+		cutoff := p.cutoff(args[4].(string))
+		zones := args[0].([]int16)
+		domains := args[1].([]int64)
+		subs := args[2].([]int16)
+		variants := args[3].([]int16)
+		var rows [][]any
+		for i := range zones { // порядок входных ключей (сортирует зонд)
+			key := retentionKey{zone: zones[i], domain: domains[i], sub: subs[i], variant: variants[i]}
+			r := p.row(key)
+			if r == nil || !p.candidate(r, cutoff) {
+				continue // не кандидат: чистить нечего / fresh / находка / рендер
+			}
+			rows = append(rows, []any{r.key.zone, r.key.domain, r.key.sub, r.key.variant, r.hash})
+		}
+		return retentionResultRows(rows...), nil
+
+	default:
 		return nil, fmt.Errorf("retention fake: неожидаемый SELECT %q", sql)
 	}
-	if p.selectErr != nil {
-		return nil, p.selectErr
-	}
-	cutoff := p.cutoff(args[0].(string))
-	after := retentionRowKey{
-		zone:    args[1].(int16),
-		domain:  args[2].(int64),
-		sub:     args[3].(int16),
-		variant: args[4].(int16),
-	}
-	limit := args[5].(int)
-
-	var sel []*retentionRow
-	for i := range p.results {
-		r := &p.results[i]
-		if !p.candidate(r, cutoff) {
-			continue
-		}
-		if !retentionKeyAfter(r.key, after) {
-			continue
-		}
-		sel = append(sel, r)
-	}
-	// ORDER BY PK (выборка уже по возрастанию ключа — сортировка копии).
-	sorted := make([]*retentionRow, len(sel))
-	copy(sorted, sel)
-	for i := 1; i < len(sorted); i++ {
-		for j := i; j > 0 && retentionKeyLess(sorted[j].key, sorted[j-1].key); j-- {
-			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
-		}
-	}
-	if len(sorted) > limit {
-		sorted = sorted[:limit]
-	}
-	// Снимок SELECT материализуется ДО хука: перезапись в окне гонки
-	// меняет строки после чтения (как в реальном конвейере recheck).
-	rows := make([][]any, len(sorted))
-	for i, r := range sorted {
-		rows[i] = []any{r.key.zone, r.key.domain, r.key.sub, r.key.variant, r.hash}
-	}
-	if p.onSelect != nil {
-		p.onSelect() // гонка перезаписи между выборкой и чисткой
-	}
-	return retentionResultRows(rows...), nil
 }
 
-// retentionKeyLess/After — сравнение ключа строки (row-value, ТЗ 6.1).
-func retentionKeyLess(a, b retentionRowKey) bool {
-	if a.zone != b.zone {
-		return a.zone < b.zone
+// retentionRowLess/After — сравнение строки с курсором по (checked_at, PK),
+// row-value порядок выборки (T-185).
+func retentionRowLess(a, b *retentionRow) bool {
+	if !a.checkedAt.Equal(b.checkedAt) {
+		return a.checkedAt.Before(b.checkedAt)
 	}
-	if a.domain != b.domain {
-		return a.domain < b.domain
-	}
-	if a.sub != b.sub {
-		return a.sub < b.sub
-	}
-	return a.variant < b.variant
+	return a.key.less(b.key)
 }
 
-func retentionKeyAfter(a, after retentionRowKey) bool { return retentionKeyLess(after, a) }
+func retentionRowAfter(r *retentionRow, after retentionCursor) bool {
+	if !r.checkedAt.Equal(after.checkedAt) {
+		return r.checkedAt.After(after.checkedAt)
+	}
+	return after.key.less(r.key)
+}
 
 func (p *retentionFakePool) Begin(context.Context) (pgx.Tx, error) {
 	p.mu.Lock()
@@ -310,13 +345,13 @@ type retentionFakeTx struct {
 	pgx.Tx // остальные методы pgx.Tx проход не использует
 
 	pool    *retentionFakePool
-	purged  map[retentionRowKey]retentionRow // очищенные строки
-	updated map[Hash]retentionFakeContent    // уменьшенные refcount
-	deleted map[Hash]struct{}                // удалённые contents
+	purged  map[retentionKey]retentionRow // очищенные строки
+	updated map[Hash]retentionFakeContent // уменьшенные refcount
+	deleted map[Hash]struct{}             // удалённые contents
 }
 
 // view-доступ к состоянию с учётом собственных изменений транзакции.
-func (t *retentionFakeTx) row(key retentionRowKey) *retentionRow {
+func (t *retentionFakeTx) row(key retentionKey) *retentionRow {
 	if r, ok := t.purged[key]; ok {
 		return &r
 	}
@@ -353,7 +388,7 @@ func (t *retentionFakeTx) Query(_ context.Context, sql string, args ...any) (pgx
 		hashes := args[4].([][]byte)
 		var out [][]any
 		for i := range zones {
-			key := retentionRowKey{zone: zones[i], domain: domains[i], sub: subs[i], variant: variants[i]}
+			key := retentionKey{zone: zones[i], domain: domains[i], sub: subs[i], variant: variants[i]}
 			r := t.row(key)
 			if r == nil {
 				continue // строка исчезла (перепроверка переписала) — охрана
@@ -365,7 +400,7 @@ func (t *retentionFakeTx) Query(_ context.Context, sql string, args ...any) (pgx
 				continue // контент сменился — охрана content_hash
 			}
 			if t.purged == nil {
-				t.purged = make(map[retentionRowKey]retentionRow)
+				t.purged = make(map[retentionKey]retentionRow)
 			}
 			clean := *r
 			clean.hash, clean.jsonb = nil, false
@@ -498,17 +533,17 @@ func retentionSeedPool(now time.Time) *retentionFakePool {
 	pool.laravel[retentionDomKey{zone: 1, id: 20}] = true
 	pool.results = []retentionRow{
 		// 10: обычная не-находка — чистится.
-		{key: retentionRowKey{zone: 1, domain: 10, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xAA), jsonb: true},
+		{key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xAA), jsonb: true},
 		// 20: Laravel-находка — контент хранится всегда.
-		{key: retentionRowKey{zone: 1, domain: 20, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xBB), jsonb: true},
+		{key: retentionKey{zone: 1, domain: 20, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xBB), jsonb: true},
 		// 30: render_pending и не rendered — ждёт рендера.
-		{key: retentionRowKey{zone: 1, domain: 30, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xCC), jsonb: true},
+		{key: retentionKey{zone: 1, domain: 30, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xCC), jsonb: true},
 		// 40: render_pending, но rendered — рендер уже заменил контент.
-		{key: retentionRowKey{zone: 1, domain: 40, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xDD), jsonb: true, rendered: true},
+		{key: retentionKey{zone: 1, domain: 40, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xDD), jsonb: true, rendered: true},
 		// 50: deleted — территория очистки T-020.
-		{key: retentionRowKey{zone: 1, domain: 50, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xEE), jsonb: true},
+		{key: retentionKey{zone: 1, domain: 50, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xEE), jsonb: true},
 		// 60: свежая запись — не остарела.
-		{key: retentionRowKey{zone: 1, domain: 60, sub: 0, variant: 0}, checkedAt: now.Add(-time.Minute), hash: retentionHash16(0xFF), jsonb: true},
+		{key: retentionKey{zone: 1, domain: 60, sub: 0, variant: 0}, checkedAt: now.Add(-time.Minute), hash: retentionHash16(0xFF), jsonb: true},
 	}
 	pool.contents[retentionHash(0xAA)] = retentionFakeContent{refc: 1, clen: 7000}
 	pool.contents[retentionHash(0xBB)] = retentionFakeContent{refc: 1, clen: 7000}
@@ -554,13 +589,13 @@ func TestRetentionOnce_Selection(t *testing.T) {
 		t.Errorf("аномалий быть не должно: %+v", stats)
 	}
 	for _, dom := range []int64{10, 40} {
-		r := pool.row(retentionRowKey{zone: 1, domain: dom, sub: 0, variant: 0})
+		r := pool.row(retentionKey{zone: 1, domain: dom, sub: 0, variant: 0})
 		if r == nil || r.hash != nil || r.jsonb {
 			t.Errorf("домен %d: запись не очищена: %+v", dom, r)
 		}
 	}
 	for _, dom := range []int64{20, 30, 50, 60} {
-		r := pool.row(retentionRowKey{zone: 1, domain: dom, sub: 0, variant: 0})
+		r := pool.row(retentionKey{zone: 1, domain: dom, sub: 0, variant: 0})
 		if r == nil || r.hash == nil || !r.jsonb {
 			t.Errorf("домен %d: запись обязана остаться нетронутой: %+v", dom, r)
 		}
@@ -589,7 +624,7 @@ func TestRetentionOnce_OnlyJSONB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
-	r := pool.row(retentionRowKey{zone: 1, domain: 10, sub: 0, variant: 0})
+	r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0})
 	if r == nil || r.jsonb {
 		t.Errorf("запись без контента: jsonb не зачищен: %+v", r)
 	}
@@ -635,7 +670,7 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if len(pool.queries) != 1 {
-		t.Fatalf("SELECT'ов = %d, want 1 (одна неполная пачка)", len(pool.queries))
+		t.Fatalf("SELECT'ов дренажа = %d, want 1 (одна неполная пачка; чтение счётчика долга не в счёт)", len(pool.queries))
 	}
 	sel := pool.queries[0]
 	if sel.sql != retentionSelectSQL {
@@ -643,7 +678,7 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 	}
 	wantArgs := []any{
 		DefaultRetention.String(),
-		int16(0), int64(0), int16(0), int16(0), // нулевой курсор первой пачки
+		time.Time{}, int16(0), int64(0), int16(0), int16(0), // нулевой курсор первой пачки (время + PK)
 		100,
 	}
 	if !reflect.DeepEqual(sel.args, wantArgs) {
@@ -698,8 +733,8 @@ func TestRetentionOnce_DedupAggregation(t *testing.T) {
 	old := now.Add(-2 * DefaultRetention)
 	pool.domains[retentionDomKey{zone: 1, id: 10}] = retentionFakeDomain{}
 	pool.results = []retentionRow{
-		{key: retentionRowKey{zone: 1, domain: 10, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0x11)},
-		{key: retentionRowKey{zone: 1, domain: 10, sub: 1, variant: 0}, checkedAt: old, hash: retentionHash16(0x11)},
+		{key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0x11)},
+		{key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}, checkedAt: old, hash: retentionHash16(0x11)},
 	}
 	pool.contents[retentionHash(0x11)] = retentionFakeContent{refc: 2, clen: 5000}
 
@@ -761,7 +796,7 @@ func TestRetentionOnce_BadHashes(t *testing.T) {
 	if len(hashes) != 1 || !retentionBytesEqual(hashes[0], retentionHash16(0xDD)) {
 		t.Errorf("decref по хэшам %v, want только валидный 0xDD", hashes)
 	}
-	if r := pool.row(retentionRowKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash != nil {
+	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash != nil {
 		t.Errorf("строка с кривым хэшем не очищена: %+v", r)
 	}
 }
@@ -848,7 +883,7 @@ func TestRetentionOnce_RaceRewritten(t *testing.T) {
 		if stats.Rows != 0 || stats.Refs != 0 || stats.Batches != 1 {
 			t.Fatalf("stats = %+v, want пустая зафиксированная пачка", stats)
 		}
-		if r := pool.row(retentionRowKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil || !r.jsonb {
+		if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil || !r.jsonb {
 			t.Fatalf("перезаписанная строка тронута: %+v", r)
 		}
 	})
@@ -980,7 +1015,7 @@ func TestRetentionOnce_Drain(t *testing.T) {
 	var rows []retentionRow
 	for sub := int16(0); sub < 3; sub++ {
 		rows = append(rows, retentionRow{
-			key:       retentionRowKey{zone: 1, domain: 10, sub: sub, variant: 0},
+			key:       retentionKey{zone: 1, domain: 10, sub: sub, variant: 0},
 			checkedAt: old, hash: retentionHash16(byte(0x10 + sub)), jsonb: true,
 		})
 		pool.contents[retentionHash(byte(0x10+sub))] = retentionFakeContent{refc: 1, clen: 1000}
@@ -999,9 +1034,11 @@ func TestRetentionOnce_Drain(t *testing.T) {
 	if len(pool.queries) != 2 {
 		t.Fatalf("SELECT'ов = %d, want 2", len(pool.queries))
 	}
-	// Курсор второй пачки — за последним ключом первой (sub=1).
+	// Курсор второй пачки — (checked_at, PK) за последней строкой первой
+	// (sub=1): время ведёт, PK детерминирует порядок равных отметок.
 	second := pool.queries[1]
-	if want := []any{DefaultRetention.String(), int16(1), int64(10), int16(1), int16(0), 2}; !reflect.DeepEqual(second.args, want) {
+	want := []any{DefaultRetention.String(), old, int16(1), int64(10), int16(1), int16(0), 2}
+	if !reflect.DeepEqual(second.args, want) {
 		t.Errorf("args второй пачки = %v, want %v", second.args, want)
 	}
 }
