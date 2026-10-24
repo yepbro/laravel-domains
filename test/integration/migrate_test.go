@@ -256,7 +256,8 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	// 000011 снимает таблицу laravel_history (000010 — CREATE OR REPLACE
 	// функции, повторное применение безопасно без подготовки), 0013/0014
 	// снимают частичный индекс deleted-доменов и индексы окон
-	// мониторинга (T-170/T-171).
+	// мониторинга (T-170/T-171), 0015 — таблицу счётчика crawler_counters
+	// (T-175).
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -273,6 +274,7 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		"DROP INDEX IF EXISTS domains_lease_idx",
 		"DROP TABLE IF EXISTS laravel_history",
 		"DROP TABLE IF EXISTS web_checks",
+		"DROP TABLE IF EXISTS crawler_counters",
 		"DROP INDEX IF EXISTS laravel_domains_updated_at_idx",
 		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_laravel",
 		"TRUNCATE schema_migrations",
