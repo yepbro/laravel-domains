@@ -1,0 +1,51 @@
+name: ops-telegram-env
+
+# Разовая/повторяемая доставка Telegram-секретов мониторинга на боевой
+# сервер (T-173): значения TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID живут в
+# секретах репозитория (write-only — прочитать их нельзя) и нужны в
+# EnvironmentFile юнита crawler-monitor (/etc/crawler/crawler.env), чтобы
+# монитор доставлял алерты (T-162) и отчёты нагрузки (T-173) оператору.
+# CI — единственное место с доступом и к секретам, и к серверу
+# (DEPLOY_SSH_KEY, тот же, что у deploy). Запуск — только вручную
+# workflow_dispatch; шаги повторяют SSH-паттерн deploy.yml.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops-production
+  cancel-in-progress: false
+
+jobs:
+  telegram-env:
+    name: ssh · env upsert · restart monitor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SSH_HOST: root@155.212.174.88
+      SSH_OPTS: -o UserKnownHostsFile=known_hosts.txt -o ConnectTimeout=15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Настроить SSH
+        run: |
+          install -m 600 /dev/null id_ed25519
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > id_ed25519
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}" > known_hosts.txt
+
+      # Секреты передаются аргументами bash-скрипта по SSH: GitHub маскирует
+      # их в логах рана, скрипт значения не печатает (deploy/telegram-env.sh;
+      # стиль «bash -s» из deploy.yml). Коды скрипта: 4 — нет env-файла или
+      # аргументов, 3 — строка включения доставки не найдена в журнале.
+      - name: Доставить секреты и перезапустить monitor
+        run: |
+          set +e
+          ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s -- ' \
+            "${{ secrets.TELEGRAM_BOT_TOKEN }}" "${{ secrets.TELEGRAM_CHAT_ID }}" \
+            < deploy/telegram-env.sh
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
