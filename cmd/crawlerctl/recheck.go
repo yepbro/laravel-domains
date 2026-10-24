@@ -38,6 +38,8 @@ import (
 	"io"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
+
 	"crawler/internal/db"
 	"crawler/internal/idn"
 	"crawler/internal/model"
@@ -109,6 +111,29 @@ const recheckUpdateSQL = "UPDATE domains AS d " +
 	"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id AND d.status <> $4 " +
 	"RETURNING d.zone_id, d.id"
 
+// recheckStatesSQL — старые check_state переводимых строк точечным
+// предчтением FOR UPDATE (T-178, ТЗИ §6.1.2: оператор перевода не
+// пинирует старое состояние — pending/queued/done переводятся alike, а
+// PG 16 без RETURNING OLD): блокировка строки сериализует предчтение с
+// переводом в одной транзакции (recheckDB) — старое состояние
+// актуально на момент UPDATE, дельты счётчиков зон точны (done →
+// checked −n/pending +n, queued → queued −n/pending +n, pending → без
+// дельт: состояние не менялось).
+const recheckStatesSQL = "SELECT d.zone_id, d.id, d.check_state " +
+	"FROM domains AS d " +
+	"JOIN unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
+	"ON d.zone_id = k.zone_id AND d.id = k.domain_id " +
+	"WHERE d.status <> $3 " +
+	"FOR UPDATE OF d"
+
+// recheckDB — пул перевода с транзакциями: предчтение состояний,
+// перевод и дельты счётчиков зон атомарны (T-178, ТЗИ §6.1.3);
+// *pgxpool.Pool (openManagePool) удовлетворяет интерфейсу.
+type recheckDB interface {
+	db.DB
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
 // ---------------------------------------------------------------- данные
 
 // recheckItem — один запрошенный домен после разрешения имени
@@ -161,31 +186,82 @@ type recheckKey struct {
 	id   int64
 }
 
-// recheckTranslate переводит найденные домены в pending (один оператор
-// recheckUpdateSQL); возвращает множество фактически переведённых ключей
-// (по RETURNING — охрана status могла пропустить строку).
-func recheckTranslate(ctx context.Context, pool db.DB, keys []recheckKey) (map[recheckKey]bool, error) {
+// recheckTranslate переводит найденные домены в pending в одной
+// транзакции (T-178): предчтение старых состояний FOR UPDATE →
+// перевод (recheckUpdateSQL) → дельты счётчиков зон по старым
+// состояниям переведённых строк (db.ZoneShift); возвращает множество
+// фактически переведённых ключей (по RETURNING — охрана status могла
+// пропустить строку).
+func recheckTranslate(ctx context.Context, pool recheckDB, keys []recheckKey) (map[recheckKey]bool, error) {
 	zones := make([]int16, len(keys))
 	ids := make([]int64, len(keys))
 	for i, k := range keys {
 		zones[i], ids[i] = k.zone, k.id
 	}
-	rows, err := pool.Query(ctx, recheckUpdateSQL,
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("перевод доменов в pending: транзакция: %w", err)
+	}
+	// Откат безусловно: после Commit — no-op (стиль T-044).
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Старые состояния: блокировка строк делает предчтение и перевод
+	// согласованными (дубль-доставка record/lease меняет состояние
+	// только до блокировки — после неё мимо транзакции не пройти).
+	oldStates := make(map[recheckKey]model.CheckState, len(keys))
+	rows, err := tx.Query(ctx, recheckStatesSQL, zones, ids, int16(model.StatusDeleted))
+	if err != nil {
+		return nil, fmt.Errorf("перевод доменов в pending: чтение состояний: %w", err)
+	}
+	for rows.Next() {
+		var k recheckKey
+		var state int16
+		if err := rows.Scan(&k.zone, &k.id, &state); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("перевод доменов в pending: чтение состояний: строка: %w", err)
+		}
+		oldStates[k] = model.CheckState(state)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("перевод доменов в pending: чтение состояний: %w", err)
+	}
+	rows.Close()
+
+	rows, err = tx.Query(ctx, recheckUpdateSQL,
 		int16(model.CheckStatePending), zones, ids, int16(model.StatusDeleted))
 	if err != nil {
 		return nil, fmt.Errorf("перевод доменов в pending: %w", err)
 	}
-	defer rows.Close()
+	shift := db.NewZoneShift()
 	done := make(map[recheckKey]bool, len(keys))
 	for rows.Next() {
 		var k recheckKey
 		if err := rows.Scan(&k.zone, &k.id); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("перевод доменов в pending: чтение: %w", err)
 		}
 		done[k] = true
+		switch oldStates[k] {
+		case model.CheckStateDone:
+			shift.Add(k.zone, 0, 1, 0, -1) // checked −1, pending +1
+		case model.CheckStateQueued:
+			shift.Add(k.zone, 0, 1, -1, 0) // queued −1, pending +1
+		}
+		// pending → pending: состояние не менялось — без дельт.
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return nil, fmt.Errorf("перевод доменов в pending: %w", err)
+	}
+	rows.Close()
+
+	if err := shift.Exec(ctx, tx); err != nil {
+		return nil, fmt.Errorf("перевод доменов в pending: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("перевод доменов в pending: фиксация: %w", err)
 	}
 	return done, nil
 }
@@ -197,7 +273,7 @@ func recheckTranslate(ctx context.Context, pool db.DB, keys []recheckKey) (map[r
 // один домен не поставлен (переведённые остаются в pending — перевод
 // не откатывается, повтор команды идемпотентен). names — полные
 // punycode-имена (idn.Normalize), порядок сохраняется в выводе.
-func recheckRun(ctx context.Context, pool db.DB, names []string, stdout io.Writer) error {
+func recheckRun(ctx context.Context, pool recheckDB, names []string, stdout io.Writer) error {
 	items, err := fetchRecheckItems(ctx, pool, names)
 	if err != nil {
 		return err

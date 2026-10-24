@@ -72,9 +72,14 @@ const enqueueMaxNameLen = 253
 // crawlerctl recheck) — свежий эпизод всегда начинается с чистого бита,
 // иначе пометка прошлого эпизода подавила бы его публикацию (потеря
 // задачи q:http). Знаковая маска ~бита и ::int2 — smallint-арифметика PG
-// (стиль renderq.go T-066). Охрана t.check_state = pending перепроверяет
-// состояние на момент блокировки строки; RETURNING — ключи фактически
-// переведённых строк: публикация строится ровно по ним.
+// (стиль renderq.go T-066). Охрана t.check_state = pending И t.status <>
+// deleted перепроверяет состояние на момент блокировки строки: pending
+// — что строка ещё кандидат выборки, не-deleted — что её не удалил
+// delete-файл (T-019) между выборкой и переводом: apply_delete
+// check_state не меняет, и перевод удалённой строки давал бы двойной
+// декремент pending и фантомный queued (дельты T-178, ревью P2-1);
+// RETURNING — ключи фактически переведённых строк: публикация строится
+// ровно по ним.
 var enqueueUpdate = db.Update("domains").
 	Key(
 		db.Column{Name: "zone_id", Type: "int2"},
@@ -85,8 +90,31 @@ var enqueueUpdate = db.Update("domains").
 		"queued_at = now()",
 		fmt.Sprintf("flags = (t.flags & %d)::int2", int16(^int16(model.FlagHTTPPublished))),
 	).
-	Where(fmt.Sprintf("t.check_state = %d", int16(model.CheckStatePending))).
+	Where(fmt.Sprintf("t.check_state = %d AND t.status <> %d", int16(model.CheckStatePending), int16(model.StatusDeleted))).
 	Returning("t.zone_id", "t.id")
+
+// enqueueBatchSQL — перевод пачки + дельты счётчиков зон ОДНИМ
+// оператором (T-178, ТЗИ §6.1: CTE того же оператора — откат/фиксация
+// пары «переход + дельта» атомарны без явной транзакции): upd — перевод
+// (текст enqueueUpdate, единственная точка правды конструктора),
+// zc — сдвиг pending −n / queued +n по зонам переведённых строк
+// (RETURNING zone_id → GROUP BY; предикат перевода пинирует старое
+// состояние pending — дельта считается по числу фактически
+// переведённых строк, ТЗИ §6.1.2), внешний SELECT — ключи переведённых
+// строк для публикации (как RETURNING перевода прежде).
+var enqueueBatchSQL = func() string {
+	inner, err := enqueueUpdate.SQL()
+	if err != nil {
+		panic("scheduler: построение enqueueUpdate: " + err.Error())
+	}
+	return "WITH upd AS (" + inner + "), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_pending = z.domains_pending - c.n, " +
+		"domains_queued = z.domains_queued + c.n " +
+		"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT u.zone_id, u.id FROM upd AS u"
+}()
 
 // enqueueKey — ключ строки domains: пачка адресуется парой (zone_id, id).
 type enqueueKey struct {
@@ -138,8 +166,10 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 		domainIDs[i] = r.DomainID
 	}
 
-	// Перевод. RETURNING — ключи фактически переведённых строк.
-	rows, err := enqueueUpdate.Query(ctx, pool, zoneIDs, domainIDs)
+	// Перевод. RETURNING — ключи фактически переведённых строк; дельты
+	// счётчиков зон (pending −n / queued +n) выполняет CTE того же
+	// оператора (T-178): перевод и дельты атомарны.
+	rows, err := pool.Query(ctx, enqueueBatchSQL, zoneIDs, domainIDs)
 	if err != nil {
 		return EnqueueResult{}, fmt.Errorf("scheduler: постановка пачки (%d доменов): %w", len(batch), err)
 	}

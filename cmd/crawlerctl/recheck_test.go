@@ -48,12 +48,23 @@ const wantRecheckUpdate = "UPDATE domains AS d " +
 	"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id AND d.status <> $4 " +
 	"RETURNING d.zone_id, d.id"
 
+// wantRecheckStates — предчтение старых состояний FOR UPDATE (T-178).
+const wantRecheckStates = "SELECT d.zone_id, d.id, d.check_state " +
+	"FROM domains AS d " +
+	"JOIN unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
+	"ON d.zone_id = k.zone_id AND d.id = k.domain_id " +
+	"WHERE d.status <> $3 " +
+	"FOR UPDATE OF d"
+
 func TestRecheckSQLContract(t *testing.T) {
 	if recheckLookupSQL != wantRecheckLookup {
 		t.Errorf("SQL-контракт lookup:\nполучен %s\nожидался %s", recheckLookupSQL, wantRecheckLookup)
 	}
 	if recheckUpdateSQL != wantRecheckUpdate {
 		t.Errorf("SQL-контракт update:\nполучен %s\nожидался %s", recheckUpdateSQL, wantRecheckUpdate)
+	}
+	if recheckStatesSQL != wantRecheckStates {
+		t.Errorf("SQL-контракт состояний:\nполучен %s\nожидался %s", recheckStatesSQL, wantRecheckStates)
 	}
 }
 
@@ -89,6 +100,7 @@ type recheckPool struct {
 	queryErrAfter int // первые N Query успешны, затем queryErr (сбой перевода)
 	onUpdate      func()
 	queries       []subCall
+	execs         []subCall // Exec транзакций (сдвиг счётчиков зон, T-178)
 }
 
 var _ db.DB = (*recheckPool)(nil)
@@ -126,6 +138,8 @@ func (p *recheckPool) Query(_ context.Context, sql string, args ...any) (pgx.Row
 	switch sql {
 	case recheckLookupSQL:
 		return p.lookupRows(args[0].([]string)), nil
+	case recheckStatesSQL:
+		return p.statesRows(args[0].([]int16), args[1].([]int64), args[2].(int16)), nil
 	case recheckUpdateSQL:
 		if p.onUpdate != nil {
 			p.onUpdate() // гонка между lookup и UPDATE (например, delete-файл)
@@ -134,6 +148,55 @@ func (p *recheckPool) Query(_ context.Context, sql string, args ...any) (pgx.Row
 	default:
 		return nil, fmt.Errorf("recheckPool: неожидаемый SQL Query: %s", sql)
 	}
+}
+
+// Begin — транзакция перевода (T-178: предчтение состояний, перевод и
+// дельты счётчиков зон атомарны).
+func (p *recheckPool) Begin(context.Context) (pgx.Tx, error) {
+	return &recheckPoolTx{pool: p}, nil
+}
+
+// recheckPoolTx — транзакция поверх фейка: Query/Exec идут в протокол
+// пула (Exec — сдвиг счётчиков зон), Commit/Rollback считаются.
+type recheckPoolTx struct {
+	pgx.Tx
+	pool     *recheckPool
+	commits  int
+	rollback int
+}
+
+func (t *recheckPoolTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return t.pool.Query(ctx, sql, args...)
+}
+
+func (t *recheckPoolTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	t.pool.execs = append(t.pool.execs, subCall{sql, append([]any(nil), args...)})
+	if sql != db.ZoneCounterShiftSQL {
+		return pgconn.CommandTag{}, fmt.Errorf("recheckPool: неожидаемый SQL Exec: %s", sql)
+	}
+	ids := args[0].([]int16)
+	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", len(ids))), nil
+}
+
+func (t *recheckPoolTx) Commit(context.Context) error   { t.commits++; return nil }
+func (t *recheckPoolTx) Rollback(context.Context) error { t.rollback++; return nil }
+
+// statesRows применяет семантику recheckStatesSQL (T-178): старые
+// состояния строк по ключам с охраной status <> deleted (FOR UPDATE).
+func (p *recheckPool) statesRows(zones []int16, ids []int64, deleted int16) pgx.Rows {
+	var rows [][]any
+	for i, zone := range zones {
+		id := ids[i]
+		for _, d := range p.domains {
+			if d.zone == zone && d.id == id && int16(d.status) != deleted {
+				rows = append(rows, []any{zone, id, int16(d.state)})
+				break
+			}
+		}
+	}
+	return statusRowsOf(rows...)
 }
 
 // lookupRows применяет семантику recheckLookupSQL: зона — длиннейший

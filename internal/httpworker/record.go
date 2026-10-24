@@ -116,6 +116,34 @@ var (
 			int16(model.FlagDeadHostCutoff), int16(^int16(model.FlagDeadHostCutoff))) +
 		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d", int16(model.StatusDeleted))
 
+	// recordSelectStateSQL — точечное предчтение старых значений строки
+	// домена перед UPDATE (T-178, ТЗИ §6.4): PG 16 без RETURNING OLD, а
+	// recordDomainSQL не пинирует старый check_state (охрана только по
+	// статусу). SELECT … FOR UPDATE первым шагом транзакции берёт на себя
+	// роль блокировки строки («UPDATE первым шагом блокирует строку»
+	// прежде): конкурентные записи эпизода сериализуются, решение об
+	// удалении принимается на актуальной версии строки. PK-лукап —
+	// дополнительная цена одна точечная PK-чтение на домен (темп
+	// завершений — десятки в секунду по замеру §12) против точных дельт
+	// счётчиков зон (дубль-доставка, возврат аренды посреди обработки).
+	recordSelectStateSQL = "SELECT status, check_state FROM domains " +
+		"WHERE zone_id = $1::int2 AND id = $2::int8 FOR UPDATE"
+
+	// recordZoneShiftSQL — дельта счётчиков зоны по старому состоянию
+	// переведённой строки (T-178): queued/…−1 (дельты параметрами:
+	// −1 старой колонки, +1 checked; старое done — дубль-доставка, дельты
+	// нулевые — повторная запись результата уже выводила домен из queued
+	// при первом проходе, ТЗИ §6.4). Той же транзакцией, что и запись
+	// результата: откат откатывает пару. RowsAffected != 1 — строка зоны
+	// отсутствует (возможна только при ручной правке справочника,
+	// runbooks §6): молчаливый дрейф недопустим, ошибка громче (стиль
+	// renderBumpDebtCounter, T-175).
+	recordZoneShiftSQL = "UPDATE zones " +
+		"SET domains_pending = domains_pending + $2::int8, " +
+		"domains_queued = domains_queued + $3::int8, " +
+		"domains_checked = domains_checked + $4::int8 " +
+		"WHERE id = $1::int2"
+
 	// recordDeleteSQL — перезапись результата (§3.5): удаляются все строки
 	// домена, RETURNING собирает content_hash для свопа ссылок (T-044).
 	// Ведущие колонки PK (zone_id, domain_id) — партиционирование LIST по
@@ -248,19 +276,42 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	// Откат безусловно: после Commit — no-op (стиль T-044).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Итог домена первым шагом: блокирует строку и решает судьбу записи
-	// (удалённому домену результат не пишется, §8). Четвёртый параметр —
-	// бит dead_host_cutoff последнего эпизода (T-164).
+	// Старые значения строки первым шагом (T-178, ТЗИ §6.4): FOR UPDATE
+	// блокирует строку домена (роль, которую прежде выполнял UPDATE),
+	// статус/check_state дают дельты счётчиков зоны. Отсутствие строки и
+	// deleted — те же штатные исходы, что раньше давал RowsAffected = 0
+	// UPDATE: пустой результат — откат пустой транзакции, false без
+	// ошибки (§8/§13.1: удалённому во время проверки домену результат не
+	// записывается).
+	var oldStatus, oldState int16
+	err = tx.QueryRow(ctx, recordSelectStateSQL, res.ZoneID, res.DomainID).Scan(&oldStatus, &oldState)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			r.log.Debug("результат не записан — домен отсутствует",
+				"domain", res.Name, "zone_id", res.ZoneID, "domain_id", res.DomainID)
+			return false, nil
+		}
+		return false, fmt.Errorf("httpworker: домен %s: запись результата: строка: %w", res.Name, err)
+	}
+	if model.Status(oldStatus) == model.StatusDeleted {
+		r.log.Debug("результат не записан — домен удалён",
+			"domain", res.Name, "zone_id", res.ZoneID, "domain_id", res.DomainID)
+		return false, nil
+	}
+
+	// Итог домена: строка заблокирована предчтением и не удалена — охрана
+	// UPDATE по статусу сохранена (второй рубеж против ручных правок
+	// между операторами). Четвёртый параметр — бит dead_host_cutoff
+	// последнего эпизода (T-164).
 	tag, err := tx.Exec(ctx, recordDomainSQL, res.ZoneID, res.DomainID, int16(status), res.Cutoff)
 	if err != nil {
 		return false, fmt.Errorf("httpworker: домен %s: запись результата: статус: %w", res.Name, err)
 	}
-	if tag.RowsAffected() == 0 {
-		// Домен удалён во время проверки (§13.1) или строки нет —
-		// штатные случаи, откат пустой транзакции.
-		r.log.Debug("результат не записан — домен удалён или отсутствует",
-			"domain", res.Name, "zone_id", res.ZoneID, "domain_id", res.DomainID)
-		return false, nil
+	if tag.RowsAffected() != 1 {
+		// Строка заблокирована и не удалена — недостижимо (страховка
+		// прямых вызовов/ручных правок); тихий пропуск дельт сделал бы
+		// счётчики ложью.
+		return false, fmt.Errorf("httpworker: домен %s: запись результата: статус: затронуто %d строк", res.Name, tag.RowsAffected())
 	}
 
 	// Флаг render_pending — той же транзакцией (T-066, §5.6): решение
@@ -310,6 +361,38 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		if int(tag.RowsAffected()) != len(batch.zone) {
 			return false, fmt.Errorf("httpworker: домен %s: вставлено %d строк из %d", res.Name, tag.RowsAffected(), len(batch.zone))
 		}
+	}
+	// Дельта счётчиков зоны — той же транзакцией (T-178, ТЗИ §6.4): по
+	// старому check_state предчтения (старое done — дубль-доставка, нули).
+	// Последние шаги перед фиксацией — строка зоны блокируется на
+	// минимум (как строка счётчика долга ниже, ревью T-175, P3-4).
+	shiftZone := func() error {
+		var dPending, dQueued, dChecked int64
+		switch model.CheckState(oldState) {
+		case model.CheckStatePending:
+			dPending, dChecked = -1, 1
+		case model.CheckStateQueued:
+			dQueued, dChecked = -1, 1
+		case model.CheckStateDone:
+			// Дубль-доставка: повторная запись результата уже выводила
+			// домен из queued при первом проходе — без дельт (ТЗИ §6.4).
+			return nil
+		default:
+			// Код вне перечисления — мусор в схеме; молчаливый пропуск
+			// дельт сделал бы счётчики ложью, ошибка громче.
+			return fmt.Errorf("старое состояние %d вне перечисления check_state", oldState)
+		}
+		tag, err := tx.Exec(ctx, recordZoneShiftSQL, res.ZoneID, dPending, dQueued, dChecked)
+		if err != nil {
+			return fmt.Errorf("счётчики зоны: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("счётчики зоны: затронуто %d строк (строка зоны %d обязательна)", tag.RowsAffected(), res.ZoneID)
+		}
+		return nil
+	}
+	if err := shiftZone(); err != nil {
+		return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 	}
 	// Счётчик долга — последним шагом транзакции (та же фиксация, §3.4:
 	// откат откатывает пару; окно блокировки строки счётчика — минимум).

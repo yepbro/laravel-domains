@@ -73,6 +73,11 @@ const (
 // отбор на момент блокировки строки (гонки с воркерами и вторым
 // проходом).
 //
+// Дельты счётчиков зон (queued −n / pending +n) — CTE zc того же
+// оператора по RETURNING zone_id переведённых строк (T-178, ТЗИ §6.2:
+// предикат пинирует старое состояние queued); внешний SELECT отдаёт
+// zone_id переведённых — LeaseOnce считает по нему итог прохода.
+//
 // Коды check_state/status вшиты в текст литералами через model.* — коды
 // схемы, а не данные (стиль dispatch.go): параметр в предикате частичного
 // индекса планировщик не доказывает, generic-план подготовленного
@@ -96,15 +101,22 @@ const (
 // Срок передан секундами через make_interval — интервал в одной точке
 // правды, без клиентской арифметики timestamp.
 var leaseUpdateSQL = fmt.Sprintf(
-	"UPDATE domains AS d "+
-		"SET check_state = $1, queued_at = NULL "+
-		"FROM (SELECT zone_id, id FROM domains "+
+	"WITH b AS (SELECT zone_id, id FROM domains "+
 		"WHERE check_state = %d AND status <> %d "+
 		"AND queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3) "+
-		"ORDER BY queued_at, zone_id, id LIMIT $4) AS b "+
-		"WHERE d.zone_id = b.zone_id AND d.id = b.id "+
+		"ORDER BY queued_at, zone_id, id LIMIT $4), "+
+		"upd AS (UPDATE domains AS d "+
+		"SET check_state = $1, queued_at = NULL "+
+		"FROM b WHERE d.zone_id = b.zone_id AND d.id = b.id "+
 		"AND d.check_state = %d AND d.status <> %d "+
-		"AND d.queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3)",
+		"AND d.queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3) "+
+		"RETURNING d.zone_id), "+
+		"zc AS (UPDATE zones AS z "+
+		"SET domains_queued = z.domains_queued - c.n, "+
+		"domains_pending = z.domains_pending + c.n "+
+		"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c "+
+		"WHERE z.id = c.zone_id) "+
+		"SELECT zone_id FROM upd",
 	int16(model.CheckStateQueued), int16(model.StatusDeleted),
 	int16(model.CheckStateQueued), int16(model.StatusDeleted))
 
@@ -166,9 +178,10 @@ type LeaseResult struct {
 // LeaseOnce выполняет один проход (ТЗ 5.3): до opts.BatchSize доменов
 // со check_state = queued и queued_at старше opts.Timeout (не deleted,
 // без результата) переводятся в check_state = pending одним оператором —
-// отметка аренды сбрасывается, остальные колонки не меняются. Порог
-// считает сервер БД (see leaseUpdateSQL); повторный проход безопасен
-// (ТЗ 3.4): переведённые строки подзапрос больше не выбирает.
+// отметка аренды сбрасывается, остальные колонки не меняются; CTE того
+// же оператора ведёт дельты счётчиков зон (T-178). Порог считает сервер
+// БД (see leaseUpdateSQL); повторный проход безопасен (ТЗ 3.4):
+// переведённые строки подзапрос больше не выбирает.
 func LeaseOnce(ctx context.Context, pool db.DB, opts LeaseOptions) (LeaseResult, error) {
 	if pool == nil {
 		return LeaseResult{}, errors.New("scheduler: возврат истёкших lease: пул не задан")
@@ -183,7 +196,7 @@ func LeaseOnce(ctx context.Context, pool db.DB, opts LeaseOptions) (LeaseResult,
 		now = &t
 	}
 
-	tag, err := pool.Exec(ctx, leaseUpdateSQL,
+	rows, err := pool.Query(ctx, leaseUpdateSQL,
 		int16(model.CheckStatePending),
 		now,
 		o.Timeout.Seconds(),
@@ -192,7 +205,20 @@ func LeaseOnce(ctx context.Context, pool db.DB, opts LeaseOptions) (LeaseResult,
 	if err != nil {
 		return LeaseResult{}, fmt.Errorf("scheduler: возврат истёкших lease: %w", err)
 	}
-	return LeaseResult{Domains: tag.RowsAffected()}, nil
+	defer rows.Close()
+
+	var n int64
+	for rows.Next() {
+		var zoneID int16
+		if err := rows.Scan(&zoneID); err != nil {
+			return LeaseResult{}, fmt.Errorf("scheduler: возврат истёкших lease: чтение: %w", err)
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return LeaseResult{}, fmt.Errorf("scheduler: возврат истёкших lease: %w", err)
+	}
+	return LeaseResult{Domains: n}, nil
 }
 
 // LeaseWatch — фоновый цикл возврата доменов с истёкшей арендой: дренаж

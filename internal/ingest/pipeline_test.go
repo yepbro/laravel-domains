@@ -54,6 +54,8 @@ type pipePool struct {
 	execs []pipeExec // результаты Exec по очереди (конец — нулевой тег)
 	execI int
 
+	inserted   int64 // ответ CTE вставки (T-178: Query)
+	revived    int64 // ответ CTE возврата (T-178: Query)
 	uniques    int64 // ответ countAddSQL (уникальных доменов партии add)
 	delDeleted int64 // ответ applyDeleteSQL
 	delMissing int64
@@ -162,6 +164,10 @@ func (p *pipePool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, e
 	}
 	p.ops = append(p.ops, "query:"+sql)
 	switch sql {
+	case insertAddSQL:
+		return &oneRowRows{vals: []any{p.inserted}}, nil
+	case reviveAddSQL:
+		return &oneRowRows{vals: []any{p.revived}}, nil
 	case countAddSQL:
 		return &oneRowRows{vals: []any{p.uniques}}, nil
 	case applyDeleteSQL:
@@ -250,11 +256,11 @@ func TestPipelineAdd(t *testing.T) {
 
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		{tag: pgconn.NewCommandTag("INSERT 1")}, // новый: foo (example существует в deleted)
-		{tag: pgconn.NewCommandTag("UPDATE 1")}, // возвращён из deleted: example
 		{tag: pgconn.NewCommandTag("DELETE 3")}, // очистка после применения
 	}
-	pt.pool.uniques = 2 // уникальных меток партии: example, foo (дубль строки — одна метка)
+	pt.pool.inserted = 1 // новый: foo (example существует в deleted)
+	pt.pool.revived = 1  // возвращён из deleted: example
+	pt.pool.uniques = 2  // уникальных меток партии: example, foo (дубль строки — одна метка)
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err != nil {
@@ -298,8 +304,8 @@ func TestPipelineAdd(t *testing.T) {
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:3",
-		"exec:" + insertAddSQL,
-		"exec:" + reviveAddSQL,
+		"query:" + insertAddSQL,
+		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
 	}
@@ -328,10 +334,11 @@ func TestPipelineZonelessAdd(t *testing.T) {
 
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		{tag: pgconn.NewCommandTag("INSERT 3")}, // новые: все три домена
-		{tag: pgconn.NewCommandTag("UPDATE 0")}, // возврата из deleted нет
+		// вставка/возврат — ответы Query (inserted=3, revived=0)
 		{tag: pgconn.NewCommandTag("DELETE 3")}, // очистка после применения
 	}
+	pt.pool.inserted = 3
+	pt.pool.revived = 0
 	pt.pool.uniques = 3
 
 	out, err := pt.pipe.Process(context.Background(), abs)
@@ -404,10 +411,11 @@ func TestPipelineZonelessNumericZone(t *testing.T) {
 
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		{tag: pgconn.NewCommandTag("INSERT 1")}, // только 0-0.su
-		{tag: pgconn.NewCommandTag("UPDATE 0")}, // возвращать некого
+		// вставка/возврат — ответы Query (inserted=1, revived=0)
 		{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
 	}
+	pt.pool.inserted = 1
+	pt.pool.revived = 0
 	pt.pool.uniques = 1
 
 	// Половина строк отклонена — дефолтного порога 10% хватило бы
@@ -572,10 +580,11 @@ func TestPipelineExtractLines(t *testing.T) {
 	}
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		{tag: pgconn.NewCommandTag("INSERT 3")}, // xxx, shop, plain
-		{tag: pgconn.NewCommandTag("UPDATE 0")}, // возвращать некого
+		// вставка/возврат — ответы Query (inserted=3, revived=0)
 		{tag: pgconn.NewCommandTag("DELETE 4")}, // очистка после применения
 	}
+	pt.pool.inserted = 3
+	pt.pool.revived = 0
 	pt.pool.uniques = 3
 
 	out, err := pipe.Process(context.Background(), abs)
@@ -602,8 +611,8 @@ func TestPipelineExtractLines(t *testing.T) {
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:3",
-		"exec:" + insertAddSQL,
-		"exec:" + reviveAddSQL,
+		"query:" + insertAddSQL,
+		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
 	}
@@ -712,10 +721,11 @@ func TestPipelineDuplicateOtherZoneWarn(t *testing.T) {
 
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		{tag: pgconn.NewCommandTag("INSERT 1")}, // example
-		{tag: pgconn.NewCommandTag("UPDATE 0")}, // возвращать некого
+		// вставка/возврат — ответы Query (inserted=1, revived=0)
 		{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
 	}
+	pt.pool.inserted = 1
+	pt.pool.revived = 0
 	pt.pool.uniques = 1
 
 	var buf bytes.Buffer
@@ -1101,7 +1111,7 @@ func TestPipelineApplyError(t *testing.T) {
 		t.Error("отчёт не пишется при сбое применения")
 	}
 	// вставка без очистки ApplyAdd (сбой) → отбрасывание конвейером
-	if !strings.Contains(strings.Join(pt.pool.ops, "\n"), "exec:"+insertAddSQL) {
+	if !strings.Contains(strings.Join(pt.pool.ops, "\n"), "query:"+insertAddSQL) {
 		t.Errorf("обращения = %v, want попытка вставки", pt.pool.ops)
 	}
 	if pt.pool.ops[len(pt.pool.ops)-1] != "exec:"+clearStageSQL {
@@ -1117,10 +1127,11 @@ func TestPipelineRecordError(t *testing.T) {
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")},
-		{tag: pgconn.NewCommandTag("INSERT 1")},
-		{tag: pgconn.NewCommandTag("UPDATE 0")},
+		// вставка/возврат — ответы Query (inserted=1, revived=0)
 		{tag: pgconn.NewCommandTag("DELETE 1")},
 	}
+	pt.pool.inserted = 1
+	pt.pool.revived = 0
 	pt.pool.uniques = 1
 	pt.files.recErr = errors.New("журнал недоступен")
 
@@ -1207,10 +1218,11 @@ func TestPipelineMoveCollision(t *testing.T) {
 	}
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")},
-		{tag: pgconn.NewCommandTag("INSERT 1")},
-		{tag: pgconn.NewCommandTag("UPDATE 0")},
+		// вставка/возврат — ответы Query (inserted=1, revived=0)
 		{tag: pgconn.NewCommandTag("DELETE 1")},
 	}
+	pt.pool.inserted = 1
+	pt.pool.revived = 0
 	pt.pool.uniques = 1
 
 	out, err := pt.pipe.Process(context.Background(), abs)
@@ -1252,8 +1264,8 @@ func TestPipelineEmptyFile(t *testing.T) {
 	// COPY с пустой пачкой не выполняется (db.CopyFrom: пустая пачка — no-op).
 	if strings.Join(pt.pool.ops, "\n") != strings.Join([]string{
 		"exec:" + clearStageSQL,
-		"exec:" + insertAddSQL,
-		"exec:" + reviveAddSQL,
+		"query:" + insertAddSQL,
+		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
 	}, "\n") {

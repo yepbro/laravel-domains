@@ -202,12 +202,13 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_psi_cpu_some_percent` | gauge | `kind` | monitor (T-162) | проход алертов: some-доля времени задержки CPU из `/proc/pressure/cpu` хоста (kind=avg10/avg60/avg300); устойчивый avg300 >90 % — голод планировщика (алерт `psi_cpu`, T-162), ядро без PSI — ряда нет |
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`) |
-| `crawler_render_pending_domains` | gauge | — | monitor (T-175) | цикл рендер-долга (`monitor.render_debt_interval`, 5 мин): домены с битом `render_pending` — счётчик `crawler_counters['render_pending']` (миграция 000015) ведут переходы бита в транзакции перехода (наблюдаемость без seq scan по 41,8 млн строк; лаг `q:render` — `crawler_queue_depth{queue="q:render"}`, долг = сумма — алерт `render_debt` и строка отчёта нагрузки T-173) |
+| `crawler_render_pending_domains` | gauge | — | monitor (T-175) | цикл рендер-долга (`monitor.render_debt_interval`, 5 мин): домены с битом `render_pending` — счётчик `crawler_counters['render_pending']` (миграция 000015) ведут переходы бита в транзакции перехода; авторитетное значение периодически перезаписывает реконсиляция T-178 (наблюдаемость без seq scan по 41,8 млн строк; лаг `q:render` — `crawler_queue_depth{queue="q:render"}`, долг = сумма — алерт `render_debt` и строка отчёта нагрузки T-173) |
 | `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод записи в q:dead (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
 | `crawler_redis_memory_ratio` | gauge | — | monitor (T-154) | проход алертов: `used_memory/maxmemory` из `INFO memory` (обёртка источника `monitor.NewRedisMemoryMetrics`); при noeviction — прокси-метрика предстоящих OOM-отказов записи (алерт `redis_memory` при ≥ 0.8); `maxmemory` не задан — ряд не пишется |
-| `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) с периодом `scheduler.backlog_interval` (по умолчанию 5 мин, T-161; был 30 с) — `scheduler.BacklogLoop` |
-| `crawler_backlog_pass_seconds` / `crawler_backlog_skipped_ticks_total` | histogram / counter | — | scheduler (T-161) | каждый проход агрегата backlog: длительность (корзины 0.5с…~8.5 мин — замер §12: 17+ с на 47 млн строк) и пропущенные тики single-flight (проход дольше интервала — накопившийся тик не запускает новый проход, Warn в журнале); рост пропусков — таблица растёт быстрее интервала, поднимать `scheduler.backlog_interval` |
-| `crawler_zonestats_pass_seconds` / `crawler_zonestats_skipped_ticks_total` | histogram / counter | — | monitor (T-161) | каждый проход пересчёта зон T-078: длительность и пропущенные тики single-flight (та же механика, что у backlog) |
+| `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | суммы инкрементальных счётчиков зон (T-178: `sum(zones.domains_pending/queued)`, базовое множество `status <> deleted`) с периодом `scheduler.backlog_interval` (по умолчанию 5 мин) — `scheduler.BacklogLoop`: чтение справочника вместо прохода по 47 млн строк (ТЗИ §8.4) |
+| `crawler_backlog_pass_seconds` / `crawler_backlog_skipped_ticks_total` | histogram / counter | — | scheduler (T-161) | каждый проход backlog: длительность (проход — суммы справочника, T-178) и пропущенные тики single-flight (проход дольше интервала — накопившийся тик не запускает новый проход, Warn в журнале); рост пропусков — поднимать `scheduler.backlog_interval` |
+| `crawler_counters_recount_seconds` / `crawler_zonestats_skipped_ticks_total` | histogram / counter | — | monitor (T-161/T-178) | каждый проход совмещённой реконсиляции счётчиков (агрегаты domains/laravel_domains/laravel_history → zones + crawler_counters): длительность (корзины 0.5с…~8.5 мин — замер §12: десятки секунд на 47 млн строк) и пропущенные тики single-flight; `crawler_counters_recount_seconds` — переименование `crawler_zonestats_pass_seconds` (T-178) |
+| `crawler_counters_drift` | gauge | `counter` | monitor (T-178) | дрейф инкрементальных счётчиков на проходе реконсиляции: \|старое − новое\| по позициям `zone:<id>:<колонка>` / `global:<имя>` (статусные строки вне дрейфа — пишутся одной реконсиляцией); стационар стремится к нулю (проход — три оператора под READ COMMITTED, единичный транзиентный дрейф под нагрузкой нормален), устойчивый ненулевой — пропущенный переход или ручной SQL мимо кода (Warn в журнале, разбор — `docs/runbooks.md`) |
 | `crawler_pg_slow_queries` | gauge | — | monitor (T-177) | проход цикла медленных запросов: клиентские операторы PostgreSQL, выполняемые дольше `monitor.slow_query_min_duration` на момент снимка `pg_stat_activity` (собственные агрегаты monitor исключены `application_name`); hold-last при сбое источника |
 | `crawler_pg_slow_queries_total` | counter | `app` | monitor (T-177) | обнаруженные медленные запросы по `application_name` сервиса (новые операторы дольше порога, дебаунс pid+query_start); дублируют Telegram-сообщение метками Prometheus |
 | `crawler_dashboard_snapshots_total` | counter | `result` | dashboard (`ok`/`error`, ТЗД §10) | каждый проход цикла сборки снимков: `error` — проход с деградированными секциями (снимок публикуется, причины — Warn в логе и карта `errors` /api/status) |
@@ -282,13 +283,17 @@ pending с чередованием зон (`DispatchBatch`, T-027) → пере
 T-109) и повторных проверок `temp_error`
 (`RetryTempErrors`, T-031). Рядом с ними — коллектор глубины backlog
 `BacklogLoop` (T-077): gauge `crawler_backlog_domains{pending|queued}`
-из БД с периодом `scheduler.backlog_interval` (по умолчанию 5 мин —
-T-161, замер §12: на 47 млн строк проход 17+ с каждые 30 с входил в
-большую часть CPU postgres; коридор 30с..1ч). Проходы single-flight
-(T-161): выполняются в горутине цикла — новый не начинается, пока не
-завершился предыдущий, а проход дольше интервала сбрасывает
-накопившийся тик ticker'а (иначе агрегат молол бы БД непрерывно), Warn и
-`crawler_backlog_skipped_ticks_total` поднимают шум.
+суммами инкрементальных счётчиков зон (T-178: справочник вместо
+прохода по 47 млн строк, ТЗИ §8.4) с периодом
+`scheduler.backlog_interval` (по умолчанию 5 мин; коридор 30с..1ч).
+Проходы single-flight (T-161): выполняются в горутине цикла — новый не
+начинается, пока не завершился предыдущий, а проход дольше интервала
+сбрасывает накопившийся тик ticker'а, Warn и
+`crawler_backlog_skipped_ticks_total` поднимают шум. Переводы
+состояний (enqueue/lease/recheck/retry) ведут дельты счётчиков зон
+`domains_pending`/`domains_queued`/`domains_checked` CTE того же
+оператора (T-178): переход и дельта атомарны, точность восстанавливает
+реконсиляция monitor.
 
 `dns-worker` (этап 3, T-036…T-039): его `OnRun` выполняет
 цикл `dnsworker.Run` (`internal/dnsworker/result.go`):
@@ -324,12 +329,15 @@ T-161, замер §12: на 47 млн строк проход 17+ с кажды
   сузилось с «сбой записи у любого домена пачки × попытки доставки»
   (до `redis.max_attempts × |пачка|` задач) до краха воркера между XADD
   и одним UPDATE пометки (или отказа БД в нём — пометка non-fatal);
-- запись — одним UPDATE на домен: `dns_mask`, статус (терминальные
-  ветки), `check_state = done`, `queued_at = NULL`, `last_checked_at`,
-  сброс `temp_attempts` на не-`temp_error` итоге (контракт T-031);
-  тем же оператором снимается бит `http_published` (T-108);
-  охраны `status <> deleted` (§13.1) и `check_state <> done`
-  (идемпотентность);
+- запись — одним оператором на домен (CTE, T-178): `dns_mask`, статус
+  (терминальные ветки), `check_state = done`, `queued_at = NULL`,
+  `last_checked_at`, сброс `temp_attempts` на не-`temp_error` итоге
+  (контракт T-031); тем же оператором снимается бит `http_published`
+  (T-108); охраны `status <> deleted` (§13.1) и `check_state <> done`
+  (идемпотентность); CTE ведёт дельты счётчиков зоны по старому
+  состоянию строки (главный переход конвейера queued/pending → done:
+  предчтение `FOR UPDATE` → `queued −1`/`pending −1` + `checked +1`,
+  ревью P1-1) — внешний `SELECT count(*)` отдаёт число переведённых;
 - домен с пустым/пробельным именем в пачке — ядовитая строка
   (`ErrEmptyDomain`, мусорная/порченая строка `domains`): терминальный
   диагноз `invalid` (T-109) отдельным UPDATE (`check_state = done`,
@@ -585,36 +593,60 @@ T-092 §4: ≈5.1 с/страница; дефолт 8 контекстов, T-16
 - analyzer ничего не публикует (конец конвейера §7) — гейт backpressure
   не нужен, очередь читается и подтверждается напрямую.
 
-`monitor` (этап 8, T-078): его `OnRun` выполняет цикл
-`monitor.ZoneStatsLoop` (`internal/monitor/zonestats.go`):
+`monitor` (этап 8, T-078/T-178): его `OnRun` выполняет цикл
+`monitor.ZoneStatsLoop` (`internal/monitor/zonestats.go`) —
+периодическую реконсиляцию инкрементальных счётчиков конвейера:
 
-- периодический пакетный пересчёт кэширующих счётчиков прогресса зон
-  `zones.domains_total` / `zones.domains_checked` (ТЗ 5.9, период —
-  `monitor.zone_stats_interval`, по умолчанию 5 минут — T-161, замер §12:
-  исходные 60 с верхней границы коридора ТЗ 5.9 «30–60 с» рассчитаны на
-  малый корпус, а UPDATE-агрегат по 47 млн строк входил в большую часть
-  CPU postgres): одним
-  оператором `UPDATE … FROM (агрегат domains GROUP BY zone_id …)` по всем
-  зонам сразу, без row-per-zone и без счётчика на каждую строку domains;
-  GROUP BY по ключу партиционирования позволяет агрегировать по партициям,
-  LEFT JOIN от зон обнуляет счётчики зон без живых доменов;
+- один совмещённый проход раз в `monitor.zone_stats_interval` (по
+  умолчанию 5 минут) — единственный полный проход `domains` в
+  стационаре (T-178, замер §12: живые агрегаты зон/статусов/backlog и
+  часовой проход истории входили в большую часть CPU postgres): в одной
+  транзакции перезаписываются колонки зон `domains_total` /
+  `domains_pending` / `domains_queued` / `domains_checked` /
+  `domains_laravel` (агрегат `domains` FILTER по `check_state` GROUP BY
+  `zone_id` — partitionwise, плюс агрегат `laravel_domains`) и строки
+  глобальных скаляров `crawler_counters` (`status_<имя>` по легенде
+  статусов, кумулятивы `laravel_appeared_total`/`laravel_lost_total`,
+  `render_pending`); upsert строк создаёт их первым проходом;
+- между проходами счётчики ведут дельты переходов в транзакциях самих
+  переходов (T-178: DNS-этап — главный переход queued/pending → done,
+  CTE с `FOR UPDATE` в записи результата; scheduler enqueue/lease/
+  recheck/retry — CTE того же оператора; ingest add/delete; CLI recheck
+  и submodules recheck; запись результата http-worker поверх done —
+  без дельт (предчтение `FOR UPDATE`); analyzer — `domains_laravel` ±1
+  и инкремент кумулятивов): откат транзакции откатывает пару;
+- дрейф |старое − новое| каждой позиции — gauge
+  `crawler_counters_drift{counter}` (стационар стремится к нулю:
+  проход — три оператора под READ COMMITTED, единичный транзиентный
+  дрейф под живой нагрузкой нормален; статусные строки вне дрейфа —
+  пишутся одной реконсиляцией) и Warn при ненулевом дрейфе (первый
+  успешный проход цикла дрейгом не считается — заполняет нули после
+  миграции/простоя); устойчивый дрейф — пропущенный переход или ручной
+  SQL мимо кода, разбор — `docs/runbooks.md`, ручное восстановление —
+  `crawlerctl counters recount|verify` (T-178);
 - проходы single-flight (T-161): в горутине цикла новый проход не
   начинается, пока не завершился предыдущий, а проход дольше интервала
   (рост таблицы) сбрасывает накопившийся тик ticker'а — Warn,
-  `crawler_zonestats_pass_seconds` и
+  `crawler_counters_recount_seconds` (переименование
+  `crawler_zonestats_pass_seconds`, T-178) и
   `crawler_zonestats_skipped_ticks_total` поднимают шум;
-- семантика (ТЗ 11.4 п. 6 «всего / проверено»): `domains_total` — живые
-  домены зоны (`status <> deleted`, ТЗ 13.1), `domains_checked` —
-  проверенные в текущем цикле (`check_state = done`, ТЗ 6.1): возрастная
-  перепроверка (ТЗ 5.3) переводит done → pending, и счётчики отслеживают
-  прогресс нового цикла; оба считаются по одному базовому множеству,
-  поэтому `checked ≤ total`;
-- первый проход — сразу при старте (свежие счётчики после простоя),
-  ошибка прохода — Warn, цикл живёт; отмена ctx — чистый nil (graceful
-  shutdown, ТЗ 3.4). Счётчики читают `crawlerctl status` (T-079) и выбор
-  размера партиций (`docs/schema.md`). Прогресс зон наблюдается алертами
-  monitor (T-080, цикл ниже); счётчики очередей/backlog/этапов конвейера
-  собирают сами сервисы (таблица выше, T-077).
+- семантика (ТЗ 11.4 п. 6 «всего / проверено»; базовое множество ВСЕХ
+  колонок зон — `status <> deleted`, унификация T-178, ТЗИ §4.1):
+  `domains_total` — живые домены зоны, `domains_pending` /
+  `domains_queued` — ожидают выборки / в работе с lease, —
+  `domains_checked` — проверенные в текущем цикле (`check_state =
+  done`, ТЗ 6.1): возрастная перепроверка (ТЗ 5.3) переводит done →
+  pending, и счётчики отслеживают прогресс нового цикла; все считаются
+  по одному базовому множеству, поэтому `pending + queued + checked =
+  total`;
+- первый проход — сразу при старте (свежие счётчики после простоя и
+  заполнение нулей после миграции), ошибка прохода — Warn, цикл живёт;
+  отмена ctx — чистый nil (graceful shutdown, ТЗ 3.4). Счётчики читают
+  `crawlerctl status` (T-079), дашборд (без JOIN domains, T-178),
+  backlog-цикл scheduler (суммы справочника) и выбор размера партиций
+  (`docs/schema.md`). Прогресс зон наблюдается алертами monitor (T-080,
+  цикл ниже); счётчики очередей/backlog/этапов конвейера собирают сами
+  сервисы (таблица выше, T-077).
 
 Третий цикл того же сервиса — счётчик серой зоны Laravel-детекции
 (`internal/monitor/nearstats.go`, T-115): gauge

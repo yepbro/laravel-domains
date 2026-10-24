@@ -41,18 +41,20 @@ import (
 type anEventKind string
 
 const (
-	anEvGet       anEventKind = "get"        // чтение контента
-	anEvBegin     anEventKind = "begin"      // открытие транзакции
-	anEvMark      anEventKind = "mark"       // UPDATE-штамп rules_version
-	anEvUpsert    anEventKind = "upsert"     // INSERT ... ON CONFLICT laravel_findings
-	anEvDelete    anEventKind = "delete"     // DELETE laravel_findings
-	anEvLock      anEventKind = "lock"       // advisory-блокировка домена (T-072)
-	anEvAggSelect anEventKind = "agg_select" // SELECT findings домена для агрегации
-	anEvAggExists anEventKind = "agg_exists" // SELECT EXISTS laravel_domains (T-118)
-	anEvAggUpsert anEventKind = "agg_upsert" // upsert laravel_domains
-	anEvAggDelete anEventKind = "agg_delete" // DELETE laravel_domains
-	anEvAggClose  anEventKind = "agg_close"  // Close строк агрегации (T-M10)
-	anEvHistory   anEventKind = "agg_hist"   // INSERT laravel_history appeared/lost (T-118)
+	anEvGet       anEventKind = "get"         // чтение контента
+	anEvBegin     anEventKind = "begin"       // открытие транзакции
+	anEvMark      anEventKind = "mark"        // UPDATE-штамп rules_version
+	anEvUpsert    anEventKind = "upsert"      // INSERT ... ON CONFLICT laravel_findings
+	anEvDelete    anEventKind = "delete"      // DELETE laravel_findings
+	anEvLock      anEventKind = "lock"        // advisory-блокировка домена (T-072)
+	anEvAggSelect anEventKind = "agg_select"  // SELECT findings домена для агрегации
+	anEvAggExists anEventKind = "agg_exists"  // SELECT EXISTS laravel_domains (T-118)
+	anEvAggUpsert anEventKind = "agg_upsert"  // upsert laravel_domains
+	anEvAggDelete anEventKind = "agg_delete"  // DELETE laravel_domains
+	anEvAggClose  anEventKind = "agg_close"   // Close строк агрегации (T-M10)
+	anEvHistory   anEventKind = "agg_hist"    // INSERT laravel_history appeared/lost (T-118)
+	anEvZoneLarav anEventKind = "agg_zone"    // дельта zones.domains_laravel (T-178)
+	anEvCounter   anEventKind = "agg_counter" // дельта кумулятива crawler_counters (T-178)
 	anEvCommit    anEventKind = "commit"
 	anEvAck       anEventKind = "ack"
 )
@@ -140,11 +142,14 @@ type anFinding struct {
 type anFakePool struct {
 	j *anJournal
 
-	results  map[anRowKey]*anResultRow
-	statuses map[anRowKey]int16 // status домена по ключу строки
-	findings map[anRowKey]*anFinding
-	domains  map[anDomainKey]*anDomain
-	history  []anHistoryRec // laravel_history (T-118): append-only журнал переходов
+	results     map[anRowKey]*anResultRow
+	statuses    map[anRowKey]int16 // status домена по ключу строки
+	findings    map[anRowKey]*anFinding
+	domains     map[anDomainKey]*anDomain
+	history     []anHistoryRec   // laravel_history (T-118): append-only журнал переходов
+	zoneLaravel map[int16]int64  // счётчики зон domains_laravel (T-178)
+	counters    map[string]int64 // строки crawler_counters (T-178)
+	zoneNoRow   bool             // строка зоны отсутствует (ручная правка справочника)
 
 	queryErr     error
 	beginErr     error
@@ -187,11 +192,13 @@ type anHistoryRec struct {
 
 func newANFakePool() *anFakePool {
 	return &anFakePool{
-		j:        &anJournal{},
-		results:  make(map[anRowKey]*anResultRow),
-		statuses: make(map[anRowKey]int16),
-		findings: make(map[anRowKey]*anFinding),
-		domains:  make(map[anDomainKey]*anDomain),
+		j:           &anJournal{},
+		results:     make(map[anRowKey]*anResultRow),
+		statuses:    make(map[anRowKey]int16),
+		findings:    make(map[anRowKey]*anFinding),
+		domains:     make(map[anDomainKey]*anDomain),
+		zoneLaravel: make(map[int16]int64),
+		counters:    make(map[string]int64),
 	}
 }
 
@@ -320,20 +327,31 @@ func (p *anFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 		snapDomains[k] = &c
 	}
 	snapHistory := append([]anHistoryRec(nil), p.history...)
+	snapZoneLaravel := make(map[int16]int64, len(p.zoneLaravel))
+	for k, v := range p.zoneLaravel {
+		snapZoneLaravel[k] = v
+	}
+	snapCounters := make(map[string]int64, len(p.counters))
+	for k, v := range p.counters {
+		snapCounters[k] = v
+	}
 	p.j.record(anEvBegin)
 	return &anFakeTx{pool: p, snapResults: snapResults, snapFindings: snapFindings,
-		snapDomains: snapDomains, snapHistory: snapHistory}, nil
+		snapDomains: snapDomains, snapHistory: snapHistory,
+		snapZoneLaravel: snapZoneLaravel, snapCounters: snapCounters}, nil
 }
 
 type anFakeTx struct {
 	pgx.Tx // остальные методы pgx.Tx этап не использует
 
-	pool         *anFakePool
-	snapResults  map[anRowKey]*anResultRow
-	snapFindings map[anRowKey]*anFinding
-	snapDomains  map[anDomainKey]*anDomain
-	snapHistory  []anHistoryRec
-	commit       bool
+	pool            *anFakePool
+	snapResults     map[anRowKey]*anResultRow
+	snapFindings    map[anRowKey]*anFinding
+	snapDomains     map[anDomainKey]*anDomain
+	snapHistory     []anHistoryRec
+	snapZoneLaravel map[int16]int64
+	snapCounters    map[string]int64
+	commit          bool
 }
 
 func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -453,6 +471,22 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		t.pool.j.record(anEvHistory)
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 
+	case aggregateZoneLaravelSQL:
+		// Дельта счётчика зоны (T-178): delta, zone.
+		if t.pool.zoneNoRow {
+			return pgconn.NewCommandTag("UPDATE 0"), nil
+		}
+		t.pool.zoneLaravel[args[1].(int16)] += args[0].(int64)
+		t.pool.j.record(anEvZoneLarav)
+		return pgconn.NewCommandTag("UPDATE 1"), nil
+
+	case aggregateCounterDeltaSQL:
+		// Инкремент кумулятива истории (T-178): upsert — строки может
+		// не быть (первая реконсиляция ещё не прошла).
+		t.pool.counters[args[0].(string)] += args[1].(int64)
+		t.pool.j.record(anEvCounter)
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
+
 	default:
 		return pgconn.CommandTag{}, fmt.Errorf("anFakePool: неожидаемый SQL: %s", sql)
 	}
@@ -518,6 +552,7 @@ func (t *anFakeTx) Rollback(context.Context) error {
 	}
 	t.pool.results, t.pool.findings, t.pool.domains = t.snapResults, t.snapFindings, t.snapDomains
 	t.pool.history = t.snapHistory
+	t.pool.zoneLaravel, t.pool.counters = t.snapZoneLaravel, t.snapCounters
 	return nil
 }
 

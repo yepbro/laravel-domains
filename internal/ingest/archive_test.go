@@ -146,13 +146,13 @@ func buildGz(t *testing.T, path, content string) {
 	}
 }
 
-// addExecs — заготовки Exec удачного применения add: очистка Stage,
-// вставка n новых, возврат r удалённых, очистка после применения.
-func addExecs(n, r int) []pipeExec {
+// addExecs — заготовка удачного применения add: ответы CTE вставки/
+// возврата (Query, T-178) уходят в поля пула, Exec остаются две
+// очистки Stage — перед загрузкой и после применения.
+func addExecs(pool *pipePool, n, r int) []pipeExec {
+	pool.inserted, pool.revived = int64(n), int64(r)
 	return []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")},                      // очистка перед загрузкой (Stage)
-		{tag: pgconn.NewCommandTag(fmt.Sprintf("INSERT %d", n))},     // новые домены
-		{tag: pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", r))},     // возвращённые из deleted
 		{tag: pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n+r+1))}, // очистка после применения
 	}
 }
@@ -271,7 +271,7 @@ func TestPipelineArchiveZip(t *testing.T) {
 	}
 	sha := sha256.Sum256(raw)
 
-	pt.pool.execs = addExecs(4, 0) // метки a, b, c, d (дубль a.com — одна)
+	pt.pool.execs = addExecs(pt.pool, 4, 0) // метки a, b, c, d (дубль a.com — одна)
 	pt.pool.uniques = 4
 
 	var logBuf bytes.Buffer
@@ -317,8 +317,8 @@ func TestPipelineArchiveZip(t *testing.T) {
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:5", // строки всех членов — одна партия
-		"exec:" + insertAddSQL,
-		"exec:" + reviveAddSQL,
+		"query:" + insertAddSQL,
+		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
 	}
@@ -369,7 +369,7 @@ func TestPipelineArchiveTarGzTgz(t *testing.T) {
 			abs := filepath.Join(pt.dir, filepath.FromSlash(tc.file))
 			buildTar(t, abs, tc.gz, entries...)
 
-			pt.pool.execs = addExecs(2, 0)
+			pt.pool.execs = addExecs(pt.pool, 2, 0)
 			pt.pool.uniques = 2
 
 			out, err := pt.pipe.Process(context.Background(), abs)
@@ -412,7 +412,7 @@ func TestPipelineArchiveGz(t *testing.T) {
 	}
 	sha := sha256.Sum256(raw)
 
-	pt.pool.execs = addExecs(12, 0)
+	pt.pool.execs = addExecs(pt.pool, 12, 0)
 	pt.pool.uniques = 12
 
 	var rejBuf strings.Builder
@@ -803,7 +803,7 @@ func TestPipelineArchiveDuplicate(t *testing.T) {
 	}
 	sha := sha256.Sum256(raw)
 
-	pt.pool.execs = addExecs(2, 0)
+	pt.pool.execs = addExecs(pt.pool, 2, 0)
 	pt.pool.uniques = 2
 
 	out, err := pt.pipe.Process(context.Background(), abs)
@@ -872,7 +872,7 @@ func TestPipelineArchiveEmpty(t *testing.T) {
 			abs := filepath.Join(pt.dir, filepath.FromSlash(tc.rel))
 			tc.build(t, abs)
 
-			pt.pool.execs = addExecs(0, 0)
+			pt.pool.execs = addExecs(pt.pool, 0, 0)
 
 			out, err := pt.pipe.Process(context.Background(), abs)
 			if err != nil {
@@ -891,8 +891,8 @@ func TestPipelineArchiveEmpty(t *testing.T) {
 			// COPY с пустой пачкой не выполняется (db.CopyFrom: пустая пачка — no-op).
 			want := []string{
 				"exec:" + clearStageSQL,
-				"exec:" + insertAddSQL,
-				"exec:" + reviveAddSQL,
+				"query:" + insertAddSQL,
+				"query:" + reviveAddSQL,
 				"query:" + countAddSQL,
 				"exec:" + clearStageSQL,
 			}
@@ -923,7 +923,7 @@ func TestPipelineArchivePaddedTarSHA(t *testing.T) {
 	}
 	sha := sha256.Sum256(raw)
 
-	pt.pool.execs = addExecs(2, 0)
+	pt.pool.execs = addExecs(pt.pool, 2, 0)
 	pt.pool.uniques = 2
 
 	out, err := pt.pipe.Process(context.Background(), abs)

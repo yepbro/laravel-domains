@@ -54,7 +54,7 @@ type snapPool struct {
 	mu      sync.Mutex
 	zones   []snapZone
 	thr     status.Throughput
-	stats   map[int16]int64
+	stats   map[string]int64
 	laravel status.LaravelStats
 	ingest  []status.IngestReport
 
@@ -88,19 +88,22 @@ func (p *snapPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, e
 		}
 	}
 	switch {
-	case strings.Contains(sql, "FROM zones AS z LEFT JOIN"):
+	case strings.Contains(sql, "FROM zones AS z"):
+		// Сводка зон — счётчики справочника (T-178); Done — та же
+		// колонка domains_checked (унификация базового множества).
 		rows := make([][]any, len(p.zones))
 		for i, z := range p.zones {
-			rows[i] = []any{z.id, z.name, "", z.active, z.total, z.checked, z.pending, z.queued, z.done}
+			rows[i] = []any{z.id, z.name, "", z.active, z.total, z.pending, z.queued, z.checked}
 		}
 		return snapRowsOf(rows...), nil
 	case strings.Contains(sql, "AS done_today"):
 		return snapRowsOf([]any{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour}), nil
-	case strings.Contains(sql, "GROUP BY status"):
+	case strings.Contains(sql, "FROM crawler_counters"):
+		// Распределение статусов — строки status_* счётчиков (T-178).
 		rows := make([][]any, 0, len(p.stats))
-		for code := int16(0); code <= 9; code++ {
-			if n, ok := p.stats[code]; ok {
-				rows = append(rows, []any{code, n})
+		for _, st := range model.Statuses {
+			if n, ok := p.stats[st.String()]; ok {
+				rows = append(rows, []any{"status_" + st.String(), n})
 			}
 		}
 		return snapRowsOf(rows...), nil
@@ -285,7 +288,7 @@ func healthyPool() *snapPool {
 	return &snapPool{
 		zones: []snapZone{{id: 1, name: "crawl.test", active: true, total: 100, checked: 40, pending: 58, queued: 2, done: 40}},
 		thr:   status.Throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600},
-		stats: map[int16]int64{int16(model.StatusNew): 58, int16(model.StatusAlive): 40, int16(model.StatusDeleted): 2},
+		stats: map[string]int64{model.StatusNew.String(): 58, model.StatusAlive.String(): 40, model.StatusDeleted.String(): 2},
 		laravel: status.LaravelStats{
 			Total: 2, Last24h: 1,
 			Recent: []status.LaravelRecent{{
@@ -530,13 +533,13 @@ func TestCollectOnceStatusCache(t *testing.T) {
 
 	// Тяжёлые секции — одна выборка на окно TTL, лёгкие — каждый проход.
 	calls := pool.calls()
-	if n := countSQLCalls(calls, "FROM zones AS z LEFT JOIN"); n != 1 {
+	if n := countSQLCalls(calls, "FROM zones AS z"); n != 1 {
 		t.Errorf("выборок зон = %d, want 1 (кэш в окне TTL)", n)
 	}
 	if n := countSQLCalls(calls, "AS done_today"); n != 1 {
 		t.Errorf("выборок темпа = %d, want 1 (кэш в окне TTL)", n)
 	}
-	if n := countSQLCalls(calls, "GROUP BY status"); n != 1 {
+	if n := countSQLCalls(calls, "FROM crawler_counters"); n != 1 {
 		t.Errorf("выборок статусов = %d, want 1 (кэш в окне TTL)", n)
 	}
 	if n := countSQLCalls(calls, "ORDER BY ld.updated_at"); n != 2 {
@@ -552,7 +555,7 @@ func TestCollectOnceStatusCache(t *testing.T) {
 		t.Fatalf("проход после TTL: totals=%v errors=%v", snap3.Totals, snap3.Errors)
 	}
 	calls = pool.calls()
-	if n := countSQLCalls(calls, "FROM zones AS z LEFT JOIN"); n != 2 {
+	if n := countSQLCalls(calls, "FROM zones AS z"); n != 2 {
 		t.Errorf("выборок зон после TTL = %d, want 2 (перечёт)", n)
 	}
 	if n := countSQLCalls(calls, "AS done_today"); n != 2 {

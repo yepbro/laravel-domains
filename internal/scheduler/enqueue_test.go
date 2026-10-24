@@ -143,7 +143,7 @@ func (p *enqueueFakePool) Query(ctx context.Context, sql string, args ...any) (p
 
 	kind := enqueueKindDispatch
 	switch {
-	case strings.HasPrefix(sql, "UPDATE"):
+	case strings.HasPrefix(sql, "WITH upd AS (UPDATE"):
 		kind = enqueueKindUpdate
 	case strings.HasPrefix(sql, "SELECT id, name FROM zones"):
 		kind = enqueueKindZones
@@ -615,19 +615,30 @@ func TestEnqueueBatch_ContextCanceled(t *testing.T) {
 
 // ------------------------------------------------------------ контракт SQL
 
-const wantEnqueueUpdateSQL = `UPDATE "domains" AS t ` +
+// wantEnqueueUpdateSQL — перевод пачки + дельты счётчиков зон одним
+// оператором (T-178): CTE upd — перевод (бывший один оператор T-028),
+// CTE zc — pending −n / queued +n по зонам переведённых строк, внешний
+// SELECT — ключи переведённых для публикации.
+const wantEnqueueUpdateSQL = `WITH upd AS (UPDATE "domains" AS t ` +
 	`SET check_state = 1, queued_at = now(), flags = (t.flags & -5)::int2 ` +
 	`FROM unnest($1::int2[], $2::int8[]) AS u("zone_id", "id") ` +
-	`WHERE t."zone_id" = u."zone_id" AND t."id" = u."id" AND t.check_state = 0 ` +
-	`RETURNING t.zone_id, t.id`
+	`WHERE t."zone_id" = u."zone_id" AND t."id" = u."id" AND t.check_state = 0 AND t.status <> 6 ` +
+	`RETURNING t.zone_id, t.id), ` +
+	`zc AS (UPDATE zones AS z ` +
+	`SET domains_pending = z.domains_pending - c.n, ` +
+	`domains_queued = z.domains_queued + c.n ` +
+	`FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c ` +
+	`WHERE z.id = c.zone_id) ` +
+	`SELECT u.zone_id, u.id FROM upd AS u`
 
 // TestEnqueue_SQLContract — точный текст перевода: ключи по PK domains,
 // check_state литералом кода queued, queued_at = now() (сервер БД, единый
 // момент lease пачки), снятие бита http_published (T-108: постановка —
 // единая точка входа в новый эпизод, бит прошлого эпизода не должен
 // подавлять публикацию свежего), охрана pending, RETURNING ключей
-// фактически переведённых строк. Литералы связаны с кодами модели и
-// схемой миграции 000001 (queued_at, PK).
+// фактически переведённых строк; дельты счётчиков зон — тем же
+// оператором (T-178). Литералы связаны с кодами модели и схемой
+// миграций 000001/000016 (queued_at, PK, колонки счётчиков).
 func TestEnqueue_SQLContract(t *testing.T) {
 	pool := &enqueueFakePool{}
 	if _, err := EnqueueBatch(context.Background(), pool, &enqueueFakeQueue{}, enqueueBatch3()[:1]); err != nil {
@@ -659,6 +670,14 @@ func TestEnqueue_SQLContract(t *testing.T) {
 	// Ключи пачки — PK таблицы: UPDATE адресует строки парой (zone_id, id).
 	if !strings.Contains(up, "PRIMARY KEY (zone_id, id)") {
 		t.Error("в миграции 000001 нет PK domains (zone_id, id) — ключи перевода обязаны совпадать с ним")
+	}
+	// Колонки счётчиков зон (T-178): дельты zc пишут domains_pending/
+	// domains_queued — обязаны существовать (миграция 000016).
+	mig := dispatchReadMigration(t, "000016_zone_pipeline_counters.up.sql")
+	for _, col := range []string{"domains_pending", "domains_queued"} {
+		if !strings.Contains(mig, col) {
+			t.Errorf("в миграции 000016 нет zones.%s — дельты перевода ссылаются на колонку", col)
+		}
 	}
 }
 

@@ -40,19 +40,33 @@ const (
 	wantSubdomainInsert  = "INSERT INTO subdomains (id, label, enabled) VALUES ($1, $2, true) RETURNING id"
 	wantSubdomainDisable = "UPDATE subdomains SET enabled = false WHERE id = $1 RETURNING id, label, enabled"
 
-	wantSubRecheckAll = "UPDATE domains AS d SET check_state = $1, queued_at = NULL " +
-		"FROM (SELECT zone_id, id FROM domains " +
+	wantSubRecheckAll = "WITH b AS (SELECT zone_id, id FROM domains " +
 		"WHERE check_state = $2 AND status <> $3 " +
-		"ORDER BY zone_id, id LIMIT $4) AS b " +
-		"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-		"AND d.check_state = $2 AND d.status <> $3"
+		"ORDER BY zone_id, id LIMIT $4), " +
+		"upd AS (UPDATE domains AS d SET check_state = $1, queued_at = NULL " +
+		"FROM b WHERE d.zone_id = b.zone_id AND d.id = b.id " +
+		"AND d.check_state = $2 AND d.status <> $3 " +
+		"RETURNING d.zone_id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_checked = z.domains_checked - c.n, " +
+		"domains_pending = z.domains_pending + c.n " +
+		"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM upd"
 
-	wantSubRecheckZone = "UPDATE domains AS d SET check_state = $1, queued_at = NULL " +
-		"FROM (SELECT zone_id, id FROM domains " +
+	wantSubRecheckZone = "WITH b AS (SELECT zone_id, id FROM domains " +
 		"WHERE check_state = $2 AND status <> $3 AND zone_id = $4 " +
-		"ORDER BY zone_id, id LIMIT $5) AS b " +
-		"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-		"AND d.check_state = $2 AND d.status <> $3 AND d.zone_id = $4"
+		"ORDER BY zone_id, id LIMIT $5), " +
+		"upd AS (UPDATE domains AS d SET check_state = $1, queued_at = NULL " +
+		"FROM b WHERE d.zone_id = b.zone_id AND d.id = b.id " +
+		"AND d.check_state = $2 AND d.status <> $3 AND d.zone_id = $4 " +
+		"RETURNING d.zone_id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_checked = z.domains_checked - c.n, " +
+		"domains_pending = z.domains_pending + c.n " +
+		"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM upd"
 
 	// wantSubZoneIDByName — контракт analyzer.ZoneIDByName (переиспользуется
 	// recheck для --zone): текст зафиксирован здесь, чтобы смена чужого
@@ -147,22 +161,7 @@ func (p *subdomainsPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx
 }
 
 func (p *subdomainsPool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.execs = append(p.execs, subCall{sql, append([]any(nil), args...)})
-	if p.execErr != nil && (p.execErrAfter == 0 || len(p.execs) > p.execErrAfter) {
-		return pgconn.CommandTag{}, p.execErr
-	}
-	switch sql {
-	case subdomainRecheckAllSQL:
-		n := p.recheck(args[1].(int16), args[2].(int16), 0, args[3].(int))
-		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", n)), nil
-	case subdomainRecheckZoneSQL:
-		n := p.recheck(args[1].(int16), args[2].(int16), args[3].(int16), args[4].(int))
-		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", n)), nil
-	default:
-		return pgconn.CommandTag{}, fmt.Errorf("subdomainsPool: неожидаемый Exec: %s", sql)
-	}
+	return pgconn.CommandTag{}, fmt.Errorf("subdomainsPool: неожидаемый Exec: %s (recheck — CTE через Query, T-178)", sql)
 }
 
 // recheck — семантика подзапроса и внешнего WHERE: кандидаты — done
@@ -202,6 +201,22 @@ func (p *subdomainsPool) Query(_ context.Context, sql string, args ...any) (pgx.
 		return nil, p.queryErr
 	}
 	switch sql {
+	// Операторы перевода recheck — CTE с внешним SELECT count (T-178):
+	// учитываются в протоколе execs (заготовки ошибок/дренажа).
+	case subdomainRecheckAllSQL:
+		p.execs = append(p.execs, subCall{sql, append([]any(nil), args...)})
+		if p.execErr != nil && (p.execErrAfter == 0 || len(p.execs) > p.execErrAfter) {
+			return nil, p.execErr
+		}
+		n := p.recheck(args[1].(int16), args[2].(int16), 0, args[3].(int))
+		return statusRowsOf([]any{n}), nil
+	case subdomainRecheckZoneSQL:
+		p.execs = append(p.execs, subCall{sql, append([]any(nil), args...)})
+		if p.execErr != nil && (p.execErrAfter == 0 || len(p.execs) > p.execErrAfter) {
+			return nil, p.execErr
+		}
+		n := p.recheck(args[1].(int16), args[2].(int16), args[3].(int16), args[4].(int))
+		return statusRowsOf([]any{n}), nil
 	case subdomainsSelectSQL:
 		rows := make([][]any, len(p.subs))
 		for i, s := range p.subs {

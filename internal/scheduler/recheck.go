@@ -104,15 +104,26 @@ const (
 // индекс, следующая пачка продолжается с места остановки — дренаж линеен
 // и не перечитывает несозревшее множество (внешнего состояния нет,
 // сбой и рестарт ничего не теряют, ТЗ 3.4).
+//
+// Дельты счётчиков зон (checked −n / pending +n) — CTE zc того же
+// оператора по RETURNING zone_id переведённых строк (T-178, ТЗИ §6.2:
+// предикат пинирует старое состояние done); внешний SELECT отдаёт
+// zone_id переведённых — RecheckOnce считает по нему итог.
 var recheckUpdateSQL = fmt.Sprintf(
-	"UPDATE domains AS d "+
+	"WITH b AS (SELECT zone_id, id FROM domains "+
+		"WHERE check_state = %[1]d AND status <> %[2]d AND status <> %[3]d AND last_checked_at < $2 "+
+		"ORDER BY last_checked_at, zone_id, id LIMIT $3), "+
+		"upd AS (UPDATE domains AS d "+
 		"SET check_state = $1, queued_at = NULL "+
-		"FROM (SELECT zone_id, id FROM domains "+
-		"WHERE check_state = %d AND status <> %d AND status <> %d AND last_checked_at < $2 "+
-		"ORDER BY last_checked_at, zone_id, id LIMIT $3) AS b "+
-		"WHERE d.zone_id = b.zone_id AND d.id = b.id "+
-		"AND d.check_state = %d AND d.status <> %d AND d.status <> %d AND d.last_checked_at < $2",
-	int16(model.CheckStateDone), int16(model.StatusDeleted), int16(model.StatusInvalid),
+		"FROM b WHERE d.zone_id = b.zone_id AND d.id = b.id "+
+		"AND d.check_state = %[1]d AND d.status <> %[2]d AND d.status <> %[3]d AND d.last_checked_at < $2 "+
+		"RETURNING d.zone_id), "+
+		"zc AS (UPDATE zones AS z "+
+		"SET domains_checked = z.domains_checked - c.n, "+
+		"domains_pending = z.domains_pending + c.n "+
+		"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c "+
+		"WHERE z.id = c.zone_id) "+
+		"SELECT zone_id FROM upd",
 	int16(model.CheckStateDone), int16(model.StatusDeleted), int16(model.StatusInvalid))
 
 // RecheckOptions — параметры перепроверки; нулевые значения заменяются
@@ -160,7 +171,8 @@ type RecheckResult struct {
 // со check_state = done и last_checked_at старше opts.Interval (не
 // deleted) переводятся в check_state = pending одним оператором —
 // статус результата и остальные колонки не меняются, queued_at
-// сбрасывается. Повторный проход безопасен (ТЗ 3.4): переведённые
+// сбрасывается; CTE того же оператора ведёт дельты счётчиков зон
+// (T-178). Повторный проход безопасен (ТЗ 3.4): переведённые
 // строки подзапрос больше не выбирает.
 func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckResult, error) {
 	if pool == nil {
@@ -173,7 +185,7 @@ func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckR
 	}
 	cutoff := now().Add(-o.Interval)
 
-	tag, err := pool.Exec(ctx, recheckUpdateSQL,
+	rows, err := pool.Query(ctx, recheckUpdateSQL,
 		int16(model.CheckStatePending),
 		cutoff,
 		o.BatchSize,
@@ -181,7 +193,20 @@ func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckR
 	if err != nil {
 		return RecheckResult{}, fmt.Errorf("scheduler: перепроверка доменов: %w", err)
 	}
-	return RecheckResult{Domains: tag.RowsAffected()}, nil
+	defer rows.Close()
+
+	var n int64
+	for rows.Next() {
+		var zoneID int16
+		if err := rows.Scan(&zoneID); err != nil {
+			return RecheckResult{}, fmt.Errorf("scheduler: перепроверка доменов: чтение: %w", err)
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return RecheckResult{}, fmt.Errorf("scheduler: перепроверка доменов: %w", err)
+	}
+	return RecheckResult{Domains: n}, nil
 }
 
 // RecheckDaily — суточный цикл перепроверки (ТЗ 5.3: «раз в сутки»):

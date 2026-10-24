@@ -53,6 +53,7 @@ var commands = map[string]commandFunc{
 	"test-rules":       cmdTestRules,
 	"near":             cmdNear,
 	"check":            cmdCheck,
+	"counters":         cmdCounters,
 }
 
 // usageText — справка верхнего уровня: без аргументов, help, неизвестная
@@ -86,6 +87,12 @@ const usageText = `crawlerctl — CLI Domain Crawler
   check <домен>                  живая проверка домена конвейером:
                                  DNS → HTTP (+рендер SPA) → анализ,
                                  read-only (T-119)
+
+Команды счётчиков (T-178):
+  counters list|recount|verify
+                                 инкрементальные счётчики конвейера:
+                                 значения, ручная реконсиляция (--zone),
+                                 сверка с живыми агрегатами (код 0/1)
 
 Команды dev-окружения:
   seed [--incoming DIR] [--scenarios FILE] [--bulk N]

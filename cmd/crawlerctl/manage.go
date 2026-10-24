@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/analyzer"
@@ -247,21 +248,39 @@ const subdomainDisableSQL = "UPDATE subdomains SET enabled = false WHERE id = $1
 // Отличия от суточной перепроверки: нет порога возраста last_checked_at
 // (перепроверить надо все готовые домены зоны, а не созревшие) и есть
 // фильтр зоны. Коды check_state/status — параметры, как в T-030.
-const subdomainRecheckAllSQL = "UPDATE domains AS d " +
-	"SET check_state = $1, queued_at = NULL " +
-	"FROM (SELECT zone_id, id FROM domains " +
+// Дельты счётчиков зон (checked −n / pending +n) — CTE zc по RETURNING
+// zone_id переведённых: предикат пинирует старое состояние done (T-178,
+// ревью P2-2); внешний SELECT — счёт переведённых (CommandTag составного
+// оператора неприменим).
+const subdomainRecheckAllSQL = "WITH b AS (SELECT zone_id, id FROM domains " +
 	"WHERE check_state = $2 AND status <> $3 " +
-	"ORDER BY zone_id, id LIMIT $4) AS b " +
-	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3"
-
-const subdomainRecheckZoneSQL = "UPDATE domains AS d " +
+	"ORDER BY zone_id, id LIMIT $4), " +
+	"upd AS (UPDATE domains AS d " +
 	"SET check_state = $1, queued_at = NULL " +
-	"FROM (SELECT zone_id, id FROM domains " +
+	"FROM b WHERE d.zone_id = b.zone_id AND d.id = b.id " +
+	"AND d.check_state = $2 AND d.status <> $3 " +
+	"RETURNING d.zone_id), " +
+	"zc AS (UPDATE zones AS z " +
+	"SET domains_checked = z.domains_checked - c.n, " +
+	"domains_pending = z.domains_pending + c.n " +
+	"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
+	"WHERE z.id = c.zone_id) " +
+	"SELECT count(*) FROM upd"
+
+const subdomainRecheckZoneSQL = "WITH b AS (SELECT zone_id, id FROM domains " +
 	"WHERE check_state = $2 AND status <> $3 AND zone_id = $4 " +
-	"ORDER BY zone_id, id LIMIT $5) AS b " +
-	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = $2 AND d.status <> $3 AND d.zone_id = $4"
+	"ORDER BY zone_id, id LIMIT $5), " +
+	"upd AS (UPDATE domains AS d " +
+	"SET check_state = $1, queued_at = NULL " +
+	"FROM b WHERE d.zone_id = b.zone_id AND d.id = b.id " +
+	"AND d.check_state = $2 AND d.status <> $3 AND d.zone_id = $4 " +
+	"RETURNING d.zone_id), " +
+	"zc AS (UPDATE zones AS z " +
+	"SET domains_checked = z.domains_checked - c.n, " +
+	"domains_pending = z.domains_pending + c.n " +
+	"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
+	"WHERE z.id = c.zone_id) " +
+	"SELECT count(*) FROM upd"
 
 // subdomainRecheckBatch — доменов в одной пачке перевода: диапазон пачек
 // планировщика (ТЗ 5.3: 1000–10 000), совпадает с дефолтом суточной
@@ -564,23 +583,29 @@ func drainSubdomainRecheck(ctx context.Context, pool db.DB, zoneID *int16) (int6
 // subdomainRecheckOnce — один проход перевода пачки done → pending
 // (SQL — subdomainRecheckAllSQL/subdomainRecheckZoneSQL).
 func subdomainRecheckOnce(ctx context.Context, pool db.DB, zoneID *int16) (int64, error) {
+	what := "перевод done → pending"
+	var sql string
+	var args []any
 	if zoneID == nil {
-		tag, err := pool.Exec(ctx, subdomainRecheckAllSQL,
-			int16(model.CheckStatePending), int16(model.CheckStateDone),
-			int16(model.StatusDeleted), subdomainRecheckBatch)
-		if err != nil {
-			return 0, fmt.Errorf("перевод done → pending: %w", err)
-		}
-		return tag.RowsAffected(), nil
+		sql = subdomainRecheckAllSQL
+		args = []any{int16(model.CheckStatePending), int16(model.CheckStateDone),
+			int16(model.StatusDeleted), subdomainRecheckBatch}
+	} else {
+		z := *zoneID
+		what = fmt.Sprintf("перевод done → pending (зона %d)", z)
+		sql = subdomainRecheckZoneSQL
+		args = []any{int16(model.CheckStatePending), int16(model.CheckStateDone),
+			int16(model.StatusDeleted), z, subdomainRecheckBatch}
 	}
-	z := *zoneID
-	tag, err := pool.Exec(ctx, subdomainRecheckZoneSQL,
-		int16(model.CheckStatePending), int16(model.CheckStateDone),
-		int16(model.StatusDeleted), z, subdomainRecheckBatch)
+	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
-		return 0, fmt.Errorf("перевод done → pending (зона %d): %w", z, err)
+		return 0, fmt.Errorf("%s: %w", what, err)
 	}
-	return tag.RowsAffected(), nil
+	n, err := pgx.CollectOneRow(rows, pgx.RowTo[int64])
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", what, err)
+	}
+	return n, nil
 }
 
 // ---------------------------------------------------------------- команды

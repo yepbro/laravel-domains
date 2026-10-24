@@ -15,11 +15,10 @@
 // Что измеримо из БД (решения зафиксированы, остальное — честно не
 // показывается, ТЗ 5.9 «скорость… ожидаемое время завершения цикла»):
 //
-//   - прогресс зон — счётчики zones.domains_total/domains_checked (их
-//     обновляет сервис monitor, ТЗ 5.9) плюс живой агрегат domains по
-//     check_state: pending без учёта deleted (удалённый домен планировщик
-//     не выбирает, T-028 — ждать его проверки нечего), queued и done без
-//     фильтра статуса;
+//   - прогресс зон — счётчики zones.domains_total/domains_pending/
+//     domains_queued/domains_checked (дельты переходов + реконсиляция
+//     monitor, T-178; базовое множество — status <> deleted, ТЗИ §4.1),
+//     читаются справочником без прохода domains;
 //   - скорость доменов — средняя с начала суток: last_checked_at имеет
 //     точность дня (date, ТЗ 6.1), часового окна нет; короче 10 минут
 //     окно не используется (сразу после полуночи оценка скачет);
@@ -32,15 +31,16 @@
 //   - ETA первого цикла = (pending + queued) / скорость доменов, защита
 //     от деления на ноль — скорости нет или она 0 → «н/д».
 //
-// Агрегаты и окна: календарные окна (сутки по domains.last_checked_at,
-// час по subdomain_results.checked_at) обслуживаются индексами T-171
-// (domains_last_checked_idx, subdomain_results_checked_idx) — правый
-// край диапазона, стоимость пропорциональна окну, а не таблице;
-// распределения по статусам/состояниям (GROUP BY) остаются полными
-// проходами — для разовой диагностики допустимо. Постоянные потребители
-// не повторяют проходы на каждый запрос — дашборд кэширует снимки
-// фоновым циклом (ТЗД §4.4), а его период (dashboard.refresh) задаёт
-// цену мониторинга на большом корпусе.
+// Окна и распределения: календарные окна (сутки по domains.
+// last_checked_at, час по subdomain_results.checked_at) обслуживаются
+// индексами T-171/T-120 — правый край диапазона, стоимость
+// пропорциональна окну, а не таблице; распределения и состояния —
+// инкрементальные счётчики (T-178: zones + crawler_counters, дельты
+// переходов + реконсиляция раз в monitor.zone_stats_interval — единственный
+// полный проход domains в стационаре). Дашборд кэширует снимки фоновым
+// циклом (ТЗД §4.4, TTL-кэш T-161 — теперь он кэширует дешёвые чтения,
+// защищая от трафика между refresh-циклами), его период
+// (dashboard.refresh) задаёт цену мониторинга.
 package status
 
 import (
@@ -48,6 +48,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"crawler/internal/db"
@@ -57,21 +58,17 @@ import (
 
 // ---------------------------------------------------------------- SQL
 
-// zoneStatsSQL — сводка по зонам одним проходом: счётчики zones +
-// агрегат domains по check_state (LEFT JOIN — зона без доменов остаётся
-// в сводке). Коды check_state/status — константы model, вшитые в текст
-// (стиль scheduler/dispatch.go); count(d.id) игнорирует строку зоны без
-// доменов, FILTER — NULL-колонки непрошедших условий LEFT JOIN.
-var zoneStatsSQL = fmt.Sprintf(
-	"SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_unicode, "+
-		"z.is_active, z.domains_total, z.domains_checked, "+
-		"count(d.id) FILTER (WHERE d.check_state = %d AND d.status <> %d) AS pending, "+
-		"count(d.id) FILTER (WHERE d.check_state = %d) AS queued, "+
-		"count(d.id) FILTER (WHERE d.check_state = %d) AS done "+
-		"FROM zones AS z LEFT JOIN domains AS d ON d.zone_id = z.id "+
-		"GROUP BY z.id ORDER BY z.name",
-	int16(model.CheckStatePending), int16(model.StatusDeleted),
-	int16(model.CheckStateQueued), int16(model.CheckStateDone))
+// zoneStatsSQL — сводка по зонам из счётчиков справочника (T-178, ТЗИ
+// §8.1): без JOIN domains — полный проход 47 млн строк ушёл из путей
+// чтения, сводка читает тысячи строк зон; счётчики ведут дельты
+// переходов (ТЗИ §6) и реконсиляция monitor (ТЗИ §7). Базовое множество
+// всех колонок — status <> deleted (унификация ТЗИ §4.1: queued/done
+// прежде живого агрегата считались без фильтра статуса — удалённый с
+// зависшей арендой попадал в queued; теперь удалённый домен не является
+// ни работой, ни прогрессом).
+var zoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_unicode, " +
+	"z.is_active, z.domains_total, z.domains_pending, z.domains_queued, z.domains_checked " +
+	"FROM zones AS z ORDER BY z.name"
 
 // throughputSQL — замеры темпа одним запросом. now() — время транзакции:
 // оба интервала согласованы внутри одного выполнения; current_date и
@@ -84,18 +81,29 @@ const throughputSQL = "SELECT " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour') AS results_hour, " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour' AND rendered) AS rendered_hour"
 
-// domainStatusSQL — распределение domains по статусам (ТЗД §5.5):
-// единственный агрегат секции, ORDER BY status — детерминированный
-// порядок строк (имена и полнота легенды — в FetchDomainStatuses).
-const domainStatusSQL = "SELECT status, count(*) FROM domains GROUP BY status ORDER BY status"
+// domainStatusSQL — распределение domains по статусам (ТЗД §5.5) из
+// строк status_* таблицы crawler_counters (T-178, ТЗИ §8.2): строки
+// пишет реконсиляция monitor (статус-распределение не инкрементируется
+// на переходах — старые статусы не пинируются предикатами операторов,
+// ТЗИ §13.3; FILTER-колонки в реконсиляционном скане бесплатны),
+// свежесть — monitor.zone_stats_interval (5 мин; прежде живой агрегат
+// кэшировался минутой T-161). LIKE-шаблон с экранированным
+// подчёркиванием: имя строки — status_<имя>, односимвольная маска _
+// ловила бы чужие имена. ORDER BY name — детерминированный порядок
+// строк (имена и полнота легенды — в FetchDomainStatuses).
+const domainStatusSQL = "SELECT name, value FROM crawler_counters WHERE name LIKE 'status\\_%' ORDER BY name"
 
-// laravelTotalsSQL — счётчики Laravel-находок (ТЗД §5.6) одним проходом
-// laravel_domains: всего и обновлённых за 24 часа (updated_at — момент
-// последнего пересчёта агрегата, ТЗ 5.8). Окно 24 часа — то же, что у
-// «находок за 24 ч» лендинга (T-118/T-120), но по laravel_domains —
-// ТЗД §5.6 явно называет эту таблицу: секция показывает живой агрегат,
-// а не журнал переходов.
-const laravelTotalsSQL = "SELECT count(*), " +
+// laravelTotalsSQL — счётчики Laravel-находок (ТЗД §5.6): всего — сумма
+// инкрементальных счётчиков зон (T-178, ТЗИ §8.3: sum(zones.
+// domains_laravel), как читает лендинг с T-122; дельты пишет analyzer,
+// авторитет — реконсиляция), окно 24 часа — живой агрегат по
+// laravel_domains (обновлится при пересчёте агрегата, ТЗ 5.8) по индексу
+// laravel_domains_updated_at_idx (T-120): цена пропорциональна окну, а
+// не таблице (рамки ТЗИ §3.1). Окно 24 часа — то же, что у «находок за
+// 24 ч» лендинга (T-118/T-120), но по laravel_domains — ТЗД §5.6 явно
+// называет эту таблицу: секция показывает живой агрегат, а не журнал
+// переходов.
+const laravelTotalsSQL = "SELECT (SELECT coalesce(sum(domains_laravel), 0) FROM zones), " +
 	"count(*) FILTER (WHERE updated_at >= now() - interval '24 hours') " +
 	"FROM laravel_domains"
 
@@ -126,11 +134,15 @@ type ZoneStats struct {
 	Name           string // punycode — каноническая форма (ТЗ 5.2)
 	NameUnicode    string // "" — NULL; только отображение (в JSON)
 	IsActive       bool
-	DomainsTotal   int64 // счётчик zones.domains_total (обновляет monitor)
-	DomainsChecked int64 // счётчик zones.domains_checked (обновляет monitor)
-	Pending        int64 // агрегат domains: ожидает выборки (без deleted)
-	Queued         int64 // в работе (lease)
-	Done           int64 // DNS/HTTP-этап завершён (ТЗ 7)
+	DomainsTotal   int64 // счётчик zones.domains_total (дельты + реконсиляция, T-178)
+	DomainsChecked int64 // счётчик zones.domains_checked (дельты + реконсиляция, T-178)
+	Pending        int64 // счётчик zones.domains_pending: ожидает выборки
+	Queued         int64 // счётчик zones.domains_queued: в работе (lease)
+	Done           int64 // DNS/HTTP-этап завершён (ТЗ 7) — теперь тот же
+	// счётчик domains_checked (T-178: прежде живой агрегат считал done
+	// без фильтра статуса — унификация базового множества ТЗИ §4.1
+	// закрыла расхождение в пользу реконсиляции); поле сохранено —
+	// wire-формат JSON (§5.3) показывает обе колонки.
 }
 
 // Throughput — замеры темпа из БД (одно выполнение throughputSQL).
@@ -155,9 +167,10 @@ func FetchZoneStats(ctx context.Context, pool db.DB) ([]ZoneStats, error) {
 	for rows.Next() {
 		var z ZoneStats
 		if err := rows.Scan(&z.ID, &z.Name, &z.NameUnicode, &z.IsActive,
-			&z.DomainsTotal, &z.DomainsChecked, &z.Pending, &z.Queued, &z.Done); err != nil {
+			&z.DomainsTotal, &z.Pending, &z.Queued, &z.DomainsChecked); err != nil {
 			return nil, fmt.Errorf("status: зоны: чтение: %w", err)
 		}
+		z.Done = z.DomainsChecked // одна колонка счётчика — обе семантики (T-178)
 		zones = append(zones, z)
 	}
 	if err := rows.Err(); err != nil {
@@ -226,10 +239,13 @@ type IngestReport struct {
 	ProcessedAt time.Time // zero — NULL
 }
 
-// FetchDomainStatuses — распределение domains по статусам (ТЗД §5.5).
-// Ключи — имена по ТЗ 6.2 основного ТЗ (model.Statuses); статусы без
-// строк входят с нулём — полная легенда для отображения без знания
-// таблицы на клиенте; неизвестный код схемы — под именем Status(N).
+// FetchDomainStatuses — распределение domains по статусам (ТЗД §5.5)
+// из строк status_* crawler_counters (T-178). Ключи — имена по ТЗ 6.2
+// основного ТЗ (model.Statuses); статусы без строк входят с нулём —
+// полная легенда для отображения без знания таблицы на клиенте; строки
+// с именем вне легенды (неизвестный код схемы) не отображаются —
+// реконсиляция пишет только model.Statuses, чужая строка — ручная
+// правка таблицы (runbooks §6).
 func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, error) {
 	if pool == nil {
 		return nil, errors.New("status: статусы: пул не задан")
@@ -243,13 +259,17 @@ func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, err
 	for _, s := range model.Statuses {
 		counts[s.String()] = 0
 	}
+	const statusPrefix = "status_"
 	for rows.Next() {
-		var code int16
+		var name string
 		var n int64
-		if err := rows.Scan(&code, &n); err != nil {
+		if err := rows.Scan(&name, &n); err != nil {
 			return nil, fmt.Errorf("status: статусы: чтение: %w", err)
 		}
-		counts[model.Status(code).String()] = n
+		if _, ok := counts[strings.TrimPrefix(name, statusPrefix)]; !ok {
+			continue // имя вне легенды model.Statuses — комментарий выше
+		}
+		counts[strings.TrimPrefix(name, statusPrefix)] = n
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("status: статусы: %w", err)

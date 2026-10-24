@@ -42,6 +42,7 @@ const (
 	recordEvDelete  recordEventKind = "delete"
 	recordEvSwap    recordEventKind = "swapref"
 	recordEvInsert  recordEventKind = "insert"
+	recordEvShift   recordEventKind = "zone-shift" // дельта счётчиков зоны (T-178)
 	recordEvCommit  recordEventKind = "commit"
 	recordEvPublish recordEventKind = "publish"
 	recordEvAck     recordEventKind = "ack"
@@ -146,7 +147,8 @@ type recordFakeRow struct {
 
 // recordFakePool — RecordDB без БД: живая семантика domains (охрана
 // status <> deleted у UPDATE), subdomain_results (DELETE … RETURNING,
-// INSERT-пачка) и contents (refcount с охраной > 0). Транзакция работает
+// INSERT-пачка), contents (refcount с охраной > 0) и счётчиков зон
+// (recordZoneShiftSQL, T-178). Транзакция работает
 // на снапшоте: Rollback восстанавливает состояние пула, Commit оставляет
 // (достаточно для последовательных вызовов записи; конкурентные
 // транзакции фейк не моделирует — их сериализует PostgreSQL).
@@ -156,6 +158,7 @@ type recordFakePool struct {
 	domains map[recordDomainKey]*recordFakeDomain
 	rows    map[recordDomainKey][]recordFakeRow
 	refc    map[content.Hash]int32
+	zones   map[int16]*recordFakeZone
 
 	begins   int
 	txs      int // создано транзакций
@@ -169,13 +172,28 @@ type recordFakePool struct {
 	mu sync.Mutex
 }
 
+// recordFakeZone — строка zones: колонки инкрементальных счётчиков
+// (T-178); сдвигает recordZoneShiftSQL.
+type recordFakeZone struct {
+	total, pending, queued, checked int64
+}
+
 func newRecordFakePool() *recordFakePool {
 	return &recordFakePool{
 		j:       &recordJournal{},
 		domains: make(map[recordDomainKey]*recordFakeDomain),
 		rows:    make(map[recordDomainKey][]recordFakeRow),
 		refc:    make(map[content.Hash]int32),
+		zones:   make(map[int16]*recordFakeZone),
 	}
+}
+
+// recordSeedZone — зона с заданными счётчиками (T-178); зоны без записи —
+// строка справочника отсутствует, сдвиг честно ответит UPDATE 0.
+func (p *recordFakePool) recordSeedZone(id int16, total, pending, queued, checked int64) *recordFakeZone {
+	z := &recordFakeZone{total: total, pending: pending, queued: queued, checked: checked}
+	p.zones[id] = z
+	return z
 }
 
 var _ RecordDB = (*recordFakePool)(nil)
@@ -186,6 +204,11 @@ func (p *recordFakePool) recordSeedDomain(zone int16, id int64, status model.Sta
 	now := time.Now()
 	d.queuedAt = &now
 	p.domains[recordDomainKey{zone: zone, id: id}] = d
+	if _, ok := p.zones[zone]; !ok {
+		// Зона справочника для дельт счётчиков (T-178): нулевые counters
+		// — тесты, которым нужны значения, сеют явно recordSeedZone.
+		p.recordSeedZone(zone, 0, 0, 0, 0)
+	}
 	return d
 }
 
@@ -227,11 +250,16 @@ func (p *recordFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	for k, v := range p.refc {
 		snapRefc[k] = v
 	}
+	snapZones := make(map[int16]*recordFakeZone, len(p.zones))
+	for k, v := range p.zones {
+		c := *v
+		snapZones[k] = &c
+	}
 	p.txs++
 	p.j.record(recordEvBegin)
 	return &recordFakeTx{
 		pool: p, j: p.j,
-		snapDomains: snapDomains, snapRows: snapRows, snapRefc: snapRefc,
+		snapDomains: snapDomains, snapRows: snapRows, snapRefc: snapRefc, snapZones: snapZones,
 	}, nil
 }
 
@@ -245,7 +273,44 @@ type recordFakeTx struct {
 	snapDomains map[recordDomainKey]*recordFakeDomain
 	snapRows    map[recordDomainKey][]recordFakeRow
 	snapRefc    map[content.Hash]int32
+	snapZones   map[int16]*recordFakeZone
 	committed   bool
+}
+
+// recordFakeRow — pgx.Row предчтения состояний (T-178): два int16
+// (status, check_state) или ошибка (pgx.ErrNoRows — строки нет).
+type recordStateRow struct {
+	status, state int16
+	err           error
+}
+
+func (r recordStateRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if len(dest) != 2 {
+		return fmt.Errorf("recordStateRow: приёмников %d, нужно 2", len(dest))
+	}
+	*dest[0].(*int16) = r.status
+	*dest[1].(*int16) = r.state
+	return nil
+}
+
+// QueryRow — точечное предчтение состояний FOR UPDATE (recordSelectStateSQL,
+// T-178): строка домена любой прозрачности статуса — блокировка «есть»;
+// отсутствующая строка — ErrNoRows.
+func (t *recordFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	if sql != recordSelectStateSQL {
+		return recordStateRow{err: fmt.Errorf("recordFakePool: неожидаемый QueryRow: %s", sql)}
+	}
+	key := recordDomainKey{zone: args[0].(int16), id: args[1].(int64)}
+	d, ok := t.pool.domains[key]
+	if !ok {
+		return recordStateRow{err: pgx.ErrNoRows}
+	}
+	return recordStateRow{status: int16(d.status), state: int16(d.checkState)}
 }
 
 // recordDelRefSQLPrefix — префикс sqlMetaDelRef из content/pack.go
@@ -338,6 +403,20 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 			return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", t.pool.insertTag)), nil
 		}
 		return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", n)), nil
+	case recordZoneShiftSQL:
+		// Дельта счётчиков зоны по старому состоянию строки (T-178):
+		// зона + дельты pending/queued/checked (total запись результата
+		// не меняет; нулевые дельты — колонка не тронута).
+		zone := args[0].(int16)
+		z, ok := t.pool.zones[zone]
+		if !ok {
+			return pgconn.NewCommandTag("UPDATE 0"), nil // строка зоны обязательна
+		}
+		z.pending += args[1].(int64)
+		z.queued += args[2].(int64)
+		z.checked += args[3].(int64)
+		t.j.record(recordEvShift)
+		return pgconn.NewCommandTag("UPDATE 1"), nil
 	default:
 		if !strings.HasPrefix(sql, recordDelRefSQLPrefix) {
 			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: неожидаемый SQL: %s", sql)
@@ -401,7 +480,7 @@ func (t *recordFakeTx) Rollback(context.Context) error {
 	if t.committed {
 		return nil // откат после Commit — no-op
 	}
-	t.pool.domains, t.pool.rows, t.pool.refc = t.snapDomains, t.snapRows, t.snapRefc
+	t.pool.domains, t.pool.rows, t.pool.refc, t.pool.zones = t.snapDomains, t.snapRows, t.snapRefc, t.snapZones
 	return nil
 }
 
@@ -667,12 +746,19 @@ func recordRecorder(t *testing.T, pool *recordFakePool, q *recordFakeQueue) *Rec
 func TestRecordWritesAllColumns(t *testing.T) {
 	pool := newRecordFakePool()
 	pool.recordSeedDomain(7, 91, model.StatusNew, 3)
+	zone := pool.recordSeedZone(7, 10, 2, 3, 5) // счётчики зоны до записи (T-178)
 	q := &recordFakeQueue{j: pool.j}
 	res, hashes := recordRichResult()
 
 	ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 	if err != nil || !ok {
 		t.Fatalf("RecordAndPublish: ok=%v err=%v", ok, err)
+	}
+
+	// Дельта счётчиков зоны той же транзакцией (T-178, ТЗИ §6.4): домен
+	// был queued → queued −1, checked +1, total/pending не тронуты.
+	if zone.queued != 2 || zone.checked != 6 || zone.total != 10 || zone.pending != 2 {
+		t.Fatalf("счётчики зоны = %+v, want {10 2 2 6} (queued −1, checked +1)", *zone)
 	}
 
 	dom := pool.domains[recordDomainKey{zone: 7, id: 91}]

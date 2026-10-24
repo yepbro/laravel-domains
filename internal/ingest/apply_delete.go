@@ -16,25 +16,37 @@ import (
 
 // applyDeleteSQL — применение delete одним оператором (ТЗ 5.1):
 //
-//   - CTE applied — перенос статуса: UPDATE domains SET status = deleted
+//   - CTE moved — перенос статуса: UPDATE domains SET status = deleted
 //     для доменов партии (соединение по уникальному ключу (zone_id, label);
 //     фильтры batch_id/action адресуют только свою партию и только её
-//     delete-строки). Охраны по текущему статусу нет: delete переводит в
-//     deleted любой статус, уже удалённый домен остаётся удалённым —
-//     повторное применение не меняет состояние (идемпотентность
-//     at-least-once, ТЗ 3.4). RETURNING возвращает ключи переведённых
-//     доменов — по ним считаются строки отчёта;
+//     delete-строки). Охраны по текущему статусу до T-178 не было:
+//     повторное применение переводило уже удалённый в тот же deleted
+//     (идемпотентность at-least-once, ТЗ 3.4) — отчёт считал строку
+//     «удалённой». Охрана d.status <> deleted теперь нужна для дельт
+//     счётчиков зон (T-178, ТЗИ §6.2): повторное применение не должно
+//     декрементировать счётчики за уже удалённый домен; отчёт это
+//     сохраняет — см. внешний SELECT;
+//   - CTE zc — дельты счётчиков зон по RETURNING zone_id, check_state
+//     переведённых строк (T-178): total −n и по состоянию —
+//     pending −n / queued −n / checked −n (оператор не меняет
+//     check_state — RETURNING отдаёт старое значение, ТЗИ §6.1.2);
+//     базовое множество колонок зон — status <> deleted (ТЗИ §4.1),
+//     удаляемый домен покидает все колонки;
 //   - внешний SELECT без FROM всегда возвращает одну строку счётчиков:
-//     deleted — строки файла, чей домен переведён (повторяющаяся метка в
-//     файле считает каждую свою строку), not_found — строки, чьего домена
-//     нет в domains. Все обращения к staging — через StageTable: единый
+//     deleted — строки файла, чей домен переведён этим оператором
+//     (EXISTS по moved) ЛИБО уже был удалён до него (EXISTS по domains
+//     со старым статусом — снимок оператора не видит собственной записи
+//     moved): семантика счётчика прежняя (повторяющаяся метка в файле
+//     считает каждую свою строку, повторное применение считает свои
+//     строки удалёнными), not_found — строки, чьего домена нет
+//     в domains. Все обращения к staging — через StageTable: единый
 //     источник таблицы с COPY и очисткой партии.
 //
 // Оба множества (staging и domains) уже находятся в БД, поэтому один
 // set-based оператор вместо db.Update с unnest-массивами: ничего не
 // возится через приложение, память не зависит от размера файла (ТЗ 3.5),
 // а счётчики считаются тем же оператором и не расходятся с применением.
-var applyDeleteSQL = `WITH applied AS (
+var applyDeleteSQL = `WITH moved AS (
 	UPDATE domains AS d
 	SET status = $2
 	FROM ` + StageTable.Sanitize() + ` AS s
@@ -42,12 +54,30 @@ var applyDeleteSQL = `WITH applied AS (
 	  AND s.action = $3
 	  AND d.zone_id = s.zone_id
 	  AND d.label = s.label
-	RETURNING d.zone_id, d.label
+	  AND d.status <> $2
+	RETURNING d.zone_id, d.label, d.check_state
+), zc AS (
+	UPDATE zones AS z
+	SET domains_total = z.domains_total - c.n_total,
+	    domains_pending = z.domains_pending - c.n_pending,
+	    domains_queued = z.domains_queued - c.n_queued,
+	    domains_checked = z.domains_checked - c.n_checked
+	FROM (SELECT zone_id,
+	             count(*) AS n_total,
+	             count(*) FILTER (WHERE check_state = ` + fmt.Sprint(int16(model.CheckStatePending)) + `) AS n_pending,
+	             count(*) FILTER (WHERE check_state = ` + fmt.Sprint(int16(model.CheckStateQueued)) + `) AS n_queued,
+	             count(*) FILTER (WHERE check_state = ` + fmt.Sprint(int16(model.CheckStateDone)) + `) AS n_checked
+	      FROM moved GROUP BY zone_id) AS c
+	WHERE z.id = c.zone_id
 )
 SELECT
 	(SELECT count(*) FROM ` + StageTable.Sanitize() + ` AS s
-	JOIN applied AS a USING (zone_id, label)
-	WHERE s.batch_id = $1 AND s.action = $3) AS deleted,
+	WHERE s.batch_id = $1 AND s.action = $3
+	  AND (EXISTS (SELECT 1 FROM moved AS m
+	               WHERE m.zone_id = s.zone_id AND m.label = s.label)
+	       OR EXISTS (SELECT 1 FROM domains AS d2
+	                  WHERE d2.zone_id = s.zone_id AND d2.label = s.label
+	                    AND d2.status = $2))) AS deleted,
 	(SELECT count(*) FROM ` + StageTable.Sanitize() + ` AS s
 	WHERE s.batch_id = $1 AND s.action = $3
 	  AND NOT EXISTS (SELECT 1 FROM domains AS d

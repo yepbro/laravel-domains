@@ -121,11 +121,15 @@ func TestApplyDelete(t *testing.T) {
 }
 
 // TestApplyDeleteSQLContract — точный текст применения: перенос статуса
-// по ключу (zone_id, label) из строк своей партии, без охраны по текущему
-// статусу (уже deleted остаётся deleted — идемпотентность, ТЗ 3.4/13.1),
-// домен остаётся в БД (нет DELETE), счётчики по строкам staging.
+// по ключу (zone_id, label) из строк своей партии с охраной «ещё не
+// deleted» (T-178: дельты счётчиков зон декрементируют только
+// действительно переводимые строки — повторное применение партии
+// идемпотентно и по счётчикам, ТЗ 3.4; отчёт при этом сохраняет прежнюю
+// семантику: уже удалённый домен считается строкой «удалён»),
+// дельты счётчиков зон по check_state переведённых, домен остаётся в БД
+// (нет DELETE), счётчики по строкам staging.
 func TestApplyDeleteSQLContract(t *testing.T) {
-	want := `WITH applied AS (
+	want := `WITH moved AS (
 	UPDATE domains AS d
 	SET status = $2
 	FROM ` + StageTable.Sanitize() + ` AS s
@@ -133,12 +137,30 @@ func TestApplyDeleteSQLContract(t *testing.T) {
 	  AND s.action = $3
 	  AND d.zone_id = s.zone_id
 	  AND d.label = s.label
-	RETURNING d.zone_id, d.label
+	  AND d.status <> $2
+	RETURNING d.zone_id, d.label, d.check_state
+), zc AS (
+	UPDATE zones AS z
+	SET domains_total = z.domains_total - c.n_total,
+	    domains_pending = z.domains_pending - c.n_pending,
+	    domains_queued = z.domains_queued - c.n_queued,
+	    domains_checked = z.domains_checked - c.n_checked
+	FROM (SELECT zone_id,
+	             count(*) AS n_total,
+	             count(*) FILTER (WHERE check_state = 0) AS n_pending,
+	             count(*) FILTER (WHERE check_state = 1) AS n_queued,
+	             count(*) FILTER (WHERE check_state = 2) AS n_checked
+	      FROM moved GROUP BY zone_id) AS c
+	WHERE z.id = c.zone_id
 )
 SELECT
 	(SELECT count(*) FROM ` + StageTable.Sanitize() + ` AS s
-	JOIN applied AS a USING (zone_id, label)
-	WHERE s.batch_id = $1 AND s.action = $3) AS deleted,
+	WHERE s.batch_id = $1 AND s.action = $3
+	  AND (EXISTS (SELECT 1 FROM moved AS m
+	               WHERE m.zone_id = s.zone_id AND m.label = s.label)
+	       OR EXISTS (SELECT 1 FROM domains AS d2
+	                  WHERE d2.zone_id = s.zone_id AND d2.label = s.label
+	                    AND d2.status = $2))) AS deleted,
 	(SELECT count(*) FROM ` + StageTable.Sanitize() + ` AS s
 	WHERE s.batch_id = $1 AND s.action = $3
 	  AND NOT EXISTS (SELECT 1 FROM domains AS d
@@ -156,10 +178,15 @@ SELECT
 	if !strings.Contains(applyDeleteSQL, "UPDATE domains") || strings.Contains(applyDeleteSQL, "DELETE FROM domains") {
 		t.Errorf("SQL = %q, want только UPDATE domains", applyDeleteSQL)
 	}
-	// Без охраны по текущему статусу: переводится любой статус, уже
-	// удалённый считается удалённым (счётчик Deleted).
-	if strings.Contains(applyDeleteSQL, "status <>") || strings.Contains(applyDeleteSQL, "status !=") {
-		t.Errorf("SQL = %q, неожидаемая охрана по текущему статусу", applyDeleteSQL)
+	// Охрана статуса пинирует перевод для дельт (T-178): оператор не
+	// меняет check_state — RETURNING отдаёт старое значение (ТЗИ §6.1.2).
+	if !strings.Contains(applyDeleteSQL, "AND d.status <> $2") {
+		t.Errorf("SQL = %q, want охрана «ещё не deleted» для дельт счётчиков", applyDeleteSQL)
+	}
+	// Отчёт: уже удалённый до оператора домен считается «удалён»
+	// (EXISTS по domains со старым статусом — снимок оператора).
+	if !strings.Contains(applyDeleteSQL, "OR EXISTS") {
+		t.Errorf("SQL = %q, want альтернативу «уже был deleted» в счётчике deleted", applyDeleteSQL)
 	}
 }
 

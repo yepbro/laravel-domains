@@ -113,18 +113,30 @@ const (
 	// перевыберет диспетчер T-027), счётчик попыток + 1. Охрана
 	// status = temp_error AND check_state = done: домен, успевший уйти
 	// из done мимо прохода (recheck T-030, возврат lease T-029, воскрешение
-	// add-файлом T-018), не инкрементируется повторно.
-	retryRequeueSQL = "UPDATE domains d " +
+	// add-файлом T-018), не инкрементируется повторно. Дельты счётчиков
+	// зон (checked −n / pending +n) — CTE zc того же оператора по
+	// RETURNING zone_id (T-178, ТЗИ §6.2: предикат пинирует старое
+	// состояние done); внешний SELECT — ключи переведённых строк.
+	retryRequeueSQL = "WITH upd AS (UPDATE domains d " +
 		"SET check_state = $3, temp_attempts = d.temp_attempts + 1 " +
 		"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
 		"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id " +
 		"AND d.status = $4 AND d.check_state = $5 " +
-		"RETURNING d.zone_id, d.id"
+		"RETURNING d.zone_id, d.id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_checked = z.domains_checked - c.n, " +
+		"domains_pending = z.domains_pending + c.n " +
+		"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT u.zone_id, u.id FROM upd AS u"
 
 	// retryFinalizeSQL — исчерпание попыток: итоговый статус по последней
 	// проверке — delegated_no_address (см. комментарий в начале файла),
 	// счётчик в ноль: следующий эпизод temp_error начнётся с чистого
-	// счётчика. Охрана та же, что у назначения повтора.
+	// счётчика. Охрана та же, что у назначения повтора. Дельт счётчиков
+	// зон нет: check_state остаётся done, status-распределение
+	// инкрементами не ведётся — его пишет реконсиляция monitor (ТЗИ
+	// §13.3, T-178).
 	retryFinalizeSQL = "UPDATE domains d " +
 		"SET status = $3, temp_attempts = 0 " +
 		"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +

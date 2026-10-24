@@ -24,19 +24,30 @@ var (
 	// insertAddSQL — новые домены партии (ТЗ 5.1): вставляются только
 	// отсутствующие — ON CONFLICT DO NOTHING пропускает существующие
 	// (в том числе повторяющиеся метки внутри одного файла, миграция
-	// 000004), RowsAffected = число вставленных. Новые домены получают
-	// DEFAULT схемы: status = new, check_state = pending (ТЗ 6.2) — домен
-	// сразу в цикле проверок. is_idn вычисляется из метки (ТЗ 5.2 п. 9):
-	// staging флага не хранит, а метка — его единственный источник.
+	// 000004), счёт вставленных — внешний SELECT по CТЕ ins. Новые домены
+	// получают DEFAULT схемы: status = new, check_state = pending (ТЗ 6.2)
+	// — домен сразу в цикле проверок. is_idn вычисляется из метки (ТЗ 5.2
+	// п. 9): staging флага не хранит, а метка — его единственный источник.
 	// Условие — любая метка имени начинается с xn-- (метка бывает
 	// составной, ING-P1-1): первая ('xn--%') либо после точки
 	// ('%.xn--%') — эквивалент idn.HasXNLabel, ILIKE — без учёта
 	// регистра.
-	insertAddSQL = "INSERT INTO domains (zone_id, label, flags) " +
+	//
+	// Дельты счётчиков зон (total +n / pending +n) — CTE zc того же
+	// оператора по RETURNING zone_id вставленных строк (T-178, ТЗИ §6.2):
+	// вставка и дельты атомарны, повторное применение партии (после сбоя
+	// до очистки staging) конфликтует и дельт не добавляет.
+	insertAddSQL = "WITH ins AS (INSERT INTO domains (zone_id, label, flags) " +
 		"SELECT s.zone_id, s.label, CASE WHEN s.label ILIKE 'xn--%' OR s.label ILIKE '%.xn--%' THEN " + fmt.Sprint(int16(model.FlagIDN)) + " ELSE 0 END " +
 		"FROM ingest_stage AS s " +
 		"WHERE s.batch_id = $1 AND s.action = $2 " +
-		"ON CONFLICT DO NOTHING"
+		"ON CONFLICT DO NOTHING RETURNING zone_id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_total = z.domains_total + c.n, " +
+		"domains_pending = z.domains_pending + c.n " +
+		"FROM (SELECT zone_id, count(*) AS n FROM ins GROUP BY zone_id) AS c " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM ins"
 
 	// reviveAddSQL — возврат удалённых доменов партии в проверку (ТЗ 5.1:
 	// существующий домен не меняется, «кроме случая статуса deleted — он
@@ -49,14 +60,22 @@ var (
 	// нет действующего lease (ТЗ 5.3). flags, dns_mask, last_checked_at не
 	// трогаются: признаки метки и история прошлых проверок сохраняются —
 	// перепроверка перепишет их сама.
-	reviveAddSQL = fmt.Sprintf(
-		"UPDATE domains AS d "+
-			"SET status = %d, check_state = %d, queued_at = NULL "+
-			"FROM ingest_stage AS s "+
-			"WHERE s.batch_id = $1 AND s.action = $2 "+
-			"AND d.zone_id = s.zone_id AND d.label = s.label "+
-			"AND d.status = %d",
-		int16(model.StatusNew), int16(model.CheckStatePending), int16(model.StatusDeleted))
+	//
+	// Дельты счётчиков зон (total +n / pending +n) — CTE zc по RETURNING
+	// zone_id возвращённых строк (T-178, ТЗИ §6.2: домен был вне базового
+	// множества — счётчики его не содержали, декрементов нет).
+	reviveAddSQL = "WITH rev AS (UPDATE domains AS d " +
+		fmt.Sprintf("SET status = %d, check_state = %d, queued_at = NULL ", int16(model.StatusNew), int16(model.CheckStatePending)) +
+		"FROM ingest_stage AS s " +
+		"WHERE s.batch_id = $1 AND s.action = $2 " +
+		"AND d.zone_id = s.zone_id AND d.label = s.label " +
+		fmt.Sprintf("AND d.status = %d RETURNING d.zone_id), ", int16(model.StatusDeleted)) +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_total = z.domains_total + c.n, " +
+		"domains_pending = z.domains_pending + c.n " +
+		"FROM (SELECT zone_id, count(*) AS n FROM rev GROUP BY zone_id) AS c " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM rev"
 
 	// countAddSQL — уникальные домены партии (по паре zone_id, label —
 	// дубликаты строк файла не надувают счётчики) до очистки: из него
@@ -114,17 +133,17 @@ func ApplyAdd(ctx context.Context, pool db.DB, batch Batch) (AddResult, error) {
 
 	args := []any{batch.ID[:], int16(model.ActionAdd)}
 
-	tag, err := pool.Exec(ctx, insertAddSQL, args...)
+	n, err := applyAddCount(ctx, pool, insertAddSQL, args, "вставка новых доменов партии add")
 	if err != nil {
-		return res, fmt.Errorf("ingest: вставка новых доменов партии add: %w", err)
+		return res, err
 	}
-	res.Inserted = tag.RowsAffected()
+	res.Inserted = n
 
-	tag, err = pool.Exec(ctx, reviveAddSQL, args...)
+	n, err = applyAddCount(ctx, pool, reviveAddSQL, args, "возврат удалённых доменов партии add")
 	if err != nil {
-		return res, fmt.Errorf("ingest: возврат удалённых доменов партии add: %w", err)
+		return res, err
 	}
-	res.Revived = tag.RowsAffected()
+	res.Revived = n
 
 	rows, err := pool.Query(ctx, countAddSQL, args...)
 	if err != nil {
@@ -144,4 +163,20 @@ func ApplyAdd(ctx context.Context, pool db.DB, batch Batch) (AddResult, error) {
 		return res, err
 	}
 	return res, nil
+}
+
+// applyAddCount выполняет CTE-оператор применения (вставка/возврат +
+// дельты счётчиков зон одним оператором, T-178) и возвращает счётчик
+// внешнего SELECT (число затронутых строк партии).
+func applyAddCount(ctx context.Context, pool db.DB, sql string, args []any, kind string) (int64, error) {
+	rows, err := pool.Query(ctx, sql, args...)
+	if err != nil {
+		return 0, fmt.Errorf("ingest: %s: %w", kind, err)
+	}
+	defer rows.Close()
+	n, err := pgx.CollectOneRow(rows, pgx.RowTo[int64])
+	if err != nil {
+		return 0, fmt.Errorf("ingest: %s: %w", kind, err)
+	}
+	return n, nil
 }

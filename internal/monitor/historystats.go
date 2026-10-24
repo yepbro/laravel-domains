@@ -1,17 +1,14 @@
-// Счётчики истории детекции Laravel (T-118): append-only журнал
-// laravel_history (appeared/lost, пишет analyzer при свежих эпизодах
-// HTTP) — источник кумулятивных метрик crawler_laravel_appeared_total /
-// crawler_laravel_lost_total. События происходят в analyzer, но реестр
-// экспонирует monitor периодическим агрегатом по журналу: история
-// append-only (переходы не меняются), count(*) монотонен — gauge с
-// counter-семантикой корректен для rate()/increase() в Prometheus
-// (решение T-118: метрики отнесены задаче к internal/monitor, а не
-// реестру analyzer — события агрегируются запросом, воркер не несёт
-// приборов истории).
-//
-// Период — час, как у счётчика серой зоны (nearstats.go): проход —
-// seq scan журнала, тренды детекции — материал дашборда/отчётов, а не
-// оперативный сигнал конвейера.
+// Счётчики истории детекции Laravel (T-118): кумулятивные метрики
+// crawler_laravel_appeared_total / crawler_laravel_lost_total.
+// События (строки append-only журнала laravel_history, пишет analyzer
+// при свежих эпизодах HTTP) инкрементируют строки crawler_counters
+// той же транзакцией (T-178, analyzer/aggregate.go), авторитетное
+// значение периодически перезаписывает совмещённая реконсиляция
+// (zonestats.go, агрегат laravel_history) — часовой seq scan по
+// журналу ушёл из цикла, проход читает две точки PK (ТЗИ §8.5).
+// gauge с counter-семантикой корректен для rate()/increase() в
+// Prometheus (значения монотонны; решение T-118 — метрики отнесены
+// internal/monitor, а не реестру analyzer).
 package monitor
 
 import (
@@ -28,13 +25,16 @@ import (
 )
 
 // DefaultHistoryStatsInterval — период цикла HistoryStatsLoop: 1 ч
-// (обоснование — в комментарии пакета).
+// (свежесть кумулятивов между реконсиляциями; проход — точечные чтения,
+// интервал задаёт не цену, а частоту Debug-строк).
 const DefaultHistoryStatsInterval = time.Hour
 
-// historyStatsSQL — один проход: оба счётчика одним сканом FILTER-вариантом
-// count (стиль zoneStatsSQL). Пустой журнал честно даёт нули.
-const historyStatsSQL = "SELECT count(*) FILTER (WHERE appeared), " +
-	"count(*) FILTER (WHERE NOT appeared) FROM laravel_history"
+// historyStatsSQL — чтение обеих строк счётчиков одним оператором:
+// FILTER-позиции вместо двух Lookup; отсутствующая строка (до первой
+// реконсиляции) честно даёт 0 — как пустой журнал раньше.
+const historyStatsSQL = "SELECT coalesce(max(value) FILTER (WHERE name = 'laravel_appeared_total'), 0), " +
+	"coalesce(max(value) FILTER (WHERE name = 'laravel_lost_total'), 0) " +
+	"FROM crawler_counters WHERE name IN ('laravel_appeared_total', 'laravel_lost_total')"
 
 // HistoryStatsOptions — параметры цикла HistoryStatsLoop; нулевые значения
 // заменяются дефолтами (стиль NearStatsOptions).

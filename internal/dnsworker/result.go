@@ -97,7 +97,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5"
 
 	"crawler/internal/db"
 	"crawler/internal/dnsclient"
@@ -115,6 +115,15 @@ import (
 // T-027); last_checked_at = now() — время сервера БД (T-028), колонка
 // date получает дату приведением присваивания.
 //
+// Дельты счётчиков зон (T-178, ревью P1-1): DNS-этап — главный переход
+// queued/pending → done конвейера, оператор ведёт domains_queued/
+// domains_pending −n и domains_checked +n по старому состоянию строки
+// (ТЗИ §6.1.2: предикат check_state <> done не пинирует старое —
+// предчтение FOR UPDATE в CTE s той же транзакции-оператора). Домен в
+// pending (lease вернул посреди эпизода) корректно даёт pending −1 /
+// checked +1. RowsAffected счётчика зоны отдельно не проверяется: строки
+// зон создаются ingest'ом раньше доменов (EnsureZone, T-014).
+//
 // temp_attempts (T-031): счётчик повторов сбрасывается в 0 на каждом
 // не-temp_error итоге — новый эпизод временной ошибки начинается с чистого
 // счётчика (контракт T-031 возложен на DNS-этап); temp_error сохраняет
@@ -129,24 +138,52 @@ import (
 // smallint до int — возврат ::int2, стиль renderq.go T-066).
 var (
 	// resultUpdateStatusSQL — терминальный статус DNS-эпизода
-	// (not_delegated / temp_error / delegated_no_address).
-	resultUpdateStatusSQL = "UPDATE domains AS t " +
+	// (not_delegated / temp_error / delegated_no_address). Внешний
+	// SELECT — число фактически переведённых строк (идемпотентность
+	// повторной доставки: охрана отсекла — 0).
+	resultUpdateStatusSQL = "WITH s AS (" +
+		"SELECT zone_id, id, check_state FROM domains " +
+		fmt.Sprintf("WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> %d AND check_state <> %d ",
+			int16(model.StatusDeleted), int16(model.CheckStateDone)) +
+		"FOR UPDATE), " +
+		"upd AS (UPDATE domains AS t " +
 		"SET dns_mask = $3::int8, status = $4::int2, " +
 		fmt.Sprintf("temp_attempts = CASE WHEN $4::int2 = %d THEN t.temp_attempts ELSE 0 END, ", int16(model.StatusTempError)) +
 		fmt.Sprintf("flags = (t.flags & %d)::int2, ", int16(^int16(model.FlagHTTPPublished))) +
 		fmt.Sprintf("check_state = %d, queued_at = NULL, last_checked_at = now() ", int16(model.CheckStateDone)) +
-		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d AND t.check_state <> %d",
-			int16(model.StatusDeleted), int16(model.CheckStateDone))
+		"FROM s WHERE t.zone_id = s.zone_id AND t.id = s.id " +
+		"RETURNING s.check_state, t.zone_id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_pending = z.domains_pending - c.n_pending, " +
+		"domains_queued = z.domains_queued - c.n_queued, " +
+		"domains_checked = z.domains_checked + c.n " +
+		fmt.Sprintf("FROM (SELECT zone_id, count(*) AS n, count(*) FILTER (WHERE check_state = %d) AS n_pending, ", int16(model.CheckStatePending)) +
+		fmt.Sprintf("count(*) FILTER (WHERE check_state = %d) AS n_queued FROM upd GROUP BY zone_id) AS c ", int16(model.CheckStateQueued)) +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM upd"
 
 	// resultUpdateKeepStatusSQL — ветка «есть адреса»: статус не пишется
 	// (итог поставит HTTP-этап, §7), temp_attempts сбрасывается — эпизод
-	// успешен.
-	resultUpdateKeepStatusSQL = "UPDATE domains AS t " +
+	// успешен. Дельты зон и предчтение — как у терминальной ветки (T-178).
+	resultUpdateKeepStatusSQL = "WITH s AS (" +
+		"SELECT zone_id, id, check_state FROM domains " +
+		fmt.Sprintf("WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> %d AND check_state <> %d ",
+			int16(model.StatusDeleted), int16(model.CheckStateDone)) +
+		"FOR UPDATE), " +
+		"upd AS (UPDATE domains AS t " +
 		"SET dns_mask = $3::int8, temp_attempts = 0, " +
 		fmt.Sprintf("flags = (t.flags & %d)::int2, ", int16(^int16(model.FlagHTTPPublished))) +
 		fmt.Sprintf("check_state = %d, queued_at = NULL, last_checked_at = now() ", int16(model.CheckStateDone)) +
-		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d AND t.check_state <> %d",
-			int16(model.StatusDeleted), int16(model.CheckStateDone))
+		"FROM s WHERE t.zone_id = s.zone_id AND t.id = s.id " +
+		"RETURNING s.check_state, t.zone_id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_pending = z.domains_pending - c.n_pending, " +
+		"domains_queued = z.domains_queued - c.n_queued, " +
+		"domains_checked = z.domains_checked + c.n " +
+		fmt.Sprintf("FROM (SELECT zone_id, count(*) AS n, count(*) FILTER (WHERE check_state = %d) AS n_pending, ", int16(model.CheckStatePending)) +
+		fmt.Sprintf("count(*) FILTER (WHERE check_state = %d) AS n_queued FROM upd GROUP BY zone_id) AS c ", int16(model.CheckStateQueued)) +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM upd"
 
 	// resultMarkPublishedSQL — staging-пометка публикации q:http (T-108,
 	// DNS-04): бит http_published ставится сразу после успешного XADD и
@@ -172,12 +209,26 @@ var (
 	// done-строка чиста от staging-пометки (T-108). Охраны — как у
 	// записи результата: deleted не перезаписывается (§13.1), повторная
 	// доставка уже зафиксированного диагноза идемпотентна (ТЗ 3.4).
-	resultInvalidSQL = "UPDATE domains AS t " +
+	// Дельты зон и предчтение — как у записи результата (T-178).
+	resultInvalidSQL = "WITH s AS (" +
+		"SELECT zone_id, id, check_state FROM domains " +
+		fmt.Sprintf("WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> %d AND check_state <> %d ",
+			int16(model.StatusDeleted), int16(model.CheckStateDone)) +
+		"FOR UPDATE), " +
+		"upd AS (UPDATE domains AS t " +
 		fmt.Sprintf("SET status = %d::int2, temp_attempts = 0, ", int16(model.StatusInvalid)) +
 		fmt.Sprintf("flags = (t.flags & %d)::int2, ", int16(^int16(model.FlagHTTPPublished))) +
 		fmt.Sprintf("check_state = %d, queued_at = NULL, last_checked_at = now() ", int16(model.CheckStateDone)) +
-		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d AND t.check_state <> %d",
-			int16(model.StatusDeleted), int16(model.CheckStateDone))
+		"FROM s WHERE t.zone_id = s.zone_id AND t.id = s.id " +
+		"RETURNING s.check_state, t.zone_id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_pending = z.domains_pending - c.n_pending, " +
+		"domains_queued = z.domains_queued - c.n_queued, " +
+		"domains_checked = z.domains_checked + c.n " +
+		fmt.Sprintf("FROM (SELECT zone_id, count(*) AS n, count(*) FILTER (WHERE check_state = %d) AS n_pending, ", int16(model.CheckStatePending)) +
+		fmt.Sprintf("count(*) FILTER (WHERE check_state = %d) AS n_queued FROM upd GROUP BY zone_id) AS c ", int16(model.CheckStateQueued)) +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM upd"
 
 	// resultPendingSQL — фильтр актуальности пачки q:dns: остаются домены
 	// ещё не записанные (check_state <> done — повторная доставка,
@@ -326,8 +377,10 @@ func resultCNAME(c string) string {
 // результат повторная доставка не трогает (идемпотентность, ТЗ 3.4 —
 // XACK только после записи, T-025); тем же оператором снимается бит
 // http_published (T-108): done — точка, где staging-пометка публикации
-// выполнила своё назначение. Возвращает false, когда охраны отсекли
-// строку (done/deleted) — это успех, а не ошибка.
+// выполнила своё назначение; CTE того же оператора ведёт дельты
+// счётчиков зоны по старому состоянию строки (T-178, ревью P1-1).
+// Возвращает false, когда охраны отсекли строку (done/deleted) — это
+// успех, а не ошибка.
 func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64, res EpisodeResult) (bool, error) {
 	if pool == nil {
 		return false, errors.New("dnsworker: запись результата: пул не задан")
@@ -336,19 +389,22 @@ func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 		return false, fmt.Errorf("dnsworker: запись результата домена %d/%d: недопустимый статус %d", zoneID, domainID, int16(res.Status))
 	}
 
-	var (
-		tag pgconn.CommandTag
-		err error
-	)
+	var sql, what string
+	args := []any{zoneID, domainID}
 	if res.SetStatus {
-		tag, err = pool.Exec(ctx, resultUpdateStatusSQL, zoneID, domainID, int64(res.Mask), int16(res.Status))
+		sql = resultUpdateStatusSQL
+		what = "запись результата"
+		args = append(args, int64(res.Mask), int16(res.Status))
 	} else {
-		tag, err = pool.Exec(ctx, resultUpdateKeepStatusSQL, zoneID, domainID, int64(res.Mask))
+		sql = resultUpdateKeepStatusSQL
+		what = "запись результата"
+		args = append(args, int64(res.Mask))
 	}
+	n, err := resultCount(ctx, pool, sql, args, zoneID, domainID, what)
 	if err != nil {
-		return false, fmt.Errorf("dnsworker: запись результата домена %d/%d: %w", zoneID, domainID, err)
+		return false, err
 	}
-	return tag.RowsAffected() > 0, nil
+	return n > 0, nil
 }
 
 // MarkHTTPPublished ставит бит http_published — staging-пометку «задача
@@ -372,18 +428,35 @@ func MarkHTTPPublished(ctx context.Context, pool db.DB, zoneID int16, domainID i
 // (пустое имя, ErrEmptyDomain), покидает цикл переиздания вместо
 // бесконечного lease-возврата. Оператор resultInvalidSQL с охранами
 // актуальности: удалённый домен не перезаписывается (§13.1), повторная
-// доставка зафиксированного диагноза — no-op (идемпотентность, ТЗ 3.4).
+// доставка зафиксированного диагноза — no-op (идемпотентность, ТЗ 3.4);
+// CTE ведёт дельты счётчиков зоны (T-178).
 // Возвращает false, когда охраны отсекли строку (done/deleted) — это
 // успех, а не ошибка.
 func RecordInvalid(ctx context.Context, pool db.DB, zoneID int16, domainID int64) (bool, error) {
 	if pool == nil {
 		return false, errors.New("dnsworker: диагноз invalid: пул не задан")
 	}
-	tag, err := pool.Exec(ctx, resultInvalidSQL, zoneID, domainID)
+	n, err := resultCount(ctx, pool, resultInvalidSQL, []any{zoneID, domainID}, zoneID, domainID, "диагноз invalid")
 	if err != nil {
-		return false, fmt.Errorf("dnsworker: диагноз invalid домена %d/%d: %w", zoneID, domainID, err)
+		return false, err
 	}
-	return tag.RowsAffected() > 0, nil
+	return n > 0, nil
+}
+
+// resultCount выполняет CTE-оператор перевода в done и возвращает число
+// фактически переведённых строк (внешний SELECT; для одиночного UPDATE
+// CommandTag неприменим — оператор теперь составной, T-178). what —
+// контекст операции в сообщении об ошибке.
+func resultCount(ctx context.Context, pool db.DB, sql string, args []any, zoneID int16, domainID int64, what string) (int64, error) {
+	rows, err := pool.Query(ctx, sql, args...)
+	if err != nil {
+		return 0, fmt.Errorf("dnsworker: %s домена %d/%d: %w", what, zoneID, domainID, err)
+	}
+	n, err := pgx.CollectOneRow(rows, pgx.RowTo[int64])
+	if err != nil {
+		return 0, fmt.Errorf("dnsworker: %s домена %d/%d: %w", what, zoneID, domainID, err)
+	}
+	return n, nil
 }
 
 // ProcessDomain — DNS-эпизод одного домена целиком (ТЗ 5.4, §7): апекс

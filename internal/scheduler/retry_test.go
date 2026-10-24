@@ -241,12 +241,18 @@ const wantRetrySelect = "SELECT d.zone_id, d.id, d.temp_attempts FROM domains d 
 	"AND d.last_checked_at < $3 " +
 	"ORDER BY d.zone_id, d.id LIMIT $4"
 
-const wantRetryRequeue = "UPDATE domains d " +
+const wantRetryRequeue = "WITH upd AS (UPDATE domains d " +
 	"SET check_state = $3, temp_attempts = d.temp_attempts + 1 " +
 	"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
 	"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id " +
 	"AND d.status = $4 AND d.check_state = $5 " +
-	"RETURNING d.zone_id, d.id"
+	"RETURNING d.zone_id, d.id), " +
+	"zc AS (UPDATE zones AS z " +
+	"SET domains_checked = z.domains_checked - c.n, " +
+	"domains_pending = z.domains_pending + c.n " +
+	"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
+	"WHERE z.id = c.zone_id) " +
+	"SELECT u.zone_id, u.id FROM upd AS u"
 
 const wantRetryFinalize = "UPDATE domains d " +
 	"SET status = $3, temp_attempts = 0 " +

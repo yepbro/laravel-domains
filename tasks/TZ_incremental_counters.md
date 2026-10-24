@@ -189,11 +189,13 @@ COMMENT на колонки/таблицу — по образцу 000012 (вл�
 
 | Переход | Владелец | Дельты зон (по `RETURNING zone_id` GROUP BY) |
 |---|---|---|
-| pending → queued (пачка выборки) | `scheduler/enqueue.go` (T-028) | `pending −n`, `queued +n` |
+| pending → queued (пачка выборки) | `scheduler/enqueue.go` (T-028) | `pending −n`, `queued +n`; охрана `check_state = pending AND status <> deleted` — гонка с delete-файлом (T-019) не даёт двойного `pending −n` (добавлено T-178) |
 | queued → pending (истёкшая аренда) | `scheduler/lease.go` (T-029) | `queued −n`, `pending +n` |
 | done → pending (возрастная перепроверка) | `scheduler/recheck.go` (T-030) | `checked −n`, `pending +n` |
 | done → pending (temp_error, повтор) | `scheduler/retry.go` (T-031) | `checked −n`, `pending +n` |
-| done → pending (принудительно, CLI) | `cmd/crawlerctl/recheck.go` | `checked −n`, `pending +n` |
+| done → pending (принудительно, CLI) | `cmd/crawlerctl/recheck.go` | предчтение `FOR UPDATE`: `checked/queued −n`, `pending +n` |
+| done → pending (новый субдомен, CLI) | `cmd/crawlerctl/manage.go` (T-083) | `checked −n`, `pending +n` (добавлено T-178: перевод пачками done → pending) |
+| queued/pending → done (запись DNS-результата) | `dnsworker/result.go` (T-039) | предчтение `FOR UPDATE` в CTE: `queued −n`/`pending −n`, `checked +n` — главный переход конвейера (добавлено T-178: §6.4 покрывал только запись HTTP-результата, которая идёт уже поверх done) |
 | INSERT новых (status=new, pending) | `ingest/apply_add.go` | `total +n`, `pending +n` |
 | deleted → new/pending (revive) | `ingest/apply_add.go` | `total +n`, `pending +n` (домен был вне базового множества — декрементов нет) |
 | → deleted (по файлу удаления) | `ingest/apply_delete.go` | `total −n`; по `RETURNING check_state` (не меняется оператором): `pending −n` / `queued −n` / `checked −n` |

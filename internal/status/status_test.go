@@ -33,12 +33,8 @@ import (
 // wantZoneStatsSQL / wantThroughputSQL — ожидаемый текст запросов; фейк
 // сопоставляет SQL точно, неожидаемый запрос валит тест громко.
 const wantZoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_unicode, " +
-	"z.is_active, z.domains_total, z.domains_checked, " +
-	"count(d.id) FILTER (WHERE d.check_state = 0 AND d.status <> 6) AS pending, " +
-	"count(d.id) FILTER (WHERE d.check_state = 1) AS queued, " +
-	"count(d.id) FILTER (WHERE d.check_state = 2) AS done " +
-	"FROM zones AS z LEFT JOIN domains AS d ON d.zone_id = z.id " +
-	"GROUP BY z.id ORDER BY z.name"
+	"z.is_active, z.domains_total, z.domains_pending, z.domains_queued, z.domains_checked " +
+	"FROM zones AS z ORDER BY z.name"
 
 const wantThroughputSQL = "SELECT " +
 	"(SELECT count(*) FROM domains WHERE last_checked_at = current_date) AS done_today, " +
@@ -46,9 +42,9 @@ const wantThroughputSQL = "SELECT " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour') AS results_hour, " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour' AND rendered) AS rendered_hour"
 
-const wantDomainStatusSQL = "SELECT status, count(*) FROM domains GROUP BY status ORDER BY status"
+const wantDomainStatusSQL = "SELECT name, value FROM crawler_counters WHERE name LIKE 'status\\_%' ORDER BY name"
 
-const wantLaravelTotalsSQL = "SELECT count(*), " +
+const wantLaravelTotalsSQL = "SELECT (SELECT coalesce(sum(domains_laravel), 0) FROM zones), " +
 	"count(*) FILTER (WHERE updated_at >= now() - interval '24 hours') " +
 	"FROM laravel_domains"
 
@@ -71,20 +67,16 @@ type statusZoneSeed struct {
 	unicode string
 	active  bool
 	total   int64
+	pending int64
+	queued  int64
 	checked int64
 	hasUni  bool // name_unicode не NULL (в SQL — coalesce в '')
 }
 
-// statusDomSeed — домен для агрегата check_state.
-type statusDomSeed struct {
-	zone  int16
-	state model.CheckState
-	stats model.Status
-}
-
-// statusStatusSeed — строка агрегата распределения статусов (§5.5).
+// statusStatusSeed — строка счётчика распределения статусов (§5.5,
+// T-178): имя статуса легенды и значение строки crawler_counters.
 type statusStatusSeed struct {
-	code  int16
+	name  string
 	count int64
 }
 
@@ -132,10 +124,10 @@ type statusGlitch struct {
 // Laravel по часам фейка, сортировка последних находок и ingest-файлов.
 type statusPool struct {
 	zones       []statusZoneSeed
-	domains     []statusDomSeed
 	thr         Throughput
 	domStatuses []statusStatusSeed
 	laravel     []statusLaravelSeed
+	zoneLaravel int64 // сумма zones.domains_laravel (laravelTotalsSQL, T-178)
 	ingest      []statusIngestSeed
 	now         time.Time // часы сервера БД для окон laravelTotalsSQL
 
@@ -155,17 +147,15 @@ func newStatusPool() *statusPool {
 	return &statusPool{now: time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)}
 }
 
-func (p *statusPool) seedZone(id int16, name string, active bool, total, checked int64) {
-	p.zones = append(p.zones, statusZoneSeed{id: id, name: name, active: active, total: total, checked: checked})
+func (p *statusPool) seedZone(id int16, name string, active bool, total, pending, queued, checked int64) {
+	p.zones = append(p.zones, statusZoneSeed{id: id, name: name, active: active,
+		total: total, pending: pending, queued: queued, checked: checked})
 }
 
 // seedZoneUnicode — зона с непустым name_unicode (NULL vs значение).
-func (p *statusPool) seedZoneUnicode(id int16, name, unicode string, active bool, total, checked int64) {
-	p.zones = append(p.zones, statusZoneSeed{id: id, name: name, unicode: unicode, active: active, total: total, checked: checked, hasUni: true})
-}
-
-func (p *statusPool) seedDomain(zone int16, state model.CheckState, stats model.Status) {
-	p.domains = append(p.domains, statusDomSeed{zone: zone, state: state, stats: stats})
+func (p *statusPool) seedZoneUnicode(id int16, name, unicode string, active bool, total, pending, queued, checked int64) {
+	p.zones = append(p.zones, statusZoneSeed{id: id, name: name, unicode: unicode, active: active,
+		total: total, pending: pending, queued: queued, checked: checked, hasUni: true})
 }
 
 func (p *statusPool) setQueryErr(err error) {
@@ -239,7 +229,7 @@ func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows,
 	case domainStatusSQL:
 		rows := make([][]any, len(p.domStatuses))
 		for i, s := range p.domStatuses {
-			rows[i] = []any{s.code, s.count}
+			rows[i] = []any{"status_" + s.name, s.count}
 		}
 		return p.decorate(sql, rows), nil
 	case laravelTotalsSQL:
@@ -249,7 +239,7 @@ func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows,
 				last24h++
 			}
 		}
-		return p.decorate(sql, [][]any{{int64(len(p.laravel)), last24h}}), nil
+		return p.decorate(sql, [][]any{{p.zoneLaravel, last24h}}), nil
 	case laravelRecentSQL:
 		// Модель pool_size=1: второй запрос при открытом первом set
 		// занял бы единственное соединение (дедлок, комментарий
@@ -289,23 +279,9 @@ func (p *statusPool) decorate(sql string, rows [][]any) *statusRows {
 	return r
 }
 
-// zoneRowsData применяет семантику zoneStatsSQL к сидам.
+// zoneRowsData применяет семантику zoneStatsSQL к сидам: справочник
+// зон с инкрементальными счётчиками (T-178) — без прохода domains.
 func (p *statusPool) zoneRowsData() [][]any {
-	pending := make(map[int16]int64)
-	queued := make(map[int16]int64)
-	done := make(map[int16]int64)
-	for _, d := range p.domains {
-		switch d.state {
-		case model.CheckStatePending:
-			if d.stats != model.StatusDeleted { // status <> deleted
-				pending[d.zone]++
-			}
-		case model.CheckStateQueued:
-			queued[d.zone]++ // без фильтра статуса: домен в работе
-		case model.CheckStateDone:
-			done[d.zone]++
-		}
-	}
 	sorted := append([]statusZoneSeed(nil), p.zones...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].name < sorted[j].name })
 	rows := make([][]any, len(sorted))
@@ -314,8 +290,7 @@ func (p *statusPool) zoneRowsData() [][]any {
 		if z.hasUni {
 			uni = z.unicode // coalesce(name_unicode, '')
 		}
-		rows[i] = []any{z.id, z.name, uni, z.active, z.total, z.checked,
-			pending[z.id], queued[z.id], done[z.id]}
+		rows[i] = []any{z.id, z.name, uni, z.active, z.total, z.pending, z.queued, z.checked}
 	}
 	return rows
 }
@@ -507,22 +482,16 @@ func TestStatusSQLContract(t *testing.T) {
 	}
 }
 
-// TestFetchZoneStats — агрегат по зонам: pending без deleted, queued/done
-// без фильтра статуса, зона без доменов (LEFT JOIN) в сводке, сортировка
-// по имени, unicode и флаг активности дочитываются.
+// TestFetchZoneStats — сводка зон из счётчиков справочника (T-178):
+// без JOIN domains; pending/queued/checked — колонки зон (базовое
+// множество status <> deleted ведут дельты и реконсиляция), Done —
+// та же колонка domains_checked; сортировка по имени, unicode и флаг
+// активности дочитываются.
 func TestFetchZoneStats(t *testing.T) {
 	pool := newStatusPool()
-	pool.seedZoneUnicode(2, "com", "com", true, 1000, 400)
-	pool.seedZone(1, "crawl.test", true, 100, 40)
-	pool.seedZone(3, "empty.test", false, 0, 0) // LEFT JOIN: доменов нет
-
-	pool.seedDomain(1, model.CheckStatePending, model.StatusNew)
-	pool.seedDomain(1, model.CheckStatePending, model.StatusNew)
-	pool.seedDomain(1, model.CheckStatePending, model.StatusDeleted) // не ждёт проверки
-	pool.seedDomain(1, model.CheckStateQueued, model.StatusNew)
-	pool.seedDomain(1, model.CheckStateQueued, model.StatusDeleted) // в работе
-	pool.seedDomain(1, model.CheckStateDone, model.StatusAlive)
-	pool.seedDomain(2, model.CheckStateDone, model.StatusNotDelegated)
+	pool.seedZoneUnicode(2, "com", "com", true, 1000, 3, 1, 400)
+	pool.seedZone(1, "crawl.test", true, 100, 2, 2, 40)
+	pool.seedZone(3, "empty.test", false, 0, 0, 0, 0) // зона без доменов
 
 	zones, err := FetchZoneStats(context.Background(), pool)
 	if err != nil {
@@ -532,9 +501,10 @@ func TestFetchZoneStats(t *testing.T) {
 		t.Fatalf("запросы = %q, хочу один zoneStatsSQL", calls)
 	}
 	want := []ZoneStats{
-		{ID: 2, Name: "com", NameUnicode: "com", IsActive: true, DomainsTotal: 1000, DomainsChecked: 400, Done: 1},
+		{ID: 2, Name: "com", NameUnicode: "com", IsActive: true, DomainsTotal: 1000,
+			DomainsChecked: 400, Pending: 3, Queued: 1, Done: 400},
 		{ID: 1, Name: "crawl.test", IsActive: true, DomainsTotal: 100, DomainsChecked: 40,
-			Pending: 2, Queued: 2, Done: 1},
+			Pending: 2, Queued: 2, Done: 40},
 		{ID: 3, Name: "empty.test", IsActive: false},
 	}
 	if !reflect.DeepEqual(zones, want) {
@@ -616,9 +586,8 @@ func TestFetchRowDegradations(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := newStatusPool()
-			pool.seedZone(1, "crawl.test", true, 1, 0)
-			pool.seedDomain(1, model.CheckStatePending, model.StatusNew)
-			pool.domStatuses = []statusStatusSeed{{int16(model.StatusNew), 1}}
+			pool.seedZone(1, "crawl.test", true, 1, 1, 0, 0)
+			pool.domStatuses = []statusStatusSeed{{model.StatusNew.String(), 1}}
 			pool.ingest = []statusIngestSeed{{id: 1}}
 			pool.setGlitch(tc.sql, tc.glitch)
 			var err error
@@ -679,16 +648,18 @@ func int16Ptr(v int16) *int16 { return &v }
 
 func int64Ptr(v int64) *int64 { return &v }
 
-// TestFetchDomainStatuses — распределение по именам ТЗ 6.2: все статусы
-// model.Statuses с нулями (полная легенда), счётчики по кодам,
-// неизвестный код — Status(N); ошибки и nil-пул.
+// TestFetchDomainStatuses — распределение по именам ТЗ 6.2 из строк
+// status_* crawler_counters (T-178): все статусы model.Statuses с нулями
+// (полная легенда), отсутствующие строки — 0; строка с именем вне
+// легенды не отображается (реконсиляция пишет только model.Statuses —
+// чужая строка это ручная правка таблицы); ошибки и nil-пул.
 func TestFetchDomainStatuses(t *testing.T) {
 	pool := newStatusPool()
 	pool.domStatuses = []statusStatusSeed{
-		{int16(model.StatusNew), 1000},
-		{int16(model.StatusAlive), 40},
-		{int16(model.StatusDeleted), 3},
-		{9, 1}, // код вне таблицы ТЗ 6.2 — честное имя, не потеря
+		{model.StatusNew.String(), 1000},
+		{model.StatusAlive.String(), 40},
+		{model.StatusDeleted.String(), 3},
+		{"unknown", 1}, // имя вне легенды model.Statuses — не отображается
 	}
 	got, err := FetchDomainStatuses(context.Background(), pool)
 	if err != nil {
@@ -699,7 +670,7 @@ func TestFetchDomainStatuses(t *testing.T) {
 	}
 	want := map[string]int64{
 		"new": 1000, "not_delegated": 0, "delegated_no_address": 0, "no_http": 0,
-		"alive": 40, "temp_error": 0, "deleted": 3, "invalid": 0, "Status(9)": 1,
+		"alive": 40, "temp_error": 0, "deleted": 3, "invalid": 0,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("statuses = %v\nwant %v", got, want)
@@ -735,7 +706,8 @@ func TestFetchDomainStatuses(t *testing.T) {
 // DESC, LIMIT 10, ver_min/ver_max NULL → пустые строки.
 func TestFetchLaravelStats(t *testing.T) {
 	pool := newStatusPool()
-	pool.seedZone(1, "crawl.test", true, 0, 0)
+	pool.seedZone(1, "crawl.test", true, 0, 0, 0, 0)
+	pool.zoneLaravel = 3 // сумма zones.domains_laravel (T-178): Total секции
 	fresh := pool.now.Add(-2 * time.Hour)
 	stale := pool.now.Add(-30 * time.Hour)
 	pool.laravel = []statusLaravelSeed{
@@ -779,7 +751,7 @@ func TestFetchLaravelStats(t *testing.T) {
 
 	// Ошибка любого из двух запросов — ошибка секции целиком.
 	pool = newStatusPool()
-	pool.seedZone(1, "crawl.test", true, 0, 0)
+	pool.seedZone(1, "crawl.test", true, 0, 0, 0, 0)
 	pool.laravel = []statusLaravelSeed{{zone: 1, domain: 1, label: "shop", updatedAt: fresh}}
 	pool.setQueryErr(errors.New("boom"))
 	if _, err := FetchLaravelStats(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: laravel:") {
@@ -799,7 +771,7 @@ func TestFetchLaravelStats(t *testing.T) {
 func TestFetchLaravelStatsDegradations(t *testing.T) {
 	seeded := func(glitches map[string]statusGlitch) *statusPool {
 		pool := newStatusPool()
-		pool.seedZone(1, "crawl.test", true, 0, 0)
+		pool.seedZone(1, "crawl.test", true, 0, 0, 0, 0)
 		pool.laravel = []statusLaravelSeed{{zone: 1, domain: 1, label: "shop", updatedAt: pool.now}}
 		for sql, g := range glitches {
 			pool.setGlitch(sql, g)

@@ -23,9 +23,10 @@ import (
 )
 
 // applyAddPool — db.DB для ApplyAdd: записывает порядок операций, SQL и
-// аргументы; Exec возвращает заготовленные CommandTag/ошибку по очереди
-// вызовов, Query — заготовленное число уникальных доменов. Как и реальный
-// pgx, отказывается работать с отменённым контекстом.
+// аргументы; Exec (очистка партии) возвращает заготовленные
+// CommandTag/ошибку по очереди вызовов, Query (CTE вставки/возврата с
+// дельтами зон T-178 и подсчёт) — заготовленные числа строк по очереди.
+// Как и реальный pgx, отказывается работать с отменённым контекстом.
 type applyAddPool struct {
 	ops       []string // порядок: "exec:<sql>", "query:<sql>"
 	execSQL   []string
@@ -35,7 +36,7 @@ type applyAddPool struct {
 	execTags  []pgconn.CommandTag // результат каждого Exec по очереди
 	execErrs  []error             // ошибка i-го Exec (nil — успех)
 	counts    []int64             // результат каждого Query по очереди
-	queryErr  error
+	queryErrs []error             // ошибка i-го Query (nil — успех)
 }
 
 var _ db.DB = (*applyAddPool)(nil)
@@ -69,8 +70,8 @@ func (p *applyAddPool) Query(ctx context.Context, sql string, args ...any) (pgx.
 	p.querySQL = append(p.querySQL, sql)
 	p.queryArgs = append(p.queryArgs, args)
 	p.ops = append(p.ops, "query:"+sql)
-	if p.queryErr != nil {
-		return nil, p.queryErr
+	if i < len(p.queryErrs) && p.queryErrs[i] != nil {
+		return nil, p.queryErrs[i]
 	}
 	count := int64(0)
 	if i < len(p.counts) {
@@ -123,11 +124,13 @@ func (r *applyAddRows) Conn() *pgx.Conn      { return nil }
 func (r *applyAddRows) TypeMap() *pgtype.Map { return nil }
 
 // applyAddOps — ожидаемый порядок операций применения (вставка → возврат
-// удалённых → подсчёт → очистка).
+// удалённых → подсчёт → очистка). Вставка и возврат — CTE-операторы с
+// дельтами счётчиков зон (T-178): результат читается Query (внешний
+// SELECT числа строк), очистка — Exec.
 func applyAddOps() []string {
 	return []string{
-		"exec:" + insertAddSQL,
-		"exec:" + reviveAddSQL,
+		"query:" + insertAddSQL,
+		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
 	}
@@ -137,11 +140,9 @@ func TestApplyAdd(t *testing.T) {
 	b := validBatch(t) // зона 7, add — как после EnsureZone и Stage
 	pool := &applyAddPool{
 		execTags: []pgconn.CommandTag{
-			pgconn.NewCommandTag("INSERT 5"),  // вставлено новых
-			pgconn.NewCommandTag("UPDATE 3"),  // возвращено из deleted
 			pgconn.NewCommandTag("DELETE 10"), // партия очищена
 		},
-		counts: []int64{10}, // уникальных меток в партии
+		counts: []int64{5, 3, 10}, // вставлено новых, возвращено из deleted, уникальных меток
 	}
 
 	res, err := ApplyAdd(context.Background(), pool, b)
@@ -160,18 +161,15 @@ func TestApplyAdd(t *testing.T) {
 		t.Errorf("порядок операций:\n%s\nwant:\n%s", got, strings.Join(applyAddOps(), "\n"))
 	}
 
-	// Вставка и возврат адресуют свою партию и только строки add.
+	// Вставка, возврат и подсчёт адресуют свою партию и только строки add.
 	wantArgs := []any{[]byte(b.ID[:]), int16(model.ActionAdd)}
-	for i, name := range []string{"вставка", "возврат"} {
-		if !reflect.DeepEqual(pool.execArgs[i], wantArgs) {
-			t.Errorf("аргументы %s = %v, want [batch_id, action=%d]", name, pool.execArgs[i], int16(model.ActionAdd))
+	for i, name := range []string{"вставка", "возврат", "подсчёт"} {
+		if !reflect.DeepEqual(pool.queryArgs[i], wantArgs) {
+			t.Errorf("аргументы %s = %v, want [batch_id, action=%d]", name, pool.queryArgs[i], int16(model.ActionAdd))
 		}
 	}
-	if len(pool.queryArgs) != 1 || !reflect.DeepEqual(pool.queryArgs[0], wantArgs) {
-		t.Errorf("аргументы подсчёта = %v, want [batch_id, action]", pool.queryArgs)
-	}
 	// Очистка — ClearBatch своей партии.
-	if len(pool.execArgs) != 3 || !reflect.DeepEqual(pool.execArgs[2][0], []byte(b.ID[:])) {
+	if len(pool.execArgs) != 1 || !reflect.DeepEqual(pool.execArgs[0][0], []byte(b.ID[:])) {
 		t.Errorf("очистка = %v, want ClearBatch(batch_id)", pool.execArgs)
 	}
 }
@@ -195,19 +193,15 @@ func TestApplyAdd_EmptyBatch(t *testing.T) {
 }
 
 // TestApplyAdd_Reapply — повторное применение той же партии (ТЗ 3.4):
-// после первой попытки вставка конфликтует, возврат уже выполнен —
-// данные не меняются, счётчики повторного прогона нулевые.
+// после первой попытки вставка конфликтует (CTE считает 0), возврат уже
+// выполнен — данные не меняются, счётчики повторного прогона нулевые.
 func TestApplyAdd_Reapply(t *testing.T) {
 	pool := &applyAddPool{
 		execTags: []pgconn.CommandTag{
-			pgconn.NewCommandTag("INSERT 5"),
-			pgconn.NewCommandTag("UPDATE 3"),
 			pgconn.NewCommandTag("DELETE 10"),
-			pgconn.NewCommandTag("INSERT 0"), // повтор: вставлять нечего
-			pgconn.NewCommandTag("UPDATE 0"), // возвращать некого
 			pgconn.NewCommandTag("DELETE 0"), // staging уже пуст
 		},
-		counts: []int64{10, 0},
+		counts: []int64{5, 3, 10, 0, 0, 0},
 	}
 	b := validBatch(t)
 
@@ -255,25 +249,26 @@ func TestApplyAdd_Validation(t *testing.T) {
 func TestApplyAdd_StepErrors(t *testing.T) {
 	boom := errors.New("соединение потеряно")
 	cases := []struct {
-		name     string
-		execErrs []error
-		wantOps  int    // обращений к БД до сбоя включительно
-		want     string // фрагмент ожидаемой ошибки
+		name      string
+		queryErrs []error // по одному на Query: вставка, возврат, подсчёт
+		execErrs  []error // очистка
+		wantOps   int     // обращений к БД до сбоя включительно
+		want      string  // фрагмент ожидаемой ошибки
 	}{
-		{"сбой вставки", []error{boom, nil, nil}, 1, "вставка новых доменов"},
-		{"сбой возврата", []error{nil, boom, nil}, 2, "возврат удалённых"},
-		{"сбой очистки", []error{nil, nil, boom}, 4, "очистка партии"},
+		{"сбой вставки", []error{boom, nil, nil}, nil, 1, "вставка новых доменов"},
+		{"сбой возврата", []error{nil, boom, nil}, nil, 2, "возврат удалённых"},
+		{"сбой подсчёта", []error{nil, nil, boom}, nil, 3, "подсчёт доменов"},
+		{"сбой очистки", nil, []error{boom}, 4, "очистка партии"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := &applyAddPool{
 				execTags: []pgconn.CommandTag{
-					pgconn.NewCommandTag("INSERT 5"),
-					pgconn.NewCommandTag("UPDATE 3"),
 					pgconn.NewCommandTag("DELETE 10"),
 				},
-				execErrs: tc.execErrs,
-				counts:   []int64{10},
+				execErrs:  tc.execErrs,
+				queryErrs: tc.queryErrs,
+				counts:    []int64{5, 3, 10},
 			}
 			res, err := ApplyAdd(context.Background(), pool, validBatch(t))
 			if err == nil || !strings.Contains(err.Error(), tc.want) || !errors.Is(err, boom) {
@@ -288,6 +283,9 @@ func TestApplyAdd_StepErrors(t *testing.T) {
 			if tc.wantOps > 1 && res.Inserted != 5 {
 				t.Errorf("Inserted = %d, want 5 (шаг завершён до сбоя)", res.Inserted)
 			}
+			if tc.wantOps > 2 && res.Revived != 3 {
+				t.Errorf("Revived = %d, want 3 (шаг завершён до сбоя)", res.Revived)
+			}
 		})
 	}
 }
@@ -295,11 +293,10 @@ func TestApplyAdd_StepErrors(t *testing.T) {
 func TestApplyAdd_CountError(t *testing.T) {
 	pool := &applyAddPool{
 		execTags: []pgconn.CommandTag{
-			pgconn.NewCommandTag("INSERT 5"),
-			pgconn.NewCommandTag("UPDATE 3"),
+			pgconn.NewCommandTag("DELETE 10"),
 		},
-		counts:   []int64{0},
-		queryErr: errors.New("соединение потеряно"),
+		counts:    []int64{5, 3, 0},
+		queryErrs: []error{nil, nil, errors.New("соединение потеряно")},
 	}
 
 	res, err := ApplyAdd(context.Background(), pool, validBatch(t))
@@ -320,10 +317,9 @@ func TestApplyAdd_CountError(t *testing.T) {
 func TestApplyAdd_CountInvariant(t *testing.T) {
 	pool := &applyAddPool{
 		execTags: []pgconn.CommandTag{
-			pgconn.NewCommandTag("INSERT 5"),
-			pgconn.NewCommandTag("UPDATE 3"),
+			pgconn.NewCommandTag("DELETE 10"),
 		},
-		counts: []int64{1}, // меньше 5 + 3
+		counts: []int64{5, 3, 1}, // уникальных 1 < 5 + 3
 	}
 
 	_, err := ApplyAdd(context.Background(), pool, validBatch(t))
@@ -355,18 +351,30 @@ func TestApplyAdd_ContextCanceled(t *testing.T) {
 // ---------------------------------------------------------------- контракт SQL
 
 const (
-	wantAddInsertSQL = "INSERT INTO domains (zone_id, label, flags) " +
+	wantAddInsertSQL = "WITH ins AS (INSERT INTO domains (zone_id, label, flags) " +
 		"SELECT s.zone_id, s.label, CASE WHEN s.label ILIKE 'xn--%' OR s.label ILIKE '%.xn--%' THEN 1 ELSE 0 END " +
 		"FROM ingest_stage AS s " +
 		"WHERE s.batch_id = $1 AND s.action = $2 " +
-		"ON CONFLICT DO NOTHING"
+		"ON CONFLICT DO NOTHING RETURNING zone_id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_total = z.domains_total + c.n, " +
+		"domains_pending = z.domains_pending + c.n " +
+		"FROM (SELECT zone_id, count(*) AS n FROM ins GROUP BY zone_id) AS c " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM ins"
 
-	wantAddReviveSQL = "UPDATE domains AS d " +
+	wantAddReviveSQL = "WITH rev AS (UPDATE domains AS d " +
 		"SET status = 0, check_state = 0, queued_at = NULL " +
 		"FROM ingest_stage AS s " +
 		"WHERE s.batch_id = $1 AND s.action = $2 " +
 		"AND d.zone_id = s.zone_id AND d.label = s.label " +
-		"AND d.status = 6"
+		"AND d.status = 6 RETURNING d.zone_id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_total = z.domains_total + c.n, " +
+		"domains_pending = z.domains_pending + c.n " +
+		"FROM (SELECT zone_id, count(*) AS n FROM rev GROUP BY zone_id) AS c " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM rev"
 
 	wantAddCountSQL = "SELECT count(*) FROM (" +
 		"SELECT DISTINCT s.zone_id, s.label FROM ingest_stage AS s " +

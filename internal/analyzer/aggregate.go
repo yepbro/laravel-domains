@@ -118,6 +118,34 @@ var (
 	// пакета).
 	aggregateHistorySQL = "INSERT INTO laravel_history (zone_id, domain_id, appeared) " +
 		"VALUES ($1::int2, $2::int8, $3)"
+
+	// aggregateZoneLaravelSQL — дельта Laravel-счётчика зоны при
+	// переходе наличия строки laravel_domains (T-178, ТЗИ §6.5):
+	// выполняется в транзакции пересчёта — откат откатывает пару
+	// «строка + счётчик». Переходы считаются по факту (existed против
+	// результата), а не только по fresh: переанализ тоже меняет
+	// множество laravel_domains, реконсиляция (агрегат count(*)) считает
+	// строки независимо от их происхождения. RowsAffected != 1 — строки
+	// зоны нет (ручная правка справочника): молчаливый дрейф недопустим.
+	aggregateZoneLaravelSQL = "UPDATE zones " +
+		"SET domains_laravel = domains_laravel + $1::int8 WHERE id = $2::int2"
+
+	// aggregateCounterDeltaSQL — дельта кумулятива истории appeared/lost
+	// в crawler_counters (T-178, ТЗИ §6.5): upsert с наращиванием —
+	// строку создаёт первая реконсиляция (ТЗИ §5), инкремент до неё
+	// сам себе гарантирует строку (в отличие от render_pending T-175,
+	// чью строку бэкфиллит миграция 000015). Той же транзакцией, что и
+	// строка laravel_history: откат откатывает пару.
+	aggregateCounterDeltaSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ($1, $2::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
+)
+
+// Имена строк кумулятивов истории (crawler_counters, T-178).
+const (
+	counterLaravelAppeared = "laravel_appeared_total"
+	counterLaravelLost     = "laravel_lost_total"
 )
 
 // aggregateDomain пересчитывает строку laravel_domains домена по его
@@ -174,10 +202,19 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 		// вырезание fresh — оно прикрыто TestAggregate_History (переанализ
 		// не пишет историю); trade-off §4 docs/mutation-testing.md.
 		// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer
-		if tag.RowsAffected() > 0 && fresh && existed {
-			// Строка была и исчезла — lost (только свежий эпизод, T-118).
-			if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, false); err != nil {
-				return fmt.Errorf("запись истории (lost): %w", err)
+		if tag.RowsAffected() > 0 && existed {
+			// Строка была и исчезла — счётчик зоны −1 (переход наличия,
+			// T-178); при fresh — lost в журнале и кумулятиве (T-118).
+			if err := aggregateShiftZoneLaravel(ctx, tx, zoneID, -1); err != nil {
+				return err
+			}
+			if fresh {
+				if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, false); err != nil {
+					return fmt.Errorf("запись истории (lost): %w", err)
+				}
+				if err := aggregateBumpHistoryCounter(ctx, tx, counterLaravelLost, 1); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -191,11 +228,48 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("запись строки домена: затронуто %d строк", tag.RowsAffected())
 	}
-	if !existed && fresh {
-		// Строки не было и появилась — appeared (только свежий эпизод).
+	if existed {
+		return nil
+	}
+	// Строки не было и появилась — счётчик зоны +1 (переход наличия,
+	// T-178; независимо от fresh — переанализ тоже меняет множество);
+	// при fresh — appeared в журнале и кумулятиве (T-118).
+	if err := aggregateShiftZoneLaravel(ctx, tx, zoneID, 1); err != nil {
+		return err
+	}
+	if fresh {
 		if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, true); err != nil {
 			return fmt.Errorf("запись истории (appeared): %w", err)
 		}
+		if err := aggregateBumpHistoryCounter(ctx, tx, counterLaravelAppeared, 1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// aggregateShiftZoneLaravel — дельта zones.domains_laravel в транзакции
+// пересчёта (aggregateZoneLaravelSQL, T-178).
+func aggregateShiftZoneLaravel(ctx context.Context, tx pgx.Tx, zoneID int16, delta int64) error {
+	tag, err := tx.Exec(ctx, aggregateZoneLaravelSQL, delta, zoneID)
+	if err != nil {
+		return fmt.Errorf("счётчик Laravel-зоны: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("счётчик Laravel-зоны: затронуто %d строк (строка зоны %d обязательна)", tag.RowsAffected(), zoneID)
+	}
+	return nil
+}
+
+// aggregateBumpHistoryCounter — инкремент кумулятива appeared/lost в
+// транзакции пересчёта (aggregateCounterDeltaSQL, T-178).
+func aggregateBumpHistoryCounter(ctx context.Context, tx pgx.Tx, name string, delta int64) error {
+	tag, err := tx.Exec(ctx, aggregateCounterDeltaSQL, name, delta)
+	if err != nil {
+		return fmt.Errorf("счётчик истории (%s): %w", name, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("счётчик истории (%s): затронуто %d строк", name, tag.RowsAffected())
 	}
 	return nil
 }

@@ -1,11 +1,12 @@
-// Сервис monitor (ТЗ 5.9): два цикла в OnRun — периодический пакетный
-// пересчёт кэширующих счётчиков прогресса зон zones.domains_total /
-// domains_checked (internal/monitor.ZoneStatsLoop, T-078) с периодом
-// monitor.zone_stats_interval и оценка алертов минимального набора ТЗ 5.9
-// (internal/monitor.AlertsLoop, T-080): доля ошибок DNS, переполнение
-// очередей, остановка прогресса, свободное место каталога контента,
-// износ NVMe (SMART), всплеск мусорных content_hash очистки ingest
-// (T-099, зонд /metrics), OOM и рестарты юнитов crawler (T-145,
+// Сервис monitor (ТЗ 5.9): фоновый цикл реконсиляции инкрементальных
+// счётчиков конвейера (internal/monitor.ZoneStatsLoop, T-178: один
+// совмещённый проход — колонки зон + глобальные скаляры
+// crawler_counters — раз в monitor.zone_stats_interval, единственный
+// полный проход domains в стационаре) и оценка алертов минимального
+// набора ТЗ 5.9 (internal/monitor.AlertsLoop, T-080): доля ошибок DNS,
+// переполнение очередей, остановка прогресса, свободное место каталога
+// контента, износ NVMe (SMART), всплеск мусорных content_hash очистки
+// ingest (T-099, зонд /metrics), OOM и рестарты юнитов crawler (T-145,
 // systemctl + cgroup v2), неразобранный q:dead и память Redis (T-154,
 // XLEN + INFO memory); недостающие пороги T-162 — абсолютный минимум
 // диска (Warn/эскалация), троттлинг MemoryHigh, замороженная очередь
@@ -14,7 +15,8 @@
 // доставляются в Telegram (TelegramNotifier → telegram-notify.sh
 // --message). Ещё два цикла — отчёт системной нагрузки (T-173) и
 // медленные запросы PostgreSQL (T-177: pg_stat_activity → Telegram той
-// же доставкой), плюс цикл gauge рендер-долга (T-175).
+// же доставкой), плюс цикл gauge рендер-долга (T-175) и кумулятивы
+// истории детекции appeared/lost из строк счётчиков (T-118/T-178).
 // Каркас — internal/service: миграции, пул БД (OnDBPool), пробы /livez +
 // /healthz, /metrics, graceful shutdown (ТЗ 3.4).
 package main
@@ -108,16 +110,17 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Фоновые циклы: пересчёт счётчиков зон (T-078; период —
-	// monitor.zone_stats_interval, T-161 поднял дефолт до 5 мин по замеру
-	// §12; реестр — метрики длительности прохода и пропусков тиков),
-	// gauge серой зоны Laravel-находок (T-115) и счётчики истории
-	// детекции appeared/lost (T-118) — все периодические проходы по БД,
-	// завершаются отменой ctx. Четвёртый цикл — отчёт системной
-	// нагрузки (T-173), пятый — медленные запросы PostgreSQL (T-177):
-	// оба подключаются ниже, после сборки Telegram-доставки. Шестой —
-	// рендер-долг (T-175): gauge crawler_render_pending_domains и сводка
-	// в журнал (счётчик флагов из БД + лаг q:render тем же гейтом).
+	// Фоновые циклы: реконсиляция инкрементальных счётчиков (T-178;
+	// период — monitor.zone_stats_interval, единственный полный проход
+	// domains в стационаре; реестр — длительность прохода, пропуски
+	// тиков и gauge дрейфа crawler_counters_drift), gauge серой зоны
+	// Laravel-находок (T-115) и кумулятивы истории детекции
+	// appeared/lost (T-118; строки счётчиков — T-178). Четвёртый цикл —
+	// отчёт системной нагрузки (T-173), пятый — медленные запросы
+	// PostgreSQL (T-177): оба подключаются ниже, после сборки
+	// Telegram-доставки. Шестой — рендер-долг (T-175): gauge
+	// crawler_render_pending_domains и сводка в журнал (счётчик флагов
+	// из БД + лаг q:render тем же гейтом).
 	bg := make(chan error, 6)
 	go func() {
 		bg <- monitor.ZoneStatsLoop(ctx, pool, reg, monitor.ZoneStatsOptions{

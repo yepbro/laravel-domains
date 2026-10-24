@@ -25,10 +25,10 @@ func (c *cacheClock) Now() time.Time       { return c.now }
 
 func newCacheTestPool() *statusPool {
 	p := newStatusPool()
-	p.seedZone(1, "crawl.test", true, 100, 40)
-	p.seedDomain(1, model.CheckStatePending, model.StatusAlive)
+	p.seedZone(1, "crawl.test", true, 100, 30, 5, 40)
+	p.zoneLaravel = 4
 	p.thr = Throughput{DoneToday: 10, ElapsedSec: 3600, ResultsHour: 5, RenderedHour: 2}
-	p.domStatuses = []statusStatusSeed{{code: 1, count: 7}}
+	p.domStatuses = []statusStatusSeed{{name: model.StatusNotDelegated.String(), count: 7}}
 	return p
 }
 
@@ -120,7 +120,7 @@ func TestCacheSectionsIndependent(t *testing.T) {
 	if n := countSQL(calls, "AS done_today"); n != 1 {
 		t.Errorf("выборок темпа = %d, want 1 (запись жива)", n)
 	}
-	if n := countSQL(calls, "GROUP BY status"); n != 1 {
+	if n := countSQL(calls, "FROM crawler_counters"); n != 1 {
 		t.Errorf("выборок статусов = %d, want 1 (запись жива)", n)
 	}
 }

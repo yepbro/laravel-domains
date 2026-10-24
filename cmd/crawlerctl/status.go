@@ -67,8 +67,8 @@ func percentMark(checked, total int64) string {
 // (текстовые колонки влево, числа вправо), очереди, скорость, цикл.
 // lens == nil — Redis недоступен, очереди «н/д».
 func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, thr status.Throughput, rates status.Rates, lens map[string]int64) {
-	out(w, "зоны: всего/проверено — счётчики zones (обновляет monitor, ТЗ 5.9);\n"+
-		"pending/queued/done — агрегат domains по check_state (deleted не ждёт проверки)\n\n")
+	out(w, "зоны: всего/проверено/pending/queued/done — инкрементальные счётчики zones\n"+
+		"(дельты переходов + реконсиляция monitor, T-178; deleted вне базового множества)\n\n")
 
 	// Колонки: зона и акт — текст, остальные — числа (выравнивание
 	// вправо). Имя зоны — punycode (каноническая форма, как каталог

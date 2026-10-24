@@ -318,6 +318,12 @@ crawlerctl check <домен>                  # живая проверка д�
                                           # результат — только в stdout;
                                           # поставить домен на настоящий
                                           # цикл с записью в БД — recheck
+crawlerctl counters list|recount|verify  # инкрементальные счётчики
+                                           # конвейера (T-178): значения,
+                                           # ручная реконсиляция (--zone),
+                                           # сверка с живыми агрегатами
+                                           # без записи (код 0/1); разбор
+                                           # дрейфа — docs/runbooks.md §7
 crawlerctl seed / test-rules             # dev-команды (make seed, make test-rules)
 ```
 

@@ -133,8 +133,9 @@ func (r *historyRows) TypeMap() *pgtype.Map   { return nil }
 
 // --- тесты --------------------------------------------------------------------
 
-const wantHistoryStatsSQL = "SELECT count(*) FILTER (WHERE appeared), " +
-	"count(*) FILTER (WHERE NOT appeared) FROM laravel_history"
+const wantHistoryStatsSQL = "SELECT coalesce(max(value) FILTER (WHERE name = 'laravel_appeared_total'), 0), " +
+	"coalesce(max(value) FILTER (WHERE name = 'laravel_lost_total'), 0) " +
+	"FROM crawler_counters WHERE name IN ('laravel_appeared_total', 'laravel_lost_total')"
 
 func TestHistoryStatsOnceSQL(t *testing.T) {
 	pool := &historystatsFakePool{stats: [][2]int64{{12, 3}}}

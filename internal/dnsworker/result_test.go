@@ -207,10 +207,11 @@ func (p *resultFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx
 	return 0, errors.New("resultFakePool: CopyFrom не должен вызываться")
 }
 
-func (p *resultFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if err := ctx.Err(); err != nil {
-		return pgconn.CommandTag{}, err
-	}
+// recordExec — учёт одного оператора записи (T-178: операторы записи
+// результата — CTE с внешним SELECT count, идут через Query; протокол и
+// заготовки тегов/ошибок — общие с Exec): возвращает число переведённых
+// строк (тег «UPDATE N»).
+func (p *resultFakePool) recordExec(sql string, args ...any) (int64, error) {
 	p.mu.Lock()
 	p.execs = append(p.execs, resultExec{sql: sql, args: args})
 	i := len(p.execs) - 1
@@ -218,15 +219,29 @@ func (p *resultFakePool) Exec(ctx context.Context, sql string, args ...any) (pgc
 	p.j.record(resultEvExec, sql, args...)
 
 	if p.execErr != nil {
-		return pgconn.CommandTag{}, p.execErr
+		return 0, p.execErr
 	}
 	if i < len(p.execErrs) && p.execErrs[i] != nil {
-		return pgconn.CommandTag{}, p.execErrs[i]
+		return 0, p.execErrs[i]
 	}
 	if i < len(p.execTags) {
-		return p.execTags[i], nil
+		var n int
+		if _, err := fmt.Sscanf(p.execTags[i].String(), "UPDATE %d", &n); err == nil {
+			return int64(n), nil
+		}
 	}
-	return pgconn.NewCommandTag("UPDATE 1"), nil
+	return 1, nil
+}
+
+func (p *resultFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if err := ctx.Err(); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	n, err := p.recordExec(sql, args...)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", n)), nil
 }
 
 func (p *resultFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -244,6 +259,14 @@ func (p *resultFakePool) Query(ctx context.Context, sql string, args ...any) (pg
 			rows[i] = []any{s.ID, s.Label, s.Enabled}
 		}
 		return resultFakeRowsOf(rows...), nil
+	case resultUpdateStatusSQL, resultUpdateKeepStatusSQL, resultInvalidSQL:
+		// Операторы записи результата (T-178): CTE с внешним SELECT
+		// count(*) — результат одной строкой.
+		n, err := p.recordExec(sql, args...)
+		if err != nil {
+			return nil, err
+		}
+		return resultFakeRowsOf([]any{n}), nil
 	case resultPendingSQL:
 		p.j.record(resultEvQueryPend, sql, args...)
 		p.mu.Lock()
@@ -569,23 +592,51 @@ func resultWaitAck(j *resultJournal, timeout time.Duration) bool {
 // коды схемы ТЗ 6.1/6.2: done = 2, temp_error = 5, deleted = 6; бит
 // http_published = 4, маска снятия — знаковое ~4 = −5, T-108).
 func TestResultSQLContract(t *testing.T) {
-	wantStatus := "UPDATE domains AS t " +
+	// Операторы записи результата — CTE (T-178): предчтение старого
+	// состояния FOR UPDATE, перевод, дельты счётчиков зоны по старому
+	// состоянию; внешний SELECT — счёт переведённых строк.
+	const cteTail = "FOR UPDATE), " +
+		"upd AS (UPDATE domains AS t "
+	const cteShift = "FROM s WHERE t.zone_id = s.zone_id AND t.id = s.id " +
+		"RETURNING s.check_state, t.zone_id), " +
+		"zc AS (UPDATE zones AS z " +
+		"SET domains_pending = z.domains_pending - c.n_pending, " +
+		"domains_queued = z.domains_queued - c.n_queued, " +
+		"domains_checked = z.domains_checked + c.n " +
+		"FROM (SELECT zone_id, count(*) AS n, count(*) FILTER (WHERE check_state = 0) AS n_pending, " +
+		"count(*) FILTER (WHERE check_state = 1) AS n_queued FROM upd GROUP BY zone_id) AS c " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT count(*) FROM upd"
+	const cteHead = "WITH s AS (" +
+		"SELECT zone_id, id, check_state FROM domains " +
+		"WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> 6 AND check_state <> 2 "
+
+	wantStatus := cteHead + cteTail +
 		"SET dns_mask = $3::int8, status = $4::int2, " +
 		"temp_attempts = CASE WHEN $4::int2 = 5 THEN t.temp_attempts ELSE 0 END, " +
 		"flags = (t.flags & -5)::int2, " +
 		"check_state = 2, queued_at = NULL, last_checked_at = now() " +
-		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> 6 AND t.check_state <> 2"
+		cteShift
 	if resultUpdateStatusSQL != wantStatus {
 		t.Errorf("resultUpdateStatusSQL = %q,\nwant %q", resultUpdateStatusSQL, wantStatus)
 	}
 
-	wantKeep := "UPDATE domains AS t " +
+	wantKeep := cteHead + cteTail +
 		"SET dns_mask = $3::int8, temp_attempts = 0, " +
 		"flags = (t.flags & -5)::int2, " +
 		"check_state = 2, queued_at = NULL, last_checked_at = now() " +
-		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> 6 AND t.check_state <> 2"
+		cteShift
 	if resultUpdateKeepStatusSQL != wantKeep {
 		t.Errorf("resultUpdateKeepStatusSQL = %q,\nwant %q", resultUpdateKeepStatusSQL, wantKeep)
+	}
+
+	wantInvalid := cteHead + cteTail +
+		"SET status = 7::int2, temp_attempts = 0, " +
+		"flags = (t.flags & -5)::int2, " +
+		"check_state = 2, queued_at = NULL, last_checked_at = now() " +
+		cteShift
+	if resultInvalidSQL != wantInvalid {
+		t.Errorf("resultInvalidSQL = %q,\nwant %q", resultInvalidSQL, wantInvalid)
 	}
 
 	wantMark := "UPDATE domains AS t " +

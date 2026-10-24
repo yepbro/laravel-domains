@@ -1,14 +1,14 @@
-// Scheduler: коллектор глубины backlog (T-077, ТЗ 5.9): периодический
-// подсчёт строк domains по check_state → gauge crawler_backlog_domains
-// {state=pending|queued}.
+// Scheduler: коллектор глубины backlog (T-077, ТЗ 5.9): периодическое
+// чтение сумм счётчиков зон → gauge crawler_backlog_domains
+// {state=pending|queued} (T-178: справочник вместо прохода по domains).
 //
 // Архитектурное решение (где живёт фоновый SQL-опрос): в сервисе
 // scheduler — он владелец состояний domains (переводит pending → queued
 // в EnqueueBatch T-028, возвращает queued → pending по lease T-029 и
 // done → pending перепроверками T-030/T-031), имеет пул БД с самого
 // старта и не занят обменами; monitor не трогается (его территория —
-// счётчики зон T-078 и алерты T-080). Длина стримов q:* — отдельная
-// метрика crawler_queue_depth у потребителей (internal/metrics/
+// реконсиляция счётчиков T-178 и алерты T-080). Длина стримов q:* —
+// отдельная метрика crawler_queue_depth у потребителей (internal/metrics/
 // collect.go); backlog из БД — «истинная» глубина: Redis-очередь
 // усечётся MAXLEN, потеряет задачи при сбое (восстановит планировщик,
 // ТЗ 3.4), а pending/queued в БД — полный объём невыполненной работы,
@@ -16,9 +16,10 @@
 //
 // Счётчики отслеживают текущее состояние (gauge), а не наращиваются
 // (counter): backlog — уровень, а не событие; алерты T-080 (остановка
-// прогресса, переполнение) читают уровень. deleted исключаются (§13.1 —
-// удалённые не проверяются), done не считается: прогресс по зонам —
-// счётчики domains_checked (monitor, T-078).
+// прогресса, переполнение) читают уровень. deleted исключены базовым
+// множеством счётчиков (§13.1 — удалённые не проверяются), done не
+// считается: прогресс по зонам — счётчики domains_checked (monitor,
+// T-078).
 package scheduler
 
 import (
@@ -37,24 +38,22 @@ import (
 
 // DefaultBacklogInterval — период опроса: 5 минут. Исходные 30 с (нижняя
 // граница коридора ТЗ 5.9 30–60 с) рассчитаны на малый корпус: замер
-// §12 docs/load-measurements.md (47 млн строк) — проход GROUP BY 17+ с
+// §12 docs/load-measurements.md — проход GROUP BY по 47 млн строк 17+ с
 // каждые 30 с, вместе с пересчётом зон и агрегатами status — большая
-// часть CPU postgres; gauge глубины на дашборде допускает пятиминутную
-// свежесть (постановка T-161). Коридор ТЗ остаётся доступным конфигом
+// часть CPU postgres; T-178 перевёл проход на суммы счётчиков справочника
+// (миллисекунды), период оставлен 5-минутным: gauge глубины на дашборде
+// допускает такую свежесть (постановка T-161), интервал задаёт баланс
+// свежести и нагрузки. Коридор ТЗ остаётся доступным конфигом
 // scheduler.backlog_interval для малых корпусов.
 const DefaultBacklogInterval = 5 * time.Minute
 
-// backlogSQL — один проход: счётчики строк по check_state живых доменов.
-// GROUP BY по ключу партиционирования (zone_id в листах HASH-субпартиций
-// T-005 входит в PK) агрегируется по партициям; deleted исключены —
-// невыполненной работой они не являются (§13.1). Индекса у прохода нет
-// и быть не может (T-104): агрегат по всем строкам обоих состояний с
-// фильтром status не сводится к предикату частичного индекса — цена
-// метрики O(таблица) за проход, интервал задаёт баланс свежести и
-// нагрузки (scheduler.backlog_interval, коридор 30с..1ч; ТЗ 5.9
-// допускал 30–60 с на малом корпусе).
-const backlogSQL = "SELECT check_state, count(*) FROM domains " +
-	"WHERE status <> $1 GROUP BY check_state"
+// backlogSQL — глубина backlog из справочника зон: сумма инкрементальных
+// счётчиков (T-178, ТЗИ §8.4) — один дешёвый проход по тысячам строк
+// зон вместо GROUP BY по 47 млн строк domains (замер §12 — 17+ с каждые
+// 5 мин). Счётчики ведут дельты переходов (ТЗИ §6) и реконсиляция
+// monitor (ТЗИ §7); deleted исключены базовым множеством колонок
+// (status <> deleted, ТЗИ §4.1).
+const backlogSQL = "SELECT coalesce(sum(domains_pending), 0), coalesce(sum(domains_queued), 0) FROM zones"
 
 // BacklogOptions — параметры цикла; нулевые значения заменяются
 // дефолтами (withDefaults, стиль EnqueueOptions).
@@ -91,7 +90,7 @@ func NewBacklogGauge(reg *metrics.Registry) *prometheus.GaugeVec {
 	}
 	return reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_backlog_domains",
-		Help: "Глубина backlog из БД: домены в ожидании выборки (pending) и в работе с lease (queued), без удалённых.",
+		Help: "Глубина backlog: домены в ожидании выборки (pending) и в работе с lease (queued) — суммы счётчиков зон (дельты переходов + реконсиляция, T-178), без удалённых.",
 	}, metrics.LabelState)
 }
 
@@ -104,9 +103,8 @@ type backlogLoopMetrics struct {
 	skipped *prometheus.CounterVec
 }
 
-// newBacklogLoopMetrics — приборы в реестре reg (nil — nil). Корзины —
-// экспонента 0.5 с…~8.5 мин: замер §12 — проход по 47 млн строк 17+ с,
-// дефолтные корзины Prometheus (потолок 10 с) малы.
+// newBacklogLoopMetrics — приборы в реестре reg (nil — nil). Проход —
+// чтение справочника зон (T-178): корзины дефолтные с запасом.
 func newBacklogLoopMetrics(reg *metrics.Registry) *backlogLoopMetrics {
 	if reg == nil {
 		return nil
@@ -114,7 +112,7 @@ func newBacklogLoopMetrics(reg *metrics.Registry) *backlogLoopMetrics {
 	return &backlogLoopMetrics{
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_backlog_pass_seconds",
-			Help:    "Длительность прохода агрегата глубины backlog (GROUP BY check_state по всем живым доменам, T-077).",
+			Help:    "Длительность прохода глубины backlog (суммы счётчиков зон по справочнику, T-077/T-178).",
 			Buckets: prometheus.ExponentialBuckets(0.5, 2, 11),
 		}),
 		skipped: reg.MustCounter(prometheus.CounterOpts{
@@ -140,8 +138,8 @@ func (m *backlogLoopMetrics) skip() {
 	m.skipped.WithLabelValues().Inc()
 }
 
-// BacklogOnce — один проход: GROUP BY check_state живых доменов → gauge
-// обеих серий (отсутствующее в агрегате состояние — 0: пустой backlog
+// BacklogOnce — один проход: суммы счётчиков зон (pending/queued,
+// T-178) → gauge обеих серий (пустой справочник — нули: пустой backlog
 // обязан экспортироваться, а не пропадать до следующего непустого).
 func BacklogOnce(ctx context.Context, pool db.DB, gauge *prometheus.GaugeVec) (BacklogResult, error) {
 	if pool == nil {
@@ -151,27 +149,18 @@ func BacklogOnce(ctx context.Context, pool db.DB, gauge *prometheus.GaugeVec) (B
 		return BacklogResult{}, errors.New("scheduler: глубина backlog: gauge не задан")
 	}
 
-	rows, err := pool.Query(ctx, backlogSQL, int16(model.StatusDeleted))
+	rows, err := pool.Query(ctx, backlogSQL)
 	if err != nil {
 		return BacklogResult{}, fmt.Errorf("scheduler: глубина backlog: %w", err)
 	}
 	defer rows.Close()
 
 	var out BacklogResult
-	for rows.Next() {
-		var (
-			state int16
-			n     int64
-		)
-		if err := rows.Scan(&state, &n); err != nil {
-			return BacklogResult{}, fmt.Errorf("scheduler: глубина backlog: чтение: %w", err)
-		}
-		switch model.CheckState(state) {
-		case model.CheckStatePending:
-			out.Pending = n
-		case model.CheckStateQueued:
-			out.Queued = n
-		}
+	if !rows.Next() {
+		return BacklogResult{}, fmt.Errorf("scheduler: глубина backlog: пустой ответ агрегата")
+	}
+	if err := rows.Scan(&out.Pending, &out.Queued); err != nil {
+		return BacklogResult{}, fmt.Errorf("scheduler: глубина backlog: чтение: %w", err)
 	}
 	if err := rows.Err(); err != nil {
 		return BacklogResult{}, fmt.Errorf("scheduler: глубина backlog: %w", err)

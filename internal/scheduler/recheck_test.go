@@ -32,35 +32,35 @@ type recheckCall struct {
 	args []any
 }
 
-// recheckFakePool — db.DB без БД: очередь результатов Exec (число
-// переведённых строк) и ошибок, протокол вызовов. Всё под замком:
-// цикл RecheckDaily работает в горутине, тест ожидает прогресс по
+// recheckFakePool — db.DB без БД: очередь результатов Query (число
+// переведённых строк — строки zone_id внешнего SELECT оператора
+// прохода, T-178) и ошибок, протокол вызовов. Всё под замком: цикл
+// RecheckDaily работает в горутине, тест ожидает прогресс по
 // счётчикам.
 type recheckFakePool struct {
 	mu       sync.Mutex
-	tags     []int64 // очередь RowsAffected (кончилась — 0: пустой набор)
-	execErrs []error // очередь ошибок Exec (nil — вызов без ошибки)
-
-	execs []recheckCall
+	tags     []int64 // очередь числа строк ответа (кончилась — 0: пустой набор)
+	execErrs []error // очередь ошибок Query (nil — вызов без ошибки)
+	queries  []recheckCall
 }
 
 func (p *recheckFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
 	return 0, errors.New("CopyFrom не должен вызываться")
 }
 
-func (p *recheckFakePool) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("Query не должен вызываться")
+func (p *recheckFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
 }
 
-func (p *recheckFakePool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (p *recheckFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.execs = append(p.execs, recheckCall{sql: sql, args: args})
+	p.queries = append(p.queries, recheckCall{sql: sql, args: args})
 	if len(p.execErrs) > 0 {
 		err := p.execErrs[0]
 		p.execErrs = p.execErrs[1:]
 		if err != nil {
-			return pgconn.CommandTag{}, err
+			return nil, err
 		}
 	}
 	n := int64(0)
@@ -68,32 +68,41 @@ func (p *recheckFakePool) Exec(_ context.Context, sql string, args ...any) (pgco
 		n = p.tags[0]
 		p.tags = p.tags[1:]
 	}
-	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", n)), nil
+	rows := make([][]any, n)
+	for i := range rows {
+		rows[i] = []any{int16(1)} // zone_id: значение для счёта строк не важно
+	}
+	return retryRows(rows...), nil
 }
 
 // stats — снимок числа вызовов под замком (ожидание прогресса цикла).
 func (p *recheckFakePool) stats() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.execs)
+	return len(p.queries)
 }
 
 // calls — снимок протокола вызовов под замком.
 func (p *recheckFakePool) calls() []recheckCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]recheckCall(nil), p.execs...)
+	return append([]recheckCall(nil), p.queries...)
 }
 
-// --- ожидаемый SQL-текст (контракт) ---------------------------------------
-
-const wantRecheckUpdate = "UPDATE domains AS d " +
-	"SET check_state = $1, queued_at = NULL " +
-	"FROM (SELECT zone_id, id FROM domains " +
+const wantRecheckUpdate = "WITH b AS (SELECT zone_id, id FROM domains " +
 	"WHERE check_state = 2 AND status <> 6 AND status <> 7 AND last_checked_at < $2 " +
-	"ORDER BY last_checked_at, zone_id, id LIMIT $3) AS b " +
-	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
-	"AND d.check_state = 2 AND d.status <> 6 AND d.status <> 7 AND d.last_checked_at < $2"
+	"ORDER BY last_checked_at, zone_id, id LIMIT $3), " +
+	"upd AS (UPDATE domains AS d " +
+	"SET check_state = $1, queued_at = NULL " +
+	"FROM b WHERE d.zone_id = b.zone_id AND d.id = b.id " +
+	"AND d.check_state = 2 AND d.status <> 6 AND d.status <> 7 AND d.last_checked_at < $2 " +
+	"RETURNING d.zone_id), " +
+	"zc AS (UPDATE zones AS z " +
+	"SET domains_checked = z.domains_checked - c.n, " +
+	"domains_pending = z.domains_pending + c.n " +
+	"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
+	"WHERE z.id = c.zone_id) " +
+	"SELECT zone_id FROM upd"
 
 // recheckFixedClock — часы с фиксированным «сейчас» (порог прохода
 // воспроизводим до наносекунды).
@@ -136,7 +145,7 @@ func TestRecheckOnceSQL(t *testing.T) {
 		t.Errorf("аргументы = %v, want %v", calls[0].args, wantArgs)
 	}
 	if res.Domains != 42 {
-		t.Errorf("итог = %+v, want Domains=42 (RowsAffected)", res)
+		t.Errorf("итог = %+v, want Domains=42 (строки внешнего SELECT)", res)
 	}
 }
 

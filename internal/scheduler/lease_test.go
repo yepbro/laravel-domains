@@ -32,35 +32,35 @@ type leaseCall struct {
 	args []any
 }
 
-// leaseFakePool — db.DB без БД: очередь результатов Exec (число
-// возвращённых строк) и ошибок, протокол вызовов. Всё под замком:
+// leaseFakePool — db.DB без БД: очередь результатов Query (число
+// переведённых строк — строки zone_id внешнего SELECT оператора
+// прохода, T-178) и ошибок, протокол вызовов. Всё под замком:
 // цикл LeaseWatch работает в горутине, тест ожидает прогресс по
 // счётчикам.
 type leaseFakePool struct {
 	mu       sync.Mutex
-	tags     []int64 // очередь RowsAffected (кончилась — 0: пустой набор)
-	execErrs []error // очередь ошибок Exec (nil — вызов без ошибки)
-
-	execs []leaseCall
+	tags     []int64 // очередь числа строк ответа (кончилась — 0: пустой набор)
+	execErrs []error // очередь ошибок Query (nil — вызов без ошибки)
+	queries  []leaseCall
 }
 
 func (p *leaseFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
 	return 0, errors.New("CopyFrom не должен вызываться")
 }
 
-func (p *leaseFakePool) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("Query не должен вызываться")
+func (p *leaseFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
 }
 
-func (p *leaseFakePool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (p *leaseFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.execs = append(p.execs, leaseCall{sql: sql, args: args})
+	p.queries = append(p.queries, leaseCall{sql: sql, args: args})
 	if len(p.execErrs) > 0 {
 		err := p.execErrs[0]
 		p.execErrs = p.execErrs[1:]
 		if err != nil {
-			return pgconn.CommandTag{}, err
+			return nil, err
 		}
 	}
 	n := int64(0)
@@ -68,34 +68,45 @@ func (p *leaseFakePool) Exec(_ context.Context, sql string, args ...any) (pgconn
 		n = p.tags[0]
 		p.tags = p.tags[1:]
 	}
-	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", n)), nil
+	rows := make([][]any, n)
+	for i := range rows {
+		rows[i] = []any{int16(1)} // zone_id: значение для счёта строк не важно
+	}
+	return retryRows(rows...), nil
 }
 
 // stats — снимок числа вызовов под замком (ожидание прогресса цикла).
 func (p *leaseFakePool) stats() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.execs)
+	return len(p.queries)
 }
 
 // calls — снимок протокола вызовов под замком.
 func (p *leaseFakePool) calls() []leaseCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]leaseCall(nil), p.execs...)
+	return append([]leaseCall(nil), p.queries...)
 }
 
 // --- ожидаемый SQL-текст (контракт) ---------------------------------------
 
-const wantLeaseUpdate = "UPDATE domains AS d " +
-	"SET check_state = $1, queued_at = NULL " +
-	"FROM (SELECT zone_id, id FROM domains " +
+const wantLeaseUpdate = "WITH b AS (SELECT zone_id, id FROM domains " +
 	"WHERE check_state = 1 AND status <> 6 " +
 	"AND queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3) " +
-	"ORDER BY queued_at, zone_id, id LIMIT $4) AS b " +
-	"WHERE d.zone_id = b.zone_id AND d.id = b.id " +
+	"ORDER BY queued_at, zone_id, id LIMIT $4), " +
+	"upd AS (UPDATE domains AS d " +
+	"SET check_state = $1, queued_at = NULL " +
+	"FROM b WHERE d.zone_id = b.zone_id AND d.id = b.id " +
 	"AND d.check_state = 1 AND d.status <> 6 " +
-	"AND d.queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3)"
+	"AND d.queued_at < COALESCE($2::timestamptz, now()) - make_interval(secs => $3) " +
+	"RETURNING d.zone_id), " +
+	"zc AS (UPDATE zones AS z " +
+	"SET domains_queued = z.domains_queued - c.n, " +
+	"domains_pending = z.domains_pending + c.n " +
+	"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
+	"WHERE z.id = c.zone_id) " +
+	"SELECT zone_id FROM upd"
 
 // leaseFixedClock — часы с фиксированным «сейчас» (порог прохода
 // воспроизводим до наносекунды).
@@ -140,7 +151,7 @@ func TestLeaseOnceSQL(t *testing.T) {
 		t.Errorf("аргументы = %v, want %v", calls[0].args, wantArgs)
 	}
 	if res.Domains != 42 {
-		t.Errorf("итог = %+v, want Domains=42 (RowsAffected)", res)
+		t.Errorf("итог = %+v, want Domains=42 (строки внешнего SELECT)", res)
 	}
 }
 

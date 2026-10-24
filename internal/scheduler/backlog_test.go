@@ -156,8 +156,13 @@ func (b *syncBuf) contains(s string) bool {
 
 // --- ожидаемый SQL-текст (контракт) ---------------------------------------
 
-const wantBacklogSQL = "SELECT check_state, count(*) FROM domains " +
-	"WHERE status <> $1 GROUP BY check_state"
+const wantBacklogSQL = "SELECT coalesce(sum(domains_pending), 0), coalesce(sum(domains_queued), 0) FROM zones"
+
+// backlogPair — строка ответа нового прохода (pending, queued): суммы
+// счётчиков справочника зон (T-178).
+func backlogPair(pending, queued int64) *backlogFakeRows {
+	return backlogRows([]any{pending, queued})
+}
 
 // backlogGaugeValue — текущее значение серии crawler_backlog_domains.
 func backlogGaugeValue(t *testing.T, reg *metrics.Registry, state string) (float64, bool) {
@@ -187,12 +192,7 @@ func backlogGaugeValue(t *testing.T, reg *metrics.Registry, state string) (float
 func TestBacklogOnce(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{hook: func() (pgx.Rows, error) {
-		// done в агрегате игнорируется: прогресс — счётчики зон T-078.
-		return backlogRows(
-			[]any{int16(model.CheckStatePending), int64(10)},
-			[]any{int16(model.CheckStateQueued), int64(7)},
-			[]any{int16(model.CheckStateDone), int64(350)},
-		), nil
+		return backlogPair(10, 7), nil
 	}}
 
 	res, err := BacklogOnce(context.Background(), pool, NewBacklogGauge(reg))
@@ -206,9 +206,8 @@ func TestBacklogOnce(t *testing.T) {
 	if len(pool.calls) != 1 || pool.calls[0].sql != wantBacklogSQL {
 		t.Fatalf("SQL = %q, want точный контракт", pool.calls[0].sql)
 	}
-	if want := []any{int16(model.StatusDeleted)}; len(pool.calls[0].args) != 1 ||
-		pool.calls[0].args[0] != want[0] {
-		t.Errorf("args = %v, want %v (исключение deleted, §13.1)", pool.calls[0].args, want)
+	if len(pool.calls[0].args) != 0 {
+		t.Errorf("args = %v, want пусто (суммы справочника, T-178)", pool.calls[0].args)
 	}
 
 	for state, want := range map[string]float64{
@@ -221,12 +220,13 @@ func TestBacklogOnce(t *testing.T) {
 	}
 }
 
-// Отсутствующее в агрегате состояние — экспортируется нулём: пустой
-// backlog не должен пропадать из /metrics до следующего непустого.
+// Пустой справочник — нули: пустой backlog обязан экспортироваться, а
+// не пропадать из /metrics до следующего непустого (агрегат без GROUP BY
+// всегда отвечает одной строкой с нулями).
 func TestBacklogOnceEmptyStates(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{hook: func() (pgx.Rows, error) {
-		return backlogRows(), nil // БД пуста — GROUP BY без строк
+		return backlogPair(0, 0), nil
 	}}
 
 	res, err := BacklogOnce(context.Background(), pool, NewBacklogGauge(reg))
@@ -287,29 +287,38 @@ func TestBacklogOptionsDefaults(t *testing.T) {
 	}
 }
 
-// TestBacklogOnceRowsErrors — ошибки чтения строк агрегата: Scan (лишняя
-// колонка ломает позиционный приём) и rows.Err после исчерпания строк —
-// точные контексты сообщений, исходная ошибка проксируется (errors.Is).
+// TestBacklogOnceRowsErrors — ошибки чтения ответа: Scan (лишняя колонка
+// ломает позиционный приём), rows.Err после строки и пустой ответ
+// (агрегат обязан отвечать одной строкой) — точные контексты
+// сообщений, исходная ошибка проксируется (errors.Is).
 func TestBacklogOnceRowsErrors(t *testing.T) {
 	reg := metrics.New("scheduler")
 
 	// Scan: строка с тремя колонками вместо двух.
 	scanPool := &backlogFakePool{hook: func() (pgx.Rows, error) {
-		return backlogRows([]any{int16(model.CheckStatePending), int64(1), int64(2)}), nil
+		return backlogRows([]any{int64(1), int64(2), int64(3)}), nil
 	}}
 	if _, err := BacklogOnce(context.Background(), scanPool, NewBacklogGauge(reg)); err == nil ||
 		!strings.Contains(err.Error(), "чтение") {
 		t.Errorf("ошибка Scan = %v, want контекст «чтение»", err)
 	}
 
-	// rows.Err после исчерпания строк агрегата.
+	// rows.Err после строки ответа.
 	boom := errors.New("бд недоступна")
-	errRows := backlogRows([]any{int16(model.CheckStatePending), int64(3)})
+	errRows := backlogPair(3, 4)
 	errRows.err = boom
 	errPool := &backlogFakePool{hook: func() (pgx.Rows, error) { return errRows, nil }}
 	if _, err := BacklogOnce(context.Background(), errPool, NewBacklogGauge(reg)); err == nil ||
 		!errors.Is(err, boom) {
 		t.Errorf("ошибка rows.Err = %v, want исходная %v", err, boom)
+	}
+
+	// Пустой ответ — аномалия формы (агрегат без GROUP BY отвечает
+	// одной строкой).
+	emptyPool := &backlogFakePool{hook: func() (pgx.Rows, error) { return backlogRows(), nil }}
+	if _, err := BacklogOnce(context.Background(), emptyPool, NewBacklogGauge(reg)); err == nil ||
+		!strings.Contains(err.Error(), "пустой ответ агрегата") {
+		t.Errorf("пустой ответ = %v, want «пустой ответ агрегата»", err)
 	}
 }
 
@@ -319,10 +328,7 @@ func TestBacklogLoop(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{}
 	pool.setHook(func() (pgx.Rows, error) {
-		return backlogRows(
-			[]any{int16(model.CheckStatePending), int64(3)},
-			[]any{int16(model.CheckStateQueued), int64(4)},
-		), nil
+		return backlogPair(3, 4), nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -353,10 +359,7 @@ func TestBacklogLoop(t *testing.T) {
 		t.Errorf("при сбоях pending = %v, want последнее известное 3", v)
 	}
 	pool.setHook(func() (pgx.Rows, error) {
-		return backlogRows(
-			[]any{int16(model.CheckStatePending), int64(5)},
-			[]any{int16(model.CheckStateQueued), int64(0)},
-		), nil
+		return backlogPair(5, 0), nil
 	})
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -387,10 +390,7 @@ func TestBacklogLoopImmediateFirstPass(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{}
 	pool.setHook(func() (pgx.Rows, error) {
-		return backlogRows(
-			[]any{int16(model.CheckStatePending), int64(3)},
-			[]any{int16(model.CheckStateQueued), int64(4)},
-		), nil
+		return backlogPair(3, 4), nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -437,10 +437,7 @@ func TestBacklogLoopLogging(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{}
 	pool.setHook(func() (pgx.Rows, error) {
-		return backlogRows(
-			[]any{int16(model.CheckStatePending), int64(3)},
-			[]any{int16(model.CheckStateQueued), int64(4)},
-		), nil
+		return backlogPair(3, 4), nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -508,10 +505,7 @@ func TestBacklogLoopCancelDuringPass(t *testing.T) {
 
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{hook: func() (pgx.Rows, error) {
-		return backlogRows(
-			[]any{int16(model.CheckStatePending), int64(3)},
-			[]any{int16(model.CheckStateQueued), int64(4)},
-		), nil
+		return backlogPair(3, 4), nil
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -599,10 +593,7 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 	pool := &backlogFakePool{}
 	pool.setHook(func() (pgx.Rows, error) {
 		time.Sleep(120 * time.Millisecond) // медленный агрегат (замер §12)
-		return backlogRows(
-			[]any{int16(model.CheckStatePending), int64(3)},
-			[]any{int16(model.CheckStateQueued), int64(4)},
-		), nil
+		return backlogPair(3, 4), nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -634,10 +625,7 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 
 	// Проход 2 быстрый: обычный режим восстанавливается, цикл живёт.
 	pool.setHook(func() (pgx.Rows, error) {
-		return backlogRows(
-			[]any{int16(model.CheckStatePending), int64(5)},
-			[]any{int16(model.CheckStateQueued), int64(6)},
-		), nil
+		return backlogPair(5, 6), nil
 	})
 	deadline = time.Now().Add(2 * time.Second)
 	for pool.callsCount() < 2 {
@@ -672,10 +660,7 @@ func TestBacklogLoopFastPassNoSkip(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{}
 	pool.setHook(func() (pgx.Rows, error) {
-		return backlogRows(
-			[]any{int16(model.CheckStatePending), int64(3)},
-			[]any{int16(model.CheckStateQueued), int64(4)},
-		), nil
+		return backlogPair(3, 4), nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

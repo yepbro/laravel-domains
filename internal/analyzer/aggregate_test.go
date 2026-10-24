@@ -695,6 +695,98 @@ func TestAggregate_History(t *testing.T) {
 	}
 }
 
+// TestAggregate_Counters — инкрементальные счётчики переходов строки
+// laravel_domains (T-178, ТЗИ §6.5): zones.domains_laravel ±1 на КАЖДОМ
+// переходе наличия (включая переанализ — реконсиляция считает строки
+// независимо от происхождения), кумулятивы crawler_counters appeared/
+// lost — только при fresh (строки кумулятивов соответствуют записям
+// laravel_history). Инварианты сверяются с журналом истории фейка.
+func TestAggregate_Counters(t *testing.T) {
+	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
+	ctx := context.Background()
+
+	runTask := func(task queue.Result) {
+		t.Helper()
+		if _, err := f.w.ProcessResult(ctx, task); err != nil {
+			t.Fatalf("ProcessResult: %v", err)
+		}
+	}
+
+	laravelHash := anTestHash(7)
+	f.store.blocks[laravelHash] = anPageHTML()
+	plainHash := anTestHash(8)
+	f.store.blocks[plainHash] = []byte(`<html><body>nothing here</body></html>`)
+
+	// Появление (fresh): домен 3 → зона +1, appeared +1.
+	task := anTask // зона anKey (3)
+	task.Fresh = true
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
+	runTask(task)
+	if got := f.pool.zoneLaravel[anKey.zone]; got != 1 {
+		t.Fatalf("domains_laravel зоны после появления = %d, хочу 1", got)
+	}
+	if got := f.pool.counters["laravel_appeared_total"]; got != 1 {
+		t.Fatalf("laravel_appeared_total = %d, хочу 1", got)
+	}
+	if got := f.pool.counters["laravel_lost_total"]; got != 0 {
+		t.Fatalf("laravel_lost_total = %d, хочу 0", got)
+	}
+
+	// Исчезновение (fresh): зона −1, lost +1.
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t), plainHash[:])
+	runTask(task)
+	if got := f.pool.zoneLaravel[anKey.zone]; got != 0 {
+		t.Fatalf("domains_laravel зоны после исчезновения = %d, хочу 0", got)
+	}
+	if got := f.pool.counters["laravel_lost_total"]; got != 1 {
+		t.Fatalf("laravel_lost_total = %d, хочу 1", got)
+	}
+
+	// Повторный эпизод без смены наличия — дельт нет.
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
+	runTask(task)
+	if got := f.pool.zoneLaravel[anKey.zone]; got != 1 {
+		t.Fatalf("domains_laravel после повторного появления = %d, хочу 1", got)
+	}
+
+	// Переанализ исчезновения (fresh=false): строка удаляется — зона −1
+	// (множество меняется), кумулятив lost не растёт (записи истории нет).
+	rTask := task
+	rTask.Fresh = false
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t), plainHash[:])
+	runTask(rTask)
+	if got := f.pool.zoneLaravel[anKey.zone]; got != 0 {
+		t.Fatalf("domains_laravel после переанализа-исчезновения = %d, хочу 0 (переход без fresh)", got)
+	}
+	if got := f.pool.counters["laravel_lost_total"]; got != 1 {
+		t.Fatalf("laravel_lost_total после переанализа = %d, хочу 1 (история не пишется)", got)
+	}
+
+	// Кумулятивы соответствуют журналу истории (инвариант ТЗИ §6.5).
+	hist := anHistorySnapshot(f.pool)
+	var appeared, lost int64
+	for _, h := range hist {
+		if h.appeared {
+			appeared++
+		} else {
+			lost++
+		}
+	}
+	if appeared != f.pool.counters["laravel_appeared_total"] || lost != f.pool.counters["laravel_lost_total"] {
+		t.Fatalf("кумулятивы (%d/%d) разошлись с журналом истории (%d/%d)",
+			f.pool.counters["laravel_appeared_total"], f.pool.counters["laravel_lost_total"], appeared, lost)
+	}
+
+	// Строка зоны отсутствует (ручная правка справочника): сдвиг громко
+	// падает — молчаливый дрейф недопустим.
+	f.pool.zoneNoRow = true
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
+	if _, err := f.w.ProcessResult(ctx, anTask); err == nil || !strings.Contains(err.Error(), "счётчик Laravel-зоны") {
+		t.Fatalf("отсутствующая строка зоны: err = %v, хочу ошибку счётчика зоны", err)
+	}
+	f.pool.zoneNoRow = false
+}
+
 // anStrEq / anStrDeref — сравнение и печать NULL-границ.
 func anStrEq(a, b *string) bool {
 	if a == nil || b == nil {

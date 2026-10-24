@@ -754,6 +754,12 @@ func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		t.pool.counters["render_pending"] += delta
 		t.j.record("debtcount")
 		return pgconn.NewCommandTag("UPDATE 1"), nil
+	case recordZoneShiftSQL:
+		// Дельта счётчиков зоны (T-178): значения фейку не важны —
+		// запись сценария долга рендера их не проверяет; строка зоны
+		// «существует» всегда.
+		t.j.record("zoneshift")
+		return pgconn.NewCommandTag("UPDATE 1"), nil
 	case recordInsertSQL:
 		if len(args) != 18 {
 			return pgconn.CommandTag{}, fmt.Errorf("renderqRecPool: INSERT: параметров %d, нужно 18", len(args))
@@ -807,6 +813,23 @@ func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		t.j.record("swap")
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	}
+}
+
+// QueryRow — предчтение состояний строки домена (recordSelectStateSQL,
+// T-178): значения фейку не важны (сценарии долга статуса строки не
+// меняют), absent — ErrNoRows.
+func (t *renderqRecTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	if sql != recordSelectStateSQL {
+		return recordStateRow{err: fmt.Errorf("renderqRecPool: неожидаемый QueryRow: %s", sql)}
+	}
+	key := recordDomainKey{zone: args[0].(int16), id: args[1].(int64)}
+	d, ok := t.pool.domains[key]
+	if !ok {
+		return recordStateRow{err: pgx.ErrNoRows}
+	}
+	return recordStateRow{status: int16(d.status), state: int16(d.checkState)}
 }
 
 func (t *renderqRecTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
