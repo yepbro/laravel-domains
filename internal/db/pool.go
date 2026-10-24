@@ -96,6 +96,12 @@ type Options struct {
 	HealthCheckPeriod time.Duration
 	// ConnectTimeout — установка одного соединения. По умолчанию 10s.
 	ConnectTimeout time.Duration
+	// AppName — application_name соединений пула: метка сервиса в
+	// pg_stat_activity (журнал сервера, мониторинг T-177 — цикл медленных
+	// запросов отличает по ней свои агрегаты от патологий конвейера).
+	// "" — не задаётся; явное application_name в DSN не перетирается
+	// (выбор оператора в строке подключения важнее).
+	AppName string
 	// AfterConnect — настройка каждого нового соединения (nil — нет):
 	// см. AfterConnectFunc. Значение применяется и к переоткрытиям
 	// по MaxConnLifetime — SET-подобные настройки сессии переживают
@@ -135,6 +141,11 @@ func buildPoolConfig(opts Options) (*pgxpool.Config, error) {
 	cfg.MaxConnIdleTime = defaultIfZero(opts.MaxConnIdleTime, DefaultMaxConnIdleTime)
 	cfg.HealthCheckPeriod = defaultIfZero(opts.HealthCheckPeriod, DefaultHealthCheckPeriod)
 	cfg.ConnConfig.ConnectTimeout = defaultIfZero(opts.ConnectTimeout, DefaultConnectTimeout)
+	// Метка сервиса в pg_stat_activity: только если DSN её не задал
+	// (явное значение в строке подключения — выбор оператора).
+	if opts.AppName != "" && cfg.ConnConfig.RuntimeParams["application_name"] == "" {
+		cfg.ConnConfig.RuntimeParams["application_name"] = opts.AppName
+	}
 	cfg.AfterConnect = opts.AfterConnect
 	return cfg, nil
 }

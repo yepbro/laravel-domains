@@ -417,6 +417,16 @@ type Monitor struct {
 	// (T-173): снимок CPU/памяти/процессов/диска/очередей уходит в
 	// Telegram (monitor.alerts.telegram) и журнал; 0 — цикл выключен.
 	LoadReportInterval Duration `yaml:"load_report_interval"`
+	// SlowQueryInterval — период опроса pg_stat_activity на медленные
+	// запросы (T-177): выполняемые дольше SlowQueryMinDuration
+	// клиентские операторы уходят в Telegram той же доставкой, что
+	// алерты/отчёт нагрузки; 0 — цикл выключен.
+	SlowQueryInterval Duration `yaml:"slow_query_interval"`
+	// SlowQueryMinDuration — порог медленного запроса (T-177): 3 с —
+	// порог боевого лога log_min_duration_statement (deploy/postgres/
+	// postgresql.conf), одна граница «патология» в журнале сервера и в
+	// Telegram. 0 — дефолт цикла.
+	SlowQueryMinDuration Duration `yaml:"slow_query_min_duration"`
 	// IngestMetricsURL — адрес /metrics сервиса ingest (T-099): алерт
 	// мусорных content_hash очистки читает счётчик из экспозиции ingest
 	// зондом раз в период алертов. Тот же адрес, что скрейпит Prometheus;
@@ -760,6 +770,12 @@ func Default() *Config {
 			// CPU/памяти (десятки минут), 144 сообщения/сутки не тонут
 			// алерты в группе; 0 — выключить (коридор Validate).
 			LoadReportInterval: Duration(10 * time.Minute),
+			// Медленные запросы T-177: 10 с — снимок pg_stat_activity
+			// (микросекунды на ≤ 50 соединений), дольше — теряются
+			// эпизоды короче интервала; порог 3 с — порог боевого
+			// log_min_duration_statement.
+			SlowQueryInterval:    Duration(10 * time.Second),
+			SlowQueryMinDuration: Duration(3 * time.Second),
 			// Loopback ingest по METRICS_ADDR (systemd-юниты привязывают
 			// 127.0.0.1:9101); docker-сети переопределяют именем сервиса
 			// (config.dev.yaml: http://ingest:9101/metrics).
@@ -1278,6 +1294,22 @@ func (c *Config) Validate() error {
 		(lr < Duration(time.Minute) || lr > Duration(time.Hour)) {
 		problems = append(problems, fmt.Sprintf("monitor.load_report_interval: ожидается 0 (выключен) или %s..%s, задано %s",
 			Duration(time.Minute), Duration(time.Hour), lr))
+	}
+	// Медленные запросы (T-177): период 0 — выключен, иначе коридор
+	// 5с..10м — снимок pg_stat_activity дешёв (≤ 50 соединений), чаще —
+	// лишний опрос, реже — теряются эпизоды короче интервала. Порог
+	// 1с..1ч: ниже секунды шумят точечные пачки конвейера, выше часа —
+	// не про «медленный запрос»; короче периода цикла допустим —
+	// короткие эпизоды цикл ловит частично (полный след — лог сервера).
+	if sq := c.Monitor.SlowQueryInterval; sq != 0 &&
+		(sq < Duration(5*time.Second) || sq > Duration(10*time.Minute)) {
+		problems = append(problems, fmt.Sprintf("monitor.slow_query_interval: ожидается 0 (выключен) или %s..%s, задано %s",
+			Duration(5*time.Second), Duration(10*time.Minute), sq))
+	}
+	if c.Monitor.SlowQueryInterval != 0 && c.Monitor.SlowQueryMinDuration != 0 &&
+		(c.Monitor.SlowQueryMinDuration < Duration(time.Second) || c.Monitor.SlowQueryMinDuration > Duration(time.Hour)) {
+		problems = append(problems, fmt.Sprintf("monitor.slow_query_min_duration: ожидается 0 (дефолт) или %s..%s, задано %s",
+			Duration(time.Second), Duration(time.Hour), c.Monitor.SlowQueryMinDuration))
 	}
 	if c.Monitor.IngestMetricsURL != "" {
 		if u, err := url.Parse(c.Monitor.IngestMetricsURL); err != nil ||

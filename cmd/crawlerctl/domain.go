@@ -701,6 +701,7 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 	// manage.go, T-074).
 	poolOpts := db.NewOptions(cfg.Postgres)
 	poolOpts.PoolSize = 2
+	poolOpts.AppName = "crawlerctl" // метка в pg_stat_activity (T-177)
 	pool, err := db.Open(ctx, poolOpts)
 	if err != nil {
 		return fmt.Errorf("domain: %w", err)

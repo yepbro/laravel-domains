@@ -803,6 +803,8 @@ rules:
 | `listen` | `CRAWLER_MONITOR_LISTEN` | [host]:port | `:9100` |
 | `zone_stats_interval` | `CRAWLER_MONITOR_ZONE_STATS_INTERVAL` | длительность | `5m` (коридор 30s..1h; T-161) |
 | `load_report_interval` | `CRAWLER_MONITOR_LOAD_REPORT_INTERVAL` | длительность | `10m` (0 — выключен; коридор 1m..1h; T-173) |
+| `slow_query_interval` | `CRAWLER_MONITOR_SLOW_QUERY_INTERVAL` | длительность | `10s` (0 — выключен; коридор 5s..10m; T-177) |
+| `slow_query_min_duration` | `CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION` | длительность | `3s` (0 — дефолт; коридор 1s..1h; T-177) |
 | `ingest_metrics_url` | `CRAWLER_MONITOR_INGEST_METRICS_URL` | http(s)-URL | `http://127.0.0.1:9101/metrics` |
 | `alerts.telegram` | `CRAWLER_MONITOR_ALERTS_TELEGRAM` | bool | `true` (T-162) |
 | `alerts.telegram_script` | `CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT` | путь | `/opt/crawler/bin/telegram-notify.sh` |
@@ -856,6 +858,24 @@ Telegram той же доставкой, что алерты (`alerts.telegram` 
 `crawler_os_*` в `/metrics`. Первый проход после старта — база:
 утилизация и темпы «н/д», размеры полноценны. Дефолт 10 минут (144
 сообщения/сутки не тонут алерты), `0` — выключить; коридор 1m..1h.
+`slow_query_interval` / `slow_query_min_duration` — цикл медленных
+запросов PostgreSQL (T-177): раз в период monitor опрашивает
+`pg_stat_activity`, и выполняемые дольше порога (`3 с` по умолчанию —
+порог боевого лога `log_min_duration_statement`,
+[db.md](db.md) §«Мониторинг») клиентские операторы уходят в Telegram
+той же доставкой, что алерты и отчёт нагрузки: шапка с числом новых и
+«всего в работе», три самых долгих строки «длительность [сервис]
+pid: текст» (обрезка 160 символов; полный текст — журнал сервера).
+Дебаунс — pid+query_start: каждый оператор сообщается один раз при
+первом наблюдении; собственные проходы monitor (агрегаты по 47 млн
+строк, замер §12) исключены `application_name` пула, метки сервисов в
+сообщении — оттуда же; для текста чужих сессий роли БД нужен
+`pg_read_all_stats` (без него — пометка «текст недоступен»). Снимок —
+мгновенный: короче интервала эпизоды ловятся частично, дольше — всегда
+(полный посмертный след — лог сервера). Дублируется Warn в журнал и
+метриками `crawler_pg_slow_queries` / `crawler_pg_slow_queries_total`
+(метка `app`). `slow_query_interval: 0` — выключить (коридор 5s..10m),
+`slow_query_min_duration` — коридор 1s..1h, `0` — дефолт цикла.
 
 `alerts` (T-162) — недостающие пороги ТЗ 5.9 (замер §12: все P0 того
 периода найдены вручную) и доставка алертов оператору; семантика

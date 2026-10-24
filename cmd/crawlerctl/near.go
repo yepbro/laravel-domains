@@ -115,7 +115,8 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 	defer stop()
 
 	poolOpts := db.NewOptions(cfg.Postgres)
-	poolOpts.PoolSize = 2 // бюджет соединений ТЗ 6.3 — у сервисов
+	poolOpts.PoolSize = 2           // бюджет соединений ТЗ 6.3 — у сервисов
+	poolOpts.AppName = "crawlerctl" // метка в pg_stat_activity (T-177)
 	pool, err := db.Open(ctx, poolOpts)
 	if err != nil {
 		return fmt.Errorf("near: %w", err)

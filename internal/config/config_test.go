@@ -112,6 +112,8 @@ func TestDefault(t *testing.T) {
 		{"analyzer.laravel_min_score", c.Analyzer.LaravelMinScore, 0.6},
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
 		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 5 * time.Minute},
+		{"monitor.slow_query_interval", c.Monitor.SlowQueryInterval.D(), 10 * time.Second},
+		{"monitor.slow_query_min_duration", c.Monitor.SlowQueryMinDuration.D(), 3 * time.Second},
 		{"monitor.ingest_metrics_url", c.Monitor.IngestMetricsURL, "http://127.0.0.1:9101/metrics"},
 		{"monitor.alerts.telegram", c.Monitor.Alerts.Telegram, true},
 		{"monitor.alerts.telegram_script", c.Monitor.Alerts.TelegramScript, "/opt/crawler/bin/telegram-notify.sh"},
@@ -246,6 +248,8 @@ subdomains:
 monitor:
   listen: "127.0.0.1:9110"
   zone_stats_interval: "30s"
+  slow_query_interval: "15s"
+  slow_query_min_duration: "5s"
   alerts:
     telegram: false
     telegram_script: "/srv/telegram-notify.sh"
@@ -341,6 +345,8 @@ log:
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.75},
 		{"monitor.listen", cfg.Monitor.Listen, "127.0.0.1:9110"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 30 * time.Second},
+		{"monitor.slow_query_interval", cfg.Monitor.SlowQueryInterval.D(), 15 * time.Second},
+		{"monitor.slow_query_min_duration", cfg.Monitor.SlowQueryMinDuration.D(), 5 * time.Second},
 		{"monitor.alerts.telegram", cfg.Monitor.Alerts.Telegram, false},
 		{"monitor.alerts.telegram_script", cfg.Monitor.Alerts.TelegramScript, "/srv/telegram-notify.sh"},
 		{"monitor.alerts.disk_free_min_bytes", cfg.Monitor.Alerts.DiskFreeMinBytes.B(), int64(20 << 30)},
@@ -534,6 +540,8 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_SUBDOMAINS":                          "www, mail",
 		"CRAWLER_MONITOR_LISTEN":                      ":9199",
 		"CRAWLER_MONITOR_ZONE_STATS_INTERVAL":         "45s",
+		"CRAWLER_MONITOR_SLOW_QUERY_INTERVAL":         "20s",
+		"CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION":     "7s",
 		"CRAWLER_MONITOR_INGEST_METRICS_URL":          "http://env-ingest:9101/metrics",
 		"CRAWLER_MONITOR_ALERTS_TELEGRAM":             "false",
 		"CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT":      "/env/telegram-notify.sh",
@@ -627,6 +635,8 @@ func TestEnvOverrides(t *testing.T) {
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.9},
 		{"monitor.listen", cfg.Monitor.Listen, ":9199"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 45 * time.Second},
+		{"monitor.slow_query_interval", cfg.Monitor.SlowQueryInterval.D(), 20 * time.Second},
+		{"monitor.slow_query_min_duration", cfg.Monitor.SlowQueryMinDuration.D(), 7 * time.Second},
 		{"monitor.ingest_metrics_url", cfg.Monitor.IngestMetricsURL, "http://env-ingest:9101/metrics"},
 		{"monitor.alerts.telegram", cfg.Monitor.Alerts.Telegram, false},
 		{"monitor.alerts.telegram_script", cfg.Monitor.Alerts.TelegramScript, "/env/telegram-notify.sh"},
@@ -988,6 +998,14 @@ func TestValidate(t *testing.T) {
 		{"zone_stats_interval 0", func(c *Config) { c.Monitor.ZoneStatsInterval = 0 }, "monitor.zone_stats_interval"},
 		{"zone_stats_interval меньше 30с", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(10 * time.Second) }, "monitor.zone_stats_interval"},
 		{"zone_stats_interval больше часа", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(2 * time.Hour) }, "monitor.zone_stats_interval"},
+		{"slow_query_interval меньше 5с", func(c *Config) { c.Monitor.SlowQueryInterval = Duration(2 * time.Second) }, "monitor.slow_query_interval"},
+		{"slow_query_interval больше 10м", func(c *Config) { c.Monitor.SlowQueryInterval = Duration(11 * time.Minute) }, "monitor.slow_query_interval"},
+		{"slow_query_min_duration меньше секунды", func(c *Config) {
+			c.Monitor.SlowQueryMinDuration = Duration(500 * time.Millisecond)
+		}, "monitor.slow_query_min_duration"},
+		{"slow_query_min_duration больше часа", func(c *Config) {
+			c.Monitor.SlowQueryMinDuration = Duration(61 * time.Minute)
+		}, "monitor.slow_query_min_duration"},
 		{"ingest_metrics_url не адрес", func(c *Config) { c.Monitor.IngestMetricsURL = "ingest:9101" }, "monitor.ingest_metrics_url"},
 		{"ingest_metrics_url не http(s)", func(c *Config) { c.Monitor.IngestMetricsURL = "ftp://ingest:9101/metrics" }, "monitor.ingest_metrics_url"},
 		{"alerts crit ≥ min", func(c *Config) {
@@ -1058,6 +1076,8 @@ func TestValidate(t *testing.T) {
 	c.Web.Listen = "/run/crawler-web/web.sock"                                         // unix-сокет — вариант публичного входа web (T-124)
 	c.Dashboard.Refresh = Duration(5 * time.Minute)                                    // верхняя граница периода снимков (ТЗД §8.3)
 	c.Dashboard.Probes = map[string]string{"dns-worker": "http://dns-worker:9102"}     // проба живости (ТЗД §5.8)
+	c.Monitor.SlowQueryInterval = 0                                                    // медленные запросы выключены — допустимо (T-177)
+	c.Monitor.SlowQueryMinDuration = 0                                                 // порог 0 — дефолт цикла (T-177)
 	c.Subdomains = make([]string, maxSubdomains)
 	for i := range c.Subdomains {
 		c.Subdomains[i] = fmt.Sprintf("s%d", i)

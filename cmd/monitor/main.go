@@ -10,7 +10,9 @@
 // XLEN + INFO memory); недостающие пороги T-162 — абсолютный минимум
 // диска (Warn/эскалация), троттлинг MemoryHigh, замороженная очередь
 // (last-delivered-id), PSI CPU; переходы алертов доставляются в
-// Telegram (TelegramNotifier → telegram-notify.sh --message).
+// Telegram (TelegramNotifier → telegram-notify.sh --message). Ещё два
+// цикла — отчёт системной нагрузки (T-173) и медленные запросы
+// PostgreSQL (T-177: pg_stat_activity → Telegram той же доставкой).
 // Каркас — internal/service: миграции, пул БД (OnDBPool), пробы /livez +
 // /healthz, /metrics, graceful shutdown (ТЗ 3.4).
 package main
@@ -110,8 +112,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// gauge серой зоны Laravel-находок (T-115) и счётчики истории
 	// детекции appeared/lost (T-118) — все периодические проходы по БД,
 	// завершаются отменой ctx. Четвёртый цикл — отчёт системной
-	// нагрузки (T-173), подключается ниже — после сборки Telegram-доставки.
-	bg := make(chan error, 4)
+	// нагрузки (T-173), пятый — медленные запросы PostgreSQL (T-177):
+	// оба подключаются ниже, после сборки Telegram-доставки.
+	bg := make(chan error, 5)
 	go func() {
 		bg <- monitor.ZoneStatsLoop(ctx, pool, reg, monitor.ZoneStatsOptions{
 			Interval: cfg.Monitor.ZoneStatsInterval.D(),
@@ -196,6 +199,27 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		})
 	}()
 
+	// Медленные запросы PostgreSQL (T-177): цикл опрашивает
+	// pg_stat_activity — выполняемые дольше monitor.slow_query_min_duration
+	// клиентские операторы уходят в Telegram той же доставкой, что алерты
+	// и отчёт нагрузки (дебаунс pid+query_start; агрегаты monitor —
+	// UPDATE по 47 млн строк каждые 5 мин, замер §12 — исключены
+	// application_name пула). Полный посмертный след — журнал сервера
+	// (log_min_duration_statement, deploy/postgres). 0 — цикл выключен
+	// (SlowQueryLoop молча выйдет).
+	go func() {
+		bg <- monitor.SlowQueryLoop(ctx, monitor.PGSlowQueries{
+			Pool:       pool,
+			ExcludeApp: "monitor",
+		}, monitor.SlowQueryOptions{
+			Interval:    cfg.Monitor.SlowQueryInterval.D(),
+			MinDuration: cfg.Monitor.SlowQueryMinDuration.D(),
+			Log:         logger,
+			Metrics:     reg,
+			Notify:      telegram.Send,
+		})
+	}()
+
 	err := monitor.AlertsLoop(ctx, deps, monitor.AlertsOptions{
 		Interval:          cfg.Monitor.ZoneStatsInterval.D(),
 		ZoneStatsInterval: cfg.Monitor.ZoneStatsInterval.D(),
@@ -216,7 +240,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// (отмена идемпотентна и при уже остановленных циклах). Их сбой не
 	// прячем за nil алертов — забираем результаты.
 	cancel()
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 5; i++ {
 		bgErr := <-bg
 		if err == nil {
 			err = bgErr

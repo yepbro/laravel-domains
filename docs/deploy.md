@@ -367,7 +367,14 @@ dev; расширение pg_stat_statements и preload — postgresql-конф�
 sudo -u postgres psql -c "CREATE ROLE crawler LOGIN PASSWORD '...';"
 sudo -u postgres createdb -O crawler crawler
 sudo -u postgres psql -d crawler -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+sudo -u postgres psql -d crawler -c "GRANT pg_read_all_stats TO crawler;"
 ```
+
+Грант `pg_read_all_stats` (T-177): без него `pg_stat_activity` прячет
+текст запросов чужих сессий от роли `crawler` — цикл медленных запросов
+monitor видит длительности, но не тексты (сообщения с пометкой «текст
+недоступен»); грант даёт чтение статистики (pg_stat_activity/
+pg_stat_statements), не прав.
 
 Unbound: конфиг рекурсии — `deploy/docker/unbound/unbound.internet.conf`
 (кэши под бюджет ≈ 0,7 ГБ уже рассчитаны в нём; копия в

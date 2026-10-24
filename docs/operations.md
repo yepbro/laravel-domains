@@ -246,6 +246,17 @@ make logs SERVICE=monitor | grep -i warn      # dev
 
 После правок `crawler.env` — `systemctl restart crawler-monitor`.
 
+Той же доставкой отправляются ещё два типа сообщений monitor: отчёт
+нагрузки 📊 (T-173, раз в `monitor.load_report_interval`) и извещения о
+медленных запросах PostgreSQL 🐌 (T-177): операторы, выполняемые дольше
+`monitor.slow_query_min_duration` (3 с), — по одному сообщению на
+каждый новый (дебаунс pid+query_start), с меткой сервиса и pid; полный
+лог медленных операторов — журнал сервера PostgreSQL
+(`log_min_duration_statement = 3s`, [db.md](db.md) §«Мониторинг»). Для
+текстов чужих сессий нужен `GRANT pg_read_all_stats` роли `crawler`
+([deploy.md](deploy.md) §4.1) — без гранта в сообщении пометка «текст
+недоступен».
+
 **Мусорные `content_hash`** (`ingest_bad_hashes`): счётчик
 `crawler_ingest_bad_hashes_total` сервиса ingest (удалённые очисткой
 результаты с хэшем неверной длины) вырос на ≥ 10 за окно ≈15 минут —

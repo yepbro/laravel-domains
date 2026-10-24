@@ -124,6 +124,9 @@ func TestRequiredSettings(t *testing.T) {
 		"random_page_cost":                      "1.1",
 		"maintenance_io_concurrency":            "200",
 		"shared_preload_libraries":              "pg_stat_statements",
+		// T-177: порог лога медленных запросов = порогу цикла monitor
+		// (monitor.slow_query_min_duration) — одна граница «патология».
+		"log_min_duration_statement": "3000",
 	}
 	for name, want := range required {
 		if got := settings[name]; got != want {

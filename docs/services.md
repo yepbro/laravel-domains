@@ -207,6 +207,8 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | коллектор SQL `GROUP BY check_state` (без deleted, §13.1) с периодом `scheduler.backlog_interval` (по умолчанию 5 мин, T-161; был 30 с) — `scheduler.BacklogLoop` |
 | `crawler_backlog_pass_seconds` / `crawler_backlog_skipped_ticks_total` | histogram / counter | — | scheduler (T-161) | каждый проход агрегата backlog: длительность (корзины 0.5с…~8.5 мин — замер §12: 17+ с на 47 млн строк) и пропущенные тики single-flight (проход дольше интервала — накопившийся тик не запускает новый проход, Warn в журнале); рост пропусков — таблица растёт быстрее интервала, поднимать `scheduler.backlog_interval` |
 | `crawler_zonestats_pass_seconds` / `crawler_zonestats_skipped_ticks_total` | histogram / counter | — | monitor (T-161) | каждый проход пересчёта зон T-078: длительность и пропущенные тики single-flight (та же механика, что у backlog) |
+| `crawler_pg_slow_queries` | gauge | — | monitor (T-177) | проход цикла медленных запросов: клиентские операторы PostgreSQL, выполняемые дольше `monitor.slow_query_min_duration` на момент снимка `pg_stat_activity` (собственные агрегаты monitor исключены `application_name`); hold-last при сбое источника |
+| `crawler_pg_slow_queries_total` | counter | `app` | monitor (T-177) | обнаруженные медленные запросы по `application_name` сервиса (новые операторы дольше порога, дебаунс pid+query_start); дублируют Telegram-сообщение метками Prometheus |
 | `crawler_dashboard_snapshots_total` | counter | `result` | dashboard (`ok`/`error`, ТЗД §10) | каждый проход цикла сборки снимков: `error` — проход с деградированными секциями (снимок публикуется, причины — Warn в логе и карта `errors` /api/status) |
 | `crawler_dashboard_snapshot_seconds` | histogram | — | dashboard | длительность того же прохода (корзины 50 мс…~3 мин: проход — полные агрегаты `internal/status`) |
 
@@ -622,6 +624,25 @@ HTTP). Значения монотонны (журнал append-only) — gauge 
 counter-семантикой корректен для `rate()`/`increase()`; период — 1 ч,
 как у серой зоны: тренды детекции — материал дашборда, не оперативный
 сигнал конвейера.
+
+Цикл медленных запросов PostgreSQL того же сервиса
+(`internal/monitor/slowqueries.go`, T-177): раз в
+`monitor.slow_query_interval` (по умолчанию 10 с) опрашивает
+`pg_stat_activity` — клиентские операторы, выполняемые дольше
+`monitor.slow_query_min_duration` (3 с — порог боевого лога
+`log_min_duration_statement`, [db.md](db.md) §«Мониторинг»), уходят
+одним сообщением в Telegram той же доставкой, что алерты (шапка с
+числом новых и «всего в работе», три самых долгих строки
+«длительность [сервис] pid: текст»; Warn в журнал и метрики
+`crawler_pg_slow_queries` / `crawler_pg_slow_queries_total`). Дебаунс —
+pid+query_start: оператор сообщается один раз при первом наблюдении,
+завершившийся покидает базу; собственные агрегаты monitor (UPDATE по
+47 млн строк каждые 5 мин, замер §12 — штатная нагрузка) исключены
+`application_name` пула, метки сервисов в сообщении — оттуда же. Снимок
+мгновенный, а не поток событий: эпизоды короче интервала цикла ловятся
+частично, дольше — всегда; полный посмертный след — журнал сервера.
+Для текста чужих сессий роли БД нужен `pg_read_all_stats` (deploy.md
+§4.1) — без гранта сообщение честно помечает «текст недоступен».
 
 Второй цикл того же сервиса — оценка алертов минимального набора ТЗ 5.9
 (`internal/monitor/alerts.go`, T-080; ТЗ 8, ТЗ 10.3), период — тот же

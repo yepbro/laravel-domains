@@ -1,6 +1,7 @@
 // Юнит-тесты пула подключений без БД: сборка pgxpool.Config из Options
-// (дефолты, приоритет pool_size над DSN, валидация), fail-fast Open на
-// недоступном сервере, скрытие пароля в ошибках.
+// (дефолты, приоритет pool_size над DSN, метка application_name,
+// валидация), fail-fast Open на недоступном сервере, скрытие пароля в
+// ошибках.
 package db
 
 import (
@@ -71,6 +72,36 @@ func TestBuildPoolConfig_Overrides(t *testing.T) {
 	}
 	if cfg.ConnConfig.ConnectTimeout != 3*time.Second {
 		t.Errorf("ConnectTimeout = %s, want 3s", cfg.ConnConfig.ConnectTimeout)
+	}
+}
+
+func TestBuildPoolConfig_AppName(t *testing.T) {
+	// Метка сервиса: AppName задаёт application_name пула; явная метка
+	// в DSN важнее (T-177 — выбор оператора не перетирается).
+	cfg, err := buildPoolConfig(Options{DSN: testDSN, AppName: "monitor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.ConnConfig.RuntimeParams["application_name"]; got != "monitor" {
+		t.Errorf("application_name = %q, want monitor", got)
+	}
+
+	dsn := "postgres://crawler@127.0.0.1:5432/crawler?sslmode=disable&application_name=ops-console"
+	cfg, err = buildPoolConfig(Options{DSN: dsn, AppName: "monitor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.ConnConfig.RuntimeParams["application_name"]; got != "ops-console" {
+		t.Errorf("application_name = %q, want ops-console (DSN важнее AppName)", got)
+	}
+
+	// Пустой AppName — параметр не задаётся вовсе.
+	cfg, err = buildPoolConfig(Options{DSN: testDSN})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := cfg.ConnConfig.RuntimeParams["application_name"]; ok {
+		t.Errorf("application_name = %q без AppName, want не задан", got)
 	}
 }
 

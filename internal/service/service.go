@@ -245,7 +245,15 @@ func Run(opts Options) error {
 			poolSize = opts.Config.Postgres.PoolSize
 		}
 		openCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		p, err := db.Open(openCtx, db.Options{DSN: dsn, PoolSize: poolSize, AfterConnect: opts.DBAfterConnect})
+		p, err := db.Open(openCtx, db.Options{
+			DSN:          dsn,
+			PoolSize:     poolSize,
+			AfterConnect: opts.DBAfterConnect,
+			// Метка сервиса в pg_stat_activity (T-177: цикл медленных
+			// запросов monitor исключает свои агрегаты и читает метку
+			// сервиса в сообщениях оператору).
+			AppName: opts.Name,
+		})
 		cancel()
 		if err != nil {
 			opts.Logger.Error("пул PostgreSQL", "err", err)
