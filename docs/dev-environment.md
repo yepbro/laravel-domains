@@ -541,7 +541,7 @@ ingest/schema), а не дублируют их; карта покрытия:
 | п. 4 | анализ (версии/score) + reanalyze без скачивания | `TestAccept04_ReanalyzeNoRefetch` |
 | п. 5 | выборки из `laravel_domains`/`laravel_findings` | `TestAccept05_LaravelTablesQueries` |
 | п. 6 | прогресс зон обновляется автоматически; метрики | `TestAccept06_ZoneProgressAutomatic` |
-| п. 7 | суточный прогон в бюджете памяти на целевом сервере | вне dev-стенда — задача T-093 |
+| п. 7 | суточный прогон в бюджете памяти на целевом сервере | вне dev-стенда — задача T-093, выполнена ([load-measurements.md](load-measurements.md) §13) |
 | п. 8 | интервал перепроверки (6 месяцев, конфиг) | `TestAccept08_RecheckInterval` |
 | п. 9 | рестарты сервисов: без потерь и «застрявших» (lease) | `TestAccept09_RestartNoStuckDomains` |
 | п. 10 | поиск по имени в любой форме; понятное «не найдено» | `TestAccept10_DomainSearchByName` |

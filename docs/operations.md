@@ -367,8 +367,12 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # тома
   и логу юнита.
 - **Память**: `systemctl status crawler-<сервис>` показывает `Memory:`;
   потолок — `systemctl show -p MemoryMax` (http-worker — и мягкий
-  `-p MemoryHigh`, T-145). Суточный прогон без OOM —
-  критерий ТЗ 11.4 п. 7 (T-093): `journalctl -k --grep oom` пуст,
+  `-p MemoryHigh`, T-145). Суточный прогон без OOM — критерий ТЗ 11.4
+  п. 7 (T-093, **выполнен** 24.10: `journalctl -k --since "2026-10-23
+  09:00" --grep oom` пуст — окно в `--since` обязательно, без него
+  видны записи инцидентов до окна; пики в бюджетах MemoryMax —
+  [`load-measurements.md`](load-measurements.md) §13); текущий
+  контроль: `journalctl -k --grep oom` пуст,
   рестарты — по `NRestarts` (бьёт алерт unit_oom, T-145).
 - **Память Redis** — `crawler_redis_memory_ratio` (алерт `redis_memory`
   при ≥ 80 % `maxmemory`, T-154; при noeviction — предупреждение

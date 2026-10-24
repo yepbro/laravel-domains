@@ -703,9 +703,13 @@ systemctl kill -s HUP crawler-analyzer  # перезагрузка правил 
 - **Память**: `systemctl status crawler-http-worker` показывает
   `Memory: …` (текущее потребление cgroup); потолок виден в
   `systemctl show crawler-http-worker -p MemoryMax`. Проверка суточного
-  прогона без OOM — критерий приёмки ТЗ 11.4 п. 7 (задача T-093): журнал
-  ядра `journalctl -k --grep 'oom'` должен быть пуст, рестарты юнитов —
-  по счётчику `NRestarts`.
+  прогона без OOM — критерий приёмки ТЗ 11.4 п. 7 (задача T-093,
+  **выполнен** — окно 23–24.10 ≈25 ч: `journalctl -k --since
+  "2026-10-23 09:00" --grep 'oom'` пуст — `--since` обязателен:
+  без окна команда покажет записи инцидентов до окна, напр. cgroup-OOM
+  T-157 от 23.10 05:48; oom_kill/NRestarts юнитов нулевые, пики
+  в бюджетах MemoryMax —
+  [`load-measurements.md`](load-measurements.md) §13).
 - **Метрики**: `127.0.0.1:9100…9108/metrics` (monitor — 9100, web —
   9107, dashboard — 9108; второй+ экземпляр render-worker — 9109 и
   далее по имени экземпляра, §2.2). Скрейпит установленный на сервере
