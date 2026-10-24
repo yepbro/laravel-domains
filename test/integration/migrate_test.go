@@ -257,7 +257,8 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	// функции, повторное применение безопасно без подготовки), 0013/0014
 	// снимают частичный индекс deleted-доменов и индексы окон
 	// мониторинга (T-170/T-171), 0015 — таблицу счётчика crawler_counters
-	// (T-175).
+	// вместе с колонкой updated_at из 0016 (T-178), 0016 — колонки
+	// счётчиков зон.
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -277,6 +278,8 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		"DROP TABLE IF EXISTS crawler_counters",
 		"DROP INDEX IF EXISTS laravel_domains_updated_at_idx",
 		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_laravel",
+		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_pending",
+		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_queued",
 		"TRUNCATE schema_migrations",
 		"INSERT INTO schema_migrations (version, dirty) VALUES (7, false)",
 	} {

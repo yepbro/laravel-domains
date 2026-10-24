@@ -24,6 +24,7 @@ import (
 	"crawler/internal/config"
 	"crawler/internal/dashboard"
 	"crawler/internal/dashboard/auth"
+	"crawler/internal/monitor"
 	"crawler/internal/queue"
 )
 
@@ -109,6 +110,15 @@ func TestDashboard_Snapshot(t *testing.T) {
 	seed := seedDashboardData(t, pool)
 	if seed.zoneID == 0 || seed.domains[0] == 0 {
 		t.Fatal("посев данных не вернул идентификаторы")
+	}
+
+	// Реконсиляция счётчиков (T-178): зоны/status-распределение/
+	// кумулятивы истории читаются дашбордом из zones.domains_* и
+	// crawler_counters — их наполняет совмещённый проход monitor
+	// (посев ниже уровня переходов, прямой SQL). Тот же порядок, что и
+	// в бою: миграция → первый проход monitor → читатели.
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("реконсиляция счётчиков после посева: %v", err)
 	}
 
 	// Глубины стримов: записи без групп потребителей — Len даёт XLEN.
