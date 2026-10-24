@@ -551,9 +551,13 @@ ops-workflow'ем `ops-telegram-env` (Actions → Run workflow: значения
 деплой-архиве вместе с бинарниками (deploy.yml кладёт
 `deploy/telegram-notify.sh` в архив, install распаковывает его в
 `/opt/crawler/bin` и chmod 0755) — отдельной установки не требует;
-скрипту нужен пакет `jq` (§4.1). Пошагово —
-[`operations.md`](operations.md) §4.3; без секретов алерты и отчёты
-остаются Warn/Info в journald monitor.
+скрипту нужен пакет `jq` (§4.1). Третье условие — сеть до
+`api.telegram.org`: с российских хостингов API Telegram часто
+недоступен (дроп TCP при живом интернете) — доставка тогда идёт
+через `https_proxy` в `crawler.env` и прокси на внешнем VPS.
+Пошагово — [`operations.md`](operations.md) §4.3 (секреты, скрипт,
+прокси) и §5 (запись 24.10 — установка прокси); без секретов алерты
+и отчёты остаются Warn/Info в journald monitor.
 
 ### 4.6. Юниты и запуск
 

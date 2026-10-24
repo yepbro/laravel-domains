@@ -242,7 +242,22 @@ make logs SERVICE=monitor | grep -i warn      # dev
    скрипту нужны `bash`, `curl` и `jq` на сервере (`jq` — список пакетов
    [`deploy.md`](deploy.md) §4.1; без него отправка падает exit 127);
    путь переопределяется `monitor.alerts.telegram_script`. Проверка без
-   отправки: `TELEGRAM_BOT_TOKEN=x TELEGRAM_CHAT_ID=y /opt/crawler/bin/telegram-notify.sh --message "тест" --dry-run`.
+   отправки: `TELEGRAM_BOT_TOKEN=x TELEGRAM_CHAT_ID=y /opt/crawler/bin/telegram-notify.sh --message "тест" --dry-run`;
+3. Сеть до `api.telegram.org`: боевой сервер (российский хостинг) не
+   проходит к API Telegram — TCP на `api.telegram.org:443` дропается
+   (блокировка РКН; замер 24.10: github.com → 200, ya.ru → 302,
+   telegram → таймаут по IPv4 и IPv6, DNS корректен). Симптом — Warn
+   в журнале monitor каждые 10 минут: `curl: (28) Failed to connect
+   to api.telegram.org … Timeout was reached (HTTP 000)`. Решение —
+   HTTP-прокси на доступном извне VPS (внешний хост оператора
+   `104.253.1.37`): `tinyproxy`, порт 3128, только `CONNECT 443`,
+   `Allow` только IP боевого сервера; подключение — строкой
+   `https_proxy=http://104.253.1.37:3128` в `/etc/crawler/crawler.env`
+   (curl скрипта берёт переменную из окружения юнита автоматически).
+   Установка/диагностика/откат прокси — журнал работ §5 (24.10) и
+   `/root/README.crawler-telegram-proxy.txt` на самом VPS. Без прокси
+   алерты и отчёты продолжают писаться в journald — краулер не
+   страдает, тихо недоступна только доставка.
 
 После правок `crawler.env` — `systemctl restart crawler-monitor`.
 
@@ -434,3 +449,30 @@ Telegram и Actions).
   docker-сети (postgres→web, затем dashboard→testweb занимали чужие
   адреса при остановленных соседях) — порядок старта: остановить
   узурпатора → стартовать владельца IP → вернуть узурпатора.
+
+### 2026-10-24 — доставка Telegram через прокси (разблокировка T-162/T-173)
+
+- После деплоя T-173 отчёты нагрузки генерировались каждые 10 минут,
+  но доставка молчала: `curl: (28) Failed to connect to
+  api.telegram.org:443 — Timeout` (HTTP 000) на каждой отправке.
+  Упавший ops-ран `ops-telegram-env` (06:58, код 3 «строка включения
+  не найдена») — ложная тревога: он стартовал до деплоя фикса
+  `61b3484` (скрипта ещё не было в `/opt/crawler/bin`), секреты при
+  этом записаны корректно; после деплоя 07:17 доставка включилась
+  сама и упёрлась в сеть.
+- Диагноз: с боевого IP `api.telegram.org` недоступен (дроп TCP),
+  остальной интернет работает (github → 200, ya.ru → 302); CI-извещения
+  приходили, т.к. их шлёт раннер GitHub — это маскировало проблему.
+- Решение: на внешнем VPS оператора `104.253.1.37` (vpn, Ubuntu 24.04)
+  установлен `tinyproxy 1.11.1` — порт 3128 (свободен: Amnezia-стек
+  слушает 53/443/500/4500/47386/34116/41289/35826, mtproto-proxy —
+  8443), только `CONNECT 443`, `Allow` только 155.212.174.88 и
+  localhost, `enable --now`. Конфиг `/etc/tinyproxy/tinyproxy.conf`,
+  памятка — `/root/README.crawler-telegram-proxy.txt` на VPS.
+- На проде: `https_proxy=http://104.253.1.37:3128` дописан в
+  `/etc/crawler/crawler.env` (переживает деплои и ops-раны — те
+  меняют только `TELEGRAM_*` ключи), `systemctl restart
+  crawler-monitor`. Проверка 09:57 MSK: CONNECT в логе прокси,
+  ошибок отправки нет, отчёты ходят в группу.
+- Откат: убрать `https_proxy` из `crawler.env` + restart monitor;
+  на VPS — `systemctl disable --now tinyproxy && apt purge tinyproxy`.
