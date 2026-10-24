@@ -74,6 +74,15 @@ func (j *renderqJournal) count(e string) int {
 	return n
 }
 
+// snapshot — копия всех событий (проверка последовательностей шагов).
+func (j *renderqJournal) snapshot() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]string, len(j.events))
+	copy(out, j.events)
+	return out
+}
+
 // --- фейковые RenderLen и очередь --------------------------------------------
 
 // renderqLen — RenderLen: длина по счётчику вызовов (seq — ответы по
@@ -227,14 +236,18 @@ type renderqRow struct {
 type renderqPool struct {
 	j *renderqJournal
 
-	zones    map[int16]string
-	domains  map[renderqDomKey]*renderqDomain
-	rows     map[renderqDomKey][]renderqRow
+	zones   map[int16]string
+	domains map[renderqDomKey]*renderqDomain
+	rows    map[renderqDomKey][]renderqRow
+	// order — порядок вставки доменов: «физический порядок кучи» для
+	// выборки без ORDER BY (T-181) — seq scan возвращает строки
+	// раскладкой, а не PK; сид-порядок детерминирует пачки в тестах.
+	order    []renderqDomKey
 	counters map[string]int64 // T-175: crawler_counters ('render_pending')
 
 	queryErrs    map[string]error
 	beforeHook   func() // вызывается перед первым Exec транзакции снятия (симуляция гонок)
-	counterNoRow bool   // строка счётчика отсутствует (UPDATE 0 — ошибка вызывающего)
+	counterNoRow bool   // строка счётчика отсутствует (guard и UPDATE 0 — ошибка вызывающего)
 
 	mu       sync.Mutex
 	queries  int
@@ -258,6 +271,7 @@ func newRenderqPool() *renderqPool {
 func (p *renderqPool) seedDomain(zone int16, id int64, label string, flags model.Flags, status model.Status) *renderqDomain {
 	d := &renderqDomain{flags: flags, status: status, label: label}
 	p.domains[renderqDomKey{zone: zone, id: id}] = d
+	p.order = append(p.order, renderqDomKey{zone: zone, id: id})
 	// Инвариант счётчика (T-175): он равен числу строк с битом — как
 	// бэкфилл миграции 000015 (без фильтра по status: удалённый с битом
 	// домен в счётчике остаётся, снимает бит только проход доработки).
@@ -322,15 +336,20 @@ func (t *renderqTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.C
 	}
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
-	if t.pool.beforeHook != nil {
-		t.pool.beforeHook()
-		t.pool.beforeHook = nil
-	}
 	if err := t.pool.queryErrs[sql]; err != nil {
 		return pgconn.CommandTag{}, err
 	}
 	switch sql {
+	case renderPlanNoIndexScanSQL, renderPlanNoBitmapScanSQL, renderPlanNoIOSQL:
+		// Закрепление плана выборки (T-181): SET LOCAL ×3 до SELECT —
+		// последовательность проверяет TestRequeueOnceSelectPlan.
+		t.j.record("plan")
+		return pgconn.NewCommandTag("SET"), nil
 	case renderClearPendingSQL:
+		if t.pool.beforeHook != nil {
+			t.pool.beforeHook()
+			t.pool.beforeHook = nil
+		}
 		if len(args) != 2 {
 			return pgconn.CommandTag{}, fmt.Errorf("renderqPool: снятие флага: параметров %d, нужно 2", len(args))
 		}
@@ -377,6 +396,48 @@ func (t *renderqTx) Commit(context.Context) error {
 	return nil
 }
 
+// Query — выборка пачки доменов ВНУТРИ транзакции закрепления плана
+// (T-181): renderSelectPending зовёт tx.Query, не пул — фейк повторяет
+// живую точку вызова (пул напрямую пачку не читает).
+func (t *renderqTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	if err := t.pool.queryErrs[sql]; err != nil {
+		return nil, err
+	}
+	t.pool.queries++
+	switch sql {
+	case renderPendingDomainsSQL:
+		if len(args) != 1 {
+			return nil, fmt.Errorf("renderqPool: домены: параметров %d, нужно 1 (LIMIT)", len(args))
+		}
+		limit, ok := args[0].(int)
+		if !ok || limit <= 0 {
+			return nil, fmt.Errorf("renderqPool: домены: LIMIT %v (%T)", args[0], args[0])
+		}
+		t.j.record("select")
+		// Порядок — «физический» (order, порядок вставки): SQL без
+		// ORDER BY, seq scan возвращает раскладку кучи (T-181).
+		rows := make([][]any, 0, limit)
+		for _, k := range t.pool.order {
+			if len(rows) == limit {
+				break
+			}
+			d, ok := t.pool.domains[k]
+			if !ok || !d.flags.Test(model.FlagRenderPending) || d.status == model.StatusDeleted {
+				continue // WHERE бита и status <> deleted
+			}
+			rows = append(rows, []any{k.zone, k.id, d.label + "." + t.pool.zones[k.zone]})
+		}
+		return renderqRowsOf(rows...), nil
+	default:
+		return nil, fmt.Errorf("renderqPool: неожидаемый SQL Query в транзакции: %s", sql)
+	}
+}
+
 func (t *renderqTx) Rollback(context.Context) error {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
@@ -398,48 +459,14 @@ func (p *renderqPool) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	}
 	p.queries++
 	switch sql {
-	case renderPendingDomainsSQL:
-		if len(args) != 1 {
-			return nil, fmt.Errorf("renderqPool: домены: параметров %d, нужно 1 (LIMIT)", len(args))
+	case renderDebtCounterSQL:
+		// Guard прохода (T-181): точечное чтение счётчика долга; строка
+		// обязана быть (миграция 000015) — её отсутствие эмулируется
+		// пустым набором (renderDebtCount ошибается).
+		if p.counterNoRow {
+			return renderqRowsOf(), nil
 		}
-		limit, ok := args[0].(int)
-		if !ok || limit <= 0 {
-			return nil, fmt.Errorf("renderqPool: домены: LIMIT %v (%T)", args[0], args[0])
-		}
-		type dom struct {
-			z int16
-			i int64
-			n string
-		}
-		var sel []dom
-		for k, d := range p.domains {
-			if !d.flags.Test(model.FlagRenderPending) || d.status == model.StatusDeleted {
-				continue // WHERE бита и status <> deleted
-			}
-			sel = append(sel, dom{z: k.zone, i: k.id, n: d.label + "." + p.zones[k.zone]})
-		}
-		sortDom := func(a, b dom) bool {
-			if a.z != b.z {
-				return a.z < b.z
-			}
-			return a.i < b.i
-		}
-		// ORDER BY zone_id, id + LIMIT (пузырёк: пачки маленькие).
-		for i := 0; i < len(sel); i++ {
-			for j := i + 1; j < len(sel); j++ {
-				if sortDom(sel[j], sel[i]) {
-					sel[i], sel[j] = sel[j], sel[i]
-				}
-			}
-		}
-		if len(sel) > limit {
-			sel = sel[:limit]
-		}
-		rows := make([][]any, len(sel))
-		for i, d := range sel {
-			rows[i] = []any{d.z, d.i, d.n}
-		}
-		return renderqRowsOf(rows...), nil
+		return renderqRowsOf([]any{p.counters["render_pending"]}), nil
 	case renderPendingRowsSQL:
 		if len(args) != 2 {
 			return nil, fmt.Errorf("renderqPool: записи: параметров %d, нужно 2", len(args))
@@ -1587,6 +1614,204 @@ func TestRequeueOnceSelection(t *testing.T) {
 	}
 }
 
+// TestRequeueOnceBatchLimit — LIMIT пачки без ORDER BY (T-181): выборка
+// берёт первые limit строк «физического» порядка, остальные домены
+// сохраняют флаг до следующего прохода (детерминизм пачек не нужен —
+// снятие флага исключает повторы).
+func TestRequeueOnceBatchLimit(t *testing.T) {
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	pool.seedDomain(5, 11, "one", model.FlagRenderPending, model.StatusAlive)
+	pool.seedDomain(5, 12, "two", model.FlagRenderPending, model.StatusAlive)
+	pool.seedDomain(5, 13, "three", model.FlagRenderPending, model.StatusAlive)
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{BatchSize: 2})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Selected != 2 || res.Full {
+		t.Fatalf("итог %+v, ожидался selected=2 (LIMIT) full=false", res)
+	}
+	// Первые два по порядку вставки сняты (черновой флаг — без SPA-записей),
+	// третий ждёт следующего прохода.
+	for _, id := range []int64{11, 12} {
+		if pool.domains[renderqDomKey{zone: 5, id: id}].flags.Test(model.FlagRenderPending) {
+			t.Fatalf("домен %d не снят первым проходом", id)
+		}
+	}
+	if !pool.domains[renderqDomKey{zone: 5, id: 13}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("домен за пределами LIMIT снят — пачка больше лимита")
+	}
+}
+
+// TestRequeueOnceSelectPlan — закрепление формы плана выборки (T-181):
+// пачка читается в явной транзакции строго последовательностью
+// SET LOCAL ×3 → SELECT → COMMIT (реплика диаграммы §2 ТЗ: без
+// закрепления планировщик берёт index scan по PK — запрос №2 журнала
+// медленных 24.10); выборка идёт через транзакцию, не пул.
+func TestRequeueOnceSelectPlan(t *testing.T) {
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+
+	if _, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{}); err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	ev := pool.j.snapshot()
+	sel := pool.j.indexOf("select")
+	if sel < 4 {
+		t.Fatalf("select в журнале на позиции %d — нет истории шагов: %v", sel, ev)
+	}
+	if ev[sel-4] != "begin" || ev[sel-3] != "plan" || ev[sel-2] != "plan" || ev[sel-1] != "plan" {
+		t.Fatalf("перед SELECT нет транзакции закрепления плана: %v", ev)
+	}
+	if len(ev) <= sel+1 || ev[sel+1] != "commit" {
+		t.Fatalf("после SELECT нет фиксации: %v", ev)
+	}
+}
+
+// TestRequeueRenderPendingDrainNoProgress — стартовый дренаж не крутится
+// вхолостую по пачке без прогресса (T-181): контент не читается (keep),
+// флаги стоят — очередная выборка вернула бы те же домены; без остановки
+// цикл молотил бы БД без темпителя (дорогая выборка журнала медленных
+// больше не замедляет его сама).
+func TestRequeueRenderPendingDrainNoProgress(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool := newRenderqPool()
+	pool.zones[5] = "example"
+	body := &renderqContent{
+		bodies: map[content.Hash][]byte{},
+		errOn:  map[content.Hash]error{hSPA: errors.New("pack: блок не читается")},
+	}
+	pool.j.done = make(chan string, 64)
+	q := &renderqQueue{j: pool.j}
+	rq, err := NewRenderQueue(q, &renderqLen{}, 100, nil)
+	if err != nil {
+		t.Fatalf("NewRenderQueue: %v", err)
+	}
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RequeueRenderPending(ctx, pool, body, rq,
+			RequeueOptions{Interval: time.Hour, BatchSize: 1})
+	}()
+
+	// Ждём выборки стартового прохода.
+	deadline := time.After(3 * time.Second)
+	for pool.j.count("select") == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("стартовый дренаж не выполнил выборку")
+		case <-pool.j.done:
+		case <-time.After(time.Millisecond):
+		}
+	}
+	// Пачка полная (BatchSize = 1), флаг не снят (контент не читается):
+	// дренаж обязан остановиться — следующий тик не раньше Interval.
+	time.Sleep(50 * time.Millisecond)
+	if c := pool.j.count("select"); c != 1 {
+		t.Fatalf("выборок %d за стартовый проход, ожидалась 1 (пачка без прогресса — ждать тика)", c)
+	}
+	if !pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("флаг снят при нечитаемом контенте")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RequeueRenderPending: %v (отмена — чистый nil)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("цикл не завершился после отмены ctx")
+	}
+}
+
+// TestRequeueOnceGuardZeroDebt — guard счётчиком долга (T-181): при
+// нулевом счётчике тяжёлая выборка не выполняется вовсе — даже если
+// флаги живы (рассинхрон ручного SQL: дренаж стоит до пересчёта,
+// runbooks §6; честный стационар — то же поведение без чтения domains).
+func TestRequeueOnceGuardZeroDebt(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, q, ln, rq := renderqPassKit(t, 0)
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
+	pool.counters["render_pending"] = 0 // ручной рассинхрон: флаг жив, счётчик нулевой
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Selected != 0 || res.Cleared != 0 || res.Published != 0 || res.Full {
+		t.Fatalf("итог %+v, ожидался пустой (guard: долга нет)", res)
+	}
+	if c := pool.j.count("select"); c != 0 {
+		t.Fatalf("тяжёлый SELECT выполнен %d раз при нулевом счётчике долга", c)
+	}
+	if c := pool.j.count("plan"); c != 0 {
+		t.Fatalf("закрепление плана выполнено %d раз при нулевом счётчике долга", c)
+	}
+	if n := len(q.snapshot()); n != 0 {
+		t.Fatalf("публикаций %d при нулевом счётчике долга", n)
+	}
+	if !pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("флаг снят при нулевом счётчике — guard обязан держать дренаж до пересчёта")
+	}
+	if n := ln.callsCount(); n != 1 {
+		t.Fatalf("обращений к XLEN %d, ожидалось 1 (guard — после проверки ёмкости)", n)
+	}
+
+	// Отрицательный счётчик (невозможен кодом — только ручная правка):
+	// тот же ранний возврат «долга нет» — тихий баг счётчика не должен
+	// запускать дренаж по отрицательному долгу.
+	pool.counters["render_pending"] = -1
+	res, err = RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce (отрицательный счётчик): %v", err)
+	}
+	if res.Selected != 0 || res.Cleared != 0 || res.Published != 0 {
+		t.Fatalf("итог %+v при отрицательном счётчике, ожидался пустой", res)
+	}
+	if c := pool.j.count("select"); c != 0 {
+		t.Fatalf("тяжёлый SELECT выполнен %d раз при отрицательном счётчике", c)
+	}
+}
+
+// TestRequeueOnceGuardCounter — guard-чтение счётчика: строка есть —
+// точечный Lookup по имени; долг есть — выборка выполняется (счётчик
+// согласован с числом флагов: инвариант бэкфилла миграции 000015).
+func TestRequeueOnceGuardCounter(t *testing.T) {
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	pool.seedDomain(5, 12, "two", model.FlagRenderPending, model.StatusAlive)
+	if got := pool.counters["render_pending"]; got != 2 {
+		t.Fatalf("сид счётчика = %d, ожидался 2", got)
+	}
+
+	// Два прохода: первый снимает оба флага (черновые — без SPA-записей),
+	// счётчик к нулю; второй — guard: тяжёлой выборки нет.
+	for i := 1; i <= 2; i++ {
+		res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+		if err != nil {
+			t.Fatalf("проход %d: %v", i, err)
+		}
+		switch i {
+		case 1:
+			if res.Selected != 2 || res.Cleared != 2 {
+				t.Fatalf("проход 1: итог %+v, ожидался selected=2 cleared=2", res)
+			}
+		case 2:
+			if res.Selected != 0 || res.Cleared != 0 {
+				t.Fatalf("проход 2: итог %+v, ожидался пустой (долг исчерпан)", res)
+			}
+			if c := pool.j.count("select"); c != 1 {
+				t.Fatalf("тяжёлых SELECT за два прохода %d, ожидался 1 (второй — guard)", c)
+			}
+		}
+	}
+}
+
 // TestRequeueOnceClearRace — охрана бита при снятии: конкурент уже снял
 // флаг — RowsAffected 0 без ошибки, домен не засчитан.
 func TestRequeueOnceClearRace(t *testing.T) {
@@ -1679,7 +1904,9 @@ func TestRequeueOnceCounterFailure(t *testing.T) {
 }
 
 // TestRequeueOnceCounterMissingRow — строки счётчика нет (ручная
-// правка): ошибка, флаг не снят — пара бит+счётчик не расходится.
+// правка): guard прохода (T-181) ошибается ДО выборки — молчаливый
+// рассинхрон сделал бы и gauge, и сам guard ложью; флаг не снят — пара
+// бит+счётчик не расходится.
 func TestRequeueOnceCounterMissingRow(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, _, _, rq := renderqPassKit(t, 0)
@@ -1701,10 +1928,35 @@ func TestRequeueOnceCounterMissingRow(t *testing.T) {
 func TestRequeueOnceErrors(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 
+	// Ошибка тяжёлой выборки: долг есть (флаг + счётчик) — guard
+	// пропускает к выборке, сбой SELECT возвращается вызывающему.
 	pool, body, _, _, rq := renderqPassKit(t, 0)
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
 	pool.queryErrs[renderPendingDomainsSQL] = errors.New("sql: select")
 	if _, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{}); err == nil {
 		t.Fatal("ошибка выборки не возвращена")
+	}
+
+	// Сбой закрепления плана (SET LOCAL) — ошибка прохода, без SELECT.
+	pool2, body2, _, _, rq2 := renderqPassKit(t, 0)
+	pool2.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	pool2.queryErrs[renderPlanNoIndexScanSQL] = errors.New("sql: set local")
+	if _, err := RequeueOnce(context.Background(), pool2, body2, rq2, RequeueOptions{}); err == nil {
+		t.Fatal("ошибка SET LOCAL не возвращена")
+	}
+	if c := pool2.j.count("select"); c != 0 {
+		t.Fatalf("SELECT выполнен %d раз при сбое закрепления плана", c)
+	}
+
+	// Сбой guard-чтения счётчика — ошибка прохода, без выборки.
+	pool3, body3, _, _, rq3 := renderqPassKit(t, 0)
+	pool3.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	pool3.queryErrs[renderDebtCounterSQL] = errors.New("sql: counter")
+	if _, err := RequeueOnce(context.Background(), pool3, body3, rq3, RequeueOptions{}); err == nil {
+		t.Fatal("ошибка чтения счётчика не возвращена")
+	}
+	if c := pool3.j.count("select"); c != 0 {
+		t.Fatalf("SELECT выполнен %d раз при сбое guard", c)
 	}
 
 	pool, body, _, _, rq = renderqPassKit(t, 0)
@@ -1808,8 +2060,18 @@ func TestRenderSQLContract(t *testing.T) {
 	}
 	if !strings.Contains(renderPendingDomainsSQL, "(d.flags & 2) <> 0") ||
 		!strings.Contains(renderPendingDomainsSQL, "d.status <> 6") ||
-		!strings.Contains(renderPendingDomainsSQL, "ORDER BY d.zone_id, d.id LIMIT $1") {
-		t.Fatalf("renderPendingDomainsSQL разошёлся с контрактом:\n%s", renderPendingDomainsSQL)
+		!strings.Contains(renderPendingDomainsSQL, "LIMIT $1") ||
+		strings.Contains(renderPendingDomainsSQL, "ORDER BY") {
+		t.Fatalf("renderPendingDomainsSQL разошёлся с контрактом T-181 (без PK-порядка, LIMIT — пачка):\n%s", renderPendingDomainsSQL)
+	}
+	if renderPlanNoIndexScanSQL != "SET LOCAL enable_indexscan = off" ||
+		renderPlanNoBitmapScanSQL != "SET LOCAL enable_bitmapscan = off" {
+		t.Fatalf("закрепление плана выборки разошлось с контрактом T-181:\n%s\n%s",
+			renderPlanNoIndexScanSQL, renderPlanNoBitmapScanSQL)
+	}
+	if !strings.Contains(renderDebtCounterSQL, "SELECT value FROM crawler_counters") ||
+		!strings.Contains(renderDebtCounterSQL, "WHERE name = 'render_pending'") {
+		t.Fatalf("renderDebtCounterSQL разошёлся с контрактом T-181/T-175:\n%s", renderDebtCounterSQL)
 	}
 	if !strings.Contains(renderPendingRowsSQL, "rendered = false") ||
 		!strings.Contains(renderPendingRowsSQL, "final_url IS NOT NULL") ||

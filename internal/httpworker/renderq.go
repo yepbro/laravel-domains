@@ -46,7 +46,12 @@
 // Проход доработки (§5.6 «дорабатываются позже»): фоновый цикл
 // RequeueRenderPending (стиль суточной перепроверки T-030 и очистки
 // T-020) подбирает домены с флагом и дорабатывает их, когда очередь
-// свободна. SPA-вердикт берётся из сохранённого контента записи:
+// свободна. Выборка пачки — без PK-порядка, seq scan с ранним остановом
+// LIMIT и закреплением плана SET LOCAL + guard счётчиком долга (T-181:
+// index scan по PK вытаптывал дренированный «пустой» префикс — запрос №2
+// журнала медленных 24.10, медиана 44 с; закреплённый seq scan — десятки
+// мс, стационар без долга не трогает domains вовсе). SPA-вердикт берётся
+// из сохранённого контента записи:
 // DetectSPA (T-057) детерминирован над теми же байтами, что воркер
 // проверял при записи, — вердикт совпадает; алиасы (content_hash NULL,
 // alias_subdomain_id NOT NULL) наследуют вердикт субдомена-оригинала —
@@ -141,12 +146,50 @@ var (
 	// renderPendingDomainsSQL — пачка доменов, ждущих доработки рендера:
 	// бит render_pending выставлен, домен не удалён (§13.1 — вне цикла
 	// проверок). Имя — label || '.' || зона (стиль T-027) для Result.Name
-	// и логов; ORDER BY по PK — детерминированные пачки, LIMIT — пачка.
+	// и логов; LIMIT — пачка. ORDER BY по PK отсутствует сознательно
+	// (T-181, решение оператора 24.10 — порядок доменов не важен): сортировка
+	// держала index scan по PK, который при живом долге вытаптывает
+	// дренированный «пустой» префикс PK-порядка (запрос №2 журнала
+	// медленных 24.10: 14,1 млн Rows Removed, ≈4,5 ГБ буферов за вызов,
+	// медиана 44 с); недетерминированные пачки корректны — снятие флага
+	// после публикации исключает повторы. Форма плана (seq scan с ранним
+	// остановом LIMIT) закреплена SET LOCAL в транзакции выборки —
+	// renderPlanNoIndexScanSQL/renderPlanNoBitmapScanSQL ниже.
 	renderPendingDomainsSQL = "SELECT d.zone_id, d.id, d.label || '.' || z.name " +
 		"FROM domains AS d JOIN zones AS z ON z.id = d.zone_id " +
 		"WHERE (d.flags & " + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + ") <> 0 " +
 		"AND d.status <> " + fmt.Sprintf("%d", int16(model.StatusDeleted)) + " " +
-		"ORDER BY d.zone_id, d.id LIMIT $1"
+		"LIMIT $1"
+
+	// renderPlanNoIndexScanSQL/renderPlanNoBitmapScanSQL/renderPlanNoIOSQL —
+	// закрепление формы плана выборки пачки (T-181): SET LOCAL в транзакции
+	// renderSelectPending отключает index scan, bitmap scan и index-only
+	// scan до оператора выборки. Статистики выражения (flags & 2) <> 0 у
+	// планировщика нет (индекс по flags невозможен — HOT-инвариант, T-175),
+	// фильтр оценивается почти неселективным (41,6 из 41,6 млн строк), и без
+	// закрепления планировщик берёт index scan по PK даже без ORDER BY —
+	// то же вытаптывание префикса; закреплённый seq scan находит первую
+	// пачку флаговых строк ранним остановом LIMIT (флаговый долг .рф
+	// физически в начале кучи: ingest ru/rf/su шёл первым, HOT держит
+	// версии на родных страницах) — 43 мс против 30 с на замере 24.10
+	// (700×). Действие SET LOCAL — только эта транзакция, остальные
+	// запросы пула не затронуты; bitmap- и index-only-скан отключаются
+	// вслед за index-сканом — все индексные формы доступа к domains
+	// закрыты (index-only по PK повторил бы патологию, хоть ТЗ §4.2 и
+	// проверяло диагностикой только пару index/bitmap), по flags индексов
+	// не будет.
+	renderPlanNoIndexScanSQL  = "SET LOCAL enable_indexscan = off"
+	renderPlanNoBitmapScanSQL = "SET LOCAL enable_bitmapscan = off"
+	renderPlanNoIOSQL         = "SET LOCAL enable_indexonlyscan = off"
+
+	// renderDebtCounterSQL — guard прохода точечным чтением счётчика
+	// рендер-долга (T-181; счётчик — T-175): value = 0 — тяжёлая выборка
+	// пачки не выполняется вовсе (стационар без долга стоит одно чтение
+	// строки за тик вместо seq scan по 41,8 млн строк); отсутствие строки —
+	// ошибка прохода (строку гарантирует миграция 000015; молчаливый
+	// рассинхрон сделал бы guard ложью — философия renderBumpDebtCounter,
+	// runbooks §6).
+	renderDebtCounterSQL = "SELECT value FROM crawler_counters WHERE name = 'render_pending'"
 
 	// renderPendingRowsSQL — записи домена для повторного SPA-вердикта:
 	// ещё не отрендеренные (rendered = false ставит запись результата
@@ -361,8 +404,9 @@ type renderPendingRow struct {
 // RequeueOnce — один проход доработки рендера (§5.6 «дорабатываются
 // позже»): до opts.BatchSize доменов с флагом render_pending. Ёмкость
 // q:render проверяется до выборки и перед публикацией каждого домена —
-// при переполнении проход останавливается (Full), флаги сохранены. Для
-// домена — ключи SPA-записей (повторный вердикт по сохранённому
+// при переполнении проход останавливается (Full), флаги сохранены; при
+// нулевом счётчике долга (guard T-181) тяжёлая выборка не выполняется.
+// Для домена — ключи SPA-записей (повторный вердикт по сохранённому
 // контенту) → публикация q:render → снятие флага со счётчиком долга
 // одной транзакцией (T-175). Пустой набор ключей — флаг снимается без
 // публикации (черновой флаг: страница перестала быть SPA); нечитаемый
@@ -396,11 +440,39 @@ func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		return RequeueResult{Full: true}, nil
 	}
 
+	// Guard счётчиком рендер-долга (T-181, счётчик — T-175): стационар без
+	// долга не платит за выборку пачки — точечное чтение строки счётчика
+	// вместо seq scan по всей domains раз в тик; 0 → пустая пачка (Selected
+	// = 0 — drain корректно останавливается). Отрицательное значение кодом
+	// не порождается (переходы бита ведут счётчик парой ±1, T-175) и
+	// трактуется так же — как «долга нет», но громко: тихий баг счётчика
+	// не должен прятаться за молчаливым простоем дренажа.
+	debt, err := renderDebtCount(ctx, pool)
+	if err != nil {
+		return out, err
+	}
+	if debt < 0 {
+		o.Log.Warn("проход рендера: отрицательный счётчик рендер-долга — рассинхрон (runbooks §6)", "debt", debt)
+	}
+	if debt <= 0 {
+		return out, nil
+	}
+
 	domains, err := renderSelectPending(ctx, pool, o.BatchSize)
 	if err != nil {
 		return out, err
 	}
 	out.Selected = len(domains)
+	if len(domains) == 0 {
+		// Счётчик видит долг, выборка — нет: биты-«сироты» (удалённые с
+		// флагом домены — выборка честно исключает их по §13.1, а снять
+		// бит некому) либо рассинхрон ручного SQL (runbooks §6). Дренаж
+		// платит полный проход без раннего останова за каждый тик —
+		// оператор обязан это видеть.
+		o.Log.Warn("проход рендера: счётчик долга > 0, выборка пуста — биты-«сироты» либо рассинхрон счётчика (runbooks §6)",
+			"debt", debt)
+		return out, nil
+	}
 
 	for i := range domains {
 		if err := ctx.Err(); err != nil {
@@ -493,9 +565,66 @@ func renderBumpDebtCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	return nil
 }
 
-// renderSelectPending выбирает пачку доменов с флагом render_pending.
-func renderSelectPending(ctx context.Context, pool db.DB, limit int) ([]renderPendingDomain, error) {
-	rows, err := pool.Query(ctx, renderPendingDomainsSQL, limit)
+// renderDebtCount — guard прохода доработки (T-181): точечное чтение
+// счётчика рендер-долга crawler_counters['render_pending'] (T-175).
+// 0 — долга нет, тяжёлая выборка пачки (seq scan по domains) не
+// выполняется вовсе; отсутствие строки — ошибка: строку создаёт бэкфилл
+// миграции 000015, пропасть она может только при ручной правке таблицы
+// (runbooks §6) — молчаливый рассинхрон сделал бы guard ложью, громче
+// ошибкой (как у renderBumpDebtCounter).
+func renderDebtCount(ctx context.Context, pool RecordDB) (int64, error) {
+	rows, err := pool.Query(ctx, renderDebtCounterSQL)
+	if err != nil {
+		return 0, fmt.Errorf("httpworker: проход рендера: счётчик долга: %w", err)
+	}
+	defer rows.Close()
+	var n int64
+	if !rows.Next() {
+		// Сначала сбой чтения: обрыв соединения — не «строки нет»,
+		// диагноз отсутствия строки должен быть честным (runbooks §6
+		// ведёт оператора делать INSERT).
+		if err := rows.Err(); err != nil {
+			return 0, fmt.Errorf("httpworker: проход рендера: счётчик долга: %w", err)
+		}
+		return 0, errors.New("httpworker: проход рендера: строка счётчика 'render_pending' отсутствует (миграция 000015, runbooks §6)")
+	}
+	if err := rows.Scan(&n); err != nil {
+		return 0, fmt.Errorf("httpworker: проход рендера: счётчик долга: чтение: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("httpworker: проход рендера: счётчик долга: %w", err)
+	}
+	return n, nil
+}
+
+// renderSelectPending выбирает пачку доменов с флагом render_pending —
+// единая точка тяжёлой выборки прохода. Выборка идёт в явной транзакции с
+// SET LOCAL enable_indexscan/bitmapscan = off (T-181): закрепление формы
+// плана (seq scan по domains + ранний останов LIMIT) — см. комментарий к
+// renderPlanNoIndexScanSQL; без закрепления планировщик без статистики
+// выражения (flags & 2) <> 0 берёт index scan по PK, вытаптывающий
+// дренированный «пустой» префикс (медиана 44 с на живом долге, замер
+// 24.10). Транзакция — только оболочка закрепления: SELECT читает
+// зафиксированные данные, фиксация/откат по содержанию равнозначны.
+func renderSelectPending(ctx context.Context, pool RecordDB, limit int) ([]renderPendingDomain, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("httpworker: проход рендера: транзакция выборки: %w", err)
+	}
+	// Откат безусловно: после Commit — no-op (стиль T-044).
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, renderPlanNoIndexScanSQL); err != nil {
+		return nil, fmt.Errorf("httpworker: проход рендера: закрепление плана: %w", err)
+	}
+	if _, err := tx.Exec(ctx, renderPlanNoBitmapScanSQL); err != nil {
+		return nil, fmt.Errorf("httpworker: проход рендера: закрепление плана: %w", err)
+	}
+	if _, err := tx.Exec(ctx, renderPlanNoIOSQL); err != nil {
+		return nil, fmt.Errorf("httpworker: проход рендера: закрепление плана: %w", err)
+	}
+
+	rows, err := tx.Query(ctx, renderPendingDomainsSQL, limit)
 	if err != nil {
 		return nil, fmt.Errorf("httpworker: проход рендера: выборка доменов: %w", err)
 	}
@@ -511,6 +640,9 @@ func renderSelectPending(ctx context.Context, pool db.DB, limit int) ([]renderPe
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("httpworker: проход рендера: выборка доменов: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("httpworker: проход рендера: фиксация выборки: %w", err)
 	}
 	return out, nil
 }
@@ -647,7 +779,12 @@ func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderCon
 			}
 			// Полная пачка — возможно, остались домены; полная очередь —
 			// ждать тика (публикация «впритык к порогу» не нужна).
-			if res.Full || res.Selected < o.BatchSize {
+			// Пачка БЕЗ снятых флагов — тоже ждать тика: контент не
+			// читается (keep), стартовый дренаж не крутится вхолостую —
+			// T-181 убрал естественный темпитель дорогой выборкой (замер
+			// 24.10: 137 срабатываний журнала за 2,7 ч ≈ темп drain),
+			// голый цикл по битым блокам молотил бы БД без останова.
+			if res.Full || res.Selected < o.BatchSize || res.Cleared == 0 {
 				return
 			}
 		}
