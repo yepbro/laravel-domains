@@ -750,7 +750,7 @@ RequeueRenderPending из накопленного) садится точно в
 («инкрементальные счётчики зон на переходах статусов, отдельная волна»).
 ТЗ этапа: [`TZ_incremental_counters.md`](./TZ_incremental_counters.md).
 
-- **T-178** [в работе] — P1, инкрементальные счётчики состояний конвейера
+- **T-178** [сделана] — P1, инкрементальные счётчики состояний конвейера
   (полные проходы 47 млн строк `domains` из путей чтения убрать: замер
   §12 — `zoneStatsSQL`/`domainStatusSQL` internal/status, `backlogSQL`
   scheduler 17+ с каждые 5 мин, `historyStatsSQL` monitor — большая
