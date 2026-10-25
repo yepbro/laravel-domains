@@ -700,6 +700,109 @@ func TestCounters_DeleteWhileQueued(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после delete в queued")
 }
 
+// TestCounters_DeleteWithRenderPending — удаление домена с битом
+// render_pending (T-186): применение delete снимает бит той же
+// транзакцией и декрементирует счётчик рендер-долга (инвариант T-175
+// «счётчик = число строк с битом»); прочие биты сохраняются; повторное
+// применение партии (at-least-once, ТЗ 3.4) не декрементирует дважды;
+// сверка сходится.
+func TestCounters_DeleteWithRenderPending(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := countersSchema(t)
+	ctx := context.Background()
+
+	zone := countersSeedZone(t, pool, "render-del.test")
+	ids := countersSeedDomains(t, pool, zone, "r", 2, model.CheckStateDone, model.StatusAlive)
+	// Бит render_pending (2) поверх is_idn (1) — как постановка флага в
+	// записи результата (renderq.go); счётчик долга — те же переходы
+	// (бэкфилл 000015 считал бы 2).
+	for _, id := range ids {
+		if _, err := pool.Exec(ctx,
+			"UPDATE domains SET flags = 3 WHERE zone_id = $1 AND id = $2", zone, id); err != nil {
+			t.Fatalf("бит render_pending домена %d: %v", id, err)
+		}
+	}
+	// Строка счётчика существует после миграции 000015 (бэкфилл пустой
+	// схемы — 0); сеем значение, как вели бы переходы постановки бита.
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO crawler_counters (name, value) VALUES ('render_pending', 2) "+
+			"ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value"); err != nil {
+		t.Fatalf("счётчик долга: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE zones SET domains_total = 2, domains_checked = 2 WHERE id = $1", zone); err != nil {
+		t.Fatalf("счётчики зоны: %v", err)
+	}
+
+	apply := func(batch ingest.BatchID) ingest.DeleteResult {
+		t.Helper()
+		for i, label := range []string{"r0", "r1"} {
+			if _, err := pool.Exec(ctx,
+				"INSERT INTO ingest_stage (batch_id, zone_id, label, action, line_no) VALUES ($1, $2, $3, $4, $5)",
+				batch[:], zone, label, int16(model.ActionDelete), int16(i+1)); err != nil {
+				t.Fatalf("staging %s: %v", label, err)
+			}
+		}
+		res, err := ingest.ApplyDelete(ctx, pool, ingest.Batch{ID: batch, ZoneID: zone, Action: model.ActionDelete})
+		if err != nil {
+			t.Fatalf("ApplyDelete: %v", err)
+		}
+		return res
+	}
+
+	if res := apply(mustBatchID(t)); res.Deleted != 2 || res.NotFound != 0 {
+		t.Fatalf("итог delete = %+v, хочу {2 0}", res)
+	}
+
+	// Бит снят, is_idn сохранён; счётчик долга декрементирован на 2.
+	for i, id := range ids {
+		var flags int16
+		if err := pool.QueryRow(ctx,
+			"SELECT flags FROM domains WHERE zone_id = $1 AND id = $2", zone, id,
+		).Scan(&flags); err != nil {
+			t.Fatalf("домен r%d: %v", i, err)
+		}
+		if flags != 1 {
+			t.Fatalf("домен r%d: flags = %d, хочу 1 (бит render_pending снят, is_idn сохранён)", i, flags)
+		}
+	}
+	var debt int64
+	if err := pool.QueryRow(ctx,
+		"SELECT value FROM crawler_counters WHERE name = 'render_pending'").Scan(&debt); err != nil {
+		t.Fatalf("счётчик долга: %v", err)
+	}
+	if debt != 0 {
+		t.Fatalf("счётчик рендер-долга = %d, хочу 0 (декремент на 2)", debt)
+	}
+	countersVerifyEmpty(t, pool, "после delete с битом")
+
+	// Повторная доставка того же delete-содержимого (новая партия,
+	// at-least-once, ТЗ 3.4): домены уже deleted — охрана статуса не
+	// декрементирует счётчик дважды и не трогает биты, отчёт считает
+	// строки «удалёнными» (семантика T-019).
+	if res := apply(mustBatchID(t)); res.Deleted != 2 || res.NotFound != 0 {
+		t.Fatalf("повтор = %+v, хочу {2 0} (уже удалён — тоже «удалён»)", res)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT value FROM crawler_counters WHERE name = 'render_pending'").Scan(&debt); err != nil {
+		t.Fatalf("счётчик долга (повтор): %v", err)
+	}
+	if debt != 0 {
+		t.Fatalf("счётчик рендер-долга после повтора = %d, хочу 0 (идемпотентность)", debt)
+	}
+	countersVerifyEmpty(t, pool, "после повтора delete")
+}
+
+// mustBatchID — новая партия для повторного применения сценария T-186.
+func mustBatchID(t *testing.T) ingest.BatchID {
+	t.Helper()
+	id, err := ingest.NewBatchID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 // TestCounters_DriftCaughtAndFixed — искусственный дрейф (ручной UPDATE
 // zones мимо кода): verify ловит позицию (для CLI это код 1), recount
 // чинит, повторная verify чиста (критерий ТЗИ §12.3).

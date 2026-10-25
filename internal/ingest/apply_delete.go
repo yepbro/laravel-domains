@@ -2,7 +2,10 @@
 // action=delete переводит статус подходящих доменов в deleted. Домен
 // остаётся в БД (ТЗ 13.1: «удалённый домен остаётся в БД со статусом
 // deleted; результаты и контент удаляются фоновой задачей») — их чистит
-// фоновая задача T-020, здесь ничего кроме статуса не трогается.
+// фоновая задача T-020. Вместе со статусом снимается бит render_pending
+// (T-186): удаляемый домен покидает цикл проверок, проход доработки
+// рендера его больше не выберет — бит снимает перевод в deleted той же
+// транзакцией с декрементом счётчика рендер-долга (applyDeleteSQL).
 package ingest
 
 import (
@@ -16,22 +19,61 @@ import (
 
 // applyDeleteSQL — применение delete одним оператором (ТЗ 5.1):
 //
+//   - CTE pre — снимок кандидатов перевода ДО изменения (тот же снимок
+//     оператора, что и у moved): staging×domains по ключу (zone_id,
+//     label) с фильтрами партии и охраной «ещё не deleted» (T-178).
+//     Единственная цель — старое значение бита render_pending (had_render
+//     по снимку): RETURNING обновления не видит старых значений колонок
+//     из SET (PG16 без RETURNING OLD), а считать переходы бита обязан
+//     тот же оператор, что их выполняет. MATERIALIZED обязателен:
+//     одиночная ссылка позволяет планировщику инлинить pre в moved
+//     (замер на живой БД) — семантика had_render «старый бит» держится
+//     на привязке выражения к СКАНИРУЕМОМУ экземпляру таблицы, а не к
+//     целевому; материализация закрепляет её от формы плана (в духе
+//     закреплений T-181), цена — пачка размера файла;
 //   - CTE moved — перенос статуса: UPDATE domains SET status = deleted
-//     для доменов партии (соединение по уникальному ключу (zone_id, label);
-//     фильтры batch_id/action адресуют только свою партию и только её
-//     delete-строки). Охраны по текущему статусу до T-178 не было:
+//     для доменов партии — соединение с pre по уникальному ключу
+//     (zone_id, label). Охраны по текущему статусу до T-178 не было:
 //     повторное применение переводило уже удалённый в тот же deleted
 //     (идемпотентность at-least-once, ТЗ 3.4) — отчёт считал строку
 //     «удалённой». Охрана d.status <> deleted теперь нужна для дельт
 //     счётчиков зон (T-178, ТЗИ §6.2): повторное применение не должно
 //     декрементировать счётчики за уже удалённый домен; отчёт это
-//     сохраняет — см. внешний SELECT;
+//     сохраняет — см. внешний SELECT. Охрана повторена в moved (не только
+//     в pre): при конкуренции за строку (второй delete-файл по тому же
+//     домену) повторная проверка условия после ожидания блокировки
+//     отсекает уже переведённую строку от дельт. Второе назначение
+//     обновления — снятие бита render_pending (T-186, бит 1 flags):
+//     удаляемый домен покидает цикл проверок (§13.1), проход доработки
+//     рендера его больше не выбирает (renderq исключает deleted), а бит
+//     без владельца держал бы счётчик рендер-долга навсегда — guard
+//     T-181 не спал и гонял порожний seq scan каждый тик. CASE читает
+//     ТЕКУЩУЮ версию строки (не had_render из снимка): конкурирующий
+//     переход бита между снимком и обновлением не оставит рассогласования
+//     «бит снят/поставлен, счётчик не сдвинут» худе, чем ±1 до
+//     реконсиляции (она чинит, ТЗИ §7). Снятие обязано жить в этом же
+//     UPDATE: второй data-modifying CTE по той же строке не работает —
+//     PostgreSQL применяет к строке только одну модификацию оператора
+//     (проверено на живой БД), а отдельный оператор ломал бы атомарность
+//     пары «статус + бит»;
 //   - CTE zc — дельты счётчиков зон по RETURNING zone_id, check_state
 //     переведённых строк (T-178): total −n и по состоянию —
 //     pending −n / queued −n / checked −n (оператор не меняет
 //     check_state — RETURNING отдаёт старое значение, ТЗИ §6.1.2);
 //     базовое множество колонок зон — status <> deleted (ТЗИ §4.1),
 //     удаляемый домен покидает все колонки;
+//   - CTE rd — декремент счётчика рендер-долга
+//     crawler_counters['render_pending'] на число снимочных битов
+//     переведённых строк (T-186, инвариант T-175 «счётчик = число строк
+//     с битом, без фильтра статуса»): upsert в стиле реконсиляции
+//     (zonestats.go); HAVING > 0 не трогает строку счётчика (единая
+//     точка сериализации флажащих транзакций, record.go) файлами без
+//     флаговых доменов. CTE стоит после zc — порядок блокировок
+//     «domains → zones → счётчик» общий с писателями переходов
+//     (record.go: зоны → render_pending) и исключает циклы. Редкий
+//     рассинхрон «сняли бит, а счётчик уже сдвинули» (конкурирующий
+//     переход бита в окне снимок→обновление) — ±1 до ближайшей
+//     реконсиляции (ТЗИ §7, gauge crawler_counters_drift);
 //   - внешний SELECT без FROM всегда возвращает одну строку счётчиков:
 //     deleted — строки файла, чей домен переведён этим оператором
 //     (EXISTS по moved) ЛИБО уже был удалён до него (EXISTS по domains
@@ -46,16 +88,24 @@ import (
 // set-based оператор вместо db.Update с unnest-массивами: ничего не
 // возится через приложение, память не зависит от размера файла (ТЗ 3.5),
 // а счётчики считаются тем же оператором и не расходятся с применением.
-var applyDeleteSQL = `WITH moved AS (
-	UPDATE domains AS d
-	SET status = $2
+var applyDeleteSQL = `WITH pre AS MATERIALIZED (
+	SELECT d.zone_id, d.label, (d.flags & ` + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + `) <> 0 AS had_render
 	FROM ` + StageTable.Sanitize() + ` AS s
+	JOIN domains AS d ON d.zone_id = s.zone_id AND d.label = s.label
 	WHERE s.batch_id = $1
 	  AND s.action = $3
-	  AND d.zone_id = s.zone_id
-	  AND d.label = s.label
 	  AND d.status <> $2
-	RETURNING d.zone_id, d.label, d.check_state
+), moved AS (
+	UPDATE domains AS d
+	SET status = $2,
+	    flags = CASE WHEN (d.flags & ` + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + `) <> 0
+	                 THEN (d.flags & ` + fmt.Sprintf("%d", int16(^int16(model.FlagRenderPending))) + `)::int2
+	                 ELSE d.flags END
+	FROM pre AS p
+	WHERE d.zone_id = p.zone_id
+	  AND d.label = p.label
+	  AND d.status <> $2
+	RETURNING d.zone_id, d.label, d.check_state, p.had_render
 ), zc AS (
 	UPDATE zones AS z
 	SET domains_total = z.domains_total - c.n_total,
@@ -69,6 +119,12 @@ var applyDeleteSQL = `WITH moved AS (
 	             count(*) FILTER (WHERE check_state = ` + fmt.Sprint(int16(model.CheckStateDone)) + `) AS n_checked
 	      FROM moved GROUP BY zone_id) AS c
 	WHERE z.id = c.zone_id
+), rd AS (
+	INSERT INTO crawler_counters (name, value)
+	SELECT 'render_pending', -count(*) FROM moved WHERE had_render
+	HAVING count(*) > 0
+	ON CONFLICT (name) DO UPDATE
+	SET value = crawler_counters.value + EXCLUDED.value
 )
 SELECT
 	(SELECT count(*) FROM ` + StageTable.Sanitize() + ` AS s
@@ -98,9 +154,11 @@ type DeleteResult struct {
 }
 
 // ApplyDelete применяет партию action=delete из staging (Stage, T-017):
-// переводит статус подходящих доменов в model.StatusDeleted и возвращает
-// счётчики строк файла (DeleteResult). Домены остаются в БД (ТЗ 13.1);
-// результаты и ссылки на контент удаляются фоновой задачей (T-020).
+// переводит статус подходящих доменов в model.StatusDeleted (снятием
+// бита render_pending с декрементом счётчика рендер-долга той же
+// транзакцией, T-186) и возвращает счётчики строк файла (DeleteResult).
+// Домены остаются в БД (ТЗ 13.1); результаты и ссылки на контент
+// удаляются фоновой задачей (T-020).
 //
 // Применение — один оператор applyDeleteSQL: пустая партия — no-op с
 // нулевыми счётчиками. После применения партия очищается из staging

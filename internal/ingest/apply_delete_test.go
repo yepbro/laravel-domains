@@ -1,8 +1,9 @@
 // Юнит-тесты применения delete без БД (стиль stage_test.go/zones_test.go):
 // текст SQL и параметры, счётчики, порядок «применить → очистить», пустая
-// партия, идемпотентность повтора (ТЗ 3.4), ошибки применения и очистки,
-// отмена ctx. Реальное поведение против живой БД — интеграционные тесты
-// ingest (T-023).
+// партия, идемпотентность повтора (ТЗ 3.4), снятие бита render_pending и
+// декремент счётчика долга тем же оператором (T-186), ошибки применения и
+// очистки, отмена ctx. Реальное поведение против живой БД — интеграционные
+// тесты ingest (T-023).
 package ingest
 
 import (
@@ -125,20 +126,29 @@ func TestApplyDelete(t *testing.T) {
 // deleted» (T-178: дельты счётчиков зон декрементируют только
 // действительно переводимые строки — повторное применение партии
 // идемпотентно и по счётчикам, ТЗ 3.4; отчёт при этом сохраняет прежнюю
-// семантику: уже удалённый домен считается строкой «удалён»),
-// дельты счётчиков зон по check_state переведённых, домен остаётся в БД
-// (нет DELETE), счётчики по строкам staging.
+// семантику: уже удалённый домен считается строкой «удалён»), снятие
+// бита render_pending тем же UPDATE с декрементом счётчика долга тем же
+// оператором (T-186), дельты счётчиков зон по check_state переведённых,
+// домен остаётся в БД (нет DELETE), счётчики по строкам staging.
 func TestApplyDeleteSQLContract(t *testing.T) {
-	want := `WITH moved AS (
-	UPDATE domains AS d
-	SET status = $2
+	want := `WITH pre AS MATERIALIZED (
+	SELECT d.zone_id, d.label, (d.flags & 2) <> 0 AS had_render
 	FROM ` + StageTable.Sanitize() + ` AS s
+	JOIN domains AS d ON d.zone_id = s.zone_id AND d.label = s.label
 	WHERE s.batch_id = $1
 	  AND s.action = $3
-	  AND d.zone_id = s.zone_id
-	  AND d.label = s.label
 	  AND d.status <> $2
-	RETURNING d.zone_id, d.label, d.check_state
+), moved AS (
+	UPDATE domains AS d
+	SET status = $2,
+	    flags = CASE WHEN (d.flags & 2) <> 0
+	                 THEN (d.flags & -3)::int2
+	                 ELSE d.flags END
+	FROM pre AS p
+	WHERE d.zone_id = p.zone_id
+	  AND d.label = p.label
+	  AND d.status <> $2
+	RETURNING d.zone_id, d.label, d.check_state, p.had_render
 ), zc AS (
 	UPDATE zones AS z
 	SET domains_total = z.domains_total - c.n_total,
@@ -152,6 +162,12 @@ func TestApplyDeleteSQLContract(t *testing.T) {
 	             count(*) FILTER (WHERE check_state = 2) AS n_checked
 	      FROM moved GROUP BY zone_id) AS c
 	WHERE z.id = c.zone_id
+), rd AS (
+	INSERT INTO crawler_counters (name, value)
+	SELECT 'render_pending', -count(*) FROM moved WHERE had_render
+	HAVING count(*) > 0
+	ON CONFLICT (name) DO UPDATE
+	SET value = crawler_counters.value + EXCLUDED.value
 )
 SELECT
 	(SELECT count(*) FROM ` + StageTable.Sanitize() + ` AS s
@@ -187,6 +203,22 @@ SELECT
 	// (EXISTS по domains со старым статусом — снимок оператора).
 	if !strings.Contains(applyDeleteSQL, "OR EXISTS") {
 		t.Errorf("SQL = %q, want альтернативу «уже был deleted» в счётчике deleted", applyDeleteSQL)
+	}
+	// Бит render_pending снимается тем же UPDATE (T-186): CASE с маской
+	// −3 (знаковое ~бита, прочие биты сохраняются — стиль renderq.go),
+	// количество переходов — по снимочному had_render из pre (RETURNING
+	// не видит старых значений колонок из SET; MATERIALIZED закрепляет
+	// семантику «старый бит» от инлайна — см. комментарий applyDeleteSQL).
+	if !strings.Contains(applyDeleteSQL, "WITH pre AS MATERIALIZED") ||
+		!strings.Contains(applyDeleteSQL, "THEN (d.flags & -3)::int2") {
+		t.Errorf("SQL = %q, want снятие бита render_pending маской -3 в moved", applyDeleteSQL)
+	}
+	// Декремент счётчика долга — тем же оператором (T-186): upsert
+	// только при ненулевом числе снятий (HAVING) — файлы без флаговых
+	// доменов не трогают строку счётчика.
+	if !strings.Contains(applyDeleteSQL, "INSERT INTO crawler_counters") ||
+		!strings.Contains(applyDeleteSQL, "HAVING count(*) > 0") {
+		t.Errorf("SQL = %q, want upsert-декремент render_pending по снятым битам", applyDeleteSQL)
 	}
 }
 
