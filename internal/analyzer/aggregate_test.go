@@ -587,8 +587,12 @@ func TestAggregate_CtxCancelled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := aggregateDomain(ctx, tx, anKey.zone, anKey.domain, 1001, false); err == nil {
+	unfound, err := aggregateDomain(ctx, tx, anKey.zone, anKey.domain, 1001, false)
+	if err == nil {
 		t.Fatal("отменённый ctx — ошибка агрегации")
+	}
+	if unfound {
+		t.Error("сбой агрегации не может сигнализировать снятие находки (T-187)")
 	}
 }
 

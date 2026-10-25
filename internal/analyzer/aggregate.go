@@ -42,7 +42,9 @@
 // (T-118, appeared/lost) — только по свежим эпизодам HTTP
 // (queue.Result.Fresh): переанализ (T-074) пересчитывает тот же
 // скачанный контент по новым правилам и фактом о сайте не является;
-// детали семантики — в комментарии aggregateDomain.
+// детали семантики — в комментарии aggregateDomain. Снятие находки
+// переанализом (не-fresh) — сигнал точечного дренажа контента домена
+// (T-187, content.DrainDomain): возвращаемое значение aggregateDomain.
 //
 // Согласование параллельных доставок домена: воркер обрабатывает до
 // Concurrency доставок одновременно, инстансов может быть несколько
@@ -163,21 +165,30 @@ const (
 // строке, а не к сайту: «ушёл при переанализе, вернулся свежим
 // эпизодом» оставит один appeared (появление) без парного lost —
 // плата за защиту от шума правил, тренд по множеству доменов верен.
-func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int64, version int32, fresh bool) error {
+//
+// Возврат unfound — сигнал снятия находки переанализом (T-187): строка
+// laravel_domains существовала и удалена доставкой БЕЗ fresh
+// (RowsAffected > 0 ∧ ¬fresh ∧ existed). Старые записи домена
+// subdomain_results такой доставкой не переписываются и возвращаются в
+// множество кандидатов retention позади курсора дренажа (T-185) —
+// вызывающий отвечает точечным дренажем контента домена
+// (content.DrainDomain, worker.drainUnfound). При fresh сигнал ложен:
+// свежий эпизод переписал строки отметками впереди курсора (T-058).
+func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int64, version int32, fresh bool) (unfound bool, err error) {
 	// Сначала блокировка: пересчёты одного домена выстраиваются в очередь,
 	// второй читает findings после фиксации первого.
 	if _, err := tx.Exec(ctx, aggregateLockSQL, domainID); err != nil {
-		return fmt.Errorf("блокировка домена: %w", err)
+		return false, fmt.Errorf("блокировка домена: %w", err)
 	}
 
 	rows, err := tx.Query(ctx, aggregateSelectSQL, zoneID, domainID)
 	if err != nil {
-		return fmt.Errorf("чтение срабатываний: %w", err)
+		return false, fmt.Errorf("чтение срабатываний: %w", err)
 	}
 	agg, err := scanAggregate(rows)
 	rows.Close()
 	if err != nil {
-		return fmt.Errorf("чтение срабатываний: %w", err)
+		return false, fmt.Errorf("чтение срабатываний: %w", err)
 	}
 
 	// Наличие строки до пересчёта — для перехода appeared/lost (T-118);
@@ -185,13 +196,13 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	// между проверкой и записью.
 	var existed bool
 	if err := tx.QueryRow(ctx, aggregateExistsSQL, zoneID, domainID).Scan(&existed); err != nil {
-		return fmt.Errorf("чтение строки домена: %w", err)
+		return false, fmt.Errorf("чтение строки домена: %w", err)
 	}
 
 	if agg.findings == 0 {
 		tag, err := tx.Exec(ctx, aggregateDeleteSQL, zoneID, domainID)
 		if err != nil {
-			return fmt.Errorf("удаление строки домена: %w", err)
+			return false, fmt.Errorf("удаление строки домена: %w", err)
 		}
 		// Эквивалентные мутанты (T-M10): RowsAffected у DELETE — 0 или 1,
 		// а existed читается под advisory-блокировкой ДО удаления
@@ -206,46 +217,49 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 			// Строка была и исчезла — счётчик зоны −1 (переход наличия,
 			// T-178); при fresh — lost в журнале и кумулятиве (T-118).
 			if err := aggregateShiftZoneLaravel(ctx, tx, zoneID, -1); err != nil {
-				return err
+				return false, err
 			}
 			if fresh {
 				if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, false); err != nil {
-					return fmt.Errorf("запись истории (lost): %w", err)
+					return false, fmt.Errorf("запись истории (lost): %w", err)
 				}
 				if err := aggregateBumpHistoryCounter(ctx, tx, counterLaravelLost, 1); err != nil {
-					return err
+					return false, err
 				}
 			}
+			// Сигнал T-187: переход без fresh — переанализ снял находку,
+			// не переписав записи домена (см. док-комментарий функции).
+			return !fresh, nil
 		}
-		return nil
+		return false, nil
 	}
 	tag, err := tx.Exec(ctx, aggregateUpsertSQL,
 		zoneID, domainID, agg.score, agg.verMin, agg.verMax,
 		int64(agg.foundOnMask), version)
 	if err != nil {
-		return fmt.Errorf("запись строки домена: %w", err)
+		return false, fmt.Errorf("запись строки домена: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("запись строки домена: затронуто %d строк", tag.RowsAffected())
+		return false, fmt.Errorf("запись строки домена: затронуто %d строк", tag.RowsAffected())
 	}
 	if existed {
-		return nil
+		return false, nil
 	}
 	// Строки не было и появилась — счётчик зоны +1 (переход наличия,
 	// T-178; независимо от fresh — переанализ тоже меняет множество);
 	// при fresh — appeared в журнале и кумулятиве (T-118).
 	if err := aggregateShiftZoneLaravel(ctx, tx, zoneID, 1); err != nil {
-		return err
+		return false, err
 	}
 	if fresh {
 		if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, true); err != nil {
-			return fmt.Errorf("запись истории (appeared): %w", err)
+			return false, fmt.Errorf("запись истории (appeared): %w", err)
 		}
 		if err := aggregateBumpHistoryCounter(ctx, tx, counterLaravelAppeared, 1); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // aggregateShiftZoneLaravel — дельта zones.domains_laravel в транзакции

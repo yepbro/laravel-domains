@@ -55,6 +55,7 @@ const (
 	anEvHistory   anEventKind = "agg_hist"    // INSERT laravel_history appeared/lost (T-118)
 	anEvZoneLarav anEventKind = "agg_zone"    // дельта zones.domains_laravel (T-178)
 	anEvCounter   anEventKind = "agg_counter" // дельта кумулятива crawler_counters (T-178)
+	anEvDrain     anEventKind = "drain"       // точечный дренаж контента домена (T-187)
 	anEvCommit    anEventKind = "commit"
 	anEvAck       anEventKind = "ack"
 )

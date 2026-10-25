@@ -39,7 +39,10 @@
 // Агрегация на уровне домена — T-072 (aggregate.go): той же транзакцией,
 // сразу после findings, пересчитывается строка laravel_domains (§6.1:
 // максимальный score, объединённый диапазон версий, found_on_mask,
-// rules_version; ТЗ 5.8 «на уровне домена — агрегат»).
+// rules_version; ТЗ 5.8 «на уровне домена — агрегат»). Снятие находки
+// переанализом (не-fresh) после фиксации запускает точечный дренаж
+// контента домена (T-187, drainUnfound → content.DrainDomain): записи
+// домена вернулись в кандидаты retention позади курсора дренажа (T-185).
 package analyzer
 
 import (
@@ -192,6 +195,17 @@ type Options struct {
 	// 0 — дефолт очереди (queue.DefaultRecoverInterval). Конфиг —
 	// redis.recover_interval (T-153).
 	RecoverInterval time.Duration
+	// Retention — окно жизни контента не-находок (content.retention,
+	// T-166): им точечный дренаж DrainDomain чистит контент домена при
+	// снятии находки переанализом (T-187). ≤ 0 — retention выключен
+	// (контент хранится всегда) — дренажа нет, событие только считается.
+	Retention time.Duration
+	// DrainDomain — шов точечного дренажа контента домена (T-187):
+	// удовлетворяется content.DrainDomain (пул воркера —
+	// content.RetentionDB); nil — дренаж выключен (изолированные сборки,
+	// юнит-тесты без контентной семантики) — событие только считается.
+	DrainDomain func(ctx context.Context, pool content.RetentionDB,
+		retention time.Duration, zoneID int16, domainID int64) (content.RetentionStats, error)
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
@@ -376,8 +390,10 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// Агрегация домена — T-072: пересчёт laravel_domains по findings
 	// домена той же транзакцией (решения и согласование параллельных
 	// доставок — aggregate.go); fresh — признак свежего эпизода HTTP
-	// в задаче: при переходе пишет историю appeared/lost (T-118).
-	if err := aggregateDomain(ctx, tx, task.ZoneID, task.DomainID, set.Version, task.Fresh); err != nil {
+	// в задаче: при переходе пишет историю appeared/lost (T-118);
+	// unfound — сигнал снятия находки переанализом (T-187).
+	unfound, err := aggregateDomain(ctx, tx, task.ZoneID, task.DomainID, set.Version, task.Fresh)
+	if err != nil {
 		return false, fmt.Errorf("analyzer: %s: %w", name, err)
 	}
 
@@ -385,11 +401,61 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, fmt.Errorf("analyzer: %s: запись findings: фиксация: %w", name, err)
 	}
 
+	// Снятие находки переанализом (T-187) — после фиксации: событие уже
+	// состоялось, ошибки дренажа не роняют доставку (findings и агрегат
+	// зафиксированы, XACK состоится; записи домена без дренажа остались
+	// бы позади курсора retention — класс до T-187, см. drainUnfound).
+	w.drainUnfound(ctx, task, name, unfound)
+
 	w.opt.log().Debug("анализ записан",
 		"domain", name, "signals", len(res.Signals), "score", res.Score,
 		"is_laravel", isLaravel, "ver_min", res.VerMin, "ver_max", res.VerMax,
 		"conflict", res.Conflict, "rules_version", set.Version)
 	return true, nil
+}
+
+// drainUnfound — точечный дренаж контента домена при снятии находки
+// переанализом (T-187): сигнал unfound агрегации (aggregateDomain,
+// переход строки laravel_domains доставкой без fresh) означает, что
+// старые записи домена subdomain_results вернулись в множество
+// кандидатов retention позади курсора дренажа (T-185) — часовой проход
+// их больше не увидит. Дренаж — content.DrainDomain: те же фильтры
+// отбора и purge-механика T-166 по префиксу PK (zone_id, domain_id).
+// Вызывается после фиксации транзакции доставки: сбой дренажа — Warn и
+// метрика, доставка подтверждается (анализ — ядро работы; записи без
+// дренажа остаются в классе до T-187, их подберут редкие catch-up-круги
+// T-185 либо перепроверка T-030). Идемпотентен: повтор не найдёт
+// кандидатов. Отмена ctx — часть остановки, не тревога.
+func (w *Worker) drainUnfound(ctx context.Context, task queue.Result, name string, unfound bool) {
+	if !unfound {
+		return
+	}
+	w.met.Unfound()
+	if w.opt.DrainDomain == nil || w.opt.Retention <= 0 {
+		// Минимум T-187 при выключенном дренаже: retention = 0 — контент
+		// хранится всегда (цикла retention нет вовсе, позади курсора ничего
+		// не копится); шов не задан — изолированная сборка. Событие
+		// наблюдаемо метрикой и логом.
+		w.opt.log().Info("снятие находки переанализом — точечный дренаж контента выключен",
+			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID)
+		return
+	}
+	stats, err := w.opt.DrainDomain(ctx, w.db, w.opt.Retention, task.ZoneID, task.DomainID)
+	if err != nil {
+		if ctx.Err() == nil {
+			w.opt.log().Warn("снятие находки переанализом: точечный дренаж контента домена не выполнен — записи останутся позади курсора retention",
+				"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID, "err", err)
+		}
+		w.met.UnfoundDrainError()
+		return
+	}
+	w.met.UnfoundDrain(stats.Rows)
+	if stats.Rows > 0 {
+		w.opt.log().Info("снятие находки переанализом — контент домена дренирован точечно",
+			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID,
+			"rows", stats.Rows, "refs", stats.Refs, "contents", stats.Contents,
+			"freed_bytes", stats.FreedBytes)
+	}
 }
 
 // selectResult читает вход анализа по ключу задачи: заголовки, cookies и

@@ -289,6 +289,38 @@ func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (p
 		}
 		return retentionResultRows(rows...), nil
 
+	case retentionDomainSQL:
+		p.queries = append(p.queries, retentionCall{sql: sql, args: args})
+		if p.selectErr != nil {
+			return nil, p.selectErr
+		}
+		zone, domain := args[0].(int16), args[1].(int64)
+		cutoff := p.cutoff(args[2].(string))
+		var sel []*retentionRow
+		for i := range p.results {
+			r := &p.results[i]
+			if r.key.zone != zone || r.key.domain != domain {
+				continue // префикс PK (zone_id, domain_id)
+			}
+			if !p.candidate(r, cutoff) {
+				continue
+			}
+			sel = append(sel, r)
+		}
+		// ORDER BY PK — детерминированные аргументы пачки.
+		sorted := make([]*retentionRow, len(sel))
+		copy(sorted, sel)
+		for i := 1; i < len(sorted); i++ {
+			for j := i; j > 0 && sorted[j].key.less(sorted[j-1].key); j-- {
+				sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+			}
+		}
+		rows := make([][]any, len(sorted))
+		for i, r := range sorted {
+			rows[i] = []any{r.key.zone, r.key.domain, r.key.sub, r.key.variant, r.hash, r.checkedAt}
+		}
+		return retentionResultRows(rows...), nil
+
 	case retentionProbeSQL:
 		p.queries = append(p.queries, retentionCall{sql: sql, args: args})
 		cutoff := p.cutoff(args[4].(string))

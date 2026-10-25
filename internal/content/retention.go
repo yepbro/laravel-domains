@@ -195,6 +195,31 @@ var (
 		"WHERE ld.zone_id = r.zone_id AND ld.domain_id = r.domain_id) " +
 		"LIMIT 1) AS r ON true"
 
+	// retentionDomainSQL — точечный дренаж контента одного домена (T-187,
+	// retentiondomain.go): снятие Laravel-находки переанализом
+	// (aggregateDomain, не-fresh) возвращает остаревшие записи домена в
+	// множество кандидатов ПОЗАДИ курсора дренажа (строка посещается один
+	// раз за жизнь, T-185) — часовой проход их больше не увидит. Фильтры —
+	// те же, что у retentionSelectSQL, но адресация по префиксу PK
+	// (zone_id, domain_id) и без курсора: лист партиции/субпартиции
+	// (T-005) режет выборку до строк домена, курсор дренажа не трогается
+	// (очищенные строки выпадут из любого будущего круга сами). Строк у
+	// домена ограниченное число (субдомены 0..62 × варианты, §5.10) —
+	// LIMIT не нужен; ORDER BY PK — детерминированные аргументы пачки
+	// (стиль cleanupRefcounts T-020) и порядок блокировок строк.
+	retentionDomainSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, r.content_hash, r.checked_at " +
+		"FROM subdomain_results AS r " +
+		"JOIN domains AS d ON d.zone_id = r.zone_id AND d.id = r.domain_id " +
+		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
+		"AND r.checked_at < now() - $3::interval " +
+		"AND (r.content_hash IS NOT NULL OR r.headers IS NOT NULL OR r.cookies IS NOT NULL " +
+		"OR r.tls IS NOT NULL OR r.redirects IS NOT NULL OR r.addrs IS NOT NULL OR r.cname IS NOT NULL) " +
+		fmt.Sprintf("AND (r.rendered OR (d.flags & %d) = 0) ", int16(model.FlagRenderPending)) +
+		fmt.Sprintf("AND d.status <> %d ", int16(model.StatusDeleted)) +
+		"AND NOT EXISTS (SELECT 1 FROM laravel_domains AS ld " +
+		"WHERE ld.zone_id = r.zone_id AND ld.domain_id = r.domain_id) " +
+		"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant"
+
 	// retentionDebtSQL — точечное чтение счётчика рендер-долга
 	// crawler_counters['render_pending'] (T-175) в начале каждого
 	// прохода (T-185): переход счётчика в 0 — момент снятия всей

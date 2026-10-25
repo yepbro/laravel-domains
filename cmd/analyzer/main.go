@@ -159,8 +159,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// redis.recover_*.
 		RecoverBatch:    cfg.Redis.RecoverBatch,
 		RecoverInterval: cfg.Redis.RecoverInterval.D(),
-		Metrics:         reg, // приборы этапа: задачи и длительности (T-077)
-		Log:             logger,
+		// Точечный дренаж контента домена при снятии находки переанализом
+		// (T-187): окно то же, что у цикла retention http-worker
+		// (content.retention), чистка — content.DrainDomain поверх пула
+		// сервиса; retention = 0 — контент хранится всегда, дренажа нет.
+		Retention:   cfg.Content.Retention.D(),
+		DrainDomain: content.DrainDomain,
+		Metrics:     reg, // приборы этапа: задачи и длительности (T-077)
+		Log:         logger,
 	}
 	w, err := analyzer.New(pool, q, store, reloader, opts)
 	if err != nil {

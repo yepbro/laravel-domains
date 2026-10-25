@@ -108,6 +108,33 @@ func TestMetricsProcessDelivery(t *testing.T) {
 	}
 }
 
+// TestMetricsUnfound — приборы снятия находки переанализом (T-187):
+// событие, срезанные строки и ошибки дренажа — счётчики растут
+// независимо (nil-приёмник — no-op).
+func TestMetricsUnfound(t *testing.T) {
+	var nilMetrics *Metrics
+	nilMetrics.Unfound()
+	nilMetrics.UnfoundDrain(3)
+	nilMetrics.UnfoundDrainError()
+
+	reg := metrics.New("analyzer")
+	m := NewMetrics(reg)
+	m.Unfound()
+	m.UnfoundDrain(5)
+	m.UnfoundDrain(0) // нулевой итог значения не меняет
+	m.UnfoundDrainError()
+
+	if got := anMetricValue(t, reg, "crawler_analyzer_laravel_unfound_total", nil); got != 1 {
+		t.Errorf("crawler_analyzer_laravel_unfound_total = %v, want 1", got)
+	}
+	if got := anMetricValue(t, reg, "crawler_analyzer_unfound_drained_rows_total", nil); got != 5 {
+		t.Errorf("crawler_analyzer_unfound_drained_rows_total = %v, want 5", got)
+	}
+	if got := anMetricValue(t, reg, "crawler_analyzer_unfound_drain_errors_total", nil); got != 1 {
+		t.Errorf("crawler_analyzer_unfound_drain_errors_total = %v, want 1", got)
+	}
+}
+
 // TestMetricsBuckets — корзины гистограммы длительностей зарегистрированы
 // ровно заданным списком (литерал — пин против мутантов ±1/сдвигов
 // элементов analyzeSecondsBuckets, T-M10). Prometheus-клиент не отдаёт
