@@ -299,14 +299,124 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 // и окна реконсиляции); отсутствующая строка — ошибка теста.
 func countersChecksToday(t *testing.T, pool *pgxpool.Pool) int64 {
 	t.Helper()
+	return countersDailyToday(t, pool, "checks")
+}
+
+// countersTempToday — значение строки суточного числителя temp_error
+// текущего дня (T-182); отсутствующая строка — ошибка теста.
+func countersTempToday(t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	return countersDailyToday(t, pool, "temp_error")
+}
+
+// countersDailyToday — значение суточной строки <prefix>:YYYY-MM-DD.
+func countersDailyToday(t *testing.T, pool *pgxpool.Pool, prefix string) int64 {
+	t.Helper()
 	var v int64
 	err := pool.QueryRow(context.Background(),
-		"SELECT value FROM crawler_counters WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')",
+		"SELECT value FROM crawler_counters WHERE name = $1 || to_char(current_date, 'YYYY-MM-DD')",
+		prefix+":",
 	).Scan(&v)
 	if err != nil {
-		t.Fatalf("чтение checks:<день>: %v", err)
+		t.Fatalf("чтение %s:<день>: %v", prefix, err)
 	}
 	return v
+}
+
+// TestCounters_DNSTempErrorShare — суточный числитель temp_error (T-182,
+// TZ_slow_dns_share §8.2): temp_error-эпизод растит числитель и знаменатель
+// вместе; повторный эпизод без temp_error — только знаменатель; дубль
+// temp_error-эпизода — снова оба (доля устойчива к дублям); реконсиляция
+// сводит обе строки к живому окну (доля считается по строкам — скан окна
+// суток из алерта исчез), позиции daily:checks/daily:temp_error наблюдают
+// разницу семантик, verify суточные строки не сверяет.
+func TestCounters_DNSTempErrorShare(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := countersSchema(t)
+	ctx := context.Background()
+
+	zone := countersSeedZone(t, pool, "share.test")
+	ids := countersSeedDomains(t, pool, zone, "s", 2, model.CheckStateQueued, model.StatusNew)
+	// Стартовый проход — колонки зон по живому агрегату (2 queued), суточные
+	// строки дня нулями (домены сегодня не проверялись).
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("стартовый проход: %v", err)
+	}
+	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil)
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+
+	// temp_error-эпизод: записи нет, все проверки — таймауты (вердикт
+	// temp_error, §5.5 п. 9).
+	tempRes := &httpworker.DomainResult{
+		ZoneID: zone, DomainID: ids[0], Name: "s0.share.test",
+		Subdomains: []httpworker.SubdomainResult{{
+			SubdomainID: 0,
+			HTTPS:       httpworker.SchemeCheck{ErrClass: httpworker.ErrTimeout},
+			HTTP:        httpworker.SchemeCheck{ErrClass: httpworker.ErrTimeout},
+		}},
+	}
+	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
+		t.Fatalf("temp_error-эпизод: ok=%v err=%v", ok, err)
+	}
+	if got := countersChecksToday(t, pool); got != 1 {
+		t.Fatalf("после temp_error-эпизода checks:<день> = %d, хочу 1", got)
+	}
+	if got := countersTempToday(t, pool); got != 1 {
+		t.Fatalf("после temp_error-эпизода temp_error:<день> = %d, хочу 1", got)
+	}
+
+	// Эпизод без temp_error (молчит постоянно — no_http): знаменатель
+	// растёт, числитель не тронут.
+	silentRes := &httpworker.DomainResult{ZoneID: zone, DomainID: ids[1], Name: "s1.share.test"}
+	if ok, err := rec.RecordAndPublish(ctx, silentRes); err != nil || !ok {
+		t.Fatalf("no_http-эпизод: ok=%v err=%v", ok, err)
+	}
+	if got := countersChecksToday(t, pool); got != 2 {
+		t.Fatalf("после no_http-эпизода checks:<день> = %d, хочу 2", got)
+	}
+	if got := countersTempToday(t, pool); got != 1 {
+		t.Fatalf("после no_http-эпизода temp_error:<день> = %d, хочу 1 (не temp_error-итог не инкрементирует)", got)
+	}
+
+	// Дубль-доставка temp_error-эпизода: +1 в числитель и знаменатель
+	// одновременно — доля не менялась бы, события записи честны.
+	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
+		t.Fatalf("дубль temp_error-эпизода: ok=%v err=%v", ok, err)
+	}
+	if got := countersChecksToday(t, pool); got != 3 {
+		t.Fatalf("после дубля checks:<день> = %d, хочу 3", got)
+	}
+	if got := countersTempToday(t, pool); got != 2 {
+		t.Fatalf("после дубля temp_error:<день> = %d, хочу 2", got)
+	}
+	countersVerifyEmpty(t, pool, "после эпизодов доли (суточные строки вне verify)")
+
+	// Реконсиляция — авторитет: живое окно — 2 домена дня (у одного
+	// статус temp_error), доля 1/2; инкременты дали 3/2 (дубль) —
+	// позиции daily:* наблюдают разницу.
+	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
+	if err != nil {
+		t.Fatalf("реконсиляция: %v", err)
+	}
+	if got := countersChecksToday(t, pool); got != 2 {
+		t.Fatalf("после реконсиляции checks:<день> = %d, хочу 2 (живое окно: два домена сегодня)", got)
+	}
+	if got := countersTempToday(t, pool); got != 1 {
+		t.Fatalf("после реконсиляции temp_error:<день> = %d, хочу 1 (один temp_error-домен дня)", got)
+	}
+	byName := map[string]monitor.CounterPosition{}
+	for _, p := range pass.Positions {
+		byName[p.Counter] = p
+	}
+	if p := byName["daily:checks"]; p.Old != 3 || p.New != 2 || p.Drift() != 1 {
+		t.Fatalf("daily:checks = %+v, хочу old=3 new=2 drift=1", p)
+	}
+	if p := byName["daily:temp_error"]; p.Old != 2 || p.New != 1 || p.Drift() != 1 {
+		t.Fatalf("daily:temp_error = %+v, хочу old=2 new=1 drift=1 (дубль события)", p)
+	}
+	countersVerifyEmpty(t, pool, "после реконсиляции доли")
 }
 
 // TestCounters_DailyChecksDayChange — ротация суток (T-179, ТЗ §9.2):

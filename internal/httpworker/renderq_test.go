@@ -799,6 +799,12 @@ func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		// пройти шаг (upsert всегда 1).
 		t.j.record("checks")
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	case recordTempErrBumpSQL:
+		// Суточный числитель temp_error (T-182): выполняется только у
+		// temp_error-эпизодов — сценариям рендера значение не нужно,
+		// транзакция обязана пройти шаг.
+		t.j.record("temp-err")
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordInsertSQL:
 		if len(args) != 18 {
 			return pgconn.CommandTag{}, fmt.Errorf("renderqRecPool: INSERT: параметров %d, нужно 18", len(args))

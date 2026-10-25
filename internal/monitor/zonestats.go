@@ -30,7 +30,10 @@
 //     прежнего подзапроса count(*) … WHERE last_checked_at =
 //     current_date; имя дня вычисляет БД — отдельным оператором после
 //     скаляров, в unnest-пачку с Go-именем не кладётся: рассинхрон
-//     таймзоны Go/БД молча развёл бы строку и окно FILTER);
+//     таймзоны Go/БД молча развёл бы строку и окно FILTER),
+//     temp_error:YYYY-MM-DD — суточный числитель доли temp_error
+//     (T-182, TZ_slow_dns_share §6: та же FILTER-цена нуля, знаменатель
+//     алерта доли — строка checks:);
 //   - дрейф |старое − новое| каждой позиции: до перезаписи читаются
 //     прежние значения, после — новые (транзакция видит собственную
 //     запись); ненулевой дрейф — gauge crawler_counters_drift + Warn
@@ -41,8 +44,9 @@
 // check_state без фильтра статуса) обслуживает и колонки зон
 // (total/pending/queued/checked — status <> deleted в FILTER), и
 // глобальное распределение статусов + бит рендера (суммы по зонам), и
-// суточное окно проверок (FILTER last_checked_at = current_date, T-179)
-// — дополнительная цена FILTER-колонок ноль (ТЗИ §13.3).
+// суточные окна проверок с temp_error-числителем (FILTER
+// last_checked_at = current_date × статус, T-179/T-182) —
+// дополнительная цена FILTER-колонок ноль (ТЗИ §13.3).
 //
 // Семантика колонок зон — комментарий пакета ниже; изменения против
 // T-078 — только расширение (pending/queued), существующие колонки
@@ -54,6 +58,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -130,9 +135,14 @@ func init() {
 // last_checked_at = current_date, что у прежнего подзапроса done_today
 // throughputSQL (включая строки deleted — живой аналог их не фильтровал);
 // FILTER-колонка — цена нуля на уже идущем скане (ТЗИ §13.3), сумма по
-// зонам — значение строки checks:YYYY-MM-DD.
+// зонам — значение строки checks:YYYY-MM-DD. f_temp_today — числитель
+// доли temp_error суток (T-182, TZ_slow_dns_share §6): то же окно
+// × статус temp_error, FILTER-цена нуля (живой аналог прежнего dnsShareSQL
+// считал окно целиком и ходил в heap за статусом — запрос №6 журнала
+// медленных 24.10), сумма по зонам — значение строки
+// temp_error:YYYY-MM-DD.
 var domainsAggSQL = func() string {
-	cols := make([]string, 0, len(statusAggCols)+6)
+	cols := make([]string, 0, len(statusAggCols)+7)
 	cols = append(cols,
 		fmt.Sprintf("count(*) FILTER (WHERE status <> %d) AS total", int16(model.StatusDeleted)),
 		fmt.Sprintf("count(*) FILTER (WHERE status <> %d AND check_state = %d) AS pending", int16(model.StatusDeleted), int16(model.CheckStatePending)),
@@ -143,19 +153,21 @@ var domainsAggSQL = func() string {
 	}
 	cols = append(cols,
 		fmt.Sprintf("count(*) FILTER (WHERE (flags & %d) <> 0) AS f_render", int16(model.FlagRenderPending)),
-		"count(*) FILTER (WHERE last_checked_at = current_date) AS f_checks_today")
+		"count(*) FILTER (WHERE last_checked_at = current_date) AS f_checks_today",
+		fmt.Sprintf("count(*) FILTER (WHERE last_checked_at = current_date AND status = %d) AS f_temp_today", int16(model.StatusTempError)))
 	return "SELECT zone_id, " + strings.Join(cols, ", ") + " FROM domains GROUP BY zone_id"
 }()
 
 // zoneAggRow — строка per-zone агрегата (колонки domainsAggSQL): значения
 // состояний и легенда статусов по порядку statusAggCols + бит рендера +
-// суточное окно проверок (T-179).
+// суточное окно проверок (T-179) и его temp_error-числитель (T-182).
 type zoneAggRow struct {
 	zone                            int16
 	total, pending, queued, checked int64
 	statuses                        []int64 // по порядку statusAggCols
 	render                          int64
 	checksToday                     int64 // FILTER last_checked_at = current_date (T-179)
+	tempToday                       int64 // FILTER last_checked_at = current_date AND status = temp_error (T-182)
 }
 
 // recountAggQuerySQL — чтение per-zone агрегата прохода (единственный
@@ -225,6 +237,15 @@ const readCountersSQL = "SELECT name, value FROM crawler_counters WHERE name = A
 const readDailyChecksSQL = "SELECT value FROM crawler_counters " +
 	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')"
 
+// readDailyTempSQL — старое значение строки суточного числителя
+// temp_error до перезаписи (дрейф, T-182): пара readDailyChecksSQL,
+// строка temp_error:YYYY-MM-DD (инкремент записи результата с вердиктом
+// temp_error, TZ_slow_dns_share §5); пустой результат — строки дня ещё
+// нет (первый temp_error-эпизод суток или проход создаст) — заполнение,
+// не дрейф.
+const readDailyTempSQL = "SELECT value FROM crawler_counters " +
+	"WHERE name = 'temp_error:' || to_char(current_date, 'YYYY-MM-DD')"
+
 // recountDailyChecksSQL — перезапись строки текущего дня значением
 // агрегата прохода (T-179, TZ_slow_done_today §6): value := сумма
 // FILTER-колонок f_checks_today per-zone агрегата, имя дня — снова БД
@@ -239,11 +260,25 @@ const recountDailyChecksSQL = "INSERT INTO crawler_counters (name, value, update
 	"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 	"RETURNING value"
 
+// recountDailyTempSQL — перезапись суточного числителя temp_error
+// значением агрегата прохода (T-182, TZ_slow_dns_share §6): value := сумма
+// FILTER-колонок f_temp_today; пара recountDailyChecksSQL — блокировка
+// ПОСЛЕ строки знаменателя (тот же порядок, что у инкрементов record.go:
+// checks: → temp_error: — без циклов блокировок), RETURNING — новое
+// значение для дрейфа. Строку дня без temp_error-событий проход создаёт
+// значением окна (может быть нулём) — симметрия знаменателю, читатель
+// доли до прохода видит coalesce-ноль инкрементов.
+const recountDailyTempSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+	"VALUES ('temp_error:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, $2) " +
+	"ON CONFLICT (name) DO UPDATE " +
+	"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
+	"RETURNING value"
+
 // CounterNames — имена строк глобальных счётчиков, поддерживаемых
-// реконсиляцией (легенда для чтения/сверки; T-182 добавит суточную
-// temp_error:…). Суточная строка checks:YYYY-MM-DD сюда не входит: имя
-// дня вычисляет БД (readDailyChecksSQL/recountDailyChecksSQL), в
-// unnest-пачке с Go-именами её нет.
+// реконсиляцией (легенда для чтения/сверки). Суточные строки
+// checks:YYYY-MM-DD и temp_error:YYYY-MM-DD (T-179/T-182) сюда не
+// входят: имя дня вычисляет БД (readDailyChecksSQL/recountDailyChecksSQL
+// и их temp-пары), в unnest-пачке с Go-именами их нет.
 func CounterNames() []string {
 	names := make([]string, 0, len(model.Statuses)+3)
 	for _, s := range model.Statuses {
@@ -259,13 +294,14 @@ func CounterNames() []string {
 // (ТЗИ §13.3 — старые статусы переходов не пинируются предикатами
 // операторов), под живой нагрузкой их «дрейф» — freshwater лаг
 // интервала, а не аномалия: Warn/gauge по ним шумели бы на каждом
-// проходе, verify — никогда не сходился бы без допуска. Суточная
-// строка checks: (T-179) — дельта-ведомая, но с потоковой семантикой
-// расхождения (события записи результата HTTP против доменов дня всех
-// веток конвейера, TZ_slow_done_today §5.1): её позиция daily:checks
-// ведётся в проходе отдельно (имя дня вычисляет БД), а verify её не
-// сверяет — под нагрузкой расхождение равно разнице потоков этапов с
-// прошлого прохода (свежесть, не аномалия).
+// проходе, verify — никогда не сходился бы без допуска. Суточные строки
+// checks:/temp_error: (T-179/T-182) — дельта-ведомые, но с потоковой
+// семантикой расхождения (события записи результата HTTP против доменов
+// дня всех веток конвейера, TZ_slow_done_today §5.1): их позиции
+// daily:checks/daily:temp_error ведутся в проходе отдельно (имя дня
+// вычисляет БД), а verify их не сверяет — под нагрузкой расхождение
+// равно разнице потоков этапов с прошлого прохода (свежесть, не
+// аномалия).
 func driftCounterNames() []string {
 	return []string{"render_pending", "laravel_appeared_total", "laravel_lost_total"}
 }
@@ -275,6 +311,22 @@ func driftCounterNames() []string {
 // нулевая в стационаре: не участвует в агрегированном Warn
 // (reportDrift), наблюдается только gauge.
 const dailyChecksCounter = "daily:checks"
+
+// dailyTempCounter — метка позиции суточного числителя temp_error в
+// дрейфе прохода (T-182, TZ_slow_dns_share §6): та же потоковая
+// семантика, что dailyChecksCounter (числитель и знаменатель расходятся
+// с живым окном вместе — повторы эпизодов суток), вне Warn, наблюдается
+// gauge.
+const dailyTempCounter = "daily:temp_error"
+
+// dailyStreamingPositions — суточные позиции потоковой семантики
+// (T-179/T-182): инкременты считают события записи результатов HTTP,
+// живое окно прохода — домены дня всех веток конвейера; стационарного
+// нуля нет, агрегированный Warn дрейфа их не поднимает (шум под живой
+// нагрузкой), gauge экспонирует.
+func dailyStreamingPositions() []string {
+	return []string{dailyChecksCounter, dailyTempCounter}
+}
 
 // ---------------------------------------------------------------- проход
 
@@ -357,18 +409,18 @@ var zoneColumnPositions = [...]string{"total", "pending", "queued", "checked", "
 
 // ZoneStatsOnce выполняет один совмещённый проход реконсиляции (ТЗИ
 // §7.1) в одной транзакции: (1) читает старые значения зон, счётчиков
-// и суточной строки проверок; (2) единственный полный скан domains —
-// per-zone агрегат (recountAggQuerySQL, включая FILTER-колонку
-// last_checked_at = current_date, T-179), агрегаты laravel_domains и
-// laravel_history; (3) перезаписывает колонки зонunnest-пачкой значений
-// (блокировки зон — первыми); (4) upsert-ит глобальные скаляры
-// (блокировки crawler_counters — после зон, порядок против дедлоков —
-// recountZonesSQL) и строку суточного счётчика проверок (последней);
-// RETURNING обоих операторов даёт новые значения для дрейфа. Проход
-// идемпотентен (ТЗ 3.4): повтор даёт те же значения; сбой откатывает
-// транзакцию целиком — половинчатых состояний не бывает. Фильтр Zone
-// (recount --zone) ограничивает перезапись зон; глобальные скаляры и
-// суточная строка пересчитываются всегда (ТЗИ §9).
+// и суточных строк (проверок и temp_error, T-179/T-182); (2) единственный
+// полный скан domains — per-zone агрегат (recountAggQuerySQL, включая
+// FILTER-колонки last_checked_at = current_date, T-179/T-182), агрегаты
+// laravel_domains и laravel_history; (3) перезаписывает колонки
+// зонunnest-пачкой значений (блокировки зон — первыми); (4) upsert-ит
+// глобальные скаляры (блокировки crawler_counters — после зон, порядок
+// против дедлоков — recountZonesSQL) и суточные строки (последними, в
+// порядке checks: → temp_error:); RETURNING операторов даёт новые
+// значения для дрейфа. Проход идемпотентен (ТЗ 3.4): повтор даёт те же
+// значения; сбой откатывает транзакцию целиком — половинчатых состояний
+// не бывает. Фильтр Zone (recount --zone) ограничивает перезапись зон;
+// глобальные скаляры и суточные строки пересчитываются всегда (ТЗИ §9).
 func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions) (ZoneStatsResult, error) {
 	if pool == nil {
 		return ZoneStatsResult{}, errors.New("monitor: реконсиляция счётчиков: пул не задан")
@@ -394,10 +446,14 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Суточная строка — тем же блоком старых чтений (снапшот один): имя
-	// дня вычисляет БД (T-179), присутствие — признак заполнения (дрейф
-	// только у существующей строки).
-	oldDaily, dailyExists, err := readDailyChecksValue(ctx, tx)
+	// Суточные строки — тем же блоком старых чтений (снапшот один): имя
+	// дня вычисляет БД (T-179/T-182), присутствие — признак заполнения
+	// (дрейф только у существующей строки).
+	oldDaily, dailyExists, err := readDailyValue(ctx, tx, readDailyChecksSQL, "суточная строка проверок")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
+	oldTemp, tempExists, err := readDailyValue(ctx, tx, readDailyTempSQL, "суточная строка temp_error")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -459,16 +515,23 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Суточный счётчик проверок — последней записью прохода (T-179):
-	// значение — сумма FILTER-колонок f_checks_today, строка дня —
-	// всегда глобальная (фильтр Zone касался только колонок зон).
-	// Ротация суток — просто новая строка: проход после полуночи
-	// создаёт её значением окна, вчерашняя остаётся историей темпа.
-	var checksToday int64
+	// Суточные строки — последними записями прохода (T-179/T-182):
+	// значение — сумма FILTER-колонок f_checks_today/f_temp_today, строка
+	// дня — всегда глобальная (фильтр Zone касался только колонок зон);
+	// порядок «checks: → temp_error:» общий с инкрементами record.go —
+	// без циклов блокировок. Ротация суток — просто новая строка: проход
+	// после полуночи создаёт её значением окна, вчерашняя остаётся
+	// историей темпа.
+	var checksToday, tempToday int64
 	for i := range agg {
 		checksToday += agg[i].checksToday
+		tempToday += agg[i].tempToday
 	}
-	newDaily, err := writeDailyChecks(ctx, tx, checksToday, now())
+	newDaily, err := writeDailyCounter(ctx, tx, recountDailyChecksSQL, checksToday, now(), "суточная строка проверок")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
+	newTemp, err := writeDailyCounter(ctx, tx, recountDailyTempSQL, tempToday, now(), "суточная строка temp_error")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -476,7 +539,7 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		return ZoneStatsResult{}, fmt.Errorf("monitor: реконсиляция счётчиков: фиксация: %w", err)
 	}
 
-	res := ZoneStatsResult{Zones: int64(len(newZones)), Positions: make([]CounterPosition, 0, len(newZones)*len(zoneColumnPositions)+len(driftCounterNames())+1)}
+	res := ZoneStatsResult{Zones: int64(len(newZones)), Positions: make([]CounterPosition, 0, len(newZones)*len(zoneColumnPositions)+len(driftCounterNames())+len(dailyStreamingPositions()))}
 	for _, id := range zoneIDs {
 		nz, ok := newZones[id]
 		if !ok {
@@ -503,16 +566,17 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 			New:     newCounters[name],
 		})
 	}
-	// Суточный счётчик проверок (T-179): дрейф — потоковая разница
-	// семантик, а не аномалия: инкременты считают события записи
-	// результата HTTP-этапа, живое окно — домены дня всех веток
-	// (DNS-терминальные завершения — not_delegated и пр. — эпизода HTTP
-	// не имеют), между ними — повторные эпизоды суток. Стационарного
-	// нуля нет (в отличие от render_pending), позиция наблюдаемая.
-	// Строки дня ещё не было — заполнение, не дрейф (Old := New):
-	// расхождение с нулём считало бы in-flight записи DNS-этапа, к
-	// инкрементам отношения не имеющие (прецедент — стартовый проход
-	// цикла, ТЗИ §7.1.3).
+	// Суточные позиции (T-179/T-182): дрейф — потоковая разница семантик,
+	// а не аномалия: инкременты считают события записи результата
+	// HTTP-этапа, живое окно — домены дня всех веток (DNS-терминальные
+	// завершения — not_delegated и пр. — эпизода HTTP не имеют), между
+	// ними — повторные эпизоды суток. Числитель temp_error расходится
+	// вдобавок ретраями, закрывшими ошибку (событие осталось в истории).
+	// Стационарного нуля нет (в отличие от render_pending), позиции
+	// наблюдаемые. Строки дня ещё не было — заполнение, не дрейф
+	// (Old := New): расхождение с нулём считало бы in-flight записи
+	// DNS-этапа, к инкрементам отношения не имеющие (прецедент —
+	// стартовый проход цикла, ТЗИ §7.1.3).
 	dailyOld := oldDaily
 	if !dailyExists {
 		dailyOld = newDaily
@@ -521,6 +585,15 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		Counter: dailyChecksCounter,
 		Old:     dailyOld,
 		New:     newDaily,
+	})
+	tempOld := oldTemp
+	if !tempExists {
+		tempOld = newTemp
+	}
+	res.Positions = append(res.Positions, CounterPosition{
+		Counter: dailyTempCounter,
+		Old:     tempOld,
+		New:     newTemp,
 	})
 	return res, nil
 }
@@ -532,9 +605,10 @@ type laravelAggRow struct {
 }
 
 // readZoneAgg — per-zone агрегат domainsAggSQL: колонки в порядке
-// домена, затем легенда statusAggCols, бит рендера и суточное окно
-// проверок (T-179). Приёмник — db.DB (транзакция прохода или пул
-// verify: агрегат один, точка правды — ТЗИ §9).
+// домена, затем легенда statusAggCols, бит рендера, суточное окно
+// проверок и его temp_error-числитель (T-179/T-182). Приёмник — db.DB
+// (транзакция прохода или пул verify: агрегат один, точка правды —
+// ТЗИ §9).
 func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
 	rows, err := q.Query(ctx, recountAggQuerySQL)
 	if err != nil {
@@ -545,12 +619,12 @@ func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
 	for rows.Next() {
 		var r zoneAggRow
 		r.statuses = make([]int64, len(statusAggCols))
-		dest := make([]any, 0, 5+len(statusAggCols)+2)
+		dest := make([]any, 0, 5+len(statusAggCols)+3)
 		dest = append(dest, &r.zone, &r.total, &r.pending, &r.queued, &r.checked)
 		for i := range r.statuses {
 			dest = append(dest, &r.statuses[i])
 		}
-		dest = append(dest, &r.render, &r.checksToday)
+		dest = append(dest, &r.render, &r.checksToday, &r.tempToday)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("monitor: реконсиляция счётчиков: агрегат: чтение: %w", err)
 		}
@@ -657,53 +731,54 @@ func writeGlobalCounters(ctx context.Context, tx pgx.Tx, names []string, values 
 	return out, nil
 }
 
-// readDailyChecksValue — старое значение строки суточного счётчика
-// проверок (T-179) в транзакции прохода: exists различает «0» от
-// «строки дня ещё нет» (заполнение — не дрейф). Пустой набор без
-// ошибки rows.Err — честное отсутствие строки (PK-лукап по имени,
-// вычисленному БД).
-func readDailyChecksValue(ctx context.Context, tx pgx.Tx) (value int64, exists bool, err error) {
-	rows, err := tx.Query(ctx, readDailyChecksSQL)
+// readDailyValue — старое значение суточной строки (T-179 checks:,
+// T-182 temp_error:) в транзакции прохода: sqlQ — точечный PK-лукап с
+// именем дня, вычисляемым БД; what — контекст ошибок. exists различает
+// «0» от «строки дня ещё нет» (заполнение — не дрейф). Пустой набор без
+// ошибки rows.Err — честное отсутствие строки.
+func readDailyValue(ctx context.Context, tx pgx.Tx, sqlQ, what string) (value int64, exists bool, err error) {
+	rows, err := tx.Query(ctx, sqlQ)
 	if err != nil {
-		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: суточная строка: %w", err)
+		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		// Сначала сбой чтения: обрыв соединения — не «строки нет»
 		// (стиль renderDebtCount).
 		if err := rows.Err(); err != nil {
-			return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: суточная строка: %w", err)
+			return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
 		}
 		return 0, false, nil
 	}
 	if err := rows.Scan(&value); err != nil {
-		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: суточная строка: чтение: %w", err)
+		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: чтение: %w", what, err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: суточная строка: %w", err)
+		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
 	}
 	return value, true, nil
 }
 
-// writeDailyChecks — перезапись строки текущего дня значением агрегата
-// прохода (recountDailyChecksSQL, T-179); возврат — новое значение по
-// RETURNING (дрейф). Upsert создаёт строку первого прохода дня (или
-// исправляет созданную инкрементами — проход авторитетен).
-func writeDailyChecks(ctx context.Context, tx pgx.Tx, value int64, at time.Time) (int64, error) {
-	rows, err := tx.Query(ctx, recountDailyChecksSQL, value, at)
+// writeDailyCounter — перезапись суточной строки значением агрегата
+// прохода (recountDailyChecksSQL/recountDailyTempSQL, T-179/T-182);
+// возврат — новое значение по RETURNING (дрейф). Upsert создаёт строку
+// первого прохода дня (или исправляет созданную инкрементами — проход
+// авторитетен).
+func writeDailyCounter(ctx context.Context, tx pgx.Tx, sqlQ string, value int64, at time.Time, what string) (int64, error) {
+	rows, err := tx.Query(ctx, sqlQ, value, at)
 	if err != nil {
-		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: суточная строка: %w", err)
+		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: суточная строка: пустой ответ upsert")
+		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: %s: пустой ответ upsert", what)
 	}
 	var fresh int64
 	if err := rows.Scan(&fresh); err != nil {
-		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: суточная строка: чтение: %w", err)
+		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: %s: чтение: %w", what, err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: суточная строка: %w", err)
+		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
 	}
 	return fresh, nil
 }
@@ -874,19 +949,19 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 
 // reportDrift — наблюдение дрейфа (ТЗИ §7.1.3): gauge каждой позиции
 // (стационар — 0), Warn при ненулевом дрейфе любой позиции — КРОМЕ
-// суточной строки проверок (T-179): её «дрейф» — потоковая разница
-// семантик (события записи HTTP против доменов дня всех веток),
-// ненулевая под живой нагрузкой почти всегда — Warn каждые 5 минут
-// хоронил бы сигнал остальных позиций под шумом (отступление от §8
-// TZ_slow_done_today, писавшегося в предположении «дрейф = повторы,
-// доля мала»; наблюдаемость позиции — gauge). Первый проход цикла
-// (fillFirst) не наблюдается вовсе: после миграции/простоя он
-// заполняет нули — старые значения не дрейф, а отсутствие счётчиков
-// (ТЗИ §5); метрики по нему не поднимаются, со второго прохода gauge
-// экспонирует все позиции (включая нулевые). Warn агрегирует: проход по
-// 2 тыс. зон с полным дрейфом (рестарт на обнулённых счётчиках) не
-// должен флудить журнал — счётчик позиций, сумма |Δ| и первые пять
-// имён; полный список — crawlerctl counters verify (ТЗИ §9).
+// суточных строк (T-179/T-182): их «дрейф» — потоковая разница семантик
+// (события записи HTTP против доменов дня всех веток), ненулевая под
+// живой нагрузкой почти всегда — Warn каждые 5 минут хоронил бы сигнал
+// остальных позиций под шумом (отступление от §8 TZ_slow_done_today,
+// писавшегося в предположении «дрейф = повторы, доля мала»;
+// наблюдаемость позиций — gauge). Первый проход цикла (fillFirst) не
+// наблюдается вовсе: после миграции/простоя он заполняет нули — старые
+// значения не дрейф, а отсутствие счётчиков (ТЗИ §5); метрики по нему
+// не поднимаются, со второго прохода gauge экспонирует все позиции
+// (включая нулевые). Warn агрегирует: проход по 2 тыс. зон с полным
+// дрейфом (рестарт на обнулённых счётчиках) не должен флудить журнал —
+// счётчик позиций, сумма |Δ| и первые пять имён; полный список —
+// crawlerctl counters verify (ТЗИ §9).
 func reportDrift(log *slog.Logger, m *zoneStatsLoopMetrics, res ZoneStatsResult, fillFirst bool) {
 	if fillFirst {
 		return
@@ -896,10 +971,11 @@ func reportDrift(log *slog.Logger, m *zoneStatsLoopMetrics, res ZoneStatsResult,
 			m.drift.WithLabelValues(p.Counter).Set(float64(p.Drift()))
 		}
 	}
+	streaming := dailyStreamingPositions()
 	var drifted []CounterPosition
 	var sum int64
 	for _, p := range res.Positions {
-		if p.Counter == dailyChecksCounter || p.Drift() == 0 {
+		if slices.Contains(streaming, p.Counter) || p.Drift() == 0 {
 			continue
 		}
 		drifted = append(drifted, p)
@@ -950,7 +1026,7 @@ func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
 		}),
 		drift: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_counters_drift",
-			Help: "Дрейф инкрементальных счётчиков на проходе реконсиляции: |старое − новое| по позициям (zone:<id>:колонка, global:<имя>; daily:checks — суточный темп проверок T-179). Стационар — 0, устойчивый ненулевой дрейф — пропущенный переход или ручной SQL мимо кода (разбор — docs/runbooks.md, T-178); исключение — daily:checks: позиция потоковая (события записи HTTP против доменов дня всех веток конвейера), ненулевая под живой нагрузкой — читается как наблюдаемая величина, в Warn не входит.",
+			Help: "Дрейф инкрементальных счётчиков на проходе реконсиляции: |старое − новое| по позициям (zone:<id>:колонка, global:<имя>; daily:checks и daily:temp_error — суточный темп проверок и его temp_error-числитель, T-179/T-182). Стационар — 0, устойчивый ненулевой дрейф — пропущенный переход или ручной SQL мимо кода (разбор — docs/runbooks.md, T-178); исключение — суточные позиции daily:*: они потоковые (события записи HTTP против доменов дня всех веток конвейера), ненулевая под живой нагрузкой — читается как наблюдаемая величина, в Warn не входит.",
 		}, "counter"),
 	}
 }
@@ -1084,13 +1160,13 @@ func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]Coun
 		// Только дельта-ведомые скаляры: распределение статусов пишется
 		// только реконсиляцией (ТЗИ §13.3) — сверка «сохранённое против
 		// живого» под нагрузкой расходится на темп статусов, это
-		// свежесть интервала, не дрейф. Суточная строка checks: (T-179)
-		// — тоже мимо сверки: инкременты считают события записи
-		// результата HTTP, живой агрегат — домены дня всех веток
+		// свежесть интервала, не дрейф. Суточные строки checks:/temp_error:
+		// (T-179/T-182) — тоже мимо сверки: инкременты считают события
+		// записи результата HTTP, живой агрегат — домены дня всех веток
 		// (TZ_slow_done_today §5.1); под нагрузкой расхождение равно
 		// разнице потоков этапов с прошлого прохода — наблюдается
-		// позицией daily:checks прохода реконсиляции, сверка с допуском
-		// 0 сигналила бы штатную работу.
+		// позициями daily:* прохода реконсиляции, сверка с допуском 0
+		// сигналила бы штатную работу.
 		if absDiff(stored[name], live[name]) > opts.Tolerance {
 			out = append(out, CounterPosition{
 				Counter: "global:" + name,

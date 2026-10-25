@@ -20,7 +20,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -30,37 +29,37 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"crawler/internal/model"
 	"crawler/internal/queue"
 )
 
 // --- фейковые источники -----------------------------------------------------
 
-// alertShare — ответ dnsShareSQL.
-type alertShare struct {
+// alertDNSDaily — ответ dnsDailyCountersSQL: числитель (temp_error-события
+// суток) и знаменатель (события записей) доли temp_error (T-182).
+type alertDNSDaily struct {
 	temp  int64
 	total int64
 }
 
-// alertsPool — db.DB без БД: маршрутизация двух SQL алертов, очереди
+// alertsPool — db.DB без БД: маршрутизация трёх SQL алертов, очереди
 // результатов и ошибок, протокол вызовов. Под замком: AlertsLoop работает
 // в горутине, тесты ждут прогресса по счётчику проходов.
 type alertsPool struct {
 	mu    sync.Mutex
-	share []alertShare   // очередь ответов dnsShareSQL (кончилась — нули)
-	fresh []sql.NullTime // очередь ответов zoneFreshSQL (кончилась — нулевая)
-	debt  []int64        // очередь ответов renderDebtFlagsSQL (кончилась — нули)
+	daily []alertDNSDaily // очередь ответов dnsDailyCountersSQL (кончилась — нули)
+	fresh []sql.NullTime  // очередь ответов zoneFreshSQL (кончилась — нулевая)
+	debt  []int64         // очередь ответов renderDebtFlagsSQL (кончилась — нули)
 
-	shareErrs []error
+	dailyErrs []error
 	freshErrs []error
 	debtErrs  []error
 
 	// Деградации формы ответа: без строк (rows.Next ложен), строка с
 	// нечитаемыми типами (ошибка Scan), ошибка итерации (rows.Err).
-	shareEmpty, shareBadRow    bool
+	dailyEmpty, dailyBadRow    bool
 	freshEmpty, freshBadRow    bool
 	debtEmpty, debtBadRow      bool
-	shareRowsErr, freshRowsErr error
+	dailyRowsErr, freshRowsErr error
 	debtRowsErr                error
 
 	queries []zonestatsCall // переиспользован: sql + args
@@ -79,22 +78,22 @@ func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Row
 	defer p.mu.Unlock()
 	p.queries = append(p.queries, zonestatsCall{sql: sqlQ, args: args})
 	switch sqlQ {
-	case dnsShareSQL:
-		if err := popErr(&p.shareErrs); err != nil {
+	case dnsDailyCountersSQL:
+		if err := popErr(&p.dailyErrs); err != nil {
 			return nil, err
 		}
-		if p.shareEmpty {
-			return &alertRows{err: p.shareRowsErr}, nil
+		if p.dailyEmpty {
+			return &alertRows{err: p.dailyRowsErr}, nil
 		}
-		if p.shareBadRow {
-			return &alertRows{rows: [][]any{{"байты", "байты"}}, err: p.shareRowsErr}, nil
+		if p.dailyBadRow {
+			return &alertRows{rows: [][]any{{"байты", "байты"}}, err: p.dailyRowsErr}, nil
 		}
-		s := alertShare{}
-		if len(p.share) > 0 {
-			s = p.share[0]
-			p.share = p.share[1:]
+		d := alertDNSDaily{}
+		if len(p.daily) > 0 {
+			d = p.daily[0]
+			p.daily = p.daily[1:]
 		}
-		return &alertRows{rows: [][]any{{s.temp, s.total}}, err: p.shareRowsErr}, nil
+		return &alertRows{rows: [][]any{{d.temp, d.total}}, err: p.dailyRowsErr}, nil
 	case zoneFreshSQL:
 		if err := popErr(&p.freshErrs); err != nil {
 			return nil, err
@@ -317,15 +316,15 @@ func alertsFixedClock() (time.Time, func() time.Time) {
 	return zonestatsFixedClock()
 }
 
-// alertHealthyShares — очередь здоровых ответов dnsShareSQL (доля 0 %)
-// на n проходов: тесты, не занятые долей ошибок, не упираются в пустую
-// очередь.
-func alertHealthyShares(n int) []alertShare {
-	shares := make([]alertShare, n)
-	for i := range shares {
-		shares[i] = alertShare{temp: 0, total: 1000}
+// alertHealthyShares — очередь здоровых ответов dnsDailyCountersSQL
+// (доля 0 %: temp_error-событий нет) на n проходов: тесты, не занятые
+// долей ошибок, не упираются в пустую очередь.
+func alertHealthyShares(n int) []alertDNSDaily {
+	daily := make([]alertDNSDaily, n)
+	for i := range daily {
+		daily[i] = alertDNSDaily{temp: 0, total: 1000}
 	}
-	return shares
+	return daily
 }
 
 // alertHealthyFresh — очередь свежих ответов zoneFreshSQL (минута назад)
@@ -342,7 +341,7 @@ func newAlertsTestEnv(t *testing.T, mod func(o *AlertsOptions)) *alertsTestEnv {
 	t.Helper()
 	now, clock := alertsFixedClock()
 	pool := &alertsPool{
-		share: alertHealthyShares(10),
+		daily: alertHealthyShares(10),
 		fresh: alertHealthyFresh(now, 10),
 	}
 	lener := &fakeLener{lens: map[string]int64{}}
@@ -389,11 +388,13 @@ func snapshotOf(t *testing.T, res AlertsResult, name string) AlertSnapshot {
 
 // --- доля ошибок DNS ---------------------------------------------------------
 
-// TestAlertsDNSContract — точный SQL (окно — текущие сутки по date-колонке
-// last_checked_at) и параметр-статус temp_error; доля ≥ порога — алерт.
+// TestAlertsDNSContract — точный SQL доли: два точечных чтения суточных
+// строк crawler_counters (имена дней вычисляет БД, coalesce снаружи
+// подзапросов), без параметров и без скана domains (T-182 — прежний
+// dnsShareSQL агрегировал окно суток целиком); доля ≥ порога — алерт.
 func TestAlertsDNSContract(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	env.pool.share = []alertShare{{temp: 350, total: 1000}}
+	env.pool.daily = []alertDNSDaily{{temp: 350, total: 1000}}
 
 	res := env.Pass(context.Background())
 	s := snapshotOf(t, res, AlertDNSErrors)
@@ -409,15 +410,30 @@ func TestAlertsDNSContract(t *testing.T) {
 	calls := env.pool.calls()
 	var dns []zonestatsCall
 	for _, c := range calls {
-		if c.sql == dnsShareSQL {
+		if c.sql == dnsDailyCountersSQL {
 			dns = append(dns, c)
 		}
 	}
 	if len(dns) != 1 {
-		t.Fatalf("запросов dnsShareSQL = %d, want 1", len(dns))
+		t.Fatalf("запросов dnsDailyCountersSQL = %d, want 1", len(dns))
 	}
-	if !reflect.DeepEqual(dns[0].args, []any{int16(model.StatusTempError)}) {
-		t.Errorf("аргументы = %v, want [temp_error]", dns[0].args)
+	if len(dns[0].args) != 0 {
+		t.Errorf("аргументы = %v, want пусто (имена дней вычисляет БД)", dns[0].args)
+	}
+	// Имена суточных строк — выражения БД (current_date), внешние
+	// coalesce дают честный ноль до первой записи суток; окна domains
+	// в SQL нет.
+	for _, want := range []string{
+		"'temp_error:' || to_char(current_date, 'YYYY-MM-DD')",
+		"'checks:' || to_char(current_date, 'YYYY-MM-DD')",
+		"coalesce((SELECT value FROM crawler_counters",
+	} {
+		if !strings.Contains(dnsDailyCountersSQL, want) {
+			t.Errorf("dnsDailyCountersSQL без %q:\n%s", want, dnsDailyCountersSQL)
+		}
+	}
+	if strings.Contains(dnsDailyCountersSQL, "FROM domains") {
+		t.Errorf("dnsDailyCountersSQL читает domains — скан окна суток обязан исчезнуть (T-182):\n%s", dnsDailyCountersSQL)
 	}
 }
 
@@ -428,36 +444,48 @@ func TestAlertsDNSHysteresis(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 	steps := []struct {
-		share alertShare
+		daily alertDNSDaily
 		want  string
 	}{
-		{alertShare{300, 1000}, AlertStatusFiring}, // 30.0 % — включение
-		{alertShare{250, 1000}, AlertStatusFiring}, // 25.0 % — коридор гистерезиса
-		{alertShare{200, 1000}, AlertStatusFiring}, // ровно 20.0 % — удержание (граница снятия)
-		{alertShare{199, 1000}, AlertStatusOK},     // 19.9 % — снятие
-		{alertShare{250, 1000}, AlertStatusOK},     // 25 % без сработавшего алерта — не включается
+		{alertDNSDaily{300, 1000}, AlertStatusFiring}, // 30.0 % — включение
+		{alertDNSDaily{250, 1000}, AlertStatusFiring}, // 25.0 % — коридор гистерезиса
+		{alertDNSDaily{200, 1000}, AlertStatusFiring}, // ровно 20.0 % — удержание (граница снятия)
+		{alertDNSDaily{199, 1000}, AlertStatusOK},     // 19.9 % — снятие
+		{alertDNSDaily{250, 1000}, AlertStatusOK},     // 25 % без сработавшего алерта — не включается
 	}
-	env.pool.share = make([]alertShare, len(steps))
+	env.pool.daily = make([]alertDNSDaily, len(steps))
 	for i, s := range steps {
-		env.pool.share[i] = s.share
+		env.pool.daily[i] = s.daily
 	}
 	for i, s := range steps {
 		got := snapshotOf(t, env.Pass(ctx), AlertDNSErrors)
 		if got.Status != s.want {
 			t.Errorf("шаг %d (доля %d/%d): статус = %s (%s), want %s",
-				i, s.share.temp, s.share.total, got.Status, got.Detail, s.want)
+				i, s.daily.temp, s.daily.total, got.Status, got.Detail, s.want)
 		}
 	}
 }
 
-// TestAlertsDNSMinSamples — пустое окно (меньше 100 проверок за сутки):
-// доля не показательна — «не измеряется», не срабатывание. Ровно 100 —
-// уже показательна: граница строгая (меньше, не «не больше»).
+// TestAlertsDNSMinSamples — пустой счётчик суток (строк ещё нет — честный
+// ноль) и малое окно (меньше 100 событий знаменателя): доля не
+// показательна — «не измеряется», не срабатывание. Ровно 100 — уже
+// показательна: граница строгая (меньше, не «не больше»).
 func TestAlertsDNSMinSamples(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	env.pool.share = []alertShare{{temp: 2, total: 50}}
 
+	// До первой записи суток обе строки отсутствуют: coalesce даёт нули
+	// — «не измеряется», не ложное срабатывание (TZ_slow_dns_share §7).
+	env.pool.daily = []alertDNSDaily{{temp: 0, total: 0}}
 	s := snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
+	if s.Status != AlertStatusNotMeasured {
+		t.Fatalf("пустой счётчик: статус = %s (%s), want not_measured", s.Status, s.Detail)
+	}
+	if !strings.Contains(s.Detail, "0") || !strings.Contains(s.Detail, "100") {
+		t.Errorf("detail %q без чисел выборки", s.Detail)
+	}
+
+	env.pool.daily = []alertDNSDaily{{temp: 2, total: 50}}
+	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
 	if s.Status != AlertStatusNotMeasured {
 		t.Fatalf("статус = %s (%s), want not_measured", s.Status, s.Detail)
 	}
@@ -466,7 +494,7 @@ func TestAlertsDNSMinSamples(t *testing.T) {
 	}
 
 	// Ровно порог выборки — доля считается (0 из 100 — корректный ноль).
-	env.pool.share = []alertShare{{temp: 0, total: 100}}
+	env.pool.daily = []alertDNSDaily{{temp: 0, total: 100}}
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "из 100") {
 		t.Errorf("ровно 100 проверок: статус = %s (%s), want ok с долей по 100", s.Status, s.Detail)
@@ -477,7 +505,7 @@ func TestAlertsDNSMinSamples(t *testing.T) {
 // следующий проход работает (цикл живёт).
 func TestAlertsDNSSourceError(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	env.pool.shareErrs = []error{errors.New("бд недоступна")}
+	env.pool.dailyErrs = []error{errors.New("бд недоступна")}
 
 	res := env.Pass(context.Background())
 	s := snapshotOf(t, res, AlertDNSErrors)
@@ -498,12 +526,13 @@ func TestAlertsDNSSourceError(t *testing.T) {
 }
 
 // TestAlertsDNSSourceErrors — деградации формы ответа: пустой результат
-// (нет строк), нечитаемая строка (ошибка Scan), ошибка итерации (rows.Err)
+// (скалярный SELECT обязан вернуть строку — пустой набор это сбой
+// протокола), нечитаемая строка (ошибка Scan), ошибка итерации (rows.Err)
 // — ошибки источника с Warn и причиной в detail, не молчаливое «мало
 // данных» по нулям.
 func TestAlertsDNSSourceErrors(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	env.pool.shareEmpty = true
+	env.pool.dailyEmpty = true
 	s := snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "пустой ответ") {
 		t.Errorf("пустой ответ: статус = %s (%s), want not_measured «пустой ответ»", s.Status, s.Detail)
@@ -513,14 +542,14 @@ func TestAlertsDNSSourceErrors(t *testing.T) {
 	}
 
 	env = newAlertsTestEnv(t, nil)
-	env.pool.shareBadRow = true
+	env.pool.dailyBadRow = true
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "чтение") {
 		t.Errorf("ошибка Scan: статус = %s (%s), want not_measured «чтение»", s.Status, s.Detail)
 	}
 
 	env = newAlertsTestEnv(t, nil)
-	env.pool.shareRowsErr = errors.New("соединение сброшено")
+	env.pool.dailyRowsErr = errors.New("соединение сброшено")
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "соединение сброшено") {
 		t.Errorf("rows.Err: статус = %s (%s), want not_measured с ошибкой итерации", s.Status, s.Detail)
@@ -1054,7 +1083,7 @@ func TestAlertsTransitionsLogging(t *testing.T) {
 
 	// Четыре прохода: срабатывание, устойчивое срабатывание (тихо),
 	// снятие, устойчивое «ok» (тихо).
-	env.pool.share = []alertShare{{temp: 500, total: 1000}, {temp: 500, total: 1000}, {temp: 0, total: 1000}, {temp: 0, total: 1000}}
+	env.pool.daily = []alertDNSDaily{{temp: 500, total: 1000}, {temp: 500, total: 1000}, {temp: 0, total: 1000}, {temp: 0, total: 1000}}
 	env.Pass(ctx) // срабатывание
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "АЛЕРТ: рост доли ошибок DNS") {
 		t.Errorf("срабатывание без Warn-записи:\n%s", env.buf.String())
@@ -1085,13 +1114,13 @@ func TestAlertsTransitionsLogging(t *testing.T) {
 	// Уход сработавшего алерта в «не измеряется» (сбой источника):
 	// потеря активной аварии фиксируется Info, не тихим Debug.
 	// Перед сбоем алерт снова срабатывает — переход именно из firing.
-	env.pool.share = []alertShare{{temp: 500, total: 1000}}
+	env.pool.daily = []alertDNSDaily{{temp: 500, total: 1000}}
 	env.Pass(ctx)
 	if !strings.Contains(env.buf.String(), "АЛЕРТ: рост доли ошибок DNS") {
 		t.Fatalf("повторное срабатывание не залогировано:\n%s", env.buf.String())
 	}
 	before2 := env.buf.String()
-	env.pool.shareErrs = []error{errors.New("бд недоступна")}
+	env.pool.dailyErrs = []error{errors.New("бд недоступна")}
 	env.Pass(ctx)
 	delta2 := env.buf.String()[len(before2):]
 	if !strings.Contains(delta2, "сработавший алерт больше не измеряется") || !strings.Contains(delta2, "level=INFO") {
@@ -1111,7 +1140,7 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 			passes = append(passes, r)
 		}
 	})
-	env.pool.share = []alertShare{{temp: 500, total: 1000}}
+	env.pool.daily = []alertDNSDaily{{temp: 500, total: 1000}}
 
 	res := env.Pass(context.Background())
 	mu.Lock()
@@ -1953,7 +1982,7 @@ func TestAlertsLoopPasses(t *testing.T) {
 		o.Interval = 2 * time.Millisecond
 		o.OnPass = func(AlertsResult) { mu.Lock(); passes++; mu.Unlock() }
 	})
-	env.pool.shareErrs = []error{errors.New("бд недоступна")} // стартовый проход — ошибка
+	env.pool.dailyErrs = []error{errors.New("бд недоступна")} // стартовый проход — ошибка
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1990,7 +2019,7 @@ func TestAlertsLoopCancelDuringPass(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-	pool := &alertsPool{shareErrs: []error{context.Canceled}}
+	pool := &alertsPool{dailyErrs: []error{context.Canceled}}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // отменён до старта: первый же запрос прохода провалится
 

@@ -30,9 +30,10 @@
 //	    ссылка без строки). Внутри: UPDATE domains (охрана удаления) →
 //	    DELETE старых строк субдомен×вариант с RETURNING content_hash →
 //	    −1 refcount каждого старого хэша → INSERT новых строк; хвостовыми
-//	    шагами — дельты счётчиков: зон (T-178), рендер-долга (T-175) и
-//	    суточного счётчика проверок checks:YYYY-MM-DD (T-179 — события
-//	    записи, авторитет — реконсиляция monitor);
+//	    шагами — дельты счётчиков: зон (T-178), рендер-долга (T-175),
+//	    суточного счётчика проверок checks:YYYY-MM-DD и его числителя
+//	    temp_error:YYYY-MM-DD (T-179/T-182 — события записи, авторитет —
+//	    реконсиляция monitor);
 //	  - публикация q:analyze — ПОСЛЕ фиксации транзакции: потребитель Result
 //	    (анализатор, T-068+) читает запись из БД по ключу — сообщение раньше
 //	    строки смотрело бы в пустоту. Сбой публикации → доставка q:http без
@@ -161,6 +162,24 @@ var (
 	// T-178), дрейф — наблюдаемая метрика.
 	recordChecksBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('checks:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
+
+	// recordTempErrBumpSQL — инкремент суточного числителя доли temp_error
+	// crawler_counters['temp_error:YYYY-MM-DD'] (T-182, TZ_slow_dns_share
+	// §5): тот же upsert-паттерн, что recordChecksBumpSQL (T-179); имя
+	// дня вычисляет БД — таймзона согласована с now() записи
+	// last_checked_at и окном реконсиляции. Дельта — 1 на эпизод,
+	// записанный с итоговым статусом temp_error (вердикт recordStatus —
+	// один на домен, не по числу строк субдомен×вариант); итоги без
+	// temp_error оператор не выполняют вовсе — строку нового дня создаёт
+	// первый temp_error-эпизод, до него читатель доли видит честный ноль.
+	// Семантика — события записей, как у знаменателя (§5.1): ретрай,
+	// закрывший ошибку, остаётся в истории событий — доля устойчива к
+	// дублям доставки (числитель и знаменатель растут вместе), абсолюты
+	// чинит реконсиляция.
+	recordTempErrBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('temp_error:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
@@ -441,6 +460,18 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	if err := recordBumpChecksCounter(ctx, tx, recorded); err != nil {
 		return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 	}
+	// Числитель доли temp_error (T-182) — следом за знаменателем checks:
+	// дельта — только у temp_error-эпизода (вердикт итогового UPDATE
+	// известен выше), прочие итоги строку дня не трогают — блокировки
+	// сериализации temp_error-транзакций не касаются alive/no_http-потока.
+	// Порядок «checks: → temp_error:» общий с проходом реконсиляции
+	// (зоны → скаляры → строки суток в этом же порядке) — без циклов
+	// блокировок; откат откатывает результат и обе дельты вместе (§3.4).
+	if status == model.StatusTempError {
+		if err := recordBumpTempErrCounter(ctx, tx, recorded); err != nil {
+			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("httpworker: домен %s: запись результата: фиксация: %w", res.Name, err)
 	}
@@ -527,6 +558,26 @@ func recordBumpChecksCounter(ctx context.Context, tx pgx.Tx, delta int64) error 
 	}
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("суточный счётчик проверок: затронуто %d строк (upsert строки дня обязан 1)",
+			tag.RowsAffected())
+	}
+	return nil
+}
+
+// recordBumpTempErrCounter — инкремент суточного числителя temp_error в
+// ОТКРЫТОЙ транзакции записи результата (T-182): delta — RowsAffected
+// итогового UPDATE домена (вызывающий гарантирует статус temp_error,
+// вердикт известен до транзакции). Upsert сам создаёт строку дня (первый
+// temp_error-эпизод после полуночи) — RowsAffected гарантированно 1,
+// проверка — страховка прямых вызовов с чужим SQL (молчаливая потеря
+// дельты занижала бы долю). Возврат с ошибкой откатывает транзакцию
+// вызывающего — результат и счётчик меняются только вместе (§3.4).
+func recordBumpTempErrCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
+	tag, err := tx.Exec(ctx, recordTempErrBumpSQL, delta)
+	if err != nil {
+		return fmt.Errorf("суточный числитель temp_error: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("суточный числитель temp_error: затронуто %d строк (upsert строки дня обязан 1)",
 			tag.RowsAffected())
 	}
 	return nil

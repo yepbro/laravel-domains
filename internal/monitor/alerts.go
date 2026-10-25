@@ -3,9 +3,10 @@
 //
 // Набор и источники:
 //
-//   - рост доли ошибок DNS — доля temp_error среди проверок текущих суток
-//     (SQL по domains.last_checked_at/статусам; temp_error — исход DNS-этапа
-//     после исчерпания ретраев, ТЗ 5.4; NXDOMAIN → not_delegated — валидный
+//   - рост доли ошибок DNS — доля temp_error среди проверок текущих
+//     суток (суточные строки crawler_counters temp_error:/checks: —
+//     точечные чтения, T-182; temp_error — исход DNS-этапа после
+//     исчерпания ретраев, ТЗ 5.4; NXDOMAIN → not_delegated — валидный
 //     результат, не ошибка);
 //   - переполнение очередей — глубина рабочих стримов q:dns/q:http/
 //     q:render/q:analyze (backlog групп потребления) против
@@ -121,7 +122,6 @@ import (
 	"unsafe"
 
 	"crawler/internal/db"
-	"crawler/internal/model"
 	"crawler/internal/queue"
 )
 
@@ -323,18 +323,28 @@ const (
 	DefaultRenderDebtPasses = 2
 )
 
-// dnsShareSQL — числитель и знаменатель доли temp_error одним проходом по
-// domains. Окно — текущие сутки: last_checked_at имеет точность дня
-// (date, ТЗ 6.1), минутных окон на колонке нет — тот же выбор, что у темпа
-// crawlerctl status (T-079). current_date — таймзона сервера БД, как и
-// now() записи last_checked_at (T-058). Окно обслуживает
-// domains_last_checked_idx (T-171): диапазонный скан сегодняшних строк
-// вместо полного прохода партиций (частичный domains_recheck_idx T-104
-// не подходит — фильтр по статусу без check_state в предикате запроса
-// индекс не доказывает); статус читается из кучи — страницы сегодняшних
-// проверок самые горячие, в shared_buffers.
-const dnsShareSQL = "SELECT count(*) FILTER (WHERE status = $1), count(*) " +
-	"FROM domains WHERE last_checked_at >= current_date"
+// dnsDailyCountersSQL — числитель и знаменатель доли temp_error текущих
+// суток ДВУМЯ точечными чтениями суточных строк crawler_counters (T-182,
+// TZ_slow_dns_share §7): temp_error:YYYY-MM-DD — события записей
+// результатов с вердиктом temp_error (инкремент httpworker/record.go,
+// T-182), checks:YYYY-MM-DD — события записей результатов (T-179);
+// авторитет обеих строк — проход реконсиляции monitor (FILTER-колонки
+// last_checked_at = current_date, занижены между проходами на DNS-only
+// завершения — доля устойчива, абсолюты чинит проход). Имя дня
+// вычисляет БД (current_date — та же таймзона, что у now() записи
+// last_checked_at и окна реконсиляции); coalesce СНАРУЖИ подзапросов
+// (стиль throughputSQL T-179): до первой записи суток подзапрос пуст —
+// честный ноль. Прежний живой агрегат по окну суток (dnsShareSQL,
+// count(*) FILTER … WHERE last_checked_at >= current_date) убран:
+// Index Scan окна обязан был посещать heap каждой строки за статусом
+// (status в индексе быть не может — HOT-инвариант, docs/schema.md),
+// запрос №6 журнала медленных боя 24.10 (33 срабатывания >3 с, медиана
+// 27,7 с, max 110,7 с — ≈1,3 ГБ чтений за оценку).
+const dnsDailyCountersSQL = "SELECT " +
+	"coalesce((SELECT value FROM crawler_counters " +
+	"WHERE name = 'temp_error:' || to_char(current_date, 'YYYY-MM-DD')), 0), " +
+	"coalesce((SELECT value FROM crawler_counters " +
+	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')), 0)"
 
 // zoneFreshSQL — свежесть прогресса: последний момент пересчёта зон
 // (zones.updated_at пишет ZoneStatsLoop, T-078). Справочник зон маленький;
@@ -1031,11 +1041,17 @@ func (a *Alerts) transition(name, prev string, v verdict) {
 	}
 }
 
-// evalDNS — доля temp_error среди проверок текущих суток. Гистерезис:
+// evalDNS — доля temp_error среди проверок текущих суток: числитель и
+// знаменатель — суточные строки crawler_counters (T-182, точечные
+// чтения dnsDailyCountersSQL; события записей результатов — ретраи и
+// дубли доставки остаются в истории событий, доля устойчива, абсолюты
+// чинит реконсиляция). До 100 событий знаменателя (AlertDNSMinSamples)
+// доля — шум пустого окна, «не измеряется». Гистерезис прежний (пороги
+// T-080/T-162 не меняются — T-182 меняет только источник чисел):
 // включение ≥ AlertDNSFireShare, при сработавшем алерте удержание до
 // падения ниже AlertDNSRecoverShare.
 func (a *Alerts) evalDNS(ctx context.Context, prev string) verdict {
-	rows, err := a.deps.Pool.Query(ctx, dnsShareSQL, int16(model.StatusTempError))
+	rows, err := a.deps.Pool.Query(ctx, dnsDailyCountersSQL)
 	if err != nil {
 		return verdict{err: fmt.Errorf("monitor: доля ошибок DNS: %w", err)}
 	}

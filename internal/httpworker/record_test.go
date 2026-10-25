@@ -42,8 +42,9 @@ const (
 	recordEvDelete  recordEventKind = "delete"
 	recordEvSwap    recordEventKind = "swapref"
 	recordEvInsert  recordEventKind = "insert"
-	recordEvShift   recordEventKind = "zone-shift"  // дельта счётчиков зоны (T-178)
-	recordEvChecks  recordEventKind = "checks-bump" // дельта суточного счётчика проверок (T-179)
+	recordEvShift   recordEventKind = "zone-shift"    // дельта счётчиков зоны (T-178)
+	recordEvChecks  recordEventKind = "checks-bump"   // дельта суточного счётчика проверок (T-179)
+	recordEvTempErr recordEventKind = "temp-err-bump" // дельта суточного числителя temp_error (T-182)
 	recordEvCommit  recordEventKind = "commit"
 	recordEvPublish recordEventKind = "publish"
 	recordEvAck     recordEventKind = "ack"
@@ -149,9 +150,10 @@ type recordFakeRow struct {
 // recordFakePool — RecordDB без БД: живая семантика domains (охрана
 // status <> deleted у UPDATE), subdomain_results (DELETE … RETURNING,
 // INSERT-пачка), contents (refcount с охраной > 0), счётчиков зон
-// (recordZoneShiftSQL, T-178) и суточного счётчика проверок
-// (recordChecksBumpSQL, T-179 — имя дня вычисляет БД, фейк ведёт одно
-// значение «строки текущего дня»). Транзакция работает
+// (recordZoneShiftSQL, T-178), суточного счётчика проверок и его
+// temp_error-числителя (recordChecksBumpSQL/recordTempErrBumpSQL,
+// T-179/T-182 — имя дня вычисляет БД, фейк ведёт по одному значению
+// «строк текущего дня»). Транзакция работает
 // на снапшоте: Rollback восстанавливает состояние пула, Commit оставляет
 // (достаточно для последовательных вызовов записи; конкурентные
 // транзакции фейк не моделирует — их сериализует PostgreSQL).
@@ -163,6 +165,7 @@ type recordFakePool struct {
 	refc    map[content.Hash]int32
 	zones   map[int16]*recordFakeZone
 	checks  int64
+	tempErr int64
 
 	begins   int
 	txs      int // создано транзакций
@@ -205,6 +208,14 @@ func (p *recordFakePool) checksValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.checks
+}
+
+// tempErrValue — значение суточного числителя temp_error (T-182) под
+// замком.
+func (p *recordFakePool) tempErrValue() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tempErr
 }
 
 var _ RecordDB = (*recordFakePool)(nil)
@@ -267,12 +278,13 @@ func (p *recordFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 		snapZones[k] = &c
 	}
 	snapChecks := p.checks
+	snapTempErr := p.tempErr
 	p.txs++
 	p.j.record(recordEvBegin)
 	return &recordFakeTx{
 		pool: p, j: p.j,
 		snapDomains: snapDomains, snapRows: snapRows, snapRefc: snapRefc, snapZones: snapZones,
-		snapChecks: snapChecks,
+		snapChecks: snapChecks, snapTempErr: snapTempErr,
 	}, nil
 }
 
@@ -288,6 +300,7 @@ type recordFakeTx struct {
 	snapRefc    map[content.Hash]int32
 	snapZones   map[int16]*recordFakeZone
 	snapChecks  int64
+	snapTempErr int64
 	committed   bool
 }
 
@@ -438,6 +451,13 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		t.pool.checks += args[0].(int64)
 		t.j.record(recordEvChecks)
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	case recordTempErrBumpSQL:
+		// Инкремент суточного числителя temp_error (T-182): та же пара —
+		// оператор выполняют только temp_error-эпизоды (вызывающий
+		// гарантирует статус), фейк ведёт одно значение строки дня.
+		t.pool.tempErr += args[0].(int64)
+		t.j.record(recordEvTempErr)
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	default:
 		if !strings.HasPrefix(sql, recordDelRefSQLPrefix) {
 			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: неожидаемый SQL: %s", sql)
@@ -503,6 +523,7 @@ func (t *recordFakeTx) Rollback(context.Context) error {
 	}
 	t.pool.domains, t.pool.rows, t.pool.refc, t.pool.zones = t.snapDomains, t.snapRows, t.snapRefc, t.snapZones
 	t.pool.checks = t.snapChecks
+	t.pool.tempErr = t.snapTempErr
 	return nil
 }
 
@@ -786,9 +807,14 @@ func TestRecordWritesAllColumns(t *testing.T) {
 	// Суточный счётчик проверок (T-179): один эпизод — +1, а не +2 по
 	// числу записей субдомен×вариант (дельта — RowsAffected UPDATE
 	// домена, не INSERT-пачки); дельта в той же транзакции — после
-	// сдвига зоны, до фиксации.
+	// сдвига зоны, до фиксации. Числитель temp_error (T-182) живым
+	// (alive) эпизодом не тронут — оператор выполняют только
+	// temp_error-итоги.
 	if got := pool.checksValue(); got != 1 {
 		t.Fatalf("суточный счётчик = %d, want 1 (один эпизод из двух записей)", got)
+	}
+	if got := pool.tempErrValue(); got != 0 {
+		t.Fatalf("суточный числитель temp_error = %d, want 0 (эпизод alive)", got)
 	}
 	if shift, checks := pool.j.indexOf(recordEvShift), pool.j.indexOf(recordEvChecks); shift > checks || checks > pool.j.indexOf(recordEvCommit) {
 		t.Fatalf("порядок счётчиков: shift=%d checks=%d commit=%d (зона → checks → фиксация)",
@@ -1044,6 +1070,66 @@ func TestRecordCutoffFlag(t *testing.T) {
 	}
 }
 
+// TestRecordTempErrCounter — суточный числитель temp_error (T-182):
+// инкремент — только у temp_error-итога эпизода (та же транзакция, после
+// знаменателя checks:, до фиксации — порядок общий с проходом
+// реконсиляции); no_http-итог строку дня не трогает; дубль-доставка
+// temp_error-эпизода — ещё одно событие в числителе и знаменателе
+// одновременно (доля устойчива, абсолюты чинит реконсиляция,
+// TZ_slow_dns_share §5).
+func TestRecordTempErrCounter(t *testing.T) {
+	pool := newRecordFakePool()
+	q := &recordFakeQueue{j: pool.j}
+	r := recordRecorder(t, pool, q)
+
+	// temp_error-эпизод: +1 знаменатель, +1 числитель, инкремент числителя
+	// — между знаменателем и фиксацией.
+	temp := recordSilentResult(true)
+	pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
+	if ok, err := r.RecordAndPublish(context.Background(), temp); err != nil || !ok {
+		t.Fatalf("temp_error-эпизод: ok=%v err=%v", ok, err)
+	}
+	if got := pool.checksValue(); got != 1 {
+		t.Fatalf("после temp_error-эпизода checks = %d, want 1", got)
+	}
+	if got := pool.tempErrValue(); got != 1 {
+		t.Fatalf("после temp_error-эпизода temp_error = %d, want 1", got)
+	}
+	if checks, tempBump := pool.j.indexOf(recordEvChecks), pool.j.indexOf(recordEvTempErr); tempBump < checks || tempBump > pool.j.indexOf(recordEvCommit) {
+		t.Fatalf("порядок: checks=%d temp=%d commit=%d (checks → temp_error → фиксация)",
+			checks, tempBump, pool.j.indexOf(recordEvCommit))
+	}
+
+	// no_http-эпизод: знаменатель растёт, числитель не тронут — оператор
+	// выполняют только temp_error-итоги.
+	silent := recordSilentResult(false)
+	pool.recordSeedDomain(silent.ZoneID, silent.DomainID, model.StatusNew, 0)
+	if ok, err := r.RecordAndPublish(context.Background(), silent); err != nil || !ok {
+		t.Fatalf("no_http-эпизод: ok=%v err=%v", ok, err)
+	}
+	if got := pool.checksValue(); got != 2 {
+		t.Fatalf("после no_http-эпизода checks = %d, want 2", got)
+	}
+	if got := pool.tempErrValue(); got != 1 {
+		t.Fatalf("после no_http-эпизода temp_error = %d, want 1 (не temp_error-итог не инкрементирует)", got)
+	}
+	if n := pool.j.count(recordEvTempErr); n != 1 {
+		t.Fatalf("инкрементов temp_error = %d, want 1", n)
+	}
+
+	// Дубль-доставка temp_error-эпизода: +1 в числитель и знаменатель
+	// вместе — событие записи, ретраи остаются в истории (§5.1).
+	if ok, err := r.RecordAndPublish(context.Background(), temp); err != nil || !ok {
+		t.Fatalf("повтор temp_error-эпизода: ok=%v err=%v", ok, err)
+	}
+	if got := pool.checksValue(); got != 3 {
+		t.Fatalf("после повтора checks = %d, want 3", got)
+	}
+	if got := pool.tempErrValue(); got != 2 {
+		t.Fatalf("после повтора temp_error = %d, want 2 (по одному событию на запись)", got)
+	}
+}
+
 // --- охрана deleted (§8/§13.1) ----------------------------------------------
 
 func TestRecordDeletedGuard(t *testing.T) {
@@ -1072,9 +1158,11 @@ func TestRecordDeletedGuard(t *testing.T) {
 		t.Fatal("транзакция обязана остановиться на охране UPDATE")
 	}
 	// Удалённому результат не пишется — суточный счётчик тоже не растёт
-	// (T-179: дельта только при RowsAffected > 0 UPDATE, ТЗИ §6.1.3).
-	if pool.j.count(recordEvChecks) != 0 || pool.checksValue() != 0 {
-		t.Fatal("суточный счётчик тронут при охране deleted")
+	// (T-179: дельта только при RowsAffected > 0 UPDATE, ТЗИ §6.1.3);
+	// числитель temp_error — тем более (T-182).
+	if pool.j.count(recordEvChecks) != 0 || pool.checksValue() != 0 ||
+		pool.j.count(recordEvTempErr) != 0 || pool.tempErrValue() != 0 {
+		t.Fatal("суточные счётчики тронуты при охране deleted")
 	}
 	if got := len(q.publishesSnapshot()); got != 0 {
 		t.Fatalf("публикаций %d — без записи публиковать нельзя", got)
@@ -1253,6 +1341,27 @@ func TestRecordTransactionFailures(t *testing.T) {
 		assertRolledBack(t, pool, q, err, 0)
 		if got := pool.checksValue(); got != 0 {
 			t.Fatalf("суточный счётчик = %d после отката, want 0", got)
+		}
+	})
+	t.Run("суточный числитель temp_error", func(t *testing.T) {
+		// T-182: сбой инкремента числителя откатывает и результат, и
+		// знаменатель — пара счётчиков меняется только вместе с записью.
+		temp := recordSilentResult(true)
+		pool, q := seed(t)
+		pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
+		pool.failExec = map[string]error{recordTempErrBumpSQL: errors.New("счётчики недоступны")}
+		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), temp)
+		assertRolledBack(t, pool, q, err, 0)
+		dom := pool.domains[recordDomainKey{zone: temp.ZoneID, id: temp.DomainID}]
+		if dom.status != model.StatusNew || dom.checkState != model.CheckStateQueued {
+			t.Fatalf("temp_error-домен изменён при сбое числителя: %v/%v — транзакция обязана откатиться",
+				dom.status, dom.checkState)
+		}
+		if got := pool.checksValue(); got != 0 {
+			t.Fatalf("суточный счётчик = %d после отката на числителе, want 0", got)
+		}
+		if got := pool.tempErrValue(); got != 0 {
+			t.Fatalf("суточный числитель temp_error = %d после отката, want 0", got)
 		}
 	})
 	t.Run("Commit", func(t *testing.T) {
