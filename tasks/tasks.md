@@ -6,7 +6,7 @@
 
 ## Как работать с файлом
 
-- Задачи пронумерованы `T-001…T-190` и упорядочены по выполнению (сверху вниз).
+- Задачи пронумерованы `T-001…T-198` и упорядочены по выполнению (сверху вниз).
 - Статус задачи — метка в квадратных скобках, меняется редактированием:
   - `[новая]` — задача не начата;
   - `[в работе]` — задача выполняется;
@@ -51,6 +51,7 @@
 | 27 | Медленные запросы PostgreSQL — разбор боевого лога (2026-10-24) | — | T-179, T-181…T-183, T-185…T-187, T-191…T-193 |
 | 28 | Dev-окружение: детерминированные адреса docker-сети (2026-10-24) | — | T-180 |
 | 29 | Сходимость цифр наблюдаемости — отчёт нагрузки vs crawlerctl status (2026-10-25) | — | T-188…T-190 |
+| 30 | Зоны только верхнего уровня (TLD-only) (2026-10-26) | заменяет ТЗ 5.2 п. 5 | T-194…T-198 |
 Этапы 0–23 завершены: 156 выполненных задач перенесены в архив
 [`tasks_done.md`](./tasks_done.md) (последние переносы: волны этапов 21–23 —
 T-141…T-156 — 2026-10-23, T-093 — 2026-10-24, закрытие приёмки этапа 10).
@@ -1129,4 +1130,81 @@ lag 0) был фантомным: анализатор успевает за п�
   зафиксировать правило (локальный -race для monitor или CI-шаг).
   Критерий: `go test -race ./internal/monitor` — 0 WARNING; `make
   test`/`make lint` зелёные.
+
+## Этап 30. Зоны только верхнего уровня (TLD-only) (2026-10-26)
+
+Источник: 2LD-зоны по списку Mozilla PSL (`5g.in`, `co.in`, … — реестры
+добавляют их сами, PSL вшит в golang.org/x/net) дробят справочник
+`zones`, статистику и партиции, а полный дамп `.in` невозможно принять
+через `incoming/in/` — каждая строка под 2LD-суффиксом отвергается
+`wrong_zone` (`domainLabel`, internal/ingest/validate.go). Решение
+(обсуждение 26.10): зона — последняя метка имени (TLD), label — всё
+остальное (составной label — норма); каталоги `incoming/<tld>/`;
+многоуровневые каталоги — только allowlist `ingest.allowed_zone_paths`
+(тестовые зоны testbed); данные существующих 2LD-зон сворачиваются
+командой `crawlerctl zones collapse` в окне обслуживания. Отменяет
+семантику ТЗ 5.2 п. 5 (публичный суффикс по PSL) — управляет дополнение
+[`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
+
+- **T-194** [новая] — P1, `internal/idn`: зона — последняя метка имени
+  (TLD-only): `Normalize` режет ASCII-имя по последней точке (зона =
+  TLD, label = префикс), вызов и импорт
+  `golang.org/x/net/publicsuffix` удалить; `ErrNumericZone` (последняя
+  метка из цифр — даты выгрузок, IPv4-литералы) и `ErrNoLabel` (голый
+  TLD) сохранить; докстринги пакета/`Result` — без отсылок к PSL.
+  Сознательные смены контракта: голые суффиксы (`github.io`, `co.in`)
+  становятся валидными доменами (мусор без фильтра — ТЗ §12.6),
+  `example.co.uk` → зона `uk`, label `example.co`. Критерий: корпус
+  T-010 и юнит-тесты держат таблицу §4.2 ТЗ целиком; `make test`/
+  `make lint` зелёные. ТЗ:
+  [`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
+
+- **T-195** [новая] — P1, `internal/ingest` + `internal/config`:
+  каталоги зон только TLD + allowlist: `incoming/<tld>/add|delete/` —
+  рабочий путь (полный дамп `.in` одним файлом); многоуровневый каталог
+  — ошибка уровня файла (`failed/`, T-021), кроме нового
+  `ingest.allowed_zone_paths` (дефолт пусто; валидация `NormalizeZone`
+  + минимум одна точка, дедуп при загрузке); `domainLabel` структурно
+  не меняется; тексты валидации `zone_weights`/
+  `requeue_deprioritized_zones` — имена TLD (убрать «составные —
+  co.uk»). Критерий: `example.5g.in` в `incoming/in/` принимается
+  (label `example.5g`, бывший `wrong_zone`); `crawl.test` из allowlist
+  работает, без allowlist — `failed/`; тесты ingest/config зелёные. ТЗ:
+  [`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
+
+- **T-196** [новая] — P1, `crawlerctl zones collapse` — перенос данных
+  2LD→TLD: dry-run по умолчанию, `--apply`/`--skip-reconcile`/
+  `--force`; по каждой зоне (§7 ТЗ): ensure TLD-зоны и партиций
+  (`create_zone_partitions`), батчи `UPDATE` с row movement (domains с
+  доклейкой `label || '.' || префикс`, subdomain_results,
+  laravel_domains, laravel_findings, laravel_history), `ingest_files`
+  перепривязать к TLD с разруливанием дедупа `(zone_id, action,
+  sha256)`, дроп партиций 2LD, `DELETE zones`, реконсиляция счётчиков;
+  идемпотентно и возобновляемо; allowlist-зоны не сворачиваются;
+  предусловие — нет `check_state = 1`. Критерий: интеграционный тест на
+  сидированной схеме (перенос всех шести таблиц, конфликт дедупа, no-op
+  повтором, продолжение после сбоя на середине, пост-проверки §7.5);
+  `make test-integration` зелёный. ТЗ:
+  [`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
+
+- **T-197** [новая] — P2, документация и testbed волны TLD-only:
+  docs/schema.md (§«Обработка имени» — зона TLD), docs/incoming-files.md
+  (каталоги `incoming/<tld>/`, allowlist), docs/configuration.md и
+  config.example.yaml (`allowed_zone_paths`, комментарии весов — TLD),
+  docs/runbooks.md (окно сворачивания зон §8 ТЗ), конфиг testbed —
+  `allowed_zone_paths: [crawl.test]`. Критерий: ревью документации;
+  сценарии testbed (ingest→check в зоне `crawl.test`) проходят. ТЗ:
+  [`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
+
+- **T-198** [новая] — P1, окно обслуживания: сворачивание 2LD-зон
+  продуктивной БД по runbook §8 ТЗ: бэкап → стоп источников (ingest,
+  scheduler) → дрейн `q:dns`/`q:http`/`q:analyze`/`q:render` → стоп
+  воркеров → `crawlerctl zones collapse --apply` → пост-проверки §7.5 и
+  спот-чек `domain_info('example.5g.in')` → зона `in` → `VACUUM
+  (ANALYZE)` доменных таблиц → выкат сборки с T-194…T-197 → старт и
+  контроль реконсиляции. Откат — только восстановление бэкапа (перенос
+  необратим, ТЗ §12.5). Критерий: пост-проверки зелёные; справочник
+  `zones` без многоуровневых зон; повторная доставка дампа `.in` в
+  `incoming/in/` принимается одним файлом. ТЗ:
+  [`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
 
