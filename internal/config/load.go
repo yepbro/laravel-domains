@@ -157,6 +157,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_RENDER_RESTART_EVERY_PAGES", setInt(func(c *Config) *int { return &c.Render.RestartEveryPages })},
 		{"CRAWLER_RENDER_RESTART_MEMORY_BYTES", setSize(func(c *Config) *ByteSize { return &c.Render.RestartMemoryBytes })},
 		{"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK", setInt(func(c *Config) *int { return &c.Render.QueueHighWatermark })},
+		{"CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES", setZoneNames(func(c *Config) *[]string { return &c.Render.RequeueDeprioritizedZones })},
 		{"CRAWLER_CONTENT_DIR", setString(func(c *Config) *string { return &c.Content.Dir })},
 		{"CRAWLER_CONTENT_PACK_SIZE", setSize(func(c *Config) *ByteSize { return &c.Content.PackSize })},
 		{"CRAWLER_CONTENT_MAX_STORE_BYTES", setSize(func(c *Config) *ByteSize { return &c.Content.MaxStoreBytes })},
@@ -301,6 +302,26 @@ func setStrings(get func(*Config) *[]string) func(*Config, string) error {
 		parts := strings.Split(v, ",")
 		for i := range parts {
 			parts[i] = strings.TrimSpace(parts[i])
+		}
+		*get(c) = parts
+		return nil
+	}
+}
+
+// setZoneNames разбирает список имён зон через запятую (xn--p1ai,net) —
+// по образцу пустых элементов карт (setZoneWeights): пустое имя зоны
+// невозможно по определению, хвостовая запятая и шаблонные
+// «${ZONES:-xn--p1ai,}» не должны валить старт; значение целиком
+// заменяет список из YAML. Приведение регистра — normalize, форму имени
+// и дубли проверяет валидация; зона не содержит запятой — разделитель
+// однозначен.
+func setZoneNames(get func(*Config) *[]string) func(*Config, string) error {
+	return func(c *Config, v string) error {
+		parts := make([]string, 0, 4)
+		for _, part := range strings.Split(v, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				parts = append(parts, part)
+			}
 		}
 		*get(c) = parts
 		return nil

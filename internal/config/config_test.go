@@ -154,6 +154,9 @@ func TestDefault(t *testing.T) {
 	if len(c.Dashboard.Probes) != 0 {
 		t.Errorf("dashboard.probes: по умолчанию пуст (пробы не заданы, ТЗД §8.1), получено %v", c.Dashboard.Probes)
 	}
+	if len(c.Render.RequeueDeprioritizedZones) != 0 {
+		t.Errorf("render.requeue_deprioritized_zones: по умолчанию пуст (приоритет зон не задан, T-184), получено %v", c.Render.RequeueDeprioritizedZones)
+	}
 
 	// Все значения по умолчанию проходят валидацию после задания dsn.
 	c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
@@ -233,6 +236,9 @@ render:
   restart_every_pages: 200
   restart_memory_bytes: "1GiB"
   queue_high_watermark: 7000
+  requeue_deprioritized_zones:
+    - "xn--p1ai"
+    - "net"
 content:
   dir: "/srv/content"
   pack_size: "1GiB"
@@ -385,6 +391,10 @@ log:
 	}
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 3 || w["com"] != 5 || w["co.uk"] != 3 || w["xn--p1ai"] != 2 {
 		t.Errorf("scheduler.zone_weights: ожидается map[com:5 co.uk:3 xn--p1ai:2], получено %v", w)
+	}
+	// Приоритет зон прохода доработки рендера (T-184): список как есть.
+	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
+		t.Errorf("render.requeue_deprioritized_zones: ожидается [xn--p1ai net], получено %v", z)
 	}
 	// Префиксы парковщиков (T-165): карта CIDR → лимит как есть.
 	if o := cfg.HTTP.PerIPOverrides; len(o) != 2 || o["195.208.0.0/16"] != 12 || o["2a02:6b8::/32"] != 8 {
@@ -539,6 +549,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_RENDER_RESTART_EVERY_PAGES":          "99",
 		"CRAWLER_RENDER_RESTART_MEMORY_BYTES":         "768MiB",
 		"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK":         "7000",
+		"CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES":  "xn--p1ai, org",
 		"CRAWLER_CONTENT_DIR":                         "/env/content",
 		"CRAWLER_CONTENT_PACK_SIZE":                   "256MB",
 		"CRAWLER_CONTENT_MAX_STORE_BYTES":             "512KiB",
@@ -688,6 +699,11 @@ func TestEnvOverrides(t *testing.T) {
 	// Карта весов зон из env: ключи приводятся к нижнему регистру.
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 2 || w["org"] != 7 || w["xn--p1ai"] != 2 {
 		t.Errorf("scheduler.zone_weights: ожидается map[org:7 xn--p1ai:2], получено %v", w)
+	}
+	// Приоритет зон прохода доработки рендера из env (T-184): список через
+	// запятую, имена приводятся к нижнему регистру, значение заменяет YAML.
+	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,org" {
+		t.Errorf("render.requeue_deprioritized_zones: ожидается [xn--p1ai org], получено %v", z)
 	}
 	// Карта override-лимитов per-IP из env (T-165): CIDR нормализуется
 	// маскированием, значение целиком заменяет карту из YAML.
@@ -987,6 +1003,10 @@ func TestValidate(t *testing.T) {
 		{"restart_memory_bytes велик", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(17 << 30) }, "render.restart_memory_bytes"},
 		{"render.queue_high_watermark отрицательный", func(c *Config) { c.Render.QueueHighWatermark = -1 }, "render.queue_high_watermark"},
 		{"render.queue_high_watermark сверхпотолка", func(c *Config) { c.Render.QueueHighWatermark = 100000001 }, "render.queue_high_watermark"},
+		{"requeue-зона пустая", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{""} }, "render.requeue_deprioritized_zones"},
+		{"requeue-зона unicode", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"рф"} }, "render.requeue_deprioritized_zones"},
+		{"requeue-зона с точкой в конце", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"com."} }, "render.requeue_deprioritized_zones"},
+		{"requeue-зона повтор", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"com", "com"} }, "render.requeue_deprioritized_zones"},
 		{"content.dir пуст", func(c *Config) { c.Content.Dir = "" }, "content.dir"},
 		{"pack_size мал", func(c *Config) { c.Content.PackSize = 1 }, "content.pack_size"},
 		{"pack_size велик", func(c *Config) { c.Content.PackSize = ByteSize(16 << 30) }, "content.pack_size"},
@@ -1101,6 +1121,7 @@ func TestValidate(t *testing.T) {
 	c.Ingest.MaxErrorRatio = 1
 	c.Render.RestartMemoryBytes = 0                                                    // контроль памяти отключён — допустимо
 	c.Render.QueueHighWatermark = 100000000                                            // верхняя граница порога ёмкости q:render (T-174)
+	c.Render.RequeueDeprioritizedZones = []string{"com", "co.uk", "xn--p1ai"}          // границы имён зон (T-184)
 	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)
 	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // границы весов
 	c.Web.Listen = "/run/crawler-web/web.sock"                                         // unix-сокет — вариант публичного входа web (T-124)
@@ -1162,6 +1183,35 @@ func TestZoneWeightsNormalize(t *testing.T) {
 		if w := cfg.Scheduler.ZoneWeights; len(w) != 1 || w["com"] != 2 {
 			t.Errorf("%q: после normalize: ожидается map[com:2], получено %v", yaml, w)
 		}
+	}
+}
+
+// Имена деприоритизированных зон приводятся к нижнему регистру без
+// пробелов (normalize, T-184): фильтр ступеней выборки сопоставляет по
+// zones.name — punycode нижним регистром; дубль после приведения ловит
+// валидация.
+func TestRequeueDeprioritizedZonesNormalize(t *testing.T) {
+	cfg := mustLoad(t, "render:\n  requeue_deprioritized_zones:\n    - \" XN--P1AI \"\n    - net\n", validDSN())
+	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
+		t.Errorf("render.requeue_deprioritized_zones после normalize: ожидается [xn--p1ai net], получено %v", z)
+	}
+	// Дубль после приведения — ошибка валидации (как «WWW»/«www» у
+	// subdomains).
+	_, err := loadFrom(t, "render:\n  requeue_deprioritized_zones:\n    - com\n    - \" COM \"\n", validDSN())
+	if err == nil || !strings.Contains(err.Error(), "повтор") {
+		t.Errorf("com и COM после normalize — дубль, ожидается ошибка, получено %v", err)
+	}
+}
+
+// Env-список имён зон пропускает пустые элементы (хвостовая запятая,
+// шаблонные подстановки) — пустое имя зоны невозможно, отказ старта был
+// бы footgun (setZoneNames, по образцу пустых элементов карт).
+func TestRequeueDeprioritizedZonesEnvEmpty(t *testing.T) {
+	env := validDSN()
+	env["CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES"] = " xn--p1ai , ,net, "
+	cfg := mustLoad(t, "", env)
+	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
+		t.Errorf("env после разбора: ожидается [xn--p1ai net] без пустых элементов, получено %v", z)
 	}
 }
 

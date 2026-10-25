@@ -245,11 +245,19 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// Проход доработки рендера (T-066, §5.6 «дорабатываются позже»):
 	// домены с флагом render_pending → повторный SPA-вердикт по
 	// сохранённому контенту → публикация q:render при свободной очереди.
+	// Приоритет зон (T-184, решение (а) T-176): непустой
+	// render.requeue_deprioritized_zones (прод — парковочные .рф,
+	// xn--p1ai) дренажируется по остаточному принципу — пачка прохода
+	// собирается сначала доменами остальных зон; наблюдаемость — поле
+	// deprioritized строки «проход доработки рендера» в журнале.
 	// Отдельной горутиной в том же OnRun (образец CleanupDeleted
 	// T-020/T-021): не зависит от цикла задач q:http, завершается
 	// отменой ctx.
 	go func() {
-		bg <- httpworker.RequeueRenderPending(ctx, pool, store, renderQ, httpworker.RequeueOptions{Log: logger})
+		bg <- httpworker.RequeueRenderPending(ctx, pool, store, renderQ, httpworker.RequeueOptions{
+			Log:                logger,
+			DeprioritizedZones: cfg.Render.RequeueDeprioritizedZones,
+		})
 	}()
 
 	// Retention контента и трим jsonb не-находок (T-166, ТЗ 5.7: контент

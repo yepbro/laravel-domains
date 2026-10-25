@@ -50,7 +50,17 @@
 // LIMIT и закреплением плана SET LOCAL + guard счётчиком долга (T-181:
 // index scan по PK вытаптывал дренированный «пустой» префикс — запрос №2
 // журнала медленных 24.10, медиана 44 с; закреплённый seq scan — десятки
-// мс, стационар без долга не трогает domains вовсе). SPA-вердикт берётся
+// мс, стационар без долга не трогает domains вовсе). Приоритет зон
+// (T-184, решение (а) T-176 — оператор 24.10: рендерим всё, ничего не
+// теряем; зоны с высоким DOM-вкладом — вперёд, парковочные .рф — по
+// остаточному принципу): непустой render.requeue_deprioritized_zones
+// делит выборку на две ступени БЕЗ сортировки — сначала домены зон НЕ
+// из списка, неполная пачка (исчерпание: LIMIT не сработал, скан дошёл
+// до конца таблицы) добирается зонами списка; обе ступени под теми же
+// закреплениями плана, очередь долга не теряет записей (всё
+// дорабатывается, зоны списка — последними), порожний проход исчерпанной
+// первой ступени цикл не повторяет (renderStage: память по счётчику
+// долга). SPA-вердикт берётся
 // из сохранённого контента записи:
 // DetectSPA (T-057) детерминирован над теми же байтами, что воркер
 // проверял при записи, — вердикт совпадает; алиасы (content_hash NULL,
@@ -154,12 +164,38 @@ var (
 	// медиана 44 с); недетерминированные пачки корректны — снятие флага
 	// после публикации исключает повторы. Форма плана (seq scan с ранним
 	// остановом LIMIT) закреплена SET LOCAL в транзакции выборки —
-	// renderPlanNoIndexScanSQL/renderPlanNoBitmapScanSQL ниже.
-	renderPendingDomainsSQL = "SELECT d.zone_id, d.id, d.label || '.' || z.name " +
+	// renderPlanNoIndexScanSQL/renderPlanNoBitmapScanSQL ниже. Это ступень
+	// без фильтра зон (пустой render.requeue_deprioritized_zones — T-184);
+	// приоритет зон строит renderPendingDomainsBaseSQL +
+	// renderPendingDomainsNotInSQL/…InSQL.
+	renderPendingDomainsSQL = renderPendingDomainsBaseSQL + "LIMIT $1"
+
+	// renderPendingDomainsBaseSQL — общая часть ступеней выборки (T-184):
+	// WHERE/JOIN как у прежнего renderPendingDomainsSQL (T-181), ступени
+	// дополняют фильтром зоны и LIMIT.
+	renderPendingDomainsBaseSQL = "SELECT d.zone_id, d.id, d.label || '.' || z.name " +
 		"FROM domains AS d JOIN zones AS z ON z.id = d.zone_id " +
 		"WHERE (d.flags & " + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + ") <> 0 " +
-		"AND d.status <> " + fmt.Sprintf("%d", int16(model.StatusDeleted)) + " " +
-		"LIMIT $1"
+		"AND d.status <> " + fmt.Sprintf("%d", int16(model.StatusDeleted)) + " "
+
+	// renderPendingDomainsNotInSQL / renderPendingDomainsInSQL — ступени
+	// приоритизации рендер-долга по зонам (T-184, решение (а) T-176):
+	// непустой render.requeue_deprioritized_zones делит выборку пачки на
+	// две ступени БЕЗ сортировки — первая берёт домены зон НЕ из списка
+	// (приоритет: зоны с высоким DOM-вкладом), вторая — домены зон списка
+	// (парковочные классы, по остаточному принципу). Фильтр по имени зоны
+	// в JOIN (справочник zones — мал, hash join; сопоставление живое:
+	// зоны создаёт ingest первым файлом, отдельного разрешения на старте
+	// нет), обе ступени идут в тех же транзакциях закрепления плана
+	// (T-181): seq scan по domains с ранним остановом LIMIT сохраняется —
+	// сортировка ступеней не вводится сознательно, она вернула бы
+	// вытаптывание префикса/полный проход сортировки. Очередь долга не
+	// теряет записей: исчерпание первой ступени (пачка неполная — LIMIT
+	// не сработал, скан дошёл до конца таблицы) добирается второй.
+	renderPendingDomainsNotInSQL = renderPendingDomainsBaseSQL +
+		"AND z.name <> ALL($2::text[]) LIMIT $1"
+	renderPendingDomainsInSQL = renderPendingDomainsBaseSQL +
+		"AND z.name = ANY($2::text[]) LIMIT $1"
 
 	// renderPlanNoIndexScanSQL/renderPlanNoBitmapScanSQL/renderPlanNoIOSQL —
 	// закрепление формы плана выборки пачки (T-181): SET LOCAL в транзакции
@@ -357,6 +393,15 @@ type RequeueOptions struct {
 	// BatchSize — максимум доменов в одной пачке
 	// (DefaultRenderRequeueBatch).
 	BatchSize int
+	// DeprioritizedZones — имена зон (punycode, как в справочнике zones),
+	// чей долг проход обслуживает по остаточному принципу (T-184, решение
+	// (а) T-176): пачка собирается двухступенчато — сначала домены зон
+	// НЕ из списка, при неполной пачке остаток добирается зонами списка.
+	// nil/пустой список — прежний порядок (одна ступень без фильтра,
+	// T-181). Источник — render.requeue_deprioritized_zones; память
+	// исчерпания первой ступени ведёт цикл RequeueRenderPending (разовый
+	// RequeueOnce исполняет обе ступени честно, без памяти между вызовами).
+	DeprioritizedZones []string
 	// Log — логгер цикла и Warn-и прохода; nil — записи подавлены
 	// (slog.DiscardHandler).
 	Log *slog.Logger
@@ -381,6 +426,11 @@ type RequeueResult struct {
 	Cleared int
 	// Published — опубликовано сообщений q:render.
 	Published int
+	// Deprioritized — доменов пачки из зон render.requeue_deprioritized_zones
+	// (вторая ступень выборки, T-184): 0 — пачка целиком из приоритетных
+	// зон; рост поля в журнале прохода — первая ступень исчерпана, дренаж
+	// дошёл до отложенных зон (контроль порядка без ручного SQL).
+	Deprioritized int
 	// Full — проход остановлен: q:render у порога; необработанные домены
 	// сохранили флаг, доработка продолжится следующим проходом.
 	Full bool
@@ -413,6 +463,12 @@ type renderPendingRow struct {
 // контент флаг сохраняет до следующего прохода (renderDomainKeys).
 // Пул с транзакциями (RecordDB): снятие бита и декремент счётчика
 // рендер-долга обязаны фиксироваться вместе (§3.4, T-175).
+//
+// Приоритет зон (T-184): непустой opts.DeprioritizedZones делит выборку
+// на две ступени (зоны НЕ из списка, затем — при неполной пачке — зоны
+// списка); разовый вызов исполняет обе ступени без памяти между вызовами
+// — исчерпание первой ступени помнит только цикл RequeueRenderPending
+// (renderStage, экономия порожнего полного seq scan).
 func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, opts RequeueOptions) (RequeueResult, error) {
 	if pool == nil {
 		return RequeueResult{}, errors.New("httpworker: проход рендера: пул не задан")
@@ -427,6 +483,45 @@ func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, ren
 	if o.Log == nil {
 		o.Log = slog.New(slog.DiscardHandler)
 	}
+	return requeuePass(ctx, pool, contents, render, o, &renderStage{})
+}
+
+// renderStage — память переключения ступеней выборки долга (T-184).
+// Исчерпание первой ступени (зоны НЕ из списка) доказывается неполной
+// пачкой: LIMIT не сработал — seq scan дошёл до конца таблицы, значит
+// порожний проход первой ступени — ПОЛНЫЙ seq scan по domains (патология
+// запроса №2 журнала медленных 24.10, которую убрал T-181; хвост долга
+// зон списка тянулся бы часами, платя полный проход за каждый тик и
+// каждую итерацию стартового дренажа). Пока счётчик долга равен ожиданию
+// (значение на момент доказательства минус снятия флагов, выполненные
+// этим циклом после него), новых постановок бита не было (каждая — +1
+// счётчику, T-175) и чужих снятий тоже — первая ступень не выполняется
+// вовсе. Любое расхождение возобновляет её: рост счётчика — новой
+// постановке бита (любой зоны, в т.ч. зоны списка — отличить по одному
+// счётчику нельзя, перестраховка дешевле потерянной приоритетности),
+// убывание сверх своих снятий — второй экземпляр прохода либо ручной SQL
+// (runbooks §6). Доказательство снимается и без расхождения счётчика,
+// если хоть один домен первой ступени пачки остался с флагом (keep при
+// нечитаемом контенте, ранний выход Full/ошибка — requeuePass, firstLeft):
+// выборка видела эти строки, но проход их не доработал, а вторая ступень
+// (зоны списка) застрявший приоритетный долг не выберет никогда. Память
+// неточна только при точной компенсации «чужая постановка + чужое снятие»
+// между тиками — одиночный экземпляр цикла этого не порождает (T-181 §5.3).
+type renderStage struct {
+	known     bool  // первая ступень доказанно исчерпана
+	proofDebt int64 // счётчик рендер-долга в момент доказательства
+	ownClears int64 // снятия флагов этим циклом после доказательства
+}
+
+// expectedDebt — ожидаемое циклом значение счётчика долга: совпадение с
+// прочитанным разрешает пропуск первой ступени.
+func (s *renderStage) expectedDebt() int64 { return s.proofDebt - s.ownClears }
+
+// requeuePass — тело прохода доработки (RequeueOnce без валидаций);
+// stage — память ступеней цикла (T-184): known/proofDebt читаются и
+// пишутся только в двухступенчатом режиме, ownClears сдвигается и в
+// одноступенчатом (мёртвое состояние — память в нём не консультируется).
+func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, o RequeueOptions, stage *renderStage) (RequeueResult, error) {
 	out := RequeueResult{}
 
 	// Полная очередь — БД не читается (одно чтение глубины):
@@ -458,20 +553,88 @@ func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		return out, nil
 	}
 
-	domains, err := renderSelectPending(ctx, pool, o.BatchSize)
-	if err != nil {
-		return out, err
-	}
-	out.Selected = len(domains)
-	if len(domains) == 0 {
-		// Счётчик видит долг, выборка — нет: биты-«сироты» (удалённые с
-		// флагом домены — выборка честно исключает их по §13.1, а снять
-		// бит некому) либо рассинхрон ручного SQL (runbooks §6). Дренаж
-		// платит полный проход без раннего останова за каждый тик —
-		// оператор обязан это видеть.
-		o.Log.Warn("проход рендера: счётчик долга > 0, выборка пуста — биты-«сироты» либо рассинхрон счётчика (runbooks §6)",
-			"debt", debt)
-		return out, nil
+	// Выборка пачки: одна ступень (T-181) либо приоритет зон (T-184).
+	//
+	// firstLeft — домены ПЕРВОЙ ступени пачки, чей флаг ещё не снят
+	// (ревью T-184, P1): доказательство исчерпания переживает проход,
+	// только если к концу их ноль — keep (нечитаемый контент) или ранний
+	// выход (Full/ошибка/отмена, включая ошибку выборки второй ступени)
+	// оставляют флаг живым, а пропуск первой ступени зажал бы застрявший
+	// ПРИОРИТЕТНЫЙ долг навсегда: вторая ступень (зоны списка) его не
+	// видит, счётчик и ожидание не расходятся — Warn «биты-сироты» и
+	// полный seq scan каждый тик вместо доработки (контракт шапки:
+	// «проход повторит чтение на следующем тике»). Домены второй ступени
+	// не считаются: застрявшие в зонах списка подберёт сама вторая
+	// ступень следующего прохода — она выполняется при каждом пропуске
+	// первой. Снимается defer-ом на каждом выходе прохода.
+	var domains []renderPendingDomain
+	firstN, firstLeft := 0, 0
+	if len(o.DeprioritizedZones) == 0 {
+		domains, err = renderSelectPending(ctx, pool, o.BatchSize, nil, false)
+		if err != nil {
+			return out, err
+		}
+		out.Selected = len(domains)
+		if len(domains) == 0 {
+			// Счётчик видит долг, выборка — нет: биты-«сироты» (удалённые с
+			// флагом домены — выборка честно исключает их по §13.1, а снять
+			// бит некому) либо рассинхрон ручного SQL (runbooks §6). Дренаж
+			// платит полный проход без раннего останова за каждый тик —
+			// оператор обязан это видеть.
+			o.Log.Warn("проход рендера: счётчик долга > 0, выборка пуста — биты-«сироты» либо рассинхрон счётчика (runbooks §6)",
+				"debt", debt)
+			return out, nil
+		}
+	} else {
+		// Первая ступень обязательна, пока память исчерпания нет или
+		// счётчик разошёлся с ожиданием (см. renderStage).
+		if !stage.known || debt != stage.expectedDebt() {
+			first, err := renderSelectPending(ctx, pool, o.BatchSize, o.DeprioritizedZones, false)
+			if err != nil {
+				return out, err
+			}
+			if len(first) < o.BatchSize {
+				// Неполная пачка — ВЫБОРКА исчерпана (скан дошёл до конца);
+				// счётчик прочитан этим же проходом ДО выборки, своих
+				// снятий после чтения ещё не было. Доказательство переживёт
+				// проход, только если каждый домен первой ступени будет
+				// снят — счётчик firstLeft ниже.
+				stage.known, stage.proofDebt, stage.ownClears = true, debt, 0
+			} else {
+				// Полная пачка — за LIMIT'ом могут оставаться домены:
+				// прежнее доказательство исчерпания недействительно.
+				stage.known = false
+			}
+			domains = first
+			// Учёт неснятия — сразу за первой выборкой: ошибка второй
+			// ступени ниже тоже обязана снять доказательство (домены
+			// первой ступени остались с флагами).
+			firstN, firstLeft = len(first), len(first)
+			if firstN > 0 {
+				defer func() {
+					if firstLeft > 0 {
+						stage.known = false
+					}
+				}()
+			}
+		}
+		if len(domains) < o.BatchSize {
+			// Исчерпание первой ступени (пустая пачка или добор остатка):
+			// вторая ступень — зоны списка, по остаточному принципу.
+			second, err := renderSelectPending(ctx, pool, o.BatchSize-len(domains), o.DeprioritizedZones, true)
+			if err != nil {
+				return out, err
+			}
+			out.Deprioritized = len(second)
+			domains = append(domains, second...)
+		}
+		out.Selected = len(domains)
+		if len(domains) == 0 {
+			// Обе ступени пусты — та же диагностика, что и в одну ступень.
+			o.Log.Warn("проход рендера: счётчик долга > 0, выборка пуста — биты-«сироты» либо рассинхрон счётчика (runbooks §6)",
+				"debt", debt)
+			return out, nil
+		}
 	}
 
 	for i := range domains {
@@ -501,6 +664,8 @@ func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, ren
 			// Контент части записей не прочитан (транзиентный сбой):
 			// флаг сохраняется — следующий проход повторит домен;
 			// снятие сняло бы SPA-задачу до перепроверки T-030.
+			// Домен первой ступени (i < firstN) при этом «застревает» —
+			// доказательство снимет defer.
 			continue
 		}
 		// Снятие флага — после публикации (§3.4, порядок в шапке файла),
@@ -509,8 +674,18 @@ func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		if err != nil {
 			return out, fmt.Errorf("httpworker: проход рендера: домен %s: снятие флага: %w", d.name, err)
 		}
+		if i < firstN {
+			// Флага больше нет (снято нами или конкурентом — охрана бита):
+			// домен первой ступени не застрял.
+			firstLeft--
+		}
 		if cleared > 0 {
 			out.Cleared++
+			// Своё снятие сдвигает ожидание счётчика (память ступеней,
+			// T-184): приоритетная зона или списка — без разницы, любая
+			// новая постановка бита поверх всё равно разойдёт счётчик с
+			// ожиданием и возобновит первую ступень.
+			stage.ownClears++
 		}
 	}
 	return out, nil
@@ -599,14 +774,21 @@ func renderDebtCount(ctx context.Context, pool RecordDB) (int64, error) {
 
 // renderSelectPending выбирает пачку доменов с флагом render_pending —
 // единая точка тяжёлой выборки прохода. Выборка идёт в явной транзакции с
-// SET LOCAL enable_indexscan/bitmapscan = off (T-181): закрепление формы
-// плана (seq scan по domains + ранний останов LIMIT) — см. комментарий к
-// renderPlanNoIndexScanSQL; без закрепления планировщик без статистики
-// выражения (flags & 2) <> 0 берёт index scan по PK, вытаптывающий
-// дренированный «пустой» префикс (медиана 44 с на живом долге, замер
-// 24.10). Транзакция — только оболочка закрепления: SELECT читает
-// зафиксированные данные, фиксация/откат по содержанию равнозначны.
-func renderSelectPending(ctx context.Context, pool RecordDB, limit int) ([]renderPendingDomain, error) {
+// SET LOCAL enable_indexscan/bitmapscan/indexonlyscan = off (T-181):
+// закрепление формы плана (seq scan по domains + ранний останов LIMIT) —
+// см. комментарий к renderPlanNoIndexScanSQL; без закрепления планировщик
+// без статистики выражения (flags & 2) <> 0 берёт index scan по PK,
+// вытаптывающий дренированный «пустой» префикс (медиана 44 с на живом
+// долге, замер 24.10). Транзакция — только оболочка закрепления: SELECT
+// читает зафиксированные данные, фиксация/откат по содержанию равнозначны.
+//
+// Ступени T-184: zoneNames пуст — базовая выборка без фильтра зон
+// (renderPendingDomainsSQL, порядок T-181); иначе имя зоны в JOIN —
+// первая ступень берёт зоны НЕ из списка (renderPendingDomainsNotInSQL),
+// вторая — зоны списка (renderPendingDomainsInSQL); фильтр не меняет
+// форму плана (малый справочник zones — hash join, сортировки нет),
+// ранний останов LIMIT сохраняется.
+func renderSelectPending(ctx context.Context, pool RecordDB, limit int, zoneNames []string, inList bool) ([]renderPendingDomain, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("httpworker: проход рендера: транзакция выборки: %w", err)
@@ -624,7 +806,16 @@ func renderSelectPending(ctx context.Context, pool RecordDB, limit int) ([]rende
 		return nil, fmt.Errorf("httpworker: проход рендера: закрепление плана: %w", err)
 	}
 
-	rows, err := tx.Query(ctx, renderPendingDomainsSQL, limit)
+	sql, args := renderPendingDomainsSQL, []any{limit}
+	if len(zoneNames) > 0 {
+		sql = renderPendingDomainsNotInSQL
+		if inList {
+			sql = renderPendingDomainsInSQL
+		}
+		args = append(args, zoneNames)
+	}
+
+	rows, err := tx.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("httpworker: проход рендера: выборка доменов: %w", err)
 	}
@@ -741,10 +932,13 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 // «дорабатываются позже»): стартовый дренаж пачками до исчерпания либо
 // до полного q:render (подбор флагов, накопленных за простоем, — стиль
 // CleanupDeleted T-020 / RecheckDaily T-030), далее тикер Interval.
-// Ошибка прохода — Warn, цикл живёт (контракт OnRun, T-012): очередной
-// проход продолжит с того же места — снятое не снимается дважды,
-// неопубликованное сохраняет флаг. Отмена ctx — чистый nil (graceful
-// shutdown, §3.4).
+// Приоритет зон (T-184, opts.DeprioritizedZones): цикл держит память
+// исчерпания первой ступени (renderStage) — без неё хвост долга зон
+// списка платил бы порожний полный seq scan первой ступени за каждый
+// тик и итерацию дренажа. Ошибка прохода — Warn, цикл живёт (контракт
+// OnRun, T-012): очередной проход продолжит с того же места — снятое
+// не снимается дважды, неопубликованное сохраняет флаг. Отмена ctx —
+// чистый nil (graceful shutdown, §3.4).
 func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, opts RequeueOptions) error {
 	if pool == nil {
 		return errors.New("httpworker: проход рендера: пул не задан")
@@ -756,16 +950,23 @@ func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderCon
 		return errors.New("httpworker: проход рендера: очередь рендера не задана")
 	}
 	o := opts.withDefaults()
-	log := o.Log
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
+	if o.Log == nil {
+		// Дефолт логгера — здесь: drain зовёт requeuePass напрямую,
+		// минуя дефолт RequeueOnce.
+		o.Log = slog.New(slog.DiscardHandler)
 	}
+	log := o.Log
 	log.Info("проход доработки рендера запущен",
-		"interval", o.Interval.String(), "batch", o.BatchSize)
+		"interval", o.Interval.String(), "batch", o.BatchSize,
+		"deprioritized_zones", o.DeprioritizedZones)
+
+	// Память ступеней приоритета (T-184) — на цикл: повторные проходы не
+	// повторяют порожний проход исчерпанной первой ступени.
+	stage := &renderStage{}
 
 	drain := func() {
 		for {
-			res, err := RequeueOnce(ctx, pool, contents, render, o)
+			res, err := requeuePass(ctx, pool, contents, render, o, stage)
 			if err != nil {
 				// Отмена во время прохода — часть остановки, не тревога.
 				if ctx.Err() == nil {
@@ -774,8 +975,13 @@ func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderCon
 				return
 			}
 			if res.Published > 0 || res.Cleared > 0 {
+				// deprioritized — домены пачки из зон списка (T-184):
+				// 0 в окне дренажа — приоритет работает, публикации идут
+				// зонами НЕ из списка вперёд (контроль порядка без
+				// ручного SQL).
 				log.Info("проход доработки рендера",
-					"domains", res.Cleared, "published", res.Published, "full", res.Full)
+					"domains", res.Cleared, "published", res.Published,
+					"deprioritized", res.Deprioritized, "full", res.Full)
 			}
 			// Полная пачка — возможно, остались домены; полная очередь —
 			// ждать тика (публикация «впритык к порогу» не нужна).

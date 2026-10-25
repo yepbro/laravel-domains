@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"strings"
 	"sync"
@@ -228,9 +229,10 @@ type renderqRow struct {
 
 // renderqPool — RecordDB прохода без БД: живая семантика фильтров SQL
 // (флаг render_pending, status <> deleted, rendered = false,
-// final_url IS NOT NULL), смена флага с охраной бита и счётчик долга
-// crawler_counters (T-175: строка render_pending, ±1 в транзакции
-// снятия — как в живом RequeueOnce); SQL сопоставляется ТОЧНО
+// final_url IS NOT NULL, ступени зон T-184 — членство имени зоны в
+// списке render.requeue_deprioritized_zones), смена флага с охраной бита
+// и счётчик долга crawler_counters (T-175: строка render_pending, ±1 в
+// транзакции снятия — как в живом RequeueOnce); SQL сопоставляется ТОЧНО
 // (неожидаемый — ошибка, тест падает громко). RecordDB, а не db.DB
 // (T-175): проход снимает флаг транзакцией со счётчиком.
 type renderqPool struct {
@@ -249,10 +251,12 @@ type renderqPool struct {
 	beforeHook   func() // вызывается перед первым Exec транзакции снятия (симуляция гонок)
 	counterNoRow bool   // строка счётчика отсутствует (guard и UPDATE 0 — ошибка вызывающего)
 
-	mu       sync.Mutex
-	queries  int
-	clears   int
-	clearTag int64 // RowsAffected снятия флага (0 — честный ответ)
+	mu           sync.Mutex
+	queries      int
+	clears       int
+	stage1Select int   // выборки первой ступени T-184 (зоны НЕ из списка)
+	stage2Select int   // выборки второй ступени T-184 (зоны списка)
+	clearTag     int64 // RowsAffected снятия флага (0 — честный ответ)
 }
 
 var _ RecordDB = (*renderqPool)(nil)
@@ -410,15 +414,32 @@ func (t *renderqTx) Query(ctx context.Context, sql string, args ...any) (pgx.Row
 	}
 	t.pool.queries++
 	switch sql {
-	case renderPendingDomainsSQL:
-		if len(args) != 1 {
+	case renderPendingDomainsSQL, renderPendingDomainsNotInSQL, renderPendingDomainsInSQL:
+		if sql == renderPendingDomainsSQL && len(args) != 1 {
 			return nil, fmt.Errorf("renderqPool: домены: параметров %d, нужно 1 (LIMIT)", len(args))
+		}
+		if sql != renderPendingDomainsSQL && len(args) != 2 {
+			return nil, fmt.Errorf("renderqPool: домены (ступень T-184): параметров %d, нужно 2 (LIMIT, зоны)", len(args))
 		}
 		limit, ok := args[0].(int)
 		if !ok || limit <= 0 {
 			return nil, fmt.Errorf("renderqPool: домены: LIMIT %v (%T)", args[0], args[0])
 		}
+		// Ступени T-184: вторая колонка — имена зон (массив text[]).
+		var zoneNames []string
+		if sql != renderPendingDomainsSQL {
+			zoneNames, ok = args[1].([]string)
+			if !ok {
+				return nil, fmt.Errorf("renderqPool: домены (ступень T-184): зоны %T, нужно []string", args[1])
+			}
+		}
 		t.j.record("select")
+		if sql == renderPendingDomainsNotInSQL {
+			t.pool.stage1Select++
+		}
+		if sql == renderPendingDomainsInSQL {
+			t.pool.stage2Select++
+		}
 		// Порядок — «физический» (order, порядок вставки): SQL без
 		// ORDER BY, seq scan возвращает раскладку кучи (T-181).
 		rows := make([][]any, 0, limit)
@@ -429,6 +450,18 @@ func (t *renderqTx) Query(ctx context.Context, sql string, args ...any) (pgx.Row
 			d, ok := t.pool.domains[k]
 			if !ok || !d.flags.Test(model.FlagRenderPending) || d.status == model.StatusDeleted {
 				continue // WHERE бита и status <> deleted
+			}
+			// Ступени T-184: членство имени зоны домена в списке
+			// (z.name <> ALL / = ANY — живая семантика фильтра).
+			depr := false
+			for _, name := range zoneNames {
+				if t.pool.zones[k.zone] == name {
+					depr = true
+					break
+				}
+			}
+			if depr != (sql == renderPendingDomainsInSQL) {
+				continue
 			}
 			rows = append(rows, []any{k.zone, k.id, d.label + "." + t.pool.zones[k.zone]})
 		}
@@ -1835,6 +1868,491 @@ func TestRequeueOnceGuardCounter(t *testing.T) {
 	}
 }
 
+// TestRequeueOnceZonePriority — приоритет зон (T-184, решение (а) T-176):
+// домены зон НЕ из списка публикуются вперёд доменов зон списка, даже
+// когда те лежат раньше в «куче» (прод-раскладка: флаговый долг .рф —
+// физически в начале кучи); записи не теряются — долг зон списка
+// дорабатывается следующими проходами, последним.
+func TestRequeueOnceZonePriority(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, q, _, rq := renderqPassKit(t, 0)
+	pool.zones[6] = "xn--p1ai" // деприоритизированная зона (прод — .рф)
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(6, 21, "rf1", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf1.xn--p1ai/")
+	pool.seedDomain(6, 22, "rf2", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 22, 0, model.VariantMain, hSPA[:], nil, false, "https://rf2.xn--p1ai/")
+	pool.seedDomain(5, 11, "prio", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio.example/")
+
+	opts := RequeueOptions{BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}}
+	// Проход 1: первая ступень берёт приоритетную зону, минуя .рф в
+	// начале «кучи».
+	res, err := RequeueOnce(context.Background(), pool, body, rq, opts)
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Selected != 1 || res.Deprioritized != 0 || res.Cleared != 1 || res.Published != 1 {
+		t.Fatalf("проход 1: итог %+v, ожидался selected=1 deprioritized=0 cleared=1 published=1", res)
+	}
+	if pub := q.snapshot(); len(pub) != 1 || pub[0].msg.DomainID != 11 || pub[0].msg.ZoneID != 5 {
+		t.Fatalf("проход 1: опубликован %+v, ожидался приоритетный домен 5/11", pub)
+	}
+	if !pool.domains[renderqDomKey{zone: 6, id: 21}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("домен .рф доработан раньше приоритетного — приоритет не работает")
+	}
+
+	// Проходы 2–3: первая ступень исчерпана — вторая дорабатывает .рф
+	// (разовый RequeueOnce памяти ступеней не держит — первая ступень
+	// выполняется каждый проход, это цена разовости; цикл помнит).
+	for i, want := range []int64{21, 22} {
+		res, err := RequeueOnce(context.Background(), pool, body, rq, opts)
+		if err != nil {
+			t.Fatalf("проход %d: %v", i+2, err)
+		}
+		if res.Selected != 1 || res.Deprioritized != 1 || res.Cleared != 1 {
+			t.Fatalf("проход %d: итог %+v, ожидался selected=1 deprioritized=1 cleared=1 (долг зон списка)", i+2, res)
+		}
+		if pub := q.snapshot(); pub[len(pub)-1].msg.DomainID != want || pub[len(pub)-1].msg.ZoneID != 6 {
+			t.Fatalf("проход %d: опубликован %+v, ожидался домен .рф 6/%d", i+2, pub[len(pub)-1], want)
+		}
+	}
+	if got := pool.counters["render_pending"]; got != 0 {
+		t.Fatalf("счётчик долга = %d, ожидался 0 (всё доработано)", got)
+	}
+}
+
+// TestRequeueOnceZoneBatchFill — неполная первая ступень добирается
+// второй до полной пачки (T-184): исчерпание доказано (LIMIT не
+// сработал — скан дошёл до конца таблицы), приоритетные домены идут в
+// начале пачки (порядок публикаций), очередь долга не теряет записей.
+func TestRequeueOnceZoneBatchFill(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, q, _, rq := renderqPassKit(t, 0)
+	pool.zones[6] = "xn--p1ai"
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(6, 21, "rf1", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf1.xn--p1ai/")
+	pool.seedDomain(5, 11, "prio", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio.example/")
+	pool.seedDomain(6, 22, "rf2", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 22, 0, model.VariantMain, hSPA[:], nil, false, "https://rf2.xn--p1ai/")
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq,
+		RequeueOptions{BatchSize: 3, DeprioritizedZones: []string{"xn--p1ai"}})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Selected != 3 || res.Deprioritized != 2 || res.Cleared != 3 || res.Published != 3 || res.Full {
+		t.Fatalf("итог %+v, ожидался selected=3 deprioritized=2 cleared=3 published=3 full=false", res)
+	}
+	// Порядок публикаций: приоритетная зона вперёд, дальше — зоны списка.
+	pub := q.snapshot()
+	if len(pub) != 3 {
+		t.Fatalf("публикаций %d, ожидалось 3", len(pub))
+	}
+	want := []renderqDomKey{{zone: 5, id: 11}, {zone: 6, id: 21}, {zone: 6, id: 22}}
+	for i, w := range want {
+		if pub[i].msg.ZoneID != w.zone || pub[i].msg.DomainID != w.id {
+			t.Fatalf("публикация %d: домен %d/%d, ожидался %d/%d (приоритет — в начале пачки)",
+				i, pub[i].msg.ZoneID, pub[i].msg.DomainID, w.zone, w.id)
+		}
+	}
+}
+
+// TestRequeueOnceZoneListEmpty — пустой список зон (умолчание):
+// единственная ступень без фильтра — базовая выборка T-181, ступенчатые
+// SQL не выполняются вовсе.
+func TestRequeueOnceZoneListEmpty(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	pool.zones[6] = "xn--p1ai"
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(6, 21, "rf1", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf1.xn--p1ai/")
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Selected != 1 || res.Deprioritized != 0 || res.Cleared != 1 {
+		t.Fatalf("итог %+v, ожидался selected=1 cleared=1 без ступеней", res)
+	}
+	if pool.stage1Select != 0 || pool.stage2Select != 0 {
+		t.Fatalf("ступенчатые выборки выполнены (st1=%d st2=%d) при пустом списке зон", pool.stage1Select, pool.stage2Select)
+	}
+}
+
+// TestRequeueZoneStageMemory — память исчерпания первой ступени (T-184):
+// после доказательства (пустая/неполная пачка — seq scan дошёл до конца
+// таблицы) порожний полный проход первой ступени не повторяется, пока
+// счётчик долга сходится с ожиданием цикла; новая постановка бита (+1,
+// T-175) возобновляет первую ступень.
+func TestRequeueZoneStageMemory(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, q, _, rq := renderqPassKit(t, 0)
+	pool.zones[6] = "xn--p1ai"
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(6, 21, "rf1", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf1.xn--p1ai/")
+	pool.seedDomain(6, 22, "rf2", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 22, 0, model.VariantMain, hSPA[:], nil, false, "https://rf2.xn--p1ai/")
+
+	ctx := context.Background()
+	stage := &renderStage{}
+	opts := RequeueOptions{BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
+
+	// Проход 1: первая ступень пуста (доказательство исчерпания при
+	// долге 2), вторая берёт первый домен .рф.
+	res, err := requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход 1: %v", err)
+	}
+	if res.Deprioritized != 1 || res.Cleared != 1 || !stage.known || stage.proofDebt != 2 || stage.ownClears != 1 {
+		t.Fatalf("проход 1: итог %+v память %+v", res, *stage)
+	}
+	if pool.stage1Select != 1 || pool.stage2Select != 1 {
+		t.Fatalf("проход 1: выборок st1=%d st2=%d, ожидалось 1/1", pool.stage1Select, pool.stage2Select)
+	}
+
+	// Проход 2: долг 1 == ожидание (2 − своё снятие) — первая ступень
+	// пропущена, вторая дорабатывает .рф.
+	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход 2: %v", err)
+	}
+	if res.Deprioritized != 1 || res.Cleared != 1 {
+		t.Fatalf("проход 2: итог %+v", res)
+	}
+	if pool.stage1Select != 1 || pool.stage2Select != 2 {
+		t.Fatalf("проход 2: выборок st1=%d st2=%d, ожидалось 1/2 — порожний проход первой ступени не должен повторяться",
+			pool.stage1Select, pool.stage2Select)
+	}
+
+	// Проход 3: долг 0 — guard, тяжёлых выборок нет вовсе.
+	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход 3: %v", err)
+	}
+	if res.Selected != 0 || res.Deprioritized != 0 {
+		t.Fatalf("проход 3: итог %+v, ожидался пустой (guard)", res)
+	}
+	if pool.stage1Select != 1 || pool.stage2Select != 2 {
+		t.Fatalf("проход 3: выборки при нулевом долге (st1=%d st2=%d)", pool.stage1Select, pool.stage2Select)
+	}
+
+	// Новая постановка бита в приоритетной зоне: счётчик 0 → 1 —
+	// расхождение с ожиданием возобновляет первую ступень.
+	pool.seedDomain(5, 11, "prio", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio.example/")
+	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход 4: %v", err)
+	}
+	if res.Selected != 1 || res.Deprioritized != 0 || res.Cleared != 1 {
+		t.Fatalf("проход 4: итог %+v, ожидался selected=1 deprioritized=0 (приоритетный домен)", res)
+	}
+	if pool.stage1Select != 2 {
+		t.Fatalf("проход 4: выборок первой ступени %d, ожидалось 2 — рост долга обязан возобновлять первую ступень", pool.stage1Select)
+	}
+	if pub := len(q.snapshot()); pub != 3 { // rf1, rf2, prio
+		t.Fatalf("публикаций %d, ожидалось 3", pub)
+	}
+}
+
+// TestRequeueZoneStageFullBatchInvalidates — полная пачка первой ступени
+// лишает память доказательства (за LIMIT'ом могут оставаться домены):
+// следующий проход первую ступень выполняет (T-184).
+func TestRequeueZoneStageFullBatchInvalidates(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	pool.zones[6] = "xn--p1ai"
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(5, 11, "prio", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio.example/")
+
+	ctx := context.Background()
+	stage := &renderStage{}
+	// «Чужое» доказательство исчерпания (как будто было раньше) — полная
+	// пачка обязана его сбросить.
+	stage.known, stage.proofDebt = true, 100
+	opts := RequeueOptions{BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
+
+	res, err := requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход: %v", err)
+	}
+	if res.Selected != 1 || res.Cleared != 1 || res.Deprioritized != 0 {
+		t.Fatalf("итог %+v, ожидался selected=1 (полная пачка первой ступени)", res)
+	}
+	if pool.stage1Select != 1 {
+		t.Fatalf("выборок первой ступени %d, ожидалась 1 — полная пачка сбрасывает доказательство", pool.stage1Select)
+	}
+	if stage.known {
+		t.Fatal("полная пачка оставила доказательство исчерпания — память лжёт")
+	}
+}
+
+// TestRequeueZoneStageKeepInvalidates — неснятый домен первой ступени
+// снимает доказательство исчерпания (ревью T-184, P1): keep при
+// нечитаемом контенте оставляет флаг живым, счётчик и ожидание не
+// расходятся — без снятия доказательства первая ступень пропускалась бы
+// вечно, а вторая (зоны списка) приоритетный домен не видит: долг
+// застревал бы с Warn «биты-сироты» и полным seq scan каждый тик.
+func TestRequeueZoneStageKeepInvalidates(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	hDead := content.HashOf([]byte("приоритетный блок, который не читается"))
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	pool.zones[6] = "xn--p1ai"
+	pool.seedDomain(5, 11, "prio", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hDead[:], nil, false, "https://prio.example/")
+	pool.seedDomain(6, 21, "rf", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf.xn--p1ai/")
+	body.bodies[hSPA] = renderqSPABody
+	body.bodies[hDead] = renderqSPABody
+	// Контент приоритетного домена не читается — keep (транзиентный сбой).
+	body.errOn[hDead] = errors.New("pack: блок не читается")
+
+	ctx := context.Background()
+	stage := &renderStage{}
+	opts := RequeueOptions{BatchSize: 2, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
+
+	// Проход 1: обе ступени дали по домену, приоритетный не снят (keep)
+	// — доказательство обязано быть снято, .рф доработан.
+	res, err := requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход 1: %v", err)
+	}
+	if res.Selected != 2 || res.Deprioritized != 1 || res.Cleared != 1 {
+		t.Fatalf("проход 1: итог %+v, ожидался selected=2 deprioritized=1 cleared=1 (keep приоритетного)", res)
+	}
+	if stage.known {
+		t.Fatal("неснятый домен первой ступени оставил доказательство исчерпания — застрявший приоритетный долг")
+	}
+	if !pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("флаг приоритетного домена снят при нечитаемом контенте")
+	}
+
+	// Проход 2: контент читается (сбой транзиентный) — первая ступень
+	// выполняется снова и дорабатывает застрявший домен.
+	delete(body.errOn, hDead)
+	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход 2: %v", err)
+	}
+	if res.Selected != 1 || res.Cleared != 1 || res.Deprioritized != 0 {
+		t.Fatalf("проход 2: итог %+v, ожидался selected=1 cleared=1 (застрявший приоритетный доработан)", res)
+	}
+	if pool.stage1Select != 2 {
+		t.Fatalf("выборок первой ступени %d, ожидалось 2 — неснятый домен обязан возобновлять первую ступень", pool.stage1Select)
+	}
+	if got := pool.counters["render_pending"]; got != 0 {
+		t.Fatalf("счётчик долга = %d, ожидался 0", got)
+	}
+}
+
+// TestRequeueZoneStageFullMidBatchInvalidates — ранний выход по ёмкости
+// (Full) с непроработанными доменами первой ступени снимает доказательство
+// (ревью T-184, P1): счётчик и ожидание не расходятся (нет ни снятий, ни
+// постановок) — без снятия первая ступень пропускалась бы, а Full-хвост
+// остался бы с флагом навсегда.
+func TestRequeueZoneStageFullMidBatchInvalidates(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, _, _, rq := renderqPassKit(t, 0, 0, 100) // после первого домена очередь полна
+	pool.zones[6] = "xn--p1ai"
+	body.bodies[hSPA] = renderqSPABody
+	// Две приоритетные + .рф: первая ступень неполная (доказательство
+	// установлено), Full обрывает обработку на втором приоритетном.
+	pool.seedDomain(5, 11, "prio1", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio1.example/")
+	pool.seedDomain(5, 12, "prio2", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 12, 0, model.VariantMain, hSPA[:], nil, false, "https://prio2.example/")
+	pool.seedDomain(6, 21, "rf", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf.xn--p1ai/")
+
+	ctx := context.Background()
+	stage := &renderStage{}
+	opts := RequeueOptions{BatchSize: 3, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
+
+	res, err := requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход: %v", err)
+	}
+	if !res.Full || res.Selected != 3 || res.Cleared != 1 {
+		t.Fatalf("итог %+v, ожидался full selected=3 cleared=1 (второй приоритетный ждёт ёмкости)", res)
+	}
+	if stage.known {
+		t.Fatal("ранний выход Full оставил доказательство исчерпания — непроработанный приоритетный долг застрянет")
+	}
+	if !pool.domains[renderqDomKey{zone: 5, id: 12}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("флаг второго приоритетного домена снят при полной очереди")
+	}
+}
+
+// TestRequeueZoneStageSecondSelectError — ошибка выборки второй ступени
+// снимает доказательство исчерпания (ревью T-184, раунд 2): домены
+// первой ступени пачки остались с флагами, а счётчик и ожидание не
+// расходились бы — без снятия первая ступень пропускалась бы вечно.
+func TestRequeueZoneStageSecondSelectError(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	pool.zones[6] = "xn--p1ai"
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(5, 11, "prio", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio.example/")
+	pool.seedDomain(6, 21, "rf", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf.xn--p1ai/")
+	pool.queryErrs[renderPendingDomainsInSQL] = errors.New("sql: вторая ступень")
+
+	ctx := context.Background()
+	stage := &renderStage{}
+	opts := RequeueOptions{BatchSize: 2, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
+
+	if _, err := requeuePass(ctx, pool, body, rq, opts, stage); err == nil {
+		t.Fatal("ошибка второй ступени не возвращена")
+	}
+	if stage.known {
+		t.Fatal("ошибка второй ступени оставила доказательство исчерпания — приоритетный долг пачки застрянет")
+	}
+}
+
+// TestRequeueZoneStageSecondKeepKeepsProof — застрявший домен ВТОРОЙ
+// ступени (зоны списка) доказательства не снимает (ревью T-184, раунд 2):
+// его подберёт сама вторая ступень следующего прохода (она выполняется
+// при каждом пропуске первой) — ложные снятия возвращали бы порожний
+// полный seq scan первой ступени после каждого keep-эпизода хвоста.
+func TestRequeueZoneStageSecondKeepKeepsProof(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	hDead := content.HashOf([]byte("блок .рф, который не читается"))
+	pool, body, _, _, rq := renderqPassKit(t, 0)
+	pool.zones[6] = "xn--p1ai"
+	pool.seedDomain(5, 11, "prio", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio.example/")
+	pool.seedDomain(6, 21, "rf", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 21, 0, model.VariantMain, hDead[:], nil, false, "https://rf.xn--p1ai/")
+	body.bodies[hSPA] = renderqSPABody
+	body.bodies[hDead] = renderqSPABody
+	body.errOn[hDead] = errors.New("pack: блок не читается")
+
+	ctx := context.Background()
+	stage := &renderStage{}
+	opts := RequeueOptions{BatchSize: 2, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
+
+	// Проход 1: приоритетный снят, .рф застрял (keep) — доказательство
+	// переживает: застрявший в зоне списка подоберёт вторая ступень.
+	res, err := requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход 1: %v", err)
+	}
+	if res.Cleared != 1 || res.Deprioritized != 1 {
+		t.Fatalf("проход 1: итог %+v, ожидался cleared=1 (приоритетный) deprioritized=1", res)
+	}
+	if !stage.known {
+		t.Fatal("keep домена второй ступени снял доказательство — ложное снятие возвращает порожние полные проходы")
+	}
+	if got, want := stage.expectedDebt(), pool.counters["render_pending"]; got != want {
+		t.Fatalf("ожидание счётчика %d, фактический долг %d — рассинхрон памяти", got, want)
+	}
+
+	// Проход 2: счётчик сходится — первая ступень пропущена, вторая
+	// повторяет застрявший .рф (контент читается).
+	delete(body.errOn, hDead)
+	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
+	if err != nil {
+		t.Fatalf("проход 2: %v", err)
+	}
+	if res.Selected != 1 || res.Deprioritized != 1 || res.Cleared != 1 {
+		t.Fatalf("проход 2: итог %+v, ожидался selected=1 deprioritized=1 cleared=1 (вторая ступень добирает своё)", res)
+	}
+	if pool.stage1Select != 1 {
+		t.Fatalf("выборок первой ступени %d, ожидалась 1 — keep второй ступени не должен возобновлять первую", pool.stage1Select)
+	}
+	if got := pool.counters["render_pending"]; got != 0 {
+		t.Fatalf("счётчик долга = %d, ожидался 0", got)
+	}
+}
+
+// TestRequeueRenderPendingZoneCycle — цикл с приоритетом зон (T-184):
+// стартовый дренаж доводит весь долг (приоритетные зоны вперёд, зоны
+// списка — последними), память ступеней переживает проходы, отмена ctx —
+// чистый nil.
+func TestRequeueRenderPendingZoneCycle(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool := newRenderqPool()
+	pool.zones[5] = "example"
+	pool.zones[6] = "xn--p1ai"
+	body := &renderqContent{bodies: map[content.Hash][]byte{hSPA: renderqSPABody}, errOn: make(map[content.Hash]error)}
+	pool.j.done = make(chan string, 64)
+	q := &renderqQueue{j: pool.j}
+	rq, err := NewRenderQueue(q, &renderqLen{}, 100, nil)
+	if err != nil {
+		t.Fatalf("NewRenderQueue: %v", err)
+	}
+	// «Куча»: .рф первыми, приоритетные — за ними.
+	pool.seedDomain(6, 21, "rf1", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf1.xn--p1ai/")
+	pool.seedDomain(5, 11, "prio1", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio1.example/")
+	pool.seedDomain(5, 12, "prio2", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 12, 0, model.VariantMain, hSPA[:], nil, false, "https://prio2.example/")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RequeueRenderPending(ctx, pool, body, rq,
+			RequeueOptions{Interval: time.Hour, BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}})
+	}()
+
+	// Ждём полного дренажа: все три флага сняты.
+	deadline := time.After(3 * time.Second)
+	for {
+		pool.mu.Lock()
+		left := 0
+		for _, d := range pool.domains {
+			if d.flags.Test(model.FlagRenderPending) {
+				left++
+			}
+		}
+		pool.mu.Unlock()
+		if left == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("дренаж не завершён: флагов осталось %d", left)
+		case <-pool.j.done:
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	// Порядок публикаций: приоритетные зоны вперёд (.рф в «куче» первым,
+	// но доработан последним).
+	pub := q.snapshot()
+	if len(pub) != 3 {
+		t.Fatalf("публикаций %d, ожидалось 3", len(pub))
+	}
+	want := []renderqDomKey{{zone: 5, id: 11}, {zone: 5, id: 12}, {zone: 6, id: 21}}
+	for i, w := range want {
+		if pub[i].msg.ZoneID != w.zone || pub[i].msg.DomainID != w.id {
+			t.Fatalf("публикация %d: домен %d/%d, ожидался %d/%d (приоритет зон)",
+				i, pub[i].msg.ZoneID, pub[i].msg.DomainID, w.zone, w.id)
+		}
+	}
+	if got := pool.counters["render_pending"]; got != 0 {
+		t.Fatalf("счётчик долга = %d, ожидался 0", got)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RequeueRenderPending: %v (отмена — чистый nil)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("цикл не завершился после отмены ctx")
+	}
+}
+
 // TestRequeueOnceClearRace — охрана бита при снятии: конкурент уже снял
 // флаг — RowsAffected 0 без ошибки, домен не засчитан.
 func TestRequeueOnceClearRace(t *testing.T) {
@@ -2086,6 +2604,24 @@ func TestRenderSQLContract(t *testing.T) {
 		!strings.Contains(renderPendingDomainsSQL, "LIMIT $1") ||
 		strings.Contains(renderPendingDomainsSQL, "ORDER BY") {
 		t.Fatalf("renderPendingDomainsSQL разошёлся с контрактом T-181 (без PK-порядка, LIMIT — пачка):\n%s", renderPendingDomainsSQL)
+	}
+	// Ступени приоритета зон (T-184): фильтр по имени зоны в JOIN,
+	// LIMIT — пачка, сортировки нет (форма плана T-181 сохраняется).
+	if !strings.Contains(renderPendingDomainsNotInSQL, "z.name <> ALL($2::text[])") ||
+		!strings.Contains(renderPendingDomainsNotInSQL, "LIMIT $1") ||
+		strings.Contains(renderPendingDomainsNotInSQL, "ORDER BY") {
+		t.Fatalf("renderPendingDomainsNotInSQL разошёлся с контрактом T-184 (первая ступень — зоны НЕ из списка):\n%s", renderPendingDomainsNotInSQL)
+	}
+	if !strings.Contains(renderPendingDomainsInSQL, "z.name = ANY($2::text[])") ||
+		!strings.Contains(renderPendingDomainsInSQL, "LIMIT $1") ||
+		strings.Contains(renderPendingDomainsInSQL, "ORDER BY") {
+		t.Fatalf("renderPendingDomainsInSQL разошёлся с контрактом T-184 (вторая ступень — зоны списка):\n%s", renderPendingDomainsInSQL)
+	}
+	if !strings.Contains(renderPendingDomainsNotInSQL, "(d.flags & 2) <> 0") ||
+		!strings.Contains(renderPendingDomainsNotInSQL, "d.status <> 6") ||
+		!strings.Contains(renderPendingDomainsInSQL, "(d.flags & 2) <> 0") ||
+		!strings.Contains(renderPendingDomainsInSQL, "d.status <> 6") {
+		t.Fatalf("ступени T-184 утратили фильтры базовой выборки T-181:\n%s\n%s", renderPendingDomainsNotInSQL, renderPendingDomainsInSQL)
 	}
 	if renderPlanNoIndexScanSQL != "SET LOCAL enable_indexscan = off" ||
 		renderPlanNoBitmapScanSQL != "SET LOCAL enable_bitmapscan = off" {

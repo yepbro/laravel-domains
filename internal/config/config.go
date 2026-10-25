@@ -382,6 +382,23 @@ type Render struct {
 	// считает проводка cmd/http-worker. Расширение к минимальному
 	// составу ТЗ 5.10.
 	QueueHighWatermark int `yaml:"queue_high_watermark"`
+	// RequeueDeprioritizedZones — имена зон (punycode, как в справочнике
+	// zones; IDN-зона .рф — xn--p1ai), чей рендер-долг (флаг
+	// render_pending) проход доработки RequeueRenderPending обслуживает
+	// по остаточному принципу (T-184, решение (а) T-176 — оператор
+	// 24.10: рендерим всё, ничего не теряем; зоны с высоким DOM-вкладом —
+	// вперёд, парковочные .рф — последними): выборка пачки двухступенчатая
+	// — сначала домены зон НЕ из списка, при исчерпании — зоны списка
+	// (очередь долга не теряет записей). Пустой список — прежний порядок
+	// (одна ступень без фильтра зон, T-181). Имени может не быть в
+	// справочнике (зону создаёт ingest первым файлом, ТЗ 5.1) — фильтр
+	// ступеней сопоставляет по имени в самой выборке и вступает в силу с
+	// появлением зоны, отдельного разрешения на старте нет. Влияет только
+	// на порядок дренажа долга: публикация SPA-результатов живой проверки
+	// не приоритизируется (её дозируют ворота q:render), недоставленный
+	// хвост стрима дренируется FIFO как есть. Расширение к минимальному
+	// составу ТЗ 5.10.
+	RequeueDeprioritizedZones []string `yaml:"requeue_deprioritized_zones"`
 }
 
 // Content — хранилище контента (ТЗ 5.7).
@@ -763,6 +780,10 @@ func Default() *Config {
 			// (замер 24.10: ≈5,1 тыс. задач/ч) — обоснование у поля
 			// QueueHighWatermark.
 			QueueHighWatermark: 10000,
+			// Приоритет зон прохода доработки (T-184) не задан — все зоны
+			// дренажируются одним порядком (T-181); прод ставит сюда
+			// парковочные зоны по замеру T-176 (xn--p1ai).
+			RequeueDeprioritizedZones: nil,
 		},
 		Content: Content{
 			Dir:            "/data/content",
@@ -895,6 +916,12 @@ func Default() *Config {
 func (c *Config) normalize() {
 	for i, s := range c.Subdomains {
 		c.Subdomains[i] = strings.ToLower(strings.TrimSpace(s))
+	}
+	// Имена деприоритизированных зон — punycode в нижнем регистре без
+	// пробелов (как zones.name и ключи scheduler.zone_weights); дубль
+	// после приведения ловит Validate.
+	for i, s := range c.Render.RequeueDeprioritizedZones {
+		c.Render.RequeueDeprioritizedZones[i] = strings.ToLower(strings.TrimSpace(s))
 	}
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
 	// Ключи весов зон — punycode-имена в нижнем регистре (как zones.name);
@@ -1262,6 +1289,24 @@ func (c *Config) Validate() error {
 	if w := c.Render.QueueHighWatermark; w != 0 && !inRange(w, 1, 100000000) {
 		problems = append(problems, fmt.Sprintf("render.queue_high_watermark: ожидается 0 (порог scheduler.queue_high_watermark) или %d..%d, задано %d",
 			1, 100000000, w))
+	}
+	// Приоритет зон прохода доработки (T-184): синтаксически невозможное
+	// имя ловим здесь (справочник такого имени содержать не может — как у
+	// весов зон T-106); имени может не быть в справочнике — не ошибка
+	// (зону создаёт ingest первым файлом, фильтр сопоставляет по имени в
+	// самой выборке и вступает в силу с появлением зоны).
+	seenDepr := make(map[string]bool, len(c.Render.RequeueDeprioritizedZones))
+	for _, name := range c.Render.RequeueDeprioritizedZones {
+		if name == "" || len(name) > 253 || !zoneNameRe.MatchString(name) {
+			problems = append(problems, fmt.Sprintf(
+				"render.requeue_deprioritized_zones: %q — ожидается имя зоны в punycode нижним регистром, как в справочнике zones (составные — co.uk, IDN — xn--p1ai)", name))
+			continue
+		}
+		if seenDepr[name] {
+			problems = append(problems, fmt.Sprintf("render.requeue_deprioritized_zones: повтор %q", name))
+			continue
+		}
+		seenDepr[name] = true
 	}
 
 	// content
