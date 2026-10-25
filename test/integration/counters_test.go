@@ -214,7 +214,12 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 // TestCounters_RecordDoubleDelivery — запись результата HTTP-эпизода
 // поверх done (DNS-этап уже перевёл домен, T-178: DNS — главный переход
 // queued → done) и её повторная доставка: дельт зон нет ни у одной
-// записи (старое состояние строки — done, ТЗИ §6.4); сверка сходится.
+// записи (старое состояние строки — done, ТЗИ §6.4); суточный счётчик
+// проверок (T-179) считает события записи — по +1 на доставку, —
+// реконсиляция сводит строку к живому окну (один домен), дрейф
+// daily:checks наблюдаем в позициях прохода; сверка сходится (суточная
+// строка в verify не входит — принятое расхождение семантик,
+// TZ_slow_done_today §5.1).
 func TestCounters_RecordDoubleDelivery(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -240,7 +245,7 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 		t.Fatalf("NewRecorder: %v", err)
 	}
 	res := &httpworker.DomainResult{ZoneID: zone, DomainID: ids[0], Name: "q0.record.test"}
-	for i := 0; i < 2; i++ { // дубль-доставка поверх done — без дельт
+	for i := 0; i < 2; i++ { // дубль-доставка поверх done — без дельт зон
 		ok, err := rec.RecordAndPublish(ctx, res)
 		if err != nil || !ok {
 			t.Fatalf("запись %d: ok=%v err=%v", i+1, ok, err)
@@ -255,7 +260,164 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 	if queued != 0 || checked != 1 {
 		t.Fatalf("после record×2 queued=%d checked=%d, хочу 0/1 (дельта один раз — на DNS-переходе)", queued, checked)
 	}
-	countersVerifyEmpty(t, pool, "после record×2 поверх done")
+
+	// Суточный счётчик (T-179): две записи результата — два события
+	// (дельта не двоится на доставку: одна доставка — один инкремент);
+	// живое окно — один домен с last_checked_at = current_date.
+	if got := countersChecksToday(t, pool); got != 2 {
+		t.Fatalf("после record×2 checks:<день> = %d, хочу 2 (по одному событию на запись)", got)
+	}
+	countersVerifyEmpty(t, pool, "после record×2 поверх done (суточная строка вне verify)")
+
+	// Реконсиляция — авторитет: строка дня := живое окно (1), дрейф
+	// |2 − 1| виден позицией daily:checks прохода.
+	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
+	if err != nil {
+		t.Fatalf("реконсиляция: %v", err)
+	}
+	if got := countersChecksToday(t, pool); got != 1 {
+		t.Fatalf("после реконсиляции checks:<день> = %d, хочу 1 (живое окно: один домен сегодня)", got)
+	}
+	drifted := false
+	for _, p := range pass.Positions {
+		if p.Counter != "daily:checks" {
+			continue
+		}
+		drifted = true
+		if p.Old != 2 || p.New != 1 || p.Drift() != 1 {
+			t.Fatalf("daily:checks = %+v, хочу old=2 new=1 drift=1", p)
+		}
+	}
+	if !drifted {
+		t.Fatal("позиция daily:checks отсутствует в итогах прохода")
+	}
+	countersVerifyEmpty(t, pool, "после реконсиляции")
+}
+
+// countersChecksToday — значение строки суточного счётчика проверок
+// текущего дня (имя вычисляет БД — тот же current_date, что у инкремента
+// и окна реконсиляции); отсутствующая строка — ошибка теста.
+func countersChecksToday(t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	var v int64
+	err := pool.QueryRow(context.Background(),
+		"SELECT value FROM crawler_counters WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')",
+	).Scan(&v)
+	if err != nil {
+		t.Fatalf("чтение checks:<день>: %v", err)
+	}
+	return v
+}
+
+// TestCounters_DailyChecksDayChange — ротация суток (T-179, ТЗ §9.2):
+// эмуляция смены даты фиксированной таймзоной соединения (current_date
+// выводится из TimeZone сессии): записи «в разные дни» ведут разные
+// строки checks:, вчерашняя остаётся историей темпа, живое окно каждого
+// дня считает только его записи. Пул с MaxConns=1 — SET TimeZone
+// действует на единственное соединение, транзакции записи видят его.
+func TestCounters_DailyChecksDayChange(t *testing.T) {
+	skipUnlessIntegration(t)
+	dsn, cleanup := withTestSchema(t)
+	t.Cleanup(cleanup)
+	if err := migrate.Up(context.Background(), dsn); err != nil {
+		t.Fatalf("миграции: %v", err)
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("разбор DSN: %v", err)
+	}
+	cfg.MaxConns = 1 // TimeZone сессионный: все операторы — одно соединение
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("пул: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	ctx := context.Background()
+
+	// Pacific/Midway (UTC−11) и Pacific/Kiritimati (UTC+14) —
+	// разносят current_date минимум на сутки в любой момент прогона
+	// (25 часов между зонами; DST в обеих нет). set_config —
+	// параметризуемый аналог SET TIME ZONE (сам SET параметров не
+	// принимает), is_local=false — уровень сессии.
+	const (
+		tzDay1 = "Pacific/Midway"
+		tzDay2 = "Pacific/Kiritimati"
+	)
+	setTZ := func(tz string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, "SELECT set_config('TimeZone', $1, false)", tz); err != nil {
+			t.Fatalf("таймзона %s: %v", tz, err)
+		}
+	}
+	var day1, day2 string
+	readDate := func(tz string) string {
+		setTZ(tz)
+		var d string
+		if err := pool.QueryRow(ctx, "SELECT to_char(current_date, 'YYYY-MM-DD')").Scan(&d); err != nil {
+			t.Fatalf("current_date (%s): %v", tz, err)
+		}
+		return d
+	}
+	day1 = readDate(tzDay1)
+	day2 = readDate(tzDay2)
+	if day1 == day2 {
+		t.Fatalf("таймзоны не развели сутки: %s == %s (прогон в окне ±14ч вокруг полуночи — повторить)", day1, day2)
+	}
+
+	zone := countersSeedZone(t, pool, "days.test")
+	ids := countersSeedDomains(t, pool, zone, "d", 2, model.CheckStateDone, model.StatusNew)
+	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil)
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+	checksRow := func(day string) (int64, bool) {
+		var v int64
+		err := pool.QueryRow(ctx,
+			"SELECT value FROM crawler_counters WHERE name = $1", "checks:"+day).Scan(&v)
+		if err != nil {
+			return 0, false
+		}
+		return v, true
+	}
+
+	// День 1: первый домен записан — строка дня создана инкрементом.
+	setTZ(tzDay1)
+	if ok, err := rec.RecordAndPublish(ctx, &httpworker.DomainResult{
+		ZoneID: zone, DomainID: ids[0], Name: "d0.days.test",
+	}); err != nil || !ok {
+		t.Fatalf("запись дня 1: ok=%v err=%v", ok, err)
+	}
+	if v, ok := checksRow(day1); !ok || v != 1 {
+		t.Fatalf("checks:%s = (%d, %v), хочу (1, true) — строку создаёт первый инкремент суток", day1, v, ok)
+	}
+
+	// День 2 (для соединения): второй домен — новая строка, вчерашняя
+	// не тронута.
+	setTZ(tzDay2)
+	if ok, err := rec.RecordAndPublish(ctx, &httpworker.DomainResult{
+		ZoneID: zone, DomainID: ids[1], Name: "d1.days.test",
+	}); err != nil || !ok {
+		t.Fatalf("запись дня 2: ok=%v err=%v", ok, err)
+	}
+	if v, ok := checksRow(day2); !ok || v != 1 {
+		t.Fatalf("checks:%s = (%d, %v), хочу (1, true) — новая строка нового дня", day2, v, ok)
+	}
+	if v, ok := checksRow(day1); !ok || v != 1 {
+		t.Fatalf("checks:%s = (%d, %v) после записи дня 2, хочу (1, true) — история не тронута", day1, v, ok)
+	}
+
+	// Реконсиляция «дня 2»: окно current_date видит только домен дня 2
+	// (last_checked_at дня 1 вне окна), строка дня 2 сходится, день 1
+	// проход не перезаписывает.
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("реконсиляция: %v", err)
+	}
+	if v, _ := checksRow(day2); v != 1 {
+		t.Fatalf("после реконсиляции checks:%s = %d, хочу 1", day2, v)
+	}
+	if v, _ := checksRow(day1); v != 1 {
+		t.Fatalf("реконсиляция тронула вчерашнюю строку checks:%s = %d, хочу 1 (история)", day1, v)
+	}
 }
 
 // TestCounters_DNSStageTransitions — главный переход конвейера
@@ -336,6 +498,37 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	}
 	if queued != 1 || checked != 3 {
 		t.Fatalf("после DNS-переходов queued=%d checked=%d, хочу 1/3", queued, checked)
+	}
+
+	// Суточный счётчик проверок (T-179): инкремент — событие записи
+	// результата httpworker, DNS-переходы его не дают (эпизода HTTP у
+	// терминальных веток нет) — строка дня осталась нулём стартового
+	// прохода; живое окно выросло до 3 (last_checked_at = current_date
+	// ставит и DNS-этап). Проход — авторитет: перезаписывает строку
+	// окном, дрейф-позиция daily:checks наблюдает разницу потоков
+	// (3 DNS-only завершения), не «нули-аномалию».
+	if got := countersChecksToday(t, pool); got != 0 {
+		t.Fatalf("после DNS-переходов checks:<день> = %d, хочу 0 (инкремент — только запись результата HTTP)", got)
+	}
+	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
+	if err != nil {
+		t.Fatalf("реконсиляция: %v", err)
+	}
+	if got := countersChecksToday(t, pool); got != 3 {
+		t.Fatalf("после реконсиляции checks:<день> = %d, хочу 3 (живое окно всех веток конвейера)", got)
+	}
+	dailySeen := false
+	for _, p := range pass.Positions {
+		if p.Counter != "daily:checks" {
+			continue
+		}
+		dailySeen = true
+		if p.Old != 0 || p.New != 3 || p.Drift() != 3 {
+			t.Fatalf("daily:checks = %+v, хочу old=0 new=3 drift=3 (DNS-only завершения окна)", p)
+		}
+	}
+	if !dailySeen {
+		t.Fatal("позиция daily:checks отсутствует в итогах прохода")
 	}
 }
 

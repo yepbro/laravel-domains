@@ -120,7 +120,10 @@ func TestCacheSectionsIndependent(t *testing.T) {
 	if n := countSQL(calls, "AS done_today"); n != 1 {
 		t.Errorf("выборок темпа = %d, want 1 (запись жива)", n)
 	}
-	if n := countSQL(calls, "FROM crawler_counters"); n != 1 {
+	// Маркер статусов — LIKE 'status (domainStatusSQL): throughputSQL
+	// с T-179 тоже читает crawler_counters (счётчик суточных проверок) —
+	// подстрока FROM crawler_counters больше не различает запросы.
+	if n := countSQL(calls, "LIKE 'status"); n != 1 {
 		t.Errorf("выборок статусов = %d, want 1 (запись жива)", n)
 	}
 }

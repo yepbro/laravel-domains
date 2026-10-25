@@ -19,9 +19,10 @@
 //     domains_queued/domains_checked (дельты переходов + реконсиляция
 //     monitor, T-178; базовое множество — status <> deleted, ТЗИ §4.1),
 //     читаются справочником без прохода domains;
-//   - скорость доменов — средняя с начала суток: last_checked_at имеет
-//     точность дня (date, ТЗ 6.1), часового окна нет; короче 10 минут
-//     окно не используется (сразу после полуночи оценка скачет);
+//   - скорость доменов — средняя с начала суток по суточному счётчику
+//     проверок checks:YYYY-MM-DD (T-179; last_checked_at имеет точность
+//     дня, ТЗ 6.1, часового окна нет); короче 10 минут окно не
+//     используется (сразу после полуночи оценка скачет);
 //   - HTTP-результаты и рендеры — за последний час по checked_at
 //     (timestamptz пишет http-worker, T-058); собственной отметки времени
 //     у рендера нет — считается доля rendered среди результатов окна;
@@ -31,10 +32,12 @@
 //   - ETA первого цикла = (pending + queued) / скорость доменов, защита
 //     от деления на ноль — скорости нет или она 0 → «н/д».
 //
-// Окна и распределения: календарные окна (сутки по domains.
-// last_checked_at, час по subdomain_results.checked_at) обслуживаются
-// индексами T-171/T-120 — правый край диапазона, стоимость
-// пропорциональна окну, а не таблице; распределения и состояния —
+// Окна и распределения: часовые окна темпа (subdomain_results.
+// checked_at) обслуживает индекс T-120 — правый край диапазона,
+// стоимость пропорциональна окну, а не таблице; суточное окно темпа —
+// инкрементальный счётчик checks:YYYY-MM-DD (T-179: живой подсчёт
+// last_checked_at = current_date деградировал heap-fetch'ами свежих
+// страниц — замер §2 TZ_slow_done_today); распределения и состояния —
 // инкрементальные счётчики (T-178: zones + crawler_counters, дельты
 // переходов + реконсиляция раз в monitor.zone_stats_interval — единственный
 // полный проход domains в стационаре). Дашборд кэширует снимки фоновым
@@ -73,10 +76,23 @@ var zoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_un
 // throughputSQL — замеры темпа одним запросом. now() — время транзакции:
 // оба интервала согласованы внутри одного выполнения; current_date и
 // date_trunc — одна таймзона сервера БД, как и now() в записи
-// last_checked_at (T-058). done_today считает проверки, а не домены:
-// повторные проверки одного домена за сутки сходятся в «темп работы».
+// last_checked_at (T-058). done_today — точечное чтение суточного
+// счётчика crawler_counters['checks:YYYY-MM-DD'] (T-179): имя дня
+// вычисляет БД тем же current_date, что и окно реконсиляции, — Go-часы
+// в имени не участвуют; счётчик ведут инкременты записи результата
+// (httpworker/record.go), авторитет — реконсиляция monitor. coalesce
+// СНАРУЖИ подзапроса: до первой записи суток подзапрос пуст (NULL), а не
+// строка с NULL-значением — часы простоя конвейера показывают честный
+// ноль (TZ_slow_done_today §4/§7). done_today считает события записи
+// результатов, а не домены: повторные эпизоды того же домена за сутки
+// сходятся в «темп работы» (расхождение с живым count(*) — §5.1 ТЗ,
+// восстанавливается реконсиляцией). Часовые окна results_hour/
+// rendered_hour остаются живыми подзапросами по subdomain_results —
+// окно маленькое, индекс subdomain_results_checked_idx отрабатывает как
+// задумано (замер §2 ТЗ: 0,07 мс).
 const throughputSQL = "SELECT " +
-	"(SELECT count(*) FROM domains WHERE last_checked_at = current_date) AS done_today, " +
+	"coalesce((SELECT value FROM crawler_counters " +
+	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')), 0) AS done_today, " +
 	"extract(epoch FROM (now() - date_trunc('day', now())))::float8 AS elapsed_sec, " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour') AS results_hour, " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour' AND rendered) AS rendered_hour"
@@ -147,7 +163,7 @@ type ZoneStats struct {
 
 // Throughput — замеры темпа из БД (одно выполнение throughputSQL).
 type Throughput struct {
-	DoneToday    int64   // проверок доменов с начала суток (last_checked_at)
+	DoneToday    int64   // событий записи результатов с начала суток (счётчик checks:, T-179)
 	ElapsedSec   float64 // прошло с начала суток по часам БД
 	ResultsHour  int64   // HTTP-результатов за последний час (checked_at)
 	RenderedHour int64   // из них с итоговым DOM (rendered)

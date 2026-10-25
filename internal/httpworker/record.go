@@ -29,7 +29,10 @@
 //	    раздельные транзакции опасны в обе стороны — строка без ссылки или
 //	    ссылка без строки). Внутри: UPDATE domains (охрана удаления) →
 //	    DELETE старых строк субдомен×вариант с RETURNING content_hash →
-//	    −1 refcount каждого старого хэша → INSERT новых строк;
+//	    −1 refcount каждого старого хэша → INSERT новых строк; хвостовыми
+//	    шагами — дельты счётчиков: зон (T-178), рендер-долга (T-175) и
+//	    суточного счётчика проверок checks:YYYY-MM-DD (T-179 — события
+//	    записи, авторитет — реконсиляция monitor);
 //	  - публикация q:analyze — ПОСЛЕ фиксации транзакции: потребитель Result
 //	    (анализатор, T-068+) читает запись из БД по ключу — сообщение раньше
 //	    строки смотрело бы в пустоту. Сбой публикации → доставка q:http без
@@ -143,6 +146,23 @@ var (
 		"domains_queued = domains_queued + $3::int8, " +
 		"domains_checked = domains_checked + $4::int8 " +
 		"WHERE id = $1::int2"
+
+	// recordChecksBumpSQL — инкремент суточного счётчика проверок
+	// crawler_counters['checks:YYYY-MM-DD'] (T-179, TZ_slow_done_today
+	// §5): upsert с наращиванием — строку нового дня создаёт первый
+	// инкремент после полуночи (ротация не создаёт работы, вчерашняя
+	// строка остаётся историей темпа — 365 строк/год, чистка не нужна).
+	// Имя дня вычисляет БД ('checks:' || current_date): таймзона
+	// согласована с now() записи last_checked_at (T-058) и с окном
+	// реконсиляции monitor — Go-часы в имени не участвуют. Счётчик
+	// считает события записи результата (§5.1): повтор эпизода того же
+	// домена в те же сутки даёт +1 при живом count(*), дающем 0 —
+	// расхождение восстанавливает реконсиляция (FILTER-позиция прохода
+	// T-178), дрейф — наблюдаемая метрика.
+	recordChecksBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('checks:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
 	// recordDeleteSQL — перезапись результата (§3.5): удаляются все строки
 	// домена, RETURNING собирает content_hash для свопа ссылок (T-044).
@@ -313,6 +333,12 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		// счётчики ложью.
 		return false, fmt.Errorf("httpworker: домен %s: запись результата: статус: затронуто %d строк", res.Name, tag.RowsAffected())
 	}
+	// RowsAffected итогового UPDATE — дельта суточного счётчика проверок
+	// (T-179, TZ_slow_done_today §5): не число записей subdomain_results
+	// пачки (домен с пятью субдомен×вариант — один эпизод, +1); охрана
+	// deleted/отсутствие строки отсекли запись выше — до сюда доходят
+	// только записанные результаты.
+	recorded := tag.RowsAffected()
 
 	// Флаг render_pending — той же транзакцией (T-066, §5.6): решение
 	// относится к этому результату (переполнение q:render в момент
@@ -401,6 +427,20 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
+	// Суточный счётчик проверок — тем же «хвостовым» шагом (T-179):
+	// последним оператором перед фиксацией, после зоны и рендер-долга —
+	// строка текущего дня сериализует все записи результатов (как
+	// render_pending, ревью T-175 P3-4), держать её блокировку всю
+	// тяжёлую часть транзакции незачем; порядок «render_pending →
+	// checks:» общий с реконсиляцией monitor (зоны → скаляры → строка
+	// дня) — без циклов блокировок. Дельта — RowsAffected UPDATE выше
+	// (проверка != 1 гарантирует 1; параметр сохранён по контракту
+	// «$1 — RowsAffected», ТЗ §5). Откат откатывает результат и дельту
+	// вместе (§3.4); сбой XACK вернёт доставку — повторная запись
+	// добавит ещё событие (§5.1, сводит реконсиляция).
+	if err := recordBumpChecksCounter(ctx, tx, recorded); err != nil {
+		return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("httpworker: домен %s: запись результата: фиксация: %w", res.Name, err)
 	}
@@ -471,6 +511,25 @@ func recordDeleteOld(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	}
 	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i][:], out[j][:]) < 0 })
 	return out, nil
+}
+
+// recordBumpChecksCounter — инкремент суточного счётчика проверок в
+// ОТКРЫТОЙ транзакции записи результата (T-179): delta — RowsAffected
+// итогового UPDATE домена (1 на эпизод). Upsert сам создаёт строку дня
+// (первый инкремент после полуночи) — RowsAffected гарантированно 1,
+// проверка — страховка прямых вызовов с чужим SQL (молчаливая потеря
+// дельты занижала бы темп). Возврат с ошибкой откатывает транзакцию
+// вызывающего — результат и счётчик меняются только вместе (§3.4).
+func recordBumpChecksCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
+	tag, err := tx.Exec(ctx, recordChecksBumpSQL, delta)
+	if err != nil {
+		return fmt.Errorf("суточный счётчик проверок: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("суточный счётчик проверок: затронуто %d строк (upsert строки дня обязан 1)",
+			tag.RowsAffected())
+	}
+	return nil
 }
 
 // recordStatus — итоговый статус домена HTTP-эпизода (§5.5 п. 9, §7).

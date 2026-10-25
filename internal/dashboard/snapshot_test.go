@@ -97,8 +97,10 @@ func (p *snapPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, e
 		}
 		return snapRowsOf(rows...), nil
 	case strings.Contains(sql, "AS done_today"):
+		// Темп: done_today — суточный счётчик проверок (T-179),
+		// остальное — живые окна; значения из посева.
 		return snapRowsOf([]any{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour}), nil
-	case strings.Contains(sql, "FROM crawler_counters"):
+	case strings.Contains(sql, "LIKE 'status"):
 		// Распределение статусов — строки status_* счётчиков (T-178).
 		rows := make([][]any, 0, len(p.stats))
 		for _, st := range model.Statuses {
@@ -539,7 +541,9 @@ func TestCollectOnceStatusCache(t *testing.T) {
 	if n := countSQLCalls(calls, "AS done_today"); n != 1 {
 		t.Errorf("выборок темпа = %d, want 1 (кэш в окне TTL)", n)
 	}
-	if n := countSQLCalls(calls, "FROM crawler_counters"); n != 1 {
+	// Маркер статусов — LIKE 'status (domainStatusSQL): throughputSQL
+	// с T-179 тоже читает crawler_counters (суточный счётчик проверок).
+	if n := countSQLCalls(calls, "LIKE 'status"); n != 1 {
 		t.Errorf("выборок статусов = %d, want 1 (кэш в окне TTL)", n)
 	}
 	if n := countSQLCalls(calls, "ORDER BY ld.updated_at"); n != 2 {

@@ -42,7 +42,8 @@ const (
 	recordEvDelete  recordEventKind = "delete"
 	recordEvSwap    recordEventKind = "swapref"
 	recordEvInsert  recordEventKind = "insert"
-	recordEvShift   recordEventKind = "zone-shift" // дельта счётчиков зоны (T-178)
+	recordEvShift   recordEventKind = "zone-shift"  // дельта счётчиков зоны (T-178)
+	recordEvChecks  recordEventKind = "checks-bump" // дельта суточного счётчика проверок (T-179)
 	recordEvCommit  recordEventKind = "commit"
 	recordEvPublish recordEventKind = "publish"
 	recordEvAck     recordEventKind = "ack"
@@ -147,8 +148,10 @@ type recordFakeRow struct {
 
 // recordFakePool — RecordDB без БД: живая семантика domains (охрана
 // status <> deleted у UPDATE), subdomain_results (DELETE … RETURNING,
-// INSERT-пачка), contents (refcount с охраной > 0) и счётчиков зон
-// (recordZoneShiftSQL, T-178). Транзакция работает
+// INSERT-пачка), contents (refcount с охраной > 0), счётчиков зон
+// (recordZoneShiftSQL, T-178) и суточного счётчика проверок
+// (recordChecksBumpSQL, T-179 — имя дня вычисляет БД, фейк ведёт одно
+// значение «строки текущего дня»). Транзакция работает
 // на снапшоте: Rollback восстанавливает состояние пула, Commit оставляет
 // (достаточно для последовательных вызовов записи; конкурентные
 // транзакции фейк не моделирует — их сериализует PostgreSQL).
@@ -159,6 +162,7 @@ type recordFakePool struct {
 	rows    map[recordDomainKey][]recordFakeRow
 	refc    map[content.Hash]int32
 	zones   map[int16]*recordFakeZone
+	checks  int64
 
 	begins   int
 	txs      int // создано транзакций
@@ -194,6 +198,13 @@ func (p *recordFakePool) recordSeedZone(id int16, total, pending, queued, checke
 	z := &recordFakeZone{total: total, pending: pending, queued: queued, checked: checked}
 	p.zones[id] = z
 	return z
+}
+
+// checksValue — значение суточного счётчика проверок (T-179) под замком.
+func (p *recordFakePool) checksValue() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.checks
 }
 
 var _ RecordDB = (*recordFakePool)(nil)
@@ -255,11 +266,13 @@ func (p *recordFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 		c := *v
 		snapZones[k] = &c
 	}
+	snapChecks := p.checks
 	p.txs++
 	p.j.record(recordEvBegin)
 	return &recordFakeTx{
 		pool: p, j: p.j,
 		snapDomains: snapDomains, snapRows: snapRows, snapRefc: snapRefc, snapZones: snapZones,
+		snapChecks: snapChecks,
 	}, nil
 }
 
@@ -274,6 +287,7 @@ type recordFakeTx struct {
 	snapRows    map[recordDomainKey][]recordFakeRow
 	snapRefc    map[content.Hash]int32
 	snapZones   map[int16]*recordFakeZone
+	snapChecks  int64
 	committed   bool
 }
 
@@ -417,6 +431,13 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		z.checked += args[3].(int64)
 		t.j.record(recordEvShift)
 		return pgconn.NewCommandTag("UPDATE 1"), nil
+	case recordChecksBumpSQL:
+		// Инкремент суточного счётчика проверок (T-179): upsert строки
+		// дня — имя вычисляет БД, фейк ведёт одно значение. RowsAffected
+		// upsert'а всегда 1 (строку создаёт конфликт-ветвь).
+		t.pool.checks += args[0].(int64)
+		t.j.record(recordEvChecks)
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	default:
 		if !strings.HasPrefix(sql, recordDelRefSQLPrefix) {
 			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: неожидаемый SQL: %s", sql)
@@ -481,6 +502,7 @@ func (t *recordFakeTx) Rollback(context.Context) error {
 		return nil // откат после Commit — no-op
 	}
 	t.pool.domains, t.pool.rows, t.pool.refc, t.pool.zones = t.snapDomains, t.snapRows, t.snapRefc, t.snapZones
+	t.pool.checks = t.snapChecks
 	return nil
 }
 
@@ -761,6 +783,18 @@ func TestRecordWritesAllColumns(t *testing.T) {
 		t.Fatalf("счётчики зоны = %+v, want {10 2 2 6} (queued −1, checked +1)", *zone)
 	}
 
+	// Суточный счётчик проверок (T-179): один эпизод — +1, а не +2 по
+	// числу записей субдомен×вариант (дельта — RowsAffected UPDATE
+	// домена, не INSERT-пачки); дельта в той же транзакции — после
+	// сдвига зоны, до фиксации.
+	if got := pool.checksValue(); got != 1 {
+		t.Fatalf("суточный счётчик = %d, want 1 (один эпизод из двух записей)", got)
+	}
+	if shift, checks := pool.j.indexOf(recordEvShift), pool.j.indexOf(recordEvChecks); shift > checks || checks > pool.j.indexOf(recordEvCommit) {
+		t.Fatalf("порядок счётчиков: shift=%d checks=%d commit=%d (зона → checks → фиксация)",
+			shift, checks, pool.j.indexOf(recordEvCommit))
+	}
+
 	dom := pool.domains[recordDomainKey{zone: 7, id: 91}]
 	if dom.status != model.StatusAlive || dom.checkState != model.CheckStateDone {
 		t.Fatalf("домен: status=%v check_state=%v, ожидалось alive/done", dom.status, dom.checkState)
@@ -1037,6 +1071,11 @@ func TestRecordDeletedGuard(t *testing.T) {
 	if pool.j.count(recordEvInsert) != 0 || pool.j.count(recordEvDelete) != 0 {
 		t.Fatal("транзакция обязана остановиться на охране UPDATE")
 	}
+	// Удалённому результат не пишется — суточный счётчик тоже не растёт
+	// (T-179: дельта только при RowsAffected > 0 UPDATE, ТЗИ §6.1.3).
+	if pool.j.count(recordEvChecks) != 0 || pool.checksValue() != 0 {
+		t.Fatal("суточный счётчик тронут при охране deleted")
+	}
 	if got := len(q.publishesSnapshot()); got != 0 {
 		t.Fatalf("публикаций %d — без записи публиковать нельзя", got)
 	}
@@ -1144,6 +1183,13 @@ func TestRecordIdempotentRepeat(t *testing.T) {
 	if got := len(q.publishesSnapshot()); got != 4 {
 		t.Fatalf("публикаций суммарно %d, ожидалось 4 (2×2)", got)
 	}
+	// Суточный счётчик считает события записи (T-179, TZ_slow_done_today
+	// §5.1): повторная доставка — ещё одно событие, +1 (не ×2 на
+	// доставку); сходят к живому окну реконсиляцией (интеграционный
+	// сценарий — TestCounters_RecordDoubleDelivery).
+	if got := pool.checksValue(); got != 2 {
+		t.Fatalf("суточный счётчик = %d, want 2 (по одному событию на запись)", got)
+	}
 }
 
 // --- транзакционность и сбои шагов -------------------------------------------
@@ -1197,6 +1243,17 @@ func TestRecordTransactionFailures(t *testing.T) {
 		pool.failExec = map[string]error{recordInsertSQL: errors.New("нарушение PK")}
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
+	})
+	t.Run("суточный счётчик проверок", func(t *testing.T) {
+		// T-179: сбой инкремента откатывает транзакцию целиком —
+		// результат и счётчик меняются только вместе.
+		pool, q := seed(t)
+		pool.failExec = map[string]error{recordChecksBumpSQL: errors.New("счётчики недоступны")}
+		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
+		assertRolledBack(t, pool, q, err, 0)
+		if got := pool.checksValue(); got != 0 {
+			t.Fatalf("суточный счётчик = %d после отката, want 0", got)
+		}
 	})
 	t.Run("Commit", func(t *testing.T) {
 		pool, q := seed(t)

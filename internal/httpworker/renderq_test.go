@@ -793,6 +793,12 @@ func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		// «существует» всегда.
 		t.j.record("zoneshift")
 		return pgconn.NewCommandTag("UPDATE 1"), nil
+	case recordChecksBumpSQL:
+		// Суточный счётчик проверок (T-179): имя дня вычисляет БД —
+		// сценариям рендера значение не нужно, транзакция обязана
+		// пройти шаг (upsert всегда 1).
+		t.j.record("checks")
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordInsertSQL:
 		if len(args) != 18 {
 			return pgconn.CommandTag{}, fmt.Errorf("renderqRecPool: INSERT: параметров %d, нужно 18", len(args))

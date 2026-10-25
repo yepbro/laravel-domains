@@ -36,8 +36,15 @@ const wantZoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS n
 	"z.is_active, z.domains_total, z.domains_pending, z.domains_queued, z.domains_checked " +
 	"FROM zones AS z ORDER BY z.name"
 
+// wantThroughputSQL — done_today читает суточный счётчик проверок
+// crawler_counters['checks:YYYY-MM-DD'] точечным лукапом по PK (T-179):
+// полного прохода domains в запросе нет; coalesce СНАРУЖИ подзапроса —
+// до первой записи суток подзапрос пуст (NULL), часы простоя показывают
+// честный ноль; имя дня вычисляет БД (current_date) — согласовано с
+// now() записи last_checked_at (T-058) и окном реконсиляции.
 const wantThroughputSQL = "SELECT " +
-	"(SELECT count(*) FROM domains WHERE last_checked_at = current_date) AS done_today, " +
+	"coalesce((SELECT value FROM crawler_counters " +
+	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')), 0) AS done_today, " +
 	"extract(epoch FROM (now() - date_trunc('day', now())))::float8 AS elapsed_sec, " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour') AS results_hour, " +
 	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour' AND rendered) AS rendered_hour"
