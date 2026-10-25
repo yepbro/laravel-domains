@@ -841,7 +841,7 @@ RequeueRenderPending из накопленного) садится точно в
   counter = 0 тик не обращается к domains; make test + test-integration
   зелёные. ТЗ: [`TZ_slow_render_requeue.md`](./TZ_slow_render_requeue.md).
 
-- **T-182** [в работе] — P1, доля temp_error на суточных счётчиках —
+- **T-182** [сделана] — P1, доля temp_error на суточных счётчиках —
   запрос №6 боевого лога (33 срабатывания >3 с за 09:43–12:19 UTC,
   медиана 28 с, max 111 с): `dnsShareSQL` (monitor/alerts.go) — алерт
   T-080 доли temp_error, цикл 5 мин. Диагноз EXPLAIN: индекс T-171
@@ -922,7 +922,7 @@ RequeueRenderPending из накопленного) садится точно в
   бит и уменьшает счётчик; при counter = 0 тик не обращается к
   domains (T-181); make test + test-integration зелёные.
 
-- **T-187** [новая] — P3, хвост ревью T-185 (условие ревьюера R3) —
+- **T-187** [в работе] — P3, хвост ревью T-185 (условие ревьюера R3) —
   точечный дренаж при переанализе не-fresh: снятие находки
   переанализом (не-fresh, `aggregateDomain` internal/analyzer/
   aggregate.go — событие RowsAffected > 0 ∧ ¬fresh ∧ existed)
