@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/config"
+	"crawler/internal/db"
 	"crawler/internal/dnsclient"
 	"crawler/internal/dnsworker"
 	"crawler/internal/metrics"
@@ -56,7 +57,13 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9103"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
+		// AfterConnect-хук write-пула (T-192): сессионный потолок
+		// lock_timeout 30 с — транзакции записи результатов и публикации
+		// берут строчные локи domains; конвой блокировок 25.10 (держатель
+		// ≈37 мин, жертвы до 39 мин) обрезается откатом транзакции
+		// и повтором доставки пачки (at-least-once, ТЗ §3.4).
+		DBAfterConnect: db.LockTimeout(db.DefaultLockTimeout),
+		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}

@@ -44,6 +44,7 @@ import (
 
 	"crawler/internal/config"
 	"crawler/internal/content"
+	"crawler/internal/db"
 	"crawler/internal/dnsclient"
 	"crawler/internal/httpfetch"
 	"crawler/internal/httpworker"
@@ -88,7 +89,13 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9104"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
+		// AfterConnect-хук write-пула (T-192): сессионный потолок
+		// lock_timeout 30 с — запись результатов и чтение счётчиков (FOR
+		// UPDATE) берут строчные локи domains; конвой блокировок 25.10
+		// (держатель ≈37 мин, жертвы до 39 мин) обрезается откатом
+		// транзакции и повтором доставки задачи (at-least-once, ТЗ §3.4).
+		DBAfterConnect: db.LockTimeout(db.DefaultLockTimeout),
+		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}

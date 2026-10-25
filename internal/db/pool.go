@@ -76,6 +76,65 @@ func NoParallelGather(ctx context.Context, conn *pgx.Conn) error {
 	return nil
 }
 
+// DefaultLockTimeout — потолок ожидания строковых блокировок для
+// write-пулов конвейера (T-192). Боевой инцидент 25.10: длинная
+// транзакция держала строчные локи domains ≈37 мин, точечные write-операторы
+// (все — по PK, планы идеальны) стояли в очереди за ней до 39 мин без
+// потолка — конвейер молча замер на ≈55 минут (q:dns у watermark, XACK не
+// шёл). 30 с на три порядка выше штатных ожиданий (миллисекунды на запись
+// результата; максимум вне инцидента — enqueue 10,6 с) и на порядок ниже
+// инцидентных 15–39 мин: режет только конвой. Превышение — SQLSTATE 55P03,
+// откат транзакции записи и штатный повтор доставки (at-least-once, ТЗ §3.4),
+// а не немое ожидание. Потолок — инцидентная константа, не тюнинг: выноса
+// в конфиг не требуется.
+const DefaultLockTimeout = 30 * time.Second
+
+// lockTimeoutSQLFmt — сессионный потолок ожидания чужих блокировок.
+// Форма <N>ms валидна для GUC-времени PostgreSQL при любой длительности;
+// Duration.String() не годится: 90 с он выводит как "1m30s", а "m" —
+// не единица парсера GUC (мс/с/мин/ч/д).
+const lockTimeoutSQLFmt = "SET lock_timeout = '%dms'"
+
+// LockTimeout — AfterConnect-хук write-пулов конвейера (T-192): сессионный
+// SET lock_timeout на каждом соединении пула (включая переоткрытия по
+// MaxConnLifetime). Включён у dns-worker, http-worker и scheduler — их
+// транзакции берут строчные локи domains; читатели (monitor, dashboard,
+// web) и анализатор не трогаются. Неположительная длительность — ошибка
+// хука (соединение не открывается, сервис падает на старте): потолок
+// обязан быть потолком, «0» здесь означал бы его тихое отключение.
+func LockTimeout(d time.Duration) AfterConnectFunc {
+	return func(ctx context.Context, conn *pgx.Conn) error {
+		if d <= 0 {
+			return fmt.Errorf("db: SET lock_timeout: неположительная длительность %s", d)
+		}
+		sql := fmt.Sprintf(lockTimeoutSQLFmt, d.Milliseconds())
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			return fmt.Errorf("db: %s: %w", sql, err)
+		}
+		return nil
+	}
+}
+
+// JoinHooks — композиция AfterConnect-хуков (T-192): выполняет их по
+// порядку, сбой любого — ошибка открытия соединения (как у одиночного
+// хука); nil-элементы пропускаются (аналог nil AfterConnect — настройка
+// не задана). Нужна пулам с несколькими сессионными настройками:
+// scheduler — NoParallelGather (T-171) + LockTimeout (T-192) одним
+// проводником Options.DBAfterConnect.
+func JoinHooks(hooks ...AfterConnectFunc) AfterConnectFunc {
+	return func(ctx context.Context, conn *pgx.Conn) error {
+		for _, h := range hooks {
+			if h == nil {
+				continue
+			}
+			if err := h(ctx, conn); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 // Options — параметры пула подключений. Нулевые длительности и PoolSize
 // заменяются значениями по умолчанию; DSN обязателен.
 type Options struct {

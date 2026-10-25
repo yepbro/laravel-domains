@@ -6,9 +6,13 @@ package db
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"crawler/internal/config"
 )
@@ -128,6 +132,54 @@ func TestBuildPoolConfig_Validation(t *testing.T) {
 	// Граница допустимого проходит.
 	if _, err := buildPoolConfig(Options{DSN: testDSN, PoolSize: MaxPoolSize}); err != nil {
 		t.Errorf("pool_size = %d должен быть допустим: %v", MaxPoolSize, err)
+	}
+}
+
+// TestLockTimeout_HookSQL — контракт хука LockTimeout (T-192): значение-
+// константа 30 с (инцидентный потолок) и текст SET в форме ms — валидной
+// для GUC-времени PostgreSQL при любой длительности.
+func TestLockTimeout_HookSQL(t *testing.T) {
+	if DefaultLockTimeout != 30*time.Second {
+		t.Errorf("DefaultLockTimeout = %s, want 30s (инцидентный потолок T-192)", DefaultLockTimeout)
+	}
+	if got := fmt.Sprintf(lockTimeoutSQLFmt, DefaultLockTimeout.Milliseconds()); got != "SET lock_timeout = '30000ms'" {
+		t.Errorf("SET lock_timeout = %q, want \"SET lock_timeout = '30000ms'\"", got)
+	}
+	// Неположительная длительность — ошибка до обращения к соединению:
+	// fail-fast открытия пула, а не тихое отключение потолка.
+	for _, d := range []time.Duration{0, -time.Second} {
+		if err := LockTimeout(d)(context.Background(), nil); err == nil {
+			t.Errorf("LockTimeout(%s): want ошибку неположительной длительности", d)
+		}
+	}
+}
+
+// TestJoinHooks — композиция хуков (T-192): порядок сохраняется, nil
+// пропускается, сбой прерывает цепочку и возвращается как есть (scheduler:
+// NoParallelGather + LockTimeout одним Options.DBAfterConnect).
+func TestJoinHooks(t *testing.T) {
+	var calls []string
+	hook := func(name string, ret error) AfterConnectFunc {
+		return func(context.Context, *pgx.Conn) error {
+			calls = append(calls, name)
+			return ret
+		}
+	}
+
+	fail := errors.New("сбой хука")
+	if err := JoinHooks(nil, hook("a", nil), hook("b", fail), hook("c", nil))(context.Background(), nil); !errors.Is(err, fail) {
+		t.Errorf("ошибка композиции = %v, want %v", err, fail)
+	}
+	if got := strings.Join(calls, ","); got != "a,b" {
+		t.Errorf("выполнены %q, want a,b (nil пропущен, сбой прерывает)", got)
+	}
+
+	calls = nil
+	if err := JoinHooks(hook("a", nil), hook("b", nil))(context.Background(), nil); err != nil {
+		t.Errorf("ошибка композиции успешных хуков = %v, want nil", err)
+	}
+	if got := strings.Join(calls, ","); got != "a,b" {
+		t.Errorf("выполнены %q, want a,b", got)
 	}
 }
 

@@ -52,12 +52,17 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9102"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		// Агрегатный коллектор backlog (T-077) не разбирает параллельные
-		// воркеры (T-171): путь постановки пачек — индексные сканы
+		// Составной AfterConnect-хук пула (db.JoinHooks, T-192): агрегатный
+		// коллектор backlog (T-077) не разбирает параллельные воркеры
+		// (T-171) — путь постановки пачек — индексные сканы
 		// domains_pending_idx без параллельных планов, сессионный SET
 		// его не замедляет, а seq-проходы (backlog, retry temp_error)
-		// перестают забирать все ядра у конвейера.
-		DBAfterConnect: db.NoParallelGather,
+		// перестают забирать все ядра у конвейера; транзакции планировщика
+		// берут строчные локи domains (enqueue, lease-возврат) — потолок
+		// lock_timeout 30 с (T-192) обрезает конвой блокировок
+		// (инцидент 25.10: ожидания до 39 мин) откатом и штатным
+		// повтором пути постановки.
+		DBAfterConnect: db.JoinHooks(db.NoParallelGather, db.LockTimeout(db.DefaultLockTimeout)),
 		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)

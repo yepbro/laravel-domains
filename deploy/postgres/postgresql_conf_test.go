@@ -127,6 +127,10 @@ func TestRequiredSettings(t *testing.T) {
 		// T-177: порог лога медленных запросов = порогу цикла monitor
 		// (monitor.slow_query_min_duration) — одна граница «патология».
 		"log_min_duration_statement": "3000",
+		// T-192: ожидания блокировок дольше deadlock_timeout — в журнал
+		// («process N still waiting …»): имя держателя конвоя доменных
+		// строк в следующем инциденте (25.10 — не восстановим).
+		"log_lock_waits": "on",
 	}
 	for name, want := range required {
 		if got := settings[name]; got != want {

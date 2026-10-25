@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/config"
@@ -369,4 +370,118 @@ func idRange(n int64) []any {
 		ids[i] = i
 	}
 	return ids
+}
+
+// TestDB_AfterConnectLockTimeout — хук LockTimeout (T-192): сессия пула
+// видит потолок lock_timeout (SHOW), а операция, ждущая строку дольше
+// потолка, получает SQLSTATE 55P03 (lock_not_available) — ошибку сервера,
+// а не таймаут контекста; после освобождения строки тот же оператор
+// проходит штатно. Потолок тестового хука 1 с (DefaultLockTimeout —
+// юнит-тест): сценарий быстрый, семантика та же.
+func TestDB_AfterConnectLockTimeout(t *testing.T) {
+	skipUnlessIntegration(t)
+	// Контекст шире потолка (1 с): 55P03 обязан прийти от сервера,
+	// а не от отмены контекста.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	schema := fmt.Sprintf("db_locktimeout_%d_%d", os.Getpid(), time.Now().UnixNano()%1_000_000)
+	// base — держатель строки и DDL: search_path сразу в DSN (схема
+	// создаётся ниже по полному имени — GUC не валидируется при коннекте),
+	// иначе затравка и держатель работали бы с public.
+	base, err := pgxpool.New(ctx, pgDSN(t)+"&search_path="+schema)
+	if err != nil {
+		t.Fatalf("подключение к PostgreSQL: %v", err)
+	}
+	if _, err := base.Exec(ctx, "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
+		t.Fatalf("drop schema: %v", err)
+	}
+	if _, err := base.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	const table = `CREATE TABLE %s.items (
+		zone_id smallint NOT NULL,
+		id      bigint  NOT NULL,
+		PRIMARY KEY (zone_id, id))`
+	if _, err := base.Exec(ctx, fmt.Sprintf(table, schema)); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Держатель строки и пул-жертва; cleanup закрывает всё живое.
+	var pool *pgxpool.Pool
+	var holder *pgxpool.Conn
+	t.Cleanup(func() {
+		if pool != nil {
+			pool.Close()
+		}
+		if holder != nil {
+			_, _ = holder.Exec(context.Background(), "ROLLBACK")
+			holder.Release()
+		}
+		if _, err := base.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
+			t.Errorf("очистка схемы %s: %v", schema, err)
+		}
+		base.Close()
+	})
+
+	// Пул с хуком — как у write-сервисов (T-192): db.Open прогоняет
+	// AfterConnect уже на проверочном Ping.
+	pool, err = db.Open(ctx, db.Options{
+		DSN:          pgDSN(t) + "&search_path=" + schema,
+		PoolSize:     1,
+		AfterConnect: db.LockTimeout(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("db.Open с AfterConnect LockTimeout: %v", err)
+	}
+
+	// Затравка: закоммиченная строка — конфликт идёт за неё (лок
+	// закоммиченной строки держателем; незакоммиченный INSERT жертва
+	// под READ COMMITTED просто не видит — конфликта нет).
+	if _, err := base.Exec(ctx, "INSERT INTO items (zone_id, id) VALUES (1, 1)"); err != nil {
+		t.Fatalf("затравка: вставка строки: %v", err)
+	}
+
+	// Держатель строки — вторая сессия с открытой транзакцией
+	// (BEGIN + SELECT FOR UPDATE закоммиченной строки): жертва ждёт
+	// ShareLock on transaction — тот же класс ожидания, что в конвое
+	// 25.10 (записи №2/№6 журнала медленных).
+	holder, err = base.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("соединение держателя: %v", err)
+	}
+	if _, err := holder.Exec(ctx, "BEGIN"); err != nil {
+		t.Fatalf("держатель: BEGIN: %v", err)
+	}
+	if _, err := holder.Exec(ctx, "SELECT zone_id FROM items WHERE zone_id = 1 AND id = 1 FOR UPDATE"); err != nil {
+		t.Fatalf("держатель: захват строки: %v", err)
+	}
+
+	// Сессия пула видит потолок хука (1000ms → «1s»).
+	var lt string
+	if err := pool.QueryRow(ctx, "SHOW lock_timeout").Scan(&lt); err != nil {
+		t.Fatalf("SHOW lock_timeout: %v", err)
+	}
+	if lt != "1s" {
+		t.Errorf("lock_timeout сессии пула = %q, want 1s (AfterConnect-хук)", lt)
+	}
+
+	// Жертва: SELECT FOR UPDATE ждёт строку держателя дольше потолка.
+	_, err = pool.Exec(ctx, "SELECT zone_id FROM items WHERE zone_id = 1 AND id = 1 FOR UPDATE")
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("ошибка ожидания строки = %v, want SQLSTATE 55P03 (lock_not_available)", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("контекст истёк раньше потолка lock_timeout: ошибка не от сервера")
+	}
+
+	// Освобождение строки (откат держателя) — тот же оператор проходит
+	// без ошибки: потолок режет только ожидание, штатный путь цел.
+	if _, err := holder.Exec(ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("держатель: ROLLBACK: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "SELECT zone_id FROM items WHERE zone_id = 1 AND id = 1 FOR UPDATE"); err != nil {
+		t.Fatalf("после освобождения строки: %v", err)
+	}
 }
