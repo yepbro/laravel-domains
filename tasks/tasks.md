@@ -1005,7 +1005,7 @@ lag 0) был фантомным: анализатор успевает за п�
 [`task_one_load_report_queue_backlog.md`](./task_one_load_report_queue_backlog.md),
 [`task_four_topcpu_ticks_underflow.md`](./task_four_topcpu_ticks_underflow.md).
 
-- **T-188** [в работе] — P1, строка «📬 Очереди» отчёта нагрузки — бэклог
+- **T-188** [сделана] — P1, строка «📬 Очереди» отчёта нагрузки — бэклог
   групп вместо сырого XLEN (`internal/monitor/load.go`,
   `RedisQueues.Queues`): `min(lag, XLEN) + pending` по всем группам —
   формула та же, что `BackpressureGate.Len` и `RedisStreamGroups`
@@ -1018,7 +1018,7 @@ lag 0) был фантомным: анализатор успевает за п�
   `make test`/`make lint`/`make test-integration` зелёные. ТЗ:
   [`task_one_load_report_queue_backlog.md`](./task_one_load_report_queue_backlog.md).
 
-- **T-189** [новая] — P2, топ-CPU отчёта нагрузки: беззнаковое
+- **T-189** [в работе] — P2, топ-CPU отчёта нагрузки: беззнаковое
   вычитание тиков (`ProcAgg.Ticks uint64`, load.go, дельта окна в
   `LoadReportLoop`) андерфлоуится при рестарте процессов имени между
   проходами — 25.10 «postgres 310613997334638.2я» (18 → 16 процессов,
