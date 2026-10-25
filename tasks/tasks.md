@@ -908,7 +908,7 @@ RequeueRenderPending из накопленного) садится точно в
   [`TZ_slow_retention_drain.md`](./TZ_slow_retention_drain.md);
   зависимости — T-171 (индекс), T-175 (опционально).
 
-- **T-186** [в работе] — P2, хвост ревью T-181 (P1 deepseek, раунд 1) —
+- **T-186** [сделана] — P2, хвост ревью T-181 (P1 deepseek, раунд 1) —
   снятие бита render_pending при удалении домена: биты-«сироты»
   удалённых с флагом держат `crawler_counters['render_pending']` > 0
   вечно — guard T-181 не спит, renderSelectPending гоняет полный
@@ -1005,7 +1005,7 @@ lag 0) был фантомным: анализатор успевает за п�
 [`task_one_load_report_queue_backlog.md`](./task_one_load_report_queue_backlog.md),
 [`task_four_topcpu_ticks_underflow.md`](./task_four_topcpu_ticks_underflow.md).
 
-- **T-188** [новая] — P1, строка «📬 Очереди» отчёта нагрузки — бэклог
+- **T-188** [в работе] — P1, строка «📬 Очереди» отчёта нагрузки — бэклог
   групп вместо сырого XLEN (`internal/monitor/load.go`,
   `RedisQueues.Queues`): `min(lag, XLEN) + pending` по всем группам —
   формула та же, что `BackpressureGate.Len` и `RedisStreamGroups`
