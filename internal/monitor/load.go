@@ -14,6 +14,8 @@
 //     /proc агрегируются по имени (comm) — 12 рендереров Chromium видны
 //     одной строкой «headless-shell», бэкенды PostgreSQL — «postgres»;
 //     CPU за окно — дельтой между проходами, в долях ядра (1.0 = ядро);
+//     имя, чьи процессы рестартовали за окно (сумма тиков упала),
+//     пропускается до следующего окна — тики имени немонотонны (T-189);
 //   - диск: statfs каталогов отчёта (контент-каталог — главный потребитель
 //     тома; SpaceChecker алертов disk_free_*, alerts.go);
 //   - очереди: глубина рабочих стримов — бэклог групп потребления
@@ -667,13 +669,20 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 
 		// Топ процессов: доли ядра — дельта тиков имени к дельте одного
 		// ядра (delta_total/cores); сумма по именам ≈ busy × ядра.
+		// Рестарт/исчез процессов имени за окно (бой 25.10: postgres
+		// 18 → 16 процессов) роняет сумму тиков имени — вычитание
+		// uint64 андерфлоуится к ~2⁶⁴ и даёт мусорные «10¹⁴ ядер»:
+		// немонотонное имя честно пропускается за окно (ни нуля, ни
+		// мусора; новые имена идут с полной суммой — их тики начаты
+		// внутри окна).
 		procCPU := make(map[string]float64, len(st.Procs))
 		if d := st.CPU.Total - prev.cpu.Total; prev.started && d > 0 {
 			if perCore := float64(d) / float64(st.CPU.Cores); perCore > 0 {
 				for name, agg := range st.Procs {
-					if dt := agg.Ticks - prev.ticks[name]; dt > 0 {
-						procCPU[name] = float64(dt) / perCore
+					if agg.Ticks <= prev.ticks[name] {
+						continue // рестарт/исчез процессов имени: окно пропущено
 					}
+					procCPU[name] = float64(agg.Ticks-prev.ticks[name]) / perCore
 				}
 			}
 		}

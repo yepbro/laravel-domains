@@ -1,10 +1,12 @@
 // Юнит-тесты отчёта системной нагрузки (T-173): разбор /proc-файлов
 // (loadavg, stat, meminfo, строки процессов, PSI some/full), дельты
 // утилизации CPU и тиков процессов, топы, формат отчёта (секции,
-// «н/д»-деградация), источник OSLoad на каталоге фикстур, цикл одним
-// проходом на фейках; источник очередей RedisQueues — бэклог групп
-// потребления на фейке redisGroupsCmd (T-188). Живые /proc и Redis —
-// вне юнит-тестов (герметичность, стиль psi_test.go).
+// «н/д»-деградация), источник OSLoad на каталоге фикстур, цикл на
+// фейках одним-двумя проходами (рестарт имени между проходами — окно
+// топа CPU пропускается без мусора андерфлоу, T-189); источник очередей
+// RedisQueues — бэклог групп потребления на фейке redisGroupsCmd
+// (T-188). Живые /proc и Redis — вне юнит-тестов (герметичность,
+// стиль psi_test.go).
 package monitor
 
 import (
@@ -12,6 +14,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -268,6 +271,111 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 			t.Errorf("отчёт не содержит %q:\n%s", want, r)
 		}
 	}
+}
+
+// TestLoadReportLoop_ProcRestart — рестарт процессов имени между
+// проходами (T-189, бой 25.10: postgres 18 → 16 процессов — сумма тиков
+// имени упала): uint64-вычитание меньшей суммы из большей андерфлоуится
+// к ~2⁶⁴ и после деления на perCore печатает мусорные «10¹⁴ ядер»
+// («postgres 310613997334638.2я»). Немонотонное имя пропускается за
+// окно — честное отсутствие, не ноль и не мусор; прочие имена корректны,
+// топ памяти рестартованного имени жив (имя не исчезает из отчёта).
+func TestLoadReportLoop_ProcRestart(t *testing.T) {
+	// Окно 40 000 тиков на 4 ядрах → perCore 10 000. База: postgres
+	// 100 000 тиков; второй проход: postgres рестартован (сумма упала
+	// до 1 000), headless-shell и render-worker монотонно растут.
+	base := LoadStat{
+		Load1: 4, Load5: 4, Load15: 4,
+		CPU:      CPUStat{Total: 1_000_000, Cores: 4},
+		MemTotal: 8 << 30, MemAvailable: 4 << 30,
+		Procs: map[string]ProcAgg{
+			"postgres":       {Ticks: 100_000, RSS: 2 << 30, Count: 18},
+			"headless-shell": {Ticks: 50_000, RSS: 1 << 30, Count: 2},
+			"render-worker":  {Ticks: 20_000},
+		},
+	}
+	cur := LoadStat{
+		Load1: 4, Load5: 4, Load15: 4,
+		CPU:      CPUStat{Total: 1_040_000, Cores: 4},
+		MemTotal: 8 << 30, MemAvailable: 4 << 30,
+		Procs: map[string]ProcAgg{
+			"postgres":       {Ticks: 1_000, RSS: 2 << 30, Count: 16},
+			"headless-shell": {Ticks: 60_000, RSS: 1 << 30, Count: 2},
+			"render-worker":  {Ticks: 21_000},
+			// Новое имя окна: в базе его не было — полная сумма тиков
+			// и есть дельта (тики начаты внутри окна), 5 000/10 000.
+			"cron": {Ticks: 5_000},
+		},
+	}
+	src := &fakeLoadSource{states: []LoadStat{base, cur}}
+	reports := make(chan string, 8) // буфер: хвостовые проходы до отмены
+	opts := LoadReportOptions{
+		Interval: 20 * time.Millisecond,
+		Notify:   func(text string) { reports <- text },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- LoadReportLoop(ctx, src, opts) }()
+
+	recv := func(step string) string {
+		select {
+		case r := <-reports:
+			return r
+		case <-time.After(5 * time.Second):
+			t.Fatalf("проход %s: отчёт не пришёл", step)
+		}
+		return ""
+	}
+	if r := recv("базовый"); !strings.Contains(r, "🧮 Топ CPU: н/д") {
+		t.Errorf("база: топ CPU не «н/д» (дельты нет):\n%s", r)
+	}
+	r := recv("окно")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("цикл: %v", err)
+	}
+
+	// Рестартованное имя пропущено, прочие корректны: headless-shell
+	// 10 000/10 000 = 1.0я; новое имя cron — 5 000/10 000 = 0.5я
+	// (полная сумма: в базе его не было); render-worker 1 000/10 000 = 0.1я.
+	if want := "🧮 Топ CPU: headless-shell 1.0я, cron 0.5я, render-worker 0.1я"; !strings.Contains(r, want) {
+		t.Errorf("топ CPU = %q, хочу %q:\n%s", topCPULine(r), want, r)
+	}
+	// Топ памяти имени жив — рестарт лечит только дельту CPU.
+	if want := "postgres 2.0ГиБ (16 пр.)"; !strings.Contains(r, want) {
+		t.Errorf("postgres исчез из топа памяти (должен остаться):\n%s", r)
+	}
+
+	// Мусорных значений нет: доля имени ограничена ядрами сверху (сумма
+	// тиков всех имён ≤ тиков системы), всё выше — андерфлоу; порог
+	// ядра × 8 — запас на счётные аномалии, мусор симптома ~10¹⁴.
+	for _, item := range strings.Split(strings.TrimPrefix(topCPULine(r), "🧮 Топ CPU: "), ", ") {
+		name, v, ok := strings.Cut(item, " ")
+		if !ok {
+			t.Fatalf("строка топа не разбирается: %q", item)
+		}
+		share, err := strconv.ParseFloat(strings.TrimSuffix(v, "я"), 64)
+		if err != nil {
+			t.Fatalf("доля топа %q не число: %v", v, err)
+		}
+		if name == "postgres" {
+			t.Errorf("рестартованное имя в топе: %s %.1fя:\n%s", name, share, r)
+		}
+		if share > 4*8 {
+			t.Errorf("мусорная доля топа (андерфлоу): %s %.1fя:\n%s", name, share, r)
+		}
+	}
+}
+
+// topCPULine — строка «🧮 Топ CPU: …» отчёта (пусто — нет).
+func topCPULine(report string) string {
+	for _, line := range strings.Split(report, "\n") {
+		if strings.HasPrefix(line, "🧮 Топ CPU: ") {
+			return line
+		}
+	}
+	return ""
 }
 
 func TestFormatLoadReport_Deltas(t *testing.T) {
