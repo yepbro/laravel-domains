@@ -1,12 +1,16 @@
 // Юнит-тесты переанализа (T-074, ТЗ 5.8 «Переанализ», §11.4 п. 4) на
 // фейковых пуле/очереди/источнике правил — без БД, Redis и файловой
-// системы. Проверяются точный SQL-текст и параметры выборки (IS DISTINCT
-// FROM, охрана deleted §13.1, фильтр зоны, курсор пачки, LIMIT),
+// системы. Проверяются точный SQL-текст и параметры выборок обеих форм
+// (PK-форма дренажа: IS DISTINCT FROM, охрана deleted §13.1, фильтр
+// зоны, курсор пачки, LIMIT; время-форма тика T-193: композитный курсор
+// (checked_at, PK), ORDER BY по тому же ключу, якорь now−lookback),
 // живая семантика фильтров фейка, пачечность дренажа без повторов,
-// пустое множество, идемпотентность повторного прохода, ошибки и отмена
-// ctx, цикл (стартовый дренаж, Warn с продолжением, внеочередной проход
-// по смене правил, чистый выход). Поведение против живых
-// PostgreSQL/Redis — интеграционные тесты этапа 7.
+// курсор тика между проходами (продвижение пачкой, пустая пачка не
+// двигает), пустое множество, идемпотентность повторного прохода,
+// ошибки и отмена ctx, цикл (стартовый дренаж PK-формой, Warn с
+// продолжением, тиковый проход время-формой по свежему срезу,
+// внеочередной дренаж по смене правил, чистый выход). Поведение против живых PostgreSQL/Redis —
+// интеграционные тесты этапа 7 (test/integration/reanalyze_test.go).
 package analyzer
 
 import (
@@ -112,11 +116,13 @@ type reanDomain struct {
 	status model.Status
 }
 
-// reanRow — строка subdomain_results: ключ и rules_version (nil — NULL,
-// никогда не анализировалась).
+// reanRow — строка subdomain_results: ключ, rules_version (nil — NULL,
+// никогда не анализировалась) и checked_at (нулевая — только для строк
+// PK-формы; время-форма сеет через seedRowAt).
 type reanRow struct {
-	key     resultKey
-	version *int32
+	key       resultKey
+	version   *int32
+	checkedAt time.Time
 }
 
 // reanPool — db.DB без БД: живая семантика выборки переанализа (JOIN
@@ -161,6 +167,19 @@ func (p *reanPool) seedDomain(zone int16, id int64, label string, status model.S
 
 func (p *reanPool) seedRow(zone int16, domain int64, sub int16, variant model.Variant, version *int32) {
 	p.rows = append(p.rows, reanRow{key: resultKey{zone: zone, domain: domain, sub: sub, variant: variant}, version: version})
+}
+
+// seedRowAt — строка с отметкой checked_at (время-форма, T-193): курсор
+// и порядок тика идут по (checked_at, PK). Под замком: тесты цикла
+// подсевают свежие эпизоды в работающую горутину (loop-тесты T-193).
+func (p *reanPool) seedRowAt(zone int16, domain int64, sub int16, variant model.Variant, version *int32, at time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rows = append(p.rows, reanRow{
+		key:       resultKey{zone: zone, domain: domain, sub: sub, variant: variant},
+		version:   version,
+		checkedAt: at,
+	})
 }
 
 // markAnalyzed имитирует воркер T-071: все строки получают текущую
@@ -213,6 +232,8 @@ func (p *reanPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	switch sql {
 	case reanalyzeSelectSQL:
 		return p.selectRows(args)
+	case reanalyzeTickSQL:
+		return p.tickSelectRows(args)
 	case zoneIDByNameSQL:
 		if len(args) != 1 {
 			return nil, fmt.Errorf("reanPool: зона по имени: параметров %d, нужно 1", len(args))
@@ -321,6 +342,103 @@ func reanKeyGreater(a, b resultKey) bool {
 	}
 }
 
+// reanCursorGreater — row-value сравнение курсора время-формы «>» по
+// (checked_at, PK), как (t, a,b,c,d) > (u, w,x,y,z) в PostgreSQL:
+// время ведёт, PK детерминирует внутри одинаковых отметок.
+func reanCursorGreater(r reanRow, after ReanalyzeCursor) bool {
+	if !r.checkedAt.Equal(after.checkedAt) {
+		return r.checkedAt.After(after.checkedAt)
+	}
+	return reanKeyGreater(r.key, after.key)
+}
+
+// tickSelectRows применяет семантику reanalyzeTickSQL к сидам (T-193):
+// тот же отбор, что PK-форма, но курсор и порядок — по (checked_at, PK).
+func (p *reanPool) tickSelectRows(args []any) (pgx.Rows, error) {
+	if len(args) != 9 {
+		return nil, fmt.Errorf("reanPool: выборка тика: параметров %d, нужно 9", len(args))
+	}
+	version, okV := args[0].(int32)
+	deleted, okD := args[1].(int16)
+	if !okV || !okD {
+		return nil, fmt.Errorf("reanPool: выборка тика: версия %T (%v), статус %T (%v)", args[0], args[0], args[1], args[1])
+	}
+	if deleted != int16(model.StatusDeleted) {
+		return nil, fmt.Errorf("reanPool: выборка тика: статус-охрана %d, нужен код deleted %d (§13.1)",
+			deleted, model.StatusDeleted)
+	}
+	var zone *int16
+	if z, ok := args[2].(int16); ok {
+		zone = &z
+	} else if args[2] != nil {
+		return nil, fmt.Errorf("reanPool: выборка тика: зона %T (%v), нужен int16 или nil", args[2], args[2])
+	}
+	afterAt, okT := args[3].(time.Time)
+	cz, ok1 := args[4].(int16)
+	cd, ok2 := args[5].(int64)
+	cs, ok3 := args[6].(int16)
+	cv, ok4 := args[7].(int16)
+	limit, ok5 := args[8].(int)
+	if !okT || !ok1 || !ok2 || !ok3 || !ok4 || !ok5 {
+		return nil, fmt.Errorf("reanPool: выборка тика: курсор/LIMIT %v", args[3:])
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("reanPool: выборка тика: LIMIT %d ≤ 0", limit)
+	}
+	after := ReanalyzeCursor{
+		checkedAt: afterAt,
+		key:       resultKey{zone: cz, domain: cd, sub: cs, variant: model.Variant(cv)},
+	}
+
+	var sel []reanRow
+	for _, r := range p.rows {
+		d, ok := p.domains[reanDomKey{zone: r.key.zone, id: r.key.domain}]
+		if !ok {
+			continue // JOIN domains: строки без домена не выбираются
+		}
+		if d.status == model.StatusDeleted {
+			continue // §13.1
+		}
+		if r.version != nil && *r.version == version {
+			continue // rules_version = текущей — актуальна
+		}
+		if zone != nil && r.key.zone != *zone {
+			continue // фильтр зоны
+		}
+		if !reanCursorGreater(r, after) {
+			continue // композитный курсор (checked_at, PK)
+		}
+		sel = append(sel, r)
+	}
+	// ORDER BY checked_at, zone_id, domain_id, subdomain_id, variant
+	// (пузырёк: пачки маленькие) + LIMIT.
+	for i := 0; i < len(sel); i++ {
+		for j := i + 1; j < len(sel); j++ {
+			gt := false
+			if !sel[i].checkedAt.Equal(sel[j].checkedAt) {
+				gt = sel[i].checkedAt.After(sel[j].checkedAt)
+			} else {
+				gt = reanKeyGreater(sel[i].key, sel[j].key)
+			}
+			if gt {
+				sel[i], sel[j] = sel[j], sel[i]
+			}
+		}
+	}
+	if len(sel) > limit {
+		sel = sel[:limit]
+	}
+	rows := make([][]any, len(sel))
+	for i, r := range sel {
+		d := p.domains[reanDomKey{zone: r.key.zone, id: r.key.domain}]
+		rows[i] = []any{r.key.zone, r.key.domain, r.key.sub, int16(r.key.variant),
+			d.label + "." + p.zones[r.key.zone], r.checkedAt}
+	}
+	out := reanRowsOf(rows...)
+	out.scanErr, out.err = p.selectScanErr, p.selectRowsErr
+	return out, nil
+}
+
 // reanRows — pgx.Rows с заготовленными строками (Scan — позиционный,
 // типы int16/int64/string); scanErr/err — инъекции сбоев Scan/Err (T-M10).
 type reanRows struct {
@@ -369,6 +487,8 @@ func (r *reanRows) Scan(dest ...any) error {
 			*dst = v.(int64)
 		case *string:
 			*dst = v.(string)
+		case *time.Time:
+			*dst = v.(time.Time)
 		default:
 			return fmt.Errorf("reanRows: приёмник %T не поддерживается", d)
 		}
@@ -444,6 +564,20 @@ const wantReanalyzeSelect = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.va
 	"AND (r.zone_id, r.domain_id, r.subdomain_id, r.variant) > ($4::int2, $5::int8, $6::int2, $7::int2) " +
 	"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 	"LIMIT $8"
+
+// wantReanalyzeTickSQL — контракт время-формы (T-193 §4.1): тот же
+// отбор, композитный курсор (checked_at, PK) + ORDER BY по тому же
+// ключу + LIMIT; checked_at в списке колонок — курсор следующей пачки.
+const wantReanalyzeTickSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, d.label || '.' || z.name, r.checked_at " +
+	"FROM subdomain_results AS r " +
+	"JOIN domains AS d ON d.zone_id = r.zone_id AND d.id = r.domain_id " +
+	"JOIN zones AS z ON z.id = r.zone_id " +
+	"WHERE r.rules_version IS DISTINCT FROM $1::int4 " +
+	"AND d.status <> $2::int2 " +
+	"AND ($3::int2 IS NULL OR r.zone_id = $3) " +
+	"AND (r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant) > ($4::timestamptz, $5::int2, $6::int8, $7::int2, $8::int2) " +
+	"ORDER BY r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
+	"LIMIT $9"
 
 const wantZoneIDByName = "SELECT id FROM zones WHERE name = $1"
 
@@ -720,6 +854,267 @@ func TestReanalyzeIdempotent(t *testing.T) {
 	}
 }
 
+// --- ReanalyzeTick (время-форма, T-193) -----------------------------------
+
+// TestReanalyzeTickSQL — SQL-контракт время-формы и якорь старта: точный
+// текст (композитный курсор (checked_at, PK), ORDER BY по тому же ключу,
+// LIMIT, checked_at в колонках), первая выборка нулевого курсора идёт с
+// якоря now() − DefaultReanalyzeLookback с нулевой PK-частью (§4.2);
+// публикация — Result с ключом и именем в q:analyze.
+func TestReanalyzeTickSQL(t *testing.T) {
+	pool := newReanPool()
+	pool.seedZone(3, "crawl.test")
+	pool.seedDomain(3, 7, "example", model.StatusAlive)
+	before := time.Now().Add(-DefaultReanalyzeLookback)
+	pool.seedRowAt(3, 7, 0, model.VariantHTTP, nil, time.Now().Add(-time.Minute)) // NULL + свежая
+	q := &reanQueue{}
+
+	res, err := ReanalyzeTick(context.Background(), pool, q, int32(42), &ReanalyzeCursor{}, ReanalyzeOptions{BatchSize: 100})
+	if err != nil {
+		t.Fatalf("ReanalyzeTick: %v", err)
+	}
+
+	calls := pool.calls()
+	if len(calls) != 1 { // одна пачка (1 < 100) — короткая, стоп
+		t.Fatalf("выборок = %d, want 1", len(calls))
+	}
+	if calls[0].sql != wantReanalyzeTickSQL {
+		t.Errorf("SQL выборки тика:\n%s\nwant:\n%s", calls[0].sql, wantReanalyzeTickSQL)
+	}
+	if reanalyzeTickSQL != wantReanalyzeTickSQL {
+		t.Errorf("константа разошлась с контрактом теста")
+	}
+	args := calls[0].args
+	if args[0] != int32(42) || args[1] != int16(model.StatusDeleted) || args[2] != nil {
+		t.Errorf("аргументы отбора = %#v, want версия 42, deleted, зона nil", args[:3])
+	}
+	anchor, ok := args[3].(time.Time)
+	if !ok {
+		t.Fatalf("курсор времени = %T (%v), нужен time.Time", args[3], args[3])
+	}
+	// Якорь = now − lookback (допуск минуты на медленный тест).
+	if d := anchor.Sub(before); d < -time.Minute || d > time.Minute {
+		t.Errorf("якорь = %v, want now − %v (±1 мин, расхождение %v)",
+			anchor, DefaultReanalyzeLookback, d)
+	}
+	if args[4] != int16(0) || args[5] != int64(0) || args[6] != int16(0) || args[7] != int16(0) {
+		t.Errorf("PK-часть якоря = %v, want нули", args[4:8])
+	}
+	if args[8] != 100 {
+		t.Errorf("LIMIT = %v, want 100", args[8])
+	}
+
+	if res.Selected != 1 || res.Published != 1 {
+		t.Fatalf("итог = %+v, want 1/1", res)
+	}
+	pubs := q.snapshot()
+	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
+		t.Fatalf("публикации = %+v, want одна в q:analyze", pubs)
+	}
+	if want := (queue.Result{
+		ZoneID: 3, DomainID: 7, SubdomainID: 0,
+		Variant: model.VariantHTTP, Name: "example.crawl.test",
+	}); pubs[0].msg != want {
+		t.Errorf("публикация = %+v, want %+v", pubs[0].msg, want)
+	}
+}
+
+// TestReanalyzeTickAnchorWindow — якорь ограничивает окно: старше
+// lookback не отбирается (территория полного дренажа), свежие NULL и
+// устаревшие внутри окна — отбираются; проанализированная текущей
+// версией — нет.
+func TestReanalyzeTickAnchorWindow(t *testing.T) {
+	pool := newReanPool()
+	pool.seedZone(1, "test")
+	pool.seedDomain(1, 1, "fresh", model.StatusAlive)
+	pool.seedDomain(1, 2, "stale", model.StatusAlive)
+	pool.seedDomain(1, 3, "done", model.StatusAlive)
+	pool.seedDomain(1, 4, "ancient", model.StatusAlive)
+	now := time.Now()
+	pool.seedRowAt(1, 1, 0, model.VariantMain, nil, now.Add(-time.Hour))                               // новый эпизод без анализа
+	pool.seedRowAt(1, 2, 0, model.VariantMain, reanV(7), now.Add(-2*time.Hour))                        // устаревшая внутри окна
+	pool.seedRowAt(1, 3, 0, model.VariantMain, reanV(42), now.Add(-time.Minute))                       // актуальная
+	pool.seedRowAt(1, 4, 0, model.VariantMain, reanV(7), now.Add(-DefaultReanalyzeLookback-time.Hour)) // вне окна
+	q := &reanQueue{}
+
+	res, err := ReanalyzeTick(context.Background(), pool, q, 42, &ReanalyzeCursor{}, ReanalyzeOptions{})
+	if err != nil {
+		t.Fatalf("ReanalyzeTick: %v", err)
+	}
+	if res.Selected != 2 || res.Published != 2 {
+		t.Fatalf("итог = %+v, want 2/2 (NULL + устаревшая в окне)", res)
+	}
+	// Порядок пачки — по (checked_at, PK): устаревшая (2 ч) впереди
+	// свежей (1 ч).
+	for i, want := range []string{"stale.test", "fresh.test"} {
+		if got := q.snapshot()[i].msg.Name; got != want {
+			t.Errorf("публикация[%d] = %s, want %s", i, got, want)
+		}
+	}
+}
+
+// TestReanalyzeTickCursor — курсор живёт между проходами и продвигается
+// пачкой: 5 строк пачками по 2 (2+2+1), курсор каждой выборки — последняя
+// строка предыдущей (время ведёт, PK детерминирует внутри отметки);
+// повторный тик по исчерпанному окну — одна пустая выборка тем же
+// курсором (пустая пачка не двигает).
+func TestReanalyzeTickCursor(t *testing.T) {
+	pool := newReanPool()
+	pool.seedZone(1, "test")
+	base := time.Now().Add(-time.Hour)
+	for i := int64(1); i <= 5; i++ {
+		pool.seedDomain(1, i, fmt.Sprintf("d%d", i), model.StatusAlive)
+		// Одинаковая отметка у d1/d2 — PK детерминирует порядок внутри.
+		at := base.Add(time.Duration(i) * time.Minute)
+		if i == 2 {
+			at = base.Add(time.Duration(1) * time.Minute)
+		}
+		pool.seedRowAt(1, i, 0, model.VariantMain, nil, at)
+	}
+	q := &reanQueue{}
+	var cur ReanalyzeCursor
+
+	res, err := ReanalyzeTick(context.Background(), pool, q, 1, &cur, ReanalyzeOptions{BatchSize: 2})
+	if err != nil {
+		t.Fatalf("ReanalyzeTick: %v", err)
+	}
+	if res.Selected != 5 || res.Published != 5 {
+		t.Fatalf("итог = %+v, want 5/5", res)
+	}
+	calls := pool.calls()
+	if len(calls) != 3 { // 2 + 2 + 1 (короткая — стоп)
+		t.Fatalf("выборок = %d, want 3", len(calls))
+	}
+	// Курсор 2-й пачки — последняя строка 1-й (d2, отметка base+1м),
+	// 3-й — последняя 2-й (d4).
+	if gotAt, _ := calls[1].args[3].(time.Time); !gotAt.Equal(base.Add(time.Minute)) {
+		t.Errorf("курсор 2-й пачки checked_at = %v, want %v", gotAt, base.Add(time.Minute))
+	}
+	if calls[1].args[5] != int64(2) {
+		t.Errorf("курсор 2-й пачки domain = %v, want 2", calls[1].args[5])
+	}
+	if gotAt, _ := calls[2].args[3].(time.Time); !gotAt.Equal(base.Add(4 * time.Minute)) {
+		t.Errorf("курсор 3-й пачки checked_at = %v, want %v", gotAt, base.Add(4*time.Minute))
+	}
+	if calls[2].args[5] != int64(4) {
+		t.Errorf("курсор 3-й пачки domain = %v, want 4", calls[2].args[5])
+	}
+	// Курсор после прохода — последняя строка последней пачки.
+	if !cur.checkedAt.Equal(base.Add(5*time.Minute)) || cur.key.domain != 5 {
+		t.Errorf("курсор после прохода = %v/%d, want %v/5",
+			cur.checkedAt, cur.key.domain, base.Add(5*time.Minute))
+	}
+
+	// Повторный тик: окно исчерпано — одна пустая выборка курсором
+	// последней строки (пустая пачка не двигает).
+	res2, err := ReanalyzeTick(context.Background(), pool, q, 1, &cur, ReanalyzeOptions{BatchSize: 2})
+	if err != nil {
+		t.Fatalf("повторный ReanalyzeTick: %v", err)
+	}
+	if res2 != (ReanalyzeResult{}) {
+		t.Errorf("повторный тик = %+v, want нулевой (окно исчерпано)", res2)
+	}
+	calls2 := pool.calls()[3:]
+	if len(calls2) != 1 {
+		t.Fatalf("выборок повторного тика = %d, want 1", len(calls2))
+	}
+	if gotAt, _ := calls2[0].args[3].(time.Time); !gotAt.Equal(base.Add(5 * time.Minute)) {
+		t.Errorf("курсор пустого тика checked_at = %v, want прежний %v",
+			gotAt, base.Add(5*time.Minute))
+	}
+	if calls2[0].args[5] != int64(5) {
+		t.Errorf("курсор пустого тика domain = %v, want 5", calls2[0].args[5])
+	}
+	// Новая строка впереди курсора — следующий тик подберёт.
+	pool.seedDomain(1, 6, "d6", model.StatusAlive)
+	pool.seedRowAt(1, 6, 0, model.VariantMain, nil, base.Add(time.Hour))
+	res3, err := ReanalyzeTick(context.Background(), pool, q, 1, &cur, ReanalyzeOptions{BatchSize: 2})
+	if err != nil {
+		t.Fatalf("тик после свежей строки: %v", err)
+	}
+	if res3.Selected != 1 || res3.Published != 1 {
+		t.Fatalf("итог = %+v, want 1/1 (свежий эпизод впереди курсора)", res3)
+	}
+	if msg := q.snapshot()[5].msg; msg.DomainID != 6 {
+		t.Errorf("публикация свежего эпизода = %+v, want домен 6", msg)
+	}
+}
+
+// TestReanalyzeTickPublishError — сбой публикации посреди пачки не
+// двигает курсор за сбойную пачку: повторный тик выбирает её строки
+// снова (at-least-once, дубликат ограничен пачкой).
+func TestReanalyzeTickPublishError(t *testing.T) {
+	pool := newReanPool()
+	pool.seedZone(1, "test")
+	base := time.Now().Add(-time.Hour)
+	for i := int64(1); i <= 3; i++ {
+		pool.seedDomain(1, i, fmt.Sprintf("d%d", i), model.StatusAlive)
+		pool.seedRowAt(1, i, 0, model.VariantMain, nil, base.Add(time.Duration(i)*time.Minute))
+	}
+	var cur ReanalyzeCursor
+	res, err := ReanalyzeTick(context.Background(), pool,
+		&reanQueue{errs: []error{nil, errors.New("redis ушёл")}}, 1, &cur, ReanalyzeOptions{BatchSize: 3})
+	if err == nil || !strings.Contains(err.Error(), "redis ушёл") {
+		t.Fatalf("ошибка = %v, want причину публикации", err)
+	}
+	if res.Selected != 3 || res.Published != 1 {
+		t.Errorf("итог = %+v, want 3/1 (до сбоя)", res)
+	}
+	// Курсор не продвинулся: первая пачка не опубликована целиком.
+	anchor := time.Now().Add(-DefaultReanalyzeLookback)
+	if d := cur.checkedAt.Sub(anchor); d < -time.Minute || d > time.Minute {
+		t.Errorf("курсор после сбоя публикации = %v, want якорь %v (пачка не продвинута)",
+			cur.checkedAt, anchor)
+	}
+
+	// Повторный тик с тем же курсором выбирает сбойную пачку снова.
+	q2 := &reanQueue{}
+	res2, err := ReanalyzeTick(context.Background(), pool, q2, 1, &cur, ReanalyzeOptions{BatchSize: 3})
+	if err != nil {
+		t.Fatalf("повторный тик: %v", err)
+	}
+	if res2.Selected != 3 || res2.Published != 3 {
+		t.Fatalf("повторный итог = %+v, want 3/3 (пачка повторена)", res2)
+	}
+}
+
+// TestReanalyzeTickCancel — отмена ctx до прохода: чистая ошибка
+// контекста без двойной обёртки (пин текста, стиль TestReanalyzeDrainCancel).
+func TestReanalyzeTickCancel(t *testing.T) {
+	pool := newReanPool()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := ReanalyzeTick(ctx, pool, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("ошибка = %v, want context.Canceled", err)
+	}
+	if err != nil && err.Error() != "analyzer: переанализ: context canceled" {
+		t.Errorf("ошибка = %q, want точная обёртка «analyzer: переанализ: context canceled»", err)
+	}
+	if res.Published != 0 {
+		t.Errorf("итог = %+v, want без публикаций", res)
+	}
+}
+
+// TestReanalyzeTickNilCursor — nil курсор: проход с якоря без сохранения
+// (разовый вызов), panic нет.
+func TestReanalyzeTickNilCursor(t *testing.T) {
+	pool := newReanPool()
+	pool.seedZone(1, "test")
+	pool.seedDomain(1, 1, "a", model.StatusAlive)
+	pool.seedRowAt(1, 1, 0, model.VariantMain, nil, time.Now().Add(-time.Minute))
+	q := &reanQueue{}
+
+	res, err := ReanalyzeTick(context.Background(), pool, q, 1, nil, ReanalyzeOptions{})
+	if err != nil {
+		t.Fatalf("ReanalyzeTick(nil): %v", err)
+	}
+	if res.Selected != 1 || res.Published != 1 {
+		t.Fatalf("итог = %+v, want 1/1", res)
+	}
+}
+
 // --- ошибки и отмена -------------------------------------------------------
 
 // TestReanalyzePublishError — сбой публикации посреди пачки: ошибка
@@ -883,6 +1278,14 @@ func TestReanalyzeNilArgs(t *testing.T) {
 		{"цикл без источника правил", func() error {
 			return ReanalyzeLoop(context.Background(), newReanPool(), &reanQueue{}, nil, ReanalyzeOptions{})
 		}, "источник набора правил не задан"},
+		{"тик без пула", func() error {
+			_, err := ReanalyzeTick(context.Background(), nil, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{})
+			return err
+		}, "пул не задан"},
+		{"тик без очереди", func() error {
+			_, err := ReanalyzeTick(context.Background(), newReanPool(), nil, 1, &ReanalyzeCursor{}, ReanalyzeOptions{})
+			return err
+		}, "очередь не задана"},
 	} {
 		if err := check.call(); err == nil || !strings.Contains(err.Error(), check.want) {
 			t.Errorf("%s: ошибка = %v, want %q", check.name, err, check.want)
@@ -996,16 +1399,17 @@ func reanWait(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// TestReanalyzeLoopImmediateDrain — стартовый дренаж выполняется сразу:
-// устаревшее за простоем публикуется до первого тика. Без Options.Log:
-// nil-логгер обязан заменяться заглушкой — Info «проход переанализа»
-// по публикации дренажа на nil-указателе паниковал бы (мутант вырезания
-// подстановки Discard, T-M10).
+// TestReanalyzeLoopImmediateDrain — стартовый ПОЛНЫЙ дренаж выполняется
+// сразу: устаревшее за простоем (включая сменившиеся за простоем
+// правила) публикуется до первого тика — PK-формой с нулевого курсора
+// (§4.3). Без Options.Log: nil-логгер обязан заменяться заглушкой —
+// Info «проход переанализа» по публикации дренажа на nil-указателе
+// паниковал бы (мутант вырезания подстановки Discard, T-M10).
 func TestReanalyzeLoopImmediateDrain(t *testing.T) {
 	pool := newReanPool()
 	pool.seedZone(1, "test")
 	pool.seedDomain(1, 1, "a", model.StatusAlive)
-	pool.seedRow(1, 1, 0, model.VariantMain, nil)
+	pool.seedRowAt(1, 1, 0, model.VariantMain, nil, time.Now().Add(-time.Minute))
 	q := &reanQueue{}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1021,6 +1425,15 @@ func TestReanalyzeLoopImmediateDrain(t *testing.T) {
 	if n := pool.queryCount(); n != 1 {
 		t.Errorf("выборок = %d, want 1: без тика повторных проходов нет", n)
 	}
+	call := pool.calls()[0]
+	if call.sql != reanalyzeSelectSQL {
+		t.Errorf("SQL стартового прохода — PK-форма дренажа:\n%s\nwant:\n%s",
+			call.sql, reanalyzeSelectSQL)
+	}
+	// Курсор дренажа — нулевой PK (с начала множества).
+	if call.args[3] != int16(0) || call.args[4] != int64(0) {
+		t.Errorf("курсор стартового дренажа = %v, want нулевой PK", call.args[3:5])
+	}
 
 	cancel()
 	if err := <-done; err != nil {
@@ -1028,8 +1441,12 @@ func TestReanalyzeLoopImmediateDrain(t *testing.T) {
 	}
 }
 
-// TestReanalyzeLoopTickAndTrigger — тикер повторяет проход (страховка),
-// смена набора правил — внеочередной дренаж; отмена ctx — чистый nil.
+// TestReanalyzeLoopTickAndTrigger — тикер повторяет проход время-формой
+// (страховка): первый тик заякоренным курсором перепубликует ещё не
+// проштампованные строки в окне (дубликаты in-flight, T-071), курсор
+// проходит их — дальнейшие тики окно не перечитывают; смена набора
+// правил — внеочередной ПОЛНЫЙ дренаж PK-формой с нуля; отмена ctx —
+// чистый nil.
 func TestReanalyzeLoopTickAndTrigger(t *testing.T) {
 	var buf reanBuf
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
@@ -1037,7 +1454,10 @@ func TestReanalyzeLoopTickAndTrigger(t *testing.T) {
 	pool := newReanPool()
 	pool.seedZone(1, "test")
 	pool.seedDomain(1, 1, "a", model.StatusAlive)
-	pool.seedRow(1, 1, 0, model.VariantMain, nil) // остаётся устаревшей: проходы публикуют снова
+	pool.seedDomain(1, 2, "b", model.StatusAlive)
+	// Обе строки — в окне якоря первого тика (NULL-версии, не проштампованы).
+	pool.seedRowAt(1, 1, 0, model.VariantMain, nil, time.Now().Add(-2*time.Hour))
+	pool.seedRowAt(1, 2, 0, model.VariantMain, nil, time.Now().Add(-time.Minute))
 	q := &reanQueue{}
 	src := newReanSource(1)
 
@@ -1051,14 +1471,51 @@ func TestReanalyzeLoopTickAndTrigger(t *testing.T) {
 		})
 	}()
 
-	reanWait(t, "стартовый дренаж", func() bool { return q.count() >= 1 })
-	reanWait(t, "тиковый проход", func() bool { return q.count() >= 2 })
+	// Стартовый дренаж: обе строки published по одному разу.
+	reanWait(t, "стартовый дренаж", func() bool { return q.count() >= 2 })
 
-	src.switchTo(2) // SIGHUP: внеочередной проход с новой версией
+	// Первый тиковый проход время-формой: окно якоря (24 ч) вмещает обе
+	// не проштампованные строки — перепубликация in-flight (at-least-once),
+	// курсор проходит за последнюю (b).
+	reanWait(t, "тиковый проход", func() bool { return q.count() >= 4 })
+	var tickSeen bool
+	for _, c := range pool.calls() {
+		if c.sql == reanalyzeTickSQL {
+			tickSeen = true
+		}
+	}
+	if !tickSeen {
+		t.Errorf("тиковый проход не ходил время-формой (SQL не замечен)")
+	}
+
+	// Дальнейшие тики: обе строки ПОЗАДИ курсора — переизбрания нет
+	// (время-курсор, а не полный круг по версии).
+	reanWait(t, "тиковые выборки после исчерпания окна", func() bool { return pool.queryCount() >= 4 })
+	if n := q.count(); n != 4 {
+		t.Errorf("публикаций после исчерпания окна = %d, want 4 (без переизбрания)", n)
+	}
+
+	src.switchTo(2) // SIGHUP: внеочередной ПОЛНЫЙ дренаж с новой версией
 	reanWait(t, "внеочередной проход по смене правил", func() bool {
 		return strings.Contains(buf.String(), "внеочередной переанализ") &&
 			strings.Contains(buf.String(), "rules_version=2")
 	})
+	// Дренаж — PK-форма с нулевого курсора: обе строки (устаревшие против
+	// версии 2) опубликованы снова.
+	reanWait(t, "публикации дренажа", func() bool { return q.count() >= 6 })
+	drained := false
+	for _, c := range pool.calls() {
+		if c.sql != reanalyzeSelectSQL {
+			continue
+		}
+		drained = true
+		if c.args[3] != int16(0) || c.args[4] != int64(0) {
+			t.Errorf("курсор дренажа = %v, want нулевой PK (форма с нуля)", c.args[3:5])
+		}
+	}
+	if !drained {
+		t.Errorf("среди выборок нет PK-формы: смена правил обязана идти дренажом с нуля")
+	}
 
 	cancel()
 	if err := <-done; err != nil {
@@ -1068,7 +1525,8 @@ func TestReanalyzeLoopTickAndTrigger(t *testing.T) {
 
 // TestReanalyzeLoopErrorSurvives — ошибка прохода (БД недоступна) — Warn,
 // цикл живёт: после восстановления тиковый проход публикует; отмена —
-// чистый nil.
+// чистый nil. Курсор остаётся нулевым (якорь), восстановление — окно
+// lookback, ничего не теряется (§4.2).
 func TestReanalyzeLoopErrorSurvives(t *testing.T) {
 	var buf reanBuf
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
@@ -1076,10 +1534,10 @@ func TestReanalyzeLoopErrorSurvives(t *testing.T) {
 	pool := newReanPool()
 	pool.seedZone(1, "test")
 	pool.seedDomain(1, 1, "a", model.StatusAlive)
-	pool.seedRow(1, 1, 0, model.VariantMain, nil)
+	pool.seedRowAt(1, 1, 0, model.VariantMain, nil, time.Now().Add(-time.Minute))
 	q := &reanQueue{}
 
-	pool.setQueryErr(errors.New("бд недоступна")) // стартовый дренаж падает
+	pool.setQueryErr(errors.New("бд недоступна")) // стартовый проход падает
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1138,7 +1596,7 @@ func TestReanalyzeLoopNilSet(t *testing.T) {
 	pool := newReanPool()
 	pool.seedZone(1, "test")
 	pool.seedDomain(1, 1, "a", model.StatusAlive)
-	pool.seedRow(1, 1, 0, model.VariantMain, nil)
+	pool.seedRowAt(1, 1, 0, model.VariantMain, nil, time.Now().Add(-time.Minute))
 	q := &reanQueue{}
 	src := &reanSource{next: make(chan *rules.Set, 1)} // Set() = nil
 
@@ -1201,7 +1659,7 @@ func TestReanalyzeLoopPassInfo(t *testing.T) {
 		pool := newReanPool()
 		pool.seedZone(1, "test")
 		pool.seedDomain(1, 1, "a", model.StatusAlive)
-		pool.seedRow(1, 1, 0, model.VariantMain, nil)
+		pool.seedRowAt(1, 1, 0, model.VariantMain, nil, time.Now().Add(-time.Minute))
 		q := &reanQueue{}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1248,7 +1706,7 @@ func TestReanalyzeLoopClosedSets(t *testing.T) {
 		})
 	}()
 
-	reanWait(t, "стартовый дренаж", func() bool { return pool.queryCount() >= 1 })
+	reanWait(t, "стартовый проход", func() bool { return pool.queryCount() >= 1 })
 	if !strings.Contains(buf.String(), "цикл переанализа запущен") {
 		t.Errorf("Info запуска не записан:\n%s", buf.String())
 	}
