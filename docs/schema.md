@@ -379,7 +379,11 @@ ingest add/delete; CLI recheck/submodules recheck; http-worker —
 авторитетная реконсиляция monitor — один
 совмещённый проход раз в `monitor.zone_stats_interval`, единственный
 полный проход `domains` в стационаре. Базовое множество всех колонок
-зон — `status <> deleted` (унификация ТЗИ §4.1). Дрейф |старое − новое|
+зон — `status <> deleted` (унификация ТЗИ §4.1). `domains_pending`
+читается и фильтром выборки диспетчера (`> 0`, T-183): семантика
+колонки — предикат самой выборки, дрейф (ручной SQL мимо инкрементов)
+может скрыть зону с работой до ближайшей реконсиляции — наблюдается
+метрикой `crawler_counters_drift`. Дрейф |старое − новое|
 — gauge `crawler_counters_drift` + Warn; восстановление — сам проход
 или `crawlerctl counters recount` (разбор — [`runbooks.md`](runbooks.md)).
 

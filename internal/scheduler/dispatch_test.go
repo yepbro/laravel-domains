@@ -1,7 +1,8 @@
 // Юнит-тесты выборки пачки планировщиком (T-027, ТЗ 5.3) без БД (стиль
 // internal/ingest/apply_add_test.go / zones_test.go): точные SQL-тексты
-// двух запросов (активные зоны, LATERAL-префиксы очередей) и их
-// параметры (массивы зон/keyset-курсоров, квота), круговое слияние с
+// двух запросов (активные зоны с работой — domains_pending > 0, T-183;
+// LATERAL-префиксы очередей) и их параметры (массивы зон/keyset-курсоров,
+// квота — в дозаполнении остаток пачки, T-183), круговое слияние с
 // весами, дозаполнение голодных зон, пустой результат, валидация
 // параметров, ошибки запроса/чтения, отмена ctx. Реальное поведение
 // против живой БД — интеграционные тесты планировщика.
@@ -268,11 +269,60 @@ func TestDispatchBatch_Refill(t *testing.T) {
 	if len(pool.queries) != 3 {
 		t.Fatalf("запросов = %d, want 3 (зоны + очереди + дозаполнение)", len(pool.queries))
 	}
-	// Дозаполнение: зоны только голодные, курсор от последнего id,
-	// квота — остаток пачки (4).
-	wantArgs := []any{[]any{int16(1)}, []any{int64(13)}, 4}
+	// Дозаполнение: только зона 1, после id 13, квота — остаток пачки
+	// (4 − 3 = 1): вклад зоны в пачку не превосходит остатка (T-183).
+	wantArgs := []any{[]any{int16(1)}, []any{int64(13)}, 1}
 	if !reflect.DeepEqual(pool.queries[2].args, wantArgs) {
 		t.Errorf("аргументы дозаполнения = %v, want %v", pool.queries[2].args, wantArgs)
+	}
+}
+
+// TestDispatchBatch_RefillQuotaRemaining — квота раунда дозаполнения —
+// остаток пачки (Limit − набрано), не Limit (T-183): несколько голодных
+// зон, remaining > 1 < Limit — аргумент LATERAL-запроса дозаполнения
+// равен остатку; больше остатка одной зоне недоступно, пачка заполняется.
+func TestDispatchBatch_RefillQuotaRemaining(t *testing.T) {
+	pool := &dispatchPool{results: []*dispatchRows{
+		dispatchZonesResult(
+			zrow(1, "example.com"), zrow(2, "example.net"), zrow(3, "example.org"),
+			zrow(4, "example.dev"), zrow(5, "example.io"), zrow(6, "example.app"),
+		),
+		// Квота ceil(10 × 1 / 6) + 1 = 3: зоны 1 и 2 обрезаны (голодные),
+		// зоны 3–6 отдали всё (пусты).
+		drows(append(drowIDs(1, 11, 12, 13), drowIDs(2, 21, 22, 23)...)),
+		// Дозаполнение: зона 1 исчерпана (2 строки хвоста), зона 2
+		// отдаёт остаток целиком (4 = квота раунда).
+		drows(append(drowIDs(1, 14, 15), drowIDs(2, 24, 25, 26, 27)...)),
+		// Пачка полна (5 + 7 ≥ 10) — третьего раунда нет.
+		dispatchDomainsResult(),
+	}}
+
+	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Круговой порядок весов 1: чередование зон 1 и 2, равные ключи —
+	// меньший zone_id; пачка обрезана по Limit = 10.
+	wantIDs := []int64{11, 21, 12, 22, 13, 23, 14, 24, 15, 25}
+	if len(batch) != len(wantIDs) {
+		t.Fatalf("пачка = %d строк, want %d", len(batch), len(wantIDs))
+	}
+	for i, id := range wantIDs {
+		if batch[i].DomainID != id {
+			t.Fatalf("пачка[%d] = домен %d, want %d (круговой порядок)", i, batch[i].DomainID, id)
+		}
+	}
+
+	if len(pool.queries) != 3 {
+		t.Fatalf("запросов = %d, want 3 (зоны + очереди + дозаполнение)", len(pool.queries))
+	}
+	// Квота дозаполнения — остаток пачки: 10 − 6 набранных = 4 (не
+	// Limit = 10): читать сверх остатка бессмысленно — в слияние сверх
+	// не попадает.
+	wantArgs := []any{[]any{int16(1), int16(2)}, []any{int64(13), int64(23)}, 4}
+	if !reflect.DeepEqual(pool.queries[2].args, wantArgs) {
+		t.Errorf("аргументы дозаполнения = %v, want [голодные зоны, курсоры, quota=остаток 4] = %v",
+			pool.queries[2].args, wantArgs)
 	}
 }
 
@@ -351,8 +401,9 @@ func TestDispatchBatch_FullBatchStopsRefill(t *testing.T) {
 		// Квота ceil(6 × 1 / 2) + 1 = 4: зона 1 обрезана (голодная),
 		// зона 2 отдала всё (1 строка).
 		drows(r0),
-		// Дозаполнение зоны 1: 6 строк — ровно остаток пачки.
-		drows(drowIDs(1, 21, 22, 23, 24, 25, 26)),
+		// Дозаполнение зоны 1 (после id 14): квота — остаток пачки
+		// (6 − 5 = 1, T-183), LATERAL возвращает не больше остатка.
+		drows(drowIDs(1, 21)),
 	}}
 
 	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 6})
@@ -389,8 +440,9 @@ func TestDispatchBatch_RefillStopsAtExhaustedZone(t *testing.T) {
 		// Квота ceil(20 × 1 / 3) + 1 = 8: зоны 1 и 2 обрезаны (голодные),
 		// зона 3 отдала всё (3 строки).
 		drows(r0),
-		// Дозаполнение: зона 1 исчерпана (пусто), зона 2 отдаёт хвост.
-		drows(drowIDs(2, 29, 30)),
+		// Дозаполнение (квота — остаток 20 − 19 = 1): зона 1 исчерпана
+		// (пусто), зона 2 отдаёт хвост.
+		drows(drowIDs(2, 29)),
 	}}
 
 	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 20})
@@ -930,7 +982,7 @@ func TestResolveZoneWeights_Dispatch(t *testing.T) {
 
 // ---------------------------------------------------------------- контракт SQL
 
-const wantDispatchZonesSQL = "SELECT id, name FROM zones WHERE is_active"
+const wantDispatchZonesSQL = "SELECT id, name FROM zones WHERE is_active AND domains_pending > 0"
 
 const wantDispatchZoneSQL = "SELECT d.zone_id, d.id, d.label " +
 	"FROM unnest($1::int2[], $2::int8[]) AS z(zone_id, after_id) " +
@@ -942,10 +994,13 @@ const wantDispatchZoneSQL = "SELECT d.zone_id, d.id, d.label " +
 	") AS d ON true"
 
 // TestDispatch_SQLContract — точные тексты обоих запросов и опора на
-// схему (миграция 000001): чтение очереди зоны по частичному индексу
-// domains_pending_idx (фильтр зоны + ORDER BY id + LIMIT — без окон и
-// сортировки всего pending), литералы кодов — из модели, охрана от
-// deleted, зоны — только активные.
+// схему (миграции 000001/000016): чтение очереди зоны по частичному
+// индексу domains_pending_idx (фильтр зоны + ORDER BY id + LIMIT — без
+// окон и сортировки всего pending), литералы кодов — из модели, охрана от
+// deleted, зоны — только активные и только с работой (domains_pending >
+// 0, T-183: колонка T-178 — её семантика и есть предикат диспетчера,
+// проба зоны без pending вернула бы 0 строк — круг 1 их больше не
+// делает).
 func TestDispatch_SQLContract(t *testing.T) {
 	if dispatchZonesSQL != wantDispatchZonesSQL {
 		t.Errorf("dispatchZonesSQL = %q,\nwant %q", dispatchZonesSQL, wantDispatchZonesSQL)
@@ -973,6 +1028,12 @@ func TestDispatch_SQLContract(t *testing.T) {
 	// Фильтр активных зон — колонка схемы, а не выдумка.
 	if !strings.Contains(up, "is_active") {
 		t.Error("в миграции 000001 нет zones.is_active — фильтр активных зон ссылается на схему")
+	}
+	// Фильтр работы — колонка счётчиков T-178 (миграция 000016):
+	// фильтр диспетчера опирается на живой инкрементальный счётчик.
+	counters := dispatchReadMigration(t, "000016_zone_pipeline_counters.up.sql")
+	if !strings.Contains(counters, "ADD COLUMN domains_pending bigint NOT NULL DEFAULT 0") {
+		t.Error("в миграции 000016 нет zones.domains_pending — фильтр «только зоны с работой» (T-183) ссылается на счётчик T-178")
 	}
 	// Весов в схеме нет — источник весов только DispatchQuery.
 	if strings.Contains(up, "zones.weight") {

@@ -195,13 +195,17 @@ func consumeTasks(t *testing.T, q *queue.RedisQueue, stream, group, consumer str
 
 // insertPendingDomains — зона и pending-домены с метками labels прямыми
 // вставками в изолированную тестовую схему (сквозной конвейер ingest —
-// территория T-023); возвращает id доменов.
+// территория T-023); возвращает id доменов. Счётчики зоны ведутся как
+// apply_add (domains_total/domains_pending +n, T-178): выборка диспетчера
+// фильтрует зоны по domains_pending > 0 (T-183) — вставка мимо счётчиков
+// оставила бы зону невидимой для DispatchBatch.
 func insertPendingDomains(t *testing.T, pool *pgxpool.Pool, zone string, labels []string) []int64 {
 	t.Helper()
 	ctx := context.Background()
 	var zoneID int16
 	if err := pool.QueryRow(ctx,
-		"INSERT INTO zones (name) VALUES ($1) RETURNING id", zone,
+		"INSERT INTO zones (name, domains_total, domains_pending) VALUES ($1, $2, $2) RETURNING id",
+		zone, len(labels),
 	).Scan(&zoneID); err != nil {
 		t.Fatalf("вставка зоны %s: %v", zone, err)
 	}

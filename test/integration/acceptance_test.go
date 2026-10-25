@@ -255,7 +255,10 @@ func accInsertZone(t *testing.T, pool *pgxpool.Pool, name, unicode string) int16
 }
 
 // accInsertDomains — pending-домены зоны (полный конвейер ingest —
-// TestAccept01), возвращает id в порядке labels.
+// TestAccept01), возвращает id в порядке labels. Счётчики зоны ведутся
+// как apply_add (domains_total/domains_pending +n, T-178): диспетчер
+// фильтрует зоны по domains_pending > 0 (T-183) — вставка мимо счётчиков
+// оставила бы зону невидимой для DispatchBatch (accPipeline).
 func accInsertDomains(t *testing.T, pool *pgxpool.Pool, zoneID int16, labels []string) []int64 {
 	t.Helper()
 	rows, err := pool.Query(context.Background(),
@@ -279,6 +282,12 @@ func accInsertDomains(t *testing.T, pool *pgxpool.Pool, zoneID int16, labels []s
 	}
 	if len(ids) != len(labels) {
 		t.Fatalf("вставлено доменов: %d, хочу %d", len(ids), len(labels))
+	}
+	if _, err := pool.Exec(context.Background(),
+		"UPDATE zones SET domains_total = domains_total + $2, domains_pending = domains_pending + $2 WHERE id = $1",
+		zoneID, len(labels),
+	); err != nil {
+		t.Fatalf("счётчики зоны %d: %v", zoneID, err)
 	}
 	return ids
 }
