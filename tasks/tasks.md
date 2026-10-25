@@ -796,7 +796,7 @@ RequeueRenderPending из накопленного) садится точно в
 (SELECT), варианты оптимизации; взятые в работу оформляются ТЗ
 `TZ_slow_{slug}.md` со ссылкой из задачи этапа.
 
-- **T-179** [в работе] — P1, суточный счётчик проверок `done_today` —
+- **T-179** [сделана] — P1, суточный счётчик проверок `done_today` —
   запрос №1 боевого лога (96 срабатываний >3 с за 09:39–12:20 UTC,
   медиана 15 с, max 51 с): подзапрос throughputSQL `count(*) … WHERE
   last_checked_at = current_date`. План индексный (миграция 0014/T-171),
@@ -841,7 +841,7 @@ RequeueRenderPending из накопленного) садится точно в
   counter = 0 тик не обращается к domains; make test + test-integration
   зелёные. ТЗ: [`TZ_slow_render_requeue.md`](./TZ_slow_render_requeue.md).
 
-- **T-182** [новая] — P1, доля temp_error на суточных счётчиках —
+- **T-182** [в работе] — P1, доля temp_error на суточных счётчиках —
   запрос №6 боевого лога (33 срабатывания >3 с за 09:43–12:19 UTC,
   медиана 28 с, max 111 с): `dnsShareSQL` (monitor/alerts.go) — алерт
   T-080 доли temp_error, цикл 5 мин. Диагноз EXPLAIN: индекс T-171
