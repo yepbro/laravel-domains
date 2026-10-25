@@ -16,9 +16,12 @@
 //     CPU за окно — дельтой между проходами, в долях ядра (1.0 = ядро);
 //   - диск: statfs каталогов отчёта (контент-каталог — главный потребитель
 //     тома; SpaceChecker алертов disk_free_*, alerts.go);
-//   - очереди: XLEN рабочих стримов и темп потребления — дельта
-//     entries-read групп XINFO GROUPS (Redis 7+; ядро < 7 — темп «н/д»,
-//     размеры честны) и рендер-долг одной строкой (T-175: флаги
+//   - очереди: глубина рабочих стримов — бэклог групп потребления
+//     (min(lag, XLEN) + pending, общий расчёт с гейтом — queue.GroupDepth;
+//     та же цифра у `crawlerctl status` и `crawler_queue_depth`, T-188;
+//     стрим без групп и карантин q:dead — XLEN) и темп потребления —
+//     дельта entries-read групп XINFO GROUPS (Redis 7+; ядро < 7 — темп
+//     «н/д», глубины честны) и рендер-долг одной строкой (T-175: флаги
 //     render_pending + лаг q:render, renderdebt.go).
 //
 // Первый проход после старта — база: утилизация и темпы «н/д» (дельт
@@ -118,11 +121,16 @@ type CPUStat struct {
 	Cores   int    // строки cpuN (логические ядра)
 }
 
-// QueueStat — состояние одного рабочего стрима: размер и потребление.
+// QueueStat — состояние одного рабочего стрима: глубина и потребление.
 type QueueStat struct {
-	// Len — глубина стрима (XLEN).
+	// Len — глубина стрима: бэклог групп потребления — Σ по группам
+	// (min(lag, XLEN) + pending), общий расчёт queue.GroupDepth — та же
+	// цифра, что у `crawlerctl status` и `crawler_queue_depth` (T-188);
+	// стрим без групп и карантин q:dead — XLEN. Сырой XLEN для рабочих
+	// стримов не печатается: подтверждённая история до обрезки XTRIM —
+	// не очередь (инцидент 25.10: q:render завышен в ~5 раз).
 	Len int64
-	// Read — доставки группым (entries-read XINFO GROUPS, максимум по
+	// Read — доставки группы (entries-read XINFO GROUPS, максимум по
 	// группам): монотонный счётчик потребления для темпа отчёта;
 	// 0 — групп нет или Redis < 7 (поле отсутствует) — темп «н/д».
 	Read int64
@@ -394,13 +402,15 @@ func parseStatmRSS(b []byte) uint64 {
 // интерфейс для подмены в юнит-тестах (реальное чтение — XLEN/XINFO
 // живого Redis). Стиль StreamGroupsSource.
 type QueueSource interface {
-	// Queues возвращает снимок стримов отчёта (reportStreams): размер и
-	// счётчик доставок. Ошибка — «не измеряется» с причиной.
+	// Queues возвращает снимок стримов отчёта (reportStreams): глубину
+	// (бэклог групп, T-188) и счётчик доставок. Ошибка — «не измеряется»
+	// с причиной.
 	Queues(ctx context.Context) (map[string]QueueStat, error)
 }
 
 // RedisQueues — QueueSource поверх XLEN + XINFO GROUPS того же узкого
-// окна go-redis, что у групп алертов (redisGroupsCmd, streamgroups.go).
+// окна go-redis, что у групп алертов (redisGroupsCmd, streamgroups.go);
+// глубина — бэклог групп потребления (queue.GroupDepth, T-188).
 type RedisQueues struct {
 	// RDB — клиент Redis; nil — ошибка источника.
 	RDB redisGroupsCmd
@@ -411,7 +421,12 @@ var _ QueueSource = RedisQueues{}
 
 // Queues обходит стримы отчёта. Стрим без ключа (очередь пуста отродясь)
 // — вклад {0, 0}: пустая очередь — честный нуль, а не отсутствие данных.
-// Групп несколько быть может (консьюмеры раздельно) — счётчик доставок
+// Глубина рабочего стрима с группами — сумма бэклогов его групп
+// (queue.GroupDepth — общий расчёт с гейтом, `crawlerctl status` и
+// `crawler_queue_depth`: отчёт не имеет права разойтись о том, есть ли
+// работа); стрим без групп и карантин q:dead (глубина — инвентарь
+// оператора, групп у карантина нет по построению) — XLEN. Групп
+// несколько быть может (консьюмеры раздельно) — счётчик доставок
 // берётся максимумом по группам: одна группа делит общий entries-read,
 // независимые группы читают стрим каждая со своей скоростью.
 func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
@@ -420,7 +435,7 @@ func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
 	}
 	out := make(map[string]QueueStat, len(reportStreams))
 	for _, stream := range reportStreams {
-		length, err := s.RDB.XLen(ctx, stream).Result()
+		xlen, err := s.RDB.XLen(ctx, stream).Result()
 		if err != nil {
 			// Стрима нет — Redis отвечает «no such key» (та же ветка, что
 			// у BackpressureGate.Len и RedisStreamGroups).
@@ -430,16 +445,29 @@ func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
 			}
 			return nil, fmt.Errorf("monitor: нагрузка: очереди: %s: %w", stream, err)
 		}
-		st := QueueStat{Len: length}
-		// Группы — источник темпа; стрим есть, групп нет (никто не
-		// потребляет) — Read 0, размер честен; ошибка XINFO GROUPS здесь
-		// не роняет секцию: глубина стрима важнее темпа (алерт T-162
-		// следит за группами отдельно и со своими семантиками).
-		if groups, err := s.RDB.XInfoGroups(ctx, stream).Result(); err == nil {
+		groups, err := s.RDB.XInfoGroups(ctx, stream).Result()
+		if err != nil {
+			// Стрим исчез между XLEN и XINFO (DEL/обрезка в 0) — «no such
+			// key», как у гейта: групп нет. Иная ошибка роняет секцию:
+			// бэклог без состояний групп не считается, а сырой XLEN
+			// вместо него завышал бы глубину всей необрезанной историей
+			// стрима (расхождение 25.10, ТЗ §2).
+			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
+				groups = nil
+			} else {
+				return nil, fmt.Errorf("monitor: нагрузка: очереди: группы %s: %w", stream, err)
+			}
+		}
+		st := QueueStat{Len: xlen}
+		if len(groups) > 0 && stream != queue.StreamDead {
+			st.Len = 0
 			for _, g := range groups {
-				if g.EntriesRead > st.Read {
-					st.Read = g.EntriesRead
-				}
+				st.Len += queue.GroupDepth(g, xlen)
+			}
+		}
+		for _, g := range groups {
+			if g.EntriesRead > st.Read {
+				st.Read = g.EntriesRead
 			}
 		}
 		out[stream] = st
@@ -650,7 +678,9 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 			}
 		}
 
-		// Очереди: размеры сейчас, темпы — дельты deliveries за окно.
+		// Очереди: бэклог сейчас (RedisQueues), темпы — дельты доставок
+		// за окно; дельта бэклога ±N — рост/дренаж реальной очереди
+		// (необрезанная история стрима на ней не сказывается).
 		var queues map[string]QueueStat
 		var rates map[string]float64
 		if opts.Queues != nil {

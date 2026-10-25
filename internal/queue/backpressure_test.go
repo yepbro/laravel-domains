@@ -172,6 +172,34 @@ func TestStreamWatermark(t *testing.T) {
 	}
 }
 
+// TestGroupDepth — общая точка правды глубины группы (T-188): чистая
+// функция от lag/pending/XLEN, её суммируют гейт (Len), алерт T-162
+// (monitor.RedisStreamGroups) и строка «Очереди» отчёта нагрузки
+// (monitor.RedisQueues) — формулы не имеют права разойтись.
+func TestGroupDepth(t *testing.T) {
+	cases := []struct {
+		name string
+		lag  int64
+		pend int64
+		xlen int64
+		want int64
+	}{
+		{"лаг с pending", 27409, 120, 136500, 27529},
+		{"кламп фантомного лага по XLEN (T-168)", 1753, 0, 1, 1},
+		{"лаг 0 — прибавка нуля", 0, 5, 100, 5},
+		{"lag −1 (неопределён) — только pending", -1, 8, 3, 8},
+		{"пустая группа", 0, 0, 0, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := GroupDepth(redis.XInfoGroup{Name: "g", Lag: c.lag, Pending: c.pend}, c.xlen); got != c.want {
+				t.Errorf("GroupDepth(lag=%d, pending=%d, xlen=%d) = %d, хочу %d",
+					c.lag, c.pend, c.xlen, got, c.want)
+			}
+		})
+	}
+}
+
 func TestBackpressureLen(t *testing.T) {
 	// Глубина группы — lag (клампнутый XLEN стрима, T-168) плюс
 	// неподтверждённые; групп несколько — суммируются (у рабочих стримов

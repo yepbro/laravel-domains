@@ -2,8 +2,9 @@
 // (loadavg, stat, meminfo, строки процессов, PSI some/full), дельты
 // утилизации CPU и тиков процессов, топы, формат отчёта (секции,
 // «н/д»-деградация), источник OSLoad на каталоге фикстур, цикл одним
-// проходом на фейках. Живые /proc и Redis — вне юнит-тестов (герметичность,
-// стиль psi_test.go).
+// проходом на фейках; источник очередей RedisQueues — бэклог групп
+// потребления на фейке redisGroupsCmd (T-188). Живые /proc и Redis —
+// вне юнит-тестов (герметичность, стиль psi_test.go).
 package monitor
 
 import (
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"crawler/internal/queue"
 )
@@ -218,6 +221,7 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 		t.Fatalf("снимок: %v", err)
 	}
 	src := &fakeLoadSource{states: []LoadStat{st}}
+	// Len фикстуры — бэклоги (T-188): формат строки не меняется.
 	queues := map[string]QueueStat{
 		queue.StreamDNS:    {Len: 121, Read: 500},
 		queue.StreamRender: {Len: 116320, Read: 1200},
@@ -258,7 +262,7 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 		"💾 RAM: занято 5.4 из 7.6 ГиБ",  // 7973728−2359296 КиБ
 		"swap 198 МиБ",
 		"📀 Диск /var/lib/crawler/content: свободно 44 из 79 ГиБ (56%)",
-		"📬 Очереди: q:dns 121 · q:render 116320", // размеры без дельт
+		"📬 Очереди: q:dns 121 · q:render 116320", // бэклоги без дельт
 	} {
 		if !strings.Contains(r, want) {
 			t.Errorf("отчёт не содержит %q:\n%s", want, r)
@@ -279,6 +283,8 @@ func TestFormatLoadReport_Deltas(t *testing.T) {
 		"analyzer":       0.31,
 		"unbound":        0.01, // шум: ниже порога
 	}
+	// Len фикстур — бэклоги (T-188): дельта ±N — рост/дренаж бэклога
+	// (−1200 — дренаж q:render), темп N/с — доставки.
 	queues := map[string]QueueStat{
 		queue.StreamDNS:    {Len: 121, Read: 2100},
 		queue.StreamRender: {Len: 115120, Read: 1200},
@@ -353,8 +359,109 @@ func TestParseProcStatLine(t *testing.T) {
 	}
 }
 
+// TestRedisQueues_NoClient — nil-клиент: ошибка источника.
 func TestRedisQueues_NoClient(t *testing.T) {
 	if _, err := (RedisQueues{}).Queues(context.Background()); err == nil {
 		t.Error("клиент nil: хочу ошибку источника")
+	}
+}
+
+// TestRedisQueues_Backlog — глубина стрима отчёта — бэклог групп
+// потребления (T-188): история в XLEN не завышает глубину (бой 25.10:
+// q:render XLEN 136 500 при бэклоге 27 529); несколько групп — сумма
+// вкладов (queue.GroupDepth); lag −1 — только pending; стрим без групп
+// и карантин q:dead — XLEN; Read — максимум entries-read по группам.
+// Фейк — fakeGroupsRedis (streamgroups_test.go), тот же интерфейс.
+func TestRedisQueues_Backlog(t *testing.T) {
+	rdb := &fakeGroupsRedis{
+		groups: map[string][]redis.XInfoGroup{
+			// Бой 25.10 (ТЗ §2): XLEN 136 500 — 17 ч необрезанной
+			// истории, бэклог группы min(27409, 136500) + 120 = 27 529.
+			queue.StreamRender: {{
+				Name: "render-worker", Lag: 27409, Pending: 120, EntriesRead: 1097613,
+			}},
+			// Две группы: min(98, 50)+2 = 52 и 10+1 = 11 → 63; Read —
+			// максимум по группам.
+			queue.StreamHTTP: {
+				{Name: "http-worker", Lag: 98, Pending: 2, EntriesRead: 500},
+				{Name: "retry", Lag: 10, Pending: 1, EntriesRead: 700},
+			},
+			// lag −1 (обрезка недоставленного, T-168) — только pending.
+			queue.StreamAnalyze: {{
+				Name: "analyzer", Lag: -1, Pending: 1, EntriesRead: 8_000_000,
+			}},
+			// Стрим есть, групп нет — никто не доставлял: XLEN.
+			queue.StreamDNS: {},
+			// q:dead — всегда XLEN: глубина карантина — инвентарь
+			// оператора, не бэклог (групп у него нет по построению).
+			queue.StreamDead: {{Name: "triage", Lag: 100, Pending: 5, EntriesRead: 30}},
+		},
+		xlen: map[string]int64{
+			queue.StreamRender:  136500,
+			queue.StreamHTTP:    50,
+			queue.StreamAnalyze: 71784,
+			queue.StreamDNS:     2,
+			queue.StreamDead:    1441,
+		},
+	}
+	q, err := RedisQueues{RDB: rdb}.Queues(context.Background())
+	if err != nil {
+		t.Fatalf("Queues: %v", err)
+	}
+	want := map[string]QueueStat{
+		queue.StreamDNS:     {Len: 2},
+		queue.StreamHTTP:    {Len: 63, Read: 700},
+		queue.StreamRender:  {Len: 27529, Read: 1097613},
+		queue.StreamAnalyze: {Len: 1, Read: 8_000_000},
+		queue.StreamDead:    {Len: 1441, Read: 30},
+	}
+	if len(q) != len(want) {
+		t.Fatalf("стримов = %d, хочу %d: %+v", len(q), len(want), q)
+	}
+	for s, w := range want {
+		if q[s] != w {
+			t.Errorf("%s = %+v, хочу %+v", s, q[s], w)
+		}
+	}
+
+	// Стримов нет вовсе (очередь пуста отродясь) — {0, 0} без ошибки.
+	rdb2 := &fakeGroupsRedis{groups: map[string][]redis.XInfoGroup{}, xlen: map[string]int64{}}
+	q2, err := RedisQueues{RDB: rdb2}.Queues(context.Background())
+	if err != nil {
+		t.Fatalf("Queues (пусто): %v", err)
+	}
+	for _, s := range reportStreams {
+		if q2[s] != (QueueStat{}) {
+			t.Errorf("%s = %+v, хочу {0 0}", s, q2[s])
+		}
+	}
+}
+
+// TestRedisQueues_GroupsError — ошибка XINFO GROUPS (не «нет ключа»)
+// роняет секцию с именем стрима: бэклог без состояний групп не
+// считается, сырой XLEN вместо него завышал бы глубину историей (T-188).
+// «Нет ключа» от XLEN — вклад {0, 0}, секция жива.
+func TestRedisQueues_GroupsError(t *testing.T) {
+	rdb := &fakeGroupsRedis{
+		groups:    map[string][]redis.XInfoGroup{},
+		xlen:      map[string]int64{queue.StreamDNS: 5},
+		groupErrs: map[string]error{queue.StreamDNS: errors.New("connection refused")},
+	}
+	if _, err := (RedisQueues{RDB: rdb}).Queues(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "q:dns") {
+		t.Errorf("ошибка групп = %v, хочу ошибку с именем q:dns", err)
+	}
+
+	rdb2 := &fakeGroupsRedis{
+		groups:   map[string][]redis.XInfoGroup{},
+		xlen:     map[string]int64{},
+		lensErrs: map[string]error{queue.StreamDNS: redis.Nil},
+	}
+	q, err := RedisQueues{RDB: rdb2}.Queues(context.Background())
+	if err != nil {
+		t.Fatalf("Queues (нет ключа XLEN): %v", err)
+	}
+	if q[queue.StreamDNS] != (QueueStat{}) {
+		t.Errorf("q:dns = %+v, хочу {0 0}", q[queue.StreamDNS])
 	}
 }

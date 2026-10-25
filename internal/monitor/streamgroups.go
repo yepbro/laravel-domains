@@ -2,16 +2,18 @@
 // замороженной очереди (T-162; сигнатура отравленной задачи T-159:
 // XREADGROUP не отдаёт записи — last-delivered-id группы стоит, а глубина
 // (backlog) ненулевая; замер §12 — все P0 находили вручную именно по
-// таким «тихим» простоям). Глубина группы — та же формула, что у гейта
-// backpressure (min(lag, XLEN) + pending, кламп фантомного лага после
-// обрезки недоставленного — T-168): источник обязан соглашаться с
-// алертом переполнения очередей о том, есть ли работа.
+// таким «тихим» простоям). Глубина группы — queue.GroupDepth: общий
+// расчёт с гейтом backpressure (min(lag, XLEN) + pending, кламп
+// фантомного лага после обрезки недоставленного — T-168) — источник
+// обязан соглашаться с алертом переполнения очередей о том, есть ли
+// работа.
 //
 // Данные — XINFO GROUPS по каждому рабочему стриму (имя группы, lag,
 // pending, last-delivered-id) и XLEN для клампа: то же окно в go-redis,
 // что у redisDepth в internal/queue, но своим интерфейсом — пакет queue
 // не тянет проверок алертов в API гейта (гейт — механизм продюсера,
-// монитор — наблюдатель, ТЗ 5.9).
+// монитор — наблюдатель, ТЗ 5.9); сама формула глубины — общая
+// (queue.GroupDepth), чтобы наблюдение и гейт не разошлись.
 package monitor
 
 import (
@@ -21,6 +23,8 @@ import (
 	"strings"
 
 	"github.com/redis/go-redis/v9"
+
+	"crawler/internal/queue"
 )
 
 // StreamGroupState — снимок одной группы потребления рабочего стрима.
@@ -31,7 +35,7 @@ type StreamGroupState struct {
 	Group string
 	// Depth — глубина очереди группы: непрочитанный остаток
 	// (min(lag, XLEN) — кламп T-168) плюс неподтверждённые доставки
-	// (pending). Формула — BackpressureGate.Len.
+	// (pending). Формула — queue.GroupDepth (общая с BackpressureGate.Len).
 	Depth int64
 	// LastDeliveredID — last-delivered-id группы из XINFO GROUPS: ID
 	// последней записи, доставленной потребителям (XREADGROUP ">").
@@ -101,16 +105,12 @@ func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState
 			return nil, fmt.Errorf("monitor: группы %s (XLEN): %w", stream, err)
 		}
 		for _, g := range groups {
-			depth := g.Pending
-			// −1 — lag неопределён (обрезка недоставленного, Redis < 7.0):
-			// учитывается только точный pending (BackpressureGate.Len).
-			if g.Lag >= 0 {
-				depth += min(g.Lag, xlen)
-			}
 			out = append(out, StreamGroupState{
-				Stream:          stream,
-				Group:           g.Name,
-				Depth:           depth,
+				Stream: stream,
+				Group:  g.Name,
+				// −1 — lag неопределён (обрезка недоставленного, Redis < 7.0):
+				// GroupDepth учитывает только точный pending.
+				Depth:           queue.GroupDepth(g, xlen),
 				LastDeliveredID: g.LastDeliveredID,
 			})
 		}
