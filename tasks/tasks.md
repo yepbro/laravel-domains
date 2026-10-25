@@ -922,7 +922,7 @@ RequeueRenderPending из накопленного) садится точно в
   бит и уменьшает счётчик; при counter = 0 тик не обращается к
   domains (T-181); make test + test-integration зелёные.
 
-- **T-187** [в работе] — P3, хвост ревью T-185 (условие ревьюера R3) —
+- **T-187** [сделана] — P3, хвост ревью T-185 (условие ревьюера R3) —
   точечный дренаж при переанализе не-fresh: снятие находки
   переанализом (не-fresh, `aggregateDomain` internal/analyzer/
   aggregate.go — событие RowsAffected > 0 ∧ ¬fresh ∧ existed)
