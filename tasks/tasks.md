@@ -908,7 +908,7 @@ RequeueRenderPending из накопленного) садится точно в
   [`TZ_slow_retention_drain.md`](./TZ_slow_retention_drain.md);
   зависимости — T-171 (индекс), T-175 (опционально).
 
-- **T-186** [новая] — P2, хвост ревью T-181 (P1 deepseek, раунд 1) —
+- **T-186** [в работе] — P2, хвост ревью T-181 (P1 deepseek, раунд 1) —
   снятие бита render_pending при удалении домена: биты-«сироты»
   удалённых с флагом держат `crawler_counters['render_pending']` > 0
   вечно — guard T-181 не спит, renderSelectPending гоняет полный
