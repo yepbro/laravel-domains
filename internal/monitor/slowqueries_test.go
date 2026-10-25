@@ -11,21 +11,29 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 // fakeSlowSource — источник с запланированными снимками по проходам
 // (стиль fakeLoadSource); исчерпав план, отдаёт пустые снимки.
+// Счётчик под мьютексом: пишет горутина цикла, читает горутина теста
+// (waitSlowPasses) — без замка это гонка под -race (T-190; стиль
+// zonestatsFakePool). План passes/errs заполняется до старта цикла и
+// дальше только читается — замка не требует.
 type fakeSlowSource struct {
+	mu     sync.Mutex
 	passes [][]SlowQuery
 	errs   []error
 	calls  int
 }
 
 func (s *fakeSlowSource) SlowQueries(context.Context, time.Duration) ([]SlowQuery, error) {
+	s.mu.Lock()
 	i := s.calls
 	s.calls++
+	s.mu.Unlock()
 	if i < len(s.errs) && s.errs[i] != nil {
 		return nil, s.errs[i]
 	}
@@ -33,6 +41,13 @@ func (s *fakeSlowSource) SlowQueries(context.Context, time.Duration) ([]SlowQuer
 		return s.passes[i], nil
 	}
 	return nil, nil
+}
+
+// count — число выполненных проходов (потокобезопасное чтение счётчика).
+func (s *fakeSlowSource) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 // slowQueryAt — оператор с ключом дебаунса (pid, старт).
@@ -43,14 +58,17 @@ func slowQueryAt(pid int, app string, sec float64, started time.Time, query stri
 // waitSlowPasses ждёт, пока источник отдаст минимум n снимков (стиль
 // TestZoneStatsLoopTicker), и отменяет цикл: после исчерпания плана
 // снимки пусты — рассылок больше не появляется, проверки числа
-// сообщений детерминированы.
+// сообщений детерминированы. Счётчик читается через count() под
+// мьютексом фейка: пишет его горутина цикла (гонка под -race, T-190);
+// сам отчёт (reports) читается только после <-done — канал даёт
+// happens-before для всех рассылок цикла.
 func waitSlowPasses(t *testing.T, src *fakeSlowSource, n int, cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	for src.calls < n {
+	for src.count() < n {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("цикл не дошёл до прохода %d: %d", n, src.calls)
+			t.Fatalf("цикл не дошёл до прохода %d: %d", n, src.count())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -174,8 +192,8 @@ func TestSlowQueryLoop_Disabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("выключенный цикл: %v", err)
 	}
-	if src.calls != 0 {
-		t.Errorf("выключенный цикл: проходов = %d, want 0", src.calls)
+	if src.count() != 0 {
+		t.Errorf("выключенный цикл: проходов = %d, want 0", src.count())
 	}
 	if err := SlowQueryLoop(context.Background(), nil, SlowQueryOptions{Interval: time.Minute}); err == nil {
 		t.Error("источник не задан: ожидается ошибка")

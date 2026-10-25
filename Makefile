@@ -188,6 +188,20 @@ test: ## Модульные тесты Go (в контейнере)
 	$(check_env)
 	$(COMPOSE) run --rm tools go test $(GO_PKGS) -count=1
 
+# -race для пакетов с горутинными циклами (T-190): штатный make test
+# идёт без -race (CGO_ENABLED=0 в образе — боевые бинарники статические),
+# детектор гонок требует cgo — включается на один run-контейнер
+# (-e CGO_ENABLED=1; gcc в tools есть — build-base). По умолчанию только
+# monitor: циклы slowquery/load/zonestats гоняют горутины, остальное
+# покрывает обычный make test; расширение списка — по мере появления
+# конкурентных пакетов (RACE_PKGS='./internal/a/... ./internal/b').
+RACE_PKGS ?= ./internal/monitor
+
+.PHONY: test-race
+test-race: ## Тесты с детектором гонок (-race, по умолчанию internal/monitor)
+	$(check_env)
+	$(COMPOSE) run --rm -e CGO_ENABLED=1 tools go test -race $(RACE_PKGS) -count=1
+
 .PHONY: test-integration
 test-integration: ## Интеграционные тесты окружения на testbed
 	$(check_env)

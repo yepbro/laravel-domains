@@ -78,10 +78,19 @@ make up-infra        # только БД/Redis/DNS (работа над схем
 make up              # инфраструктура + testbed + приложения (стандартный день)
 make test            # модульные тесты (в контейнере, Go на хосте не нужен)
 make lint            # golangci-lint
+make test-race       # детектор гонок -race для internal/monitor (CGO включается сам)
 make test-rules      # правила Laravel по корпусу testdata/laravel-samples
 make test-integration# интеграционные тесты окружения на testbed
 make mutate          # мутационное тестирование (тяжёлое; mutation-testing.md)
 ```
+
+Правило `-race` (T-190): пакеты с горутинными циклами (сейчас это
+`internal/monitor` — slowquery/load/zonestats) держите чистыми под
+детектором гонок — локально `make test-race`, тот же шаг есть в CI.
+Штатный `make test` идёт без `-race` (CGO_ENABLED=0), поэтому гонки в
+тестах ловит только эта цель; фейки, читаемые из горутины цикла,
+синхронизируйте мьютексом (стиль `zonestatsFakePool`,
+`fakeSlowSource` в slowqueries_test.go).
 
 Мониторинг и инструменты поднимаются по требованию:
 

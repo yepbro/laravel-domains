@@ -134,7 +134,8 @@ make reset-internet
 те же make-цели через Docker Compose, что и локально, Go на хосте CI не нужен:
 
 сборка образов (`make build`, слои кэшируются в GitHub Actions cache через
-`deploy/docker/compose.ci.yaml`) → `make lint` → `make test` → `make test-rules`
+`deploy/docker/compose.ci.yaml`) → `make lint` → `make test` →
+`make test-race` (детектор гонок для monitor) → `make test-rules`
 → `make test-integration` (testbed) → `make build-runtime`.
 
 Статус — бейджем в шапке; при падении логи всех сервисов выгружаются в artifact

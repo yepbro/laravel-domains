@@ -75,6 +75,13 @@ jobs:
         id: test
         run: make test COMPOSE="$COMPOSE"
 
+      # Детектор гонок для горутинных циклов monitor (T-190): штатный
+      # make test идёт без -race; шаг дёшев — образы уже загружены,
+      # гоняется один пакет.
+      - name: Тесты с детектором гонок (monitor)
+        id: test-race
+        run: make test-race COMPOSE="$COMPOSE"
+
       - name: Правила Laravel по корпусу образцов
         id: test-rules
         run: make test-rules COMPOSE="$COMPOSE"
@@ -132,6 +139,8 @@ jobs:
             event="Ошибка в коде"; step="Линт (golangci-lint)"
           elif [ "${{ steps.test.outcome }}" = failure ]; then
             event="Ошибка тестов"; step="Модульные тесты"
+          elif [ "${{ steps.test-race.outcome }}" = failure ]; then
+            event="Ошибка тестов"; step="Тесты с детектором гонок (monitor)"
           elif [ "${{ steps.test-rules.outcome }}" = failure ]; then
             event="Ошибка тестов"; step="Правила Laravel по корпусу образцов"
           elif [ "${{ steps.test-integration.outcome }}" = failure ]; then
