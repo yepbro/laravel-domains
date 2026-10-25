@@ -73,10 +73,13 @@ const (
 	// повтора 24 часа часовой проход назначает повтор не позже чем через
 	// час после готовности домена; если retry_after настроен меньше часа,
 	// интервал ужимается до него (withDefaults), чтобы цикл не «переспал»
-	// собственное окно. Проход — seq scan по таблице (индекс невозможен без
-	// status в предикате — см. retrySelectSQL), часовой темп ограничивает
-	// цену; после дренажа множество кандидатов пусто до созревания новых
-	// temp_error (окно RetryAfter).
+	// собственное окно. Стационар без temp_error держит guard (T-191,
+	// retryCounterSQL): часовой тик стоит одно точечное чтение строки
+	// счётчика, тяжёлая выборка пачки не выполняется вовсе; шторм когорты
+	// (массовый temp_error-эпизод) дренируется проходами подряд (drain),
+	// темп определяют UPDATE пачки, а не выборка — seq scan с ранним
+	// остановом LIMIT, закреплённый в транзакции выборки
+	// (retryCandidates, T-191).
 	DefaultRetryInterval = time.Hour
 )
 
@@ -91,23 +94,48 @@ const (
 	// повтора на один эпизод проверки; pending уже ждёт выборки диспетчера,
 	// queued в работе, ТЗ 5.3), окно — по last_checked_at. NULL
 	// last_checked_at не выбирается: «ещё не проверялся» — не повод для
-	// повтора. ORDER BY по ключу домена — детерминированные пачки без
-	// сортировки (совпадает с PK, ТЗ 6.1). Точность окна — сутки:
-	// last_checked_at имеет тип date (ТЗ 6.1).
+	// повтора. ORDER BY отсутствует сознательно (T-191, прецедент T-181):
+	// порядок кандидатов не важен — деление пачки по temp_attempts не
+	// зависит от порядка, охраны retryRequeueSQL/retryFinalizeSQL
+	// перепроверяют статус и состояние на момент записи (идемпотентность
+	// ТЗ 3.4), повторный проход безопасен; сортировка держала бы индексный
+	// доступ к таблице. Точность окна — сутки: last_checked_at имеет тип
+	// date (ТЗ 6.1).
 	//
 	// Индекса у прохода нет сознательно (T-104): предикат сводится к
 	// status = temp_error, а индекс с status в ключе или предикате ломал
 	// бы HOT массовых апдейтов статуса без смены check_state — применение
 	// delete-файлов (apply_delete) и фиксация итогового статуса
-	// (retryFinalizeSQL). Частичный domains_recheck_idx не выручает:
-	// окно 24 ч покрывает почти все done-строки, диапазонный скан по
-	// возрасту читал бы их целиком ради редких temp_error. Проход —
-	// seq scan с часовым интервалом (DefaultRetryInterval).
+	// (retryFinalizeSQL). Но и без status в индексе seq scan не бесплатен:
+	// планировщик садится на частичный domains_recheck_idx (миграция
+	// 000008) — предикат check_state = done доказуем, диапазон по ведущему
+	// last_checked_at кажется узким, а слепая оценка (гистограмма
+	// last_checked_at: 92 % NULL, волна проверок моложе статистики)
+	// обещает планировщику тысячи строк; реально окно «старше 24 ч»
+	// покрывает почти все done-строки, и диапазонный скан вырождается в
+	// марафон по нескольким миллионам строк с heap-визитом каждой (запрос
+	// №1 журнала медленных 25.10: медиана 74,8 с, ≈3,6 ч времени БД за
+	// окно). Форма плана закреплена: seq scan с ранним остановом LIMIT —
+	// доли секунды, замер 195× (T-191) — SET LOCAL в транзакции выборки
+	// (retryCandidates, образец — renderSelectPending T-181).
 	retrySelectSQL = "SELECT d.zone_id, d.id, d.temp_attempts FROM domains d " +
 		"WHERE d.status = $1 " +
 		"AND d.check_state = $2 " +
 		"AND d.last_checked_at < $3 " +
-		"ORDER BY d.zone_id, d.id LIMIT $4"
+		"LIMIT $4"
+
+	// retryPlanNoIndexScanSQL/retryPlanNoBitmapScanSQL/retryPlanNoIOSQL —
+	// закрепление формы плана выборки кандидатов (T-191, прецедент T-181):
+	// SET LOCAL в транзакции retryCandidates отключает index scan, bitmap
+	// scan и index-only scan до оператора выборки — закрыты все индексные
+	// формы доступа к domains (PK и оба частичных), seq scan с ранним
+	// остановом LIMIT гарантирует пачку за доли секунды независимо от
+	// статистики (оценке планировщика верить нельзя — см.
+	// retrySelectSQL). Действие SET LOCAL — только эта транзакция,
+	// остальные запросы пула не затронуты.
+	retryPlanNoIndexScanSQL  = "SET LOCAL enable_indexscan = off"
+	retryPlanNoBitmapScanSQL = "SET LOCAL enable_bitmapscan = off"
+	retryPlanNoIOSQL         = "SET LOCAL enable_indexonlyscan = off"
 
 	// retryRequeueSQL — назначение повтора: check_state → pending (домена
 	// перевыберет диспетчер T-027), счётчик попыток + 1. Охрана
@@ -144,6 +172,23 @@ const (
 		"AND d.status = $4 AND d.check_state = $5 " +
 		"RETURNING d.zone_id, d.id"
 )
+
+// retryCounterSQL — guard прохода точечным чтением счётчика статуса
+// temp_error (T-191; легенда строк — monitor.CounterNames, T-178: имя =
+// "status_" + имя статуса; значение пишет реконсиляция monitor,
+// инкременты переходов его не ведут — статус-распределение абсолютно,
+// ТЗИ §13.3). value = 0 — тяжёлая выборка кандидатов (seq scan по
+// domains) не выполняется вовсе: зрелые кандидаты — подмножество
+// temp_error, нулевой счётчик ⇒ кандидатов нет (стационар без temp_error
+// стоит одно чтение строки за тик); отсутствие строки — ошибка прохода
+// (строку гарантирует первый проход реконсиляции T-178; молчаливый
+// рассинхрон сделал бы guard ложью — философия T-181). Не путать со
+// строкой temp_error:YYYY-MM-DD (T-182): та — события суток, этот
+// счётчик — состояние (число доменов в статусе сейчас). Имя строится из
+// model.StatusTempError (стиль кодов схемы из модели — renderq.go),
+// литерал разошёлся бы при переименовании статуса.
+var retryCounterSQL = "SELECT value FROM crawler_counters WHERE name = 'status_" +
+	model.StatusTempError.String() + "'"
 
 // RetryDB — пул для прохода: db.DB, из которого можно начать транзакцию.
 // Оба решения пачки (назначение повтора и итоговый статус) атомарны в
@@ -223,21 +268,41 @@ type retryCandidate struct {
 // проверкой и last_checked_at старше RetryAfter в одной транзакции
 // получают либо назначенный повтор (check_state → pending,
 // temp_attempts + 1 — попыток меньше MaxRetries), либо итоговый статус
-// delegated_no_address (попытки исчерпаны, temp_attempts → 0). Повторный
-// проход безопасен (ТЗ 3.4): домены в pending больше не кандидаты,
-// охраны в UPDATE перепроверяют состояние на момент записи.
+// delegated_no_address (попытки исчерпаны, temp_attempts → 0). До
+// выборки — guard счётчиком crawler_counters['status_temp_error']
+// (T-191, retryTempCount): нулевой счётчик возвращает пустой результат
+// без тяжёлой выборки. Повторный проход безопасен (ТЗ 3.4): домены в
+// pending больше не кандидаты, охраны в UPDATE перепроверяют состояние
+// на момент записи.
 func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResult, error) {
 	if pool == nil {
 		return RetryResult{}, errors.New("scheduler: повторные проверки temp_error: пул не задан")
 	}
 	o := opts.withDefaults()
 
+	// Guard счётчиком статуса temp_error (T-191): до тяжёлой выборки —
+	// точечное чтение crawler_counters['status_temp_error'] (retryTempCount);
+	// 0 → пустой результат без выборки и транзакции (drain корректно
+	// останавливается). Отрицательное значение кодом не порождается
+	// (реконсиляция пишет абсолютные числа) и трактуется так же — тихий
+	// баг счётчика не должен молотить БД.
+	temp, err := retryTempCount(ctx, pool)
+	if err != nil {
+		return RetryResult{}, err
+	}
+	if temp <= 0 {
+		return RetryResult{}, nil
+	}
+
 	candidates, err := retryCandidates(ctx, pool, o.BatchSize, o.RetryAfter)
 	if err != nil {
 		return RetryResult{}, err
 	}
 	if len(candidates) == 0 {
-		// Пустой набор — назначать нечего; транзакция не открывается.
+		// Счётчик видит temp_error, выборка — нет созревших (когорта зреет
+		// в полночь, дренаж уже прошёл; TZ T-191 §4.3 — остаточный случай,
+		// один холостой seq scan за тик): транзакция обновления не
+		// открывается.
 		return RetryResult{}, nil
 	}
 
@@ -288,11 +353,36 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 	return res, nil
 }
 
-// retryCandidates выбирает до limit кандидатов повтора (retrySelectSQL):
-// ключи доменов и их счётчики попыток для деления пачки в проходе.
+// retryCandidates выбирает до limit кандидатов повтора (retrySelectSQL) —
+// единая точка тяжёлой выборки прохода: ключи доменов и их счётчики
+// попыток для деления пачки. Выборка идёт в явной транзакции с SET LOCAL
+// enable_indexscan/bitmapscan/indexonlyscan = off (T-191, образец —
+// renderSelectPending T-181): закрепление формы плана — seq scan по
+// domains с ранним остановом LIMIT; без закрепления планировщик садится
+// на частичный domains_recheck_idx и вырождает окно повтора в марафон
+// (медиана 74,8 с на замере 25.10 — комментарий retrySelectSQL).
+// Транзакция — только оболочка закрепления: SELECT читает
+// зафиксированные данные, фиксация/откат по содержанию равнозначны.
 func retryCandidates(ctx context.Context, pool RetryDB, limit int, retryAfter time.Duration) ([]retryCandidate, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: транзакция выборки: %w", err)
+	}
+	// Откат безусловно: после Commit — no-op (стиль T-044).
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, retryPlanNoIndexScanSQL); err != nil {
+		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: закрепление плана: %w", err)
+	}
+	if _, err := tx.Exec(ctx, retryPlanNoBitmapScanSQL); err != nil {
+		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: закрепление плана: %w", err)
+	}
+	if _, err := tx.Exec(ctx, retryPlanNoIOSQL); err != nil {
+		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: закрепление плана: %w", err)
+	}
+
 	cutoff := time.Now().Add(-retryAfter)
-	rows, err := pool.Query(ctx, retrySelectSQL,
+	rows, err := tx.Query(ctx, retrySelectSQL,
 		int16(model.StatusTempError), int16(model.CheckStateDone), cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: выборка кандидатов: %w", err)
@@ -310,7 +400,43 @@ func retryCandidates(ctx context.Context, pool RetryDB, limit int, retryAfter ti
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: выборка кандидатов: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: фиксация выборки: %w", err)
+	}
 	return candidates, nil
+}
+
+// retryTempCount — guard прохода повторных проверок (T-191): точечное
+// чтение счётчика статуса crawler_counters['status_temp_error']
+// (retryCounterSQL; значение пишет реконсиляция T-178 — guard читает
+// состояние, зрелые кандидаты — подмножество temp_error). Ошибка чтения
+// и отсутствие строки (её гарантирует первый проход реконсиляции;
+// пропасть может только при ручной правке таблицы — runbooks §6) —
+// ошибка прохода: молчаливый рассинхрон сделал бы guard ложью, громче
+// ошибкой (философия renderDebtCount T-181).
+func retryTempCount(ctx context.Context, pool RetryDB) (int64, error) {
+	rows, err := pool.Query(ctx, retryCounterSQL)
+	if err != nil {
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: счётчик temp_error: %w", err)
+	}
+	defer rows.Close()
+	var n int64
+	if !rows.Next() {
+		// Сначала сбой чтения: обрыв соединения — не «строки нет»,
+		// диагноз отсутствия строки должен быть честным (runbooks §6
+		// ведёт оператора делать пересчёт crawlerctl counters recount).
+		if err := rows.Err(); err != nil {
+			return 0, fmt.Errorf("scheduler: повторные проверки temp_error: счётчик temp_error: %w", err)
+		}
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: строка счётчика 'status_temp_error' отсутствует (реконсиляция T-178, runbooks §6)")
+	}
+	if err := rows.Scan(&n); err != nil {
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: счётчик temp_error: чтение: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: счётчик temp_error: %w", err)
+	}
+	return n, nil
 }
 
 // retryUpdate выполняет пачечный UPDATE … RETURNING и возвращает число
