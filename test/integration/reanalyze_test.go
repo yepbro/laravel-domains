@@ -226,8 +226,12 @@ func TestReanalyze_TickCursor(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatalf("EXPLAIN: %v", err)
 		}
-		if !strings.Contains(plan.String(), "subdomain_results_checked_idx") {
-			t.Errorf("предикат композитного курсора не обслуживается subdomain_results_checked_idx:\n%s",
+		// Родительский индекс subdomain_results_checked_idx (миграция 0014)
+		// партиционирован: на листе DEFAULT экземпляр материализуется как
+		// subdomain_results_default_checked_at_idx (и <лист>_checked_at_idx
+		// на зональных) — assert по суффиксу имени, инвариантному к разбиению.
+		if !strings.Contains(plan.String(), "_checked_at_idx") {
+			t.Errorf("предикат композитного курсора не обслуживается листовым экземпляром subdomain_results_checked_idx:\n%s",
 				plan.String())
 		}
 	})
