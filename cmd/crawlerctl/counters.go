@@ -106,15 +106,25 @@ func openCountersPool(ctx context.Context) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// countersResolveZone — punycode-имя зоны → id справочника; пустое имя —
-// nil (все зоны).
-func countersResolveZone(ctx context.Context, pool *pgxpool.Pool, name string) (*int16, string, error) {
+// countersZoneName — punycode-имя зоны: нормализация/синтаксис ДО
+// обращения к БД (некорректное имя — ошибка использования, код 2,
+// без зависимости от доступности стека); пустое имя — все зоны.
+func countersZoneName(name string) (string, error) {
 	if name == "" {
-		return nil, "все", nil
+		return "", nil
 	}
 	normalized, err := idn.NormalizeZone(name)
 	if err != nil {
-		return nil, "", fmt.Errorf("некорректное имя зоны %q: %w", name, err)
+		return "", fmt.Errorf("некорректное имя зоны %q: %w", name, err)
+	}
+	return normalized, nil
+}
+
+// countersResolveZone — нормализованное имя зоны → id справочника;
+// пустое имя — nil (все зоны).
+func countersResolveZone(ctx context.Context, pool *pgxpool.Pool, normalized string) (*int16, string, error) {
+	if normalized == "" {
+		return nil, "все", nil
 	}
 	id, found, err := analyzer.ZoneIDByName(ctx, pool, normalized)
 	if err != nil {
@@ -266,6 +276,10 @@ func countersRecount(args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() > 0 {
 		return usagef("counters recount: лишние аргументы %v", fs.Args())
 	}
+	normalized, err := countersZoneName(*zone)
+	if err != nil {
+		return usagef("counters recount: %v", err)
+	}
 
 	ctx, stop := signalCtx()
 	defer stop()
@@ -276,7 +290,7 @@ func countersRecount(args []string, stdout, stderr io.Writer) error {
 	}
 	defer pool.Close()
 
-	zoneID, zoneDesc, err := countersResolveZone(ctx, pool, *zone)
+	zoneID, zoneDesc, err := countersResolveZone(ctx, pool, normalized)
 	if err != nil {
 		return usagef("counters recount: %v", err)
 	}
@@ -319,6 +333,10 @@ func countersVerify(args []string, stdout, stderr io.Writer) error {
 	if *tolerance < 0 {
 		return usagef("counters verify: допуск %d < 0", *tolerance)
 	}
+	normalized, err := countersZoneName(*zone)
+	if err != nil {
+		return usagef("counters verify: %v", err)
+	}
 
 	ctx, stop := signalCtx()
 	defer stop()
@@ -329,7 +347,7 @@ func countersVerify(args []string, stdout, stderr io.Writer) error {
 	}
 	defer pool.Close()
 
-	zoneID, zoneDesc, err := countersResolveZone(ctx, pool, *zone)
+	zoneID, zoneDesc, err := countersResolveZone(ctx, pool, normalized)
 	if err != nil {
 		return usagef("counters verify: %v", err)
 	}

@@ -82,20 +82,19 @@ func TestCountersVerifyUsage(t *testing.T) {
 	}
 }
 
-// TestCountersZoneFlagUsage — несуществующее/некорректное имя зоны:
-// ошибка использования с причиной, код 2 (до какой-либо записи; в
-// окружении с живым стеком — отказ «зона не найдена», без стека —
-// «некорректное имя»: обе ветки код 2, стиль near).
+// TestCountersZoneFlagUsage — некорректное имя зоны (символ вне
+// UTS-46: «_»): ошибка использования ДО обращения к БД, код 2 —
+// поведение не зависит от доступности стека (CI гоняет юнит-прогоны
+// без postgres; пробелы cleanup вырезает — «a b.test» нормализуется
+// в валидное «ab.test» и годится только веткой живого стека).
 func TestCountersZoneFlagUsage(t *testing.T) {
 	for _, sub := range []string{"recount", "verify"} {
 		var stdout, stderr bytes.Buffer
-		code := run([]string{"counters", sub, "--zone", "a b.test"}, &stdout, &stderr)
+		code := run([]string{"counters", sub, "--zone", "a_b.test"}, &stdout, &stderr)
 		if code != exitUsage {
 			t.Fatalf("%s: код = %d, хочу 2; stderr:\n%s", sub, code, stderr.String())
 		}
-		msg := stderr.String()
-		reasoned := strings.Contains(msg, "некорректное") || strings.Contains(msg, "не найдена")
-		if !strings.Contains(msg, "зона") || !reasoned {
+		if msg := stderr.String(); !strings.Contains(msg, "некорректное имя зоны") {
 			t.Errorf("%s: stderr без причины:\n%s", sub, msg)
 		}
 	}
