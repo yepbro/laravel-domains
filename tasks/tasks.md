@@ -1121,7 +1121,7 @@ lag 0) был фантомным: анализатор успевает за п�
   `make test`/`make lint` зелёные. ТЗ:
   [`task_four_topcpu_ticks_underflow.md`](./task_four_topcpu_ticks_underflow.md).
 
-- **T-190** [новая] — P3, гонки тестов slowquery под `-race` (находка
+- **T-190** [в работе] — P3, гонки тестов slowquery под `-race` (находка
   T-189): нестандартный прогон `go test -race ./internal/monitor`
   вскрывает 8 WARNING в `TestSlowQueryLoop_*` (T-177) — гонки в самих
   тестах (фейк/цикл), существующие с T-177; штатный `make test` не
