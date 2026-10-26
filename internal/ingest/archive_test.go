@@ -146,9 +146,9 @@ func buildGz(t *testing.T, path, content string) {
 	}
 }
 
-// addExecs — заготовка удачного применения add: ответы CTE вставки/
-// возврата (Query, T-178) уходят в поля пула, Exec остаются две
-// очистки Stage — перед загрузкой и после применения.
+// addExecs — заготовка удачного применения add: ответы вставки пачки/
+// возврата уходят в поля пула (Query по модели staging, T-205), Exec
+// остаются две очистки Stage — перед загрузкой и в транзакции применения.
 func addExecs(pool *pipePool, n, r int) []pipeExec {
 	pool.inserted, pool.revived = int64(n), int64(r)
 	return []pipeExec{
@@ -317,10 +317,15 @@ func TestPipelineArchiveZip(t *testing.T) {
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:5", // строки всех членов — одна партия
+		"begin",
+		"query:" + addChunkBoundSQL,
 		"query:" + insertAddSQL,
+		"query:" + addChunkBoundSQL,
+		"exec:" + zoneDeltaAddSQL,
 		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
+		"commit",
 	}
 	if got := strings.Join(pt.pool.ops, "\n"); got != strings.Join(want, "\n") {
 		t.Errorf("порядок обращений =\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
@@ -888,13 +893,17 @@ func TestPipelineArchiveEmpty(t *testing.T) {
 			if len(pt.files.records) != 1 {
 				t.Error("отчёт пустого архива должен записаться в журнал")
 			}
-			// COPY с пустой пачкой не выполняется (db.CopyFrom: пустая пачка — no-op).
+			// COPY с пустой пачкой не выполняется (db.CopyFrom: пустая
+			// пачка — no-op); применение пустой партии — граница и подсчёт
+			// без вставки и дельт зон (T-205).
 			want := []string{
 				"exec:" + clearStageSQL,
-				"query:" + insertAddSQL,
+				"begin",
+				"query:" + addChunkBoundSQL,
 				"query:" + reviveAddSQL,
 				"query:" + countAddSQL,
 				"exec:" + clearStageSQL,
+				"commit",
 			}
 			if got := strings.Join(pt.pool.ops, "\n"); got != strings.Join(want, "\n") {
 				t.Errorf("обращения =\n%s\nwant:\n%s", got, strings.Join(want, "\n"))

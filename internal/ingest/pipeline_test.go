@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -42,11 +43,14 @@ type pipeExec struct {
 }
 
 // pipePool — db.DB для конвейера: CopyFrom считает строки пачек COPY
-// (staging), Exec выдаёт результаты по очереди, Query отвечает на
-// известные SQL ApplyAdd/ApplyDelete. Как реальный pgx, отказывается
-// работать с отменённым контекстом.
+// (staging), Exec выдаёт результаты по очереди (в транзакции применения
+// add — общая очередь), Query отвечает на известные SQL ApplyAdd
+// (граница пачки и RETURNING вставки — по модели staging: строки COPY
+// партии с line_no в диапазоне курсора; inserted — сколько строк пачки
+// «вставляется», конфликтами считаются остальные) и ApplyDelete. Как
+// реальный pgx, отказывается работать с отменённым контекстом.
 type pipePool struct {
-	ops      []string // протокол: "exec:<sql>", "query:<sql>", "copy:<n>"
+	ops      []string // протокол: "exec:<sql>", "query:<sql>", "copy:<n>", "begin", "commit"
 	copies   []int64  // размеры пачек COPY по очереди
 	copyVals [][]any  // строки всех пачек COPY (значения колонок)
 	copyErr  error
@@ -59,6 +63,9 @@ type pipePool struct {
 	uniques    int64 // ответ countAddSQL (уникальных доменов партии add)
 	delDeleted int64 // ответ applyDeleteSQL
 	delMissing int64
+
+	begins  int
+	commits int
 }
 
 var _ db.DB = (*pipePool)(nil)
@@ -158,14 +165,38 @@ func (r *oneRowRows) RawValues() [][]byte    { return nil }
 func (r *oneRowRows) Conn() *pgx.Conn      { return nil }
 func (r *oneRowRows) TypeMap() *pgtype.Map { return nil }
 
-func (p *pipePool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, error) {
+func (p *pipePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	p.ops = append(p.ops, "query:"+sql)
 	switch sql {
+	case addChunkBoundSQL:
+		// Граница пачки: line_no limit-й строки партии после курсора по
+		// модели staging (строки COPY этой партии).
+		after, limit := args[2].(int64), args[3].(int)
+		rows := p.stageRows(args[0].([]byte), args[1].(int16), after, 1<<62)
+		if n := len(rows); n > limit {
+			rows = rows[:limit]
+		}
+		var bound int64
+		if len(rows) > 0 {
+			bound = rows[len(rows)-1].lineNo
+		}
+		return cleanupRows([]any{bound}), nil
 	case insertAddSQL:
-		return &oneRowRows{vals: []any{p.inserted}}, nil
+		// RETURNING zone_id вставленных строк пачки: первые inserted строк
+		// диапазона (остальные — конфликты).
+		from, to := args[2].(int64), args[3].(int64)
+		rows := p.stageRows(args[0].([]byte), args[1].(int16), from, to)
+		if n := int(p.inserted); n < len(rows) {
+			rows = rows[:n]
+		}
+		out := cleanupRows()
+		for _, r := range rows {
+			out.rows = append(out.rows, []any{r.zoneID})
+		}
+		return out, nil
 	case reviveAddSQL:
 		return &oneRowRows{vals: []any{p.revived}}, nil
 	case countAddSQL:
@@ -175,6 +206,62 @@ func (p *pipePool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, e
 	}
 	return nil, fmt.Errorf("pipePool: неожидаемый запрос: %s", sql)
 }
+
+// stagedRow — строка партии в модели staging фейка.
+type stagedRow struct {
+	lineNo int64
+	zoneID int16
+}
+
+// stageRows — строки партии в модели staging (строки COPY) с line_no в
+// (after, to]; to >= 1<<62 — без верхней границы.
+func (p *pipePool) stageRows(batch []byte, action int16, after, to int64) []stagedRow {
+	var rows []stagedRow
+	for _, vals := range p.copyVals {
+		if !bytes.Equal(vals[0].([]byte), batch) || vals[3].(int16) != action {
+			continue
+		}
+		if ln := vals[4].(int64); ln > after && ln <= to {
+			rows = append(rows, stagedRow{lineNo: ln, zoneID: vals[1].(int16)})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].lineNo < rows[j].lineNo })
+	return rows
+}
+
+// Begin — транзакция применения add (T-205): операции идут через пул
+// (общий протокол и очередь Exec), Commit/Rollback — флаги.
+func (p *pipePool) Begin(ctx context.Context) (pgx.Tx, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.begins++
+	p.ops = append(p.ops, "begin")
+	return &pipeTx{pool: p}, nil
+}
+
+// pipeTx — транзакция фейкового пула конвейера.
+type pipeTx struct {
+	pgx.Tx // остальные методы pgx.Tx конвейер не использует
+
+	pool *pipePool
+}
+
+func (t *pipeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return t.pool.Exec(ctx, sql, args...)
+}
+
+func (t *pipeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return t.pool.Query(ctx, sql, args...)
+}
+
+func (t *pipeTx) Commit(context.Context) error {
+	t.pool.commits++
+	t.pool.ops = append(t.pool.ops, "commit")
+	return nil
+}
+
+func (t *pipeTx) Rollback(context.Context) error { return nil }
 
 // --- сборка конвейера ------------------------------------------------------
 
@@ -299,15 +386,22 @@ func TestPipelineAdd(t *testing.T) {
 		t.Errorf("запись журнала = %+v, want %+v", rec, wantRec)
 	}
 
-	// Обращения к БД: очистка → COPY → вставка → возврат → подсчёт →
-	// очистка (Stage и ApplyAdd, фиксированный порядок T-017/T-018).
+	// Обращения к БД: очистка → COPY → применение в одной транзакции
+	// (граница пачки → вставка → граница «пусто» → дельты зон → возврат →
+	// подсчёт → очистка → фиксация), затем — ничего (Stage и ApplyAdd,
+	// фиксированный порядок T-017/T-018/T-205).
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:3",
+		"begin",
+		"query:" + addChunkBoundSQL,
 		"query:" + insertAddSQL,
+		"query:" + addChunkBoundSQL,
+		"exec:" + zoneDeltaAddSQL,
 		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
+		"commit",
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
 		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
@@ -611,10 +705,15 @@ func TestPipelineExtractLines(t *testing.T) {
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:3",
+		"begin",
+		"query:" + addChunkBoundSQL,
 		"query:" + insertAddSQL,
+		"query:" + addChunkBoundSQL,
+		"exec:" + zoneDeltaAddSQL,
 		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
+		"commit",
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
 		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
@@ -1142,10 +1241,14 @@ func TestPipelineRecordError(t *testing.T) {
 	if out.Kind != OutcomeLeft || !exists(t, abs) {
 		t.Fatalf("итог = %s, want left и файл в incoming", out.Kind)
 	}
-	// Применение состоялось полностью (вставка → возврат → подсчёт →
-	// очистка) — на повторе дубль по sha256 только перенесёт файл.
-	if len(pt.pool.ops) != 6 {
-		t.Errorf("обращений к БД = %d (%v), want 6 — применение завершено", len(pt.pool.ops), pt.pool.ops)
+	// Применение состоялось полностью (транзакция: границы/вставка пачки,
+	// дельты зон, возврат, подсчёт, очистка, фиксация) — на повторе дубль
+	// по sha256 только перенесёт файл.
+	if len(pt.pool.ops) != 11 {
+		t.Errorf("обращений к БД = %d (%v), want 11 — применение завершено", len(pt.pool.ops), pt.pool.ops)
+	}
+	if pt.pool.commits != 1 {
+		t.Errorf("фиксаций = %d, want 1", pt.pool.commits)
 	}
 }
 
@@ -1261,13 +1364,16 @@ func TestPipelineEmptyFile(t *testing.T) {
 	if len(pt.files.records) != 1 {
 		t.Error("отчёт пустого файла должен записаться в журнал")
 	}
-	// COPY с пустой пачкой не выполняется (db.CopyFrom: пустая пачка — no-op).
+	// COPY с пустой пачкой не выполняется (db.CopyFrom: пустая пачка — no-op);
+	// применение пустой партии — границы и подсчёт без вставки и дельт.
 	if strings.Join(pt.pool.ops, "\n") != strings.Join([]string{
 		"exec:" + clearStageSQL,
-		"query:" + insertAddSQL,
+		"begin",
+		"query:" + addChunkBoundSQL,
 		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
+		"commit",
 	}, "\n") {
 		t.Errorf("обращения = %v, want очистка → пустое применение → очистка", pt.pool.ops)
 	}

@@ -30,7 +30,6 @@ import (
 	"strings"
 	"time"
 
-	"crawler/internal/db"
 	"crawler/internal/model"
 )
 
@@ -92,17 +91,18 @@ type PipelineOptions struct {
 type Pipeline struct {
 	zones ZoneStore
 	files FileStore
-	pool  db.DB
+	pool  ApplyDB
 	opts  PipelineOptions
 	log   *slog.Logger
 	now   func() time.Time
 }
 
 // NewPipeline — конвейер над хранилищами: ZoneStore (T-014), FileStore
-// (журнал ingest_files, report.go) и пул db.DB для staging и применения.
-func NewPipeline(zones ZoneStore, files FileStore, pool db.DB, opts PipelineOptions) (*Pipeline, error) {
+// (журнал ingest_files, report.go) и пул ApplyDB для staging и применения
+// (применение add — в одной транзакции, T-205).
+func NewPipeline(zones ZoneStore, files FileStore, pool ApplyDB, opts PipelineOptions) (*Pipeline, error) {
 	if zones == nil || files == nil || pool == nil {
-		return nil, errors.New("ingest: конвейер: обязательны ZoneStore, FileStore и пул db.DB")
+		return nil, errors.New("ingest: конвейер: обязательны ZoneStore, FileStore и пул БД")
 	}
 	if opts.Dir == "" {
 		return nil, errors.New("ingest: конвейер: не задан каталог incoming (PipelineOptions.Dir)")
@@ -359,7 +359,9 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	// остаётся в incoming, повтор сойдётся к тому же итогу.
 	switch f.Action {
 	case model.ActionAdd:
-		res, aerr := ApplyAdd(ctx, p.pool, batch)
+		// Пачки применения — тем же ingest.batch_size, что и пачки COPY
+		// в staging (T-205).
+		res, aerr := ApplyAdd(ctx, p.pool, batch, p.opts.BatchSize)
 		if aerr != nil {
 			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: aerr}
