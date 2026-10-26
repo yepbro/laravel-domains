@@ -216,8 +216,12 @@ func TestRetryTempErrorPass(t *testing.T) {
 	}
 
 	// Дренаж пачками по 1 (T-031): BatchSize = 1 — каждая пачка полная,
-	// цикл продолжает итерации до исчерпания; третья выборка пуста —
-	// переведённые (pending) и незрелые не выбираются повторно.
+	// цикл продолжает итерации до исчерпания; переведённые (pending) и
+	// незрелые не выбираются повторно. Итераций с тяжёлой выборкой — две
+	// (по числу кандидатов): каждый перевод декрементирует корзину
+	// (2 → 1 → 0), нулевой guard останавливает дренаж ДО следующей
+	// выборки (T-202) — пустой тяжёлой выборки здесь не бывает; она —
+	// запасной останов дренажа при дрейфе корзин вверх.
 	t.Run("итерации дренажа сходятся: назначение и финализация", func(t *testing.T) {
 		var logBuf strings.Builder
 		logger := slog.New(slog.NewTextHandler(&logBuf, nil))
@@ -233,19 +237,19 @@ func TestRetryTempErrorPass(t *testing.T) {
 			})
 		}()
 
-		// Две полные пачки + пустая (сходство дренажа): ждём трёх тяжёлых
-		// выборок, четвёртой быть не должно (Interval = час).
+		// Две полные пачки по 1; ждём двух тяжёлых выборок, третьей быть
+		// не должно (guard закрыт декрементами; Interval = час).
 		deadline := time.Now().Add(10 * time.Second)
-		for pool.batchCalls() < 3 {
+		for pool.batchCalls() < 2 {
 			if time.Now().After(deadline) {
 				cancel()
 				t.Fatalf("дренаж не дошёл до исчерпания: тяжёлых выборок %d", pool.batchCalls())
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		time.Sleep(50 * time.Millisecond) // пустая пачка обязана остановить дренаж
-		if n := pool.batchCalls(); n != 3 {
-			t.Fatalf("тяжёлых выборок %d, хочу 3: пустая пачка останавливает дренаж", n)
+		time.Sleep(50 * time.Millisecond) // дренаж обязан остановиться без третьей выборки
+		if n := pool.batchCalls(); n != 2 {
+			t.Fatalf("тяжёлых выборок %d, хочу 2: нулевой guard закрывает дренаж до выборки", n)
 		}
 		cancel()
 		if err := <-done; err != nil {
@@ -351,7 +355,16 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// guard не входит — эпизоды зреют к полуночи, тяжёлая выборка не
 	// открывается, хотя домен формально ответил критерию статуса.
 	t.Run("сегодняшние эпизоды — guard не пускает", func(t *testing.T) {
-		seed("fresh", model.StatusTempError, model.CheckStateDone, "current_date", 0)
+		// Дата эпизода — current_date САМОЙ БД (bind-параметр $5::date
+		// принимает только литерал, «current_date» строкой не парсится;
+		// значение из БД — таймзона согласована с FILTER реконсиляции).
+		var today string
+		if err := pool.QueryRow(ctx,
+			"SELECT to_char(current_date, 'YYYY-MM-DD')",
+		).Scan(&today); err != nil {
+			t.Fatalf("current_date: %v", err)
+		}
+		seed("fresh", model.StatusTempError, model.CheckStateDone, today, 0)
 		if _, err := pool.Exec(ctx,
 			"INSERT INTO crawler_counters (name, value) "+
 				"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), 1)",
