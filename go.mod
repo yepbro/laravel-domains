@@ -4,7 +4,7 @@ go 1.26.9
 
 require (
 	github.com/andybalholm/brotli v1.2.6
-	github.com/chromedp/cdproto v0.157.8
+	github.com/chromedp/cdproto v0.158.4
 	github.com/chromedp/chromedp v0.21.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/golang-migrate/migrate/v4 v4.20.1
