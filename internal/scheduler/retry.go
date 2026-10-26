@@ -73,13 +73,13 @@ const (
 	// повтора 24 часа часовой проход назначает повтор не позже чем через
 	// час после готовности домена; если retry_after настроен меньше часа,
 	// интервал ужимается до него (withDefaults), чтобы цикл не «переспал»
-	// собственное окно. Стационар без temp_error держит guard (T-191,
-	// retryCounterSQL): часовой тик стоит одно точечное чтение строки
-	// счётчика, тяжёлая выборка пачки не выполняется вовсе; шторм когорты
-	// (массовый temp_error-эпизод) дренируется проходами подряд (drain),
-	// темп определяют UPDATE пачки, а не выборка — seq scan с ранним
-	// остановом LIMIT, закреплённый в транзакции выборки
-	// (retryCandidates, T-191).
+	// собственное окно. Стационар без зрелых кандидатов держит guard
+	// корзин зрелости (T-202, retryMatureSQL — уточнение T-191): часовой
+	// тик стоит одну дешёвую сумму строк счётчика, тяжёлая выборка пачки
+	// не выполняется вовсе; шторм когорты (массовый temp_error-эпизод)
+	// дренируется проходами подряд (drain), темп определяют UPDATE пачки,
+	// а не выборка — seq scan с ранним остановом LIMIT, закреплённый в
+	// транзакции выборки (retryCandidates, T-191).
 	DefaultRetryInterval = time.Hour
 )
 
@@ -144,18 +144,34 @@ const (
 	// add-файлом T-018), не инкрементируется повторно. Дельты счётчиков
 	// зон (checked −n / pending +n) — CTE zc того же оператора по
 	// RETURNING zone_id (T-178, ТЗИ §6.2: предикат пинирует старое
-	// состояние done); внешний SELECT — ключи переведённых строк.
+	// состояние done); CTE rm декрементирует корзину зрелости эпизода
+	// (T-202: перевод в pending завершает кандидату — момент зрелости
+	// выводится из last_checked_at, ключ тот же, что у инкремента записи
+	// результата, — комментарий retryMatureSQL); внешний SELECT — ключи
+	// переведённых строк. Порядок CTE «зоны (zc) → корзина (rm)» — общий
+	// с проходом реконсиляции; порядок нессылаемых DML-CTE —
+	// реализационная деталь PG (оговорка в zonestats.go, ревью T-202).
+	// ORDER BY в rm детерминирует захват строк корзин по возрастанию даты
+	// (= имени: старые → вчерашняя) — общий порядок с проходом monitor
+	// (очистка старых по индексу → вчерашняя → сегодняшняя), без AB-BA
+	// цикла на смешанных датах пачки (ревью T-202, P2).
 	retryRequeueSQL = "WITH upd AS (UPDATE domains d " +
 		"SET check_state = $3, temp_attempts = d.temp_attempts + 1 " +
 		"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
 		"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id " +
 		"AND d.status = $4 AND d.check_state = $5 " +
-		"RETURNING d.zone_id, d.id), " +
+		"RETURNING d.zone_id, d.id, d.last_checked_at), " +
 		"zc AS (UPDATE zones AS z " +
 		"SET domains_checked = z.domains_checked - c.n, " +
 		"domains_pending = z.domains_pending + c.n " +
 		"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
-		"WHERE z.id = c.zone_id) " +
+		"WHERE z.id = c.zone_id), " +
+		"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
+		"SELECT 'retry_mature:' || to_char(u.last_checked_at, 'YYYY-MM-DD'), -count(*), now() " +
+		"FROM upd AS u GROUP BY u.last_checked_at " +
+		"ORDER BY u.last_checked_at " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) " +
 		"SELECT u.zone_id, u.id FROM upd AS u"
 
 	// retryFinalizeSQL — исчерпание попыток: итоговый статус по последней
@@ -164,31 +180,60 @@ const (
 	// счётчика. Охрана та же, что у назначения повтора. Дельт счётчиков
 	// зон нет: check_state остаётся done, status-распределение
 	// инкрементами не ведётся — его пишет реконсиляция monitor (ТЗИ
-	// §13.3, T-178).
-	retryFinalizeSQL = "UPDATE domains d " +
+	// §13.3, T-178). CTE rm декрементирует корзину зрелости (T-202):
+	// финализация, как и назначение повтора, завершает кандидату — без
+	// декремента корзина держала бы guard открытым после дренажа (холостые
+	// seq scan каждый тик до прохода реконсиляции); ORDER BY —
+	// детерминация захвата строк корзин, как у retryRequeueSQL (ревью
+	// T-202, P2).
+	retryFinalizeSQL = "WITH upd AS (UPDATE domains d " +
 		"SET status = $3, temp_attempts = 0 " +
 		"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
 		"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id " +
 		"AND d.status = $4 AND d.check_state = $5 " +
-		"RETURNING d.zone_id, d.id"
+		"RETURNING d.zone_id, d.id, d.last_checked_at), " +
+		"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
+		"SELECT 'retry_mature:' || to_char(u.last_checked_at, 'YYYY-MM-DD'), -count(*), now() " +
+		"FROM upd AS u GROUP BY u.last_checked_at " +
+		"ORDER BY u.last_checked_at " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) " +
+		"SELECT u.zone_id, u.id FROM upd AS u"
 )
 
-// retryCounterSQL — guard прохода точечным чтением счётчика статуса
-// temp_error (T-191; легенда строк — monitor.CounterNames, T-178: имя =
-// "status_" + имя статуса; значение пишет реконсиляция monitor,
-// инкременты переходов его не ведут — статус-распределение абсолютно,
-// ТЗИ §13.3). value = 0 — тяжёлая выборка кандидатов (seq scan по
-// domains) не выполняется вовсе: зрелые кандидаты — подмножество
-// temp_error, нулевой счётчик ⇒ кандидатов нет (стационар без temp_error
-// стоит одно чтение строки за тик); отсутствие строки — ошибка прохода
-// (строку гарантирует первый проход реконсиляции T-178; молчаливый
-// рассинхрон сделал бы guard ложью — философия T-181). Не путать со
-// строкой temp_error:YYYY-MM-DD (T-182): та — события суток, этот
-// счётчик — состояние (число доменов в статусе сейчас). Имя строится из
-// model.StatusTempError (стиль кодов схемы из модели — renderq.go),
-// литерал разошёлся бы при переименовании статуса.
-var retryCounterSQL = "SELECT value FROM crawler_counters WHERE name = 'status_" +
-	model.StatusTempError.String() + "'"
+// retryMatureSQL — guard прохода суммой корзин зрелости temp_error
+// (T-202, уточнение guard T-191: счётчик status_temp_error не отличал
+// зрелых кандидатов от незрелых — 543 тыс. temp_error при пустом окне
+// зрелости держали seq scan без раннего останова на каждом часовом тике,
+// медиана 51 с / max 239 с после фикса T-191). Корзина
+// crawler_counters['retry_mature:YYYY-MM-DD'] — temp_error-эпизоды
+// суток (дата эпизода = last_checked_at записи результата): +1 пишут
+// инкременты транзакций записи результата (httpworker/record.go и
+// терминальная temp_error-ветка DNS-этапа dnsworker/result.go — оба
+// источника эпизодов), −n — CTE rm назначения повтора и финализации
+// (кандидата исчерпана); авторитет — реконсиляция monitor
+// (FILTER-позиции прохода, T-202). Сумма корзин прошедших суток —
+// число зрелых кандидатов: last_checked_at — date (миграция 000001),
+// окно «старше 24 ч» по date-колонке зреет когортами в полночь, поэтому
+// ключ корзины — дата эпизода (эквивалент «момента созревания now+24 ч,
+// округлённого до часа»: при date-точности колонки все эпизоды суток
+// зреют вместе в полночь следующего дня — часовая гранулярность
+// вырождается в суточную, формат наследует T-179; тот же ключ выводим и
+// инкрементом (current_date), и декрементом (last_checked_at) —
+// рассинхрон ключей лишил бы декремент адресата). Диапазон по
+// PK-префиксу 'retry_mature:' лексикографически отсекает корзину
+// текущих суток (name < …current_date: сегодняшние эпизоды ещё
+// незрелые) — имя дня вычисляет БД, Go-часы в границе не участвуют
+// (стиль T-179).
+// coalesce — строк корзин может не быть вовсе (до первого инкремента
+// или прохода реконсиляции): честный ноль, а не ошибка — в отличие от
+// status_temp_error строки корзин nobody не гарантирует, их отсутствие
+// и есть «зрелых нет». Значение ≤ 0 — зрелых нет: тяжёлая выборка
+// (seq scan по domains) не выполняется вовсе, стационар стоит одну
+// сумму индексного диапазона из пары строк.
+var retryMatureSQL = "SELECT coalesce(sum(value), 0) FROM crawler_counters " +
+	"WHERE name >= 'retry_mature:' " +
+	"AND name < 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')"
 
 // RetryDB — пул для прохода: db.DB, из которого можно начать транзакцию.
 // Оба решения пачки (назначение повтора и итоговый статус) атомарны в
@@ -269,9 +314,10 @@ type retryCandidate struct {
 // получают либо назначенный повтор (check_state → pending,
 // temp_attempts + 1 — попыток меньше MaxRetries), либо итоговый статус
 // delegated_no_address (попытки исчерпаны, temp_attempts → 0). До
-// выборки — guard счётчиком crawler_counters['status_temp_error']
-// (T-191, retryTempCount): нулевой счётчик возвращает пустой результат
-// без тяжёлой выборки. Повторный проход безопасен (ТЗ 3.4): домены в
+// выборки — guard суммой корзин зрелости
+// crawler_counters['retry_mature:…'] прошедших суток (T-202,
+// retryMatureCount): нулевая сумма возвращает пустой результат без
+// тяжёлой выборки. Повторный проход безопасен (ТЗ 3.4): домены в
 // pending больше не кандидаты, охраны в UPDATE перепроверяют состояние
 // на момент записи.
 func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResult, error) {
@@ -280,17 +326,18 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 	}
 	o := opts.withDefaults()
 
-	// Guard счётчиком статуса temp_error (T-191): до тяжёлой выборки —
-	// точечное чтение crawler_counters['status_temp_error'] (retryTempCount);
-	// 0 → пустой результат без выборки и транзакции (drain корректно
-	// останавливается). Отрицательное значение кодом не порождается
-	// (реконсиляция пишет абсолютные числа) и трактуется так же — тихий
-	// баг счётчика не должен молотить БД.
-	temp, err := retryTempCount(ctx, pool)
+	// Guard корзинами зрелости (T-202): до тяжёлой выборки — сумма корзин
+	// прошедших суток (retryMatureCount); 0 → пустой результат без выборки
+	// и транзакции (drain корректно останавливается). Отрицательная сумма —
+	// видимый дрейф декрементов мимо инкрементов (кандидаты, ушедшие мимо
+	// ретрая: удаление temp_error-домена delete-файлом, возрастная
+	// перепроверка T-030): реконсиляция выровняет, а guard обязан молчать —
+	// тихий баг счётчика не должен молотить БД (наследие T-191).
+	mature, err := retryMatureCount(ctx, pool)
 	if err != nil {
 		return RetryResult{}, err
 	}
-	if temp <= 0 {
+	if mature <= 0 {
 		return RetryResult{}, nil
 	}
 
@@ -299,10 +346,12 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 		return RetryResult{}, err
 	}
 	if len(candidates) == 0 {
-		// Счётчик видит temp_error, выборка — нет созревших (когорта зреет
-		// в полночь, дренаж уже прошёл; TZ T-191 §4.3 — остаточный случай,
-		// один холостой seq scan за тик): транзакция обновления не
-		// открывается.
+		// Корзины видят зрелых, выборка — нет (дрейф корзин: кандидат ушёл
+		// мимо инкрементов/декрементов, ЛИБО редкие зрелые рассеяны и ранний
+		// останов LIMIT их не догнал): транзакция обновления не открывается,
+		// один холостой seq scan за тик до ближайшей реконсиляции —
+		// остаточный случай TZ T-191 §4.3, суженный T-202 с «всех temp_error»
+		// до «суммы корзин».
 		return RetryResult{}, nil
 	}
 
@@ -406,35 +455,33 @@ func retryCandidates(ctx context.Context, pool RetryDB, limit int, retryAfter ti
 	return candidates, nil
 }
 
-// retryTempCount — guard прохода повторных проверок (T-191): точечное
-// чтение счётчика статуса crawler_counters['status_temp_error']
-// (retryCounterSQL; значение пишет реконсиляция T-178 — guard читает
-// состояние, зрелые кандидаты — подмножество temp_error). Ошибка чтения
-// и отсутствие строки (её гарантирует первый проход реконсиляции;
-// пропасть может только при ручной правке таблицы — runbooks §6) —
-// ошибка прохода: молчаливый рассинхрон сделал бы guard ложью, громче
-// ошибкой (философия renderDebtCount T-181).
-func retryTempCount(ctx context.Context, pool RetryDB) (int64, error) {
-	rows, err := pool.Query(ctx, retryCounterSQL)
+// retryMatureCount — guard прохода повторных проверок (T-202): сумма
+// корзин зрелости crawler_counters['retry_mature:…'] прошедших суток
+// (retryMatureSQL; ведут инкременты записи результата, декременты
+// ретрая и реконсиляция monitor — guard читает зрелых кандидатов, а не
+// весь статус temp_error, как T-191). coalesce в SQL гарантирует одну
+// строку даже без строк корзин (честный ноль): пустой набор — обрыв
+// протокола, а не «корзин нет», и обязан быть ошибкой.
+func retryMatureCount(ctx context.Context, pool RetryDB) (int64, error) {
+	rows, err := pool.Query(ctx, retryMatureSQL)
 	if err != nil {
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: счётчик temp_error: %w", err)
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: %w", err)
 	}
 	defer rows.Close()
 	var n int64
 	if !rows.Next() {
-		// Сначала сбой чтения: обрыв соединения — не «строки нет»,
-		// диагноз отсутствия строки должен быть честным (runbooks §6
-		// ведёт оператора делать пересчёт crawlerctl counters recount).
+		// Сначала сбой чтения: обрыв соединения — не «пустая сумма»
+		// (coalesce в SQL отвечает строкой всегда).
 		if err := rows.Err(); err != nil {
-			return 0, fmt.Errorf("scheduler: повторные проверки temp_error: счётчик temp_error: %w", err)
+			return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: %w", err)
 		}
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: строка счётчика 'status_temp_error' отсутствует (реконсиляция T-178, runbooks §6)")
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: пустой ответ агрегата")
 	}
 	if err := rows.Scan(&n); err != nil {
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: счётчик temp_error: чтение: %w", err)
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: чтение: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: счётчик temp_error: %w", err)
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: %w", err)
 	}
 	return n, nil
 }

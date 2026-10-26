@@ -45,6 +45,7 @@ const (
 	recordEvShift   recordEventKind = "zone-shift"    // дельта счётчиков зоны (T-178)
 	recordEvChecks  recordEventKind = "checks-bump"   // дельта суточного счётчика проверок (T-179)
 	recordEvTempErr recordEventKind = "temp-err-bump" // дельта суточного числителя temp_error (T-182)
+	recordEvMature  recordEventKind = "mature-bump"   // дельта корзины зрелости ретрая (T-202)
 	recordEvCommit  recordEventKind = "commit"
 	recordEvPublish recordEventKind = "publish"
 	recordEvAck     recordEventKind = "ack"
@@ -150,9 +151,10 @@ type recordFakeRow struct {
 // recordFakePool — RecordDB без БД: живая семантика domains (охрана
 // status <> deleted у UPDATE), subdomain_results (DELETE … RETURNING,
 // INSERT-пачка), contents (refcount с охраной > 0), счётчиков зон
-// (recordZoneShiftSQL, T-178), суточного счётчика проверок и его
+// (recordZoneShiftSQL, T-178), суточного счётчика проверок, его
 // temp_error-числителя (recordChecksBumpSQL/recordTempErrBumpSQL,
-// T-179/T-182 — имя дня вычисляет БД, фейк ведёт по одному значению
+// T-179/T-182) и корзины зрелости ретрая (recordRetryMatureBumpSQL,
+// T-202 — имя дня/суток вычисляет БД, фейк ведёт по одному значению
 // «строк текущего дня»). Транзакция работает
 // на снапшоте: Rollback восстанавливает состояние пула, Commit оставляет
 // (достаточно для последовательных вызовов записи; конкурентные
@@ -166,6 +168,9 @@ type recordFakePool struct {
 	zones   map[int16]*recordFakeZone
 	checks  int64
 	tempErr int64
+	// retryMature — корзина зрелости ретрая текущих суток (T-202): имя
+	// вычисляет БД, фейк ведёт одно значение (стиль суточных строк).
+	retryMature int64
 
 	begins   int
 	txs      int // создано транзакций
@@ -175,6 +180,7 @@ type recordFakePool struct {
 	deleteErr error
 	commitErr error
 	insertTag int64 // RowsAffected INSERT (0 — честный ответ)
+	matureTag int64 // RowsAffected upsert корзины зрелости (0 — честный ответ)
 
 	mu sync.Mutex
 }
@@ -216,6 +222,13 @@ func (p *recordFakePool) tempErrValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.tempErr
+}
+
+// retryMatureValue — значение корзины зрелости ретрая (T-202) под замком.
+func (p *recordFakePool) retryMatureValue() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.retryMature
 }
 
 var _ RecordDB = (*recordFakePool)(nil)
@@ -279,12 +292,13 @@ func (p *recordFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	}
 	snapChecks := p.checks
 	snapTempErr := p.tempErr
+	snapMature := p.retryMature
 	p.txs++
 	p.j.record(recordEvBegin)
 	return &recordFakeTx{
 		pool: p, j: p.j,
 		snapDomains: snapDomains, snapRows: snapRows, snapRefc: snapRefc, snapZones: snapZones,
-		snapChecks: snapChecks, snapTempErr: snapTempErr,
+		snapChecks: snapChecks, snapTempErr: snapTempErr, snapMature: snapMature,
 	}, nil
 }
 
@@ -301,6 +315,7 @@ type recordFakeTx struct {
 	snapZones   map[int16]*recordFakeZone
 	snapChecks  int64
 	snapTempErr int64
+	snapMature  int64
 	committed   bool
 }
 
@@ -458,6 +473,17 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		t.pool.tempErr += args[0].(int64)
 		t.j.record(recordEvTempErr)
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	case recordRetryMatureBumpSQL:
+		// Инкремент корзины зрелости ретрая (T-202): третья пара —
+		// выполняют только temp_error-эпизоды (статус гарантирует
+		// вызывающий), фейк ведёт одно значение корзины суток;
+		// matureTag — страховочная ветка RowsAffected ≠ 1.
+		t.pool.retryMature += args[0].(int64)
+		t.j.record(recordEvMature)
+		if t.pool.matureTag != 0 {
+			return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", t.pool.matureTag)), nil
+		}
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	default:
 		if !strings.HasPrefix(sql, recordDelRefSQLPrefix) {
 			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: неожидаемый SQL: %s", sql)
@@ -524,6 +550,7 @@ func (t *recordFakeTx) Rollback(context.Context) error {
 	t.pool.domains, t.pool.rows, t.pool.refc, t.pool.zones = t.snapDomains, t.snapRows, t.snapRefc, t.snapZones
 	t.pool.checks = t.snapChecks
 	t.pool.tempErr = t.snapTempErr
+	t.pool.retryMature = t.snapMature
 	return nil
 }
 
@@ -1070,20 +1097,22 @@ func TestRecordCutoffFlag(t *testing.T) {
 	}
 }
 
-// TestRecordTempErrCounter — суточный числитель temp_error (T-182):
-// инкремент — только у temp_error-итога эпизода (та же транзакция, после
-// знаменателя checks:, до фиксации — порядок общий с проходом
-// реконсиляции); no_http-итог строку дня не трогает; дубль-доставка
-// temp_error-эпизода — ещё одно событие в числителе и знаменателе
-// одновременно (доля устойчива, абсолюты чинит реконсиляция,
-// TZ_slow_dns_share §5).
+// TestRecordTempErrCounter — суточный числитель temp_error (T-182) и
+// корзина зрелости ретрая (T-202): инкремент — только у temp_error-итога
+// эпизода (та же транзакция, после знаменателя checks:, до фиксации —
+// порядок общий с проходом реконсиляции); no_http-итог строку дня не
+// трогает; дубль-доставка temp_error-эпизода — ещё одно событие в
+// числителе, знаменателе и корзине одновременно (доля устойчива,
+// корзину между проходами выравнивает декремент ретрая, абсолюты чинит
+// реконсиляция, TZ_slow_dns_share §5 / T-202).
 func TestRecordTempErrCounter(t *testing.T) {
 	pool := newRecordFakePool()
 	q := &recordFakeQueue{j: pool.j}
 	r := recordRecorder(t, pool, q)
 
-	// temp_error-эпизод: +1 знаменатель, +1 числитель, инкремент числителя
-	// — между знаменателем и фиксацией.
+	// temp_error-эпизод: +1 знаменатель, +1 числитель, +1 корзина;
+	// инкременты — между знаменателем и фиксацией, корзина — за
+	// числителем (порядок блокировок прохода реконсиляции).
 	temp := recordSilentResult(true)
 	pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
 	if ok, err := r.RecordAndPublish(context.Background(), temp); err != nil || !ok {
@@ -1095,13 +1124,18 @@ func TestRecordTempErrCounter(t *testing.T) {
 	if got := pool.tempErrValue(); got != 1 {
 		t.Fatalf("после temp_error-эпизода temp_error = %d, want 1", got)
 	}
-	if checks, tempBump := pool.j.indexOf(recordEvChecks), pool.j.indexOf(recordEvTempErr); tempBump < checks || tempBump > pool.j.indexOf(recordEvCommit) {
-		t.Fatalf("порядок: checks=%d temp=%d commit=%d (checks → temp_error → фиксация)",
-			checks, tempBump, pool.j.indexOf(recordEvCommit))
+	if got := pool.retryMatureValue(); got != 1 {
+		t.Fatalf("после temp_error-эпизода retry_mature = %d, want 1", got)
+	}
+	checks, tempBump := pool.j.indexOf(recordEvChecks), pool.j.indexOf(recordEvTempErr)
+	matureBump, commit := pool.j.indexOf(recordEvMature), pool.j.indexOf(recordEvCommit)
+	if tempBump < checks || matureBump < tempBump || matureBump > commit {
+		t.Fatalf("порядок: checks=%d temp=%d mature=%d commit=%d (checks → temp_error → retry_mature → фиксация)",
+			checks, tempBump, matureBump, commit)
 	}
 
-	// no_http-эпизод: знаменатель растёт, числитель не тронут — оператор
-	// выполняют только temp_error-итоги.
+	// no_http-эпизод: знаменатель растёт, числитель и корзина не тронуты —
+	// операторы выполняют только temp_error-итоги.
 	silent := recordSilentResult(false)
 	pool.recordSeedDomain(silent.ZoneID, silent.DomainID, model.StatusNew, 0)
 	if ok, err := r.RecordAndPublish(context.Background(), silent); err != nil || !ok {
@@ -1113,12 +1147,19 @@ func TestRecordTempErrCounter(t *testing.T) {
 	if got := pool.tempErrValue(); got != 1 {
 		t.Fatalf("после no_http-эпизода temp_error = %d, want 1 (не temp_error-итог не инкрементирует)", got)
 	}
+	if got := pool.retryMatureValue(); got != 1 {
+		t.Fatalf("после no_http-эпизода retry_mature = %d, want 1 (зреют только temp_error-эпизоды)", got)
+	}
 	if n := pool.j.count(recordEvTempErr); n != 1 {
 		t.Fatalf("инкрементов temp_error = %d, want 1", n)
 	}
+	if n := pool.j.count(recordEvMature); n != 1 {
+		t.Fatalf("инкрементов корзины = %d, want 1", n)
+	}
 
-	// Дубль-доставка temp_error-эпизода: +1 в числитель и знаменатель
-	// вместе — событие записи, ретраи остаются в истории (§5.1).
+	// Дубль-доставка temp_error-эпизода: +1 в числитель, знаменатель и
+	// корзину вместе — событие записи, дрейф с живым доменным счётом
+	// сводит реконсиляция (T-202).
 	if ok, err := r.RecordAndPublish(context.Background(), temp); err != nil || !ok {
 		t.Fatalf("повтор temp_error-эпизода: ok=%v err=%v", ok, err)
 	}
@@ -1127,6 +1168,9 @@ func TestRecordTempErrCounter(t *testing.T) {
 	}
 	if got := pool.tempErrValue(); got != 2 {
 		t.Fatalf("после повтора temp_error = %d, want 2 (по одному событию на запись)", got)
+	}
+	if got := pool.retryMatureValue(); got != 2 {
+		t.Fatalf("после повтора retry_mature = %d, want 2 (по одному событию на запись)", got)
 	}
 }
 
@@ -1362,6 +1406,41 @@ func TestRecordTransactionFailures(t *testing.T) {
 		}
 		if got := pool.tempErrValue(); got != 0 {
 			t.Fatalf("суточный числитель temp_error = %d после отката, want 0", got)
+		}
+	})
+	t.Run("корзина зрелости ретрая", func(t *testing.T) {
+		// T-202: сбой инкремента корзины откатывает транзакцию целиком —
+		// эпизод без корзины открыл бы guard ретрая на сутки меньше.
+		temp := recordSilentResult(true)
+		pool, q := seed(t)
+		pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
+		pool.failExec = map[string]error{recordRetryMatureBumpSQL: errors.New("счётчики недоступны")}
+		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), temp)
+		assertRolledBack(t, pool, q, err, 0)
+		dom := pool.domains[recordDomainKey{zone: temp.ZoneID, id: temp.DomainID}]
+		if dom.status != model.StatusNew || dom.checkState != model.CheckStateQueued {
+			t.Fatalf("temp_error-домен изменён при сбое корзины: %v/%v — транзакция обязана откатиться",
+				dom.status, dom.checkState)
+		}
+		if got := pool.retryMatureValue(); got != 0 {
+			t.Fatalf("корзина зрелости = %d после отката, want 0", got)
+		}
+	})
+	t.Run("корзина зрелости: RowsAffected ≠ 1", func(t *testing.T) {
+		// T-202, ревью P3-2: страховочная ветка upsert'а — «молчаливая
+		// потеря дельты держала бы guard ретрая закрытым», ответ ≠ 1
+		// обязан ошибкой и откатом (молчание — баг счётчика).
+		temp := recordSilentResult(true)
+		pool, q := seed(t)
+		pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
+		pool.matureTag = 2 // INSERT 0 2 — чужой SQL/распад протокола
+		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), temp)
+		assertRolledBack(t, pool, q, err, 0)
+		if err == nil || !strings.Contains(err.Error(), "затронуто 2 строк (upsert корзины суток обязан 1)") {
+			t.Fatalf("ошибка = %v, want RowsAffected-гард корзины зрелости", err)
+		}
+		if got := pool.retryMatureValue(); got != 0 {
+			t.Fatalf("корзина зрелости = %d после отката, want 0", got)
 		}
 	})
 	t.Run("Commit", func(t *testing.T) {

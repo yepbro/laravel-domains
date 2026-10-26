@@ -229,7 +229,7 @@ fsnotify (T-013): подхватывает файлы, существовавш�
 | `batch_size` | `CRAWLER_SCHEDULER_BATCH_SIZE` | целое | `1000` (ТЗ 5.3: 1000–10000) |
 | `queue_high_watermark` | `CRAWLER_SCHEDULER_QUEUE_HIGH_WATERMARK` | целое | `100000` (backpressure, ТЗ 4.2) |
 | `lease` | `CRAWLER_SCHEDULER_LEASE` | длительность | `30m` |
-| `temp_error_retry_after` | `CRAWLER_SCHEDULER_TEMP_ERROR_RETRY_AFTER` | длительность | `24h` |
+| `temp_error_retry_after` | `CRAWLER_SCHEDULER_TEMP_ERROR_RETRY_AFTER` | длительность | `24h` (при значении < 24 ч guard корзин зрелости зреет когортами к полуночи — внутрисуточные кандидаты ждут дренажа до полуночи, деградация ≤ суток; T-202, детали — `docs/schema.md` §crawler_counters) |
 | `temp_error_max_retries` | `CRAWLER_SCHEDULER_TEMP_ERROR_MAX_RETRIES` | целое | `3` (максимум повторов `temp_error` подряд, далее итоговый статус; ТЗ 5.3: N) |
 | `backlog_interval` | `CRAWLER_SCHEDULER_BACKLOG_INTERVAL` | длительность | `5m` (коридор 30s..1h; T-161) |
 | `zone_weights` | `CRAWLER_SCHEDULER_ZONE_WEIGHTS` | карта имя=вес | — (все веса 1, равный круговой порядок) |

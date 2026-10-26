@@ -594,7 +594,11 @@ func resultWaitAck(j *resultJournal, timeout time.Duration) bool {
 func TestResultSQLContract(t *testing.T) {
 	// Операторы записи результата — CTE (T-178): предчтение старого
 	// состояния FOR UPDATE, перевод, дельты счётчиков зоны по старому
-	// состоянию; внешний SELECT — счёт переведённых строк.
+	// состоянию; внешний SELECT — счёт переведённых строк. Терминальная
+	// ветка статуса добавляет CTE rm — инкремент корзины зрелости ретрая
+	// (T-202): условие по параметру $4 (temp_error = 5) делает CTE no-op
+	// для прочих статусов, ключ корзины — current_date, тот же, что у
+	// инкремента HTTP-этапа и декремента ретрая.
 	const cteTail = "FOR UPDATE), " +
 		"upd AS (UPDATE domains AS t "
 	const cteShift = "FROM s WHERE t.zone_id = s.zone_id AND t.id = s.id " +
@@ -605,8 +609,13 @@ func TestResultSQLContract(t *testing.T) {
 		"domains_checked = z.domains_checked + c.n " +
 		"FROM (SELECT zone_id, count(*) AS n, count(*) FILTER (WHERE check_state = 0) AS n_pending, " +
 		"count(*) FILTER (WHERE check_state = 1) AS n_queued FROM upd GROUP BY zone_id) AS c " +
-		"WHERE z.id = c.zone_id) " +
-		"SELECT count(*) FROM upd"
+		"WHERE z.id = c.zone_id)"
+	const cteEnd = " SELECT count(*) FROM upd"
+	const rmBasketCTE = ", " +
+		"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
+		"SELECT 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), count(*), now() FROM upd WHERE $4::int2 = 5 GROUP BY current_date " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now())"
 	const cteHead = "WITH s AS (" +
 		"SELECT zone_id, id, check_state FROM domains " +
 		"WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> 6 AND check_state <> 2 "
@@ -616,7 +625,7 @@ func TestResultSQLContract(t *testing.T) {
 		"temp_attempts = CASE WHEN $4::int2 = 5 THEN t.temp_attempts ELSE 0 END, " +
 		"flags = (t.flags & -5)::int2, " +
 		"check_state = 2, queued_at = NULL, last_checked_at = now() " +
-		cteShift
+		cteShift + rmBasketCTE + cteEnd
 	if resultUpdateStatusSQL != wantStatus {
 		t.Errorf("resultUpdateStatusSQL = %q,\nwant %q", resultUpdateStatusSQL, wantStatus)
 	}
@@ -625,7 +634,7 @@ func TestResultSQLContract(t *testing.T) {
 		"SET dns_mask = $3::int8, temp_attempts = 0, " +
 		"flags = (t.flags & -5)::int2, " +
 		"check_state = 2, queued_at = NULL, last_checked_at = now() " +
-		cteShift
+		cteShift + cteEnd
 	if resultUpdateKeepStatusSQL != wantKeep {
 		t.Errorf("resultUpdateKeepStatusSQL = %q,\nwant %q", resultUpdateKeepStatusSQL, wantKeep)
 	}
@@ -634,7 +643,7 @@ func TestResultSQLContract(t *testing.T) {
 		"SET status = 7::int2, temp_attempts = 0, " +
 		"flags = (t.flags & -5)::int2, " +
 		"check_state = 2, queued_at = NULL, last_checked_at = now() " +
-		cteShift
+		cteShift + cteEnd
 	if resultInvalidSQL != wantInvalid {
 		t.Errorf("resultInvalidSQL = %q,\nwant %q", resultInvalidSQL, wantInvalid)
 	}

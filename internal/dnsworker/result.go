@@ -140,7 +140,18 @@ var (
 	// resultUpdateStatusSQL — терминальный статус DNS-эпизода
 	// (not_delegated / temp_error / delegated_no_address). Внешний
 	// SELECT — число фактически переведённых строк (идемпотентность
-	// повторной доставки: охрана отсекла — 0).
+	// повторной доставки: охрана отсекла — 0). CTE rm — инкремент
+	// корзины зрелости ретрая crawler_counters['retry_mature: сутки']
+	// (T-202): SERVFAIL-ветка апекса и temp_error-итог без адресов —
+	// полноправные источники temp_error-эпизодов (массовый DNS-инцидент
+	// 24.10 оставил 491 тыс. доменов именно через эту ветку), их эпизоды
+	// зреют к полуночи и обязаны попадать в корзину тем же ключом, что
+	// пишет HTTP-этап (current_date той же транзакции записи) — иначе
+	// guard ретрая недоучитывал бы DNS-когорту. Условие WHERE по
+	// параметру $4 делает CTE no-op для не-temp_error статусов (нуль
+	// групп у агрегата — INSERT не вставляет строк), декремент той же
+	// корзины — CTE rm retryRequeueSQL/retryFinalizeSQL планировщика,
+	// авторитет — реконсиляция monitor (FILTER-позиции прохода).
 	resultUpdateStatusSQL = "WITH s AS (" +
 		"SELECT zone_id, id, check_state FROM domains " +
 		fmt.Sprintf("WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> %d AND check_state <> %d ",
@@ -159,7 +170,11 @@ var (
 		"domains_checked = z.domains_checked + c.n " +
 		fmt.Sprintf("FROM (SELECT zone_id, count(*) AS n, count(*) FILTER (WHERE check_state = %d) AS n_pending, ", int16(model.CheckStatePending)) +
 		fmt.Sprintf("count(*) FILTER (WHERE check_state = %d) AS n_queued FROM upd GROUP BY zone_id) AS c ", int16(model.CheckStateQueued)) +
-		"WHERE z.id = c.zone_id) " +
+		"WHERE z.id = c.zone_id), " +
+		"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
+		fmt.Sprintf("SELECT 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), count(*), now() FROM upd WHERE $4::int2 = %d GROUP BY current_date ", int16(model.StatusTempError)) +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) " +
 		"SELECT count(*) FROM upd"
 
 	// resultUpdateKeepStatusSQL — ветка «есть адреса»: статус не пишется
@@ -377,8 +392,11 @@ func resultCNAME(c string) string {
 // результат повторная доставка не трогает (идемпотентность, ТЗ 3.4 —
 // XACK только после записи, T-025); тем же оператором снимается бит
 // http_published (T-108): done — точка, где staging-пометка публикации
-// выполнила своё назначение; CTE того же оператора ведёт дельты
-// счётчиков зоны по старому состоянию строки (T-178, ревью P1-1).
+// выполнила своё назначение; CTE того же оператора ведут дельты
+// счётчиков зоны по старому состоянию строки (T-178, ревью P1-1) и
+// инкремент корзины зрелости ретрая у temp_error-итога (CTE rm, T-202);
+// порядок нессылаемых DML-CTE — реализационная деталь PG (оговорка в
+// monitor/zonestats.go, ревью T-202).
 // Возвращает false, когда охраны отсекли строку (done/deleted) — это
 // успех, а не ошибка.
 func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64, res EpisodeResult) (bool, error) {

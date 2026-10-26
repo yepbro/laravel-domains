@@ -34,7 +34,11 @@
 //     таймзоны Go/БД молча развёл бы строку и окно FILTER),
 //     temp_error:YYYY-MM-DD — суточный числитель доли temp_error
 //     (T-182, TZ_slow_dns_share §6: та же FILTER-цена нуля, знаменатель
-//     алерта доли — строка checks:);
+//     алерта доли — строка checks:), корзины зрелости ретрая
+//     retry_mature:YYYY-MM-DD (T-202: зрелые кандидаты temp_error по
+//     датам эпизодов — guard тяжёлой выборки ретрая; FILTER-колонки
+//     «зрелые сегодня/сегодняшние эпизоды», устаревшие корзины проход
+//     удаляет — живут две строки, вчерашняя и сегодняшняя);
 //   - дрейф |старое − новое| каждой позиции: до перезаписи читаются
 //     прежние значения, после — новые (транзакция видит собственную
 //     запись); ненулевой дрейф — gauge crawler_counters_drift + Warn
@@ -46,7 +50,8 @@
 // (total/pending/queued/checked — status <> deleted в FILTER), и
 // глобальное распределение статусов + бит рендера (суммы по зонам), и
 // суточные окна проверок с temp_error-числителем (FILTER
-// last_checked_at = current_date × статус, T-179/T-182) —
+// last_checked_at = current_date × статус, T-179/T-182), и корзины
+// зрелости ретрая temp_error по датам эпизодов (T-202) —
 // дополнительная цена FILTER-колонок ноль (ТЗИ §13.3).
 //
 // Семантика колонок зон — комментарий пакета ниже; изменения против
@@ -148,9 +153,18 @@ func init() {
 // × статус temp_error, FILTER-цена нуля (живой аналог прежнего dnsShareSQL
 // считал окно целиком и ходил в heap за статусом — запрос №6 журнала
 // медленных 24.10), сумма по зонам — значение строки
-// temp_error:YYYY-MM-DD.
+// temp_error:YYYY-MM-DD. f_retry_mature_today/f_retry_mature_past —
+// корзины зрелости ретрая temp_error (T-202): зрелые кандидаты
+// (status = temp_error × check_state = done) по датам эпизодов —
+// сегодняшние эпизоды (last_checked_at = current_date, зреют к полуночи
+// следующего дня) и созревшая когорта (last_checked_at <
+// current_date — окно ретрая «старше 24 ч» по date-колонке зреет
+// когортами в полночь); суммы по зонам — значения корзин
+// retry_mature:YYYY-MM-DD, читаемых guard тяжёлой выборки ретрая
+// (scheduler/retry.go, retryMatureSQL), FILTER-цена нуля на том же
+// скане.
 var domainsAggSQL = func() string {
-	cols := make([]string, 0, len(statusAggCols)+7)
+	cols := make([]string, 0, len(statusAggCols)+9)
 	cols = append(cols,
 		fmt.Sprintf("count(*) FILTER (WHERE status <> %d) AS total", int16(model.StatusDeleted)),
 		fmt.Sprintf("count(*) FILTER (WHERE status <> %d AND check_state = %d) AS pending", int16(model.StatusDeleted), int16(model.CheckStatePending)),
@@ -162,13 +176,17 @@ var domainsAggSQL = func() string {
 	cols = append(cols,
 		fmt.Sprintf("count(*) FILTER (WHERE (flags & %d) <> 0) AS f_render", int16(model.FlagRenderPending)),
 		"count(*) FILTER (WHERE last_checked_at = current_date) AS f_checks_today",
-		fmt.Sprintf("count(*) FILTER (WHERE last_checked_at = current_date AND status = %d) AS f_temp_today", int16(model.StatusTempError)))
+		fmt.Sprintf("count(*) FILTER (WHERE last_checked_at = current_date AND status = %d) AS f_temp_today", int16(model.StatusTempError)),
+		fmt.Sprintf("count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at = current_date) AS f_retry_mature_today", int16(model.StatusTempError), int16(model.CheckStateDone)),
+		fmt.Sprintf("count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at < current_date) AS f_retry_mature_past", int16(model.StatusTempError), int16(model.CheckStateDone)))
 	return "SELECT zone_id, " + strings.Join(cols, ", ") + " FROM domains GROUP BY zone_id"
 }()
 
 // zoneAggRow — строка per-zone агрегата (колонки domainsAggSQL): значения
 // состояний и легенда статусов по порядку statusAggCols + бит рендера +
-// суточное окно проверок (T-179) и его temp_error-числитель (T-182).
+// суточное окно проверок (T-179), его temp_error-числитель (T-182) и
+// корзины зрелости ретрая (T-202: сегодняшние/созревшие эпизоды
+// temp_error × done).
 type zoneAggRow struct {
 	zone                            int16
 	total, pending, queued, checked int64
@@ -176,6 +194,8 @@ type zoneAggRow struct {
 	render                          int64
 	checksToday                     int64 // FILTER last_checked_at = current_date (T-179)
 	tempToday                       int64 // FILTER last_checked_at = current_date AND status = temp_error (T-182)
+	retryToday                      int64 // FILTER status = temp_error AND done AND last_checked_at = current_date (T-202)
+	retryPast                       int64 // FILTER status = temp_error AND done AND last_checked_at < current_date (T-202)
 }
 
 // recountAggQuerySQL — чтение per-zone агрегата прохода (единственный
@@ -282,11 +302,79 @@ const recountDailyTempSQL = "INSERT INTO crawler_counters (name, value, updated_
 	"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 	"RETURNING value"
 
+// Корзины зрелости ретрая temp_error (T-202). Имя — дата эпизода
+// (last_checked_at записи результата temp_error): корзина становится
+// «зрелой» (суммируется guard'ом retryMatureSQL планировщика) в полночь
+// следующего дня — момент созревания когорты при date-точности колонки.
+// Проход поддерживает РОВНО ДВЕ живые корзины — вчерашнюю (зрелая
+// когорта, value := FILTER f_retry_mature_past) и сегодняшнюю
+// (эпизоды суток, value := FILTER f_retry_mature_today): старшие
+// корзины удаляет (устаревший учёт дренажей прошлых суток и хвостовые
+// декременты дат эпизодов старше вчерашней — их значение уже в сумме
+// вчерашней корзины, пересчитанной агрегатом). Имена вычисляет БД
+// (current_date/current_date − 1) — рассинхрон таймзоны Go/БД развёл бы
+// корзину и окно FILTER (стиль T-179). Порядок блокировок — последними
+// в проходе, после суточных строк, в порядке «очистка → зрелая →
+// сегодняшняя»: общий с писателями (record.go: … → retry_mature:;
+// retry.go: декремент корзины last_checked_at; monitor — здесь), без
+// циклов блокировок. Оговорка (ревью T-202): порядок выполнения
+// нессылаемых DML-CTE одного оператора PostgreSQL документацией не
+// гарантируется («executed concurrently… unpredictable») — сегодня
+// исполняются в порядке перечисления (зоны раньше счётчиков у всех
+// писателей), что и даёт отсутствие циклов; при смене поведения PG
+// смотреть сюда (радикальное лечение — отдельные операторы транзакции).
+const (
+	// readRetryPastSQL — старое значение зрелой корзины (вчерашней) до
+	// перезаписи (дрейф, T-202); пустой результат — корзины ещё нет
+	// (заполнение, не дрейф).
+	readRetryPastSQL = "SELECT value FROM crawler_counters " +
+		"WHERE name = 'retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD')"
+
+	// readRetryTodaySQL — старое значение сегодняшней корзины (дрейф,
+	// T-202); пустой результат — корзины нет до первого temp_error-эпизода
+	// суток (инкремент или проход создаст).
+	readRetryTodaySQL = "SELECT value FROM crawler_counters " +
+		"WHERE name = 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')"
+
+	// retryMatureCleanupSQL — удаление корзин старше вчерашней: их
+	// когорты уже слиты в зрелую корзину перезаписью ниже (агрегат
+	// f_retry_mature_past считает статусы целиком, а не по датам), а
+	// строки попадают в диапазон суммы guard'а — хвосты декрементов
+	// дат старых эпизодов с отрицательными значениями искажали бы сумму
+	// до ближайшего прохода; корзины — живое расписание дренажа, не
+	// история темпа (в отличие от суточных строк, T-179 §10.4).
+	// RETURNING — для единого Query-протокола прохода (значения не
+	// читаются).
+	retryMatureCleanupSQL = "DELETE FROM crawler_counters " +
+		"WHERE name >= 'retry_mature:' " +
+		"AND name < 'retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD') " +
+		"RETURNING value"
+
+	// recountRetryPastSQL — перезапись зрелой корзины значением
+	// FILTER-колонки f_retry_mature_past (сумма по зонам), RETURNING —
+	// новое значение для дрейфа.
+	recountRetryPastSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD'), $1::int8, $2) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
+		"RETURNING value"
+
+	// recountRetryTodaySQL — перезапись сегодняшней корзины значением
+	// FILTER-колонки f_retry_mature_today (сумма по зонам); пара
+	// recountRetryPastSQL, блокировка — последней из корзин.
+	recountRetryTodaySQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, $2) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
+		"RETURNING value"
+)
+
 // CounterNames — имена строк глобальных счётчиков, поддерживаемых
 // реконсиляцией (легенда для чтения/сверки). Суточные строки
-// checks:YYYY-MM-DD и temp_error:YYYY-MM-DD (T-179/T-182) сюда не
-// входят: имя дня вычисляет БД (readDailyChecksSQL/recountDailyChecksSQL
-// и их temp-пары), в unnest-пачке с Go-именами их нет.
+// checks:YYYY-MM-DD и temp_error:YYYY-MM-DD (T-179/T-182) и корзины
+// зрелости ретрая retry_mature:YYYY-MM-DD (T-202) сюда не входят: имя
+// дня вычисляет БД (readDailyChecksSQL/recountDailyChecksSQL, их
+// temp-пары и пары корзин), в unnest-пачке с Go-именами их нет.
 func CounterNames() []string {
 	names := make([]string, 0, len(model.Statuses)+3)
 	for _, s := range model.Statuses {
@@ -327,6 +415,22 @@ const dailyChecksCounter = "daily:checks"
 // gauge.
 const dailyTempCounter = "daily:temp_error"
 
+// retryMaturePastCounter — метка зрелой корзины ретрая temp_error в
+// дрейфе прохода (T-202): инкременты/декременты считают события
+// (эпизоды записи результата против ретраев), живое окно FILTER —
+// домены (status = temp_error × done × дата); дубль-доставки и
+// повторные эпизоды суток дают +1 к живому нулю, кандидаты, ушедшие
+// мимо ретрая (удаление temp_error-домена delete-файлом, возрастная
+// перепроверка T-030), оставляют +1 в корзине до прохода — потоковая
+// семантика (как daily:*, TZ_slow_done_today §5.1), вне Warn,
+// наблюдается gauge.
+const retryMaturePastCounter = "retry_mature:past"
+
+// retryMatureTodayCounter — метка сегодняшней корзины ретрая temp_error
+// (T-202): та же потоковая семантика, что retryMaturePastCounter
+// (сегодняшние эпизоды: инкременты — события, FILTER — домены).
+const retryMatureTodayCounter = "retry_mature:today"
+
 // dailyStreamingPositions — суточные позиции потоковой семантики
 // (T-179/T-182): инкременты считают события записи результатов HTTP,
 // живое окно прохода — домены дня всех веток конвейера; стационарного
@@ -334,6 +438,14 @@ const dailyTempCounter = "daily:temp_error"
 // нагрузкой), gauge экспонирует.
 func dailyStreamingPositions() []string {
 	return []string{dailyChecksCounter, dailyTempCounter}
+}
+
+// retryMatureStreamingPositions — позиции корзин зрелости ретрая
+// (T-202) той же потоковой семантики, что суточные строки: события
+// эпизодов против живых доменов фильтра; в Warn не входят, наблюдается
+// gauge (комментарий retryMaturePastCounter).
+func retryMatureStreamingPositions() []string {
+	return []string{retryMaturePastCounter, retryMatureTodayCounter}
 }
 
 // ---------------------------------------------------------------- проход
@@ -416,19 +528,22 @@ type ZoneStatsResult struct {
 var zoneColumnPositions = [...]string{"total", "pending", "queued", "checked", "laravel"}
 
 // ZoneStatsOnce выполняет один совмещённый проход реконсиляции (ТЗИ
-// §7.1) в одной транзакции: (1) читает старые значения зон, счётчиков
-// и суточных строк (проверок и temp_error, T-179/T-182); (2) единственный
-// полный скан domains — per-zone агрегат (recountAggQuerySQL, включая
-// FILTER-колонки last_checked_at = current_date, T-179/T-182), агрегаты
-// laravel_domains и laravel_history; (3) перезаписывает колонки
+// §7.1) в одной транзакции: (1) читает старые значения зон, счётчиков,
+// суточных строк (проверок и temp_error, T-179/T-182) и корзин зрелости
+// ретрая (T-202); (2) единственный полный скан domains — per-zone
+// агрегат (recountAggQuerySQL, включая FILTER-колонки
+// last_checked_at = current_date и корзины зрелости, T-179/T-182/T-202),
+// агрегаты laravel_domains и laravel_history; (3) перезаписывает колонки
 // зонunnest-пачкой значений (блокировки зон — первыми); (4) upsert-ит
 // глобальные скаляры (блокировки crawler_counters — после зон, порядок
-// против дедлоков — recountZonesSQL) и суточные строки (последними, в
-// порядке checks: → temp_error:); RETURNING операторов даёт новые
-// значения для дрейфа. Проход идемпотентен (ТЗ 3.4): повтор даёт те же
-// значения; сбой откатывает транзакцию целиком — половинчатых состояний
-// не бывает. Фильтр Zone (recount --zone) ограничивает перезапись зон;
-// глобальные скаляры и суточные строки пересчитываются всегда (ТЗИ §9).
+// против дедлоков — recountZonesSQL), суточные строки (последними, в
+// порядке checks: → temp_error:) и корзины зрелости ретрая (финал
+// прохода: очистка устаревших → зрелая → сегодняшняя, T-202);
+// RETURNING операторов даёт новые значения для дрейфа. Проход
+// идемпотентен (ТЗ 3.4): повтор даёт те же значения; сбой откатывает
+// транзакцию целиком — половинчатых состояний не бывает. Фильтр Zone
+// (recount --zone) ограничивает перезапись зон; глобальные скаляры,
+// суточные строки и корзины пересчитываются всегда (ТЗИ §9).
 func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions) (ZoneStatsResult, error) {
 	if pool == nil {
 		return ZoneStatsResult{}, errors.New("monitor: реконсиляция счётчиков: пул не задан")
@@ -462,6 +577,16 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		return ZoneStatsResult{}, err
 	}
 	oldTemp, tempExists, err := readDailyValue(ctx, tx, readDailyTempSQL, "суточная строка temp_error")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
+	// Корзины зрелости ретрая (T-202) — тем же блоком: присутствие —
+	// признак заполнения (корзину создаёт инкремент или этот проход).
+	oldRetryPast, retryPastExists, err := readDailyValue(ctx, tx, readRetryPastSQL, "зрелая корзина ретрая")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
+	oldRetryToday, retryTodayExists, err := readDailyValue(ctx, tx, readRetryTodaySQL, "сегодняшняя корзина ретрая")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -543,11 +668,36 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
+	// Корзины зрелости ретрая (T-202) — последними записями прохода:
+	// устаревшие корзины удаляются (значение зрелой когорты несут
+	// целиком в вчерашней корзине), затем перезаписываются зрелая
+	// (FILTER f_retry_mature_past) и сегодняшняя (f_retry_mature_today)
+	// — суммы тех же FILTER-колонок per-zone агрегата; порядок
+	// «очистка → зрелая → сегодняшняя» замыкает порядок блокировок
+	// писателей (record.go/dnsworker: инкремент сегодняшней; retry:
+	// декремент дат эпизодов) — без циклов. Guard тяжёлой выборки
+	// ретрая видит сумму зрелых корзин сразу после фиксации.
+	if err := cleanupRetryMature(ctx, tx); err != nil {
+		return ZoneStatsResult{}, err
+	}
+	var retryTodaySum, retryPastSum int64
+	for i := range agg {
+		retryTodaySum += agg[i].retryToday
+		retryPastSum += agg[i].retryPast
+	}
+	newRetryPast, err := writeDailyCounter(ctx, tx, recountRetryPastSQL, retryPastSum, now(), "зрелая корзина ретрая")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
+	newRetryToday, err := writeDailyCounter(ctx, tx, recountRetryTodaySQL, retryTodaySum, now(), "сегодняшняя корзина ретрая")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ZoneStatsResult{}, fmt.Errorf("monitor: реконсиляция счётчиков: фиксация: %w", err)
 	}
 
-	res := ZoneStatsResult{Zones: int64(len(newZones)), Positions: make([]CounterPosition, 0, len(newZones)*len(zoneColumnPositions)+len(driftCounterNames())+len(dailyStreamingPositions()))}
+	res := ZoneStatsResult{Zones: int64(len(newZones)), Positions: make([]CounterPosition, 0, len(newZones)*len(zoneColumnPositions)+len(driftCounterNames())+len(dailyStreamingPositions())+len(retryMatureStreamingPositions()))}
 	for _, id := range zoneIDs {
 		nz, ok := newZones[id]
 		if !ok {
@@ -603,6 +753,30 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		Old:     tempOld,
 		New:     newTemp,
 	})
+	// Корзины зрелости ретрая (T-202): дрейф — потоковая разница семантик
+	// (события эпизодов/ретраев против живых доменов фильтра — дубль-доставки,
+	// повторные эпизоды суток, кандидаты мимо ретрая), не аномалия:
+	// стационарного нуля нет, позиции наблюдаемые, в Warn не входят
+	// (retryMatureStreamingPositions). Корзины не было — заполнение, не
+	// дрейф (Old := New), прецедент стартового прохода (ТЗИ §7.1.3).
+	retryPastOld := oldRetryPast
+	if !retryPastExists {
+		retryPastOld = newRetryPast
+	}
+	res.Positions = append(res.Positions, CounterPosition{
+		Counter: retryMaturePastCounter,
+		Old:     retryPastOld,
+		New:     newRetryPast,
+	})
+	retryTodayOld := oldRetryToday
+	if !retryTodayExists {
+		retryTodayOld = newRetryToday
+	}
+	res.Positions = append(res.Positions, CounterPosition{
+		Counter: retryMatureTodayCounter,
+		Old:     retryTodayOld,
+		New:     newRetryToday,
+	})
 	return res, nil
 }
 
@@ -614,7 +788,8 @@ type laravelAggRow struct {
 
 // readZoneAgg — per-zone агрегат domainsAggSQL: колонки в порядке
 // домена, затем легенда statusAggCols, бит рендера, суточное окно
-// проверок и его temp_error-числитель (T-179/T-182). Приёмник — db.DB
+// проверок, его temp_error-числитель (T-179/T-182) и корзины зрелости
+// ретрая (T-202). Приёмник — db.DB
 // (транзакция прохода или пул verify: агрегат один, точка правды —
 // ТЗИ §9).
 func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
@@ -627,12 +802,12 @@ func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
 	for rows.Next() {
 		var r zoneAggRow
 		r.statuses = make([]int64, len(statusAggCols))
-		dest := make([]any, 0, 5+len(statusAggCols)+3)
+		dest := make([]any, 0, 5+len(statusAggCols)+5)
 		dest = append(dest, &r.zone, &r.total, &r.pending, &r.queued, &r.checked)
 		for i := range r.statuses {
 			dest = append(dest, &r.statuses[i])
 		}
-		dest = append(dest, &r.render, &r.checksToday, &r.tempToday)
+		dest = append(dest, &r.render, &r.checksToday, &r.tempToday, &r.retryToday, &r.retryPast)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("monitor: реконсиляция счётчиков: агрегат: чтение: %w", err)
 		}
@@ -765,6 +940,32 @@ func readDailyValue(ctx context.Context, tx pgx.Tx, sqlQ, what string) (value in
 		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
 	}
 	return value, true, nil
+}
+
+// cleanupRetryMature — удаление устаревших корзин зрелости ретрая
+// (retryMatureCleanupSQL, T-202): корзины старше вчерашней не читает
+// никто (guard суммирует прошедшие сутки, значение зрелой когорты
+// проход переписывает агрегатом), строки — хвост декрементов дат
+// старых эпизодов и учёт дренажей прошлых суток. RETURNING value —
+// протокол Query (проход не использует Exec), значения не читаются.
+func cleanupRetryMature(ctx context.Context, tx pgx.Tx) error {
+	rows, err := tx.Query(ctx, retryMatureCleanupSQL)
+	if err != nil {
+		return fmt.Errorf("monitor: реконсиляция счётчиков: очистка корзин ретрая: %w", err)
+	}
+	defer rows.Close()
+	var discarded int64
+	for rows.Next() {
+		// Значение удалённой корзины не читается: зрелая когорта
+		// переписывается агрегатом f_retry_mature_past целиком.
+		if err := rows.Scan(&discarded); err != nil {
+			return fmt.Errorf("monitor: реконсиляция счётчиков: очистка корзин ретрая: чтение: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("monitor: реконсиляция счётчиков: очистка корзин ретрая: %w", err)
+	}
+	return nil
 }
 
 // writeDailyCounter — перезапись суточной строки значением агрегата
@@ -957,7 +1158,8 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 
 // reportDrift — наблюдение дрейфа (ТЗИ §7.1.3): gauge каждой позиции
 // (стационар — 0), Warn при ненулевом дрейфе любой позиции — КРОМЕ
-// суточных строк (T-179/T-182): их «дрейф» — потоковая разница семантик
+// суточных строк (T-179/T-182) и корзин зрелости ретрая (T-202): их
+// «дрейф» — потоковая разница семантик
 // (события записи HTTP против доменов дня всех веток), ненулевая под
 // живой нагрузкой почти всегда — Warn каждым проходом (каждые 30 мин)
 // хоронил бы сигнал
@@ -980,7 +1182,7 @@ func reportDrift(log *slog.Logger, m *zoneStatsLoopMetrics, res ZoneStatsResult,
 			m.drift.WithLabelValues(p.Counter).Set(float64(p.Drift()))
 		}
 	}
-	streaming := dailyStreamingPositions()
+	streaming := append(dailyStreamingPositions(), retryMatureStreamingPositions()...)
 	var drifted []CounterPosition
 	var sum int64
 	for _, p := range res.Positions {
@@ -1035,7 +1237,7 @@ func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
 		}),
 		drift: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_counters_drift",
-			Help: "Дрейф инкрементальных счётчиков на проходе реконсиляции: |старое − новое| по позициям (zone:<id>:колонка, global:<имя>; daily:checks и daily:temp_error — суточный темп проверок и его temp_error-числитель, T-179/T-182). Стационар — 0, устойчивый ненулевой дрейф — пропущенный переход или ручной SQL мимо кода (разбор — docs/runbooks.md, T-178); исключение — суточные позиции daily:*: они потоковые (события записи HTTP против доменов дня всех веток конвейера), ненулевая под живой нагрузкой — читается как наблюдаемая величина, в Warn не входит.",
+			Help: "Дрейф инкрементальных счётчиков на проходе реконсиляции: |старое − новое| по позициям (zone:<id>:колонка, global:<имя>; daily:checks и daily:temp_error — суточный темп проверок и его temp_error-числитель, T-179/T-182). Стационар — 0, устойчивый ненулевой дрейф — пропущенный переход или ручной SQL мимо кода (разбор — docs/runbooks.md, T-178); исключения — потоковые позиции (считают события против живых доменов, ненулевые под живой нагрузкой — наблюдаемая величина, в Warn не входят): суточные daily:* (T-179/T-182) и корзины зрелости ретрая retry_mature:past/retry_mature:today (T-202).",
 		}, "counter"),
 	}
 }
@@ -1170,12 +1372,16 @@ func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]Coun
 		// только реконсиляцией (ТЗИ §13.3) — сверка «сохранённое против
 		// живого» под нагрузкой расходится на темп статусов, это
 		// свежесть интервала, не дрейф. Суточные строки checks:/temp_error:
-		// (T-179/T-182) — тоже мимо сверки: инкременты считают события
+		// (T-179/T-182) и корзины зрелости ретрая retry_mature: (T-202) —
+		// тоже мимо сверки: инкременты считают события
 		// записи результата HTTP, живой агрегат — домены дня всех веток
 		// (TZ_slow_done_today §5.1); под нагрузкой расхождение равно
 		// разнице потоков этапов с прошлого прохода — наблюдается
-		// позициями daily:* прохода реконсиляции, сверка с допуском 0
-		// сигналила бы штатную работу.
+		// позициями daily:*/retry_mature:* прохода реконсиляции, сверка с
+		// допуском 0 сигналила бы штатную работу (у корзин вдобавок
+		// проход держит только две строки — вчерашнюю и сегодняшнюю —
+		// и свёртывает старые корзины в зрелую, поимённая сверка дат
+		// не определена).
 		if absDiff(stored[name], live[name]) > opts.Tolerance {
 			out = append(out, CounterPosition{
 				Counter: "global:" + name,

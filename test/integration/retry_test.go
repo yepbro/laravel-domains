@@ -1,17 +1,19 @@
 // Интеграционные тесты прохода повторных проверок temp_error RetryOnce
-// (T-031; выборка кандидатов seq scan'ом с закреплением плана SET LOCAL и
-// guard счётчиком статуса status_temp_error — T-191) против живого
+// (T-031; выборка кандидатов seq scan'ом с закреплением плана SET LOCAL —
+// T-191, guard корзинами зрелости retry_mature — T-202) против живого
 // PostgreSQL: юнит-тесты retry_test.go проверяют SQL-контракты и
 // последовательность на фейках, здесь — реальное поведение на
 // мигрированной схеме: зрелая когорта temp_error дренируется пачками
 // (назначение повтора по temp_attempts < N, финализация в
 // delegated_no_address по исчерпании), переведённые не выбираются
-// повторно; status_temp_error = 0 — тяжёлая выборка не выполняется вовсе
-// (обёртка пула со счётчиком вызовов — предписание ТЗ T-191 §7.2);
-// отсутствие строки счётчика — ошибка прохода. Форма закреплённого плана
-// проверяется EXPLAIN в той же транзакции с SET LOCAL (seq scan по
-// domains, индексные формы отключены). Уровень вызовов — как у соседей:
-// библиотечные вызовы без запуска сервисов; изоляция — withTestSchema.
+// повторно; декременты корзин зануляют guard — тяжёлая выборка не
+// выполняется вовсе (обёртка пула со счётчиком вызовов — предписание ТЗ
+// T-191 §7.2); сегодняшние эпизоды guard не открывают; отсутствие строк
+// корзин — честный ноль; реконсиляция корзин сходится с живым окном.
+// Форма закреплённого плана проверяется EXPLAIN в той же транзакции с
+// SET LOCAL (seq scan по domains, индексные формы отключены). Уровень
+// вызовов — как у соседей: библиотечные вызовы без запуска сервисов;
+// изоляция — withTestSchema.
 package integration
 
 import (
@@ -28,6 +30,7 @@ import (
 
 	"crawler/internal/migrate"
 	"crawler/internal/model"
+	"crawler/internal/monitor"
 	"crawler/internal/scheduler"
 )
 
@@ -38,9 +41,9 @@ var retrySeqScanRe = regexp.MustCompile(`Seq Scan on (\w+ )?d\b`)
 
 // retryBatchPrefix — начало retrySelectSQL (литерал
 // internal/scheduler/retry.go, дублирование — стиль schema_test.go):
-// обёртка пула считает вызовы тяжёлой выборки кандидатов — guard T-191
-// обязан держать её за нулём счётчика статуса. Выборка идёт ВНУТРИ
-// транзакции закрепления плана, потому счётчик живёт в обёртке
+// обёртка пула считает вызовы тяжёлой выборки кандидатов — guard T-202
+// обязан держать её за нулевой суммой корзин зрелости. Выборка идёт
+// ВНУТРИ транзакции закрепления плана, потому счётчик живёт в обёртке
 // транзакции.
 const retryBatchPrefix = "SELECT d.zone_id, d.id, d.temp_attempts FROM domains d"
 
@@ -99,9 +102,11 @@ func (t *retryTraceTx) Query(ctx context.Context, sql string, args ...any) (pgx.
 
 // TestRetryTempErrorPass — проход повторных проверок на живом PostgreSQL:
 // зрелая когорта temp_error дренируется пачками (итерации сходятся,
-// переведённые не выбираются повторно), счётчик 0 — тяжёлая выборка не
-// выполняется; отсутствие строки счётчика — ошибка; форма плана
-// закреплена (seq scan).
+// переведённые не выбираются повторно), декременты корзин зрелости
+// (T-202) зануляют guard после дренажа — тяжёлая выборка не выполняется
+// вовсе; сегодняшние эпизоды (незрелые) guard не открывает; отсутствие
+// строк корзин — честный ноль, а не ошибка; реконсиляция корзин
+// сходится с живым окном и вычищает устаревшие.
 func TestRetryTempErrorPass(t *testing.T) {
 	skipUnlessIntegration(t)
 	ctx := context.Background()
@@ -166,9 +171,9 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// домены requeue (попыток 1 < N) и final (попыток 3 = N); молодые и
 	// незавершённые кандидатами не являются (окно RetryAfter и
 	// check_state). last_checked_at — date-литералом в прошлом (окно
-	// по умолчанию 24 ч, ТЗ 5.3). Строку status_temp_error кладёт руками
-	// (значение — как у реконсиляции T-178: число доменов статуса; сид —
-	// прямой INSERT, инкрементов переходов прямой INSERT не ведёт).
+	// по умолчанию 24 ч, ТЗ 5.3). Корзину зрелости прошедших суток кладёт
+	// руками (значение — как у реконсиляции T-202: два зрелых кандидата;
+	// сид — прямой INSERT, инкрементов записи прямой INSERT не ведёт).
 	var zone int16
 	if err := pool.QueryRow(ctx,
 		"INSERT INTO zones (name) VALUES ('retry.test') RETURNING id",
@@ -190,9 +195,24 @@ func TestRetryTempErrorPass(t *testing.T) {
 	seed("young", model.StatusTempError, model.CheckStateDone, "2999-01-01", 0)      // моложе окна — не кандидат
 	seed("pending", model.StatusTempError, model.CheckStatePending, "2020-01-01", 0) // ждёт диспетчера — не кандидат
 	if _, err := pool.Exec(ctx,
-		"INSERT INTO crawler_counters (name, value) VALUES ('status_temp_error', 4)",
+		"INSERT INTO crawler_counters (name, value) "+
+			"VALUES ('retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD'), 2)",
 	); err != nil {
 		t.Fatalf("insert crawler_counters: %v", err)
+	}
+
+	// retryMatureSum — guard-сумма корзин прошедших суток (тот же
+	// предикат, что retryMatureSQL планировщика).
+	retryMatureSum := func(t *testing.T) int64 {
+		t.Helper()
+		var sum int64
+		if err := pool.QueryRow(ctx,
+			"SELECT coalesce(sum(value), 0) FROM crawler_counters "+
+				"WHERE name >= 'retry_mature:' AND name < 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')",
+		).Scan(&sum); err != nil {
+			t.Fatalf("guard-сумма корзин: %v", err)
+		}
+		return sum
 	}
 
 	// Дренаж пачками по 1 (T-031): BatchSize = 1 — каждая пачка полная,
@@ -287,6 +307,22 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Errorf("счётчики зоны = checked %d pending %d, want -1 и 1 (переход done → pending)", checked, pend)
 		}
 
+		// Корзины зрелости (T-202): декременты CTE rm ушли в корзину дат
+		// эпизодов (2020-01-01, по −1 на назначение и финализацию) —
+		// guard-сумма сходится с живым числом зрелых кандидатов (0).
+		var stale int64
+		if err := pool.QueryRow(ctx,
+			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:2020-01-01'",
+		).Scan(&stale); err != nil {
+			t.Fatalf("корзина дат эпизодов: %v", err)
+		}
+		if stale != -2 {
+			t.Errorf("корзина 2020-01-01 = %d, want -2 (декременты назначения и финализации)", stale)
+		}
+		if got := retryMatureSum(t); got != 0 {
+			t.Errorf("guard-сумма корзин = %d, want 0 (зрелые исчерпаны, дренаж не откроется)", got)
+		}
+
 		// Итог дренажа — сумма пачек: по одному каждого вида.
 		for _, want := range []string{"requeued=1", "finalized=1"} {
 			if !strings.Contains(logBuf.String(), want) {
@@ -295,13 +331,32 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 	})
 
-	// Стационар (граница доверия guard, ТЗ T-191 §4.3): реконсиляция
-	// обнулила счётчик — тяжёлая выборка не выполняется вовсе, тик стоит
-	// одно чтение строки.
-	t.Run("счётчик 0 — тяжёлая выборка не выполняется", func(t *testing.T) {
+	// Стационар (граница доверия guard, TZ T-202): зрелых нет — тяжёлая
+	// выборка не выполняется вовсе, тик стоит одну сумму корзин.
+	t.Run("зрелых нет — тяжёлая выборка не выполняется", func(t *testing.T) {
+		before := pool.batchCalls()
+		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{})
+		if err != nil {
+			t.Fatalf("RetryOnce: %v", err)
+		}
+		if res != (scheduler.RetryResult{}) {
+			t.Fatalf("итог %+v, хочу пустой (guard: зрелых нет)", res)
+		}
+		if n := pool.batchCalls(); n != before {
+			t.Fatalf("тяжёлая выборка выполнена %d раз при нулевой сумме корзин (было %d)", n-before, before)
+		}
+	})
+
+	// Незрелые (сегодняшние эпизоды, T-202): корзина текущих суток в
+	// guard не входит — эпизоды зреют к полуночи, тяжёлая выборка не
+	// открывается, хотя домен формально ответил критерию статуса.
+	t.Run("сегодняшние эпизоды — guard не пускает", func(t *testing.T) {
+		seed("fresh", model.StatusTempError, model.CheckStateDone, "current_date", 0)
 		if _, err := pool.Exec(ctx,
-			"UPDATE crawler_counters SET value = 0 WHERE name = 'status_temp_error'"); err != nil {
-			t.Fatal(err)
+			"INSERT INTO crawler_counters (name, value) "+
+				"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), 1)",
+		); err != nil {
+			t.Fatalf("insert корзина суток: %v", err)
 		}
 		before := pool.batchCalls()
 		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{})
@@ -309,22 +364,70 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Fatalf("RetryOnce: %v", err)
 		}
 		if res != (scheduler.RetryResult{}) {
-			t.Fatalf("итог %+v, хочу пустой (guard: temp_error нет)", res)
+			t.Fatalf("итог %+v, хочу пустой (сегодняшний эпизод незрелый)", res)
 		}
 		if n := pool.batchCalls(); n != before {
-			t.Fatalf("тяжёлая выборка выполнена %d раз при нулевом счётчике (было %d)", n-before, before)
+			t.Fatalf("тяжёлая выборка выполнена при незрелых корзинах: %d вызовов (было %d)", n-before, before)
 		}
 	})
 
-	// Отсутствие строки счётчика — ошибка прохода: строку гарантирует
-	// реконсиляция T-178, молчаливый рассинхрон сделал бы guard ложью.
-	t.Run("строки счётчика нет — ошибка прохода", func(t *testing.T) {
-		if _, err := pool.Exec(ctx,
-			"DELETE FROM crawler_counters WHERE name = 'status_temp_error'"); err != nil {
+	// Реконсиляция (T-202) — авторитет корзин: сегодняшняя корзина :=
+	// живое окно (fresh — один temp_error × done сегодня), зрелая — 0,
+	// устаревшая корзина дат старых эпизодов (хвост декрементов
+	// 2020-01-01) удаляется; guard-сумма остаётся нулём (сегодняшняя
+	// корзина в сумму не входит).
+	t.Run("реконсиляция корзин сходится с живым окном", func(t *testing.T) {
+		if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+			t.Fatalf("ZoneStatsOnce: %v", err)
+		}
+		var today, past int64
+		if err := pool.QueryRow(ctx,
+			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')",
+		).Scan(&today); err != nil {
+			t.Fatalf("корзина суток: %v", err)
+		}
+		if today != 1 {
+			t.Errorf("корзина суток после прохода = %d, want 1 (fresh — один эпизод сегодня)", today)
+		}
+		if err := pool.QueryRow(ctx,
+			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD')",
+		).Scan(&past); err != nil {
+			t.Fatalf("зрелая корзина: %v", err)
+		}
+		if past != 0 {
+			t.Errorf("зрелая корзина после прохода = %d, want 0 (живых зрелых нет)", past)
+		}
+		var stale int
+		if err := pool.QueryRow(ctx,
+			"SELECT count(*) FROM crawler_counters WHERE name = 'retry_mature:2020-01-01'",
+		).Scan(&stale); err != nil {
+			t.Fatalf("устаревшая корзина: %v", err)
+		}
+		if stale != 0 {
+			t.Error("устаревшая корзина 2020-01-01 жива после прохода (очистка T-202 не сработала)")
+		}
+		if got := retryMatureSum(t); got != 0 {
+			t.Errorf("guard-сумма корзин = %d, want 0 (сегодняшняя корзина в сумму не входит)", got)
+		}
+	})
+
+	// Отсутствие строк корзин — честный ноль, а не ошибка: строки корзин
+	// создаёт первый инкремент суток или проход реконсиляции, их никто
+	// не гарантирует (в отличие от status_* T-178).
+	t.Run("корзин нет — честный ноль", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, "DELETE FROM crawler_counters WHERE name LIKE 'retry_mature:%'"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{}); err == nil {
-			t.Fatal("отсутствие строки счётчика не возвращено ошибкой (guard обязан лгать громче)")
+		before := pool.batchCalls()
+		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{})
+		if err != nil {
+			t.Fatalf("RetryOnce: %v (отсутствие корзин — не ошибка: coalesce даёт ноль)", err)
+		}
+		if res != (scheduler.RetryResult{}) {
+			t.Fatalf("итог %+v, хочу пустой", res)
+		}
+		if n := pool.batchCalls(); n != before {
+			t.Fatalf("тяжёлая выборка выполнена без корзин: %d вызовов (было %d)", n-before, before)
 		}
 	})
 }

@@ -1,12 +1,13 @@
 // Юнит-тесты повторных проверок temp_error (T-031, ТЗ 5.3, 6.2; guard
-// счётчиком статуса и закрепление плана выборки — T-191) на фейковом
-// pgx-пуле с транзакциями: точные SQL-тексты и параметры (guard-чтение
-// счётчика / SELECT кандидатов в транзакции закрепления плана / UPDATE
-// повтора / UPDATE итогового статуса), последовательность SET LOCAL ×3 →
-// SELECT, окно retry_after, границы счётчика попыток (до N / на N / после
-// N), пустой набор, guard=0 без тяжёлой выборки, охраны, ошибки и отмена
-// ctx, цикл RetryTempErrors. Поведение против живой БД — интеграционные
-// тесты (test/integration/retry_test.go).
+// корзинами зрелости — T-202, закрепление плана выборки — T-191) на
+// фейковом pgx-пуле с транзакциями: точные SQL-тексты и параметры
+// (guard-чтение суммы корзин / SELECT кандидатов в транзакции
+// закрепления плана / UPDATE повтора / UPDATE итогового статуса с
+// декрементом корзины), последовательность SET LOCAL ×3 → SELECT, окно
+// retry_after, границы счётчика попыток (до N / на N / после N),
+// пустой набор, guard=0 без тяжёлой выборки, охраны, ошибки и отмена
+// ctx, цикл RetryTempErrors. Поведение против живой БД —
+// интеграционные тесты (test/integration/retry_test.go).
 package scheduler
 
 import (
@@ -96,15 +97,16 @@ func (r *retryFakeRows) RawValues() [][]byte { return nil }
 func (r *retryFakeRows) Conn() *pgx.Conn      { return nil }
 func (r *retryFakeRows) TypeMap() *pgtype.Map { return nil }
 
-// retryFakePool — RetryDB без БД: guard-чтения счётчика (T-191) через пул,
-// очереди заготовленных результатов SELECT кандидатов (в транзакции
-// закрепления плана) и UPDATE … RETURNING (в транзакции обновления), ошибки
-// по шагам прохода, протокол вызовов. Всё под замком: цикл RetryTempErrors
-// работает в горутине, тест ожидает прогресс по счётчикам.
+// retryFakePool — RetryDB без БД: guard-чтение суммы корзин зрелости
+// (T-202) через пул, очереди заготовленных результатов SELECT кандидатов
+// (в транзакции закрепления плана) и UPDATE … RETURNING (в транзакции
+// обновления), ошибки по шагам прохода, протокол вызовов. Всё под
+// замком: цикл RetryTempErrors работает в горутине, тест ожидает
+// прогресс по счётчикам.
 type retryFakePool struct {
 	mu          sync.Mutex
-	guardVals   []int64          // FIFO значений счётчика guard; исчерпана — держится последнее, не задана вовсе — 1 (temp_error есть: проход идёт к выборке)
-	guardNoRow  bool             // guard возвращает пустой набор — строки счётчика нет
+	guardVals   []int64          // FIFO значений суммы корзин guard; исчерпана — держится последнее, не задана вовсе — 1 (зрелые есть: проход идёт к выборке)
+	guardEmpty  bool             // guard возвращает пустой набор — обрыв протокола (SQL отвечает строкой всегда)
 	guardErrs   []error          // очередь ошибок guard-чтения (nil — чтение без ошибки)
 	selects     []*retryFakeRows // очередь результатов SELECT кандидатов (кончилась — пустой набор)
 	requeues    []*retryFakeRows // очередь результатов UPDATE повтора
@@ -130,10 +132,10 @@ func (p *retryFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag
 	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
 }
 
-// nextGuardLocked — значение счётчика для очередного guard-чтения.
+// nextGuardLocked — значение суммы корзин для очередного guard-чтения.
 func (p *retryFakePool) nextGuardLocked() int64 {
 	if len(p.guardVals) == 0 {
-		return 1 // дефолт фейка: temp_error есть, проход идёт к выборке
+		return 1 // дефолт фейка: зрелые есть, проход идёт к выборке
 	}
 	v := p.guardVals[0]
 	if len(p.guardVals) > 1 {
@@ -142,14 +144,14 @@ func (p *retryFakePool) nextGuardLocked() int64 {
 	return v
 }
 
-// Query — guard-чтение счётчика статуса (T-191): единственный SELECT
-// прохода мимо транзакций; тяжёлая выборка кандидатов идёт в транзакции
-// закрепления плана (retryFakeTx.Query).
+// Query — guard-чтение суммы корзин зрелости (T-202): единственный
+// SELECT прохода мимо транзакций; тяжёлая выборка кандидатов идёт в
+// транзакции закрепления плана (retryFakeTx.Query).
 func (p *retryFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.guardQueries = append(p.guardQueries, retryCall{sql: sql, args: args})
-	if sql != retryCounterSQL {
+	if sql != retryMatureSQL {
 		return nil, fmt.Errorf("retryFakePool: неожидаемый SQL через пул: %s", sql)
 	}
 	if len(p.guardErrs) > 0 {
@@ -159,8 +161,8 @@ func (p *retryFakePool) Query(_ context.Context, sql string, args ...any) (pgx.R
 			return nil, err
 		}
 	}
-	if p.guardNoRow {
-		return retryRows(), nil // пустой набор — строки счётчика нет
+	if p.guardEmpty {
+		return retryRows(), nil // пустой набор — обрыв протокола (coalesce отвечает строкой)
 	}
 	return retryRows([]any{p.nextGuardLocked()}), nil
 }
@@ -324,20 +326,33 @@ const wantRetryRequeue = "WITH upd AS (UPDATE domains d " +
 	"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
 	"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id " +
 	"AND d.status = $4 AND d.check_state = $5 " +
-	"RETURNING d.zone_id, d.id), " +
+	"RETURNING d.zone_id, d.id, d.last_checked_at), " +
 	"zc AS (UPDATE zones AS z " +
 	"SET domains_checked = z.domains_checked - c.n, " +
 	"domains_pending = z.domains_pending + c.n " +
 	"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
-	"WHERE z.id = c.zone_id) " +
+	"WHERE z.id = c.zone_id), " +
+	"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
+	"SELECT 'retry_mature:' || to_char(u.last_checked_at, 'YYYY-MM-DD'), -count(*), now() " +
+	"FROM upd AS u GROUP BY u.last_checked_at " +
+	"ORDER BY u.last_checked_at " +
+	"ON CONFLICT (name) DO UPDATE " +
+	"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) " +
 	"SELECT u.zone_id, u.id FROM upd AS u"
 
-const wantRetryFinalize = "UPDATE domains d " +
+const wantRetryFinalize = "WITH upd AS (UPDATE domains d " +
 	"SET status = $3, temp_attempts = 0 " +
 	"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
 	"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id " +
 	"AND d.status = $4 AND d.check_state = $5 " +
-	"RETURNING d.zone_id, d.id"
+	"RETURNING d.zone_id, d.id, d.last_checked_at), " +
+	"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
+	"SELECT 'retry_mature:' || to_char(u.last_checked_at, 'YYYY-MM-DD'), -count(*), now() " +
+	"FROM upd AS u GROUP BY u.last_checked_at " +
+	"ORDER BY u.last_checked_at " +
+	"ON CONFLICT (name) DO UPDATE " +
+	"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) " +
+	"SELECT u.zone_id, u.id FROM upd AS u"
 
 // retryCutoffArg — третий аргумент SELECT кандидатов: граница окна.
 func retryCutoffArg(t *testing.T, args []any) time.Time {
@@ -361,11 +376,13 @@ func retrySelectCall(t *testing.T, tx *retryFakeTx) retryCall {
 	return retryCall{}
 }
 
-// --- контракт SQL (T-191) ---------------------------------------------------
+// --- контракт SQL (T-191/T-202) ----------------------------------------------
 
 // TestRetrySQLContract — литералы операторов прохода: выборка без ORDER BY
 // (порядок кандидатов не важен — сортировка держала бы индексный доступ),
-// SET LOCAL закрепления плана, guard по имени status_temp_error.
+// SET LOCAL закрепления плана, guard суммой корзин зрелости с границей
+// current_date от БД; декремент корзин (CTE rm) — в обоих решениях пачки,
+// ключ last_checked_at — тот же, что у инкремента записи результата.
 func TestRetrySQLContract(t *testing.T) {
 	if !strings.Contains(retrySelectSQL, "WHERE d.status = $1") ||
 		!strings.Contains(retrySelectSQL, "AND d.check_state = $2") ||
@@ -380,25 +397,59 @@ func TestRetrySQLContract(t *testing.T) {
 		t.Fatalf("закрепление плана выборки разошлось с контрактом T-191:\n%s\n%s\n%s",
 			retryPlanNoIndexScanSQL, retryPlanNoBitmapScanSQL, retryPlanNoIOSQL)
 	}
-	if want := "SELECT value FROM crawler_counters WHERE name = 'status_" +
-		model.StatusTempError.String() + "'"; retryCounterSQL != want {
-		t.Fatalf("retryCounterSQL разошёлся с контрактом T-191/T-178:\n%s\nwant:\n%s", retryCounterSQL, want)
+	// Guard корзин зрелости (T-202): сумма по диапазону PK-префикса,
+	// строгое < отсекает корзину текущих суток (сегодняшние эпизоды
+	// незрелые), coalesce — честный ноль при отсутствии строк, имя границы
+	// вычисляет БД (таймзона окна FILTER реконсиляции, стиль T-179).
+	wantGuard := "SELECT coalesce(sum(value), 0) FROM crawler_counters " +
+		"WHERE name >= 'retry_mature:' " +
+		"AND name < 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')"
+	if retryMatureSQL != wantGuard {
+		t.Fatalf("retryMatureSQL разошёлся с контрактом T-202:\n%s\nwant:\n%s", retryMatureSQL, wantGuard)
+	}
+	// Декремент корзины зрелости — в назначении повтора и финализации
+	// (CTE rm, T-202): оба решения завершают кандидату; ключ выводится из
+	// last_checked_at переведённых строк — адресат того же инкремента,
+	// что пишут записи результата (current_date их транзакции). ORDER BY
+	// детерминирует захват строк корзин по возрастанию даты — общий
+	// порядок с проходом реконсиляции (очистка старых → вчерашняя →
+	// сегодняшняя), без AB-BA цикла на смешанных датах пачки (ревью
+	// T-202, P2).
+	const wantBasketCTE = ", " +
+		"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
+		"SELECT 'retry_mature:' || to_char(u.last_checked_at, 'YYYY-MM-DD'), -count(*), now() " +
+		"FROM upd AS u GROUP BY u.last_checked_at " +
+		"ORDER BY u.last_checked_at " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) "
+	for _, sql := range []struct {
+		name string
+		text string
+	}{
+		{"retryRequeueSQL", retryRequeueSQL},
+		{"retryFinalizeSQL", retryFinalizeSQL},
+	} {
+		if !strings.Contains(sql.text, "RETURNING d.zone_id, d.id, d.last_checked_at") ||
+			!strings.Contains(sql.text, wantBasketCTE) {
+			t.Errorf("%s без декремента корзины зрелости (CTE rm, T-202):\n%s", sql.name, sql.text)
+		}
 	}
 }
 
 // --- RetryOnce ------------------------------------------------------------
 
-// TestRetryOnceGuardZero — guard счётчиком статуса (T-191): при нулевом
-// (и отрицательном — невозможен кодом, ручная правка) счётчике тяжёлая
-// выборка кандидатов не выполняется вовсе и транзакция не открывается —
-// стационар без temp_error стоит одно чтение строки.
+// TestRetryOnceGuardZero — guard корзинами зрелости (T-202): при нулевой
+// (и отрицательной — видимый дрейф декрементов, реконсиляция выровняет)
+// сумме тяжёлая выборка кандидатов не выполняется вовсе и транзакция не
+// открывается — стационар без зрелых стоит одну сумму индексного
+// диапазона.
 func TestRetryOnceGuardZero(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
 		value int64
 	}{
-		{"счётчик 0", 0},
-		{"счётчик отрицательный (рассинхрон)", -1},
+		{"сумма корзин 0", 0},
+		{"сумма корзин отрицательная (дрейф декрементов)", -1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			pool := &retryFakePool{guardVals: []int64{tt.value}}
@@ -410,37 +461,37 @@ func TestRetryOnceGuardZero(t *testing.T) {
 			if res != (RetryResult{}) {
 				t.Errorf("итог = %+v, want нулевой: кандидатов нет по guard", res)
 			}
-			if len(pool.guardQueries) != 1 || pool.guardQueries[0].sql != retryCounterSQL {
-				t.Errorf("guard-чтение = %v, want один запрос счётчика", pool.guardQueries)
+			if len(pool.guardQueries) != 1 || pool.guardQueries[0].sql != retryMatureSQL {
+				t.Errorf("guard-чтение = %v, want один запрос суммы корзин", pool.guardQueries)
 			}
 			if st := pool.stats(); st.selects != 0 || st.begins != 0 {
-				t.Errorf("тяжёлая выборка/транзакции при счётчике %d: selects=%d begins=%d, want 0 и 0",
+				t.Errorf("тяжёлая выборка/транзакции при сумме %d: selects=%d begins=%d, want 0 и 0",
 					tt.value, st.selects, st.begins)
 			}
 		})
 	}
 }
 
-// TestRetryOnceCounterMissing — отсутствие строки счётчика — ошибка
-// прохода (строку гарантирует реконсиляция T-178): молчаливый рассинхрон
-// сделал бы guard ложью.
-func TestRetryOnceCounterMissing(t *testing.T) {
-	pool := &retryFakePool{guardNoRow: true}
+// TestRetryOnceGuardEmpty — пустой ответ guard невозможен у живой БД
+// (coalesce в SQL отвечает строкой всегда): обрыв протокола — ошибка
+// прохода, а не «зрелых нет».
+func TestRetryOnceGuardEmpty(t *testing.T) {
+	pool := &retryFakePool{guardEmpty: true}
 
 	_, err := RetryOnce(context.Background(), pool, RetryOptions{})
 	if err == nil ||
 		!strings.Contains(err.Error(), "scheduler: повторные проверки temp_error") ||
-		!strings.Contains(err.Error(), "строка счётчика 'status_temp_error' отсутствует") {
-		t.Errorf("ошибка = %v, want отсутствие строки счётчика", err)
+		!strings.Contains(err.Error(), "пустой ответ агрегата") {
+		t.Errorf("ошибка = %v, want пустой ответ guard", err)
 	}
 	if st := pool.stats(); st.selects != 0 || st.begins != 0 {
-		t.Errorf("тяжёлая выборка/транзакции при отсутствии строки: selects=%d begins=%d", st.selects, st.begins)
+		t.Errorf("тяжёлая выборка/транзакции при пустом guard: selects=%d begins=%d", st.selects, st.begins)
 	}
 }
 
-// TestRetryOnceEmpty — счётчик видит temp_error, выборка пуста (когорта не
-// зрела — остаточный случай TZ T-191 §4.3): пустой итог, транзакция
-// обновления не открывается.
+// TestRetryOnceEmpty — корзины видят зрелых, выборка пуста (дрейф корзин
+// или рассеянные кандидаты): пустой итог, транзакция обновления не
+// открывается.
 func TestRetryOnceEmpty(t *testing.T) {
 	pool := &retryFakePool{} // guard по умолчанию 1, очередь SELECT пуста
 
@@ -493,12 +544,12 @@ func TestRetryOnceSQLAndFlow(t *testing.T) {
 		t.Fatalf("RetryOnce: %v", err)
 	}
 
-	// Guard: точечное чтение счётчика статуса через пул, без параметров.
+	// Guard: чтение суммы корзин зрелости через пул, без параметров.
 	if len(pool.guardQueries) != 1 {
 		t.Fatalf("guard-чтений = %d, want 1", len(pool.guardQueries))
 	}
-	if pool.guardQueries[0].sql != retryCounterSQL || len(pool.guardQueries[0].args) != 0 {
-		t.Errorf("guard-чтение = %+v, want %s без параметров", pool.guardQueries[0], retryCounterSQL)
+	if pool.guardQueries[0].sql != retryMatureSQL || len(pool.guardQueries[0].args) != 0 {
+		t.Errorf("guard-чтение = %+v, want %s без параметров", pool.guardQueries[0], retryMatureSQL)
 	}
 
 	// Две транзакции: выборка (закрепление плана + SELECT) и обновление.
@@ -751,7 +802,7 @@ func TestRetryOnceErrors(t *testing.T) {
 		{"ошибка guard", func() *retryFakePool {
 			p := &retryFakePool{guardErrs: []error{errors.New("бд недоступна")}}
 			return p
-		}(), "счётчик temp_error"},
+		}(), "корзины зрелости"},
 		{"ошибка закрепления плана", func() *retryFakePool {
 			p := newPool()
 			p.planErr = errors.New("бд недоступна")
@@ -1201,11 +1252,11 @@ func TestRetryTempErrorsNilLog(t *testing.T) {
 }
 
 // TestRetryTempErrorsGuardDrainStop — guard останавливает дренаж без
-// тяжёлой выборки: счётчик 0 после исчерпания когорты (реконсиляция
-// обнулила) — следующий проход дренажа читает только строку счётчика.
+// тяжёлой выборки: сумма корзин 0 после исчерпания когорты (декременты
+// занулили) — следующий проход дренажа читает только сумму корзин.
 func TestRetryTempErrorsGuardDrainStop(t *testing.T) {
 	pool := &retryFakePool{
-		// Пачка 1 — полная; дальше счётчик 0 (guardVals: липкое
+		// Пачка 1 — полная; дальше сумма корзин 0 (guardVals: липкое
 		// последнее значение — вторым элементом фиксируется 0).
 		guardVals: []int64{1, 0},
 		selects:   []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},

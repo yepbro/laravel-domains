@@ -151,10 +151,15 @@ type Ingest struct {
 
 // Scheduler — планировщик проверок (ТЗ 5.3).
 type Scheduler struct {
-	RecheckInterval     Duration `yaml:"recheck_interval"`
-	BatchSize           int      `yaml:"batch_size"`
-	QueueHighWatermark  int      `yaml:"queue_high_watermark"`
-	Lease               Duration `yaml:"lease"`
+	RecheckInterval    Duration `yaml:"recheck_interval"`
+	BatchSize          int      `yaml:"batch_size"`
+	QueueHighWatermark int      `yaml:"queue_high_watermark"`
+	Lease              Duration `yaml:"lease"`
+	// TempErrorRetryAfter — окно повтора temp_error (ТЗ 5.3, дефолт
+	// 24 ч). При значении < 24 ч guard корзин зрелости (T-202) зреет
+	// когортами к полуночи — внутрисуточные кандидаты ждут дренажа до
+	// полуночи (деградация ≤ суток): окно выборки идёт по date-колонке
+	// last_checked_at, подробнее — docs/schema.md §crawler_counters.
 	TempErrorRetryAfter Duration `yaml:"temp_error_retry_after"`
 	// BacklogInterval — период цикла коллектора глубины backlog
 	// (scheduler.BacklogLoop, T-077): gauge crawler_backlog_domains из

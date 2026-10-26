@@ -31,9 +31,11 @@
 //	    DELETE старых строк субдомен×вариант с RETURNING content_hash →
 //	    −1 refcount каждого старого хэша → INSERT новых строк; хвостовыми
 //	    шагами — дельты счётчиков: зон (T-178), рендер-долга (T-175),
-//	    суточного счётчика проверок checks:YYYY-MM-DD и его числителя
+//	    суточного счётчика проверок checks:YYYY-MM-DD, его числителя
 //	    temp_error:YYYY-MM-DD (T-179/T-182 — события записи, авторитет —
-//	    реконсиляция monitor);
+//	    реконсиляция monitor) и корзины зрелости ретрая
+//	    retry_mature:YYYY-MM-DD (T-202 — temp_error-эпизоды, зреющие к
+//	    полуночи; декремент — ретрай планировщика);
 //	  - публикация q:analyze — ПОСЛЕ фиксации транзакции: потребитель Result
 //	    (анализатор, T-068+) читает запись из БД по ключу — сообщение раньше
 //	    строки смотрело бы в пустоту. Сбой публикации → доставка q:http без
@@ -180,6 +182,27 @@ var (
 	// чинит реконсиляция.
 	recordTempErrBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('temp_error:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
+
+	// recordRetryMatureBumpSQL — инкремент корзины зрелости temp_error
+	// crawler_counters['retry_mature:YYYY-MM-DD'] (T-202): эпизод,
+	// записанный сегодня с итогом temp_error, зреет к полуночи следующего
+	// дня (окно ретрая «старше 24 ч» по date-колонке last_checked_at —
+	// ключ корзины вычисляет БД из current_date, тот же ключ декремент
+	// ретрая выводит из last_checked_at, а реконсиляция — FILTER-позициями
+	// прохода; guard retryMatureSQL суммирует корзины прошедших суток и не
+	// пускает тяжёлую выборку кандидатов при нулевой сумме — актуализация
+	// guard T-191, отличавшая «temp_error есть» от «зрелые есть»).
+	// Upsert-паттерн recordChecksBumpSQL/recordTempErrBumpSQL: строку
+	// корзины создаёт первый эпизод суток, дельта — RowsAffected итогового
+	// UPDATE (1 на эпизод); выполняют только temp_error-итоги — событие
+	// зрелости порождает именно temp_error-эпизод, прочие итоги корзин не
+	// касаются. Дубль-доставки и повторные эпизоды тех же суток дают +1 к
+	// живому нулю — потоковая семантика событий (как у суточных строк,
+	// TZ_slow_done_today §5.1), абсолюты выравнивает реконсиляция.
+	recordRetryMatureBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
@@ -471,6 +494,15 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		if err := recordBumpTempErrCounter(ctx, tx, recorded); err != nil {
 			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
+		// Корзина зрелости (T-202) — замыкает цепочку дельт: последней
+		// среди строк счётчика (порядок реконсиляции «… → temp_error: →
+		// retry_mature:» — без циклов блокировок). Сегодняшний эпизод
+		// зреет к полуночи — корзину сегодняшнего дня инкрементируют и
+		// DNS-этап (dnsworker/result.go), и этот оператор: оба пишут
+		// одинаковое имя из current_date той же транзакции записи.
+		if err := recordBumpRetryMatureCounter(ctx, tx, recorded); err != nil {
+			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("httpworker: домен %s: запись результата: фиксация: %w", res.Name, err)
@@ -578,6 +610,27 @@ func recordBumpTempErrCounter(ctx context.Context, tx pgx.Tx, delta int64) error
 	}
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("суточный числитель temp_error: затронуто %d строк (upsert строки дня обязан 1)",
+			tag.RowsAffected())
+	}
+	return nil
+}
+
+// recordBumpRetryMatureCounter — инкремент корзины зрелости temp_error
+// в ОТКРЫТОЙ транзакции записи результата (T-202): delta — RowsAffected
+// итогового UPDATE домена (вызывающий гарантирует статус temp_error).
+// Upsert сам создаёт корзину суток (первый temp_error-эпизод после
+// полуночи) — RowsAffected гарантированно 1, проверка — страховка
+// прямых вызовов с чужим SQL (молчаливая потеря дельты держала бы guard
+// ретрая закрытым до реконсиляции). Возврат с ошибкой откатывает
+// транзакцию вызывающего — результат и корзина меняются только вместе
+// (§3.4).
+func recordBumpRetryMatureCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
+	tag, err := tx.Exec(ctx, recordRetryMatureBumpSQL, delta)
+	if err != nil {
+		return fmt.Errorf("корзина зрелости temp_error: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("корзина зрелости temp_error: затронуто %d строк (upsert корзины суток обязан 1)",
 			tag.RowsAffected())
 	}
 	return nil

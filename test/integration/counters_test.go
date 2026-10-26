@@ -309,6 +309,13 @@ func countersTempToday(t *testing.T, pool *pgxpool.Pool) int64 {
 	return countersDailyToday(t, pool, "temp_error")
 }
 
+// countersRetryMatureToday — значение сегодняшней корзины зрелости
+// ретрая (T-202); отсутствующая строка — ошибка теста.
+func countersRetryMatureToday(t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	return countersDailyToday(t, pool, "retry_mature")
+}
+
 // countersDailyToday — значение суточной строки <prefix>:YYYY-MM-DD.
 func countersDailyToday(t *testing.T, pool *pgxpool.Pool, prefix string) int64 {
 	t.Helper()
@@ -417,6 +424,115 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 		t.Fatalf("daily:temp_error = %+v, хочу old=2 new=1 drift=1 (дубль события)", p)
 	}
 	countersVerifyEmpty(t, pool, "после реконсиляции доли")
+}
+
+// TestCounters_RetryMatureBaskets — корзины зрелости ретрая (T-202):
+// temp_error-эпизоды ОБЕИХ веток конвейера (HTTP-итог и терминальная
+// temp_error-ветка DNS-этапа — массовый DNS-инцидент приходит через
+// неё) инкрементируют сегодняшнюю корзину одним и тем же ключом; итогы
+// без temp_error корзину не трогают; дубль-доставка — ещё одно событие
+// (потоковая семантика, как у суточных строк); реконсиляция пишет
+// корзину живым окном (temp_error × done × дата), позиция
+// retry_mature:today наблюдает разницу семантик. Guard читает только
+// корзины прошедших суток — сегодняшняя тяжёлую выборку не открывает.
+func TestCounters_RetryMatureBaskets(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := countersSchema(t)
+	ctx := context.Background()
+
+	zone := countersSeedZone(t, pool, "mature.test")
+	ids := countersSeedDomains(t, pool, zone, "m", 3, model.CheckStateQueued, model.StatusNew)
+	// Стартовый проход — создаёт корзины нулями (сегодняшних temp_error
+	// эпизодов ещё нет).
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("стартовый проход: %v", err)
+	}
+	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil)
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+
+	// HTTP temp_error-эпизод (все проверки — таймауты): корзина суток +1.
+	tempRes := &httpworker.DomainResult{
+		ZoneID: zone, DomainID: ids[0], Name: "m0.mature.test",
+		Subdomains: []httpworker.SubdomainResult{{
+			SubdomainID: 0,
+			HTTPS:       httpworker.SchemeCheck{ErrClass: httpworker.ErrTimeout},
+			HTTP:        httpworker.SchemeCheck{ErrClass: httpworker.ErrTimeout},
+		}},
+	}
+	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
+		t.Fatalf("temp_error-эпизод HTTP: ok=%v err=%v", ok, err)
+	}
+	if got := countersRetryMatureToday(t, pool); got != 1 {
+		t.Fatalf("после temp_error-эпизода HTTP retry_mature:<день> = %d, хочу 1", got)
+	}
+
+	// no_http-эпизод: корзину не трогает — зреют только temp_error-итоги.
+	silentRes := &httpworker.DomainResult{ZoneID: zone, DomainID: ids[1], Name: "m1.mature.test"}
+	if ok, err := rec.RecordAndPublish(ctx, silentRes); err != nil || !ok {
+		t.Fatalf("no_http-эпизод: ok=%v err=%v", ok, err)
+	}
+	if got := countersRetryMatureToday(t, pool); got != 1 {
+		t.Fatalf("после no_http-эпизода retry_mature:<день> = %d, хочу 1", got)
+	}
+
+	// Терминальная temp_error-ветка DNS-этапа (SERVFAIL апекса): тот же
+	// ключ корзины — CTE того же оператора записи (T-202).
+	if ok, err := dnsworker.RecordEpisode(ctx, pool, zone, ids[2], dnsworker.EpisodeResult{
+		SetStatus: true,
+		Status:    model.StatusTempError,
+	}); err != nil || !ok {
+		t.Fatalf("temp_error-эпизод DNS: ok=%v err=%v", ok, err)
+	}
+	if got := countersRetryMatureToday(t, pool); got != 2 {
+		t.Fatalf("после temp_error-эпизода DNS retry_mature:<день> = %d, хочу 2", got)
+	}
+
+	// Дубль-доставка HTTP temp_error-эпизода: +1 событие (живое окно
+	// насчитает 2 домена — разницу семантик сводит реконсиляция).
+	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
+		t.Fatalf("дубль temp_error-эпизода: ok=%v err=%v", ok, err)
+	}
+	if got := countersRetryMatureToday(t, pool); got != 3 {
+		t.Fatalf("после дубля retry_mature:<день> = %d, хочу 3", got)
+	}
+	countersVerifyEmpty(t, pool, "после эпизодов (корзины вне verify)")
+
+	// Guard тяжёлой выборки ретрая: сегодняшняя корзина в сумму НЕ входит
+	// (эпизоды зреют к полуночи) — зрелых нет, сумма 0.
+	var mature int64
+	if err := pool.QueryRow(ctx,
+		"SELECT coalesce(sum(value), 0) FROM crawler_counters "+
+			"WHERE name >= 'retry_mature:' AND name < 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')",
+	).Scan(&mature); err != nil {
+		t.Fatalf("guard-сумма корзин: %v", err)
+	}
+	if mature != 0 {
+		t.Fatalf("сумма зрелых корзин = %d, хочу 0 (сегодняшние эпизоды незрелые)", mature)
+	}
+
+	// Реконсиляция — авторитет: корзина суток := живое окно
+	// (temp_error × done × текущая дата — два домена), позиция
+	// retry_mature:today наблюдает разницу (дубль события).
+	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
+	if err != nil {
+		t.Fatalf("реконсиляция: %v", err)
+	}
+	if got := countersRetryMatureToday(t, pool); got != 2 {
+		t.Fatalf("после реконсиляции retry_mature:<день> = %d, хочу 2 (живое окно: два temp_error-домена сегодня)", got)
+	}
+	byName := map[string]monitor.CounterPosition{}
+	for _, p := range pass.Positions {
+		byName[p.Counter] = p
+	}
+	if p := byName["retry_mature:today"]; p.Old != 3 || p.New != 2 || p.Drift() != 1 {
+		t.Fatalf("retry_mature:today = %+v, хочу old=3 new=2 drift=1 (дубль события)", p)
+	}
+	if p := byName["retry_mature:past"]; p.Old != 0 || p.New != 0 || p.Drift() != 0 {
+		t.Fatalf("retry_mature:past = %+v, хочу нули (зрелой когорты нет)", p)
+	}
+	countersVerifyEmpty(t, pool, "после реконсиляции корзин")
 }
 
 // TestCounters_DailyChecksDayChange — ротация суток (T-179, ТЗ §9.2):

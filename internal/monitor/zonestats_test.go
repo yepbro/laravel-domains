@@ -227,28 +227,36 @@ func (t *zonestatsFakeTx) Rollback(context.Context) error {
 
 // aggRowOf — строка per-zone агрегата: зона, total, pending, queued,
 // checked, затем легенда статусов по порядку statusAggCols, затем бит,
-// затем суточное окно проверок и его temp-числитель (T-179/T-182;
-// вариативные аргументы — по умолчанию нули, чтобы базовые проходы
-// тестов не указывали их явно: [checks] либо [checks, temp]).
+// затем суточное окно проверок, его temp-числитель (T-179/T-182) и
+// корзины зрелости ретрая (T-202: сегодняшние/созревшие эпизоды
+// temp_error × done; вариативные аргументы — по умолчанию нули, чтобы
+// базовые проходы тестов не указывали их явно: [checks] →
+// [checks, temp] → [checks, temp, retryToday, retryPast]).
 func aggRowOf(zone int16, total, pending, queued, checked int64, statuses []int64, render int64, daily ...int64) []any {
 	if len(statuses) != len(statusAggCols) {
 		panic("aggRowOf: легенда статусов неполна")
 	}
-	if len(daily) > 2 {
-		panic("aggRowOf: суточных колонок две (T-179/T-182)")
+	if len(daily) > 4 {
+		panic("aggRowOf: суточных колонок четыре (T-179/T-182/T-202)")
 	}
-	var today, temp int64
+	var today, temp, retryToday, retryPast int64
 	if len(daily) > 0 {
 		today = daily[0]
 	}
 	if len(daily) > 1 {
 		temp = daily[1]
 	}
+	if len(daily) > 2 {
+		retryToday = daily[2]
+	}
+	if len(daily) > 3 {
+		retryPast = daily[3]
+	}
 	row := []any{zone, total, pending, queued, checked}
 	for _, s := range statuses {
 		row = append(row, s)
 	}
-	return append(row, render, today, temp)
+	return append(row, render, today, temp, retryToday, retryPast)
 }
 
 // zoneValsOf — строка readZonesSQL/recountZonesSQL RETURNING.
@@ -261,16 +269,19 @@ func counterRowOf(name string, v int64) []any { return []any{name, v} }
 
 // stepsOfPass — очередь результатов одного полного прохода. Шаги:
 // старые зоны, старые счётчики, старые суточные строки проверок и
-// temp_error (T-179/T-182; по умолчанию пустые наборы — строк дня нет,
-// проход создаёт: заполнение без дрейфа), per-zone агрегат,
-// laravel-агрегат, история, перезапись зон (RETURNING новых значений =
-// zoneNew), upsert счётчиков (RETURNING новых значений), upsert суточных
-// строк (значения 0 — тесты с ненулевым окном мутируют шаг, как мутируют
-// агрегат).
+// temp_error (T-179/T-182) и корзины зрелости ретрая (T-202; по
+// умолчанию пустые наборы — строк нет, проход создаёт: заполнение без
+// дрейфа), per-zone агрегат, laravel-агрегат, история, перезапись зон
+// (RETURNING новых значений = zoneNew), upsert счётчиков (RETURNING
+// новых значений), upsert суточных строк, очистка устаревших корзин и
+// upsert обеих корзин ретрая (значения 0 — тесты с ненулевым окном
+// мутируют шаг, как мутируют агрегат).
 func stepsOfPass(zoneOld, zoneNew, agg []any, laravel *zonestatsFakeRows, oldCounters, newCounters *zonestatsFakeRows) []zonestatsStep {
 	return []zonestatsStep{
 		{rows: zonestatsRows(zoneOld)},
 		{rows: oldCounters},
+		{},
+		{},
 		{},
 		{},
 		{rows: zonestatsRows(agg)},
@@ -278,6 +289,9 @@ func stepsOfPass(zoneOld, zoneNew, agg []any, laravel *zonestatsFakeRows, oldCou
 		{rows: zonestatsRows([]any{int64(0), int64(0)})}, // история
 		{rows: zonestatsRows(zoneNew)},
 		{rows: newCounters},
+		{rows: zonestatsRows([]any{int64(0)})},
+		{rows: zonestatsRows([]any{int64(0)})},
+		{}, // очистка корзин — пустой RETURNING
 		{rows: zonestatsRows([]any{int64(0)})},
 		{rows: zonestatsRows([]any{int64(0)})},
 	}
@@ -302,10 +316,12 @@ func zonestatsFixedClock() (time.Time, func() time.Time) {
 // --- ZoneStatsOnce ---------------------------------------------------------
 
 // TestZoneStatsOnceSQL — последовательность операторов прохода в одной
-// транзакции с точными текстами: чтение старых зон, счётчиков и обеих
-// суточных строк → агрегат (единственный скан domains) → laravel →
-// история → перезапись зон (блокировки первыми) → upsert счётчиков →
-// upsert суточных строк (checks:, затем temp_error:) → Commit.
+// транзакции с точными текстами: чтение старых зон, счётчиков, обеих
+// суточных строк и обеих корзин зрелости → агрегат (единственный скан
+// domains) → laravel → история → перезапись зон (блокировки первыми) →
+// upsert счётчиков → upsert суточных строк (checks:, затем temp_error:)
+// → очистка устаревших корзин → upsert корзин ретрая (зрелая, затем
+// сегодняшняя) → Commit.
 func TestZoneStatsOnceSQL(t *testing.T) {
 	now, clock := zonestatsFixedClock()
 	statuses := make([]int64, len(statusAggCols))
@@ -314,18 +330,24 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	pool := &zonestatsFakePool{steps: stepsOfPass(
 		zoneValsOf(7, 10, 4, 2, 3, 1),
 		zoneValsOf(7, 10, 4, 2, 3, 1),
-		aggRowOf(7, 10, 4, 2, 3, statuses, 2, 8, 1),
+		aggRowOf(7, 10, 4, 2, 3, statuses, 2, 8, 1, 3, 2),
 		zonestatsRows([]any{int16(7), int64(1)}),
 		fullCounterRows(map[string]int64{"status_alive": 5, "render_pending": 2}),
 		fullCounterRows(map[string]int64{"status_alive": 5, "render_pending": 2}),
 	)}
 	// Суточные строки (T-179/T-182): старое checks 7 / temp_error 2
 	// (инкременты обогнали живое окно на один temp_error-ретрай), новые —
-	// суммы FILTER-колонок агрегата (8 и 1).
+	// суммы FILTER-колонок агрегата (8 и 1). Корзины ретрая (T-202):
+	// старое зрелая 1 / сегодняшняя 4 (декременты дренажа и события
+	// суток), новые — суммы корзиночных FILTER-колонок (2 и 3).
 	pool.steps[2].rows = zonestatsRows([]any{int64(7)})
 	pool.steps[3].rows = zonestatsRows([]any{int64(2)})
-	pool.steps[9].rows = zonestatsRows([]any{int64(8)})
-	pool.steps[10].rows = zonestatsRows([]any{int64(1)})
+	pool.steps[4].rows = zonestatsRows([]any{int64(1)})
+	pool.steps[5].rows = zonestatsRows([]any{int64(4)})
+	pool.steps[11].rows = zonestatsRows([]any{int64(8)})
+	pool.steps[12].rows = zonestatsRows([]any{int64(1)})
+	pool.steps[14].rows = zonestatsRows([]any{int64(2)})
+	pool.steps[15].rows = zonestatsRows([]any{int64(3)})
 
 	res, err := ZoneStatsOnce(context.Background(), pool, ZoneStatsOptions{Now: clock})
 	if err != nil {
@@ -333,10 +355,15 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	}
 
 	calls := pool.calls()
-	if len(calls) != 11 {
-		t.Fatalf("запросов = %d, want 11 (чтения ×4, агрегаты ×3, перезапись зон, upsert ×3)", len(calls))
+	if len(calls) != 16 {
+		t.Fatalf("запросов = %d, want 16 (чтения ×6, агрегаты ×3, перезапись зон, upsert счётчиков, суточные ×2, корзины ×3)", len(calls))
 	}
-	wantSQL := []string{readZonesSQL, readCountersSQL, readDailyChecksSQL, readDailyTempSQL, recountAggQuerySQL, laravelAggQuerySQL, historyAggSQL, recountZonesSQL, recountCountersSQL, recountDailyChecksSQL, recountDailyTempSQL}
+	wantSQL := []string{
+		readZonesSQL, readCountersSQL, readDailyChecksSQL, readDailyTempSQL, readRetryPastSQL, readRetryTodaySQL,
+		recountAggQuerySQL, laravelAggQuerySQL, historyAggSQL,
+		recountZonesSQL, recountCountersSQL, recountDailyChecksSQL, recountDailyTempSQL,
+		retryMatureCleanupSQL, recountRetryPastSQL, recountRetryTodaySQL,
+	}
 	for i, want := range wantSQL {
 		if calls[i].sql != want {
 			t.Errorf("запрос %d:\n%s\nwant:\n%s", i, calls[i].sql, want)
@@ -348,21 +375,21 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	}
 	// Перезапись зон: unnest-пачка — все параметры в порядке SQL
 	// $1 ids, $2 total, $3 pending, $4 queued, $5 checked, $6 момент,
-	// $7 laravel — из laravel-агрегата (шаг 5), не из RETURNING зон
+	// $7 laravel — из laravel-агрегата (шаг 7), не из RETURNING зон
 	// (перепутанные колонки тест обязан ловить, ревью R2).
 	wantZone := []any{[]int16{7}, []int64{10}, []int64{4}, []int64{2}, []int64{3}, now, []int64{1}}
-	if !reflect.DeepEqual(calls[7].args, wantZone) {
-		t.Errorf("unnest-пачка зон = %#v\nwant %#v", calls[7].args, wantZone)
+	if !reflect.DeepEqual(calls[9].args, wantZone) {
+		t.Errorf("unnest-пачка зон = %#v\nwant %#v", calls[9].args, wantZone)
 	}
 	// Upsert: имена полной легенды + значения + момент.
-	if got := calls[8].args[0]; !reflect.DeepEqual(got, CounterNames()) {
+	if got := calls[10].args[0]; !reflect.DeepEqual(got, CounterNames()) {
 		t.Errorf("имена upsert = %v, want легенда CounterNames", got)
 	}
-	if calls[8].args[2] != any(now) {
-		t.Errorf("updated_at upsert = %#v, want %v", calls[8].args[2], now)
+	if calls[10].args[2] != any(now) {
+		t.Errorf("updated_at upsert = %#v, want %v", calls[10].args[2], now)
 	}
 	// Значения upsert соответствуют агрегату: легенда по порядку.
-	wantVals := calls[8].args[1].([]int64)
+	wantVals := calls[10].args[1].([]int64)
 	if wantVals[len(statusAggCols)] != 2 { // render_pending после статусов
 		t.Errorf("render_pending в upsert = %d, want 2", wantVals[len(statusAggCols)])
 	}
@@ -370,17 +397,39 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	// агрегата, момент — часы прохода; имена дней вычисляет БД — в текстах
 	// операторов current_date, параметров имени нет; порядок записей
 	// «checks: → temp_error:» общий с инкрементами record.go.
-	if !reflect.DeepEqual(calls[9].args, []any{int64(8), any(now)}) {
-		t.Errorf("аргументы upsert строки проверок = %#v, want значение 8 + момент", calls[9].args)
+	if !reflect.DeepEqual(calls[11].args, []any{int64(8), any(now)}) {
+		t.Errorf("аргументы upsert строки проверок = %#v, want значение 8 + момент", calls[11].args)
 	}
-	if !reflect.DeepEqual(calls[10].args, []any{int64(1), any(now)}) {
-		t.Errorf("аргументы upsert temp-строки = %#v, want значение 1 + момент", calls[10].args)
+	if !reflect.DeepEqual(calls[12].args, []any{int64(1), any(now)}) {
+		t.Errorf("аргументы upsert temp-строки = %#v, want значение 1 + момент", calls[12].args)
 	}
 	if !strings.Contains(recountDailyChecksSQL, "'checks:' || to_char(current_date, 'YYYY-MM-DD')") {
 		t.Errorf("recountDailyChecksSQL без имени дня от БД:\n%s", recountDailyChecksSQL)
 	}
 	if !strings.Contains(recountDailyTempSQL, "'temp_error:' || to_char(current_date, 'YYYY-MM-DD')") {
 		t.Errorf("recountDailyTempSQL без имени дня от БД:\n%s", recountDailyTempSQL)
+	}
+	// Корзины зрелости ретрая (T-202): очистка — без параметров (диапазон
+	// имён вычисляет БД), upsert'ы — значение + момент; имена корзин —
+	// current_date − 1 / current_date в текстах операторов; порядок
+	// «очистка → зрелая → сегодняшняя» общий с писателями дельт.
+	if len(calls[13].args) != 0 {
+		t.Errorf("аргументы очистки корзин = %#v, want без параметров", calls[13].args)
+	}
+	if !reflect.DeepEqual(calls[14].args, []any{int64(2), any(now)}) {
+		t.Errorf("аргументы upsert зрелой корзины = %#v, want значение 2 + момент", calls[14].args)
+	}
+	if !reflect.DeepEqual(calls[15].args, []any{int64(3), any(now)}) {
+		t.Errorf("аргументы upsert сегодняшней корзины = %#v, want значение 3 + момент", calls[15].args)
+	}
+	if !strings.Contains(recountRetryPastSQL, "'retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD')") {
+		t.Errorf("recountRetryPastSQL без имени корзины от БД:\n%s", recountRetryPastSQL)
+	}
+	if !strings.Contains(recountRetryTodaySQL, "'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')") {
+		t.Errorf("recountRetryTodaySQL без имени корзины от БД:\n%s", recountRetryTodaySQL)
+	}
+	if !strings.Contains(retryMatureCleanupSQL, "< 'retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD')") {
+		t.Errorf("retryMatureCleanupSQL без границы очистки от БД:\n%s", retryMatureCleanupSQL)
 	}
 
 	begins, commits, _ := pool.txCounts()
@@ -391,9 +440,10 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 		t.Errorf("Zones = %d, want 1", res.Zones)
 	}
 	// Позиции дрейфа: 5 колонок зоны + дельта-ведомые глобальные +
-	// суточные строки (T-179/T-182).
-	if len(res.Positions) != 5+len(driftCounterNames())+2 {
-		t.Fatalf("позиций = %d, want %d", len(res.Positions), 5+len(driftCounterNames())+2)
+	// суточные строки (T-179/T-182) + корзины ретрая (T-202).
+	if len(res.Positions) != 5+len(driftCounterNames())+len(dailyStreamingPositions())+len(retryMatureStreamingPositions()) {
+		t.Fatalf("позиций = %d, want %d", len(res.Positions),
+			5+len(driftCounterNames())+len(dailyStreamingPositions())+len(retryMatureStreamingPositions()))
 	}
 	byName := make(map[string]CounterPosition, len(res.Positions))
 	for _, p := range res.Positions {
@@ -422,6 +472,15 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	if p := byName["daily:temp_error"]; p.Old != 2 || p.New != 1 || p.Drift() != 1 {
 		t.Errorf("daily:temp_error = %+v, want old=2 new=1 drift=1", p)
 	}
+	// Корзины ретрая (T-202): дрейф — потоковая разница событий и доменов
+	// (дрейф дренажа |1 − 2|, события суток |4 − 3|), позиции
+	// наблюдаемые, в Warn не входят.
+	if p := byName["retry_mature:past"]; p.Old != 1 || p.New != 2 || p.Drift() != 1 {
+		t.Errorf("retry_mature:past = %+v, want old=1 new=2 drift=1", p)
+	}
+	if p := byName["retry_mature:today"]; p.Old != 4 || p.New != 3 || p.Drift() != 1 {
+		t.Errorf("retry_mature:today = %+v, want old=4 new=3 drift=1", p)
+	}
 }
 
 // TestZoneStatsOnceDrift — дрейф: старое ≠ новое по колонке зоны и
@@ -442,10 +501,10 @@ func TestZoneStatsOnceDrift(t *testing.T) {
 	pool.steps[0].rows = zonestatsRows(
 		zoneValsOf(7, 10, 4, 2, 3, 1),
 		zoneValsOf(9, 0, 0, 0, 0, 0))
-	pool.steps[4].rows = zonestatsRows(
+	pool.steps[6].rows = zonestatsRows(
 		aggRowOf(7, 10, 6, 2, 3, statuses, 4),
 		aggRowOf(9, 2, 2, 0, 0, make([]int64, len(statusAggCols)), 0))
-	pool.steps[7].rows = zonestatsRows(
+	pool.steps[9].rows = zonestatsRows(
 		zoneValsOf(7, 10, 6, 2, 3, 1),
 		zoneValsOf(9, 2, 2, 0, 0, 0))
 
@@ -515,9 +574,9 @@ func TestZoneStatsOnceDailyChecks(t *testing.T) {
 		fullCounterRows(nil),
 		fullCounterRows(nil))
 	// stepsOfPass сеет пустые старые суточные строки (шаги 2–3) —
-	// оставляем; новые значения шагов 9–10 — окна 3 и 1.
-	create[9].rows = zonestatsRows([]any{int64(3)})
-	create[10].rows = zonestatsRows([]any{int64(1)})
+	// оставляем; новые значения шагов 11–12 — окна 3 и 1.
+	create[11].rows = zonestatsRows([]any{int64(3)})
+	create[12].rows = zonestatsRows([]any{int64(1)})
 	res, err := ZoneStatsOnce(context.Background(), &zonestatsFakePool{steps: create}, ZoneStatsOptions{})
 	if err != nil {
 		t.Fatalf("ZoneStatsOnce: %v", err)
@@ -540,8 +599,8 @@ func TestZoneStatsOnceDailyChecks(t *testing.T) {
 		fullCounterRows(nil))
 	drift[2].rows = zonestatsRows([]any{int64(5)})
 	drift[3].rows = zonestatsRows([]any{int64(2)})
-	drift[9].rows = zonestatsRows([]any{int64(3)})
-	drift[10].rows = zonestatsRows([]any{int64(1)})
+	drift[11].rows = zonestatsRows([]any{int64(3)})
+	drift[12].rows = zonestatsRows([]any{int64(1)})
 	res, err = ZoneStatsOnce(context.Background(), &zonestatsFakePool{steps: drift}, ZoneStatsOptions{})
 	if err != nil {
 		t.Fatalf("ZoneStatsOnce: %v", err)
@@ -575,8 +634,8 @@ func TestZoneStatsOnceZoneFilter(t *testing.T) {
 	if got, ok := calls[0].args[0].(*int16); !ok || got == nil || *got != zone {
 		t.Errorf("фильтр зоны чтения старых зон = %#v, want *int16(7)", calls[0].args[0])
 	}
-	if got := calls[7].args[0]; !reflect.DeepEqual(got, []int16{7}) {
-		t.Errorf("unnest зоны перезаписи = %#v, want [7] (перезапись зон — шаг 7)", got)
+	if got := calls[9].args[0]; !reflect.DeepEqual(got, []int16{7}) {
+		t.Errorf("unnest зоны перезаписи = %#v, want [7] (перезапись зон — шаг 9)", got)
 	}
 }
 
@@ -584,12 +643,16 @@ func TestZoneStatsOnceZoneFilter(t *testing.T) {
 // транзакция выполняется (строки счётчиков создаёт upsert прохода).
 func TestZoneStatsOnceEmpty(t *testing.T) {
 	// Пачка зон пуста — оператор перезаписи не выполняется (пропуск
-	// no-op в writeZonePositions), шаги: чтения ×4, агрегаты ×3,
-	// upsert ×3.
+	// no-op в writeZonePositions), шаги: чтения ×6, агрегаты ×3,
+	// upsert счётчиков, суточные ×2, корзины ×3.
 	pool := &zonestatsFakePool{steps: []zonestatsStep{
-		{}, {}, {}, {}, {rows: zonestatsRows()}, {rows: zonestatsRows()},
+		{}, {}, {}, {}, {}, {},
+		{rows: zonestatsRows()}, {rows: zonestatsRows()},
 		{rows: zonestatsRows([]any{int64(0), int64(0)})},
 		{rows: fullCounterRows(nil)},
+		{rows: zonestatsRows([]any{int64(0)})},
+		{rows: zonestatsRows([]any{int64(0)})},
+		{},
 		{rows: zonestatsRows([]any{int64(0)})},
 		{rows: zonestatsRows([]any{int64(0)})},
 	}}
@@ -601,18 +664,19 @@ func TestZoneStatsOnceEmpty(t *testing.T) {
 	if res.Zones != 0 {
 		t.Errorf("Zones = %d, want 0", res.Zones)
 	}
-	if n := pool.stats(); n != 10 {
-		t.Errorf("запросов = %d, want 10 (перезапись зон пропущена)", n)
+	if n := pool.stats(); n != 15 {
+		t.Errorf("запросов = %d, want 15 (перезапись зон пропущена)", n)
 	}
-	if len(res.Positions) != len(driftCounterNames())+len(dailyStreamingPositions()) {
-		t.Errorf("позиций = %d, want глобальные + суточные (%d)", len(res.Positions), len(driftCounterNames())+len(dailyStreamingPositions()))
+	if len(res.Positions) != len(driftCounterNames())+len(dailyStreamingPositions())+len(retryMatureStreamingPositions()) {
+		t.Errorf("позиций = %d, want глобальные + суточные + корзины (%d)", len(res.Positions),
+			len(driftCounterNames())+len(dailyStreamingPositions())+len(retryMatureStreamingPositions()))
 	}
 }
 
 // TestZoneStatsOnceErrors — ошибка каждого шага обёрнута контекстом
 // задачи; отмена ctx сохраняется errors.Is; Commit тоже может падать.
 func TestZoneStatsOnceErrors(t *testing.T) {
-	for i := 0; i < 11; i++ {
+	for i := 0; i < 16; i++ {
 		steps := stepsOfPass(
 			zoneValsOf(7, 10, 4, 2, 3, 1),
 			zoneValsOf(7, 10, 4, 2, 3, 1),
@@ -639,7 +703,7 @@ func TestZoneStatsOnceErrors(t *testing.T) {
 		zonestatsRows(),
 		fullCounterRows(nil),
 		fullCounterRows(nil))
-	cancelSteps[4].err = context.Canceled // шаг агрегата — тяжёлое чтение
+	cancelSteps[6].err = context.Canceled // шаг агрегата — тяжёлое чтение
 	cancelPool := &zonestatsFakePool{steps: cancelSteps}
 	if _, err := ZoneStatsOnce(context.Background(), cancelPool, ZoneStatsOptions{}); !errors.Is(err, context.Canceled) {
 		t.Errorf("ошибка = %v, want context.Canceled", err)
@@ -751,7 +815,7 @@ func TestZoneStatsLoopImmediatePass(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for pool.stats() < 11 {
+	for pool.stats() < 16 {
 		if time.Now().After(deadline) {
 			cancel()
 			t.Fatal("стартовый проход не выполнен")
@@ -759,8 +823,8 @@ func TestZoneStatsLoopImmediatePass(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(20 * time.Millisecond)
-	if n := pool.stats(); n != 11 {
-		t.Errorf("запросов = %d, want 11: без тика повторных проходов нет", n)
+	if n := pool.stats(); n != 16 {
+		t.Errorf("запросов = %d, want 16: без тика повторных проходов нет", n)
 	}
 
 	cancel()
@@ -828,13 +892,15 @@ func TestZoneStatsLoopFailedFirstPass(t *testing.T) {
 		zonestatsRows(),
 		fullCounterRows(nil),
 		fullCounterRows(nil))
-	// Первый проход: ровно четыре шага чтения до сбоя на агрегате (хвост не
+	// Первый проход: ровно шесть шагов чтения до сбоя на агрегате (хвост не
 	// оставляем — иначе второй проход ест заготовку со сдвигом).
 	fail := []zonestatsStep{
 		{rows: zonestatsRows(zoneValsOf(7, 0, 0, 0, 0, 0))}, // старые зоны
 		{rows: fullCounterRows(nil)},                        // старые счётчики
 		{},                                                  // старая строка проверок (T-179)
 		{},                                                  // старая temp-строка (T-182)
+		{},                                                  // старая зрелая корзина (T-202)
+		{},                                                  // старая сегодняшняя корзина (T-202)
 		{err: errors.New("бд недоступна")}, // агрегат — сбой
 	}
 	pool := &zonestatsFakePool{steps: append(fail, fill...)}
@@ -848,7 +914,7 @@ func TestZoneStatsLoopFailedFirstPass(t *testing.T) {
 		})
 	}()
 
-	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 16 }, "проход после сбойного старта")
+	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 23 }, "проход после сбойного старта")
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("ZoneStatsLoop: %v", err)
@@ -892,12 +958,18 @@ func TestZoneStatsLoopTickerDriftWarn(t *testing.T) {
 		fullCounterRows(map[string]int64{"render_pending": 5}),
 		fullCounterRows(map[string]int64{"render_pending": 6}))
 	// Суточные строки второго прохода — ненулевой «дрейф» (потоковые
-	// позиции, T-179/T-182): gauge их экспонирует, но Warn по ним не
-	// поднимается (шум под живой нагрузкой — reportDrift).
+	// позиции, T-179/T-202): gauge их экспонирует, но Warn по ним не
+	// поднимается (шум под живой нагрузкой — reportDrift). Корзины
+	// ретрая — та же потоковая семантика (T-202): старые значения
+	// корзин также расходятся с новым окном — gauge без Warn.
 	withDrift[2].rows = zonestatsRows([]any{int64(12)})
 	withDrift[3].rows = zonestatsRows([]any{int64(8)})
-	withDrift[9].rows = zonestatsRows([]any{int64(7)})
-	withDrift[10].rows = zonestatsRows([]any{int64(5)})
+	withDrift[4].rows = zonestatsRows([]any{int64(9)})
+	withDrift[5].rows = zonestatsRows([]any{int64(6)})
+	withDrift[11].rows = zonestatsRows([]any{int64(7)})
+	withDrift[12].rows = zonestatsRows([]any{int64(5)})
+	withDrift[14].rows = zonestatsRows([]any{int64(4)})
+	withDrift[15].rows = zonestatsRows([]any{int64(2)})
 	pool := &zonestatsFakePool{steps: append(noDrift, withDrift...)}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -931,10 +1003,11 @@ func TestZoneStatsLoopTickerDriftWarn(t *testing.T) {
 	}
 	// Суточные позиции — вне Warn (потоковые, reportDrift): в топе
 	// дрейфа их быть не должно, gauge при этом экспонирует |12 − 7| и
-	// |8 − 5|.
-	for _, streaming := range dailyStreamingPositions() {
+	// |8 − 5|. Корзины ретрая (T-202) — та же потоковая семантика:
+	// |9 − 4| и |6 − 2| вне Warn, gauge ведётся.
+	for _, streaming := range append(dailyStreamingPositions(), retryMatureStreamingPositions()...) {
 		if strings.Contains(log, streaming) {
-			t.Errorf("суточная позиция %s в Warn дрейфа (шум):\n%s", streaming, log)
+			t.Errorf("потоковая позиция %s в Warn дрейфа (шум):\n%s", streaming, log)
 		}
 	}
 	if v := driftGaugeValue(t, reg, "zone:7:pending"); v != 1 {
@@ -951,6 +1024,12 @@ func TestZoneStatsLoopTickerDriftWarn(t *testing.T) {
 	}
 	if v := driftGaugeValue(t, reg, dailyTempCounter); v != 3 {
 		t.Errorf("drift{daily:temp_error} = %v, want 3 (gauge ведётся и вне Warn)", v)
+	}
+	if v := driftGaugeValue(t, reg, retryMaturePastCounter); v != 5 {
+		t.Errorf("drift{retry_mature:past} = %v, want 5 (gauge ведётся и вне Warn)", v)
+	}
+	if v := driftGaugeValue(t, reg, retryMatureTodayCounter); v != 4 {
+		t.Errorf("drift{retry_mature:today} = %v, want 4 (gauge ведётся и вне Warn)", v)
 	}
 }
 
@@ -1045,7 +1124,7 @@ func zonestatsHistogramSamples(t *testing.T, reg *metrics.Registry) uint64 {
 // passSteps — заготовки N «тихих» проходов (нулевой дрейф).
 func passSteps(n int) []zonestatsStep {
 	statuses := make([]int64, len(statusAggCols))
-	out := make([]zonestatsStep, 0, n*11)
+	out := make([]zonestatsStep, 0, n*16)
 	for i := 0; i < n; i++ {
 		out = append(out, stepsOfPass(
 			zoneValsOf(7, 10, 4, 2, 3, 1),
@@ -1087,8 +1166,8 @@ func TestZoneStatsLoopSingleFlight(t *testing.T) {
 	// не начался ДО дренажа. Точное число запросов не проверяем: под
 	// нагрузкой прогона между Warn и проверкой мог наступить следующий
 	// тик (150 мс) и запустить проход 2 — это нормальный режим.
-	if n := pool.stats(); n < 11 {
-		t.Errorf("запросов = %d после дренажа, want ≥ 11 (первый проход завершён)", n)
+	if n := pool.stats(); n < 16 {
+		t.Errorf("запросов = %d после дренажа, want ≥ 16 (первый проход завершён)", n)
 	}
 
 	// Проход 2 быстрый: обычный режим восстанавливается, цикл живёт.
@@ -1097,7 +1176,7 @@ func TestZoneStatsLoopSingleFlight(t *testing.T) {
 	// со старой задержкой — честный skipped = 2, это нормальный режим;
 	// инвариант single-flight («не чаще интервала») проверен выше.
 	pool.setDelay(0)
-	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 16 }, "проход после пропуска")
+	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 22 }, "проход после пропуска")
 	if got := zonestatsSkippedValue(t, reg); got < 1 {
 		t.Errorf("skipped_ticks = %v после быстрого прохода, want ≥ 1", got)
 	}
@@ -1130,7 +1209,7 @@ func TestZoneStatsLoopNilRegistry(t *testing.T) {
 		})
 	}()
 
-	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 11 }, "стартовый проход без реестра")
+	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 16 }, "стартовый проход без реестра")
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("ZoneStatsLoop: %v, want nil без реестра", err)
@@ -1178,6 +1257,20 @@ func TestRecountSQLContracts(t *testing.T) {
 	}
 	if !strings.Contains(domainsAggSQL, fmt.Sprintf("count(*) FILTER (WHERE last_checked_at = current_date AND status = %d) AS f_temp_today", int16(model.StatusTempError))) {
 		t.Errorf("domainsAggSQL без temp-числителя f_temp_today (T-182): статус %d", int16(model.StatusTempError))
+	}
+	// Корзины зрелости ретрая (T-202): зрелые кандидаты temp_error × done
+	// по датам эпизодов — сегодняшние (зреют к полуночи) и созревшая
+	// когорта (старше текущих суток); предикат guard'а планировщика —
+	// статус × done × окно даты.
+	if !strings.Contains(domainsAggSQL, fmt.Sprintf(
+		"count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at = current_date) AS f_retry_mature_today",
+		int16(model.StatusTempError), int16(model.CheckStateDone))) {
+		t.Error("domainsAggSQL без корзины f_retry_mature_today (T-202)")
+	}
+	if !strings.Contains(domainsAggSQL, fmt.Sprintf(
+		"count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at < current_date) AS f_retry_mature_past",
+		int16(model.StatusTempError), int16(model.CheckStateDone))) {
+		t.Error("domainsAggSQL без корзины f_retry_mature_past (T-202)")
 	}
 	for _, sql := range []string{recountAggQuerySQL, verifyZonesSQL} {
 		if !strings.Contains(sql, "GROUP BY zone_id") {
