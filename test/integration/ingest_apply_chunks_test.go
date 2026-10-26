@@ -26,13 +26,17 @@ func TestIngest_ApplyAddChunked(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t) // BatchSize 4: COPY и применение — пачками по 4
 
-	// 11 доменов в двух зонах: 3 пачки применения (4 + 4 + 3).
+	// 11 доменов в двух зонах: 3 пачки применения (4 + 4 + 3). Зоны —
+	// реальные TLD (com/org): у zone-less файла зона строки — суффикс
+	// PSL (idn.Result.Zone), «crawl.test»/«walk.test» дали бы одну зону
+	// test с составными метками (проверено Normalize) — как и NRD-фид,
+	// файл смешивает зоны в одном списке.
 	lines := make([]string, 0, 11)
 	for i := 1; i <= 6; i++ {
-		lines = append(lines, fmt.Sprintf("chunk%02d.crawl.test", i))
+		lines = append(lines, fmt.Sprintf("chunk%02d.com", i))
 	}
 	for i := 1; i <= 5; i++ {
-		lines = append(lines, fmt.Sprintf("chunk%02d.walk.test", i))
+		lines = append(lines, fmt.Sprintf("chunk%02d.org", i))
 	}
 
 	out := env.process(t, "add/chunks.txt", fileContent(lines...))
@@ -80,7 +84,7 @@ func TestIngest_ApplyAddChunked(t *testing.T) {
 		t.Fatal(err)
 	}
 	if seen != 2 {
-		t.Errorf("зон = %d, want 2 (crawl.test, walk.test)", seen)
+		t.Errorf("зон = %d, want 2 (com, org)", seen)
 	}
 
 	// Партия покинула staging (применить → очистить, T-017).
