@@ -310,7 +310,8 @@ journalctl -u smartmontools            # жизнь самого демона
 `internal/monitor/alerts.go` читает health-лог ioctl-ом напрямую (без
 nvme-cli): `percentage_used` ≥ 90 % — Warn (алерт `nvme_wear`), в деталях —
 TBW устройства из `data_units_written`; период прохода —
-`monitor.zone_stats_interval` (по умолчанию 5 мин, T-161). В Docker-контейнере `/dev/nvme*` не
+`monitor.zone_stats_interval` (по умолчанию 30 мин, T-199).
+В Docker-контейнере `/dev/nvme*` не
 проброшен — алерт честно «не измеряется» (без Warn и ложных срабатываний).
 
 На боевом systemd-хосте слой включается доступом юнита `crawler-monitor`

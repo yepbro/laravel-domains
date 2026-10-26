@@ -112,7 +112,7 @@ func TestDefault(t *testing.T) {
 		{"analyzer.rules_dir", c.Analyzer.RulesDir, "/etc/crawler/rules"},
 		{"analyzer.laravel_min_score", c.Analyzer.LaravelMinScore, 0.6},
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
-		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 5 * time.Minute},
+		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 30 * time.Minute},
 		{"monitor.slow_query_interval", c.Monitor.SlowQueryInterval.D(), 10 * time.Second},
 		{"monitor.slow_query_min_duration", c.Monitor.SlowQueryMinDuration.D(), 3 * time.Second},
 		{"monitor.ingest_metrics_url", c.Monitor.IngestMetricsURL, "http://127.0.0.1:9101/metrics"},

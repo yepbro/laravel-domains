@@ -108,7 +108,7 @@ func TestAlertsBadHashesThreshold(t *testing.T) {
 // множество последних дельт (см. аннотацию в push).
 func TestBadHashesWindow(t *testing.T) {
 	if AlertBadHashesWindow != 15 {
-		t.Fatalf("AlertBadHashesWindow = %d, want 15 (окно 15 минут)", AlertBadHashesWindow)
+		t.Fatalf("AlertBadHashesWindow = %d, want 15 (окно 15 проходов алертов)", AlertBadHashesWindow)
 	}
 	w := &badHashesWindow{}
 	if sum := w.push(0); sum != 0 {
@@ -132,7 +132,7 @@ func TestBadHashesWindow(t *testing.T) {
 
 // TestAlertsBadHashesExactThreshold — сумма ровно AlertBadHashesThreshold —
 // уже всплеск (≥, не «строго больше»); деталь называет окно — 15 проходов
-// дефолтного интервала 60с = 15 минут.
+// интервала тестовой среды (DefaultAlertsInterval 5м) = 1ч15м.
 func TestAlertsBadHashesExactThreshold(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	src := &fakeBadHashes{}
@@ -145,7 +145,7 @@ func TestAlertsBadHashesExactThreshold(t *testing.T) {
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("сумма ровно 10: статус = %s (%s), want firing", s.Status, s.Detail)
 	}
-	for _, want := range []string{"15m0s", "10"} { // окно 15 × 60с, порог
+	for _, want := range []string{"1h15m0s", "10"} { // окно 15 × 5м, порог
 		if !strings.Contains(s.Detail, want) {
 			t.Errorf("detail %q не содержит %s", s.Detail, want)
 		}

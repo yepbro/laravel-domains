@@ -227,7 +227,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// pg_stat_activity — выполняемые дольше monitor.slow_query_min_duration
 	// клиентские операторы уходят в Telegram той же доставкой, что алерты
 	// и отчёт нагрузки (дебаунс pid+query_start; агрегаты monitor —
-	// UPDATE по 47 млн строк каждые 5 мин, замер §12 — исключены
+	// UPDATE по 47 млн строк каждые 30 мин (T-199), замер §12 — исключены
 	// application_name пула). Полный посмертный след — журнал сервера
 	// (log_min_duration_statement, deploy/postgres). 0 — цикл выключен
 	// (SlowQueryLoop молча выйдет).

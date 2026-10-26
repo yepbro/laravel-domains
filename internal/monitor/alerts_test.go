@@ -924,14 +924,15 @@ func TestAlertsStallSourceErrors(t *testing.T) {
 }
 
 // TestAlertsStallDefaultInterval — нулевой ZoneStatsInterval — дефолт
-// (DefaultZoneStatsInterval, 5 минут): порог 25 минут, а не ноль.
+// (DefaultZoneStatsInterval, 30 минут, T-199): порог 2,5 часа, а не ноль
+// (2 часа за порогом — ещё ок; при дефолте 5 мин сошлось бы в firing).
 func TestAlertsStallDefaultInterval(t *testing.T) {
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.ZoneStatsInterval = 0 })
 	now, _ := alertsFixedClock()
-	env.pool.fresh = []sql.NullTime{{Time: now.Add(-4 * time.Minute), Valid: true}}
+	env.pool.fresh = []sql.NullTime{{Time: now.Add(-2 * time.Hour), Valid: true}}
 
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertProgressStall); s.Status != AlertStatusOK {
-		t.Errorf("4мин при дефолтных 5×5м: статус = %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("2ч при дефолтных 5×30м: статус = %s (%s), want ok", s.Status, s.Detail)
 	}
 }
 

@@ -672,10 +672,12 @@ func TestZoneStatsOnceNilPool(t *testing.T) {
 
 // TestZoneStatsOptionsDefaults — нулевые и отрицательные значения —
 // дефолт; заданные не затираются, Now передаётся как есть. Дефолт
-// pinned литералом 5м (T-161, замер §12).
+// pinned литералом 30м (T-199: решение оператора 26.10 по замеру окна
+// медленных после 3bffc62 — 48 % медленного времени БД при 5 мин;
+// прежние 5м — T-161, замер §12).
 func TestZoneStatsOptionsDefaults(t *testing.T) {
-	if DefaultZoneStatsInterval != 5*time.Minute {
-		t.Errorf("DefaultZoneStatsInterval = %v, want 5m (T-161, замер §12)", DefaultZoneStatsInterval)
+	if DefaultZoneStatsInterval != 30*time.Minute {
+		t.Errorf("DefaultZoneStatsInterval = %v, want 30m (T-199)", DefaultZoneStatsInterval)
 	}
 	got := (ZoneStatsOptions{}).withDefaults()
 	if got.Interval != DefaultZoneStatsInterval {
