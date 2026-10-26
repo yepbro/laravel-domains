@@ -15,8 +15,10 @@
 //	→ ContentStore.Put(DOM) — новая ссылка +1 (T-056/T-042, дедуп по хэшу)
 //	→ ОДНА транзакция: UPDATE строки (rendered = true, новый content_hash,
 //	  final_url/cookies/headers рендера, rules_version = NULL; RETURNING
-//	  checked_at — час корзины rendered-темпа) + −1 refcount старого хэша
-//	  (SwapRefTx, T-044) + инкремент часовой корзины темпа
+//	  checked_at — час корзин rendered-темпа и хвостов переанализа) +
+//	  −1 refcount старого хэша (SwapRefTx, T-044) + инкремент корзины
+//	  хвостов переанализа crawler_counters['reanalyze:…'] (T-204: NULL
+//	  вернул строку в неанализированные) и часовой корзины темпа
 //	  crawler_counters['rendered:YYYY-MM-DD"T"HH24'] (T-203: той же
 //	  транзакцией — флаг и корзина меняются только вместе)
 //	→ после фиксации — публикация q:analyze (Result, тот же ключ; §7)
@@ -130,6 +132,34 @@ var (
 		"AND r.subdomain_id = $3::int2 AND r.variant = $4::int2 " +
 		"AND r.content_hash IS NOT DISTINCT FROM $9::bytea " +
 		"RETURNING r.checked_at"
+
+	// renderBumpReanalyzeSQL — инкремент корзины неанализированных хвостов
+	// crawler_counters['reanalyze:YYYY-MM-DD"T"HH24'] (T-204): замена
+	// контента ставит rules_version = NULL — прошлое заключение
+	// анализатора новому контенту не соответствует, строка снова хвост
+	// до штампа повторной публикации q:analyze ниже. $1 — checked_at
+	// строки из RETURNING renderUpdateSQL: час ЭПИЗОДА, не рендера —
+	// тот же ключ, что у инкремента записи (record.go: час now() =
+	// checked_at строк) и декремента штампа анализатора (worker.go:
+	// RETURNING checked_at) — рассинхрон ключей лишил бы декремент
+	// адресата. Guard тикового прохода переанализа
+	// (analyzer/reanalyze.go) суммирует корзины старше текущего часа:
+	// свежий рендер (эпизод текущего часа) попадает в незрелую корзину и
+	// guard не открывает; рендер-опоздание > 1 ч воскрешает корзину
+	// старого часа — guard открывается, тик вычитывает окно, хвост позади
+	// курсора не находит (строка за курсором — остаточный класс время-
+	// формы T-193 §4.2), проход monitor корзину удаляет. Рендер строки,
+	// ещё не проштампованной записью (гонка с анализатором: NULL →
+	// render(NULL) → первый штамп), даёт +1 без парного декремента —
+	// потоковая семантика событий (семейство T-202/T-203), абсолюты
+	// выравнивает реконсиляция. Upsert-паттерн renderBumpRenderedSQL;
+	// порядок блокировок — ПЕРЕД rendered: (проход реконсиляции ведёт
+	// семьи «retry_mature: → reanalyze: → rendered: → results:») — без
+	// циклов.
+	renderBumpReanalyzeSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('reanalyze:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
 	// renderBumpRenderedSQL — инкремент часовой корзины rendered-темпа
 	// crawler_counters['rendered:YYYY-MM-DD"T"HH24'] (T-203): +1 на
@@ -612,6 +642,14 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 			return false, fmt.Errorf("renderworker: %s: %w", name, err)
 		}
 	}
+	// Корзина хвостов переанализа (T-204) — перед корзиной rendered-темпа
+	// (порядок реконсиляции «reanalyze: → rendered:», комментарий
+	// renderBumpReanalyzeSQL): заменённый контент вернул строку в
+	// неанализированные до штампа повторной публикации; час — checked_at
+	// из RETURNING UPDATE выше (час эпизода).
+	if err := renderBumpReanalyzeCounter(ctx, tx, checkedAt); err != nil {
+		return false, fmt.Errorf("renderworker: %s: %w", name, err)
+	}
 	// Корзина rendered-темпа (T-203) — последним шагом транзакции (та же
 	// фиксация: откат откатывает флаг и дельту вместе, §3.4; окно
 	// блокировки строки счётчика — минимум, стиль хвостовых дельт
@@ -641,6 +679,28 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		"domain", name, "final_url", out.FinalURL, "dom_bytes", len(out.DOM),
 		"cookies", len(out.Cookies))
 	return true, nil
+}
+
+// renderBumpReanalyzeCounter — инкремент корзины неанализированных
+// хвостов в ОТКРЫТОЙ транзакции замены контента (T-204): checkedAt — час
+// корзины (RETURNING renderUpdateSQL), delta — 1 (одна строка вернулась
+// в неанализированные заменой контента). Upsert сам создаёт корзину часа
+// (или воскрешает устаревшую — рендер-опоздание, комментарий
+// renderBumpReanalyzeSQL) — RowsAffected гарантированно 1, проверка —
+// страховка прямых вызовов с чужим SQL (молчаливая потеря дельты
+// занижала бы окно guard'а тика). Возврат с ошибкой откатывает
+// транзакцию вызывающего — замена контента и корзина меняются только
+// вместе (§3.4).
+func renderBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, checkedAt time.Time) error {
+	tag, err := tx.Exec(ctx, renderBumpReanalyzeSQL, checkedAt, int64(1))
+	if err != nil {
+		return fmt.Errorf("корзина хвостов переанализа: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("корзина хвостов переанализа: затронуто %d строк (upsert корзины часа обязан 1)",
+			tag.RowsAffected())
+	}
+	return nil
 }
 
 // renderBumpRenderedCounter — инкремент корзины rendered-темпа в

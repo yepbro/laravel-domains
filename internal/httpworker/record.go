@@ -208,6 +208,34 @@ var (
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
+	// recordReanalyzeBumpSQL — инкремент корзины неанализированных хвостов
+	// crawler_counters['reanalyze:YYYY-MM-DD"T"HH24'] (T-204): +N — строк
+	// subdomain_results, вставленных этой транзакцией с rules_version =
+	// NULL (дельта — RowsAffected recordInsertSQL; час —
+	// date_trunc('hour', now()) той же транзакции = час checked_at строк,
+	// имя корзины вычисляет БД). Корзину ведут и декремент штампа
+	// анализатора (worker.go, час эпизода строки), и инкремент замены
+	// контента рендером (renderworker, час эпизода из RETURNING);
+	// авторитет — реконсиляция monitor (FILTER-позиции prev/cur агрегата
+	// окна двух живых часов). Guard тикового прохода переанализа
+	// (analyzer/reanalyze.go, reanalyzeGuardSQL) суммирует корзины старше
+	// текущего часа — записанное сейчас попадает в незрелую корзину
+	// текущего часа и guard не открывает (in-flight-поток записи →
+	// q:analyze → штамп занимает секунды); переживший границу часа без
+	// штампа — потерянная публикация, зрелый хвост — открывает guard,
+	// тик вычитывает окно и публикует. Молчаливые эпизоды (без строк)
+	// дельту 0 не пишут вовсе. Перезапись эпизода удаляет старые строки
+	// без декремента — потоковая семантика событий против живых строк
+	// (как у results:, T-203), абсолюты выравнивает реконсиляция.
+	// Upsert-паттерн recordChecksBumpSQL; порядок блокировок — после
+	// retry_mature: и перед results: (проход реконсиляции ведёт семьи
+	// «… → retry_mature: → reanalyze: → rendered: → results:», rendered:
+	// этой транзакции не касается) — без циклов.
+	recordReanalyzeBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('reanalyze:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'), $1::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
+
 	// recordResultsBumpSQL — инкремент часовой корзины темпа
 	// crawler_counters['results:YYYY-MM-DD"T"HH24'] (T-203): +N — строк
 	// subdomain_results, вставленных этой транзакцией (дельта —
@@ -228,10 +256,10 @@ var (
 	// семантика событий (как у суточных строк, TZ_slow_done_today §5.1),
 	// абсолюты выравнивает реконсиляция. Upsert-паттерн
 	// recordChecksBumpSQL; порядок блокировок — последней среди строк
-	// счётчика транзакции (после retry_mature:), общий с проходом
-	// реконсиляции «… → retry_mature: → rendered: → results:» — без
-	// циклов (rendered: этой транзакции не касается — её ведёт
-	// renderworker).
+	// счётчика транзакции (после retry_mature: и reanalyze:), общий с
+	// проходом реконсиляции «… → retry_mature: → reanalyze: → rendered:
+	// → results:» — без циклов (rendered: этой транзакции не касается —
+	// её ведёт renderworker).
 	recordResultsBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('results:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'), $1::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
@@ -544,10 +572,20 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
+	// Часовая корзина хвостов переанализа (T-204) — за корзиной ретрая,
+	// перед корзиной темпа (порядок реконсиляции, комментарий
+	// recordReanalyzeBumpSQL): все вставленные строки — неанализированные
+	// хвосты часа now() (= час checked_at строк); нулевую дельту (эпизод
+	// без записей) оператор не выполняет вовсе.
+	if inserted > 0 {
+		if err := recordBumpReanalyzeCounter(ctx, tx, inserted); err != nil {
+			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		}
+	}
 	// Часовая корзина темпа (T-203) — финал цепочки дельт счётчика:
 	// последняя строка транзакции (порядок реконсиляции
-	// «… → retry_mature: → rendered: → results:», rendered: ведёт
-	// renderworker — здесь одна точка results:); дельта — вставленные
+	// «… → retry_mature: → reanalyze: → rendered: → results:», rendered:
+	// ведёт renderworker — здесь одна точка results:); дельта — вставленные
 	// строки эпизода, час — now() транзакции (= час checked_at строк).
 	// Нулевая дельта (эпизод без записей) оператор не выполняет вовсе —
 	// пустые upsert-проходы не греют блокировку корзины.
@@ -683,6 +721,26 @@ func recordBumpRetryMatureCounter(ctx context.Context, tx pgx.Tx, delta int64) e
 	}
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("корзина зрелости temp_error: затронуто %d строк (upsert корзины суток обязан 1)",
+			tag.RowsAffected())
+	}
+	return nil
+}
+
+// recordBumpReanalyzeCounter — инкремент корзины неанализированных
+// хвостов в ОТКРЫТОЙ транзакции записи результата (T-204): delta —
+// RowsAffected INSERT-пачки (все строки с rules_version = NULL).
+// Upsert сам создаёт корзину часа (первая вставленная строка после
+// границы часа) — RowsAffected гарантированно 1, проверка — страховка
+// прямых вызовов с чужим SQL (молчаливая потеря дельты занижала бы
+// окно guard'а тика). Возврат с ошибкой откатывает транзакцию
+// вызывающего — результат и корзина меняются только вместе (§3.4).
+func recordBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
+	tag, err := tx.Exec(ctx, recordReanalyzeBumpSQL, delta)
+	if err != nil {
+		return fmt.Errorf("корзина хвостов переанализа: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("корзина хвостов переанализа: затронуто %d строк (upsert корзины часа обязан 1)",
 			tag.RowsAffected())
 	}
 	return nil

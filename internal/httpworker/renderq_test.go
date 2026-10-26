@@ -805,6 +805,12 @@ func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		// транзакция обязана пройти шаг.
 		t.j.record("temp-err")
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	case recordReanalyzeBumpSQL:
+		// Корзина неанализированных хвостов (T-204): имя часа вычисляет
+		// БД — сценариям рендера значение не нужно, транзакция обязана
+		// пройти шаг (upsert всегда 1).
+		t.j.record("reanalyze")
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordResultsBumpSQL:
 		// Часовая корзина темпа (T-203): имя часа вычисляет БД —
 		// сценариям рендера значение не нужно, транзакция обязана

@@ -55,6 +55,7 @@ const (
 	anEvHistory   anEventKind = "agg_hist"    // INSERT laravel_history appeared/lost (T-118)
 	anEvZoneLarav anEventKind = "agg_zone"    // дельта zones.domains_laravel (T-178)
 	anEvCounter   anEventKind = "agg_counter" // дельта кумулятива crawler_counters (T-178)
+	anEvConsume   anEventKind = "consume"     // декремент корзины хвостов reanalyze: (T-204)
 	anEvDrain     anEventKind = "drain"       // точечный дренаж контента домена (T-187)
 	anEvCommit    anEventKind = "commit"
 	anEvAck       anEventKind = "ack"
@@ -121,6 +122,18 @@ type anResultRow struct {
 	cookies      *string // jsonb
 	hash         []byte  // nil — NULL (контента нет)
 	rulesVersion *int32
+	checkedAt    time.Time // час корзины хвостов (RETURNING mark, T-204)
+}
+
+// anCheckedAt — отметка строки сида фикстуры: час корзины хвостов
+// переанализа в тестах (T-204) — фиксированная, детерминированный ключ
+// корзины в фейке.
+var anCheckedAt = time.Date(2026, 10, 27, 10, 15, 0, 0, time.UTC)
+
+// anTailBasket — имя корзины хвостов часа отметки сида (как вычислял бы
+// SQL 'reanalyze:' || to_char(date_trunc('hour', …))).
+func anTailBasket() string {
+	return "reanalyze:" + anCheckedAt.Truncate(time.Hour).Format("2006-01-02T15")
 }
 
 // anFinding — строка laravel_findings, которую пишет findingUpsertSQL.
@@ -155,6 +168,7 @@ type anFakePool struct {
 	queryErr     error
 	beginErr     error
 	markErr      error
+	consumeErr   error
 	upsertErr    error
 	deleteErr    error
 	lockErr      error
@@ -207,7 +221,7 @@ var _ AnalyzerDB = (*anFakePool)(nil)
 
 // seedResult — строка subdomain_results домена со статусом alive.
 func (p *anFakePool) seedResult(key anRowKey, headers, cookies *string, hash []byte) {
-	p.results[key] = &anResultRow{headers: headers, cookies: cookies, hash: hash}
+	p.results[key] = &anResultRow{headers: headers, cookies: cookies, hash: hash, checkedAt: anCheckedAt}
 	p.statuses[key] = int16(model.StatusAlive)
 }
 
@@ -362,30 +376,20 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	switch sql {
-	case analyzeMarkSQL:
-		key := anRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
-		if t.pool.markErr != nil {
-			return pgconn.CommandTag{}, t.pool.markErr
+	case analyzeReanalyzeConsumeSQL:
+		// Декремент корзины хвостов переанализа (T-204): $1 — checked_at
+		// строки из RETURNING mark (час корзины), $2 — дельта (−1);
+		// имя вычисляет БД — фейк ведёт значение по часу отметки.
+		if t.pool.consumeErr != nil {
+			return pgconn.CommandTag{}, t.pool.consumeErr
 		}
-		version := args[4].(int32)
-		hash := args[5].([]byte)
-		r, ok := t.pool.results[key]
+		at, ok := args[0].(time.Time)
 		if !ok {
-			return pgconn.NewCommandTag("UPDATE 0"), nil
+			return pgconn.CommandTag{}, fmt.Errorf("anFakePool: consume: параметр %T, нужен time.Time", args[0])
 		}
-		// Охрана content_hash IS NOT DISTINCT FROM $6.
-		same := (r.hash == nil && hash == nil) ||
-			(r.hash != nil && hash != nil && string(r.hash) == string(hash))
-		if !same {
-			return pgconn.NewCommandTag("UPDATE 0"), nil
-		}
-		if t.pool.statuses[key] == int16(model.StatusDeleted) {
-			return pgconn.NewCommandTag("UPDATE 0"), nil
-		}
-		v := version
-		r.rulesVersion = &v
-		t.pool.j.record(anEvMark)
-		return pgconn.NewCommandTag("UPDATE 1"), nil
+		t.pool.counters["reanalyze:"+at.Truncate(time.Hour).Format("2006-01-02T15")] += args[1].(int64)
+		t.pool.j.record(anEvConsume)
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 
 	case findingUpsertSQL:
 		key := anRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
@@ -493,7 +497,8 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 	}
 }
 
-// anFakeRow — pgx.Row с единственным значением (EXISTS, T-118).
+// anFakeRow — pgx.Row с единственным значением (EXISTS T-118 — *bool;
+// штамп mark T-204 — *time.Time) или ошибкой.
 type anFakeRow struct {
 	v   any
 	err error
@@ -506,32 +511,72 @@ func (r anFakeRow) Scan(dest ...any) error {
 	if len(dest) != 1 {
 		return fmt.Errorf("anFakeRow: приёмников %d, нужно 1", len(dest))
 	}
-	d, ok := dest[0].(*bool)
-	if !ok {
-		return fmt.Errorf("anFakeRow: приёмник %T, нужно *bool", dest[0])
+	switch d := dest[0].(type) {
+	case *bool:
+		*d = r.v.(bool)
+	case *time.Time:
+		at, ok := r.v.(time.Time)
+		if !ok {
+			return fmt.Errorf("anFakeRow: значение %T, нужен time.Time", r.v)
+		}
+		*d = at
+	default:
+		return fmt.Errorf("anFakeRow: приёмник %T (нужен *bool или *time.Time)", dest[0])
 	}
-	*d = r.v.(bool)
 	return nil
 }
 
-// QueryRow — единственный строковый запрос агрегации: наличие строки
-// laravel_domains (aggregateExistsSQL, T-118); прочее — громкий отказ
-// (неиспользуемые пути всплывут в тестах).
+// QueryRow — единственные строковые запросы транзакции: штамп rules_version
+// (analyzeMarkSQL, T-204: охраны актуальности — content_hash, версия
+// отлична от текущей, домен не deleted — RETURNING checked_at переведённой
+// строки) и наличие строки laravel_domains (aggregateExistsSQL, T-118);
+// прочее — громкий отказ (неиспользуемые пути всплывут в тестах).
 func (t *anFakeTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	if err := ctx.Err(); err != nil {
 		return anFakeRow{err: err}
 	}
-	if sql != aggregateExistsSQL {
-		return anFakeRow{err: fmt.Errorf("anFakeTx: неожидаемый SQL QueryRow: %s", sql)}
-	}
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
-	if t.pool.existsErr != nil {
-		return anFakeRow{err: t.pool.existsErr}
+	switch sql {
+	case analyzeMarkSQL:
+		key := anRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
+		if t.pool.markErr != nil {
+			return anFakeRow{err: t.pool.markErr}
+		}
+		version := args[4].(int32)
+		hash := args[5].([]byte)
+		r, ok := t.pool.results[key]
+		if !ok {
+			return anFakeRow{err: pgx.ErrNoRows}
+		}
+		// Охрана content_hash IS NOT DISTINCT FROM $6.
+		same := (r.hash == nil && hash == nil) ||
+			(r.hash != nil && hash != nil && string(r.hash) == string(hash))
+		if !same {
+			return anFakeRow{err: pgx.ErrNoRows}
+		}
+		// Охрана актуальности версии (T-204): штамп — только устаревшим
+		// (NULL или старой версии); актуальная — no-op.
+		if r.rulesVersion != nil && *r.rulesVersion == version {
+			return anFakeRow{err: pgx.ErrNoRows}
+		}
+		if t.pool.statuses[key] == int16(model.StatusDeleted) {
+			return anFakeRow{err: pgx.ErrNoRows}
+		}
+		v := version
+		r.rulesVersion = &v
+		t.pool.j.record(anEvMark)
+		return anFakeRow{v: r.checkedAt}
+	case aggregateExistsSQL:
+		if t.pool.existsErr != nil {
+			return anFakeRow{err: t.pool.existsErr}
+		}
+		_, exists := t.pool.domains[anDomainKey{zone: args[0].(int16), domain: args[1].(int64)}]
+		t.pool.j.record(anEvAggExists)
+		return anFakeRow{v: exists}
+	default:
+		return anFakeRow{err: fmt.Errorf("anFakeTx: неожидаемый SQL QueryRow: %s", sql)}
 	}
-	_, exists := t.pool.domains[anDomainKey{zone: args[0].(int16), domain: args[1].(int64)}]
-	t.pool.j.record(anEvAggExists)
-	return anFakeRow{v: exists}
 }
 
 func (t *anFakeTx) Commit(context.Context) error {
@@ -967,8 +1012,18 @@ func TestAnalyzer_SQLContract(t *testing.T) {
 	if !strings.Contains(analyzeMarkSQL, "content_hash IS NOT DISTINCT FROM $6::bytea") {
 		t.Error("mark: нет охраны актуальности content_hash")
 	}
+	if !strings.Contains(analyzeMarkSQL, "rules_version IS DISTINCT FROM $5::int4") {
+		t.Error("mark: нет охраны актуальности версии (штамп — только устаревшим, T-204)")
+	}
+	if !strings.Contains(analyzeMarkSQL, "RETURNING r.checked_at") {
+		t.Error("mark: нет RETURNING checked_at (час корзины хвостов, T-204)")
+	}
 	if !strings.Contains(analyzeMarkSQL, fmt.Sprintf("d.status = %d", int16(model.StatusDeleted))) {
 		t.Error("mark: нет охраны «домен не deleted» (§8/§13.1)")
+	}
+	if !strings.Contains(analyzeReanalyzeConsumeSQL,
+		"'reanalyze:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24')") {
+		t.Error("consume: нет имени корзины хвостов от БД (T-204)")
 	}
 	if !strings.Contains(findingUpsertSQL,
 		"ON CONFLICT (zone_id, domain_id, subdomain_id, variant) DO UPDATE") {
@@ -1066,6 +1121,47 @@ func TestAnalyzer_VersionConflict(t *testing.T) {
 	}
 	if finding.verMin != nil || finding.verMax != nil {
 		t.Fatalf("конфликт диапазонов: границы обязаны быть NULL, получены %v/%v", finding.verMin, finding.verMax)
+	}
+}
+
+// TestAnalyzer_TailBasket — корзина неанализированных хвостов reanalyze:
+// (T-204): штамп устаревшей строки декрементирует корзину часа ЭПИЗОДА
+// (checked_at из RETURNING mark) той же транзакцией — после агрегации
+// домена, перед фиксацией; уже актуальная версия не штампуется и дельту
+// не пишет; сбой декремента откатывает транзакцию целиком (штампа нет).
+func TestAnalyzer_TailBasket(t *testing.T) {
+	f := newANFixture(t, anSet(1001), Options{})
+	hash := anTestHash(7)
+	f.store.blocks[hash] = anPageHTML()
+	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN"), hash[:])
+
+	if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
+		t.Fatalf("ProcessResult: %v", err)
+	}
+	if got := f.pool.counters[anTailBasket()]; got != -1 {
+		t.Fatalf("корзина хвостов = %d, нужно −1 (штамп устаревшей строки)", got)
+	}
+	// Порядок: декремент — после агрегации домена, до фиксации.
+	if c, k, m := f.pool.j.indexOf(anEvConsume), f.pool.j.indexOf(anEvAggUpsert), f.pool.j.indexOf(anEvCommit); c < k || c > m {
+		t.Errorf("порядок: consume=%d agg_upsert=%d commit=%d (агрегация → декремент → фиксация)",
+			c, k, m)
+	}
+
+	// Сбой декремента — ошибка доставки, транзакция откатывается
+	// (штамп не стоит, findings нет).
+	f2 := newANFixture(t, anSet(1001), Options{})
+	f2.store.blocks[hash] = anPageHTML()
+	f2.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN"), hash[:])
+	f2.pool.consumeErr = errors.New("consume boom")
+	if _, err := f2.w.ProcessResult(context.Background(), anTask); err == nil ||
+		!strings.Contains(err.Error(), "корзина хвостов переанализа: consume boom") {
+		t.Fatalf("ошибка = %v, want контекст корзины и исходная", err)
+	}
+	if row, ok := anResultSnapshot(f2.pool, anKey); ok && row.rulesVersion != nil {
+		t.Fatal("штамп поставлен при сбое декремента (откат §3.4)")
+	}
+	if _, ok := anFindingSnapshot(f2.pool, anKey); ok {
+		t.Fatal("findings записаны при сбое декремента (откат §3.4)")
 	}
 }
 
@@ -1316,8 +1412,11 @@ func TestAnalyzer_DomainDeleted(t *testing.T) {
 }
 
 // TestAnalyzer_RepeatDelivery — повторная доставка идемпотентна (ТЗ
-// 3.4): upsert перезаписывает ту же строку, штамп ставится тем же
-// набором; XACK потерявшего ответ воркера безопасен.
+// 3.4): первый проход штампует и пишет findings; повторный той же
+// версией — no-op (охрана актуальности версии mark, T-204): findings не
+// переписываются (та же версия × тот же контент детерминированно дают
+// те же), декремент корзины хвостов не двоится — у повтора нет парного
+// инкремента записи. XACK потерявшего ответ воркера безопасен.
 func TestAnalyzer_RepeatDelivery(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{})
 	hash := anTestHash(7)
@@ -1340,8 +1439,14 @@ func TestAnalyzer_RepeatDelivery(t *testing.T) {
 	if row.rulesVersion == nil || *row.rulesVersion != 1001 {
 		t.Fatalf("rules_version строки = %v, нужно 1001", row.rulesVersion)
 	}
-	if n := countEvents(f.pool.j.snapshot(), anEvUpsert); n != 2 {
-		t.Fatalf("upsert выполнен %d раз (нужно 2 — по одному на доставку)", n)
+	if n := countEvents(f.pool.j.snapshot(), anEvUpsert); n != 1 {
+		t.Fatalf("upsert выполнен %d раз (нужно 1 — повтор той же версии no-op, T-204)", n)
+	}
+	if n := countEvents(f.pool.j.snapshot(), anEvMark); n != 1 {
+		t.Fatalf("штамп выполнен %d раз (нужно 1 — повтор той же версии no-op)", n)
+	}
+	if got := f.pool.counters[anTailBasket()]; got != -1 {
+		t.Fatalf("корзина хвостов = %d, нужно −1 (декремент без дубля, T-204)", got)
 	}
 }
 
@@ -1413,6 +1518,8 @@ func TestAnalyzer_Errors(t *testing.T) {
 		{"чтение контента", func(f *anFixture) { f.store.getErr = errors.New("disk boom") }, ""},
 		{"открытие транзакции", func(f *anFixture) { f.pool.beginErr = errors.New("begin boom") }, ""},
 		{"штамп rules_version", func(f *anFixture) { f.pool.markErr = errors.New("mark boom") }, ""},
+		{"корзина хвостов переанализа", func(f *anFixture) { f.pool.consumeErr = errors.New("consume boom") },
+			"корзина хвостов переанализа: consume boom"},
 		{"запись findings", func(f *anFixture) { f.pool.upsertErr = errors.New("upsert boom") },
 			"запись findings: upsert boom"},
 		{"удаление findings", func(f *anFixture) {
@@ -1694,12 +1801,14 @@ func TestRun_Smoke(t *testing.T) {
 	if got := f.q.ackedSnapshot(); len(got) != 2 || got[0] == got[1] {
 		t.Fatalf("подтверждены %v, нужно e1 и e2 (порядок параллелен — не важен)", got)
 	}
-	// Запись в БД строго до XACK: mark предшествует ack.
+	// Запись в БД строго до XACK: mark предшествует ack. Вторая доставка
+	// того же ключа (дубль) — no-op охраны версии mark (T-204): findings
+	// не переписываются, подтверждение проходит.
 	if f.pool.j.indexOf(anEvMark) > f.pool.j.indexOf(anEvAck) {
 		t.Fatal("XACK раньше записи в БД")
 	}
-	if n := countEvents(f.pool.j.snapshot(), anEvUpsert); n != 2 {
-		t.Fatalf("upsert выполнен %d раз, нужно 2", n)
+	if n := countEvents(f.pool.j.snapshot(), anEvUpsert); n != 1 {
+		t.Fatalf("upsert выполнен %d раз, нужно 1 (дубль той же версии — no-op, T-204)", n)
 	}
 }
 

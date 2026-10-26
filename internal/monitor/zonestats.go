@@ -38,7 +38,7 @@
 //     retry_mature:YYYY-MM-DD (T-202: зрелые кандидаты temp_error по
 //     датам эпизодов — guard тяжёлой выборки ретрая; FILTER-колонки
 //     «зрелые сегодня/сегодняшние эпизоды», устаревшие корзины проход
-//     удаляет — живут две строки, вчерашняя и сегодняшняя) и часовые
+//     удаляет — живут две строки, вчерашняя и сегодняшняя), часовые
 //     корзины темпа results:/rendered:YYYY-MM-DD"T"HH24 (T-203: окна
 //     «последний час» темпа дашборда; живые подзапросы по
 //     subdomain_results деградировали heap-fetch'ами — контрольная
@@ -47,7 +47,11 @@
 //     рендера в часе ЭПИЗОДА строки; проход держит две корзины каждой
 //     семьи — предыдущий час (хвост окна чтения: поздние рендеры
 //     дорабатывают его весь текущий час) и текущий, устаревшие
-//     удаляет);
+//     удаляет) и часовые корзины неанализированных хвостов переанализа
+//     reanalyze:YYYY-MM-DD"T"HH24 (T-204: строки с rules_version IS
+//     NULL по часам эпизодов — guard часового тика переанализа; те же
+//     FILTER-позиции prev/cur агрегата окна, две живые корзины,
+//     устаревшие удаляет);
 //   - дрейф |старое − новое| каждой позиции: до перезаписи читаются
 //     прежние значения, после — новые (транзакция видит собственную
 //     запись); ненулевой дрейф — gauge crawler_counters_drift + Warn
@@ -62,10 +66,10 @@
 // last_checked_at = current_date × статус, T-179/T-182), и корзины
 // зрелости ретрая temp_error по датам эпизодов (T-202) —
 // дополнительная цена FILTER-колонок ноль (ТЗИ §13.3). Часовые корзины
-// темпа (T-203) считаются ОТДЕЛЬНЫМ агрегатом subdomain_results по окну
-// двух живых часов (index-диапазон checked_at — цена пропорциональна
-// окну, в ≤ 2 раза больше прежнего ежеминутного читателя темпа, здесь —
-// раз в zone_stats_interval).
+// темпа (T-203) и хвостов переанализа (T-204) считаются ОТДЕЛЬНЫМ
+// агрегатом subdomain_results по окну двух живых часов (index-диапазон
+// checked_at — цена пропорциональна окну, в ≤ 2 раза больше прежнего
+// ежеминутного читателя темпа, здесь — раз в zone_stats_interval).
 //
 // Семантика колонок зон — комментарий пакета ниже; изменения против
 // T-078 — только расширение (pending/queued), существующие колонки
@@ -229,7 +233,7 @@ const laravelAggQuerySQL = "SELECT zone_id, count(*) AS laravel FROM laravel_dom
 const historyAggSQL = "SELECT count(*) FILTER (WHERE appeared) AS h_appeared, " +
 	"count(*) FILTER (WHERE NOT appeared) AS h_lost FROM laravel_history"
 
-// hourlyAggSQL — живой агрегат часовых корзин темпа (T-203): окно двух
+// hourlyAggSQL — живой агрегат часовых корзин (T-203): окно двух
 // живых часов по subdomain_results (границы вычисляет БД —
 // date_trunc('hour', now()), индекс checked_at обслуживает диапазон),
 // FILTER-позиции — те же предикаты, что у прежних живых подзапросов
@@ -239,13 +243,20 @@ const historyAggSQL = "SELECT count(*) FILTER (WHERE appeared) AS h_appeared, " 
 // асинхронный флаг этапа рендера: позиция часа учитывает строки,
 // отрендеренные ПОЗЖЕ своей проверки — как и инкремент renderworker
 // (час эпизода строки), потому корзины сходятся с живым count(*)
-// по календарному часу. Скалярный агрегат без GROUP BY — ровно одна
-// строка (пустое окно — нули, не пустой набор).
+// по календарному часу. prev_reanalyze/cur_reanalyze (T-204) — хвосты
+// переанализа: строки с rules_version IS NULL (никогда не
+// анализировались — вставка записи результата или замена контента
+// рендером) — предикат guard'а тикового прохода
+// (analyzer/reanalyze.go); цена FILTER-колонки ноль на том же скане.
+// Скалярный агрегат без GROUP BY — ровно одна строка (пустое окно —
+// нули, не пустой набор).
 const hourlyAggSQL = "SELECT " +
 	"count(*) FILTER (WHERE checked_at < date_trunc('hour', now())) AS prev_results, " +
 	"count(*) FILTER (WHERE checked_at < date_trunc('hour', now()) AND rendered) AS prev_rendered, " +
 	"count(*) FILTER (WHERE checked_at >= date_trunc('hour', now())) AS cur_results, " +
-	"count(*) FILTER (WHERE checked_at >= date_trunc('hour', now()) AND rendered) AS cur_rendered " +
+	"count(*) FILTER (WHERE checked_at >= date_trunc('hour', now()) AND rendered) AS cur_rendered, " +
+	"count(*) FILTER (WHERE checked_at < date_trunc('hour', now()) AND rules_version IS NULL) AS prev_reanalyze, " +
+	"count(*) FILTER (WHERE checked_at >= date_trunc('hour', now()) AND rules_version IS NULL) AS cur_reanalyze " +
 	"FROM subdomain_results " +
 	"WHERE checked_at >= date_trunc('hour', now() - interval '1 hour')"
 
@@ -402,6 +413,86 @@ const (
 		"RETURNING value"
 )
 
+// Корзины неанализированных хвостов переанализа (T-204):
+// reanalyze:YYYY-MM-DD"T"HH24 — строки subdomain_results с
+// rules_version IS NULL (никогда не анализировались) по часам ЭПИЗОДА
+// (checked_at). Guard часового тика переанализа
+// (analyzer/reanalyze.go, reanalyzeGuardSQL) суммирует корзины старше
+// текущего часа: незрелый in-flight-поток (запись → q:analyze → штамп —
+// секунды) живёт в корзине текущего часа и guard не открывает;
+// пережившая границу часа без штампа публикация — потерянный хвост —
+// открывает, тик вычитывает окно и публикует. Стационар без потерь
+// стоит одну сумму индексного диапазона из пары строк — тяжёлая
+// выборка окна (heap-визит ~84 тыс. строк/ч ради неиндексируемого
+// rules_version, HOT-инвариант) не выполняется вовсе (уточнение того
+// же класса, что T-191 → T-202: наивный счётчик «записано без
+// анализа» не отличает хвосты от непрерывного потока — зрелость дают
+// ЧАСОВЫЕ корзины, прецедент retry_mature). Инкременты — транзакции
+// записи результата (record.go, час now() = checked_at строк) и замены
+// контента рендером (renderworker, час эпизода из RETURNING —
+// рендер-опоздание воскрешает корзину старого часа, guard открывается
+// впустую: хвост за курсором, следующий проход корзину удаляет);
+// декремент — штамп анализатора только устаревших строк (охрана
+// версии, worker.go): повторные доставки не двоят, штампы старой
+// версии (дренажи смены правил) дают отрицательный дрейф до прохода —
+// держит guard закрытым на время дренажа, у тика там своя работа.
+// Проход поддерживает РОВНО ДВЕ живые корзины — предыдущий час
+// (пересчитывается, а не только текущая: поздние декременты штампов
+// дорабатывают её весь текущий час) и текущий; устаревшие удаляет
+// (по образцу retry_mature/hourly-семей T-202/T-203). Порядок
+// блокировок — между корзинами ретрая и rendered-темпа (единый
+// порядок семей всех писателей «retry_mature: → reanalyze: →
+// rendered: → results:» — конвенция, НЕ лексикографика имён
+// ('retry_mature:' лексикографически последний: 't' > 'a'/'n'/'s');
+// от дедлоков важна лишь согласованность порядка у всех писателей),
+// внутри семьи «очистка → prev → cur»: общий с писателями (record.go:
+// … → retry_mature: → reanalyze: → results:; renderworker:
+// reanalyze: → rendered:; analyzer: единственная точка reanalyze:) —
+// без циклов. Guard видит суммы живых корзин сразу после фиксации.
+const (
+	// readHourlyReanalyzePrevSQL — старое значение корзины хвостов
+	// предыдущего часа до перезаписи (дрейф, T-204); пустой результат —
+	// корзины ещё нет (до первого инкремента/прохода; заполнение, не
+	// дрейф).
+	readHourlyReanalyzePrevSQL = "SELECT value FROM crawler_counters " +
+		"WHERE name = 'reanalyze:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24')"
+
+	// readHourlyReanalyzeCurSQL — старое значение корзины хвостов
+	// текущего часа (дрейф, T-204); пара readHourlyReanalyzePrevSQL.
+	readHourlyReanalyzeCurSQL = "SELECT value FROM crawler_counters " +
+		"WHERE name = 'reanalyze:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24')"
+
+	// hourlyReanalyzeCleanupSQL — удаление корзин хвостов старше
+	// предыдущего часа: живой хвост часа H обслуживается тиком часа H+1
+	// (корзина H = prev, guard открыт); не подобранный за два часа
+	// (сбойные тики) хвост за границей корзин — остаточный класс
+	// время-формы (T-193 §4.2): рестарт с якорем 24 ч или полный дренаж
+	// смены правил. RETURNING — протокол Query прохода (значения не
+	// читаются).
+	hourlyReanalyzeCleanupSQL = "DELETE FROM crawler_counters " +
+		"WHERE name >= 'reanalyze:' " +
+		"AND name < 'reanalyze:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24') " +
+		"RETURNING value"
+
+	// recountHourlyReanalyzePrevSQL — перезапись корзины хвостов
+	// предыдущего часа значением FILTER-позиции prev_reanalyze агрегата
+	// hourlyAggSQL, RETURNING — новое значение для дрейфа.
+	recountHourlyReanalyzePrevSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('reanalyze:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24'), $1::int8, $2) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
+		"RETURNING value"
+
+	// recountHourlyReanalyzeCurSQL — перезапись корзины хвостов текущего
+	// часа (FILTER-позиция cur_reanalyze); блокировка — после
+	// предыдущей (возрастание имён).
+	recountHourlyReanalyzeCurSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('reanalyze:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'), $1::int8, $2) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
+		"RETURNING value"
+)
+
 // Часовые корзины темпа (T-203): results:YYYY-MM-DD"T"HH24 — строки
 // subdomain_results, вставленные транзакцией записи результата HTTP-этапа
 // (инкремент httpworker/record.go, дельта — RowsAffected INSERT-пачки;
@@ -518,10 +609,10 @@ const (
 // реконсиляцией (легенда для чтения/сверки). Суточные строки
 // checks:YYYY-MM-DD и temp_error:YYYY-MM-DD (T-179/T-182), корзины
 // зрелости ретрая retry_mature:YYYY-MM-DD (T-202) и часовые корзины
-// темпа results:/rendered:YYYY-MM-DD"T"HH24 (T-203) сюда не входят:
-// имена дней/часов вычисляет БД (readDailyChecksSQL/
-// recountDailyChecksSQL, их temp-пары, пары корзин ретрая и часовых
-// корзин), в unnest-пачке с Go-именами их нет.
+// темпа results:/rendered: и хвостов переанализа reanalyze:
+// (T-203/T-204) сюда не входят: имена дней/часов вычисляет БД
+// (readDailyChecksSQL/recountDailyChecksSQL, их temp-пары, пары корзин
+// ретрая и часовых корзин), в unnest-пачке с Go-именами их нет.
 func CounterNames() []string {
 	names := make([]string, 0, len(model.Statuses)+3)
 	for _, s := range model.Statuses {
@@ -619,13 +710,29 @@ const hourlyResultsPrevCounter = "results:prev"
 // часа (T-203); пара hourlyResultsPrevCounter.
 const hourlyResultsCurCounter = "results:cur"
 
-// hourlyStreamingPositions — позиции часовых корзин темпа (T-203)
-// потоковой семантики: события вставки строк/перевода в rendered против
-// живых строк окна; стационарного нуля нет (дубль-доставки, перезаписи
-// эпизодов), агрегированный Warn дрейфа их не поднимает (шум под живой
+// hourlyReanalyzePrevCounter — метка корзины неанализированных хвостов
+// переанализа предыдущего часа в дрейфе прохода (T-204): инкременты
+// записи/рендера и декременты штампов считают события переходов, живой
+// агрегат — строки с rules_version IS NULL; перезапись эпизода
+// (record.go DELETE без декремента), рендер непроштампованной строки
+// (двойной инкремент одного хвоста) и штампы старой версии (дренажи)
+// дают расхождение до прохода — потоковая семантика (семейство
+// T-202/T-203), вне Warn, наблюдается gauge.
+const hourlyReanalyzePrevCounter = "reanalyze:prev"
+
+// hourlyReanalyzeCurCounter — метка корзины хвостов переанализа
+// текущего часа (T-204); пара hourlyReanalyzePrevCounter.
+const hourlyReanalyzeCurCounter = "reanalyze:cur"
+
+// hourlyStreamingPositions — позиции часовых корзин темпа (T-203) и
+// хвостов переанализа (T-204) потоковой семантики: события вставки
+// строк/перевода в rendered/штампа против живых строк окна;
+// стационарного нуля нет (дубль-доставки, перезаписи эпизодов,
+// дренажи), агрегированный Warn дрейфа их не поднимает (шум под живой
 // нагрузкой), gauge экспонирует.
 func hourlyStreamingPositions() []string {
-	return []string{hourlyRenderedPrevCounter, hourlyRenderedCurCounter, hourlyResultsPrevCounter, hourlyResultsCurCounter}
+	return []string{hourlyReanalyzePrevCounter, hourlyReanalyzeCurCounter,
+		hourlyRenderedPrevCounter, hourlyRenderedCurCounter, hourlyResultsPrevCounter, hourlyResultsCurCounter}
 }
 
 // ---------------------------------------------------------------- проход
@@ -710,23 +817,26 @@ var zoneColumnPositions = [...]string{"total", "pending", "queued", "checked", "
 // ZoneStatsOnce выполняет один совмещённый проход реконсиляции (ТЗИ
 // §7.1) в одной транзакции: (1) читает старые значения зон, счётчиков,
 // суточных строк (проверок и temp_error, T-179/T-182), корзин зрелости
-// ретрая (T-202) и часовых корзин темпа (T-203); (2) единственный
-// полный скан domains — per-zone агрегат (recountAggQuerySQL, включая
-// FILTER-колонки last_checked_at = current_date и корзины зрелости,
-// T-179/T-182/T-202), агрегаты laravel_domains и laravel_history и
-// агрегат часовых корзин темпа (hourlyAggSQL — окно двух живых часов
-// subdomain_results, T-203); (3) перезаписывает колонки зон unnest-пачкой
-// значений (блокировки зон — первыми); (4) upsert-ит глобальные скаляры
-// (блокировки crawler_counters — после зон, порядок против дедлоков —
-// recountZonesSQL), суточные строки (в порядке checks: → temp_error:),
-// корзины зрелости ретрая (очистка устаревших → зрелая → сегодняшняя,
-// T-202) и часовые корзины темпа (финал прохода: rendered-семья, затем
-// results-семья, в каждой «очистка → предыдущая → текущая», T-203);
-// RETURNING операторов даёт новые значения для дрейфа. Проход
-// идемпотентен (ТЗ 3.4): повтор даёт те же значения; сбой откатывает
-// транзакцию целиком — половинчатых состояний не бывает. Фильтр Zone
-// (recount --zone) ограничивает перезапись зон; глобальные скаляры,
-// суточные строки и корзины пересчитываются всегда (ТЗИ §9).
+// ретрая (T-202), часовых корзин темпа (T-203) и корзин хвостов
+// переанализа (T-204); (2) единственный полный скан domains — per-zone
+// агрегат (recountAggQuerySQL, включая FILTER-колонки last_checked_at
+// = current_date и корзины зрелости, T-179/T-182/T-202), агрегаты
+// laravel_domains и laravel_history и агрегат часовых корзин
+// (hourlyAggSQL — окно двух живых часов subdomain_results, позиции
+// темпа T-203 и хвостов переанализа T-204); (3) перезаписывает колонки
+// зон unnest-пачкой значений (блокировки зон — первыми); (4) upsert-ит
+// глобальные скаляры (блокировки crawler_counters — после зон, порядок
+// против дедлоков — recountZonesSQL), суточные строки (в порядке
+// checks: → temp_error:), корзины зрелости ретрая (очистка устаревших
+// → зрелая → сегодняшняя, T-202), корзины хвостов переанализа и
+// часовые корзины темпа (финал прохода: reanalyze-семья, затем
+// rendered-семья, затем results-семья, в каждой «очистка →
+// предыдущая → текущая», T-203/T-204); RETURNING операторов даёт новые
+// значения для дрейфа. Проход идемпотентен (ТЗ 3.4): повтор даёт те же
+// значения; сбой откатывает транзакцию целиком — половинчатых
+// состояний не бывает. Фильтр Zone (recount --zone) ограничивает
+// перезапись зон; глобальные скаляры, суточные строки и корзины
+// пересчитываются всегда (ТЗИ §9).
 func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions) (ZoneStatsResult, error) {
 	if pool == nil {
 		return ZoneStatsResult{}, errors.New("monitor: реконсиляция счётчиков: пул не задан")
@@ -789,6 +899,17 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		return ZoneStatsResult{}, err
 	}
 	oldHourResultsCur, hourResultsCurExists, err := readDailyValue(ctx, tx, readHourlyResultsCurSQL, "корзина темпа результатов текущего часа")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
+	// Корзины хвостов переанализа (T-204) — тем же блоком: присутствие —
+	// признак заполнения (корзину создаёт инкремент записи/рендера,
+	// декремент штампа или этот проход), имя часа вычисляет БД.
+	oldHourReanalyzePrev, hourReanalyzePrevExists, err := readDailyValue(ctx, tx, readHourlyReanalyzePrevSQL, "корзина хвостов переанализа предыдущего часа")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
+	oldHourReanalyzeCur, hourReanalyzeCurExists, err := readDailyValue(ctx, tx, readHourlyReanalyzeCurSQL, "корзина хвостов переанализа текущего часа")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -898,6 +1019,24 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		return ZoneStatsResult{}, err
 	}
 	newRetryToday, err := writeDailyCounter(ctx, tx, recountRetryTodaySQL, retryTodaySum, now(), "сегодняшняя корзина ретрая")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
+	// Корзины хвостов переанализа (T-204) — за корзинами ретрая, перед
+	// корзинами rendered-темпа (порядок блокировок семей
+	// «retry_mature: → reanalyze: → rendered: → results:», комментарий
+	// семейства): устаревшие корзины удаляются, затем перезаписываются
+	// prev (FILTER-позиция prev_reanalyze — поздние декременты штампов
+	// дорабатывают её весь текущий час) и cur. Guard тика переанализа
+	// видит суммы живых корзин сразу после фиксации.
+	if err := cleanupBaskets(ctx, tx, hourlyReanalyzeCleanupSQL, "очистка корзин хвостов переанализа"); err != nil {
+		return ZoneStatsResult{}, err
+	}
+	newHourReanalyzePrev, err := writeDailyCounter(ctx, tx, recountHourlyReanalyzePrevSQL, hourly.prevReanalyze, now(), "корзина хвостов переанализа предыдущего часа")
+	if err != nil {
+		return ZoneStatsResult{}, err
+	}
+	newHourReanalyzeCur, err := writeDailyCounter(ctx, tx, recountHourlyReanalyzeCurSQL, hourly.curReanalyze, now(), "корзина хвостов переанализа текущего часа")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -1036,6 +1175,12 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	appendHourly(hourlyRenderedCurCounter, oldHourRenderedCur, hourRenderedCurExists, newHourRenderedCur)
 	appendHourly(hourlyResultsPrevCounter, oldHourResultsPrev, hourResultsPrevExists, newHourResultsPrev)
 	appendHourly(hourlyResultsCurCounter, oldHourResultsCur, hourResultsCurExists, newHourResultsCur)
+	// Корзины хвостов переанализа (T-204): та же потоковая семантика —
+	// события переходов против живых NULL-строк окна (комментарий
+	// hourlyReanalyzePrevCounter); корзины не было — заполнение, не
+	// дрейф (Old := New), прецедент стартового прохода (ТЗИ §7.1.3).
+	appendHourly(hourlyReanalyzePrevCounter, oldHourReanalyzePrev, hourReanalyzePrevExists, newHourReanalyzePrev)
+	appendHourly(hourlyReanalyzeCurCounter, oldHourReanalyzeCur, hourReanalyzeCurExists, newHourReanalyzeCur)
 	return res, nil
 }
 
@@ -1118,15 +1263,17 @@ func readHistoryAgg(ctx context.Context, tx pgx.Tx) (appeared, lost int64, err e
 	return appeared, lost, nil
 }
 
-// hourlyAggRow — FILTER-позиции агрегата часовых корзин темпа
-// (hourlyAggSQL, T-203): prev/cur обеих семей (results — все строки
-// окна часа, rendered — с флагом итогового DOM).
+// hourlyAggRow — FILTER-позиции агрегата часовых корзин (hourlyAggSQL,
+// T-203/T-204): prev/cur семей темпа (results — все строки окна часа,
+// rendered — с флагом итогового DOM) и хвостов переанализа (строки с
+// rules_version IS NULL).
 type hourlyAggRow struct {
-	prevResults, prevRendered int64
-	curResults, curRendered   int64
+	prevResults, prevRendered   int64
+	curResults, curRendered     int64
+	prevReanalyze, curReanalyze int64
 }
 
-// readHourlyAgg — агрегат часовых корзин темпа (T-203): скалярный
+// readHourlyAgg — агрегат часовых корзин (T-203/T-204): скалярный
 // агрегат без GROUP BY обязан вернуть ровно одну строку (пустое окно —
 // нули); пустой набор — обрыв протокола, ошибка.
 func readHourlyAgg(ctx context.Context, tx pgx.Tx) (hourlyAggRow, error) {
@@ -1139,7 +1286,8 @@ func readHourlyAgg(ctx context.Context, tx pgx.Tx) (hourlyAggRow, error) {
 	if !rows.Next() {
 		return hourlyAggRow{}, fmt.Errorf("monitor: реконсиляция счётчиков: часовые корзины: пустой ответ агрегата")
 	}
-	if err := rows.Scan(&r.prevResults, &r.prevRendered, &r.curResults, &r.curRendered); err != nil {
+	if err := rows.Scan(&r.prevResults, &r.prevRendered, &r.curResults, &r.curRendered,
+		&r.prevReanalyze, &r.curReanalyze); err != nil {
 		return hourlyAggRow{}, fmt.Errorf("monitor: реконсиляция счётчиков: часовые корзины: чтение: %w", err)
 	}
 	if err := rows.Err(); err != nil {
@@ -1525,7 +1673,7 @@ func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
 		}),
 		drift: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_counters_drift",
-			Help: "Дрейф инкрементальных счётчиков на проходе реконсиляции: |старое − новое| по позициям (zone:<id>:колонка, global:<имя>; daily:checks и daily:temp_error — суточный темп проверок и его temp_error-числитель, T-179/T-182). Стационар — 0, устойчивый ненулевой дрейф — пропущенный переход или ручной SQL мимо кода (разбор — docs/runbooks.md, T-178); исключения — потоковые позиции (считают события против живых доменов/строк, ненулевые под живой нагрузкой — наблюдаемая величина, в Warn не входят): суточные daily:* (T-179/T-182), корзины зрелости ретрая retry_mature:past/retry_mature:today (T-202) и часовые корзины темпа rendered:prev/rendered:cur/results:prev/results:cur (T-203 — prev/cur: предыдущий и текущий календарный час).",
+			Help: "Дрейф инкрементальных счётчиков на проходе реконсиляции: |старое − новое| по позициям (zone:<id>:колонка, global:<имя>; daily:checks и daily:temp_error — суточный темп проверок и его temp_error-числитель, T-179/T-182). Стационар — 0, устойчивый ненулевой дрейф — пропущенный переход или ручной SQL мимо кода (разбор — docs/runbooks.md, T-178); исключения — потоковые позиции (считают события против живых доменов/строк, ненулевые под живой нагрузкой — наблюдаемая величина, в Warn не входят): суточные daily:* (T-179/T-182), корзины зрелости ретрая retry_mature:past/retry_mature:today (T-202), часовые корзины темпа rendered:prev/rendered:cur/results:prev/results:cur (T-203 — prev/cur: предыдущий и текущий календарный час) и хвостов переанализа reanalyze:prev/reanalyze:cur (T-204).",
 		}, "counter"),
 	}
 }
@@ -1661,15 +1809,16 @@ func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]Coun
 		// живого» под нагрузкой расходится на темп статусов, это
 		// свежесть интервала, не дрейф. Суточные строки checks:/temp_error:
 		// (T-179/T-182), корзины зрелости ретрая retry_mature: (T-202) и
-		// часовые корзины темпа results:/rendered: (T-203) — тоже мимо
-		// сверки: инкременты считают события (записи результата,
-		// переводы в rendered), живой агрегат — строки окна; под
-		// нагрузкой расхождение равно разнице потоков с прошлого прохода
-		// — наблюдается позициями daily:*/retry_mature:*/rendered:* /
-		// results:* прохода реконсиляции, сверка с допуском 0 сигналила
-		// бы штатную работу (у корзин ретрая/темпа вдобавок проход держит
-		// только две живые строки на семью и свёртывает старые, поимённая
-		// сверка дат/часов не определена).
+		// часовые корзины темпа results:/rendered: (T-203) и хвостов
+		// переанализа reanalyze: (T-204) — тоже мимо сверки: инкременты
+		// считают события (записи результата, переводы в rendered,
+		// штампы версий), живой агрегат — строки окна; под нагрузкой
+		// расхождение равно разнице потоков с прошлого прохода —
+		// наблюдается позициями daily:*/retry_mature:*/rendered:* /
+		// results:*/reanalyze:* прохода реконсиляции, сверка с допуском 0
+		// сигналила бы штатную работу (у корзин ретрая/темпа/хвостов
+		// вдобавок проход держит только две живые строки на семью и
+		// свёртывает старые, поимённая сверка дат/часов не определена).
 		if absDiff(stored[name], live[name]) > opts.Tolerance {
 			out = append(out, CounterPosition{
 				Counter: "global:" + name,

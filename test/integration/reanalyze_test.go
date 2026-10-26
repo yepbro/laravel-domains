@@ -5,6 +5,10 @@
 // якорь старта — now() − 24 ч (остаточный класс старше — территория
 // полного дренажа), курсор переживает проходы; полный дренаж при смене
 // правил остаётся PK-формой с нуля и находит устаревшее вне окна.
+// Guard корзин хвостов (T-204): тик без зрелых хвостов не вычитывает
+// окно вовсе — корзины reanalyze: ведут инкременты записи/рендера,
+// декремент штампа и реконсиляция monitor (FILTER-позиции живого
+// окна), сценарий корзин — test/integration/counters_test.go.
 // Юнит-уровень (SQL-контракты, якорь, продвижение курсора, цикл на
 // фейках) — internal/analyzer/reanalyze_test.go. Уровень вызовов —
 // библиотечные, без запуска сервисов (стиль render_requeue_test.go);
@@ -26,6 +30,7 @@ import (
 	"crawler/internal/analyzer"
 	"crawler/internal/migrate"
 	"crawler/internal/model"
+	"crawler/internal/monitor"
 	"crawler/internal/queue"
 )
 
@@ -73,16 +78,47 @@ func reanSeedRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 	}
 }
 
-// TestReanalyze_TickCursor — сценарий §7.2: свежая строка без анализа
-// подбирается тиком и публикуется; проанализированная не отбирается;
-// повторный тик не переизбирает (курсор за строкой, а не версия);
-// смена правил — полный дренаж с нуля находит и старое вне lookback.
-// Плюс EXPLAIN-контракт: предикат композитного курсора обслуживается
-// индексом subdomain_results_checked_idx (на игрушечном объёме seq scan
-// дешевле — поэтому enable_seqscan = off: проверяется индексируемость
-// предиката, а не выбор по стоимости; стоимость — журнал T-177 на бою).
+// reanBasketValue — значение корзины хвостов переанализа заданного
+// возраста-часа (T-204; имя часа вычисляет БД тем же выражением, что
+// операторы прохода).
+func reanBasketValue(ctx context.Context, t *testing.T, pool *pgxpool.Pool, age time.Duration) int64 {
+	t.Helper()
+	var v int64
+	if err := pool.QueryRow(ctx,
+		"SELECT value FROM crawler_counters WHERE name = 'reanalyze:' || to_char(date_trunc('hour', now() - make_interval(hours => $1)), 'YYYY-MM-DD\"T\"HH24')",
+		int(age/time.Hour)).Scan(&v); err != nil {
+		t.Fatalf("корзина хвостов (%v назад): %v", age, err)
+	}
+	return v
+}
+
+// reanSkipHourBoundary — сценарии корзин хвостов привязаны к
+// «предыдущему часу» от now() (сид и окно реконсиляции): смена
+// календарного часа посреди теста сдвигает окно — сид становится
+// двухчасовым, реконсиляция его не видит, ассерты падают. У самой
+// границы часа тест пропускается: ~1 % прогонов дешевле редкого
+// флака (ревью T-204, P3-4).
+func reanSkipHourBoundary(t *testing.T) {
+	t.Helper()
+	if left := time.Until(time.Now().Truncate(time.Hour).Add(time.Hour)); left < 45*time.Second {
+		t.Skipf("граница календарного часа через %v — окно «предыдущего часа» нестабильно", left)
+	}
+}
+
+// TestReanalyze_TickCursor — сценарий §7.2 с guard'ом корзин хвостов
+// (T-204): проход monitor материализует корзины живым окном (свежая
+// строка без анализа — в корзине предыдущего часа), guard открывается —
+// тик ходит время-формой и публикует хвост; проанализированная не
+// отбирается; повторный тик не переизбирает (курсор за строкой, а не
+// версия); смена правил — полный дренаж с нуля находит и старое вне
+// lookback. Плюс EXPLAIN-контракт: предикат композитного курсора
+// обслуживается индексом subdomain_results_checked_idx (на игрушечном
+// объёме seq scan дешевле — поэтому enable_seqscan = off: проверяется
+// индексируемость предиката, а не выбор по стоимости; стоимость —
+// журнал T-177 на бою).
 func TestReanalyze_TickCursor(t *testing.T) {
 	skipUnlessIntegration(t)
+	reanSkipHourBoundary(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -98,7 +134,8 @@ func TestReanalyze_TickCursor(t *testing.T) {
 	t.Cleanup(pool.Close)
 
 	// Справочник: зона + домен; три строки одного домена (PK — субдомен):
-	// fresh — новый эпизод без анализа (NULL, 2 ч назад): кандидат тика;
+	// fresh — новый эпизод без анализа (NULL, 1 ч назад — час корзин
+	//   живого окна прохода monitor: guard обязан его увидеть);
 	// ancient — устаревшая версия 7 трое суток назад: вне lookback-якоря,
 	//   территория только полного дренажа (§4.2);
 	// done — проанализирована текущей версией (1 ч назад): не отбирается.
@@ -121,11 +158,22 @@ func TestReanalyze_TickCursor(t *testing.T) {
 		vCurrent         = int32(42)
 		vOld             = int32(7)
 	)
-	reanSeedRow(ctx, t, pool, zone, domain, subFresh, nil, 2*time.Hour)
+	reanSeedRow(ctx, t, pool, zone, domain, subFresh, nil, time.Hour)
 	old := vOld
 	reanSeedRow(ctx, t, pool, zone, domain, subAncient, &old, 72*time.Hour)
 	current := vCurrent
 	reanSeedRow(ctx, t, pool, zone, domain, subDone, &current, time.Hour)
+
+	// Проход реконсиляции (T-204): корзины хвостов материализуются
+	// агрегатом живого окна — fresh (NULL, час назад) попадает в корзину
+	// предыдущего часа, guard тика открывается; done (текущая версия) и
+	// ancient (вне окна) корзин не числят.
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("ZoneStatsOnce: %v", err)
+	}
+	if got := reanBasketValue(ctx, t, pool, time.Hour); got != 1 {
+		t.Fatalf("корзина хвостов предыдущего часа = %d, want 1 (fresh NULL строка)", got)
+	}
 
 	q := &reanQ{}
 	var cursor analyzer.ReanalyzeCursor
@@ -148,7 +196,8 @@ func TestReanalyze_TickCursor(t *testing.T) {
 
 	t.Run("повторный тик не переизбирает", func(t *testing.T) {
 		// Строка всё ещё не проштампована (rules_version NULL): её
-		// исключает курсор, а не версия — окно исчерпано.
+		// исключает курсор, а не версия — окно исчерпано (guard по-прежнему
+		// открыт корзиной: выборка идёт, публикаций нет).
 		res, err := analyzer.ReanalyzeTick(ctx, pool, q, vCurrent, &cursor, analyzer.ReanalyzeOptions{})
 		if err != nil {
 			t.Fatalf("повторный ReanalyzeTick: %v", err)

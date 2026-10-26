@@ -21,9 +21,12 @@
 //	  находит записи с устаревшей версией; T-067 ставит NULL при смене
 //	  контента) с охраной актуальности: content_hash IS NOT DISTINCT FROM
 //	  прочитанного (строку перезаписал другой эпизод — перепроверка
-//	  DELETE+INSERT T-058, рендер T-067) и домен не deleted (§8/§13.1);
-//	  0 строк — строка ушла из-под задачи: успех без записи (стиль
-//	  renderworker), у нового эпизода свои публикация и анализ
+//	  DELETE+INSERT T-058, рендер T-067), версия отлична от текущей
+//	  (повторная доставка уже проштампованной строки — no-op, T-204) и
+//	  домен не deleted (§8/§13.1); 0 строк — строка ушла из-под задачи:
+//	  успех без записи (стиль renderworker), у нового эпизода свои
+//	  публикация и анализ; RETURNING checked_at — декремент корзины
+//	  хвостов reanalyze: (T-204) тем же шагом транзакции
 //	→ запись laravel_findings по этому же ключу: ВСЕ срабатывания любого
 //	  правила независимо от порога, is_laravel = score ≥ порога
 //	  (§13.1/ТЗ 5.8); нет срабатываний — строка не пишется, существующая
@@ -82,15 +85,55 @@ var (
 	// T-058). Охрана content_hash IS NOT DISTINCT FROM $6 —
 	// оптимистическая (как renderUpdateSQL T-067): строка перезаписывается,
 	// только пока её контент тот же, что прочитан (NULL сравнивается
-	// корректно — «контента нет» легально, T-056). Охрана «домен не
+	// корректно — «контента нет» легально, T-056). Охрана актуальности
+	// версии rules_version IS DISTINCT FROM $5 (T-204): штамп ставится
+	// только устаревшим строкам — NULL («никогда не анализировалась»)
+	// и старой версии набора (дренаж смены правил T-074); уже
+	// проштампованная текущей версией строка не затрагивается (no-op:
+	// та же версия × тот же контент ⇒ детерминированно те же findings,
+	// повторная доставка перезаписывала бы их байт-в-байт) — до T-204
+	// повторный штамп выполнялся и давал ложный декремент корзине хвостов
+	// reanalyze: (RETURNING ниже): у повторных доставок (републикации
+	// тика, XAUTOCLAIM) нет парного инкремента записи. Охрана «домен не
 	// deleted» — §8/§13.1: удалённому домену результат не записывается,
 	// оставшиеся строки и findings вычистит фоновая очистка (T-020).
+	// RETURNING r.checked_at (T-204) — час корзины хвостов для декремента
+	// (analyzeReanalyzeConsumeSQL): час ЭПИЗОДА строки, как у инкрементов
+	// записи/рендера; пустой результат (pgx.ErrNoRows) — охраны отсекли
+	// (строки нет, контент сменился, домен удалён, версия уже актуальна):
+	// успех без записи (стиль renderworker).
 	analyzeMarkSQL = "UPDATE subdomain_results AS r SET rules_version = $5::int4 " +
 		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
 		"AND r.subdomain_id = $3::int2 AND r.variant = $4::int2 " +
 		"AND r.content_hash IS NOT DISTINCT FROM $6::bytea " +
+		"AND r.rules_version IS DISTINCT FROM $5::int4 " +
 		fmt.Sprintf("AND NOT EXISTS (SELECT 1 FROM domains AS d WHERE d.zone_id = r.zone_id "+
-			"AND d.id = r.domain_id AND d.status = %d)", int16(model.StatusDeleted))
+			"AND d.id = r.domain_id AND d.status = %d)", int16(model.StatusDeleted)) +
+		" RETURNING r.checked_at"
+
+	// analyzeReanalyzeConsumeSQL — декремент корзины неанализированных
+	// хвостов crawler_counters['reanalyze:YYYY-MM-DD"T"HH24'] (T-204) в
+	// транзакции штампа: −1 на переведённую устаревшей→текущей строку;
+	// $1 — checked_at строки из RETURNING analyzeMarkSQL, час корзины
+	// вычисляет БД (date_trunc) — тот же ключ, что у инкрементов записи
+	// результата (record.go, час now() = checked_at строк) и замены
+	// контента рендером (renderworker, час эпизода из RETURNING). Guard
+	// тикового прохода (reanalyzeGuardSQL) суммирует корзины старше
+	// текущего часа: опубликованный и проштампованный хвост возвращает
+	// корзине ноль, следующий тик не вычитывает окно. Штампы строк СТАРОЙ
+	// версии (дренаж смены правил, републикации тика) декрементируют без
+	// парного инкремента — отрицательный дрейф до прохода реконсиляции
+	// (FILTER-позиции prev/cur агрегата окна, monitor): держит guard
+	// закрытым на время дренажа — у тика там своя работа пересекается
+	// только дублями, семантика потоковая (семейство T-202/T-203).
+	// Upsert-паттерн record.go; порядок блокировок — единственная строка
+	// счётчика транзакции, после зон/скаляров агрегации: общий с проходом
+	// реконсиляции (reanalyze: после retry_mature:, перед rendered:) —
+	// без циклов.
+	analyzeReanalyzeConsumeSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('reanalyze:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
 	// findingUpsertSQL — запись срабатываний: все правила независимо от
 	// порога (§13.1), is_laravel отделяет уверенные срабатывания от слабых.
@@ -349,19 +392,22 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// Откат безусловно: после Commit — no-op (стиль T-044/T-058).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Штамп первым шагом: охрана актуальности решает, писать ли findings
-	// (0 строк — строка ушла из-под задачи или домен удалён).
-	tag, err := tx.Exec(ctx, analyzeMarkSQL,
+	// Штамп первым шагом: охраны актуальности решают, писать ли findings
+	// (нет строки — строка ушла из-под задачи, домен удалён, контент
+	// сменился или версия уже текущая — повторная доставка, T-204).
+	// RETURNING checked_at — час корзины хвостов для декремента ниже.
+	var stampedAt time.Time
+	err = tx.QueryRow(ctx, analyzeMarkSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant),
-		set.Version, row.hash)
+		set.Version, row.hash).Scan(&stampedAt)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			w.opt.log().Debug("findings не записаны — строка перезаписана другим эпизодом, домен удалён или уже проанализирована этой версией",
+				"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID,
+				"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
+			return false, nil
+		}
 		return false, fmt.Errorf("analyzer: %s: штамп rules_version: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		w.opt.log().Debug("findings не записаны — строка перезаписана другим эпизодом или домен удалён",
-			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID,
-			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
-		return false, nil
 	}
 
 	if len(res.Signals) > 0 {
@@ -397,6 +443,15 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, fmt.Errorf("analyzer: %s: %w", name, err)
 	}
 
+	// Декремент корзины хвостов reanalyze: (T-204) — последним шагом
+	// транзакции (хвостовая дельта, стиль record.go): строка переведена
+	// устаревшей→текущей — опубликованный хвост возвращает корзине ноль,
+	// guard следующего тика закрывается. Откат откатывает штамп и дельту
+	// вместе (§3.4).
+	if err := analyzeConsumeTail(ctx, tx, stampedAt); err != nil {
+		return false, fmt.Errorf("analyzer: %s: %w", name, err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("analyzer: %s: запись findings: фиксация: %w", name, err)
 	}
@@ -412,6 +467,28 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		"is_laravel", isLaravel, "ver_min", res.VerMin, "ver_max", res.VerMax,
 		"conflict", res.Conflict, "rules_version", set.Version)
 	return true, nil
+}
+
+// analyzeConsumeTail — декремент корзины неанализированных хвостов
+// reanalyze: в ОТКРЫТОЙ транзакции штампа (T-204): stampedAt — час
+// корзины (RETURNING analyzeMarkSQL), дельта — −1 (одна строка
+// переведена устаревшей→текущей). Upsert сам создаёт корзину часа
+// (декремент теоретически может опередить инкремент — дубль-доставка
+// после потери строки эпизода) — RowsAffected гарантированно 1,
+// проверка — страховка прямых вызовов с чужим SQL (молчаливая потеря
+// дельты держала бы guard тика открытым до реконсиляции). Возврат с
+// ошибкой откатывает транзакцию вызывающего — штамп и корзина меняются
+// только вместе (§3.4).
+func analyzeConsumeTail(ctx context.Context, tx pgx.Tx, stampedAt time.Time) error {
+	tag, err := tx.Exec(ctx, analyzeReanalyzeConsumeSQL, stampedAt, int64(-1))
+	if err != nil {
+		return fmt.Errorf("корзина хвостов переанализа: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("корзина хвостов переанализа: затронуто %d строк (upsert корзины часа обязан 1)",
+			tag.RowsAffected())
+	}
+	return nil
 }
 
 // drainUnfound — точечный дренаж контента домена при снятии находки

@@ -42,11 +42,12 @@ const (
 	recordEvDelete  recordEventKind = "delete"
 	recordEvSwap    recordEventKind = "swapref"
 	recordEvInsert  recordEventKind = "insert"
-	recordEvShift   recordEventKind = "zone-shift"    // дельта счётчиков зоны (T-178)
-	recordEvChecks  recordEventKind = "checks-bump"   // дельта суточного счётчика проверок (T-179)
-	recordEvTempErr recordEventKind = "temp-err-bump" // дельта суточного числителя temp_error (T-182)
-	recordEvMature  recordEventKind = "mature-bump"   // дельта корзины зрелости ретрая (T-202)
-	recordEvResults recordEventKind = "results-bump"  // дельта часовой корзины темпа (T-203)
+	recordEvShift   recordEventKind = "zone-shift"     // дельта счётчиков зоны (T-178)
+	recordEvChecks  recordEventKind = "checks-bump"    // дельта суточного счётчика проверок (T-179)
+	recordEvTempErr recordEventKind = "temp-err-bump"  // дельта суточного числителя temp_error (T-182)
+	recordEvMature  recordEventKind = "mature-bump"    // дельта корзины зрелости ретрая (T-202)
+	recordEvRean    recordEventKind = "reanalyze-bump" // дельта корзины неанализированных хвостов (T-204)
+	recordEvResults recordEventKind = "results-bump"   // дельта часовой корзины темпа (T-203)
 	recordEvCommit  recordEventKind = "commit"
 	recordEvPublish recordEventKind = "publish"
 	recordEvAck     recordEventKind = "ack"
@@ -173,6 +174,9 @@ type recordFakePool struct {
 	// retryMature — корзина зрелости ретрая текущих суток (T-202): имя
 	// вычисляет БД, фейк ведёт одно значение (стиль суточных строк).
 	retryMature int64
+	// reanalyze — корзина неанализированных хвостов текущего часа
+	// (T-204): имя вычисляет БД, фейк ведёт одно значение.
+	reanalyze int64
 	// results — часовая корзина темпа текущего часа (T-203): имя
 	// вычисляет БД, фейк ведёт одно значение (стиль суточных строк).
 	results int64
@@ -186,6 +190,7 @@ type recordFakePool struct {
 	commitErr  error
 	insertTag  int64 // RowsAffected INSERT (0 — честный ответ)
 	matureTag  int64 // RowsAffected upsert корзины зрелости (0 — честный ответ)
+	reanTag    int64 // RowsAffected upsert корзины хвостов (0 — честный ответ)
 	resultsTag int64 // RowsAffected upsert корзины темпа (0 — честный ответ)
 
 	mu sync.Mutex
@@ -235,6 +240,14 @@ func (p *recordFakePool) retryMatureValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.retryMature
+}
+
+// reanalyzeValue — значение корзины неанализированных хвостов (T-204)
+// под замком.
+func (p *recordFakePool) reanalyzeValue() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reanalyze
 }
 
 // resultsValue — значение часовой корзины темпа (T-203) под замком.
@@ -497,6 +510,18 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		t.j.record(recordEvMature)
 		if t.pool.matureTag != 0 {
 			return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", t.pool.matureTag)), nil
+		}
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	case recordReanalyzeBumpSQL:
+		// Инкремент корзины неанализированных хвостов (T-204): дельта —
+		// вставленные строки эпизода (0 — оператор не вызывается вовсе:
+		// все вставленные строки несут rules_version = NULL), фейк ведёт
+		// одно значение корзины часа; reanTag — страховочная ветка
+		// RowsAffected ≠ 1.
+		t.pool.reanalyze += args[0].(int64)
+		t.j.record(recordEvRean)
+		if t.pool.reanTag != 0 {
+			return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", t.pool.reanTag)), nil
 		}
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordResultsBumpSQL:
@@ -1204,14 +1229,16 @@ func TestRecordTempErrCounter(t *testing.T) {
 // TestRecordResultsCounter — часовая корзина темпа (T-203): дельта —
 // вставленные строки эпизода (не эпизоды: домен с двумя записями даёт
 // +2, молчаливый — 0 и оператор не выполняется вовсе); порядок — финал
-// цепочки дельт счётчика (после retry_mature:, перед фиксацией),
-// общий с проходом реконсиляции.
+// цепочки дельт счётчика (после retry_mature: и reanalyze:, перед
+// фиксацией), общий с проходом реконсиляции.
 func TestRecordResultsCounter(t *testing.T) {
 	pool := newRecordFakePool()
 	q := &recordFakeQueue{j: pool.j}
 	r := recordRecorder(t, pool, q)
 
-	// Богатый эпизод: две записи субдомен×вариант → корзина +2.
+	// Богатый эпизод: две записи субдомен×вариант → корзины +2/+2
+	// (хвосты переанализа T-204 — те же строки с rules_version = NULL,
+	// темп T-203 — те же строки как события вставки).
 	rich, _ := recordRichResult()
 	pool.recordSeedDomain(rich.ZoneID, rich.DomainID, model.StatusNew, 0)
 	if ok, err := r.RecordAndPublish(context.Background(), rich); err != nil || !ok {
@@ -1220,16 +1247,20 @@ func TestRecordResultsCounter(t *testing.T) {
 	if got := pool.resultsValue(); got != 2 {
 		t.Fatalf("после богатого эпизода results = %d, want 2 (две вставленные строки)", got)
 	}
+	if got := pool.reanalyzeValue(); got != 2 {
+		t.Fatalf("после богатого эпизода reanalyze = %d, want 2 (каждая вставленная строка — хвост до штампа, T-204)", got)
+	}
 	resultsBump, commit := pool.j.indexOf(recordEvResults), pool.j.indexOf(recordEvCommit)
 	matureBump := pool.j.indexOf(recordEvMature)
-	if resultsBump > commit || (matureBump >= 0 && resultsBump < matureBump) {
-		t.Fatalf("порядок: results=%d mature=%d commit=%d (… → retry_mature: → results: → фиксация)",
-			resultsBump, matureBump, commit)
+	reanBump := pool.j.indexOf(recordEvRean)
+	if resultsBump > commit || (matureBump >= 0 && resultsBump < matureBump) || reanBump > resultsBump {
+		t.Fatalf("порядок: mature=%d reanalyze=%d results=%d commit=%d (… → retry_mature: → reanalyze: → results: → фиксация)",
+			matureBump, reanBump, resultsBump, commit)
 	}
 
-	// Молчаливый эпизод (temp_error, без записей): строк нет — оператор
-	// корзины не выполняется вовсе (нулевые upsert-проходы не греют
-	// блокировку часа).
+	// Молчаливый эпизод (temp_error, без записей): строк нет — операторы
+	// корзин не выполняются вовсе (нулевые upsert-проходы не греют
+	// блокировки часов).
 	silent := recordSilentResult(true)
 	pool.recordSeedDomain(silent.ZoneID, silent.DomainID, model.StatusNew, 1)
 	if ok, err := r.RecordAndPublish(context.Background(), silent); err != nil || !ok {
@@ -1238,15 +1269,21 @@ func TestRecordResultsCounter(t *testing.T) {
 	if got := pool.resultsValue(); got != 2 {
 		t.Fatalf("после молчаливого эпизода results = %d, want 2 (эпизод без строк корзину не трогает)", got)
 	}
+	if got := pool.reanalyzeValue(); got != 2 {
+		t.Fatalf("после молчаливого эпизода reanalyze = %d, want 2 (эпизод без строк корзину не трогает)", got)
+	}
 	if n := pool.j.count(recordEvResults); n != 1 {
 		t.Fatalf("инкрементов корзины темпа = %d, want 1 (нулевая дельта не выполняется)", n)
 	}
+	if n := pool.j.count(recordEvRean); n != 1 {
+		t.Fatalf("инкрементов корзины хвостов = %d, want 1 (нулевая дельта не выполняется)", n)
+	}
 
-	// Повтор богатого эпизода (дубль-доставка): ещё +2 события вставки —
-	// живое окно насчитало бы те же 2 строки, разницу семантик сводит
-	// реконсиляция (потоковая, как у суточных строк). Повторная доставка
-	// переигрывает и сохранение контента (стиль TestRecordIdempotentRepeat):
-	// повторный Put даёт +1 refcount.
+	// Повтор богатого эпизода (дубль-доставка): ещё +2 события вставки в
+	// обе корзины — живое окно насчитало бы те же 2 строки, разницу
+	// семантик сводит реконсиляция (потоковая, как у суточных строк).
+	// Повторная доставка переигрывает и сохранение контента (стиль
+	// TestRecordIdempotentRepeat): повторный Put даёт +1 refcount.
 	_, hashes := recordRichResult()
 	pool.refc[hashes["apex"]] = 2
 	if ok, err := r.RecordAndPublish(context.Background(), rich); err != nil || !ok {
@@ -1254,6 +1291,31 @@ func TestRecordResultsCounter(t *testing.T) {
 	}
 	if got := pool.resultsValue(); got != 4 {
 		t.Fatalf("после повтора results = %d, want 4 (по событиям вставки на доставку)", got)
+	}
+	if got := pool.reanalyzeValue(); got != 4 {
+		t.Fatalf("после повтора reanalyze = %d, want 4 (по событиям вставки на доставку)", got)
+	}
+}
+
+// TestRecordReanalyzeCounterErrors — страховочная ветка RowsAffected ≠ 1
+// upsert корзины хвостов (T-204): ошибка шага откатывает транзакцию
+// целиком (строк и статуса нет), доставка вернётся повтором.
+func TestRecordReanalyzeCounterErrors(t *testing.T) {
+	pool := newRecordFakePool()
+	pool.reanTag = 2 // чужой SQL: затронуто 2 строки
+	rich, _ := recordRichResult()
+	pool.recordSeedDomain(rich.ZoneID, rich.DomainID, model.StatusNew, 0)
+	q := &recordFakeQueue{j: pool.j}
+
+	ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), rich)
+	if err == nil || !strings.Contains(err.Error(), "корзина хвостов переанализа") {
+		t.Fatalf("ошибка = %v, want контекст корзины хвостов", err)
+	}
+	if ok {
+		t.Fatal("при сбое оператора результат не считается записанным")
+	}
+	if _, exists := pool.rows[recordDomainKey{zone: rich.ZoneID, id: rich.DomainID}]; exists {
+		t.Fatal("строки эпизода записаны при сбое корзины (откат §3.4)")
 	}
 }
 

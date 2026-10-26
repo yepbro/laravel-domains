@@ -467,8 +467,8 @@ func TestAggregate_RepeatDelivery(t *testing.T) {
 		t.Fatalf("диапазон = [%v, %v], нужно [5.3, 11]",
 			anStrDeref(row.verMin), anStrDeref(row.verMax))
 	}
-	if n := countEvents(f.pool.j.snapshot(), anEvAggUpsert); n != 2 {
-		t.Fatalf("agg upsert выполнен %d раз (нужно 2 — по одному на доставку)", n)
+	if n := countEvents(f.pool.j.snapshot(), anEvAggUpsert); n != 1 {
+		t.Fatalf("agg upsert выполнен %d раз (нужно 1 — повтор той же версии no-op mark, T-204)", n)
 	}
 }
 

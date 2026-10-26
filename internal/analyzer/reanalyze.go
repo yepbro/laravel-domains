@@ -42,6 +42,25 @@
 //     вперёд курсора, стоимость ∝ притоку, а не размеру таблицы
 //     (прецедент — курсор retention T-185).
 //
+// Guard тика корзинами хвостов (T-204, reanalyzeGuardSQL): даже окно
+// часа — 84 тыс. строк (приток 2–3 млн/сут, TZ T-201 §2.1) с heap-визитом
+// каждой ради неиндексируемого rules_version стоило 5–12 с стационарно и
+// 86–94 с в полуночном шторме (множитель CPU/IO-голода, PSI ~80 %) —
+// критерий приёмки T-193 «тик исчезает из журнала медленных» не
+// достигнут. Как и у ретрая (T-191 → T-202: счётчик status_temp_error не
+// отличал зрелых кандидатов от незрелых), наивный счётчик «записано без
+// анализа» не отличает ХВОСТЫ (потерянные публикации) от НЕЗРЕЛОГО
+// in-flight-потока (запись → q:analyze → штамп занимает секунды, приток
+// 23–35 строк/с держит его ненулевым всегда) — guard по нему был бы
+// открыт каждый тик. Зрелость дают ЧАСОВЫЕ корзины crawler_counters
+// ['reanalyze:YYYY-MM-DD"T"HH24'] (семья T-202/T-203): guard суммирует
+// корзины СТАРШЕ текущего часа — свежий in-flight-поток живёт в корзине
+// текущего часа и guard не открывает; хвост, переживший границу часа,
+// виден. Нулевая сумма ⇒ тяжёлая выборка не выполняется вовсе (стиль
+// retryMatureSQL); отрицательная — дрейф событий против строк (декременты
+// штампов старых версий при дренаже, дубль-доставки) — guard молчит,
+// реконсиляция monitor выровняет корзины своим проходом.
+//
 // Дубликаты между проходами ограничены (in-flight окно) и гасятся
 // идемпотентностью потребителя по ключу — как у T-066.
 //
@@ -163,6 +182,31 @@ const reanalyzeTickSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.varia
 	"AND (r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant) > ($4::timestamptz, $5::int2, $6::int8, $7::int2, $8::int2) " +
 	"ORDER BY r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 	"LIMIT $9"
+
+// reanalyzeGuardSQL — guard тикового прохода (T-204): сумма корзин хвостов
+// reanalyze:YYYY-MM-DD"T"HH24 старше текущего часа + граница текущего
+// часа от БД (двойное назначение: зрелая область корзин и цель прыжка
+// курсора закрытого guard'а — см. ReanalyzeTick). Корзины ведут
+// инкременты записи результата (record.go, час now() транзакции =
+// checked_at строк) и замены контента рендером (renderworker, час
+// ЭПИЗОДА из RETURNING), декремент — штамп анализатора (worker.go, час
+// эпизода строки), авторитет — реконсиляция monitor (FILTER-позиции
+// prev/cur агрегата окна двух живых часов, T-203-стиль). Диапазон по
+// PK-префиксу 'reanalyze:' лексикографически отсекает корзину текущего
+// часа (незрелый in-flight-поток: запись → штамп занимает секунды,
+// корзина часа ещё дорабатывается декрементами) — имя часа вычисляет БД,
+// Go-часы в границе не участвуют (стиль T-179/T-202). coalesce — корзин
+// может не быть вовсе (до первого инкремента или прохода): честный ноль,
+// «зрелых хвостов нет», а не ошибка — в отличие от статусных строк,
+// корзины никто не гарантирует (семантика retryMatureSQL). Скалярный
+// агрегат без GROUP BY отвечает ровно одной строкой всегда: пустой набор
+// — обрыв протокола, ошибка. Хвосты декрементов и воскрешённые рендером
+// опоздания > 1 ч корзины старых часов попадают в сумму с минусом/плюсом
+// до ближайшего прохода monitor (rewrite/cleanup живых корзин) —
+// потоковая семантика событий против живых строк, семейство T-202/T-203.
+var reanalyzeGuardSQL = "SELECT coalesce(sum(value), 0), date_trunc('hour', now()) FROM crawler_counters " +
+	"WHERE name >= 'reanalyze:' " +
+	"AND name < 'reanalyze:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24')"
 
 // zoneIDByNameSQL — идентификатор зоны по имени для фильтра команды
 // crawlerctl reanalyze --zone: имя хранится в punycode (EnsureZone,
@@ -322,6 +366,26 @@ func ReanalyzeDrain(ctx context.Context, pool db.DB, q queue.Queue, version int3
 // (at-least-once, §3.4; дубликат ограничен пачкой, гасится
 // идемпотентностью воркера T-071 по ключу). Отмена ctx — ошибка
 // контекста с итогом опубликованного (стиль ReanalyzeDrain).
+//
+// Guard корзин хвостов (T-204, reanalyzeGuardSQL) — ДО тяжёлой выборки:
+// сумма корзин reanalyze: старше текущего часа — зрелые хвосты без
+// in-flight-потока. Сумма ≤ 0 — тяжёлая выборка окна (heap-визит каждой
+// строки ради rules_version, 84 тыс./ч) не выполняется вовсе, а курсор
+// ПРЫГАЕТ на границу текущего часа (дата из той же строки guard'а):
+// зрелая область объявлена корзинами пустой, незрелая (текущий час,
+// корзина дорабатывается декрементами штампов) остаётся впереди курсора.
+// Без прыжка курсор замерзал бы на последней публикации (пустая пачка
+// его не двигает), и первый хвост после тихих часов стоил бы проход по
+// многочасовому окну — прыжок держит каждое guard-открытое окно ≤ 2 ч
+// притока. Прыжок опирается на зрелость корзин там же, где и пропуск
+// выборки: граница часа от БД (не Go-часы), транзакции записи коротки
+// (мс) — опоздавшие коммиты позади границы единственны и требуют вдобавок
+// потерянной публикации, чтобы стать хвостом: остаточный класс той же
+// природы, что и якорь §4.2 (подбирается рестартом с якорем 24 ч или
+// полным дренажом смены правил). Первый тик после старта цикла при
+// закрытом guard не вычитывает якорное окно 24 ч: стартовый дренаж уже
+// прошёл всё устаревшее (его неудача — Warn, воссоздание якоря —
+// следующим рестартом), а потери первого часа видны корзинами.
 func ReanalyzeTick(ctx context.Context, pool db.DB, q queue.Queue, version int32, cursor *ReanalyzeCursor, opts ReanalyzeOptions) (ReanalyzeResult, error) {
 	if pool == nil {
 		return ReanalyzeResult{}, errors.New("analyzer: переанализ: пул не задан")
@@ -340,6 +404,22 @@ func ReanalyzeTick(ctx context.Context, pool db.DB, q queue.Queue, version int32
 	}
 	o := opts.withDefaults()
 	out := ReanalyzeResult{}
+	if err := ctx.Err(); err != nil {
+		return out, fmt.Errorf("analyzer: переанализ: %w", err)
+	}
+	// Guard корзин хвостов (T-204): до тяжёлой выборки — сумма зрелых
+	// корзин; ≤ 0 (ноль — хвостов нет, минус — дрейф декрементов, молчит
+	// по наследию T-202) — окно не вычитывается, курсор прыгает на
+	// границу текущего часа (обоснование — комментарий ReanalyzeTick).
+	tails, hourStart, err := reanalyzeMatureTails(ctx, pool)
+	if err != nil {
+		return out, err
+	}
+	if tails <= 0 {
+		cursor.checkedAt = hourStart
+		cursor.key = resultKey{}
+		return out, nil
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return out, fmt.Errorf("analyzer: переанализ: %w", err)
@@ -430,6 +510,34 @@ func reanalyzeTickSelect(ctx context.Context, pool db.DB, version int32, after R
 		return nil, fmt.Errorf("analyzer: переанализ: выборка тика: %w", err)
 	}
 	return out, nil
+}
+
+// reanalyzeMatureTails — guard тикового прохода (T-204): сумма корзин
+// хвостов reanalyze: старше текущего часа и граница текущего часа от БД
+// (reanalyzeGuardSQL). coalesce в SQL гарантирует одну строку даже без
+// строк корзин (честный ноль): пустой набор — обрыв протокола, а не
+// «корзин нет», и обязан быть ошибкой (стиль retryMatureCount).
+func reanalyzeMatureTails(ctx context.Context, pool db.DB) (tails int64, hourStart time.Time, err error) {
+	rows, err := pool.Query(ctx, reanalyzeGuardSQL)
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		// Сначала сбой чтения: обрыв соединения — не «пустая сумма»
+		// (coalesce в SQL отвечает строкой всегда).
+		if err := rows.Err(); err != nil {
+			return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: %w", err)
+		}
+		return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: пустой ответ агрегата")
+	}
+	if err := rows.Scan(&tails, &hourStart); err != nil {
+		return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: чтение: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: %w", err)
+	}
+	return tails, hourStart, nil
 }
 
 // reanalyzePublish публикует Result по каждой строке пачки (q:analyze,

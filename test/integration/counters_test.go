@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"crawler/internal/analyzer"
 	"crawler/internal/content"
 	"crawler/internal/dnsworker"
 	"crawler/internal/httpworker"
@@ -27,6 +28,7 @@ import (
 	"crawler/internal/queue"
 	"crawler/internal/render"
 	"crawler/internal/renderworker"
+	"crawler/internal/rules"
 	"crawler/internal/scheduler"
 	"crawler/internal/status"
 )
@@ -1145,4 +1147,141 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		t.Fatalf("hour_window_sec = %v, хочу [3600, 7200) — окно prev+cur корзин", thr.HourWindowSec)
 	}
 	countersVerifyEmpty(t, pool, "после реконсиляции корзин темпа (корзины вне verify)")
+}
+
+// tailContentStub — analyzer.ContentGetter: контента нет (ErrNotFound —
+// строка сида без content_hash, ТЗ 5.8: анализ по заголовкам и кукам).
+type tailContentStub struct{}
+
+func (tailContentStub) Get(_ context.Context, _ content.Hash) ([]byte, error) {
+	return nil, content.ErrNotFound
+}
+
+// tailSetsStub — analyzer.SetSource: пустой набор заданной версии (нет
+// правил — нет срабатываний; штамп ставится и на «пустой» итог, T-071).
+type tailSetsStub struct{ version int32 }
+
+func (s tailSetsStub) Set() *rules.Set { return &rules.Set{Version: s.version} }
+
+// TestCounters_ReanalyzeTailBaskets — корзины неанализированных хвостов
+// переанализа (T-204): потерянная публикация (NULL-строка прошлого часа,
+// сид мимо инкрементов — как перепроверка «до деплоя») материализуется
+// проходом monitor в prev-корзину живым окном; guard тика открывается —
+// тик публикует хвост; штамп анализатора декрементирует корзину часа
+// ЭПИЗОДА (повторная доставка — no-op охраной версии, дельта не двоится);
+// guard закрывается — незрелая строка текущего часа (in-flight) тиком не
+// вычитывается вовсе; устаревшие корзины удаляются проходом.
+func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
+	skipUnlessIntegration(t)
+	reanSkipHourBoundary(t) // сид и окно реконсиляции — «предыдущий час» от now()
+	pool := countersSchema(t)
+	ctx := context.Background()
+
+	zone := countersSeedZone(t, pool, "tail.test")
+	ids := countersSeedDomains(t, pool, zone, "t", 2, model.CheckStateDone, model.StatusNew)
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("стартовый проход: %v", err)
+	}
+
+	// Хвост прошлого часа: NULL-строка (потерянная публикация q:analyze).
+	// Домен ids[1] — БЕЗ эпизодов записи (recordDeleteSQL стирает все
+	// строки домена — урок волны T-203); момент — первая минута
+	// предыдущего календарного часа (граница от БД, гонка с границей часа
+	// — окно в миллисекунды).
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at) "+
+			"VALUES ($1, $2, 1, 2, 'https://lost.tail.test/', "+
+			"date_trunc('hour', now() - interval '1 hour') + interval '1 minute')",
+		zone, ids[1]); err != nil {
+		t.Fatalf("хвост прошлого часа: %v", err)
+	}
+
+	// Реконсиляция — авторитет: prev-корзина хвостов создаётся живым
+	// окном (1 NULL-строка прошлого часа), cur — нуль.
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("реконсиляция: %v", err)
+	}
+	if v, ok := countersHourlyBucket(t, pool, "reanalyze", "date_trunc('hour', now() - interval '1 hour')"); !ok || v != 1 {
+		t.Fatalf("после реконсиляции reanalyze:<prev час> = (%d, %v), хочу (1, true) — живое окно прошлого часа", v, ok)
+	}
+	if v, ok := countersHourlyBucket(t, pool, "reanalyze", "date_trunc('hour', now())"); !ok || v != 0 {
+		t.Fatalf("после реконсиляции reanalyze:<час> = (%d, %v), хочу (0, true) — пустой час создан нулём", v, ok)
+	}
+
+	// Guard открыт (зрелый хвост): тик вычитывает окно время-формой и
+	// публикует ровно хвост.
+	q := &reanQ{}
+	var cursor analyzer.ReanalyzeCursor
+	res, err := analyzer.ReanalyzeTick(ctx, pool, q, 1001, &cursor, analyzer.ReanalyzeOptions{})
+	if err != nil {
+		t.Fatalf("ReanalyzeTick: %v", err)
+	}
+	if res.Selected != 1 || res.Published != 1 {
+		t.Fatalf("тик = %+v, хочу 1/1 (хвост прошлого часа)", res)
+	}
+	if got := q.publishes[0]; got.DomainID != ids[1] || got.SubdomainID != 1 {
+		t.Fatalf("публикация = %+v, хочу ключ хвоста", got)
+	}
+
+	// Штамп анализатора — декремент корзины часа эпизода (той же
+	// транзакцией); повторная доставка той же версии — no-op охраной
+	// mark (T-204): дельта не двоится.
+	an, err := analyzer.New(pool, &countersStubQueue{}, tailContentStub{}, tailSetsStub{version: 1001}, analyzer.Options{})
+	if err != nil {
+		t.Fatalf("analyzer.New: %v", err)
+	}
+	task := queue.Result{
+		ZoneID: zone, DomainID: ids[1], SubdomainID: 1,
+		Variant: model.VariantMain, Name: "lost.tail.test",
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := an.ProcessResult(ctx, task); err != nil {
+			t.Fatalf("ProcessResult №%d: %v", i+1, err)
+		}
+	}
+	if v, _ := countersHourlyBucket(t, pool, "reanalyze", "date_trunc('hour', now() - interval '1 hour')"); v != 0 {
+		t.Fatalf("после штампа reanalyze:<prev час> = %d, хочу 0 (декремент без дубля)", v)
+	}
+	var stamped int32
+	if err := pool.QueryRow(ctx,
+		"SELECT rules_version FROM subdomain_results WHERE zone_id = $1 AND domain_id = $2 AND subdomain_id = 1",
+		zone, ids[1]).Scan(&stamped); err != nil || stamped != 1001 {
+		t.Fatalf("rules_version хвоста = (%d, %v), хочу штамп 1001", stamped, err)
+	}
+
+	// Guard закрыт: свежая NULL-строка ТЕКУЩЕГО часа (in-flight — её
+	// ведёт основной путь записи → q:analyze, корзина часа ещё дораба-
+	// тывается декрементами) зрелой не является — тик окно не вычитывает.
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at) "+
+			"VALUES ($1, $2, 2, 2, 'https://inflight.tail.test/', now())",
+		zone, ids[1]); err != nil {
+		t.Fatalf("in-flight строка: %v", err)
+	}
+	res2, err := analyzer.ReanalyzeTick(ctx, pool, q, 1001, &cursor, analyzer.ReanalyzeOptions{})
+	if err != nil {
+		t.Fatalf("ReanalyzeTick (guard закрыт): %v", err)
+	}
+	if res2 != (analyzer.ReanalyzeResult{}) || len(q.publishes) != 1 {
+		t.Fatalf("тик при закрытом guard = %+v (публикаций %d), хочу 0/0/1 — незрелая строка не вычитывается",
+			res2, len(q.publishes))
+	}
+
+	// Устаревшая корзина хвостов (старше предыдущего часа) — проход
+	// удаляет: корзины — живое окно guard'а, не история.
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO crawler_counters (name, value, updated_at) VALUES ('reanalyze:2000-01-01T00', 999, now())",
+	); err != nil {
+		t.Fatalf("устаревшая корзина: %v", err)
+	}
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("финальная реконсиляция: %v", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM crawler_counters WHERE name = 'reanalyze:2000-01-01T00'",
+	).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("устаревшая корзина пережила проход (count=%d err=%v)", n, err)
+	}
+	countersVerifyEmpty(t, pool, "после сценария корзин хвостов (корзины вне verify)")
 }

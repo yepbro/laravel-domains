@@ -45,6 +45,7 @@ const (
 	rwEvBegin   rwEventKind = "begin"
 	rwEvUpdate  rwEventKind = "update"
 	rwEvSwap    rwEventKind = "swapref"
+	rwEvTail    rwEventKind = "bump-tail"     // дельта корзины неанализированных хвостов (T-204)
 	rwEvBump    rwEventKind = "bump-rendered" // дельта корзины rendered-темпа (T-203)
 	rwEvCommit  rwEventKind = "commit"
 	rwEvPublish rwEventKind = "publish"
@@ -144,9 +145,10 @@ var rwRowCheckedAt = time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 type rwFakePool struct {
 	j *rwJournal
 
-	rows     map[rwRowKey]*rwRow
-	refc     map[content.Hash]int32
-	rendered int64 // корзина rendered-темпа часа строки сида (T-203)
+	rows      map[rwRowKey]*rwRow
+	refc      map[content.Hash]int32
+	rendered  int64 // корзина rendered-темпа часа строки сида (T-203)
+	reanalyze int64 // корзина неанализированных хвостов часа строки сида (T-204)
 
 	queryErr  error
 	updateErr error
@@ -189,6 +191,14 @@ func (p *rwFakePool) renderedValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.rendered
+}
+
+// reanalyzeValue — значение корзины неанализированных хвостов (T-204)
+// под замком.
+func (p *rwFakePool) reanalyzeValue() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reanalyze
 }
 
 func (p *rwFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -297,7 +307,8 @@ func (p *rwFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 		snapRefc[k] = v
 	}
 	p.j.record(rwEvBegin)
-	return &rwFakeTx{pool: p, snapRows: snapRows, snapRefc: snapRefc, snapRendered: p.rendered}, nil
+	return &rwFakeTx{pool: p, snapRows: snapRows, snapRefc: snapRefc,
+		snapRendered: p.rendered, snapReanalyze: p.reanalyze}, nil
 }
 
 // rwDelRefSQLPrefix — префикс sqlMetaDelRef из content/pack.go (T-042):
@@ -308,11 +319,12 @@ const rwDelRefSQLPrefix = "UPDATE contents SET refcount = refcount - 1"
 type rwFakeTx struct {
 	pgx.Tx // остальные методы pgx.Tx этап не использует
 
-	pool         *rwFakePool
-	snapRows     map[rwRowKey]*rwRow
-	snapRefc     map[content.Hash]int32
-	snapRendered int64
-	commit       bool
+	pool          *rwFakePool
+	snapRows      map[rwRowKey]*rwRow
+	snapRefc      map[content.Hash]int32
+	snapRendered  int64
+	snapReanalyze int64
+	commit        bool
 }
 
 // rwUpdateRow — pgx.Row результата UPDATE (RETURNING checked_at, T-203):
@@ -383,6 +395,13 @@ func (t *rwFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	switch {
+	case sql == renderBumpReanalyzeSQL:
+		// Инкремент корзины неанализированных хвостов (T-204): параметр —
+		// checked_at строки (час корзины — час ЭПИЗОДА), дельта 1; фейк
+		// ведёт одно значение (имя часа вычисляет БД).
+		t.pool.reanalyze += args[1].(int64)
+		t.pool.j.record(rwEvTail)
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case sql == renderBumpRenderedSQL:
 		// Инкремент корзины rendered-темпа (T-203): параметр — checked_at
 		// строки (час корзины), дельта 1; фейк ведёт одно значение
@@ -431,6 +450,7 @@ func (t *rwFakeTx) Rollback(context.Context) error {
 	}
 	t.pool.rows, t.pool.refc = t.snapRows, t.snapRefc
 	t.pool.rendered = t.snapRendered
+	t.pool.reanalyze = t.snapReanalyze
 	return nil
 }
 
@@ -885,13 +905,21 @@ func TestRenderWorker_SQLContract(t *testing.T) {
 	if renderBumpRenderedSQL != bumpWant {
 		t.Errorf("renderBumpRenderedSQL =\n%s\nхочу\n%s", renderBumpRenderedSQL, bumpWant)
 	}
+	tailWant := "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('reanalyze:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
+	if renderBumpReanalyzeSQL != tailWant {
+		t.Errorf("renderBumpReanalyzeSQL =\n%s\nхочу\n%s", renderBumpReanalyzeSQL, tailWant)
+	}
 }
 
-// TestRenderWorker_RenderedCounter — корзина rendered-темпа (T-203):
-// +1 в той же транзакции, что и флаг (сбой/откат — вместе, порядок
-// «UPDATE → корзина → фиксация»); охрана (строка ушла) корзину не
-// трогает; повторный рендер той же строки — ещё событие (потоковая
-// семантика, абсолюты выравнивает реконсиляция).
+// TestRenderWorker_RenderedCounter — корзины rendered-темпа (T-203) и
+// неанализированных хвостов (T-204): +1 в той же транзакции, что и флаг
+// (сбой/откат — вместе, порядок «UPDATE → хвосты → rendered →
+// фиксация»); охрана (строка ушла) корзины не трогает; повторный рендер
+// той же строки — ещё событие обеих корзин (потоковая семантика,
+// абсолюты выравнивает реконсиляция).
 func TestRenderWorker_RenderedCounter(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -904,9 +932,14 @@ func TestRenderWorker_RenderedCounter(t *testing.T) {
 	if got := f.pool.renderedValue(); got != 1 {
 		t.Fatalf("после рендера корзина rendered-темпа = %d, want 1", got)
 	}
-	update, bump, commit := f.pool.j.indexOf(rwEvUpdate), f.pool.j.indexOf(rwEvBump), f.pool.j.indexOf(rwEvCommit)
-	if bump < update || bump > commit {
-		t.Fatalf("порядок: update=%d bump=%d commit=%d (флаг → корзина → фиксация)", update, bump, commit)
+	if got := f.pool.reanalyzeValue(); got != 1 {
+		t.Fatalf("после рендера корзина хвостов = %d, want 1 (rules_version → NULL вернул строку в неанализированные, T-204)", got)
+	}
+	update, tail, bump, commit := f.pool.j.indexOf(rwEvUpdate), f.pool.j.indexOf(rwEvTail),
+		f.pool.j.indexOf(rwEvBump), f.pool.j.indexOf(rwEvCommit)
+	if tail < update || bump < tail || bump > commit {
+		t.Fatalf("порядок: update=%d tail=%d bump=%d commit=%d (флаг → хвосты → rendered → фиксация)",
+			update, tail, bump, commit)
 	}
 
 	// Повторная доставка той же задачи: DOM тем же содержимым — охрана
