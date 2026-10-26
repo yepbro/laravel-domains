@@ -55,20 +55,25 @@ type AfterConnectFunc func(ctx context.Context, conn *pgx.Conn) error
 // noParallelGatherSQL — отключение параллельных воркеров запросов сессии.
 const noParallelGatherSQL = "SET max_parallel_workers_per_gather = 0"
 
-// NoParallelGather — AfterConnect-хук мониторинговых сервисов (T-171):
+// NoParallelGather — AfterConnect-хук сервисов с агрегатными/сканирующими
+// фоновыми проходами (T-171 — мониторинг; T-201 — http-worker):
 // сессионный SET max_parallel_workers_per_gather = 0 — агрегатные проходы
-// (пересчёт зон, окна сводки, backlog) не разбирают параллельные воркеры
-// PostgreSQL и не забирают сразу все ядра поделимого CPU у конвейера
-// краулера (боевой инцидент 23–24.10: 4 ядра, load 21–23, каждый
-// параллельный агрегат занимал 3 ядра). Суммарная работа сессии та же,
-// wall-время прохода растёт — мониторингу свежесть в десятки секунд не
-// критична (порог алерта остановки прогресса — 5 периодов пересчёта зон),
-// а воркеры и транспорт получают равные доли CPU вместо всплесков.
+// (пересчёт зон, окна сводки, backlog, retention-дренаж) не разбирают
+// параллельные воркеры PostgreSQL и не забирают сразу все ядра поделимого
+// CPU у конвейера краулера (боевой инцидент 23–24.10: 4 ядра, load 21–23,
+// каждый параллельный агрегат занимал 3 ядра). Суммарная работа сессии та
+// же, wall-время прохода растёт — мониторингу свежесть в десятки секунд
+// не критична (порог алерта остановки прогресса — 5 периодов пересчёта
+// зон), фоновому дренажу — темп задаёт интервал цикла и размер пачки
+// (T-201), а воркеры и транспорт получают равные доли CPU вместо всплесков.
 //
-// Применимо только к пулам мониторинга (monitor, dashboard, коллекторы
-// метрик): путь OLTP-воркеров (выборка/запись пачек по индексам) не
-// использует параллельные планы, но фоновые seq-проходы того же сервиса
-// замедляются — решения по каждому сервису принимаются осознанно.
+// Применимо к пулам мониторинга (monitor, dashboard, коллекторы метрик),
+// scheduler (seq-проходы backlog/retry temp_error) и http-worker
+// (retention-дренаж T-201: время-форма T-185 собирала Gather Merge на
+// голодном CPU того же сервиса): путь OLTP-воркеров (выборка/запись пачек
+// по индексам) не использует параллельные планы, но фоновые seq-проходы
+// того же сервиса замедляются — решения по каждому сервису принимаются
+// осознанно.
 func NoParallelGather(ctx context.Context, conn *pgx.Conn) error {
 	if _, err := conn.Exec(ctx, noParallelGatherSQL); err != nil {
 		return fmt.Errorf("db: %s: %w", noParallelGatherSQL, err)
@@ -119,8 +124,9 @@ func LockTimeout(d time.Duration) AfterConnectFunc {
 // порядку, сбой любого — ошибка открытия соединения (как у одиночного
 // хука); nil-элементы пропускаются (аналог nil AfterConnect — настройка
 // не задана). Нужна пулам с несколькими сессионными настройками:
-// scheduler — NoParallelGather (T-171) + LockTimeout (T-192) одним
-// проводником Options.DBAfterConnect.
+// scheduler — NoParallelGather (T-171) + LockTimeout (T-192), http-worker
+// — те же два хука (T-201, retention-дренаж) одним проводником
+// Options.DBAfterConnect.
 func JoinHooks(hooks ...AfterConnectFunc) AfterConnectFunc {
 	return func(ctx context.Context, conn *pgx.Conn) error {
 		for _, h := range hooks {

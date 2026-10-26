@@ -68,10 +68,12 @@ type Options struct {
 	OnDBPool func(pool *pgxpool.Pool)
 	// DBAfterConnect — настройка каждого соединения пула БД
 	// (db.AfterConnectFunc, T-171): nil — по умолчанию. Хуки сессии:
-	// мониторинговые сервисы (db.NoParallelGather — агрегатные проходы
-	// не разбирают параллельные воркеры PostgreSQL), write-пулы конвейера
-	// (db.LockTimeout — потолок ожидания строковых блокировок, T-192);
-	// несколько хуков — композицией db.JoinHooks.
+	// db.NoParallelGather — сервисы с агрегатными/сканирующими фоновыми
+	// проходами (T-171 — мониторинг; T-201 — http-worker:
+	// retention-дренаж), write-пулы конвейера (db.LockTimeout —
+	// потолок ожидания строковых блокировок, T-192); несколько хуков —
+	// композицией db.JoinHooks (перечень по сервисам — docs/db.md
+	// §«AfterConnect-хуки»).
 	DBAfterConnect db.AfterConnectFunc
 	// OnRun — рабочая логика сервиса (воркеры этапов 2+): вызывается после
 	// полной инициализации (миграции, пул, HTTP метрик). Полученный

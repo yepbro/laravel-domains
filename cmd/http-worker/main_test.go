@@ -6,19 +6,25 @@
 // стрима — пустое множество, пагинация хвоста, ошибки, чужие тела.
 // Здесь же — эффективный порог ёмкости q:render (renderQueueWatermark,
 // T-174): фолбэк «0 — общий scheduler.queue_high_watermark» и кламп
-// MAXLEN/2 (queue.StreamWatermark).
+// MAXLEN/2 (queue.StreamWatermark); и проводка AfterConnect-хуков пула
+// сервиса (afterConnectHooks, T-201): NoParallelGather — сериальность
+// retention-дренажа + LockTimeout (T-192).
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/redis/go-redis/v9"
 
 	"crawler/internal/config"
 	"crawler/internal/content"
+	"crawler/internal/db"
 	"crawler/internal/queue"
 )
 
@@ -250,6 +256,50 @@ func TestPendingKeys_ForeignPayload(t *testing.T) {
 	}
 	if _, ok := keys[wantKey(1, 10, 0, 0)]; !ok {
 		t.Error("валидное сообщение потерялось среди чужих тел")
+	}
+}
+
+// TestAfterConnectHooks — проводка AfterConnect-хуков пула http-worker
+// (T-201): retention-дренаж (RetentionLoop) на пуле сервиса собирал
+// Gather Merge — 2 параллельных воркера на CPU HTTP-слотов (EXPLAIN
+// ANALYZE 26.10) — NoParallelGather обязан входить в состав (продление
+// T-171 на четвёртый сервис), рядом LockTimeout (T-192). До T-201
+// проводка хуков в main тестом не закреплялась (коммит T-192: «Options
+// собираются в main без шва») — именованный список afterConnectHooks и
+// есть шов: выпадение или подмена хука валит тест громко. Граница
+// покрытия (ревью T-201, P3-1): закреплён состав, но не последнее звено
+// — строку DBAfterConnect в main (стиль проекта: Options инлайн; вынос
+// сборки — отдельная задача). Сами SET — контракты
+// TestLockTimeout_HookSQL/TestJoinHooks в internal/db (исполнение хука
+// требует живого соединения — юнит-тесту нечего подменять в *pgx.Conn),
+// здесь закреплён только состав.
+func TestAfterConnectHooks(t *testing.T) {
+	if len(afterConnectHooks) != 2 {
+		t.Fatalf("AfterConnect-хуков пула = %d, want 2 (NoParallelGather T-201 + LockTimeout T-192)", len(afterConnectHooks))
+	}
+	// NoParallelGather — именованная функция пакета db: кодовый указатель
+	// однозначно идентифицирует её среди хуков (замыкание LockTimeout —
+	// другой код); регрессия T-201 — возврат к LockTimeout-без-параллельности
+	// — ловится именно здесь.
+	if reflect.ValueOf(afterConnectHooks[0]).Pointer() != reflect.ValueOf(db.NoParallelGather).Pointer() {
+		t.Error("первый AfterConnect-хук не db.NoParallelGather — retention-дренаж снова соберёт Gather Merge (T-201)")
+	}
+	// LockTimeout — замыкание: кодовый указатель сравнить нельзя —
+	// компилятор специализирует замыкание под call-site (init/main —
+	// разные коды, проверено на инструментальной цепочке проекта), а
+	// символизация runtime.FuncForPC сохраняет базовое имя литерала
+	// (…LockTimeout.func1) при любом инлайнинге. Путь в имени — пакета
+	// call-site (…cmd/http-worker.init.LockTimeout.func1), не пакета
+	// db: сверять полное имя нельзя, суффикс — правильный инструмент
+	// (подстрока совпала бы и с гипотетическими func10/func12).
+	// Аргумент 30 с — контракт TestLockTimeout_HookSQL в internal/db.
+	if name := runtime.FuncForPC(reflect.ValueOf(afterConnectHooks[1]).Pointer()).Name(); !strings.HasSuffix(name, "LockTimeout.func1") {
+		t.Errorf("второй AfterConnect-хук — %s, want замыкание db.LockTimeout (T-192)", name)
+	}
+	for i, h := range afterConnectHooks {
+		if h == nil {
+			t.Errorf("AfterConnect-хук #%d — nil: настройка сессии потеряна", i)
+		}
 	}
 }
 

@@ -53,6 +53,24 @@ import (
 	"crawler/internal/service"
 )
 
+// afterConnectHooks — AfterConnect-хуки пула http-worker в порядке
+// применения (T-201): сериальность сканирующих проходов сервиса
+// (db.NoParallelGather) и потолок строчных блокировок write-пула
+// (db.LockTimeout). Именованный список — шов wiring-теста (main_test.go):
+// до T-201 проводка хуков собиралась в main без шва и тестом не
+// закреплялась вовсе; композиция — db.JoinHooks в main.
+var afterConnectHooks = []db.AfterConnectFunc{
+	// T-201: retention-дренаж (RetentionLoop, retentionSelectSQL —
+	// время-форма T-185) на голодном CPU собирал Gather Merge — 2
+	// параллельных воркера (EXPLAIN ANALYZE 26.10) — на том же сервисе,
+	// где работают HTTP-слоты; сериальность отдаёт стенку фонового
+	// прохода в обмен на CPU-справедливость (темп задаёт
+	// retention_batch/интервал, диск T-166 дренируется часами).
+	db.NoParallelGather,
+	// T-192: см. комментарий DBAfterConnect в main.
+	db.LockTimeout(db.DefaultLockTimeout),
+}
+
 func main() {
 	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
 	cfg, err := config.Load()
@@ -89,12 +107,20 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9104"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		// AfterConnect-хук write-пула (T-192): сессионный потолок
-		// lock_timeout 30 с — запись результатов и чтение счётчиков (FOR
-		// UPDATE) берут строчные локи domains; конвой блокировок 25.10
-		// (держатель ≈37 мин, жертвы до 39 мин) обрезается откатом
-		// транзакции и повтором доставки задачи (at-least-once, ТЗ §3.4).
-		DBAfterConnect: db.LockTimeout(db.DefaultLockTimeout),
+		// Составной AfterConnect-хук пула (db.JoinHooks, T-192):
+		// NoParallelGather (T-201) — агрегатные/сканирующие операторы
+		// фоновых циклов сервиса (retention-дренаж, EXPLAIN 26.10:
+		// Parallel Index Scan + Gather Merge) не разбирают параллельные
+		// воркеры на CPU HTTP-слотов; точечные операторы слотов (PK,
+		// unnest) параллелизм не используют — поведение пула меняется
+		// только у фоновых проходов (проход доработки рендера T-066 уже
+		// сериален по своей природе). LockTimeout (T-192) — сессионный
+		// потолок lock_timeout 30 с: запись результатов и чтение
+		// счётчиков (FOR UPDATE) берут строчные локи domains; конвой
+		// блокировок 25.10 (держатель ≈37 мин, жертвы до 39 мин)
+		// обрезается откатом транзакции и повтором доставки задачи
+		// (at-least-once, ТЗ §3.4).
+		DBAfterConnect: db.JoinHooks(afterConnectHooks...),
 		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)

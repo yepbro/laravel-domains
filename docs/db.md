@@ -37,7 +37,7 @@ defer pool.Close()
 
 `PoolSize` валидируется (1..100): пул больше бюджета ТЗ не имеет смысла.
 
-### AfterConnect-хуки сессии (T-171/T-192)
+### AfterConnect-хуки сессии (T-171/T-192/T-201)
 
 `Options.AfterConnect` (`service.Options.DBAfterConnect` в каркасе) —
 настройка каждого соединения пула, включая переоткрытия по
@@ -46,13 +46,14 @@ defer pool.Close()
 
 | Хук | Действие | Где включён |
 |---|---|---|
-| `db.NoParallelGather` (T-171) | `SET max_parallel_workers_per_gather = 0` — агрегатные проходы не разбирают параллельные воркеры и не забирают все ядра поделимого CPU у конвейера | monitor, dashboard, scheduler (seq-проходы backlog/retry temp_error) |
+| `db.NoParallelGather` (T-171) | `SET max_parallel_workers_per_gather = 0` — агрегатные проходы не разбирают параллельные воркеры и не забирают все ядра поделимого CPU у конвейера | monitor, dashboard, scheduler (seq-проходы backlog/retry temp_error), http-worker (T-201: retention-дренаж — время-форма T-185 собирала Gather Merge на голодном CPU того же сервиса) |
 | `db.LockTimeout(db.DefaultLockTimeout)` (T-192) | `SET lock_timeout = '30000ms'` — потолок ожидания чужих строковых блокировок: конвой 25.10 (держатель ~37 мин, жертвы до 39 мин) обрезается откатом транзакции и повтором доставки (at-least-once), а не немым ожиданием. 30 с — на три порядка выше штатных ожиданий и на порядок ниже инцидентных; константа, не конфиг | dns-worker, http-worker, scheduler — write-пулы со строчными локами `domains` |
-| `db.JoinHooks(...)` | композиция нескольких хуков одного пула (сбой любого — ошибка открытия соединения) | scheduler: `JoinHooks(NoParallelGather, LockTimeout(DefaultLockTimeout))` |
+| `db.JoinHooks(...)` | композиция нескольких хуков одного пула (сбой любого — ошибка открытия соединения) | scheduler: `JoinHooks(NoParallelGather, LockTimeout(DefaultLockTimeout))`; http-worker — те же два хука (T-201) |
 
-Читатели без строчных локов (monitor, dashboard, web) и анализатор хуков
-не получают: `lock_timeout` режет и легитимно длинные ожидания, решение
-осознанное по каждому сервису (образец рассуждения — T-171).
+Читатели без строчных локов (monitor, dashboard, web) и анализатор хук
+`LockTimeout` не получают (у monitor/dashboard — только
+`NoParallelGather`): `lock_timeout` режет и легитимно длинные ожидания,
+решение осознанное по каждому сервису (образец рассуждения — T-171).
 
 ### Бюджет соединений: 20–50 на ВСЕ сервисы
 
@@ -334,7 +335,8 @@ per-table значения пришлось бы дублировать в ка�
   недоступном сервере), текст генерируемого SQL, AfterConnect-хуки —
   контракт `LockTimeout` (константа 30 с, текст SET, отказ
   неположительной длительности) и композиция `JoinHooks` (T-192),
-  разбивка потока на пачки,
+  проводка хуков пула http-worker — состав `afterConnectHooks`
+  (`cmd/http-worker/main_test.go`, T-201), разбивка потока на пачки,
   ошибки источника, отмена между пачками, валидация аргументов.
 - Интеграционные (`test/integration/db_test.go`, живой PostgreSQL
   dev-окружения): реальный COPY пачками со спецсимволами и юникодом,

@@ -44,7 +44,7 @@ config.Load (в main)
 |---|---|
 | `OnRun(ctx) error` | рабочая логика (воркеры этапов 2+): контекст отменяется при SIGTERM/SIGINT — по отмене доработать текущую задачу или вернуть её в очередь (ТЗ 3.4) и вернуться. Возврат без сигнала останавливает сервис: `nil` — чисто (одноразовые задачи), ошибка — с кодом 1 |
 | `OnDBPool(pool)` | получить пул PostgreSQL (после миграций); пул закрывается каркасом при shutdown последним |
-| `DBAfterConnect(hook)` | AfterConnect-хук сессионных настроек каждого соединения пула (T-171/T-192): `db.NoParallelGather` — мониторинговые пулы и scheduler, `db.LockTimeout(db.DefaultLockTimeout)` — write-пулы dns-worker/http-worker/scheduler (потолок ожидания строковых блокировок 30 с), композиция — `db.JoinHooks`; nil — нет ([db.md](db.md) §«AfterConnect-хуки») |
+| `DBAfterConnect(hook)` | AfterConnect-хук сессионных настроек каждого соединения пула (T-171/T-192/T-201): `db.NoParallelGather` — мониторинговые пулы, scheduler и http-worker (retention-дренаж), `db.LockTimeout(db.DefaultLockTimeout)` — write-пулы dns-worker/http-worker/scheduler (потолок ожидания строковых блокировок 30 с), композиция — `db.JoinHooks`; nil — нет ([db.md](db.md) §«AfterConnect-хуки») |
 | `OnSIGHUP()` | перезагрузка правил Laravel без рестарта (`make rules-reload`, ТЗ 5.8) |
 | `ExtraMux(mux)` | дополнительные хендлеры HTTP-сервера метрик |
 | `Metrics` | готовый реестр Prometheus сервиса (T-077): main создаёт реестр под приборы рабочей логики до старта `OnRun`, каркас отдаёт его через `/metrics`; nil — каркас создаёт реестр сам |
