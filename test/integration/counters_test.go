@@ -185,7 +185,7 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 		zone, int16(model.CheckStateQueued)); err != nil {
 		t.Fatalf("возраст аренды: %v", err)
 	}
-	leaseRes, err := scheduler.LeaseOnce(ctx, pool, scheduler.LeaseOptions{})
+	leaseRes, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
 	if err != nil {
 		t.Fatalf("LeaseOnce: %v", err)
 	}

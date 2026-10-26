@@ -678,7 +678,7 @@ func TestResilience_RedisLossSchedulerRecovery(t *testing.T) {
 		"UPDATE domains SET queued_at = now() - interval '1 hour'"); err != nil {
 		t.Fatalf("старение queued_at: %v", err)
 	}
-	lease, err := scheduler.LeaseOnce(ctx, pool, scheduler.LeaseOptions{})
+	lease, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
 	if err != nil {
 		t.Fatalf("LeaseOnce: %v", err)
 	}

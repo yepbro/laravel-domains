@@ -1727,8 +1727,9 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	}
 
 	// Живой lease не отдаётся: «сервис работает» — домены остаются в
-	// работе (Now без сдвига, аренда только что выдана).
-	res, err := scheduler.LeaseOnce(ctx, pool, scheduler.LeaseOptions{})
+	// работе (Now без сдвига, аренда только что выдана). Курсор nil —
+	// разовый проход с нулевого курсора (T-200).
+	res, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
 	if err != nil {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
@@ -1739,7 +1740,7 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	// Остановка сервиса: воркер умер, домены зависли в queued. Сдвиг
 	// «сейчас» за срок аренды — взгляд lease-прохода после простоя.
 	shifted := func() time.Time { return time.Now().Add(2 * scheduler.DefaultLeaseTimeout) }
-	res, err = scheduler.LeaseOnce(ctx, pool, scheduler.LeaseOptions{Now: shifted})
+	res, err = scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{Now: shifted})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1789,7 +1790,7 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 		`UPDATE domains SET status = %d WHERE id = $1`, int16(model.StatusDeleted)), ids[0]); err != nil {
 		t.Fatal(err)
 	}
-	res, err = scheduler.LeaseOnce(ctx, pool, scheduler.LeaseOptions{Now: shifted})
+	res, err = scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{Now: shifted})
 	if err != nil {
 		t.Fatal(err)
 	}
