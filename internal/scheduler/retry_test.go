@@ -1025,7 +1025,10 @@ func TestRetryTempErrorsLoop(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- RetryTempErrors(ctx, pool, RetryOptions{
-			Interval: 2 * time.Millisecond,
+			// 10 мс: окно между наблюдением третьей выборки (поллинг
+			// 1 мс) и cancel заведомо меньше тика — четвёртый проход
+			// сценария успевает лишь изредка (см. ассерты ниже).
+			Interval: 10 * time.Millisecond,
 			Log:      logger,
 		})
 	}()
@@ -1048,9 +1051,18 @@ func TestRetryTempErrorsLoop(t *testing.T) {
 	st := pool.stats()
 	// Транзакции: рабочий проход — выборка + обновление; ошибочный и
 	// пустой — только выборка (обновление не открывается); ошибочная
-	// выборка не фиксируется.
-	if st.begins != 4 || st.commits != 3 {
-		t.Errorf("транзакций %d, коммитов %d, want 4 и 3", st.begins, st.commits)
+	// выборка не фиксируется. Гонка отмены: между наблюдением третьей
+	// выборки и cancel тик мог успеть начать (и, реже, завершить)
+	// четвёртый проход циклического сценария — рабочий: +1 begin и
+	// возможно +1 commit; прерванный на середине — +1 begin без commit.
+	// Дисциплина проходов во всех исходах одна: commits ≤ begins,
+	// разброс — ровно на этот лишний проход.
+	if st.begins < 4 || st.begins > 5 {
+		t.Errorf("транзакций %d, want 4–5 (гонка тика с отменой)", st.begins)
+	}
+	if st.commits < 3 || st.commits > 4 || st.commits > st.begins {
+		t.Errorf("коммитов %d при транзакциях %d, want 3–4 и не больше begins",
+			st.commits, st.begins)
 	}
 
 	log := buf.String()

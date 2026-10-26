@@ -746,6 +746,24 @@ func TestLeaseWatchLoop(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	// Гонка отмены: между наблюдением третьего SELECT и фиксацией
+	// транзакции второй пачки — микросекунды, но отмена в этом окне
+	// прерывала дренаж молча (ctx.Err() — без Warn/Info) и итоговая
+	// строка лога не писалась. Ждём обе фиксации, пауза — на запись
+	// Info после коммита.
+	for {
+		if _, _, _, commits := pool.stats(); commits >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			begins, selects, updates, commits := pool.stats()
+			t.Fatalf("дренаж не зафиксировал обе пачки: begins=%d selects=%d updates=%d commits=%d",
+				begins, selects, updates, commits)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(25 * time.Millisecond)
 	cancel()
 
 	if err := <-done; err != nil {

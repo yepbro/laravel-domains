@@ -999,7 +999,7 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 	ctx := context.Background()
 
 	zone := countersSeedZone(t, pool, "hour.test")
-	ids := countersSeedDomains(t, pool, zone, "h", 2, model.CheckStateDone, model.StatusNew)
+	ids := countersSeedDomains(t, pool, zone, "h", 3, model.CheckStateDone, model.StatusNew)
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("стартовый проход: %v", err)
 	}
@@ -1013,11 +1013,15 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 	// Момент — первая минута предыдущего календарного часа (граница от
 	// БД: строка гарантированно внутри prev-часа в любой момент прогона;
 	// гонка с границей часа посреди теста — окно в миллисекунды).
+	// Домен — ids[2], БЕЗ эпизодов записи: каждый RecordAndPublish
+	// перезаписывает результат домена целиком (recordDeleteSQL, §3.5
+	// «история проверок не хранится») — строка под h0/h1 была бы стёрта
+	// эпизодами ниже, а не дожила бы до реконсиляции.
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at) "+
 			"VALUES ($1, $2, 1, 2, 'https://old.hour.test/', "+
 			"date_trunc('hour', now() - interval '1 hour') + interval '1 minute')",
-		zone, ids[1]); err != nil {
+		zone, ids[2]); err != nil {
 		t.Fatalf("строка прошлого часа: %v", err)
 	}
 
