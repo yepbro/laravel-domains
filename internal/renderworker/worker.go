@@ -14,8 +14,11 @@
 //	  ресурсов, ожидание готовности, DOM + cookies + заголовки)
 //	→ ContentStore.Put(DOM) — новая ссылка +1 (T-056/T-042, дедуп по хэшу)
 //	→ ОДНА транзакция: UPDATE строки (rendered = true, новый content_hash,
-//	  final_url/cookies/headers рендера, rules_version = NULL) +
-//	  −1 refcount старого хэша (SwapRefTx, T-044)
+//	  final_url/cookies/headers рендера, rules_version = NULL; RETURNING
+//	  checked_at — час корзины rendered-темпа) + −1 refcount старого хэша
+//	  (SwapRefTx, T-044) + инкремент часовой корзины темпа
+//	  crawler_counters['rendered:YYYY-MM-DD"T"HH24'] (T-203: той же
+//	  транзакцией — флаг и корзина меняются только вместе)
 //	→ после фиксации — публикация q:analyze (Result, тот же ключ; §7)
 //	→ XACK (Processing, T-025: подтверждение только после записи в БД).
 //
@@ -114,12 +117,43 @@ var (
 	// Охрана content_hash IS NOT DISTINCT FROM $9 — оптимистическая:
 	// строка перезаписывается, только пока её контент тот же, что прочитан
 	// (NULL сравнивается корректно — «контента нет» легально, T-056).
+	// RETURNING r.checked_at (T-203) — час часовой корзины rendered-темпа
+	// (renderBumpRenderedSQL той же транзакции): час ЭПИЗОДА строки, не
+	// часа рендера — так считало живое окно прежнего читателя темпа
+	// (доля rendered среди результатов окна по checked_at); пустой
+	// результат — охрана отсекла (прежний RowsAffected 0): строка ушла
+	// из-под задачи.
 	renderUpdateSQL = "UPDATE subdomain_results AS r " +
 		"SET rendered = true, final_url = $5::text, content_hash = $6::bytea, " +
 		"cookies = $7::jsonb, headers = $8::jsonb, rules_version = NULL " +
 		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
 		"AND r.subdomain_id = $3::int2 AND r.variant = $4::int2 " +
-		"AND r.content_hash IS NOT DISTINCT FROM $9::bytea"
+		"AND r.content_hash IS NOT DISTINCT FROM $9::bytea " +
+		"RETURNING r.checked_at"
+
+	// renderBumpRenderedSQL — инкремент часовой корзины rendered-темпа
+	// crawler_counters['rendered:YYYY-MM-DD"T"HH24'] (T-203): +1 на
+	// строку, переведённую этой транзакцией в rendered = true; $1 —
+	// checked_at строки из RETURNING renderUpdateSQL, час корзины
+	// вычисляет БД (date_trunc) — таймзона согласована с инкрементом
+	// записи результата (record.go), читателем темпа и реконсиляцией.
+	// Живой аналог — прежний подзапрос rendered_hour throughputSQL
+	// (count(*) по subdomain_results, checked_at >= now() − 1 ч AND
+	// rendered): index-only по свежим страницам деградировал
+	// heap-fetch'ами — контрольная точка этапа 27 (механизм суточного
+	// окна T-179). Повторный рендер уже rendered-строки (повторная
+	// доставка при потерянном XACK; охрана хэша пропускает перезапись
+	// тем же DOM) даёт +1 к живому нулю — потоковая семантика событий
+	// (как у суточных строк T-179), абсолюты выравнивает реконсиляция.
+	// Upsert-паттерн record.go; строка счётчика — ЕДИНСТВЕННАЯ точка
+	// блокировки транзакции после UPDATE строки: одна точка циклов
+	// блокировок не создаёт (порядок общий со всеми писателями
+	// crawler_counters — реконсиляция берёт rendered: после
+	// retry_mature: и до results:).
+	renderBumpRenderedSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('rendered:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 )
 
 // RenderDB — пул для чтения цели и записи результата: db.DB с
@@ -536,31 +570,36 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// Откат безусловно: после Commit — no-op (стиль T-044/T-058).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	tag, err := tx.Exec(ctx, renderUpdateSQL,
+	// Замена контента: UPDATE с оптимистической охраной возвращает
+	// checked_at переведённой строки (T-203 — час корзины rendered-темпа);
+	// пустой результат (pgx.ErrNoRows) — охрана отсекла, строка не наша
+	// (прежний признак — RowsAffected 0).
+	var checkedAt time.Time
+	err = tx.QueryRow(ctx, renderUpdateSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant),
-		out.FinalURL, newHash[:], cookies, headers, target.hash)
+		out.FinalURL, newHash[:], cookies, headers, target.hash).Scan(&checkedAt)
 	if err != nil {
-		return false, fmt.Errorf("renderworker: %s: замена контента: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		// Оптимистическая охрана: контент строки сменился после чтения
-		// (перепроверка домена перезаписала результат T-058, конкурентная
-		// доставка уже записала свой DOM) — строка не наша, транзакция
-		// откатывается отложенным Rollback. Ссылка Put снимается: без
-		// строки она повисла бы утечкой места (контент-то жив пока есть
-		// ссылки; Delete снимает ровно добавленную Put). Ошибка снятия —
-		// не ошибка задачи: Warn, доставка подтверждается.
-		_ = tx.Rollback(ctx)
-		if !hasOld || newHash != oldHash {
-			if err := w.contents.Delete(ctx, newHash); err != nil && !errors.Is(err, content.ErrNotFound) {
-				w.opt.log().Warn("рендер: ссылка контента не снята (строка ушла из-под задачи)",
-					"domain", name, "hash", newHash.String(), "err", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Оптимистическая охрана: контент строки сменился после чтения
+			// (перепроверка домена перезаписала результат T-058, конкурентная
+			// доставка уже записала свой DOM) — строка не наша, транзакция
+			// откатывается отложенным Rollback. Ссылка Put снимается: без
+			// строки она повисла бы утечкой места (контент-то жив пока есть
+			// ссылки; Delete снимает ровно добавленную Put). Ошибка снятия —
+			// не ошибка задачи: Warn, доставка подтверждается.
+			_ = tx.Rollback(ctx)
+			if !hasOld || newHash != oldHash {
+				if err := w.contents.Delete(ctx, newHash); err != nil && !errors.Is(err, content.ErrNotFound) {
+					w.opt.log().Warn("рендер: ссылка контента не снята (строка ушла из-под задачи)",
+						"domain", name, "hash", newHash.String(), "err", err)
+				}
 			}
+			w.opt.log().Debug("рендер не записан — строка перезаписана другим эпизодом",
+				"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID,
+				"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
+			return false, nil
 		}
-		w.opt.log().Debug("рендер не записан — строка перезаписана другим эпизодом",
-			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID,
-			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
-		return false, nil
+		return false, fmt.Errorf("renderworker: %s: замена контента: %w", name, err)
 	}
 
 	// −1 старому контенту (ТЗ 5.7 «при перезаписи результата счётчик
@@ -572,6 +611,14 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		if err := content.SwapRefTx(ctx, tx, oldHash, content.Hash{}); err != nil {
 			return false, fmt.Errorf("renderworker: %s: %w", name, err)
 		}
+	}
+	// Корзина rendered-темпа (T-203) — последним шагом транзакции (та же
+	// фиксация: откат откатывает флаг и дельту вместе, §3.4; окно
+	// блокировки строки счётчика — минимум, стиль хвостовых дельт
+	// record.go). Дельта — 1 (одна строка переведена), час — checked_at
+	// из RETURNING UPDATE выше.
+	if err := renderBumpRenderedCounter(ctx, tx, checkedAt); err != nil {
+		return false, fmt.Errorf("renderworker: %s: %w", name, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		// Откат вернёт строку; +1 от Put останется утечкой места —
@@ -594,6 +641,26 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		"domain", name, "final_url", out.FinalURL, "dom_bytes", len(out.DOM),
 		"cookies", len(out.Cookies))
 	return true, nil
+}
+
+// renderBumpRenderedCounter — инкремент корзины rendered-темпа в
+// ОТКРЫТОЙ транзакции замены контента (T-203): checkedAt — час корзины
+// (RETURNING renderUpdateSQL), delta — 1 (одна строка переведена в
+// rendered). Upsert сам создаёт корзину часа (первый rendered-эпизод
+// часа); RowsAffected гарантированно 1, проверка — страховка прямых
+// вызовов с чужим SQL (молчаливая потеря дельты занижала бы темп).
+// Возврат с ошибкой откатывает транзакцию вызывающего — флаг и корзина
+// меняются только вместе (§3.4).
+func renderBumpRenderedCounter(ctx context.Context, tx pgx.Tx, checkedAt time.Time) error {
+	tag, err := tx.Exec(ctx, renderBumpRenderedSQL, checkedAt, int64(1))
+	if err != nil {
+		return fmt.Errorf("корзина rendered-темпа: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("корзина rendered-темпа: затронуто %d строк (upsert корзины часа обязан 1)",
+			tag.RowsAffected())
+	}
+	return nil
 }
 
 // selectTarget читает цель рендера по ключу задачи. SELECT вне транзакции:

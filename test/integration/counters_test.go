@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"crawler/internal/content"
 	"crawler/internal/dnsworker"
 	"crawler/internal/httpworker"
 	"crawler/internal/ingest"
@@ -24,7 +25,10 @@ import (
 	"crawler/internal/model"
 	"crawler/internal/monitor"
 	"crawler/internal/queue"
+	"crawler/internal/render"
+	"crawler/internal/renderworker"
 	"crawler/internal/scheduler"
+	"crawler/internal/status"
 )
 
 // countersSchema — изолированная схема с миграциями (без метки
@@ -951,4 +955,190 @@ func TestCounters_DriftCaughtAndFixed(t *testing.T) {
 		t.Fatalf("recount: %v", err)
 	}
 	countersVerifyEmpty(t, pool, "после recount")
+}
+
+// countersHourRenderer — Renderer для часовых корзин (T-203): живой
+// результат рендера без Chromium (проверяется БД-сторона — флаг rendered
+// и корзина, не браузер).
+type countersHourRenderer struct{}
+
+func (countersHourRenderer) Run(_ context.Context, _ render.RenderTask) (render.RenderOutput, error) {
+	return render.RenderOutput{
+		FinalURL: "https://h0.hour.test/rendered",
+		DOM:      "<html><body>dom</body></html>",
+	}, nil
+}
+
+// countersHourlyBucket — значение корзины <prefix>:YYYY-MM-DD"T"HH24
+// (boundary — SQL-выражение часа, вычисляет БД); отсутствующая строка —
+// (0, false).
+func countersHourlyBucket(t *testing.T, pool *pgxpool.Pool, prefix, boundary string) (int64, bool) {
+	t.Helper()
+	var v int64
+	err := pool.QueryRow(context.Background(),
+		"SELECT value FROM crawler_counters WHERE name = $1 || to_char("+boundary+", 'YYYY-MM-DD\"T\"HH24')",
+		prefix+":",
+	).Scan(&v)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// TestCounters_HourlyThroughputBaskets — часовые корзины темпа (T-203):
+// эпизод записи результата ведёт results-корзину текущего часа дельтой
+// вставленных строк (молчаливый эпизод корзину не трогает); рендер ведёт
+// rendered-корзину часа checked_at строки (флаг и корзина — одной
+// транзакцией); реконсиляция сводит корзины с живым count по календарному
+// часу (prev-корзину создаёт по строке, сидированной мимо инкрементов) и
+// удаляет устаревшие корзины; читатель темпа (status.FetchThroughput)
+// собирает окно из двух живых корзин.
+func TestCounters_HourlyThroughputBaskets(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := countersSchema(t)
+	ctx := context.Background()
+
+	zone := countersSeedZone(t, pool, "hour.test")
+	ids := countersSeedDomains(t, pool, zone, "h", 2, model.CheckStateDone, model.StatusNew)
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("стартовый проход: %v", err)
+	}
+	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil)
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+
+	// Строка прошлого часа, сидированная мимо инкрементов (перепроверка
+	// «до деплоя»): prev-корзину обязан создать проход живым окном.
+	// Момент — первая минута предыдущего календарного часа (граница от
+	// БД: строка гарантированно внутри prev-часа в любой момент прогона;
+	// гонка с границей часа посреди теста — окно в миллисекунды).
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at) "+
+			"VALUES ($1, $2, 1, 2, 'https://old.hour.test/', "+
+			"date_trunc('hour', now() - interval '1 hour') + interval '1 minute')",
+		zone, ids[1]); err != nil {
+		t.Fatalf("строка прошлого часа: %v", err)
+	}
+
+	// Эпизод с двумя записями (два субдомена × по записи): корзина
+	// текущего часа +2 — дельта равна вставленным строкам.
+	rich := &httpworker.DomainResult{
+		ZoneID: zone, DomainID: ids[0], Name: "h0.hour.test",
+		Subdomains: []httpworker.SubdomainResult{
+			{
+				SubdomainID: 0,
+				Records: []httpworker.Record{{
+					Variant: model.VariantMain, Scheme: model.SchemeHTTPS,
+					FinalURL: "https://h0.hour.test/", HTTPStatus: 200,
+				}},
+			},
+			{
+				SubdomainID: 2,
+				Records: []httpworker.Record{{
+					Variant: model.VariantMain, Scheme: model.SchemeHTTPS,
+					FinalURL: "https://www.hour.test/", HTTPStatus: 200,
+				}},
+			},
+		},
+	}
+	if ok, err := rec.RecordAndPublish(ctx, rich); err != nil || !ok {
+		t.Fatalf("эпизод с записями: ok=%v err=%v", ok, err)
+	}
+	if v, ok := countersHourlyBucket(t, pool, "results", "date_trunc('hour', now())"); !ok || v != 2 {
+		t.Fatalf("после эпизода results:<час> = (%d, %v), хочу (2, true) — дельта вставленных строк", v, ok)
+	}
+
+	// Молчаливый temp_error-эпизод: записей нет — корзину не трогает.
+	silent := &httpworker.DomainResult{
+		ZoneID: zone, DomainID: ids[1], Name: "h1.hour.test",
+		Subdomains: []httpworker.SubdomainResult{{
+			SubdomainID: 0,
+			HTTPS:       httpworker.SchemeCheck{ErrClass: httpworker.ErrTimeout},
+			HTTP:        httpworker.SchemeCheck{ErrClass: httpworker.ErrTimeout},
+		}},
+	}
+	if ok, err := rec.RecordAndPublish(ctx, silent); err != nil || !ok {
+		t.Fatalf("молчаливый эпизод: ok=%v err=%v", ok, err)
+	}
+	if v, _ := countersHourlyBucket(t, pool, "results", "date_trunc('hour', now())"); v != 2 {
+		t.Fatalf("после молчаливого эпизода results:<час> = %d, хочу 2 (эпизод без строк корзину не трогает)", v)
+	}
+
+	// Рендер строки эпизода: rendered-корзина часа checked_at строки +1
+	// (флаг и корзина — одна транзакция замены контента).
+	store, err := content.OpenPackStore(pool, content.PackOptions{
+		Dir:           t.TempDir(),
+		PackSize:      8 << 10,
+		MaxStoreBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("OpenPackStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	rw, err := renderworker.New(pool, &countersStubQueue{}, store, countersHourRenderer{}, renderworker.Options{})
+	if err != nil {
+		t.Fatalf("renderworker.New: %v", err)
+	}
+	rendered, err := rw.ProcessResult(ctx, queue.Result{
+		ZoneID: zone, DomainID: ids[0], SubdomainID: 0, Variant: model.VariantMain, Name: "h0.hour.test",
+	})
+	if err != nil || !rendered {
+		t.Fatalf("ProcessResult: ok=%v err=%v", rendered, err)
+	}
+	if v, ok := countersHourlyBucket(t, pool, "rendered", "date_trunc('hour', now())"); !ok || v != 1 {
+		t.Fatalf("после рендера rendered:<час> = (%d, %v), хочу (1, true)", v, ok)
+	}
+
+	// Устаревшие корзины (старше предыдущего часа): сид прямым INSERT —
+	// проход обязан удалить (живое окно темпа, не история).
+	for _, name := range []string{"results:2000-01-01T00", "rendered:2000-01-01T00"} {
+		if _, err := pool.Exec(ctx,
+			"INSERT INTO crawler_counters (name, value, updated_at) VALUES ($1, 999, now())", name,
+		); err != nil {
+			t.Fatalf("устаревшая корзина %s: %v", name, err)
+		}
+	}
+
+	// Реконсиляция — авторитет: prev-корзины создаются живым окном
+	// (results 1 — сид-строка, rendered 0), cur — сходятся с
+	// инкрементами (2/1, расхождений семантик нет — дрейф нулевой);
+	// устаревшие удаляются.
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("реконсиляция: %v", err)
+	}
+	if v, ok := countersHourlyBucket(t, pool, "results", "date_trunc('hour', now() - interval '1 hour')"); !ok || v != 1 {
+		t.Fatalf("после реконсиляции results:<prev час> = (%d, %v), хочу (1, true) — живое окно прошлого часа", v, ok)
+	}
+	if v, ok := countersHourlyBucket(t, pool, "rendered", "date_trunc('hour', now() - interval '1 hour')"); !ok || v != 0 {
+		t.Fatalf("после реконсиляции rendered:<prev час> = (%d, %v), хочу (0, true) — пустой prev-час создан нулём", v, ok)
+	}
+	if v, _ := countersHourlyBucket(t, pool, "results", "date_trunc('hour', now())"); v != 2 {
+		t.Fatalf("после реконсиляции results:<час> = %d, хочу 2 (корзина сходится с живым count)", v)
+	}
+	if v, _ := countersHourlyBucket(t, pool, "rendered", "date_trunc('hour', now())"); v != 1 {
+		t.Fatalf("после реконсиляции rendered:<час> = %d, хочу 1", v)
+	}
+	for _, name := range []string{"results:2000-01-01T00", "rendered:2000-01-01T00"} {
+		var n int
+		if err := pool.QueryRow(ctx,
+			"SELECT count(*) FROM crawler_counters WHERE name = $1", name,
+		).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("устаревшая корзина %s пережила проход (count=%d err=%v)", name, n, err)
+		}
+	}
+
+	// Читатель темпа: окно из двух живых корзин (prev 1 + cur 2), доля
+	// rendered 1, окно покрытия 1–2 ч — делитель честной скорости.
+	thr, err := status.FetchThroughput(ctx, pool)
+	if err != nil {
+		t.Fatalf("FetchThroughput: %v", err)
+	}
+	if thr.ResultsHour != 3 || thr.RenderedHour != 1 {
+		t.Fatalf("throughput = %+v, хочу results_hour=3 rendered_hour=1 (prev+cur корзины)", thr)
+	}
+	if thr.HourWindowSec < 3600 || thr.HourWindowSec >= 7200 {
+		t.Fatalf("hour_window_sec = %v, хочу [3600, 7200) — окно prev+cur корзин", thr.HourWindowSec)
+	}
+	countersVerifyEmpty(t, pool, "после реконсиляции корзин темпа (корзины вне verify)")
 }

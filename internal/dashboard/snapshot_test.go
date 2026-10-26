@@ -99,7 +99,7 @@ func (p *snapPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, e
 	case strings.Contains(sql, "AS done_today"):
 		// Темп: done_today — суточный счётчик проверок (T-179),
 		// остальное — живые окна; значения из посева.
-		return snapRowsOf([]any{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour}), nil
+		return snapRowsOf([]any{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour, p.thr.HourWindowSec}), nil
 	case strings.Contains(sql, "LIKE 'status"):
 		// Распределение статусов — строки status_* счётчиков (T-178).
 		rows := make([][]any, 0, len(p.stats))
@@ -289,7 +289,7 @@ func newSnapCollector(t *testing.T, pool *snapPool, lens status.StreamLener, mut
 func healthyPool() *snapPool {
 	return &snapPool{
 		zones: []snapZone{{id: 1, name: "crawl.test", active: true, total: 100, checked: 40, pending: 58, queued: 2, done: 40}},
-		thr:   status.Throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600},
+		thr:   status.Throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600, HourWindowSec: 3600},
 		stats: map[string]int64{model.StatusNew.String(): 58, model.StatusAlive.String(): 40, model.StatusDeleted.String(): 2},
 		laravel: status.LaravelStats{
 			Total: 2, Last24h: 1,

@@ -113,7 +113,7 @@ func statusTestSnapshot() (zones []status.ZoneStats, tot status.Totals, thr stat
 		{ID: 3, Name: "empty.test", IsActive: false, DomainsTotal: 10, DomainsChecked: 0},
 	}
 	tot = status.ComputeTotals(zones)
-	thr = status.Throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600}
+	thr = status.Throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600, HourWindowSec: 3600}
 	rates = status.ComputeRates(thr, tot.Pending, tot.Queued) // 1 дом./с → ETA 62с
 	return zones, tot, thr, rates
 }
@@ -135,8 +135,8 @@ func TestWriteStatusTable(t *testing.T) {
 		"60", "38", "итого", "40%", // агрегаты и итог
 		"q:dns 5", "q:render 12", "q:dead 1", // очереди
 		"доменов/с          1.0   (3600 проверено с начала суток, прошло 1ч 00м)",
-		"HTTP-результатов/с 2.0   (7200 за последний час)",
-		"рендеров/с         1.0   (3600 с итоговым DOM за час)",
+		"HTTP-результатов/с 2.0   (7200 за окно темпа 1ч 00м)",
+		"рендеров/с         1.0   (3600 с итоговым DOM за то же окно)",
 		"цикл: осталось 62 (pending+queued); ETA ≈ 1м (по 1.0 дом./с)",
 	} {
 		if !strings.Contains(got, want) {
@@ -222,9 +222,10 @@ func TestWriteStatusJSON(t *testing.T) {
 		Totals     map[string]int64 `json:"totals"`
 		Queues     map[string]int64 `json:"queues"`
 		Throughput struct {
-			DoneToday   int64   `json:"done_today"`
-			ElapsedSec  float64 `json:"elapsed_sec"`
-			ResultsHour int64   `json:"results_hour"`
+			DoneToday     int64   `json:"done_today"`
+			ElapsedSec    float64 `json:"elapsed_sec"`
+			ResultsHour   int64   `json:"results_hour"`
+			HourWindowSec float64 `json:"hour_window_sec"`
 		} `json:"throughput"`
 		Rates struct {
 			DomainsPerSec *float64 `json:"domains_per_sec"`
@@ -250,6 +251,11 @@ func TestWriteStatusJSON(t *testing.T) {
 	}
 	if doc.Throughput.DoneToday != 3600 || doc.Throughput.ElapsedSec != 3600 {
 		t.Errorf("throughput = %+v", doc.Throughput)
+	}
+	// Длина окна корзин темпа — в wire-формате (T-203): машинный
+	// потребитель видит, чему кратна сумма results_hour.
+	if doc.Throughput.HourWindowSec != 3600 {
+		t.Errorf("hour_window_sec = %v, хочу 3600", doc.Throughput.HourWindowSec)
 	}
 	if doc.Rates.DomainsPerSec == nil || *doc.Rates.DomainsPerSec != 1 {
 		t.Errorf("domains_per_sec = %v, хочу 1", doc.Rates.DomainsPerSec)
@@ -330,7 +336,10 @@ func TestRunStatus(t *testing.T) {
 }
 
 // TestStatusHelpMentionsStreams — справка перечисляет все стримы и ETA
-// (содержание целиком проверяет TestRunHelpPerCommand в main_test.go).
+// (содержание целиком проверяет TestRunHelpPerCommand в main_test.go);
+// источник темпа — часовые корзины (T-203): справка не должна обещать
+// живой «последний час» по subdomain_results (устаревший текст — находка
+// ревью T-203 P2-1).
 func TestStatusHelpMentionsStreams(t *testing.T) {
 	for _, s := range status.Streams {
 		if !strings.Contains(statusHelp, s) {
@@ -339,5 +348,11 @@ func TestStatusHelpMentionsStreams(t *testing.T) {
 	}
 	if !strings.Contains(statusHelp, "ETA") {
 		t.Error("statusHelp не описывает ETA цикла")
+	}
+	if !strings.Contains(statusHelp, "часовые корзины crawler_counters") {
+		t.Error("statusHelp не описывает источник темпа (часовые корзины, T-203)")
+	}
+	if strings.Contains(statusHelp, "последний час") {
+		t.Error("statusHelp обещает «последний час» — окно темпа 1–2 ч из корзин (T-203)")
 	}
 }

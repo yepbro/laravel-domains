@@ -38,10 +38,11 @@ type TotalsJSON struct {
 
 // ThroughputJSON — замеры темпа (§5.2); поле-в-поле Throughput.
 type ThroughputJSON struct {
-	DoneToday    int64   `json:"done_today"`
-	ElapsedSec   float64 `json:"elapsed_sec"`
-	ResultsHour  int64   `json:"results_hour"`
-	RenderedHour int64   `json:"rendered_hour"`
+	DoneToday     int64   `json:"done_today"`
+	ElapsedSec    float64 `json:"elapsed_sec"`
+	ResultsHour   int64   `json:"results_hour"`
+	RenderedHour  int64   `json:"rendered_hour"`
+	HourWindowSec float64 `json:"hour_window_sec"`
 }
 
 // RatesJSON — производные скорости/ETA (§5.1–5.2); Known-флаги Rates

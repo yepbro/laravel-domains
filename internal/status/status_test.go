@@ -36,18 +36,32 @@ const wantZoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS n
 	"z.is_active, z.domains_total, z.domains_pending, z.domains_queued, z.domains_checked " +
 	"FROM zones AS z ORDER BY z.name"
 
-// wantThroughputSQL — done_today читает суточный счётчик проверок
-// crawler_counters['checks:YYYY-MM-DD'] точечным лукапом по PK (T-179):
-// полного прохода domains в запросе нет; coalesce СНАРУЖИ подзапроса —
-// до первой записи суток подзапрос пуст (NULL), часы простоя показывают
+// wantThroughputSQL — каждое число — точечное чтение/сумма строк
+// crawler_counters, проходов больших таблиц в запросе нет: done_today —
+// суточный счётчик проверок crawler_counters['checks:YYYY-MM-DD']
+// точечным лукапом по PK (T-179), coalesce СНАРУЖИ подзапроса — до
+// первой записи суток подзапрос пуст (NULL), часы простоя показывают
 // честный ноль; имя дня вычисляет БД (current_date) — согласовано с
 // now() записи last_checked_at (T-058) и окном реконсиляции.
+// results_hour/rendered_hour — суммы ЧАСОВЫХ корзин темпа (T-203):
+// прежние живые подзапросы по subdomain_results (окно «последний час»
+// по checked_at) деградировали heap-fetch'ами свежих страниц
+// (контрольная точка этапа 27); корзина — календарный час, читатель
+// суммирует две живые корзины (предыдущий и текущий час, IN-список),
+// hour_window_sec — фактическая длина покрытого окна для честного
+// делителя скорости; имена корзин вычисляет БД (date_trunc от now()) —
+// согласованы с инкрементами записи/рендера и реконсиляцией.
 const wantThroughputSQL = "SELECT " +
 	"coalesce((SELECT value FROM crawler_counters " +
 	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')), 0) AS done_today, " +
 	"extract(epoch FROM (now() - date_trunc('day', now())))::float8 AS elapsed_sec, " +
-	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour') AS results_hour, " +
-	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour' AND rendered) AS rendered_hour"
+	"(SELECT coalesce(sum(value), 0) FROM crawler_counters " +
+	"WHERE name IN ('results:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24'), " +
+	"'results:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'))) AS results_hour, " +
+	"(SELECT coalesce(sum(value), 0) FROM crawler_counters " +
+	"WHERE name IN ('rendered:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24'), " +
+	"'rendered:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'))) AS rendered_hour, " +
+	"extract(epoch FROM (now() - date_trunc('hour', now() - interval '1 hour')))::float8 AS hour_window_sec"
 
 const wantDomainStatusSQL = "SELECT name, value FROM crawler_counters WHERE name LIKE 'status\\_%' ORDER BY name"
 
@@ -232,7 +246,7 @@ func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows,
 	case zoneStatsSQL:
 		return p.decorate(sql, p.zoneRowsData()), nil
 	case throughputSQL:
-		return p.decorate(sql, [][]any{{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour}}), nil
+		return p.decorate(sql, [][]any{{p.thr.DoneToday, p.thr.ElapsedSec, p.thr.ResultsHour, p.thr.RenderedHour, p.thr.HourWindowSec}}), nil
 	case domainStatusSQL:
 		rows := make([][]any, len(p.domStatuses))
 		for i, s := range p.domStatuses {
@@ -530,10 +544,11 @@ func TestFetchZoneStatsEmpty(t *testing.T) {
 	}
 }
 
-// TestFetchThroughput — одна строка замеров; типы колонок (int64/float64).
+// TestFetchThroughput — одна строка замеров; типы колонок
+// (int64/float64), включая длину окна корзин (T-203).
 func TestFetchThroughput(t *testing.T) {
 	pool := newStatusPool()
-	pool.thr = Throughput{DoneToday: 2279, ElapsedSec: 3720.5, ResultsHour: 6132, RenderedHour: 1025}
+	pool.thr = Throughput{DoneToday: 2279, ElapsedSec: 3720.5, ResultsHour: 6132, RenderedHour: 1025, HourWindowSec: 5400}
 
 	thr, err := FetchThroughput(context.Background(), pool)
 	if err != nil {
@@ -939,7 +954,8 @@ func TestComputeRates(t *testing.T) {
 		t.Errorf("ETA = %d (%v), хочу 90 (известна)", r.ETASec, r.ETAKnown)
 	}
 
-	// Окно короче минимума: скорости доменов и ETA нет, часовые считаются.
+	// Окно короче минимума: скорости доменов и ETA нет, часовые считаются
+	// (нулевое окно корзин — фиксированный делитель часа, T-203).
 	r = ComputeRates(Throughput{ElapsedSec: MinSpeedWindowSec - 1, ResultsHour: 3600}, 10, 0)
 	if r.DomainsKnown || r.DomainsPerSec != 0 {
 		t.Errorf("короткое окно: Known=%v speed=%v, хочу неизвестную", r.DomainsKnown, r.DomainsPerSec)
@@ -948,7 +964,17 @@ func TestComputeRates(t *testing.T) {
 		t.Error("короткое окно: ETA известна, хочу н/д")
 	}
 	if r.ResultsPerSec != 1 {
-		t.Errorf("результаты/с = %v, хочу 1 (окно фиксированное)", r.ResultsPerSec)
+		t.Errorf("результаты/с = %v, хочу 1 (фиксированный делитель при нулевом окне)", r.ResultsPerSec)
+	}
+
+	// Окно корзин темпа (T-203): делитель — фактическая длина покрытого
+	// окна (prev+cur корзины, 1–2 ч), скорость несмещённа: 7200 строк за
+	// 5400 с окна → 4/3 в секунду; нулевое окно ручной сборки — прежний
+	// фиксированный час.
+	r = ComputeRates(Throughput{ResultsHour: 7200, RenderedHour: 3600, HourWindowSec: 5400}, 0, 0)
+	if r.ResultsPerSec != 7200.0/5400.0 || r.RenderPerSec != 3600.0/5400.0 {
+		t.Errorf("скорости окна корзин = %v/%v, хочу %v/%v (деление на длину окна)",
+			r.ResultsPerSec, r.RenderPerSec, 7200.0/5400.0, 3600.0/5400.0)
 	}
 
 	// Граница окна ровно на минимуме — скорость известна.

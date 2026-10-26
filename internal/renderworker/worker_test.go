@@ -45,6 +45,7 @@ const (
 	rwEvBegin   rwEventKind = "begin"
 	rwEvUpdate  rwEventKind = "update"
 	rwEvSwap    rwEventKind = "swapref"
+	rwEvBump    rwEventKind = "bump-rendered" // дельта корзины rendered-темпа (T-203)
 	rwEvCommit  rwEventKind = "commit"
 	rwEvPublish rwEventKind = "publish"
 	rwEvAck     rwEventKind = "ack"
@@ -84,6 +85,19 @@ func (j *rwJournal) indexOf(k rwEventKind) int {
 	return -1
 }
 
+// countEvents — число событий вида (фиксация факта «не ноль»).
+func (j *rwJournal) countEvents(k rwEventKind) int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	n := 0
+	for _, e := range j.events {
+		if e == k {
+			n++
+		}
+	}
+	return n
+}
+
 func (j *rwJournal) signalAck() {
 	if j.ackNotify == nil {
 		return
@@ -107,29 +121,39 @@ type rwRowKey struct {
 // rwRow — строка subdomain_results, которую читает renderSelectSQL и
 // меняет renderUpdateSQL.
 type rwRow struct {
-	finalURL *string
-	hash     []byte // nil — NULL (контента нет, T-056)
-	rendered bool
-	cookies  *string
-	headers  *string
+	finalURL  *string
+	hash      []byte // nil — NULL (контента нет, T-056)
+	rendered  bool
+	cookies   *string
+	headers   *string
+	checkedAt time.Time // час корзины rendered-темпа (T-203)
 }
 
+// rwRowCheckedAt — фиксированный момент эпизода строк сида: корзина
+// rendered-темпа фейка — одно значение (имя часа вычисляет БД).
+var rwRowCheckedAt = time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+
 // rwFakePool — RenderDB без БД: живая семантика subdomain_results
-// (SELECT по PK, UPDATE с охраной content_hash IS NOT DISTINCT FROM) и
-// contents (refcount с охраной > 0 — sqlMetaDelRef из SwapRefTx, T-044).
-// Транзакция работает на снапшоте: Rollback восстанавливает состояние,
-// Commit оставляет (конкурентные транзакции не моделируются — их
-// сериализует PostgreSQL).
+// (SELECT по PK, UPDATE с охраной content_hash IS NOT DISTINCT FROM,
+// RETURNING checked_at — T-203), contents (refcount с охраной > 0 —
+// sqlMetaDelRef из SwapRefTx, T-044) и корзины rendered-темпа
+// crawler_counters (renderBumpRenderedSQL, T-203 — имя часа вычисляет
+// БД, фейк ведёт одно значение). Транзакция работает на снапшоте:
+// Rollback восстанавливает состояние, Commit оставляет (конкурентные
+// транзакции не моделируются — их сериализует PostgreSQL).
 type rwFakePool struct {
 	j *rwJournal
 
-	rows map[rwRowKey]*rwRow
-	refc map[content.Hash]int32
+	rows     map[rwRowKey]*rwRow
+	refc     map[content.Hash]int32
+	rendered int64 // корзина rendered-темпа часа строки сида (T-203)
 
 	queryErr  error
 	updateErr error
 	commitErr error
 	beginErr  error
+	bumpErr   error // сбой инкремента корзины rendered-темпа (T-203)
+	bumpTag   int64 // RowsAffected upsert корзины (0 — честный ответ)
 
 	// mutateBeforeUpdate — хук: вызывается перед UPDATE внутри транзакции
 	// (симуляция перезаписи строки перепроверкой между SELECT и UPDATE).
@@ -149,7 +173,7 @@ func newRWFakePool() *rwFakePool {
 var _ RenderDB = (*rwFakePool)(nil)
 
 func (p *rwFakePool) seedRow(key rwRowKey, finalURL string, hash *content.Hash) {
-	r := &rwRow{rendered: false}
+	r := &rwRow{rendered: false, checkedAt: rwRowCheckedAt}
 	if finalURL != "" {
 		r.finalURL = &finalURL
 	}
@@ -158,6 +182,13 @@ func (p *rwFakePool) seedRow(key rwRowKey, finalURL string, hash *content.Hash) 
 		p.refc[*hash]++
 	}
 	p.rows[key] = r
+}
+
+// renderedValue — значение корзины rendered-темпа (T-203) под замком.
+func (p *rwFakePool) renderedValue() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.rendered
 }
 
 func (p *rwFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -266,7 +297,7 @@ func (p *rwFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 		snapRefc[k] = v
 	}
 	p.j.record(rwEvBegin)
-	return &rwFakeTx{pool: p, snapRows: snapRows, snapRefc: snapRefc}, nil
+	return &rwFakeTx{pool: p, snapRows: snapRows, snapRefc: snapRefc, snapRendered: p.rendered}, nil
 }
 
 // rwDelRefSQLPrefix — префикс sqlMetaDelRef из content/pack.go (T-042):
@@ -277,10 +308,72 @@ const rwDelRefSQLPrefix = "UPDATE contents SET refcount = refcount - 1"
 type rwFakeTx struct {
 	pgx.Tx // остальные методы pgx.Tx этап не использует
 
-	pool     *rwFakePool
-	snapRows map[rwRowKey]*rwRow
-	snapRefc map[content.Hash]int32
-	commit   bool
+	pool         *rwFakePool
+	snapRows     map[rwRowKey]*rwRow
+	snapRefc     map[content.Hash]int32
+	snapRendered int64
+	commit       bool
+}
+
+// rwUpdateRow — pgx.Row результата UPDATE (RETURNING checked_at, T-203):
+// один приёмник time.Time; err — ошибка оператора или pgx.ErrNoRows
+// (охрана отсекла — прежний RowsAffected 0).
+type rwUpdateRow struct {
+	checkedAt time.Time
+	err       error
+}
+
+func (r rwUpdateRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if len(dest) != 1 {
+		return fmt.Errorf("rwUpdateRow: приёмников %d, нужно 1", len(dest))
+	}
+	if d, ok := dest[0].(*time.Time); ok {
+		*d = r.checkedAt
+		return nil
+	}
+	return fmt.Errorf("rwUpdateRow: приёмник %T, ожидается *time.Time", dest[0])
+}
+
+// QueryRow — UPDATE замены контента (renderUpdateSQL, T-203): живая
+// семантика охраны content_hash IS NOT DISTINCT FROM $9, RETURNING
+// checked_at переведённой строки; пустой результат — pgx.ErrNoRows.
+func (t *rwFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	if sql != renderUpdateSQL {
+		return rwUpdateRow{err: fmt.Errorf("rwFakePool: неожидаемый QueryRow: %s", sql)}
+	}
+	if t.pool.updateErr != nil {
+		return rwUpdateRow{err: t.pool.updateErr}
+	}
+	key := rwRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
+	finalURL := args[4].(string)
+	newHash := args[5].([]byte)
+	cookies := args[6].(*string)
+	headers := args[7].(*string)
+	oldHash := args[8].([]byte)
+	r, ok := t.pool.rows[key]
+	if !ok {
+		return rwUpdateRow{err: pgx.ErrNoRows}
+	}
+	// Охрана content_hash IS NOT DISTINCT FROM $9.
+	same := (r.hash == nil && oldHash == nil) ||
+		(r.hash != nil && oldHash != nil && string(r.hash) == string(oldHash))
+	if !same {
+		return rwUpdateRow{err: pgx.ErrNoRows}
+	}
+	checkedAt := r.checkedAt
+	r.rendered = true
+	r.finalURL = &finalURL
+	h := make([]byte, len(newHash))
+	copy(h, newHash)
+	r.hash = h
+	r.cookies, r.headers = cookies, headers
+	t.pool.j.record(rwEvUpdate)
+	return rwUpdateRow{checkedAt: checkedAt}
 }
 
 func (t *rwFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -290,34 +383,20 @@ func (t *rwFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	switch {
-	case sql == renderUpdateSQL:
-		if t.pool.updateErr != nil {
-			return pgconn.CommandTag{}, t.pool.updateErr
+	case sql == renderBumpRenderedSQL:
+		// Инкремент корзины rendered-темпа (T-203): параметр — checked_at
+		// строки (час корзины), дельта 1; фейк ведёт одно значение
+		// (имя часа вычисляет БД). bumpTag — страховочная ветка
+		// RowsAffected ≠ 1.
+		if t.pool.bumpErr != nil {
+			return pgconn.CommandTag{}, t.pool.bumpErr
 		}
-		key := rwRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
-		finalURL := args[4].(string)
-		newHash := args[5].([]byte)
-		cookies := args[6].(*string)
-		headers := args[7].(*string)
-		oldHash := args[8].([]byte)
-		r, ok := t.pool.rows[key]
-		if !ok {
-			return pgconn.NewCommandTag("UPDATE 0"), nil
+		t.pool.rendered += args[1].(int64)
+		t.pool.j.record(rwEvBump)
+		if t.pool.bumpTag != 0 {
+			return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", t.pool.bumpTag)), nil
 		}
-		// Охрана content_hash IS NOT DISTINCT FROM $9.
-		same := (r.hash == nil && oldHash == nil) ||
-			(r.hash != nil && oldHash != nil && string(r.hash) == string(oldHash))
-		if !same {
-			return pgconn.NewCommandTag("UPDATE 0"), nil
-		}
-		r.rendered = true
-		r.finalURL = &finalURL
-		h := make([]byte, len(newHash))
-		copy(h, newHash)
-		r.hash = h
-		r.cookies, r.headers = cookies, headers
-		t.pool.j.record(rwEvUpdate)
-		return pgconn.NewCommandTag("UPDATE 1"), nil
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case strings.HasPrefix(sql, rwDelRefSQLPrefix):
 		// sqlMetaDelRef (SwapRefTx, T-044): −1 с охраной refcount > 0.
 		var h content.Hash
@@ -351,6 +430,7 @@ func (t *rwFakeTx) Rollback(context.Context) error {
 		return nil // откат после Commit — no-op
 	}
 	t.pool.rows, t.pool.refc = t.snapRows, t.snapRefc
+	t.pool.rendered = t.snapRendered
 	return nil
 }
 
@@ -779,7 +859,8 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 }
 
 // TestRenderWorker_SQLContract — точный текст SELECT и UPDATE с
-// литералами ТЗ (rendered = true, rules_version = NULL).
+// литералами ТЗ (rendered = true, rules_version = NULL; RETURNING
+// checked_at — час корзины rendered-темпа, T-203) и upsert корзины.
 func TestRenderWorker_SQLContract(t *testing.T) {
 	selectWant := "SELECT final_url, content_hash FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
@@ -792,9 +873,86 @@ func TestRenderWorker_SQLContract(t *testing.T) {
 		"cookies = $7::jsonb, headers = $8::jsonb, rules_version = NULL " +
 		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
 		"AND r.subdomain_id = $3::int2 AND r.variant = $4::int2 " +
-		"AND r.content_hash IS NOT DISTINCT FROM $9::bytea"
+		"AND r.content_hash IS NOT DISTINCT FROM $9::bytea " +
+		"RETURNING r.checked_at"
 	if renderUpdateSQL != updateWant {
 		t.Errorf("renderUpdateSQL =\n%s\nхочу\n%s", renderUpdateSQL, updateWant)
+	}
+	bumpWant := "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('rendered:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
+	if renderBumpRenderedSQL != bumpWant {
+		t.Errorf("renderBumpRenderedSQL =\n%s\nхочу\n%s", renderBumpRenderedSQL, bumpWant)
+	}
+}
+
+// TestRenderWorker_RenderedCounter — корзина rendered-темпа (T-203):
+// +1 в той же транзакции, что и флаг (сбой/откат — вместе, порядок
+// «UPDATE → корзина → фиксация»); охрана (строка ушла) корзину не
+// трогает; повторный рендер той же строки — ещё событие (потоковая
+// семантика, абсолюты выравнивает реконсиляция).
+func TestRenderWorker_RenderedCounter(t *testing.T) {
+	f := newRWFixture(t)
+	raw := rwTestHash(1)
+	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+	f.renderer.output = rwOutput("<html><body>a</body></html>")
+
+	if written, err := f.w.ProcessResult(context.Background(), rwTask); err != nil || !written {
+		t.Fatalf("ProcessResult: ok=%v err=%v", written, err)
+	}
+	if got := f.pool.renderedValue(); got != 1 {
+		t.Fatalf("после рендера корзина rendered-темпа = %d, want 1", got)
+	}
+	update, bump, commit := f.pool.j.indexOf(rwEvUpdate), f.pool.j.indexOf(rwEvBump), f.pool.j.indexOf(rwEvCommit)
+	if bump < update || bump > commit {
+		t.Fatalf("порядок: update=%d bump=%d commit=%d (флаг → корзина → фиксация)", update, bump, commit)
+	}
+
+	// Повторная доставка той же задачи: DOM тем же содержимым — охрана
+	// хэша пропускает перезапись, rendered уже true; событие +1 к живому
+	// нулю — разницу семантик сводит реконсиляция.
+	if written, err := f.w.ProcessResult(context.Background(), rwTask); err != nil || !written {
+		t.Fatalf("повтор ProcessResult: ok=%v err=%v", written, err)
+	}
+	if got := f.pool.renderedValue(); got != 2 {
+		t.Fatalf("после повтора корзина = %d, want 2 (событие на каждую запись флага)", got)
+	}
+
+	// Сбой инкремента откатывает транзакцию: флаг и корзина меняются
+	// только вместе (§3.4).
+	f2 := newRWFixture(t)
+	f2.pool.seedRow(rwKey, "https://spa.example/", &raw)
+	f2.renderer.output = rwOutput("<html><body>b</body></html>")
+	f2.pool.bumpErr = errors.New("счётчики недоступны")
+	if _, err := f2.w.ProcessResult(context.Background(), rwTask); err == nil {
+		t.Fatal("сбой корзины обязан вернуть ошибку")
+	}
+	if f2.pool.renderedValue() != 0 {
+		t.Fatalf("корзина = %d после отката, want 0", f2.pool.renderedValue())
+	}
+	if rwRowSnapshot(f2.pool, rwKey).rendered {
+		t.Error("флаг rendered не откатился вместе с корзиной")
+	}
+	if n := f2.pool.j.countEvents(rwEvCommit); n != 0 {
+		t.Errorf("фиксаций = %d, want 0", n)
+	}
+
+	// Строка ушла из-под задачи (охрана): корзина не тронута.
+	f3 := newRWFixture(t)
+	f3.pool.seedRow(rwKey, "https://spa.example/", &raw)
+	f3.renderer.output = rwOutput("<html><body>c</body></html>")
+	f3.pool.mutateBeforeUpdate = func(p *rwFakePool) {
+		if r, ok := p.rows[rwKey]; ok {
+			other := rwTestHash(9)
+			r.hash = other[:]
+		}
+	}
+	if written, err := f3.w.ProcessResult(context.Background(), rwTask); err != nil || written {
+		t.Fatalf("ProcessResult охраны: ok=%v err=%v, хочу (false, nil)", written, err)
+	}
+	if got := f3.pool.renderedValue(); got != 0 {
+		t.Fatalf("корзина = %d при охране, want 0 (строку не перевели)", got)
 	}
 }
 

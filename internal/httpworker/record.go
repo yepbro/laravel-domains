@@ -33,9 +33,11 @@
 //	    шагами — дельты счётчиков: зон (T-178), рендер-долга (T-175),
 //	    суточного счётчика проверок checks:YYYY-MM-DD, его числителя
 //	    temp_error:YYYY-MM-DD (T-179/T-182 — события записи, авторитет —
-//	    реконсиляция monitor) и корзины зрелости ретрая
+//	    реконсиляция monitor), корзины зрелости ретрая
 //	    retry_mature:YYYY-MM-DD (T-202 — temp_error-эпизоды, зреющие к
-//	    полуночи; декремент — ретрай планировщика);
+//	    полуночи; декремент — ретрай планировщика) и часовой корзины
+//	    темпа results:YYYY-MM-DD"T"HH24 (T-203 — вставленные строки
+//	    эпизода; корзину rendered-темпа ведёт render-worker);
 //	  - публикация q:analyze — ПОСЛЕ фиксации транзакции: потребитель Result
 //	    (анализатор, T-068+) читает запись из БД по ключу — сообщение раньше
 //	    строки смотрело бы в пустоту. Сбой публикации → доставка q:http без
@@ -203,6 +205,35 @@ var (
 	// TZ_slow_done_today §5.1), абсолюты выравнивает реконсиляция.
 	recordRetryMatureBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
+
+	// recordResultsBumpSQL — инкремент часовой корзины темпа
+	// crawler_counters['results:YYYY-MM-DD"T"HH24'] (T-203): +N — строк
+	// subdomain_results, вставленных этой транзакцией (дельта —
+	// RowsAffected recordInsertSQL; checked_at строк = now() той же
+	// транзакции, потому date_trunc('hour', now()) — час строк, имя
+	// корзины вычисляет БД — таймзона согласована с now() записи,
+	// читателем и реконсиляцией). Живой аналог — прежний подзапрос
+	// results_hour throughputSQL (count(*) по subdomain_results,
+	// checked_at >= now() − 1 ч): index-only по свежим страницам окна
+	// деградировал heap-fetch'ами — контрольная точка этапа 27 (тот же
+	// механизм, что у суточного окна T-179). Корзина — календарный час:
+	// скользящее окно читатель собирает суммой двух живых корзин
+	// (status.go throughputSQL), авторитет — реконсиляция monitor
+	// (FILTER-позиции прохода по subdomain_results). Эпизоды без строк
+	// (temp_error/no_http) дельту 0 не пишут вовсе — корзину часа создаёт
+	// первая вставленная строка. Дубль-доставка перезаписывает строки
+	// эпизода: удалённые из окна строки не декрементируются — потоковая
+	// семантика событий (как у суточных строк, TZ_slow_done_today §5.1),
+	// абсолюты выравнивает реконсиляция. Upsert-паттерн
+	// recordChecksBumpSQL; порядок блокировок — последней среди строк
+	// счётчика транзакции (после retry_mature:), общий с проходом
+	// реконсиляции «… → retry_mature: → rendered: → results:» — без
+	// циклов (rendered: этой транзакции не касается — её ведёт
+	// renderworker).
+	recordResultsBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('results:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'), $1::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
@@ -421,6 +452,11 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		}
 	}
 
+	// inserted — строки subdomain_results этой транзакции: дельта
+	// часовой корзины темпа results: (T-203); эпизоды без записей
+	// (молчаливые проверки) корзину не трогают.
+	var inserted int64
+
 	if len(batch.zone) > 0 {
 		tag, err := tx.Exec(ctx, recordInsertSQL, batch.args()...)
 		if err != nil {
@@ -429,6 +465,10 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		if int(tag.RowsAffected()) != len(batch.zone) {
 			return false, fmt.Errorf("httpworker: домен %s: вставлено %d строк из %d", res.Name, tag.RowsAffected(), len(batch.zone))
 		}
+		// Строки эпизода — дельта часовой корзины темпа (T-203): все
+		// вставленные строки несут checked_at = now() транзакции — час
+		// корзины один (date_trunc в инкременте ниже).
+		inserted = tag.RowsAffected()
 	}
 	// Дельта счётчиков зоны — той же транзакцией (T-178, ТЗИ §6.4): по
 	// старому check_state предчтения (старое done — дубль-доставка, нули).
@@ -501,6 +541,18 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		// DNS-этап (dnsworker/result.go), и этот оператор: оба пишут
 		// одинаковое имя из current_date той же транзакции записи.
 		if err := recordBumpRetryMatureCounter(ctx, tx, recorded); err != nil {
+			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		}
+	}
+	// Часовая корзина темпа (T-203) — финал цепочки дельт счётчика:
+	// последняя строка транзакции (порядок реконсиляции
+	// «… → retry_mature: → rendered: → results:», rendered: ведёт
+	// renderworker — здесь одна точка results:); дельта — вставленные
+	// строки эпизода, час — now() транзакции (= час checked_at строк).
+	// Нулевая дельта (эпизод без записей) оператор не выполняет вовсе —
+	// пустые upsert-проходы не греют блокировку корзины.
+	if inserted > 0 {
+		if err := recordBumpResultsCounter(ctx, tx, inserted); err != nil {
 			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
@@ -631,6 +683,27 @@ func recordBumpRetryMatureCounter(ctx context.Context, tx pgx.Tx, delta int64) e
 	}
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("корзина зрелости temp_error: затронуто %d строк (upsert корзины суток обязан 1)",
+			tag.RowsAffected())
+	}
+	return nil
+}
+
+// recordBumpResultsCounter — инкремент часовой корзины темпа results в
+// ОТКРЫТОЙ транзакции записи результата (T-203): delta — число строк
+// subdomain_results эпизода (RowsAffected INSERT-пачки; checked_at строк
+// — now() транзакции, час корзины вычисляет БД тем же now()). Upsert сам
+// создаёт корзину часа (первая вставленная строка после границы часа) —
+// RowsAffected гарантированно 1, проверка — страховка прямых вызовов с
+// чужим SQL (молчаливая потеря дельты занижала бы темп). Возврат с
+// ошибкой откатывает транзакцию вызывающего — результат и корзина
+// меняются только вместе (§3.4).
+func recordBumpResultsCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
+	tag, err := tx.Exec(ctx, recordResultsBumpSQL, delta)
+	if err != nil {
+		return fmt.Errorf("часовая корзина темпа: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("часовая корзина темпа: затронуто %d строк (upsert корзины часа обязан 1)",
 			tag.RowsAffected())
 	}
 	return nil

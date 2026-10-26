@@ -27,7 +27,7 @@ func newCacheTestPool() *statusPool {
 	p := newStatusPool()
 	p.seedZone(1, "crawl.test", true, 100, 30, 5, 40)
 	p.zoneLaravel = 4
-	p.thr = Throughput{DoneToday: 10, ElapsedSec: 3600, ResultsHour: 5, RenderedHour: 2}
+	p.thr = Throughput{DoneToday: 10, ElapsedSec: 3600, ResultsHour: 5, RenderedHour: 2, HourWindowSec: 5400}
 	p.domStatuses = []statusStatusSeed{{name: model.StatusNotDelegated.String(), count: 7}}
 	return p
 }

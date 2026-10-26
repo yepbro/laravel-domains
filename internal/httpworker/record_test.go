@@ -46,6 +46,7 @@ const (
 	recordEvChecks  recordEventKind = "checks-bump"   // дельта суточного счётчика проверок (T-179)
 	recordEvTempErr recordEventKind = "temp-err-bump" // дельта суточного числителя temp_error (T-182)
 	recordEvMature  recordEventKind = "mature-bump"   // дельта корзины зрелости ретрая (T-202)
+	recordEvResults recordEventKind = "results-bump"  // дельта часовой корзины темпа (T-203)
 	recordEvCommit  recordEventKind = "commit"
 	recordEvPublish recordEventKind = "publish"
 	recordEvAck     recordEventKind = "ack"
@@ -153,9 +154,10 @@ type recordFakeRow struct {
 // INSERT-пачка), contents (refcount с охраной > 0), счётчиков зон
 // (recordZoneShiftSQL, T-178), суточного счётчика проверок, его
 // temp_error-числителя (recordChecksBumpSQL/recordTempErrBumpSQL,
-// T-179/T-182) и корзины зрелости ретрая (recordRetryMatureBumpSQL,
-// T-202 — имя дня/суток вычисляет БД, фейк ведёт по одному значению
-// «строк текущего дня»). Транзакция работает
+// T-179/T-182), корзины зрелости ретрая (recordRetryMatureBumpSQL,
+// T-202) и часовой корзины темпа (recordResultsBumpSQL, T-203 — имена
+// дней/часов вычисляет БД, фейк ведёт по одному значению «строк текущих
+// суток/часа»). Транзакция работает
 // на снапшоте: Rollback восстанавливает состояние пула, Commit оставляет
 // (достаточно для последовательных вызовов записи; конкурентные
 // транзакции фейк не моделирует — их сериализует PostgreSQL).
@@ -171,16 +173,20 @@ type recordFakePool struct {
 	// retryMature — корзина зрелости ретрая текущих суток (T-202): имя
 	// вычисляет БД, фейк ведёт одно значение (стиль суточных строк).
 	retryMature int64
+	// results — часовая корзина темпа текущего часа (T-203): имя
+	// вычисляет БД, фейк ведёт одно значение (стиль суточных строк).
+	results int64
 
 	begins   int
 	txs      int // создано транзакций
 	beginErr error
 
-	failExec  map[string]error // сбой Exec по точному SQL
-	deleteErr error
-	commitErr error
-	insertTag int64 // RowsAffected INSERT (0 — честный ответ)
-	matureTag int64 // RowsAffected upsert корзины зрелости (0 — честный ответ)
+	failExec   map[string]error // сбой Exec по точному SQL
+	deleteErr  error
+	commitErr  error
+	insertTag  int64 // RowsAffected INSERT (0 — честный ответ)
+	matureTag  int64 // RowsAffected upsert корзины зрелости (0 — честный ответ)
+	resultsTag int64 // RowsAffected upsert корзины темпа (0 — честный ответ)
 
 	mu sync.Mutex
 }
@@ -229,6 +235,13 @@ func (p *recordFakePool) retryMatureValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.retryMature
+}
+
+// resultsValue — значение часовой корзины темпа (T-203) под замком.
+func (p *recordFakePool) resultsValue() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.results
 }
 
 var _ RecordDB = (*recordFakePool)(nil)
@@ -293,12 +306,13 @@ func (p *recordFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	snapChecks := p.checks
 	snapTempErr := p.tempErr
 	snapMature := p.retryMature
+	snapResults := p.results
 	p.txs++
 	p.j.record(recordEvBegin)
 	return &recordFakeTx{
 		pool: p, j: p.j,
 		snapDomains: snapDomains, snapRows: snapRows, snapRefc: snapRefc, snapZones: snapZones,
-		snapChecks: snapChecks, snapTempErr: snapTempErr, snapMature: snapMature,
+		snapChecks: snapChecks, snapTempErr: snapTempErr, snapMature: snapMature, snapResults: snapResults,
 	}, nil
 }
 
@@ -316,6 +330,7 @@ type recordFakeTx struct {
 	snapChecks  int64
 	snapTempErr int64
 	snapMature  int64
+	snapResults int64
 	committed   bool
 }
 
@@ -484,6 +499,17 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 			return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", t.pool.matureTag)), nil
 		}
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	case recordResultsBumpSQL:
+		// Инкремент часовой корзины темпа (T-203): финальная пара —
+		// дельта равна числу вставленных строк эпизода (0 — оператор не
+		// вызывается вовсе), фейк ведёт одно значение корзины часа;
+		// resultsTag — страховочная ветка RowsAffected ≠ 1.
+		t.pool.results += args[0].(int64)
+		t.j.record(recordEvResults)
+		if t.pool.resultsTag != 0 {
+			return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", t.pool.resultsTag)), nil
+		}
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	default:
 		if !strings.HasPrefix(sql, recordDelRefSQLPrefix) {
 			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: неожидаемый SQL: %s", sql)
@@ -551,6 +577,7 @@ func (t *recordFakeTx) Rollback(context.Context) error {
 	t.pool.checks = t.snapChecks
 	t.pool.tempErr = t.snapTempErr
 	t.pool.retryMature = t.snapMature
+	t.pool.results = t.snapResults
 	return nil
 }
 
@@ -1174,6 +1201,62 @@ func TestRecordTempErrCounter(t *testing.T) {
 	}
 }
 
+// TestRecordResultsCounter — часовая корзина темпа (T-203): дельта —
+// вставленные строки эпизода (не эпизоды: домен с двумя записями даёт
+// +2, молчаливый — 0 и оператор не выполняется вовсе); порядок — финал
+// цепочки дельт счётчика (после retry_mature:, перед фиксацией),
+// общий с проходом реконсиляции.
+func TestRecordResultsCounter(t *testing.T) {
+	pool := newRecordFakePool()
+	q := &recordFakeQueue{j: pool.j}
+	r := recordRecorder(t, pool, q)
+
+	// Богатый эпизод: две записи субдомен×вариант → корзина +2.
+	rich, _ := recordRichResult()
+	pool.recordSeedDomain(rich.ZoneID, rich.DomainID, model.StatusNew, 0)
+	if ok, err := r.RecordAndPublish(context.Background(), rich); err != nil || !ok {
+		t.Fatalf("богатый эпизод: ok=%v err=%v", ok, err)
+	}
+	if got := pool.resultsValue(); got != 2 {
+		t.Fatalf("после богатого эпизода results = %d, want 2 (две вставленные строки)", got)
+	}
+	resultsBump, commit := pool.j.indexOf(recordEvResults), pool.j.indexOf(recordEvCommit)
+	matureBump := pool.j.indexOf(recordEvMature)
+	if resultsBump > commit || (matureBump >= 0 && resultsBump < matureBump) {
+		t.Fatalf("порядок: results=%d mature=%d commit=%d (… → retry_mature: → results: → фиксация)",
+			resultsBump, matureBump, commit)
+	}
+
+	// Молчаливый эпизод (temp_error, без записей): строк нет — оператор
+	// корзины не выполняется вовсе (нулевые upsert-проходы не греют
+	// блокировку часа).
+	silent := recordSilentResult(true)
+	pool.recordSeedDomain(silent.ZoneID, silent.DomainID, model.StatusNew, 1)
+	if ok, err := r.RecordAndPublish(context.Background(), silent); err != nil || !ok {
+		t.Fatalf("молчаливый эпизод: ok=%v err=%v", ok, err)
+	}
+	if got := pool.resultsValue(); got != 2 {
+		t.Fatalf("после молчаливого эпизода results = %d, want 2 (эпизод без строк корзину не трогает)", got)
+	}
+	if n := pool.j.count(recordEvResults); n != 1 {
+		t.Fatalf("инкрементов корзины темпа = %d, want 1 (нулевая дельта не выполняется)", n)
+	}
+
+	// Повтор богатого эпизода (дубль-доставка): ещё +2 события вставки —
+	// живое окно насчитало бы те же 2 строки, разницу семантик сводит
+	// реконсиляция (потоковая, как у суточных строк). Повторная доставка
+	// переигрывает и сохранение контента (стиль TestRecordIdempotentRepeat):
+	// повторный Put даёт +1 refcount.
+	_, hashes := recordRichResult()
+	pool.refc[hashes["apex"]] = 2
+	if ok, err := r.RecordAndPublish(context.Background(), rich); err != nil || !ok {
+		t.Fatalf("повтор богатого эпизода: ok=%v err=%v", ok, err)
+	}
+	if got := pool.resultsValue(); got != 4 {
+		t.Fatalf("после повтора results = %d, want 4 (по событиям вставки на доставку)", got)
+	}
+}
+
 // --- охрана deleted (§8/§13.1) ----------------------------------------------
 
 func TestRecordDeletedGuard(t *testing.T) {
@@ -1441,6 +1524,32 @@ func TestRecordTransactionFailures(t *testing.T) {
 		}
 		if got := pool.retryMatureValue(); got != 0 {
 			t.Fatalf("корзина зрелости = %d после отката, want 0", got)
+		}
+	})
+	t.Run("часовая корзина темпа", func(t *testing.T) {
+		// T-203: сбой инкремента корзины откатывает транзакцию целиком —
+		// результат и корзина меняются только вместе (темп занижался бы
+		// молча).
+		pool, q := seed(t)
+		pool.failExec = map[string]error{recordResultsBumpSQL: errors.New("счётчики недоступны")}
+		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
+		assertRolledBack(t, pool, q, err, 0)
+		if got := pool.resultsValue(); got != 0 {
+			t.Fatalf("часовая корзина темпа = %d после отката, want 0", got)
+		}
+	})
+	t.Run("часовая корзина темпа: RowsAffected ≠ 1", func(t *testing.T) {
+		// T-203: страховочная ветка upsert'а (стиль корзины зрелости,
+		// ревью T-202 P3-2) — молчаливая потеря дельты занижала бы темп.
+		pool, q := seed(t)
+		pool.resultsTag = 2 // INSERT 0 2 — чужой SQL/распад протокола
+		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
+		assertRolledBack(t, pool, q, err, 0)
+		if err == nil || !strings.Contains(err.Error(), "затронуто 2 строк (upsert корзины часа обязан 1)") {
+			t.Fatalf("ошибка = %v, want RowsAffected-гард корзины темпа", err)
+		}
+		if got := pool.resultsValue(); got != 0 {
+			t.Fatalf("часовая корзина темпа = %d после отката, want 0", got)
 		}
 	})
 	t.Run("Commit", func(t *testing.T) {

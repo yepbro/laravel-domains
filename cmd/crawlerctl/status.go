@@ -36,9 +36,10 @@ const statusHelp = `crawlerctl status — сводка по зонам, очер
 monitor) и агрегат domains по check_state (pending без учёта deleted,
 queued, done); длины очередей q:dns/q:http/q:render/q:analyze/q:dead
 (XLEN); скорость проверок (доменов/с — средняя с начала суток:
-last_checked_at имеет точность дня; HTTP-результаты и рендеры — за
-последний час по subdomain_results.checked_at) и ETA завершения первого
-цикла: (pending + queued) / скорость. Темп этапов DNS и анализа из БД не
+last_checked_at имеет точность дня; HTTP-результаты и рендеры — за окно
+темпа 1–2 ч: часовые корзины crawler_counters, T-203) и ETA завершения
+первого цикла: (pending + queued) / скорость. Темп этапов DNS и анализа
+из БД не
 измерим — их видно в Prometheus. --json — машинный вывод. Команда работает
 на стеке dev-окружения (PostgreSQL/Redis); при недоступном Redis сводка
 по БД печатается, код возврата — 1.
@@ -128,8 +129,19 @@ func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, 
 	} else {
 		out(w, "  доменов/с          н/д   (окно с начала суток короче %s)\n", status.FormatDuration(status.MinSpeedWindowSec))
 	}
-	out(w, "  HTTP-результатов/с %.1f   (%d за последний час)\n", rates.ResultsPerSec, thr.ResultsHour)
-	out(w, "  рендеров/с         %.1f   (%d с итоговым DOM за час)\n", rates.RenderPerSec, thr.RenderedHour)
+	// Окно темпа результатов/рендеров — корзины календарных часов
+	// (T-203): фактическая длина покрытого окна 1–2 ч печатается рядом —
+	// «N за окно» без длины вводило бы в заблуждение скользящим «часом»;
+	// нулевое окно (ручной сбор) — фиксированный час, тот же фолбэк, что
+	// ComputeRates.
+	window := thr.HourWindowSec
+	if window <= 0 {
+		window = 3600
+	}
+	out(w, "  HTTP-результатов/с %.1f   (%d за окно темпа %s)\n",
+		rates.ResultsPerSec, thr.ResultsHour, status.FormatDuration(int64(window)))
+	out(w, "  рендеров/с         %.1f   (%d с итоговым DOM за то же окно)\n",
+		rates.RenderPerSec, thr.RenderedHour)
 
 	out(w, "\n")
 	switch {

@@ -23,19 +23,27 @@
 //     проверок checks:YYYY-MM-DD (T-179; last_checked_at имеет точность
 //     дня, ТЗ 6.1, часового окна нет); короче 10 минут окно не
 //     используется (сразу после полуночи оценка скачет);
-//   - HTTP-результаты и рендеры — за последний час по checked_at
-//     (timestamptz пишет http-worker, T-058); собственной отметки времени
-//     у рендера нет — считается доля rendered среди результатов окна;
+//   - HTTP-результаты и рендеры — часовые корзины темпа
+//     crawler_counters['results:YYYY-MM-DDTHH24'/'rendered:…'] (T-203):
+//     суммируются ДВЕ живые корзины — предыдущий и текущий календарный
+//     час, делитель скорости — фактическая длина покрытого окна
+//     (1–2 ч, HourWindowSec), оценка «в секунду» несмещённа; прежде
+//     живые подзапросы по subdomain_results.checked_at деградировали
+//     heap-fetch'ами свежих страниц (контрольная точка этапа 27);
+//     собственной отметки времени у рендера нет — считается доля
+//     rendered среди результатов окна;
 //   - темп DNS-этапа отдельно и этапа анализа из БД не измерим (нет
 //     отметок времени; завершение DNS+HTTP и есть «доменов/с») — их
 //     метрики в Prometheus (T-076/T-077);
 //   - ETA первого цикла = (pending + queued) / скорость доменов, защита
 //     от деления на ноль — скорости нет или она 0 → «н/д».
 //
-// Окна и распределения: часовые окна темпа (subdomain_results.
-// checked_at) обслуживает индекс T-120 — правый край диапазона,
-// стоимость пропорциональна окну, а не таблице; суточное окно темпа —
-// инкрементальный счётчик checks:YYYY-MM-DD (T-179: живой подсчёт
+// Окна и распределения: часовые окна темпа — часовые корзины
+// crawler_counters results:/rendered: (T-203: живые подзапросы по
+// subdomain_results.checked_at деградировали heap-fetch'ами свежих
+// страниц — контрольная точка этапа 27, тот же механизм, что у суточного
+// окна T-179); суточное окно темпа — инкрементальный счётчик
+// checks:YYYY-MM-DD (T-179: живой подсчёт
 // last_checked_at = current_date деградировал heap-fetch'ами свежих
 // страниц — замер §2 TZ_slow_done_today); распределения и состояния —
 // инкрементальные счётчики (T-178: zones + crawler_counters, дельты
@@ -73,11 +81,13 @@ var zoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_un
 	"z.is_active, z.domains_total, z.domains_pending, z.domains_queued, z.domains_checked " +
 	"FROM zones AS z ORDER BY z.name"
 
-// throughputSQL — замеры темпа одним запросом. now() — время транзакции:
-// оба интервала согласованы внутри одного выполнения; current_date и
-// date_trunc — одна таймзона сервера БД, как и now() в записи
-// last_checked_at (T-058). done_today — точечное чтение суточного
-// счётчика crawler_counters['checks:YYYY-MM-DD'] (T-179): имя дня
+// throughputSQL — замеры темпа одним запросом; каждое число — точечное
+// чтение/сумма строк crawler_counters, проходов больших таблиц в пути
+// чтения нет. now() — время транзакции: интервалы согласованы внутри
+// одного выполнения; current_date, date_trunc и now() — одна таймзона
+// сервера БД, как и now() записи last_checked_at/checked_at строк
+// (T-058). done_today — точечное чтение суточного счётчика
+// crawler_counters['checks:YYYY-MM-DD'] (T-179): имя дня
 // вычисляет БД тем же current_date, что и окно реконсиляции, — Go-часы
 // в имени не участвуют; счётчик ведут инкременты записи результата
 // (httpworker/record.go), авторитет — реконсиляция monitor. coalesce
@@ -86,16 +96,44 @@ var zoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_un
 // ноль (TZ_slow_done_today §4/§7). done_today считает события записи
 // результатов, а не домены: повторные эпизоды того же домена за сутки
 // сходятся в «темп работы» (расхождение с живым count(*) — §5.1 ТЗ,
-// восстанавливается реконсиляцией). Часовые окна results_hour/
-// rendered_hour остаются живыми подзапросами по subdomain_results —
-// окно маленькое, индекс subdomain_results_checked_idx отрабатывает как
-// задумано (замер §2 ТЗ: 0,07 мс).
+// восстанавливается реконсиляцией).
+//
+// results_hour/rendered_hour — суммы ЧАСОВЫХ корзин темпа
+// crawler_counters['results:YYYY-MM-DD"T"HH24'/'rendered:…'] (T-203):
+// прежние живые подзапросы по subdomain_results (count(*) по
+// checked_at >= now() − 1 ч) деградировали heap-fetch'ами свежих страниц
+// окна — контрольная точка этапа 27 (медиана 6,0 с > 3 с, 108 событий;
+// тот же механизм, что у суточного окна T-179 — замер §2
+// TZ_slow_done_today). Корзина — календарный час, скользящее окно
+// «последний час» точно из корзин не собирается: читатель суммирует ДВЕ
+// живые корзины — предыдущий и текущий час (минимум, покрывающий окно
+// [now() − 1 ч, now()]), а честный делитель скорости — hour_window_sec,
+// фактическая длина покрытого окна [date_trunc('hour', now() − 1 ч),
+// now()] (1–2 ч): деление на 3600 завышало бы темп пилообразно в 1–2
+// раза к границе часа. Инкременты ведут транзакции записи: results —
+// вставка строк результата (httpworker/record.go, дельта — число строк
+// пачки), rendered — выставление флага rendered = true этапом рендера
+// (renderworker/worker.go, той же транзакцией замены контента); корзина
+// rendered-семьи — час checked_at СТРОКИ (час эпизода, не рендера — так
+// считало живое окно: доля rendered среди результатов окна).
+// Сходимость корзин с живым count(*) — по календарному часу
+// (реконсиляция monitor, FILTER-позиции прохода); между проходами
+// расхождение — потоковая разница семантик (дубль-доставки,
+// перезаписи эпизодов), как у суточных строк. coalesce СНАРУЖИ: до
+// первых инкрементов корзин нет — честный ноль. Имена корзин вычисляет
+// БД (date_trunc от now()) — таймзона согласована с инкрементами и
+// реконсиляцией, Go-часы в имени не участвуют (стиль T-179).
 const throughputSQL = "SELECT " +
 	"coalesce((SELECT value FROM crawler_counters " +
 	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')), 0) AS done_today, " +
 	"extract(epoch FROM (now() - date_trunc('day', now())))::float8 AS elapsed_sec, " +
-	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour') AS results_hour, " +
-	"(SELECT count(*) FROM subdomain_results WHERE checked_at >= now() - interval '1 hour' AND rendered) AS rendered_hour"
+	"(SELECT coalesce(sum(value), 0) FROM crawler_counters " +
+	"WHERE name IN ('results:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24'), " +
+	"'results:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'))) AS results_hour, " +
+	"(SELECT coalesce(sum(value), 0) FROM crawler_counters " +
+	"WHERE name IN ('rendered:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24'), " +
+	"'rendered:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'))) AS rendered_hour, " +
+	"extract(epoch FROM (now() - date_trunc('hour', now() - interval '1 hour')))::float8 AS hour_window_sec"
 
 // domainStatusSQL — распределение domains по статусам (ТЗД §5.5) из
 // строк status_* таблицы crawler_counters (T-178, ТЗИ §8.2): строки
@@ -163,10 +201,11 @@ type ZoneStats struct {
 
 // Throughput — замеры темпа из БД (одно выполнение throughputSQL).
 type Throughput struct {
-	DoneToday    int64   // событий записи результатов с начала суток (счётчик checks:, T-179)
-	ElapsedSec   float64 // прошло с начала суток по часам БД
-	ResultsHour  int64   // HTTP-результатов за последний час (checked_at)
-	RenderedHour int64   // из них с итоговым DOM (rendered)
+	DoneToday     int64   // событий записи результатов с начала суток (счётчик checks:, T-179)
+	ElapsedSec    float64 // прошло с начала суток по часам БД
+	ResultsHour   int64   // строк результатов в корзинах окна темпа (results:, T-203): предыдущий + текущий час
+	RenderedHour  int64   // из них с итоговым DOM (корзины rendered:, T-203)
+	HourWindowSec float64 // длина покрытого окна корзин по часам БД: [trunc(now−1ч), now], 1–2 ч (T-203)
 }
 
 // FetchZoneStats выполняет zoneStatsSQL и собирает строки зон.
@@ -210,7 +249,7 @@ func FetchThroughput(ctx context.Context, pool db.DB) (Throughput, error) {
 		return Throughput{}, errors.New("status: темп: пустой ответ")
 	}
 	var t Throughput
-	if err := rows.Scan(&t.DoneToday, &t.ElapsedSec, &t.ResultsHour, &t.RenderedHour); err != nil {
+	if err := rows.Scan(&t.DoneToday, &t.ElapsedSec, &t.ResultsHour, &t.RenderedHour, &t.HourWindowSec); err != nil {
 		return Throughput{}, fmt.Errorf("status: темп: чтение: %w", err)
 	}
 	if err := rows.Err(); err != nil {
@@ -458,7 +497,9 @@ const (
 	// после полуночи среднее «с начала суток» нестабильно (окно в минуты
 	// при тысячах проверок в секунду, ТЗ 3.3).
 	MinSpeedWindowSec = 600
-	// speedWindowSec — фиксированное окно часовых счётчиков (checked_at).
+	// speedWindowSec — фиксированный делитель темпа при нулевом
+	// HourWindowSec (ручной сбор Throughput без чтения БД — тесты;
+	// живое чтение приносит фактическую длину окна корзин 1–2 ч, T-203).
 	speedWindowSec = 3600.0
 )
 
@@ -497,13 +538,22 @@ type Rates struct {
 	ETAKnown      bool
 }
 
-// ComputeRates выводит скорости и ETA первого цикла. Пустой цикл
-// (нечего проверять) завершён независимо от скорости;ETA при остатке
-// не меньше секунды — остаток в одну домену не должен выглядеть «0с».
+// ComputeRates выводит скорости и ETA первого цикла. Делитель темпа
+// результатов/рендеров — фактическая длина окна корзин HourWindowSec
+// (T-203): корзины календарные, читатель суммирует предыдущий и текущий
+// час — окно 1–2 ч, деление на его длину оставляет «в секунду»
+// несмещённой; нулевое окно (ручной сбор значений) — фиксированный час.
+// Пустой цикл (нечего проверять) завершён независимо от скорости;ETA при
+// остатке не меньше секунды — остаток в одну домену не должен выглядеть
+// «0с».
 func ComputeRates(t Throughput, pending, queued int64) Rates {
+	window := t.HourWindowSec
+	if window <= 0 {
+		window = speedWindowSec
+	}
 	r := Rates{
-		ResultsPerSec: float64(t.ResultsHour) / speedWindowSec,
-		RenderPerSec:  float64(t.RenderedHour) / speedWindowSec,
+		ResultsPerSec: float64(t.ResultsHour) / window,
+		RenderPerSec:  float64(t.RenderedHour) / window,
 		Remaining:     pending + queued,
 	}
 	if r.Remaining == 0 {

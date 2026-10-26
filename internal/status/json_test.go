@@ -21,7 +21,7 @@ func TestBuildSummaryJSON(t *testing.T) {
 		{ID: 2, Name: "xn--80adjurfhd.test", NameUnicode: "проверка.test", DomainsTotal: 10},
 	}
 	tot := ComputeTotals(zones)
-	thr := Throughput{DoneToday: 3599, ElapsedSec: 3600, ResultsHour: 7199, RenderedHour: 1}
+	thr := Throughput{DoneToday: 3599, ElapsedSec: 3600, ResultsHour: 7199, RenderedHour: 1, HourWindowSec: 3600}
 	rates := ComputeRates(thr, tot.Pending, tot.Queued) // ≈0.9997 дом./с
 
 	doc := BuildSummaryJSON(zones, tot, thr, rates, nil)
@@ -39,7 +39,7 @@ func TestBuildSummaryJSON(t *testing.T) {
 		`"domains_total":10`,
 		`"totals":{"domains_total":110,"domains_checked":40,"pending":60,"queued":2,"done":38}`,
 		`"queues":null`, // Redis недоступен
-		`"throughput":{"done_today":3599,"elapsed_sec":3600,"results_hour":7199,"rendered_hour":1}`,
+		`"throughput":{"done_today":3599,"elapsed_sec":3600,"results_hour":7199,"rendered_hour":1,"hour_window_sec":3600}`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("JSON не содержит %s:\n%s", want, got)
@@ -85,7 +85,7 @@ func TestSummaryJSONFieldNames(t *testing.T) {
 	}{
 		{ZoneJSON{}, `{"name":"","active":false,"domains_total":0,"domains_checked":0,"pending":0,"queued":0,"done":0}`},
 		{TotalsJSON{}, `{"domains_total":0,"domains_checked":0,"pending":0,"queued":0,"done":0}`},
-		{ThroughputJSON{}, `{"done_today":0,"elapsed_sec":0,"results_hour":0,"rendered_hour":0}`},
+		{ThroughputJSON{}, `{"done_today":0,"elapsed_sec":0,"results_hour":0,"rendered_hour":0,"hour_window_sec":0}`},
 		{RatesJSON{}, `{"domains_per_sec":null,"results_per_sec":0,"renders_per_sec":0,"remaining":0,"eta_sec":null}`},
 	}
 	for _, tc := range cases {
