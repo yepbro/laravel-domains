@@ -936,6 +936,57 @@ func TestAlertsStallDefaultInterval(t *testing.T) {
 	}
 }
 
+// TestAlertsDivergedIntervals — T-206: интервал цикла алертов (Interval,
+// monitor.alerts_interval) отвязан от периода реконсиляции
+// (ZoneStatsInterval, monitor.zone_stats_interval — дефолты 5 мин и
+// 30 мин). Порог остановки прогресса считается от реконсиляции
+// (5 × 30 мин = 2,5 ч: zones.updated_at пишет ZoneStatsLoop — порог
+// короче её периода стрелял бы вечно, в т.ч. 5 × alerts_interval =
+// 25 мин), окно bad_hashes — от интервала алертов (деталь называет
+// 15 × 5 мин = 1ч15м, а не 15 × 30 мин = 7,5 ч).
+func TestAlertsDivergedIntervals(t *testing.T) {
+	env := newAlertsTestEnv(t, func(o *AlertsOptions) {
+		o.Interval = 5 * time.Minute
+		o.ZoneStatsInterval = 30 * time.Minute
+	})
+	now, _ := alertsFixedClock()
+	ctx := context.Background()
+
+	// Возраст метки 2 ч — ок при пороге 5 × 30 мин (счёт от
+	// alerts_interval 5 мин дал бы порог 25 мин и ложный firing).
+	env.pool.fresh = []sql.NullTime{{Time: now.Add(-2 * time.Hour), Valid: true}}
+	s := snapshotOf(t, env.Pass(ctx), AlertProgressStall)
+	if s.Status != AlertStatusOK {
+		t.Errorf("2ч при реконсиляции 30м: статус = %s (%s), want ok", s.Status, s.Detail)
+	}
+	if !strings.Contains(s.Detail, "2h30m0s") { // порог 5 × 30м
+		t.Errorf("detail %q не содержит порог 2h30m0s (5 × zone_stats_interval)", s.Detail)
+	}
+
+	// 2 ч 31 мин — за порогом 2,5 ч.
+	env.pool.fresh = []sql.NullTime{{Time: now.Add(-151 * time.Minute), Valid: true}}
+	if s := snapshotOf(t, env.Pass(ctx), AlertProgressStall); s.Status != AlertStatusFiring {
+		t.Errorf("151м при реконсиляции 30м: статус = %s (%s), want firing", s.Status, s.Detail)
+	}
+
+	// Окно bad_hashes — от интервала алертов: 15 × 5 мин = 1ч15м.
+	src := &fakeBadHashes{}
+	env.deps.BadHashes = src
+	src.set(0)
+	snapshotOf(t, env.Pass(ctx), AlertBadHashes) // база
+	src.set(10)                                  // одна дельта ровно 10
+	s = snapshotOf(t, env.Pass(ctx), AlertBadHashes)
+	if s.Status != AlertStatusFiring {
+		t.Fatalf("сумма 10: статус = %s (%s), want firing", s.Status, s.Detail)
+	}
+	if !strings.Contains(s.Detail, "1h15m0s") {
+		t.Errorf("detail %q не содержит окно 1h15m0s (15 × alerts_interval 5м)", s.Detail)
+	}
+	if strings.Contains(s.Detail, "7h") {
+		t.Errorf("detail %q содержит окно от 30-мин интервала (7h30m) — окно не отвязано", s.Detail)
+	}
+}
+
 // --- место на диске -----------------------------------------------------------
 
 // TestAlertsDiskThreshold — та же формула, что пауза Put (strictly ниже

@@ -154,10 +154,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			})
 	}()
 
-	// Период алертов — период пересчёта зон: одна пара циклов
-	// мониторинга (коридор ТЗ 5.9 30–60 с), и порог остановки прогресса
-	// считается в тех же периодах; отдельного поля конфигурации под
-	// период алертов не заводим.
+	// Период алертов — monitor.alerts_interval (T-206): цикл отвязан
+	// от реконсиляции (zone_stats_interval, с T-199 — 30 мин), дефолт
+	// 5 мин — прежняя частота, окна детекции в проходах вернулись к
+	// прежним минутам. Порог остановки прогресса считается в периодах
+	// РЕКОНСИЛЯЦИИ (ZoneStatsInterval опции ниже): zones.updated_at
+	// пишет ZoneStatsLoop — порог 5 × 5 мин при 30-мин записи метки
+	// стрелял бы вечно.
 	//
 	// Глубина q:dead (T-154) — через тот же гейт обёрткой
 	// NewDeadDepthMetrics: Len(q:dead) зеркалится в
@@ -226,11 +229,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// Медленные запросы PostgreSQL (T-177): цикл опрашивает
 	// pg_stat_activity — выполняемые дольше monitor.slow_query_min_duration
 	// клиентские операторы уходят в Telegram той же доставкой, что алерты
-	// и отчёт нагрузки (дебаунс pid+query_start; агрегаты monitor —
-	// UPDATE по 47 млн строк каждые 30 мин (T-199), замер §12 — исключены
-	// application_name пула). Полный посмертный след — журнал сервера
-	// (log_min_duration_statement, deploy/postgres). 0 — цикл выключен
-	// (SlowQueryLoop молча выйдет).
+	// и отчёт нагрузки (дебаунс pid+query_start; агрегат реконсиляции
+	// monitor — UPDATE по 47 млн строк каждые 30 мин (T-199), замер §12 —
+	// исключены application_name пула). Полный посмертный след — журнал
+	// сервера (log_min_duration_statement, deploy/postgres). 0 — цикл
+	// выключен (SlowQueryLoop молча выйдет).
 	go func() {
 		bg <- monitor.SlowQueryLoop(ctx, monitor.PGSlowQueries{
 			Pool:       pool,
@@ -245,7 +248,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}()
 
 	err := monitor.AlertsLoop(ctx, deps, monitor.AlertsOptions{
-		Interval:          cfg.Monitor.ZoneStatsInterval.D(),
+		Interval:          cfg.Monitor.AlertsInterval.D(),
 		ZoneStatsInterval: cfg.Monitor.ZoneStatsInterval.D(),
 		QueueWatermark:    int64(cfg.Scheduler.QueueHighWatermark),
 		QueueMaxLen:       int64(cfg.Redis.MaxLen),

@@ -50,7 +50,7 @@ import (
 // быстрее пятиминутного окна он не меняется; коридор 30s..1h — по
 // образцу zone_stats_interval. Период касается ТОЛЬКО gauge и сводки
 // этого цикла: алерт render_debt оценивается проходом AlertsLoop по
-// monitor.zone_stats_interval (ревью T-175, P3-6).
+// monitor.alerts_interval (ревью T-175, P3-6; T-206).
 const DefaultRenderDebtInterval = 5 * time.Minute
 
 // renderDebtFlagsSQL — чтение счётчика флагов render_pending: точечный

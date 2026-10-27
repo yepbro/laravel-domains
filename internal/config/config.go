@@ -454,8 +454,25 @@ type Analyzer struct {
 
 // Monitor — служебный сервис мониторинга (ТЗ 5.9).
 type Monitor struct {
-	Listen            string   `yaml:"listen"`
+	Listen string `yaml:"listen"`
+	// ZoneStatsInterval — период реконсиляции инкрементальных счётчиков
+	// (ZoneStatsLoop, T-178): совмещённый проход — единственный полный
+	// проход domains в стационаре. Единица порога остановки прогресса
+	// (AlertStallFactor × интервал): zones.updated_at пишет именно этот
+	// цикл, порог обязан считать его пропусками. Цикл алертов с T-206
+	// идёт собственным интервалом (AlertsInterval ниже).
 	ZoneStatsInterval Duration `yaml:"zone_stats_interval"`
+	// AlertsInterval — период цикла оценки алертов (AlertsLoop, T-206):
+	// 5 минут — прежняя частота. T-161 держал «одну пару циклов» на
+	// zone_stats_interval, T-199 разредил реконсиляцию до 30 мин — окна
+	// детекции, заданные в проходах, растянулись в 6 раз (queue_dead
+	// 15 → 90 мин, memory_high/render_debt 10 → 60 мин, bad_hashes —
+	// окно 75 мин → 7,5 ч); отвязка (решение оператора 26.10) возвращает
+	// прежние эффективные окна и погрешность PSI-выборки ~5 мин. Порог
+	// остановки прогресса остаётся в периодах реконсиляции
+	// (zone_stats_interval): updated_at пишет ZoneStatsLoop, порог
+	// 5 × 5 мин при 30-мин записи стрелял бы вечно.
+	AlertsInterval Duration `yaml:"alerts_interval"`
 	// LoadReportInterval — период отчёта системной нагрузки оператору
 	// (T-173): снимок CPU/памяти/процессов/диска/очередей уходит в
 	// Telegram (monitor.alerts.telegram) и журнал; 0 — цикл выключен.
@@ -473,8 +490,8 @@ type Monitor struct {
 	// RenderDebtInterval — период цикла рендер-долга (T-175): gauge
 	// crawler_render_pending_domains + строка сводки в журнал; проход —
 	// точечный Lookup счётчика и XLEN q:render (миллисекунды). Алерт
-	// render_debt ходит проходом алертов (zone_stats_interval), это поле
-	// его частоту не задаёт.
+	// render_debt ходит проходом алертов (alerts_interval, T-206), это
+	// поле его частоту не задаёт.
 	RenderDebtInterval Duration `yaml:"render_debt_interval"`
 	// IngestMetricsURL — адрес /metrics сервиса ingest (T-099): алерт
 	// мусорных content_hash очистки читает счётчик из экспозиции ingest
@@ -831,9 +848,14 @@ func Default() *Config {
 			// оставшимся полным проходом domains — 48 % медленного
 			// времени БД при интервале 5 мин; решение оператора 26.10
 			// по ТЗИ §7.1 — разредить до 30 мин (обоснование —
-			// internal/monitor/zonestats.go). Тот же период у цикла
-			// алертов (порог остановки прогресса 5× интервал = 2,5 ч).
+			// internal/monitor/zonestats.go). Порог остановки прогресса
+			// — 5 × интервал = 2,5 ч (единица — период этого цикла).
 			ZoneStatsInterval: Duration(30 * time.Minute),
+			// 5 минут (T-206): прежняя частота алертов до T-199 —
+			// окна детекции в проходах вернулись к прежним минутам
+			// (обоснование — internal/monitor/alerts.go,
+			// DefaultAlertsInterval).
+			AlertsInterval: Duration(5 * time.Minute),
 			// Отчёт нагрузки T-173: 10 минут — окно ловит эпизоды голода
 			// CPU/памяти (десятки минут), 144 сообщения/сутки не тонут
 			// алерты в группе; 0 — выключить (коридор Validate).
@@ -850,7 +872,7 @@ func Default() *Config {
 			// gauge — долг меняется темпом дренажа (~1 стр/с), быстрее
 			// пятиминутного окна не двигается; коридор — по образцу
 			// zone_stats_interval. Алерт render_debt оценивается проходом
-			// алертов (zone_stats_interval), не этим полем.
+			// алертов (alerts_interval, T-206), не этим полем.
 			RenderDebtInterval: Duration(5 * time.Minute),
 			// Loopback ingest по METRICS_ADDR (systemd-юниты привязывают
 			// 127.0.0.1:9101); docker-сети переопределяют именем сервиса
@@ -1395,14 +1417,22 @@ func (c *Config) Validate() error {
 	if err := checkHostPort(c.Monitor.Listen); err != nil {
 		problems = append(problems, fmt.Sprintf("monitor.listen: ожидается [host]:port, задано %q", c.Monitor.Listen))
 	}
-	// Период пересчёта зон и цикла алертов (T-161 поднял дефолт 60с→5м,
-	// T-199 — 5м→30м по замеру окна медленных после 3bffc62): коридор
-	// 30с..1ч — нижняя граница коридора ТЗ 5.9
-	// (чаще — UPDATE-агрегат по всей domains), верхняя ограничивает и
-	// алерты (остановка прогресса: 5 × интервал, 2,5 ч на дефолте).
+	// Период реконсиляции (T-161 поднял дефолт 60с→5м, T-199 — 5м→30м
+	// по замеру окна медленных после 3bffc62): коридор 30с..1ч — нижняя
+	// граница коридора ТЗ 5.9 (чаще — UPDATE-агрегат по всей domains),
+	// верхняя ограничивает и порог остановки прогресса
+	// (5 × интервал, 2,5 ч на дефолте): updated_at пишет этот цикл.
 	if c.Monitor.ZoneStatsInterval < Duration(30*time.Second) || c.Monitor.ZoneStatsInterval > Duration(time.Hour) {
 		problems = append(problems, fmt.Sprintf("monitor.zone_stats_interval: ожидается %s..%s, задано %s",
 			Duration(30*time.Second), Duration(time.Hour), c.Monitor.ZoneStatsInterval))
+	}
+	// Период цикла алертов (T-206 — отвязка от реконсиляции): коридор
+	// тот же 30с..1ч, по образцу zone_stats_interval — чаще 30 с проход
+	// алертов (зонд /metrics ingest, XINFO, systemctl) сам становится
+	// шумом, дольше часа растягиваются окна детекции в проходах.
+	if c.Monitor.AlertsInterval < Duration(30*time.Second) || c.Monitor.AlertsInterval > Duration(time.Hour) {
+		problems = append(problems, fmt.Sprintf("monitor.alerts_interval: ожидается %s..%s, задано %s",
+			Duration(30*time.Second), Duration(time.Hour), c.Monitor.AlertsInterval))
 	}
 	// Отчёт нагрузки (T-173): 0 — выключен; иначе коридор 1м..1ч —
 	// чаще — спам группе оператора, реже — окно шире эпизодов голода.
@@ -1445,9 +1475,10 @@ func (c *Config) Validate() error {
 
 	// monitor.alerts (T-162): пороги новых алертов и доставка Telegram.
 	// Эскалация обязана быть ниже Warn-минимума, иначе она недостижима;
-	// окна устойчивости — не меньше периода цикла (коридор
-	// zone_stats_interval 30с..1ч: нижняя граница 1м отсекает и
-	// секундные настройки, и срабатывание за один проход), не больше
+	// окна устойчивости — от минуты (нижняя граница 1м отсекает и
+	// секундные настройки, и срабатывание за один проход; окно короче
+	// периода цикла алертов alerts_interval вырождается в «два соседних
+	// прохода» — psi_cpu, см. DefaultPSIWindow), не больше
 	// смены вахты оператора (6ч) — дольше молчащий алерт никто не ждёт.
 	if c.Monitor.Alerts.DiskFreeCritBytes >= c.Monitor.Alerts.DiskFreeMinBytes {
 		problems = append(problems, fmt.Sprintf(

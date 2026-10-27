@@ -113,6 +113,7 @@ func TestDefault(t *testing.T) {
 		{"analyzer.laravel_min_score", c.Analyzer.LaravelMinScore, 0.6},
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
 		{"monitor.zone_stats_interval", c.Monitor.ZoneStatsInterval.D(), 30 * time.Minute},
+		{"monitor.alerts_interval", c.Monitor.AlertsInterval.D(), 5 * time.Minute},
 		{"monitor.slow_query_interval", c.Monitor.SlowQueryInterval.D(), 10 * time.Second},
 		{"monitor.slow_query_min_duration", c.Monitor.SlowQueryMinDuration.D(), 3 * time.Second},
 		{"monitor.ingest_metrics_url", c.Monitor.IngestMetricsURL, "http://127.0.0.1:9101/metrics"},
@@ -259,6 +260,7 @@ subdomains:
 monitor:
   listen: "127.0.0.1:9110"
   zone_stats_interval: "30s"
+  alerts_interval: "2m"
   slow_query_interval: "15s"
   slow_query_min_duration: "5s"
   render_debt_interval: "2m"
@@ -360,6 +362,7 @@ log:
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.75},
 		{"monitor.listen", cfg.Monitor.Listen, "127.0.0.1:9110"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 30 * time.Second},
+		{"monitor.alerts_interval", cfg.Monitor.AlertsInterval.D(), 2 * time.Minute},
 		{"monitor.slow_query_interval", cfg.Monitor.SlowQueryInterval.D(), 15 * time.Second},
 		{"monitor.slow_query_min_duration", cfg.Monitor.SlowQueryMinDuration.D(), 5 * time.Second},
 		{"monitor.alerts.telegram", cfg.Monitor.Alerts.Telegram, false},
@@ -564,6 +567,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_SUBDOMAINS":                          "www, mail",
 		"CRAWLER_MONITOR_LISTEN":                      ":9199",
 		"CRAWLER_MONITOR_ZONE_STATS_INTERVAL":         "45s",
+		"CRAWLER_MONITOR_ALERTS_INTERVAL":             "75s",
 		"CRAWLER_MONITOR_SLOW_QUERY_INTERVAL":         "20s",
 		"CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION":     "7s",
 		"CRAWLER_MONITOR_INGEST_METRICS_URL":          "http://env-ingest:9101/metrics",
@@ -663,6 +667,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.9},
 		{"monitor.listen", cfg.Monitor.Listen, ":9199"},
 		{"monitor.zone_stats_interval", cfg.Monitor.ZoneStatsInterval.D(), 45 * time.Second},
+		{"monitor.alerts_interval", cfg.Monitor.AlertsInterval.D(), 75 * time.Second},
 		{"monitor.slow_query_interval", cfg.Monitor.SlowQueryInterval.D(), 20 * time.Second},
 		{"monitor.slow_query_min_duration", cfg.Monitor.SlowQueryMinDuration.D(), 7 * time.Second},
 		{"monitor.ingest_metrics_url", cfg.Monitor.IngestMetricsURL, "http://env-ingest:9101/metrics"},
@@ -1040,6 +1045,9 @@ func TestValidate(t *testing.T) {
 		{"zone_stats_interval 0", func(c *Config) { c.Monitor.ZoneStatsInterval = 0 }, "monitor.zone_stats_interval"},
 		{"zone_stats_interval меньше 30с", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(10 * time.Second) }, "monitor.zone_stats_interval"},
 		{"zone_stats_interval больше часа", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(2 * time.Hour) }, "monitor.zone_stats_interval"},
+		{"alerts_interval 0", func(c *Config) { c.Monitor.AlertsInterval = 0 }, "monitor.alerts_interval"},
+		{"alerts_interval меньше 30с", func(c *Config) { c.Monitor.AlertsInterval = Duration(10 * time.Second) }, "monitor.alerts_interval"},
+		{"alerts_interval больше часа", func(c *Config) { c.Monitor.AlertsInterval = Duration(2 * time.Hour) }, "monitor.alerts_interval"},
 		{"slow_query_interval меньше 5с", func(c *Config) { c.Monitor.SlowQueryInterval = Duration(2 * time.Second) }, "monitor.slow_query_interval"},
 		{"slow_query_interval больше 10м", func(c *Config) { c.Monitor.SlowQueryInterval = Duration(11 * time.Minute) }, "monitor.slow_query_interval"},
 		{"slow_query_min_duration меньше секунды", func(c *Config) {
@@ -1140,6 +1148,7 @@ func TestValidate(t *testing.T) {
 	c.Dashboard.Refresh = Duration(time.Second)              // нижняя граница периода снимков (ТЗД §8.3)
 	c.Scheduler.BacklogInterval = Duration(30 * time.Second) // нижняя граница периода backlog (T-161)
 	c.Monitor.ZoneStatsInterval = Duration(30 * time.Second) // нижняя граница коридора ТЗ 5.9
+	c.Monitor.AlertsInterval = Duration(30 * time.Second)    // нижняя граница коридора T-206 (по образцу zone_stats_interval)
 	c.Dashboard.StatusCacheTTL = Duration(5 * time.Minute)   // верхняя граница коридора T-161
 	c.HTTP.MemLimit = 0                                      // мягкий потолок кучи выключен — допустимо (T-163)
 	c.Render.QueueHighWatermark = 1                          // нижняя граница явного порога q:render (T-174)

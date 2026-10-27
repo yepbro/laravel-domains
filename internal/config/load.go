@@ -172,6 +172,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_SUBDOMAINS", setStrings(func(c *Config) *[]string { return &c.Subdomains })},
 		{"CRAWLER_MONITOR_LISTEN", setString(func(c *Config) *string { return &c.Monitor.Listen })},
 		{"CRAWLER_MONITOR_ZONE_STATS_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.ZoneStatsInterval })},
+		{"CRAWLER_MONITOR_ALERTS_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.AlertsInterval })},
 		// Пропущенное при T-173 отображение: переменная объявлена таблицей
 		// monitor в docs/configuration.md — docs и load.go расходились.
 		{"CRAWLER_MONITOR_LOAD_REPORT_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.LoadReportInterval })},
