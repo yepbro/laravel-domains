@@ -88,7 +88,7 @@
   `make test-integration` зелёный. ТЗ:
   [`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
 
-- **T-197** [новая] — P2, документация и testbed волны TLD-only:
+- **T-197** [в работе] — P2, документация и testbed волны TLD-only:
   docs/schema.md (§«Обработка имени» — зона TLD), docs/incoming-files.md
   (каталоги `incoming/<tld>/`, allowlist), docs/configuration.md и
   config.example.yaml (`allowed_zone_paths`, комментарии весов — TLD),
