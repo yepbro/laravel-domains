@@ -73,7 +73,7 @@
   работает, без allowlist — `failed/`; тесты ingest/config зелёные. ТЗ:
   [`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
 
-- **T-196** [в работе] — P1, `crawlerctl zones collapse` — перенос данных
+- **T-196** [сделана] — P1, `crawlerctl zones collapse` — перенос данных
   2LD→TLD: dry-run по умолчанию, `--apply`/`--skip-reconcile`/
   `--force`; по каждой зоне (§7 ТЗ): ensure TLD-зоны и партиций
   (`create_zone_partitions`), батчи `UPDATE` с row movement (domains с
