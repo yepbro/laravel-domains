@@ -319,7 +319,8 @@ func TestZonesCollapse(t *testing.T) {
 		if _, ok := collapseZoneID(t, pool, "co.uk"); ok {
 			t.Error("строка зоны co.uk не удалена")
 		}
-		if _, ok := collapseZoneID(t, pool, "uk"); !ok {
+		uk, hasUK := collapseZoneID(t, pool, "uk")
+		if !hasUK {
 			t.Error("зона uk не создана переносом")
 		}
 		if id, ok := collapseZoneID(t, pool, "crawl.test"); !ok || id != allow {
@@ -334,7 +335,7 @@ func TestZonesCollapse(t *testing.T) {
 			t.Errorf("доменов site<N>.5g в зоне in: %d, хочу 5", n)
 		}
 		if n = collapseCount(t, pool,
-			`SELECT count(*) FROM domains WHERE zone_id = $1 AND label LIKE 'shop%.co'`); n != 2 {
+			`SELECT count(*) FROM domains WHERE zone_id = $1 AND label LIKE 'shop%.co'`, uk); n != 2 {
 			t.Errorf("доменов shop<N>.co в зоне uk: %d, хочу 2", n)
 		}
 		if n = collapseCount(t, pool, `SELECT count(*) FROM domains WHERE zone_id = $1 AND label = 'native0'`, in); n != 1 {
@@ -466,6 +467,9 @@ func TestZonesCollapse_Resume(t *testing.T) {
 	twoLD := collapseSeedZone(t, pool, "5g.in")
 	ids := collapseSeedDomains(t, pool, twoLD, "site", 5, 0)
 	collapseSeedChildren(t, pool, twoLD, ids)
+	// Выделенные партиции 2LD-зоны: после сбоя они обязаны оставаться
+	// на месте (перос не завершён), повтор их дропнет.
+	callCreateZonePartitions(t, pool, twoLD, 2)
 
 	spec, err := collapse.SpecOf(collapse.ZoneRow{ID: twoLD, Name: "5g.in"})
 	if err != nil {
@@ -474,10 +478,13 @@ func TestZonesCollapse_Resume(t *testing.T) {
 
 	// Соединение, BEGIN которого падает после первого батча: первый
 	// батч фиксируется, второй обрывается — половинчатый перенос.
+	// Release сразу через defer: незакрытое соединение вешает
+	// pool.Close() очистки теста при любом отказе ниже.
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
+	defer conn.Release()
 	flaky := &collapseFlakyConn{Conn: conn, allowBegin: 1}
 	if _, err := collapse.Zone(ctx, flaky, spec, 2); err == nil {
 		t.Fatal("имитация сбоя не сработала")
@@ -498,7 +505,6 @@ func TestZonesCollapse_Resume(t *testing.T) {
 	if !collapseHasZonePartition(t, pool, "domains", twoLD) {
 		t.Fatal("партиции 2LD дропнуты до завершения переноса")
 	}
-	conn.Release()
 
 	// Повтор тем же кодом (Run): инвентаризация видит зону, moving_ids
 	// пересобирается по остатку, окна идут по оставшимся id.

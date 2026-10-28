@@ -555,19 +555,8 @@ func moveBatch(ctx context.Context, conn Conn, spec Spec, tid int16, lo, hi int6
 func dropZonePartitions(ctx context.Context, conn db.DB, spec Spec) ([]string, error) {
 	what := fmt.Sprintf("зона %s: партиции: ", spec.Name)
 
-	lrows, err := conn.Query(ctx, ZoneLeftSQL, spec.ID)
+	left, err := zoneLeft(ctx, conn, spec.ID)
 	if err != nil {
-		return nil, fmt.Errorf("%sостаток: %w", what, err)
-	}
-	defer lrows.Close()
-	if !lrows.Next() {
-		return nil, fmt.Errorf("%sостаток: пустой ответ агрегата", what)
-	}
-	var left [6]int64
-	if err := lrows.Scan(&left[0], &left[1], &left[2], &left[3], &left[4], &left[5]); err != nil {
-		return nil, fmt.Errorf("%sостаток: чтение: %w", what, err)
-	}
-	if err := lrows.Err(); err != nil {
 		return nil, fmt.Errorf("%sостаток: %w", what, err)
 	}
 	tables := []string{"domains", "subdomain_results", "laravel_domains", "laravel_findings", "laravel_history", "ingest_files"}
@@ -600,6 +589,25 @@ func dropZonePartitions(ctx context.Context, conn db.DB, spec Spec) ([]string, e
 		}
 	}
 	return parts, nil
+}
+
+// zoneLeft — строка остатка ZoneLeftSQL. Чтение вынесено в хелпер:
+// однострочный агрегат обязан быть потреблён и закрыт (defer на выходе)
+// до следующего запроса — соединение переноса одно (temp-таблица
+// §7.3), открытый портал держит его занятым (conn busy).
+func zoneLeft(ctx context.Context, conn db.DB, zoneID int16) (left [6]int64, err error) {
+	rows, err := conn.Query(ctx, ZoneLeftSQL, zoneID)
+	if err != nil {
+		return left, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return left, errors.New("пустой ответ агрегата")
+	}
+	if err := rows.Scan(&left[0], &left[1], &left[2], &left[3], &left[4], &left[5]); err != nil {
+		return left, fmt.Errorf("чтение: %w", err)
+	}
+	return left, rows.Err()
 }
 
 // Orphans — счётчики сиротских zone_id пост-проверки §7.5 (ссылки на
@@ -733,7 +741,8 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 		if !opts.Apply {
 			out(stdout, "дренируйте очереди перед переносом (runbook ТЗТ §8.2) или повторите с --force\n")
 		} else if !opts.Force {
-			return fmt.Errorf("в затрагиваемых зонах есть домены в очереди (check_state = 1); дренируйте очереди (runbook ТЗТ §8.2) или повторите с --force")
+			return fmt.Errorf("в затрагиваемых зонах есть домены в очереди (check_state = 1): %s; дренируйте очереди (runbook ТЗТ §8.2) или повторите с --force",
+				strings.Join(parts, ", "))
 		} else {
 			out(stdout, "продолжение по --force (после разбора очередей оператором, runbook ТЗТ §8.2)\n")
 		}
