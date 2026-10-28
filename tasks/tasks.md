@@ -60,7 +60,7 @@
   `make lint` зелёные. ТЗ:
   [`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
 
-- **T-195** [в работе] — P1, `internal/ingest` + `internal/config`:
+- **T-195** [сделана] — P1, `internal/ingest` + `internal/config`:
   каталоги зон только TLD + allowlist: `incoming/<tld>/add|delete/` —
   рабочий путь (полный дамп `.in` одним файлом); многоуровневый каталог
   — ошибка уровня файла (`failed/`, T-021), кроме нового
