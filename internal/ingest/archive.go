@@ -470,10 +470,11 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 			// Валидатор члена: адресация отклонений «архив!член» (T-133),
 			// зона — каталога архива (внутренний путь на зону не влияет).
 			v, verr := NewValidator(ValidatorOptions{
-				File:          f.Path + "!" + m.name,
-				Zone:          f.Zone,
-				MaxErrorRatio: p.opts.MaxErrorRatio,
-				RejectLog:     p.opts.RejectLog,
+				File:             f.Path + "!" + m.name,
+				Zone:             f.Zone,
+				AllowedZonePaths: p.opts.AllowedZonePaths,
+				MaxErrorRatio:    p.opts.MaxErrorRatio,
+				RejectLog:        p.opts.RejectLog,
 			})
 			if verr != nil {
 				if m.closer != nil {

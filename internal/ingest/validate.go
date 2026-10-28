@@ -10,11 +10,19 @@
 // роняет только доля ошибок выше ingest.max_error_ratio.
 //
 // Зона-less файл (add|delete/<файл>): зона каждой строки выводится
-// из самого имени — publicsuffix-зона нормализованного результата
-// (idn.Result.Zone, ТЗ 5.2 п. 5); сверки с зоной пути нет (её не задано),
+// из самого имени — TLD нормализованного результата (idn.Result.Zone —
+// последняя метка имени); сверки с зоной пути нет (её не задано),
 // wrong_zone невозможна, зоны в одном файле смешиваются. Числовые
 // суффиксы (даты выгрузок, IPv4-литералы) зоной не становятся —
 // отклонение numeric_zone (idn.ErrNumericZone).
+//
+// Каталоги зон — TLD (incoming/<tld>/add|delete/, ТЗТ tld-only-zones
+// §5.1): полный дамп TLD принимается целиком (example.5g.in в
+// incoming/in/ — валидная строка с составной меткой example.5g).
+// Многоуровневый каталог (зона с точкой) допустим только из allowlist
+// ingest.allowed_zone_paths (тестовые зоны вроде crawl.test): вне
+// списка NewValidator отвечает ошибкой уровня файла — конвейер
+// переносит файл в failed/, строки не разбираются (T-021).
 //
 // T-132 (этап 16, расширение ТЗ 5.1): перед валидацией стоит шаг
 // извлечения (extract.go) — строка с разделителями (пробел, запятая,
@@ -29,6 +37,7 @@
 package ingest
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -99,8 +108,8 @@ func (r Reason) String() string {
 // IsIDN — бит is_idn в domains.flags (model.FlagIDN).
 type Entry struct {
 	// Zone — зона строки в ASCII-форме: зона пути (общая для всех строк
-	// зона-каталога) либо — у зона-less файла — зона, выведенная из
-	// самого имени по списку publicsuffix (ТЗ 5.2 п. 5).
+	// зона-каталога) либо — у зона-less файла — TLD, выведенная из
+	// самого имени (idn.Result.Zone — последняя метка, ТЗТ §5.1).
 	Zone string
 	// Label — метка домена: имя без зоны; может быть составной
 	// («магазин.рф.co.uk» в зоне co.uk — контракт internal/idn,
@@ -118,8 +127,17 @@ type ValidatorOptions struct {
 	// Уже нормализована в ASCII (T-014); unicode-форма или верхний
 	// регистр не ошибочны — нормализуется ещё раз (идемпотентно).
 	// Пустая строка — зона-less файл (add|delete/<файл>): зоны строк
-	// выводятся из имён, сверки с зоной пути нет.
+	// выводятся из имён, сверки с зоной пути нет. Многоуровневое имя
+	// (с точкой) допустимо только из AllowedZonePaths — иначе ошибка
+	// уровня файла (ТЗТ §5.1).
 	Zone string
+	// AllowedZonePaths — многоуровневые зоны, которым разрешено быть
+	// каталогом файла (ingest.allowed_zone_paths, ТЗТ §5.1; ТЗТ §6.1):
+	// тестовые зоны testbed вроде crawl.test. nil/пусто — рабочие
+	// каталоги только TLD. Записи сравниваются с нормализованной зоной
+	// пути; сами нормализуются в checkZonePath идемпотентно (как зона),
+	// мусорная запись просто не совпадает.
+	AllowedZonePaths []string
 	// MaxErrorRatio — порог доли отклонённых строк: при превышении файл
 	// целиком считается ошибочным (ingest.max_error_ratio). 0 — дефолт
 	// DefaultMaxErrorRatio; допустимо (0, 1], как и в config.Validate.
@@ -142,11 +160,41 @@ type Validator struct {
 	reasons  map[Reason]int
 }
 
+// errZoneNotAllowed — зона каталога многоуровневая и не входит в allowlist
+// ingest.allowed_zone_paths (ТЗТ §5.1): ошибка уровня файла — конвейер
+// переносит файл в failed/ с причиной, строки не разбираются (T-021);
+// идентифицируется errors.Is (стиль errArchiveRejected).
+var errZoneNotAllowed = errors.New("многоуровневая зона каталога вне ingest.allowed_zone_paths")
+
+// checkZonePath проверяет зону каталога файла после нормализации
+// (ТЗТ §5.1): рабочие каталоги — TLD (имя без точек), многоуровневое
+// имя — только из allowlist. Записи allowlist нормализуются здесь же
+// идемпотентно (значение из конфига уже канонично — повторный вызов
+// ничего не меняет; прямой вызов с «Crawl.Test» тоже сработает),
+// не-имя зоны не совпадает ни с чем и остаётся для config.Validate.
+// Возвращает errZoneNotAllowed, обёрнутый в контекст зоны, для
+// запрещённой зоны; nil — для TLD и allowlisted.
+func checkZonePath(zone string, allowed []string) error {
+	if !strings.Contains(zone, ".") {
+		return nil // TLD — рабочий путь (incoming/<tld>/add|delete/)
+	}
+	for _, a := range allowed {
+		if a == zone {
+			return nil
+		}
+		if na, err := idn.NormalizeZone(a); err == nil && na == zone {
+			return nil
+		}
+	}
+	return fmt.Errorf("зона %s: %w", zone, errZoneNotAllowed)
+}
+
 // NewValidator подготавливает валидацию файла: зона нормализуется тем же
 // конвейером, что и строки (ТЗ 5.2 п. 6: «зона тоже нормализуется тем же
 // способом»), поэтому каталог зоны в unicode и punycode даёт одну зону.
 // Пустая зона — зона-less файл: сверка зоны не выполняется, зона каждой
-// строки выводится из имени (idn.Result.Zone).
+// строки выводится из имени (idn.Result.Zone). Многоуровневая зона вне
+// allowlist — ошибка уровня файла (errZoneNotAllowed, ТЗТ §5.1).
 func NewValidator(opts ValidatorOptions) (*Validator, error) {
 	zone := ""
 	if opts.Zone != "" {
@@ -154,6 +202,9 @@ func NewValidator(opts ValidatorOptions) (*Validator, error) {
 		zone, err = idn.NormalizeZone(opts.Zone)
 		if err != nil {
 			return nil, fmt.Errorf("ingest: зона файла %s: %w", opts.File, err)
+		}
+		if err := checkZonePath(zone, opts.AllowedZonePaths); err != nil {
+			return nil, fmt.Errorf("ingest: файл %s: %w", opts.File, err)
 		}
 	}
 	ratio := opts.MaxErrorRatio
@@ -213,7 +264,7 @@ func (v *Validator) Line(n int, line string) (Entry, Reason, bool) {
 // общий путь прежней проверки одиночной строки и кандидатов извлечения
 // (T-132). Счётчики и лог rejected — на вызывающей стороне (Line).
 // Зона-less файл (zone == ""): зона и метка берутся из нормализованного
-// имени напрямую (publicsuffix-отделение, ТЗ 5.2 п. 5) — сверять не с чем.
+// имени напрямую (зона — TLD, последняя метка) — сверять не с чем.
 func checkName(name, zone string) (Entry, Reason, bool) {
 	res, err := idn.Normalize(name)
 	if err != nil {
@@ -234,31 +285,36 @@ func checkName(name, zone string) (Entry, Reason, bool) {
 }
 
 // domainLabel выделяет метку домена зоны пути из нормализованного имени
-// (ТЗ 5.2 пп. 5–6) и возвращает пустую причину, если имя — полное имя
-// домена из зоны zone, либо причину отклонения.
+// (ТЗ 5.2 пп. 5–6; ТЗТ §5.2) и возвращает пустую причину, если имя —
+// полное имя домена из зоны zone, либо причину отклонения. Три ветки:
 //
-// Зона пути задаётся каталогом файла явно, поэтому сравнивается не только
-// с публичным суффиксом имени (res.Zone — способ отделения зоны по списку
-// publicsuffix, ТЗ 5.2 п. 5: составные зоны и частные суффиксы не режутся
-// по последней точке), но и с более глубокой зоной, которой в списке нет
-// (тестовые зоны вроде crawl.test, T-014: у example.crawl.test суффикс
-// по списку — test, а зона пути — crawl.test). Обратный случай — суффикс
-// глубже зоны пути (example.co.uk при зоне uk): домен зарегистрирован во
-// вложенной публичной зоне, простое разбиение по точке запрещено п. 5 —
-// отклонение.
+//  1. res.Zone == zone — путь — TLD имени: label res.Label уже отделён
+//     по последней метке (idn, TLD-only); составной label — норма
+//     (example.5g.in в каталоге in → example.5g, бывший wrong_zone).
+//  2. res.ASCII == zone — само имя совпадает с зоной пути: метки перед
+//     зоной нет (ReasonNoLabel; для TLD-путей это раньше ловит
+//     idn.Normalize — ветка-страховка).
+//  3. имя оканчивается на «.zone», а зона пути — на «.»+TLD имени:
+//     путь глубже TLD — allowlisted тестовая зона (example.crawl.test в
+//     каталоге crawl.test → label example). Иначе — ReasonWrongZone
+//     (домен зарегистрирован в другой зоне, путь не его).
+//
+// Код веток не менялся (ТЗТ §5.2): gate многоуровневых путей стоит
+// раньше — в NewValidator (checkZonePath, allowlist).
 func domainLabel(res idn.Result, zone string) (string, Reason) {
 	if res.Zone == zone {
-		// res.Label уже отделён по publicsuffix; составные метки
-		// допустимы — контракт internal/idn (корпус T-010).
+		// res.Label отделён по последней метке (TLD-only); составные
+		// метки допустимы — контракт internal/idn (корпус T-010).
 		return res.Label, ""
 	}
-	// Само имя зоны: метки перед зоной пути нет (для PSL-зон это
-	// раньше ловит idn.Normalize как ErrNoLabel — здесь не-PSL зоны).
+	// Само имя зоны: метки перед зоной пути нет (для TLD-путей это
+	// раньше ловит idn.Normalize как ErrNoLabel — здесь allowlisted
+	// многоуровневые зоны).
 	if res.ASCII == zone {
 		return "", ReasonNoLabel
 	}
-	// Имя обязано оканчиваться на зону пути, а зона пути — быть не
-	// мельче публичного суффикса имени (см. комментарий функции).
+	// Имя обязано оканчиваться на зону пути, а зона пути — на TLD имени
+	// (путь не мельче TLD — иначе домен чужой зоны).
 	suffix := "." + zone
 	if !strings.HasSuffix(res.ASCII, suffix) || !strings.HasSuffix(zone, "."+res.Zone) {
 		return "", ReasonWrongZone

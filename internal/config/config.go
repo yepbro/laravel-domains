@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"crawler/internal/idn"
 )
 
 // maxSubdomains — предел числа субдоменов: битовая маска dns_mask
@@ -147,6 +149,15 @@ type Ingest struct {
 	// предел расходов), для tar — по потоку. Расширение к минимальному
 	// составу ТЗ 5.10.
 	ArchiveMaxFiles int `yaml:"archive_max_files"`
+	// AllowedZonePaths — allowlist многоуровневых зон каталогов приёма
+	// (ТЗТ tld-only-zones §5.1, §6.1): рабочие каталоги incoming/ —
+	// только TLD (<tld>/add|delete/), зона с точкой в имени каталога —
+	// ошибочна (файл в failed/), кроме перечисленных здесь (тестовые
+	// зоны testbed вроде crawl.test, которым TLD-семантика запрещает
+	// быть «зоной пути»). Записи — нормализованные имена зон (punycode,
+	// нижний регистр, минимум одна точка); нормализация и дедуп — при
+	// загрузке, форму — Validate. Продуктовое значение — пусто.
+	AllowedZonePaths []string `yaml:"allowed_zone_paths"`
 }
 
 // Scheduler — планировщик проверок (ТЗ 5.3).
@@ -954,6 +965,28 @@ func (c *Config) normalize() {
 	for i, s := range c.Render.RequeueDeprioritizedZones {
 		c.Render.RequeueDeprioritizedZones[i] = strings.ToLower(strings.TrimSpace(s))
 	}
+	// Allowlist каталогов зон (ТЗТ §6.1) — та же каноничная форма, что у
+	// зон справочника: NormalizeZone ведёт к punycode нижнему регистру
+	// (idn.NormalizeZone, как каталоги приёма в ParsePath). Запись-мусор
+	// не нормализуется и остаётся как есть — её отловит Validate с
+	// исходным значением в сообщении. Дубли после приведения
+	// схлопываются (стиль ключей весов зон): перечень — множество имён,
+	// порядок первого вхождения сохраняется.
+	if len(c.Ingest.AllowedZonePaths) > 0 {
+		seen := make(map[string]bool, len(c.Ingest.AllowedZonePaths))
+		out := make([]string, 0, len(c.Ingest.AllowedZonePaths))
+		for _, z := range c.Ingest.AllowedZonePaths {
+			if nz, err := idn.NormalizeZone(z); err == nil {
+				z = nz
+			}
+			if seen[z] {
+				continue
+			}
+			seen[z] = true
+			out = append(out, z)
+		}
+		c.Ingest.AllowedZonePaths = out
+	}
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
 	// Ключи весов зон — punycode-имена в нижнем регистре (как zones.name);
 	// карта пересобирается в порядке возрастания ключей, чтобы столкновение
@@ -993,12 +1026,16 @@ func (c *Config) normalize() {
 
 var subdomainLabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
-// zoneNameRe — ключ scheduler.zone_weights: имя зоны в punycode нижним
-// регистром, как хранит справочник zones (ingest нормализует через
-// idn.NormalizeZone, ТЗ 5.2): DNS-метки через точку, составные зоны
-// (co.uk) и IDN-зоны (xn--p1ai) допустимы, unicode-форма — нет (её
-// справочник не содержит, ключ никогда бы не сработал). Полная длина
-// отдельно — ≤ 253 октет (ТЗ 5.2 п. 4).
+// zoneNameRe — имя зоны в punycode нижним регистром, как хранит
+// справочник zones (ingest нормализует через idn.NormalizeZone, ТЗ 5.2):
+// DNS-метки через точку, IDN-зоны (xn--p1ai) допустимы, unicode-форма —
+// нет (её справочник не содержит, ключ никогда бы не сработал). Regex
+// применяют только валидации ключей scheduler.zone_weights и
+// render.requeue_deprioritized_zones (ключи — TLD, ТЗТ §6.2); точки в
+// шаблоне оставлены сознательно — не менять (ТЗТ §6.2): allowlist
+// ingest.allowed_zone_paths этим regex не валидируется вовсе (его
+// собственная проверка — idn.NormalizeZone + минимум одна точка, ТЗТ
+// §6.1). Полная длина отдельно — ≤ 253 октет (ТЗ 5.2 п. 4).
 var zoneNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
 
 // Validate проверяет значения конфигурации и возвращает ошибку со списком
@@ -1088,6 +1125,24 @@ func (c *Config) Validate() error {
 	if !inRange(c.Ingest.ArchiveMaxFiles, 1, 1000000) {
 		problems = append(problems, rangeMsg("ingest.archive_max_files", c.Ingest.ArchiveMaxFiles, 1, 1000000))
 	}
+	// Allowlist каталогов зон (ТЗТ §6.1): каждая запись — валидное имя зоны
+	// (NormalizeZone, тот же конвейер, что каталоги приёма) с минимум
+	// одной точкой: TLD-зоне в allowlist делать нечего — её каталог и так
+	// рабочий. Нормализация и дедуп уже прошли при загрузке; мусор
+	// нормализация пропускает — здесь он отлавливается с исходным
+	// значением в сообщении.
+	for _, z := range c.Ingest.AllowedZonePaths {
+		nz, err := idn.NormalizeZone(z)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf(
+				"ingest.allowed_zone_paths: %q — не имя зоны (%v); ожидается многоуровневое имя зоны в punycode нижним регистром, минимум одна точка — например crawl.test", z, err))
+			continue
+		}
+		if !strings.Contains(nz, ".") {
+			problems = append(problems, fmt.Sprintf(
+				"ingest.allowed_zone_paths: %q — TLD-зоне в allowlist делать нечего (её каталог уже рабочий); ожидается многоуровневое имя с точкой — например crawl.test", z))
+		}
+	}
 
 	// scheduler
 	if c.Scheduler.RecheckInterval <= 0 {
@@ -1137,7 +1192,7 @@ func (c *Config) Validate() error {
 	for _, name := range sortedKeys(c.Scheduler.ZoneWeights) {
 		if name == "" || len(name) > 253 || !zoneNameRe.MatchString(name) {
 			problems = append(problems, fmt.Sprintf(
-				"scheduler.zone_weights: %q — ожидается имя зоны в punycode нижним регистром, как в справочнике zones (составные — co.uk, IDN — xn--p1ai)", name))
+				"scheduler.zone_weights: %q — ожидается имя зоны — TLD в punycode нижним регистром, как в справочнике zones (in, uk; IDN — xn--p1ai)", name))
 			continue
 		}
 		if w := c.Scheduler.ZoneWeights[name]; !inRange(w, 1, 1000) {
@@ -1330,7 +1385,7 @@ func (c *Config) Validate() error {
 	for _, name := range c.Render.RequeueDeprioritizedZones {
 		if name == "" || len(name) > 253 || !zoneNameRe.MatchString(name) {
 			problems = append(problems, fmt.Sprintf(
-				"render.requeue_deprioritized_zones: %q — ожидается имя зоны в punycode нижним регистром, как в справочнике zones (составные — co.uk, IDN — xn--p1ai)", name))
+				"render.requeue_deprioritized_zones: %q — ожидается имя зоны — TLD в punycode нижним регистром, как в справочнике zones (in, uk; IDN — xn--p1ai)", name))
 			continue
 		}
 		if seenDepr[name] {

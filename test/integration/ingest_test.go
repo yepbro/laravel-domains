@@ -56,6 +56,10 @@ func newIngestEnv(t *testing.T) *ingestEnv {
 			// Маленькая пачка COPY: файл из десятков строк грузится
 			// несколькими пачками, как большие файлы в проде.
 			BatchSize: 4,
+			// Тестовые зоны — многоуровневые (crawl.test, проверка.test
+			// в acceptance): каталоги приёма допустимы через allowlist
+			// (ТЗТ tld-only-zones §5.1), как конфиг testbed в проде.
+			AllowedZonePaths: []string{"crawl.test", accIDNZone},
 		},
 	)
 	if err != nil {

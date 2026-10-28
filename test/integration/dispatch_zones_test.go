@@ -85,7 +85,7 @@ func TestScheduler_DispatchOnlyZonesWithWork(t *testing.T) {
 		ingest.NewZoneStore(pool),
 		ingest.NewFileStore(pool),
 		pool,
-		ingest.PipelineOptions{Dir: dir, BatchSize: 4},
+		ingest.PipelineOptions{Dir: dir, BatchSize: 4, AllowedZonePaths: []string{"fresh.test"}},
 	)
 	if err != nil {
 		t.Fatalf("ingest.NewPipeline: %v", err)

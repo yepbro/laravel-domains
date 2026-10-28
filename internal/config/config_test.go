@@ -158,6 +158,9 @@ func TestDefault(t *testing.T) {
 	if len(c.Render.RequeueDeprioritizedZones) != 0 {
 		t.Errorf("render.requeue_deprioritized_zones: по умолчанию пуст (приоритет зон не задан, T-184), получено %v", c.Render.RequeueDeprioritizedZones)
 	}
+	if len(c.Ingest.AllowedZonePaths) != 0 {
+		t.Errorf("ingest.allowed_zone_paths: по умолчанию пуст (рабочие каталоги только TLD, ТЗТ §6.1), получено %v", c.Ingest.AllowedZonePaths)
+	}
 
 	// Все значения по умолчанию проходят валидацию после задания dsn.
 	c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
@@ -188,6 +191,9 @@ ingest:
   max_error_ratio: 0.05
   archive_max_uncompressed: "2GiB"
   archive_max_files: 500
+  allowed_zone_paths:
+    - "crawl.test"
+    - " CRAWL.TEST "
 scheduler:
   recheck_interval: "8760h"
   batch_size: 2000
@@ -395,6 +401,11 @@ log:
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 3 || w["com"] != 5 || w["co.uk"] != 3 || w["xn--p1ai"] != 2 {
 		t.Errorf("scheduler.zone_weights: ожидается map[com:5 co.uk:3 xn--p1ai:2], получено %v", w)
 	}
+	// Allowlist каталогов зон (ТЗТ §6.1): дубли после приведения
+	// схлопываются при загрузке.
+	if a := cfg.Ingest.AllowedZonePaths; strings.Join(a, ",") != "crawl.test" {
+		t.Errorf("ingest.allowed_zone_paths: ожидается [crawl.test] после дедупа, получено %v", a)
+	}
 	// Приоритет зон прохода доработки рендера (T-184): список как есть.
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
 		t.Errorf("render.requeue_deprioritized_zones: ожидается [xn--p1ai net], получено %v", z)
@@ -458,6 +469,84 @@ func TestLoadYAMLErrors(t *testing.T) {
 	}
 }
 
+// TestAllowedZonePaths — allowlist многоуровневых каталогов зон приёма
+// (ТЗТ §6.1): записи нормализуются при загрузке (punycode, нижний
+// регистр — idn.NormalizeZone, как каталоги приёма), дубли после
+// приведения схлопываются; TLD-зона и не-имя зоны — ошибки валидации,
+// сообщение указывает пример crawl.test.
+func TestAllowedZonePaths(t *testing.T) {
+	t.Run("нормализация и дедуп при загрузке", func(t *testing.T) {
+		cfg := mustLoad(t, `
+postgres:
+  dsn: "postgres://u:p@127.0.0.1:5432/crawler"
+ingest:
+  allowed_zone_paths:
+    - "crawl.test"
+    - " CRAWL.TEST "
+    - "магазин.рф.co.uk"
+    - "a.b.c"
+`, nil)
+		want := []string{"crawl.test", "xn--80aairftm.xn--p1ai.co.uk", "a.b.c"}
+		if got := cfg.Ingest.AllowedZonePaths; strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("allowed_zone_paths = %v, want %v", got, want)
+		}
+	})
+	tests := []struct {
+		name    string
+		path    string
+		wantMsg string
+	}{
+		{"TLD-зона", "com", "TLD-зоне в allowlist делать нечего"},
+		{"не имя зоны", "под_чёртка.test", "не имя зоны"},
+		{"пустая запись", "\" \"", "не имя зоны"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			yaml := "postgres:\n  dsn: \"postgres://u:p@127.0.0.1:5432/crawler\"\ningest:\n  allowed_zone_paths:\n    - " + tt.path + "\n"
+			_, err := loadFrom(t, yaml, nil)
+			if err == nil {
+				t.Fatalf("запись %s: ожидается ошибка валидации", tt.path)
+			}
+			for _, want := range []string{"ingest.allowed_zone_paths", "crawl.test", tt.wantMsg} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("ошибка %q не содержит %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestZoneNameErrorTexts — тексты валидации имён зон-ключей (ТЗТ §6.2):
+// ключи zone_weights/requeue — TLD; упоминания составных зон («составные
+// — co.uk») убраны — откат к старым формулировкам тест ловит.
+func TestZoneNameErrorTexts(t *testing.T) {
+	cfg := Default()
+	cfg.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
+	// Unicode-имя не проходит punycode-форму ключей (обе валидации).
+	cfg.Scheduler.ZoneWeights = map[string]int{"рф": 1}
+	cfg.Render.RequeueDeprioritizedZones = []string{"рф"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("ожидается ошибка валидации имён зон")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"scheduler.zone_weights",
+		"render.requeue_deprioritized_zones",
+		"TLD в punycode нижним регистром",
+		"in, uk; IDN — xn--p1ai",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("текст валидации не содержит %q:\n%s", want, msg)
+		}
+	}
+	for _, banned := range []string{"co.uk", "составные"} {
+		if strings.Contains(msg, banned) {
+			t.Errorf("текст валидации упоминает составные зоны (%q) — убраны ТЗТ §6.2:\n%s", banned, msg)
+		}
+	}
+}
+
 func TestParseSizeForms(t *testing.T) {
 	tests := []struct {
 		in   string
@@ -512,6 +601,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_INGEST_MAX_ERROR_RATIO":              "0.25",
 		"CRAWLER_INGEST_ARCHIVE_MAX_UNCOMPRESSED":     "4GiB",
 		"CRAWLER_INGEST_ARCHIVE_MAX_FILES":            "77",
+		"CRAWLER_INGEST_ALLOWED_ZONE_PATHS":           "crawl.test, co.test",
 		"CRAWLER_SCHEDULER_RECHECK_INTERVAL":          "2190h",
 		"CRAWLER_SCHEDULER_BACKLOG_INTERVAL":          "75s",
 		"CRAWLER_SCHEDULER_BATCH_SIZE":                "7777",
@@ -709,6 +799,11 @@ func TestEnvOverrides(t *testing.T) {
 	// запятую, имена приводятся к нижнему регистру, значение заменяет YAML.
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,org" {
 		t.Errorf("render.requeue_deprioritized_zones: ожидается [xn--p1ai org], получено %v", z)
+	}
+	// Allowlist каталогов зон из env (ТЗТ §6.1): список через запятую,
+	// значение заменяет YAML (стиль имён зон).
+	if a := cfg.Ingest.AllowedZonePaths; strings.Join(a, ",") != "crawl.test,co.test" {
+		t.Errorf("ingest.allowed_zone_paths: ожидается [crawl.test co.test], получено %v", a)
 	}
 	// Карта override-лимитов per-IP из env (T-165): CIDR нормализуется
 	// маскированием, значение целиком заменяет карту из YAML.
@@ -944,6 +1039,8 @@ func TestValidate(t *testing.T) {
 		{"archive_max_uncompressed велик", func(c *Config) { c.Ingest.ArchiveMaxUncompressed = ByteSize(2 << 40) }, "ingest.archive_max_uncompressed"},
 		{"archive_max_files 0", func(c *Config) { c.Ingest.ArchiveMaxFiles = 0 }, "ingest.archive_max_files"},
 		{"archive_max_files велик", func(c *Config) { c.Ingest.ArchiveMaxFiles = 1000001 }, "ingest.archive_max_files"},
+		{"allowed_zone_path без точки", func(c *Config) { c.Ingest.AllowedZonePaths = []string{"com"} }, "ingest.allowed_zone_paths"},
+		{"allowed_zone_path не-зона", func(c *Config) { c.Ingest.AllowedZonePaths = []string{"под_чёртка.test"} }, "ingest.allowed_zone_paths"},
 		{"recheck_interval 0", func(c *Config) { c.Scheduler.RecheckInterval = 0 }, "scheduler.recheck_interval"},
 		{"backlog_interval 0", func(c *Config) { c.Scheduler.BacklogInterval = 0 }, "scheduler.backlog_interval"},
 		{"backlog_interval меньше 30с", func(c *Config) { c.Scheduler.BacklogInterval = Duration(10 * time.Second) }, "scheduler.backlog_interval"},

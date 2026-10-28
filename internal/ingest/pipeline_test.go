@@ -1110,6 +1110,84 @@ func TestPipelineBadZoneDir(t *testing.T) {
 	}
 }
 
+// TestPipelineZonePathAllowlist — многоуровневый каталог зоны
+// (incoming/<зона с точкой>/) вне allowlist ingest.allowed_zone_paths —
+// ошибка уровня файла (ТЗТ §5.1): файл в failed/ с причиной, строки не
+// разбираются, зона не создаётся; зона из allowlist (crawl.test в
+// testbed) обрабатывается штатно по ветке 3 domainLabel (ТЗТ §5.2).
+func TestPipelineZonePathAllowlist(t *testing.T) {
+	t.Run("вне allowlist — failed", func(t *testing.T) {
+		pt := newPipeTest(t)
+		abs := pt.addFile(t, "crawl.test/add/list.txt", "example.crawl.test\n")
+
+		out, err := pt.pipe.Process(context.Background(), abs)
+		if err != nil {
+			t.Fatalf("Process: %v (ошибочный файл — не ошибка сервиса)", err)
+		}
+		if out.Kind != OutcomeFailed {
+			t.Fatalf("итог = %s, want failed", out.Kind)
+		}
+		if !errors.Is(out.Err, errZoneNotAllowed) {
+			t.Errorf("причина = %v, want errZoneNotAllowed", out.Err)
+		}
+		// Строки не разбираются, зона не создаётся, партия не грузится.
+		if len(pt.pool.ops) != 0 || len(pt.files.records) != 0 || len(pt.zones.calls) != 0 {
+			t.Errorf("при запрете зоны обращений к БД быть не должно: ops=%v records=%d zones=%v",
+				pt.pool.ops, len(pt.files.records), pt.zones.calls)
+		}
+		failed := filepath.Join(pt.dir, DirFailed, "crawl.test/add/list.txt")
+		if !exists(t, failed) {
+			t.Fatalf("файл не перемещён в %s", failed)
+		}
+		if report := readFile(t, failed+".report"); !strings.Contains(report, "ingest.allowed_zone_paths") {
+			t.Errorf("лог-отчёт без причины allowlist:\n%s", report)
+		}
+	})
+	t.Run("allowlist — applied", func(t *testing.T) {
+		pt := newPipeTest(t)
+		pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+			Dir:              pt.dir,
+			BatchSize:        10,
+			AllowedZonePaths: []string{"crawl.test"},
+			Now:              func() time.Time { return pt.now },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		abs := pt.addFile(t, "crawl.test/add/list.txt", "example.crawl.test\n")
+
+		pt.pool.execs = []pipeExec{
+			{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
+			{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
+		}
+		pt.pool.inserted = 1
+		pt.pool.uniques = 1
+
+		out, err := pipe.Process(context.Background(), abs)
+		if err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		if out.Kind != OutcomeApplied {
+			t.Fatalf("итог = %s, want applied", out.Kind)
+		}
+		// Ветка 3 domainLabel (ТЗТ §5.2): example.crawl.test в каталоге
+		// crawl.test — метка example, зона пути crawl.test. Метка строки
+		// проверяется по партии staging (COPY: batch, zone, label, …).
+		if rep := out.Report; rep.Zone != "crawl.test" || rep.Added != 1 {
+			t.Errorf("отчёт = %+v, want зона crawl.test, added 1", rep)
+		}
+		if len(pt.pool.copyVals) != 1 {
+			t.Fatalf("строк в staging = %d, want 1", len(pt.pool.copyVals))
+		}
+		if label := pt.pool.copyVals[0][2].(string); label != "example" {
+			t.Errorf("метка строки = %q, want example (ветка 3 domainLabel)", label)
+		}
+		if !exists(t, filepath.Join(pt.dir, DirProcessed, "crawl.test/add/list.txt")) {
+			t.Error("файл не перемещён в processed/crawl.test/")
+		}
+	})
+}
+
 // TestPipelineFailFileOutsideIncoming — Process — публичный API: путь
 // вне incoming (rel с «..» после filepath.Rel, ParsePath его отвергает)
 // не должен выводить архив за пределы failed/ (ING-P3-1): назначение

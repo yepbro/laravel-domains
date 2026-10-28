@@ -5,21 +5,30 @@ package ingest
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
 )
 
 // newValidator — валидатор одного файла с логом rejected в буфер
-// (проверка записей) и заданным порогом доли ошибок.
+// (проверка записей) и заданным порогом доли ошибок. Многоуровневая
+// зона каталога автоматически попадает в allowlist (ТЗТ §5.1): эти
+// тесты проверяют семантику domainLabel; gate allowlist — отдельно в
+// TestNewValidator.
 func newValidator(t *testing.T, zone string, ratio float64) (*Validator, *bytes.Buffer) {
 	t.Helper()
+	var allowed []string
+	if strings.Contains(zone, ".") {
+		allowed = []string{zone}
+	}
 	var buf bytes.Buffer
 	v, err := NewValidator(ValidatorOptions{
-		File:          "incoming/example.com/add/list.txt",
-		Zone:          zone,
-		MaxErrorRatio: ratio,
-		RejectLog:     NewRejectedLogger(&buf, slog.LevelInfo),
+		File:             "incoming/example.com/add/list.txt",
+		Zone:             zone,
+		AllowedZonePaths: allowed,
+		MaxErrorRatio:    ratio,
+		RejectLog:        NewRejectedLogger(&buf, slog.LevelInfo),
 	})
 	if err != nil {
 		t.Fatalf("NewValidator: %v", err)
@@ -241,6 +250,53 @@ func TestNewValidator(t *testing.T) {
 	t.Run("кривая зона каталога", func(t *testing.T) {
 		if _, err := NewValidator(ValidatorOptions{Zone: "под_чёркивание.рф"}); err == nil {
 			t.Error("невалидная зона должна давать ошибку")
+		}
+	})
+	// Gate многоуровневых каталогов (ТЗТ §5.1): рабочие каталоги — TLD,
+	// зона с точкой — только из allowlist; ошибка уровня файла
+	// идентифицируется errors.Is (конвейер → failed/, T-021).
+	t.Run("многоуровневая зона без allowlist", func(t *testing.T) {
+		for _, zone := range []string{"co.uk", "crawl.test", "a.b.c"} {
+			_, err := NewValidator(ValidatorOptions{Zone: zone})
+			if !errors.Is(err, errZoneNotAllowed) {
+				t.Errorf("зона %s без allowlist: ожидается errZoneNotAllowed, получено %v", zone, err)
+			}
+		}
+	})
+	t.Run("многоуровневая зона из allowlist", func(t *testing.T) {
+		v, err := NewValidator(ValidatorOptions{
+			Zone:             "Crawl.Test",
+			AllowedZonePaths: []string{"crawl.test", "co.uk"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.zone != "crawl.test" {
+			t.Errorf("зона = %q, want crawl.test", v.zone)
+		}
+	})
+	t.Run("allowlist-запись в верхнем регистре", func(t *testing.T) {
+		// Нормализация записи внутри checkZonePath: прямые вызовы с
+		// ненормализованным списком тоже работают (конфиг канонизирует
+		// записи при загрузке — здесь эта страховка).
+		v, err := NewValidator(ValidatorOptions{
+			Zone:             "crawl.test",
+			AllowedZonePaths: []string{"Crawl.Test"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.zone != "crawl.test" {
+			t.Errorf("зона = %q, want crawl.test", v.zone)
+		}
+	})
+	t.Run("чужая многоуровневая зона при непустом allowlist", func(t *testing.T) {
+		_, err := NewValidator(ValidatorOptions{
+			Zone:             "other.test",
+			AllowedZonePaths: []string{"crawl.test"},
+		})
+		if !errors.Is(err, errZoneNotAllowed) {
+			t.Errorf("ожидается errZoneNotAllowed, получено %v", err)
 		}
 	})
 	t.Run("порог вне диапазона", func(t *testing.T) {

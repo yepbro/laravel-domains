@@ -114,6 +114,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_INGEST_MAX_ERROR_RATIO", setFloat(func(c *Config) *float64 { return &c.Ingest.MaxErrorRatio })},
 		{"CRAWLER_INGEST_ARCHIVE_MAX_UNCOMPRESSED", setSize(func(c *Config) *ByteSize { return &c.Ingest.ArchiveMaxUncompressed })},
 		{"CRAWLER_INGEST_ARCHIVE_MAX_FILES", setInt(func(c *Config) *int { return &c.Ingest.ArchiveMaxFiles })},
+		{"CRAWLER_INGEST_ALLOWED_ZONE_PATHS", setZoneNames(func(c *Config) *[]string { return &c.Ingest.AllowedZonePaths })},
 		{"CRAWLER_SCHEDULER_RECHECK_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Scheduler.RecheckInterval })},
 		{"CRAWLER_SCHEDULER_BACKLOG_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Scheduler.BacklogInterval })},
 		{"CRAWLER_SCHEDULER_BATCH_SIZE", setInt(func(c *Config) *int { return &c.Scheduler.BatchSize })},

@@ -74,6 +74,12 @@ type PipelineOptions struct {
 	// ArchiveMaxFiles — потолок числа записей архива
 	// (ingest.archive_max_files, T-133); 0 — дефолт.
 	ArchiveMaxFiles int
+	// AllowedZonePaths — многоуровневые зоны, которым разрешено быть
+	// каталогами incoming (ingest.allowed_zone_paths, ТЗТ §5.1):
+	// тестовые зоны testbed (crawl.test); nil/пусто — рабочие каталоги
+	// только TLD. Файл запрещённого многоуровневого каталога — ошибка
+	// уровня файла (failed/, T-021).
+	AllowedZonePaths []string
 	// RejectLog — логгер rejected (NewRejectedLogger, T-016); nil —
 	// записи подавлены (счётчики ведутся всё равно).
 	RejectLog *slog.Logger
@@ -193,6 +199,16 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	}
 	rep := FileReport{Zone: f.Zone, Action: f.Action, Path: f.Path}
 
+	// Многоуровневый каталог зоны — только из allowlist (ТЗТ §5.1):
+	// проверка до EnsureZone и чтения файла — запрещённый каталог не
+	// создаёт зону в справочнике и не грузит партию, файл сразу
+	// ошибочен (failed/ с причиной, строки не разбираются, T-021).
+	// Та же проверка стоит в NewValidator (страховка прямых вызовов
+	// валидатора вне конвейера).
+	if err := checkZonePath(f.Zone, p.opts.AllowedZonePaths); err != nil {
+		return p.failFile(abs, rep, fmt.Errorf("ingest: файл %s: %w", f.Path, err))
+	}
+
 	// Зона зона-каталога находится или создаётся автоматически при первом
 	// файле (ТЗ 5.1; EnsureZone, T-014) и сразу согревает кэш зон строк.
 	// Зона-less файл (f.Zone == "") зон upfront не знает: зоны создаются
@@ -249,13 +265,17 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	rep.Accepted = int64(vres.Accepted)
 	rep.Reasons = vres.Reasons
 	if err != nil {
-		if errors.Is(err, errArchiveRejected) {
-			// Архив ошибочен по своей сути (битый, лимиты, член выше
-			// порога — T-133): как txt-файл с долей отказов выше порога —
-			// строки не применяются, партия отбрасывается (ТЗ 5.1),
-			// архив целиком в failed/ с лог-отчётом; частично принятые
-			// строки не применялись, повторная подача идемпотентна
-			// (ON CONFLICT DO NOTHING, ТЗ 5.1).
+		if errors.Is(err, errArchiveRejected) || errors.Is(err, errZoneNotAllowed) {
+			// Ошибка по сути файла: архив ошибочен (битый, лимиты, член
+			// выше порога — T-133) либо многоуровневая зона каталога вне
+			// allowlist (страховочная ветка NewValidator — рабочая
+			// проверка стоит в начале process; сюда попадает только при
+			// рассинхроне опций, классифицируем файлом, не вечным
+			// retry): как txt-файл с долей отказов выше порога — строки
+			// не применяются, партия отбрасывается (ТЗ 5.1), файл целиком
+			// в failed/ с лог-отчётом; частично принятые строки не
+			// применялись, повторная подача идемпотентна (ON CONFLICT
+			// DO NOTHING, ТЗ 5.1).
 			if derr := p.clearBatch(ctx, id); derr != nil {
 				p.discard(id)
 				return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
@@ -434,10 +454,11 @@ func (p *Pipeline) emitRow(ctx context.Context, cache map[string]int16, emit fun
 // stageStream (горутина-производитель и буферизованный канал).
 func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch Batch, zoneIDs map[string]int16) (Stats, FileResult, int64, error) {
 	v, err := NewValidator(ValidatorOptions{
-		File:          f.Path,
-		Zone:          f.Zone,
-		MaxErrorRatio: p.opts.MaxErrorRatio,
-		RejectLog:     p.opts.RejectLog,
+		File:             f.Path,
+		Zone:             f.Zone,
+		AllowedZonePaths: p.opts.AllowedZonePaths,
+		MaxErrorRatio:    p.opts.MaxErrorRatio,
+		RejectLog:        p.opts.RejectLog,
 	})
 	if err != nil {
 		return Stats{}, FileResult{}, 0, fmt.Errorf("ingest: файл %s: %w", f.Path, err)

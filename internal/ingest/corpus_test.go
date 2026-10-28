@@ -70,13 +70,20 @@ type corpusResult struct {
 
 // corpusRun — сквозной прогон кейса: парсер T-015 + валидатор T-016,
 // соединённые как в T-017; rejected-логгер пишет в io.Discard.
+// Многоуровневая зона каталога — в allowlist (ТЗТ §5.1): корпус
+// проверяет построчную семантику, gate — TestNewValidator.
 func corpusRun(t *testing.T, tc corpusCase) corpusResult {
 	t.Helper()
+	var allowed []string
+	if strings.Contains(tc.zone, ".") {
+		allowed = []string{tc.zone}
+	}
 	v, err := NewValidator(ValidatorOptions{
-		File:          "incoming/" + tc.zone + "/add/list.txt",
-		Zone:          tc.zone,
-		MaxErrorRatio: tc.ratio,
-		RejectLog:     NewRejectedLogger(io.Discard, slog.LevelInfo),
+		File:             "incoming/" + tc.zone + "/add/list.txt",
+		Zone:             tc.zone,
+		AllowedZonePaths: allowed,
+		MaxErrorRatio:    tc.ratio,
+		RejectLog:        NewRejectedLogger(io.Discard, slog.LevelInfo),
 	})
 	if err != nil {
 		t.Fatalf("NewValidator: %v", err)

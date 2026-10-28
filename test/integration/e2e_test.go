@@ -313,7 +313,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 		ingest.NewZoneStore(env.pool),
 		ingest.NewFileStore(env.pool),
 		env.pool,
-		ingest.PipelineOptions{Dir: dir, BatchSize: 4},
+		ingest.PipelineOptions{Dir: dir, BatchSize: 4, AllowedZonePaths: []string{e2eZone}},
 	)
 	if err != nil {
 		t.Fatalf("ingest.NewPipeline: %v", err)
