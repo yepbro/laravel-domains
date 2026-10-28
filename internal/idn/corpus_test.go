@@ -1,6 +1,7 @@
 // Исчерпывающий корпус тестов нормализации имён — задача T-010 (ТЗ 11.1,
 // 5.2): смешанный регистр, ß/ς, эмодзи, символы нулевой ширины, валидные и
-// битые xn--, длины, составные зоны, unicode-каталоги зон, хосты, края.
+// битые xn--, длины, TLD-зоны и составные метки, unicode-каталоги зон,
+// хосты, края.
 //
 // Ожидания зафиксированы по фактическому профилю UTS-46 из golang.org/x/net
 // v0.61.0 (таблицы Unicode 15, nontransitional: const transitionalLookup =
@@ -253,16 +254,42 @@ func TestNormalizeLengthPunycode(t *testing.T) {
 	assertNormalizeError(t, strings.Repeat("р", 58)+".com", ErrLabelLen)
 }
 
-// TestNormalizeZonesPSL — отделение зоны по PSL (ТЗ 5.2 п. 5): составные
-// ICANN-суффиксы, частные суффиксы, сами суффиксы без метки, IP-литералы.
-func TestNormalizeZonesPSL(t *testing.T) {
+// TestNormalizeZonesTLD — отделение зоны по последней метке имени (п. 5
+// в редакции ТЗТ tld-only-zones, §4.2 — таблица целиком): 2LD-регистрации
+// реестров и частные суффиксы дают TLD-зону и составную метку, голые
+// суффиксы — валидные домены (§12.6: мусор без фильтра), голый TLD —
+// no_label, числовые последние метки — numeric_zone.
+func TestNormalizeZonesTLD(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		want Result
 	}{
-		{"example.com.au", Result{"example.com.au", "example.com.au", "com.au", "example", false}},
-		{"a.b.example.com.au", Result{"a.b.example.com.au", "a.b.example.com.au", "com.au", "a.b.example", false}},
-		{"foo.appspot.com", Result{"foo.appspot.com", "foo.appspot.com", "appspot.com", "foo", false}},
+		// Простой случай: зона — TLD, метка одна.
+		{"example.com", Result{"example.com", "example.com", "com", "example", false}},
+		// 2LD-регистрации реестров (публичные суффиксы PSL): сворачиваются
+		// в TLD, всё до него — составная метка.
+		{"example.5g.in", Result{"example.5g.in", "example.5g.in", "in", "example.5g", false}},
+		{"example.co.uk", Result{"example.co.uk", "example.co.uk", "uk", "example.co", false}},
+		{"a.b.example.com.au", Result{"a.b.example.com.au", "a.b.example.com.au", "au", "a.b.example.com", false}},
+		{"example.city.kawasaki.jp", Result{"example.city.kawasaki.jp", "example.city.kawasaki.jp", "jp", "example.city.kawasaki", false}},
+		// Частные суффиксы не выделяются: github.io/appspot.com —
+		// метки под TLD.
+		{"example.github.io", Result{"example.github.io", "example.github.io", "io", "example.github", false}},
+		{"foo.appspot.com", Result{"foo.appspot.com", "foo.appspot.com", "com", "foo.appspot", false}},
+		// IDN: зона — punycode TLD, метка одна.
+		{"магазин.рф", Result{"xn--80aairftm.xn--p1ai", "магазин.рф", "xn--p1ai", "xn--80aairftm", true}},
+		// Тестовая зона testbed: зона — последняя метка, составная
+		// метка — норма (теперь всегда, без различия известных TLD).
+		{"example.crawl.test", Result{"example.crawl.test", "example.crawl.test", "test", "example.crawl", false}},
+		// Голые суффиксы — валидные домены (§12.6: отличить суффикс
+		// от домена можно только списком суффиксов — фильтра нет).
+		{"github.io", Result{"github.io", "github.io", "io", "github", false}},
+		{"co.in", Result{"co.in", "co.in", "in", "co", false}},
+		{"com.au", Result{"com.au", "com.au", "au", "com", false}},
+		{"appspot.com", Result{"appspot.com", "appspot.com", "com", "appspot", false}},
+		// Составная метка с xn-- внутри: IsIDN — по любой A-метке
+		// метки (HasXNLabel), не только по первой.
+		{"магазин.рф.co.uk", Result{"xn--80aairftm.xn--p1ai.co.uk", "магазин.рф.co.uk", "uk", "xn--80aairftm.xn--p1ai.co", true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertNormalize(t, tc.name, tc.want)
@@ -272,23 +299,23 @@ func TestNormalizeZonesPSL(t *testing.T) {
 		name string
 		kind ErrorKind
 	}{
-		{"com.au", ErrNoLabel},      // сам ICANN-суффикс
-		{"appspot.com", ErrNoLabel}, // сам частный суффикс PSL
-		// IP-литерал: publicsuffix распознаёт адрес (netip.ParseAddr) и
-		// возвращает его целиком как «суффикс» — числовая зона, таких TLD
-		// не существует. Для incoming-строк это правильно: IP — не домен
-		// зоны. Хосты из Location — отдельно, HostToASCII пропускает IP
-		// (ТЗ 5.2 п. 8).
+		// Голый TLD — метки перед зоной нет.
+		{"com", ErrNoLabel},
+		{"москва", ErrNoLabel},       // TLD москва
+		{"xn--80adxhks", ErrNoLabel}, // TLD москва в punycode
+		// IP-литерал: последняя метка из цифр — числовая зона, таких
+		// TLD не существует. Для incoming-строк это правильно: IP — не
+		// домен зоны. Хосты из Location — отдельно, HostToASCII
+		// пропускает IP (ТЗ 5.2 п. 8).
 		{"192.0.2.1", ErrNumericZone}, // IPv4-литерал
 		{"8.8.8.8", ErrNumericZone},   // IPv4-литерал
-		// Числовые «зоны» — не домены: TLD из цифр не существует (IANA),
-		// а правило «*» PSL отдаёт неизвестный числовый TLD как есть.
-		// Метки вне диапазона IPv4 — даже не адрес (netip.ParseAddr),
-		// но и не имя: числовая зона отклоняется.
+		{"1.2.3.4", ErrNumericZone},   // IPv4-литерал
+		// Числовые «зоны» — не домены: TLD из цифр не существует
+		// (IANA); метки вне диапазона IPv4 — даже не адрес, но и не
+		// имя: числовая последняя метка отклоняется.
 		{"999.888.777.666", ErrNumericZone},
 		{"18.06.1999", ErrNumericZone}, // дата выгрузки регистратора
-		{"москва", ErrNoLabel},         // сам публичный суффикс — TLD москва
-		{"xn--80adxhks", ErrNoLabel},   // TLD москва в punycode
+		{"1999", ErrNumericZone},       // голый числовой TLD
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertNormalizeError(t, tc.name, tc.kind)
@@ -315,7 +342,8 @@ func TestNormalizeEdges(t *testing.T) {
 }
 
 // TestNormalizeZoneUnicode — unicode-имена каталогов зон (ТЗ 5.2 п. 6, ТЗ
-// 11.1): нормализуются тем же конвейером, без требования принадлежности PSL.
+// 11.1): нормализуются тем же конвейером; зона каталога не обязана быть
+// TLD — составные имена допустимы.
 func TestNormalizeZoneUnicode(t *testing.T) {
 	for _, tc := range []struct {
 		in   string

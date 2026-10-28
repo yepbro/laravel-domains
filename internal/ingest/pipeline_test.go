@@ -496,28 +496,31 @@ func TestPipelineZonelessAdd(t *testing.T) {
 // в зона-less файле строки-даты (кандидаты извлечения T-132 из полей
 // выгрузки) отклоняются, зона не выводится и не создаётся (регрессия
 // дампа .SU: строка «SOCHI.SU <регистратор> <дата>…» применялась как домен
-// «18.06.1999» с автоматической зоной 1999).
+// «18.06.1999» с автоматической зоной 1999). Голый суффикс sochi.su
+// валиден как домен su (мусор без фильтра, ТЗТ tld-only-zones §12.6),
+// строка из одних дат — no_domain.
 func TestPipelineZonelessNumericZone(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "0-0.SU\tARDIS-SU\t17.11.2015\t17.11.2026\t20.12.2026\t1\n" +
-		"SOCHI.SU\tRUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1\n"
+		"SOCHI.SU\tRUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1\n" +
+		"RUCENTER-AR\t18.06.1999\t01.10.2027\t01.11.2027\t1\n"
 	abs := pt.addFile(t, "add/su_dump.txt", content)
 
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		// вставка/возврат — ответы Query (inserted=1, revived=0)
-		{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
+		// вставка/возврат — ответы Query (inserted=2, revived=0)
+		{tag: pgconn.NewCommandTag("DELETE 2")}, // очистка после применения
 	}
-	pt.pool.inserted = 1
+	pt.pool.inserted = 2
 	pt.pool.revived = 0
-	pt.pool.uniques = 1
+	pt.pool.uniques = 2
 
-	// Половина строк отклонена — дефолтного порога 10% хватило бы
+	// Треть строк отклонена — дефолтного порога 10% хватило бы
 	// «уронить» файл; здесь проверяется применение, а не порог.
 	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
 		Dir:           pt.dir,
 		BatchSize:     10,
-		MaxErrorRatio: 0.5, // 1 отклонение из 2 — файл не роняется (строго выше)
+		MaxErrorRatio: 0.5, // 1 отклонение из 3 — файл не роняется (строго выше)
 		Now:           func() time.Time { return pt.now },
 	})
 	if err != nil {
@@ -531,8 +534,8 @@ func TestPipelineZonelessNumericZone(t *testing.T) {
 		t.Fatalf("итог = %s, want applied", out.Kind)
 	}
 	rep := out.Report
-	if rep.LinesTotal != 2 || rep.Accepted != 1 || rep.Rejected != 1 || rep.Added != 1 {
-		t.Errorf("счётчики = %+v, want 2 строки, 1 валидная/добавлено, 1 отклонение", rep)
+	if rep.LinesTotal != 3 || rep.Accepted != 2 || rep.Rejected != 1 || rep.Added != 2 {
+		t.Errorf("счётчики = %+v, want 3 строки, 2 валидных/добавлено, 1 отклонение", rep)
 	}
 	if rep.Reasons[ReasonNoDomain] != 1 || len(rep.Reasons) != 1 {
 		t.Errorf("Reasons = %+v, want ровно no_domain: 1", rep.Reasons)
@@ -542,12 +545,15 @@ func TestPipelineZonelessNumericZone(t *testing.T) {
 	if want := []string{"byName:su", "create:su"}; !reflect.DeepEqual(pt.zones.calls, want) {
 		t.Errorf("обращения к зонам = %v, want %v", pt.zones.calls, want)
 	}
-	// В staging ушла одна строка — домен su, не дата.
-	if len(pt.pool.copyVals) != 1 {
-		t.Fatalf("строк COPY = %d, want 1", len(pt.pool.copyVals))
+	// В staging ушли два домена su — не даты: рядовая метка и голый
+	// суффикс sochi (валидный мусор, ТЗТ §12.6).
+	if len(pt.pool.copyVals) != 2 {
+		t.Fatalf("строк COPY = %d, want 2", len(pt.pool.copyVals))
 	}
-	if vals := pt.pool.copyVals[0]; vals[2] != "0-0" {
-		t.Errorf("метка COPY = %v, want 0-0 (не дата)", vals[2])
+	for i, want := range []string{"0-0", "sochi"} {
+		if vals := pt.pool.copyVals[i]; vals[2] != want {
+			t.Errorf("метка COPY[%d] = %v, want %s (не дата)", i, vals[2], want)
+		}
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "add/su_dump.txt")) {
 		t.Error("файл не перемещён в processed/")

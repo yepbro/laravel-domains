@@ -30,15 +30,17 @@ func TestNormalizeValid(t *testing.T) {
 		{name: "Bücher.de", ascii: "xn--bcher-kva.de", uni: "bücher.de", zone: "de", label: "xn--bcher-kva", isIDN: true},
 		// Вход уже в punycode — валиден и не меняется.
 		{name: "XN--BCHER-KVA.com", ascii: "xn--bcher-kva.com", uni: "bücher.com", zone: "com", label: "xn--bcher-kva", isIDN: true},
-		// п. 5: составная зона, не последняя метка.
-		{name: "example.co.uk", ascii: "example.co.uk", uni: "example.co.uk", zone: "co.uk", label: "example"},
-		{name: "магазин.рф.co.uk", ascii: "xn--80aairftm.xn--p1ai.co.uk", uni: "магазин.рф.co.uk", zone: "co.uk", label: "xn--80aairftm.xn--p1ai", isIDN: true},
+		// п. 5 (в редакции ТЗТ tld-only-zones): зона — последняя метка
+		// (TLD); 2LD-регистрация даёт составную метку.
+		{name: "example.co.uk", ascii: "example.co.uk", uni: "example.co.uk", zone: "uk", label: "example.co"},
+		{name: "магазин.рф.co.uk", ascii: "xn--80aairftm.xn--p1ai.co.uk", uni: "магазин.рф.co.uk", zone: "uk", label: "xn--80aairftm.xn--p1ai.co", isIDN: true},
 		// п. 9: бит is_idn — по метке домена, зона не считается.
 		{name: "example.xn--p1ai", ascii: "example.xn--p1ai", uni: "example.рф", zone: "xn--p1ai", label: "example", isIDN: false},
-		// Неизвестный PSL TLD: зона — последняя метка (правило «*»).
+		// Тестовая зона testbed: зона — последняя метка (TLD-only —
+		// теперь всегда), составная метка — норма.
 		{name: "example.crawl.test", ascii: "example.crawl.test", uni: "example.crawl.test", zone: "test", label: "example.crawl"},
-		// Частный суффикс PSL: github.io — зона, как appspot.com.
-		{name: "foo.github.io", ascii: "foo.github.io", uni: "foo.github.io", zone: "github.io", label: "foo"},
+		// Частные суффиксы не выделяются: github.io — метка под TLD io.
+		{name: "foo.github.io", ascii: "foo.github.io", uni: "foo.github.io", zone: "io", label: "foo.github"},
 		// Граница п. 4: метка ровно 63 октета — валидна.
 		{name: strings.Repeat("a", 63) + ".com", ascii: strings.Repeat("a", 63) + ".com", uni: strings.Repeat("a", 63) + ".com", zone: "com", label: strings.Repeat("a", 63)},
 		// Числовая метка в буквенной зоне — обычное имя: числовых TLD нет,
@@ -92,12 +94,10 @@ func TestNormalizeInvalid(t *testing.T) {
 		{strings.Repeat("a", 64) + ".com", ErrLabelLen}, // метка 64
 		{"àéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüß.com", ErrLabelLen},                                                           // punycode-метка 64
 		{strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 62), ErrNameLen}, // имя 254
-		// п. 5: имя — сам публичный суффикс, метки нет.
+		// п. 5: имя — сам TLD, метки нет.
 		{"com", ErrNoLabel},
-		{"co.uk", ErrNoLabel},
-		{"github.io", ErrNoLabel}, // частный суффикс PSL
-		// п. 5: числовая зона — таких TLD не существует (правило «*» PSL
-		// отдаёт неизвестный числовой TLD как есть).
+		// п. 5: числовая последняя метка — таких TLD не существует
+		// (IANA): даты выгрузок и IPv4-литералы.
 		{"18.06.1999", ErrNumericZone}, // дата выгрузки регистратора
 		{"1.2.3.4", ErrNumericZone},    // IPv4-литерал
 		{"1999", ErrNumericZone},       // голый числовой TLD
@@ -132,7 +132,7 @@ func TestNormalizeBoundaryLengths(t *testing.T) {
 	if got.ASCII != name {
 		t.Errorf("ASCII = %q, want имя без изменений", got.ASCII)
 	}
-	// Последняя метка — неизвестный PSL TLD: зона по правилу «*».
+	// Последняя метка — зона (TLD-only).
 	if want := strings.Repeat("d", 61); got.Zone != want {
 		t.Errorf("Zone = %q, want %q", got.Zone, want)
 	}
@@ -238,10 +238,9 @@ func TestHasXNLabel(t *testing.T) {
 
 // TestIsNumericZone — контракт isNumericZone прямыми вызовами: функция
 // неэкспортируемая, а случай zone == "" через Normalize недостижим
-// (publicsuffix.PublicSuffix непустому ASCII-входу всегда отдаёт
-// непустой суффикс — комментарий перед проверкой zone == "" там),
-// поэтому поведение пустой зоны фиксируется здесь, а не через
-// публичный API.
+// (зона — непустая последняя метка normalizeASCII-выхода, см.
+// комментарий перед страховочной проверкой zone == "" там), поэтому
+// поведение пустой зоны фиксируется здесь, а не через публичный API.
 func TestIsNumericZone(t *testing.T) {
 	tests := []struct {
 		in   string
@@ -253,8 +252,7 @@ func TestIsNumericZone(t *testing.T) {
 		// return true. Через Normalize ветка недостижима — контракт
 		// фиксируется прямым вызовом.
 		{"", false},
-		// Числовые зоны — таких TLD не существует (IANA); правило «*»
-		// publicsuffix отдаёт их как есть.
+		// Числовые зоны — таких TLD не существует (IANA).
 		{"1999", true},       // голый числовой TLD
 		{"18.06.1999", true}, // дата выгрузки регистратора
 		{"1.2.3.4", true},    // IPv4-литерал

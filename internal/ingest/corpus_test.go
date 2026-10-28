@@ -198,21 +198,18 @@ func TestCorpusFile(t *testing.T) {
 				{4, ReasonWrongZone},
 			},
 		},
-		// Вложенная публичная зона (ТЗ 5.2 п. 5): example.co.uk
-		// принадлежит co.uk, а не uk — wrong_zone. Порог 1: строка
-		// одна, файл не роняем — проверяем причину, не вердикт.
+		// 2LD-регистрация в TLD-зоне пути (ТЗТ §5.3): example.co.uk
+		// в каталоге uk — бывший wrong_zone, теперь accept с составной
+		// меткой example.co (зона имени — TLD uk).
 		{
-			name:   "вложенная публичная зона: example.co.uk не из зоны uk",
+			name:   "2LD-регистрация в TLD-зоне пути: example.co.uk в зоне uk",
 			zone:   "uk",
-			ratio:  1,
 			in:     "good.uk\nexample.co.uk\n",
 			stats:  Stats{Total: 2, Data: 2},
-			vstats: ValidatorStats{Total: 2, Accepted: 1, Rejected: 1},
+			vstats: ValidatorStats{Total: 2, Accepted: 2},
 			entries: []corpusEntry{
 				{1, Entry{"uk", "good", false}},
-			},
-			rejects: []corpusReject{
-				{2, ReasonWrongZone},
+				{2, Entry{"uk", "example.co", false}},
 			},
 		},
 		// Составная зона пути и составная метка (контракт idn, T-010).

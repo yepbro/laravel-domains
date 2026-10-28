@@ -46,12 +46,19 @@ func TestLineValid(t *testing.T) {
 		{"unicode зона каталога", "РФ.", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true},
 		// бит is_idn — по метке домена, а не по зоне (ТЗ 5.2 п. 9).
 		{"ascii метка в idn зоне", "xn--p1ai", "example.xn--p1ai", "xn--p1ai", "example", false},
-		// Составная зона по publicsuffix (ТЗ 5.2 п. 5).
-		{"составная зона", "co.uk", "example.co.uk", "co.uk", "example", false},
+		// Зона пути — составное имя глубже TLD имени (ветка 3
+		// domainLabel: каталог задаёт зону явно, тестовые зоны T-014).
+		{"составная зона пути", "co.uk", "example.co.uk", "co.uk", "example", false},
 		{"составная метка", "co.uk", "магазин.рф.co.uk", "co.uk", "xn--80aairftm.xn--p1ai", true},
-		// Зона пути глубже публичного суффикса — тестовые зоны (T-014):
-		// у example.crawl.test суффикс по списку test, зона пути crawl.test.
-		{"зона вне списка суффиксов", "crawl.test", "example.crawl.test", "crawl.test", "example", false},
+		// 2LD-регистрация в TLD-зоне пути: зона имени — TLD (idn,
+		// TLD-only), составная метка — норма (ТЗТ §5.3: бывший
+		// wrong_zone).
+		{"2LD-регистрация в TLD-зоне", "uk", "example.co.uk", "uk", "example.co", false},
+		{"частный суффикс в TLD-зоне", "io", "foo.github.io", "io", "foo.github", false},
+		{"5g.in в зоне in", "in", "example.5g.in", "in", "example.5g", false},
+		// Зона пути глубже TLD имени — тестовые зоны (T-014):
+		// у example.crawl.test зона имени test, зона пути crawl.test.
+		{"зона пути глубже TLD", "crawl.test", "example.crawl.test", "crawl.test", "example", false},
 		{"составная метка вне списка", "crawl.test", "sub.example.crawl.test", "crawl.test", "sub.example", false},
 		{"последняя метка как зона", "test", "crawl.test", "test", "crawl", false},
 	}
@@ -91,10 +98,9 @@ func TestLineRejected(t *testing.T) {
 		{"другая зона", "com", "example.org", ReasonWrongZone},
 		{"субдомен другой зоны", "com", "sub.example.org", ReasonWrongZone},
 		{"валидный idn не из зоны", "com", "пример.рф", ReasonWrongZone},
-		// Вложенная публичная зона: example.co.uk принадлежит co.uk,
-		// а не uk — простое разбиение по точке запрещено (п. 5).
-		{"вложенная публичная зона", "uk", "example.co.uk", ReasonWrongZone},
-		{"частный суффикс глубже", "io", "foo.github.io", ReasonWrongZone},
+		// Голый суффикс — валидное имя другой зоны (TLD-only: зона uk,
+		// метка co): в чужом каталоге — wrong_zone (ТЗТ §12.6).
+		{"голый суффикс другой зоны", "com", "co.uk", ReasonWrongZone},
 		// Классы idn.Error (ТЗ 5.2).
 		{"пустая строка", "com", "", ReasonEmpty},
 		{"только пробелы", "com", "   ", ReasonEmpty},
@@ -104,10 +110,9 @@ func TestLineRejected(t *testing.T) {
 		{"пустая метка", "com", "example..com", ReasonInvalid},
 		{"метка длиннее 63", "com", strings.Repeat("a", 64) + ".com", ReasonLabelLen},
 		{"имя длиннее 253", "com", longName, ReasonNameLen},
-		// Метки перед зоной нет: имя — сам публичный суффикс.
-		{"публичный суффикс", "com", "com", ReasonNoLabel},
-		{"составной публичный суффикс", "com", "co.uk", ReasonNoLabel},
-		// Зона пути вне списка суффиксов: имя совпадает с зоной.
+		// Метки перед зоной нет: имя — сам TLD.
+		{"голый TLD", "com", "com", ReasonNoLabel},
+		// Зона пути вне TLD: имя совпадает с зоной.
 		{"имя равно зоне пути", "crawl.test", "crawl.test", ReasonNoLabel},
 	}
 	for _, tc := range tests {
@@ -257,8 +262,8 @@ func TestNewValidator(t *testing.T) {
 }
 
 // TestValidatorZoneless — зона-less файл (Zone == ""): зоны строк
-// выводятся из самих имён (publicsuffix, ТЗ 5.2 п. 5), файл смешивает
-// зоны, wrong_zone невозможна. Тестовые зоны PSL не знает: example.crawl.test
+// выводятся из самих имён (TLD — последняя метка), файл смешивает
+// зоны, wrong_zone невозможна. Тестовые зоны: example.crawl.test
 // относится к зоне test с составной меткой — для testbed пользоваться
 // зона-каталогами.
 func TestValidatorZoneless(t *testing.T) {
@@ -272,7 +277,7 @@ func TestValidatorZoneless(t *testing.T) {
 		label string
 	}{
 		{"example.com", "com", "example"},
-		{"shop.co.uk", "co.uk", "shop"},
+		{"shop.co.uk", "uk", "shop.co"},
 		{"FOO.RU.", "ru", "foo"},
 		{"example.crawl.test", "test", "example.crawl"},
 	}
@@ -291,7 +296,7 @@ func TestValidatorZoneless(t *testing.T) {
 		t.Errorf("IDN-строка = %+v ok=%v, want зона xn--p1ai, IsIDN, punycode-метка", e, ok)
 	}
 
-	// Само имя PSL-зоны — метки нет: отклонение no_label.
+	// Голый TLD — метки перед зоной нет: отклонение no_label.
 	if _, reason, ok := v.Line(len(cases)+2, "com"); ok || reason != ReasonNoLabel {
 		t.Errorf("строка \"com\" = ok=%v причина %s, want no_label", ok, reason)
 	}
@@ -306,12 +311,13 @@ func TestValidatorZoneless(t *testing.T) {
 	}
 }
 
-// TestValidatorZonelessNumericZone — числовая зона из PSL-вывода — не домен
-// (регрессия дампа .SU: кандидат-дата «18.06.1999» проходила валидацию,
-// выводилась в фиктивную зону 1999 и применялась как домен-дата). Дата и
-// IPv4-литерал отклоняются (numeric_zone), числовая метка в буквенной зоне
-// валидна, строка выгрузки с датой целиком — no_domain: имя-кандидат — сам
-// публичный суффикс (no_label), даты — numeric_zone.
+// TestValidatorZonelessNumericZone — числовая зона из вывода зоны — не
+// домен (регрессия дампа .SU: кандидат-дата «18.06.1999» проходила
+// валидацию, выводилась в фиктивную зону 1999 и применялась как
+// домен-дата). Дата и IPv4-литерал отклоняются (numeric_zone), числовая
+// метка в буквенной зоне валидна. Голый суффикс дамп-строки (sochi.su)
+// с TLD-only-зонами — валидный домен: мусор без фильтра (ТЗТ
+// tld-only-zones §12.6); строка из одних дат — no_domain.
 func TestValidatorZonelessNumericZone(t *testing.T) {
 	v, err := NewValidator(ValidatorOptions{File: "add/list.txt", MaxErrorRatio: 1})
 	if err != nil {
@@ -326,15 +332,22 @@ func TestValidatorZonelessNumericZone(t *testing.T) {
 	if e, _, ok := v.Line(3, "123.com"); !ok || e.Zone != "com" || e.Label != "123" {
 		t.Errorf("числовая метка в буквенной зоне = %+v ok=%v, want com/123", e, ok)
 	}
-	// Строка дампа .SU: sochi.su — сам публичный суффикс (no_label),
-	// даты полей — numeric_zone; ни один кандидат не прошёл — no_domain.
+	// Строка дампа .SU: первый кандидат sochi.su — голый суффикс,
+	// валиден как домен (зона su, метка sochi) — мусор без фильтра
+	// (ТЗТ §12.6); даты полей до проверки не доходят.
 	const line = "SOCHI.SU\tRUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1"
-	if _, reason, ok := v.Line(4, line); ok || reason != ReasonNoDomain {
-		t.Errorf("строка дампа = ok=%v причина %s, want no_domain", ok, reason)
+	if e, _, ok := v.Line(4, line); !ok || e.Zone != "su" || e.Label != "sochi" {
+		t.Errorf("строка дампа = %+v ok=%v, want su/sochi (голый суффикс валиден)", e, ok)
+	}
+	// Строка выгрузки без домена: кандидаты-даты — numeric_zone,
+	// прошедшего нет — no_domain.
+	const datesOnly = "RUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1"
+	if _, reason, ok := v.Line(5, datesOnly); ok || reason != ReasonNoDomain {
+		t.Errorf("строка из дат = ok=%v причина %s, want no_domain", ok, reason)
 	}
 	res := v.Finish()
-	if res.Accepted != 1 || res.Rejected != 3 || res.Failed {
-		t.Errorf("Finish = %+v, want принято 1, отклонено 3, не failed", res)
+	if res.Accepted != 2 || res.Rejected != 3 || res.Failed {
+		t.Errorf("Finish = %+v, want принято 2, отклонено 3, не failed", res)
 	}
 	if res.Reasons[ReasonNumericZone] != 2 || res.Reasons[ReasonNoDomain] != 1 || len(res.Reasons) != 2 {
 		t.Errorf("Reasons = %+v, want numeric_zone: 2, no_domain: 1", res.Reasons)
