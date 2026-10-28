@@ -759,7 +759,7 @@ func domainNotFound(ctx context.Context, pool db.DB, name string, asJSON bool, s
 	}
 	if zoneFound {
 		label := strings.TrimSuffix(name, "."+zone)
-		return fmt.Errorf("domain: домен %s не найден: в зоне %s нет домена с меткой %s (домен не загружен ingest-ом или зона каталога не совпадает со списком publicsuffix)", name, zone, label)
+		return fmt.Errorf("domain: домен %s не найден: в зоне %s нет домена с меткой %s (домен не загружен ingest-ом, либо зона имени — другая: зона отделяется по последней метке имени (TLD) и справочнику zones, ТЗТ tld-only-zones §4)", name, zone, label)
 	}
 	return fmt.Errorf("domain: домен %s не найден: зона %s отсутствует в справочнике zones (зоны создаёт ingest при первом файле)", name, zone)
 }

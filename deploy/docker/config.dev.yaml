@@ -19,6 +19,18 @@ ingest:
   batch_size: 50000
   stable_seconds: 10
   scan_interval: "5s"               # dev: страховочный обход чаще
+  # Многоуровневые тестовые зоны testbed (ТЗТ tld-only-zones §5.1/§6.1):
+  # рабочие каталоги приёма — только TLD (incoming/<tld>/add|delete/),
+  # зоны сценариев стенда (deploy/docker/testbed/scenarios.yaml — их
+  # обслуживает coredns) обязаны быть «зонами пути», поэтому перечислены
+  # в allowlist; иначе make seed кладёт файлы в каталоги, которые ingest
+  # отправит в failed/. Имена — punycode нижним регистром (как zones.name;
+  # проверка.test → xn--80adjurfhd.test). Бой — пусто (config.example.yaml).
+  allowed_zone_paths:
+    - crawl.test            # базовая зона сценариев (e2e ingest→check)
+    - crawl2.test
+    - co.test               # составная тестовая зона (бывший аналог co.uk)
+    - xn--80adjurfhd.test   # проверка.test — IDN-зона сценариев
 
 scheduler:
   recheck_interval: "4380h"          # ~6 месяцев

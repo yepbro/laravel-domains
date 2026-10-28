@@ -23,8 +23,8 @@ package model
 
 import "time"
 
-// Zone — строка zones: справочник зон (TLD/публичных суффиксов) со
-// счётчиками прогресса (обновляет monitor, ТЗ 5.9).
+// Zone — строка zones: справочник зон (TLD + тестовые зоны allowlist)
+// со счётчиками прогресса (обновляет monitor, ТЗ 5.9).
 type Zone struct {
 	ID             int16      `db:"id"`
 	Name           string     `db:"name"`         // punycode

@@ -16,7 +16,7 @@ network:
 zones:
   - crawl.test
   - crawl2.test
-  - co.test          # составная зона, аналог публичного суффикса co.uk
+  - co.test          # составная тестовая зона: путь глубже TLD (allowlist ingest.allowed_zone_paths)
   - проверка.test    # IDN-зона
 
 scenarios:

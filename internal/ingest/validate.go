@@ -70,10 +70,11 @@ const (
 	ReasonNameLen Reason = "name_len"
 	// ReasonNoLabel — метки перед зоной нет: имя само — зона.
 	ReasonNoLabel Reason = "no_label"
-	// ReasonNumericZone — публичный суффикс имени состоит только из цифр
-	// (класс idn.ErrNumericZone): числовых TLD не существует — даты
-	// выгрузок («18.06.1999») и IPv4-литералы («1.2.3.4») не проходят
-	// вывод зоны, фиктивных числовых зон не возникает.
+	// ReasonNumericZone — зона имени (последняя метка, TLD) состоит
+	// только из цифр (класс idn.ErrNumericZone): числовых TLD не
+	// существует — даты выгрузок («18.06.1999») и IPv4-литералы
+	// («1.2.3.4») не проходят вывод зоны, фиктивных числовых зон
+	// не возникает.
 	ReasonNumericZone Reason = "numeric_zone"
 	// ReasonWrongZone — домен не из зоны пути (ТЗ 5.2 п. 6).
 	ReasonWrongZone Reason = "wrong_zone"

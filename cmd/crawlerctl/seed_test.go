@@ -8,7 +8,23 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
+
+	"crawler/internal/config"
+	"crawler/internal/idn"
 )
+
+// seedRepoRoot — корень репозитория (стиль cmd/testbedgen): файлы стенда
+// читаются тестами согласованности конфигурации dev-окружения.
+func seedRepoRoot(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
 
 // TestSeedBulk — файл seed-bulk.txt содержит ровно N строк b%08d.<зона>
 // по порядку, счётчик итога учитывает их; повторы идемпотентны.
@@ -55,6 +71,60 @@ func TestSeedBulk(t *testing.T) {
 		seen[l] = true
 		if !strings.HasSuffix(l, ".crawl.test") {
 			t.Fatalf("строка %q не в зоне crawl.test", l)
+		}
+	}
+}
+
+// TestSeedZonesAllowedInDevConfig — согласованность стенда и конфига dev
+// (Т-197): seed пишет в incoming/<зона>/add/ базовую зону сценариев и зоны
+// plain-блока scenarios.yaml. Все эти каталоги многоуровневые (зоны testbed
+// обслуживает coredns), значит каждый обязан входить в allowlist
+// ingest.allowed_zone_paths конфига dev-окружения — иначе TLD-семантика
+// приёма отправит файлы seed в failed/ и dev-шаг «make seed → ingest
+// обработал» сломается. Продуктовый конфиг (config.example.yaml) allowlist
+// не задаёт — там тестовых зон нет.
+func TestSeedZonesAllowedInDevConfig(t *testing.T) {
+	root := seedRepoRoot(t)
+
+	// Конфиг dev-окружения валиден и несёт allowlist (нормализация —
+	// punycode нижним регистром — на стороне config.LoadFile).
+	cfg, err := config.LoadFile(filepath.Join(root, "deploy", "docker", "config.dev.yaml"))
+	if err != nil {
+		t.Fatalf("config.LoadFile(config.dev.yaml): %v", err)
+	}
+	allowed := make(map[string]bool, len(cfg.Ingest.AllowedZonePaths))
+	for _, z := range cfg.Ingest.AllowedZonePaths {
+		allowed[z] = true
+	}
+
+	// Зоны, в которые пишет seed (cmdSeed): Zones[0] — базовая, далее —
+	// plain-блок. Формат scenarios.yaml — cmd/testbedgen.
+	raw, err := os.ReadFile(filepath.Join(root, "deploy", "docker", "testbed", "scenarios.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sc seedScenarios
+	if err := yaml.Unmarshal(raw, &sc); err != nil {
+		t.Fatalf("scenarios.yaml: %v", err)
+	}
+	if len(sc.Zones) == 0 {
+		t.Fatal("scenarios.yaml: нет зон")
+	}
+
+	base, err := idn.NormalizeZone(sc.Zones[0])
+	if err != nil {
+		t.Fatalf("базовая зона %q: %v", sc.Zones[0], err)
+	}
+	if !allowed[base] {
+		t.Errorf("базовая зона сценариев %q отсутствует в ingest.allowed_zone_paths config.dev.yaml — файлы seed уйдут в failed/", base)
+	}
+	for _, p := range sc.Plain {
+		zone, err := idn.NormalizeZone(p.Zone)
+		if err != nil {
+			t.Fatalf("зона plain %q: %v", p.Zone, err)
+		}
+		if !allowed[zone] {
+			t.Errorf("зона plain-блока %q отсутствует в ingest.allowed_zone_paths config.dev.yaml — файлы seed уйдут в failed/", zone)
 		}
 	}
 }
