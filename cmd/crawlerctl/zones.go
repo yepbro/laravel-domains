@@ -40,6 +40,7 @@ const zonesHelp = `crawlerctl zones — управление зонами про
   crawlerctl zones enable <зона>
   crawlerctl zones disable <зона>
   crawlerctl zones sync [--file ПУТЬ] [--url URL] [--deactivate-missing]
+  crawlerctl zones collapse [--apply] [--skip-reconcile] [--force]
 
 Зона — имя в любой форме (unicode/punycode, регистр, точка на конце),
 как каталог incoming/<зона>; в БД хранится punycode (ТЗ 5.2).
@@ -70,6 +71,23 @@ const zonesHelp = `crawlerctl zones — управление зонами про
                       в срезе (retired TLD), с их списком в отчёте.
                       Это справочник имён TLD, а не источник доменов:
                       домены — только через ingest (var/incoming)
+  collapse [--apply] [--skip-reconcile] [--force]
+                      перенести данные 2LD-зон в TLD-зоны (T-196, окно
+                      обслуживания): зона — последняя метка имени
+                      (example.5g.in → зона in, label example.5g). Без
+                      флагов — dry-run: инвентаризация и план, ничего не
+                      меняет. --apply выполняет перенос батчами по всем
+                      таблицам с zone_id (домены с доклейкой префикса к
+                      label, результаты, находки, история), перепривязывает
+                      ingest_files с разруливанием дедупа, дропает партиции
+                      2LD и удаляет их строки; идемпотентно и возобновляемо
+                      (повтор продолжает с места остановки). После переноса
+                      — реконсиляция счётчиков (общая с monitor);
+                      --skip-reconcile её пропускает, --force игнорирует
+                      домены в очереди (check_state = 1). Зоны
+                      ingest.allowed_zone_paths (тестовые) не сворачиваются.
+                      Перенос необратим: откат — восстановление бэкапа
+                      (runbook — docs/runbooks.md)
 
 Коды возврата: 0 — успех, 1 — ошибка (неизвестная зона, БД, источник
 среза, мусорная строка), 2 — использование.
@@ -289,10 +307,10 @@ func zonesToggleRun(ctx context.Context, pool db.DB, action string, name string,
 // ---------------------------------------------------------------- команды
 
 // cmdZones — роутинг действий зон: list / enable / disable / sync
-// (sync — T-125, zonessync.go).
+// (sync — T-125, zonessync.go) / collapse (T-196, zonescollapse.go).
 func cmdZones(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usagef("укажите действие: crawlerctl zones list|enable|disable|sync")
+		return usagef("укажите действие: crawlerctl zones list|enable|disable|sync|collapse")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
@@ -302,11 +320,13 @@ func cmdZones(args []string, stdout, stderr io.Writer) error {
 		return zonesToggle(action, rest, stdout, stderr)
 	case "sync":
 		return zonesSync(rest, stdout, stderr)
+	case "collapse":
+		return zonesCollapse(rest, stdout, stderr)
 	case "-h", "--help", "help":
 		out(stdout, "%s", zonesHelp)
 		return flag.ErrHelp
 	default:
-		return usagef("неизвестное действие %q (допустимы: list, enable, disable, sync)", action)
+		return usagef("неизвестное действие %q (допустимы: list, enable, disable, sync, collapse)", action)
 	}
 }
 

@@ -75,7 +75,7 @@ func TestRun(t *testing.T) {
 		// TestRunZonesExecution и субтесты zones_test.go; здесь —
 		// использование и справка.
 		{name: "zones без действия", args: []string{"zones"}, code: exitUsage, inErr: "укажите действие"},
-		{name: "zones неизвестное действие", args: []string{"zones", "fly"}, code: exitUsage, inErr: `допустимы: list, enable, disable, sync`},
+		{name: "zones неизвестное действие", args: []string{"zones", "fly"}, code: exitUsage, inErr: `допустимы: list, enable, disable, sync, collapse`},
 		{name: "zones enable без зоны", args: []string{"zones", "enable"}, code: exitUsage, inErr: "укажите зону"},
 		{name: "zones enable невалидная зона", args: []string{"zones", "enable", "bad!!zone"}, code: exitUsage, inErr: "некорректное имя зоны"},
 		{name: "zones --help", args: []string{"zones", "--help"}, code: exitOK, inOut: "zones list"},
