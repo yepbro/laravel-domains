@@ -47,7 +47,7 @@
 семантику ТЗ 5.2 п. 5 (публичный суффикс по PSL) — управляет дополнение
 [`TZ_tld_only_zones.md`](./TZ_tld_only_zones.md).
 
-- **T-194** [в работе] — P1, `internal/idn`: зона — последняя метка имени
+- **T-194** [сделана] — P1, `internal/idn`: зона — последняя метка имени
   (TLD-only): `Normalize` режет ASCII-имя по последней точке (зона =
   TLD, label = префикс), вызов и импорт
   `golang.org/x/net/publicsuffix` удалить; `ErrNumericZone` (последняя
