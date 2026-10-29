@@ -280,6 +280,9 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_laravel",
 		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_pending",
 		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_queued",
+		// 000017 (T-210): маркер render_failed_at — down-эффект, чтобы
+		// повторный Up применил миграцию на чистую колонку.
+		"ALTER TABLE subdomain_results DROP COLUMN IF EXISTS render_failed_at",
 		"TRUNCATE schema_migrations",
 		"INSERT INTO schema_migrations (version, dirty) VALUES (7, false)",
 	} {
