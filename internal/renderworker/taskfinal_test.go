@@ -66,6 +66,9 @@ func TestRenderWorker_TaskFinalizedOnLastAttempt(t *testing.T) {
 	if row.rendered {
 		t.Error("rendered должен остаться false — итог записи сырой HTML HTTP-фазы")
 	}
+	if row.failedAt == nil {
+		t.Error("render_failed_at обязан ставиться финализацией (T-210) — иначе проход доработки переиздаёт запись")
+	}
 	if row.hash == nil || string(row.hash) != string(raw[:]) {
 		t.Errorf("content_hash = %v, нужна прежняя ссылка на сырой HTML %s", row.hash, raw)
 	}

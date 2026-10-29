@@ -225,6 +225,7 @@ type renderqRow struct {
 	aliasSub  *int16 // nil — alias_subdomain_id NULL
 	rendered  bool
 	finalURL  string // "" — NULL (фильтр final_url IS NOT NULL)
+	marked    bool   // штамп «рендер невозможен» (T-210; фильтр render_failed_at IS NULL)
 }
 
 // renderqPool — RecordDB прохода без БД: живая семантика фильтров SQL
@@ -512,8 +513,8 @@ func (p *renderqPool) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		src := p.rows[renderqDomKey{zone: zone, id: id}]
 		rows := make([][]any, 0, len(src))
 		for _, r := range src {
-			if r.rendered || r.finalURL == "" {
-				continue // rendered = false AND final_url IS NOT NULL
+			if r.rendered || r.finalURL == "" || r.marked {
+				continue // rendered = false AND final_url IS NOT NULL AND render_failed_at IS NULL (T-210)
 			}
 			var alias any
 			if r.aliasSub != nil {
@@ -1521,6 +1522,10 @@ func TestRequeueOncePublishes(t *testing.T) {
 	pool.seedRow(5, 11, 2, model.VariantMain, hFlat[:], nil, false, "https://spa.example/")
 	pool.seedRow(5, 11, 3, model.VariantMain, nil, nil, false, "https://spa.example/") // контент не сохранён
 	pool.seedRow(5, 11, 4, model.VariantMain, hSPA[:], nil, true, "https://spa.example/")
+	// Отмаркированная SPA-запись (T-210 — финализация без рендера):
+	// выборкой прохода не берётся, не переиздаётся (как rendered/flat).
+	pool.seedRow(5, 11, 5, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
+	pool.rows[renderqDomKey{zone: 5, id: 11}][5].marked = true
 
 	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
 	if err != nil {
@@ -1624,6 +1629,46 @@ func TestRequeueOnceNoSPA(t *testing.T) {
 	}
 	if len(q.snapshot()) != 0 {
 		t.Fatal("публикаций без SPA-записей быть не должно")
+	}
+}
+
+// TestRequeueOnceRenderFailedMarker — маркер «рендер невозможен» (T-210):
+// отмаркированная финализацией SPA-запись выборкой прохода не берётся —
+// повторный эпизод битого хоста не переиздаёт её (публикаций нет, флаг
+// снят без публикации, как у чернового); повторный проход после нового
+// эпизода (перезапись строки сбросила маркер) переиздаёт запись снова.
+func TestRequeueOnceRenderFailedMarker(t *testing.T) {
+	hSPA := content.HashOf(renderqSPABody)
+	pool, body, q, _, rq := renderqPassKit(t, 0)
+	body.bodies[hSPA] = renderqSPABody
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
+	pool.rows[renderqDomKey{zone: 5, id: 11}][0].marked = true // финализация T-148/T-159/T-172
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Published != 0 || res.Cleared != 1 {
+		t.Fatalf("итог %+v, ожидался published=0 cleared=1 (отмаркированная запись не переиздаётся)", res)
+	}
+	if len(q.snapshot()) != 0 {
+		t.Fatal("публикаций по отмаркированной записи быть не должно (T-210)")
+	}
+
+	// Новый эпизод: перезапись строки (DELETE + INSERT, T-058) сбросила
+	// маркер, запись результата нового эпизода снова поставила флаг
+	// переполнения (пара бит+счётчик — как seedDomain, без дубля в order).
+	pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Set(model.FlagRenderPending)
+	pool.counters["render_pending"] = 1
+	pool.rows[renderqDomKey{zone: 5, id: 11}][0].marked = false
+
+	res, err = RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce после сброса маркера: %v", err)
+	}
+	if res.Published != 1 || res.Cleared != 1 {
+		t.Fatalf("итог %+v, ожидался published=1 cleared=1 (сброшенный маркер возвращает запись в выборку)", res)
 	}
 }
 
@@ -2658,8 +2703,9 @@ func TestRenderSQLContract(t *testing.T) {
 	}
 	if !strings.Contains(renderPendingRowsSQL, "rendered = false") ||
 		!strings.Contains(renderPendingRowsSQL, "final_url IS NOT NULL") ||
+		!strings.Contains(renderPendingRowsSQL, "render_failed_at IS NULL") ||
 		!strings.Contains(renderPendingRowsSQL, "ORDER BY subdomain_id, variant") {
-		t.Fatalf("renderPendingRowsSQL разошёлся с контрактом §6.1:\n%s", renderPendingRowsSQL)
+		t.Fatalf("renderPendingRowsSQL разошёлся с контрактом §6.1/T-210:\n%s", renderPendingRowsSQL)
 	}
 	if !strings.Contains(renderClearPendingSQL, "(t.flags & -3)::int2") ||
 		!strings.Contains(renderClearPendingSQL, "(t.flags & 2) <> 0") {

@@ -331,7 +331,37 @@ HTTP-фазы (запись уходит в `q:analyze`), `q:dead` растёт 
    `render_pending` (бит 1, значение 2): проход доработки HTTP-этапа
    (каждую минуту, с проверкой ёмкости `q:render`) сам переиздаст
    SPA-записи домена (детерминированный повторный вердикт по сохранённому
-   контенту: `rendered = false AND final_url IS NOT NULL`) и снимет флаг.
+   контенту: `rendered = false AND final_url IS NOT NULL AND
+   render_failed_at IS NULL`, T-210) и снимет флаг. Отмаркированные
+   `render_failed_at` записи (финализации T-148/T-159/T-172 уже признали
+   рендер невозможным до смены контента) проход НЕ переиздаст — флаг
+   снимется «черновым» снятием без публикаций; dead-записи инфраструктурных
+   ошибок штампа не имеют (финализации XACKают, в q:dead не попадают),
+   но смешанные домены и принудительный ре-рендер после починки хоста
+   требуют сброса маркера тем же списком доменов (T-210; оговорка: у
+   остаревших строк контент уже чистит retention — `content_hash` NULL,
+   проход их пропустит и без маркера, доработает только новый эпизод
+   `crawlerctl recheck`):
+
+   ```bash
+   # сброс маркера «рендер невозможен» по доменам dead-записей q:render
+   # (перед выставлением флага; RETURNING — контроль числа строк;
+   # zone_id IN — отсечение партиций subdomain_results, T-005)
+   PAIRS=$(redis-cli --raw XRANGE q:dead - + \
+     | grep '^{' \
+     | jq -r 'select(.stream == "q:render") | "(\(.zone_id),\(.domain_id))"' \
+     | sort -u)
+   [ -n "$PAIRS" ] || echo "dead-записей q:render нет — сброс маркера пропущен"
+   if [ -n "$PAIRS" ]; then
+     ZONES=$(printf '%s\n' "$PAIRS" | tr -d '()' | cut -d, -f1 | sort -u | paste -sd,)
+     printf '%s\n' "$PAIRS" \
+       | paste -sd, \
+       | sed "s#^#UPDATE subdomain_results AS r SET render_failed_at = NULL FROM (VALUES #; s#\$#) AS k(zone_id, domain_id) WHERE r.zone_id IN ($ZONES) AND (r.zone_id, r.domain_id) = (k.zone_id, k.domain_id) RETURNING 1#" \
+       > /tmp/opencode/unmark-render.sql
+     psql "$CRAWLER_PG_DSN" -f /tmp/opencode/unmark-render.sql
+   fi
+   ```
+
    Список доменов — из идентификаторов dead-записей. Флаг ставится
    атомарно со счётчиком рендер-долга (инвариант §6: проход доработки
    снимет бит с декрементом — установка без инкремента уводила бы

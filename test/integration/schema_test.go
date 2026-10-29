@@ -648,6 +648,8 @@ func TestSchema_ResultsTablesColumns(t *testing.T) {
 			"rendered": "boolean", "content_hash": "bytea", "error": "smallint",
 			"response_ms": "integer", "checked_at": "timestamp with time zone",
 			"rules_version": "integer",
+			// маркер «рендер невозможен» (T-210, миграция 000017)
+			"render_failed_at": "timestamp with time zone",
 		}, notNull: []string{
 			"zone_id", "domain_id", "subdomain_id", "variant", "scheme",
 			"alias_kind", "rendered", "checked_at",

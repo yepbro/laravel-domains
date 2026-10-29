@@ -1005,6 +1005,12 @@ func TestRecordWritesAllColumns(t *testing.T) {
 		!strings.Contains(recordInsertSQL, "::jsonb[]") || !strings.Contains(recordInsertSQL, "::bytea[]") {
 		t.Fatalf("recordInsertSQL разошёлся с колонками §6.1:\n%s", recordInsertSQL)
 	}
+	// T-210: render_failed_at в INSERT не входит — перезапись эпизода
+	// (DELETE + INSERT) сбрасывает маркер «рендер невозможен»: новый
+	// контент имеет право на рендер (DEFAULT NULL).
+	if strings.Contains(recordInsertSQL, "render_failed_at") {
+		t.Fatalf("recordInsertSQL пишет render_failed_at — маркер T-210 обязан сбрасываться перезаписью эпизода (DEFAULT NULL):\n%s", recordInsertSQL)
+	}
 	if !strings.Contains(recordDeleteSQL, "RETURNING content_hash") {
 		t.Fatalf("recordDeleteSQL без RETURNING content_hash (своп ссылок T-044):\n%s", recordDeleteSQL)
 	}

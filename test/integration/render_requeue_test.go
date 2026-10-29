@@ -294,6 +294,204 @@ func TestRenderRequeuePass(t *testing.T) {
 	})
 }
 
+// TestRenderRequeueFailedMarker — маркер «рендер невозможен»
+// subdomain_results.render_failed_at (T-210, миграция 000017) на живых
+// PostgreSQL/Redis: штамп финализации (SQL — литерал
+// internal/renderworker/worker.go, дублирование — стиль schema_test.go;
+// охраны content_hash/rendered, идемпотентность) исключает запись из
+// выборки прохода (публикаций нет, флаг снимается без публикации —
+// «черновой»), перезапись эпизода (DELETE + INSERT записи результата,
+// T-058) сбрасывает маркер — следующий проход переиздаёт запись.
+func TestRenderRequeueFailedMarker(t *testing.T) {
+	skipUnlessIntegration(t)
+	ctx := context.Background()
+
+	dsn, cleanup := withTestSchema(t)
+	t.Cleanup(cleanup)
+	if err := migrate.Up(ctx, dsn); err != nil {
+		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("подключение к тестовой схеме: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	rdb := resilienceRedisEnv(t)
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
+	store, err := content.OpenPackStore(pool, content.PackOptions{
+		Dir:           t.TempDir(),
+		PackSize:      8 << 10,
+		MaxStoreBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("OpenPackStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{})
+	renderQ, err := httpworker.NewRenderQueue(q, gate, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// renderFailMarkerSQL — литерал internal/renderworker/worker.go
+	// (renderFailMarkerSQL, T-210): расхождение кода и теста видно по
+	// поведению охран ниже.
+	const markerSQL = "UPDATE subdomain_results AS r " +
+		"SET render_failed_at = coalesce(r.render_failed_at, now()) " +
+		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
+		"AND r.subdomain_id = $3::int2 AND r.variant = $4::int2 " +
+		"AND r.rendered = false " +
+		"AND r.content_hash IS NOT DISTINCT FROM $5::bytea"
+
+	// Сид: домен с флагом долга и SPA-записью.
+	var zone int16
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO zones (name) VALUES ('failed.test') RETURNING id",
+	).Scan(&zone); err != nil {
+		t.Fatalf("insert zones: %v", err)
+	}
+	var id int64
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO domains (zone_id, label, flags) VALUES ($1, 'spa', 2) RETURNING id", zone,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert domains: %v", err)
+	}
+	put, err := store.Put(ctx, rqBody)
+	if err != nil {
+		t.Fatalf("сохранение контента: %v", err)
+	}
+	insertRow := func(url string, hash []byte) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO subdomain_results
+			 (zone_id, domain_id, subdomain_id, scheme, final_url, content_hash, checked_at)
+			 VALUES ($1, $2, 0, 2, $3, $4, now())`,
+			zone, id, url, hash); err != nil {
+			t.Fatalf("insert subdomain_results: %v", err)
+		}
+	}
+	insertRow("https://spa.failed.test/", put.Hash[:])
+	alignDebt := func() {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			"UPDATE domains SET flags = flags | 2 WHERE zone_id = $1 AND id = $2", zone, id); err != nil {
+			t.Fatalf("постановка флага: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			"UPDATE crawler_counters SET value = 1 WHERE name = 'render_pending'"); err != nil {
+			t.Fatalf("выравнивание счётчика долга: %v", err)
+		}
+	}
+	alignDebt()
+
+	marker := func() (*time.Time, error) {
+		var m *time.Time
+		err := pool.QueryRow(ctx,
+			"SELECT render_failed_at FROM subdomain_results WHERE zone_id = $1 AND domain_id = $2", zone, id,
+		).Scan(&m)
+		return m, err
+	}
+
+	t.Run("штамп финализации идемпотентен, охраны работают", func(t *testing.T) {
+		tag, err := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), put.Hash[:])
+		if err != nil {
+			t.Fatalf("маркер: %v", err)
+		}
+		if tag.RowsAffected() != 1 {
+			t.Fatalf("RowsAffected = %d, хочу 1 (строка того контента, rendered = false)", tag.RowsAffected())
+		}
+		m, err := marker()
+		if err != nil || m == nil {
+			t.Fatalf("render_failed_at после штампа: %v err=%v", m, err)
+		}
+
+		// Повторная финализация (сбой публикации вернул доставку) —
+		// RowsAffected 1, штамп ПЕРВОЙ финализации сохраняется (coalesce).
+		if tag, _ := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), put.Hash[:]); tag.RowsAffected() != 1 {
+			t.Fatalf("повторный штамп: RowsAffected = %d, хочу 1 (идемпотентность)", tag.RowsAffected())
+		}
+		if m2, err := marker(); err != nil || m2 == nil || !m2.Equal(*m) {
+			t.Fatalf("штамп переставлен повтором: %v (err=%v), хочу первую финализацию %v", m2, err, m)
+		}
+
+		// Охрана контента: новый эпизод переписал content_hash — штамп
+		// старой доставкой не ставится и не трогается.
+		fresh := put.Hash
+		fresh[0] ^= 0xff
+		if _, err := pool.Exec(ctx,
+			"UPDATE subdomain_results SET content_hash = $3 WHERE zone_id = $1 AND domain_id = $2",
+			zone, id, fresh[:]); err != nil {
+			t.Fatalf("смена контента: %v", err)
+		}
+		if tag, _ := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), put.Hash[:]); tag.RowsAffected() != 0 {
+			t.Fatalf("штамп чужому контенту: RowsAffected = %d, хочу 0 (охрана content_hash)", tag.RowsAffected())
+		}
+		if m, err := marker(); err != nil || m == nil {
+			t.Fatalf("штамп сбит охраной: %v err=%v", m, err)
+		}
+
+		// Охрана rendered: успешный конкурентный рендер закрыл вопрос —
+		// штамп не ставится и снимается переводом в rendered.
+		if _, err := pool.Exec(ctx,
+			"UPDATE subdomain_results SET rendered = true, render_failed_at = NULL "+
+				"WHERE zone_id = $1 AND domain_id = $2", zone, id); err != nil {
+			t.Fatalf("перевод в rendered: %v", err)
+		}
+		if tag, _ := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), fresh[:]); tag.RowsAffected() != 0 {
+			t.Fatalf("штамп rendered-строке: RowsAffected = %d, хочу 0 (охрана rendered)", tag.RowsAffected())
+		}
+		if m, err := marker(); err != nil || m != nil {
+			t.Fatalf("render_failed_at после успешного рендера: %v err=%v (снимается)", m, err)
+		}
+	})
+
+	t.Run("отмаркированная запись проходом не переиздаётся", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, "DELETE FROM subdomain_results WHERE zone_id = $1 AND domain_id = $2", zone, id); err != nil {
+			t.Fatalf("очистка строк: %v", err)
+		}
+		insertRow("https://spa.failed.test/", put.Hash[:])
+		alignDebt()
+		if tag, _ := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), put.Hash[:]); tag.RowsAffected() != 1 {
+			t.Fatalf("штамп: RowsAffected = %d, хочу 1", tag.RowsAffected())
+		}
+		res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{})
+		if err != nil {
+			t.Fatalf("RequeueOnce: %v", err)
+		}
+		if res.Selected != 1 || res.Cleared != 1 || res.Published != 0 {
+			t.Fatalf("итог %+v, ожидался selected=1 cleared=1 published=0 (отмаркированная запись не переиздаётся)", res)
+		}
+		if n := streamLen(t, rdb, queue.StreamRender); n != 0 {
+			t.Fatalf("сообщений q:render = %d, хочу 0 (T-210)", n)
+		}
+	})
+
+	t.Run("новый эпизод сбрасывает маркер — проход переиздаёт", func(t *testing.T) {
+		// Перезапись эпизода (T-058): DELETE старых строк + INSERT новых;
+		// render_failed_at в INSERT не входит — DEFAULT NULL.
+		if _, err := pool.Exec(ctx, "DELETE FROM subdomain_results WHERE zone_id = $1 AND domain_id = $2", zone, id); err != nil {
+			t.Fatalf("DELETE эпизода: %v", err)
+		}
+		insertRow("https://spa.failed.test/", put.Hash[:])
+		if m, err := marker(); err != nil || m != nil {
+			t.Fatalf("render_failed_at после перезаписи эпизода: %v err=%v (сброс в NULL)", m, err)
+		}
+		alignDebt()
+
+		res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{})
+		if err != nil {
+			t.Fatalf("RequeueOnce: %v", err)
+		}
+		if res.Selected != 1 || res.Cleared != 1 || res.Published != 1 {
+			t.Fatalf("итог %+v, ожидался selected=1 cleared=1 published=1 (сброшенный маркер вернул запись в выборку)", res)
+		}
+		if n := streamLen(t, rdb, queue.StreamRender); n != 1 {
+			t.Fatalf("сообщений q:render = %d, хочу 1", n)
+		}
+	})
+}
+
 // TestRenderRequeueZonePriority — приоритет зон прохода доработки (T-184,
 // решение (а) T-176): пачка первой ступени берёт домены зон НЕ из списка
 // render.requeue_deprioritized_zones (даже лежащие дальше по «куче» —

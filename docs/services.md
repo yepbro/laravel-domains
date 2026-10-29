@@ -188,9 +188,9 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_http_dead_host_cutoff_tasks_total` | counter | — | http-worker (T-164) | задачи q:http, завершённые dead-host cutoff: apex и www упали на connect-фазе (connection refused/connect-таймаут, оба протокола), остальные субдомены не проверялись; контроль критерия mean задачи ≤ 7 с — `crawler_stage_seconds{stage="http"}` |
 | `crawler_http_dead_host_cutoff_skipped_checks_total` | counter | — | http-worker (T-164) | проверки (субдомен × протокол), не выполненные из-за cutoff, — сэкономленный пул задачи; ошибками этапа не считаются (`crawler_stage_errors_total` серии `cutoff` не имеет); доля ложных cutoff (<1 %, критерий) меряется контрольной выборкой по биту `dead_host_cutoff` в `domains.flags` |
 | `crawler_render_records_total` | counter | `rendered` | http-worker (`false` — записи результата), render-worker (`true` — заменённые на DOM) | доля рендера = `rate(…{rendered="true"}) / rate(…{rendered="false"})` |
-| `crawler_render_tarpit_finalized_total` | counter | — | render-worker (T-148) | запись финализирована без рендера по исчерпании `render.timeout_attempts`: итог — сырой HTML HTTP-фазы, публикация q:analyze, XACK (в q:dead тарпиты не попадают); рост — доля таймаут-тарпитов на рендере |
-| `crawler_render_cert_finalized_total` | counter | — | render-worker (T-159) | запись финализирована без рендера по постоянной ошибке TLS-сертификата хоста (`net::ERR_CERT_AUTHORITY_INVALID`/`ERR_CERT_COMMON_NAME_INVALID`, с T-172 и `ERR_CERT_DATE_INVALID` — замер: 0 успешных ретраев из 321), с первой доставки: cert-класс не жжёт попытки доставок и не попадает в q:dead; рост при нулевом приросте q:dead — политика работает |
-| `crawler_render_task_finalized_total` | counter | `reason` | render-worker (T-172) | запись финализирована без рендера по ошибке класса задачи рендера (отказ соединения, load error — свойство хоста) на последней доставке `redis.max_attempts`: итог — сырой HTML HTTP-фазы, публикация q:analyze, XACK; метка reason — код `net::ERR_*` (например `net::ERR_CONNECTION_REFUSED`), `timeout` или `other`: состав того, что раньше уносило записи в q:dead |
+| `crawler_render_tarpit_finalized_total` | counter | — | render-worker (T-148) | запись финализирована без рендера по исчерпании `render.timeout_attempts`: итог — сырой HTML HTTP-фазы, штамп `render_failed_at` (T-210 — до смены контента проход доработки запись не переиздаёт), публикация q:analyze, XACK (в q:dead тарпиты не попадают); рост — доля таймаут-тарпитов на рендере |
+| `crawler_render_cert_finalized_total` | counter | — | render-worker (T-159) | запись финализирована без рендера по постоянной ошибке TLS-сертификата хоста (`net::ERR_CERT_AUTHORITY_INVALID`/`ERR_CERT_COMMON_NAME_INVALID`, с T-172 и `ERR_CERT_DATE_INVALID` — замер: 0 успешных ретраев из 321), с первой доставки: cert-класс не жжёт попытки доставок и не попадает в q:dead (штамп `render_failed_at`, T-210); рост при нулевом приросте q:dead — политика работает |
+| `crawler_render_task_finalized_total` | counter | `reason` | render-worker (T-172) | запись финализирована без рендера по ошибке класса задачи рендера (отказ соединения, load error — свойство хоста) на последней доставке `redis.max_attempts`: итог — сырой HTML HTTP-фазы, штамп `render_failed_at` (T-210), публикация q:analyze, XACK; метка reason — код `net::ERR_*` (например `net::ERR_CONNECTION_REFUSED`), `timeout` или `other`: состав того, что раньше уносило записи в q:dead |
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
 | `crawler_content_retention_rows_total` / `_refs_total` / `_contents_total` / `_freed_bytes_total` | counter | — | http-worker (T-166) | итог каждого прохода RetentionLoop (хук `RetentionOptions.OnPass`): строки `subdomain_results`, очищенные от контента/jsonb, срезанные ссылки `content_hash`, удалённые строки `contents` и их сжатые байты (место физически возвращает компактификация паков T-045 — сходимость видно по `disk_avail`); останов роста при работающем цикле = candidates кончились (плато) |
 | `crawler_content_retention_skips_total` | counter | — | http-worker (T-166) | пропуски прохода по интерлоку: глубина q:analyze у порога `content.retention_analyze_watermark` — анализатор не успевает, тела и headers/cookies ещё нужны; рост = анализ отстаёт, диск продолжает расти |
@@ -515,9 +515,14 @@ lease-индекса между вакуумами читается один р�
   алиасы наследуют вердикт оригинала), при свободной `q:render` —
   публикация `Result`-ключей и снятие флага с декрементом счётчика долга
   одной транзакцией (T-175; порядок «публикация → снятие» —
-  at-least-once §3.4); выборка пачки — без PK-порядка, seq scan с ранним
-  остановом LIMIT и закреплением плана `SET LOCAL` в транзакции выборки,
-  стационар без долга не трогает `domains` вовсе — guard точечным чтением
+  at-least-once §3.4); записи со штампом «рендер невозможен»
+  `render_failed_at` (T-210 — его ставят финализации render-worker'а)
+  выборкой не берутся: повторный проход по домену, чей флаг пережил
+  публикацию, не тратит доставок и слот-времени на уже признанные
+  невозможными записи, сбрасывает штамп перезапись эпизода; выборка
+  пачки — без PK-порядка, seq scan с ранним остановом LIMIT и
+  закреплением плана `SET LOCAL` в транзакции выборки, стационар без
+  долга не трогает `domains` вовсе — guard точечным чтением
   счётчика долга (T-181; детали — [`render.md`](render.md)); переполнение
   рендера не роняет и не задерживает DNS/HTTP-этапы.
 - тем же `OnRun` запускается цикл retention контента

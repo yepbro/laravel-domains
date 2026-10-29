@@ -120,11 +120,13 @@ type rwRowKey struct {
 }
 
 // rwRow — строка subdomain_results, которую читает renderSelectSQL и
-// меняет renderUpdateSQL.
+// меняют renderUpdateSQL (успешный рендер) и renderFailMarkerSQL
+// (маркер «рендер невозможен», T-210).
 type rwRow struct {
 	finalURL  *string
 	hash      []byte // nil — NULL (контента нет, T-056)
 	rendered  bool
+	failedAt  *time.Time // штамп «рендер невозможен» (T-210); nil — маркера нет
 	cookies   *string
 	headers   *string
 	checkedAt time.Time // час корзины rendered-темпа (T-203)
@@ -155,11 +157,17 @@ type rwFakePool struct {
 	commitErr error
 	beginErr  error
 	bumpErr   error // сбой инкремента корзины rendered-темпа (T-203)
+	markErr   error // сбой маркера «рендер невозможен» (T-210)
 	bumpTag   int64 // RowsAffected upsert корзины (0 — честный ответ)
 
 	// mutateBeforeUpdate — хук: вызывается перед UPDATE внутри транзакции
 	// (симуляция перезаписи строки перепроверкой между SELECT и UPDATE).
 	mutateBeforeUpdate func(p *rwFakePool)
+
+	// mutateBeforeMark — хук: вызывается перед маркером renderFailMarkerSQL
+	// (T-210, симуляция перезаписи строки перепроверкой между SELECT цели
+	// и штампом финализации).
+	mutateBeforeMark func(p *rwFakePool)
 
 	mu sync.Mutex
 }
@@ -201,12 +209,56 @@ func (p *rwFakePool) reanalyzeValue() int64 {
 	return p.reanalyze
 }
 
+// seedRowMarked — сид строки с маркером «рендер невозможен» (T-210):
+// штамп уже стоит (финализация прежней доставки), контент тот же.
+func (p *rwFakePool) seedRowMarked(key rwRowKey, finalURL string, hash *content.Hash) {
+	p.seedRow(key, finalURL, hash)
+	now := time.Now()
+	p.rows[key].failedAt = &now
+}
+
 func (p *rwFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
 	return 0, errors.New("rwFakePool: CopyFrom не должен вызываться")
 }
 
-func (p *rwFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("rwFakePool: Exec вне транзакции")
+// Exec — маркер «рендер невозможен» (T-210, renderFailMarkerSQL):
+// финализация штампует строку автокоммитом (без транзакции), охраны —
+// rendered = false и content_hash IS NOT DISTINCT FROM $5; прочий SQL
+// вне транзакции — ошибка (как раньше).
+func (p *rwFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if err := ctx.Err(); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if sql != renderFailMarkerSQL {
+		return pgconn.CommandTag{}, errors.New("rwFakePool: неожидаемый Exec вне транзакции: " + sql)
+	}
+	if p.mutateBeforeMark != nil {
+		p.mutateBeforeMark(p)
+	}
+	if p.markErr != nil {
+		return pgconn.CommandTag{}, p.markErr
+	}
+	if len(args) != 5 {
+		return pgconn.CommandTag{}, fmt.Errorf("rwFakePool: маркер: параметров %d, нужно 5", len(args))
+	}
+	key := rwRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
+	oldHash := args[4].([]byte)
+	r, ok := p.rows[key]
+	if !ok || r.rendered {
+		return pgconn.NewCommandTag("UPDATE 0"), nil
+	}
+	same := (r.hash == nil && oldHash == nil) ||
+		(r.hash != nil && oldHash != nil && string(r.hash) == string(oldHash))
+	if !same {
+		return pgconn.NewCommandTag("UPDATE 0"), nil
+	}
+	now := time.Now()
+	if r.failedAt == nil {
+		r.failedAt = &now // coalesce: штамп ПЕРВОЙ финализации (T-210)
+	}
+	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 
 // rwFakeRows — pgx.Rows с заготовленными строками SELECT (final_url,
@@ -379,6 +431,7 @@ func (t *rwFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row 
 	}
 	checkedAt := r.checkedAt
 	r.rendered = true
+	r.failedAt = nil // успешный рендер снимает маркер «рендер невозможен» (T-210)
 	r.finalURL = &finalURL
 	h := make([]byte, len(newHash))
 	copy(h, newHash)
@@ -879,8 +932,10 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 }
 
 // TestRenderWorker_SQLContract — точный текст SELECT и UPDATE с
-// литералами ТЗ (rendered = true, rules_version = NULL; RETURNING
-// checked_at — час корзины rendered-темпа, T-203) и upsert корзины.
+// литералами ТЗ (rendered = true, rules_version = NULL; render_failed_at
+// = NULL — успешный рендер снимает маркер T-210; RETURNING checked_at —
+// час корзины rendered-темпа, T-203), маркера «рендер невозможен»
+// (T-210) и upsert корзины.
 func TestRenderWorker_SQLContract(t *testing.T) {
 	selectWant := "SELECT final_url, content_hash FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
@@ -890,13 +945,22 @@ func TestRenderWorker_SQLContract(t *testing.T) {
 	}
 	updateWant := "UPDATE subdomain_results AS r " +
 		"SET rendered = true, final_url = $5::text, content_hash = $6::bytea, " +
-		"cookies = $7::jsonb, headers = $8::jsonb, rules_version = NULL " +
+		"cookies = $7::jsonb, headers = $8::jsonb, rules_version = NULL, render_failed_at = NULL " +
 		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
 		"AND r.subdomain_id = $3::int2 AND r.variant = $4::int2 " +
 		"AND r.content_hash IS NOT DISTINCT FROM $9::bytea " +
 		"RETURNING r.checked_at"
 	if renderUpdateSQL != updateWant {
 		t.Errorf("renderUpdateSQL =\n%s\nхочу\n%s", renderUpdateSQL, updateWant)
+	}
+	markerWant := "UPDATE subdomain_results AS r " +
+		"SET render_failed_at = coalesce(r.render_failed_at, now()) " +
+		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
+		"AND r.subdomain_id = $3::int2 AND r.variant = $4::int2 " +
+		"AND r.rendered = false " +
+		"AND r.content_hash IS NOT DISTINCT FROM $5::bytea"
+	if renderFailMarkerSQL != markerWant {
+		t.Errorf("renderFailMarkerSQL =\n%s\nхочу\n%s", renderFailMarkerSQL, markerWant)
 	}
 	bumpWant := "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('rendered:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +

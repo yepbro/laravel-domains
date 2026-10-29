@@ -14,7 +14,10 @@
 // (§7: «домен считается done после завершения DNS/HTTP-этапа, а
 // результаты рендера и анализа дополняют его асинхронно»); rendered =
 // false (DOM заменит сырой HTML рендер, T-067), rules_version = NULL
-// (проставит анализатор, T-068+). queued_at = NULL и last_checked_at =
+// (проставит анализатор, T-068+), render_failed_at — DEFAULT NULL:
+// перезапись эпизода (DELETE + INSERT) сбрасывает маркер «рендер
+// невозможен» (T-210) — новый контент имеет право на рендер.
+// queued_at = NULL и last_checked_at =
 // now() — стиль T-039: lease завершён вместе с эпизодом (инвариант
 // T-018/T-029/T-030), время — сервер БД; temp_attempts сбрасывается на
 // каждом не-temp_error итоге (контракт T-031, как у DNS-этапа T-039).
@@ -281,7 +284,11 @@ var (
 	// один оператор транзакции с точным SQL-контрактом в юнит-тестах
 	// (фантазировать с CopyFrom-источником поверх транзакции сложнее,
 	// чем массивы). rendered = false (рендер — T-067), rules_version =
-	// NULL (анализатор — T-068+), checked_at = now().
+	// NULL (анализатор — T-068+), checked_at = now(). render_failed_at
+	// в список не входит — DEFAULT NULL: перезапись эпизода (DELETE +
+	// INSERT) сбрасывает маркер «рендер невозможен» (T-210) — новый
+	// контент имеет право на рендер, починившийся хост отрендерится на
+	// следующем эпизоде.
 	recordInsertSQL = "INSERT INTO subdomain_results (" +
 		"zone_id, domain_id, subdomain_id, variant, scheme, " +
 		"http_status, final_url, alias_kind, alias_subdomain_id, " +
