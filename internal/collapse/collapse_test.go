@@ -1,7 +1,7 @@
 // Юнит-тесты переноса 2LD → TLD (T-196, ТЗТ §7) на фейковом соединении
 // (Conn) без БД: точные SQL-тексты и параметры (контракт, стиль
 // zonessync_test.go), порядок шагов §7.2 по протоколу вызовов, батчинг
-// §7.3 (окна id, транзакция на батч, 4 UPDATE диапазона вместе),
+// §7.3 (пачки id, транзакция на батч, 4 UPDATE пачки вместе),
 // идемпотентность/возобновление (сбой после N батчей — повтор
 // продолжается), ошибки батча (откат, остановка с именем зоны),
 // страховка остатка перед DROP, дедуп ingest_files, инвентаризация с
@@ -54,14 +54,14 @@ func TestSQLContract(t *testing.T) {
 		movingDropSQL:     "DROP TABLE IF EXISTS moving_ids",
 		movingCreateSQL:   "CREATE TEMP TABLE moving_ids AS SELECT id FROM domains WHERE zone_id = $1",
 		movingIndexSQL:    "CREATE INDEX ON moving_ids (id)",
-		movingRangeSQL:    "SELECT coalesce(min(id), 0), coalesce(max(id), 0) FROM moving_ids",
+		movingChunkSQL:    "SELECT id FROM moving_ids WHERE id > $1 ORDER BY id LIMIT $2",
 		spotLabelSQL:      "SELECT label FROM domains WHERE zone_id = $1 ORDER BY id LIMIT 1",
 		moveDomainsSQL: "UPDATE domains " +
 			"SET zone_id = $1, label = label || '.' || $2 " +
-			"WHERE zone_id = $3 AND id >= $4 AND id < $5",
-		moveResultsSQL:  "UPDATE subdomain_results SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id < $4",
-		moveLaravelSQL:  "UPDATE laravel_domains SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id < $4",
-		moveFindingsSQL: "UPDATE laravel_findings SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id < $4",
+			"WHERE zone_id = $3 AND id >= $4 AND id <= $5",
+		moveResultsSQL:  "UPDATE subdomain_results SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id <= $4",
+		moveLaravelSQL:  "UPDATE laravel_domains SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id <= $4",
+		moveFindingsSQL: "UPDATE laravel_findings SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id <= $4",
 		moveHistorySQL:  "UPDATE laravel_history SET zone_id = $1 WHERE zone_id = $2",
 		filesDedupeSQL: "DELETE FROM ingest_files a USING ingest_files b " +
 			"WHERE a.zone_id = $1 AND b.zone_id = $2 " +
@@ -417,7 +417,7 @@ func (f *fakeConn) moveChildren(table string, tid, zid int16, lo, hi int64) (pgc
 	n := int64(0)
 	for i := range f.children[table] {
 		c := &f.children[table][i]
-		if c.zone == zid && c.domain >= lo && c.domain < hi {
+		if c.zone == zid && c.domain >= lo && c.domain <= hi {
 			c.zone = tid
 			n++
 		}
@@ -500,20 +500,23 @@ func (f *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		f.nextZone++
 		f.zones = append(f.zones, fZone{id: zid, name: args[0].(string)})
 		return fakeRowsOf([]any{zid}), nil
-	case movingRangeSQL:
-		if len(f.moving) == 0 {
-			return fakeRowsOf([]any{int64(0), int64(0)}), nil
-		}
-		lo, hi := f.moving[0], f.moving[0]
-		for _, id := range f.moving {
-			if id < lo {
-				lo = id
+	case movingChunkSQL:
+		// keyset-пачка: id > after, по возрастанию, не более limit.
+		after := args[0].(int64)
+		limit := args[1].(int)
+		ids := append([]int64(nil), f.moving...)
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		out := ids[:0]
+		for _, id := range ids {
+			if id > after && len(out) < limit {
+				out = append(out, id)
 			}
-			if id > hi {
-				hi = id
-			}
 		}
-		return fakeRowsOf([]any{lo, hi}), nil
+		rowsVals := make([][]any, len(out))
+		for i, id := range out {
+			rowsVals[i] = []any{id}
+		}
+		return fakeRowsOf(rowsVals...), nil
 	case spotLabelSQL:
 		zid := args[0].(int16)
 		var first *fDomain
@@ -654,14 +657,14 @@ func (tx *fakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.Comma
 	switch sql {
 	case moveDomainsSQL:
 		lo, hi := args[3].(int64), args[4].(int64)
-		f.op(fmt.Sprintf("batch:[%d,%d)", lo, hi))
+		f.op(fmt.Sprintf("batch:[%d,%d]", lo, hi))
 		if f.batchErrFrom > 0 && lo >= f.batchErrFrom {
 			return pgconn.CommandTag{}, errors.New(`duplicate key value violates unique constraint "domains_zone_id_label_key"`)
 		}
 		n := int64(0)
 		for i := range f.domains {
 			d := &f.domains[i]
-			if d.zone == args[2].(int16) && d.id >= lo && d.id < hi {
+			if d.zone == args[2].(int16) && d.id >= lo && d.id <= hi {
 				d.zone = args[0].(int16)
 				d.label = d.label + "." + args[1].(string)
 				n++
@@ -723,10 +726,10 @@ func TestZoneFullTransfer(t *testing.T) {
 	wantOps := []string{
 		"call-partitions:" + fmt.Sprint(in),
 		"moving-drop", "moving-create", "moving-index",
-		// батчи по 3 id: 10..16 → окна [10,13), [13,16), [16,19)
-		"begin", "batch:[10,13)", "commit",
-		"begin", "batch:[13,16)", "commit",
-		"begin", "batch:[16,19)", "commit",
+		// батчи по 3 актуальных id: 10..16 → пачки [10,12], [13,15], [16,16]
+		"begin", "batch:[10,12]", "commit",
+		"begin", "batch:[13,15]", "commit",
+		"begin", "batch:[16,16]", "commit",
 		"history", "files-dedupe", "files-move",
 		"drop:domains_z" + strconv.Itoa(int(zid)),
 		"drop:subdomain_results_z" + strconv.Itoa(int(zid)),
@@ -798,8 +801,10 @@ func TestZoneFullTransfer(t *testing.T) {
 	}
 }
 
-// TestZoneBatches — окна батчей §7.3 по возрастанию id: [min, min+batch)
-// и далее; каждый батч — 4 UPDATE одного диапазона в одной транзакции.
+// TestZoneBatches — пачки батчей §7.3 по возрастанию фактических id из
+// moving_ids: разреженные id зоны — одна пачка [min, max] (а не окно
+// глобального id-пространства), каждый батч — 4 UPDATE одной пачки
+// в одной транзакции.
 func TestZoneBatches(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{5, 100, 9000}, false) // разреженные id
@@ -807,9 +812,10 @@ func TestZoneBatches(t *testing.T) {
 	if _, err := Zone(context.Background(), f, spec5g(zid), 50000); err != nil {
 		t.Fatalf("Zone: %v", err)
 	}
-	// Одно окно [5, 50005): все id внутри одной ширины батча.
+	// Одна пачка [5, 9000]: все 3 id — в одном батче (пачка строк,
+	// ширина id-пространства между ними не множит батчи).
 	if f.begins != 1 {
-		t.Errorf("транзакций %d, хочу 1 (все id в одном окне)", f.begins)
+		t.Errorf("транзакций %d, хочу 1 (все id в одной пачке)", f.begins)
 	}
 	var dom []call
 	var child []call
@@ -827,8 +833,8 @@ func TestZoneBatches(t *testing.T) {
 	in, _ := f.zoneID("in")
 	// Параметры UPDATE доменов: tid, префикс, zid, lo, hi (контракт §7.3).
 	if got := dom[0].args; len(got) != 5 || got[0] != in || got[1] != "5g" ||
-		got[2] != zid || got[3] != int64(5) || got[4] != int64(50005) {
-		t.Errorf("аргументы UPDATE доменов = %v, хочу [%d 5g %d 5 50005]", got, in, zid)
+		got[2] != zid || got[3] != int64(5) || got[4] != int64(9000) {
+		t.Errorf("аргументы UPDATE доменов = %v, хочу [%d 5g %d 5 9000]", got, in, zid)
 	}
 	// Дети — тем же диапазоном, тем же батчем (4 UPDATE вместе).
 	if len(child) != 3 {
@@ -836,7 +842,7 @@ func TestZoneBatches(t *testing.T) {
 	}
 	for _, c := range child {
 		if got := c.args; len(got) != 4 || got[0] != in || got[1] != zid ||
-			got[2] != int64(5) || got[3] != int64(50005) {
+			got[2] != int64(5) || got[3] != int64(9000) {
 			t.Errorf("аргументы UPDATE детей %s = %v", c.sql[:30], got)
 		}
 	}
@@ -875,7 +881,7 @@ func TestZoneResume(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "зона 5g.in") {
 		t.Fatalf("ошибка прерывания = %v, хочу контекст зоны 5g.in", err)
 	}
-	// Частичный перенос: окно [1,3) уехало, файлы/партиции/зона на месте.
+	// Частичный перенос: пачка [1,2] уехала, файлы/партиции/зона на месте.
 	moved, left := 0, 0
 	for _, d := range f.domains {
 		switch d.zone {
@@ -892,7 +898,7 @@ func TestZoneResume(t *testing.T) {
 		t.Fatal("строка зоны удалена до завершения переноса")
 	}
 
-	// Повтор: moving_ids пересобран по остатку, окна адресуют только
+	// Повтор: moving_ids пересобран по остатку, пачки адресуют только
 	// оставшиеся строки.
 	f.beginErrAfter = 0
 	res, err := Zone(context.Background(), f, spec5g(zid), 2)
@@ -938,13 +944,13 @@ func TestZoneResume(t *testing.T) {
 func TestZoneBatchConflict(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{1, 2, 3, 4}, false)
-	f.batchErrFrom = 3 // второй батч [3,5)
+	f.batchErrFrom = 3 // второй батч [3,4]
 
 	_, err := Zone(context.Background(), f, spec5g(zid), 2)
 	if err == nil {
 		t.Fatal("конфликт UNIQUE не остановил команду")
 	}
-	for _, want := range []string{"зона 5g.in", "[3, 5)", "domains_zone_id_label_key"} {
+	for _, want := range []string{"зона 5g.in", "[3, 4]", "domains_zone_id_label_key"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("ошибка %q не содержит %q", err, want)
 		}

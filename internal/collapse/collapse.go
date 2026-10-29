@@ -106,9 +106,13 @@ const (
 	movingDropSQL   = "DROP TABLE IF EXISTS moving_ids"
 	movingCreateSQL = "CREATE TEMP TABLE moving_ids AS SELECT id FROM domains WHERE zone_id = $1"
 	movingIndexSQL  = "CREATE INDEX ON moving_ids (id)"
-	// movingRangeSQL — границы окон: id ≥ 1 (последовательность
-	// domain_id_seq), coalesce 0 — пустое множество (батчей нет).
-	movingRangeSQL = "SELECT coalesce(min(id), 0), coalesce(max(id), 0) FROM moving_ids"
+	// movingChunkSQL — очередная пачка актуальных id переноса (keyset по
+	// id): батч §7.3 — пачка строк moving_ids, а не окно глобального
+	// id-пространства (домены зоны разрежены по всей последовательности
+	// domain_id_seq — окно 50k id почти пусто, боевые зоны давали сотни
+	// пустых батчей). Границы батча — [min, max] пачки, диапазон
+	// замкнутый.
+	movingChunkSQL = "SELECT id FROM moving_ids WHERE id > $1 ORDER BY id LIMIT $2"
 	// spotLabelSQL — метка первого домена зоны до переноса: материал
 	// спот-чека §7.5 (domain_info после переноса).
 	spotLabelSQL = "SELECT label FROM domains WHERE zone_id = $1 ORDER BY id LIMIT 1"
@@ -122,10 +126,10 @@ const (
 const (
 	moveDomainsSQL = "UPDATE domains " +
 		"SET zone_id = $1, label = label || '.' || $2 " +
-		"WHERE zone_id = $3 AND id >= $4 AND id < $5"
-	moveResultsSQL  = "UPDATE subdomain_results SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id < $4"
-	moveLaravelSQL  = "UPDATE laravel_domains SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id < $4"
-	moveFindingsSQL = "UPDATE laravel_findings SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id < $4"
+		"WHERE zone_id = $3 AND id >= $4 AND id <= $5"
+	moveResultsSQL  = "UPDATE subdomain_results SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id <= $4"
+	moveLaravelSQL  = "UPDATE laravel_domains SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id <= $4"
+	moveFindingsSQL = "UPDATE laravel_findings SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id <= $4"
 	// laravel_history — без партиций, объём на порядки меньше (миграция
 	// 000011): одним оператором на зону (§7.2 шаг 4).
 	moveHistorySQL = "UPDATE laravel_history SET zone_id = $1 WHERE zone_id = $2"
@@ -377,14 +381,19 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 		res.SpotLabel = label + "." + spec.Prefix
 	}
 
-	// Шаг 4 — перенос батчами (§7.3): окна по возрастанию id.
-	lo0, hi0, err := movingRange(ctx, conn)
-	if err != nil {
-		return res, err
-	}
-	for lo := lo0; hi0 > 0 && lo <= hi0; lo += int64(batch) {
-		hi := lo + int64(batch)
-		m, err := moveBatch(ctx, conn, spec, tid, lo, hi)
+	// Шаг 4 — перенос батчами (§7.3): пачки по batch актуальных id из
+	// moving_ids по возрастанию (keyset), границы батча — [min, max]
+	// пачки; домены и их дети одного диапазона едут атомарно.
+	last := int64(0)
+	for {
+		ids, err := movingChunk(ctx, conn, last, batch)
+		if err != nil {
+			return res, err
+		}
+		if len(ids) == 0 {
+			break
+		}
+		m, err := moveBatch(ctx, conn, spec, tid, ids[0], ids[len(ids)-1])
 		if err != nil {
 			return res, err
 		}
@@ -393,6 +402,10 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 		res.Results += m.results
 		res.Laravel += m.laravel
 		res.Findings += m.findings
+		last = ids[len(ids)-1]
+		if len(ids) < batch {
+			break
+		}
 	}
 
 	// laravel_history — одним оператором на зону (без партиций).
@@ -489,22 +502,25 @@ func firstZoneLabel(ctx context.Context, conn db.DB, zoneID int16) (string, bool
 	return "", false, nil
 }
 
-// movingRange — границы окон батчей: [min(id), max(id)] moving_ids;
-// 0/0 — множество пусто.
-func movingRange(ctx context.Context, conn db.DB) (int64, int64, error) {
-	rows, err := conn.Query(ctx, movingRangeSQL)
+// movingChunk — очередная пачка id переноса (keyset: строго после
+// after, по возрастанию, не более limit строк); пустая пачка — перенос
+// исчерпан. Читается до конца (rows исчерпаны — соединение свободно
+// для транзакции батча).
+func movingChunk(ctx context.Context, conn db.DB, after int64, limit int) ([]int64, error) {
+	rows, err := conn.Query(ctx, movingChunkSQL, after, limit)
 	if err != nil {
-		return 0, 0, fmt.Errorf("moving_ids: границы: %w", err)
+		return nil, fmt.Errorf("moving_ids: пачка: %w", err)
 	}
 	defer rows.Close()
-	if !rows.Next() {
-		return 0, 0, fmt.Errorf("moving_ids: границы: пустой ответ агрегата")
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("moving_ids: пачка: чтение: %w", err)
+		}
+		ids = append(ids, id)
 	}
-	var lo, hi int64
-	if err := rows.Scan(&lo, &hi); err != nil {
-		return 0, 0, fmt.Errorf("moving_ids: границы: чтение: %w", err)
-	}
-	return lo, hi, rows.Err()
+	return ids, rows.Err()
 }
 
 // batchMoved — строки одного батча по таблицам.
@@ -521,7 +537,7 @@ func moveBatch(ctx context.Context, conn Conn, spec Spec, tid int16, lo, hi int6
 	var m batchMoved
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return m, fmt.Errorf("зона %s: батч [%d, %d): транзакция: %w", spec.Name, lo, hi, err)
+		return m, fmt.Errorf("зона %s: батч [%d, %d]: транзакция: %w", spec.Name, lo, hi, err)
 	}
 	// Откат безусловно: после Commit — no-op (стиль monitor, T-044).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -539,12 +555,12 @@ func moveBatch(ctx context.Context, conn Conn, spec Spec, tid int16, lo, hi int6
 	for _, st := range steps {
 		tag, err := tx.Exec(ctx, st.sql, st.args...)
 		if err != nil {
-			return m, fmt.Errorf("зона %s: батч [%d, %d): %w", spec.Name, lo, hi, err)
+			return m, fmt.Errorf("зона %s: батч [%d, %d]: %w", spec.Name, lo, hi, err)
 		}
 		*st.dst = tag.RowsAffected()
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return m, fmt.Errorf("зона %s: батч [%d, %d): фиксация: %w", spec.Name, lo, hi, err)
+		return m, fmt.Errorf("зона %s: батч [%d, %d]: фиксация: %w", spec.Name, lo, hi, err)
 	}
 	return m, nil
 }
