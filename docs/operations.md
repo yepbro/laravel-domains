@@ -453,6 +453,12 @@ systemctl stop crawler.target      # весь набор (бой); точечн�
 make down                          # dev (тома сохраняются)
 ```
 
+Таймер ресайкла chromium (`crawler-chromium-recycle.timer`, T-208) в
+`crawler.target` не входит (deploy.md §2.2): при остановленном наборе
+гасить отдельно — `systemctl disable --now
+crawler-chromium-recycle.timer`, иначе очередной запуск (раз в 2 ч)
+поднимет остановленный chromium.
+
 Перезапуск любого сервиса безопасен: недоработанные задачи вернутся
 повторной доставкой, домены — lease-проходом (ТЗ 11.4 п. 9).
 

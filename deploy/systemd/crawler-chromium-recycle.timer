@@ -1,0 +1,17 @@
+# Domain Crawler — таймер ресайкла Chromium (T-208): раз в 2 ч запускает
+# crawler-chromium-recycle.service (рестарт crawler-chromium; пара
+# установлена на боевом сервере 29.10 в окне T-198, перенесена в
+# комплект). Период — по замеру деградации 29.10 (~2 ч, шапка
+# crawler-chromium-recycle.service); первый запуск через 30 мин после
+# активации таймера (OnActiveSec) — после старта браузер свежий и в
+# ресайкле не нуждается. Обоснование и установка — docs/deploy.md §2.2.
+
+[Unit]
+Description=Таймер ресайкла crawler-chromium каждые 2 ч
+
+[Timer]
+OnActiveSec=30min
+OnUnitActiveSec=2h
+
+[Install]
+WantedBy=timers.target

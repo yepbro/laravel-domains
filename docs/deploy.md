@@ -147,7 +147,8 @@ Chromium отдельным юнитом, а не процессом ворке�
 — тот же контракт, что у dev-профиля app. Компенсация remote-режима:
 перезапуск по числу страниц/RSS изнутри воркера (T-065) невозможен для
 чужого процесса — потолок и перезапуск держит юнит (аналогия mem_limit
-dev-сервиса chromium, docs/docker.md §6).
+dev-сервиса chromium, docs/docker.md §6); плановый ресайкл раз в 2 ч —
+таймер `crawler-chromium-recycle.timer` (§2.2 ниже, T-208).
 
 Применение T-160 на живом сервере (unbound 700 → 800M, dns-worker
 256 → 384M) — **до деплоя**, по образцу §2.1 (T-158): значения те же,
@@ -282,7 +283,10 @@ configuration.md, `render`): второй воркер оправдан, ког�
   `crawler-chromium.service` с портом 9223 и отдельным user-data-dir
   (например `/var/lib/crawler/chromium2`); его cgroup ≈2 ГБ — отдельная
   строка бюджета ТЗ 3.2, на сервере 8 ГБ — только по замеру свободной
-  памяти (MemAvailable, §12).
+  памяти (MemAvailable, §12); ресайкл таймером
+  `crawler-chromium-recycle.timer` (см. ниже) не покрывается — имя юнита
+  зашито в `ExecStart`, второму нужен свой таймер по образцу
+  (юнит-шаблон второго Chromium — T-209).
 
 Запуск и контроль:
 
@@ -297,6 +301,45 @@ journalctl -t crawler-render-worker@9109 -f # логи экземпляра
 `redis.claim_min_idle`). Копируется шаблон общим порядком установки
 (§4.6, `cp deploy/systemd/crawler*.service` — маска захватывает и
 шаблон).
+
+#### Ресайкл Chromium: таймер crawler-chromium-recycle (T-208)
+
+Пара [`crawler-chromium-recycle.service`](../deploy/systemd/crawler-chromium-recycle.service)
+и [`crawler-chromium-recycle.timer`](../deploy/systemd/crawler-chromium-recycle.timer)
+раз в 2 ч перезапускает `crawler-chromium` — анти-деградация
+remote-режима рендера. **Когда нужен**: боевой деплой по умолчанию
+работает в remote-режиме (§2, `render.remote_url = ws://127.0.0.1:9222`),
+где воркер не может перезапустить чужой браузер по числу страниц/RSS
+(T-065) — ресайкл держит systemd, а не воркер. Без него chromium копит
+память 400→950+ МиБ за ~2 ч, таймауты рендера удваиваются; замер 29.10
+(окно дренажа T-198): после ресайкла таймауты вдвое ниже, 227→110. В
+local-режиме (`render.remote_url` пуст — браузер как процесс воркера)
+таймер не нужен: воркер сам перезапускает браузер (T-065,
+[`render.md`](render.md)).
+
+Цена рестарта — прерванные идущие рендеры (<1 мин каждый): доставки
+вернутся клеймом XAUTOCLAIM (идемпотентность ТЗ 3.4), воркер переживает
+паузу потребления при мёртвом браузере (docs/render.md). Период — по
+замеру деградации (~2 ч, `OnUnitActiveSec`), первый запуск через 30 мин
+после активации таймера (`OnActiveSec`) — после старта браузер свежий.
+
+Установка — общим порядком §4.6 (маска `cp` захватывает `crawler*.timer`,
+таймер в списке `enable --now`); на уже развёрнутом хосте (пара
+установлена 29.10 вручную, вне комплекта) достаточно:
+
+```bash
+cp deploy/systemd/crawler-chromium-recycle.{service,timer} /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now crawler-chromium-recycle.timer
+systemctl list-timers 'crawler-chromium-recycle*' # контроль расписания
+```
+
+Таймер живёт в `timers.target`, в `crawler.target` не входит (директивы —
+как на сервере) и остановкой набора не гасится: очередной запуск
+ресайкла (`systemctl restart`) поднимёт остановленный chromium. При
+остановке/выключении набора гасить таймер отдельно — `systemctl
+disable --now crawler-chromium-recycle.timer` (обратное включение —
+§4.6).
 
 ## 3. Пользователи: статические, по одному на сервис
 
@@ -576,10 +619,10 @@ ops-workflow'ем `ops-telegram-env` (Actions → Run workflow: значения
 ### 4.6. Юниты и запуск
 
 ```bash
-cp deploy/systemd/crawler*.service deploy/systemd/crawler.target /etc/systemd/system/
+cp deploy/systemd/crawler*.service deploy/systemd/crawler*.timer deploy/systemd/crawler.target /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now crawler.target \
-    crawler-chromium.service crawler-ingest.service crawler-scheduler.service \
+    crawler-chromium.service crawler-chromium-recycle.timer crawler-ingest.service crawler-scheduler.service \
     crawler-dns-worker.service crawler-http-worker.service crawler-render-worker.service \
     crawler-analyzer.service crawler-monitor.service crawler-web.service \
     crawler-dashboard.service
@@ -660,7 +703,8 @@ install -m 0644 deploy/nrd/crawler-nrd.cron /etc/cron.d/crawler-nrd
 
 ```bash
 systemctl list-units 'crawler-*'        # статус всех сервисов набора
-systemctl stop crawler.target           # весь набор (graceful: PartOf=)
+systemctl stop crawler.target           # весь набор (graceful: PartOf=);
+                                       # таймер ресайкла отдельно — §2.2 (T-208)
 journalctl -t crawler-scheduler -f      # логи по SyslogIdentifier
 curl -fsS 127.0.0.1:9102/livez         # liveness каждого сервиса
 curl -fsS 127.0.0.1:9102/healthz       # readiness (пул БД); /metrics — тот же порт
