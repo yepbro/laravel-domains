@@ -127,7 +127,7 @@ func TestRenderWorker_TaskFinalizeBoundary(t *testing.T) {
 		f := newRWFixture(t)
 		raw := rwTestHash(1)
 		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
-		f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_NAME_NOT_RESOLVED")
+		f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")
 		var err error
 		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{MaxAttempts: max})
 		if err != nil {

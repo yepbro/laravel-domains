@@ -5,8 +5,9 @@
 // rendered=true счётчика crawler_render_records_total (ветку false
 // наращивает HTTP-этап после записи результата; доля — отношением rate
 // в PromQL), тарпит-финализации без рендера (T-148), финализации по
-// постоянной ошибке сертификата хоста (T-159) и финализации ошибки
-// класса задачи на последней попытке с меткой причины (T-172).
+// постоянной ошибке сертификата хоста (T-159), финализации по DNS-отказу
+// хоста (T-211) и финализации ошибки класса задачи на последней попытке
+// с меткой причины (T-172).
 package renderworker
 
 import (
@@ -35,6 +36,7 @@ type Metrics struct {
 	rendered prometheus.Counter     // crawler_render_records_total{rendered="true"}
 	tarpits  prometheus.Counter     // crawler_render_tarpit_finalized_total (T-148)
 	certs    prometheus.Counter     // crawler_render_cert_finalized_total (T-159)
+	dns      prometheus.Counter     // crawler_render_dns_finalized_total (T-211)
 	tasksFin *prometheus.CounterVec // crawler_render_task_finalized_total{reason} (T-172)
 }
 
@@ -69,6 +71,10 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		certs: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_cert_finalized_total",
 			Help: "Записи, финализированные без рендера по постоянной ошибке TLS-сертификата хоста — net::ERR_CERT_AUTHORITY_INVALID / net::ERR_CERT_COMMON_NAME_INVALID (T-159): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze, в q:dead cert-класс не попадает.",
+		}).WithLabelValues(),
+		dns: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_render_dns_finalized_total",
+			Help: "Записи, финализированные без рендера по DNS-отказу хоста — net::ERR_NAME_NOT_RESOLVED (T-211): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze, в q:dead DNS-класс не попадает.",
 		}).WithLabelValues(),
 		tasksFin: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_task_finalized_total",
@@ -115,6 +121,18 @@ func (m *Metrics) CertFinalized() {
 		return
 	}
 	m.certs.Inc()
+}
+
+// DNSFinalized — запись финализирована без рендера по DNS-отказу хоста
+// (T-211): +1 в счётчик DNS-финализаций — материал критерия «−2
+// доставки и −20 мин PEL на мёртвом хосте» (замер T-207: 252+186
+// финализаций в сутки; рост счётчика при нулевом приросте q:dead —
+// политика работает).
+func (m *Metrics) DNSFinalized() {
+	if m == nil {
+		return
+	}
+	m.dns.Inc()
 }
 
 // TaskFinalized — запись финализирована без рендера по ошибке класса

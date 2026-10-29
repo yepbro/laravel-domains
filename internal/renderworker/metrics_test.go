@@ -67,6 +67,7 @@ func TestMetricsNilSafe(t *testing.T) {
 	m.Error(render.ClassTask) // no-op
 	m.TarpitFinalized()       // no-op (T-148)
 	m.CertFinalized()         // no-op (T-159)
+	m.DNSFinalized()          // no-op (T-211)
 	m.TaskFinalized("other")  // no-op (T-172)
 }
 
@@ -82,6 +83,7 @@ func TestMetricsMethods(t *testing.T) {
 	m.Error(render.ClassBrowser)
 	m.TarpitFinalized()
 	m.CertFinalized()
+	m.DNSFinalized()
 	m.TaskFinalized("net::ERR_CONNECTION_REFUSED")
 	m.TaskFinalized("net::ERR_CONNECTION_REFUSED")
 	m.TaskFinalized("other")
@@ -101,6 +103,9 @@ func TestMetricsMethods(t *testing.T) {
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 1 {
 		t.Errorf("crawler_render_cert_finalized_total = %v, want 1", got)
+	}
+	if got := rwMetricValue(t, reg, "crawler_render_dns_finalized_total", nil); got != 1 {
+		t.Errorf("crawler_render_dns_finalized_total = %v, want 1", got)
 	}
 	for reason, want := range map[string]float64{
 		"net::ERR_CONNECTION_REFUSED": 2,

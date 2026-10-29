@@ -185,7 +185,7 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 		err  error
 	}{
 		{"отказ соединения (может быть временным)", rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")},
-		{"резолв (может быть временным)", rwCertErr("https://spa.example/", "net::ERR_NAME_NOT_RESOLVED")},
+		{"таймаут соединения (может быть временным)", rwCertErr("https://spa.example/", "net::ERR_CONNECTION_TIMED_OUT")},
 		{"код сертификата в чужом классе (контекст умер)", &render.Error{
 			Class: render.ClassContext, URL: "https://spa.example/",
 			Err: &chromedp.LoadError{ErrorText: "net::ERR_CERT_AUTHORITY_INVALID"}}},
