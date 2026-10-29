@@ -30,9 +30,10 @@
 # инстанс chromium на :9223: per-instance файл
 # /etc/crawler/render-worker@<порт>.env (необязательный, позже общего
 # crawler.env — переопределяет) с
-# CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223; юнит chromium — копия
-# crawler-chromium.service с портом 9223 и отдельным user-data-dir
-# (например /var/lib/crawler/chromium2), своя cgroup ≈2 ГБ (ТЗ 3.2 —
+# CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223; юнит второго chromium —
+# в комплекте: crawler-chromium2.service (deploy.md §2.2, T-209;
+# ReadWritePaths обязательно на каталог chromium2 — дефект sed-копии
+# описан в шапке юнита), своя cgroup ≈2 ГБ (ТЗ 3.2 —
 # отдельная строка бюджета; на сервере 8 ГБ — только по замеру
 # свободной памяти, MemAvailable §12 load-measurements.md).
 # Логи экземпляра: journalctl -t crawler-render-worker@<порт>.

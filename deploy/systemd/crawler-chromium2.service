@@ -1,0 +1,105 @@
+# Domain Crawler — Chromium headless-shell для render-worker (CDP на
+# 127.0.0.1:9223). ТЗ 3.2: строка бюджета отдельная — «Chromium (рендер,
+# cgroup MemoryMax) ≈ 2 ГБ»; ТЗ 10.1: Chromium — отдельный пакет/каталог
+# (не пакет ОС, а дистрибутив headless-shell в /opt/crawler/chromium —
+# та же сборка, что в образе chromedp/headless-shell dev/dev-runtime
+# окружения, версия — CHROMEDP_HEADLESS_IMAGE в .env.example).
+#
+# Отдельный юнит, а не процесс воркера (render.remote_url пуст = собственный
+# процесс): у Chromium своя cgroup с потолком 2 ГБ — OOM внутри браузера
+# (отдельная вкладка/процесс рендера) убивается ядром в пределах этой
+# cgroup и перезапускается systemd'ом, не затрагивая воркер и остальные
+# сервисы; рестарты по числу страниц изнутри воркера (T-065) в remote-режиме
+# не работают (чужой процесс) — потолок и рестарт держит этот юнит
+# (аналогия mem_limit dev-сервиса chromium, docs/render.md, docs/deploy.md).
+#
+# --no-sandbox обязателен: непривилегированный пользователь без
+# user-namespace sandbox (тот же флаг передаёт воркер в локальном режиме,
+# internal/render). Слушает только loopback — CDP не наружу (ТЗ §9).
+#
+# Второй инстанс chromium — шаблон на будущее (T-209), по умолчанию НЕ
+# включается: поднимается при насыщении первого браузера (MemoryCurrent
+# юнита chromium у 2048M / стационарный потолок скорости при свободных
+# слотах воркера) и наличии памяти — своя cgroup ≈2 ГБ, отдельная строка
+# бюджета ТЗ 3.2. Родился в эксперименте 29.10 (окно дренажа T-198)
+# как sed-копия crawler-chromium.service: порт 9222→9223,
+# --user-data-dir=…/chromium2/profile, Description; остальные — как
+# у первого инстанса, кроме ReadWritePaths (фикс — ниже). Имя —
+# конкретный юнит, а не шаблон @.service: спецификаторы в путях
+# изоляции (ReadWritePaths=) systemd раскрывает давно (с v233; на
+# сервере 255 работает), но пара «порт 9223 + профиль chromium2» из
+# одного %i не выводится (9223 и 2 — разные числа) — шаблон потребовал бы
+# переименования порта или каталога на сервере; конкретный юнит хранит
+# серверные директивы буквально и сверяется побайтово (md5,
+# прецедент T-208).
+#
+# Дефект юнита-копии (29.10, зафиксирован, чтобы не повторить):
+# ReadWritePaths обязан указывать каталог профиля ЭТОГО инстанса —
+# chromium2, и это замена, а не добавление (каталог первого инстанса
+# второму не нужен). В sed-копии осталась строка оригинала
+# «ReadWritePaths=/var/lib/crawler/chromium»: в паре с
+# ProtectSystem=strict она запрещает запись в chromium2 → headless-shell
+# не может создать профиль → exit → рестарт-луп → start-limit
+# (StartLimitBurst=10 за 5 мин) → юнит failed; воркер на
+# ws://127.0.0.1:9223 в это время crash-loop «dial tcp 127.0.0.1:9223:
+# connection refused». Каталог профиля создаётся до старта:
+# install -d -o crawler-chromium -g crawler -m 0770 /var/lib/crawler/chromium2.
+#
+# Итог эксперимента 29.10: на 4 vCPU второй браузер конвейер не ускорил
+# (96 дом/мин против 112–144 у одного) — узкое место CPU, два браузера
+# суммарно ≈400 %; юнит на сервере disable, env-файл воркера удалён,
+# файл оставлен как шаблон для возврата к двум браузерам на расширенном
+# железе. Ресайкл crawler-chromium-recycle.timer (T-208) второй инстанс
+# не покрывает (имя юнита зашито в ExecStart= ресайкл-сервиса) — нужен
+# свой таймер по образцу. Установка и откат — docs/deploy.md §2.2
+# (комплект §4.6 копирует маской crawler*.service, в список
+# enable --now не входит).
+
+[Unit]
+Description=Domain Crawler — Chromium второй инстанс (headless-shell, CDP 127.0.0.1:9223, deploy.md §2.2)
+PartOf=crawler.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=crawler-chromium
+Group=crawler
+SyslogIdentifier=crawler-chromium
+ExecStart=/opt/crawler/chromium/headless-shell --remote-debugging-address=127.0.0.1 --remote-debugging-port=9223 --no-sandbox --disable-gpu --user-data-dir=/var/lib/crawler/chromium2/profile
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+# ТЗ 3.2: бюджет Chromium ≈ 2 ГБ (потолок выше бюджета не нужен: воркер
+# в отдельной cgroup, это потолок только браузера; сопоставимо
+# с MEM_CHROMIUM/MEM_RENDER dev-окружения).
+MemoryMax=2048M
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+# Набор мягче, чем у Go-сервисов: V8 требует исполняемую память JIT
+# (MemoryDenyWriteExecute сломал бы JS), network change listener браузера
+# общается через AF_NETLINK. Остальное — как у сервисов.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Служебный профиль браузера (страницы задач живут в изолированных
+# контекстах CDP и его не касаются — docs/render.md). Каталог — только
+# этого инстанса (chromium2): при ручном копировании юнита заменять
+# обязательно, чужой каталог = старт в start-limit (дефект — шапка, T-209).
+ReadWritePaths=/var/lib/crawler/chromium2
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target

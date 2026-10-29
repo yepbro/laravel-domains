@@ -42,7 +42,7 @@ cgroup, systemd перезапускает юнит, остальные серв
 | `redis-server.service` + drop-in | **640M** (maxmemory 512mb + ~128 МБ служебных, docs/redis.md §7) | Redis ≤ 0,5 ГБ |
 | `unbound.service` + drop-in | **800M** (бюджет ≈ 0,7 ГБ + рост кэша на ≈47 млн имён: 733.9 MiB у старого потолка 700M, §12; +100M из MemAvailable 2.6 GiB) | Unbound ≈ 0,7 ГБ |
 | `crawler-*.service` (9 юнитов) | **2436M суммарно** (второй экземпляр render-worker@ добавляет свой 256M — §2.2) | Go-сервисы ≈ 1,3 ГБ (7 конвейерных) + web этапа 13 + dashboard этапа 15 |
-| `crawler-chromium.service` | **2048M** | Chromium ≈ 2 ГБ |
+| `crawler-chromium.service` | **2048M** | Chromium ≈ 2 ГБ (шаблон второго инстанса chromium2 — ещё +2048M при включении, §2.2/T-209) |
 
 Итого потолки 8996M при 8192M RAM — суммарно выше объёма памяти, и это
 допустимо: потолок — не резервация, одновременного касания всех потолков
@@ -279,14 +279,15 @@ configuration.md, `render`): второй воркер оправдан, ког�
   при свободных слотах): per-instance файл
   `/etc/crawler/render-worker@9109.env` с
   `CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223` (шаблон подключает
-  его позже общего crawler.env — переопределяет), юнит chromium — копия
-  `crawler-chromium.service` с портом 9223 и отдельным user-data-dir
-  (например `/var/lib/crawler/chromium2`); его cgroup ≈2 ГБ — отдельная
-  строка бюджета ТЗ 3.2, на сервере 8 ГБ — только по замеру свободной
-  памяти (MemAvailable, §12); ресайкл таймером
+  его позже общего crawler.env — переопределяет), юнит — в комплекте:
+  [`crawler-chromium2.service`](../deploy/systemd/crawler-chromium2.service)
+  (порт 9223, отдельный профиль `/var/lib/crawler/chromium2/profile`;
+  установка и дефект ReadWritePaths — подраздел ниже, T-209); его
+  cgroup ≈2 ГБ — отдельная строка бюджета ТЗ 3.2, на сервере 8 ГБ —
+  только по замеру свободной памяти (MemAvailable, §12); ресайкл таймером
   `crawler-chromium-recycle.timer` (см. ниже) не покрывается — имя юнита
-  зашито в `ExecStart`, второму нужен свой таймер по образцу
-  (юнит-шаблон второго Chromium — T-209).
+  зашито в `ExecStart=` ресайкл-сервиса, второму нужен свой таймер
+  по образцу.
 
 Запуск и контроль:
 
@@ -301,6 +302,71 @@ journalctl -t crawler-render-worker@9109 -f # логи экземпляра
 `redis.claim_min_idle`). Копируется шаблон общим порядком установки
 (§4.6, `cp deploy/systemd/crawler*.service` — маска захватывает и
 шаблон).
+
+#### Второй Chromium: юнит crawler-chromium2 (T-209)
+
+[`crawler-chromium2.service`](../deploy/systemd/crawler-chromium2.service)
+— второй инстанс headless-shell (CDP `127.0.0.1:9223`, отдельный профиль
+`/var/lib/crawler/chromium2/profile`, своя cgroup с MemoryMax 2048M) для
+второго воркера ступени 3 (буллет выше). Перенесён из эксперимента 29.10
+(окно дренажа T-198), где получен sed-копией `crawler-chromium.service`
+(порт 9222→9223, user-data-dir, Description; остальные директивы — как у
+первого, кроме `ReadWritePaths` — фикс ниже), директивы сверены с сервером
+побайтово. Это конкретный юнит, а не `@.service`-шаблон: спецификаторы
+в путях изоляции (`ReadWritePaths=`) systemd раскрывает давно (с v233;
+на сервере Ubuntu 24.04 — systemd 255, работает), но пара «порт 9223 +
+профиль chromium2» из одного `%i` не выводится (9223 и 2 — разные
+числа) — шаблон потребовал бы переименования порта или каталога на
+сервере; конкретный юнит хранит серверные директивы буквально
+и сверяется md5. На сервере
+после эксперимента юнит **disable** (env-файл воркера удалён): в комплекте
+файл — шаблон на случай возврата к двум браузерам, состоянием
+сервера после установки комплекта не управляет — §4.6 копирует его маской
+`crawler*.service`, но в список `enable --now` он не входит.
+
+Возврат к двум браузерам (насыщение первого + свободная память — критерии
+буллета выше; сумма потолков §2 8996M вырастет на 2048M до ≈11 ГБ при
+8 ГБ RAM — только по замеру MemAvailable, §12):
+
+```bash
+install -d -o crawler-chromium -g crawler -m 0770 /var/lib/crawler/chromium2
+cp deploy/systemd/crawler-chromium2.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now crawler-chromium2.service
+curl -fsS 127.0.0.1:9223/json/version # CDP второго браузера отвечает
+journalctl -u crawler-chromium2 -f    # логи: SyslogIdentifier общий с первым, отличать по юниту
+# воркер → второй браузер: per-instance env (буллет выше). Файл создаём
+# с этой единственной строкой; появятся иные переопределения — дописывать
+# (`>>`), не затирая:
+echo 'CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223' \
+  > /etc/crawler/render-worker@9109.env
+systemctl restart crawler-render-worker@9109
+```
+
+Откат — `systemctl disable --now crawler-chromium2.service`, удалить
+`/etc/crawler/render-worker@9109.env` и перезапустить экземпляр воркера
+(вернётся к :9222 из общего crawler.env) — состояние сервера на 30.10.
+
+**Дефект ручного копирования** (найден 29.10): при копировании
+`crawler-chromium.service` sed'ом `ReadWritePaths` обязан быть заменён на
+каталог профиля этого инстанса — `/var/lib/crawler/chromium2`, именно
+заменён, не дополнен (каталог первого инстанса второму не нужен).
+Оставшийся от оригинала `ReadWritePaths=/var/lib/crawler/chromium` в
+паре с `ProtectSystem=strict` запрещает запись в `chromium2` —
+headless-shell не может создать профиль, exit → рестарт-луп до start-limit
+(10 стартов за 5 мин, юнит failed), а воркер на `:9223` в это время
+crash-loop «dial tcp 127.0.0.1:9223: connection refused». Симптом
+обманчив — выглядит как падение браузера, причина — путь в изоляции
+юнита (подробности — шапка юнита). Лечение: правка `ReadWritePaths`, затем
+`systemctl daemon-reload && systemctl reset-failed crawler-chromium2.service`
+(start-limit сам не отпускает) и старт.
+
+**Итог эксперимента 29.10**: на 4 vCPU второй браузер конвейер не ускорил
+— 96 дом/мин против 112–144 у одного, два браузера суммарно ≈400 % CPU:
+узкое место — процессор, не слоты рендера. Возврат к двум браузерам
+оправдан только на расширенном железе (больше vCPU; память — вторая
+строка бюджета 2048M, ТЗ 3.2); ресайкл второму — свой таймер по образцу T-208 (имя юнита
+зашито в `ExecStart=` ресайкл-сервиса, не таймера).
 
 #### Ресайкл Chromium: таймер crawler-chromium-recycle (T-208)
 
@@ -363,6 +429,7 @@ disable --now crawler-chromium-recycle.timer` (обратное включени
 /var/lib/crawler/incoming/   crawler-ingest:crawler 0770 — наблюдаемая папка ingest (ТЗ 5.1)
 /var/lib/crawler/content/    root:crawler 02775  — пак-файлы контента (setgid: группа crawler)
 /var/lib/crawler/chromium/   crawler-chromium:crawler 0770 — служебный профиль браузера
+/var/lib/crawler/chromium2/  crawler-chromium:crawler 0770 — профиль второго Chromium (создаётся при его включении, §2.2/T-209)
 /etc/crawler/                root:crawler 0750 — config.yaml, crawler.env, rules/
 /opt/crawler/bin/            root:root 0755 — бинарники; /opt/crawler/chromium/ — headless-shell
 ```
