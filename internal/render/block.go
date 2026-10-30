@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
@@ -15,7 +16,7 @@ import (
 )
 
 // Блокировка загрузки изображений, шрифтов и медиа в Chromium — ТЗ 5.6
-// («экономия ресурсов»), задача T-062.
+// («экономия ресурсов»), задача T-062; опционально и CSS (T-213).
 //
 // Механика: перехват сетевых запросов вкладки доменом CDP Fetch
 // (Network.setRequestInterception из протокола удалён; в chromedp v0.21
@@ -30,19 +31,25 @@ import (
 // приостанавливается лишь то, что будет отклонено, — Fetch.failRequest
 // (BlockedByClient → net::ERR_BLOCKED_BY_CLIENT) на стадии Request:
 // запрос не покидает браузер, не тратится ни трафик, ни декодирование.
-// Остальные запросы (Document, Stylesheet, Script, XHR/Fetch, WebSocket,
-// …) браузер не приостанавливает вовсе: они проходят сетевым стеком сами,
-// и сбой или задержка слушателя не могут повесить страницу (fail-open —
-// блокировка экономит ресурсы, но не обеспечивает корректность рендера).
+// Остальные запросы (Document, Script, XHR/Fetch, WebSocket, …, а без
+// опции T-213 ниже — и Stylesheet) браузер не приостанавливает вовсе:
+// они проходят сетевым стеком сами, и сбой или задержка слушателя не
+// могут повесить страницу (fail-open — блокировка экономит ресурсы,
+// но не обеспечивает корректность рендера).
 // Скрипты и XHR обязаны грузиться: SPA-оболочки дорисовываются после
 // загрузки — рендер и существует ради JS (ТЗ 5.6).
+//
+// Stylesheet при включённой опции render.block_stylesheet (T-213)
+// присоединяется к блокируемым тем же механизмом (blockTypes); дефолт
+// false — риск computed styles, обоснование у опции.
 
 // blockDisableTimeout — предел Fetch.disable при остановке перехвата:
 // обычный вызов CDP занимает миллисекунды, дольше ждать незачем.
 const blockDisableTimeout = 2 * time.Second
 
-// blockBlockedTypes — блокируемые типы ресурсов (ТЗ 5.6: изображения,
-// шрифты, медиа). Полный перечень network.ResourceType см. в тесте
+// blockBlockedTypes — базовый перечень блокируемых типов ресурсов
+// (ТЗ 5.6: изображения, шрифты, медиа — T-062; 91% веса типичной
+// страницы). Полный перечень network.ResourceType см. в тесте
 // TestBlockResourceType: всё, чего нет здесь, проходит.
 //
 // Favicon причислен к Image: иконка — изображение, и запрошенные
@@ -57,11 +64,29 @@ var blockBlockedTypes = []network.ResourceType{
 	network.ResourceTypeFont,
 }
 
+// blockTypes — блокируемые типы ресурсов сессии: базовый перечень
+// blockBlockedTypes плюс Stylesheet при включённой опции
+// render.block_stylesheet (T-213). CSS — оставшиеся 5–10% байт веса
+// страницы и заметная часть style/layout CPU (ресёрч 31.10: блок
+// CSS+картинок — ещё −треть ко времени загрузки), но отсечён от
+// базового перечня риском: у редких сайтов JS читает computed styles и
+// media queries — на не-применённых стилях их логика (и итоговый DOM)
+// могла бы отличаться, поэтому Stylesheet блокируется опцией с дефолтом
+// false, а включение на проде — только после A/B (доля расхождений
+// детекции <1%, темп не хуже). Список с опцией — копия: базовый
+// перечень общий для всех сессий и мутировать его нельзя.
+func blockTypes(blockStylesheet bool) []network.ResourceType {
+	if !blockStylesheet {
+		return blockBlockedTypes
+	}
+	return append(slices.Clone(blockBlockedTypes), network.ResourceTypeStylesheet)
+}
+
 // blockResourceType — блокируется ли тип ресурса. Неизвестные типы
 // (появятся в будущих версиях протокола) проходят: консервативное
 // поведение не ломает загрузку страницы.
-func blockResourceType(t network.ResourceType) bool {
-	for _, b := range blockBlockedTypes {
+func blockResourceType(types []network.ResourceType, t network.ResourceType) bool {
+	for _, b := range types {
 		if t == b {
 			return true
 		}
@@ -71,9 +96,9 @@ func blockResourceType(t network.ResourceType) bool {
 
 // blockPatterns — паттерны Fetch.enable: по одному на блокируемый тип,
 // стадия Request (отказ до отправки — экономится и исходящий трафик).
-func blockPatterns() []*fetch.RequestPattern {
-	patterns := make([]*fetch.RequestPattern, len(blockBlockedTypes))
-	for i, t := range blockBlockedTypes {
+func blockPatterns(types []network.ResourceType) []*fetch.RequestPattern {
+	patterns := make([]*fetch.RequestPattern, len(types))
+	for i, t := range types {
 		patterns[i] = &fetch.RequestPattern{
 			ResourceType: t,
 			RequestStage: fetch.RequestStageRequest,
@@ -83,9 +108,9 @@ func blockPatterns() []*fetch.RequestPattern {
 }
 
 // blockEnable включает перехват на сессии CDP вкладки.
-func blockEnable(ctx context.Context, sess cdp.Session) error {
+func blockEnable(ctx context.Context, sess cdp.Session, types []network.ResourceType) error {
 	_, err := cdp.Call(ctx, sess, fetch.Enable, fetch.EnableParams{
-		Patterns: blockPatterns(),
+		Patterns: blockPatterns(types),
 	})
 	return err
 }
@@ -105,9 +130,9 @@ func blockDisable(ctx context.Context, sess cdp.Session) {
 // должны приостанавливать чужие типы, но расхождение классификации не
 // должно вешать запрос). Ошибки ответа не фатальны: перехват — экономия,
 // страница дорабатывает и без него (fail-open).
-func blockRespond(ctx context.Context, sess cdp.Session, ev fetch.EventRequestPaused) {
+func blockRespond(ctx context.Context, sess cdp.Session, ev fetch.EventRequestPaused, types []network.ResourceType) {
 	var err error
-	if blockResourceType(ev.ResourceType) {
+	if blockResourceType(types, ev.ResourceType) {
 		_, err = cdp.Call(ctx, sess, fetch.FailRequest, fetch.FailRequestParams{
 			RequestID:   ev.RequestID,
 			ErrorReason: network.ErrorReasonBlockedByClient,
@@ -133,10 +158,10 @@ func blockRespond(ctx context.Context, sess cdp.Session, ev fetch.EventRequestPa
 
 // blockListen — production-обвязка насоса: подписка на requestPaused
 // сессии вкладки (Target реализует cdp.Session).
-func blockListen(ctx context.Context, sess cdp.Session) (stop func()) {
+func blockListen(ctx context.Context, sess cdp.Session, types []network.ResourceType) (stop func()) {
 	return blockPump(ctx, func(lctx context.Context) iter.Seq2[fetch.EventRequestPaused, error] {
 		return cdp.Events(lctx, sess, fetch.RequestPaused)
-	}, sess)
+	}, sess, types)
 }
 
 // blockPump качает события перехвата и отвечает на каждый; завершается
@@ -149,9 +174,12 @@ func blockListen(ctx context.Context, sess cdp.Session) (stop func()) {
 // фиксируется раньше Fetch.enable (startBlock), а stop, отменяя этот же
 // контекст, детерминированно завершает и обход итератора. Тесты подают
 // свою фабрику вместо реальной подписки.
+//
+// types — блокируемые типы сессии (blockTypes, T-213): судьбу каждого
+// запроса решает blockRespond.
 func blockPump(ctx context.Context,
 	eventsOf func(context.Context) iter.Seq2[fetch.EventRequestPaused, error],
-	sess cdp.Session) (stop func()) {
+	sess cdp.Session, types []network.ResourceType) (stop func()) {
 	lctx, cancel := context.WithCancel(ctx)
 	events := eventsOf(lctx)
 	done := make(chan struct{})
@@ -163,7 +191,7 @@ func blockPump(ctx context.Context,
 				// закончен (yield ошибки у итератора терминальный).
 				return
 			}
-			blockRespond(lctx, sess, ev)
+			blockRespond(lctx, sess, ev, types)
 		}
 		// Канал событий закрылся при живом контексте — подписка кончилась
 		// неожиданно: выключить перехват, чтобы блокируемые запросы не
@@ -178,8 +206,9 @@ func blockPump(ctx context.Context,
 	}
 }
 
-// startBlock включает блокировку ресурсов в конвейере сессии (T-062);
-// вызывается из Session.Run ДО перехода на страницу. Ошибка включения —
+// startBlock включает блокировку ресурсов в конвейере сессии (T-062;
+// с опцией Options.BlockStylesheet — и CSS, T-213); вызывается из
+// Session.Run ДО перехода на страницу. Ошибка включения —
 // ошибка конвейера (вкладка/браузер), Run классифицирует её обычным wrap.
 // Возвращённый stop гасит слушателя и выключает перехват; сессия
 // одноразовая, но прямой пользователь Session не наследует блокировку.
@@ -189,10 +218,11 @@ func (s *Session) startBlock(ctx context.Context) (stop func(), err error) {
 		return nil, errors.New("контекст вкладки не инициализирован")
 	}
 	tgt := c.Target
+	types := blockTypes(s.b.opts.BlockStylesheet)
 
 	// Подписка строго до Fetch.enable (см. докомментарий файла).
-	stopListen := blockListen(ctx, tgt)
-	if err := blockEnable(ctx, tgt); err != nil {
+	stopListen := blockListen(ctx, tgt, types)
+	if err := blockEnable(ctx, tgt, types); err != nil {
 		stopListen()
 		return nil, fmt.Errorf("включение перехвата Fetch: %w", err)
 	}

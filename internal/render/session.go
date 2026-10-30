@@ -114,9 +114,10 @@ func (s *Session) start(ctx context.Context) error {
 // file:/data: браузер открыл бы, а съём DOM унёс бы содержимое локального
 // ресурса в хранилище контента.
 //
-// Блокировка изображений/шрифтов/медиа (T-062, ТЗ 5.6) включается здесь,
-// до перехода (startBlock, перед waitSubscribe): перехват видит запросы
-// страницы с первого. Этапы — chromedp.Run/Do над s.Context().
+// Блокировка изображений/шрифтов/медиа (T-062, ТЗ 5.6; с опцией
+// Options.BlockStylesheet — и CSS, T-213) включается здесь, до перехода
+// (startBlock, перед waitSubscribe): перехват видит запросы страницы с
+// первого. Этапы — chromedp.Run/Do над s.Context().
 func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	if err := validateTaskURL(task.URL); err != nil {
 		return RenderOutput{}, err

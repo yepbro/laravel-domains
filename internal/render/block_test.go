@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -100,9 +102,10 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 // TestBlockResourceType — перечень блокируемых и пропускаемых типов.
-// Блокируются ровно Image/Media/Font (ТЗ 5.6); полный список типов
-// протокола перечислен явно: новый тип в cdproto по умолчанию проходит
-// (консервативное поведение, не ломает загрузку страницы).
+// Блокируются ровно Image/Media/Font (ТЗ 5.6); с опцией block_stylesheet
+// (T-213) — и Stylesheet; полный список типов протокола перечислен явно:
+// новый тип в cdproto по умолчанию проходит (консервативное поведение,
+// не ломает загрузку страницы).
 func TestBlockResourceType(t *testing.T) {
 	all := []network.ResourceType{
 		network.ResourceTypeDocument,
@@ -125,51 +128,94 @@ func TestBlockResourceType(t *testing.T) {
 		network.ResourceTypeFedCM,
 		network.ResourceTypeOther,
 	}
-	want := map[network.ResourceType]bool{
+	baseWant := map[network.ResourceType]bool{
 		network.ResourceTypeImage: true,
 		network.ResourceTypeMedia: true,
 		network.ResourceTypeFont:  true,
 	}
-	for _, rt := range all {
-		if got := blockResourceType(rt); got != want[rt] {
-			t.Errorf("blockResourceType(%s) = %v, хочу %v", rt, got, want[rt])
-		}
+	cssWant := maps.Clone(baseWant)
+	cssWant[network.ResourceTypeStylesheet] = true
+	for name, tc := range map[string]struct {
+		types []network.ResourceType
+		want  map[network.ResourceType]bool
+	}{
+		"без опции (T-062)":        {blockTypes(false), baseWant},
+		"block_stylesheet (T-213)": {blockTypes(true), cssWant},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, rt := range all {
+				if got := blockResourceType(tc.types, rt); got != tc.want[rt] {
+					t.Errorf("blockResourceType(%s) = %v, хочу %v", rt, got, tc.want[rt])
+				}
+			}
+			// Неизвестный тип — проходит.
+			if blockResourceType(tc.types, network.ResourceType("SomethingNew")) {
+				t.Error("неизвестный тип должен проходить")
+			}
+			// Пустой тип (Chrome его не присылает) — проходит.
+			if blockResourceType(tc.types, network.ResourceType("")) {
+				t.Error("пустой тип должен проходить")
+			}
+		})
 	}
-	// Неизвестный тип — проходит.
-	if blockResourceType(network.ResourceType("SomethingNew")) {
-		t.Error("неизвестный тип должен проходить")
+}
+
+// TestBlockTypes — перечень типов сессии (T-213): без опции — базовый
+// набор T-062 (Image/Media/Font, Stylesheet проходит), с опцией — плюс
+// Stylesheet; копия не затрагивает общий базовый перечень (иначе
+// выключенная опция подтянула бы CSS вслед за включённой).
+func TestBlockTypes(t *testing.T) {
+	base := blockTypes(false)
+	if !slices.Equal(base, []network.ResourceType{
+		network.ResourceTypeImage, network.ResourceTypeMedia, network.ResourceTypeFont,
+	}) {
+		t.Fatalf("без опции блокируются %v, хочу Image/Media/Font (T-062)", base)
 	}
-	// Пустой тип (Chrome его не присылает) — проходит.
-	if blockResourceType(network.ResourceType("")) {
-		t.Error("пустой тип должен проходить")
+	css := blockTypes(true)
+	if len(css) != len(base)+1 || css[len(css)-1] != network.ResourceTypeStylesheet {
+		t.Fatalf("с опцией блокируются %v, хочу базовый набор + Stylesheet (T-213)", css)
+	}
+	if !slices.Equal(css[:len(base)], base) {
+		t.Errorf("с опцией базовая часть %v изменилась, хочу %v", css[:len(base)], base)
+	}
+	// Копия, а не append в общий слайс: базовый перечень не вырос.
+	if len(blockBlockedTypes) != 3 {
+		t.Errorf("базовый перечень вырос до %d после blockTypes(true) — общая мутация", len(blockBlockedTypes))
 	}
 }
 
 // TestBlockPatterns — паттерны Fetch.enable: по одному на блокируемый
 // тип, стадия Request (отказ до отправки запроса), без URL-фильтра.
 func TestBlockPatterns(t *testing.T) {
-	patterns := blockPatterns()
-	if len(patterns) != len(blockBlockedTypes) {
-		t.Fatalf("паттернов %d, хочу %d (по числу блокируемых типов)",
-			len(patterns), len(blockBlockedTypes))
-	}
-	seen := make(map[network.ResourceType]bool)
-	for _, p := range patterns {
-		if !blockResourceType(p.ResourceType) {
-			t.Errorf("паттерн с незаблокированным типом %s", p.ResourceType)
-		}
-		if seen[p.ResourceType] {
-			t.Errorf("дублирующийся тип паттерна %s", p.ResourceType)
-		}
-		seen[p.ResourceType] = true
-		if p.RequestStage != fetch.RequestStageRequest {
-			t.Errorf("стадия паттерна %s: %s, хочу Request",
-				p.ResourceType, p.RequestStage)
-		}
-		if p.URLPattern != "" {
-			t.Errorf("URL-фильтр паттерна %s: %q, хочу пусто (только по типу)",
-				p.ResourceType, p.URLPattern)
-		}
+	for name, types := range map[string][]network.ResourceType{
+		"без опции (T-062)":        blockTypes(false),
+		"block_stylesheet (T-213)": blockTypes(true),
+	} {
+		t.Run(name, func(t *testing.T) {
+			patterns := blockPatterns(types)
+			if len(patterns) != len(types) {
+				t.Fatalf("паттернов %d, хочу %d (по числу блокируемых типов)",
+					len(patterns), len(types))
+			}
+			seen := make(map[network.ResourceType]bool)
+			for _, p := range patterns {
+				if !blockResourceType(types, p.ResourceType) {
+					t.Errorf("паттерн с незаблокированным типом %s", p.ResourceType)
+				}
+				if seen[p.ResourceType] {
+					t.Errorf("дублирующийся тип паттерна %s", p.ResourceType)
+				}
+				seen[p.ResourceType] = true
+				if p.RequestStage != fetch.RequestStageRequest {
+					t.Errorf("стадия паттерна %s: %s, хочу Request",
+						p.ResourceType, p.RequestStage)
+				}
+				if p.URLPattern != "" {
+					t.Errorf("URL-фильтр паттерна %s: %q, хочу пусто (только по типу)",
+						p.ResourceType, p.URLPattern)
+				}
+			}
+		})
 	}
 }
 
@@ -178,7 +224,8 @@ func TestBlockPatterns(t *testing.T) {
 func TestBlockEnable(t *testing.T) {
 	t.Run("команда и параметры", func(t *testing.T) {
 		fake := &fakeCDPSession{}
-		if err := blockEnable(context.Background(), fake); err != nil {
+		types := blockTypes(true) // с опцией: паттернов на единицу больше
+		if err := blockEnable(context.Background(), fake, types); err != nil {
 			t.Fatalf("blockEnable: %v", err)
 		}
 		calls := fake.callsOf()
@@ -189,11 +236,11 @@ func TestBlockEnable(t *testing.T) {
 		if !ok {
 			t.Fatalf("параметры %T, хочу fetch.EnableParams", calls[0].Params)
 		}
-		if len(params.Patterns) != len(blockBlockedTypes) {
-			t.Fatalf("паттернов %d, хочу %d", len(params.Patterns), len(blockBlockedTypes))
+		if len(params.Patterns) != len(types) {
+			t.Fatalf("паттернов %d, хочу %d", len(params.Patterns), len(types))
 		}
 		for _, p := range params.Patterns {
-			if !blockResourceType(p.ResourceType) || p.RequestStage != fetch.RequestStageRequest {
+			if !blockResourceType(types, p.ResourceType) || p.RequestStage != fetch.RequestStageRequest {
 				t.Errorf("паттерн %+v вне блокируемого набора", p)
 			}
 		}
@@ -202,7 +249,7 @@ func TestBlockEnable(t *testing.T) {
 	t.Run("ошибка CDP прокладывается", func(t *testing.T) {
 		boom := errors.New("session gone")
 		fake := &fakeCDPSession{fail: map[string]error{"Fetch.enable": boom}}
-		err := blockEnable(context.Background(), fake)
+		err := blockEnable(context.Background(), fake, blockTypes(false))
 		if !errors.Is(err, boom) {
 			t.Fatalf("ошибка %v, хочу %v", err, boom)
 		}
@@ -211,7 +258,8 @@ func TestBlockEnable(t *testing.T) {
 
 // TestBlockRespond — судьба приостановленного запроса по типу:
 // блокируемые — Fetch.failRequest(BlockedByClient) с тем же RequestID,
-// остальные — Fetch.continueRequest; ошибка команды не панике.
+// остальные — Fetch.continueRequest; Stylesheet блокируется только с
+// опцией (T-213); ошибка команды не панике.
 func TestBlockRespond(t *testing.T) {
 	cases := []struct {
 		typ  network.ResourceType
@@ -234,7 +282,7 @@ func TestBlockRespond(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			fake := &fakeCDPSession{}
 			ev := fetch.EventRequestPaused{RequestID: "req-1", ResourceType: tc.typ}
-			blockRespond(context.Background(), fake, ev)
+			blockRespond(context.Background(), fake, ev, blockTypes(false))
 
 			calls := fake.callsOf()
 			if len(calls) != 1 {
@@ -270,10 +318,32 @@ func TestBlockRespond(t *testing.T) {
 		})
 	}
 
+	// Stylesheet с опцией block_stylesheet (T-213) — failRequest, как
+	// базовые блокируемые типы.
+	t.Run("Stylesheet→fail при опции (T-213)", func(t *testing.T) {
+		fake := &fakeCDPSession{}
+		ev := fetch.EventRequestPaused{RequestID: "css-1", ResourceType: network.ResourceTypeStylesheet}
+		blockRespond(context.Background(), fake, ev, blockTypes(true))
+		calls := fake.callsOf()
+		if len(calls) != 1 || calls[0].Method != "Fetch.failRequest" {
+			t.Fatalf("команды %v, хочу одну Fetch.failRequest", calls)
+		}
+		params, ok := calls[0].Params.(fetch.FailRequestParams)
+		if !ok {
+			t.Fatalf("параметры %T, хочу fetch.FailRequestParams", calls[0].Params)
+		}
+		if params.RequestID != ev.RequestID {
+			t.Errorf("RequestID %s, хочу %s", params.RequestID, ev.RequestID)
+		}
+		if params.ErrorReason != network.ErrorReasonBlockedByClient {
+			t.Errorf("ErrorReason %s, хочу BlockedByClient", params.ErrorReason)
+		}
+	})
+
 	t.Run("ошибка команды проглатывается", func(t *testing.T) {
 		fake := &fakeCDPSession{fail: map[string]error{"Fetch.failRequest": errors.New("dead")}}
 		ev := fetch.EventRequestPaused{RequestID: "r", ResourceType: network.ResourceTypeImage}
-		blockRespond(context.Background(), fake, ev) // не паникует
+		blockRespond(context.Background(), fake, ev, blockTypes(false)) // не паникует
 	})
 }
 
@@ -338,7 +408,7 @@ func TestBlockPumpLifecycle(t *testing.T) {
 	defer cancel()
 	events := make(chan fetch.EventRequestPaused)
 	fake := &fakeCDPSession{}
-	stop := blockPump(ctx, pumpEvents(events), fake)
+	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
 
 	// События обоих видов получают ответы.
 	events <- fetch.EventRequestPaused{RequestID: "img", ResourceType: network.ResourceTypeImage}
@@ -380,7 +450,7 @@ func TestBlockPumpCtxDone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan fetch.EventRequestPaused)
 	fake := &fakeCDPSession{}
-	stop := blockPump(ctx, pumpEvents(events), fake)
+	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
 
 	events <- fetch.EventRequestPaused{RequestID: "i", ResourceType: network.ResourceTypeImage}
 	waitFor(t, func() bool { return fake.countOf("Fetch.failRequest") == 1 })
@@ -414,7 +484,7 @@ func TestBlockPumpEventsClosed(t *testing.T) {
 	defer cancel()
 	events := make(chan fetch.EventRequestPaused)
 	fake := &fakeCDPSession{}
-	stop := blockPump(ctx, pumpEvents(events), fake)
+	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
 
 	close(events)
 	waitFor(t, func() bool { return fake.countOf("Fetch.disable") == 1 })
@@ -436,7 +506,7 @@ func TestBlockPumpEventError(t *testing.T) {
 		entered:   make(chan struct{}),
 		yieldDone: make(chan struct{}),
 	}
-	stop := blockPump(ctx, probe.events(errors.New("событие не разбирается")), fake)
+	stop := blockPump(ctx, probe.events(errors.New("событие не разбирается")), fake, blockTypes(false))
 
 	select {
 	case <-probe.entered:
@@ -481,7 +551,7 @@ func TestBlockPumpRespondError(t *testing.T) {
 	defer cancel()
 	events := make(chan fetch.EventRequestPaused, 2)
 	fake := &fakeCDPSession{fail: map[string]error{"Fetch.failRequest": errors.New("boom")}}
-	stop := blockPump(ctx, pumpEvents(events), fake)
+	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
 
 	events <- fetch.EventRequestPaused{RequestID: "a", ResourceType: network.ResourceTypeImage}
 	events <- fetch.EventRequestPaused{RequestID: "b", ResourceType: network.ResourceTypeImage}
@@ -500,7 +570,7 @@ func TestBlockPumpStopWaitsForListener(t *testing.T) {
 	events := make(chan fetch.EventRequestPaused)
 	gate := make(chan struct{})
 	fake := &fakeCDPSession{gate: map[string]chan struct{}{"Fetch.continueRequest": gate}}
-	stop := blockPump(ctx, pumpEvents(events), fake)
+	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
 
 	// Слушатель вошёл в blockRespond и ждёт освобождения шлюза: команда
 	// записана в журнал до ожидания.
@@ -528,11 +598,18 @@ func TestBlockPumpStopWaitsForListener(t *testing.T) {
 
 // TestStartBlock — включение блокировки в конвейере сессии: отказы контекста
 // вкладки и Fetch.enable, штатный stop (гасит слушателя и выключает
-// перехват). События перехвата подаются через fakeCDP — in-memory транспорт
+// перехват), расширение паттернов Stylesheet опцией Options.BlockStylesheet
+// (T-213). События перехвата подаются через fakeCDP — in-memory транспорт
 // chromedp (cdpfake_test.go), живой браузер не нужен.
 func TestStartBlock(t *testing.T) {
+	// newSession — сессия с браузером, чьи опции читает startBlock
+	// (BlockStylesheet); браузер как таковой не нужен — только opts.
+	newSession := func(ctx context.Context, opts Options) *Session {
+		return &Session{b: &Browser{opts: opts}, ctx: ctx}
+	}
+
 	t.Run("контекст сессии — не chromedp", func(t *testing.T) {
-		s := &Session{ctx: context.Background()}
+		s := newSession(context.Background(), Options{})
 		_, err := s.startBlock(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "контекст вкладки не инициализирован") {
 			t.Fatalf("ошибка %v, хочу «контекст вкладки не инициализирован»", err)
@@ -546,7 +623,7 @@ func TestStartBlock(t *testing.T) {
 		defer cancelAlloc()
 		sctx, cancel := chromedp.NewContext(allocCtx) // без Do: Target не создан
 		defer cancel()
-		s := &Session{ctx: sctx}
+		s := newSession(sctx, Options{})
 		_, err := s.startBlock(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "контекст вкладки не инициализирован") {
 			t.Fatalf("ошибка %v, хочу «контекст вкладки не инициализирован»", err)
@@ -556,7 +633,7 @@ func TestStartBlock(t *testing.T) {
 	t.Run("ошибка Fetch.enable", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
 		tr.setError("Fetch.enable", &cdproto.Error{Code: -32000, Message: "домен Fetch сломан"})
-		s := &Session{ctx: ctx}
+		s := newSession(ctx, Options{})
 		_, err := s.startBlock(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "включение перехвата Fetch") {
 			t.Fatalf("ошибка %v, хочу wrap «включение перехвата Fetch»", err)
@@ -574,7 +651,7 @@ func TestStartBlock(t *testing.T) {
 
 	t.Run("stop гасит слушателя и выключает перехват", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
-		s := &Session{ctx: ctx}
+		s := newSession(ctx, Options{})
 		stop, err := s.startBlock(context.Background())
 		if err != nil {
 			t.Fatalf("startBlock: %v", err)
@@ -596,6 +673,36 @@ func TestStartBlock(t *testing.T) {
 		tr.fireSession("Fetch.requestPaused",
 			`{"requestId":"late","resourceType":"Media"}`)
 		assertNoNewCDPCalls(t, tr, "Fetch.requestPaused-после-stop")
+	})
+
+	// Опция BlockStylesheet (T-213): паттерны Fetch.enable пополняются
+	// Stylesheet, и приостановленный Stylesheet получает failRequest.
+	t.Run("block_stylesheet расширяет перехват (T-213)", func(t *testing.T) {
+		ctx, tr := newFakeCDPContext(t)
+		s := newSession(ctx, Options{BlockStylesheet: true})
+		stop, err := s.startBlock(context.Background())
+		if err != nil {
+			t.Fatalf("startBlock: %v", err)
+		}
+		defer stop()
+
+		enable := tr.callsOf()
+		n, params := 0, ""
+		for _, c := range enable {
+			if c.Method == "Fetch.enable" {
+				n++
+				params = c.Params
+			}
+		}
+		if n != 1 {
+			t.Fatalf("Fetch.enable выполнен %d раз, хочу 1", n)
+		}
+		if !strings.Contains(params, `"Stylesheet"`) {
+			t.Errorf("паттерны Fetch.enable без Stylesheet: %s", params)
+		}
+		tr.fireSession("Fetch.requestPaused",
+			`{"requestId":"css-1","resourceType":"Stylesheet"}`)
+		waitFor(t, func() bool { return tr.countOf("Fetch.failRequest") == 1 })
 	})
 }
 

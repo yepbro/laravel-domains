@@ -134,6 +134,13 @@ type Options struct {
 	// сборке — content.max_store_bytes: контент сверх лимита хранилище не
 	// принимает (ErrTooLarge), держать его в памяти бессмысленно.
 	MaxDOMBytes int64
+	// BlockStylesheet — блокировать ли CSS в рендер-контексте (T-213):
+	// при true перечень блокируемых типов (block.go, T-062:
+	// Image/Media/Font) пополняется Stylesheet. Дефолт false — риск
+	// редких сайтов, чей JS читает computed styles/media queries:
+	// включение на проде — только после A/B (доля расхождений детекции
+	// <1%, темп не хуже). Источник — render.block_stylesheet.
+	BlockStylesheet bool
 }
 
 // NewOptions собирает Options из конфигурации сервиса (ТЗ 5.10): секция
@@ -149,6 +156,7 @@ func NewOptions(cfg config.Config) Options {
 		MemoryThreshold:   cfg.Render.RestartMemoryBytes.B(),
 		UserAgent:         cfg.HTTP.UserAgent,
 		MaxDOMBytes:       cfg.Content.MaxStoreBytes.B(),
+		BlockStylesheet:   cfg.Render.BlockStylesheet,
 	}
 }
 

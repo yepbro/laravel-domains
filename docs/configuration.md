@@ -599,6 +599,7 @@ Go: без потолка). Замер критерия T-163 сэмплером
 | `timeout_attempts` | `CRAWLER_RENDER_TIMEOUT_ATTEMPTS` | целое | `2` (диапазон: 1..100; обязан быть ≤ `redis.max_attempts`) |
 | `restart_every_pages` | `CRAWLER_RENDER_RESTART_EVERY_PAGES` | целое | `500` |
 | `restart_memory_bytes` | `CRAWLER_RENDER_RESTART_MEMORY_BYTES` | размер | `1536MiB` (диапазон: 256MiB–16GiB, `0` — отключено) |
+| `block_stylesheet` | `CRAWLER_RENDER_BLOCK_STYLESHEET` | bool | `false` (T-213; включение — после A/B, риск computed styles — ниже) |
 | `queue_high_watermark` | `CRAWLER_RENDER_QUEUE_HIGH_WATERMARK` | целое | `10000` (0 — общий `scheduler.queue_high_watermark`) |
 | `requeue_deprioritized_zones` | `CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES` | список имён зон | `[]` (замена целиком; имена — punycode нижним регистром, как в справочнике zones) |
 
@@ -700,6 +701,19 @@ Chromium (:9223) и второй render-worker ([`deploy.md`](deploy.md) §2.2),
 а не подъём порога. В remote-режиме (dev-стек) RSS чужого контейнера
 недоступен — контроль по памяти не работает, потолок держит лимит
 контейнера Chromium.
+
+`block_stylesheet` — блокировка CSS в рендер-контексте (T-213): при
+`true` перечень блокируемых типов рендера ([`render.md`](render.md),
+«Блокировка … T-062»: Image/Media/Font — 91% веса страницы) пополняется
+`Stylesheet` — оставшиеся 5–10% байт плюс заметная часть style/layout
+CPU; по ресёрчу 31.10 блок CSS+картинок даёт ещё −треть ко времени
+загрузки. Дефолт `false` — осознанное решение: у редких сайтов JS читает
+computed styles и media queries (`getComputedStyle`, `matchMedia`) и на
+не-применённых стилях меняет итоговый DOM — вердикты детекции Laravel
+могли бы отличаться. Поэтому включение — только после A/B на проде:
+диф сигнатур Laravel до/после на одинаковой выборке (критерий: доля
+расхождений детекции < 1%) и контроль темпа (не хуже текущего);
+механика и границы риска — [`render.md`](render.md), раздел блокировки.
 
 `queue_high_watermark` — порог ёмкости очереди рендера (T-174; ворота
 публикации `q:render` — T-066, `renderq.go` HTTP-этапа,

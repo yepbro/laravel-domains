@@ -1,10 +1,10 @@
 package render
 
-// Live-проверка блокировки ресурсов (T-062) — против реального Chromium
-// dev-стека. Внутри теста поднимается HTTP-сервер со счётчиками обращений:
-// страница тянет картинку, шрифт, CSS, скрипт и делает XHR; счётчики
-// доказывают факт запроса независимо от наших же CDP-событий (иначе
-// проверка была бы замкнута на саму себя).
+// Live-проверка блокировки ресурсов (T-062; CSS — опция T-213) — против
+// реального Chromium dev-стека. Внутри теста поднимается HTTP-сервер со
+// счётчиками обращений: страница тянет картинку, шрифт, CSS, скрипт и
+// делает XHR; счётчики доказывают факт запроса независимо от наших же
+// CDP-событий (иначе проверка была бы замкнута на саму себя).
 //
 // Тест исполняется в run-контейнере tools (compose run), Chromium — в
 // соседнем контейнере chromium; оба в сети crawler_net. httptest.NewServer
@@ -57,12 +57,11 @@ func blockLiveIPv4(t *testing.T) string {
 	return ""
 }
 
-// TestBlockLiveResources — картинка и шрифт не запрошены (Fetch.failRequest
-// до отправки), CSS/скрипт/XHR запрошены (проходят, JS работает — ТЗ 5.6).
-func TestBlockLiveResources(t *testing.T) {
-	skipUnlessLive(t)
-	ctx := context.Background()
-
+// blockLiveServe — тестовая страница со счётчиками обращений: одна на оба
+// live-теста блокировки (дефолт T-062 и опция T-213). Возвращает счётчики
+// и адрес страницы; сервер живёт до конца теста (Cleanup).
+func blockLiveServe(t *testing.T) (*blockLiveCounters, string) {
+	t.Helper()
 	c := &blockLiveCounters{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/page.html", func(w http.ResponseWriter, _ *http.Request) {
@@ -127,9 +126,15 @@ x.open('GET','/data.json',false);x.send();`)
 		_ = srv.Close()
 		<-done
 	})
-	pageURL := "http://" + net.JoinHostPort(blockLiveIPv4(t), fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)) + "/page.html"
+	return c, "http://" + net.JoinHostPort(blockLiveIPv4(t), fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)) + "/page.html"
+}
 
-	b, err := StartBrowser(ctx, liveOptions())
+// blockLiveRun — страница в сессии с данными опциями (общая обвязка
+// тестов): старт браузера, сессия, Run, снятие сессии.
+func blockLiveRun(t *testing.T, opts Options, pageURL string) RenderOutput {
+	t.Helper()
+	ctx := context.Background()
+	b, err := StartBrowser(ctx, opts)
 	if err != nil {
 		t.Fatalf("StartBrowser: %v", err)
 	}
@@ -143,21 +148,43 @@ x.open('GET','/data.json',false);x.send();`)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+	return out
+}
+
+// blockLiveWaitReady — опрос до готовности счётчиков ресурсов, обязанных
+// дойти (страница/скрипт/XHR): Navigate ждёт событие load, обычно они уже
+// стоят; опрос страхует медленную доставку. Истечение срока — ошибка
+// сразу с причиной (стиль waitFor юнит-тестов): дальнейшие проверки
+// счётчиков дали бы каскад неинформативных «запрошен 0 раз».
+// Заблокированные счётчики могут только оставаться нулём: попытка
+// запроса блокируется до отправки в любой момент жизни страницы, гонки
+// нет.
+func blockLiveWaitReady(t *testing.T, c *blockLiveCounters) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.page.Load() >= 1 && c.js.Load() >= 1 && c.xhr.Load() >= 1 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("ресурсы, обязанные дойти, не запрошены за 10 с: page=%d js=%d xhr=%d",
+		c.page.Load(), c.js.Load(), c.xhr.Load())
+}
+
+// TestBlockLiveResources — картинка и шрифт не запрошены (Fetch.failRequest
+// до отправки), CSS/скрипт/XHR запрошены (проходят, JS работает — ТЗ 5.6):
+// дефолтный набор T-062, CSS опцией не блокируется.
+func TestBlockLiveResources(t *testing.T) {
+	skipUnlessLive(t)
+	c, pageURL := blockLiveServe(t)
+
+	out := blockLiveRun(t, liveOptions(), pageURL)
 	if out.FinalURL != pageURL {
 		t.Errorf("final URL %q, хочу %q", out.FinalURL, pageURL)
 	}
 
-	// Navigate ждёт событие load, счётчики запрошенного обычно уже стоят;
-	// опрос страхует медленную доставку. Заблокированные счётчики могут
-	// только оставаться нулём: попытка запроса блокируется до отправки в
-	// любой момент жизни страницы, гонки нет.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if c.page.Load() >= 1 && c.css.Load() >= 1 && c.js.Load() >= 1 && c.xhr.Load() >= 1 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	blockLiveWaitReady(t, c)
 	if got := c.page.Load(); got < 1 {
 		t.Errorf("страница запрошена %d раз, хочу >= 1", got)
 	}
@@ -182,4 +209,41 @@ x.open('GET','/data.json',false);x.send();`)
 	// диагностики.
 	t.Logf("favicon.ico запрошен %d раз (тип Other не блокируется)",
 		c.favicon.Load())
+}
+
+// TestBlockLiveStylesheetBlocked — опция block_stylesheet (T-213): CSS не
+// запрошен вовсе (failRequest до отправки), страница живёт — скрипт и XHR
+// проходят, JS работает, DOM снимается: блок CSS не ломает рендер как
+// таковой (риск опции — computed styles у редких сайтов, поэтому дефолт
+// false и включение — после A/B).
+func TestBlockLiveStylesheetBlocked(t *testing.T) {
+	skipUnlessLive(t)
+	c, pageURL := blockLiveServe(t)
+
+	opts := liveOptions()
+	opts.BlockStylesheet = true
+	out := blockLiveRun(t, opts, pageURL)
+	if out.FinalURL != pageURL {
+		t.Errorf("final URL %q, хочу %q", out.FinalURL, pageURL)
+	}
+
+	blockLiveWaitReady(t, c)
+	if got := c.page.Load(); got < 1 {
+		t.Errorf("страница запрошена %d раз, хочу >= 1", got)
+	}
+	if got := c.css.Load(); got != 0 {
+		t.Errorf("CSS запрошен %d раз, хочу 0 (заблокирован опцией, T-213)", got)
+	}
+	if got := c.js.Load(); got < 1 {
+		t.Errorf("скрипт запрошен %d раз, хочу >= 1 (не блокируется)", got)
+	}
+	if got := c.xhr.Load(); got < 1 {
+		t.Errorf("XHR запрошен %d раз, хочу >= 1 (JS обязан работать)", got)
+	}
+	if got := c.img.Load(); got != 0 {
+		t.Errorf("картинка запрошена %d раз, хочу 0 (заблокирована, ТЗ 5.6)", got)
+	}
+	if got := c.font.Load(); got != 0 {
+		t.Errorf("шрифт запрошен %d раз, хочу 0 (заблокирован, ТЗ 5.6)", got)
+	}
 }

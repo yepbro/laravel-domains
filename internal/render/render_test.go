@@ -37,6 +37,7 @@ func TestNewOptions(t *testing.T) {
 		Timeout:            config.Duration(25 * time.Second),
 		RestartEveryPages:  500,
 		RestartMemoryBytes: config.ByteSize(1536 << 20),
+		BlockStylesheet:    true,
 	}
 	cfg.HTTP.UserAgent = "Crawler/1.0 (+https://example.example; admin@example.example)"
 
@@ -49,6 +50,7 @@ func TestNewOptions(t *testing.T) {
 		MemoryThreshold:   1536 << 20,
 		UserAgent:         "Crawler/1.0 (+https://example.example; admin@example.example)",
 		MaxDOMBytes:       cfg.Content.MaxStoreBytes.B(), // R-02: потолок DOM — лимит хранилища
+		BlockStylesheet:   true,
 	}
 	if got != want {
 		t.Fatalf("NewOptions:\n got %+v\nwant %+v", got, want)
@@ -84,6 +86,16 @@ func TestOptionsValidate(t *testing.T) {
 	local.RemoteURL = ""
 	if err := local.validate(); err != nil {
 		t.Fatalf("локальный режим отклонён: %v", err)
+	}
+
+	// BlockStylesheet (T-213) — bool без диапазона: оба значения легальны,
+	// включение — вопрос A/B-решения, а не валидации.
+	for _, css := range []bool{false, true} {
+		opt := valid
+		opt.BlockStylesheet = css
+		if err := opt.validate(); err != nil {
+			t.Errorf("block_stylesheet = %v отклонён: %v", css, err)
+		}
 	}
 
 	// Разрешённые схемы remote_url: ws/wss/http/https — вырезание любой

@@ -157,6 +157,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_RENDER_TIMEOUT_ATTEMPTS", setInt(func(c *Config) *int { return &c.Render.TimeoutAttempts })},
 		{"CRAWLER_RENDER_RESTART_EVERY_PAGES", setInt(func(c *Config) *int { return &c.Render.RestartEveryPages })},
 		{"CRAWLER_RENDER_RESTART_MEMORY_BYTES", setSize(func(c *Config) *ByteSize { return &c.Render.RestartMemoryBytes })},
+		{"CRAWLER_RENDER_BLOCK_STYLESHEET", setBool(func(c *Config) *bool { return &c.Render.BlockStylesheet })},
 		{"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK", setInt(func(c *Config) *int { return &c.Render.QueueHighWatermark })},
 		{"CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES", setZoneNames(func(c *Config) *[]string { return &c.Render.RequeueDeprioritizedZones })},
 		{"CRAWLER_CONTENT_DIR", setString(func(c *Config) *string { return &c.Content.Dir })},
