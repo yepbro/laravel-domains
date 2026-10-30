@@ -186,13 +186,14 @@ func TestBlockTypes(t *testing.T) {
 
 // TestBlockPatterns — паттерны Fetch.enable: по одному на блокируемый
 // тип, стадия Request (отказ до отправки запроса), без URL-фильтра.
+// Доменные паттерны трекеров (T-214) — отдельный TestBlockPatternsTrackers.
 func TestBlockPatterns(t *testing.T) {
 	for name, types := range map[string][]network.ResourceType{
 		"без опции (T-062)":        blockTypes(false),
 		"block_stylesheet (T-213)": blockTypes(true),
 	} {
 		t.Run(name, func(t *testing.T) {
-			patterns := blockPatterns(types)
+			patterns := blockPatterns(types, false)
 			if len(patterns) != len(types) {
 				t.Fatalf("паттернов %d, хочу %d (по числу блокируемых типов)",
 					len(patterns), len(types))
@@ -219,13 +220,131 @@ func TestBlockPatterns(t *testing.T) {
 	}
 }
 
+// TestBlockPatternsTrackers — доменные паттерны Fetch.enable (T-214):
+// при включённой опции по одному на домен списка — urlPattern «домен в
+// звёздках» (glob Fetch.enable с полным совпадением: без звёздок
+// паттерн совпал бы только с адресом, равным домену), без resourceType
+// (аналитика ходит любыми типами), стадия Request; при выключенной —
+// доменных паттернов нет вовсе.
+func TestBlockPatternsTrackers(t *testing.T) {
+	on := blockPatterns(blockTypes(false), true)
+	urlPatterns := make(map[string]bool)
+	typePatterns := 0
+	for _, p := range on {
+		if p.URLPattern == "" {
+			typePatterns++
+			continue
+		}
+		urlPatterns[p.URLPattern] = true
+		if p.ResourceType != "" {
+			t.Errorf("доменный паттерн %q с типом %s — типом аналитика не ловится",
+				p.URLPattern, p.ResourceType)
+		}
+		if p.RequestStage != fetch.RequestStageRequest {
+			t.Errorf("стадия доменного паттерна %q: %s, хочу Request",
+				p.URLPattern, p.RequestStage)
+		}
+	}
+	if typePatterns != len(blockTypes(false)) {
+		t.Errorf("типовых паттернов %d, хочу %d (доменные — сверх типов)",
+			typePatterns, len(blockTypes(false)))
+	}
+	if len(urlPatterns) != len(blockTrackerDomains) {
+		t.Errorf("доменных паттернов %d, хочу %d (по числу доменов списка)",
+			len(urlPatterns), len(blockTrackerDomains))
+	}
+	for _, d := range blockTrackerDomains {
+		if !urlPatterns["*"+d+"*"] {
+			t.Errorf("домен %s без паттерна *%s*", d, d)
+		}
+	}
+
+	for name, types := range map[string][]network.ResourceType{
+		"без опции (T-062)":        blockTypes(false),
+		"block_stylesheet (T-213)": blockTypes(true),
+	} {
+		t.Run("выключено: "+name, func(t *testing.T) {
+			off := blockPatterns(types, false)
+			if len(off) != len(types) {
+				t.Fatalf("паттернов %d, хочу %d (только типы)",
+					len(off), len(types))
+			}
+			for _, p := range off {
+				if p.URLPattern != "" {
+					t.Errorf("при выключенной опции доменный паттерн %q", p.URLPattern)
+				}
+			}
+		})
+	}
+}
+
+// TestBlockTrackerURL — точная хостовая проверка против списка
+// blockTrackerDomains (T-214): хост-домен и его поддомены — трекеры;
+// подстрока домена в пути/query/userinfo и трекер-суффикс чужого хоста —
+// нет; неразобранный URL — нет (fail-open).
+func TestBlockTrackerURL(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{"хост трекера", "https://www.google-analytics.com/g/collect?cid=1", true},
+		{"апекс трекера", "https://google-analytics.com/analytics.js", true},
+		{"поддомен трекера", "https://cdn4.mixpanel.com/lib.min.js", true},
+		{"метрика RU", "https://mc.yandex.ru/metrika/tag.js", true},
+		{"метрика международная", "https://mc.yandex.com/watch/12345678", true},
+		{"sentry ingest-поддомен", "https://o123456.ingest.sentry.io/api/1/envelope/", true},
+		{"путь с подстрокой домена", "https://site.example/js/google-analytics.com.js", false},
+		{"query с подстрокой домена", "https://site.example/search?q=doubleclick.net", false},
+		{"userinfo с доменом", "https://google-analytics.com@site.example/collect", false},
+		{"трекер-суффикс чужого хоста", "https://google-analytics.com.evil.example/ga.js", false},
+		{"граница домена (.co ≠ .com)", "https://api.mixpanel.co/track", false},
+		{"обычный сайт", "https://laravel.example/js/app.js", false},
+		{"неразобранный URL", "://нет-схемы", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := blockTrackerURL(tc.url); got != tc.want {
+				t.Errorf("blockTrackerURL(%q) = %v, хочу %v", tc.url, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBlockTrackerDomainsList — гигиена списка доменов (T-214): каждый
+// элемент — нижнерегистровый хост без схемы/подстановочных символов,
+// без дублей; список накрывает и апекс, и поддомены каждого домена
+// (инвариант пары «широкий паттерн *domain* → хостовая проверка»).
+func TestBlockTrackerDomainsList(t *testing.T) {
+	if n := len(blockTrackerDomains); n < 12 || n > 16 {
+		t.Errorf("в списке %d доменов — задуман диапазон 12–16", n)
+	}
+	seen := make(map[string]bool, len(blockTrackerDomains))
+	for _, d := range blockTrackerDomains {
+		if d == "" || d != strings.ToLower(d) || !strings.Contains(d, ".") ||
+			strings.ContainsAny(d, "/:?*") {
+			t.Errorf("домен %q — не нижнерегистровый хост без схемы и звёздочек", d)
+		}
+		if seen[d] {
+			t.Errorf("дубль домена %q", d)
+		}
+		seen[d] = true
+		if !blockTrackerURL("https://" + d + "/tag.js") {
+			t.Errorf("апекс %s не опознаётся списком", d)
+		}
+		if !blockTrackerURL("https://static." + d + "/tag.js") {
+			t.Errorf("поддомен static.%s не опознаётся списком", d)
+		}
+	}
+}
+
 // TestBlockEnable — включение перехвата командой Fetch.enable с паттернами
 // по блокируемым типам; ошибка команды возвращается вызывающему.
 func TestBlockEnable(t *testing.T) {
 	t.Run("команда и параметры", func(t *testing.T) {
 		fake := &fakeCDPSession{}
-		types := blockTypes(true) // с опцией: паттернов на единицу больше
-		if err := blockEnable(context.Background(), fake, types); err != nil {
+		rules := blockRulesOf(Options{BlockStylesheet: true}) // с опцией: паттернов на единицу больше
+		if err := blockEnable(context.Background(), fake, rules); err != nil {
 			t.Fatalf("blockEnable: %v", err)
 		}
 		calls := fake.callsOf()
@@ -236,11 +355,11 @@ func TestBlockEnable(t *testing.T) {
 		if !ok {
 			t.Fatalf("параметры %T, хочу fetch.EnableParams", calls[0].Params)
 		}
-		if len(params.Patterns) != len(types) {
-			t.Fatalf("паттернов %d, хочу %d", len(params.Patterns), len(types))
+		if len(params.Patterns) != len(rules.types) {
+			t.Fatalf("паттернов %d, хочу %d", len(params.Patterns), len(rules.types))
 		}
 		for _, p := range params.Patterns {
-			if !blockResourceType(types, p.ResourceType) || p.RequestStage != fetch.RequestStageRequest {
+			if !blockResourceType(rules.types, p.ResourceType) || p.RequestStage != fetch.RequestStageRequest {
 				t.Errorf("паттерн %+v вне блокируемого набора", p)
 			}
 		}
@@ -249,7 +368,7 @@ func TestBlockEnable(t *testing.T) {
 	t.Run("ошибка CDP прокладывается", func(t *testing.T) {
 		boom := errors.New("session gone")
 		fake := &fakeCDPSession{fail: map[string]error{"Fetch.enable": boom}}
-		err := blockEnable(context.Background(), fake, blockTypes(false))
+		err := blockEnable(context.Background(), fake, blockRulesOf(Options{}))
 		if !errors.Is(err, boom) {
 			t.Fatalf("ошибка %v, хочу %v", err, boom)
 		}
@@ -282,7 +401,7 @@ func TestBlockRespond(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			fake := &fakeCDPSession{}
 			ev := fetch.EventRequestPaused{RequestID: "req-1", ResourceType: tc.typ}
-			blockRespond(context.Background(), fake, ev, blockTypes(false))
+			blockRespond(context.Background(), fake, ev, blockRulesOf(Options{}))
 
 			calls := fake.callsOf()
 			if len(calls) != 1 {
@@ -323,7 +442,7 @@ func TestBlockRespond(t *testing.T) {
 	t.Run("Stylesheet→fail при опции (T-213)", func(t *testing.T) {
 		fake := &fakeCDPSession{}
 		ev := fetch.EventRequestPaused{RequestID: "css-1", ResourceType: network.ResourceTypeStylesheet}
-		blockRespond(context.Background(), fake, ev, blockTypes(true))
+		blockRespond(context.Background(), fake, ev, blockRulesOf(Options{BlockStylesheet: true}))
 		calls := fake.callsOf()
 		if len(calls) != 1 || calls[0].Method != "Fetch.failRequest" {
 			t.Fatalf("команды %v, хочу одну Fetch.failRequest", calls)
@@ -340,10 +459,88 @@ func TestBlockRespond(t *testing.T) {
 		}
 	})
 
+	// Трекер-домены (T-214): при включённой опции запрос ЛЮБОГО типа к
+	// хосту-трекеру — failRequest (аналитика ходит Script/XHR — типом не
+	// ловится), приостановленный подстрокой путь с чужим хостом —
+	// continueRequest (точность сидит в слушателе, а не в паттерне);
+	// при выключенной опции трекер-запрос неблокируемого типа проходит.
+	t.Run("трекер-домены (T-214)", func(t *testing.T) {
+		on := blockRulesOf(Options{BlockTrackerDomains: true})
+		for _, tc := range []struct {
+			name string
+			ev   fetch.EventRequestPaused
+			fail bool
+		}{
+			{"Script→fail", fetch.EventRequestPaused{
+				RequestID: "ga-js", ResourceType: network.ResourceTypeScript,
+				Request: &network.Request{URL: "https://www.google-analytics.com/analytics.js"},
+			}, true},
+			{"XHR→fail", fetch.EventRequestPaused{
+				RequestID: "mc-xhr", ResourceType: network.ResourceTypeXHR,
+				Request: &network.Request{URL: "https://mc.yandex.ru/watch/12345678"},
+			}, true},
+			{"Document→fail", fetch.EventRequestPaused{
+				RequestID: "dc-doc", ResourceType: network.ResourceTypeDocument,
+				Request: &network.Request{URL: "https://stats.g.doubleclick.net/r/collect"},
+			}, true},
+			{"Ping→fail", fetch.EventRequestPaused{
+				RequestID: "cl-ping", ResourceType: network.ResourceTypePing,
+				Request: &network.Request{URL: "https://www.clarity.ms/tag/xyz"},
+			}, true},
+			{"Image трекера→fail (тип и домен)", fetch.EventRequestPaused{
+				RequestID: "ga-img", ResourceType: network.ResourceTypeImage,
+				Request: &network.Request{URL: "https://www.google-analytics.com/collect.gif"},
+			}, true},
+			{"Script с доменом в пути→continue", fetch.EventRequestPaused{
+				RequestID: "own-js", ResourceType: network.ResourceTypeScript,
+				Request: &network.Request{URL: "https://site.example/js/google-analytics.com.js"},
+			}, false},
+			{"событие без request→continue", fetch.EventRequestPaused{
+				RequestID: "anomaly", ResourceType: network.ResourceTypeScript,
+			}, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				fake := &fakeCDPSession{}
+				blockRespond(context.Background(), fake, tc.ev, on)
+				calls := fake.callsOf()
+				want := "Fetch.continueRequest"
+				if tc.fail {
+					want = "Fetch.failRequest"
+				}
+				if len(calls) != 1 || calls[0].Method != want {
+					t.Fatalf("команды %v, хочу одну %s", calls, want)
+				}
+				if tc.fail {
+					params, ok := calls[0].Params.(fetch.FailRequestParams)
+					if !ok {
+						t.Fatalf("параметры %T, хочу fetch.FailRequestParams", calls[0].Params)
+					}
+					if params.RequestID != tc.ev.RequestID {
+						t.Errorf("RequestID %s, хочу %s", params.RequestID, tc.ev.RequestID)
+					}
+					if params.ErrorReason != network.ErrorReasonBlockedByClient {
+						t.Errorf("ErrorReason %s, хочу BlockedByClient", params.ErrorReason)
+					}
+				}
+			})
+		}
+
+		// Опция выключена — трекер-скрипт проходит: доменные паттерны не
+		// только не попадают в Fetch.enable, но и не влияют на вердикты.
+		fake := &fakeCDPSession{}
+		blockRespond(context.Background(), fake, fetch.EventRequestPaused{
+			RequestID: "ga-off", ResourceType: network.ResourceTypeScript,
+			Request: &network.Request{URL: "https://www.google-analytics.com/analytics.js"},
+		}, blockRulesOf(Options{}))
+		if calls := fake.callsOf(); len(calls) != 1 || calls[0].Method != "Fetch.continueRequest" {
+			t.Fatalf("команды %v, хочу одну Fetch.continueRequest (опция выключена)", calls)
+		}
+	})
+
 	t.Run("ошибка команды проглатывается", func(t *testing.T) {
 		fake := &fakeCDPSession{fail: map[string]error{"Fetch.failRequest": errors.New("dead")}}
 		ev := fetch.EventRequestPaused{RequestID: "r", ResourceType: network.ResourceTypeImage}
-		blockRespond(context.Background(), fake, ev, blockTypes(false)) // не паникует
+		blockRespond(context.Background(), fake, ev, blockRulesOf(Options{})) // не паникует
 	})
 }
 
@@ -408,7 +605,7 @@ func TestBlockPumpLifecycle(t *testing.T) {
 	defer cancel()
 	events := make(chan fetch.EventRequestPaused)
 	fake := &fakeCDPSession{}
-	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
+	stop := blockPump(ctx, pumpEvents(events), fake, blockRulesOf(Options{}))
 
 	// События обоих видов получают ответы.
 	events <- fetch.EventRequestPaused{RequestID: "img", ResourceType: network.ResourceTypeImage}
@@ -450,7 +647,7 @@ func TestBlockPumpCtxDone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan fetch.EventRequestPaused)
 	fake := &fakeCDPSession{}
-	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
+	stop := blockPump(ctx, pumpEvents(events), fake, blockRulesOf(Options{}))
 
 	events <- fetch.EventRequestPaused{RequestID: "i", ResourceType: network.ResourceTypeImage}
 	waitFor(t, func() bool { return fake.countOf("Fetch.failRequest") == 1 })
@@ -484,7 +681,7 @@ func TestBlockPumpEventsClosed(t *testing.T) {
 	defer cancel()
 	events := make(chan fetch.EventRequestPaused)
 	fake := &fakeCDPSession{}
-	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
+	stop := blockPump(ctx, pumpEvents(events), fake, blockRulesOf(Options{}))
 
 	close(events)
 	waitFor(t, func() bool { return fake.countOf("Fetch.disable") == 1 })
@@ -506,7 +703,7 @@ func TestBlockPumpEventError(t *testing.T) {
 		entered:   make(chan struct{}),
 		yieldDone: make(chan struct{}),
 	}
-	stop := blockPump(ctx, probe.events(errors.New("событие не разбирается")), fake, blockTypes(false))
+	stop := blockPump(ctx, probe.events(errors.New("событие не разбирается")), fake, blockRulesOf(Options{}))
 
 	select {
 	case <-probe.entered:
@@ -551,7 +748,7 @@ func TestBlockPumpRespondError(t *testing.T) {
 	defer cancel()
 	events := make(chan fetch.EventRequestPaused, 2)
 	fake := &fakeCDPSession{fail: map[string]error{"Fetch.failRequest": errors.New("boom")}}
-	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
+	stop := blockPump(ctx, pumpEvents(events), fake, blockRulesOf(Options{}))
 
 	events <- fetch.EventRequestPaused{RequestID: "a", ResourceType: network.ResourceTypeImage}
 	events <- fetch.EventRequestPaused{RequestID: "b", ResourceType: network.ResourceTypeImage}
@@ -570,7 +767,7 @@ func TestBlockPumpStopWaitsForListener(t *testing.T) {
 	events := make(chan fetch.EventRequestPaused)
 	gate := make(chan struct{})
 	fake := &fakeCDPSession{gate: map[string]chan struct{}{"Fetch.continueRequest": gate}}
-	stop := blockPump(ctx, pumpEvents(events), fake, blockTypes(false))
+	stop := blockPump(ctx, pumpEvents(events), fake, blockRulesOf(Options{}))
 
 	// Слушатель вошёл в blockRespond и ждёт освобождения шлюза: команда
 	// записана в журнал до ожидания.
@@ -599,7 +796,8 @@ func TestBlockPumpStopWaitsForListener(t *testing.T) {
 // TestStartBlock — включение блокировки в конвейере сессии: отказы контекста
 // вкладки и Fetch.enable, штатный stop (гасит слушателя и выключает
 // перехват), расширение паттернов Stylesheet опцией Options.BlockStylesheet
-// (T-213). События перехвата подаются через fakeCDP — in-memory транспорт
+// (T-213) и доменами трекеров опцией Options.BlockTrackerDomains (T-214).
+// События перехвата подаются через fakeCDP — in-memory транспорт
 // chromedp (cdpfake_test.go), живой браузер не нужен.
 func TestStartBlock(t *testing.T) {
 	// newSession — сессия с браузером, чьи опции читает startBlock
@@ -703,6 +901,68 @@ func TestStartBlock(t *testing.T) {
 		tr.fireSession("Fetch.requestPaused",
 			`{"requestId":"css-1","resourceType":"Stylesheet"}`)
 		waitFor(t, func() bool { return tr.countOf("Fetch.failRequest") == 1 })
+	})
+
+	// Опция BlockTrackerDomains (T-214): паттерны Fetch.enable пополняются
+	// доменными, приостановленный Script к трекеру — failRequest, Script
+	// с доменом трекера в пути чужого хоста — continueRequest.
+	t.Run("block_tracker_domains расширяет перехват (T-214)", func(t *testing.T) {
+		ctx, tr := newFakeCDPContext(t)
+		s := newSession(ctx, Options{BlockTrackerDomains: true})
+		stop, err := s.startBlock(context.Background())
+		if err != nil {
+			t.Fatalf("startBlock: %v", err)
+		}
+		defer stop()
+
+		enable := tr.callsOf()
+		n, params := 0, ""
+		for _, c := range enable {
+			if c.Method == "Fetch.enable" {
+				n++
+				params = c.Params
+			}
+		}
+		if n != 1 {
+			t.Fatalf("Fetch.enable выполнен %d раз, хочу 1", n)
+		}
+		if !strings.Contains(params, `"*google-analytics.com*"`) {
+			t.Errorf("паттерны Fetch.enable без домена трекера: %s", params)
+		}
+		if !strings.Contains(params, `"*mc.yandex.ru*"`) {
+			t.Errorf("паттерны Fetch.enable без mc.yandex.ru: %s", params)
+		}
+
+		tr.fireSession("Fetch.requestPaused",
+			`{"requestId":"ga-1","resourceType":"Script",`+
+				`"request":{"url":"https://www.google-analytics.com/analytics.js"}}`)
+		waitFor(t, func() bool { return tr.countOf("Fetch.failRequest") == 1 })
+
+		tr.fireSession("Fetch.requestPaused",
+			`{"requestId":"own-1","resourceType":"Script",`+
+				`"request":{"url":"https://site.example/js/google-analytics.com.js"}}`)
+		waitFor(t, func() bool { return tr.countOf("Fetch.continueRequest") == 1 })
+	})
+
+	// Без опции доменных паттернов нет вовсе — Fetch.enable несёт только
+	// типовые (T-062/T-213).
+	t.Run("без block_tracker_domains доменных паттернов нет (T-214)", func(t *testing.T) {
+		ctx, tr := newFakeCDPContext(t)
+		s := newSession(ctx, Options{})
+		stop, err := s.startBlock(context.Background())
+		if err != nil {
+			t.Fatalf("startBlock: %v", err)
+		}
+		defer stop()
+
+		for _, c := range tr.callsOf() {
+			if c.Method != "Fetch.enable" {
+				continue
+			}
+			if strings.Contains(c.Params, "urlPattern") {
+				t.Errorf("паттерны Fetch.enable содержат urlPattern: %s", c.Params)
+			}
+		}
 	})
 }
 

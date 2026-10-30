@@ -665,6 +665,24 @@ services:
     <<: *go-common
     build: *go-build
     command: ["sleep", "infinity"]
+    # Явное networks (переопределяет плоский список якоря go-common) ради
+    # DNS-алиасов трекер-доменов live-теста block_tracker_domains (T-214,
+    # block_live_test.go): run-контейнер сам отдаёт зонды трекер-доменов —
+    # герметичный unbound эти имена не резолвит, а без резолва «заблокировано»
+    # в тесте неотличимо от DNS-отказа. Хосты — не Google-аналитика:
+    # google-домены в HSTS-preload Chromium (http-зонд принудительно
+    # апгрейдится на https и падает на TLS с HTTP-сервером теста).
+    # Алиасы применяются только с флагом `docker compose run --use-aliases`
+    # (без него run-контейнеры алиасы служб не получают), живут, пока жив
+    # run-контейнер (make test/lint — секунды-минуты) и действуют только в
+    # dev-стеке; параллельные run-контейнеры разделяют имена (round-robin
+    # Docker DNS) — окно гонки того же класса, что и динамические адреса
+    # T-180.
+    networks:
+      crawler_net:
+        aliases:
+          - c.clarity.ms
+          - mc.yandex.ru
     environment:
       # Поверх общих переменных — адрес CDP dev-chromium для live-тестов
       # рендера (internal/render/*_live_test.go) и приёмочных тестов

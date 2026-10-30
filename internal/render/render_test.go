@@ -32,25 +32,27 @@ func testBrowser(contexts int) *Browser {
 func TestNewOptions(t *testing.T) {
 	cfg := config.Default()
 	cfg.Render = config.Render{
-		RemoteURL:          "ws://chromium:9222",
-		Contexts:           3,
-		Timeout:            config.Duration(25 * time.Second),
-		RestartEveryPages:  500,
-		RestartMemoryBytes: config.ByteSize(1536 << 20),
-		BlockStylesheet:    true,
+		RemoteURL:           "ws://chromium:9222",
+		Contexts:            3,
+		Timeout:             config.Duration(25 * time.Second),
+		RestartEveryPages:   500,
+		RestartMemoryBytes:  config.ByteSize(1536 << 20),
+		BlockStylesheet:     true,
+		BlockTrackerDomains: true,
 	}
 	cfg.HTTP.UserAgent = "Crawler/1.0 (+https://example.example; admin@example.example)"
 
 	got := NewOptions(*cfg)
 	want := Options{
-		RemoteURL:         "ws://chromium:9222",
-		Contexts:          3,
-		Timeout:           25 * time.Second,
-		RestartEveryPages: 500,
-		MemoryThreshold:   1536 << 20,
-		UserAgent:         "Crawler/1.0 (+https://example.example; admin@example.example)",
-		MaxDOMBytes:       cfg.Content.MaxStoreBytes.B(), // R-02: потолок DOM — лимит хранилища
-		BlockStylesheet:   true,
+		RemoteURL:           "ws://chromium:9222",
+		Contexts:            3,
+		Timeout:             25 * time.Second,
+		RestartEveryPages:   500,
+		MemoryThreshold:     1536 << 20,
+		UserAgent:           "Crawler/1.0 (+https://example.example; admin@example.example)",
+		MaxDOMBytes:         cfg.Content.MaxStoreBytes.B(), // R-02: потолок DOM — лимит хранилища
+		BlockStylesheet:     true,
+		BlockTrackerDomains: true,
 	}
 	if got != want {
 		t.Fatalf("NewOptions:\n got %+v\nwant %+v", got, want)
@@ -88,13 +90,15 @@ func TestOptionsValidate(t *testing.T) {
 		t.Fatalf("локальный режим отклонён: %v", err)
 	}
 
-	// BlockStylesheet (T-213) — bool без диапазона: оба значения легальны,
-	// включение — вопрос A/B-решения, а не валидации.
-	for _, css := range []bool{false, true} {
+	// Булевы опции без диапазона: оба значения легальны — для
+	// block_stylesheet (T-213) включение — вопрос A/B-решения, для
+	// block_tracker_domains (T-214) — вопрос экономии, не корректности.
+	for _, b := range []bool{false, true} {
 		opt := valid
-		opt.BlockStylesheet = css
+		opt.BlockStylesheet = b
+		opt.BlockTrackerDomains = b
 		if err := opt.validate(); err != nil {
-			t.Errorf("block_stylesheet = %v отклонён: %v", css, err)
+			t.Errorf("block_stylesheet/block_tracker_domains = %v отклонены: %v", b, err)
 		}
 	}
 

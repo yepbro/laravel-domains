@@ -141,6 +141,16 @@ type Options struct {
 	// включение на проде — только после A/B (доля расхождений детекции
 	// <1%, темп не хуже). Источник — render.block_stylesheet.
 	BlockStylesheet bool
+	// BlockTrackerDomains — блокировать ли в рендер-контексте запросы к
+	// доменам веб-аналитики/телеметрии (T-214): Fetch.enable получает
+	// urlPattern-паттерны по доменам списка blockTrackerDomains
+	// (block.go), вердикт по каждому приостановленному запросу — точная
+	// хостовая проверка (свои скрипты сайта и пути с похожей подстрокой
+	// не задеты). Дефолт true — трекеры не участвуют в детекции,
+	// экономия трафика и CPU прямая; остаточный риск и обоснование
+	// дефолта — у поля BlockTrackerDomains internal/config. Источник —
+	// render.block_tracker_domains.
+	BlockTrackerDomains bool
 }
 
 // NewOptions собирает Options из конфигурации сервиса (ТЗ 5.10): секция
@@ -149,14 +159,15 @@ type Options struct {
 // того, что хранилище контента принимает).
 func NewOptions(cfg config.Config) Options {
 	return Options{
-		RemoteURL:         cfg.Render.RemoteURL,
-		Contexts:          cfg.Render.Contexts,
-		Timeout:           time.Duration(cfg.Render.Timeout),
-		RestartEveryPages: cfg.Render.RestartEveryPages,
-		MemoryThreshold:   cfg.Render.RestartMemoryBytes.B(),
-		UserAgent:         cfg.HTTP.UserAgent,
-		MaxDOMBytes:       cfg.Content.MaxStoreBytes.B(),
-		BlockStylesheet:   cfg.Render.BlockStylesheet,
+		RemoteURL:           cfg.Render.RemoteURL,
+		Contexts:            cfg.Render.Contexts,
+		Timeout:             time.Duration(cfg.Render.Timeout),
+		RestartEveryPages:   cfg.Render.RestartEveryPages,
+		MemoryThreshold:     cfg.Render.RestartMemoryBytes.B(),
+		UserAgent:           cfg.HTTP.UserAgent,
+		MaxDOMBytes:         cfg.Content.MaxStoreBytes.B(),
+		BlockStylesheet:     cfg.Render.BlockStylesheet,
+		BlockTrackerDomains: cfg.Render.BlockTrackerDomains,
 	}
 }
 

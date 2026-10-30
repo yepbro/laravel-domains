@@ -1,6 +1,7 @@
 package render
 
-// Live-проверка блокировки ресурсов (T-062; CSS — опция T-213) — против
+// Live-проверка блокировки ресурсов (T-062; CSS — опция T-213;
+// трекер-домены — опция T-214) — против
 // реального Chromium dev-стека. Внутри теста поднимается HTTP-сервер со
 // счётчиками обращений: страница тянет картинку, шрифт, CSS, скрипт и
 // делает XHR; счётчики доказывают факт запроса независимо от наших же
@@ -11,12 +12,16 @@ package render
 // здесь не годится (слушает 127.0.0.1 — Chromium из другого контейнера не
 // достучится): сервер слушает на 0.0.0.0, а странице отдаётся адрес этого
 // контейнера в crawler_net — первый не-loopback IPv4 (net.InterfaceAddrs),
-// DNS не нужен.
+// DNS не нужен. Для T-214 трекер-домены резолвятся DNS-алиасами сервиса
+// tools в compose (c.clarity.ms, mc.yandex.ru → run-контейнер); алиасы
+// применяет флаг --use-aliases у compose run (см. запуск ниже), без него
+// run-контейнер алиасы служб не получает — контрольный прогон теста T-214
+// скажет об этом явно.
 //
 // Запуск — как в browser_live_test.go:
 //
 //	docker compose --project-directory . -f deploy/docker/compose.yaml \
-//	  run -e CRAWLER_RENDER_TEST=1 --rm tools \
+//	  run --use-aliases -e CRAWLER_RENDER_TEST=1 --rm tools \
 //	  go test ./internal/render -run BlockLive -v -count=1
 
 import (
@@ -24,6 +29,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,6 +44,14 @@ type blockLiveCounters struct {
 	img     atomic.Int64
 	font    atomic.Int64
 	favicon atomic.Int64
+	// Счётчики страницы T-214 (tracker.html): собственный скрипт
+	// (trackerJS), зонды трекер-доменов через DNS-алиасы compose
+	// (clarityProbe — c.clarity.ms, mcProbe — mc.yandex.ru) и
+	// запрос с доменом трекера в ПУТИ, но своим хостом (trackerTrap).
+	clarityProbe atomic.Int64
+	mcProbe      atomic.Int64
+	trackerJS    atomic.Int64
+	trackerTrap  atomic.Int64
 }
 
 // blockLiveIPv4 — адрес этого контейнера в crawler_net для Chromium.
@@ -111,11 +125,68 @@ x.open('GET','/data.json',false);x.send();`)
 		w.Header().Set("Content-Type", "image/x-icon")
 		_, _ = w.Write(nil)
 	})
+	// Страница T-214 (block_tracker_domains). Трекер-домены резолвит
+	// Docker DNS по алиасам compose (deploy/docker/compose.yaml, сервис
+	// tools: www.google-analytics.com и mc.yandex.ru → этот же
+	// run-контейнер): герметичный unbound такие имена не знает, а без
+	// резолва «заблокировано перехватом» было бы неотличимо от
+	// DNS-отказа. Зонды — синхронные XHR с итогом в атрибуте <body>
+	// (CORS: читаем и статус): контрольный прогон с выключенной опцией
+	// обязан их ДОГРУЗИТЬ (доказывает резолв+раздачу), рабочий —
+	// оборвать до отправки (доказывает блокировку счётчиком сервера).
+	port := 0 // порт сервера — заполняется после Listen
+	mux.HandleFunc("/tracker.html", func(w http.ResponseWriter, _ *http.Request) {
+		c.page.Add(1)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, `<!doctype html>
+<html><body>
+<script src="/tracker-app.js"></script>
+</body></html>`)
+	})
+	mux.HandleFunc("/tracker-app.js", func(w http.ResponseWriter, _ *http.Request) {
+		c.trackerJS.Add(1)
+		w.Header().Set("Content-Type", "text/javascript")
+		_, _ = fmt.Fprintf(w, `
+function probe(attr, url) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', url, false);
+    x.send();
+    document.body.setAttribute(attr, 'loaded ' + x.status);
+  } catch (e) {
+    document.body.setAttribute(attr, 'error');
+  }
+}
+probe('clarity-xhr', 'http://c.clarity.ms:`+"%[1]d"+`/clarity-probe');
+probe('mc-xhr', 'http://mc.yandex.ru:`+"%[1]d"+`/mc-probe');
+probe('path-trap', '/js/google-analytics.com.js');
+`, port)
+	})
+	clarityProbe := func(w http.ResponseWriter, _ *http.Request) {
+		c.clarityProbe.Add(1)
+		w.Header().Set("Content-Type", "text/javascript")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_, _ = fmt.Fprint(w, "// зонд clarity.ms")
+	}
+	mux.HandleFunc("/clarity-probe", clarityProbe)
+	mux.HandleFunc("/mc-probe", func(w http.ResponseWriter, _ *http.Request) {
+		c.mcProbe.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_, _ = fmt.Fprint(w, "ok")
+	})
+	mux.HandleFunc("/js/google-analytics.com.js", func(w http.ResponseWriter, _ *http.Request) {
+		c.trackerTrap.Add(1)
+		w.Header().Set("Content-Type", "text/javascript")
+		_, _ = fmt.Fprint(w, "// имя трекер-домена в пути, хост — тестовый сервер")
+	})
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
+	// До старта Serve: handler-горутина читает port без синхронизации.
+	port = ln.Addr().(*net.TCPAddr).Port
 	srv := &http.Server{Handler: mux}
 	done := make(chan struct{})
 	go func() {
@@ -126,7 +197,7 @@ x.open('GET','/data.json',false);x.send();`)
 		_ = srv.Close()
 		<-done
 	})
-	return c, "http://" + net.JoinHostPort(blockLiveIPv4(t), fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)) + "/page.html"
+	return c, "http://" + net.JoinHostPort(blockLiveIPv4(t), fmt.Sprint(port)) + "/page.html"
 }
 
 // blockLiveRun — страница в сессии с данными опциями (общая обвязка
@@ -245,5 +316,111 @@ func TestBlockLiveStylesheetBlocked(t *testing.T) {
 	}
 	if got := c.font.Load(); got != 0 {
 		t.Errorf("шрифт запрошен %d раз, хочу 0 (заблокирован, ТЗ 5.6)", got)
+	}
+}
+
+// domAttr — значение атрибута тела из итогового DOM (live-тест T-214):
+// атрибуты выставляет сама страница по итогам своих XHR — читаются из
+// публичного результата рендера. Отсутствие атрибута — пустая строка.
+func domAttr(dom, name string) string {
+	i := strings.Index(dom, name+"=\"")
+	if i < 0 {
+		return ""
+	}
+	rest := dom[i+len(name)+2:]
+	if j := strings.IndexByte(rest, '"'); j >= 0 {
+		return rest[:j]
+	}
+	return rest
+}
+
+// TestBlockLiveTrackerDomains — опция block_tracker_domains (T-214)
+// против живого Chromium, дифференциалом двух прогонов одной страницы
+// (трекер-домены резолвятся DNS-алиасами compose в этот же run-контейнер,
+// счётчики сервера — независимое от CDP-событий доказательство):
+//
+//   - контроль (опция выключена): зонды обоих трекер-доменов ДОХОДЯТ до
+//     сервера и читаются (loaded 200) — иначе тест ничего не доказывает
+//     (без резолва DNS-отказ неотличим от блокировки);
+//   - рабочий прогон (опция включена): зонды оборваны ДО отправки
+//     (Fetch.failRequest — счётчики ноль), собственный скрипт страницы
+//     работает, а XHR по пути с доменом трекера в имени файла (хост —
+//     наш сервер) проходит: подстрочную паузу urlPattern отпускает
+//     точная хостовая проверка.
+//
+// Зонды: c.clarity.ms — поддомен домена списка (суффиксный матчинг),
+// mc.yandex.ru — точный хост списка. Google-аналитика (google-analytics,
+// googletagmanager, doubleclick) зондируется юнит-тестами, но не live:
+// google-домены в HSTS-preload Chromium — http-зонд принудительно
+// апгрейдится на https и падает на TLS с HTTP-сервером теста.
+func TestBlockLiveTrackerDomains(t *testing.T) {
+	skipUnlessLive(t)
+
+	// Контрольный прогон: свежий сервер — счётчики только этого прогона.
+	cOff, offPage := blockLiveServe(t)
+	offURL := strings.TrimSuffix(offPage, "page.html") + "tracker.html"
+	offOut := blockLiveRun(t, liveOptions(), offURL)
+	if got := cOff.clarityProbe.Load(); got < 1 {
+		t.Fatalf("контроль: зонд clarity.ms не дошёл до сервера (%d; атрибут clarity-xhr %q, mc-xhr %q) — "+
+			"проверьте флаг --use-aliases у compose run и DNS-алиасы сервиса tools (T-214)",
+			got, domAttr(offOut.DOM, "clarity-xhr"), domAttr(offOut.DOM, "mc-xhr"))
+	}
+	if got := cOff.mcProbe.Load(); got < 1 {
+		t.Fatalf("контроль: зонд mc.yandex.ru не дошёл до сервера (%d) — "+
+			"проверьте флаг --use-aliases у compose run и DNS-алиасы сервиса tools (T-214)", got)
+	}
+	if attr := domAttr(offOut.DOM, "clarity-xhr"); attr != "loaded 200" {
+		t.Errorf("контроль: clarity-xhr %q, хочу loaded 200 (блокировки нет)", attr)
+	}
+	if attr := domAttr(offOut.DOM, "mc-xhr"); attr != "loaded 200" {
+		t.Errorf("контроль: mc-xhr %q, хочу loaded 200 (блокировки нет)", attr)
+	}
+
+	// Рабочий прогон: опция включена.
+	cOn, onPage := blockLiveServe(t)
+	onURL := strings.TrimSuffix(onPage, "page.html") + "tracker.html"
+	opts := liveOptions()
+	opts.BlockTrackerDomains = true
+	onOut := blockLiveRun(t, opts, onURL)
+	if onOut.FinalURL != onURL {
+		t.Errorf("final URL %q, хочу %q", onOut.FinalURL, onURL)
+	}
+
+	// Обязанные дойти: страница и собственный скрипт (JS жив, свой домен
+	// не задет) — оба синхронны/предшествуют load, обычно уже стоят;
+	// опрос страхует медленную доставку (стиль blockLiveWaitReady).
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) &&
+		(cOn.page.Load() < 1 || cOn.trackerJS.Load() < 1) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := cOn.page.Load(); got < 1 {
+		t.Fatalf("страница не запрошена за 10 с — тест страницы T-214 не выполнился")
+	}
+	if got := cOn.trackerJS.Load(); got < 1 {
+		t.Fatalf("собственный скрипт не запрошен за 10 с (блокировка не должна трогать свой домен)")
+	}
+
+	// Трекеры оборваны до отправки: счётчики ноль и атрибуты — ошибка.
+	if got := cOn.clarityProbe.Load(); got != 0 {
+		t.Errorf("зонд clarity.ms дошёл до сервера %d раз, хочу 0 (заблокирован, T-214)", got)
+	}
+	if got := cOn.mcProbe.Load(); got != 0 {
+		t.Errorf("зонд mc.yandex.ru дошёл до сервера %d раз, хочу 0 (заблокирован, T-214)", got)
+	}
+	if attr := domAttr(onOut.DOM, "clarity-xhr"); attr != "error" {
+		t.Errorf("clarity-xhr %q, хочу error (заблокирован)", attr)
+	}
+	if attr := domAttr(onOut.DOM, "mc-xhr"); attr != "error" {
+		t.Errorf("mc-xhr %q, хочу error (заблокирован)", attr)
+	}
+
+	// Ложное срабатывание: путь содержит домен трекера, хост — наш
+	// сервер; запрос обязан дойти (счётчик) и прочитаться (200).
+	if got := cOn.trackerTrap.Load(); got != 1 {
+		t.Errorf("запросов к /js/google-analytics.com.js: %d, хочу 1 (хост не трекер — проходит)", got)
+	}
+	if attr := domAttr(onOut.DOM, "path-trap"); attr != "loaded 200" {
+		t.Errorf("path-trap %q, хочу loaded 200 (хост не трекер — проходит)", attr)
 	}
 }

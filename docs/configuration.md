@@ -600,6 +600,7 @@ Go: без потолка). Замер критерия T-163 сэмплером
 | `restart_every_pages` | `CRAWLER_RENDER_RESTART_EVERY_PAGES` | целое | `500` |
 | `restart_memory_bytes` | `CRAWLER_RENDER_RESTART_MEMORY_BYTES` | размер | `1536MiB` (диапазон: 256MiB–16GiB, `0` — отключено) |
 | `block_stylesheet` | `CRAWLER_RENDER_BLOCK_STYLESHEET` | bool | `false` (T-213; включение — после A/B, риск computed styles — ниже) |
+| `block_tracker_domains` | `CRAWLER_RENDER_BLOCK_TRACKER_DOMAINS` | bool | `true` (T-214; список доменов и принцип выбора — ниже и в [`render.md`](render.md)) |
 | `queue_high_watermark` | `CRAWLER_RENDER_QUEUE_HIGH_WATERMARK` | целое | `10000` (0 — общий `scheduler.queue_high_watermark`) |
 | `requeue_deprioritized_zones` | `CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES` | список имён зон | `[]` (замена целиком; имена — punycode нижним регистром, как в справочнике zones) |
 
@@ -714,6 +715,25 @@ computed styles и media queries (`getComputedStyle`, `matchMedia`) и на
 диф сигнатур Laravel до/после на одинаковой выборке (критерий: доля
 расхождений детекции < 1%) и контроль темпа (не хуже текущего);
 механика и границы риска — [`render.md`](render.md), раздел блокировки.
+
+`block_tracker_domains` — блокировка запросов к доменам веб-аналитики и
+телеметрии в рендер-контексте (T-214): Google Analytics, GTM,
+DoubleClick, Яндекс Метрика, Hotjar, Clarity, Mixpanel и пр. — полный
+список (15 доменов) и принцип выбора в [`render.md`](render.md), раздел
+блокировки (только специализированная аналитика/телеметрия, не CDN
+общего назначения). Аналитика приходит Script/XHR-запросами — по типам
+она не ловится (T-062/T-213), а режет трафик (5–15 запросов, 100–500 КБ
+на страницу по замерам источников) и CPU таймеров трекеров, продлевающих
+«затишье» сети; поэтому `Fetch.enable` получает urlPattern-паттерны по
+доменам, а вердикт по каждому приостановленному запросу выносит точная
+хостовая проверка — собственные скрипты сайта и пути с похожей подстрокой
+(например `/js/google-analytics.com.js`) не задеты. Дефолт `true` —
+отличие от `block_stylesheet` (T-213): трекеры не участвуют в детекции
+Laravel (правила ищут сигнатуры фреймворка в контенте и скриптах самого
+сайта), остаточный риск — экзотика, собирающая видимый контент тегами
+менеджера тегов; выгода прямая, A/B не требуется, контроль после
+включения — обычные метрики этапа (темп и успешность рендера не хуже
+текущих). `false` — трекеры грузятся как раньше.
 
 `queue_high_watermark` — порог ёмкости очереди рендера (T-174; ворота
 публикации `q:render` — T-066, `renderq.go` HTTP-этапа,

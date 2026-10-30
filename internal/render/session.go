@@ -115,7 +115,8 @@ func (s *Session) start(ctx context.Context) error {
 // ресурса в хранилище контента.
 //
 // Блокировка изображений/шрифтов/медиа (T-062, ТЗ 5.6; с опцией
-// Options.BlockStylesheet — и CSS, T-213) включается здесь, до перехода
+// Options.BlockStylesheet — и CSS, T-213; с Options.BlockTrackerDomains
+// — и домены аналитики, T-214) включается здесь, до перехода
 // (startBlock, перед waitSubscribe): перехват видит запросы страницы с
 // первого. Этапы — chromedp.Run/Do над s.Context().
 func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {

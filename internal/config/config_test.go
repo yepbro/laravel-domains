@@ -100,6 +100,7 @@ func TestDefault(t *testing.T) {
 		{"render.restart_every_pages", c.Render.RestartEveryPages, 500},
 		{"render.restart_memory_bytes", c.Render.RestartMemoryBytes.B(), int64(1536 << 20)},
 		{"render.block_stylesheet", c.Render.BlockStylesheet, false},
+		{"render.block_tracker_domains", c.Render.BlockTrackerDomains, true},
 		{"render.queue_high_watermark", c.Render.QueueHighWatermark, 10000},
 		{"content.dir", c.Content.Dir, "/data/content"},
 		{"content.pack_size", c.Content.PackSize.B(), int64(512 << 20)},
@@ -244,6 +245,7 @@ render:
   restart_every_pages: 200
   restart_memory_bytes: "1GiB"
   block_stylesheet: true
+  block_tracker_domains: false
   queue_high_watermark: 7000
   requeue_deprioritized_zones:
     - "xn--p1ai"
@@ -357,6 +359,7 @@ log:
 		{"render.restart_every_pages", cfg.Render.RestartEveryPages, 200},
 		{"render.restart_memory_bytes", cfg.Render.RestartMemoryBytes.B(), int64(1 << 30)},
 		{"render.block_stylesheet", cfg.Render.BlockStylesheet, true},
+		{"render.block_tracker_domains", cfg.Render.BlockTrackerDomains, false},
 		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
 		{"content.dir", cfg.Content.Dir, "/srv/content"},
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(1 << 30)},
@@ -645,6 +648,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_RENDER_RESTART_EVERY_PAGES":          "99",
 		"CRAWLER_RENDER_RESTART_MEMORY_BYTES":         "768MiB",
 		"CRAWLER_RENDER_BLOCK_STYLESHEET":             "true",
+		"CRAWLER_RENDER_BLOCK_TRACKER_DOMAINS":        "false",
 		"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK":         "7000",
 		"CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES":  "xn--p1ai, org",
 		"CRAWLER_CONTENT_DIR":                         "/env/content",
@@ -748,6 +752,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"render.restart_every_pages", cfg.Render.RestartEveryPages, 99},
 		{"render.restart_memory_bytes", cfg.Render.RestartMemoryBytes.B(), int64(768 << 20)},
 		{"render.block_stylesheet", cfg.Render.BlockStylesheet, true},
+		{"render.block_tracker_domains", cfg.Render.BlockTrackerDomains, false},
 		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
 		{"content.dir", cfg.Content.Dir, "/env/content"},
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(256 * 1000 * 1000)},
