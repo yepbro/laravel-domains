@@ -137,7 +137,7 @@ baseline `make test` + `make lint` зелёный; ревьюеры —
   defer-закрытий. Критерий: все циклы джойнятся до закрытий (проверка
   тестом-хуком или ревью), `make test`/`make lint` зелёные.
 
-- **T-224** [в работе] — P2, scheduler EnqueueBatch держит соединение
+- **T-224** [сделана] — P2, scheduler EnqueueBatch держит соединение
   пула и курсор на время публикации в Redis: `defer rows.Close()`
   (`internal/scheduler/enqueue.go:172-176`) снимается только на
   выходе, а между вычиткой и `q.Publish` (:214, ретраи/паузы до
