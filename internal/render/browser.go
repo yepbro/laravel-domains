@@ -11,8 +11,8 @@ import (
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/emulation"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
-	"github.com/chromedp/chromedp/remote"
 )
 
 // probeTimeout — таймаут живого зонда вкладки при классификации ошибок:
@@ -44,16 +44,25 @@ type Browser struct {
 	// для контроля памяти (Browser.RSS, T-065). Неизменен после старта.
 	rootPID int
 
+	// lost — залипающая отметка «соединение мёртво» (T-218): её ставит
+	// probeConn, когда живой зонд браузера не получил ответа — chromedp
+	// в такой ситуации ничего не знает (чтение WebSocket не реагирует ни
+	// на контекст, ни на таймауты). Полузакрытый сокет не воскресает,
+	// поэтому отметка не снимается: поколение меняет Manager.
+	lost atomic.Bool
+
 	mu     sync.Mutex
 	closed bool
 }
 
 // StartBrowser подключается к внешнему Chromium (Options.RemoteURL — remote
-// через chromedp/remote.NewAllocator) или запускает собственный процесс
-// headless-shell (пустой RemoteURL — chromedp.NewExecAllocator, боевой
-// render-образ) и инициализирует браузерную сессию. Профиль браузерной
-// сессии — сам headless-shell без пользовательского каталога: он служебный,
-// страницы задач живут в изолированных контекстах и его не касаются.
+// через собственный аллокатор поверх chromedp/remote, remotealloc.go —
+// детерминированное закрытие соединения, T-218) или запускает собственный
+// процесс headless-shell (пустой RemoteURL — chromedp.NewExecAllocator,
+// боевой render-образ) и инициализирует браузерную сессию. Профиль
+// браузерной сессии — сам headless-shell без пользовательского каталога:
+// он служебный, страницы задач живут в изолированных контекстах и его
+// не касаются.
 //
 // ctx — контекст жизненного цикла: в chromedp браузер живёт, пока жив
 // контекст первого вызова, поэтому отмена ctx останавливает браузер
@@ -78,11 +87,14 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 	var cancelAlloc context.CancelFunc
 	mode := opts.RemoteURL
 	if mode != "" {
-		// Dev-стек: внешний headless-shell, compose-сервис chromium
-		// (ws://host:9222; аллокатор сам уточнит WebSocket-адрес браузера
-		// запросом /json/version).
-		allocCtx, cancelAlloc = remote.NewAllocator(ctx, opts.RemoteURL,
-			remote.WithDialTimeout(opts.DialTimeout))
+		// Внешний Chromium (dev-стек: compose-сервис chromium; боевой
+		// systemd-юнит crawler-chromium, render.remote_url): собственный
+		// аллокатор поверх chromedp/remote — соединение WebSocket с
+		// детерминированным закрытием сокета при смене поколения
+		// (remotealloc.go, T-218), адрес при необходимости уточняется
+		// запросом /json/version.
+		allocCtx, cancelAlloc = chromedp.NewAllocatorContext(ctx,
+			newRemoteAllocator(opts))
 	} else {
 		// Боевой режим: собственный процесс. --no-sandbox обязателен в
 		// контейнере без привилегий (deploy/docker/Dockerfile.render,
@@ -103,12 +115,19 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 	// Инициализация соединения и служебной вкладки. Первый Run обязан идти
 	// на самом bctx: в chromedp браузер живёт, пока жив контекст первого
 	// вызова (правило из докомментария chromedp.Run) — дочерний контекст с
-	// таймаутом отменился бы после инициализации и погасил браузер.
-	// Длительность попытки ограничена самим chromedp: remote —
-	// Options.DialTimeout (WebSocket) и уточнение адреса /json/version,
-	// local — таймаут чтения адреса от процесса (20 с в chromedp);
-	// внешняя граница — отмена ctx вызывающим.
-	if err := chromedp.Do(bctx); err != nil {
+	// таймаутом отменился бы после инициализации и погасил браузер,
+	// поэтому потолок — обгонная гонка initBrowserSession, а не дедлайн
+	// на самом bctx. Подключение ограничено Options.DialTimeout
+	// (remoteDial, включая уточнение адреса /json/version); дальнейший
+	// bootstrap (создание/подключение служебной вкладки, включение
+	// доменов) самой chromedp не ограничен — на подвисшем, но принимающем
+	// соединения Chromium он висит бесконечно, удерживая мьютекс
+	// менеджера (restartLocked, T-218), — поэтому попытка гонится с
+	// внешним потолком DialTimeout + SessionStartTimeout (масштаб того же
+	// bootstrap'а у сессии). Локальный режим — чтение адреса процесса
+	// (20 с в chromedp), потолок гонки покрывает и его; внешняя граница —
+	// отмена ctx вызывающим.
+	if err := initBrowserSession(bctx, opts); err != nil {
 		// Отмены при неудачной инициализации — гигиена ресурсов chromedp
 		// (горутины/соединения/процесс); герметичные отказы старта
 		// (connection refused, fork/exec несуществующего бинарка) ничего
@@ -157,12 +176,41 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 	return b, nil
 }
 
-// Alive — жива ли браузерная сессия: контекст не отменён и соединение с
-// Chromium не потеряно. При потере соединения chromedp закрывает
-// LostConnection в обоих режимах (WebSocket-обрыв remote, смерть процесса
-// local) и отменяет браузерный контекст.
+// initBrowserSession — инициализация браузерной сессии (соединение +
+// служебная вкладка) с внешним потолком: bootstrap chromedp не
+// ограничен изнутри (см. StartBrowser), а старт идёт под мьютексом
+// менеджера — обгонная гонка, как у Session.start. Превышение — ошибка
+// (старт поколения повторится следующей задачей/зондом), отмены всего
+// созданного делает вызывающий StartBrowser.
+func initBrowserSession(bctx context.Context, opts Options) error {
+	type result struct{ err error }
+	done := make(chan result, 1)
+	go func() {
+		done <- result{chromedp.Do(bctx)}
+	}()
+	limit := opts.DialTimeout + opts.SessionStartTimeout
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case r := <-done:
+		return r.err
+	case <-timer.C:
+		return fmt.Errorf("таймаут инициализации %s", limit)
+	}
+}
+
+// Alive — жива ли браузерная сессия: контекст не отменён, соединение с
+// Chromium не потеряно и зонд соединения не признал его мёртвым (lost,
+// T-218). При потере соединения chromedp закрывает LostConnection в
+// обоих режимах (WebSocket-обрыв remote, смерть процесса local) и
+// отменяет браузерный контекст; полузакрытое соединение (без FIN/RST —
+// NAT/conntrack, подвисший при остановке браузер) библиотека не видит
+// вовсе — его ловит probeConn.
 func (b *Browser) Alive() bool {
 	if b == nil || b.ctx == nil || b.ctx.Err() != nil {
+		return false
+	}
+	if b.lost.Load() {
 		return false
 	}
 	if c := chromedp.FromContext(b.ctx); c != nil && c.Browser != nil {
@@ -171,6 +219,47 @@ func (b *Browser) Alive() bool {
 			return false
 		default:
 		}
+	}
+	return true
+}
+
+// probeConn — зонд соединения с браузером: живая команда уровня браузера
+// (Target.getTargets) с коротким таймаутом. Нужен помимо Alive: chromedp
+// узнаёт о смерти соединения только от ошибок сокета, а чтение
+// WebSocket (remote.Conn.Read) не реагирует ни на контекст, ни на
+// таймауты — полузакрытое соединение выглядит живым бесконечно
+// (инцидент 02.11: сессии висели в «таймауте создания контекста 15s» ×
+// 11 520 за 6 ч, поколение не сменялось). Нет ответа — соединение
+// мертво: браузер помечается lost (залипающе — полузакрытый сокет не
+// воскресает), Alive() возвращает false и Manager меняет поколение.
+//
+// Одна попытка, и lost ставится на любую ошибку вызова — осознанно:
+// подтверждающий повтор удвоил бы латентность детекции (инцидент
+// требует восстановления за минуты), а цена ложного срабатывания — один
+// реконнект к тому же Chromium; персистентная ошибка зонда без
+// залипания не меняла бы поколение вовсе (Alive её не видит) — тише, но
+// не дешевле.
+func (b *Browser) probeConn() bool {
+	if b == nil {
+		return false
+	}
+	if b.lost.Load() {
+		return false
+	}
+	if b.ctx == nil {
+		// Без контекста chromedp (юнит-фейки пакета) — зонду нечего
+		// проверять; Alive для таких браузеров уже вёл себя так же.
+		return true
+	}
+	c := chromedp.FromContext(b.ctx)
+	if c == nil || c.Browser == nil {
+		return true
+	}
+	ctx, stop := context.WithTimeout(b.ctx, probeTimeout)
+	defer stop()
+	if _, err := cdp.Call(ctx, c.Browser, target.GetTargets, target.GetTargetsParams{}); err != nil {
+		b.lost.Store(true)
+		return false
 	}
 	return true
 }
@@ -268,6 +357,15 @@ func (b *Browser) classifyCtx(err error, url string, s *Session) *Error {
 		// Страница не загрузилась (net::ERR_*): вкладка жива, профиль цел.
 		return &Error{Class: ClassTask, URL: url, Err: err}
 	case s == nil || !s.probe():
+		// Неответчивая вкладка: отличить умершее соединение с браузером
+		// (полузакрытый сокет — зонд probeConn, T-218) от умершей вкладки
+		// при живом соединении: первое — класс browser (повтор на новом
+		// контексте того же мёртвого сокета бессмысленен, поколение
+		// сменит Manager), второе — класс context (существующий повтор).
+		if !b.probeConn() {
+			return &Error{Class: ClassBrowser, URL: url,
+				Err: fmt.Errorf("браузер Chromium недоступен: %w", err)}
+		}
 		return &Error{Class: ClassContext, URL: url,
 			Err: fmt.Errorf("контекст вкладки не отвечает: %w", err)}
 	default:

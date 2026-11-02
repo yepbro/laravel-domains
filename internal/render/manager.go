@@ -231,7 +231,10 @@ func (m *Manager) swapReasonLocked() (string, bool) {
 // — их ожидание на мьютексе эквивалентно ожиданию поколения, и вынос старта
 // за критическую секцию (single-flight) ничего бы не сэкономил, добавив
 // гонки установки поколения. Верхняя граница — Options.DialTimeout
-// (remote) или чтение адреса процесса (local).
+// (подключение remote, включая уточнение адреса /json/version) плюс
+// Options.SessionStartTimeout (bootstrap-команды, initBrowserSession —
+// T-218: сама chromedp их не ограничивает) или чтение адреса процесса
+// (local, 20 с в chromedp).
 func (m *Manager) restartLocked(reason string) error {
 	old := m.p
 	if old != nil {
@@ -280,8 +283,10 @@ func (m *Manager) mode() string {
 // Options.Timeout) не блокирует acquire, зонд Alive и Browser() — новые
 // задачи получают ErrClosed сразу, не ожидая дрена (R-07). Если Close
 // попадает на идущий перезапуск, он ждёт мьютекс до конца старта (до
-// Options.DialTimeout): старт поколения короткоживущий, а браузер этого
-// ещё не созданного поколения погасит отмена контекста жизненного цикла.
+// Options.DialTimeout + Options.SessionStartTimeout — потолок
+// initBrowserSession, T-218): старт поколения короткоживущий, а браузер
+// этого ещё не созданного поколения погасит отмена контекста жизненного
+// цикла.
 // Фоновые закрытия прошлых поколений завершаются независимо. Повторный
 // вызов безвреден.
 func (m *Manager) Close() {

@@ -34,6 +34,15 @@ func (b *Browser) NewSession(ctx context.Context) (*Session, error) {
 	if !b.Alive() {
 		return nil, &Error{Class: ClassBrowser, Err: ErrBrowserDead}
 	}
+	// Зонд соединения до создания контекста (T-218): полузакрытый сокет
+	// Alive не видит, а проявляется он именно здесь — зависшим
+	// createBrowserContext до SessionStartTimeout (15 с бесполезного
+	// ожидания на каждую задачу, инцидент 02.11). Зонд закрывает вопрос
+	// за probeTimeout: смерть соединения — класс browser, менеджер сменит
+	// поколение и повторит задачу на новом соединении.
+	if !b.probeConn() {
+		return nil, &Error{Class: ClassBrowser, Err: ErrBrowserDead}
+	}
 	sctx, cancel := chromedp.NewContext(b.ctx, chromedp.WithNewBrowserContext())
 	s := &Session{b: b, ctx: sctx, cancel: cancel}
 	if err := s.start(ctx); err != nil {
@@ -82,6 +91,19 @@ func (s *Session) start(ctx context.Context) error {
 		// браузер против не сложившегося контекста.
 		return s.b.classifyCtx(r.err, "", nil)
 	case <-timer.C:
+		// Контекст не создался за SessionStartTimeout: отличить
+		// умершее/подвисшее соединение (зонд probeConn — класс browser:
+		// повтор на новом контексте того же мёртвого сокета
+		// бессмысленен, поколение сменит Manager) от просто медленного
+		// браузера при живом соединении (класс context — существующий
+		// повтор на новом контексте). Инцидент 02.11: без зонда эта
+		// ветка единолично давала 11 520 WARN «контекст рендера умер»
+		// за 6 ч на полузакрытом соединении (T-218).
+		if !s.b.probeConn() {
+			return &Error{Class: ClassBrowser,
+				Err: fmt.Errorf("браузер Chromium недоступен: таймаут создания контекста %s",
+					s.b.opts.SessionStartTimeout)}
+		}
 		return &Error{Class: ClassContext,
 			Err: fmt.Errorf("таймаут создания контекста %s", s.b.opts.SessionStartTimeout)}
 	case <-ctx.Done():
@@ -191,14 +213,27 @@ func (s *Session) Close() {
 func (s *Session) Context() context.Context { return s.ctx }
 
 // wrap классифицирует ошибку этапа страницы: отменённый вызывающий контекст
-// и истёкший таймаут страницы — ClassTask (повтор на новом контексте
-// бессмысленен), остальное — classifyCtx по состоянию браузера/вкладки.
+// — ClassTask (повтор на новом контексте бессмысленен), истёкший таймаут
+// страницы — ClassTask, если соединение с браузером живо (тарпит-политика
+// T-148: тяжёлая страница), и ClassBrowser, если зонд обнаружил мёртвое
+// соединение (T-218: полузакрытый сокет не даёт ошибок транспорта —
+// таймаут страницы на нём выглядит как тарпит, а это инфраструктурный
+// отказ: Manager сменит поколение и повторит задачу); остальное —
+// classifyCtx по состоянию браузера/вкладки.
 func (s *Session) wrap(err error, caller, opCtx context.Context, url string) *Error {
 	switch {
 	case caller.Err() != nil:
 		return &Error{Class: ClassTask, URL: url,
 			Err: fmt.Errorf("задача отменена: %w: %w", caller.Err(), err)}
 	case opCtx.Err() != nil:
+		// Зонд соединения дёшев на живом браузере (getTargets отвечает
+		// за миллисекунды и при медленной странице); probeTimeout стоит
+		// только мёртвому сокету — ровно там, где нужен класс browser.
+		if !s.b.probeConn() {
+			return &Error{Class: ClassBrowser, URL: url,
+				Err: fmt.Errorf("браузер Chromium недоступен: таймаут страницы %s: %w: %w",
+					s.b.opts.Timeout, opCtx.Err(), err)}
+		}
 		return &Error{Class: ClassTask, URL: url,
 			Err: fmt.Errorf("таймаут страницы %s: %w: %w", s.b.opts.Timeout, opCtx.Err(), err)}
 	default:
