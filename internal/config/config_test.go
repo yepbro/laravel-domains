@@ -685,6 +685,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_WEB_RATE_LIMIT":                      "10",
 		"CRAWLER_WEB_LIVE_CONCURRENCY":                "7",
 		"CRAWLER_WEB_TIMEOUT":                         "90s",
+		"CRAWLER_WEB_PUBLIC_HOST":                     " crawler.example.com ",
 		"CRAWLER_DASHBOARD_LISTEN":                    "127.0.0.1:8191",
 		"CRAWLER_DASHBOARD_REFRESH_INTERVAL":          "30s",
 		"CRAWLER_DASHBOARD_STATUS_CACHE_TTL":          "3m",
@@ -788,6 +789,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"web.rate_limit", cfg.Web.RateLimit, 10},
 		{"web.timeout", cfg.Web.Timeout.D(), 90 * time.Second},
 		{"web.live_concurrency", cfg.Web.LiveConcurrency, 7},
+		{"web.public_host (нормализация пробелов)", cfg.Web.PublicHost, "crawler.example.com"},
 		{"dashboard.listen", cfg.Dashboard.Listen, "127.0.0.1:8191"},
 		{"dashboard.refresh", cfg.Dashboard.Refresh.D(), 30 * time.Second},
 		{"dashboard.status_cache_ttl", cfg.Dashboard.StatusCacheTTL.D(), 3 * time.Minute},
@@ -1204,6 +1206,15 @@ func TestValidate(t *testing.T) {
 		{"web.live_concurrency велик", func(c *Config) { c.Web.LiveConcurrency = 65 }, "web.live_concurrency"},
 		{"web.timeout 0", func(c *Config) { c.Web.Timeout = 0 }, "web.timeout"},
 		{"web.timeout велик", func(c *Config) { c.Web.Timeout = Duration(11 * time.Minute) }, "web.timeout"},
+		{"web.public_host со схемой", func(c *Config) { c.Web.PublicHost = "https://crawler.example.com" }, "web.public_host"},
+		{"web.public_host с путём", func(c *Config) { c.Web.PublicHost = "crawler.example.com/ru" }, "web.public_host"},
+		{"web.public_host длинный", func(c *Config) { c.Web.PublicHost = strings.Repeat("h", 254) }, "web.public_host"},
+		{"web.public_host голая схема", func(c *Config) { c.Web.PublicHost = "https:" }, "web.public_host"},
+		{"web.public_host порт не число", func(c *Config) { c.Web.PublicHost = "crawler.example.com:8O80" }, "web.public_host"},
+		{"web.public_host порт вне диапазона", func(c *Config) { c.Web.PublicHost = "crawler.example.com:99999" }, "web.public_host"},
+		{"web.public_host IPv6 без скобок", func(c *Config) { c.Web.PublicHost = "::1" }, "web.public_host"},
+		{"web.public_host userinfo", func(c *Config) { c.Web.PublicHost = "user@crawler.example.com" }, "web.public_host"},
+		{"web.public_host управляющий символ", func(c *Config) { c.Web.PublicHost = "crawler\x00.example.com" }, "web.public_host"},
 		{"dashboard.listen кривой", func(c *Config) { c.Dashboard.Listen = "8090" }, "dashboard.listen"},
 		{"dashboard.refresh 0", func(c *Config) { c.Dashboard.Refresh = 0 }, "dashboard.refresh"},
 		{"dashboard.refresh менее секунды", func(c *Config) { c.Dashboard.Refresh = Duration(500 * time.Millisecond) }, "dashboard.refresh"},
@@ -1245,6 +1256,7 @@ func TestValidate(t *testing.T) {
 	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)
 	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // границы весов
 	c.Web.Listen = "/run/crawler-web/web.sock"                                         // unix-сокет — вариант публичного входа web (T-124)
+	c.Web.PublicHost = "crawler.example.com:8443"                                      // канонический хост с портом (T-227)
 	c.Dashboard.Refresh = Duration(5 * time.Minute)                                    // верхняя граница периода снимков (ТЗД §8.3)
 	c.Dashboard.Probes = map[string]string{"dns-worker": "http://dns-worker:9102"}     // проба живости (ТЗД §5.8)
 	c.Monitor.SlowQueryInterval = 0                                                    // медленные запросы выключены — допустимо (T-177)

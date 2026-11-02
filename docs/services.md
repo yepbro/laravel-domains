@@ -1064,8 +1064,9 @@ SEO canonical/hreflang/OG/Twitter, счётчик Яндекс.Метрики), 
 readiness ping PostgreSQL (503), `GET /robots.txt` и
 `GET /sitemap.xml` — служебные файлы поисковых роботов (T-124:
 robots — статика из embed, sitemap — минимальный набор локалей,
-абсолютные URL собираются из запроса — адрес публикации в конфиге
-не хранится), `GET /static/*` — статика (go:embed). Адрес посетителя
+абсолютные URL — из канонического хоста `web.public_host` с фолбэком
+на `Host` запроса, схема — факт TLS либо `X-Forwarded-Proto`
+доверенного пира, T-227), `GET /static/*` — статика (go:embed). Адрес посетителя
 формы за прокси — `X-Real-IP` от loopback-пира TCP или пира
 unix-сокета (T-221, обе позиции доверия — вариант деплоя из
 deploy/nginx/README.md; запасной `X-Forwarded-For` без `X-Real-IP`
@@ -1087,7 +1088,7 @@ build-стадии до `go build` — go:embed встраивает насто�
 `make web-css` для dev-просмотра (одноразовый docker run).
 
 Конфигурация — секция `web` (`listen`/`rate_limit`/`timeout`/
-`live_concurrency`, [`configuration.md`](configuration.md)). Развёртывание (T-124):
+`live_concurrency`/`public_host`, [`configuration.md`](configuration.md)). Развёртывание (T-124):
 dev — compose-сервис `web` профиля app (порт лендинга публикуется на
 `127.0.0.1` хоста, `WEB_PORT`); бой — юнит `crawler-web.service`
 (docs/deploy.md) за reverse-proxy с TLS (первый образец —
@@ -1122,7 +1123,9 @@ Read 10 с, Write 15 с, Idle 60 с). Стартовая проверка кре
 PBKDF2-сверка формата T-127 (`internal/dashboard/auth`,
 `subtle.ConstantTimeCompare`, §7.4). После успешной сверки выдаётся
 cookie-сессия `<expiry>.<HMAC-SHA256(expiry, производный ключ KDF)>`
-(§7.5): HttpOnly, SameSite=Lax, 24 ч; быстрая проверка подписи снимает
+(§7.5): HttpOnly, SameSite=Lax, 24 ч, `Secure` по факту TLS — прямое
+соединение либо `X-Forwarded-Proto: https` от loopback-пира (T-227);
+быстрая проверка подписи снимает
 стоимость KDF (полсекунды на 600 000 итераций) с периодического опроса;
 ключом служит ключ хэша — смена `password_hash` инвалидирует все
 сессии, отдельный серверный секрет не нужен. Per-IP защита от подбора

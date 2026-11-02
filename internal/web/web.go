@@ -409,8 +409,9 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 // handleRobots — GET /robots.txt: статика из embed (T-124). Индексируются
 // страницы локалей и статика; API формы проверки и healthz ботам закрыты.
-// Строки Sitemap нет: адрес публикации в конфигурации не хранится,
-// /sitemap.xml находится по стандартному пути.
+// Строки Sitemap по-прежнему нет (сознательное решение, T-227): адрес
+// находится по стандартному пути /sitemap.xml — web.public_host задаёт
+// хост <loc>, отдельная строка ничего не добавляет.
 func (s *Server) handleRobots(w http.ResponseWriter, r *http.Request) {
 	b, err := staticFS.ReadFile("static/robots.txt")
 	if err != nil {
@@ -425,30 +426,48 @@ func (s *Server) handleRobots(w http.ResponseWriter, r *http.Request) {
 
 // handleSitemap — GET /sitemap.xml: минимальный sitemap — только
 // статические страницы-локали (T-124), доменных страниц у лендинга нет.
-// <loc> обязан быть абсолютным URL, а адрес публикации в конфигурации
-// не хранится — схема и хост берутся из запроса (за reverse-proxy их
-// передаёт nginx: X-Forwarded-Proto, Host), поэтому sitemap собирается
-// на запрос, а не лежит статикой.
+// <loc> обязан быть абсолютным URL. Хост — канонический web.public_host
+// (T-227): Host запроса за reverse-proxy передаёт nginx значением $host
+// посетителя, и без канона <loc> зависел бы от заголовка недоверенной
+// стороны (host-header poisoning); пустое поле — прежний фолбэк на Host
+// запроса. Схема — publicScheme (X-Forwarded-Proto только доверенного
+// пира). Поэтому sitemap собирается на запрос, а не лежит статикой.
 func (s *Server) handleSitemap(w http.ResponseWriter, r *http.Request) {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	// За reverse-proxy соединение к сервису всегда http: реальную схему
-	// клиента несёт X-Forwarded-Proto (может быть списком — берём первую).
-	// Чужие значения заголовка игнорируем: <loc> ограничен web-адресами.
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		first, _, _ := strings.Cut(proto, ",")
-		switch strings.ToLower(strings.TrimSpace(first)) {
-		case "http", "https":
-			scheme = strings.TrimSpace(first)
-		}
+	scheme := publicScheme(r)
+	host := strings.TrimSpace(s.cfg.Web.PublicHost)
+	if host == "" {
+		host = r.Host
 	}
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	_, _ = fmt.Fprint(w, xml.Header, `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`+"\n")
 	for _, loc := range Locales {
-		url := template.HTMLEscapeString(fmt.Sprintf("%s://%s/%s", scheme, r.Host, loc))
+		url := template.HTMLEscapeString(fmt.Sprintf("%s://%s/%s", scheme, host, loc))
 		_, _ = fmt.Fprintf(w, "\t<url>\n\t\t<loc>%s</loc>\n\t\t<changefreq>daily</changefreq>\n\t\t<priority>1.0</priority>\n\t</url>\n", url)
 	}
 	_, _ = fmt.Fprint(w, "</urlset>\n")
+}
+
+// publicScheme — схема публичного URL (<loc> sitemap, T-227): прямое
+// TLS-соединение — https; за reverse-proxy схему клиента несёт
+// X-Forwarded-Proto, но только от доверенного пира (loopback/unix —
+// trustedProxyPeer, тот же принцип, что адрес посетителя в clientIP):
+// заголовок прямого посетителя схемой не управляет, остаётся дефолт по
+// факту TLS (http). Значений может быть список — берётся ПОСЛЕДНЯЯ
+// позиция (её дописал наш прокси; клиентское начало списка не
+// доверено — по образцу X-Forwarded-For в proxyHeaderIP), образец
+// nginx ставит одиночное значение $scheme; мусор/пусто — дефолт.
+func publicScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if !trustedProxyPeer(r) {
+		return "http"
+	}
+	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	last := strings.ToLower(strings.TrimSpace(proto[strings.LastIndex(proto, ",")+1:]))
+	switch last {
+	case "http", "https":
+		return last
+	}
+	return "http"
 }

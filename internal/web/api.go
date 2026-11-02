@@ -116,13 +116,15 @@ var errLiveOverloaded = errors.New("живая проверка перегруж
 // клиентам: 200 с found=false выглядел бы «Laravel не найден» для домена
 // со stored-данными, а stored-часть landing.js не показывает), 502
 // (живая проверка не удалась инфраструктурно и домен конвейеру неизвестен).
+// Все исходы ошибок — JSON {"error": код} с Content-Type application/json
+// (checkWriteError, T-227).
 func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ip, isIP := clientIP(r)
 	if !s.limiter.allow(ip, time.Now()) {
 		s.met.Outcome(checkResultRateLimited)
 		w.Header().Set("Retry-After", "60")
-		http.Error(w, `{"error":"rate_limited"}`, http.StatusTooManyRequests)
+		checkWriteError(w, "rate_limited", http.StatusTooManyRequests)
 		return
 	}
 
@@ -237,14 +239,14 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 			// не найден»).
 			s.met.Outcome(checkResultBusy)
 			w.Header().Set("Retry-After", "5")
-			http.Error(w, `{"error":"busy"}`, http.StatusServiceUnavailable)
+			checkWriteError(w, "busy", http.StatusServiceUnavailable)
 			return
 		}
 		s.met.Failure(checkErrLive)
 		if resp.Stored == nil {
 			s.met.Outcome(checkResultFailed)
 			s.opt.Log.Warn("форма: живая проверка не удалась", "domain", normalized, "err", liveErr)
-			http.Error(w, `{"error":"check_failed"}`, http.StatusBadGateway)
+			checkWriteError(w, "check_failed", http.StatusBadGateway)
 			return
 		}
 		s.met.Outcome(checkResultStoredOnly)
@@ -375,23 +377,56 @@ const unixLocalKey = "unix-local"
 // IP; иначе — RemoteAddr (подделка заголовка снаружи и с чужих адресов
 // не расходует чужой бакет).
 func clientIP(r *http.Request) (string, bool) {
-	if _, ok := r.Context().Value(http.LocalAddrContextKey).(*net.UnixAddr); ok {
+	if isUnixPeer(r) {
 		// Пир unix-сокета: доверенный прокси.
 		if pip := proxyHeaderIP(r.Header); pip != "" {
 			return pip, true
 		}
 		return unixLocalKey, false
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
+	host := remoteHost(r)
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		if pip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); pip != nil {
 			return pip.String(), true
 		}
 	}
 	return host, net.ParseIP(host) != nil
+}
+
+// isUnixPeer — соединение пришло через unix-сокет (T-221): пир — сам
+// nginx на этом хосте, доверенный прокси. Положительное распознавание —
+// по локальному адресу соединения из контекста, который кладёт туда
+// http.Server: у пира unix-сокета это *net.UnixAddr (RemoteAddr при
+// этом «@» автобинда или путь сокета — не IP, а путь с двоеточием даже
+// разобрался бы SplitHostPort'ом как host:port).
+func isUnixPeer(r *http.Request) bool {
+	_, ok := r.Context().Value(http.LocalAddrContextKey).(*net.UnixAddr)
+	return ok
+}
+
+// remoteHost — хост RemoteAddr без порта; строка не в форме host:port
+// возвращается как есть (SplitHostPort для неё ошибочен).
+func remoteHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// trustedProxyPeer — пир соединения является доверенным reverse-proxy
+// этого хоста (T-227): nginx за TCP-loopback (deploy/nginx/
+// crawler.example.conf) либо за unix-сокетом (deploy/nginx/README.md).
+// Заголовкам, которые ставит прокси (X-Real-IP, X-Forwarded-For,
+// X-Forwarded-Proto), доверяем только от такого пира — прямой
+// посетитель и чужой адрес могут слать свои значения, но они не
+// читаются (тот же принцип, что адрес посетителя в clientIP).
+func trustedProxyPeer(r *http.Request) bool {
+	if isUnixPeer(r) {
+		return true
+	}
+	ip := net.ParseIP(remoteHost(r))
+	return ip != nil && ip.IsLoopback()
 }
 
 // proxyHeaderIP — адрес посетителя из заголовков прокси (unix-пир):
@@ -414,8 +449,14 @@ func proxyHeaderIP(h http.Header) string {
 	return ""
 }
 
+// checkWriteError — JSON-тело ошибки формы с корректным Content-Type
+// (единый формат всех исходов, включая 429/503/502 — до T-227 они
+// уходили через http.Error с text/plain; landing.js различает исходы по
+// статусу, тело — контракт прочих JSON-клиентов). nosniff — как ставил
+// http.Error, паритет поведения до унификации.
 func checkWriteError(w http.ResponseWriter, code string, status int) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(`{"error":"` + code + `"}`))
 }

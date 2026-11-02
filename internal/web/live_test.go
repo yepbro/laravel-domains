@@ -281,6 +281,10 @@ func TestLiveSemaphoreRetryAfter(t *testing.T) {
 	if ra := resp.Header.Get("Retry-After"); ra == "" {
 		t.Error("503 перегрузки без Retry-After")
 	}
+	// JSON-тело с корректным Content-Type (T-227, унификация с 422).
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("503 Content-Type = %q, хочу application/json", ct)
+	}
 	if !strings.Contains(string(body[:n]), `"busy"`) {
 		t.Errorf("тело 503: %s", string(body[:n]))
 	}
@@ -317,8 +321,20 @@ func TestLiveCircuitBuildRetriedAfterFailure(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	if st, body := postCheck(t, ts.URL); st != http.StatusBadGateway || !strings.Contains(body, "check_failed") {
-		t.Fatalf("первый запрос (сборка упала): %d %s, хочу 502 check_failed", st, body)
+	// Первый запрос (сборка падает) — 502 check_failed с JSON-телом и
+	// корректным Content-Type (T-227): раньше http.Error отдавал JSON
+	// с text/plain.
+	resp, err := http.Post(ts.URL+"/api/check-domain", "application/json",
+		strings.NewReader(`{"domain":"example.com"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBody := readBody(t, resp)
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(firstBody, "check_failed") {
+		t.Fatalf("первый запрос (сборка упала): %d %s, хочу 502 check_failed", resp.StatusCode, firstBody)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("502 Content-Type = %q, хочу application/json", ct)
 	}
 	if got := builds.Load(); got != 1 {
 		t.Fatalf("попыток сборки %d после первого запроса, хочу 1", got)

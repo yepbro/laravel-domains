@@ -7,6 +7,7 @@ package web
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -229,6 +230,9 @@ func TestCheckDomainInvalid(t *testing.T) {
 	if !strings.Contains(string(body[:n]), `"invalid"`) {
 		t.Errorf("тело 422 не в формате формы: %s", string(body[:n]))
 	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("422 Content-Type = %q, хочу application/json (T-227)", ct)
+	}
 }
 
 // TestCheckDomainRateLimited — 429 с Retry-After.
@@ -267,4 +271,24 @@ func TestCheckDomainRateLimited(t *testing.T) {
 	if ra := second.Header.Get("Retry-After"); ra == "" {
 		t.Error("429 без Retry-After")
 	}
+	// JSON-тело с корректным Content-Type (T-227): раньше http.Error
+	// отдавал JSON с text/plain — landing.js смотрит на статус, но
+	// контракт единообразия всех исходов формы.
+	if ct := second.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("429 Content-Type = %q, хочу application/json", ct)
+	}
+	if !strings.Contains(readBody(t, second), `"rate_limited"`) {
+		t.Error("тело 429 без error:rate_limited")
+	}
+}
+
+// readBody — тело ответа целиком (закрывает Body).
+func readBody(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	defer func() { _ = resp.Body.Close() }()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

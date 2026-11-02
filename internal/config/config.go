@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"crawler/internal/idn"
 )
@@ -622,6 +623,17 @@ type Web struct {
 	// общий Fetcher, один render.Manager), параллелизм ограничивает
 	// память проверок (тела страниц, рендер) в бюджете юнита.
 	LiveConcurrency int `yaml:"live_concurrency"`
+	// PublicHost — канонический хост публичного адреса лендинга
+	// (T-227, например «crawler.example.com», при нестандартном порте —
+	// с ним: «host:8443»): им собираются абсолютные URL sitemap.xml.
+	// Пустая строка — фолбэк на Host запроса: за reverse-proxy nginx
+	// передаёт его значением $host посетителя, и <loc> зависит от
+	// заголовка недоверенной стороны (host-header poisoning) —
+	// публикуемый наружу лендинг обязан задавать поле. Схему sitemap
+	// поле не задаёт: прямое соединение — факт TLS, за прокси —
+	// X-Forwarded-Proto доверенного пира (см. internal/web publicScheme).
+	// Расширение к минимальному составу ТЗ 5.10.
+	PublicHost string `yaml:"public_host"`
 }
 
 // Log — уровень логирования сервисов (каркас internal/service). Расширение
@@ -987,6 +999,10 @@ func Default() *Config {
 			// MemoryMax 256M юнита. 4 — как rate_limit: редкий посетитель
 			// не ждёт слота, всплеск интереса разряжается 503.
 			LiveConcurrency: 4,
+			// Канонический хост публичного адреса не задан: sitemap.xml
+			// собирает <loc> из Host запроса (T-227); публикуемый наружу
+			// лендинг задаёт web.public_host своим доменом.
+			PublicHost: "",
 		},
 		Dashboard: Dashboard{
 			// Loopback: публикация наружу — reverse-proxy с TLS
@@ -1046,6 +1062,10 @@ func (c *Config) normalize() {
 		c.Ingest.AllowedZonePaths = out
 	}
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
+	// Канонический хост лендинга — без краевых пробелов (idn-нормализацию
+	// не делаем: поле задаёт хост публичного адреса как есть, punycode —
+	// забота оператора; форму проверяет Validate).
+	c.Web.PublicHost = strings.TrimSpace(c.Web.PublicHost)
 	// Ключи весов зон — punycode-имена в нижнем регистре (как zones.name);
 	// карта пересобирается в порядке возрастания ключей, чтобы столкновение
 	// после приведения («Com» и «com» в одном YAML) разрешалось
@@ -1660,6 +1680,32 @@ func (c *Config) Validate() error {
 	if c.Web.Timeout <= 0 || c.Web.Timeout > Duration(10*time.Minute) {
 		problems = append(problems, fmt.Sprintf("web.timeout: ожидается %s..%s, задано %s",
 			Duration(time.Second), Duration(10*time.Minute), c.Web.Timeout))
+	}
+	// Канонический хост публичного адреса (T-227): host[:port] без
+	// схемы, пути и userinfo — значение целиком идёт в <loc> sitemap.xml
+	// (порт опционален: хост без порта — нормальный адрес за прокси на
+	// 80/443; IPv6-литерал — в квадратных скобках, как в URL). Управляющие
+	// символы ломали бы URL/XML; 253 октета — предел DNS-имени (без
+	// порта). Пустое поле — фолбэк sitemap на Host запроса.
+	if h := c.Web.PublicHost; h != "" {
+		hostPart := h
+		if i := strings.LastIndex(h, ":"); i >= 0 {
+			hostPart = h[:i]
+			if n, err := strconv.Atoi(h[i+1:]); err != nil || n < 1 || n > 65535 {
+				problems = append(problems, fmt.Sprintf(
+					"web.public_host: порт не в 1..65535 — ожидается host[:port] (например crawler.example.com:8443), задано %q", h))
+			}
+		}
+		// «:» без порта («https:»), пустой хост, userinfo («user@host»),
+		// голый IPv6 без скобок («::1»), схемы/пути/фрагменты и
+		// управляющие символы — не хост.
+		if hostPart == "" || len(hostPart) > 253 || strings.ContainsAny(hostPart, "/?#@") ||
+			strings.ContainsFunc(h, unicode.IsControl) ||
+			(strings.Contains(hostPart, ":") &&
+				(!strings.HasPrefix(hostPart, "[") || !strings.HasSuffix(hostPart, "]"))) {
+			problems = append(problems, fmt.Sprintf(
+				"web.public_host: ожидается host[:port] без схемы, пути и userinfo (например crawler.example.com, IPv6 — в скобках), задано %q", h))
+		}
 	}
 
 	// dashboard (ТЗД §8.1/§8.3, T-127). Username/PasswordHash общим

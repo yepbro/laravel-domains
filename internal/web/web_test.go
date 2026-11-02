@@ -6,6 +6,7 @@ package web
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -432,8 +433,9 @@ func TestRunUnixSocket(t *testing.T) {
 
 // TestRobotsSitemap — служебные файлы поисковых роботов у корня (T-124):
 // robots.txt — статика из embed; sitemap.xml — минимальный набор
-// локалей с абсолютным URL из запроса (схему за reverse-proxy передаёт
-// X-Forwarded-Proto); POST на маршруты — 405.
+// локалей с абсолютным URL (хост — Host запроса при пустом
+// web.public_host, схему за reverse-proxy передаёт X-Forwarded-Proto —
+// T-227 доверяет ему только loopback/unix-пиру); POST на маршруты — 405.
 func TestRobotsSitemap(t *testing.T) {
 	srv := newTestServer(t, &fakeDB{seed: seedLanding()})
 	ts := httptest.NewServer(srv.Handler())
@@ -484,10 +486,15 @@ func TestRobotsSitemap(t *testing.T) {
 	}
 
 	// За reverse-proxy схему передаёт X-Forwarded-Proto (публичный вход
-	// — TLS), Host берётся из запроса. Чужое значение заголовка
+	// — TLS), Host берётся из запроса (public_host не задан — фолбэк).
+	// Заголовок читается только от доверенного пира (T-227): по умолчанию
+	// httptest.NewRequest ставит RemoteAddr 192.0.2.1:1234 (TEST-NET-1,
+	// недоверенный пир) — поэтому пир задаётся явно loopback-адресом,
+	// как реальный nginx на этом хосте. Чужое значение заголовка
 	// игнорируется (остаётся схема соединения).
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/sitemap.xml", nil)
+	req.RemoteAddr = "127.0.0.1:60001"
 	req.Host = "crawler.example.com"
 	req.Header.Set("X-Forwarded-Proto", "https")
 	srv.Handler().ServeHTTP(rec, req)
@@ -499,6 +506,7 @@ func TestRobotsSitemap(t *testing.T) {
 	}
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/sitemap.xml", nil)
+	req.RemoteAddr = "127.0.0.1:60002"
 	req.Host = "crawler.example.com"
 	req.Header.Set("X-Forwarded-Proto", "javascript") // мусор — не web-схема
 	srv.Handler().ServeHTTP(rec, req)
@@ -515,5 +523,115 @@ func TestRobotsSitemap(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("POST /robots.txt = %d, хочу 405", resp.StatusCode)
+	}
+}
+
+// TestSitemapCanonicalHost — <loc> sitemap не зависит от Host и
+// X-Forwarded-Proto недоверенных пиров (T-227): хост — канонический
+// web.public_host (пустое поле — фолбэк на Host запроса), схема — факт
+// TLS либо XFP только от доверенного пира (loopback TCP/unix-сокет).
+func TestSitemapCanonicalHost(t *testing.T) {
+	// body — тело sitemap для запроса с заданными public_host, пиром,
+	// Host и XFP; unix — запрос «от nginx за unix-сокетом» (контекст
+	// локального адреса, как в TestClientIP), directTLS — прямое
+	// TLS-соединение.
+	body := func(publicHost, remote, host, xfp string, unix, directTLS bool) string {
+		cfg := config.Default()
+		cfg.Web.PublicHost = publicHost
+		srv, err := New(&fakeDB{seed: seedLanding()}, cfg, Options{})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodGet, "/sitemap.xml", nil)
+		req.RemoteAddr = remote
+		req.Host = host
+		if unix {
+			req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey,
+				&net.UnixAddr{Name: "@", Net: "unix"}))
+		}
+		if directTLS {
+			req.TLS = &tls.ConnectionState{}
+		}
+		if xfp != "" {
+			req.Header.Set("X-Forwarded-Proto", xfp)
+		}
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec.Body.String()
+	}
+	const evil = `evil.example.org`
+	for _, tc := range []struct {
+		name       string
+		publicHost string
+		remote     string
+		host       string
+		xfp        string
+		unix       bool
+		directTLS  bool
+		want       string
+	}{
+		{
+			// Канон задан: прямой запрос с чужими Host/XFP не влияет
+			// ни на хост, ни на схему (дефолт — http, соединение без TLS).
+			name:       "канон + недоверенный пир с чужими Host/XFP",
+			publicHost: "crawler.example.com", remote: "203.0.113.9:40001", host: evil,
+			xfp:  "https",
+			want: "<loc>http://crawler.example.com/ru</loc>",
+		},
+		{
+			// Канон + доверенный loopback-пир с XFP https: схема https,
+			// Host запроса игнорируется.
+			name:       "канон + loopback-прокси с XFP https",
+			publicHost: "crawler.example.com", remote: "127.0.0.1:40002", host: evil,
+			xfp:  "https",
+			want: "<loc>https://crawler.example.com/ru</loc>",
+		},
+		{
+			// Канон + доверенный пир unix-сокета: тот же результат.
+			name:       "канон + unix-прокси с XFP https",
+			publicHost: "crawler.example.com", remote: "@", host: evil,
+			xfp: "https", unix: true,
+			want: "<loc>https://crawler.example.com/ru</loc>",
+		},
+		{
+			// Канон + список XFP: последняя позиция (наша), начало
+			// списка пришло от клиента.
+			name:       "канон + список XFP (клиент, прокси)",
+			publicHost: "crawler.example.com", remote: "127.0.0.1:40003", host: evil,
+			xfp:  "http, https",
+			want: "<loc>https://crawler.example.com/ru</loc>",
+		},
+		{
+			// Прямое TLS-соединение: https независимо от XFP (web так не
+			// слушает — ветка publicScheme на будущее, T-227).
+			name:       "канон + прямое TLS с XFP http",
+			publicHost: "crawler.example.com", remote: "203.0.113.9:40006", host: evil,
+			xfp: "http", directTLS: true,
+			want: "<loc>https://crawler.example.com/ru</loc>",
+		},
+		{
+			// Канон не задан: фолбэк на Host запроса за доверенным
+			// пиром (публичный вход передаёт Host $host).
+			name:   "фолбэк Host + loopback-прокси с XFP https",
+			remote: "127.0.0.1:40004", host: "crawler.example.com",
+			xfp:  "https",
+			want: "<loc>https://crawler.example.com/ru</loc>",
+		},
+		{
+			// Канон не задан, пир недоверенный: XFP не читается —
+			// дефолтная схема соединения (http).
+			name:   "фолбэк Host + недоверенный пир с XFP https",
+			remote: "203.0.113.9:40005", host: "crawler.example.com",
+			xfp:  "https",
+			want: "<loc>http://crawler.example.com/ru</loc>",
+		},
+	} {
+		got := body(tc.publicHost, tc.remote, tc.host, tc.xfp, tc.unix, tc.directTLS)
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("%s: sitemap без %q:\n%s", tc.name, tc.want, got)
+		}
+		if strings.Contains(got, evil) {
+			t.Errorf("%s: sitemap зависит от Host недоверенной стороны (%s):\n%s", tc.name, evil, got)
+		}
 	}
 }

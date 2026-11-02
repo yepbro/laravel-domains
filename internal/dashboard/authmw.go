@@ -82,6 +82,11 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			Value:    s.newSession(now),
 			Path:     "/",
 			HttpOnly: true,
+			// Secure в TLS-режиме (T-227): при работе за прокси с TLS
+			// браузер не уйдёт с сессией по plaintext при прямом заходе
+			// мимо прокси; в plain-деплое не ставится — cookie с Secure
+			// по http вообще не вернулась бы.
+			Secure:   requestIsHTTPS(r),
 			SameSite: http.SameSiteLaxMode,
 			MaxAge:   int(sessionTTL.Seconds()),
 		})
@@ -237,4 +242,43 @@ func clientIP(r *http.Request) string {
 		}
 	}
 	return host
+}
+
+// requestIsHTTPS — запрос клиента пришёл по TLS (T-227): прямое
+// TLS-соединение (r.TLS — дашборд так не слушает, оговорка на будущее)
+// либо reverse-proxy терминирует TLS и передаёт схему клиента в
+// X-Forwarded-Proto (образец nginx — docs/deploy.md §6; заголовку
+// доверяем только от доверенного пира — тот же паттерн, что clientIP).
+// Определяет флаг Secure cookie-сессии: без него cookie при работе за
+// TLS ушла бы по plaintext при прямом доступе мимо прокси.
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if !trustedPeer(r) {
+		return false
+	}
+	// Список значений: последняя позиция — её дописал наш прокси
+	// (по образцу X-Forwarded-For в internal/web, T-221); образец
+	// nginx ставит одиночное значение $scheme.
+	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	return strings.EqualFold(strings.TrimSpace(proto[strings.LastIndex(proto, ",")+1:]), "https")
+}
+
+// trustedPeer — пир соединения является доверенным reverse-proxy этого
+// хоста: loopback TCP (dashboard.listen за nginx, docs/deploy.md §6)
+// либо unix-сокет. Сегодня дашборд слушает только TCP
+// (dashboard.Run: net.Listen("tcp"), валидация конфига — [host]:port);
+// unix-ветка — паритет с internal/web (T-221), чтобы при появлении
+// unix-слушателя флаг Secure не пропал молча.
+func trustedPeer(r *http.Request) bool {
+	if _, ok := r.Context().Value(http.LocalAddrContextKey).(*net.UnixAddr); ok {
+		return true
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

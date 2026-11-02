@@ -7,6 +7,7 @@ package dashboard
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"log/slog"
 	"net"
@@ -265,6 +266,56 @@ func TestAuthSuccess(t *testing.T) {
 	}
 	if exp, err := strconv.ParseInt(expiry, 10, 64); err != nil || exp != clock.now.Add(sessionTTL).Unix() {
 		t.Errorf("expiry %q: хочу unix-время now+24ч", expiry)
+	}
+}
+
+// TestAuthCookieSecure — флаг Secure cookie-сессии следует факту TLS
+// (T-227): прямое TLS-соединение или reverse-proxy с X-Forwarded-Proto
+// https от loopback-пира (образец nginx — docs/deploy.md §6) — Secure;
+// plain-деплой и подделка заголовка с чужого адреса — без Secure
+// (иначе cookie по http не вернулась бы вовсе).
+func TestAuthCookieSecure(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		remoteAddr string
+		xfp        string
+		unix       bool
+		directTLS  bool
+		want       bool
+	}{
+		{"loopback-прокси + XFP https", "127.0.0.1:4101", "https", false, false, true},
+		{"loopback-прокси + XFP HTTP (регистр)", "127.0.0.1:4102", "HTTPS", false, false, true},
+		{"loopback-прокси + список XFP (клиент, прокси)", "127.0.0.1:4103", "http, https", false, false, true},
+		{"loopback-прокси + XFP http (вход без TLS)", "127.0.0.1:4104", "http", false, false, false},
+		{"loopback без XFP (прямой dev-доступ)", "127.0.0.1:4105", "", false, false, false},
+		{"чужой пир + подделка XFP https", "203.0.113.9:4106", "https", false, false, false},
+		{"прямое TLS-соединение", "203.0.113.9:4107", "", false, true, true},
+		// Unix-пир — доверенный прокси (дашборд слушает только TCP —
+		// ветка паритета с internal/web, T-221/T-227).
+		{"unix-пир + XFP https", "@", "https", true, false, true},
+		{"unix-пир без XFP", "@", "", true, false, false},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = tc.remoteAddr
+		if tc.unix {
+			req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey,
+				&net.UnixAddr{Name: "@", Net: "unix"}))
+		}
+		if tc.xfp != "" {
+			req.Header.Set("X-Forwarded-Proto", tc.xfp)
+		}
+		if tc.directTLS {
+			req.TLS = &tls.ConnectionState{}
+		}
+		req.SetBasicAuth(testUser, testPassword)
+		rec := httptest.NewRecorder()
+		newTestServer(t, nil).Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: статус = %d, хочу 200 (тело: %s)", tc.name, rec.Code, rec.Body.String())
+		}
+		if got := sessionCookie(t, rec).Secure; got != tc.want {
+			t.Errorf("%s: cookie Secure = %v, хочу %v", tc.name, got, tc.want)
+		}
 	}
 }
 

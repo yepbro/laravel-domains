@@ -649,6 +649,12 @@ cp -r rules /etc/crawler/rules                    # правила Laravel дл�
 - `web.listen` — публичный адрес лендинга: дефолт loopback
   `127.0.0.1:8080` (рядом с nginx — §6 ниже), смена на unix-сокет —
   абсолютным путём в значении;
+- `web.public_host` — домен публичного лендинга (например
+  `crawler.example.com`, при нестандартном порте — с портом): им
+  собираются абсолютные URL `sitemap.xml`. Без него за reverse-proxy
+  `<loc>` берётся из `Host`-заголовка посетителя (host-header
+  poisoning) — публикуемый наружу лендинг обязан задавать поле;
+  в примере оно закомментировано (T-227);
 - `dashboard.username` / `dashboard.password_hash` — креды оператора
   дашборда (обязательны для запуска `crawler-dashboard`, ТЗД §7.7).
   Хэш генерируется CLI (пароль — аргументом или stdin; stdin — не
@@ -879,7 +885,12 @@ TCP — `CRAWLER_WEB_LISTEN=/run/crawler-web/web.sock` в `crawler.env`).
 Через прокси наружу идёт только лендинг: метрики и пробы web
 (`127.0.0.1:9107`) не публикуются (ТЗ §9). HTTP→HTTPS, ACME-проверки
 certbot и заголовки безопасности — в образце; правки под конкретный
-домен — по месту деплоя.
+домен — по месту деплоя. Канонический хост лендинга задаётся
+`web.public_host` (T-227, обязательная правка §4.5): sitemap.xml
+собирает абсолютные URL им, а не `Host` запроса (который прокси
+передаёт значением посетителя — без канона `<loc>` зависел бы от
+чужого заголовка; пустое поле — фолбэк на `Host`, для loopback/dev
+без публикации).
 
 Дашборд (`crawler-dashboard.service`) использует ту же схему (ТЗД §9.1):
 слушает loopback `127.0.0.1:8090`, наружу — отдельный server-блок nginx
@@ -888,7 +899,13 @@ certbot и заголовки безопасности — в образце; п
 certbot и заголовок HSTS возьмите из блока лендинга выше. TLS обязателен:
 авторизация — HTTP Basic, креды нельзя передавать открытым текстом вне
 loopback (ТЗД §7.1); `X-Real-IP` нужен per-IP защите от подбора (ТЗД
-§7.6 — сервис доверяет заголовку от loopback-пира). Метрики и пробы
+§7.6 — сервис доверяет заголовку от loopback-пира), `X-Forwarded-Proto` —
+флагу `Secure` cookie-сессии (сервис доверяет заголовку тому же пиру,
+T-227: за входом с TLS браузер не унесёт сессию по plaintext при прямом
+заходе мимо прокси). Флаг ставится в момент выдачи cookie: сессии,
+выданные до включения TLS/XFP, остаются без `Secure` до истечения TTL
+(24 ч) — закрыть их сразу можно сменой `dashboard.password_hash`
+(инвалидирует все сессии). Метрики и пробы
 дашборда (`127.0.0.1:9108`) через прокси не идут:
 
 ```nginx
@@ -902,8 +919,9 @@ server {
     add_header X-Content-Type-Options "nosniff" always;
     location / {
         proxy_pass http://127.0.0.1:8090;
-        proxy_set_header Host      $host;
-        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
