@@ -34,6 +34,15 @@ type fakeClaimRedis struct {
 	pendRes    map[string][]redis.XPendingExt // ответ XPENDING по Start-идентификатору
 	pendErr    error
 	pendOneErr map[string]error // ошибка XPENDING по конкретному Start-идентификатору
+	// pendCtxFail — XPENDING по отменённому ctx отвечает ошибкой ctx
+	// (как живый клиент): тесты классификации после отмены (T-222).
+	pendCtxFail bool
+
+	// dos — зафиксированные вызовы Do (возврат попыток, T-222): сырые
+	// аргументы команды XCLAIM … JUSTID RETRYCOUNT; doErr — заготовленная
+	// ошибка всех вызовов.
+	dos   [][]interface{}
+	doErr error
 }
 
 func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
@@ -59,6 +68,11 @@ func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs
 func (f *fakeClaimRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd {
 	f.pends = append(f.pends, *a)
 	cmd := redis.NewXPendingExtCmd(ctx, "xpending")
+	if f.pendCtxFail && ctx.Err() != nil {
+		cmd.SetVal(nil)
+		cmd.SetErr(ctx.Err())
+		return cmd
+	}
 	if err, ok := f.pendOneErr[a.Start]; ok {
 		cmd.SetVal(nil)
 		cmd.SetErr(err)
@@ -69,11 +83,23 @@ func (f *fakeClaimRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtAr
 	return cmd
 }
 
+// Do — окно возврата попыток (claimRefunder, T-222): записывает сырые
+// аргументы команды (XCLAIM … JUSTID RETRYCOUNT) и отвечает заготовкой
+// (возврату достаточно Err).
+func (f *fakeClaimRedis) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
+	f.dos = append(f.dos, args)
+	cmd := redis.NewCmd(ctx)
+	cmd.SetErr(f.doErr)
+	return cmd
+}
+
 // Компиляционные проверки: расширенный фейк взаимозаменяем с реальным
 // клиентом, Reliab собирается из клиента и Queue.
 var (
-	_ claimStreams = (*fakeClaimRedis)(nil)
-	_ claimStreams = (*redis.Client)(nil)
+	_ claimStreams  = (*fakeClaimRedis)(nil)
+	_ claimStreams  = (*redis.Client)(nil)
+	_ claimRefunder = (*fakeClaimRedis)(nil)
+	_ claimRefunder = (*redis.Client)(nil)
 )
 
 // newTestReliab — связка как в бою: очередь и слой надёжности на одном
@@ -595,6 +621,135 @@ func TestReliabClaimErrors(t *testing.T) {
 	}
 	if len(fake.adds) != 0 || len(fake.acks) != 0 {
 		t.Errorf("неформатная запись не публикуется и не подтверждается: %+v %+v", fake.adds, fake.acks)
+	}
+}
+
+// TestReliabRefund — возврат попыток необработанным записям (T-222):
+// XCLAIM … JUSTID RETRYCOUNT <attempts-1> тому же потребителю, записи
+// с разными счётчиками — отдельными командами (RETRYCOUNT один на
+// команду); клиент без окна Do — прозрачный nil; ошибки команд
+// возвращаются, остальные группы возвращаются всё равно.
+func TestReliabRefund(t *testing.T) {
+	fake := &fakeClaimRedis{}
+	r := newTestReliab(fake, ReliabOptions{})
+	claimed := []Claimed{
+		{Delivery{StreamHTTP, "1-1", []byte(`{"task_id":"t1"}`)}, 2},
+		{Delivery{StreamHTTP, "1-2", []byte(`{"task_id":"t2"}`)}, 2},
+		{Delivery{StreamHTTP, "1-3", []byte(`{"task_id":"t3"}`)}, 3},
+	}
+	if err := r.Refund(context.Background(), "http", "recover-1", claimed); err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	// Две группы по счётчику: {1-1, 1-2} → retrycount 1, {1-3} → 2.
+	// Порядок групп не определён (map) — сопоставление по содержимому.
+	if len(fake.dos) != 2 {
+		t.Fatalf("команд возврата: %d, хочу 2 (группы по счётчику)", len(fake.dos))
+	}
+	byRC := make(map[int64][]interface{})
+	for _, args := range fake.dos {
+		if got := args[0]; got != "xclaim" {
+			t.Errorf("команда возврата: %v, хочу xclaim", got)
+		}
+		if stream, group, consumer := args[1], args[2], args[3]; stream != StreamHTTP || group != "http" || consumer != "recover-1" {
+			t.Errorf("xclaim стрим/группа/потребитель: %v/%v/%v", stream, group, consumer)
+		}
+		if idle := args[4]; idle != int64(0) {
+			t.Errorf("xclaim min-idle: %v, хочу 0 (записи только что закреплены этим потребителем)", idle)
+		}
+		ids := append([]interface{}{}, args[5:len(args)-3]...)
+		rc := args[len(args)-1].(int64)
+		if args[len(args)-3] != "justid" || args[len(args)-2] != "retrycount" {
+			t.Errorf("xclaim без JUSTID RETRYCOUNT: %v", args)
+		}
+		byRC[rc] = ids
+	}
+	if ids := byRC[1]; !reflect.DeepEqual(ids, []interface{}{"1-1", "1-2"}) {
+		t.Errorf("группа retrycount 1: %v, хочу [1-1 1-2] (счётчик 2 до клейма-1)", ids)
+	}
+	if ids := byRC[2]; !reflect.DeepEqual(ids, []interface{}{"1-3"}) {
+		t.Errorf("группа retrycount 2: %v, хочу [1-3] (счётчик 3 до клейма-1)", ids)
+	}
+
+	// Пустой возврат — нет команд; nil-окно (клиент без Do) прозрачно.
+	fake = &fakeClaimRedis{}
+	if err := newTestReliab(fake, ReliabOptions{}).Refund(context.Background(), "g", "c", nil); err != nil {
+		t.Errorf("Refund без записей: %v, хочу nil", err)
+	}
+	if len(fake.dos) != 0 {
+		t.Errorf("команд без записей: %d, хочу 0", len(fake.dos))
+	}
+	claimOnly := struct{ claimStreams }{fake}
+	ro := NewReliab(claimOnly, NewRedisQueue(fake, RedisOptions{}), ReliabOptions{})
+	if err := ro.Refund(context.Background(), "g", "c", claimed); err != nil {
+		t.Errorf("Refund без окна Do: %v, хочу прозрачный nil (поведение до T-222)", err)
+	}
+	if len(fake.dos) != 0 {
+		t.Errorf("команд без окна Do: %d, хочу 0", len(fake.dos))
+	}
+
+	// Ошибка команды — в возврате с контекстом записей; второй группы
+	// не отменяет (здесь она одна).
+	fake = &fakeClaimRedis{doErr: errors.New("ERR no such key")}
+	err := newTestReliab(fake, ReliabOptions{}).Refund(context.Background(), "http", "recover-1", claimed[:1])
+	if err == nil || !contains(err, "возврат попыток") || !contains(err, "1-1") {
+		t.Errorf("ошибка возврата: %v, хочу ошибку с записью 1-1", err)
+	}
+
+	// Кламп нулевого счётчика: Attempts 0 → retrycount 0, не −1
+	// (отрицательный RETRYCOUNT — ошибка сервера).
+	fake = &fakeClaimRedis{}
+	zero := []Claimed{{Delivery{StreamHTTP, "9-9", []byte(`{"task_id":"t9"}`)}, 0}}
+	if err := newTestReliab(fake, ReliabOptions{}).Refund(context.Background(), "http", "recover-1", zero); err != nil {
+		t.Fatalf("Refund нулевого счётчика: %v", err)
+	}
+	if rc := fake.dos[0][len(fake.dos[0])-1]; rc != int64(0) {
+		t.Errorf("retrycount нулевого счётчика: %v, хочу 0", rc)
+	}
+
+	// Неизвестный стрим — ошибка до Redis (стиль Claim).
+	fake = &fakeClaimRedis{}
+	bad := []Claimed{{Delivery{"q:typo", "1-1", []byte(`{"task_id":"t1"}`)}, 2}}
+	if err := newTestReliab(fake, ReliabOptions{}).Refund(context.Background(), "http", "recover-1", bad); err == nil || !contains(err, "неизвестный стрим") {
+		t.Errorf("Refund неизвестного стрима: %v, хочу ошибку", err)
+	}
+	if len(fake.dos) != 0 {
+		t.Errorf("Redis вызван с плохим стримом: %+v", fake.dos)
+	}
+}
+
+// TestReliabClaimClassifiesAfterCancel — отмена ctx после успешного
+// клейма не прерывает классификацию счётчиков (T-222, P2-2 ревью):
+// XAUTOCLAIM уже закрепил записи и списал попытки — записи без
+// прочитанного счётчика RecoverLoop не сможет вернуть (Refund не знает
+// их ID). Классификация идёт под отдельным ctx без отмены вызывающего;
+// отмену уважает сам XAUTOCLAIM (новое изъятие из PEL после останова
+// не начинается — TestRecoverLoopCanceledContext).
+func TestReliabClaimClassifiesAfterCancel(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+			{ID: "1-2", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1-1": {{ID: "1-1", RetryCount: 2}},
+			"1-2": {{ID: "1-2", RetryCount: 2}},
+		},
+		pendCtxFail: true, // XPENDING по отменённому ctx падал бы (живой клиент)
+	}
+	// Клейм «успел» до отмены: фейк XAUTOCLAIM от ctx не зависит —
+	// модель гонки «сервер выполнил команду, отмена пришла следом».
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got, _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamHTTP, "http", "recover-1", time.Minute, 5, "0-0")
+	if err != nil {
+		t.Fatalf("Claim после отмены: %v — классификация обязана переживать отмену", err)
+	}
+	want := []Claimed{
+		{Delivery{StreamHTTP, "1-1", []byte(`{"task_id":"t1"}`)}, 2},
+		{Delivery{StreamHTTP, "1-2", []byte(`{"task_id":"t2"}`)}, 2},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Claim после отмены:\n получил  %+v\n хочу     %+v (счётчики прочитаны, записи возвратимы)", got, want)
 	}
 }
 

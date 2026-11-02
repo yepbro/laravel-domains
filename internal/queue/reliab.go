@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -206,6 +207,18 @@ const (
 	writeProbeTTL = 2 * time.Hour
 )
 
+// claimRefunder — окно go-redis для возврата попыток необработанным
+// записям (T-222): XCLAIM … JUSTID RETRYCOUNT через Do. Отдельный от
+// claimStreams интерфейс по образцу writeProbe: типизированный XClaimArgs
+// go-redis v9.23 не передаёт RETRYCOUNT (XClaim/XClaimJustID сериализуют
+// только стрим/группу/потребителя/простои/ID), а семантика отката
+// счётчика доставок — именно в RETRYCOUNT; *redis.Client (боевые сборки,
+// queue.NewClient) и фейки юнит-тестов удовлетворяют интерфейсу
+// (Reliab.Refund у клиента без Do прозрачен — поведение до T-222).
+type claimRefunder interface {
+	Do(ctx context.Context, args ...interface{}) *redis.Cmd
+}
+
 // ReliabOptions — параметры возврата зависших записей (T-025).
 type ReliabOptions struct {
 	// MaxAttempts — максимум доставок задачи (первая + клеймы) до
@@ -233,10 +246,11 @@ type ReliabOptions struct {
 // работу, пока не исчерпан лимит попыток; исчерпавшие лимит публикуются
 // в q:dead (Dead) и подтверждаются в исходном стриме, покидая pending.
 type Reliab struct {
-	rdb   claimStreams // XAUTOCLAIM + XPENDING
-	q     Queue        // публикация Dead и XACK исходных записей
-	opt   ReliabOptions
-	probe writeProbe // SET-проба записи (T-152); nil — проба недоступна, гейт выключен
+	rdb    claimStreams // XAUTOCLAIM + XPENDING
+	q      Queue        // публикация Dead и XACK исходных записей
+	opt    ReliabOptions
+	probe  writeProbe    // SET-проба записи (T-152); nil — проба недоступна, гейт выключен
+	refund claimRefunder // XCLAIM JUSTID RETRYCOUNT (T-222); nil — возврат недоступен, отмена жжёт попытки как до T-222
 }
 
 // NewReliab строит слой надёжности поверх очереди q и клиента rdb — это
@@ -256,6 +270,9 @@ func NewReliab(rdb claimStreams, q Queue, opt ReliabOptions) *Reliab {
 	r := &Reliab{rdb: rdb, q: q, opt: opt}
 	if p, ok := rdb.(writeProbe); ok {
 		r.probe = p
+	}
+	if rf, ok := rdb.(claimRefunder); ok {
+		r.refund = rf
 	}
 	return r
 }
@@ -302,7 +319,10 @@ type Claimed struct {
 //
 // Счётчик попыток ведёт сам Redis — deliveries-счётчик PEL записи
 // (поле RetryCount ответа XPENDING EXTENDED: инкрементируется на каждую
-// доставку — первое чтение группы и каждый клейм). Тело записи стрима
+// доставку — первое чтение группы и каждый клейм; XAUTOCLAIM инкрементирует
+// всей заклеймленной пачке сразу, в момент клейма, а не в момент начала
+// обработки — необработанный при отмене хвост пачки получает попытку назад
+// отдельной командой, Reliab.Refund, T-222). Тело записи стрима
 // immutable, отдельные ключи-счётчики не заводятся: счётчик живёт в PEL,
 // переживает рестарты воркеров и согласован при многих восстановителях.
 // Счётчик читается XPENDING EXTENDED по каждой вернувшейся записи
@@ -326,6 +346,9 @@ type Claimed struct {
 // Счётчик читается XPENDING EXTENDED по каждой вернувшейся записи
 // (диапазон id..id: XAUTOCLAIM его не возвращает); чтение без побочных
 // эффектов, поэтому безопасно при гонках с другими восстановителями.
+// Отмена ctx после успешного клейма чтения счётчиков не прерывает
+// (WithoutCancel + собственный бюджет, T-222): записи без счётчика
+// невозвратны для Refund.
 //
 // Пустой результат без ошибки — зависших записей нет.
 func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, n int, start string) ([]Claimed, string, error) {
@@ -361,6 +384,18 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 	if next == "" {
 		next = "0-0" // обход PEL завершён — следующий с начала
 	}
+	// Классификация счётчиков переживает отмену ctx вызывающего (T-222,
+	// P2-2 ревью): XAUTOCLAIM выше уже закрепил записи и списал каждой
+	// попытку — прерывать чтение счётчиков по отмене бессмысленно, а
+	// записи без счётчика RecoverLoop уже не вернёт (Refund не знает их
+	// ID): окно потери до пачки попыток за одну остановку. Поэтому после
+	// успешного клейма чтения идут под отдельным ctx — без отмены
+	// вызывающего (WithoutCancel), с собственным коротким бюджетом;
+	// сам XAUTOCLAIM отмену уважает: не начинать новое изъятие из PEL
+	// после останова.
+	cctx, cancelClassification := context.WithTimeout(context.WithoutCancel(ctx), classifyTimeout)
+	defer cancelClassification()
+	ctx = cctx
 	out := make([]Claimed, 0, len(msgs))
 	var errs []error
 	for _, m := range msgs {
@@ -407,6 +442,104 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 		return nil, next, nil
 	}
 	return out, next, errors.Join(errs...)
+}
+
+// Параметры возврата попыток необработанным записям (T-222).
+const (
+	// classifyTimeout — бюджет классификации пачки после клейма
+	// (XPENDING по каждой записи, bury исчерпавших): чтения переживают
+	// отмену ctx вызывающего (см. Claim), но не висят дольше бюджета
+	// graceful shutdown; до Batch коротких чтений с запасом.
+	classifyTimeout = 5 * time.Second
+)
+
+// refundKey — группа записей одного возврата попыток (Refund): RETRYCOUNT
+// задаётся одним числом на команду XCLAIM, записи с разными счётчиками
+// (и стримами) возвращаются отдельными командами.
+type refundKey struct {
+	stream   string
+	attempts int
+}
+
+// Refund возвращает попытку доставки записям, заклеймленным XAUTOCLAIM,
+// но не обработанным (T-222). Семантика счётчика (см. Claim): XAUTOCLAIM
+// инкрементирует deliveries-счётчик PEL всей пачке в момент клейма — не
+// в момент начала обработки, — поэтому отмена RecoverLoop посреди пачки
+// (graceful shutdown: бюджет остановки 10 с меньше времени обхода пачки;
+// рендер — до 25 с на запись) оставляла хвост пачки с сожжённой попыткой
+// без единого вызова обработчика: минус попытка на каждом рестарте,
+// после redis.max_attempts — q:dead без обработки. Гейт записи (T-152)
+// закрывает соседний сценарий (недоступный Redis), отмену контекста он
+// не видит. Вызывается из RecoverLoop для необработанного хвоста пачки
+// под отдельным коротким контекстом — контекст цикла к этому моменту
+// уже отменён.
+//
+// Механизм — XCLAIM <stream> <group> <consumer> 0 <ids…> JUSTID
+// RETRYCOUNT <attempts-1> на того же потребителя, за которым записи
+// закреплены клеймом:
+//
+//   - RETRYCOUNT устанавливает счётчик доставок точным значением
+//     (семантика Redis, t_stream.c xclaimGenericCommand: RETRYCOUNT
+//     перекрывает обычный инкремент клейма; JUSTID без RETRYCOUNT его
+//     не трогает) — attempts-1 возвращает счётчик к значению до клейма:
+//     следующая доставка увидит тот же номер попытки, что и отменённый
+//     проход;
+//   - JUSTID — без тел записей в ответе: тела не нужны, счётчик
+//     возвращает явный RETRYCOUNT;
+//   - min-idle 0 — записи закреплены за этим потребителем только что,
+//     FORCE не нужен: записи в PEL группы. Переклейм RecoverLoop
+//     соседнего воркера невозможен, пока обход пачки укладывается
+//     в claim_min_idle (инвариант T-153) — RecoverLoop сверяет время
+//     от клейма и вне инварианта возврат пропускает: возврат после
+//     чужого клейма погасил бы и его инкремент счётчика;
+//
+// Побочный эффект: XCLAIM обновляет время доставки — простой
+// возвращённых записей начинается заново, следующий клейм не раньше чем
+// через claim_min_idle. Плата за честный счётчик — задержка возврата,
+// не корректность (at-least-once, ТЗ 3.4).
+//
+// Записи группируются по (стрим, счётчику); ошибки команд собираются в
+// возврат (errors.Join), сбой одной группы не отменяет остальные —
+// вернуть хотя бы часть лучше, чем ничего (не возвращённая попытка —
+// дожигание до q:dead, которого фикс избегает). Клиент без окна Do
+// (nil) — прозрачный nil: попытки остаются расходованы, как до T-222.
+func (r *Reliab) Refund(ctx context.Context, group, consumer string, claimed []Claimed) error {
+	if r.refund == nil || len(claimed) == 0 {
+		return nil
+	}
+	if group == "" || consumer == "" {
+		return fmt.Errorf("queue: возврат попыток: не заданы группа (%q) или потребитель (%q)", group, consumer)
+	}
+	// Стрим — боевые константы пакета, как у Claim: XCLAIM по произвольному
+	// имени не отправляем.
+	for _, c := range claimed {
+		if !knownStream(c.Stream) {
+			return fmt.Errorf("queue: возврат попыток: неизвестный стрим %q", c.Stream)
+		}
+	}
+	ids := make(map[refundKey][]string, len(claimed))
+	for _, c := range claimed {
+		n := c.Attempts - 1
+		if n < 0 {
+			n = 0 // защитный предел: счётчик доставок не бывает отрицательным
+		}
+		k := refundKey{stream: c.Stream, attempts: n}
+		ids[k] = append(ids[k], c.ID)
+	}
+	var errs []error
+	for k, list := range ids {
+		args := make([]interface{}, 0, 8+len(list))
+		args = append(args, "xclaim", k.stream, group, consumer, int64(0))
+		for _, id := range list {
+			args = append(args, id)
+		}
+		args = append(args, "justid", "retrycount", int64(k.attempts))
+		if err := r.refund.Do(ctx, args...).Err(); err != nil {
+			errs = append(errs, fmt.Errorf("queue: возврат попыток записям %s стрима %s (группа %s): %w",
+				strings.Join(list, ","), k.stream, group, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Process — паттерн Processing поверх очереди слоя: клеймнутая Claim

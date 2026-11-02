@@ -367,6 +367,177 @@ func TestRecoverLoopCanceledMidBatch(t *testing.T) {
 	}
 }
 
+// TestRecoverLoopCancelRefundsUnprocessed — отмена ctx посреди пачки
+// (T-222, критерий задачи): XAUTOCLAIM инкрементирует счётчик доставок
+// всей пачке в момент клейма, а не начала обработки; записи, до которых
+// обход не дошёл, получают попытку назад — XCLAIM JUSTID RETRYCOUNT
+// <attempts-1> (до T-222 хвост пачки терял по попытке на каждом
+// рестарте — бюджет graceful shutdown меньше времени обхода пачки —
+// и после max_attempts уходил в q:dead без единой обработки).
+func TestRecoverLoopCancelRefundsUnprocessed(t *testing.T) {
+	// Пачка из 4 записей, счётчик каждой после клейма — 2 (доставка +
+	// клейм): до клейма было 1, возврат — RETRYCOUNT 1.
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+			{ID: "1-2", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+			{ID: "1-3", Values: map[string]any{fieldData: `{"task_id":"t3"}`}},
+			{ID: "1-4", Values: map[string]any{fieldData: `{"task_id":"t4"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1-1": {{ID: "1-1", RetryCount: 2}},
+			"1-2": {{ID: "1-2", RetryCount: 2}},
+			"1-3": {{ID: "1-3", RetryCount: 2}},
+			"1-4": {{ID: "1-4", RetryCount: 2}},
+		},
+	}
+
+	// Обработчик дорабатывает две записи, вторая отменяет ctx («SIGTERM
+	// между записями пачки»): третья и четвёртая не начинаются.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	handled := make([]string, 0, 4)
+	done := make(chan error, 1)
+	r := newTestReliab(fake, ReliabOptions{MinIdle: time.Minute})
+	go func() {
+		done <- RecoverLoop(ctx, r, func(_ context.Context, d Delivery) error {
+			mu.Lock()
+			handled = append(handled, d.ID)
+			n := len(handled)
+			mu.Unlock()
+			if n == 2 {
+				cancel()
+			}
+			return nil
+		}, RecoverOptions{
+			Stream: StreamHTTP, Group: "http", Consumer: "recover-1",
+			Batch: 4, Interval: time.Hour,
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RecoverLoop после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RecoverLoop не остановился по отмене ctx")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"1-1", "1-2"}; !reflect.DeepEqual(handled, want) {
+		t.Fatalf("обработаны %v, хочу %v (после отмены пачка не продолжается)", handled, want)
+	}
+	// Критерий T-222: попытки необработанных (4 − 2) записей не растут —
+	// одна команда возврата хвоста пачки со счётчиком до клейма.
+	if len(fake.dos) != 1 {
+		t.Fatalf("команд возврата: %d, хочу 1 (хвост 1-3, 1-4 одной группой)", len(fake.dos))
+	}
+	want := []interface{}{"xclaim", StreamHTTP, "http", "recover-1", int64(0), "1-3", "1-4", "justid", "retrycount", int64(1)}
+	if got := fake.dos[0]; !reflect.DeepEqual(got, want) {
+		t.Errorf("возврат:\n получил  %v\n хочу     %v", got, want)
+	}
+	// Доработанные до отмены записи: первая подтверждена до отмены.
+	// Подтверждение второй идёт по уже отменённому ctx и не отправляется
+	// (живой клиент — как и фейк, P3-4 ревью): запись остаётся в PEL
+	// без подтверждения — повторная доставка идемпотентна (ТЗ 3.4).
+	if !sameAcks(fake.acks, []ackCall{
+		{StreamHTTP, "http", []string{"1-1"}},
+	}) {
+		t.Errorf("XACK до отмены: %+v", fake.acks)
+	}
+}
+
+// TestRecoverLoopCancelOutOfInvariantSkipsRefund — обход пачки дольше
+// claim_min_idle (инвариант T-153 нарушен — пачка тарпитов рендера):
+// хвост мог быть переклеймлен RecoverLoop соседнего воркера, и возврат
+// погасил бы чужой инкремент счётчика — возврат пропускается, Warn,
+// поведение до T-222 (P2-1 ревью). Минимальный MinIdle делает «обгон»
+// детерминированным: время обхода всегда больше него.
+func TestRecoverLoopCancelOutOfInvariantSkipsRefund(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+			{ID: "1-2", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1-1": {{ID: "1-1", RetryCount: 2}},
+			"1-2": {{ID: "1-2", RetryCount: 2}},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var buf bytes.Buffer
+	done := make(chan error, 1)
+	// MinIdle наносекунда: Claim вызван с minIdle 0 → эффективна опция,
+	// а time.Since(claimAt) к отмене всегда больше наносекунды.
+	r := newTestReliab(fake, ReliabOptions{MinIdle: time.Nanosecond})
+	go func() {
+		done <- RecoverLoop(ctx, r, func(_ context.Context, d Delivery) error {
+			cancel() // отмена на первой записи: хвост — вся вторая запись
+			return nil
+		}, recoverLogOpts(&buf, time.Hour))
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RecoverLoop после отмены вне инварианта: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RecoverLoop не остановился по отмене ctx")
+	}
+	if len(fake.dos) != 0 {
+		t.Errorf("возврат вне инварианта: %+v, хочу 0 команд (чужой клейм не гасим)", fake.dos)
+	}
+	if !strings.Contains(buf.String(), "возврат попыток пропущен") {
+		t.Errorf("пропуск возврата вне инварианта не записан: %q", buf.String())
+	}
+}
+
+// TestRecoverLoopCancelRefundFails — сбой возврата попыток (Redis
+// недоступен на остановке) не роняет цикл: Warn с контекстом, выход
+// чистый; попытки хвоста остаются расходованы — best effort, не хуже
+// поведения до T-222.
+func TestRecoverLoopCancelRefundFails(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+			{ID: "1-2", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1-1": {{ID: "1-1", RetryCount: 2}},
+			"1-2": {{ID: "1-2", RetryCount: 2}},
+		},
+		doErr: errors.New("ERR connection refused"),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var buf bytes.Buffer
+	done := make(chan error, 1)
+	r := newTestReliab(fake, ReliabOptions{MinIdle: time.Minute})
+	go func() {
+		done <- RecoverLoop(ctx, r, func(_ context.Context, d Delivery) error {
+			cancel() // отмена на первой записи: хвост — вся вторая запись
+			return nil
+		}, recoverLogOpts(&buf, time.Hour))
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RecoverLoop после отмены со сбойным возвратом: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RecoverLoop не остановился по отмене ctx")
+	}
+	if !strings.Contains(buf.String(), "не возвращены") {
+		t.Errorf("сбой возврата попыток не записан: %q", buf.String())
+	}
+	if len(fake.dos) != 1 {
+		t.Errorf("попыток возврата: %d, хочу 1 (best effort — одна команда)", len(fake.dos))
+	}
+}
+
 // TestRecoverLoopValidation — nil слоя и обработчика: ошибка до старта
 // (сборка сервиса падает внятно, Redis не трогается).
 func TestRecoverLoopValidation(t *testing.T) {

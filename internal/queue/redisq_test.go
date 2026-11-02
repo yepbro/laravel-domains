@@ -87,6 +87,11 @@ func (f *fakeRedis) XReadGroup(ctx context.Context, a *redis.XReadGroupArgs) *re
 }
 
 func (f *fakeRedis) XAck(ctx context.Context, stream, group string, ids ...string) *redis.IntCmd {
+	if err := ctx.Err(); err != nil {
+		// Живой клиент не отправляет команду по отменённому ctx (T-222,
+		// P3-4 ревью) — фейк тоже не записывает её в протокол.
+		return redis.NewIntResult(0, err)
+	}
 	f.acks = append(f.acks, ackCall{stream, group, ids})
 	return redis.NewIntResult(f.ackCount, f.ackErr)
 }

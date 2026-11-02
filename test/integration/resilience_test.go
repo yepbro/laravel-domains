@@ -1419,3 +1419,103 @@ func TestResilience_OOMDoesNotBurnAttempts(t *testing.T) {
 		t.Errorf("записей в q:dead: %d, хочу 0 (T-152: OOM не сжигает попытки)", n)
 	}
 }
+
+// TestResilience_CancelMidBatchDoesNotBurnAttempts — отмена RecoverLoop
+// посреди заклеймленной пачки не сжигает попытки необработанным записям
+// (T-222): XAUTOCLAIM инкрементирует deliveries-счётчик PEL (XPENDING
+// RetryCount) всей пачке в момент клейма, поэтому записи, до которых
+// обход не дошёл, получают попытку назад — XCLAIM … JUSTID RETRYCOUNT
+// <attempts-1> (семантика проверяется на живом Redis: RETRYCOUNT
+// устанавливает счётчик точным значением; JUSTID без RETRYCOUNT счётчик
+// не трогает — отдельный проход ниже). Начатая обработкой запись попытку
+// расходует: счётчик «доставка + клейм» у неё остаётся. Сценарий —
+// graceful shutdown (бюджет остановки меньше времени обхода пачки
+// рендера): до T-222 хвост пачки терял по попытке на каждом рестарте,
+// после max_attempts задачи уходили в q:dead без единой обработки.
+func TestResilience_CancelMidBatchDoesNotBurnAttempts(t *testing.T) {
+	skipUnlessIntegration(t)
+	rdb := resilienceRedisEnv(t)
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
+	// MinIdle 500 мс: Mature для клейма через полсекунды и запас для
+	// guard возврата (обход пачки короче claim_min_idle — инвариант
+	// T-153; при 30 мс тест флакал бы на нагруженном раннере).
+	reliab := queue.NewReliab(rdb, q, queue.ReliabOptions{MinIdle: 500 * time.Millisecond})
+	ctx := context.Background()
+	const group = "resil-refund"
+	const total = 4
+
+	// Пачка q:render прочитана и не подтверждена: RetryCount = 1
+	// (первая доставка) — модель зависшей пачки, которую разбирает
+	// RecoverLoop.
+	for i := 0; i < total; i++ {
+		if _, err := q.Publish(ctx, queue.StreamRender, queue.Result{
+			TaskID:   fmt.Sprintf("t-refund-%02d", i+1),
+			ZoneID:   12,
+			DomainID: int64(500 + i),
+		}); err != nil {
+			t.Fatalf("публикация %d: %v", i, err)
+		}
+	}
+	batch := consumeTasks(t, q, queue.StreamRender, group, "w1", total)
+	if len(batch) != total {
+		t.Fatalf("потреблено задач: %d, хочу %d", len(batch), total)
+	}
+	waitPendingIdle(t, rdb, queue.StreamRender, group, total, 500*time.Millisecond)
+
+	// Цикл возврата: первая запись входит в обработку и «зависает на
+	// бюджете остановки» — отмена ctx посреди пачки.
+	loopCtx, cancelLoop := context.WithCancel(ctx)
+	defer cancelLoop()
+	// Буфер: сигнал старта не теряется, если обработчик обогнал приём
+	// (P3-1 ревью) — иначе тест висел бы до таймаута пакета.
+	started := make(chan struct{}, 1)
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		_ = queue.RecoverLoop(loopCtx, reliab, func(c context.Context, d queue.Delivery) error {
+			started <- struct{}{}
+			<-c.Done() // «бюджет graceful shutdown кончился посреди записи»
+			return c.Err()
+		}, queue.RecoverOptions{
+			Stream: queue.StreamRender, Group: group, Consumer: "recover",
+			Batch: total, Interval: 100 * time.Millisecond,
+		})
+	}()
+
+	<-started    // первая запись в работе
+	cancelLoop() // graceful shutdown
+	<-loopDone
+
+	// Необработанный хвост (3 записи) получил попытку назад: счётчик
+	// как до клейма (1). Начатая запись — «доставка + клейм» (2):
+	// попытка расходуется доставкой, начавшей обработку.
+	assertRefundCounts := func() {
+		t.Helper()
+		pending := pendingExt(t, rdb, queue.StreamRender, group)
+		if len(pending) != total {
+			t.Fatalf("записей в PEL: %d, хочу %d", len(pending), total)
+		}
+		for _, p := range pending {
+			want := int64(1)
+			if p.ID == batch[0].ID {
+				want = 2
+			}
+			if p.RetryCount != want {
+				t.Errorf("запись %s: доставок %d, хочу %d (отмена посреди пачки не сжигает попытки необработанным, T-222)",
+					p.ID, p.RetryCount, want)
+			}
+		}
+	}
+	assertRefundCounts()
+
+	// Семантика JUSTID без RETRYCOUNT на живом Redis (дока redis.md
+	// §4.2): клейм идентификаторов сам по себе счётчик не инкрементирует.
+	if err := rdb.Do(ctx, "xclaim", queue.StreamRender, group, "recover", 0, batch[0].ID, "justid").Err(); err != nil {
+		t.Fatalf("xclaim justid: %v", err)
+	}
+	assertRefundCounts()
+
+	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
+		t.Errorf("записей в q:dead: %d, хочу 0", n)
+	}
+}

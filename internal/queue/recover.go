@@ -60,6 +60,14 @@ const DefaultRecoverInterval = 30 * time.Second
 // в docs/configuration.md, раздел redis.
 const DefaultRecoverBatch = 64
 
+// refundTimeout — бюджет возврата попыток необработанному хвосту пачки
+// при отмене ctx (T-222): отдельный контекст по образцу discardTimeout
+// (ingest, pipeline.discard) — возврат обязан переживать отмену
+// контекста цикла (уже отменён), но не висеть дольше бюджета graceful
+// shutdown (10 с, service.DefaultShutdownTimeout): одна-две команды
+// Redis на пачку укладываются с большим запасом.
+const refundTimeout = 5 * time.Second
+
 // RecoverOptions — параметры цикла RecoverLoop; нулевые значения
 // заменяются дефолтами (withDefaults, стиль ReliabOptions).
 type RecoverOptions struct {
@@ -100,7 +108,9 @@ func (o RecoverOptions) withDefaults() RecoverOptions {
 // T-012; не подтверждённая обработкой запись вернётся следующим клеймом,
 // счётчик попыток ускорит перевод в q:dead). Работает до отмены ctx и
 // возвращает nil — graceful shutdown (ТЗ 3.4): начатая обработка
-// дорабатывает или остаётся неподтверждённой.
+// дорабатывает или остаётся неподтверждённой, а необработанный хвост
+// пачки получает попытку назад (Refund, T-222) — отмена не сжигает
+// доставку записи, до которой обход не дошёл.
 func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, Delivery) error, opt RecoverOptions) error {
 	if process == nil {
 		return errors.New("queue: цикл возврата зависших: обработчик не задан")
@@ -151,18 +161,53 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 	// между проходами: большой PEL перечитывается страницами, а не с
 	// начала на каждом тике (Q-07).
 	cursor := "0-0"
+	// refund — возврат попыток необработанному хвосту пачки при отмене
+	// (T-222): XAUTOCLAIM инкрементирует счётчик доставок всей пачке в
+	// момент клейма, а отмена посреди обхода (graceful shutdown: бюджет
+	// остановки меньше времени обработки пачки) оставляла записи, до
+	// которых обход не дошёл, с сожжённой попыткой без единого вызова
+	// обработчика — по попытке за рестарт, до q:dead без обработки.
+	// Возврат — XCLAIM JUSTID RETRYCOUNT (Reliab.Refund) под отдельным
+	// коротким ctx: контекст цикла уже отменён. Запись, начатая
+	// обработкой (ProcessAttempt успел вернуться), попытку расходует —
+	// доставка состоялась; попытку возвращает только запись, чья
+	// обработка не начиналась.
+	refund := func(rest []Claimed) {
+		rctx, cancel := context.WithTimeout(context.Background(), refundTimeout)
+		defer cancel()
+		if err := r.Refund(rctx, o.Group, o.Consumer, rest); err != nil {
+			log.Warn("возврат зависших доставок: попытки необработанного хвоста не возвращены — записи уязвимы к дожиганию до q:dead (T-222)",
+				"n", len(rest), "err", err)
+		} else {
+			log.Info("возврат зависших доставок: попытки необработанного хвоста возвращены", "n", len(rest))
+		}
+	}
 	claim := func() int {
 		// Эквивалентный мутант (T-M04): minIdle 0 → −1 неотличим — Claim
 		// заменяет любое неположительное значение опцией слоя. Единицу
 		// (numbers/incrementer) отличим тестом по MinIdle XAUTOCLAIM.
 		// mutator-disable-next-line numbers/decrementer
+		claimAt := time.Now() // начало простоя записей пачки (idle сброшен клеймом)
 		claimed, next, err := r.Claim(ctx, o.Stream, o.Group, o.Consumer, 0, o.Batch, cursor)
 		if err != nil && ctx.Err() == nil {
 			log.Warn("возврат зависших доставок: клейм", "err", err)
 		}
 		cursor = next
-		for _, c := range claimed {
+		for i, c := range claimed {
 			if ctx.Err() != nil {
+				// Инвариант T-153: batch × худшее время записи <
+				// claim_min_idle (Claim вызван с minIdle 0 — эффективен
+				// r.opt.MinIdle). Пока он держится, хвост пачки не мог
+				// быть переклеймлен RecoverLoop соседнего воркера, и
+				// возврат гасит ровно свой инкремент; вне инварианта
+				// возврат погасил бы и чужой клейм (занижение счётчика,
+				// P2-1 ревью) — пропустить, как до T-222.
+				if elapsed := time.Since(claimAt); elapsed < r.opt.MinIdle {
+					refund(claimed[i:]) // T-222: хвост не начинался — попытка назад
+				} else {
+					log.Warn("возврат зависших доставок: обход пачки дольше claim_min_idle — хвост мог быть переклеймлен соседним воркером, возврат попыток пропущен (T-222)",
+						"n", len(claimed)-i, "elapsed", elapsed.String(), "min_idle", r.opt.MinIdle.String())
+				}
 				return len(claimed)
 			}
 			if err := r.ProcessAttempt(ctx, o.Group, c.Delivery, c.Attempts, process); err != nil && ctx.Err() == nil {
@@ -176,6 +221,13 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 	ticker := time.NewTicker(o.Interval)
 	defer ticker.Stop()
 	for {
+		// Отмена между проходами (в т.ч. сразу после возврата хвоста
+		// полной пачки выше) — чистый выход без пробы записи: SET по
+		// отменённому ctx падал бы и логировал бы «Redis не доступен
+		// на запись» на каждом останове посреди полной пачки.
+		if ctx.Err() != nil {
+			return nil
+		}
 		// Гейт записи (T-152): пока Redis отвергает записи, клейм
 		// пропускается — попытки доставок не расходуются. Проба —
 		// один SET (Reliab.Writable); при неподдерживаемой пробе
