@@ -639,37 +639,75 @@ func (o Orphans) Any() bool {
 
 // PostChecks — пост-проверки §7.5: 2LD-зон вне allowlist не осталось
 // (zonesLeft = 0) и сиротских zone_id нет.
+//
+// Каждый агрегат читается своим хелпером: однострочный set закрывается
+// ДО следующего запроса пула (стиль zoneLeft и status.FetchLaravelStats)
+// — открытый set держит соединение до Close, а соединение переноса уже
+// занято Run на весь проход (temp-таблица §7.3): при pool_size CLI = 2
+// второй запрос пост-проверок ждал бы соединение вечно (дедлок T-217).
 func PostChecks(ctx context.Context, pool db.DB, allowlist []string) (zonesLeft int64, orphans Orphans, err error) {
+	zonesLeft, err = zonesLeftCount(ctx, pool, allowlist)
+	if err != nil {
+		return 0, Orphans{}, err
+	}
+	orphans, err = orphansCounts(ctx, pool)
+	if err != nil {
+		return 0, Orphans{}, err
+	}
+	return zonesLeft, orphans, nil
+}
+
+// zonesLeftCount — пост-проверка §7.5: 2LD-зоны вне allowlist. Чтение в
+// хелпере: rows закрываются (defer) до возврата — следующий запрос пула
+// не конкурирует за соединение с открытым set'ом (T-217).
+func zonesLeftCount(ctx context.Context, pool db.DB, allowlist []string) (int64, error) {
 	zrows, err := pool.Query(ctx, CheckZonesLeftSQL, allowlistArg(allowlist))
 	if err != nil {
-		return 0, Orphans{}, fmt.Errorf("collapse: пост-проверка 2LD-зон: %w", err)
+		return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: %w", err)
 	}
 	defer zrows.Close()
 	if !zrows.Next() {
-		return 0, Orphans{}, fmt.Errorf("collapse: пост-проверка 2LD-зон: пустой ответ агрегата")
+		// Сначала сбой чтения: обрыв соединения — не «пусто» (стиль
+		// monitor.readDailyValue, ревью T-217 P3-4).
+		if err := zrows.Err(); err != nil {
+			return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: %w", err)
+		}
+		return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: пустой ответ агрегата")
 	}
+	var zonesLeft int64
 	if err := zrows.Scan(&zonesLeft); err != nil {
-		return 0, Orphans{}, fmt.Errorf("collapse: пост-проверка 2LD-зон: чтение: %w", err)
+		return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: чтение: %w", err)
 	}
 	if err := zrows.Err(); err != nil {
-		return 0, Orphans{}, fmt.Errorf("collapse: пост-проверка 2LD-зон: %w", err)
+		return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: %w", err)
 	}
+	return zonesLeft, nil
+}
 
+// orphansCounts — пост-проверка §7.5: сиротские zone_id в таблицах с
+// зоной. Пара zonesLeftCount: set закрывается до возврата (T-217).
+func orphansCounts(ctx context.Context, pool db.DB) (Orphans, error) {
 	orows, err := pool.Query(ctx, CheckOrphansSQL)
 	if err != nil {
-		return 0, Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: %w", err)
+		return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: %w", err)
 	}
 	defer orows.Close()
 	if !orows.Next() {
-		return 0, Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: пустой ответ агрегата")
+		// Сначала сбой чтения — не «пусто» (пара zonesLeftCount,
+		// ревью T-217 P3-4).
+		if err := orows.Err(); err != nil {
+			return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: %w", err)
+		}
+		return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: пустой ответ агрегата")
 	}
+	var orphans Orphans
 	if err := orows.Scan(&orphans.Domains, &orphans.Results, &orphans.Laravel, &orphans.Findings, &orphans.History); err != nil {
-		return 0, Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: чтение: %w", err)
+		return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: чтение: %w", err)
 	}
 	if err := orows.Err(); err != nil {
-		return 0, Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: %w", err)
+		return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: %w", err)
 	}
-	return zonesLeft, orphans, nil
+	return orphans, nil
 }
 
 // SpotCheck — спот-чек §7.5: domain_info(name) отвечает зону wantZone и

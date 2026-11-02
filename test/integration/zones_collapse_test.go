@@ -16,11 +16,13 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/collapse"
+	"crawler/internal/migrate"
 )
 
 // collapseSeedZone — зона справочника; возвращает id.
@@ -608,4 +610,74 @@ func (c *collapseFlakyConn) Begin(ctx context.Context) (pgx.Tx, error) {
 		return nil, fmt.Errorf("имитация сбоя: соединение потеряно после %d батчей", c.allowBegin)
 	}
 	return c.Conn.Begin(ctx)
+}
+
+// TestZonesCollapse_SmallPoolDeadlock — регрессия дедлока пост-проверок
+// §7.5 (T-217, P2-находка окна T-198, инцидент 29.10): crawlerctl zones
+// collapse открывает пул из ДВУХ соединений (бюджет ТЗ 6.3), соединение
+// переноса удерживается до конца Run (temp-таблица moving_ids, §7.3), а
+// пост-проверки читали первый агрегат (CheckZonesLeftSQL) set'ом,
+// закрывавшимся только в defer PostChecks, — второй запрос
+// (CheckOrphansSQL) ждал третье соединение вечно: сервер выполнил
+// CheckZonesLeftSQL (сессия idle in ClientRead, результат не потреблён
+// клиентом), transfer-соединение висело за DELETE FROM zones, процесс
+// стоял в ожидании пула (futex). Тест повторяет контур CLI (MaxConns = 2)
+// и превращает вечное ожидание в FAIL по дедлайну: Run обязан завершиться
+// сам за отведённое время (после фикса — секунды), зависание — падение.
+func TestZonesCollapse_SmallPoolDeadlock(t *testing.T) {
+	skipUnlessIntegration(t)
+	dsn, cleanup := withTestSchema(t)
+	t.Cleanup(cleanup)
+	if err := migrate.Up(context.Background(), dsn); err != nil {
+		t.Fatalf("миграции: %v", err)
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("разбор DSN: %v", err)
+	}
+	cfg.MaxConns = 2 // контур CLI: crawlerctl zones collapse (PoolSize = 2)
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("пул: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	twoLD := collapseSeedZone(t, pool, "5g.in")
+	ids := collapseSeedDomains(t, pool, twoLD, "site", 2, 0)
+	collapseSeedChildren(t, pool, twoLD, ids)
+
+	// Run в горутине: зависший прогон детектируется дедлайном, а не
+	// таймаутом go test; cancel развязывает ожидание Acquire (отмена ctx
+	// прерывает его) и возвращает соединения к pool.Close очистки.
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	var out strings.Builder
+	go func() {
+		done <- collapse.Run(runCtx, pool, collapse.Options{Apply: true}, &out)
+	}()
+
+	const deadline = 30 * time.Second
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("collapse.Run (пул 2): %v", err)
+		}
+		if !strings.Contains(out.String(), "перенос завершён: 2LD-зон 1") {
+			t.Errorf("отчёт apply неполон:\n%s", out.String())
+		}
+	case <-time.After(deadline):
+		// Развязать прогон (Acquire чувствует отмену ctx) и ДОЖДАТЬСЯ
+		// возврата соединений до pool.Close очистки: defer Run делает
+		// movingDropSQL на удерживаемом соединении без дедлайна — если
+		// подвисание когда-нибудь окажется не в Acquire, ждём не вечно,
+		// а grace, и падаем честным FAIL (ревью T-217 P3-2).
+		cancel()
+		const grace = 10 * time.Second
+		select {
+		case <-done:
+		case <-time.After(grace):
+		}
+		t.Fatalf("collapse.Run не завершился за %v (+%v на развязку отменой) — подвисание прохода, подозрение: дедлок пост-проверок §7.5 на пуле из 2 соединений (T-217)", deadline, grace)
+	}
 }

@@ -130,15 +130,23 @@ func TestSpecOf(t *testing.T) {
 // --- фейковое соединение ----------------------------------------------------------
 
 // fakeRows — pgx.Rows с заготовленными строками (позиционный Scan,
-// стиль statusRows в тестах cmd/crawlerctl).
+// стиль statusRows в тестах cmd/crawlerctl). onClose — наблюдение
+// закрытия set'а пулом фейка (контракт T-217: set пост-проверки
+// закрывается до следующего запроса).
 type fakeRows struct {
-	rows [][]any
-	i    int
+	rows    [][]any
+	i       int
+	onClose func()
 }
 
 func fakeRowsOf(rows ...[]any) *fakeRows { return &fakeRows{rows: rows} }
 
-func (r *fakeRows) Close()                                       {}
+func (r *fakeRows) Close() {
+	if r.onClose != nil {
+		r.onClose()
+		r.onClose = nil
+	}
+}
 func (r *fakeRows) Err() error                                   { return nil }
 func (r *fakeRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (r *fakeRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
@@ -238,6 +246,9 @@ type fakeConn struct {
 	execs   []call
 	queries []call
 	begins  int
+	// openSets — выданные Query и не закрытые set'ы: модель занятости
+	// соединений пула (T-217) — guard CheckOrphansSQL.
+	openSets int
 
 	errE, queryErr error
 	batchErrFrom   int64
@@ -432,6 +443,22 @@ func (f *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 	if f.queryErr != nil {
 		return nil, f.queryErr
 	}
+	rows, err := f.query(sql, args)
+	if err != nil {
+		return nil, err
+	}
+	// Выдача set'а: не закрытый set держит соединение пула (T-217).
+	f.openSets++
+	rows.onClose = func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.openSets--
+	}
+	return rows, nil
+}
+
+// query — семантика SQL переноса; mu фейка уже удерживается.
+func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 	switch sql {
 	case InventorySQL:
 		allow := map[string]bool{}
@@ -576,6 +603,12 @@ func (f *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		}
 		return fakeRowsOf(rows...), nil
 	case CheckZonesLeftSQL:
+		// Симметричный guard (ревью T-217 P3-1): первый запрос
+		// пост-проверок тоже обязан приходить без открытых set'ов —
+		// перестановка хелперов местами на реальном пуле тот же дедлок.
+		if f.openSets > 0 {
+			return nil, fmt.Errorf("fakeConn: CheckZonesLeftSQL при открытом set'е (%d) — пост-проверки не выдают запросы при открытом set'е (дедлок пула, T-217)", f.openSets)
+		}
 		allow := map[string]bool{}
 		for _, a := range args[0].([]string) {
 			allow[a] = true
@@ -588,6 +621,14 @@ func (f *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		}
 		return fakeRowsOf([]any{n}), nil
 	case CheckOrphansSQL:
+		// Модель пула CLI (T-217): запрос сирот пост-проверки обязан
+		// приходить после Close первого set'а — открытый set держит
+		// соединение, и при pool_size = 2 (соединение переноса + один
+		// set) Acquire второго запроса ждал бы вечно (дедлок
+		// пост-проверок инцидента 29.10). Стиль statusPool.
+		if f.openSets > 0 {
+			return nil, fmt.Errorf("fakeConn: CheckOrphansSQL при открытом set'е (%d) — первый set пост-проверок закрывается до второго запроса (дедлок пула, T-217)", f.openSets)
+		}
 		var d, r, ld, lf, h int64
 		for _, dom := range f.domains {
 			if !f.zoneByID(dom.zone) {
@@ -1193,6 +1234,28 @@ func TestPostChecksAndSpot(t *testing.T) {
 	if err := SpotCheck(context.Background(), f, "no-such.in", "in", "no-such"); err == nil ||
 		!strings.Contains(err.Error(), "не нашёл") {
 		t.Errorf("SpotCheck отсутствующего = %v, хочу «не нашёл»", err)
+	}
+}
+
+// TestPostChecksClosesSetBeforeOrphans — регрессия T-217: set'ы
+// пост-проверок закрываются до следующего запроса. Guard'ы фейка
+// (CheckZonesLeftSQL/CheckOrphansSQL при открытом set'е) моделируют пул
+// CLI из 2 соединений: соединение переноса + один открытый set — второй
+// запрос ждал бы третье соединение вечно (дедлок инцидента 29.10; живой
+// контур — интеграционный TestZonesCollapse_SmallPoolDeadlock).
+// Итоговое openSets == 0 закрывает и утечку второго set'а, и
+// перестановку хелперов (ревью T-217 P3-1).
+func TestPostChecksClosesSetBeforeOrphans(t *testing.T) {
+	f := newFakeConn()
+	f.seed2LD(t, []int64{1}, false)
+	if _, _, err := PostChecks(context.Background(), f, []string{"crawl.test"}); err != nil {
+		t.Fatalf("PostChecks: %v", err)
+	}
+	f.mu.Lock()
+	open := f.openSets
+	f.mu.Unlock()
+	if open != 0 {
+		t.Errorf("после PostChecks открытых set'ов %d, хочу 0 (оба set'а закрываются)", open)
 	}
 }
 
