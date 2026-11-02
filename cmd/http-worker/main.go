@@ -38,6 +38,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -193,18 +194,48 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// в реестре видно сразу при старте.
 	content.WarnDictMismatch(store.Dir(), logger)
 
-	// Фоновые циклы сервиса (наблюдатель диска, коллектор длин очередей,
-	// проход доработки рендера) живут до отмены ctx; их результаты
-	// забираются в bg после главного цикла — до defer-закрытий store,
-	// rdb и транспорта ниже (стиль cmd/scheduler): незаджойненная
-	// горутина могла трогать закрытые PackStore/Redis/Fetcher.
-	bg := make(chan error, 3)
+	// Клиент Redis (q:http/q:analyze/q:render) — до запуска фоновых
+	// циклов: его defer-закрытие обязано стоять в LIFO раньше джойна
+	// (ниже), гейт и очереди собираются дальше по проводке.
+	rdb := queue.NewClient(cfg.Redis.Addr)
+	defer func() { _ = rdb.Close() }()
+
+	// Джойн фоновых циклов (T-223): производная отмена + WaitGroup.
+	// Каркас отменяет ctx OnRun только после его возврата (internal/
+	// service: cancelRun после onRunDone) — ранний выход run из
+	// конструкторов ниже или паника обязаны останавливать циклы сами,
+	// иначе defer-закрытия rdb/store/транспорта закроют ресурсы под
+	// серединой прохода компактификации/retention; до T-223 CompactLoop
+	// и RetentionLoop жили fire-and-forget даже на штатной остановке —
+	// три приёма bg-канала их не накрывали, четвёртый сендер вис бы на
+	// канале ёмкости 3. Джойн — defer, зарегистрированный ПОСЛЕ
+	// defer-закрытий выше → исполняется ДО них (LIFO). WaitGroup, а не
+	// канал ёмкости (стиль scheduler/monitor): джойн ждёт ровно
+	// запущенное (Add/Done по месту запуска) — ранний выход с частью
+	// циклов не виснет на «недостающих» приёмах, связку «ёмкость =
+	// сендеры = приёмы» держать руками не нужно. Ошибки циклов
+	// отбрасываются сознательно: каждый цикл логирует свои сбои сам.
+	// Инварианты закреплены структурным тестом TestRunBackgroundJoin
+	// (main_test.go).
+	ctx, cancel := context.WithCancel(ctx)
+	var bg sync.WaitGroup
+	defer func() {
+		// Штатно ctx уже отменён каркасом к моменту возврата run;
+		// ранний выход/паника гасят ещё живые циклы здесь — до
+		// defer-закрытий (LIFO).
+		cancel()
+		bg.Wait()
+	}()
 
 	// Контроль свободного места каталога контента (T-046, ТЗ 8):
 	// периодический наблюдатель горутиной (не зависит от цикла задач),
 	// Warn и событие при входе в паузу записи/восстановлении; завершается
 	// с отменой ctx.
-	go func() { bg <- content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger}) }()
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		_ = content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger})
+	}()
 
 	// Фоновая компактификация паков (T-045, ТЗ 5.7): единственный
 	// механизм физического освобождения места и удаления мёртвых строк
@@ -212,7 +243,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// хранилище — здесь, рядом с DiskWatchLoop (проходам не нужен
 	// параллелизм; одновременный запуск во втором писателе формально
 	// допустим, но бесполезен). Завершается с отменой ctx.
-	go func() { _ = content.CompactLoop(ctx, store, content.CompactOptions{Log: logger}) }()
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		_ = content.CompactLoop(ctx, store, content.CompactOptions{Log: logger})
+	}()
 
 	saver, err := httpworker.NewContentSaver(store, logger)
 	if err != nil {
@@ -227,8 +262,6 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// при переполнении домен получает флаг render_pending вместо
 	// публикации (renderq.go; порог ёмкости —
 	// render.queue_high_watermark, T-174, ниже).
-	rdb := queue.NewClient(cfg.Redis.Addr)
-	defer func() { _ = rdb.Close() }()
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
 		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
@@ -265,8 +298,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Длина потребляемого стрима q:http → crawler_queue_depth (T-077):
 	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
+	bg.Add(1)
 	go func() {
-		bg <- metrics.CollectQueueLoop(ctx, reg, gate.Len,
+		defer bg.Done()
+		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamHTTP}, metrics.DefaultQueueCollectInterval, logger)
 	}()
 
@@ -286,8 +321,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// Отдельной горутиной в том же OnRun (образец CleanupDeleted
 	// T-020/T-021): не зависит от цикла задач q:http, завершается
 	// отменой ctx.
+	bg.Add(1)
 	go func() {
-		bg <- httpworker.RequeueRenderPending(ctx, pool, store, renderQ, httpworker.RequeueOptions{
+		defer bg.Done()
+		_ = httpworker.RequeueRenderPending(ctx, pool, store, renderQ, httpworker.RequeueOptions{
 			Log:                logger,
 			DeprioritizedZones: cfg.Render.RequeueDeprioritizedZones,
 		})
@@ -314,7 +351,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	if retentionWatermark <= 0 {
 		retentionWatermark = int64(cfg.Scheduler.QueueHighWatermark)
 	}
+	bg.Add(1)
 	go func() {
+		defer bg.Done()
 		_ = content.RetentionLoop(ctx, pool, content.RetentionOptions{
 			Retention:        cfg.Content.Retention.D(),
 			Interval:         cfg.Content.RetentionInterval.D(),
@@ -365,14 +404,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 
-	err = httpworker.Run(ctx, q, w, opts2)
-	// Главный цикл завершён отменой ctx — фоновые циклы видят ту же
-	// отмену и заканчиваются сами; дождаться их до defer-закрытий
-	// store/rdb/соединений транспорта (гонка времени жизни ресурсов).
-	<-bg
-	<-bg
-	<-bg
-	return err
+	// Главный цикл живёт до отмены ctx (graceful shutdown); джойн
+	// фоновых циклов — defer выше: любой выход run (штатный, ранний из
+	// конструктора, паника) сначала гасит и дожидается циклов, и лишь
+	// затем LIFO закрывает rdb/store/соединения транспорта.
+	return httpworker.Run(ctx, q, w, opts2)
 }
 
 // renderQueueWatermark — эффективный порог ёмкости q:render (T-174):

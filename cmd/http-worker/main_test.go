@@ -8,13 +8,19 @@
 // T-174): фолбэк «0 — общий scheduler.queue_high_watermark» и кламп
 // MAXLEN/2 (queue.StreamWatermark); и проводка AfterConnect-хуков пула
 // сервиса (afterConnectHooks, T-201): NoParallelGather — сериальность
-// retention-дренажа + LockTimeout (T-192).
+// retention-дренажа + LockTimeout (T-192); и структурный инвариант
+// остановки run (TestRunBackgroundJoin, T-223): производная отмена +
+// WaitGroup — каждый фоновый цикл Add/Done, джойн-defer исполняется до
+// defer-закрытий ресурсов.
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"reflect"
 	"runtime"
 	"strings"
@@ -356,4 +362,227 @@ func TestRenderQueueWatermark(t *testing.T) {
 	if half := queue.DefaultStreamMaxLen(queue.StreamRender) / 2; def > half {
 		t.Errorf("дефолт %d выше DefaultStreamMaxLen(q:render)/2 = %d — ворота не сработают до обрезки", def, half)
 	}
+}
+
+// TestRunBackgroundJoin — структурный инвариант остановки http-worker
+// (T-223): все фоновые циклы run останавливаются и джойнятся до
+// defer-закрытий store/rdb и транспорта на любом выходе — штатной
+// отмене ctx, раннем возврате из конструктора, панике. До T-223
+// CompactLoop и RetentionLoop запускались fire-and-forget: run после
+// трёх приёмов bg-канала возвращался и закрывал PackStore/пул Redis под
+// серединой прохода компактификации/retention, а четвёртый сендер вис
+// бы на канале ёмкости 3. Схема — производная отмена + WaitGroup (по
+// ревью T-223: канал ёмкости не накрывает ранние выходы и панику, а
+// связка «ёмкость = сендеры = приёмы» хрупка руками). Прогнать run в
+// юнит-тесте нельзя (живые Postgres/Redis/DNS), инвариант закреплён
+// разбором main.go через go/ast (прецедент чтения исходников тестами —
+// compose_test.go, postgresql_conf_test.go):
+//
+//   - run выводит ctx производной отменой (context.WithCancel): каркас
+//     отменяет ctx OnRun только после его возврата, ранний выход/паника
+//     обязаны гасить циклы сами;
+//   - джойн-defer (единственный defer с bg.Wait) вызывает cancel и
+//     зарегистрирован последним из defer run → исполняется первым
+//     (LIFO), до закрытий rdb/store/транспорта, и до первого запуска
+//     циклов;
+//   - каждый go-запуск в run обёрнут парой «bg.Add(1); go func(){ defer
+//     bg.Done(); … }()»: Add без пары к go — незаджойненный цикл
+//     (регрессия T-223), defer bg.Done обязан быть безусловным
+//     оператором верхнего уровня литерала — условный Done (внутри if)
+//     оставил бы Wait виснуть.
+func TestRunBackgroundJoin(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("разбор main.go: %v", err)
+	}
+	var run *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fn, ok := d.(*ast.FuncDecl); ok && fn.Name.Name == "run" && fn.Recv == nil {
+			run = fn
+		}
+	}
+	if run == nil {
+		t.Fatal("функция run в main.go не найдена")
+	}
+
+	var (
+		withCancel = token.NoPos // ctx, cancel := context.WithCancel(ctx)
+		joinDefer  *ast.DeferStmt
+		joinCancel bool // джойн-defer гасит циклы сам
+		waits      int  // bg.Wait() в run — ровно один
+		launches   int
+		firstGo    = token.NoPos
+		topDefers  []*ast.DeferStmt // defer-операторы run (не горутин циклов)
+		broken     []string
+	)
+
+	// Джойн-defer и порядок defer-ов — по верхнему уровню run: defer
+	// bg.Done() внутри горутин циклов — не defer run, в LIFO закрытий
+	// не участвует.
+	for _, st := range run.Body.List {
+		if d, ok := st.(*ast.DeferStmt); ok {
+			topDefers = append(topDefers, d)
+			if callsBgWait(d) {
+				if joinDefer != nil {
+					broken = append(broken, "больше одного defer с bg.Wait()")
+				}
+				joinDefer = d
+				joinCancel = callsIdent(d, "cancel")
+			}
+		}
+	}
+
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if len(n.Lhs) == 2 && len(n.Rhs) == 1 {
+				if call, ok := n.Rhs[0].(*ast.CallExpr); ok && isPkgCall(call, "context", "WithCancel") && withCancel == token.NoPos {
+					withCancel = n.Pos()
+				}
+			}
+		case *ast.BlockStmt:
+			// Пара «bg.Add(1); go …» — в каждом списке операторов
+			// (запуски циклов лежат на верхнем уровне run).
+			for i, st := range n.List {
+				goSt, ok := st.(*ast.GoStmt)
+				if !ok {
+					continue
+				}
+				launches++
+				if firstGo == token.NoPos {
+					firstGo = goSt.Pos()
+				}
+				if i == 0 || !isBgAddOne(n.List[i-1]) {
+					broken = append(broken, "go-запуск без bg.Add(1) непосредственно перед ним — цикл вне джойна (T-223)")
+				}
+				if !defersBgDoneTopLevel(goSt) {
+					broken = append(broken, "go-запуск без безусловного defer bg.Done() верхнего уровня литерала")
+				}
+			}
+		case *ast.CallExpr:
+			if isMethodCall(n, "bg", "Wait") {
+				waits++
+			}
+		}
+		return true
+	})
+
+	if withCancel == token.NoPos {
+		t.Fatal("в run нет производной отмены (context.WithCancel) — ранний выход/паника оставляют циклы с живым ctx")
+	}
+	if joinDefer == nil {
+		t.Fatal("в run нет defer с bg.Wait() — фоновые циклы не джойнятся до defer-закрытий ресурсов")
+	}
+	if !joinCancel {
+		t.Error("джойн-defer не вызывает cancel() — ранний выход run не остановит ещё живые циклы, Wait зависнет")
+	}
+	if waits != 1 {
+		t.Errorf("вызовов bg.Wait() в run = %d, хочу 1 (только джойн-defer)", waits)
+	}
+	if launches == 0 {
+		t.Fatal("в run нет go-запусков фоновых циклов — проверять нечего")
+	}
+	// Джойн-defer зарегистрирован последним из defer run → исполняется
+	// первым (LIFO): любой defer-закрытие ресурса уже видит
+	// остановленные циклы.
+	for _, d := range topDefers {
+		if d == joinDefer {
+			continue
+		}
+		if d.Pos() > joinDefer.Pos() {
+			t.Errorf("defer (%s) зарегистрирован после джойна — LIFO закроет его ресурс раньше остановки циклов", fset.Position(d.Pos()))
+		}
+	}
+	if withCancel > joinDefer.Pos() {
+		t.Error("производная отмена стоит после джойн-defer — циклы могут получить неотменяемый ctx")
+	}
+	if firstGo != token.NoPos && firstGo < joinDefer.Pos() {
+		t.Error("go-запуск цикла стоит до регистрации джойн-defer — путь между ними выходит из run без джойна")
+	}
+	for _, b := range broken {
+		t.Error(b)
+	}
+}
+
+// callsBgWait — есть ли в поддереве вызов bg.Wait().
+func callsBgWait(n ast.Node) bool {
+	found := false
+	ast.Inspect(n, func(m ast.Node) bool {
+		if call, ok := m.(*ast.CallExpr); ok && isMethodCall(call, "bg", "Wait") {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// callsIdent — есть ли в поддереве вызов функции-идентификатора name.
+func callsIdent(n ast.Node, name string) bool {
+	found := false
+	ast.Inspect(n, func(m ast.Node) bool {
+		if call, ok := m.(*ast.CallExpr); ok {
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == name {
+				found = true
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// isBgAddOne — оператор «bg.Add(1)».
+func isBgAddOne(st ast.Stmt) bool {
+	expr, ok := st.(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	call, ok := expr.X.(*ast.CallExpr)
+	if !ok || !isMethodCall(call, "bg", "Add") || len(call.Args) != 1 {
+		return false
+	}
+	lit, ok := call.Args[0].(*ast.BasicLit)
+	return ok && lit.Kind == token.INT && lit.Value == "1"
+}
+
+// defersBgDoneTopLevel — go-запуск обязан быть func-литералом с
+// безусловным оператором «defer bg.Done()» на верхнем уровне тела:
+// Done внутри if/for оставил бы Wait виснуть на «незавершённом» цикле.
+func defersBgDoneTopLevel(goSt *ast.GoStmt) bool {
+	lit, ok := goSt.Call.Fun.(*ast.FuncLit)
+	if !ok {
+		return false
+	}
+	for _, st := range lit.Body.List {
+		d, ok := st.(*ast.DeferStmt)
+		if !ok {
+			continue
+		}
+		if call, ok := d.Call.Fun.(*ast.SelectorExpr); ok {
+			if id, ok := call.X.(*ast.Ident); ok && id.Name == "bg" && call.Sel.Name == "Done" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isPkgCall — вызов pkg.Fn(…) по имени пакета и функции.
+func isPkgCall(call *ast.CallExpr, pkg, fn string) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	return ok && id.Name == pkg && sel.Sel.Name == fn
+}
+
+// isMethodCall — вызов recv.Method(…) по именам получателя и метода.
+func isMethodCall(call *ast.CallExpr, recv, method string) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	return ok && id.Name == recv && sel.Sel.Name == method
 }
