@@ -9,9 +9,12 @@
 # (<1 мин) — доставки вернутся клеймом (идемпотентность ТЗ 3.4), воркер
 # переживает паузу потребления при мёртвом браузере (docs/render.md).
 # Обоснование и установка — docs/deploy.md §2.2.
+# PartOf гасит юнит вместе с набором: после stop crawler.target
+# незавершённый ресайкл не продолжится (T-215).
 
 [Unit]
 Description=Ресайкл crawler-chromium (дренаж рендер-долга T-198)
+PartOf=crawler.target
 
 [Service]
 Type=oneshot

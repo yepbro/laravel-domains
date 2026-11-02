@@ -453,11 +453,14 @@ systemctl stop crawler.target      # весь набор (бой); точечн�
 make down                          # dev (тома сохраняются)
 ```
 
-Таймер ресайкла chromium (`crawler-chromium-recycle.timer`, T-208) в
-`crawler.target` не входит (deploy.md §2.2): при остановленном наборе
-гасить отдельно — `systemctl disable --now
-crawler-chromium-recycle.timer`, иначе очередной запуск (раз в 2 ч)
-поднимет остановленный chromium.
+Таймер ресайкла chromium (`crawler-chromium-recycle.timer`, T-208) входит
+в набор (deploy.md §2.2, T-215): `PartOf=crawler.target` в обоих юнитах
+пары гасит и сервис, и таймер вместе с набором — очередной тик (раз в
+2 ч) не поднимет остановленный chromium; `WantedBy=crawler.target`
+возвращает таймер при старте набора. Отдельного гашения при остановке
+набора не требуется. Точечная остановка одного `crawler-chromium.service`
+таймер не гасит — ближайший тик (≤2 ч) вернёт браузер; при работающем
+наборе это штатно.
 
 Перезапуск любого сервиса безопасен: недоработанные задачи вернутся
 повторной доставкой, домены — lease-проходом (ТЗ 11.4 п. 9).
@@ -726,3 +729,29 @@ Telegram и Actions).
   26.10 (день 2026-10-25 — непрерывность суточного фида сохранена).
 - Откат: конфиг — вернуть `5m` + restart monitor; cron — вернуть
   строку `33 23 * * *` и комментарий (копия в /root).
+
+### 2026-11-02 — T-215: пара recycle-юнитов chromium введена в crawler.target (PartOf/WantedBy)
+
+- На боевом сервере в `crawler-chromium-recycle.{service,timer}` добавлен
+  `PartOf=crawler.target`, таймер переведён с `WantedBy=timers.target`
+  на `WantedBy=crawler.target` (`reenable`: симлинк переехал из
+  `timers.target.wants/` в `crawler.target.wants/`), `daemon-reload`;
+  юниты синхронизированы в комплект `deploy/systemd/` (deploy.md §2.2).
+  Причина: после `systemctl stop crawler.target` очередной тик таймера
+  (раз в 2 ч) запускал остановленный chromium. Бэкап прежних юнитов —
+  `/root/t215-backup-20261102/`.
+- Живой стоп-тест набора не проводился: идёт дренаж `q:render`
+  (150 тыс. записей), scheduler намеренно остановлен с 30.10 —
+  `start crawler.target` поднял бы его поверх дренажа. Связки проверены
+  статически (`systemctl show -p PartOf,WantedBy`,
+  `list-dependencies --reverse`: оба юнита под crawler.target) и
+  семантика PartOf→timer подтверждена пробными юнитами в
+  `/run/systemd/system` (stop цели гасит таймер, start возвращает;
+  systemd 255). Провести короткий живой тест (stop → таймер и chromium
+  inactive → start → всё вернулось) после завершения дренажа `q:render`
+  и возврата scheduler в работу.
+- Откат: `cp /root/t215-backup-20261102/{crawler-chromium-recycle.service,crawler-chromium-recycle.timer} /etc/systemd/system/`,
+  `daemon-reload`, `reenable --now` таймера (вернётся в timers.target.wants/;
+  `--now` обязателен: без него остановленный таймер `start crawler.target`
+  не поднимет — WantedBy после отката снова timers.target, а он активен
+  с загрузки), контроль — `systemctl is-active crawler-chromium-recycle.timer`.

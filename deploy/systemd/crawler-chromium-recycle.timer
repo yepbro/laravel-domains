@@ -5,13 +5,20 @@
 # crawler-chromium-recycle.service); первый запуск через 30 мин после
 # активации таймера (OnActiveSec) — после старта браузер свежий и в
 # ресайкле не нуждается. Обоснование и установка — docs/deploy.md §2.2.
+#
+# Жизненный цикл — вместе с набором (T-215): PartOf=crawler.target гасит
+# таймер при остановке набора — очередной тик (раз в 2 ч) не запустит
+# остановленный chromium; WantedBy=crawler.target (enable-симлинк в
+# crawler.target.wants/) возвращает таймер при старте набора: PartOf
+# транслирует только stop/restart, не start.
 
 [Unit]
 Description=Таймер ресайкла crawler-chromium каждые 2 ч
+PartOf=crawler.target
 
 [Timer]
 OnActiveSec=30min
 OnUnitActiveSec=2h
 
 [Install]
-WantedBy=timers.target
+WantedBy=crawler.target

@@ -396,16 +396,24 @@ local-режиме (`render.remote_url` пуст — браузер как пр�
 ```bash
 cp deploy/systemd/crawler-chromium-recycle.{service,timer} /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now crawler-chromium-recycle.timer
+systemctl reenable --now crawler-chromium-recycle.timer # до T-215 был WantedBy=timers.target — симлинк переезжает в crawler.target.wants/
 systemctl list-timers 'crawler-chromium-recycle*' # контроль расписания
 ```
 
-Таймер живёт в `timers.target`, в `crawler.target` не входит (директивы —
-как на сервере) и остановкой набора не гасится: очередной запуск
-ресайкла (`systemctl restart`) поднимёт остановленный chromium. При
-остановке/выключении набора гасить таймер отдельно — `systemctl
-disable --now crawler-chromium-recycle.timer` (обратное включение —
-§4.6).
+Жизненный цикл пары — вместе с набором (T-215): `PartOf=crawler.target`
+в обоих юнитах гасит и сервис, и таймер при `systemctl stop
+crawler.target` — очередной тик (раз в 2 ч) не запустит остановленный
+chromium; `WantedBy=crawler.target` возвращает таймер при старте набора
+(`PartOf=` транслирует только stop/restart, не start — потому связка из
+двух директив). Отдельно гасить таймер при остановке набора больше не
+нужно; `systemctl disable --now crawler-chromium-recycle.timer` — только
+если ресайкл не нужен вовсе (local-режим; обратное включение — §4.6).
+Рестарт набора транслируется паре так же, как stop (`PartOf=` передаёт
+и restart): при `systemctl restart crawler.target` отработает и ресайкл —
+дополнительный рестарт chromium в той же транзакции (безвреден: рендеры
+вернутся клеймом; возможный транзиентный `failed` ресайкла при схлопывании
+job'ов снимется следующим тиком). После ручного рестарта набора полезен
+контроль `systemctl --failed`.
 
 ## 3. Пользователи: статические, по одному на сервис
 
@@ -771,7 +779,7 @@ install -m 0644 deploy/nrd/crawler-nrd.cron /etc/cron.d/crawler-nrd
 ```bash
 systemctl list-units 'crawler-*'        # статус всех сервисов набора
 systemctl stop crawler.target           # весь набор (graceful: PartOf=);
-                                       # таймер ресайкла отдельно — §2.2 (T-208)
+                                       # таймер ресайкла гасится вместе с набором (§2.2, T-215)
 journalctl -t crawler-scheduler -f      # логи по SyslogIdentifier
 curl -fsS 127.0.0.1:9102/livez         # liveness каждого сервиса
 curl -fsS 127.0.0.1:9102/healthz       # readiness (пул БД); /metrics — тот же порт
