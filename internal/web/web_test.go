@@ -42,13 +42,17 @@ type webSeed struct {
 	domainInfo []byte  // ответ domain_info(text) или nil (домен неизвестен)
 }
 
-// fakeDB — Pinger + Querier с живой семантикой SQL данных лендинга.
+// fakeDB — Pinger + Querier + Execer с живой семантикой SQL данных
+// лендинга.
 type fakeDB struct {
 	seed webSeed
 	ping error
+	// execErr — отказ Exec (INSERT web_checks, T-221); nil — успех.
+	execErr error
 
 	mu      sync.Mutex
 	queries []string
+	execs   []string
 }
 
 func (d *fakeDB) Ping(context.Context) error { return d.ping }
@@ -58,7 +62,26 @@ func (d *fakeDB) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFro
 }
 
 func (d *fakeDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, fmt.Errorf("fakeDB: неожидаемый Exec: %s", sql)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.execs = append(d.execs, sql)
+	if d.execErr != nil {
+		return pgconn.CommandTag{}, d.execErr
+	}
+	return pgconn.CommandTag{}, nil
+}
+
+// webCheckInserts — сколько INSERT web_checks прошло через Exec.
+func (d *fakeDB) webCheckInserts() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := 0
+	for _, sql := range d.execs {
+		if strings.Contains(sql, "INSERT INTO web_checks") {
+			n++
+		}
+	}
+	return n
 }
 
 func (d *fakeDB) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, error) {

@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/config"
+	"crawler/internal/metrics"
 	"crawler/internal/service"
 	"crawler/internal/web"
 )
@@ -30,18 +31,23 @@ func main() {
 	}
 	logger := service.NewLogger("web", cfg)
 
-	// Метрики — loopback (ТЗ §9: публичная точка входа одна — web.listen;
-	// 9107 — следующий свободный за analyzer :9106). Пул приходит от
-	// каркаса после миграций (OnDBPool): postgres.dsn обязателен
-	// (config.Validate), readiness /healthz публичного mux пингует его.
+	// Реестр создаётся здесь (не каркасом), чтобы приборы формы
+	// (исходы/сбои/длительность, T-221) жили в том же реестре, что
+	// отдаёт /metrics. Метрики — loopback (ТЗ §9: публичная точка входа
+	// одна — web.listen; 9107 — следующий свободный за analyzer :9106).
+	// Пул приходит от каркаса после миграций (OnDBPool): postgres.dsn
+	// обязателен (config.Validate), readiness /healthz публичного mux
+	// пингует его.
+	reg := metrics.New("web")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "web",
 		Config:      cfg,
 		Logger:      logger,
+		Metrics:     reg,
 		MetricsAddr: service.EnvOr("METRICS_ADDR", "127.0.0.1:9107"),
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool) },
+		OnRun:       func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
 		os.Exit(1)
 	}
@@ -50,11 +56,11 @@ func main() {
 // run — публичный слушатель внутри OnRun: жизненным циклом владеет
 // сервис web (graceful stop по отмене ctx — прецедент OnRun-клиентов
 // воркеров), завершение возвращает каркасу.
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) error {
+func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("web: пул БД не получен (postgres.dsn обязателен)")
 	}
-	srv, err := web.New(pool, cfg, web.Options{Log: logger})
+	srv, err := web.New(pool, cfg, web.Options{Log: logger, Metrics: reg})
 	if err != nil {
 		return err
 	}

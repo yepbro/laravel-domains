@@ -203,6 +203,9 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_analyzer_unfound_drained_rows_total` | counter | — | analyzer (T-187) | строки `subdomain_results`, очищенные точечным дренажом при снятии находки переанализом: без дренажа остались бы позади курсора retention до редких catch-up-кругов (docs/content.md) |
 | `crawler_analyzer_unfound_drain_errors_total` | counter | — | analyzer (T-187) | неудачи точечного дренажа (Warn в логе): записи домена остались позади курсора — подберут редкие catch-up-круги T-185 либо перепроверка T-030; рост = разбирать причину сбоя |
 | `crawler_unit_oom_events` | gauge | `unit`, `kind` | monitor (T-145) | проход алертов (5 мин, T-206): счётчики memory.events cgroup v2 юнитов `crawler-*.service` (kind=oom/oom_kill); обнуляются пересозданием cgroup на рестарте юнита — gauge, не counter; рост = события OOM (алерт unit_oom) |
+| `crawler_web_checks_total` | counter | `result` | web (T-221) | каждый запрос `POST /api/check-domain` по исходу: `ok` — живая проверка прошла (200), `stored_only` — живая сбоила, ответ из сохранённых данных (200), `failed` — живая сбоила без сохранённых (502), `busy` — перегруз семафора живых проверок (503, T-220), `rate_limited` — рейт-лимит формы (429), `invalid` — мусорный ввод (422) |
+| `crawler_web_check_errors_total` | counter | `type` | web (T-221) | сбои формы по классам: `live` — конвейер живой проверки не удался (перегруз — исход `busy`, не ошибка), `journal` — INSERT `web_checks` не удался (строка журнала ручных проверок потеряна — до T-221 терялась молча), `non_ip` — адрес клиента не IP (пир unix-сокета без валидного заголовка прокси), запись журнала пропущена (Warn в journald) |
+| `crawler_web_check_seconds` | histogram | — | web (T-221) | полное время обработки запроса формы после лимита и валидации (stored-чтение, живая проверка, запись журнала; 429/422/перегруз 503 не наблюдаются — работы не выполняли) |
 | `crawler_unit_memory_high_events` | gauge | `unit` | monitor (T-162) | тот же проход, что unit_oom: счётчик memory.events high (попадания за мягкий потолок MemoryHigh — троттлинг reclaim'ом); накапливается за жизнь cgroup, осмыслен рост — алерт `memory_high` при росте ≥2 проходов подряд (T-162: предвестник фаталов http-worker, T-157) |
 | `crawler_psi_cpu_some_percent` | gauge | `kind` | monitor (T-162) | проход алертов: some-доля времени задержки CPU из `/proc/pressure/cpu` хоста (kind=avg10/avg60/avg300); устойчивый avg300 >90 % — голод планировщика (алерт `psi_cpu`, T-162), ядро без PSI — ряда нет |
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
@@ -1062,7 +1065,16 @@ readiness ping PostgreSQL (503), `GET /robots.txt` и
 `GET /sitemap.xml` — служебные файлы поисковых роботов (T-124:
 robots — статика из embed, sitemap — минимальный набор локалей,
 абсолютные URL собираются из запроса — адрес публикации в конфиге
-не хранится), `GET /static/*` — статика (go:embed). Шаблоны —
+не хранится), `GET /static/*` — статика (go:embed). Адрес посетителя
+формы за прокси — `X-Real-IP` от loopback-пира TCP или пира
+unix-сокета (T-221, обе позиции доверия — вариант деплоя из
+deploy/nginx/README.md; запасной `X-Forwarded-For` без `X-Real-IP`
+берёт последнюю позицию списка — её дописал прокси), без валидного
+заголовка пир unix-сокета — бакет-метка без записи не-IP в
+`web_checks`; исходы/сбои/длительность формы — метрики
+`crawler_web_checks_total{result}` /
+`crawler_web_check_errors_total{type}` / `crawler_web_check_seconds`
+(T-221, таблица «Метрики рабочей логики» ниже). Шаблоны —
 `html/template` + `go:embed`, новых зависимостей нет.
 
 CSS лендинга — Tailwind v4 без node: исходник

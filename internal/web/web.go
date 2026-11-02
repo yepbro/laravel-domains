@@ -44,9 +44,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"crawler/internal/checker"
 	"crawler/internal/config"
+	"crawler/internal/metrics"
 )
 
 // Pinger — readiness-часть зависимости БД.
@@ -60,10 +62,18 @@ type Querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-// DB — зависимость сервиса: readiness ping + данные страницы.
+// Execer — записи формы (*pgxpool.Pool удовлетворяет): журнал web_checks
+// (T-120) — единственная точка записи сервиса.
+type Execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// DB — зависимость сервиса: readiness ping + данные страницы + журнал
+// формы.
 type DB interface {
 	Pinger
 	Querier
+	Execer
 }
 
 // Locales — поддерживаемые локали лендинга (зафиксированное решение
@@ -77,6 +87,10 @@ const DefaultLocale = "ru"
 type Options struct {
 	// Log — логгер сервиса; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
+	// Metrics — реестр Prometheus сервиса (T-221): из него New строит
+	// приборы формы (исходы/сбои/длительность); nil — без метрик
+	// (изолированные тесты, методы no-op).
+	Metrics *metrics.Registry
 }
 
 // Server — публичный HTTP-сервер лендинга.
@@ -86,6 +100,8 @@ type Server struct {
 	tpl     *template.Template
 	cfg     *config.Config
 	limiter *tokenBucketLimiter
+	// met — приборы формы (T-221); nil — no-op.
+	met *Metrics
 	// liveSem — семафор одновременных живых проверок (T-220): конвейер
 	// держит сеть/память (запросы обоих схем с телами страниц, рендер
 	// SPA); избыток — быстрый отказ 503 с Retry-After, а не очередь до
@@ -165,6 +181,7 @@ func New(db DB, cfg *config.Config, opts Options) (*Server, error) {
 		cfg:     cfg,
 		limiter: newLimiter(cfg.Web.RateLimit, time.Minute),
 		liveSem: make(chan struct{}, live),
+		met:     NewMetrics(opts.Metrics),
 	}, nil
 }
 

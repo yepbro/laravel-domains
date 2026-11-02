@@ -173,6 +173,11 @@ SELECT * FROM schema_migrations;   -- version, dirty = false
   (материал калибровки правил, T-115);
 - `crawler_laravel_appeared_total` / `crawler_laravel_lost_total` —
   появления/исчезновения Laravel-доменов (история детекции T-118);
+- `crawler_web_checks_total{result}` / `crawler_web_check_errors_total{type}`
+  / `crawler_web_check_seconds` — здоровье публичной формы проверки
+  (web, T-221): исходы запросов, сбои по классам (рост `type="journal"`
+  = потеря строк журнала `web_checks`, `type="non_ip"` = прокси не
+  передаёт адрес посетителя), длительность;
 - `crawler_service_up{service}` — живость (включая полную смерть
   процесса).
 

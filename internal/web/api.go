@@ -4,6 +4,9 @@
 // 4 запроса/мин на IP — in-memory token bucket (один инстанс сервиса,
 // stdlib; фиксированное решение этапа 13 — как троттлинг larasites).
 // Результат пишется в web_checks (T-120) — кто/что/когда проверял.
+// Адрес посетителя за прокси и исходы/сбои/длительность формы — T-124
+// (TCP-loopback пир) и T-221 (пир unix-сокета — вариант деплоя из
+// deploy/nginx/README.md; исходы — метрики metrics.go на :9107).
 //
 // Ресурсы живой проверки (T-220): конвейер работает на долгоживущем
 // контуре checker.Runtime (одна цепь резолверов с малым пулом UDP,
@@ -32,7 +35,8 @@ import (
 )
 
 // checkerDB — адаптер web.DB → db.DB пакета checker (CopyFrom/Exec форме
-// не нужны, checker их не вызывает — read-only конвейер).
+// не нужны, checker их не вызывает — read-only конвейер; Exec —
+// предохранитель с ошибкой, см. реализацию).
 type checkerDB struct{ db DB }
 
 func (c checkerDB) Ping(ctx context.Context) error { return c.db.Ping(ctx) }
@@ -42,7 +46,11 @@ func (c checkerDB) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyF
 }
 
 func (c checkerDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, fmt.Errorf("web: неожидаемый Exec формы: %s", sql)
+	// Предохранитель read-only (P3-1 ревью T-221): живой конвейер Exec
+	// не вызывает, журнал формы пишет собственным путём (recordCheck)
+	// мимо адаптера. Если checker когда-нибудь начнёт писать — ошибка
+	// вскроет это сразу, а не пройдёт молча.
+	return pgconn.CommandTag{}, fmt.Errorf("web: неожидаемый Exec живой проверки: %s", sql)
 }
 
 func (c checkerDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -109,8 +117,10 @@ var errLiveOverloaded = errors.New("живая проверка перегруж
 // со stored-данными, а stored-часть landing.js не показывает), 502
 // (живая проверка не удалась инфраструктурно и домен конвейеру неизвестен).
 func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	start := time.Now()
+	ip, isIP := clientIP(r)
 	if !s.limiter.allow(ip, time.Now()) {
+		s.met.Outcome(checkResultRateLimited)
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, `{"error":"rate_limited"}`, http.StatusTooManyRequests)
 		return
@@ -120,11 +130,13 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 		Domain string `json:"domain"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		s.met.Outcome(checkResultInvalid)
 		checkWriteError(w, "invalid", http.StatusUnprocessableEntity)
 		return
 	}
 	normalized, err := validateCheckInput(req.Domain)
 	if err != nil {
+		s.met.Outcome(checkResultInvalid)
 		checkWriteError(w, "invalid", http.StatusUnprocessableEntity)
 		return
 	}
@@ -202,9 +214,19 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 	// (3) журнал web_checks (T-120): best-effort — отказ записи не
 	// ломает ответ посетителю. Перегрузка не журналируется: проверки
 	// не было, строка found=false/score=0 портила бы аудит и добавляла
-	// INSERT в БД на пути «быстрого» 503.
+	// INSERT в БД на пути «быстрого» 503. Адрес без IP (пир unix-сокета
+	// без валидного заголовка прокси, T-221) не пишется вовсе: колонка
+	// ip_address inet NOT NULL произвольную строку не примет — пропуск
+	// явный (Warn + метрика non_ip), не молчаливый.
 	if !errors.Is(liveErr, errLiveOverloaded) {
-		s.recordCheck(r.Context(), normalized, resp.Found, resp.Score, resp.DurationMS, ip)
+		if isIP {
+			s.recordCheck(r.Context(), normalized, resp.Found, resp.Score, resp.DurationMS, ip)
+		} else {
+			s.opt.Log.Warn("форма: журнал web_checks пропущен — адрес клиента не IP (пир без валидного заголовка прокси)",
+				"domain", normalized)
+			s.met.Failure(checkErrNonIP)
+		}
+		s.met.Duration(time.Since(start))
 	}
 
 	if liveErr != nil {
@@ -213,15 +235,21 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 			// повтора: независимо от stored-части (landing.js её не
 			// показывает, 200 с found=false читался бы как «Laravel
 			// не найден»).
+			s.met.Outcome(checkResultBusy)
 			w.Header().Set("Retry-After", "5")
 			http.Error(w, `{"error":"busy"}`, http.StatusServiceUnavailable)
 			return
 		}
+		s.met.Failure(checkErrLive)
 		if resp.Stored == nil {
+			s.met.Outcome(checkResultFailed)
 			s.opt.Log.Warn("форма: живая проверка не удалась", "domain", normalized, "err", liveErr)
 			http.Error(w, `{"error":"check_failed"}`, http.StatusBadGateway)
 			return
 		}
+		s.met.Outcome(checkResultStoredOnly)
+	} else {
+		s.met.Outcome(checkResultOK)
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -295,36 +323,95 @@ func (s *Server) fetchStored(ctx context.Context, domain string) *storedSummary 
 	return st
 }
 
-// recordCheck — INSERT web_checks (T-120): best-effort.
+// recordCheck — INSERT web_checks (T-120): best-effort — отказ записи не
+// ломает ответ посетителю, но логируется и считается метрикой (T-221:
+// до неё INSERT шёл через Query без чтения строк — ошибка проглатывалась
+// и журнал молча пустел). Exec, а не Query: INSERT строк не возвращает.
+// Контекст запроса отменяется уходом посетителя (живая проверка до
+// web.timeout), а журнал — аудит «кто/что/когда проверял»: INSERT живёт
+// собственным коротким окном, не зависящим от отключения клиента
+// (P3-5 ревью T-221).
 func (s *Server) recordCheck(ctx context.Context, punycode string, found bool, score float64, durMS int64, ip string) {
-	rows, err := s.db.Query(ctx,
+	jctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if _, err := s.db.Exec(jctx,
 		"INSERT INTO web_checks (domain, punycode_domain, ip_address, found, score, duration_ms) "+
 			"VALUES ($1::text, $2::text, $3::inet, $4, $5::real, $6::int4)",
-		punycode, punycode, ip, found, score, int32(durMS))
-	if err == nil {
-		rows.Close()
+		punycode, punycode, ip, found, score, int32(durMS)); err != nil {
+		// Домен и причина — без адреса посетителя (персональные данные
+		// в лог не попадают, адрес остаётся только в web_checks).
+		s.opt.Log.Warn("форма: журнал web_checks не записан", "domain", punycode, "err", err)
+		s.met.Failure(checkErrJournal)
 	}
 }
 
+// unixLocalKey — ключ бакета рейт-лимита для пира unix-сокета без
+// валидного X-Real-IP/X-Forwarded-For (T-221): строка, заведомо не IP —
+// не пишется в inet, все такие посетители делят один бакет (прокси
+// сконфигурирован без заголовков — общее окно честнее обхода лимита).
+const unixLocalKey = "unix-local"
+
 // clientIP — адрес клиента для рейт-лимита и журнала web_checks.
-// За reverse-proxy (T-124) все соединения приходят с loopback nginx —
-// тогда адрес посетителя несёт X-Real-IP (образец nginx перезаписывает
-// его значением $remote_addr — подделать снаружи нельзя, а сам сервис
-// слушает loopback, прямых соединений с визитором нет). Заголовку
-// доверяем только от loopback-пира и только валидному IP; иначе —
-// RemoteAddr (подделка заголовка снаружи и с чужих адресов не
-// расходует чужой бакет).
-func clientIP(r *http.Request) string {
+// Второе возвращаемое — является ли результат IP вовсе: ложь для пира
+// unix-сокета без валидного заголовка прокси и мусорного RemoteAddr
+// (в inet не пишется).
+//
+// Unix-сокет (T-221, deploy/nginx/README.md §«Вариант unix-сокета»)
+// распознаётся положительно — по локальному адресу соединения, который
+// http.Server кладёт в контекст: у пира unix-сокета это *net.UnixAddr
+// (RemoteAddr при этом «@» автобинда или путь сокета — не IP, а путь с
+// двоеточием даже разобрался бы SplitHostPort'ом как host:port).
+// Пир unix-сокета — сам nginx на том же хосте: доверенный прокси, как и
+// loopback TCP. Адрес посетителя — X-Real-IP, затем X-Forwarded-For
+// (запас для конфигураций без X-Real-IP), только валидный net.ParseIP;
+// невалидный или отсутствующий — ключ-метка unixLocalKey без записи в
+// журнал (inet NOT NULL).
+//
+// TCP-ветка (T-124) без изменений: за reverse-proxy все соединения
+// приходят с loopback nginx — адрес посетителя несёт X-Real-IP (образец
+// nginx перезаписывает его значением $remote_addr — подделать снаружи
+// нельзя, а сам сервис слушает loopback, прямых соединений с визитором
+// нет). Заголовку доверяем только от loopback-пира и только валидному
+// IP; иначе — RemoteAddr (подделка заголовка снаружи и с чужих адресов
+// не расходует чужой бакет).
+func clientIP(r *http.Request) (string, bool) {
+	if _, ok := r.Context().Value(http.LocalAddrContextKey).(*net.UnixAddr); ok {
+		// Пир unix-сокета: доверенный прокси.
+		if pip := proxyHeaderIP(r.Header); pip != "" {
+			return pip, true
+		}
+		return unixLocalKey, false
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		if pip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); pip != nil {
+			return pip.String(), true
+		}
+	}
+	return host, net.ParseIP(host) != nil
+}
+
+// proxyHeaderIP — адрес посетителя из заголовков прокси (unix-пир):
+// X-Real-IP, затем X-Forwarded-For. XFF берётся ПОСЛЕДНЯЯ позиция — её
+// дописал наш nginx ($proxy_add_x_forwarded_for, P1-1 ревью T-221):
+// начало списка пришло от клиента и не доверено — иначе посетитель
+// слал бы каждый запрос с новым значением и обходил токен-бакет.
+// Возвращается только валидный net.ParseIP; неверный или отсутствующий
+// заголовок — "".
+func proxyHeaderIP(h http.Header) string {
+	if pip := net.ParseIP(strings.TrimSpace(h.Get("X-Real-IP"))); pip != nil {
+		return pip.String()
+	}
+	if xff := strings.TrimSpace(h.Get("X-Forwarded-For")); xff != "" {
+		last := xff[strings.LastIndex(xff, ",")+1:]
+		if pip := net.ParseIP(strings.TrimSpace(last)); pip != nil {
 			return pip.String()
 		}
 	}
-	return host
+	return ""
 }
 
 func checkWriteError(w http.ResponseWriter, code string, status int) {
