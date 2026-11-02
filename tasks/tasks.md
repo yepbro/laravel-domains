@@ -30,7 +30,7 @@
 Follow-up-задачи из ревью и находок волн 30–32, не вошедшие в их
 критерии приёмки.
 
-- **T-215** [новая] — P3, `PartOf=crawler.target` для пары
+- **T-215** [в работе] — P3, `PartOf=crawler.target` для пары
   `crawler-chromium-recycle.{service,timer}` (кандидат из ревью T-208):
   сейчас после `systemctl stop crawler.target` очередной тик таймера
   запускает остановленный chromium (задокументировано оговоркой в
