@@ -122,7 +122,7 @@ baseline `make test` + `make lint` зелёный; ревьюеры —
   посреди пачки — попытки необработанных записей не растут»;
   `make test` зелёный, `make test-integration` зелёный.
 
-- **T-223** [новая] — P2, cmd/http-worker: CompactLoop и
+- **T-223** [в работе] — P2, cmd/http-worker: CompactLoop и
   RetentionLoop не джойнятся до закрытия ресурсов: комментарий
   инварианта требует «фон = ждём в bg до defer-закрытий store/rdb»,
   но в `bg` (cap 3) пишут только три цикла (main.go:207,269,290),
