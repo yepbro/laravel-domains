@@ -167,10 +167,10 @@ func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 		// NavigateResponse — переход с ожиданием загрузки (то же ожидание,
 		// что у Navigate) плюс ответ основной навигации: chromedp отслеживает
 		// цепочку loader/request через редиректы и возвращает итоговый
-		// документ (T-064 — заголовки для правил ТЗ 5.8). У навигаций без
-		// сетевого запроса Chromium отдаёт псевдо-ответ (data: —
-		// Content-Type из URL), возможен и nil — оба случая обрабатываются
-		// ниже проверкой resp != nil.
+		// документ (T-064 — заголовки для правил ТЗ 5.8). Схема задачи —
+		// http/https (validateTaskURL выше), ответ навигации — реальный
+		// сетевой; nil (оборонительный случай) обрабатывается ниже
+		// проверкой resp != nil.
 		resp, err = chromedp.Run(tctx, chromedp.NavigateResponse(task.URL))
 	}
 	if err == nil {

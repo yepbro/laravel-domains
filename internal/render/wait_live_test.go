@@ -5,35 +5,46 @@ package render
 // CRAWLER_RENDER_TEST=1 (адрес: CRAWLER_RENDER_REMOTE_URL, затем
 // CHROMIUM_WS_URL, по умолчанию ws://172.28.100.14:9222).
 //
-//	внешней сети не требуется: страницы — data: URL; «шумная» страница
-//	порождает сетевые запросы fetch на TEST-NET (192.0.2.1, RFC 5737) —
-//	событие Network.requestWillBeSent приходит в момент инициирования
-//	запроса, ответ не нужен.
+//	Страницы — HTTP-фикстуры (liveServe в browser_live_test.go): внешней
+//	сети не требуется, «шумная» страница порождает сетевые запросы fetch
+//	на TEST-NET (192.0.2.1, RFC 5737) — событие Network.requestWillBeSent
+//	приходит в момент инициирования запроса, ответ не нужен. data:-страницы
+//	(герметичность без сервера) невозможны после R-09: validateTaskURL
+//	отвергает не-http схемы (T-216).
 
 import (
 	"context"
 	"errors"
-	"net/url"
+	"fmt"
+	"net/http"
 	"testing"
 	"time"
 )
 
-// waitLiveNoisyURL — data:-страница с фоновым трафиком: запрос каждые
-// 300 мс. Запросы на TEST-NET не отвечают (сеть тестbed их уронит или
-// молча уронит маршрутизатор) — для окна затишья важно лишь событие
-// инициирования Network.requestWillBeSent.
-func waitLiveNoisyURL() string {
-	body := `<title>noisy</title><script>setInterval(function(){fetch("http://192.0.2.1/ping").catch(function(){})},300)</script>`
-	return "data:text/html," + url.QueryEscape(body)
-}
-
-// waitLiveStuckURL — data:-страница с вечным парсер-блокирующим скриптом:
-// событие load не наступает (скрипт не finishes), а съём результата
-// (Runtime.evaluate заголовка) висит на занятом рендерере — общий таймаут
-// режет визит целиком.
-func waitLiveStuckURL() string {
-	body := `<title>stuck</title><script>for(;;);</script>`
-	return "data:text/html," + url.QueryEscape(body)
+// waitLiveServe — страницы стратегий ожидания на локальном сервере.
+// quiet — тихая страница (load и ни одного запроса после); noisy — фоновый
+// трафик: запрос каждые 300 мс на TEST-NET, ответы не приходят (сеть
+// testbed их уронит или молча уронит маршрутизатор) — для окна затишья
+// важно лишь событие инициирования Network.requestWillBeSent; stuck —
+// вечный парсер-блокирующий скрипт: событие load не наступает (скрипт не
+// завершается), а съём результата (Runtime.evaluate заголовка) висит на
+// занятом рендерере — общий таймаут режет визит целиком.
+func waitLiveServe(t *testing.T) (quiet, noisy, stuck string) {
+	t.Helper()
+	page := func(body string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprint(w, body)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/quiet", page(`<title>settle-quiet</title>hello`))
+	mux.HandleFunc("/noisy", page(`<title>noisy</title><script>`+
+		`setInterval(function(){fetch("http://192.0.2.1/ping").catch(function(){})},300)`+
+		`</script>`))
+	mux.HandleFunc("/stuck", page(`<title>stuck</title><script>for(;;);</script>`))
+	base := liveServe(t, mux)
+	return base + "/quiet", base + "/noisy", base + "/stuck"
 }
 
 func TestWaitLiveSettleQuiet(t *testing.T) {
@@ -51,7 +62,7 @@ func TestWaitLiveSettleQuiet(t *testing.T) {
 	p := NewPool(b)
 	defer p.Close()
 
-	want := dataURL("settle-quiet")
+	want, _, _ := waitLiveServe(t)
 	start := time.Now()
 	out, err := p.Run(ctx, RenderTask{URL: want})
 	elapsed := time.Since(start)
@@ -89,7 +100,7 @@ func TestWaitLiveSettleNoisy(t *testing.T) {
 	p := NewPool(b)
 	defer p.Close()
 
-	want := waitLiveNoisyURL()
+	_, want, _ := waitLiveServe(t)
 	start := time.Now()
 	out, err := p.Run(ctx, RenderTask{URL: want})
 	elapsed := time.Since(start)
@@ -124,8 +135,9 @@ func TestWaitLiveOverallTimeout(t *testing.T) {
 	p := NewPool(b)
 	defer p.Close()
 
+	_, _, stuck := waitLiveServe(t)
 	start := time.Now()
-	_, err = p.Run(ctx, RenderTask{URL: waitLiveStuckURL()})
+	_, err = p.Run(ctx, RenderTask{URL: stuck})
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("ожидана ошибка общего таймаута, получен успех")

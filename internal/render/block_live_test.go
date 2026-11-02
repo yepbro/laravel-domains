@@ -54,23 +54,6 @@ type blockLiveCounters struct {
 	trackerTrap  atomic.Int64
 }
 
-// blockLiveIPv4 — адрес этого контейнера в crawler_net для Chromium.
-func blockLiveIPv4(t *testing.T) string {
-	t.Helper()
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		t.Fatalf("InterfaceAddrs: %v", err)
-	}
-	for _, a := range addrs {
-		ipn, ok := a.(*net.IPNet)
-		if ok && !ipn.IP.IsLoopback() && ipn.IP.To4() != nil {
-			return ipn.IP.String()
-		}
-	}
-	t.Fatal("нет не-loopback IPv4: run-контейнер обязан быть в crawler_net")
-	return ""
-}
-
 // blockLiveServe — тестовая страница со счётчиками обращений: одна на оба
 // live-теста блокировки (дефолт T-062 и опция T-213). Возвращает счётчики
 // и адрес страницы; сервер живёт до конца теста (Cleanup).
@@ -197,7 +180,7 @@ probe('path-trap', '/js/google-analytics.com.js');
 		_ = srv.Close()
 		<-done
 	})
-	return c, "http://" + net.JoinHostPort(blockLiveIPv4(t), fmt.Sprint(port)) + "/page.html"
+	return c, "http://" + net.JoinHostPort(liveIPv4(t), fmt.Sprint(port)) + "/page.html"
 }
 
 // blockLiveRun — страница в сессии с данными опциями (общая обвязка

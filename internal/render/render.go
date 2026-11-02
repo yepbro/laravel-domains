@@ -76,12 +76,13 @@ type RenderOutput struct {
 	// выставленные JS (ТЗ 5.6, §11.4 п. 3): CDP читает хранилище
 	// изолированного контекста, document.cookie их не видит. Формат —
 	// единый контракт subdomain_results.cookies (T-058). Для страниц без
-	// cookie-хранилища (data:, about:) — nil.
+	// cookie-хранилища — nil.
 	Cookies []ExtractCookie
 	// ResponseHeaders — заголовки ответа основной навигации (ТЗ 5.8 —
 	// правила по заголовкам): http.Header, как у HTTP-этапа (T-058).
-	// У навигаций без сетевого запроса — псевдо-ответ Chromium (data: —
-	// Content-Type из URL) либо nil.
+	// Задачи — только http/https (validateTaskURL, R-09): у навигации
+	// есть реальный сетевой ответ; nil (ответ не получен) обрабатывается
+	// защитно в Session.Run.
 	ResponseHeaders http.Header
 }
 

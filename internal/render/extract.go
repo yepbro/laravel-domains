@@ -293,8 +293,9 @@ func newExtractCDP(domLimit int) extractCDP {
 // extractResult — финальный этап Session.Run (T-064): итоговый DOM и все
 // cookies итоговой страницы в out. DOM обязателен (без него результат не
 // нужен) и ограничен потолком Options.MaxDOMBytes (обрезка с признаком,
-// R-02); cookies снимаются по FinalURL; для схем без cookie-хранилища
-// (data:, about:) набора не существует — шаг пропускается без ошибки.
+// R-02); cookies снимаются по FinalURL; задачи — только http/https
+// (validateTaskURL, R-09), не-http итоговый URL — оборонительный случай:
+// набора cookies не существует, шаг пропускается без ошибки.
 func (e extractCDP) extractResult(ctx context.Context, out *RenderOutput) error {
 	dom, err := e.dom(ctx)
 	if err != nil {

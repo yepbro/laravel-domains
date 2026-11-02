@@ -16,7 +16,10 @@ package render
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -51,14 +54,63 @@ func liveOptions() Options {
 	}
 }
 
-// dataURL — hermetic-страница без сети (в testbed нет произвольных DNS-имён).
-func dataURL(title string) string {
-	return "data:text/html,<title>" + title + "</title>hello"
+// liveIPv4 — адрес run-контейнера в crawler_net: HTTP-фикстуры live-тестов
+// слушают 0.0.0.0, а Chromium живёт в соседнем контейнере стека — ему нужен
+// не-loopback адрес этого контейнера (первый IPv4 из net.InterfaceAddrs),
+// DNS не требуется.
+func liveIPv4(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatalf("InterfaceAddrs: %v", err)
+	}
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if ok && !ipn.IP.IsLoopback() && ipn.IP.To4() != nil {
+			return ipn.IP.String()
+		}
+	}
+	t.Fatal("нет не-loopback IPv4: run-контейнер обязан быть в crawler_net")
+	return ""
+}
+
+// liveServe — HTTP-сервер страниц-фикстур live-тестов (паттерн
+// block_live_test.go): слушает 0.0.0.0 — httptest.NewServer с 127.0.0.1 не
+// годится, Chromium из соседнего контейнера не достучится. Возвращает
+// базовый URL (http://<адрес-контейнера>:<порт>); сервер живёт до конца
+// теста (Cleanup). data:-страницы («дешёвая» герметичность ранних
+// live-тестов) невозможны после R-09: validateTaskURL отвергает не-http
+// схемы, поэтому задачи — обычные http-страницы фикстур (T-216).
+func liveServe(t *testing.T, mux *http.ServeMux) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	srv := &http.Server{Handler: mux}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+	return "http://" + net.JoinHostPort(liveIPv4(t), fmt.Sprint(ln.Addr().(*net.TCPAddr).Port))
 }
 
 func TestBrowserLivePoolRender(t *testing.T) {
 	skipUnlessLive(t)
 	ctx := context.Background()
+
+	// Фикстуры: title страницы = путь без слэша (/ok-N → «ok-N»).
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprintf(w, "<title>%s</title>hello", strings.TrimPrefix(r.URL.Path, "/"))
+	})
+	base := liveServe(t, mux)
 
 	b, err := StartBrowser(ctx, liveOptions())
 	if err != nil {
@@ -76,7 +128,7 @@ func TestBrowserLivePoolRender(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			outs[i], errs[i] = p.Run(ctx, RenderTask{URL: dataURL(fmt.Sprintf("ok-%d", i))})
+			outs[i], errs[i] = p.Run(ctx, RenderTask{URL: fmt.Sprintf("%s/ok-%d", base, i)})
 		}()
 	}
 	wg.Wait()
@@ -90,8 +142,8 @@ func TestBrowserLivePoolRender(t *testing.T) {
 		if outs[i].Title != want {
 			t.Errorf("задача %d: title %q, хочу %q", i, outs[i].Title, want)
 		}
-		if outs[i].FinalURL != dataURL(want) {
-			t.Errorf("задача %d: final URL %q, хочу %q", i, outs[i].FinalURL, dataURL(want))
+		if wantURL := fmt.Sprintf("%s/ok-%d", base, i); outs[i].FinalURL != wantURL {
+			t.Errorf("задача %d: final URL %q, хочу %q", i, outs[i].FinalURL, wantURL)
 		}
 	}
 	if got := b.Pages(); got != n {
