@@ -41,7 +41,7 @@ Follow-up-задачи из ревью и находок волн 30–32, не 
   `systemctl stop crawler.target` останавливает и таймерный рестарт не
   поднимает chromium до старта набора.
 
-- **T-216** [в работе] — P3, падающие live-тесты рендера на master:
+- **T-216** [сделана] — P3, падающие live-тесты рендера на master:
   `WaitLive`/`ExtractLiveDataURL`/`TestBrowserLivePoolRender`
   (internal/render, контур CRAWLER_RENDER_TEST=1) ломаются на `data:`
   URL — `validateTaskURL` стал отвергать их позже написания тестов
