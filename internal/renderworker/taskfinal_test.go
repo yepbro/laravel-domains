@@ -160,32 +160,41 @@ func TestRenderWorker_TaskFinalizeBoundary(t *testing.T) {
 // (без XACK → q:dead) — браузер, контекст, отмена вызывающего контекста
 // (не свойство хоста), ошибки БД/хранилища/публикации (не ошибки
 // рендера — render.Error в цепочке отсутствует), пустой результат
-// (нарушение контракта T-064 — на разбор оператору).
+// (нарушение контракта T-064 — на разбор оператору). Кейс публикации —
+// путь T-225 (Commit прошёл, Publish упал): строка записана, но задача
+// не завершена — обязана умереть ошибкой, без маркера render_failed_at.
 func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 	cases := []struct {
 		name string
 		set  func(f *rwFixture)
+		// pubAttempted — кейс сам пытается публиковать (фейк фиксирует
+		// даже неуспешную попытку): проверка «публикаций нет» не применима.
+		pubAttempted bool
 	}{
 		{"браузер", func(f *rwFixture) {
 			f.renderer.err = &render.Error{Class: render.ClassBrowser, URL: "https://spa.example/", Err: errors.New("canceled")}
-		}},
+		}, false},
 		{"контекст", func(f *rwFixture) {
 			f.renderer.err = &render.Error{Class: render.ClassContext, URL: "https://spa.example/", Err: errors.New("Session not found")}
-		}},
+		}, false},
 		{"отмена вызывающего контекста (класс task, но не свойство хоста)", func(f *rwFixture) {
 			f.renderer.err = &render.Error{Class: render.ClassTask, URL: "https://spa.example/",
 				Err: fmt.Errorf("задача отменена: %w: %w", context.Canceled, errors.New("canceled"))}
-		}},
+		}, false},
 		{"сбой БД (не ошибка рендера)", func(f *rwFixture) {
 			f.pool.queryErr = errors.New("база недоступна")
-		}},
+		}, false},
 		{"сбой хранилища (не ошибка рендера)", func(f *rwFixture) {
 			f.renderer.output = rwOutput("<html>dom</html>")
 			f.store.putErr = errors.New("диск полон")
-		}},
+		}, false},
 		{"пустой результат рендера (контракт T-064)", func(f *rwFixture) {
 			f.renderer.output = render.RenderOutput{FinalURL: "https://spa.example/x"} // DOM пуст
-		}},
+		}, false},
+		{"сбой публикации q:analyze (Commit прошёл, T-225)", func(f *rwFixture) {
+			f.renderer.output = rwOutput("<html>dom</html>")
+			f.q.publishErrs = []error{errors.New("redis недоступен")}
+		}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -203,8 +212,23 @@ func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 			if acked := f.q.ackedSnapshot(); len(acked) != 0 {
 				t.Errorf("XACK = %v — инфраструктурная ошибка не подтверждается", acked)
 			}
-			if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-				t.Errorf("публикаций быть не должно: %+v", pubs)
+			if !c.pubAttempted {
+				if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
+					t.Errorf("публикаций быть не должно: %+v", pubs)
+				}
+			}
+			if c.pubAttempted {
+				// Путь T-225: строка зафиксирована рендером (Commit до
+				// публикации), но не финализирована «без рендера» —
+				// маркера render_failed_at нет, повторная доставка
+				// перезапишет и опубликует заново.
+				row := rwRowSnapshot(f.pool, rwKey)
+				if !row.rendered {
+					t.Error("строка должна быть записана (Commit до сбоя публикации)")
+				}
+				if row.failedAt != nil {
+					t.Error("маркер render_failed_at не ставится: сбой публикации — не финализация без рендера")
+				}
 			}
 		})
 	}

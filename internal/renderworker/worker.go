@@ -653,8 +653,11 @@ func taskFinalizeReason(err error) string {
 // без ошибки, когда задачи делать нечего: строки нет, у неё нет итогового
 // URL или она ушла из-под задачи (перепроверка перезаписала — охрана
 // UPDATE) — это успех, публикация не нужна, доставка подтверждается.
-// Ошибка — сбой любого шага: доставка q:render не подтверждается и
-// вернётся повторной доставкой (Processing, T-025); повторная обработка
+// true возвращается только вместе с nil-ошибкой — запись обработана
+// целиком (DOM записан и q:analyze опубликован, T-225); каждый ошибочный
+// путь — false, ошибка. Ошибка — сбой любого шага (включая публикацию
+// после зафиксированной транзакции): доставка q:render не подтверждается
+// и вернётся повторной доставкой (Processing, T-025); повторная обработка
 // идемпотентна (перезапись, см. комментарий пакета).
 func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, error) {
 	target, found, err := w.selectTarget(ctx, task)
@@ -814,7 +817,16 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// а не переанализ — история детекции пишётся (T-118).
 	task.Fresh = true
 	if _, err := w.q.Publish(ctx, queue.StreamAnalyze, task); err != nil {
-		return true, fmt.Errorf("renderworker: %s: публикация q:analyze: %w", name, err)
+		// Строка уже зафиксирована (Commit выше), но обработка не завершена:
+		// публикация — часть задачи, поэтому false, как у всех ошибочных
+		// путей (контракт «true = запись обработана целиком и err == nil»,
+		// T-225); доставка вернётся и опубликует заново. Факт записанного
+		// DOM — Warn-логом (метрика Rendered считает только полностью
+		// завершённые задачи, сбой уйдёт в счётчик ошибок этапа в
+		// processDelivery).
+		w.opt.log().Warn("DOM записан, публикация q:analyze не удалась — повторная доставка опубликует заново",
+			"domain", name, "final_url", out.FinalURL, "err", err)
+		return false, fmt.Errorf("renderworker: %s: публикация q:analyze: %w", name, err)
 	}
 	w.opt.log().Debug("DOM записан",
 		"domain", name, "final_url", out.FinalURL, "dom_bytes", len(out.DOM),
@@ -1245,7 +1257,8 @@ dispatch:
 // остаётся настоящим инфраструктурным ошибкам.
 //
 // Успешная обработка идёт в приборы этапа (T-077): счётчик задач и
-// длительность, rendered=true при записанном DOM; ошибка — в счётчик
+// длительность, processed=true — запись обработана целиком (DOM записан
+// и q:analyze опубликован, T-225); ошибка — в счётчик
 // классов рендера (доставка вернётся повторной доставкой, ТЗ 3.4),
 // финализация без рендера — в crawler_render_tarpit_finalized_total /
 // crawler_render_cert_finalized_total /
@@ -1257,7 +1270,10 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 		return fmt.Errorf("renderworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
 	}
 	start := time.Now()
-	rendered, err := w.ProcessResult(ctx, task)
+	// processed (не «rendered»): true = запись обработана целиком,
+	// только при err == nil (T-225) — иначе расходится с метрикой
+	// Rendered() и колонкой rendered (DOM записан, публикация упала).
+	processed, err := w.ProcessResult(ctx, task)
 	if err != nil {
 		var ce *certError
 		if errors.As(err, &ce) {
@@ -1324,7 +1340,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 		return fmt.Errorf("renderworker: домен %s: замена контента: %w", task.Name, err)
 	}
 	w.met.Task(time.Since(start))
-	if rendered {
+	if processed {
 		w.met.Rendered()
 	}
 	return nil

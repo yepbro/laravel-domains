@@ -1378,8 +1378,10 @@ func TestRenderWorker_CommitError(t *testing.T) {
 }
 
 // TestRenderWorker_PublishError — сбой публикации q:analyze при
-// зафиксированной строке: written=true + ошибка — доставка вернётся
-// повторной доставкой и опубликует заново (at-least-once, ТЗ 3.4).
+// зафиксированной строке: written=false + ошибка — публикация часть
+// задачи, запись не обработана целиком (контракт T-225); доставка
+// вернётся повторной доставкой и опубликует заново (at-least-once,
+// ТЗ 3.4). Факт записанного DOM виден по строке (Commit до публикации).
 func TestRenderWorker_PublishError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1391,11 +1393,88 @@ func TestRenderWorker_PublishError(t *testing.T) {
 	if err == nil {
 		t.Fatal("ошибка публикации обязана возвращаться")
 	}
-	if !written {
-		t.Error("written должен быть true — строка зафиксирована до публикации")
+	if written {
+		t.Error("written должен быть false — публикация не состоялась, запись не обработана целиком (T-225)")
 	}
 	if !rwRowSnapshot(f.pool, rwKey).rendered {
 		t.Error("строка записана (Commit до публикации)")
+	}
+}
+
+// TestProcessResult_WrittenContract — контракт ProcessResult (T-225):
+// true возвращается только вместе с nil-ошибкой — запись обработана
+// целиком (DOM записан и q:analyze опубликован); каждый ошибочный путь —
+// false + ошибка (доставка вернётся повторной доставкой). Штатный отказ
+// (строки нет) — false без ошибки: обрабатывать нечего.
+func TestProcessResult_WrittenContract(t *testing.T) {
+	raw := rwTestHash(1)
+	seed := func(f *rwFixture) {
+		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+		f.renderer.output = rwOutput("<html>dom</html>")
+	}
+	cases := []struct {
+		name    string
+		setup   func(f *rwFixture)
+		wantOK  bool
+		wantErr bool
+	}{
+		{"сбой чтения строки", func(f *rwFixture) {
+			f.pool.queryErr = errors.New("база недоступна")
+		}, false, true},
+		{"ошибка рендера", func(f *rwFixture) {
+			seed(f)
+			f.renderer.err = errors.New("страница не загрузилась")
+		}, false, true},
+		{"пустой результат рендера", func(f *rwFixture) {
+			seed(f)
+			f.renderer.output = render.RenderOutput{FinalURL: "https://spa.example/"}
+		}, false, true},
+		{"сбой сохранения DOM", func(f *rwFixture) {
+			seed(f)
+			f.store.putErr = errors.New("хранилище переполнено")
+		}, false, true},
+		{"сбой транзакции", func(f *rwFixture) {
+			seed(f)
+			f.pool.beginErr = errors.New("пул соединений исчерпан")
+		}, false, true},
+		{"сбой UPDATE строки", func(f *rwFixture) {
+			seed(f)
+			f.pool.updateErr = errors.New("serialize failure")
+		}, false, true},
+		{"сбой фиксации", func(f *rwFixture) {
+			seed(f)
+			f.pool.commitErr = errors.New("сервер закрыл соединение")
+		}, false, true},
+		{"сбой корзины rendered-темпа", func(f *rwFixture) {
+			seed(f)
+			f.pool.bumpErr = errors.New("счётчики недоступны")
+		}, false, true},
+		{"расхождение учёта ссылок", func(f *rwFixture) {
+			seed(f)
+			f.pool.refc[raw] = 0
+		}, false, true},
+		{"сбой публикации q:analyze", func(f *rwFixture) {
+			seed(f)
+			f.q.publishErrs = []error{errors.New("redis недоступен")}
+		}, false, true},
+		{"успех", seed, true, false},
+		{"штатный отказ — строки нет", func(f *rwFixture) {}, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newRWFixture(t)
+			c.setup(f)
+			written, err := f.w.ProcessResult(context.Background(), rwTask)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("ошибка = %v, wantErr = %v", err, c.wantErr)
+			}
+			if written != c.wantOK {
+				t.Errorf("written = %v, want %v", written, c.wantOK)
+			}
+			if written && err != nil {
+				t.Errorf("written=true при ошибке %v — контракт «true только при err == nil» нарушен", err)
+			}
+		})
 	}
 }
 
