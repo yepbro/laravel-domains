@@ -4,6 +4,13 @@
 // 4 запроса/мин на IP — in-memory token bucket (один инстанс сервиса,
 // stdlib; фиксированное решение этапа 13 — как троттлинг larasites).
 // Результат пишется в web_checks (T-120) — кто/что/когда проверял.
+//
+// Ресурсы живой проверки (T-220): конвейер работает на долгоживущем
+// контуре checker.Runtime (одна цепь резолверов с малым пулом UDP,
+// общий Fetcher с общими лимитами, кэш правил, один render.Manager —
+// собирается лениво первой проверкой, web.New/liveFunc), а потолок
+// одновременных конвейеров держит семафор web.live_concurrency:
+// перегруз — быстрый 503 с Retry-After, не очередь до web.timeout.
 package web
 
 import (
@@ -20,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"crawler/internal/checker"
 	"crawler/internal/idn"
 )
 
@@ -89,10 +97,17 @@ type signalJSON struct {
 	Evidence string  `json:"evidence"`
 }
 
+// errLiveOverloaded — семафор одновременных живых проверок полон (T-220):
+// быстрый 503 с Retry-After вместо ожидания слота до web.timeout.
+var errLiveOverloaded = errors.New("живая проверка перегружена")
+
 // handleCheckDomainLive — T-123: валидация → stored → live (timeout
-// web.timeout) → запись web_checks → JSON. Ошибки: 422 (валидация,
-// формат по образцу landing.js), 429 (рейт-лимит, +Retry-After), 502
-// (живая проверка не удалась инфраструктурно).
+// web.timeout, семафор web.live_concurrency) → запись web_checks → JSON.
+// Ошибки: 422 (валидация, формат по образцу landing.js), 429 (рейт-лимит,
+// +Retry-After), 503 (перегрузка живых проверок, +Retry-After — всем
+// клиентам: 200 с found=false выглядел бы «Laravel не найден» для домена
+// со stored-данными, а stored-часть landing.js не показывает), 502
+// (живая проверка не удалась инфраструктурно и домен конвейеру неизвестен).
 func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
 	if !s.limiter.allow(ip, time.Now()) {
@@ -121,10 +136,34 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 		resp.Stored = st
 	}
 
-	// (2) live: полный конвейер с потолком web.timeout.
-	liveCtx, cancel := context.WithTimeout(r.Context(), s.cfg.Web.Timeout.D())
-	live, liveErr := s.liveCheck(liveCtx, s.cfg, checkerDB{s.db}, normalized, s.opt.Log)
-	cancel()
+	// (2) live: полный конвейер с потолком web.timeout под семафором
+	// одновременных проверок (T-220): конвейер держит сеть/память,
+	// перегруз отвечает быстро (503 с Retry-After), а не копит очередь
+	// до таймаута. Сам конвейер работает на общем долгоживущем контуре
+	// checker.Runtime — одна цепь резолверов, общий Fetcher, кэш
+	// правил, один render.Manager на сервис.
+	var (
+		live    *checker.Result
+		liveErr error
+	)
+	select {
+	case s.liveSem <- struct{}{}:
+		func() {
+			defer func() { <-s.liveSem }()
+			fn, err := s.liveFunc()
+			if err != nil {
+				liveErr = err
+				return
+			}
+			liveCtx, cancel := context.WithTimeout(r.Context(), s.cfg.Web.Timeout.D())
+			defer cancel()
+			live, liveErr = fn(liveCtx, s.cfg, checkerDB{s.db}, normalized, s.opt.Log)
+		}()
+	default:
+		liveErr = errLiveOverloaded
+		s.opt.Log.Warn("форма: живая проверка перегружена", "domain", normalized,
+			"limit", cap(s.liveSem))
+	}
 
 	if liveErr == nil {
 		resp.Found = live.Found
@@ -161,13 +200,28 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 	// пометкой; полностью пустой итог без stored — 502.
 
 	// (3) журнал web_checks (T-120): best-effort — отказ записи не
-	// ломает ответ посетителю.
-	s.recordCheck(r.Context(), normalized, resp.Found, resp.Score, resp.DurationMS, ip)
+	// ломает ответ посетителю. Перегрузка не журналируется: проверки
+	// не было, строка found=false/score=0 портила бы аудит и добавляла
+	// INSERT в БД на пути «быстрого» 503.
+	if !errors.Is(liveErr, errLiveOverloaded) {
+		s.recordCheck(r.Context(), normalized, resp.Found, resp.Score, resp.DurationMS, ip)
+	}
 
-	if liveErr != nil && resp.Stored == nil {
-		s.opt.Log.Warn("форма: живая проверка не удалась", "domain", normalized, "err", liveErr)
-		http.Error(w, `{"error":"check_failed"}`, http.StatusBadGateway)
-		return
+	if liveErr != nil {
+		if errors.Is(liveErr, errLiveOverloaded) {
+			// Перегруз — быстрый отказ всем клиентам с подсказкой
+			// повтора: независимо от stored-части (landing.js её не
+			// показывает, 200 с found=false читался бы как «Laravel
+			// не найден»).
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, `{"error":"busy"}`, http.StatusServiceUnavailable)
+			return
+		}
+		if resp.Stored == nil {
+			s.opt.Log.Warn("форма: живая проверка не удалась", "domain", normalized, "err", liveErr)
+			http.Error(w, `{"error":"check_failed"}`, http.StatusBadGateway)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(resp)

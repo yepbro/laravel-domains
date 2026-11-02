@@ -615,6 +615,13 @@ type Web struct {
 	// одного имени (DNS → HTTP → рендер SPA → анализ), ответ посетителю
 	// не позже потолка.
 	Timeout Duration `yaml:"timeout"`
+	// LiveConcurrency — потолок одновременных живых проверок формы
+	// (T-220): семафор до запуска конвейера — избыток получает быстрый
+	// 503 с Retry-After, а не ждёт слота до web.timeout. Конвейер
+	// работает на общем долгоживущем контуре (одна цепь резолверов,
+	// общий Fetcher, один render.Manager), параллелизм ограничивает
+	// память проверок (тела страниц, рендер) в бюджете юнита.
+	LiveConcurrency int `yaml:"live_concurrency"`
 }
 
 // Log — уровень логирования сервисов (каркас internal/service). Расширение
@@ -974,6 +981,12 @@ func Default() *Config {
 			// (render.timeout 25 с) + анализ (мгновения) — 60 с покрывает
 			// худший случай без вечного ожидания посетителя.
 			Timeout: Duration(60 * time.Second),
+			// Ресурсный потолок формы (T-220): конвейеры на общем
+			// долгоживущем контуре, но каждая живая проверка держит тела
+			// страниц и рендер SPA — параллелизм выше единиц упирается в
+			// MemoryMax 256M юнита. 4 — как rate_limit: редкий посетитель
+			// не ждёт слота, всплеск интереса разряжается 503.
+			LiveConcurrency: 4,
 		},
 		Dashboard: Dashboard{
 			// Loopback: публикация наружу — reverse-proxy с TLS
@@ -1637,6 +1650,12 @@ func (c *Config) Validate() error {
 	// абсурда, не от эксплуатации.
 	if !inRange(c.Web.RateLimit, 1, 1000) {
 		problems = append(problems, rangeMsg("web.rate_limit", c.Web.RateLimit, 1, 1000)+" (проверок формы в минуту на IP)")
+	}
+	// Семафор одновременных живых проверок (T-220): минимум 1 — форма
+	// работает; потолок 64 — далеко за ресурсный бюджет юнита (MemoryMax
+	// 256M), практические значения — единицы.
+	if !inRange(c.Web.LiveConcurrency, 1, 64) {
+		problems = append(problems, rangeMsg("web.live_concurrency", c.Web.LiveConcurrency, 1, 64)+" (одновременных живых проверок)")
 	}
 	if c.Web.Timeout <= 0 || c.Web.Timeout > Duration(10*time.Minute) {
 		problems = append(problems, fmt.Sprintf("web.timeout: ожидается %s..%s, задано %s",

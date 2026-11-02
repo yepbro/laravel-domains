@@ -1052,7 +1052,12 @@ count-up, облако зон топ-50 с лог-масштабом и колл
 находки с бейджами субдоменов и диапазоном версий, контакты/Telegram;
 SEO canonical/hreflang/OG/Twitter, счётчик Яндекс.Метрики), данные —
 кэши T-120 + laravel_history («находки за 24 ч», T-118), `POST
-/api/check-domain` — живая проверка из формы (T-123), `GET /healthz` —
+/api/check-domain` — живая проверка из формы (T-123; конвейер — на
+долгоживущем контуре `checker.Runtime`, T-220: одна цепь резолверов
+с малым пулом UDP, общий Fetcher, кэш правил, один render.Manager —
+собирается первой проверкой, закрывается на остановке сервиса;
+одновременные проверки ограничены `web.live_concurrency`, перегруз —
+быстрый 503 с `Retry-After`), `GET /healthz` —
 readiness ping PostgreSQL (503), `GET /robots.txt` и
 `GET /sitemap.xml` — служебные файлы поисковых роботов (T-124:
 robots — статика из embed, sitemap — минимальный набор локалей,
@@ -1069,8 +1074,8 @@ CSS лендинга — Tailwind v4 без node: исходник
 build-стадии до `go build` — go:embed встраивает настоящий CSS) или
 `make web-css` для dev-просмотра (одноразовый docker run).
 
-Конфигурация — секция `web` (`listen`/`rate_limit`/`timeout`,
-[`configuration.md`](configuration.md)). Развёртывание (T-124):
+Конфигурация — секция `web` (`listen`/`rate_limit`/`timeout`/
+`live_concurrency`, [`configuration.md`](configuration.md)). Развёртывание (T-124):
 dev — compose-сервис `web` профиля app (порт лендинга публикуется на
 `127.0.0.1` хоста, `WEB_PORT`); бой — юнит `crawler-web.service`
 (docs/deploy.md) за reverse-proxy с TLS (первый образец —

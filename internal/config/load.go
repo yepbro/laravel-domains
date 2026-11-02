@@ -195,6 +195,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_MONITOR_ALERTS_RENDER_DEBT_PASSES", setInt(func(c *Config) *int { return &c.Monitor.Alerts.RenderDebtPasses })},
 		{"CRAWLER_WEB_LISTEN", setString(func(c *Config) *string { return &c.Web.Listen })},
 		{"CRAWLER_WEB_RATE_LIMIT", setInt(func(c *Config) *int { return &c.Web.RateLimit })},
+		{"CRAWLER_WEB_LIVE_CONCURRENCY", setInt(func(c *Config) *int { return &c.Web.LiveConcurrency })},
 		{"CRAWLER_WEB_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Web.Timeout })},
 		{"CRAWLER_DASHBOARD_LISTEN", setString(func(c *Config) *string { return &c.Dashboard.Listen })},
 		{"CRAWLER_DASHBOARD_REFRESH_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Dashboard.Refresh })},

@@ -40,6 +40,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -85,10 +86,22 @@ type Server struct {
 	tpl     *template.Template
 	cfg     *config.Config
 	limiter *tokenBucketLimiter
+	// liveSem — семафор одновременных живых проверок (T-220): конвейер
+	// держит сеть/память (запросы обоих схем с телами страниц, рендер
+	// SPA); избыток — быстрый отказ 503 с Retry-After, а не очередь до
+	// web.timeout. Размер — web.live_concurrency.
+	liveSem chan struct{}
 
-	// liveCheck — шов живой проверки (T-123): production — checker.Run;
+	// liveCheck — шов живой проверки (T-123): nil — продакшн-путь через
+	// лениво собранный контур checker.Runtime (T-220, один на сервис);
 	// тесты подменяют фейком без сети (в стиле ContentGetter воркеров).
 	liveCheck checker.LiveFunc
+
+	// liveMu охраняет ленивую сборку контура, его закрытие и lifeCtx.
+	liveMu      sync.Mutex
+	liveCircuit checker.LiveCircuit
+	liveClosed  bool            // контур закрыт навсегда (выход Run) — сборки больше нет
+	lifeCtx     context.Context // контекст жизни контура (ставится в Run)
 }
 
 // landingVM — данные рендера лендинга: локаль, список локалей,
@@ -121,8 +134,12 @@ func (v landingVM) ToJSON(s string) template.HTML {
 
 // New собирает сервер: db — пул БД (ping + данные страницы + журнал
 // формы). cfg — конфигурация секции web (рейт-лимит, timeout живой
-// проверки, T-123). Шаблон парсится один раз: локаль приходит данными
-// (landingVM), словарь — метод рендера.
+// проверки, потолок одновременных живых проверок, T-123/T-220).
+// Шаблон парсится один раз: локаль приходит данными
+// (landingVM), словарь — метод рендера. Контур живой проверки
+// (checker.Runtime) New не собирает — он создаётся лениво первой
+// live-проверкой (liveFunc) и живёт до остановки сервиса (Run →
+// closeLive), ошибки сборки не мешают остальным страницам.
 func New(db DB, cfg *config.Config, opts Options) (*Server, error) {
 	if db == nil {
 		return nil, errors.New("web: пул БД не задан (postgres.dsn обязателен)")
@@ -137,14 +154,80 @@ func New(db DB, cfg *config.Config, opts Options) (*Server, error) {
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
+	live := cfg.Web.LiveConcurrency
+	if live < 1 {
+		live = 1 // конфиг без Default/Validate: минимум один слот
+	}
 	return &Server{
-		db:        db,
-		opt:       opts,
-		tpl:       tpl,
-		cfg:       cfg,
-		limiter:   newLimiter(cfg.Web.RateLimit, time.Minute),
-		liveCheck: checker.Run,
+		db:      db,
+		opt:     opts,
+		tpl:     tpl,
+		cfg:     cfg,
+		limiter: newLimiter(cfg.Web.RateLimit, time.Minute),
+		liveSem: make(chan struct{}, live),
 	}, nil
+}
+
+// newLiveCircuit — шов сборки контура живой проверки (T-220): продакшн —
+// checker.NewRuntime (одна цепь резолверов с малым пулом UDP, общий
+// Fetcher, кэш правил с перезагрузкой, один render.Manager); тесты web
+// подменяют, проверяя «контур один на сервис» без сети.
+var newLiveCircuit = func(ctx context.Context, cfg *config.Config, log checker.Logger) (checker.LiveCircuit, error) {
+	return checker.NewRuntime(ctx, cfg, log, checker.RuntimeOptions{})
+}
+
+// errLiveStopped — контур живой проверки закрыт навсегда (выход Run,
+// сервис останавливается): запросы больше не собирают новый контур.
+var errLiveStopped = errors.New("живая проверка остановлена: сервис завершается")
+
+// liveFunc возвращает LiveFunc живой проверки: подменённый шов liveCheck
+// (тесты) либо Run лениво собранного контура. Контур создаётся при
+// первой live-проверке и переиспользуется до остановки сервиса;
+// неудачная сборка не запоминается — следующий запрос пробует снова
+// (правила/сокеты могут появиться), ошибка уходит в семантику сбоя
+// живой проверки (502/stored-only, как отказ конвейера). После
+// closeLive сборки нет (P3-2 ревью T-220): Run уже вернулся, новый
+// контур никто не закрыл бы.
+func (s *Server) liveFunc() (checker.LiveFunc, error) {
+	if s.liveCheck != nil {
+		return s.liveCheck, nil
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	if s.liveClosed {
+		return nil, errLiveStopped
+	}
+	if s.liveCircuit != nil {
+		return s.liveCircuit.Run, nil
+	}
+	life := s.lifeCtx
+	if life == nil {
+		// Handler без Run — прямой юнит-вызов; продакшн-путь всегда
+		// через Run (lifeCtx выставлен до первого запроса).
+		life = context.Background()
+	}
+	c, err := newLiveCircuit(life, s.cfg, s.opt.Log)
+	if err != nil {
+		return nil, err
+	}
+	s.liveCircuit = c
+	return c.Run, nil
+}
+
+// closeLive останавливает контур живой проверки (выход Run — остановка
+// сервиса): пулы UDP цепи, рендер, перезагрузка правил. Идемпотентна;
+// параллельная сборка исключена мьютексом liveMu, после закрытия
+// новые контуры не собираются (liveClosed).
+func (s *Server) closeLive() {
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	s.liveClosed = true
+	if s.liveCircuit == nil {
+		return
+	}
+	c := s.liveCircuit
+	s.liveCircuit = nil
+	_ = c.Close()
 }
 
 //go:embed templates
@@ -174,7 +257,10 @@ func (s *Server) Handler() http.Handler {
 
 // Run — жизненный цикл: слушатель web.listen, graceful stop по отмене
 // ctx (бюджет остановки каркаса — 10 с: Shutdown с меньшим окном,
-// начатые ответы дорабатывают). Вызывается из OnRun cmd/web.
+// начатые ответы дорабатывают). Вызывается из OnRun cmd/web. Здесь же
+// живёт контекст жизни контура живой проверки (T-220): контур получает
+// его при ленивой сборке, а на выходе Run закрывается (closeLive —
+// сокеты цепи резолверов, рендер, перезагрузка правил).
 //
 // Адрес — [host]:port (TCP) или абсолютный путь (unix-сокет — вариант
 // деплоя за nginx без занятия TCP-порта, T-124; валидация конфига
@@ -183,6 +269,10 @@ func (s *Server) Handler() http.Handler {
 // по Restart=on-failure циклился бы на address already in use до
 // StartLimitBurst; удаляется и после штатной остановки.
 func (s *Server) Run(ctx context.Context, listen string) error {
+	s.liveMu.Lock()
+	s.lifeCtx = ctx
+	s.liveMu.Unlock()
+	defer s.closeLive()
 	network := "tcp"
 	if strings.HasPrefix(listen, "/") {
 		network = "unix"

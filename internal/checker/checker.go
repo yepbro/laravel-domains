@@ -11,7 +11,6 @@ package checker
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -21,7 +20,6 @@ import (
 	"crawler/internal/config"
 	"crawler/internal/content"
 	"crawler/internal/db"
-	"crawler/internal/dnsclient"
 	"crawler/internal/dnsworker"
 	"crawler/internal/httpfetch"
 	"crawler/internal/httpworker"
@@ -76,18 +74,30 @@ type Logger interface {
 }
 
 // LiveFunc — шов конвейера для потребителей (форма лендинга T-123
-// подменяет в тестах без сети).
+// подменяет в тестах без сети; продакшн-реализация — метод Run
+// долгоживущего контура Runtime, T-220, и одноразовая функция Run для
+// CLI).
 type LiveFunc func(ctx context.Context, cfg *config.Config, pool Pool, domain string, log Logger) (*Result, error)
 
 // Pool — зависимость конвейера: справочник subdomains (db.DB).
 type Pool = db.DB
 
-// Run выполняет полный конвейер одного имени. pool используется только
-// чтением справочника subdomains (LoadSubdomains). Ошибки сети/анализа
-// не возвращаются как отказ проверки — они отражаются в записях
+// Run выполняет полный конвейер одного имени на готовом контуре (T-220):
+// метод совпадает с LiveFunc по сигнатуре — web передаёт его от контура,
+// собранного на время жизни сервиса; cfg-параметр игнорируется (контур
+// собран из своей конфигурации при NewRuntime, включая порог
+// analyzer.laravel_min_score). pool используется только чтением
+// справочника subdomains (LoadSubdomains). Ошибки сети/анализа не
+// возвращаются как отказ проверки — они отражаются в записях
 // (Status/Signals); возврат ошибки — только инфраструктурные сбои
-// (резолвер, правила, БД справочника, отмена ctx).
-func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log Logger) (*Result, error) {
+// (БД справочника, отмена ctx). Одноразовый вызов без своего контура —
+// свободная функция Run (CLI).
+func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain string, log Logger) (*Result, error) {
+	if log == nil {
+		// NewRuntime допускает nil-логгер — конвейер не должен
+		// паниковать на Warn (P3-1 ревью T-220).
+		log = rt.log
+	}
 	start := time.Now()
 	norm, err := idn.Normalize(domain)
 	if err != nil {
@@ -101,18 +111,9 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 	}
 
 	// DNS-этап как библиотека: цепь ручной проверки (resolve.go) под
-	// лимитами T-035 — лимит параллелизма и токен QPS берутся один раз
-	// на весь проход цепи (как LimitResolver(FallbackResolver(…)) у
-	// dns-worker).
-	chain, closeChain, err := newResolverChain(ctx, cfg.DNS)
-	if err != nil {
-		return nil, fmt.Errorf("checker: %w", err)
-	}
-	defer func() { _ = closeChain() }()
-	resolve, err := dnsclient.NewLimitResolver(chain, dnsclient.NewLimitOptions(cfg.DNS))
-	if err != nil {
-		return nil, fmt.Errorf("checker: %w", err)
-	}
+	// лимитами T-035 — цепь и лимитёр собраны на контуре один раз
+	// (NewRuntime), здесь только сам проход.
+	resolve := rt.resolve
 
 	dnsStart := time.Now()
 	apex, err := dnsworker.CheckApex(ctx, resolve, norm.ASCII)
@@ -128,7 +129,7 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 		return res, nil
 	}
 
-	rep, err := dnsworker.CheckSubdomains(ctx, resolve, norm.ASCII, subs, cfg.DNS.IPv6)
+	rep, err := dnsworker.CheckSubdomains(ctx, resolve, norm.ASCII, subs, rt.cfg.DNS.IPv6)
 	if err != nil {
 		return nil, fmt.Errorf("checker: %s: субдомены: %w", norm.ASCII, err)
 	}
@@ -152,13 +153,9 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 	}
 	res.DNSMS = time.Since(dnsStart).Milliseconds()
 
-	// Транспорт как у боевого http-worker (T-049/T-050/T-047).
-	opts := httpfetch.NewOptions(cfg.HTTP)
-	opts.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	opts.Resolver = httpfetch.NewCachingResolver(
-		httpworker.NewDNSLookup(resolve, cfg.DNS.IPv6), httpfetch.CacheOptions{})
-	fetcher := httpfetch.NewFetcher(opts)
-	defer fetcher.CloseIdleConnections()
+	// Транспорт как у боевого http-worker (T-049/T-050/T-047) — один на
+	// контур (NewRuntime) с общими limitState; здесь только сам проход.
+	fetcher := rt.fetcher
 
 	// Живой проверке некуда (и незачем) писать боевой контент: воркер
 	// с T-147 сохраняет тела ранним Put и требует ContentStore — одноразовое
@@ -166,7 +163,7 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 	// хэшу записи (render для SPA подменит HTML своим DOM ниже).
 	mem := newCheckerStore()
 	worker, err := httpworker.New(httpworker.ChainFetch(fetcher), httpworker.Options{
-		MaxRedirects: cfg.HTTP.MaxRedirects,
+		MaxRedirects: rt.cfg.HTTP.MaxRedirects,
 		Store:        mem,
 	})
 	if err != nil {
@@ -179,23 +176,22 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 		return nil, fmt.Errorf("checker: %s: HTTP: %w", norm.ASCII, err)
 	}
 
-	// Рендер SPA — внешний CDP-браузер (render.remote_url); не настроен
-	// или недоступен — анализ по исходному HTML.
-	var renderer *render.Manager
-	if cfg.Render.RemoteURL != "" {
-		renderer = render.NewManager(ctx, render.NewOptions(*cfg))
-		if err := renderer.Start(); err != nil {
-			log.Warn("checker: рендер недоступен — SPA по исходному HTML", "err", err)
-			renderer = nil
-		} else {
-			defer renderer.Close()
-		}
-	}
+	// Рендер SPA — внешний CDP-браузер (render.remote_url); менеджер
+	// собран на контуре, поколение браузера поднимается лениво первым
+	// рендером (недоступный Chromium — анализ по исходному HTML, как и
+	// при ошибке рендера записи). Первый отказ класса «браузер» гасит
+	// рендер до конца этой проверки (аналог renderer=nil одноразового
+	// Run до T-220): повторные попытки на общем менеджере стартуют
+	// поколение под его мьютексом и платят Dial+SessionStart таймауты
+	// на каждой SPA-записи (P2-3 ревью T-220), следующая проверка
+	// попробует снова.
+	renderer := rt.renderer
+	renderDown := false
 
-	set, err := rules.LoadDir(cfg.Analyzer.RulesDir)
-	if err != nil {
-		return nil, fmt.Errorf("checker: %w", err)
-	}
+	// Снапшот правил — из Reloader контура: набор читается один раз на
+	// сборке и актуализируется фоновой перезагрузкой, а не с диска на
+	// каждый запрос (T-220).
+	set := rt.rules.Set()
 
 	for i := range dom.Subdomains {
 		sub := &dom.Subdomains[i]
@@ -235,7 +231,7 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 				Cookies: ruleCookies(rec.Cookies),
 				Headers: map[string][]string(rec.Header),
 			}
-			if rec.SPA != nil && rec.SPA.SPA && renderer != nil {
+			if rec.SPA != nil && rec.SPA.SPA && renderer != nil && !renderDown {
 				if ro, rerr := renderer.Run(ctx, render.RenderTask{URL: rec.FinalURL}); rerr == nil {
 					page.HTML = []byte(ro.DOM)
 					for _, c := range ro.Cookies {
@@ -243,13 +239,16 @@ func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log 
 					}
 					page.Headers = map[string][]string(ro.ResponseHeaders)
 					sr.Rendered = true
+				} else if render.ClassOf(rerr) == render.ClassBrowser {
+					log.Warn("checker: рендер недоступен — SPA по исходному HTML до конца проверки", "err", rerr)
+					renderDown = true
 				}
 			}
 			eval := set.EvaluateCtx(ctx, page, rules.Limits{})
 			sr.Signals = eval.Signals
 			sr.Score = eval.Score
 			sr.VerMin, sr.VerMax = eval.VerMin, eval.VerMax
-			if eval.IsLaravel(cfg.Analyzer.LaravelMinScore) {
+			if eval.IsLaravel(rt.cfg.Analyzer.LaravelMinScore) {
 				sr.Score = eval.Score
 				if eval.Score > res.Score {
 					res.Score = eval.Score

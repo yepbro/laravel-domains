@@ -92,11 +92,18 @@ func (t escalateTarget) desc(v any) string {
 
 // newResolverChain собирает цепь для живой проверки: основной клиент
 // (dns.resolvers[0] — локальный unbound) плюс по клиенту на каждый
-// dns.fallback_resolvers. Пустой список резервов вырождается в единственный
-// основной клиент — поведение до цепи (T-119). Возвращаемый close закрывает
-// все клиенты цепи (один вызов, ошибки объединены).
-func newResolverChain(ctx context.Context, cfg config.DNS) (dnsclient.Resolver, func() error, error) {
+// dns.fallback_resolvers. udpPoolSize — размер пула UDP-сокетов каждого
+// клиента (0 — udp_pool_size секции dns, массовый конвейер): долгоживущий
+// контур формы (T-220) передаёт малый LiveUDPPoolSize — параллелизм живой
+// проверки ограничен семафором web, фонд сокетов боевого размера не нужен.
+// Пустой список резервов вырождается в единственный основной клиент —
+// поведение до цепи (T-119). Возвращаемый close закрывает все клиенты
+// цепи (один вызов, ошибки объединены).
+func newResolverChain(ctx context.Context, cfg config.DNS, udpPoolSize int) (dnsclient.Resolver, func() error, error) {
 	primaryOpts := dnsclient.NewOptions(cfg)
+	if udpPoolSize > 0 {
+		primaryOpts.UDPPoolSize = udpPoolSize
+	}
 	primary, err := dnsclient.NewClient(ctx, primaryOpts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("checker: основной резолвер %s: %w", primaryOpts.Addr, err)
@@ -115,6 +122,9 @@ func newResolverChain(ctx context.Context, cfg config.DNS) (dnsclient.Resolver, 
 	for _, addr := range cfg.FallbackResolvers {
 		opts := dnsclient.NewOptions(cfg)
 		opts.Addr = addr
+		if udpPoolSize > 0 {
+			opts.UDPPoolSize = udpPoolSize
+		}
 		c, err := dnsclient.NewClient(ctx, opts)
 		if err != nil {
 			_ = closeAll()
