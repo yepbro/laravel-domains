@@ -193,7 +193,7 @@ func TestBlockPatterns(t *testing.T) {
 		"block_stylesheet (T-213)": blockTypes(true),
 	} {
 		t.Run(name, func(t *testing.T) {
-			patterns := blockPatterns(types, false)
+			patterns := blockPatterns(types, false, false)
 			if len(patterns) != len(types) {
 				t.Fatalf("паттернов %d, хочу %d (по числу блокируемых типов)",
 					len(patterns), len(types))
@@ -227,7 +227,7 @@ func TestBlockPatterns(t *testing.T) {
 // (аналитика ходит любыми типами), стадия Request; при выключенной —
 // доменных паттернов нет вовсе.
 func TestBlockPatternsTrackers(t *testing.T) {
-	on := blockPatterns(blockTypes(false), true)
+	on := blockPatterns(blockTypes(false), true, false)
 	urlPatterns := make(map[string]bool)
 	typePatterns := 0
 	for _, p := range on {
@@ -264,7 +264,7 @@ func TestBlockPatternsTrackers(t *testing.T) {
 		"block_stylesheet (T-213)": blockTypes(true),
 	} {
 		t.Run("выключено: "+name, func(t *testing.T) {
-			off := blockPatterns(types, false)
+			off := blockPatterns(types, false, false)
 			if len(off) != len(types) {
 				t.Fatalf("паттернов %d, хочу %d (только типы)",
 					len(off), len(types))
@@ -275,6 +275,128 @@ func TestBlockPatternsTrackers(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestBlockPatternsInternal — паттерн-«всё» SSRF-контура (T-219): при
+// включённом http.block_internal_addrs Fetch.enable получает ровно один
+// дополнительный паттерн без типа и URL (приостанавливает каждый запрос
+// сессии — Document, Script, XHR, WebSocket), стадия Request; при
+// выключенном флаге паттерна нет вовсе.
+func TestBlockPatternsInternal(t *testing.T) {
+	on := blockPatterns(blockTypes(false), false, true)
+	if len(on) != len(blockTypes(false))+1 {
+		t.Fatalf("паттернов %d, хочу %d+1 (типы + «всё»)", len(on), len(blockTypes(false)))
+	}
+	catchAll := 0
+	for _, p := range on {
+		if p.URLPattern == "*" {
+			catchAll++
+			if p.ResourceType != "" {
+				t.Errorf("паттерн-«всё» с типом %s — типом контур не ловится", p.ResourceType)
+			}
+			if p.RequestStage != fetch.RequestStageRequest {
+				t.Errorf("стадия паттерна-«всё»: %s, хочу Request", p.RequestStage)
+			}
+		}
+	}
+	if catchAll != 1 {
+		t.Errorf("паттернов-«всё» %d, хочу 1", catchAll)
+	}
+
+	off := blockPatterns(blockTypes(false), false, false)
+	for _, p := range off {
+		if p.URLPattern == "*" {
+			t.Errorf("при выключенном контуре есть паттерн-«всё»: %+v", p)
+		}
+	}
+}
+
+// TestBlockRespondInternal — SSRF-контур (T-219): при включённом флаге
+// запрос любого типа на внутренний хост (loopback, RFC1918, cloud
+// metadata, IPv4-в-IPv6, loopback-имя, числоподобная форма) —
+// failRequest(BlockedByClient); внешний хост и событие без request —
+// continueRequest; при выключенном флаге внутренний хост проходит.
+func TestBlockRespondInternal(t *testing.T) {
+	on := blockRulesOf(Options{BlockInternalAddrs: true})
+	for _, tc := range []struct {
+		name string
+		ev   fetch.EventRequestPaused
+		fail bool
+	}{
+		{"Document→127.0.0.1 fail", fetch.EventRequestPaused{
+			RequestID: "doc-1", ResourceType: network.ResourceTypeDocument,
+			Request: &network.Request{URL: "http://127.0.0.1/admin"},
+		}, true},
+		{"Document→169.254.169.254 fail", fetch.EventRequestPaused{
+			RequestID: "doc-2", ResourceType: network.ResourceTypeDocument,
+			Request: &network.Request{URL: "http://169.254.169.254/latest/meta-data/"},
+		}, true},
+		{"Document→[::ffff:169.254.169.254] fail", fetch.EventRequestPaused{
+			RequestID: "doc-3", ResourceType: network.ResourceTypeDocument,
+			Request: &network.Request{URL: "http://[::ffff:169.254.169.254]/latest/meta-data/"},
+		}, true},
+		{"Script→10.0.0.1 fail", fetch.EventRequestPaused{
+			RequestID: "js-1", ResourceType: network.ResourceTypeScript,
+			Request: &network.Request{URL: "http://10.0.0.1/app.js"},
+		}, true},
+		{"XHR→localhost fail", fetch.EventRequestPaused{
+			RequestID: "xhr-1", ResourceType: network.ResourceTypeXHR,
+			Request: &network.Request{URL: "http://localhost:6379/stats"},
+		}, true},
+		{"WebSocket→127.1 fail (WHATWG-форма)", fetch.EventRequestPaused{
+			RequestID: "ws-1", ResourceType: network.ResourceTypeWebSocket,
+			Request: &network.Request{URL: "ws://127.1/socket"},
+		}, true},
+		{"Document→site.example continue", fetch.EventRequestPaused{
+			RequestID: "doc-4", ResourceType: network.ResourceTypeDocument,
+			Request: &network.Request{URL: "http://site.example/page"},
+		}, false},
+		{"Script→203.0.113.7 continue", fetch.EventRequestPaused{
+			RequestID: "js-2", ResourceType: network.ResourceTypeScript,
+			Request: &network.Request{URL: "http://203.0.113.7/app.js"},
+		}, false},
+		{"путь с подстрокой 127.0.0.1 continue", fetch.EventRequestPaused{
+			RequestID: "js-3", ResourceType: network.ResourceTypeScript,
+			Request: &network.Request{URL: "http://site.example/js/127.0.0.1.js"},
+		}, false},
+		{"событие без request continue", fetch.EventRequestPaused{
+			RequestID: "anomaly", ResourceType: network.ResourceTypeScript,
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeCDPSession{}
+			blockRespond(context.Background(), fake, tc.ev, on)
+			calls := fake.callsOf()
+			want := "Fetch.continueRequest"
+			if tc.fail {
+				want = "Fetch.failRequest"
+			}
+			if len(calls) != 1 || calls[0].Method != want {
+				t.Fatalf("команды %v, хочу одну %s", calls, want)
+			}
+			if tc.fail {
+				params, ok := calls[0].Params.(fetch.FailRequestParams)
+				if !ok {
+					t.Fatalf("параметры %T, хочу fetch.FailRequestParams", calls[0].Params)
+				}
+				if params.RequestID != tc.ev.RequestID ||
+					params.ErrorReason != network.ErrorReasonBlockedByClient {
+					t.Errorf("failRequest %+v, хочу RequestID %s BlockedByClient",
+						params, tc.ev.RequestID)
+				}
+			}
+		})
+	}
+
+	// Флаг выключен — внутренний хост проходит (dev/testbed).
+	fake := &fakeCDPSession{}
+	blockRespond(context.Background(), fake, fetch.EventRequestPaused{
+		RequestID: "dev-1", ResourceType: network.ResourceTypeDocument,
+		Request: &network.Request{URL: "http://127.0.0.1/"},
+	}, blockRulesOf(Options{}))
+	if calls := fake.callsOf(); len(calls) != 1 || calls[0].Method != "Fetch.continueRequest" {
+		t.Fatalf("команды %v, хочу одну Fetch.continueRequest (флаг выключен)", calls)
 	}
 }
 

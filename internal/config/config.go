@@ -278,12 +278,14 @@ type HTTP struct {
 	// (T-049).
 	MaxRPS int `yaml:"max_rps"`
 	// BlockInternalAddrs — запрет подключения к внутренним адресам
-	// (loopback/RFC1918/ULA/link-local/unspecified/multicast) по хостам
-	// HTTP-редиректов: SSRF-защита — недоверенный сайт может увести
-	// краулер на 127.0.0.1, cloud metadata или адрес сети БД/Redis.
-	// Адреса DNS-этапа не фильтруются. По умолчанию false (testbed и
+	// (loopback/RFC1918/ULA/link-local/unspecified/multicast, включая
+	// IPv4-в-IPv6 форму) по всем путям SSRF-контура (T-219): адреса
+	// DNS-этапа стартового хоста, литералы и резолвы хостов
+	// HTTP-редиректов, IP-литеральные хосты задач рендера. SSRF-защита:
+	// недоверенный сайт может увести краулер на 127.0.0.1, cloud
+	// metadata или адрес сети БД/Redis. По умолчанию false (testbed и
 	// dev-стенды резолвят сценарии во внутренние сети 172.28.100.0/24);
-	// для Internet-боевой эксплуатации рекомендуется включать.
+	// для Internet-боевой эксплуатации включать обязательно.
 	// Расширение к минимальному составу ТЗ 5.10.
 	BlockInternalAddrs bool `yaml:"block_internal_addrs"`
 	// TaskConcurrency — одновременных задач q:http (доменов) в цикле

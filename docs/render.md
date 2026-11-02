@@ -68,7 +68,24 @@ IndexedDB, service workers) и одна вкладка `about:blank`.
 
 Задача и результат — `RenderTask{URL}` и `RenderOutput`: итоговый URL
 (включая JS-редиректы, которых HTTP-этап не видит), `Title`,
-итоговый `DOM`, `Cookies` и `ResponseHeaders` (T-064, ниже). User-Agent
+итоговый `DOM`, `Cookies` и `ResponseHeaders` (T-064, ниже). Схема
+задачи контролируется до перехода (`validateTaskURL`, R-09 — только
+http/https); при включённом `http.block_internal_addrs` в начале `Run`
+отвергаются задачи с внутренними хостами (SSRF-контур T-219, класс
+task: IP-литералы любых форм — включая IPv4-в-IPv6 и числоподобные
+`127.1`/`2130706433`, которые Chromium канонизирует, — и loopback-имена;
+`renderHostInternal`). Той же проверкой живёт перехват запросов
+Chromium (`blockInternal`): при включённом флаге `Fetch.enable` получает
+паттерн-«всё», и любой запрос сессии — навигации по HTTP/JS-редиректам
+(Document) и подресурсы (Script/XHR/WebSocket) — с внутренним хостом
+отклоняется до выхода в сеть; цена — CDP-цикл на каждый запрос, поэтому
+паттерн ставится только флагом. Остаточный риск: произвольные имена не
+резолвятся (их адреса фильтрует HTTP-этап конвейера), и
+DNS-rebinding между HTTP-этапом и Chromium контур не ловит — для
+Internet-эксплуатации контейнер Chromium стоит держать в сетевом
+egress-политике без доступа во внутренние подсети; имена-хосты
+фильтруются HTTP-этапом той же воронкой —
+docs/configuration.md, `block_internal_addrs`). User-Agent
 страниц — единый идентифицируемый UA краулера `http.user_agent` (ТЗ §9; в
 секции render ТЗ 5.10 отдельного поля нет): применяется к вкладке через
 `Emulation.setUserAgentOverride`.

@@ -527,12 +527,67 @@ func TestDialContextRedirectIPLiteral(t *testing.T) {
 	}
 }
 
-// --- SSRF-защита пути редиректов ---------------------------------------------
+// --- SSRF-контур (T-219) -------------------------------------------------------
+
+// ssrfDialSeam — шов диала для SSRF-тестов: подключение к любому адресу
+// ведёт к локальному тестовому серверу (порт попытки сохраняется), а
+// адреса попыток записываются — тесты утверждают, что внутренние адреса
+// до диала не дошли (воронка filterInternalAddrs сидит раньше шва).
+// Воронка срабатывает до диала, поэтому шов не мешает блокировке, но
+// делает «прошло бы без фильтра» наблюдаемым успехом запроса (без шова
+// литерал вида ::ffff:169.254.169.254 просто не дозвонился бы — тест не
+// отличил бы блок от таймаута). Запись потокобезопасна: попытки dialAddrs
+// стартуют горутинами (стиль newTestFetcher).
+func ssrfDialSeam() (dialFunc, func() []netip.Addr) {
+	var mu sync.Mutex
+	calls := []netip.Addr{}
+	return func(ctx context.Context, addr netip.Addr, port string) (net.Conn, error) {
+			mu.Lock()
+			calls = append(calls, addr)
+			mu.Unlock()
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", port))
+		}, func() []netip.Addr {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]netip.Addr(nil), calls...)
+		}
+}
+
+// TestAddrIsInternal — предикат единой воронки (T-219): внутренние
+// диапазоны, включая IPv4-в-IPv6 (замер: ::ffff:0.0.0.0 ловит только
+// Unmap — IsUnspecified 4-in-6 не разворачивает; остальные предикаты
+// разворачивают сами, Unmap даёт одну семантику любому литералу);
+// внешние адреса и документационные сети — нет.
+func TestAddrIsInternal(t *testing.T) {
+	internal := []string{
+		"127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1",
+		"169.254.169.254", "0.0.0.0", "224.0.0.1",
+		"::1", "fd00::1", "fe80::1", "ff02::1", "::",
+		"::ffff:127.0.0.1", "::ffff:10.0.0.5", "::ffff:169.254.169.254",
+		"::ffff:0.0.0.0",
+	}
+	for _, s := range internal {
+		if !AddrIsInternal(netip.MustParseAddr(s)) {
+			t.Errorf("AddrIsInternal(%s) = false, хочу true", s)
+		}
+	}
+	external := []string{
+		"192.0.2.10", "198.51.100.7", "203.0.113.10", "1.1.1.1",
+		"2001:db8::1", "2606:4700::1111", "::ffff:203.0.113.10",
+	}
+	for _, s := range external {
+		if AddrIsInternal(netip.MustParseAddr(s)) {
+			t.Errorf("AddrIsInternal(%s) = true, хочу false", s)
+		}
+	}
+}
 
 // TestLookupBlocksInternalAddrs: Options.BlockInternalAddrs отбраковывает
 // в воронке lookup внутренние адреса — литералы из Location (SSRF:
-// loopback, RFC1918, cloud metadata) и адреса резолва; внешний адрес
-// смешанного ответа остаётся.
+// loopback, RFC1918, cloud metadata, включая IPv4-в-IPv6 — Unmap в
+// AddrIsInternal) и адреса резолва; внешний адрес смешанного ответа
+// остаётся.
 func TestLookupBlocksInternalAddrs(t *testing.T) {
 	f := NewFetcher(Options{
 		BlockInternalAddrs: true,
@@ -553,7 +608,13 @@ func TestLookupBlocksInternalAddrs(t *testing.T) {
 		t.Errorf("ожидался только внешний адрес, получено %v", addrs)
 	}
 
-	for _, host := range []string{"127.0.0.1", "10.0.0.5", "169.254.169.254", "::1", "fd00::1", "192.168.1.1"} {
+	for _, host := range []string{
+		"127.0.0.1", "10.0.0.5", "169.254.169.254", "::1", "fd00::1", "192.168.1.1",
+		// IPv4-в-IPv6: часть предикатов netip 4-in-6 не разворачивает
+		// (IsUnspecified — ::ffff:0.0.0.0); единая семантика — Unmap
+		// в AddrIsInternal (T-219).
+		"::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.5", "::ffff:0.0.0.0",
+	} {
 		if _, err := f.lookup(context.Background(), host); err == nil {
 			t.Errorf("внутренний литерал %q не заблокирован", host)
 		}
@@ -579,9 +640,63 @@ func TestLookupBlocksInternalAddrs(t *testing.T) {
 	}
 }
 
+// TestFetchBlocksInternalDNSAddrs: с включённым контуром адреса DNS-этапа
+// (FetchRequest.Addrs) проходят ту же воронку, что и редиректы, —
+// стартовый запрос к A-записи из внутренней сети (SSRF: подложный DNS
+// или локальный резолвер) не выполняется. До T-219 красный: Fetch
+// подключался по внутренним адресам без проверки (диал шёл в локальный
+// сервер — успех вместо отказа).
+func TestFetchBlocksInternalDNSAddrs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+
+	f := NewFetcher(Options{BlockInternalAddrs: true, Resolver: redirectResolverFail})
+	dial, dialed := ssrfDialSeam()
+	f.dial = dial
+	for _, addr := range []string{"127.0.0.1", "10.0.0.5", "::ffff:127.0.0.1"} {
+		_, err := f.Fetch(context.Background(), FetchRequest{
+			URL:   redirectReqURL(srv.URL, "ssrf.example.net", "/start"),
+			Addrs: []netip.Addr{netip.MustParseAddr(addr)},
+		})
+		if err == nil || !strings.Contains(err.Error(), "внутренние") {
+			t.Errorf("%s: ожидалась блокировка внутренних адресов DNS-этапа, получено: %v", addr, err)
+		}
+	}
+	// Смешанный список оставляет внешние — семантика воронки; внутренний
+	// адрес до диала не доходит вовсе (пин против регрессии «фильтровать
+	// только когда все внутренние»).
+	res, err := f.Fetch(context.Background(), FetchRequest{
+		URL: redirectReqURL(srv.URL, "ssrf.example.net", "/start"),
+		Addrs: []netip.Addr{
+			netip.MustParseAddr("10.0.0.5"),     // внутренний — отброшен
+			netip.MustParseAddr("203.0.113.10"), // TEST-NET-3 — внешний
+		},
+	})
+	if err != nil {
+		t.Fatalf("смешанный список адресов: %v", err)
+	}
+	_ = res.Body.Close()
+	attempts := dialed()
+	if len(attempts) != 1 || attempts[0] != netip.MustParseAddr("203.0.113.10") {
+		t.Errorf("до диала дошли адреса %v, хочу только 203.0.113.10", attempts)
+	}
+
+	// Флаг выключен — адреса DNS-этапа проходят как есть (dev/testbed).
+	f2 := NewFetcher(Options{Resolver: redirectResolverFail})
+	f2.dial, _ = ssrfDialSeam()
+	res2, err := f2.Fetch(context.Background(), FetchRequest{
+		URL: redirectReqURL(srv.URL, "dev.example.net", "/start"), Addrs: loopbackAddr()})
+	if err != nil {
+		t.Fatalf("без флага внутренние адреса DNS-этапа должны проходить: %v", err)
+	}
+	_ = res2.Body.Close()
+}
+
 // TestFetchChainBlocksInternalRedirect: Location на внутренний адрес —
-// переход не выполняется (ошибка резолва, цепочка — выполненная часть);
-// адреса DNS-этапа стартового хоста фильтр не затрагивает.
+// переход не выполняется (ошибка воронки, цепочка — выполненная часть).
+// Стартовый хост — внешний адрес (шов диала ведёт к локальному
+// серверу): с T-219 фильтруется и стартовый диал, петля в
+// FetchRequest.Addrs блокировала бы запрос до ответа 302.
 func TestFetchChainBlocksInternalRedirect(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "http://169.254.169.254/latest/meta-data/")
@@ -589,15 +704,50 @@ func TestFetchChainBlocksInternalRedirect(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Стартовый запрос идёт по адресам DNS-этапа (петля!) — не фильтруется.
 	f := NewFetcher(Options{BlockInternalAddrs: true, Resolver: redirectResolverFail})
+	f.dial, _ = ssrfDialSeam()
 	got, err := FetchChain(context.Background(), f, FetchRequest{
-		URL: redirectReqURL(srv.URL, "ssrf.example.net", "/start"), Addrs: loopbackAddr()})
+		URL:   redirectReqURL(srv.URL, "ssrf.example.net", "/start"),
+		Addrs: []netip.Addr{netip.MustParseAddr("203.0.113.10")}})
 	if err == nil || !strings.Contains(err.Error(), "внутренние") {
 		t.Fatalf("ожидалась блокировка внутреннего адреса, получено: %v", err)
 	}
 	if len(got.Chain) != 1 {
 		t.Errorf("цепочка: %+v, ожидался 1 шаг (перехода нет)", got.Chain)
+	}
+}
+
+// TestFetchChainBlocksInternalRedirect4in6: Location с IPv4-в-IPv6
+// литералом внутреннего диапазона — тот же отказ. ::ffff:0.0.0.0 —
+// единственная форма, ловимая именно Unmap (замер T-219: предикаты
+// IsLoopback/IsPrivate/IsLinkLocalUnicast 4-in-6 разворачивают сами,
+// IsUnspecified — нет): без Unmap шов диала довёл бы запрос до
+// успеха. ::ffff:169.254.169.254 — пин cloud-metadata формы.
+func TestFetchChainBlocksInternalRedirect4in6(t *testing.T) {
+	for _, location := range []string{
+		"http://[::ffff:169.254.169.254]/latest/meta-data/",
+		"http://[::ffff:0.0.0.0]/latest/meta-data/",
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", location)
+			w.WriteHeader(http.StatusFound)
+		}))
+
+		f := NewFetcher(Options{BlockInternalAddrs: true, Resolver: redirectResolverFail})
+		f.dial, _ = ssrfDialSeam()
+		got, err := FetchChain(context.Background(), f, FetchRequest{
+			URL:   redirectReqURL(srv.URL, "ssrf.example.net", "/start"),
+			Addrs: []netip.Addr{netip.MustParseAddr("203.0.113.10")}})
+		if err == nil || !strings.Contains(err.Error(), "внутренние") {
+			t.Errorf("Location %s: ожидалась блокировка IPv4-в-IPv6 внутреннего литерала, получено: %v",
+				location, err)
+			srv.Close()
+			continue
+		}
+		if len(got.Chain) != 1 {
+			t.Errorf("Location %s: цепочка %+v, ожидался 1 шаг (перехода нет)", location, got.Chain)
+		}
+		srv.Close()
 	}
 }
 

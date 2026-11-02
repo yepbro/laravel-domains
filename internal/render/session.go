@@ -134,7 +134,9 @@ func (s *Session) start(ctx context.Context) error {
 //
 // Схема URL проверяется до любых команд CDP (validateTaskURL, R-09):
 // file:/data: браузер открыл бы, а съём DOM унёс бы содержимое локального
-// ресурса в хранилище контента.
+// ресурса в хранилище контента. При включённом SSRF-контуре рядом
+// отвергается и внутренний IP-литеральный хост (validateTaskURLInternal,
+// T-219: http.block_internal_addrs — общий флаг с HTTP-этапом).
 //
 // Блокировка изображений/шрифтов/медиа (T-062, ТЗ 5.6; с опцией
 // Options.BlockStylesheet — и CSS, T-213; с Options.BlockTrackerDomains
@@ -144,6 +146,13 @@ func (s *Session) start(ctx context.Context) error {
 func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	if err := validateTaskURL(task.URL); err != nil {
 		return RenderOutput{}, err
+	}
+	// SSRF-контур (T-219): внутренний IP-литерал — рядом со схемой,
+	// до перехода на страницу; класс task.
+	if s.b.opts.BlockInternalAddrs {
+		if err := validateTaskURLInternal(task.URL); err != nil {
+			return RenderOutput{}, err
+		}
 	}
 	tctx, stop := context.WithTimeout(s.ctx, s.b.opts.Timeout)
 	defer stop()

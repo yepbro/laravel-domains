@@ -40,11 +40,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"crawler/internal/config"
+	"crawler/internal/httpfetch"
 )
 
 // RenderTask — одна задача рендера: открыть страницу и снять результат.
@@ -156,12 +159,25 @@ type Options struct {
 	// дефолта — у поля BlockTrackerDomains internal/config. Источник —
 	// render.block_tracker_domains.
 	BlockTrackerDomains bool
+	// BlockInternalAddrs — SSRF-контур рендера (T-219): тот же флаг
+	// http.block_internal_addrs, что у HTTP-этапа. При true задача с
+	// IP-литеральным хостом внутреннего диапазона
+	// (httpfetch.AddrIsInternal, включая IPv4-в-IPv6 —
+	// [::ffff:10.0.0.1]) отвергается классом task до перехода —
+	// Chromium не открывает внутренние адреса: final_url приходит из
+	// БД, и аномалия пайплайна или компрометация БД не должна
+	// превращаться в обход контура. Имена-хосты отдельно не резолвятся:
+	// их адреса фильтруются HTTP-этапом под той же воронкой httpfetch,
+	// второй резолвер в рендере расширял бы контур. false — прежнее
+	// поведение: dev/testbed рендерит внутренние стенды.
+	BlockInternalAddrs bool
 }
 
 // NewOptions собирает Options из конфигурации сервиса (ТЗ 5.10): секция
 // render плюс User-Agent HTTP-этапа (ТЗ §9 — единый идентифицируемый UA
-// краулера) и потолок DOM из секции content (R-02: итоговый DOM не больше
-// того, что хранилище контента принимает).
+// краулера), потолок DOM из секции content (R-02: итоговый DOM не больше
+// того, что хранилище контента принимает) и флаг SSRF-контура
+// http.block_internal_addrs (T-219 — общий с HTTP-этапом).
 func NewOptions(cfg config.Config) Options {
 	return Options{
 		RemoteURL:           cfg.Render.RemoteURL,
@@ -173,6 +189,7 @@ func NewOptions(cfg config.Config) Options {
 		MaxDOMBytes:         cfg.Content.MaxStoreBytes.B(),
 		BlockStylesheet:     cfg.Render.BlockStylesheet,
 		BlockTrackerDomains: cfg.Render.BlockTrackerDomains,
+		BlockInternalAddrs:  cfg.HTTP.BlockInternalAddrs,
 	}
 }
 
@@ -257,4 +274,114 @@ func validateTaskURL(raw string) error {
 			Err: fmt.Errorf("рендер открывает только http/https, задано %q", raw)}
 	}
 	return nil
+}
+
+// validateTaskURLInternal — контроль адреса задачи рендера при
+// включённом SSRF-контуре (http.block_internal_addrs, T-219): хост
+// внутреннего диапазона (renderHostInternal — IP-литералы, включая
+// IPv4-в-IPv6 и числоподобные формы WHATWG, loopback-имена) не
+// открывается, класс task — повторная доставка уровня очереди (T-066),
+// как у проверки схемы. Имя-хост проходит без резолва: его адреса уже
+// отфильтрованы HTTP-этапом под той же воронкой httpfetch, а резолв в
+// рендере означал бы второй резолвер в контуре и гонку адресов с
+// DNS-этапом. Той же проверкой живёт перехват запросов Chromium
+// (blockInternal): навигации по HTTP/JS-редиректам и подресурсы
+// блокируются в самом браузере.
+func validateTaskURLInternal(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil // схема/хост уже отвергнуты validateTaskURL
+	}
+	if renderHostInternal(u.Hostname()) {
+		return &Error{Class: ClassTask, URL: raw,
+			Err: fmt.Errorf("рендер внутренних адресов запрещён (SSRF, http.block_internal_addrs): %q", raw)}
+	}
+	return nil
+}
+
+// renderHostInternal — хост внутренний для SSRF-контура рендера
+// (T-219): loopback-имена Chromium (localhost и поддомены — браузер
+// резолвит их в петлю сам), IP-литералы внутренних диапазонов
+// (httpfetch.AddrIsInternal — единое определение контура, включая
+// IPv4-в-IPv6) и «числоподобные» хосты, которые Chromium канонизирует
+// в IPv4 по алгоритму WHATWG («127.1», «2130706433», «0x7f.1» — все
+// 127.0.0.1; netip такие формы не разбирает, а браузер открывал бы).
+// Прочие имена проходят без резолва: их адреса фильтруются HTTP-этапом
+// (если имя пришло через конвейер); остаточный вектор DNS-rebinding'а
+// в самом Chromium зафиксирован в docs/render.md.
+func renderHostInternal(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return httpfetch.AddrIsInternal(ip)
+	}
+	if ip, ok := whatwgParseIPv4(host); ok {
+		return httpfetch.AddrIsInternal(ip)
+	}
+	return false
+}
+
+// whatwgParseIPv4 — канонизация числоподобного хоста по алгоритму
+// IPv4-парсера WHATWG URL (им руководствуется Chromium): хост из 1..4
+// точечных частей, каждая — десятичное/восьмеричное (ведущий 0)/
+// шестнадцатеричное (0x) число, сворачивается в IPv4; хост, чья
+// последняя часть не число — имя, не IPv4 («0.com» проходит как имя).
+// Точная копия порогов WHATWG: не-последние части ≤ 255, последняя <
+// 256^(5−n). ok=false — хост не числоподобный (имя или мусор).
+func whatwgParseIPv4(host string) (netip.Addr, bool) {
+	parts := strings.Split(host, ".")
+	if len(parts) == 0 || len(parts) > 4 {
+		return netip.Addr{}, false
+	}
+	if _, ok := whatwgIPv4Number(parts[len(parts)-1]); !ok {
+		return netip.Addr{}, false // не заканчивается числом — имя
+	}
+	nums := make([]uint64, len(parts))
+	for i, p := range parts {
+		v, ok := whatwgIPv4Number(p)
+		if !ok {
+			return netip.Addr{}, false
+		}
+		nums[i] = v
+	}
+	for _, v := range nums[:len(nums)-1] {
+		if v > 255 {
+			return netip.Addr{}, false
+		}
+	}
+	if nums[len(nums)-1] >= uint64(1)<<(8*(5-len(nums))) {
+		return netip.Addr{}, false
+	}
+	var v uint64
+	for i, n := range nums[:len(nums)-1] {
+		v += n << (8 * (3 - i)) // части, кроме последней, — старшие байты
+	}
+	v += nums[len(nums)-1]
+	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}), true
+}
+
+// whatwgIPv4Number — число одной части IPv4-хоста WHATWG: 0x/0X —
+// шестнадцатеричное (пустая мантисса — 0), ведущий 0 — восьмеричное,
+// иначе десятичное; пустая строка и посторонние символы — не число.
+func whatwgIPv4Number(s string) (uint64, bool) {
+	switch {
+	case len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'):
+		m := s[2:]
+		if m == "" {
+			return 0, true
+		}
+		v, err := strconv.ParseUint(m, 16, 64)
+		return v, err == nil
+	case len(s) > 1 && s[0] == '0':
+		v, err := strconv.ParseUint(s[1:], 8, 64)
+		return v, err == nil
+	default:
+		if s == "" {
+			return 0, false
+		}
+		v, err := strconv.ParseUint(s, 10, 64)
+		return v, err == nil
+	}
 }

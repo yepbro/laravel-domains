@@ -55,6 +55,17 @@ import (
 // Stylesheet при включённой опции render.block_stylesheet (T-213)
 // присоединяется к блокируемым тем же механизмом (blockTypes); дефолт
 // false — риск computed styles, обоснование у опции.
+//
+// SSRF-контур (T-219, http.block_internal_addrs) — исключение из
+// fail-open: паттерн-«всё» приостанавливает каждый запрос сессии
+// (включая Document, Script, XHR/Fetch, WebSocket — навигация по
+// HTTP/JS-редиректам и подресурсы идут сетевым стеком Chromium мимо
+// воронки httpfetch), и запрос с внутренним хостом отклоняется
+// (blockInternal, renderHostInternal). Цена — CDP-цикл на каждый
+// запрос страницы, поэтому паттерн есть только при включённом флаге
+// (Internet-профиль); дефолт false его не ставит. Контур проверяет
+// IP-литералы и loopback-имена; произвольные имена не резолвятся —
+// остаточный вектор DNS-rebinding'а зафиксирован в docs/render.md.
 
 // blockDisableTimeout — предел Fetch.disable при остановке перехвата:
 // обычный вызов CDP занимает миллисекунды, дольше ждать незачем.
@@ -133,16 +144,18 @@ var blockTrackerDomains = []string{
 }
 
 // blockRules — правила блокировки одной сессии рендера: блокируемые
-// типы (blockTypes — единая точка опций T-062/T-213) и включённость
-// доменной блокировки трекеров (T-214). Единая точка вычисления —
-// blockRulesOf: startBlock собирает правила из Options один раз, дальше
-// один неизменяемый набор разъезжается по всем точкам решения — паттерны
-// Fetch.enable (blockEnable) и вердикты blockRespond видят одну и ту же
+// типы (blockTypes — единая точка опций T-062/T-213), включённость
+// доменной блокировки трекеров (T-214) и SSRF-контур внутренних
+// адресов (T-219). Единая точка вычисления — blockRulesOf: startBlock
+// собирает правила из Options один раз, дальше один неизменяемый набор
+// разъезжается по всем точкам решения — паттерны Fetch.enable
+// (blockEnable) и вердикты blockRespond видят одну и ту же
 // конфигурацию, расхождение списков исключено в принципе (стиль
 // единой точки blockTypes у T-213).
 type blockRules struct {
 	types    []network.ResourceType
 	trackers bool
+	internal bool
 }
 
 // blockRulesOf — правила сессии из опций браузера.
@@ -150,6 +163,7 @@ func blockRulesOf(opts Options) blockRules {
 	return blockRules{
 		types:    blockTypes(opts.BlockStylesheet),
 		trackers: opts.BlockTrackerDomains,
+		internal: opts.BlockInternalAddrs,
 	}
 }
 
@@ -209,7 +223,15 @@ func blockResourceType(types []network.ResourceType, t network.ResourceType) boo
 // и путь /js/google-analytics.com.js, судьбу решает точная проверка в
 // blockRespond (страховка от ложных срабатываний сидит в слушателе, а
 // не в паттерне).
-func blockPatterns(types []network.ResourceType, trackers bool) []*fetch.RequestPattern {
+//
+// С включённым SSRF-контуром (T-219) добавляется паттерн-«всё»
+// (urlPattern "*", без типа): приостанавливается каждый запрос сессии,
+// включая Document (навигации по HTTP/JS-редиректам) и Script/XHR/
+// WebSocket (подресурсы), — внутренние хосты отклоняет blockInternal,
+// остальные отпускаются continueRequest. Один лишний CDP-цикл на
+// запрос — цена замыкания контура в самом Chromium; при выключенном
+// флаге паттерна нет вовсе.
+func blockPatterns(types []network.ResourceType, trackers, internal bool) []*fetch.RequestPattern {
 	patterns := make([]*fetch.RequestPattern, 0, len(types))
 	for _, t := range types {
 		patterns = append(patterns, &fetch.RequestPattern{
@@ -225,13 +247,19 @@ func blockPatterns(types []network.ResourceType, trackers bool) []*fetch.Request
 			})
 		}
 	}
+	if internal {
+		patterns = append(patterns, &fetch.RequestPattern{
+			URLPattern:   "*",
+			RequestStage: fetch.RequestStageRequest,
+		})
+	}
 	return patterns
 }
 
 // blockEnable включает перехват на сессии CDP вкладки.
 func blockEnable(ctx context.Context, sess cdp.Session, rules blockRules) error {
 	_, err := cdp.Call(ctx, sess, fetch.Enable, fetch.EnableParams{
-		Patterns: blockPatterns(rules.types, rules.trackers),
+		Patterns: blockPatterns(rules.types, rules.trackers, rules.internal),
 	})
 	return err
 }
@@ -246,16 +274,40 @@ func blockDisable(ctx context.Context, sess cdp.Session) {
 	_, _ = cdp.Call(dctx, sess, fetch.Disable, cdp.Empty{})
 }
 
-// blockRespond отвечает на приостановленный запрос: блокируемый тип или
-// (T-214) трекер-домен — failRequest, любой другой — continueRequest
-// (страховка: паттерны не должны приостанавливать чужие запросы, но
-// подстрока urlPattern доменных паттернов шире хостовой проверки —
+// blockInternal — приостановленный запрос идёт на внутренний адрес
+// (SSRF-контур T-219, http.block_internal_addrs): фильтр включён и хост
+// URL — внутренний (renderHostInternal: IP-литерал любого вида,
+// включая IPv4-в-IPv6 и числоподобные формы, loopback-имена). URL в
+// событии канонизирован браузером, но вход здесь — та же единая
+// проверка, что у задач рендера: расхождения форм хоста исключены.
+// Событие без сведений о запросе (аномалия протокола) внутренним не
+// считается — как у трекеров.
+func (r blockRules) blockInternal(ev fetch.EventRequestPaused) bool {
+	return r.internal && ev.Request != nil && requestURLInternal(ev.Request.URL)
+}
+
+// requestURLInternal — хост URL запроса внутренний; неразобранный URL —
+// нет (fail-open, как у blockTrackerURL: блокировка не имеет права
+// резать чужое, контур задачи держит validateTaskURLInternal).
+func requestURLInternal(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return renderHostInternal(u.Hostname())
+}
+
+// blockRespond отвечает на приостановленный запрос: внутренний адрес
+// (T-219), блокируемый тип или (T-214) трекер-домен — failRequest,
+// любой другой — continueRequest (страховка: паттерны не должны
+// приостанавливать чужие запросы, но подстрока urlPattern доменных
+// паттернов и паттерн-«всё» SSRF-контура шире точных проверок —
 // расхождение классификации не должно вешать запрос). Ошибки ответа не
 // фатальны: перехват — экономия, страница дорабатывает и без него
 // (fail-open).
 func blockRespond(ctx context.Context, sess cdp.Session, ev fetch.EventRequestPaused, rules blockRules) {
 	var err error
-	if blockResourceType(rules.types, ev.ResourceType) || rules.blockTracker(ev) {
+	if rules.blockInternal(ev) || blockResourceType(rules.types, ev.ResourceType) || rules.blockTracker(ev) {
 		_, err = cdp.Call(ctx, sess, fetch.FailRequest, fetch.FailRequestParams{
 			RequestID:   ev.RequestID,
 			ErrorReason: network.ErrorReasonBlockedByClient,

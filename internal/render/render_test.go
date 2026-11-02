@@ -1,6 +1,7 @@
 package render
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -208,6 +209,153 @@ func TestValidateTaskURL(t *testing.T) {
 		}
 		if ClassOf(err) != ClassTask {
 			t.Errorf("%s: класс %v, хочу task (повторная доставка уровня очереди)", u, ClassOf(err))
+		}
+	}
+}
+
+// TestSessionRunBlocksInternalTaskURL — SSRF-контур рендера (T-219): при
+// http.block_internal_addrs задача с внутренним хостом (включая
+// IPv4-в-IPv6 и числоподобные формы WHATWG) отвергается классом task в
+// начале Run — до перехода на страницу (сессия собрана из одних опций,
+// браузер не нужен; создание CDP-контекста NewSession эта проверка не
+// отменяет — см. ревью T-219). Внешний литерал и флаг-выключено
+// проходят адресный контроль (отказ, если он случится, — про браузер,
+// не про контур).
+func TestSessionRunBlocksInternalTaskURL(t *testing.T) {
+	newSession := func(opts Options) *Session {
+		return &Session{b: &Browser{opts: opts}, ctx: context.Background()}
+	}
+	for _, u := range []string{
+		"http://127.0.0.1/",
+		"http://10.0.0.5/",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://[::1]/",
+		"http://[::ffff:10.0.0.1]/x",
+		"http://[::ffff:169.254.169.254]/latest/meta-data/",
+		// Loopback-имена и числоподобные формы WHATWG: netip их не
+		// разбирает, Chromium канонизирует в 127.0.0.1 (T-219, P1
+		// ревью) — ловит renderHostInternal.
+		"http://localhost/", "http://sub.localhost:8080/",
+		"http://127.1/", "http://2130706433/", "http://0x7f.1/", "http://0177.0.0.1/",
+	} {
+		s := newSession(Options{Timeout: time.Second, BlockInternalAddrs: true})
+		_, err := s.Run(context.Background(), RenderTask{URL: u})
+		if err == nil {
+			t.Errorf("%s: ожидался отказ задачи с внутренним хостом", u)
+			continue
+		}
+		if ClassOf(err) != ClassTask {
+			t.Errorf("%s: класс %v, хочу task (повторная доставка уровня очереди)", u, ClassOf(err))
+		}
+	}
+	// Внешние литералы (TEST-NET-3, 2001:db8::/32), «числоподобное, но
+	// имя» (последняя метка не число) и имя-хост контур не задевают: Run
+	// уходит дальше валидации и падает на отсутствии chromedp-контекста
+	// вкладки, не на адресе.
+	for _, u := range []string{
+		"http://203.0.113.7/", "http://[2001:db8::1]/", "http://ssrf.example.net/",
+		"http://0.com/", "http://127.example.net/",
+	} {
+		s := newSession(Options{Timeout: time.Second, BlockInternalAddrs: true})
+		_, err := s.Run(context.Background(), RenderTask{URL: u})
+		if err != nil && strings.Contains(err.Error(), "внутренн") {
+			t.Errorf("%s: внешний адрес ошибочно заблокирован: %v", u, err)
+		}
+	}
+	// Флаг выключен — внутренний литерал не блокируется (dev/testbed):
+	// отказ, если он случится, — про браузер, не про контур.
+	s := newSession(Options{Timeout: time.Second})
+	if _, err := s.Run(context.Background(), RenderTask{URL: "http://127.0.0.1/"}); err != nil &&
+		strings.Contains(err.Error(), "внутренн") {
+		t.Errorf("без флага внутренний адрес не блокируется: %v", err)
+	}
+}
+
+// TestRenderHostInternal — единая проверка «хост внутренний» SSRF-контура
+// рендера (T-219): канонические литералы (включая IPv4-в-IPv6),
+// loopback-имена и числоподобные формы WHATWG — внутренние; внешние
+// литералы, обычные и «числоподобные, но имена» — нет.
+func TestRenderHostInternal(t *testing.T) {
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"127.0.0.1", true},
+		{"10.0.0.5", true},
+		{"192.168.1.1", true},
+		{"169.254.169.254", true},
+		{"::1", true},
+		{"fd00::1", true},
+		{"::ffff:127.0.0.1", true},
+		{"::ffff:169.254.169.254", true},
+		{"::ffff:0.0.0.0", true}, // IsUnspecified без Unmap 4-in-6 не разворачивает
+		{"localhost", true},
+		{"LOCALHOST", true},
+		{"sub.localhost", true},
+		{"127.1", true},
+		{"2130706433", true},
+		{"0x7f.1", true},
+		{"0177.0.0.1", true},
+		{"0", true},
+		{"127.0.0.1.", true}, // хвостовая точка — WHATWG срезает
+		{"203.0.113.7", false},
+		{"2001:db8::1", false},
+		{"example.net", false},
+		{"0.com", false}, // последняя метка не число — имя
+		{"127.example.net", false},
+		{"1.2.3.4", false},
+		{"not a host", false},
+		{"256.1.1.1", false}, // >255 в не-последней части — имя для WHATWG
+	}
+	for _, tc := range cases {
+		if got := renderHostInternal(tc.host); got != tc.want {
+			t.Errorf("renderHostInternal(%q) = %v, хочу %v", tc.host, got, tc.want)
+		}
+	}
+}
+
+// TestWhatwgParseIPv4 — канонизация числоподобных хостов по алгоритму
+// WHATWG (поведение Chromium): формы записей 127.0.0.1, пороги частей
+// (не-последние ≤ 255, последняя < 256^(5−n)), «не заканчивается
+// числом» — имя.
+func TestWhatwgParseIPv4(t *testing.T) {
+	cases := []struct {
+		host string
+		want string // "" — не числоподобный
+	}{
+		{"127.0.0.1", "127.0.0.1"},
+		{"127.1", "127.0.0.1"},
+		{"2130706433", "127.0.0.1"},
+		{"0x7f.0.0.1", "127.0.0.1"},
+		{"0177.0.0.1", "127.0.0.1"},
+		{"0x7f.1", "127.0.0.1"},
+		{"0", "0.0.0.0"},
+		{"1", "0.0.0.1"},
+		{"1.2.3", "1.2.0.3"},
+		{"0x1", "0.0.0.1"},
+		{"010", "0.0.0.8"},
+		{"0x", "0.0.0.0"},
+		{"example.com", ""},
+		{"0.com", ""},
+		{"1.2.3.4.5", ""},
+		{"256.1.1.1", ""},
+		{"1.2.3.256", ""},
+		{"1.2.3.4.", ""}, // хвостовая точка срезается до whatwgParseIPv4
+		{"", ""},
+		{"..", ""},
+		{"0xg", ""},
+		{"09", ""}, // 9 — не восьмеричная цифра
+	}
+	for _, tc := range cases {
+		ip, ok := whatwgParseIPv4(tc.host)
+		if tc.want == "" {
+			if ok {
+				t.Errorf("whatwgParseIPv4(%q) = %v, хочу не-числоподобный", tc.host, ip)
+			}
+			continue
+		}
+		if !ok || ip.String() != tc.want {
+			t.Errorf("whatwgParseIPv4(%q) = %v %v, хочу %s", tc.host, ip, ok, tc.want)
 		}
 	}
 }
