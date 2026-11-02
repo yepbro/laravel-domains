@@ -39,7 +39,7 @@ baseline `make test` + `make lint` зелёный; ревьюеры —
 `/tmp/opencode/review/34-full-audit-{deepseek,minimax}.md` (временно,
 суть продублирована в задачах).
 
-- **T-219** [в работе] — P0, SSRF-контур: фильтр внутренних адресов
+- **T-219** [сделана] — P0, SSRF-контур: фильтр внутренних адресов
   покрывает только путь редиректов. Адреса DNS-этапа идут в
   `dialAddrs` без проверки (`internal/httpfetch/transport.go:562-575`,
   комментарий «в воронку не попадают»), `BlockInternalAddrs` живёт
