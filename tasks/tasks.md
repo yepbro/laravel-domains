@@ -174,7 +174,7 @@ baseline `make test` + `make lint` зелёный; ревьюеры —
   одиночный таймаут зонда не гасит поколение, двойной — гасит;
   `make test` зелёный.
 
-- **T-227** [новая] — P3, web/dashboard мелочи доверия к запросу:
+- **T-227** [в работе] — P3, web/dashboard мелочи доверия к запросу:
   (1) сессионная cookie `dashboard_session` без `Secure`
   (`internal/dashboard/authmw.go:80-88`) — при прямом доступе мимо
   nginx уйдёт по plaintext; ставить при работе за TLS (флаг/
