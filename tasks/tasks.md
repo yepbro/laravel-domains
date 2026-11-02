@@ -148,7 +148,7 @@ baseline `make test` + `make lint` зелёный; ревьюеры —
   на время сетевого I/O в Redis (ревью/тест с малым пулом);
   `make test` зелёный.
 
-- **T-225** [в работе] — P2, renderworker `ProcessResult` возвращает
+- **T-225** [сделана] — P2, renderworker `ProcessResult` возвращает
   `true` вместе с ошибкой: путь «транзакция зафиксирована, публикация
   q:analyze упала» (`internal/renderworker/worker.go:817`) —
   `return true, err`, все прочие ошибочные пути — `false, err`;
