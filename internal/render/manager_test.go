@@ -329,6 +329,20 @@ func TestManagerBoundedRestarts(t *testing.T) {
 	}
 }
 
+// TestRestartBudgetCoversProbeSeries — инвариант T-226: серия неудач зонда
+// соединения (probeFailThreshold выполнений задачи — каждая первая неудача
+// классом browser уходит в повтор Manager.Run) плюс рестарт и успешное
+// выполнение обязаны укладываться в бюджет 1+maxRestartsPerTask — иначе
+// восстановление после чёрной дыры T-218 не помещается в одну задачу и
+// требует повторной доставки. Пин отношения констант (сами литералы пинят
+// свои тесты — здесь только связь).
+func TestRestartBudgetCoversProbeSeries(t *testing.T) {
+	if maxRestartsPerTask < probeFailThreshold {
+		t.Fatalf("maxRestartsPerTask=%d < probeFailThreshold=%d: серия неудач зонда съедает бюджет повторов — восстановление T-218 не укладывается в один Manager.Run",
+			maxRestartsPerTask, probeFailThreshold)
+	}
+}
+
 func TestManagerStartFailure(t *testing.T) {
 	m := NewManager(context.Background(), managerOpts())
 	var fail atomic.Bool

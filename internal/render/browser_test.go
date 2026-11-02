@@ -60,11 +60,15 @@ func TestStartBrowserLocalExecMissing(t *testing.T) {
 	}
 }
 
-// TestProbeTimeout пинит литерал зонда вкладки: короткий (решение о повторе
-// контекста не ждёт уровня таймаута страницы), но и не нулевой/трёхсекундный.
+// TestProbeTimeout пинит литералы зондов: соединение (probeConn) — с
+// запасом на перегруженный Chromium (T-226: 2 с давали ложные смерти
+// поколения); вкладка (Session.probe) — короткий, поколение не решает.
 func TestProbeTimeout(t *testing.T) {
-	if probeTimeout != 2*time.Second {
-		t.Errorf("probeTimeout = %s, хочу 2s", probeTimeout)
+	if probeTimeout != 5*time.Second {
+		t.Errorf("probeTimeout = %s, хочу 5s", probeTimeout)
+	}
+	if tabProbeTimeout != 2*time.Second {
+		t.Errorf("tabProbeTimeout = %s, хочу 2s", tabProbeTimeout)
 	}
 }
 

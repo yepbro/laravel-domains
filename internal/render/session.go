@@ -38,8 +38,10 @@ func (b *Browser) NewSession(ctx context.Context) (*Session, error) {
 	// Alive не видит, а проявляется он именно здесь — зависшим
 	// createBrowserContext до SessionStartTimeout (15 с бесполезного
 	// ожидания на каждую задачу, инцидент 02.11). Зонд закрывает вопрос
-	// за probeTimeout: смерть соединения — класс browser, менеджер сменит
-	// поколение и повторит задачу на новом соединении.
+	// за probeTimeout: неудача — класс browser, Manager повторит задачу;
+	// поколение сменится со второй подряд неудачи зонда или сразу по
+	// смерти транспорта (T-226: разовый таймаут перегруженного Chromium
+	// поколение не рвёт).
 	if !b.probeConn() {
 		return nil, &Error{Class: ClassBrowser, Err: ErrBrowserDead}
 	}
@@ -253,7 +255,8 @@ func (s *Session) wrap(err error, caller, opCtx context.Context, url string) *Er
 // probe — зонд вкладки для классификации ошибок: chromedp не отменяет
 // контекст вкладки при её падении (тексты ошибок при этом неинформативны:
 // «Session not found» и т. п.), поэтому неответчивость проверяется живым
-// запросом с коротким таймаутом.
+// запросом с коротким таймаутом (tabProbeTimeout: вкладка не решает судьбу
+// поколения — потолок короче зонда соединения, T-226).
 func (s *Session) probe() bool {
 	if s.ctx == nil || s.ctx.Err() != nil {
 		return false
@@ -261,7 +264,7 @@ func (s *Session) probe() bool {
 	if s.probeFn != nil {
 		return s.probeFn()
 	}
-	ctx, stop := context.WithTimeout(s.ctx, probeTimeout)
+	ctx, stop := context.WithTimeout(s.ctx, tabProbeTimeout)
 	defer stop()
 	_, err := chromedp.Run(ctx, chromedp.Evaluate[int]("1"))
 	return err == nil

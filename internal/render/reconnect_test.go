@@ -55,6 +55,7 @@ type switchableCDP struct {
 	closed bool
 	seq    int
 	hang   map[string]bool
+	fail   map[string]bool
 	inbox  chan *cdproto.Message
 	cmds   []fakeCDPCmd
 	closeC chan struct{}
@@ -64,6 +65,7 @@ func newSwitchableCDP() *switchableCDP {
 	return &switchableCDP{
 		alive:  true,
 		hang:   make(map[string]bool),
+		fail:   make(map[string]bool),
 		inbox:  make(chan *cdproto.Message, 1024),
 		closeC: make(chan struct{}),
 	}
@@ -83,6 +85,7 @@ func (f *switchableCDP) Write(ctx context.Context, m *cdproto.Message) error {
 	})
 	method := string(m.Method)
 	dead := !f.alive || f.hang[method]
+	cmdErr := f.fail[method]
 	f.seq++
 	seq := f.seq
 	f.mu.Unlock()
@@ -91,16 +94,20 @@ func (f *switchableCDP) Write(ctx context.Context, m *cdproto.Message) error {
 	}
 
 	reply := &cdproto.Message{ID: m.ID, SessionID: m.SessionID}
-	switch method {
-	case "Target.attachToTarget":
+	switch {
+	case cmdErr:
+		// Ответ-ошибка протокола при живом соединении (браузер ответил —
+		// смерть транспорта это не подтверждает).
+		reply.Error = &cdproto.Error{Code: -32000, Message: "команда сломана"}
+	case method == "Target.attachToTarget":
 		reply.Result = jsonv2.Value(fmt.Sprintf(`{"sessionId":"sw-session-%d"}`, seq))
-	case "Target.createTarget":
+	case method == "Target.createTarget":
 		reply.Result = jsonv2.Value(fmt.Sprintf(`{"targetId":"sw-target-%d"}`, seq))
-	case "Target.createBrowserContext":
+	case method == "Target.createBrowserContext":
 		reply.Result = jsonv2.Value(fmt.Sprintf(`{"browserContextId":"sw-bc-%d"}`, seq))
-	case "Runtime.evaluate":
+	case method == "Runtime.evaluate":
 		reply.Result = jsonv2.Value(`{"result":{"type":"object","className":"Object"}}`)
-	case "Target.getTargets":
+	case method == "Target.getTargets":
 		reply.Result = jsonv2.Value(`{"targetInfos":[]}`)
 	default:
 		reply.Result = jsonv2.Value("{}")
@@ -160,6 +167,21 @@ func (f *switchableCDP) hangMethod(method string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hang[method] = true
+}
+
+// failMethod — отвечать на метод ошибкой протокола при живом соединении
+// (браузер прислал ответ-ошибку — транспорт работает).
+func (f *switchableCDP) failMethod(method string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fail[method] = true
+}
+
+// unhangMethod — снять подвисание метода (снова отвечает).
+func (f *switchableCDP) unhangMethod(method string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.hang, method)
 }
 
 func (f *switchableCDP) isClosed() bool {
@@ -253,6 +275,13 @@ func remoteOpts() Options {
 	}
 }
 
+// testProbeTimeout — тестовый бюджет зонда соединения (T-226): серия
+// зондов в тестах идёт в реальном времени; полный продуктовый probeTimeout
+// (5 с × ~10 зондов) вытолкнул бы пакет за бюджет мутационного прогона
+// (MUTATE_TIMEOUT=60 с). Короткий бюджет не меняет проверяемую семантику:
+// «чёрная дыра»/висящий метод не отвечают и за 100 мс.
+const testProbeTimeout = 100 * time.Millisecond
+
 // switchableBrowser — браузер поверх управляемого транспорта: полный
 // bootstrap chromedp (StartBrowser не подходит — он строит браузер из
 // Options сам), здесь контекст уже поднят вызывающим для тонких сценариев
@@ -269,7 +298,8 @@ func switchableBrowser(t *testing.T, tr *switchableCDP, opts Options) *Browser {
 	if err := initBrowserSession(bctx, opts); err != nil {
 		t.Fatalf("bootstrap браузера поверх фейка: %v", err)
 	}
-	return &Browser{opts: opts, ctx: bctx, cancel: cancelBrowser, cancelAlloc: cancelAlloc}
+	return &Browser{opts: opts, ctx: bctx, cancel: cancelBrowser, cancelAlloc: cancelAlloc,
+		probeTimeout: testProbeTimeout}
 }
 
 // TestManagerRecoversAfterBrowserDeath — приёмник задачи T-218: смерть
@@ -283,6 +313,17 @@ func TestManagerRecoversAfterBrowserDeath(t *testing.T) {
 	overrideRemoteDial(t, rec.dial)
 
 	m := NewManager(context.Background(), remoteOpts())
+	// Старт — реальный StartBrowser (полный bootstrap поверх фейка), но
+	// с тестовым бюджетом зонда: сценарий дважды ждёт неудачный зонд,
+	// продуктовые 5 с × 2 несовместимы с бюджетом прогона (MUTATE_TIMEOUT).
+	realBrowser := m.newBrowser
+	m.newBrowser = func(ctx context.Context, opts Options) (*Browser, error) {
+		b, err := realBrowser(ctx, opts)
+		if b != nil {
+			b.probeTimeout = testProbeTimeout
+		}
+		return b, err
+	}
 	// Пул с реальным созданием сессий (зонд + контекст) и мгновенной
 	// задачей — см. bootSession.
 	m.newPool = func(b *Browser) *Pool {
@@ -380,9 +421,12 @@ func TestRemoteAllocatorClosesConnectionOnCancel(t *testing.T) {
 	cancelBrowser()
 }
 
-// TestBrowserProbeConnDeadConnection — зонд соединения: живое отвечает,
-// «чёрная дыра» помечается lost залипающе, Alive это видит даже при
-// живом (по мнению chromedp) контексте — состояние инцидента 02.11.
+// TestBrowserProbeConnDeadConnection — зонд соединения против «чёрной
+// дыры» T-218 (полузакрытый сокет: транспорт «жив», ответов нет): живое
+// отвечает; после смерти первая неудача поколение ещё не гасит —
+// одиночный таймаут не отличает дыру от перегруженного Chromium (T-226),
+// вторая подряд гасит залипающе, Alive это видит даже при живом (по
+// мнению chromedp) контексте — состояние инцидента 02.11.
 func TestBrowserProbeConnDeadConnection(t *testing.T) {
 	tr := newSwitchableCDP()
 	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
@@ -399,6 +443,14 @@ func TestBrowserProbeConnDeadConnection(t *testing.T) {
 	}
 
 	tr.kill()
+	// Первая неудача: класс browser (зонд не прошёл), но поколение живо.
+	if b.probeConn() {
+		t.Fatal("зонд мёртвого соединения прошёл")
+	}
+	if !b.Alive() {
+		t.Fatal("одиночный таймаут «чёрной дыры» погасил поколение (T-226: требуется серия)")
+	}
+	// Вторая подряд — lost залипающе, Manager увидит смену поколения.
 	if b.probeConn() {
 		t.Fatal("зонд мёртвого соединения прошёл")
 	}
@@ -412,6 +464,139 @@ func TestBrowserProbeConnDeadConnection(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > probeTimeout/2 {
 		t.Errorf("повторный зонд на залипающем lost занял %s, хочу мгновенно", elapsed)
+	}
+}
+
+// TestProbeConnTimeoutTwoFailures — приёмник T-226: одиночный таймаут
+// зонда не гасит поколение. Сценарий — «перегруженный Chromium»: соединение
+// живо (транспорт отвечает на прочие команды), Target.getTargets не успевает
+// за probeTimeout. Обратная сторона контрмеры T-218: зонд ходит перед
+// каждой задачей, и разовый лаг занятого браузера не должен стоить
+// поколения (рестарт, разрыв чужих задач) — lost ставится со второй
+// неудачи подряд, успех между неудачами сбрасывает счётчик.
+func TestProbeConnTimeoutTwoFailures(t *testing.T) {
+	tr := newSwitchableCDP()
+	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
+		return tr, nil
+	})
+	opts := remoteOpts()
+	b := switchableBrowser(t, tr, opts)
+
+	if !b.probeConn() {
+		t.Fatal("зонд живого соединения не прошёл")
+	}
+
+	// Одиночный таймаут: неудача без смерти поколения.
+	tr.hangMethod("Target.getTargets")
+	started := time.Now()
+	if b.probeConn() {
+		t.Fatal("зонд висящего getTargets прошёл")
+	}
+	// Пин подмены бюджета: продуктовый probeTimeout зонд ждать не должен
+	// (без подмены поля эта проверка падает на ~5 с).
+	if elapsed := time.Since(started); elapsed >= probeTimeout {
+		t.Errorf("зонд ждал полный продуктовый probeTimeout (%s) — тестовый бюджет не подменён", elapsed)
+	}
+	if !b.Alive() {
+		t.Fatal("одиночный таймаут зонда погасил поколение (T-226: ложная смерть на нагруженном воркере)")
+	}
+
+	// Успех между неудачами сбрасывает счётчик: следующий одиночный
+	// таймаут — всё ещё не смерть.
+	tr.unhangMethod("Target.getTargets")
+	if !b.probeConn() {
+		t.Fatal("зонд живого соединения после сброса не прошёл")
+	}
+	tr.hangMethod("Target.getTargets")
+	if b.probeConn() {
+		t.Fatal("зонд висящего getTargets прошёл")
+	}
+	if !b.Alive() {
+		t.Fatal("таймаут сразу после успеха (сброс счётчика) погасил поколение")
+	}
+
+	// Вторая подряд неудача: поколение гасится залипающе.
+	if b.probeConn() {
+		t.Fatal("зонд висящего getTargets прошёл")
+	}
+	if b.Alive() {
+		t.Fatal("двойной таймаут зонда не погасил поколение")
+	}
+	// Залипание: повторный зонд не ждёт probeTimeout и не «оживляет».
+	started = time.Now()
+	if b.probeConn() {
+		t.Fatal("повторный зонд потерянного браузера прошёл")
+	}
+	if elapsed := time.Since(started); elapsed > probeTimeout/2 {
+		t.Errorf("повторный зонд на залипающем lost занял %s, хочу мгновенно", elapsed)
+	}
+}
+
+// TestProbeConnTransportDeathInstantLost — доказанная смерть транспорта
+// (закрытый сокет: чтение падает, chromedp закрывает LostConnection, ошибки
+// вызова оборачивают context.Canceled) не ослаблена контрмерой T-226:
+// lost ставится первой же неудачей, без серии, мгновенно.
+func TestProbeConnTransportDeathInstantLost(t *testing.T) {
+	tr := newSwitchableCDP()
+	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
+		return tr, nil
+	})
+	opts := remoteOpts()
+	b := switchableBrowser(t, tr, opts)
+
+	// Закрытие сокета (аналог FIN/RST — «use of closed network
+	// connection»): chromedp узнаёт от чтения и закрывает LostConnection.
+	_ = tr.Close()
+	c := chromedp.FromContext(b.ctx)
+	waitForFor(t, 5*time.Second, func() bool {
+		select {
+		case <-c.Browser.LostConnection:
+			return true
+		default:
+			return false
+		}
+	})
+
+	started := time.Now()
+	if b.probeConn() {
+		t.Fatal("зонд закрытого соединения прошёл")
+	}
+	if elapsed := time.Since(started); elapsed > probeTimeout/2 {
+		t.Errorf("зонд закрытого соединения ждал %s — смерть транспорта детектится мгновенно, без probeTimeout", elapsed)
+	}
+	if !b.lost.Load() {
+		t.Fatal("транспортная смерть не залипнула с первой неудачи (ослаблен детект T-218)")
+	}
+	if b.Alive() {
+		t.Fatal("потерянное соединение: Alive обязан быть false")
+	}
+}
+
+// TestProbeConnProtocolErrorSeries — ответ-ошибка протокола на getTargets
+// при живом соединении (браузер ответил — транспорт работает) относится к
+// «необъяснённым» неудачам T-226, а не к доказанной смерти: одиночный
+// ошибочный ответ не гасит поколение (класс ложных смертей), серия из
+// двух — гасит.
+func TestProbeConnProtocolErrorSeries(t *testing.T) {
+	tr := newSwitchableCDP()
+	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
+		return tr, nil
+	})
+	opts := remoteOpts()
+	b := switchableBrowser(t, tr, opts)
+
+	tr.failMethod("Target.getTargets")
+	if b.probeConn() {
+		t.Fatal("зонд с ответом-ошибкой прошёл")
+	}
+	if !b.Alive() {
+		t.Fatal("одиночный ошибочный ответ протокола погасил поколение (T-226: соединение живо — браузер ответил)")
+	}
+	if b.probeConn() {
+		t.Fatal("зонд с ответом-ошибкой прошёл")
+	}
+	if b.Alive() {
+		t.Fatal("серия ошибочных ответов не погасила поколение")
 	}
 }
 
