@@ -222,6 +222,11 @@ type enqueueFakeQueue struct {
 	publishes []enqueuePublish
 	errs      []error // очередь ошибок (пусто — успех)
 	notify    chan struct{}
+	// onPublish — если задан, вызывается в начале Publish под замком
+	// (непереходным): хук не должен вызывать методы этой очереди —
+	// самодедлок; состояние фейков читает легально только из горутины,
+	// вызвавшей EnqueueBatch (записывающий шов порядка, T-224).
+	onPublish func()
 }
 
 var _ queue.Queue = (*enqueueFakeQueue)(nil)
@@ -232,6 +237,9 @@ func (q *enqueueFakeQueue) Publish(ctx context.Context, stream string, msg queue
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.onPublish != nil {
+		q.onPublish()
+	}
 	var err error
 	if len(q.errs) > 0 {
 		err = q.errs[0]
@@ -555,20 +563,26 @@ func TestEnqueueBatch_UpdateError(t *testing.T) {
 func TestEnqueueBatch_ReadErrors(t *testing.T) {
 	boom := errors.New("декодирование сорвалось")
 
-	pool := &enqueueFakePool{updates: []*enqueueFakeRows{
-		{rows: [][]any{{int16(1), int64(101)}, {int16(1), int64(102)}}, scanErr: boom},
-	}}
+	// Курсор закрывается и на ошибочных путях чтения (T-224: явный
+	// Close на каждой ветке) — ссылки на строки фейка пинируют это.
+	scanRows := &enqueueFakeRows{rows: [][]any{{int16(1), int64(101)}, {int16(1), int64(102)}}, scanErr: boom}
+	pool := &enqueueFakePool{updates: []*enqueueFakeRows{scanRows}}
 	_, err := EnqueueBatch(context.Background(), pool, &enqueueFakeQueue{}, enqueueBatch3()[:2])
 	if err == nil || !errors.Is(err, boom) || !strings.Contains(err.Error(), "чтение переведённых") {
 		t.Fatalf("err = %v, want обёрнутая ошибка чтения RETURNING", err)
 	}
+	if !scanRows.closed {
+		t.Error("курсор RETURNING не закрыт на пути ошибки Scan (T-224)")
+	}
 
-	pool = &enqueueFakePool{updates: []*enqueueFakeRows{
-		{rows: [][]any{{int16(1), int64(101)}}, err: boom},
-	}}
+	errRows := &enqueueFakeRows{rows: [][]any{{int16(1), int64(101)}}, err: boom}
+	pool = &enqueueFakePool{updates: []*enqueueFakeRows{errRows}}
 	_, err = EnqueueBatch(context.Background(), pool, &enqueueFakeQueue{}, enqueueBatch3()[:2])
 	if err == nil || !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want ошибка итерации (rows.Err)", err)
+	}
+	if !errRows.closed {
+		t.Error("курсор RETURNING не закрыт на пути ошибки rows.Err (T-224)")
 	}
 }
 
@@ -590,6 +604,56 @@ func TestEnqueueBatch_PublishError(t *testing.T) {
 	pubs := q.enqueueQueuePublishes()
 	if len(pubs) != 1 || pubs[0].err == nil {
 		t.Fatalf("публикации = %+v, want одна неудачная попытка", pubs)
+	}
+}
+
+// TestEnqueueBatch_ClosesRowsBeforePublish — курсор RETURNING закрыт до
+// публикации (T-224): q.Publish — сетевой I/O в Redis (XADD с ретраями и
+// паузами до ~0,75 с при сбоях, redisq.go), открытый курсор держал бы
+// соединение пула на всё это время — при малом бюджете соединений
+// планировщик упирается в пул, а не в скорость очереди. Пул подменён
+// фейком (юнит-тесты без живой БД, стиль файла), дедлок на pgxpool
+// MaxConns=1 здесь не построить: тест пинирует инвариант порядка
+// Close→Publish записывающим швом — onPublish выполняется внутри Publish
+// и видит rows.closed; до фикса (defer rows.Close на выходе из функции)
+// Publish заходил с открытым курсором и тест падал.
+func TestEnqueueBatch_ClosesRowsBeforePublish(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		errs []error // ошибка публикации (nil — успех): курсор обязан быть закрыт и здесь
+	}{
+		{"успешная публикация", nil},
+		{"сбой публикации", []error{errors.New("redis лежит")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := enqueueFakeRowsOf(
+				[]any{int16(1), int64(101)},
+				[]any{int16(1), int64(102)},
+			)
+			pool := &enqueueFakePool{updates: []*enqueueFakeRows{rows}}
+			q := &enqueueFakeQueue{errs: tc.errs}
+			q.onPublish = func() {
+				if !rows.closed {
+					t.Error("q.Publish выполняется до rows.Close() — курсор держит соединение пула на время сетевого I/O очереди (T-224)")
+				}
+			}
+
+			_, _ = EnqueueBatch(context.Background(), pool, q, enqueueBatch3()[:2])
+			if !rows.closed {
+				t.Error("курсор RETURNING не закрыт по завершении постановки")
+			}
+		})
+	}
+
+	// Публикации нет вовсе (вся пачка проиграла гонку) — курсор всё равно
+	// закрыт: возврат пути без очереди не должен протекать соединением.
+	rows := enqueueFakeRowsOf()
+	pool := &enqueueFakePool{updates: []*enqueueFakeRows{rows}}
+	if _, err := EnqueueBatch(context.Background(), pool, &enqueueFakeQueue{}, enqueueBatch3()); err != nil {
+		t.Fatal(err)
+	}
+	if !rows.closed {
+		t.Error("курсор RETURNING не закрыт на пути без публикации (пачка проиграла гонку)")
 	}
 }
 

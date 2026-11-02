@@ -173,19 +173,32 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 	if err != nil {
 		return EnqueueResult{}, fmt.Errorf("scheduler: постановка пачки (%d доменов): %w", len(batch), err)
 	}
-	defer rows.Close()
 
 	translated := make(map[enqueueKey]struct{}, len(batch))
 	for rows.Next() {
 		var k enqueueKey
 		if err := rows.Scan(&k.zone, &k.id); err != nil {
+			// Close на каждой ветке чтения без defer: defer держал бы
+			// курсор до выхода из функции, т.е. и на время публикации
+			// (стиль VerifyCounters, T-217).
+			rows.Close()
 			return EnqueueResult{}, fmt.Errorf("scheduler: постановка пачки: чтение переведённых: %w", err)
 		}
 		translated[k] = struct{}{}
 	}
+	// rows.Err до Close: обрыв соединения — не «переведённых нет»
+	// (прецедент readDailyValue, T-217).
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return EnqueueResult{}, fmt.Errorf("scheduler: постановка пачки: %w", err)
 	}
+	// Курсор закрыт ДО сборки сообщения и публикации (T-224): Publish —
+	// сетевой I/O в Redis (XADD с ретраями и паузами до ~0,75 с при
+	// сбоях, redisq.go); открытый курсор держал бы соединение пула всё
+	// это время — при медленном Redis планировщик упирается в бюджет
+	// соединений, а не в скорость очереди. Ключи прочитаны целиком —
+	// курсор больше не нужен (стиль VerifyCounters, T-217).
+	rows.Close()
 
 	res := EnqueueResult{Queued: len(translated), Skipped: len(batch) - len(translated)}
 
