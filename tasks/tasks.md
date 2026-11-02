@@ -159,7 +159,7 @@ baseline `make test` + `make lint` зелёный; ревьюеры —
   Критерий: контрактный тест `true` только при `err == nil`;
   `make test` зелёный.
 
-- **T-226** [новая] — P2, зонд CDP `probeConn` меняет поколение
+- **T-226** [в работе] — P2, зонд CDP `probeConn` меняет поколение
   браузера по одиночному таймауту: любая ошибка `Target.getTargets`
   за `probeTimeout = 2с` (включая `DeadlineExceeded` перегруженного
   Chromium) ставит залипающий `lost` (`internal/render/browser.go:242-265`)
