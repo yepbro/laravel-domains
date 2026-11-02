@@ -51,7 +51,7 @@ Follow-up-задачи из ревью и находок волн 30–32, не 
   Критерий: `CRAWLER_RENDER_TEST=1 go test ./internal/render` — зелёный
   целиком; make test/lint не тронуты.
 
-- **T-217** [новая] — P2, дедлок пост-проверок `crawlerctl zones
+- **T-217** [в работе] — P2, дедлок пост-проверок `crawlerctl zones
   collapse` (P2-находка окна T-198, 29.10): после успешной
   реконсиляции счётчиков процесс завис (futex_wait, ~10 потоков),
   сессии БД idle in ClientRead — CheckZonesLeftSQL выполнен сервером,
