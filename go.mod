@@ -3,8 +3,8 @@ module crawler
 go 1.26.9
 
 require (
-	github.com/andybalholm/brotli v1.2.6
-	github.com/chromedp/cdproto v0.157.8
+	github.com/andybalholm/brotli v1.2.7
+	github.com/chromedp/cdproto v0.158.6
 	github.com/chromedp/chromedp v0.21.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/golang-migrate/migrate/v4 v4.20.1
@@ -13,7 +13,7 @@ require (
 	github.com/miekg/dns v1.1.73
 	github.com/prometheus/client_golang v1.25.0
 	github.com/redis/go-redis/v9 v9.23.0
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 	golang.org/x/text v0.43.0
 	gopkg.in/yaml.v3 v3.0.1
 )
