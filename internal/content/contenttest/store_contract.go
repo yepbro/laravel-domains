@@ -1,12 +1,14 @@
-package content
-
-// Контрактный набор StoreContract (T-041) — тестовый каркас проверок
-// контракта ContentStore. Вынесен из store_test.go в обычный файл пакета:
-// набор переиспользуется не только внутри пакета (pack_test.go, T-042),
-// но и внешними тестами реализаций — интеграционными тестами хранилища
-// против живой БД (test/integration, T-046); из _test-файла импорт
-// внешнему пакету недоступен. Аналог stdlib-пакетов вида testing/fstest,
-// но без отдельного пакета — набор оперирует только экспортируемым API.
+// Пакет contenttest — контрактный набор проверок хранилища контента
+// (T-041; вынесен сюда из content/store_contract.go в T-228). Набор
+// оперирует *testing.T и потому живёт отдельным пакетом — аналогом
+// stdlib testing/fstest, — импортируемым только тестами: обычный файл
+// в пакете content тянул testing в нетестовую сборку (в прод-бинарник).
+// Набор оперирует только экспортируемым API пакета content и
+// переиспользуется тестами реализаций: эталонный прогон на in-memory
+// фейке (store_contract_test.go), PackStore (внешний тест-пакет
+// content_test, T-042) и интеграционные тесты против живой БД
+// (test/integration, T-046).
+package contenttest
 
 import (
 	"bytes"
@@ -14,6 +16,8 @@ import (
 	"errors"
 	"sync"
 	"testing"
+
+	"crawler/internal/content"
 )
 
 // StoreContract прогоняет контракт ContentStore (ТЗ 5.7) по реализации,
@@ -26,7 +30,7 @@ import (
 // конфигурации конкретной реализации — лимит max_store_bytes (ErrTooLarge)
 // и переполнение диска (ErrStoreFull, ТЗ 8) — набор не моделирует: его
 // проверяют собственные тесты реализаций (T-046).
-func StoreContract(t *testing.T, newStore func(t *testing.T) ContentStore) {
+func StoreContract(t *testing.T, newStore func(t *testing.T) content.ContentStore) {
 	t.Helper()
 
 	// Корпус: пустой контент (nil и пустой срез — один и тот же контент,
@@ -52,7 +56,7 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) ContentStore) {
 			if !res.Created {
 				t.Errorf("Put(%d): первый Put должен записать новый контент, Created = false", i)
 			}
-			if want := HashOf(d); res.Hash != want {
+			if want := content.HashOf(d); res.Hash != want {
 				t.Errorf("Put(%d): hash = %s, want HashOf(data) = %s", i, res.Hash, want)
 			}
 			got, err := store.Get(ctx, res.Hash)
@@ -147,18 +151,18 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) ContentStore) {
 		if err := store.Delete(ctx, res.Hash); err != nil { // последняя ссылка
 			t.Fatalf("Delete последней ссылки: %v", err)
 		}
-		if _, err := store.Get(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
+		if _, err := store.Get(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
 			t.Errorf("Get после исчерпания ссылок: %v, want ErrNotFound", err)
 		}
-		if err := store.Delete(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
+		if err := store.Delete(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
 			t.Errorf("Delete без ссылок: %v, want ErrNotFound", err)
 		}
 	})
 
 	t.Run("Get несуществующего", func(t *testing.T) {
 		store := newStore(t)
-		for _, h := range []Hash{{}, HashOf([]byte("такого контента нет"))} {
-			if _, err := store.Get(ctx, h); !errors.Is(err, ErrNotFound) {
+		for _, h := range []content.Hash{{}, content.HashOf([]byte("такого контента нет"))} {
+			if _, err := store.Get(ctx, h); !errors.Is(err, content.ErrNotFound) {
 				t.Errorf("Get(%s): %v, want ErrNotFound", h, err)
 			}
 		}
@@ -166,8 +170,8 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) ContentStore) {
 
 	t.Run("Delete несуществующего", func(t *testing.T) {
 		store := newStore(t)
-		h := HashOf([]byte("такого контента нет"))
-		if err := store.Delete(ctx, h); !errors.Is(err, ErrNotFound) {
+		h := content.HashOf([]byte("такого контента нет"))
+		if err := store.Delete(ctx, h); !errors.Is(err, content.ErrNotFound) {
 			t.Errorf("Delete(%s): %v, want ErrNotFound", h, err)
 		}
 	})
@@ -180,7 +184,7 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) ContentStore) {
 		if _, err := store.Put(canceled, d); !errors.Is(err, context.Canceled) {
 			t.Errorf("Put с отменённым ctx: %v, want context.Canceled", err)
 		}
-		h := HashOf(d)
+		h := content.HashOf(d)
 		if _, err := store.Get(canceled, h); !errors.Is(err, context.Canceled) {
 			t.Errorf("Get с отменённым ctx: %v, want context.Canceled", err)
 		}
@@ -188,7 +192,7 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) ContentStore) {
 			t.Errorf("Delete с отменённым ctx: %v, want context.Canceled", err)
 		}
 		// Отменённые операции не меняют хранилище: контент не появился.
-		if _, err := store.Get(ctx, h); !errors.Is(err, ErrNotFound) {
+		if _, err := store.Get(ctx, h); !errors.Is(err, content.ErrNotFound) {
 			t.Errorf("Get после отменённого Put: %v, want ErrNotFound", err)
 		}
 	})
@@ -197,7 +201,7 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) ContentStore) {
 		store := newStore(t)
 		const workers = 8
 		var wg sync.WaitGroup
-		hashes := make([]Hash, workers)
+		hashes := make([]content.Hash, workers)
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			go func(i int) {
@@ -211,7 +215,7 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) ContentStore) {
 			}(i)
 		}
 		wg.Wait()
-		want := HashOf(data[3])
+		want := content.HashOf(data[3])
 		for i, h := range hashes {
 			if h != want {
 				t.Fatalf("горутина %d: hash = %s, want %s", i, h, want)
@@ -223,7 +227,7 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) ContentStore) {
 				t.Fatalf("Delete %d из %d: %v", i+1, workers, err)
 			}
 		}
-		if _, err := store.Get(ctx, want); !errors.Is(err, ErrNotFound) {
+		if _, err := store.Get(ctx, want); !errors.Is(err, content.ErrNotFound) {
 			t.Errorf("Get после %d Delete: %v, want ErrNotFound", workers, err)
 		}
 	})

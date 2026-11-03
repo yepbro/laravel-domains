@@ -42,10 +42,16 @@ import (
 const (
 	// Дедуп-пачка: живой контент пачки — только ссылки, байты не пишутся
 	// (пачковый аналог sqlMetaAddRef: одна команда на пачку вместо
-	// построчных UPDATE). Мёртвые строки (refcount = 0) не воскресаются:
-	// их блоки могли быть скомпактифицированы, новые Put пишут свежие байты.
-	sqlMetaAddRefBatch = "UPDATE contents SET refcount = refcount + 1 " +
-		"WHERE hash = ANY($1::bytea[]) AND refcount > 0 RETURNING hash"
+	// построчных UPDATE). Приращение — счётчик копий хэша в пачке
+	// (unnest-пара hash → n, как у sqlMetaPutBatch): каждый Put элемента
+	// добавляет ссылку, семантика последовательных Put (T-228: раньше
+	// пачка дублей живого контента давала ровно +1 — ссылки занижались,
+	// и компактификация удалила бы ещё нужный блок). Мёртвые строки
+	// (refcount = 0) не воскресаются: их блоки могли быть
+	// скомпактифицированы, новые Put пишут свежие байты.
+	sqlMetaAddRefBatch = "UPDATE contents SET refcount = refcount + v.c " +
+		"FROM unnest($1::bytea[], $2::int4[]) AS v(h, c) " +
+		"WHERE hash = v.h AND refcount > 0 RETURNING hash"
 
 	// Пакетная фиксация новых блоков пачки (пачковый аналог sqlMetaPut):
 	// unnest-массивы; хэши в пачке уникальны (дубликаты одного хэша
@@ -215,14 +221,22 @@ func (s *PackStore) PutBatch(ctx context.Context, items [][]byte) ([]PutResult, 
 }
 
 // addRefBatch — дедуп-пачка (шаг 1): живому контенту добавляются ссылки
-// без записи байтов, одна команда на пачку. Возвращает множество хэшей,
-// получивших ссылку.
+// без записи байтов, одна команда на пачку. Каждый хэш идёт парой с
+// числом копий в пачке — приращение n, а не 1 (контракт «каждый Put
+// элемента добавляет ссылку»). Инвариант: хэши items уникальны —
+// гарантирует дедуп byHash шага 0 PutBatch (при дубле хэша в unnest
+// PostgreSQL обновил бы строку один раз по одной из join-строк, а не
+// суммировал пары; фейк-пул в тестах на дубликат обязан падать, а не
+// расходиться с сервером молча — ревью T-228, P3-2). Возвращает
+// множество хэшей, получивших ссылки.
 func (s *PackStore) addRefBatch(ctx context.Context, items []*batchItem) (map[Hash]bool, error) {
 	hashes := make([][]byte, 0, len(items))
+	counts := make([]int32, 0, len(items))
 	for _, it := range items {
 		hashes = append(hashes, it.hash[:])
+		counts = append(counts, it.count)
 	}
-	rows, err := s.pool.Query(ctx, sqlMetaAddRefBatch, hashes)
+	rows, err := s.pool.Query(ctx, sqlMetaAddRefBatch, hashes, counts)
 	if err != nil {
 		return nil, fmt.Errorf("content: метаданные пачки (%d хэшей): %w", len(hashes), err)
 	}

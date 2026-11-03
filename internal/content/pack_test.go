@@ -42,8 +42,9 @@ type packFakeRow struct {
 }
 
 // packFakePool — db.DB с настоящей семантикой четырёх SQL метаданных
-// (карта hash → строка, refcount по правилам хранилища): StoreContract
-// и тесты ротации требуют живое состояние, а не заготовленные ответы.
+// (карта hash → строка, refcount по правилам хранилища): внешний прогон
+// StoreContract (pack_contract_test.go, T-228) и тесты ротации требуют
+// живое состояние, а не заготовленные ответы.
 // Неизвестный SQL — ошибка: пул закрепляет точные тексты запросов.
 type packFakePool struct {
 	mu       sync.Mutex
@@ -153,13 +154,26 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 		}
 		return &packRows{rows: [][]any{{true}}}, nil
 	case sqlMetaAddRefBatch:
-		// Дедуп-пачка (T-102): +1 каждому живому хэшу, RETURNING по нему.
+		// Дедуп-пачка (T-102; счётчики копий — T-228): +n каждому
+		// живому хэшу (n копий в пачке), RETURNING по нему.
+		// Инвариант PutBatch — хэши уникальны (дедуп byHash шага 0):
+		// живой PostgreSQL при двух join-строках на одну цель обновил
+		// бы строку один раз с произвольной парой, а не суммировал —
+		// фейк на дубликате падает, а не расходится с сервером молча
+		// (ревью T-228, P3-2).
+		hashes := args[0].([][]byte)
+		counts := args[1].([]int32)
+		seen := make(map[[HashLen]byte]bool, len(hashes))
 		var rows [][]any
-		for _, hb := range args[0].([][]byte) {
+		for i, hb := range hashes {
 			var h [HashLen]byte
 			copy(h[:], hb)
+			if seen[h] {
+				return nil, fmt.Errorf("packFakePool: дубликат хэша %x в дедуп-пачке — нарушен инвариант PutBatch (byHash)", h)
+			}
+			seen[h] = true
 			if r := p.contents[h]; r != nil && r.refc > 0 {
-				r.refc++
+				r.refc += counts[i]
 				rows = append(rows, []any{h[:]})
 			}
 		}
@@ -289,14 +303,12 @@ func newPackTestStore(t *testing.T, mutate func(*PackOptions)) (*PackStore, *pac
 	return st, pool
 }
 
-// TestStoreContractOnPack — контракт ContentStore (T-041) на реализации
-// пак-файлов: главная проверка задачи.
-func TestStoreContractOnPack(t *testing.T) {
-	StoreContract(t, func(t *testing.T) ContentStore {
-		st, _ := newPackTestStore(t, nil)
-		return st
-	})
-}
+// TestStoreContractOnPack вынесен во внешний тест-пакет
+// (pack_contract_test.go, T-228): набор StoreContract живёт в
+// contenttest, импортирующем content, — внутренние _test-файлы пакета
+// импортировать contenttest не могут (цикл импортов в тесте), внешний
+// content_test может (go перепривязывает его зависимость от content к
+// тестовому варианту пакета); фабрика хранилища — export_test.go.
 
 // --- ожидаемые SQL (контракт против схемы 000001) ---------------------------
 

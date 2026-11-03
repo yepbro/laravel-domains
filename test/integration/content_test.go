@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/content"
+	"crawler/internal/content/contenttest"
 )
 
 // contentTestEnv — PackStore на живой схеме (таблица contents из миграции
@@ -116,13 +117,78 @@ func parkingPage(domain, note string) []byte {
 }
 
 // TestContent_StoreContract — контракт ContentStore (T-041) на PackStore
-// с живыми PostgreSQL и файлами: главная проверка задачи.
+// с живыми PostgreSQL и файлами: главная проверка задачи. Набор — в
+// пакете contenttest с T-228 (testing только в тестовых пакетах).
 func TestContent_StoreContract(t *testing.T) {
 	skipUnlessIntegration(t)
-	content.StoreContract(t, func(t *testing.T) content.ContentStore {
+	contenttest.StoreContract(t, func(t *testing.T) content.ContentStore {
 		st, _ := contentTestEnv(t, nil)
 		return st
 	})
+}
+
+// TestContent_PutBatch — групповая фиксация на живой PostgreSQL (T-228,
+// ревью P3-1): дедуп-пачка (unnest-джойн с счётчиками копий) и пакетный
+// INSERT с повторами хэша — единственная проверка операторов пачки
+// реальным сервером и pgx-кодирования аргументов (юнит-тесты идут на
+// фейковом пуле). Оба пути: живой хэш → refcount 1+n, новый с дублями →
+// n; ссылки настоящие — Delete × refcount исчерпывает контент.
+func TestContent_PutBatch(t *testing.T) {
+	skipUnlessIntegration(t)
+	st, pool := contentTestEnv(t, nil)
+	ctx := context.Background()
+
+	live := parkingPage("live-batch.example", "живой до пачки")
+	if _, err := st.Put(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	fresh := parkingPage("fresh-batch.example", "новый, в пачке трижды")
+
+	results, errs, err := st.PutBatch(ctx, [][]byte{live, live, live, fresh, fresh, fresh})
+	if err != nil {
+		t.Fatalf("PutBatch: %v", err)
+	}
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("элемент %d: %v", i, e)
+		}
+	}
+	// Created: live — дедуп (байтов нет), fresh — первый элемент пишет
+	// байты, повторы хэша — нет.
+	for i, want := range []bool{false, false, false, true, false, false} {
+		if results[i].Created != want {
+			t.Errorf("элемент %d: Created = %v, want %v", i, results[i].Created, want)
+		}
+	}
+	for h, want := range map[content.Hash]int32{
+		content.HashOf(live): 4, content.HashOf(fresh): 3,
+	} {
+		row, ok := contentRowByHash(t, pool, h)
+		if !ok {
+			t.Fatalf("%s: нет строки contents", h)
+		}
+		if row.refc != want {
+			t.Errorf("%s: refcount = %d, want %d (каждая копия в пачке — ссылка)", h, row.refc, want)
+		}
+	}
+
+	// Ссылки настоящие: исчерпание Delete × refcount убивает контент.
+	for i := 0; i < 4; i++ {
+		if err := st.Delete(ctx, content.HashOf(live)); err != nil {
+			t.Fatalf("Delete живого %d из 4: %v", i+1, err)
+		}
+	}
+	if _, err := st.Get(ctx, content.HashOf(live)); !errors.Is(err, content.ErrNotFound) {
+		t.Errorf("Get живого после 4 Delete: %v, want ErrNotFound", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := st.Delete(ctx, content.HashOf(fresh)); err != nil {
+			t.Fatalf("Delete свежего %d из 3: %v", i+1, err)
+		}
+	}
+	if _, err := st.Get(ctx, content.HashOf(fresh)); !errors.Is(err, content.ErrNotFound) {
+		t.Errorf("Get свежего после 3 Delete: %v, want ErrNotFound", err)
+	}
 }
 
 // TestContent_Roundtrip — запись/чтение: со словарём и без, сжатие

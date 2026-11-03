@@ -144,8 +144,10 @@ mtime каталога, меняющемуся при создании/удал�
 **Групповая фиксация (T-102).** Доставка воркера сохраняет несколько
 страниц сразу, и платить fsync-на-блок за каждую расточительно: `PutBatch`
 (необязательное расширение `BatchStore`) фиксирует пачку контентов одной
-групповой фиксацией — дедуп-пачка одним `UPDATE … WHERE hash = ANY(…)
-RETURNING`, затем под **одним** захватом мьютекса и flock: дописывание
+групповой фиксацией — дедуп-пачка одним `UPDATE … FROM unnest(хэши,
+счётчики копий) … RETURNING` (приращение — счётчик копий хэша в пачке:
+каждый Put элемента добавляет ссылку, T-228), затем под **одним** захватом
+мьютекса и flock: дописывание
 всех блоков, **один fsync пачки**, **один пакетный INSERT** метаданных
 (unnest-массивы; дубликаты хэша внутри пачки сведены в одну строку со
 счётчиком ссылок — `ON CONFLICT` не может затрагивать одну строку
@@ -180,7 +182,7 @@ Get не блокирует: паки append-only, зафиксированны�
 |---|---|
 | Put, дедуп | `UPDATE contents SET refcount = refcount + 1 WHERE hash = $1 AND refcount > 0` |
 | Put, новый блок | `INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) VALUES (…) ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + 1, pack_id = EXCLUDED.pack_id, off = EXCLUDED.off, … RETURNING (xmax = 0)` |
-| PutBatch, дедуп-пачка (T-102) | `UPDATE contents SET refcount = refcount + 1 WHERE hash = ANY($1::bytea[]) AND refcount > 0 RETURNING hash` |
+| PutBatch, дедуп-пачка (T-102) | `UPDATE contents SET refcount = refcount + v.c FROM unnest($1::bytea[], $2::int4[]) AS v(h, c) WHERE hash = v.h AND refcount > 0 RETURNING hash` (приращение — счётчик копий, T-228) |
 | PutBatch, новые блоки (T-102) | `INSERT INTO contents (…) SELECT … FROM unnest($1::bytea[], …, $6::int4[]) AS v(…) ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + EXCLUDED.refcount, … RETURNING hash, (xmax = 0)` |
 | Get | `SELECT pack_id, off, len, raw_len FROM contents WHERE hash = $1 AND refcount > 0` |
 | Delete | `UPDATE contents SET refcount = refcount - 1 WHERE hash = $1 AND refcount > 0` |

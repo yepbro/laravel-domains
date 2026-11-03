@@ -64,8 +64,9 @@ func countSQL(calls []packCall, sql string) int {
 // Точные тексты пакетных операторов (против схемы 000001, стиль
 // TestPackSQLContract).
 const (
-	wantSQLAddRefBatch = "UPDATE contents SET refcount = refcount + 1 " +
-		"WHERE hash = ANY($1::bytea[]) AND refcount > 0 RETURNING hash"
+	wantSQLAddRefBatch = "UPDATE contents SET refcount = refcount + v.c " +
+		"FROM unnest($1::bytea[], $2::int4[]) AS v(h, c) " +
+		"WHERE hash = v.h AND refcount > 0 RETURNING hash"
 	wantSQLPutBatch = "INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) " +
 		"SELECT hash, pack_id, off, len, raw_len, n " +
 		"FROM unnest($1::bytea[], $2::int4[], $3::int8[], $4::int4[], $5::int4[], $6::int4[]) " +
@@ -77,8 +78,9 @@ const (
 )
 
 // TestPutBatchSQLContract — тексты и аргументы пакетных операторов: хэши
-// []byte[16], идентификаторы пака int32, смещения int64, длины/счётчики
-// int32; одна команда дедупа и одна фиксация на пачку.
+// []byte[16] с счётчиками копий int32 (дедуп-пачка), идентификаторы пака
+// int32, смещения int64, длины/счётчики int32; одна команда дедупа и одна
+// фиксация на пачку.
 func TestPutBatchSQLContract(t *testing.T) {
 	if sqlMetaAddRefBatch != wantSQLAddRefBatch || sqlMetaPutBatch != wantSQLPutBatch {
 		t.Fatal("SQL групповой фиксации изменился — обновите контракт и schema_test")
@@ -99,8 +101,20 @@ func TestPutBatchSQLContract(t *testing.T) {
 	if calls[0].sql != sqlMetaAddRefBatch || calls[1].sql != sqlMetaPutBatch {
 		t.Fatalf("порядок SQL: %q, %q — want addRefBatch, putBatch", calls[0].sql, calls[1].sql)
 	}
+	if len(calls[0].args) != 2 {
+		t.Fatalf("addRefBatch: аргументов %d, want 2 (хэши, счётчики копий)", len(calls[0].args))
+	}
 	if hashes, ok := calls[0].args[0].([][]byte); !ok || len(hashes) != 2 {
 		t.Errorf("addRefBatch: аргумент %T(%d), want [][]byte(2)", calls[0].args[0], len(hashes))
+	}
+	if counts, ok := calls[0].args[1].([]int32); !ok || len(counts) != 2 {
+		t.Errorf("addRefBatch: счётчики %T(%d), want []int32(2)", calls[0].args[1], len(counts))
+	} else {
+		for i, c := range counts {
+			if c != 1 {
+				t.Errorf("addRefBatch: счётчик %d = %d, want 1 (в пачке без дублей)", i, c)
+			}
+		}
 	}
 	args := calls[1].args
 	if len(args) != 6 {
@@ -253,6 +267,82 @@ func TestPutBatchDuplicatesAndDedup(t *testing.T) {
 		if got, err := st.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
 			t.Errorf("Get: %v (совпадение = %v)", err, string(got) == string(d))
 		}
+	}
+}
+
+// TestPutBatchDuplicateRefsBothPaths — дубликаты одного хэша в пачке на
+// обоих путях фиксации, таблицей (T-228, латентный дефект: дедуп-UPDATE
+// приращал ровно +1 независимо от числа копий — ссылки занижались, и
+// при появлении пачечного писателя компактификация удалила бы ещё
+// нужный блок):
+//
+//	путь                       | refcount
+//	----------------------------+------------------------------------
+//	живой хэш, 1 ссылка до пачки| 1 + n копий (дедуп, sqlMetaAddRefBatch)
+//	новый хэш                   | n копий      (INSERT, counts → sqlMetaPutBatch)
+//
+// Ссылки настоящие: исчерпание Delete × refcount убивает контент.
+func TestPutBatchDuplicateRefsBothPaths(t *testing.T) {
+	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
+	ctx := context.Background()
+
+	live := []byte("<html>живой до пачки, в пачке трижды</html>")
+	if _, err := st.Put(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	fresh := []byte("<html>новый контент, в пачке трижды</html>")
+
+	results, errs, err := st.PutBatch(ctx, [][]byte{live, live, live, fresh, fresh, fresh})
+	if err != nil {
+		t.Fatalf("PutBatch: %v", err)
+	}
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("элемент %d: %v", i, e)
+		}
+	}
+	// Created: live — дедуп (байтов нет), fresh — первый элемент пишет
+	// байты, повторы хэша — нет.
+	for i, want := range []bool{false, false, false, true, false, false} {
+		if results[i].Created != want {
+			t.Errorf("элемент %d: Created = %v, want %v", i, results[i].Created, want)
+		}
+	}
+	for h, want := range map[Hash]int32{HashOf(live): 4, HashOf(fresh): 3} {
+		row, ok := pool.row(h)
+		if !ok {
+			t.Fatalf("%s: нет строки", h)
+		}
+		if row.refc != want {
+			t.Errorf("%s: refcount = %d, want %d (каждая копия в пачке — ссылка)", h, row.refc, want)
+		}
+	}
+
+	// Ссылки настоящие, а не число: исчерпание Delete × refcount.
+	for i := 0; i < 3; i++ {
+		if err := st.Delete(ctx, HashOf(live)); err != nil {
+			t.Fatalf("Delete живого %d из 4: %v", i+1, err)
+		}
+		if _, err := st.Get(ctx, HashOf(live)); err != nil {
+			t.Fatalf("Get живого после Delete %d из 4: %v (контент ещё нужен)", i+1, err)
+		}
+	}
+	if err := st.Delete(ctx, HashOf(live)); err != nil {
+		t.Fatal("Delete четвёртой ссылки живого")
+	}
+	if _, err := st.Get(ctx, HashOf(live)); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get живого после 4 Delete: %v, want ErrNotFound", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := st.Delete(ctx, HashOf(fresh)); err != nil {
+			t.Fatalf("Delete свежего %d из 3: %v", i+1, err)
+		}
+	}
+	if err := st.Delete(ctx, HashOf(fresh)); err != nil {
+		t.Fatal("Delete третьей ссылки свежего")
+	}
+	if _, err := st.Get(ctx, HashOf(fresh)); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get свежего после 3 Delete: %v, want ErrNotFound", err)
 	}
 }
 
