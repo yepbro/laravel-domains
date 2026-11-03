@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -484,6 +485,211 @@ func TestBruteForceSuccessResets(t *testing.T) {
 		if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
 			t.Fatalf("неудача после сброса %d: %d, хочу 401 (окно началось заново)", i+1, rec.Code)
 		}
+	}
+}
+
+// countingVerifier — заглушка сверки пароля (шов passwordVerifier,
+// T-231): считает вызовы Verify — каждая сверка на проде это один
+// PBKDF2 (~полсекунды CPU), счётчик наблюдает стоимость KDF без
+// реальной деривации. cost имитирует время KDF: запрос удерживается
+// между проверкой лимита и записью неудачи, так что гонка неатомарного
+// окна (отдельные check и record вокруг сверки) проявляется
+// детерминированно; verdict — исход сверки.
+type countingVerifier struct {
+	calls   atomic.Int64
+	cost    time.Duration
+	verdict bool
+}
+
+func (v *countingVerifier) Verify(string) bool {
+	v.calls.Add(1)
+	time.Sleep(v.cost)
+	return v.verdict
+}
+
+// TestBruteForceConcurrentBatch — параллельная пачка неудачных
+// Basic-запросов с одного IP не доходит до KDF вся целиком (T-231):
+// слот неудачи резервируется атомарно с проверкой лимита, до сверки,
+// поэтому из 10 одновременных попыток её проходят ровно
+// maxLoginFailures, остальные — 429 без вызова Verify. До фикса
+// (check и record по разные стороны сверки) вся пачка видела окно
+// незаполненным и тратила KDF на каждый запрос — лимит держал только
+// последовательные попытки (CPU-DoS).
+func TestBruteForceConcurrentBatch(t *testing.T) {
+	verifier := &countingVerifier{cost: 5 * time.Millisecond}
+	srv := newTestServer(t, nil)
+	srv.verify = verifier
+	h := srv.Handler()
+
+	const n = 10
+	codes := make([]int, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // общий барьер: пачка приходит одновременно
+			codes[i] = doReq(h, http.MethodGet, "/", "10.0.0.13:1313",
+				map[string]string{"Authorization": basic(testUser, "wrong")}).Code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	unauthorized, limited := 0, 0
+	for _, c := range codes {
+		switch c {
+		case http.StatusUnauthorized:
+			unauthorized++
+		case http.StatusTooManyRequests:
+			limited++
+		default:
+			t.Fatalf("параллельная пачка: неожиданный статус %d (хочу 401 или 429)", c)
+		}
+	}
+	if unauthorized != maxLoginFailures || limited != n-maxLoginFailures {
+		t.Errorf("параллельная пачка %d: 401=%d, 429=%d, хочу %d и %d — слоты достаются ровно %d попыткам",
+			n, unauthorized, limited, maxLoginFailures, n-maxLoginFailures, maxLoginFailures)
+	}
+	if calls := verifier.calls.Load(); calls > maxLoginFailures {
+		t.Errorf("Verify вызван %d раз при параллельной пачке %d, хочу ≤%d (KDF за лимитом не выполняется)",
+			calls, n, maxLoginFailures)
+	}
+}
+
+// TestBruteForceConcurrentSuccessBatch — граница резервирования (T-231):
+// слот занимается до сверки, поэтому из одновременных валидных попыток
+// сверх maxLoginFailures лишние получают 429 — потолок одновременных
+// сверок с IP, осознанный компромисс варианта A (браузер после первой
+// сверки ходит с cookie). Успехи окно не копят: после пачки вход
+// проходит свободно.
+func TestBruteForceConcurrentSuccessBatch(t *testing.T) {
+	verifier := &countingVerifier{cost: 5 * time.Millisecond, verdict: true}
+	srv := newTestServer(t, nil)
+	srv.verify = verifier
+	h := srv.Handler()
+	authHeader := authed()
+
+	const n = maxLoginFailures + 1
+	codes := make([]int, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			codes[i] = doReq(h, http.MethodGet, "/", "10.0.0.15:1515", authHeader).Code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	passed, limited := 0, 0
+	for _, c := range codes {
+		switch c {
+		case http.StatusOK:
+			passed++
+		case http.StatusTooManyRequests:
+			limited++
+		default:
+			t.Fatalf("параллельные валидные попытки: неожиданный статус %d", c)
+		}
+	}
+	if passed != maxLoginFailures || limited != 1 {
+		t.Errorf("параллельные валидные %d: 200=%d, 429=%d, хочу %d и 1 (потолок одновременных сверок)",
+			n, passed, limited, maxLoginFailures)
+	}
+	// Успехи списывают слоты сбросом окна — следующая попытка свободна.
+	if rec := doReq(h, http.MethodGet, "/", "10.0.0.15:1515", authHeader); rec.Code != http.StatusOK {
+		t.Errorf("вход после пачки успехов: %d, хочу 200 (окно не заполнено успехами)", rec.Code)
+	}
+}
+
+// TestBruteForcePartialWindowExpiry — частичное окно истекает целиком:
+// после паузы больше окна счётчик не наследует «хвост» прошлых неудач
+// (регрессия P1 ревью T-231 — сброс истёкшего окна обязан работать и
+// при fails < max, как в старом record). Одна неудача → пауза > окна →
+// новое окно принимает ровно maxLoginFailures сверок, следующая — 429.
+func TestBruteForcePartialWindowExpiry(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)}
+	verifier := &countingVerifier{}
+	srv := newTestServer(t, func(o *Options) { o.Now = clock.Now })
+	srv.verify = verifier
+	h := srv.Handler()
+	bad := map[string]string{"Authorization": basic(testUser, "wrong")}
+	const ip = "10.0.0.16:1616"
+
+	// Одна неудача: окно начато, но не заполнено.
+	if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("одиночная неудача: %d, хочу 401", rec.Code)
+	}
+	// Пауза больше окна: следующая минута начинается с чистого счётчика.
+	clock.now = clock.now.Add(loginWindow + time.Second)
+	for i := 0; i < maxLoginFailures; i++ {
+		if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("неудача нового окна %d: %d, хочу 401 (хвост старого окна не переносится)", i+1, rec.Code)
+		}
+	}
+	if calls := verifier.calls.Load(); calls != maxLoginFailures+1 {
+		t.Fatalf("Verify: %d вызовов, хочу %d (одна + новое окно без хвоста)", calls, maxLoginFailures+1)
+	}
+	if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("попытка сверх нового окна: %d, хочу 429", rec.Code)
+	}
+	if calls := verifier.calls.Load(); calls != maxLoginFailures+1 {
+		t.Errorf("429 потратил сверку: Verify %d, хочу прежние %d", calls, maxLoginFailures+1)
+	}
+}
+
+// TestBruteForceVerifyBudget — бюджет сверок за окно исчерпывается
+// ровно на maxLoginFailures попытках (критерий T-231): шестая неудача
+// и верные креды с заполненным окном — 429 без вызова Verify; после
+// истечения окна успех сбрасывает его (зарезервированный слот списан),
+// и неудачная попытка снова тратит сверку.
+func TestBruteForceVerifyBudget(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)}
+	verifier := &countingVerifier{}
+	srv := newTestServer(t, func(o *Options) { o.Now = clock.Now })
+	srv.verify = verifier
+	h := srv.Handler()
+	bad := map[string]string{"Authorization": basic(testUser, "wrong")}
+	const ip = "10.0.0.14:1414"
+
+	// Пять последовательных неудач — сверка на каждой, окно заполнено.
+	for i := 0; i < maxLoginFailures; i++ {
+		if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("неудача %d: %d", i+1, rec.Code)
+		}
+	}
+	if calls := verifier.calls.Load(); calls != maxLoginFailures {
+		t.Fatalf("после %d неудач Verify вызван %d раз, хочу %d", maxLoginFailures, calls, maxLoginFailures)
+	}
+
+	// Шестая (неверные и верные креды) — 429 без сверки.
+	for i, header := range []map[string]string{bad, authed()} {
+		if rec := doReq(h, http.MethodGet, "/", ip, header); rec.Code != http.StatusTooManyRequests {
+			t.Errorf("попытка %d с заполненным окном: %d, хочу 429", i+1, rec.Code)
+		}
+	}
+	if calls := verifier.calls.Load(); calls != maxLoginFailures {
+		t.Errorf("429 потратил сверку: Verify %d раз, хочу прежние %d", calls, maxLoginFailures)
+	}
+
+	// Окно истекло — успешный вход сбрасывает его, следующая неудача
+	// снова выполняет сверку (окно началось заново).
+	clock.now = clock.now.Add(loginWindow + time.Second)
+	verifier.verdict = true
+	if rec := doReq(h, http.MethodGet, "/", ip, authed()); rec.Code != http.StatusOK {
+		t.Fatalf("вход после истечения окна: %d, хочу 200", rec.Code)
+	}
+	verifier.verdict = false
+	if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("неудача после успешного входа: %d, хочу 401 (окно сброшено)", rec.Code)
+	}
+	if calls := verifier.calls.Load(); calls != maxLoginFailures+2 {
+		t.Errorf("Verify после сброса окна: %d вызовов, хочу %d (вход + неудача)", calls, maxLoginFailures+2)
 	}
 }
 

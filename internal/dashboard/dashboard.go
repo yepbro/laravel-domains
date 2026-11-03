@@ -64,6 +64,14 @@ type Options struct {
 	Snapshots SnapshotSource
 }
 
+// passwordVerifier — сверка пароля оператора (§7.4); интерфейсу
+// удовлетворяет auth.PasswordHash. Отдельный тип, а не конкретная
+// структура, — шов тестов защиты от подбора (§7.6, T-231): подмена
+// считает вызовы KDF, не выполняя реального PBKDF2.
+type passwordVerifier interface {
+	Verify(password string) bool
+}
+
 // Server — публичный HTTP-сервер дашборда.
 type Server struct {
 	db       Pinger
@@ -71,7 +79,11 @@ type Server struct {
 	opt      Options
 	username string
 	hash     auth.PasswordHash
-	limiter  *loginLimiter
+	// verify — сверка пароля Basic-запросов; New ставит hash.
+	// Поля hash и verify разделены: hash.Key нужен подписи cookie-сессий
+	// (§7.5) и остаётся конкретным типом.
+	verify  passwordVerifier
+	limiter *loginLimiter
 }
 
 // ParseCredentials — стартовая проверка кредов (ТЗД §7.7): пустые
@@ -126,6 +138,7 @@ func New(db Pinger, cfg *config.Config, opts Options) (*Server, error) {
 		opt:      opts,
 		username: cfg.Dashboard.Username,
 		hash:     hash,
+		verify:   hash,
 		limiter:  newLoginLimiter(maxLoginFailures, loginWindow),
 	}, nil
 }
