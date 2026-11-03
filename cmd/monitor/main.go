@@ -233,7 +233,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// monitor — UPDATE по 47 млн строк каждые 30 мин (T-199), замер §12 —
 	// исключены application_name пула). Полный посмертный след — журнал
 	// сервера (log_min_duration_statement, deploy/postgres). 0 — цикл
-	// выключен (SlowQueryLoop молча выйдет).
+	// выключен (SlowQueryLoop молча выйдет). Доставка в Telegram —
+	// только при monitor.slow_query_telegram (по умолчанию выключена:
+	// диагностика уже видна в журнале monitor, метриках и логе сервера);
+	// без флага Notify nil — цикл ограничен Warn в журнал и метриками.
+	var slowQueryNotify func(string)
+	if cfg.Monitor.SlowQueryTelegram {
+		slowQueryNotify = telegram.Send
+	}
 	go func() {
 		bg <- monitor.SlowQueryLoop(ctx, monitor.PGSlowQueries{
 			Pool:       pool,
@@ -243,7 +250,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			MinDuration: cfg.Monitor.SlowQueryMinDuration.D(),
 			Log:         logger,
 			Metrics:     reg,
-			Notify:      telegram.Send,
+			Notify:      slowQueryNotify,
 		})
 	}()
 

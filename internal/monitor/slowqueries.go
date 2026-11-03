@@ -3,9 +3,11 @@
 // pg_stat_activity — клиентские операторы, выполняемые дольше
 // monitor.slow_query_min_duration (по умолчанию 3 с — порог боевого
 // лога log_min_duration_statement, deploy/postgres/postgresql.conf),
-// уходит одним сообщением в Telegram (Notify-хук — TelegramNotifier.Send,
-// та же доставка, что алерты T-162 и отчёт нагрузки T-173), дублируется
-// Warn в журнал monitor и метриками crawler_pg_slow_queries*.
+// уходят одним сообщением в Telegram (Notify-хук — TelegramNotifier.Send,
+// та же доставка, что алерты T-162 и отчёт нагрузки T-173; доставка
+// включается конфигом monitor.slow_query_telegram — по умолчанию
+// выключена, Notify nil), дублируются Warn в журнал monitor и метриками
+// crawler_pg_slow_queries*.
 //
 // Две наблюдательные поверхности не дублируют друг друга:
 //

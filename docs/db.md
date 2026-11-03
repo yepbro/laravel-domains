@@ -310,8 +310,10 @@ per-table значения пришлось бы дублировать в ка�
 медленных запросов monitor (`internal/monitor/slowqueries.go`,
 `monitor.slow_query_min_duration`): опрашивает `pg_stat_activity` и
 отправляет выполняемые дольше порога операторы в Telegram той же
-доставкой, что алерты (debounce pid+query_start; свои агрегаты monitor
-исключены по `application_name` пула, метки сервисов в сообщении — от
+доставкой, что алерты, при `monitor.slow_query_telegram` (по умолчанию
+выключена — Warn в журнал и метрики; debounce pid+query_start; свои
+агрегаты monitor исключены по `application_name` пула, метки сервисов
+в сообщении — от
 туда же; полный посмертный след остаётся в журнале сервера). Для текста
 чужих сессий в `pg_stat_activity` роли БД нужен
 `GRANT pg_read_all_stats` (deploy.md §4.1) — без него сообщение честно

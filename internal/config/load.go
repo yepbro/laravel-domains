@@ -181,6 +181,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_MONITOR_LOAD_REPORT_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.LoadReportInterval })},
 		{"CRAWLER_MONITOR_SLOW_QUERY_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.SlowQueryInterval })},
 		{"CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION", setDuration(func(c *Config) *Duration { return &c.Monitor.SlowQueryMinDuration })},
+		{"CRAWLER_MONITOR_SLOW_QUERY_TELEGRAM", setBool(func(c *Config) *bool { return &c.Monitor.SlowQueryTelegram })},
 		{"CRAWLER_MONITOR_RENDER_DEBT_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.RenderDebtInterval })},
 		{"CRAWLER_MONITOR_INGEST_METRICS_URL", setString(func(c *Config) *string { return &c.Monitor.IngestMetricsURL })},
 		{"CRAWLER_MONITOR_ALERTS_TELEGRAM", setBool(func(c *Config) *bool { return &c.Monitor.Alerts.Telegram })},

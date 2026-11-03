@@ -990,6 +990,7 @@ rules:
 | `load_report_interval` | `CRAWLER_MONITOR_LOAD_REPORT_INTERVAL` | длительность | `10m` (0 — выключен; коридор 1m..1h; T-173) |
 | `slow_query_interval` | `CRAWLER_MONITOR_SLOW_QUERY_INTERVAL` | длительность | `10s` (0 — выключен; коридор 5s..10m; T-177) |
 | `slow_query_min_duration` | `CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION` | длительность | `3s` (0 — дефолт; коридор 1s..1h; T-177) |
+| `slow_query_telegram` | `CRAWLER_MONITOR_SLOW_QUERY_TELEGRAM` | bool | `false` (T-177) |
 | `render_debt_interval` | `CRAWLER_MONITOR_RENDER_DEBT_INTERVAL` | длительность | `5m` (коридор 30s..1h; T-175) |
 | `ingest_metrics_url` | `CRAWLER_MONITOR_INGEST_METRICS_URL` | http(s)-URL | `http://127.0.0.1:9101/metrics` |
 | `alerts.telegram` | `CRAWLER_MONITOR_ALERTS_TELEGRAM` | bool | `true` (T-162) |
@@ -1083,6 +1084,12 @@ pid: текст» (обрезка 160 символов; полный текст 
 метриками `crawler_pg_slow_queries` / `crawler_pg_slow_queries_total`
 (метка `app`). `slow_query_interval: 0` — выключить (коридор 5s..10m),
 `slow_query_min_duration` — коридор 1s..1h, `0` — дефолт цикла.
+`slow_query_telegram` — доставка медленных запросов в Telegram:
+по умолчанию `false` — цикл ограничен Warn в журнал и метриками
+(медленный запрос — диагностика, уже продублированная журналом сервера
+PostgreSQL, а не событие, требующее реакции «сейчас», как алерты);
+`true` — сообщениями той же доставки, что алерты (`alerts.telegram` —
+секреты и скрипт одни).
 `render_debt_interval` — период цикла рендер-долга (T-175; алерт
 `render_debt` оценивается проходом алертов по `alerts_interval` (T-206),
 это поле задаёт только свежесть gauge и сводки): раз в период

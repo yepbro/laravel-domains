@@ -118,6 +118,7 @@ func TestDefault(t *testing.T) {
 		{"monitor.alerts_interval", c.Monitor.AlertsInterval.D(), 5 * time.Minute},
 		{"monitor.slow_query_interval", c.Monitor.SlowQueryInterval.D(), 10 * time.Second},
 		{"monitor.slow_query_min_duration", c.Monitor.SlowQueryMinDuration.D(), 3 * time.Second},
+		{"monitor.slow_query_telegram", c.Monitor.SlowQueryTelegram, false},
 		{"monitor.ingest_metrics_url", c.Monitor.IngestMetricsURL, "http://127.0.0.1:9101/metrics"},
 		{"monitor.alerts.telegram", c.Monitor.Alerts.Telegram, true},
 		{"monitor.alerts.telegram_script", c.Monitor.Alerts.TelegramScript, "/opt/crawler/bin/telegram-notify.sh"},
@@ -274,6 +275,7 @@ monitor:
   alerts_interval: "2m"
   slow_query_interval: "15s"
   slow_query_min_duration: "5s"
+  slow_query_telegram: true
   render_debt_interval: "2m"
   alerts:
     telegram: false
@@ -378,6 +380,7 @@ log:
 		{"monitor.alerts_interval", cfg.Monitor.AlertsInterval.D(), 2 * time.Minute},
 		{"monitor.slow_query_interval", cfg.Monitor.SlowQueryInterval.D(), 15 * time.Second},
 		{"monitor.slow_query_min_duration", cfg.Monitor.SlowQueryMinDuration.D(), 5 * time.Second},
+		{"monitor.slow_query_telegram", cfg.Monitor.SlowQueryTelegram, true},
 		{"monitor.alerts.telegram", cfg.Monitor.Alerts.Telegram, false},
 		{"monitor.alerts.telegram_script", cfg.Monitor.Alerts.TelegramScript, "/srv/telegram-notify.sh"},
 		{"monitor.alerts.disk_free_min_bytes", cfg.Monitor.Alerts.DiskFreeMinBytes.B(), int64(20 << 30)},
@@ -669,6 +672,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_MONITOR_ALERTS_INTERVAL":             "75s",
 		"CRAWLER_MONITOR_SLOW_QUERY_INTERVAL":         "20s",
 		"CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION":     "7s",
+		"CRAWLER_MONITOR_SLOW_QUERY_TELEGRAM":         "true",
 		"CRAWLER_MONITOR_INGEST_METRICS_URL":          "http://env-ingest:9101/metrics",
 		"CRAWLER_MONITOR_ALERTS_TELEGRAM":             "false",
 		"CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT":      "/env/telegram-notify.sh",
@@ -773,6 +777,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"monitor.alerts_interval", cfg.Monitor.AlertsInterval.D(), 75 * time.Second},
 		{"monitor.slow_query_interval", cfg.Monitor.SlowQueryInterval.D(), 20 * time.Second},
 		{"monitor.slow_query_min_duration", cfg.Monitor.SlowQueryMinDuration.D(), 7 * time.Second},
+		{"monitor.slow_query_telegram", cfg.Monitor.SlowQueryTelegram, true},
 		{"monitor.ingest_metrics_url", cfg.Monitor.IngestMetricsURL, "http://env-ingest:9101/metrics"},
 		{"monitor.alerts.telegram", cfg.Monitor.Alerts.Telegram, false},
 		{"monitor.alerts.telegram_script", cfg.Monitor.Alerts.TelegramScript, "/env/telegram-notify.sh"},

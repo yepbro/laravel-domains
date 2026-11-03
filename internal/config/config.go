@@ -527,14 +527,22 @@ type Monitor struct {
 	LoadReportInterval Duration `yaml:"load_report_interval"`
 	// SlowQueryInterval — период опроса pg_stat_activity на медленные
 	// запросы (T-177): выполняемые дольше SlowQueryMinDuration
-	// клиентские операторы уходят в Telegram той же доставкой, что
-	// алерты/отчёт нагрузки; 0 — цикл выключен.
+	// клиентские операторы уходят в Telegram (SlowQueryTelegram ниже)
+	// той же доставкой, что алерты/отчёт нагрузки; 0 — цикл выключен.
 	SlowQueryInterval Duration `yaml:"slow_query_interval"`
 	// SlowQueryMinDuration — порог медленного запроса (T-177): 3 с —
 	// порог боевого лога log_min_duration_statement (deploy/postgres/
 	// postgresql.conf), одна граница «патология» в журнале сервера и в
 	// Telegram. 0 — дефолт цикла.
 	SlowQueryMinDuration Duration `yaml:"slow_query_min_duration"`
+	// SlowQueryTelegram — доставка медленных запросов (T-177) в
+	// Telegram той же доставкой, что алерты и отчёт нагрузки. false —
+	// по умолчанию: медленный запрос — диагностика, а не переход
+	// состояния, требующий реакции «сейчас» (как алерты T-162), он уже
+	// виден в трёх поверхностях — Warn журнал monitor, метрики
+	// crawler_pg_slow_queries* и полный посмертный след в журнале
+	// сервера; в группу Telegram уходит только по явному включению.
+	SlowQueryTelegram bool `yaml:"slow_query_telegram"`
 	// RenderDebtInterval — период цикла рендер-долга (T-175): gauge
 	// crawler_render_pending_domains + строка сводки в журнал; проход —
 	// точечный Lookup счётчика и XLEN q:render (миллисекунды). Алерт
@@ -943,6 +951,14 @@ func Default() *Config {
 			// log_min_duration_statement.
 			SlowQueryInterval:    Duration(10 * time.Second),
 			SlowQueryMinDuration: Duration(3 * time.Second),
+			// Telegram-доставка медленных запросов выключена: в
+			// отличие от алертов (Telegram: true выше — оператор
+			// журналы не читает, мотивация T-162) медленный запрос
+			// — диагностика, уже продублированная журналом monitor,
+			// метриками и логом сервера PostgreSQL; доставка в
+			// группу — осознанный выбор (обоснование — поле
+			// SlowQueryTelegram).
+			SlowQueryTelegram: false,
 			// Рендер-долг (T-175): 5 минут (паритет с пересчётом зон
 			// закончился — T-199 разредил реконсиляцию до 30 мин);
 			// проход дешёвый (Lookup + XLEN), период выбирает свежесть

@@ -273,9 +273,12 @@ make logs SERVICE=monitor | grep -i warn      # dev
 
 Той же доставкой отправляются ещё два типа сообщений monitor: отчёт
 нагрузки 📊 (T-173, раз в `monitor.load_report_interval`) и извещения о
-медленных запросах PostgreSQL 🐌 (T-177): операторы, выполняемые дольше
-`monitor.slow_query_min_duration` (3 с), — по одному сообщению на
-каждый новый (дебаунс pid+query_start), с меткой сервиса и pid; полный
+медленных запросах PostgreSQL 🐌 (T-177, только при
+`monitor.slow_query_telegram` — по умолчанию выключена): операторы,
+выполняемые дольше `monitor.slow_query_min_duration` (3 с), — по одному
+сообщению на каждый новый (дебаунс pid+query_start), с меткой сервиса
+и pid; без флага цикл ограничен Warn в журнале monitor и метриками,
+полный
 лог медленных операторов — журнал сервера PostgreSQL
 (`log_min_duration_statement = 3s`, [db.md](db.md) §«Мониторинг»). Для
 текстов чужих сессий нужен `GRANT pg_read_all_stats` роли `crawler`
