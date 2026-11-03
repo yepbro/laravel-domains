@@ -27,6 +27,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -78,7 +79,9 @@ func main() {
 // (метрика длин очередей, ТЗ 5.9). Завершение — отмена ctx (graceful
 // shutdown, ТЗ 3.4): задачи дорабатываются (каждая ограничена
 // render.timeout) или возвращаются очереди повторной доставкой
-// (Processing, T-025).
+// (Processing, T-025); фоновые циклы (DiskWatchLoop, коллектор q:render)
+// гасятся производной отменой и джойнятся до defer-закрытий rdb/store
+// (T-232).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("render-worker: пул БД не получен (postgres.dsn обязателен)")
@@ -121,10 +124,6 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// в реестре видно сразу при старте.
 	content.WarnDictMismatch(store.Dir(), logger)
 
-	// Контроль свободного места каталога контента (T-046, ТЗ 8):
-	// периодический наблюдатель горутиной, завершается с отменой ctx.
-	go func() { _ = content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger}) }()
-
 	// Очередь: потребление q:render и XACK проходят прозрачно, публикация
 	// q:analyze — под гейтом backpressure (T-026: порог общий для
 	// гейтируемых стримов; как у dns-worker с q:http и http-worker с
@@ -132,6 +131,42 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// render.queue_high_watermark, T-174).
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
+
+	// Джойн фоновых циклов (T-232, инвариант http-worker T-223):
+	// производная отмена + WaitGroup. Каркас отменяет ctx OnRun только
+	// после его возврата (internal/service: cancelRun после onRunDone) —
+	// ранний выход run из конструктора ниже (renderworker.New) или паника
+	// обязаны останавливать циклы сами, иначе defer-закрытия rdb/store
+	// (LIFO ниже) закроют ресурсы под серединой прохода DiskWatchLoop
+	// (store) или запроса глубины q:render (gate.Len → rdb); до T-232
+	// оба цикла жили fire-and-forget. Джойн — defer, зарегистрированный
+	// ПОСЛЕ defer-закрытий выше → исполняется ДО них и до закрытия
+	// менеджера Chromium (LIFO). WaitGroup, а не канал ёмкости: джойн
+	// ждёт ровно запущенное (Add/Done по месту запуска) — ранний выход с
+	// частью циклов не виснет на «недостающих» приёмах. Ошибки циклов
+	// отбрасываются сознательно: каждый цикл логирует свои сбои сам.
+	// Инварианты закреплены структурным тестом TestRunBackgroundJoin
+	// (main_test.go, разборщик — internal/bgjoin).
+	ctx, cancel := context.WithCancel(ctx)
+	var bg sync.WaitGroup
+	defer func() {
+		// Штатно ctx уже отменён каркасом к моменту возврата run;
+		// ранний выход/паника гасят ещё живые циклы здесь — до
+		// defer-закрытий (LIFO).
+		cancel()
+		bg.Wait()
+	}()
+
+	// Контроль свободного места каталога контента (T-046, ТЗ 8):
+	// периодический наблюдатель горутиной (не зависит от цикла задач),
+	// Warn и событие при входе в паузу записи/восстановлении; завершается
+	// с отменой ctx.
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		_ = content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger})
+	}()
+
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
 		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
@@ -155,7 +190,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Длина потребляемого стрима q:render → crawler_queue_depth (T-077):
 	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
+	bg.Add(1)
 	go func() {
+		defer bg.Done()
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamRender}, metrics.DefaultQueueCollectInterval, logger)
 	}()
@@ -194,5 +231,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	if err != nil {
 		return err
 	}
+	// Главный цикл живёт до отмены ctx (graceful shutdown); джойн
+	// фоновых циклов — defer выше: любой выход run (штатный, ранний из
+	// конструктора, паника) сначала гасит и дожидается циклы, и лишь
+	// затем LIFO закрывает rdb/store/менеджера Chromium.
 	return renderworker.Run(ctx, w, opts)
 }

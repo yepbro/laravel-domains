@@ -23,6 +23,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -76,7 +77,9 @@ func main() {
 // и переключений на резерв (метрика глубины очередей — ТЗ 5.9: backlog
 // стрима, который потребляет этот воркер). Завершение — отмена ctx
 // (graceful shutdown, ТЗ 3.4): начатые эпизоды дорабатывают или
-// возвращаются очереди повторной доставкой (Processing, T-025).
+// возвращаются очереди повторной доставкой (Processing, T-025);
+// фоновые коллекторы гасятся производной отменой и джойнятся до
+// defer-закрытий rdb/резолверов (T-232).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("dns-worker: пул БД не получен (postgres.dsn обязателен)")
@@ -151,6 +154,27 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
 	}), gate)
 
+	// Джойн фоновых циклов (T-232, инвариант http-worker T-223):
+	// производная отмена + WaitGroup. Каркас отменяет ctx OnRun только
+	// после его возврата (internal/service: cancelRun после onRunDone);
+	// паника в цикле воркера обязана останавливать коллекторы сама, иначе
+	// defer-закрытия rdb/клиентов цепи (LIFO ниже) закроют ресурсы под
+	// запросом глубины q:dns (gate.Len → rdb); до T-232 все три
+	// коллектора жили fire-and-forget. Джойн — defer, зарегистрированный
+	// ПОСЛЕ defer-закрытий выше → исполняется ДО них (LIFO). WaitGroup,
+	// а не канал ёмкости: джойн ждёт ровно запущенное (Add/Done по месту
+	// запуска). Инварианты закреплены структурным тестом
+	// TestRunBackgroundJoin (main_test.go, разборщик — internal/bgjoin).
+	ctx, cancel := context.WithCancel(ctx)
+	var bg sync.WaitGroup
+	defer func() {
+		// Штатно ctx уже отменён каркасом к моменту возврата run;
+		// ранняя паника гасит ещё живые коллекторы здесь — до
+		// defer-закрытий (LIFO).
+		cancel()
+		bg.Wait()
+	}()
+
 	// Возврат зависших доставок q:dns (T-025): RecoverLoop в воркере —
 	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
 	// и темпа — секция redis (max_attempts, claim_min_idle,
@@ -165,7 +189,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Длина потребляемого стрима q:dns → crawler_queue_depth (T-077):
 	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
+	bg.Add(1)
 	go func() {
+		defer bg.Done()
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamDNS}, metrics.DefaultQueueCollectInterval, logger)
 	}()
@@ -174,7 +200,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// потолки после адаптива, доля таймаутов в окне, обмены в полёте —
 	// тихая деградация резолвера (снижение до пола) видна метрикой,
 	// а не только ростом temp_error (DNS-06).
+	bg.Add(1)
 	go func() {
+		defer bg.Done()
 		_ = dnsworker.CollectLimitLoop(ctx, reg, resolve.Stats, 0, logger)
 	}()
 
@@ -183,10 +211,16 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// unbound при живом резерве (лимитёр при этом «здоров» — адаптив
 	// видит итог-успех), crawler_dns_fallback_exhausted_total — не
 	// ответил никто, завтрашние temp_error.
+	bg.Add(1)
 	go func() {
+		defer bg.Done()
 		_ = dnsworker.CollectFallbackLoop(ctx, reg, fallback.Stats, 0, logger)
 	}()
 
+	// Главный цикл живёт до отмены ctx (graceful shutdown); джойн
+	// фоновых коллекторов — defer выше: любой выход run (штатный, паника)
+	// сначала гасит и дожидается их, и лишь затем LIFO закрывает
+	// rdb и клиентов цепи резолверов.
 	return dnsworker.Run(ctx, pool, q, resolve, dnsworker.Options{
 		Concurrency: cfg.DNS.Concurrency, // параллелизм эпизодов = dns.concurrency (ТЗ 5.10)
 		AskAAAA:     cfg.DNS.IPv6,        // AAAA отключаются конфигом без IPv6 (ТЗ 5.4)

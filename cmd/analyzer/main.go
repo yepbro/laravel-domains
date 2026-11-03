@@ -21,6 +21,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -81,7 +82,9 @@ func main() {
 // переанализа (T-074). Завершение — отмена ctx (graceful shutdown,
 // ТЗ 3.4): начатые доставки дорабатывают или возвращаются очереди
 // повторной доставкой (Processing, T-025); ReanalyzeLoop на отмене
-// возвращает чистый nil.
+// возвращает чистый nil; фоновые циклы (ReanalyzeLoop, коллектор
+// q:analyze) гасятся производной отменой и джойнятся до defer-закрытий
+// store/rdb (T-232).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reloader *rules.Reloader, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("analyzer: пул БД не получен (postgres.dsn обязателен)")
@@ -125,17 +128,46 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		OnBury:      metrics.NewDeadBuriedHook(reg),
 	})
 
-	// Фоновый цикл переанализа (T-074, ТЗ 5.8): стартовый дренаж + тикер +
-	// внеочередной проход по смене набора правил (Reloader.Subscribe);
-	// ошибки проходов цикл логирует Warn сам, возвращает только по отмене
-	// ctx — живёт до остановки сервиса рядом с воркером.
+	// Гейт backpressure (T-026) для публикации цикла переанализа ниже:
+	// сам воркер только потребляет q:analyze и XACK (конец конвейера §7).
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
 		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
 		Log:       logger,
 	})
 	publish := queue.NewWatermarkPublisher(q, gate)
+
+	// Джойн фоновых циклов (T-232, инвариант http-worker T-223):
+	// производная отмена + WaitGroup. Каркас отменяет ctx OnRun только
+	// после его возврата (internal/service: cancelRun после onRunDone) —
+	// ранний выход run из конструктора ниже (analyzer.New) или паника
+	// обязаны останавливать циклы сами, иначе defer-закрытия rdb/store
+	// (LIFO ниже) закроют ресурсы под серединой прохода переанализа
+	// (пул БД, публикация q:analyze через rdb) или запроса глубины
+	// очереди (gate.Len → rdb); до T-232 оба цикла жили fire-and-forget.
+	// Джойн — defer, зарегистрированный ПОСЛЕ defer-закрытий выше →
+	// исполняется ДО них (LIFO). WaitGroup, а не канал ёмкости: джойн
+	// ждёт ровно запущенное (Add/Done по месту запуска) — ранний выход с
+	// частью циклов не виснет на «недостающих» приёмах. Инварианты
+	// закреплены структурным тестом TestRunBackgroundJoin (main_test.go,
+	// разборщик — internal/bgjoin).
+	ctx, cancel := context.WithCancel(ctx)
+	var bg sync.WaitGroup
+	defer func() {
+		// Штатно ctx уже отменён каркасом к моменту возврата run;
+		// ранний выход/паника гасят ещё живые циклы здесь — до
+		// defer-закрытий (LIFO).
+		cancel()
+		bg.Wait()
+	}()
+
+	// Фоновый цикл переанализа (T-074, ТЗ 5.8): стартовый дренаж + тикер +
+	// внеочередной проход по смене набора правил (Reloader.Subscribe);
+	// ошибки проходов цикл логирует Warn сам, возвращает только по отмене
+	// ctx — живёт до остановки сервиса рядом с воркером.
+	bg.Add(1)
 	go func() {
+		defer bg.Done()
 		if err := analyzer.ReanalyzeLoop(ctx, pool, publish, reloader, analyzer.ReanalyzeOptions{
 			Log: logger,
 		}); err != nil {
@@ -145,7 +177,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Длина потребляемого стрима q:analyze → crawler_queue_depth (T-077):
 	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
+	bg.Add(1)
 	go func() {
+		defer bg.Done()
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
 			[]string{queue.StreamAnalyze}, metrics.DefaultQueueCollectInterval, logger)
 	}()
@@ -172,5 +206,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	if err != nil {
 		return err
 	}
+	// Главный цикл живёт до отмены ctx (graceful shutdown); джойн
+	// фоновых циклов — defer выше: любой выход run (штатный, ранний из
+	// конструктора, паника) сначала гасит и дожидается циклы, и лишь
+	// затем LIFO закрывает rdb/store.
 	return analyzer.Run(ctx, w, opts)
 }
