@@ -210,7 +210,7 @@ baseline `make test` + `make lint` зелёный; ревьюеры —
   `testing` вне тестовых пакетов не импортируется (проверка сборки);
   `make test` зелёный.
 
-- **T-229** [новая] — P3, мелочи collapse/render: (1) уборка
+- **T-229** [в работе] — P3, мелочи collapse/render: (1) уборка
   `moving_ids` после переноса зон — `conn.Exec(context.Background(),
   …)` без таймаута (`internal/collapse/collapse.go:778-784`): при
   зависшем PostgreSQL CLI висит неограниченно, удерживая соединение;
