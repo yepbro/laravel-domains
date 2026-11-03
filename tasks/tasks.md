@@ -193,7 +193,7 @@ baseline `make test` + `make lint` зелёный; ревьюеры —
   от Host/заголовков недоверенных пиров; ошибки формы — JSON с
   корректным Content-Type; `make test`/`make lint` зелёные.
 
-- **T-228** [новая] — P3, content: (1) `store_contract.go` без
+- **T-228** [в работе] — P3, content: (1) `store_contract.go` без
   build-тега импортирует `testing` и попадает в прод-бинарье
   (`internal/content/store_contract.go:11-17`; комментарий
   фиксирует осознанность — нужен внешним интеграционным тестам) —
