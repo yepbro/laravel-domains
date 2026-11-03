@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"net"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -15,6 +17,8 @@ import (
 	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
+
+	"crawler/internal/httpfetch"
 )
 
 // Блокировка загрузки изображений, шрифтов и медиа в Chromium — ТЗ 5.6
@@ -64,12 +68,34 @@ import (
 // (blockInternal, renderHostInternal). Цена — CDP-цикл на каждый
 // запрос страницы, поэтому паттерн есть только при включённом флаге
 // (Internet-профиль); дефолт false его не ставит. Контур проверяет
-// IP-литералы и loopback-имена; произвольные имена не резолвятся —
-// остаточный вектор DNS-rebinding'а зафиксирован в docs/render.md.
+// IP-литералы и loopback-имена; с T-230 произвольные имена резолвятся
+// в самом перехвате (dnsCache ниже): имя, публичное на HTTP-этапе и
+// внутреннее к моменту рендера (смена адреса между этапами —
+// DNS-rebinding во времени), больше не проходит. Остаточный вектор —
+// атакующий, владеющий зоной, различает сами резолвы (перехвата и
+// Chromium — два отдельных DNS-обмена) и отвечает им разными
+// адресами; полное закрытие остаётся за egress-политикой контейнера
+// Chromium (docs/render.md).
 
 // blockDisableTimeout — предел Fetch.disable при остановке перехвата:
 // обычный вызов CDP занимает миллисекунды, дольше ждать незачем.
 const blockDisableTimeout = 2 * time.Second
+
+// dnsCacheTTL — время жизни кэша резолвов SSRF-контура (T-230):
+// повторные запросы того же хоста (подресурсы страницы) не множат
+// DNS-обмены, но и не фиксируют вердикт дольше окна — TTL 30 с на
+// порядок больше типичного обмена с локальным unbound и на порядок
+// меньше эпизода перепроверки домена.
+const dnsCacheTTL = 30 * time.Second
+
+// dnsLookupTimeout — потолок ОДНОГО резолва контура (T-230, по ревью):
+// обмен идёт в горутине насоса перехвата (пока он длится, приос-
+// тановленные запросы страницы ждут ответа), поэтому зависший резолвер
+// не должен выедать бюджет страницы без границы — обмен длиннее потолка
+// обрезается, вердикт fail-open (см. hostInternal). 3 с — выше холодной
+// рекурсии unbound за чужим доменом (типовой обмен — миллисекунды),
+// ниже таймаута страницы (render.timeout 15–25 с).
+const dnsLookupTimeout = 3 * time.Second
 
 // blockBlockedTypes — базовый перечень блокируемых типов ресурсов
 // (ТЗ 5.6: изображения, шрифты, медиа — T-062; 91% веса типичной
@@ -145,26 +171,34 @@ var blockTrackerDomains = []string{
 
 // blockRules — правила блокировки одной сессии рендера: блокируемые
 // типы (blockTypes — единая точка опций T-062/T-213), включённость
-// доменной блокировки трекеров (T-214) и SSRF-контур внутренних
-// адресов (T-219). Единая точка вычисления — blockRulesOf: startBlock
-// собирает правила из Options один раз, дальше один неизменяемый набор
-// разъезжается по всем точкам решения — паттерны Fetch.enable
-// (blockEnable) и вердикты blockRespond видят одну и ту же
-// конфигурацию, расхождение списков исключено в принципе (стиль
-// единой точки blockTypes у T-213).
+// доменной блокировки трекеров (T-214), SSRF-контур внутренних
+// адресов (T-219) и кэш резолвов имён этого контура (T-230).
+// Единая точка вычисления — blockRulesOf: startBlock собирает правила
+// из Options один раз, дальше один неизменяемый набор разъезжается по
+// всем точкам решения — паттерны Fetch.enable (blockEnable) и вердикты
+// blockRespond видят одну и ту же конфигурацию, расхождение списков
+// исключено в принципе (стиль единой точки blockTypes у T-213).
 type blockRules struct {
 	types    []network.ResourceType
 	trackers bool
 	internal bool
+	// dns — кэш резолвов имён SSRF-контура (T-230); создаётся на сессию
+	// только при включённом контуре. Нил (контур выключен / правила,
+	// собранные без него) — резолв не вызывается вовсе.
+	dns *dnsCache
 }
 
 // blockRulesOf — правила сессии из опций браузера.
 func blockRulesOf(opts Options) blockRules {
-	return blockRules{
+	r := blockRules{
 		types:    blockTypes(opts.BlockStylesheet),
 		trackers: opts.BlockTrackerDomains,
 		internal: opts.BlockInternalAddrs,
 	}
+	if opts.BlockInternalAddrs {
+		r.dns = newDNSCache(opts.LookupHost)
+	}
+	return r
 }
 
 // blockTrackerURL — точная проверка URL против blockTrackerDomains:
@@ -275,39 +309,182 @@ func blockDisable(ctx context.Context, sess cdp.Session) {
 }
 
 // blockInternal — приостановленный запрос идёт на внутренний адрес
-// (SSRF-контур T-219, http.block_internal_addrs): фильтр включён и хост
-// URL — внутренний (renderHostInternal: IP-литерал любого вида,
-// включая IPv4-в-IPv6 и числоподобные формы, loopback-имена). URL в
-// событии канонизирован браузером, но вход здесь — та же единая
-// проверка, что у задач рендера: расхождения форм хоста исключены.
-// Событие без сведений о запросе (аномалия протокола) внутренним не
-// считается — как у трекеров.
-func (r blockRules) blockInternal(ev fetch.EventRequestPaused) bool {
-	return r.internal && ev.Request != nil && requestURLInternal(ev.Request.URL)
+// (SSRF-контур T-219/T-230, http.block_internal_addrs): фильтр включён
+// и хост URL — внутренний. Литеральные формы (IP-литерал любого вида,
+// включая IPv4-в-IPv6 и числоподобные WHATWG) и loopback-имена ловит
+// синхронная проверка renderHostInternal — путь T-219; произвольное
+// имя резолвится с кэшем на сессию (dnsCache, T-230): DNS-rebinding
+// (имя публичное на HTTP-этапе, внутреннее — к моменту рендера)
+// отклоняется в самом Chromium. URL в событии канонизирован браузером,
+// но вход здесь — та же единая проверка, что у задач рендера:
+// расхождения форм хоста исключены. Событие без сведений о запросе
+// (аномалия протокола) внутренним не считается — как у трекеров.
+func (r blockRules) blockInternal(ctx context.Context, ev fetch.EventRequestPaused) bool {
+	return r.internal && ev.Request != nil && requestURLInternal(ctx, ev.Request.URL, r.dns)
 }
 
 // requestURLInternal — хост URL запроса внутренний; неразобранный URL —
 // нет (fail-open, как у blockTrackerURL: блокировка не имеет права
 // резать чужое, контур задачи держит validateTaskURLInternal).
-func requestURLInternal(rawURL string) bool {
+// Литеральные и числоподобные формы — renderHostInternal без резолва;
+// прочие имена — резолв через кэш (T-230): внешний литерал тоже не
+// резолвится (адрес уже известен).
+func requestURLInternal(ctx context.Context, rawURL string, dns *dnsCache) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return false
 	}
-	return renderHostInternal(u.Hostname())
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if renderHostInternal(host) {
+		return true
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return false // внешний IP-литерал — адрес известен, резолв не нужен
+	}
+	if _, ok := whatwgParseIPv4(host); ok {
+		return false // внешняя числоподобная форма WHATWG — то же
+	}
+	return dns.hostInternal(ctx, host)
+}
+
+// dnsCache — кэш резолвов имён SSRF-контура перехвата (T-230):
+// положительные (внутренний адрес), отрицательные (внешний) и ошибочные
+// вердикты живут dnsCacheTTL — подресурсы страницы ходят по одному хосту
+// десятками запросов, без кэша каждый обменялся бы с DNS отдельно.
+// Кэш принадлежит правилам одной сессии (blockRulesOf в startBlock):
+// обращения идут только из горутины насоса перехвата этой сессии
+// (blockPump → blockRespond — события сериализованы), мьютекс не нужен;
+// сессия живёт одну задачу (≤ render.timeout), межстраничное
+// переселение вердиктов исключено самим сроком жизни (карту записей не
+// ограничиваем сознательно: её размер ограничен числом хостов одной
+// страницы — сотни записей по десяткам байт; долгоживущий кэш
+// httpfetch.CachingResolver с MaxEntries — другой масштаб, сессия
+// умирает вместе с задачей).
+//
+// Fail-семантика контура разделена (T-230): ошибка резолва — fail-open
+// (запрос проходит: NXDOMAIN рекламных и битых подресурсов — норма
+// страницы, резолв-ошибка ≠ внутренний адрес; fail-closed здесь резал
+// бы легитимные страницы пачками), найденный внутренний адрес —
+// fail-closed (failRequest): это ровно то, ради чего контур существует.
+// Обмен ограничен собственным потолком timeout (dnsLookupTimeout):
+// зависший резолвер обрезается, а не выедает бюджет страницы в горутине
+// насоса; обрыв по дедлайну/отмене НЕ кэшируется (обрыв — не ответ DNS,
+// следующий запрос того же хоста повторит обмен), детерминированные
+// ошибки (NXDOMAIN) — кэшируются как «не внутренний» на общих TTL.
+type dnsCache struct {
+	// lookup — шов резолва (Options.LookupHost; nil — системный
+	// net.DefaultResolver: headless-shell резолвит системным же,
+	// перехват видит то же представление об адресах, что браузер).
+	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
+	// now — шов времени для тестов TTL; nil — time.Now.
+	now func() time.Time
+	// timeout — потолок одного обмена (dnsLookupTimeout; шов тестов).
+	timeout time.Duration
+	// entries — вердикты по хостам; ключ — канонический хост (нижний
+	// регистр без хвостовой точки, нормализует requestURLInternal).
+	entries map[string]dnsCacheEntry
+}
+
+// dnsCacheEntry — закэшированный вердикт резолва.
+type dnsCacheEntry struct {
+	internal bool
+	at       time.Time
+}
+
+// newDNSCache — кэш на сессию с швом резолва.
+func newDNSCache(lookup func(context.Context, string) ([]netip.Addr, error)) *dnsCache {
+	if lookup == nil {
+		lookup = lookupHostSystem
+	}
+	return &dnsCache{lookup: lookup, now: time.Now, timeout: dnsLookupTimeout}
+}
+
+// lookupHostSystem — системный резолвер (дефолт шва Options.LookupHost):
+// тот же /etc/resolv.conf, которым резолвит сам Chromium, — вердикт
+// контура не расходится с адресами, по которым реально идёт загрузка.
+func lookupHostSystem(ctx context.Context, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+}
+
+// hostInternal — имя резолвится во внутренний адрес (хотя бы один из
+// ответа: список отдаёт атакующий, fail-closed по найденному). Ошибка
+// резолва и пустой ответ — не внутренний (fail-open, см. докомментарий
+// dnsCache); детерминированные исходы (ответ, пустой ответ, NXDOMAIN)
+// кэшируются на dnsCacheTTL, обрыв по дедлайну/отмене — нет.
+// Нил-кэш (правила без контура — страховка вызывающих) — не внутренний.
+func (c *dnsCache) hostInternal(ctx context.Context, host string) bool {
+	if c == nil {
+		return false
+	}
+	if c.now == nil {
+		c.now = time.Now
+	}
+	if e, ok := c.entries[host]; ok && c.now().Sub(e.at) < dnsCacheTTL {
+		return e.internal
+	}
+	internal := false
+	definitive := true
+	if addrs, err := c.exchange(ctx, host); err == nil {
+		for _, a := range addrs {
+			if httpfetch.AddrIsInternal(a) {
+				internal = true
+				break
+			}
+		}
+	} else if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		// Обрыв обмена (потолок timeout или конец страницы) — не ответ
+		// DNS: вердикт fail-open, но не кэшируем — повтор запроса того
+		// же хоста обменяется заново.
+		definitive = false
+	} // прочие ошибки (NXDOMAIN, SERVFAIL-ответ) — детерминированный
+	// «не внутренний» с кэшированием на общих основаниях.
+	// Логирование (§4 docs/mutation-testing.md): Debug-запись не влияет
+	// на судьбу запроса (вердикт уже вычислен), мутанты ветки и
+	// вырезания оператора меняют только текст отладочного лога (образец
+	// — лог blockRespond ниже); аннотации две — branch/if гасится на
+	// строке if, statement/remove — на строке вызова, оба мутанта
+	// дают неразличимый дифф (noop тела).
+	// mutator-disable-next-line branch/if
+	if internal {
+		// mutator-disable-next-line statement/remove
+		slog.Debug("рендер: имя резолвится во внутренний адрес — запрос отклоняется (SSRF)",
+			"host", host)
+	}
+	if definitive {
+		if c.entries == nil {
+			c.entries = make(map[string]dnsCacheEntry)
+		}
+		c.entries[host] = dnsCacheEntry{internal: internal, at: c.now()}
+	}
+	return internal
+}
+
+// exchange — один обмен с потолком timeout: зависший резолвер не
+// выедает бюджет страницы в горутине насоса (потолок ниже
+// render.timeout, стоп-вызов stop дожидается обмена не дольше потолка).
+func (c *dnsCache) exchange(ctx context.Context, host string) ([]netip.Addr, error) {
+	if c.timeout <= 0 {
+		return c.lookup(ctx, host)
+	}
+	rctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.lookup(rctx, host)
 }
 
 // blockRespond отвечает на приостановленный запрос: внутренний адрес
-// (T-219), блокируемый тип или (T-214) трекер-домен — failRequest,
-// любой другой — continueRequest (страховка: паттерны не должны
-// приостанавливать чужие запросы, но подстрока urlPattern доменных
-// паттернов и паттерн-«всё» SSRF-контура шире точных проверок —
-// расхождение классификации не должно вешать запрос). Ошибки ответа не
-// фатальны: перехват — экономия, страница дорабатывает и без него
-// (fail-open).
+// (T-219 — литералы, T-230 — имена по резолву), блокируемый тип или
+// (T-214) трекер-домен — failRequest, любой другой — continueRequest
+// (страховка: паттерны не должны приостанавливать чужие запросы, но
+// подстрока urlPattern доменных паттернов и паттерн-«всё» SSRF-контура
+// шире точных проверок — расхождение классификации не должно вешать
+// запрос). Порядок условий — сначала дешёвые вердикты без сети (тип,
+// трекер), контур с резолвом последним: запрос, который всё равно
+// отклоняется по типу/домену, не должен тратить DNS-обмен (по ревью
+// T-230). Ошибки ответа не фатальны: перехват — экономия, страница
+// дорабатывает и без него (fail-open).
 func blockRespond(ctx context.Context, sess cdp.Session, ev fetch.EventRequestPaused, rules blockRules) {
 	var err error
-	if rules.blockInternal(ev) || blockResourceType(rules.types, ev.ResourceType) || rules.blockTracker(ev) {
+	if blockResourceType(rules.types, ev.ResourceType) || rules.blockTracker(ev) || rules.blockInternal(ctx, ev) {
 		_, err = cdp.Call(ctx, sess, fetch.FailRequest, fetch.FailRequestParams{
 			RequestID:   ev.RequestID,
 			ErrorReason: network.ErrorReasonBlockedByClient,

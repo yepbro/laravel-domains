@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -55,8 +56,14 @@ func TestNewOptions(t *testing.T) {
 		BlockStylesheet:     true,
 		BlockTrackerDomains: true,
 	}
-	if got != want {
+	// LookupHost — шов тестов (T-230): сборка из конфигурации оставляет
+	// nil (перехват берёт системный резолвер); Options с полем-функцией
+	// не сравнима оператором ==, поэтому DeepEqual.
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("NewOptions:\n got %+v\nwant %+v", got, want)
+	}
+	if got.LookupHost != nil {
+		t.Errorf("NewOptions заполнил LookupHost из конфигурации: %p, хочу nil (дефолт — системный резолвер)", got.LookupHost)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"iter"
 	"maps"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -317,56 +318,36 @@ func TestBlockPatternsInternal(t *testing.T) {
 // metadata, IPv4-в-IPv6, loopback-имя, числоподобная форма) —
 // failRequest(BlockedByClient); внешний хост и событие без request —
 // continueRequest; при выключенном флаге внутренний хост проходит.
+// Резолвер — фейк (T-230: имена-хосты уходят в резолв, настоящий DNS
+// в юнит-тесте делал бы кейс «публичное имя → continue» зависимым от
+// окружения — фильтрующие резолверы отвечают 0.0.0.0, что внутренний).
 func TestBlockRespondInternal(t *testing.T) {
-	on := blockRulesOf(Options{BlockInternalAddrs: true})
 	for _, tc := range []struct {
-		name string
-		ev   fetch.EventRequestPaused
-		fail bool
+		name    string
+		url     string
+		fail    bool
+		lookups int // обменов резолвера: литералы/loopback — 0, имя — 1
 	}{
-		{"Document→127.0.0.1 fail", fetch.EventRequestPaused{
-			RequestID: "doc-1", ResourceType: network.ResourceTypeDocument,
-			Request: &network.Request{URL: "http://127.0.0.1/admin"},
-		}, true},
-		{"Document→169.254.169.254 fail", fetch.EventRequestPaused{
-			RequestID: "doc-2", ResourceType: network.ResourceTypeDocument,
-			Request: &network.Request{URL: "http://169.254.169.254/latest/meta-data/"},
-		}, true},
-		{"Document→[::ffff:169.254.169.254] fail", fetch.EventRequestPaused{
-			RequestID: "doc-3", ResourceType: network.ResourceTypeDocument,
-			Request: &network.Request{URL: "http://[::ffff:169.254.169.254]/latest/meta-data/"},
-		}, true},
-		{"Script→10.0.0.1 fail", fetch.EventRequestPaused{
-			RequestID: "js-1", ResourceType: network.ResourceTypeScript,
-			Request: &network.Request{URL: "http://10.0.0.1/app.js"},
-		}, true},
-		{"XHR→localhost fail", fetch.EventRequestPaused{
-			RequestID: "xhr-1", ResourceType: network.ResourceTypeXHR,
-			Request: &network.Request{URL: "http://localhost:6379/stats"},
-		}, true},
-		{"WebSocket→127.1 fail (WHATWG-форма)", fetch.EventRequestPaused{
-			RequestID: "ws-1", ResourceType: network.ResourceTypeWebSocket,
-			Request: &network.Request{URL: "ws://127.1/socket"},
-		}, true},
-		{"Document→site.example continue", fetch.EventRequestPaused{
-			RequestID: "doc-4", ResourceType: network.ResourceTypeDocument,
-			Request: &network.Request{URL: "http://site.example/page"},
-		}, false},
-		{"Script→203.0.113.7 continue", fetch.EventRequestPaused{
-			RequestID: "js-2", ResourceType: network.ResourceTypeScript,
-			Request: &network.Request{URL: "http://203.0.113.7/app.js"},
-		}, false},
-		{"путь с подстрокой 127.0.0.1 continue", fetch.EventRequestPaused{
-			RequestID: "js-3", ResourceType: network.ResourceTypeScript,
-			Request: &network.Request{URL: "http://site.example/js/127.0.0.1.js"},
-		}, false},
-		{"событие без request continue", fetch.EventRequestPaused{
-			RequestID: "anomaly", ResourceType: network.ResourceTypeScript,
-		}, false},
+		{"Document→127.0.0.1 fail", "http://127.0.0.1/admin", true, 0},
+		{"Document→169.254.169.254 fail", "http://169.254.169.254/latest/meta-data/", true, 0},
+		{"Document→[::ffff:169.254.169.254] fail", "http://[::ffff:169.254.169.254]/latest/meta-data/", true, 0},
+		{"Script→10.0.0.1 fail", "http://10.0.0.1/app.js", true, 0},
+		{"XHR→localhost fail", "http://localhost:6379/stats", true, 0},
+		{"WebSocket→127.1 fail (WHATWG-форма)", "ws://127.1/socket", true, 0},
+		{"Document→site.example continue", "http://site.example/page", false, 1},
+		{"Script→203.0.113.7 continue", "http://203.0.113.7/app.js", false, 0},
+		{"путь с подстрокой 127.0.0.1 continue", "http://site.example/js/127.0.0.1.js", false, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			lookup := &fakeLookupHost{addrs: map[string][]netip.Addr{
+				"site.example": {netip.MustParseAddr("203.0.113.7")},
+			}}
+			on := blockRulesOf(Options{BlockInternalAddrs: true, LookupHost: lookup.lookup})
 			fake := &fakeCDPSession{}
-			blockRespond(context.Background(), fake, tc.ev, on)
+			blockRespond(context.Background(), fake, fetch.EventRequestPaused{
+				RequestID: "req-1", ResourceType: network.ResourceTypeDocument,
+				Request: &network.Request{URL: tc.url},
+			}, on)
 			calls := fake.callsOf()
 			want := "Fetch.continueRequest"
 			if tc.fail {
@@ -375,28 +356,43 @@ func TestBlockRespondInternal(t *testing.T) {
 			if len(calls) != 1 || calls[0].Method != want {
 				t.Fatalf("команды %v, хочу одну %s", calls, want)
 			}
+			if n := len(lookup.callsOf()); n != tc.lookups {
+				t.Errorf("обменов резолвера %d, хочу %d (вызовы %v)",
+					n, tc.lookups, lookup.callsOf())
+			}
 			if tc.fail {
 				params, ok := calls[0].Params.(fetch.FailRequestParams)
 				if !ok {
 					t.Fatalf("параметры %T, хочу fetch.FailRequestParams", calls[0].Params)
 				}
-				if params.RequestID != tc.ev.RequestID ||
-					params.ErrorReason != network.ErrorReasonBlockedByClient {
-					t.Errorf("failRequest %+v, хочу RequestID %s BlockedByClient",
-						params, tc.ev.RequestID)
+				if params.ErrorReason != network.ErrorReasonBlockedByClient {
+					t.Errorf("failRequest %+v, хочу BlockedByClient", params)
 				}
 			}
 		})
 	}
 
-	// Флаг выключен — внутренний хост проходит (dev/testbed).
+	// Событие без request — continue (аномалия протокола; как у трекеров).
 	fake := &fakeCDPSession{}
+	blockRespond(context.Background(), fake, fetch.EventRequestPaused{
+		RequestID: "anomaly", ResourceType: network.ResourceTypeScript,
+	}, blockRulesOf(Options{BlockInternalAddrs: true}))
+	if calls := fake.callsOf(); len(calls) != 1 || calls[0].Method != "Fetch.continueRequest" {
+		t.Fatalf("команды %v, хочу одну Fetch.continueRequest (событие без request)", calls)
+	}
+
+	// Флаг выключен — внутренний хост проходит (dev/testbed), резолва нет.
+	lookup := &fakeLookupHost{}
+	fake = &fakeCDPSession{}
 	blockRespond(context.Background(), fake, fetch.EventRequestPaused{
 		RequestID: "dev-1", ResourceType: network.ResourceTypeDocument,
 		Request: &network.Request{URL: "http://127.0.0.1/"},
-	}, blockRulesOf(Options{}))
+	}, blockRulesOf(Options{LookupHost: lookup.lookup}))
 	if calls := fake.callsOf(); len(calls) != 1 || calls[0].Method != "Fetch.continueRequest" {
 		t.Fatalf("команды %v, хочу одну Fetch.continueRequest (флаг выключен)", calls)
+	}
+	if n := len(lookup.callsOf()); n != 0 {
+		t.Errorf("обменов резолвера %d, хочу 0 (контур выключен)", n)
 	}
 }
 
@@ -1066,6 +1062,45 @@ func TestStartBlock(t *testing.T) {
 		waitFor(t, func() bool { return tr.countOf("Fetch.continueRequest") == 1 })
 	})
 
+	// Опция BlockInternalAddrs + резолв имён (T-230): паттерн-«всё»
+	// (TestBlockPatternsInternal) приостанавливает каждый запрос, и
+	// вердикт перехвата для произвольного имени — по резолву: имя, на
+	// момент рендера резолвящееся во внутренний адрес (DNS-rebinding),
+	// — failRequest, внешнее имя — continueRequest; повторное имя берёт
+	// вердикт из кэша на сессию без нового DNS-обмена.
+	t.Run("block_internal_addrs резолвит имена в перехвате (T-230)", func(t *testing.T) {
+		lookup := &fakeLookupHost{addrs: map[string][]netip.Addr{
+			"rebind.example.net": {netip.MustParseAddr("169.254.169.254")},
+			"ok.example.net":     {netip.MustParseAddr("203.0.113.7")},
+		}}
+		ctx, tr := newFakeCDPContext(t)
+		s := newSession(ctx, Options{BlockInternalAddrs: true, LookupHost: lookup.lookup})
+		stop, err := s.startBlock(context.Background())
+		if err != nil {
+			t.Fatalf("startBlock: %v", err)
+		}
+		defer stop()
+
+		tr.fireSession("Fetch.requestPaused",
+			`{"requestId":"rb-1","resourceType":"Document",`+
+				`"request":{"url":"http://rebind.example.net/"}}`)
+		waitFor(t, func() bool { return tr.countOf("Fetch.failRequest") == 1 })
+
+		tr.fireSession("Fetch.requestPaused",
+			`{"requestId":"rb-ok","resourceType":"Script",`+
+				`"request":{"url":"http://ok.example.net/app.js"}}`)
+		waitFor(t, func() bool { return tr.countOf("Fetch.continueRequest") == 1 })
+
+		tr.fireSession("Fetch.requestPaused",
+			`{"requestId":"rb-2","resourceType":"XHR",`+
+				`"request":{"url":"http://rebind.example.net/2"}}`)
+		waitFor(t, func() bool { return tr.countOf("Fetch.failRequest") == 2 })
+		if n := len(lookup.callsOf()); n != 2 {
+			t.Errorf("обменов резолвера %d, хочу 2 (кэш на сессию — по одному на хост; вызовы %v)",
+				n, lookup.callsOf())
+		}
+	})
+
 	// Без опции доменных паттернов нет вовсе — Fetch.enable несёт только
 	// типовые (T-062/T-213).
 	t.Run("без block_tracker_domains доменных паттернов нет (T-214)", func(t *testing.T) {
@@ -1088,6 +1123,119 @@ func TestStartBlock(t *testing.T) {
 	})
 }
 
+// TestDNSCacheResolveTTL — кэш резолвов на сессию (T-230): повторные
+// запросы того же хоста не множат DNS-обмены, запись живёт dnsCacheTTL
+// и по истечении обновляется свежим обменом (вердикт не фиксируется
+// навсегда — DNS между обменами может сменить ответ); негативные
+// (внешний адрес) и ошибочные вердикты кэшируются так же; нил-кэш —
+// не внутренний (страховка правил без контура).
+func TestDNSCacheResolveTTL(t *testing.T) {
+	lookup := &fakeLookupHost{addrs: map[string][]netip.Addr{
+		"rebind.example.net": {netip.MustParseAddr("169.254.169.254")},
+		"ok.example.net":     {netip.MustParseAddr("203.0.113.7")},
+	}, errs: map[string]error{
+		"nx.example.net": errors.New("нет такого хоста"),
+	}}
+	c := newDNSCache(lookup.lookup)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	// Первый запрос — обмен; вердикт «внутренний» кэшируется, повтор в
+	// окне TTL — без обмена.
+	if !c.hostInternal(context.Background(), "rebind.example.net") {
+		t.Fatal("первый резолв: хочу внутренний (169.254.169.254)")
+	}
+	if !c.hostInternal(context.Background(), "rebind.example.net") {
+		t.Fatal("кэшированный вердикт: хочу внутренний")
+	}
+	if n := len(lookup.callsOf()); n != 1 {
+		t.Fatalf("обменов %d, хочу 1 (повтор в окне TTL — из кэша)", n)
+	}
+
+	// Истечение TTL — свежий обмен; DNS сменил ответ на публичный
+	// (rebinding-контур не держит вердикт дольше окна).
+	lookup.addrs["rebind.example.net"] = []netip.Addr{netip.MustParseAddr("203.0.113.7")}
+	now = now.Add(dnsCacheTTL + time.Second)
+	if c.hostInternal(context.Background(), "rebind.example.net") {
+		t.Fatal("после истечения TTL: хочу внешний по новому ответу")
+	}
+	if n := len(lookup.callsOf()); n != 2 {
+		t.Fatalf("обменов %d, хочу 2 (истёкшая запись обновляется обменом)", n)
+	}
+
+	// Негативный и ошибочный вердикты кэшируются так же: по одному
+	// обмену на два обращения.
+	for _, host := range []string{"ok.example.net", "nx.example.net"} {
+		if c.hostInternal(context.Background(), host) {
+			t.Fatalf("%s: хочу не-внутренний", host)
+		}
+		if c.hostInternal(context.Background(), host) {
+			t.Fatalf("%s: кэшированный вердикт — тоже не-внутренний", host)
+		}
+	}
+	if n := len(lookup.callsOf()); n != 4 {
+		t.Fatalf("обменов %d, хочу 4 (по одному на хост: негатив и ошибка кэшируются)", n)
+	}
+
+	// Нил-кэш (правила без контура — страховка) — не внутренний.
+	var nilCache *dnsCache
+	if nilCache.hostInternal(context.Background(), "any.example.net") {
+		t.Error("нил-кэш: хочу не-внутренний")
+	}
+}
+
+// TestDNSCacheLookupTimeout — потолок одного резолва (T-230, по ревью
+// P1): зависший обмен обрезается собственным таймаутом кэша (не
+// контекстом страницы), вердикт — fail-open (не внутренний), но НЕ
+// кэшируется: обрыв — не ответ DNS, повторный запрос того же хоста
+// снова обменивается (скованные одним потолком обмены, без накопления
+// ожидания). Детерминированная ошибка (NXDOMAIN) кэшируется, как и
+// прежде.
+func TestDNSCacheLookupTimeout(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	started := make(chan struct{}, 4)
+	c := newDNSCache(func(ctx context.Context, host string) ([]netip.Addr, error) {
+		started <- struct{}{}
+		select {
+		case <-release: // не закрывается до конца теста — выход только по rctx
+			return []netip.Addr{netip.MustParseAddr("169.254.169.254")}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err() // DeadlineExceeded от потолка exchange
+		}
+	})
+	c.timeout = 20 * time.Millisecond
+
+	for i := 0; i < 2; i++ {
+		if c.hostInternal(context.Background(), "blackhole.example.net") {
+			t.Fatalf("обмен %d: хочу fail-open (не внутренний)", i+1)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("обмен не начался")
+		}
+	}
+	if n := len(c.entries); n != 0 {
+		t.Errorf("кэш после обрывов: %d записей, хочу 0 (обрыв не кэшируется)", n)
+	}
+
+	// Детерминированная ошибка резолва — кэшируется (fail-open).
+	errLookup := &fakeLookupHost{errs: map[string]error{
+		"nx.example.net": errors.New("нет такого хоста"),
+	}}
+	e := newDNSCache(errLookup.lookup)
+	if e.hostInternal(context.Background(), "nx.example.net") {
+		t.Error("NXDOMAIN: хочу не-внутренний")
+	}
+	if e.hostInternal(context.Background(), "nx.example.net") {
+		t.Error("NXDOMAIN из кэша: хочу не-внутренний")
+	}
+	if n := len(errLookup.callsOf()); n != 1 {
+		t.Errorf("обменов %d, хочу 1 (ошибка кэшируется)", n)
+	}
+}
+
 // assertNoNewCDPCalls — негативная проверка: с момента вызова новые команды
 // через транспорт не проходят (окно 100 мс — порядок запаса против
 // микросекунд цепочки доставки; в стиле пакета — негативные паузы
@@ -1101,5 +1249,105 @@ func assertNoNewCDPCalls(t *testing.T, tr *fakeCDP, what string) {
 	}
 	if got := len(tr.callsOf()); got != before {
 		t.Errorf("%s: прошли новые команды %+v", what, tr.callsOf()[before:])
+	}
+}
+
+// fakeLookupHost — фейк шва Options.LookupHost для тестов резолва
+// SSRF-контура перехвата (T-230): карта хост → адреса и хост → ошибка,
+// журнал обменов (кэш на сессию не должен множить резолвы одного хоста).
+type fakeLookupHost struct {
+	mu    sync.Mutex
+	addrs map[string][]netip.Addr
+	errs  map[string]error
+	calls []string
+}
+
+func (f *fakeLookupHost) lookup(_ context.Context, host string) ([]netip.Addr, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, host)
+	if err, ok := f.errs[host]; ok {
+		return nil, err
+	}
+	return f.addrs[host], nil
+}
+
+func (f *fakeLookupHost) callsOf() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+// TestBlockRespondInternalResolve — резолв имён в перехвате SSRF-контура
+// (T-230, критерий задачи): при включённом флаге произвольное имя,
+// резолвящееся на момент рендера во внутренний адрес (сценарий
+// DNS-rebinding'а: имя публичное на HTTP-этапе, внутреннее — к моменту
+// рендера), отклоняется перехватом failRequest'ом; при выключенном
+// флаге то же имя проходит; имя с публичным резолвом и ошибка резолва
+// проходят (fail-open: NXDOMAIN подресурсов обычен, резолв-ошибка ≠
+// внутренний адрес); IP-литералы (включая числоподобные формы) идут
+// прежним путём T-219 без резолва вовсе.
+func TestBlockRespondInternalResolve(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		internal bool
+		url      string
+		fail     bool
+		lookups  int // ожидаемое число обменов резолвера
+	}{
+		{"включён: имя → 169.254.169.254 — fail (rebinding)", true,
+			"http://rebind.example.net/latest/meta-data/", true, 1},
+		{"включён: имя → RFC1918 — fail", true,
+			"http://intranet.example.net/", true, 1},
+		{"включён: имя → публичный адрес — continue", true,
+			"http://ok.example.net/app.js", false, 1},
+		{"включён: ошибка резолва — continue (fail-open)", true,
+			"http://nx.example.net/pixel.gif", false, 1},
+		{"включён: IP-литерал внутренний — fail без резолва (T-219)", true,
+			"http://10.0.0.1/admin", true, 0},
+		{"включён: IP-литерал внешний — continue без резолва", true,
+			"http://203.0.113.7/", false, 0},
+		{"включён: числоподобная форма — fail без резолва (WHATWG)", true,
+			"http://127.1/x", true, 0},
+		{"включён: loopback-имя — fail без резолва", true,
+			"http://localhost:6379/stats", true, 0},
+		{"выключен: имя → 169.254.169.254 — continue", false,
+			"http://rebind.example.net/latest/meta-data/", false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lookup := &fakeLookupHost{
+				addrs: map[string][]netip.Addr{
+					// Смешанный ответ: найденный внутренний адрес — вердикт
+					// «внутренний» (fail-closed по найденному адресу: список
+					// отдаёт атакующий, браузер выбрал бы любой).
+					"rebind.example.net": {
+						netip.MustParseAddr("203.0.113.7"),
+						netip.MustParseAddr("169.254.169.254"),
+					},
+					"intranet.example.net": {netip.MustParseAddr("10.0.0.5")},
+					"ok.example.net":       {netip.MustParseAddr("203.0.113.7")},
+				},
+				errs: map[string]error{
+					"nx.example.net": errors.New("нет такого хоста"),
+				},
+			}
+			fake := &fakeCDPSession{}
+			blockRespond(context.Background(), fake, fetch.EventRequestPaused{
+				RequestID: "req-1", ResourceType: network.ResourceTypeDocument,
+				Request: &network.Request{URL: tc.url},
+			}, blockRulesOf(Options{BlockInternalAddrs: tc.internal, LookupHost: lookup.lookup}))
+			calls := fake.callsOf()
+			want := "Fetch.continueRequest"
+			if tc.fail {
+				want = "Fetch.failRequest"
+			}
+			if len(calls) != 1 || calls[0].Method != want {
+				t.Fatalf("команды %v, хочу одну %s", calls, want)
+			}
+			if n := len(lookup.callsOf()); n != tc.lookups {
+				t.Errorf("обменов резолвера %d, хочу %d (вызовы %v)",
+					n, tc.lookups, lookup.callsOf())
+			}
+		})
 	}
 }
