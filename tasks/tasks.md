@@ -226,7 +226,7 @@ baseline `make test` + `make lint` зелёный; ревьюеры —
   не блокирует выход CLI; WS подключается вторым адресом (тест);
   `/proc` читается не чаще TTL; `make test`/`make lint` зелёные.
 
-- **T-230** [новая] — P1 (grok, верифицировано), SSRF: контур
+- **T-230** [в работе] — P1 (grok, верифицировано), SSRF: контур
   включён кодом, но выключен в примерах деплоя, а рендер не ловит
   DNS-rebinding: (1) `config.example.yaml:128` —
   `block_internal_addrs: false` и в `deploy/systemd/
