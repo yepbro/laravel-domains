@@ -13,11 +13,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -1304,5 +1306,67 @@ func TestPrintPlanFormat(t *testing.T) {
 				t.Errorf("колонка доменов co.in не вправо:\n%s", got)
 			}
 		}
+	}
+}
+
+// hangDropConn — Conn для теста бюджета уборки moving_ids (T-229): Exec
+// DROP висит до отмены контекста (зависший PostgreSQL — команда принята,
+// ответа нет); отмену фиксирует закрытие канала. Прочие методы не
+// вызываются и падают при вызове.
+type hangDropConn struct {
+	canceled chan struct{}
+	once     sync.Once
+}
+
+var _ Conn = (*hangDropConn)(nil)
+
+func (h *hangDropConn) Exec(ctx context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+	if sql != movingDropSQL {
+		return pgconn.CommandTag{}, nil
+	}
+	<-ctx.Done()
+	h.once.Do(func() { close(h.canceled) })
+	return pgconn.CommandTag{}, ctx.Err()
+}
+
+func (h *hangDropConn) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
+	return 0, errors.New("hangDropConn: CopyFrom не должен вызываться")
+}
+
+func (h *hangDropConn) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("hangDropConn: Query не должен вызываться")
+}
+
+func (h *hangDropConn) Begin(context.Context) (pgx.Tx, error) {
+	return nil, errors.New("hangDropConn: Begin не должен вызываться")
+}
+
+// TestDropMovingTimeout — уборка moving_ids обязана отменяться
+// собственным бюджетом времени (T-229): зависший DROP не удерживает
+// соединение и выход CLI неограниченно; ошибка логируется Warn, не
+// возвращаясь (затенять результат команды ей нечем).
+func TestDropMovingTimeout(t *testing.T) {
+	if movingDropTimeout != 5*time.Second {
+		t.Errorf("movingDropTimeout = %s, хочу 5s (образец discardTimeout, ingest)", movingDropTimeout)
+	}
+	conn := &hangDropConn{canceled: make(chan struct{})}
+	var logBuf strings.Builder
+	log := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	// Бюджет теста короткий: проверяется факт отмены контекста, а не
+	// величина продуктового бюджета (она — контрактом выше).
+	const budget = 50 * time.Millisecond
+	started := time.Now()
+	dropMoving(conn, budget, log)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Errorf("уборка висела %s — бюджет %s не отменил зависший DROP", elapsed, budget)
+	}
+	select {
+	case <-conn.canceled:
+	default:
+		t.Error("Exec не увидел отмену контекста (контекст без дедлайна висел бы вечно)")
+	}
+	if out := logBuf.String(); !strings.Contains(out, "moving_ids") {
+		t.Errorf("ошибка уборки не попала в лог (Warn): %q", out)
 	}
 }

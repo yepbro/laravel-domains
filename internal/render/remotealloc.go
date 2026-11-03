@@ -46,6 +46,13 @@ var remoteDial = func(ctx context.Context, wsURL string, timeout time.Duration) 
 	return conn, nil
 }
 
+// remoteResolve — резолв хоста Chromium в адреса; шов юнит-тестов
+// resolveRemoteWSURL (порядок адресов ответа DNS, T-229), продуктовый
+// путь — net.DefaultResolver (стиль remoteDial).
+var remoteResolve = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
 // remoteAllocator — аллокатор браузерной сессии поверх внешнего
 // Chromium: одно WebSocket-соединение на поколение браузера (StartBrowser
 // создаёт аллокатор заново). Реализует chromedp.Allocator и
@@ -110,12 +117,34 @@ func (a *remoteAllocator) Attaches() bool { return true }
 // аллокатора завершены.
 func (a *remoteAllocator) Wait() { a.wg.Wait() }
 
+// preferIPv4 — адрес подключения из ответа резолва (T-229): первый IPv4,
+// если он есть, иначе первый адрес. DNS может отдавать IPv6-first
+// (сортировка адресов dual-stack хоста), а Chromium внешнего юнита
+// слушает IPv4 (docker публикует :9222 на 0.0.0.0, systemd-юнит
+// crawler-chromium — на адрес хоста): попытка v6-адреса к v4-only
+// слушателю отказала бы при живом браузере — поколение не поднялось бы.
+// Перебор адресов с попыткой подключения здесь избыточен: резолв только
+// строит URL, фактическое подключение — remoteDial за Options.DialTimeout;
+// v6-only хост продолжает работать первым адресом.
+//
+// Контракт входа — net.Resolver.LookupIPAddr: err == nil гарантирует
+// непустой срез (отсутствие записей — ошибка), индексация [0] безопасна.
+func preferIPv4(addrs []net.IPAddr) net.IPAddr {
+	for _, a := range addrs {
+		if a.IP.To4() != nil {
+			return a
+		}
+	}
+	return addrs[0]
+}
+
 // resolveRemoteWSURL — WebSocket-адрес браузера для подключения: адрес
 // конфигурации с путём /devtools/browser/ — готовый адрес и используется
 // как есть; иначе уточняется запросом /json/version
 // (webSocketDebuggerUrl), как это делает remote.Allocator. Хост, не
-// являющийся IP/localhost, резолвится в IP: Chrome ≥66 требует, чтобы
-// Host-заголовок подключения был IP-адресом или localhost.
+// являющийся IP/localhost, резолвится в IP (предпочтение IPv4 —
+// preferIPv4): Chrome ≥66 требует, чтобы Host-заголовок подключения был
+// IP-адресом или localhost.
 func resolveRemoteWSURL(ctx context.Context, raw string, timeout time.Duration) (string, error) {
 	// Один потолок timeout на всё уточнение адреса (резолв и запрос):
 	// входной ctx — контекст жизненного цикла браузера, без дедлайна
@@ -128,14 +157,21 @@ func resolveRemoteWSURL(ctx context.Context, raw string, timeout time.Duration) 
 		return "", fmt.Errorf("адрес Chromium %q: %w", raw, err)
 	}
 	if host := u.Hostname(); host != "localhost" && net.ParseIP(host) == nil {
-		addrs, err := net.DefaultResolver.LookupIPAddr(rctx, host)
+		addrs, err := remoteResolve(rctx, host)
 		if err != nil {
 			return "", fmt.Errorf("резолв хоста Chromium %s: %w", host, err)
 		}
+		ip := preferIPv4(addrs)
 		if port := u.Port(); port != "" {
-			u.Host = net.JoinHostPort(addrs[0].IP.String(), port)
+			u.Host = net.JoinHostPort(ip.String(), port)
+		} else if ip.IP.To4() != nil {
+			u.Host = ip.String()
 		} else {
-			u.Host = addrs[0].IP.String()
+			// IPv6 без порта — только в скобках: голые двоеточия в host
+			// перепарсились бы схемой «host:port» (Hostname "2001:db8:",
+			// Port "1"). JoinHostPort ставит скобки сам, ветка с портом
+			// в этом не нуждается (T-229, ревью P3-7).
+			u.Host = "[" + ip.String() + "]"
 		}
 	}
 	if strings.Contains(u.Path, "/devtools/browser/") {

@@ -540,6 +540,12 @@ func TestBrowserOverMemory(t *testing.T) {
 	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
 		t.Skipf("SIGSTOP не удался: %v", err)
 	}
+	// Прогрев мог закэшировать значение до SIGSTOP (T-229) — петля
+	// стабилизации обязана мерить живой /proc после заморозки, а не
+	// подпись кэша: сброс окна.
+	b.mu.Lock()
+	b.rssAt = time.Time{}
+	b.mu.Unlock()
 	// Заморозили — дождаться стабильного значения (два подряд
 	// одинаковых чтения) на случай последних проживлённых страниц.
 	stable := time.Now().Add(2 * time.Second)
@@ -580,6 +586,76 @@ func TestBrowserOverMemory(t *testing.T) {
 		if b.OverMemory() {
 			t.Error("нулевой RSS не должен триггерить перезапуск")
 		}
+	}
+}
+
+// TestBrowserRSSCache — кэш RSS (T-229): повторные чтения того же корня
+// в окне TTL не обходят /proc (порог проверяется перед каждой задачей);
+// после TTL и смены rootPID (поколение/другой корень) — свежий снимок;
+// неположительные измерения (0 — корень исчез, -1 — /proc недоступен)
+// не кэшируются. Обход /proc и время — швы (procRSS, timeNow).
+func TestBrowserRSSCache(t *testing.T) {
+	if rssCacheTTL != 10*time.Second {
+		t.Errorf("rssCacheTTL = %s, хочу 10 с (окно 5–15 с по T-229, закреплено точно — стиль movingDropTimeout)", rssCacheTTL)
+	}
+
+	var reads atomic.Int32
+	rssVal := int64(100 << 20)
+	oldProc, oldNow := procRSS, timeNow
+	procRSS = func(int) int64 {
+		reads.Add(1)
+		return rssVal
+	}
+	fakeNow := time.Now()
+	timeNow = func() time.Time { return fakeNow }
+	t.Cleanup(func() { procRSS, timeNow = oldProc, oldNow })
+
+	b := &Browser{rootPID: 42}
+
+	// Первое чтение — снимок; второе в окне TTL — из кэша, без /proc.
+	if got := b.RSS(); got != rssVal {
+		t.Fatalf("RSS = %d, хочу %d", got, rssVal)
+	}
+	if got := b.RSS(); got != rssVal {
+		t.Fatalf("RSS повторно = %d, хочу %d", got, rssVal)
+	}
+	if n := reads.Load(); n != 1 {
+		t.Errorf("проходов /proc %d, хочу 1 (второе чтение — из кэша)", n)
+	}
+
+	// TTL истёк — свежий снимок.
+	fakeNow = fakeNow.Add(rssCacheTTL)
+	rssVal = 200 << 20
+	if got := b.RSS(); got != rssVal {
+		t.Fatalf("RSS после TTL = %d, хочу %d", got, rssVal)
+	}
+	if n := reads.Load(); n != 2 {
+		t.Errorf("проходов /proc после TTL %d, хочу 2", n)
+	}
+
+	// Смена rootPID — чужой снимок не читается, даже в окне TTL.
+	b.rootPID = 43
+	rssVal = 300 << 20
+	if got := b.RSS(); got != rssVal {
+		t.Fatalf("RSS после смены rootPID = %d, хочу %d", got, rssVal)
+	}
+	if n := reads.Load(); n != 3 {
+		t.Errorf("проходов /proc после смены корня %d, хочу 3", n)
+	}
+
+	// Неположительные измерения не кэшируются: нулевой RSS (корень
+	// исчез) повторяется проходом, а не залипает до конца TTL (время
+	// сдвинуто за окно, чтобы обе проверки шли мимо валидного кэша).
+	fakeNow = fakeNow.Add(rssCacheTTL)
+	rssVal = 0
+	if got := b.RSS(); got != 0 {
+		t.Fatalf("RSS исчезнувшего корня = %d, хочу 0", got)
+	}
+	if got := b.RSS(); got != 0 {
+		t.Fatalf("RSS исчезнувшего корня повторно = %d, хочу 0", got)
+	}
+	if n := reads.Load(); n != 5 {
+		t.Errorf("проходов /proc с нулевым RSS %d, хочу 5 (ноль не кэшируется)", n)
 	}
 }
 

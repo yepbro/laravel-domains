@@ -669,9 +669,10 @@ func TestZonesCollapse_SmallPoolDeadlock(t *testing.T) {
 	case <-time.After(deadline):
 		// Развязать прогон (Acquire чувствует отмену ctx) и ДОЖДАТЬСЯ
 		// возврата соединений до pool.Close очистки: defer Run делает
-		// movingDropSQL на удерживаемом соединении без дедлайна — если
-		// подвисание когда-нибудь окажется не в Acquire, ждём не вечно,
-		// а grace, и падаем честным FAIL (ревью T-217 P3-2).
+		// movingDropSQL на удерживаемом соединении с бюджетом
+		// movingDropTimeout 5 с (T-229) — если подвисание когда-нибудь
+		// окажется не в Acquire, ждём не вечно, а grace (10 с покрывает
+		// уборку), и падаем честным FAIL (ревью T-217 P3-2).
 		cancel()
 		const grace = 10 * time.Second
 		select {

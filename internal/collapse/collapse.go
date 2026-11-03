@@ -27,8 +27,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -216,6 +218,10 @@ type Options struct {
 	// Batch — размер окна id (§7.3); 0 — DefaultBatch. Не конфиг:
 	// уменьшение для интеграционного теста возобновления.
 	Batch int
+	// Log — логгер команды; nil — записи подавлены (slog.DiscardHandler,
+	// стиль RecoverOptions). Запись одна: Warn о неудачной финальной
+	// уборке moving_ids (dropMoving, T-229).
+	Log *slog.Logger
 }
 
 // ZoneRow — строка инвентаризации: зона и объёмы переноса (отчёт §7.4).
@@ -737,6 +743,29 @@ func SpotCheck(ctx context.Context, pool db.DB, name, wantZone, wantLabel string
 
 // ---------------------------------------------------------------- проход
 
+// movingDropTimeout — бюджет финальной уборки moving_ids (T-229):
+// отдельный контекст по образцу discardTimeout (ingest, pipeline.discard)
+// и refundTimeout (queue, recover) — уборка обязана переживать отмену ctx
+// команды (Ctrl-C в момент финиша: контекст уже отменён, а temp-таблица
+// пережила бы возврат соединения в пул), но не висеть неограниченно:
+// DROP без дедлайна на зависшем PostgreSQL удерживал бы соединение и
+// выход CLI сколь угодно долго.
+const movingDropTimeout = 5 * time.Second
+
+// dropMoving — финальная уборка temp-таблицы moving_ids: best-effort DROP
+// с собственным бюджетом времени, ошибка не затеняет результат команды —
+// Warn в лог (T-229). Пережившая уборку таблица не ломает следующие
+// запуски: шаг 3 Zone пересоздаёт её (DROP IF EXISTS) в той же сессии
+// соединения пула.
+func dropMoving(conn Conn, timeout time.Duration, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if _, err := conn.Exec(ctx, movingDropSQL); err != nil {
+		log.Warn("collapse: финальная уборка moving_ids не выполнена — temp-таблица останется в сессии соединения, следующий запуск зоны пересоздаст её",
+			"err", err)
+	}
+}
+
 // Run — полный проход команды (§7.1–§7.5): инвентаризация и отчёт-план,
 // предусловие check_state = 1, по --apply — перенос зон по шагам §7.2,
 // реконсиляция счётчиков (общая с monitor/crawlerctl counters, T-178 —
@@ -748,6 +777,10 @@ func SpotCheck(ctx context.Context, pool db.DB, name, wantZone, wantLabel string
 func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer) error {
 	if pool == nil {
 		return errors.New("collapse: пул не задан")
+	}
+	log := opts.Log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
 	}
 	allow := allowlistArg(opts.Allowlist)
 	batch := opts.Batch
@@ -815,9 +848,11 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 	}
 	defer func() {
 		// Финальная уборка moving_ids (§7.2): temp-таблица пережила бы
-		// возврат соединения в пул. Луч-effort: отмена ctx не должна
-		// мешать уборке.
-		_, _ = conn.Exec(context.Background(), movingDropSQL)
+		// возврат соединения в пул. Best-effort с собственным бюджетом
+		// времени (dropMoving, T-229): отмена ctx не мешает уборке, а
+		// зависший PostgreSQL не удерживает соединение и выход CLI;
+		// Release — на всех путях, независимо от исхода DROP.
+		dropMoving(conn, movingDropTimeout, log)
 		conn.Release()
 	}()
 

@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -764,5 +765,55 @@ func TestResolveRemoteWSURL(t *testing.T) {
 		t.Error("ответ без webSocketDebuggerUrl обязан ошибкой")
 	} else if !strings.Contains(err.Error(), "webSocketDebuggerUrl") {
 		t.Errorf("ошибка не называет причину: %v", err)
+	}
+}
+
+// overrideRemoteResolve — подмена шва резолва на время теста (стиль
+// overrideRemoteDial).
+func overrideRemoteResolve(t *testing.T, f func(context.Context, string) ([]net.IPAddr, error)) {
+	t.Helper()
+	old := remoteResolve
+	remoteResolve = f
+	t.Cleanup(func() { remoteResolve = old })
+}
+
+// TestResolveRemoteWSURLPreferIPv4 — выбор адреса из ответа DNS (T-229):
+// IPv6-first порядок не должен отдавать v6-адрес Chromium, слушающему
+// только IPv4 (подключение пошло бы вторым адресом); v4-first и v6-only
+// ответы работают первым адресом. Путь /devtools/browser/ — без сети,
+// адрес проверяется сразу после резолва.
+func TestResolveRemoteWSURLPreferIPv4(t *testing.T) {
+	ctx := context.Background()
+	v6 := net.ParseIP("2001:db8::1")
+	v4 := net.ParseIP("192.0.2.10")
+	const withPath = "ws://chromium.example:9222/devtools/browser/abc"
+	const noPort = "ws://chromium.example/devtools/browser/abc"
+
+	for _, tc := range []struct {
+		name  string
+		raw   string
+		addrs []net.IPAddr
+		want  string
+	}{
+		{"IPv6-first — выбран IPv4", withPath, []net.IPAddr{{IP: v6}, {IP: v4}}, "ws://192.0.2.10:9222/devtools/browser/abc"},
+		{"IPv4-first — он же", withPath, []net.IPAddr{{IP: v4}, {IP: v6}}, "ws://192.0.2.10:9222/devtools/browser/abc"},
+		{"только IPv6 — первый адрес", withPath, []net.IPAddr{{IP: v6}}, "ws://[2001:db8::1]:9222/devtools/browser/abc"},
+		// Без порта: v4 — как есть, v6 — в скобках (голые двоеточия
+		// host перепарсились бы портом, ревью P3-7).
+		{"IPv4 без порта", noPort, []net.IPAddr{{IP: v6}, {IP: v4}}, "ws://192.0.2.10/devtools/browser/abc"},
+		{"IPv6 без порта — в скобках", noPort, []net.IPAddr{{IP: v6}}, "ws://[2001:db8::1]/devtools/browser/abc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrideRemoteResolve(t, func(_ context.Context, _ string) ([]net.IPAddr, error) {
+				return tc.addrs, nil
+			})
+			ws, err := resolveRemoteWSURL(ctx, tc.raw, time.Second)
+			if err != nil {
+				t.Fatalf("резолв: %v", err)
+			}
+			if ws != tc.want {
+				t.Errorf("адрес %s, хочу %s", ws, tc.want)
+			}
+		})
 	}
 }

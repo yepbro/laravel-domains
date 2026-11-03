@@ -13,6 +13,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"log/slog"
 
 	"crawler/internal/collapse"
 	"crawler/internal/config"
@@ -61,6 +62,9 @@ func zonesCollapse(args []string, stdout, stderr io.Writer) error {
 		Apply:         *apply,
 		Force:         *force,
 		SkipReconcile: *skipReconcile,
+		// Warn о неудачной финальной уборке moving_ids (T-229) — в stderr,
+		// стиль manage.go (stdout — только отчёт команды).
+		Log: slog.New(slog.NewTextHandler(stderr, nil)),
 	}
 	if err := collapse.Run(ctx, pool, opts, stdout); err != nil {
 		return fmt.Errorf("zones collapse: %w", err)
