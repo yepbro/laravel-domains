@@ -371,6 +371,86 @@
         });
     }
 
+    // ------------------------------------------------------------ движки рендера (ТЗ рендера §4.6)
+
+    // renderRender — панель движков: темп/успешность по engine (метка
+    // метрик этапа, T-235) и фолбэк published/consumed/глубина
+    // q:render-fallback. Секция null — адреса не заданы («н/д» без
+    // ошибки) или экспозиции недоступны (причина — в errors).
+    function renderRender(snap) {
+        var body = document.getElementById('render-engines-body');
+        var fb = document.getElementById('render-fallback');
+        var hint = document.getElementById('render-hint');
+        if (!body || !fb) return;
+        body.textContent = '';
+        fb.textContent = '';
+
+        var r = snap.render;
+        if (!r) {
+            ndRow(body, 5, errTitle(snap, 'render'));
+            var nd = el('span', 'nd', ND);
+            if (!snap.errors || !snap.errors.render) {
+                nd.title = 'адреса экспозиций не заданы (dashboard.render_metrics_urls пуст)';
+            } else {
+                nd.title = errTitle(snap, 'render');
+            }
+            fb.appendChild(nd);
+            if (hint) hint.textContent = '';
+            return;
+        }
+
+        if (!r.engines || !r.engines.length) {
+            ndRow(body, 5);
+            body.lastChild.firstChild.textContent = 'воркеры без рендеров';
+        } else {
+            r.engines.forEach(function (e) {
+                var row = el('tr');
+                row.appendChild(el('td', 'mono', e.engine));
+                row.appendChild(el('td', 'num', fmtRate(e.rendered_per_sec)));
+                row.appendChild(el('td', 'num', fmtInt(e.rendered_total)));
+                row.appendChild(el('td', 'num', fmtInt(e.finalized_total)));
+                var pct = el('td', 'num',
+                    num(e.success_pct) ? fmtPct(e.success_pct) : '—');
+                if (!num(e.success_pct)) {
+                    pct.title = 'атрибутированных движком завершений ещё нет';
+                } else {
+                    pct.title = 'доля успешных среди завершений с меткой движка ' +
+                        '(движко-независимые DNS/cert-финализации не входят)';
+                }
+                row.appendChild(pct);
+                body.appendChild(row);
+            });
+        }
+
+        // Фолбэк: published (воркер A) / consumed по исходам (воркер B) /
+        // глубина q:render-fallback. Темпы — 0 до первой пары проходов;
+        // сравнение темпов публикаций и потребления — диагностика
+        // «воркер B не успевает» (алерт render_fallback_depth).
+        var f = r.fallback || {};
+        var by = f.consumed_by_result || {};
+        var parts = [];
+        parts.push('фолбэк: опубликовано ' + fmtInt(f.published_total) +
+            ' (' + fmtRate(f.published_per_sec) + '/с)');
+        parts.push('потреблено ' + fmtInt(f.consumed_total) +
+            ' (' + fmtRate(f.consumed_per_sec) + '/с) — доработано ' + fmtInt(by.rendered) +
+            ' / финализировано ' + fmtInt(by.finalized) +
+            ' / пропущено ' + fmtInt(by.skipped));
+        var depth = el('span');
+        if (num(f.depth)) {
+            depth.appendChild(document.createTextNode('глубина q:render-fallback: ' + fmtInt(f.depth)));
+        } else {
+            var dnd = el('span', 'nd', 'глубина q:render-fallback: ' + ND);
+            dnd.title = 'глубина недоступна (Redis)';
+            depth.appendChild(dnd);
+        }
+        fb.appendChild(document.createTextNode(parts.join(' · ')));
+        fb.appendChild(document.createTextNode(' · '));
+        fb.appendChild(depth);
+        if (hint) {
+            hint.textContent = 'успешность — по метке engine метрик этапа; кумулятивы — с рестарта воркеров';
+        }
+    }
+
     // ------------------------------------------------------------ зоны (§5.3)
 
     function renderZones(snap) {
@@ -577,6 +657,7 @@
         renderCards(snap);
         renderLaravelCard(snap);
         renderQueues(snap);
+        renderRender(snap);
         renderZones(snap);
         renderStatuses(snap);
         renderLaravel(snap);

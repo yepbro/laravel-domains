@@ -108,6 +108,9 @@ monitor:
   # Зонд алерта мусорных content_hash (T-099): /metrics сервиса ingest
   # по имени сервиса в docker-сети (то же, что скрейпит Prometheus).
   ingest_metrics_url: "http://ingest:9101/metrics"
+  # Зонд алерта бюджета доли фолбэка рендера (T-246): /metrics
+  # render-worker по имени сервиса в docker-сети.
+  render_metrics_url: "http://render-worker:9105/metrics"
 
 web:
   # dev: лендинг слушает все интерфейсы контейнера (:8080 — внутри
@@ -140,6 +143,15 @@ dashboard:
     render-worker: "http://render-worker:9105"
     analyzer: "http://analyzer:9106"
     monitor: "http://monitor:9100"
+  # Панель движков рендера (T-246): экспозиция основной сборки
+  # render-worker (движок этапа — метки engine). Воркер B фолбэка —
+  # сервис render-fallback профиля runtime (в docker-сети — тот же
+  # дефолт бинарника :9105, т.е. http://render-fallback:9105/metrics;
+  # адрес добавляют для стендовых прогонов фолбэка, docs/render.md);
+  # на стандартном dev-стеке B не поднимается — без него панель
+  # показывает только движок этапа, потребление/глубина — нули.
+  render_metrics_urls:
+    - "http://render-worker:9105/metrics"
 
 log:
   level: "info"                    # dev: info, для отладки воркеров — debug

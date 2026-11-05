@@ -629,6 +629,12 @@ type Monitor struct {
 	// зондом раз в период алертов. Тот же адрес, что скрейпит Prometheus;
 	// пустая строка — алерт «не измеряется».
 	IngestMetricsURL string `yaml:"ingest_metrics_url"`
+	// RenderMetricsURL — адрес /metrics рендер-воркера (T-246): алерт
+	// превышения бюджета доли фолбэка читает счётчик событий приостановки
+	// (crawler_render_fallback_suspended_total) из экспозиции зонда раз
+	// в период алертов. Тот же адрес, что скрейпит Prometheus; пустая
+	// строка — алерт «не измеряется» (тихо).
+	RenderMetricsURL string `yaml:"render_metrics_url"`
 	// Alerts — недостающие пороги ТЗ 5.9 и доставка алертов оператору
 	// (T-162, замер §12: все P0 того периода найдены вручную).
 	Alerts Alerts `yaml:"alerts"`
@@ -756,6 +762,13 @@ type Dashboard struct {
 	// internal/service отдаёт /livez на METRICS_ADDR; в docker-сети —
 	// http://<имя-сервиса>:<порт>). nil/пустая карта — секция «н/д».
 	Probes map[string]string `yaml:"probes"`
+	// RenderMetrics — адреса /metrics рендер-воркеров для панели движков
+	// (ТЗ рендера §4.6 п.4, T-246): основная сборка (движок этапа —
+	// метки engine у счётчиков) и сборка воркера B фолбэка
+	// (потребление/глубина q:render-fallback). Те же адреса, что
+	// скрейпит Prometheus; nil/пусто — панель «н/д» (не ошибка, стиль
+	// probes).
+	RenderMetrics []string `yaml:"render_metrics_urls"`
 }
 
 // Default возвращает конфигурацию со значениями по умолчанию из ТЗ 5.10
@@ -1061,6 +1074,10 @@ func Default() *Config {
 			// 127.0.0.1:9101); docker-сети переопределяют именем сервиса
 			// (config.dev.yaml: http://ingest:9101/metrics).
 			IngestMetricsURL: "http://127.0.0.1:9101/metrics",
+			// Loopback рендер-воркера по METRICS_ADDR (порт 9105);
+			// docker-сети переопределяют именем сервиса (config.dev.yaml:
+			// http://render-worker:9105/metrics).
+			RenderMetricsURL: "http://127.0.0.1:9105/metrics",
 			Alerts: Alerts{
 				// Включена по умолчанию: решение о доставке принимают
 				// секреты/скрипт на хосте (нет любого — тихо выключена),
@@ -1211,6 +1228,19 @@ func (c *Config) normalize() {
 			p[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(c.Dashboard.Probes[name])
 		}
 		c.Dashboard.Probes = p
+	}
+	// Адреса /metrics рендер-воркеров панели движков — без краевых
+	// пробелов и пустых элементов (лишняя запятая в YAML не должна
+	// ронять секцию); порядок сохраняется — он не влияет на агрегацию
+	// (счётчики суммируются), но детерминирован для журналов.
+	if len(c.Dashboard.RenderMetrics) > 0 {
+		urls := make([]string, 0, len(c.Dashboard.RenderMetrics))
+		for _, u := range c.Dashboard.RenderMetrics {
+			if u = strings.TrimSpace(u); u != "" {
+				urls = append(urls, u)
+			}
+		}
+		c.Dashboard.RenderMetrics = urls
 	}
 }
 
@@ -1763,6 +1793,13 @@ func (c *Config) Validate() error {
 				"monitor.ingest_metrics_url: ожидается абсолютный http(s)-адрес, задано %q", c.Monitor.IngestMetricsURL))
 		}
 	}
+	if c.Monitor.RenderMetricsURL != "" {
+		if u, err := url.Parse(c.Monitor.RenderMetricsURL); err != nil ||
+			(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			problems = append(problems, fmt.Sprintf(
+				"monitor.render_metrics_url: ожидается абсолютный http(s)-адрес, задано %q", c.Monitor.RenderMetricsURL))
+		}
+	}
 
 	// monitor.alerts (T-162): пороги новых алертов и доставка Telegram.
 	// Эскалация обязана быть ниже Warn-минимума, иначе она недостижима;
@@ -1894,6 +1931,15 @@ func (c *Config) Validate() error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			problems = append(problems, fmt.Sprintf(
 				"dashboard.probes: %s=%q — ожидается абсолютный http(s)-адрес (базовый URL метрик сервиса, ТЗД §8.3)", name, c.Dashboard.Probes[name]))
+		}
+	}
+	// Адреса панели движков (T-246) — тот же критерий абсолютного
+	// http(s)-адреса, что у проб: экспозиция /metrics рендер-воркеров.
+	for _, raw := range c.Dashboard.RenderMetrics {
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			problems = append(problems, fmt.Sprintf(
+				"dashboard.render_metrics_urls: %q — ожидается абсолютный http(s)-адрес (экспозиция /metrics рендер-воркера)", raw))
 		}
 	}
 

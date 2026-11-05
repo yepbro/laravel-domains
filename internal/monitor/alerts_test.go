@@ -742,7 +742,8 @@ func TestAlertsDeadDegradation(t *testing.T) {
 	env = newAlertsTestEnv(t, nil)
 	env.lener.lens = map[string]int64{queue.StreamDead: 4}
 	// Ошибок — на все чтения прохода: алерт очередей читает 4 рабочих
-	// стрима до q:dead (evaluators), каждой своей ошибки не хватит.
+	// стрима, дальше q:dead, q:render-fallback (T-246) и q:render
+	// рендер-долга — каждому чтению своя ошибка.
 	env.lener.errs = []error{
 		errors.New("connection refused"), errors.New("connection refused"),
 		errors.New("connection refused"), errors.New("connection refused"),
@@ -1202,7 +1203,8 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 	}
 	wantNames := []string{AlertDNSErrors, AlertQueueOverflow, AlertProgressStall, AlertDiskFree,
 		AlertDiskMin, AlertDiskCrit, AlertNVMeWear, AlertBadHashes, AlertUnitOOM, AlertMemHigh,
-		AlertQueueDead, AlertQueueFreeze, AlertRedisMemory, AlertPSICPU, AlertRenderDebt}
+		AlertQueueDead, AlertQueueFreeze, AlertRedisMemory, AlertPSICPU, AlertRenderDebt,
+		AlertRenderFbDepth, AlertRenderFbBudget}
 	if len(res.Alerts) != len(wantNames) {
 		t.Fatalf("алертов в снапшоте = %d, want %d", len(res.Alerts), len(wantNames))
 	}
@@ -1942,7 +1944,9 @@ func TestAlertsRenderDebtDegradation(t *testing.T) {
 	}
 
 	// Ошибка XLEN — Warn. До рендер-долга Len зовут ещё 5 раз (4 стрима
-	// алерта очередей + q:dead) — ошибка ставится шестой в очереди.
+	// алерта очередей + q:dead) — ошибка ставится шестой в очереди
+	// (алерт глубины фолбэка T-246 идёт после рендер-долга и порядок не
+	// сдвигает).
 	env4 := newAlertsTestEnv(t, nil)
 	env4.lener.errs = []error{nil, nil, nil, nil, nil, errors.New("redis: xlen")}
 	s = snapshotOf(t, env4.Pass(context.Background()), AlertRenderDebt)

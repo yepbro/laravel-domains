@@ -126,6 +126,7 @@ func TestDefault(t *testing.T) {
 		{"monitor.slow_query_min_duration", c.Monitor.SlowQueryMinDuration.D(), 3 * time.Second},
 		{"monitor.slow_query_telegram", c.Monitor.SlowQueryTelegram, false},
 		{"monitor.ingest_metrics_url", c.Monitor.IngestMetricsURL, "http://127.0.0.1:9101/metrics"},
+		{"monitor.render_metrics_url", c.Monitor.RenderMetricsURL, "http://127.0.0.1:9105/metrics"},
 		{"monitor.alerts.telegram", c.Monitor.Alerts.Telegram, true},
 		{"monitor.alerts.telegram_script", c.Monitor.Alerts.TelegramScript, "/opt/crawler/bin/telegram-notify.sh"},
 		{"monitor.alerts.disk_free_min_bytes", c.Monitor.Alerts.DiskFreeMinBytes.B(), int64(15 << 30)},
@@ -146,6 +147,9 @@ func TestDefault(t *testing.T) {
 		{"dashboard.status_cache_ttl", c.Dashboard.StatusCacheTTL.D(), time.Minute},
 		{"dashboard.username", c.Dashboard.Username, ""},
 		{"dashboard.password_hash", c.Dashboard.PasswordHash, ""},
+		// Панель движков (T-246): адреса экспозиций по умолчанию не
+		// заданы — секция «н/д» (стиль probes).
+		{"dashboard.render_metrics_urls", len(c.Dashboard.RenderMetrics), 0},
 		{"log.level", c.Log.Level, "info"},
 	}
 	for _, ch := range checks {
@@ -1221,6 +1225,11 @@ func TestValidate(t *testing.T) {
 		}, "monitor.slow_query_min_duration"},
 		{"ingest_metrics_url не адрес", func(c *Config) { c.Monitor.IngestMetricsURL = "ingest:9101" }, "monitor.ingest_metrics_url"},
 		{"ingest_metrics_url не http(s)", func(c *Config) { c.Monitor.IngestMetricsURL = "ftp://ingest:9101/metrics" }, "monitor.ingest_metrics_url"},
+		{"render_metrics_url не адрес", func(c *Config) { c.Monitor.RenderMetricsURL = "render-worker:9105" }, "monitor.render_metrics_url"},
+		{"render_metrics_url не http(s)", func(c *Config) { c.Monitor.RenderMetricsURL = "ftp://render:9105/metrics" }, "monitor.render_metrics_url"},
+		{"dashboard.render_metrics_urls не адрес", func(c *Config) {
+			c.Dashboard.RenderMetrics = []string{"http://render-worker:9105/metrics", "render-fallback:9110"}
+		}, "dashboard.render_metrics_urls"},
 		{"alerts crit ≥ min", func(c *Config) {
 			c.Monitor.Alerts.DiskFreeCritBytes = c.Monitor.Alerts.DiskFreeMinBytes
 		}, "monitor.alerts.disk_free_crit_bytes"},
@@ -1487,6 +1496,17 @@ func TestDashboardProbesNormalize(t *testing.T) {
 		if p := cfg.Dashboard.Probes; len(p) != 1 || p["mon"] != "http://b:1" {
 			t.Errorf("%q: после normalize: ожидается map[mon:http://b:1], получено %v", yaml, p)
 		}
+	}
+}
+
+// Адреса экспозиций панели движков чистятся от краевых пробелов и
+// пустых элементов (лишняя запятая в YAML не роняет секцию), порядок
+// сохраняется (T-246).
+func TestDashboardRenderMetricsNormalize(t *testing.T) {
+	cfg := mustLoad(t, "dashboard:\n  render_metrics_urls:\n    - \" http://render-worker:9105/metrics \"\n    - \"\"\n    - \"http://render-fallback:9110/metrics\"\n", validDSN())
+	want := []string{"http://render-worker:9105/metrics", "http://render-fallback:9110/metrics"}
+	if got := cfg.Dashboard.RenderMetrics; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("dashboard.render_metrics_urls после normalize: ожидается %v, получено %v", want, got)
 	}
 }
 

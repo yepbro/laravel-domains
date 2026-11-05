@@ -11,7 +11,9 @@
 // XLEN + INFO memory); недостающие пороги T-162 — абсолютный минимум
 // диска (Warn/эскалация), троттлинг MemoryHigh, замороженная очередь
 // (last-delivered-id), PSI CPU; накопление рендер-долга — T-175 (флаги
-// render_pending по счётчику + лаг q:render); переходы алертов
+// render_pending по счётчику + лаг q:render); очередь фолбэка рендера —
+// T-246 (рост глубины q:render-fallback + события бюджета доли из
+// зонда /metrics рендер-воркера); переходы алертов
 // доставляются в Telegram (TelegramNotifier → telegram-notify.sh
 // --message). Ещё два цикла — отчёт системной нагрузки (T-173) и
 // медленные запросы PostgreSQL (T-177: pg_stat_activity → Telegram той
@@ -175,6 +177,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	deps := monitor.AlertsDeps{Pool: pool, Redis: monitor.NewDeadDepthMetrics(reg, gate)}
 	if cfg.Monitor.IngestMetricsURL != "" {
 		deps.BadHashes = monitor.IngestBadHashes{URL: cfg.Monitor.IngestMetricsURL}
+	}
+	// Источник событий бюджета доли фолбэка (T-246): зонд экспозиции
+	// /metrics рендер-воркера (счётчик suspended{reason="budget"} растёт
+	// в процессе воркера, монитор читает его тем же адресом, что
+	// скрейпит Prometheus). Пустой адрес — алерт «не измеряется» тихо
+	// (а не Warn зондом на каждый проход), стиль ingest-зонда.
+	if cfg.Monitor.RenderMetricsURL != "" {
+		deps.FallbackBudget = monitor.RenderSuspends{URL: cfg.Monitor.RenderMetricsURL}
 	}
 	// События юнитов (T-145): systemctl show + cgroup v2 memory.events
 	// (unitevents.go), обёрнуты в метрики — одно чтение на проход питает

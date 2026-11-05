@@ -712,8 +712,10 @@ func TestSnapshotJSONForm(t *testing.T) {
 		t.Fatalf("снимок не JSON-объект: %v;\n%s", err, b)
 	}
 	// Точный набор ключей: 5 секций CLI + секции дашборда + built_at.
+	// render — панель движков (T-246): null — адреса экспозиций не
+	// заданы («н/д», не ошибка — как health без проб).
 	wantKeys := []string{"zones", "totals", "queues", "throughput", "rates",
-		"statuses", "laravel", "ingest", "health", "errors", "built_at", "queue_watermarks"}
+		"statuses", "laravel", "ingest", "health", "errors", "built_at", "queue_watermarks", "render"}
 	if len(doc) != len(wantKeys) {
 		t.Errorf("ключи = %d (%v), хочу %d", len(doc), docKeys(doc), len(wantKeys))
 	}

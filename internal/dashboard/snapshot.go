@@ -63,6 +63,56 @@ type ProbeJSON struct {
 	Error string `json:"error,omitempty"`
 }
 
+// RenderEngineJSON — строка панели движков (ТЗ рендера §4.6 п.4, T-246):
+// темп и успешность одного движка рендера по счётчикам этапа с меткой
+// engine (T-235): rendered — crawler_render_records_total{rendered=
+// "true",engine}, finalized — Σ crawler_render_task_finalized_total по
+// причинам (движко-зависимый класс задачи T-172; тарпит/cert/DNS без
+// метки движка в долю не входят — cert/DNS движко-независимы по ТЗ
+// рендера, тарпит недоатрибутирован, оговорка — docs/render.md).
+// Кумулятив — с рестарта воркеров (метрики процесса), темп — между
+// проходами сборщика.
+type RenderEngineJSON struct {
+	// Engine — движок сборки рендер-воркера (chromium|moli|lightpanda,
+	// render.engine).
+	Engine string `json:"engine"`
+	// RenderedTotal — успешные рендеры движка с рестарта воркера.
+	RenderedTotal int64 `json:"rendered_total"`
+	// FinalizedTotal — финализации класса задачи с меткой движка.
+	FinalizedTotal int64 `json:"finalized_total"`
+	// SuccessPct — доля успешных среди атрибутированных движком
+	// завершений (rendered/(rendered+finalized)); nil — завершений ещё
+	// нет (молодой воркер).
+	SuccessPct *float64 `json:"success_pct"`
+	// RenderedPerSec — темп успешных рендеров между проходами сборщика
+	// (0 — первый проход или рестарт воркера: базы дельты нет).
+	RenderedPerSec float64 `json:"rendered_per_sec"`
+}
+
+// RenderFallbackJSON — блок фолбэка панели движков (T-246): публикации
+// воркера A (crawler_render_fallback_published_total, T-238), потребление
+// воркером B (crawler_render_fallback_consumed_total по исходам, T-245)
+// и остаток — глубина q:render-fallback (тот же общий расчёт глубины,
+// что у секции очередей).
+type RenderFallbackJSON struct {
+	// PublishedTotal — публикации в q:render-fallback с рестарта воркера A.
+	PublishedTotal int64 `json:"published_total"`
+	// PublishedPerSec — темп публикаций между проходами (0 — без базы).
+	PublishedPerSec float64 `json:"published_per_sec"`
+	// ConsumedTotal — потреблено воркером B с рестарта.
+	ConsumedTotal int64 `json:"consumed_total"`
+	// ConsumedPerSec — темп потребления между проходами (0 — без базы);
+	// пара к PublishedPerSec — сравнение темпов и есть диагностика
+	// «воркер B не успевает» (алерт render_fallback_depth, T-246).
+	ConsumedPerSec float64 `json:"consumed_per_sec"`
+	// ConsumedByResult — потребление по исходам delivered
+	// (rendered|finalized|skipped).
+	ConsumedByResult map[string]int64 `json:"consumed_by_result"`
+	// Depth — глубина q:render-fallback (backlog группы render-fallback-
+	// worker); nil — Redis недоступен (глубина «н/д», секция жива).
+	Depth *int64 `json:"depth"`
+}
+
 // Snapshot — снимок состояния (ТЗД §5): готовый к отдаче документ.
 // Общие секции зон/итогов/очередей/темпа/скоростей (§5.1–5.4) —
 // status.SummaryJSON (wire-контракт CLI --json, ТЗД §6.2): встраивание
@@ -89,6 +139,24 @@ type Snapshot struct {
 	// отключён. Значение конфигурации (пересчитывается на каждом
 	// проходе), секцией не является и деградировать не может.
 	QueueWatermarks map[string]int64 `json:"queue_watermarks"`
+
+	// Render — панель движков рендера и фолбэка (ТЗ рендера §4.6 п.4,
+	// T-246): темп/успешность по engine из экспозиций /metrics
+	// рендер-воркеров (dashboard.render_metrics_urls) и fallback-рейт —
+	// published/consumed/глубина q:render-fallback. nil — адреса не
+	// заданы («н/д», не ошибка — стиль Health) или секция деградировала
+	// (причина — в errors).
+	Render *RenderJSON `json:"render"`
+}
+
+// RenderJSON — секция панели движков: строки по движкам (темп/успешность)
+// и блок фолбэка.
+type RenderJSON struct {
+	// Engines — движки, замеченные в экспозициях воркеров (порядок —
+	// по имени, детерминированный JSON); пусто — воркеры без рендеров.
+	Engines []RenderEngineJSON `json:"engines"`
+	// Fallback — published/consumed/глубина фолбэка.
+	Fallback RenderFallbackJSON `json:"fallback"`
 }
 
 // rfc3339 — единый формат моментов времени снимка.

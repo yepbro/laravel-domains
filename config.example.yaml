@@ -394,6 +394,11 @@ monitor:
   # Зонд алерта мусорных content_hash (T-099): /metrics сервиса ingest
   # (loopback по METRICS_ADDR юнита); пустая строка — алерт «не измеряется».
   ingest_metrics_url: "http://127.0.0.1:9101/metrics"
+  # Зонд алерта бюджета доли фолбэка рендера (T-246): /metrics
+  # рендер-воркера (loopback 9105) — счётчик событий приостановки
+  # crawler_render_fallback_suspended_total{reason="budget"} (T-239);
+  # пустая строка — алерт «не измеряется» (тихо).
+  render_metrics_url: "http://127.0.0.1:9105/metrics"
   # Цикл рендер-долга (T-175): раз в период — счётчик доменов с флагом
   # render_pending (crawler_counters, ведут переходы бита) + лаг q:render
   # в gauge crawler_render_pending_domains и строкой сводки в журнал
@@ -502,6 +507,14 @@ dashboard:
   # probes:
   #   dns-worker: "http://127.0.0.1:9103"
   #   http-worker: "http://127.0.0.1:9104"
+  # Панель движков рендера (T-246, ТЗ рендера §4.6 п.4): экспозиции
+  # /metrics рендер-воркеров — основная сборка (метки engine счётчиков
+  # этапа, T-235) и сборка воркера B фолбэка (потребление q:render-
+  # fallback, порт 9110 — deploy.md §2.3); глубина очереди читается из
+  # Redis напрямую. Пусто — панель «н/д» (не ошибка).
+  # render_metrics_urls:
+  #   - "http://127.0.0.1:9105/metrics"
+  #   - "http://127.0.0.1:9110/metrics"
 
 log:
   level: "info"                      # уровень логирования сервисов: debug|info|warn|error

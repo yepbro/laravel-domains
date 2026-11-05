@@ -15,6 +15,10 @@
 //     (BackpressureGate, ТЗД §4.3.2): клиент собирает cmd/dashboard по
 //     конфигу redis — как cmd/monitor; порог гейта не участвует (только
 //     Len, стиль crawlerctl status);
+//   - HTTP-экспозиции /metrics рендер-воркеров (T-246, renders.go) —
+//     панель движков: темп/успешность по engine (метка T-235) и
+//     фолбэк published/consumed; глубина q:render-fallback — тем же
+//     Len по Redis;
 //   - пробы /livez сервисов конвейера из dashboard.probes — параллельно
 //     (горутины + WaitGroup; errgroup не используется — golang.org/x/sync
 //     в go.mod косвенная, ТЗД §3.2.1 новых зависимостей не вводит),
@@ -116,6 +120,10 @@ type CollectorOptions struct {
 	// 0 — пределы по стримам политики T-025): нужен для эффективного
 	// порога стрима (см. QueueWatermark).
 	QueueMaxLen int64
+	// RenderMetrics — адреса /metrics рендер-воркеров для панели движков
+	// (T-246; рабочее значение — dashboard.render_metrics_urls): nil/
+	// пусто — секция render «н/д» (не ошибка, стиль Probes).
+	RenderMetrics []string
 	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 	// Metrics — реестр сервиса (метрики §10); nil — без метрик (шов
@@ -154,6 +162,10 @@ type Collector struct {
 	client  *http.Client
 	metrics *collectorMetrics
 	cache   *status.Cache
+	// rates — память темпов панели движков между проходами (кумулятивы
+	// экспозиций воркеров и момент прошлого скрейпа, T-246); пишется
+	// только Loop/CollectOnce — одиночным владельцем, без замка.
+	rates renderRateState
 
 	snap  atomic.Pointer[Snapshot]
 	ready atomic.Bool
@@ -174,6 +186,9 @@ func NewCollector(pool db.DB, lens status.StreamLener, cfg config.Dashboard, opt
 	}
 	if opts.Probes == nil {
 		opts.Probes = cfg.Probes
+	}
+	if opts.RenderMetrics == nil {
+		opts.RenderMetrics = cfg.RenderMetrics
 	}
 	o := opts.withDefaults()
 	client := o.HTTPClient
@@ -307,6 +322,17 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 		}
 	}
 
+	// Панель движков рендера и фолбэка (ТЗ рендера §4.6 п.4, T-246):
+	// экспозиции /metrics рендер-воркеров + глубина q:render-fallback.
+	// Адреса не заданы — Render nil («н/д», не ошибка, стиль Health);
+	// ошибка сбора деградирует секцию (причина — в errors), остальные
+	// секции живут.
+	if r, rerr := c.collectRender(ctx); rerr != nil {
+		snap.Errors["render"] = rerr.Error()
+	} else {
+		snap.Render = r
+	}
+
 	// Здоровье сервисов (§5.8): пробы параллельно; пустой список проб —
 	// секция «н/д» (null), не ошибка.
 	snap.Health = c.probeAll(ctx)
@@ -394,7 +420,7 @@ func (c *Collector) probeOne(ctx context.Context, name, base string) ProbeJSON {
 // просто сдвигает следующий тик (ticker не накапливает пропуски).
 func (c *Collector) Loop(ctx context.Context) error {
 	c.opt.Log.Info("цикл сборки снимков дашборда",
-		"interval", c.opt.Interval.String(), "probes", len(c.opt.Probes))
+		"interval", c.opt.Interval.String(), "probes", len(c.opt.Probes), "render_metrics", len(c.opt.RenderMetrics))
 
 	pass := func() {
 		started := time.Now()

@@ -104,6 +104,33 @@
   </div>
 </section>
 
+<!-- Панель движков рендера и фолбэка (ТЗ рендер-движков §4.6 п.4,
+     T-246): темп/успешность по движкам (метка engine метрик этапа,
+     T-235) и fallback-рейт — published воркера A / consumed воркера B /
+     глубина q:render-fallback. Значения — из экспозиций /metrics
+     рендер-воркеров (dashboard.render_metrics_urls); адреса не заданы
+     или экспозиции недоступны — «н/д». -->
+<section>
+  <h2>Движки рендера <span class="hint" id="render-hint"></span></h2>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Движок</th>
+          <th class="num">Ренд./с</th>
+          <th class="num">Успешно</th>
+          <th class="num">Финализаций</th>
+          <th class="num">Успешность</th>
+        </tr>
+      </thead>
+      <tbody id="render-engines-body">
+        <tr><td colspan="5" class="nd">н/д</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="fb" id="render-fallback"><span class="nd">н/д</span></div>
+</section>
+
 <!-- §5.3: зоны с прогресс-барами; punycode — имя, unicode — подсказка. -->
 <section>
   <h2>Зоны</h2>

@@ -1066,6 +1066,7 @@ rules:
 | `slow_query_telegram` | `CRAWLER_MONITOR_SLOW_QUERY_TELEGRAM` | bool | `false` (T-177) |
 | `render_debt_interval` | `CRAWLER_MONITOR_RENDER_DEBT_INTERVAL` | длительность | `5m` (коридор 30s..1h; T-175) |
 | `ingest_metrics_url` | `CRAWLER_MONITOR_INGEST_METRICS_URL` | http(s)-URL | `http://127.0.0.1:9101/metrics` |
+| `render_metrics_url` | `CRAWLER_MONITOR_RENDER_METRICS_URL` | http(s)-URL | `http://127.0.0.1:9105/metrics` |
 | `alerts.telegram` | `CRAWLER_MONITOR_ALERTS_TELEGRAM` | bool | `true` (T-162) |
 | `alerts.telegram_script` | `CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT` | путь | `/opt/crawler/bin/telegram-notify.sh` |
 | `alerts.disk_free_min_bytes` | `CRAWLER_MONITOR_ALERTS_DISK_FREE_MIN_BYTES` | размер | `15GiB` |
@@ -1129,6 +1130,14 @@ max 501 с) при проходе раз в 5 минут — и оператор
 config.dev.yaml), на боевом хосте — loopback ingest по `METRICS_ADDR`
 юнита. Пустая строка — алерт «не измеряется» (зонд не поднимается);
 значение обязано быть абсолютным http(s)-адресом.
+`render_metrics_url` — адрес `/metrics` рендер-воркера для зонда алерта
+бюджета доли фолбэка (T-246): счётчик событий приостановки
+`crawler_render_fallback_suspended_total{reason="budget"}` (T-239)
+живёт в процессе воркера, монитор читает его тем же адресом, что
+скрейпит Prometheus; в docker-сети — `http://render-worker:9105/metrics`
+(config.dev.yaml), на боевом хосте — loopback по `METRICS_ADDR` юнита
+(9105). Пустая строка — алерт «не измеряется» тихо (зонд не
+поднимается); значение обязано быть абсолютным http(s)-адресом.
 `load_report_interval` — период отчёта системной нагрузки оператору
 (T-173): снимок `/proc` (утилизация и PSI CPU, load average, RAM/swap и
 PSI памяти, топ процессов по CPU и RSS — агрегаты по имени, «htop»-вид),
@@ -1291,6 +1300,7 @@ T-199 разредил реконсиляцию до 30 мин); коридор 
 | `username` | `CRAWLER_DASHBOARD_USERNAME` | строка | `""` |
 | `password_hash` | `CRAWLER_DASHBOARD_PASSWORD_HASH` | строка формата ТЗД §7.2 | `""` |
 | `probes` | `CRAWLER_DASHBOARD_PROBES` | карта имя=url | — |
+| `render_metrics_urls` | `CRAWLER_DASHBOARD_RENDER_METRICS_URLS` | список http(s)-URL | — |
 
 `listen` — публичный адрес операторского дашборда: страницы и API
 (ТЗД §4.2). Дефолт — loopback: публикация наружу — reverse-proxy с TLS
@@ -1342,6 +1352,16 @@ dashboard-secret` (пароль — аргумент или stdin; справк�
 имена приводятся к нижнему регистру; пустая карта — секция здоровья
 «н/д». Переменная заменяет карту из YAML целиком, элементы через
 запятую: `CRAWLER_DASHBOARD_PROBES="dns-worker=http://dns-worker:9103,http-worker=http://http-worker:9104"`.
+
+`render_metrics_urls` — адреса `/metrics` рендер-воркеров для панели
+движков (T-246, ТЗ рендера §4.6 п.4): темп/успешность рендера по
+движкам (метка `engine` счётчиков этапа, T-235 — атрибуция существует
+только в метриках, схема БД движка не знает) и fallback-рейт —
+published/consumed/глубина `q:render-fallback`. Основная сборка —
+движок этапа (9105), сборка воркера B фолбэка — потребление (systemd:
+9110, deploy.md §2.3); глубину дашборд читает из Redis напрямую.
+Значения — абсолютные http(s)-адреса; пусто — панель «н/д» (не
+ошибка). Переменная заменяет список целиком, элементы через запятую.
 
 Cookie-сессия дашборда (24 ч, ТЗД §7.5) получает флаг `Secure` по факту
 TLS (T-227): прямое TLS-соединение либо `X-Forwarded-Proto: https` от
