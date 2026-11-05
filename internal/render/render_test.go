@@ -67,6 +67,21 @@ func TestNewOptions(t *testing.T) {
 	}
 }
 
+// TestNewOptionsEngine — проводка движка рендера (ТЗР движков §4.2,
+// ФТ-4): render.engine переносится в Options как есть, без нормализации
+// («» = chromium — семантика валидации, не сборки); дальше движок читают
+// только validate и remote-аллокатор.
+func TestNewOptionsEngine(t *testing.T) {
+	for _, engine := range []string{"", config.EngineChromium, config.EngineMoli, config.EngineLightpanda} {
+		cfg := config.Default()
+		cfg.Render.Engine = engine
+		cfg.Render.RemoteURL = "ws://engine:9222"
+		if got := NewOptions(*cfg).Engine; got != engine {
+			t.Errorf("render.engine %q: NewOptions перенёс %q, хочу как есть", engine, got)
+		}
+	}
+}
+
 func TestOptionsWithDefaults(t *testing.T) {
 	got := Options{}.withDefaults()
 	if got.DialTimeout != 10*time.Second {
@@ -146,11 +161,64 @@ func TestOptionsValidate(t *testing.T) {
 		}
 	}
 
+	// Движок рендера (ТЗР движков §4.2, ФТ-1/3): chromium и "" допускают
+	// оба режима подключения; moli|lightpanda — только внешний CDP, для
+	// них обязателен remote_url и выключен порог памяти (RSS чужого
+	// процесса недоступен). Базовые valid/local выше — движок "".
+	for _, engine := range []string{config.EngineChromium, config.EngineMoli, config.EngineLightpanda} {
+		named := local
+		named.Engine = engine
+		if engine != config.EngineChromium {
+			named.RemoteURL = valid.RemoteURL // альтернативам нужен внешний CDP
+		}
+		if err := named.validate(); err != nil {
+			t.Errorf("движок %s отклонён: %v", engine, err)
+		}
+	}
+	// Связка «движок × remote_url × memory_threshold» (ФТ-3): движковые
+	// ошибки называют поле и движок.
+	for _, engine := range []string{config.EngineMoli, config.EngineLightpanda} {
+		noRemote := valid
+		noRemote.Engine = engine
+		noRemote.RemoteURL = ""
+		err := noRemote.validate()
+		if err == nil || !strings.Contains(err.Error(), "engine: для "+engine+" обязателен remote_url") {
+			t.Errorf("движок %s без remote_url: хочу ошибку связки, получено %v", engine, err)
+		}
+		withThreshold := valid
+		withThreshold.Engine = engine
+		withThreshold.MemoryThreshold = 256 << 20
+		err = withThreshold.validate()
+		if err == nil || !strings.Contains(err.Error(), "memory_threshold: для движка "+engine+" ожидается 0") {
+			t.Errorf("движок %s с порогом памяти: хочу ошибку связки, получено %v", engine, err)
+		}
+	}
+	// Схема remote_url альтернативных движков — только ws/wss (P2
+	// ревью T-234): адрес конфигурации (lightpanda) или его authority
+	// (moli) идут в WebSocket-диал напрямую, http(s) жив лишь
+	// уточнением у chromium.
+	for _, engine := range []string{config.EngineMoli, config.EngineLightpanda} {
+		badScheme := valid
+		badScheme.Engine = engine
+		badScheme.RemoteURL = "http://engine:9222"
+		err := badScheme.validate()
+		if err == nil || !strings.Contains(err.Error(), "remote_url: для движка "+engine+" ожидается ws://") {
+			t.Errorf("движок %s с http-адресом: хочу ошибку схемы, получено %v", engine, err)
+		}
+		wss := valid
+		wss.Engine = engine
+		wss.RemoteURL = "wss://engine:9222"
+		if err := wss.validate(); err != nil {
+			t.Errorf("движок %s с wss-адресом отклонён: %v", engine, err)
+		}
+	}
+
 	cases := []struct {
 		name  string
 		opts  Options
 		field string
 	}{
+		{"движок неизвестен", Options{Engine: "webkit", RemoteURL: "ws://x:9222", Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}, "engine"},
 		{"схема remote_url", Options{RemoteURL: "ftp://x:9222", Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}, "remote_url"},
 		{"remote_url без хоста", Options{RemoteURL: "ws://", Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}, "remote_url"},
 		{"contexts 0", Options{Contexts: 0, Timeout: time.Second, RestartEveryPages: 1}, "contexts"},

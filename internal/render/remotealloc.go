@@ -29,6 +29,8 @@ import (
 
 	"github.com/chromedp/chromedp"
 	"github.com/chromedp/chromedp/remote"
+
+	"crawler/internal/config"
 )
 
 // remoteDial — подключение транспорта к внешнему Chromium (WebSocket).
@@ -61,14 +63,57 @@ var remoteResolve = func(ctx context.Context, host string) ([]net.IPAddr, error)
 type remoteAllocator struct {
 	wsURL       string
 	dialTimeout time.Duration
+	// urlMode — режим подготовки адреса подключения (ТЗР движков §4.2
+	// п.1/п.3): движковые CDP-нюансы фиксируются параметрами аллокатора,
+	// не кодом ядра. Ставится в newRemoteAllocator по Options.Engine.
+	urlMode wsURLMode
 
 	wg sync.WaitGroup
 }
 
+// wsURLMode — режим подготовки адреса подключения к внешнему движку
+// (ТЗР движков §4.2 п.1: движковая специфика — только здесь). Поведение
+// подтверждено на закреплённых образах стека (moli v1.1.21,
+// lightpanda 1.0.2): moli отдаёт browser-WebSocket только на пути
+// /devtools/browser/<uuid>, генерируемом на каждый старт процесса
+// (хендшейк на корне — 404, на uuid-пути — 101, uuid меняется
+// рестартом), lightpanda — на корневом пути самого адреса (хендшейк
+// на «/» — 101).
+type wsURLMode int
+
+const (
+	// wsURLResolve — chromium: резолв хоста в IP и уточнение адреса
+	// запросом /json/version (resolveRemoteWSURL); рекламируемый
+	// webSocketDebuggerUrl используется как есть — Chromium строит его
+	// от того же слушателя.
+	wsURLResolve wsURLMode = iota
+	// wsURLAsIs — lightpanda: browser-WebSocket живёт на корневом пути
+	// адреса — подключение идёт по адресу конфигурации без изменений
+	// (аналог опции remote.NoModifyURL chromedp/remote); реклама
+	// /json/version строится от адреса бинда и для подключения не
+	// используется.
+	wsURLAsIs
+	// wsURLResolveAuthority — moli: путь browser-сессии обязан
+	// уточняться запросом /json/version (uuid-путь нов на каждый старт),
+	// но authority (хост:порт) рекламируемого URL подменяется адресом
+	// конфигурации: moli строит рекламу от адреса бинда (флага
+	// advertise-host нет), при бинде 0.0.0.0/127.0.0.1 она недостижима
+	// извне контейнера — см. wsURLWithAuthority.
+	wsURLResolveAuthority
+)
+
 // newRemoteAllocator — аллокатор для Options.RemoteURL (DialTimeout —
-// бюджет и уточнения адреса, и подключения).
+// бюджет и уточнения адреса, и подключения). Режим адреса — по движку
+// (Options.Engine; chromium и "" — уточнение, как до этапа 35).
 func newRemoteAllocator(opts Options) *remoteAllocator {
-	return &remoteAllocator{wsURL: opts.RemoteURL, dialTimeout: opts.DialTimeout}
+	a := &remoteAllocator{wsURL: opts.RemoteURL, dialTimeout: opts.DialTimeout, urlMode: wsURLResolve}
+	switch opts.Engine {
+	case config.EngineLightpanda:
+		a.urlMode = wsURLAsIs
+	case config.EngineMoli:
+		a.urlMode = wsURLResolveAuthority
+	}
+	return a
 }
 
 // Allocate удовлетворяет chromedp.Allocator: ctx — контекст браузерной
@@ -76,7 +121,7 @@ func newRemoteAllocator(opts Options) *remoteAllocator {
 // сессию — сначала мягко (команды закрытия вкладок), затем принудительно
 // (сокет). dial-часть ограничена dialTimeout через remoteDial.
 func (a *remoteAllocator) Allocate(ctx context.Context, opts ...chromedp.BrowserOption) (*chromedp.Browser, error) {
-	wsURL, err := resolveRemoteWSURL(ctx, a.wsURL, a.dialTimeout)
+	wsURL, err := a.dialURL(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +148,44 @@ func (a *remoteAllocator) Allocate(ctx context.Context, opts ...chromedp.Browser
 		wcancel()
 	})
 	return chromedp.NewBrowserTransport(wctx, tr, opts...)
+}
+
+// dialURL — адрес WebSocket-подключения по режиму движка (wsURLMode):
+// chromium уточняет адрес (резолв хоста + /json/version), lightpanda
+// использует адрес конфигурации как есть, moli уточняет путь через
+// /json/version, но подключается с authority адреса конфигурации.
+func (a *remoteAllocator) dialURL(ctx context.Context) (string, error) {
+	if a.urlMode == wsURLAsIs {
+		return a.wsURL, nil
+	}
+	ws, err := resolveRemoteWSURL(ctx, a.wsURL, a.dialTimeout)
+	if err != nil || a.urlMode != wsURLResolveAuthority {
+		return ws, err
+	}
+	return wsURLWithAuthority(ws, a.wsURL)
+}
+
+// wsURLWithAuthority — webSocketDebuggerUrl с authority (хост:порт)
+// адреса конфигурации (режим moli): путь browser-сессии движка
+// (/devtools/browser/<uuid>, новый на каждый старт) и схема остаются от
+// рекламы, а адрес подключения берётся тот, что задан оператором, —
+// движок строит рекламу от адреса бинда, и при бинде 0.0.0.0/127.0.0.1
+// она недостижима извне контейнера. Адрес конфигурации уже прошёл
+// валидацию (непустой хост); пустой разбор здесь — защитный отказ.
+func wsURLWithAuthority(wsURL, cfgURL string) (string, error) {
+	ws, err := url.Parse(wsURL)
+	if err != nil {
+		return "", fmt.Errorf("webSocketDebuggerUrl %q: %w", wsURL, err)
+	}
+	cfg, err := url.Parse(cfgURL)
+	if err != nil {
+		return "", fmt.Errorf("адрес конфигурации %q: %w", cfgURL, err)
+	}
+	if cfg.Host == "" {
+		return "", fmt.Errorf("адрес конфигурации %q без хоста", cfgURL)
+	}
+	ws.Host = cfg.Host
+	return ws.String(), nil
 }
 
 // Attaches удовлетворяет chromedp.Attacher: браузер уже запущен внешним

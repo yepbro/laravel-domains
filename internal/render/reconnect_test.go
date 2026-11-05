@@ -41,6 +41,8 @@ import (
 	"github.com/chromedp/cdproto"
 	"github.com/chromedp/cdproto/cdp/jsonv2"
 	"github.com/chromedp/chromedp"
+
+	"crawler/internal/config"
 )
 
 // switchableCDP — транспорт CDP с переключением жизни: как fakeCDP
@@ -420,6 +422,140 @@ func TestRemoteAllocatorClosesConnectionOnCancel(t *testing.T) {
 	waitForFor(t, 10*time.Second, tr.isClosed)
 	a.Wait() // фоновое закрытие соединения завершено
 	cancelBrowser()
+}
+
+// TestRemoteAllocatorEngineURLMode — движковая проводка аллокатора
+// (ТЗР движков §4.2 п.1/п.3, ФТ-4): режим адреса wsURLMode по движку.
+// Поведение движков подтверждено на закреплённых образах стека (moli
+// v1.1.21: browser-WS только на пути /devtools/browser/<uuid>, новом на
+// каждый старт, корень — 404; lightpanda 1.0.2: browser-WS на корневом
+// пути). lightpanda подключается по адресу конфигурации как есть; moli
+// берёт путь из /json/version, но authority — из адреса конфигурации
+// (реклама строится от адреса бинда); контроль: chromium использует
+// webSocketDebuggerUrl из /json/version как есть (поведение до этапа 35).
+func TestRemoteAllocatorEngineURLMode(t *testing.T) {
+	// lightpanda: имя-хост без пути /devtools/browser/ — chromium в
+	// такой конфигурации обязан резолвить и уточнять адрес; для
+	// lightpanda любая попытка — регрессия (резолв подменён отказом,
+	// сервера /json/version нет): подключение проходит только по
+	// адресу как есть.
+	t.Run(config.EngineLightpanda, func(t *testing.T) {
+		tr := newSwitchableCDP()
+		var mu sync.Mutex
+		dialed := ""
+		overrideRemoteDial(t, func(_ context.Context, wsURL string, _ time.Duration) (chromedp.Transport, error) {
+			mu.Lock()
+			dialed = wsURL
+			mu.Unlock()
+			return tr, nil
+		})
+		overrideRemoteResolve(t, func(_ context.Context, host string) ([]net.IPAddr, error) {
+			t.Errorf("резолв %s при движке lightpanda: адрес не должен уточняться", host)
+			return nil, errors.New("резолв не ожидается")
+		})
+
+		opts := remoteOpts()
+		opts.Engine = config.EngineLightpanda
+		opts.RemoteURL = "ws://engine.example:9222"
+		b, err := StartBrowser(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("подключение к lightpanda по адресу как есть: %v", err)
+		}
+		b.Close()
+		waitForFor(t, 10*time.Second, tr.isClosed)
+
+		mu.Lock()
+		got := dialed
+		mu.Unlock()
+		if got != opts.RemoteURL {
+			t.Errorf("lightpanda: подключение к %q, хочу адрес конфигурации %q как есть", got, opts.RemoteURL)
+		}
+	})
+
+	// moli: путь browser-сессии — из /json/version, authority — из
+	// адреса конфигурации: реклама ws://0.0.0.0:9222 (бинд 0.0.0.0,
+	// флага advertise-host у moli нет) недостижима, подключение идёт
+	// на адрес оператора с рекламируемым путём.
+	t.Run(config.EngineMoli, func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/json/version" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"Browser":"moli","webSocketDebuggerUrl":"ws://0.0.0.0:9222/devtools/browser/moli-uuid"}`)
+		}))
+		defer srv.Close()
+
+		tr := newSwitchableCDP()
+		var mu sync.Mutex
+		dialed := ""
+		overrideRemoteDial(t, func(_ context.Context, wsURL string, _ time.Duration) (chromedp.Transport, error) {
+			mu.Lock()
+			dialed = wsURL
+			mu.Unlock()
+			return tr, nil
+		})
+
+		opts := remoteOpts()
+		opts.Engine = config.EngineMoli
+		opts.RemoteURL = strings.Replace(srv.URL, "http://", "ws://", 1) // ws-схема: валидация альт-движков требует ws/wss
+		b, err := StartBrowser(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("подключение к moli с путём из /json/version: %v", err)
+		}
+		b.Close()
+		waitForFor(t, 10*time.Second, tr.isClosed)
+
+		want := strings.Replace(srv.URL, "http://", "ws://", 1) + "/devtools/browser/moli-uuid"
+		mu.Lock()
+		got := dialed
+		mu.Unlock()
+		if got != want {
+			t.Errorf("moli: подключение к %q, хочу путь из /json/version с authority конфигурации %q", got, want)
+		}
+	})
+
+	// Контроль (chromium): webSocketDebuggerUrl из /json/version
+	// используется как есть, authority не подменяется — поведение
+	// до этапа 35.
+	t.Run(config.EngineChromium, func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/json/version" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"Browser":"x","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/adv"}`)
+		}))
+		defer srv.Close()
+
+		tr := newSwitchableCDP()
+		var mu sync.Mutex
+		dialed := ""
+		overrideRemoteDial(t, func(_ context.Context, wsURL string, _ time.Duration) (chromedp.Transport, error) {
+			mu.Lock()
+			dialed = wsURL
+			mu.Unlock()
+			return tr, nil
+		})
+
+		opts := remoteOpts()
+		opts.Engine = config.EngineChromium
+		opts.RemoteURL = srv.URL // http://IP:port без /devtools/browser/ — форсирует уточнение
+		b, err := StartBrowser(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("подключение к chromium с уточнением адреса: %v", err)
+		}
+		b.Close()
+		waitForFor(t, 10*time.Second, tr.isClosed)
+
+		mu.Lock()
+		got := dialed
+		mu.Unlock()
+		const advertised = "ws://127.0.0.1:9222/devtools/browser/adv"
+		if got != advertised {
+			t.Errorf("chromium: подключение к %q, хочу webSocketDebuggerUrl из /json/version %q", got, advertised)
+		}
+	})
 }
 
 // TestBrowserProbeConnDeadConnection — зонд соединения против «чёрной

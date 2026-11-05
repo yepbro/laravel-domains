@@ -134,17 +134,22 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 	var cancelAlloc context.CancelFunc
 	mode := opts.RemoteURL
 	if mode != "" {
-		// Внешний Chromium (dev-стек: compose-сервис chromium; боевой
-		// systemd-юнит crawler-chromium, render.remote_url): собственный
+		// Внешний CDP-сервер (dev-стек: compose-сервис chromium; боевой
+		// systemd-юнит crawler-chromium, render.remote_url; то же —
+		// альтернативные движки moli/lightpanda, ТЗР §4.2): собственный
 		// аллокатор поверх chromedp/remote — соединение WebSocket с
 		// детерминированным закрытием сокета при смене поколения
-		// (remotealloc.go, T-218), адрес при необходимости уточняется
-		// запросом /json/version.
+		// (remotealloc.go, T-218); режим адреса — по движку
+		// (wsURLMode): chromium уточняет адрес запросом /json/version,
+		// lightpanda подключается по адресу конфигурации, moli
+		// комбинирует путь из /json/version с адресом конфигурации.
 		allocCtx, cancelAlloc = chromedp.NewAllocatorContext(ctx,
 			newRemoteAllocator(opts))
 	} else {
-		// Боевой режим: собственный процесс. --no-sandbox обязателен в
-		// контейнере без привилегий (deploy/docker/Dockerfile.render,
+		// Боевой режим: собственный процесс — только для движка chromium
+		// (валидация Options требует RemoteURL для moli|lightpanda,
+		// сюда они не доходят; ТЗР §4.2, ФТ-3). --no-sandbox обязателен
+		// в контейнере без привилегий (deploy/docker/Dockerfile.render,
 		// USER nobody); остальное — головной набор chromedp: headless, без
 		// фоновых сервисов браузера.
 		mode = "локальный процесс"

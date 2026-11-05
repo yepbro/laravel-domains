@@ -94,6 +94,17 @@ type RenderOutput struct {
 // производные таймауты (DialTimeout, SessionStartTimeout) — внутренние
 // режимы работы, в ТЗ 5.10 не параметризуются.
 type Options struct {
+	// Engine — движок рендера (ТЗР движков §4.2, ФТ-1/3/4): "" или
+	// config.EngineChromium — сегодняшний режим (внешний CDP при
+	// заданном RemoteURL, собственный процесс при пустом — здесь и
+	// ниже «chromium» покрывает оба); config.EngineMoli и
+	// config.EngineLightpanda — внешние альтернативные CDP-серверы:
+	// RemoteURL для них обязателен (схема ws/wss), MemoryThreshold — 0
+	// (связку проверяет validate), режим адреса аллокатора — по движку
+	// (remotealloc.go, wsURLMode). Движок видят только валидация и
+	// аллокатор: ядро пакета (Session/Pool/Manager/extract/block/wait)
+	// по нему не ветвится (ФТ-4).
+	Engine string
 	// RemoteURL — адрес внешнего Chromium по CDP (ws://host:9222):
 	// dev-стек, compose-сервис chromium. Пусто — воркер запускает
 	// собственный процесс headless-shell (боевой render-образ).
@@ -194,6 +205,15 @@ type Options struct {
 	LookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
 }
 
+// altEngine — внешний альтернативный движок рендера (ТЗР движков §4.2
+// п.1, ФТ-4): moli или lightpanda. Единственная производная по Engine
+// рядом с Options — читается валидацией (связка «движок × RemoteURL ×
+// MemoryThreshold» и схема RemoteURL) и проводкой remote-аллокатора;
+// глубже пакета движок не проходит.
+func (o Options) altEngine() bool {
+	return o.Engine == config.EngineMoli || o.Engine == config.EngineLightpanda
+}
+
 // NewOptions собирает Options из конфигурации сервиса (ТЗ 5.10): секция
 // render плюс User-Agent HTTP-этапа (ТЗ §9 — единый идентифицируемый UA
 // краулера), потолок DOM из секции content (R-02: итоговый DOM не больше
@@ -201,6 +221,7 @@ type Options struct {
 // http.block_internal_addrs (T-219 — общий с HTTP-этапом).
 func NewOptions(cfg config.Config) Options {
 	return Options{
+		Engine:              cfg.Render.Engine,
 		RemoteURL:           cfg.Render.RemoteURL,
 		Contexts:            cfg.Render.Contexts,
 		Timeout:             time.Duration(cfg.Render.Timeout),
@@ -232,6 +253,43 @@ func (o Options) withDefaults() Options {
 // повторяют секцию render internal/config (ТЗ 5.10).
 func (o Options) validate() error {
 	var problems []string
+	// Движок рендера (ТЗР движков §4.2, ФТ-3): перечисление и связка
+	// «движок × remote_url × memory_threshold» повторяют валидацию
+	// секции render internal/config (T-233) — Options собирается не
+	// только из конфигурации, пограничная проверка здесь удерживает
+	// контракт аллокатора: moli|lightpanda — внешние CDP-серверы,
+	// remote_url обязателен (собственный процесс браузера — только
+	// chromium, ФТ-2), RSS чужого процесса недоступен — memory_threshold
+	// обязан быть 0. Chromium допускает оба режима подключения; порог
+	// памяти при внешнем chromium не работает, но не запрещён — как
+	// сегодня.
+	switch o.Engine {
+	case "", config.EngineChromium, config.EngineMoli, config.EngineLightpanda: // "" — как chromium (конфиг без Default())
+	default:
+		problems = append(problems, fmt.Sprintf("engine: ожидается %s|%s|%s, задано %q",
+			config.EngineChromium, config.EngineMoli, config.EngineLightpanda, o.Engine))
+	}
+	if o.altEngine() {
+		if o.RemoteURL == "" {
+			problems = append(problems, fmt.Sprintf(
+				"engine: для %s обязателен remote_url (внешний CDP-сервер ws://host:9222; собственный процесс браузера — только %s)",
+				o.Engine, config.EngineChromium))
+		} else if u, err := url.Parse(o.RemoteURL); err != nil || u.Host == "" ||
+			(u.Scheme != "ws" && u.Scheme != "wss") {
+			// Аллокатор альтернативных движков диалит адрес конфигурации
+			// (lightpanda) или его authority (moli) напрямую в WebSocket:
+			// http(s) у него нет пути уточнения через /json/version с
+			// готовым ws-адресом, а websocket-клиент chromedp принимает
+			// только ws/wss — отказ на сборке, а не невнятный хендшейк.
+			problems = append(problems, fmt.Sprintf(
+				"remote_url: для движка %s ожидается ws://host:9222, задано %q", o.Engine, o.RemoteURL))
+		}
+		if o.MemoryThreshold != 0 {
+			problems = append(problems, fmt.Sprintf(
+				"memory_threshold: для движка %s ожидается 0 (RSS чужого процесса недоступен), задано %d",
+				o.Engine, o.MemoryThreshold))
+		}
+	}
 	if o.RemoteURL != "" {
 		u, err := url.Parse(o.RemoteURL)
 		if err != nil || u.Host == "" ||
