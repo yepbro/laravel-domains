@@ -402,7 +402,13 @@ NavigateResponse (переход; само ждёт загрузку — T-064)
 ## Цикл очередей (T-067, ТЗ 5.6/§5.7/§7)
 
 Потребитель q:render — пакет `internal/renderworker`, цикл
-`renderworker.Run` в `cmd/render-worker`. Задача — `Result`-сообщение
+`renderworker.Run` в `cmd/render-worker`. Стрим потребления — параметр
+сборки воркера (T-236, ФТ-12): `renderworker.Options.Stream` (дефолт
+`DefaultStream` = q:render, отдельные точки проводки — чтение цикла,
+клейм RecoverLoop и коллектор глубины `crawler_queue_depth` в
+`cmd/render-worker`); воркер фолбэка рендера (ТЗ фолбэка, §4.5) — тот же
+бинарь другой сборкой: стрим q:render-fallback и отдельная группа
+потребителей. Задача — `Result`-сообщение
 (ключ строки `subdomain_results`, T-024); итоговый URL читается из
 строки, сообщение идентификаторов не раздувает (ТЗ 4.2). Обработка
 одной доставки — порядок «запись в БД → публикация → XACK» (ТЗ 4.2):

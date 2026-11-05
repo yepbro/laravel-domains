@@ -1,5 +1,6 @@
 // Сервис render-worker (ТЗ 5.6, §5.7, §7; T-067): этап рендера.
-// Потребляет задачи q:render (Result — ключ строки subdomain_results,
+// Потребляет задачи стрима потребления (дефолт q:render; Result — ключ
+// строки subdomain_results,
 // T-024; публикуют HTTP-этап при SPA-вердиктах T-057/T-066 и проход
 // доработки renderq.go) группой потребителей; итоговый URL читается из
 // строки, страница рендерится браузером Chromium под менеджером поколений
@@ -124,7 +125,8 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// в реестре видно сразу при старте.
 	content.WarnDictMismatch(store.Dir(), logger)
 
-	// Очередь: потребление q:render и XACK проходят прозрачно, публикация
+	// Очередь: потребление стрима воркера (stream, дефолт q:render) и
+	// XACK проходят прозрачно, публикация
 	// q:analyze — под гейтом backpressure (T-026: порог общий для
 	// гейтируемых стримов; как у dns-worker с q:http и http-worker с
 	// q:analyze; ворота ёмкости q:render — отдельные,
@@ -176,7 +178,8 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
 	}), gate)
 
-	// Возврат зависших доставок q:render (T-025): RecoverLoop в воркере —
+	// Возврат зависших доставок стрима потребления (T-025): RecoverLoop
+	// в воркере —
 	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
 	// и темпа — секция redis (max_attempts, claim_min_idle,
 	// recover_batch, recover_interval — T-153). OnBury — счётчик смертей
@@ -188,19 +191,32 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		OnBury:      metrics.NewDeadBuriedHook(reg),
 	})
 
-	// Длина потребляемого стрима q:render → crawler_queue_depth (T-077):
+	// Стрим потребления воркера (T-236, ТЗ §4.1 п.3/ФТ-12): дефолт —
+	// q:render; воркер фолбэка (ТЗ §4.5) — тот же бинарь другой сборкой:
+	// стрим q:render-fallback (константа queue.StreamRenderFallback —
+	// задача T-237) и отдельная группа потребителей. Единая точка ниже
+	// кормит и Options воркера (чтение Run и клейм RecoverLoop), и
+	// коллектор глубины — глубина меряется по потребляемому стриму,
+	// расходиться им незачем.
+	stream := renderworker.DefaultStream
+
+	// Длина потребляемого стрима (stream) → crawler_queue_depth (T-077):
 	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
 		_ = metrics.CollectQueueLoop(ctx, reg, gate.Len,
-			[]string{queue.StreamRender}, metrics.DefaultQueueCollectInterval, logger)
+			[]string{stream}, metrics.DefaultQueueCollectInterval, logger)
 	}()
 
 	// Опции воркера — одни на сборку (стиль http-worker): Worker хранит
 	// их для ProcessResult, цикл Run берёт те же Group/Consume/Alive.
 	opts := renderworker.Options{
-		Recover: rel, // возврат зависших задач q:render (T-025)
+		// Стрим потребления (T-236, ФТ-12): чтение цикла Run и клейм
+		// RecoverLoop — одно значение с коллектором глубины выше;
+		// дефолт q:render, сборка воркера фолбэка переопределяет.
+		Stream:  stream,
+		Recover: rel, // возврат зависших задач (T-025)
 		// Темп возврата зависших (T-153): пачка/интервал клейма —
 		// redis.recover_*; инвариант с claim_min_idle (рендер — самый
 		// медленный последовательный обход) — docs/configuration.md.

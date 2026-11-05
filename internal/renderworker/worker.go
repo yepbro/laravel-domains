@@ -2,7 +2,9 @@
 // сырой HTML в хранилище; в результате выставляется rendered = true», §5.7,
 // §7 «render-worker → DOM + cookies → обновление результата → q:analyze»).
 //
-// Воркер потребляет q:render (сообщение Result — ключ строки
+// Воркер потребляет стрим Options.Stream — по умолчанию q:render, воркер
+// фолбэка (ФТ-12, ТЗ §4.5) — тот же бинарь с другим стримом и отдельной
+// группой потребителей (сообщение Result — ключ строки
 // subdomain_results: домен, субдомен, вариант; формат T-024, публикуют
 // HTTP-этап T-066 при SPA-вердикте T-057 и проход доработки renderq.go).
 // Сам результат остаётся в БД, сообщение только указывает на запись —
@@ -295,8 +297,18 @@ type Renderer interface {
 
 // Дефолты воркера.
 const (
-	// DefaultGroup — группа потребителей q:render (ТЗ 4.2: consumer groups
-	// масштабируют воркеров горизонтально).
+	// DefaultStream — стрим потребления воркера по умолчанию (q:render,
+	// ТЗ 4.2): чтение цикла Run и клейм RecoverLoop. Воркер фолбэка
+	// (ТЗ §4.5 п.1, ФТ-12) — тот же бинарь другой сборкой: Options.Stream
+	// переопределяется на стрим фолбэка (q:render-fallback, константа
+	// queue.StreamRenderFallback — задача T-237), Options.Group — на
+	// отдельную группу; второй код воркера не пишется.
+	DefaultStream = queue.StreamRender
+
+	// DefaultGroup — группа потребителей стрима потребления воркера (ТЗ
+	// 4.2: consumer groups масштабируют воркеров горизонтально);
+	// дефолтная сборка — группа q:render, воркер фолбэка (ФТ-12)
+	// собирается с отдельной группой.
 	DefaultGroup = "render-worker"
 
 	// DefaultConcurrency — доставок q:render в работе одновременно.
@@ -345,7 +357,15 @@ type Options struct {
 	Concurrency int
 	// Consume — записей q:render за одно чтение; 0 — DefaultConsume.
 	Consume int
-	// Group — группа потребителей q:render; "" — DefaultGroup.
+	// Stream — стрим потребления воркера: чтение цикла Run и клейм
+	// RecoverLoop (ФТ-12: воркер фолбэка — тот же бинарь со стримом
+	// q:render-fallback и отдельной группой); "" — DefaultStream (q:render,
+	// ноль изменений поведения основной сборки). Имя обязано быть рабочим
+	// стримом очереди (knownStream, internal/queue) — транспорт чужие
+	// отвергает; публикация q:analyze от стрима потребления не зависит
+	// (формат Result общий для обоих стримов).
+	Stream string
+	// Group — группа потребителей стрима Stream; "" — DefaultGroup.
 	Group string
 	// Consumer — имя потребителя группы; "" — "render-worker-<pid>".
 	Consumer string
@@ -407,6 +427,9 @@ func (o Options) withDefaults() Options {
 	if o.Consume <= 0 {
 		o.Consume = DefaultConsume
 	}
+	if o.Stream == "" {
+		o.Stream = DefaultStream
+	}
 	if o.Group == "" {
 		o.Group = DefaultGroup
 	}
@@ -429,8 +452,9 @@ func (o Options) log() *slog.Logger {
 	return o.Log
 }
 
-// Worker — рендер-воркер: обрабатывает задачи q:render (ключи строк
-// subdomain_results) через швы рендера и хранилища. Потокобезопасен:
+// Worker — рендер-воркер: обрабатывает задачи стрима потребления
+// Options.Stream (дефолт q:render; ключи строк subdomain_results) через
+// швы рендера и хранилища. Потокобезопасен:
 // состояние неизменно после New.
 type Worker struct {
 	db       RenderDB
@@ -973,7 +997,9 @@ func renderFailBackoff(streak int) time.Duration {
 }
 
 // Run — рабочий цикл render-worker (ТЗ 4.2, §5.6, §7): читает задачи
-// q:render группой потребителей пачками Consume и обрабатывает доставки
+// стрима Options.Stream (дефолт q:render; воркер фолбэка — ФТ-12 —
+// собирается со стримом q:render-fallback) группой потребителей пачками
+// Consume и обрабатывает доставки
 // параллельно до Concurrency, каждую — паттерном Processing (T-025):
 // рендер → запись в БД → публикация q:analyze → XACK. Потребление
 // скользящее (T-142, образец T-139 httpworker): следующее чтение
@@ -1002,7 +1028,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 	o := opts.withDefaults()
 	log := o.log()
 	log.Info("цикл render-worker",
-		"group", o.Group, "consumer", o.Consumer,
+		"stream", o.Stream, "group", o.Group, "consumer", o.Consumer,
 		"concurrency", o.Concurrency, "consume", o.Consume, "alive", o.Alive != nil)
 
 	wait := func(d time.Duration) {
@@ -1025,7 +1051,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 		go func() {
 			defer close(recDone)
 			_ = queue.RecoverLoopAttempt(ctx, o.Recover, w.processDelivery, queue.RecoverOptions{
-				Stream:   queue.StreamRender,
+				Stream:   o.Stream,
 				Group:    o.Group,
 				Consumer: o.Consumer,
 				// Темп обхода PEL — очередь, не этап (redis.recover_*,
@@ -1079,7 +1105,8 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 			// цикла, поведение не хуже. Поколение зонды менеджера
 			// заменяют сами (реконнект, T-065).
 			if o.Alive != nil && !o.Alive() {
-				log.Warn("Chromium недоступен — q:render не читается (перезапуск — менеджер, T-065)")
+				log.Warn("Chromium недоступен — стрим потребления не читается (перезапуск — менеджер, T-065)",
+					"stream", o.Stream)
 				wait(DefaultErrorWait)
 				if ctx.Err() != nil {
 					return // graceful shutdown
@@ -1095,8 +1122,8 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				if o.Recover != nil && !o.Recover.Writable(ctx) {
 					infraStreak++
 					pause := renderFailBackoff(infraStreak)
-					log.Warn("пауза чтения q:render: публикация результатов падает об инфраструктуру Redis (OOM/соединение) — новые доставки не читаются (T-152)",
-						"streak", infraStreak, "wait", pause.String())
+					log.Warn("пауза чтения: публикация результатов падает об инфраструктуру Redis (OOM/соединение) — новые доставки не читаются (T-152)",
+						"stream", o.Stream, "streak", infraStreak, "wait", pause.String())
 					wait(pause)
 					if ctx.Err() != nil {
 						return // graceful shutdown: wait вышел по отмене
@@ -1106,7 +1133,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				infraDown.Store(false)
 				infraStreak = 0
 				if o.Recover != nil {
-					log.Info("запись в Redis восстановлена — чтение q:render возобновляется")
+					log.Info("запись в Redis восстановлена — чтение возобновляется", "stream", o.Stream)
 				}
 			}
 			// Предохранитель (renderFailWaitBase): доставки, подряд
@@ -1127,19 +1154,19 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				// Наблюдаемость простоя: пауза останавливает чтение
 				// этапа — Warn с серией и числом неудач (частота
 				// ограничена удвоением паузы, не чаще ~2/мин на серии).
-				log.Warn("пауза предохранителя чтения q:render: доставки падают подряд",
-					"failed", n, "streak", failStreak, "wait", pause.String())
+				log.Warn("пауза предохранителя чтения: доставки падают подряд",
+					"stream", o.Stream, "failed", n, "streak", failStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
 					return // graceful shutdown: wait вышел по отмене
 				}
 			}
-			deliveries, err := w.q.Consume(ctx, queue.StreamRender, o.Group, o.Consumer, o.Consume)
+			deliveries, err := w.q.Consume(ctx, o.Stream, o.Group, o.Consumer, o.Consume)
 			if err != nil {
 				if ctx.Err() != nil {
 					return // graceful shutdown
 				}
-				log.Warn("цикл render-worker: чтение q:render", "err", err)
+				log.Warn("цикл render-worker: чтение стрима потребления", "stream", o.Stream, "err", err)
 				wait(DefaultErrorWait)
 				continue
 			}
@@ -1190,8 +1217,8 @@ dispatch:
 			defer func() {
 				if r := recover(); r != nil {
 					failed.Add(1)
-					log.Error("паника обработки доставки q:render",
-						"entry", d.ID, "panic", r, "stack", string(debug.Stack()))
+					log.Error("паника обработки доставки",
+						"stream", o.Stream, "entry", d.ID, "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			// Свежая доставка XREADGROUP — первая по счётчику PEL: attempts=1
@@ -1205,8 +1232,8 @@ dispatch:
 					infraDown.Store(true)
 				}
 				if ctx.Err() == nil {
-					log.Warn("задача q:render не подтверждена — вернётся повторной доставкой",
-						"entry", d.ID, "err", err)
+					log.Warn("задача не подтверждена — вернётся повторной доставкой",
+						"stream", o.Stream, "entry", d.ID, "err", err)
 				}
 			} else {
 				failed.Store(0)
