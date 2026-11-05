@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,6 +94,7 @@ func TestDefault(t *testing.T) {
 		{"http.task_per_domain", c.HTTP.TaskPerDomain, 8},
 		{"http.dead_host_cutoff", c.HTTP.DeadHostCutoff, true},
 		{"http.mem_limit", c.HTTP.MemLimit.B(), int64(768 << 20)},
+		{"render.engine", c.Render.Engine, EngineChromium},
 		{"render.remote_url", c.Render.RemoteURL, ""},
 		{"render.contexts", c.Render.Contexts, 8},
 		{"render.timeout", c.Render.Timeout.D(), 25 * time.Second},
@@ -102,6 +104,10 @@ func TestDefault(t *testing.T) {
 		{"render.block_stylesheet", c.Render.BlockStylesheet, false},
 		{"render.block_tracker_domains", c.Render.BlockTrackerDomains, true},
 		{"render.queue_high_watermark", c.Render.QueueHighWatermark, 10000},
+		{"render.fallback.enabled", c.Render.Fallback.Enabled, false},
+		{"render.fallback.worker_rate", c.Render.Fallback.WorkerRate, 100},
+		{"render.fallback.share_percent", c.Render.Fallback.SharePercent, 30.0},
+		{"render.fallback.health_gate_streak", c.Render.Fallback.HealthGateStreak, 3},
 		{"content.dir", c.Content.Dir, "/data/content"},
 		{"content.pack_size", c.Content.PackSize.B(), int64(512 << 20)},
 		{"content.max_store_bytes", c.Content.MaxStoreBytes.B(), int64(2 << 20)},
@@ -240,6 +246,7 @@ http:
   dead_host_cutoff: false
   mem_limit: "768MiB"
 render:
+  engine: "Chromium"
   remote_url: "ws://10.0.0.9:9222"
   contexts: 4
   timeout: "40s"
@@ -252,6 +259,11 @@ render:
   requeue_deprioritized_zones:
     - "xn--p1ai"
     - "net"
+  fallback:
+    enabled: true
+    worker_rate: 500
+    share_percent: 12.5
+    health_gate_streak: 5
 content:
   dir: "/srv/content"
   pack_size: "1GiB"
@@ -355,6 +367,7 @@ log:
 		{"http.task_per_domain", cfg.HTTP.TaskPerDomain, 6},
 		{"http.dead_host_cutoff", cfg.HTTP.DeadHostCutoff, false},
 		{"http.mem_limit", cfg.HTTP.MemLimit.B(), int64(768 << 20)},
+		{"render.engine", cfg.Render.Engine, EngineChromium}, // «Chromium» → normalize → chromium
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 4},
 		{"render.timeout", cfg.Render.Timeout.D(), 40 * time.Second},
@@ -364,6 +377,10 @@ log:
 		{"render.block_stylesheet", cfg.Render.BlockStylesheet, true},
 		{"render.block_tracker_domains", cfg.Render.BlockTrackerDomains, false},
 		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
+		{"render.fallback.enabled", cfg.Render.Fallback.Enabled, true},
+		{"render.fallback.worker_rate", cfg.Render.Fallback.WorkerRate, 500},
+		{"render.fallback.share_percent", cfg.Render.Fallback.SharePercent, 12.5},
+		{"render.fallback.health_gate_streak", cfg.Render.Fallback.HealthGateStreak, 5},
 		{"content.dir", cfg.Content.Dir, "/srv/content"},
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(1 << 30)},
 		{"content.max_store_bytes", cfg.Content.MaxStoreBytes.B(), int64(1 << 20)},
@@ -645,6 +662,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_HTTP_DEAD_HOST_CUTOFF":               "false",
 		"CRAWLER_HTTP_MEM_LIMIT":                      "512MiB",
 		"CRAWLER_HTTP_PER_IP_OVERRIDES":               "195.209.0.0/16=9, 2a02:7b8::/32=6",
+		"CRAWLER_RENDER_ENGINE":                       " chromium ",
 		"CRAWLER_RENDER_REMOTE_URL":                   "ws://10.0.0.9:9222",
 		"CRAWLER_RENDER_CONTEXTS":                     "2",
 		"CRAWLER_RENDER_TIMEOUT":                      "11s",
@@ -655,6 +673,10 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_RENDER_BLOCK_TRACKER_DOMAINS":        "false",
 		"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK":         "7000",
 		"CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES":  "xn--p1ai, org",
+		"CRAWLER_RENDER_FALLBACK_ENABLED":             "true",
+		"CRAWLER_RENDER_FALLBACK_WORKER_RATE":         "250",
+		"CRAWLER_RENDER_FALLBACK_SHARE_PERCENT":       "17.5",
+		"CRAWLER_RENDER_FALLBACK_HEALTH_GATE_STREAK":  "7",
 		"CRAWLER_CONTENT_DIR":                         "/env/content",
 		"CRAWLER_CONTENT_PACK_SIZE":                   "256MB",
 		"CRAWLER_CONTENT_MAX_STORE_BYTES":             "512KiB",
@@ -752,6 +774,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"http.task_per_domain", cfg.HTTP.TaskPerDomain, 4},
 		{"http.dead_host_cutoff", cfg.HTTP.DeadHostCutoff, false},
 		{"http.mem_limit", cfg.HTTP.MemLimit.B(), int64(512 << 20)},
+		{"render.engine", cfg.Render.Engine, EngineChromium}, // « chromium » → normalize → chromium
 		{"render.remote_url", cfg.Render.RemoteURL, "ws://10.0.0.9:9222"},
 		{"render.contexts", cfg.Render.Contexts, 2},
 		{"render.timeout", cfg.Render.Timeout.D(), 11 * time.Second},
@@ -761,6 +784,10 @@ func TestEnvOverrides(t *testing.T) {
 		{"render.block_stylesheet", cfg.Render.BlockStylesheet, true},
 		{"render.block_tracker_domains", cfg.Render.BlockTrackerDomains, false},
 		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
+		{"render.fallback.enabled", cfg.Render.Fallback.Enabled, true},
+		{"render.fallback.worker_rate", cfg.Render.Fallback.WorkerRate, 250},
+		{"render.fallback.share_percent", cfg.Render.Fallback.SharePercent, 17.5},
+		{"render.fallback.health_gate_streak", cfg.Render.Fallback.HealthGateStreak, 7},
 		{"content.dir", cfg.Content.Dir, "/env/content"},
 		{"content.pack_size", cfg.Content.PackSize.B(), int64(256 * 1000 * 1000)},
 		{"content.max_store_bytes", cfg.Content.MaxStoreBytes.B(), int64(512 << 10)},
@@ -851,6 +878,7 @@ func TestEnvBadValues(t *testing.T) {
 		{map[string]string{"CRAWLER_INGEST_ARCHIVE_MAX_UNCOMPRESSED": "огромно"}, "CRAWLER_INGEST_ARCHIVE_MAX_UNCOMPRESSED"},
 		{map[string]string{"CRAWLER_INGEST_ARCHIVE_MAX_FILES": "много"}, "CRAWLER_INGEST_ARCHIVE_MAX_FILES"},
 		{map[string]string{"CRAWLER_LOG_LEVEL": "verbose"}, "log.level"},
+		{map[string]string{"CRAWLER_RENDER_ENGINE": "safari"}, "render.engine"},
 		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
 		{map[string]string{"CRAWLER_SCHEDULER_ZONE_WEIGHTS": "com=много"}, "CRAWLER_SCHEDULER_ZONE_WEIGHTS"},
 		{map[string]string{"CRAWLER_HTTP_PER_IP_OVERRIDES": "195.208.0.0/16"}, "CRAWLER_HTTP_PER_IP_OVERRIDES"},
@@ -1129,6 +1157,23 @@ func TestValidate(t *testing.T) {
 		{"requeue-зона unicode", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"рф"} }, "render.requeue_deprioritized_zones"},
 		{"requeue-зона с точкой в конце", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"com."} }, "render.requeue_deprioritized_zones"},
 		{"requeue-зона повтор", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"com", "com"} }, "render.requeue_deprioritized_zones"},
+		{"движок неизвестен", func(c *Config) { c.Render.Engine = "webkit" }, "render.engine"},
+		{"moli без remote_url", func(c *Config) {
+			c.Render.Engine = EngineMoli
+			c.Render.RestartMemoryBytes = 0
+		}, "render.engine"},
+		{"moli с порогом памяти", func(c *Config) {
+			c.Render.Engine = EngineMoli
+			c.Render.RemoteURL = "ws://10.0.0.9:9222"
+		}, "render.restart_memory_bytes"},
+		{"lightpanda без remote_url и с порогом", func(c *Config) { c.Render.Engine = EngineLightpanda }, "render.engine"},
+		{"fallback worker_rate 0", func(c *Config) { c.Render.Fallback.WorkerRate = 0 }, "render.fallback.worker_rate"},
+		{"fallback worker_rate велик", func(c *Config) { c.Render.Fallback.WorkerRate = 1000001 }, "render.fallback.worker_rate"},
+		{"fallback share_percent отрицательный", func(c *Config) { c.Render.Fallback.SharePercent = -1 }, "render.fallback.share_percent"},
+		{"fallback share_percent >100", func(c *Config) { c.Render.Fallback.SharePercent = 100.1 }, "render.fallback.share_percent"},
+		{"fallback share_percent NaN", func(c *Config) { c.Render.Fallback.SharePercent = math.NaN() }, "render.fallback.share_percent"},
+		{"fallback health_gate_streak 0", func(c *Config) { c.Render.Fallback.HealthGateStreak = 0 }, "render.fallback.health_gate_streak"},
+		{"fallback health_gate_streak велик", func(c *Config) { c.Render.Fallback.HealthGateStreak = 101 }, "render.fallback.health_gate_streak"},
 		{"content.dir пуст", func(c *Config) { c.Content.Dir = "" }, "content.dir"},
 		{"pack_size мал", func(c *Config) { c.Content.PackSize = 1 }, "content.pack_size"},
 		{"pack_size велик", func(c *Config) { c.Content.PackSize = ByteSize(16 << 30) }, "content.pack_size"},
@@ -1258,6 +1303,9 @@ func TestValidate(t *testing.T) {
 	c.Render.RestartMemoryBytes = 0                                                    // контроль памяти отключён — допустимо
 	c.Render.QueueHighWatermark = 100000000                                            // верхняя граница порога ёмкости q:render (T-174)
 	c.Render.RequeueDeprioritizedZones = []string{"com", "co.uk", "xn--p1ai"}          // границы имён зон (T-184)
+	c.Render.Fallback.WorkerRate = 1000000                                             // верхняя граница темпа воркера B (T-233)
+	c.Render.Fallback.SharePercent = 100                                               // верхняя граница бюджета доли фолбэка (T-233)
+	c.Render.Fallback.HealthGateStreak = 100                                           // верхняя граница стрика health-гейта (T-233)
 	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)
 	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // границы весов
 	c.Web.Listen = "/run/crawler-web/web.sock"                                         // unix-сокет — вариант публичного входа web (T-124)
@@ -1281,12 +1329,78 @@ func TestValidate(t *testing.T) {
 	c.Dashboard.StatusCacheTTL = Duration(5 * time.Minute)   // верхняя граница коридора T-161
 	c.HTTP.MemLimit = 0                                      // мягкий потолок кучи выключен — допустимо (T-163)
 	c.Render.QueueHighWatermark = 1                          // нижняя граница явного порога q:render (T-174)
+	c.Render.Fallback.WorkerRate = 1                         // нижняя граница темпа воркера B (T-233)
+	c.Render.Fallback.SharePercent = 0                       // бюджет доли выключен — допустимо (T-233)
+	c.Render.Fallback.HealthGateStreak = 1                   // нижняя граница стрика health-гейта (T-233)
 	if err := c.Validate(); err != nil {
 		t.Errorf("нижние границы должны быть валидны: %v", err)
 	}
 	c.Render.QueueHighWatermark = 0 // 0 — общий scheduler.queue_high_watermark, фолбэк (T-174)
 	if err := c.Validate(); err != nil {
 		t.Errorf("порог 0 (общий) должен быть валиден: %v", err)
+	}
+}
+
+// TestRenderEngineFallbackMatrix — матрица связки «движок × remote_url ×
+// restart_memory_bytes» (T-233, ТЗР §4.1 п.2, ФТ-2/ФТ-3): все комбинации
+// трёх движков и неизвестного значения с пустым/заданным remote_url и
+// нулевым/заданным порогом памяти; включённый фолбэк валиден на дефолтных
+// потолках. Границы диапазонов подсекции fallback — TestValidate.
+func TestRenderEngineFallbackMatrix(t *testing.T) {
+	const ws = "ws://10.0.0.9:9222"
+	tests := []struct {
+		name     string
+		engine   string
+		remote   string
+		mem      ByteSize
+		wantErrs []string // пусто — конфиг валиден
+	}{
+		{"chromium: собственный процесс (прод)", EngineChromium, "", ByteSize(1536 << 20), nil},
+		{"chromium: внешний CDP (dev-стек)", EngineChromium, ws, 0, nil},
+		{"chromium: внешний CDP с порогом памяти — не работает, но не запрещён", EngineChromium, ws, ByteSize(1536 << 20), nil},
+		{"moli: внешний CDP", EngineMoli, ws, 0, nil},
+		{"moli: без remote_url", EngineMoli, "", 0, []string{"render.engine"}},
+		{"moli: с порогом памяти", EngineMoli, ws, ByteSize(1 << 30), []string{"render.restart_memory_bytes"}},
+		{"moli: без remote_url и с порогом", EngineMoli, "", ByteSize(1 << 30), []string{"render.engine", "render.restart_memory_bytes"}},
+		{"lightpanda: внешний CDP", EngineLightpanda, ws, 0, nil},
+		{"lightpanda: без remote_url", EngineLightpanda, "", 0, []string{"render.engine"}},
+		{"lightpanda: с порогом памяти", EngineLightpanda, ws, ByteSize(256 << 20), []string{"render.restart_memory_bytes"}},
+		{"lightpanda: без remote_url и с порогом", EngineLightpanda, "", ByteSize(1 << 30), []string{"render.engine", "render.restart_memory_bytes"}},
+		{"неизвестный движок", "webkit", "", ByteSize(1536 << 20), []string{"render.engine"}},
+		{"пустой движок — конфиг без Default(), трактуется как chromium", "", "", ByteSize(1536 << 20), nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Default()
+			c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
+			c.Render.Engine = tt.engine
+			c.Render.RemoteURL = tt.remote
+			c.Render.RestartMemoryBytes = tt.mem
+			c.normalize()
+			err := c.Validate()
+			if len(tt.wantErrs) == 0 {
+				if err != nil {
+					t.Fatalf("комбинация должна быть валидна: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ожидается ошибка валидации (%s)", strings.Join(tt.wantErrs, "; "))
+			}
+			for _, want := range tt.wantErrs {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("ошибка %q не содержит %q", err, want)
+				}
+			}
+		})
+	}
+	// Включённый фолбэк валиден на дефолтных потолках (enabled — не
+	// переключатель валидации, ФТ-14).
+	c := Default()
+	c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
+	c.Render.Fallback.Enabled = true
+	if err := c.Validate(); err != nil {
+		t.Errorf("включённый фолбэк на дефолтных потолках должен быть валиден: %v", err)
 	}
 }
 

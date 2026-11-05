@@ -363,10 +363,33 @@ type HTTP struct {
 	MemLimit ByteSize `yaml:"mem_limit"`
 }
 
+// Движки рендера (ТЗР — tasks/TZ_render_engines.md, §4.1 п.1, ФТ-1):
+// значения поля render.engine. Строки, а не числовой iota: значение
+// видно в конфиге, метриках (лейбл engine, ФТ-15) и журналах как есть.
+const (
+	// EngineChromium — собственный процесс headless-shell (боевой
+	// render-образ) или внешний CDP dev-стека (render.remote_url).
+	EngineChromium = "chromium"
+	// EngineMoli / EngineLightpanda — внешние CDP-серверы: контейнер
+	// движка поднимает инфраструктура, воркер только подключается
+	// (render.remote_url обязателен, ФТ-3).
+	EngineMoli       = "moli"
+	EngineLightpanda = "lightpanda"
+)
+
 // Render — параметры рендера (ТЗ 5.6). RemoteURL — расширение dev-окружения:
 // адрес внешнего Chromium по CDP (ws://…); в боевом режиме воркер запускает
 // браузер сам и поле остаётся пустым.
 type Render struct {
+	// Engine — движок рендера (ТЗР §4.1 п.1, ФТ-1): chromium (дефолт,
+	// воспроизводит сегодняшнее поведение пиксель-в-пиксель — смена
+	// движка только явным переключением), moli|lightpanda — внешние
+	// CDP-серверы: для них обязателен render.remote_url и запрещён
+	// ненулевой restart_memory_bytes (ФТ-3, связку проверяет валидация).
+	// Ядро internal/render движка не различает (ФТ-4: различия — проводка
+	// аллокатора, деплой, документация). "" — конфиг без Default():
+	// валидацией трактуется как chromium (как "" у log.level).
+	Engine            string   `yaml:"engine"`
 	RemoteURL         string   `yaml:"remote_url"`
 	Contexts          int      `yaml:"contexts"`
 	Timeout           Duration `yaml:"timeout"`
@@ -452,6 +475,55 @@ type Render struct {
 	// хвост стрима дренируется FIFO как есть. Расширение к минимальному
 	// составу ТЗ 5.10.
 	RequeueDeprioritizedZones []string `yaml:"requeue_deprioritized_zones"`
+	// Fallback — подсекция render.fallback: очередь фолбэка на Chromium
+	// (ТЗР §4.1 п.1, ФТ-6…ФТ-14). Поля описывают контракт фичи целиком;
+	// механика (публикация из путей финализации, health-гейт, бюджет
+	// доли, темп воркера B) — этап 35. Дефолт выключен и ни на что не
+	// влияет: диапазоны полей валидны и при enabled=false, чтобы
+	// включение правкой одного флага (ФТ-14) не взрывало старт.
+	Fallback RenderFallback `yaml:"fallback"`
+}
+
+// RenderFallback — подсекция render.fallback (ТЗР §4.1 п.1): задачи, не
+// прошедшие рендер на основном движке по движко-зависимой причине (тарпит
+// T-148, класс задачи T-172 на последней попытке), дорабатываются отдельным
+// chromium-воркером B из очереди q:render-fallback. Движко-независимые
+// причины (DNS T-207, cert T-159) фолбэка не получают — Chromium их не
+// исправит (ФТ-7); воркер B — тот же бинарь в другой сборке конфигурации
+// (ФТ-12), рекурсивный фолбэк фолбэка запрещён (ФТ-10).
+type RenderFallback struct {
+	// Enabled — включение фолбэка (ФТ-14): false — первичный воркер
+	// финализирует без рендера как сегодня (маркер render_failed_at,
+	// T-210), подсекция ни на что не влияет; true — публикации в
+	// q:render-fallback подчинены потолкам ниже. Выключение — без
+	// деплоя новых сущностей: накопленное в очереди дорабатывается
+	// воркером B до пуста.
+	Enabled bool `yaml:"enabled"`
+	// WorkerRate — потолок темпа воркера B (ФТ-13): записей за окно
+	// потребления воркера — батч-режим «собрать и доработать» без
+	// наращивания chromium-мощности (окно — тик/окно цикла воркера,
+	// T-240). Дефолт 100 ≈ полной мощности одного chromium (8 контекстов
+	// × ~5 с/страница ≈ 1,6 стр/с): стартовое значение, калибруется
+	// стендовым прогоном (ТЗР §4.4 п.4 — потолок настраивается по стенду).
+	WorkerRate int `yaml:"worker_rate"`
+	// SharePercent — бюджет доли фолбэка (ФТ-9б): потолок доли публикаций
+	// в фолбэк, % рендер-потока за скользящее окно; при превышении
+	// фолбэк приостанавливается до конца окна, задачи финализируются как
+	// сегодня, поднимается алерт (окно — скользящее окно гейта, T-239).
+	// Дефолт 30 — порог отклонения ТЗР §5.3 (fallback-рейт выше ~30%
+	// обнуляет экономику фичи, §7 п.2): бюджет — штормовой размыкатель
+	// защиты от перелива всего потока на дорогой движок, не критерий
+	// канарейки. 0 — без потолка.
+	SharePercent float64 `yaml:"share_percent"`
+	// HealthGateStreak — порог health-гейта (ФТ-9а): столько подряд
+	// инфра-ошибок класса браузера (ClassBrowser — основной движок
+	// недоступен) приостанавливают фолбэк-публикацию до восстановления
+	// движка: перелив всего потока на дорогой chromium при падении лёгкого
+	// исключён. Дефолт 3: единичная инфра-ошибка — шум живого потока
+	// (фолбэк не гасится), лежачий движок даёт стрик на каждой доставке —
+	// порог достигается за секунды. Образец стрик-логики —
+	// renderFailBackoff воркера (обнуление успехом, нарастание сбоем).
+	HealthGateStreak int `yaml:"health_gate_streak"`
 }
 
 // Content — хранилище контента (ТЗ 5.7).
@@ -824,6 +896,11 @@ func Default() *Config {
 			MemLimit: ByteSize(768 << 20),
 		},
 		Render: Render{
+			// Chromium (ФТ-1): дефолт воспроизводит сегодняшнее поведение
+			// пиксель-в-пиксель — прод-контур меняется только явным
+			// переключением на moli|lightpanda (и тогда обязан сопутствовать
+			// render.remote_url, ФТ-3).
+			Engine:    EngineChromium,
 			RemoteURL: "",
 			// 8 (T-169) — осознанное превышение рекомендации ТЗ 5.6
 			// (2–4) по замеру, прецедент ступени 3→4 — T-142. Спрос при
@@ -891,6 +968,16 @@ func Default() *Config {
 			// дренажируются одним порядком (T-181); прод ставит сюда
 			// парковочные зоны по замеру T-176 (xn--p1ai).
 			RequeueDeprioritizedZones: nil,
+			// Очередь фолбэка на Chromium (ФТ-14) выключена: первичный
+			// воркер финализирует без рендера как сегодня — включение
+			// отдельно настраиваемым флагом, без деплоя новых сущностей.
+			// Обоснования потолков — поля RenderFallback.
+			Fallback: RenderFallback{
+				Enabled:          false,
+				WorkerRate:       100,
+				SharePercent:     30,
+				HealthGateStreak: 3,
+			},
 		},
 		Content: Content{
 			Dir:            "/data/content",
@@ -1079,6 +1166,10 @@ func (c *Config) normalize() {
 		}
 		c.Ingest.AllowedZonePaths = out
 	}
+	// Движок рендера — нижний регистр без краевых пробелов (как log.level):
+	// «Chromium»/« MOLI » в YAML/окружении — допустимая форма записи,
+	// каноничную сравнивает валидация и читают консументы (ТЗР §4.1 п.1).
+	c.Render.Engine = strings.ToLower(strings.TrimSpace(c.Render.Engine))
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
 	// Канонический хост лендинга — без краевых пробелов (idn-нормализацию
 	// не делаем: поле задаёт хост публичного адреса как есть, punycode —
@@ -1426,6 +1517,33 @@ func (c *Config) Validate() error {
 	}
 
 	// render
+	// Движок рендера (ТЗР §4.1 п.2, ФТ-3): перечисление и связка
+	// «движок × remote_url × restart_memory_bytes». moli|lightpanda —
+	// внешние CDP-серверы: remote_url обязателен (собственный процесс
+	// браузера — только chromium), RSS чужого процесса недоступен —
+	// restart_memory_bytes обязан быть 0 (как уже сегодня не работает
+	// контроль памяти в remote-режиме dev-стека). chromium допускает оба
+	// режима (ФТ-2: собственный headless-shell прода + внешний CDP
+	// dev-стека); порог памяти при внешнем chromium не работает, но не
+	// запрещён — как сегодня.
+	switch c.Render.Engine {
+	case "", EngineChromium, EngineMoli, EngineLightpanda: // "" — конфиг без Default() (chromium)
+	default:
+		problems = append(problems, fmt.Sprintf("render.engine: ожидается %s|%s|%s, задано %q",
+			EngineChromium, EngineMoli, EngineLightpanda, c.Render.Engine))
+	}
+	if c.Render.Engine == EngineMoli || c.Render.Engine == EngineLightpanda {
+		if c.Render.RemoteURL == "" {
+			problems = append(problems, fmt.Sprintf(
+				"render.engine: для %s обязателен render.remote_url (внешний CDP-сервер ws://host:9222; собственный процесс браузера — только %s)",
+				c.Render.Engine, EngineChromium))
+		}
+		if t := c.Render.RestartMemoryBytes; t != 0 {
+			problems = append(problems, fmt.Sprintf(
+				"render.restart_memory_bytes: для движка %s ожидается 0 (RSS чужого процесса недоступен), задано %s",
+				c.Render.Engine, t))
+		}
+	}
 	if c.Render.RemoteURL != "" {
 		u, err := url.Parse(c.Render.RemoteURL)
 		if err != nil || u.Host == "" {
@@ -1489,6 +1607,25 @@ func (c *Config) Validate() error {
 			continue
 		}
 		seenDepr[name] = true
+	}
+	// Подсекция фолбэка (ТЗР §4.1 п.2): диапазоны проверяются и при
+	// enabled=false — включение фолбэка правкой одного флага (ФТ-14) не
+	// должно взрывать старт невалидными соседями (стиль monitor.alerts:
+	// пороги валидны независимо от включения доставки). Потолок темпа —
+	// как restart_every_pages (счётчик записей), порог стрика — как
+	// timeout_attempts; доля — процент (0, 100] с выключением нулём
+	// (стиль mem_limit, а не disk_free_percent: контроль опционален).
+	// Форма !(p >= 0 && p <= 100), а не p < 0 || p > 100: NaN нечувствителен
+	// к сравнениям и прошёл бы насквозь, молча выключив защитный потолок
+	// (ревью T-233; setFloat принимает NaN из ParseFloat).
+	if !inRange(c.Render.Fallback.WorkerRate, 1, 1000000) {
+		problems = append(problems, rangeMsg("render.fallback.worker_rate", c.Render.Fallback.WorkerRate, 1, 1000000))
+	}
+	if p := c.Render.Fallback.SharePercent; p != 0 && !(p >= 0 && p <= 100) {
+		problems = append(problems, fmt.Sprintf("render.fallback.share_percent: ожидается 0 (без потолка) или (0..100], задано %v", p))
+	}
+	if !inRange(c.Render.Fallback.HealthGateStreak, 1, 100) {
+		problems = append(problems, rangeMsg("render.fallback.health_gate_streak", c.Render.Fallback.HealthGateStreak, 1, 100))
 	}
 
 	// content
