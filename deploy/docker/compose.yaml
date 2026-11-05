@@ -7,7 +7,9 @@
 #   testbed        coredns, testweb, mockserver — изолированный «мини-интернет»
 #   app            Go-сервисы проекта + chromium
 #   monitoring     prometheus
-#   runtime        render — боевой render-контейнер (Dockerfile.render)
+#   runtime        render — боевой render-контейнер (Dockerfile.render);
+#                  render-fallback — воркер B: тот же образ, стрим
+#                  q:render-fallback и потолок темпа (T-240, ТЗ §4.5)
 #   render-engines lightpanda, moli — альтернативные движки рендера (T-241)
 #   tools          adminer, redis-insight, tools (запускаются по требованию)
 #
@@ -23,7 +25,7 @@
 #                   scheduler 172.28.100.22, dns-worker 172.28.100.23, http-worker 172.28.100.24,
 #                   render-worker 172.28.100.25, analyzer 172.28.100.26, web 172.28.100.27,
 #                   dashboard 172.28.100.28 — адрес .2k = порт метрик 910k; .29 — резерв
-#   runtime:        render 172.28.100.15
+#   runtime:        render 172.28.100.15, render-fallback 172.28.100.18 (T-240)
 #   render-engines: lightpanda 172.28.100.16, moli 172.28.100.17 (T-241)
 #   monitoring:     prometheus 172.28.100.30
 #   tools:          adminer 172.28.100.31, redis-insight 172.28.100.32 (далее свободно)
@@ -676,6 +678,63 @@ services:
       crawler_net:
         ipv4_address: 172.28.100.15
     mem_limit: ${MEM_RENDER:-2048m}
+    shm_size: "1gb"
+    init: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles: ["runtime"]
+
+  # Воркер B — фолбэк-рендер на Chromium (ТЗР этапа 35 §4.5, T-240):
+  # тот же бинарь/образ, что render, другой сборкой — стрим потребления
+  # q:render-fallback (RENDER_WORKER_STREAM, группа — каноническая пара
+  # render-fallback-worker) и потолок темпа render.fallback.worker_rate
+  # (ФТ-13: записей за скользящее окно 1 мин — renderworker.RateWindow).
+  # Движок chromium, собственный headless-shell в контейнере (без
+  # изменений, Dockerfile.render): перезапуски по страницам/RSS — изнутри
+  # воркера (T-065), как у render; recycle-пара T-208 к docker-рендерам
+  # не относится (она про нативный юнит crawler-chromium.service,
+  # docs/deploy.md §2.3). Ресурсы — те же строки бюджета Chromium ≈2 ГБ
+  # (ТЗ 3.2): движок тот же, темп ниже (MEM_RENDER_FALLBACK отдельной
+  # переменной — калибровка стендом §5.1 ТЗР). Поднимается по готовности
+  # канарейки (ТЗ §4.5 п.3): до включения фолбэка работает по пустой
+  # очереди — проверка проводки.
+  render-fallback:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.render
+      target: render
+      args:
+        GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (см. .env.example)}
+        CHROMEDP_HEADLESS_IMAGE: ${CHROMEDP_HEADLESS_IMAGE:-chromedp/headless-shell:156.0.8078.17}
+    image: crawler/render:local
+    user: "${DEV_UID:-1000}:${DEV_GID:-1000}"
+    environment:
+      APP_PG_DSN: postgres://${APP_DB_USER:-crawler}:${APP_DB_PASSWORD:-dev-only-crawler}@172.28.100.2:5432/${POSTGRES_DB:-crawler}?sslmode=disable
+      CRAWLER_REDIS_ADDR: 172.28.100.3:6379
+      CRAWLER_CONFIG: /etc/crawler/config.render-fallback.yaml
+      # Сборка воркера B (T-240, ФТ-12): стрим потребления — параметр
+      # запуска (не конфигурации, ТЗ §4.1 п.3); группа выводится канонической
+      # парой стрима (queue.WorkingGroups): render-fallback-worker.
+      RENDER_WORKER_STREAM: q:render-fallback
+      CRAWLER_HTTP_USER_AGENT: "${CRAWLER_USER_AGENT:-DomainCrawler/dev (+dev-environment; contact: dev@example.invalid)}"
+    volumes:
+      - ./deploy/docker/config.render-fallback.yaml:/etc/crawler/config.render-fallback.yaml:ro
+      - ./var/content:/data/content
+    dns:
+      - 172.28.100.10
+    dns_opt:
+      - "ndots:1"
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.18
+    mem_limit: ${MEM_RENDER_FALLBACK:-2048m}
     shm_size: "1gb"
     init: true
     cap_drop: ["ALL"]

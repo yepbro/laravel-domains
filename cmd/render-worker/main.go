@@ -18,8 +18,12 @@
 // (WatermarkPublisher, T-026). При включённом render.fallback.enabled
 // (T-238) движко-зависимые финализации (тарпит T-148, класс задачи
 // T-172) публикуются в q:render-fallback вместо маркера — доработка
-// chromium-воркером B (ТЗР этапа 35 §4.4). Перезапуск браузера —
-// менеджер T-065;
+// chromium-воркером B (ТЗР этапа 35 §4.4). Воркер B — этот же бинарь
+// другой сборкой (T-240, ФТ-12/§4.5): RENDER_WORKER_STREAM=q:render-
+// fallback переключает стрим потребления и группу (render-fallback-
+// worker), темп — render.fallback.worker_rate за скользящее окно
+// renderworker.RateWindow (ФТ-13); развёртывание — docs/deploy.md §2.3.
+// Перезапуск браузера — менеджер T-065;
 // при недоступном Chromium цикл лишь приостанавливает потребление
 // (зонд Manager.Alive — реконнект и перезапуск делает сам зонд).
 // Каркас — internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz
@@ -29,6 +33,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -198,11 +203,21 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// Стрим потребления воркера (T-236, ТЗ §4.1 п.3/ФТ-12): дефолт —
 	// q:render; воркер фолбэка (ТЗ §4.5) — тот же бинарь другой сборкой:
 	// стрим q:render-fallback (константа queue.StreamRenderFallback —
-	// задача T-237) и отдельная группа потребителей. Единая точка ниже
-	// кормит и Options воркера (чтение Run и клейм RecoverLoop), и
-	// коллектор глубины — глубина меряется по потребляемому стриму,
-	// расходиться им незачем.
-	stream := renderworker.DefaultStream
+	// задача T-237). Переключатель сборки — переменная окружения
+	// RENDER_WORKER_STREAM (как METRICS_ADDR — параметр запуска, а не
+	// поля конфигурации: стрим потребления — параметр сборки, ТЗ §4.1
+	// п.3; профиль воркера B — deploy/docker/config.render-fallback.yaml,
+	// docs/deploy.md §2.3). Допустимы только стримы рендер-воркера
+	// (q:render/q:render-fallback): чужой стрим гонял бы рендер чужой
+	// группой потребителей. Группа — каноническая пара стрима
+	// (queue.WorkingGroups, инвариант «одна consumer group на рабочий
+	// стрим», T-155): основная сборка — DefaultGroup, воркер B —
+	// render-fallback-worker.
+	stream := service.EnvOr("RENDER_WORKER_STREAM", renderworker.DefaultStream)
+	if stream != renderworker.DefaultStream && stream != queue.StreamRenderFallback {
+		return fmt.Errorf("render-worker: стрим потребления %q недопустим: стримы рендер-воркера — q:render (основная сборка) и q:render-fallback (воркер B, ФТ-12/T-237)", stream)
+	}
+	group := queue.WorkingGroups()[stream]
 
 	// Длина потребляемого стрима (stream) → crawler_queue_depth (T-077):
 	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
@@ -215,11 +230,25 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	// Опции воркера — одни на сборку (стиль http-worker): Worker хранит
 	// их для ProcessResult, цикл Run берёт те же Group/Consume/Alive.
+	// Темп потребления (T-240, ФТ-13): потолок включается на стриме
+	// фолбэка — сборке воркера B: render.fallback.worker_rate (T-233)
+	// записей за скользящее окно renderworker.RateWindow, батч-режим
+	// «собрать и доработать» без наращивания chromium-мощности. Основная
+	// сборка (q:render) читает без потолка; воркер B держит темп и при
+	// выключенном render.fallback.enabled — дорабатывает накопленное в
+	// q:render-fallback до пуста (ФТ-14).
+	rate := 0
+	if stream == queue.StreamRenderFallback {
+		rate = cfg.Render.Fallback.WorkerRate
+	}
 	opts := renderworker.Options{
 		// Стрим потребления (T-236, ФТ-12): чтение цикла Run и клейм
 		// RecoverLoop — одно значение с коллектором глубины выше;
 		// дефолт q:render, сборка воркера фолбэка переопределяет.
-		Stream:  stream,
+		Stream: stream,
+		// Группа — каноническая пара стрима (queue.WorkingGroups):
+		// render-worker (основная сборка) / render-fallback-worker (B).
+		Group:   group,
 		Recover: rel, // возврат зависших задач (T-025)
 		// Темп возврата зависших (T-153): пачка/интервал клейма —
 		// redis.recover_*; инвариант с claim_min_idle (рендер — самый
@@ -270,6 +299,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 				Ceiling: cfg.Render.Fallback.SharePercent,
 			},
 		},
+		// Потолок темпа потребления (T-240, ФТ-13; комментарий у rate
+		// выше): воркер B — render.fallback.worker_rate за окно
+		// renderworker.RateWindow, основная сборка — 0 (без потолка).
+		Rate: rate,
 	}
 	w, err := renderworker.New(pool, q, store, manager, opts)
 	if err != nil {

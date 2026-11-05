@@ -386,6 +386,18 @@ type Options struct {
 	Concurrency int
 	// Consume — записей q:render за одно чтение; 0 — DefaultConsume.
 	Consume int
+	// Rate — потолок темпа потребления: не больше Rate записей за
+	// скользящее окно renderRateWindow (T-240, ФТ-13 — батч-режим
+	// «собрать и доработать» без наращивания chromium-мощности; окно —
+	// RateWindow = 1 мин). Параметр темпа общий, без привязки к движку
+	// и стриму (ФТ-4: ветвлений по движку нет) — применяется всегда,
+	// когда задан; ограничивается потребление (XREADGROUP), клейм
+	// RecoverLoop потолком не трогается (темп возврата зависших —
+	// redis.recover_*, T-153). Боевая проводка ставит потолок на сборке
+	// воркера B (render.fallback.worker_rate, стрим q:render-fallback,
+	// cmd/render-worker); пустое чтение потолок не расходует. ≤ 0 — без
+	// потолка (дефолт: основная сборка q:render читает как раньше).
+	Rate int
 	// Stream — стрим потребления воркера: чтение цикла Run и клейм
 	// RecoverLoop (ФТ-12: воркер фолбэка — тот же бинарь со стримом
 	// q:render-fallback и отдельной группой); "" — DefaultStream (q:render,
@@ -522,6 +534,13 @@ func (o Options) withDefaults() Options {
 	}
 	if o.MaxAttempts <= 0 {
 		o.MaxAttempts = queue.DefaultMaxAttempts
+	}
+	// Rate отрицательным быть не может по смыслу (потолок потребления);
+	// withDefaults не подставляет дефолт: 0 — честное «без потолка»,
+	// дефолт ограничил бы основную сборку q:render (Rate — параметр
+	// сборки, а не этапа).
+	if o.Rate < 0 {
+		o.Rate = 0
 	}
 	return o
 }
@@ -1447,9 +1466,14 @@ func renderFailBackoff(streak int) time.Duration {
 // (ТЗ 4.2); Consume доставок подряд без единого подтверждения —
 // систематический сбой обработки — выдерживает паузу-предохранитель
 // (renderFailWaitBase): черпать новые задачи при лежащей обработке
-// бессмысленно, попытки доставок сгорают. Инфраструктурный сбой
-// публикации (InfraError: OOM Redis/соединение, T-152) останавливает
-// чтение сразу и до восстановления записи (Reliab.Writable).
+// бессмысленно, попытки доставок сгорают. Потолок темпа Options.Rate
+// (T-240, ФТ-13) — перед каждым чтением: пачка урезается до свободных
+// слотов скользящего окна (RateWindow), исчерпанное окно держит паузу до
+// выхода старейшей записи; пустое чтение потолок не расходует (очередь
+// пуста — воркер простаивает в блоке XREADGROUP с полным бюджетом).
+// Инфраструктурный сбой публикации (InfraError: OOM Redis/соединение,
+// T-152) останавливает чтение сразу и до восстановления записи
+// (Reliab.Writable).
 func Run(ctx context.Context, w *Worker, opts Options) error {
 	if w == nil {
 		return errors.New("renderworker: цикл воркера: воркер не задан")
@@ -1514,6 +1538,17 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 	// (ревью T-142; числа пересчитаны под дефолт 8, T-169).
 	pending := make(chan queue.Delivery, o.Consume)
 	var failed atomic.Int64 // доставок подряд без подтверждения
+	// rateLim — скользящее окно темпа потребления (T-240, ФТ-13):
+	// Options.Rate > 0 — чтение ограничивается потолком записей за окно
+	// (батч-режим воркера B «собрать и доработать», render.fallback.
+	// worker_rate); nil — потолка нет, чтение как раньше. Ведёт только
+	// читатель ниже — без блокировок (локальные счётчики читателя).
+	var rateLim *rateWindow
+	if o.Rate > 0 {
+		rateLim = newRateWindow(o.Rate, renderRateWindow)
+		log.Info("потолок темпа потребления",
+			"stream", o.Stream, "rate", o.Rate, "window", renderRateWindow.String())
+	}
 	// infraDown — устойчивая инфраструктурная ошибка публикации
 	// (OOM/соединение Redis, T-152): чтение q:render приостанавливается
 	// до восстановления записи (Reliab.Writable) — публикации всё равно
@@ -1590,7 +1625,30 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 					return // graceful shutdown: wait вышел по отмене
 				}
 			}
-			deliveries, err := w.q.Consume(ctx, o.Stream, o.Group, o.Consumer, o.Consume)
+			// Темп потребления (T-240, ФТ-13): перед чтением пачка
+			// урезается до свободных слотов окна (не брать за раз больше
+			// потолка); исчерпанное окно — пауза до выхода старейшей
+			// записи. Debug, не Warn: потолок — штатный режим сборки B
+			// (какие записи ждать — видно глубиной очереди), а не сбой;
+			// частота — раз-два за окно.
+			batch := o.Consume
+			if rateLim != nil {
+				now := time.Now()
+				if allow := rateLim.allowance(now); allow <= 0 {
+					pause := rateLim.retry(now)
+					log.Debug("потолок темпа потребления исчерпан — чтение ждёт окно",
+						"stream", o.Stream, "rate", o.Rate,
+						"window", renderRateWindow.String(), "wait", pause.String())
+					wait(pause)
+					if ctx.Err() != nil {
+						return // graceful shutdown: wait вышел по отмене
+					}
+					continue
+				} else if allow < batch {
+					batch = allow
+				}
+			}
+			deliveries, err := w.q.Consume(ctx, o.Stream, o.Group, o.Consumer, batch)
 			if err != nil {
 				if ctx.Err() != nil {
 					return // graceful shutdown
@@ -1598,6 +1656,12 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				log.Warn("цикл render-worker: чтение стрима потребления", "stream", o.Stream, "err", err)
 				wait(DefaultErrorWait)
 				continue
+			}
+			// Прочитанные записи входят в окно темпа (T-240): пустое
+			// чтение — no-op, простой бюджета не расходует
+			// (rateWindow.record).
+			if rateLim != nil {
+				rateLim.record(time.Now(), len(deliveries))
 			}
 			for _, d := range deliveries {
 				select {

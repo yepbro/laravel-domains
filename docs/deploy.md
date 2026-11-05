@@ -41,7 +41,7 @@ cgroup, systemd перезапускает юнит, остальные серв
 | `postgresql@.service` + drop-in | **3072M** (бюджет ≈ 2,5 ГБ + запас на пики обслуживания) | PostgreSQL ≈ 2,5 ГБ |
 | `redis-server.service` + drop-in | **640M** (maxmemory 512mb + ~128 МБ служебных, docs/redis.md §7) | Redis ≤ 0,5 ГБ |
 | `unbound.service` + drop-in | **800M** (бюджет ≈ 0,7 ГБ + рост кэша на ≈47 млн имён: 733.9 MiB у старого потолка 700M, §12; +100M из MemAvailable 2.6 GiB) | Unbound ≈ 0,7 ГБ |
-| `crawler-*.service` (9 юнитов) | **2436M суммарно** (второй экземпляр render-worker@ добавляет свой 256M — §2.2) | Go-сервисы ≈ 1,3 ГБ (7 конвейерных) + web этапа 13 + dashboard этапа 15 |
+| `crawler-*.service` (9 юнитов) | **2436M суммарно** (второй экземпляр render-worker@ добавляет свой 256M — §2.2; воркер B фолбэка — ещё +256M, §2.3) | Go-сервисы ≈ 1,3 ГБ (7 конвейерных) + web этапа 13 + dashboard этапа 15 |
 | `crawler-chromium.service` | **2048M** | Chromium ≈ 2 ГБ (шаблон второго инстанса chromium2 — ещё +2048M при включении, §2.2/T-209) |
 
 Итого потолки 8996M при 8192M RAM — суммарно выше объёма памяти, и это
@@ -267,8 +267,9 @@ configuration.md, `render`): второй воркер оправдан, ког�
 через БД — как http-worker с render-worker, ТЗ 5.7).
 
 - **Метрики**: имя экземпляра = порт: `crawler-render-worker@9109` →
-  `METRICS_ADDR=127.0.0.1:9109` (9101–9108 заняты комплектом, следующие
-  свободны с 9109). `METRICS_ADDR` нельзя задавать в общем
+  `METRICS_ADDR=127.0.0.1:9109` (9101–9108 заняты комплектом; свободны
+  9109 и 9111+ — 9110 занимает постоянный юнит воркера B фолбэка, §2.3).
+  `METRICS_ADDR` нельзя задавать в общем
   `/etc/crawler/crawler.env` — EnvironmentFile переопределяет
   `Environment` юнита и столкнёт порты всех экземпляров;
 - **память**: свой потолок 256M на экземпляр (cgroup отдельная от
@@ -415,13 +416,75 @@ chromium; `WantedBy=crawler.target` возвращает таймер при с�
 job'ов снимется следующим тиком). После ручного рестарта набора полезен
 контроль `systemctl --failed`.
 
+### 2.3. Воркер B фолбэка рендера (T-240)
+
+[`crawler-render-fallback-worker.service`](../deploy/systemd/crawler-render-fallback-worker.service)
+— доработка на Chromium задач, не прошедших рендер на основном движке
+(ТЗР этапа 35 §4.5, очередь `q:render-fallback`): тот же бинарник, что
+`crawler-render-worker.service`, другой сборкой. Отличия сборки:
+
+- **стрим потребления** — `RENDER_WORKER_STREAM=q:render-fallback` в
+  юните (параметр запуска, как `METRICS_ADDR`; стрим потребления —
+  параметр сборки воркера, не поля конфигурации, ТЗР §4.1 п.3). Группа
+  выводится канонической парой стрима (`queue.WorkingGroups`):
+  `render-fallback-worker`, отдельная от основной `render-worker` —
+  доставки фолбэка не делятся с основным конвейером;
+- **темп** (ФТ-13) — `render.fallback.worker_rate` записей за
+  скользящее окно 1 мин (`renderworker.RateWindow`) из общего
+  `/etc/crawler/config.yaml`: батч-режим «собрать и доработать» без
+  наращивания chromium-мощности. Действует и при выключенном
+  `render.fallback.enabled` — накопленное в очереди дорабатывается до
+  пуста (ФТ-14). Сам воркер B фолбэк не публикует — рекурсия запрещена
+  (ФТ-10);
+- **метрики** — `127.0.0.1:9110`: 9101–9108 заняты комплектом; 9110 —
+  фиксированный порт воркера B, диапазон экземпляров `render-worker@`
+  (§2.2) разведён с ним: 9109 и 9111+.
+
+Chromium — общий с основным воркером (`render.remote_url` из
+`crawler.env` → `ws://127.0.0.1:9222`, юнит `crawler-chromium.service`):
+CDP-браузер держит нескольких консьюмеров, бюджет памяти юнита один на
+всех (§2.2). **Ресайкл-пара T-208 применима как есть, новых файлов не
+требуется**: `ExecStart` ресайкл-сервиса перезапускает именно
+`crawler-chromium.service` — общий браузер обоих воркеров; собственной
+пары воркеру B не нужно. Локальный headless-shell (без внешнего юнита) —
+режим docker-runtime: сервис `render-fallback` профиля `runtime`
+(`deploy/docker/compose.yaml`, образ — сегодняшний `Dockerfile.render`
+без изменений, конфигурация —
+[`deploy/docker/config.render-fallback.yaml`](../deploy/docker/config.render-fallback.yaml)),
+перезапуски браузера там делает сам воркер (T-065), как у `render`.
+
+Юнит копируется маской `crawler*.service` (§4.6), но **не входит в
+enable-список комплекта**: включение — осознанный шаг ввода фолбэка
+(строка бюджета §2 +256M; +5 соединений пула БД — пересчитать бюджет
+`postgres.pool_size`, §4.5). До готовности канарейки (ТЗР §4.5 п.3)
+воркер B может работать по пустой очереди — проверка проводки; при
+выключенном `render.fallback.enabled` публикаций нет вовсе (шаг 2
+приёмки ТЗР §6.2 — очередь пуста на основном chromium).
+
+```bash
+# На уже развёрнутом хосте — сначала пользователь (§4.4 создаёт его на
+# свежих установках; воркер B — отдельный, не экземпляр шаблона):
+useradd -r -g crawler -d /var/lib/crawler -s /usr/sbin/nologin crawler-render-fallback-worker
+systemctl enable --now crawler-render-fallback-worker.service
+curl -fsS 127.0.0.1:9110/livez               # живость воркера B
+journalctl -t crawler-render-fallback-worker -f
+# темп действует: чтения пачками ≤ render.fallback.worker_rate за минуту
+```
+
+Откат (ФТ-14): `systemctl disable --now
+crawler-render-fallback-worker.service` останавливает потребление
+(доставки остаются в стриме, не в PEL) либо, наоборот, воркер оставляется
+до пуста очереди при выключенном флаге публикации в конфиге основного
+воркера. Отдельных миграций/очисток нет (ТЗР §4.8).
+
 ## 3. Пользователи: статические, по одному на сервис
 
 ТЗ §10.1 требует отдельных пользователей на сервис. Решение — **статические
 системные пользователи** `crawler-<сервис>` (без shell, home
 `/var/lib/crawler`) в общей группе `crawler`, а не `DynamicUser=yes`:
 
-- хранилище контента пишут **два** юнита (http-worker, render-worker) и
+- хранилище контента пишут **три** юнита (http-worker, render-worker,
+  render-fallback-worker — §2.3) и
   читают analyzer и `crawlerctl`: нужна стабильная принадлежность файлов
   группе — setgid-каталог + фиксированные UID/GID; DynamicUser ротировал бы
   владельца и требовал бы перекладки прав на каждый старт;
@@ -583,7 +646,7 @@ fc-list | grep -q . && echo "fonts ok" || echo "FONTS MISSING"
 
 ```bash
 groupadd -r crawler
-for s in ingest scheduler dns-worker http-worker render-worker analyzer monitor web dashboard chromium; do
+for s in ingest scheduler dns-worker http-worker render-worker render-fallback-worker analyzer monitor web dashboard chromium; do
     useradd -r -g crawler -d /var/lib/crawler -s /usr/sbin/nologin "crawler-$s"
 done
 install -d -o root -g crawler -m 0755 /var/lib/crawler
@@ -616,7 +679,12 @@ cp -r rules /etc/crawler/rules                    # правила Laravel дл�
   резервирует `superuser_reserved_connections`). Менять — только
   с пересчётом суммы; сразу всем сервисам —
   `CRAWLER_POSTGRES_POOL_SIZE` в `crawler.env`
-  (docs/db.md, «Бюджет соединений»). Внимание: EnvironmentFile
+  (docs/db.md, «Бюджет соединений»). Воркер B фолбэка (§2.3) — десятый
+  сервис со своим пулом: при его включении сумма растёт ещё на
+  `pool_size` (10 × 5 + 2 + админ ≈ 52 против 47 доступных слотов) —
+  пересчитывайте бюджет: глобально `CRAWLER_POSTGRES_POOL_SIZE=4`
+  (10 × 4 + 2 + админ ≈ 44) либо меньший пул одному воркеру B
+  переопределением в его юните. Внимание: EnvironmentFile
   (crawler.env) переопределяет Environment юнита — включение глобальной
   переменной затронет и пул дашборда (9 × 5 + 2 + админ ≈ 48 упрётся
   в потолок доступных слотов); безопасный глобальный максимум — 4

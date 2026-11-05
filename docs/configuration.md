@@ -663,7 +663,7 @@ Go: без потолка). Замер критерия T-163 сэмплером
 | `queue_high_watermark` | `CRAWLER_RENDER_QUEUE_HIGH_WATERMARK` | целое | `10000` (0 — общий `scheduler.queue_high_watermark`) |
 | `requeue_deprioritized_zones` | `CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES` | список имён зон | `[]` (замена целиком; имена — punycode нижним регистром, как в справочнике zones) |
 | `fallback.enabled` | `CRAWLER_RENDER_FALLBACK_ENABLED` | bool | `false` (включение очереди фолбэка — ниже) |
-| `fallback.worker_rate` | `CRAWLER_RENDER_FALLBACK_WORKER_RATE` | целое | `100` (записей за окно; диапазон 1..1000000) |
+| `fallback.worker_rate` | `CRAWLER_RENDER_FALLBACK_WORKER_RATE` | целое | `100` (записей за окно 1 мин; диапазон 1..1000000) |
 | `fallback.share_percent` | `CRAWLER_RENDER_FALLBACK_SHARE_PERCENT` | число | `30` (% за окно из 1000 доставок этапа; диапазон (0..100], `0` — без потолка) |
 | `fallback.health_gate_streak` | `CRAWLER_RENDER_FALLBACK_HEALTH_GATE_STREAK` | целое | `3` (диапазон 1..100) |
 
@@ -896,11 +896,14 @@ false` (умолчание) — первичный воркер финализи
 `crawler_render_fallback_suspended_total{reason=gate|budget}`.
 Потолки:
 
-- `worker_rate` — темп воркера B, записей за окно потребления воркера:
-  батч-режим «собрать и доработать» без наращивания chromium-мощности.
-  Дефолт 100 ≈ полной мощности одного chromium (8 контекстов × ~5
-  с/страница ≈ 1,6 стр/с) — стартовое значение, калибруется стендовым
-  прогоном этапа 35;
+- `worker_rate` — темп воркера B, записей за скользящее окно потребления
+  1 мин (`renderworker.RateWindow`, T-240): батч-режим «собрать и
+  доработать» без наращивания chromium-мощности. Дефолт 100 ≈ полной
+  мощности одного chromium (8 контекстов × ~5 с/страница ≈ 1,6 стр/с) —
+  стартовое значение, калибруется стендовым прогоном этапа 35. Потолок
+  ограничивает потребление (XREADGROUP; клейм — `redis.recover_*`, темп
+  возврата отдельная ручка) и действует у воркера B и при выключенном
+  фолбэке — накопленное дорабатывается до пуста (ФТ-14);
 - `share_percent` — бюджет доли фолбэка: доля публикаций в фолбэк за
   окно (1000 подтверждённых доставок этапа, T-239) сверх потолка
   приостанавливает фолбэк до конца следующего окна — задачи

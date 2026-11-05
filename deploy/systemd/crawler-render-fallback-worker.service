@@ -1,0 +1,97 @@
+# Domain Crawler — render-fallback-worker (воркер B): доработка на
+# Chromium задач, не прошедших рендер на основном движке (ТЗР этапа 35
+# §4.5, T-240; очередь q:render-fallback — T-237). Тот же бинарник, что
+# crawler-render-worker.service: сборка отличается стримом потребления —
+# RENDER_WORKER_STREAM=q:render-fallback (параметр запуска, как
+# METRICS_ADDR; стрим потребления — параметр сборки воркера, не поля
+# конфигурации, ТЗ §4.1 п.3). Группа — каноническая пара стрима
+# (queue.WorkingGroups): render-fallback-worker, отдельная от основной
+# render-worker — доставки q:render-fallback не делятся с основным
+# конвейером.
+#
+# Темп (ФТ-13): render.fallback.worker_rate записей за скользящее окно
+# 1 мин (renderworker.RateWindow) из общего /etc/crawler/config.yaml —
+# батч-режим «собрать и доработать» без наращивания chromium-мощности;
+# действует и при выключенном фолбэке (накопленное дорабатывается до
+# пуста, ФТ-14). Воркер B фолбэк не публикует (рекурсия запрещена,
+# ФТ-10 — publishFallback отсекает по стриму потребления).
+#
+# Chromium: общий с основным воркером — render.remote_url из crawler.env
+# (ws://127.0.0.1:9222, юнит crawler-chromium.service; перезапуск изнутри
+# воркера в remote-режиме невозможен — потолок держит MemoryMax юнита
+# chromium). Ресайкл-пара T-208 (crawler-chromium-recycle.timer)
+# применима КАК ЕСТЬ, новых файлов не нужно: ExecStart ресайкл-сервиса
+# перезапускает именно crawler-chromium.service — общий браузер обоих
+# воркеров; собственная пара воркеру B не требуется (локального
+# headless-shell в нативном деплое нет — это режим docker-runtime,
+# сервис render-fallback профиля runtime в deploy/docker/compose.yaml,
+# где перезапуски делает сам воркер, T-065).
+#
+# Порт метрик 9110: 9101–9108 заняты комплектом; диапазон экземпляров
+# render-worker@ (§2.2) разведён с этим портом — 9109 и 9111+ (стало
+# быть, crawler-render-worker@9110 не запускать: коллизия bind).
+# Не входит в enable-список комплекта (§4.6): включение — осознанный шаг
+# ввода фолбэка (строка бюджета §2 +256M, +5 соединений пула БД — §4.5);
+# до готовности канарейки может работать по пустой очереди — проверка
+# проводки (ТЗ §4.5 п.3).
+
+[Unit]
+Description=Domain Crawler — render-fallback-worker (воркер B: доработка фолбэка на Chromium)
+PartOf=crawler.target
+# Комментарий о After/Wants без Requires — crawler-ingest.service.
+After=network-online.target crawler-chromium.service postgresql.service redis-server.service unbound.service
+Wants=network-online.target crawler-chromium.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Отдельный пользователь по правилу «один на сервис» (ТЗ §10.1, §3):
+# воркер B — другой логический сервис (свой стрим/группа), а не
+# экземпляр шаблона render-worker@ (те делят пользователя основного
+# воркера — масштабирование одного сервиса).
+User=crawler-render-fallback-worker
+Group=crawler
+EnvironmentFile=/etc/crawler/crawler.env
+Environment=METRICS_ADDR=127.0.0.1:9110
+# Сборка воркера B (ФТ-12): стрим потребления q:render-fallback; группа
+# выводится канонической парой стрима (render-fallback-worker).
+Environment=RENDER_WORKER_STREAM=q:render-fallback
+WorkingDirectory=/var/lib/crawler
+SyslogIdentifier=crawler-render-fallback-worker
+ExecStart=/opt/crawler/bin/render-worker
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+MemoryMax=256M
+# Как у основного render-worker (замер T-092 §6, T-169): DOM в полёте ≤
+# render.contexts × content.max_store_bytes + буферы pgx/очереди; темп
+# воркера B ниже, потолок оставлен с запасом — контроль после деплоя:
+# memory.events oom=0, NRestarts 0 (бюджет — docs/deploy.md §2/§2.3).
+# CPU-приоритет (T-158): этап конвейера с потолком темпа — вес 300, как
+# у основного воркера; тяжёлый CPU рендера живёт в chromium (отдельная
+# cgroup на дефолте 100).
+CPUWeight=300
+LimitNOFILE=65535
+UMask=0007
+# --- Изоляция (ТЗ §9/§10.1) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Заменяет HTML на DOM в общем с http-worker хранилище контента.
+ReadWritePaths=/var/lib/crawler/content
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target
