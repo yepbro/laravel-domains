@@ -255,11 +255,20 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// (T-233) — тарпиты T-148 и класс задачи T-172 на последней
 		// доставке публикуются в q:render-fallback вместо маркера
 		// render_failed_at; false (дефолт) — финализации как сегодня.
-		// Гейт/бюджет решения — T-239, темп воркера B — T-240; воркер B
-		// (стрим q:render-fallback) фолбэк не публикует — рекурсия
-		// запрещена (ФТ-10), проверяется в publishFallback по Stream.
+		// Гейт/бюджет решения (T-239, ФТ-9): порог стрика инфра-ошибок
+		// класса браузера и потолок доли публикаций за окно — из
+		// render.fallback (T-233); состояния (стрик, окно) ведёт воркер.
+		// Темп воркера B — T-240; воркер B (стрим q:render-fallback)
+		// фолбэк не публикует — рекурсия запрещена (ФТ-10), проверяется
+		// в publishFallback по Stream.
 		Fallback: renderworker.FallbackOptions{
 			Enabled: cfg.Render.Fallback.Enabled,
+			Gate: renderworker.FallbackGate{
+				Threshold: cfg.Render.Fallback.HealthGateStreak,
+			},
+			Budget: renderworker.FallbackBudget{
+				Ceiling: cfg.Render.Fallback.SharePercent,
+			},
 		},
 	}
 	w, err := renderworker.New(pool, q, store, manager, opts)

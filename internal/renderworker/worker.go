@@ -105,9 +105,13 @@
 // движко-независимые свойства хоста, фолбэка не получают при любом
 // флаге (ФТ-7: Chromium их не исправит). Идемпотентность публикации —
 // фильтр дубля по идентификатору записи результата (ключ строки +
-// content_hash эпизода, ТЗ §4.4 п.5); решение о публикации — чистая
+// checked_at эпизода, ТЗ §4.4 п.5); решение о публикации — чистая
 // функция fallbackPublishDecision (кандидат × гейт × бюджет, ФТ-9):
-// заглушка T-238 — always-publish, health-гейт и бюджет доли — T-239.
+// гейт по стрику инфра-ошибок ClassBrowser (render.fallback
+// .health_gate_streak — приостановка публикаций до восстановления
+// движка, T-239) и бюджет доли публикаций за окно (render.fallback
+// .share_percent — приостановка до границы окна, T-239); отказ
+// решения — финализация по-сегодняшнему (маркер), без потерь задач.
 //
 // Все четыре финализации штампуют маркер «рендер невозможен»
 // subdomain_results.render_failed_at (T-210, миграция 000017) — кроме
@@ -483,15 +487,17 @@ type FallbackOptions struct {
 	// (ФТ-9а: стрик инфра-ошибок класса браузера — «основной движок
 	// недоступен» — приостанавливает фолбэк-публикацию до восстановления
 	// движка, перелив всего потока на дорогой chromium исключён).
-	// T-238 — заглушка always-publish значение не читает; живое
-	// состояние стрика и его проводка — T-239 (параллельная точка
-	// расширения той же функции).
+	// Порог — Threshold (render.fallback.health_gate_streak, T-233);
+	// стрик живого потока ведёт воркер (fbObserveOutcome), решение читает
+	// срез (T-239).
 	Gate FallbackGate
-	// Budget — вход скользящего бюджета доли функции-решения
+	// Budget — вход бюджета доли функции-решения
 	// (ФТ-9б: доля публикаций в фолбэк за окно сверх потолка
 	// share_percent приостанавливает фолбэк до конца окна — задачи
-	// финализируются штатно с маркером). T-238 — заглушка
-	// always-publish значение не читает; окно и учёт — T-239.
+	// финализируются штатно с маркером). Потолок — Ceiling
+	// (render.fallback.share_percent, T-233); окно и учёт доли ведёт
+	// воркер (fbObserveTask/fbRecordPublish), решение читает срез
+	// (T-239).
 	Budget FallbackBudget
 }
 
@@ -530,9 +536,9 @@ func (o Options) log() *slog.Logger {
 // Worker — рендер-воркер: обрабатывает задачи стрима потребления
 // Options.Stream (дефолт q:render; ключи строк subdomain_results) через
 // швы рендера и хранилища. Потокобезопасен: неизменно после New всё,
-// кроме fbDedup — фильтра дубля фолбэк-публикаций (T-238) под
-// собственным мьютексом (доставки идут параллельно; приборы метрик —
-// синхронизированные).
+// кроме fbDedup — фильтра дубля фолбэк-публикаций (T-238) — и состояний
+// гейта/бюджета фолбэка fbGate/fbBudget (T-239) под общим мьютексом
+// fbMu (доставки идут параллельно; приборы метрик — синхронизированные).
 type Worker struct {
 	db       RenderDB
 	q        queue.Queue
@@ -541,6 +547,9 @@ type Worker struct {
 	opt      Options
 	met      *Metrics       // приборы этапа (T-077); nil — no-op
 	fbDedup  *fallbackDedup // фильтр дубля фолбэк-публикаций (T-238); строится в New
+	fbMu     sync.Mutex     // состояния гейта/бюджета фолбэка (T-239): стрик и окно под ним
+	fbGate   FallbackGate   // health-гейт (T-239): копия Options.Fallback.Gate с живым стриком
+	fbBudget FallbackBudget // бюджет доли (T-239): копия Options.Fallback.Budget со счётчиками окна
 }
 
 // New строит воркер поверх пула БД, очереди (публикация q:analyze — под
@@ -561,7 +570,8 @@ func New(db RenderDB, q queue.Queue, contents ContentStore, renderer Renderer, o
 		return nil, errors.New("renderworker: пул рендера не задан")
 	}
 	return &Worker{db: db, q: q, contents: contents, renderer: renderer,
-		opt: opts.withDefaults(), met: NewMetrics(opts.Metrics, opts.Engine), fbDedup: newFallbackDedup()}, nil
+		opt: opts.withDefaults(), met: NewMetrics(opts.Metrics, opts.Engine), fbDedup: newFallbackDedup(),
+		fbGate: opts.Fallback.Gate, fbBudget: opts.Fallback.Budget}, nil
 }
 
 // renderTarget — прочитанная строка результата: цель рендера и старая
@@ -771,35 +781,122 @@ type fallbackCandidate struct {
 }
 
 // FallbackGate — состояние health-гейта фолбэка (ФТ-9а, ТЗ §4.4 п.3):
-// при стрике инфра-ошибок рендера класса браузера (основной движок
-// недоступен) фолбэк-публикация приостанавливается до восстановления —
-// задачи ждут в redelivery q:render, перелив всего потока на дорогой
-// chromium при падении лёгкого исключён. T-238 — тип-заглушка без
-// полей: решение always-publish его не читает; состояние стрика (образец
-// счётчика — renderFailBackoff) и его чтение — T-239.
-type FallbackGate struct{}
+// стрик инфра-ошибок рендера класса браузера (основной движок
+// недоступен) числом Threshold приостанавливает фолбэк-публикацию до
+// восстановления движка — перелив всего потока на дорогой chromium при
+// падении лёгкого исключён. Значение-срез читает функция-решение
+// (fallbackPublishDecision), живой стрик ведёт воркер
+// (fbObserveOutcome под fbMu — доставки параллельны; образец
+// стрик-логики renderFailBackoff: нарастание сбоем, обнуление
+// успехом). Threshold 0 — гейта нет (нулевые сборки без конфигурации:
+// поведение заглушки always-publish T-238); боевую сборку наполняет
+// cmd/render-worker из render.fallback.health_gate_streak (T-233,
+// диапазон проверяет config.Validate).
+type FallbackGate struct {
+	// Threshold — порог стрика инфра-ошибок ClassBrowser
+	// (render.fallback.health_gate_streak, T-233).
+	Threshold int
+	// streak — инфра-ошибки ClassBrowser с последнего успешного
+	// рендера (ProcessResult обработал запись целиком — DOM записан и
+	// q:analyze опубликован, T-225); успех обнуляет (движок подал
+	// признак жизни — образец renderFailBackoff: обнуление успехом,
+	// нарастание сбоем), ошибки классов задачи/контекста и штатные
+	// отказы без рендера (строки нет / ушла из-под задачи) не трогают
+	// — рендера не было, признака жизни движка нет (ревью T-239, P1).
+	streak int
+}
 
-// FallbackBudget — состояние скользящего бюджета доли фолбэка (ФТ-9б,
-// ТЗ §4.4 п.4): доля публикаций за окно сверх потолка share_percent
-// выключает фолбэк до конца окна — задачи финализируются с маркером как
-// сегодня, поднимается алерт. T-238 — тип-заглушка без полей; окно,
-// учёт доли и порог — T-239.
-type FallbackBudget struct{}
+// suspended — гейт закрыт: стрик инфра-ошибок достиг порога, движок
+// считается нездоровым, фолбэк-публикация приостановлена до
+// восстановления (успешный рендер обнулит стрик).
+func (g FallbackGate) suspended() bool {
+	return g.Threshold > 0 && g.streak >= g.Threshold
+}
+
+// fallbackBudgetWindow — окно бюджета доли фолбэка (ФТ-9б, ТЗ §4.4
+// п.4): подтверждённых доставок этапа в одном окне. Окна следуют
+// подряд без наложения: заполненное окно закрывается оценкой доли
+// (публикации/доставки сверх потолка share_percent приостанавливают
+// публикации следующего окна — «до конца окна», ФТ-9б), счётчики
+// сбрасываются; окно с нулём публикаций (приостановленное) оценку не
+// проходит, и фолбэк возобновляется — приостановка самовозвратная,
+// без ручного вмешательства. Размер — код, не конфигурация:
+// настраивается потолок (share_percent, T-233), окно — мера потока
+// этапа; 1000 ≈ 12 мин потока (замер 24.10: ≈5,1 тыс. задач/ч) —
+// достаточная статистика доли (меньше — шум живого потока мотал бы
+// приостановку), терпимая задержка реакции штормового размыкателя
+// (быстрые случаи закрывает health-гейт стриком за секунды).
+const fallbackBudgetWindow = 1000
+
+// FallbackBudget — состояние бюджета доли фолбэка (ФТ-9б, ТЗ §4.4
+// п.4): доля публикаций за окно fallbackBudgetWindow сверх потолка
+// Ceiling приостанавливает фолбэк до конца следующего окна — задачи
+// финализируются с маркером как сегодня (ФТ-9б), поднимается событие
+// метрики (алерт — ТЗ §4.6 п.3). Значение-срез читает функция-решение,
+// счётчики окна ведёт воркер (fbObserveTask/fbRecordPublish под fbMu).
+// Ceiling 0 — без потолка (нулевые сборки, конфигурация «0 — без
+// потолка», T-233); боевую сборку наполняет cmd/render-worker из
+// render.fallback.share_percent.
+type FallbackBudget struct {
+	// Ceiling — потолок доли публикаций, % подтверждённых доставок
+	// окна (render.fallback.share_percent, T-233); 0 — без потолка.
+	Ceiling float64
+	// tasks — доставок в текущем окне, завершившихся обработкой без
+	// ошибки (знаменатель доли; поток этапа — те же единицы, что у
+	// crawler_stage_tasks_total: fallback-рейт = публикации/поток,
+	// ФТ-15; учёт — на выходе обработчика, до XACK уровнем очереди:
+	// сбой Ack или паника дают лишний +1, повторная доставка
+	// посчитается снова — допуск единиц, порядок доли не меняющий;
+	// допуск на границе окна ≤ Concurrency публикаций, ревью T-239).
+	tasks int
+	// published — публикаций в q:render-fallback в текущем окне
+	// (числитель доли; считаются состоявшиеся XADD — отказы решения
+	// и дубли доставок не тратят бюджет).
+	published int
+	// hold — окно приостановлено: предыдущее окно перерасходовало
+	// потолок, публикации выключены до границы этого окна (сброс
+	// счётчиков при закрытии возвращает фолбэк).
+	hold bool
+}
+
+// suspended — бюджет приостановлен: предыдущее окно ушло за потолок
+// доли, публикации текущего окна выключены («до конца окна», ФТ-9б).
+func (b FallbackBudget) suspended() bool {
+	return b.Ceiling > 0 && b.hold
+}
+
+// overCeiling — окно перерасходовало потолок: доля публикаций выше
+// Ceiling процентов (умножением, без деления — точность на границе).
+func (b FallbackBudget) overCeiling() bool {
+	return b.Ceiling > 0 && float64(b.published)*100 > float64(b.tasks)*b.Ceiling
+}
 
 // fallbackPublishDecision — чистая функция-решение о публикации
 // кандидата в q:render-fallback (ТЗ §4.4 п.3–4, ФТ-9): кандидат ×
-// health-гейт × бюджет доли. T-238 — заглушка always-publish: движко-
-// зависимые кандидаты публикуются всегда (гейт и бюджет в этой задаче
-// не реализуются); реализация решения — T-239: стрик инфра-ошибок
-// ClassBrowser гасит публикации до восстановления движка, превышение
-// доли за окно — до конца окна (сигнатура сохраняется, меняется тело и
-// наполняются FallbackGate/FallbackBudget). Чистая и бессостоятельна
-// нарочно: состояния гейта/бюджета ведёт воркер (образец — счётчик
-// failed цикла Run), функция только сводит их с кандидатом —
-// тестируется таблицей без окружения.
+// health-гейт × бюджет доли. Отказ любого входа приостанавливает
+// публикацию — вызывающий финализирует задачу по-сегодняшнему (маркер
+// render_failed_at + q:analyze, ТЗ §4.4 п.3–4), без потерь:
+//
+//   - гейт (ФТ-9а, T-239): стрик инфра-ошибок ClassBrowser достиг
+//     порога — основной движок нездоров, перелив потока на дорогой
+//     chromium запрещён до восстановления (browser-класс сам живёт в
+//     redelivery q:render — финализацией не покрывается);
+//   - бюджет (ФТ-9б, T-239): доля публикаций за окно ушла за потолок
+//     share_percent — окно приостановлено до своей границы.
+//
+// Чистая и бессостоятельна нарочно: состояние стрика и окна ведёт
+// воркер (fbObserveOutcome/fbObserveTask/fbRecordPublish под fbMu),
+// функция сводит срезы состояния с кандидатом — тестируется таблицей
+// без окружения. Кандидат на решение не влияет: движко-зависимые
+// причины (тарпит T-148, класс задачи T-172) симметричны — в
+// сигнатуре по контракту T-238 «кандидат × гейт × бюджет».
 func fallbackPublishDecision(cand fallbackCandidate, gate FallbackGate, budget FallbackBudget) bool {
-	// Заглушка T-238 — always-publish: входы не читаются, имена в
-	// сигнатуре держат контракт «кандидат × гейт × бюджет» для T-239.
+	if gate.suspended() {
+		return false
+	}
+	if budget.suspended() {
+		return false
+	}
 	return true
 }
 
@@ -865,6 +962,18 @@ func (d *fallbackDedup) claim(key string) bool {
 	return true
 }
 
+// known — уже фиксировался ли идентификатор (read-only, без фиксации):
+// повторная доставка уже опубликованной записи узнаёт об этом ДО
+// решения гейта/бюджета — приостановка не отменяет состоявшуюся
+// публикацию, дубль подтверждается без маркера и без q:analyze (ФТ-11;
+// ревью T-239, P3).
+func (d *fallbackDedup) known(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.seen[key]
+	return ok
+}
+
 // release снимает фиксацию идентификатора — публикация по нему НЕ
 // состоялась (сбой XADD): повторная доставка обязана иметь право на
 // новую попытку, иначе задача потерялась бы между фильтром и стримом
@@ -894,6 +1003,101 @@ func (d *fallbackDedup) release(key string) {
 func fallbackDedupKey(task queue.Result, checkedAt time.Time) string {
 	return fmt.Sprintf("%d/%d/%d/%d/%d",
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant), checkedAt.UnixNano())
+}
+
+// --- состояния гейта и бюджета (T-239, ТЗ §4.4 п.3–4, ФТ-9) ------------------
+
+// fallbackArmed — сборка публикует фолбэк: включён render.fallback
+// .enabled и стрим потребления q:render (те же условия, что guard
+// publishFallback, ФТ-10/ФТ-12 — воркер B фолбэк не публикует).
+// Наблюдения состояний и события приостановки идут только в вооружённой
+// сборке: метрики лежачего движка воркера B (chromium) не должны
+// поднимать алерты фолбэка первичного.
+func (w *Worker) fallbackArmed() bool {
+	return w.opt.Fallback.Enabled && w.opt.Stream == queue.StreamRender
+}
+
+// fallbackStates — срезы состояний гейта и бюджета для функции-решения
+// (fallbackPublishDecision читает значения; живые счётчики — под fbMu,
+// доставки параллельны).
+func (w *Worker) fallbackStates() (FallbackGate, FallbackBudget) {
+	w.fbMu.Lock()
+	defer w.fbMu.Unlock()
+	return w.fbGate, w.fbBudget
+}
+
+// fbObserveOutcome — исход доставки для health-гейта (T-239, ФТ-9а):
+// ошибка рендера класса браузера (основной движок недоступен) наращивает
+// стрик, успешный рендер (rendered — ProcessResult обработал запись
+// целиком: DOM записан и q:analyze опубликован, T-225) обнуляет — движок
+// подал признак жизни (образец renderFailBackoff: нарастание сбоем,
+// обнуление успехом); ошибки классов задачи/контекста и штатные отказы
+// без рендера (строки нет / ушла из-под задачи — rendered=false) стрик
+// не трогают — рендера не было, признака жизни движка нет (ревью T-239,
+// P1: no-op между браузерными ошибками открывал бы гейт лежачему).
+// Достижение порога — переход «открыт → закрыт» — событие приостановки
+// crawler_render_fallback_suspended_total{gate} (ТЗ §4.6 п.2) и Warn;
+// пока гейт закрыт, кандидаты фолбэка финализируются
+// по-сегодняшнему (маркер), browser-класс сам ждёт в redelivery
+// q:render — финализацией не покрывается, задачи без потерь.
+func (w *Worker) fbObserveOutcome(err error, rendered bool) {
+	if !w.fallbackArmed() {
+		return
+	}
+	w.fbMu.Lock()
+	defer w.fbMu.Unlock()
+	switch {
+	case err == nil && rendered:
+		w.fbGate.streak = 0
+	case render.ClassOf(err) == render.ClassBrowser:
+		w.fbGate.streak++
+		if w.fbGate.Threshold > 0 && w.fbGate.streak == w.fbGate.Threshold {
+			w.met.FallbackSuspended(fbReasonGate)
+			w.opt.log().Warn("фолбэк приостановлен: health-гейт — стрик инфра-ошибок класса браузера (основной движок недоступен)",
+				"streak", w.fbGate.streak, "threshold", w.fbGate.Threshold)
+		}
+	}
+}
+
+// fbObserveTask — доставка, завершившаяся обработкой без ошибки, вошла
+// в поток этапа (T-239, ФТ-9б): окно бюджета доли считает её
+// знаменателем (доля = публикации/поток — тот же поток, что у
+// crawler_stage_tasks_total; повторные доставки считаются один раз —
+// при успешном завершении обработки). Заполненное окно закрывается
+// оценкой: перерасход над потолком приостанавливает публикации
+// следующего окна (событие crawler_render_fallback_suspended_total
+// {budget} и Warn — ТЗ §4.6 п.3), счётчики сбрасываются —
+// приостановленное окно публикаций не набирает, следующая оценка
+// возвращает фолбэк («до конца окна», самовозврат без ручного
+// вмешательства).
+func (w *Worker) fbObserveTask() {
+	if !w.fallbackArmed() {
+		return
+	}
+	w.fbMu.Lock()
+	defer w.fbMu.Unlock()
+	w.fbBudget.tasks++
+	if w.fbBudget.tasks >= fallbackBudgetWindow {
+		over := w.fbBudget.overCeiling()
+		if over {
+			w.met.FallbackSuspended(fbReasonBudget)
+			w.opt.log().Warn("фолбэк приостановлен: бюджет доли — окно перерасходовало потолок",
+				"published", w.fbBudget.published, "window", w.fbBudget.tasks,
+				"ceiling_percent", w.fbBudget.Ceiling)
+		}
+		w.fbBudget.hold = over
+		w.fbBudget.tasks, w.fbBudget.published = 0, 0
+	}
+}
+
+// fbRecordPublish — публикация в q:render-fallback состоялась (T-239):
+// числитель доли бюджета. Вызывается после успешного XADD: отказы
+// решения (гейт/бюджет) и дубли доставок бюджет не тратят — доля
+// считается по записям, реально ушедшим в очередь.
+func (w *Worker) fbRecordPublish() {
+	w.fbMu.Lock()
+	defer w.fbMu.Unlock()
+	w.fbBudget.published++
 }
 
 // ProcessResult обрабатывает одну задачу q:render (§5.6, §7): рендер
@@ -1519,17 +1723,35 @@ dispatch:
 // (T-238, вместо финализации тарпита/класса задачи) — в
 // crawler_render_fallback_published_total{reason} (словарь
 // taskFinalizeReason; метрика не растёт на дубле доставки — публикация
-// не выполнялась).
-func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attempts int) error {
+// не выполнялась), события приостановки фолбэка (T-239) — в
+// crawler_render_fallback_suspended_total{gate|budget} (стрик
+// ClassBrowser и перерасход окна бюджета).
+func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attempts int) (err error) {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
 		return fmt.Errorf("renderworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
 	}
 	start := time.Now()
+	// Бюджет доли фолбэка (T-239): знаменатель окна — доставки,
+	// завершившиеся обработкой без ошибки (err == nil на выходе
+	// обработчика — до XACK уровнем выше, ProcessingAttempt): сбой
+	// Ack или паника дают лишний +1, повторная доставка посчитается
+	// снова — допуск единиц на 1000-доставочном окне, порядок доли
+	// не меняющий (ревью T-239, P2).
+	defer func() {
+		if err == nil {
+			w.fbObserveTask()
+		}
+	}()
 	// processed (не «rendered»): true = запись обработана целиком,
 	// только при err == nil (T-225) — иначе расходится с метрикой
 	// Rendered() и колонкой rendered (DOM записан, публикация упала).
 	processed, err := w.ProcessResult(ctx, task)
+	// Health-гейт фолбэка (T-239): класс браузера — признак нездоровья
+	// движка (стрик растёт), успешный рендер (processed) — признак
+	// жизни (сброс); ошибки классов задачи/контекста и no-op стрик не
+	// трогают.
+	w.fbObserveOutcome(err, processed)
 	if err != nil {
 		var ce *certError
 		if errors.As(err, &ce) {
@@ -1680,8 +1902,9 @@ func (w *Worker) finalizeNoRender(ctx context.Context, task queue.Result, msg st
 // finalizeSkipRender — финализация записи без рендера по тарпиту (T-148,
 // зафиксированное решение): вызывается из processDelivery после того, как
 // publishFallback (T-238) отказал — фолбэк выключен, чужой стрим
-// потребления, rendered=true либо отказ решения гейта/бюджета (T-239;
-// до его реализации ветка отказа недостижима — заглушка always-publish):
+// потребления, rendered=true либо отказ решения гейта/бюджета (T-239 —
+// стрик инфра-ошибок ClassBrowser / перерасход доли за окно: публикация
+// приостановлена, задача без потерь):
 // тарпит — движко-зависимый кандидат, при включённом фолбэке он
 // публикуется в q:render-fallback вместо финализации. Страница раз за
 // разом не укладывается в
@@ -1745,8 +1968,9 @@ func (w *Worker) finalizeDNSError(ctx context.Context, task queue.Result, cause 
 // задачи на последней попытке (T-172, зафиксированное решение):
 // вызывается из processDelivery после того, как publishFallback (T-238)
 // отказал — фолбэк выключен, чужой стрим потребления, rendered=true либо
-// отказ решения гейта/бюджета (T-239; до его реализации ветка отказа
-// недостижима — заглушка always-publish): движко-зависимая причина при
+// отказ решения гейта/бюджета (T-239 — стрик инфра-ошибок ClassBrowser
+// / перерасход доли за окно: публикация приостановлена, задача без
+// потерь): движко-зависимая причина при
 // включённом фолбэке публикуется в q:render-fallback вместо
 // финализации. Хост
 // исчерпал доставки (redis.max_attempts) с ошибкой рендера класса task —
@@ -1805,15 +2029,20 @@ func (w *Worker) finalizeTaskError(ctx context.Context, task queue.Result, cause
 //     публикация не нужна: дорабатывать нечего, доставка подтверждается
 //     без публикаций (закрывает окно лишнего повторного рендера
 //     воркером B — ревью T-238, P3);
-//   - решение fallbackPublishDecision (кандидат × гейт × бюджет,
-//     ФТ-9): заглушка T-238 — always-publish; отказ решения
-//     (health-гейт/бюджет доли, T-239) — финализация как сегодня
-//     (маркер, ТЗ §4.4 п.3–4);
 //   - фильтр дубля fallbackDedup по идентификатору записи результата
 //     (ключ строки + checked_at эпизода): повторная доставка уже
 //     опубликованной записи (сбой XACK после публикации) не даёт
 //     вторую запись в стриме (ТЗ §4.4 п.5) — доставка подтверждается
-//     без публикаций.
+//     без публикаций. Проверка дубля стоит ДО решения гейта/бюджета:
+//     запись уже ждёт воркера B, приостановка её не отменяет и маркер
+//     ей не нужен (ревью T-239, P3); фиксация (claim) — после
+//     решения: claim при отказе без публикации закрыл бы фолбэк
+//     записи до смены эпизода;
+//   - решение fallbackPublishDecision (кандидат × гейт × бюджет,
+//     ФТ-9, T-239): health-гейт закрыт стриком инфра-ошибок
+//     ClassBrowser (движок нездоров — восстановление обнулит) или окно
+//     бюджета перерасходовало потолок доли — публикация приостановлена,
+//     задача финализируется по-сегодняшнему (маркер, ТЗ §4.4 п.3–4).
 //
 // Возвраты:
 //   - (true, nil): доставка подтверждается БЕЗ finalizeNoRender —
@@ -1828,7 +2057,7 @@ func (w *Worker) finalizeTaskError(ctx context.Context, task queue.Result, cause
 //     возвращает ошибку: доставка без XACK вернётся (redelivery),
 //     маркера нет, состояние записи не менялось.
 func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause error) (bool, error) {
-	if !w.opt.Fallback.Enabled || w.opt.Stream != queue.StreamRender {
+	if !w.fallbackArmed() {
 		return false, nil
 	}
 	target, found, err := w.selectTarget(ctx, task)
@@ -1850,10 +2079,25 @@ func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause e
 		return true, nil
 	}
 	cand := fallbackCandidate{task: task, reason: taskFinalizeReason(cause)}
-	if !fallbackPublishDecision(cand, w.opt.Fallback.Gate, w.opt.Fallback.Budget) {
+	// Дубль ДО решения гейта/бюджета (ревью T-239, P3): запись этого
+	// эпизода уже в стриме (сбой XACK после публикации) — приостановка
+	// состоявшуюся публикацию не отменяет, вторая запись и маркер не
+	// нужны; доставка подтверждается (ФТ-11). Фиксация (claim) — ниже,
+	// после решения: claim без публикации закрыл бы фолбэк записи.
+	key := fallbackDedupKey(task, target.checkedAt)
+	if w.fbDedup.known(key) {
+		w.opt.log().Debug("фолбэк: запись уже опубликована в q:render-fallback — дубль доставки подтверждается",
+			"zone_id", task.ZoneID, "domain_id", task.DomainID,
+			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
+		return true, nil
+	}
+	gate, budget := w.fallbackStates()
+	if !fallbackPublishDecision(cand, gate, budget) {
+		// Гейт/бюджет приостановили публикацию (ФТ-9, T-239): задача
+		// финализируется по-сегодняшнему — маркер и q:analyze
+		// вызывающим, без потерь (ТЗ §4.4 п.3–4).
 		return false, nil
 	}
-	key := fallbackDedupKey(task, target.checkedAt)
 	if !w.fbDedup.claim(key) {
 		// Дубль: запись этого эпизода уже в стриме (сбой XACK после
 		// публикации) — вторая запись не нужна (ТЗ §4.4 п.5), доставка
@@ -1875,6 +2119,8 @@ func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause e
 		return false, fmt.Errorf("фолбэк-публикация q:render-fallback: %w", err)
 	}
 	w.met.FallbackPublished(cand.reason)
+	// Числитель доли бюджета (T-239): публикация реально ушла в очередь.
+	w.fbRecordPublish()
 	w.opt.log().Warn("рендер-фолбэк: задача опубликована в q:render-fallback — дорабатывает chromium-воркер B, запись без маркера",
 		"domain", renderLogName(task, target.finalURL), "final_url", target.finalURL,
 		"reason", cand.reason, "err", cause.Error())

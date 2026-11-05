@@ -24,7 +24,9 @@ import (
 
 // newRWFallbackFixture — фикстура с включённым фолбэком
 // (FallbackOptions.Enabled, T-238): остальные опции — дефолты
-// (TimeoutAttempts 2, MaxAttempts 3, Stream q:render).
+// (TimeoutAttempts 2, MaxAttempts 3, Stream q:render); нулевые пороги
+// гейта/бюджета (T-239) — состояния выключены, решение публикует без
+// потолков (поведение заглушки always-publish для тестов T-238).
 func newRWFallbackFixture(t *testing.T) *rwFixture {
 	t.Helper()
 	f := newRWFixture(t)
@@ -445,23 +447,9 @@ func TestRenderWorker_FallbackNoRowNoURL(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackDecisionStub — заглушка always-publish
-// (T-238): решение публикует любого кандидата при нулевых состояниях
-// гейта/бюджета; пин сигнатуры «кандидат × гейт × бюджет» для T-239
-// (тело заменит реализация гейта/бюджета — данные тесты заменятся
-// таблицей состояний).
-func TestRenderWorker_FallbackDecisionStub(t *testing.T) {
-	candidates := []fallbackCandidate{
-		{task: rwTask, reason: "timeout"},
-		{task: rwTask, reason: "net::ERR_CONNECTION_REFUSED"},
-		{task: rwTask, reason: "other"},
-	}
-	for _, cand := range candidates {
-		if !fallbackPublishDecision(cand, FallbackGate{}, FallbackBudget{}) {
-			t.Errorf("заглушка T-238 обязана публиковать любого кандидата: %+v", cand)
-		}
-	}
-}
+// Таблица состояний функции-решения (кандидат × гейт × бюджет) —
+// TestRenderWorker_FallbackDecision, fallbackgate_test.go (T-239):
+// стаб-тест always-publish T-238 заменён реализацией гейта/бюджета.
 
 // TestRenderWorker_FallbackDedupEviction — ёмкость фильтра: при
 // превышении вытесняется старейший ключ (его дубль становится

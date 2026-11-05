@@ -8,7 +8,9 @@
 // постоянной ошибке сертификата хоста (T-159), финализации по DNS-отказу
 // хоста (T-211), финализации ошибки класса задачи на последней попытке
 // с меткой причины (T-172), публикации в очередь фолбэка с меткой
-// причины (T-238, ТЗ §4.6 п.2 — числитель fallback-рейта, ФТ-15) и
+// причины (T-238, ТЗ §4.6 п.2 — числитель fallback-рейта, ФТ-15),
+// события приостановки фолбэк-публикации с меткой причины gate|budget
+// (T-239, ФТ-9, ТЗ §4.6 п.2) и
 // метка движка engine на доле рендера и финализациях класса задачи
 // (T-235, ТЗ §4.6 п.1, ФТ-15: кардинальность 3 — chromium/moli/
 // lightpanda, значение — движок сборки воркера, Options.Engine ←
@@ -23,6 +25,19 @@ import (
 	"crawler/internal/config"
 	"crawler/internal/metrics"
 	"crawler/internal/render"
+)
+
+// Package-уровневые константы ниже — словарь причин приостановки.
+const (
+	// fbReasonGate — health-гейт (ФТ-9а): стрик инфра-ошибок класса
+	// браузера достиг render.fallback.health_gate_streak — основной
+	// движок нездоров, фолбэк-публикация приостановлена до
+	// восстановления (T-239).
+	fbReasonGate = "gate"
+	// fbReasonBudget — бюджет доли (ФТ-9б): доля публикаций за окно
+	// ушла за потолок render.fallback.share_percent — следующее окно
+	// без публикаций (T-239).
+	fbReasonBudget = "budget"
 )
 
 // renderSecondsBuckets — корзины длительности задачи рендера: страница
@@ -45,6 +60,7 @@ type Metrics struct {
 	dns      prometheus.Counter     // crawler_render_dns_finalized_total (T-211)
 	tasksFin *prometheus.CounterVec // crawler_render_task_finalized_total{reason,engine} (T-172/T-235)
 	fallback *prometheus.CounterVec // crawler_render_fallback_published_total{reason} (T-238)
+	suspend  *prometheus.CounterVec // crawler_render_fallback_suspended_total{reason} (T-239)
 	engine   string                 // значение метки engine — движок сборки воркера (T-235)
 }
 
@@ -104,6 +120,10 @@ func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 		fallback: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_fallback_published_total",
 			Help: "Задачи, опубликованные в очередь фолбэка q:render-fallback из путей финализации без рендера (T-238, ТЗ 4.4): движко-зависимые причины (тарпит T-148, класс задачи T-172 на последней доставке) дорабатывает chromium-воркер B, запись остаётся без маркера render_failed_at. Метка reason — словарь crawler_render_task_finalized_total (код net::ERR_*, timeout, other); числитель fallback-рейта (ФТ-15).",
+		}, "reason"),
+		suspend: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_render_fallback_suspended_total",
+			Help: "События приостановки фолбэк-публикации (T-239, ФТ-9), не состояние — каждое защёлкивание одна точка: reason=gate — health-гейт, стрик инфра-ошибок класса браузера (основной движок недоступен) достиг render.fallback.health_gate_streak, публикация приостановлена до восстановления (успешный рендер обнуляет стрик; ошибки классов задачи/контекста стрик не трогают); reason=budget — бюджет доли, доля публикаций за окно в 1000 доставок этапа ушла за потолок render.fallback.share_percent, следующее окно без публикаций. Пока приостановка держится, кандидаты фолбэка финализируются штатно с маркером render_failed_at (как при выключенном фолбэке); browser-класс ждёт в redelivery q:render в пределах окна ретраев redis.max_attempts. Рост — сигнал деградации основного движка (алерты ТЗ 4.6 п.3).",
 		}, "reason"),
 	}
 }
@@ -185,6 +205,21 @@ func (m *Metrics) FallbackPublished(reason string) {
 		return
 	}
 	m.fallback.WithLabelValues(reason).Inc()
+}
+
+// FallbackSuspended — событие приостановки фолбэк-публикации (T-239,
+// ФТ-9, ТЗ §4.6 п.2): +1 с меткой причины (замкнутый словарь
+// fbReasonGate/fbReasonBudget — «gate»/«budget»). Событие, не
+// состояние: одна точка на защёлкивание приостановки — гейт закрылся
+// стриком инфра-ошибок класса браузера (движок нездоров) или окно
+// бюджета перерасходовало потолок доли; пока приостановка держится,
+// кандидаты финализируются штатно с маркером. Материал алертов
+// деградации основного движка (ТЗ §4.6 п.3).
+func (m *Metrics) FallbackSuspended(reason string) {
+	if m == nil {
+		return
+	}
+	m.suspend.WithLabelValues(reason).Inc()
 }
 
 // Error — задача рендера не подтверждена (вернётся повторной доставкой):
