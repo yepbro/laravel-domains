@@ -214,8 +214,10 @@ test-integration: ## Интеграционные тесты окружения 
 	# CLI (тот же набор migrations/); раннер сервисов проверяют TestMigrate_*.
 	$(COMPOSE) run --rm tools sh -c \
 	  'migrate -path /migrations -database "$$APP_PG_DSN" up'
+	# ./cmd/crawlerctl — интеграционный тест наката фикстуры T-243
+	# (гейт CRAWLER_INTEGRATION, изолированная схема в той же БД).
 	$(COMPOSE) run --rm -e CRAWLER_INTEGRATION=1 tools \
-		go test ./test/integration -count=1 -v -timeout 10m
+		go test ./test/integration ./cmd/crawlerctl -count=1 -v -timeout 10m
 
 # --------------------------------------------------------------- мутационное тестирование
 # Как читать отчёты, гейтить порог и помечать ложных мутантов —

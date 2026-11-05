@@ -4,8 +4,8 @@
 // tasks/TZ_render_engines.md §6.1 п. 1–2): выгрузка фикстуры доменов
 // с боевой БД для локального стенда сравнения движков рендера (§5.1) и
 // smoke-прогонов смены pinned-версий (§6.1 п. 6). Одноразовый инструмент
-// этапа: выгрузка читает БД, накат дампа в тестовую БД — задача T-243
-// (действие import добавит туда же); контент-хранилище не выгружается —
+// этапа: выгрузка читает БД, накат дампа и публикация задач — fixtures
+// import (T-243, fixtures_import.go); контент-хранилище не выгружается —
 // DOM на стенде пишет сам рендер, baseline снимается там же.
 //
 // Выборка (§6.1 п. 1) — строки subdomain_results, являвшиеся реальными
@@ -125,12 +125,13 @@ import (
 
 // fixturesHelp — справка crawlerctl fixtures [--help]; она же печатается
 // для действий fixtures <действие> --help.
-const fixturesHelp = `crawlerctl fixtures — фикстуры стенда сравнения движков рендера (T-242)
+const fixturesHelp = `crawlerctl fixtures — фикстуры стенда сравнения движков рендера (T-242/T-243)
 
 Использование:
   crawlerctl fixtures export --out КАТАЛОГ [--ok N] [--failed N]
                               [--heavy N] [--smoke N] [--weeks N]
                               [--seed N]
+  crawlerctl fixtures import --dir КАТАЛОГ [--publish all|smoke]
 
 Выгрузка фикстуры доменов с БД (ТЗ рендера §6.1 п. 1–2): выборка строк
 subdomain_results — реальных задач q:render (final_url после SPA-вердикта
@@ -153,12 +154,34 @@ render_failed_at T-210 — тарпиты/класс задачи T-172, вкл�
   --seed N       seed детерминированной выборки (по умолчанию 242):
                  тот же seed и те же данные — те же строки дампа
 
+import — идемпотентный накат дампа формата v1 в тестовую БД (§6.1 п. 3)
+и публикация задач фикстуры прямо в q:render (§6.1 п. 4) — рендер-этап
+тестируется изолированно, без DNS/HTTP. Накат идёт по первичным ключам
+из ключей дампа (повторный накат не дублирует, а восстанавливает
+состояние дампа — прогоны сравниваются на одном старте); зоны входят
+мимо identity (OVERRIDING SYSTEM VALUE), последовательности zones.id и
+domain_id_seq выставляются выше максимума; контентные ссылки дампа
+сбрасываются (contents не выгружался — DOM пишет сам стенд). БД должна
+быть чистой (миграции дев-стека без данных): зона/домен с тем же
+именем, но другим id — конфликт, накат останавливается до записи.
+
+  --dir КАТАЛОГ   каталог дампа (обязателен; формат v1 — export)
+  --publish РЕЖИМ публикация задач фикстуры в q:render: all — все записи
+                  дампа, smoke — домены smoke-подвыборки; без флага —
+                  только накат. Публикация идёт в Redis конфигурации
+                  (redis.addr) — воркер стенда должен читать тот же
+                  инстанс. Повторный запуск с --publish добавляет записи
+                  заново: между прогонами очищайте q:render (инструкция —
+                  docs/dev-environment.md)
+
 Дампа не хватает строк страты (мало данных) — берутся все доступные,
 деградация отмечается в выводе и manifest.json. Формат дампа v1 —
-контракт наката (T-243), подробно: doc-комментарий cmd/crawlerctl/fixtures.go.
+контракт export→import, подробно: doc-комментарии cmd/crawlerctl/
+fixtures.go и fixtures_import.go.
 
 Подключение к БД — как у остальных команд: postgres.dsn конфигурации
-(CRAWLER_POSTGRES_DSN / APP_PG_DSN). Боевая БД читается без записи.
+(CRAWLER_POSTGRES_DSN / APP_PG_DSN). export читает БД без записи;
+import пишет в тестовую БД и (с --publish) в Redis.
 
 Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
 `
@@ -956,20 +979,22 @@ func fixturesExportRun(ctx context.Context, pool db.DB, p fixturesParams, stdout
 // ---------------------------------------------------------------- команда
 
 // cmdFixtures — crawlerctl fixtures: маршрутизация действий (export —
-// T-242; import/накат — T-243 добавит сюда же).
+// T-242; import — T-243, fixtures_import.go).
 func cmdFixtures(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usagef("укажите действие: crawlerctl fixtures export")
+		return usagef("укажите действие: crawlerctl fixtures export|import")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
 	case "export":
 		return fixturesExportCmd(rest, stdout, stderr)
+	case "import":
+		return fixturesImportCmd(rest, stdout, stderr)
 	case "-h", "--help", "help":
 		out(stdout, "%s", fixturesHelp)
 		return flag.ErrHelp
 	default:
-		return usagef("неизвестное действие %q (допустимы: export)", action)
+		return usagef("неизвестное действие %q (допустимы: export, import)", action)
 	}
 }
 

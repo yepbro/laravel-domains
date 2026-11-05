@@ -107,6 +107,11 @@ const usageText = `crawlerctl — CLI Domain Crawler
                                  выгрузка фикстуры рендера (zones/domains/
                                  subdomain_results без контента) для
                                  стенда движков (ТЗ рендера §6.1, T-242)
+  fixtures import --dir КАТАЛОГ [--publish all|smoke]
+                                 накат дампа фикстуры в тестовую БД
+                                 (идемпотентно по PK) и публикация задач
+                                 прямо в q:render без DNS/HTTP (ТЗ
+                                 рендера §6.1, T-243)
 
 Справка по команде: crawlerctl <команда> --help
 `

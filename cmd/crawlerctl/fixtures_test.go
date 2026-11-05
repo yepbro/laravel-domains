@@ -34,10 +34,12 @@ func TestRunFixtures(t *testing.T) {
 
 	cases := []runCase{
 		{name: "fixtures без действия", args: []string{"fixtures"}, code: exitUsage, inErr: "укажите действие"},
-		{name: "fixtures неизвестное действие", args: []string{"fixtures", "import"}, code: exitUsage, inErr: `допустимы: export`},
+		{name: "fixtures неизвестное действие", args: []string{"fixtures", "restore"}, code: exitUsage, inErr: `допустимы: export, import`},
 		{name: "fixtures --help", args: []string{"fixtures", "--help"}, code: exitOK, inOut: "фикстуры стенда сравнения движков рендера"},
 		{name: "fixtures help", args: []string{"fixtures", "help"}, code: exitOK, inOut: "fixtures export --out"},
 		{name: "export --help", args: []string{"fixtures", "export", "--help"}, code: exitOK, inOut: "--seed N"},
+		{name: "import --help", args: []string{"fixtures", "import", "--help"}, code: exitOK, inOut: "--publish РЕЖИМ"},
+		{name: "import help", args: []string{"fixtures", "import", "help"}, code: exitOK, inOut: "fixtures import --dir"},
 		{name: "export без --out", args: []string{"fixtures", "export"}, code: exitUsage, inErr: "укажите каталог дампа"},
 		{name: "export --out пустой", args: []string{"fixtures", "export", "--out", "  "}, code: exitUsage, inErr: "укажите каталог дампа"},
 		{name: "export лишний аргумент", args: []string{"fixtures", "export", "--out", "d", "stray"}, code: exitUsage, inErr: "лишние аргументы"},
@@ -49,8 +51,20 @@ func TestRunFixtures(t *testing.T) {
 			code: exitUsage, inErr: "--weeks"},
 		{name: "export валидный — нет конфигурации", args: []string{"fixtures", "export", "--out", "d"},
 			code: exitError, inErr: "fixtures export:"},
+		{name: "import без --dir", args: []string{"fixtures", "import"}, code: exitUsage, inErr: "укажите каталог дампа"},
+		{name: "import --dir пустой", args: []string{"fixtures", "import", "--dir", " "}, code: exitUsage, inErr: "укажите каталог дампа"},
+		{name: "import --publish мусор", args: []string{"fixtures", "import", "--dir", "d", "--publish", "some"},
+			code: exitUsage, inErr: "--publish"},
+		{name: "import лишний аргумент", args: []string{"fixtures", "import", "--dir", "d", "stray"},
+			code: exitUsage, inErr: "лишние аргументы"},
+		{name: "import валидный — нет конфигурации", args: []string{"fixtures", "import", "--dir", "d"},
+			code: exitError, inErr: "fixtures import:"},
+		{name: "import валидный с публикацией — нет конфигурации", args: []string{"fixtures", "import", "--dir", "d", "--publish", "smoke"},
+			code: exitError, inErr: "fixtures import:"},
 		{name: "справка верхнего уровня упоминает fixtures", args: []string{"--help"},
 			code: exitOK, inOut: "fixtures export --out"},
+		{name: "справка верхнего уровня упоминает fixtures import", args: []string{"--help"},
+			code: exitOK, inOut: "fixtures import --dir"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
