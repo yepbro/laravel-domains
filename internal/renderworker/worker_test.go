@@ -262,7 +262,7 @@ func (p *rwFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.
 }
 
 // rwFakeRows — pgx.Rows с заготовленными строками SELECT (final_url,
-// content_hash).
+// content_hash, rendered, checked_at).
 type rwFakeRows struct {
 	rows [][]any
 	i    int
@@ -281,12 +281,12 @@ func (r *rwFakeRows) Next() bool {
 }
 
 func (r *rwFakeRows) Scan(dest ...any) error {
-	if r.i == 0 || r.i > len(r.rows) || len(dest) != 2 {
-		return fmt.Errorf("rwFakeRows: Scan без Next или приёмников %d (нужно 2)", len(dest))
+	if r.i == 0 || r.i > len(r.rows) || len(dest) != 4 {
+		return fmt.Errorf("rwFakeRows: Scan без Next или приёмников %d (нужно 4)", len(dest))
 	}
 	row := r.rows[r.i-1]
-	// final_url: NULL → nil-приёмник остаётся нетронутым (pgx semantics:
-	// *string остаётся nil).
+	// NULL-колонки оставляют приёмник нетронутым (семантика pgx:
+	// *string/*[]byte остаются nil) — final_url и content_hash.
 	if row[0] != nil {
 		if d, ok := dest[0].(**string); ok {
 			*d = row[0].(*string)
@@ -300,6 +300,16 @@ func (r *rwFakeRows) Scan(dest ...any) error {
 		} else {
 			return fmt.Errorf("rwFakeRows: приёмник[1] %T, ожидается *[]byte", dest[1])
 		}
+	}
+	if d, ok := dest[2].(*bool); ok {
+		*d = row[2].(bool)
+	} else {
+		return fmt.Errorf("rwFakeRows: приёмник[2] %T, ожидается *bool", dest[2])
+	}
+	if d, ok := dest[3].(*time.Time); ok {
+		*d = row[3].(time.Time)
+	} else {
+		return fmt.Errorf("rwFakeRows: приёмник[3] %T, ожидается *time.Time", dest[3])
 	}
 	return nil
 }
@@ -332,7 +342,7 @@ func (p *rwFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 		copy(h, r.hash)
 		hash = h
 	}
-	return &rwFakeRows{rows: [][]any{{r.finalURL, hash}}}, nil
+	return &rwFakeRows{rows: [][]any{{r.finalURL, hash, r.rendered, r.checkedAt}}}, nil
 }
 
 func (p *rwFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -937,7 +947,7 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 // час корзины rendered-темпа, T-203), маркера «рендер невозможен»
 // (T-210) и upsert корзины.
 func TestRenderWorker_SQLContract(t *testing.T) {
-	selectWant := "SELECT final_url, content_hash FROM subdomain_results " +
+	selectWant := "SELECT final_url, content_hash, rendered, checked_at FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
 		"AND subdomain_id = $3::int2 AND variant = $4::int2"
 	if renderSelectSQL != selectWant {

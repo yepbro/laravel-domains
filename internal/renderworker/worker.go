@@ -91,8 +91,28 @@
 // хранилище, публикация, браузер) — в духе T-148 «q:dead — настоящим
 // инфраструктурным ошибкам».
 //
+// Публикация фолбэка (T-238, ТЗ §4.4): при включённом
+// render.fallback.enabled (Options.Fallback, T-233/ФТ-14) тарпит T-148
+// и класс задачи T-172 на последней попытке — движко-зависимые причины
+// (свойство пары «сайт × движок»: зависшая на лёгком движке страница
+// может открыться в chromium, ТЗ §4.4 п.2) — не финализируются, а
+// публикуются в q:render-fallback (publishFallback): запись остаётся
+// без маркера («ждёт фолбэка» — промежуточное состояние выражается
+// отсутствием маркера и глубиной очереди, ТЗ §4.4 п.1) и дорабатывается
+// chromium-воркером B — тем же бинарём на стриме фолбэка (ФТ-12,
+// T-236); рекурсивный фолбэк фолбэка запрещён: публикации идут только
+// из стрима q:render (ФТ-10). DNS-класс T-211 и cert-класс T-159 —
+// движко-независимые свойства хоста, фолбэка не получают при любом
+// флаге (ФТ-7: Chromium их не исправит). Идемпотентность публикации —
+// фильтр дубля по идентификатору записи результата (ключ строки +
+// content_hash эпизода, ТЗ §4.4 п.5); решение о публикации — чистая
+// функция fallbackPublishDecision (кандидат × гейт × бюджет, ФТ-9):
+// заглушка T-238 — always-publish, health-гейт и бюджет доли — T-239.
+//
 // Все четыре финализации штампуют маркер «рендер невозможен»
-// subdomain_results.render_failed_at (T-210, миграция 000017):
+// subdomain_results.render_failed_at (T-210, миграция 000017) — кроме
+// путей с фолбэком выше: там маркер первичный воркер не ставит вовсе,
+// его ставит воркер B после исчерпания фолбэка (ФТ-10):
 // финализированная-без-рендера запись навсегда rendered = false и до
 // маркера была неотличима от «не пробовали» — проход доработки
 // (httpworker/renderq.go) переиздавал такие записи без разбора (замер
@@ -137,11 +157,16 @@ import (
 // публикация q:analyze ниже переанализирует запись и проставит свежую
 // версию. Ключи — литералами типов (стиль record.go T-058).
 var (
-	// renderSelectSQL — цель рендера: итоговый URL строки результата и её
+	// renderSelectSQL — цель рендера: итоговый URL строки результата, её
 	// текущая ссылка на контент (оспариваемая оптимистической охраной
-	// renderUpdateSQL). Ведущие колонки PK — партиционирование LIST по
-	// zone_id и субпартиционирование HASH (T-005) режут поиск до листа.
-	renderSelectSQL = "SELECT final_url, content_hash FROM subdomain_results " +
+	// renderUpdateSQL), признак rendered (фолбэк-публикация T-238
+	// пропускает уже отрендеренные — дорабатывать нечего) и checked_at —
+	// час корзины rendered-темпа (T-203) и идентификатор эпизода записи
+	// для фильтра дубля фолбэка (T-238: перезапись эпизода T-058 пишет
+	// новый checked_at, повторные доставки эпизода читают тот же).
+	// Ведущие колонки PK — партиционирование LIST по zone_id и
+	// субпартиционирование HASH (T-005) режут поиск до листа.
+	renderSelectSQL = "SELECT final_url, content_hash, rendered, checked_at FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
 		"AND subdomain_id = $3::int2 AND variant = $4::int2"
 
@@ -412,12 +437,52 @@ type Options struct {
 	// 0 — дефолт очереди (queue.DefaultRecoverInterval). Конфиг —
 	// redis.recover_interval (T-153).
 	RecoverInterval time.Duration
+	// Fallback — публикация фолбэка из путей финализации без рендера
+	// (T-238, ТЗ §4.4, ФТ-8/ФТ-14): включение (render.fallback.enabled,
+	// T-233) переключает тарпит T-148 и класс задачи T-172 (последняя
+	// попытка) с проставления render_failed_at на публикацию задачи в
+	// q:render-fallback. Нулевое значение (дефолт) — фолбэка нет,
+	// поведение финализаций прежнее.
+	Fallback FallbackOptions
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
 	// строит приборы этапа (NewMetrics); nil — без метрик (изолированные
 	// сборки и тесты).
 	Metrics *metrics.Registry
+}
+
+// FallbackOptions — параметры публикации фолбэка (T-238, ТЗ §4.4
+// п.1–2/п.5, ФТ-7/8/10/14). Поля конфигурации потолков (worker_rate,
+// share_percent, health_gate_streak — T-233) сюда не входят: они
+// принадлежат гейту/бюджету/воркеру B (T-239/T-240); здесь — только
+// включение, которым воркер обязан распоряжаться на путях финализации.
+type FallbackOptions struct {
+	// Enabled — render.fallback.enabled (T-233, ФТ-14): false (дефолт,
+	// ноль изменений поведения и прод-контура до явного включения) —
+	// финализации без рендера работают как сегодня: тарпит T-148 и
+	// класс задачи T-172 на последней попытке штампуют маркер
+	// render_failed_at (T-210) и публикуют q:analyze; true — вместо
+	// маркера задача публикуется в q:render-fallback (publishFallback),
+	// запись дорабатывает chromium-воркер B (ТЗ §4.5). DNS-класс T-211
+	// и cert-класс T-159 не фолбэкаются при любом значении (ФТ-7).
+	// Выключение — без деплоя новых сущностей: накопленное в очереди
+	// дорабатывается воркером B до пуста (ФТ-14).
+	Enabled bool
+	// Gate — вход health-гейта функции-решения fallbackPublishDecision
+	// (ФТ-9а: стрик инфра-ошибок класса браузера — «основной движок
+	// недоступен» — приостанавливает фолбэк-публикацию до восстановления
+	// движка, перелив всего потока на дорогой chromium исключён).
+	// T-238 — заглушка always-publish значение не читает; живое
+	// состояние стрика и его проводка — T-239 (параллельная точка
+	// расширения той же функции).
+	Gate FallbackGate
+	// Budget — вход скользящего бюджета доли функции-решения
+	// (ФТ-9б: доля публикаций в фолбэк за окно сверх потолка
+	// share_percent приостанавливает фолбэк до конца окна — задачи
+	// финализируются штатно с маркером). T-238 — заглушка
+	// always-publish значение не читает; окно и учёт — T-239.
+	Budget FallbackBudget
 }
 
 func (o Options) withDefaults() Options {
@@ -454,15 +519,18 @@ func (o Options) log() *slog.Logger {
 
 // Worker — рендер-воркер: обрабатывает задачи стрима потребления
 // Options.Stream (дефолт q:render; ключи строк subdomain_results) через
-// швы рендера и хранилища. Потокобезопасен:
-// состояние неизменно после New.
+// швы рендера и хранилища. Потокобезопасен: неизменно после New всё,
+// кроме fbDedup — фильтра дубля фолбэк-публикаций (T-238) под
+// собственным мьютексом (доставки идут параллельно; приборы метрик —
+// синхронизированные).
 type Worker struct {
 	db       RenderDB
 	q        queue.Queue
 	contents ContentStore
 	renderer Renderer
 	opt      Options
-	met      *Metrics // приборы этапа (T-077); nil — no-op
+	met      *Metrics       // приборы этапа (T-077); nil — no-op
+	fbDedup  *fallbackDedup // фильтр дубля фолбэк-публикаций (T-238); строится в New
 }
 
 // New строит воркер поверх пула БД, очереди (публикация q:analyze — под
@@ -482,14 +550,19 @@ func New(db RenderDB, q queue.Queue, contents ContentStore, renderer Renderer, o
 	if renderer == nil {
 		return nil, errors.New("renderworker: пул рендера не задан")
 	}
-	return &Worker{db: db, q: q, contents: contents, renderer: renderer, opt: opts.withDefaults(), met: NewMetrics(opts.Metrics)}, nil
+	return &Worker{db: db, q: q, contents: contents, renderer: renderer,
+		opt: opts.withDefaults(), met: NewMetrics(opts.Metrics), fbDedup: newFallbackDedup()}, nil
 }
 
 // renderTarget — прочитанная строка результата: цель рендера и старая
-// ссылка на контент.
+// ссылка на контент; rendered/checkedAt — фильтры фолбэка (T-238):
+// отрендеренную строку в фолбэк не публикует никто, checked_at
+// идентифицирует эпизод записи (перезапись эпизода T-058 — новый).
 type renderTarget struct {
-	finalURL string
-	hash     []byte // nil — контента нет (NULL content_hash, T-056)
+	finalURL  string
+	hash      []byte    // nil — контента нет (NULL content_hash, T-056)
+	rendered  bool      // успешный рендер уже закрыл вопрос (T-238)
+	checkedAt time.Time // эпизод записи — ключ фильтра дубля (T-238), час корзины (T-203)
 }
 
 // tarpitError — маркер таймаут-тарпита (T-148): ошибка рендера класса
@@ -669,6 +742,148 @@ func taskFinalizeReason(err error) string {
 		return "timeout"
 	}
 	return "other"
+}
+
+// --- фолбэк-публикация (T-238, ТЗ §4.4) --------------------------------------
+
+// fallbackCandidate — кандидат на фолбэк (ФТ-7, ТЗ §4.4 п.1–2): задача
+// пути финализации без рендера по движко-зависимой причине — тарпит
+// T-148 (исчерпание render.timeout_attempts) или класс задачи T-172 на
+// последней попытке (redis.max_attempts): свойство пары «сайт ×
+// движок» — зависшая на лёгком движке страница может открыться в
+// chromium. reason — словарь taskFinalizeReason (метрика
+// crawler_render_fallback_published_total, ТЗ §4.6 п.2); эпизод записи
+// (идентификатор фильтра дубля) кандидату не нужен — его держит
+// вызывающий (checked_at строки, fallbackDedupKey).
+type fallbackCandidate struct {
+	task   queue.Result
+	reason string // taskFinalizeReason(cause)
+}
+
+// FallbackGate — состояние health-гейта фолбэка (ФТ-9а, ТЗ §4.4 п.3):
+// при стрике инфра-ошибок рендера класса браузера (основной движок
+// недоступен) фолбэк-публикация приостанавливается до восстановления —
+// задачи ждут в redelivery q:render, перелив всего потока на дорогой
+// chromium при падении лёгкого исключён. T-238 — тип-заглушка без
+// полей: решение always-publish его не читает; состояние стрика (образец
+// счётчика — renderFailBackoff) и его чтение — T-239.
+type FallbackGate struct{}
+
+// FallbackBudget — состояние скользящего бюджета доли фолбэка (ФТ-9б,
+// ТЗ §4.4 п.4): доля публикаций за окно сверх потолка share_percent
+// выключает фолбэк до конца окна — задачи финализируются с маркером как
+// сегодня, поднимается алерт. T-238 — тип-заглушка без полей; окно,
+// учёт доли и порог — T-239.
+type FallbackBudget struct{}
+
+// fallbackPublishDecision — чистая функция-решение о публикации
+// кандидата в q:render-fallback (ТЗ §4.4 п.3–4, ФТ-9): кандидат ×
+// health-гейт × бюджет доли. T-238 — заглушка always-publish: движко-
+// зависимые кандидаты публикуются всегда (гейт и бюджет в этой задаче
+// не реализуются); реализация решения — T-239: стрик инфра-ошибок
+// ClassBrowser гасит публикации до восстановления движка, превышение
+// доли за окно — до конца окна (сигнатура сохраняется, меняется тело и
+// наполняются FallbackGate/FallbackBudget). Чистая и бессостоятельна
+// нарочно: состояния гейта/бюджета ведёт воркер (образец — счётчик
+// failed цикла Run), функция только сводит их с кандидатом —
+// тестируется таблицей без окружения.
+func fallbackPublishDecision(cand fallbackCandidate, gate FallbackGate, budget FallbackBudget) bool {
+	// Заглушка T-238 — always-publish: входы не читаются, имена в
+	// сигнатуре держат контракт «кандидат × гейт × бюджет» для T-239.
+	return true
+}
+
+// fallbackDedupCap — ёмкость фильтра дубля фолбэк-публикаций: 32 768 —
+// с запасом выше потолка MAXLEN q:render-fallback (15 000, T-237):
+// интересующее окно дубля — записи, которые воркер B ещё не потребил
+// (глубина стрима ≤ потолка), всё старее либо потреблено, либо срезано
+// обрезкой — дубль тому лишняя работа консьюмера B, не потеря (ФТ-11).
+// Без ёмкости фильтр рос бы без предела (десятки тысяч ключей в сутки).
+const fallbackDedupCap = 1 << 15
+
+// fallbackDedup — фильтр дубля публикации в q:render-fallback по
+// идентификатору записи результата (ТЗ §4.4 п.5): повторная доставка
+// той же записи (сбой XACK после успешной публикации; конкурентный
+// дубль сообщения эпизода — источники перечислены в T-210) не даёт
+// вторую запись в стриме. Образец — parking-дедуп (бит render_pending
+// T-066/T-175: переход «опубликовано» фиксируется ровно один раз —
+// охрана UPDATE, — повторное исполнение видит «уже сделано» и
+// пропускает побочный эффект). Идентификатор — ключ строки +
+// checked_at эпизода (fallbackDedupKey): checked_at стабилен в жизни
+// эпизода (повторные доставки читают тот же) и меняется перезаписью
+// эпизода (перепроверка T-058) — новый эпизод легитимно переходит
+// фолбэк заново; контентный content_hash для идентификации эпизода НЕ
+// годится: хэш контентно-адресный (дедуп T-056), и новый эпизод с
+// побайтово тем же контентом совпал бы со старым — фильтр ложно гасил
+// бы фолбэк свежего эпизода (ревью T-238, P1).
+//
+// Память процесса, не Redis/БД: состояние фолбэка живёт в очереди и
+// метриках (ТЗ §4.8 — схема БД без новых колонок/таблиц), а дедуп
+// обязан пережить лишь окно повторных доставок этой записи
+// (секунды–минуты PEL), не рестарты воркера — дубль после рестарта
+// или вытеснения из ёмкости допустим и гасится консьюмером B (ФТ-11).
+// Потокобезопасен: доставки обрабатываются параллельно.
+type fallbackDedup struct {
+	mu    sync.Mutex
+	seen  map[string]struct{}
+	order []string // ключи в порядке вставки — вытеснение старейших (FIFO)
+}
+
+// newFallbackDedup строит пустой фильтр.
+func newFallbackDedup() *fallbackDedup {
+	return &fallbackDedup{seen: make(map[string]struct{})}
+}
+
+// claim фиксирует идентификатор как опубликованный: true — первая
+// фиксация (публикацию можно выполнять), false — уже фиксировался
+// (дубль: вторая запись в стриме не нужна). При превышении ёмкости
+// вытесняется старейший ключ (его дубль станет допустимым — ФТ-11).
+func (d *fallbackDedup) claim(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.seen[key]; ok {
+		return false
+	}
+	if len(d.order) >= fallbackDedupCap {
+		// Вытеснение старейшего: order — очередь вставки, seen держит
+		// ровно ключи order (release удаляет из обоих).
+		delete(d.seen, d.order[0])
+		d.order = d.order[1:]
+	}
+	d.seen[key] = struct{}{}
+	d.order = append(d.order, key)
+	return true
+}
+
+// release снимает фиксацию идентификатора — публикация по нему НЕ
+// состоялась (сбой XADD): повторная доставка обязана иметь право на
+// новую попытку, иначе задача потерялась бы между фильтром и стримом
+// (claim без публикации навсегда закрывал бы фолбэк записи до смены
+// эпизода). Пары к claim того же ключа; незнакомый ключ — no-op
+// (симметрия вызовов при ошибках до claim).
+func (d *fallbackDedup) release(key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.seen[key]; !ok {
+		return
+	}
+	delete(d.seen, key)
+	for i, k := range d.order {
+		if k == key {
+			d.order = append(d.order[:i], d.order[i+1:]...)
+			break
+		}
+	}
+}
+
+// fallbackDedupKey — идентификатор записи результата для фильтра дубля:
+// ключ строки subdomain_results + checked_at эпизода (UnixNano —
+// компактная печать timestamptz; эпизод = запись строки T-058, все
+// доставки эпизода читают один и тот же checked_at, перезапись эпизода
+// пишет новый).
+func fallbackDedupKey(task queue.Result, checkedAt time.Time) string {
+	return fmt.Sprintf("%d/%d/%d/%d/%d",
+		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant), checkedAt.UnixNano())
 }
 
 // ProcessResult обрабатывает одну задачу q:render (§5.6, §7): рендер
@@ -915,7 +1130,7 @@ func (w *Worker) selectTarget(ctx context.Context, task queue.Result) (renderTar
 	var t renderTarget
 	if rows.Next() {
 		var finalURL *string
-		if err := rows.Scan(&finalURL, &t.hash); err != nil {
+		if err := rows.Scan(&finalURL, &t.hash, &t.rendered, &t.checkedAt); err != nil {
 			return renderTarget{}, false, fmt.Errorf("renderworker: чтение строки результата: %w", err)
 		}
 		if finalURL != nil {
@@ -1290,7 +1505,11 @@ dispatch:
 // финализация без рендера — в crawler_render_tarpit_finalized_total /
 // crawler_render_cert_finalized_total /
 // crawler_render_dns_finalized_total /
-// crawler_render_task_finalized_total{reason}.
+// crawler_render_task_finalized_total{reason}, публикация фолбэка
+// (T-238, вместо финализации тарпита/класса задачи) — в
+// crawler_render_fallback_published_total{reason} (словарь
+// taskFinalizeReason; метрика не растёт на дубле доставки — публикация
+// не выполнялась).
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attempts int) error {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
@@ -1337,6 +1556,19 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 		}
 		var tp *tarpitError
 		if errors.As(err, &tp) && attempts >= w.opt.TimeoutAttempts {
+			// Фолбэк (T-238, ФТ-8): тарпит — движко-зависимый кандидат,
+			// при включённом фолбэке задача публикуется в
+			// q:render-fallback вместо финализации (маркер не ставится —
+			// доработку и финализацию выполняет воркер B, ФТ-10).
+			fb, ferr := w.publishFallback(ctx, task, tp)
+			if ferr != nil {
+				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+			}
+			if fb {
+				w.met.Task(time.Since(start))
+				w.met.Error(render.ClassTask)
+				return nil // в фолбэке: ни маркера, ни q:analyze (воркер B)
+			}
 			// Лимит таймаутов исчерпан (T-148): запись финализируется без
 			// рендера — итог сырой HTML HTTP-фазы, конвейер продолжается
 			// анализом (q:analyze), доставка подтверждается.
@@ -1355,6 +1587,18 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			// 6.6% ретраев ERR_CONNECTION_REFUSED успешны), работу не
 			// теряем: итог — сырой HTML HTTP-фазы, конвейер продолжается
 			// анализом (q:analyze), доставка подтверждается.
+			// Фолбэк (T-238, ФТ-8): та же движко-зависимая причина —
+			// при включённом фолбэке публикация в q:render-fallback
+			// вместо финализации (маркер — воркеру B, ФТ-10).
+			fb, ferr := w.publishFallback(ctx, task, err)
+			if ferr != nil {
+				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+			}
+			if fb {
+				w.met.Task(time.Since(start))
+				w.met.Error(render.ClassTask)
+				return nil // в фолбэке: ни маркера, ни q:analyze (воркер B)
+			}
 			if ferr := w.finalizeTaskError(ctx, task, err, attempts); ferr != nil {
 				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
 			}
@@ -1424,7 +1668,13 @@ func (w *Worker) finalizeNoRender(ctx context.Context, task queue.Result, msg st
 }
 
 // finalizeSkipRender — финализация записи без рендера по тарпиту (T-148,
-// зафиксированное решение): страница раз за разом не укладывается в
+// зафиксированное решение): вызывается из processDelivery после того, как
+// publishFallback (T-238) отказал — фолбэк выключен, чужой стрим
+// потребления, rendered=true либо отказ решения гейта/бюджета (T-239;
+// до его реализации ветка отказа недостижима — заглушка always-publish):
+// тарпит — движко-зависимый кандидат, при включённом фолбэке он
+// публикуется в q:render-fallback вместо финализации. Страница раз за
+// разом не укладывается в
 // render.timeout, рендерные попытки исчерпаны — итогом записи остаётся
 // сырой HTML HTTP-фазы (rendered = false), строка получает маркер
 // «рендер невозможен» render_failed_at (T-210 — до смены контента проход
@@ -1482,7 +1732,13 @@ func (w *Worker) finalizeDNSError(ctx context.Context, task queue.Result, cause 
 }
 
 // finalizeTaskError — финализация записи без рендера по ошибке класса
-// задачи на последней попытке (T-172, зафиксированное решение): хост
+// задачи на последней попытке (T-172, зафиксированное решение):
+// вызывается из processDelivery после того, как publishFallback (T-238)
+// отказал — фолбэк выключен, чужой стрим потребления, rendered=true либо
+// отказ решения гейта/бюджета (T-239; до его реализации ветка отказа
+// недостижима — заглушка always-publish): движко-зависимая причина при
+// включённом фолбэке публикуется в q:render-fallback вместо
+// финализации. Хост
 // исчерпал доставки (redis.max_attempts) с ошибкой рендера класса task —
 // отказ соединения, load error (isTaskRenderError), — ретраи уже даны,
 // дальше путь только в q:dead; вместо захоронения итогом записи остаётся
@@ -1504,4 +1760,113 @@ func (w *Worker) finalizeTaskError(ctx context.Context, task queue.Result, cause
 		"рендер невозможен: ошибка класса задачи исчерпала доставки — запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
 		"attempts", attempts, "max_attempts", w.opt.MaxAttempts,
 		"err", cause.Error())
+}
+
+// publishFallback — попытка отправить задачу в q:render-fallback вместо
+// финализации записи без рендера (T-238, ТЗ §4.4 п.1/п.5, ФТ-7/8/10):
+// движко-зависимый кандидат (тарпит T-148 или класс задачи T-172 на
+// последней попытке — их общий признак «рендер финализировался бы без
+// результата», ФТ-7) дорабатывается chromium-воркером B (ТЗ §4.5), а
+// первичный воркер НЕ ставит маркер render_failed_at и НЕ публикует
+// q:analyze — и то и другое делает воркер B (успех — renderUpdateSQL
+// с NULL-маркером и публикация q:analyze; исчерпание фолбэка — маркер
+// finalizeNoRender, ФТ-10). Промежуточное состояние записи «ждёт
+// фолбэка» — отсутствие маркера и глубина q:render-fallback, отдельной
+// колонки нет (ТЗ §4.8 — схема БД не меняется, состояние фолбэка живёт
+// в очереди и метриках).
+//
+// Порядок «публикация до XACK» — по образцу связи финализации с
+// публикацией q:analyze (finalizeNoRender: штамп → публикация →
+// подтверждение, сбой любого шага — повтор всей попытки): здесь
+// публикация → подтверждение, сбой публикации — ошибка без маркера и
+// без XACK, доставка вернётся и разыграет попытку заново (запись не
+// менялась — повторять нечего, идемпотентность по построению).
+//
+// Фильтры до публикации:
+//   - Fallback.Enabled (render.fallback.enabled, ФТ-14) и стрим
+//     потребления: публикации идут только из q:render — воркер B (тот
+//     же бинарь на q:render-fallback, ФТ-12) фолбэка не публикует:
+//     рекурсивный фолбэк фолбэка запрещён (ФТ-10), его движко-зависимые
+//     сбои финализируются finalizeNoRender (ТЗ §4.5 п.2);
+//   - строки нет / нет итогового URL — фолбэку нечего дорабатывать:
+//     вызывающий финализирует запись (там тот же штатный отказ);
+//   - строка уже rendered=true (воркер B доработал её между
+//     публикацией и поздним дублем доставки, конкурентный рендер) —
+//     публикация не нужна: дорабатывать нечего, доставка подтверждается
+//     без публикаций (закрывает окно лишнего повторного рендера
+//     воркером B — ревью T-238, P3);
+//   - решение fallbackPublishDecision (кандидат × гейт × бюджет,
+//     ФТ-9): заглушка T-238 — always-publish; отказ решения
+//     (health-гейт/бюджет доли, T-239) — финализация как сегодня
+//     (маркер, ТЗ §4.4 п.3–4);
+//   - фильтр дубля fallbackDedup по идентификатору записи результата
+//     (ключ строки + checked_at эпизода): повторная доставка уже
+//     опубликованной записи (сбой XACK после публикации) не даёт
+//     вторую запись в стриме (ТЗ §4.4 п.5) — доставка подтверждается
+//     без публикаций.
+//
+// Возвраты:
+//   - (true, nil): доставка подтверждается БЕЗ finalizeNoRender —
+//     успешная публикация (+1 метрика
+//     crawler_render_fallback_published_total{reason}), дубль (стрим
+//     уже ждёт запись, метрика не растёт) либо rendered=true (публиковать
+//     нечего);
+//   - (false, nil): публикация не выполнялась (фолбэк выключен / стрим
+//     потребления не q:render / строки нет / решение отказало) —
+//     вызывающий финализирует запись по-сегодняшнему;
+//   - (_, err): сбой чтения строки или публикации — вызывающий
+//     возвращает ошибку: доставка без XACK вернётся (redelivery),
+//     маркера нет, состояние записи не менялось.
+func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause error) (bool, error) {
+	if !w.opt.Fallback.Enabled || w.opt.Stream != queue.StreamRender {
+		return false, nil
+	}
+	target, found, err := w.selectTarget(ctx, task)
+	if err != nil {
+		return false, fmt.Errorf("фолбэк-публикация: чтение строки результата: %w", err)
+	}
+	if !found || target.finalURL == "" {
+		// Фолбэку нечего дорабатывать: вызывающий финализирует запись —
+		// там тот же штатный отказ без публикаций.
+		return false, nil
+	}
+	if target.rendered {
+		// Строка уже отрендерена (воркер B доработал, конкурентный
+		// рендер): фолбэк и финализация не нужны — доставка
+		// подтверждается без публикаций и маркера.
+		w.opt.log().Debug("фолбэк: строка уже отрендерена — публикация не требуется",
+			"zone_id", task.ZoneID, "domain_id", task.DomainID,
+			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
+		return true, nil
+	}
+	cand := fallbackCandidate{task: task, reason: taskFinalizeReason(cause)}
+	if !fallbackPublishDecision(cand, w.opt.Fallback.Gate, w.opt.Fallback.Budget) {
+		return false, nil
+	}
+	key := fallbackDedupKey(task, target.checkedAt)
+	if !w.fbDedup.claim(key) {
+		// Дубль: запись этого эпизода уже в стриме (сбой XACK после
+		// публикации) — вторая запись не нужна (ТЗ §4.4 п.5), доставка
+		// подтверждается.
+		w.opt.log().Debug("фолбэк: запись уже опубликована в q:render-fallback — дубль доставки подтверждается",
+			"zone_id", task.ZoneID, "domain_id", task.DomainID,
+			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
+		return true, nil
+	}
+	// Fresh=true — доработка текущего эпизода, как у финализации и
+	// успешного рендера: воркер B опубликует q:analyze тем же ключом.
+	task.Fresh = true
+	if _, err := w.q.Publish(ctx, queue.StreamRenderFallback, task); err != nil {
+		// Публикация не состоялась: фиксация дубля снимается — иначе
+		// повторная доставка увидела бы «уже опубликована» и потеряла
+		// задачу между фильтром и стримом; маркера нет, XACK не будет —
+		// состояние записи не менялось, повтор разыграет всё заново.
+		w.fbDedup.release(key)
+		return false, fmt.Errorf("фолбэк-публикация q:render-fallback: %w", err)
+	}
+	w.met.FallbackPublished(cand.reason)
+	w.opt.log().Warn("рендер-фолбэк: задача опубликована в q:render-fallback — дорабатывает chromium-воркер B, запись без маркера",
+		"domain", renderLogName(task, target.finalURL), "final_url", target.finalURL,
+		"reason", cand.reason, "err", cause.Error())
+	return true, nil
 }

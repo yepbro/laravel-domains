@@ -6,8 +6,9 @@
 // наращивает HTTP-этап после записи результата; доля — отношением rate
 // в PromQL), тарпит-финализации без рендера (T-148), финализации по
 // постоянной ошибке сертификата хоста (T-159), финализации по DNS-отказу
-// хоста (T-211) и финализации ошибки класса задачи на последней попытке
-// с меткой причины (T-172).
+// хоста (T-211), финализации ошибки класса задачи на последней попытке
+// с меткой причины (T-172) и публикации в очередь фолбэка с меткой
+// причины (T-238, ТЗ §4.6 п.2 — числитель fallback-рейта, ФТ-15).
 package renderworker
 
 import (
@@ -38,6 +39,7 @@ type Metrics struct {
 	certs    prometheus.Counter     // crawler_render_cert_finalized_total (T-159)
 	dns      prometheus.Counter     // crawler_render_dns_finalized_total (T-211)
 	tasksFin *prometheus.CounterVec // crawler_render_task_finalized_total{reason} (T-172)
+	fallback *prometheus.CounterVec // crawler_render_fallback_published_total{reason} (T-238)
 }
 
 // NewMetrics регистрирует приборы этапа в реестре reg (каррированные по
@@ -79,6 +81,10 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		tasksFin: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_task_finalized_total",
 			Help: "Записи, финализированные без рендера по ошибке класса задачи рендера на последней доставке (T-172): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze, в q:dead не попадает. Метка reason — код net::ERR_* (например net::ERR_CONNECTION_REFUSED), timeout или other: состав того, что раньше уносило записи в q:dead.",
+		}, "reason"),
+		fallback: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_render_fallback_published_total",
+			Help: "Задачи, опубликованные в очередь фолбэка q:render-fallback из путей финализации без рендера (T-238, ТЗ 4.4): движко-зависимые причины (тарпит T-148, класс задачи T-172 на последней доставке) дорабатывает chromium-воркер B, запись остаётся без маркера render_failed_at. Метка reason — словарь crawler_render_task_finalized_total (код net::ERR_*, timeout, other); числитель fallback-рейта (ФТ-15).",
 		}, "reason"),
 	}
 }
@@ -145,6 +151,20 @@ func (m *Metrics) TaskFinalized(reason string) {
 		return
 	}
 	m.tasksFin.WithLabelValues(reason).Inc()
+}
+
+// FallbackPublished — задача опубликована в q:render-fallback из пути
+// финализации без рендера (T-238): +1 с меткой причины (словарь
+// taskFinalizeReason — код net::ERR_* / timeout / other, тот же, что у
+// TaskFinalized). Числитель fallback-рейта (ФТ-15: доля публикаций
+// против потока этапа — штатный индикатор здоровья основного движка).
+// Дубль доставки (стрим уже ждёт запись) методом не считается —
+// публикация не выполнялась (publishFallback).
+func (m *Metrics) FallbackPublished(reason string) {
+	if m == nil {
+		return
+	}
+	m.fallback.WithLabelValues(reason).Inc()
 }
 
 // Error — задача рендера не подтверждена (вернётся повторной доставкой):

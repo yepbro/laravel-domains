@@ -23,17 +23,19 @@ func retentionTestNow() time.Time {
 }
 
 // fakePending — источник непотреблённых ключей с заготовленными
-// снимками: render/analyze — последовательности множеств по снимкам
-// (последний повторяется), errFrom — с какого снимка (1-based, снимок
-// считается по обращению к q:render — первый стрим чтения) отвечать
-// ошибкой Redis; 0 — никогда. calls — порядок обращений по стримам.
+// снимками: render/fallback/analyze — последовательности множеств по
+// снимкам (последний повторяется), errFrom — с какого снимка (1-based,
+// снимок считается по обращению к q:render — первый стрим чтения)
+// отвечать ошибкой Redis; 0 — никогда. calls — порядок обращений по
+// стримам.
 type fakePending struct {
-	mu      sync.Mutex
-	render  []map[RetentionPendingKey]struct{}
-	analyze []map[RetentionPendingKey]struct{}
-	errFrom int
-	snap    int
-	calls   []string
+	mu       sync.Mutex
+	render   []map[RetentionPendingKey]struct{}
+	fallback []map[RetentionPendingKey]struct{}
+	analyze  []map[RetentionPendingKey]struct{}
+	errFrom  int
+	snap     int
+	calls    []string
 }
 
 // compile-time: фейк — источник защиты для тестов без Redis.
@@ -50,8 +52,11 @@ func (f *fakePending) PendingKeys(_ context.Context, stream string) (map[Retenti
 		return nil, errors.New("redis недоступен")
 	}
 	seq := &f.analyze
-	if stream == queue.StreamRender {
+	switch stream {
+	case queue.StreamRender:
 		seq = &f.render
+	case queue.StreamRenderFallback:
+		seq = &f.fallback
 	}
 	if len(*seq) == 0 {
 		return map[RetentionPendingKey]struct{}{}, nil
@@ -71,29 +76,36 @@ func pendingKey(zone int16, domain int64, sub, variant int16) map[RetentionPendi
 }
 
 // TestRetentionOnce_PendingExclude — записи, чьи сообщения ждут
-// потребителей q:render/q:analyze, исключаются из чистки, хотя выборка
-// вернула их кандидатами: контент, jsonb и refcount не тронуты; запись,
-// ждущая оба стрима сразу, считается в каждом (наблюдаемость «кто
-// держит»); не-ожидающие записи пачки чистятся штатно.
+// потребителей q:render/q:render-fallback/q:analyze, исключаются из
+// чистки, хотя выборка вернула их кандидатами: контент, jsonb и
+// refcount не тронуты; запись, ждущая несколько стримов сразу,
+// считается в каждом (наблюдаемость «кто держит»); не-ожидающие записи
+// пачки чистятся штатно.
 func TestRetentionOnce_PendingExclude(t *testing.T) {
 	now := retentionTestNow()
 	pool := retentionSeedPool(now)
 	old := now.Add(-2 * DefaultRetention)
-	// Два дополнительных кандидата: (10,1,0) ждёт оба стрима,
-	// (10,2,1) — только q:analyze; чистые кандидаты seed — (10,0,0)
-	// и rendered-запись домена 40.
+	// Три дополнительных кандидата: (10,1,0) ждёт q:render и q:analyze,
+	// (10,2,1) — только q:analyze, (10,3,0) — только q:render-fallback
+	// (запись ушла в фолбэк рендера, T-238: темп воркера B ограничен,
+	// сырой контент нужен при финализации после исчерпания фолбэка);
+	// чистые кандидаты seed — (10,0,0) и rendered-запись домена 40.
 	pool.results = append(pool.results,
 		retentionRow{key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}, checkedAt: old, hash: retentionHash16(0x11), jsonb: true},
 		retentionRow{key: retentionKey{zone: 1, domain: 10, sub: 2, variant: 1}, checkedAt: old, hash: retentionHash16(0x22), jsonb: true},
+		retentionRow{key: retentionKey{zone: 1, domain: 10, sub: 3, variant: 0}, checkedAt: old, hash: retentionHash16(0x33), jsonb: true},
 	)
 	pool.contents[retentionHash(0x11)] = retentionFakeContent{refc: 1, clen: 1000}
 	pool.contents[retentionHash(0x22)] = retentionFakeContent{refc: 1, clen: 1000}
+	pool.contents[retentionHash(0x33)] = retentionFakeContent{refc: 1, clen: 1000}
 
 	opts := retentionDefaultOpts()
-	// Снимок 1 (единственный): (10,1,0) ждёт оба стрима, (10,2,1) — q:analyze.
+	// Снимок 1 (единственный): (10,1,0) ждёт q:render и q:analyze,
+	// (10,2,1) — q:analyze, (10,3,0) — q:render-fallback.
 	opts.Pending = &fakePending{
-		render:  []map[RetentionPendingKey]struct{}{pendingKey(1, 10, 1, 0)},
-		analyze: []map[RetentionPendingKey]struct{}{mergePending(pendingKey(1, 10, 1, 0), pendingKey(1, 10, 2, 1))},
+		render:   []map[RetentionPendingKey]struct{}{pendingKey(1, 10, 1, 0)},
+		fallback: []map[RetentionPendingKey]struct{}{pendingKey(1, 10, 3, 0)},
+		analyze:  []map[RetentionPendingKey]struct{}{mergePending(pendingKey(1, 10, 1, 0), pendingKey(1, 10, 2, 1))},
 	}
 	stats, err := RetentionOnce(context.Background(), pool, opts)
 	if err != nil {
@@ -102,8 +114,9 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 	if stats.Rows != 2 || stats.Refs != 2 {
 		t.Fatalf("stats = %+v, want Rows=Refs=2 (только не-ожидающие: 10 и 40)", stats)
 	}
-	if stats.Deferred[queue.StreamRender] != 1 || stats.Deferred[queue.StreamAnalyze] != 2 {
-		t.Fatalf("Deferred = %v, want q:render=1 (запись 10/1/0), q:analyze=2 (10/1/0 и 10/2/1)", stats.Deferred)
+	if stats.Deferred[queue.StreamRender] != 1 || stats.Deferred[queue.StreamRenderFallback] != 1 ||
+		stats.Deferred[queue.StreamAnalyze] != 2 {
+		t.Fatalf("Deferred = %v, want q:render=1 (10/1/0), q:render-fallback=1 (10/3/0), q:analyze=2 (10/1/0 и 10/2/1)", stats.Deferred)
 	}
 	if stats.Skipped || stats.SkippedPending {
 		t.Fatalf("stats = %+v, want проход без пропусков", stats)
@@ -113,6 +126,7 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 	for _, key := range []retentionKey{
 		{zone: 1, domain: 10, sub: 1, variant: 0},
 		{zone: 1, domain: 10, sub: 2, variant: 1},
+		{zone: 1, domain: 10, sub: 3, variant: 0},
 	} {
 		if r := pool.row(key); r == nil || r.hash == nil || !r.jsonb {
 			t.Errorf("запись %v, ждущая очередей, очищена: %+v", key, r)
@@ -123,6 +137,9 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 	}
 	if _, ok := pool.contents[retentionHash(0x22)]; !ok {
 		t.Error("contents 0x22 (ждёт очередей) удалён")
+	}
+	if _, ok := pool.contents[retentionHash(0x33)]; !ok {
+		t.Error("contents 0x33 (ждёт q:render-fallback) удалён")
 	}
 	// SQL вернул ждущие записи кандидатами — исключение сделала защита.
 	if len(pool.queries) == 0 {
@@ -206,8 +223,8 @@ func TestRetentionOnce_PendingRefresh(t *testing.T) {
 		t.Errorf("запись sub=12 без защиты не очищена")
 	}
 	p := opts.Pending.(*fakePending)
-	if len(p.calls) != 4 {
-		t.Fatalf("обращений к стримам = %v, want 4 (два снимка × q:render+q:analyze)", p.calls)
+	if len(p.calls) != 6 {
+		t.Fatalf("обращений к стримам = %v, want 6 (два снимка × q:render+q:render-fallback+q:analyze)", p.calls)
 	}
 }
 

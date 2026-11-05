@@ -15,7 +15,11 @@
 // контента (§7). Подтверждение q:render — паттерном Processing (XACK
 // только после записи в БД, T-025); повторные доставки идемпотентны
 // (перезапись, ТЗ 3.4). Публикация q:analyze — под гейтом backpressure
-// (WatermarkPublisher, T-026). Перезапуск браузера — менеджер T-065;
+// (WatermarkPublisher, T-026). При включённом render.fallback.enabled
+// (T-238) движко-зависимые финализации (тарпит T-148, класс задачи
+// T-172) публикуются в q:render-fallback вместо маркера — доработка
+// chromium-воркером B (ТЗР этапа 35 §4.4). Перезапуск браузера —
+// менеджер T-065;
 // при недоступном Chromium цикл лишь приостанавливает потребление
 // (зонд Manager.Alive — реконнект и перезапуск делает сам зонд).
 // Каркас — internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz
@@ -242,6 +246,16 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// рендера вместо q:dead — то же значение, что у Reliab выше
 		// (граница захоронения), чтобы политика успевала до перевода.
 		MaxAttempts: cfg.Redis.MaxAttempts,
+		// Фолбэк-публикация (T-238, ТЗ 4.4, ФТ-14): render.fallback.enabled
+		// (T-233) — тарпиты T-148 и класс задачи T-172 на последней
+		// доставке публикуются в q:render-fallback вместо маркера
+		// render_failed_at; false (дефолт) — финализации как сегодня.
+		// Гейт/бюджет решения — T-239, темп воркера B — T-240; воркер B
+		// (стрим q:render-fallback) фолбэк не публикует — рекурсия
+		// запрещена (ФТ-10), проверяется в publishFallback по Stream.
+		Fallback: renderworker.FallbackOptions{
+			Enabled: cfg.Render.Fallback.Enabled,
+		},
 	}
 	w, err := renderworker.New(pool, q, store, manager, opts)
 	if err != nil {

@@ -9,7 +9,12 @@
 //	п. 1  TestAccept01 — add/delete + IDN-зоны без дублей (детали: ingest_test)
 //	п. 2  TestAccept02 — субдомены независимо, варианты/алиасы §5.5 (http_test)
 //	п. 3  TestAccept03 — SPA: DOM и cookies; HTML; дедуп/сжатие; чтение
-//	                     обратно (content_test, render live-тесты)
+//	                     обратно (content_test, render live-тесты);
+//	                     TestAccept03_RenderFallback — сценарий очереди
+//	                     фолбэка рендера (ТЗР этапа 35 §4.4/§4.5, T-238):
+//	                     тарпит основного движка → q:render-fallback без
+//	                     маркера → доработка chromium-воркером B →
+//	                     q:analyze
 //	п. 4  TestAccept04 — анализ версий/score + reanalyze без скачивания
 //	п. 5  TestAccept05 — выборки из laravel_domains/laravel_findings (e2e)
 //	п. 6  TestAccept06 — прогресс зон обновляется автоматически + метрики
@@ -937,6 +942,15 @@ func (r accHTTPRenderer) Run(ctx context.Context, task render.RenderTask) (rende
 	return r.inner.Run(ctx, task)
 }
 
+// accFailRenderer — рендерер, всегда возвращающий заданную ошибку:
+// сценарий сбоя основного движка в приёмочном сценарии фолбэка
+// (тарпит на каждой доставке — TestAccept03_RenderFallback).
+type accFailRenderer struct{ err error }
+
+func (r accFailRenderer) Run(context.Context, render.RenderTask) (render.RenderOutput, error) {
+	return render.RenderOutput{}, r.err
+}
+
 // accChromiumWS — адрес CDP внешнего Chromium (как live-тесты рендера:
 // CRAWLER_RENDER_REMOTE_URL → CHROMIUM_WS_URL → адрес стека).
 func accChromiumWS() string {
@@ -1114,6 +1128,166 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 		// Публикация q:analyze после замены контента (§7).
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore+1 {
 			t.Errorf("q:analyze после рендера: %d, хочу %d (+1)", n, analyzeBefore+1)
+		}
+	})
+}
+
+// TestAccept03_RenderFallback — сценарий очереди фолбэка рендера (ТЗР
+// этапа 35, §4.4/§4.5, ФТ-7/8/10; карта приёмки фолбэка): движко-
+// зависимый сбой основного движка (тарпит T-148 на исчерпании
+// render.timeout_attempts) не финализирует запись маркером, а публикует
+// её в q:render-fallback — запись остаётся rendered=false без
+// render_failed_at и без публикации q:analyze (первичный воркер);
+// chromium-воркер B — тот же бинарь другой сборкой (стрим
+// q:render-fallback, отдельная группа потребителей, ФТ-12) —
+// дорабатывает запись на живом Chromium: rendered=true со сменой
+// content_hash, публикация q:analyze (Fresh). Рекурсивный фолбэк
+// фолбэка запрещён (ФТ-10) — воркер B публикует только q:analyze.
+// Движко-независимые причины (DNS T-207/cert T-159) фолбэка не
+// получают (ФТ-7) — фильтр причин покрыт юнит-тестами
+// (TestRenderWorker_DNSCertNoFallback, internal/renderworker).
+func TestAccept03_RenderFallback(t *testing.T) {
+	skipUnlessIntegration(t)
+	env := newAccEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	// Рендер-конвейер записи (как TestAccept03): SPA-запись публикуется
+	// в q:render живой HTTP-фазой.
+	gate := queue.NewBackpressureGate(env.rdb, queue.BackpressureOptions{})
+	renderQ, err := httpworker.NewRenderQueue(env.q, gate, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := httpworker.NewRenderRecorder(env.pool, env.q, renderQ, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.recorder = rec
+	ids := accPipeline(ctx, t, env, accZone, []string{"spa-shell"})
+
+	analyzeBefore := streamLen(t, env.rdb, queue.StreamAnalyze)
+	before := accRows(t, env.pool, ids["spa-shell"])[0]
+	rawHash := accHash(before.contentHash)
+
+	// Первичный воркер (воркер A): основной движок «виснет» — тарпит на
+	// каждой доставке; фолбэк включён (render.fallback.enabled, T-238).
+	// Клейм укорочен (MinIdle 300 мс): первая доставка возвращает тарпит
+	// ниже лимита (attempts=1 < 2), клейм возвращает с attempts=2 —
+	// публикация в q:render-fallback вместо маркера.
+	tarpit := &render.Error{Class: render.ClassTask, URL: "https://spa.example/",
+		Err: fmt.Errorf("таймаут страницы %s: %w: %w",
+			25*time.Second, context.DeadlineExceeded, errors.New("navigation timeout"))}
+	optsA := renderworker.Options{
+		Stream:          queue.StreamRender,
+		Group:           "acc-render-fb",
+		Consumer:        "acc-fb-a",
+		Concurrency:     1,
+		Consume:         4,
+		TimeoutAttempts: 2,
+		Recover:         queue.NewReliab(env.rdb, env.q, queue.ReliabOptions{MaxAttempts: 3, MinIdle: 300 * time.Millisecond}),
+		RecoverInterval: 200 * time.Millisecond,
+		Fallback:        renderworker.FallbackOptions{Enabled: true},
+	}
+	wA, err := renderworker.New(env.pool, env.q, env.store, accFailRenderer{err: tarpit}, optsA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctxA, cancelA := context.WithCancel(ctx)
+	runADone := make(chan struct{})
+	go func() { defer close(runADone); _ = renderworker.Run(ctxA, wA, optsA) }()
+
+	// Задача ушла в q:render-fallback (первая доставка — ошибка,
+	// клейм с attempts=2 — публикация и XACK).
+	accWaitFor(t, "задача опубликована в q:render-fallback", 30*time.Second, func() bool {
+		return streamLen(t, env.rdb, queue.StreamRenderFallback) == 1
+	})
+	cancelA()
+	<-runADone
+
+	t.Run("первичный воркер: запись ждёт фолбэка без маркера", func(t *testing.T) {
+		row := accRows(t, env.pool, ids["spa-shell"])[0]
+		if row.rendered {
+			t.Error("rendered обязан остаться false — рендера не было")
+		}
+		if accHash(row.contentHash) != rawHash {
+			t.Error("content_hash не должен меняться до доработки воркером B")
+		}
+		var failedAt *time.Time
+		if err := env.pool.QueryRow(ctx,
+			"SELECT render_failed_at FROM subdomain_results WHERE domain_id = $1", ids["spa-shell"],
+		).Scan(&failedAt); err != nil {
+			t.Fatal(err)
+		}
+		if failedAt != nil {
+			t.Error("render_failed_at ставить нельзя — маркер ставит воркер B после исчерпания фолбэка (ФТ-10)")
+		}
+		// q:analyze не публикуется первичным воркером: анализ опубликует
+		// воркер B по итогу доработки (ФТ-10).
+		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore {
+			t.Errorf("q:analyze = %d, хочу %d (без прироста — публикация за воркером B)", n, analyzeBefore)
+		}
+	})
+
+	// Воркер B: тот же бинарь другой сборкой — стрим q:render-fallback,
+	// отдельная группа; живой Chromium дорабатывает запись.
+	browser, err := render.StartBrowser(context.Background(), render.Options{
+		RemoteURL:         accChromiumWS(),
+		Contexts:          1,
+		Timeout:           30 * time.Second,
+		RestartEveryPages: 1000,
+	})
+	if err != nil {
+		t.Fatalf("подключение к Chromium: %v", err)
+	}
+	t.Cleanup(browser.Close)
+	chromePool := render.NewPool(browser)
+	t.Cleanup(chromePool.Close)
+	optsB := renderworker.Options{
+		Stream:          queue.StreamRenderFallback,
+		Group:           "acc-render-fb-b",
+		Consumer:        "acc-fb-b",
+		Concurrency:     1,
+		Consume:         4,
+		Recover:         queue.NewReliab(env.rdb, env.q, queue.ReliabOptions{MaxAttempts: 3, MinIdle: 300 * time.Millisecond}),
+		RecoverInterval: 200 * time.Millisecond,
+		Fallback:        renderworker.FallbackOptions{Enabled: true}, // рекурсия запрещена стримом (ФТ-10)
+	}
+	wB, err := renderworker.New(env.pool, env.q, env.store, accHTTPRenderer{inner: chromePool}, optsB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctxB, cancelB := context.WithCancel(ctx)
+	runBDone := make(chan struct{})
+	go func() { defer close(runBDone); _ = renderworker.Run(ctxB, wB, optsB) }()
+
+	accWaitFor(t, "воркер B отрендерил запись фолбэка", 90*time.Second, func() bool {
+		rows := accRows(t, env.pool, ids["spa-shell"])
+		return len(rows) == 1 && rows[0].rendered
+	})
+	cancelB()
+	<-runBDone
+
+	t.Run("воркер B: DOM записан, q:analyze опубликована", func(t *testing.T) {
+		after := accRows(t, env.pool, ids["spa-shell"])[0]
+		if !after.rendered {
+			t.Fatal("rendered не выставлен — доработка фолбэка не записана")
+		}
+		if accHash(after.contentHash) == rawHash {
+			t.Error("content_hash не изменился — записан сырой HTML вместо DOM")
+		}
+		dom, err := env.store.Get(ctx, accHash(after.contentHash))
+		if err != nil {
+			t.Fatalf("чтение DOM из хранилища: %v", err)
+		}
+		if !strings.Contains(string(dom), "SPA-контент после рендера") {
+			t.Errorf("DOM без контента, нарисованного JS: %.120q", dom)
+		}
+		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore+1 {
+			t.Errorf("q:analyze = %d, хочу %d (+1 — публикация доработки, Fresh)", n, analyzeBefore+1)
+		}
+		if n := streamLen(t, env.rdb, queue.StreamRenderFallback); n != 1 {
+			t.Errorf("q:render-fallback = %d, хочу 1 (рекурсивный фолбэк запрещён, ФТ-10)", n)
 		}
 	})
 }

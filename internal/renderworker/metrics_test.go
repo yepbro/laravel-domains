@@ -62,13 +62,14 @@ func TestMetricsNilSafe(t *testing.T) {
 		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
 	}
 	var m *Metrics
-	m.Task(time.Second)       // no-op, не паникует
-	m.Rendered()              // no-op
-	m.Error(render.ClassTask) // no-op
-	m.TarpitFinalized()       // no-op (T-148)
-	m.CertFinalized()         // no-op (T-159)
-	m.DNSFinalized()          // no-op (T-211)
-	m.TaskFinalized("other")  // no-op (T-172)
+	m.Task(time.Second)            // no-op, не паникует
+	m.Rendered()                   // no-op
+	m.Error(render.ClassTask)      // no-op
+	m.TarpitFinalized()            // no-op (T-148)
+	m.CertFinalized()              // no-op (T-159)
+	m.DNSFinalized()               // no-op (T-211)
+	m.TaskFinalized("other")       // no-op (T-172)
+	m.FallbackPublished("timeout") // no-op (T-238)
 }
 
 func TestMetricsMethods(t *testing.T) {
@@ -87,6 +88,9 @@ func TestMetricsMethods(t *testing.T) {
 	m.TaskFinalized("net::ERR_CONNECTION_REFUSED")
 	m.TaskFinalized("net::ERR_CONNECTION_REFUSED")
 	m.TaskFinalized("other")
+	m.FallbackPublished("timeout")
+	m.FallbackPublished("timeout")
+	m.FallbackPublished("net::ERR_CONNECTION_REFUSED")
 
 	stage := map[string]string{"stage": metrics.StageRender}
 	if got := rwMetricValue(t, reg, "crawler_stage_tasks_total", stage); got != 2 {
@@ -114,6 +118,15 @@ func TestMetricsMethods(t *testing.T) {
 	} {
 		if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", map[string]string{"reason": reason}); got != want {
 			t.Errorf("crawler_render_task_finalized_total{reason=%s} = %v, want %v", reason, got, want)
+		}
+	}
+	for reason, want := range map[string]float64{
+		"timeout":                     2,
+		"net::ERR_CONNECTION_REFUSED": 1,
+		"other":                       -1, // нет серии
+	} {
+		if got := rwMetricValue(t, reg, "crawler_render_fallback_published_total", map[string]string{"reason": reason}); got != want {
+			t.Errorf("crawler_render_fallback_published_total{reason=%s} = %v, want %v", reason, got, want)
 		}
 	}
 	for typ, want := range map[string]float64{
