@@ -3,7 +3,9 @@
 // по классам render.Class, ветка rendered=true доли рендера), метка
 // engine движка сборки на доле рендера и финализациях класса задачи
 // (T-235), инкременты в типовом пути processDelivery — на фейках пула,
-// хранилища, рендера и очереди из worker_test.go.
+// хранилища, рендера и очереди из worker_test.go; потребление фолбэка
+// с меткой исхода (T-245) — точки проводки воркера B покрыты
+// TestRenderWorker_FallbackConsumedMetrics (fallback_test.go).
 package renderworker
 
 import (
@@ -64,16 +66,17 @@ func TestMetricsNilSafe(t *testing.T) {
 		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
 	}
 	var m *Metrics
-	m.Task(time.Second)                 // no-op, не паникует
-	m.Rendered()                        // no-op
-	m.Error(render.ClassTask)           // no-op
-	m.TarpitFinalized()                 // no-op (T-148)
-	m.CertFinalized()                   // no-op (T-159)
-	m.DNSFinalized()                    // no-op (T-211)
-	m.TaskFinalized("other")            // no-op (T-172)
-	m.FallbackPublished("timeout")      // no-op (T-238)
-	m.FallbackSuspended(fbReasonGate)   // no-op (T-239)
-	m.FallbackSuspended(fbReasonBudget) // no-op (T-239)
+	m.Task(time.Second)                  // no-op, не паникует
+	m.Rendered()                         // no-op
+	m.Error(render.ClassTask)            // no-op
+	m.TarpitFinalized()                  // no-op (T-148)
+	m.CertFinalized()                    // no-op (T-159)
+	m.DNSFinalized()                     // no-op (T-211)
+	m.TaskFinalized("other")             // no-op (T-172)
+	m.FallbackPublished("timeout")       // no-op (T-238)
+	m.FallbackSuspended(fbReasonGate)    // no-op (T-239)
+	m.FallbackSuspended(fbReasonBudget)  // no-op (T-239)
+	m.FallbackConsumed(fbResultRendered) // no-op (T-245)
 }
 
 func TestMetricsMethods(t *testing.T) {
@@ -98,6 +101,10 @@ func TestMetricsMethods(t *testing.T) {
 	m.FallbackSuspended(fbReasonGate)
 	m.FallbackSuspended(fbReasonBudget)
 	m.FallbackSuspended(fbReasonBudget)
+	m.FallbackConsumed(fbResultRendered)
+	m.FallbackConsumed(fbResultRendered)
+	m.FallbackConsumed(fbResultFinalized)
+	m.FallbackConsumed(fbResultSkipped)
 
 	stage := map[string]string{"stage": metrics.StageRender}
 	if got := rwMetricValue(t, reg, "crawler_stage_tasks_total", stage); got != 2 {
@@ -155,6 +162,19 @@ func TestMetricsMethods(t *testing.T) {
 	} {
 		if got := rwMetricValue(t, reg, "crawler_render_fallback_suspended_total", map[string]string{"reason": reason}); got != want {
 			t.Errorf("crawler_render_fallback_suspended_total{reason=%s} = %v, want %v", reason, got, want)
+		}
+	}
+	// Потребление фолбэка (T-245): исходы rendered|finalized|skipped —
+	// замкнутый словарь, иных серий нет (считает сборка воркера B,
+	// проводка — TestRenderWorker_FallbackConsumedMetrics).
+	for result, want := range map[string]float64{
+		fbResultRendered:  2,
+		fbResultFinalized: 1,
+		fbResultSkipped:   1,
+		"other":           -1,
+	} {
+		if got := rwMetricValue(t, reg, "crawler_render_fallback_consumed_total", map[string]string{"result": result}); got != want {
+			t.Errorf("crawler_render_fallback_consumed_total{result=%s} = %v, want %v", result, got, want)
 		}
 	}
 	for typ, want := range map[string]float64{

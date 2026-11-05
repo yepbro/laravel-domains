@@ -18,8 +18,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"crawler/internal/metrics"
 	"crawler/internal/queue"
+	"crawler/internal/render"
 )
 
 // newRWFallbackFixture — фикстура с включённым фолбэком
@@ -510,4 +513,163 @@ func TestRenderWorker_FallbackDedupKey(t *testing.T) {
 	if fallbackDedupKey(rwTask, ts) == fallbackDedupKey(rwTask, time.Time{}) {
 		t.Error("нулевой checked_at — тоже значение идентификатора (не совпадает)")
 	}
+}
+
+// TestRenderWorker_FallbackConsumedMetrics — учёт потребления фолбэка
+// воркером B (T-245, ТЗ §4.6 п.2, ФТ-15): счётчик
+// crawler_render_fallback_consumed_total растёт только у сборки со
+// стримом q:render-fallback (Options.Stream, ФТ-12) и только на
+// подтверждаемых доставках — по исходам: rendered (успешная доработка:
+// DOM записан, q:analyze), finalized (финализация с маркером —
+// исчерпание фолбэка, ФТ-10), skipped (строки нет — без побочных
+// эффектов). Основная сборка (q:render) счётчик не трогает: серий нет —
+// потребление фолбэка учитывает только дорабатывающий воркер. Баланс
+// published = consumed + остаток q:render-fallback — шаг 4 приёмки
+// ТЗ §6.2 (интеграционная сверка — TestAccept03_RenderFallback).
+func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
+	// consumedSeries — значение серии исхода (-1 — серии нет).
+	consumedSeries := func(t *testing.T, g prometheus.Gatherer, result string) float64 {
+		t.Helper()
+		return rwMetricValue(t, g, "crawler_render_fallback_consumed_total", map[string]string{"result": result})
+	}
+
+	t.Run("успех доработки — rendered", func(t *testing.T) {
+		f := newRWFixture(t)
+		reg := metrics.New("render-fallback-worker")
+		var err error
+		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
+			Stream:  queue.StreamRenderFallback, // сборка воркера B (T-236)
+			Metrics: reg,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		raw := rwTestHash(1)
+		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+		f.renderer.output = rwOutput("<html><body>dom</body></html>")
+
+		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
+			t.Fatalf("processDelivery: %v", err)
+		}
+		if got := consumedSeries(t, reg, fbResultRendered); got != 1 {
+			t.Errorf("crawler_render_fallback_consumed_total{rendered} = %v, want 1", got)
+		}
+		for _, result := range []string{fbResultFinalized, fbResultSkipped} {
+			if got := consumedSeries(t, reg, result); got != -1 {
+				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want -1 (серии нет)", result, got)
+			}
+		}
+	})
+
+	t.Run("исчерпание фолбэка — finalized", func(t *testing.T) {
+		f := newRWFixture(t)
+		reg := metrics.New("render-fallback-worker")
+		var err error
+		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
+			Stream:  queue.StreamRenderFallback, // сборка воркера B (T-236)
+			Metrics: reg,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		raw := rwTestHash(1)
+		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+		f.renderer.err = rwTarpitErr("https://spa.example/")
+
+		// Тарпит на исчерпании: воркер B не публикует рекурсивный фолбэк
+		// (ФТ-10) — финализация с маркером (TestRenderWorker_
+		// FallbackNoRecursionWorkerB) = потребление finalized.
+		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
+			t.Fatalf("processDelivery: %v", err)
+		}
+		// Cert-класс — другой вызов fbConsume в processDelivery (та же
+		// семантика finalized, путь T-159 с первой доставки).
+		f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CERT_AUTHORITY_INVALID")
+		if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 1); err != nil {
+			t.Fatalf("processDelivery (cert): %v", err)
+		}
+		if got := consumedSeries(t, reg, fbResultFinalized); got != 2 {
+			t.Errorf("crawler_render_fallback_consumed_total{finalized} = %v, want 2 (тарпит + cert)", got)
+		}
+		if got := consumedSeries(t, reg, fbResultRendered); got != -1 {
+			t.Errorf("crawler_render_fallback_consumed_total{rendered} = %v, want -1 (серии нет)", got)
+		}
+	})
+
+	t.Run("ошибка доставки не считается — серия не создаётся", func(t *testing.T) {
+		f := newRWFixture(t)
+		reg := metrics.New("render-fallback-worker")
+		var err error
+		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
+			Stream:  queue.StreamRenderFallback, // сборка воркера B (T-236)
+			Metrics: reg,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		raw := rwTestHash(1)
+		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+		// Класс браузера (движок недоступен) — инфраструктурная ошибка:
+		// доставка без XACK остаётся в PEL (клейм/bury — очередь),
+		// потреблением не считается — ключевой инвариант баланса
+		// published = consumed + остаток (шаг 4 приёмки ТЗ §6.2).
+		f.renderer.err = &render.Error{Class: render.ClassBrowser, URL: "https://spa.example/",
+			Err: errors.New("chromium недоступен")}
+
+		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err == nil {
+			t.Fatal("ошибка класса браузера — ошибка доставки (повторная доставка), не успех")
+		}
+		for _, result := range []string{fbResultRendered, fbResultFinalized, fbResultSkipped} {
+			if got := consumedSeries(t, reg, result); got != -1 {
+				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want -1 (ошибочная доставка не считается)", result, got)
+			}
+		}
+	})
+
+	t.Run("строки нет — skipped", func(t *testing.T) {
+		f := newRWFixture(t)
+		reg := metrics.New("render-fallback-worker")
+		var err error
+		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
+			Stream:  queue.StreamRenderFallback, // сборка воркера B (T-236)
+			Metrics: reg,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		// Строку не сеем: перепроверка переписала эпизод между публикацией
+		// и потреблением — доставка подтверждается без рендера и маркера,
+		// но потреблением считается (баланс не расходится).
+		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
+			t.Fatalf("processDelivery: %v", err)
+		}
+		if got := consumedSeries(t, reg, fbResultSkipped); got != 1 {
+			t.Errorf("crawler_render_fallback_consumed_total{skipped} = %v, want 1", got)
+		}
+	})
+
+	t.Run("основная сборка (q:render) потребление не считает", func(t *testing.T) {
+		f := newRWFixture(t)
+		reg := metrics.New("render-worker")
+		var err error
+		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
+			// Stream — дефолт q:render (основная сборка).
+			Metrics: reg,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		raw := rwTestHash(1)
+		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+		f.renderer.output = rwOutput("<html><body>dom</body></html>")
+
+		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
+			t.Fatalf("processDelivery: %v", err)
+		}
+		for _, result := range []string{fbResultRendered, fbResultFinalized, fbResultSkipped} {
+			if got := consumedSeries(t, reg, result); got != -1 {
+				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want -1 (считает только воркер B)", result, got)
+			}
+		}
+	})
 }

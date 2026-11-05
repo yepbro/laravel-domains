@@ -632,6 +632,20 @@ SELECT строки (final_url, content_hash)
   (одно на защёлкивание; материал алертов ТЗР §4.6 п.3). Наблюдаемость
   публикаций — `crawler_render_fallback_published_total{reason}`
   (словарь `taskFinalizeReason`: код `net::ERR_*`, `timeout`, `other`).
+  Потребление — `crawler_render_fallback_consumed_total{result}`
+  (T-245, только сборка воркера B: `rendered` — доработка успешна,
+  `finalized` — исчерпание фолбэка, запись закрыта путём финализации
+  (маркер `render_failed_at`, пока строка принадлежит эпизоду), `skipped`
+  — строка ушла из-под задачи (строки нет, без итогового URL, охрана
+  UPDATE отсекла) — доставка закрыта без побочных эффектов).
+  Баланс-чек шага 4 приёмки ТЗР §6.2:
+  `increase(published) = increase(consumed) + crawler_queue_depth
+  {queue="q:render-fallback"} + increase(crawler_queue_dead_buried_total
+  {queue="q:render-fallback"})` (глубина — коллектор сборки B:
+  непрочитанный лаг + PEL; похороненные — ошибки классов
+  браузера/инфраструктуры на исчерпании попыток), сверка по приростам
+  между рестартами, при дренированной очереди остаток нулевой;
+  формула и границы применимости — docs/services.md.
 - **Маркер «рендер невозможен» `render_failed_at`** (T-210, миграция
   000017): все четыре финализации выше штампуют запись — финализированная
   без рендера строка навсегда `rendered = false` и до маркера была

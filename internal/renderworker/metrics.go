@@ -10,7 +10,10 @@
 // с меткой причины (T-172), публикации в очередь фолбэка с меткой
 // причины (T-238, ТЗ §4.6 п.2 — числитель fallback-рейта, ФТ-15),
 // события приостановки фолбэк-публикации с меткой причины gate|budget
-// (T-239, ФТ-9, ТЗ §4.6 п.2) и
+// (T-239, ФТ-9, ТЗ §4.6 п.2), потребление фолбэка воркером B с меткой
+// исхода rendered|finalized|skipped (T-245, ТЗ §4.6 п.2, ФТ-11/ФТ-15 —
+// баланс published = consumed + остаток q:render-fallback, шаг 4
+// приёмки ТЗ §6.2) и
 // метка движка engine на доле рендера и финализациях класса задачи
 // (T-235, ТЗ §4.6 п.1, ФТ-15: кардинальность 3 — chromium/moli/
 // lightpanda, значение — движок сборки воркера, Options.Engine ←
@@ -40,6 +43,23 @@ const (
 	fbReasonBudget = "budget"
 )
 
+// Словарь исходов потребления фолбэка (T-245, ФТ-15): метка result
+// счётчика crawler_render_fallback_consumed_total — чем закончилась
+// доставка q:render-fallback у воркера B.
+const (
+	// fbResultRendered — доработка успешна (ТЗ §4.5 п.2): DOM записан,
+	// rendered = true, публикация q:analyze.
+	fbResultRendered = "rendered"
+	// fbResultFinalized — фолбэк исчерпан (ФТ-10): запись финализирована
+	// с маркером render_failed_at, публикация q:analyze (пути тарпита
+	// T-148 / класса задачи T-172 / cert T-159 / DNS T-211 воркера B).
+	fbResultFinalized = "finalized"
+	// fbResultSkipped — штатный отказ без побочных эффектов: строки нет
+	// или без итогового URL (перепроверка переписала эпизод) — доставка
+	// подтверждается без рендера и маркера.
+	fbResultSkipped = "skipped"
+)
+
 // renderSecondsBuckets — корзины длительности задачи рендера: страница
 // рендерится в изолированном контексте с ожиданием готовности до
 // render.timeout (по умолчанию 25 с, ТЗ 5.6/5.10), быстрые статические
@@ -61,6 +81,7 @@ type Metrics struct {
 	tasksFin *prometheus.CounterVec // crawler_render_task_finalized_total{reason,engine} (T-172/T-235)
 	fallback *prometheus.CounterVec // crawler_render_fallback_published_total{reason} (T-238)
 	suspend  *prometheus.CounterVec // crawler_render_fallback_suspended_total{reason} (T-239)
+	consumed *prometheus.CounterVec // crawler_render_fallback_consumed_total{result} (T-245)
 	engine   string                 // значение метки engine — движок сборки воркера (T-235)
 }
 
@@ -125,6 +146,10 @@ func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 			Name: "crawler_render_fallback_suspended_total",
 			Help: "События приостановки фолбэк-публикации (T-239, ФТ-9), не состояние — каждое защёлкивание одна точка: reason=gate — health-гейт, стрик инфра-ошибок класса браузера (основной движок недоступен) достиг render.fallback.health_gate_streak, публикация приостановлена до восстановления (успешный рендер обнуляет стрик; ошибки классов задачи/контекста стрик не трогают); reason=budget — бюджет доли, доля публикаций за окно в 1000 доставок этапа ушла за потолок render.fallback.share_percent, следующее окно без публикаций. Пока приостановка держится, кандидаты фолбэка финализируются штатно с маркером render_failed_at (как при выключенном фолбэке); browser-класс ждёт в redelivery q:render в пределах окна ретраев redis.max_attempts. Рост — сигнал деградации основного движка (алерты ТЗ 4.6 п.3).",
 		}, "reason"),
+		consumed: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_render_fallback_consumed_total",
+			Help: "Задачи q:render-fallback, потреблённые chromium-воркером B (T-245, ТЗ 4.5/4.6 п.2, ФТ-11/ФТ-15), по исходу доставки, завершившейся обработкой без ошибки: result=rendered — доработка успешна (DOM записан, rendered=true, публикация q:analyze, ТЗ 4.5 п.2); result=finalized — фолбэк исчерпан, запись закрыта путём финализации (маркер render_failed_at + публикация q:analyze, ФТ-10: пути тарпита T-148 / класса задачи T-172 / cert T-159 / DNS T-211; маркер ставится, пока строка принадлежит эпизоду — гонка с перепроверкой T-058 закрывает запись без маркера); result=skipped — штатный отказ без побочных эффектов (строки нет, без итогового URL или охрана UPDATE отсекла — строка ушла из-под задачи). Счёт — в обработчике до XACK уровнем очереди: сбой Ack или повторная доставка дают дубль — допуск единиц at-least-once (как у окна бюджета T-239); ошибочные доставки не считаются — живут в PEL до клейма либо bury в q:dead. Баланс-чек приёмки (ТЗ 6.2 п.4): crawler_render_fallback_published_total (воркер A, T-238) = сумма этого счётчика + остаток q:render-fallback — crawler_queue_depth{queue=\"q:render-fallback\"} воркера B (backlog группы: непрочитанный лаг + PEL; держится до потолка MAXLEN стрима) + increase(crawler_queue_dead_buried_total{queue=\"q:render-fallback\"}). Считает только сборка воркера B (Options.Stream = q:render-fallback, ФТ-12): у основной сборки серии не создаются.",
+		}, "result"),
 	}
 }
 
@@ -220,6 +245,24 @@ func (m *Metrics) FallbackSuspended(reason string) {
 		return
 	}
 	m.suspend.WithLabelValues(reason).Inc()
+}
+
+// FallbackConsumed — доставка q:render-fallback обработана воркером B
+// без ошибки (T-245, ТЗ §4.6 п.2, ФТ-15): +1 с меткой исхода (замкнутый
+// словарь fbResult*): rendered — доработка успешна, finalized — запись
+// закрыта путём финализации после исчерпания фолбэка (ФТ-10), skipped —
+// штатный отказ без побочных эффектов. Знаменатель баланса published =
+// consumed + остаток q:render-fallback + похороненные в q:dead (шаг 4
+// приёмки ТЗ §6.2): доставка без ошибки уходит из PEL стрима XACK'ом
+// уровнем очереди (счёт до него — дубль от сбоя XACK допустим, единицы
+// at-least-once), ошибочная — живёт в PEL до клейма либо bury (в баланс
+// — членом crawler_queue_dead_buried_total). Вызывает только сборка
+// воркера B (Options.Stream = q:render-fallback, worker.fbConsume).
+func (m *Metrics) FallbackConsumed(result string) {
+	if m == nil {
+		return
+	}
+	m.consumed.WithLabelValues(result).Inc()
 }
 
 // Error — задача рендера не подтверждена (вернётся повторной доставкой):

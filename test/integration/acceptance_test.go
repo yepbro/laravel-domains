@@ -53,6 +53,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 
 	"crawler/internal/analyzer"
@@ -64,6 +65,7 @@ import (
 	"crawler/internal/httpworker"
 	"crawler/internal/idn"
 	"crawler/internal/ingest"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 	"crawler/internal/monitor"
 	"crawler/internal/queue"
@@ -586,6 +588,48 @@ func accWaitFor(t *testing.T, what string, deadline time.Duration, ready func() 
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// accCounterSum — сумма counter-серий метрики name из реестра g
+// (метрика с метками — все серии; метки-фильтр парами «имя, значение»
+// ограничивает сумму одной серией). Баланс-чек фолбэка T-245 читает
+// счётчики published/consumed тем же Gather, что скрейпит Prometheus.
+func accCounterSum(t *testing.T, g prometheus.Gatherer, name string, label ...string) float64 {
+	t.Helper()
+	if len(label)%2 != 0 {
+		t.Fatalf("accCounterSum: метки-фильтр парами «имя, значение», получили %d", len(label))
+	}
+	filter := map[string]string{}
+	for i := 0; i < len(label); i += 2 {
+		filter[label[i]] = label[i+1]
+	}
+	families, err := g.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	var sum float64
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+	series:
+		for _, m := range mf.GetMetric() {
+			for lv, want := range filter {
+				found := false
+				for _, l := range m.GetLabel() {
+					if l.GetName() == lv && l.GetValue() == want {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue series
+				}
+			}
+			sum += m.GetCounter().GetValue()
+		}
+	}
+	return sum
 }
 
 // ---------------------------------------------------------------- п. 1
@@ -1178,6 +1222,11 @@ func TestAccept03_RenderFallback(t *testing.T) {
 	tarpit := &render.Error{Class: render.ClassTask, URL: "https://spa.example/",
 		Err: fmt.Errorf("таймаут страницы %s: %w: %w",
 			25*time.Second, context.DeadlineExceeded, errors.New("navigation timeout"))}
+	// Реестры приборов обеих сборок (T-245): published считает воркер A,
+	// consumed — воркер B; сверка баланса — последним блоком теста
+	// (шаг 4 приёмки ТЗ §6.2).
+	regA := metrics.New("acc-render-fb-a")
+	regB := metrics.New("acc-render-fb-b")
 	optsA := renderworker.Options{
 		Stream:          queue.StreamRender,
 		Group:           "acc-render-fb",
@@ -1188,6 +1237,7 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		Recover:         queue.NewReliab(env.rdb, env.q, queue.ReliabOptions{MaxAttempts: 3, MinIdle: 300 * time.Millisecond}),
 		RecoverInterval: 200 * time.Millisecond,
 		Fallback:        renderworker.FallbackOptions{Enabled: true},
+		Metrics:         regA,
 	}
 	wA, err := renderworker.New(env.pool, env.q, env.store, accFailRenderer{err: tarpit}, optsA)
 	if err != nil {
@@ -1252,6 +1302,7 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		Recover:         queue.NewReliab(env.rdb, env.q, queue.ReliabOptions{MaxAttempts: 3, MinIdle: 300 * time.Millisecond}),
 		RecoverInterval: 200 * time.Millisecond,
 		Fallback:        renderworker.FallbackOptions{Enabled: true}, // рекурсия запрещена стримом (ФТ-10)
+		Metrics:         regB,                                        // потребление фолбэка — счётчик сборки B (T-245)
 	}
 	wB, err := renderworker.New(env.pool, env.q, env.store, accHTTPRenderer{inner: chromePool}, optsB)
 	if err != nil {
@@ -1264,6 +1315,13 @@ func TestAccept03_RenderFallback(t *testing.T) {
 	accWaitFor(t, "воркер B отрендерил запись фолбэка", 90*time.Second, func() bool {
 		rows := accRows(t, env.pool, ids["spa-shell"])
 		return len(rows) == 1 && rows[0].rendered
+	})
+	// Дождаться подтверждения доставки (XACK после записи и публикации):
+	// баланс-блок ниже читает PEL группы и глубину стрима — отмена ctx
+	// воркера B в окне «коммит строки → XACK» оставляла бы запись в PEL
+	// и флакала сверку (ревью T-245).
+	accWaitFor(t, "воркер B подтвердил доставку фолбэка (XACK)", 30*time.Second, func() bool {
+		return pendingCount(t, env.rdb, queue.StreamRenderFallback, "acc-render-fb-b") == 0
 	})
 	cancelB()
 	<-runBDone
@@ -1288,6 +1346,41 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		}
 		if n := streamLen(t, env.rdb, queue.StreamRenderFallback); n != 1 {
 			t.Errorf("q:render-fallback = %d, хочу 1 (рекурсивный фолбэк запрещён, ФТ-10)", n)
+		}
+	})
+
+	// Баланс-чек фолбэка (T-245, шаг 4 приёмки ТЗ §6.2, ФТ-11):
+	// опубликованное воркером A равно потреблённому воркером B плюс
+	// остатку очереди. Инструментарий — те же приборы, что в бою:
+	// published/consumed — счётчики сборок, остаток — глубина стрима
+	// crawler_queue_depth (BackpressureGate.Len: min(lag, XLEN) + PEL по
+	// группам), её PEL-часть — прямой XPENDING группы сборки B. Сценарий
+	// доработан до конца — остаток 0, расхождений 0.
+	t.Run("баланс: published = consumed + остаток q:render-fallback", func(t *testing.T) {
+		published := accCounterSum(t, regA, "crawler_render_fallback_published_total")
+		if published != 1 {
+			t.Fatalf("published = %v, хочу 1 (одна публикация тарпита)", published)
+		}
+		consumed := accCounterSum(t, regB, "crawler_render_fallback_consumed_total")
+		if consumed != 1 {
+			t.Fatalf("consumed = %v, хочу 1 (одна доработка воркером B)", consumed)
+		}
+		if got := accCounterSum(t, regB, "crawler_render_fallback_consumed_total", "result", "rendered"); got != 1 {
+			t.Errorf("consumed{rendered} = %v, хочу 1 (исход доработки — успех)", got)
+		}
+		depth, err := gate.Len(ctx, queue.StreamRenderFallback)
+		if err != nil {
+			t.Fatalf("глубина q:render-fallback (crawler_queue_depth): %v", err)
+		}
+		if pel := pendingCount(t, env.rdb, queue.StreamRenderFallback, "acc-render-fb-b"); pel != 0 {
+			t.Errorf("остаток PEL группы воркера B = %d, хочу 0 (доставка подтверждена)", pel)
+		}
+		if diff := published - consumed - float64(depth); diff != 0 {
+			t.Errorf("баланс фолбэка: published(%v) != consumed(%v) + остаток(%d), расхождение %v", published, consumed, depth, diff)
+		}
+		// Сборка A ничего не потребляла: серий consumed в её реестре нет.
+		if got := accCounterSum(t, regA, "crawler_render_fallback_consumed_total"); got != 0 {
+			t.Errorf("consumed у основной сборки = %v, хочу 0 (считает только воркер B)", got)
 		}
 	})
 }

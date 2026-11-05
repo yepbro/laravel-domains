@@ -194,6 +194,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_render_task_finalized_total` | counter | `reason`, `engine` | render-worker (T-172) | запись финализирована без рендера по ошибке класса задачи рендера (отказ соединения, load error — свойство хоста) на последней доставке `redis.max_attempts`: итог — сырой HTML HTTP-фазы, штамп `render_failed_at` (T-210), публикация q:analyze, XACK; метка reason — код `net::ERR_*` (например `net::ERR_CONNECTION_REFUSED`), `timeout` или `other`: состав того, что раньше уносило записи в q:dead; метка `engine` (T-235, ФТ-15) — движок рендера сборки воркера (`render.engine`, chromium/moli/lightpanda), агрегации без `engine` не меняются |
 | `crawler_render_fallback_published_total` | counter | `reason` | render-worker (T-238) | задача опубликована в очередь фолбэка `q:render-fallback` из пути финализации без рендера (движко-зависимые причины — тарпит T-148, класс задачи T-172 на последней доставке — при включённом `render.fallback.enabled`): запись остаётся без маркера `render_failed_at`, дорабатывает chromium-воркер B; метка reason — тот же словарь `net::ERR_*`/`timeout`/`other`, числитель fallback-рейта (ФТ-15); дубль доставки не считается (публикация не выполнялась) |
 | `crawler_render_fallback_suspended_total` | counter | `reason` | render-worker (T-239) | события приостановки фолбэк-публикации (ФТ-9), одно на защёлкивание, не состояние: `gate` — health-гейт, стрик инфра-ошибок класса браузера (основной движок недоступен) с последнего успешного рендера достиг `render.fallback.health_gate_streak`, публикация приостановлена до восстановления (успех обнуляет стрик; ошибки классов задачи/контекста стрик не трогают); `budget` — доля публикаций за окно в 1000 подтверждённых доставок ушла за потолок `render.fallback.share_percent`, следующее окно без публикаций (самовозврат по закрытии). Пока приостановка держится, кандидаты фолбэка финализируются штатно с маркером `render_failed_at` (как при выключенном фолбэке) — задачи не теряются; рост — сигнал деградации основного движка (алерты ТЗ 4.6 п.3) |
+| `crawler_render_fallback_consumed_total` | counter | `result` | render-worker, сборка воркера B (T-245) | задачи `q:render-fallback`, потреблённые chromium-воркером B (стрим потребления `RENDER_WORKER_STREAM=q:render-fallback`), по исходу доставки, завершившейся обработкой без ошибки: `rendered` — доработка успешна (DOM записан, `rendered=true`, публикация q:analyze); `finalized` — фолбэк исчерпан, запись закрыта путём финализации (маркер `render_failed_at` + q:analyze, ФТ-10: маркер ставит воркер B, не первичный; пути тарпита T-148 / класса задачи T-172 / cert T-159 / DNS T-211 — маркер кладётся, пока строка принадлежит эпизоду, гонка с перепроверкой T-058 закрывает запись без маркера); `skipped` — штатный отказ без побочных эффектов (строки нет, без итогового URL или охрана UPDATE отсекла — строка ушла из-под задачи). Счёт — до XACK уровнем очереди: сбой Ack/дубль доставки дают дубль (допуск единиц at-least-once, как у окна бюджета T-239); ошибочные доставки не считаются — живут в PEL до клейма либо bury в q:dead; основная сборка q:render серий не создаёт. Знаменатель баланс-чека приёмки (ТЗР рендера §6.2 п.4) — см. строку `crawler_queue_depth` |
 | `crawler_ingest_bad_hashes_total` | counter | — | ingest | итог каждого прохода CleanupDeleted (хук `CleanupOptions.OnPass`, T-099): удалённые результаты с `content_hash` неверной длины; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056) |
 | `crawler_content_retention_rows_total` / `_refs_total` / `_contents_total` / `_freed_bytes_total` | counter | — | http-worker (T-166) | итог каждого прохода RetentionLoop (хук `RetentionOptions.OnPass`): строки `subdomain_results`, очищенные от контента/jsonb, срезанные ссылки `content_hash`, удалённые строки `contents` и их сжатые байты (место физически возвращает компактификация паков T-045 — сходимость видно по `disk_avail`); останов роста при работающем цикле = candidates кончились (плато) |
 | `crawler_content_retention_skips_total` | counter | — | http-worker (T-166) | пропуски прохода по интерлоку: глубина q:analyze у порога `content.retention_analyze_watermark` — анализатор не успевает, тела и headers/cookies ещё нужны; рост = анализ отстаёт, диск продолжает расти |
@@ -211,7 +212,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_unit_memory_high_events` | gauge | `unit` | monitor (T-162) | тот же проход, что unit_oom: счётчик memory.events high (попадания за мягкий потолок MemoryHigh — троттлинг reclaim'ом); накапливается за жизнь cgroup, осмыслен рост — алерт `memory_high` при росте ≥2 проходов подряд (T-162: предвестник фаталов http-worker, T-157) |
 | `crawler_psi_cpu_some_percent` | gauge | `kind` | monitor (T-162) | проход алертов: some-доля времени задержки CPU из `/proc/pressure/cpu` хоста (kind=avg10/avg60/avg300); устойчивый avg300 >90 % — голод планировщика (алерт `psi_cpu`, T-162), ядро без PSI — ряда нет |
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
-| `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`) |
+| `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`; сборка воркера B фолбэка — `q:render-fallback`, T-236/T-240), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`); ряд `queue="q:render-fallback"` — остаток для баланс-чека фолбэка (T-245: `published = consumed + остаток + похороненные` — формула и границы применимости в решениях ниже, шаг 4 приёмки ТЗР рендера §6.2) |
 | `crawler_render_pending_domains` | gauge | — | monitor (T-175) | цикл рендер-долга (`monitor.render_debt_interval`, 5 мин): домены с битом `render_pending` — счётчик `crawler_counters['render_pending']` (миграция 000015) ведут переходы бита в транзакции перехода; авторитетное значение периодически перезаписывает реконсиляция T-178 (наблюдаемость без seq scan по 41,8 млн строк; лаг `q:render` — `crawler_queue_depth{queue="q:render"}`, долг = сумма — алерт `render_debt` и строка отчёта нагрузки T-173) |
 | `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод записи в q:dead (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
 | `crawler_redis_memory_ratio` | gauge | — | monitor (T-154) | проход алертов: `used_memory/maxmemory` из `INFO memory` (обёртка источника `monitor.NewRedisMemoryMetrics`); при noeviction — прокси-метрика предстоящих OOM-отказов записи (алерт `redis_memory` при ≥ 0.8); `maxmemory` не задан — ряд не пишется |
@@ -247,6 +248,36 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
   подсветкой дашборда (T-126/T-144) и алертом `queue_dead`;
   до появления наблюдателя глубину показывал только `crawlerctl
   status` (T-079).
+- **Остаток фолбэк-очереди для баланс-чека** (T-245, ТЗР рендера §6.2
+  п.4) снимается существующим механизмом глубины, отдельной метрики PEL
+  не вводится: сборка воркера B потребляет `q:render-fallback` — её
+  коллектор уже публикует `crawler_queue_depth{queue="q:render-fallback"}`
+  (backlog группы: непрочитанный лаг + PEL неподтверждённых доставок),
+  а именно эта сумма и есть остаток уравнения приёмки — PEL без лага
+  занижал бы остаток на ещё не прочитанное. Полное уравнение шага 4:
+
+  `increase(crawler_render_fallback_published_total)` (воркер A, T-238)
+  = `increase(crawler_render_fallback_consumed_total)` (воркер B, T-245)
+  + `crawler_queue_depth{queue="q:render-fallback"}`
+  + `increase(crawler_queue_dead_buried_total{queue="q:render-fallback"})`
+  — последний член: ошибочные доставки (класс браузера/инфраструктуры)
+  на исчерпании `redis.max_attempts` bury уходит в q:dead, покидая PEL
+  без потребления (хук OnBury смонтирован и у сборки B). Сверка — по
+  приростам `increase()` на окне: счётчики живут процессом, рестарт
+  воркера A или B обнуляет их независимо (снимок «в лоб» верен только
+  между рестартами); при дренированной очереди (воркер B дорабатывает
+  до пуста, ФТ-14) остаток нулевой. Границы применимости: равенство
+  держится, пока глубина ниже потолка MAXLEN стрима (~15 000) —
+  XADD-обрезка может срезать непрочитанное при отставании воркера B
+  (ловится алертом роста глубины, ТЗР §4.6 п.3/T-246, а не балансом);
+  ряд остатка экспонирует только процесс воркера B — при его остановке
+  члена уравнения нет до возврата (независимый источник глубины в
+  monitor — задача T-246); стрим обязан держать одну группу
+  (`render-fallback-worker`, инвариант T-155) — лишняя группа завысит
+  остаток суммированием по всем группам (`BackpressureGate.Len`).
+  Интеграционная сверка — TestAccept03_RenderFallback
+  (test/integration/acceptance_test.go): счётчики обеих сборок +
+  `BackpressureGate.Len` + прямой XPENDING группы B.
 - **Глубина backlog** (pending/queued из БД) — в scheduler: он владелец
   состояний `domains` (постановка T-028, возврат lease T-029,
   перепроверки T-030/T-031), пул БД и периодический цикл уже его.

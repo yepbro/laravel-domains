@@ -1119,6 +1119,35 @@ func (w *Worker) fbRecordPublish() {
 	w.fbBudget.published++
 }
 
+// fbConsuming — сборка потребляет фолбэк-очередь: стрим потребления —
+// q:render-fallback (воркер B, ФТ-12, T-236; Options.Stream). Учёт
+// потребления ведёт только сборка B — у основной сборки (q:render)
+// счётчик crawler_render_fallback_consumed_total серий не создаёт:
+// потребление фолбэка — доработка воркером B, не этап первичного
+// воркера (взаимно исключающие стримы с fallbackArmed — публикации и
+// потребление считает каждый свою сторону).
+func (w *Worker) fbConsuming() bool {
+	return w.opt.Stream == queue.StreamRenderFallback
+}
+
+// fbConsume — учёт исхода доставки фолбэка, завершившейся обработкой без
+// ошибки (T-245, ТЗ §4.6 п.2, ФТ-15): +1 в
+// crawler_render_fallback_consumed_total{result} — знаменатель баланса
+// published (воркер A, T-238) = consumed (воркер B) + остаток
+// q:render-fallback (crawler_queue_depth сборки B — лаг + PEL) +
+// похороненные (crawler_queue_dead_buried_total{queue="q:render-fallback"}
+// — ошибки классов браузера/инфраструктуры на исчерпании
+// redis.max_attempts; шаг 4 приёмки ТЗ §6.2). Счёт — в обработчике, до
+// XACK уровнем очереди: сбой Ack или повторная доставка дают дубль —
+// допуск единиц at-least-once (как у окна бюджета T-239); ошибочные
+// доставки не считаются вовсе — остаются в PEL до возврата клеймом либо
+// bury в q:dead (третий член баланса).
+func (w *Worker) fbConsume(result string) {
+	if w.fbConsuming() {
+		w.met.FallbackConsumed(result)
+	}
+}
+
 // ProcessResult обрабатывает одну задачу q:render (§5.6, §7): рендер
 // итогового URL строки, DOM в хранилище, атомарная замена ссылки и
 // rendered = true, публикация q:analyze после фиксации. Возвращает false
@@ -1789,7 +1818,12 @@ dispatch:
 // taskFinalizeReason; метрика не растёт на дубле доставки — публикация
 // не выполнялась), события приостановки фолбэка (T-239) — в
 // crawler_render_fallback_suspended_total{gate|budget} (стрик
-// ClassBrowser и перерасход окна бюджета).
+// ClassBrowser и перерасход окна бюджета), потребление фолбэка
+// (T-245, только сборка воркера B — стрим q:render-fallback) — в
+// crawler_render_fallback_consumed_total{rendered|finalized|skipped}
+// по исходу доставки, завершившейся обработкой без ошибки (баланс
+// published = consumed + остаток q:render-fallback + похороненные,
+// шаг 4 приёмки ТЗ §6.2).
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attempts int) (err error) {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
@@ -1831,6 +1865,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			w.met.Task(time.Since(start))
 			w.met.Error(render.ClassTask)
 			w.met.CertFinalized()
+			w.fbConsume(fbResultFinalized)
 			return nil
 		}
 		var de *dnsError
@@ -1848,6 +1883,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			w.met.Task(time.Since(start))
 			w.met.Error(render.ClassTask)
 			w.met.DNSFinalized()
+			w.fbConsume(fbResultFinalized)
 			return nil
 		}
 		var tp *tarpitError
@@ -1874,6 +1910,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			w.met.Task(time.Since(start))
 			w.met.Error(render.ClassTask)
 			w.met.TarpitFinalized()
+			w.fbConsume(fbResultFinalized)
 			return nil
 		}
 		if attempts >= w.opt.MaxAttempts && isTaskRenderError(err) {
@@ -1901,6 +1938,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			w.met.Task(time.Since(start))
 			w.met.Error(render.ClassTask)
 			w.met.TaskFinalized(taskFinalizeReason(err))
+			w.fbConsume(fbResultFinalized)
 			return nil
 		}
 		w.met.Error(render.ClassOf(err))
@@ -1909,6 +1947,17 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 	w.met.Task(time.Since(start))
 	if processed {
 		w.met.Rendered()
+		// Фолбэк-потребление (T-245): успех доработки воркера B —
+		// rendered=true и публикация q:analyze (T-225: processed = запись
+		// обработана целиком).
+		w.fbConsume(fbResultRendered)
+	} else {
+		// Штатный отказ без побочных эффектов (строки нет / нет итогового
+		// URL / охрана UPDATE отсекла — строка ушла из-под задачи):
+		// доставка закрывается — потребление фолбэка это учитывает
+		// (skipped), иначе баланс published = consumed + остаток
+		// расходился бы на «пустых» доставках.
+		w.fbConsume(fbResultSkipped)
 	}
 	return nil
 }
