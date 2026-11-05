@@ -54,6 +54,7 @@ var commands = map[string]commandFunc{
 	"near":             cmdNear,
 	"check":            cmdCheck,
 	"counters":         cmdCounters,
+	"fixtures":         cmdFixtures,
 }
 
 // usageText — справка верхнего уровня: без аргументов, help, неизвестная
@@ -101,6 +102,11 @@ const usageText = `crawlerctl — CLI Domain Crawler
                                 тестовые списки доменов в incoming
   test-rules [--rules DIR] [--samples DIR] [--min-score F]
                                 прогон правил Laravel по корпусу образцов
+  fixtures export --out КАТАЛОГ [--ok N] [--failed N] [--heavy N]
+                                 [--smoke N] [--weeks N] [--seed N]
+                                 выгрузка фикстуры рендера (zones/domains/
+                                 subdomain_results без контента) для
+                                 стенда движков (ТЗ рендера §6.1, T-242)
 
 Справка по команде: crawlerctl <команда> --help
 `

@@ -397,6 +397,21 @@ crawlerctl counters list|recount|verify  # инкрементальные счё
                                            # без записи (код 0/1); разбор
                                            # дрейфа — docs/runbooks.md §7
 crawlerctl seed / test-rules             # dev-команды (make seed, make test-rules)
+crawlerctl fixtures export --out КАТАЛОГ [--ok N] [--failed N] [--heavy N]
+                                          # [--smoke N] [--weeks N] [--seed N]
+                                          # выгрузка фикстуры рендера (T-242,
+                                          # ТЗ рендера §6.1 п. 1–2): выборка
+                                          # subdomain_results — задач q:render —
+                                          # стратами ok/failed/heavy
+                                          # пропорционально зонам + smoke-домены;
+                                          # контент-хранилище не выгружается.
+                                          # Дамп (zones/domains/
+                                          # subdomain_results/smoke NDJSON +
+                                          # manifest) — контракт наката T-243;
+                                          # формат v1 — докомментарий
+                                          # cmd/crawlerctl/fixtures.go. Читает
+                                          # БД по postgres.dsn, записывает
+                                          # только каталог --out
 ```
 
 Обучение словаря сжатия контента (ТЗ 5.7): `--samples` — файл или каталог
