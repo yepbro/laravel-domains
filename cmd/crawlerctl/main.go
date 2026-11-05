@@ -112,6 +112,14 @@ const usageText = `crawlerctl — CLI Domain Crawler
                                  (идемпотентно по PK) и публикация задач
                                  прямо в q:render без DNS/HTTP (ТЗ
                                  рендера §6.1, T-243)
+  fixtures snapshot --dir КАТАЛОГ --label ИМЯ --engine ИМЯ
+                                  фиксация результатов прогона стенда
+                                  (строки БД по фикстуре, темп по q:analyze,
+                                  метрики этапа) в JSON-снимок (T-244)
+  fixtures report --baseline ФАЙЛ --candidate ФАЙЛ
+                                  отчёт сравнения движков по ТЗ §5.1:
+                                  метрики п.3 и явные вердикты против
+                                  порогов п.4 (T-244)
 
 Справка по команде: crawlerctl <команда> --help
 `

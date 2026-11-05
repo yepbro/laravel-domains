@@ -125,13 +125,19 @@ import (
 
 // fixturesHelp — справка crawlerctl fixtures [--help]; она же печатается
 // для действий fixtures <действие> --help.
-const fixturesHelp = `crawlerctl fixtures — фикстуры стенда сравнения движков рендера (T-242/T-243)
+const fixturesHelp = `crawlerctl fixtures — фикстуры стенда сравнения движков рендера (T-242/T-243/T-244)
 
 Использование:
   crawlerctl fixtures export --out КАТАЛОГ [--ok N] [--failed N]
                               [--heavy N] [--smoke N] [--weeks N]
                               [--seed N]
   crawlerctl fixtures import --dir КАТАЛОГ [--publish all|smoke]
+  crawlerctl fixtures snapshot --dir КАТАЛОГ --label ИМЯ --engine ИМЯ
+                               [--metrics URL] [--engine-rss-max БАЙТ]
+                               [--engine-crashes N] [--out ФАЙЛ] [--no-dom]
+  crawlerctl fixtures report --baseline ФАЙЛ --candidate ФАЙЛ
+                               [--out ФАЙЛ] [--memory-budget БАЙТ]
+                               [--fail-exit]
 
 Выгрузка фикстуры доменов с БД (ТЗ рендера §6.1 п. 1–2): выборка строк
 subdomain_results — реальных задач q:render (final_url после SPA-вердикта
@@ -179,9 +185,51 @@ domain_id_seq выставляются выше максимума; контен
 контракт export→import, подробно: doc-комментарии cmd/crawlerctl/
 fixtures.go и fixtures_import.go.
 
+snapshot — фиксация результатов одного прогона (§6.1 п. 5) в JSON-снимок
+вход отчёта: строки фикстуры из тестовой БД (успешные рендеры, длина/
+хэш/узлы/скрипты DOM, вердикты анализатора), границы q:analyze из Redis
+(темп) и — с --metrics — счётчики этапа render-worker (причины
+финализаций, время страницы). Снимается ПОСЛЕ прогона (пустая q:render,
+фолбэк доработан) и ДО повторного import (накат сбрасывает строки и
+выметает контент — по БД задним числом прогон не прочесть). Между
+прогонами перезапускайте render-worker: счётчики /metrics тогда равны
+ровно прогону (иначе отчёт пометит их накопительными и деградирует
+завязанные вердикты).
+
+  --dir КАТАЛОГ        каталог дампа фикстуры (ключи прогона; обязателен)
+  --label ИМЯ          метка прогона (обязательна; файл —
+                       <dir>/<label>.snapshot.json)
+  --engine ИМЯ         движок прогона: chromium|moli|lightpanda (обязателен)
+  --metrics URL        URL /metrics render-worker стенда (пусто — без
+                       метрик этапа; например http://render-worker:9105/metrics)
+  --engine-rss-max N   макс. RSS контейнера движка за прогон, байты
+                       (периодический docker stats --no-stream во время
+                       прогона; 0 — не задан: в dev-стеке экспортёра
+                       памяти движков нет, отчёт без него деградирует
+                       по порогу памяти)
+  --engine-crashes N   падения ядра движка за прогон (>= 0 — задано)
+  --no-dom             не читать DOM хранилища (без узлов/скриптов)
+
+report — сравнение снапшотов по метрикам ТЗ §5.1 п. 3 (успешность,
+причины финализаций, темп ср./p95, память, диф детекции Laravel против
+baseline-chromium по протоколу T-213, структурные метрики DOM —
+нормализованное сравнение, побайтовый диф не применяется) с явными
+строками вердикта против порогов §5.1 п. 4 (детекция <1%, успешность,
+темп, память <⅓ бюджета chromium, 0 crashes). Отсутствующий источник —
+строка «НЕТ ДАННЫХ», отчёт не выдумывает значения.
+
+  --baseline ФАЙЛ    снапшот baseline-chromium (обязателен)
+  --candidate ФАЙЛ   снапшот движка-кандидата (обязателен)
+  --out ФАЙЛ         записать отчёт файлом (для протокола T-247)
+  --memory-budget N  бюджет памяти chromium для порога ⅓ (по умолчанию
+                     2 GiB — прод-бюджет рендер-контура, ТЗ 3.2)
+  --fail-exit        код 1 при любом вердикте НЕ ПРОЙДЕН (для скриптов)
+
 Подключение к БД — как у остальных команд: postgres.dsn конфигурации
 (CRAWLER_POSTGRES_DSN / APP_PG_DSN). export читает БД без записи;
-import пишет в тестовую БД и (с --publish) в Redis.
+import пишет в тестовую БД и (с --publish) в Redis; snapshot читает БД,
+Redis (redis.addr) и хранилище контента (content.dir) без записи;
+report работает по файлам снапшотов без инфраструктуры.
 
 Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
 `
@@ -979,10 +1027,11 @@ func fixturesExportRun(ctx context.Context, pool db.DB, p fixturesParams, stdout
 // ---------------------------------------------------------------- команда
 
 // cmdFixtures — crawlerctl fixtures: маршрутизация действий (export —
-// T-242; import — T-243, fixtures_import.go).
+// T-242; import — T-243, fixtures_import.go; snapshot/report — T-244,
+// fixtures_snapshot.go / fixtures_report.go).
 func cmdFixtures(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usagef("укажите действие: crawlerctl fixtures export|import")
+		return usagef("укажите действие: crawlerctl fixtures export|import|snapshot|report")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
@@ -990,11 +1039,15 @@ func cmdFixtures(args []string, stdout, stderr io.Writer) error {
 		return fixturesExportCmd(rest, stdout, stderr)
 	case "import":
 		return fixturesImportCmd(rest, stdout, stderr)
+	case "snapshot":
+		return fixturesSnapshotCmd(rest, stdout, stderr)
+	case "report":
+		return fixturesReportCmd(rest, stdout, stderr)
 	case "-h", "--help", "help":
 		out(stdout, "%s", fixturesHelp)
 		return flag.ErrHelp
 	default:
-		return usagef("неизвестное действие %q (допустимы: export, import)", action)
+		return usagef("неизвестное действие %q (допустимы: export, import, snapshot, report)", action)
 	}
 }
 
