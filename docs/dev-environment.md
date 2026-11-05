@@ -65,11 +65,12 @@ make reset-internet          # полный сброс (тома, var/content, �
 | (по умолчанию) | `postgres`, `redis`, `unbound` |
 | `testbed` | `coredns`, `testweb` (Caddy), `mockserver` |
 | `app` | Go-сервисы (`ingest` … `monitor`, `render-worker`) + публичный лендинг `web` (http://127.0.0.1:8081) + операторский дашборд `dashboard` (http://127.0.0.1:8090, креды dev — admin/admin) + `chromium` |
+| `render-engines` | `lightpanda`, `moli` — альтернативные движки рендера (этап 35): по требованию, когда render-worker переключают с chromium (см. «Движки рендера» ниже) |
+| `monitoring` | `prometheus` (UI на http://127.0.0.1:9090) |
+| `tools` | `adminer` (http://127.0.0.1:8080), `redis-insight` (http://127.0.0.1:5540), контейнер `tools` |
 
 Миграции PostgreSQL отдельного сервиса не имеют: каждый Go-сервис применяет
 их сам при старте (см. [`migrations.md`](migrations.md)).
-| `monitoring` | `prometheus` (UI на http://127.0.0.1:9090) |
-| `tools` | `adminer` (http://127.0.0.1:8080), `redis-insight` (http://127.0.0.1:5540), контейнер `tools` |
 
 Типовые сценарии:
 
@@ -142,6 +143,58 @@ make up-internet     # пересоздаст unbound в режиме рекур
 Ограничения скорости из боевой конфигурации действуют и здесь; `User-Agent`
 содержит пометку `dev` (переменная `CRAWLER_USER_AGENT` в `.env`).
 Возврат в изолированный режим — `make up`.
+
+### Движки рендера: lightpanda и moli (этап 35)
+
+Помимо штатного `chromium` (профиль `app`, CDP на `ws://172.28.100.14:9222`)
+dev-стек умеет поднимать оба альтернативных движка рендера — Lightpanda
+([lightpanda-io/browser](https://github.com/lightpanda-io/browser),
+официальный образ) и Moli ([lexmount/moli](https://github.com/lexmount/moli),
+свой минимальный образ из релизного tarball — `deploy/docker/Dockerfile.moli`).
+Оба говорят по CDP на том же эндпоинте `/json/version`, что и Chromium, и
+поднимаются профилем `render-engines` — **по требованию**, не вместе с
+`make up`: три браузера одновременно дев-машине не нужны.
+
+Переключение движка render-worker'ом — правка одного адреса в конфигурации,
+без правки кода (ФТ-16 ТЗ по движкам рендера). Здесь и ниже `dc` — алиас
+канонического вызова compose ([`docker.md`](docker.md) §2):
+
+```bash
+# 1) поднять контейнер движка (первый запуск собирает/качает образ)
+dc --profile render-engines up -d lightpanda   # или: moli
+
+# 2) переключить render-worker: в deploy/docker/config.dev.yaml заменить
+#    render.remote_url (закомментированные образцы там же):
+#      lightpanda → ws://172.28.100.16:9222
+#      moli       → ws://172.28.100.17:9222
+
+# 3) перезапустить воркер — air конфиг не перечитывает
+dc restart render-worker
+```
+
+Возврат на chromium — вернуть `remote_url: "ws://172.28.100.14:9222"` и
+перезапустить воркер; контейнеры движков можно остановить
+(`dc --profile render-engines stop lightpanda moli`).
+
+Адреса в `crawler_net`: `lightpanda` — `172.28.100.16`, `moli` —
+`172.28.100.17` (план адресов — [`docker.md`](docker.md) §8). Версии
+закреплены в `.env` (ФТ-17): `LIGHTPANDA_IMAGE`, пара `MOLI_VERSION` +
+`MOLI_SHA256` (контрольная сумма релизного ассета) и база образа
+`DEBIAN_VERSION`; смена версии движка — отдельная процедура со
+smoke-прогоном, не «поехало с latest». Эксплуатационные флаги (ФТ-18):
+у Lightpanda телеметрия обязательно отключена переменной
+`LIGHTPANDA_DISABLE_TELEMETRY` (в release-сборках она включена по умолчанию),
+`--obey-robots` не передаётся, а `--advertise-host 172.28.100.16` обязателен
+— без него Lightpanda рекламирует в `/json/version` адрес бинда
+(`ws://127.0.0.1:9222`), по которому remote-воркер из соседнего контейнера
+не подключится; Moli запускается `serve` с биндом на свой статический адрес
+`172.28.100.17` (того же класса нюанс: webSocketDebuggerUrl строится от
+адреса бинда), без `--layout` (геометрия не нужна) и без `--resource`
+(ресурсные семейства блокирует сам этап рендера, T-062). Healthcheck обоих
+движков — `GET /json/version` (внутри контейнера lightpanda проба идёт на
+`127.0.0.1:9222`, moli — на свой статический адрес; из сети движки удобнее
+проверять целиком:
+`dc run --rm --no-deps tools wget -qO- http://172.28.100.16:9222/json/version`).
 
 ## 3. Структура каталогов
 

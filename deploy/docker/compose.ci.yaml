@@ -16,3 +16,6 @@ services:
   monitor: *build-cache
   tools: *build-cache
   mockserver: *build-cache
+  # moli (render-engines) попадает в make build через --profile '*': без
+  # кэш-скоупов каждый CI-ран качал бы 45 МБ tarball и ставил apt-пакеты.
+  moli: *build-cache

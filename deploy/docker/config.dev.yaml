@@ -59,6 +59,15 @@ http:
 render:
   # dev: внешний chromium-контейнер (compose-сервис chromium, ws://172.28.100.14:9222)
   remote_url: "ws://172.28.100.14:9222"
+  # Альтернативные движки рендера (этап 35, ФТ-16): контейнер движка
+  # поднимается профилем render-engines, здесь меняется один адрес
+  # (закомментированные образцы), затем dc restart render-worker — air
+  # конфиг не перечитывает. Подробности: docs/dev-environment.md,
+  # «Движки рендера».
+  #   lightpanda (dc --profile render-engines up -d lightpanda):
+  # remote_url: "ws://172.28.100.16:9222"
+  #   moli (dc --profile render-engines up -d moli):
+  # remote_url: "ws://172.28.100.17:9222"
   # Осознанно ниже боевого дефолта 4 (T-142): dev-chromium делят юнит- и
   # live-тесты рендера, консервативный параллелизм держит память
   # контейнера (MEM_CHROMIUM 2048m) предсказуемой под смоук-прогонами.

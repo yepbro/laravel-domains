@@ -8,6 +8,7 @@
 #   app            Go-сервисы проекта + chromium
 #   monitoring     prometheus
 #   runtime        render — боевой render-контейнер (Dockerfile.render)
+#   render-engines lightpanda, moli — альтернативные движки рендера (T-241)
 #   tools          adminer, redis-insight, tools (запускаются по требованию)
 #
 # Сеть crawler_net (172.28.100.0/24) — детерминированные адреса (T-180):
@@ -23,6 +24,7 @@
 #                   render-worker 172.28.100.25, analyzer 172.28.100.26, web 172.28.100.27,
 #                   dashboard 172.28.100.28 — адрес .2k = порт метрик 910k; .29 — резерв
 #   runtime:        render 172.28.100.15
+#   render-engines: lightpanda 172.28.100.16, moli 172.28.100.17 (T-241)
 #   monitoring:     prometheus 172.28.100.30
 #   tools:          adminer 172.28.100.31, redis-insight 172.28.100.32 (далее свободно)
 #   172.28.100.250 — «чёрная дыра» (адрес без слушателя для сценариев
@@ -517,6 +519,110 @@ services:
     mem_limit: ${MEM_CHROMIUM:-2048m}
     restart: unless-stopped
     profiles: ["app"]
+
+  # ==========================================================================
+  # Альтернативные движки рендера (profile: render-engines, этап 35 / T-241)
+  # ==========================================================================
+
+  lightpanda:
+    # Lightpanda (github.com/lightpanda-io/browser) — альтернативный
+    # CDP-движок рендера для локальной разработки и стендовых прогонов
+    # (ТЗ рендер-движков §4.7, ФТ-16): render-worker переключается на него
+    # заменой render.remote_url в config.dev.yaml. Отдельный профиль:
+    # движки не поднимаются вместе с make up — три браузера одновременно
+    # дев-машине не нужны (бюджет памяти), конкретный движок стартует по
+    # требованию (docs/dev-environment.md, «Движки рендера»). Версия
+    # закреплена LIGHTPANDA_IMAGE (ФТ-17: смена — отдельная процедура со
+    # smoke-прогоном).
+    image: ${LIGHTPANDA_IMAGE:-lightpanda/browser:1.0.2}
+    environment:
+      # ФТ-18: телеметрия Lightpanda включена в release-сборках по умолчанию
+      # и для краулера по чужим доменам недопустима — выключена (отключает
+      # сам факт наличия переменной; значение true для читаемости).
+      LIGHTPANDA_DISABLE_TELEMETRY: "true"
+    # Базовый serve-запуск оставляем от CMD образа (lightpanda serve --host
+    # 0.0.0.0 --port 9222 --log-level info; --obey-robots не передаётся —
+    # ФТ-18), но добавляем --advertise-host: Lightpanda строит
+    # webSocketDebuggerUrl из адреса бинда, а не из Host-запроса, и без
+    # флага рекламировал бы ws://127.0.0.1:9222 — remote-аллокатор воркера
+    # (remotealloc) подключается именно по рекламированному адресу, из
+    # чужого контейнера это мимо. Значение равно статическому адресу сервиса
+    # (план адресов выше), как у chromium: ws://172.28.100.14:9222.
+    command: ["/bin/lightpanda", "serve", "--host", "0.0.0.0", "--port", "9222", "--advertise-host", "172.28.100.16", "--log-level", "info"]
+    # DNS — unbound, как chromium: движок сам резолвит имена страниц
+    # (ТЗ 5.4). Бюджет памяти — стартовый потолок движка (ТЗ рендер-движков
+    # §4.7 п.2, ≤1 ГБ): remote-воркер не видит RSS чужого контейнера,
+    # жёсткий потолок держит mem_limit + restart.
+    dns:
+      - 172.28.100.10
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.16
+    mem_limit: ${MEM_LIGHTPANDA:-1gb}
+    restart: unless-stopped
+    # Healthcheck — /json/version (общий CDP-эндпоинт всех трёх движков,
+    # тот же, что у health-checkа воркера и TestChromium_CDP). Образ —
+    # debian:stable-slim без wget/curl, единственный HTTP-клиент — bash
+    # /dev/tcp: открываем соединение, шлём GET, grep по «Browser» в теле
+    # подтверждает ответ именно /json/version.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c \"exec 3<>/dev/tcp/127.0.0.1/9222 && printf 'GET /json/version HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q Browser <&3\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    profiles: ["render-engines"]
+
+  moli:
+    # Moli (github.com/lexmount/moli) — второй альтернативный CDP-движок
+    # (ФТ-16; лицензии Apache-2.0/MIT). Официального образа нет: минимальный
+    # свой образ из tarball релиза — deploy/docker/Dockerfile.moli. Версия и
+    # контрольная сумма ассета закреплены в .env парой MOLI_VERSION/
+    # MOLI_SHA256 (ФТ-17). Запуск — serve без --layout и без --resource,
+    # --obey-robots не передаётся, --block-private-networks не включается
+    # (ФТ-18 и testbed: страницы отдаёт testweb с приватным адресом —
+    # обоснование в Dockerfile.moli); хост бинда переопределён ниже.
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.moli
+      args:
+        DEBIAN_VERSION: ${DEBIAN_VERSION:-13.7-slim}
+        MOLI_VERSION: ${MOLI_VERSION:-v1.1.21}
+        MOLI_SHA256: ${MOLI_SHA256:-048d9e482b6c618af08b17eb19200ea65b1b2fafd39975e5b9de19a60653ed8f}
+    # Тег с версией, а не :local — иначе up -d не замечает смену MOLI_VERSION
+    # (образ есть — пересборки нет, ФТ-17 молча не применяется): новой
+    # версии тега локально нет, compose собирает его сам; прежний тег
+    # остаётся для открата (dc --profile render-engines up -d moli).
+    image: crawler/moli:${MOLI_VERSION:-v1.1.21}
+    # Moli строит webSocketDebuggerUrl из адреса бинда (аналог проблемы
+    # lightpanda, но флага --advertise-host нет): serve на 0.0.0.0 рекламиро-
+    # вал бы ws://0.0.0.0:9222, и remote-аллокатор воркера (remotealloc)
+    # подключался бы мимо. Поэтому бинд на статический адрес сервиса —
+    # реклама и реальный адрес совпадают; healthcheck ниже идёт по нему же
+    # (127.0.0.1 при таком бинде не слушается — проверено).
+    command: ["serve", "--host", "172.28.100.17", "--port", "9222"]
+    # DNS/память — симметрично lightpanda (см. комментарий выше).
+    dns:
+      - 172.28.100.10
+    networks:
+      crawler_net:
+        ipv4_address: 172.28.100.17
+    mem_limit: ${MEM_MOLI:-1gb}
+    restart: unless-stopped
+    # Healthcheck — /json/version, curl из собственного образа (в отличие
+    # от lightpanda свой образ собираем сами и кладём в него HTTP-клиент —
+    # по образцу mockserver в Dockerfile.go). Адрес — статический IP
+    # сервиса: moli не слушает 127.0.0.1 при бинде на конкретный адрес.
+    # Внимание: адрес moli зашит в трёх местах (ipv4_address, command
+    # --host и эта проба) — при смене адреса по плану менять все три
+    # (docs/docker.md §8).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://172.28.100.17:9222/json/version >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    profiles: ["render-engines"]
 
   # ==========================================================================
   # Боевой render-контейнер (profile: runtime)
