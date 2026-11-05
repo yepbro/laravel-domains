@@ -113,7 +113,7 @@ C (T-235/239/240/244), D (T-245/246), затем операционные T-247�
 
 ### Волна B (после A)
 
-- **T-234** [в работе] — P1, render: движок в Options и аллокаторе
+- **T-234** [сделана] — P1, render: движок в Options и аллокаторе
   (ТЗ §4.2, ФТ-4; зависит от T-233). `internal/render/render.go`:
   поле Engine в Options + перенос в NewOptions + валидация Options
   повторяет связку ТЗ (движок × RemoteURL × MemoryThreshold);
