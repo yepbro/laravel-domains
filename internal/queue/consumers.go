@@ -83,14 +83,17 @@ const DefaultConsumerInterval = time.Minute
 // docs/redis.md §2). Имена зеркалируют DefaultGroup пакетов воркеров
 // (пакет queue не может импортировать их напрямую — воркеры строятся
 // поверх queue, цикл импорта); соответствие сверяет пин-тест
-// consumers_pin_test.go (внешний пакет queue_test). q:dead не входит:
+// consumers_pin_test.go (внешний пакет queue_test). q:render-fallback —
+// группа render-fallback-worker профиля воркера B (ФТ-12: тот же бинарь
+// renderworker, отдельная группа). q:dead не входит:
 // стрим без группы (ручной разбор) — консьюмеров нет.
 func WorkingGroups() map[string]string {
 	return map[string]string{
-		StreamDNS:     "dns-worker",    // dnsworker.DefaultGroup
-		StreamHTTP:    "http-worker",   // httpworker.DefaultGroup
-		StreamRender:  "render-worker", // renderworker.DefaultGroup
-		StreamAnalyze: "analyzer",      // analyzer.DefaultGroup
+		StreamDNS:            "dns-worker",             // dnsworker.DefaultGroup
+		StreamHTTP:           "http-worker",            // httpworker.DefaultGroup
+		StreamRender:         "render-worker",          // renderworker.DefaultGroup
+		StreamRenderFallback: "render-fallback-worker", // профиль воркера B (T-240, ФТ-12)
+		StreamAnalyze:        "analyzer",               // analyzer.DefaultGroup
 	}
 }
 
@@ -167,7 +170,7 @@ func CleanupConsumersOnce(ctx context.Context, rdb consumerGroups, opt ConsumerO
 	for _, stream := range streams {
 		group := o.Groups[stream]
 		if !knownStream(stream) {
-			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров: неизвестный стрим %q (стримы очереди — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamAnalyze, StreamDead)", stream))
+			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров: неизвестный стрим %q (стримы очереди — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream))
 			continue
 		}
 		if group == "" {

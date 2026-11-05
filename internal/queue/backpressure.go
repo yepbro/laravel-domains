@@ -22,6 +22,11 @@
 //     0 — общий scheduler.queue_high_watermark): глубину стрима читает
 //     тот же BackpressureGate.Len, кламп порога — тот же
 //     StreamWatermark (проводка cmd/http-worker);
+//   - q:render-fallback не гейтируется (ТЗ 4.3 п.3): публикация —
+//     часть финализации рендер-воркера, ожидание ёмкости задержало бы
+//     XACK задачи q:render (та же патология, что убрала T-066); поток
+//     в фолбэк ограничен бюджетом доли и темпом воркера B, память —
+//     потолком MAXLEN (T-237);
 //   - q:dead не ограничивается: перенос исчерпавших попытки задач
 //     (T-025) — часть механизма надёжности и блокироваться
 //     переполнением не должен.
@@ -224,7 +229,7 @@ func GroupDepth(g redis.XInfoGroup, xlen int64) int64 {
 // шапке файла.
 func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error) {
 	if !knownStream(stream) {
-		return 0, fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamAnalyze, StreamDead)", stream)
+		return 0, fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
 	}
 	if g.rdb == nil {
 		return 0, fmt.Errorf("queue: глубина %s: клиент Redis не задан", stream)
@@ -274,11 +279,11 @@ func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error
 // глубине (недоступный Redis — не «очередь пуста»), решение о повторе
 // принимает вызывающий цикл.
 //
-// Отключённый гейт (Watermark ≤ 0) и q:dead проходят без обращения
-// к Redis (см. шапку файла).
+// Отключённый гейт (Watermark ≤ 0), q:dead и q:render-fallback (ТЗ 4.3
+// п.3) проходят без обращения к Redis (см. шапку файла).
 func (g *BackpressureGate) AwaitCapacity(ctx context.Context, stream string) error {
 	watermark := g.watermarkFor(stream)
-	if watermark <= 0 || stream == StreamDead {
+	if watermark <= 0 || stream == StreamDead || stream == StreamRenderFallback {
 		return nil
 	}
 	waited := false

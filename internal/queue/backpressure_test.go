@@ -575,6 +575,16 @@ func TestBackpressureGateUngated(t *testing.T) {
 		t.Errorf("q:dead не должен гейтироваться: %v %v", fake.infos, fake.xlens)
 	}
 
+	// q:render-fallback — публикация из финализации рендера без ожидания
+	// ёмкости (ТЗ 4.3 п.3): ожидание задержало бы XACK задачи q:render
+	// (патология T-066); поток держат бюджет доли и темп воркера B.
+	if err := gate.AwaitCapacity(context.Background(), StreamRenderFallback); err != nil {
+		t.Errorf("q:render-fallback: %v", err)
+	}
+	if len(fake.infos)+len(fake.xlens) != 0 {
+		t.Errorf("q:render-fallback не должен гейтироваться: %v %v", fake.infos, fake.xlens)
+	}
+
 	if err := gate.AwaitCapacity(context.Background(), "q:typo"); err == nil ||
 		!strings.Contains(err.Error(), "неизвестный стрим") {
 		t.Errorf("чужой стрим: %v", err)

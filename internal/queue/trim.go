@@ -22,7 +22,7 @@
 // Почему XTRIM MINID, а не XDEL после каждого Ack (ТЗ 4.2 допускает оба):
 //
 //   - нагрузка на Redis: один проход — XINFO GROUPS + XPENDING (по группам
-//     с pending) + XTRIM на стрим, ~12 команд в минуту на четыре стрима,
+//     с pending) + XTRIM на стрим, ~15 команд в минуту на пять стримов,
 //     против дополнительной команды XDEL на каждую подтверждённую запись
 //     (тысячи в минуту на пике HTTP-этапа, замер T-139);
 //   - атомарность: XTRIM — одна команда, точка обрезки вычисляется по
@@ -103,8 +103,8 @@ type trimStreams interface {
 // дефолтами (withDefaults, стиль RecoverOptions).
 type TrimOptions struct {
 	// Streams — освобождаемые стримы; nil — рабочие стримы задач
-	// (q:dns, q:http, q:render, q:analyze). q:dead не входит: без
-	// consumer group подтверждённого префикса не бывает.
+	// (q:dns, q:http, q:render, q:render-fallback, q:analyze). q:dead
+	// не входит: без consumer group подтверждённого префикса не бывает.
 	Streams []string
 	// Interval — период проходов TrimLoop; 0 — DefaultTrimInterval.
 	// TrimOnce проход и так делает — поле управляет только циклом.
@@ -187,7 +187,7 @@ func TrimOnce(ctx context.Context, rdb trimStreams, opt TrimOptions) (int64, []s
 // обычная обрезка такое не лечит, нужен разбор групп стрима.
 func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOptions) (int64, bool, error) {
 	if !knownStream(stream) {
-		return 0, false, fmt.Errorf("queue: освобождение: неизвестный стрим %q (стримы очереди — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamAnalyze, StreamDead)", stream)
+		return 0, false, fmt.Errorf("queue: освобождение: неизвестный стрим %q (стримы очереди — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
 	}
 	groups, err := rdb.XInfoGroups(ctx, stream).Result()
 	if err != nil {

@@ -141,8 +141,9 @@ func TestNewReliabDefaults(t *testing.T) {
 // валидации конфигурации — пин-тестом
 // config.TestSchedulerBatchFitsStreamBudget (config_test.go), который
 // считает от maxSchedulerBatchSize. Дефолт (пачка 1000): q:dns
-// 250 × 1000 × 66 Б ≈ 16 МиБ + 3 × 103 МиБ + 2 МиБ ≈ 327 МиБ; худший
-// случай (пачка 10 000) ≈ 467 МиБ — оба ниже предела 480 МиБ.
+// 250 × 1000 × 66 Б ≈ 16 МиБ + 3 × 103 МиБ + фолбэк 15 000 ≈ 10 МиБ +
+// 2 МиБ ≈ 337 МиБ; худший случай (пачка 10 000) ≈ 478 МиБ — оба ниже
+// предела 480 МиБ.
 func TestStreamPolicyFitsBudget(t *testing.T) {
 	const (
 		worstBatch  = 10_000 // верх нормативной вилки ТЗ 5.3
@@ -150,6 +151,7 @@ func TestStreamPolicyFitsBudget(t *testing.T) {
 	)
 	total := DefaultStreamMaxLen(StreamDNS)*worstBatch*DNSStreamBytesPerDomain +
 		3*DefaultStreamMaxLen(StreamHTTP)*UnitStreamBytesWorst +
+		DefaultStreamMaxLen(StreamRenderFallback)*UnitStreamBytesWorst +
 		DefaultStreamMaxLen(StreamDead)*DeadStreamBytesWorst
 	if total > streamLimit {
 		t.Errorf("сумма потолков стримов при пачке %d ≈ %d МиБ > %d МиБ — бюджет Redis 512 МиБ (ТЗ 3.2) пробит: пересогласуйте defaultMaxLen* / scheduler.batch_size (docs/redis.md §3.1)",
@@ -158,6 +160,7 @@ func TestStreamPolicyFitsBudget(t *testing.T) {
 	// Дефолтная пачка — на порядок свободнее: проконтролировать запас.
 	def := DefaultStreamMaxLen(StreamDNS)*1000*DNSStreamBytesPerDomain +
 		3*DefaultStreamMaxLen(StreamHTTP)*UnitStreamBytesWorst +
+		DefaultStreamMaxLen(StreamRenderFallback)*UnitStreamBytesWorst +
 		DefaultStreamMaxLen(StreamDead)*DeadStreamBytesWorst
 	if def > 400<<20 {
 		t.Errorf("сумма потолков при дефолтной пачке ≈ %d МиБ — съедает запас бюджета (межобрезочный остаток TrimLoop, служебная память)", def>>20)
@@ -1043,6 +1046,7 @@ func TestPublishMaxLenPolicy(t *testing.T) {
 		{StreamHTTP, HTTPTask{ZoneID: 1, DomainID: 1, Name: "a.test",
 			Subdomains: []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}}},
 		{StreamRender, Result{ZoneID: 1, DomainID: 1, SubdomainID: 0}},
+		{StreamRenderFallback, Result{ZoneID: 1, DomainID: 1, SubdomainID: 0}},
 		{StreamAnalyze, Result{ZoneID: 1, DomainID: 1, SubdomainID: 0}},
 		{StreamDead, Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1,
 			Payload: json.RawMessage(`{}`)}},

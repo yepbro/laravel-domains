@@ -1037,6 +1037,7 @@ func TestSchedulerBatchFitsStreamBudget(t *testing.T) {
 	const streamLimit = 480 << 20 // 512 МиБ ТЗ 3.2 − запас на служебную память
 	total := queue.DefaultStreamMaxLen(queue.StreamDNS)*int64(maxSchedulerBatchSize)*queue.DNSStreamBytesPerDomain +
 		3*queue.DefaultStreamMaxLen(queue.StreamHTTP)*queue.UnitStreamBytesWorst +
+		queue.DefaultStreamMaxLen(queue.StreamRenderFallback)*queue.UnitStreamBytesWorst +
 		queue.DefaultStreamMaxLen(queue.StreamDead)*queue.DeadStreamBytesWorst
 	if total > streamLimit {
 		t.Errorf("сумма потолков стримов при пачке %d ≈ %d МиБ > %d МиБ — бюджет Redis 512 МиБ (ТЗ 3.2) пробит: пересогласуйте queue.DefaultStreamMaxLen / вилку scheduler.batch_size (docs/redis.md §3.1)",

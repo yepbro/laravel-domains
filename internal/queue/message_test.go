@@ -20,7 +20,7 @@ func TestMessageStreams(t *testing.T) {
 	}{
 		{DNSBatch{}, []string{StreamDNS}},
 		{HTTPTask{}, []string{StreamHTTP}},
-		{Result{}, []string{StreamRender, StreamAnalyze}},
+		{Result{}, []string{StreamRender, StreamRenderFallback, StreamAnalyze}},
 		{Dead{}, []string{StreamDead}},
 	}
 	for _, c := range cases {
@@ -151,6 +151,7 @@ func TestMessageRoundtrip(t *testing.T) {
 		{StreamDNS, batch, func(d Delivery) (any, error) { return Decode[DNSBatch](d) }},
 		{StreamHTTP, task, func(d Delivery) (any, error) { return Decode[HTTPTask](d) }},
 		{StreamRender, result, func(d Delivery) (any, error) { return Decode[Result](d) }},
+		{StreamRenderFallback, result, func(d Delivery) (any, error) { return Decode[Result](d) }},
 		{StreamAnalyze, result, func(d Delivery) (any, error) { return Decode[Result](d) }},
 		{StreamDead, dead, func(d Delivery) (any, error) { return Decode[Dead](d) }},
 	}
@@ -408,6 +409,7 @@ func TestValidateMessages(t *testing.T) {
 		{"результат ок", Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantHTTP}, ""},
 		{"результат с кривым вариантом", Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.Variant(5)}, "вариант"},
 		{"dead ок", Dead{TaskID: "t", Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1}, ""},
+		{"dead из q:render-fallback", Dead{TaskID: "t", Stream: StreamRenderFallback, EntryID: "1-0", Attempts: 1}, ""},
 		{"dead без task_id", Dead{Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1}, "task_id"},
 		{"dead из q:dead", Dead{TaskID: "t", Stream: StreamDead, EntryID: "1-0", Attempts: 1}, "стрим-источник"},
 		{
@@ -600,6 +602,9 @@ func TestDeadSubjectOf(t *testing.T) {
 		{"q:render основной вариант", StreamRender,
 			`{"task_id":"t3","zone_id":3,"domain_id":42,"subdomain_id":0,"variant":0,"name":"example.com"}`,
 			Dead{ZoneID: 3, DomainID: 42, Name: "example.com"}},
+		{"q:render-fallback http-вариант", StreamRenderFallback,
+			`{"task_id":"t6","zone_id":3,"domain_id":42,"subdomain_id":2,"variant":1,"name":"www.example.com"}`,
+			Dead{ZoneID: 3, DomainID: 42, SubdomainID: 2, Variant: model.VariantHTTP, Name: "www.example.com"}},
 		{"q:analyze http-вариант", StreamAnalyze,
 			`{"task_id":"t4","zone_id":3,"domain_id":42,"subdomain_id":1,"variant":1,"name":"www.example.com"}`,
 			Dead{ZoneID: 3, DomainID: 42, SubdomainID: 1, Variant: model.VariantHTTP, Name: "www.example.com"}},

@@ -70,7 +70,7 @@ const resilienceRedisDB = 15
 // зачищаются между проверками внутри тестовой БД (см. комментарий файла).
 var resilienceStreams = []string{
 	queue.StreamDNS, queue.StreamHTTP, queue.StreamRender,
-	queue.StreamAnalyze, queue.StreamDead,
+	queue.StreamRenderFallback, queue.StreamAnalyze, queue.StreamDead,
 }
 
 // resilienceRedisEnv — клиент живого Redis testbed (выделенная БД) с

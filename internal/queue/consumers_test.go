@@ -264,8 +264,8 @@ func TestCleanupConsumersOnceUnknownStreamAndNilClient(t *testing.T) {
 }
 
 // TestConsumerOptionsDefaults — нулевые Groups/Idle/Interval заменяются
-// дефолтами: рабочие пары задач (WorkingGroups — все четыре рабочих
-// стрима, без q:dead), DefaultConsumerIdle и DefaultConsumerInterval.
+// дефолтами: рабочие пары задач (WorkingGroups — все пять рабочих
+// стримов, без q:dead), DefaultConsumerIdle и DefaultConsumerInterval.
 // Пин-тест: новый рабочий стрим обязан попасть в WorkingGroups, иначе
 // его группы молча не чистятся; соответствие имён групп константам
 // воркеров сверяет consumers_pin_test.go.

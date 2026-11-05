@@ -36,18 +36,19 @@ import (
 
 // Имена стримов Redis Streams (ТЗ 4.2).
 const (
-	StreamDNS     = "q:dns"     // пачка доменов (id + имя) → dns-worker
-	StreamHTTP    = "q:http"    // домен с DNS-живыми субдоменами → http-worker
-	StreamRender  = "q:render"  // результат для рендера → render-worker
-	StreamAnalyze = "q:analyze" // результат на анализ → analyzer
-	StreamDead    = "q:dead"    // задачи, исчерпавшие попытки (ручной разбор)
+	StreamDNS            = "q:dns"             // пачка доменов (id + имя) → dns-worker
+	StreamHTTP           = "q:http"            // домен с DNS-живыми субдоменами → http-worker
+	StreamRender         = "q:render"          // результат для рендера → render-worker
+	StreamRenderFallback = "q:render-fallback" // результат, не прошедший рендер на основном движке, → chromium-воркер B (ТЗ 4.3, ФТ-6)
+	StreamAnalyze        = "q:analyze"         // результат на анализ → analyzer
+	StreamDead           = "q:dead"            // задачи, исчерпавшие попытки (ручной разбор)
 )
 
 // allStreams — все стримы очереди: единственный источник имён, по нему
 // строятся knownStream (принадлежность очереди) и workingStreams
 // (освобождение подтверждённого префикса, trim.go) — новый стрим
 // добавляется одной строкой и сразу известен всей очереди.
-var allStreams = []string{StreamDNS, StreamHTTP, StreamRender, StreamAnalyze, StreamDead}
+var allStreams = []string{StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead}
 
 // NewClient создаёт клиент Redis по адресу addr (например "127.0.0.1:6379";
 // секция redis конфигурации, T-006). Пул подключений и таймауты — настройки

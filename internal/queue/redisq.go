@@ -112,7 +112,7 @@ func NewRedisQueue(rdb redisStreams, opt RedisOptions) *RedisQueue {
 // паузы; устойчивая недоступность — InfraError.
 func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (string, error) {
 	if !knownStream(stream) {
-		return "", fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamAnalyze, StreamDead)", stream)
+		return "", fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
 	}
 	if !streamAllowed(msg, stream) {
 		return "", fmt.Errorf("queue: сообщение %T публикуется в %v, а не в %q", msg, msg.Streams(), stream)

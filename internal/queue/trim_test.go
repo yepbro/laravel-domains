@@ -301,8 +301,8 @@ func TestTrimOptionsDefaults(t *testing.T) {
 			t.Errorf("workingStreams содержит неизвестный стрим %q", s)
 		}
 	}
-	if len(want) != 4 {
-		t.Errorf("рабочих стримов задач %d (%v), хочу 4 — новый стрим добавьте в workingStreams", len(want), want)
+	if len(want) != 5 {
+		t.Errorf("рабочих стримов задач %d (%v), хочу 5 — новый стрим добавьте в workingStreams", len(want), want)
 	}
 	if o.Interval != DefaultTrimInterval {
 		t.Errorf("Interval по умолчанию = %s, хочу %s", o.Interval, DefaultTrimInterval)

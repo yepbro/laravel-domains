@@ -36,16 +36,18 @@ const (
 )
 
 // Message — сообщение одного из стримов очереди: DNSBatch (q:dns),
-// HTTPTask (q:http), Result (q:render, q:analyze), Dead (q:dead).
-// Интерфейс запечатан неэкспортируемым методом validate: форматы стримов
-// вводит только пакет queue, сторонние типы публиковать нельзя.
+// HTTPTask (q:http), Result (q:render, q:render-fallback, q:analyze),
+// Dead (q:dead). Интерфейс запечатан неэкспортируемым методом validate:
+// форматы стримов вводит только пакет queue, сторонние типы публиковать
+// нельзя.
 //
 // Имена — ASCII-форма (punycode, ТЗ 5.2): в очереди, как и во всей
 // системе, ходят только ASCII-имена.
 type Message interface {
 	// Streams возвращает стримы, в которые допустима публикация
-	// сообщения (ТЗ 4.2). У Result их два: q:render и q:analyze
-	// используют один формат «один результат».
+	// сообщения (ТЗ 4.2). У Result их три: q:render, q:render-fallback
+	// (очередь фолбэка движка, ТЗ 4.3) и q:analyze используют один
+	// формат «один результат».
 	Streams() []string
 
 	// validate проверяет минимальную допустимость значений перед
@@ -153,7 +155,9 @@ func (t HTTPTask) validate() error {
 	return nil
 }
 
-// Result — сообщение q:render и q:analyze: один результат — ключ строки
+// Result — сообщение q:render, q:render-fallback и q:analyze (T-237,
+// ТЗ 4.3 п.1: фолбэк-очередь использует тот же контракт — сообщение
+// самодостаточно, конвертация не нужна): один результат — ключ строки
 // subdomain_results (домен, субдомен, вариант; ТЗ 4.2, §6.1). Сам
 // результат остаётся в БД, сообщение только указывает, какую запись
 // обрабатывать (рендер берёт итоговый URL, анализатор — контент по ключу);
@@ -175,9 +179,11 @@ type Result struct {
 	Fresh bool `json:"fresh,omitempty"`
 }
 
-// Streams — стримы результата: формат один, рендер и анализ публикуют
-// одинаковое сообщение.
-func (Result) Streams() []string { return []string{StreamRender, StreamAnalyze} }
+// Streams — стримы результата: формат один, рендер (основной движок и
+// фолбэк-воркер B) и анализ публикуют одинаковое сообщение.
+func (Result) Streams() []string {
+	return []string{StreamRender, StreamRenderFallback, StreamAnalyze}
+}
 
 func (r Result) validate() error {
 	if r.ZoneID <= 0 {
@@ -246,7 +252,7 @@ func (d Dead) validate() error {
 	// генерации — альтернатива блэклисту чексумм (docs/mutation-testing.md §4).
 	// Снять аннотацию, если у ветки появится тело.
 	// mutator-disable-next-line branch/case
-	case StreamDNS, StreamHTTP, StreamRender, StreamAnalyze:
+	case StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze:
 	default:
 		return fmt.Errorf("queue: q:dead: стрим-источник %q не является рабочим стримом задач", d.Stream)
 	}
@@ -282,7 +288,8 @@ func (d Dead) validate() error {
 // deadSubjectOf выжимает из тела исходного сообщения идентификаторы
 // предмета задачи в запись Dead (T-105): q:dns — размер пачки (список
 // доменов не переносится — до ~250 КБ на запись, см. Dead), q:http —
-// домен, q:render/q:analyze — ключ строки subdomain_results.
+// домен, q:render/q:render-fallback/q:analyze (тело Result) — ключ
+// строки subdomain_results.
 // Best-effort: тело, не разбирающееся как сообщение стрима, оставляет
 // поля нулевыми; разобравшееся, но чужое (недопустимые значения) bury
 // откатывает к записи без идентификаторов — перенос в q:dead не падает
@@ -303,7 +310,7 @@ func deadSubjectOf(d *Dead, stream string, payload []byte) {
 		if json.Unmarshal(payload, &m) == nil {
 			d.ZoneID, d.DomainID, d.Name = m.ZoneID, m.DomainID, m.Name
 		}
-	case StreamRender, StreamAnalyze:
+	case StreamRender, StreamRenderFallback, StreamAnalyze:
 		var m Result
 		if json.Unmarshal(payload, &m) == nil {
 			d.ZoneID, d.DomainID = m.ZoneID, m.DomainID
