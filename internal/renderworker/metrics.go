@@ -7,8 +7,12 @@
 // в PromQL), тарпит-финализации без рендера (T-148), финализации по
 // постоянной ошибке сертификата хоста (T-159), финализации по DNS-отказу
 // хоста (T-211), финализации ошибки класса задачи на последней попытке
-// с меткой причины (T-172) и публикации в очередь фолбэка с меткой
-// причины (T-238, ТЗ §4.6 п.2 — числитель fallback-рейта, ФТ-15).
+// с меткой причины (T-172), публикации в очередь фолбэка с меткой
+// причины (T-238, ТЗ §4.6 п.2 — числитель fallback-рейта, ФТ-15) и
+// метка движка engine на доле рендера и финализациях класса задачи
+// (T-235, ТЗ §4.6 п.1, ФТ-15: кардинальность 3 — chromium/moli/
+// lightpanda, значение — движок сборки воркера, Options.Engine ←
+// render.engine; существующие агрегации без engine не меняются).
 package renderworker
 
 import (
@@ -16,6 +20,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"crawler/internal/config"
 	"crawler/internal/metrics"
 	"crawler/internal/render"
 )
@@ -34,21 +39,35 @@ type Metrics struct {
 	tasks    prometheus.Counter     // crawler_stage_tasks_total{stage="render"}
 	seconds  prometheus.Observer    // crawler_stage_seconds{stage="render"}
 	errors   *prometheus.CounterVec // crawler_stage_errors_total{stage,type}
-	rendered prometheus.Counter     // crawler_render_records_total{rendered="true"}
+	rendered prometheus.Counter     // crawler_render_records_total{rendered="true",engine} (T-235)
 	tarpits  prometheus.Counter     // crawler_render_tarpit_finalized_total (T-148)
 	certs    prometheus.Counter     // crawler_render_cert_finalized_total (T-159)
 	dns      prometheus.Counter     // crawler_render_dns_finalized_total (T-211)
-	tasksFin *prometheus.CounterVec // crawler_render_task_finalized_total{reason} (T-172)
+	tasksFin *prometheus.CounterVec // crawler_render_task_finalized_total{reason,engine} (T-172/T-235)
 	fallback *prometheus.CounterVec // crawler_render_fallback_published_total{reason} (T-238)
+	engine   string                 // значение метки engine — движок сборки воркера (T-235)
 }
 
 // NewMetrics регистрирует приборы этапа в реестре reg (каррированные по
-// service и stage); nil — nil. Идемпотентен (T-076).
-func NewMetrics(reg *metrics.Registry) *Metrics {
+// service и stage); nil — nil. Идемпотентен (T-076). engine — значение
+// метки движка (T-235, ТЗ §4.6 п.1, ФТ-15) на crawler_render_records_total
+// и crawler_render_task_finalized_total: движок сборки воркера
+// (Options.Engine ← render.engine, словарь config.Engine*), кардинальность
+// 3 — chromium/moli/lightpanda; словарь и связку «движок × remote_url ×
+// порог памяти» уже проверили config.Validate и render.Options.validate,
+// воркер значение не перепроверяет — неизвестный движок сборка рендера
+// отвергает раньше старта воркера. Пустое значение — chromium, как у
+// render.Options.Engine (сборки без конфигурации); нормализация здесь —
+// кардинальность метки держит владелец приборов.
+func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 	if reg == nil {
 		return nil
 	}
+	if engine == "" {
+		engine = config.EngineChromium
+	}
 	return &Metrics{
+		engine: engine,
 		tasks: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_stage_tasks_total",
 			Help: "Обработанные задачи этапов конвейера: dns — домены, http — домены, render/analyze — записи субдомен×вариант.",
@@ -64,8 +83,8 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		}, metrics.LabelStage, metrics.LabelType),
 		rendered: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_records_total",
-			Help: "Записи результатов по признаку rendered: false пишет HTTP-этап, true — render-worker; доля рендера — отношение rate.",
-		}, "rendered").WithLabelValues("true"),
+			Help: "Записи результатов по признаку rendered: false пишет HTTP-этап, true — render-worker; доля рендера — отношение rate. Метка engine — движок рендера сборки воркера (chromium|moli|lightpanda, render.engine, T-235): у ветки false HTTP-этапа метки нет, агрегации и доля рендера без engine не меняются.",
+		}, "rendered", metrics.LabelEngine).WithLabelValues("true", engine),
 		tarpits: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_tarpit_finalized_total",
 			Help: "Записи, финализированные без рендера после исчерпания render.timeout_attempts (T-148): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze; рост — доля таймаут-тарпитов на рендере.",
@@ -80,8 +99,8 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		}).WithLabelValues(),
 		tasksFin: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_task_finalized_total",
-			Help: "Записи, финализированные без рендера по ошибке класса задачи рендера на последней доставке (T-172): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze, в q:dead не попадает. Метка reason — код net::ERR_* (например net::ERR_CONNECTION_REFUSED), timeout или other: состав того, что раньше уносило записи в q:dead.",
-		}, "reason"),
+			Help: "Записи, финализированные без рендера по ошибке класса задачи рендера на последней доставке (T-172): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze, в q:dead не попадает. Метка reason — код net::ERR_* (например net::ERR_CONNECTION_REFUSED), timeout или other: состав того, что раньше уносило записи в q:dead. Метка engine — движок рендера сборки воркера (chromium|moli|lightpanda, render.engine, T-235): агрегации без engine не меняются.",
+		}, "reason", metrics.LabelEngine),
 		fallback: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_fallback_published_total",
 			Help: "Задачи, опубликованные в очередь фолбэка q:render-fallback из путей финализации без рендера (T-238, ТЗ 4.4): движко-зависимые причины (тарпит T-148, класс задачи T-172 на последней доставке) дорабатывает chromium-воркер B, запись остаётся без маркера render_failed_at. Метка reason — словарь crawler_render_task_finalized_total (код net::ERR_*, timeout, other); числитель fallback-рейта (ФТ-15).",
@@ -101,7 +120,7 @@ func (m *Metrics) Task(d time.Duration) {
 }
 
 // Rendered — DOM записан в строку (rendered = true, ТЗ 5.6): +1 в ветку
-// rendered=true счётчика доли рендера.
+// rendered=true счётчика доли рендера (с меткой engine сборки, T-235).
 func (m *Metrics) Rendered() {
 	if m == nil {
 		return
@@ -143,14 +162,15 @@ func (m *Metrics) DNSFinalized() {
 
 // TaskFinalized — запись финализирована без рендера по ошибке класса
 // задачи на последней доставке (T-172): +1 в счётчик финализаций с
-// меткой причины (код net::ERR_* / timeout / other) — материал критерия
-// «суточный прирост q:dead от q:render = 0» и видимости состава причин
-// (что именно доезжало до q:dead прежде).
+// меткой причины (код net::ERR_* / timeout / other) и меткой engine
+// сборки (T-235) — материал критерия «суточный прирост q:dead от
+// q:render = 0» и видимости состава причин (что именно доезжало до
+// q:dead прежде).
 func (m *Metrics) TaskFinalized(reason string) {
 	if m == nil {
 		return
 	}
-	m.tasksFin.WithLabelValues(reason).Inc()
+	m.tasksFin.WithLabelValues(reason, m.engine).Inc()
 }
 
 // FallbackPublished — задача опубликована в q:render-fallback из пути

@@ -58,6 +58,11 @@ const (
 	// метрик событий юнитов монитора (T-145): системный контур, а не
 	// этап конвейера — отдельное имя от LabelService.
 	LabelUnit = "unit"
+	// LabelEngine — движок рендера сборки render-worker (chromium,
+	// moli, lightpanda — словарь internal/config) для метрик этапа
+	// рендера (T-235, ТЗР движков §4.6 п.1, ФТ-15): серия различает
+	// движки; агрегации без метки (sum by без engine) не меняются.
+	LabelEngine = "engine"
 )
 
 // buildMode — значение метки mode метрики crawler_build_info. Боевые

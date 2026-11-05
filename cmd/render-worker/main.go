@@ -227,7 +227,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		RecoverBatch:    cfg.Redis.RecoverBatch,
 		RecoverInterval: cfg.Redis.RecoverInterval.D(),
 		Metrics:         reg, // приборы этапа: задачи, длительности, ошибки классов, rendered (T-077)
-		Log:             logger,
+		// Движок сборки (render.engine, T-234) → метка engine метрик
+		// этапа (T-235, ФТ-15): то же значение, что у
+		// render.NewOptions выше (менеджер рендера), — движок сборки
+		// один, метки метрик различают движки канареечных окон.
+		Engine: cfg.Render.Engine,
+		Log:    logger,
 		// Зонд браузера: мёртвое поколение менеджер заменяет прямо в зонде
 		// (Manager.Alive, T-065 — реконнект после потери Chromium), здесь —
 		// только пауза потребления, пока старт не удастся: доставки

@@ -1,7 +1,8 @@
 // Юнит-тесты приборов этапа рендера (T-077, ТЗ 5.9): nil-безопасность,
 // экспорт значений через Gather (счётчик задач и длительности, ошибки
-// по классам render.Class, ветка rendered=true доли рендера),
-// инкременты в типовом пути processDelivery — на фейках пула,
+// по классам render.Class, ветка rendered=true доли рендера), метка
+// engine движка сборки на доле рендера и финализациях класса задачи
+// (T-235), инкременты в типовом пути processDelivery — на фейках пула,
 // хранилища, рендера и очереди из worker_test.go.
 package renderworker
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"crawler/internal/config"
 	"crawler/internal/metrics"
 	"crawler/internal/render"
 )
@@ -58,7 +60,7 @@ func rwMetricValue(t *testing.T, g prometheus.Gatherer, name string, labels map[
 }
 
 func TestMetricsNilSafe(t *testing.T) {
-	if NewMetrics(nil) != nil {
+	if NewMetrics(nil, config.EngineChromium) != nil {
 		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
 	}
 	var m *Metrics
@@ -74,7 +76,7 @@ func TestMetricsNilSafe(t *testing.T) {
 
 func TestMetricsMethods(t *testing.T) {
 	reg := metrics.New("render-worker")
-	m := NewMetrics(reg)
+	m := NewMetrics(reg, config.EngineLightpanda)
 
 	m.Task(2 * time.Second)
 	m.Task(3 * time.Second)
@@ -99,8 +101,14 @@ func TestMetricsMethods(t *testing.T) {
 	if got := rwMetricValue(t, reg, "crawler_stage_seconds", stage); got != 2 {
 		t.Errorf("crawler_stage_seconds (count) = %v, want 2", got)
 	}
-	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true"}); got != 1 {
-		t.Errorf("crawler_render_records_total{rendered=\"true\"} = %v, want 1", got)
+	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true", "engine": config.EngineLightpanda}); got != 1 {
+		t.Errorf("crawler_render_records_total{rendered=\"true\",engine=%s} = %v, want 1", config.EngineLightpanda, got)
+	}
+	// Метка engine фиксирована сборкой (T-235): серий чужого движка и
+	// без неё воркер не экспортирует — кардинальность 3 держит
+	// инициализация, а не вызывающий.
+	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true", "engine": config.EngineChromium}); got != -1 {
+		t.Errorf("crawler_render_records_total{engine=%s} = %v, want -1 (серия чужого движка)", config.EngineChromium, got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", nil); got != 1 {
 		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 1", got)
@@ -116,9 +124,14 @@ func TestMetricsMethods(t *testing.T) {
 		"other":                       1,
 		"net::ERR_NAME_NOT_RESOLVED":  -1,
 	} {
-		if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", map[string]string{"reason": reason}); got != want {
-			t.Errorf("crawler_render_task_finalized_total{reason=%s} = %v, want %v", reason, got, want)
+		labels := map[string]string{"reason": reason, "engine": config.EngineLightpanda}
+		if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", labels); got != want {
+			t.Errorf("crawler_render_task_finalized_total{reason=%s,engine=%s} = %v, want %v", reason, config.EngineLightpanda, got, want)
 		}
+	}
+	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total",
+		map[string]string{"reason": "other", "engine": config.EngineMoli}); got != -1 {
+		t.Errorf("crawler_render_task_finalized_total{engine=%s} = %v, want -1 (серия чужого движка)", config.EngineMoli, got)
 	}
 	for reason, want := range map[string]float64{
 		"timeout":                     2,
@@ -141,6 +154,28 @@ func TestMetricsMethods(t *testing.T) {
 	}
 }
 
+// TestMetricsEngineDefault — пустое значение engine (сборки без
+// конфигурации, Options{Metrics: reg} в тестах) трактуется как
+// chromium, как у render.Options.Engine (T-235): нулевое значение
+// Options не расширяет кардинальность метки за пределы словаря из 3
+// движков.
+func TestMetricsEngineDefault(t *testing.T) {
+	reg := metrics.New("render-worker")
+	m := NewMetrics(reg, "")
+
+	m.Rendered()
+	m.TaskFinalized("other")
+
+	if got := rwMetricValue(t, reg, "crawler_render_records_total",
+		map[string]string{"rendered": "true", "engine": config.EngineChromium}); got != 1 {
+		t.Errorf("crawler_render_records_total{engine=%s} = %v, want 1", config.EngineChromium, got)
+	}
+	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total",
+		map[string]string{"reason": "other", "engine": config.EngineChromium}); got != 1 {
+		t.Errorf("crawler_render_task_finalized_total{engine=%s} = %v, want 1", config.EngineChromium, got)
+	}
+}
+
 // TestMetricsProcessDelivery — приборы инкрементируются типовым путём:
 // успешная доставка (DOM записан → rendered=true) и неудачная (класс
 // ошибки страницы → счётчик ошибок, задача не посчитана).
@@ -152,7 +187,8 @@ func TestMetricsProcessDelivery(t *testing.T) {
 		store := &rwFakeStore{j: pool.j, p: pool}
 		renderer := &rwFakeRenderer{j: pool.j, output: rwOutput("<html><body>dom</body></html>")}
 		q := &rwFakeQueue{j: pool.j}
-		w, err := New(pool, q, store, renderer, Options{Metrics: reg})
+		// Engine Options воркера → метка engine приборов (T-235).
+		w, err := New(pool, q, store, renderer, Options{Metrics: reg, Engine: config.EngineMoli})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -169,8 +205,9 @@ func TestMetricsProcessDelivery(t *testing.T) {
 		if got := rwMetricValue(t, reg, "crawler_stage_seconds", stage); got != 1 {
 			t.Errorf("crawler_stage_seconds (count) = %v, want 1", got)
 		}
-		if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true"}); got != 1 {
-			t.Errorf("crawler_render_records_total{rendered=\"true\"} = %v, want 1", got)
+		if got := rwMetricValue(t, reg, "crawler_render_records_total",
+			map[string]string{"rendered": "true", "engine": config.EngineMoli}); got != 1 {
+			t.Errorf("crawler_render_records_total{rendered=\"true\",engine=%s} = %v, want 1", config.EngineMoli, got)
 		}
 	})
 

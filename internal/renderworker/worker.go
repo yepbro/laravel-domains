@@ -444,6 +444,16 @@ type Options struct {
 	// q:render-fallback. Нулевое значение (дефолт) — фолбэка нет,
 	// поведение финализаций прежнее.
 	Fallback FallbackOptions
+	// Engine — движок рендера сборки (render.engine, T-234; словарь
+	// config.EngineChromium|EngineMoli|EngineLightpanda): значение метки
+	// engine метрик этапа (T-235, ТЗ §4.6 п.1, ФТ-15 — проводится в
+	// NewMetrics при инициализации приборов; кардинальность 3).
+	// На поведение рендера поле не влияет: движок видят только
+	// конфигурация и аллокатор (ФТ-4), здесь — наблюдаемость; словарь
+	// и связку «движок × remote_url × порог памяти» уже проверили
+	// config.Validate и render.Options.validate. "" — chromium (как у
+	// render.Options.Engine, сборки без конфигурации).
+	Engine string
 	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
 	Log *slog.Logger
 	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
@@ -551,7 +561,7 @@ func New(db RenderDB, q queue.Queue, contents ContentStore, renderer Renderer, o
 		return nil, errors.New("renderworker: пул рендера не задан")
 	}
 	return &Worker{db: db, q: q, contents: contents, renderer: renderer,
-		opt: opts.withDefaults(), met: NewMetrics(opts.Metrics), fbDedup: newFallbackDedup()}, nil
+		opt: opts.withDefaults(), met: NewMetrics(opts.Metrics, opts.Engine), fbDedup: newFallbackDedup()}, nil
 }
 
 // renderTarget — прочитанная строка результата: цель рендера и старая
