@@ -43,8 +43,21 @@ scheduler ──> q:dns ──> dns-worker ──> q:http ──> http-worker �
 - Два среза `XINFO GROUPS` (Δentries-read) → скорость. См. формулы в SKILL.md.
 - XINFO GROUPS --raw, одна группа, позиции строк (Redis 7.4):
   2=name, 4=consumers, 6=pending, 8=last-delivered-id, 10=entries-read, 12=lag.
-- Backpressure: `scheduler.queue_high_watermark` (100 тыс.) — выше порога
-  задачи не публикуются, у домена ставится флаг `render_pending`.
+- Backpressure: общий `scheduler.queue_high_watermark` (100 тыс.), а у
+  q:render — отдельный `render.queue_high_watermark` (T-174, на проде
+  10 тыс., `/etc/crawler/config.yaml` секция `render:`). Выше порога
+  SPA-записи не публикуются, у домена ставится флаг `render_pending`
+  (бит 1 `domains.flags`).
+- Пополнение q:render из долга (T-066): пока глубина стрима ниже
+  `render.queue_high_watermark`, проход доработки `RequeueRenderPending`
+  в http-worker (тик ~1 мин, пачка до 100 доменов) публикует SPA-задачи
+  доменов с флагом и снимает бит — переходы бита ведут счётчик
+  `crawler_counters['render_pending']` (T-175). Следствие: лаг q:render
+  держится у порога, пока долг не исчерпан. Между снимками сравнивать
+  только сумму **lag(q:render) + render_pending** (готовая метрика
+  monitor: `crawler_render_pending_domains`); дренаж жив — если в
+  журнале http-worker идёт «проход доработки рендера» (full=true —
+  пачка упёрлась в порог, это норма).
 
 ## Порты метрик (Prometheus, 127.0.0.1, с сервера)
 
@@ -72,6 +85,9 @@ curl -s 127.0.0.1:9100/metrics | grep -E '^crawler_(queue|unit|redis)'
   `checks:ГГГГ-ММ-ДД` — проверок доменов за сутки (0 при стоящем фронте);
   `laravel_appeared_total` / `laravel_lost_total` — находки;
   `render_pending` — рендер-долг (защита retention, T-166/T-185);
+  полный рендер-долг = лаг q:render + это значение — сравнивать q:render
+  между снимками только вместе с ним (метрика
+  `crawler_render_pending_domains`);
   `reanalyze:*` — шум, фильтровать.
 
 ## Контент-хранилище и диск
@@ -103,6 +119,7 @@ curl -s 127.0.0.1:9100/metrics | grep -E '^crawler_(queue|unit|redis)'
 | 03.11.2026 | скорость 0 дом/с сутками, q:dns/q:http пустые | crawler-scheduler остановлен вручную оператором |
 | 23.10.2026 | лаг q:render ≈99 тыс., retention стоит | рендер-долг: защита записей от удаления (T-166/T-167) |
 | 03.11.2026 | syslog +2.5 ГБ за 2 дня | консоли чужих страниц из chromium (см. drop-in выше) |
+| 04.11.2026 | лаг q:render ~9,9 тыс. сутами «не тает», прогноз дренажа за часы не сбылся | равновесие у `render.queue_high_watermark` (10 тыс.): проход доработки T-066/T-174 пополняет очередь из render_pending (~350 тыс.) — это норма; метрика — lag + render_pending, ETA по сумме |
 
 ## Точечные команды по блокам
 
@@ -116,6 +133,9 @@ journalctl -u crawler-http-worker --since -1h -q | grep -iE "err|warn|fatal|pani
 
 # зависшие сообщения очереди (pending у группы)
 redis-cli XPENDING q:render render-worker
+
+# дренаж рендер-долга: пополнение q:render из render_pending (T-066)
+journalctl -u crawler-http-worker --since -30m -q | grep "проход доработки рендера" | tail -5
 
 # состояние домена
 set -a; . /etc/crawler/crawler.env 2>/dev/null; set +a
