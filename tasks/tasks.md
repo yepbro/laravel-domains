@@ -289,7 +289,7 @@ worktree `fix-s35-<slug>`, **каждая находка — отдельный 
 почти не пересекаются, последовательность — из-за окна; T-254 — после
 всех фикс-задач, решение оператора 2026-11-06).
 
-- **T-250** [в работе] — fix-s35-worker (internal/renderworker +
+- **T-250** [сделана] — fix-s35-worker (internal/renderworker +
   acceptance): (1) S-P1-1 — движковый guard публикации фолбэка:
   `fallbackArmed()` не публикует при engine=chromium (шаг 1 приёмки
   ТЗ §6.2, откат §6.4 «гаснет сама», ФТ-14); acceptance
@@ -306,7 +306,7 @@ worktree `fix-s35-<slug>`, **каждая находка — отдельный 
   панели НЕ меняем — решение оператора); services.md. Критерий: тесты
   трёх пунктов зелёные, behavior по умолчанию (chromium без фолбэка)
   не меняется.
-- **T-251** [новая] — fix-s35-infra (internal/config + deploy):
+- **T-251** [в работе] — fix-s35-infra (internal/config + deploy):
   (1) S-P1-2 — `restart_memory_bytes: 0` в deploy/docker/config.dev.yaml
   + пояснение в закомментированных образцах движков + тест профиля dev
   с engine=moli/lightpanda проходит Validate + dev-environment.md
