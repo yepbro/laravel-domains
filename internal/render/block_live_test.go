@@ -318,9 +318,19 @@ func domAttr(dom, name string) string {
 }
 
 // TestBlockLiveTrackerDomains — опция block_tracker_domains (T-214)
-// против живого Chromium, дифференциалом двух прогонов одной страницы
+// против живого Chromium (дифференциал — blockLiveTrackerDomains; детали
+// механики и обоснование зондов — в докомментарии хелпера).
+func TestBlockLiveTrackerDomains(t *testing.T) {
+	skipUnlessLive(t)
+	blockLiveTrackerDomains(t, liveOptions())
+}
+
+// blockLiveTrackerDomains — дифференциал двух прогонов одной страницы
 // (трекер-домены резолвятся DNS-алиасами compose в этот же run-контейнер,
-// счётчики сервера — независимое от CDP-событий доказательство):
+// счётчики сервера — независимое от CDP-событий доказательство); opts —
+// браузер прогона (контрольный — как передан, рабочий — копия с
+// BlockTrackerDomains). Параметр — per-engine срез T-254
+// (engines_live_test.go) и живой Chromium (liveOptions):
 //
 //   - контроль (опция выключена): зонды обоих трекер-доменов ДОХОДЯТ до
 //     сервера и читаются (loaded 200) — иначе тест ничего не доказывает
@@ -336,13 +346,13 @@ func domAttr(dom, name string) string {
 // googletagmanager, doubleclick) зондируется юнит-тестами, но не live:
 // google-домены в HSTS-preload Chromium — http-зонд принудительно
 // апгрейдится на https и падает на TLS с HTTP-сервером теста.
-func TestBlockLiveTrackerDomains(t *testing.T) {
-	skipUnlessLive(t)
+func blockLiveTrackerDomains(t *testing.T, opts Options) {
+	t.Helper()
 
 	// Контрольный прогон: свежий сервер — счётчики только этого прогона.
 	cOff, offPage := blockLiveServe(t)
 	offURL := strings.TrimSuffix(offPage, "page.html") + "tracker.html"
-	offOut := blockLiveRun(t, liveOptions(), offURL)
+	offOut := blockLiveRun(t, opts, offURL)
 	if got := cOff.clarityProbe.Load(); got < 1 {
 		t.Fatalf("контроль: зонд clarity.ms не дошёл до сервера (%d; атрибут clarity-xhr %q, mc-xhr %q) — "+
 			"проверьте флаг --use-aliases у compose run и DNS-алиасы сервиса tools (T-214)",
@@ -362,9 +372,9 @@ func TestBlockLiveTrackerDomains(t *testing.T) {
 	// Рабочий прогон: опция включена.
 	cOn, onPage := blockLiveServe(t)
 	onURL := strings.TrimSuffix(onPage, "page.html") + "tracker.html"
-	opts := liveOptions()
-	opts.BlockTrackerDomains = true
-	onOut := blockLiveRun(t, opts, onURL)
+	onOpts := opts
+	onOpts.BlockTrackerDomains = true
+	onOut := blockLiveRun(t, onOpts, onURL)
 	if onOut.FinalURL != onURL {
 		t.Errorf("final URL %q, хочу %q", onOut.FinalURL, onURL)
 	}

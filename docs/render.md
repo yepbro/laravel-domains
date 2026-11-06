@@ -1072,8 +1072,29 @@ docker compose --project-directory . -f deploy/docker/compose.yaml \
   go test ./internal/render -run BrowserLive -v -count=1
 ```
 
-`--use-aliases` включает DNS-алиасы сервиса tools (нужны только
-live-тесту блокировки трекеров T-214, остальным не мешает).
+`--use-aliases` включает DNS-алиасы сервиса tools (нужны live-тестам
+блокировки трекеров — T-214 и per-engine срезу ниже, — остальным не
+мешает).
+
+Per-engine срез движков (T-254, `engines_live_test.go`): таблица
+chromium/moli/lightpanda — один код × наборы переменных адресов
+(`CHROMIUM_WS_URL`/`MOLI_WS_URL`/`LIGHTPANDA_WS_URL`, дефолты — адреса
+compose-сервисов; общий оверрайд `CRAWLER_RENDER_REMOTE_URL` остальных
+live-тестов срез не читает). На каждый движок — зонд `/json/version`
+(недоступный движок при дефолтном адресе — SKIP с причиной, при явно
+заданной переменной — отказ), затем срез инвариантов ТЗ 5.6 (ФТ-5 ТЗР
+движков): изоляция контекста на задачу, navigate + съём DOM/JS- и
+httpOnly-cookies/заголовков ответа, перехват Fetch по типам (T-062) и
+трекер-доменам (T-214, общий дифференциал `blockLiveTrackerDomains`),
+SSRF-контур (T-219: отказ задачи классом task; T-230: навигация на
+приватный адрес testbed обрывается перехватом —
+`net::ERR_BLOCKED_BY_CLIENT`; резолв контура в тесте — unbound стека
+через шов `Options.LookupHost`: резолвер run-контейнера tools внешний,
+тестовых зон не знает), UA-override (и в `navigator.userAgent`, и в
+заголовке запроса на сервер фикстуры). moli/lightpanda поднимаются профилем
+`render-engines`; состояние pinned-версий против среза — докомментарий
+файла и процедура smoke ФТ-17 в
+[`dev-environment.md`](dev-environment.md).
 
 Страницы-задачи — HTTP-фикстуры: тест поднимает сервер в run-контейнере
 (слушает 0.0.0.0, страницам отдаётся адрес контейнера в `crawler_net` —

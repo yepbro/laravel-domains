@@ -205,6 +205,17 @@ Moli запускается `serve` с биндом на свой статиче
 проверять целиком:
 `dc run --rm --no-deps tools wget -qO- http://172.28.100.16:9222/json/version`).
 
+Per-engine живые тесты рендера (T-254): полный CDP-срез каждого движка
+против зон `*.crawl.test` — изоляция контекста, съём DOM/cookies/заголовков,
+перехват Fetch, SSRF-контур, UA-override; таблица движков, адреса —
+`CHROMIUM_WS_URL`/`MOLI_WS_URL`/`LIGHTPANDA_WS_URL` (дефолты — адреса
+стека; недоступный движок при адресе по умолчанию — SKIP; в
+tools-контейнере `CHROMIUM_WS_URL` задан compose — недоступный chromium
+даёт отказ, а не SKIP). Запуск и текущее состояние pinned-версий —
+докомментарий `internal/render/engines_live_test.go` и раздел
+[«Smoke движка при смене версии (ФТ-17)»](#smoke-движка-при-смене-версии-фт-17-t-254)
+ниже.
+
 ### Фикстуры рендера и изолированный прогон этапа (T-242/T-243/T-244)
 
 Стенд сравнения движков (ТЗ рендера §6.1) не гоняет домены через весь
@@ -357,6 +368,94 @@ render-воркеру. Выделенная БД Redis (например, 15 —
 из DSN, без пароля) и план; `--force` печатает цель перед первой записью —
 проверяйте её: `fixtures import` перезаписывает зоны/домены/результаты
 по PK и выметает contents — это инструмент тестовой БД, не прода.
+
+### Smoke движка при смене версии (ФТ-17, T-254)
+
+Смена pinned-версии движка рендера — отдельная процедура, не «поехало с
+latest» (ФТ-17 ТЗР движков): версии закреплены в `.env` — `LIGHTPANDA_IMAGE`,
+пара `MOLI_VERSION` + `MOLI_SHA256` (контрольная сумма релизного ассета),
+`CHROMEDP_HEADLESS_IMAGE` (последняя входит и в args `Dockerfile.render` —
+профиль runtime пересобирается тем же пином). Процедура — два слоя: сначала
+герметичный testbed-срез (интернета не требует), затем реальный smoke по
+smoke-подвыборке фикстуры (§6.1 п. 6 ТЗР движков, ~300 доменов). Красный
+любой шаг — откат переменной (образ прежней версии остаётся локально,
+переподъём возвращает его) и разбор причины.
+
+1. **Пересборка/переподъём профиля движка.** moli: сменить
+   `MOLI_VERSION`/`MOLI_SHA256` → `dc --profile render-engines up -d moli`
+   (тег образа несёт версию — compose пересоберёт сам); lightpanda: сменить
+   `LIGHTPANDA_IMAGE` → тот же up; chromium: сменить `CHROMEDP_HEADLESS_IMAGE`
+   → `dc up -d chromium` (+ пересборка render/render-fallback профиля
+   runtime, если стенд проверяет и боевой образ). Здоровье — healthcheck
+   `/json/version` в `dc ps` зелёный.
+2. **Слой 1 — testbed-срез нового движка** (`TestEnginesLiveCDPSlice`,
+   `internal/render/engines_live_test.go`; таблица движков: адреса
+   `CHROMIUM_WS_URL`/`MOLI_WS_URL`/`LIGHTPANDA_WS_URL`, дефолты — адреса
+   стека, недоступный движок — SKIP):
+
+   ```bash
+   dc run --use-aliases -e CRAWLER_RENDER_TEST=1 --rm tools \
+       go test ./internal/render -run 'TestEnginesLiveCDPSlice/<движок>' -v -count=1
+   ```
+
+   Гейт среза печатает ответ `/json/version` — сверить версию в нём с новым
+   пином. Красный срез — стоп-сигнал: новый движок не тянет CDP-инварианты
+   этапа (инварианты — ТЗ 5.6/ФТ-5: изоляция контекста на задачу, съём
+   DOM/cookies/заголовков, перехват Fetch, SSRF-контур, UA-override).
+   Прецеденты pinned-версий на момент T-254 — в докомментарии файла:
+   lightpanda 1.0.2 — один browser context на соединение (сессия не
+   создаётся вовсе), moli v1.1.21 — `Fetch.enable` по типам Media/Font
+   отвечает InvalidParams (каждая задача падает на включении перехвата);
+   до починки движка/ядра срез по нему обязан быть красным.
+3. **Реальный smoke по smoke-подвыборке.** Стенд — отдельный инстанс
+   dev-стека в режиме internet (`ALLOW_INTERNET=1`, `make up-internet` —
+   реальные домены требуют резолва наружу) с составом и изоляцией из
+   раздела выше. Фикстура — свежий дамп с прода (`fixtures export`, T-242,
+   на копии прода) или существующий дамп стенда. Порядок:
+
+   ```bash
+   # 0) baseline-chromium по той же smoke-выборке — один раз на дамп
+   #    (переключатель движка — раздел «Движки рендера» выше; после
+   #    дренирования q:render — снапшот; обновлять при смене дампа/правил)
+   # 1) накат и публикация smoke-подвыборки (~300 доменов)
+   #    ($APP_PG_DSN — DSN тестовой БД стенда по образцу compose,
+   #    $REDIS — адрес Redis стенда; как и в блоке фикстур выше)
+   dc run --rm -e CRAWLER_POSTGRES_DSN="$APP_PG_DSN" tools \
+       go run ./cmd/crawlerctl fixtures import \
+       --dir /src/var/fixtures-render --force --publish smoke
+   # 2) render-worker стенда — в профиле тестируемого движка
+   #    (engine + remote_url в конфиге стенда, dc restart render-worker),
+   #    ожидание дренирования q:render (crawlerctl status / дашборд)
+   # 3) снапшот прогона кандидата (метрики — /metrics render-worker стенда)
+   dc run --rm -e CRAWLER_POSTGRES_DSN="$APP_PG_DSN" -e CRAWLER_REDIS_ADDR="$REDIS" tools \
+       go run ./cmd/crawlerctl fixtures snapshot \
+       --dir /src/var/fixtures-render --label moli-v1.1.22 --engine moli \
+       --metrics http://172.28.100.25:9105/metrics
+   # 4) отчёт против baseline-chromium (пороги §5.1 п.4 ТЗР движков)
+   dc run --rm tools go run ./cmd/crawlerctl fixtures report \
+       --baseline /src/var/fixtures-render/chromium-baseline.snapshot.json \
+       --candidate /src/var/fixtures-render/moli-v1.1.22.snapshot.json
+   ```
+
+   На 300 доменах пороги §5.1 индикативны (полная процедура — стендовое
+   сравнение T-247): критерий smoke — успешность/темп без деградации
+   против baseline, 0 crashes ядра движка, память в порядке; между
+   baseline и кандидатом перезапускайте render-worker (счётчики = ровно
+   прогон) и повторяйте `import --force` + `--publish` (сброс строк и
+   стримов — раздел «Фикстуры рендера» выше).
+4. **Решение и фиксация.** Зелёные шаги 1–3 — пин обновлён (при смене
+   дефолта — коммит `.env.example`), журнал — `docs/operations.md`; красный
+   шаг — откат переменной, переподъём, при движковой причине — issue в
+   апстрим движка (прецеденты — докомментарий `engines_live_test.go`).
+
+Ручные шаги процедуры (инструмента нет, выполняет оператор): замер RSS
+движка во время прогона — периодический `docker stats --no-stream` и
+`--engine-rss-max` на снапшоте (экспортёра памяти движков в dev-стеке нет,
+без флага порог памяти отчёта честно деградирует в «НЕТ ДАННЫХ»); контроль
+дренирования очередей; обновление baseline-chromium при смене дампа или
+правил (диф детекции сравнивает вердикты одного `rules_version`). Слой 2 —
+именно процедура, не автотест: реальный интернет и живые домены в CI и
+штатном `make test` не участвуют никогда.
 
 ## 3. Структура каталогов
 
