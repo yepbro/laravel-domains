@@ -306,7 +306,7 @@ worktree `fix-s35-<slug>`, **каждая находка — отдельный 
   панели НЕ меняем — решение оператора); services.md. Критерий: тесты
   трёх пунктов зелёные, behavior по умолчанию (chromium без фолбэка)
   не меняется.
-- **T-251** [в работе] — fix-s35-infra (internal/config + deploy):
+- **T-251** [сделана] — fix-s35-infra (internal/config + deploy):
   (1) S-P1-2 — `restart_memory_bytes: 0` в deploy/docker/config.dev.yaml
   + пояснение в закомментированных образцах движков + тест профиля dev
   с engine=moli/lightpanda проходит Validate + dev-environment.md
@@ -325,7 +325,7 @@ worktree `fix-s35-<slug>`, **каждая находка — отдельный 
   (6) S-P3-4 — docs/configuration.md: где живёт worker_rate в docker
   (профиль B) vs systemd (общий конфиг). Критерий: профиль-тесты
   зелёные, docker compose config валиден, env-тесты зелёные.
-- **T-252** [новая] — fix-s35-monodash (monitor + dashboard + status):
+- **T-252** [в работе] — fix-s35-monodash (monitor + dashboard + status):
   (1) S-P2-1 (решение: streak без роста) — render_fallback_depth:
   второй триггер «n ≥ порога 2 прохода подряд» без требования роста;
   тесты: стационар 9000 → firing, упор в MAXLEN 15000 → firing+удержание,
