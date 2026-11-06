@@ -74,6 +74,13 @@ rollback() {
     for u in crawler-chromium crawler-ingest crawler-scheduler crawler-dns-worker \
              crawler-http-worker crawler-render-worker crawler-analyzer \
              crawler-monitor crawler-web crawler-dashboard; do
+        # Отключённый оператором юнит (disable/mask — как в
+        # deploy-healthcheck.sh) планово выключен, а не «не поднялся»:
+        # из проверки исключается, иначе откат ложно репортит degraded.
+        enabled=$(systemctl is-enabled "$u" 2>/dev/null || true)
+        if [ "$enabled" = disabled ] || [ "$enabled" = masked ]; then
+            continue
+        fi
         state=$(systemctl is-active "$u" 2>/dev/null || true)
         if [ "$state" != active ]; then
             echo "юнит $u после отката: $state" >&2

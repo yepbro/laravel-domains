@@ -211,6 +211,32 @@ history»: merge-коммиты запрещены (bypass-обход владе
   очереди, testbed), затем удаление worktree и ветки. Пуш
   (`git push origin master`) — только по явному указанию (см. «Правила»).
 
+### Деплой: ветка production
+
+Прод деплоится только с ветки `production` (push в production → ci →
+deploy → healthcheck с авто-откатом; детали — docs/ci-cd.md).
+
+- Коммиты — **только в `master`** (feature-ветки вливаются в него
+  линейно, см. «Линейная история master»). В `production` коммиты не
+  делаются никогда: это движущийся ff-указатель на коммит из истории
+  `master`. Собственные коммиты в `production` и force-push в него
+  запрещены (не-ff пуш GitHub отвергает сам).
+- Релиз — `git push origin master:production` (или `<sha>:production`);
+  перед пушем проверить, что ff возможен:
+  `git fetch && git merge-base --is-ancestor origin/production master`.
+  Пуш в `production` = деплой на боевой сервер.
+- Хотфикс и откат релиза — коммит/revert в `master`, затем ff
+  `production` (история вперёд, контент назад). Cherry-picк напрямую
+  в `production` ломает ff-связь с `master` — не допускается.
+- Триггер `workflow_run` в `deploy.yml` GitHub читает только с ветки
+  по умолчанию (`master`) — правки workflows деплоя проходят через
+  `master`, изменения только в `production` на триггеры не влияют.
+- Юнит, планово отключённый на сервере оператором
+  (`systemctl disable --now` + `mask`, например `crawler-scheduler`),
+  не проверяется healthcheck'ом деплоя и проверкой юнитов в
+  install/rollback-скриптах. Обратное включение — `systemctl unmask` +
+  `enable --now` (+ рестарт `crawler.target`).
+
 ### Параллельное выполнение
 
 - По умолчанию — скользящее окно: до 4 независимых задач одновременно
@@ -265,7 +291,8 @@ T-номера. Ревью — по необходимости, по схеме 
 ## Правила
 
 - **Не пушить без явного указания:** `git push` (в т.ч. `git push
-  origin master` после вливаний) не выполняется, пока пользователь
+  origin master` после вливаний и `git push origin master:production` —
+  релиз на прод) не выполняется, пока пользователь
   прямо не попросит об этом. Коммиты и вливания — локально, без пуша.
 - **Модели субагентов:** любая разработка (задачи цикла, разовые
   поручения) — `zai-coding-plan/glm-5.3`; правки по ревью в рамках

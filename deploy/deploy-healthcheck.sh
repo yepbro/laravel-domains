@@ -17,14 +17,37 @@ READY_DEADLINE=${READY_DEADLINE:-300} # бюджет готовности health
 PROBE_TIMEOUT=5                       # curl -m, с
 PROBE_PAUSE=5                         # пауза между попытками, с
 
+# Юниты с их портами healthz (docs/deploy.md §5; chromium — только
+# активность юнита, порта метрик нет). Юнит, отключённый на сервере
+# оператором (systemctl disable/mask — например, crawler-scheduler при
+# приостановке постановки задач), исключается из проверки целиком:
+# планово выключенный сервис — не сбой деплоя, healthcheck не должен
+# авто-откатывать релиз из-за него.
+checked=()
+ports=()
+for spec in crawler-chromium:- crawler-ingest:9101 crawler-scheduler:9102 \
+            crawler-dns-worker:9103 crawler-http-worker:9104 \
+            crawler-render-worker:9105 crawler-analyzer:9106 \
+            crawler-web:9107 crawler-dashboard:9108; do
+    u=${spec%%:*}
+    p=${spec#*:}
+    enabled=$(systemctl is-enabled "$u" 2>/dev/null || true)
+    if [ "$enabled" = disabled ] || [ "$enabled" = masked ]; then
+        echo "юнит $u: $enabled — исключён из проверки (отключён оператором)"
+        continue
+    fi
+    checked+=("$u")
+    if [ "$p" != - ]; then
+        ports+=("$p")
+    fi
+done
+
 # Юниты: до 60 секунд на активность (рестарт набора не мгновенный)
 units_deadline=$((SECONDS + 60))
 fail=0
 while :; do
     fail=0
-    for u in crawler-chromium crawler-ingest crawler-scheduler crawler-dns-worker \
-             crawler-http-worker crawler-render-worker crawler-analyzer \
-             crawler-monitor crawler-web crawler-dashboard; do
+    for u in "${checked[@]}"; do
         state=$(systemctl is-active "$u" 2>/dev/null || true)
         if [ "$state" != active ]; then
             echo "юнит $u: $state"
@@ -38,10 +61,8 @@ while :; do
     sleep "$PROBE_PAUSE"
 done
 
-# monitor 9100, ingest 9101, scheduler 9102, dns 9103, http 9104,
-# render 9105, analyzer 9106, web 9107, dashboard 9108 (docs/deploy.md §5)
 deadline=$((SECONDS + READY_DEADLINE))
-for p in 9100 9101 9102 9103 9104 9105 9106 9107 9108; do
+for p in "${ports[@]}"; do
     until curl -fsS -m "$PROBE_TIMEOUT" "127.0.0.1:$p/healthz" >/dev/null 2>&1; do
         if [ "$SECONDS" -ge "$deadline" ]; then
             echo "healthz 127.0.0.1:$p: FAIL (нет ответа за ${READY_DEADLINE}s)"
@@ -65,4 +86,4 @@ if [ "$fail" -ne 0 ]; then
     echo "ЕСТЬ КРАСНЫЕ ПРОВЕРКИ" >&2
     exit 1
 fi
-echo "все проверки зелёные: 10 юнитов active, healthz 9100…9108 ok, crawlerctl ok (за ${SECONDS}s)"
+echo "все проверки зелёные: ${#checked[@]} юнитов active, healthz ${ports[*]} ok, crawlerctl ok (за ${SECONDS}s)"
