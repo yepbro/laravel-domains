@@ -39,6 +39,14 @@
 // множество, защита от собранных вручную); повторный запуск import с
 // --publish добавляет записи в стрим заново — между прогонами стрим
 // очищается (инструкция — docs/dev-environment.md).
+//
+// Запись — только с явным --force (S-P3-5, сверхраунд ревью этапа 35;
+// образец — zones collapse --apply): накат перезаписывает зоны/домены/
+// строки результатов по PK и выметает contents, ошибочный DSN необратимо
+// менял бы чужие строки. Без флага — dry-run: цель из DSN (без пароля) и
+// полный план наката без единой записи; с флагом цель и план печатаются
+// перед первой записью. --publish дополняет --force — публикация q:render
+// молча не идёт.
 
 package main
 
@@ -49,6 +57,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -188,6 +197,28 @@ const (
 // воркерах стенда (Put до записи результата — транзиентная ссылка).
 const fixturesSweepContentsSQL = "DELETE FROM contents WHERE NOT EXISTS " +
 	"(SELECT 1 FROM subdomain_results AS r WHERE r.content_hash = contents.hash)"
+
+// План наката (S-P3-5) — read-only счётчики для dry-run и вводного
+// вывода --force: существующие по PK строки дампа (разбивка «вставка /
+// обновление») и объём уборки контента — предикат тот же, что у
+// fixturesSweepContentsSQL, но подсчётом, без DELETE.
+const (
+	fixturesPlanZonesExistSQL = "SELECT count(*) FROM zones AS z " +
+		"JOIN unnest($1::int2[]) AS k(id) ON z.id = k.id"
+
+	fixturesPlanDomainsExistSQL = "SELECT count(*) FROM domains AS d " +
+		"JOIN unnest($1::int2[], $2::int8[]) AS k(zone_id, id) " +
+		"ON d.zone_id = k.zone_id AND d.id = k.id"
+
+	fixturesPlanResultsExistSQL = "SELECT count(*) FROM subdomain_results AS r " +
+		"JOIN unnest($1::int2[], $2::int8[], $3::int2[], $4::int2[]) " +
+		"AS k(zone_id, domain_id, subdomain_id, variant) " +
+		"ON r.zone_id = k.zone_id AND r.domain_id = k.domain_id " +
+		"AND r.subdomain_id = k.subdomain_id AND r.variant = k.variant"
+
+	fixturesPlanSweepCountSQL = "SELECT count(*) FROM contents WHERE NOT EXISTS " +
+		"(SELECT 1 FROM subdomain_results AS r WHERE r.content_hash = contents.hash)"
+)
 
 // ---------------------------------------------------------------- дамп
 
@@ -735,6 +766,197 @@ func maxDumpDomainID(domains []fixturesDomain) int64 {
 	return max
 }
 
+// ---------------------------------------------------------------- план (S-P3-5)
+
+// fixturesImportPlan — план наката: цель из DSN без секрета и счётчики по
+// таблицам — всё, что оператор обязан видеть до первой записи. Строится
+// только SELECT'ами: dry-run (без --force) и вводный вывод перед реальным
+// накатом — один и тот же план.
+type fixturesImportPlan struct {
+	Target        string // user@host:port/dbname — без пароля (fixturesImportTarget)
+	Zones         int    // строки дампа к накату (после дедупа)
+	ZonesExist    int    // из них уже в БД по PK → ON CONFLICT DO UPDATE
+	Domains       int
+	DomainsExist  int
+	Results       int
+	ResultsExist  int
+	SweepContents int64 // строк contents выметет накат (сироты без живых ссылок)
+	MaxZoneID     int64 // последовательности поднимутся не ниже максимума дампа
+	MaxDomainID   int64
+	DupZones      int
+	DupDomains    int
+	DupResults    int
+}
+
+// fixturesImportTarget — цель наката из DSN для вывода оператору:
+// user@host:port/dbname без пароля и query-секретов (S-P3-5: накат
+// перезаписывает строки, цель обязана быть на экране до записи — но не
+// весь DSN). DSN не в URL-форме (keyword/value) и неразбораемые строки —
+// db.RedactDSN: пароль вырезан, структура не раскрывается глубже.
+func fixturesImportTarget(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil || u.Host == "" || u.Path == "" {
+		return db.RedactDSN(dsn, "DSN postgres без host/dbname — см. postgres.dsn (конфигурация)")
+	}
+	user := ""
+	if u.User != nil {
+		user = u.User.Username() + "@"
+	}
+	return user + u.Host + u.Path // host[:port] + /dbname
+}
+
+// fixturesImportPlanBuild — план по дампу и текущему состоянию БД:
+// предпроверки естественных ключей (те же, что у наката, — отказ честнее
+// увидеть в dry-run, до --force), разбивка строк дампа на вставку и
+// обновление по существующим PK, объём выметаемого контента. Только
+// чтение.
+func fixturesImportPlanBuild(ctx context.Context, pool db.DB, dump *fixturesDump, target string) (*fixturesImportPlan, error) {
+	if err := fixturesCheckNaturalKeys(ctx, pool, dump); err != nil {
+		return nil, err
+	}
+	plan := &fixturesImportPlan{
+		Target:      target,
+		Zones:       len(dump.Zones),
+		Domains:     len(dump.Domains),
+		Results:     len(dump.Results),
+		MaxZoneID:   maxDumpZoneID(dump.Zones),
+		MaxDomainID: maxDumpDomainID(dump.Domains),
+		DupZones:    dump.DupZones,
+		DupDomains:  dump.DupDomains,
+		DupResults:  dump.DupResults,
+	}
+	if len(dump.Zones) > 0 {
+		ids := make([]int16, len(dump.Zones))
+		for i, z := range dump.Zones {
+			ids[i] = z.ID
+		}
+		n, err := fixturesCountRows(ctx, pool, fixturesPlanZonesExistSQL, ids)
+		if err != nil {
+			return nil, fmt.Errorf("план наката: существующие зоны: %w", err)
+		}
+		plan.ZonesExist = int(n)
+	}
+	if len(dump.Domains) > 0 {
+		zones := make([]int16, len(dump.Domains))
+		ids := make([]int64, len(dump.Domains))
+		for i, d := range dump.Domains {
+			zones[i], ids[i] = d.ZoneID, d.ID
+		}
+		n, err := fixturesCountRows(ctx, pool, fixturesPlanDomainsExistSQL, zones, ids)
+		if err != nil {
+			return nil, fmt.Errorf("план наката: существующие домены: %w", err)
+		}
+		plan.DomainsExist = int(n)
+	}
+	if len(dump.Results) > 0 {
+		n, err := fixturesCountRows(ctx, pool, fixturesPlanSweepCountSQL)
+		if err != nil {
+			return nil, fmt.Errorf("план наката: уборка контента: %w", err)
+		}
+		plan.SweepContents = n
+		zones := make([]int16, len(dump.Results))
+		domains := make([]int64, len(dump.Results))
+		subs := make([]int16, len(dump.Results))
+		variants := make([]int16, len(dump.Results))
+		for i, r := range dump.Results {
+			zones[i], domains[i], subs[i], variants[i] = r.ZoneID, r.DomainID, r.SubdomainID, r.Variant
+		}
+		if n, err = fixturesCountRows(ctx, pool, fixturesPlanResultsExistSQL, zones, domains, subs, variants); err != nil {
+			return nil, fmt.Errorf("план наката: существующие строки результатов: %w", err)
+		}
+		plan.ResultsExist = int(n)
+	}
+	return plan, nil
+}
+
+// fixturesCountRows — скалярный count-запрос плана.
+func fixturesCountRows(ctx context.Context, pool db.DB, sql string, args ...any) (int64, error) {
+	rows, err := pool.Query(ctx, sql, args...)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return 0, errors.New("пустой ответ count")
+	}
+	var n int64
+	if err := rows.Scan(&n); err != nil {
+		return 0, fmt.Errorf("чтение count: %w", err)
+	}
+	return n, rows.Err()
+}
+
+// fixturesPrintPlan — план наката: цель (сверьте, что это стенд, а не
+// прод), строки по таблицам с разбивкой вставка/обновление,
+// последовательности, дубли ключей дампа, выметаемый контент.
+func fixturesPrintPlan(w io.Writer, plan *fixturesImportPlan, mode string) {
+	out(w, "цель наката: %s (режим: %s)\n", plan.Target, mode)
+	out(w, "план: зоны %d (вставка %d, обновление %d), домены %d (вставка %d, обновление %d), "+
+		"строки результатов %d (вставка %d, обновление %d)\n",
+		plan.Zones, plan.Zones-plan.ZonesExist, plan.ZonesExist,
+		plan.Domains, plan.Domains-plan.DomainsExist, plan.DomainsExist,
+		plan.Results, plan.Results-plan.ResultsExist, plan.ResultsExist)
+	out(w, "последовательности: zones.id → не ниже %d, domain_id_seq → не ниже %d\n",
+		plan.MaxZoneID, plan.MaxDomainID)
+	out(w, "дубли ключей дампа (схлопнуты): зоны %d, домены %d, результаты %d\n",
+		plan.DupZones, plan.DupDomains, plan.DupResults)
+	out(w, "выметается из contents: %d строк без живых ссылок\n", plan.SweepContents)
+}
+
+// fixturesPublishCount — задач публикации по режиму (строка плана):
+// all — все строки дампа, smoke — строки доменов подвыборки (тот же
+// фильтр, что у fixturesPublishRun).
+func fixturesPublishCount(dump *fixturesDump, mode string) int {
+	if mode != fixturesPublishSmoke {
+		return len(dump.Results)
+	}
+	smokeKeys := make(map[fixturesDomainKey]bool, len(dump.Smoke))
+	for _, s := range dump.Smoke {
+		smokeKeys[fixturesDomainKey{s.ZoneID, s.DomainID}] = true
+	}
+	n := 0
+	for _, r := range dump.Results {
+		if smokeKeys[fixturesDomainKey{r.ZoneID, r.DomainID}] {
+			n++
+		}
+	}
+	return n
+}
+
+// fixturesImportOpts — параметры выполнения наката.
+type fixturesImportOpts struct {
+	Force     bool   // запись; без флага — dry-run
+	DSN       string // цель из DSN (без секрета) для плана
+	Publish   string // режим публикации: "", all, smoke (только с Force)
+	RedisAddr string // цель публикации для плана
+}
+
+// fixturesImportApply — план и накат: до первой записи — цель из DSN и
+// полный план; без Force — dry-run, возврат без записи (SELECT'ы плана —
+// не запись); с Force — план печатается и выполняется накат. Выделен из
+// fixturesImportCmd для тестов флага без конфигурации и БД.
+func fixturesImportApply(ctx context.Context, pool db.DB, dump *fixturesDump, opts fixturesImportOpts, stdout io.Writer) error {
+	plan, err := fixturesImportPlanBuild(ctx, pool, dump, fixturesImportTarget(opts.DSN))
+	if err != nil {
+		return err
+	}
+	mode := "dry-run"
+	if opts.Force {
+		mode = "force"
+	}
+	fixturesPrintPlan(stdout, plan, mode)
+	if opts.Publish != "" {
+		out(stdout, "план публикации q:render (%s): задач %d → Redis %s\n",
+			opts.Publish, fixturesPublishCount(dump, opts.Publish), opts.RedisAddr)
+	}
+	if !opts.Force {
+		out(stdout, "dry-run: БД не изменена — накат выполнит та же команда с --force\n")
+		return nil
+	}
+	_, err = fixturesImportRun(ctx, pool, dump, stdout)
+	return err
+}
+
 // ---------------------------------------------------------------- публикация
 
 // fixturesPublishStats — итог публикации: опубликованные задачи, пропущенные
@@ -849,14 +1071,17 @@ func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, 
 // ---------------------------------------------------------------- команда
 
 // fixturesImportCmd — crawlerctl fixtures import: разбор флагов, чтение
-// дампа (локальные проверки до инфраструктуры), накат и — с --publish —
-// публикация. Подключения — по образцу reanalyze: конфигурация + окружение
+// дампа (локальные проверки до инфраструктуры), план и накат за --force
+// (S-P3-5: без флага — dry-run, --publish дополняет --force), публикация.
+// Подключения — по образцу reanalyze: конфигурация + окружение
 // (internal/config), пул 2 (бюджет ТЗ 6.3), Redis — адрес секции redis.
 func fixturesImportCmd(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("fixtures import")
 	dir := fs.String("dir", "", "каталог дампа формата v1 (обязателен)")
 	publish := fs.String("publish", "", "публикация задач фикстуры в q:render без DNS/HTTP: "+fixturesPublishAll+
-		" — все записи дампа, "+fixturesPublishSmoke+" — домены smoke-подвыборки (пусто — только накат)")
+		" — все записи дампа, "+fixturesPublishSmoke+" — домены smoke-подвыборки (только с --force)")
+	force := fs.Bool("force", false,
+		"выполнить накат (без флага — dry-run: цель из DSN и полный план без записи)")
 	if handled, err := parseFlags(fs, fixturesHelp, args, stdout); handled {
 		return err
 	}
@@ -868,6 +1093,9 @@ func fixturesImportCmd(args []string, stdout, stderr io.Writer) error {
 	default:
 		return usagef("fixtures import: --publish: неизвестный режим %q (допустимы: %s, %s)",
 			*publish, fixturesPublishAll, fixturesPublishSmoke)
+	}
+	if *publish != "" && !*force {
+		return usagef("fixtures import: --publish дополняет --force (dry-run ничего не накатывает и не публикует)")
 	}
 	if fs.NArg() > 0 {
 		return usagef("fixtures import: лишние аргументы %v (команда принимает только флаги)", fs.Args())
@@ -893,10 +1121,15 @@ func fixturesImportCmd(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("fixtures import: %w", err)
 	}
-	if _, err := fixturesImportRun(ctx, pool, dump, stdout); err != nil {
+	if err := fixturesImportApply(ctx, pool, dump, fixturesImportOpts{
+		Force:     *force,
+		DSN:       cfg.Postgres.DSN,
+		Publish:   *publish,
+		RedisAddr: cfg.Redis.Addr,
+	}, stdout); err != nil {
 		return fmt.Errorf("fixtures import: %w", err)
 	}
-	if *publish == "" {
+	if !*force || *publish == "" {
 		return nil
 	}
 

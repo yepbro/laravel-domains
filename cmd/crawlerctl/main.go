@@ -107,9 +107,11 @@ const usageText = `crawlerctl — CLI Domain Crawler
                                  выгрузка фикстуры рендера (zones/domains/
                                  subdomain_results без контента) для
                                  стенда движков (ТЗ рендера §6.1, T-242)
-  fixtures import --dir КАТАЛОГ [--publish all|smoke]
+  fixtures import --dir КАТАЛОГ [--force] [--publish all|smoke]
                                  накат дампа фикстуры в тестовую БД
-                                 (идемпотентно по PK) и публикация задач
+                                 (идемпотентно по PK; без --force —
+                                 dry-run: цель из DSN и план без записи)
+                                 и публикация задач
                                  прямо в q:render без DNS/HTTP (ТЗ
                                  рендера §6.1, T-243)
   fixtures snapshot --dir КАТАЛОГ --label ИМЯ --engine ИМЯ

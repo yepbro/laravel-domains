@@ -264,14 +264,14 @@ func TestFixturesReadDump(t *testing.T) {
 // ---------------------------------------------------------------- пул
 
 // importPool — фейковый db.DB для наката: INSERT идут в Exec (RowsAffected
-// из длины первой колонки-массива — пачка строк), предпроверки и setval —
-// в Query с заготовленными ответами; все SQL запоминаются (контракты и
-// повторный прогон).
+// из длины первой колонки-массива — пачка строк), предпроверки, setval и
+// read-only счётчики плана (S-P3-5) — в Query с заготовленными ответами;
+// все SQL запоминаются (контракты и повторный прогон).
 type importPool struct {
 	mu sync.Mutex
 	// execSQL — тексты выполненных INSERT/setval-запросов (порядок).
 	execSQL []string
-	// querySQL — тексты Query (предпроверки, setval).
+	// querySQL — тексты Query (предпроверки, setval, план).
 	querySQL []string
 	// zoneRows — ответ предпроверки зон: (id, name).
 	zoneRows [][]any
@@ -279,7 +279,11 @@ type importPool struct {
 	domainRows [][]any
 	// setvalVal — ответ setval.
 	setvalVal int64
-	failOn    string // подстрока SQL → ошибка
+	// Счётчики плана: существующие по PK строки дампа и выметаемый
+	// контент (dry-run читает их SELECT'ами).
+	zonesExist, domainsExist, resultsExist int
+	sweepVal                               int64
+	failOn                                 string // подстрока SQL → ошибка
 }
 
 func (p *importPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -311,6 +315,14 @@ func (p *importPool) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, e
 		return nil, fmt.Errorf("фиктивный сбой БД (%s)", p.failOn)
 	}
 	switch {
+	case strings.Contains(sql, "count(*) FROM zones AS z"): // план: существующие PK
+		return &fixturesRows{rows: [][]any{{int64(p.zonesExist)}}}, nil
+	case strings.Contains(sql, "count(*) FROM domains AS d"):
+		return &fixturesRows{rows: [][]any{{int64(p.domainsExist)}}}, nil
+	case strings.Contains(sql, "count(*) FROM subdomain_results AS r"):
+		return &fixturesRows{rows: [][]any{{int64(p.resultsExist)}}}, nil
+	case strings.Contains(sql, "count(*) FROM contents"): // план: уборка
+		return &fixturesRows{rows: [][]any{{p.sweepVal}}}, nil
 	case strings.Contains(sql, "SELECT id, name FROM zones"):
 		return &fixturesRows{rows: p.zoneRows}, nil
 	case strings.Contains(sql, "AS k(zone_id, label)"):
@@ -491,6 +503,139 @@ func TestFixturesImportRun(t *testing.T) {
 			t.Errorf("пустой дамп выполняет операторы: exec %v, query %v", exec, query)
 		}
 	})
+}
+
+// TestFixturesImportForceGate — гейт --force (S-P3-5): без флага — только
+// план (цель из DSN без секрета, счётчики вставки/обновления по таблицам,
+// дубли ключей, выметаемый контент), БД не тронута (ни одного Exec);
+// с флагом — план и накат; цель не содержит пароль DSN.
+func TestFixturesImportForceGate(t *testing.T) {
+	dsn := "postgres://crawler:secret@127.0.0.1:5432/stand?sslmode=disable"
+
+	t.Run("без --force — только план, БД не тронута", func(t *testing.T) {
+		pool := &importPool{setvalVal: 7, zonesExist: 1, domainsExist: 0, resultsExist: 1, sweepVal: 3}
+		var out bytes.Buffer
+		if err := fixturesImportApply(context.Background(), pool, importDump(t),
+			fixturesImportOpts{DSN: dsn}, &out); err != nil {
+			t.Fatalf("dry-run: %v", err)
+		}
+		s := out.String()
+		for _, need := range []string{
+			"цель наката: crawler@127.0.0.1:5432/stand (режим: dry-run)",
+			"план: зоны 1 (вставка 0, обновление 1)",
+			"домены 1 (вставка 1, обновление 0)",
+			"строки результатов 2 (вставка 1, обновление 1)",
+			"последовательности: zones.id → не ниже 7, domain_id_seq → не ниже 42",
+			"дубли ключей дампа (схлопнуты): зоны 0, домены 0, результаты 0",
+			"выметается из contents: 3 строк без живых ссылок",
+			"dry-run: БД не изменена",
+		} {
+			if !strings.Contains(s, need) {
+				t.Errorf("план без %q:\n%s", need, s)
+			}
+		}
+		if strings.Contains(s, "накат: зоны") {
+			t.Errorf("dry-run выполнил накат:\n%s", s)
+		}
+		if exec, _ := pool.calls(); len(exec) != 0 {
+			t.Errorf("dry-run записал в БД: %d Exec-операторов", len(exec))
+		}
+		// План — на SELECT'ах: предпроверки и счётчики существующих PK.
+		_, query := pool.calls()
+		joined := strings.Join(query, "\n")
+		for _, substr := range []string{
+			"SELECT id, name FROM zones", // предпроверка естественных ключей
+			"count(*) FROM zones AS z",
+			"count(*) FROM domains AS d",
+			"count(*) FROM subdomain_results AS r",
+			"count(*) FROM contents",
+		} {
+			if !strings.Contains(joined, substr) {
+				t.Errorf("план без запроса %q (запросы: %v)", substr, query)
+			}
+		}
+	})
+
+	t.Run("с --force — план и накат", func(t *testing.T) {
+		pool := &importPool{setvalVal: 7, zonesExist: 1}
+		var out bytes.Buffer
+		if err := fixturesImportApply(context.Background(), pool, importDump(t),
+			fixturesImportOpts{Force: true, DSN: dsn}, &out); err != nil {
+			t.Fatalf("накат: %v", err)
+		}
+		s := out.String()
+		if !strings.Contains(s, "цель наката: crawler@127.0.0.1:5432/stand (режим: force)") ||
+			!strings.Contains(s, "накат: зоны 1, домены 1, строки результатов 2") {
+			t.Errorf("вывод --force без цели/наката:\n%s", s)
+		}
+		if n := pool.countSQL("INSERT INTO zones"); n != 1 {
+			t.Errorf("INSERT зон %d, хочу 1 (накат идёт)", n)
+		}
+	})
+
+	t.Run("план публикации при --publish", func(t *testing.T) {
+		pool := &importPool{}
+		var out bytes.Buffer
+		if err := fixturesImportApply(context.Background(), pool, importDump(t),
+			fixturesImportOpts{DSN: dsn, Publish: fixturesPublishSmoke, RedisAddr: "127.0.0.1:6379"}, &out); err != nil {
+			t.Fatalf("план публикации: %v", err)
+		}
+		if !strings.Contains(out.String(), "план публикации q:render (smoke): задач 2 → Redis 127.0.0.1:6379") {
+			t.Errorf("план без строки публикации:\n%s", out.String())
+		}
+	})
+
+	t.Run("цель без секрета DSN — любая форма DSN", func(t *testing.T) {
+		pool := &importPool{}
+		for _, dsn := range []string{
+			"postgres://crawler:hunter2@db.prod.example:5432/crawler?sslmode=disable",
+			"postgres://db.prod.example:5432/crawler?password=hunter2",
+			"host=db.prod.example user=crawler password=hunter2",
+		} {
+			var out bytes.Buffer
+			if err := fixturesImportApply(context.Background(), pool, &fixturesDump{},
+				fixturesImportOpts{DSN: dsn}, &out); err != nil {
+				t.Fatalf("пустой дамп (%s): %v", dsn, err)
+			}
+			if s := out.String(); strings.Contains(s, "hunter2") {
+				t.Errorf("вывод цели содержит пароль DSN (%s):\n%s", dsn, s)
+			}
+		}
+	})
+
+	t.Run("конфликт имени зоны виден в dry-run — до записи", func(t *testing.T) {
+		pool := &importPool{zoneRows: [][]any{{int16(3), "su"}}} // в дампе su = id 7
+		var out bytes.Buffer
+		if err := fixturesImportApply(context.Background(), pool, importDump(t),
+			fixturesImportOpts{DSN: dsn}, &out); err == nil ||
+			!strings.Contains(err.Error(), "id дампа 7, id БД 3") {
+			t.Errorf("ошибка dry-run = %v, хочу отказ предпроверки до записи", err)
+		}
+		if exec, _ := pool.calls(); len(exec) != 0 {
+			t.Errorf("после отказа предпроверки выполнено %d Exec", len(exec))
+		}
+	})
+}
+
+// TestFixturesImportTarget — цель из DSN: user@host:port/dbname, никогда
+// пароль (userinfo или query); keyword/value-DSN и мусор — маска
+// db.RedactDSN без структуры.
+func TestFixturesImportTarget(t *testing.T) {
+	for _, c := range []struct{ dsn, want string }{
+		{"postgres://crawler:secret@127.0.0.1:5432/stand?sslmode=disable", "crawler@127.0.0.1:5432/stand"},
+		{"postgres://crawler@localhost/stand", "crawler@localhost/stand"},
+		{"postgres://localhost/stand", "localhost/stand"},
+		{"postgres://u:p@h/db?password=also-secret", "u@h/db"},
+	} {
+		if got := fixturesImportTarget(c.dsn); got != c.want {
+			t.Errorf("target(%s) = %q, хочу %q", c.dsn, got, c.want)
+		}
+	}
+	for _, dsn := range []string{"host=h user=u password=hunter2", "not a dsn", ""} {
+		if got := fixturesImportTarget(dsn); got == dsn || strings.Contains(got, "hunter2") {
+			t.Errorf("target(%q) = %q — DSN раскрыт как есть или с паролем", dsn, got)
+		}
+	}
 }
 
 // TestFixturesImportSQLContract — контракты SQL наката: unnest-массивы
