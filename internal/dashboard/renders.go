@@ -1,6 +1,8 @@
-// Панель движков рендера и фолбэка (ТЗ рендера §4.6 п.4, T-246): темп и
-// успешность рендера по движкам (метка engine счётчиков этапа, T-235) и
-// fallback-рейт — published/consumed/глубина q:render-fallback.
+// Панель движков рендера и фолбэка (ТЗ рендера §4.6 п.4, T-246; полнота
+// ТЗ — S-P3-2): темп, успешность и тарпит-рейт рендера по движкам
+// (метки engine счётчиков этапа, T-235/S-P2-4), RSS воркеров движка,
+// fallback-рейт — published/страницы этапа — и потребление
+// (consumed/глубина q:render-fallback).
 //
 // Источники — HTTP-экспозиции /metrics рендер-воркеров
 // (dashboard.render_metrics_urls: основная сборка — движок этапа,
@@ -48,8 +50,11 @@ import (
 const (
 	renderRecordsMetric   = "crawler_render_records_total"            // {rendered,engine} (T-235)
 	renderFinalizedMetric = "crawler_render_task_finalized_total"     // {reason,engine} (T-172/T-235)
+	renderTarpitMetric    = "crawler_render_tarpit_finalized_total"   // {engine} (T-148/S-P2-4)
 	fbPublishedMetric     = "crawler_render_fallback_published_total" // {reason} (T-238)
 	fbConsumedMetric      = "crawler_render_fallback_consumed_total"  // {result} (T-245)
+	stageTasksMetric      = "crawler_stage_tasks_total"               // {stage} — знаменатель fallback-рейта (S-P3-2)
+	processRSSMetric      = "process_resident_memory_bytes"           // стандартный process-collector — RSS воркера (S-P3-2)
 )
 
 // renderBodyLimit — потолок чтения тела /metrics: реестр воркера несёт
@@ -213,8 +218,11 @@ func promUnescape(s string) string {
 type renderCounters struct {
 	rendered  map[string]float64 // engine → rendered="true" (T-235)
 	finalized map[string]float64 // engine → Σ task_finalized по причинам
+	tarpits   map[string]float64 // engine → tarpit_finalized (T-148/S-P2-4)
 	published float64            // Σ fallback_published по причинам (T-238)
 	consumed  map[string]float64 // result → fallback_consumed (T-245)
+	tasks     float64            // Σ stage_tasks{stage="render"} — страницы этапа (S-P3-2)
+	rss       map[string]float64 // engine → Σ RSS воркеров движка (S-P3-2)
 }
 
 // collectRenderCounters — скрейп всех экспозиций параллельно (стиль
@@ -248,7 +256,9 @@ func (c *Collector) collectRenderCounters(ctx context.Context) (renderCounters, 
 	agg := renderCounters{
 		rendered:  map[string]float64{},
 		finalized: map[string]float64{},
+		tarpits:   map[string]float64{},
 		consumed:  map[string]float64{},
+		rss:       map[string]float64{},
 	}
 	for _, body := range bodies {
 		samples, err := parsePromExposition(bytes.NewReader(body))
@@ -284,10 +294,24 @@ func (c *Collector) fetchRenderMetrics(ctx context.Context, raw string) ([]byte,
 }
 
 // add — сведение сэмплов одной экспозиции в агрегат: знакомые приборы
-// по именам, ветки — по меткам (rendered="true"; engine у доли рендера и
-// финализаций класса задачи; reason у публикаций не различается —
-// публике нужен темп; result у потребления).
+// по именам, ветки — по меткам (rendered="true"; engine у доли рендера,
+// тарпитов и финализаций класса задачи; reason у публикаций не
+// различается — публике нужен темп; result у потребления; stage="render"
+// у страниц этапа). RSS экспозиции (process_resident_memory_bytes, без
+// меток) атрибутируется движку сборки воркера — метке engine
+// предсозданной серии rendered="true" (NewMetrics, T-235: серия в
+// экспозиции с первого старта); сборка без метки (старее T-235) — RSS
+// не атрибутируется, пропускается.
 func (a *renderCounters) add(samples []promSample) {
+	engine := ""
+	for _, s := range samples {
+		if s.Name == renderRecordsMetric && s.Labels["rendered"] == "true" {
+			if e := s.Labels["engine"]; e != "" {
+				engine = e
+				break
+			}
+		}
+	}
 	for _, s := range samples {
 		switch s.Name {
 		case renderRecordsMetric:
@@ -300,11 +324,23 @@ func (a *renderCounters) add(samples []promSample) {
 			if e := s.Labels["engine"]; e != "" {
 				a.finalized[e] += s.Value
 			}
+		case renderTarpitMetric:
+			if e := s.Labels["engine"]; e != "" {
+				a.tarpits[e] += s.Value
+			}
 		case fbPublishedMetric:
 			a.published += s.Value
 		case fbConsumedMetric:
 			if r := s.Labels["result"]; r != "" {
 				a.consumed[r] += s.Value
+			}
+		case stageTasksMetric:
+			if s.Labels["stage"] == "render" {
+				a.tasks += s.Value
+			}
+		case processRSSMetric:
+			if engine != "" {
+				a.rss[engine] += s.Value
 			}
 		}
 	}
@@ -387,18 +423,14 @@ func (c *Collector) collectRender(ctx context.Context) (*RenderJSON, error) {
 	}
 	rates := c.rates.observe(agg, c.opt.Now())
 
-	engines := make([]string, 0, len(agg.rendered)+len(agg.finalized))
+	engines := make([]string, 0, len(agg.rendered)+len(agg.finalized)+len(agg.tarpits)+len(agg.rss))
 	seenEngine := map[string]bool{}
-	for e := range agg.rendered {
-		if !seenEngine[e] {
-			seenEngine[e] = true
-			engines = append(engines, e)
-		}
-	}
-	for e := range agg.finalized {
-		if !seenEngine[e] {
-			seenEngine[e] = true
-			engines = append(engines, e)
+	for _, m := range []map[string]float64{agg.rendered, agg.finalized, agg.tarpits, agg.rss} {
+		for e := range m {
+			if !seenEngine[e] {
+				seenEngine[e] = true
+				engines = append(engines, e)
+			}
 		}
 	}
 	sort.Strings(engines)
@@ -417,17 +449,36 @@ func (c *Collector) collectRender(ctx context.Context) (*RenderJSON, error) {
 			Engine:         e,
 			RenderedTotal:  int64(agg.rendered[e]),
 			FinalizedTotal: int64(agg.finalized[e]),
+			TarpitTotal:    int64(agg.tarpits[e]),
+			RSSBytes:       int64(agg.rss[e]),
 			RenderedPerSec: rates.rendered[e],
 		}
+		// Успешность — знаменатель прежний (rendered+finalized,
+		// решение оператора по S-P2-4): тарпит — отдельной колонкой.
 		if denom := agg.rendered[e] + agg.finalized[e]; denom > 0 {
 			pct := 100 * agg.rendered[e] / denom
 			row.SuccessPct = &pct
+		}
+		// Тарпит-рейт — доля тарпит-финализаций среди всех завершений
+		// движка с меткой engine (кумулятивы, как успешность: свежий
+		// воркер без завершений — nil «—»).
+		if denom := agg.rendered[e] + agg.finalized[e] + agg.tarpits[e]; denom > 0 {
+			pct := 100 * agg.tarpits[e] / denom
+			row.TarpitPct = &pct
 		}
 		out.Engines = append(out.Engines, row)
 	}
 	for r, v := range agg.consumed {
 		out.Fallback.ConsumedByResult[r] = int64(v)
 		out.Fallback.ConsumedTotal += int64(v)
+	}
+	// Fallback-рейт — доля публикаций от страниц этапа: числитель —
+	// published воркера A, знаменатель — Σ stage_tasks{stage="render"}
+	// всех экспозиций (воркеры A+B, те же единицы, что окно бюджета
+	// T-239); nil — этап ещё не обработал ни одной страницы.
+	if agg.tasks > 0 {
+		pct := 100 * agg.published / agg.tasks
+		out.Fallback.RatePct = &pct
 	}
 
 	// Глубина q:render-fallback — тем же lens и бюджетом, что секция

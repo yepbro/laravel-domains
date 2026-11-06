@@ -129,6 +129,19 @@
         return String(v.toFixed(1)).replace('.', ',') + '%';
     }
 
+    // fmtBytes — человеко-читаемые байты (1,2 ГиБ / 850 МиБ / 512 КиБ),
+    // как alertBytes монитора; null/undefined — «н/д».
+    function fmtBytes(v) {
+        if (!num(v)) return ND;
+        var units = [[1 << 30, 'ГиБ'], [1 << 20, 'МиБ'], [1 << 10, 'КиБ']];
+        for (var i = 0; i < units.length; i++) {
+            if (v >= units[i][0]) {
+                return String((v / units[i][0]).toFixed(1)).replace('.', ',') + ' ' + units[i][1];
+            }
+        }
+        return v + ' Б';
+    }
+
     // fmtDur — человекочитаемый интервал, как status.FormatDuration CLI:
     // «45с», «13м», «5ч 20м», «3д 4ч».
     function fmtDur(sec) {
@@ -374,8 +387,9 @@
 
     // ------------------------------------------------------------ движки рендера (ТЗ рендера §4.6)
 
-    // renderRender — панель движков: темп/успешность по engine (метка
-    // метрик этапа, T-235) и фолбэк published/consumed/глубина
+    // renderRender — панель движков: темп/успешность/тарпит-рейт/RSS по
+    // engine (метки метрик этапа, T-235/S-P2-4) и фолбэк — fallback-рейт
+    // (доля published от страниц этапа), consumed/глубина
     // q:render-fallback. Секция null — адреса не заданы («н/д» без
     // ошибки) или экспозиции недоступны (причина — в errors).
     function renderRender(snap) {
@@ -388,7 +402,7 @@
 
         var r = snap.render;
         if (!r) {
-            ndRow(body, 5, errTitle(snap, 'render'));
+            ndRow(body, 7, errTitle(snap, 'render'));
             var nd = el('span', 'nd', ND);
             if (!snap.errors || !snap.errors.render) {
                 nd.title = 'адреса экспозиций не заданы (dashboard.render_metrics_urls пуст)';
@@ -401,7 +415,7 @@
         }
 
         if (!r.engines || !r.engines.length) {
-            ndRow(body, 5);
+            ndRow(body, 7);
             body.lastChild.firstChild.textContent = 'воркеры без рендеров';
         } else {
             r.engines.forEach(function (e) {
@@ -419,23 +433,51 @@
                         '(движко-независимые DNS/cert-финализации не входят)';
                 }
                 row.appendChild(pct);
+                // Тарпит-рейт — доля тарпит-финализаций движка (T-148 —
+                // движко-зависимый отказ, S-P2-4); тултип называет счётчик.
+                var tar = el('td', 'num',
+                    num(e.tarpit_pct) ? fmtPct(e.tarpit_pct) : '—');
+                if (num(e.tarpit_pct)) {
+                    tar.title = fmtInt(e.tarpit_total || 0) +
+                        ' тарпит-финализаций из завершений движка с рестарта воркера';
+                } else {
+                    tar.title = 'атрибутированных движком завершений ещё нет';
+                }
+                row.appendChild(tar);
+                // RSS — сумма памяти воркеров движка (S-P3-2); 0 —
+                // экспозиция без метки engine (сборка старее T-235).
+                var rss = el('td', 'num', e.rss_bytes > 0 ? fmtBytes(e.rss_bytes) : '—');
+                rss.title = e.rss_bytes > 0
+                    ? 'process_resident_memory_bytes воркеров движка'
+                    : 'RSS недоступен (экспозиция без метки engine)';
+                row.appendChild(rss);
                 body.appendChild(row);
             });
         }
 
-        // Фолбэк: published (воркер A) / consumed по исходам (воркер B) /
-        // глубина q:render-fallback. Темпы — 0 до первой пары проходов;
-        // сравнение темпов публикаций и потребления — диагностика
-        // «воркер B не успевает» (алерт render_fallback_depth).
+        // Фолбэк: fallback-рейт (доля published от страниц этапа —
+        // контрольные точки ТЗ §5.3), published (воркер A) / consumed по
+        // исходам (воркер B) / глубина q:render-fallback. Темпы — 0 до
+        // первой пары проходов; сравнение темпов публикаций и
+        // потребления — диагностика «воркер B не успевает» (алерт
+        // render_fallback_depth). Исходы consumed — через || 0: серии
+        // предсозданы нулями с T-250, старая экспозиция без серии — 0,
+        // не «н/д» (S-P3-2).
         var f = r.fallback || {};
         var by = f.consumed_by_result || {};
         var parts = [];
         parts.push('фолбэк: опубликовано ' + fmtInt(f.published_total) +
             ' (' + fmtRate(f.published_per_sec) + '/с)');
+        if (num(f.rate_pct)) {
+            parts.push('fallback-рейт ' + fmtPct(f.rate_pct) +
+                ' от страниц этапа');
+        } else {
+            parts.push('fallback-рейт —');
+        }
         parts.push('потреблено ' + fmtInt(f.consumed_total) +
-            ' (' + fmtRate(f.consumed_per_sec) + '/с) — доработано ' + fmtInt(by.rendered) +
-            ' / финализировано ' + fmtInt(by.finalized) +
-            ' / пропущено ' + fmtInt(by.skipped));
+            ' (' + fmtRate(f.consumed_per_sec) + '/с) — доработано ' + fmtInt(by.rendered || 0) +
+            ' / финализировано ' + fmtInt(by.finalized || 0) +
+            ' / пропущено ' + fmtInt(by.skipped || 0));
         var depth = el('span');
         if (num(f.depth)) {
             depth.appendChild(document.createTextNode('глубина q:render-fallback: ' + fmtInt(f.depth)));
@@ -448,7 +490,8 @@
         fb.appendChild(document.createTextNode(' · '));
         fb.appendChild(depth);
         if (hint) {
-            hint.textContent = 'успешность — по метке engine метрик этапа; кумулятивы — с рестарта воркеров';
+            hint.textContent = 'успешность/тарпит-рейт — по метке engine метрик этапа; ' +
+                'кумулятивы — с рестарта воркеров; fallback-рейт — published/страницы этапа';
         }
     }
 

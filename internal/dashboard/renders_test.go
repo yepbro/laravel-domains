@@ -98,10 +98,13 @@ type renderWorkerExpo struct {
 	engine            string
 	rendered          float64
 	finalized         float64
+	tarpits           float64
 	published         float64
 	consumedRendered  float64
 	consumedFinalized float64
 	consumedSkipped   float64
+	tasks             float64
+	rss               float64
 }
 
 func (w renderWorkerExpo) exposition() string {
@@ -110,8 +113,16 @@ func (w renderWorkerExpo) exposition() string {
 	b.WriteString("crawler_render_records_total{rendered=\"true\",engine=\"" + w.engine + "\"} " +
 		formatFloat(w.rendered) + "\n")
 	b.WriteString("crawler_render_records_total{rendered=\"false\"} 999\n")
+	b.WriteString("crawler_stage_tasks_total{stage=\"render\"} " +
+		formatFloat(w.tasks) + "\n")
 	b.WriteString("crawler_render_task_finalized_total{reason=\"timeout\",engine=\"" + w.engine + "\"} " +
 		formatFloat(w.finalized) + "\n")
+	// Тарпиты и RSS — как в живой экспозиции: тарпит-семейство ленивое
+	// (без событий серии нет), process_resident_memory_bytes — всегда.
+	if w.tarpits > 0 {
+		b.WriteString("crawler_render_tarpit_finalized_total{engine=\"" + w.engine + "\"} " +
+			formatFloat(w.tarpits) + "\n")
+	}
 	if w.published > 0 {
 		b.WriteString("crawler_render_fallback_published_total{reason=\"timeout\"} " +
 			formatFloat(w.published) + "\n")
@@ -123,6 +134,9 @@ func (w renderWorkerExpo) exposition() string {
 			formatFloat(w.consumedFinalized) + "\n")
 		b.WriteString("crawler_render_fallback_consumed_total{result=\"skipped\"} " +
 			formatFloat(w.consumedSkipped) + "\n")
+	}
+	if w.rss > 0 {
+		b.WriteString("process_resident_memory_bytes " + formatFloat(w.rss) + "\n")
 	}
 	return b.String()
 }
@@ -158,7 +172,8 @@ func TestCollectRenderPanel(t *testing.T) {
 	// Экспозиции читаются горутинами сервера, тест мутирует значения
 	// между проходами — замок (гонка под -race).
 	var mu sync.Mutex
-	workerA := renderWorkerExpo{engine: "moli", rendered: 1000, finalized: 100, published: 10}
+	workerA := renderWorkerExpo{engine: "moli", rendered: 1000, finalized: 100,
+		tarpits: 25, published: 10, tasks: 2000, rss: 512 << 20}
 	setA := func(w renderWorkerExpo) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -172,7 +187,8 @@ func TestCollectRenderPanel(t *testing.T) {
 	}))
 	defer srvA.Close()
 	workerB := renderWorkerExpo{engine: "chromium", rendered: 50,
-		consumedRendered: 5, consumedFinalized: 1, consumedSkipped: 2}
+		consumedRendered: 5, consumedFinalized: 1, consumedSkipped: 2,
+		tasks: 300, rss: 256 << 20}
 	setB := func(w renderWorkerExpo) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -211,9 +227,26 @@ func TestCollectRenderPanel(t *testing.T) {
 	if moli.SuccessPct == nil || math.Abs(*moli.SuccessPct-1000.0/1100*100) > 1e-9 {
 		t.Errorf("moli success = %v, want 1000/1100", moli.SuccessPct)
 	}
+	// S-P3-2: тарпит-рейт — доля тарпитов среди завершений движка
+	// (25/(1000+100+25)), успешность знаменатель не меняет.
+	if moli.TarpitTotal != 25 || moli.TarpitPct == nil ||
+		math.Abs(*moli.TarpitPct-25.0/1125*100) > 1e-9 {
+		t.Errorf("moli тарпиты = %+v (%v), want 25 и 25/1125", moli.TarpitTotal, moli.TarpitPct)
+	}
+	if moli.RSSBytes != 512<<20 {
+		t.Errorf("moli RSS = %d, want %d (process_resident_memory_bytes)", moli.RSSBytes, 512<<20)
+	}
 	chromium := snap.Render.Engines[0]
 	if chromium.RenderedTotal != 50 || chromium.FinalizedTotal != 0 || chromium.SuccessPct == nil || *chromium.SuccessPct != 100 {
 		t.Errorf("chromium = %+v, want 50/0 и 100%%", chromium)
+	}
+	// Ленивое тарпит-семейство (серии нет) — 0 и рейт 0 при имеющихся
+	// завершениях, не «—» и не отсутствие движка.
+	if chromium.TarpitTotal != 0 || chromium.TarpitPct == nil || *chromium.TarpitPct != 0 {
+		t.Errorf("chromium тарпиты = %d (%v), want 0 и 0%%", chromium.TarpitTotal, chromium.TarpitPct)
+	}
+	if chromium.RSSBytes != 256<<20 {
+		t.Errorf("chromium RSS = %d, want %d", chromium.RSSBytes, 256<<20)
 	}
 	for _, e := range snap.Render.Engines {
 		if e.RenderedPerSec != 0 {
@@ -223,6 +256,11 @@ func TestCollectRenderPanel(t *testing.T) {
 	fb := snap.Render.Fallback
 	if fb.PublishedTotal != 10 || fb.PublishedPerSec != 0 {
 		t.Errorf("published = %+v, want 10 и темп 0 (база)", fb)
+	}
+	// S-P3-2: fallback-рейт — доля published от страниц этапа
+	// (10/(2000+300), знаменатель — обе экспозиции).
+	if fb.RatePct == nil || math.Abs(*fb.RatePct-10.0/2300*100) > 1e-9 {
+		t.Errorf("rate_pct = %v, want 10/2300", fb.RatePct)
 	}
 	if fb.ConsumedTotal != 8 || fb.ConsumedPerSec != 0 {
 		t.Errorf("consumed = %+v, want 8 и темп 0 (база)", fb)
@@ -238,10 +276,13 @@ func TestCollectRenderPanel(t *testing.T) {
 	// Второй проход через 10 с: moli +100 рендеров и +2 публикации —
 	// темпы 10/с и 0.2/с; воркер B доработал 2 записи — темп потребления
 	// 0.2/с (пара темпов — диагностика «воркер B не успевает», ревью
-	// T-246); rendered движков без движения — 0.
-	setA(renderWorkerExpo{engine: "moli", rendered: 1100, finalized: 100, published: 12})
+	// T-246); rendered движков без движения — 0; fallback-рейт — по
+	// кумулятивам (12/2400).
+	setA(renderWorkerExpo{engine: "moli", rendered: 1100, finalized: 100,
+		tarpits: 25, published: 12, tasks: 2100, rss: 512 << 20})
 	setB(renderWorkerExpo{engine: "chromium", rendered: 50,
-		consumedRendered: 7, consumedFinalized: 1, consumedSkipped: 2})
+		consumedRendered: 7, consumedFinalized: 1, consumedSkipped: 2,
+		tasks: 300, rss: 256 << 20})
 	setClock(time.Date(2026, 11, 6, 12, 0, 10, 0, time.UTC))
 	snap = coll.CollectOnce(ctx)
 	if snap.Render == nil {
@@ -263,10 +304,14 @@ func TestCollectRenderPanel(t *testing.T) {
 	if snap.Render.Fallback.ConsumedTotal != 10 {
 		t.Errorf("consumed = %d, want 10 (7+1+2)", snap.Render.Fallback.ConsumedTotal)
 	}
+	if pct := snap.Render.Fallback.RatePct; pct == nil || math.Abs(*pct-12.0/2400*100) > 1e-9 {
+		t.Errorf("rate_pct второго прохода = %v, want 12/2400", pct)
+	}
 
 	// Рестарт воркера A (кумулятив упал) — нулевая дельта, не отрицательная;
-	// B без движения — темп потребления тоже 0.
-	setA(renderWorkerExpo{engine: "moli", rendered: 5})
+	// B без движения — темп потребления тоже 0; страницы этапа B ещё
+	// есть — fallback-рейт честный 0 (публикаций нет), не «—».
+	setA(renderWorkerExpo{engine: "moli", rendered: 5, tasks: 10})
 	setClock(time.Date(2026, 11, 6, 12, 0, 20, 0, time.UTC))
 	snap = coll.CollectOnce(ctx)
 	if got := snap.Render.Engines[1].RenderedPerSec; got != 0 {
@@ -274,6 +319,9 @@ func TestCollectRenderPanel(t *testing.T) {
 	}
 	if pct := snap.Render.Engines[1].SuccessPct; pct == nil || *pct != 100 {
 		t.Errorf("успешность после рестарта = %v, want 100 (5/5)", pct)
+	}
+	if pct := snap.Render.Fallback.RatePct; pct == nil || *pct != 0 {
+		t.Errorf("fallback-рейт после рестарта = %v, want 0 (публикаций нет, этап жив)", pct)
 	}
 	if got := snap.Render.Fallback.ConsumedPerSec; got != 0 {
 		t.Errorf("consumed темп без движения = %v, want 0", got)
@@ -332,6 +380,11 @@ func TestCollectRenderDegradation(t *testing.T) {
 	snap = coll.CollectOnce(context.Background())
 	if snap.Render == nil || snap.Render.Fallback.Depth != nil {
 		t.Errorf("render=%v depth=%v, want секция жива с Depth nil", snap.Render, snap.Render.Fallback.Depth)
+	}
+	// Экспозиция без stage_tasks (страниц этапа нет) — fallback-рейт
+	// «—» (nil), не паника и не 0.
+	if snap.Render.Fallback.RatePct != nil {
+		t.Errorf("rate_pct без страниц этапа = %v, want nil", *snap.Render.Fallback.RatePct)
 	}
 	if len(snap.Errors) != 1 || snap.Errors["queues"] == "" {
 		t.Errorf("отказ Redis не отражён секцией очередей: %v", snap.Errors)

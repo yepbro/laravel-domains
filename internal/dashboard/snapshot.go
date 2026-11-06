@@ -64,12 +64,14 @@ type ProbeJSON struct {
 }
 
 // RenderEngineJSON — строка панели движков (ТЗ рендера §4.6 п.4, T-246):
-// темп и успешность одного движка рендера по счётчикам этапа с меткой
-// engine (T-235): rendered — crawler_render_records_total{rendered=
-// "true",engine}, finalized — Σ crawler_render_task_finalized_total по
-// причинам (движко-зависимый класс задачи T-172; тарпит/cert/DNS без
-// метки движка в долю не входят — cert/DNS движко-независимы по ТЗ
-// рендера, тарпит недоатрибутирован, оговорка — docs/render.md).
+// темп, успешность и тарпит-рейт одного движка рендера по счётчикам
+// этапа с меткой engine (T-235): rendered — crawler_render_records_total
+// {rendered="true",engine}, finalized — Σ
+// crawler_render_task_finalized_total по причинам (движко-зависимый
+// класс задачи T-172; знаменатель успешности — решение оператора по
+// S-P2-4), tarpits — crawler_render_tarpit_finalized_total (T-148,
+// движко-зависимый отказ, метка engine от T-250); cert/DNS-финализации
+// движко-независимы по ТЗ рендера и в доли движка не входят.
 // Кумулятив — с рестарта воркеров (метрики процесса), темп — между
 // проходами сборщика.
 type RenderEngineJSON struct {
@@ -80,10 +82,22 @@ type RenderEngineJSON struct {
 	RenderedTotal int64 `json:"rendered_total"`
 	// FinalizedTotal — финализации класса задачи с меткой движка.
 	FinalizedTotal int64 `json:"finalized_total"`
+	// TarpitTotal — тарпит-финализации движка (T-148, метка engine —
+	// S-P2-4/T-250): движко-зависимый отказ, материал тарпит-рейта.
+	TarpitTotal int64 `json:"tarpit_total"`
 	// SuccessPct — доля успешных среди атрибутированных движком
 	// завершений (rendered/(rendered+finalized)); nil — завершений ещё
 	// нет (молодой воркер).
 	SuccessPct *float64 `json:"success_pct"`
+	// TarpitPct — тарпит-рейт: доля тарпит-финализаций среди всех
+	// завершений движка (tarpits/(rendered+finalized+tarpits));
+	// nil — завершений ещё нет. Знаменатель успешности не меняет
+	// (решение оператора по S-P2-4) — колонки независимы.
+	TarpitPct *float64 `json:"tarpit_pct"`
+	// RSSBytes — сумма process_resident_memory_bytes воркеров движка
+	// (S-P3-2): память (RSS) из ТЗ §4.6 п.4; 0 — экспозиция без метки
+	// engine (сборка старее T-235).
+	RSSBytes int64 `json:"rss_bytes"`
 	// RenderedPerSec — темп успешных рендеров между проходами сборщика
 	// (0 — первый проход или рестарт воркера: базы дельты нет).
 	RenderedPerSec float64 `json:"rendered_per_sec"`
@@ -91,14 +105,22 @@ type RenderEngineJSON struct {
 
 // RenderFallbackJSON — блок фолбэка панели движков (T-246): публикации
 // воркера A (crawler_render_fallback_published_total, T-238), потребление
-// воркером B (crawler_render_fallback_consumed_total по исходам, T-245)
-// и остаток — глубина q:render-fallback (тот же общий расчёт глубины,
-// что у секции очередей).
+// воркером B (crawler_render_fallback_consumed_total по исходам, T-245),
+// fallback-рейт (доля публикаций от страниц этапа, S-P3-2) и остаток —
+// глубина q:render-fallback (тот же общий расчёт глубины, что у секции
+// очередей).
 type RenderFallbackJSON struct {
 	// PublishedTotal — публикации в q:render-fallback с рестарта воркера A.
 	PublishedTotal int64 `json:"published_total"`
 	// PublishedPerSec — темп публикаций между проходами (0 — без базы).
 	PublishedPerSec float64 `json:"published_per_sec"`
+	// RatePct — fallback-рейт: доля публикаций от страниц этапа —
+	// числитель published, знаменатель Σ
+	// crawler_stage_tasks_total{stage="render"} всех экспозиций (те же
+	// единицы, что окно бюджета T-239); nil — этап ещё без страниц.
+	// Контрольные точки приёмки (ТЗ §5.3) сравнивают с порогами долю,
+	// а не абсолютный темп.
+	RatePct *float64 `json:"rate_pct"`
 	// ConsumedTotal — потреблено воркером B с рестарта.
 	ConsumedTotal int64 `json:"consumed_total"`
 	// ConsumedPerSec — темп потребления между проходами (0 — без базы);
@@ -106,7 +128,8 @@ type RenderFallbackJSON struct {
 	// «воркер B не успевает» (алерт render_fallback_depth, T-246).
 	ConsumedPerSec float64 `json:"consumed_per_sec"`
 	// ConsumedByResult — потребление по исходам delivered
-	// (rendered|finalized|skipped).
+	// (rendered|finalized|skipped); серии предсозданы нулями с T-250,
+	// у старой экспозиции исхода может не быть — фронт читает через || 0.
 	ConsumedByResult map[string]int64 `json:"consumed_by_result"`
 	// Depth — глубина q:render-fallback (backlog группы render-fallback-
 	// worker); nil — Redis недоступен (глубина «н/д», секция жива).
@@ -141,11 +164,11 @@ type Snapshot struct {
 	QueueWatermarks map[string]int64 `json:"queue_watermarks"`
 
 	// Render — панель движков рендера и фолбэка (ТЗ рендера §4.6 п.4,
-	// T-246): темп/успешность по engine из экспозиций /metrics
-	// рендер-воркеров (dashboard.render_metrics_urls) и fallback-рейт —
-	// published/consumed/глубина q:render-fallback. nil — адреса не
-	// заданы («н/д», не ошибка — стиль Health) или секция деградировала
-	// (причина — в errors).
+	// T-246 + S-P3-2): темп/успешность/тарпит-рейт/RSS по engine из
+	// экспозиций /metrics рендер-воркеров (dashboard.render_metrics_urls)
+	// и fallback-рейт — published/страницы этапа, consumed/глубина
+	// q:render-fallback. nil — адреса не заданы («н/д», не ошибка —
+	// стиль Health) или секция деградировала (причина — в errors).
 	Render *RenderJSON `json:"render"`
 }
 

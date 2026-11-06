@@ -105,8 +105,9 @@
 </section>
 
 <!-- Панель движков рендера и фолбэка (ТЗ рендер-движков §4.6 п.4,
-     T-246): темп/успешность по движкам (метка engine метрик этапа,
-     T-235) и fallback-рейт — published воркера A / consumed воркера B /
+     T-246; полнота §4.6 п.4 — S-P3-2): темп/успешность/тарпит-рейт/RSS
+     по движкам (метки engine метрик этапа, T-235/S-P2-4) и фолбэк —
+     fallback-рейт (published/страницы этапа), consumed воркера B /
      глубина q:render-fallback. Значения — из экспозиций /metrics
      рендер-воркеров (dashboard.render_metrics_urls); адреса не заданы
      или экспозиции недоступны — «н/д». -->
@@ -121,10 +122,12 @@
           <th class="num">Успешно</th>
           <th class="num">Финализаций</th>
           <th class="num">Успешность</th>
+          <th class="num">Тарпит-рейт</th>
+          <th class="num">RSS</th>
         </tr>
       </thead>
       <tbody id="render-engines-body">
-        <tr><td colspan="5" class="nd">н/д</td></tr>
+        <tr><td colspan="7" class="nd">н/д</td></tr>
       </tbody>
     </table>
   </div>
