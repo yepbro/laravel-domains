@@ -17,7 +17,10 @@
 // метка движка engine на доле рендера и финализациях класса задачи
 // (T-235, ТЗ §4.6 п.1, ФТ-15: кардинальность 3 — chromium/moli/
 // lightpanda, значение — движок сборки воркера, Options.Engine ←
-// render.engine; существующие агрегации без engine не меняются).
+// render.engine; существующие агрегации без engine не меняются) и
+// предсоздание нулевых серий замкнутых словарей suspended{gate,budget}
+// и consumed{rendered,finalized,skipped} (S-P1-4): семейства видны в
+// экспозиции с первого старта, первое событие счётчика не теряется.
 package renderworker
 
 import (
@@ -95,7 +98,16 @@ type Metrics struct {
 // воркер значение не перепроверяет — неизвестный движок сборка рендера
 // отвергает раньше старта воркера. Пустое значение — chromium, как у
 // render.Options.Engine (сборки без конфигурации); нормализация здесь —
-// кардинальность метки держит владелец приборов.
+// кардинальность метки держит владелец приборов. Замкнутые словари
+// событий приостановки (gate|budget) и потребления фолбэка
+// (rendered|finalized|skipped) предсоздаются нулевыми сериями (S-P1-4,
+// решение оператора): семейства видны в экспозиции с первого старта —
+// алерты/панель не ждут первого события и не теряют его (до
+// предсоздания первая точка ленивого счётчика базировала prev зонда и
+// событие 0→1 пропускалось); открытые словари (reason кодов net::ERR_* —
+// fallback{reason}, tasksFin{reason,engine}) предсоздать нельзя и не
+// нужно: коды не перечислимы, серия рождается первой финализацией с
+// этим кодом.
 func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 	if reg == nil {
 		return nil
@@ -103,7 +115,7 @@ func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 	if engine == "" {
 		engine = config.EngineChromium
 	}
-	return &Metrics{
+	m := &Metrics{
 		engine: engine,
 		tasks: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_stage_tasks_total",
@@ -144,13 +156,24 @@ func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 		}, "reason"),
 		suspend: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_fallback_suspended_total",
-			Help: "События приостановки фолбэк-публикации (T-239, ФТ-9), не состояние — каждое защёлкивание одна точка: reason=gate — health-гейт, стрик инфра-ошибок класса браузера (основной движок недоступен) достиг render.fallback.health_gate_streak, публикация приостановлена до восстановления (успешный рендер обнуляет стрик; ошибки классов задачи/контекста стрик не трогают); reason=budget — бюджет доли, доля публикаций за окно в 1000 доставок этапа ушла за потолок render.fallback.share_percent, следующее окно без публикаций. Пока приостановка держится, кандидаты фолбэка финализируются штатно с маркером render_failed_at (как при выключенном фолбэке); browser-класс ждёт в redelivery q:render в пределах окна ретраев redis.max_attempts. Рост — сигнал деградации основного движка (алерты ТЗ 4.6 п.3).",
+			Help: "События приостановки фолбэк-публикации (T-239, ФТ-9), не состояние — каждое защёлкивание одна точка: reason=gate — health-гейт, стрик инфра-ошибок класса браузера (основной движок недоступен) достиг render.fallback.health_gate_streak, публикация приостановлена до восстановления (успешный рендер обнуляет стрик; ошибки классов задачи/контекста стрик не трогают); reason=budget — бюджет доли, доля публикаций за окно в 1000 доставок этапа ушла за потолок render.fallback.share_percent, следующее окно без публикаций. Пока приостановка держится, кандидаты фолбэка финализируются штатно с маркером render_failed_at (как при выключенном фолбэке); browser-класс ждёт в redelivery q:render в пределах окна ретраев redis.max_attempts. Рост — сигнал деградации основного движка (алерты ТЗ 4.6 п.3). Серии замкнутого словаря gate|budget предсозданы нулевыми (S-P1-4): семейство в экспозиции с первого старта, события считает только вооружённая сборка (движок-кандидат, q:render — fallbackArmed).",
 		}, "reason"),
 		consumed: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_fallback_consumed_total",
-			Help: "Задачи q:render-fallback, потреблённые chromium-воркером B (T-245, ТЗ 4.5/4.6 п.2, ФТ-11/ФТ-15), по исходу доставки, завершившейся обработкой без ошибки: result=rendered — доработка успешна (DOM записан, rendered=true, публикация q:analyze, ТЗ 4.5 п.2); result=finalized — фолбэк исчерпан, запись закрыта путём финализации (маркер render_failed_at + публикация q:analyze, ФТ-10: пути тарпита T-148 / класса задачи T-172 / cert T-159 / DNS T-211; маркер ставится, пока строка принадлежит эпизоду — гонка с перепроверкой T-058 закрывает запись без маркера); result=skipped — штатный отказ без побочных эффектов (строки нет, без итогового URL или охрана UPDATE отсекла — строка ушла из-под задачи). Счёт — в обработчике до XACK уровнем очереди: сбой Ack или повторная доставка дают дубль — допуск единиц at-least-once (как у окна бюджета T-239); ошибочные доставки не считаются — живут в PEL до клейма либо bury в q:dead. Баланс-чек приёмки (ТЗ 6.2 п.4): crawler_render_fallback_published_total (воркер A, T-238) = сумма этого счётчика + остаток q:render-fallback — crawler_queue_depth{queue=\"q:render-fallback\"} воркера B (backlog группы: непрочитанный лаг + PEL; держится до потолка MAXLEN стрима) + increase(crawler_queue_dead_buried_total{queue=\"q:render-fallback\"}). Считает только сборка воркера B (Options.Stream = q:render-fallback, ФТ-12): у основной сборки серии не создаются.",
+			Help: "Задачи q:render-fallback, потреблённые chromium-воркером B (T-245, ТЗ 4.5/4.6 п.2, ФТ-11/ФТ-15), по исходу доставки, завершившейся обработкой без ошибки: result=rendered — доработка успешна (DOM записан, rendered=true, публикация q:analyze, ТЗ 4.5 п.2); result=finalized — фолбэк исчерпан, запись закрыта путём финализации (маркер render_failed_at + публикация q:analyze, ФТ-10: пути тарпита T-148 / класса задачи T-172 / cert T-159 / DNS T-211; маркер ставится, пока строка принадлежит эпизоду — гонка с перепроверкой T-058 закрывает запись без маркера); result=skipped — штатный отказ без побочных эффектов (строки нет, без итогового URL или охрана UPDATE отсекла — строка ушла из-под задачи). Счёт — в обработчике до XACK уровнем очереди: сбой Ack или повторная доставка дают дубль — допуск единиц at-least-once (как у окна бюджета T-239); ошибочные доставки не считаются — живут в PEL до клейма либо bury в q:dead. Баланс-чек приёмки (ТЗ 6.2 п.4): crawler_render_fallback_published_total (воркер A, T-238) = сумма этого счётчика + остаток q:render-fallback — crawler_queue_depth{queue=\"q:render-fallback\"} воркера B (backlog группы: непрочитанный лаг + PEL; держится до потолка MAXLEN стрима) + increase(crawler_queue_dead_buried_total{queue=\"q:render-fallback\"}). Считает только сборка воркера B (Options.Stream = q:render-fallback, ФТ-12): серии замкнутого словаря трёх исходов предсозданы нулевыми у всех сборок (S-P1-4 — семейство в экспозиции с первого старта), растут только у воркера B: у основной сборки живут нулями.",
 		}, "result"),
 	}
+	// Предсоздание нулевых серий замкнутых словарей (S-P1-4): оба
+	// семейства экспортируются с момента старта (нулями), алерт бюджета
+	// и панель не ждут первого события; растут серии только в
+	// вооружённой сборке (suspend — движок-кандидат, consumed — воркер
+	// B), у остальных сборок живут нулями.
+	m.suspend.WithLabelValues(fbReasonGate).Add(0)
+	m.suspend.WithLabelValues(fbReasonBudget).Add(0)
+	m.consumed.WithLabelValues(fbResultRendered).Add(0)
+	m.consumed.WithLabelValues(fbResultFinalized).Add(0)
+	m.consumed.WithLabelValues(fbResultSkipped).Add(0)
+	return m
 }
 
 // Task — задача q:render обработана успешно (включая штатный отказ —

@@ -608,8 +608,10 @@ func TestRenderWorker_FallbackDedupKey(t *testing.T) {
 // подтверждаемых доставках — по исходам: rendered (успешная доработка:
 // DOM записан, q:analyze), finalized (финализация с маркером —
 // исчерпание фолбэка, ФТ-10), skipped (строки нет — без побочных
-// эффектов). Основная сборка (q:render) счётчик не трогает: серий нет —
-// потребление фолбэка учитывает только дорабатывающий воркер. Баланс
+// эффектов). Основная сборка (q:render) счётчик не трогает: серии
+// замкнутого словаря предсозданы нулями у всех сборок (S-P1-4) и
+// остаются нулями — потребление фолбэка учитывает только дорабатывающий
+// воркер. Баланс
 // published = consumed + остаток q:render-fallback — шаг 4 приёмки
 // ТЗ §6.2 (интеграционная сверка — TestAccept03_RenderFallback).
 func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
@@ -641,8 +643,8 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 			t.Errorf("crawler_render_fallback_consumed_total{rendered} = %v, want 1", got)
 		}
 		for _, result := range []string{fbResultFinalized, fbResultSkipped} {
-			if got := consumedSeries(t, reg, result); got != -1 {
-				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want -1 (серии нет)", result, got)
+			if got := consumedSeries(t, reg, result); got != 0 {
+				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want 0 (серия предсоздана нулём — S-P1-4, исхода не было)", result, got)
 			}
 		}
 	})
@@ -677,12 +679,12 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		if got := consumedSeries(t, reg, fbResultFinalized); got != 2 {
 			t.Errorf("crawler_render_fallback_consumed_total{finalized} = %v, want 2 (тарпит + cert)", got)
 		}
-		if got := consumedSeries(t, reg, fbResultRendered); got != -1 {
-			t.Errorf("crawler_render_fallback_consumed_total{rendered} = %v, want -1 (серии нет)", got)
+		if got := consumedSeries(t, reg, fbResultRendered); got != 0 {
+			t.Errorf("crawler_render_fallback_consumed_total{rendered} = %v, want 0 (серия предсоздана нулём, исхода не было)", got)
 		}
 	})
 
-	t.Run("ошибка доставки не считается — серия не создаётся", func(t *testing.T) {
+	t.Run("ошибка доставки не считается", func(t *testing.T) {
 		f := newRWFixture(t)
 		reg := metrics.New("render-fallback-worker")
 		var err error
@@ -706,8 +708,8 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 			t.Fatal("ошибка класса браузера — ошибка доставки (повторная доставка), не успех")
 		}
 		for _, result := range []string{fbResultRendered, fbResultFinalized, fbResultSkipped} {
-			if got := consumedSeries(t, reg, result); got != -1 {
-				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want -1 (ошибочная доставка не считается)", result, got)
+			if got := consumedSeries(t, reg, result); got != 0 {
+				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want 0 (ошибочная доставка не считается; серия предсоздана нулём)", result, got)
 			}
 		}
 	})
@@ -753,8 +755,8 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 			t.Fatalf("processDelivery: %v", err)
 		}
 		for _, result := range []string{fbResultRendered, fbResultFinalized, fbResultSkipped} {
-			if got := consumedSeries(t, reg, result); got != -1 {
-				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want -1 (считает только воркер B)", result, got)
+			if got := consumedSeries(t, reg, result); got != 0 {
+				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want 0 (считает только воркер B; серии предсозданы нулями у всех сборок)", result, got)
 			}
 		}
 	})

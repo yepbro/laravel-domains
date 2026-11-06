@@ -639,11 +639,19 @@ SELECT строки (final_url, content_hash)
   публикаций — `crawler_render_fallback_published_total{reason}`
   (словарь `taskFinalizeReason`: код `net::ERR_*`, `timeout`, `other`).
   Потребление — `crawler_render_fallback_consumed_total{result}`
-  (T-245, только сборка воркера B: `rendered` — доработка успешна,
+  (T-245, считает только сборка воркера B: `rendered` — доработка успешна,
   `finalized` — исчерпание фолбэка, запись закрыта путём финализации
   (маркер `render_failed_at`, пока строка принадлежит эпизоду), `skipped`
   — строка ушла из-под задачи (строки нет, без итогового URL, охрана
-  UPDATE отсекла) — доставка закрыта без побочных эффектов).
+  UPDATE отсекла) — доставка закрыта без побочных эффектов). Серии
+  замкнутых словарей приостановок `{gate,budget}` и потребления
+  `{rendered,finalized,skipped}` предсозданы нулевыми в NewMetrics
+  (S-P1-4): семейства видны в `/metrics` с первого старта — алерт
+  бюджета не простаивает в «не измеряется» на тихом проде и зонд не
+  теряет первое событие (до предсоздания первая точка ленивой серии
+  базировала prev и дельта 0→1 не срабатывала); открытые словари
+  (`reason` кодов `net::ERR_*` у published/finalized) предсоздания не
+  имеют — коды не перечислимы, серия рождается первой финализацией.
   Баланс-чек шага 4 приёмки ТЗР §6.2:
   `increase(published) = increase(consumed) + crawler_queue_depth
   {queue="q:render-fallback"} + increase(crawler_queue_dead_buried_total

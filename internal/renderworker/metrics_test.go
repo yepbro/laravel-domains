@@ -189,6 +189,42 @@ func TestMetricsMethods(t *testing.T) {
 	}
 }
 
+// TestMetricsPrecreatedClosedSeries — замкнутые словари предсозданы
+// нулевыми сериями в NewMetrics (S-P1-4): семейства приостановок
+// {gate,budget} и потребления {rendered,finalized,skipped} присутствуют
+// в экспозиции с первого старта (алерт бюджета и панель не ждут
+// первого события, зонд не теряет его 0→1), первое событие даёт 1.
+func TestMetricsPrecreatedClosedSeries(t *testing.T) {
+	reg := metrics.New("render-worker")
+	m := NewMetrics(reg, config.EngineChromium)
+
+	for _, reason := range []string{fbReasonGate, fbReasonBudget} {
+		if got := rwMetricValue(t, reg, "crawler_render_fallback_suspended_total",
+			map[string]string{"reason": reason}); got != 0 {
+			t.Errorf("crawler_render_fallback_suspended_total{%s} после NewMetrics = %v, want 0 (серия предсоздана)", reason, got)
+		}
+	}
+	for _, result := range []string{fbResultRendered, fbResultFinalized, fbResultSkipped} {
+		if got := rwMetricValue(t, reg, "crawler_render_fallback_consumed_total",
+			map[string]string{"result": result}); got != 0 {
+			t.Errorf("crawler_render_fallback_consumed_total{%s} после NewMetrics = %v, want 0 (серия предсоздана)", result, got)
+		}
+	}
+
+	// Первое событие каждого семейства: предсозданный ноль → 1 (без
+	// «базирующего» скачка — счётчик уже существовал).
+	m.FallbackSuspended(fbReasonBudget)
+	if got := rwMetricValue(t, reg, "crawler_render_fallback_suspended_total",
+		map[string]string{"reason": fbReasonBudget}); got != 1 {
+		t.Errorf("crawler_render_fallback_suspended_total{budget} после первого события = %v, want 1", got)
+	}
+	m.FallbackConsumed(fbResultRendered)
+	if got := rwMetricValue(t, reg, "crawler_render_fallback_consumed_total",
+		map[string]string{"result": fbResultRendered}); got != 1 {
+		t.Errorf("crawler_render_fallback_consumed_total{rendered} после первого события = %v, want 1", got)
+	}
+}
+
 // TestMetricsEngineDefault — пустое значение engine (сборки без
 // конфигурации, Options{Metrics: reg} в тестах) трактуется как
 // chromium, как у render.Options.Engine (T-235): нулевое значение

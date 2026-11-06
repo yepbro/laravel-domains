@@ -60,7 +60,7 @@ func rwBrowserErr(url string) error {
 }
 
 // rwGateSuspended — значение crawler_render_fallback_suspended_total
-// {reason=gate} (−1 — серии нет).
+// {reason=gate} (серия предсоздана нулём — S-P1-4: 0 — события не было).
 func rwGateSuspended(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
 	return rwMetricValue(t, reg, "crawler_render_fallback_suspended_total",
@@ -68,7 +68,7 @@ func rwGateSuspended(t *testing.T, reg *metrics.Registry) float64 {
 }
 
 // rwBudgetSuspended — значение crawler_render_fallback_suspended_total
-// {reason=budget} (−1 — серии нет).
+// {reason=budget} (серия предсоздана нулём — S-P1-4: 0 — события не было).
 func rwBudgetSuspended(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
 	return rwMetricValue(t, reg, "crawler_render_fallback_suspended_total",
@@ -134,8 +134,8 @@ func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 			t.Fatalf("инфра-ошибка класса браузера — ошибка доставки (redelivery), доставка %d", i)
 		}
 	}
-	if got := rwGateSuspended(t, reg); got != -1 {
-		t.Errorf("crawler_render_fallback_suspended_total{gate} до порога = %v, want -1 (серии нет)", got)
+	if got := rwGateSuspended(t, reg); got != 0 {
+		t.Errorf("crawler_render_fallback_suspended_total{gate} до порога = %v, want 0 (серия предсоздана нулём, S-P1-4)", got)
 	}
 
 	// Кандидат между инфра-ошибками (стрик 2 < 3): публикация идёт,
@@ -268,8 +268,8 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 	if n := rwFBCount(t, f); n != pubs {
 		t.Fatalf("публикаций q:render-fallback = %d, want %d", n, pubs)
 	}
-	if got := rwBudgetSuspended(t, reg); got != -1 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} до закрытия окна = %v, want -1", got)
+	if got := rwBudgetSuspended(t, reg); got != 0 {
+		t.Errorf("crawler_render_fallback_suspended_total{budget} до закрытия окна = %v, want 0 (серия предсоздана нулём)", got)
 	}
 
 	// Фаза B — наполнитель до 1000 подтверждённых доставок: доставки
@@ -356,8 +356,8 @@ func TestRenderWorker_FallbackBudgetExactCeilingNotSuspended(t *testing.T) {
 			t.Fatalf("наполнитель %d: %v", i, err)
 		}
 	}
-	if got := rwBudgetSuspended(t, reg); got != -1 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want -1 (доля на потолке, не сверх)", got)
+	if got := rwBudgetSuspended(t, reg); got != 0 {
+		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 0 (доля на потолке, не сверх; серия предсоздана нулём)", got)
 	}
 	// Следующий кандидат публикуется: окно не приостанавливалось.
 	key := rwRowKey{zone: 3, domain: 31000, subdomain: 1, variant: 0}
@@ -492,8 +492,8 @@ func TestRenderWorker_FallbackStatesParallel(t *testing.T) {
 		map[string]string{"reason": "timeout"}); got != float64(n) {
 		t.Errorf("crawler_render_fallback_published_total{timeout} = %v, want %d", got, n)
 	}
-	if got := rwBudgetSuspended(t, reg); got != -1 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want -1 (окно не закрывалось)", got)
+	if got := rwBudgetSuspended(t, reg); got != 0 {
+		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 0 (окно не закрывалось; серия предсоздана нулём)", got)
 	}
 	_, budget := f.w.fallbackStates()
 	if budget.tasks != n || budget.published != n {
@@ -537,11 +537,13 @@ func TestRenderWorker_FallbackWorkerBNoState(t *testing.T) {
 	if gate.streak != 0 || budget.tasks != 0 || budget.published != 0 || budget.hold {
 		t.Errorf("состояния воркера B: gate=%+v budget=%+v, хочу нулевые (наблюдения только в вооружённой сборке)", gate, budget)
 	}
-	if got := rwMetricValue(t, reg, "crawler_render_fallback_suspended_total", nil); got != -1 {
-		t.Errorf("crawler_render_fallback_suspended_total = %v, want -1 (серий нет)", got)
+	// Серии предсозданы нулевыми у всех сборок (S-P1-4): у воркера B
+	// семейство есть, но не растёт — событий приостановки нет.
+	if got := rwMetricValue(t, reg, "crawler_render_fallback_suspended_total", nil); got != 0 {
+		t.Errorf("crawler_render_fallback_suspended_total = %v, want 0 (серии предсозданы нулями, не растут)", got)
 	}
-	if got := rwGateSuspended(t, reg); got != -1 {
-		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want -1", got)
+	if got := rwGateSuspended(t, reg); got != 0 {
+		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 0", got)
 	}
 }
 
