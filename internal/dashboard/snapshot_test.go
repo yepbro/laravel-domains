@@ -728,8 +728,9 @@ func TestSnapshotJSONForm(t *testing.T) {
 		}
 	}
 	// §5.4: эффективные пороги по стримам — кламп по половине MAXLEN
-	// (T-141: q:dns — 125 пачек, штучные — 75 000 при дефолтах).
-	if want := `{"q:analyze":75000,"q:dns":125,"q:http":75000,"q:render":75000}`; string(doc["queue_watermarks"]) != want {
+	// (T-141: q:dns — 125 пачек, штучные — 75 000; q:render-fallback —
+	// 15 000/2 = 7 500, политика T-237).
+	if want := `{"q:analyze":75000,"q:dns":125,"q:http":75000,"q:render":75000,"q:render-fallback":7500}`; string(doc["queue_watermarks"]) != want {
 		t.Errorf("queue_watermarks = %s, хочу %s (§5.4, эффективные пороги T-141)", doc["queue_watermarks"], want)
 	}
 	// Порядок ключей — секции CLI первыми (embedded SummaryJSON).

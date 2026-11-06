@@ -34,8 +34,8 @@ const statusHelp = `crawlerctl status — сводка по зонам, очер
 
 Сводка: по каждой зоне — счётчики domains_total/domains_checked (обновляет
 monitor) и агрегат domains по check_state (pending без учёта deleted,
-queued, done); длины очередей q:dns/q:http/q:render/q:analyze/q:dead
-(XLEN); скорость проверок (доменов/с — средняя с начала суток:
+queued, done); длины очередей q:dns/q:http/q:render/q:render-fallback/
+q:analyze/q:dead (XLEN); скорость проверок (доменов/с — средняя с начала суток:
 last_checked_at имеет точность дня; HTTP-результаты и рендеры — за окно
 темпа 1–2 ч: часовые корзины crawler_counters, T-203) и ETA завершения
 первого цикла: (pending + queued) / скорость. Темп этапов DNS и анализа

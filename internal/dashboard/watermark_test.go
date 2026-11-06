@@ -38,6 +38,8 @@ func TestQueueWatermarksSync(t *testing.T) {
 			map[string]int64{
 				queue.StreamDNS: 125, queue.StreamHTTP: 75000,
 				queue.StreamRender: 75000, queue.StreamAnalyze: 75000,
+				// q:render-fallback: MAXLEN 15 000 (политика T-237) → 7 500.
+				queue.StreamRenderFallback: 7500,
 			},
 		},
 		{
@@ -46,6 +48,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			map[string]int64{
 				queue.StreamDNS: 50, queue.StreamHTTP: 50,
 				queue.StreamRender: 50, queue.StreamAnalyze: 50,
+				queue.StreamRenderFallback: 50,
 			},
 		},
 		{
@@ -54,6 +57,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			map[string]int64{
 				queue.StreamDNS: 150, queue.StreamHTTP: 150,
 				queue.StreamRender: 150, queue.StreamAnalyze: 150,
+				queue.StreamRenderFallback: 150,
 			},
 		},
 		{
@@ -62,6 +66,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			map[string]int64{
 				queue.StreamDNS: 100000, queue.StreamHTTP: 100000,
 				queue.StreamRender: 100000, queue.StreamAnalyze: 100000,
+				queue.StreamRenderFallback: 100000,
 			},
 		},
 		{
@@ -70,6 +75,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			map[string]int64{
 				queue.StreamDNS: 0, queue.StreamHTTP: 0,
 				queue.StreamRender: 0, queue.StreamAnalyze: 0,
+				queue.StreamRenderFallback: 0,
 			},
 		},
 	}

@@ -26,6 +26,7 @@ import (
 
 	"crawler/internal/db"
 	"crawler/internal/model"
+	"crawler/internal/queue"
 )
 
 // --- SQL-контракты ----------------------------------------------------------
@@ -635,7 +636,7 @@ func TestFetchRowDegradations(t *testing.T) {
 // TestFetchQueueLens — все рабочие стримы в порядке ТЗ 4.2; ошибка
 // останавливает сбор (Redis один); nil-клиент — ошибка.
 func TestFetchQueueLens(t *testing.T) {
-	lens := map[string]int64{"q:dns": 5, "q:http": 0, "q:render": 12, "q:analyze": 3, "q:dead": 1}
+	lens := map[string]int64{"q:dns": 5, "q:http": 0, "q:render": 12, "q:render-fallback": 2, "q:analyze": 3, "q:dead": 1}
 	lenner := &statusLenner{lens: lens}
 	got, err := FetchQueueLens(context.Background(), lenner)
 	if err != nil {
@@ -647,8 +648,19 @@ func TestFetchQueueLens(t *testing.T) {
 	if order := lenner.order(); !reflect.DeepEqual(order, Streams) {
 		t.Errorf("порядок опроса = %v, want %v", order, Streams)
 	}
-	if want := []string{"q:dns", "q:http", "q:render", "q:analyze", "q:dead"}; !reflect.DeepEqual(Streams, want) {
-		t.Errorf("Streams = %v, want %v (все стримы ТЗ 4.2)", Streams, want)
+	// S-P3-1: перечень — производная от единственного источника очереди
+	// (queue.allStreams), порядок конвейера; q:render-fallback (T-237)
+	// входит как рабочий стрим. Копия, не срез источника: мутация
+	// результата на списки пакета не влияет.
+	if want := []string{"q:dns", "q:http", "q:render", "q:render-fallback", "q:analyze", "q:dead"}; !reflect.DeepEqual(Streams, want) {
+		t.Errorf("Streams = %v, want %v (все стримы ТЗ 4.2 + q:render-fallback)", Streams, want)
+	}
+	if !reflect.DeepEqual(Streams, queue.AllStreams()) {
+		t.Errorf("Streams = %v, want queue.AllStreams() = %v (единый источник)", Streams, queue.AllStreams())
+	}
+	mutated := append(Streams, "q:extra")
+	if len(queue.AllStreams()) == len(mutated) {
+		t.Error("AllStreams возвращает срез источника: мутация копии изменила источник")
 	}
 
 	_, err = FetchQueueLens(context.Background(), &statusLenner{err: errors.New("connection refused")})

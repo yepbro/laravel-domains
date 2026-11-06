@@ -500,16 +500,22 @@ func TestRedisQueues_Backlog(t *testing.T) {
 			}},
 			// Стрим есть, групп нет — никто не доставлял: XLEN.
 			queue.StreamDNS: {},
+			// q:render-fallback — группа воркера B: min(40, 300)+1 = 41
+			// (S-P3-1: стрим в отчёте, бэклог считается общей формулой).
+			queue.StreamRenderFallback: {{
+				Name: "render-fallback-worker", Lag: 40, Pending: 1, EntriesRead: 77,
+			}},
 			// q:dead — всегда XLEN: глубина карантина — инвентарь
 			// оператора, не бэклог (групп у него нет по построению).
 			queue.StreamDead: {{Name: "triage", Lag: 100, Pending: 5, EntriesRead: 30}},
 		},
 		xlen: map[string]int64{
-			queue.StreamRender:  136500,
-			queue.StreamHTTP:    50,
-			queue.StreamAnalyze: 71784,
-			queue.StreamDNS:     2,
-			queue.StreamDead:    1441,
+			queue.StreamRender:         136500,
+			queue.StreamHTTP:           50,
+			queue.StreamAnalyze:        71784,
+			queue.StreamDNS:            2,
+			queue.StreamRenderFallback: 300,
+			queue.StreamDead:           1441,
 		},
 	}
 	q, err := RedisQueues{RDB: rdb}.Queues(context.Background())
@@ -517,11 +523,12 @@ func TestRedisQueues_Backlog(t *testing.T) {
 		t.Fatalf("Queues: %v", err)
 	}
 	want := map[string]QueueStat{
-		queue.StreamDNS:     {Len: 2},
-		queue.StreamHTTP:    {Len: 63, Read: 700},
-		queue.StreamRender:  {Len: 27529, Read: 1097613},
-		queue.StreamAnalyze: {Len: 1, Read: 8_000_000},
-		queue.StreamDead:    {Len: 1441, Read: 30},
+		queue.StreamDNS:            {Len: 2},
+		queue.StreamHTTP:           {Len: 63, Read: 700},
+		queue.StreamRender:         {Len: 27529, Read: 1097613},
+		queue.StreamAnalyze:        {Len: 1, Read: 8_000_000},
+		queue.StreamRenderFallback: {Len: 41, Read: 77},
+		queue.StreamDead:           {Len: 1441, Read: 30},
 	}
 	if len(q) != len(want) {
 		t.Fatalf("стримов = %d, хочу %d: %+v", len(q), len(want), q)

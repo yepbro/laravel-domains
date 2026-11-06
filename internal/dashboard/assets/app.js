@@ -53,10 +53,11 @@
     };
     var STATUS_FALLBACK_COLOR = '#6e7681';
 
-    // Рабочие стримы в порядке вывода (status.Streams, ТЗ 4.2); q:dead —
+    // Рабочие стримы в порядке вывода (status.Streams ← queue.AllStreams,
+    // ТЗ 4.2; q:render-fallback — очередь фолбэка рендера, T-237); q:dead —
     // отдельная строка с собственной подсветкой (ТЗД §5.4).
     var STREAM_DEAD = 'q:dead';
-    var STREAMS = ['q:dns', 'q:http', 'q:render', 'q:analyze', STREAM_DEAD];
+    var STREAMS = ['q:dns', 'q:http', 'q:render', 'q:render-fallback', 'q:analyze', STREAM_DEAD];
 
     // Порог подсветки очередей: глубина рабочего стрима считается
     // приближающейся к его эффективному watermark от 90 % (§5.4

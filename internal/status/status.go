@@ -467,10 +467,13 @@ type StreamLener interface {
 	Len(ctx context.Context, stream string) (int64, error)
 }
 
-// Streams — рабочие стримы очереди в порядке вывода (ТЗ 4.2).
-var Streams = []string{
-	queue.StreamDNS, queue.StreamHTTP, queue.StreamRender, queue.StreamAnalyze, queue.StreamDead,
-}
+// Streams — рабочие стримы очереди в порядке вывода (ТЗ 4.2):
+// q:dns → q:http → q:render → q:render-fallback → q:analyze → q:dead.
+// Единый источник — queue.AllStreams (S-P3-1): перечень не расходится с
+// очередью, стрим, добавленный в allStreams, появляется в сводках
+// CLI/дашборда автоматически (обещание T-237 о «мониторинге, подхватывающем
+// автоматически»).
+var Streams = queue.AllStreams()
 
 // FetchQueueLens собирает глубину очередей. Ошибка любого стрима
 // останавливает сбор: Redis один, повторные обращения к недоступному

@@ -138,12 +138,12 @@ type QueueStat struct {
 	Read int64
 }
 
-// reportStreams — стримы очередей отчёта: все пять, включая карантин
-// q:dead (его глубина — инвентарь оператора, ТЗ 4.2). Порядок — конвейер:
-// q:dns → q:http → q:render → q:analyze → q:dead.
-var reportStreams = []string{
-	queue.StreamDNS, queue.StreamHTTP, queue.StreamRender, queue.StreamAnalyze, queue.StreamDead,
-}
+// reportStreams — стримы очередей отчёта: все шесть, включая очередь
+// фолбэка рендера q:render-fallback (T-237, ФТ-6) и карантин q:dead
+// (его глубина — инвентарь оператора, ТЗ 4.2). Единый источник —
+// queue.AllStreams (S-P3-1), порядок — конвейер: q:dns → q:http →
+// q:render → q:render-fallback → q:analyze → q:dead.
+var reportStreams = queue.AllStreams()
 
 // LoadSource — источник снимка системы и процессов; интерфейс для
 // подмены в юнит-тестах (реальное чтение — /proc хоста). Стиль PSISource.
