@@ -700,6 +700,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION":     "7s",
 		"CRAWLER_MONITOR_SLOW_QUERY_TELEGRAM":         "true",
 		"CRAWLER_MONITOR_INGEST_METRICS_URL":          "http://env-ingest:9101/metrics",
+		"CRAWLER_MONITOR_RENDER_METRICS_URL":          "http://env-render:9105/metrics",
 		"CRAWLER_MONITOR_ALERTS_TELEGRAM":             "false",
 		"CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT":      "/env/telegram-notify.sh",
 		"CRAWLER_MONITOR_ALERTS_DISK_FREE_MIN_BYTES":  "17GiB",
@@ -722,6 +723,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_DASHBOARD_USERNAME":                  "envop",
 		"CRAWLER_DASHBOARD_PASSWORD_HASH":             "pbkdf2-sha256$1000$c2FsdA==$a2V5",
 		"CRAWLER_DASHBOARD_PROBES":                    "Mon=http://mon:9100, api=http://api:9104",
+		"CRAWLER_DASHBOARD_RENDER_METRICS_URLS":       "http://env-render:9105/metrics, http://env-render-fb:9120/metrics",
 		"CRAWLER_LOG_LEVEL":                           "debug",
 	})
 	type check struct {
@@ -810,6 +812,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"monitor.slow_query_min_duration", cfg.Monitor.SlowQueryMinDuration.D(), 7 * time.Second},
 		{"monitor.slow_query_telegram", cfg.Monitor.SlowQueryTelegram, true},
 		{"monitor.ingest_metrics_url", cfg.Monitor.IngestMetricsURL, "http://env-ingest:9101/metrics"},
+		{"monitor.render_metrics_url", cfg.Monitor.RenderMetricsURL, "http://env-render:9105/metrics"},
 		{"monitor.alerts.telegram", cfg.Monitor.Alerts.Telegram, false},
 		{"monitor.alerts.telegram_script", cfg.Monitor.Alerts.TelegramScript, "/env/telegram-notify.sh"},
 		{"monitor.alerts.disk_free_min_bytes", cfg.Monitor.Alerts.DiskFreeMinBytes.B(), int64(17 << 30)},
@@ -865,6 +868,12 @@ func TestEnvOverrides(t *testing.T) {
 	// значений обрезаются.
 	if p := cfg.Dashboard.Probes; len(p) != 2 || p["mon"] != "http://mon:9100" || p["api"] != "http://api:9104" {
 		t.Errorf("dashboard.probes: ожидается map[api:http://api:9104 mon:http://mon:9100], получено %v", p)
+	}
+	// Список адресов панели движков из env (S-P2-2): элементы через
+	// запятую, значение заменяет YAML целиком; пустые элементы (лишние
+	// запятые) снимает normalize.
+	if u := cfg.Dashboard.RenderMetrics; strings.Join(u, ";") != "http://env-render:9105/metrics;http://env-render-fb:9120/metrics" {
+		t.Errorf("dashboard.render_metrics_urls: ожидается [http://env-render:9105/metrics http://env-render-fb:9120/metrics], получено %v", u)
 	}
 }
 

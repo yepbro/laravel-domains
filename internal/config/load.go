@@ -189,6 +189,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_MONITOR_SLOW_QUERY_TELEGRAM", setBool(func(c *Config) *bool { return &c.Monitor.SlowQueryTelegram })},
 		{"CRAWLER_MONITOR_RENDER_DEBT_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.RenderDebtInterval })},
 		{"CRAWLER_MONITOR_INGEST_METRICS_URL", setString(func(c *Config) *string { return &c.Monitor.IngestMetricsURL })},
+		{"CRAWLER_MONITOR_RENDER_METRICS_URL", setString(func(c *Config) *string { return &c.Monitor.RenderMetricsURL })},
 		{"CRAWLER_MONITOR_ALERTS_TELEGRAM", setBool(func(c *Config) *bool { return &c.Monitor.Alerts.Telegram })},
 		{"CRAWLER_MONITOR_ALERTS_TELEGRAM_SCRIPT", setString(func(c *Config) *string { return &c.Monitor.Alerts.TelegramScript })},
 		{"CRAWLER_MONITOR_ALERTS_DISK_FREE_MIN_BYTES", setSize(func(c *Config) *ByteSize { return &c.Monitor.Alerts.DiskFreeMinBytes })},
@@ -210,6 +211,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_DASHBOARD_USERNAME", setString(func(c *Config) *string { return &c.Dashboard.Username })},
 		{"CRAWLER_DASHBOARD_PASSWORD_HASH", setString(func(c *Config) *string { return &c.Dashboard.PasswordHash })},
 		{"CRAWLER_DASHBOARD_PROBES", setStringMap(func(c *Config) *map[string]string { return &c.Dashboard.Probes })},
+		{"CRAWLER_DASHBOARD_RENDER_METRICS_URLS", setStrings(func(c *Config) *[]string { return &c.Dashboard.RenderMetrics })},
 		{"CRAWLER_LOG_LEVEL", setString(func(c *Config) *string { return &c.Log.Level })},
 	}
 }
