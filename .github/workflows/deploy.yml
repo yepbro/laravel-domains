@@ -1,13 +1,13 @@
 name: deploy
 
 # CD-конвейер (T-135): деплой боевого сервера 155.212.174.88 после зелёного
-# ci на master. Запускается workflow_run по завершении ci (деплоится ровно
+# ci на production. Запускается workflow_run по завершении ci (деплоится ровно
 # тот SHA, что протестирован) или вручную workflow_dispatch.
 on:
   workflow_run:
     workflows: [ci]
     types: [completed]
-    branches: [master]
+    branches: [production]
   workflow_dispatch:
 
 permissions:
@@ -20,12 +20,14 @@ concurrency:
 jobs:
   deploy:
     name: build · upload · restart · healthz · rollback
-    # Только успех ci на push в master (или ручной запуск)
+    # Только успех ci на push в production (или ручной запуск): master —
+    # основная ветка разработки, на прод уходит только то, что смержено
+    # в production (docs/ci-cd.md).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch == 'master')
+       github.event.workflow_run.head_branch == 'production')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:

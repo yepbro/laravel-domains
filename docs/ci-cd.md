@@ -1,15 +1,16 @@
 # CI/CD: боевой деплой через GitHub Actions
 
 Непрерывный деплой боевого сервера (дополнение к T-135): после зелёного
-CI на `master` тот же коммит собирается в статические бинарники и
+CI на `production` тот же коммит собирается в статические бинарники и
 устанавливается на сервер systemd-деплоя ([`deploy.md`](deploy.md)).
-Конфигурации сервера (`/etc/crawler`, юниты, nginx, сертификаты) конвейер
-не трогает — только `/opt/crawler/bin`.
+`master` — ветка разработки (ci без деплоя); на прод уходит только
+смердженное в `production`. Конфигурации сервера (`/etc/crawler`, юниты,
+nginx, сертификаты) конвейер не трогает — только `/opt/crawler/bin`.
 
 ## Конвейер
 
 ```
-push в master ──▶ ci (тесты, lint, интеграция)
+push в production ──▶ ci (тесты, lint, интеграция)
                       │ успех
                       ▼
                  deploy (workflow_run)
@@ -26,7 +27,7 @@ push в master ──▶ ci (тесты, lint, интеграция)
 
 | Файл | Назначение |
 |---|---|
-| [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) | workflow: запуск после успеха `ci` на `master` (или вручную), сборка, деплой, откат по провалу healthcheck |
+| [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) | workflow: запуск после успеха `ci` на `production` (или вручную), сборка, деплой, откат по провалу healthcheck |
 | [`deploy/deploy-install.sh`](../deploy/deploy-install.sh) | серверная сторона: атомарная замена `/opt/crawler/bin` с откатом |
 | [`deploy/deploy-healthcheck.sh`](../deploy/deploy-healthcheck.sh) | серверная сторона: 10 юнитов active + healthz + crawlerctl |
 | [`deploy/deploy-rollback.sh`](../deploy/deploy-rollback.sh) | серверная сторона: восстановление `bin.prev` и перезапуск набора (T-137) |
@@ -139,7 +140,7 @@ trap-отката: «выполнен на предыдущую версию (bi
 ## Ручной запуск и операции
 
 ```bash
-# запустить деплой текущего master без ожидания ci (GitHub → Actions → deploy → Run workflow)
+# запустить деплой текущего production без ожидания ci (GitHub → Actions → deploy → Run workflow)
 gh workflow run deploy
 
 # на сервере: предыдущие бинарники (последний успешный деплой)

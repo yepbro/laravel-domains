@@ -1,10 +1,12 @@
 name: ci
 
-# Прогон только на master и в PR: событие push на ветке с открытым PR
-# дублировало бы тот же коммит двумя ранами.
+# Прогон на master, production и в PR: событие push на ветке с открытым PR
+# дублировало бы тот же коммит двумя ранами. production нужен отдельно:
+# deploy (workflow_run) срабатывает по зелёному ci-рану на production
+# (docs/ci-cd.md) — без push-рана ci на этой ветке цепочка деплоя не стартует.
 on:
   push:
-    branches: [master]
+    branches: [master, production]
   pull_request:
   workflow_dispatch:
 
