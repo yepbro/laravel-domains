@@ -146,6 +146,11 @@ func TestDashboard_Snapshot(t *testing.T) {
 	cfg := config.Default()
 	coll, err := dashboard.NewCollector(pool, gate, cfg.Dashboard, dashboard.CollectorOptions{
 		Probes: map[string]string{"alive": alive.URL, "dead": deadURL},
+		// Секция движков: пустой НЕ-nil срез — «н/д» без ошибок
+		// (operator-способ выключения, S-P2-5): nil подтянул бы дефолт
+		// config.Default() с адресом render-worker:9105, которого нет
+		// в тестовом окружении, — снимок падал бы ошибкой секции render.
+		RenderMetrics: []string{},
 		// Пороги подсветки очередей — как в cmd/dashboard: NewCollector
 		// не читает секции scheduler/redis сам (§5.4); MaxLen — для
 		// эффективного порога стрима (кламп по MAXLEN).
