@@ -27,7 +27,7 @@
 последний перенос 2026-11-03: этап 34 — T-219…T-232, находки
 полного код-ревью). Активная волна: **этап 35** (T-233…T-249,
 ТЗ [`TZ_render_engines.md`](TZ_render_engines.md)) — движки рендера
-и очередь фолбэка.
+и очередь фолбэка. Активная волна: этап 36 — фиксы сверхраунда ревью (T-250…T-253).
 
 ## Этап 35: выбор движка рендера и очередь фолбэка (T-233…T-249)
 
@@ -270,3 +270,83 @@ C (T-235/239/240/244), D (T-245/246), затем операционные T-247�
   откат §6.4 выполнен и задокументирован (валидный исход «остаться на
   chromium», ТЗ §5.3 п.2).
 
+
+## Этап 36: фиксы сверхраунда код-ревью этапа 35 (T-250…T-253)
+
+Источник: сверхраунд-ревью всего этапа 35 (16 находок: 4×P1, 6×P2,
+6×P3; отчёт — `/tmp/opencode/review/stage35-full-review.md`, ревьюер
+deepseek-v4.1-flash) + решения оператора по спорным пунктам (2026-11-06:
+предсоздание серий; streak «≥порога» без требования роста; тарпит-рейт
+отдельной колонкой; rate-алерт browser-ошибок; MAXLEN принять с
+контролем в приёмке — внесено в ТЗ v0.2; `--force` для fixtures import).
+Режим — «Массовое код-ревью и фиксы» AGENT.md: группа домена = один
+worktree `fix-s35-<slug>`, **каждая находка — отдельный коммит**
+`fix: <описание> (S-PN-N)`, перед каждым коммитом
+`COMPOSE_PROJECT_NAME=crawler make test` + `make lint` в worktree,
+модель субагентов `zai-coding-plan/glm-5.3#max`. Невалидная находка не
+исправляется, а разбирается в отчёте. Окно 1/1, порядок групп
+последовательный: T-250 → T-251 → T-252 → T-253 (файлы групп почти не
+пересекаются, последовательность — из-за окна).
+
+- **T-250** [в работе] — fix-s35-worker (internal/renderworker +
+  acceptance): (1) S-P1-1 — движковый guard публикации фолбэка:
+  `fallbackArmed()` не публикует при engine=chromium (шаг 1 приёмки
+  ТЗ §6.2, откат §6.4 «гаснет сама», ФТ-14); acceptance
+  TestAccept03_RenderFallback — первичный воркер с движком-кандидатом;
+  юнит-тест «chromium+enabled → публикаций нет»; доки render.md/deploy.md.
+  (2) S-P1-4 (решение: предсоздание серий) — нулевые дети
+  `suspended{gate,budget}` и `consumed{rendered,finalized,skipped}` в
+  NewMetrics (+ по консистентности — оценить `fallback{reason}`/
+  `tasksFin{reason,engine}`: словарь открытый — предсоздавать только
+  замкнутые, открытие аргументировать); тест «первое событие 0→1 →
+  алерт firing» на стороне монитора живёт в T-252, здесь — метрики.
+  (3) S-P2-4 (ядро) — метка engine на
+  `crawler_render_tarpit_finalized_total` (знаменатель успешности
+  панели НЕ меняем — решение оператора); services.md. Критерий: тесты
+  трёх пунктов зелёные, behavior по умолчанию (chromium без фолбэка)
+  не меняется.
+- **T-251** [новая] — fix-s35-infra (internal/config + deploy):
+  (1) S-P1-2 — `restart_memory_bytes: 0` в deploy/docker/config.dev.yaml
+  + пояснение в закомментированных образцах движков + тест профиля dev
+  с engine=moli/lightpanda проходит Validate + dev-environment.md
+  (переключение = engine+remote_url, порог уже 0). (2) S-P1-3 —
+  systemd-закрепление chromium за воркером B: EnvironmentFile
+  -/etc/crawler/render-fallback-worker.env ПОСЛЕ общего
+  (CRAWLER_RENDER_ENGINE=chromium, remote_url chromium), установка в
+  deploy.md §2.3/§4.4. (3) S-P2-2 — реализовать
+  CRAWLER_MONITOR_RENDER_METRICS_URL и CRAWLER_DASHBOARD_RENDER_METRICS_URLS
+  в envSpecs + тесты TestEnvOverrides. (4) S-P2-3 — порт метрик воркера
+  B 9110→9120 (юнит + docs/deploy.md + docs/docker.md; @-диапазон
+  9109/9111+ не трогаем). (5) S-P2-5/S-P3-3 — дефолт
+  dashboard.render_metrics_urls=[127.0.0.1:9105/metrics], шаг деплоя
+  адреса B (9110→9120) в docs/deploy.md §2.3 и чек-лист T-248, job
+  render-fallback в deploy/docker/prometheus/prometheus.yml.
+  (6) S-P3-4 — docs/configuration.md: где живёт worker_rate в docker
+  (профиль B) vs systemd (общий конфиг). Критерий: профиль-тесты
+  зелёные, docker compose config валиден, env-тесты зелёные.
+- **T-252** [новая] — fix-s35-monodash (monitor + dashboard + status):
+  (1) S-P2-1 (решение: streak без роста) — render_fallback_depth:
+  второй триггер «n ≥ порога 2 прохода подряд» без требования роста;
+  тесты: стационар 9000 → firing, упор в MAXLEN 15000 → firing+удержание,
+  одиночный всплеск между проходами → тихо. (2) S-P2-6 (решение:
+  rate-детектор) — алерт render_engine_browser_errors (или расширение
+  существующего) на рост `crawler_stage_errors_total{stage="render",
+  type="browser"}` из зонда render-worker со стриком 2-3 прохода;
+  событие гейта остаётся счётчиком/логом; operations.md/services.md.
+  (3) S-P1-4 (мониторная часть) — тесты «первое событие бюджета →
+  firing», «отсутствующая серия = 0, не not_measured» (после
+  предсоздания из T-250; парсер — по решению T-250, тест здесь).
+  (4) S-P3-1 — q:render-fallback в internal/status Streams,
+  monitor/load reportStreams, справка crawlerctl status; комментарии
+  «пять стримов» → актуальные. (5) S-P3-2 (остаток) — панель: колонка
+  «тарпит-рейт» (из тарпит-счётчика с engine от T-250), колонка RSS
+  (process_resident_memory_bytes экспозиции), строка
+  «fallback-рейт = published/страницы», `by.* || 0` на фронте;
+  docs/services.md — секция render JSON+фронт. Критерий: тесты
+  алертов/панели по образцу существующих зелёные.
+- **T-253** [новая] — fix-s35-tools (crawlerctl fixtures): (1) S-P3-5
+  (решение: --force по образцу zones collapse) — `fixtures import`
+  требует явный `--force` для выполнения наката, перед началом выводит
+  цель (host/database DSN, счётчики строк по таблицам) и затрагиваемые
+  таблицы; без --force — dry-run-вывод плана; dev-environment.md
+  обновить цикл. Критерий: тесты флага/dry-run; справка синхронна.
