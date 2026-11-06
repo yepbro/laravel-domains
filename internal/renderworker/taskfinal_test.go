@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"testing"
 
+	"crawler/internal/config"
 	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/render"
@@ -323,8 +324,9 @@ func TestRenderWorker_TaskFinalizeMetrics(t *testing.T) {
 		map[string]string{"reason": "net::ERR_NAME_NOT_RESOLVED"}); got != -1 {
 		t.Errorf("чужая метка причины = %v, want −1 (нет серии)", got)
 	}
-	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", nil); got != 0 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 0 (не тарпит)", got)
+	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
+		map[string]string{"engine": config.EngineChromium}); got != -1 {
+		t.Errorf("crawler_render_tarpit_finalized_total = %v, want −1 (не тарпит, серия не создаётся)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 0 {
 		t.Errorf("crawler_render_cert_finalized_total = %v, want 0 (не cert)", got)
@@ -374,7 +376,8 @@ func TestRenderWorker_TaskFinalizeTarpitPriority(t *testing.T) {
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
 		t.Fatalf("финализация: %v", err)
 	}
-	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", nil); got != 1 {
+	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
+		map[string]string{"engine": config.EngineChromium}); got != 1 {
 		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 1 (таймаут — территория T-148)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", nil); got != -1 {

@@ -1,8 +1,9 @@
 // Юнит-тесты приборов этапа рендера (T-077, ТЗ 5.9): nil-безопасность,
 // экспорт значений через Gather (счётчик задач и длительности, ошибки
 // по классам render.Class, ветка rendered=true доли рендера), метка
-// engine движка сборки на доле рендера и финализациях класса задачи
-// (T-235), инкременты в типовом пути processDelivery — на фейках пула,
+// engine движка сборки на доле рендера, тарпит-финализациях (S-P2-4) и
+// финализациях класса задачи (T-235), инкременты в типовом пути
+// processDelivery — на фейках пула,
 // хранилища, рендера и очереди из worker_test.go; потребление фолбэка
 // с меткой исхода (T-245) — точки проводки воркера B покрыты
 // TestRenderWorker_FallbackConsumedMetrics (fallback_test.go).
@@ -122,8 +123,16 @@ func TestMetricsMethods(t *testing.T) {
 	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true", "engine": config.EngineChromium}); got != -1 {
 		t.Errorf("crawler_render_records_total{engine=%s} = %v, want -1 (серия чужого движка)", config.EngineChromium, got)
 	}
-	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", nil); got != 1 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 1", got)
+	// Тарпит-финализации с меткой engine сборки (S-P2-4): серия чужого
+	// движка не создаётся — словарь ленивый (открытых кодов нет, но
+	// предсоздания нет и по решению оператора — только suspended/consumed).
+	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
+		map[string]string{"engine": config.EngineLightpanda}); got != 1 {
+		t.Errorf("crawler_render_tarpit_finalized_total{engine=%s} = %v, want 1", config.EngineLightpanda, got)
+	}
+	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
+		map[string]string{"engine": config.EngineChromium}); got != -1 {
+		t.Errorf("crawler_render_tarpit_finalized_total{engine=%s} = %v, want -1 (серия чужого движка)", config.EngineChromium, got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 1 {
 		t.Errorf("crawler_render_cert_finalized_total = %v, want 1", got)

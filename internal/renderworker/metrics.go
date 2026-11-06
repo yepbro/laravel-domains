@@ -13,13 +13,14 @@
 // (T-239, ФТ-9, ТЗ §4.6 п.2), потребление фолбэка воркером B с меткой
 // исхода rendered|finalized|skipped (T-245, ТЗ §4.6 п.2, ФТ-11/ФТ-15 —
 // баланс published = consumed + остаток q:render-fallback, шаг 4
-// приёмки ТЗ §6.2) и
-// метка движка engine на доле рендера и финализациях класса задачи
-// (T-235, ТЗ §4.6 п.1, ФТ-15: кардинальность 3 — chromium/moli/
-// lightpanda, значение — движок сборки воркера, Options.Engine ←
-// render.engine; существующие агрегации без engine не меняются) и
-// предсоздание нулевых серий замкнутых словарей suspended{gate,budget}
-// и consumed{rendered,finalized,skipped} (S-P1-4): семейства видны в
+// приёмки ТЗ §6.2); метка движка engine на доле рендера,
+// тарпит-финализациях (S-P2-4: тарпит — движко-зависимый отказ) и
+// финализациях класса задачи (T-235, ТЗ §4.6 п.1, ФТ-15:
+// кардинальность 3 — chromium/moli/lightpanda, значение — движок
+// сборки воркера, Options.Engine ← render.engine; существующие
+// агрегации без engine не меняются); предсоздание нулевых серий
+// замкнутых словарей suspended{gate,budget} и
+// consumed{rendered,finalized,skipped} (S-P1-4): семейства видны в
 // экспозиции с первого старта, первое событие счётчика не теряется.
 package renderworker
 
@@ -78,7 +79,7 @@ type Metrics struct {
 	seconds  prometheus.Observer    // crawler_stage_seconds{stage="render"}
 	errors   *prometheus.CounterVec // crawler_stage_errors_total{stage,type}
 	rendered prometheus.Counter     // crawler_render_records_total{rendered="true",engine} (T-235)
-	tarpits  prometheus.Counter     // crawler_render_tarpit_finalized_total (T-148)
+	tarpits  *prometheus.CounterVec // crawler_render_tarpit_finalized_total{engine} (T-148/S-P2-4)
 	certs    prometheus.Counter     // crawler_render_cert_finalized_total (T-159)
 	dns      prometheus.Counter     // crawler_render_dns_finalized_total (T-211)
 	tasksFin *prometheus.CounterVec // crawler_render_task_finalized_total{reason,engine} (T-172/T-235)
@@ -136,8 +137,8 @@ func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 		}, "rendered", metrics.LabelEngine).WithLabelValues("true", engine),
 		tarpits: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_tarpit_finalized_total",
-			Help: "Записи, финализированные без рендера после исчерпания render.timeout_attempts (T-148): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze; рост — доля таймаут-тарпитов на рендере.",
-		}).WithLabelValues(),
+			Help: "Записи, финализированные без рендера после исчерпания render.timeout_attempts (T-148): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze; рост — доля таймаут-тарпитов на рендере. Метка engine — движок рендера сборки воркера (chromium|moli|lightpanda, render.engine, S-P2-4): тарпит — движко-зависимый отказ (зависшая на лёгком движке страница может открыться в chromium), метка атрибутирует его движку; агрегации без engine не меняются.",
+		}, metrics.LabelEngine),
 		certs: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_cert_finalized_total",
 			Help: "Записи, финализированные без рендера по постоянной ошибке TLS-сертификата хоста — net::ERR_CERT_AUTHORITY_INVALID / net::ERR_CERT_COMMON_NAME_INVALID (T-159): итог — сырой HTML HTTP-фазы, запись уходит в q:analyze, в q:dead cert-класс не попадает.",
@@ -197,12 +198,14 @@ func (m *Metrics) Rendered() {
 }
 
 // TarpitFinalized — запись финализирована без рендера по исчерпании
-// лимита таймаутов (T-148): +1 в счётчик тарпит-финализаций.
+// лимита таймаутов (T-148): +1 в счётчик тарпит-финализаций с меткой
+// engine сборки (S-P2-4) — движко-зависимый отказ атрибутируется
+// движку (материал тарпит-рейта движка на панели).
 func (m *Metrics) TarpitFinalized() {
 	if m == nil {
 		return
 	}
-	m.tarpits.Inc()
+	m.tarpits.WithLabelValues(m.engine).Inc()
 }
 
 // CertFinalized — запись финализирована без рендера по постоянной ошибке

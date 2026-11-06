@@ -128,8 +128,9 @@ func TestRenderWorker_TarpitFallbackPublish(t *testing.T) {
 		map[string]string{"reason": "timeout"}); got != 1 {
 		t.Errorf("crawler_render_fallback_published_total{timeout} = %v, want 1", got)
 	}
-	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", nil); got != 0 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 0 (не финализация)", got)
+	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
+		map[string]string{"engine": rwFBCandidateEngine}); got != -1 {
+		t.Errorf("crawler_render_tarpit_finalized_total = %v, want -1 (не финализация — серия не создаётся)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", nil); got != -1 {
 		t.Errorf("crawler_render_task_finalized_total не должен иметь серий: %v", got)

@@ -499,7 +499,9 @@ SELECT строки (final_url, content_hash)
   HTML HTTP-фазы (`rendered = false`), публикация q:analyze, XACK —
   тяжёлая страница не уводит работу в q:dead (там остаются только
   инфраструктурные ошибки; разбор накопившегося — runbooks §2.5).
-  Доля финализаций — метрика `crawler_render_tarpit_finalized_total`.
+  Доля финализаций — метрика `crawler_render_tarpit_finalized_total`
+  (с меткой `engine` сборки — S-P2-4: тарпит движко-зависим, метка
+  атрибутирует его движку).
 - **Постоянные ошибки сертификата хоста** (T-159, расширение T-172):
   `ERR_CERT_AUTHORITY_INVALID` (сертификат не издан доверенным ЦС),
   `ERR_CERT_COMMON_NAME_INVALID` (не покрывает имя хоста) и

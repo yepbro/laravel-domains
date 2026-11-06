@@ -15,10 +15,19 @@ import (
 	"testing"
 	"time"
 
+	"crawler/internal/config"
 	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/render"
 )
+
+// rwTarpitMetric — значение crawler_render_tarpit_finalized_total{engine}
+// сборки (S-P2-4): engine — движок сборки воркера (дефолт фикстур —
+// chromium, "" → chromium).
+func rwTarpitMetric(t *testing.T, reg *metrics.Registry, engine string) float64 {
+	t.Helper()
+	return rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", map[string]string{"engine": engine})
+}
 
 // rwTarpitErr — ошибка рендера, неотличимая от боевой по классификации
 // (session.wrap: ClassTask + context.DeadlineExceeded в цепочке — так
@@ -231,7 +240,9 @@ func TestRenderWorker_TarpitAttemptsBoundary(t *testing.T) {
 }
 
 // TestRenderWorker_TarpitMetrics — финализация без рендера считается
-// задачей этапа, ошибкой класса task и отдельным счётчиком тарпитов.
+// задачей этапа, ошибкой класса task и отдельным счётчиком тарпитов
+// с меткой engine сборки (S-P2-4: тарпит — движко-зависимый отказ,
+// серия чужого движка не создаётся).
 func TestRenderWorker_TarpitMetrics(t *testing.T) {
 	f := newRWFixture(t)
 	reg := metrics.New("render-worker")
@@ -255,8 +266,11 @@ func TestRenderWorker_TarpitMetrics(t *testing.T) {
 	if got := rwMetricValue(t, reg, "crawler_stage_errors_total", labels); got != 1 {
 		t.Errorf("crawler_stage_errors_total{task} = %v, want 1", got)
 	}
-	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", nil); got != 1 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 1", got)
+	if got := rwTarpitMetric(t, reg, config.EngineChromium); got != 1 {
+		t.Errorf("crawler_render_tarpit_finalized_total{engine=%s} = %v, want 1", config.EngineChromium, got)
+	}
+	if got := rwTarpitMetric(t, reg, config.EngineMoli); got != -1 {
+		t.Errorf("crawler_render_tarpit_finalized_total{engine=%s} = %v, want -1 (серия чужого движка)", config.EngineMoli, got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true"}); got != 0 {
 		t.Errorf("crawler_render_records_total{rendered=true} = %v, want 0 (DOM не записан)", got)

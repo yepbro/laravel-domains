@@ -19,6 +19,7 @@ import (
 
 	"github.com/chromedp/chromedp"
 
+	"crawler/internal/config"
 	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/render"
@@ -289,8 +290,9 @@ func TestRenderWorker_CertMetrics(t *testing.T) {
 	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 1 {
 		t.Errorf("crawler_render_cert_finalized_total = %v, want 1", got)
 	}
-	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", nil); got != 0 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 0 (cert ≠ тарпит)", got)
+	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
+		map[string]string{"engine": config.EngineChromium}); got != -1 {
+		t.Errorf("crawler_render_tarpit_finalized_total = %v, want −1 (cert ≠ тарпит, серия не создаётся)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true"}); got != 0 {
 		t.Errorf("crawler_render_records_total{rendered=true} = %v, want 0 (DOM не записан)", got)
