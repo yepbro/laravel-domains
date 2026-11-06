@@ -89,7 +89,15 @@
 //     Падение юнита движка отдельным алертом не вводится: юниты движков
 //     рендера — crawler-*.service (crawler-chromium сегодня, moli/
 //     lightpanda по ТЗ рендера §4.7 п.3) — покрывает существующий
-//     unit_oom (T-145, шаблон unitEventsPattern).
+//     unit_oom (T-145, шаблон unitEventsPattern);
+//   - устойчивый рост browser-ошибок этапа рендера (S-P2-6, ТЗ рендера
+//     §4.6 п.3, решение оператора — rate-детектор) — счётчик
+//     crawler_stage_errors_total{stage="render",type="browser"} из
+//     того же зонда /metrics рендер-воркера растёт 2 проходов подряд:
+//     движок-кандидат (moli/lightpanda) завис или недоступен (гейт
+//     T-239 приостанавливает фолбэк-публикации; событие гейта —
+//     счётчик suspended{reason="gate"} и Warn-лог воркера, детектор —
+//     здесь).
 //
 // Доставка (T-162): переходы алертов (срабатывание/снятие) уходят
 // оператору в Telegram — хук AlertsOptions.OnPass (TelegramNotifier,
@@ -160,44 +168,46 @@ const (
 
 // Имена алертов — метка в логах и снапшоте прохода.
 const (
-	AlertDNSErrors      = "dns_temp_error_share"   // доля temp_error за сутки
-	AlertQueueOverflow  = "queue_overflow"         // глубина очереди у порога гейта
-	AlertProgressStall  = "progress_stall"         // zones.updated_at устарел
-	AlertDiskFree       = "disk_free"              // место каталога контента
-	AlertNVMeWear       = "nvme_wear"              // SMART percentage_used
-	AlertBadHashes      = "ingest_bad_hashes"      // всплеск мусорных content_hash
-	AlertUnitOOM        = "unit_oom"               // OOM/рестарты юнитов crawler (T-145)
-	AlertQueueDead      = "queue_dead"             // неразобранный q:dead (T-154)
-	AlertRedisMemory    = "redis_memory"           // память Redis у maxmemory (T-154)
-	AlertDiskMin        = "disk_free_min"          // абсолютный минимум места, Warn (T-162)
-	AlertDiskCrit       = "disk_free_crit"         // эскалация абсолютного минимума (T-162)
-	AlertMemHigh        = "memory_high"            // троттлинг MemoryHigh (T-162)
-	AlertQueueFreeze    = "queue_frozen"           // замороженная очередь (T-162)
-	AlertPSICPU         = "psi_cpu"                // PSI CPU some (T-162)
-	AlertRenderDebt     = "render_debt"            // накопление рендер-долга (T-175)
-	AlertRenderFbDepth  = "render_fallback_depth"  // рост глубины q:render-fallback (T-246)
-	AlertRenderFbBudget = "render_fallback_budget" // превышение бюджета доли фолбэка (T-246)
+	AlertDNSErrors        = "dns_temp_error_share"   // доля temp_error за сутки
+	AlertQueueOverflow    = "queue_overflow"         // глубина очереди у порога гейта
+	AlertProgressStall    = "progress_stall"         // zones.updated_at устарел
+	AlertDiskFree         = "disk_free"              // место каталога контента
+	AlertNVMeWear         = "nvme_wear"              // SMART percentage_used
+	AlertBadHashes        = "ingest_bad_hashes"      // всплеск мусорных content_hash
+	AlertUnitOOM          = "unit_oom"               // OOM/рестарты юнитов crawler (T-145)
+	AlertQueueDead        = "queue_dead"             // неразобранный q:dead (T-154)
+	AlertRedisMemory      = "redis_memory"           // память Redis у maxmemory (T-154)
+	AlertDiskMin          = "disk_free_min"          // абсолютный минимум места, Warn (T-162)
+	AlertDiskCrit         = "disk_free_crit"         // эскалация абсолютного минимума (T-162)
+	AlertMemHigh          = "memory_high"            // троттлинг MemoryHigh (T-162)
+	AlertQueueFreeze      = "queue_frozen"           // замороженная очередь (T-162)
+	AlertPSICPU           = "psi_cpu"                // PSI CPU some (T-162)
+	AlertRenderDebt       = "render_debt"            // накопление рендер-долга (T-175)
+	AlertRenderFbDepth    = "render_fallback_depth"  // рост глубины q:render-fallback (T-246)
+	AlertRenderFbBudget   = "render_fallback_budget" // превышение бюджета доли фолбэка (T-246)
+	AlertRenderBrowserErr = "render_browser_errors"  // рост browser-ошибок этапа: движок недоступен (S-P2-6)
 )
 
 // alertDescs — человекочитаемые описания алертов для записей лога.
 var alertDescs = map[string]string{
-	AlertDNSErrors:      "рост доли ошибок DNS",
-	AlertQueueOverflow:  "переполнение очередей",
-	AlertProgressStall:  "остановка прогресса",
-	AlertDiskFree:       "нехватка места на диске",
-	AlertNVMeWear:       "износ NVMe (SMART)",
-	AlertBadHashes:      "мусорные content_hash при очистке удалённых доменов",
-	AlertUnitOOM:        "OOM-убийства и крэш-рестарты юнитов crawler",
-	AlertQueueDead:      "мертвые задачи в q:dead не разбираются",
-	AlertRedisMemory:    "память Redis у порога maxmemory",
-	AlertDiskMin:        "свободное место ниже абсолютного минимума",
-	AlertDiskCrit:       "свободное место ниже порога эскалации",
-	AlertMemHigh:        "троттлинг MemoryHigh юнита (устойчивый рост reclaim-событий)",
-	AlertQueueFreeze:    "замороженная очередь: группа не читает стрим",
-	AlertPSICPU:         "голод CPU (PSI some) устойчиво выше порога",
-	AlertRenderDebt:     "накопление рендер-долга: приток SPA обгоняет дренаж q:render",
-	AlertRenderFbDepth:  "накопление очереди фолбэка q:render-fallback: воркер B не успевает",
-	AlertRenderFbBudget: "превышение бюджета доли фолбэка: деградация основного движка",
+	AlertDNSErrors:        "рост доли ошибок DNS",
+	AlertQueueOverflow:    "переполнение очередей",
+	AlertProgressStall:    "остановка прогресса",
+	AlertDiskFree:         "нехватка места на диске",
+	AlertNVMeWear:         "износ NVMe (SMART)",
+	AlertBadHashes:        "мусорные content_hash при очистке удалённых доменов",
+	AlertUnitOOM:          "OOM-убийства и крэш-рестарты юнитов crawler",
+	AlertQueueDead:        "мертвые задачи в q:dead не разбираются",
+	AlertRedisMemory:      "память Redis у порога maxmemory",
+	AlertDiskMin:          "свободное место ниже абсолютного минимума",
+	AlertDiskCrit:         "свободное место ниже порога эскалации",
+	AlertMemHigh:          "троттлинг MemoryHigh юнита (устойчивый рост reclaim-событий)",
+	AlertQueueFreeze:      "замороженная очередь: группа не читает стрим",
+	AlertPSICPU:           "голод CPU (PSI some) устойчиво выше порога",
+	AlertRenderDebt:       "накопление рендер-долга: приток SPA обгоняет дренаж q:render",
+	AlertRenderFbDepth:    "накопление очереди фолбэка q:render-fallback: воркер B не успевает",
+	AlertRenderFbBudget:   "превышение бюджета доли фолбэка: деградация основного движка",
+	AlertRenderBrowserErr: "рост browser-ошибок этапа рендера: движок завис или недоступен",
 }
 
 // Пороги оценки. Числа ТЗ не задаёт; переиспользуются существующие пороги
@@ -399,6 +409,20 @@ const (
 	// всегда аномалия (в норме публикации укладываются в потолок доли),
 	// порог — одно событие, стиль износа NVMe.
 	AlertFallbackBudgetWindow = 6
+
+	// AlertRenderBrowserErrorsPasses — проходов алертов подряд с ростом
+	// счётчика browser-ошибок этапа рендера до срабатывания
+	// render_browser_errors (S-P2-6, решение оператора — rate-детектор):
+	// 2 × период алертов (5 мин на дефолте, T-206) = 10 мин (по образцу
+	// mem_high/render_debt). Разовая browser-ошибка — штатная работа ядра
+	// рендера (перезапуск сессии/контекста, T-063) и эпизод, разбираемый
+	// health-гейтом; серия роста — движок (moli/lightpanda) завис или
+	// недоступен: гейт T-239 уже приостановил фолбэк-публикации,
+	// браузер-класс ждёт в redelivery q:render — оператору нужен сигнал
+	// про сам движок. Событие гейта остаётся счётчиком
+	// suspended{reason="gate"} и Warn-логом воркера: гейт — порог стрика
+	// в воркере, алерт — наблюдаемость средствами монитора.
+	AlertRenderBrowserErrorsPasses = 2
 )
 
 // dnsDailyCountersSQL — числитель и знаменатель доли temp_error текущих
@@ -710,6 +734,19 @@ type FallbackBudgetSource interface {
 	FallbackBudget(ctx context.Context) (int64, error)
 }
 
+// RenderBrowserErrorsSource — счётчик ошибок класса браузера этапа
+// рендера (crawler_stage_errors_total{stage="render",type="browser"},
+// S-P2-6); реализация RenderSuspends (suspends.go) читает его из той же
+// экспозиции /metrics рендер-воркера (адрес monitor.render_metrics_url),
+// юнит-тесты подменяют фейком. Стиль FallbackBudgetSource: источник
+// заменяем, алерт не зависит от HTTP.
+type RenderBrowserErrorsSource interface {
+	// RenderBrowserErrors возвращает текущее значение счётчика (монотонно
+	// растёт инфра-ошибками движка; рестарт воркера обнуляет). Ошибка
+	// errNotRenderExposition — «адрес настроен не на рендер-воркера».
+	RenderBrowserErrors(ctx context.Context) (int64, error)
+}
+
 // alertStreams — проверяемые стримы: рабочие, ограниченные гейтом
 // backpressure (q:dead не ограничивается — см. шапку backpressure.go).
 var alertStreams = []string{
@@ -735,6 +772,10 @@ type AlertsDeps struct {
 	// рендера (T-246); nil — алерт «не измеряется». Источником командует
 	// cmd/monitor (RenderSuspends по monitor.render_metrics_url).
 	FallbackBudget FallbackBudgetSource
+	// RenderBrowserErrors — счётчик ошибок класса браузера этапа рендера
+	// (S-P2-6); nil — алерт «не измеряется». Источник — тот же зонд
+	// RenderSuspends по monitor.render_metrics_url (cmd/monitor).
+	RenderBrowserErrors RenderBrowserErrorsSource
 	// UnitEvents — OOM/рестарты юнитов crawler (T-145); nil — алерт
 	// «не измеряется». Дефолтной реализации ОС нет (в отличие от
 	// Space/Wear): OSUnitEvents делает exec systemctl и читает хостовый
@@ -1005,6 +1046,15 @@ type depthGrowthTrack struct {
 	hot int
 }
 
+// counterGrowthTrack — память трекинга роста одиночного счётчика между
+// проходами (S-P2-6): прошлый снимок и серия растущих проходов (стиль
+// memHighTrack; отдельный тип — счётчик int64, как значения зондов).
+type counterGrowthTrack struct {
+	prev   int64
+	streak int
+	seen   bool
+}
+
 // Alerts — оценка алертов с памятью состояний между проходами
 // (гистерезис, фронтовые записи лога только на переходах).
 type Alerts struct {
@@ -1039,6 +1089,9 @@ type Alerts struct {
 	// (T-246): кольцо дельт счётчика suspended{reason="budget"}, ёмкость
 	// — AlertFallbackBudgetWindow (не дефолтная окна мусорных хешей).
 	renderFbBudget badHashesWindow
+	// renderBrowserErr — трекинг роста счётчика browser-ошибок этапа
+	// рендера (S-P2-6): прошлый снимок зонда и серия растущих проходов.
+	renderBrowserErr counterGrowthTrack
 }
 
 // NewAlerts строит оценщик: нормализует опции (дефолты периодов), источники
@@ -1094,6 +1147,7 @@ func (a *Alerts) evaluators() []alertEval {
 		{AlertRenderDebt, a.evalRenderDebt},
 		{AlertRenderFbDepth, a.evalRenderFallbackDepth},
 		{AlertRenderFbBudget, a.evalRenderFallbackBudget},
+		{AlertRenderBrowserErr, a.evalRenderBrowserErrors},
 	}
 }
 
@@ -1995,6 +2049,64 @@ func (a *Alerts) evalRenderFallbackBudget(ctx context.Context, _ string) verdict
 		return verdict{
 			status: AlertStatusFiring,
 			detail: detail + " — доля фолбэка ушла за потолок render.fallback.share_percent: деградация основного движка (fallback-рейт — панель движков дашборда, причины — crawler_render_task_finalized_total)",
+		}
+	}
+	return verdict{status: AlertStatusOK, detail: detail}
+}
+
+// evalRenderBrowserErrors — устойчивый рост счётчика ошибок класса
+// браузера этапа рендера (S-P2-6, решение оператора — rate-детектор):
+// crawler_stage_errors_total{stage="render",type="browser"} из зонда
+// /metrics рендер-воркера (тот же адрес, что у зонда бюджета) растёт
+// AlertRenderBrowserErrorsPasses проходов подряд — движок-кандидат
+// (moli/lightpanda) завис или недоступен: health-гейт T-239 к этому
+// моменту приостанавливает фолбэк-публикации, браузер-класс ждёт в
+// redelivery q:render в пределах окна ретраев — сигнал оператору «чинить
+// движок / откат на chromium» (ТЗ рендера §6.4). Событие гейта остаётся
+// счётчиком suspended{reason="gate"} и Warn-логом воркера: детектор не
+// дублирует защёлкивание, а видит первопричину — стрик инфра-ошибок.
+// Разовая browser-ошибка (штатный перезапуск сессии/контекста, T-063)
+// серию не набирает. Рестарт воркера (убыль счётчика) — нулевая дельта,
+// серия с нуля (стиль badHashesWindow). Семейство stage_errors ленивое:
+// «серии нет» у рендер-воркера — 0, не «не измеряется» (маркер
+// crawler_stage_tasks_total{stage="render"}; как suspended после
+// предсоздания T-250). Чужая экспозиция (маркера нет) — тихое «не
+// измеряется» без Warn: адрес monitor.render_metrics_url настроен не на
+// рендер-воркер — конфигурационная проблема, зонд жив; сетевая ошибка
+// зонда — «не измеряется» с Warn, как у остальных зондов.
+func (a *Alerts) evalRenderBrowserErrors(ctx context.Context, _ string) verdict {
+	if a.deps.RenderBrowserErrors == nil {
+		return verdict{
+			status: AlertStatusNotMeasured,
+			detail: "источник не задан (monitor.render_metrics_url)",
+		}
+	}
+	cur, err := a.deps.RenderBrowserErrors.RenderBrowserErrors(ctx)
+	if err != nil {
+		if errors.Is(err, errNotRenderExposition) {
+			return verdict{
+				status: AlertStatusNotMeasured,
+				detail: "экспозиция не рендер-воркера (нет crawler_stage_tasks_total{stage=\"render\"}) — проверьте monitor.render_metrics_url",
+			}
+		}
+		return verdict{err: fmt.Errorf("monitor: browser-ошибки рендера: %w", err)}
+	}
+	tr := a.renderBrowserErr
+	var delta int64
+	if tr.seen && cur > tr.prev {
+		tr.streak++
+		delta = cur - tr.prev
+	} else {
+		tr.streak = 0
+	}
+	tr.seen, tr.prev = true, cur
+	a.renderBrowserErr = tr
+	detail := fmt.Sprintf("browser-ошибки рендера %d, серия роста %d/%d (+%d за проход)",
+		cur, tr.streak, AlertRenderBrowserErrorsPasses, delta)
+	if tr.streak >= AlertRenderBrowserErrorsPasses {
+		return verdict{
+			status: AlertStatusFiring,
+			detail: detail + " — движок рендера завис или недоступен: health-гейт приостановил фолбэк-публикации, браузер-класс в redelivery q:render (откат движка — ТЗ рендера §6.4, разбор — docs/render.md)",
 		}
 	}
 	return verdict{status: AlertStatusOK, detail: detail}

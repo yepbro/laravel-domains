@@ -1,9 +1,12 @@
 // Юнит-тесты алертов очереди фолбэка рендера (T-246, ТЗ рендера §4.6
 // п.3): рост глубины q:render-fallback (порог — эффективный watermark
-// стрима, механика render_debt: уровень + серия роста + защёлка) и
-// превышение бюджета доли (окно дельт счётчика событий suspended{reason=
-// "budget"} зонда /metrics рендер-воркера, suspends.go — парсер и
-// деградации). Фейковые источники, стиль renderdebt/badhashes тестов.
+// стрима, механика render_debt: уровень + серия роста/у порога +
+// защёлка), превышение бюджета доли (окно дельт счётчика событий
+// suspended{reason="budget"} зонда /metrics рендер-воркера, suspends.go
+// — парсер и деградации) и рост browser-ошибок этапа (S-P2-6,
+// rate-детектор по счётчику
+// crawler_stage_errors_total{stage="render",type="browser"} того же
+// зонда). Фейковые источники, стиль renderdebt/badhashes тестов.
 package monitor
 
 import (
@@ -435,16 +438,176 @@ func TestAlertsRenderFallbackBudgetDegradation(t *testing.T) {
 	}
 }
 
+// --- browser-ошибки этапа рендера (S-P2-6) --------------------------------------
+
+// fakeBrowserErrors — источник счётчика browser-ошибок по заготовке
+// (стиль fakeBudgetEvents).
+type fakeBrowserErrors struct {
+	mu   sync.Mutex
+	val  int64
+	errs []error
+}
+
+func (f *fakeBrowserErrors) RenderBrowserErrors(context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := popErr(&f.errs); err != nil {
+		return 0, err
+	}
+	return f.val, nil
+}
+
+func (f *fakeBrowserErrors) set(v int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.val = v
+}
+
+// TestAlertsRenderBrowserErrors — rate-детектор (S-P2-6): серия
+// browser-ошибок (рост счётчика 2 прохода подряд) — firing; одиночная
+// ошибка — тихо; счётчик перестал расти — снятие (алерт события, не
+// состояния); рестарт воркера (убыль) — без всплеска, новое накопление
+// с нуля.
+func TestAlertsRenderBrowserErrors(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	src := &fakeBrowserErrors{}
+	env.deps.RenderBrowserErrors = src
+	ctx := context.Background()
+
+	// База: ленивое семейство — 0 у живого воркера без browser-ошибок.
+	src.set(0)
+	s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "browser-ошибки рендера 0") {
+		t.Fatalf("база: %s (%s), want ok с нулём", s.Status, s.Detail)
+	}
+	// Одиночная ошибка — серия 1/2, тихо (штатный перезапуск сессии).
+	src.set(1)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
+		t.Fatalf("одиночная: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	}
+	// Серия — второй растущий проход: firing.
+	src.set(3)
+	s = snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr)
+	if s.Status != AlertStatusFiring {
+		t.Fatalf("серия: %s (%s), want firing", s.Status, s.Detail)
+	}
+	for _, want := range []string{"browser-ошибки рендера 3", "+2", "движок"} {
+		if !strings.Contains(s.Detail, want) {
+			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+		}
+	}
+	// Счётчик стоит — серия сброшена, алерт снят (восстановление движка
+	// или удержание гейта: новых ошибок нет).
+	src.set(3)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusOK {
+		t.Errorf("стационарно: %s (%s), want ok", s.Status, s.Detail)
+	}
+	// Рестарт воркера (счётчик процессный, обнулился) — убыль не всплеск.
+	src.set(0)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusOK {
+		t.Errorf("рестарт воркера: %s (%s), want ok без всплеска", s.Status, s.Detail)
+	}
+	// Новое накопление — снова два растущих прохода.
+	src.set(2)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
+		t.Errorf("первый проход новой серии: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	}
+	src.set(5)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusFiring {
+		t.Errorf("второй проход новой серии: %s (%s), want firing", s.Status, s.Detail)
+	}
+}
+
+// TestAlertsRenderBrowserErrorsDegradation — источник не задан — тихое
+// «не измеряется» с подсказкой адреса; чужая экспозиция (адрес настроен
+// не на рендер-воркер) — тихое «не измеряется» без Warn (S-P2-6:
+// конфигурация, не авария зонда); сетевая ошибка — «не измеряется»
+// с Warn.
+func TestAlertsRenderBrowserErrorsDegradation(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	s := snapshotOf(t, env.Pass(context.Background()), AlertRenderBrowserErr)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "monitor.render_metrics_url") {
+		t.Fatalf("источник не задан: %s (%s), want not_measured с подсказкой", s.Status, s.Detail)
+	}
+	if strings.Contains(env.buf.String(), "level=WARN") {
+		t.Errorf("источник не задан дал Warn:\n%s", env.buf.String())
+	}
+
+	env2 := newAlertsTestEnv(t, nil)
+	env2.deps.RenderBrowserErrors = &fakeBrowserErrors{errs: []error{errNotRenderExposition}}
+	s = snapshotOf(t, env2.Pass(context.Background()), AlertRenderBrowserErr)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "не рендер-воркера") {
+		t.Fatalf("чужая экспозиция: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+	}
+	if strings.Contains(env2.buf.String(), "level=WARN") {
+		t.Errorf("чужая экспозиция дала Warn:\n%s", env2.buf.String())
+	}
+
+	env3 := newAlertsTestEnv(t, nil)
+	env3.deps.RenderBrowserErrors = &fakeBrowserErrors{errs: []error{errors.New("connection refused")}}
+	s = snapshotOf(t, env3.Pass(context.Background()), AlertRenderBrowserErr)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "connection refused") {
+		t.Fatalf("сетевая ошибка: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+	}
+	if !strings.Contains(env3.buf.String(), "level=WARN") {
+		t.Errorf("сетевая ошибка без Warn:\n%s", env3.buf.String())
+	}
+}
+
+// TestParseBrowserErrorsExposition — табличный разбор ветки
+// stage="render",type="browser": соседние классы (task/context) и чужой
+// stage не мешают; ленивое семейство (серии нет у рендер-воркера) — 0;
+// чужая экспозиция без маркера — errNotRenderExposition.
+func TestParseBrowserErrorsExposition(t *testing.T) {
+	cases := []struct {
+		name    string
+		expo    string
+		want    int64
+		wantErr string
+	}{
+		{"ветка browser", `crawler_stage_errors_total{stage="render",type="browser"} 7`, 7, ""},
+		{"соседние классы этапа не мешают",
+			"crawler_stage_errors_total{stage=\"render\",type=\"task\"} 3\n" +
+				"crawler_stage_errors_total{stage=\"render\",type=\"context\"} 2\n" +
+				"crawler_stage_errors_total{stage=\"render\",type=\"browser\"} 1\n", 1, ""},
+		{"чужой stage (http-воркер) — чужая экспозиция",
+			"crawler_stage_errors_total{stage=\"http\",type=\"timeout\"} 99", 0, "не рендер-воркера"},
+		{"ленивое семейство у рендер-воркера — 0",
+			"crawler_stage_tasks_total{stage=\"render\"} 5\n", 0, ""},
+		{"без метрик вовсе — чужая экспозиция", "# HELP x y\n", 0, "не рендер-воркера"},
+		{"не-число", `crawler_stage_errors_total{stage="render",type="browser"} много`, 0, "не счётчик"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseBrowserErrorsExposition(strings.NewReader(tc.expo))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ошибка = %v, want содержит %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("разбор: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("значение = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // --- зонд /metrics рендер-воркера (suspends.go) ----------------------------------
 
-// TestRenderSuspendsHTTP — зонд читает ветку reason="budget" из живой
-// экспозиции (httptest): gate-события и прочие приборы не мешают, путь
-// 404 — ошибка с адресом.
+// TestRenderSuspendsHTTP — зонд читает ветку reason="budget" и счётчик
+// browser-ошибок из живой экспозиции (httptest): gate-события и прочие
+// приборы не мешают, путь 404 — ошибка с адресом.
 func TestRenderSuspendsHTTP(t *testing.T) {
 	const expo = `# HELP crawler_render_fallback_suspended_total События приостановки
 # TYPE crawler_render_fallback_suspended_total counter
 crawler_render_fallback_suspended_total{reason="gate"} 2
 crawler_render_fallback_suspended_total{reason="budget"} 7
+crawler_stage_errors_total{stage="render",type="browser"} 4
+crawler_stage_errors_total{stage="render",type="task"} 9
 crawler_stage_tasks_total{stage="render"} 123
 `
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -460,6 +623,14 @@ crawler_stage_tasks_total{stage="render"} 123
 		t.Errorf("счётчик = %d, want 7 (только ветка budget)", got)
 	}
 
+	browser, err := RenderSuspends{URL: srv.URL}.RenderBrowserErrors(context.Background())
+	if err != nil {
+		t.Fatalf("RenderBrowserErrors: %v", err)
+	}
+	if browser != 4 {
+		t.Errorf("browser-ошибки = %d, want 4 (ветка browser, соседние классы не мешают)", browser)
+	}
+
 	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
@@ -467,6 +638,10 @@ crawler_stage_tasks_total{stage="render"} 123
 	if _, err := (RenderSuspends{URL: broken.URL}).FallbackBudget(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "500") {
 		t.Errorf("не-200: %v, want ошибка со статусом", err)
+	}
+	if _, err := (RenderSuspends{URL: broken.URL}).RenderBrowserErrors(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "500") {
+		t.Errorf("не-200 (browser): %v, want ошибка со статусом", err)
 	}
 }
 

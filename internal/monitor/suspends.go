@@ -1,15 +1,18 @@
-// Источник алерта превышения бюджета доли фолбэка (T-246, ТЗ рендера
-// §4.6 п.3): счётчик событий приостановки
-// crawler_render_fallback_suspended_total{reason="budget"} (T-239, ФТ-9б)
-// читается из HTTP-экспозиции /metrics рендер-воркера — общий реестр на
-// сервис (ТЗ 5.9, metrics.New), у monitor своей копии счётчика быть не
-// может (процессы разные). Второй межсервисный зонд пакета по образцу
-// IngestBadHashes (T-099): те же адреса, что скрейпит Prometheus, без
-// промежуточной БД — счётчик живёт у владельца данных. Читается ветка
-// reason="budget" (деградация основного движка по доле публикаций);
-// события health-гейта (reason="gate") алертом не считаются — стрик
-// инфра-ошибок класса браузера виден напрямую ошибками этапа
-// crawler_stage_errors_total{stage="render",type="browser"}.
+// Источник алертов наблюдаемости выбора движка рендера (T-246, ТЗ
+// рендера §4.6 п.3): HTTP-экспозиция /metrics рендер-воркера — общий
+// реестр на сервис (ТЗ 5.9, metrics.New), у monitor своей копии
+// счётчиков быть не может (процессы разные). Второй межсервисный зонд
+// пакета по образцу IngestBadHashes (T-099): те же адреса, что скрейпит
+// Prometheus, без промежуточной БД — счётчики живут у владельца данных.
+// Читаются две ветки: события приостановки бюджета доли
+// crawler_render_fallback_suspended_total{reason="budget"} (T-239,
+// ФТ-9б — деградация основного движка по доле публикаций) и ошибки
+// класса браузера crawler_stage_errors_total{stage="render",
+// type="browser"} (S-P2-6, решение оператора — rate-детектор:
+// устойчивый рост — движок завис/недоступен). События health-гейта
+// (reason="gate") алертом не считаются: защёлкивание гейта — счётчик и
+// Warn-лог воркера, детектор смотрит первопричину — стрик инфра-ошибок
+// класса браузера.
 //
 // Деградация: render-worker остановлен или экспозиция чужая (нет маркера
 // рендер-этапа crawler_stage_tasks_total{stage="render"}) — ошибка
@@ -28,6 +31,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -52,6 +56,13 @@ const (
 	renderStageTasksMetric = "crawler_stage_tasks_total"
 	renderStagePair        = `stage="render"`
 
+	// browserErrorsMetric / browserTypePair — счётчик ошибок этапа по
+	// классам render.Class (internal/renderworker/metrics.go), ветка
+	// stage="render",type="browser" — инфра-ошибки движка (T-063):
+	// семейство ленивое, у воркера без browser-ошибок серии нет.
+	browserErrorsMetric = "crawler_stage_errors_total"
+	browserTypePair     = `type="browser"`
+
 	// suspendedBodyLimit — потолок чтения тела /metrics: реестр воркера
 	// несёт коллекторы Go/runtime и процесса (десятки КиБ), потолок —
 	// защита от неадекватного ответа, не оценка размера (стиль
@@ -70,8 +81,12 @@ type RenderSuspends struct {
 	Client *http.Client
 }
 
-// compile-time: RenderSuspends — FallbackBudgetSource.
-var _ FallbackBudgetSource = RenderSuspends{}
+// compile-time: RenderSuspends — FallbackBudgetSource и
+// RenderBrowserErrorsSource.
+var (
+	_ FallbackBudgetSource      = RenderSuspends{}
+	_ RenderBrowserErrorsSource = RenderSuspends{}
+)
 
 // rendersProbeTimeout — бюджет одного чтения (паритет ingestProbeTimeout:
 // цикл алертов живёт своим периодом, зонд не должен его задерживать
@@ -80,26 +95,50 @@ var _ FallbackBudgetSource = RenderSuspends{}
 // mutator-disable-next-line arithmetic/base, numbers/decrementer, numbers/incrementer
 const rendersProbeTimeout = 5 * time.Second
 
-// FallbackBudget читает текущее значение счётчика событий бюджета доли
-// из экспозиции рендер-воркера.
-func (s RenderSuspends) FallbackBudget(ctx context.Context) (int64, error) {
+// fetch — GET экспозиции /metrics рендер-воркера: тело при 200,
+// общая транспортная часть зондов бюджета и browser-ошибок.
+func (s RenderSuspends) fetch(ctx context.Context) (io.ReadCloser, error) {
 	cl := s.Client
 	if cl == nil {
 		cl = &http.Client{Timeout: rendersProbeTimeout}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
 	if err != nil {
-		return 0, fmt.Errorf("monitor: зонд %s: %w", s.URL, err)
+		return nil, fmt.Errorf("monitor: зонд %s: %w", s.URL, err)
 	}
 	resp, err := cl.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("monitor: зонд %s: %w", s.URL, err)
+		return nil, fmt.Errorf("monitor: зонд %s: %w", s.URL, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("monitor: зонд %s: статус %s", s.URL, resp.Status)
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("monitor: зонд %s: статус %s", s.URL, resp.Status)
 	}
-	return parseSuspendExposition(resp.Body)
+	return resp.Body, nil
+}
+
+// FallbackBudget читает текущее значение счётчика событий бюджета доли
+// из экспозиции рендер-воркера.
+func (s RenderSuspends) FallbackBudget(ctx context.Context) (int64, error) {
+	body, err := s.fetch(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = body.Close() }()
+	return parseSuspendExposition(body)
+}
+
+// RenderBrowserErrors читает текущее значение счётчика ошибок класса
+// браузера этапа рендера из той же экспозиции (S-P2-6): тот же адрес
+// monitor.render_metrics_url, отдельный запрос — зонды независимы,
+// период цикла алертов поглощает стоимость.
+func (s RenderSuspends) RenderBrowserErrors(ctx context.Context) (int64, error) {
+	body, err := s.fetch(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = body.Close() }()
+	return parseBrowserErrorsExposition(body)
 }
 
 // parseSuspendExposition достаёт значение счётчика ветки reason="budget"
@@ -210,4 +249,36 @@ func promHasPairs(labelPart string, pairs ...string) bool {
 func renderExposition(body []byte) bool {
 	_, found, _ := findPromSeries(body, renderStageTasksMetric, renderStagePair)
 	return found
+}
+
+// errNotRenderExposition — экспозиция не рендер-воркера (нет маркера
+// crawler_stage_tasks_total{stage="render"}): адрес
+// monitor.render_metrics_url настроен на чужой сервис. Тихое «не
+// измеряется» без Warn (S-P2-6): зонд при этом жив (200 OK) — это
+// конфигурационная проблема, а не авария источника, причина видна в
+// detail алерта.
+var errNotRenderExposition = errors.New("monitor: экспозиция не рендер-воркера")
+
+// parseBrowserErrorsExposition — значение счётчика
+// crawler_stage_errors_total{stage="render",type="browser"}: стрик
+// инфра-ошибок движка, первопричина защёлкивания health-гейта (T-239).
+// Семейство ленивое: у рендер-воркера без browser-ошибок серии нет — 0
+// при маркере рендер-этапа (как suspended после предсоздания T-250,
+// S-P1-4), чужая экспозиция (без маркера) — errNotRenderExposition.
+func parseBrowserErrorsExposition(r io.Reader) (int64, error) {
+	body, err := readExposition(r)
+	if err != nil {
+		return 0, err
+	}
+	v, found, err := findPromSeries(body, browserErrorsMetric, renderStagePair, browserTypePair)
+	if err != nil {
+		return 0, err
+	}
+	if found {
+		return int64(v), nil
+	}
+	if renderExposition(body) {
+		return 0, nil // рендер-воркер, browser-ошибок ещё не было — 0
+	}
+	return 0, errNotRenderExposition
 }

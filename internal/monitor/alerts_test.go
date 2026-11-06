@@ -1204,7 +1204,7 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 	wantNames := []string{AlertDNSErrors, AlertQueueOverflow, AlertProgressStall, AlertDiskFree,
 		AlertDiskMin, AlertDiskCrit, AlertNVMeWear, AlertBadHashes, AlertUnitOOM, AlertMemHigh,
 		AlertQueueDead, AlertQueueFreeze, AlertRedisMemory, AlertPSICPU, AlertRenderDebt,
-		AlertRenderFbDepth, AlertRenderFbBudget}
+		AlertRenderFbDepth, AlertRenderFbBudget, AlertRenderBrowserErr}
 	if len(res.Alerts) != len(wantNames) {
 		t.Fatalf("алертов в снапшоте = %d, want %d", len(res.Alerts), len(wantNames))
 	}

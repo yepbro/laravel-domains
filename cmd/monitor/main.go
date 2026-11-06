@@ -182,9 +182,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// /metrics рендер-воркера (счётчик suspended{reason="budget"} растёт
 	// в процессе воркера, монитор читает его тем же адресом, что
 	// скрейпит Prometheus). Пустой адрес — алерт «не измеряется» тихо
-	// (а не Warn зондом на каждый проход), стиль ingest-зонда.
+	// (а не Warn зондом на каждый проход), стиль ingest-зонда. Тот же
+	// зонд питает алерт browser-ошибок (S-P2-6): один адрес — два
+	// независимых чтения, период цикла алертов поглощает стоимость.
 	if cfg.Monitor.RenderMetricsURL != "" {
-		deps.FallbackBudget = monitor.RenderSuspends{URL: cfg.Monitor.RenderMetricsURL}
+		probe := monitor.RenderSuspends{URL: cfg.Monitor.RenderMetricsURL}
+		deps.FallbackBudget = probe
+		deps.RenderBrowserErrors = probe
 	}
 	// События юнитов (T-145): systemctl show + cgroup v2 memory.events
 	// (unitevents.go), обёрнуты в метрики — одно чтение на проход питает
