@@ -62,7 +62,9 @@ render:
   # Альтернативные движки рендера (этап 35, ФТ-16): контейнер движка
   # поднимается профилем render-engines, здесь меняются engine и один
   # адрес (закомментированные образцы), затем dc restart render-worker —
-  # air конфиг не перечитывает. Подробности: docs/render.md и
+  # air конфиг не перечитывает. Порог перезапуска ниже уже 0 — правка
+  # образца движка сводится к engine + remote_url (для moli/lightpanda
+  # валидация требует 0). Подробности: docs/render.md и
   # docs/dev-environment.md, «Движки рендера».
   #   lightpanda (dc --profile render-engines up -d lightpanda):
   # engine: "lightpanda"
@@ -76,6 +78,11 @@ render:
   contexts: 3
   timeout: "25s"
   restart_every_pages: 500
+  # 0 обязателен для moli/lightpanda (валидация: RSS чужого процесса
+  # недоступен), а в dev порог и так не работал бы — браузер всегда
+  # внешний контейнер, не процесс воркера. Без ключа профиль унаследовал
+  # бы боевой дефолт 1536MiB и отвергал переключение движка.
+  restart_memory_bytes: 0
 
 content:
   dir: "/data/content"
