@@ -159,6 +159,8 @@ dashboard:
   # показывает только движок этапа, потребление/глубина — нули.
   render_metrics_urls:
     - "http://render-worker:9105/metrics"
+    # воркер B (раскомментировать для стендовых прогонов фолбэка):
+    # - "http://render-fallback:9105/metrics"
 
 log:
   level: "info"                    # dev: info, для отладки воркеров — debug

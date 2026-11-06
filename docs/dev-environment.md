@@ -242,7 +242,12 @@ dc run --rm -e CRAWLER_POSTGRES_DSN="$APP_PG_DSN" tools \
 ```
 
 Прогон: render-worker стенда читает тот же Redis (`redis.addr`), движок —
-по переключателю выше (chromium/lightpanda/moli). Повторный прогон того
+по переключателю выше (chromium/lightpanda/moli). Стенд фолбэка (воркер
+B — сервис `render-fallback` профиля runtime): его экспозиция
+`http://render-fallback:9105/metrics` добавляется строкой в
+`dashboard.render_metrics_urls` (образец закомментирован в
+`config.dev.yaml`), Prometheus дев-стека скрейпит её job'ом
+`render-fallback`. Повторный прогон того
 же движка (контроль вариативности, §5.1 п. 2): повторный
 `fixtures import` (сброс строк к состоянию дампа — прогон воркера менял
 rendered/ссылки на контент/маркеры финализации; заодно выметается

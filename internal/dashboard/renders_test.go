@@ -141,6 +141,9 @@ func newRenderCollector(t *testing.T, lens *renderLens, urls []string) (*Collect
 	clock := func() time.Time { return now }
 	set := func(t time.Time) { now = t }
 	coll := newSnapCollector(t, healthyPool(), lens, func(o *CollectorOptions) {
+		if urls == nil {
+			urls = []string{} // «адреса не заданы»: nil подтянул бы дефолт cfg
+		}
 		o.RenderMetrics = urls
 		o.Now = clock
 	})

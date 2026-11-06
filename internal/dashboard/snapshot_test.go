@@ -274,7 +274,10 @@ func (s staticSource) Current() *Snapshot { return s.snap }
 func newSnapCollector(t *testing.T, pool *snapPool, lens status.StreamLener, mutate func(*CollectorOptions)) *Collector {
 	t.Helper()
 	cfg := config.Default()
-	opts := CollectorOptions{Probes: map[string]string{}}
+	// Пустые (не nil) проб/адреса панели — «секции не настроены»:
+	// nil подтянул бы дефолты cfg (с S-P2-5 — экспозицию основной
+	// сборки 127.0.0.1:9105) и тесты ходили бы в сеть.
+	opts := CollectorOptions{Probes: map[string]string{}, RenderMetrics: []string{}}
 	if mutate != nil {
 		mutate(&opts)
 	}

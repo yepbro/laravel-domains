@@ -147,9 +147,11 @@ func TestDefault(t *testing.T) {
 		{"dashboard.status_cache_ttl", c.Dashboard.StatusCacheTTL.D(), time.Minute},
 		{"dashboard.username", c.Dashboard.Username, ""},
 		{"dashboard.password_hash", c.Dashboard.PasswordHash, ""},
-		// Панель движков (T-246): адреса экспозиций по умолчанию не
-		// заданы — секция «н/д» (стиль probes).
-		{"dashboard.render_metrics_urls", len(c.Dashboard.RenderMetrics), 0},
+		// Панель движков (T-246, S-P2-5): дефолт — экспозиция основной
+		// сборки на стандартном порте метрик 9105 (согласовано с
+		// monitor.render_metrics_url); воркер B фолбэка добавляют при
+		// включении фолбэка (deploy.md §2.3).
+		{"dashboard.render_metrics_urls", strings.Join(c.Dashboard.RenderMetrics, ";"), "http://127.0.0.1:9105/metrics"},
 		{"log.level", c.Log.Level, "info"},
 	}
 	for _, ch := range checks {

@@ -48,6 +48,18 @@ scrape_configs:
         port: 9105
         type: A
 
+  # Воркер B фолбэка (T-240, S-P3-3): контейнер профиля runtime — метрики
+  # на стандартном порте бинарника 9105 в своём network namespace (docker.md
+  # §8). Пока профиль не поднят, у dns_sd нет таргетов — job молчит и
+  # оживает вместе с сервисом render-fallback (crawler_service_up,
+  # consumed/глубина для баланса published/consumed — services.md,
+  # «Метрики рабочей логики»).
+  - job_name: render-fallback
+    dns_sd_configs:
+      - names: ["render-fallback"]
+        port: 9105
+        type: A
+
   - job_name: analyzer
     dns_sd_configs:
       - names: ["analyzer"]
