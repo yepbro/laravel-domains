@@ -53,41 +53,44 @@ func setFallbackDepth(env *alertsTestEnv, depth int64) {
 	env.lener.lens[queue.StreamRenderFallback] = depth
 }
 
-// TestAlertsRenderFallbackDepthGrowth — срабатывание на глубине у
-// эффективного порога И росте 2 проходов подряд; удержание стагнацией
+// TestAlertsRenderFallbackDepthGrowth — срабатывание по росту: глубина
+// растёт 2 прохода подряд, пересекая порог; удержание стагнацией
 // (защёлка), снятие дренажем ниже 90 % порога; разовый всплеск публикаций
-// (скачок без серии роста) оператора не будит.
+// (скачок, рассосавшийся до следующего прохода) оператора не будит.
+// Стационарная глубина у порога — второй триггер, отдельный тест ниже
+// (TestAlertsRenderFallbackDepthStationary).
 func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
 	// Порог 1000 (watermark из дефолта тестового окружения; предел
 	// MAXLEN стрима выше — без клампа), снятие < 900.
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 
-	// База: глубина уже у порога, роста нет.
-	setFallbackDepth(env, 1200)
+	// База и рост ниже порога: серия роста копится, порог ещё не
+	// задействован.
+	setFallbackDepth(env, 500)
 	s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
 	if s.Status != AlertStatusOK {
 		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
 	}
-	for _, want := range []string{"q:render-fallback=1200", "порог 1000", "снятие < 900"} {
+	for _, want := range []string{"q:render-fallback=500", "порог 1000", "снятие < 900", "у порога 0/2"} {
 		if !strings.Contains(s.Detail, want) {
 			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
 		}
 	}
 	// Один проход роста — серии мало (разовый всплеск публикаций —
 	// штатная работа фолбэка «собрать и доработать»).
-	setFallbackDepth(env, 1300)
+	setFallbackDepth(env, 800)
 	s = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Fatalf("один проход роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
 	}
-	// Второй проход роста — срабатывание.
+	// Второй проход роста с пересечением порога — срабатывание.
 	setFallbackDepth(env, 1420)
 	s = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("второй проход роста: %s (%s), want firing", s.Status, s.Detail)
 	}
-	for _, want := range []string{"q:render-fallback=1420", "+120", "воркера B"} {
+	for _, want := range []string{"q:render-fallback=1420", "+620", "воркера B"} {
 		if !strings.Contains(s.Detail, want) {
 			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
 		}
@@ -120,6 +123,67 @@ func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
 	setFallbackDepth(env, 1060)
 	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
 		t.Errorf("второй проход повторного роста: %s (%s), want firing", s.Status, s.Detail)
+	}
+}
+
+// TestAlertsRenderFallbackDepthStationary — второй триггер (S-P2-1,
+// решение оператора): глубина ≥ порога 2 прохода подряд БЕЗ роста —
+// firing со 2-го прохода (серия роста базируется нулём и стационарную
+// глубину не видит — рестарт монитора посреди эпизода больше не глушит
+// алерт); упор в потолок MAXLEN — firing и удержание (XADD вытесняет
+// старейшие недоставленные записи, глубина стоит); одиночный всплеск,
+// рассосавшийся между проходами, — тихо (анти-спайк); защёлка/снятие
+// прежние.
+func TestAlertsRenderFallbackDepthStationary(t *testing.T) {
+	// Порог — кламп по половине MAXLEN q:render-fallback (15 000/2 =
+	// 7 500), как на дефолтных watermark 100 тыс.
+	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 100000 })
+	ctx := context.Background()
+
+	// Стационарная глубина 9000 без роста: первый проход — база
+	// (у порога 1/2), второй — firing.
+	setFallbackDepth(env, 9000)
+	s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "у порога 1/2") {
+		t.Fatalf("стационарная база: %s (%s), want ok с серией у порога 1/2", s.Status, s.Detail)
+	}
+	setFallbackDepth(env, 9000)
+	s = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
+	if s.Status != AlertStatusFiring {
+		t.Fatalf("стационарная 9000: %s (%s), want firing со 2-го прохода", s.Status, s.Detail)
+	}
+	for _, want := range []string{"q:render-fallback=9000", "порог 7500", "снятие < 6750", "серия роста 0/2", "у порога 2/2", "стационарно"} {
+		if !strings.Contains(s.Detail, want) {
+			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+		}
+	}
+
+	// Упор в потолок MAXLEN: глубина не растёт (обрезка вытесняет
+	// недоставленное) — firing и удержание.
+	setFallbackDepth(env, 15000)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
+		t.Errorf("упор в MAXLEN: %s (%s), want firing", s.Status, s.Detail)
+	}
+	setFallbackDepth(env, 15000)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
+		t.Errorf("упор в MAXLEN, второй проход: %s (%s), want firing (удержание)", s.Status, s.Detail)
+	}
+
+	// Дренаж ниже 90 % порога — снятие (защёлка не вечна).
+	setFallbackDepth(env, 6000)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusOK {
+		t.Errorf("дренаж: %s (%s), want ok", s.Status, s.Detail)
+	}
+
+	// Одиночный всплеск между проходами (рассасывается) — тихо: серия
+	// у порога не набирается, рост одного прохода — не триггер.
+	setFallbackDepth(env, 9000)
+	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // у порога 1/2, ok
+	setFallbackDepth(env, 100)
+	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // рассосался, ok
+	setFallbackDepth(env, 9000)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "у порога 1/2") {
+		t.Errorf("одиночный всплеск: %s (%s), want ok с серией у порога 1/2 (анти-спайк)", s.Status, s.Detail)
 	}
 }
 
@@ -165,22 +229,24 @@ func TestAlertsRenderFallbackDepthWatermark(t *testing.T) {
 			}
 		})
 	}
-	// Глубина ровно порога без роста не срабатывает (строгого «меньше
-	// порога» достаточно, равенство — уже «у порога», но серия роста —
-	// обязательный триггер); рост с пересечением порога — срабатывание.
+	// Глубина ровно порога: одиночный проход — не firing (анти-спайк:
+	// всплеск обязан пережить второй проход), стационарно — firing со
+	// второго прохода (S-P2-1: равенство — уже «у порога», серия у
+	// порога без роста — полноценный триггер); рост с пересечением
+	// порога — срабатывание.
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 1000 })
 	ctx := context.Background()
 	setFallbackDepth(env, 1000)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // база
+	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // база (у порога 1/2)
 	setFallbackDepth(env, 1000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusOK {
-		t.Errorf("глубина == порогу без роста: %s (%s), want ok", s.Status, s.Detail)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
+		t.Errorf("глубина == порогу без роста два прохода: %s (%s), want firing (стационарно у порога, S-P2-1)", s.Status, s.Detail)
 	}
 	setFallbackDepth(env, 1001)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // рост 1 (пересечение порога)
+	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // рост 1 (удержание)
 	setFallbackDepth(env, 1002)
 	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
-		t.Errorf("рост через порог двумя проходами: %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("рост через порог: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
 
