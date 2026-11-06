@@ -20,21 +20,30 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"crawler/internal/config"
 	"crawler/internal/metrics"
 	"crawler/internal/queue"
 	"crawler/internal/render"
 )
 
+// rwFBCandidateEngine — движок-кандидат сборки воркера A в тестах
+// фолбэка (S-P1-1): движковый guard fallbackArmed не публикует с
+// chromium (шаг 1 приёмки ТЗ §6.2, откат §6.4), поэтому фикстуры
+// вооружённого фолбэка собирают первичного воркера с движком-кандидатом
+// — движок здесь только поле, рендер решает фейк.
+const rwFBCandidateEngine = config.EngineMoli
+
 // newRWFallbackFixture — фикстура с включённым фолбэком
-// (FallbackOptions.Enabled, T-238): остальные опции — дефолты
-// (TimeoutAttempts 2, MaxAttempts 3, Stream q:render); нулевые пороги
-// гейта/бюджета (T-239) — состояния выключены, решение публикует без
-// потолков (поведение заглушки always-publish для тестов T-238).
+// (FallbackOptions.Enabled, T-238) и движком-кандидатом сборки (S-P1-1):
+// остальные опции — дефолты (TimeoutAttempts 2, MaxAttempts 3, Stream
+// q:render); нулевые пороги гейта/бюджета (T-239) — состояния выключены,
+// решение публикует без потолков (поведение заглушки always-publish для
+// тестов T-238).
 func newRWFallbackFixture(t *testing.T) *rwFixture {
 	t.Helper()
 	f := newRWFixture(t)
 	var err error
-	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{Fallback: FallbackOptions{Enabled: true}})
+	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{Fallback: FallbackOptions{Enabled: true}, Engine: rwFBCandidateEngine})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -66,7 +75,7 @@ func TestRenderWorker_TarpitFallbackPublish(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	reg := metrics.New("render-worker")
 	var err error
-	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{Fallback: FallbackOptions{Enabled: true}, Metrics: reg})
+	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{Fallback: FallbackOptions{Enabled: true}, Engine: rwFBCandidateEngine, Metrics: reg})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -135,7 +144,7 @@ func TestRenderWorker_TaskFallbackPublish(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	reg := metrics.New("render-worker")
 	var err error
-	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{Fallback: FallbackOptions{Enabled: true}, Metrics: reg})
+	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{Fallback: FallbackOptions{Enabled: true}, Engine: rwFBCandidateEngine, Metrics: reg})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -189,6 +198,83 @@ func TestRenderWorker_FallbackDisabledTodayBehavior(t *testing.T) {
 	}
 	if fb := rwFallbackPublishes(t, f); len(fb) != 0 {
 		t.Errorf("публикаций q:render-fallback быть не должно: %+v", fb)
+	}
+}
+
+// TestRenderWorker_FallbackChromiumEngineNotArmed — движковый guard
+// публикации (S-P1-1, ТЗ §6.2 п.2/§6.4 п.1, ФТ-14): на движке сборки
+// chromium — включая пустое значение Options.Engine (сборки без
+// конфигурации) — фолбэк не публикует и при включённом
+// render.fallback.enabled: тарпит T-148 и класс задачи T-172 на
+// последней доставке финализируются как при выключенном фолбэке
+// (маркер render_failed_at + q:analyze), метрика публикаций серий
+// не создаёт.
+// Шаг 1 приёмки (включение фолбэка без смены движка) оставляет
+// q:render-fallback пустой; откат на chromium гасит публикацию сам.
+func TestRenderWorker_FallbackChromiumEngineNotArmed(t *testing.T) {
+	cases := []struct {
+		name   string
+		engine string
+	}{
+		{"движок chromium", config.EngineChromium},
+		{"движок не задан — дефолт chromium", ""},
+	}
+	paths := []struct {
+		name    string
+		err     error
+		attempt int
+		reason  string
+	}{
+		{
+			name:    "тарпит T-148 (исчерпание render.timeout_attempts)",
+			err:     rwTarpitErr("https://spa.example/"),
+			attempt: 2, // DefaultTimeoutAttempts
+			reason:  "timeout",
+		},
+		{
+			name:    "класс задачи T-172 (последняя доставка)",
+			err:     rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED"),
+			attempt: 3, // DefaultMaxAttempts
+			reason:  "net::ERR_CONNECTION_REFUSED",
+		},
+	}
+	for _, c := range cases {
+		for _, p := range paths {
+			t.Run(c.name+" × "+p.name, func(t *testing.T) {
+				f := newRWFixture(t)
+				reg := metrics.New("render-worker")
+				var err error
+				f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
+					Fallback: FallbackOptions{Enabled: true},
+					Engine:   c.engine,
+					Metrics:  reg,
+				})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				raw := rwTestHash(1)
+				f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+				f.renderer.err = p.err
+
+				if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), p.attempt); err != nil {
+					t.Fatalf("chromium: кандидат — штатная финализация, не ошибка: %v", err)
+				}
+				if fb := rwFallbackPublishes(t, f); len(fb) != 0 {
+					t.Errorf("публикаций q:render-fallback быть не должно: %+v", fb)
+				}
+				pubs := f.q.publishesSnapshot()
+				if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
+					t.Fatalf("публикации %+v, нужна одна q:analyze (как при выключенном фолбэке)", pubs)
+				}
+				if row := rwRowSnapshot(f.pool, rwKey); row.failedAt == nil {
+					t.Error("маркер render_failed_at обязан ставиться — chromium не публикует, финализация по-сегодняшнему")
+				}
+				if got := rwMetricValue(t, reg, "crawler_render_fallback_published_total",
+					map[string]string{"reason": p.reason}); got != -1 {
+					t.Errorf("crawler_render_fallback_published_total{%s} = %v, want -1 (публикаций не было)", p.reason, got)
+				}
+			})
+		}
 	}
 }
 
@@ -322,7 +408,7 @@ func TestRenderWorker_FallbackDuplicateDelivery(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	reg := metrics.New("render-worker")
 	var err error
-	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{Fallback: FallbackOptions{Enabled: true}, Metrics: reg})
+	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{Fallback: FallbackOptions{Enabled: true}, Engine: rwFBCandidateEngine, Metrics: reg})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

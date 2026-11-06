@@ -1187,6 +1187,9 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 // дорабатывает запись на живом Chromium: rendered=true со сменой
 // content_hash, публикация q:analyze (Fresh). Рекурсивный фолбэк
 // фолбэка запрещён (ФТ-10) — воркер B публикует только q:analyze.
+// Первичный воркер собирается с движком-кандидатом (engine=moli,
+// S-P1-1: публикации идут только с движка-кандидата — chromium фолбэк
+// не публикует; движок здесь только поле, рендер решает фейк).
 // Движко-независимые причины (DNS T-207/cert T-159) фолбэка не
 // получают (ФТ-7) — фильтр причин покрыт юнит-тестами
 // (TestRenderWorker_DNSCertNoFallback, internal/renderworker).
@@ -1237,7 +1240,12 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		Recover:         queue.NewReliab(env.rdb, env.q, queue.ReliabOptions{MaxAttempts: 3, MinIdle: 300 * time.Millisecond}),
 		RecoverInterval: 200 * time.Millisecond,
 		Fallback:        renderworker.FallbackOptions{Enabled: true},
-		Metrics:         regA,
+		// Движок-кандидат сборки воркера A (S-P1-1): движковый guard
+		// публикации — chromium (включая пустое значение) фолбэк не
+		// публикует (шаг 1 приёмки ТЗ §6.2, откат §6.4); движок — только
+		// поле, рендер решает фейк-тарпит выше.
+		Engine:  config.EngineMoli,
+		Metrics: regA,
 	}
 	wA, err := renderworker.New(env.pool, env.q, env.store, accFailRenderer{err: tarpit}, optsA)
 	if err != nil {

@@ -25,7 +25,8 @@ import (
 )
 
 // newRWGateFixture — фикстура с вооружённым фолбэком (Enabled + стрим
-// q:render) и подключёнными состояниями гейта/бюджета (T-239):
+// q:render + движок-кандидат сборки — S-P1-1: chromium фолбэк не
+// публикует) и подключёнными состояниями гейта/бюджета (T-239):
 // threshold — порог стрика инфра-ошибок (render.fallback
 // .health_gate_streak), ceiling — потолок доли публикаций за окно
 // (render.fallback.share_percent; 0 — без потолка). Реестр метрик —
@@ -41,6 +42,7 @@ func newRWGateFixture(t *testing.T, threshold int, ceiling float64) (*rwFixture,
 			Gate:    FallbackGate{Threshold: threshold},
 			Budget:  FallbackBudget{Ceiling: ceiling},
 		},
+		Engine:  rwFBCandidateEngine, // движок-кандидат: guard публикации (S-P1-1)
 		Metrics: reg,
 	})
 	if err != nil {

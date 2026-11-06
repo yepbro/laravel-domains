@@ -289,7 +289,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// render.fallback (T-233); состояния (стрик, окно) ведёт воркер.
 		// Темп воркера B — T-240; воркер B (стрим q:render-fallback)
 		// фолбэк не публикует — рекурсия запрещена (ФТ-10), проверяется
-		// в publishFallback по Stream.
+		// в publishFallback по Stream; движок сборки chromium (включая
+		// пустое значение render.engine) тоже не публикует (S-P1-1,
+		// ТЗ §6.2 п.2/§6.4 п.1) — шаг 1 приёмки и откат гасят
+		// публикацию без смены флага.
 		Fallback: renderworker.FallbackOptions{
 			Enabled: cfg.Render.Fallback.Enabled,
 			Gate: renderworker.FallbackGate{
