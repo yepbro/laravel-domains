@@ -13,7 +13,9 @@ Load 12–17 во время активного рендера — извест�
   входящие — `incoming/`).
 - Окружение: `/etc/crawler/crawler.env`; конфиг: `/etc/crawler/config.yaml`.
 - Юниты: `crawler-{ingest,scheduler,dns-worker,http-worker,render-worker,
-  render-worker@9109,analyzer,monitor,web,dashboard,chromium}`, плюс
+  render-worker@9109,render-fallback-worker,analyzer,monitor,web,dashboard,
+  chromium}` (render-fallback-worker — воркер B, появляется после деплоя
+  этапа 35/36; до деплоя юнита нет — норма), плюс
   `redis-server`, `postgresql@16-main`, `unbound`, `nginx`, `fail2ban`.
 
 ### Подводный камень crawler.env
@@ -30,14 +32,43 @@ set -a; . /etc/crawler/crawler.env 2>/dev/null; set +a
 
 ## Конвейер и очереди (Redis Streams)
 
+**До деплоя этапа 35/36 ветки фолбэка на проде нет** (стрима
+q:render-fallback в Redis, юнита воркера B, порта 9120; метрики
+движков/фолбэка в /metrics — отсутствуют или нулевые серии без роста,
+в т.ч. предсозданные нули suspended/consumed): это норма, а не
+аномалия — код в master, прод ждёт пуша в production; правила этого
+блока действуют после деплоя.
+
 ```
 scheduler ──> q:dns ──> dns-worker ──> q:http ──> http-worker ─┬─> q:analyze ──> analyzer ──> PostgreSQL
-                                          │                    └─> q:render ──> render-worker ──> q:analyze
-                          (исчерпаны retry ──> q:dead — без потребителя, ручной разбор)
+                                          │                    └─> q:render ──> render-worker ─┬─> q:analyze
+                                          │                                        │ движко-зависимые сбои рендера
+                                          │                                        │ (тарпит T-148 / класс задачи T-172
+                                          │                                        │  на последней доставке, после
+                                          │                                        │  деплоя этапа 35/36)
+                                          │                                        └─> q:render-fallback ──> render-fallback-worker
+                                          │                                                                     (воркер B, chromium, потолок темпа
+                                          │                                                                      render.fallback.worker_rate)
+                                          │                                                                        └─> q:analyze
+                           (исчерпаны retry ──> q:dead — без потребителя, ручной разбор)
 ```
 
-Группы: `dns-worker`, `http-worker`, `render-worker`, `analyzer` — по одной
+Группы: `dns-worker`, `http-worker`, `render-worker`,
+`render-fallback-worker` (после деплоя 35/36), `analyzer` — по одной
 на стрим. Поле сообщений — `subdomain_results` (DNSBatch/HTTPTask/Result).
+
+Ветка фолбэка (после деплоя): при включённом `render.fallback.enabled`
+движко-зависимые кандидаты рендера не финализируются, а публикуются
+воркером A в q:render-fallback; воркер B (тот же бинарь, chromium)
+дорабатывает их темпом `render.fallback.worker_rate`: успех —
+`rendered = true` + q:analyze, исчерпание — маркер `render_failed_at`
++ q:analyze. **Health-гейт/бюджет доли** — защита от шторма
+публикаций: стрик browser-ошибок (гейт — основной движок недоступен)
+или перерасход `render.fallback.share_percent` за окно (бюджет)
+приостанавливает публикации — задачи при этом НЕ теряются:
+финализируются маркером как обычно, browser-класс ждёт в redelivery
+q:render. При engine=chromium публикаций нет вовсе — движковый guard
+(chromium сам себе не фолбэчится, пустая очередь — норма).
 
 - Глубина: `min(lag, XLEN) + pending` — так считает и `crawler_queue_depth`.
 - Два среза `XINFO GROUPS` (Δentries-read) → скорость. См. формулы в SKILL.md.
@@ -67,11 +98,39 @@ scheduler ──> q:dns ──> dns-worker ──> q:http ──> http-worker �
 | 9104 | http-worker (retention, компактификация, HTTP-этап) |
 | 9105 / 9109 | render-worker (осн. + второй экземпляр @9109) |
 | 9106 | analyzer |
+| 9120 | render-fallback-worker, воркер B — после деплоя этапа 35/36 (порт фиксированный: 9109+ — зона экземпляров render-worker@; 9110 в старых заметках — устарело, фикс S-P2-3) |
 
 ```bash
 curl -s 127.0.0.1:9104/metrics | grep -E '^crawler_queue_depth|^crawler_content_'
 curl -s 127.0.0.1:9100/metrics | grep -E '^crawler_(queue|unit|redis)'
 ```
+
+### Словарь метрик рендера: движки и фолбэк (после деплоя 35/36)
+
+- `crawler_render_fallback_published_total{reason}` — задачи,
+  опубликованные в q:render-fallback из путей финализации без рендера
+  (движко-зависимые причины: тарпит, класс задачи на последней
+  доставке); reason — код `net::ERR_*` / `timeout` / `other`;
+  числитель fallback-рейта. Экспонирует воркер A (:9105).
+- `crawler_render_fallback_consumed_total{result}` — потребление
+  q:render-fallback воркером B по исходу доставки: `rendered` —
+  доработка успешна (DOM записан); `finalized` — фолбэк исчерпан,
+  запись закрыта маркером `render_failed_at`; `skipped` — строка ушла
+  из-под задачи (строки нет / без итогового URL), без побочных
+  эффектов. Считает только сборка B (:9120); ошибочные доставки живут
+  в PEL до клейма либо bury в q:dead.
+- `crawler_render_fallback_suspended_total{reason}` — события (не
+  состояние!) приостановки публикаций фолбэка: `gate` — health-гейт,
+  стрик инфра-ошибок класса браузера (основной движок недоступен)
+  достиг `render.fallback.health_gate_streak`; `budget` — доля
+  публикаций за окно 1000 доставок ушла за потолок
+  `render.fallback.share_percent`. Пока приостановка держится,
+  кандидаты финализируются штатно с маркером — задачи не теряются.
+- `crawler_render_records_total{rendered,engine}` — записи по признаку
+  rendered (`false` — HTTP-этап, без engine; `true` — воркеры рендера);
+  метка `engine` (chromium|moli|lightpanda) — движок сборки воркера,
+  материал доли движков. Тарпит-финализации атрибутируются движку —
+  `crawler_render_tarpit_finalized_total{engine}`.
 
 ## PostgreSQL (sudo -u postgres psql -d crawler)
 
@@ -120,6 +179,7 @@ curl -s 127.0.0.1:9100/metrics | grep -E '^crawler_(queue|unit|redis)'
 | 23.10.2026 | лаг q:render ≈99 тыс., retention стоит | рендер-долг: защита записей от удаления (T-166/T-167) |
 | 03.11.2026 | syslog +2.5 ГБ за 2 дня | консоли чужих страниц из chromium (см. drop-in выше) |
 | 04.11.2026 | лаг q:render ~9,9 тыс. сутами «не тает», прогноз дренажа за часы не сбылся | равновесие у `render.queue_high_watermark` (10 тыс.): проход доработки T-066/T-174 пополняет очередь из render_pending (~350 тыс.) — это норма; метрика — lag + render_pending, ETA по сумме |
+| 06.11.2026 | движки-кандидаты красные на per-engine срезе (прогоны на дев-стенде, НЕ прод) | стендовое сравнение движков (этап 35/36): moli 1.1.21/1.1.22 — `Fetch.enable` InvalidParams (PR upstream #2470, ждём 1.1.23), lightpanda 1.0.2/1.0.3 — один browser context на соединение (upstream #4151, watch), chromium — baseline ≈92% успешности; контекст для будущих канареечных окон |
 
 ## Точечные команды по блокам
 
@@ -133,6 +193,16 @@ journalctl -u crawler-http-worker --since -1h -q | grep -iE "err|warn|fatal|pani
 
 # зависшие сообщения очереди (pending у группы)
 redis-cli XPENDING q:render render-worker
+
+# фолбэк рендера (после деплоя этапа 35/36; до деплоя стрима/юнита нет —
+# это норма): pending группы воркера B
+redis-cli XPENDING q:render-fallback render-fallback-worker
+
+# потребление фолбэка воркером B — его экспозиция :9120
+curl -s 127.0.0.1:9120/metrics | grep fallback
+
+# приостановки публикаций (gate/budget) — экспозиция основного воркера A
+curl -s 127.0.0.1:9105/metrics | grep suspended
 
 # дренаж рендер-долга: пополнение q:render из render_pending (T-066)
 journalctl -u crawler-http-worker --since -30m -q | grep "проход доработки рендера" | tail -5

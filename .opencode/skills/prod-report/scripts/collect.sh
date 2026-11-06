@@ -44,11 +44,11 @@ echo
 echo "## Очереди (два среза, ${IV} c)"
 snap() {
   local s xlen g pend rd lag
-  for s in q:dns q:http q:render q:analyze q:dead; do
+  for s in q:dns q:http q:render q:render-fallback q:analyze q:dead; do
     xlen=$(redis-cli XLEN "$s" 2>/dev/null)
     g=$(redis-cli --raw XINFO GROUPS "$s" 2>/dev/null)
     if [[ -z "${g:-}" ]]; then
-      echo "$(date +%s) $s ${xlen:-0} - - -"   # q:dead: группы нет — только XLEN
+      echo "$(date +%s) $s ${xlen:-0} - - -"   # группы нет — только XLEN
     else
       pend=$(sed -n 6p <<<"$g"); rd=$(sed -n 10p <<<"$g"); lag=$(sed -n 12p <<<"$g")
       echo "$(date +%s) $s ${xlen:-0} ${pend:-0} ${rd:-0} ${lag:-0}"
@@ -65,6 +65,9 @@ paste <(printf '%s\n' "$S1") <(printf '%s\n' "$S2") | awk -v iv="$IV" '{
     printf "%-9s %9s %9s %8s %11s %11s\n", $2, $9, "-", "-", "-", "-"
   }
 }'
+if [[ "$(redis-cli --raw EXISTS q:render-fallback 2>/dev/null)" != "1" ]]; then
+  echo "q:render-fallback: стрима нет в Redis — норма до деплоя этапа 35/36"
+fi
 echo
 
 echo "## Redis"
@@ -100,6 +103,27 @@ echo
 echo "## Метрики http-worker:9104"
 curl -s -m 3 http://127.0.0.1:9104/metrics 2>/dev/null \
   | grep -E '^crawler_queue_depth|^crawler_content_' | head -15
+echo
+
+# Этап 35/36 (движки рендера + очередь фолбэка). До деплоя этапа на проде
+# этих сущностей нет — каждое поле толерантно к отсутствию и печатает
+# пометку, а не пустоту: «нет (до деплоя)» — норма, не аномалия.
+echo "## Рендер: движки и фолбэк (этап 35/36)"
+if systemctl cat crawler-render-fallback-worker.service >/dev/null 2>&1; then
+  echo "[юнит воркера B] $(systemctl is-active crawler-render-fallback-worker 2>/dev/null)"
+else
+  echo "[юнит воркера B] нет юнита — норма до деплоя этапа 35/36"
+fi
+echo "[воркер A :9105 — fallback-счётчики]"
+out=$(curl -s -m 3 http://127.0.0.1:9105/metrics 2>/dev/null | grep '^crawler_render_fallback')
+echo "${out:-нет (до деплоя этапа 35/36)}"
+echo "[воркер A :9105 — записи по движкам, метка engine]"
+out=$(curl -s -m 3 http://127.0.0.1:9105/metrics 2>/dev/null \
+  | grep '^crawler_render_records_total' | grep 'engine=')
+echo "${out:-нет метки engine (до деплоя этапа 35/36)}"
+echo "[воркер B :9120 — fallback-счётчики, порт слушает после деплоя]"
+out=$(curl -s -m 3 http://127.0.0.1:9120/metrics 2>/dev/null | grep '^crawler_render_fallback')
+echo "${out:-нет (до деплоя этапа 35/36 / порт не слушает)}"
 echo
 
 echo "## Логи"
