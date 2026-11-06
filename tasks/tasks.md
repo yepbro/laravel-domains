@@ -325,7 +325,7 @@ worktree `fix-s35-<slug>`, **каждая находка — отдельный 
   (6) S-P3-4 — docs/configuration.md: где живёт worker_rate в docker
   (профиль B) vs systemd (общий конфиг). Критерий: профиль-тесты
   зелёные, docker compose config валиден, env-тесты зелёные.
-- **T-252** [в работе] — fix-s35-monodash (monitor + dashboard + status):
+- **T-252** [сделана] — fix-s35-monodash (monitor + dashboard + status):
   (1) S-P2-1 (решение: streak без роста) — render_fallback_depth:
   второй триггер «n ≥ порога 2 прохода подряд» без требования роста;
   тесты: стационар 9000 → firing, упор в MAXLEN 15000 → firing+удержание,
@@ -345,7 +345,7 @@ worktree `fix-s35-<slug>`, **каждая находка — отдельный 
   «fallback-рейт = published/страницы», `by.* || 0` на фронте;
   docs/services.md — секция render JSON+фронт. Критерий: тесты
   алертов/панели по образцу существующих зелёные.
-- **T-253** [новая] — fix-s35-tools (crawlerctl fixtures): (1) S-P3-5
+- **T-253** [в работе] — fix-s35-tools (crawlerctl fixtures): (1) S-P3-5
   (решение: --force по образцу zones collapse) — `fixtures import`
   требует явный `--force` для выполнения наката, перед началом выводит
   цель (host/database DSN, счётчики строк по таблицам) и затрагиваемые
