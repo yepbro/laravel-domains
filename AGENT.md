@@ -231,11 +231,13 @@ deploy → healthcheck с авто-откатом; детали — docs/ci-cd.m
 - Триггер `workflow_run` в `deploy.yml` GitHub читает только с ветки
   по умолчанию (`master`) — правки workflows деплоя проходят через
   `master`, изменения только в `production` на триггеры не влияют.
-- Юнит, планово отключённый на сервере оператором
-  (`systemctl disable --now` + `mask`, например `crawler-scheduler`),
-  не проверяется healthcheck'ом деплоя и проверкой юнитов в
-  install/rollback-скриптах. Обратное включение — `systemctl unmask` +
-  `enable --now` (+ рестарт `crawler.target`).
+- Временная остановка юнита на сервере — `systemctl stop` (без disable):
+  юнит остаётся enabled и сам возвращается на следующем деплое
+  (`systemctl start crawler.target` в install поднимает его до
+  healthcheck). Планово отключённый юнит (`disable --now` + `mask`)
+  healthcheck и проверка юнитов в install/rollback-скриптах не
+  проверяют; обратное включение — `systemctl unmask` + `enable --now`
+  (+ рестарт `crawler.target`).
 
 ### Параллельное выполнение
 
