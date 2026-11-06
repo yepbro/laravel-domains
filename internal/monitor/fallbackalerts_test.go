@@ -363,6 +363,50 @@ func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 	}
 }
 
+// TestAlertsRenderFallbackBudgetPrecreatedSeries — S-P1-4 (мониторная
+// часть) поверх предсозданных серий T-250: первое событие бюджета 0→1 —
+// firing (первый проход зонда читает 0 и базирует prev нулём — событие
+// больше не теряется); рестарт воркера (счётчик процессный, обнулился) —
+// повторное первое событие снова firing, убыль — без ложного всплеска.
+func TestAlertsRenderFallbackBudgetPrecreatedSeries(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	src := &fakeBudgetEvents{}
+	env.deps.FallbackBudget = src
+	ctx := context.Background()
+
+	// Предсозданная серия: зонд читает 0 (не «не измеряется»), prev
+	// базируется нулём.
+	src.set(0)
+	s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget)
+	if s.Status != AlertStatusOK {
+		t.Fatalf("нулевая серия: %s (%s), want ok (предсоздание T-250)", s.Status, s.Detail)
+	}
+	// Первое событие 0→1 — firing: дельта видна, окно её держит.
+	src.set(1)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusFiring {
+		t.Fatalf("первое событие 0→1: %s (%s), want firing", s.Status, s.Detail)
+	}
+	// Окно стареет: 5 проходов держат событие, шестой вытесняет — снятие.
+	for range 5 {
+		if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusFiring {
+			t.Fatalf("окно держит событие: %s (%s), want firing", s.Status, s.Detail)
+		}
+	}
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusOK {
+		t.Fatalf("после старения окна: %s (%s), want ok", s.Status, s.Detail)
+	}
+	// Рестарт воркера: счётчик процессный — обнулился; убыль не всплеск.
+	src.set(0)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusOK {
+		t.Fatalf("рестарт воркера: %s (%s), want ok без всплеска", s.Status, s.Detail)
+	}
+	// Повторное первое событие (0→1 нового процесса) — снова firing.
+	src.set(1)
+	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusFiring {
+		t.Fatalf("первое событие после рестарта: %s (%s), want firing", s.Status, s.Detail)
+	}
+}
+
 // TestAlertsRenderFallbackBudgetDegradation — источник не задан — тихое
 // «не измеряется» (адрес не настроен), ошибка зонда — «не измеряется»
 // с Warn (метрики нет в экспозиции — ошибка разбора, тоже Warn).
@@ -427,8 +471,10 @@ crawler_stage_tasks_total{stage="render"} 123
 }
 
 // TestParseSuspendExposition — табличный разбор: точная пара меток,
-// пропуск HELP/TYPE и чужих метрик, отсутствие метрики/ветки — ошибка,
-// мусорное значение — ошибка.
+// пропуск HELP/TYPE и чужих метрик, предсозданная серия T-250 (0 с
+// первого старта), отсутствие метрики/ветки — 0 при маркере
+// рендер-воркера (S-P1-4) и ошибка для чужой экспозиции, мусорное
+// значение — ошибка.
 func TestParseSuspendExposition(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -437,8 +483,16 @@ func TestParseSuspendExposition(t *testing.T) {
 		wantErr string
 	}{
 		{"ветка бюджета", `crawler_render_fallback_suspended_total{reason="budget"} 7`, 7, ""},
-		{"только gate — метрики бюджета нет", `crawler_render_fallback_suspended_total{reason="gate"} 2`, 0, "отсутствует"},
-		{"без метрик вовсе", "# HELP x y\n", 0, "отсутствует"},
+		{"предсозданная серия T-250 — 0 с первого старта",
+			"crawler_stage_tasks_total{stage=\"render\"} 123\n" +
+				"crawler_render_fallback_suspended_total{reason=\"budget\"} 0\n", 0, ""},
+		{"семейство есть, ветки budget нет, маркер рендер-воркера — 0 (S-P1-4)",
+			"crawler_render_fallback_suspended_total{reason=\"gate\"} 2\n" +
+				"crawler_stage_tasks_total{stage=\"render\"} 123\n", 0, ""},
+		{"старая сборка: маркер есть, семейства нет — 0",
+			"crawler_stage_tasks_total{stage=\"render\"} 123\n", 0, ""},
+		{"только gate, маркера нет — чужая экспозиция", `crawler_render_fallback_suspended_total{reason="gate"} 2`, 0, "отсутствует"},
+		{"без метрик вовсе (чужая экспозиция)", "# HELP x y\n", 0, "отсутствует"},
 		{"не-число", `crawler_render_fallback_suspended_total{reason="budget"} много`, 0, "не счётчик"},
 		{"отрицательное", `crawler_render_fallback_suspended_total{reason="budget"} -1`, 0, "не счётчик"},
 	}

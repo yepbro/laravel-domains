@@ -11,15 +11,22 @@
 // инфра-ошибок класса браузера виден напрямую ошибками этапа
 // crawler_stage_errors_total{stage="render",type="browser"}.
 //
-// Деградация: render-worker остановлен или метрики в экспозиции нет
-// (старая версия) — ошибка источника, алерт «не измеряется» (Warn), не
-// ложное срабатывание; смерть самого воркера видна по crawler_service_up
-// каркаса. Пустой monitor.render_metrics_url (не настроен) — источник не
-// подключается вовсе, алерт «не измеряется» тихо (стиль ingest-зонда).
+// Деградация: render-worker остановлен или экспозиция чужая (нет маркера
+// рендер-этапа crawler_stage_tasks_total{stage="render"}) — ошибка
+// источника, алерт «не измеряется» (Warn), не ложное срабатывание; смерть
+// самого воркера видна по crawler_service_up каркаса. Серии
+// suspended{reason="budget"} нет в экспозиции рендер-воркера — 0, не
+// ошибка (S-P1-4, решение T-250 — предсоздание): серия предсоздана нулём
+// с T-250, у более старых сборок ленивое семейство до первого события
+// означает тот же ноль — алерт не глушится «не измеряется» и не теряет
+// первое событие 0→1. Пустой monitor.render_metrics_url (не настроен) —
+// источник не подключается вовсе, алерт «не измеряется» тихо (стиль
+// ingest-зонда).
 package monitor
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -37,6 +44,13 @@ const (
 	// suspendedBudgetPair — точная пара метка-значение ветки бюджета доли
 	// (словарь причин замкнут: gate|budget).
 	suspendedBudgetPair = `reason="budget"`
+
+	// renderStageTasksMetric / renderStagePair — маркер рендер-воркера:
+	// серия crawler_stage_tasks_total{stage="render"} предсоздаётся в
+	// NewMetrics воркера и отличает его экспозицию от чужой (http-воркер
+	// экспонирует stage="http").
+	renderStageTasksMetric = "crawler_stage_tasks_total"
+	renderStagePair        = `stage="render"`
 
 	// suspendedBodyLimit — потолок чтения тела /metrics: реестр воркера
 	// несёт коллекторы Go/runtime и процесса (десятки КиБ), потолок —
@@ -92,8 +106,52 @@ func (s RenderSuspends) FallbackBudget(ctx context.Context) (int64, error) {
 // из текстовой экспозиции Prometheus: строки «имя{метки} значение»,
 // '#'-строки (HELP/TYPE) пропускаются. Выделен чистой функцией для
 // табличного теста без HTTP (стиль parseBadHashesExposition).
+//
+// Серии нет — 0, а не ошибка, когда экспозиция принадлежит
+// рендер-воркеру (маркер crawler_stage_tasks_total{stage="render"},
+// предсоздаётся в NewMetrics): серия suspended{reason="budget"}
+// предсоздана нулём с T-250 (S-P1-4), у сборок постарше семейство
+// ленивое — до первого события это тот же честный ноль, алерт не
+// переводится в «не измеряется» и не теряет первое событие 0→1.
+// Ошибкой остаётся только чужая экспозиция (маркера нет — адрес
+// настроен не на рендер-воркера).
 func parseSuspendExposition(r io.Reader) (int64, error) {
-	sc := bufio.NewScanner(io.LimitReader(r, suspendedBodyLimit))
+	body, err := readExposition(r)
+	if err != nil {
+		return 0, err
+	}
+	v, found, err := findPromSeries(body, suspendedMetricName, suspendedBudgetPair)
+	if err != nil {
+		return 0, err
+	}
+	if found {
+		return int64(v), nil
+	}
+	if renderExposition(body) {
+		return 0, nil // рендер-воркер, серии ещё нет — 0 (S-P1-4)
+	}
+	return 0, fmt.Errorf("monitor: метрика %s{%s} отсутствует в экспозиции рендер-воркера",
+		suspendedMetricName, suspendedBudgetPair)
+}
+
+// readExposition — тело экспозиции целиком в память (потолок
+// suspendedBodyLimit): повторный поиск по строкам требует буфера,
+// io.Reader однопроходен.
+func readExposition(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, suspendedBodyLimit))
+	if err != nil {
+		return nil, fmt.Errorf("monitor: чтение экспозиции: %w", err)
+	}
+	return body, nil
+}
+
+// findPromSeries — значение первого сэмпла metric, содержащего все пары
+// меток pairs (подмножество: лишние метки сэмпла не мешают — «семейство
+// есть, нужной ветки нет» отличает следующий за именем фильтр).
+// '#'-строки и пустые пропускаются; не-число/отрицательное значение —
+// ошибка «не счётчик» (стиль parseBadHashesExposition).
+func findPromSeries(body []byte, metric string, pairs ...string) (float64, bool, error) {
+	sc := bufio.NewScanner(bytes.NewReader(body))
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
 		// Пропуск '#'-строк и пустых эквивалентен сравнению имени: Cut от
@@ -104,33 +162,52 @@ func parseSuspendExposition(r io.Reader) (int64, error) {
 			continue
 		}
 		name, labels, _ := strings.Cut(fields[0], "{")
-		if name != suspendedMetricName {
+		if name != metric {
 			continue
 		}
-		// Метки до '}': пара reason="budget" ищется точным сравнением
-		// элемента списка (словарь замкнут, значений с запятыми/кавычками
-		// в нём нет).
+		// Метки до '}': пары ищутся точным сравнением элемента списка
+		// (словари замкнуты, значений с запятыми/кавычками в них нет).
 		labelPart, _, _ := strings.Cut(labels, "}")
-		budget := false
-		for _, pair := range strings.Split(labelPart, ",") {
-			if pair == suspendedBudgetPair {
-				budget = true
-				break
-			}
-		}
-		if !budget {
+		if !promHasPairs(labelPart, pairs...) {
 			continue
 		}
 		v, err := strconv.ParseFloat(fields[1], 64)
 		if err != nil || v < 0 {
-			return 0, fmt.Errorf("monitor: %s{%s}: значение %q не счётчик",
-				suspendedMetricName, labelPart, fields[1])
+			return 0, false, fmt.Errorf("monitor: %s{%s}: значение %q не счётчик",
+				metric, labelPart, fields[1])
 		}
-		return int64(v), nil
+		return v, true, nil
 	}
 	if err := sc.Err(); err != nil {
-		return 0, fmt.Errorf("monitor: чтение экспозиции: %w", err)
+		return 0, false, fmt.Errorf("monitor: чтение экспозиции: %w", err)
 	}
-	return 0, fmt.Errorf("monitor: метрика %s{%s} отсутствует в экспозиции рендер-воркера",
-		suspendedMetricName, suspendedBudgetPair)
+	return 0, false, nil
+}
+
+// promHasPairs — все ли пары меток name="value" есть в списке через
+// запятую.
+func promHasPairs(labelPart string, pairs ...string) bool {
+	for _, want := range pairs {
+		found := false
+		for _, pair := range strings.Split(labelPart, ",") {
+			if pair == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// renderExposition — маркер рендер-воркера: серия
+// crawler_stage_tasks_total{stage="render"} предсоздаётся в NewMetrics
+// воркера (T-077) и живёт в экспозиции с первого старта — прочие сервисы
+// экспонируют свой stage (http-воркер — stage="http") или не экспонируют
+// семейство вовсе. Отсутствие маркера = чужая экспозиция.
+func renderExposition(body []byte) bool {
+	_, found, _ := findPromSeries(body, renderStageTasksMetric, renderStagePair)
+	return found
 }
