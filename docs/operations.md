@@ -441,7 +441,7 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # тома
   алертов — воркер B не успевает дорабатывать; снятие — дренаж ниже
   6 750): сверить темп потребления `crawler_render_fallback_consumed_
   total` (воркер B жив? `systemctl status crawler-render-fallback-
-  worker`, метрика — порт 9110) против потока публикаций
+  worker`, метрика — порт 9120) против потока публикаций
   `crawler_render_fallback_published_total`; темп потолком
   `render.fallback.worker_rate` (окно 1 мин) — поднять потолок или
   завести второй воркер B по образцу render-worker@ (deploy.md §2.2);

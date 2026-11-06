@@ -268,7 +268,8 @@ configuration.md, `render`): второй воркер оправдан, ког�
 
 - **Метрики**: имя экземпляра = порт: `crawler-render-worker@9109` →
   `METRICS_ADDR=127.0.0.1:9109` (9101–9108 заняты комплектом; свободны
-  9109 и 9111+ — 9110 занимает постоянный юнит воркера B фолбэка, §2.3).
+  9109+ кроме 9120 — фиксированный порт воркера B фолбэка, вынесен из
+  зоны роста экземпляров, §2.3).
   `METRICS_ADDR` нельзя задавать в общем
   `/etc/crawler/crawler.env` — EnvironmentFile переопределяет
   `Environment` юнита и столкнёт порты всех экземпляров;
@@ -458,9 +459,9 @@ job'ов снимется следующим тиком). После ручно�
   смешивались бы в `crawler_render_records_total{engine}`. Файл
   необязателен (`-`): до его создания юнит стартует с движком из общего
   конфига (без канарейки это тот же chromium);
-- **метрики** — `127.0.0.1:9110`: 9101–9108 заняты комплектом; 9110 —
-  фиксированный порт воркера B, диапазон экземпляров `render-worker@`
-  (§2.2) разведён с ним: 9109 и 9111+.
+- **метрики** — `127.0.0.1:9120`: 9101–9108 заняты комплектом; 9120 —
+  фиксированный порт воркера B, вынесенный из зоны естественного роста
+  экземпляров `render-worker@` (§2.2: свободны 9109+, кроме 9120).
 
 Chromium — общий с основным воркером (`render.remote_url` из
 `crawler.env` → `ws://127.0.0.1:9222`, юнит `crawler-chromium.service`):
@@ -501,7 +502,7 @@ printf '%s\n' 'CRAWLER_RENDER_ENGINE=chromium' \
 chown root:crawler /etc/crawler/render-fallback-worker.env
 chmod 0640 /etc/crawler/render-fallback-worker.env
 systemctl enable --now crawler-render-fallback-worker.service
-curl -fsS 127.0.0.1:9110/livez               # живость воркера B
+curl -fsS 127.0.0.1:9120/livez               # живость воркера B
 journalctl -t crawler-render-fallback-worker -f
 # темп действует: чтения пачками ≤ render.fallback.worker_rate за минуту
 ```

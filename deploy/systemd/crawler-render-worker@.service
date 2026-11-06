@@ -14,9 +14,9 @@
 #
 # Имя экземпляра = порт метрик: crawler-render-worker@9109.service
 # слушает METRICS_ADDR 127.0.0.1:9109 (9101–9108 заняты комплектом;
-# 9109 и 9111+ свободны — 9110 занимает постоянный юнит воркера B
-# crawler-render-fallback-worker, §2.3 deploy.md; метрики — только
-# loopback, ТЗ §9).
+# 9109+ свободны, кроме 9120 — фиксированный порт постоянного юнита
+# воркера B crawler-render-fallback-worker, вынесен из зоны роста
+# экземпляров, §2.3 deploy.md; метрики — только loopback, ТЗ §9).
 # METRICS_ADDR нельзя задавать в общем /etc/crawler/crawler.env —
 # EnvironmentFile переопределяет Environment юнита и столкнёт порты
 # экземпляров.
@@ -57,9 +57,10 @@ EnvironmentFile=/etc/crawler/crawler.env
 # Per-instance переопределения (позже общего crawler.env — важнее):
 # CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223 при втором Chromium.
 EnvironmentFile=-/etc/crawler/render-worker@%i.env
-# Порт метрик — шаблонный параметр: имя экземпляра = порт (9109 и 9111+;
-# 9101–9108 заняты, 9110 — постоянный юнит воркера B фолбэка, §2.3
-# deploy.md; шапка юнита о конфликте с crawler.env).
+# Порт метрик — шаблонный параметр: имя экземпляра = порт (9109+,
+# кроме 9120; 9101–9108 заняты комплектом, 9120 — фиксированный порт
+# постоянного юнита воркера B фолбэка, §2.3 deploy.md; шапка юнита о
+# конфликте с crawler.env).
 Environment=METRICS_ADDR=127.0.0.1:%i
 WorkingDirectory=/var/lib/crawler
 ExecStart=/opt/crawler/bin/render-worker
