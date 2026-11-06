@@ -19,7 +19,14 @@
 # Chromium: общий с основным воркером — render.remote_url из crawler.env
 # (ws://127.0.0.1:9222, юнит crawler-chromium.service; перезапуск изнутри
 # воркера в remote-режиме невозможен — потолок держит MemoryMax юнита
-# chromium). Ресайкл-пара T-208 (crawler-chromium-recycle.timer)
+# chromium). Движок за сборкой B закреплён юнит-локальным
+# EnvironmentFile ниже (render-fallback-worker.env, ПОСЛЕ общего
+# crawler.env — важнее): при переводе основного воркера на движка-
+# кандидата (правка render.engine/remote_url в общем конфиге/окружении,
+# T-248/T-249) воркер B обязан остаться на chromium — рекурсивный
+# фолбэк запрещён (ФТ-10), метрики сборок не смешиваются
+# (crawler_render_records_total{engine}). Ресайкл-пара T-208
+# (crawler-chromium-recycle.timer)
 # применима КАК ЕСТЬ, новых файлов не нужно: ExecStart ресайкл-сервиса
 # перезапускает именно crawler-chromium.service — общий браузер обоих
 # воркеров; собственная пара воркеру B не требуется (локального
@@ -53,6 +60,18 @@ Type=simple
 User=crawler-render-fallback-worker
 Group=crawler
 EnvironmentFile=/etc/crawler/crawler.env
+# Закрепление chromium за сборкой B (ТЗ §4.5 п.1): юнит-локальный файл
+# читается ПОСЛЕ общего crawler.env — одноимённые переменные важнее
+# (приоритет поздних EnvironmentFile, как per-instance файл у
+# crawler-render-worker@.service). Содержимое (установка —
+# docs/deploy.md §2.3):
+#   CRAWLER_RENDER_ENGINE=chromium
+#   CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222   # только когда общий
+#   # crawler.env переведён на движка-кандидата или второй Chromium
+#   # (:9223) — возвращает B к chromium основного юнита.
+# «-»: до включения фолбэка юнит стартует и без файла (движок тогда
+# наследуется из общего конфига — базовое поведение без канарейки).
+EnvironmentFile=-/etc/crawler/render-fallback-worker.env
 Environment=METRICS_ADDR=127.0.0.1:9110
 # Сборка воркера B (ФТ-12): стрим потребления q:render-fallback; группа
 # выводится канонической парой стрима (render-fallback-worker).

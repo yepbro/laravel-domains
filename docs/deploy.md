@@ -436,6 +436,28 @@ job'ов снимется следующим тиком). После ручно�
   `render.fallback.enabled` — накопленное в очереди дорабатывается до
   пуста (ФТ-14). Сам воркер B фолбэк не публикует — рекурсия запрещена
   (ФТ-10);
+- **движок** — chromium закреплён за сборкой B юнит-локальным
+  `EnvironmentFile=-/etc/crawler/render-fallback-worker.env` (юнит читает
+  его **после** общего `crawler.env` — одноимённые переменные важнее, как
+  per-instance файл у `render-worker@`, §2.2). Содержимое боевого файла
+  (живёт на хосте, отдельного файла в `deploy/` нет):
+
+  ```
+  CRAWLER_RENDER_ENGINE=chromium
+  CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222
+  ```
+
+  Вторая строка нужна не всегда: пока основной воркер на chromium,
+  значение и так приходит из общего `crawler.env`; после перевода основного
+  воркера на движка-кандидата (правка `render.engine`/`render.remote_url`
+  в общем конфиге или `crawler.env`, T-248/T-249) она возвращает воркер B
+  к chromium основного юнита (`:9222`; второй Chromium — `:9223`, §2.2).
+  Без закрепления воркер B уехал бы на кандидата вместе с общим конфигом —
+  дорабатывал бы фолбэк тем же лёгким движком, который задачи не осилил
+  (рекурсивный фолбэк запрещён, ФТ-10/§4.5 п.1), а метрики сборок
+  смешивались бы в `crawler_render_records_total{engine}`. Файл
+  необязателен (`-`): до его создания юнит стартует с движком из общего
+  конфига (без канарейки это тот же chromium);
 - **метрики** — `127.0.0.1:9110`: 9101–9108 заняты комплектом; 9110 —
   фиксированный порт воркера B, диапазон экземпляров `render-worker@`
   (§2.2) разведён с ним: 9109 и 9111+.
@@ -471,6 +493,13 @@ chromium гасит публикацию сам (без смены флага), 
 # На уже развёрнутом хосте — сначала пользователь (§4.4 создаёт его на
 # свежих установках; воркер B — отдельный, не экземпляр шаблона):
 useradd -r -g crawler -d /var/lib/crawler -s /usr/sbin/nologin crawler-render-fallback-worker
+# Закрепление chromium за сборкой B (содержимое файла — выше, права как у
+# crawler.env, §4.5; юнит читает его после общего crawler.env):
+printf '%s\n' 'CRAWLER_RENDER_ENGINE=chromium' \
+  'CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222' \
+  > /etc/crawler/render-fallback-worker.env
+chown root:crawler /etc/crawler/render-fallback-worker.env
+chmod 0640 /etc/crawler/render-fallback-worker.env
 systemctl enable --now crawler-render-fallback-worker.service
 curl -fsS 127.0.0.1:9110/livez               # живость воркера B
 journalctl -t crawler-render-fallback-worker -f
