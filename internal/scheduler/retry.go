@@ -10,7 +10,9 @@
 // в статусе temp_error, чья проверка завершена (check_state = done, ТЗ 7)
 // и last_checked_at старше temp_error_retry_after, — и делит их по
 // счётчику попыток domains.temp_attempts (миграция 000005) на два решения,
-// каждое — в СОБСТВЕННОЙ транзакции (порядок блокировок, retryDecide):
+// каждое — в СОБСТВЕННОЙ транзакции (порядок блокировок, retryDecide;
+// назначение повтора — два оператора: декремент корзин счётчиков вынесен
+// из оператора зон, T-267):
 //
 //   - попыток меньше N — назначается повтор: check_state → pending
 //     (домена перевыберет диспетчер T-027 и поставит в q:dns, T-028),
@@ -145,17 +147,19 @@ const (
 	// add-файлом T-018), не инкрементируется повторно. Дельты счётчиков
 	// зон (checked −n / pending +n) — CTE zc того же оператора по
 	// RETURNING zone_id (T-178, ТЗИ §6.2: предикат пинирует старое
-	// состояние done); CTE rm декрементирует корзину зрелости эпизода
-	// (T-202: перевод в pending завершает кандидату — момент зрелости
-	// выводится из last_checked_at, ключ тот же, что у инкремента записи
-	// результата, — комментарий retryMatureSQL); внешний SELECT — ключи
-	// переведённых строк. Порядок CTE «зоны (zc) → корзина (rm)» — общий
-	// с проходом реконсиляции; порядок нессылаемых DML-CTE —
-	// реализационная деталь PG (оговорка в zonestats.go, ревью T-202).
-	// ORDER BY в rm детерминирует захват строк корзин по возрастанию даты
-	// (= имени: старые → вчерашняя) — общий порядок с проходом monitor
-	// (очистка старых по индексу → вчерашняя → сегодняшняя), без AB-BA
-	// цикла на смешанных датах пачки (ревью T-202, P2).
+	// состояние done); внешний SELECT — ключи переведённых строк с датой
+	// эпизода (last_checked_at — адресат хвостового декремента корзин
+	// зрелости, retryRequeueMatureSQL). Оператор строго «domains →
+	// zones» (T-267): декремент корзин выведен из него ВТОРЫМ оператором
+	// транзакции решения — нессылаемые DML-CTE зон и счётчика одного
+	// оператора исполняются в непредсказуемом порядке (документация PG,
+	// оговорка в zonestats.go; инцидент 07.11 — ребро «счётчики → зоны»
+	// против зонодержателей, runbooks.md §2.8), операторы же транзакции
+	// исполняются в текстовом порядке; зоны удерживаются до Commit —
+	// конвенция «domains → zones → counters» соблюдена, ребро
+	// «счётчики → domains» (устранено разделением транзакций решений,
+	// 15ff3a3) не возвращается: после декремента транзакция новых строк
+	// domains не захватывает.
 	retryRequeueSQL = "WITH upd AS (UPDATE domains d " +
 		"SET check_state = $3, temp_attempts = d.temp_attempts + 1 " +
 		"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
@@ -166,14 +170,32 @@ const (
 		"SET domains_checked = z.domains_checked - c.n, " +
 		"domains_pending = z.domains_pending + c.n " +
 		"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
-		"WHERE z.id = c.zone_id), " +
-		"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
-		"SELECT 'retry_mature:' || to_char(u.last_checked_at, 'YYYY-MM-DD'), -count(*), now() " +
-		"FROM upd AS u GROUP BY u.last_checked_at " +
-		"ORDER BY u.last_checked_at " +
+		"WHERE z.id = c.zone_id) " +
+		"SELECT u.zone_id, u.id, u.last_checked_at FROM upd AS u"
+
+	// retryRequeueMatureSQL — хвостовой декремент корзин зрелости
+	// назначения повтора (T-202/T-267): второй оператор транзакции
+	// решения ПОСЛЕ перевода (retryRequeueSQL: upd+zc), по датам
+	// эпизодов переведённых строк — RETURNING первого оператора
+	// (перевод в pending завершает кандидату: момент зрелости выводится
+	// из last_checked_at, ключ тот же, что у инкремента записи
+	// результата — current_date её оператора; рассинхрон ключей лишил
+	// бы декремент адресата). Параметр — пачка дат unnest($1::date[]);
+	// ORDER BY детерминирует захват строк корзин по возрастанию даты
+	// (= имени: старые → вчерашняя) — общий порядок с проходом monitor
+	// (очистка старых → вчерашняя → сегодняшняя), без AB-BA цикла на
+	// смешанных датах пачки (ревью T-202, P2). В той же транзакции,
+	// что и перевод: сбой декремента откатывает пару целиком (§3.4),
+	// кандидаты остаются кандидатами следующего прохода — в отличие от
+	// разнесённых autocommit'ами операторов записи результата DNS-этапа
+	// (dnsworker/result.go, окно ±1 до реконсиляции); пустая пачка
+	// (охрана отбила всех) оператор не выполняется вовсе.
+	retryRequeueMatureSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"SELECT 'retry_mature:' || to_char(d, 'YYYY-MM-DD'), -count(*), now() " +
+		"FROM unnest($1::date[]) AS d " +
+		"GROUP BY d ORDER BY d " +
 		"ON CONFLICT (name) DO UPDATE " +
-		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) " +
-		"SELECT u.zone_id, u.id FROM upd AS u"
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
 	// retryFinalizeSQL — исчерпание попыток: итоговый статус по последней
 	// проверке — delegated_no_address (см. комментарий в начале файла),
@@ -185,8 +207,13 @@ const (
 	// финализация, как и назначение повтора, завершает кандидату — без
 	// декремента корзина держала бы guard открытым после дренажа (холостые
 	// seq scan каждый тик до прохода реконсиляции); ORDER BY —
-	// детерминация захвата строк корзин, как у retryRequeueSQL (ревью
-	// T-202, P2).
+	// детерминация захвата строк корзин (ревью T-202, P2). Декремент
+	// ОСТАВЛЕН в самом операторе сознательно (T-267 выносил ребро
+	// «счётчики → зоны» горячего requeue): rm ссылается на upd —
+	// единственная CTE, исполнение гарантированно после перевода; зон
+	// оператор не трогает — порядок блокировок «domains → counters»
+	// без ребра против зонодержателей, отдельный оператор ничего бы
+	// не изменил.
 	retryFinalizeSQL = "WITH upd AS (UPDATE domains d " +
 		"SET status = $3, temp_attempts = 0 " +
 		"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
@@ -209,10 +236,12 @@ const (
 // медиана 51 с / max 239 с после фикса T-191). Корзина
 // crawler_counters['retry_mature:YYYY-MM-DD'] — temp_error-эпизоды
 // суток (дата эпизода = last_checked_at записи результата): +1 пишут
-// инкременты транзакций записи результата (httpworker/record.go и
-// терминальная temp_error-ветка DNS-этапа dnsworker/result.go — оба
-// источника эпизодов), −n — CTE rm назначения повтора и финализации
-// (кандидата исчерпана); авторитет — реконсиляция monitor
+// инкременты записи результата (httpworker/record.go и терминальная
+// temp_error-ветка DNS-этапа dnsworker/result.go — отдельным
+// autocommit-оператором после записи, T-267, — оба источника
+// эпизодов), −n — решения ретрая: назначение повтора хвостовым
+// оператором retryRequeueMatureSQL, финализация — CTE rm самого
+// оператора (кандидата исчерпана); авторитет — реконсиляция monitor
 // (FILTER-позиции прохода, T-202). Сумма корзин прошедших суток —
 // число зрелых кандидатов: last_checked_at — date (миграция 000001),
 // окно «старше 24 ч» по date-колонке зреет когортами в полночь, поэтому
@@ -244,9 +273,13 @@ var retryMatureSQL = "SELECT coalesce(sum(value), 0) FROM crawler_counters " +
 // бы domains-строки финализации, уже держа зоны и корзины счётчиков, —
 // ребро «счётчики → domains» замыкало цикл дедлока 40P01 с транзакциями
 // записи результата http-worker (инцидент retry-волны: пачки по 1000,
-// десятки корзин retry_mature до конца tx). Атомарность пачки не
-// критична: охраны обоих UPDATE идемпотентны, незавершённая половина
-// безопасно подбирается следующим проходом (ТЗ 3.4);
+// десятки корзин retry_mature до конца tx). Назначение повтора
+// выполняется в своей транзакции ДВУМЯ операторами (T-267): перевод
+// (upd+zc), затем декремент корзин (retryRequeueMatureSQL) — операторы
+// транзакции исполняются в текстовом порядке, зоны удерживаются до
+// Commit. Атомарность пачки не критична: охраны обоих UPDATE
+// идемпотентны, незавершённая половина безопасно подбирается следующим
+// проходом (ТЗ 3.4);
 // *pgxpool.Pool удовлетворяет интерфейсу.
 type RetryDB interface {
 	db.DB
@@ -326,7 +359,10 @@ type retryCandidate struct {
 // «domains → zones → counters» — общая транзакция захватывала бы
 // domains-строки финализации, уже держа зоны и корзины retry_mature
 // (ребро «счётчики → domains», цикл дедлока 40P01 с записью результата
-// http-worker); сбой между половинами безопасен — охраны обоих UPDATE
+// http-worker); назначение повтора — ДВА оператора своей транзакции
+// (перевод upd+zc, затем декремент корзин по датам переведённых строк,
+// T-267 — порядок нессылаемых DML-CTE одного оператора PG не
+// гарантирует); сбой между половинами безопасен — охраны обоих UPDATE
 // идемпотентны, незавершённая половина подберётся следующим проходом
 // (ТЗ 3.4). До выборки — guard суммой корзин зрелости
 // crawler_counters['retry_mature:…'] прошедших суток (T-202,
@@ -387,7 +423,7 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 
 	var res RetryResult
 	if len(requeueZones) > 0 {
-		n, err := retryDecide(ctx, pool, retryRequeueSQL, "назначение повтора", requeueZones, requeueIDs,
+		n, err := retryDecide(ctx, pool, retryRequeueSQL, retryRequeueMatureSQL, "назначение повтора", requeueZones, requeueIDs,
 			int16(model.CheckStatePending), int16(model.StatusTempError), int16(model.CheckStateDone))
 		if err != nil {
 			return RetryResult{}, err
@@ -395,7 +431,7 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 		res.Requeued = n
 	}
 	if len(finalZones) > 0 {
-		n, err := retryDecide(ctx, pool, retryFinalizeSQL, "итоговый статус", finalZones, finalIDs,
+		n, err := retryDecide(ctx, pool, retryFinalizeSQL, "", "итоговый статус", finalZones, finalIDs,
 			int16(model.StatusDelegatedNoAddress), int16(model.StatusTempError), int16(model.CheckStateDone))
 		if err != nil {
 			return RetryResult{}, err
@@ -406,26 +442,38 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 }
 
 // retryDecide — одно решение пачки (назначение повтора или итоговый
-// статус) в собственной транзакции. Разделение — инвариант порядка
-// блокировок (docs/schema.md, раздел crawler_counters): каждый оператор
-// сам по себе лочит строки в порядке «domains → zones → counters»
-// (retryRequeueSQL: upd → zc → rm; retryFinalizeSQL: upd → rm), но ДВА
-// оператора в одной транзакции захватывают domains-строки второй
-// половины, уже держа зоны и корзины retry_mature:{даты} первой, —
-// ребро «счётчики → domains» против транзакций записи результата
-// http-worker и прохода реконсиляции monitor (обе идут «domains → … →
-// counters» и до счётчиков ждут своих domains-строк) замыкало цикл
-// дедлока 40P01: 9 случаев за 3 ч на retry-волне, задача q:http
-// ределиверилась полным повторным HTTP-эпизодом. Раздельные транзакции
-// каждую возвращают конвенции, циклы через http-worker рвутся; держать
-// локи каждой половины — один оператор, окно блокировки минимально.
-// Сбой между половинами не портит данные: охраны обоих UPDATE
-// перепроверяют status/check_state на момент записи, зафиксированная
-// половина остаётся (переведённые не кандидаты), незавершённая —
-// кандидаты следующего прохода (идемпотентность ТЗ 3.4); ошибка
-// половины возвращает ошибку прохода — RetryResult отбрасывается,
-// дренаж RetryTempErrors продолжит следующим тиком.
-func retryDecide(ctx context.Context, pool RetryDB, sql, kind string,
+// статус) в собственной транзакции. Разделение транзакций — инвариант
+// порядка блокировок (docs/schema.md, раздел crawler_counters): ДВА
+// решения в одной транзакции захватывают domains-строки второй половины,
+// уже держа зоны и корзины retry_mature:{даты} первой, — ребро
+// «счётчики → domains» против транзакций записи результата http-worker
+// и прохода реконсиляции monitor (обе идут «domains → … → counters» и
+// до счётчиков ждут своих domains-строк) замыкало цикл дедлока 40P01:
+// 9 случаев за 3 ч на retry-волне, задача q:http ределиверилась полным
+// повторным HTTP-эпизодом. Раздельные транзакции каждую возвращают
+// конвенции, циклы через http-worker рвутся.
+// Назначение повтора выполняет в своей транзакции ДВА оператора
+// (T-267, matureSQL = retryRequeueMatureSQL): перевод (retryRequeueSQL:
+// upd → zc), затем хвостовой декремент корзин зрелости по ключам
+// (датам эпизодов) первого — операторы транзакции исполняются в
+// текстовом порядке, в отличие от нессылаемых DML-CTE одного оператора
+// (порядок PG не гарантирует, оговорка в zonestats.go; смешение zc/rm
+// одного оператора создавало ребро «счётчики → зоны» — инцидент
+// 07.11, runbooks.md §2.8). Зоны удерживаются до Commit — порядок
+// «domains → zones → counters» тот же, ребро «счётчики → domains»
+// не возвращается: после декремента транзакция новых строк domains
+// не захватывает. matureSQL = "" — решение без декремента
+// (финализация: rm в самом операторе, ссылается на upd). Декремент
+// выполняется только по непустому множеству ключей (охрана отбила
+// всех — корзины не трогаем).
+// Сбой любого оператора откатывает половину целиком (перевод и
+// декремент — одна транзакция, ТЗ 3.4): прерванная половина не
+// оставляет половинчатых изменений, кандидаты остаются кандидатами
+// следующего прохода (идемпотентность); зафиксированная половина
+// остаётся (переведённые не кандидаты). Ошибка половины возвращает
+// ошибку прохода — RetryResult отбрасывается, дренаж RetryTempErrors
+// продолжит следующим тиком.
+func retryDecide(ctx context.Context, pool RetryDB, sql, matureSQL, kind string,
 	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16) (int, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -435,14 +483,23 @@ func retryDecide(ctx context.Context, pool RetryDB, sql, kind string,
 	// половина не оставляет половинчатых изменений внутри себя (ТЗ 3.4).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	n, err := retryUpdate(ctx, tx, sql, kind, zoneIDs, domainIDs, set, guardStatus, guardState)
+	keys, err := retryUpdate(ctx, tx, sql, kind, zoneIDs, domainIDs, set, guardStatus, guardState)
 	if err != nil {
 		return 0, err
+	}
+	if matureSQL != "" && len(keys) > 0 {
+		days := make([]time.Time, len(keys))
+		for i, k := range keys {
+			days[i] = k.day
+		}
+		if _, err := tx.Exec(ctx, matureSQL, days); err != nil {
+			return 0, fmt.Errorf("scheduler: повторные проверки temp_error: %s: декремент корзин зрелости: %w", kind, err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: фиксация решения (%s): %w", kind, err)
 	}
-	return n, nil
+	return len(keys), nil
 }
 
 // retryCandidates выбирает до limit кандидатов повтора (retrySelectSQL) —
@@ -529,44 +586,55 @@ func retryMatureCount(ctx context.Context, pool RetryDB) (int64, error) {
 	return n, nil
 }
 
-// retryUpdate выполняет пачечный UPDATE … RETURNING и возвращает число
-// фактически затронутых доменов (после охран — как RETURNING cleanup,
+// retryKey — ключ переведённой строки пачки: зона, домен и дата
+// эпизода (last_checked_at) — адресат хвостового декремента корзин
+// зрелости (T-202/T-267).
+type retryKey struct {
+	zone int16
+	id   int64
+	day  time.Time
+}
+
+// retryUpdate выполняет пачечный UPDATE … RETURNING и возвращает ключи
+// фактически переведённых доменов (после охран — как RETURNING cleanup,
 // T-020: вторая параллельная транзакция, успевшая первой, не считается).
-// set — значение SET-колонки (check_state повтора или итоговый status),
-// guardStatus/guardState — охрана WHERE.
+// Назначение повтора возвращает ключи с датой эпизода (третья колонка
+// RETURNING — адресат декремента корзин, T-267); финализация — пару
+// (зона, id). set — значение SET-колонки (check_state повтора или
+// итоговый status), guardStatus/guardState — охрана WHERE.
 func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
-	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16) (int, error) {
+	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16) ([]retryKey, error) {
 	rows, err := tx.Query(ctx, sql, zoneIDs, domainIDs, set, guardStatus, guardState)
 	if err != nil {
-		// Эквивалентные мутанты (T-M06): сдвиг возвращаемого счётчика
-		// (0 → −1/1) ненаблюдаем — RetryOnce при err != nil отбрасывает
-		// результат (RetryResult{}, err) и значение никто не читает.
-		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
+		// Результат при err != nil отбрасывается вызывателем (RetryOnce
+		// возвращает RetryResult{}, err) — эквивалентных мутантов нет.
+		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
 	}
 	defer rows.Close()
 
-	n := 0
+	withDay := sql == retryRequeueSQL // ключи с датой эпизода — адресат декремента корзин (T-267)
+	keys := make([]retryKey, 0, len(zoneIDs))
 	for rows.Next() {
-		var zoneID int16
-		var id int64
-		if err := rows.Scan(&zoneID, &id); err != nil {
-			// Эквивалентные мутанты (T-M06): счётчик при ошибке Scan не
-			// читается вызывателем (см. выше), ветка return закрыта тестом
-			// TestRetryOnceRowsErrors.
-			// mutator-disable-next-line numbers/decrementer, numbers/incrementer
-			return 0, fmt.Errorf("scheduler: повторные проверки temp_error: %s: чтение ключей: %w", kind, err)
+		var k retryKey
+		var scanErr error
+		if withDay {
+			scanErr = rows.Scan(&k.zone, &k.id, &k.day)
+		} else {
+			scanErr = rows.Scan(&k.zone, &k.id)
 		}
-		n++
+		if scanErr != nil {
+			// Ключи при ошибке Scan не читаются вызывателем (см. выше),
+			// ветка return закрыта тестом TestRetryOnceRowsErrors.
+			return nil, fmt.Errorf("scheduler: повторные проверки temp_error: %s: чтение ключей: %w", kind, scanErr)
+		}
+		keys = append(keys, k)
 	}
 	if err := rows.Err(); err != nil {
-		// Эквивалентные мутанты (T-M06): счётчик при ошибке rows.Err() не
-		// читается вызывателем (см. выше), ветка return закрыта тестом
-		// TestRetryOnceRowsErrors.
-		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
+		// Ключи при ошибке rows.Err() не читаются вызывателем (см. выше),
+		// ветка return закрыта тестом TestRetryOnceRowsErrors.
+		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
 	}
-	return n, nil
+	return keys, nil
 }
 
 // RetryTempErrors — фоновая задача повторных проверок (ТЗ 5.3): по

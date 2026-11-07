@@ -140,18 +140,24 @@ var (
 	// resultUpdateStatusSQL — терминальный статус DNS-эпизода
 	// (not_delegated / temp_error / delegated_no_address). Внешний
 	// SELECT — число фактически переведённых строк (идемпотентность
-	// повторной доставки: охрана отсекла — 0). CTE rm — инкремент
-	// корзины зрелости ретрая crawler_counters['retry_mature: сутки']
-	// (T-202): SERVFAIL-ветка апекса и temp_error-итог без адресов —
-	// полноправные источники temp_error-эпизодов (массовый DNS-инцидент
-	// 24.10 оставил 491 тыс. доменов именно через эту ветку), их эпизоды
-	// зреют к полуночи и обязаны попадать в корзину тем же ключом, что
-	// пишет HTTP-этап (current_date той же транзакции записи) — иначе
-	// guard ретрая недоучитывал бы DNS-когорту. Условие WHERE по
-	// параметру $4 делает CTE no-op для не-temp_error статусов (нуль
-	// групп у агрегата — INSERT не вставляет строк), декремент той же
-	// корзины — CTE rm retryRequeueSQL/retryFinalizeSQL планировщика,
-	// авторитет — реконсиляция monitor (FILTER-позиции прохода).
+	// повторной доставки: охрана отсекла — 0). Оператор строго
+	// «domains → zones» (T-267): инкремент корзины зрелости ретрая
+	// crawler_counters['retry_mature: сутки'] (T-202) выведен из него
+	// отдельным autocommit-оператором resultMatureIncSQL — порядок
+	// исполнения нессылаемых DML-CTE одного оператора PostgreSQL не
+	// гарантирует (оговорка в monitor/zonestats.go), на проде 07.11
+	// CTE rm/zc исполнились инверсно (rm → zc): оператор держал строку
+	// счётчика и ждал зону — ребро «счётчики → зоны» против http-worker
+	// RecordAndPublish (держит зоны до Commit, ждёт retry_mature:today)
+	// замыкало цикл дедлока 40P01 (~3–4/ч; разбор — runbooks.md §2.8).
+	// SERVFAIL-ветка апекса и temp_error-итог без адресов — полноправные
+	// источники temp_error-эпизодов (массовый DNS-инцидент 24.10 оставил
+	// 491 тыс. доменов именно через эту ветку), их эпизоды зреют к
+	// полуночи и обязаны попадать в корзину тем же ключом, что пишет
+	// HTTP-этап (current_date записи) — иначе guard ретрая недоучитывал
+	// бы DNS-когорту; декремент той же корзины — планировщик
+	// (retryRequeueMatureSQL/retryFinalizeSQL), авторитет —
+	// реконсиляция monitor (FILTER-позиции прохода).
 	resultUpdateStatusSQL = "WITH s AS (" +
 		"SELECT zone_id, id, check_state FROM domains " +
 		fmt.Sprintf("WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> %d AND check_state <> %d ",
@@ -170,12 +176,27 @@ var (
 		"domains_checked = z.domains_checked + c.n " +
 		fmt.Sprintf("FROM (SELECT zone_id, count(*) AS n, count(*) FILTER (WHERE check_state = %d) AS n_pending, ", int16(model.CheckStatePending)) +
 		fmt.Sprintf("count(*) FILTER (WHERE check_state = %d) AS n_queued FROM upd GROUP BY zone_id) AS c ", int16(model.CheckStateQueued)) +
-		"WHERE z.id = c.zone_id), " +
-		"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
-		fmt.Sprintf("SELECT 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), count(*), now() FROM upd WHERE $4::int2 = %d GROUP BY current_date ", int16(model.StatusTempError)) +
-		"ON CONFLICT (name) DO UPDATE " +
-		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) " +
+		"WHERE z.id = c.zone_id) " +
 		"SELECT count(*) FROM upd"
+
+	// resultMatureIncSQL — инкремент корзины зрелости ретрая
+	// crawler_counters['retry_mature: сутки'] у temp_error-итога
+	// DNS-эпизода: +1 отдельным autocommit-оператором ПОСЛЕ успешной
+	// записи (T-267; прежде — CTE rm resultUpdateStatusSQL, чей
+	// нессылаемый порядок исполнения и создавал ребро дедлока —
+	// комментарий выше). Upsert-паттерн recordRetryMatureBumpSQL
+	// HTTP-этапа (internal/httpworker record.go), дельта — литерал 1
+	// (один домен на вызов), ключ current_date вычисляет БД — тот же,
+	// что у инкремента HTTP-этапа и декремента ретрая. Окно
+	// неатомарности ±1 до ближайшей реконсиляции (≤
+	// monitor.zone_stats_interval): сбой между операторами оставляет
+	// переход записанным (done), а корзину заниженной — безопасно,
+	// авторитет семейства — реконсиляция monitor, guard ретрая читает
+	// только корзины прошедших суток (retryMatureSQL).
+	resultMatureIncSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), 1, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
 	// resultUpdateKeepStatusSQL — ветка «есть адреса»: статус не пишется
 	// (итог поставит HTTP-этап, §7), temp_attempts сбрасывается — эпизод
@@ -387,16 +408,23 @@ func resultCNAME(c string) string {
 }
 
 // RecordEpisode записывает результат DNS-эпизода одного домена (ТЗ 5.4
-// п. 4) одним оператором UPDATE с охраной актуальности: удалённый во
-// время проверки домен не перезаписывается (§13.1), уже записанный
-// результат повторная доставка не трогает (идемпотентность, ТЗ 3.4 —
-// XACK только после записи, T-025); тем же оператором снимается бит
-// http_published (T-108): done — точка, где staging-пометка публикации
+// п. 4): перевод в done одним оператором UPDATE с охраной актуальности —
+// удалённый во время проверки домен не перезаписывается (§13.1), уже
+// записанный результат повторная доставка не трогает (идемпотентность,
+// ТЗ 3.4 — XACK только после записи, T-025); тем же оператором снимается
+// бит http_published (T-108): done — точка, где staging-пометка публикации
 // выполнила своё назначение; CTE того же оператора ведут дельты
-// счётчиков зоны по старому состоянию строки (T-178, ревью P1-1) и
-// инкремент корзины зрелости ретрая у temp_error-итога (CTE rm, T-202);
-// порядок нессылаемых DML-CTE — реализационная деталь PG (оговорка в
-// monitor/zonestats.go, ревью T-202).
+// счётчиков зоны по старому состоянию строки (T-178, ревью P1-1).
+// temp_error-итог дополнительно инкрементирует корзину зрелости ретрая
+// crawler_counters['retry_mature: сутки'] — ОТДЕЛЬНЫМ autocommit-оператором
+// resultMatureIncSQL после успешной записи (T-267): счётчик и зоны —
+// разные операторы, порядок их блокировок детерминирован (нессылаемые
+// DML-CTE одного оператора PG порядком не гарантирует — инцидент 07.11,
+// runbooks.md §2.8). Окно неатомарности ±1 до ближайшей реконсиляции
+// (≤ monitor.zone_stats_interval): сбой инкремента не отменяет
+// зафиксированный переход и не лечится повторной доставкой (охрана done
+// отсечёт оба оператора) — возвращает (true, err): вызыватель завершает
+// эпизод (корзину выровняет monitor), а не роняет доставку.
 // Возвращает false, когда охраны отсекли строку (done/deleted) — это
 // успех, а не ошибка.
 func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64, res EpisodeResult) (bool, error) {
@@ -421,6 +449,15 @@ func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 	n, err := resultCount(ctx, pool, sql, args, zoneID, domainID, what)
 	if err != nil {
 		return false, err
+	}
+	if n > 0 && res.SetStatus && res.Status == model.StatusTempError {
+		// Корзина зрелости — отдельный autocommit ПОСЛЕ записи (T-267):
+		// сбой здесь не роняет эпизод — переход зафиксирован, повторная
+		// доставка его не улучшит (охрана done), корзину ±1 догонит
+		// реконсиляция monitor.
+		if _, err := pool.Exec(ctx, resultMatureIncSQL); err != nil {
+			return true, fmt.Errorf("dnsworker: инкремент корзины retry_mature домена %d/%d: %w", zoneID, domainID, err)
+		}
 	}
 	return n > 0, nil
 }
@@ -587,7 +624,7 @@ func ProcessDomain(
 	}
 
 	recorded, err := RecordEpisode(ctx, pool, dom.ZoneID, dom.DomainID, res)
-	if err != nil {
+	if err != nil && !recorded {
 		return err
 	}
 	if !recorded {
@@ -596,6 +633,15 @@ func ProcessDomain(
 		log.Debug("результат не записан — домен удалён или уже done",
 			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 		return nil
+	}
+	if err != nil {
+		// Переход зафиксирован, инкремент корзины retry_mature — нет
+		// (T-267): окно неатомарности ±1, повторная доставка бессильна
+		// (охрана done отсечёт запись и инкремент), корзину догонит
+		// реконсиляция monitor — эпизод завершён, non-fatal (стиль
+		// пометки T-108).
+		log.Warn("инкремент корзины retry_mature не записан — корзину догонит реконсиляция",
+			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID, "err", err)
 	}
 	if res.SetStatus {
 		// Терминальная ветка DNS-этапа — счётчик финальных статусов

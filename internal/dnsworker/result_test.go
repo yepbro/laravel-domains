@@ -1,14 +1,16 @@
 // Юнит-тесты записи результата DNS-эпизода и цикла dns-worker (T-039;
-// ТЗ 5.4 пп. 4–5, §7, 3.4) на фейковых пуле, очереди и резолвере — без
-// БД, Redis и сети. Решение статусов (DecideEpisode), точные SQL-тексты
-// и параметры записи, порядок «публикация q:http → запись done», ветка
-// wildcard, ошибки/отмена, идемпотентный повтор пачки (фильтр
-// актуальности) и smoke цикла Run (чтение → эпизоды → XACK).
-// Поведение против живых Redis/PostgreSQL/unbound — интеграционные
-// тесты (T-032, T-040).
+// ТЗ 5.4 пп. 4–5, §7, 3.4; инкремент корзины retry_mature отдельным
+// оператором после записи — T-267) на фейковых пуле, очереди и
+// резолвере — без БД, Redis и сети. Решение статусов (DecideEpisode),
+// точные SQL-тексты и параметры записи, порядок «публикация q:http →
+// запись done», ветка wildcard, ошибки/отмена, идемпотентный повтор
+// пачки (фильтр актуальности) и smoke цикла Run (чтение → эпизоды →
+// XACK). Поведение против живых Redis/PostgreSQL/unbound —
+// интеграционные тесты (T-032, T-040).
 package dnsworker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -594,11 +596,12 @@ func resultWaitAck(j *resultJournal, timeout time.Duration) bool {
 func TestResultSQLContract(t *testing.T) {
 	// Операторы записи результата — CTE (T-178): предчтение старого
 	// состояния FOR UPDATE, перевод, дельты счётчиков зоны по старому
-	// состоянию; внешний SELECT — счёт переведённых строк. Терминальная
-	// ветка статуса добавляет CTE rm — инкремент корзины зрелости ретрая
-	// (T-202): условие по параметру $4 (temp_error = 5) делает CTE no-op
-	// для прочих статусов, ключ корзины — current_date, тот же, что у
-	// инкремента HTTP-этапа и декремента ретрая.
+	// состоянию; внешний SELECT — счёт переведённых строк. Оператор
+	// строго «domains → zones» (T-267): инкремент корзины зрелости
+	// ретрая (T-202) вынесен отдельным autocommit-оператором
+	// resultMatureIncSQL — нессылаемые DML-CTE зон и счётчика одного
+	// оператора исполняются в непредсказуемом порядке (инцидент 07.11 —
+	// ребро «счётчики → зоны», runbooks.md §2.8).
 	const cteTail = "FOR UPDATE), " +
 		"upd AS (UPDATE domains AS t "
 	const cteShift = "FROM s WHERE t.zone_id = s.zone_id AND t.id = s.id " +
@@ -611,11 +614,6 @@ func TestResultSQLContract(t *testing.T) {
 		"count(*) FILTER (WHERE check_state = 1) AS n_queued FROM upd GROUP BY zone_id) AS c " +
 		"WHERE z.id = c.zone_id)"
 	const cteEnd = " SELECT count(*) FROM upd"
-	const rmBasketCTE = ", " +
-		"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
-		"SELECT 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), count(*), now() FROM upd WHERE $4::int2 = 5 GROUP BY current_date " +
-		"ON CONFLICT (name) DO UPDATE " +
-		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now())"
 	const cteHead = "WITH s AS (" +
 		"SELECT zone_id, id, check_state FROM domains " +
 		"WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> 6 AND check_state <> 2 "
@@ -625,9 +623,25 @@ func TestResultSQLContract(t *testing.T) {
 		"temp_attempts = CASE WHEN $4::int2 = 5 THEN t.temp_attempts ELSE 0 END, " +
 		"flags = (t.flags & -5)::int2, " +
 		"check_state = 2, queued_at = NULL, last_checked_at = now() " +
-		cteShift + rmBasketCTE + cteEnd
+		cteShift + cteEnd
 	if resultUpdateStatusSQL != wantStatus {
 		t.Errorf("resultUpdateStatusSQL = %q,\nwant %q", resultUpdateStatusSQL, wantStatus)
+	}
+	if strings.Contains(resultUpdateStatusSQL, "crawler_counters") {
+		t.Errorf("resultUpdateStatusSQL пишет счётчики в операторе зон (T-267 — вынесено resultMatureIncSQL):\n%s",
+			resultUpdateStatusSQL)
+	}
+
+	// Инкремент корзины зрелости — отдельный autocommit-оператор после
+	// записи (T-267): upsert-паттерн recordRetryMatureBumpSQL HTTP-этапа,
+	// дельта — литерал 1 (один домен на вызов), ключ current_date
+	// вычисляет БД (таймзона согласована с last_checked_at записи).
+	wantMature := "INSERT INTO crawler_counters (name, value, updated_at) " +
+		"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), 1, now()) " +
+		"ON CONFLICT (name) DO UPDATE " +
+		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
+	if resultMatureIncSQL != wantMature {
+		t.Errorf("resultMatureIncSQL = %q,\nwant %q", resultMatureIncSQL, wantMature)
 	}
 
 	wantKeep := cteHead + cteTail +
@@ -957,7 +971,51 @@ func TestResultRecordEpisode(t *testing.T) {
 		}
 	})
 
-	t.Run("охраны отсекли строку — успех без записи", func(t *testing.T) {
+	t.Run("temp_error-итог — запись и инкремент корзины отдельными операторами", func(t *testing.T) {
+		j := &resultJournal{}
+		pool := &resultFakePool{j: j}
+		res := EpisodeResult{SetStatus: true, Status: model.StatusTempError}
+		recorded, err := RecordEpisode(context.Background(), pool, 7, 42, res)
+		if err != nil || !recorded {
+			t.Fatalf("RecordEpisode = (%v, %v), want (true, nil)", recorded, err)
+		}
+		execs := pool.resultPoolExecs()
+		if len(execs) != 2 {
+			t.Fatalf("Exec вызовов %d, want 2 (запись + инкремент корзины, T-267)", len(execs))
+		}
+		if execs[0].sql != resultUpdateStatusSQL {
+			t.Errorf("SQL №1 = %q, want resultUpdateStatusSQL (запись прежде инкремента)", execs[0].sql)
+		}
+		if execs[1].sql != resultMatureIncSQL {
+			t.Errorf("SQL №2 = %q, want resultMatureIncSQL (инкремент отдельным оператором)", execs[1].sql)
+		}
+		if len(execs[1].args) != 0 {
+			t.Errorf("args инкремента = %v, want пусто (ключ current_date вычисляет БД)", execs[1].args)
+		}
+		// Порядок в протоколе: инкремент строго после записи (T-267) —
+		// счётчик ждёт зафиксированного перехода, не наоборот.
+		ei, ii := j.indexOf(resultEvExec, resultUpdateStatusSQL), j.indexOf(resultEvExec, resultMatureIncSQL)
+		if ei < 0 || ii < 0 || ei > ii {
+			t.Fatalf("порядок нарушен: запись=%d инкремент=%d (нужна запись до инкремента)", ei, ii)
+		}
+	})
+
+	t.Run("сбой инкремента — переход записан, корзину догонит реконсиляция", func(t *testing.T) {
+		pool := &resultFakePool{j: &resultJournal{}, execErrs: []error{nil, errors.New("бд моргнула")}}
+		recorded, err := RecordEpisode(context.Background(), pool, 7, 42,
+			EpisodeResult{SetStatus: true, Status: model.StatusTempError})
+		if err == nil || !strings.Contains(err.Error(), "инкремент корзины retry_mature домена 7/42") {
+			t.Fatalf("ошибка = %v, want «инкремент корзины retry_mature домена 7/42»", err)
+		}
+		if !recorded {
+			t.Error("recorded = false, want true (переход зафиксирован до сбоя инкремента — окно ±1, T-267)")
+		}
+		if execs := pool.resultPoolExecs(); len(execs) != 2 {
+			t.Fatalf("Exec вызовов %d, want 2", len(execs))
+		}
+	})
+
+	t.Run("охраны отсекли строку — успех без записи и инкремента", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}, execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0")}}
 		recorded, err := RecordEpisode(context.Background(), pool, 7, 42,
 			EpisodeResult{SetStatus: true, Status: model.StatusTempError})
@@ -966,6 +1024,9 @@ func TestResultRecordEpisode(t *testing.T) {
 		}
 		if recorded {
 			t.Error("recorded = true, want false (уже done или deleted)")
+		}
+		if execs := pool.resultPoolExecs(); len(execs) != 1 {
+			t.Errorf("Exec вызовов %d, want 1 (нуль переведённых — инкремент не выполняется)", len(execs))
 		}
 	})
 
@@ -1372,6 +1433,37 @@ func TestResultProcessDomainMarkFailure(t *testing.T) {
 	execs := pool.resultPoolExecs()
 	if len(execs) != 2 || execs[0].sql != resultMarkPublishedSQL || execs[1].sql != resultUpdateKeepStatusSQL {
 		t.Fatalf("execs = %+v, want упавшая пометка + запись", execs)
+	}
+}
+
+// TestResultProcessDomainMatureFailure — сбой инкремента корзины
+// retry_mature ПОСЛЕ записи — non-fatal (T-267): переход зафиксирован,
+// эпизод завершён (доставка подтверждается), повторная доставка
+// бессильна (охрана done отсечёт оба оператора), корзину ±1 догонит
+// реконсиляция monitor — Warn, а не ошибка эпизода.
+func TestResultProcessDomainMatureFailure(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	// SERVFAIL апекса — терминальный temp_error без субдоменов (§7).
+	j := &resultJournal{}
+	pool := &resultFakePool{j: j, execErrs: []error{nil, errors.New("бд моргнула")}}
+	q := &resultFakeQueue{j: j}
+	resolve := resultNewResolver()
+	resolve.setAnswer("flaky.example.com", dns.TypeA, resultReply(dnsclient.RCodeSERVFAIL))
+
+	dom := PendingDomain{DNSDomain: queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "flaky.example.com"}}
+	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), false, nil, log); err != nil {
+		t.Fatalf("ProcessDomain: %v, want nil (инкремент корзины non-fatal)", err)
+	}
+	if n := j.count(resultEvPublish); n != 0 {
+		t.Errorf("публикаций %d, want 0 (терминальная ветка без адресов)", n)
+	}
+	execs := pool.resultPoolExecs()
+	if len(execs) != 2 || execs[0].sql != resultUpdateStatusSQL || execs[1].sql != resultMatureIncSQL {
+		t.Fatalf("execs = %+v, want запись temp_error + упавший инкремент корзины", execs)
+	}
+	if !strings.Contains(buf.String(), "инкремент корзины retry_mature не записан") {
+		t.Errorf("лог не содержит Warn о инкременте корзины:\n%s", buf.String())
 	}
 }
 

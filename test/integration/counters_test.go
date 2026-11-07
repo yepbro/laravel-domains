@@ -11,10 +11,14 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/analyzer"
@@ -484,7 +488,8 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 	}
 
 	// Терминальная temp_error-ветка DNS-этапа (SERVFAIL апекса): тот же
-	// ключ корзины — CTE того же оператора записи (T-202).
+	// ключ корзины — отдельный autocommit-оператор ПОСЛЕ записи
+	// (T-267; прежде — CTE того же оператора, T-202).
 	if ok, err := dnsworker.RecordEpisode(ctx, pool, zone, ids[2], dnsworker.EpisodeResult{
 		SetStatus: true,
 		Status:    model.StatusTempError,
@@ -539,6 +544,108 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 		t.Fatalf("retry_mature:past = %+v, хочу нули (зрелой когорты нет)", p)
 	}
 	countersVerifyEmpty(t, pool, "после реконсиляции корзин")
+}
+
+// countersMatureFailPool — db.DB-обёртка пула: Exec инкремента корзины
+// retry_mature (resultMatureIncSQL dnsworker, T-267) падает, всё
+// остальное делегируется пулу — сценарий сбоя МЕЖДУ операторами записи
+// результата (переход уже зафиксирован, инкремент — нет).
+type countersMatureFailPool struct {
+	*pgxpool.Pool
+}
+
+// countersMatureIncMark — опознаватель инкремента корзины в тексте SQL
+// (дублирование литерал — стиль schema_test.go: константа не экспортирована).
+const countersMatureIncMark = "VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), 1, now())"
+
+func (p *countersMatureFailPool) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {
+	return p.Pool.CopyFrom(ctx, tableName, columnNames, rowSrc)
+}
+
+func (p *countersMatureFailPool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, countersMatureIncMark) {
+		return pgconn.CommandTag{}, errors.New("сбой инкремента корзины (сценарий)")
+	}
+	return p.Pool.Exec(ctx, sql, args...)
+}
+
+func (p *countersMatureFailPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return p.Pool.Query(ctx, sql, args...)
+}
+
+// TestCounters_RetryMatureIncrementFailure — окно неатомарности ±1
+// (T-267): инкремент корзины retry_mature:today — отдельный
+// autocommit-оператор ПОСЛЕ записи перехода; его сбой оставляет домен
+// записанным (done + temp_error), а корзину заниженной до ближайшей
+// реконсиляции — проход monitor пишет корзину живым окном
+// (temp_error × done × дата) и выравнивает её, guard ретрая не
+// страдает (читает только корзины прошедших суток).
+func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := countersSchema(t)
+	ctx := context.Background()
+
+	zone := countersSeedZone(t, pool, "maturefail.test")
+	ids := countersSeedDomains(t, pool, zone, "mf", 1, model.CheckStateQueued, model.StatusNew)
+
+	fail := &countersMatureFailPool{Pool: pool}
+	recorded, err := dnsworker.RecordEpisode(ctx, fail, zone, ids[0], dnsworker.EpisodeResult{
+		SetStatus: true,
+		Status:    model.StatusTempError,
+	})
+	if err == nil || !strings.Contains(err.Error(), "инкремент корзины retry_mature") {
+		t.Fatalf("RecordEpisode = (%v, %v), want (true, ошибка инкремента)", recorded, err)
+	}
+	if !recorded {
+		t.Fatal("recorded = false, want true: переход зафиксирован до сбоя инкремента")
+	}
+
+	// Переход записан: домен done + temp_error, дельты зоны честные.
+	var status, state int16
+	if err := pool.QueryRow(ctx,
+		"SELECT status, check_state FROM domains WHERE zone_id = $1 AND id = $2", zone, ids[0],
+	).Scan(&status, &state); err != nil {
+		t.Fatalf("чтение домена: %v", err)
+	}
+	if model.Status(status) != model.StatusTempError || model.CheckState(state) != model.CheckStateDone {
+		t.Fatalf("домен = статус %d состояние %d, want temp_error/done (переход пережил сбой инкремента)",
+			status, state)
+	}
+
+	// Корзина занижена на 1 (инкремент не прошёл) — живое окно видит
+	// одного temp_error сегодня. Строки корзины может не быть вовсе:
+	// resultMatureIncSQL — upsert, он же и создатель строки, а его
+	// перехватил fail-пул — ErrNoRows и есть корзина 0 (занижение до
+	// реконсиляции в терминах отсутствия инкремента).
+	var basket int64
+	err = pool.QueryRow(ctx,
+		"SELECT value FROM crawler_counters "+
+			"WHERE name = 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')",
+	).Scan(&basket)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		basket = 0 // строки нет — корзина не создана (инкремент упал)
+	case err != nil:
+		t.Fatalf("чтение корзины суток: %v", err)
+	}
+	if basket != 0 {
+		t.Fatalf("корзина суток = %d, want 0 (инкремент упал — окно ±1 до реконсиляции)", basket)
+	}
+
+	// Реконсиляция — авторитет: корзина := живое окно (один temp_error ×
+	// done сегодня), занижение догнано.
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
+		t.Fatalf("реконсиляция: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT value FROM crawler_counters "+
+			"WHERE name = 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')",
+	).Scan(&basket); err != nil {
+		t.Fatalf("чтение корзины суток после прохода: %v", err)
+	}
+	if basket != 1 {
+		t.Fatalf("корзина суток после реконсиляции = %d, want 1 (живое окно догнало сбой инкремента)", basket)
+	}
 }
 
 // TestCounters_DailyChecksDayChange — ротация суток (T-179, ТЗ §9.2):

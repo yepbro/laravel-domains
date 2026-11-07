@@ -1,6 +1,7 @@
 // Интеграционные тесты прохода повторных проверок temp_error RetryOnce
 // (T-031; выборка кандидатов seq scan'ом с закреплением плана SET LOCAL —
-// T-191, guard корзинами зрелости retry_mature — T-202) против живого
+// T-191, guard корзинами зрелости retry_mature — T-202, вынос декремента
+// корзин из оператора зон повтора — T-267) против живого
 // PostgreSQL: юнит-тесты retry_test.go проверяют SQL-контракты и
 // последовательность на фейках, здесь — реальное поведение на
 // мигрированной схеме: зрелая когорта temp_error дренируется пачками
@@ -18,6 +19,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -26,6 +28,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/migrate"
@@ -98,6 +101,39 @@ func (t *retryTraceTx) Query(ctx context.Context, sql string, args ...any) (pgx.
 		t.pool.countBatch()
 	}
 	return t.Tx.Query(ctx, sql, args...)
+}
+
+// retryMatureFailPool — RetryDB-обёртка пула: транзакция, чей Exec
+// хвостового декремента корзин зрелости (retryRequeueMatureSQL, второй
+// оператор назначения повтора, T-267) падает — проверка атомарности
+// половины повтора: откатываются и перевод, и декремент.
+type retryMatureFailPool struct {
+	*pgxpool.Pool
+}
+
+// retryMatureDecMark — опознаватель декремента корзин в тексте SQL
+// (дублирование литерал — стиль schema_test.go: константа не экспортирована).
+const retryMatureDecMark = "FROM unnest($1::date[]) AS d"
+
+func (p *retryMatureFailPool) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := p.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &retryMatureFailTx{Tx: tx}, nil
+}
+
+// retryMatureFailTx — транзакция-обёртка: Exec декремента корзин
+// зрелости падает, остальное делегируется.
+type retryMatureFailTx struct {
+	pgx.Tx
+}
+
+func (t *retryMatureFailTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "retry_mature") && strings.Contains(sql, retryMatureDecMark) {
+		return pgconn.CommandTag{}, errors.New("сбой декремента корзин (сценарий)")
+	}
+	return t.Tx.Exec(ctx, sql, args...)
 }
 
 // TestRetryTempErrorPass — проход повторных проверок на живом PostgreSQL:
@@ -299,7 +335,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Errorf("pending тронут: %+v, want temp_error/pending/0 (не кандидат)", r)
 		}
 
-		// Дельты счётчиков зоны (CTE retryRequeueSQL, T-178): единственный
+		// Дельты счётчиков зоны (CTE zc retryRequeueSQL, T-178): единственный
 		// переход done → pending — по requeue.
 		var checked, pend int64
 		if err := pool.QueryRow(ctx,
@@ -311,9 +347,12 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Errorf("счётчики зоны = checked %d pending %d, want -1 и 1 (переход done → pending)", checked, pend)
 		}
 
-		// Корзины зрелости (T-202): декременты CTE rm ушли в корзину дат
-		// эпизодов (2020-01-01, по −1 на назначение и финализацию) —
-		// guard-сумма сходится с живым числом зрелых кандидатов (0).
+		// Корзины зрелости (T-202/T-267): декременты хвостового оператора
+		// назначения повтора ушли в корзину дат эпизодов (2020-01-01,
+		// по −1 на назначение и финализацию — ключ выводится из дат
+		// переведённых строк, переданных пачкой из RETURNING первого
+		// оператора) — guard-сумма сходится с живым числом зрелых
+		// кандидатов (0).
 		var stale int64
 		if err := pool.QueryRow(ctx,
 			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:2020-01-01'",
@@ -342,9 +381,11 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// свои domains-строки, пока не дойдёт до хвостовых счётчиков
 	// (checks:/temp_error:/retry_mature:). Половина повтора обязана
 	// зафиксироваться и отпустить свои блокировки (domains/зоны/корзина
-	// retry_mature), НЕ дожидаясь финализации: в общей транзакции пачки
-	// она висела бы на чужой domains-строке, держа корзину счётчика, —
-	// ребро «счётчики → domains» цикла дедлока с записью результата.
+	// retry_mature — перевод и хвостовой декремент ДВУМЯ операторами
+	// одной транзакции, T-267), НЕ дожидаясь финализации: в общей
+	// транзакции пачки она висела бы на чужой domains-строке, держа
+	// корзину счётчика, — ребро «счётчики → domains» цикла дедлока с
+	// записью результата.
 	t.Run("половины пачки — независимые транзакции (регрессия 40P01)", func(t *testing.T) {
 		seed("mixreq", model.StatusTempError, model.CheckStateDone, "2020-01-01", 0) // повтор
 		seed("mixfin", model.StatusTempError, model.CheckStateDone, "2020-01-01", int16(scheduler.DefaultRetryMaxRetries))
@@ -436,6 +477,82 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 		if finStatus != int16(model.StatusDelegatedNoAddress) {
 			t.Errorf("статус mixfin = %d, want delegated_no_address (финализация после освобождения)", finStatus)
+		}
+	})
+
+	// Атомарность половины повтора (T-267): перевод и хвостовой
+	// декремент корзин — ДВА оператора ОДНОЙ транзакции; сбой декремента
+	// откатывает половину целиком — домен остаётся кандидатом (done),
+	// дельты зон и корзины не тронуты. Контраст с записью результата
+	// DNS-этапа, где операторы разнесены autocommit'ами и корзину
+	// догоняет реконсиляция (counters_test.go, окно ±1).
+	t.Run("сбой декремента корзин откатывает половину повтора", func(t *testing.T) {
+		seed("mixfail", model.StatusTempError, model.CheckStateDone, "2020-01-01", 0)
+		if _, err := pool.Exec(ctx,
+			"INSERT INTO crawler_counters (name, value, updated_at) "+
+				"VALUES ('retry_mature:2020-01-01', 1, now()) "+
+				"ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+		); err != nil {
+			t.Fatalf("reset корзины зрелости: %v", err)
+		}
+		fail := &retryMatureFailPool{Pool: raw}
+
+		var checkedBefore, pendBefore int64
+		if err := pool.QueryRow(ctx,
+			"SELECT domains_checked, domains_pending FROM zones WHERE id = $1", zone,
+		).Scan(&checkedBefore, &pendBefore); err != nil {
+			t.Fatalf("select zones до: %v", err)
+		}
+		if _, err := scheduler.RetryOnce(ctx, fail, scheduler.RetryOptions{BatchSize: 1}); err == nil ||
+			!strings.Contains(err.Error(), "декремент корзин зрелости") {
+			t.Fatalf("RetryOnce = %v, want ошибка декремента корзин зрелости", err)
+		}
+		var state, attempts int16
+		if err := pool.QueryRow(ctx,
+			"SELECT check_state, temp_attempts FROM domains WHERE zone_id = $1 AND label = $2", zone, "mixfail",
+		).Scan(&state, &attempts); err != nil {
+			t.Fatalf("чтение mixfail: %v", err)
+		}
+		if model.CheckState(state) != model.CheckStateDone || attempts != 0 {
+			t.Fatalf("mixfail = состояние %d попыток %d, want done/0 (перевод откатился вместе с декрементом)",
+				state, attempts)
+		}
+		var checked, pend int64
+		if err := pool.QueryRow(ctx,
+			"SELECT domains_checked, domains_pending FROM zones WHERE id = $1", zone,
+		).Scan(&checked, &pend); err != nil {
+			t.Fatalf("select zones: %v", err)
+		}
+		if checked != checkedBefore || pend != pendBefore {
+			t.Errorf("дельты зоны изменились при откате: checked %d pending %d, want без изменений (%d/%d)",
+				checked, pend, checkedBefore, pendBefore)
+		}
+		var basket int64
+		if err := pool.QueryRow(ctx,
+			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:2020-01-01'",
+		).Scan(&basket); err != nil {
+			t.Fatalf("корзина дат эпизодов: %v", err)
+		}
+		if basket != 1 {
+			t.Errorf("корзина 2020-01-01 = %d, want 1 (декремент откатился вместе с переводом)", basket)
+		}
+		// Кандидат цел — следующий проход (живой пул) его разбирает:
+		// перевод и декремент проходят вместе, дельты зоны уходят.
+		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{BatchSize: 1})
+		if err != nil {
+			t.Fatalf("повторный проход: %v", err)
+		}
+		if res.Requeued != 1 {
+			t.Errorf("повторный проход = %+v, want requeued=1 (кандидат уцелел в done)", res)
+		}
+		if err := pool.QueryRow(ctx,
+			"SELECT domains_checked, domains_pending FROM zones WHERE id = $1", zone,
+		).Scan(&checked, &pend); err != nil {
+			t.Fatalf("select zones после прохода: %v", err)
+		}
+		if checked != checkedBefore-1 || pend != pendBefore+1 {
+			t.Errorf("дельты зоны после прохода: checked %d pending %d, want %d и %d (done → pending)",
+				checked, pend, checkedBefore-1, pendBefore+1)
 		}
 	})
 

@@ -1,10 +1,12 @@
 // Юнит-тесты повторных проверок temp_error (T-031, ТЗ 5.3, 6.2; guard
 // корзинами зрелости — T-202, закрепление плана выборки — T-191,
-// раздельные транзакции решений — регрессия дедлока 40P01 счётчиков)
+// раздельные транзакции решений — регрессия дедлока 40P01 счётчиков,
+// вынос декремента корзин из оператора зон повтора — T-267)
 // на фейковом pgx-пуле с транзакциями: точные SQL-тексты и параметры
 // (guard-чтение суммы корзин / SELECT кандидатов в транзакции
-// закрепления плана / UPDATE повтора / UPDATE итогового статуса с
-// декрементом корзины), последовательность SET LOCAL ×3 → SELECT, окно
+// закрепления плана / UPDATE повтора + хвостовой декремент корзин /
+// UPDATE итогового статуса с декрементом в самом операторе),
+// последовательность SET LOCAL ×3 → SELECT, окно
 // retry_after, границы счётчика попыток (до N / на N / после N),
 // пустой набор, guard=0 без тяжёлой выборки, охраны, ошибки и отмена
 // ctx, цикл RetryTempErrors. Поведение против живой БД —
@@ -41,6 +43,11 @@ type retryCall struct {
 	sql  string
 	args []any
 }
+
+// retryDay — дата эпизода переведённых строк в заготовках RETURNING
+// назначения повтора (третья колонка, T-267 — адресат декремента
+// корзин зрелости).
+var retryDay = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // retryFakeRows — pgx.Rows с заготовленными строками; Scan позиционный,
 // в порядке колонок SQL.
@@ -125,6 +132,8 @@ type retryFakePool struct {
 	begins       int
 	seq          int // монотонный порядок событий Begin/Commit (регрессия разделения tx решений)
 	txs          []*retryFakeTx
+
+	matureErr error // ошибка хвостового декремента корзин (retryRequeueMatureSQL, T-267)
 }
 
 func (p *retryFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -244,7 +253,9 @@ func (t *retryFakeTx) isSelect() bool {
 }
 
 // Exec — закрепление плана выборки (T-191): SET LOCAL ×3 до SELECT —
-// последовательность проверяет TestRetryOnceSelectPlan.
+// последовательность проверяет TestRetryOnceSelectPlan; хвостовой
+// декремент корзин зрелости назначения повтора (retryRequeueMatureSQL,
+// T-267) — второй оператор транзакции решения.
 func (t *retryFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
@@ -255,6 +266,11 @@ func (t *retryFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.C
 			return pgconn.CommandTag{}, t.pool.planErr
 		}
 		return pgconn.NewCommandTag("SET"), nil
+	case retryRequeueMatureSQL:
+		if t.pool.matureErr != nil {
+			return pgconn.CommandTag{}, t.pool.matureErr
+		}
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	default:
 		return pgconn.CommandTag{}, fmt.Errorf("retryFakeTx: неожидаемый SQL Exec: %s", sql)
 	}
@@ -351,14 +367,19 @@ const wantRetryRequeue = "WITH upd AS (UPDATE domains d " +
 	"SET domains_checked = z.domains_checked - c.n, " +
 	"domains_pending = z.domains_pending + c.n " +
 	"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
-	"WHERE z.id = c.zone_id), " +
-	"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
-	"SELECT 'retry_mature:' || to_char(u.last_checked_at, 'YYYY-MM-DD'), -count(*), now() " +
-	"FROM upd AS u GROUP BY u.last_checked_at " +
-	"ORDER BY u.last_checked_at " +
+	"WHERE z.id = c.zone_id) " +
+	"SELECT u.zone_id, u.id, u.last_checked_at FROM upd AS u"
+
+// wantRetryRequeueMature — хвостовой декремент корзин зрелости
+// назначения повтора (T-267): второй оператор транзакции решения по
+// датам эпизодов переведённых строк (unnest-пачка дат), ORDER BY —
+// детерминация захвата корзин по возрастанию даты.
+const wantRetryRequeueMature = "INSERT INTO crawler_counters (name, value, updated_at) " +
+	"SELECT 'retry_mature:' || to_char(d, 'YYYY-MM-DD'), -count(*), now() " +
+	"FROM unnest($1::date[]) AS d " +
+	"GROUP BY d ORDER BY d " +
 	"ON CONFLICT (name) DO UPDATE " +
-	"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) " +
-	"SELECT u.zone_id, u.id FROM upd AS u"
+	"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
 const wantRetryFinalize = "WITH upd AS (UPDATE domains d " +
 	"SET status = $3, temp_attempts = 0 " +
@@ -401,7 +422,8 @@ func retrySelectCall(t *testing.T, tx *retryFakeTx) retryCall {
 // TestRetrySQLContract — литералы операторов прохода: выборка без ORDER BY
 // (порядок кандидатов не важен — сортировка держала бы индексный доступ),
 // SET LOCAL закрепления плана, guard суммой корзин зрелости с границей
-// current_date от БД; декремент корзин (CTE rm) — в обоих решениях пачки,
+// current_date от БД; декремент корзин — в финализации (CTE rm самого
+// оператора) и отдельным оператором назначения повтора (T-267),
 // ключ last_checked_at — тот же, что у инкремента записи результата.
 func TestRetrySQLContract(t *testing.T) {
 	if !strings.Contains(retrySelectSQL, "WHERE d.status = $1") ||
@@ -427,14 +449,15 @@ func TestRetrySQLContract(t *testing.T) {
 	if retryMatureSQL != wantGuard {
 		t.Fatalf("retryMatureSQL разошёлся с контрактом T-202:\n%s\nwant:\n%s", retryMatureSQL, wantGuard)
 	}
-	// Декремент корзины зрелости — в назначении повтора и финализации
-	// (CTE rm, T-202): оба решения завершают кандидату; ключ выводится из
-	// last_checked_at переведённых строк — адресат того же инкремента,
-	// что пишут записи результата (current_date их транзакции). ORDER BY
-	// детерминирует захват строк корзин по возрастанию даты — общий
-	// порядок с проходом реконсиляции (очистка старых → вчерашняя →
-	// сегодняшняя), без AB-BA цикла на смешанных датах пачки (ревью
-	// T-202, P2).
+	// Декремент корзины зрелости финализации — в самом операторе
+	// (CTE rm, T-202): rm ссылается на upd (единственная CTE —
+	// исполнение гарантированно после перевода), зон нет; ключ выводится
+	// из last_checked_at переведённых строк — адресат того же
+	// инкремента, что пишут записи результата (current_date их
+	// оператора). ORDER BY детерминирует захват строк корзин по
+	// возрастанию даты — общий порядок с проходом реконсиляции
+	// (очистка старых → вчерашняя → сегодняшняя), без AB-BA цикла на
+	// смешанных датах пачки (ревью T-202, P2).
 	const wantBasketCTE = ", " +
 		"rm AS (INSERT INTO crawler_counters (name, value, updated_at) " +
 		"SELECT 'retry_mature:' || to_char(u.last_checked_at, 'YYYY-MM-DD'), -count(*), now() " +
@@ -442,17 +465,23 @@ func TestRetrySQLContract(t *testing.T) {
 		"ORDER BY u.last_checked_at " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) "
-	for _, sql := range []struct {
-		name string
-		text string
-	}{
-		{"retryRequeueSQL", retryRequeueSQL},
-		{"retryFinalizeSQL", retryFinalizeSQL},
-	} {
-		if !strings.Contains(sql.text, "RETURNING d.zone_id, d.id, d.last_checked_at") ||
-			!strings.Contains(sql.text, wantBasketCTE) {
-			t.Errorf("%s без декремента корзины зрелости (CTE rm, T-202):\n%s", sql.name, sql.text)
-		}
+	if !strings.Contains(retryFinalizeSQL, "RETURNING d.zone_id, d.id, d.last_checked_at") ||
+		!strings.Contains(retryFinalizeSQL, wantBasketCTE) {
+		t.Errorf("retryFinalizeSQL без декремента корзины зрелости (CTE rm, T-202):\n%s", retryFinalizeSQL)
+	}
+
+	// Назначение повтора — БЕЗ счётчиков в операторе (T-267): оператор
+	// строго «domains → zones» — нессылаемые DML-CTE зон и счётчика
+	// исполняются в непредсказуемом порядке (документация PG), инверсия
+	// rm → zc инцидента 07.11 создавала ребро «счётчики → зоны» против
+	// зонодержателей (runbooks.md §2.8); декремент — второй оператор
+	// той же транзакции по датам переведённых строк.
+	if strings.Contains(retryRequeueSQL, "crawler_counters") {
+		t.Errorf("retryRequeueSQL пишет счётчики в операторе зон (T-267 — вынесено вторым оператором):\n%s", retryRequeueSQL)
+	}
+	if retryRequeueMatureSQL != wantRetryRequeueMature {
+		t.Errorf("retryRequeueMatureSQL разошёлся с контрактом T-267:\n%s\nwant:\n%s",
+			retryRequeueMatureSQL, wantRetryRequeueMature)
 	}
 }
 
@@ -550,8 +579,10 @@ func TestRetryOnceSQLAndFlow(t *testing.T) {
 		)},
 		requeues: []*retryFakeRows{retryRows(
 			// Охрана отбила домен 1/11 (успел уйти из done) — не считается.
-			[]any{int16(1), int64(10)},
-			[]any{int16(2), int64(20)},
+			// Третья колонка — дата эпизода (last_checked_at): адресат
+			// декремента корзин (T-267).
+			[]any{int16(1), int64(10), retryDay},
+			[]any{int16(2), int64(20), retryDay},
 		)},
 		finalizes: []*retryFakeRows{retryRows(
 			[]any{int16(2), int64(21)},
@@ -594,9 +625,10 @@ func TestRetryOnceSQLAndFlow(t *testing.T) {
 		t.Errorf("лимит пачки = %v, want 10", gotLimit)
 	}
 
-	// Решения — каждое в собственной транзакции, одним оператором.
-	if len(requeueTx.calls) != 1 {
-		t.Fatalf("вызовов в транзакции повтора = %d, want 1", len(requeueTx.calls))
+	// Решения — каждое в собственной транзакции; повтор — ДВА оператора
+	// (перевод + хвостовой декремент корзин, T-267), итог — один.
+	if len(requeueTx.calls) != 2 {
+		t.Fatalf("вызовов в транзакции повтора = %d, want 2 (перевод + декремент корзин)", len(requeueTx.calls))
 	}
 	if requeueTx.calls[0].sql != wantRetryRequeue {
 		t.Errorf("SQL повтора:\n%s\nwant:\n%s", requeueTx.calls[0].sql, wantRetryRequeue)
@@ -607,8 +639,17 @@ func TestRetryOnceSQLAndFlow(t *testing.T) {
 	}; !reflect.DeepEqual(requeueTx.calls[0].args, want) {
 		t.Errorf("аргументы повтора = %v, want %v", requeueTx.calls[0].args, want)
 	}
+	if requeueTx.calls[1].sql != wantRetryRequeueMature {
+		t.Errorf("SQL декремента корзин:\n%s\nwant:\n%s", requeueTx.calls[1].sql, wantRetryRequeueMature)
+	}
+	// Декремент — по датам эпизодов переведённых строк (обе даты равны —
+	// одна корзина в пачке); пустых ключей у охраны нет — оператор
+	// выполняется.
+	if want := []any{[]time.Time{retryDay, retryDay}}; !reflect.DeepEqual(requeueTx.calls[1].args, want) {
+		t.Errorf("аргументы декремента корзин = %v, want %v", requeueTx.calls[1].args, want)
+	}
 	if len(finalizeTx.calls) != 1 {
-		t.Fatalf("вызовов в транзакции итогового статуса = %d, want 1", len(finalizeTx.calls))
+		t.Fatalf("вызовов в транзакции итогового статуса = %d, want 1 (декремент — в самом операторе)", len(finalizeTx.calls))
 	}
 	if finalizeTx.calls[0].sql != wantRetryFinalize {
 		t.Errorf("SQL итогового статуса:\n%s\nwant:\n%s", finalizeTx.calls[0].sql, wantRetryFinalize)
@@ -648,7 +689,7 @@ func TestRetryOnceSplitTransactions(t *testing.T) {
 			[]any{int16(1), int64(10), int16(0)}, // попыток 0 < 3 → повтор
 			[]any{int16(2), int64(20), int16(3)}, // 3 = N → итоговый статус
 		)},
-		requeues:  []*retryFakeRows{retryRows([]any{int16(1), int64(10)})},
+		requeues:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
 		finalizes: []*retryFakeRows{retryRows([]any{int16(2), int64(20)})},
 	}
 
@@ -661,15 +702,21 @@ func TestRetryOnceSplitTransactions(t *testing.T) {
 	}
 	selTx, requeueTx, finalizeTx := pool.txs[0], pool.txs[1], pool.txs[2]
 
-	// Каждое решение — единственный оператор своей транзакции: смешение
-	// обоих операторов в одной tx и есть инверсия порядка блокировок.
+	// Каждое решение — только свои операторы: смешение обоих решений в
+	// одной tx и есть инверсия порядка блокировок.
 	for _, tx := range []*retryFakeTx{requeueTx, finalizeTx} {
 		if tx.isSelect() {
 			t.Errorf("транзакция решения содержит SELECT кандидатов: %v", tx.calls)
 		}
 	}
-	if len(requeueTx.calls) != 1 || requeueTx.calls[0].sql != retryRequeueSQL {
-		t.Errorf("транзакция повтора = %v, want только retryRequeueSQL", requeueTx.calls)
+	// Половина повтора — перевод и хвостовой декремент корзин (двумя
+	// операторами, T-267: операторы транзакции исполняются в текстовом
+	// порядке — нессылаемые DML-CTE одного оператора PG порядком не
+	// гарантирует).
+	if len(requeueTx.calls) != 2 ||
+		requeueTx.calls[0].sql != retryRequeueSQL ||
+		requeueTx.calls[1].sql != retryRequeueMatureSQL {
+		t.Errorf("транзакция повтора = %v, want retryRequeueSQL + retryRequeueMatureSQL", requeueTx.calls)
 	}
 	if len(finalizeTx.calls) != 1 || finalizeTx.calls[0].sql != retryFinalizeSQL {
 		t.Errorf("транзакция итогового статуса = %v, want только retryFinalizeSQL", finalizeTx.calls)
@@ -774,7 +821,7 @@ func TestRetryOnceAttemptBoundaries(t *testing.T) {
 			pool := &retryFakePool{
 				selects: []*retryFakeRows{retryRows([]any{int16(7), int64(70), tt.attempts})},
 				requeues: []*retryFakeRows{retryRows(
-					[]any{int16(7), int64(70)})},
+					[]any{int16(7), int64(70), retryDay})},
 				finalizes: []*retryFakeRows{retryRows(
 					[]any{int16(7), int64(70)})},
 			}
@@ -788,8 +835,9 @@ func TestRetryOnceAttemptBoundaries(t *testing.T) {
 				if res != (RetryResult{Requeued: 1}) {
 					t.Errorf("итог = %+v, want повтор одной проверки", res)
 				}
-				if len(tx.calls) != 1 || tx.calls[0].sql != wantRetryRequeue {
-					t.Errorf("вызовы = %d, want только назначение повтора", len(tx.calls))
+				if len(tx.calls) != 2 || tx.calls[0].sql != wantRetryRequeue ||
+					tx.calls[1].sql != retryRequeueMatureSQL {
+					t.Errorf("вызовы = %d, want перевод + декремент корзин", len(tx.calls))
 				}
 			} else {
 				if res != (RetryResult{Finalized: 1}) {
@@ -821,7 +869,7 @@ func TestRetryOnceDefaultBatch(t *testing.T) {
 func TestRetryOnceRepeatPasses(t *testing.T) {
 	pool := &retryFakePool{
 		selects:  []*retryFakeRows{retryRows([]any{int16(3), int64(30), int16(0)})},
-		requeues: []*retryFakeRows{retryRows([]any{int16(3), int64(30)})},
+		requeues: []*retryFakeRows{retryRows([]any{int16(3), int64(30), retryDay})},
 	}
 
 	first, err := RetryOnce(context.Background(), pool, RetryOptions{})
@@ -851,7 +899,8 @@ func TestRetryOnceRepeatPasses(t *testing.T) {
 
 // TestRetryOnceGuardedAway — охрана UPDATE отбила всех кандидатов
 // (домены ушли из done мимо прохода): счётчики нулевые, транзакция
-// обновления фиксируется без эффекта.
+// обновления фиксируется без эффекта — пустое множество ключей не
+// открывает хвостовой декремент корзин (T-267).
 func TestRetryOnceGuardedAway(t *testing.T) {
 	pool := &retryFakePool{
 		selects:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
@@ -868,13 +917,16 @@ func TestRetryOnceGuardedAway(t *testing.T) {
 	if !pool.txs[1].committed {
 		t.Error("транзакция обновления не зафиксирована: пустой RETURNING — не ошибка")
 	}
+	if len(pool.txs[1].calls) != 1 || pool.txs[1].calls[0].sql != retryRequeueSQL {
+		t.Errorf("транзакция повтора = %v, want только retryRequeueSQL (декремент — по непустым ключам)", pool.txs[1].calls)
+	}
 }
 
 func TestRetryOnceErrors(t *testing.T) {
 	newPool := func() *retryFakePool {
 		return &retryFakePool{
 			selects:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
-			requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10)})},
+			requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
 		}
 	}
 
@@ -907,6 +959,11 @@ func TestRetryOnceErrors(t *testing.T) {
 			p.requeueErr = errors.New("бд недоступна")
 			return p
 		}(), "назначение повтора"},
+		{"ошибка декремента корзин", func() *retryFakePool {
+			p := newPool()
+			p.matureErr = errors.New("бд недоступна")
+			return p
+		}(), "декремент корзин зрелости"},
 		{"ошибка итога", func() *retryFakePool {
 			// Кандидат с исчерпанными попытками — выполняется ветка
 			// итогового статуса.
@@ -978,6 +1035,38 @@ func TestRetryOnceErrors(t *testing.T) {
 	}
 }
 
+// TestRetryOnceMatureRollback — сбой ВТОРОГО оператора половины
+// повтора (хвостовой декремент корзин, T-267) откатывает половину
+// ЦЕЛИКОМ: перевод и декремент — одна транзакция (ТЗ 3.4), кандидаты
+// остаются кандидатами следующего прохода; контраст с инкрементом
+// записи результата DNS-этапа — там операторы разнесены autocommit'ами,
+// переход переживает сбой инкремента, корзину догоняет реконсиляция.
+func TestRetryOnceMatureRollback(t *testing.T) {
+	pool := &retryFakePool{
+		selects: []*retryFakeRows{retryRows(
+			[]any{int16(1), int64(10), int16(0)}, // повтор — перевод проходит, декремент падает
+		)},
+		requeues:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
+		matureErr: errors.New("бд недоступна"),
+	}
+
+	_, err := RetryOnce(context.Background(), pool, RetryOptions{})
+	if err == nil || !strings.Contains(err.Error(), "декремент корзин зрелости") ||
+		!errors.Is(err, pool.matureErr) {
+		t.Fatalf("ошибка = %v, want «декремент корзин зрелости» и исходная", err)
+	}
+	if len(pool.txs) != 2 {
+		t.Fatalf("транзакций = %d, want 2 (выборка + половина повтора)", len(pool.txs))
+	}
+	half := pool.txs[1]
+	if half.committed || !half.rolledBack {
+		t.Error("половина повтора зафиксирована или не откачена при сбое декремента")
+	}
+	if len(half.calls) != 2 || half.calls[0].sql != retryRequeueSQL || half.calls[1].sql != retryRequeueMatureSQL {
+		t.Errorf("транзакция повтора = %v, want перевод + упавший декремент корзин", half.calls)
+	}
+}
+
 // TestRetryOnceHalfCommittedOnError — сбой второй половины пачки не
 // откатывает зафиксированную первую (раздельные транзакции решений):
 // охраны обоих UPDATE идемпотентны, переведённые первой половиной не
@@ -990,7 +1079,7 @@ func TestRetryOnceHalfCommittedOnError(t *testing.T) {
 			[]any{int16(1), int64(10), int16(0)}, // повтор — фиксируется
 			[]any{int16(2), int64(20), int16(3)}, // итог — Commit падает
 		)},
-		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10)})},
+		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
 		// Выборка и повтор фиксируются, фиксация итога — ошибка.
 		commitErrs: []error{nil, nil, errors.New("бд недоступна")},
 	}
@@ -1064,10 +1153,11 @@ func TestRetryOnceRowsErrors(t *testing.T) {
 		t.Errorf("ошибка rows.Err кандидатов = %v, want «выборка кандидатов» и исходная", err)
 	}
 
-	// Scan ключей RETURNING: вторая строка с одной колонкой вместо двух.
+	// Scan ключей RETURNING: вторая строка с одной колонкой вместо трёх
+	// (перевод возвращает зону, домен и дату эпизода — T-267).
 	keyScanPool := &retryFakePool{
 		selects:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
-		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10)}, []any{int16(2)})},
+		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay}, []any{int16(2)})},
 	}
 	if _, err := RetryOnce(context.Background(), keyScanPool, RetryOptions{}); err == nil ||
 		!strings.Contains(err.Error(), "чтение ключей") {
@@ -1075,7 +1165,7 @@ func TestRetryOnceRowsErrors(t *testing.T) {
 	}
 
 	// rows.Err после чтения ключей RETURNING.
-	keyRows := retryRows([]any{int16(1), int64(10)})
+	keyRows := retryRows([]any{int16(1), int64(10), retryDay})
 	keyRows.err = boom
 	keyPool := &retryFakePool{
 		selects:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
@@ -1159,7 +1249,7 @@ func TestRetryTempErrorsLoop(t *testing.T) {
 		},
 		selectErrs: []error{nil, errors.New("бд недоступна")},
 		requeues: []*retryFakeRows{retryRows(
-			[]any{int16(1), int64(10)},
+			[]any{int16(1), int64(10), retryDay},
 		)},
 	}
 
@@ -1232,8 +1322,8 @@ func TestRetryTempErrorsDrain(t *testing.T) {
 			retryRows(),
 		},
 		requeues: []*retryFakeRows{
-			retryRows([]any{int16(1), int64(10)}),
-			retryRows([]any{int16(2), int64(20)}),
+			retryRows([]any{int16(1), int64(10), retryDay}),
+			retryRows([]any{int16(2), int64(20), retryDay}),
 		},
 	}
 
@@ -1289,8 +1379,8 @@ func TestRetryTempErrorsDrainTotals(t *testing.T) {
 				retryRows([]any{int16(2), int64(20), int16(0)}),
 			},
 			requeues: []*retryFakeRows{
-				retryRows([]any{int16(1), int64(10)}),
-				retryRows([]any{int16(2), int64(20)}),
+				retryRows([]any{int16(1), int64(10), retryDay}),
+				retryRows([]any{int16(2), int64(20), retryDay}),
 			},
 			opts: RetryOptions{BatchSize: 1},
 			want: "requeued=2",
@@ -1363,7 +1453,7 @@ func TestRetryTempErrorsCancelDuringDrain(t *testing.T) {
 	pool := &retryFakePool{
 		selects: []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
 		requeues: []*retryFakeRows{
-			retryRows([]any{int16(1), int64(10)}),
+			retryRows([]any{int16(1), int64(10), retryDay}),
 		},
 		selectErrs: []error{nil, context.Canceled},
 	}
@@ -1414,7 +1504,7 @@ func TestRetryTempErrorsGuardDrainStop(t *testing.T) {
 		// последнее значение — вторым элементом фиксируется 0).
 		guardVals: []int64{1, 0},
 		selects:   []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
-		requeues:  []*retryFakeRows{retryRows([]any{int16(1), int64(10)})},
+		requeues:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
