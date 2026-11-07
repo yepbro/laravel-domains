@@ -126,6 +126,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		MaxAttempts: cfg.Redis.MaxAttempts,
 		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
 		OnBury:      metrics.NewDeadBuriedHook(reg),
+		// OnBuryUnidentified — карантин неидентифицируемых записей
+		// (без task_id): crawler_queue_dead_unidentified_total
+		// (T-260, ФТ-6.1) — терминальная ветка bury.
+		OnBuryUnidentified: metrics.NewDeadUnidentifiedHook(reg),
 	})
 
 	// Гейт backpressure (T-026) для публикации цикла переанализа ниже:

@@ -348,7 +348,7 @@ func TestResilience_ProcessingAckAfterDB(t *testing.T) {
 	// Клейм возвращает зависшую запись (attempts = 2: первая доставка +
 	// клейм), повторная обработка завершает цикл.
 	waitPendingIdle(t, rdb, queue.StreamDNS, group, 1, 30*time.Millisecond)
-	claimed, _, err := reliab.Claim(ctx, queue.StreamDNS, group, "w2", 30*time.Millisecond, 10, "0-0")
+	claimed, _, _, err := reliab.Claim(ctx, queue.StreamDNS, group, "w2", 30*time.Millisecond, 10, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestResilience_WorkerDiesMidBatch(t *testing.T) {
 	// Проход восстановления: XAUTOCLAIM возвращает остаток пачки
 	// (2 из 6 подтверждены выше).
 	waitPendingIdle(t, rdb, queue.StreamHTTP, group, total-2, 30*time.Millisecond)
-	claimed, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 30*time.Millisecond, total, "0-0")
+	claimed, _, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 30*time.Millisecond, total, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -527,7 +527,7 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 		// Клейм предыдущего раунда закрепил записи за «recoverителем»
 		// и сбросил им простой — состаривание ждётся заново.
 		waitPendingIdle(t, rdb, queue.StreamRender, group, total, 20*time.Millisecond)
-		claimed, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0")
+		claimed, _, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0")
 		if err != nil {
 			t.Fatalf("клейм №%d: %v", round+1, err)
 		}
@@ -547,7 +547,7 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 	// Клейм №3: счётчик 4 > MaxAttempts 3 — записи не возвращаются,
 	// а переводятся в q:dead и подтверждаются в исходном стриме.
 	waitPendingIdle(t, rdb, queue.StreamRender, group, total, 20*time.Millisecond)
-	if claimed, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0"); err != nil {
+	if claimed, _, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0"); err != nil {
 		t.Fatalf("клейм №3: %v", err)
 	} else if len(claimed) != 0 {
 		t.Fatalf("клейм №3 вернул работу %+v, хочу перевод в q:dead", claimed)
@@ -598,6 +598,205 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 	}
 	if len(seen) != total {
 		t.Errorf("уникальных task_id в q:dead: %d, хочу %d", len(seen), total)
+	}
+}
+
+// TestResilience_DeadUnidentifiedNoTaskID — терминальная ветка записи
+// без task_id (T-260, ФТ-6.1): до T-260 bury отклонял перенос ошибкой,
+// и запись крутилась в PEL вечным циклом клейма. Запись, опубликованная
+// в рабочий стрим мимо контракта пакета (ручной XADD без task_id),
+// после исчерпания попыток покидает PEL и видна в q:dead с синтетическим
+// идентификатором unknown:<stream>:<entry-id>, без предметных полей.
+func TestResilience_DeadUnidentifiedNoTaskID(t *testing.T) {
+	skipUnlessIntegration(t)
+	rdb := resilienceRedisEnv(t)
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
+	// MaxAttempts — дефолт 3; MinIdle маленький: 5 минут ждать незачем.
+	reliab := queue.NewReliab(rdb, q, queue.ReliabOptions{MinIdle: 20 * time.Millisecond})
+	ctx := context.Background()
+	const group = "resil-unidentified"
+
+	// Запись вне форматов пакета: конверт data есть, task_id нет —
+	// публикуется напрямую XADD (queue.Publish потребовал бы task_id).
+	id, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: queue.StreamHTTP,
+		Values: map[string]any{"data": `{"no_task":"id","zone_id":3}`},
+	}).Result()
+	if err != nil {
+		t.Fatalf("XADD неидентифицируемой записи: %v", err)
+	}
+	batch := consumeTasks(t, q, queue.StreamHTTP, group, "w1", 10)
+	if len(batch) != 1 || batch[0].ID != id {
+		t.Fatalf("потреблено %d записей, хочу 1 (%s)", len(batch), id)
+	}
+
+	// Клеймы №1–№2 возвращают запись в работу (счётчики 2 и 3 —
+	// последняя разрешённая), обработка не выполняется — запись снова
+	// зависает; клейм №3 (счётчик 4 > лимита 3) — терминальная ветка.
+	for round, wantAttempts := range []int64{2, 3} {
+		waitPendingIdle(t, rdb, queue.StreamHTTP, group, 1, 20*time.Millisecond)
+		claimed, _, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 20*time.Millisecond, 10, "0-0")
+		if err != nil {
+			t.Fatalf("клейм №%d: %v", round+1, err)
+		}
+		if len(claimed) != 1 || claimed[0].Attempts != int(wantAttempts) {
+			t.Fatalf("клейм №%d вернул %+v, хочу запись %s с попыткой %d",
+				round+1, claimed, id, wantAttempts)
+		}
+	}
+	waitPendingIdle(t, rdb, queue.StreamHTTP, group, 1, 20*time.Millisecond)
+	if claimed, _, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 20*time.Millisecond, 10, "0-0"); err != nil {
+		t.Fatalf("клейм №3: %v", err)
+	} else if len(claimed) != 0 {
+		t.Fatalf("клейм №3 вернул работу %+v, хочу терминальную ветку", claimed)
+	}
+
+	// Запись покинула PEL (цикл клейма разомкнут) и видна в q:dead.
+	if n := pendingCount(t, rdb, queue.StreamHTTP, group); n != 0 {
+		t.Fatalf("запись без task_id не покинула pending: %d, хочу 0 (ФТ-6.1)", n)
+	}
+	if n := streamLen(t, rdb, queue.StreamDead); n != 1 {
+		t.Fatalf("записей в q:dead: %d, хочу 1", n)
+	}
+	deadMsgs := consumeTasks(t, q, queue.StreamDead, "resil-dead", "operator", 10)
+	if len(deadMsgs) != 1 {
+		t.Fatalf("прочитано из q:dead: %d, хочу 1", len(deadMsgs))
+	}
+	dead, err := queue.Decode[queue.Dead](deadMsgs[0])
+	if err != nil {
+		t.Fatalf("декодирование Dead: %v", err)
+	}
+	if dead.TaskID != "unknown:q:http:"+id {
+		t.Errorf("Dead.task_id = %q, хочу синтетический unknown:q:http:%s", dead.TaskID, id)
+	}
+	if dead.Stream != queue.StreamHTTP || dead.EntryID != id {
+		t.Errorf("Dead.stream/entry_id = %q/%q, хочу %q/%q", dead.Stream, dead.EntryID, queue.StreamHTTP, id)
+	}
+	if dead.Attempts != 4 {
+		t.Errorf("Dead.attempts = %d, хочу 4 (доставка + 3 клейма)", dead.Attempts)
+	}
+	// Предметных полей нет: тело вне форматов пакета, выжимке не доверять
+	// (zone_id исходного тела не переносится).
+	if dead.ZoneID != 0 || dead.DomainID != 0 || dead.Name != "" || dead.Domains != 0 {
+		t.Errorf("Dead неидентифицируемой записи несёт предметные поля: %+v", dead)
+	}
+}
+
+// pendingFlakyRedis — клиент живого Redis с инъекцией сбоя чтения
+// счётчика: первые XPENDING по заданным записям падают (ФТ-6.2 — живой
+// Redis сам XPENDING не роняет). Встраивание *redis.Client продвигает
+// остальные команды (XAUTOCLAIM, XCLAIM через Do) без изменений.
+type pendingFlakyRedis struct {
+	*redis.Client
+	failOnce map[string]int // ID записи → сколько первых XPENDING падают
+}
+
+// XPendingExt — обёртка инъекции: возврат команды с ошибкой до живого
+// вызова (как фейк reliab_test.go).
+func (f *pendingFlakyRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd {
+	if n, ok := f.failOnce[a.Start]; ok && n > 0 {
+		f.failOnce[a.Start] = n - 1
+		cmd := redis.NewXPendingExtCmd(ctx, "xpending")
+		cmd.SetErr(errors.New("инъекция сбоя чтения счётчика (тест ФТ-6.2)"))
+		return cmd
+	}
+	return f.Client.XPendingExt(ctx, a)
+}
+
+// TestResilience_PendingFailureDoesNotBurnAttempts — сбой классификации
+// XPENDING после клейма не сжигает попытку (T-260, ФТ-6.2): клейм
+// XAUTOCLAIM списал счётчик, чтение его XPENDING сбойнуло — Claim
+// отдаёт запись для возврата, RefundUnclassified читает счётчик в
+// момент возврата и откатывает RETRYCOUNT к значению до клейма.
+// Повторный клейм возвращает запись в работу с честным номером попытки,
+// обработка завершает цикл; до T-260 попытка сгорала бесследно (Refund
+// требовал известный счётчик) и запись дожигалась до q:dead.
+func TestResilience_PendingFailureDoesNotBurnAttempts(t *testing.T) {
+	skipUnlessIntegration(t)
+	rdb := resilienceRedisEnv(t)
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
+	ctx := context.Background()
+	const group = "resil-unclassified"
+
+	// Две задачи: классификация A сбойнет один раз (после клейма),
+	// B классифицируется штатно.
+	var ids []string
+	for _, task := range []string{"t-unclass-a", "t-unclass-b"} {
+		id, err := q.Publish(ctx, queue.StreamRender, queue.Result{
+			TaskID: task, ZoneID: 13, DomainID: 777,
+		})
+		if err != nil {
+			t.Fatalf("публикация %s: %v", task, err)
+		}
+		ids = append(ids, id)
+	}
+	batch := consumeTasks(t, q, queue.StreamRender, group, "w1", len(ids))
+	if len(batch) != len(ids) {
+		t.Fatalf("потреблено задач: %d, хочу %d", len(batch), len(ids))
+	}
+	waitPendingIdle(t, rdb, queue.StreamRender, group, len(ids), 30*time.Millisecond)
+
+	// Клейм с инъекцией сбоя: XAUTOCLAIM закрепил обе (счётчики 1→2),
+	// классификация A падает — запись отдаётся вторым результатом для
+	// возврата попытки; B классифицирована (2 ≤ 3) и вернулась в работу.
+	flaky := &pendingFlakyRedis{Client: rdb, failOnce: map[string]int{ids[0]: 1}}
+	reliab := queue.NewReliab(flaky, q, queue.ReliabOptions{MinIdle: 30 * time.Millisecond})
+	claimed, unclassified, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 30*time.Millisecond, 10, "0-0")
+	if err == nil {
+		t.Fatal("Claim со сбойной классификацией: ожидалась ошибка чтения счётчика")
+	}
+	if len(claimed) != 1 || claimed[0].ID != ids[1] {
+		t.Fatalf("валидная часть клейма: %+v, хочу запись %s", claimed, ids[1])
+	}
+	if len(unclassified) != 1 || unclassified[0].ID != ids[0] {
+		t.Fatalf("записи без классификации: %+v, хочу %s", unclassified, ids[0])
+	}
+
+	// B обрабатывается штатно (результат «в БД» → XACK) — классифицирована
+	// и обработана, попытка расходуется доставкой как обычно.
+	if err := queue.Processing(ctx, q, group, claimed[0].Delivery,
+		func(context.Context, queue.Delivery) error { return nil }); err != nil {
+		t.Fatalf("Processing записи %s: %v", ids[1], err)
+	}
+
+	// Возврат попытки A: счётчик прочитан в момент возврата (2 после
+	// клейма) и откачен к 1 — RETRYCOUNT вернулся, попытка не сгорела.
+	if err := reliab.RefundUnclassified(ctx, group, "recover", unclassified); err != nil {
+		t.Fatalf("RefundUnclassified: %v", err)
+	}
+	pending := pendingExt(t, rdb, queue.StreamRender, group)
+	if len(pending) != 1 || pending[0].ID != ids[0] {
+		t.Fatalf("PEL после возврата: %+v, хочу только запись %s (B подтверждена)", pending, ids[0])
+	}
+	if pending[0].RetryCount != 1 {
+		t.Errorf("счётчик A после возврата: %d, хочу 1 (RETRYCOUNT откачен к значению до клейма, ФТ-6.2)", pending[0].RetryCount)
+	}
+
+	// Повторная доставка A: клейм читает счётчик 2 (1 + клейм) — попытки
+	// не сгорели (без возврата было бы 3: следующая доставка — q:dead
+	// без обработки). Обработка завершает цикл.
+	waitPendingIdle(t, rdb, queue.StreamRender, group, 1, 30*time.Millisecond)
+	plain := queue.NewReliab(rdb, q, queue.ReliabOptions{MinIdle: 30 * time.Millisecond})
+	reclaimed, _, _, err := plain.Claim(ctx, queue.StreamRender, group, "recover", 30*time.Millisecond, 10, "0-0")
+	if err != nil {
+		t.Fatalf("повторный клейм A: %v", err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].ID != ids[0] {
+		t.Fatalf("повторный клейм: %+v, хочу запись %s", reclaimed, ids[0])
+	}
+	if reclaimed[0].Attempts != 2 {
+		t.Errorf("попыток A после возврата: %d, хочу 2 (возврат откатил клейм со сбойной классификацией)", reclaimed[0].Attempts)
+	}
+	if err := queue.Processing(ctx, q, group, reclaimed[0].Delivery,
+		func(context.Context, queue.Delivery) error { return nil }); err != nil {
+		t.Fatalf("Processing записи %s: %v", ids[0], err)
+	}
+
+	if n := pendingCount(t, rdb, queue.StreamRender, group); n != 0 {
+		t.Errorf("неподтверждённых в итоге: %d, хочу 0", n)
+	}
+	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
+		t.Errorf("записей в q:dead: %d, хочу 0 (попытки не сгорели, записи обработаны)", n)
 	}
 }
 

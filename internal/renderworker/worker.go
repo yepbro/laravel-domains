@@ -1253,7 +1253,10 @@ func (w *Worker) fbConsuming() bool {
 // q:render-fallback (crawler_queue_depth сборки B — лаг + PEL) +
 // похороненные (crawler_queue_dead_buried_total{queue="q:render-fallback"}
 // — ошибки классов браузера/инфраструктуры на исчерпании
-// redis.max_attempts; шаг 4 приёмки ТЗ §6.2). Счёт — в обработчике, до
+// redis.max_attempts) + неидентифицируемые
+// (crawler_queue_dead_unidentified_total{queue="q:render-fallback"},
+// T-260 — записи без task_id, стационарно ноль; шаг 4 приёмки
+// ТЗ §6.2). Счёт — в обработчике, до
 // XACK уровнем очереди: сбой Ack или повторная доставка дают дубль —
 // допуск единиц at-least-once (как у окна бюджета T-239); ошибочные
 // доставки не считаются вовсе — остаются в PEL до возврата клеймом либо

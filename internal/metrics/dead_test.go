@@ -63,3 +63,39 @@ func TestDeadBuriedHook(t *testing.T) {
 		t.Errorf("после второго хука q:dns = %v, хочу 3", v)
 	}
 }
+
+// TestDeadUnidentifiedHook — хук инкрементит
+// crawler_queue_dead_unidentified_total{queue} по стримам-источникам
+// (T-260, ФТ-6.1); nil reg — nil; событие не пишет ряд соседнего
+// счётчика смертей dead_buried (смерть задачи и карантин
+// неидентифицируемой записи — разные события); повторная сборка делит
+// прибор (идемпотентность T-076).
+func TestDeadUnidentifiedHook(t *testing.T) {
+	if hook := NewDeadUnidentifiedHook(nil); hook != nil {
+		t.Fatalf("nil реестр: хук задан (%T), хочу nil", hook)
+	}
+
+	reg := New("http-worker")
+	hook := NewDeadUnidentifiedHook(reg)
+	hook("q:http")
+	hook("q:render-fallback")
+	hook("q:http")
+
+	for queue, want := range map[string]float64{"q:http": 2, "q:render-fallback": 1} {
+		if v, ok := counterValue(t, reg, "crawler_queue_dead_unidentified_total", queue); !ok || v != want {
+			t.Errorf("crawler_queue_dead_unidentified_total{queue=%q} = (%v, %v), хочу (%v, true)", queue, v, ok, want)
+		}
+	}
+	if _, ok := counterValue(t, reg, "crawler_queue_dead_unidentified_total", "q:dns"); ok {
+		t.Error("серия q:dns без событий не должна существовать")
+	}
+	if _, ok := counterValue(t, reg, "crawler_queue_dead_buried_total", "q:http"); ok {
+		t.Error("карантин неидентифицируемой записи не должен писать dead_buried_total")
+	}
+
+	// Повторная сборка хука — тот же прибор (идемпотентность T-076).
+	NewDeadUnidentifiedHook(reg)("q:http")
+	if v, _ := counterValue(t, reg, "crawler_queue_dead_unidentified_total", "q:http"); v != 3 {
+		t.Errorf("после второго хука q:http = %v, хочу 3", v)
+	}
+}

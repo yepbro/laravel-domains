@@ -165,8 +165,11 @@ SELECT * FROM schema_migrations;   -- version, dirty = false
   пропускная способность этапов dns/http/render/analyze;
 - `crawler_queue_depth{queue}` — глубина очередей `q:*` (backlog групп
   потребления; лаг ограничен длиной стрима — кламп фантома T-168);
-- `crawler_queue_dead_buried_total{queue}` / `crawler_redis_memory_ratio` —
-  смерти задач (переводы в q:dead, T-154) и заполнение `maxmemory` Redis;
+- `crawler_queue_dead_buried_total{queue}` /
+  `crawler_queue_dead_unidentified_total{queue}` /
+  `crawler_redis_memory_ratio` — смерти задач (переводы в q:dead, T-154),
+  карантины неидентифицируемых записей без `task_id` (T-260) и заполнение
+  `maxmemory` Redis;
 - `crawler_backlog_domains{state}` — pending/queued по БД;
 - `crawler_domain_status_total{type}` — статусы доменов;
 - `crawler_laravel_near_findings` — находки Laravel в серой зоне порога
@@ -438,7 +441,8 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # тома
 
 - **`q:dead` не пуст или растёт** (алерт `queue_dead` бьёт на 3 прохода
   устойчивой глубины, T-154: ≈15 мин на дефолтных 5 мин — T-206; темп смертей —
-  `crawler_queue_dead_buried_total`) — разбрать:
+  `crawler_queue_dead_buried_total`, поток неидентифицируемых записей —
+  `crawler_queue_dead_unidentified_total`, T-260) — разбрать:
   [`runbooks.md`](runbooks.md) §2.
 - **Замороженная очередь** (алерт `queue_frozen`, T-162:
   last-delivered-id группы не движется ≥ 15 мин при глубине > 0 —

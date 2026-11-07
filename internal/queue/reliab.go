@@ -254,8 +254,18 @@ type ReliabOptions struct {
 	// Монтируют сервисы (счётчик смертей crawler_queue_dead_buried_total,
 	// metrics.NewDeadBuriedHook): пакет очереди метрик не знает — стиль
 	// queue-метрик кодовой базы (шов-функция, как LenFunc коллектора
-	// глубин T-077). nil — перевод молчалив (как до T-154).
+	// глубин T-077). nil — перевод молчалив (как до T-154). Хук зовётся
+	// только для записей с task_id; неидентифицируемые (без task_id,
+	// терминальная ветка bury, T-260/ФТ-6.1) отмечаются OnBuryUnidentified.
 	OnBury func(stream string)
+	// OnBuryUnidentified — хук завершённого перевода в q:dead записи
+	// без task_id (T-260, ФТ-6.1): Synthetic TaskID unknown:<stream>:
+	// <entry-id>, без предметных полей. Отдельный от OnBury шов: смерть
+	// задачи и карантин неидентифицируемой записи — разные события
+	// (crawler_queue_dead_buried_total считает задачи с task_id,
+	// crawler_queue_dead_unidentified_total — неидентифицируемые записи;
+	// metrics.NewDeadUnidentifiedHook). nil — перевод молчалив.
+	OnBuryUnidentified func(stream string)
 }
 
 // Reliab — возврат зависших записей Redis Streams со счётчиком попыток
@@ -356,37 +366,41 @@ type Claimed struct {
 // в исходном стриме — сообщение покидает pending. Dead публикуется до
 // XACK: сбой XACK оставит запись в pending и даст дубль в q:dead на
 // следующем проходе — поток q:dead редок и разбирается вручную, дубль
-// предпочтительнее потери (ТЗ 3.4).
+// предпочтительнее потери (ТЗ 3.4). Запись без task_id (вне форматов
+// пакета) переводится с синтетическим идентификатором — см. bury.
 //
 // Ошибка XPENDING одной записи не рушит пачку: XAUTOCLAIM уже закрепил
 // записи за потребителем и сбросил им idle — потеря всей пачки на сбое
 // одной проверки означала бы ещё один MinIdle простоя для записей,
 // счётчик которых известен. Ошибки собираются в возврат (errors.Join),
-// валидная часть отдаётся; запись с неизвестным счётчиком остаётся
-// закреплённой и вернётся следующим клеймом после нового MinIdle.
-// Счётчик читается XPENDING EXTENDED по каждой вернувшейся записи
-// (диапазон id..id: XAUTOCLAIM его не возвращает); чтение без побочных
-// эффектов, поэтому безопасно при гонках с другими восстановителями.
+// валидная часть отдаётся; запись с неизвестным счётчиком возвращается
+// вторым результатом (unclassified): попытка её клеймом уже списана,
+// RecoverLoop возвращает её возвратом RefundUnclassified (RETRYCOUNT
+// откат, ФТ-6.2 — окно T-222 расширено с «отмена ctx» на «любая
+// незавершённая классификация»); возврат не состоялся (окно Do
+// недоступно, сбой команд) — запись остаётся закреплённой и вернётся
+// следующим клеймом после нового MinIdle.
 // Отмена ctx после успешного клейма чтения счётчиков не прерывает
-// (WithoutCancel + собственный бюджет, T-222): записи без счётчика
-// невозвратны для Refund.
+// (WithoutCancel + собственный бюджет, T-222): прерывание оставило бы
+// записи без классификации — их возврат потребовал бы повторного
+// чтения счётчика (RefundUnclassified читает сам).
 //
 // Пустой результат без ошибки — зависших записей нет.
-func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, n int, start string) ([]Claimed, string, error) {
+func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, n int, start string) ([]Claimed, []Delivery, string, error) {
 	if !knownStream(stream) {
-		return nil, "", fmt.Errorf("queue: неизвестный стрим %q", stream)
+		return nil, nil, "", fmt.Errorf("queue: неизвестный стрим %q", stream)
 	}
 	if group == "" {
-		return nil, "", fmt.Errorf("queue: не задана группа потребителей стрима %s", stream)
+		return nil, nil, "", fmt.Errorf("queue: не задана группа потребителей стрима %s", stream)
 	}
 	if consumer == "" {
-		return nil, "", fmt.Errorf("queue: не задано имя потребителя группы %s", group)
+		return nil, nil, "", fmt.Errorf("queue: не задано имя потребителя группы %s", group)
 	}
 	if minIdle <= 0 {
 		minIdle = r.opt.MinIdle
 	}
 	if n < 1 {
-		return nil, "", fmt.Errorf("queue: размер пачки клейма %d < 1", n)
+		return nil, nil, "", fmt.Errorf("queue: размер пачки клейма %d < 1", n)
 	}
 	if start == "" {
 		start = "0-0"
@@ -400,7 +414,7 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 		Count:    int64(n),
 	}).Result()
 	if err != nil {
-		return nil, "", fmt.Errorf("queue: claim %s (группа %s): %w", stream, group, err)
+		return nil, nil, "", fmt.Errorf("queue: claim %s (группа %s): %w", stream, group, err)
 	}
 	if next == "" {
 		next = "0-0" // обход PEL завершён — следующий с начала
@@ -408,16 +422,17 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 	// Классификация счётчиков переживает отмену ctx вызывающего (T-222,
 	// P2-2 ревью): XAUTOCLAIM выше уже закрепил записи и списал каждой
 	// попытку — прерывать чтение счётчиков по отмене бессмысленно, а
-	// записи без счётчика RecoverLoop уже не вернёт (Refund не знает их
-	// ID): окно потери до пачки попыток за одну остановку. Поэтому после
-	// успешного клейма чтения идут под отдельным ctx — без отмены
-	// вызывающего (WithoutCancel), с собственным коротким бюджетом;
-	// сам XAUTOCLAIM отмену уважает: не начинать новое изъятие из PEL
-	// после останова.
+	// записи без классификации возвращаются вторым результатом
+	// (unclassified) и требуют повторного чтения счётчика при возврате
+	// попытки (RefundUnclassified, ФТ-6.2). Поэтому после успешного
+	// клейма чтения идут под отдельным ctx — без отмены вызывающего
+	// (WithoutCancel), с собственным коротким бюджетом; сам XAUTOCLAIM
+	// отмену уважает: не начинать новое изъятие из PEL после останова.
 	cctx, cancelClassification := context.WithTimeout(context.WithoutCancel(ctx), classifyTimeout)
 	defer cancelClassification()
 	ctx = cctx
 	out := make([]Claimed, 0, len(msgs))
+	var unclassified []Delivery
 	var errs []error
 	for _, m := range msgs {
 		d := Delivery{Stream: stream, ID: m.ID, Payload: payloadBytes(m.Values)}
@@ -435,6 +450,9 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 		}).Result()
 		if err != nil {
 			errs = append(errs, fmt.Errorf("queue: счётчик доставок записи %s (%s): %w", m.ID, stream, err))
+			// Клейм уже списал попытку — запись возвращается для возврата
+			// её (ФТ-6.2): без этого сбой чтения сжигал попытку бесследно.
+			unclassified = append(unclassified, d)
 			continue
 		}
 		if len(pending) == 0 {
@@ -451,18 +469,18 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 		}
 		out = append(out, Claimed{Delivery: d, Attempts: attempts})
 	}
-	if len(out) == 0 {
+	if len(out) == 0 && len(unclassified) == 0 {
 		// Эквивалентные мутанты (T-M04): `> 0` → `>= 0`/`> -1` неотличимы —
 		// errors.Join() без ошибок возвращает nil, ветка при пустых errs
 		// совпадает с падением в return ниже. `> 1` (numbers/incrementer)
 		// отличим одиночной ошибкой и не гасится.
 		// mutator-disable-next-line expression/comparison, numbers/decrementer
 		if len(errs) > 0 {
-			return nil, next, errors.Join(errs...)
+			return nil, nil, next, errors.Join(errs...)
 		}
-		return nil, next, nil
+		return nil, nil, next, nil
 	}
-	return out, next, errors.Join(errs...)
+	return out, unclassified, next, errors.Join(errs...)
 }
 
 // Параметры возврата попыток необработанным записям (T-222).
@@ -493,7 +511,10 @@ type refundKey struct {
 // закрывает соседний сценарий (недоступный Redis), отмену контекста он
 // не видит. Вызывается из RecoverLoop для необработанного хвоста пачки
 // под отдельным коротким контекстом — контекст цикла к этому моменту
-// уже отменён.
+// уже отменён. Записям, чья классификация не завершилась (сбой чтения
+// XPENDING после клейма, Claim → unclassified), счётчик неизвестен —
+// их возвращает RefundUnclassified (T-260/ФТ-6.2): окно T-222 расширено
+// с «отмена ctx» на «любая незавершённая классификация».
 //
 // Механизм — XCLAIM <stream> <group> <consumer> 0 <ids…> JUSTID
 // RETRYCOUNT <attempts-1> на того же потребителя, за которым записи
@@ -563,6 +584,70 @@ func (r *Reliab) Refund(ctx context.Context, group, consumer string, claimed []C
 	return errors.Join(errs...)
 }
 
+// RefundUnclassified возвращает попытку доставки записям, заклеймленным
+// XAUTOCLAIM, но не получившим классификации — чтение счётчика XPENDING
+// после клейма сбойнуло (T-260, ФТ-6.2; расширение окна T-222 с «отмена
+// ctx» на «любая незавершённая классификация»). До фикса такая попытка
+// сгорала бесследно: счётчик записям RecoverLoop уже не вернёт (Refund
+// требует известный Attempts), а запись молча дожигалась до q:dead
+// повторными клеймами без единого вызова обработчика.
+//
+// Счётчик читается в момент возврата (XPENDING EXTENDED по каждой
+// записи, диапазон id..id — как классификация Claim): попытка клеймом
+// уже списана, чтение без побочных эффектов, поэтому окно между сбоем
+// классификации и возвратом не искажает значение. Запись, покинувшая
+// PEL за это время (подтверждена тем, кто её обрабатывал, или похоронена
+// соседом), возврата не требует — пропускается. Ошибка повторного
+// чтения — в возврате (errors.Join), попытка записи остаётся
+// израсходованной: не хуже поведения до T-260, следующая классификация
+// решит её судьбу. Обработка записей не начиналась вовсе (классификация
+// — до обработки), поэтому возврат правомерен для всей переданной
+// пачки; записи с завершённой классификацией сюда не попадают — их
+// возвращает Refund из необработанного хвоста (T-222).
+//
+// Сам возврат — тот же механизм Refund (XCLAIM JUSTID RETRYCOUNT
+// <счётчик−1> на потребителя клейма): группировка, кламп нуля, окно Do
+// (nil — прозрачный nil, попытки расходованы как до T-222) и инвариант
+// T-153 (возврат гасит ровно свой инкремент — вызывается RecoverLoop
+// немедленно после Claim) — см. Refund.
+func (r *Reliab) RefundUnclassified(ctx context.Context, group, consumer string, ds []Delivery) error {
+	if r.refund == nil || len(ds) == 0 {
+		return nil
+	}
+	if group == "" || consumer == "" {
+		return fmt.Errorf("queue: возврат попыток: не заданы группа (%q) или потребитель (%q)", group, consumer)
+	}
+	// Стрим — боевые константы пакета, как у Claim/Refund: XPENDING по
+	// произвольному имени не отправляем.
+	for _, d := range ds {
+		if !knownStream(d.Stream) {
+			return fmt.Errorf("queue: возврат попыток: неизвестный стрим %q", d.Stream)
+		}
+	}
+	classified := make([]Claimed, 0, len(ds))
+	var errs []error
+	for _, d := range ds {
+		pending, err := r.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: d.Stream,
+			Group:  group,
+			Start:  d.ID,
+			End:    d.ID, // ровно эта запись: счётчик чтения ради, без разбора чужого pending
+			Count:  1,
+		}).Result()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("queue: счётчик доставок записи %s (%s): %w", d.ID, d.Stream, err))
+			continue
+		}
+		if len(pending) == 0 {
+			// Запись покинула PEL между клеймом и возвратом — попытки
+			// больше нет, возвращать нечего.
+			continue
+		}
+		classified = append(classified, Claimed{Delivery: d, Attempts: int(pending[0].RetryCount)})
+	}
+	return errors.Join(append(errs, r.Refund(ctx, group, consumer, classified))...)
+}
+
 // Process — паттерн Processing поверх очереди слоя: клеймнутая Claim
 // запись обрабатывается тем же правилом «результат в БД → XACK» (ТЗ 4.2),
 // что и свежие доставки воркера. RecoverLoop использует для повторов
@@ -590,28 +675,54 @@ func (r *Reliab) ProcessAttempt(ctx context.Context, group string, d Delivery, a
 // исходная запись подтверждена) отмечается хуком OnBury — наблюдаемость
 // смертей (T-154: bury был молчалив, 5507 смертей инцидента 22.10
 // прошли без единого алерта).
+//
+// Запись без task_id (сообщение вне форматов пакета) получает
+// терминальную ветку вместо ошибки (T-260, ФТ-6.1): до фикса bury
+// возвращал ошибку, запись оставалась в PEL и крутилась вечным циклом
+// клейма — каждый проход RecoverLoop клеймил её снова (+1 к счётчику)
+// и упирался в ту же ошибку переноса, XACK не наступал никогда.
+// Теперь Dead публикуется с синтетическим идентификатором
+// unknownTaskID — unknown:<stream>:<entry-id>, без предметных полей
+// (выжимка из тела, не разбирающегося как сообщение стрима, субъект
+// задачи не идентифицирует), исходная запись подтверждается — запись
+// покидает PEL, разбор остаётся ручным (q:dead — карантин). Перевод
+// отмечается отдельным хуком OnBuryUnidentified (счётчик
+// crawler_queue_dead_unidentified_total): смерть задачи и карантин
+// неидентифицируемой записи — разные события. Записи с task_id
+// обрабатываются как раньше.
 func (r *Reliab) bury(ctx context.Context, group string, d Delivery, attempts int) error {
 	taskID := taskIDOf(d.Payload)
-	if taskID == "" {
-		return fmt.Errorf("queue: запись %s стрима %s без task_id — в q:dead не переводится (сообщение вне форматов пакета), разберите вручную", d.ID, d.Stream)
+	unidentified := taskID == ""
+	if unidentified {
+		taskID = unknownTaskID(d.Stream, d.ID)
+	}
+	reason := fmt.Sprintf("исчерпан лимит попыток %d: доставок без подтверждения — %d", r.opt.MaxAttempts, attempts)
+	if unidentified {
+		reason = fmt.Sprintf("запись вне форматов пакета (без task_id), лимит попыток %d: доставок без подтверждения — %d",
+			r.opt.MaxAttempts, attempts)
 	}
 	dead := Dead{
 		TaskID:   taskID,
 		Stream:   d.Stream,
 		EntryID:  d.ID,
 		Attempts: attempts,
-		Reason:   fmt.Sprintf("исчерпан лимит попыток %d: доставок без подтверждения — %d", r.opt.MaxAttempts, attempts),
+		Reason:   reason,
 	}
-	// Идентификаторы предмета (T-105). Выжимка из чужого тела может дать
-	// недопустимые значения (variant вне 0/1, имя длиннее лимита) —
-	// Publish отклонил бы такую запись, XACK не состоялся бы, и задача
-	// с task_id навсегда застряла бы в pending. Тогда переносим базу без
-	// идентификаторов: q:dead — карантин, обязан принять любую задачу
-	// с task_id (база всегда валидна — проверены полями bury/Claim).
-	subject := dead
-	deadSubjectOf(&subject, d.Stream, d.Payload)
-	if subject.validate() == nil {
-		dead = subject
+	// Идентификаторы предмета (T-105) — только идентифицируемым записям:
+	// выжимка из чужого тела может дать недопустимые значения (variant
+	// вне 0/1, имя длиннее лимита) — Publish отклонил бы такую запись,
+	// XACK не состоялся бы, и задача с task_id навсегда застряла бы
+	// в pending. Тогда переносим базу без идентификаторов: q:dead —
+	// карантин, обязан принять любую задачу с task_id (база всегда
+	// валидна — проверены полями bury/Claim). Телу без task_id выжимка
+	// не доверяется вовсе: предмет классифицировать нельзя (ФТ-6.1 —
+	// запись без предметных полей).
+	if !unidentified {
+		subject := dead
+		deadSubjectOf(&subject, d.Stream, d.Payload)
+		if subject.validate() == nil {
+			dead = subject
+		}
 	}
 	if _, err := r.q.Publish(ctx, StreamDead, dead); err != nil {
 		return fmt.Errorf("queue: публикация в q:dead записи %s стрима %s: %w", d.ID, d.Stream, err)
@@ -619,10 +730,27 @@ func (r *Reliab) bury(ctx context.Context, group string, d Delivery, attempts in
 	if err := r.q.Ack(ctx, d.Stream, group, d.ID); err != nil {
 		return fmt.Errorf("queue: подтверждение перенесённой в q:dead записи %s стрима %s: %w", d.ID, d.Stream, err)
 	}
+	if unidentified {
+		if r.opt.OnBuryUnidentified != nil {
+			r.opt.OnBuryUnidentified(d.Stream)
+		}
+		return nil
+	}
 	if r.opt.OnBury != nil {
 		r.opt.OnBury(d.Stream)
 	}
 	return nil
+}
+
+// unknownTaskID — синтетический идентификатор записи q:dead, из которой
+// не извлекается task_id (T-260, ФТ-6.1): unknown:<stream>:<entry-id>.
+// Идентифицирует самую запись (стрим-источник + идентификатор записи),
+// а не задачу: связь с исходной задачей невозможна — тело вне форматов
+// пакета. Префикс unknown отличает синтетику от настоящих task_id
+// (hex NewTaskID) в ручном разборе q:dead; предметные поля записи
+// остаются нулевыми.
+func unknownTaskID(stream, entryID string) string {
+	return "unknown:" + stream + ":" + entryID
 }
 
 // taskIDOf достаёт task_id из тела записи — envelope всех сообщений пакета

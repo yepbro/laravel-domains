@@ -215,7 +215,8 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`; сборка воркера B фолбэка — `q:render-fallback`, T-236/T-240), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`); ряд `queue="q:render-fallback"` — остаток для баланс-чека фолбэка (T-245: `published = consumed + остаток + похороненные` — формула и границы применимости в решениях ниже, шаг 4 приёмки ТЗР рендера §6.2) |
 | `crawler_render_pending_domains` | gauge | — | monitor (T-175) | цикл рендер-долга (`monitor.render_debt_interval`, 5 мин): домены с битом `render_pending` — счётчик `crawler_counters['render_pending']` (миграция 000015) ведут переходы бита в транзакции перехода; авторитетное значение периодически перезаписывает реконсиляция T-178 (наблюдаемость без seq scan по 41,8 млн строк; лаг `q:render` — `crawler_queue_depth{queue="q:render"}`, долг = сумма — алерт `render_debt` и строка отчёта нагрузки T-173) |
-| `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод записи в q:dead (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
+| `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод в q:dead задачи с task_id (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; переводы неидентифицируемых записей (без `task_id`) считает соседний `crawler_queue_dead_unidentified_total`; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
+| `crawler_queue_dead_unidentified_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-260) | карантин неидентифицируемых записей: запись PEL без `task_id` (тело вне форматов пакета) исчерпала попытки и переведена в q:dead с синтетическим `task_id` `unknown:<stream>:<entry-id>`, без предметных полей (`Reliab.bury`, терминальная ветка ФТ-6.1 ТЗ-fsm; хук `ReliabOptions.OnBuryUnidentified` ← `metrics.NewDeadUnidentifiedHook`) — до T-260 такие записи крутились вечным циклом клейма в PEL; стационарно ноль, рост — записи публикуются мимо контракта пакета (ручной XADD, баг писателя): найти источник по `entry_id`, разбор — runbooks.md §2 |
 | `crawler_db_deadlock_retried_total` | counter | — | dns-worker, http-worker, scheduler (T-268) | повторы операторов БД после дедлока 40P01 (`db.RetryDeadlock`, страховка поверх инварианта порядка блокировок счётчиков T-267): http-worker — транзакция записи результата целиком (`RecordAndPublish`), dns-worker — autocommit-операторы записи эпизода (`RecordEpisode`: перевод в done, инкремент корзины `retry_mature`, диагноз invalid) без повторного DNS-эпизода, scheduler — транзакция решения ретрая temp_error (`retryDecide`); дренаж ретрая переживает ошибку пачки (до 3 подряд). Единичные события — норма (страховка работает, задача не уходит в ределивери полным эпизодом); устойчивый рост — новый цикл блокировок: разбор runbooks.md §2.8 |
 | `crawler_redis_memory_ratio` | gauge | — | monitor (T-154) | проход алертов: `used_memory/maxmemory` из `INFO memory` (обёртка источника `monitor.NewRedisMemoryMetrics`); при noeviction — прокси-метрика предстоящих OOM-отказов записи (алерт `redis_memory` при ≥ 0.8); `maxmemory` не задан — ряд не пишется |
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | суммы инкрементальных счётчиков зон (T-178: `sum(zones.domains_pending/queued)`, базовое множество `status <> deleted`) с периодом `scheduler.backlog_interval` (по умолчанию 5 мин) — `scheduler.BacklogLoop`: чтение справочника вместо прохода по 47 млн строк (ТЗИ §8.4) |
@@ -263,12 +264,16 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
   = `increase(crawler_render_fallback_consumed_total)` (воркер B, T-245)
   + `crawler_queue_depth{queue="q:render-fallback"}`
   + `increase(crawler_queue_dead_buried_total{queue="q:render-fallback"})`
-  — последний член: ошибочные доставки (класс браузера/инфраструктуры)
+  + `increase(crawler_queue_dead_unidentified_total{queue="q:render-fallback"})`
+  — предпоследний член: ошибочные доставки (класс браузера/инфраструктуры)
   на исчерпании `redis.max_attempts` bury уходит в q:dead, покидая PEL
-  без потребления (хук OnBury смонтирован и у сборки B). Сверка — по
-  приростам `increase()` на окне: счётчики живут процессом, рестарт
-  воркера A или B обнуляет их независимо (снимок «в лоб» верен только
-  между рестартами); при дренированной очереди (воркер B дорабатывает
+  без потребления (хук OnBury смонтирован и у сборки B); последний —
+  неидентифицируемые записи без task_id (T-260): карантин с синтетическим
+  id покидает PEL так же, стационарно ноль (в q:render-fallback — только
+  при публикации мимо контракта пакета: ручной XADD либо баг писателя).
+  Сверка — по приростам `increase()` на окне: счётчики живут процессом,
+  рестарт воркера A или B обнуляет их независимо (снимок «в лоб» верен
+  только между рестартами); при дренированной очереди (воркер B дорабатывает
   до пуста, ФТ-14) остаток нулевой. Границы применимости: равенство
   держится, пока глубина ниже потолка MAXLEN стрима (~15 000) —
   XADD-обрезка может срезать непрочитанное при отставании воркера B
@@ -998,8 +1003,10 @@ pid+query_start: оператор сообщается один раз при п
   алерта очередей: потребителей у `q:dead` нет, Len читает XLEN;
   обёртка `NewDeadDepthMetrics` заодно зеркалит её в
   `crawler_queue_depth{queue="q:dead"}`. Согласован с подсветкой q:dead
-  дашборда (T-126/T-144: глубина > 0) и счётчиком смертей
-  `crawler_queue_dead_buried_total`: счётчик — темп (rate) смертей,
+  дашборда (T-126/T-144: глубина > 0) и счётчиками смертей
+  `crawler_queue_dead_buried_total` (задачи с task_id) и
+  `crawler_queue_dead_unidentified_total` (неидентифицируемые записи,
+  T-260): счётчики — темп (rate) смертей,
   глубина — сток; эпизод 22.10 (5507 смертей,
   docs/load-measurements.md §11.1) растянулся клеймом на часы — сток
   держит сигнал всё это время, темп виден ретроспективно;

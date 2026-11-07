@@ -449,6 +449,113 @@ func TestRecoverLoopCancelRefundsUnprocessed(t *testing.T) {
 	}
 }
 
+// TestRecoverLoopRefundsUnclassified — сбой классификации одной записи
+// пачки (T-260, ФТ-6.2): клейм XAUTOCLAIM списал попытку, а чтение
+// счётчика XPENDING сбойнуло (transient). RecoverLoop возвращает попытку
+// немедленно тем же проходом (RefundUnclassified: повторное чтение
+// счётчика + XCLAIM JUSTID RETRYCOUNT до клейма), валидная часть пачки
+// обрабатывается как обычно. До T-260 попытка такой записи сгорала
+// бесследно — окно T-222 («отмена ctx») не покрывало незавершённую
+// классификацию.
+func TestRecoverLoopRefundsUnclassified(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}, // классификация сбойна (однократно)
+			{ID: "1-2", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1-1": {{ID: "1-1", RetryCount: 2}}, // счётчик после клейма
+			"1-2": {{ID: "1-2", RetryCount: 2}},
+		},
+		pendFailOnce: map[string]error{
+			"1-1": errors.New("ERR connection refused"), // только классификация
+		},
+	}
+
+	processed, _, stop := runRecoverLoop(t, fake, RecoverOptions{
+		Stream: StreamHTTP, Group: "http", Consumer: "recover-1",
+		Batch: 4, Interval: time.Hour,
+	}, nil)
+	d := waitProcessed(t, processed) // валидная часть пачки — в работу
+	if d.ID != "1-2" {
+		t.Errorf("обработана доставка %s, хочу 1-2 (валидная часть пачки)", d.ID)
+	}
+	stop()
+
+	// Попытка 1-1 возвращена: счётчик после клейма 2, откат к 1 —
+	// одной командой на ту же группу/потребителя.
+	if len(fake.dos) != 1 {
+		t.Fatalf("команд возврата: %d, хочу 1 (запись без классификации)", len(fake.dos))
+	}
+	want := []interface{}{"xclaim", StreamHTTP, "http", "recover-1", int64(0), "1-1", "justid", "retrycount", int64(1)}
+	if got := fake.dos[0]; !reflect.DeepEqual(got, want) {
+		t.Errorf("возврат:\n получил  %v\n хочу     %v", got, want)
+	}
+	// Счётчик 1-1 читался дважды: классификация (сбой) и возврат (успех).
+	reads := 0
+	for _, p := range fake.pends {
+		if p.Start == "1-1" {
+			reads++
+		}
+	}
+	if reads != 2 {
+		t.Errorf("чтений счётчика 1-1: %d, хочу 2 (классификация + возврат)", reads)
+	}
+	// Валидная запись обработана и подтверждена; запись без классификации
+	// попыткой — ничего не уходит в q:dead.
+	if want := []ackCall{{StreamHTTP, "http", []string{"1-2"}}}; !sameAcks(fake.acks, want) {
+		t.Errorf("XACK валидной записи: %+v, хочу %+v", fake.acks, want)
+	}
+	if len(fake.adds) != 0 {
+		t.Errorf("публикаций в q:dead быть не должно: %+v", fake.adds)
+	}
+}
+
+// TestRecoverLoopUnclassifiedOutOfInvariantSkipsRefund — классификация
+// дольше claim_min_idle (инвариант T-153 нарушен): запись без счётчика
+// могла быть переклеймлена соседним воркером за время классификации,
+// и возврат погасил бы чужой инкремент — возврат пропускается, Warn
+// (зеркало TestRecoverLoopCancelOutOfInvariantSkipsRefund для ветки
+// ФТ-6.2). MinIdle наносекунда делает «обгон» детерминированным.
+func TestRecoverLoopUnclassifiedOutOfInvariantSkipsRefund(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1-1": {{ID: "1-1", RetryCount: 2}},
+		},
+		// Классификация сбойна постоянно: возврат не должен случиться
+		// вовсе (охрана инварианта — до чтения счётчика возврата).
+		pendOneErr: map[string]error{"1-1": errors.New("ERR connection refused")},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var buf bytes.Buffer
+	done := make(chan error, 1)
+	r := newTestReliab(fake, ReliabOptions{MinIdle: time.Nanosecond})
+	go func() {
+		done <- RecoverLoop(ctx, r, func(context.Context, Delivery) error { return nil },
+			recoverLogOpts(&buf, time.Hour))
+	}()
+	time.Sleep(50 * time.Millisecond) // клейм и классификация прошли
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RecoverLoop после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RecoverLoop не остановился по отмене ctx")
+	}
+	if len(fake.dos) != 0 {
+		t.Errorf("возврат вне инварианта: %+v, хочу 0 команд (чужой клейм не гасим)", fake.dos)
+	}
+	if !strings.Contains(buf.String(), "классификация дольше claim_min_idle") {
+		t.Errorf("пропуск возврата вне инварианта не записан: %q", buf.String())
+	}
+}
+
 // TestRecoverLoopCancelOutOfInvariantSkipsRefund — обход пачки дольше
 // claim_min_idle (инвариант T-153 нарушен — пачка тарпитов рендера):
 // хвост мог быть переклеймлен RecoverLoop соседнего воркера, и возврат

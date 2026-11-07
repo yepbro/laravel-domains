@@ -657,9 +657,12 @@ SELECT строки (final_url, content_hash)
   Баланс-чек шага 4 приёмки ТЗР §6.2:
   `increase(published) = increase(consumed) + crawler_queue_depth
   {queue="q:render-fallback"} + increase(crawler_queue_dead_buried_total
+  {queue="q:render-fallback"}) + increase(crawler_queue_dead_unidentified_total
   {queue="q:render-fallback"})` (глубина — коллектор сборки B:
   непрочитанный лаг + PEL; похороненные — ошибки классов
-  браузера/инфраструктуры на исчерпании попыток), сверка по приростам
+  браузера/инфраструктуры на исчерпании попыток; неидентифицируемые —
+  записи без task_id, T-260: стационарно ноль, появляются только при
+  публикации мимо контракта пакета), сверка по приростам
   между рестартами, при дренированной очереди остаток нулевой;
   формула и границы применимости — docs/services.md.
 - **Маркер «рендер невозможен» `render_failed_at`** (T-210, миграция

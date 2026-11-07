@@ -134,7 +134,7 @@ func TestRenderFallbackClaim(t *testing.T) {
 	}
 	r := newTestReliab(fake, ReliabOptions{})
 
-	got, next, err := r.Claim(context.Background(), StreamRenderFallback,
+	got, _, next, err := r.Claim(context.Background(), StreamRenderFallback,
 		"render-fallback-worker", "recover-1", time.Minute, 5, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
