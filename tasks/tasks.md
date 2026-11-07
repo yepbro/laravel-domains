@@ -566,7 +566,7 @@ http-worker `RecordAndPublish`, держащий зоны до Commit и жду�
 `retry_mature:today`. Задачи последовательны (общие файлы): сначала
 структурный фикс, затем страховка.
 
-- **T-267** [новая] — P0, dnsworker + scheduler: убрать инкремент
+- **T-267** [в работе] — P0, dnsworker + scheduler: убрать инкремент
   `retry_mature:` из горячего CTE (счётчик и зоны — разные
   операторы). (1) `internal/dnsworker/result.go`: CTE `rm` покидает
   `resultUpdateStatusSQL` — оператор становится строго
