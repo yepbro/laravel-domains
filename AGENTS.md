@@ -98,7 +98,36 @@ fallback'ом, — всё ещё один раунд.
    (инструмента спавна вложенных субагентов нет — не искать). Промпт
    передаёт правила read-only и путь отчёта; финальное сообщение
    остаётся в stdout-файле как резервная копия.
-2. Первый fallback — `kimi` (Kimi Code CLI, модель `kimi-code/k3.1-pro`;
+2. Первый fallback — `cursor-agent` (Cursor CLI, модель `grok-4.7-high`;
+   авторизация/диагностика — `~/.config/opencode/agent-cursor.md`):
+
+   ```bash
+   timeout 1200 cursor-agent -p --output-format text --mode ask \
+     --model grok-4.7-high --trust \
+     "$(cat /tmp/opencode/review/prompt-<slug>.md)" </dev/null \
+     > /tmp/opencode/review/<slug>-cursor.md 2>&1; echo "exit=$?"
+   ```
+
+   Параметры: `-p` — headless-режим с печатью ответа в stdout (без
+   него поднимается TUI); `--mode ask` — read-only на уровне CLI
+   (правки и шелл заблокированы самим режимом — сильнее промпта);
+   `--trust` — снять интерактивный вопрос доверия каталогу, без него
+   headless-запуск зависает; `--model` — модель на один запуск;
+   `</dev/null` держит headless. `-f`/`--yolo` не использовать —
+   они принудительно разрешают команды и противоречат read-only.
+   Как и у kimi, text-вывод может содержать рабочий транскрипт —
+   искать тело отчёта (метки P0–P3), прежде чем считать запуск
+   проваленным.
+3. Второй fallback — `opencode run` с `zai-coding-plan/glm-5.3#max`
+   (та же форма команды, что у основного, другая модель):
+
+   ```bash
+   timeout 1200 opencode run --auto \
+     -m "zai-coding-plan/glm-5.3#max" \
+     --title "review-<slug>" "$(cat /tmp/opencode/review/prompt-<slug>.md)" \
+     > /tmp/opencode/review/<slug>-glm.md 2>&1; echo "exit=$?"
+   ```
+4. Третий fallback — `kimi` (Kimi Code CLI, модель `kimi-code/k3.1-pro`;
    авторизация/диагностика — `~/.config/opencode/agent-kimi.md`):
 
    ```bash
@@ -111,15 +140,6 @@ fallback'ом, — всё ещё один раунд.
    headless. Text-вывод может содержать рабочий транскрипт перед
    телом отчёта — искать тело (находки с метками P0–P3), прежде чем
    считать запуск проваленным.
-3. Второй fallback — `opencode run` с `zai-coding-plan/glm-5.3#max`
-   (та же форма команды, что у основного, другая модель):
-
-   ```bash
-   timeout 1200 opencode run --auto \
-     -m "zai-coding-plan/glm-5.3#max" \
-     --title "review-<slug>" "$(cat /tmp/opencode/review/prompt-<slug>.md)" \
-     > /tmp/opencode/review/<slug>-glm.md 2>&1; echo "exit=$?"
-   ```
 
 Правила ревьюера (единые для всей цепочки; явно дублируются в промпте —
 read-only и формат P0–P3 обязаны быть в тексте промпта):
@@ -302,8 +322,8 @@ T-номера. Ревью — по необходимости, по схеме 
   фиксов массового ревью — `zai-coding-plan/glm-5.3#max` (см.
   «Массовое код-ревью и фиксы»). glm-модели — только через провайдер
   `zai-coding-plan`. Ревью — по «Схеме ревью» (цепочка: `opencode run
-  opencode-go/deepseek-v4.1-flash` → `kimi kimi-code/k3.1-pro` →
-  `opencode run zai-coding-plan/glm-5.3#max`; один раунд).
+  opencode-go/deepseek-v4.1-flash` → `cursor-agent grok-4.7-high` →
+  `opencode run zai-coding-plan/glm-5.3#max` → `kimi kimi-code/k3.1-pro`; один раунд).
 - Этапы в `tasks/tasks.md` выполнять по порядку; внутри этапа — сверху вниз.
 - Следовать структуре, именованию и стилю существующего кода.
 - Задача заблокирована — вернуть статус `[новая]`, добавить под ней строку с причиной, взять следующую.
