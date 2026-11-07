@@ -592,7 +592,7 @@ http-worker `RecordAndPublish`, держащий зоны до Commit и жду�
   (затронуты БД-контракты — основной прогон `make test-integration`
   после вливания).
 
-- **T-268** [новая] — P1, db + dnsworker + httpworker + scheduler:
+- **T-268** [в работе] — P1, db + dnsworker + httpworker + scheduler:
   прикладной ретрай 40P01 в горячих точках (страховка от остаточных
   и будущих циклов; после T-267). Хелпер распознавания SQLSTATE
   40P01 (pgconn.PgError) + обёртка повтора (1–2 попытки, джиттер,
