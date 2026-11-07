@@ -73,6 +73,7 @@ type Metrics struct {
 	cutoff    prometheus.Counter     // crawler_http_dead_host_cutoff_tasks_total (T-164)
 	cutSkip   prometheus.Counter     // crawler_http_dead_host_cutoff_skipped_checks_total (T-164)
 	dbRetried prometheus.Counter     // crawler_db_deadlock_retried_total (T-268)
+	late      prometheus.Counter     // crawler_render_late_republish_total (T-259)
 }
 
 // NewMetrics регистрирует приборы HTTP-этапа в реестре reg (каррированные
@@ -138,6 +139,10 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		// Счётчик 40P01-повторов транзакции записи (T-268): единые
 		// имя/HELP для всех сервисов — конструктор internal/metrics.
 		dbRetried: metrics.NewDBDeadlockRetried(reg),
+		late: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_render_late_republish_total",
+			Help: "Переиздания q:render поздним переиздателем (T-259, ТЗ-fsm ФТ-5.3): «вечно молодые» записи (rendered = false, final_url не пуст, без маркера render_failed_at) старше 6 ч без бита render_pending и без непотреблённых сообщений q:render/q:render-fallback — потерянные MAXLEN-усечением и сбоями публикации задачи; стационарно не растёт, рост после инцидента — дренаж потерь, спад до нуля — дренаж завершён.",
+		}).WithLabelValues(),
 	}
 }
 
@@ -239,4 +244,15 @@ func (m *Metrics) DBDeadlockRetried(attempt int) {
 		return
 	}
 	m.dbRetried.Inc()
+}
+
+// LateRepublished — поздний переиздатель опубликовал n переизданий
+// q:render (T-259, ФТ-5.3): +n к crawler_render_late_republish_total;
+// вызывается проходом LateOnce по факту публикации (Full/ошибка не
+// считаются — издания не было).
+func (m *Metrics) LateRepublished(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.late.Add(float64(n))
 }

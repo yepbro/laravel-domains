@@ -472,7 +472,13 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # тома
   завести второй воркер B по образцу render-worker@ (deploy.md §2.2);
   растущий поток публикаций при здоровом B — сигнал деградации
   основного движка (смотреть `render_fallback_budget` и причины
-  финализаций `crawler_render_task_finalized_total{reason}`).
+  финализаций `crawler_render_task_finalized_total{reason}`);
+  записи, потерянные обрезкой MAXLEN недоставленным, возвращает
+  поздний переиздатель T-259 (http-worker, раз в минуту): его метрика
+  `crawler_render_late_republish_total` после инцидента растёт
+  (дренаж потерь) и спадает до нуля — зависшая ненулевая при пустой
+  `q:render` — повод смотреть журнал http-worker (render.md
+  §«Поздний переиздатель»).
 - **Бюджет доли фолбэка превышен** (алерт `render_fallback_budget`,
   T-246: событие приостановки `crawler_render_fallback_suspended_total
   {reason="budget"}` — доля публикаций за окно бюджета ушла за потолок

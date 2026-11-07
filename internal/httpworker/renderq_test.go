@@ -586,6 +586,8 @@ func (r *renderqRows) Scan(dest ...any) error {
 			*dst = v.(int64)
 		case *string:
 			*dst = v.(string)
+		case *bool:
+			*dst = v.(bool)
 		case *[]byte:
 			if v == nil {
 				*dst = nil

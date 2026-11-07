@@ -334,6 +334,24 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		})
 	}()
 
+	// Поздний переиздатель рендера (T-259, ТЗ-fsm §3 ФТ-5.3): фоновый
+	// проход переиздаёт в q:render «вечно молодые» записи (не
+	// отрендеренные, без маркера, с целью рендера) старше 6 ч — без бита
+	// render_pending у домена (долгом владеет проход доработки выше) и
+	// без непотреблённых сообщений q:render/q:render-fallback (интерлок
+	// снимком стримов — адаптер retentionPending, тот же, что у защиты
+	// retention). Лечит потерю MAXLEN-усечённых фолбэк-задач и
+	// потерянные публикации: состояние записи перестаёт зависеть от
+	// выживания сообщения в стриме. Курсор по PK, пачка/интервал —
+	// опции цикла; наблюдаемость —
+	// crawler_render_late_republish_total (httpworker.Metrics).
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		_ = httpworker.RenderLateLoop(ctx, pool, store, renderQ,
+			retentionPending{rdb: rdb}, met, httpworker.LateOptions{Log: logger})
+	}()
+
 	// Retention контента и трим jsonb не-находок (T-166, ТЗ 5.7: контент
 	// хранится, пока нужно переприменять правила; решение оператора
 	// 2026-10-23 — диск без новых мощностей): записи старше
