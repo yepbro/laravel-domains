@@ -20,7 +20,9 @@
 //
 // Условия возврата: check_state = queued И queued_at старше now() − lease.
 // NULL queued_at сравнением отсеивается: queued без отметки времени —
-// нарушенный инвариант T-028, переводить его по возрасту бессмысленно.
+// нарушенный инвариант T-028, переводить его по возрасту бессмысленно;
+// такие строки возвращает терминальная страховка ФТ-1.2 — ремонтный
+// проход того же цикла LeaseWatch (leasenull.go, T-255).
 // Статус deleted исключается (ТЗ 13.1, как в перепроверке T-030):
 // удалённый домен выпадает из цикла проверок целиком — диспетчер его не
 // выбирает (охрана T-027), возвращать его в pending значило бы накапливать
@@ -79,6 +81,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"crawler/internal/db"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 )
 
@@ -208,6 +211,12 @@ type LeaseOptions struct {
 	// (slog.DiscardHandler). LeaseOnce не логирует — итог возвращается
 	// LeaseResult.
 	Log *slog.Logger
+	// Metrics — реестр Prometheus сервиса (T-255, ФТ-1.2): счётчик
+	// ремонтного прохода crawler_scheduler_lease_null_returned_total
+	// (leasenull.go — страховка queued/NULL queued_at); nil — без метрик
+	// (изолированные сборки/тесты). На параметры основного прохода
+	// не влияет.
+	Metrics *metrics.Registry
 }
 
 // withDefaults заменяет неположительные значения дефолтами (Now
@@ -418,7 +427,9 @@ func leaseTranslate(ctx context.Context, tx pgx.Tx, o LeaseOptions, batch []leas
 // прерывает только текущий дренаж: логируется Warn, цикл живёт (контракт
 // OnRun, T-012), очередной дренаж продолжит — переведённое не
 // возвращается дважды. Отмена ctx — чистый выход с nil (graceful
-// shutdown, ТЗ 3.4).
+// shutdown, ТЗ 3.4). Тем же тиком цикла выполняется ремонтный проход
+// страховки queued/NULL queued_at (LeaseNullOnce, ФТ-1.2/T-255 —
+// leasenull.go): дренаж основного множества, затем страховка.
 //
 // Курсор дренажа — состояние цикла, переживающее пачки и дренажи (T-200,
 // стиль retentionCursor T-185): мёртвый префикс lease-индекса читается
@@ -483,7 +494,42 @@ func LeaseWatch(ctx context.Context, pool LeaseDB, opts LeaseOptions) error {
 		}
 	}
 
+	// drainNull — ремонтный проход страховки (ФТ-1.2, leasenull.go):
+	// пачки LeaseNullOnce повторяются, пока выборка проходит целиком
+	// (LIMIT заполнен — за ней ещё есть); неполная пачка — множество
+	// исчерпано. Итог > 0 — Warn: стационарно страховка пуста (инвариант
+	// И1 держат все писатели), каждое событие видимо оператору и счётчиком
+	// crawler_scheduler_lease_null_returned_total (runbooks §2.9). Ошибка
+	// пачки прерывает только проход: очередной тик повторит (контракт
+	// OnRun, T-012).
+	drainNull := func() {
+		var total int64
+		for {
+			res, err := LeaseNullOnce(ctx, pool, o)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Warn("ремонтный проход queued без queued_at",
+						"err", err, "returned", total)
+				}
+				return
+			}
+			total += res.Domains
+			if res.Selected < o.BatchSize {
+				if total > 0 {
+					log.Warn("ремонтный проход: строки queued без queued_at возвращены в pending",
+						"domains", total)
+				}
+				return
+			}
+		}
+	}
+
 	drain()
+	// Ремонтный проход страховки (T-255, ФТ-1.2) — тем же тиком цикла:
+	// строки queued с NULL queued_at (нарушенный инвариант И1,
+	// checkstate.go) возвращаются в pending; стационарно множество пусто —
+	// проход стоит одну выборку по NULL-диапазону lease-индекса.
+	drainNull()
 	ticker := time.NewTicker(o.Interval)
 	defer ticker.Stop()
 	for {
@@ -492,6 +538,7 @@ func LeaseWatch(ctx context.Context, pool LeaseDB, opts LeaseOptions) error {
 			return nil
 		case <-ticker.C:
 			drain()
+			drainNull()
 		}
 	}
 }

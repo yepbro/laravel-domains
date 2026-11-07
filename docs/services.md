@@ -219,6 +219,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_redis_memory_ratio` | gauge | — | monitor (T-154) | проход алертов: `used_memory/maxmemory` из `INFO memory` (обёртка источника `monitor.NewRedisMemoryMetrics`); при noeviction — прокси-метрика предстоящих OOM-отказов записи (алерт `redis_memory` при ≥ 0.8); `maxmemory` не задан — ряд не пишется |
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | суммы инкрементальных счётчиков зон (T-178: `sum(zones.domains_pending/queued)`, базовое множество `status <> deleted`) с периодом `scheduler.backlog_interval` (по умолчанию 5 мин) — `scheduler.BacklogLoop`: чтение справочника вместо прохода по 47 млн строк (ТЗИ §8.4) |
 | `crawler_backlog_pass_seconds` / `crawler_backlog_skipped_ticks_total` | histogram / counter | — | scheduler (T-161) | каждый проход backlog: длительность (проход — суммы справочника, T-178) и пропущенные тики single-flight (проход дольше интервала — накопившийся тик не запускает новый проход, Warn в журнале); рост пропусков — поднимать `scheduler.backlog_interval` |
+| `crawler_scheduler_lease_null_returned_total` | counter | — | scheduler (T-255) | терминальная страховка инварианта T-028 «queued ⇒ queued_at NOT NULL»: ремонтный проход цикла LeaseWatch (`LeaseNullOnce`, ФТ-1.2) вернул строки `check_state=queued` с NULL `queued_at` в pending (без страховки — вечное зависание: NULL отсеивается сравнением возраста lease-прохода; спецификация автомата — `internal/scheduler/checkstate.go`). Каждое событие — одна возвращённая строка; стационарно ноль, ненулевой темп роста — ручной SQL или баг писателя, ставящего queued без отметки: разбор runbooks.md §2.9 |
 | `crawler_counters_recount_seconds` / `crawler_zonestats_skipped_ticks_total` | histogram / counter | — | monitor (T-161/T-178) | каждый проход совмещённой реконсиляции счётчиков (агрегаты domains/laravel_domains/laravel_history → zones + crawler_counters): длительность (корзины 0.5с…~8.5 мин — замер §12: десятки секунд на 47 млн строк) и пропущенные тики single-flight; `crawler_counters_recount_seconds` — переименование `crawler_zonestats_pass_seconds` (T-178) |
 | `crawler_counters_drift` | gauge | `counter` | monitor (T-178) | дрейф инкрементальных счётчиков на проходе реконсиляции: \|старое − новое\| по позициям `zone:<id>:<колонка>` / `global:<имя>` / `daily:checks` (статусные строки вне дрейфа — пишутся одной реконсиляцией); стационар стремится к нулю (проход — три оператора под READ COMMITTED, единичный транзиентный дрейф под нагрузкой нормален), устойчивый ненулевой — пропущенный переход или ручной SQL мимо кода (Warn в журнале, разбор — `docs/runbooks.md`); исключения — потоковые позиции: `daily:checks`/`daily:temp_error` (T-179/T-182: события записи результата HTTP против доменов дня всех веток конвейера), `retry_mature:past`/`retry_mature:today` (T-202: события temp_error-эпизодов/ретраев против живых доменов фильтра зрелости), `rendered:prev`/`rendered:cur`/`results:prev`/`results:cur` (T-203: события вставки строк/перевода в rendered против живых строк окна темпа; prev/cur — предыдущий и текущий календарный час) и `reanalyze:prev`/`reanalyze:cur` (T-204: события записи/рендера/штампа против живых NULL-строк окна — корзины хвостов переанализа) — ненулевые под живой нагрузкой, наблюдаются gauge, в Warn не входят |
 | `crawler_pg_slow_queries` | gauge | — | monitor (T-177) | проход цикла медленных запросов: клиентские операторы PostgreSQL, выполняемые дольше `monitor.slow_query_min_duration` на момент снимка `pg_stat_activity` (собственные агрегаты monitor исключены `application_name`); hold-last при сбое источника |
@@ -368,7 +369,15 @@ T-109) и повторных проверок `temp_error`
 живёт в состоянии цикла и переживает пачки и дренажи — мёртвый префикс
 lease-индекса между вакуумами читается один раз за жизнь процесса, а не
 каждой пачкой каждого дренажа; рестарт сбрасывает курсор — стартовый
-полный дренаж сохраняется). Рядом
+полный дренаж сохраняется). Тем же тиком цикла — терминальная страховка
+инварианта T-028 (T-255, ФТ-1.2): ремонтный проход `LeaseNullOnce`
+возвращает пачками строки `queued` с NULL `queued_at` (нарушенный
+инвариант — вечное зависание вне основного lease-прохода; спецификация
+автомата `check_state` — `internal/scheduler/checkstate.go`) тем же
+guard-оператором по `domains_lease_idx` (`queued_at IS NULL` — поисковое
+условие на ведущей колонке), счётчик
+`crawler_scheduler_lease_null_returned_total` и Warn — сигнал оператору
+(runbooks §2.9). Рядом
 с ними — коллектор глубины backlog
 `BacklogLoop` (T-077): gauge `crawler_backlog_domains{pending|queued}`
 суммами инкрементальных счётчиков зон (T-178: справочник вместо
@@ -382,7 +391,10 @@ lease-индекса между вакуумами читается один р�
 `domains_pending`/`domains_queued`/`domains_checked` CTE оператора
 перехода (T-178; возврат lease — в транзакции прохода T-200): переход и
 дельта атомарны, точность восстанавливает
-реконсиляция monitor.
+реконсиляция monitor. Спецификация автомата `check_state` (таблица
+«состояние × событие × охраны × цель × побочные действия» для всех
+писателей колонки — планировщик, воркеры, ingest, crawlerctl) —
+`internal/scheduler/checkstate.go` (T-255).
 
 `dns-worker` (этап 3, T-036…T-039): его `OnRun` выполняет
 цикл `dnsworker.Run` (`internal/dnsworker/result.go`):

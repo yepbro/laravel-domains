@@ -105,6 +105,9 @@ import (
 // T-039); now() — время транзакции сервера БД: checked_at строк и
 // last_checked_at домена — один момент (transaction_timestamp стабилен
 // внутри транзакции).
+//
+// Переход check_state здесь — строка Р4 спецификации автомата (единая
+// точка правды: internal/scheduler/checkstate.go, T-255).
 var (
 	// recordDomainSQL — итоговый статус эпизода HTTP (alive/no_http/
 	// temp_error, §7), done, сброс lease и счётчика повторов (контракт

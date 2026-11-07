@@ -17,7 +17,11 @@ import (
 	"crawler/internal/model"
 )
 
-// applyDeleteSQL — применение delete одним оператором (ТЗ 5.1):
+// applyDeleteSQL — применение delete одним оператором (ТЗ 5.1). В терминах
+// автомата check_state — строка Р14 спецификации (единая точка правды:
+// internal/scheduler/checkstate.go, T-255): статус-переход в deleted,
+// check_state НЕ меняется — строка выпадает из всех проходов охранными
+// предикатами status <> deleted. Детали оператора:
 //
 //   - CTE pre — снимок кандидатов перевода ДО изменения (тот же снимок
 //     оператора, что и у moved): staging×domains по ключу (zone_id,

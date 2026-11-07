@@ -141,6 +141,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		bg <- scheduler.LeaseWatch(ctx, pool, scheduler.LeaseOptions{
 			Timeout: cfg.Scheduler.Lease.D(),
 			Log:     logger,
+			// Счётчик ремонтного прохода queued/NULL queued_at (T-255,
+			// ФТ-1.2): ненулевой стационар — сигнал оператору.
+			Metrics: reg,
 		})
 	}()
 	go func() {

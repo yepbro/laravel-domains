@@ -245,6 +245,8 @@ const subdomainDisableSQL = "UPDATE subdomains SET enabled = false WHERE id = $1
 // ORDER BY по ключу PK — детерминированные пачки, охрана
 // check_state/status и в подзапросе, и во внешнем WHERE (гонка с
 // delete-файлом T-019 и вторым проходом не переведёт изменившуюся строку).
+// Переход check_state — строка Р12 спецификации автомата (единая точка
+// правды: internal/scheduler/checkstate.go, T-255).
 // Отличия от суточной перепроверки: нет порога возраста last_checked_at
 // (перепроверить надо все готовые домены зоны, а не созревшие) и есть
 // фильтр зоны. Коды check_state/status — параметры, как в T-030.

@@ -253,6 +253,7 @@ T-096): это не индекс «под будущую выборку», а п
 |---|---|---|
 | выборка pending (T-027) | `check_state = 0`, не deleted, ORDER BY `(zone_id, id)` | `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0` |
 | возврат lease (T-029) | `check_state = 1`, не deleted, `queued_at < now() − lease`, ORDER BY `(queued_at, zone_id, id)` | `domains_lease_idx` (`queued_at, zone_id, id`) `WHERE check_state = 1` |
+| страховка queued/NULL queued_at (T-255, ФТ-1.2) | `check_state = 1`, не deleted, `queued_at IS NULL`, ORDER BY `(queued_at, zone_id, id)` | `domains_lease_idx` — тот же: `IS NULL` — поисковое условие на ведущей колонке ключа (NULL-записи компактным диапазоном), форма основного lease-запроса не меняется |
 | перепроверка (T-030) | `check_state = 2`, не deleted, не invalid, `last_checked_at < now() − interval`, ORDER BY `(last_checked_at, zone_id, id)` | `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` |
 | очистка deleted (T-020) | `status = deleted`, есть `subdomain_results`, ORDER BY `(zone_id, id)` | `domains_deleted_idx` (`zone_id, id`) `WHERE status = 6` (T-170) |
 | повтор temp_error (T-031) | `status = temp_error AND check_state = 2`, `last_checked_at < now() − retry_after` | **нет** — см. ниже |

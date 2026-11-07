@@ -101,7 +101,9 @@ const recheckLookupSQL = "SELECT n.ord, " +
 // оператором по ключам PK (unnest — стиль enqueueUpdate T-028):
 // check_state = pending и queued_at = NULL — как у суточной
 // перепроверки (T-030): у pending нет lease, его заведёт постановка
-// в очередь. Охрана d.status <> deleted перепроверяет статус на момент
+// в очередь. Переход check_state — строка Р11 спецификации автомата
+// (единая точка правды: internal/scheduler/checkstate.go, T-255).
+// Охрана d.status <> deleted перепроверяет статус на момент
 // блокировки строки — гонка с delete-файлом (T-019) не переведёт
 // удаляемый домен; RETURNING — ключи фактически переведённых строк
 // (пропущенные raced в deleted и попадают в отказ).

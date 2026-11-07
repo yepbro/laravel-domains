@@ -50,10 +50,19 @@ type leaseBatch struct {
 	translated int64
 }
 
+// leaseNullBatch — заготовка ремонтного прохода (leasenull.go): пачка
+// SELECT (ключи queued/NULL строк) и итог перевода.
+type leaseNullBatch struct {
+	rows       []leaseNullRow
+	translated int64
+}
+
 // leaseFakePool — LeaseDB без БД: очередь пачек SELECT (кончилась —
 // пустая пачка), ошибки по шагам прохода, протокол вызовов и порядок
 // операций транзакции. Всё под замком: цикл LeaseWatch работает в
-// горутине, тест ожидает прогресс по счётчикам.
+// горутине, тест ожидает прогресс по счётчикам. Ремонтный проход
+// страховки (ФТ-1.2) — те же поля с префиксом null: счётчики основного
+// прохода тесты проверяют отдельно.
 type leaseFakePool struct {
 	mu         sync.Mutex
 	batches    []leaseBatch // FIFO пачек SELECT
@@ -61,6 +70,12 @@ type leaseFakePool struct {
 	updateErrs []error      // FIFO ошибок UPDATE (nil — без ошибки)
 	beginErr   error
 	commitErrs []error // FIFO ошибок Commit (кончилась — фиксация без ошибки)
+
+	nullBatches     []leaseNullBatch // FIFO пачек страховки
+	nullSelectErrs  []error
+	nullUpdateErrs  []error
+	nullSelectCalls []leaseCall
+	nullUpdateCalls []leaseCall
 
 	ops         []string    // порядок операций: begin/select/update/commit
 	begins      int         // транзакций открыто
@@ -115,6 +130,17 @@ func (p *leaseFakePool) nextBatchLocked() leaseBatch {
 	return b
 }
 
+// nextNullBatchLocked — следующая пачка страховки FIFO (кончилась —
+// пустая).
+func (p *leaseFakePool) nextNullBatchLocked() leaseNullBatch {
+	if len(p.nullBatches) == 0 {
+		return leaseNullBatch{}
+	}
+	b := p.nullBatches[0]
+	p.nullBatches = p.nullBatches[1:]
+	return b
+}
+
 // stats — снимок счётчиков под замком (ожидание прогресса цикла).
 func (p *leaseFakePool) stats() (begins, selects, updates, commits int) {
 	p.mu.Lock()
@@ -143,14 +169,30 @@ func (p *leaseFakePool) updateSnapshot() []leaseCall {
 	return append([]leaseCall(nil), p.updateCalls...)
 }
 
+// nullSelectSnapshot — снимок протокола SELECT страховки под замком.
+func (p *leaseFakePool) nullSelectSnapshot() []leaseCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]leaseCall(nil), p.nullSelectCalls...)
+}
+
+// nullUpdateSnapshot — снимок протокола UPDATE страховки под замком.
+func (p *leaseFakePool) nullUpdateSnapshot() []leaseCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]leaseCall(nil), p.nullUpdateCalls...)
+}
+
 // leaseFakeTx — транзакция фейкового пула: SELECT пачки и UPDATE перевода
 // (оба обязаны идти в ней — пул напрямую операторов не принимает), помнит
-// пачку этого SELECT: UPDATE обязан пробивать ровно её ключи.
+// пачку этого SELECT: UPDATE обязан пробивать ровно её ключи. Операторы
+// ремонтного прохода страховки (ФТ-1.2) — той же транзакцией.
 type leaseFakeTx struct {
 	pgx.Tx // остальные методы pgx.Tx проход не использует
 
 	pool      *leaseFakePool
 	batch     leaseBatch // пачка SELECT этой транзакции
+	nullBatch leaseNullBatch
 	committed bool
 }
 
@@ -171,6 +213,47 @@ func (t *leaseFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		rows := make([][]any, len(t.batch.rows))
 		for i, r := range t.batch.rows {
 			rows[i] = []any{r.zone, r.id, r.queuedAt}
+		}
+		return retryRows(rows...), nil
+	case leaseNullSelectSQL:
+		t.pool.nullSelectCalls = append(t.pool.nullSelectCalls, leaseCall{sql: sql, args: args})
+		if err, ok := nextErrLocked(&t.pool.nullSelectErrs); ok && err != nil {
+			return nil, err
+		}
+		t.nullBatch = t.pool.nextNullBatchLocked()
+		t.pool.ops = append(t.pool.ops, "null_select")
+		rows := make([][]any, len(t.nullBatch.rows))
+		for i, r := range t.nullBatch.rows {
+			rows[i] = []any{r.zone, r.id}
+		}
+		return retryRows(rows...), nil
+	case leaseNullUpdateSQL:
+		t.pool.nullUpdateCalls = append(t.pool.nullUpdateCalls, leaseCall{sql: sql, args: args})
+		if err, ok := nextErrLocked(&t.pool.nullUpdateErrs); ok && err != nil {
+			return nil, err
+		}
+		if len(args) != 3 {
+			return nil, fmt.Errorf("leaseFakeTx: перевод страховки: параметров %d, нужно 3", len(args))
+		}
+		zones, okZ := args[1].([]int16)
+		ids, okI := args[2].([]int64)
+		if !okZ || !okI {
+			return nil, fmt.Errorf("leaseFakeTx: перевод страховки: ключи %T/%T, нужно []int16/[]int64", args[1], args[2])
+		}
+		if len(zones) != len(t.nullBatch.rows) || len(ids) != len(t.nullBatch.rows) {
+			return nil, fmt.Errorf("leaseFakeTx: перевод страховки: ключей %d, выбрано %d — пробивать обязано пачку",
+				len(zones), len(t.nullBatch.rows))
+		}
+		for i, r := range t.nullBatch.rows {
+			if zones[i] != r.zone || ids[i] != r.id {
+				return nil, fmt.Errorf("leaseFakeTx: перевод страховки: ключ %d = (%d,%d), выбран (%d,%d)",
+					i, zones[i], ids[i], r.zone, r.id)
+			}
+		}
+		t.pool.ops = append(t.pool.ops, "null_update")
+		rows := make([][]any, t.nullBatch.translated)
+		for i := range rows {
+			rows[i] = []any{int16(1)} // zone_id: значение для счёта строк не важно
 		}
 		return retryRows(rows...), nil
 	case leaseUpdateSQL:
