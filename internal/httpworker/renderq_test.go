@@ -1007,7 +1007,7 @@ func renderqRecorder(t *testing.T, pool *renderqRecPool, q *renderqQueue, ln *re
 	if err != nil {
 		t.Fatalf("NewRenderQueue: %v", err)
 	}
-	r, err := NewRenderRecorder(pool, q, rq, nil)
+	r, err := NewRenderRecorder(pool, q, rq, nil, nil)
 	if err != nil {
 		t.Fatalf("NewRenderRecorder: %v", err)
 	}
@@ -1320,7 +1320,7 @@ func TestRecorderWithoutRender(t *testing.T) {
 	q := &renderqQueue{j: pool.j}
 	res, _, _ := renderqResult()
 
-	r, err := NewRecorder(pool, q, nil)
+	r, err := NewRecorder(pool, q, nil, nil)
 	if err != nil {
 		t.Fatalf("NewRecorder: %v", err)
 	}

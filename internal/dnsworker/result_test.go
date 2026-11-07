@@ -1,12 +1,12 @@
 // Юнит-тесты записи результата DNS-эпизода и цикла dns-worker (T-039;
 // ТЗ 5.4 пп. 4–5, §7, 3.4; инкремент корзины retry_mature отдельным
-// оператором после записи — T-267) на фейковых пуле, очереди и
-// резолвере — без БД, Redis и сети. Решение статусов (DecideEpisode),
-// точные SQL-тексты и параметры записи, порядок «публикация q:http →
-// запись done», ветка wildcard, ошибки/отмена, идемпотентный повтор
-// пачки (фильтр актуальности) и smoke цикла Run (чтение → эпизоды →
-// XACK). Поведение против живых Redis/PostgreSQL/unbound —
-// интеграционные тесты (T-032, T-040).
+// оператором после записи — T-267; ретрай 40P01 точек записи — T-268) на
+// фейковых пуле, очереди и резолвере — без БД, Redis и сети. Решение
+// статусов (DecideEpisode), точные SQL-тексты и параметры записи, порядок
+// «публикация q:http → запись done», ветка wildcard, ошибки/отмена,
+// идемпотентный повтор пачки (фильтр актуальности) и smoke цикла Run
+// (чтение → эпизоды → XACK). Поведение против живых Redis/PostgreSQL/
+// unbound — интеграционные тесты (T-032, T-040).
 package dnsworker
 
 import (
@@ -29,6 +29,7 @@ import (
 
 	"crawler/internal/db"
 	"crawler/internal/dnsclient"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 	"crawler/internal/queue"
 )
@@ -937,7 +938,7 @@ func TestResultRecordEpisode(t *testing.T) {
 		j := &resultJournal{}
 		pool := &resultFakePool{j: j}
 		res := EpisodeResult{SetStatus: true, Status: model.StatusNotDelegated, Mask: mustMask(t, 1)}
-		recorded, err := RecordEpisode(context.Background(), pool, 7, 42, res)
+		recorded, err := RecordEpisode(context.Background(), pool, 7, 42, res, nil)
 		if err != nil || !recorded {
 			t.Fatalf("RecordEpisode = (%v, %v), want (true, nil)", recorded, err)
 		}
@@ -958,7 +959,7 @@ func TestResultRecordEpisode(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}}
 		res := EpisodeResult{Mask: mustMask(t, 0, 1),
 			HTTPSubdomains: []queue.HTTPSubdomain{{SubdomainID: 0, Label: "", Addrs: []string{"192.0.2.10"}}}}
-		if _, err := RecordEpisode(context.Background(), pool, 7, 42, res); err != nil {
+		if _, err := RecordEpisode(context.Background(), pool, 7, 42, res, nil); err != nil {
 			t.Fatalf("RecordEpisode: %v", err)
 		}
 		execs := pool.resultPoolExecs()
@@ -975,7 +976,7 @@ func TestResultRecordEpisode(t *testing.T) {
 		j := &resultJournal{}
 		pool := &resultFakePool{j: j}
 		res := EpisodeResult{SetStatus: true, Status: model.StatusTempError}
-		recorded, err := RecordEpisode(context.Background(), pool, 7, 42, res)
+		recorded, err := RecordEpisode(context.Background(), pool, 7, 42, res, nil)
 		if err != nil || !recorded {
 			t.Fatalf("RecordEpisode = (%v, %v), want (true, nil)", recorded, err)
 		}
@@ -1003,7 +1004,7 @@ func TestResultRecordEpisode(t *testing.T) {
 	t.Run("сбой инкремента — переход записан, корзину догонит реконсиляция", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}, execErrs: []error{nil, errors.New("бд моргнула")}}
 		recorded, err := RecordEpisode(context.Background(), pool, 7, 42,
-			EpisodeResult{SetStatus: true, Status: model.StatusTempError})
+			EpisodeResult{SetStatus: true, Status: model.StatusTempError}, nil)
 		if err == nil || !strings.Contains(err.Error(), "инкремент корзины retry_mature домена 7/42") {
 			t.Fatalf("ошибка = %v, want «инкремент корзины retry_mature домена 7/42»", err)
 		}
@@ -1018,7 +1019,7 @@ func TestResultRecordEpisode(t *testing.T) {
 	t.Run("охраны отсекли строку — успех без записи и инкремента", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}, execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0")}}
 		recorded, err := RecordEpisode(context.Background(), pool, 7, 42,
-			EpisodeResult{SetStatus: true, Status: model.StatusTempError})
+			EpisodeResult{SetStatus: true, Status: model.StatusTempError}, nil)
 		if err != nil {
 			t.Fatalf("RecordEpisode: %v", err)
 		}
@@ -1032,7 +1033,7 @@ func TestResultRecordEpisode(t *testing.T) {
 
 	t.Run("ошибка БД — ошибка записи", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}, execErr: errors.New("бд недоступна")}
-		_, err := RecordEpisode(context.Background(), pool, 7, 42, EpisodeResult{})
+		_, err := RecordEpisode(context.Background(), pool, 7, 42, EpisodeResult{}, nil)
 		if err == nil || !strings.Contains(err.Error(), "запись результата домена 7/42") ||
 			!errors.Is(err, pool.execErr) {
 			t.Fatalf("ошибка = %v, want «запись результата домена 7/42: бд недоступна»", err)
@@ -1042,7 +1043,7 @@ func TestResultRecordEpisode(t *testing.T) {
 	t.Run("недопустимый статус — ошибка до БД", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}}
 		_, err := RecordEpisode(context.Background(), pool, 7, 42,
-			EpisodeResult{SetStatus: true, Status: model.Status(99)})
+			EpisodeResult{SetStatus: true, Status: model.Status(99)}, nil)
 		if err == nil || !strings.Contains(err.Error(), "недопустимый статус") {
 			t.Fatalf("ошибка = %v, want «недопустимый статус»", err)
 		}
@@ -1055,17 +1056,150 @@ func TestResultRecordEpisode(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if _, err := RecordEpisode(ctx, pool, 7, 42, EpisodeResult{}); err == nil {
+		if _, err := RecordEpisode(ctx, pool, 7, 42, EpisodeResult{}, nil); err == nil {
 			t.Fatal("RecordEpisode с отменённым ctx = nil, want ошибка контекста")
 		}
 	})
 
 	t.Run("пул не задан", func(t *testing.T) {
-		if _, err := RecordEpisode(context.Background(), nil, 1, 1, EpisodeResult{}); err == nil ||
+		if _, err := RecordEpisode(context.Background(), nil, 1, 1, EpisodeResult{}, nil); err == nil ||
 			!strings.Contains(err.Error(), "пул не задан") {
 			t.Fatalf("ошибка = %v, want «пул не задан»", err)
 		}
 	})
+}
+
+// TestResultRecordEpisodeDeadlock — фолт-инъекция 40P01 (T-268): дедлок
+// оператора записи поглощается повтором autocommit-команды как есть —
+// DNS-эпизод не роняется и не переигрывается (XACK доставки пройдёт);
+// после исчерпания попыток ошибка наружу (доставка без XACK, ТЗ 3.4).
+func TestResultRecordEpisodeDeadlock(t *testing.T) {
+	deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
+
+	t.Run("дедлок записи затем успех — повтор команды, метрика", func(t *testing.T) {
+		reg := metrics.New("dns-worker")
+		pool := &resultFakePool{j: &resultJournal{}, execErrs: []error{deadlock, nil}}
+		recorded, err := RecordEpisode(context.Background(), pool, 7, 42, EpisodeResult{}, NewMetrics(reg))
+		if err != nil || !recorded {
+			t.Fatalf("RecordEpisode = (%v, %v), want (true, nil) — дедлок поглощён", recorded, err)
+		}
+		execs := pool.resultPoolExecs()
+		if len(execs) != 2 || execs[0].sql != resultUpdateKeepStatusSQL || execs[1].sql != resultUpdateKeepStatusSQL {
+			t.Fatalf("execs = %+v, want повтор той же команды записи", execs)
+		}
+		if got := dnsMetricValue(t, reg, "crawler_db_deadlock_retried_total", "dns-worker"); got != 1 {
+			t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
+		}
+	})
+
+	t.Run("дедлок инкремента корзины затем успех — эпизод завершён", func(t *testing.T) {
+		reg := metrics.New("dns-worker")
+		pool := &resultFakePool{j: &resultJournal{}, execErrs: []error{nil, deadlock, nil}}
+		recorded, err := RecordEpisode(context.Background(), pool, 7, 42,
+			EpisodeResult{SetStatus: true, Status: model.StatusTempError}, NewMetrics(reg))
+		if err != nil || !recorded {
+			t.Fatalf("RecordEpisode = (%v, %v), want (true, nil) — инкремент повторён", recorded, err)
+		}
+		execs := pool.resultPoolExecs()
+		if len(execs) != 3 || execs[1].sql != resultMatureIncSQL || execs[2].sql != resultMatureIncSQL {
+			t.Fatalf("execs = %+v, want запись + повтор инкремента корзины", execs)
+		}
+		if got := dnsMetricValue(t, reg, "crawler_db_deadlock_retried_total", "dns-worker"); got != 1 {
+			t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
+		}
+	})
+
+	t.Run("устойчивый дедлок — ошибка наружу после исчерпания повторов", func(t *testing.T) {
+		reg := metrics.New("dns-worker")
+		pool := &resultFakePool{j: &resultJournal{}, execErr: deadlock}
+		recorded, err := RecordEpisode(context.Background(), pool, 7, 42, EpisodeResult{}, NewMetrics(reg))
+		if err == nil || !db.IsDeadlock(err) ||
+			!strings.Contains(err.Error(), "запись результата домена 7/42") {
+			t.Fatalf("ошибка = %v, want 40P01 «запись результата домена 7/42» наружу", err)
+		}
+		if recorded {
+			t.Error("recorded = true, want false (переход не зафиксирован)")
+		}
+		if execs := pool.resultPoolExecs(); len(execs) != 1+db.MaxDeadlockRetries {
+			t.Errorf("Exec вызовов %d, want %d (первая + повторы)", len(execs), 1+db.MaxDeadlockRetries)
+		}
+		if got := dnsMetricValue(t, reg, "crawler_db_deadlock_retried_total", "dns-worker"); got != db.MaxDeadlockRetries {
+			t.Errorf("crawler_db_deadlock_retried_total = %v, want %d", got, db.MaxDeadlockRetries)
+		}
+	})
+}
+
+// TestResultRecordInvalidDeadlock — диагноз invalid под 40P01-ретраем
+// (T-268, тот же resultRetry): дедлок поглощается повтором той же
+// команды — ядовитая строка выводится из цикла переиздания без
+// ределивери доставки.
+func TestResultRecordInvalidDeadlock(t *testing.T) {
+	reg := metrics.New("dns-worker")
+	pool := &resultFakePool{j: &resultJournal{},
+		execErrs: []error{&pgconn.PgError{Code: "40P01", Message: "deadlock detected"}}}
+	recorded, err := RecordInvalid(context.Background(), pool, 7, 42, NewMetrics(reg))
+	if err != nil || !recorded {
+		t.Fatalf("RecordInvalid = (%v, %v), want (true, nil) — дедлок поглощён", recorded, err)
+	}
+	execs := pool.resultPoolExecs()
+	if len(execs) != 2 || execs[0].sql != resultInvalidSQL || execs[1].sql != resultInvalidSQL {
+		t.Fatalf("execs = %+v, want повтор той же команды диагноза", execs)
+	}
+	if got := dnsMetricValue(t, reg, "crawler_db_deadlock_retried_total", "dns-worker"); got != 1 {
+		t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
+	}
+}
+
+// TestResultRunDeadlockAck — критерий приёмки T-268: дедлок записи
+// результата поглощён повтором — доставка q:dns подтверждается (XACK),
+// задача не сгорает в ределивери; метрика растёт.
+func TestResultRunDeadlockAck(t *testing.T) {
+	reg := metrics.New("dns-worker")
+	j := &resultJournal{ackNotify: make(chan struct{}, 4)}
+	// Порядок Exec (Concurrency 1): пометка публикации → запись; запись
+	// спотыкается о дедлок и повторяется (третий Exec — по умолчанию nil).
+	pool := &resultFakePool{j: j, subdomains: resultSubs(),
+		execErrs: []error{nil, &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}}}
+	q := &resultFakeQueue{j: j, deliveries: []queue.Delivery{
+		resultDelivery("9-1", "task-9",
+			queue.DNSDomain{ZoneID: 3, DomainID: 31, Name: "delegated.example.com"}),
+	}}
+	resolve := resultNewResolver()
+	resultSetDelegated(resolve, "delegated.example.com")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, pool, q, resolve, Options{
+			Concurrency: 1, Group: "g", Consumer: "c", Metrics: reg,
+		})
+	}()
+
+	if !resultWaitAck(j, 5*time.Second) {
+		cancel()
+		t.Fatal("XACK не дождались: дедлок не поглощён — доставка не подтверждена")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+
+	if got := dnsMetricValue(t, reg, "crawler_db_deadlock_retried_total", "dns-worker"); got != 1 {
+		t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
+	}
+	if n := j.count(resultEvPublish); n != 1 {
+		t.Errorf("публикаций q:http = %d, want 1 (дубля нет — эпизод не переигрывался)", n)
+	}
+	if execs := pool.resultPoolExecs(); len(execs) != 3 ||
+		execs[0].sql != resultMarkPublishedSQL || execs[1].sql != resultUpdateKeepStatusSQL ||
+		execs[2].sql != resultUpdateKeepStatusSQL {
+		t.Errorf("execs = %+v, want пометка + запись с повтором той же команды", execs)
+	}
 }
 
 // --- ProcessDomain ---------------------------------------------------------
@@ -1824,7 +1958,7 @@ func TestResultProcessBatchPoisonDomainRecordError(t *testing.T) {
 func TestResultRecordInvalid(t *testing.T) {
 	t.Run("оператор с литералом invalid и охранами", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}}
-		recorded, err := RecordInvalid(context.Background(), pool, 3, 12)
+		recorded, err := RecordInvalid(context.Background(), pool, 3, 12, nil)
 		if err != nil || !recorded {
 			t.Fatalf("RecordInvalid = (%v, %v), want (true, nil)", recorded, err)
 		}
@@ -1843,7 +1977,7 @@ func TestResultRecordInvalid(t *testing.T) {
 
 	t.Run("охраны отсекли строку — успех без записи", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}, execTags: []pgconn.CommandTag{pgconn.NewCommandTag("UPDATE 0")}}
-		recorded, err := RecordInvalid(context.Background(), pool, 3, 12)
+		recorded, err := RecordInvalid(context.Background(), pool, 3, 12, nil)
 		if err != nil {
 			t.Fatalf("RecordInvalid: %v", err)
 		}
@@ -1854,7 +1988,7 @@ func TestResultRecordInvalid(t *testing.T) {
 
 	t.Run("ошибка БД — ошибка записи", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}, execErr: errors.New("бд недоступна")}
-		_, err := RecordInvalid(context.Background(), pool, 3, 12)
+		_, err := RecordInvalid(context.Background(), pool, 3, 12, nil)
 		if err == nil || !strings.Contains(err.Error(), "диагноз invalid домена 3/12") ||
 			!errors.Is(err, pool.execErr) {
 			t.Fatalf("ошибка = %v, want «диагноз invalid домена 3/12: бд недоступна»", err)
@@ -1862,7 +1996,7 @@ func TestResultRecordInvalid(t *testing.T) {
 	})
 
 	t.Run("пул не задан", func(t *testing.T) {
-		if _, err := RecordInvalid(context.Background(), nil, 1, 1); err == nil ||
+		if _, err := RecordInvalid(context.Background(), nil, 1, 1, nil); err == nil ||
 			!strings.Contains(err.Error(), "пул не задан") {
 			t.Fatalf("ошибка = %v, want «пул не задан»", err)
 		}

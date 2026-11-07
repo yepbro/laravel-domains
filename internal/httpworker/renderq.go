@@ -391,11 +391,12 @@ func renderSPAResults(res *DomainResult) []queue.Result {
 
 // NewRenderRecorder — записатель результата с рендер-конвейером (T-066):
 // NewRecorder (T-058) + очередь рендера. Отдельный конструктор, а не
-// новый параметр NewRecorder: сигнатура T-058 закреплена его тестами;
+// новый параметр NewRecorder: сигнатура T-058 была закреплена его
+// тестами, расширение (метрики этапа, T-268) прошло вместе с ними —
 // render = nil у NewRecorder сохраняет прежнее поведение (без q:render и
 // флага) для изолированных сборок.
-func NewRenderRecorder(pool RecordDB, q queue.Queue, render *RenderQueue, log *slog.Logger) (*Recorder, error) {
-	r, err := NewRecorder(pool, q, log)
+func NewRenderRecorder(pool RecordDB, q queue.Queue, render *RenderQueue, met *Metrics, log *slog.Logger) (*Recorder, error) {
+	r, err := NewRecorder(pool, q, met, log)
 	if err != nil {
 		return nil, err
 	}

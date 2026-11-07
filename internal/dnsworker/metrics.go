@@ -31,9 +31,10 @@ var dnsSecondsBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 1
 // Потокобезопасен: эпизоды идут параллельно, приборы prometheus
 // синхронизированы.
 type Metrics struct {
-	tasks    prometheus.Counter     // crawler_stage_tasks_total{stage="dns"}
-	seconds  prometheus.Observer    // crawler_stage_seconds{stage="dns"}
-	statuses *prometheus.CounterVec // crawler_domain_status_total{type}
+	tasks     prometheus.Counter     // crawler_stage_tasks_total{stage="dns"}
+	seconds   prometheus.Observer    // crawler_stage_seconds{stage="dns"}
+	statuses  *prometheus.CounterVec // crawler_domain_status_total{type}
+	dbRetried prometheus.Counter     // crawler_db_deadlock_retried_total (T-268)
 }
 
 // NewMetrics регистрирует приборы DNS-этапа в реестре reg (каррированные
@@ -57,6 +58,9 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 			Name: "crawler_domain_status_total",
 			Help: "Финальные статусы доменов по итогам эпизодов (ТЗ 6.2): DNS-этап — not_delegated/delegated_no_address/temp_error/invalid (диагноз ядовитой строки, T-109), HTTP-этап — alive/no_http/temp_error.",
 		}, metrics.LabelType),
+		// Счётчик 40P01-повторов (T-268): единые имя/HELP для всех
+		// сервисов — конструктор internal/metrics.
+		dbRetried: metrics.NewDBDeadlockRetried(reg),
 	}
 }
 
@@ -81,4 +85,14 @@ func (m *Metrics) DomainStatus(status model.Status) {
 		return
 	}
 	m.statuses.WithLabelValues(status.String()).Inc()
+}
+
+// DBDeadlockRetried — оператор БД повторён после дедлока 40P01 (T-268):
+// +1 к счётчику повтора; хук db.RetryDeadlock (attempt — номер повтора,
+// ряд один, метка зарезервирована за сервисом).
+func (m *Metrics) DBDeadlockRetried(attempt int) {
+	if m == nil {
+		return
+	}
+	m.dbRetried.Inc()
 }

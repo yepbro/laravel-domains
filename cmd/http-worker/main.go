@@ -158,9 +158,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// тем же резолвером DNS-этапа с кэшем (ТЗ 5.5 п. 2, CachingResolver
 	// T-047, адаптер httpworker.DNSLookup); InsecureSkipVerify — ТЗ 5.5
 	// п. 3. Ожидание слота per-IP семафора — в гистограмму :9104 (T-165):
-	// NewMetrics идемпотентен (T-076), воркер ниже делит те же коллекторы.
+	// NewMetrics идемпотентен (T-076), воркер ниже делит те же коллекторы;
+	// тот же met держит счётчик 40P01-повторов транзакции записи
+	// (crawler_db_deadlock_retried_total, T-268) — передаётся записателю
+	// результата ниже.
+	met := httpworker.NewMetrics(reg)
 	opts := httpfetch.NewOptions(cfg.HTTP)
-	opts.Limits.OnPerIPWait = httpworker.NewMetrics(reg).PerIPWait
+	opts.Limits.OnPerIPWait = met.PerIPWait
 	opts.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	opts.Resolver = httpfetch.NewCachingResolver(
 		httpworker.NewDNSLookup(resolve, cfg.DNS.IPv6), httpfetch.CacheOptions{})
@@ -305,7 +309,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			[]string{queue.StreamHTTP}, metrics.DefaultQueueCollectInterval, logger)
 	}()
 
-	recorder, err := httpworker.NewRenderRecorder(pool, q, renderQ, logger)
+	recorder, err := httpworker.NewRenderRecorder(pool, q, renderQ, met, logger)
 	if err != nil {
 		return err
 	}

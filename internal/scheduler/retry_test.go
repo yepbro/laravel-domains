@@ -29,6 +29,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"crawler/internal/db"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 )
 
@@ -133,7 +135,10 @@ type retryFakePool struct {
 	seq          int // монотонный порядок событий Begin/Commit (регрессия разделения tx решений)
 	txs          []*retryFakeTx
 
-	matureErr error // ошибка хвостового декремента корзин (retryRequeueMatureSQL, T-267)
+	matureErr    error   // ошибка хвостового декремента корзин (retryRequeueMatureSQL, T-267)
+	requeueErrs  []error // FIFO одноразовых ошибок UPDATE повтора (nil — попытка без ошибки; фолт-инъекция 40P01, T-268)
+	finalizeErrs []error // FIFO одноразовых ошибок UPDATE итогового статуса
+	matureErrs   []error // FIFO одноразовых ошибок декремента корзин
 }
 
 func (p *retryFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -252,6 +257,17 @@ func (t *retryFakeTx) isSelect() bool {
 	return false
 }
 
+// nextErrLocked — ошибка очередного вызова из FIFO-очереди одноразовых
+// ошибок (nil — попытка без ошибки); очередь пуста — nil.
+func (p *retryFakePool) nextErrLocked(queue *[]error) error {
+	if len(*queue) == 0 {
+		return nil
+	}
+	err := (*queue)[0]
+	*queue = (*queue)[1:]
+	return err
+}
+
 // Exec — закрепление плана выборки (T-191): SET LOCAL ×3 до SELECT —
 // последовательность проверяет TestRetryOnceSelectPlan; хвостовой
 // декремент корзин зрелости назначения повтора (retryRequeueMatureSQL,
@@ -267,6 +283,9 @@ func (t *retryFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.C
 		}
 		return pgconn.NewCommandTag("SET"), nil
 	case retryRequeueMatureSQL:
+		if err := t.pool.nextErrLocked(&t.pool.matureErrs); err != nil {
+			return pgconn.CommandTag{}, err
+		}
 		if t.pool.matureErr != nil {
 			return pgconn.CommandTag{}, t.pool.matureErr
 		}
@@ -297,6 +316,9 @@ func (t *retryFakeTx) Query(_ context.Context, sql string, args ...any) (pgx.Row
 		}
 		return retryRows(), nil
 	case retryRequeueSQL:
+		if err := t.pool.nextErrLocked(&t.pool.requeueErrs); err != nil {
+			return nil, err
+		}
 		if t.pool.requeueErr != nil {
 			return nil, t.pool.requeueErr
 		}
@@ -307,6 +329,9 @@ func (t *retryFakeTx) Query(_ context.Context, sql string, args ...any) (pgx.Row
 		}
 		return retryRows(), nil
 	case retryFinalizeSQL:
+		if err := t.pool.nextErrLocked(&t.pool.finalizeErrs); err != nil {
+			return nil, err
+		}
 		if t.pool.finalizeErr != nil {
 			return nil, t.pool.finalizeErr
 		}
@@ -1185,6 +1210,105 @@ func TestRetryOnceNilPool(t *testing.T) {
 	}
 }
 
+// retryDeadlockValue — текущее значение счётчика
+// crawler_db_deadlock_retried_total из реестра (стиль backlogSkippedValue).
+func retryDeadlockValue(t *testing.T, reg *metrics.Registry) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != "crawler_db_deadlock_retried_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			return m.GetCounter().GetValue()
+		}
+	}
+	return 0
+}
+
+// TestRetryOnceDeadlockRetry — фолт-инъекция 40P01 (T-268): дедлок
+// транзакции решения поглощается повтором ЦЕЛИКОМ — неудачная попытка
+// откатывается (перевода нет, декремент корзин не открывался), вторая
+// проходит оба оператора и фиксируется; метрика растёт на каждый повтор.
+func TestRetryOnceDeadlockRetry(t *testing.T) {
+	reg := metrics.New("scheduler")
+	pool := &retryFakePool{
+		selects:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
+		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
+		// Первая попытка UPDATE повтора падает дедлоком, повтор — проходит.
+		requeueErrs: []error{&pgconn.PgError{Code: "40P01", Message: "deadlock detected"}},
+	}
+
+	res, err := RetryOnce(context.Background(), pool, RetryOptions{Metrics: reg})
+	if err != nil {
+		t.Fatalf("RetryOnce: %v, want nil — дедлок поглощён", err)
+	}
+	if res.Requeued != 1 || res.Finalized != 0 {
+		t.Fatalf("итог = %+v, want повтор одного домена", res)
+	}
+	// Транзакции: выборка + ДВЕ попытки решения — первая откачена
+	// (перевода нет), вторая зафиксирована.
+	if len(pool.txs) != 3 {
+		t.Fatalf("транзакций = %d, want 3 (выборка + попытка + повтор)", len(pool.txs))
+	}
+	failTx, okTx := pool.txs[1], pool.txs[2]
+	if failTx.committed || !failTx.rolledBack {
+		t.Error("первая попытка не откачена при дедлоке")
+	}
+	if len(failTx.calls) != 1 || failTx.calls[0].sql != retryRequeueSQL {
+		t.Errorf("попытка = %v, want только упавший перевод (декремент не открывался)", failTx.calls)
+	}
+	if !okTx.committed || okTx.rolledBack {
+		t.Error("повтор не зафиксирован")
+	}
+	if len(okTx.calls) != 2 || okTx.calls[0].sql != retryRequeueSQL || okTx.calls[1].sql != retryRequeueMatureSQL {
+		t.Errorf("повтор = %v, want перевод + декремент корзин", okTx.calls)
+	}
+	if got := retryDeadlockValue(t, reg); got != 1 {
+		t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
+	}
+}
+
+// TestRetryOnceDeadlockExhausted — устойчивый дедлок: после исчерпания
+// повторов ошибка наружу (проход падает, дренаж продолжит), все попытки
+// откачены, каждая фиксировала метрику.
+func TestRetryOnceDeadlockExhausted(t *testing.T) {
+	reg := metrics.New("scheduler")
+	pool := &retryFakePool{
+		selects: []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
+		// Дедлок на каждой попытке UPDATE повтора.
+		requeueErr: &pgconn.PgError{Code: "40P01", Message: "deadlock detected"},
+	}
+
+	res, err := RetryOnce(context.Background(), pool, RetryOptions{Metrics: reg})
+	if err == nil || !db.IsDeadlock(err) ||
+		!strings.Contains(err.Error(), "назначение повтора") {
+		t.Fatalf("ошибка = %v, want 40P01 «назначение повтора» наружу", err)
+	}
+	if res != (RetryResult{}) {
+		t.Errorf("итог при ошибке = %+v, want нулевой", res)
+	}
+	// Выборка + первая попытка + MaxDeadlockRetries повторов — все
+	// откачены, ни одна не дошла до декремента корзин.
+	if len(pool.txs) != 2+db.MaxDeadlockRetries {
+		t.Fatalf("транзакций = %d, want %d (выборка + попытки)", len(pool.txs), 2+db.MaxDeadlockRetries)
+	}
+	for _, tx := range pool.txs[1:] {
+		if tx.committed || !tx.rolledBack {
+			t.Errorf("попытка решения %p: committed=%v rolledBack=%v, want откат", tx, tx.committed, tx.rolledBack)
+		}
+		if len(tx.calls) != 1 || tx.calls[0].sql != retryRequeueSQL {
+			t.Errorf("попытка %p = %v, want только упавший перевод", tx, tx.calls)
+		}
+	}
+	if got := retryDeadlockValue(t, reg); got != db.MaxDeadlockRetries {
+		t.Errorf("crawler_db_deadlock_retried_total = %v, want %d", got, db.MaxDeadlockRetries)
+	}
+}
+
 // --- RetryOptions ----------------------------------------------------------
 
 func TestRetryOptionsDefaults(t *testing.T) {
@@ -1530,5 +1654,118 @@ func TestRetryTempErrorsNilPool(t *testing.T) {
 	err := RetryTempErrors(context.Background(), nil, RetryOptions{})
 	if err == nil || !strings.Contains(err.Error(), "пул не задан") {
 		t.Errorf("ошибка = %v, want «пул не задан»", err)
+	}
+}
+
+// TestRetryTempErrorsDrainContinues — критерий приёмки T-268: ошибка
+// одной пачки больше не срывает часовой дренаж (инцидент 07.11 16:04 —
+// 118 тыс. доменов ждали следующего тика): пачка повторяется, дренаж
+// доходит до исчерпания множества в том же тике.
+func TestRetryTempErrorsDrainContinues(t *testing.T) {
+	// syncBuf: логгер пишет из горутины цикла, тест читает из своей —
+	// буфер под замком (стиль backlog_test, гонка -race).
+	buf := &syncBuf{}
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+	// Пачка 1 — сбой guard (БД моргнула); пачка 2 — полная (BatchSize 1);
+	// пачка 3 — пустая (множество исчерпано, дренаж завершён).
+	pool := &retryFakePool{
+		guardErrs: []error{errors.New("бд моргнула")},
+		selects: []*retryFakeRows{
+			retryRows([]any{int16(1), int64(10), int16(0)}),
+			retryRows(),
+		},
+		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RetryTempErrors(ctx, pool, RetryOptions{
+			BatchSize: 1,
+			Interval:  time.Hour, // тик не наступит: продолжить обязан тот же дренаж
+			Log:       logger,
+		})
+	}()
+
+	// Ждём Info-итога дренажа — доказательство, что он дошёл до конца,
+	// а не вернулся по ошибке первой пачки.
+	deadline := time.Now().Add(2 * time.Second)
+	for !buf.contains("requeued=1") {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("дренаж не дошёл до итога:\n%s", buf.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RetryTempErrors: %v", err)
+	}
+
+	log := buf.String()
+	for _, want := range []string{
+		"пачка не прошла — дренаж продолжается", // WARN сбоя пачки
+		"бд моргнула",
+		"requeued=1", // Info-итог того же дренажа
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("лог не содержит %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "предел упавших пачек") {
+		t.Errorf("единичный сбой остановил дренаж:\n%s", log)
+	}
+	// Пройдено три прохода: сбойный (guard, без транзакции), рабочий
+	// (выборка + решение) и пустой (выборка).
+	if st := pool.stats(); st.guards != 3 || st.selects != 2 || st.begins != 3 || st.commits != 3 {
+		t.Errorf("статистика = guards=%d selects=%d begins=%d commits=%d, want 3/2/3/3",
+			st.guards, st.selects, st.begins, st.commits)
+	}
+}
+
+// TestRetryTempErrorsDrainFailLimit — потолок ПОДРЯД упавших пачек
+// (DefaultRetryDrainFails, T-268): устойчивый сбой останавливает дренаж
+// до следующего тика — не молотя БД вхолостую; счётчик сбоев обнуляется
+// успехом (проверяет TestRetryTempErrorsDrainContinues: после сбоя
+// дренаж доработал).
+func TestRetryTempErrorsDrainFailLimit(t *testing.T) {
+	// syncBuf — как в DrainContinues: цикл пишет, тест читает.
+	buf := &syncBuf{}
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+	// Все guard-чтения пачек падают (тройной FIFO — по числу попыток
+	// предела) — дренаж обязан остановиться на пределе, а не молотить
+	// дальше.
+	dbDown := errors.New("бд недоступна")
+	pool := &retryFakePool{guardErrs: []error{dbDown, dbDown, dbDown}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RetryTempErrors(ctx, pool, RetryOptions{
+			Interval: time.Hour,
+			Log:      logger,
+		})
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !buf.contains("предел упавших пачек") {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("дренаж не остановился на пределе сбоёв:\n%s", buf.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RetryTempErrors: %v", err)
+	}
+
+	// Ровно DefaultRetryDrainFails попыток — не больше: устойчивый сбой
+	// не молотит БД до тика.
+	if got := len(pool.guardQueries); got != DefaultRetryDrainFails {
+		t.Errorf("guard-чтений = %d, want %d (предел упавших пачек)", got, DefaultRetryDrainFails)
+	}
+	if st := pool.stats(); st.begins != 0 || st.selects != 0 {
+		t.Errorf("транзакций/выборок при сбое guard = %d/%d, want 0/0", st.begins, st.selects)
 	}
 }

@@ -425,9 +425,12 @@ func resultCNAME(c string) string {
 // зафиксированный переход и не лечится повторной доставкой (охрана done
 // отсечёт оба оператора) — возвращает (true, err): вызыватель завершает
 // эпизод (корзину выровняет monitor), а не роняет доставку.
+// Оба оператора — autocommit под 40P01-ретраем (T-268, resultRetry):
+// повторяется команда как есть, БЕЗ повторного DNS-эпизода (эпизод на
+// порядки дороже команды, а охраны делают повтор безопасным — ТЗ 3.4).
 // Возвращает false, когда охраны отсекли строку (done/deleted) — это
 // успех, а не ошибка.
-func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64, res EpisodeResult) (bool, error) {
+func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64, res EpisodeResult, met *Metrics) (bool, error) {
 	if pool == nil {
 		return false, errors.New("dnsworker: запись результата: пул не задан")
 	}
@@ -446,20 +449,38 @@ func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 		what = "запись результата"
 		args = append(args, int64(res.Mask))
 	}
-	n, err := resultCount(ctx, pool, sql, args, zoneID, domainID, what)
-	if err != nil {
+	var n int64
+	if err := resultRetry(ctx, met, func() error {
+		var err error
+		n, err = resultCount(ctx, pool, sql, args, zoneID, domainID, what)
+		return err
+	}); err != nil {
 		return false, err
 	}
 	if n > 0 && res.SetStatus && res.Status == model.StatusTempError {
 		// Корзина зрелости — отдельный autocommit ПОСЛЕ записи (T-267):
 		// сбой здесь не роняет эпизод — переход зафиксирован, повторная
 		// доставка его не улучшит (охрана done), корзину ±1 догонит
-		// реконсиляция monitor.
-		if _, err := pool.Exec(ctx, resultMatureIncSQL); err != nil {
+		// реконсиляция monitor. 40P01-ретрай (T-268) — прежде сбоя:
+		// дедлок корзины гасится повтором upsert'а, окно неатомарности
+		// остаётся только для иных ошибок.
+		if err := resultRetry(ctx, met, func() error {
+			_, err := pool.Exec(ctx, resultMatureIncSQL)
+			return err
+		}); err != nil {
 			return true, fmt.Errorf("dnsworker: инкремент корзины retry_mature домена %d/%d: %w", zoneID, domainID, err)
 		}
 	}
 	return n > 0, nil
+}
+
+// resultRetry — обёртка 40P01-повтора точки записи DNS-этапа (T-268):
+// команда (autocommit-оператор записи) повторяется как есть — охраны
+// актуальности делают повтор идемпотентным (ТЗ 3.4), DNS-эпизод не
+// переигрывается; met может быть nil (изолированные сборки — приборы
+// no-op). Параметры — DefaultDeadlockRetry.
+func resultRetry(ctx context.Context, met *Metrics, fn func() error) error {
+	return db.RetryDeadlock(ctx, db.DefaultDeadlockRetry, met.DBDeadlockRetried, fn)
 }
 
 // MarkHTTPPublished ставит бит http_published — staging-пометку «задача
@@ -484,15 +505,20 @@ func MarkHTTPPublished(ctx context.Context, pool db.DB, zoneID int16, domainID i
 // бесконечного lease-возврата. Оператор resultInvalidSQL с охранами
 // актуальности: удалённый домен не перезаписывается (§13.1), повторная
 // доставка зафиксированного диагноза — no-op (идемпотентность, ТЗ 3.4);
-// CTE ведёт дельты счётчиков зоны (T-178).
+// CTE ведёт дельты счётчиков зоны (T-178). Autocommit-оператор под
+// 40P01-ретраем (T-268, resultRetry) — как запись результата.
 // Возвращает false, когда охраны отсекли строку (done/deleted) — это
 // успех, а не ошибка.
-func RecordInvalid(ctx context.Context, pool db.DB, zoneID int16, domainID int64) (bool, error) {
+func RecordInvalid(ctx context.Context, pool db.DB, zoneID int16, domainID int64, met *Metrics) (bool, error) {
 	if pool == nil {
 		return false, errors.New("dnsworker: диагноз invalid: пул не задан")
 	}
-	n, err := resultCount(ctx, pool, resultInvalidSQL, []any{zoneID, domainID}, zoneID, domainID, "диагноз invalid")
-	if err != nil {
+	var n int64
+	if err := resultRetry(ctx, met, func() error {
+		var err error
+		n, err = resultCount(ctx, pool, resultInvalidSQL, []any{zoneID, domainID}, zoneID, domainID, "диагноз invalid")
+		return err
+	}); err != nil {
 		return false, err
 	}
 	return n > 0, nil
@@ -623,7 +649,7 @@ func ProcessDomain(
 		}
 	}
 
-	recorded, err := RecordEpisode(ctx, pool, dom.ZoneID, dom.DomainID, res)
+	recorded, err := RecordEpisode(ctx, pool, dom.ZoneID, dom.DomainID, res, met)
 	if err != nil && !recorded {
 		return err
 	}
@@ -1052,7 +1078,7 @@ func processBatch(
 				// Warn и продолжение: остальные домены пачки обрабатываются,
 				// доставка подтверждается. Сбой записи диагноза — ошибка
 				// эпизода (без XACK): повторная доставка доиграет фиксацию.
-				recorded, rerr := RecordInvalid(ctx, pool, dom.ZoneID, dom.DomainID)
+				recorded, rerr := RecordInvalid(ctx, pool, dom.ZoneID, dom.DomainID, met)
 				switch {
 				case rerr != nil:
 					mu.Lock()

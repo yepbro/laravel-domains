@@ -133,6 +133,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		bg <- scheduler.RetryTempErrors(ctx, pool, scheduler.RetryOptions{
 			RetryAfter: cfg.Scheduler.TempErrorRetryAfter.D(),
 			MaxRetries: cfg.Scheduler.TempErrorMaxRetries,
+			Metrics:    reg, // счётчик 40P01-повторов транзакций решений (T-268)
 			Log:        logger,
 		})
 	}()

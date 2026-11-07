@@ -10,9 +10,9 @@
 // в статусе temp_error, чья проверка завершена (check_state = done, ТЗ 7)
 // и last_checked_at старше temp_error_retry_after, — и делит их по
 // счётчику попыток domains.temp_attempts (миграция 000005) на два решения,
-// каждое — в СОБСТВЕННОЙ транзакции (порядок блокировок, retryDecide;
-// назначение повтора — два оператора: декремент корзин счётчиков вынесен
-// из оператора зон, T-267):
+// каждое — в СОБСТВЕННОЙ транзакции под 40P01-ретраем (порядок блокировок
+// — retryDecide, T-268; назначение повтора — два оператора: декремент
+// корзин счётчиков вынесен из оператора зон, T-267):
 //
 //   - попыток меньше N — назначается повтор: check_state → pending
 //     (домена перевыберет диспетчер T-027 и поставит в q:dns, T-028),
@@ -52,8 +52,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"crawler/internal/db"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 )
 
@@ -84,6 +86,14 @@ const (
 	// а не выборка — seq scan с ранним остановом LIMIT, закреплённый в
 	// транзакции выборки (retryCandidates, T-191).
 	DefaultRetryInterval = time.Hour
+
+	// DefaultRetryDrainFails — потолок ПОДРЯД упавших пачек одного
+	// дренажа (T-268): ошибка пачки больше не срывает часовой проход
+	// (инцидент 07.11 16:04 — WARN единственной пачки оставлял неразобранным
+	// дренаж 118 тыс. доменов до следующего тика), дренаж продолжает
+	// следующие пачки; предел останавливает его при устойчивом сбое
+	// (БД недоступна) — до следующего тика, не молотя БД вхолостую.
+	DefaultRetryDrainFails = 3
 )
 
 // SQL прохода. unnest-пачки — стиль пакетных UPDATE internal/db (ТЗ 6:
@@ -307,6 +317,10 @@ type RetryOptions struct {
 	// RetryOnce не влияет. Ноль/отрицательное — min(RetryAfter,
 	// DefaultRetryInterval), см. DefaultRetryInterval.
 	Interval time.Duration
+	// Metrics — реестр Prometheus сервиса (T-268): счётчик 40P01-повторов
+	// транзакций решений crawler_db_deadlock_retried_total; nil — без
+	// метрик (изолированные сборки/тесты).
+	Metrics *metrics.Registry
 	// Log — логгер цикла RetryTempErrors; nil — записи подавлены
 	// (slog.DiscardHandler). RetryOnce не логирует — итог возвращается
 	// RetryResult.
@@ -422,9 +436,10 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 	}
 
 	var res RetryResult
+	met := newRetryMetrics(o.Metrics)
 	if len(requeueZones) > 0 {
 		n, err := retryDecide(ctx, pool, retryRequeueSQL, retryRequeueMatureSQL, "назначение повтора", requeueZones, requeueIDs,
-			int16(model.CheckStatePending), int16(model.StatusTempError), int16(model.CheckStateDone))
+			int16(model.CheckStatePending), int16(model.StatusTempError), int16(model.CheckStateDone), met)
 		if err != nil {
 			return RetryResult{}, err
 		}
@@ -432,13 +447,42 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 	}
 	if len(finalZones) > 0 {
 		n, err := retryDecide(ctx, pool, retryFinalizeSQL, "", "итоговый статус", finalZones, finalIDs,
-			int16(model.StatusDelegatedNoAddress), int16(model.StatusTempError), int16(model.CheckStateDone))
+			int16(model.StatusDelegatedNoAddress), int16(model.StatusTempError), int16(model.CheckStateDone), met)
 		if err != nil {
 			return RetryResult{}, err
 		}
 		res.Finalized = n
 	}
 	return res, nil
+}
+
+// retryMetrics — приборы прохода повторных проверок (T-268): счётчик
+// 40P01-повторов транзакций решений; nil — no-op (стиль
+// backlogLoopMetrics).
+type retryMetrics struct {
+	dbRetried prometheus.Counter
+}
+
+// newRetryMetrics — приборы в реестре reg (nil — nil). Счётчик
+// 40P01-повторов — единые имя/HELP для всех сервисов (конструктор
+// internal/metrics, T-268); регистрация идемпотентна — построение на
+// каждый проход дренажа делит вектор первого вызова.
+func newRetryMetrics(reg *metrics.Registry) *retryMetrics {
+	if reg == nil {
+		return nil
+	}
+	return &retryMetrics{
+		dbRetried: metrics.NewDBDeadlockRetried(reg),
+	}
+}
+
+// dbDeadlockRetried — транзакция повторена после дедлока (T-268); nil —
+// no-op.
+func (m *retryMetrics) dbDeadlockRetried(attempt int) {
+	if m == nil {
+		return
+	}
+	m.dbRetried.Inc()
 }
 
 // retryDecide — одно решение пачки (назначение повтора или итоговый
@@ -466,14 +510,36 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 // (финализация: rm в самом операторе, ссылается на upd). Декремент
 // выполняется только по непустому множеству ключей (охрана отбила
 // всех — корзины не трогаем).
+// Транзакция решения — под 40P01-ретраем (T-268, met — хук счётчика
+// повторов): попытка повторяется ЦЕЛИКОМ — охраны обоих UPDATE
+// идемпотентны (переведённые первой попыткой не переведутся повторно,
+// откаченная попытка не оставляет половин), остаточные циклы блокировок
+// гасятся на месте, не срывая дренаж.
 // Сбой любого оператора откатывает половину целиком (перевод и
 // декремент — одна транзакция, ТЗ 3.4): прерванная половина не
 // оставляет половинчатых изменений, кандидаты остаются кандидатами
 // следующего прохода (идемпотентность); зафиксированная половина
-// остаётся (переведённые не кандидаты). Ошибка половины возвращает
-// ошибку прохода — RetryResult отбрасывается, дренаж RetryTempErrors
-// продолжит следующим тиком.
+// остаётся (переведённые не кандидаты). Ошибка половины (после
+// исчерпания ретраев) возвращает ошибку прохода — RetryResult
+// отбрасывается; дренаж RetryTempErrors повторит пачку тем же тиком
+// (до DefaultRetryDrainFails подряд), при устойчивом сбое — следующим
+// тиком.
 func retryDecide(ctx context.Context, pool RetryDB, sql, matureSQL, kind string,
+	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16, met *retryMetrics) (int, error) {
+	var n int
+	if err := db.RetryDeadlock(ctx, db.DefaultDeadlockRetry, met.dbDeadlockRetried, func() error {
+		var err error
+		n, err = retryDecideOnce(ctx, pool, sql, matureSQL, kind, zoneIDs, domainIDs, set, guardStatus, guardState)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// retryDecideOnce — ОДНА попытка транзакции решения (точка повтора
+// 40P01 — retryDecide, T-268).
+func retryDecideOnce(ctx context.Context, pool RetryDB, sql, matureSQL, kind string,
 	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16) (int, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -642,9 +708,9 @@ func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
 // (первый дренаж — сразу при старте: накопленное за простой разбирается
 // целиком, а не по пачке за тик), до отмены ctx и возвращает nil —
 // контракт OnRun каркаса сервисов (T-012: чистое завершение по
-// SIGTERM). Ошибка пачки прерывает только текущий дренаж: логируется
-// (Warn), цикл живёт — очередной дренаж продолжит, проход идемпотентен
-// (ТЗ 3.4).
+// SIGTERM). Ошибка пачки не прерывает дренаж (T-268): он продолжает
+// следующие пачки до DefaultRetryDrainFails подряд упавших, затем —
+// очередной тик (цикл живёт, проход идемпотентен, ТЗ 3.4).
 func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error {
 	if pool == nil {
 		return errors.New("scheduler: повторные проверки temp_error: пул не задан")
@@ -665,8 +731,15 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 	// месяцами). Пачки повторяются, пока проходят целиком; переведённые
 	// в pending не выбираются повторно — дренаж конечен, переводы
 	// подбирает главный цикл постановки (T-028).
+	// Ошибка пачки не срывает дренаж (T-268: инцидент 07.11 16:04 — WARN
+	// единственной пачки оставлял неразобранными 118 тыс. доменов до
+	// следующего тика): пачка повторяется (40P01 решения гасится ещё
+	// ретраем retryDecide, прочие ошибки — устойчивый сбой — проходят
+	// сюда), пока подряд упавших не накопится DefaultRetryDrainFails;
+	// успешная пачка обнуляет счётчик — дренаж жив, пока идёт прогресс.
 	drain := func() {
 		var total RetryResult
+		fails := 0
 		for {
 			res, err := RetryOnce(ctx, pool, o)
 			switch {
@@ -674,10 +747,19 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 				// Отмена во время прохода — часть остановки, не тревога.
 				return
 			case err != nil:
-				log.Warn("дренаж повторных проверок temp_error", "err", err,
+				fails++
+				if fails >= DefaultRetryDrainFails {
+					log.Warn("дренаж повторных проверок temp_error: предел упавших пачек — до следующего тика",
+						"err", err, "failed_batches", fails,
+						"requeued", total.Requeued, "finalized", total.Finalized)
+					return
+				}
+				log.Warn("дренаж повторных проверок temp_error: пачка не прошла — дренаж продолжается",
+					"err", err, "failed_batches", fails,
 					"requeued", total.Requeued, "finalized", total.Finalized)
-				return
+				continue
 			}
+			fails = 0
 			total.Requeued += res.Requeued
 			total.Finalized += res.Finalized
 			if res.Requeued+res.Finalized < o.BatchSize {

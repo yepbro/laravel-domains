@@ -331,13 +331,19 @@ type Recorder struct {
 	// отключён (q:render не публикуется, флаг не ставится); ставится
 	// NewRenderRecorder.
 	render *RenderQueue
-	log    *slog.Logger
+	// met — приборы этапа (T-268): хук счётчика 40P01-повторов транзакции
+	// записи crawler_db_deadlock_retried_total; nil — no-op (изолированные
+	// сборки/тесты).
+	met *Metrics
+	log *slog.Logger
 }
 
 // NewRecorder строит записатель поверх пула БД и очереди (продакшн —
 // *pgxpool.Pool и очередь под WatermarkPublisher, T-026). nil-зависимости
-// — ошибка: тихая потеря результата/публикации незаметна для оператора.
-func NewRecorder(pool RecordDB, q queue.Queue, log *slog.Logger) (*Recorder, error) {
+// (пул/очередь) — ошибка: тихая потеря результата/публикации незаметна
+// для оператора; met может быть nil — без метрик. Боевой записатель
+// собирает NewRenderRecorder.
+func NewRecorder(pool RecordDB, q queue.Queue, met *Metrics, log *slog.Logger) (*Recorder, error) {
 	if pool == nil {
 		return nil, errors.New("httpworker: запись результата: пул не задан")
 	}
@@ -347,7 +353,7 @@ func NewRecorder(pool RecordDB, q queue.Queue, log *slog.Logger) (*Recorder, err
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Recorder{pool: pool, q: q, log: log}, nil
+	return &Recorder{pool: pool, q: q, met: met, log: log}, nil
 }
 
 // RecordAndPublish записывает результат домена одной транзакцией (UPDATE
@@ -355,13 +361,16 @@ func NewRecorder(pool RecordDB, q queue.Queue, log *slog.Logger) (*Recorder, err
 // старых строк + своп ссылок contents + INSERT новых, ТЗ 3.4/§5.5 п. 7)
 // и после фиксации публикует q:analyze по одному Result на запись
 // субдомен×вариант (формат T-024) и q:render по SPA-записям при
-// свободной очереди (T-066). Возвращает false без ошибки, когда охрана
-// отсекла запись (домен удалён — §8/§13.1, или строки нет): это успех,
-// публикация не нужна. Ошибка — сбой любого шага: доставка q:http не
-// подтверждается и вернётся повторной доставкой (Processing, T-025);
-// повторная доставка перезапишет результат идемпотентно и заново решит
-// вопрос рендера (флаг — CASE-free: ставится только при переполнении,
-// снимает проход доработки renderq.go).
+// свободной очереди (T-066). Транзакция идёт под 40P01-ретраем (T-268,
+// recordTx): дедлок повторяется целиком — идемпотентность записи (ТЗ 3.4)
+// делает повтор безопасным, а ределивери q:http стоил бы полный
+// HTTP-эпизод (инцидент 07.11 — runbooks.md §2.8).
+// Возвращает false без ошибки, когда охрана отсекла запись (домен удалён
+// — §8/§13.1, или строки нет): это успех, публикация не нужна. Ошибка —
+// сбой любого шага: доставка q:http не подтверждается и вернётся
+// повторной доставкой (Processing, T-025); повторная доставка перезапишет
+// результат идемпотентно и заново решит вопрос рендера (флаг — CASE-free:
+// ставится только при переполнении, снимает проход доработки renderq.go).
 func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (bool, error) {
 	if res == nil {
 		return false, nil // не бывает (processDelivery); защита прямых вызовов
@@ -397,9 +406,72 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		}
 	}
 
+	// Транзакция записи — под 40P01-ретраем (T-268): повтор ЦЕЛИКОМ,
+	// транзакция идемпотентна (охрана удаления §8/§13.1, перезапись
+	// DELETE+INSERT — ТЗ 3.4), ределивери q:http стоил бы полный
+	// HTTP-эпизод (инцидент 07.11 — runbooks.md §2.8). Публикации —
+	// после фиксации ПОПЫТКИ и вне ретрая: у упавшей транзакции их не
+	// было, у зафиксированной повтор не выполняется (ошибка публикации —
+	// не дедлок).
+	var (
+		recorded bool
+		swapped  int
+	)
+	if err := db.RetryDeadlock(ctx, db.DefaultDeadlockRetry, r.met.DBDeadlockRetried, func() error {
+		var err error
+		recorded, swapped, err = r.recordTx(ctx, res, batch, status, renderPending)
+		return err
+	}); err != nil {
+		return recorded, err
+	}
+	if !recorded {
+		return false, nil
+	}
+
+	// Публикация q:analyze после записи (§5.5 п. 9): Result указывает на
+	// строку — она обязана существовать к моменту потребления. Все записи
+	// домена: анализ идёт по каждому результату субдомен×вариант, рендер
+	// (T-067) позже заменит контент и опубликует заново — граница этапов,
+	// не фильтр здесь.
+	for i := range batch.pub {
+		if _, err := r.q.Publish(ctx, queue.StreamAnalyze, batch.pub[i]); err != nil {
+			return true, fmt.Errorf("httpworker: домен %s: публикация q:analyze (запись %d/%d): %w",
+				res.Name, i+1, len(batch.pub), err)
+		}
+	}
+
+	// q:render по SPA-записям (T-066, §5.5 п. 8): после фиксации — как и
+	// q:analyze, Result указывает на строку. Только при свободной очереди:
+	// переполнение уже закрыто флагом в транзакции. Публикация мимо
+	// WatermarkPublisher (T-026) — ёмкость проверена выше, ожидание здесь
+	// задержало бы XACK (§5.6).
+	if len(renderKeys) > 0 && !renderPending {
+		if err := r.render.Publish(ctx, renderKeys); err != nil {
+			return true, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		}
+	}
+
+	r.log.Debug("HTTP-результат записан",
+		"domain", res.Name, "status", status.String(), "records", len(batch.zone),
+		"swapped_refs", swapped, "cutoff", res.Cutoff,
+		"render_pending", renderPending, "q_render", len(renderKeys))
+	return true, nil
+}
+
+// recordTx — ОДНА попытка транзакции записи результата (T-058; точка
+// повтора 40P01 — T-268): предчтение строки домена FOR UPDATE → UPDATE
+// итогового статуса (+ флаг render_pending при переполнении q:render,
+// T-066) → DELETE старых строк + своп ссылок contents (T-044) → INSERT
+// новых → хвостовые дельты счётчиков (зоны T-178, рендер-долг T-175,
+// сутки/корзины T-179/T-182/T-202/T-203/T-204) → Commit. Возвращает
+// false без ошибки, когда запись не нужна (строки нет или домен удалён —
+// §8/§13.1); swapped — число снятых ссылок на контент (для журнала).
+// Откат прерванной попытки — defer Rollback (после Commit — no-op):
+// повтор транзакции с чистого листа, половинчатых состояний нет.
+func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recordBatch, status model.Status, renderPending bool) (bool, int, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("httpworker: домен %s: запись результата: транзакция: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: транзакция: %w", res.Name, err)
 	}
 	// Откат безусловно: после Commit — no-op (стиль T-044).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -417,14 +489,14 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		if errors.Is(err, pgx.ErrNoRows) {
 			r.log.Debug("результат не записан — домен отсутствует",
 				"domain", res.Name, "zone_id", res.ZoneID, "domain_id", res.DomainID)
-			return false, nil
+			return false, 0, nil
 		}
-		return false, fmt.Errorf("httpworker: домен %s: запись результата: строка: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: строка: %w", res.Name, err)
 	}
 	if model.Status(oldStatus) == model.StatusDeleted {
 		r.log.Debug("результат не записан — домен удалён",
 			"domain", res.Name, "zone_id", res.ZoneID, "domain_id", res.DomainID)
-		return false, nil
+		return false, 0, nil
 	}
 
 	// Итог домена: строка заблокирована предчтением и не удалена — охрана
@@ -433,13 +505,13 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	// последнего эпизода (T-164).
 	tag, err := tx.Exec(ctx, recordDomainSQL, res.ZoneID, res.DomainID, int16(status), res.Cutoff)
 	if err != nil {
-		return false, fmt.Errorf("httpworker: домен %s: запись результата: статус: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: статус: %w", res.Name, err)
 	}
 	if tag.RowsAffected() != 1 {
 		// Строка заблокирована и не удалена — недостижимо (страховка
 		// прямых вызовов/ручных правок); тихий пропуск дельт сделал бы
 		// счётчики ложью.
-		return false, fmt.Errorf("httpworker: домен %s: запись результата: статус: затронуто %d строк", res.Name, tag.RowsAffected())
+		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: статус: затронуто %d строк", res.Name, tag.RowsAffected())
 	}
 	// RowsAffected итогового UPDATE — дельта суточного счётчика проверок
 	// (T-179, TZ_slow_done_today §5): не число записей subdomain_results
@@ -466,10 +538,10 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	if renderPending {
 		tag, err := tx.Exec(ctx, renderSetPendingSQL, res.ZoneID, res.DomainID)
 		if err != nil {
-			return false, fmt.Errorf("httpworker: домен %s: флаг render_pending: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: домен %s: флаг render_pending: %w", res.Name, err)
 		}
 		if tag.RowsAffected() > 1 {
-			return false, fmt.Errorf("httpworker: домен %s: флаг render_pending: затронуто %d строк", res.Name, tag.RowsAffected())
+			return false, 0, fmt.Errorf("httpworker: домен %s: флаг render_pending: затронуто %d строк", res.Name, tag.RowsAffected())
 		}
 		bumpDebt = tag.RowsAffected() == 1
 	}
@@ -479,11 +551,11 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	// (T-044).
 	oldHashes, err := recordDeleteOld(ctx, tx, res.ZoneID, res.DomainID)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	for _, h := range oldHashes {
 		if err := content.SwapRefTx(ctx, tx, h, content.Hash{}); err != nil {
-			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
 
@@ -495,10 +567,10 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	if len(batch.zone) > 0 {
 		tag, err := tx.Exec(ctx, recordInsertSQL, batch.args()...)
 		if err != nil {
-			return false, fmt.Errorf("httpworker: домен %s: запись результата: строки: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: строки: %w", res.Name, err)
 		}
 		if int(tag.RowsAffected()) != len(batch.zone) {
-			return false, fmt.Errorf("httpworker: домен %s: вставлено %d строк из %d", res.Name, tag.RowsAffected(), len(batch.zone))
+			return false, 0, fmt.Errorf("httpworker: домен %s: вставлено %d строк из %d", res.Name, tag.RowsAffected(), len(batch.zone))
 		}
 		// Строки эпизода — дельта часовой корзины темпа (T-203): все
 		// вставленные строки несут checked_at = now() транзакции — час
@@ -535,13 +607,13 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		return nil
 	}
 	if err := shiftZone(); err != nil {
-		return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 	}
 	// Счётчик долга — последним шагом транзакции (та же фиксация, §3.4:
 	// откат откатывает пару; окно блокировки строки счётчика — минимум).
 	if bumpDebt {
 		if err := renderBumpDebtCounter(ctx, tx, 1); err != nil {
-			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
 	// Суточный счётчик проверок — тем же «хвостовым» шагом (T-179):
@@ -556,7 +628,7 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	// вместе (§3.4); сбой XACK вернёт доставку — повторная запись
 	// добавит ещё событие (§5.1, сводит реконсиляция).
 	if err := recordBumpChecksCounter(ctx, tx, recorded); err != nil {
-		return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 	}
 	// Числитель доли temp_error (T-182) — следом за знаменателем checks:
 	// дельта — только у temp_error-эпизода (вердикт итогового UPDATE
@@ -567,7 +639,7 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	// блокировок; откат откатывает результат и обе дельты вместе (§3.4).
 	if status == model.StatusTempError {
 		if err := recordBumpTempErrCounter(ctx, tx, recorded); err != nil {
-			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 		// Корзина зрелости (T-202) — замыкает цепочку дельт: последней
 		// среди строк счётчика (порядок реконсиляции «… → temp_error: →
@@ -576,7 +648,7 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		// DNS-этап (dnsworker/result.go), и этот оператор: оба пишут
 		// одинаковое имя из current_date той же транзакции записи.
 		if err := recordBumpRetryMatureCounter(ctx, tx, recorded); err != nil {
-			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
 	// Часовая корзина хвостов переанализа (T-204) — за корзиной ретрая,
@@ -586,7 +658,7 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	// без записей) оператор не выполняет вовсе.
 	if inserted > 0 {
 		if err := recordBumpReanalyzeCounter(ctx, tx, inserted); err != nil {
-			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
 	// Часовая корзина темпа (T-203) — финал цепочки дельт счётчика:
@@ -598,41 +670,13 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	// пустые upsert-проходы не греют блокировку корзины.
 	if inserted > 0 {
 		if err := recordBumpResultsCounter(ctx, tx, inserted); err != nil {
-			return false, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("httpworker: домен %s: запись результата: фиксация: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: фиксация: %w", res.Name, err)
 	}
-
-	// Публикация q:analyze после записи (§5.5 п. 9): Result указывает на
-	// строку — она обязана существовать к моменту потребления. Все записи
-	// домена: анализ идёт по каждому результату субдомен×вариант, рендер
-	// (T-067) позже заменит контент и опубликует заново — граница этапов,
-	// не фильтр здесь.
-	for i := range batch.pub {
-		if _, err := r.q.Publish(ctx, queue.StreamAnalyze, batch.pub[i]); err != nil {
-			return true, fmt.Errorf("httpworker: домен %s: публикация q:analyze (запись %d/%d): %w",
-				res.Name, i+1, len(batch.pub), err)
-		}
-	}
-
-	// q:render по SPA-записям (T-066, §5.5 п. 8): после фиксации — как и
-	// q:analyze, Result указывает на строку. Только при свободной очереди:
-	// переполнение уже закрыто флагом в транзакции. Публикация мимо
-	// WatermarkPublisher (T-026) — ёмкость проверена выше, ожидание здесь
-	// задержало бы XACK (§5.6).
-	if len(renderKeys) > 0 && !renderPending {
-		if err := r.render.Publish(ctx, renderKeys); err != nil {
-			return true, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
-		}
-	}
-
-	r.log.Debug("HTTP-результат записан",
-		"domain", res.Name, "status", status.String(), "records", len(batch.zone),
-		"swapped_refs", len(oldHashes), "cutoff", res.Cutoff,
-		"render_pending", renderPending, "q_render", len(renderKeys))
-	return true, nil
+	return true, len(oldHashes), nil
 }
 
 // recordDeleteOld удаляет старые строки домена и возвращает агрегированные

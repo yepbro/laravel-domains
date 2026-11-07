@@ -135,7 +135,7 @@ func newAccEnv(t *testing.T) *accEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recorder, err := httpworker.NewRecorder(pool, q, nil)
+	recorder, err := httpworker.NewRecorder(pool, q, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1034,7 +1034,7 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec, err := httpworker.NewRenderRecorder(env.pool, env.q, renderQ, nil)
+	rec, err := httpworker.NewRenderRecorder(env.pool, env.q, renderQ, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1206,7 +1206,7 @@ func TestAccept03_RenderFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec, err := httpworker.NewRenderRecorder(env.pool, env.q, renderQ, nil)
+	rec, err := httpworker.NewRenderRecorder(env.pool, env.q, renderQ, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

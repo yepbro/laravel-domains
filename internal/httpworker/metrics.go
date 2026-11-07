@@ -72,6 +72,7 @@ type Metrics struct {
 	perIPWait prometheus.Observer    // crawler_http_per_ip_wait_seconds (T-165)
 	cutoff    prometheus.Counter     // crawler_http_dead_host_cutoff_tasks_total (T-164)
 	cutSkip   prometheus.Counter     // crawler_http_dead_host_cutoff_skipped_checks_total (T-164)
+	dbRetried prometheus.Counter     // crawler_db_deadlock_retried_total (T-268)
 }
 
 // NewMetrics регистрирует приборы HTTP-этапа в реестре reg (каррированные
@@ -134,6 +135,9 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 			Name: "crawler_http_dead_host_cutoff_skipped_checks_total",
 			Help: "Проверки (субдомен × протокол), не выполненные из-за dead-host cutoff (T-164), — сэкономленный пул задачи. Доля ложных cutoff (<1%, критерий T-164) меряется контрольной выборкой по битам dead_host_cutoff в domains.flags.",
 		}).WithLabelValues(),
+		// Счётчик 40P01-повторов транзакции записи (T-268): единые
+		// имя/HELP для всех сервисов — конструктор internal/metrics.
+		dbRetried: metrics.NewDBDeadlockRetried(reg),
 	}
 }
 
@@ -225,4 +229,14 @@ func (m *Metrics) PerIPWait(wait time.Duration) {
 		return
 	}
 	m.perIPWait.Observe(wait.Seconds())
+}
+
+// DBDeadlockRetried — транзакция БД повторена после дедлока 40P01
+// (T-268): +1 к счётчику; хук db.RetryDeadlock записателя результата
+// (attempt — номер повтора, ряд один, метка зарезервирована за сервисом).
+func (m *Metrics) DBDeadlockRetried(attempt int) {
+	if m == nil {
+		return
+	}
+	m.dbRetried.Inc()
 }

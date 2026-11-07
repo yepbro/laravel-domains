@@ -1,5 +1,6 @@
 // Юнит-тесты записи результата HTTP-эпизода и публикации q:analyze (T-058;
-// ТЗ 5.5 пп. 7, 9, §6.1, §7, §8, 3.4) на фейковых пуле и очереди — без БД,
+// ТЗ 5.5 пп. 7, 9, §6.1, §7, §8, 3.4; ретрай 40P01 транзакции записи —
+// T-268) на фейковых пуле и очереди — без БД,
 // Redis и сети. Фейковый пул живёт семантикой таблиц (domains, contents,
 // subdomain_results) с транзакциями-снапшотами: проверяются точные SQL и
 // параметры, порядок «запись → публикация q:analyze», границы транзакции
@@ -26,7 +27,9 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"crawler/internal/content"
+	"crawler/internal/db"
 	"crawler/internal/httpfetch"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 	"crawler/internal/queue"
 )
@@ -185,13 +188,14 @@ type recordFakePool struct {
 	txs      int // создано транзакций
 	beginErr error
 
-	failExec   map[string]error // сбой Exec по точному SQL
-	deleteErr  error
-	commitErr  error
-	insertTag  int64 // RowsAffected INSERT (0 — честный ответ)
-	matureTag  int64 // RowsAffected upsert корзины зрелости (0 — честный ответ)
-	reanTag    int64 // RowsAffected upsert корзины хвостов (0 — честный ответ)
-	resultsTag int64 // RowsAffected upsert корзины темпа (0 — честный ответ)
+	failExec     map[string]error // сбой Exec по точному SQL (все попытки)
+	failExecOnce map[string]error // сбой Exec по точному SQL — одна первая попытка (фолт-инъекция 40P01, T-268)
+	deleteErr    error
+	commitErr    error
+	insertTag    int64 // RowsAffected INSERT (0 — честный ответ)
+	matureTag    int64 // RowsAffected upsert корзины зрелости (0 — честный ответ)
+	reanTag      int64 // RowsAffected upsert корзины хвостов (0 — честный ответ)
+	resultsTag   int64 // RowsAffected upsert корзины темпа (0 — честный ответ)
 
 	mu sync.Mutex
 }
@@ -394,6 +398,12 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 	}
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
+	// Разовая фолт-инъекция (T-268): первая попытка оператора падает
+	// дедлоком 40P01, повтор (после отката транзакции-попытки) — проходит.
+	if err, ok := t.pool.failExecOnce[sql]; ok {
+		delete(t.pool.failExecOnce, sql)
+		return pgconn.CommandTag{}, err
+	}
 	if err, ok := t.pool.failExec[sql]; ok {
 		return pgconn.CommandTag{}, err
 	}
@@ -852,7 +862,7 @@ func recordSilentResult(timeout bool) *DomainResult {
 
 func recordRecorder(t *testing.T, pool *recordFakePool, q *recordFakeQueue) *Recorder {
 	t.Helper()
-	r, err := NewRecorder(pool, q, nil)
+	r, err := NewRecorder(pool, q, nil, nil)
 	if err != nil {
 		t.Fatalf("NewRecorder: %v", err)
 	}
@@ -1655,6 +1665,153 @@ func TestRecordTransactionFailures(t *testing.T) {
 	})
 }
 
+// TestRecordDeadlockRetry — фолт-инъекция 40P01 (T-268): дедлок внутри
+// транзакции записи повторяется ЦЕЛИКОМ (попытка откатывается и
+// исполняется заново — begin ×2, половинчатых состояний нет), публикация
+// q:analyze — одна (у упавшей попытки её не было); после исчерпания
+// повторов ошибка наружу (доставка без XACK, ТЗ 3.4), метрика
+// crawler_db_deadlock_retried_total растёт на каждый повтор.
+func TestRecordDeadlockRetry(t *testing.T) {
+	deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
+	res, _ := recordRichResult()
+	seed := func(t *testing.T) (*recordFakePool, *recordFakeQueue) {
+		pool := newRecordFakePool()
+		pool.recordSeedDomain(7, 91, model.StatusNew, 0)
+		return pool, &recordFakeQueue{j: pool.j}
+	}
+
+	t.Run("дедлок поглощён — транзакция повторена целиком", func(t *testing.T) {
+		pool, q := seed(t)
+		reg := metrics.New("http-worker")
+		pool.failExecOnce = map[string]error{recordDomainSQL: deadlock}
+		r, err := NewRecorder(pool, q, NewMetrics(reg), nil)
+		if err != nil {
+			t.Fatalf("NewRecorder: %v", err)
+		}
+		ok, err := r.RecordAndPublish(context.Background(), res)
+		if err != nil || !ok {
+			t.Fatalf("RecordAndPublish = (%v, %v), want (true, nil) — дедлок поглощён", ok, err)
+		}
+		// Две попытки транзакции: первая откатилась на UPDATE, вторая
+		// прошла до Commit; публикации — после фиксации, одна пачка
+		// (по одной на запись субдомен×вариант, дубля от попытки нет).
+		if pool.begins != 2 {
+			t.Errorf("транзакций-попыток = %d, want 2 (повтор целиком)", pool.begins)
+		}
+		if got := pool.j.count(recordEvCommit); got != 1 {
+			t.Errorf("Commit = %d, want 1 (зафиксирована только вторая попытка)", got)
+		}
+		if got, want := len(q.publishesSnapshot()), res.RecordCount(); got != want {
+			t.Errorf("публикаций q:analyze = %d, want %d (одна пачка после фиксации)", got, want)
+		}
+		// Повтор честный: попытка 1 закоммитила ничего, счётчики не задвоены.
+		if got := pool.checksValue(); got != 1 {
+			t.Errorf("суточный счётчик = %d, want 1 (без задвоения дельт)", got)
+		}
+		if got := httpMetricValue(t, reg, "crawler_db_deadlock_retried_total", nil); got != 1 {
+			t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
+		}
+	})
+
+	t.Run("дедлок корзины счётчиков — тот же ретрай транзакции", func(t *testing.T) {
+		pool, q := seed(t)
+		pool.failExecOnce = map[string]error{recordChecksBumpSQL: deadlock}
+		ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
+		if err != nil || !ok {
+			t.Fatalf("RecordAndPublish = (%v, %v), want (true, nil)", ok, err)
+		}
+		if pool.begins != 2 || pool.checksValue() != 1 {
+			t.Errorf("попыток %d, счётчик %d — want 2 и 1 (хвостовые дельты в повторе)", pool.begins, pool.checksValue())
+		}
+	})
+
+	t.Run("исчерпание повторов — ошибка наружу, состояние откатано", func(t *testing.T) {
+		pool, q := seed(t)
+		reg := metrics.New("http-worker")
+		pool.failExec = map[string]error{recordDomainSQL: deadlock}
+		r, err := NewRecorder(pool, q, NewMetrics(reg), nil)
+		if err != nil {
+			t.Fatalf("NewRecorder: %v", err)
+		}
+		ok, err := r.RecordAndPublish(context.Background(), res)
+		if err == nil || !db.IsDeadlock(err) || ok {
+			t.Fatalf("RecordAndPublish = (%v, %v), want (false, 40P01) наружу", ok, err)
+		}
+		if want := 1 + db.MaxDeadlockRetries; pool.begins != want {
+			t.Errorf("попыток = %d, want %d (первая + повторы)", pool.begins, want)
+		}
+		if dom := pool.domains[recordDomainKey{zone: 7, id: 91}]; dom.status != model.StatusNew ||
+			dom.checkState != model.CheckStateQueued {
+			t.Errorf("домен изменён: %v/%v — все попытки обязаны откатиться", dom.status, dom.checkState)
+		}
+		if got := len(q.publishesSnapshot()); got != 0 {
+			t.Errorf("публикаций %d при незаписанном результате", got)
+		}
+		if got := httpMetricValue(t, reg, "crawler_db_deadlock_retried_total", nil); got != db.MaxDeadlockRetries {
+			t.Errorf("crawler_db_deadlock_retried_total = %v, want %d", got, db.MaxDeadlockRetries)
+		}
+	})
+}
+
+// TestRecordDeadlockRunAck — критерий приёмки T-268 целиком: дедлок
+// транзакции записи в цепочке OnResult поглощён повтором — доставка
+// q:http подтверждается (XACK), задача не сгорает в ределивери.
+func TestRecordDeadlockRunAck(t *testing.T) {
+	body := "<html>" + strings.Repeat("страница для проверки ретрая дедлока ", 30) + "</html>"
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"deadlock.test":         {status: 200, body: body},
+		"http://deadlock.test/": {status: 200, body: body},
+	})
+	reg := metrics.New("http-worker")
+	w := workerWorker(t, fetch, nil)
+	pool := newRecordFakePool()
+	pool.recordSeedDomain(5, 42, model.StatusNew, 0)
+	pool.failExecOnce = map[string]error{
+		recordDomainSQL: &pgconn.PgError{Code: "40P01", Message: "deadlock detected"},
+	}
+	q := &workerFakeQueue{deliveries: []queue.Delivery{workerDelivery(t, queue.HTTPTask{
+		TaskID: "task-1", ZoneID: 5, DomainID: 42, Name: "deadlock.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")},
+	})}}
+	rec, err := NewRecorder(pool, q, NewMetrics(reg), nil)
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+	opts := Options{OnResult: func(c context.Context, res *DomainResult) error {
+		_, err := rec.RecordAndPublish(c, res)
+		return err
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	deadline := time.After(5 * time.Second)
+	for q.ackedCount() == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("XACK не дождались: дедлок не поглощён — задача сгорает в ределивери")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	if pool.begins != 2 {
+		t.Errorf("попыток транзакции = %d, want 2", pool.begins)
+	}
+	if got := httpMetricValue(t, reg, "crawler_db_deadlock_retried_total", nil); got != 1 {
+		t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
+	}
+}
+
 // --- публикация: после записи, ошибки не молчат -------------------------------
 
 func TestRecordPublishFailures(t *testing.T) {
@@ -1735,10 +1892,10 @@ func TestRecordValidation(t *testing.T) {
 		if ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), nil); err != nil || ok {
 			t.Fatalf("nil: ok=%v err=%v", ok, err)
 		}
-		if _, err := NewRecorder(nil, q, nil); err == nil {
+		if _, err := NewRecorder(nil, q, nil, nil); err == nil {
 			t.Fatal("NewRecorder без пула прошёл")
 		}
-		if _, err := NewRecorder(pool, nil, nil); err == nil {
+		if _, err := NewRecorder(pool, nil, nil, nil); err == nil {
 			t.Fatal("NewRecorder без очереди прошёл")
 		}
 	})

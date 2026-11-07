@@ -353,7 +353,7 @@ func httpWorkerSetup(t *testing.T, mutate func(*httpfetch.Options)) *httpWorkerE
 	if err != nil {
 		t.Fatal(err)
 	}
-	recorder, err := httpworker.NewRecorder(pool, q, nil)
+	recorder, err := httpworker.NewRecorder(pool, q, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

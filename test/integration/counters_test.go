@@ -244,13 +244,13 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 
 	// DNS-эпизод переводит queued → done (терминальный статус не нужен:
 	// ветка «есть адреса» — итог за HTTP-этапом).
-	ok, err := dnsworker.RecordEpisode(ctx, pool, zone, ids[0], dnsworker.EpisodeResult{Mask: 1})
+	ok, err := dnsworker.RecordEpisode(ctx, pool, zone, ids[0], dnsworker.EpisodeResult{Mask: 1}, nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordEpisode: ok=%v err=%v", ok, err)
 	}
 	countersVerifyEmpty(t, pool, "после DNS-перехода")
 
-	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil)
+	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil, nil)
 	if err != nil {
 		t.Fatalf("NewRecorder: %v", err)
 	}
@@ -359,7 +359,7 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("стартовый проход: %v", err)
 	}
-	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil)
+	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil, nil)
 	if err != nil {
 		t.Fatalf("NewRecorder: %v", err)
 	}
@@ -457,7 +457,7 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("стартовый проход: %v", err)
 	}
-	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil)
+	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil, nil)
 	if err != nil {
 		t.Fatalf("NewRecorder: %v", err)
 	}
@@ -493,7 +493,7 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 	if ok, err := dnsworker.RecordEpisode(ctx, pool, zone, ids[2], dnsworker.EpisodeResult{
 		SetStatus: true,
 		Status:    model.StatusTempError,
-	}); err != nil || !ok {
+	}, nil); err != nil || !ok {
 		t.Fatalf("temp_error-эпизод DNS: ok=%v err=%v", ok, err)
 	}
 	if got := countersRetryMatureToday(t, pool); got != 2 {
@@ -592,7 +592,7 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 	recorded, err := dnsworker.RecordEpisode(ctx, fail, zone, ids[0], dnsworker.EpisodeResult{
 		SetStatus: true,
 		Status:    model.StatusTempError,
-	})
+	}, nil)
 	if err == nil || !strings.Contains(err.Error(), "инкремент корзины retry_mature") {
 		t.Fatalf("RecordEpisode = (%v, %v), want (true, ошибка инкремента)", recorded, err)
 	}
@@ -705,7 +705,7 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 
 	zone := countersSeedZone(t, pool, "days.test")
 	ids := countersSeedDomains(t, pool, zone, "d", 2, model.CheckStateDone, model.StatusNew)
-	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil)
+	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil, nil)
 	if err != nil {
 		t.Fatalf("NewRecorder: %v", err)
 	}
@@ -800,14 +800,14 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	// Терминальный статус (not_delegated): queued → done.
 	ok, err := dnsworker.RecordEpisode(ctx, pool, zone, ids[1], dnsworker.EpisodeResult{
 		SetStatus: true, Status: model.StatusNotDelegated, Mask: 1,
-	})
+	}, nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordEpisode terminal: ok=%v err=%v", ok, err)
 	}
 	countersVerifyEmpty(t, pool, "после терминального статуса")
 
 	// Ветка «есть адреса»: pending → done.
-	ok, err = dnsworker.RecordEpisode(ctx, pool, zone, ids[0], dnsworker.EpisodeResult{Mask: 3})
+	ok, err = dnsworker.RecordEpisode(ctx, pool, zone, ids[0], dnsworker.EpisodeResult{Mask: 3}, nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordEpisode keep-status: ok=%v err=%v", ok, err)
 	}
@@ -816,14 +816,14 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	// Повторная доставка уже зафиксированного эпизода — no-op.
 	ok, err = dnsworker.RecordEpisode(ctx, pool, zone, ids[1], dnsworker.EpisodeResult{
 		SetStatus: true, Status: model.StatusNotDelegated, Mask: 1,
-	})
+	}, nil)
 	if err != nil || ok {
 		t.Fatalf("RecordEpisode дубль: ok=%v err=%v, хочу (false, nil)", ok, err)
 	}
 	countersVerifyEmpty(t, pool, "после дубля доставки")
 
 	// Диагноз invalid: queued → done, строка покидает цикл.
-	ok, err = dnsworker.RecordInvalid(ctx, pool, zone, ids[2])
+	ok, err = dnsworker.RecordInvalid(ctx, pool, zone, ids[2], nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordInvalid: ok=%v err=%v", ok, err)
 	}
@@ -1112,7 +1112,7 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("стартовый проход: %v", err)
 	}
-	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil)
+	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil, nil)
 	if err != nil {
 		t.Fatalf("NewRecorder: %v", err)
 	}

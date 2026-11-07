@@ -56,6 +56,7 @@ func TestMetricsNilSafe(t *testing.T) {
 	var m *Metrics
 	m.Episode(time.Second)             // no-op, не паникует
 	m.DomainStatus(model.StatusNoHTTP) // no-op
+	m.DBDeadlockRetried(1)             // no-op (T-268)
 }
 
 func TestMetricsRegistered(t *testing.T) {
@@ -70,6 +71,8 @@ func TestMetricsRegistered(t *testing.T) {
 	m.DomainStatus(model.StatusNotDelegated)
 	m.DomainStatus(model.StatusTempError)
 	m.DomainStatus(model.StatusTempError)
+	m.DBDeadlockRetried(1) // T-268
+	m.DBDeadlockRetried(2)
 
 	// Проверки серий (имя + значение метки): задачи и длительности.
 	if got := dnsMetricValue(t, reg, "crawler_stage_tasks_total", metrics.StageDNS); got != 2 {
@@ -86,6 +89,9 @@ func TestMetricsRegistered(t *testing.T) {
 	}
 	if got := dnsMetricValue(t, reg, "crawler_domain_status_total", model.StatusAlive.String()); got != -1 {
 		t.Errorf("crawler_domain_status_total{alive} = %v, want серия отсутствует (живой статус пишет HTTP-этап)", got)
+	}
+	if got := dnsMetricValue(t, reg, "crawler_db_deadlock_retried_total", "dns-worker"); got != 2 {
+		t.Errorf("crawler_db_deadlock_retried_total = %v, want 2 (T-268)", got)
 	}
 }
 

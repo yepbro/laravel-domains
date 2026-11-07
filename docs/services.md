@@ -215,6 +215,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`; сборка воркера B фолбэка — `q:render-fallback`, T-236/T-240), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`); ряд `queue="q:render-fallback"` — остаток для баланс-чека фолбэка (T-245: `published = consumed + остаток + похороненные` — формула и границы применимости в решениях ниже, шаг 4 приёмки ТЗР рендера §6.2) |
 | `crawler_render_pending_domains` | gauge | — | monitor (T-175) | цикл рендер-долга (`monitor.render_debt_interval`, 5 мин): домены с битом `render_pending` — счётчик `crawler_counters['render_pending']` (миграция 000015) ведут переходы бита в транзакции перехода; авторитетное значение периодически перезаписывает реконсиляция T-178 (наблюдаемость без seq scan по 41,8 млн строк; лаг `q:render` — `crawler_queue_depth{queue="q:render"}`, долг = сумма — алерт `render_debt` и строка отчёта нагрузки T-173) |
 | `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод записи в q:dead (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
+| `crawler_db_deadlock_retried_total` | counter | — | dns-worker, http-worker, scheduler (T-268) | повторы операторов БД после дедлока 40P01 (`db.RetryDeadlock`, страховка поверх инварианта порядка блокировок счётчиков T-267): http-worker — транзакция записи результата целиком (`RecordAndPublish`), dns-worker — autocommit-операторы записи эпизода (`RecordEpisode`: перевод в done, инкремент корзины `retry_mature`, диагноз invalid) без повторного DNS-эпизода, scheduler — транзакция решения ретрая temp_error (`retryDecide`); дренаж ретрая переживает ошибку пачки (до 3 подряд). Единичные события — норма (страховка работает, задача не уходит в ределивери полным эпизодом); устойчивый рост — новый цикл блокировок: разбор runbooks.md §2.8 |
 | `crawler_redis_memory_ratio` | gauge | — | monitor (T-154) | проход алертов: `used_memory/maxmemory` из `INFO memory` (обёртка источника `monitor.NewRedisMemoryMetrics`); при noeviction — прокси-метрика предстоящих OOM-отказов записи (алерт `redis_memory` при ≥ 0.8); `maxmemory` не задан — ряд не пишется |
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | суммы инкрементальных счётчиков зон (T-178: `sum(zones.domains_pending/queued)`, базовое множество `status <> deleted`) с периодом `scheduler.backlog_interval` (по умолчанию 5 мин) — `scheduler.BacklogLoop`: чтение справочника вместо прохода по 47 млн строк (ТЗИ §8.4) |
 | `crawler_backlog_pass_seconds` / `crawler_backlog_skipped_ticks_total` | histogram / counter | — | scheduler (T-161) | каждый проход backlog: длительность (проход — суммы справочника, T-178) и пропущенные тики single-flight (проход дольше интервала — накопившийся тик не запускает новый проход, Warn в журнале); рост пропусков — поднимать `scheduler.backlog_interval` |
@@ -347,13 +348,17 @@ T-109) и повторных проверок `temp_error`
 решения ретрая, авторитет — реконсиляция (строки
 `retry_mature:YYYY-MM-DD`, `docs/schema.md`); стационар без зрелых не
 трогает `domains` вовсе). Решения пачки (назначение повтора и итоговый
-статус) идут раздельными транзакциями: каждая соблюдает порядок
+статус) идут раздельными транзакциями под 40P01-ретраем (T-268,
+`retryDecide` — повтор целиком, счётчик
+`crawler_db_deadlock_retried_total`): каждая соблюдает порядок
 блокировок «domains → zones → counters» (инвариант `docs/schema.md`)
 — общая транзакция держала корзины `retry_mature:` поверх повторного
 захвата domains-строк (ребро «счётчики → domains», цикл дедлока 40P01
 с записью результата http-worker — runbooks §2.8); сбой между
 половинами безопасен: охраны идемпотентны, незавершённая половина —
-кандидаты следующего прохода. Проход возврата lease — ДВА оператора в одной
+кандидаты следующего прохода; ошибка пачки не срывает часовой дренаж —
+до трёх упавших подряд, далее до следующего тика (T-268, инцидент
+07.11: 118 тыс. доменов ждали тик из-за одного WARN). Проход возврата lease — ДВА оператора в одной
 транзакции: SELECT пачки по ключу `domains_lease_idx` (T-104) с
 композитным курсором `(queued_at, zone_id, id)` и перевод
 `UPDATE … FROM unnest` PK-пробами с guard-перепроверками на момент
