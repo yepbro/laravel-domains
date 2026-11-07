@@ -335,6 +335,110 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 	})
 
+	// Регрессия дедлока 40P01 счётчиков: решения пачки (назначение
+	// повтора и финализация) выполняются РАЗДЕЛЬНЫМИ транзакциями.
+	// Сессия-держатель держит SELECT FOR UPDATE domains-строку кандидата
+	// финализации — как транзакция записи результата http-worker держит
+	// свои domains-строки, пока не дойдёт до хвостовых счётчиков
+	// (checks:/temp_error:/retry_mature:). Половина повтора обязана
+	// зафиксироваться и отпустить свои блокировки (domains/зоны/корзина
+	// retry_mature), НЕ дожидаясь финализации: в общей транзакции пачки
+	// она висела бы на чужой domains-строке, держа корзину счётчика, —
+	// ребро «счётчики → domains» цикла дедлока с записью результата.
+	t.Run("половины пачки — независимые транзакции (регрессия 40P01)", func(t *testing.T) {
+		seed("mixreq", model.StatusTempError, model.CheckStateDone, "2020-01-01", 0) // повтор
+		seed("mixfin", model.StatusTempError, model.CheckStateDone, "2020-01-01", int16(scheduler.DefaultRetryMaxRetries))
+		// Guard-фикстура самодостаточна: хвосты сабтеста дренажа выше —
+		// корзина вчерашнего дня = 2 (сид guard'а) и декременты
+		// 2020-01-01 = −2 (их сумма нулевая, но новый проход обязан
+		// опираться только на свою корзину) — обнуляются; корзина дат
+		// эпизодов кандидатов := 2. Строки не удаляются: корзину
+		// вчерашнего дня читает сабтест реконсиляции ниже.
+		if _, err := pool.Exec(ctx,
+			"UPDATE crawler_counters SET value = 0 WHERE name LIKE 'retry_mature:%'",
+		); err != nil {
+			t.Fatalf("обнуление корзин зрелости: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			"INSERT INTO crawler_counters (name, value, updated_at) "+
+				"VALUES ('retry_mature:2020-01-01', 2, now()) "+
+				"ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+		); err != nil {
+			t.Fatalf("reset корзины зрелости: %v", err)
+		}
+
+		// Держатель: domains-строка кандидата финализации захвачена до
+		// прохода (образ транзакции записи результата).
+		holder, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin держателя: %v", err)
+		}
+		defer func() { _ = holder.Rollback(ctx) }()
+		if _, err := holder.Exec(ctx,
+			"SELECT id FROM domains WHERE zone_id = $1 AND label = $2 FOR UPDATE", zone, "mixfin",
+		); err != nil {
+			t.Fatalf("FOR UPDATE держателя: %v", err)
+		}
+
+		type onceResult struct {
+			res scheduler.RetryResult
+			err error
+		}
+		done := make(chan onceResult, 1)
+		go func() {
+			res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{})
+			done <- onceResult{res, err}
+		}()
+
+		// Пока держатель не отпустил строку финализации, половина
+		// повтора уже зафиксирована и видна из другой сессии: retryRequeue
+		// закоммичен ДО ожидания retryFinalize. До фикса (общая
+		// транзакция пачки) перевод повтора висел бы вместе с
+		// финализацией — poll упирался бы в дедлайн.
+		deadline := time.Now().Add(10 * time.Second)
+		var state int16
+		for time.Now().Before(deadline) {
+			if err := pool.QueryRow(ctx,
+				"SELECT check_state FROM domains WHERE zone_id = $1 AND label = $2", zone, "mixreq",
+			).Scan(&state); err != nil {
+				t.Fatalf("чтение mixreq: %v", err)
+			}
+			if state == int16(model.CheckStatePending) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if state != int16(model.CheckStatePending) {
+			t.Fatalf("половина повтора не зафиксирована до финализации: check_state mixreq = %d", state)
+		}
+
+		// Держатель отпускает строку — финализация проходит, проход
+		// завершается парой {1, 1}.
+		if err := holder.Rollback(ctx); err != nil {
+			t.Fatalf("откат держателя: %v", err)
+		}
+		select {
+		case r := <-done:
+			if r.err != nil {
+				t.Fatalf("RetryOnce: %v", r.err)
+			}
+			if want := (scheduler.RetryResult{Requeued: 1, Finalized: 1}); r.res != want {
+				t.Errorf("итог = %+v, want %+v", r.res, want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("RetryOnce не завершился после освобождения строки")
+		}
+		var finStatus int16
+		if err := pool.QueryRow(ctx,
+			"SELECT status FROM domains WHERE zone_id = $1 AND label = $2", zone, "mixfin",
+		).Scan(&finStatus); err != nil {
+			t.Fatalf("чтение mixfin: %v", err)
+		}
+		if finStatus != int16(model.StatusDelegatedNoAddress) {
+			t.Errorf("статус mixfin = %d, want delegated_no_address (финализация после освобождения)", finStatus)
+		}
+	})
+
 	// Стационар (граница доверия guard, TZ T-202): зрелых нет — тяжёлая
 	// выборка не выполняется вовсе, тик стоит одну сумму корзин.
 	t.Run("зрелых нет — тяжёлая выборка не выполняется", func(t *testing.T) {

@@ -8,8 +8,9 @@
 //
 // Проход RetryOnce пачкой до opts.BatchSize выбирает кандидатов — домены
 // в статусе temp_error, чья проверка завершена (check_state = done, ТЗ 7)
-// и last_checked_at старше temp_error_retry_after, — и в одной транзакции
-// делит их по счётчику попыток domains.temp_attempts (миграция 000005):
+// и last_checked_at старше temp_error_retry_after, — и делит их по
+// счётчику попыток domains.temp_attempts (миграция 000005) на два решения,
+// каждое — в СОБСТВЕННОЙ транзакции (порядок блокировок, retryDecide):
 //
 //   - попыток меньше N — назначается повтор: check_state → pending
 //     (домена перевыберет диспетчер T-027 и поставит в q:dns, T-028),
@@ -236,10 +237,17 @@ var retryMatureSQL = "SELECT coalesce(sum(value), 0) FROM crawler_counters " +
 	"AND name < 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')"
 
 // RetryDB — пул для прохода: db.DB, из которого можно начать транзакцию.
-// Оба решения пачки (назначение повтора и итоговый статус) атомарны в
-// одной транзакции: сбой между ними не оставляет половину пачки
-// обработанной (повтор прохода безопасен, ТЗ 3.4); *pgxpool.Pool
-// удовлетворяет интерфейсу.
+// Решения пачки (назначение повтора и итоговый статус) идут РАЗДЕЛЬНЫМИ
+// транзакциями (retryDecide): каждая по отдельности соблюдает конвенцию
+// порядка блокировок «domains → zones → counters, счётчики — последними»
+// (docs/schema.md, раздел crawler_counters); общая транзакция захватывала
+// бы domains-строки финализации, уже держа зоны и корзины счётчиков, —
+// ребро «счётчики → domains» замыкало цикл дедлока 40P01 с транзакциями
+// записи результата http-worker (инцидент retry-волны: пачки по 1000,
+// десятки корзин retry_mature до конца tx). Атомарность пачки не
+// критична: охраны обоих UPDATE идемпотентны, незавершённая половина
+// безопасно подбирается следующим проходом (ТЗ 3.4);
+// *pgxpool.Pool удовлетворяет интерфейсу.
 type RetryDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
@@ -310,11 +318,17 @@ type retryCandidate struct {
 
 // RetryOnce выполняет один проход повторных проверок (ТЗ 5.3, 6.2):
 // до opts.BatchSize доменов в статусе temp_error с завершённой
-// проверкой и last_checked_at старше RetryAfter в одной транзакции
-// получают либо назначенный повтор (check_state → pending,
-// temp_attempts + 1 — попыток меньше MaxRetries), либо итоговый статус
-// delegated_no_address (попытки исчерпаны, temp_attempts → 0). До
-// выборки — guard суммой корзин зрелости
+// проверкой и last_checked_at старше RetryAfter получают либо
+// назначенный повтор (check_state → pending, temp_attempts + 1 — попыток
+// меньше MaxRetries), либо итоговый статус delegated_no_address (попытки
+// исчерпаны, temp_attempts → 0). Решения пачки идут РАЗДЕЛЬНЫМИ
+// транзакциями (retryDecide): каждая соблюдает порядок блокировок
+// «domains → zones → counters» — общая транзакция захватывала бы
+// domains-строки финализации, уже держа зоны и корзины retry_mature
+// (ребро «счётчики → domains», цикл дедлока 40P01 с записью результата
+// http-worker); сбой между половинами безопасен — охраны обоих UPDATE
+// идемпотентны, незавершённая половина подберётся следующим проходом
+// (ТЗ 3.4). До выборки — guard суммой корзин зрелости
 // crawler_counters['retry_mature:…'] прошедших суток (T-202,
 // retryMatureCount): нулевая сумма возвращает пустой результат без
 // тяжёлой выборки. Повторный проход безопасен (ТЗ 3.4): домены в
@@ -348,7 +362,7 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 	if len(candidates) == 0 {
 		// Корзины видят зрелых, выборка — нет (дрейф корзин: кандидат ушёл
 		// мимо инкрементов/декрементов, ЛИБО редкие зрелые рассеяны и ранний
-		// останов LIMIT их не догнал): транзакция обновления не открывается,
+		// останов LIMIT их не догнал): транзакции решений не открываются,
 		// один холостой seq scan за тик до ближайшей реконсиляции —
 		// остаточный случай TZ T-191 §4.3, суженный T-202 с «всех temp_error»
 		// до «суммы корзин».
@@ -371,17 +385,9 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 		}
 	}
 
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return RetryResult{}, fmt.Errorf("scheduler: повторные проверки temp_error: транзакция: %w", err)
-	}
-	// Откат безусловно: после Commit — no-op. Прерванный проход не
-	// оставляет половинчатых изменений (ТЗ 3.4).
-	defer func() { _ = tx.Rollback(ctx) }()
-
 	var res RetryResult
 	if len(requeueZones) > 0 {
-		n, err := retryUpdate(ctx, tx, retryRequeueSQL, "назначение повтора", requeueZones, requeueIDs,
+		n, err := retryDecide(ctx, pool, retryRequeueSQL, "назначение повтора", requeueZones, requeueIDs,
 			int16(model.CheckStatePending), int16(model.StatusTempError), int16(model.CheckStateDone))
 		if err != nil {
 			return RetryResult{}, err
@@ -389,17 +395,54 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 		res.Requeued = n
 	}
 	if len(finalZones) > 0 {
-		n, err := retryUpdate(ctx, tx, retryFinalizeSQL, "итоговый статус", finalZones, finalIDs,
+		n, err := retryDecide(ctx, pool, retryFinalizeSQL, "итоговый статус", finalZones, finalIDs,
 			int16(model.StatusDelegatedNoAddress), int16(model.StatusTempError), int16(model.CheckStateDone))
 		if err != nil {
 			return RetryResult{}, err
 		}
 		res.Finalized = n
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return RetryResult{}, fmt.Errorf("scheduler: повторные проверки temp_error: фиксация: %w", err)
-	}
 	return res, nil
+}
+
+// retryDecide — одно решение пачки (назначение повтора или итоговый
+// статус) в собственной транзакции. Разделение — инвариант порядка
+// блокировок (docs/schema.md, раздел crawler_counters): каждый оператор
+// сам по себе лочит строки в порядке «domains → zones → counters»
+// (retryRequeueSQL: upd → zc → rm; retryFinalizeSQL: upd → rm), но ДВА
+// оператора в одной транзакции захватывают domains-строки второй
+// половины, уже держа зоны и корзины retry_mature:{даты} первой, —
+// ребро «счётчики → domains» против транзакций записи результата
+// http-worker и прохода реконсиляции monitor (обе идут «domains → … →
+// counters» и до счётчиков ждут своих domains-строк) замыкало цикл
+// дедлока 40P01: 9 случаев за 3 ч на retry-волне, задача q:http
+// ределиверилась полным повторным HTTP-эпизодом. Раздельные транзакции
+// каждую возвращают конвенции, циклы через http-worker рвутся; держать
+// локи каждой половины — один оператор, окно блокировки минимально.
+// Сбой между половинами не портит данные: охраны обоих UPDATE
+// перепроверяют status/check_state на момент записи, зафиксированная
+// половина остаётся (переведённые не кандидаты), незавершённая —
+// кандидаты следующего прохода (идемпотентность ТЗ 3.4); ошибка
+// половины возвращает ошибку прохода — RetryResult отбрасывается,
+// дренаж RetryTempErrors продолжит следующим тиком.
+func retryDecide(ctx context.Context, pool RetryDB, sql, kind string,
+	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16) (int, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: транзакция решения (%s): %w", kind, err)
+	}
+	// Откат безусловно: после Commit — no-op (стиль T-044). Прерванная
+	// половина не оставляет половинчатых изменений внутри себя (ТЗ 3.4).
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	n, err := retryUpdate(ctx, tx, sql, kind, zoneIDs, domainIDs, set, guardStatus, guardState)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: фиксация решения (%s): %w", kind, err)
+	}
+	return n, nil
 }
 
 // retryCandidates выбирает до limit кандидатов повтора (retrySelectSQL) —

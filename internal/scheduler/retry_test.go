@@ -1,6 +1,7 @@
 // Юнит-тесты повторных проверок temp_error (T-031, ТЗ 5.3, 6.2; guard
-// корзинами зрелости — T-202, закрепление плана выборки — T-191) на
-// фейковом pgx-пуле с транзакциями: точные SQL-тексты и параметры
+// корзинами зрелости — T-202, закрепление плана выборки — T-191,
+// раздельные транзакции решений — регрессия дедлока 40P01 счётчиков)
+// на фейковом pgx-пуле с транзакциями: точные SQL-тексты и параметры
 // (guard-чтение суммы корзин / SELECT кандидатов в транзакции
 // закрепления плана / UPDATE повтора / UPDATE итогового статуса с
 // декрементом корзины), последовательность SET LOCAL ×3 → SELECT, окно
@@ -115,12 +116,14 @@ type retryFakePool struct {
 	planErr     error            // ошибка закрепления плана (SET LOCAL)
 	requeueErr  error
 	finalizeErr error
-	beginErr    error
+	beginErr    error   // ошибка Begin, пока очередь beginErrs пуста
+	beginErrs   []error // FIFO ошибок Begin (nil — успешный Begin)
 	commitErrs  []error // FIFO ошибок Commit (кончилась — фиксация без ошибки)
 
 	guardQueries []retryCall // guard-чтения через пул
 	selectCalls  int         // тяжёлые SELECT кандидатов (в транзакциях закрепления)
 	begins       int
+	seq          int // монотонный порядок событий Begin/Commit (регрессия разделения tx решений)
 	txs          []*retryFakeTx
 }
 
@@ -171,12 +174,24 @@ func (p *retryFakePool) Begin(context.Context) (pgx.Tx, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.begins++
-	if p.beginErr != nil {
-		return nil, p.beginErr
+	if err := p.nextBeginErrLocked(); err != nil {
+		return nil, err
 	}
-	tx := &retryFakeTx{pool: p}
+	p.seq++
+	tx := &retryFakeTx{pool: p, beginSeq: p.seq}
 	p.txs = append(p.txs, tx)
 	return tx, nil
+}
+
+// nextBeginErrLocked — ошибка очередного Begin: FIFO beginErrs (nil —
+// успешный Begin), пустая очередь — постоянный beginErr.
+func (p *retryFakePool) nextBeginErrLocked() error {
+	if len(p.beginErrs) > 0 {
+		err := p.beginErrs[0]
+		p.beginErrs = p.beginErrs[1:]
+		return err
+	}
+	return p.beginErr
 }
 
 // stats — снимок счётчиков под замком (ожидание прогресса в тестах цикла).
@@ -203,7 +218,8 @@ func (p *retryFakePool) stats() retryStats {
 	return s
 }
 
-// retryFakeTx — транзакция фейкового пула: помнит вызовы и исход.
+// retryFakeTx — транзакция фейкового пула: помнит вызовы, исход и своё
+// место в порядке событий Begin/Commit пула.
 type retryFakeTx struct {
 	pgx.Tx // остальные методы pgx.Tx проход не использует
 
@@ -211,6 +227,8 @@ type retryFakeTx struct {
 	calls      []retryCall
 	committed  bool
 	rolledBack bool
+	beginSeq   int // номер события Begin пула (0 — транзакции нет)
+	commitSeq  int // номер события Commit пула (0 — фиксации не было)
 }
 
 // isSelect — транзакция выборки кандидатов (закрепление плана), а не
@@ -298,6 +316,8 @@ func (t *retryFakeTx) Commit(context.Context) error {
 		}
 	}
 	t.committed = true
+	t.pool.seq++
+	t.commitSeq = t.pool.seq
 	return nil
 }
 
@@ -552,11 +572,13 @@ func TestRetryOnceSQLAndFlow(t *testing.T) {
 		t.Errorf("guard-чтение = %+v, want %s без параметров", pool.guardQueries[0], retryMatureSQL)
 	}
 
-	// Две транзакции: выборка (закрепление плана + SELECT) и обновление.
-	if pool.begins != 2 || len(pool.txs) != 2 {
-		t.Fatalf("транзакций = %d, want 2 (выборка + обновление)", pool.begins)
+	// Три транзакции: выборка (закрепление плана + SELECT) и два решения
+	// пачки — назначение повтора и итоговый статус раздельно (регрессия
+	// дедлока 40P01, retryDecide).
+	if pool.begins != 3 || len(pool.txs) != 3 {
+		t.Fatalf("транзакций = %d, want 3 (выборка + повтор + итоговый статус)", pool.begins)
 	}
-	selTx, updTx := pool.txs[0], pool.txs[1]
+	selTx, requeueTx, finalizeTx := pool.txs[0], pool.txs[1], pool.txs[2]
 
 	// Выборка кандидатов: статус temp_error, состояние done, лимит пачки.
 	sel := retrySelectCall(t, selTx)
@@ -572,34 +594,96 @@ func TestRetryOnceSQLAndFlow(t *testing.T) {
 		t.Errorf("лимит пачки = %v, want 10", gotLimit)
 	}
 
-	// Обновление: назначение повтора + итоговый статус.
-	if len(updTx.calls) != 2 {
-		t.Fatalf("вызовов в транзакции обновления = %d, want 2 (повтор + итоговый статус)", len(updTx.calls))
+	// Решения — каждое в собственной транзакции, одним оператором.
+	if len(requeueTx.calls) != 1 {
+		t.Fatalf("вызовов в транзакции повтора = %d, want 1", len(requeueTx.calls))
 	}
-	if updTx.calls[0].sql != wantRetryRequeue {
-		t.Errorf("SQL повтора:\n%s\nwant:\n%s", updTx.calls[0].sql, wantRetryRequeue)
+	if requeueTx.calls[0].sql != wantRetryRequeue {
+		t.Errorf("SQL повтора:\n%s\nwant:\n%s", requeueTx.calls[0].sql, wantRetryRequeue)
 	}
 	if want := []any{
 		[]int16{1, 1, 2}, []int64{10, 11, 20},
 		int16(model.CheckStatePending), int16(model.StatusTempError), int16(model.CheckStateDone),
-	}; !reflect.DeepEqual(updTx.calls[0].args, want) {
-		t.Errorf("аргументы повтора = %v, want %v", updTx.calls[0].args, want)
+	}; !reflect.DeepEqual(requeueTx.calls[0].args, want) {
+		t.Errorf("аргументы повтора = %v, want %v", requeueTx.calls[0].args, want)
 	}
-	if updTx.calls[1].sql != wantRetryFinalize {
-		t.Errorf("SQL итогового статуса:\n%s\nwant:\n%s", updTx.calls[1].sql, wantRetryFinalize)
+	if len(finalizeTx.calls) != 1 {
+		t.Fatalf("вызовов в транзакции итогового статуса = %d, want 1", len(finalizeTx.calls))
+	}
+	if finalizeTx.calls[0].sql != wantRetryFinalize {
+		t.Errorf("SQL итогового статуса:\n%s\nwant:\n%s", finalizeTx.calls[0].sql, wantRetryFinalize)
 	}
 	if want := []any{
 		[]int16{2, 3}, []int64{21, 30},
 		int16(model.StatusDelegatedNoAddress), int16(model.StatusTempError), int16(model.CheckStateDone),
-	}; !reflect.DeepEqual(updTx.calls[1].args, want) {
-		t.Errorf("аргументы итогового статуса = %v, want %v", updTx.calls[1].args, want)
+	}; !reflect.DeepEqual(finalizeTx.calls[0].args, want) {
+		t.Errorf("аргументы итогового статуса = %v, want %v", finalizeTx.calls[0].args, want)
 	}
 
 	// Счётчики — по фактически затронутым строкам (охрана отбила 1/11).
 	if want := (RetryResult{Requeued: 2, Finalized: 2}); res != want {
 		t.Errorf("итог = %+v, want %+v", res, want)
 	}
-	for _, tx := range []*retryFakeTx{selTx, updTx} {
+	for _, tx := range []*retryFakeTx{selTx, requeueTx, finalizeTx} {
+		if !tx.committed || tx.rolledBack {
+			t.Errorf("транзакция %p: committed=%v rolledBack=%v, want фиксация без отката", tx, tx.committed, tx.rolledBack)
+		}
+	}
+}
+
+// TestRetryOnceSplitTransactions — регрессия дедлока 40P01 счётчиков
+// (инцидент retry-волны: 9 дедлоков за 3 ч, upsert checks:YYYY-MM-DD в
+// транзакции записи результата http-worker): решения пачки выполняются
+// РАЗДЕЛЬНЫМИ транзакциями — Begin транзакции итогового статуса строго
+// ПОСЛЕ Commit транзакции повтора (блокировки первой — domains/зоны/
+// корзины — отпущены до захвата domains-строк второй), ни одна
+// транзакция не содержит оба оператора. Общая транзакция держала бы
+// зоны и корзины retry_mature:{даты} поверх повторного захвата
+// domains-строк — ребро «счётчики → domains» против идущих
+// «domains → … → counters» транзакций http-worker/monitor замыкало
+// цикл.
+func TestRetryOnceSplitTransactions(t *testing.T) {
+	pool := &retryFakePool{
+		selects: []*retryFakeRows{retryRows(
+			[]any{int16(1), int64(10), int16(0)}, // попыток 0 < 3 → повтор
+			[]any{int16(2), int64(20), int16(3)}, // 3 = N → итоговый статус
+		)},
+		requeues:  []*retryFakeRows{retryRows([]any{int16(1), int64(10)})},
+		finalizes: []*retryFakeRows{retryRows([]any{int16(2), int64(20)})},
+	}
+
+	if _, err := RetryOnce(context.Background(), pool, RetryOptions{}); err != nil {
+		t.Fatalf("RetryOnce: %v", err)
+	}
+
+	if len(pool.txs) != 3 {
+		t.Fatalf("транзакций = %d, want 3 (выборка + два решения)", len(pool.txs))
+	}
+	selTx, requeueTx, finalizeTx := pool.txs[0], pool.txs[1], pool.txs[2]
+
+	// Каждое решение — единственный оператор своей транзакции: смешение
+	// обоих операторов в одной tx и есть инверсия порядка блокировок.
+	for _, tx := range []*retryFakeTx{requeueTx, finalizeTx} {
+		if tx.isSelect() {
+			t.Errorf("транзакция решения содержит SELECT кандидатов: %v", tx.calls)
+		}
+	}
+	if len(requeueTx.calls) != 1 || requeueTx.calls[0].sql != retryRequeueSQL {
+		t.Errorf("транзакция повтора = %v, want только retryRequeueSQL", requeueTx.calls)
+	}
+	if len(finalizeTx.calls) != 1 || finalizeTx.calls[0].sql != retryFinalizeSQL {
+		t.Errorf("транзакция итогового статуса = %v, want только retryFinalizeSQL", finalizeTx.calls)
+	}
+
+	// Порядок событий пула: Commit повтора строго до Begin итогового
+	// статуса — счётчики/зоны первой половины не переживают захват
+	// domains-строк второй.
+	if requeueTx.commitSeq == 0 || finalizeTx.beginSeq == 0 ||
+		requeueTx.commitSeq > finalizeTx.beginSeq {
+		t.Errorf("порядок событий: commit повтора %d, begin итога %d — want commit прежде begin",
+			requeueTx.commitSeq, finalizeTx.beginSeq)
+	}
+	for _, tx := range []*retryFakeTx{selTx, requeueTx, finalizeTx} {
 		if !tx.committed || tx.rolledBack {
 			t.Errorf("транзакция %p: committed=%v rolledBack=%v, want фиксация без отката", tx, tx.committed, tx.rolledBack)
 		}
@@ -831,16 +915,36 @@ func TestRetryOnceErrors(t *testing.T) {
 			p.finalizeErr = errors.New("бд недоступна")
 			return p
 		}(), "итоговый статус"},
+		{"ошибка Begin решения", func() *retryFakePool {
+			// Выборка проходит, транзакция назначения повтора не
+			// открывается (после разделения решений — независимая
+			// точка отказа).
+			p := newPool()
+			p.beginErrs = []error{nil, errors.New("бд недоступна")}
+			return p
+		}(), "транзакция решения (назначение повтора)"},
 		{"ошибка Commit выборки", func() *retryFakePool {
 			p := newPool()
 			p.commitErrs = []error{errors.New("бд недоступна")}
 			return p
 		}(), "фиксация выборки"},
-		{"ошибка Commit обновления", func() *retryFakePool {
+		{"ошибка Commit повтора", func() *retryFakePool {
 			p := newPool()
 			p.commitErrs = []error{nil, errors.New("бд недоступна")}
 			return p
-		}(), "фиксация"},
+		}(), "фиксация решения (назначение повтора)"},
+		{"ошибка Commit итога", func() *retryFakePool {
+			// Смешанная пачка: фиксация повтора проходит, фиксация
+			// итогового статуса — нет; зафиксированная половина не
+			// откатывается (раздельные транзакции решений).
+			p := newPool()
+			p.selects = []*retryFakeRows{retryRows(
+				[]any{int16(1), int64(10), int16(0)},
+				[]any{int16(2), int64(20), int16(DefaultRetryMaxRetries)},
+			)}
+			p.commitErrs = []error{nil, nil, errors.New("бд недоступна")}
+			return p
+		}(), "фиксация решения (итоговый статус)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -853,21 +957,59 @@ func TestRetryOnceErrors(t *testing.T) {
 				!strings.Contains(err.Error(), "бд недоступна") {
 				t.Errorf("сообщение = %q, want контекст %q и исходная ошибка", err, tt.context)
 			}
-			for _, tx := range tt.pool.txs {
-				if tx.committed && !tx.isSelect() {
-					t.Errorf("транзакция обновления закоммичена при ошибке %q", tt.name)
-					continue
-				}
-				// Отложенный откат обязан сработать: прерванный проход не
-				// оставляет половинчатых изменений (ТЗ 3.4). Транзакция
-				// выборки — только оболочка закрепления плана (SELECT по
-				// зафиксированным данным), её фиксация до ошибки — не
-				// половинчатость.
+			// Раздельные транзакции решений (регрессия 40P01): при
+			// ошибке прохода зафиксированной может быть только половина
+			// ДО точки сбоя — откаченная транзакция решений обязана
+			// быть последней (коммиты половин — префикс, после сбоя
+			// новых транзакций нет). Транзакция выборки — только
+			// оболочка закрепления плана (SELECT по зафиксированным
+			// данным), её фиксация до ошибки — не половинчатость;
+			// отложенный откат обязан сработать для всех
+			// незафиксированных.
+			for i, tx := range tt.pool.txs {
 				if !tx.committed && !tx.rolledBack {
 					t.Errorf("транзакция не откачена при ошибке %q", tt.name)
 				}
+				if !tx.committed && !tx.isSelect() && i != len(tt.pool.txs)-1 {
+					t.Errorf("после откаченной транзакции решений открыта ещё одна (кейс %q)", tt.name)
+				}
 			}
 		})
+	}
+}
+
+// TestRetryOnceHalfCommittedOnError — сбой второй половины пачки не
+// откатывает зафиксированную первую (раздельные транзакции решений):
+// охраны обоих UPDATE идемпотентны, переведённые первой половиной не
+// кандидаты следующего прохода, незавершённая половина — кандидаты
+// (ТЗ 3.4). Прежний контракт «всё или ничего» заменён на «идемпотентный
+// повтор прохода» — атомарность пачки не критична.
+func TestRetryOnceHalfCommittedOnError(t *testing.T) {
+	pool := &retryFakePool{
+		selects: []*retryFakeRows{retryRows(
+			[]any{int16(1), int64(10), int16(0)}, // повтор — фиксируется
+			[]any{int16(2), int64(20), int16(3)}, // итог — Commit падает
+		)},
+		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10)})},
+		// Выборка и повтор фиксируются, фиксация итога — ошибка.
+		commitErrs: []error{nil, nil, errors.New("бд недоступна")},
+	}
+
+	res, err := RetryOnce(context.Background(), pool, RetryOptions{})
+	if err == nil || !strings.Contains(err.Error(), "фиксация решения (итоговый статус)") {
+		t.Fatalf("ошибка = %v, want сбой фиксации итогового статуса", err)
+	}
+	if res != (RetryResult{}) {
+		t.Errorf("итог при ошибке = %+v, want нулевой (вызыватель видит только ошибку)", res)
+	}
+	if len(pool.txs) != 3 {
+		t.Fatalf("транзакций = %d, want 3", len(pool.txs))
+	}
+	if !pool.txs[1].committed || pool.txs[1].rolledBack {
+		t.Error("половина повтора не зафиксирована: сбой второй половины не откатывает первую")
+	}
+	if pool.txs[2].committed || !pool.txs[2].rolledBack {
+		t.Error("половина итогового статуса зафиксирована или не откачена при сбое Commit")
 	}
 }
 
