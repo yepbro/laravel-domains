@@ -43,7 +43,7 @@
 //	| Р1 | pending | постановка планировщика | check_state = pending, status <> deleted | queued | queued_at = now() (сервер БД); снятие бита http_published (новый эпизод с чистой пометкой); зоны pending −n / queued +n; публикация q:dns по RETURNING (перевод ДО публикации: сбой публикации оставляет queued без задачи — вернёт lease Р5) | enqueue.go EnqueueBatch (T-028) |
 //	| Р2 | queued | запись результата DNS-эпизода, терминальная ветка (not_delegated / delegated_no_address / temp_error) | status <> deleted, check_state <> done | done | queued_at = NULL (аренда завершена); last_checked_at = now(); статус-итог; temp_attempts = 0 (кроме temp_error — сохраняет); снятие http_published; зоны queued −n / checked +n; корзина retry_mature +1 при temp_error-итоге | dnsworker/result.go resultUpdateStatusSQL (T-036+) |
 //	| Р3 | queued | запись результата DNS-эпизода, ветка «есть адреса» (итог за HTTP-этапом) | те же | done | queued_at = NULL; last_checked_at = now(); temp_attempts = 0; снятие http_published; зоны queued −n / checked +n | dnsworker/result.go resultUpdateKeepStatusSQL |
-//	| Р4 | pending | запись результата DNS/HTTP-эпизода (lease вернул посреди эпизода, дубль-доставка) | те же (HTTP: status <> deleted БЕЗ охраны check_state — осознанная асимметрия: повторная доставка обязана переиздать q:analyze, фильтр done отбросил бы публикацию навсегда) | done | queued_at = NULL; last_checked_at = now(); зоны pending −n / checked +n (предчтение старого состояния FOR UPDATE, T-178) | dnsworker/result.go, httpworker/record.go recordDomainSQL (T-058) |
+//	| Р4 | pending | запись результата DNS/HTTP-эпизода (lease вернул посреди эпизода, дубль-доставка) | те же (HTTP: status <> deleted БЕЗ охраны check_state — осознанная асимметрия: повторная доставка обязана переиздать q:analyze, фильтр done отбросил бы публикацию навсегда) | done | queued_at = NULL; last_checked_at = now(); снятие http_published у DNS-ветки (HTTP-ветка бит не трогает); зоны pending −n / checked +n (предчтение старого состояния FOR UPDATE, T-178) | dnsworker/result.go, httpworker/record.go recordDomainSQL (T-058) |
 //	| Р5 | queued | истечение аренды (lease-возврат) | check_state = queued, status <> deleted, queued_at < now() − scheduler.lease (NULL отсеивается сравнением — возраста нет) | pending | queued_at = NULL; зоны queued −n / pending +n; перевыберет диспетчер — повторная доставка безопасна (ТЗ 3.4) | lease.go LeaseOnce (T-029) |
 //	| Р6 | queued | терминальная страховка NULL-инварианта (нарушен И1: queued без queued_at — вечное зависание вне Р5) | check_state = queued, status <> deleted, queued_at IS NULL | pending | queued_at = NULL (уже NULL); зоны queued −n / pending +n; счётчик crawler_scheduler_lease_null_returned_total (ненулевой стационар — сигнал оператору, docs/runbooks.md §2.9) | leasenull.go LeaseNullOnce (T-255, ФТ-1.2) |
 //	| Р7 | done | суточная возрастная перепроверка | check_state = done, status <> deleted, status <> invalid (ядовитые строки не циклируются, T-109), last_checked_at < now() − scheduler.recheck_interval | pending | queued_at = NULL; статус-итог сохраняется (перепишет новая проверка); зоны checked −n / pending +n | recheck.go RecheckOnce (T-030) |
@@ -61,8 +61,11 @@
 //     SELECT check_state <> done ∧ status <> deleted — отсев повторной
 //     доставкой уже зафиксированных эпизодов;
 //   - пометка http_published (dnsworker/result.go resultMarkPublishedSQL,
-//     T-108): бит flags, не переход — спецификация бита отдельная (ТЗ-fsm
-//     §3 ФТ-3); снятие бита — побочное действие Р1–Р4, Р13;
+//     T-108): бит flags, не переход — спецификация бита отдельная (там же,
+//     у resultMarkPublishedSQL; ТЗ-fsm §3 ФТ-3, T-257); снятие бита —
+//     побочное действие Р1–Р4, Р13 (в Р4 — только DNS-ветка: операторы
+//     dnsworker пишут done и из pending; HTTP-ветка recordDomainSQL бит
+//     не трогает — сохраняет прочие биты, кроме dead_host_cutoff);
 //   - диспетчер DispatchBatch (dispatch.go, T-027): читает pending,
 //     состояние не меняет (переводит следующий шаг Р1).
 //
