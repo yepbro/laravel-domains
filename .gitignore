@@ -32,3 +32,6 @@ out/
 
 # open-codebase-index
 .opencode/index/
+
+# codegraphcontext (локальный индекс MCP)
+.codegraphcontext/

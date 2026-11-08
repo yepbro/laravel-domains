@@ -202,7 +202,9 @@ func (p *pipePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	case countAddSQL:
 		return &oneRowRows{vals: []any{p.uniques}}, nil
 	case applyDeleteSQL:
-		return &oneRowRows{vals: []any{p.delDeleted, p.delMissing}}, nil
+		// T-269: строка несёт и битовые массивы (в конвейерных тестах
+		// флаговых строк нет — вторая пара не выполняется).
+		return &oneRowRows{vals: []any{p.delDeleted, p.delMissing, []int16{}, []string{}}}, nil
 	}
 	return nil, fmt.Errorf("pipePool: неожидаемый запрос: %s", sql)
 }
@@ -642,7 +644,10 @@ func TestPipelineDelete(t *testing.T) {
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:2",
+		"begin", // транзакция применения delete (T-269): перевод статуса и
+		// пара «бит × счётчик» — два оператора одной транзакции
 		"query:" + applyDeleteSQL,
+		"commit",
 		"exec:" + clearStageSQL,
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
