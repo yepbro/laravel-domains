@@ -637,7 +637,7 @@ monitor (`internal/monitor/zonestats.go`, T-178: `render_pending` в
 (снапшот ожидания снят до прохода T-066, факт — после) даёт второе
 −18. Гипотеза не доказана — задача начинается с воспроизведения.
 
-- **T-269** [новая] — P1, monitor: расследовать и починить write-путь
+- **T-269** [в работе] — P1, monitor: расследовать и починить write-путь
   `render_pending` реконсиляции zonestats. (1) Аудит всех писателей
   `crawler_counters['render_pending']` (httpworker
   `renderBumpDebtCounter`/`renderSetPendingSQL` — парный инвариант
