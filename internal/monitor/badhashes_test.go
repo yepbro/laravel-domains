@@ -51,56 +51,52 @@ func (f *fakeBadHashes) set(v int64) {
 // и алерт снимается.
 func TestAlertsBadHashesThreshold(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	src := &fakeBadHashes{}
-	env.deps.BadHashes = src
 	ctx := context.Background()
+	m := env.newBadHashesMachine()
 
 	// Первое наблюдение — база: накопленное до старта мониторинга
 	// (100) не считается всплеском.
-	src.set(100)
-	if s := snapshotOf(t, env.Pass(ctx), AlertBadHashes); s.Status != AlertStatusOK {
-		t.Fatalf("база: статус = %s (%s), want ok", s.Status, s.Detail)
-	}
-
 	// Рост по 5 и 3 — сумма 8 < 10: ок.
-	src.set(105)
-	if s := snapshotOf(t, env.Pass(ctx), AlertBadHashes); s.Status != AlertStatusOK {
-		t.Errorf("сумма 8: статус = %s (%s), want ok", s.Status, s.Detail)
-	}
-	src.set(108)
-	if s := snapshotOf(t, env.Pass(ctx), AlertBadHashes); s.Status != AlertStatusOK {
-		t.Errorf("сумма 8: статус = %s (%s), want ok", s.Status, s.Detail)
-	}
-
 	// Ещё 4 — сумма 12 ≥ 10: всплеск.
-	src.set(112)
-	s := snapshotOf(t, env.Pass(ctx), AlertBadHashes)
-	if s.Status != AlertStatusFiring {
-		t.Fatalf("сумма 12: статус = %s (%s), want firing", s.Status, s.Detail)
+	steps := []struct {
+		cur  int64
+		want string
+	}{
+		{100, AlertStatusOK},
+		{105, AlertStatusOK},
+		{108, AlertStatusOK},
+		{112, AlertStatusFiring},
 	}
-	for _, want := range []string{"112", "12", "10"} { // счётчик, сумма, порог
-		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail %q не содержит %s", s.Detail, want)
+	for i, s := range steps {
+		got := m.transition(env.Alerts, ctx, obs(s.cur))
+		if got.Status != s.want {
+			t.Errorf("шаг %d (счётчик %d): статус = %s (%s), want %s", i, s.cur, got.Status, got.Detail, s.want)
+		}
+		if i == len(steps)-1 {
+			for _, want := range []string{"112", "12", "10"} { // счётчик, сумма, порог
+				if !strings.Contains(got.Detail, want) {
+					t.Errorf("detail %q не содержит %s", got.Detail, want)
+				}
+			}
 		}
 	}
 
 	// Держится следующий проход (сумма ещё в окне)…
-	src.set(112)
-	if s := snapshotOf(t, env.Pass(ctx), AlertBadHashes); s.Status != AlertStatusFiring {
-		t.Errorf("окно ещё держит сумму: статус = %s (%s), want firing", s.Status, s.Detail)
+	if got := m.transition(env.Alerts, ctx, obs(int64(112))); got.Status != AlertStatusFiring {
+		t.Errorf("окно ещё держит сумму: статус = %s (%s), want firing", got.Status, got.Detail)
 	}
 
 	// …и стареет без новых мусорных строк: после окна нулевых дельт
 	// сумма обнуляется — снятие.
 	for range AlertBadHashesWindow + 2 {
-		if s := snapshotOf(t, env.Pass(ctx), AlertBadHashes); s.Status == AlertStatusOK {
+		if got := m.transition(env.Alerts, ctx, obs(int64(112))); got.Status == AlertStatusOK {
 			return
 		}
 	}
 	t.Fatal("алерт не снят после старения окна без новых мусорных строк")
 }
 
-// TestBadHashesWindow — размер кольца дельт: окно ровно 15 значений —
+// TestBadHashesWindow — размер кольца дельт (deltaRing): окно ровно 15 значений —
 // всплеск удерживается суммой до вытеснения последней (15-й) нулевой
 // дельтой. Размер pinned литералом в начале: граница из константы
 // мутировалась бы вместе с тестом и «следовала» за мутантом. Шаг записи
@@ -110,7 +106,7 @@ func TestBadHashesWindow(t *testing.T) {
 	if AlertBadHashesWindow != 15 {
 		t.Fatalf("AlertBadHashesWindow = %d, want 15 (окно 15 проходов алертов)", AlertBadHashesWindow)
 	}
-	w := &badHashesWindow{}
+	w := &deltaRing{}
 	if sum := w.push(0); sum != 0 {
 		t.Fatalf("первое наблюдение (база): сумма = %d, want 0", sum)
 	}
@@ -135,13 +131,11 @@ func TestBadHashesWindow(t *testing.T) {
 // интервала тестовой среды (DefaultAlertsInterval 5м) = 1ч15м.
 func TestAlertsBadHashesExactThreshold(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	src := &fakeBadHashes{}
-	env.deps.BadHashes = src
+	ctx := context.Background()
+	m := env.newBadHashesMachine()
 
-	src.set(0)
-	snapshotOf(t, env.Pass(context.Background()), AlertBadHashes) // база
-	src.set(10)                                                   // одна дельта ровно 10
-	s := snapshotOf(t, env.Pass(context.Background()), AlertBadHashes)
+	_ = m.transition(env.Alerts, ctx, obs(int64(0)))   // база
+	s := m.transition(env.Alerts, ctx, obs(int64(10))) // одна дельта ровно 10
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("сумма ровно 10: статус = %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -156,27 +150,23 @@ func TestAlertsBadHashesExactThreshold(t *testing.T) {
 // даёт нулевую дельту, ложного всплеска нет (счётчик считается заново).
 func TestAlertsBadHashesRestart(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	src := &fakeBadHashes{}
-	env.deps.BadHashes = src
 	ctx := context.Background()
+	m := env.newBadHashesMachine()
 
-	src.set(50) // база
-	snapshotOf(t, env.Pass(ctx), AlertBadHashes)
-	src.set(50) // тишина
-	if s := snapshotOf(t, env.Pass(ctx), AlertBadHashes); s.Status != AlertStatusOK {
-		t.Fatalf("тишина: статус = %s (%s), want ok", s.Status, s.Detail)
+	_ = m.transition(env.Alerts, ctx, obs(int64(50)))                                      // база
+	if got := m.transition(env.Alerts, ctx, obs(int64(50))); got.Status != AlertStatusOK { // тишина
+		t.Fatalf("тишина: статус = %s (%s), want ok", got.Status, got.Detail)
 	}
 
-	src.set(3) // рестарт ingest: счётчик меньше прежнего
-	s := snapshotOf(t, env.Pass(ctx), AlertBadHashes)
-	if s.Status != AlertStatusOK {
-		t.Errorf("рестарт источника: статус = %s (%s), want ok без ложного всплеска", s.Status, s.Detail)
+	// Рестарт ingest: счётчик меньше прежнего — убыль даёт нулевую
+	// дельту, ложного всплеска нет (счётчик считается заново).
+	if got := m.transition(env.Alerts, ctx, obs(int64(3))); got.Status != AlertStatusOK {
+		t.Errorf("рестарт источника: статус = %s (%s), want ok без ложного всплеска", got.Status, got.Detail)
 	}
 
-	// Новый рост после рестарта считается от новой базы.
-	src.set(20) // +17 ≥ порога
-	if s := snapshotOf(t, env.Pass(ctx), AlertBadHashes); s.Status != AlertStatusFiring {
-		t.Errorf("рост после рестарта: статус = %s (%s), want firing", s.Status, s.Detail)
+	// Новый рост после рестарта считается от новой базы: +17 ≥ порога.
+	if got := m.transition(env.Alerts, ctx, obs(int64(20))); got.Status != AlertStatusFiring {
+		t.Errorf("рост после рестарта: статус = %s (%s), want firing", got.Status, got.Detail)
 	}
 }
 

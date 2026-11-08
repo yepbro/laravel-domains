@@ -470,6 +470,7 @@ func TestAlertsDNSContract(t *testing.T) {
 func TestAlertsDNSHysteresis(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
+	m := env.newDNSMachine()
 	steps := []struct {
 		daily alertDNSDaily
 		want  string
@@ -480,12 +481,8 @@ func TestAlertsDNSHysteresis(t *testing.T) {
 		{alertDNSDaily{199, 1000}, AlertStatusOK},     // 19.9 % — снятие
 		{alertDNSDaily{250, 1000}, AlertStatusOK},     // 25 % без сработавшего алерта — не включается
 	}
-	env.pool.daily = make([]alertDNSDaily, len(steps))
 	for i, s := range steps {
-		env.pool.daily[i] = s.daily
-	}
-	for i, s := range steps {
-		got := snapshotOf(t, env.Pass(ctx), AlertDNSErrors)
+		got := m.transition(env.Alerts, ctx, obs(dnsShare{temp: s.daily.temp, total: s.daily.total}))
 		if got.Status != s.want {
 			t.Errorf("шаг %d (доля %d/%d): статус = %s (%s), want %s",
 				i, s.daily.temp, s.daily.total, got.Status, got.Detail, s.want)
@@ -593,6 +590,7 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	env.lener.lens[queue.StreamDead] = 1 << 40 // алертом очередей не учитывается
 	ctx := context.Background()
+	m := env.newQueuesMachine()
 	steps := []struct {
 		lens map[string]int64
 		want string
@@ -605,8 +603,7 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 		{map[string]int64{queue.StreamHTTP: 899}, AlertStatusOK},     // ниже 90 %
 	}
 	for i, s := range steps {
-		env.lener.lens = s.lens
-		got := snapshotOf(t, env.Pass(ctx), AlertQueueOverflow)
+		got := m.transition(env.Alerts, ctx, obs(s.lens))
 		if got.Status != s.want {
 			t.Errorf("шаг %d (%v): статус = %s (%s), want %s", i, s.lens, got.Status, got.Detail, s.want)
 		}
@@ -623,18 +620,17 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 	// Деталь «ok» — максимум среди рабочих стримов: обновление в цикле
 	// (лидер не первый стрим) и стартовое значение (лидер первый стрим
 	// читается из карты, а не нулём соседа).
-	env.lener.lens = map[string]int64{queue.StreamDNS: 3}
-	if s := snapshotOf(t, env.Pass(ctx), AlertQueueOverflow); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "макс q:dns=3") {
+	if s := m.transition(env.Alerts, ctx, obs(map[string]int64{queue.StreamDNS: 3})); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "макс q:dns=3") {
 		t.Errorf("максимум q:dns: %s (%s), want ok макс q:dns=3", s.Status, s.Detail)
 	}
-	env.lener.lens = map[string]int64{queue.StreamHTTP: 5}
-	if s := snapshotOf(t, env.Pass(ctx), AlertQueueOverflow); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "макс q:http=5") {
+	if s := m.transition(env.Alerts, ctx, obs(map[string]int64{queue.StreamHTTP: 5})); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "макс q:http=5") {
 		t.Errorf("максимум q:http: %s (%s), want ok макс q:http=5", s.Status, s.Detail)
 	}
 
 	// Алерт очередей не опрашивает q:dead даже при огромной глубине
-	// карантина: опросы q:dead в протоколе — только алерт queue_dead
-	// (проверяется отдельно в TestAlertsDeadEpisode).
+	// карантина: живой проход читает только рабочие стримы, опросы q:dead
+	// в протоколе — только алерт queue_dead.
+	_ = snapshotOf(t, env.Pass(ctx), AlertQueueOverflow)
 	deadPolls := 0
 	for _, s := range env.lener.streams() {
 		if s == queue.StreamDead {
@@ -645,9 +641,7 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 		t.Error("алерт queue_dead не опрашивает q:dead (протокол пуст)")
 	}
 	// detail сработавшего шага называет стрим и длину.
-	env.lener.lens = map[string]int64{queue.StreamRender: 4242}
-	s := snapshotOf(t, env.Pass(ctx), AlertQueueOverflow)
-	if s.Status != AlertStatusFiring || !strings.Contains(s.Detail, "q:render=4242") {
+	if s := m.transition(env.Alerts, ctx, obs(map[string]int64{queue.StreamRender: 4242})); s.Status != AlertStatusFiring || !strings.Contains(s.Detail, "q:render=4242") {
 		t.Errorf("сработавший detail = %q (%s), want q:render=4242 firing", s.Detail, s.Status)
 	}
 }
@@ -698,6 +692,7 @@ func TestAlertsQueuesSourceError(t *testing.T) {
 func TestAlertsDeadEpisode(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
+	m := env.newDeadMachine()
 
 	steps := []struct {
 		dead int64
@@ -712,16 +707,14 @@ func TestAlertsDeadEpisode(t *testing.T) {
 		{7, AlertStatusOK},     // новая смерть после снятия — новый эпизод, 1/3
 	}
 	for i, s := range steps {
-		env.lener.lens = map[string]int64{queue.StreamDead: s.dead}
-		got := snapshotOf(t, env.Pass(ctx), AlertQueueDead)
+		got := m.transition(env.Alerts, ctx, obs(s.dead))
 		if got.Status != s.want {
 			t.Errorf("шаг %d (q:dead=%d): статус = %s (%s), want %s", i, s.dead, got.Status, got.Detail, s.want)
 		}
 	}
 	// Detail с глубиной и счётчиком проходов (сверка с bury-счётчиком):
 	// после шагов выше серия — 1 наблюдение, этот проход — второй.
-	env.lener.lens = map[string]int64{queue.StreamDead: 12}
-	got := snapshotOf(t, env.Pass(ctx), AlertQueueDead)
+	got := m.transition(env.Alerts, ctx, obs(int64(12)))
 	for _, want := range []string{"q:dead=12", "2/3", "crawler_queue_dead_buried_total"} {
 		if !strings.Contains(got.Detail, want) {
 			t.Errorf("detail %q не содержит %q", got.Detail, want)
@@ -729,7 +722,7 @@ func TestAlertsDeadEpisode(t *testing.T) {
 	}
 
 	// Один Warn на эпизод: срабатывание Warn «АЛЕРТ», устойчивое
-	// срабатывание и снятие после — без повторного Warn.
+	// срабатывание и снятие после — без повторного Warn (полный проход).
 	env = newAlertsTestEnv(t, nil)
 	for range 3 {
 		env.lener.lens = map[string]int64{queue.StreamDead: 9}
@@ -815,6 +808,7 @@ func TestAlertsDeadDegradation(t *testing.T) {
 func TestAlertsRedisMemoryThreshold(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
+	m := env.newRedisMemoryMachine()
 	const max = int64(1000)
 	steps := []struct {
 		used int64
@@ -828,15 +822,14 @@ func TestAlertsRedisMemoryThreshold(t *testing.T) {
 		{760, AlertStatusOK},     // коридор без сработавшего — не включается
 	}
 	for i, s := range steps {
-		env.redisMem.mem = RedisMemory{UsedBytes: s.used, MaxBytes: max, Policy: "noeviction"}
-		got := snapshotOf(t, env.Pass(ctx), AlertRedisMemory)
+		got := m.transition(env.Alerts, ctx, obs(RedisMemory{UsedBytes: s.used, MaxBytes: max, Policy: "noeviction"}))
 		if got.Status != s.want {
 			t.Errorf("шаг %d (used %d из %d): статус = %s (%s), want %s", i, s.used, max, got.Status, got.Detail, s.want)
 		}
 	}
 	// Detail с абсолютами, долей и политикой.
-	env.redisMem.mem = RedisMemory{UsedBytes: 800, MaxBytes: 1000, Policy: "noeviction"}
-	if s := snapshotOf(t, env.Pass(ctx), AlertRedisMemory); s.Status != AlertStatusFiring ||
+	s := m.transition(env.Alerts, ctx, obs(RedisMemory{UsedBytes: 800, MaxBytes: 1000, Policy: "noeviction"}))
+	if s.Status != AlertStatusFiring ||
 		!strings.Contains(s.Detail, "80.0%") || !strings.Contains(s.Detail, "noeviction") {
 		t.Errorf("detail = %q (%s), want firing с долей 80.0%% и политикой", s.Detail, s.Status)
 	}
@@ -879,27 +872,25 @@ func TestAlertsStallThreshold(t *testing.T) {
 	env := newAlertsTestEnv(t, nil) // ZoneStatsInterval 60s → порог 300s
 	now, _ := alertsFixedClock()
 	ctx := context.Background()
+	m := env.newStallMachine()
+	at := func(age time.Duration) observation[time.Time] { return obs(now.Add(-age)) }
 
-	env.pool.fresh = []sql.NullTime{{Time: now.Add(-60 * time.Second), Valid: true}}
-	if s := snapshotOf(t, env.Pass(ctx), AlertProgressStall); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, at(60*time.Second)); s.Status != AlertStatusOK {
 		t.Errorf("60с: статус = %s (%s), want ok", s.Status, s.Detail)
 	}
 
 	// Между 4 и 5 периодами (250с при пороге 5×60с) — ок: фиксирует
 	// фактор порога, а не «какой-то из соседних».
-	env.pool.fresh = []sql.NullTime{{Time: now.Add(-250 * time.Second), Valid: true}}
-	if s := snapshotOf(t, env.Pass(ctx), AlertProgressStall); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, at(250*time.Second)); s.Status != AlertStatusOK {
 		t.Errorf("250с: статус = %s (%s), want ok (порог 5, не 4 периода)", s.Status, s.Detail)
 	}
 
 	// Ровно порог (300с = 5 × 60с) — ещё не остановка: строго больше.
-	env.pool.fresh = []sql.NullTime{{Time: now.Add(-5 * time.Minute), Valid: true}}
-	if s := snapshotOf(t, env.Pass(ctx), AlertProgressStall); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, at(5*time.Minute)); s.Status != AlertStatusOK {
 		t.Errorf("ровно 300с: статус = %s (%s), want ok", s.Status, s.Detail)
 	}
 
-	env.pool.fresh = []sql.NullTime{{Time: now.Add(-301 * time.Second), Valid: true}}
-	s := snapshotOf(t, env.Pass(ctx), AlertProgressStall)
+	s := m.transition(env.Alerts, ctx, at(301*time.Second))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("301с: статус = %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -909,8 +900,9 @@ func TestAlertsStallThreshold(t *testing.T) {
 		}
 	}
 
-	env.pool.fresh = []sql.NullTime{{}}
-	if s := snapshotOf(t, env.Pass(ctx), AlertProgressStall); s.Status != AlertStatusNotMeasured {
+	// Зон нет (NULL) — не измеряется: наблюдение с причиной.
+	if s := m.transition(env.Alerts, ctx,
+		obsReason[time.Time]("справочник зон пуст — прогресс не отслеживается")); s.Status != AlertStatusNotMeasured {
 		t.Errorf("без зон: статус = %s, want not_measured", s.Status)
 	}
 }
@@ -1022,9 +1014,9 @@ func TestAlertsDivergedIntervals(t *testing.T) {
 func TestAlertsDiskThreshold(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
+	m := env.newDiskMachine()
 
-	env.space.stat = SpaceStat{Avail: 4 << 30, Total: 100 << 30} // 4.0 %
-	s := snapshotOf(t, env.Pass(ctx), AlertDiskFree)
+	s := m.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 4 << 30, Total: 100 << 30})) // 4.0 %
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("4%%: статус = %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -1032,22 +1024,21 @@ func TestAlertsDiskThreshold(t *testing.T) {
 		t.Errorf("detail %q без доли/порога", s.Detail)
 	}
 
-	env.space.stat = SpaceStat{Avail: 5 << 30, Total: 100 << 30} // ровно порог — не меньше
-	if s := snapshotOf(t, env.Pass(ctx), AlertDiskFree); s.Status != AlertStatusOK {
+	// Ровно порог — не меньше.
+	if s := m.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 5 << 30, Total: 100 << 30})); s.Status != AlertStatusOK {
 		t.Errorf("ровно порог: статус = %s (%s), want ok", s.Status, s.Detail)
 	}
 
 	// Порог 1 % — минимальный валидный контроль, не «выключен».
 	env = newAlertsTestEnv(t, func(o *AlertsOptions) { o.DiskFreePercent = 1 })
-	if s := snapshotOf(t, env.Pass(ctx), AlertDiskFree); s.Status != AlertStatusOK {
+	m = env.newDiskMachine()
+	if s := m.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 100 << 30, Total: 200 << 30})); s.Status != AlertStatusOK {
 		t.Errorf("порог 1%%: статус = %s (%s), want ok — контроль включён", s.Status, s.Detail)
 	}
 
 	// Множитель 100: свободно 100 из 10100 байт — 0.99… % < 1 — алерт;
 	// 101·Avail/Total дало бы ровно 1.0 % и сняло алерт.
-	env = newAlertsTestEnv(t, func(o *AlertsOptions) { o.DiskFreePercent = 1 })
-	env.space.stat = SpaceStat{Avail: 100, Total: 10100}
-	if s := snapshotOf(t, env.Pass(ctx), AlertDiskFree); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 100, Total: 10100})); s.Status != AlertStatusFiring {
 		t.Errorf("100 из 10100 байт: статус = %s (%s), want firing (0.99%% < 1%%)", s.Status, s.Detail)
 	}
 }
@@ -1088,9 +1079,10 @@ func TestAlertsDiskDegradation(t *testing.T) {
 // худшему; detail с TBW.
 func TestAlertsNVMeWear(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	env.wear.wears = []NVMeWear{{Device: "nvme0", PercentUsed: 90, DataUnitsWritten: 200_000_000}}
+	ctx := context.Background()
+	m := env.newWearMachine()
 
-	s := snapshotOf(t, env.Pass(context.Background()), AlertNVMeWear)
+	s := m.transition(env.Alerts, ctx, obs([]NVMeWear{{Device: "nvme0", PercentUsed: 90, DataUnitsWritten: 200_000_000}}))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("90%%: статус = %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -1098,40 +1090,43 @@ func TestAlertsNVMeWear(t *testing.T) {
 		t.Errorf("detail %q без устройства/TBW", s.Detail)
 	}
 
-	env.wear.wears = []NVMeWear{
+	s = m.transition(env.Alerts, ctx, obs([]NVMeWear{
 		{Device: "nvme0", PercentUsed: 41},
 		{Device: "nvme1", PercentUsed: 89}, // худший, но ниже порога
-	}
-	s = snapshotOf(t, env.Pass(context.Background()), AlertNVMeWear)
+	}))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "nvme1") || !strings.Contains(s.Detail, "89%") {
 		t.Errorf("89%%: статус = %s (%s), want ok по худшему nvme1", s.Status, s.Detail)
 	}
 
 	// Новый накопитель (0 %): стартовое значение — первое устройство,
 	// деталь называет имя, а не пустую строку.
-	env.wear.wears = []NVMeWear{{Device: "nvme0", PercentUsed: 0}}
-	s = snapshotOf(t, env.Pass(context.Background()), AlertNVMeWear)
+	s = m.transition(env.Alerts, ctx, obs([]NVMeWear{{Device: "nvme0", PercentUsed: 0}}))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "nvme0") || !strings.Contains(s.Detail, "0%") {
 		t.Errorf("0%%: статус = %s (%s), want ok с именем nvme0", s.Status, s.Detail)
 	}
 
 	// Пустой список (источник жив, устройств нет) — «не измеряется»,
 	// не паника на первом элементе.
-	env.wear.wears = nil
-	s = snapshotOf(t, env.Pass(context.Background()), AlertNVMeWear)
+	s = m.transition(env.Alerts, ctx, obsReason[[]NVMeWear]("NVMe-устройства не найдены"))
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "не найдены") {
 		t.Errorf("без устройств: статус = %s (%s), want not_measured", s.Status, s.Detail)
 	}
 
 	// Равный износ двух устройств: худший — первое (замена строго на
 	// «больше», не «не меньше»).
-	env.wear.wears = []NVMeWear{
+	s = m.transition(env.Alerts, ctx, obs([]NVMeWear{
 		{Device: "nvme0", PercentUsed: 50},
 		{Device: "nvme1", PercentUsed: 50},
-	}
-	s = snapshotOf(t, env.Pass(context.Background()), AlertNVMeWear)
+	}))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "nvme0: использовано 50%") {
 		t.Errorf("равный износ: %s (%s), want ok по первому nvme0", s.Status, s.Detail)
+	}
+
+	// Пустой список через полный проход (observeWear: источник жив,
+	// устройств нет) — то же «не измеряется» без паники.
+	env.wear.wears = nil
+	if s := snapshotOf(t, env.Pass(ctx), AlertNVMeWear); s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "не найдены") {
+		t.Errorf("без устройств (полный проход): статус = %s (%s), want not_measured «не найдены»", s.Status, s.Detail)
 	}
 }
 
@@ -1415,6 +1410,7 @@ func TestOSWearDegradation(t *testing.T) {
 func TestAlertsDiskMinThreshold(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
+	minM, critM := env.newDiskMinMachine(), env.newDiskCritMachine()
 	steps := []struct {
 		avail     uint64
 		min, crit string
@@ -1428,9 +1424,9 @@ func TestAlertsDiskMinThreshold(t *testing.T) {
 		{15 << 30, AlertStatusOK, AlertStatusOK},           // восстановление Warn-минимума
 	}
 	for i, s := range steps {
-		env.space.stat = SpaceStat{Avail: s.avail, Total: 79 << 30}
-		mn := snapshotOf(t, env.Pass(ctx), AlertDiskMin)
-		cr := snapshotOf(t, env.Pass(ctx), AlertDiskCrit)
+		sp := obs(SpaceStat{Avail: s.avail, Total: 79 << 30})
+		mn := minM.transition(env.Alerts, ctx, sp)
+		cr := critM.transition(env.Alerts, ctx, sp)
 		if mn.Status != s.min {
 			t.Errorf("шаг %d (avail %d): disk_free_min = %s (%s), want %s",
 				i, s.avail, mn.Status, mn.Detail, s.min)
@@ -1441,8 +1437,7 @@ func TestAlertsDiskMinThreshold(t *testing.T) {
 		}
 	}
 	// Деталь называет порог в читаемых единицах.
-	env.space.stat = SpaceStat{Avail: 9 << 30, Total: 79 << 30}
-	s := snapshotOf(t, env.Pass(ctx), AlertDiskCrit)
+	s := critM.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 9 << 30, Total: 79 << 30}))
 	for _, want := range []string{"9.0GiB", "79.0GiB", "10.0GiB"} {
 		if !strings.Contains(s.Detail, want) {
 			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
@@ -1509,25 +1504,22 @@ func TestAlertsDiskMinCustomAndDegradation(t *testing.T) {
 func TestAlertsMemHighStreak(t *testing.T) {
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.MemHighMinPasses = 2 })
 	ctx := context.Background()
-
-	set := func(high uint64) {
-		env.units.units = []UnitEvents{{Unit: "crawler-http-worker.service", High: high}}
+	m := env.newMemHighMachine()
+	set := func(high uint64) observation[[]UnitEvents] {
+		return obs([]UnitEvents{{Unit: "crawler-http-worker.service", High: high}})
 	}
 
 	// Первый проход — база (без него нельзя считать дельту).
-	set(120000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertMemHigh); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, set(120000)); s.Status != AlertStatusOK {
 		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Растёт один проход — серии ещё мало.
-	set(120500)
-	s := snapshotOf(t, env.Pass(ctx), AlertMemHigh)
+	s := m.transition(env.Alerts, ctx, set(120500))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "рост") {
 		t.Fatalf("один проход роста: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Второй проход роста — срабатывание, detail называет юнит и прирост.
-	set(121300)
-	s = snapshotOf(t, env.Pass(ctx), AlertMemHigh)
+	s = m.transition(env.Alerts, ctx, set(121300))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("второй проход роста: %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -1537,23 +1529,18 @@ func TestAlertsMemHighStreak(t *testing.T) {
 		}
 	}
 	// Рост прекратился — снятие тем же проходом.
-	set(121300)
-	if s := snapshotOf(t, env.Pass(ctx), AlertMemHigh); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, set(121300)); s.Status != AlertStatusOK {
 		t.Errorf("без роста: %s (%s), want ok (снятие)", s.Status, s.Detail)
 	}
 	// Рестарт юнита: счётчик в нуле — убыль не всплеск, серия с нуля.
-	set(121300)
-	_ = snapshotOf(t, env.Pass(ctx), AlertMemHigh)
-	set(5)
-	if s := snapshotOf(t, env.Pass(ctx), AlertMemHigh); s.Status != AlertStatusOK {
+	_ = m.transition(env.Alerts, ctx, set(121300))
+	if s := m.transition(env.Alerts, ctx, set(5)); s.Status != AlertStatusOK {
 		t.Errorf("рестарт юнита: %s (%s), want ok без ложного всплеска", s.Status, s.Detail)
 	}
-	set(50)
-	if s := snapshotOf(t, env.Pass(ctx), AlertMemHigh); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, set(50)); s.Status != AlertStatusOK {
 		t.Errorf("первый проход роста после рестарта: %s (%s), want ok (серия 1 < 2)", s.Status, s.Detail)
 	}
-	set(55)
-	if s := snapshotOf(t, env.Pass(ctx), AlertMemHigh); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, set(55)); s.Status != AlertStatusFiring {
 		t.Errorf("рост после рестарта двумя проходами: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
@@ -1567,12 +1554,27 @@ func TestAlertsMemHighDegradation(t *testing.T) {
 		t.Fatalf("здоровые юниты: %s (%s), want ok", s.Status, s.Detail)
 	}
 
+	// Пустой список юнитов — ВАЛИДНОЕ измерение memory_high (асимметрия
+	// с unit_oom осознанная, прежняя: у master evalMemHigh не было ветки
+	// «не найдены»): ok с деталью «0 юнитов», not_measured было бы ложной
+	// деградацией (ревью T-264, P1); фронтовой лог при этом не пишется.
+	env.units.units = nil
+	s := snapshotOf(t, env.Pass(context.Background()), AlertMemHigh)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "0 юнитов") {
+		t.Fatalf("пустой список: %s (%s), want ok «0 юнитов» (не not_measured)", s.Status, s.Detail)
+	}
+	// Соседний unit_oom пустой список трактует «не найдены» — машины
+	// расходятся намеренно.
+	if u := snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM); u.Status != AlertStatusNotMeasured {
+		t.Fatalf("unit_oom на пустом списке: %s, want not_measured (асимметрия машин)", u.Status)
+	}
+
 	env2 := newAlertsTestEnv(t, nil)
 	// Очередь ошибок: unit_oom и memory_high читают источник независимо
 	// (два вызова на проход) — каждая получает свою ошибку.
 	noSystemd := fmt.Errorf("monitor: юниты: %w: systemctl show: упал", errNoSystemd)
 	env2.units.errs = []error{noSystemd, noSystemd}
-	s := snapshotOf(t, env2.Pass(context.Background()), AlertMemHigh)
+	s = snapshotOf(t, env2.Pass(context.Background()), AlertMemHigh)
 	if s.Status != AlertStatusNotMeasured || strings.Contains(env2.buf.String(), "level=WARN") {
 		t.Errorf("без systemd: %s, want тихое not_measured (лог:\n%s)", s.Status, env2.buf.String())
 	}
@@ -1609,20 +1611,20 @@ func TestAlertsQueueFreeze(t *testing.T) {
 		o.Now = func() time.Time { return now }
 	})
 	ctx := context.Background()
-	g := func(id string, depth int64) {
-		env.groups.groups = []StreamGroupState{
+	m := env.newQueueFreezeMachine()
+	g := func(id string, depth int64) observation[[]StreamGroupState] {
+		return obs([]StreamGroupState{
 			{Stream: queue.StreamRender, Group: "render-worker", Depth: depth, LastDeliveredID: id},
-		}
+		})
 	}
 
 	// База: очередь с работой, ID свежий.
-	g("1761280800000-0", 40)
-	if s := snapshotOf(t, env.Pass(ctx), AlertQueueFreeze); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, g("1761280800000-0", 40)); s.Status != AlertStatusOK {
 		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Час без движения при глубине — заморожена.
 	now = now.Add(time.Hour)
-	s := snapshotOf(t, env.Pass(ctx), AlertQueueFreeze)
+	s := m.transition(env.Alerts, ctx, g("1761280800000-0", 40))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("час без доставок: %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -1632,25 +1634,22 @@ func TestAlertsQueueFreeze(t *testing.T) {
 		}
 	}
 	// Очередь опустела — снятие, накопленное время сброшено.
-	g("1761280800000-0", 0)
 	now = now.Add(time.Minute)
-	if s := snapshotOf(t, env.Pass(ctx), AlertQueueFreeze); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, g("1761280800000-0", 0)); s.Status != AlertStatusOK {
 		t.Errorf("пустая очередь: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Снова глубина с тем же ID: простой не считается с прошлого раза —
 	// окно тикает заново; 14 минут с возвращения глубины не хватает.
-	g("1761280800000-0", 7)
 	now = now.Add(14 * time.Minute)
-	if s := snapshotOf(t, env.Pass(ctx), AlertQueueFreeze); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, g("1761280800000-0", 7)); s.Status != AlertStatusOK {
 		t.Errorf("14 мин новой глубины: %s (%s), want ok (окно сброшено пустой очередью)", s.Status, s.Detail)
 	}
 	now = now.Add(15 * time.Minute)
-	if s := snapshotOf(t, env.Pass(ctx), AlertQueueFreeze); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, g("1761280800000-0", 7)); s.Status != AlertStatusFiring {
 		t.Errorf("15 мин без движения: %s (%s), want firing", s.Status, s.Detail)
 	}
 	// Доставка пошла — снятие, момент обновился.
-	g("1761284400000-0", 7)
-	if s := snapshotOf(t, env.Pass(ctx), AlertQueueFreeze); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, g("1761284400000-0", 7)); s.Status != AlertStatusOK {
 		t.Errorf("движение ID: %s (%s), want ok", s.Status, s.Detail)
 	}
 }
@@ -1712,32 +1711,29 @@ func TestAlertsPSICPU(t *testing.T) {
 		o.Now = func() time.Time { return now }
 	})
 	ctx := context.Background()
-	set := func(avg300 float64) {
-		env.psi.psi = PSIStat{Avg10: avg300, Avg60: avg300, Avg300: avg300}
+	m := env.newPSIMachine()
+	set := func(avg300 float64) observation[PSIStat] {
+		return obs(PSIStat{Avg10: avg300, Avg60: avg300, Avg300: avg300})
 	}
 
-	set(50)
-	if s := snapshotOf(t, env.Pass(ctx), AlertPSICPU); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, set(50)); s.Status != AlertStatusOK {
 		t.Fatalf("без давления: %s (%s), want ok", s.Status, s.Detail)
 	}
-	set(95)
 	now = now.Add(10 * time.Minute)
-	s := snapshotOf(t, env.Pass(ctx), AlertPSICPU)
+	s := m.transition(env.Alerts, ctx, set(95))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "накопление") {
 		t.Fatalf("10 мин из 30: %s (%s), want ok с накоплением", s.Status, s.Detail)
 	}
 	// Краткий провал (avg300 под порогом) — окно заново: следующие
 	// 30 минут копятся с нуля, а не продолжают накопленное.
-	set(85)
-	_ = snapshotOf(t, env.Pass(ctx), AlertPSICPU) // провал: psiHot сброшен
-	set(95)
-	_ = snapshotOf(t, env.Pass(ctx), AlertPSICPU) // окно пошло заново (held=0)
+	_ = m.transition(env.Alerts, ctx, set(85)) // провал: окно сброшено
+	_ = m.transition(env.Alerts, ctx, set(95)) // окно пошло заново (held=0)
 	now = now.Add(29 * time.Minute)
-	if s := snapshotOf(t, env.Pass(ctx), AlertPSICPU); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, set(95)); s.Status != AlertStatusOK {
 		t.Fatalf("29 мин после провала: %s (%s), want ok (окно перезапущено)", s.Status, s.Detail)
 	}
 	now = now.Add(time.Minute)
-	s = snapshotOf(t, env.Pass(ctx), AlertPSICPU)
+	s = m.transition(env.Alerts, ctx, set(95))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("30 мин выше порога: %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -1745,8 +1741,7 @@ func TestAlertsPSICPU(t *testing.T) {
 		t.Errorf("detail = %q, want avg300=95.00%% и удержание 30m0s", s.Detail)
 	}
 	// Снятие возвратом под порог.
-	set(70)
-	if s := snapshotOf(t, env.Pass(ctx), AlertPSICPU); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, set(70)); s.Status != AlertStatusOK {
 		t.Errorf("под порогом: %s (%s), want ok", s.Status, s.Detail)
 	}
 }
@@ -1791,10 +1786,11 @@ func TestAlertsRenderDebtGrowth(t *testing.T) {
 		o.RenderDebtPasses = 2
 	})
 	ctx := context.Background()
+	m := env.newRenderDebtMachine()
+	debt := func(flags, lag int64) observation[RenderDebt] { return obs(RenderDebt{Flags: flags, Lag: lag}) }
 
 	// База: долг уже выше порога, но роста ещё нет.
-	setRenderDebt(env, 443000, 99000)
-	s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	s := m.transition(env.Alerts, ctx, debt(443000, 99000))
 	if s.Status != AlertStatusOK {
 		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
 	}
@@ -1805,14 +1801,12 @@ func TestAlertsRenderDebtGrowth(t *testing.T) {
 		t.Errorf("detail = %q, want порог снятия (гистерезис 90%%)", s.Detail)
 	}
 	// Растёт один проход — серии мало.
-	setRenderDebt(env, 445000, 99000)
-	s = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	s = m.transition(env.Alerts, ctx, debt(445000, 99000))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Fatalf("один проход роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
 	}
 	// Второй проход роста — срабатывание.
-	setRenderDebt(env, 447000, 100000)
-	s = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	s = m.transition(env.Alerts, ctx, debt(447000, 100000))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("второй проход роста: %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -1823,50 +1817,42 @@ func TestAlertsRenderDebtGrowth(t *testing.T) {
 	}
 	// Стагнация (рост прекратился) — алерт ДЕРЖИТСЯ: снятие «по
 	// не-росту» качало бы эпизод на колебаниях лага (ревью T-175, P2-1).
-	setRenderDebt(env, 447000, 100000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, debt(447000, 100000)); s.Status != AlertStatusFiring {
 		t.Errorf("стагнация: %s (%s), want firing (удержание выше порога снятия)", s.Status, s.Detail)
 	}
 	// Колебания лага вокруг стационарного высокого долга — тоже
 	// удержание, не снятие.
-	setRenderDebt(env, 446500, 100300)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, debt(446500, 100300)); s.Status != AlertStatusFiring {
 		t.Errorf("колебание лага: %s (%s), want firing (удержание)", s.Status, s.Detail)
 	}
 	// Дренаж ниже порога снятия (90 % от 50 тыс.) — снятие; коридор
 	// гистерезиса (45000..50000) держал бы эпизод.
-	setRenderDebt(env, 44680, 300)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, debt(44680, 300)); s.Status != AlertStatusOK {
 		t.Errorf("ниже порога снятия: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// В коридоре гистерезиса (без сработавшего алерта) — ok: порог
 	// срабатывания строгий.
-	setRenderDebt(env, 44680, 400)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, debt(44680, 400)); s.Status != AlertStatusOK {
 		t.Errorf("коридор гистерезиса без алерта: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Повторное накопление: серия сброшена не-ростом, два прохода роста
 	// выше порога — оба прохода проверяются (первый — серии ещё мало).
-	setRenderDebt(env, 44650, 0)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt) // streak 0
-	setRenderDebt(env, 49800, 600)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
+	_ = m.transition(env.Alerts, ctx, debt(44650, 0)) // streak 0
+	s = m.transition(env.Alerts, ctx, debt(49800, 600))
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Errorf("первый проход повторного роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
 	}
-	setRenderDebt(env, 49900, 800)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, debt(49900, 800)); s.Status != AlertStatusFiring {
 		t.Errorf("второй проход повторного роста: %s (%s), want firing", s.Status, s.Detail)
 	}
 	// Коридор удержания (45–50 тыс. при сработавшем алерте): снятие
 	// «ниже порога срабатывания» не выстреливает — держит до 45 тыс.
-	setRenderDebt(env, 30000, 18000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, debt(30000, 18000)); s.Status != AlertStatusFiring {
 		t.Errorf("коридор удержания 48000: %s (%s), want firing (снятие < 45000, не < 50000)", s.Status, s.Detail)
 	}
 	// Снятие — только дренажем ниже порога снятия (90 % от 50 тыс.);
 	// 40 тыс. < 45 тыс. — восстановление.
-	setRenderDebt(env, 20000, 20000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, debt(20000, 20000)); s.Status != AlertStatusOK {
 		t.Errorf("ниже порога снятия: %s (%s), want ok", s.Status, s.Detail)
 	}
 }
@@ -1881,14 +1867,15 @@ func TestAlertsRenderDebtJitter(t *testing.T) {
 		o.RenderDebtPasses = 2
 	})
 	ctx := context.Background()
+	m := env.newRenderDebtMachine()
+	debt := func(flags int64) observation[RenderDebt] { return obs(RenderDebt{Flags: flags}) }
 
 	// Две положительные дельты подряд не набираются — алерт молчит.
 	for _, d := range []RenderDebt{
 		{Flags: 60000}, {Flags: 60050}, {Flags: 59980},
 		{Flags: 60040}, {Flags: 60020},
 	} {
-		setRenderDebt(env, d.Flags, d.Lag)
-		if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+		if s := m.transition(env.Alerts, ctx, obs(d)); s.Status != AlertStatusOK {
 			t.Fatalf("дрожание без серии роста: %s (%s), want ok", s.Status, s.Detail)
 		}
 	}
@@ -1896,18 +1883,13 @@ func TestAlertsRenderDebtJitter(t *testing.T) {
 	// Сработавший (двумя проходами роста) алерт дрожание не снимает:
 	// 60000 → 60100 → 60200 (firing) → 60150 → 60180 → 60120 — все выше
 	// порога снятия, эпизод один.
-	setRenderDebt(env, 60000, 0)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
-	setRenderDebt(env, 60100, 0)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
-	setRenderDebt(env, 60200, 0)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
+	_ = m.transition(env.Alerts, ctx, debt(60000))
+	_ = m.transition(env.Alerts, ctx, debt(60100))
+	if s := m.transition(env.Alerts, ctx, debt(60200)); s.Status != AlertStatusFiring {
 		t.Fatalf("рост двумя проходами: %s (%s), want firing", s.Status, s.Detail)
 	}
 	for _, flags := range []int64{60150, 60180, 60120} {
-		setRenderDebt(env, flags, 0)
-		s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
-		if s.Status != AlertStatusFiring {
+		if s := m.transition(env.Alerts, ctx, debt(flags)); s.Status != AlertStatusFiring {
 			t.Errorf("дрожание @%d: %s (%s), want firing (снятие — только дренаж)", flags, s.Status, s.Detail)
 		}
 	}
@@ -1923,16 +1905,15 @@ func TestAlertsRenderDebtBoundary(t *testing.T) {
 		o.RenderDebtPasses = 2
 	})
 	ctx := context.Background()
+	m := env.newRenderDebtMachine()
+	debt := func(flags int64) observation[RenderDebt] { return obs(RenderDebt{Flags: flags}) }
 
-	setRenderDebt(env, 99000, 0)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt) // база
-	setRenderDebt(env, 100000, 0)                     // == порогу: рост есть, порога нет
-	s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	_ = m.transition(env.Alerts, ctx, debt(99000))   // база
+	s := m.transition(env.Alerts, ctx, debt(100000)) // == порогу: рост есть, порога нет
 	if s.Status != AlertStatusOK {
 		t.Fatalf("долг == порогу: %s (%s), want ok (строгое сравнение)", s.Status, s.Detail)
 	}
-	setRenderDebt(env, 100001, 0) // порог+1 при серии роста 2
-	s = snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	s = m.transition(env.Alerts, ctx, debt(100001)) // порог+1 при серии роста 2
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("порог+1 с серией 2: %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -2033,23 +2014,23 @@ func TestAlertsRenderDebtTinyThreshold(t *testing.T) {
 		o.RenderDebtPasses = 1
 	})
 	ctx := context.Background()
+	m := env.newRenderDebtMachine()
+	debt := func(flags int64) observation[RenderDebt] { return obs(RenderDebt{Flags: flags}) }
 
-	setRenderDebt(env, 0, 0)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderDebt) // база
-	setRenderDebt(env, 2, 0)                          // рост +2, выше порога 1
-	s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt)
+	_ = m.transition(env.Alerts, ctx, debt(0))  // база
+	s := m.transition(env.Alerts, ctx, debt(2)) // рост +2, выше порога 1
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("порог 1: %s (%s), want firing", s.Status, s.Detail)
 	}
 	if !strings.Contains(s.Detail, "снятие < 1") {
 		t.Errorf("detail = %q, want «снятие < 1» (ceil 90%% от 1)", s.Detail)
 	}
-	setRenderDebt(env, 1, 0) // ровно порог снятия — удержание
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusFiring {
-		t.Errorf("долг 1 при пороге снятия 1: %s, want firing (удержание)", s.Status)
+	// Ровно порог снятия — удержание.
+	if s := m.transition(env.Alerts, ctx, debt(1)); s.Status != AlertStatusFiring {
+		t.Errorf("долг 1 при пороге снятия 1: %s (%s), want firing (удержание)", s.Status, s.Detail)
 	}
-	setRenderDebt(env, 0, 0) // ноль — снятие
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
+	// Ноль — снятие.
+	if s := m.transition(env.Alerts, ctx, debt(0)); s.Status != AlertStatusOK {
 		t.Errorf("нулевой долг: %s (%s), want ok (снятие достижимо)", s.Status, s.Detail)
 	}
 }
@@ -2072,75 +2053,79 @@ func staleSnap(v int64, min int) alertStaleSnap {
 func TestAlertsNewDoneStaleEpisode(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
+	m := env.newDomainsStaleMachine()
+	snap := func(v, min int64) observation[staleRow] {
+		at, _ := alertsFixedClock()
+		return obs(staleRow{
+			value: v,
+			snap:  sql.NullTime{Time: at.Add(time.Duration(min) * time.Minute), Valid: true},
+		})
+	}
 
 	steps := []struct {
-		snap alertStaleSnap
-		want string
+		value, min int64
+		want       string
 	}{
-		{staleSnap(0, 0), AlertStatusOK},      // норма: повисших нет
-		{staleSnap(3, 30), AlertStatusOK},     // первый ненулевой снапшот 1/2
-		{staleSnap(3, 30), AlertStatusOK},     // тот же снапшот — серия не растёт (алерт ходит чаще источника)
-		{staleSnap(3, 60), AlertStatusFiring}, // второй ненулевой снапшот 2/2 — устойчиво
-		{staleSnap(1, 60), AlertStatusFiring}, // удержание: любая ненулевая строка
-		{staleSnap(0, 90), AlertStatusOK},     // перепроверка T-030 закрыла — снятие
-		{staleSnap(7, 120), AlertStatusOK},    // новый эпизод после снятия — 1/2
+		{0, 0, AlertStatusOK},      // норма: повисших нет
+		{3, 30, AlertStatusOK},     // первый ненулевой снапшот 1/2
+		{3, 30, AlertStatusOK},     // тот же снапшот — серия не растёт (алерт ходит чаще источника)
+		{3, 60, AlertStatusFiring}, // второй ненулевой снапшот 2/2 — устойчиво
+		{1, 60, AlertStatusFiring}, // удержание: любая ненулевая строка
+		{0, 90, AlertStatusOK},     // перепроверка T-030 закрыла — снятие
+		{7, 120, AlertStatusOK},    // новый эпизод после снятия — 1/2
 	}
 	for i, s := range steps {
-		env.pool.stale = []alertStaleSnap{s.snap}
-		got := snapshotOf(t, env.Pass(ctx), AlertDomainsStale)
+		got := m.transition(env.Alerts, ctx, snap(s.value, s.min))
 		if got.Status != s.want {
-			t.Errorf("шаг %d (new_done_stale=%d@%s): статус = %s (%s), want %s",
-				i, s.snap.value, s.snap.at.Format("15:04"), got.Status, got.Detail, s.want)
+			t.Errorf("шаг %d (new_done_stale=%d@+%dм): статус = %s (%s), want %s",
+				i, s.value, s.min, got.Status, got.Detail, s.want)
 		}
 	}
 	// Пограничный случай границы суток (ревью P2-1): одиночный ненулевой
 	// снапшот (полночь состарила вчерашние in-flight эпизоды) следующим
 	// проходом перезаписывается нулём — алерта нет вовсе.
-	env = newAlertsTestEnv(t, nil)
-	env.pool.stale = []alertStaleSnap{staleSnap(2, 0), staleSnap(0, 30)}
-	for i, want := range []string{AlertStatusOK, AlertStatusOK} {
-		if got := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); got.Status != want {
-			t.Errorf("пограничный снапшот, шаг %d: %s (%s), want %s — без алерта", i, got.Status, got.Detail, want)
-		}
-	}
-	if strings.Contains(env.buf.String(), "АЛЕРТ") {
-		t.Errorf("пограничный снапшот дал Warn:\n%s", env.buf.String())
+	env2 := newAlertsTestEnv(t, nil)
+	m2 := env2.newDomainsStaleMachine()
+	got := runSequence(env2.Alerts, m2, snap(2, 0), snap(0, 30))
+	wantSequence(t, "пограничный снапшот", got, []string{AlertStatusOK, AlertStatusOK})
+	if strings.Contains(env2.buf.String(), "АЛЕРТ") {
+		t.Errorf("пограничный снапшот дал Warn:\n%s", env2.buf.String())
 	}
 
 	// Detail с уровнем, счётчиком снапшотов и путём лечения: серия
 	// растёт на каждом новом снапшоте (3/2 — перевыполнен, удержание).
-	env = newAlertsTestEnv(t, nil)
-	env.pool.stale = []alertStaleSnap{staleSnap(9, 0), staleSnap(9, 30), staleSnap(12, 60)}
-	_ = snapshotOf(t, env.Pass(ctx), AlertDomainsStale) // 1/2
-	_ = snapshotOf(t, env.Pass(ctx), AlertDomainsStale) // 2/2 — firing
-	got := snapshotOf(t, env.Pass(ctx), AlertDomainsStale)
+	env3 := newAlertsTestEnv(t, nil)
+	m3 := env3.newDomainsStaleMachine()
+	_ = m3.transition(env3.Alerts, ctx, snap(9, 0))  // 1/2
+	_ = m3.transition(env3.Alerts, ctx, snap(9, 30)) // 2/2 — firing
+	g := m3.transition(env3.Alerts, ctx, snap(12, 60))
 	for _, want := range []string{"12", "3/2", "crawler_domains_new_done_stale"} {
-		if !strings.Contains(got.Detail, want) {
-			t.Errorf("detail %q не содержит %q", got.Detail, want)
+		if !strings.Contains(g.Detail, want) {
+			t.Errorf("detail %q не содержит %q", g.Detail, want)
 		}
 	}
 
 	// Один Warn на эпизод: срабатывание Warn «АЛЕРТ», удержание и
-	// снятие — без повторного Warn.
-	env = newAlertsTestEnv(t, nil)
-	env.pool.stale = []alertStaleSnap{staleSnap(9, 0), staleSnap(9, 30)}
+	// снятие — без повторного Warn (полный проход).
+	env4 := newAlertsTestEnv(t, nil)
+	env4.pool.stale = []alertStaleSnap{staleSnap(9, 0), staleSnap(9, 30)}
 	for range 2 {
-		env.Pass(ctx)
+		env4.Pass(ctx)
 	}
-	if n := strings.Count(env.buf.String(), "АЛЕРТ: домены «статус повис»"); n != 1 {
-		t.Errorf("Warn срабатывания = %d, want 1:\n%s", n, env.buf.String())
+	if n := strings.Count(env4.buf.String(), "АЛЕРТ: домены «статус повис»"); n != 1 {
+		t.Errorf("Warn срабатывания = %d, want 1:\n%s", n, env4.buf.String())
 	}
-	env.pool.stale = []alertStaleSnap{staleSnap(9, 90)}
-	if got := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); got.Status != AlertStatusFiring {
+	env4.pool.stale = []alertStaleSnap{staleSnap(9, 90)}
+	if got := snapshotOf(t, env4.Pass(ctx), AlertDomainsStale); got.Status != AlertStatusFiring {
 		t.Fatalf("устойчивое срабатывание: %s, want firing", got.Status)
 	}
-	before := env.buf.String()
-	env.pool.stale = nil // нули по умолчанию
-	s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale)
+	before := env4.buf.String()
+	env4.pool.stale = nil // нули по умолчанию
+	s := snapshotOf(t, env4.Pass(ctx), AlertDomainsStale)
 	if s.Status != AlertStatusOK {
 		t.Fatalf("нулевая строка: %s, want ok", s.Status)
 	}
-	if delta := env.buf.String()[len(before):]; strings.Contains(delta, "level=WARN") {
+	if delta := env4.buf.String()[len(before):]; strings.Contains(delta, "level=WARN") {
 		t.Errorf("снятие дало Warn:\n%s", delta)
 	} else if !strings.Contains(delta, "level=INFO") || !strings.Contains(delta, "алерт снят") {
 		t.Errorf("снятие без Info:\n%s", delta)

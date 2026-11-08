@@ -78,7 +78,7 @@ var _ StreamGroupsSource = RedisStreamGroups{}
 // пустой вклад, глубина такого стрима — территория алерта переполнения
 // (Len читает XLEN). Ошибка чтения любого стрима останавливает проход
 // целиком: непрочитанные состояния не подменяются пустотой, иначе сбой
-// ложно «оживлял» бы замороженную группу (сброс трекинга в evalQueueFreeze).
+// ложно «оживлял» бы замороженную группу (сброс трекинга в машине queue_frozen).
 func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState, error) {
 	if s.RDB == nil {
 		return nil, fmt.Errorf("monitor: группы стримов: клиент Redis не задан")

@@ -31,6 +31,12 @@ type fakeBudgetEvents struct {
 	calls int
 }
 
+func (f *fakeBudgetEvents) set(v int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.val = v
+}
+
 func (f *fakeBudgetEvents) FallbackBudget(context.Context) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -39,12 +45,6 @@ func (f *fakeBudgetEvents) FallbackBudget(context.Context) (int64, error) {
 		return 0, err
 	}
 	return f.val, nil
-}
-
-func (f *fakeBudgetEvents) set(v int64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.val = v
 }
 
 // --- рост глубины q:render-fallback -------------------------------------------
@@ -67,11 +67,11 @@ func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
 	// MAXLEN стрима выше — без клампа), снятие < 900.
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
+	m := env.newRenderFbDepthMachine()
 
 	// База и рост ниже порога: серия роста копится, порог ещё не
 	// задействован.
-	setFallbackDepth(env, 500)
-	s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
+	s := m.transition(env.Alerts, ctx, obs(int64(500)))
 	if s.Status != AlertStatusOK {
 		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
 	}
@@ -82,14 +82,12 @@ func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
 	}
 	// Один проход роста — серии мало (разовый всплеск публикаций —
 	// штатная работа фолбэка «собрать и доработать»).
-	setFallbackDepth(env, 800)
-	s = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
+	s = m.transition(env.Alerts, ctx, obs(int64(800)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Fatalf("один проход роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
 	}
 	// Второй проход роста с пересечением порога — срабатывание.
-	setFallbackDepth(env, 1420)
-	s = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
+	s = m.transition(env.Alerts, ctx, obs(int64(1420)))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("второй проход роста: %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -100,31 +98,26 @@ func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
 	}
 	// Стагнация выше порога снятия — удержание (не повторный Warn,
 	// эпизод один).
-	setFallbackDepth(env, 1410)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, obs(int64(1410))); s.Status != AlertStatusFiring {
 		t.Errorf("стагнация: %s (%s), want firing (удержание)", s.Status, s.Detail)
 	}
 	// Дренаж ниже 90 % порога — снятие.
-	setFallbackDepth(env, 890)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, obs(int64(890))); s.Status != AlertStatusOK {
 		t.Errorf("дренаж: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Коридор гистерезиса (900..1000) без сработавшего алерта — ok:
 	// порог срабатывания строгий, рост в коридоре серию копит.
-	setFallbackDepth(env, 950)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, obs(int64(950))); s.Status != AlertStatusOK {
 		t.Errorf("коридор без алерта: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Просадка сбрасывает серию; повторное накопление — снова два
 	// прохода роста (рост через порог — то же накопление).
-	setFallbackDepth(env, 800)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // streak 0
-	setFallbackDepth(env, 1010)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
+	_ = m.transition(env.Alerts, ctx, obs(int64(800))) // streak 0
+	s = m.transition(env.Alerts, ctx, obs(int64(1010)))
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Errorf("первый проход повторного роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
 	}
-	setFallbackDepth(env, 1060)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, obs(int64(1060))); s.Status != AlertStatusFiring {
 		t.Errorf("второй проход повторного роста: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
@@ -142,16 +135,15 @@ func TestAlertsRenderFallbackDepthStationary(t *testing.T) {
 	// 7 500), как на дефолтных watermark 100 тыс.
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 100000 })
 	ctx := context.Background()
+	m := env.newRenderFbDepthMachine()
 
 	// Стационарная глубина 9000 без роста: первый проход — база
 	// (у порога 1/2), второй — firing.
-	setFallbackDepth(env, 9000)
-	s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
+	s := m.transition(env.Alerts, ctx, obs(int64(9000)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "у порога 1/2") {
 		t.Fatalf("стационарная база: %s (%s), want ok с серией у порога 1/2", s.Status, s.Detail)
 	}
-	setFallbackDepth(env, 9000)
-	s = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
+	s = m.transition(env.Alerts, ctx, obs(int64(9000)))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("стационарная 9000: %s (%s), want firing со 2-го прохода", s.Status, s.Detail)
 	}
@@ -163,29 +155,24 @@ func TestAlertsRenderFallbackDepthStationary(t *testing.T) {
 
 	// Упор в потолок MAXLEN: глубина не растёт (обрезка вытесняет
 	// недоставленное) — firing и удержание.
-	setFallbackDepth(env, 15000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, obs(int64(15000))); s.Status != AlertStatusFiring {
 		t.Errorf("упор в MAXLEN: %s (%s), want firing", s.Status, s.Detail)
 	}
-	setFallbackDepth(env, 15000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, obs(int64(15000))); s.Status != AlertStatusFiring {
 		t.Errorf("упор в MAXLEN, второй проход: %s (%s), want firing (удержание)", s.Status, s.Detail)
 	}
 
 	// Дренаж ниже 90 % порога — снятие (защёлка не вечна).
-	setFallbackDepth(env, 6000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, obs(int64(6000))); s.Status != AlertStatusOK {
 		t.Errorf("дренаж: %s (%s), want ok", s.Status, s.Detail)
 	}
 
 	// Одиночный всплеск между проходами (рассасывается) — тихо: серия
 	// у порога не набирается, рост одного прохода — не триггер.
-	setFallbackDepth(env, 9000)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // у порога 1/2, ok
-	setFallbackDepth(env, 100)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // рассосался, ok
-	setFallbackDepth(env, 9000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "у порога 1/2") {
+	_ = m.transition(env.Alerts, ctx, obs(int64(9000))) // у порога 1/2, ok
+	_ = m.transition(env.Alerts, ctx, obs(int64(100)))  // рассосался, ok
+	s = m.transition(env.Alerts, ctx, obs(int64(9000)))
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "у порога 1/2") {
 		t.Errorf("одиночный всплеск: %s (%s), want ok с серией у порога 1/2 (анти-спайк)", s.Status, s.Detail)
 	}
 }
@@ -213,13 +200,11 @@ func TestAlertsRenderFallbackDepthWatermark(t *testing.T) {
 				o.QueueMaxLen = tc.maxLen
 			})
 			ctx := context.Background()
+			m := env.newRenderFbDepthMachine()
 			// Серия роста двумя проходами на глубине ровно порога.
-			setFallbackDepth(env, tc.want+10)
-			_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // база
-			setFallbackDepth(env, tc.want+20)
-			_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // рост 1
-			setFallbackDepth(env, tc.want+30)
-			s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth)
+			_ = m.transition(env.Alerts, ctx, obs(tc.want+10)) // база
+			_ = m.transition(env.Alerts, ctx, obs(tc.want+20)) // рост 1
+			s := m.transition(env.Alerts, ctx, obs(tc.want+30))
 			if s.Status != AlertStatusFiring {
 				t.Fatalf("глубина %d > порога %d: %s (%s), want firing",
 					tc.want+30, tc.want, s.Status, s.Detail)
@@ -239,16 +224,13 @@ func TestAlertsRenderFallbackDepthWatermark(t *testing.T) {
 	// порога — срабатывание.
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 1000 })
 	ctx := context.Background()
-	setFallbackDepth(env, 1000)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // база (у порога 1/2)
-	setFallbackDepth(env, 1000)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
+	m := env.newRenderFbDepthMachine()
+	_ = m.transition(env.Alerts, ctx, obs(int64(1000))) // база (у порога 1/2)
+	if s := m.transition(env.Alerts, ctx, obs(int64(1000))); s.Status != AlertStatusFiring {
 		t.Errorf("глубина == порогу без роста два прохода: %s (%s), want firing (стационарно у порога, S-P2-1)", s.Status, s.Detail)
 	}
-	setFallbackDepth(env, 1001)
-	_ = snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth) // рост 1 (удержание)
-	setFallbackDepth(env, 1002)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
+	_ = m.transition(env.Alerts, ctx, obs(int64(1001))) // рост 1 (удержание)
+	if s := m.transition(env.Alerts, ctx, obs(int64(1002))); s.Status != AlertStatusFiring {
 		t.Errorf("рост через порог: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
@@ -273,7 +255,7 @@ func TestAlertsRenderFallbackDepthDegradation(t *testing.T) {
 
 	// Ошибка Len — Warn; очередь ошибок: до этого алерта Len зовут
 	// 6 раз (4 стрима алерта очередей + q:dead + q:render рендер-долга
-	// — он раньше по порядку evaluators), ошибка — седьмая.
+	// — он раньше по порядку машин NewAlerts), ошибка — седьмая.
 	env3 := newAlertsTestEnv(t, nil)
 	env3.lener.errs = []error{nil, nil, nil, nil, nil, nil, errors.New("redis: xinfo")}
 	s := snapshotOf(t, env3.Pass(context.Background()), AlertRenderFbDepth)
@@ -318,13 +300,11 @@ func TestAlertsRenderFallbackDepthDegradation(t *testing.T) {
 // счётчика) — без ложного всплеска.
 func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	src := &fakeBudgetEvents{}
-	env.deps.FallbackBudget = src
 	ctx := context.Background()
+	m := env.newRenderFbBudgetMachine()
 
 	// База: накопленное до старта мониторинга не событие.
-	src.set(3)
-	s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget)
+	s := m.transition(env.Alerts, ctx, obs(int64(3)))
 	if s.Status != AlertStatusOK {
 		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
 	}
@@ -332,8 +312,7 @@ func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 		t.Errorf("detail = %q, want значение счётчика", s.Detail)
 	}
 	// Событие — срабатывание (порог 1: каждое защёлкивание — аномалия).
-	src.set(4)
-	s = snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget)
+	s = m.transition(env.Alerts, ctx, obs(int64(4)))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("событие: %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -345,23 +324,21 @@ func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 	// Окно 6 проходов держит алерт старением: 5 проходов без событий —
 	// ещё держит, шестой вытесняет дельту — снятие.
 	for range 5 {
-		if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusFiring {
-			t.Fatalf("окно держит событие: %s (%s), want firing", s.Status, s.Detail)
+		if got := m.transition(env.Alerts, ctx, obs(int64(4))); got.Status != AlertStatusFiring {
+			t.Fatalf("окно держит событие: %s (%s), want firing", got.Status, got.Detail)
 		}
 	}
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusOK {
-		t.Fatalf("после старения окна: %s (%s), want ok", s.Status, s.Detail)
+	if got := m.transition(env.Alerts, ctx, obs(int64(4))); got.Status != AlertStatusOK {
+		t.Fatalf("после старения окна: %s (%s), want ok", got.Status, got.Detail)
 	}
 	// Рестарт воркера (счётчик обнулился) — убыль не всплеск.
-	src.set(0)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusOK {
-		t.Errorf("рестарт воркера: %s (%s), want ok без всплеска", s.Status, s.Detail)
+	if got := m.transition(env.Alerts, ctx, obs(int64(0))); got.Status != AlertStatusOK {
+		t.Errorf("рестарт воркера: %s (%s), want ok без всплеска", got.Status, got.Detail)
 	}
 	// Поток событий продлевает алерт: событие в каждом проходе.
-	for i := range 3 {
-		src.set(int64(i + 1))
-		if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusFiring {
-			t.Fatalf("поток событий, проход %d: %s, want firing", i, s.Status)
+	for i := int64(1); i <= 3; i++ {
+		if got := m.transition(env.Alerts, ctx, obs(i)); got.Status != AlertStatusFiring {
+			t.Fatalf("поток событий, проход %d: %s, want firing", i, got.Status)
 		}
 	}
 }
@@ -373,40 +350,34 @@ func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 // повторное первое событие снова firing, убыль — без ложного всплеска.
 func TestAlertsRenderFallbackBudgetPrecreatedSeries(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	src := &fakeBudgetEvents{}
-	env.deps.FallbackBudget = src
 	ctx := context.Background()
+	m := env.newRenderFbBudgetMachine()
 
 	// Предсозданная серия: зонд читает 0 (не «не измеряется»), prev
 	// базируется нулём.
-	src.set(0)
-	s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget)
-	if s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, obs(int64(0))); s.Status != AlertStatusOK {
 		t.Fatalf("нулевая серия: %s (%s), want ok (предсоздание T-250)", s.Status, s.Detail)
 	}
 	// Первое событие 0→1 — firing: дельта видна, окно её держит.
-	src.set(1)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, obs(int64(1))); s.Status != AlertStatusFiring {
 		t.Fatalf("первое событие 0→1: %s (%s), want firing", s.Status, s.Detail)
 	}
 	// Окно стареет: 5 проходов держат событие, шестой вытесняет — снятие.
 	for range 5 {
-		if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusFiring {
-			t.Fatalf("окно держит событие: %s (%s), want firing", s.Status, s.Detail)
+		if got := m.transition(env.Alerts, ctx, obs(int64(1))); got.Status != AlertStatusFiring {
+			t.Fatalf("окно держит событие: %s (%s), want firing", got.Status, got.Detail)
 		}
 	}
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusOK {
-		t.Fatalf("после старения окна: %s (%s), want ok", s.Status, s.Detail)
+	if got := m.transition(env.Alerts, ctx, obs(int64(1))); got.Status != AlertStatusOK {
+		t.Fatalf("после старения окна: %s (%s), want ok", got.Status, got.Detail)
 	}
 	// Рестарт воркера: счётчик процессный — обнулился; убыль не всплеск.
-	src.set(0)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusOK {
-		t.Fatalf("рестарт воркера: %s (%s), want ok без всплеска", s.Status, s.Detail)
+	if got := m.transition(env.Alerts, ctx, obs(int64(0))); got.Status != AlertStatusOK {
+		t.Fatalf("рестарт воркера: %s (%s), want ok без всплеска", got.Status, got.Detail)
 	}
 	// Повторное первое событие (0→1 нового процесса) — снова firing.
-	src.set(1)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderFbBudget); s.Status != AlertStatusFiring {
-		t.Fatalf("первое событие после рестарта: %s (%s), want firing", s.Status, s.Detail)
+	if got := m.transition(env.Alerts, ctx, obs(int64(1))); got.Status != AlertStatusFiring {
+		t.Fatalf("первое событие после рестарта: %s (%s), want firing", got.Status, got.Detail)
 	}
 }
 
@@ -436,6 +407,15 @@ func TestAlertsRenderFallbackBudgetDegradation(t *testing.T) {
 	if !strings.Contains(env2.buf.String(), "level=WARN") {
 		t.Errorf("ошибка зонда без Warn:\n%s", env2.buf.String())
 	}
+
+	// Очередь ошибок опустела — следующий проход живого зонда работает
+	// (успешный путь observeRenderFallbackBudget полным стеком): база
+	// кольца без всплеска.
+	src.set(5)
+	if s := snapshotOf(t, env2.Pass(context.Background()), AlertRenderFbBudget); s.Status != AlertStatusOK ||
+		!strings.Contains(s.Detail, "события бюджета 5") {
+		t.Errorf("живой зонд после ошибки: %s (%s), want ok с базой кольца", s.Status, s.Detail)
+	}
 }
 
 // --- browser-ошибки этапа рендера (S-P2-6) --------------------------------------
@@ -457,12 +437,6 @@ func (f *fakeBrowserErrors) RenderBrowserErrors(context.Context) (int64, error) 
 	return f.val, nil
 }
 
-func (f *fakeBrowserErrors) set(v int64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.val = v
-}
-
 // TestAlertsRenderBrowserErrors — rate-детектор (S-P2-6): серия
 // browser-ошибок (рост счётчика 2 прохода подряд) — firing; одиночная
 // ошибка — тихо; счётчик перестал расти — снятие (алерт события, не
@@ -470,24 +444,21 @@ func (f *fakeBrowserErrors) set(v int64) {
 // с нуля.
 func TestAlertsRenderBrowserErrors(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	src := &fakeBrowserErrors{}
-	env.deps.RenderBrowserErrors = src
 	ctx := context.Background()
+	m := env.newRenderBrowserErrMachine()
 
 	// База: ленивое семейство — 0 у живого воркера без browser-ошибок.
-	src.set(0)
-	s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr)
+	s := m.transition(env.Alerts, ctx, obs(int64(0)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "browser-ошибки рендера 0") {
 		t.Fatalf("база: %s (%s), want ok с нулём", s.Status, s.Detail)
 	}
 	// Одиночная ошибка — серия 1/2, тихо (штатный перезапуск сессии).
-	src.set(1)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
+	s = m.transition(env.Alerts, ctx, obs(int64(1)))
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Fatalf("одиночная: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
 	}
 	// Серия — второй растущий проход: firing.
-	src.set(3)
-	s = snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr)
+	s = m.transition(env.Alerts, ctx, obs(int64(3)))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("серия: %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -498,22 +469,19 @@ func TestAlertsRenderBrowserErrors(t *testing.T) {
 	}
 	// Счётчик стоит — серия сброшена, алерт снят (восстановление движка
 	// или удержание гейта: новых ошибок нет).
-	src.set(3)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, obs(int64(3))); s.Status != AlertStatusOK {
 		t.Errorf("стационарно: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Рестарт воркера (счётчик процессный, обнулился) — убыль не всплеск.
-	src.set(0)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusOK {
+	if s := m.transition(env.Alerts, ctx, obs(int64(0))); s.Status != AlertStatusOK {
 		t.Errorf("рестарт воркера: %s (%s), want ok без всплеска", s.Status, s.Detail)
 	}
 	// Новое накопление — снова два растущих прохода.
-	src.set(2)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
+	s = m.transition(env.Alerts, ctx, obs(int64(2)))
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Errorf("первый проход новой серии: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
 	}
-	src.set(5)
-	if s := snapshotOf(t, env.Pass(ctx), AlertRenderBrowserErr); s.Status != AlertStatusFiring {
+	if s := m.transition(env.Alerts, ctx, obs(int64(5))); s.Status != AlertStatusFiring {
 		t.Errorf("второй проход новой серии: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
@@ -544,13 +512,21 @@ func TestAlertsRenderBrowserErrorsDegradation(t *testing.T) {
 	}
 
 	env3 := newAlertsTestEnv(t, nil)
-	env3.deps.RenderBrowserErrors = &fakeBrowserErrors{errs: []error{errors.New("connection refused")}}
+	src := &fakeBrowserErrors{errs: []error{errors.New("connection refused")}}
+	env3.deps.RenderBrowserErrors = src
 	s = snapshotOf(t, env3.Pass(context.Background()), AlertRenderBrowserErr)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "connection refused") {
 		t.Fatalf("сетевая ошибка: %s (%s), want not_measured с причиной", s.Status, s.Detail)
 	}
 	if !strings.Contains(env3.buf.String(), "level=WARN") {
 		t.Errorf("сетевая ошибка без Warn:\n%s", env3.buf.String())
+	}
+
+	// Очередь ошибок опустела — живой зонд читает ленивую серию (успех
+	// observeRenderBrowserErrors полным стеком): 0 без ошибок — ok.
+	if s := snapshotOf(t, env3.Pass(context.Background()), AlertRenderBrowserErr); s.Status != AlertStatusOK ||
+		!strings.Contains(s.Detail, "browser-ошибки рендера 0") {
+		t.Errorf("живой зонд после ошибки: %s (%s), want ok с нулём", s.Status, s.Detail)
 	}
 }
 

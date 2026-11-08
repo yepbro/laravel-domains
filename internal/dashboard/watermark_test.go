@@ -94,7 +94,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 					continue
 				}
 				// Порог монитора: queue.StreamWatermark с теми же
-				// опциями (alerts.go evalQueues, T-080).
+				// опциями (alerts.go, машина queue_overflow, T-080).
 				monitorWM := queue.StreamWatermark(tc.watermark, tc.maxLen, s)
 				if got := snap.QueueWatermarks[s]; got != monitorWM {
 					t.Errorf("queue_watermarks[%s] = %d, хочу %d (порог монитора)", s, got, monitorWM)

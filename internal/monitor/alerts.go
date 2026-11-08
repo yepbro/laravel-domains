@@ -146,6 +146,13 @@
 // (T-076): метрики алертов (crawler_alert_firing по меткам) заведёт слой
 // T-077 поверх общего реестра, хук даёт точку подключения без правки
 // цикла.
+//
+// Автомат алертов (T-264, ТЗ tasks/TZ-fsm.md §3 ФТ-10): каждый алерт —
+// значение единой структуры «{имя, статус, track-память}»
+// (alertMachine) с единственной точкой записи состояния transition;
+// eval-функции этого файла возвращают наблюдение (observation), решение
+// принимают типизированные track-памяти. Спецификация состояний и
+// переходов — internal/monitor/alertstate.go.
 package monitor
 
 import (
@@ -959,7 +966,7 @@ type AlertSnapshot struct {
 }
 
 // AlertsResult — снапшот прохода оценки: по одному AlertSnapshot на алерт,
-// порядок фиксирован (evaluators).
+// порядок фиксирован (NewAlerts).
 type AlertsResult struct {
 	Alerts []AlertSnapshot
 }
@@ -975,190 +982,30 @@ func (r AlertsResult) Firing() []AlertSnapshot {
 	return firing
 }
 
-// verdict — итог проверки одного алерта до наложения гистерезиса
-// (гистерезис решает внутри evaluators по prev).
-type verdict struct {
-	status string
-	detail string
-	// err — ошибка источника: алерт переводится в «не измеряется», ошибка
-	// логируется Warn каждого прохода (цикл живёт). Пустые-guard'ы
-	// («мало данных», «выключено») задают detail без err — тише.
-	err error
-}
-
-// alertEval — одна проверка: prev — прошлое состояние алерта (для
-// гистерезиса), verdict — новое.
-type alertEval struct {
-	name string
-	eval func(ctx context.Context, prev string) verdict
-}
-
-// badHashesWindow — память окна всплеска мусорных content_hash (T-099):
-// дельты счётчика между проходами алертов в кольце последних значений
-// (ёмкость — size; 0 — AlertBadHashesWindow). Тот же кольцевой счётчик
-// событий переиспользует окно бюджета доли фолбэка (T-246). Первое
-// наблюдение только базирует prev — старт мониторинга позже
-// накопленного счётчика не ретроспективен (окно считает новые события,
-// а не всю историю); убывание счётчика (рестарт владельца) даёт нулевую
-// дельту — счётчик начинается заново, ложного всплеска нет.
-type badHashesWindow struct {
-	prev   int64
-	seen   bool
-	deltas []int64
-	i      int
-	// size — ёмкость кольца в проходах; 0 — AlertBadHashesWindow
-	// (историческое поведение всплеска мусорных хешей).
-	size int
-}
-
-// push принимает текущее значение счётчика и возвращает сумму окна.
-func (w *badHashesWindow) push(cur int64) int64 {
-	var d int64
-	if !w.seen {
-		w.seen = true // база: накопленное до старта мониторинга не считается
-		// Эквивалентный мутант: при cur == prev обе ветви дают дельту 0.
-		// mutator-disable-next-line expression/comparison
-	} else if cur > w.prev {
-		d = cur - w.prev
-	}
-	w.prev = cur
-	if w.deltas == nil {
-		size := w.size
-		if size <= 0 {
-			size = AlertBadHashesWindow
-		}
-		w.deltas = make([]int64, size)
-	}
-	w.deltas[w.i] = d
-	// Эквивалентный мутант шага +2: 2 взаимно просто с длинной окна 15 —
-	// кольцо в обоих случаях содержит последние 15 дельт, сумма окна
-	// неотличима тестом.
-	// mutator-disable-next-line numbers/incrementer
-	w.i = (w.i + 1) % len(w.deltas)
-	var sum int64
-	for _, d := range w.deltas {
-		sum += d
-	}
-	return sum
-}
-
-// memHighTrack — память трекинга троттлинга MemoryHigh одного юнита
-// (T-162): прошлый счётчик memory.events high и серия проходов подряд с
-// его ростом. Ростом считается только увеличение: рестарт юнита
-// пересоздаёт cgroup и обнуляет счётчик — убыль начинает новую серию без
-// ложного всплеска (стиль badHashesWindow).
-type memHighTrack struct {
-	prev   uint64
-	streak int
-	seen   bool
-}
-
-// freezeTrack — память трекинга замороженной группы стрима (T-162):
-// последний замеченный last-delivered-id и момент, с которого он стоит.
-// since живёт только при глубине > 0 — простой пустой очереди не
-// накапливает «время без доставок» (см. evalQueueFreeze).
-type freezeTrack struct {
-	lastID string
-	since  time.Time
-}
-
-// depthGrowthTrack — память трекинга роста уровня-глубины (общая у
-// render_debt T-175 и render_fallback_depth T-246): прошлый снимок,
-// серия проходов подряд с ростом (стиль memHighTrack) и защёлка
-// сработавшего эпизода. Рост — строго увеличение: дренаж и приток
-// плещутся вокруг константы — стагнация, а не накопление, серию не
-// копит. Защёлка firing переживает «не измеряется» (сбой источника
-// состояние алерта перезаписывает, ревью T-175 раунд 2, P2-1):
-// удержание обязано опираться на неё, а не на прошлый статус — иначе
-// короткий сбой БД/Redis посреди эпизода давал бы ложное ✅
-// «Восстановлено» при долге выше порога снятия; сбрасывает защёлку
-// только фактический дренаж ниже порога.
-type depthGrowthTrack struct {
-	prev   int64
-	streak int
-	seen   bool
-	firing bool
-	// hot — серия проходов с уровнем ≥ порога срабатывания, без
-	// требования роста (S-P2-1, только render_fallback_depth): ловит
-	// стационарно высокую глубину, которую серия роста не видит —
-	// рестарт монитора посреди эпизода (первый проход базирует prev и
-	// серию роста нулём) и упор в предел MAXLEN стрима (обрезка
-	// вытесняет старейшие недоставленные записи — глубина перестаёт
-	// расти). render_debt уровня hot не ведёт: стагнация долга — строка
-	// отчёта нагрузки, алерт там — про накопление (T-175).
-	hot int
-}
-
-// counterGrowthTrack — память трекинга роста одиночного счётчика между
-// проходами (S-P2-6): прошлый снимок и серия растущих проходов (стиль
-// memHighTrack; отдельный тип — счётчик int64, как значения зондов).
-type counterGrowthTrack struct {
-	prev   int64
-	streak int
-	seen   bool
-}
-
-// newDoneStaleTrack — память трекинга строки new_done_stale (T-256,
-// ФТ-2.2): метка последнего прочитанного снапшота реконсиляции
-// (updated_at) и серия НОВЫХ снапшотов подряд с ненулевым значением.
-// Проходы алертов (5 мин) чаще проходов источника (zone_stats_interval,
-// 30 мин): серия растёт только при смене метки — два чтения одной
-// строки не два наблюдения (ревью T-256, P2-1); нулевое значение серию
-// обнуляет, ошибка источника память не трогает (стиль deadStreak).
-type newDoneStaleTrack struct {
-	snap   time.Time
-	streak int
-	seen   bool
-}
-
 // Alerts — оценка алертов с памятью состояний между проходами
-// (гистерезис, фронтовые записи лога только на переходах).
+// (гистерезис, фронтовые записи лога только на переходах). Каждый алерт
+// — машина alertMachine (T-264, ТЗ-fsm §3 ФТ-10): «{имя, статус,
+// track-память}» с единственной точкой записи состояния transition —
+// спецификация автомата и типизированные track-памяти в alertstate.go,
+// этот файл — источники наблюдений (observe*) и сборка машин.
 type Alerts struct {
-	deps    AlertsDeps
-	opts    AlertsOptions
-	log     *slog.Logger
-	now     func() time.Time
-	state   map[string]string
-	badHash badHashesWindow // окно всплеска мусорных content_hash (T-099)
-	// deadStreak — проходов подряд с ненулевой глубиной q:dead (T-154):
-	// «устойчиво ненулевой» вместо мгновенного срабатывания на первую
-	// смерть; обнуляется пустым q:dead, ошибка источника не сбрасывает
-	// (неизвестное наблюдение — не нулевое).
-	deadStreak int
-	// memHigh — трекинг memory.events high по юнитам (T-162), ключ — имя
-	// юнита. Размер ограничен числом юнитов crawler (шаблон
-	// unitEventsPattern); исчезнувшие юниты чистит evalMemHigh.
-	memHigh map[string]memHighTrack
-	// frozen — трекинг last-delivered-id по группам стримов (T-162),
-	// ключ «стрим/группа». Записи живы только при глубине > 0.
-	frozen map[string]freezeTrack
-	// psiHot — момент первого наблюдения PSI выше порога (T-162);
-	// нулевое время — давления нет, окно устойчивости не тикает.
-	psiHot time.Time
-	// renderDebt — трекинг роста рендер-долга (T-175): прошлый снимок и
-	// серия растущих проходов.
-	renderDebt depthGrowthTrack
-	// renderFbDepth — трекинг роста глубины q:render-fallback (T-246):
-	// тот же профиль, что рендер-долг (уровень + серия роста + защёлка).
-	renderFbDepth depthGrowthTrack
-	// renderFbBudget — окно событий приостановки бюджета доли фолбэка
-	// (T-246): кольцо дельт счётчика suspended{reason="budget"}, ёмкость
-	// — AlertFallbackBudgetWindow (не дефолтная окна мусорных хешей).
-	renderFbBudget badHashesWindow
-	// renderBrowserErr — трекинг роста счётчика browser-ошибок этапа
-	// рендера (S-P2-6): прошлый снимок зонда и серия растущих проходов.
-	renderBrowserErr counterGrowthTrack
-	// newDoneStale — трекинг строки new_done_stale (T-256, ФТ-2.2):
-	// метка последнего прочитанного снапшота (updated_at строки — момент
-	// прохода реконсиляции) и серия ненулевых НОВЫХ снапшотов подряд.
-	// Повторные чтения одной строки между проходами реконсиляции серию
-	// не наращивают (алерт ходит чаще источника); ошибка источника
-	// память не трогает — неизвестное наблюдение не обнуляет серию.
-	newDoneStale newDoneStaleTrack
+	deps AlertsDeps
+	opts AlertsOptions
+	log  *slog.Logger
+	now  func() time.Time
+	// machines — машины алертов в фиксированном порядке (инвариант И4
+	// alertstate.go): снапшот AlertsResult детерминирован, очередь
+	// чтений Redis источников стабильна.
+	machines []alertRunner
 }
 
-// NewAlerts строит оценщик: нормализует опции (дефолты периодов), источники
-// Space/Wear/PSI (nil → реализации ОС) и готовит память состояний.
+// NewAlerts строит оценщик: нормализует опции (дефолты периодов),
+// источники Space/Wear/PSI (nil → реализации ОС) и собирает машины
+// алертов (конструкторы newXMachine — рядом с observe-функциями
+// источников; источники и пороги — шапка файла). Порядок машин —
+// прежний порядок evaluators (T-080…T-256): от него зависит очередь
+// чтений общих источников (фейки тестов позиционируют ошибки по номеру
+// чтения Len).
 func NewAlerts(deps AlertsDeps, opts AlertsOptions) *Alerts {
 	o := opts.withDefaults()
 	log := o.Log
@@ -1178,41 +1025,29 @@ func NewAlerts(deps AlertsDeps, opts AlertsOptions) *Alerts {
 	if deps.PSI == nil {
 		deps.PSI = OSPSI{}
 	}
-	return &Alerts{
-		deps: deps, opts: o, log: log, now: now,
-		state:   make(map[string]string),
-		memHigh: make(map[string]memHighTrack),
-		frozen:  make(map[string]freezeTrack),
-		// Окно бюджета фолбэка — 6 проходов (не 15 окна мусорных хешей):
-		// ёмкость кольца задаётся здесь, push дефолта не знает.
-		renderFbBudget: badHashesWindow{size: AlertFallbackBudgetWindow},
+	a := &Alerts{deps: deps, opts: o, log: log, now: now}
+	a.machines = []alertRunner{
+		a.newDNSMachine(),
+		a.newQueuesMachine(),
+		a.newStallMachine(),
+		a.newDiskMachine(),
+		a.newDiskMinMachine(),
+		a.newDiskCritMachine(),
+		a.newWearMachine(),
+		a.newBadHashesMachine(),
+		a.newUnitOOMMachine(),
+		a.newMemHighMachine(),
+		a.newDeadMachine(),
+		a.newQueueFreezeMachine(),
+		a.newRedisMemoryMachine(),
+		a.newPSIMachine(),
+		a.newRenderDebtMachine(),
+		a.newRenderFbDepthMachine(),
+		a.newRenderFbBudgetMachine(),
+		a.newRenderBrowserErrMachine(),
+		a.newDomainsStaleMachine(),
 	}
-}
-
-// evaluators — проверки прохода в фиксированном порядке (порядок
-// снапшота AlertsResult).
-func (a *Alerts) evaluators() []alertEval {
-	return []alertEval{
-		{AlertDNSErrors, a.evalDNS},
-		{AlertQueueOverflow, a.evalQueues},
-		{AlertProgressStall, a.evalStall},
-		{AlertDiskFree, a.evalDisk},
-		{AlertDiskMin, a.evalDiskMin},
-		{AlertDiskCrit, a.evalDiskCrit},
-		{AlertNVMeWear, a.evalWear},
-		{AlertBadHashes, a.evalBadHashes},
-		{AlertUnitOOM, a.evalUnitOOM},
-		{AlertMemHigh, a.evalMemHigh},
-		{AlertQueueDead, a.evalDead},
-		{AlertQueueFreeze, a.evalQueueFreeze},
-		{AlertRedisMemory, a.evalRedisMemory},
-		{AlertPSICPU, a.evalPSICPU},
-		{AlertRenderDebt, a.evalRenderDebt},
-		{AlertRenderFbDepth, a.evalRenderFallbackDepth},
-		{AlertRenderFbBudget, a.evalRenderFallbackBudget},
-		{AlertRenderBrowserErr, a.evalRenderBrowserErrors},
-		{AlertDomainsStale, a.evalDomainsNewDoneStale},
-	}
+	return a
 }
 
 // mutator-disable-regexp a\.log\.Debug\("проход statement/remove
@@ -1220,14 +1055,13 @@ func (a *Alerts) evaluators() []alertEval {
 // Обоснование: служебные записи цикла (итог прохода Debug, старт Info) —
 // поведение алертов не меняют, гасятся по docs/mutation-testing.md §4.
 
-// Pass выполняет один проход: оценивает все алерты (ошибка источника
-// одного не останавливает остальные), логирует переходы, отдаёт снапшот
-// в OnPass и возвращает его.
+// Pass выполняет один проход: прогоняет все машины (деградация
+// источника одной не останавливает остальные), логирует переходы,
+// отдаёт снапшот в OnPass и возвращает его.
 func (a *Alerts) Pass(ctx context.Context) AlertsResult {
-	evals := a.evaluators()
-	snaps := make([]AlertSnapshot, 0, len(evals))
-	for _, e := range evals {
-		snaps = append(snaps, a.evaluate(ctx, e))
+	snaps := make([]AlertSnapshot, 0, len(a.machines))
+	for _, m := range a.machines {
+		snaps = append(snaps, m.run(ctx, a))
 	}
 	res := AlertsResult{Alerts: snaps}
 	if a.opts.OnPass != nil {
@@ -1237,335 +1071,415 @@ func (a *Alerts) Pass(ctx context.Context) AlertsResult {
 	return res
 }
 
-// evaluate прогоняет одну проверку: ошибка источника — Warn (кроме
-// отмены ctx — часть остановки, стиль ZoneStatsLoop) и «не измеряется»;
-// переход состояния логируется фронтовой записью.
-func (a *Alerts) evaluate(ctx context.Context, e alertEval) AlertSnapshot {
-	prev := a.state[e.name]
-	v := e.eval(ctx, prev)
-	if v.err != nil {
-		if ctx.Err() == nil {
-			a.log.Warn("оценка алерта: "+alertDescs[e.name], "alert", e.name, "err", v.err)
-		}
-		v.status = AlertStatusNotMeasured
-		if v.detail == "" {
-			v.detail = v.err.Error()
-		}
-	}
-	a.transition(e.name, prev, v)
-	a.state[e.name] = v.status
-	return AlertSnapshot{Name: e.name, Status: v.status, Detail: v.detail}
-}
-
-// transition пишет лог на смене состояния: срабатывание — Warn, снятие —
-// Info, неприменимость — Debug. Исключение — уход сработавшего алерта
-// в «не измеряется» (сбой источника): Warn об ошибке пишет evaluate,
-// потерю самого алерта фиксируем Info — иначе авария исчезла бы из лога
-// без единой записи о прекращении.
-func (a *Alerts) transition(name, prev string, v verdict) {
-	if prev == v.status {
+// logFront пишет фронтовую запись на смене состояния (инвариант И3
+// alertstate.go): срабатывание — Warn, снятие — Info, неприменимость —
+// Debug. Исключение — уход сработавшего алерта в «не измеряется» (сбой
+// источника): Warn об ошибке пишет transition, потерю самого алерта
+// фиксируем Info — иначе авария исчезла бы из лога без единой записи
+// о прекращении.
+func (a *Alerts) logFront(name, prev, status, detail string) {
+	if prev == status {
 		return
 	}
 	desc := name
 	if d, ok := alertDescs[name]; ok {
 		desc = d
 	}
-	switch v.status {
+	switch status {
 	case AlertStatusFiring:
-		a.log.Warn("АЛЕРТ: "+desc, "alert", name, "detail", v.detail)
+		a.log.Warn("АЛЕРТ: "+desc, "alert", name, "detail", detail)
 	case AlertStatusOK:
 		if prev == AlertStatusFiring {
-			a.log.Info("алерт снят: "+desc, "alert", name, "detail", v.detail)
+			a.log.Info("алерт снят: "+desc, "alert", name, "detail", detail)
 		}
 	case AlertStatusNotMeasured:
 		if prev == AlertStatusFiring {
-			a.log.Info("сработавший алерт больше не измеряется: "+desc, "alert", name, "причина", v.detail)
+			a.log.Info("сработавший алерт больше не измеряется: "+desc, "alert", name, "причина", detail)
 		} else {
-			a.log.Debug("алерт не измеряется: "+desc, "alert", name, "причина", v.detail)
+			a.log.Debug("алерт не измеряется: "+desc, "alert", name, "причина", detail)
 		}
 	}
 }
 
-// evalDNS — доля temp_error среди проверок текущих суток: числитель и
-// знаменатель — суточные строки crawler_counters (T-182, точечные
+// observeDNS — доля temp_error среди проверок текущих суток: числитель
+// и знаменатель — суточные строки crawler_counters (T-182, точечные
 // чтения dnsDailyCountersSQL; события записей результатов — ретраи и
 // дубли доставки остаются в истории событий, доля устойчива, абсолюты
 // чинит реконсиляция). До 100 событий знаменателя (AlertDNSMinSamples)
-// доля — шум пустого окна, «не измеряется». Гистерезис прежний (пороги
-// T-080/T-162 не меняются — T-182 меняет только источник чисел):
-// включение ≥ AlertDNSFireShare, при сработавшем алерте удержание до
-// падения ниже AlertDNSRecoverShare.
-func (a *Alerts) evalDNS(ctx context.Context, prev string) verdict {
+// доля — шум пустого окна, тихое «не измеряется»; гистерезис доли —
+// track машины (пороги T-080/T-162 не менялись с T-182).
+func (a *Alerts) observeDNS(ctx context.Context) observation[dnsShare] {
 	rows, err := a.deps.Pool.Query(ctx, dnsDailyCountersSQL)
 	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: доля ошибок DNS: %w", err)}
+		return observation[dnsShare]{err: fmt.Errorf("monitor: доля ошибок DNS: %w", err)}
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return verdict{err: errors.New("monitor: доля ошибок DNS: пустой ответ")}
+		return observation[dnsShare]{err: errors.New("monitor: доля ошибок DNS: пустой ответ")}
 	}
 	var temp, total int64
 	if err := rows.Scan(&temp, &total); err != nil {
-		return verdict{err: fmt.Errorf("monitor: доля ошибок DNS: чтение: %w", err)}
+		return observation[dnsShare]{err: fmt.Errorf("monitor: доля ошибок DNS: чтение: %w", err)}
 	}
 	if err := rows.Err(); err != nil {
-		return verdict{err: fmt.Errorf("monitor: доля ошибок DNS: %w", err)}
+		return observation[dnsShare]{err: fmt.Errorf("monitor: доля ошибок DNS: %w", err)}
 	}
 	if total < AlertDNSMinSamples {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: fmt.Sprintf("проверок за текущие сутки %d < %d — доля не показательна", total, AlertDNSMinSamples),
+		return observation[dnsShare]{
+			reason: fmt.Sprintf("проверок за текущие сутки %d < %d — доля не показательна", total, AlertDNSMinSamples),
 		}
 	}
-	share := float64(temp) / float64(total)
-	detail := fmt.Sprintf("доля temp_error %.1f%% (%d из %d проверок за текущие сутки)",
-		100*share, temp, total)
-	firing := share >= AlertDNSFireShare ||
-		(prev == AlertStatusFiring && share >= AlertDNSRecoverShare)
-	if firing {
-		return verdict{status: AlertStatusFiring, detail: detail}
-	}
-	return verdict{status: AlertStatusOK, detail: detail}
+	return observation[dnsShare]{value: dnsShare{temp: temp, total: total}}
 }
 
-// evalQueues — глубина рабочих стримов против порога гейта. Срабатывание —
-// depth ≥ эффективного порога стрима (в тот же момент гейт закрывает
-// публикацию); снятие — все стримы ниже 90 % порога.
-func (a *Alerts) evalQueues(ctx context.Context, prev string) verdict {
+// newDNSMachine — машина dns_temp_error_share: гистерезис порогов доли
+// (включение ≥ AlertDNSFireShare 30 %, удержание сработавшего до
+// AlertDNSRecoverShare 20 % — коридор не дребезжит Warn).
+func (a *Alerts) newDNSMachine() *alertMachine[dnsShare] {
+	return &alertMachine[dnsShare]{
+		name: AlertDNSErrors,
+		track: hysteresisTrack[dnsShare]{
+			fire: func(v dnsShare) bool { return v.share() >= AlertDNSFireShare },
+			hold: func(v dnsShare) bool { return v.share() >= AlertDNSRecoverShare },
+			okDetail: func(v dnsShare) string {
+				return fmt.Sprintf("доля temp_error %.1f%% (%d из %d проверок за текущие сутки)",
+					100*v.share(), v.temp, v.total)
+			},
+		},
+		eval: a.observeDNS,
+	}
+}
+
+// observeQueues — глубина рабочих стримов (источник наблюдения): Len по
+// каждому рабочему стриму alertStreams; гистерезис «порог гейта /
+// 90 % порога» — track машины. q:dead алертом очередей не опрашивается
+// (глубину карантина читает queue_dead).
+func (a *Alerts) observeQueues(ctx context.Context) observation[map[string]int64] {
 	if a.deps.Redis == nil {
-		return verdict{status: AlertStatusNotMeasured, detail: "Redis не задан"}
+		return observation[map[string]int64]{reason: "Redis не задан"}
 	}
 	if a.opts.QueueWatermark <= 0 {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "порог scheduler.queue_high_watermark не задан",
+		return observation[map[string]int64]{
+			reason: "порог scheduler.queue_high_watermark не задан",
 		}
 	}
 	lens := make(map[string]int64, len(alertStreams))
 	for _, s := range alertStreams {
 		n, err := a.deps.Redis.Len(ctx, s)
 		if err != nil {
-			return verdict{err: fmt.Errorf("monitor: глубина %s: %w", s, err)}
+			return observation[map[string]int64]{err: fmt.Errorf("monitor: глубина %s: %w", s, err)}
 		}
 		lens[s] = n
 	}
-	// Порог — по стриму, как у гейта (T-026): для q:dns настроенные
-	// 100 000 записей ограничиваются половиной его MAXLEN по политике
-	// (DefaultStreamMaxLen, T-141: 125 пачек).
+	return observation[map[string]int64]{value: lens}
+}
+
+// newQueuesMachine — машина queue_overflow: гистерезис глубин рабочих
+// стримов — срабатывание на эффективном пороге стрима (в тот же момент
+// гейт закрывает публикацию), снятие ниже 90 % порога
+// (AlertQueueRecoverFactor — мягкий гейт: между проверкой и публикацией
+// другие продюсеры добавляют записи, T-026). Порог — по стриму, как у
+// гейта (T-026): для q:dns настроенные 100 000 записей ограничиваются
+// половиной его MAXLEN по политике (DefaultStreamMaxLen, T-141:
+// 125 пачек).
+func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 	wm := make(map[string]int64, len(alertStreams))
 	for _, s := range alertStreams {
 		wm[s] = queue.StreamWatermark(a.opts.QueueWatermark, a.opts.QueueMaxLen, s)
 	}
-	var hot, hold []string
-	for _, s := range alertStreams {
-		n := lens[s]
-		recoverAt := int64(float64(wm[s]) * AlertQueueRecoverFactor)
-		switch {
-		case n >= wm[s]:
-			hot = append(hot, fmt.Sprintf("%s=%d (порог %d)", s, n, wm[s]))
-		case prev == AlertStatusFiring && n >= recoverAt:
-			hold = append(hold, fmt.Sprintf("%s=%d (порог %d)", s, n, wm[s]))
-		}
+	holdAt := func(s string) int64 {
+		return int64(float64(wm[s]) * AlertQueueRecoverFactor)
 	}
-	if len(hot) > 0 || len(hold) > 0 {
-		at := hot
-		if len(at) == 0 {
-			at = hold // коридор гистерезиса: ниже порога гейта, но близко
-		}
-		return verdict{
-			status: AlertStatusFiring,
-			detail: strings.Join(at, ", ") + " — глубина у порога",
-		}
-	}
-	// Деталь «ok» — максимальная глубина среди рабочих стримов; стартовое
-	// значение — первый стрим: при всех нулях (простаивающие очереди)
-	// деталь называет стрим, а не пустую строку.
-	maxStream, maxLen := alertStreams[0], lens[alertStreams[0]]
-	// Эквивалентный мутант alertStreams[0:]: первый элемент не превосходит
-	// сам себя (старт максимума), итог не меняется.
-	// mutator-disable-next-line numbers/decrementer
-	for _, s := range alertStreams[1:] {
-		if lens[s] > maxLen {
-			maxStream, maxLen = s, lens[s]
-		}
-	}
-	return verdict{
-		status: AlertStatusOK,
-		detail: fmt.Sprintf("макс %s=%d", maxStream, maxLen),
+	return &alertMachine[map[string]int64]{
+		name: AlertQueueOverflow,
+		track: hysteresisTrack[map[string]int64]{
+			fire: func(lens map[string]int64) bool {
+				for _, s := range alertStreams {
+					if lens[s] >= wm[s] {
+						return true
+					}
+				}
+				return false
+			},
+			hold: func(lens map[string]int64) bool {
+				for _, s := range alertStreams {
+					if lens[s] >= holdAt(s) {
+						return true
+					}
+				}
+				return false
+			},
+			okDetail: func(lens map[string]int64) string {
+				// Деталь «ok» — максимальная глубина среди рабочих
+				// стримов; стартовое значение — первый стрим: при всех
+				// нулях (простаивающие очереди) деталь называет стрим,
+				// а не пустую строку.
+				maxStream, maxLen := alertStreams[0], lens[alertStreams[0]]
+				// Эквивалентный мутант alertStreams[0:]: первый элемент
+				// не превосходит сам себя (старт максимума), итог не
+				// меняется.
+				// mutator-disable-next-line numbers/decrementer
+				for _, s := range alertStreams[1:] {
+					if lens[s] > maxLen {
+						maxStream, maxLen = s, lens[s]
+					}
+				}
+				return fmt.Sprintf("макс %s=%d", maxStream, maxLen)
+			},
+			hotDetail: func(lens map[string]int64) string {
+				// Сработавшая деталь называет горячие стримы; при их
+				// отсутствии — удерживающие коридор гистерезиса.
+				var hot, hold []string
+				for _, s := range alertStreams {
+					n := lens[s]
+					switch {
+					case n >= wm[s]:
+						hot = append(hot, fmt.Sprintf("%s=%d (порог %d)", s, n, wm[s]))
+					case n >= holdAt(s):
+						hold = append(hold, fmt.Sprintf("%s=%d (порог %d)", s, n, wm[s]))
+					}
+				}
+				at := hot
+				if len(at) == 0 {
+					at = hold // коридор гистерезиса: ниже порога гейта, но близко
+				}
+				return strings.Join(at, ", ") + " — глубина у порога"
+			},
+		},
+		eval: a.observeQueues,
 	}
 }
 
-// evalStall — возраст последнего пересчёта зон (zones.updated_at пишет
-// ZoneStatsLoop, T-078): старше AlertStallFactor периодов — прогресс
-// остановлен. Гистерезис не нужен: возраст уменьшается только новым
-// проходом, дребезга у порога нет. Оговорка самоконтроля: updated_at
-// пишет сам monitor — при полной смерти процесса алерт некому сработать,
-// пропажу сервиса видит метрика crawler_service_up каркаса (T-012).
-func (a *Alerts) evalStall(ctx context.Context, _ string) verdict {
+// observeStall — свежесть последнего пересчёта зон: zones.updated_at
+// (пишет ZoneStatsLoop, T-078); NULL — зон нет, прогресс не
+// отслеживается (тихое «не измеряется»). Порог возраста — track машины;
+// оговорка самоконтроля: updated_at пишет сам monitor — при полной
+// смерти процесса алерт некому сработать, пропажу сервиса видит метрика
+// crawler_service_up каркаса (T-012).
+func (a *Alerts) observeStall(ctx context.Context) observation[time.Time] {
 	rows, err := a.deps.Pool.Query(ctx, zoneFreshSQL)
 	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: остановка прогресса: %w", err)}
+		return observation[time.Time]{err: fmt.Errorf("monitor: остановка прогресса: %w", err)}
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return verdict{err: errors.New("monitor: остановка прогресса: пустой ответ")}
+		return observation[time.Time]{err: errors.New("monitor: остановка прогресса: пустой ответ")}
 	}
 	var last sql.NullTime
 	if err := rows.Scan(&last); err != nil {
-		return verdict{err: fmt.Errorf("monitor: остановка прогресса: чтение: %w", err)}
+		return observation[time.Time]{err: fmt.Errorf("monitor: остановка прогресса: чтение: %w", err)}
 	}
 	if err := rows.Err(); err != nil {
-		return verdict{err: fmt.Errorf("monitor: остановка прогресса: %w", err)}
+		return observation[time.Time]{err: fmt.Errorf("monitor: остановка прогресса: %w", err)}
 	}
 	if !last.Valid {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "справочник зон пуст — прогресс не отслеживается",
-		}
+		return observation[time.Time]{reason: "справочник зон пуст — прогресс не отслеживается"}
 	}
-	age := a.now().Sub(last.Time)
+	return observation[time.Time]{value: last.Time}
+}
+
+// newStallMachine — машина progress_stall: порог возраста метки в
+// периодах РЕКОНСИЛЯЦИИ (AlertStallFactor × ZoneStatsInterval — метку
+// пишет именно этот цикл, а не проходы алертов: при 30-мин
+// реконсиляции порог 5 × 5 мин стрелял бы вечно; проход T-078 по
+// десяткам млн строк — минуты, единичный пропуск периода не авария,
+// 5 периодов — уверенная остановка). Гистерезис не нужен: возраст
+// уменьшается только новым проходом, дребезга у порога нет.
+func (a *Alerts) newStallMachine() *alertMachine[time.Time] {
 	stallAfter := time.Duration(AlertStallFactor) * a.opts.ZoneStatsInterval
-	if age > stallAfter {
-		return verdict{
-			status: AlertStatusFiring,
-			detail: fmt.Sprintf("zones.updated_at старше порога: %s (порог %d × %s)",
-				age.Round(time.Second), AlertStallFactor, a.opts.ZoneStatsInterval),
-		}
-	}
-	return verdict{
-		status: AlertStatusOK,
-		detail: fmt.Sprintf("последний пересчёт %s назад (порог %s)",
-			age.Round(time.Second), stallAfter),
+	return &alertMachine[time.Time]{
+		name: AlertProgressStall,
+		track: thresholdTrack[time.Time]{
+			fire: func(now, last time.Time) bool {
+				return now.Sub(last) > stallAfter
+			},
+			okDetail: func(now, last time.Time) string {
+				return fmt.Sprintf("последний пересчёт %s назад (порог %s)",
+					now.Sub(last).Round(time.Second), stallAfter)
+			},
+			hotDetail: func(now, last time.Time) string {
+				return fmt.Sprintf("zones.updated_at старше порога: %s (порог %d × %s)",
+					now.Sub(last).Round(time.Second), AlertStallFactor, a.opts.ZoneStatsInterval)
+			},
+		},
+		eval: a.observeStall,
 	}
 }
 
-// evalDisk — доля свободного места каталога контента: та же формула, что
-// пауза Put в internal/content (T-046), — алерт срабатывает ровно когда
-// запись контента останавливается; отдельный порог рассинхронировал бы
-// сигнал с реальной паузой, поэтому без зазора гистерезиса.
-func (a *Alerts) evalDisk(_ context.Context, _ string) verdict {
+// observeDisk — наблюдение процентного алерта места: каталог контента
+// не задан / контроль выключен (content.disk_free_percent ≤ 0) — тихое
+// «не измеряется», не ложное срабатывание; далее — общий снимок места
+// observeDiskSpace.
+func (a *Alerts) observeDisk(_ context.Context) observation[SpaceStat] {
 	if a.opts.ContentDir == "" {
-		return verdict{status: AlertStatusNotMeasured, detail: "каталог контента не задан"}
+		return observation[SpaceStat]{reason: "каталог контента не задан"}
 	}
 	if a.opts.DiskFreePercent <= 0 {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "контроль места выключен (content.disk_free_percent ≤ 0)",
+		return observation[SpaceStat]{
+			reason: "контроль места выключен (content.disk_free_percent ≤ 0)",
 		}
 	}
+	return a.observeDiskSpace()
+}
+
+// observeDiskSpace — общий снимок statfs каталога контента: доля
+// свободного места (та же формула, что пауза Put в internal/content,
+// T-046) и абсолютные минимумы читают один и тот же срез (две копии
+// сисколла на проход дешевле связывания алертов общим кэшем). Ошибка
+// statfs — Warn; total=0 — файловая система не сообщает ёмкость.
+func (a *Alerts) observeDiskSpace() observation[SpaceStat] {
 	sp, err := a.deps.Space.Space(a.opts.ContentDir)
 	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: свободное место %s: %w", a.opts.ContentDir, err)}
+		return observation[SpaceStat]{err: fmt.Errorf("monitor: свободное место %s: %w", a.opts.ContentDir, err)}
 	}
 	if sp.Total == 0 {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "файловая система не сообщает ёмкость (total=0)",
-		}
+		return observation[SpaceStat]{reason: "файловая система не сообщает ёмкость (total=0)"}
 	}
-	free := 100 * float64(sp.Avail) / float64(sp.Total)
-	detail := fmt.Sprintf("свободно %.1f%% (%s из %s), порог %.1f%%",
-		free, alertBytes(sp.Avail), alertBytes(sp.Total), a.opts.DiskFreePercent)
-	if free < a.opts.DiskFreePercent {
-		return verdict{status: AlertStatusFiring, detail: detail}
+	return observation[SpaceStat]{value: sp}
+}
+
+// observeDiskBytes — наблюдение абсолютных минимумов места
+// (disk_free_min/disk_free_crit, T-162): каталог не задан — тихое «не
+// измеряется»; далее — общий снимок observeDiskSpace.
+func (a *Alerts) observeDiskBytes(_ context.Context) observation[SpaceStat] {
+	if a.opts.ContentDir == "" {
+		return observation[SpaceStat]{reason: "каталог контента не задан"}
 	}
-	return verdict{status: AlertStatusOK, detail: detail}
+	return a.observeDiskSpace()
 }
 
-// evalDiskMin / evalDiskCrit — абсолютный минимум свободного места
-// каталога контента (T-162): Warn при Avail < disk_free_min_bytes (15 GiB)
-// и эскалация отдельным алертом при < disk_free_crit_bytes (10 GiB).
-// Процентный порог (content.disk_free_percent) на большом томе поздний:
-// 10 % от 79 ГБ — это 8 ГБ ≈ 5 ч до заполнения при темпе ≈36 GiB/сут
-// (замер §12); абсолютный минимум даёт запас на разбор независимо от
-// размера тома. Гистерезиса нет, как у процентного: место при инциденте
-// убывает монотонно (~1,5 ГБ/ч) — дребезг у порога нечему двигать;
-// срабатывание строгое (<), восстановление при возврате к порогу.
-// Эскалация — второй алерт, а не «уровень» первого: каждое состояние
-// видно своей парой сообщений срабатывание/снятие (дебаунс notify.go)
-// и своей строкой в журнале, иерархия Warn→усиление читается по имени.
-func (a *Alerts) evalDiskMin(_ context.Context, _ string) verdict {
-	return a.evalDiskBytes(a.opts.DiskFreeMinBytes)
+// newDiskMachine — машина disk_free: срабатывание при доле свободного
+// строго ниже порога — ровно когда Pause контента останавливает запись;
+// отдельный порог рассинхронировал бы сигнал с реальной паузой,
+// поэтому без зазора гистерезиса.
+func (a *Alerts) newDiskMachine() *alertMachine[SpaceStat] {
+	pct := a.opts.DiskFreePercent
+	return &alertMachine[SpaceStat]{
+		name: AlertDiskFree,
+		track: thresholdTrack[SpaceStat]{
+			fire: func(_ time.Time, sp SpaceStat) bool {
+				return 100*float64(sp.Avail)/float64(sp.Total) < pct
+			},
+			okDetail: func(_ time.Time, sp SpaceStat) string {
+				free := 100 * float64(sp.Avail) / float64(sp.Total)
+				return fmt.Sprintf("свободно %.1f%% (%s из %s), порог %.1f%%",
+					free, alertBytes(sp.Avail), alertBytes(sp.Total), pct)
+			},
+		},
+		eval: a.observeDisk,
+	}
 }
 
-func (a *Alerts) evalDiskCrit(_ context.Context, _ string) verdict {
-	return a.evalDiskBytes(a.opts.DiskFreeCritBytes)
-}
-
-// evalDiskBytes — общая проверка абсолютного порога: тот же снимок
-// statfs, что у процентного алерта (две копии сисколла на проход дешевле
-// связывания алертов общим кэшем). Порог ≥ ёмкости тома неприменим:
+// newDiskBytesMachine — машина абсолютного минимума места (T-162):
+// Warn при Avail < порога, эскалация — отдельным алертом, а не
+// «уровнем» первого: каждое состояние видно своей парой сообщений
+// срабатывание/снятие (дебаунс notify.go) и своей строкой в журнале,
+// иерархия Warn→усиление читается по имени. Срабатывание строгое (<),
+// восстановление возвратом к порогу; гистерезиса нет, как у
+// процентного: место при инциденте убывает монотонно (~1,5 ГБ/ч) —
+// дребезг у порога нечему двигать. Порог ≥ ёмкости тома неприменим:
 // свободное место никогда не достигнет минимума (dev-том 10 ГБ против
 // 15 GiB) — вечное срабатывание было бы ложным, малые тома остаются
 // под крылом процентного порога.
-func (a *Alerts) evalDiskBytes(threshold int64) verdict {
-	if a.opts.ContentDir == "" {
-		return verdict{status: AlertStatusNotMeasured, detail: "каталог контента не задан"}
+func (a *Alerts) newDiskBytesMachine(name string, threshold int64) *alertMachine[SpaceStat] {
+	return &alertMachine[SpaceStat]{
+		name: name,
+		track: thresholdTrack[SpaceStat]{
+			fire: func(_ time.Time, sp SpaceStat) bool {
+				return int64(sp.Avail) < threshold
+			},
+			na: func(sp SpaceStat) string {
+				if threshold >= int64(sp.Total) {
+					return fmt.Sprintf("минимум %s ≥ ёмкости тома %s — порог неприменим, малый том под крылом процентного",
+						alertBytes(uint64(threshold)), alertBytes(sp.Total))
+				}
+				return ""
+			},
+			okDetail: func(_ time.Time, sp SpaceStat) string {
+				return fmt.Sprintf("свободно %s из %s, порог %s",
+					alertBytes(sp.Avail), alertBytes(sp.Total), alertBytes(uint64(threshold)))
+			},
+		},
+		eval: a.observeDiskBytes,
 	}
-	sp, err := a.deps.Space.Space(a.opts.ContentDir)
-	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: свободное место %s: %w", a.opts.ContentDir, err)}
-	}
-	if sp.Total == 0 {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "файловая система не сообщает ёмкость (total=0)",
-		}
-	}
-	if threshold >= int64(sp.Total) {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: fmt.Sprintf("минимум %s ≥ ёмкости тома %s — порог неприменим, малый том под крылом процентного",
-				alertBytes(uint64(threshold)), alertBytes(sp.Total)),
-		}
-	}
-	detail := fmt.Sprintf("свободно %s из %s, порог %s",
-		alertBytes(sp.Avail), alertBytes(sp.Total), alertBytes(uint64(threshold)))
-	if int64(sp.Avail) < threshold {
-		return verdict{status: AlertStatusFiring, detail: detail}
-	}
-	return verdict{status: AlertStatusOK, detail: detail}
 }
 
-// evalWear — износ NVMe по health-логу: алерт при percentage_used ≥
-// AlertNVMeWearPercent любого устройства. Недоступность SMART — ожидаемое
-// состояние контейнера: verdict без err (Debug, не Warn) — деградация
-// честная и тихая (см. шапку файла).
-func (a *Alerts) evalWear(ctx context.Context, _ string) verdict {
+// newDiskMinMachine / newDiskCritMachine — Warn-минимум (15 GiB,
+// DefaultDiskFreeMinBytes) и эскалация (10 GiB, DefaultDiskFreeCritBytes)
+// абсолютного запаса места: процентный порог на большом томе поздний
+// (10 % от 79 ГБ = 8 ГБ ≈ 5 ч до заполнения при темпе ≈36 GiB/сут,
+// замер §12), минимум в байтах даёт запас на разбор независимо от
+// размера тома.
+func (a *Alerts) newDiskMinMachine() *alertMachine[SpaceStat] {
+	return a.newDiskBytesMachine(AlertDiskMin, a.opts.DiskFreeMinBytes)
+}
+
+func (a *Alerts) newDiskCritMachine() *alertMachine[SpaceStat] {
+	return a.newDiskBytesMachine(AlertDiskCrit, a.opts.DiskFreeCritBytes)
+}
+
+// observeWear — износ NVMe по health-логу. Недоступность SMART —
+// ожидаемое состояние контейнера: тихое «не измеряется» без Warn —
+// деградация честная (см. шапку файла); на боевом systemd-хосте слой
+// включается доступом юнита к /dev/nvme* (группа nvme-smart, T-089 —
+// docs/disks.md). Пустой список — источник жив, устройств нет.
+func (a *Alerts) observeWear(ctx context.Context) observation[[]NVMeWear] {
 	wears, err := a.deps.Wear.Wear(ctx)
 	if err != nil {
-		return verdict{status: AlertStatusNotMeasured, detail: err.Error()}
+		return observation[[]NVMeWear]{reason: err.Error()}
 	}
 	if len(wears) == 0 {
-		return verdict{status: AlertStatusNotMeasured, detail: "NVMe-устройства не найдены"}
+		return observation[[]NVMeWear]{reason: "NVMe-устройства не найдены"}
 	}
+	return observation[[]NVMeWear]{value: wears}
+}
+
+// newWearMachine — машина nvme_wear: алерт при percentage_used ≥
+// AlertNVMeWearPercent (90 % — осталось ≤10 % расчётного ресурса, порог
+// планирования замены) любого устройства; ресурс монотонен (не
+// восстанавливается) — гистерезис не нужен, значения >100 % валидны
+// (ресурс исчерпан) и тоже алертятся.
+func (a *Alerts) newWearMachine() *alertMachine[[]NVMeWear] {
 	// Худший по износу; старт — первое устройство, а не нулевое значение:
 	// новый накопитель (0 %) оставил бы пустое имя в детали.
-	worst := wears[0]
-	// Эквивалентный мутант wears[0:]: первый элемент не превосходит сам
-	// себя (старт максимума), итог не меняется.
-	// mutator-disable-next-line numbers/decrementer
-	for _, w := range wears[1:] {
-		if w.PercentUsed > worst.PercentUsed {
-			worst = w
-		}
-	}
-	detail := fmt.Sprintf("%s: использовано %d%% ресурса, записано %.1f ТБ (TBW)",
-		worst.Device, worst.PercentUsed, nvmeTBW(worst))
-	if worst.PercentUsed >= AlertNVMeWearPercent {
-		var hot []string
-		for _, w := range wears {
-			if w.PercentUsed >= AlertNVMeWearPercent {
-				hot = append(hot, fmt.Sprintf("%s=%d%%", w.Device, w.PercentUsed))
+	worstOf := func(wears []NVMeWear) NVMeWear {
+		worst := wears[0]
+		// Эквивалентный мутант wears[0:]: первый элемент не превосходит
+		// сам себя (старт максимума), итог не меняется.
+		// mutator-disable-next-line numbers/decrementer
+		for _, w := range wears[1:] {
+			if w.PercentUsed > worst.PercentUsed {
+				worst = w
 			}
 		}
-		return verdict{
-			status: AlertStatusFiring,
-			detail: fmt.Sprintf("износ %s ≥ порога %d%% (%s)",
-				strings.Join(hot, ", "), AlertNVMeWearPercent, detail),
-		}
+		return worst
 	}
-	return verdict{status: AlertStatusOK, detail: detail}
+	return &alertMachine[[]NVMeWear]{
+		name: AlertNVMeWear,
+		track: thresholdTrack[[]NVMeWear]{
+			fire: func(_ time.Time, wears []NVMeWear) bool {
+				return worstOf(wears).PercentUsed >= AlertNVMeWearPercent
+			},
+			okDetail: func(_ time.Time, wears []NVMeWear) string {
+				worst := worstOf(wears)
+				return fmt.Sprintf("%s: использовано %d%% ресурса, записано %.1f ТБ (TBW)",
+					worst.Device, worst.PercentUsed, nvmeTBW(worst))
+			},
+			hotDetail: func(_ time.Time, wears []NVMeWear) string {
+				worst := worstOf(wears)
+				var hot []string
+				for _, w := range wears {
+					if w.PercentUsed >= AlertNVMeWearPercent {
+						hot = append(hot, fmt.Sprintf("%s=%d%%", w.Device, w.PercentUsed))
+					}
+				}
+				return fmt.Sprintf("износ %s ≥ порога %d%% (%s: использовано %d%% ресурса, записано %.1f ТБ (TBW))",
+					strings.Join(hot, ", "), AlertNVMeWearPercent,
+					worst.Device, worst.PercentUsed, nvmeTBW(worst))
+			},
+		},
+		eval: a.observeWear,
+	}
 }
 
 // nvmeTBW — записано терабайт (единица NVMe = 512 000 байт, десятичные
@@ -1574,676 +1488,519 @@ func nvmeTBW(w NVMeWear) float64 {
 	return float64(w.DataUnitsWritten) * 512000 / 1e12
 }
 
-// evalBadHashes — всплеск мусорных content_hash очистки ingest (T-099):
-// сумма дельт счётчика за окно AlertBadHashesWindow проходов ≥
-// AlertBadHashesThreshold — срабатывание. Снятие — старением: окно
-// держит сработавшим только при продолжении потока новых мусорных
-// строк; гистерезис не нужен (см. AlertBadHashesWindow). Ошибка
-// источника (ingest недоступен, метрики нет) — «не измеряется» с Warn:
-// смерть самого ingest видна по crawler_service_up, а не этим алертом.
-func (a *Alerts) evalBadHashes(ctx context.Context, _ string) verdict {
+// observeBadHashes — счётчик мусорных content_hash очистки ingest
+// (T-099): источник — экспозиция /metrics сервиса ingest (BadHashes).
+// Ошибка источника (ingest недоступен, метрики нет) — «не измеряется»
+// с Warn: смерть самого ingest видна по crawler_service_up, а не этим
+// алертом; окно всплеска (кольцо дельт, снятие старением — гистерезис
+// не нужен, сумма окна убывает только старением) — track машины.
+func (a *Alerts) observeBadHashes(ctx context.Context) observation[int64] {
 	if a.deps.BadHashes == nil {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "источник не задан (monitor.ingest_metrics_url)",
+		return observation[int64]{
+			reason: "источник не задан (monitor.ingest_metrics_url)",
 		}
 	}
 	cur, err := a.deps.BadHashes.BadHashes(ctx)
 	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: мусорные content_hash: %w", err)}
+		return observation[int64]{err: fmt.Errorf("monitor: мусорные content_hash: %w", err)}
 	}
-	sum := a.badHash.push(cur)
-	detail := fmt.Sprintf("счётчик %d, новых за окно %s — %d (порог %d)",
-		cur, (time.Duration(AlertBadHashesWindow) * a.opts.Interval).Round(time.Second),
-		sum, AlertBadHashesThreshold)
-	if sum >= AlertBadHashesThreshold {
-		return verdict{
-			status: AlertStatusFiring,
-			detail: detail + " — ошибка писателя результатов (T-056), refcount не менялся",
-		}
-	}
-	return verdict{status: AlertStatusOK, detail: detail}
+	return observation[int64]{value: cur}
 }
 
-// evalUnitOOM — события юнитов crawler (T-145): срабатывание, пока у
-// любого юнита есть oom/oom_kill (memory.events) или NRestarts > 0.
-// Счётчики монотонны внутри жизни cgroup/юнита — гистерезис не нужен
-// (стиль износа NVMe): эпизод тянется от первого события до сброса
-// состояния юнита — перезапуска (деплой сбрасывает сам: stop →
-// reset-failed → start в deploy-install.sh; reset-failed/старт обнуляет
-// NRestarts, пересозданная cgroup забирает oom/oom_kill с собой). Один
-// Warn на эпизод даёт фронтовая механика transition. Ошибка источника
-// класса errNoSystemd (dev-контейнер) — тихое «не измеряется», как у
-// SMART: окружение без systemd — норма dev, а не авария; прочие ошибки
-// (боевой хост, systemd/cgroupfs сломан) — Warn каждого прохода, стиль
-// остальных источников (зонд ingest).
-func (a *Alerts) evalUnitOOM(ctx context.Context, _ string) verdict {
+// newBadHashesMachine — машина ingest_bad_hashes: кольцо дельт за окно
+// AlertBadHashesWindow проходов, порог AlertBadHashesThreshold (в норме
+// инвариант писателя результатов держит ноль всегда; порог отсекает
+// единичные реликты до фикса ING-P2-4 — обоснование у константы).
+func (a *Alerts) newBadHashesMachine() *alertMachine[int64] {
+	return &alertMachine[int64]{
+		name: AlertBadHashes,
+		track: ringTrack{
+			ring:      &deltaRing{},
+			threshold: AlertBadHashesThreshold,
+			passes:    AlertBadHashesWindow,
+			interval:  a.opts.Interval,
+			label:     "счётчик",
+			fireNote:  " — ошибка писателя результатов (T-056), refcount не менялся",
+		},
+		eval: a.observeBadHashes,
+	}
+}
+
+// observeUnitsSource — чтение источника юнитов без трактовки пустого
+// списка: деградации общие у машин unit_oom и memory_high — источник
+// не задан (тихо), errNoSystemd (dev-контейнер — тихо, как у SMART:
+// окружение без systemd — норма dev, а не авария) и прочие ошибки
+// (боевой хост, systemd/cgroupfs сломан — Warn каждого прохода, стиль
+// остальных источников; без повторного «monitor: юниты:» — источник
+// уже ставит префикс).
+func (a *Alerts) observeUnitsSource(ctx context.Context) observation[[]UnitEvents] {
 	if a.deps.UnitEvents == nil {
-		return verdict{status: AlertStatusNotMeasured, detail: "источник не задан"}
+		return observation[[]UnitEvents]{reason: "источник не задан"}
 	}
 	units, err := a.deps.UnitEvents.UnitEvents(ctx)
 	if err != nil {
 		if errors.Is(err, errNoSystemd) {
-			return verdict{status: AlertStatusNotMeasured, detail: err.Error()}
+			return observation[[]UnitEvents]{reason: err.Error()}
 		}
-		// Без повторного «monitor: юниты:» — источник уже ставит префикс.
-		return verdict{err: err}
+		return observation[[]UnitEvents]{err: err}
 	}
-	if len(units) == 0 {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "юниты " + unitEventsPattern + " не найдены",
-		}
+	return observation[[]UnitEvents]{value: units}
+}
+
+// observeUnitEvents — наблюдение unit_oom: пустой список — юниты не
+// загружены, «не измеряется» (события юнитов вне наблюдения).
+func (a *Alerts) observeUnitEvents(ctx context.Context) observation[[]UnitEvents] {
+	o := a.observeUnitsSource(ctx)
+	if o.err != nil || o.reason != "" {
+		return o
 	}
-	var hot []string
-	for _, u := range units {
-		if !u.hot() {
-			continue
-		}
-		hot = append(hot, fmt.Sprintf("%s: oom=%d oom_kill=%d рестартов=%d",
-			u.Unit, u.OOM, u.OOMKill, u.NRestarts))
+	if len(o.value) == 0 {
+		return observation[[]UnitEvents]{reason: "юниты " + unitEventsPattern + " не найдены"}
 	}
-	if len(hot) > 0 {
-		return verdict{
-			status: AlertStatusFiring,
-			detail: strings.Join(hot, ", ") + " — эпизод до перезапуска юнита (NRestarts — reset-failed, oom/oom_kill — новая cgroup)",
-		}
-	}
-	return verdict{
-		status: AlertStatusOK,
-		detail: fmt.Sprintf("OOM и рестартов нет (%d юнитов)", len(units)),
+	return o
+}
+
+// observeMemHighUnits — наблюдение memory_high: пустой список —
+// ВАЛИДНОЕ измерение (0 юнитов), а не «не найдены» — асимметрия
+// осознанная и прежняя (evalMemHigh в master не имел ветки пустого
+// списка): троттлинг — про скорость счётчиков живых юнитов, пустой
+// ответ чистит память исчезнувших и даёт ok «0 юнитов» (эпизод без
+// горячих юнитов закрывается честно), а unit_oom — про события, их
+// отсутствие вне загруженных юнитов не наблюдаемо.
+func (a *Alerts) observeMemHighUnits(ctx context.Context) observation[[]UnitEvents] {
+	return a.observeUnitsSource(ctx)
+}
+
+// newUnitOOMMachine — машина unit_oom: срабатывание, пока у любого
+// юнита есть oom/oom_kill (memory.events) или NRestarts > 0. Счётчики
+// монотонны внутри жизни cgroup/юнита — гистерезис не нужен (стиль
+// износа NVMe): эпизод тянется от первого события до сброса состояния
+// юнита — перезапуска (деплой сбрасывает сам: stop → reset-failed →
+// start в deploy-install.sh; reset-failed/старт обнуляет NRestarts,
+// пересозданная cgroup забирает oom/oom_kill с собой). Один Warn на
+// эпизод даёт фронтовая механика transition.
+func (a *Alerts) newUnitOOMMachine() *alertMachine[[]UnitEvents] {
+	return &alertMachine[[]UnitEvents]{
+		name: AlertUnitOOM,
+		track: thresholdTrack[[]UnitEvents]{
+			fire: func(_ time.Time, units []UnitEvents) bool {
+				for _, u := range units {
+					if u.hot() {
+						return true
+					}
+				}
+				return false
+			},
+			okDetail: func(_ time.Time, units []UnitEvents) string {
+				return fmt.Sprintf("OOM и рестартов нет (%d юнитов)", len(units))
+			},
+			hotDetail: func(_ time.Time, units []UnitEvents) string {
+				var hot []string
+				for _, u := range units {
+					if !u.hot() {
+						continue
+					}
+					hot = append(hot, fmt.Sprintf("%s: oom=%d oom_kill=%d рестартов=%d",
+						u.Unit, u.OOM, u.OOMKill, u.NRestarts))
+				}
+				return strings.Join(hot, ", ") + " — эпизод до перезапуска юнита (NRestarts — reset-failed, oom/oom_kill — новая cgroup)"
+			},
+		},
+		eval: a.observeUnitEvents,
 	}
 }
 
-// evalMemHigh — троттлинг MemoryHigh (T-162): счётчик memory.events high
-// юнита растёт от прохода к проходу (каждое попадание за мягкий потолок —
-// принудительный reclaim/задержка). Порог — не значение, а скорость:
-// счётчик накапливается за жизнь cgroup (http-worker с MemoryHigh=850M
-// набирает >100 тыс. за сутки), осмыслен только рост. Устойчивость — рост
-// MemHighMinPasses проходов подряд (2 × период алертов = 10 мин на
-// дефолтных 5 мин, T-206): одиночный
-// всплеск — штатная работа мягкого потолка, устойчивый троттлинг —
-// предвестник фаталов http-worker (T-157: рестарты по памяти до
-// OOM-kill) и запрос потолка выше (docs/deploy.md §2). Снятие — первый
-// проход без роста: гистерезис не нужен, событие снятия и есть «рост
-// прекратился», дребезг у нуля серии невозможен (серия целая).
-// Источник и деградации — те же, что у unit_oom: errNoSystemd (dev)
-// тихо «не измеряется», прочие ошибки — Warn.
-func (a *Alerts) evalMemHigh(ctx context.Context, _ string) verdict {
-	if a.deps.UnitEvents == nil {
-		return verdict{status: AlertStatusNotMeasured, detail: "источник не задан"}
-	}
-	units, err := a.deps.UnitEvents.UnitEvents(ctx)
-	if err != nil {
-		if errors.Is(err, errNoSystemd) {
-			return verdict{status: AlertStatusNotMeasured, detail: err.Error()}
-		}
-		return verdict{err: err}
-	}
-	seen := make(map[string]bool, len(units))
-	var hot []string
-	for _, u := range units {
-		seen[u.Unit] = true
-		tr := a.memHigh[u.Unit]
-		grew := int64(0)
-		if tr.seen && u.High > tr.prev {
-			tr.streak++
-			grew = int64(u.High - tr.prev)
-		} else {
-			tr.streak = 0
-		}
-		tr.seen, tr.prev = true, u.High
-		a.memHigh[u.Unit] = tr
-		if tr.streak >= a.opts.MemHighMinPasses {
-			hot = append(hot, fmt.Sprintf("%s: +%d за проход, серия %d", u.Unit, grew, tr.streak))
-		}
-	}
-	for name := range a.memHigh { // юнит исчез (переименован/выгружен) — не копить
-		if !seen[name] {
-			delete(a.memHigh, name)
-		}
-	}
-	if len(hot) > 0 {
-		return verdict{
-			status: AlertStatusFiring,
-			detail: strings.Join(hot, ", ") + " — устойчивый троттлинг MemoryHigh (reclaim), предвестник фаталов (T-157)",
-		}
-	}
-	return verdict{
-		status: AlertStatusOK,
-		detail: fmt.Sprintf("роста троттлинга MemoryHigh нет (%d юнитов, порог — рост %d проходов подряд)",
-			len(units), a.opts.MemHighMinPasses),
+// newMemHighMachine — машина memory_high (T-162): серия роста счётчика
+// memory.events high по юнитам — порог не значение, а скорость (счётчик
+// накапливается за жизнь cgroup: http-worker с MemoryHigh=850M набирает
+// >100 тыс. за сутки). Устойчивость — рост MemHighMinPasses проходов
+// подряд (2 × период алертов = 10 мин на дефолтных 5 мин, T-206):
+// одиночный всплеск — штатная работа мягкого потолка, устойчивый
+// троттлинг — предвестник фаталов http-worker (T-157) и запроса потолка
+// выше (docs/deploy.md §2). Снятие — первый проход без роста:
+// гистерезис не нужен, событие снятия и есть «рост прекратился»,
+// дребезг у нуля серии невозможен (серия целая). Источник и деградации
+// — те же, что у unit_oom, КРОМЕ пустого списка: для memory_high это
+// валидное измерение «0 юнитов» (observeMemHighUnits), не «не
+// найдены» — прежняя асимметрия master.
+func (a *Alerts) newMemHighMachine() *alertMachine[[]UnitEvents] {
+	return &alertMachine[[]UnitEvents]{
+		name:  AlertMemHigh,
+		track: &memHighStreakTrack{minPasses: a.opts.MemHighMinPasses, units: make(map[string]memHighTrack)},
+		eval:  a.observeMemHighUnits,
 	}
 }
 
-// evalDead — устойчиво ненулевая глубина q:dead (T-154): карантин без
-// потребителей (ручной разбор, ТЗ 4.2), Len читает XLEN, покидают записи
-// карантин только разбором оператора (XTRIM/runbooks §2) — глубина и есть
-// «неразобранный остаток». Срабатывание — глубина > 0 AlertDeadMinPasses
-// проходов подряд; сработавший алерт держит любая ненулевая глубина
-// (гистерезис: эпизод от третьего прохода до разбора), снятие — пустой
-// q:dead. Отдельный контроль роста не нужен: рост — частный случай
-// устойчивой ненулевости, а дифференциация «растёт/стоит» дребезжала бы
-// на подвижном XTRIM разбора. Источник — тот же Redis, что у алерта
-// очередей (StreamLener), сверка со счётчиком смертей — темп
+// observeDead — глубина q:dead (T-154): карантин без потребителей
+// (ручной разбор, ТЗ 4.2), Len читает XLEN, покидают записи карантин
+// только разбором оператора (XTRIM/runbooks §2) — глубина и есть
+// «неразобранный остаток». Источник — тот же Redis, что у алерта
+// очередей (StreamLener); сверка темпа смертей — счётчик
 // crawler_queue_dead_buried_total (T-154) объясняет, откуда сток.
-func (a *Alerts) evalDead(ctx context.Context, prev string) verdict {
+// Устойчивость (серия проходов, удержание любой ненулевой глубиной,
+// снятие пустым карантином) — track машины; отдельный контроль роста
+// не нужен: рост — частный случай устойчивой ненулёвости, а
+// дифференциация «растёт/стоит» дребезжала бы на подвижном XTRIM
+// разбора.
+func (a *Alerts) observeDead(ctx context.Context) observation[int64] {
 	if a.deps.Redis == nil {
-		return verdict{status: AlertStatusNotMeasured, detail: "Redis не задан"}
+		return observation[int64]{reason: "Redis не задан"}
 	}
 	n, err := a.deps.Redis.Len(ctx, queue.StreamDead)
 	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: глубина q:dead: %w", err)}
+		return observation[int64]{err: fmt.Errorf("monitor: глубина q:dead: %w", err)}
 	}
-	if n > 0 {
-		a.deadStreak++
-	} else {
-		a.deadStreak = 0
-	}
-	detail := fmt.Sprintf("глубина q:dead=%d, ненулевых проходов подряд %d/%d; темп смертей — crawler_queue_dead_buried_total",
-		n, a.deadStreak, AlertDeadMinPasses)
-	if a.deadStreak >= AlertDeadMinPasses || (prev == AlertStatusFiring && n > 0) {
-		return verdict{status: AlertStatusFiring, detail: detail + " — разбор: runbooks §2"}
-	}
-	return verdict{status: AlertStatusOK, detail: detail}
+	return observation[int64]{value: n}
 }
 
-// evalQueueFreeze — замороженная очередь (T-162): last-delivered-id
-// группы рабочего стрима не движется ≥ queue_freeze_window при глубине
-// > 0. Живой потребитель двигает last-delivered-id каждым XREADGROUP
-// (пачки в секунды — ТЗ 3.3); стоящий ID при непустом backlog — записи
-// не доставляются вовсе: потребитель мёртв или валится на первой записи
-// (яд T-159), lease-восстановление не поднимает. Согласована с
-// BackpressureGate.Len о глубине (кламп T-168 в источнике):
-// застрявший фантомный лаг инцидента 22–23.10 сам по себе не «глубина»,
-// но замороженные доставки там были — алерт ловит и этот класс простоев.
-//
-// Трекинг: запись группы живёт только при Depth > 0 (пустая очередь не
-// должна копить «время без доставок» — иначе час простоя + первая
-// нечитаемая запись дали бы мгновенное ложное срабатывание); движение ID
-// обновляет момент; первое наблюдение (нет записи) — база с текущего
-// момента: после рестарта monitor алерт сработает не раньше окна, а не
-// ретроспективно. Ошибка источника память не трогает — восстановление
-// чтения доедет по фактическому ID. Снятие — первый проход, где группы
-// ни одна не заморожена (глубина ушла в ноль или доставки пошли):
-// гистерезис не нужен, окно 15 мин — естественный фильтр дребезга.
-func (a *Alerts) evalQueueFreeze(ctx context.Context, _ string) verdict {
+// newDeadMachine — машина queue_dead: срабатывание на AlertDeadMinPasses
+// проходе с ненулевой глубиной («устойчиво ненулевой», а не «любая
+// смерть»: карантин не опустошается сам, но окно несопоставимо с
+// инцидентным масштабом пост-мортема §11.1 — сигнал опаздывает максимум
+// на один проход), удержание любой ненулевой глубиной, снятие пустым
+// q:dead.
+func (a *Alerts) newDeadMachine() *alertMachine[int64] {
+	return &alertMachine[int64]{
+		name:  AlertQueueDead,
+		track: &deadStreakTrack{minPasses: AlertDeadMinPasses},
+		eval:  a.observeDead,
+	}
+}
+
+// observeQueueFreeze — группы рабочих стримов (T-162):
+// last-delivered-id и глубина групп потребления (источник
+// StreamGroupsSource). Согласовано с BackpressureGate.Len о глубине
+// (кламп T-168 в источнике): застрявший фантомный лаг инцидента
+// 22–23.10 сам по себе не «глубина», но замороженные доставки там были
+// — алерт ловит и этот класс простоев. Окно неподвижности — track
+// машины.
+func (a *Alerts) observeQueueFreeze(ctx context.Context) observation[[]StreamGroupState] {
 	if a.deps.StreamGroups == nil {
-		return verdict{status: AlertStatusNotMeasured, detail: "источник не задан"}
+		return observation[[]StreamGroupState]{reason: "источник не задан"}
 	}
 	groups, err := a.deps.StreamGroups.StreamGroups(ctx)
 	if err != nil {
-		return verdict{err: err}
+		return observation[[]StreamGroupState]{err: err}
 	}
-	now := a.now()
-	seen := make(map[string]bool, len(groups))
-	var frozen []string
-	var moving int
-	for _, g := range groups {
-		key := g.Stream + "/" + g.Group
-		seen[key] = true
-		if g.Depth <= 0 {
-			delete(a.frozen, key) // работа кончилась — копить нечего
-			moving++
-			continue
-		}
-		tr, ok := a.frozen[key]
-		if !ok || g.LastDeliveredID != tr.lastID {
-			a.frozen[key] = freezeTrack{lastID: g.LastDeliveredID, since: now}
-			moving++
-			continue
-		}
-		idle := now.Sub(tr.since)
-		if idle >= a.opts.QueueFreeze {
-			frozen = append(frozen, fmt.Sprintf("%s/%s: доставки нет %s при глубине %d (последний ID %s)",
-				g.Stream, g.Group, idle.Round(time.Second), g.Depth, g.LastDeliveredID))
-		}
-	}
-	for key := range a.frozen { // группа исчезла (стрим удалён) — не копить
-		if !seen[key] {
-			delete(a.frozen, key)
-		}
-	}
-	if len(frozen) > 0 {
-		return verdict{
-			status: AlertStatusFiring,
-			detail: strings.Join(frozen, "; ") + " — потребитель не читает: лог юнита-воркера и q:dead (яд T-159), перезапуск воркера",
-		}
-	}
-	return verdict{
-		status: AlertStatusOK,
-		detail: fmt.Sprintf("групп с движением/без backlog — %d из %d (окно %s)",
-			moving, len(groups), a.opts.QueueFreeze),
+	return observation[[]StreamGroupState]{value: groups}
+}
+
+// newQueueFreezeMachine — машина queue_frozen: окно неподвижности
+// last-delivered-id группы при глубине > 0 (QueueFreeze — 15 мин:
+// живой потребитель двигает ID каждым XREADGROUP, пачки в секунды —
+// ТЗ 3.3; короче — ложные срабатывания на паузах между пачками,
+// длиннее — теряется половина шага «перезапусти потребителя и посмотри
+// логи»). Снятие — первый проход, где ни одна группа не заморожена
+// (глубина ушла в ноль или доставки пошли): гистерезис не нужен, окно
+// — естественный фильтр дребезга.
+func (a *Alerts) newQueueFreezeMachine() *alertMachine[[]StreamGroupState] {
+	return &alertMachine[[]StreamGroupState]{
+		name:  AlertQueueFreeze,
+		track: &queueFreezeTrack{window: a.opts.QueueFreeze, groups: make(map[string]freezeEntry)},
+		eval:  a.observeQueueFreeze,
 	}
 }
 
-// evalRedisMemory — доля памяти Redis used_memory/maxmemory из INFO
-// memory (T-154): включение ≥ AlertRedisMemFireRatio (80 %), удержание
-// сработавшего до AlertRedisMemRecoverRatio (75 %) — гистерезис против
-// дребезга у порога (память ползёт межобрезочными остатками TrimLoop
-// и падает резко после XTRIM). При noeviction (политика бюджета ТЗ 3.2)
-// заполнение maxmemory — отказ записи XADD: прямого счётчика отказов
-// INFO не отдаёт, доля — прокси-метрика с запасом на буферы/фрагментацию
+// observeRedisMemory — доля памяти Redis used_memory/maxmemory из INFO
+// memory (T-154): при noeviction (политика бюджета ТЗ 3.2) заполнение
+// maxmemory — отказ записи XADD: прямого счётчика отказов INFO не
+// отдаёт, доля — прокси-метрика с запасом на буферы/фрагментацию
 // (инцидент 22.10: OOM-отказы публикаций при 620 из 900 МиБ).
 // maxmemory 0 (без потолка) — «не измеряется»: отношение не определено,
-// отказов записи по maxmemory не бывает.
-func (a *Alerts) evalRedisMemory(ctx context.Context, prev string) verdict {
+// отказов записи по maxmemory не бывает. Гистерезис 80 %/75 % — track
+// машины.
+func (a *Alerts) observeRedisMemory(ctx context.Context) observation[RedisMemory] {
 	if a.deps.RedisMemory == nil {
-		return verdict{status: AlertStatusNotMeasured, detail: "источник не задан"}
+		return observation[RedisMemory]{reason: "источник не задан"}
 	}
 	m, err := a.deps.RedisMemory.RedisMemory(ctx)
 	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: память Redis: %w", err)}
+		return observation[RedisMemory]{err: fmt.Errorf("monitor: память Redis: %w", err)}
 	}
 	if m.MaxBytes <= 0 {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: fmt.Sprintf("maxmemory=%d — потолка нет, доля не определена", m.MaxBytes),
+		return observation[RedisMemory]{
+			reason: fmt.Sprintf("maxmemory=%d — потолка нет, доля не определена", m.MaxBytes),
 		}
 	}
-	share := float64(m.UsedBytes) / float64(m.MaxBytes)
-	detail := fmt.Sprintf("used_memory %s из %s maxmemory (%.1f%%), политика %s",
-		alertBytes(uint64(m.UsedBytes)), alertBytes(uint64(m.MaxBytes)), 100*share, m.Policy)
-	if share >= AlertRedisMemFireRatio || (prev == AlertStatusFiring && share >= AlertRedisMemRecoverRatio) {
-		return verdict{
-			status: AlertStatusFiring,
-			detail: detail + " — при noeviction у порога отказы записи (OOM command not allowed)",
-		}
-	}
-	return verdict{status: AlertStatusOK, detail: detail}
+	return observation[RedisMemory]{value: m}
 }
 
-// evalPSICPU — голод CPU по PSI some avg300 (T-162): выше порога
-// psi_cpu_percent (90 %) устойчиво psi_cpu_window (30 мин) — срабатывание.
-// Метрика — some (задержка хотя бы одной задачи), не full и не load
-// average: утилизация 100 % без очереди — норма CPU-bound конвейера, а
-// вот some ≈90+ % — этапы ждут CPU втроём-вчетвером (замер §12), тонут
-// все разом (T-158 поэтому понизил вес monitor'у). Устойчивость —
-// первый проход выше порога стартует окно psiHot, срабатывание при
-// его закрытии; avg300 сам сглаживает 5 минут, окно отбрасывает разовые
-// шпильки (деплой, ретро-пачки). Гистерезис не нужен: чтобы «снять»,
-// avg300 должен опуститься к порогу после 30+ минут выше — это
-// фактическое восстановление, а не дребезг; сброс окна при кратком
-// провале — консервативнее удержания (шпилька не продлевает алерт).
-// Ядро без PSI — errNoPSI, тихая деградация (как SMART в контейнере).
-func (a *Alerts) evalPSICPU(ctx context.Context, _ string) verdict {
+// newRedisMemoryMachine — машина redis_memory: гистерезис доли
+// used/max (включение AlertRedisMemFireRatio 80 % — 20 % запаса на
+// межобрезочные остатки TrimLoop, фрагментацию и буферы клиентов;
+// удержание сработавшего до AlertRedisMemRecoverRatio 75 % — память
+// ползёт и падает резко после XTRIM, доля в коридоре не дребезжала бы
+// Warn у порога).
+func (a *Alerts) newRedisMemoryMachine() *alertMachine[RedisMemory] {
+	share := func(m RedisMemory) float64 { return float64(m.UsedBytes) / float64(m.MaxBytes) }
+	detail := func(m RedisMemory) string {
+		return fmt.Sprintf("used_memory %s из %s maxmemory (%.1f%%), политика %s",
+			alertBytes(uint64(m.UsedBytes)), alertBytes(uint64(m.MaxBytes)), 100*share(m), m.Policy)
+	}
+	return &alertMachine[RedisMemory]{
+		name: AlertRedisMemory,
+		track: hysteresisTrack[RedisMemory]{
+			fire:     func(m RedisMemory) bool { return share(m) >= AlertRedisMemFireRatio },
+			hold:     func(m RedisMemory) bool { return share(m) >= AlertRedisMemRecoverRatio },
+			okDetail: func(m RedisMemory) string { return detail(m) },
+			hotDetail: func(m RedisMemory) string {
+				return detail(m) + " — при noeviction у порога отказы записи (OOM command not allowed)"
+			},
+		},
+		eval: a.observeRedisMemory,
+	}
+}
+
+// observePSI — давление CPU /proc/pressure/cpu (some avg10/60/300 —
+// метрика some: задержка хотя бы одной задачи, не full и не load
+// average: утилизация 100 % без очереди — норма CPU-bound конвейера).
+// Ядро без PSI — errNoPSI, тихая деградация (как SMART в контейнере);
+// окно устойчивости — track машины.
+func (a *Alerts) observePSI(ctx context.Context) observation[PSIStat] {
 	st, err := a.deps.PSI.PSI(ctx)
 	if err != nil {
 		if errors.Is(err, errNoPSI) {
-			return verdict{status: AlertStatusNotMeasured, detail: err.Error()}
+			return observation[PSIStat]{reason: err.Error()}
 		}
-		return verdict{err: fmt.Errorf("monitor: PSI CPU: %w", err)}
+		return observation[PSIStat]{err: fmt.Errorf("monitor: PSI CPU: %w", err)}
 	}
-	now := a.now()
-	over := st.Avg300 > a.opts.PSICPUPercent
-	switch {
-	case !over:
-		a.psiHot = time.Time{}
-	case a.psiHot.IsZero():
-		a.psiHot = now
-	}
-	detail := fmt.Sprintf("some avg10=%.2f%% avg60=%.2f%% avg300=%.2f%%, порог %.0f%% (окно %s)",
-		st.Avg10, st.Avg60, st.Avg300, a.opts.PSICPUPercent, a.opts.PSIWindow)
-	if over {
-		held := now.Sub(a.psiHot)
-		if held >= a.opts.PSIWindow {
-			return verdict{
-				status: AlertStatusFiring,
-				detail: detail + fmt.Sprintf(" — выше порога уже %s", held.Round(time.Second)),
-			}
-		}
-		return verdict{
-			status: AlertStatusOK,
-			detail: detail + fmt.Sprintf(" — выше порога %s из окна, накопление", held.Round(time.Second)),
-		}
-	}
-	return verdict{status: AlertStatusOK, detail: detail}
+	return observation[PSIStat]{value: st}
 }
 
-// evalRenderDebt — накопление рендер-долга (T-175): срабатывание —
-// долг (флаги render_pending по счётчику crawler_counters + лаг q:render,
-// renderdebt.go) выше monitor.alerts.render_debt_domains И растёт
-// render_debt_passes проходов подряд (серия положительных дельт,
-// стиль evalMemHigh). Снятие — дренаж долга ниже 90 % порога: долг —
-// УРОВЕНЬ (флаги + лаг), а не монотонный счётчик, лаг q:render
-// колеблется на сотни-тысячи за проход при дренаже ~1–2 стр/с — снятие
-// «по не-росту» качало бы эпизод 🚨/✅ каждые несколько проходов на
-// стационарном высоком долге (ревью T-175, P2-1). Поэтому рост — только
-// триггер (стагнация без серии роста не будит оператора — она видна
-// строкой «Рендер-долг» отчёта нагрузки T-173 и gauge), уровень —
-// удержание и снятие (гистерезис 90 % против дребезга у порога, стиль
-// очередей AlertQueueRecoverFactor; ceil, чтобы малые пороги не теряли
-// зазор — при пороге 1 снятие < 1 достигается нулём, ревью раунд 2
-// P3-3). Удержание опирается на защёлку трекинга, а не прошлый статус:
-// «не измеряется» (сбой источника) состояние алерта перезаписывает, а
-// эпизод не рвёт (ревью раунд 2, P2-1). Первый проход — база (рост
-// неизвестен). Порог, а не только рост: здоровый фон — тысячи флагов
-// локальных переполнений, алертом считается именно накопление в
-// масштабе суток дренажа. Источники — те же пул БД и гейт глубин, что у
-// остальных алертов (счётчик — точечный Lookup, лаг — XLEN той же
-// семантики, что queue_overflow): ошибка любого — «не измеряется» с
-// Warn, память трекинга не трогается (восстановление доедет по
-// фактическому долгу). Отсутствие строки счётчика (ручная правка
-// таблицы, runbooks §6) — ошибка с Warn, а не тихий ноль: gauge долга
-// не должен лгать.
-func (a *Alerts) evalRenderDebt(ctx context.Context, _ string) verdict {
+// newPSIMachine — машина psi_cpu: окно удержания avg300 выше порога
+// (PSICPUPercent 90 % — рабочий голод планировщика по замеру §12
+// 91–95 %, ниже — утилизация без очереди; PSIWindow 30 мин — avg300
+// сам сглаживает 5 минут, окно требует устойчивый голод, разовые
+// шпильки деплоя/ретро-пачек алертом не считаются; T-158 понизил вес
+// monitor'у — собственные проходы голод не приближают).
+func (a *Alerts) newPSIMachine() *alertMachine[PSIStat] {
+	return &alertMachine[PSIStat]{
+		name:  AlertPSICPU,
+		track: &psiWindowTrack{percent: a.opts.PSICPUPercent, window: a.opts.PSIWindow},
+		eval:  a.observePSI,
+	}
+}
+
+// observeRenderDebt — снимок рендер-долга (T-175): флаги render_pending
+// (точечный Lookup счётчика crawler_counters) + лаг q:render (XLEN той
+// же семантики, что queue_overflow) — renderDebtOf: один снимок с
+// циклом gauge и строкой отчёта нагрузки (семантика не расходится).
+// Источники — те же пул БД и гейт глубин: ошибка любого — «не
+// измеряется» с Warn, память трекинга не трогается (восстановление
+// доедет по фактическому долгу). Отсутствие строки счётчика (миграция
+// не applied / ручная правка таблицы, runbooks §6) — ошибка с Warn,
+// а не тихий ноль: gauge долга не должен лгать. Порог/серия/защёлка —
+// track машины.
+func (a *Alerts) observeRenderDebt(ctx context.Context) observation[RenderDebt] {
 	if a.deps.Redis == nil {
-		return verdict{status: AlertStatusNotMeasured, detail: "Redis не задан"}
+		return observation[RenderDebt]{reason: "Redis не задан"}
 	}
 	d, err := renderDebtOf(ctx, a.deps.Pool, a.deps.Redis)
 	if err != nil {
-		return verdict{err: err}
+		return observation[RenderDebt]{err: err}
 	}
-	tr := a.renderDebt
-	var delta int64
-	if tr.seen && d.Total() > tr.prev {
-		tr.streak++
-		delta = d.Total() - tr.prev
-	} else {
-		tr.streak = 0
-	}
-	tr.seen, tr.prev = true, d.Total()
-
-	// Порог снятия — 90 % порога срабатывания, целочисленный ceil:
-	// гистерезис против дребезга у порога (ревью T-175, P2-1), коридор
-	// ≥ 1 при любом допустимом пороге (минимум 1) — сработавший алерт
-	// всегда достижим для снятия (ревью раунд 2, P3-3); при 50 тыс.
-	// снятие — ниже 45 тыс.
-	recoverAt := (a.opts.RenderDebtDomains*9 + 9) / 10
-	detail := fmt.Sprintf("рендер-долг: %s, порог %d (снятие < %d), серия роста %d/%d проходов (+%d за проход)",
-		d.String(), a.opts.RenderDebtDomains, recoverAt, tr.streak, a.opts.RenderDebtPasses, delta)
-	var v verdict
-	switch {
-	case d.Total() > a.opts.RenderDebtDomains && tr.streak >= a.opts.RenderDebtPasses:
-		tr.firing = true
-		v = verdict{
-			status: AlertStatusFiring,
-			detail: detail + " — накопление: приток SPA обгоняет дренаж (render.contexts / приток планировщика, разбор — docs/runbooks.md)",
-		}
-	case tr.firing && d.Total() >= recoverAt:
-		// Удержание сработавшего: колебания лага при стационарном долге
-		// (серия роста сброшена, уровень выше порога снятия) — эпизод
-		// живёт до фактического дренажа. Защёлка, а не прошлый статус:
-		// сбой источника («не измеряется») эпизод не закрывает.
-		v = verdict{
-			status: AlertStatusFiring,
-			detail: detail + " — долг держится выше порога снятия (уровень — строка «Рендер-долг» отчёта нагрузки)",
-		}
-	default:
-		tr.firing = false
-		v = verdict{status: AlertStatusOK, detail: detail}
-	}
-	a.renderDebt = tr
-	return v
+	return observation[RenderDebt]{value: d}
 }
 
-// evalRenderFallbackDepth — накопление очереди фолбэка рендера (T-246,
-// ТЗ рендера §4.6 п.3; второй триггер — S-P2-1, решение оператора):
-// глубина q:render-fallback (backlog группы потребления воркера B —
-// общий расчёт GroupDepth через тот же гейт, что у алертов очередей;
-// метрика-зеркало сборки B crawler_queue_depth{queue="q:render-fallback"}
-// экспонируется самим воркером и при его смерти ряда нет — инцидент
-// «B стоит» виден только прямое чтение Redis, поэтому источник здесь
-// Redis, а не зонд метрик) у эффективного порога стрима И (растёт
-// AlertRenderFallbackPasses проходов подряд — механика render_debt ИЛИ
-// держится над порогом AlertRenderFallbackPasses проходов подряд без
-// требования роста): разовый всплеск публикаций фолбэка (штатная работа
-// «собрать и доработать», ФТ-13) не будит оператора, устойчивый рост —
-// темп воркера B ниже притока, а стационарная глубина у порога —
-// остановленный B либо упор в предел MAXLEN стрима (XADD вытесняет
-// старейшие недоставленные записи: глубина перестаёт расти, новые
-// фолбэк-задачи молча теряются) и эпизод, переживший рестарт монитора
-// (серия роста базируется нулём и стационарную глубину не видит).
-// Порог — тот же единый расчёт
-// queue.StreamWatermark(scheduler.queue_high_watermark, redis.maxlen,
-// стрим), что у алерта очередей и подсветки дашборда: для
-// q:render-fallback это не порог гейта (стрим воротами не ограничивается
-// — ТЗ рендера §4.3 п.3, потолок — бюджет доли и темп воркера B), а
-// порог наблюдения «глубина приближается к пределу MAXLEN стрима»
-// (15 000, половина — 7 500 на дефолтных watermark 100 тыс.). Снятие —
-// дренаж ниже 90 % порога (ceil, стиль render_debt); стагнация выше
-// порога удерживается защёлкой, не будит повторно. Ошибка источника
-// память трекинга не трогает (восстановление доедет по фактической
-// глубине).
-func (a *Alerts) evalRenderFallbackDepth(ctx context.Context, _ string) verdict {
+// newRenderDebtMachine — машина render_debt: защёлка уровня + серия
+// роста (RenderDebtDomains 50 тыс. — здоровый фон тысячи флагов,
+// алерт про накопление в масштабе суток дренажа; RenderDebtPasses 2 —
+// 10 мин непрерывного роста, разовый скачок разбирает проход
+// доработки). Спецификация переходов — alertstate.go (renderDebtTrack).
+func (a *Alerts) newRenderDebtMachine() *alertMachine[RenderDebt] {
+	return &alertMachine[RenderDebt]{
+		name:  AlertRenderDebt,
+		track: &renderDebtTrack{domains: a.opts.RenderDebtDomains, passes: a.opts.RenderDebtPasses},
+		eval:  a.observeRenderDebt,
+	}
+}
+
+// observeRenderFallbackDepth — глубина q:render-fallback (T-246):
+// backlog группы потребления воркера B через тот же гейт, что у
+// алертов очередей. Метрика-зеркало сборки B
+// crawler_queue_depth{queue="q:render-fallback"} экспонируется самим
+// воркером и при его смерти ряда нет — инцидент «B стоит» виден только
+// прямое чтение Redis, поэтому источник здесь Redis, а не зонд метрик.
+// Порог — единый расчёт queue.StreamWatermark (для q:render-fallback
+// это не порог гейта — стрим воротами не ограничивается, ТЗ рендера
+// §4.3 п.3, — а порог наблюдения «глубина приближается к пределу
+// MAXLEN стрима»: 15 000, половина — 7 500 на дефолтных watermark
+// 100 тыс.); триггеры (серия роста ИЛИ стационарная глубина) и защёлка
+// — track машины.
+func (a *Alerts) observeRenderFallbackDepth(ctx context.Context) observation[int64] {
 	if a.deps.Redis == nil {
-		return verdict{status: AlertStatusNotMeasured, detail: "Redis не задан"}
+		return observation[int64]{reason: "Redis не задан"}
 	}
 	if a.opts.QueueWatermark <= 0 {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "порог scheduler.queue_high_watermark не задан",
+		return observation[int64]{
+			reason: "порог scheduler.queue_high_watermark не задан",
 		}
 	}
 	n, err := a.deps.Redis.Len(ctx, queue.StreamRenderFallback)
 	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: глубина %s: %w", queue.StreamRenderFallback, err)}
+		return observation[int64]{err: fmt.Errorf("monitor: глубина %s: %w", queue.StreamRenderFallback, err)}
 	}
-	wm := queue.StreamWatermark(a.opts.QueueWatermark, a.opts.QueueMaxLen, queue.StreamRenderFallback)
-	tr := a.renderFbDepth
-	var delta int64
-	if tr.seen && n > tr.prev {
-		tr.streak++
-		delta = n - tr.prev
-	} else {
-		tr.streak = 0
-	}
-	// Второй триггер (S-P2-1, решение оператора): серия проходов НАД
-	// порогом без требования роста. Стационарная глубина у порога —
-	// инцидент не хуже растущей: рестарт монитора посреди эпизода
-	// (первый проход базирует prev, серия роста больше не копится —
-	// глубина стоит) и упор в потолок MAXLEN (XADD вытесняет старейшие
-	// недоставленные записи — XLEN перестаёт расти, новые задачи
-	// молча теряются). Анти-спайк прежний: одиночный всплеск между
-	// проходами рассасывается, серия не набирается.
-	if n >= wm {
-		tr.hot++
-	} else {
-		tr.hot = 0
-	}
-	tr.seen, tr.prev = true, n
-
-	// Порог снятия — 90 % порога срабатывания, целочисленный ceil
-	// (стиль render_debt): коридор ≥ 1 при любом валидном watermark.
-	recoverAt := (wm*9 + 9) / 10
-	detail := fmt.Sprintf("глубина %s=%d, порог %d (снятие < %d), серия роста %d/%d (+%d за проход), у порога %d/%d проходов",
-		queue.StreamRenderFallback, n, wm, recoverAt, tr.streak, AlertRenderFallbackPasses, delta,
-		tr.hot, AlertRenderFallbackPasses)
-	var v verdict
-	switch {
-	case n >= wm && (tr.streak >= AlertRenderFallbackPasses || tr.hot >= AlertRenderFallbackPasses):
-		tr.firing = true
-		if tr.streak >= AlertRenderFallbackPasses {
-			v = verdict{
-				status: AlertStatusFiring,
-				detail: detail + " — накопление: приток фолбэка обгоняет темп воркера B (render.fallback.worker_rate / движок-кандидат, разбор — docs/render.md)",
-			}
-		} else {
-			v = verdict{
-				status: AlertStatusFiring,
-				detail: detail + " — глубина стационарно у порога без роста: воркер B стоит либо очередь упёрлась в предел MAXLEN стрима (XADD вытесняет недоставленное), разбор — docs/render.md",
-			}
-		}
-	case tr.firing && n >= recoverAt:
-		v = verdict{
-			status: AlertStatusFiring,
-			detail: detail + " — глубина держится выше порога снятия (темп/глубина — панель движков дашборда)",
-		}
-	default:
-		tr.firing = false
-		v = verdict{status: AlertStatusOK, detail: detail}
-	}
-	a.renderFbDepth = tr
-	return v
+	return observation[int64]{value: n}
 }
 
-// evalRenderFallbackBudget — превышение бюджета доли фолбэка (T-246, ТЗ
-// рендера §4.6 п.3): рост счётчика событий приостановки
-// crawler_render_fallback_suspended_total{reason="budget"} (T-239, зонд
-// /metrics рендер-воркера) — доля публикаций за окно бюджета ушла за
-// потолок render.fallback.share_percent. Событие, а не состояние: одно
-// защёлкивание — одна точка счётчика, пока приостановка держится,
-// кандидаты фолбэка финализируются штатно (задачи не теряются, ФТ-9) —
-// сигнал оператору «основной движок деградирует, fallback-рейт за
-// потолком», а не «конвейер встал». Срабатывание — любое событие в
-// окне AlertFallbackBudgetWindow проходов (кольцо дельт, стиль
-// bad_hashes), снятие — старением: разовое превышение держит алерт до
-// вытеснения дельты из кольца, поток событий — продлевает; гистерезис
-// не нужен (сумма окна убывает только старением). Рестарт воркера
-// (убыль счётчика) — нулевая дельта без ложного всплеска. Ошибка зонда
-// (воркер остановлен, метрики нет) — «не измеряется» с Warn: смерть
-// самого воркера видна по crawler_service_up; пустой
-// monitor.render_metrics_url — тихое «не измеряется» (источник не
-// подключён, стиль ingest-зонда).
-func (a *Alerts) evalRenderFallbackBudget(ctx context.Context, _ string) verdict {
+// newRenderFbDepthMachine — машина render_fallback_depth: защёлка
+// уровня с двумя триггерами — рост AlertRenderFallbackPasses проходов
+// подряд (механика render_debt) ИЛИ стационарная глубина над порогом
+// столько же проходов (S-P2-1: остановленный B, упор в MAXLEN или
+// эпизод, переживший рестарт монитора). Разовый всплеск публикаций —
+// штатная работа фолбэка «собрать и доработать» (ФТ-13), оператора не
+// будит. Спецификация переходов — alertstate.go (renderFbDepthTrack).
+func (a *Alerts) newRenderFbDepthMachine() *alertMachine[int64] {
+	wm := queue.StreamWatermark(a.opts.QueueWatermark, a.opts.QueueMaxLen, queue.StreamRenderFallback)
+	return &alertMachine[int64]{
+		name:  AlertRenderFbDepth,
+		track: &renderFbDepthTrack{wm: wm, passes: AlertRenderFallbackPasses},
+		eval:  a.observeRenderFallbackDepth,
+	}
+}
+
+// observeRenderFallbackBudget — счётчик событий приостановки бюджета
+// доли фолбэка crawler_render_fallback_suspended_total{reason="budget"}
+// (T-239, зонд /metrics рендер-воркера): событие, а не состояние — одно
+// защёлкивание приостановки одна точка счётчика, пока приостановка
+// держится, кандидаты фолбэка финализируются штатно (задачи не теряются,
+// ФТ-9). Пустой monitor.render_metrics_url — тихое «не измеряется»
+// (источник не подключён, стиль ingest-зонда); ошибка зонда (воркер
+// остановлен, метрики нет) — «не измеряется» с Warn: смерть самого
+// воркера видна по crawler_service_up. Окно событий — track машины.
+func (a *Alerts) observeRenderFallbackBudget(ctx context.Context) observation[int64] {
 	if a.deps.FallbackBudget == nil {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "источник не задан (monitor.render_metrics_url)",
+		return observation[int64]{
+			reason: "источник не задан (monitor.render_metrics_url)",
 		}
 	}
 	cur, err := a.deps.FallbackBudget.FallbackBudget(ctx)
 	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: бюджет доли фолбэка: %w", err)}
+		return observation[int64]{err: fmt.Errorf("monitor: бюджет доли фолбэка: %w", err)}
 	}
-	sum := a.renderFbBudget.push(cur)
-	detail := fmt.Sprintf("события бюджета %d, новых за окно %s — %d (порог 1)",
-		cur, (time.Duration(AlertFallbackBudgetWindow) * a.opts.Interval).Round(time.Second), sum)
-	if sum >= 1 {
-		return verdict{
-			status: AlertStatusFiring,
-			detail: detail + " — доля фолбэка ушла за потолок render.fallback.share_percent: деградация основного движка (fallback-рейт — панель движков дашборда, причины — crawler_render_task_finalized_total)",
-		}
-	}
-	return verdict{status: AlertStatusOK, detail: detail}
+	return observation[int64]{value: cur}
 }
 
-// evalRenderBrowserErrors — устойчивый рост счётчика ошибок класса
-// браузера этапа рендера (S-P2-6, решение оператора — rate-детектор):
-// crawler_stage_errors_total{stage="render",type="browser"} из зонда
-// /metrics рендер-воркера (тот же адрес, что у зонда бюджета) растёт
-// AlertRenderBrowserErrorsPasses проходов подряд — движок-кандидат
-// (moli/lightpanda) завис или недоступен: health-гейт T-239 к этому
-// моменту приостанавливает фолбэк-публикации, браузер-класс ждёт в
-// redelivery q:render в пределах окна ретраев — сигнал оператору «чинить
-// движок / откат на chromium» (ТЗ рендера §6.4). Событие гейта остаётся
-// счётчиком suspended{reason="gate"} и Warn-логом воркера: детектор не
-// дублирует защёлкивание, а видит первопричину — стрик инфра-ошибок.
-// Разовая browser-ошибка (штатный перезапуск сессии/контекста, T-063)
-// серию не набирает. Рестарт воркера (убыль счётчика) — нулевая дельта,
-// серия с нуля (стиль badHashesWindow). Семейство stage_errors ленивое:
-// «серии нет» у рендер-воркера — 0, не «не измеряется» (маркер
-// crawler_stage_tasks_total{stage="render"}; как suspended после
-// предсоздания T-250). Чужая экспозиция (маркера нет) — тихое «не
-// измеряется» без Warn: адрес monitor.render_metrics_url настроен не на
-// рендер-воркер — конфигурационная проблема, зонд жив; сетевая ошибка
-// зонда — «не измеряется» с Warn, как у остальных зондов.
-func (a *Alerts) evalRenderBrowserErrors(ctx context.Context, _ string) verdict {
+// newRenderFbBudgetMachine — машина render_fallback_budget: кольцо
+// дельт событий за окно AlertFallbackBudgetWindow проходов (30 мин —
+// окно вмещает эпизод бюджетного окна T-239 и один рецидив), порог 1 —
+// каждое событие аномалия (в норме публикации укладываются в потолок
+// доли); снятие старением: пока приостановка держится, новых точек нет
+// — держит только окно, оператору виден fallback-рейт панели движков.
+func (a *Alerts) newRenderFbBudgetMachine() *alertMachine[int64] {
+	return &alertMachine[int64]{
+		name: AlertRenderFbBudget,
+		track: ringTrack{
+			// Окно 6 проходов (не 15 окна мусорных хешей): ёмкость кольца
+			// задаётся здесь, push дефолта не знает.
+			ring:      &deltaRing{size: AlertFallbackBudgetWindow},
+			threshold: 1,
+			passes:    AlertFallbackBudgetWindow,
+			interval:  a.opts.Interval,
+			label:     "события бюджета",
+			fireNote:  " — доля фолбэка ушла за потолок render.fallback.share_percent: деградация основного движка (fallback-рейт — панель движков дашборда, причины — crawler_render_task_finalized_total)",
+		},
+		eval: a.observeRenderFallbackBudget,
+	}
+}
+
+// observeRenderBrowserErrors — счётчик ошибок класса браузера этапа
+// рендера crawler_stage_errors_total{stage="render",type="browser"}
+// (S-P2-6) из зонда /metrics рендер-воркера (тот же адрес, что у зонда
+// бюджета). Семейство stage_errors ленивое: «серии нет» у рендер-воркера
+// — 0, не «не измеряется» (маркер crawler_stage_tasks_total{stage=
+// "render"}; как suspended после предсоздания T-250). Чужая экспозиция
+// (маркера нет) — тихое «не измеряется» без Warn: адрес
+// monitor.render_metrics_url настроен не на рендер-воркера —
+// конфигурационная проблема, зонд жив; сетевая ошибка зонда — «не
+// измеряется» с Warn, как у остальных зондов. Серия роста — track
+// машины.
+func (a *Alerts) observeRenderBrowserErrors(ctx context.Context) observation[int64] {
 	if a.deps.RenderBrowserErrors == nil {
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "источник не задан (monitor.render_metrics_url)",
+		return observation[int64]{
+			reason: "источник не задан (monitor.render_metrics_url)",
 		}
 	}
 	cur, err := a.deps.RenderBrowserErrors.RenderBrowserErrors(ctx)
 	if err != nil {
 		if errors.Is(err, errNotRenderExposition) {
-			return verdict{
-				status: AlertStatusNotMeasured,
-				detail: "экспозиция не рендер-воркера (нет crawler_stage_tasks_total{stage=\"render\"}) — проверьте monitor.render_metrics_url",
+			return observation[int64]{
+				reason: "экспозиция не рендер-воркера (нет crawler_stage_tasks_total{stage=\"render\"}) — проверьте monitor.render_metrics_url",
 			}
 		}
-		return verdict{err: fmt.Errorf("monitor: browser-ошибки рендера: %w", err)}
+		return observation[int64]{err: fmt.Errorf("monitor: browser-ошибки рендера: %w", err)}
 	}
-	tr := a.renderBrowserErr
-	var delta int64
-	if tr.seen && cur > tr.prev {
-		tr.streak++
-		delta = cur - tr.prev
-	} else {
-		tr.streak = 0
-	}
-	tr.seen, tr.prev = true, cur
-	a.renderBrowserErr = tr
-	detail := fmt.Sprintf("browser-ошибки рендера %d, серия роста %d/%d (+%d за проход)",
-		cur, tr.streak, AlertRenderBrowserErrorsPasses, delta)
-	if tr.streak >= AlertRenderBrowserErrorsPasses {
-		return verdict{
-			status: AlertStatusFiring,
-			detail: detail + " — движок рендера завис или недоступен: health-гейт приостановил фолбэк-публикации, браузер-класс в redelivery q:render (откат движка — ТЗ рендера §6.4, разбор — docs/render.md)",
-		}
-	}
-	return verdict{status: AlertStatusOK, detail: detail}
+	return observation[int64]{value: cur}
 }
 
-// evalDomainsNewDoneStale — домены «статус повис» (T-256, ТЗ-fsm §3
-// ФТ-2.2): строка crawler_counters new_done_stale — домены со
-// status = new ∧ check_state = done ∧ last_checked_at старше суток
-// (DNS-этап записал ветку «есть адреса» — О6 общей таблицы статусов
-// internal/model/enums.go, HTTP-итог О7–О9 не пришёл: задача q:http
-// потеряна, компенсатора нет). Значение пишет проход реконсиляции
-// (FILTER-колонка f_new_done_stale агрегата domainsAggSQL), алерт
-// читает его точечным лукапом — seq scan по domains не добавляет.
-// Срабатывание — AlertNewDoneStalePasses НОВЫХ снапшотов реконсиляции
-// подряд с ненулевым значением (серия растёт только при смене updated_at
-// строки: проходы алертов чаще источника, повторные чтения одного
-// снапшота наблюдением не считаются — одиночный пограничный снапшот
-// границы суток следующим проходом перезаписывается и алерта не даёт);
-// удержание — любая ненулевая, снятие — ноль (стиль evalDead). Ошибка
-// источника серию не сбрасывает: неизвестное наблюдение — не нулевое;
-// пустой результат (строки нет до первого прохода реконсиляции) —
-// тихое «не измеряется». Автолечения нет — лечит регулярная
-// перепроверка T-030: алерт только сигнал, уровень наблюдаем gauge'ом
+// newRenderBrowserErrMachine — машина render_browser_errors: серия
+// роста счётчика AlertRenderBrowserErrorsPasses проходов (10 мин):
+// разовая browser-ошибка — штатный перезапуск сессии/контекста (T-063)
+// и эпизод, разбираемый health-гейтом, серию не набирает; серия роста
+// — движок-кандидат (moli/lightpanda) завис или недоступен: гейт T-239
+// уже приостановил фолбэк-публикации, браузер-класс ждёт в redelivery
+// q:render — оператору нужен сигнал про сам движок. Событие гейта
+// остаётся счётчиком suspended{reason="gate"} и Warn-логом воркера:
+// детектор не дублирует защёлкивание, а видит первопричину.
+func (a *Alerts) newRenderBrowserErrMachine() *alertMachine[int64] {
+	return &alertMachine[int64]{
+		name:  AlertRenderBrowserErr,
+		track: &counterGrowthTrack{minPasses: AlertRenderBrowserErrorsPasses},
+		eval:  a.observeRenderBrowserErrors,
+	}
+}
+
+// observeDomainsNewDoneStale — строка crawler_counters new_done_stale
+// (T-256, ФТ-2.2): домены «статус повис» (status = new ∧ check_state =
+// done ∧ last_checked_at старше суток; DNS-этап записал ветку «есть
+// адреса» — О6 общей таблицы статусов internal/model/enums.go, HTTP-итог
+// О7–О9 не пришёл: задача q:http потеряна, компенсатора нет). Значение
+// пишет FILTER-колонка f_new_done_stale прохода реконсиляции
+// (zonestats.go), алерт читает его точечным лукапом — seq scan по
+// domains не добавляет; updated_at — метка снапшота (серия растёт
+// только на НОВОМ снапшоте — track машины). Пустой результат (строки
+// нет до первого прохода реконсиляции — обе петли monitor стартуют
+// вместе, корректного «нет строки» не бывает) — тихое «не измеряется»;
+// ошибка чтения — Warn. Автолечения нет — лечит регулярная перепроверка
+// T-030: алерт только сигнал, уровень наблюдаем gauge'ом
 // crawler_domains_new_done_stale.
-func (a *Alerts) evalDomainsNewDoneStale(ctx context.Context, prev string) verdict {
+func (a *Alerts) observeDomainsNewDoneStale(ctx context.Context) observation[staleRow] {
 	rows, err := a.deps.Pool.Query(ctx, newDoneStaleSQL)
 	if err != nil {
-		return verdict{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
+		return observation[staleRow]{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		// Обрыв соединения — не «строки нет»: сначала сбой чтения
 		// (стиль retryMatureCount).
 		if err := rows.Err(); err != nil {
-			return verdict{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
+			return observation[staleRow]{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
 		}
-		return verdict{
-			status: AlertStatusNotMeasured,
-			detail: "строки new_done_stale нет — первый проход реконсиляции ещё не завершился",
+		return observation[staleRow]{
+			reason: "строки new_done_stale нет — первый проход реконсиляции ещё не завершился",
 		}
 	}
 	var n int64
 	var snap sql.NullTime
 	if err := rows.Scan(&n, &snap); err != nil {
-		return verdict{err: fmt.Errorf("monitor: домены «статус повис»: чтение: %w", err)}
+		return observation[staleRow]{err: fmt.Errorf("monitor: домены «статус повис»: чтение: %w", err)}
 	}
 	if err := rows.Err(); err != nil {
-		return verdict{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
+		return observation[staleRow]{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
 	}
-	tr := a.newDoneStale
-	if n > 0 {
-		// Серия — число различных ненулевых снапшотов: повторное чтение
-		// той же строки (алерт ходит чаще реконсиляции) серию не
-		// наращивает; нулевой снапшот обнуляет.
-		switch {
-		case !tr.seen || !snap.Valid || !snap.Time.Equal(tr.snap):
-			tr.streak++
-		}
-		tr.seen = true
-		tr.snap = snap.Time
-	} else {
-		tr.streak = 0
+	return observation[staleRow]{value: staleRow{value: n, snap: snap}}
+}
+
+// newDomainsStaleMachine — машина domains_new_done_stale: серия НОВЫХ
+// ненулевых снапшотов реконсиляции (AlertNewDoneStalePasses — 2 × период
+// реконсиляции ≈ 1 ч устойчивого ненулевого значения; стационарно ноль
+// в норме — норма не будит вовсе).
+func (a *Alerts) newDomainsStaleMachine() *alertMachine[staleRow] {
+	return &alertMachine[staleRow]{
+		name:  AlertDomainsStale,
+		track: &newDoneStaleTrack{minPasses: AlertNewDoneStalePasses},
+		eval:  a.observeDomainsNewDoneStale,
 	}
-	a.newDoneStale = tr
-	detail := fmt.Sprintf("доменов new∧done старше суток %d, ненулевых снапшотов реконсиляции подряд %d/%d (значение — проход реконсиляции, gauge crawler_domains_new_done_stale)",
-		n, tr.streak, AlertNewDoneStalePasses)
-	if tr.streak >= AlertNewDoneStalePasses || (prev == AlertStatusFiring && n > 0) {
-		return verdict{
-			status: AlertStatusFiring,
-			detail: detail + " — потеря задач q:http: HTTP-итог не записан, компенсатора нет (лечит перепроверка T-030; спецификация — internal/model/enums.go)",
-		}
-	}
-	return verdict{status: AlertStatusOK, detail: detail}
 }
 
 // AlertsLoop — периодический цикл оценки алертов (стиль ZoneStatsLoop):
@@ -2257,7 +2014,7 @@ func AlertsLoop(ctx context.Context, deps AlertsDeps, opts AlertsOptions) error 
 	}
 	a := NewAlerts(deps, opts)
 	a.log.Info("цикл оценки алертов",
-		"interval", a.opts.Interval.String(), "алертов", len(a.evaluators()))
+		"interval", a.opts.Interval.String(), "алертов", len(a.machines))
 
 	pass := func() { a.Pass(ctx) }
 	pass()
