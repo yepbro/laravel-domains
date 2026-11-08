@@ -42,7 +42,7 @@ T-202 — корзины зрелости, T-204 — guard корзин), и к�
 | № | Автомат | Состояние закодировано | Ключевые дефекты аудита |
 |---|---|---|---|
 | 1 | `check_state` домена | `domains.check_state` × `queued_at`; писатели — 5 пакетов (`scheduler/enqueue.go:83-117`, `scheduler/lease.go:129-174`, `scheduler/recheck.go:112-127`, `scheduler/retry.go:158-201`, `cmd/crawlerctl/recheck.go:108-127`, `cmd/crawlerctl/manage.go:255-283`, `dnsworker/result.go:155-246`, `httpworker/record.go:117-128`, `ingest/apply_add.go:119-130`) | queued с NULL `queued_at` — вне lease-прохода навсегда (`lease.go:129-135`); queued без задачи в Redis — самолечение 30 мин |
-| 2 | `status` домена | `domains.status` × `temp_attempts`; писатели `dnsworker/result.go:155-201,228-246`, `httpworker/record.go:117-128`, `ingest/apply_delete.go:88-130`, `scheduler/retry.go:189-201` | «статус повис» new/done при потере q:http — компенсатора нет; асимметрия идемпотентности DNS/HTTP (`record.go:66-74`) |
+| 2 | `status` домена | `domains.status` × `temp_attempts`; писатели `dnsworker/result.go:155-201,228-246`, `httpworker/record.go:117-128`, `ingest/apply_delete.go:88-130`, `scheduler/retry.go:189-201` | «статус повис» new/done при потере q:http — лечит компенсатор T-270 (ранний recheck Р15 спецификации `check_state`); асимметрия идемпотентности DNS/HTTP (`record.go:66-74`) гасит дубль задачи ожившего воркера |
 | 3 | бит `http_published` | `domains.flags` бит 2 (`dnsworker/result.go:203-214`) | окно «XADD без бита» — дубль q:http; залипание на done |
 | 4 | бит `render_pending` × счётчик | `domains.flags` бит 1 × `crawler_counters['render_pending']` (`httpworker/renderq.go:141-161,263-287,725-746`) | двойное кодирование долга; «биты-сироты»; черновой флаг/keep |
 | 5 | рендер-состояние строки | `subdomain_results.rendered/render_failed_at` + сообщения q:render/q:render-fallback (`renderworker/worker.go:174-245,2137-2140`) | состояние «ждёт фолбэка» без колонки; потеря MAXLEN-усечённых задач — запись неотличима от «не пробовали» |
@@ -102,7 +102,12 @@ ready-latch дашборда, reloader правил, каркас сервиса
   `crawler_domains_new_done_stale` в проходе `monitor/zonestats.go`
   (по счётчикам, без seq scan по domains — окно реконсиляции) и алерт
   `domains_new_done_stale` (стрик 2 прохода, стационарно нулевой в норме).
-  Автовосстановления нет (лечит перепроверка T-030) — алерт только сигнал.
+  Автовосстановление — компенсатор T-270 (этап 40): часовой проход
+  планировщика `scheduler/stalerequeue.go` возвращает new∧done старше
+  24 ч в `pending` (переход Р15 спецификации `check_state`; дешёвая
+  проба по строке `new_done_stale` — стационарно domains не
+  сканируются; дубль q:http ожившего воркера гасится асимметрией А3) —
+  gauge/алерт остаются сигналом о новых потерях.
 
 ### Автомат 3: бит `http_published` (T-257)
 

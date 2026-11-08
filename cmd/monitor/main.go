@@ -201,6 +201,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// обёрнута в метрики — одно чтение питает алерт redis_memory и gauge
 	// crawler_redis_memory_ratio/_bytes.
 	deps.RedisMemory = monitor.NewRedisMemoryMetrics(reg, monitor.RedisInfo{RDB: rdb})
+	// Аптайм Redis (T-270): INFO server того же клиента — алерт
+	// redis_restart (рестарт без персистентности теряет недоставленные
+	// записи стримов: главная причина класса потерь «статус повис»,
+	// ФТ-2.2).
+	deps.RedisUptime = monitor.RedisInfo{RDB: rdb}
 	// Группы стримов для алерта замороженной очереди (T-162): XINFO
 	// GROUPS + XLEN того же клиента (last-delivered-id и глубина группы
 	// с клампом T-168); стрим без групп — пустой вклад.

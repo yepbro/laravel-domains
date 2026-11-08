@@ -43,7 +43,7 @@
 //
 //	| track-тип | машины | включение → firing | удержание firing | снятие → ok |
 //	|-----------|--------|--------------------|-----------------|-------------|
-//	| порог уровня thresholdTrack | progress_stall, disk_free, disk_free_min, disk_free_crit, nvme_wear, unit_oom | предикат наблюдения | — (памяти нет: каждый проход решает заново; «память» — сам наблюдаемый уровень, монотонный по механике: возраст метки, место, износ, счётчики событий) | тот же предикат |
+//	| порог уровня thresholdTrack | progress_stall, disk_free, disk_free_min, disk_free_crit, nvme_wear, unit_oom, redis_restart | предикат наблюдения | — (памяти нет: каждый проход решает заново; «память» — сам наблюдаемый уровень, монотонный по механике: возраст метки, место, износ, счётчики событий, аптайм Redis) | тот же предикат |
 //	| гистерезис порогов hysteresisTrack | dns_temp_error_share, queue_overflow, redis_memory | fire(v) | prev = firing ∧ hold(v) — коридор снятия не дребезжит Warn | ¬(fire ∨ hold) |
 //	| серия: deadStreakTrack | queue_dead | ненулевая глубина N=3 проходов подряд | prev = firing ∧ глубина > 0 | нулевая глубина |
 //	| серия: memHighStreakTrack | memory_high | рост счётчика high юнита N=2 проходов подряд (любой юнит) | серия горячего юнита не оборвана | первый проход без роста |
@@ -140,7 +140,7 @@ type alertTrack[V any] interface {
 }
 
 // alertMachine — единая структура автомата алерта (ФТ-10): «{имя,
-// статус, track-память}». Все 19 алертов — значения этого типа;
+// статус, track-память}». Все 20 алертов — значения этого типа;
 // отличается машины только тип track-памяти (alertTrack) и источник
 // наблюдения (eval — observe*-функция в alerts.go). Единственная точка
 // записи состояния — transition (И1).
@@ -431,7 +431,7 @@ func (t *newDoneStaleTrack) decide(prev string, _ time.Time, row staleRow) decis
 	if t.streak >= t.minPasses || (prev == AlertStatusFiring && n > 0) {
 		return decision{
 			AlertStatusFiring,
-			detail + " — потеря задач q:http: HTTP-итог не записан, компенсатора нет (лечит перепроверка T-030; спецификация — internal/model/enums.go)",
+			detail + " — потеря задач q:http: HTTP-итог не записан, когорту вернёт компенсатор T-270 (ранний recheck, stalerequeue.go; спецификация — internal/model/enums.go)",
 		}
 	}
 	return decision{AlertStatusOK, detail}

@@ -511,14 +511,17 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # тома
   устойчивого значения; домены `status = new ∧ check_state = done` со
   `last_checked_at` старше суток; уровень — gauge
   `crawler_domains_new_done_stale`): DNS-этап записал «есть адреса», а
-  HTTP-итог не пришёл — потерянные задачи `q:http` (компенсатора нет,
-  спецификация статусов — `internal/model/enums.go`). Автолечения нет:
-  регулярная перепроверка закроет сама через `recheck_interval`
-  (~полгода); для ускорения — найти когорту (SQL по фильтру алерта),
-  сверить журнал http-worker на время потери (краш? обрезка MAXLEN
-  стрима `q:http`?) и при необходимости издать ручной recheck
-  (`crawlerctl recheck`, runbooks.md §2) — переиздание задач закроет
-  эпизод, алерт снимется нулём.
+  HTTP-итог не пришёл — потерянные задачи `q:http` (спецификация
+  статусов — `internal/model/enums.go`). Когорту лечит компенсатор
+  T-270 (ранний recheck: часовой проход планировщика возвращает
+  new∧done старше 24 ч в `pending` сам, счётчик
+  `crawler_scheduler_stale_requeued_total`, runbooks.md §2.10) —
+  действий обычно не требуется; алерт остаётся сигналом о НОВЫХ
+  потерях: сверить причину (рестарт Redis — параллельный алерт
+  `redis_restart`; OOM-окно — журнал http-worker) и следить, что
+  компенсатор дренирует когорту (счётчик растёт, gauge падает до нуля
+  в пределах часа после реконсиляции). Не дренирует — разбор по
+  runbooks.md §2.10.
 - **Троттлинг MemoryHigh** (алерт `memory_high`, T-162: счётчик
   memory.events high юнита растёт ≥ 2 проходов подряд — устойчивый
   reclaim под мягким потолком, предвестник фаталов T-157): проверить
@@ -563,6 +566,12 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # тома
   при ≥ 80 % `maxmemory`, T-154; при noeviction — предупреждение
   отказов записи): сверить `redis-cli INFO memory`, разбор —
   [`redis.md`](redis.md).
+- **Рестарт Redis** — алерт `redis_restart` (T-270: uptime из
+  `INFO server` < 15 мин): недоставленные записи стримов потеряны —
+  q:dns вернёт lease, потерянные q:http при записанном done —
+  компенсатор T-270 (`new_done_stale` дренируется в пределах часа,
+  runbooks.md §2.10); сверить причину перезапуска (юнит/OOM/хост),
+  разбор — [`redis.md`](redis.md).
 - **SMART/TBW** — `smartctl -H -A /dev/nvme0`, предупреждения smartd:
   [`disks.md`](disks.md) §6.
 - **Отказоустойчивость**: падение PostgreSQL/Redis не останавливает

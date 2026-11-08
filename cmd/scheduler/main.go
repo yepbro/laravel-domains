@@ -3,8 +3,10 @@
 // DispatchBatch, T-027), перевод в queued с lease и публикация пачек
 // DNSBatch в q:dns (EnqueueBatch/EnqueueLoop, T-028) — и фоновые циклы в
 // тех же OnRun: суточная перепроверка done-доменов (RecheckDaily, T-030),
-// повторные проверки temp_error (RetryTempErrors, T-031) и возврат
-// доменов с истёкшим lease (LeaseWatch, T-029). Публикация — под гейтом
+// повторные проверки temp_error (RetryTempErrors, T-031), возврат
+// доменов с истёкшим lease (LeaseWatch, T-029) и компенсатор «статус
+// повис» new∧done — ранний recheck потерявших q:http (StaleRequeueLoop,
+// T-270). Публикация — под гейтом
 // backpressure (WatermarkPublisher, T-026). Очередь — Redis Streams
 // (internal/queue, клиент queue.NewClient/RedisQueue); каркас —
 // internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz, /metrics,
@@ -122,7 +124,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			"zones", strings.Join(unknownZones, ", "))
 	}
 
-	bg := make(chan error, 6)
+	bg := make(chan error, 7)
 	go func() {
 		bg <- scheduler.RecheckDaily(ctx, pool, scheduler.RecheckOptions{
 			Interval: cfg.Scheduler.RecheckInterval.D(),
@@ -143,6 +145,18 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			Log:     logger,
 			// Счётчик ремонтного прохода queued/NULL queued_at (T-255,
 			// ФТ-1.2): ненулевой стационар — сигнал оператору.
+			Metrics: reg,
+		})
+	}()
+	go func() {
+		// Компенсатор «статус повис» (T-270, ФТ-2.2): часовой проход
+		// возвращает new∧done старше 24 ч (потеря задачи q:http) в
+		// pending; guard по строке new_done_stale — стационарно один
+		// PK-лукап за тик, счётчик
+		// crawler_scheduler_stale_requeued_total — сигнал о новых
+		// потерях.
+		bg <- scheduler.StaleRequeueLoop(ctx, pool, scheduler.StaleRequeueOptions{
+			Log:     logger,
 			Metrics: reg,
 		})
 	}()
@@ -184,6 +198,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		ZoneWeights: zoneWeights,
 		Log:         logger,
 	})
+	<-bg
 	<-bg
 	<-bg
 	<-bg

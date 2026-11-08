@@ -42,6 +42,14 @@
 //     noeviction (ТЗ 3.2) заполнение maxmemory — прокси-метрика
 //     предстоящих OOM-отказов записи, прямого счётчика отказов INFO
 //     не отдаёт;
+//   - рестарт Redis (T-270, ТЗ-fsm §3 ФТ-2.2) — uptime_in_seconds из
+//     INFO server (RedisUptimeSource, реализация RedisInfo —
+//     redisuptime.go) меньше окна AlertRedisRestartWindow: рестарт при
+//     отсутствии персистентности (docs/redis.md §5) теряет все
+//     недоставленные записи стримов — главная причина класса потерь
+//     «статус повис» (потерянные q:http при записанном done лечит
+//     компенсатор T-270), сигнал — в момент события, а не когортой
+//     gauge спустя сутки;
 //   - абсолютный минимум места на диске (T-162) — свободные байты
 //     каталога контента против monitor.alerts.disk_free_min_bytes
 //     (Warn) и disk_free_crit_bytes (эскалация отдельным алертом):
@@ -102,14 +110,16 @@
 //     crawler_counters new_done_stale (FILTER-колонка прохода
 //     реконсиляции zonestats.go: status = new ∧ check_state = done ∧
 //     last_checked_at старше суток — DNS записал «есть адреса», HTTP
-//     итог не пришёл: потеря задачи q:http, компенсатора нет)
+//     итог не пришёл: потеря задачи q:http)
 //     ненулевая в 2 НОВЫХ снапшотах реконсиляции подряд (серия — по
 //     смене updated_at строки: проходы алертов чаще источника,
 //     повторные чтения одного снапшота наблюдением не считаются).
 //     Точечное PK-чтение, без скана domains; стационарно ноль в норме.
-//     Автолечения нет — лечит регулярная перепроверка T-030, алерт
-//     только сигнал оператору (gauge crawler_domains_new_done_stale
-//     экспонирует уровень).
+//     Лечит компенсатор T-270 (ранний recheck Р15 спецификации
+//     check_state, часовой проход планировщика stalerequeue.go —
+//     его guard читает ту же строку); алерт остаётся сигналом о новых
+//     потерях (gauge crawler_domains_new_done_stale экспонирует
+//     уровень).
 //
 // Доставка (T-162): переходы алертов (срабатывание/снятие) уходят
 // оператору в Telegram — хук AlertsOptions.OnPass (TelegramNotifier,
@@ -196,6 +206,7 @@ const (
 	AlertUnitOOM          = "unit_oom"               // OOM/рестарты юнитов crawler (T-145)
 	AlertQueueDead        = "queue_dead"             // неразобранный q:dead (T-154)
 	AlertRedisMemory      = "redis_memory"           // память Redis у maxmemory (T-154)
+	AlertRedisRestart     = "redis_restart"          // рестарт Redis: недоставленные записи стримов потеряны (T-270)
 	AlertDiskMin          = "disk_free_min"          // абсолютный минимум места, Warn (T-162)
 	AlertDiskCrit         = "disk_free_crit"         // эскалация абсолютного минимума (T-162)
 	AlertMemHigh          = "memory_high"            // троттлинг MemoryHigh (T-162)
@@ -219,6 +230,7 @@ var alertDescs = map[string]string{
 	AlertUnitOOM:          "OOM-убийства и крэш-рестарты юнитов crawler",
 	AlertQueueDead:        "мертвые задачи в q:dead не разбираются",
 	AlertRedisMemory:      "память Redis у порога maxmemory",
+	AlertRedisRestart:     "рестарт Redis: недоставленные записи стримов потеряны (персистентности нет)",
 	AlertDiskMin:          "свободное место ниже абсолютного минимума",
 	AlertDiskCrit:         "свободное место ниже порога эскалации",
 	AlertMemHigh:          "троттлинг MemoryHigh юнита (устойчивый рост reclaim-событий)",
@@ -457,6 +469,21 @@ const (
 	// перезаписывается нулём и алерта не даёт (ревью T-256, P2-1).
 	// Стационарно ноль: норма не будит вовсе.
 	AlertNewDoneStalePasses = 2
+
+	// AlertRedisRestartWindow — окно «недавнего рестарта» Redis (T-270):
+	// uptime_in_seconds меньше окна — алерт redis_restart. 15 мин =
+	// 3 прохода алертов (5 мин, T-206): рестарт между проходами не
+	// проскакивает; после выхода из окна алерт снимается сам (uptime
+	// монотонно растёт — уровень, память машины не нужна, порог
+	// «без зазора» как у износа NVMe). Рестарт при отсутствии
+	// персистентности (docs/redis.md §5) теряет ВСЕ недоставленные
+	// записи стримов: q:dns самолечится lease T-029, потерянные q:http
+	// при записанном done — компенсатор T-270; сигнал оператору — в
+	// момент события (ожидать рост new_done_stale и всплеск
+	// crawler_scheduler_stale_requeued_total), а не когортой спустя
+	// сутки. Плановый рестарт алертится так же: потери недоставленного
+	// не зависят от намерений.
+	AlertRedisRestartWindow = 15 * time.Minute
 )
 
 // dnsDailyCountersSQL — числитель и знаменатель доли temp_error текущих
@@ -838,6 +865,10 @@ type AlertsDeps struct {
 	// cmd/monitor (RedisInfo того же клиента, что у гейта глубин,
 	// обёрнутая в метрики NewRedisMemoryMetrics).
 	RedisMemory RedisMemorySource
+	// RedisUptime — uptime_in_seconds из INFO server (T-270); nil —
+	// алерт redis_restart «не измеряется». Источник — тот же клиент
+	// Redis, что у памяти (cmd/monitor: RedisInfo).
+	RedisUptime RedisUptimeSource
 	// StreamGroups — группы рабочих стримов для алерта замороженной
 	// очереди (T-162); nil — алерт «не измеряется». Источником командует
 	// cmd/monitor (RedisStreamGroups того же клиента, что у гейта).
@@ -1046,6 +1077,7 @@ func NewAlerts(deps AlertsDeps, opts AlertsOptions) *Alerts {
 		a.newRenderFbBudgetMachine(),
 		a.newRenderBrowserErrMachine(),
 		a.newDomainsStaleMachine(),
+		a.newRedisRestartMachine(),
 	}
 	return a
 }
@@ -1751,6 +1783,41 @@ func (a *Alerts) newRedisMemoryMachine() *alertMachine[RedisMemory] {
 	}
 }
 
+// observeRedisUptime — аптайм Redis (INFO server, T-270): уровень,
+// монотонно растущий от запуска; рестарт обнуляет — окно «меньше N мин»
+// ловит событие без памяти машины.
+func (a *Alerts) observeRedisUptime(ctx context.Context) observation[int64] {
+	if a.deps.RedisUptime == nil {
+		return observation[int64]{reason: "источник не задан"}
+	}
+	up, err := a.deps.RedisUptime.RedisUptime(ctx)
+	if err != nil {
+		return observation[int64]{err: fmt.Errorf("monitor: аптайм Redis: %w", err)}
+	}
+	return observation[int64]{value: up.Seconds}
+}
+
+// newRedisRestartMachine — машина redis_restart (T-270): порог уровня
+// uptime — меньше окна (рестарт «недавно»); снятие — сам выход из окна,
+// track-память не нужна (thresholdTrack: uptime монотонен между
+// рестартами, дребезг у порога исключён механикой источника).
+func (a *Alerts) newRedisRestartMachine() *alertMachine[int64] {
+	window := int64(AlertRedisRestartWindow / time.Second)
+	uptime := func(v int64) string { return (time.Duration(v) * time.Second).Round(time.Second).String() }
+	return &alertMachine[int64]{
+		name: AlertRedisRestart,
+		track: thresholdTrack[int64]{
+			fire:     func(_ time.Time, v int64) bool { return v < window },
+			okDetail: func(_ time.Time, v int64) string { return "uptime " + uptime(v) },
+			hotDetail: func(_ time.Time, v int64) string {
+				return fmt.Sprintf("Redis запущен %s назад — недоставленные записи стримов потеряны (персистентности нет, docs/redis.md §5); ожидать рост new_done_stale и возврат когорты компенсатором T-270",
+					uptime(v))
+			},
+		},
+		eval: a.observeRedisUptime,
+	}
+}
+
 // observePSI — давление CPU /proc/pressure/cpu (some avg10/60/300 —
 // метрика some: задержка хотя бы одной задачи, не full и не load
 // average: утилизация 100 % без очереди — норма CPU-bound конвейера).
@@ -1954,15 +2021,16 @@ func (a *Alerts) newRenderBrowserErrMachine() *alertMachine[int64] {
 // (T-256, ФТ-2.2): домены «статус повис» (status = new ∧ check_state =
 // done ∧ last_checked_at старше суток; DNS-этап записал ветку «есть
 // адреса» — О6 общей таблицы статусов internal/model/enums.go, HTTP-итог
-// О7–О9 не пришёл: задача q:http потеряна, компенсатора нет). Значение
+// О7–О9 не пришёл: задача q:http потеряна). Значение
 // пишет FILTER-колонка f_new_done_stale прохода реконсиляции
 // (zonestats.go), алерт читает его точечным лукапом — seq scan по
 // domains не добавляет; updated_at — метка снапшота (серия растёт
 // только на НОВОМ снапшоте — track машины). Пустой результат (строки
 // нет до первого прохода реконсиляции — обе петли monitor стартуют
 // вместе, корректного «нет строки» не бывает) — тихое «не измеряется»;
-// ошибка чтения — Warn. Автолечения нет — лечит регулярная перепроверка
-// T-030: алерт только сигнал, уровень наблюдаем gauge'ом
+// ошибка чтения — Warn. Когорту лечит компенсатор T-270 (ранний recheck
+// Р15, stalerequeue.go — guard прохода читает ту же строку): алерт —
+// сигнал о новых потерях, уровень наблюдаем gauge'ом
 // crawler_domains_new_done_stale.
 func (a *Alerts) observeDomainsNewDoneStale(ctx context.Context) observation[staleRow] {
 	rows, err := a.deps.Pool.Query(ctx, newDoneStaleSQL)

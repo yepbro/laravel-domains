@@ -222,7 +222,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`; сборка воркера B фолбэка — `q:render-fallback`, T-236/T-240), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`); ряд `queue="q:render-fallback"` — остаток для баланс-чека фолбэка (T-245: `published = consumed + остаток + похороненные` — формула и границы применимости в решениях ниже, шаг 4 приёмки ТЗР рендера §6.2) |
 | `crawler_render_pending_domains` | gauge | — | monitor (T-175) | цикл рендер-долга (`monitor.render_debt_interval`, 5 мин): домены с битом `render_pending` — счётчик `crawler_counters['render_pending']` (миграция 000015) ведут переходы бита в транзакции перехода; авторитетное значение периодически перезаписывает реконсиляция T-178 (наблюдаемость без seq scan по 41,8 млн строк; лаг `q:render` — `crawler_queue_depth{queue="q:render"}`, долг = сумма — алерт `render_debt` и строка отчёта нагрузки T-173) |
-| `crawler_domains_new_done_stale` | gauge | — | monitor (T-256) | домены «статус повис» (ТЗ-fsm §3 ФТ-2.2): `status = new ∧ check_state = done ∧ last_checked_at` старше суток — DNS-этап записал ветку «есть адреса» (О6 таблицы решений статусов, `internal/model/enums.go`), HTTP-итог не пришёл (потеря задачи `q:http`, компенсатора нет). Значение — FILTER-колонка `f_new_done_stale` прохода реконсиляции (строка `crawler_counters['new_done_stale']`), обновляется раз в `monitor.zone_stats_interval`; стационарно 0 в норме, ненулевое — алерт `domains_new_done_stale` (2 ненулевых снапшота реконсиляции подряд), автолечения нет — лечит регулярная перепроверка T-030 |
+| `crawler_domains_new_done_stale` | gauge | — | monitor (T-256) | домены «статус повис» (ТЗ-fsm §3 ФТ-2.2): `status = new ∧ check_state = done ∧ last_checked_at` старше суток — DNS-этап записал ветку «есть адреса» (О6 таблицы решений статусов, `internal/model/enums.go`), HTTP-итог не пришёл (потеря задачи `q:http`). Значение — FILTER-колонка `f_new_done_stale` прохода реконсиляции (строка `crawler_counters['new_done_stale']`), обновляется раз в `monitor.zone_stats_interval`; стационарно 0 в норме, ненулевое — алерт `domains_new_done_stale` (2 ненулевых снапшота реконсиляции подряд): когорту лечит компенсатор T-270 (`scheduler/stalerequeue.go`, счётчик `crawler_scheduler_stale_requeued_total`), gauge — сигнал о новых потерях |
 | `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод в q:dead задачи с task_id (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; переводы неидентифицируемых записей (без `task_id`) считает соседний `crawler_queue_dead_unidentified_total`; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
 | `crawler_queue_dead_unidentified_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-260) | карантин неидентифицируемых записей: запись PEL без `task_id` (тело вне форматов пакета) исчерпала попытки и переведена в q:dead с синтетическим `task_id` `unknown:<stream>:<entry-id>`, без предметных полей (`Reliab.bury`, терминальная ветка ФТ-6.1 ТЗ-fsm; хук `ReliabOptions.OnBuryUnidentified` ← `metrics.NewDeadUnidentifiedHook`) — до T-260 такие записи крутились вечным циклом клейма в PEL; стационарно ноль, рост — записи публикуются мимо контракта пакета (ручной XADD, баг писателя): найти источник по `entry_id`, разбор — runbooks.md §2 |
 | `crawler_db_deadlock_retried_total` | counter | — | dns-worker, http-worker, scheduler (T-268) | повторы операторов БД после дедлока 40P01 (`db.RetryDeadlock`, страховка поверх инварианта порядка блокировок счётчиков T-267): http-worker — транзакция записи результата целиком (`RecordAndPublish`), dns-worker — autocommit-операторы записи эпизода (`RecordEpisode`: перевод в done, инкремент корзины `retry_mature`, диагноз invalid) без повторного DNS-эпизода, scheduler — транзакция решения ретрая temp_error (`retryDecide`); дренаж ретрая переживает ошибку пачки (до 3 подряд). Единичные события — норма (страховка работает, задача не уходит в ределивери полным эпизодом); устойчивый рост — новый цикл блокировок: разбор runbooks.md §2.8 |
@@ -230,6 +230,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_backlog_domains` | gauge | `state` | scheduler (`pending`, `queued`) | суммы инкрементальных счётчиков зон (T-178: `sum(zones.domains_pending/queued)`, базовое множество `status <> deleted`) с периодом `scheduler.backlog_interval` (по умолчанию 5 мин) — `scheduler.BacklogLoop`: чтение справочника вместо прохода по 47 млн строк (ТЗИ §8.4) |
 | `crawler_backlog_pass_seconds` / `crawler_backlog_skipped_ticks_total` | histogram / counter | — | scheduler (T-161) | каждый проход backlog: длительность (проход — суммы справочника, T-178) и пропущенные тики single-flight (проход дольше интервала — накопившийся тик не запускает новый проход, Warn в журнале); рост пропусков — поднимать `scheduler.backlog_interval` |
 | `crawler_scheduler_lease_null_returned_total` | counter | — | scheduler (T-255) | терминальная страховка инварианта T-028 «queued ⇒ queued_at NOT NULL»: ремонтный проход цикла LeaseWatch (`LeaseNullOnce`, ФТ-1.2) вернул строки `check_state=queued` с NULL `queued_at` в pending (без страховки — вечное зависание: NULL отсеивается сравнением возраста lease-прохода; спецификация автомата — `internal/scheduler/checkstate.go`). Каждое событие — одна возвращённая строка; стационарно ноль, ненулевой темп роста — ручной SQL или баг писателя, ставящего queued без отметки: разбор runbooks.md §2.9 |
+| `crawler_scheduler_stale_requeued_total` | counter | — | scheduler (T-270) | компенсатор «статус повис» (ФТ-2.2 ТЗ-fsm, переход Р15 спецификации `check_state`): часовой цикл `StaleRequeueLoop` (`StaleRequeueOnce`) вернул в pending домены `status=new ∧ check_state=done` с `last_checked_at` старше суток — задачу q:http потеряна после XADD (рестарт Redis без персистентности, OOM-окно), lease-проход (только queued) и возрастная перепроверка (recheck_interval, месяцы) строку не возвращают; выборка — seq scan с ранним остановом под guard-ом строки `new_done_stale` (стационарно один PK-лукап за тик, domains не сканируются). Каждое событие — одна переведённая строка (по RETURNING после охран); стационарно ноль, рост — потери q:http (уровень — gauge `crawler_domains_new_done_stale`, сигнал момента — алерт `redis_restart`); у границы суток непустой q:http даёт штатный полуночный борт живых доставок (окно зреет когортами в полночь по date-колонке — дубль эпизода гасится асимметрией А3, не потери): разбор runbooks.md §2.10 |
 | `crawler_counters_recount_seconds` / `crawler_zonestats_skipped_ticks_total` | histogram / counter | — | monitor (T-161/T-178) | каждый проход совмещённой реконсиляции счётчиков (агрегаты domains/laravel_domains/laravel_history → zones + crawler_counters): длительность (корзины 0.5с…~8.5 мин — замер §12: десятки секунд на 47 млн строк) и пропущенные тики single-flight; `crawler_counters_recount_seconds` — переименование `crawler_zonestats_pass_seconds` (T-178) |
 | `crawler_counters_drift` | gauge | `counter` | monitor (T-178) | дрейф инкрементальных счётчиков на проходе реконсиляции: \|старое − новое\| по позициям `zone:<id>:<колонка>` / `global:<имя>` / `daily:checks` (статусные строки вне дрейфа — пишутся одной реконсиляцией); стационар стремится к нулю (проход — три оператора под READ COMMITTED, единичный транзиентный дрейф под нагрузкой нормален), устойчивый ненулевой — пропущенный переход или ручной SQL мимо кода (Warn в журнале, разбор — `docs/runbooks.md`); исключения — потоковые позиции: `daily:checks`/`daily:temp_error` (T-179/T-182: события записи результата HTTP против доменов дня всех веток конвейера), `retry_mature:past`/`retry_mature:today` (T-202: события temp_error-эпизодов/ретраев против живых доменов фильтра зрелости), `rendered:prev`/`rendered:cur`/`results:prev`/`results:cur` (T-203: события вставки строк/перевода в rendered против живых строк окна темпа; prev/cur — предыдущий и текущий календарный час) и `reanalyze:prev`/`reanalyze:cur` (T-204: события записи/рендера/штампа против живых NULL-строк окна — корзины хвостов переанализа) — ненулевые под живой нагрузкой, наблюдаются gauge, в Warn не входят |
 | `crawler_pg_slow_queries` | gauge | — | monitor (T-177) | проход цикла медленных запросов: клиентские операторы PostgreSQL, выполняемые дольше `monitor.slow_query_min_duration` на момент снимка `pg_stat_activity` (собственные агрегаты monitor исключены `application_name`); hold-last при сбое источника |
@@ -362,7 +363,17 @@ T-109) и повторных проверок `temp_error`
 результата (обе ветки temp_error — HTTP и DNS-этап), декременты —
 решения ретрая, авторитет — реконсиляция (строки
 `retry_mature:YYYY-MM-DD`, `docs/schema.md`); стационар без зрелых не
-трогает `domains` вовсе). Решения пачки (назначение повтора и итоговый
+трогает `domains` вовсе) и компенсатора «статус повис»
+(`StaleRequeueLoop`, T-270 — ранний recheck доменов `new ∧ done`
+старше 24 ч: потерянная после XADD задача `q:http` не возвращается ни
+lease (строка вне queued), ни возрастной перепроверкой (месяцы);
+порог — окно gauge `new_done_stale` (ФТ-2.2), guard — точечное чтение
+строки уровня: стационарно один PK-лукап за часовой тик, `domains` не
+сканируется; выборка пачки — тот же приём T-191: seq scan с ранним
+остановом `LIMIT` под закреплением `SET LOCAL`, перевод — отдельной
+транзакцией PK-пробами под 40P01-ретраем; дельты зон и счётчик
+`crawler_scheduler_stale_requeued_total` ведёт оператор перевода,
+дубль q:http ожившего воркера гасится асимметрией А3). Решения пачки (назначение повтора и итоговый
 статус) идут раздельными транзакциями под 40P01-ретраем (T-268,
 `retryDecide` — повтор целиком, счётчик
 `crawler_db_deadlock_retried_total`): каждая соблюдает порядок
@@ -1028,6 +1039,21 @@ pid+query_start: оператор сообщается один раз при п
   (межобрезочные остатки TrimLoop, фрагментация, буферы) — прокси
   предстоящих отказов. `maxmemory` 0 (потолка нет) — «не измеряется»:
   отношение не определено;
+- **рестарт Redis** (T-270, алерт `redis_restart`) — `uptime_in_seconds`
+  из `INFO server` (источник `RedisInfo` того же клиента, что у памяти)
+  меньше окна `AlertRedisRestartWindow` (15 мин = 3 прохода алертов:
+  рестарт между проходами не проскакивает): рестарт при отсутствии
+  персистентности (redis.md §5) теряет ВСЕ недоставленные записи
+  стримов — главная причина класса потерь «статус повис» ФТ-2.2
+  (инцидент 22.10: когорта 1865 доменов, gauge T-256); q:dns
+  самолечится lease T-029, потерянные q:http при записанном done
+  вернёт компенсатор T-270 — сигнал оператору в момент события
+  (ожидать рост `new_done_stale` и возврат когорты
+  `crawler_scheduler_stale_requeued_total`), а не когортой gauge спустя
+  сутки. Уровень монотонен между рестартами: снятие — сам выход из
+  окна, память машины не нужна (гистерезис не требуется); плановый
+  рестарт алертится так же — потери недоставленного от намерений
+  не зависят;
 - **абсолютный минимум места на диске** (T-162) — свободные байты
   каталога контента против `monitor.alerts.disk_free_min_bytes`
   (15 GiB, Warn) и `disk_free_crit_bytes` (10 GiB, эскалация отдельным
@@ -1171,7 +1197,7 @@ pid+query_start: оператор сообщается один раз при п
   домены `status = new ∧ check_state = done ∧ last_checked_at` старше
   суток — DNS-этап записал ветку «есть адреса» (О6 таблицы решений
   статусов, `internal/model/enums.go`), а HTTP-итог (О7–О9) не пришёл:
-  потеря задачи `q:http`, компенсатора нет (спецификация автомата
+  потеря задачи `q:http` (спецификация автомата
   `status` — там же; ветки этапов — `internal/dnsworker/result.go`,
   `internal/httpworker/record.go`). Источник — точечное PK-чтение
   строки (значение пишет FILTER-колонка `f_new_done_stale` прохода
@@ -1186,9 +1212,11 @@ pid+query_start: оператор сообщается один раз при п
   перезаписывается нулём и алерта не даёт, ≈1 ч устойчивого значения),
   удержание — любая ненулевая, снятие — ноль (стиль `queue_dead`).
   Стационарно 0 в норме; строки нет до первого прохода реконсиляции —
-  тихое «не измеряется». Автолечения нет: лечит регулярная
-  перепроверка T-030 (~6 мес), алерт — сигнал оператору (разбор —
-  operations.md §4.4).
+  тихое «не измеряется». Когорту лечит компенсатор T-270 (ранний
+  recheck Р15 спецификации `check_state`, `scheduler/stalerequeue.go`:
+  часовой проход возвращает new∧done старше 24 ч в `pending` —
+  `crawler_scheduler_stale_requeued_total`); алерт остаётся сигналом
+  оператору о новых потерях (разбор — operations.md §4.4).
 
 Доставка алертов оператору (T-162, ТЗ 5.9/10.4): переходы состояний
 (срабатывание/снятие) уходят в Telegram тем же ботом и группой, что

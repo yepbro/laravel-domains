@@ -54,6 +54,7 @@
 //	| Р12 | done | массовый recheck субдомена (справочник целиком или зона) | check_state = done, status <> deleted, (опционально zone_id) — порога возраста НЕТ (перепроверить надо все готовые) | pending | queued_at = NULL; зоны checked −n / pending +n | cmd/crawlerctl/manage.go subdomainRecheck*SQL (T-084) |
 //	| Р13 | queued, pending | диагноз ядовитой строки (пустое имя — проверка невозможна детерминированно) | status <> deleted, check_state <> done | done (status = invalid) | queued_at = NULL; temp_attempts = 0; снятие http_published; зоны по старому состоянию; invalid не возвращается перепроверкой Р7 — выход один: ручной разбор | dnsworker/result.go resultInvalidSQL (T-109) |
 //	| Р14 | любое | delete-файл | строка не deleted | check_state НЕ меняется (status = deleted) | удаляется из цикла охранными предикатами всех проходов; результаты чистит T-020; счётчики зон total −n и колонка старого состояния −n | ingest/apply_delete.go (T-019) |
+//	| Р15 | done | компенсатор «статус повис» (ранний recheck: О6 без О7–О9 — задача q:http потеряна после XADD) | check_state = done, status = new, last_checked_at < now() − 24 ч (NULL отсеивается сравнением; date-точность колонки делает порог эквивалентом last_checked_at < current_date — окно gauge ФТ-2.2, когорта зреет в полночь по прецеденту T-031/T-202: полуночный борт живых доставок q:http дренируется с дублем эпизода — плата date-гранулярности, гасится А3) | pending | queued_at = NULL (у done уже NULL); статус-итог и temp_attempts сохраняются (new — не temp_error); бит http_published НЕ трогается — снимет постановка Р1 нового эпизода (И4); зоны checked −n / pending +n; счётчик crawler_scheduler_stale_requeued_total; переиздание потерянного сообщения невозможно (HTTPTask несёт адреса субдоменов, нигде не хранятся, internal/queue/message.go) — только возврат в pending через диспетчер | stalerequeue.go StaleRequeueOnce (T-270, ФТ-2.2) |
 //
 // Не-переходы (наблюдения, check_state не меняют):
 //
@@ -76,7 +77,7 @@
 //	    строка зависает в queued навсегда. Терминальная страховка —
 //	    ремонтный проход Р6 того же цикла LeaseWatch (ФТ-1.2, leasenull.go).
 //	И2  pending ⇒ queued_at IS NULL: у pending нет аренды — каждый писатель
-//	    перевода в pending сбрасывает отметку (Р5–Р12).
+//	    перевода в pending сбрасывает отметку (Р5–Р12, Р15).
 //	И3  done ⇒ queued_at IS NULL: запись результата завершает аренду (Р2–Р4,
 //	    Р13); ненулевая отметка остаётся только у queued-строк.
 //	И4  единственный переход в queued — постановка планировщика Р1: любой

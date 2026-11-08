@@ -54,8 +54,9 @@
 //     устаревшие удаляет), new_done_stale — домены «статус повис»
 //     (status = new ∧ check_state = done ∧ last_checked_at старше
 //     суток, ФТ-2.2 ТЗ-fsm: FILTER-колонка f_new_done_stale того же
-//     скана; стационарно ноль — норма, автолечения нет — gauge/алерт
-//     сигнал оператору);
+//     скана; стационарно ноль — норма; лечит компенсатор T-270 —
+//     scheduler/stalerequeue.go, guard часового прохода читает эту
+//     строку; gauge/алерт — сигнал о новых потерях);
 //   - дрейф |старое − новое| каждой позиции: до перезаписи читаются
 //     прежние значения, после — новые (транзакция видит собственную
 //     запись); ненулевой дрейф — gauge crawler_counters_drift + Warn
@@ -189,7 +190,7 @@ func init() {
 // T-256): status = new ∧ check_state = done ∧ last_checked_at <
 // current_date — DNS-этап записал ветку «есть адреса» (О6 общей
 // таблицы статусов, internal/model/enums.go), а HTTP-итог (О7–О9) не
-// пришёл (задача q:http потеряна, компенсатора нет). Граница суток —
+// пришёл (задача q:http потеряна). Граница суток —
 // точность колонки last_checked_at (date, ТЗ 6.1), та же реализация
 // «старше 24 ч», что у окна ретрая T-031/T-202 (retrySelectSQL:
 // date < now() − 24ч эквивалентно date < current_date). NULL
@@ -640,7 +641,8 @@ const (
 // ретрая и часовых корзин), в unnest-пачке с Go-именами их нет.
 // new_done_stale (ФТ-2.2) — абсолютный уровень, как status_*: пишется
 // только реконсиляцией (инкрементов нет), читается точечным лукапом
-// алерта domains_new_done_stale и gauge'ом цикла.
+// алерта domains_new_done_stale, gauge'ом цикла и guard'ом компенсатора
+// T-270 (scheduler/stalerequeue.go).
 func CounterNames() []string {
 	names := make([]string, 0, len(model.Statuses)+4)
 	for _, s := range model.Statuses {
@@ -842,7 +844,9 @@ type ZoneStatsResult struct {
 	// строки new_done_stale и gauge crawler_domains_new_done_stale
 	// (цикл ZoneStatsLoop). Стационарно ноль в норме; ненулевое —
 	// потерянная задача q:http (О6 без О7–О9, общая таблица статусов
-	// internal/model/enums.go), автолечения нет — сигнал оператору.
+	// internal/model/enums.go) — лечит компенсатор T-270 (guard его
+	// часового прохода — чтение этой строки), gauge остаётся сигналом
+	// о новых потерях.
 	NewDoneStale int64
 }
 
@@ -1725,7 +1729,7 @@ func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
 		}, "counter"),
 		newDoneStale: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_domains_new_done_stale",
-			Help: "Домены «статус повис» (ФТ-2.2 ТЗ-fsm, T-256): status = new ∧ check_state = done ∧ last_checked_at старше суток — DNS-этап записал ветку «есть адреса», HTTP-итог не пришёл (потеря задачи q:http, компенсатора нет). Значение — FILTER-колонка прохода реконсиляции (строка crawler_counters new_done_stale, без seq scan по domains), обновляется раз в monitor.zone_stats_interval. Стационарно 0 в норме; ненулевое — алерт domains_new_done_stale (стрик 2 прохода), автолечения нет — лечит регулярная перепроверка; спецификация автомата статусов — internal/model/enums.go.",
+			Help: "Домены «статус повис» (ФТ-2.2 ТЗ-fsm, T-256): status = new ∧ check_state = done ∧ last_checked_at старше суток — DNS-этап записал ветку «есть адреса», HTTP-итог не пришёл (потеря задачи q:http). Значение — FILTER-колонка прохода реконсиляции (строка crawler_counters new_done_stale, без seq scan по domains), обновляется раз в monitor.zone_stats_interval. Стационарно 0 в норме; ненулевое — алерт domains_new_done_stale (стрик 2 прохода): когорту лечит компенсатор T-270 (ранний recheck new∧done, crawler_scheduler_stale_requeued_total; спецификация — internal/model/enums.go), gauge — сигнал о новых потерях.",
 		}),
 	}
 }
