@@ -242,6 +242,13 @@ MUTATION_MIN_SCORE ?= 0
 .PHONY: mutate
 mutate: ## Мутационное тестирование go-mutesting (отчёт var/mutation/)
 	$(check_env)
+	# Каталог отчётов создаём на хосте ДО compose run: на чистом
+	# чекауте (CI) var/ отсутствует, и недостающие хост-пути bind-маунтов
+	# (./var/incoming, ./var/content и родителя var/) демон docker
+	# создаёт от root — после этого непривилегированный контейнер
+	# (user DEV_UID) не может создать var/mutation в bind /src
+	# (Permission denied; мутационный CI падал так с первого прогона).
+	mkdir -p var/mutation
 	$(COMPOSE) run --rm \
 		-e MUTATE_PKGS='$(PKGS)' \
 		-e MUTATE_TIMEOUT='$(MUTATE_TIMEOUT)' \
