@@ -55,6 +55,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -1325,7 +1326,11 @@ func workerReadBody(res *httpfetch.FetchResult) ([]byte, error) {
 // публикации (InfraError: OOM Redis/соединение, T-152) останавливает
 // чтение сразу и до восстановления записи (Reliab.Writable): публикации
 // всё равно падают, а обработки без шанса записать результат только
-// копят pending.
+// копят pending. Режимы читателя (чтение | пауза-браузер | пауза-инфра
+// | пауза-предохранитель | пауза-темп; браузер и темп в q:http
+// структурно недостижимы) формализованы автоматом readerstate.go
+// (T-262, ТЗ-fsm §3 ФТ-8): режим прохода выбирает одна функция над
+// наблюдениями, порядок приоритетов пауз — таблица переходов там же.
 func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	if q == nil {
 		return errors.New("httpworker: цикл воркера: очередь не задана")
@@ -1389,7 +1394,9 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	// (OOM/соединение Redis, T-152): чтение q:http приостанавливается
 	// до восстановления записи (Reliab.Writable) — Redis всё равно
 	// отвергает XADD результатов, новые доставки только копились бы
-	// в pending без шанса опубликоваться.
+	// в pending без шанса опубликоваться. Наблюдение infra автомата
+	// режимов читателя (readerstate.go, T-262): флаг ставит диспетчер
+	// ниже (queue.IsInfra), гасят проба записи или успех обработки.
 	var infraDown atomic.Bool
 	readerDone := make(chan struct{})
 	go func() {
@@ -1397,39 +1404,53 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 		failStreak := 0  // подряд выдержанных пауз предохранителя
 		infraStreak := 0 // подряд выдержанных пауз инфраструктуры
 		for {
-			// Пауза потребления при устойчивой InfraError публикации
-			// (T-152): пока проба записи падает — чтение не ведётся
-			// (предохранитель ниже считал бы те же неудачи дольше и
-			// читал бы пачки между паузами). Проба — один SET; после
-			// восстановления записи чтение возобновляется немедленно.
-			if infraDown.Load() {
-				if o.Recover != nil && !o.Recover.Writable(ctx) {
-					infraStreak++
-					pause := workerFailBackoff(infraStreak)
-					log.Warn("пауза чтения q:http: публикация результатов падает об инфраструктуру Redis (OOM/соединение) — новые доставки не читаются (T-152)",
-						"streak", infraStreak, "wait", pause.String())
-					wait(pause)
-					if ctx.Err() != nil {
-						return // graceful shutdown: wait вышел по отмене
-					}
-					continue
-				}
-				infraDown.Store(false)
-				infraStreak = 0
-				if o.Recover != nil {
-					log.Info("запись в Redis восстановлена — чтение q:http возобновляется")
-				}
+			// Наблюдения прохода (ФТ-8, readerstate.go): датчики
+			// опрашиваются только смонтированными (Writable — проба
+			// записи при горящем флаге T-152, один SET), режим прохода
+			// выбирает readerDecide — порядок приоритетов пауз живёт
+			// в таблице переходов, а не в порядке if. Браузера
+			// (Options.Alive — зонд renderworker) и потолка темпа
+			// (Options.Rate, T-240) в q:http нет: режимы пауза-браузер
+			// и пауза-темп входят в enum для паритета автомата
+			// (ФТ-8) и структурно недостижимы — browser/rate нулевые.
+			obs := readerObs{
+				infra:  infraDown.Load(),
+				failed: failed.Load(),
+				batch:  o.Consume,
 			}
-			// Предохранитель (workerFailWaitBase): доставки, подряд
-			// оставшиеся без подтверждения числом в целую пачку чтения
-			// (Consume) без единого успеха — систематический сбой
-			// обработки (Options.OnResult/БД); пауза с удвоением до
-			// DefaultErrorWait. Подтверждённая доставка обнуляет счётчик
-			// неудач сразу, серия пауз сбрасывается на следующей
-			// итерации читателя, увидевшей счётчик нулевым.
-			if n := failed.Load(); n == 0 {
-				failStreak = 0
-			} else if int(n) >= o.Consume {
+			if obs.infra {
+				// Проба записи — только при горящем флаге (T-152):
+				// после восстановления записи чтение возобновляется
+				// немедленно. Датчика Recover нет — флаг гасится
+				// возобновлением ниже (успех обработки снимет и так).
+				obs.writable = o.Recover == nil || o.Recover.Writable(ctx)
+			}
+			switch readerDecide(obs) {
+			case modePauseInfra:
+				// Пауза потребления при устойчивой InfraError публикации
+				// (T-152): пока проба записи падает — чтение не ведётся
+				// (предохранитель ниже считал бы те же неудачи дольше и
+				// читал бы пачки между паузами).
+				infraStreak++
+				pause := workerFailBackoff(infraStreak)
+				log.Warn("пауза чтения q:http: публикация результатов падает об инфраструктуру Redis (OOM/соединение) — новые доставки не читаются (T-152)",
+					"streak", infraStreak, "wait", pause.String())
+				wait(pause)
+				if ctx.Err() != nil {
+					return // graceful shutdown: wait вышел по отмене
+				}
+				continue
+			case modePauseFail:
+				// Предохранитель (workerFailWaitBase): доставки, подряд
+				// оставшиеся без подтверждения числом в целую пачку
+				// чтения (Consume) без единого успеха — систематический
+				// сбой обработки (Options.OnResult/БД); пауза с
+				// удвоением до DefaultErrorWait. После паузы проход
+				// читает (ФТ-8): предохранитель душит темп, но не
+				// блокирует чтение до нулевого счётчика. Подтверждённая
+				// доставка обнуляет счётчик неудач сразу, серия пауз
+				// сбрасывается на следующем проходе читателя, увидевшем
+				// счётчик нулевым.
 				if ctx.Err() != nil {
 					return // graceful shutdown: паузы не было и не будет
 				}
@@ -1440,11 +1461,28 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 				// Warn с серией и числом неудач (частота ограничена
 				// удвоением паузы, не чаще ~2/мин на серии).
 				log.Warn("пауза предохранителя чтения q:http: доставки падают подряд",
-					"failed", n, "streak", failStreak, "wait", pause.String())
+					"failed", obs.failed, "streak", failStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
 					return // graceful shutdown: wait вышел по отмене
 				}
+			}
+			// Возобновление после инфра-паузы (T-152): флаг горел
+			// в наблюдениях прохода, а режим — уже не пауза-инфра:
+			// проба записи прошла (или датчика нет — флаг гасит
+			// успех обработки). Флаг гасится, серия инфра-пауз
+			// начинается заново (погашенный успехом флаг серию не
+			// сбрасывает — как и до T-262).
+			if obs.infra && infraDown.Swap(false) {
+				infraStreak = 0
+				if o.Recover != nil {
+					log.Info("запись в Redis восстановлена — чтение q:http возобновляется")
+				}
+			}
+			// Серия пауз предохранителя сбрасывается наблюдением
+			// нулевого счётчика неудач (подтверждённая доставка).
+			if failed.Load() == 0 {
+				failStreak = 0
 			}
 			deliveries, err := q.Consume(ctx, queue.StreamHTTP, o.Group, o.Consumer, o.Consume)
 			if err != nil {
@@ -1492,6 +1530,23 @@ dispatch:
 		go func(d queue.Delivery) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// Паника доставки не должна ронять процесс без лога и
+			// очистки — recover-паритет с renderworker (T-262,
+			// ТЗ-fsm §3 ФТ-8): panic → Error-лог, доставка без XACK
+			// вернётся повторной доставкой (XAUTOCLAIM, T-025);
+			// in-flight соседей и graceful shutdown сохраняются.
+			// Покрытие — горутина доставки; клейм-путь RecoverLoop —
+			// как в renderworker-образце, без recover (границы
+			// покрытия — readerstate.go). Для предохранителя паника —
+			// та же неподтверждённая доставка: серия паник пережигала
+			// бы попытки без паузы.
+			defer func() {
+				if r := recover(); r != nil {
+					failed.Add(1)
+					log.Error("паника обработки доставки",
+						"entry", d.ID, "panic", r, "stack", string(debug.Stack()))
+				}
+			}()
 			err := queue.Processing(ctx, q, o.Group, d, func(c context.Context, del queue.Delivery) error {
 				return w.processDelivery(c, del, o)
 			})

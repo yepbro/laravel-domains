@@ -1200,6 +1200,13 @@ func (q *workerFakeQueue) ackedCount() int {
 	return len(q.acked)
 }
 
+// ackedSnapshot — копия подтверждённых ID (порядок сохранён).
+func (q *workerFakeQueue) ackedSnapshot() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([]string(nil), q.acked...)
+}
+
 func (q *workerFakeQueue) consumeCount() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -1602,6 +1609,214 @@ func TestWorkerRunInfraPause(t *testing.T) {
 			t.Fatalf("после восстановления записи подтверждено %d, хочу ≥2", q.ackedCount())
 		case <-time.After(2 * time.Millisecond):
 		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+}
+
+// TestWorkerRunPanicRecovered — recover-паритет паник доставки
+// (T-262, ТЗ-fsm §3 ФТ-8; образец — TestRenderWorker_RunPanicRecovered):
+// паника обработки одной доставки (Options.OnResult — точка записи
+// результата, синхронный стек горутины доставки) не роняет процесс —
+// паникующая запись не подтверждается, соседняя доставка окна
+// дорабатывается и подтверждается, цикл жив до отмены ctx. До T-262
+// паника в горутине доставки убивала юнит http-worker целиком.
+// (Паника в шве загрузки живёт в горутинах PerDomain — тех этот
+// recover и прежде не накрывал, здесь не моделируется.)
+func TestWorkerRunPanicRecovered(t *testing.T) {
+	panicBody := "<html>" + strings.Repeat("страница паникующей доставки ", 30) + "</html>"
+	okBody := "<html>" + strings.Repeat("страница здоровой доставки цикла ", 30) + "</html>"
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"panic.test": {status: 200, body: panicBody},
+		"ok.test":    {status: 200, body: okBody},
+	})
+	w := workerWorker(t, fetch, nil)
+
+	task1 := queue.HTTPTask{TaskID: "task-1", ZoneID: 5, DomainID: 42, Name: "panic.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}
+	task2 := queue.HTTPTask{TaskID: "task-2", ZoneID: 5, DomainID: 43, Name: "ok.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}
+	payload2, err := json.Marshal(task2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := &workerFakeQueue{deliveries: []queue.Delivery{
+		workerDelivery(t, task1),
+		{Stream: queue.StreamHTTP, ID: "e2", Payload: payload2},
+	}}
+
+	// Паникующая доставка обязана дойти до обработки результата ДО
+	// отмены (по образцу ревью T-142 P2-4): отмена сразу после XACK
+	// соседа оставляла recover-ветку недетерминированной.
+	panicHit := make(chan struct{}, 1)
+	opts := Options{Concurrency: 2, Consume: 2, OnResult: func(_ context.Context, res *DomainResult) error {
+		if res.Name == "panic.test" {
+			select {
+			case panicHit <- struct{}{}:
+			default:
+			}
+			panic("обработка результата упала: запись в БД")
+		}
+		return nil
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	deadline := time.After(5 * time.Second)
+	select {
+	case <-panicHit:
+	case <-deadline:
+		cancel()
+		t.Fatal("паникующая доставка не дошла до обработки результата")
+	}
+
+	// Соседняя доставка обязана доработать и подтвердиться, несмотря
+	// на панику первой.
+	for q.ackedCount() == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("XACK здоровой доставки не наступил (паника убила цикл?)")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run после отмены: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не завершился после отмены ctx")
+	}
+	if acked := q.ackedSnapshot(); len(acked) != 1 || acked[0] != "e2" {
+		t.Errorf("XACK = %v, нужен только e2 (паникующая e1 — без XACK)", acked)
+	}
+}
+
+// workerPanicQueue — бесконечный источник валидных задач q:http
+// паникующего домена (T-262): Decode проходит, загрузка паникует
+// (recover в горутине доставки, паритет с renderworker) — доставки
+// без XACK; скорость чтений душит предохранитель, паники учтены
+// счётчиком failed как неудачи.
+type workerPanicQueue struct {
+	payload []byte // задача паникующего домена
+
+	mu       sync.Mutex
+	consumes int
+}
+
+func (q *workerPanicQueue) Publish(context.Context, string, queue.Message) (string, error) {
+	return "", nil // до публикации паникующая доставка не доходит
+}
+
+func (q *workerPanicQueue) Consume(_ context.Context, _, _, _ string, n int) ([]queue.Delivery, error) {
+	if n < 1 {
+		n = 1
+	}
+	out := make([]queue.Delivery, n)
+	for i := range out {
+		out[i] = queue.Delivery{Stream: queue.StreamHTTP, ID: fmt.Sprintf("panic-%d", i), Payload: q.payload}
+	}
+	q.mu.Lock()
+	q.consumes++
+	q.mu.Unlock()
+	return out, nil
+}
+
+func (q *workerPanicQueue) Ack(context.Context, string, string, ...string) error {
+	panic("workerPanicQueue: Ack недостижим — паникующие доставки не подтверждаются")
+}
+
+func (q *workerPanicQueue) consumeCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.consumes
+}
+
+// TestWorkerRunPanicBackoff — паники в счётчике предохранителя
+// (T-262, паритет с TestRenderWorker_RunPanicBackoff): серия паникующих
+// доставок без единого подтверждения — та же серия неудач, что и
+// ошибки обработки (recover учитывает панику в failed): чтение q:http
+// душится паузой с удвоением, процесс не падает; без учёта паник цикл
+// пережигал бы попытки доставок (XAUTOCLAIM → q:dead, T-025) на полном
+// ходу.
+func TestWorkerRunPanicBackoff(t *testing.T) {
+	old := workerFailWaitBase
+	workerFailWaitBase = 100 * time.Millisecond
+	t.Cleanup(func() { workerFailWaitBase = old })
+
+	panicBody := "<html>" + strings.Repeat("страница серии паник цикла ", 30) + "</html>"
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"panic.test": {status: 200, body: panicBody},
+	})
+	w := workerWorker(t, fetch, nil)
+
+	payload, err := json.Marshal(queue.HTTPTask{
+		TaskID: "t-panic", ZoneID: 5, DomainID: 42, Name: "panic.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := &workerPanicQueue{payload: payload}
+
+	// Паникующая обработка результата (синхронный стек горутины
+	// доставки) — сигнал, что доставки доходят до сбоя.
+	panicHit := make(chan struct{}, 1)
+	opts := Options{Concurrency: 1, Consume: 1, OnResult: func(_ context.Context, res *DomainResult) error {
+		select {
+		case panicHit <- struct{}{}:
+		default:
+		}
+		panic("обработка результата упала: запись в БД")
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, q, w, opts) }()
+
+	// Паника случилась (доставка дошла до обработки), чтения душатся —
+	// те же границы, что у TestWorkerRunBackoffOnFailures.
+	select {
+	case <-panicHit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("паникующая доставка не дошла до обработки результата — тест ничего не проверил")
+	}
+	deadline := time.After(5 * time.Second)
+	waitCount := func(n int) int {
+		for {
+			got := q.consumeCount()
+			if got >= n {
+				return got
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("чтений %d, ждалось ≥%d — предохранитель заблокировал цикл", got, n)
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}
+	waitCount(1)
+	time.Sleep(450 * time.Millisecond)
+	first := q.consumeCount()
+	if first > 10 {
+		t.Errorf("чтений %d за 450 мс — паники не душат темп (ждалось ≤10)", first)
+	}
+	time.Sleep(450 * time.Millisecond)
+	if grew := q.consumeCount() - first; grew > 2 {
+		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией паник", grew)
 	}
 
 	cancel()
