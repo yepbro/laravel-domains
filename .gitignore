@@ -29,3 +29,6 @@ coverage.*
 
 # Сборка боевых бинарников (deploy.md §4.2)
 out/
+
+# open-codebase-index
+.opencode/index/
