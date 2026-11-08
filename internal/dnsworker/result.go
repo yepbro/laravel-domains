@@ -121,6 +121,29 @@ import (
 // автомата (единая точка правды: internal/scheduler/checkstate.go,
 // T-255).
 //
+// # Таблица решений DNS-этапа автомата status (T-256, ТЗ-fsm §3 ФТ-2)
+//
+// Общая часть (все этапы и писатели) — одной таблицей в
+// internal/model/enums.go у кодов model.Status; здесь — развёртка
+// DNS-веток (О2–О6, О10 общей таблицы) с привязкой к операторам и
+// входам. Решение принимает чистая функция DecideEpisode (таблица —
+// её контракт, покрыта юнит-тестом TestResultDecideEpisode):
+//
+//	| Ветка | Вход эпизода | Решение EpisodeResult | Оператор записи |
+//	|-------|--------------|----------------------|-----------------|
+//	| С1 (О2) | апекс NXDOMAIN | SetStatus: not_delegated; маска пуста, субдомены не проверялись (RFC 8020) | resultUpdateStatusSQL |
+//	| С2 (О3) | апекс SERVFAIL/таймаут | SetStatus: temp_error; маска пуста, субдомены не проверялись | resultUpdateStatusSQL |
+//	| С3 (О6) | HTTP-набор после wildcard-фильтра непуст (частичный сбой субдоменов задачу не рушит, T-037) | SetStatus = false: статус решит HTTP-этап (О7–О9), домен сохраняет прежний (первая проверка — new); публикация q:http | resultUpdateKeepStatusSQL |
+//	| С4 (О4) | HTTP-набор пуст, сбоев резолвера нет (все NOERROR/NXDOMAIN — NXDOMAIN субдомена авторитетен; дефекты зоны — цикл/глубина CNAME — не сбой; wildcard-only — «адресов нет») | SetStatus: delegated_no_address | resultUpdateStatusSQL |
+//	| С5 (О5) | HTTP-набор пуст, был сбой резолвера (транспорт после ретраев либо код вне NOERROR/NXDOMAIN) | SetStatus: temp_error — «нет адресов» по молчащему резолверу не выводится (ложный терминальный статус) | resultUpdateStatusSQL |
+//	| С6 (О10) | ядовитая строка: ErrEmptyDomain (пустое имя) | SetStatus: invalid — вне DecideEpisode, диагноз ставит RecordInvalid (T-109) | resultInvalidSQL |
+//
+// Асимметрии зафиксированы в общей таблице (model/enums.go): temp_error
+// без адресов зреет к финализации А1 у планировщика (retry), прочие
+// ветки терминальны сами. Аномалия «статус повис» — С3 без HTTP-итога
+// (status = new ∧ check_state = done) — наблюдаема gauge'ом ФТ-2.2
+// (спецификация — model/enums.go).
+//
 // Дельты счётчиков зон (T-178, ревью P1-1): DNS-этап — главный переход
 // queued/pending → done конвейера, оператор ведёт domains_queued/
 // domains_pending −n и domains_checked +n по старому состоянию строки

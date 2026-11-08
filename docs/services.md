@@ -215,6 +215,7 @@ HELP/TYPE экспортируются Prometheus из `Name`/`Help` — док�
 | `crawler_unit_restarts` | gauge | `unit` | monitor (T-145) | тот же проход: `NRestarts` юнитов (крэш-рестарты с последнего старта/`reset-failed`); источник обоих — `systemctl show` + чтение cgroupfs (internal/monitor/unitevents.go) |
 | `crawler_queue_depth` | gauge | `queue` | dns-worker (`q:dns`), http-worker (`q:http`), render-worker (`q:render`; сборка воркера B фолбэка — `q:render-fallback`, T-236/T-240), analyzer (`q:analyze`), monitor (`q:dead`, T-154) | коллектор глубины потребляемого стрима раз в 15 с (backlog группы потребления: `min(lag, XLEN)` + `pending` — лаг ограничен длиной стрима против фантома Redis 7.0.x после XTRIM недоставленного, T-168; `metrics.CollectQueueLoop`, источник — гейт backpressure T-026); `q:dead` публикует monitor с прохода алерта `queue_dead` (групп у карантина нет — XLEN, обёртка `monitor.NewDeadDepthMetrics`); ряд `queue="q:render-fallback"` — остаток для баланс-чека фолбэка (T-245: `published = consumed + остаток + похороненные` — формула и границы применимости в решениях ниже, шаг 4 приёмки ТЗР рендера §6.2) |
 | `crawler_render_pending_domains` | gauge | — | monitor (T-175) | цикл рендер-долга (`monitor.render_debt_interval`, 5 мин): домены с битом `render_pending` — счётчик `crawler_counters['render_pending']` (миграция 000015) ведут переходы бита в транзакции перехода; авторитетное значение периодически перезаписывает реконсиляция T-178 (наблюдаемость без seq scan по 41,8 млн строк; лаг `q:render` — `crawler_queue_depth{queue="q:render"}`, долг = сумма — алерт `render_debt` и строка отчёта нагрузки T-173) |
+| `crawler_domains_new_done_stale` | gauge | — | monitor (T-256) | домены «статус повис» (ТЗ-fsm §3 ФТ-2.2): `status = new ∧ check_state = done ∧ last_checked_at` старше суток — DNS-этап записал ветку «есть адреса» (О6 таблицы решений статусов, `internal/model/enums.go`), HTTP-итог не пришёл (потеря задачи `q:http`, компенсатора нет). Значение — FILTER-колонка `f_new_done_stale` прохода реконсиляции (строка `crawler_counters['new_done_stale']`), обновляется раз в `monitor.zone_stats_interval`; стационарно 0 в норме, ненулевое — алерт `domains_new_done_stale` (2 ненулевых снапшота реконсиляции подряд), автолечения нет — лечит регулярная перепроверка T-030 |
 | `crawler_queue_dead_buried_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-154) | каждый перевод в q:dead задачи с task_id (`Reliab.bury` после публикации Dead и XACK исходной записи; хук `ReliabOptions.OnBury` ← `metrics.NewDeadBuriedHook`) — метка `queue` — стрим-источник умершей задачи; переводы неидентифицируемых записей (без `task_id`) считает соседний `crawler_queue_dead_unidentified_total`; темп смертей — `rate()`, неразобранный остаток — глубина q:dead монитора |
 | `crawler_queue_dead_unidentified_total` | counter | `queue` | dns-worker, http-worker, render-worker, analyzer (T-260) | карантин неидентифицируемых записей: запись PEL без `task_id` (тело вне форматов пакета) исчерпала попытки и переведена в q:dead с синтетическим `task_id` `unknown:<stream>:<entry-id>`, без предметных полей (`Reliab.bury`, терминальная ветка ФТ-6.1 ТЗ-fsm; хук `ReliabOptions.OnBuryUnidentified` ← `metrics.NewDeadUnidentifiedHook`) — до T-260 такие записи крутились вечным циклом клейма в PEL; стационарно ноль, рост — записи публикуются мимо контракта пакета (ручной XADD, баг писателя): найти источник по `entry_id`, разбор — runbooks.md §2 |
 | `crawler_db_deadlock_retried_total` | counter | — | dns-worker, http-worker, scheduler (T-268) | повторы операторов БД после дедлока 40P01 (`db.RetryDeadlock`, страховка поверх инварианта порядка блокировок счётчиков T-267): http-worker — транзакция записи результата целиком (`RecordAndPublish`), dns-worker — autocommit-операторы записи эпизода (`RecordEpisode`: перевод в done, инкремент корзины `retry_mature`, диагноз invalid) без повторного DNS-эпизода, scheduler — транзакция решения ретрая temp_error (`retryDecide`); дренаж ретрая переживает ошибку пачки (до 3 подряд). Единичные события — норма (страховка работает, задача не уходит в ределивери полным эпизодом); устойчивый рост — новый цикл блокировок: разбор runbooks.md §2.8 |
@@ -1157,7 +1158,30 @@ pid+query_start: оператор сообщается один раз при п
   юнита движка отдельного алерта не требует:
   юниты движков — `crawler-*.service` (crawler-chromium сегодня,
   moli/lightpanda по ТЗ рендера §4.7 п.3) — покрывает существующий
-  `unit_oom` (T-145, шаблон `crawler-*.service`).
+  `unit_oom` (T-145, шаблон `crawler-*.service`);
+- **домены «статус повис»** (T-256, алерт `domains_new_done_stale`,
+  ТЗ-fsm §3 ФТ-2.2) — строка `crawler_counters['new_done_stale']`:
+  домены `status = new ∧ check_state = done ∧ last_checked_at` старше
+  суток — DNS-этап записал ветку «есть адреса» (О6 таблицы решений
+  статусов, `internal/model/enums.go`), а HTTP-итог (О7–О9) не пришёл:
+  потеря задачи `q:http`, компенсатора нет (спецификация автомата
+  `status` — там же; ветки этапов — `internal/dnsworker/result.go`,
+  `internal/httpworker/record.go`). Источник — точечное PK-чтение
+  строки (значение пишет FILTER-колонка `f_new_done_stale` прохода
+  реконсиляции — seq scan по `domains` алерту не нужен, глубина окна —
+  `zone_stats_interval`), уровень наблюдаем gauge
+  `crawler_domains_new_done_stale`. Срабатывание — 2 НОВЫХ снапшота
+  реконсиляции подряд с ненулевым значением (AlertNewDoneStalePasses;
+  серия растёт только при смене `updated_at` строки — проходы алертов
+  чаще источника, повторные чтения одного снапшота наблюдением не
+  считаются: одиночный пограничный снапшот границы суток — полночь
+  состарила вчерашние in-flight эпизоды — следующим проходом
+  перезаписывается нулём и алерта не даёт, ≈1 ч устойчивого значения),
+  удержание — любая ненулевая, снятие — ноль (стиль `queue_dead`).
+  Стационарно 0 в норме; строки нет до первого прохода реконсиляции —
+  тихое «не измеряется». Автолечения нет: лечит регулярная
+  перепроверка T-030 (~6 мес), алерт — сигнал оператору (разбор —
+  operations.md §4.4).
 
 Доставка алертов оператору (T-162, ТЗ 5.9/10.4): переходы состояний
 (срабатывание/снятие) уходят в Telegram тем же ботом и группой, что

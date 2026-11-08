@@ -46,23 +46,34 @@ type alertDNSDaily struct {
 // в горутине, тесты ждут прогресса по счётчику проходов.
 type alertsPool struct {
 	mu    sync.Mutex
-	daily []alertDNSDaily // очередь ответов dnsDailyCountersSQL (кончилась — нули)
-	fresh []sql.NullTime  // очередь ответов zoneFreshSQL (кончилась — нулевая)
-	debt  []int64         // очередь ответов renderDebtFlagsSQL (кончилась — нули)
+	daily []alertDNSDaily  // очередь ответов dnsDailyCountersSQL (кончилась — нули)
+	fresh []sql.NullTime   // очередь ответов zoneFreshSQL (кончилась — нулевая)
+	debt  []int64          // очередь ответов renderDebtFlagsSQL (кончилась — нули)
+	stale []alertStaleSnap // очередь ответов newDoneStaleSQL (кончилась — нули)
 
 	dailyErrs []error
 	freshErrs []error
 	debtErrs  []error
+	staleErrs []error
 
 	// Деградации формы ответа: без строк (rows.Next ложен), строка с
 	// нечитаемыми типами (ошибка Scan), ошибка итерации (rows.Err).
 	dailyEmpty, dailyBadRow    bool
 	freshEmpty, freshBadRow    bool
 	debtEmpty, debtBadRow      bool
+	staleEmpty, staleBadRow    bool
 	dailyRowsErr, freshRowsErr error
 	debtRowsErr                error
+	staleRowsErr               error
 
 	queries []zonestatsCall // переиспользован: sql + args
+}
+
+// alertStaleSnap — ответ newDoneStaleSQL: значение строки new_done_stale
+// и метка снапшота (updated_at — момент прохода реконсиляции, писал его).
+type alertStaleSnap struct {
+	value int64
+	at    time.Time
 }
 
 func (p *alertsPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -126,6 +137,22 @@ func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Row
 			p.debt = p.debt[1:]
 		}
 		return &alertRows{rows: [][]any{{v}}, err: p.debtRowsErr}, nil
+	case newDoneStaleSQL:
+		if err := popErr(&p.staleErrs); err != nil {
+			return nil, err
+		}
+		if p.staleEmpty {
+			return &alertRows{err: p.staleRowsErr}, nil
+		}
+		if p.staleBadRow {
+			return &alertRows{rows: [][]any{{"байты", "байты"}}, err: p.staleRowsErr}, nil
+		}
+		s := alertStaleSnap{}
+		if len(p.stale) > 0 {
+			s = p.stale[0]
+			p.stale = p.stale[1:]
+		}
+		return &alertRows{rows: [][]any{{s.value, sql.NullTime{Time: s.at, Valid: !s.at.IsZero()}}}, err: p.staleRowsErr}, nil
 	default:
 		return nil, fmt.Errorf("alertsPool: неожидаемый SQL Query: %s", sqlQ)
 	}
@@ -1181,7 +1208,7 @@ func TestAlertsTransitionsLogging(t *testing.T) {
 	}
 }
 
-// TestAlertsOnPassSnapshot — хук получает снапшот всех девяти алертов
+// TestAlertsOnPassSnapshot — хук получает снапшот всех алертов
 // в фиксированном порядке; Firing() отбирает сработавшие.
 func TestAlertsOnPassSnapshot(t *testing.T) {
 	var mu sync.Mutex
@@ -1204,7 +1231,7 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 	wantNames := []string{AlertDNSErrors, AlertQueueOverflow, AlertProgressStall, AlertDiskFree,
 		AlertDiskMin, AlertDiskCrit, AlertNVMeWear, AlertBadHashes, AlertUnitOOM, AlertMemHigh,
 		AlertQueueDead, AlertQueueFreeze, AlertRedisMemory, AlertPSICPU, AlertRenderDebt,
-		AlertRenderFbDepth, AlertRenderFbBudget, AlertRenderBrowserErr}
+		AlertRenderFbDepth, AlertRenderFbBudget, AlertRenderBrowserErr, AlertDomainsStale}
 	if len(res.Alerts) != len(wantNames) {
 		t.Fatalf("алертов в снапшоте = %d, want %d", len(res.Alerts), len(wantNames))
 	}
@@ -2024,6 +2051,154 @@ func TestAlertsRenderDebtTinyThreshold(t *testing.T) {
 	setRenderDebt(env, 0, 0) // ноль — снятие
 	if s := snapshotOf(t, env.Pass(ctx), AlertRenderDebt); s.Status != AlertStatusOK {
 		t.Errorf("нулевой долг: %s (%s), want ok (снятие достижимо)", s.Status, s.Detail)
+	}
+}
+
+// --- домены «статус повис» (T-256, ФТ-2.2) --------------------------------------
+
+// staleSnap — снапшот строки new_done_stale: минуты от фиксированной
+// базы (метки проходов реконсиляции различны — серия растёт только на
+// новом снапшоте, ревью T-256 P2-1).
+func staleSnap(v int64, min int) alertStaleSnap {
+	now, _ := alertsFixedClock()
+	return alertStaleSnap{value: v, at: now.Add(time.Duration(min) * time.Minute)}
+}
+
+// TestAlertsNewDoneStaleEpisode — эпизод domains_new_done_stale: ноль в
+// норме, серия растёт только на НОВЫХ снапшотах реконсиляции (проходы
+// алертов чаще источника — повторные чтения одной строки наблюдением не
+// считаются), срабатывание на втором ненулевом снапшоте, удержание
+// любой ненулевой строкой, снятие нулём; один Warn на эпизод.
+func TestAlertsNewDoneStaleEpisode(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	ctx := context.Background()
+
+	steps := []struct {
+		snap alertStaleSnap
+		want string
+	}{
+		{staleSnap(0, 0), AlertStatusOK},      // норма: повисших нет
+		{staleSnap(3, 30), AlertStatusOK},     // первый ненулевой снапшот 1/2
+		{staleSnap(3, 30), AlertStatusOK},     // тот же снапшот — серия не растёт (алерт ходит чаще источника)
+		{staleSnap(3, 60), AlertStatusFiring}, // второй ненулевой снапшот 2/2 — устойчиво
+		{staleSnap(1, 60), AlertStatusFiring}, // удержание: любая ненулевая строка
+		{staleSnap(0, 90), AlertStatusOK},     // перепроверка T-030 закрыла — снятие
+		{staleSnap(7, 120), AlertStatusOK},    // новый эпизод после снятия — 1/2
+	}
+	for i, s := range steps {
+		env.pool.stale = []alertStaleSnap{s.snap}
+		got := snapshotOf(t, env.Pass(ctx), AlertDomainsStale)
+		if got.Status != s.want {
+			t.Errorf("шаг %d (new_done_stale=%d@%s): статус = %s (%s), want %s",
+				i, s.snap.value, s.snap.at.Format("15:04"), got.Status, got.Detail, s.want)
+		}
+	}
+	// Пограничный случай границы суток (ревью P2-1): одиночный ненулевой
+	// снапшот (полночь состарила вчерашние in-flight эпизоды) следующим
+	// проходом перезаписывается нулём — алерта нет вовсе.
+	env = newAlertsTestEnv(t, nil)
+	env.pool.stale = []alertStaleSnap{staleSnap(2, 0), staleSnap(0, 30)}
+	for i, want := range []string{AlertStatusOK, AlertStatusOK} {
+		if got := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); got.Status != want {
+			t.Errorf("пограничный снапшот, шаг %d: %s (%s), want %s — без алерта", i, got.Status, got.Detail, want)
+		}
+	}
+	if strings.Contains(env.buf.String(), "АЛЕРТ") {
+		t.Errorf("пограничный снапшот дал Warn:\n%s", env.buf.String())
+	}
+
+	// Detail с уровнем, счётчиком снапшотов и путём лечения: серия
+	// растёт на каждом новом снапшоте (3/2 — перевыполнен, удержание).
+	env = newAlertsTestEnv(t, nil)
+	env.pool.stale = []alertStaleSnap{staleSnap(9, 0), staleSnap(9, 30), staleSnap(12, 60)}
+	_ = snapshotOf(t, env.Pass(ctx), AlertDomainsStale) // 1/2
+	_ = snapshotOf(t, env.Pass(ctx), AlertDomainsStale) // 2/2 — firing
+	got := snapshotOf(t, env.Pass(ctx), AlertDomainsStale)
+	for _, want := range []string{"12", "3/2", "crawler_domains_new_done_stale"} {
+		if !strings.Contains(got.Detail, want) {
+			t.Errorf("detail %q не содержит %q", got.Detail, want)
+		}
+	}
+
+	// Один Warn на эпизод: срабатывание Warn «АЛЕРТ», удержание и
+	// снятие — без повторного Warn.
+	env = newAlertsTestEnv(t, nil)
+	env.pool.stale = []alertStaleSnap{staleSnap(9, 0), staleSnap(9, 30)}
+	for range 2 {
+		env.Pass(ctx)
+	}
+	if n := strings.Count(env.buf.String(), "АЛЕРТ: домены «статус повис»"); n != 1 {
+		t.Errorf("Warn срабатывания = %d, want 1:\n%s", n, env.buf.String())
+	}
+	env.pool.stale = []alertStaleSnap{staleSnap(9, 90)}
+	if got := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); got.Status != AlertStatusFiring {
+		t.Fatalf("устойчивое срабатывание: %s, want firing", got.Status)
+	}
+	before := env.buf.String()
+	env.pool.stale = nil // нули по умолчанию
+	s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale)
+	if s.Status != AlertStatusOK {
+		t.Fatalf("нулевая строка: %s, want ok", s.Status)
+	}
+	if delta := env.buf.String()[len(before):]; strings.Contains(delta, "level=WARN") {
+		t.Errorf("снятие дало Warn:\n%s", delta)
+	} else if !strings.Contains(delta, "level=INFO") || !strings.Contains(delta, "алерт снят") {
+		t.Errorf("снятие без Info:\n%s", delta)
+	}
+}
+
+// TestAlertsNewDoneStaleDegradation — строка new_done_stale ещё не
+// создана первым проходом реконсиляции — тихое «не измеряется» (без
+// Warn и без ложного нуля); ошибка чтения — «не измеряется» с Warn,
+// серия наблюдений ошибкой не сбрасывается: неизвестное наблюдение —
+// не нулевое.
+func TestAlertsNewDoneStaleDegradation(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	env.pool.staleEmpty = true
+	s := snapshotOf(t, env.Pass(context.Background()), AlertDomainsStale)
+	if s.Status != AlertStatusNotMeasured {
+		t.Fatalf("строки нет: статус = %s, want not_measured", s.Status)
+	}
+	if strings.Contains(env.buf.String(), "level=WARN") {
+		t.Errorf("гонка старта циклов дала Warn:\n%s", env.buf.String())
+	}
+
+	ctx := context.Background()
+	env = newAlertsTestEnv(t, nil)
+	env.pool.stale = []alertStaleSnap{staleSnap(4, 0)}
+	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusOK {
+		t.Fatalf("первое наблюдение: %s, want ok (1/2)", s.Status)
+	}
+	env.pool.staleErrs = []error{errors.New("connection refused")}
+	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusNotMeasured {
+		t.Fatalf("ошибка чтения: %s, want not_measured", s.Status)
+	}
+	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "connection refused") {
+		t.Errorf("ошибка чтения строки без Warn:\n%s", env.buf.String())
+	}
+	// Ошибка память трекинга не трогает: тот же снапшот после сбоя —
+	// серия по-прежнему 1 (не «первое наблюдение»), новый ненулевой
+	// снапшот — второй, срабатывание.
+	env.pool.staleErrs = nil
+	env.pool.stale = []alertStaleSnap{staleSnap(4, 0)}
+	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "1/2") {
+		t.Fatalf("тот же снапшот после сбоя: %s (%s), want ok 1/2 (серия сохранена)", s.Status, s.Detail)
+	}
+	env.pool.stale = []alertStaleSnap{staleSnap(4, 30)}
+	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusFiring {
+		t.Fatalf("новый снапшот после сбоя: %s, want firing (серия сохранена)", s.Status)
+	}
+
+	// Нечитаемая строка и ошибка итерации — «не измеряется» с Warn.
+	env = newAlertsTestEnv(t, nil)
+	env.pool.staleBadRow = true
+	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusNotMeasured {
+		t.Errorf("нечитаемая строка: %s, want not_measured", s.Status)
+	}
+	env = newAlertsTestEnv(t, nil)
+	env.pool.staleRowsErr = errors.New("iteration failed")
+	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusNotMeasured {
+		t.Errorf("ошибка итерации: %s, want not_measured", s.Status)
 	}
 }
 

@@ -97,7 +97,19 @@
 //     движок-кандидат (moli/lightpanda) завис или недоступен (гейт
 //     T-239 приостанавливает фолбэк-публикации; событие гейта —
 //     счётчик suspended{reason="gate"} и Warn-лог воркера, детектор —
-//     здесь).
+//     здесь);
+//   - домены «статус повис» (T-256, ТЗ-fsm §3 ФТ-2.2) — строка
+//     crawler_counters new_done_stale (FILTER-колонка прохода
+//     реконсиляции zonestats.go: status = new ∧ check_state = done ∧
+//     last_checked_at старше суток — DNS записал «есть адреса», HTTP
+//     итог не пришёл: потеря задачи q:http, компенсатора нет)
+//     ненулевая в 2 НОВЫХ снапшотах реконсиляции подряд (серия — по
+//     смене updated_at строки: проходы алертов чаще источника,
+//     повторные чтения одного снапшота наблюдением не считаются).
+//     Точечное PK-чтение, без скана domains; стационарно ноль в норме.
+//     Автолечения нет — лечит регулярная перепроверка T-030, алерт
+//     только сигнал оператору (gauge crawler_domains_new_done_stale
+//     экспонирует уровень).
 //
 // Доставка (T-162): переходы алертов (срабатывание/снятие) уходят
 // оператору в Telegram — хук AlertsOptions.OnPass (TelegramNotifier,
@@ -186,6 +198,7 @@ const (
 	AlertRenderFbDepth    = "render_fallback_depth"  // рост глубины q:render-fallback (T-246)
 	AlertRenderFbBudget   = "render_fallback_budget" // превышение бюджета доли фолбэка (T-246)
 	AlertRenderBrowserErr = "render_browser_errors"  // рост browser-ошибок этапа: движок недоступен (S-P2-6)
+	AlertDomainsStale     = "domains_new_done_stale" // домены «статус повис» new∧done старше суток (T-256, ФТ-2.2)
 )
 
 // alertDescs — человекочитаемые описания алертов для записей лога.
@@ -208,6 +221,7 @@ var alertDescs = map[string]string{
 	AlertRenderFbDepth:    "накопление очереди фолбэка q:render-fallback: воркер B не успевает",
 	AlertRenderFbBudget:   "превышение бюджета доли фолбэка: деградация основного движка",
 	AlertRenderBrowserErr: "рост browser-ошибок этапа рендера: движок завис или недоступен",
+	AlertDomainsStale:     "домены «статус повис»: new с завершённой проверкой старше 24 ч",
 }
 
 // Пороги оценки. Числа ТЗ не задаёт; переиспользуются существующие пороги
@@ -423,6 +437,19 @@ const (
 	// suspended{reason="gate"} и Warn-логом воркера: гейт — порог стрика
 	// в воркере, алерт — наблюдаемость средствами монитора.
 	AlertRenderBrowserErrorsPasses = 2
+
+	// AlertNewDoneStalePasses — НОВЫХ снапшотов реконсиляции подряд с
+	// ненулевой строкой new_done_stale до срабатывания domains_new_done_stale
+	// (T-256, ФТ-2.2): 2 × период реконсиляции (30 мин на дефолте,
+	// T-199) ≈ 1 ч устойчивого ненулевого значения. Проходы алертов
+	// (5 мин, T-206) чаще проходов источника — серия растёт только при
+	// смене updated_at снапшота, повторные чтения одной строки наблюдением
+	// не считаются: одиночный пограничный снапшот границы суток (полночь
+	// состарила вчерашние in-flight эпизоды «новой» проверки — DNS-итог
+	// вчера, HTTP в полёте на скане агрегата) следующим проходом
+	// перезаписывается нулём и алерта не даёт (ревью T-256, P2-1).
+	// Стационарно ноль: норма не будит вовсе.
+	AlertNewDoneStalePasses = 2
 )
 
 // dnsDailyCountersSQL — числитель и знаменатель доли temp_error текущих
@@ -447,6 +474,22 @@ const dnsDailyCountersSQL = "SELECT " +
 	"WHERE name = 'temp_error:' || to_char(current_date, 'YYYY-MM-DD')), 0), " +
 	"coalesce((SELECT value FROM crawler_counters " +
 	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')), 0)"
+
+// newDoneStaleSQL — точечное PK-чтение строки new_done_stale (T-256,
+// ФТ-2.2): домены «статус повис» (status = new ∧ check_state = done ∧
+// last_checked_at старше суток) — значение пишет FILTER-колонка
+// f_new_done_stale прохода реконсиляции (zonestats.go), алерт ценой
+// одного лукапа наблюдает её между проходами (глубина окна —
+// zone_stats_interval), seq scan по domains не добавляет. updated_at —
+// метка снапшота: проходы алертов чаще проходов источника (5 мин против
+// 30), серия алерта растёт только на НОВОМ снапшоте — два чтения одной
+// строки не «два наблюдения» (ревью T-256, P2-1). Пустой результат —
+// строки ещё нет: её создаёт первый проход реконсиляции (обе петли
+// monitor стартуют вместе; в отличие от render_pending, создающегося
+// миграцией, корректного «нет строки» у new_done_stale не бывает — либо
+// гонка старта, либо ручная правка таблицы) — тихое «не измеряется»
+// без Warn, а не ложный ноль и не тревога.
+const newDoneStaleSQL = "SELECT value, updated_at FROM crawler_counters WHERE name = 'new_done_stale'"
 
 // zoneFreshSQL — свежесть прогресса: последний момент пересчёта зон
 // (zones.updated_at пишет ZoneStatsLoop, T-078). Справочник зон маленький;
@@ -1055,6 +1098,19 @@ type counterGrowthTrack struct {
 	seen   bool
 }
 
+// newDoneStaleTrack — память трекинга строки new_done_stale (T-256,
+// ФТ-2.2): метка последнего прочитанного снапшота реконсиляции
+// (updated_at) и серия НОВЫХ снапшотов подряд с ненулевым значением.
+// Проходы алертов (5 мин) чаще проходов источника (zone_stats_interval,
+// 30 мин): серия растёт только при смене метки — два чтения одной
+// строки не два наблюдения (ревью T-256, P2-1); нулевое значение серию
+// обнуляет, ошибка источника память не трогает (стиль deadStreak).
+type newDoneStaleTrack struct {
+	snap   time.Time
+	streak int
+	seen   bool
+}
+
 // Alerts — оценка алертов с памятью состояний между проходами
 // (гистерезис, фронтовые записи лога только на переходах).
 type Alerts struct {
@@ -1092,6 +1148,13 @@ type Alerts struct {
 	// renderBrowserErr — трекинг роста счётчика browser-ошибок этапа
 	// рендера (S-P2-6): прошлый снимок зонда и серия растущих проходов.
 	renderBrowserErr counterGrowthTrack
+	// newDoneStale — трекинг строки new_done_stale (T-256, ФТ-2.2):
+	// метка последнего прочитанного снапшота (updated_at строки — момент
+	// прохода реконсиляции) и серия ненулевых НОВЫХ снапшотов подряд.
+	// Повторные чтения одной строки между проходами реконсиляции серию
+	// не наращивают (алерт ходит чаще источника); ошибка источника
+	// память не трогает — неизвестное наблюдение не обнуляет серию.
+	newDoneStale newDoneStaleTrack
 }
 
 // NewAlerts строит оценщик: нормализует опции (дефолты периодов), источники
@@ -1148,6 +1211,7 @@ func (a *Alerts) evaluators() []alertEval {
 		{AlertRenderFbDepth, a.evalRenderFallbackDepth},
 		{AlertRenderFbBudget, a.evalRenderFallbackBudget},
 		{AlertRenderBrowserErr, a.evalRenderBrowserErrors},
+		{AlertDomainsStale, a.evalDomainsNewDoneStale},
 	}
 }
 
@@ -2107,6 +2171,76 @@ func (a *Alerts) evalRenderBrowserErrors(ctx context.Context, _ string) verdict 
 		return verdict{
 			status: AlertStatusFiring,
 			detail: detail + " — движок рендера завис или недоступен: health-гейт приостановил фолбэк-публикации, браузер-класс в redelivery q:render (откат движка — ТЗ рендера §6.4, разбор — docs/render.md)",
+		}
+	}
+	return verdict{status: AlertStatusOK, detail: detail}
+}
+
+// evalDomainsNewDoneStale — домены «статус повис» (T-256, ТЗ-fsm §3
+// ФТ-2.2): строка crawler_counters new_done_stale — домены со
+// status = new ∧ check_state = done ∧ last_checked_at старше суток
+// (DNS-этап записал ветку «есть адреса» — О6 общей таблицы статусов
+// internal/model/enums.go, HTTP-итог О7–О9 не пришёл: задача q:http
+// потеряна, компенсатора нет). Значение пишет проход реконсиляции
+// (FILTER-колонка f_new_done_stale агрегата domainsAggSQL), алерт
+// читает его точечным лукапом — seq scan по domains не добавляет.
+// Срабатывание — AlertNewDoneStalePasses НОВЫХ снапшотов реконсиляции
+// подряд с ненулевым значением (серия растёт только при смене updated_at
+// строки: проходы алертов чаще источника, повторные чтения одного
+// снапшота наблюдением не считаются — одиночный пограничный снапшот
+// границы суток следующим проходом перезаписывается и алерта не даёт);
+// удержание — любая ненулевая, снятие — ноль (стиль evalDead). Ошибка
+// источника серию не сбрасывает: неизвестное наблюдение — не нулевое;
+// пустой результат (строки нет до первого прохода реконсиляции) —
+// тихое «не измеряется». Автолечения нет — лечит регулярная
+// перепроверка T-030: алерт только сигнал, уровень наблюдаем gauge'ом
+// crawler_domains_new_done_stale.
+func (a *Alerts) evalDomainsNewDoneStale(ctx context.Context, prev string) verdict {
+	rows, err := a.deps.Pool.Query(ctx, newDoneStaleSQL)
+	if err != nil {
+		return verdict{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		// Обрыв соединения — не «строки нет»: сначала сбой чтения
+		// (стиль retryMatureCount).
+		if err := rows.Err(); err != nil {
+			return verdict{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
+		}
+		return verdict{
+			status: AlertStatusNotMeasured,
+			detail: "строки new_done_stale нет — первый проход реконсиляции ещё не завершился",
+		}
+	}
+	var n int64
+	var snap sql.NullTime
+	if err := rows.Scan(&n, &snap); err != nil {
+		return verdict{err: fmt.Errorf("monitor: домены «статус повис»: чтение: %w", err)}
+	}
+	if err := rows.Err(); err != nil {
+		return verdict{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
+	}
+	tr := a.newDoneStale
+	if n > 0 {
+		// Серия — число различных ненулевых снапшотов: повторное чтение
+		// той же строки (алерт ходит чаще реконсиляции) серию не
+		// наращивает; нулевой снапшот обнуляет.
+		switch {
+		case !tr.seen || !snap.Valid || !snap.Time.Equal(tr.snap):
+			tr.streak++
+		}
+		tr.seen = true
+		tr.snap = snap.Time
+	} else {
+		tr.streak = 0
+	}
+	a.newDoneStale = tr
+	detail := fmt.Sprintf("доменов new∧done старше суток %d, ненулевых снапшотов реконсиляции подряд %d/%d (значение — проход реконсиляции, gauge crawler_domains_new_done_stale)",
+		n, tr.streak, AlertNewDoneStalePasses)
+	if tr.streak >= AlertNewDoneStalePasses || (prev == AlertStatusFiring && n > 0) {
+		return verdict{
+			status: AlertStatusFiring,
+			detail: detail + " — потеря задач q:http: HTTP-итог не записан, компенсатора нет (лечит перепроверка T-030; спецификация — internal/model/enums.go)",
 		}
 	}
 	return verdict{status: AlertStatusOK, detail: detail}

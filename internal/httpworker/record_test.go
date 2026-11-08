@@ -1056,6 +1056,58 @@ func TestRecordWritesAllColumns(t *testing.T) {
 
 // --- статусы домена (§5.5 п. 9, §7) ------------------------------------------
 
+// recordClassSub — субдомен без записей с классами ошибок обоих
+// протоколов (чистая таблица решений recordStatus).
+func recordClassSub(https, http ErrorClass) SubdomainResult {
+	return SubdomainResult{
+		SubdomainID: 0, Label: "", Hostname: "t.example",
+		Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.9")},
+		HTTPS: SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: https},
+		HTTP:  SchemeCheck{Scheme: model.SchemeHTTP, ErrClass: http},
+	}
+}
+
+// TestRecordStatusDecision — таблица решений HTTP-этапа автомата status
+// (T-256, ТЗ-fsm §3 ФТ-2; спецификация — doc-комментарий у
+// recordDomainSQL, общая часть — internal/model/enums.go): чистая
+// функция recordStatus по строкам В1–В3, включая асимметрию А2
+// (connect-refused → no_http против connect-таймаута → temp_error) и
+// не-temp классы В3 (cutoff-синтетика не порождает temp_error).
+func TestRecordStatusDecision(t *testing.T) {
+	recorded := recordClassSub(ErrNone, ErrNone)
+	recorded.Records = []Record{{Variant: model.VariantMain, Scheme: model.SchemeHTTPS}}
+	cases := []struct {
+		name string
+		res  *DomainResult
+		want model.Status
+	}{
+		{"В1 (О7): есть записи — alive", &DomainResult{Subdomains: []SubdomainResult{recorded}}, model.StatusAlive},
+		{"В2 (О8): записей нет, connect-таймаут — temp_error (асимметрия А2)",
+			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrTimeout, ErrNetwork)}}, model.StatusTempError},
+		{"В2 (О8): таймаут второго протокола тоже temp_error",
+			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrNone, ErrTimeout)}}, model.StatusTempError},
+		{"В3 (О9): записей нет, connect-refused — no_http (асимметрия А2)",
+			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrNetwork, ErrNetwork)}}, model.StatusNoHTTP},
+		{"В3 (О9): сбой TLS-рукопожатия — no_http",
+			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrTLS, ErrNone)}}, model.StatusNoHTTP},
+		{"В3 (О9): лимит редиректов — no_http",
+			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrRedirects, ErrRedirects)}}, model.StatusNoHTTP},
+		{"В3 (О9): обрезка тела — no_http",
+			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrBody, ErrNone)}}, model.StatusNoHTTP},
+		{"В3 (О9): dead-host cutoff синтетик — no_http (ErrCutoff не temp)",
+			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrCutoff, ErrCutoff)}}, model.StatusNoHTTP},
+		{"В2 доминирует над В3 у разных субдоменов: таймаут одного — temp_error",
+			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrNone, ErrNone), recordClassSub(ErrTimeout, ErrTimeout)}}, model.StatusTempError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recordStatus(tc.res); got != tc.want {
+				t.Fatalf("recordStatus = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRecordStatuses(t *testing.T) {
 	cases := []struct {
 		name string

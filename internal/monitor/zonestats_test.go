@@ -227,19 +227,21 @@ func (t *zonestatsFakeTx) Rollback(context.Context) error {
 
 // aggRowOf — строка per-zone агрегата: зона, total, pending, queued,
 // checked, затем легенда статусов по порядку statusAggCols, затем бит,
-// затем суточное окно проверок, его temp-числитель (T-179/T-182) и
+// затем суточное окно проверок, его temp-числитель (T-179/T-182),
 // корзины зрелости ретрая (T-202: сегодняшние/созревшие эпизоды
-// temp_error × done; вариативные аргументы — по умолчанию нули, чтобы
+// temp_error × done) и домены «статус повис» (ФТ-2.2: new ∧ done ∧
+// старше суток; вариативные аргументы — по умолчанию нули, чтобы
 // базовые проходы тестов не указывали их явно: [checks] →
-// [checks, temp] → [checks, temp, retryToday, retryPast]).
+// [checks, temp] → [checks, temp, retryToday, retryPast,
+// newDoneStale]).
 func aggRowOf(zone int16, total, pending, queued, checked int64, statuses []int64, render int64, daily ...int64) []any {
 	if len(statuses) != len(statusAggCols) {
 		panic("aggRowOf: легенда статусов неполна")
 	}
-	if len(daily) > 4 {
-		panic("aggRowOf: суточных колонок четыре (T-179/T-182/T-202)")
+	if len(daily) > 5 {
+		panic("aggRowOf: суточных колонок пять (T-179/T-182/T-202/ФТ-2.2)")
 	}
-	var today, temp, retryToday, retryPast int64
+	var today, temp, retryToday, retryPast, newDoneStale int64
 	if len(daily) > 0 {
 		today = daily[0]
 	}
@@ -252,11 +254,14 @@ func aggRowOf(zone int16, total, pending, queued, checked int64, statuses []int6
 	if len(daily) > 3 {
 		retryPast = daily[3]
 	}
+	if len(daily) > 4 {
+		newDoneStale = daily[4]
+	}
 	row := []any{zone, total, pending, queued, checked}
 	for _, s := range statuses {
 		row = append(row, s)
 	}
-	return append(row, render, today, temp, retryToday, retryPast)
+	return append(row, render, today, temp, retryToday, retryPast, newDoneStale)
 }
 
 // zoneValsOf — строка readZonesSQL/recountZonesSQL RETURNING.
@@ -351,7 +356,7 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	pool := &zonestatsFakePool{steps: stepsOfPass(
 		zoneValsOf(7, 10, 4, 2, 3, 1),
 		zoneValsOf(7, 10, 4, 2, 3, 1),
-		aggRowOf(7, 10, 4, 2, 3, statuses, 2, 8, 1, 3, 2),
+		aggRowOf(7, 10, 4, 2, 3, statuses, 2, 8, 1, 3, 2, 1),
 		zonestatsRows([]any{int16(7), int64(1)}),
 		fullCounterRows(map[string]int64{"status_alive": 5, "render_pending": 2}),
 		fullCounterRows(map[string]int64{"status_alive": 5, "render_pending": 2}),
@@ -436,6 +441,12 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	wantVals := calls[17].args[1].([]int64)
 	if wantVals[len(statusAggCols)] != 2 { // render_pending после статусов
 		t.Errorf("render_pending в upsert = %d, want 2", wantVals[len(statusAggCols)])
+	}
+	// Домены «статус повис» (ФТ-2.2): абсолютный уровень в хвосте
+	// легенды (после laravel-кумулятивов) — сумма FILTER-колонки
+	// f_new_done_stale агрегата.
+	if wantVals[len(statusAggCols)+3] != 1 {
+		t.Errorf("new_done_stale в upsert = %d, want 1", wantVals[len(statusAggCols)+3])
 	}
 	// Суточные строки (T-179/T-182): значения — суммы FILTER-колонок
 	// агрегата, момент — часы прохода; имена дней вычисляет БД — в текстах
@@ -552,6 +563,11 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	}
 	if res.Zones != 1 {
 		t.Errorf("Zones = %d, want 1", res.Zones)
+	}
+	// Домены «статус повис» (ФТ-2.2): поле результата — сумма
+	// FILTER-колонки агрегата (значение gauge цикла).
+	if res.NewDoneStale != 1 {
+		t.Errorf("NewDoneStale = %d, want 1", res.NewDoneStale)
 	}
 	// Позиции дрейфа: 5 колонок зоны + дельта-ведомые глобальные +
 	// суточные строки (T-179/T-182) + корзины ретрая (T-202) + часовые
@@ -676,6 +692,55 @@ func TestZoneStatsOnceDrift(t *testing.T) {
 	}
 	if drifted != 4 { // pending зоны 7, total+pending зоны 9, render_pending
 		t.Errorf("позиций с дрейфом = %d, want 4", drifted)
+	}
+}
+
+// TestZoneStatsOnceNewDoneStale — домены «статус повис» (ФТ-2.2, T-256):
+// поле NewDoneStale — сумма FILTER-колонки f_new_done_stale по зонам,
+// строка new_done_stale — в unnest-upsert глобальных скаляров (абсолют
+// как status_*, дрейф-позицией не является: пишется одной
+// реконсиляцией).
+func TestZoneStatsOnceNewDoneStale(t *testing.T) {
+	statuses := make([]int64, len(statusAggCols))
+	pool := &zonestatsFakePool{steps: stepsOfPass(
+		zoneValsOf(7, 10, 4, 2, 3, 1),
+		zoneValsOf(7, 10, 4, 2, 3, 1),
+		aggRowOf(7, 10, 4, 2, 3, statuses, 0, 0, 0, 0, 0, 2),
+		zonestatsRows(),
+		fullCounterRows(nil),
+		fullCounterRows(nil),
+	)}
+	pool.steps[0].rows = zonestatsRows(
+		zoneValsOf(7, 10, 4, 2, 3, 1),
+		zoneValsOf(9, 2, 2, 0, 0, 0))
+	pool.steps[12].rows = zonestatsRows(
+		aggRowOf(7, 10, 4, 2, 3, statuses, 0, 0, 0, 0, 0, 2),
+		aggRowOf(9, 2, 2, 0, 0, make([]int64, len(statusAggCols)), 0, 0, 0, 0, 0, 5))
+	pool.steps[16].rows = zonestatsRows(
+		zoneValsOf(7, 10, 4, 2, 3, 1),
+		zoneValsOf(9, 2, 2, 0, 0, 0))
+
+	res, err := ZoneStatsOnce(context.Background(), pool, ZoneStatsOptions{})
+	if err != nil {
+		t.Fatalf("ZoneStatsOnce: %v", err)
+	}
+	if res.NewDoneStale != 7 {
+		t.Errorf("NewDoneStale = %d, want 7 (сумма 2 + 5 по зонам)", res.NewDoneStale)
+	}
+	// Строка new_done_stale — последней в легенде unnest-upsert'а со
+	// значением суммы (порядок CounterNames: статусы, render_pending,
+	// кумулятивы).
+	calls := pool.calls()
+	vals := calls[17].args[1].([]int64)
+	if got := vals[len(statusAggCols)+3]; got != 7 {
+		t.Errorf("new_done_stale в upsert = %d, want 7", got)
+	}
+	// Дрейф-позицией уровень не является (пишется одной
+	// реконсиляцией, как status_*).
+	for _, p := range res.Positions {
+		if strings.Contains(p.Counter, "new_done_stale") {
+			t.Errorf("new_done_stale в позициях дрейфа: %+v", p)
+		}
 	}
 }
 
@@ -949,7 +1014,7 @@ func TestZoneStatsLoopImmediatePass(t *testing.T) {
 	pool := &zonestatsFakePool{steps: stepsOfPass(
 		zoneValsOf(7, 0, 0, 0, 0, 0),
 		zoneValsOf(7, 10, 4, 2, 3, 1),
-		aggRowOf(7, 10, 4, 2, 3, statuses, 5),
+		aggRowOf(7, 10, 4, 2, 3, statuses, 5, 0, 0, 0, 0, 3),
 		zonestatsRows(),
 		fullCounterRows(nil),
 		fullCounterRows(map[string]int64{"status_alive": 5}))}
@@ -987,6 +1052,11 @@ func TestZoneStatsLoopImmediatePass(t *testing.T) {
 	}
 	if driftGaugeValue(t, reg, "zone:7:total") != 0 {
 		t.Errorf("gauge дрейфа первого прохода не нулевой/отсутствует: метрики первого прохода не поднимаются")
+	}
+	// Gauge «статус повис» (ФТ-2.2) — уровень, а не дрейф: первый
+	// (заполняющий) проход обязан выставить значение FILTER-колонки.
+	if got := historyGaugeValue(t, reg, "crawler_domains_new_done_stale"); got != 3 {
+		t.Errorf("gauge crawler_domains_new_done_stale после первого прохода = %v, want 3", got)
 	}
 }
 
@@ -1452,6 +1522,14 @@ func TestRecountSQLContracts(t *testing.T) {
 		"count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at < current_date) AS f_retry_mature_past",
 		int16(model.StatusTempError), int16(model.CheckStateDone))) {
 		t.Error("domainsAggSQL без корзины f_retry_mature_past (T-202)")
+	}
+	// Домены «статус повис» (ФТ-2.2, T-256): new × done × старше суток —
+	// та же граница даты, что у зрелой корзины ретрая (точность колонки
+	// date, реализация «старше 24 ч»).
+	if !strings.Contains(domainsAggSQL, fmt.Sprintf(
+		"count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at < current_date) AS f_new_done_stale",
+		int16(model.StatusNew), int16(model.CheckStateDone))) {
+		t.Error("domainsAggSQL без f_new_done_stale (ФТ-2.2, T-256)")
 	}
 	for _, sql := range []string{recountAggQuerySQL, verifyZonesSQL} {
 		if !strings.Contains(sql, "GROUP BY zone_id") {

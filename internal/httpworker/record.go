@@ -108,6 +108,33 @@ import (
 //
 // Переход check_state здесь — строка Р4 спецификации автомата (единая
 // точка правды: internal/scheduler/checkstate.go, T-255).
+//
+// # Таблица решений HTTP-этапа автомата status (T-256, ТЗ-fsm §3 ФТ-2)
+//
+// Общая часть (все этапы и писатели) — одной таблицей в
+// internal/model/enums.go у кодов model.Status; здесь — развёртка
+// HTTP-веток (О7–О9, строки А2/А3 асимметрий). Вердикт вычисляет чистая
+// функция recordStatus (внизу файла; контракт — юнит-тест таблицы
+// решений TestRecordStatusDecision), запись ведёт recordDomainSQL:
+//
+//	| Ветка | Условие эпизода (DomainResult) | Статус | Источник условия |
+//	|-------|-------------------------------|--------|------------------|
+//	| В1 (О7) | HasRecords: хоть один субдомен×протокол ответил (живая запись результата) | alive | записи DomainResult (вставляет recordInsertSQL) |
+//	| В2 (О8) | записей нет И AnyTimeout: среди проверок есть таймаут-класс ErrTimeout — connect-таймаут, TLS, заголовки, общий, анти-тарпит | temp_error | workerClassifyError → ErrTimeout (httpfetch.IsTimeout: net.Error.Timeout) |
+//	| В3 (О9) | записей нет, таймаутов нет — веб молчит постоянно: connection refused (ErrNetwork), сбой TLS-рукопожатия (ErrTLS), лимит редиректов (ErrRedirects), обрезка тела (ErrBody), dead-host cutoff синтетических проверок (ErrCutoff, IsTemp false) | no_http | workerClassifyError → прочие классы (IsTemp false) |
+//
+// Осознанные асимметрии этапа (решения общей таблицы, НЕ меняются):
+//
+//	А2  connect-refused → В3 (no_http), connect-таймаут → В2 (temp_error):
+//	    RST на SYN — порт закрыт, постоянное свойство хоста; молчание SYN —
+//	    транзиент сети/файрвола, повтор имеет смысл. Классы разведены
+//	    workerClassifyError (ECONNREFUSED не является net.Error-таймаутом
+//	    → ErrNetwork; таймаут диала → ErrTimeout).
+//	А3  recordDomainSQL пишет итог БЕЗ охраны check_state <> done (в
+//	    отличие от DNS-операторов): порядок «запись → публикация»
+//	    оставляет окно «записано, q:analyze не опубликовано» — повторная
+//	    доставка обязана переиздать публикацию, фильтр done отбросил бы
+//	    её навсегда (комментарий файла, идемпотентность ТЗ 3.4).
 var (
 	// recordDomainSQL — итоговый статус эпизода HTTP (alive/no_http/
 	// temp_error, §7), done, сброс lease и счётчика повторов (контракт

@@ -10,6 +10,80 @@ import (
 // invalid (T-109). ТЗ 6.2 допускает дополнительные статусы (например,
 // parked): новая константа расширяет Statuses и таблицу statusNames
 // следующим кодом по порядку.
+//
+// # Автомат status домена: общая таблица решений (T-256, ТЗ-fsm §3 ФТ-2)
+//
+// Единая точка правды о переходах статуса: таблица «этап × условие →
+// статус» по писателям штатного конвейера (административные пути —
+// импорт fixtures стенда T-242, cmd/crawlerctl, переносит состояние
+// дампа как есть, и ручной SQL — вне таблицы). Формализация не
+// переписывает переходы на FSM-фреймворк — они остаются SQL-операторами
+// с охранными предикатами (ТЗ-fsm §1); спецификация — ниже, писатели
+// ссылаются на неё и не дублируют. Ветки этапов развёрнуты в
+// пакетах-исполнителях: DNS — internal/dnsworker (result.go, у
+// операторов записи), HTTP — internal/httpworker (record.go). Смежный
+// автомат — check_state (internal/scheduler/checkstate.go, T-255):
+// статус — факт последнего эпизода, check_state — состояние цикла;
+// переходы той таблицы, несущие переходы статуса этой как побочное
+// действие, — записи результатов и диагноз (Р2/Р3/Р4/Р13 = О2–О6, О10),
+// ретрай (Р8 = О11), удаление/воскрешение/вставка (Р14/Р9/Р10 =
+// О12/О13/О1).
+//
+//	| №  | Этап     | Условие                                        | Статус                | Побочные действия                                | Писатель |
+//	|----|----------|------------------------------------------------|-----------------------|--------------------------------------------------|----------|
+//	| О1 | ingest   | вставка нового домена add-файлом               | new (DEFAULT схемы)   | —                                                | ingest/apply_add.go insertAddSQL (T-018) |
+//	| О2 | DNS      | апекс NXDOMAIN (RFC 8020)                      | not_delegated         | dns_mask = 0; temp_attempts = 0                  | dnsworker/result.go resultUpdateStatusSQL |
+//	| О3 | DNS      | апекс SERVFAIL/таймаут после ретраев           | temp_error            | dns_mask = 0; temp_attempts сохраняет            | dnsworker/result.go resultUpdateStatusSQL |
+//	| О4 | DNS      | адресов нет, сбоев резолвера нет (вкл. wildcard-only и дефекты зоны: цикл/глубина CNAME) | delegated_no_address | dns_mask эпизода; temp_attempts = 0 | dnsworker/result.go resultUpdateStatusSQL |
+//	| О5 | DNS      | адресов нет, был сбой резолвера (транспорт / код вне NOERROR и NXDOMAIN) | temp_error | dns_mask эпизода; temp_attempts сохраняет | dnsworker/result.go resultUpdateStatusSQL |
+//	| О6 | DNS      | адреса есть (маска после wildcard-фильтра непуста) | НЕ пишется: статус решает HTTP-этап (О7–О9); до его итога хранится прежний (первая проверка — new) | dns_mask эпизода; temp_attempts = 0; публикация q:http | dnsworker/result.go resultUpdateKeepStatusSQL |
+//	| О7 | HTTP     | есть записи (хоть один субдомен×протокол ответил) | alive              | temp_attempts = 0; строки subdomain_results      | httpworker/record.go recordDomainSQL |
+//	| О8 | HTTP     | записей нет, среди проверок есть таймаут-класс ErrTimeout (вкл. connect-таймаут) | temp_error | temp_attempts сохраняет | httpworker/record.go recordDomainSQL |
+//	| О9 | HTTP     | записей нет, таймаутов нет (вкл. connect-refused — ErrNetwork) | no_http | temp_attempts = 0 | httpworker/record.go recordDomainSQL |
+//	| О10 | DNS     | ядовитая строка: проверка невозможна детерминированно (пустое имя) | invalid (T-109) | temp_attempts = 0; перепроверка не возвращает | dnsworker/result.go resultInvalidSQL |
+//	| О11 | scheduler | temp_error, окно temp_error_retry_after прошло, temp_attempts ≥ max_retries | delegated_no_address (АСИММЕТРИЯ А1) | temp_attempts = 0; check_state остаётся done | scheduler/retry.go retryFinalizeSQL (T-031) |
+//	| О12 | ingest  | delete-файл: домен удалён из зарегистрированных | deleted             | строки результата чистит T-020; флаг render_pending снимает та же транзакция | ingest/apply_delete.go (T-019) |
+//	| О13 | ingest  | воскрешение: deleted-домен в новом add-файле   | new                  | dns_mask/flags/last_checked_at сохраняются (факт прошлой проверки не обнуляется) | ingest/apply_add.go reviveAddSQL (T-018) |
+//
+// temp_attempts (T-031): сбрасывается в 0 на каждом не-temp_error итоге
+// записи эпизода (О2, О4, О6, О7, О9, О10) и при финализации ретрая
+// (О11); temp_error-итоги (О3, О5, О8) сохраняют накопленное —
+// наращивает планировщик при назначении повтора (Р8 спецификации
+// check_state); ingest-переходы (О12, О13) счётчик не трогают.
+//
+// ## Осознанные асимметрии (решения, НЕ дефекты — не «исправляются»)
+//
+//	А1  О11: temp_error при исчерпании попыток финализируется в
+//	    delegated_no_address, а не в спец-статус: последняя проверка
+//	    закончилась SERVFAIL/таймаутом — адресов для HTTP-этапа нет,
+//	    это терминальная ветка «нет адресов» алгоритма ТЗ 7;
+//	    not_delegated отвергнут (кодирует именно NXDOMAIN апекса,
+//	    RFC 8020), новых статусов набор не расширяется (семь статусов
+//	    подтверждены заказчиком, ТЗ 13.1). Ошибка самокорректируется
+//	    регулярной перепроверкой T-030 (см. scheduler/retry.go).
+//	А2  О8/О9: connect-refused → no_http против connect-таймаута →
+//	    temp_error: RST на SYN (порт закрыт) — постоянное свойство
+//	    хоста, повтор в ближнем горизонте бессмыслен (ErrNetwork, не
+//	    temp); молчание SYN (connect-таймаут) — транзиент (ErrTimeout).
+//	    Классифицирует httpworker/worker.go workerClassifyError по
+//	    httpfetch.IsTimeout (net.Error.Timeout).
+//	А3  HTTP-этап (О7–О9) пишет итог БЕЗ охраны check_state <> done
+//	    (в отличие от DNS-операторов): повторная доставка обязана
+//	    переиздать q:analyze, фильтр done отбросил бы публикацию
+//	    навсегда (httpworker/record.go, комментарий файла). Плата —
+//	    теоретическая гонка со свежей перепроверкой, окно практически
+//	    недостижимо (попытки доставки исчерпываются за минуты, recheck
+//	    измеряется месяцами).
+//
+// ## Наблюдаемость аномалии «статус повис» (ФТ-2.2)
+//
+// О6 без О7–О9 (задача q:http потеряна — компенсатора нет) оставляет
+// домен в status = new ∧ check_state = done: нормой состояние НЕ
+// является (О6 обязан завершиться HTTP-итогом), наблюдается gauge
+// crawler_domains_new_done_stale и алертом domains_new_done_stale
+// (проход monitor/zonestats.go по счётчикам реконсиляции, без seq scan
+// по domains). Автолечения нет — лечит регулярная перепроверка T-030;
+// сигнал — оператору.
 type Status int16
 
 // Статусы домена (ТЗ 6.2). Комментарии — значения из таблицы §6.2.

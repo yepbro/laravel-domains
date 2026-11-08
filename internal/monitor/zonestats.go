@@ -51,7 +51,11 @@
 //     reanalyze:YYYY-MM-DD"T"HH24 (T-204: строки с rules_version IS
 //     NULL по часам эпизодов — guard часового тика переанализа; те же
 //     FILTER-позиции prev/cur агрегата окна, две живые корзины,
-//     устаревшие удаляет);
+//     устаревшие удаляет), new_done_stale — домены «статус повис»
+//     (status = new ∧ check_state = done ∧ last_checked_at старше
+//     суток, ФТ-2.2 ТЗ-fsm: FILTER-колонка f_new_done_stale того же
+//     скана; стационарно ноль — норма, автолечения нет — gauge/алерт
+//     сигнал оператору);
 //   - дрейф |старое − новое| каждой позиции: до перезаписи читаются
 //     прежние значения, после — новые (транзакция видит собственную
 //     запись); ненулевой дрейф — gauge crawler_counters_drift + Warn
@@ -181,9 +185,20 @@ func init() {
 // когортами в полночь); суммы по зонам — значения корзин
 // retry_mature:YYYY-MM-DD, читаемых guard тяжёлой выборки ретрая
 // (scheduler/retry.go, retryMatureSQL), FILTER-цена нуля на том же
-// скане.
+// скане. f_new_done_stale — домены «статус повис» (ФТ-2.2 ТЗ-fsm,
+// T-256): status = new ∧ check_state = done ∧ last_checked_at <
+// current_date — DNS-этап записал ветку «есть адреса» (О6 общей
+// таблицы статусов, internal/model/enums.go), а HTTP-итог (О7–О9) не
+// пришёл (задача q:http потеряна, компенсатора нет). Граница суток —
+// точность колонки last_checked_at (date, ТЗ 6.1), та же реализация
+// «старше 24 ч», что у окна ретрая T-031/T-202 (retrySelectSQL:
+// date < now() − 24ч эквивалентно date < current_date). NULL
+// last_checked_at не считается: писатели done ставят отметку всегда,
+// NULL у new∧done — мусор ручного SQL, а не повисший статус. Сумма по
+// зонам — значение строки new_done_stale и gauge
+// crawler_domains_new_done_stale; стационарно ноль в норме.
 var domainsAggSQL = func() string {
-	cols := make([]string, 0, len(statusAggCols)+9)
+	cols := make([]string, 0, len(statusAggCols)+10)
 	cols = append(cols,
 		fmt.Sprintf("count(*) FILTER (WHERE status <> %d) AS total", int16(model.StatusDeleted)),
 		fmt.Sprintf("count(*) FILTER (WHERE status <> %d AND check_state = %d) AS pending", int16(model.StatusDeleted), int16(model.CheckStatePending)),
@@ -197,15 +212,17 @@ var domainsAggSQL = func() string {
 		"count(*) FILTER (WHERE last_checked_at = current_date) AS f_checks_today",
 		fmt.Sprintf("count(*) FILTER (WHERE last_checked_at = current_date AND status = %d) AS f_temp_today", int16(model.StatusTempError)),
 		fmt.Sprintf("count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at = current_date) AS f_retry_mature_today", int16(model.StatusTempError), int16(model.CheckStateDone)),
-		fmt.Sprintf("count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at < current_date) AS f_retry_mature_past", int16(model.StatusTempError), int16(model.CheckStateDone)))
+		fmt.Sprintf("count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at < current_date) AS f_retry_mature_past", int16(model.StatusTempError), int16(model.CheckStateDone)),
+		fmt.Sprintf("count(*) FILTER (WHERE status = %d AND check_state = %d AND last_checked_at < current_date) AS f_new_done_stale", int16(model.StatusNew), int16(model.CheckStateDone)))
 	return "SELECT zone_id, " + strings.Join(cols, ", ") + " FROM domains GROUP BY zone_id"
 }()
 
 // zoneAggRow — строка per-zone агрегата (колонки domainsAggSQL): значения
 // состояний и легенда статусов по порядку statusAggCols + бит рендера +
-// суточное окно проверок (T-179), его temp_error-числитель (T-182) и
+// суточное окно проверок (T-179), его temp_error-числитель (T-182),
 // корзины зрелости ретрая (T-202: сегодняшние/созревшие эпизоды
-// temp_error × done).
+// temp_error × done) и домены «статус повис» (ФТ-2.2: new ∧ done ∧
+// старше суток).
 type zoneAggRow struct {
 	zone                            int16
 	total, pending, queued, checked int64
@@ -215,6 +232,7 @@ type zoneAggRow struct {
 	tempToday                       int64 // FILTER last_checked_at = current_date AND status = temp_error (T-182)
 	retryToday                      int64 // FILTER status = temp_error AND done AND last_checked_at = current_date (T-202)
 	retryPast                       int64 // FILTER status = temp_error AND done AND last_checked_at < current_date (T-202)
+	newDoneStale                    int64 // FILTER status = new AND done AND last_checked_at < current_date (ФТ-2.2, T-256)
 }
 
 // recountAggQuerySQL — чтение per-zone агрегата прохода (единственный
@@ -620,12 +638,15 @@ const (
 // (T-203/T-204) сюда не входят: имена дней/часов вычисляет БД
 // (readDailyChecksSQL/recountDailyChecksSQL, их temp-пары, пары корзин
 // ретрая и часовых корзин), в unnest-пачке с Go-именами их нет.
+// new_done_stale (ФТ-2.2) — абсолютный уровень, как status_*: пишется
+// только реконсиляцией (инкрементов нет), читается точечным лукапом
+// алерта domains_new_done_stale и gauge'ом цикла.
 func CounterNames() []string {
-	names := make([]string, 0, len(model.Statuses)+3)
+	names := make([]string, 0, len(model.Statuses)+4)
 	for _, s := range model.Statuses {
 		names = append(names, "status_"+s.String())
 	}
-	return append(names, "render_pending", "laravel_appeared_total", "laravel_lost_total")
+	return append(names, "render_pending", "laravel_appeared_total", "laravel_lost_total", "new_done_stale")
 }
 
 // driftCounterNames — глобальные строки с ДЕЛЬТА-ведомой семантикой:
@@ -815,6 +836,14 @@ type ZoneStatsResult struct {
 	// дрейф. Пустой может быть только у прохода с фильтром несуществующей
 	// зоны.
 	Positions []CounterPosition
+	// NewDoneStale — домены «статус повис» (ФТ-2.2 ТЗ-fsm, T-256):
+	// status = new ∧ check_state = done ∧ last_checked_at старше суток —
+	// сумма FILTER-колонки f_new_done_stale per-zone агрегата; значение
+	// строки new_done_stale и gauge crawler_domains_new_done_stale
+	// (цикл ZoneStatsLoop). Стационарно ноль в норме; ненулевое —
+	// потерянная задача q:http (О6 без О7–О9, общая таблица статусов
+	// internal/model/enums.go), автолечения нет — сигнал оператору.
+	NewDoneStale int64
 }
 
 // zoneColumnPositions — метрики позиций колонок зоны (порядок —
@@ -991,10 +1020,11 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	// без циклов блокировок. Ротация суток — просто новая строка: проход
 	// после полуночи создаёт её значением окна, вчерашняя остаётся
 	// историей темпа.
-	var checksToday, tempToday int64
+	var checksToday, tempToday, newDoneStale int64
 	for i := range agg {
 		checksToday += agg[i].checksToday
 		tempToday += agg[i].tempToday
+		newDoneStale += agg[i].newDoneStale
 	}
 	newDaily, err := writeDailyCounter(ctx, tx, recountDailyChecksSQL, checksToday, now(), "суточная строка проверок")
 	if err != nil {
@@ -1082,7 +1112,7 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		return ZoneStatsResult{}, fmt.Errorf("monitor: реконсиляция счётчиков: фиксация: %w", err)
 	}
 
-	res := ZoneStatsResult{Zones: int64(len(newZones)), Positions: make([]CounterPosition, 0, len(newZones)*len(zoneColumnPositions)+len(driftCounterNames())+len(dailyStreamingPositions())+len(retryMatureStreamingPositions())+len(hourlyStreamingPositions()))}
+	res := ZoneStatsResult{Zones: int64(len(newZones)), NewDoneStale: newDoneStale, Positions: make([]CounterPosition, 0, len(newZones)*len(zoneColumnPositions)+len(driftCounterNames())+len(dailyStreamingPositions())+len(retryMatureStreamingPositions())+len(hourlyStreamingPositions()))}
 	for _, id := range zoneIDs {
 		nz, ok := newZones[id]
 		if !ok {
@@ -1199,8 +1229,8 @@ type laravelAggRow struct {
 
 // readZoneAgg — per-zone агрегат domainsAggSQL: колонки в порядке
 // домена, затем легенда statusAggCols, бит рендера, суточное окно
-// проверок, его temp_error-числитель (T-179/T-182) и корзины зрелости
-// ретрая (T-202). Приёмник — db.DB
+// проверок, его temp_error-числитель (T-179/T-182), корзины зрелости
+// ретрая (T-202) и домены «статус повис» (ФТ-2.2). Приёмник — db.DB
 // (транзакция прохода или пул verify: агрегат один, точка правды —
 // ТЗИ §9).
 func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
@@ -1213,12 +1243,12 @@ func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
 	for rows.Next() {
 		var r zoneAggRow
 		r.statuses = make([]int64, len(statusAggCols))
-		dest := make([]any, 0, 5+len(statusAggCols)+5)
+		dest := make([]any, 0, 5+len(statusAggCols)+6)
 		dest = append(dest, &r.zone, &r.total, &r.pending, &r.queued, &r.checked)
 		for i := range r.statuses {
 			dest = append(dest, &r.statuses[i])
 		}
-		dest = append(dest, &r.render, &r.checksToday, &r.tempToday, &r.retryToday, &r.retryPast)
+		dest = append(dest, &r.render, &r.checksToday, &r.tempToday, &r.retryToday, &r.retryPast, &r.newDoneStale)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("monitor: реконсиляция счётчиков: агрегат: чтение: %w", err)
 		}
@@ -1440,20 +1470,22 @@ func writeDailyCounter(ctx context.Context, tx pgx.Tx, sqlQ string, value int64,
 // и кумулятивов журнала. Одна точка правды соответствия «зона →
 // глобальные суммы» для реконсиляции и verify (ТЗИ §9).
 func globalCounters(agg []zoneAggRow, appeared, lost int64) map[string]int64 {
-	out := make(map[string]int64, len(statusAggCols)+3)
+	out := make(map[string]int64, len(statusAggCols)+4)
 	for i, c := range statusAggCols {
 		out["status_"+c.status.String()] = 0
 		for j := range agg {
 			out["status_"+c.status.String()] += agg[j].statuses[i]
 		}
 	}
-	var render int64
+	var render, newDoneStale int64
 	for j := range agg {
 		render += agg[j].render
+		newDoneStale += agg[j].newDoneStale
 	}
 	out["render_pending"] = render
 	out["laravel_appeared_total"] = appeared
 	out["laravel_lost_total"] = lost
+	out["new_done_stale"] = newDoneStale
 	return out
 }
 
@@ -1564,6 +1596,10 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 			log.Warn("проход реконсиляции счётчиков", "err", err)
 		default:
 			reportDrift(log, m, res, first)
+			// Gauge «статус повис» (ФТ-2.2) — уровень, а не дрейф:
+			// выставляется каждым успешным проходом, включая первый
+			// заполняющий (стационар — честный ноль).
+			m.setNewDoneStale(res.NewDoneStale)
 			log.Debug("проход реконсиляции счётчиков", "zones", res.Zones)
 			// «Первый» снимается только успешным проходом (ревью P3-5):
 			// сбойный старт (БД ещё не готова) счётчиков не заполнил —
@@ -1650,12 +1686,17 @@ func reportDrift(log *slog.Logger, m *zoneStatsLoopMetrics, res ZoneStatsResult,
 }
 
 // zoneStatsLoopMetrics — приборы цикла реконсиляции (T-161/T-178):
-// длительность прохода, счётчик пропущенных тиков и gauge дрейфа;
-// nil-приёмник — no-op (цикл без реестра, стиль scheduler.backlogLoopMetrics).
+// длительность прохода, счётчик пропущенных тиков, gauge дрейфа и gauge
+// доменов «статус повис» (ФТ-2.2, T-256); nil-приёмник — no-op (цикл без
+// реестра, стиль scheduler.backlogLoopMetrics).
 type zoneStatsLoopMetrics struct {
 	seconds prometheus.ObserverVec
 	skipped *prometheus.CounterVec
 	drift   *prometheus.GaugeVec
+	// newDoneStale — значение строки new_done_stale прохода (уровень,
+	// не дрейф): выставляется каждым успешным проходом, включая первый
+	// заполняющий (в отличие от дрейфа — норма ноль и «заполнять» нечего).
+	newDoneStale *prometheus.GaugeVec
 }
 
 // newZoneStatsLoopMetrics — приборы в реестре reg (nil — nil). Корзины —
@@ -1682,6 +1723,10 @@ func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
 			Name: "crawler_counters_drift",
 			Help: "Дрейф инкрементальных счётчиков на проходе реконсиляции: |старое − новое| по позициям (zone:<id>:колонка, global:<имя>; daily:checks и daily:temp_error — суточный темп проверок и его temp_error-числитель, T-179/T-182). Стационар — 0, устойчивый ненулевой дрейф — пропущенный переход или ручной SQL мимо кода (разбор — docs/runbooks.md, T-178); исключения — потоковые позиции (считают события против живых доменов/строк, ненулевые под живой нагрузкой — наблюдаемая величина, в Warn не входят): суточные daily:* (T-179/T-182), корзины зрелости ретрая retry_mature:past/retry_mature:today (T-202), часовые корзины темпа rendered:prev/rendered:cur/results:prev/results:cur (T-203 — prev/cur: предыдущий и текущий календарный час) и хвостов переанализа reanalyze:prev/reanalyze:cur (T-204).",
 		}, "counter"),
+		newDoneStale: reg.MustGauge(prometheus.GaugeOpts{
+			Name: "crawler_domains_new_done_stale",
+			Help: "Домены «статус повис» (ФТ-2.2 ТЗ-fsm, T-256): status = new ∧ check_state = done ∧ last_checked_at старше суток — DNS-этап записал ветку «есть адреса», HTTP-итог не пришёл (потеря задачи q:http, компенсатора нет). Значение — FILTER-колонка прохода реконсиляции (строка crawler_counters new_done_stale, без seq scan по domains), обновляется раз в monitor.zone_stats_interval. Стационарно 0 в норме; ненулевое — алерт domains_new_done_stale (стрик 2 прохода), автолечения нет — лечит регулярная перепроверка; спецификация автомата статусов — internal/model/enums.go.",
+		}),
 	}
 }
 
@@ -1699,6 +1744,15 @@ func (m *zoneStatsLoopMetrics) skip() {
 		return
 	}
 	m.skipped.WithLabelValues().Inc()
+}
+
+// setNewDoneStale — выставляет gauge доменов «статус повис» значением
+// успешного прохода (ФТ-2.2); nil — no-op.
+func (m *zoneStatsLoopMetrics) setNewDoneStale(n int64) {
+	if m == nil {
+		return
+	}
+	m.newDoneStale.WithLabelValues().Set(float64(n))
 }
 
 // ---------------------------------------------------------------- verify
