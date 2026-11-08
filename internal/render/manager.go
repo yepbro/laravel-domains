@@ -3,7 +3,6 @@ package render
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -24,7 +23,7 @@ const maxRestartsPerTask = 2
 // браузера каждые N страниц и при превышении порога памяти»): старт,
 // перезапуски и graceful stop. Владеет текущим поколением «браузер + пул»;
 // задачи выполняет Run — конкурентно, как Pool.Run (вызывает цикл очередей,
-// T-067).
+// T-067). Состояния и переходы поколения — автомат T-263 (genstate.go).
 //
 // Смена поколения не ждёт задач старого пула: старый пул уходит на graceful
 // stop фоновой горутиной (дорабатывает свои страницы — каждая ограничена
@@ -124,11 +123,12 @@ func (m *Manager) Start() error {
 // Restart=on-failure) зонд сам восстанавливает поколение — пауза
 // потребления не зависает навсегда. Ошибка старта — false: потребление
 // остаётся на паузе (доставки не расходуют попытки, T-025), следующий
-// вызов зонда повторит старт.
+// вызов зонда повторит старт. Закрытость менеджера и живость поколения —
+// предикатом автомата genStateLocked (genstate.go, T-263).
 func (m *Manager) Alive() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed.Load() {
+	if m.genStateLocked() == genClosed {
 		return false
 	}
 	if reason, swap := m.swapReasonLocked(); swap {
@@ -162,66 +162,6 @@ func (m *Manager) acquire() (*Pool, error) {
 	}
 	m.p.wg.Add(1)
 	return m.p, nil
-}
-
-// swapReasonLocked — причина смены поколения, если она нужна. Порог памяти
-// проверяется по RSS дерева процессов (Browser.RSS, proc.go); неизвестный
-// RSS (remote-режим dev-стека) не триггерует — там жёсткий потолок держит
-// mem_limit контейнера Chromium (ТЗ 3.2/10.1). Закрытый пул — страховка от
-// гонки «поколение сменилось сразу после acquire»: закрытое поколение
-// заменяется, а ошибки ErrClosed не копятся до исчерпания попыток задачи.
-func (m *Manager) swapReasonLocked() (string, bool) {
-	// Эквивалентный мутант (T-M08): вырезание тела if с m.b == nil
-	// проваливается в !m.b.Alive() — nil-guard Alive возвращает false,
-	// решение о смене поколения то же (true); отличается только
-	// строка-причина, а она уходит исключительно в текст slog.Info
-	// перезапуска (логирование, §4 docs/mutation-testing.md).
-	// mutator-disable-next-line branch/if
-	if m.b == nil {
-		return "первый старт", true
-	}
-	if !m.b.Alive() {
-		return "браузер недоступен", true
-	}
-	if m.p == nil || m.p.closed.Load() {
-		return "пул закрыт", true
-	}
-	if m.b.NeedsRestart() {
-		return fmt.Sprintf("порог страниц %d (отрендерено %d)",
-			m.b.opts.RestartEveryPages, m.b.Pages()), true
-	}
-	// Порог памяти: RSS читается одним проходом /proc — значение идёт и в
-	// проверку, и в сообщение (R-06); контроль отключён — /proc не читается
-	// вовсе. Неизвестный RSS (remote-режим) не триггерует.
-	if m.b.opts.MemoryThreshold > 0 {
-		// Эквивалентны только мутанты левой половины условия (T-M08; тот
-		// же вывод, что у Browser.OverMemory в browser.go): при пороге
-		// >= 1 (guard выше) `rss > 0` неотличимо от `>= 0`/`> -1`/`true`
-		// — rss == 0 и rss == -1 отбрасываются правой половиной (0/-1 >=
-		// порог неверно), rss == 1 недостижим (RSS из /proc кратен
-		// странице). Строчная гранулярность аннотации гасит и двух
-		// убиваемых мутантов правой половины — trade-off §4
-		// docs/mutation-testing.md: вырезание `rss >= порог` (осталось
-		// бы `rss > 0` — перезапуск при любом положительном RSS) и
-		// границу `>= -> >` (равенство RSS == порогу через живой /proc
-		// недетерминированно). Вырезание правой половины закреплено
-		// TestManagerMemoryRestartBoundaries (порог выше живого RSS —
-		// без перезапуска); граница `>= -> >` детерминированного
-		// прикрытия не имеет вовсе (равенство RSS == порогу через живой
-		// /proc недостижимо) — из тестов она закрыта только для копии
-		// выражения в Browser.OverMemory (TestBrowserOverMemory,
-		// SIGSTOP-фиксация RSS).
-		// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer, numbers/incrementer
-		if rss := m.b.RSS(); rss > 0 && rss >= m.b.opts.MemoryThreshold {
-			return fmt.Sprintf("порог памяти %d MiB (RSS %d MiB)",
-				// Логирование (§4 docs/mutation-testing.md): сдвиги и ±1
-				// аргументов меняют только текст сообщения о причине
-				// перезапуска, не решение о нём.
-				// mutator-disable-next-line arithmetic/bitwise, numbers/decrementer, numbers/incrementer
-				m.b.opts.MemoryThreshold>>20, rss>>20), true
-		}
-	}
-	return "", false
 }
 
 // restartLocked стартует новое поколение. Старый пул выводится из работы
