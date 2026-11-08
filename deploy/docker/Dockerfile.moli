@@ -53,13 +53,20 @@ RUN apt-get update -yq \
 # архитектура — по TARGETARCH BuildKit (amd64/arm64), релизные ассеты есть
 # для обеих. Tarball содержит каталог верхнего уровня с бинарём —
 # --strip-components=1 (как в официальном moli-installer.sh).
+# Загрузка устойчива к флапу release-CDN GitHub (инцидент 08.11.2026:
+# два падения CI подряд, 504 раннерам при живом ассете): 504/503/таймаут
+# — transient для curl, --retry повторяет попытку внутри того же RUN;
+# --max-time ограничивает зависшую попытку, чтобы повторы успели
+# случиться. Ошибки вроде 404 (битый пин версии) повторами НЕ считаются —
+# падаем сразу, как и раньше.
 ARG TARGETARCH
 RUN set -eu \
  && case "${TARGETARCH}" in \
       arm64) moli_target=aarch64-unknown-linux-gnu ;; \
       *) moli_target=x86_64-unknown-linux-gnu ;; \
     esac \
- && curl -fsSLo /tmp/moli.tar.gz \
+ && curl -fsSL --retry 5 --retry-delay 5 --connect-timeout 15 --max-time 90 \
+      -o /tmp/moli.tar.gz \
       "https://github.com/lexmount/moli/releases/download/${MOLI_VERSION}/moli-${moli_target}.tar.gz" \
  && echo "${MOLI_SHA256}  /tmp/moli.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/moli.tar.gz -C /tmp --strip-components=1 \
