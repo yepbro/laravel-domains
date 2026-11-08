@@ -826,12 +826,14 @@ func recordRichResult() (*DomainResult, map[string]content.Hash) {
 					Variant: model.VariantMain, Scheme: model.SchemeHTTPS,
 					SubdomainID: 1, Label: "www",
 					FinalURL: final, Host: "rich.example", Path: "/",
-					HTTPStatus:       200,
-					Header:           http.Header{"Server": []string{"nginx"}},
-					ResponseMS:       456,
-					Redirects:        []httpfetch.RedirectStep{{URL: "https://www.rich.example/", Status: 301}, {URL: final, Status: 200}},
-					Truncated:        true,
-					ContentNotStored: true, // обрезанное тело не хранится (T-056)
+					HTTPStatus: 200,
+					Header:     http.Header{"Server": []string{"nginx"}},
+					ResponseMS: 456,
+					Redirects:  []httpfetch.RedirectStep{{URL: "https://www.rich.example/", Status: 301}, {URL: final, Status: 200}},
+					Truncated:  true,
+					// Алиас обрезанной страницы после Save: контент
+					// класса — у оригинала (T-055), ContentNotStored
+					// у алиасов не ставится (матрица Р8, T-266/T-056).
 					AliasKind:        model.AliasRedirect,
 					AliasSubdomainID: &aliasTo,
 					ErrClass:         ErrBody,
@@ -1922,6 +1924,22 @@ func TestRecordValidation(t *testing.T) {
 			return res
 		}(), "дубликат"},
 		{"ContentNotStored с хэшем", newRes(func(r *Record) { r.ContentNotStored = true }), "T-056"},
+		{"ContentNotStored у алиаса", newRes(func(r *Record) {
+			r.AliasKind = model.AliasRedirect
+			id := int16(1)
+			r.AliasSubdomainID = &id
+			r.ContentHash = nil
+			r.StoreContent = false
+			r.ContentNotStored = true
+		}), "T-056"},
+		{"оригинал без контента и признака", newRes(func(r *Record) { r.ContentHash = nil }), "T-056"},
+		{"алиас с StoreContent", newRes(func(r *Record) {
+			r.AliasKind = model.AliasRedirect
+			id := int16(1)
+			r.AliasSubdomainID = &id
+			r.StoreContent = true
+		}), "T-055"},
+		{"класс записи вне доступной проверки", newRes(func(r *Record) { r.ErrClass = ErrTimeout }), "доступной"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

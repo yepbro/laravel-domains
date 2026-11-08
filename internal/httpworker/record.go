@@ -928,8 +928,13 @@ func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 				return nil, fmt.Errorf("httpworker: домен %s: субдомен %d, вариант %d: дубликат ключа subdomain_results", res.Name, sub.SubdomainID, int16(rec.Variant))
 			}
 			seen[key] = struct{}{}
-			if err := recordValidateRow(res.Name, sub, rec); err != nil {
-				return nil, err
+			// Граница этапа (T-266, ТЗ-fsm §3 ФТ-12): инварианты
+			// контентной части записи (AliasNone ⇔ alias_id,
+			// ContentNotStored ⇒ hash=nil и прочие — матрица Р1–Р8)
+			// проверяет централизованный валидатор автомата
+			// (schemestate.go), прежде — recordValidateRow.
+			if err := rec.validate(); err != nil {
+				return nil, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 			}
 
 			var httpStatus *int16
@@ -1007,33 +1012,6 @@ func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 type recordKey struct {
 	sub     int16
 	variant model.Variant
-}
-
-// recordValidateRow — инварианты записи (коды модели §6.1; контракт
-// алиасов T-055: вид связи ⟺ ссылка; ContentHash либо nil, либо полный
-// 16-байтный хэш — типизирован content.Hash, проверка длины — страховка
-// прямых вызовов). Обрезанному телу хэша для хранения не полагается
-// (T-056) — ContentNotStored ⇒ hash nil.
-func recordValidateRow(name string, sub *SubdomainResult, rec *Record) error {
-	if !rec.Variant.Valid() {
-		return fmt.Errorf("httpworker: домен %s: субдомен %d: вариант %d", name, sub.SubdomainID, int16(rec.Variant))
-	}
-	if !rec.Scheme.Valid() {
-		return fmt.Errorf("httpworker: домен %s: субдомен %d: схема %d", name, sub.SubdomainID, int16(rec.Scheme))
-	}
-	if !rec.AliasKind.Valid() {
-		return fmt.Errorf("httpworker: домен %s: субдомен %d: вид алиаса %d", name, sub.SubdomainID, int16(rec.AliasKind))
-	}
-	if (rec.AliasKind == model.AliasNone) != (rec.AliasSubdomainID == nil) {
-		return fmt.Errorf("httpworker: домен %s: субдомен %d: alias_kind %d ⟺ alias_subdomain_id (контракт T-055)", name, sub.SubdomainID, int16(rec.AliasKind))
-	}
-	if rec.ContentHash != nil && len(*rec.ContentHash) != content.HashLen {
-		return fmt.Errorf("httpworker: домен %s: субдомен %d: content_hash %d байт (нужно %d)", name, sub.SubdomainID, len(*rec.ContentHash), content.HashLen)
-	}
-	if rec.ContentNotStored && rec.ContentHash != nil {
-		return fmt.Errorf("httpworker: домен %s: субдомен %d: ContentNotStored при живом content_hash (контракт T-056)", name, sub.SubdomainID)
-	}
-	return nil
 }
 
 // recordJSON сериализует значение в jsonb-колонку, когда оно есть

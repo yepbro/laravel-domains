@@ -322,9 +322,17 @@ type SchemeCheck struct {
 	// первоисточника (до его заголовков) переносится в ResponseMS —
 	// запись-оригинал алиас-класса несёт реальное время ответа страницы;
 	// метрики времени ответа кэш-попадания по-прежнему не наблюдают.
+	// Состояние кэш-попадания — строки С4–С6 матрицы автомата (T-266,
+	// schemestate.go).
 	Cached bool
 	// FinalURL — итоговый URL (страница в конце цепочки, ТЗ 5.5 п. 4);
-	// nil при ошибке загрузки.
+	// nil при ошибке загрузки. При кэш-попадании (Cached) поле несёт
+	// СТАРТОВЫЙ URL проверки, а не итоговый URL первоисточника:
+	// итоговый URL с query (?i=1 — ключ кэша query не включает,
+	// workerCacheKey) записывается своей без-запросной формой, Redirects —
+	// синтетический единственный шаг. Осознанное искажение, не меняется
+	// (T-266, ТЗ-fsm §3 ФТ-12; хост/путь — критерии T-054/T-055 —
+	// совпадают точно).
 	FinalURL *url.URL
 	// Status — код статуса итогового ответа.
 	Status int
@@ -950,6 +958,17 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 		rec.AliasKind = ar.AliasKind
 		rec.AliasSubdomainID = ar.AliasSubdomainID
 		rec.StoreContent = ar.StoreContent
+	}
+
+	// Граница этапа (T-266, ТЗ-fsm §3 ФТ-12): результат домена собран
+	// целиком — все проверки и записи прогоняются через централизованные
+	// валидаторы автомата состояния проверки схемы (schemestate.go,
+	// validateResult) до передачи в Options.OnResult (первое звено —
+	// ContentSaver, T-056). Нелегальная комбинация полей — баг
+	// построения результата: доставка q:http возвращается без XACK
+	// (ТЗ 3.4), мусор в БД не попадает.
+	if err := validateResult(res); err != nil {
+		return nil, fmt.Errorf("httpworker: домен %s: %w", task.Name, err)
 	}
 
 	// Реестр ранних Put (T-147) — в результат: ContentSaver.Save сверит
