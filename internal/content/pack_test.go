@@ -228,6 +228,14 @@ func (p *packFakePool) row(h Hash) (packFakeRow, bool) {
 	return packFakeRow(*r), true
 }
 
+// dropRow — удалить строку contents из фейка (путь retention/
+// компактификации: строка уходит целиком, не через счётчик).
+func (p *packFakePool) dropRow(h Hash) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.contents, h)
+}
+
 func (p *packFakePool) snapshotCalls() []packCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -669,6 +677,117 @@ func TestPackDeadRowInvisible(t *testing.T) {
 	}
 	if got, err := st.Get(ctx, res.Hash); err != nil || string(got) != string(d) {
 		t.Errorf("Get воскрешённого контента: %v", err)
+	}
+}
+
+// TestPackRefcountFSM — инвариантный проход автомата refcount (T-265,
+// ТЗ-fsm §3 ФТ-11; спецификация — doc-комментарий pack.go): цепочка
+// П1→П2→П4→П5 (absent → live → tombstone), запрет двойного снятия (И4),
+// невидимость мёртвого для Get и дедупа (И2), воскрешение П6 с переводом
+// размещения на свежий блок (И3) и клэмп-представление «строки нет» П7.
+// Соседние поведенческие тесты (TestPackDeadRowInvisible, контракт
+// StoreContract) закрывают те же операторы по сценариям — здесь
+// состояния закреплены явно, по таблице переходов. Живая PostgreSQL —
+// test/integration/content_test.go (TestContent_RefcountFSM).
+func TestPackRefcountFSM(t *testing.T) {
+	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
+	ctx := context.Background()
+	d := []byte("автомат refcount: absent → live(n) → dead → deleted")
+
+	// П1: С0 absent → С1(1) вставкой, Created = true.
+	res, err := st.Put(ctx, d)
+	if err != nil {
+		t.Fatalf("Put нового контента: %v", err)
+	}
+	if !res.Created {
+		t.Error("первый Put: Created = false, want true (П1 — вставка)")
+	}
+	live1, ok := pool.row(res.Hash)
+	if !ok || live1.refc != 1 {
+		t.Fatalf("после П1: строка %+v (found=%v), want refcount 1", live1, ok)
+	}
+
+	// П2: С1(1) → С1(2) дедупом, байты не пишутся.
+	dup, err := st.Put(ctx, append([]byte(nil), d...))
+	if err != nil {
+		t.Fatalf("Put-дедуп: %v", err)
+	}
+	if dup.Created {
+		t.Error("Put-дедуп: Created = true, want false (П2)")
+	}
+	if row, _ := pool.row(res.Hash); row.refc != 2 {
+		t.Errorf("после П2: refcount = %d, want 2", row.refc)
+	}
+
+	// П4: С1(2) → С1(1) — снятие одной ссылки.
+	if err := st.Delete(ctx, res.Hash); err != nil {
+		t.Fatalf("Delete при двух ссылках: %v", err)
+	}
+	if row, _ := pool.row(res.Hash); row.refc != 1 {
+		t.Errorf("после П4: refcount = %d, want 1", row.refc)
+	}
+
+	// П5: С1(1) → С2 dead·tombstone — строка остаётся с refcount = 0.
+	if err := st.Delete(ctx, res.Hash); err != nil {
+		t.Fatalf("Delete последней ссылки: %v", err)
+	}
+	row, ok := pool.row(res.Hash)
+	if !ok {
+		t.Fatal("П5: мёртвая строка обязана остаться в contents до компактификации (tombstone)")
+	}
+	if row.refc != 0 {
+		t.Fatalf("П5: refcount = %d, want 0", row.refc)
+	}
+
+	// И2: мёртвая невидима Get; дедуп её не видит (следующий Put пойдёт
+	// в upsert, не в AddRef); И4: двойное снятие — ErrNotFound.
+	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get мёртвой (И2): %v, want ErrNotFound", err)
+	}
+	if err := st.Delete(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
+		t.Errorf("повторный Delete (И4): %v, want ErrNotFound", err)
+	}
+
+	// П6: С2 → С1(1) воскрешение — DO UPDATE от нуля, размещение
+	// переводится на свежий блок (EXCLUDED), Created = false.
+	res2, err := st.Put(ctx, d)
+	if err != nil {
+		t.Fatalf("Put воскрешения: %v", err)
+	}
+	if res2.Created {
+		t.Error("воскрешение tombstone: Created = true, want false (П6 — DO UPDATE)")
+	}
+	rised, ok := pool.row(res.Hash)
+	if !ok || rised.refc != 1 {
+		t.Fatalf("после П6: строка %+v (found=%v), want refcount 1", rised, ok)
+	}
+	if rised.packID == live1.packID && rised.off == live1.off {
+		t.Error("П6: размещение не переведено на свежий блок (EXCLUDED)")
+	}
+	if got, err := st.Get(ctx, res.Hash); err != nil || string(got) != string(d) {
+		t.Errorf("Get воскрешённого: %v", err)
+	}
+
+	// П7 (представление «строки нет»): удаление строки руками — путь
+	// retention/компактификации (retentionDeleteSQL/sqlCompactDeadPack) —
+	// и воскрешение веткой вставки: Created = true, неотличимо от нового
+	// контента.
+	pool.dropRow(res.Hash)
+	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get отсутствующей строки: %v, want ErrNotFound", err)
+	}
+	if err := st.Delete(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Delete отсутствующей строки (И4): %v, want ErrNotFound", err)
+	}
+	res3, err := st.Put(ctx, d)
+	if err != nil {
+		t.Fatalf("Put после удаления строки: %v", err)
+	}
+	if !res3.Created {
+		t.Error("воскрешение отсутствующей строки: Created = false, want true (П7 — INSERT)")
+	}
+	if row, ok := pool.row(res.Hash); !ok || row.refc != 1 {
+		t.Errorf("после П7: строка %+v (found=%v), want refcount 1", row, ok)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -49,6 +50,7 @@ func contentTestEnv(t *testing.T, mutate func(*content.PackOptions)) (*content.P
 // contentRow — строка contents для проверок напрямую в БД.
 type contentRow struct {
 	packID int32
+	off    int64
 	clen   int32
 	rawLen int32
 	refc   int32
@@ -60,8 +62,8 @@ func contentRowByHash(t *testing.T, pool *pgxpool.Pool, h content.Hash) (content
 	t.Helper()
 	var r contentRow
 	err := pool.QueryRow(context.Background(),
-		"SELECT pack_id, len, raw_len, refcount FROM contents WHERE hash = $1", h[:],
-	).Scan(&r.packID, &r.clen, &r.rawLen, &r.refc)
+		"SELECT pack_id, off, len, raw_len, refcount FROM contents WHERE hash = $1", h[:],
+	).Scan(&r.packID, &r.off, &r.clen, &r.rawLen, &r.refc)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return r, false
 	}
@@ -705,4 +707,235 @@ func TestContent_DiskFullPause(t *testing.T) {
 	if _, err := st2.Put(ctx, parkingPage("ok.example", "места достаточно")); err != nil {
 		t.Fatalf("Put при живом пороге: %v", err)
 	}
+}
+
+// TestContent_RefcountFSM — инварианты автомата refcount на живой
+// PostgreSQL (T-265, ТЗ-fsm §3 ФТ-11; спецификация — doc-комментарий
+// internal/content/pack.go): воскрешение tombstone-строки идёт веткой
+// ON CONFLICT DO UPDATE — refcount 0→1, размещение переведено на свежий
+// блок (EXCLUDED), Created = false; строка, удалённая целиком
+// (представление retention/компактификации), воскресает веткой INSERT —
+// Created = true; двойной Delete мёртвого — ErrNotFound. Юнит-проход по
+// таблице переходов — internal/content (TestPackRefcountFSM).
+func TestContent_RefcountFSM(t *testing.T) {
+	skipUnlessIntegration(t)
+	st, pool := contentTestEnv(t, nil)
+	ctx := context.Background()
+	page := parkingPage("fsm.example", "автомат refcount")
+
+	res, err := st.Put(ctx, page)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if !res.Created {
+		t.Error("первый Put: Created = false, want true (вставка)")
+	}
+	if _, err := st.Put(ctx, append([]byte(nil), page...)); err != nil {
+		t.Fatalf("Put-дедуп: %v", err)
+	}
+	oldRow, ok := contentRowByHash(t, pool, res.Hash)
+	if !ok || oldRow.refc != 2 {
+		t.Fatalf("после дедупа: строка %+v (found=%v), want refcount 2", oldRow, ok)
+	}
+
+	// live(2) → dead·tombstone: обе ссылки сняты, строка остаётся.
+	for i := 0; i < 2; i++ {
+		if err := st.Delete(ctx, res.Hash); err != nil {
+			t.Fatalf("Delete %d: %v", i+1, err)
+		}
+	}
+	row, ok := contentRowByHash(t, pool, res.Hash)
+	if !ok || row.refc != 0 {
+		t.Fatalf("tombstone: строка %+v (found=%v), want refcount 0", row, ok)
+	}
+	if err := st.Delete(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
+		t.Errorf("повторный Delete мёртвой: %v, want ErrNotFound", err)
+	}
+
+	// П6: воскрешение tombstone — DO UPDATE, размещение EXCLUDED.
+	again, err := st.Put(ctx, page)
+	if err != nil {
+		t.Fatalf("Put воскрешения: %v", err)
+	}
+	if again.Created {
+		t.Error("воскрешение tombstone: Created = true, want false (DO UPDATE)")
+	}
+	row, _ = contentRowByHash(t, pool, res.Hash)
+	if row.refc != 1 {
+		t.Errorf("после воскрешения: refcount = %d, want 1", row.refc)
+	}
+	if row.packID == oldRow.packID && row.off == oldRow.off {
+		t.Error("воскрешение не перевело размещение на свежий блок (EXCLUDED)")
+	}
+	if got, err := st.Get(ctx, res.Hash); err != nil || string(got) != string(page) {
+		t.Errorf("Get воскрешённого: %v", err)
+	}
+
+	// Представление «строки нет» (путь retention T-166 / вычистки
+	// компактификации T-045): строка удалена целиком — Get/Delete как у
+	// мёртвого, воскрешение веткой INSERT, Created = true.
+	if _, err := pool.Exec(ctx, "DELETE FROM contents WHERE hash = $1", res.Hash[:]); err != nil {
+		t.Fatalf("удаление строки: %v", err)
+	}
+	if _, ok := contentRowByHash(t, pool, res.Hash); ok {
+		t.Fatal("строка обязана быть удалена")
+	}
+	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
+		t.Errorf("Get отсутствующей: %v, want ErrNotFound", err)
+	}
+	if err := st.Delete(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
+		t.Errorf("Delete отсутствующей: %v, want ErrNotFound", err)
+	}
+	fresh, err := st.Put(ctx, page)
+	if err != nil {
+		t.Fatalf("Put после удаления строки: %v", err)
+	}
+	if !fresh.Created {
+		t.Error("воскрешение отсутствующей строки: Created = false, want true (INSERT)")
+	}
+	if row, ok := contentRowByHash(t, pool, res.Hash); !ok || row.refc != 1 {
+		t.Errorf("после INSERT-воскрешения: строка %+v (found=%v), want refcount 1", row, ok)
+	}
+}
+
+// TestContent_RefcountClampDesync — клэмп GREATEST(refcount − n, 0) при
+// рассинхроне на живой PostgreSQL (T-265, инвариант И1 автомата
+// refcount, переход П9): две остаревшие записи ссылаются на контент со
+// счётчиком 1 — агрегированное срезание двух ссылок клэмпится в ноль, а
+// не в минус, строка удаляется той же транзакцией (retention минует
+// tombstone), проход не падает и не триггерит CHECK
+// contents_refcount_check (миграция 000019). Юнит-проход —
+// internal/content (TestRetentionOnce_ClampDesync).
+func TestContent_RefcountClampDesync(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	ctx := context.Background()
+
+	var zone int16
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO zones (name) VALUES ('clamp.test') RETURNING id").Scan(&zone); err != nil {
+		t.Fatalf("insert zones: %v", err)
+	}
+	var id int64
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO domains (zone_id, label) VALUES ($1, 'clamp') RETURNING id", zone,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert domains: %v", err)
+	}
+
+	// Рассинхрон: держателей 2, счётчик 1 (одна ссылка уже снята иным
+	// путём — сценарий ошибки учёта, которую клэмп прощает нулём).
+	h := make([]byte, 16)
+	h[15] = 0x42
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount)
+		VALUES ($1, 1, 0, 10, 20, 1)`, h); err != nil {
+		t.Fatalf("посев contents: %v", err)
+	}
+	for sub := int16(0); sub < 2; sub++ {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, checked_at, content_hash)
+			VALUES ($1, $2, $3, 2, now() - interval '2 hours', $4)`, zone, id, sub, h); err != nil {
+			t.Fatalf("посев результата sub=%d: %v", sub, err)
+		}
+	}
+
+	stats, err := content.RetentionOnce(ctx, pool, content.RetentionOptions{
+		Retention: time.Hour,
+		BatchSize: 100,
+	})
+	if err != nil {
+		t.Fatalf("RetentionOnce при рассинхроне: %v", err)
+	}
+	if stats.Rows != 2 || stats.Refs != 2 || stats.Contents != 1 || stats.FreedBytes != 10 {
+		t.Fatalf("stats = %+v, want Rows=2 Refs=2 Contents=1 FreedBytes=10 (клэмп 1−2 → 0)", stats)
+	}
+	if stats.BadHashes != 0 || stats.Missing != 0 || stats.Skipped || stats.SkippedPending {
+		t.Errorf("аномалий быть не должно: %+v", stats)
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM contents WHERE hash = $1", h).Scan(&n); err != nil {
+		t.Fatalf("чтение contents: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("contents после клэмпа: строк %d, want 0 (refcount дошёл до нуля — удалена)", n)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM subdomain_results WHERE content_hash IS NOT NULL").Scan(&n); err != nil {
+		t.Fatalf("чтение subdomain_results: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("ссылок осталось %d, want 0 (обе записи очищены)", n)
+	}
+}
+
+// TestSchema_ContentsRefcountCheck — парный тест-инвариант CHECK
+// contents_refcount_check (T-265, ФТ-11, миграция 000019): refcount < 0
+// отвергается схемой (23514) на INSERT и UPDATE, tombstone refcount = 0
+// легален (мёртвое представление № 1, T-042), ограничение добавлено
+// NOT VALID (convalidated = false — VALIDATE по регламенту миграций,
+// docs/schema.md «CHECK-инварианты»); contents не секционирована —
+// объект один.
+func TestSchema_ContentsRefcountCheck(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	ctx := context.Background()
+
+	// Легальные строки: живая refcount = 1 и tombstone refcount = 0.
+	ins := func(hb byte, refc int) error {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount)
+			VALUES ($1, 1, 0, 10, 20, $2)`, refcTestHash(hb), refc)
+		return err
+	}
+	if err := ins(0x01, 1); err != nil {
+		t.Fatalf("живая строка refcount 1: %v", err)
+	}
+	if err := ins(0x02, 0); err != nil {
+		t.Fatalf("tombstone refcount 0: %v (нулевая строка легальна — мёртвая до компактификации T-045)", err)
+	}
+
+	// Нарушение инварианта: INSERT с refcount = −1 — 23514 схемой.
+	if err := ins(0x03, -1); err == nil || !strings.Contains(err.Error(), "contents_refcount_check") {
+		t.Errorf("INSERT refcount −1: err = %v, want violation contents_refcount_check", err)
+	}
+	// UPDATE существующей строки в минус — тоже отвергается (NOT VALID
+	// бдит новые и изменяемые строки).
+	if _, err := pool.Exec(ctx,
+		"UPDATE contents SET refcount = -1 WHERE hash = $1", refcTestHash(0x01)); err == nil ||
+		!strings.Contains(err.Error(), "contents_refcount_check") {
+		t.Errorf("UPDATE в минус: err = %v, want violation contents_refcount_check", err)
+	}
+
+	// NOT VALID: ограничение в схеме теста (фильтр по current_schema —
+	// в БД живут схемы соседних прогонов) ещё не валидировано; contents
+	// не секционирована (миграция 000001) — объект один.
+	rows, err := pool.Query(ctx,
+		`SELECT count(*) FILTER (WHERE convalidated) AS validated, count(*) AS total
+		 FROM pg_constraint
+		 WHERE conname = 'contents_refcount_check'
+		   AND connamespace = current_schema()::regnamespace`)
+	if err != nil {
+		t.Fatalf("pg_constraint: %v", err)
+	}
+	defer rows.Close()
+	var validated, total int
+	if !rows.Next() || rows.Scan(&validated, &total) != nil {
+		t.Fatalf("чтение pg_constraint: %v", rows.Err())
+	}
+	if total != 1 {
+		t.Fatalf("ограничение в схеме теста на %d объектах, want 1 (миграция 000019)", total)
+	}
+	if validated != 0 {
+		t.Errorf("convalidated = true, want false (NOT VALID, VALIDATE — по регламенту)")
+	}
+}
+
+// refcTestHash — 16-октетный хэш с байтом-заполнителем (посев
+// TestSchema_ContentsRefcountCheck).
+func refcTestHash(b byte) []byte {
+	h := make([]byte, 16)
+	h[15] = b
+	return h
 }

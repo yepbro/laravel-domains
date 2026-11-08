@@ -704,6 +704,12 @@ SELECT count(*) FROM subdomain_results
 WHERE rendered AND render_failed_at IS NOT NULL;
 ```
 
+Разведочный запрос нарушителей `contents_refcount_check` (T-265):
+
+```sql
+SELECT count(*) FROM contents WHERE refcount < 0;
+```
+
 Парные тест-инварианты —
 `test/integration` (нарушение отвергается, `convalidated = false` до
 VALIDATE).
@@ -711,6 +717,7 @@ VALIDATE).
 | Ограничение | Таблица | Инвариант | Миграция | Тест |
 |---|---|---|---|---|
 | `subdomain_results_rendered_check` | `subdomain_results` | `rendered = true ⇒ render_failed_at IS NULL` — «отрендерена И невозможна» бессмысленна (T-259, ТЗ-fsm §3 ФТ-5.2; охраны писателей — `renderUpdateSQL`/`renderFailMarkerSQL`, `internal/renderworker`) | 000018, NOT VALID | `TestSchema_ResultsRenderedCheck`, `test/integration/render_late_test.go` |
+| `contents_refcount_check` | `contents` | `refcount >= 0` — отрицательный счётчик ломает семантику «0 = мёртвый» и маскирует двойное списание ссылки (T-265, ТЗ-fsm §3 ФТ-11; охраны писателей — предикаты `refcount > 0` у точечных операторов, `GREATEST`-клэмп у массовых, спецификация автомата — doc-комментарий `internal/content/pack.go`) | 000019, NOT VALID | `TestSchema_ContentsRefcountCheck`, `test/integration/content_test.go` |
 
 ## Идемпотентность записи
 

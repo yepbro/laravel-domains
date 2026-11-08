@@ -782,6 +782,46 @@ func TestRetentionOnce_DedupAggregation(t *testing.T) {
 	}
 }
 
+// TestRetentionOnce_ClampDesync — клэмп GREATEST при рассинхроне учёта
+// (T-265, инвариант И1 автомата refcount, спецификация — doc-комментарий
+// pack.go, переход П9): агрегированное срезание больше фактического
+// refcount (две остаревшие ссылки на контент со счётчиком 1) не уводит
+// счётчик в минус: 1 − 2 клэмпится в 0, строка удаляется как лишившаяся
+// последней ссылки (retention минует tombstone), проход не падает.
+// Отрицательный refcount отвергал бы и CHECK contents_refcount_check
+// (миграция 000019) — клэмп гарантирует, что массовый проход его не
+// триггерит. Поведение GREATEST против живой PostgreSQL —
+// test/integration (TestContent_RefcountClampDesync).
+func TestRetentionOnce_ClampDesync(t *testing.T) {
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	pool := newRetentionFakePool(now)
+	old := now.Add(-2 * DefaultRetention)
+	pool.domains[retentionDomKey{zone: 1, id: 10}] = retentionFakeDomain{}
+	pool.results = []retentionRow{
+		{key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0x22)},
+		{key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}, checkedAt: old, hash: retentionHash16(0x22)},
+	}
+	// Рассинхрон: держателей 2, счётчик 1 (ссылка уже снята иным путём).
+	pool.contents[retentionHash(0x22)] = retentionFakeContent{refc: 1, clen: 5000}
+
+	stats, err := RetentionOnce(context.Background(), pool, retentionDefaultOpts())
+	if err != nil {
+		t.Fatalf("RetentionOnce при рассинхроне: %v", err)
+	}
+	if stats.Refs != 2 || stats.Contents != 1 || stats.FreedBytes != 5000 {
+		t.Fatalf("stats = %+v, want Refs=2 Contents=1 FreedBytes=5000 (клэмп 1−2 → 0, строка удалена)", stats)
+	}
+	if c, ok := pool.contents[retentionHash(0x22)]; ok {
+		t.Errorf("contents после клэмпа = %+v, want удалена (refcount дошёл до нуля)", c)
+	}
+	for _, sub := range []int16{0, 1} {
+		r := pool.row(retentionKey{zone: 1, domain: 10, sub: sub, variant: 0})
+		if r == nil || r.hash != nil {
+			t.Errorf("запись sub=%d не очищена: %+v", sub, r)
+		}
+	}
+}
+
 // TestRetentionOnce_SharedContentLives — контент, на который ссылается
 // ещё не остаревшая запись, не умирает (refcount > 0 после decref).
 func TestRetentionOnce_SharedContentLives(t *testing.T) {

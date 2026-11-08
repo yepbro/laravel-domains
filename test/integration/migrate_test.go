@@ -283,6 +283,13 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		// 000017 (T-210): маркер render_failed_at — down-эффект, чтобы
 		// повторный Up применил миграцию на чистую колонку.
 		"ALTER TABLE subdomain_results DROP COLUMN IF EXISTS render_failed_at",
+		// 000018 (T-259) отдельной записи не требует: её CHECK
+		// subdomain_results_rendered_check умирает вместе с колонкой
+		// render_failed_at (каскад DROP COLUMN) — эффект уже снят
+		// строкой выше. 000019 (T-265): CHECK refcount — down-эффект,
+		// чтобы повторный Up применил ограничение на чистую таблицу
+		// (иначе ADD CONSTRAINT падает 42710 duplicate_object).
+		"ALTER TABLE contents DROP CONSTRAINT IF EXISTS contents_refcount_check",
 		"TRUNCATE schema_migrations",
 		"INSERT INTO schema_migrations (version, dirty) VALUES (7, false)",
 	} {
