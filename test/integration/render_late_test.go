@@ -385,3 +385,93 @@ func TestSchema_ResultsRenderedCheck(t *testing.T) {
 			validated, total)
 	}
 }
+
+// latePinSelectSQL — полный текст lateRenderRowsSQL с литералами
+// параметров (T-271; якорь — internal/httpworker/renderlate.go,
+// дублирование — стиль rqBatchSQL; коды схемы литералами:
+// FlagRenderPending = 2, StatusDeleted = 6).
+const latePinSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, " +
+	"r.content_hash, r.alias_subdomain_id, d.label || '.' || z.name " +
+	"FROM subdomain_results AS r " +
+	"JOIN domains AS d ON d.zone_id = r.zone_id AND d.id = r.domain_id " +
+	"JOIN zones AS z ON z.id = r.zone_id " +
+	"WHERE r.rendered = false AND r.final_url IS NOT NULL AND r.render_failed_at IS NULL " +
+	"AND r.checked_at < now() - interval '6 hours' " +
+	"AND (d.flags & 2) = 0 " +
+	"AND d.status <> 6 " +
+	"AND (r.zone_id, r.domain_id, r.subdomain_id, r.variant) > (0::int2, 0::int8, 0::int2, 0::int2) " +
+	"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
+	"LIMIT 1000"
+
+// TestRenderLateSelectPlanPinned — закрепление формы плана выборки пачки
+// позднего переиздателя (T-271; до задачи форма сознательно не
+// закреплялась — инцидент 08–09.11.2026 показал деградацию до
+// seq scan + hash join + Sort ≈1 ГиБ, вместе с соседним retention-сканом
+// — пять OOM-киллов PostgreSQL за ночь): внутри транзакции закрепления
+// (SET LOCAL seq/hash/merge/bitmap off — те же литералы
+// internal/httpworker/renderlate.go) EXPLAIN показывает Index Scan по
+// PK subdomain_results + Limit, без Hash/Merge Join и Seq Scan (ORDER BY
+// PK — порядок индекса, Sort-узла не ожидается). Bitmap выключен
+// доводкой T-271: битмап-путь не сохраняет порядок PK-курсора → явный
+// Sort, форма недетерминирована.
+func TestRenderLateSelectPlanPinned(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	ctx := context.Background()
+
+	var zone int16
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO zones (name) VALUES ('late-pin.test') RETURNING id").Scan(&zone); err != nil {
+		t.Fatalf("insert zones: %v", err)
+	}
+	var id int64
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO domains (zone_id, label) VALUES ($1, 'late-pin') RETURNING id", zone,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert domains: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at)
+		VALUES ($1, $2, 0, 2, 'https://late-pin.test/', now() - interval '7 hours')`,
+		zone, id); err != nil {
+		t.Fatalf("посев результата: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, pin := range []string{
+		"SET LOCAL enable_seqscan = off",
+		"SET LOCAL enable_hashjoin = off",
+		"SET LOCAL enable_mergejoin = off",
+		"SET LOCAL enable_bitmapscan = off",
+	} {
+		if _, err := tx.Exec(ctx, pin); err != nil {
+			t.Fatalf("%s: %v", pin, err)
+		}
+	}
+	plan := explainPlan(t, tx, ctx, latePinSelectSQL)
+	if !planIdxScanRe.MatchString(plan) {
+		t.Errorf("закреплённый план без Index Scan по PK subdomain_results:\n%s", plan)
+	}
+	if !strings.Contains(plan, "Limit") {
+		t.Errorf("закреплённый план без Limit (ранний останов пачки):\n%s", plan)
+	}
+	for _, bad := range []string{"Hash Join", "Merge Join", "Seq Scan"} {
+		if strings.Contains(plan, bad) {
+			t.Errorf("закреплённый план содержит %q (SET LOCAL не подействовал):\n%s", bad, plan)
+		}
+	}
+	// Bitmap-путь и Sort — другой диагноз, чем невыключенные GUC:
+	// закрепление действует, но форма не закрыта до конца — битмап не
+	// сохраняет порядок индекса, ORDER BY PK закрывается явным Sort
+	// (доводка T-271). Incremental Sort тут допустимой формы не
+	// составляет: PK-порядок даёт сам индексный скан.
+	for _, bad := range []string{"Sort", "Bitmap Index Scan", "Bitmap Heap Scan"} {
+		if strings.Contains(plan, bad) {
+			t.Errorf("закреплённый план содержит %q (порядок курсора ломается — форма не закреплена до конца):\n%s", bad, plan)
+		}
+	}
+}

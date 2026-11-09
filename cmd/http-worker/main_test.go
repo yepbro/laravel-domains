@@ -8,7 +8,9 @@
 // T-174): фолбэк «0 — общий scheduler.queue_high_watermark» и кламп
 // MAXLEN/2 (queue.StreamWatermark); и проводка AfterConnect-хуков пула
 // сервиса (afterConnectHooks, T-201): NoParallelGather — сериальность
-// retention-дренажа + LockTimeout (T-192); и структурный инвариант
+// retention-дренажа + LockTimeout (T-192); и гейт тяжёлых фоновых
+// сканов (scanGate, T-271): retention ↔ render-late не совпадают в
+// PostgreSQL; и структурный инвариант
 // остановки run (TestRunBackgroundJoin, T-223): производная отмена +
 // WaitGroup — каждый фоновый цикл Add/Done, джойн-defer исполняется до
 // defer-закрытий ресурсов (разборщик — общий internal/bgjoin, T-232).
@@ -18,6 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"reflect"
 	"runtime"
 	"strings"
@@ -303,6 +309,87 @@ func TestAfterConnectHooks(t *testing.T) {
 	for i, h := range afterConnectHooks {
 		if h == nil {
 			t.Errorf("AfterConnect-хук #%d — nil: настройка сессии потеряна", i)
+		}
+	}
+}
+
+// TestScanGate — проводка общего семафора тяжёлых фоновых сканов
+// (scanGate, T-271): retention-дренаж и поздний переиздатель обязаны
+// делить ОДИН гейт ёмкости 1 — совпадение их сканов в PostgreSQL и было
+// инцидентом 08–09.11.2026 (пять OOM-киллов за ночь: два деградировавших
+// курсорных SELECT по ≈1 ГиБ поверх shared_buffers 2 ГиБ). Граница
+// покрытия — как у TestAfterConnectHooks (ревью T-201, P3-1): закреплён
+// сам гейт (ёмкость 1, не nil); последнее звено — строки Gate в опциях
+// циклов run — TestScanGateLoopWiring (ревью T-271, P3-4). Взаимное
+// исключение держателей — TestScanGate в internal/db; поведение под
+// гейтом — TestRetentionSelectGate/TestRenderLateSelectGate в пакетах
+// циклов.
+func TestScanGate(t *testing.T) {
+	if scanGate == nil {
+		t.Fatal("scanGate = nil: гейт тяжёлых сканов не создан — циклы уйдут без сериализации (T-271)")
+	}
+	if cap(scanGate) != 1 {
+		t.Fatalf("ёмкость scanGate = %d, want 1 (один тяжёлый скан на сервис)", cap(scanGate))
+	}
+}
+
+// TestScanGateLoopWiring — последнее звено проводки scanGate: поле Gate
+// в опциях циклов run (ревью T-271, P3-4). Выпадение строки Gate молчало
+// бы во всех остальных проверках: TestScanGate закрепляет сам гейт,
+// тесты пакетов циклов — поведение под переданным гейтом, но никто не
+// проверял, что run его передаёт. Прогнать run в юнит-тесте нельзя
+// (живые Postgres/Redis), вынос сборки опций в шов-функцию — отдельная
+// задача (признана ревью T-201, P3-1: стиль проекта — Options инлайн),
+// поэтому инвариант закреплён разбором main.go через go/ast — прецедент
+// TestRunBackgroundJoin/bgjoin (T-223). Инвариант: литералы
+// LateOptions/RetentionOptions существуют ровно по одному (каждый цикл
+// запускается) и содержат Gate: scanGate.
+func TestScanGateLoopWiring(t *testing.T) {
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("разбор main.go: %v", err)
+	}
+	literals := map[string]int{ // литералы опций циклов по типам
+		"httpworker.LateOptions":   0,
+		"content.RetentionOptions": 0,
+	}
+	ast.Inspect(parsed, func(n ast.Node) bool {
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		sel, ok := lit.Type.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		typ := pkg.Name + "." + sel.Sel.Name
+		if _, known := literals[typ]; !known {
+			return true
+		}
+		literals[typ]++
+		for _, el := range lit.Elts {
+			kv, ok := el.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "Gate" {
+				if val, ok := kv.Value.(*ast.Ident); !ok || val.Name != "scanGate" {
+					t.Errorf("%s: Gate = %s, want scanGate — цикл уйдёт без гейта (T-271)", typ, types.ExprString(kv.Value))
+				}
+				return true
+			}
+		}
+		t.Errorf("%s{...}: поле Gate отсутствует — тяжёлый скан цикла без single-flight (T-271)", typ)
+		return true
+	})
+	for typ, n := range literals {
+		if n != 1 {
+			t.Errorf("литералов %s в main.go = %d, want 1 (цикл запускается ровно один раз)", typ, n)
 		}
 	}
 }

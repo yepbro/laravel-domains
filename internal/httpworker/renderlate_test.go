@@ -8,14 +8,19 @@
 // SPA-вердикт по контенту и наследование алиасом, курсорная дисциплина
 // (пачка целиком — курсор вперёд, короткая — замыкание, Full/ошибка —
 // курсор на месте), метрика crawler_render_late_republish_total, цикл.
-// Поведение против живых PostgreSQL/Redis — test/integration
-// render_late_test.go.
+// ТЗ T-271: tx-оболочка закрепления плана выборки (SET LOCAL ×4 →
+// SELECT → COMMIT), потолок SelectTimeout, гейт тяжёлых сканов и
+// backoff цикла после ошибки. Поведение против живых PostgreSQL/Redis —
+// test/integration render_late_test.go.
 package httpworker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -103,7 +108,9 @@ type lateSeedDomain struct {
 // окно возраста, бит render_pending, status <> deleted, курсор PK,
 // LIMIT; алиасный запрос — предикаты renderPendingRowsSQL по субдоменам
 // ANY); SQL сопоставляется ТОЧНО (неожидаемый — ошибка, тест падает
-// громко, стиль renderqPool).
+// громко, стиль renderqPool). С T-271 пул — RecordDB: тяжёлая выборка
+// идёт в транзакции закрепления плана (Begin → lateTx), алиасный запрос
+// остаётся точечным через пул.
 type latePool struct {
 	mu      sync.Mutex
 	domains map[lateKey]*lateSeedDomain // key.domain — идентификатор (sub/variant нулевые)
@@ -113,9 +120,14 @@ type latePool struct {
 	aliasErr  error
 	rowsCalls int
 	aliasLast []int16 // субдомены последнего алиасного запроса
+	begins    int
+	txs       []*lateTx
+	// rowsBlock — «зависшая» выборка: ответ только по ctx-дедлайну
+	// (тест ctx-таймаута T-271).
+	rowsBlock bool
 }
 
-var _ db.DB = (*latePool)(nil)
+var _ RecordDB = (*latePool)(nil)
 
 func newLatePool() *latePool {
 	return &latePool{domains: make(map[lateKey]*lateSeedDomain)}
@@ -142,14 +154,73 @@ func (p *latePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	switch sql {
-	case lateRenderRowsSQL:
-		return p.queryRows(args)
 	case lateRenderAliasSQL:
 		return p.queryAlias(args)
 	default:
 		return nil, fmt.Errorf("latePool: неожидаемый SQL Query: %s", sql)
 	}
 }
+
+// Begin — транзакция закрепления плана (T-271): тяжёлая выборка пачки
+// идёт через lateTx, точечные запросы остаются в пуле.
+func (p *latePool) Begin(context.Context) (pgx.Tx, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.begins++
+	tx := &lateTx{pool: p}
+	p.txs = append(p.txs, tx)
+	return tx, nil
+}
+
+// lateTx — транзакция закрепления плана: SET LOCAL ×4 до SELECT
+// (T-271), calls — упорядоченный журнал операторов (контракт порядка,
+// стиль retentionFakeTx.calls).
+type lateTx struct {
+	pgx.Tx // остальные методы pgx.Tx проход не использует
+
+	pool      *latePool
+	calls     []string
+	committed bool
+}
+
+func (t *lateTx) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	t.calls = append(t.calls, sql)
+	switch {
+	case sql == latePlanNoSeqScanSQL || sql == latePlanNoHashJoinSQL ||
+		sql == latePlanNoMergeJoinSQL || sql == latePlanNoBitmapScanSQL ||
+		strings.HasPrefix(sql, "SET LOCAL statement_timeout = "):
+		return pgconn.NewCommandTag("SET"), nil
+	default:
+		return pgconn.CommandTag{}, fmt.Errorf("lateTx: неожидаемый Exec %q", sql)
+	}
+}
+
+func (t *lateTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	// «Зависшая» выборка (тест ctx-таймаута T-271): ответ только по
+	// дедлайну, до журналов и семантики.
+	if sql == lateRenderRowsSQL && t.pool.rowsBlock {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	t.calls = append(t.calls, sql)
+	if sql != lateRenderRowsSQL {
+		return nil, fmt.Errorf("lateTx: неожидаемый SQL Query: %s", sql)
+	}
+	return t.pool.queryRows(args)
+}
+
+func (t *lateTx) Commit(context.Context) error {
+	t.pool.mu.Lock()
+	defer t.pool.mu.Unlock()
+	t.committed = true
+	return nil
+}
+
+func (t *lateTx) Rollback(context.Context) error { return nil }
 
 func (p *latePool) queryRows(args []any) (pgx.Rows, error) {
 	if p.rowsErr != nil {
@@ -355,12 +426,14 @@ func lateOpts() LateOptions { return LateOptions{BatchSize: 100, After: testLate
 // TestRenderLateSelect — точный SQL выборки: курсор row-value > по PK,
 // ORDER BY PK, LIMIT, граница возраста параметром; предикаты (rendered,
 // final_url, маркер, возраст, бит render_pending, deleted) — живой
-// смысл фейка проверяется поведением ниже.
+// смысл фейка проверяется поведением ниже. Выборка идёт в tx-оболочке
+// закрепления плана (T-271) — порядок операторов проверяет
+// TestRenderLateSelectPlan.
 func TestRenderLateSelect(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
 	cur := &RenderLateCursor{}
-	rows, err := lateSelect(ctx, f.pool, time.Now().Add(-testLateAfter), cur.key, 100)
+	rows, err := lateSelect(ctx, f.pool, lateOpts(), time.Now().Add(-testLateAfter), cur.key)
 	if err != nil {
 		t.Fatalf("lateSelect пустого пула: %v", err)
 	}
@@ -370,7 +443,7 @@ func TestRenderLateSelect(t *testing.T) {
 
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10, sub: 0, variant: 0}, old: true, finalURL: "https://x/", hash: f.spaHash[:]})
-	rows, err = lateSelect(ctx, f.pool, time.Now().Add(-testLateAfter), cur.key, 100)
+	rows, err = lateSelect(ctx, f.pool, lateOpts(), time.Now().Add(-testLateAfter), cur.key)
 	if err != nil {
 		t.Fatalf("lateSelect: %v", err)
 	}
@@ -383,8 +456,124 @@ func TestRenderLateSelect(t *testing.T) {
 
 	// Курсор: строка за курсором не выбирается.
 	cur.key = rows[0].key
-	if rows, err = lateSelect(ctx, f.pool, time.Now().Add(-testLateAfter), cur.key, 100); err != nil || len(rows) != 0 {
+	if rows, err = lateSelect(ctx, f.pool, lateOpts(), time.Now().Add(-testLateAfter), cur.key); err != nil || len(rows) != 0 {
 		t.Fatalf("выборка за курсором: %d строк (err=%v), хочу 0", len(rows), err)
+	}
+}
+
+// TestRenderLateSelectPlan — закрепление формы плана выборки (T-271):
+// пачка читается в явной транзакции строго последовательностью
+// SET LOCAL ×5 (seq/hash/merge/bitmap off + statement_timeout) → SELECT →
+// COMMIT (реплика T-181/T-191; без закрепления деградировавший план —
+// seq scan + hash join + Sort ≈1 ГиБ — клал PostgreSQL OOM, инцидент
+// 08–09.11.2026); выборка идёт через транзакцию, не пул. Bitmap-путь
+// выключен доводкой T-271: битмап ломает порядок PK-курсора → явный
+// Sort, форма перестаёт быть детерминированной.
+func TestRenderLateSelectPlan(t *testing.T) {
+	f := newLateFixture(t)
+	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
+	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://x/", hash: f.spaHash[:]})
+
+	if _, err := LateOnce(context.Background(), f.pool, f.bodies, f.renderQ(t), f.pending, f.met, lateOpts(), &RenderLateCursor{}); err != nil {
+		t.Fatalf("LateOnce: %v", err)
+	}
+	if len(f.pool.txs) != 1 {
+		t.Fatalf("транзакций = %d, хочу 1 (tx-оболочка выборки)", len(f.pool.txs))
+	}
+	tx := f.pool.txs[0]
+	// Тексты закрепления — литералы (контракт интеграционного
+	// EXPLAIN-теста, стиль renderq_test.go).
+	if latePlanNoSeqScanSQL != "SET LOCAL enable_seqscan = off" ||
+		latePlanNoHashJoinSQL != "SET LOCAL enable_hashjoin = off" ||
+		latePlanNoMergeJoinSQL != "SET LOCAL enable_mergejoin = off" ||
+		latePlanNoBitmapScanSQL != "SET LOCAL enable_bitmapscan = off" ||
+		lateSelectTimeoutFmt != "SET LOCAL statement_timeout = '%dms'" {
+		t.Fatalf("тексты закрепления плана изменены")
+	}
+	want := []string{
+		latePlanNoSeqScanSQL,
+		latePlanNoHashJoinSQL,
+		latePlanNoMergeJoinSQL,
+		latePlanNoBitmapScanSQL,
+		fmt.Sprintf(lateSelectTimeoutFmt, DefaultRenderLateSelectTimeout.Milliseconds()),
+		lateRenderRowsSQL,
+	}
+	if len(tx.calls) != len(want) {
+		t.Fatalf("операторов tx-оболочки = %d, хочу %d (SET LOCAL ×5 + SELECT): %v", len(tx.calls), len(want), tx.calls)
+	}
+	for i, sql := range want {
+		if tx.calls[i] != sql {
+			t.Errorf("шаг %d = %s, хочу %s (порядок SET LOCAL ×5 → SELECT)", i, tx.calls[i], sql)
+		}
+	}
+	if !tx.committed {
+		t.Error("tx-оболочка выборки не зафиксирована")
+	}
+}
+
+// TestRenderLateSelectCtxTimeout — зависшая выборка режется клиентским
+// ctx-дедлайном SelectTimeout (T-271): обёрнутая ошибка с контекстом
+// «выборка», курсор на месте — пачка повторится (идемпотентность, ТЗ 3.4).
+func TestRenderLateSelectCtxTimeout(t *testing.T) {
+	f := newLateFixture(t)
+	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
+	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://x/", hash: f.spaHash[:]})
+	f.pool.rowsBlock = true // SELECT не отвечает до отмены ctx
+
+	opts := lateOpts()
+	opts.SelectTimeout = 40 * time.Millisecond
+	cur := &RenderLateCursor{}
+	_, err := LateOnce(context.Background(), f.pool, f.bodies, f.renderQ(t), f.pending, f.met, opts, cur)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "выборка") {
+		t.Fatalf("ошибка = %v, хочу обёрнутый context.DeadlineExceeded «выборка»", err)
+	}
+	if cur.key != (lateKey{}) {
+		t.Fatalf("курсор при таймауте = %+v, хочу нулевой (пачка повторится)", cur.key)
+	}
+	if len(f.published()) != 0 {
+		t.Fatalf("публикаций = %d, хочу 0", len(f.published()))
+	}
+}
+
+// TestRenderLateSelectGate — тяжёлая выборка под общим гейтом сканов
+// (db.ScanGate, T-271): занятый гейт держит выборку ДО Begin, отпускание
+// пропускает её; взаимное исключение двух держателей — TestScanGate в
+// internal/db.
+func TestRenderLateSelectGate(t *testing.T) {
+	f := newLateFixture(t)
+	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
+	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://x/", hash: f.spaHash[:]})
+	gate := make(db.ScanGate, 1)
+	if err := gate.Acquire(context.Background()); err != nil {
+		t.Fatalf("занятие гейта тестом: %v", err)
+	}
+	opts := lateOpts()
+	opts.Gate = gate
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := lateSelect(context.Background(), f.pool, opts, time.Now().Add(-testLateAfter), lateKey{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("выборка прошла под занятым гейтом: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	f.pool.mu.Lock()
+	begins := f.pool.begins
+	f.pool.mu.Unlock()
+	if begins != 0 {
+		t.Fatalf("Begin под занятым гейтом: транзакций %d, хочу 0 (гейт до Begin)", begins)
+	}
+	gate.Release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("выборка после освобождения гейта: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("выборка не прошла после освобождения гейта")
 	}
 }
 
@@ -761,18 +950,30 @@ func TestRenderLateValidation(t *testing.T) {
 	}
 }
 
-// TestRenderLateDefaults — дефолты опций (интервал/пачка/окно) и состав
-// стримов интерлока.
+// TestRenderLateDefaults — дефолты опций (интервал/пачка/окно/таймаут/
+// backoff) и состав стримов интерлока.
 func TestRenderLateDefaults(t *testing.T) {
 	o := LateOptions{}.withDefaults()
 	if o.Interval != DefaultRenderLateInterval || o.BatchSize != DefaultRenderLateBatch || o.After != DefaultRenderLateAfter {
 		t.Fatalf("дефолты %+v", o)
+	}
+	if o.SelectTimeout != DefaultRenderLateSelectTimeout {
+		t.Errorf("SelectTimeout = %s, хочу %s (T-271)", o.SelectTimeout, DefaultRenderLateSelectTimeout)
+	}
+	if o.ErrorBackoff != DefaultRenderLateErrorBackoff {
+		t.Errorf("ErrorBackoff = %s, хочу %s (T-271)", o.ErrorBackoff, DefaultRenderLateErrorBackoff)
 	}
 	if DefaultRenderLateInterval != time.Minute {
 		t.Fatalf("интервал %s, хочу минуту (стиль прохода доработки)", DefaultRenderLateInterval)
 	}
 	if DefaultRenderLateAfter != 6*time.Hour {
 		t.Fatalf("окно возраста %s, хочу 6 ч (ФТ-5.3)", DefaultRenderLateAfter)
+	}
+	if DefaultRenderLateSelectTimeout != 60*time.Second {
+		t.Errorf("потолок выборки %s, хочу 60 с (T-271)", DefaultRenderLateSelectTimeout)
+	}
+	if DefaultRenderLateErrorBackoff != 15*time.Minute {
+		t.Errorf("backoff ошибки %s, хочу 15 мин (T-271)", DefaultRenderLateErrorBackoff)
 	}
 	want := []string{queue.StreamRender, queue.StreamRenderFallback}
 	if len(lateRenderStreams) != 2 || lateRenderStreams[0] != want[0] || lateRenderStreams[1] != want[1] {
@@ -827,5 +1028,67 @@ func TestRenderLateLoop(t *testing.T) {
 	}
 	if n2 != n1 {
 		t.Fatalf("публикации растут после интерлока: %d → %d, хочу стабилизацию", n1, n2)
+	}
+}
+
+// TestRenderLateLoop_Backoff — ошибка прохода переводит тикер в backoff
+// (T-271): тик 10-мс интервала не перезапускает проход немедленно
+// (инцидент 08–09.11.2026 — проход в только что поднятый после
+// OOM-килла PostgreSQL); тик паузы повторяет проход, дублей нет
+// (публикация не состоялась), Warn в журнале.
+func TestRenderLateLoop_Backoff(t *testing.T) {
+	f := newLateFixture(t)
+	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
+	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://spa/", hash: f.spaHash[:]})
+	f.pool.rowsErr = errors.New("потеря соединения: unexpected EOF")
+
+	var buf bytes.Buffer
+	opts := LateOptions{
+		Interval:     10 * time.Millisecond, // без backoff — ~10 проходов на 100 мс
+		BatchSize:    100,
+		After:        testLateAfter,
+		ErrorBackoff: 250 * time.Millisecond, // пауза ошибочного тика
+		Log:          slog.New(slog.NewTextHandler(&buf, nil)),
+	}
+	attempts := func() int {
+		f.pool.mu.Lock()
+		defer f.pool.mu.Unlock()
+		return f.pool.begins // каждая попытка прохода открывает tx-оболочку выборки
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- RenderLateLoop(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, opts) }()
+
+	// Первый тик ошибся; следующие тики интервала не перезапускают
+	// проход в пределах паузы backoff.
+	time.Sleep(80 * time.Millisecond)
+	if n := attempts(); n != 1 {
+		cancel()
+		t.Fatalf("попыток за паузу backoff = %d, хочу 1 (без backoff ~8)", n)
+	}
+	// Тик паузы повторяет проход (ошибка держится — пауза сохраняется).
+	deadline := time.Now().Add(3 * time.Second)
+	for attempts() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := attempts(); n < 2 {
+		cancel()
+		t.Fatalf("повтора после паузы нет: попыток %d, хочу ≥2", n)
+	}
+	if pub := len(f.published()); pub != 0 {
+		cancel()
+		t.Fatalf("публикаций = %d, хочу 0 (проходы ошибаются до издания)", pub)
+	}
+	// Лог читается только после остановки цикла: горутина цикла пишет в
+	// тот же буфер (ревью T-271 P2-1 — bytes.Buffer не потокобезопасен).
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("цикл не завершился после отмены ctx")
+	}
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("лог = %q, хочу Warn ошибочного прохода", buf.String())
 	}
 }

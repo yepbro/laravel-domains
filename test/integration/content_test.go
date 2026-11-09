@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -938,4 +939,133 @@ func refcTestHash(b byte) []byte {
 	h := make([]byte, 16)
 	h[15] = b
 	return h
+}
+
+// retentionPinSelectSQL — полный текст retentionSelectSQL с литералами
+// параметров (T-271; якорь — internal/content/retention.go, дублирование
+// — стиль rqBatchSQL): EXPLAIN с параметрами требует подготовленного
+// оператора, проверке формы плана литералы безразличны. Коды схемы —
+// литералами (FlagRenderPending = 2, StatusDeleted = 6 — стиль
+// rqBatchSQL).
+const retentionPinSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, r.content_hash, r.checked_at " +
+	"FROM subdomain_results AS r " +
+	"JOIN domains AS d ON d.zone_id = r.zone_id AND d.id = r.domain_id " +
+	"WHERE r.checked_at < now() - interval '6 hours' " +
+	"AND (r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant) " +
+	"> ('1970-01-01'::timestamptz, 0::int2, 0::int8, 0::int2, 0::int2) " +
+	"AND (r.content_hash IS NOT NULL OR r.headers IS NOT NULL OR r.cookies IS NOT NULL " +
+	"OR r.tls IS NOT NULL OR r.redirects IS NOT NULL OR r.addrs IS NOT NULL OR r.cname IS NOT NULL) " +
+	"AND (r.rendered OR (d.flags & 2) = 0) " +
+	"AND d.status <> 6 " +
+	"AND NOT EXISTS (SELECT 1 FROM laravel_domains AS ld " +
+	"WHERE ld.zone_id = r.zone_id AND ld.domain_id = r.domain_id) " +
+	"ORDER BY r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
+	"LIMIT 10000"
+
+// TestContent_RetentionSelectPlanPinned — закрепление формы плана
+// выборки пачки retention (T-271; инцидент 08–09.11.2026 — деградация
+// плана до seq scan 9 млн строк + hash join domains + Sort ≈1 ГиБ
+// поверх shared_buffers 2 ГиБ клала PostgreSQL OOM-киллами, пачки не
+// коммитились — курсор не двигался): внутри транзакции закрепления
+// (SET LOCAL seq/hash/merge/bitmap off — те же литералы
+// internal/content/retention.go) EXPLAIN показывает индексную форму
+// доступа к subdomain_results + Limit, без Hash/Merge Join и Seq Scan;
+// Incremental Sort допустим (enable_sort не отключается — ORDER BY
+// (checked_at, PK) держит его поверх порядка индекса). Bitmap выключен
+// доводкой T-271: битмап-путь не сохраняет порядок индекса → явный
+// Sort, форма недетерминирована.
+func TestContent_RetentionSelectPlanPinned(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	ctx := context.Background()
+
+	// Посев: зона, живой домен, остаревшая запись с контентом — форма
+	// плана от объёма не зависит (закрепление — SET LOCAL), но пустая
+	// таблица статистикой вводила бы планировщик в нулевые оценки.
+	var zone int16
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO zones (name) VALUES ('pin.test') RETURNING id").Scan(&zone); err != nil {
+		t.Fatalf("insert zones: %v", err)
+	}
+	var id int64
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO domains (zone_id, label) VALUES ($1, 'pin') RETURNING id", zone,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert domains: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, content_hash, checked_at)
+		VALUES ($1, $2, 0, 2, 'https://pin.test/', $3, now() - interval '2 hours')`,
+		zone, id, refcTestHash(0x77)); err != nil {
+		t.Fatalf("посев результата: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, pin := range []string{
+		"SET LOCAL enable_seqscan = off",
+		"SET LOCAL enable_hashjoin = off",
+		"SET LOCAL enable_mergejoin = off",
+		"SET LOCAL enable_bitmapscan = off",
+	} {
+		if _, err := tx.Exec(ctx, pin); err != nil {
+			t.Fatalf("%s: %v", pin, err)
+		}
+	}
+	plan := explainPlan(t, tx, ctx, retentionPinSelectSQL)
+	if !planIdxScanRe.MatchString(plan) {
+		t.Errorf("закреплённый план без индексного доступа к subdomain_results:\n%s", plan)
+	}
+	if !strings.Contains(plan, "Limit") {
+		t.Errorf("закреплённый план без Limit (ранний останов пачки):\n%s", plan)
+	}
+	for _, bad := range []string{"Hash Join", "Merge Join", "Seq Scan"} {
+		if strings.Contains(plan, bad) {
+			t.Errorf("закреплённый план содержит %q (SET LOCAL не подействовал):\n%s", bad, plan)
+		}
+	}
+	// Bitmap-путь — другой диагноз, чем невыключенные GUC: закрепление
+	// действует, но форма не закрыта до конца — битмап не сохраняет
+	// порядок индекса, ORDER BY закрывается явным Sort (доводка T-271).
+	for _, bad := range []string{"Bitmap Index Scan", "Bitmap Heap Scan"} {
+		if strings.Contains(plan, bad) {
+			t.Errorf("закреплённый план содержит %q (bitmap-путь ломает порядок курсора — форма не закреплена до конца):\n%s", bad, plan)
+		}
+	}
+}
+
+// planIdxScanRe — индексная форма доступа (Index Scan / Index Only
+// Scan) в EXPLAIN-тестах закрепления планов (T-271): покрывает обе
+// записи и листовые партиции PG16, и родителей PG17+. Якорь на начало
+// строки узла (^, ->): «Bitmap Index Scan»/«Bitmap Heap Scan» содержат
+// подстроку «Index Scan», и без якоря bitmap-план проходил проверку
+// (ревью T-271, P3-2) — сами bitmap-узлы запрещены в bad-списках тестов.
+var planIdxScanRe = regexp.MustCompile(`(?m)^\s*(?:->\s*)?(Index Scan|Index Only Scan)\b`)
+
+// explainPlan — текст EXPLAIN (COSTS OFF) запроса внутри транзакции
+// закрепления (T-271; вынесено из inline-блоков render_requeue_test.go
+// для тестов закрепления обоих курсорных выборок).
+func explainPlan(t *testing.T, tx pgx.Tx, ctx context.Context, sql string) string {
+	t.Helper()
+	rows, err := tx.Query(ctx, "EXPLAIN (COSTS OFF) "+sql)
+	if err != nil {
+		t.Fatalf("EXPLAIN: %v", err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("EXPLAIN: чтение: %v", err)
+		}
+		plan.WriteString(line)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("EXPLAIN: %v", err)
+	}
+	return plan.String()
 }

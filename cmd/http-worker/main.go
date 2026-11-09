@@ -72,6 +72,17 @@ var afterConnectHooks = []db.AfterConnectFunc{
 	db.LockTimeout(db.DefaultLockTimeout),
 }
 
+// scanGate — семафор единственности тяжёлых фоновых сканов сервиса
+// (db.ScanGate, T-271): выборки retention-дренажа и позднего
+// переиздателя рендера не совпадают в PostgreSQL — инцидент
+// 08–09.11.2026 (пять OOM-киллов PG за ночь: два деградировавших
+// курсорных SELECT по ≈1 ГиБ рабочих структур поверх shared_buffers
+// 2 ГиБ; сами планы закреплены SET LOCAL у выборок, гейт — страховка
+// от совпадения остаточно тяжёлых сканов). Именованная переменная —
+// шов wiring-теста (main_test.go, стиль afterConnectHooks): проводка —
+// поле Gate в опциях обоих циклов в run.
+var scanGate = make(db.ScanGate, 1)
+
 func main() {
 	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
 	cfg, err := config.Load()
@@ -348,12 +359,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// потерянные публикации: состояние записи перестаёт зависеть от
 	// выживания сообщения в стриме. Курсор по PK, пачка/интервал —
 	// опции цикла; наблюдаемость —
-	// crawler_render_late_republish_total (httpworker.Metrics).
+	// crawler_render_late_republish_total (httpworker.Metrics). Выборка
+	// — тяжёлый скан под общим гейтом scanGate (T-271: не совпадать с
+	// retention-дренажем в PostgreSQL).
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
 		_ = httpworker.RenderLateLoop(ctx, pool, store, renderQ,
-			retentionPending{rdb: rdb}, met, httpworker.LateOptions{Log: logger})
+			retentionPending{rdb: rdb}, met, httpworker.LateOptions{Log: logger, Gate: scanGate})
 	}()
 
 	// Retention контента и трим jsonb не-находок (T-166, ТЗ 5.7: контент
@@ -372,7 +385,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// Цикл здесь же, где компактификация: purge лишь готовит мёртвые
 	// блоки, место возвращает её часовой проход; второму владельцу он не
 	// нужен (охраны делают параллельный запуск безопасным, но
-	// бесполезным). Завершается отменой ctx.
+	// бесполезным). Завершается отменой ctx. Выборка пачки — тяжёлый
+	// скан под общим гейтом scanGate (T-271: не совпадать с поздним
+	// переиздателем рендера в PostgreSQL) в tx-оболочке закрепления
+	// плана с потолком statement_timeout.
 	retentionWatermark := int64(cfg.Content.RetentionAnalyzeWatermark)
 	if retentionWatermark <= 0 {
 		retentionWatermark = int64(cfg.Scheduler.QueueHighWatermark)
@@ -387,6 +403,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			Depth:            analyzeDepth{gate: gate},
 			Pending:          retentionPending{rdb: rdb},
 			AnalyzeWatermark: retentionWatermark,
+			Gate:             scanGate,
 			Log:              logger,
 			OnPass:           content.NewRetentionMetrics(reg).Observe,
 		})

@@ -148,8 +148,9 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 }
 
 // TestRetentionOnce_PendingAllExcluded — пачка целиком ждёт очередей:
-// транзакция не открывается, дренаж завершается штатно (курсор прошёл
-// выборку), записи не тронуты.
+// транзакция чистки не открывается (единственная транзакция —
+// tx-оболочка закрепления выборки, T-271), дренаж завершается штатно
+// (курсор прошёл выборку), записи не тронуты.
 func TestRetentionOnce_PendingAllExcluded(t *testing.T) {
 	now := retentionTestNow()
 	pool := retentionSeedPool(now)
@@ -169,8 +170,10 @@ func TestRetentionOnce_PendingAllExcluded(t *testing.T) {
 	if stats.Deferred[queue.StreamRender] != 1 {
 		t.Fatalf("Deferred = %v, want q:render=1", stats.Deferred)
 	}
-	if pool.begins != 0 {
-		t.Fatalf("транзакций = %d, want 0 (чистить нечего)", pool.begins)
+	// Единственная транзакция — tx-оболочка закрепления выборки (T-271);
+	// транзакции чистки нет: чистить нечего.
+	if pool.begins != 1 {
+		t.Fatalf("транзакций = %d, want 1 (только tx-оболочка выборки, чистки нет)", pool.begins)
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil || !r.jsonb {
 		t.Fatalf("ждущая запись тронута: %+v", r)

@@ -124,6 +124,30 @@ const (
 	// строк/сут (замер §12) за ~13 пачек часового прохода, транзакция
 	// держит блокировки строк пачки минимальное время.
 	DefaultRetentionBatch = 10000
+
+	// DefaultRetentionSelectTimeout — потолок одной выборки пачки (T-271):
+	// серверный statement_timeout в tx-оболочке закрепления плана и
+	// клиентский ctx-дедлайн выборки — один потолок двумя уровнями
+	// (statement_timeout режет сам оператор, ctx — оболочку и чёрные дыры
+	// сети); зависший запрос невозможен, повтор идемпотентен — пачка не
+	// закоммичена, курсор не двигается. Замер T-201: медиана 13,8 с,
+	// максимум 222,8 с — 600 с ≈ 2,7× максимума; превышение — ошибка
+	// прохода (Warn цикла) и backoff тикера.
+	DefaultRetentionSelectTimeout = 600 * time.Second
+
+	// DefaultRetentionErrorBackoff — пауза тикера цикла после ошибочного
+	// прохода (T-271). Инцидент 08–09.11.2026: проход, оборванный
+	// OOM-киллом PostgreSQL, встречал тик, сработавший за время долгого
+	// прохода (рантайм хранит один недоставленный тик и отдаёт его
+	// немедленно по возврату цикла в select), и мгновенно перезапускался
+	// в только что поднятую БД — проходы шли без паузы, пока не роняли
+	// её снова (за ночь — пять киллов, ни одного успешного прохода).
+	// 15 минут — на порядок дольше подъёма PG (сотни секунд); короче
+	// часового интервала осознанно: ошибка прохода — сигнал нездоровья
+	// БД, повтор — раньше очередного штатного тика, но много позже
+	// подъёма PG; дренаж притока не теряется (курсор переживает паузу),
+	// первый успешный проход возвращает штатный интервал.
+	DefaultRetentionErrorBackoff = 15 * time.Minute
 )
 
 // SQL retention. Коды схемы (бит render_pending, статус deleted) —
@@ -176,6 +200,44 @@ var (
 		"WHERE ld.zone_id = r.zone_id AND ld.domain_id = r.domain_id) " +
 		"ORDER BY r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 		"LIMIT $7"
+
+	// retentionPlanNoSeqScanSQL / retentionPlanNoHashJoinSQL /
+	// retentionPlanNoMergeJoinSQL / retentionPlanNoBitmapScanSQL —
+	// закрепление формы плана выборки пачки
+	// (T-271; образец T-181/T-191 — SET LOCAL в tx-оболочке выборки):
+	// seq scan и hash/merge join отключаются до оператора выборки,
+	// планировщик держит Index Scan по subdomain_results_checked_idx +
+	// Nested Loop точечных проб domains/laravel_domains + Limit с ранним
+	// остановом. Инцидент 08–09.11.2026: без закрепления деградировавший
+	// план (seq scan 9 млн строк + hash join domains + Sort, ≈1 ГиБ
+	// рабочих структур поверх shared_buffers 2 ГиБ) вместе с соседним
+	// render-late-сканом положил PostgreSQL пятью OOM-киллами за ночь;
+	// пачки не коммитились — курсор не двигался, каждый проход шёл
+	// catch-up-кругом с нулевого курсора. Bitmap-скан выключается туда
+	// же (доводка T-271 по интеграционному EXPLAIN): при выключенных
+	// seq/hash/merge планировщик на курсорном предикате выбирает
+	// Bitmap Heap + Bitmap Index Scan — битмап не сохраняет порядок
+	// индекса, ORDER BY (checked_at, PK) закрывается явным Sort, и форма
+	// перестаёт быть детерминированной (зависит от того, какой путь
+	// приглянулся планировщику на данном объёме); с выключенным битмэпом
+	// путь один — Index Scan (+ Incremental Sort при необходимости).
+	// enable_sort НЕ отключается:
+	// ORDER BY (checked_at, PK) держит Incremental Sort поверх порядка
+	// индекса (узкое окно дренажа), Sort среза — только широкий catch-up
+	// круг. Действие SET LOCAL — только эта транзакция, остальные запросы
+	// пула не затронуты.
+	retentionPlanNoSeqScanSQL    = "SET LOCAL enable_seqscan = off"
+	retentionPlanNoHashJoinSQL   = "SET LOCAL enable_hashjoin = off"
+	retentionPlanNoMergeJoinSQL  = "SET LOCAL enable_mergejoin = off"
+	retentionPlanNoBitmapScanSQL = "SET LOCAL enable_bitmapscan = off"
+
+	// retentionSelectTimeoutFmt — серверный потолок выборки той же
+	// tx-оболочкой (T-271): формат '<N>ms' валиден парсеру GUC-времени
+	// при любой длительности (стиль db.lockTimeoutSQLFmt;
+	// Duration.String() не годится — «1h0m0s» не парсится). Значение —
+	// RetentionOptions.SelectTimeout, текст закрепляется юнит-тестом
+	// (retention_test.go).
+	retentionSelectTimeoutFmt = "SET LOCAL statement_timeout = '%dms'"
 
 	// retentionProbeSQL — точечное предложение ретраев защиты очередей
 	// (T-185): ключи, отложенные снимком q:render/q:analyze, лежат позади
@@ -326,6 +388,23 @@ type RetentionOptions struct {
 	// BatchSize — максимум строк в одной пачке-транзакции
 	// (DefaultRetentionBatch).
 	BatchSize int
+	// SelectTimeout — потолок одной выборки пачки
+	// (DefaultRetentionSelectTimeout, T-271): серверный
+	// statement_timeout tx-оболочки закрепления плана и клиентский
+	// ctx-дедлайн выборки; превышение — ошибка прохода, повтор
+	// идемпотентен (пачка не закоммичена).
+	SelectTimeout time.Duration
+	// ErrorBackoff — пауза тикера после ошибочного прохода
+	// (DefaultRetentionErrorBackoff, T-271): тик, сработавший за время
+	// долгого прохода, не перезапускает его немедленно в только что
+	// поднявшийся PostgreSQL (инцидент 08–09.11.2026 — пять OOM-киллов
+	// за ночь).
+	ErrorBackoff time.Duration
+	// Gate — семафор единственности тяжёлых фоновых сканов http-worker
+	// (db.ScanGate, T-271): выборка retention и позднего переиздателя
+	// рендера не совпадают в PostgreSQL; nil — без сериализации
+	// (изолированные сборки, юнит-тесты).
+	Gate db.ScanGate
 	// Depth — источник глубины q:analyze (интерлок); nil — интерлок
 	// выключен (проход не ждёт анализатора — осознанный режим,
 	// управляемый AnalyzeWatermark = 0 в сборке сервиса).
@@ -357,6 +436,12 @@ func (o RetentionOptions) withDefaults() RetentionOptions {
 	}
 	if o.BatchSize <= 0 {
 		o.BatchSize = DefaultRetentionBatch
+	}
+	if o.SelectTimeout <= 0 {
+		o.SelectTimeout = DefaultRetentionSelectTimeout
+	}
+	if o.ErrorBackoff <= 0 {
+		o.ErrorBackoff = DefaultRetentionErrorBackoff
 	}
 	return o
 }
@@ -505,9 +590,48 @@ func retentionBlocked(ctx context.Context, o RetentionOptions) (int64, bool, err
 }
 
 // retentionSelect — пачка кандидатов после курсора after
-// (retentionSelectSQL).
+// (retentionSelectSQL). Единая точка тяжёлой выборки: явная транзакция с
+// закреплением формы плана SET LOCAL seq/hash/merge/bitmap off +
+// statement_timeout до SELECT (T-271, образец retryCandidates T-191 /
+// renderSelectPending T-181 — см. комментарий к
+// retentionPlanNoSeqScanSQL), клиентский ctx-дедлайн SelectTimeout
+// накрывает и оболочку (BEGIN/SET LOCAL/COMMIT). Транзакция — только
+// оболочка закрепления: SELECT читает зафиксированные данные,
+// фиксация/откат по содержанию равнозначны. Тяжёлый скан под общим
+// гейтом http-worker (o.Gate, T-271): выборка retention и позднего
+// переиздателя рендера не совпадают в PostgreSQL («1+1 ГиБ» поверх
+// shared_buffers — инцидент 08–09.11.2026); гейт занимается ДО Begin —
+// соединение пула не простаивает в очереди.
 func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, after retentionCursor) ([]retentionCandidate, error) {
-	rows, err := pool.Query(ctx, retentionSelectSQL,
+	o = o.withDefaults()
+	if err := o.Gate.Acquire(ctx); err != nil {
+		return nil, fmt.Errorf("content: retention: выборка кандидатов: %w", err)
+	}
+	defer o.Gate.Release()
+
+	ctx, cancel := context.WithTimeout(ctx, o.SelectTimeout)
+	defer cancel()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("content: retention: транзакция выборки: %w", err)
+	}
+	// Откат безусловно: после Commit — no-op (стиль T-020/T-044).
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, pin := range []string{
+		retentionPlanNoSeqScanSQL,
+		retentionPlanNoHashJoinSQL,
+		retentionPlanNoMergeJoinSQL,
+		retentionPlanNoBitmapScanSQL,
+		fmt.Sprintf(retentionSelectTimeoutFmt, o.SelectTimeout.Milliseconds()),
+	} {
+		if _, err := tx.Exec(ctx, pin); err != nil {
+			return nil, fmt.Errorf("content: retention: закрепление плана: %w", err)
+		}
+	}
+
+	rows, err := tx.Query(ctx, retentionSelectSQL,
 		o.Retention.String(),
 		after.checkedAt, after.key.zone, after.key.domain, after.key.sub, after.key.variant,
 		o.BatchSize,
@@ -531,6 +655,9 @@ func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, 
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("content: retention: выборка кандидатов: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("content: retention: фиксация выборки: %w", err)
 	}
 	return out, nil
 }
@@ -732,9 +859,13 @@ func compareHash(a, b Hash) int {
 // продолжает с места остановки (стоимость ∝ притоку, не размеру
 // таблицы); runbook-точки входа см. retentiondrain.go. Retention = 0 —
 // retention выключен: цикл не поднимается вовсе (Info в лог). Ошибка
-// прохода не останавливает цикл: Warn, очередной проход повторит —
-// проходы идемпотентны (ТЗ 3.4). Состояние трогает только цикл
-// (одна горутина тикера) — блокировки не нужны.
+// прохода не останавливает цикл: Warn, тикер переводится в backoff
+// DefaultRetentionErrorBackoff (T-271) — тик, сработавший за время
+// долгого ошибочного прохода, не перезапускает его немедленно в только
+// что поднятый PostgreSQL (инцидент 08–09.11.2026); очередной проход
+// после паузы повторит — проходы идемпотентны (ТЗ 3.4), успех
+// возвращает штатный интервал. Состояние трогает только цикл (одна
+// горутина тикера) — блокировки не нужны.
 func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions) error {
 	if pool == nil {
 		return errors.New("content: retention: пул не задан")
@@ -757,7 +888,7 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 		"retry_limit", DefaultRetentionRetryLimit)
 
 	state := &retentionState{}
-	pass := func() {
+	pass := func() error {
 		start := time.Now()
 		stats, err := retentionPass(ctx, pool, o, state)
 		if err != nil {
@@ -765,7 +896,7 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 			if ctx.Err() == nil {
 				log.Warn("проход retention контента", "err", err)
 			}
-			return
+			return err
 		}
 		if stats.Skipped {
 			// Интерлок: анализатор не успевает, тела ещё нужны — алерт
@@ -802,17 +933,56 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 		if o.OnPass != nil {
 			o.OnPass(stats, time.Since(start))
 		}
+		return nil
 	}
 
-	pass()
-	ticker := time.NewTicker(o.Interval)
+	// Стартовый дренаж — сразу (catch-up за простоем). Ошибка прохода —
+	// Warn и перевод тикера в backoff (T-271): тик, сработавший за время
+	// долгого ошибочного прохода, не обязан немедленно перезапускать
+	// проход в только что поднятый PostgreSQL (инцидент 08–09.11.2026);
+	// успех очередного прохода возвращает штатный интервал.
+	backoff := false
+	if err := pass(); err != nil && ctx.Err() == nil {
+		backoff = true
+	}
+	period := o.Interval
+	if backoff {
+		period = o.ErrorBackoff
+	}
+	ticker := time.NewTicker(period)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			pass()
+			err := pass()
+			switch {
+			case err != nil && ctx.Err() == nil && !backoff:
+				backoff = true
+				retentionResetTicker(ticker, o.ErrorBackoff)
+			case err == nil && backoff:
+				backoff = false
+				retentionResetTicker(ticker, o.Interval)
+			}
 		}
+	}
+}
+
+// retentionResetTicker — сброс тикера цикла (T-271). Механика инцидента
+// 08–09.11.2026: тик, сработавший за время прохода длиннее интервала,
+// не теряется — рантайм держит один недоставленный тик и отдаёт его
+// немедленно по возврате цикла в select (Go ≥1.23: отложенный send на
+// небуферизованном канале тикера, cap(t.C) = 0; ранее — буфер канала
+// ёмкости 1), и ошибочный проход повторялся мгновенно. Reset переводит
+// период на паузу backoff; под текущей цепочкой (Go ≥1.23) Reset
+// синхронизируется с отложенным тиком и убирает его сам, слив ниже —
+// безвредная страховка под старые цепочки, где буфер канала Reset не
+// чистил (замечание ревью T-271, P3-1).
+func retentionResetTicker(t *time.Ticker, d time.Duration) {
+	t.Reset(d)
+	select {
+	case <-t.C: // слив недоставленного тика старого периода
+	default:
 	}
 }
