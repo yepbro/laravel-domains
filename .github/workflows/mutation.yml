@@ -33,9 +33,10 @@ jobs:
   mutate:
     name: mutation testing
     runs-on: ubuntu-24.04
-    # 4 ч: полный охват ~2.6 ч локально (T-M14), CI-раннер медленнее —
-    # запас на сборку образа и медленные mutants.
-    timeout-minutes: 240
+    # 6 ч (платформенный максимум): полный охват ~2.6 ч локально (T-M14),
+    # CI-раннер в ~1.6× медленнее — прогон 09.11.2026 срезан на 4 ч,
+    # не дойдя до конца; 360 мин покрывает запас и сборку образа.
+    timeout-minutes: 360
     env:
       # Как в ci.yml: те же compose-файлы + кэш слоёв type=gha
       COMPOSE: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env
