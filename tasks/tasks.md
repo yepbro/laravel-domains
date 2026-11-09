@@ -35,9 +35,11 @@
 08.11.2026); последний перенос 2026-11-08. В активной работе —
 только операционные задачи этапа 35: **T-247…T-249** (стендовые
 прогоны движков, разворачивание на проде, канарейка —
-последовательны) и этап 40: **T-270** — компенсатор «статус повис»
+последовательны), этап 40: **T-270** — компенсатор «статус повис»
 new∧done (по итогам анализа прод-инцидента 22–29.10.2026, датчик
-T-256).
+T-256) и этап 41: **T-271** — хотфикс OOM PG из-за курсорных
+выборок retention/render-late (прод-инцидент 08–09.11.2026, цикл
+ hourly-киллов активен).
 
 ## Этап 35: выбор движка рендера и очередь фолбэка (T-233…T-249)
 
@@ -145,5 +147,68 @@ Redis). Когорта стабильна (ноль новых после 29.10)
   `make test-integration` после вливания (затронут scheduler и БД).
   Опционально (по решению оператора): алерт на рестарт Redis
   (ActiveEnterTimestamp/uptime) — главная причина класса потерь.
+
+## Этап 41: стабилизация PG — закрепление планов курсорных выборок retention/render-late (T-271)
+
+Источник: прод-инцидент 08–09.11.2026 — 5 OOM-киллов PostgreSQL за ночь
+(`oom-kill: CONSTRAINT_MEMCG`, MemoryMax 3 Ги, NRestarts=5; 20:43, 23:39,
+04:30, 07:30, 08:30), каждому секунд-в-секунду соответствует WARN
+`проход retention контента … unexpected EOF`; retention ни одного успешного
+прохода (метрики :9104 нулевые), контент растёт (13→16 Г за ночь), киллы
+самоподдерживают retry-шторм temp_error (+6.5/с) и рост q:dead. Исследование
+(2026-11-09): деградация планов двух курсорных SELECT http-worker до
+«seq scan 9 млн строк + hash join domains + Sort» по ~1 ГиБ каждый поверх
+`shared_buffers=2 ГиБ` — `retentionSelectSQL` (`internal/content/retention.go`)
+и `lateRenderRowsSQL` (`internal/httpworker/renderlate.go`, T-259 — форма
+плана сознательно не закреплялась, «контролировать журналом медленных»).
+Курсор двигается только закоммиченной пачкой (`retentiondrain.go`) → ни одной
+успешной пачки → каждый проход catch-up с нулевого курсора (лог 08:30:49:
+«catch-up-круг с нулевого курсора … рендер-защита снята»); buffered-тик тикера
+немедленно перезапускает проход в только что поднявшийся PG — backoff и
+single-flight отсутствуют. Отягчающие: generic-планы prepared statements
+(после 5 выполнений селективность row-value курсора неизвестна) и устаревшая
+статистика (ANALYZE не успевает за 2–3 млн вставок/сут).
+
+- **T-271** [новая] — P0, http-worker + content: хотфикс цикла OOM —
+  закрепление планов тяжёлых курсорных выборок + таймауты + backoff/
+  single-flight (контекст — шапка этапа). Состав:
+  1. Закрепление планов `retentionSelectSQL` и `lateRenderRowsSQL`
+     tx-оболочкой по образцу T-191 (`internal/scheduler/retry.go` —
+     SET LOCAL enable_seqscan/hashjoin/mergejoin=off); `enable_sort` НЕ
+     отключать (нужен Incremental Sort); желаемая форма — Index Scan
+     (`subdomain_results_checked_idx` / PK) + Nested Loop проб + Limit
+     с ранним остановом; SQL-тексты не меняются.
+  2. `SET LOCAL statement_timeout` в той же оболочке: 600 с retention
+     (замер T-201: медиана 13,8 с, max 222,8 с), 60 с render-late; плюс
+     клиентский ctx-таймаут (`context.WithTimeout`) на выборку — зависший
+     запрос невозможен; повтор идемпотентен (пачка не закоммичена).
+  3. Backoff после ошибки прохода в `RetentionLoop` и `RenderLateLoop`
+     (пропуск тиков / сброс тикера на 15–30 мин) — убрать немедленный
+     buffered-тик в только что перезапущенный PG.
+  4. Single-flight тяжёлых фоновых сканов http-worker: общий семафор
+     retention ↔ render-late (исключает совпадение «1+1 ГиБ»).
+  Вне задачи (кандидаты следующих): двухфазная выборка «ключи → PK-зонд»
+  (TZ_slow_retention_residual §5.2 п.2 — правильный фикс под ~47 млн,
+  M), пересмотр бюджета памяти PG (shared_buffers/MemoryHigh, с замерами),
+  `plan_cache_mode=force_custom_plan`. Не делать: рестарт http-worker как
+  «лечение» (сброс курсоров = самый дорогой catch-up, runbook §5.2),
+  уменьшение retention_batch (T-201), индексы по payload/rendered
+  (HOT-инвариант, TZ §4.3/§6).
+  Тесты: SQL-контракт `TestRetentionOnce_SQLContract` — дополнить
+  SET LOCAL-порядком `BEGIN → SET LOCAL … → SELECT → COMMIT` (образец
+  `retry_test.go`, закрепление T-191); ctx-таймаут — зависший fake-Query
+  + дедлайн → обёрнутая ошибка; backoff — после ошибки тикер не
+  перезапускает немедленно (`TestRetentionLoop`); single-flight — два
+  цикла на одном гейте, взаимное исключение; интеграционный EXPLAIN-тест
+  формы плана на наполненной таблице (нет Hash Join / Sort над
+  JOIN-результатом, есть Index Scan + Limit; образцы schema_test.go /
+  render_late_test.go).
+  Критерий: `make test`/`make lint` зелёные, `make test-integration`
+  после вливания (затронут http-worker и БД); прод-приёмка после деплоя:
+  `crawler_content_retention_*` оживает (успешные проходы), оба SELECT
+  уходят из журнала медленных (порог 3 с, T-177), MemoryCurrent PG
+  устойчиво < 2,5 Ги, NRestarts PG не растёт, бэклог ~9 млн строк
+  дренируется пачками (≈900 × 10–25 с, размазано часовыми проходами).
+
 
 
