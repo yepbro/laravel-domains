@@ -3,12 +3,24 @@ name: mutation
 # Мутационное тестирование (go-mutesting) — тяжёлая проверка, в CI
 # каждого пуша не входит: еженедельный прогон по master (воскресенье
 # вечером по Москве) + ручной запуск.
+#
+# Полный охват гоняется ДВУМЯ ПАРАЛЛЕЛЬНЫМИ ДЖОБАМИ (половины A и B):
+# hosted-раннер в ~2.5× медленнее локали (~2.5 ч локально, наблюдаемый
+# темп CI ~0.9 с/LOC → полная дистанция ~6.5–7 ч) и не влезает в
+# платформенный потолок джоба 6 ч (360 мин — максимум). Фактура
+# прогонов 09.11.2026: первый срезан по тогдашнему таймауту 240 мин;
+# второй остановлен вручную на ~4.6 ч в 7-м пакете из 10 (render),
+# до конца оставалось ~2.3 ч. Половины сбалансированы по весу
+# (52/48% LOC; по мутантам 961/1671 — половина B тяжелее: LOC и
+# мутанты по пакетам расходятся в разы). Консервативные оценки:
+# A ≈ 3.4 ч, B до ~4.3 ч — в потолок 6 ч обе влезают с запасом
+# не менее ~1.5 ч.
 # Порог и охват настраиваются входами; отчёты — в artifact рана.
 on:
   workflow_dispatch:
     inputs:
       pkgs:
-        description: 'Охват: ./-шаблоны пакетов через пробел (пусто — default из Makefile)'
+        description: 'Точечный охват: ./-шаблоны через пробел (пусто — полный охват, обе половины; полный список сюда не вписывать — один джоб срежется по 6 ч)'
         required: false
         default: ''
       min_score:
@@ -29,17 +41,27 @@ concurrency:
   group: mutation-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Как в ci.yml: те же compose-файлы + кэш слоёв type=gha
+  COMPOSE: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env
+
 jobs:
-  mutate:
-    name: mutation testing
+  # Два явных джоба, а не matrix: у половин разные наборы и разный вес,
+  # у B своё условие скипа (ручной точечный pkgs), а fail-fast матрицы
+  # отменял бы соседнюю половину при провале одной. Гейт порога — на
+  # каждой половине отдельно: строже глобального взвешенного 0.98 (тот
+  # допускал бы перекос — идеальная половина компенсировала бы
+  # провальную ниже порога); осознанное решение.
+  mutate-a:
+    name: mutation testing (половина A)
     runs-on: ubuntu-24.04
-    # 6 ч (платформенный максимум): полный охват ~2.6 ч локально (T-M14),
-    # CI-раннер в ~1.6× медленнее — прогон 09.11.2026 срезан на 4 ч,
-    # не дойдя до конца; 360 мин покрывает запас и сборку образа.
+    # 6 ч — платформенный максимум hosted-джоба; половина A — 13506 LOC,
+    # 961 мутант, ≈ 3.4 ч: запас на сборку образа и медленный раннер.
     timeout-minutes: 360
     env:
-      # Как в ci.yml: те же compose-файлы + кэш слоёв type=gha
-      COMPOSE: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env
+      # Половина A — 13506 LOC, 52% веса (961 мутант): analyzer,
+      # dashboard (вкл. подпакет auth), idn, model, monitor.
+      HALF_PKGS: ./internal/analyzer/... ./internal/dashboard/... ./internal/idn/... ./internal/model/... ./internal/monitor/...
     steps:
       - uses: actions/checkout@v7
 
@@ -51,16 +73,38 @@ jobs:
       # Достаточно tools-образа (dev stage): линт/тесты здесь не гоняются,
       # инфраструктура не нужна — юнит-тесты мутационного охвата герметичны.
       - name: Собрать tools-образ (с кэшем слоёв)
-        run: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env build tools
+        run: $COMPOSE build tools
 
       - name: Мутационное тестирование
+        # Потолок шага ниже потолка джоба (360): при срезе по шаговому
+        # потолку always()-выгрузка ниже выполняется штатно, а вот
+        # убийство джоба по джобовому потолку выгрузку не гарантирует.
+        timeout-minutes: 340
+        env:
+          # Входы — через env, не интерполяцией ${{ }} в тело скрипта
+          # (защита от инъекций в run).
+          DISPATCH_PKGS: ${{ inputs.pkgs }}
+          MIN_SCORE: ${{ inputs.min_score || '0.98' }}
+          TEST_TIMEOUT: ${{ inputs.timeout || '60' }}
         run: |
-          if [ -n "${{ inputs.pkgs }}" ]; then
-            export MUTATE_PKGS="${{ inputs.pkgs }}"
+          # Ручной точечный прогон (задан pkgs): назначенный набор
+          # заменяет половину A; половина B скипается (if её джоба).
+          pkgs="$HALF_PKGS"
+          if [ -n "$DISPATCH_PKGS" ]; then
+            # Белый список символов: значение дальше попадает в рецепт
+            # make в одинарных кавычках — кавычка/;/$ в нём ломали бы
+            # команду (значение задаёт человек с write-доступом, но
+            # защита в глубину дешевле разбора).
+            case "$DISPATCH_PKGS" in
+              *[!A-Za-z0-9./_\ -]*)
+                echo "ОШИБКА: недопустимые символы в pkgs (допустимы буквы/цифры и ./_ и пробел): $DISPATCH_PKGS" >&2
+                exit 2 ;;
+            esac
+            pkgs="$DISPATCH_PKGS"
           fi
-          make mutate COMPOSE="$COMPOSE" \
-            MUTATION_MIN_SCORE="${{ inputs.min_score || '0.98' }}" \
-            MUTATE_TIMEOUT="${{ inputs.timeout || '60' }}"
+          make mutate COMPOSE="$COMPOSE" PKGS="$pkgs" \
+            MUTATION_MIN_SCORE="$MIN_SCORE" \
+            MUTATE_TIMEOUT="$TEST_TIMEOUT"
 
       # Отчёты полезны и при падении (разбор выживших), и при успехе
       # (динамика score); mutate.log дублирует консоль рана.
@@ -68,6 +112,57 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: mutation-report-${{ github.run_id }}
+          name: mutation-report-a-${{ github.run_id }}
+          retention-days: 14
+          path: var/mutation/
+
+  mutate-b:
+    name: mutation testing (половина B)
+    # Точечный ручной прогон (задан pkgs) выполняет один джоб A с этим
+    # набором; еженедельный и полный ручной гоняют обе половины.
+    # Условие явное по событию: на schedule inputs-контекст пуст,
+    # сравнение с '' работает, но неявно — читаемость важнее.
+    if: github.event_name != 'workflow_dispatch' || inputs.pkgs == ''
+    runs-on: ubuntu-24.04
+    # 6 ч — платформенный максимум hosted-джоба; половина B — 12606 LOC
+    # (48% веса), но 1671 мутант (63%): консервативная оценка до ~4.3 ч,
+    # запас до потолка ≥ 1.5 ч.
+    timeout-minutes: 360
+    env:
+      # Половина B — 12606 LOC, 48% веса, 1671 мутант: queue, render,
+      # rules, scheduler, status.
+      HALF_PKGS: ./internal/queue/... ./internal/render/... ./internal/rules/... ./internal/scheduler/... ./internal/status/...
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Подготовить .env
+        run: cp .env.example .env
+
+      # Достаточно tools-образа (dev stage): линт/тесты здесь не гоняются,
+      # инфраструктура не нужна — юнит-тесты мутационного охвата герметичны.
+      - name: Собрать tools-образ (с кэшем слоёв)
+        run: $COMPOSE build tools
+
+      - name: Мутационное тестирование
+        # Потолок шага ниже потолка джоба (360) — чтобы always()-выгрузка
+        # успела положить отчёты при срезе (как у джоба A, см. там).
+        timeout-minutes: 340
+        env:
+          MIN_SCORE: ${{ inputs.min_score || '0.98' }}
+          TEST_TIMEOUT: ${{ inputs.timeout || '60' }}
+        run: |
+          make mutate COMPOSE="$COMPOSE" PKGS="$HALF_PKGS" \
+            MUTATION_MIN_SCORE="$MIN_SCORE" \
+            MUTATE_TIMEOUT="$TEST_TIMEOUT"
+
+      # Отчёты полезны и при падении (разбор выживших), и при успехе
+      # (динамика score); mutate.log дублирует консоль рана.
+      - name: Выгрузить отчёты в artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-report-b-${{ github.run_id }}
           retention-days: 14
           path: var/mutation/

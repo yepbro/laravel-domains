@@ -119,7 +119,7 @@ make reset-internet
 | [`docs/render.md`](docs/render.md) | рендер: Chromium, изолированные контексты, ожидание готовности, съём DOM/cookies |
 | [`docs/analyzer.md`](docs/analyzer.md) | движок правил Laravel: цели (cookie/заголовки/HTML/meta), свидетельства срабатываний, переанализ |
 | [`docs/runbooks.md`](docs/runbooks.md) | процедурные инструкции: переобучение словаря zstd, разбор `q:dead`, переанализ |
-| [`docs/mutation-testing.md`](docs/mutation-testing.md) | мутационное тестирование go-mutesting: охват и пороги `make mutate`, отчёты, гашение ложных мутантов, ночной CI-прогон |
+| [`docs/mutation-testing.md`](docs/mutation-testing.md) | мутационное тестирование go-mutesting: охват и пороги `make mutate`, отчёты, гашение ложных мутантов, еженедельный CI-прогон (два параллельных джоба-половины) |
 | [`docs/deploy.md`](docs/deploy.md) | боевой деплой systemd: юниты, бюджет памяти, установка |
 | [`docs/ci-cd.md`](docs/ci-cd.md) | непрерывный деплой: GitHub Actions после зелёного CI, откат, секреты, извещения Telegram |
 | [`docs/disks.md`](docs/disks.md) | диски боевого сервера: тома PostgreSQL и контента, SMART/TBW (ТЗ §10.3) |
@@ -147,9 +147,11 @@ make reset-internet
 ТЗ §10.4, детали в [`docs/ci-cd.md`](docs/ci-cd.md).
 
 Мутационное тестирование в основной CI не входит (тяжёлая проверка):
-ночью по `master` и вручную его гоняет отдельный workflow
+еженедельно (воскресенье 20:00 МСК) по `master` и вручную его гоняет
+отдельный workflow
 [`.github/workflows/mutation.yml`](.github/workflows/mutation.yml)
-(`make mutate` с порогом score, отчёты — в artifact;
+(`make mutate` в двух параллельных джобах-половинах с порогом score,
+отчёты — в artifacts;
 [`docs/mutation-testing.md`](docs/mutation-testing.md)).
 
 ## Боевой сервер
