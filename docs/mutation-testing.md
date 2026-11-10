@@ -136,10 +136,48 @@ teardown chromedp, окно негативной проверки расшире
    ```
 
 2. **Блэклист чексумм** — `test/mutation/blacklist.txt` (MD5 из строки
-   `FAIL "..." with checksum <md5>` в `mutate.log`, по одной в строке);
+   `FAIL "..." with checksum <md5>` в `mutate.log`, по одной в строке;
+   парсер форка требует ровно 32 hex-символа — комментарии в файле
+   недопустимы, обоснования групп — в этом файле, ниже);
    подключается автоматически, если файл непуст. Способ хрупкий: правка
    исходника меняет чексуммы — поэтому только для мутантов, которые
-   нельзя закрыть аннотацией.
+   нельзя закрыть аннотацией. Занесённые в блэклист мутанты идут как
+   duplicates и НЕ входят ни в числитель, ни в знаменатель score
+   (`Msi = (killed + error + skipped) / (killed + escaped + error +
+   skipped)`, internal/models форка) — погашение повышает score ровно
+   как убийство тестом, потому группа обязана быть доказуемо
+   эквивалентной/ненаблюдаемой, а не «не нашёл, как убить».
+
+   Состав блэклиста (триаж выживших CI-прогна 09.11.2026, половина A —
+   96 чексумм) по группам:
+
+   | Группа | Где | Обоснование |
+   |---|---|---|
+   | `parsefloat-bitsize` | load.go, psi.go, renders.go | `strconv.ParseFloat` с bitSize ≠ 32 ведёт себя как 64 (ветвления по 32/остальное в strconv) — мутанты bitSize 63/65/9 эквивалентны |
+   | `log:side-effect`, `*-log` (loop/drain/info/warn/debug) | monitor, analyzer | журнальные вызовы (log.Info/Warn/Debug и их охранные `ctx.Err() == nil`): единственный эффект — строка в журнале, контракт поведения не меняется; suppressed тем же смыслом, что аннотации `mutator-disable-regexp log\.…` в nearstats/historystats |
+   | `make-cap` | zonestats.go, renders.go | ёмкость `make(...)` — хинт производительности: значения длины/содержимое не меняются |
+   | `load:guest-break` | load.go L261 | `break → continue` в цикле тиков: после 8 полей обе формы ничего не пишут (continue лишь лишние итерации без эффектов) |
+   | `load:closeq-open` | load.go | `close_ <= open → <`: close_ == open недостижимо (разные символы скобок) |
+   | `load:read-max-eq` | load.go | максимум по группам с равным entries-read — то же значение |
+   | `load:busy-clamp-eq`, `load:round-neg-eq` | load.go | клампы нуля: при 0 обе ветви дают 0; для `v < -1` — усечение int(x+0.5) к 0 на [-1, 0.5) |
+   | `load:procwin-guard` | load.go | ослабления `d > 0`/`perCore > 0`/`agg.Ticks <= prev` прикрыты внутренней охраной `perCore > 0` и порогом шума topByCPU: доля 0 отфильтровывается, отчёт тот же |
+   | `load:rate-window-eq` | load.go | `window == 0` между проходами недостижимо (тикер ≥ интервала); равный/упавший Read даёт темп 0/отрицательный — строка темпа не печатается ни в одном из вариантов |
+   | `load:top-trunc-eq` | load.go | `len(items) >= topProcs` при равенстве — срез той же длины |
+   | `zonestats:init-guard` | zonestats.go init() | защита от рассинхрона легенды при будущих правках: на согласованном коде невыполнима (см. соседнюю аннотацию-прецедент) |
+   | `zonestats:drift-int`, `zonestats:absdiff-eq` | zonestats.go | `d < 0 → <= 0` и `a > b → >= b` на int64: в точке равенства обе ветви дают 0 |
+   | `zonestats:sort-uniq` | zonestats.go | компаратор `<=`: ключи zoneIDs уникальны (map), равенство недостижимо |
+   | `zonestats:took-eq` | zonestats.go | `took >= interval` различается только при точном равенстве измеренной длительности интервалу — недетерминированно/недостижимо в тесте |
+   | `zonestats:globals-prezero` | zonestats.go | предобнуление статусов перед `+=`: += по отсутствующему ключу читает 0 — карта неотличима |
+   | `zonestats:returning-missing` | zonestats.go L1123 | ветка «RETURNING не вернул зону» недостижима: writeZonePositions требует len(out) == len(ids) и роняет проход раньше |
+   | `slowqueries:phrase-eq` | slowqueries.go | `n%100 <= 10`/`> 20` отличаются только при n%100==10/20, где n%10==0 — первая клауза `n%10 >= 2` уже отсекает; `n%10 >= 1` перекрыто case 1 (`n%10 == 1 ∧ n%100 != 11`) — доказано перебором 0..300 |
+   | `renders:trunc-hash` | renders.go | усечение `#`-хвоста: значение — первый токен rest в обоих вариантах (защитный код) |
+   | `renders:labels-end-neg` | renders.go | `end <= 0`: end ≥ start+1 ≥ 1, нуль недостижим |
+   | `renders:escape-boundary-eq` | renders.go | `i+1 < len(s) → i+0/i-1/true` (граница последнего символа): обе формы заканчивают цикл без находки скобки |
+   | `renders:rateof-eq` | renders.go | `cur <= prev → <`: при равенстве обе дают 0 |
+   | `renders:dt-clamp-eq` | renders.go | кламп dt прикрыт собственной охраной rateOf (`dt <= 0 → 0`) — отрицательное окно даёт 0 в обоих путях |
+   | `renders:body-close`, `renders:ctx-cancel` | renders.go | Close тела/отмена контекста после чтения — без наблюдаемого эффекта в юнит-поверхности |
+   | `idn:unreachable-guard` | idn.go | `i == 0` (имя с ведущей точкой) исключено normalizeASCII; соседняя ветка-защита уже погашена аннотацией с тем же обоснованием |
+   | `worker:drain-log` | worker.go | `stats.Rows > 0 → >= 0/> -1/> 1`: тело ветки — только log.Info |
 
 Конфиг `test/mutation/go-mutesting.yml` дополнительно отсекает файлы без
 сопутствующего `*_test.go` и файлы, чьи тесты под build-тегом, — убить

@@ -40,10 +40,11 @@ type zonestatsCall struct {
 // zonestatsFakeRows — pgx.Rows с заготовленными строками; Scan
 // позиционный, в порядке колонок SQL.
 type zonestatsFakeRows struct {
-	rows   [][]any
-	i      int
-	closed bool
-	err    error
+	rows    [][]any
+	i       int
+	closed  bool
+	err     error
+	scanErr error
 }
 
 func zonestatsRows(rows ...[]any) *zonestatsFakeRows {
@@ -67,6 +68,9 @@ func (r *zonestatsFakeRows) Next() bool {
 }
 
 func (r *zonestatsFakeRows) Scan(dest ...any) error {
+	if r.scanErr != nil {
+		return r.scanErr
+	}
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
 		return errors.New("zonestatsFakeRows: Scan без Next")
 	}
@@ -108,6 +112,7 @@ type zonestatsFakePool struct {
 	mu        sync.Mutex
 	steps     []zonestatsStep
 	commitErr error
+	beginErr  error
 	delay     time.Duration
 
 	queries   []zonestatsCall
@@ -149,6 +154,9 @@ func (p *zonestatsFakePool) Begin(context.Context) (pgx.Tx, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.begins++
+	if p.beginErr != nil {
+		return nil, p.beginErr
+	}
 	return &zonestatsFakeTx{pool: p}, nil
 }
 

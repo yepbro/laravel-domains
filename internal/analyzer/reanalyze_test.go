@@ -150,6 +150,14 @@ type reanPool struct {
 	zoneScanErr   error
 	zoneRowsErr   error
 
+	// Инъекции триажа мутантов 09.11.2026: сбои guard-агрегата и выборки
+	// тика по отдельности (queryErr бьёт первую же выборку).
+	guardScanErr error
+	guardRowsErr error
+	tickQueryErr error
+	tickScanErr  error
+	tickRowsErr  error
+
 	mu       sync.Mutex
 	queryErr error // настраиваемый сбой любой выборки
 	queries  []reanCall
@@ -243,19 +251,25 @@ func (p *reanPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	case reanalyzeSelectSQL:
 		return p.selectRows(args)
 	case reanalyzeTickSQL:
+		if p.tickQueryErr != nil {
+			return nil, p.tickQueryErr
+		}
 		return p.tickSelectRows(args)
 	case reanalyzeGuardSQL:
 		if len(args) != 0 {
 			return nil, fmt.Errorf("reanPool: guard корзин: параметров %d, нужно 0", len(args))
 		}
 		if p.guardEmpty {
-			return &reanRows{}, nil // обрыв протокола (агрегат обязан строкой)
+			// Обрыв протокола (агрегат обязан строкой): пустой набор;
+			// инъекция Err — «обрыв ДО строки», не «пустой ответ».
+			return &reanRows{err: p.guardRowsErr}, nil
 		}
 		hour := p.guardHour
 		if hour.IsZero() {
 			hour = time.Now().Truncate(time.Hour)
 		}
-		return &reanRows{rows: [][]any{{p.guardTails, hour}}}, nil
+		return &reanRows{rows: [][]any{{p.guardTails, hour}},
+			scanErr: p.guardScanErr, err: p.guardRowsErr}, nil
 	case zoneIDByNameSQL:
 		if len(args) != 1 {
 			return nil, fmt.Errorf("reanPool: зона по имени: параметров %d, нужно 1", len(args))
@@ -457,7 +471,7 @@ func (p *reanPool) tickSelectRows(args []any) (pgx.Rows, error) {
 			d.label + "." + p.zones[r.key.zone], r.checkedAt}
 	}
 	out := reanRowsOf(rows...)
-	out.scanErr, out.err = p.selectScanErr, p.selectRowsErr
+	out.scanErr, out.err = p.tickScanErr, p.tickRowsErr
 	return out, nil
 }
 
