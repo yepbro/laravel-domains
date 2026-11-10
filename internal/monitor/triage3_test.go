@@ -17,6 +17,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -385,18 +386,20 @@ func TestRenderDebtLoopSourceCalls(t *testing.T) {
 	}
 }
 
-// countingDebtSource — источник рендер-долга со счётчиком вызовов.
+// countingDebtSource — источник рендер-долга со счётчиком вызовов;
+// счётчик атомарный: RenderDebt зовётся из горутины цикла, calls() —
+// из теста до остановки цикла (race-detector).
 type countingDebtSource struct {
 	debt RenderDebt
-	n    int
+	n    atomic.Int64
 }
 
 func (s *countingDebtSource) RenderDebt(context.Context) (RenderDebt, error) {
-	s.n++
+	s.n.Add(1)
 	return s.debt, nil
 }
 
-func (s *countingDebtSource) calls() int { return s.n }
+func (s *countingDebtSource) calls() int { return int(s.n.Load()) }
 
 // TestVerifyCountersClosedEveryBranch — строки сверки закрываются Close
 // на каждой ошибочной ветке (Scan-ошибка и пустой ответ истории).

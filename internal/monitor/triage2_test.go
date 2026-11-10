@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -962,24 +963,26 @@ func TestLoadReportLoopNanosecondInterval(t *testing.T) {
 	st := LoadStat{Load1: 1, Load5: 1, Load15: 1, CPU: CPUStat{Cores: 1},
 		MemTotal: 1, MemAvailable: 1}
 	src := &fakeLoadSource{states: []LoadStat{st}}
-	var reports int
+	// Счётчик инкрементируется из горутины цикла (Notify) и опрашивается
+	// здесь до остановки — только атомарно (race-detector).
+	var reports atomic.Int64
 	done := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		done <- LoadReportLoop(ctx, src, LoadReportOptions{
 			Interval: 1,
-			Notify:   func(string) { reports++ },
+			Notify:   func(string) { reports.Add(1) },
 		})
 	}()
 	deadline := time.Now().Add(2 * time.Second)
-	for reports < 1 && time.Now().Before(deadline) {
+	for reports.Load() < 1 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("цикл: %v", err)
 	}
-	if reports < 1 {
+	if reports.Load() < 1 {
 		t.Error("Interval=1нс: стартовый отчёт не построен (цикл принят выключенным)")
 	}
 }

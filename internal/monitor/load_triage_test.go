@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -790,21 +791,33 @@ func TestLoadReportLoop_SourceErrorNoReport(t *testing.T) {
 	}
 	// Первый проход — снимок, далее — стойкая ошибка источника.
 	src := &flakyLoadSource{first: st, err: errors.New("источник недоступен")}
+	// reports пишется из горутины цикла (Notify) и опрашивается здесь
+	// до остановки цикла — доступ только под мьютексом (race-detector).
+	var mu sync.Mutex
 	var reports []string
 	opts := LoadReportOptions{
 		Interval: 10 * time.Millisecond,
-		Notify:   func(text string) { reports = append(reports, text) },
+		Notify:   func(text string) { mu.Lock(); reports = append(reports, text); mu.Unlock() },
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- LoadReportLoop(ctx, src, opts) }()
 	deadline := time.Now().Add(2 * time.Second)
-	for len(reports) < 1 && time.Now().Before(deadline) {
+	for {
+		mu.Lock()
+		n := len(reports)
+		mu.Unlock()
+		if n >= 1 || time.Now().After(deadline) {
+			break
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if len(reports) != 1 {
+	mu.Lock()
+	n := len(reports)
+	mu.Unlock()
+	if n != 1 {
 		cancel()
-		t.Fatalf("отчётов = %d, want 1 (успешный старт)", len(reports))
+		t.Fatalf("отчётов = %d, want 1 (успешный старт)", n)
 	}
 	// Ждём пару ошибочных проходов и отменяем: новых отчётов нет.
 	time.Sleep(60 * time.Millisecond)
@@ -812,8 +825,11 @@ func TestLoadReportLoop_SourceErrorNoReport(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("цикл: %v", err)
 	}
-	if len(reports) != 1 {
-		t.Errorf("отчётов после сбоев источника = %d, want 1 (сбой не строит отчёт)", len(reports))
+	mu.Lock()
+	n = len(reports)
+	mu.Unlock()
+	if n != 1 {
+		t.Errorf("отчётов после сбоев источника = %d, want 1 (сбой не строит отчёт)", n)
 	}
 }
 
