@@ -55,7 +55,11 @@ func newLatePending() *latePending {
 	}
 }
 
+// add вызывается из горутины теста, пока цикл читает снимки через
+// PendingKeys — доступ к sets строго под мьютексом (race-детектор).
 func (p *latePending) add(stream string, k content.RetentionPendingKey) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	set := p.sets[stream]
 	if set == nil {
 		set = make(map[content.RetentionPendingKey]struct{})

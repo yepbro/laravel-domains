@@ -192,10 +192,19 @@ test: ## Модульные тесты Go (в контейнере)
 # идёт без -race (CGO_ENABLED=0 в образе — боевые бинарники статические),
 # детектор гонок требует cgo — включается на один run-контейнер
 # (-e CGO_ENABLED=1; gcc в tools есть — build-base). По умолчанию только
-# monitor: циклы slowquery/load/zonestats гоняют горутины, остальное
-# покрывает обычный make test; расширение списка — по мере появления
-# конкурентных пакетов (RACE_PKGS='./internal/a/... ./internal/b').
-RACE_PKGS ?= ./internal/monitor
+# Пакеты с горутинными циклами/воркерами — детектор гонок обязан
+# видеть их все (инцидент 10.11: гонки триаж-тестов monitor прошлись
+# мимо локального make test). Расширение списка — по мере появления
+# новых конкурентных пакетов (RACE_PKGS='./internal/a/... ./internal/b').
+# Замер: полный набор ~50 с (render/content с -race — основная часть).
+RACE_PKGS ?= ./internal/monitor \
+	./internal/scheduler \
+	./internal/renderworker \
+	./internal/httpworker \
+	./internal/dnsworker \
+	./internal/queue \
+	./internal/render \
+	./internal/content
 
 .PHONY: test-race
 test-race: ## Тесты с детектором гонок (-race, по умолчанию internal/monitor)
