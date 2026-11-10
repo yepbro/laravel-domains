@@ -190,6 +190,14 @@ type anFakePool struct {
 	aggRowsErr       error
 	aggUpsertRowsAff int64 // 0 — стандартный «INSERT 0 1»
 
+	// Инъекции триажа мутантов 09.11.2026: сбои дельт зоны/кумулятива
+	// истории, «нет строки» у кумулятива (INSERT 0 0) и нестандартный
+	// RowsAffected декремента корзины хвостов.
+	zoneLaravelErr  error
+	counterDeltaErr error
+	counterNoRow    bool
+	consumeRowsAff  int64 // 0 — стандартный «INSERT 0 1»
+
 	// mutateBeforeTx — хук: вызывается перед снапшотом транзакции
 	// (симуляция перезаписи строки перепроверкой/рендером между SELECT
 	// и UPDATE, либо удаления домена).
@@ -383,6 +391,9 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		if t.pool.consumeErr != nil {
 			return pgconn.CommandTag{}, t.pool.consumeErr
 		}
+		if t.pool.consumeRowsAff > 0 {
+			return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", t.pool.consumeRowsAff)), nil
+		}
 		at, ok := args[0].(time.Time)
 		if !ok {
 			return pgconn.CommandTag{}, fmt.Errorf("anFakePool: consume: параметр %T, нужен time.Time", args[0])
@@ -478,6 +489,9 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 
 	case aggregateZoneLaravelSQL:
 		// Дельта счётчика зоны (T-178): delta, zone.
+		if t.pool.zoneLaravelErr != nil {
+			return pgconn.CommandTag{}, t.pool.zoneLaravelErr
+		}
 		if t.pool.zoneNoRow {
 			return pgconn.NewCommandTag("UPDATE 0"), nil
 		}
@@ -488,6 +502,12 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 	case aggregateCounterDeltaSQL:
 		// Инкремент кумулятива истории (T-178): upsert — строки может
 		// не быть (первая реконсиляция ещё не прошла).
+		if t.pool.counterDeltaErr != nil {
+			return pgconn.CommandTag{}, t.pool.counterDeltaErr
+		}
+		if t.pool.counterNoRow {
+			return pgconn.NewCommandTag("INSERT 0 0"), nil
+		}
 		t.pool.counters[args[0].(string)] += args[1].(int64)
 		t.pool.j.record(anEvCounter)
 		return pgconn.NewCommandTag("INSERT 0 1"), nil

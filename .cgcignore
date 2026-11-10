@@ -1,0 +1,15 @@
+# CGC-зеркало .gitignore
+.env
+/var/
+/tmp/
+/bin/
+internal/web/static/app.css
+*.test
+*.out
+coverage.*
+out/
+.idea/
+.vscode/
+.config/
+.opencode/index/
+.codegraphcontext/

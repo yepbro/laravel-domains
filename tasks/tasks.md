@@ -39,7 +39,9 @@
 new∧done (по итогам анализа прод-инцидента 22–29.10.2026, датчик
 T-256) и этап 41: **T-271** — хотфикс OOM PG из-за курсорных
 выборок retention/render-late (прод-инцидент 08–09.11.2026, цикл
- hourly-киллов активен).
+ hourly-киллов активен). Этап 42: **T-272** — пере-тест moli v1.1.23
+ (upstream-фикс Fetch.enable Font — наш PR #2470 — вышел в релизе
+ 09.11.2026; план пере-теста из T-247).
 
 ## Этап 35: выбор движка рендера и очередь фолбэка (T-233…T-249)
 
@@ -209,6 +211,75 @@ single-flight отсутствуют. Отягчающие: generic-планы p
   уходят из журнала медленных (порог 3 с, T-177), MemoryCurrent PG
   устойчиво < 2,5 Ги, NRestarts PG не растёт, бэклог ~9 млн строк
   дренируется пачками (≈900 × 10–25 с, размазано часовыми проходами).
+
+## Этап 42: пере-тест moli v1.1.23 — upstream-фикс Fetch.enable Font (T-272)
+
+Источник: релиз moli
+[v1.1.23](https://github.com/lexmount/moli/releases/tag/v1.1.23)
+(2026-11-09, commit `ee0652d`) с нашим PR
+[lexmount/moli#2470](https://github.com/lexmount/moli/pull/2470)
+«fix(fetch): accept the Font resourceType in Fetch.enable patterns» (форк
+`yepbro/moli`, ветка `fix/fetch-enable-font-resource-type`, коммит
+`4729723`; отправлен 2026-11-06, мейнтейнеры пометили целевым релизом
+1.1.23) и парным мейнтейнерским #2476 «intercept font and media loads
+with shared admission». Причина фикса: на pinned v1.1.21/1.1.22 CDP-срез
+`TestEnginesLiveCDPSlice/moli` красный — `Fetch.enable` с паттернами
+базового набора блокировки T-062 (Image+Media+Font) отвечает
+InvalidParams → каждая задача падает на startBlock, engine=moli
+неработоспособен (live-прогон 2026-11-06: 0/100 из-за паттерна Font;
+прецеденты — докомментарий `internal/render/engines_live_test.go`,
+журнал `.opencode/skills/prod-report/references/prod-topology.md` от
+06.11). Процедура — план пере-теста из T-247 (решение оператора
+2026-11-06, ТЗ v0.3 «watch + smoke по релизам»), шаги —
+docs/dev-environment.md, «Смена pinned-версии движка» (smoke ФТ-17/
+T-254). Операционная задача (не код), как T-247…T-249; lightpanda вне
+задачи (ждёт апстрим #4151 — один browser context на соединение).
+
+- **T-272** [новая] — P1, операционный: bump пина moli до v1.1.23, CDP-срез,
+  smoke на посевной сотне, вердикт кандидата (вход для T-247/T-249;
+  инфраструктура пина и smoke-процедуры — T-241/T-254). Шаги:
+  1. Bump пина парой `MOLI_VERSION=v1.1.23` + `MOLI_SHA256` (релизный ассет
+     `moli-x86_64-unknown-linux-gnu.tar.gz`, sha256
+     `df360c04e567ce2e56a8391a03dc677d794465848b5821f944d2de10f3f1f430`)
+     во всех местах дефолта: `deploy/docker/.env.example`,
+     `deploy/docker/compose.yaml` (два литерала — ARG и тег образа),
+     `deploy/docker/Dockerfile.moli` (ARG-дефолты); на стенде — пара в
+     `.env` (сейчас пин задан дефолтами compose, пары в `.env` нет).
+  2. Пересборка/переподъём: `dc --profile render-engines up -d moli` →
+     образ `crawler/moli:v1.1.23` (тег с версией), healthcheck
+     `/json/version` зелёный, версия в ответе совпадает с пином (гейт
+     среза печатает её сам).
+  3. Слой 1 — CDP-срез: `dc run --use-aliases -e CRAWLER_RENDER_TEST=1
+     --rm tools go test ./internal/render
+     -run 'TestEnginesLiveCDPSlice/moli' -v -count=1`. Ожидание:
+     позеленеет (InvalidParams на Fetch.enable уходит с #2470+#2476;
+     инварианты этапа — ТЗ 5.6/ФТ-5). Дополнительно прогнать набор с
+     `BlockStylesheet` (T-213): если Stylesheet в moli так и не приняли —
+     НЕ блокер базового профиля (опция опциональна, дефолт false),
+     зафиксировать отдельной строкой для CSS-режима. Красный срез —
+     стоп-сигнал: откат переменной на v1.1.21, разбор причины, при
+     движковой причине — issue в апстрим.
+  4. Слой 2 (при зелёном слое 1) — smoke на посевной сотне по процедуре
+     docs/dev-environment.md (шаги 3–4 «Реальный smoke»): `fixtures
+     import --force --publish smoke` → render-worker стенда в профиле
+     moli (engine: moli + ws://172.28.100.17:9222) → дренирование
+     q:render → `fixtures snapshot --label moli-v1.1.23 --engine moli` →
+     `fixtures report` против baseline-chromium. Пороги §5.1 п.4 ТЗР
+     движков (на сотне индикативны; полное сравнение 3000×2 — T-247);
+     критерий smoke: успешность/темп без деградации против baseline,
+     0 crashes ядра движка, память в порядке; между baseline и
+     кандидатом — рестарт render-worker и повторный `import --force` +
+     `--publish`.
+  5. Вердикт и фиксация: «готов/не готов сейчас» против порогов — вход
+     для T-247 (полное стендовое сравнение) и T-249 (канарейка);
+     обновить докомментарий-прецеденты `internal/render/
+     engines_live_test.go` (moli v1.1.23 — зелёный/красный), строку
+     журнала prod-topology.md (06.11 «ждём 1.1.23» → факт), журнал
+     docs/operations.md.
+  Критерий: пин v1.1.23 закоммичен во всех местах дефолта, срез и smoke
+  зафиксированы (снапшоты/отчёты в var/fixtures-render), вердикт и
+  правки доков закоммичены; при красном — откат на v1.1.21 и записан
+  план следующего пере-теста (по следующему релизу движка).
 
 
 

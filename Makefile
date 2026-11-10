@@ -192,10 +192,19 @@ test: ## Модульные тесты Go (в контейнере)
 # идёт без -race (CGO_ENABLED=0 в образе — боевые бинарники статические),
 # детектор гонок требует cgo — включается на один run-контейнер
 # (-e CGO_ENABLED=1; gcc в tools есть — build-base). По умолчанию только
-# monitor: циклы slowquery/load/zonestats гоняют горутины, остальное
-# покрывает обычный make test; расширение списка — по мере появления
-# конкурентных пакетов (RACE_PKGS='./internal/a/... ./internal/b').
-RACE_PKGS ?= ./internal/monitor
+# Пакеты с горутинными циклами/воркерами — детектор гонок обязан
+# видеть их все (инцидент 10.11: гонки триаж-тестов monitor прошлись
+# мимо локального make test). Расширение списка — по мере появления
+# новых конкурентных пакетов (RACE_PKGS='./internal/a/... ./internal/b').
+# Замер: полный набор ~50 с (render/content с -race — основная часть).
+RACE_PKGS ?= ./internal/monitor \
+	./internal/scheduler \
+	./internal/renderworker \
+	./internal/httpworker \
+	./internal/dnsworker \
+	./internal/queue \
+	./internal/render \
+	./internal/content
 
 .PHONY: test-race
 test-race: ## Тесты с детектором гонок (-race, по умолчанию internal/monitor)
@@ -229,10 +238,11 @@ test-integration: ## Интеграционные тесты окружения 
 # там сотни мутантов по yaml-биндингу и i18n-обвязке при низком сигнале.
 # Точечный запуск любого пакета:
 #   make mutate PKGS='./internal/httpfetch/...'
-# CI (mutation.yml) для еженедельного прогона делит этот набор на две
-# половины (~52/48% веса) и гоняет их параллельными джобами — полный
-# охват ~6.5–7 ч на hosted-раннере не влезает в 6-часовой потолок
-# джоба. Локальный прогон — всегда полный набор ниже (или точечный).
+# CI (mutation.yml) для еженедельного прогона делит этот набор на три
+# части по замеренному времени и гоняет их параллельными джобами —
+# полный охват на hosted-раннере не влезает в 6-часовой потолок джоба
+# (render с темпом ~29 с/мутант — отдельный джоб). Локальный прогон —
+# всегда полный набор ниже (или точечный).
 PKGS ?= ./internal/analyzer/... \
 	./internal/dashboard/... ./internal/idn/... ./internal/model/... \
 	./internal/monitor/... ./internal/queue/... ./internal/render/... \
