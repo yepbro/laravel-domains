@@ -179,6 +179,37 @@ teardown chromedp, окно негативной проверки расшире
    | `idn:unreachable-guard` | idn.go | `i == 0` (имя с ведущей точкой) исключено normalizeASCII; соседняя ветка-защита уже погашена аннотацией с тем же обоснованием |
    | `worker:drain-log` | worker.go | `stats.Rows > 0 → >= 0/> -1/> 1`: тело ветки — только log.Info |
 
+   Состав блэклиста части B (триаж выживших CI-прогона 10.11.2026,
+   джоб `mutate-b` queue+rules+scheduler+status: 286 выживших → 153
+   закрыты тестами `*_triage_test.go` пакетов, 133 чексуммы ниже) по
+   группам:
+
+   | Группа | Где | Обоснование |
+   |---|---|---|
+   | `consumers:loop-log` | consumers.go | журналирование цикла чистки (Info/Warn, сбор пар групп, охранные `err != nil && ctx.Err() == nil` и `removed > 0`) — единственный эффект — строка в журнале (прецедент A `log:side-effect`) |
+   | `redisq:publish-retry-pause-timing` | redisq.go | экспоненциальная пауза повторов XADD (`<< min(attempt-1, 5)` и сдвиги границ) — тайминговый контракт; факт/число повторов и останов по успеху/чужой ошибке закрыты тестами |
+   | `redisq:publish-retry-guard-eq` | redisq.go | эквивалентные охраны цикла повторов: `err != nil && infraCause` (infraCause(nil) = false), `ctx.Err()` заголовка при body-break, `break → continue` на не-инфра ошибке — выход тем же путём без лишнего XADD |
+   | `recover:refund-timeout-timing`, `reliab:classify-timeout-timing` | recover.go, reliab.go | бюджеты ctx возвратов/классификации (5 с) — тайминговые константы: фейки юнит-поверхности к дедлайну не чувствительны, поведение команд закрыто тестами |
+   | `recover:refund-log` | recover.go | журнальные ветви возвратов попыток (Info/Warn и охранный `ctx.Err() == nil` клейма) |
+   | `recover:unclassified-guard-eq` | recover.go | `len(unclassified) > 0 → >= 0/> -1`: пустой хвост — только журнал (Refund* с пустой пачкой прозрачен, команд нет) |
+   | `recover:minidle-boundary-eq` | recover.go | `elapsed < MinIdle → <=`: равенство измеренного интервала порогу недостижимо детерминированно (прецедент A `zonestats:took-eq`) |
+   | `recover:claim-minidle-eq` | recover.go | minIdle 0 → −1 неотличим — Claim нормализует неположительные (комментарий-прецедент T-M04 в самом коде) |
+   | `reliab:refund-clamp-eq` | reliab.go | кламп `n < 0 → <= 0/< 1`: в точке 0 обе ветви дают 0 |
+   | `reliab:processing-attempt-arg-eq` | reliab.go | аргумент-попытка Processing потребляется замыканием-обёрткой с `_` — значение не наблюдаемо из публичной поверхности |
+   | `reliab:probe-value-eq` | reliab.go | значение SET-пробы записи не читается — важен факт записи ключа |
+   | `trim:make-cap` | trim.go | ёмкость `make(...)-1` — хинт производительности (группа A `make-cap`) |
+   | `trim:loop-log-bookkeeping` | trim.go | журнал цикла и карта warned («Warn один раз за эпизод», stuckSet, delete-проходка) — только предупреждения |
+   | `trim:cand-empty-guard-eq` | trim.go | `continue` при пустом cand: `streamIDGreater(safe, "")` = false (splitStreamID пустой строки падает) — безопасное присваивание не меняет точку |
+   | `infra:nil-guard-eq`, `infra:ctx-canceled-eq` | infra.go | nil-ошибка и context.Canceled не матчатся ни одной последующей проверкой классификатора — ранний выход эквивалентен проходу до конца |
+   | `scheduler:err-count-unobs` | stalerequeue, retry, lease, leasenull | `return ±1, err` на ошибках: значение никем не читается — все вызывающие проверяют err первым и отбрасывают результат |
+   | `scheduler:drain-total-log` | stalerequeue, lease | итоги дренажей (`total +=/-=/=`, `total > 0`) — только журнал |
+   | `stalerequeue:guard-wrap-eq`, `retry:guard-wrap-eq` | stalerequeue.go, retry.go | глушение возврата `rows.Err()` после `!Next` перехватывается следующим охранным возвратом того же шага (Scan после исчерпания строк обязан упасть / «пустой ответ агрегата») — различие только в тексте обёртки |
+   | `retry:finalize-keys-eq` | retry.go | ключи RETURNING финализации не читаются — только len (дни эпизодов потребляет лишь ветка назначения повтора) |
+   | `retry:empty-candidates-eq` | retry.go | пустая выборка кандидатов: ранний выход эквивалентен проходу до конца (обе транзакции решений пропускаются пустыми пачками) |
+   | `backlog:took-boundary-eq` | backlog.go | `took > Interval → >=`: равенство измеренной длительности интервалу недетерминированно |
+   | `enqueue:panic-guard` | enqueue.go | защитный panic на ошибке построения enqueueUpdate недостижим без бага конструкции (прецедент A `zonestats:init-guard`) |
+   | `cache:valid-guard-eq` | cache.go | `e.valid &&` — мёртвая охрана: valid=false только у ненаписанной записи с нулевым expiresAt, а `now.Before(нулём)` = false |
+
 Конфиг `test/mutation/go-mutesting.yml` дополнительно отсекает файлы без
 сопутствующего `*_test.go` и файлы, чьи тесты под build-тегом, — убить
 мутанта без исполняемых тестов невозможно.
