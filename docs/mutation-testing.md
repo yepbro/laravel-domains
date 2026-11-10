@@ -209,6 +209,21 @@ teardown chromedp, окно негативной проверки расшире
    | `backlog:took-boundary-eq` | backlog.go | `took > Interval → >=`: равенство измеренной длительности интервалу недетерминированно |
    | `enqueue:panic-guard` | enqueue.go | защитный panic на ошибке построения enqueueUpdate недостижим без бага конструкции (прецедент A `zonestats:init-guard`) |
    | `cache:valid-guard-eq` | cache.go | `e.valid &&` — мёртвая охрана: valid=false только у ненаписанной записи с нулевым expiresAt, а `now.Before(нулём)` = false |
+   Продолжение — триаж части C (render, CI-прогон 10.11.2026, score
+   0.916: 54 выживших — 43 закрыты тестами `internal/render/triage_test.go`
+   и дополнением таблиц TestWhatwgParseIPv4/TestOptionsValidate в
+   render_test.go, 11 эквивалентных — блэклист):
+
+   | Группа | Где | Обоснование |
+   |---|---|---|
+   | `render:dns-internal-break` | block.go, hostInternal | `break → continue` в цикле AddrIsInternal: internal уже true, оставшиеся итерации — чтения без эффектов, вердикт тот же |
+   | `render:chan-cap-init` | browser.go, initBrowserSession | ёмкость `make(chan result, 1)`: 2 — строго без эффекта (один send); 0 — блокирует лишь горутину брошенного пути таймера, наблюдаемого поведения нет |
+   | `render:case-identical` | render.go, whatwgIPv4Number | branch/case-мутация даёт байт-в-байт совпадающий исходник (пустой diff, вырожденный мутант) |
+   | `render:whatwg-redundant-guard` | render.go, whatwgParseIPv4 | ранний возврат «не заканчивается числом» продублирован проверкой той же части в цикле ниже — оба пути дают false |
+   | `render:whatwg-empty-default` | render.go, whatwgIPv4Number | `return 0/1,false` для пустой строки: ParseUint("") и так возвращает (0,false), а v при ok=false не читается ни одним вызовом |
+   | `render:validate-host-guard` | render.go, validateTaskURLInternal | `u.Host == "" → false`: Hostname() пустого Host тоже пуст, renderHostInternal("") = false — оба пути дают nil |
+   | `render:whatwg-split-nonempty` | render.go, whatwgParseIPv4 | `len(parts) == 0` недостижим (strings.Split всегда ≥ 1 части): мутанты операнда в false и −1 меняют мёртвый код |
+   | `render:octal-leading-zero` | render.go, whatwgIPv4Number | `s[1:] → s[0:]` в октальном ParseUint: ведущий нуль добавляет 0·8^k — значение и множество валидных цифр те же |
 
 Конфиг `test/mutation/go-mutesting.yml` дополнительно отсекает файлы без
 сопутствующего `*_test.go` и файлы, чьи тесты под build-тегом, — убить
