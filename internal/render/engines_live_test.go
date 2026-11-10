@@ -48,18 +48,34 @@ package render
 //
 // Один движок — фильтром Go: -run 'TestEnginesLiveCDPSlice/moli'.
 //
-// Состояние pinned-версий на момент задачи (live-прогон 2026-11-06:
-// moli v1.1.21, lightpanda 1.0.2 — обе альтернативы СЛОМАНЫ против среза,
-// срез обязан показывать это красным до починки движков/ядра):
+// Состояние движков против среза (pinned-версии и пере-тесты:
+// live-прогон 2026-11-06, пере-тест moli v1.1.23 2026-11-10) — moli и
+// lightpanda 1.0.2, обе альтернативы СЛОМАНЫ против среза, срез обязан
+// показывать это красным до починки движков/ядра):
 //
-//   - moli v1.1.21: Fetch.enable с паттернами по типам Media/Font
-//     (базовый набор T-062) отвечает InvalidParams — moli различает
-//     урезанный набор resourceType (Document/Image/Script/WebSocket/Ping/
-//     CSPViolationReport/EventSource/Fetch/Other; Stylesheet/Media/Font/
-//     TextTrack/Manifest/SignedExchange/Preflight — нет). Ядро включает
-//     перехват паттернами Image+Media+Font → каждая задача падает на
-//     startBlock: engine=moli в dev-профиле неработоспособен (ФТ-5 на
-//     pinned-версии не выполняется — ресёрх этапа 35 переоценил срез).
+//   - moli v1.1.23 (T-272; pinned в репо остаётся v1.1.21):
+//     InvalidParams на Fetch.enable ушёл — Font/Media в паттернах
+//     приняли фиксы lexmount/moli#2470 (наш PR, форк yepbro/moli) +
+//     парный #2476. Навигация/DOM/cookies/изоляция контекста/UA-override
+//     зелёные. Срез держат красным два дефекта перехвата Fetch:
+//     (1) при включённом перехвате синхронный XHR из JS страницы
+//     падает на клиенте NetworkError (лог moli: Uncaught NetworkError:
+//     Failed to execute 'send' on 'XMLHttpRequest') — запрос до
+//     сервера не доходит (block_resources/block_trackers);
+//     (2) fetch.failRequest главной навигации не завершает навигацию
+//     ошибкой загрузки — вкладка неотзывчива (classifyCtx → context),
+//     ERR_BLOCKED_BY_CLIENT приходит вне канала loadFailed, кода
+//     загрузки нет (ssrf); (3) Stylesheet в supports_fetch_enable()
+//     v1.1.23 отсутствует (fetch_support.rs: enum тип парсит, но в
+//     supports-список не входит) — паттерн Stylesheet валит весь
+//     Fetch.enable InvalidParams: BlockStylesheet (T-213, CSS-режим)
+//     на moli недоступен; не блокер базового профиля (опция дефолтно
+//     false). Ждём фикс апстрима → пере-тест по
+//     следующему релизу (T-247). История до v1.1.23 (v1.1.21/1.1.22,
+//     прогон 2026-11-06): Fetch.enable с паттернами Media/Font
+//     отвечал InvalidParams — moli различал урезанный набор
+//     resourceType; каждая задача падала на startBlock (0/100 на
+//     посевной сотне).
 //   - lightpanda 1.0.2: один browser context на соединение («Cannot have
 //     more than one browser context at a time», зафиксировано и
 //     сторонними замерами). Служебная вкладка стартового контекста
@@ -69,7 +85,9 @@ package render
 //
 // Красный срез = регрессия движка против инвариантов этапа (пиновка
 // новой версией — процедура smoke ФТ-17/T-254,
-// docs/dev-environment.md); зелёный chromium — эталон.
+// docs/dev-environment.md); зелёный chromium — эталон (контроль
+// 2026-11-10: 6/6 подтестов PASS на том же стенде — отказы moli
+// движковые, не стендовые).
 
 import (
 	"context"
