@@ -1037,6 +1037,137 @@ func TestContent_RetentionSelectPlanPinned(t *testing.T) {
 	}
 }
 
+// TestContent_RetentionCatchUpFromZeroCursor — главный тест-пробел T-271,
+// закрытый T-273: catch-up-проход с НУЛЕВОГО курсора обязан завершаться
+// в SelectTimeout при чистом skip-префиксе и дренировать всё множество
+// кандидатов. Прод-механика инцидента 09–10.11.2026 (масштаб —
+// прод-пропорция в миниатюре, свойство важнее абсолютных миллионов):
+// retention стоял с ночи 08.11 → курсор нулевой → каждая выборка идёт
+// «с начала таблицы» через миллионы уже чистых строк (предикат «есть
+// что чистить» вне индекса — heap-визит каждой); дедлайн 600 с убивал
+// проход ДО коммита → курсор не двигался → идентичный обречённый скан
+// (вечная петля). Здесь: 200 тыс. чистых остаревших строк (skip-префикс
+// по checked_at) впереди 30 тыс. кандидатов (jsonb) и 5 тыс. свежих —
+// один проход RetentionOnce обязан очистить всех кандидатов и уложиться
+// в ужиженный через опции SelectTimeout (30 с на пачку против продовых
+// 3600 с), а повторный — увидеть пустое множество (дренаж завершён).
+// Контракт-тест по сути: стоимость прод-петли на фикстуре не
+// воспроизводится (тесту без разницы, секунды или часы шёл проход,
+// пока укладывается в потолок) — он фиксирует, что проход с нулевого
+// курсора ЗАВЕРШАЕТСЯ и двигает дренаж до конца множества; форму плана
+// и факт исполнения на объёме проверяет TestRenderLateSelectPlanUnpinned
+// и EXPLAIN-тест закреплённой выборки retention выше.
+func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	ctx := context.Background()
+
+	// Две зоны → выделенные партиции subdomain_results (прод — ~677;
+	// партиционирование — часть стоимости: Append по листам, PK-пробы).
+	var z1, z2 int16
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO zones (name) VALUES ('cup-a.test') RETURNING id").Scan(&z1); err != nil {
+		t.Fatalf("insert zones: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO zones (name) VALUES ('cup-b.test') RETURNING id").Scan(&z2); err != nil {
+		t.Fatalf("insert zones: %v", err)
+	}
+	for _, z := range []int16{z1, z2} {
+		if _, err := pool.Exec(ctx, fmt.Sprintf(
+			"CREATE TABLE subdomain_results_cup_%d PARTITION OF subdomain_results FOR VALUES IN (%d)", z, z)); err != nil {
+			t.Fatalf("партиция зоны %d: %v", z, err)
+		}
+	}
+
+	const (
+		cleanPrefix = 200000 // чистые остаревшие строки ПОЗАДИ курсора стоимости
+		dirty       = 30000  // кандидаты: остаревшие с jsonb
+		fresh       = 5000   // моложе окна — вне дренажа
+		total       = cleanPrefix + dirty + fresh
+	)
+	// Домен на строку — прод-пропорция (43 млн domains при 11,3 млн
+	// записей: большинство доменов без записей).
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO domains (zone_id, id, label)
+		SELECT CASE WHEN g % 2 = 0 THEN $1::int2 ELSE $2::int2 END, g, 'cup' || g
+		FROM generate_series(1, $3) g`, z1, z2, total); err != nil {
+		t.Fatalf("посев domains: %v", err)
+	}
+	// Строки по checked_at-порядку: чистый префикс [−35ч, −7,2ч] →
+	// кандидаты [−7ч, −6,2ч] (окно retention 6 ч — остаревшие) → свежие
+	// [−1ч, −59м]. Кандидаты отличимы заголовком jsonb (трим без ссылок
+	// — contents не нужен), чистый префикс — паспорт без jsonb, как их
+	// оставил retention до простоя.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO subdomain_results
+		    (zone_id, domain_id, subdomain_id, variant, scheme, checked_at, headers)
+		SELECT CASE WHEN g % 2 = 0 THEN $1::int2 ELSE $2::int2 END, g, (g % 63)::smallint, 0, 2,
+		       CASE
+		       WHEN g <= $3 THEN now() - interval '35 hours' + (g * interval '0.5 seconds')
+		       WHEN g <= $4 THEN now() - interval '7 hours' + ((g - $3) * interval '0.1 seconds')
+		       ELSE now() - interval '1 hour' + ((g - $4) * interval '0.1 seconds')
+		       END,
+		       CASE WHEN g > $3 THEN '{"cup":1}'::jsonb END
+		FROM generate_series(1, $5) g`, z1, z2, cleanPrefix, cleanPrefix+dirty, total); err != nil {
+		t.Fatalf("посев subdomain_results: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "ANALYZE subdomain_results"); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+
+	// Catch-up-проход с нулевого курсора: SelectTimeout ужижен через
+	// опции (30 с на пачку — щедро против фактических единиц секунд,
+	// многократно меньше продовых 3600 с: свойство «проход успевает»
+	// проверяется, а не ждётся час).
+	start := time.Now()
+	stats, err := content.RetentionOnce(ctx, pool, content.RetentionOptions{
+		Retention:     6 * time.Hour,
+		BatchSize:     10000,
+		SelectTimeout: 30 * time.Second,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("catch-up с нулевого курсора не завершился в SelectTimeout: %v (проход %v)", err, elapsed)
+	}
+	if stats.Rows != dirty {
+		t.Fatalf("очищено строк = %d, want %d (весь бэклог одним проходом)", stats.Rows, dirty)
+	}
+	if stats.Batches != dirty/10000 {
+		t.Fatalf("пачек = %d, want %d", stats.Batches, dirty/10000)
+	}
+	if stats.BadHashes != 0 || stats.Missing != 0 || stats.Skipped || stats.SkippedPending {
+		t.Errorf("аномалий быть не должно: %+v", stats)
+	}
+	// Дренаж завершён: кандидатов не осталось (свежие не тронуты —
+	// у них headers на месте, окно возраста не вышло).
+	var n int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM subdomain_results WHERE headers IS NOT NULL").Scan(&n); err != nil {
+		t.Fatalf("чтение остатков: %v", err)
+	}
+	if n != fresh {
+		t.Errorf("строк с jsonb после прохода = %d, want %d (только свежие)", n, fresh)
+	}
+	if elapsed > time.Minute {
+		t.Errorf("catch-up-проход на фикстуре занял %v — деградация формы плана (бюджет теста: минута)", elapsed)
+	}
+
+	// Повторный проход — множество исчерпано (курсор/очистка
+	// продвинулись): пустой дренаж за одну выборку.
+	stats, err = content.RetentionOnce(ctx, pool, content.RetentionOptions{
+		Retention:     6 * time.Hour,
+		BatchSize:     10000,
+		SelectTimeout: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("повторный проход: %v", err)
+	}
+	if stats.Rows != 0 || stats.Batches != 0 {
+		t.Fatalf("повторный проход = %+v, want пустой (множество исчерпано)", stats)
+	}
+}
+
 // planIdxScanRe — индексная форма доступа (Index Scan / Index Only
 // Scan) в EXPLAIN-тестах закрепления планов (T-271): покрывает обе
 // записи и листовые партиции PG16, и родителей PG17+. Якорь на начало

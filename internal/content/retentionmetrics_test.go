@@ -208,3 +208,29 @@ func TestRetentionMetricsIdempotent(t *testing.T) {
 		t.Errorf("rows = %v, want 7 (один коллектор на два конструктора)", got)
 	}
 }
+
+// TestRetentionMetricsErrorsCounter — счётчик ошибочных проходов
+// crawler_content_retention_errors_total (T-273): экспонируется, растёт
+// на ObserveError (по одному на неудачный проход — хук RetentionOptions.
+// OnError), успешный/пропущенный проход его не трогает; nil-приёмник —
+// no-op. До T-273 ошибки проходов были видны только в journalctl
+// (инцидент 09–10.11.2026: сутки WARN-ов при нулевых метриках).
+func TestRetentionMetricsErrorsCounter(t *testing.T) {
+	reg := metrics.New("http-worker")
+	m := NewRetentionMetrics(reg)
+	const name = "crawler_content_retention_errors_total"
+
+	m.Observe(RetentionStats{}, time.Second)              // успешный (пустой) проход
+	m.Observe(RetentionStats{Skipped: true}, time.Second) // пропуск интерлока
+	if got := retentionCounterValue(t, reg, name); got != 0 {
+		t.Fatalf("%s до ошибок = %v, want 0 (успех/пропуск не считаются)", name, got)
+	}
+	m.ObserveError(nil)
+	m.ObserveError(nil)
+	if got := retentionCounterValue(t, reg, name); got != 2 {
+		t.Fatalf("%s после двух ошибочных проходов = %v, want 2", name, got)
+	}
+
+	// nil-приёмник (сервис без реестра) — no-op, не паникует.
+	NewRetentionMetrics(nil).ObserveError(nil)
+}

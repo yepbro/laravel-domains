@@ -160,6 +160,12 @@ type retentionFakePool struct {
 	selectBeginErr  error
 	selectCommitErr error
 
+	// selectDelay — задержка тяжёлой выборки (тест семантики backoff
+	// T-273: проход длится дольше тика интервала); selectsAt — метки
+	// времени вызовов выборки дренажа (старты проходов).
+	selectDelay time.Duration
+	selectsAt   []time.Time
+
 	// onSelect — хук между выборкой и чисткой (гонки перезаписи): вызывается
 	// после отбора кандидатов, до возврата строк.
 	onSelect func()
@@ -399,6 +405,17 @@ func (t *retentionFakeTx) Query(ctx context.Context, sql string, args ...any) (p
 	if sql == retentionSelectSQL && t.pool.selectBlock {
 		<-ctx.Done()
 		return nil, ctx.Err()
+	}
+	if sql == retentionSelectSQL {
+		// Момент старта прохода и задержка выборки (семантика backoff
+		// T-273): сон вне мьютекса — пул остаётся доступен тесту.
+		t.pool.mu.Lock()
+		t.pool.selectsAt = append(t.pool.selectsAt, time.Now())
+		delay := t.pool.selectDelay
+		t.pool.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 	}
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
@@ -803,8 +820,10 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 
 	// Оболочка закрепления (T-271): первая транзакция — SET LOCAL ×5 +
 	// SELECT, фиксация без отката; тексты — литералы пакета (потолок
-	// statement_timeout — дефолт 600 с замера T-201; bitmap off —
-	// доводка T-271: битмап-путь ломает порядок курсора).
+	// statement_timeout — дефолт 3600 с T-273: таймаут обязан накрывать
+	// первый catch-up-проход с нулевого курсора, а не только штатные
+	// пачки замера T-201; bitmap off — доводка T-271: битмап-путь
+	// ломает порядок курсора).
 	if retentionPlanNoSeqScanSQL != "SET LOCAL enable_seqscan = off" ||
 		retentionPlanNoHashJoinSQL != "SET LOCAL enable_hashjoin = off" ||
 		retentionPlanNoMergeJoinSQL != "SET LOCAL enable_mergejoin = off" ||
@@ -1015,6 +1034,136 @@ func TestRetentionLoop_Backoff(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("лог = %q, want Warn ошибочного прохода", buf.String())
+	}
+}
+
+// TestRetentionLoop_BackoffEveryErrorResetsTicker — семантика backoff
+// (T-273, главный диагностический пробел T-271): reset тикера после
+// КАЖДОЙ ошибки. До T-273 reset выполнялся только на первую (условие
+// !backoff): якорем тикера оставался конец первого ошибочного прохода,
+// и повторные ошибки шли паузой «backoff − длительность прохода»
+// (проход 600 с при backoff 15 мин — реальная пауза 300 с), каденс
+// WARN-ов маскировал длительность проходов. Проход здесь длится дольше
+// тика интервала (selectDelay 150 мс > interval 40 мс) и ошибается:
+// старты проходов обязаны идти с паузой ≥ длительность прохода +
+// backoff (гарантия снизу: сон и тикер не заканчиваются раньше срока).
+func TestRetentionLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
+	pool := retentionSeedPool(time.Date(2026, 11, 9, 14, 13, 0, 0, time.UTC))
+	pool.mu.Lock()
+	pool.selectErr = errors.New("content: retention: выборка кандидатов: timeout: context deadline exceeded")
+	pool.selectDelay = 150 * time.Millisecond
+	pool.mu.Unlock()
+	opts := RetentionOptions{
+		Retention:    DefaultRetention,
+		Interval:     40 * time.Millisecond,
+		ErrorBackoff: 500 * time.Millisecond,
+		BatchSize:    100,
+	}
+	attempts := func() []time.Time {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		return append([]time.Time(nil), pool.selectsAt...)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- RetentionLoop(ctx, pool, opts) }()
+
+	// Стартовый проход + два повторных за щедрый бюджет (пауза 650 мс).
+	deadline := time.Now().Add(5 * time.Second)
+	var starts []time.Time
+	for {
+		starts = attempts()
+		if len(starts) >= 3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("цикл не завершился после отмены ctx")
+	}
+	if len(starts) < 3 {
+		t.Fatalf("стартов прохода = %d, want ≥3 (стартовый + два повторных)", len(starts))
+	}
+	// Пауза между стартами ≥ проход (150 мс) + backoff (500 мс) − запас
+	// на планировщик (50 мс). Прошлая семантика давала ровно backoff
+	// (500 мс) между повторными ошибками — якорь тикера не переанкорился.
+	const minGap = 150 + 500 - 50
+	for i := 1; i < len(starts); i++ {
+		if gap := starts[i].Sub(starts[i-1]); gap < minGap*time.Millisecond {
+			t.Errorf("пауза между проходами %d→%d = %v, want ≥ %v (проход + backoff: reset после каждой ошибки)",
+				i-1, i, gap, minGap*time.Millisecond)
+		}
+	}
+}
+
+// TestRetentionLoop_OnError — хук ошибки прохода (T-273): вызывается на
+// каждом неудачном проходе (вместе с Warn), на успешных — нет; счётчик
+// ошибок цикла (crawler_content_retention_errors_total) растёт ровно на
+// число неудачных проходов — до T-273 ошибки были видны только в
+// journalctl (метрики :9104 — нули при 70+ WARN-ах за сутки).
+func TestRetentionLoop_OnError(t *testing.T) {
+	pool := retentionSeedPool(time.Date(2026, 11, 9, 14, 13, 0, 0, time.UTC))
+	pool.mu.Lock()
+	pool.selectErr = errors.New("потеря соединения: unexpected EOF")
+	pool.mu.Unlock()
+
+	errs := make(chan error, 16)
+	opts := RetentionOptions{
+		Retention:    DefaultRetention,
+		Interval:     20 * time.Millisecond,
+		ErrorBackoff: 60 * time.Millisecond,
+		BatchSize:    100,
+		OnError:      func(err error) { errs <- err },
+	}
+	count := func() int {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		return len(pool.selectsAt)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- RetentionLoop(ctx, pool, opts) }()
+
+	// Стартовый проход и первый повтор — ошибки: по вызову хука на each.
+	deadline := time.Now().Add(3 * time.Second)
+	for count() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Ошибка снята: успешные проходы хук не зовут.
+	pool.mu.Lock()
+	pool.selectErr = nil
+	pool.mu.Unlock()
+	errored := count()
+	deadline = time.Now().Add(3 * time.Second)
+	for count() < errored+2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("цикл не завершился после отмены ctx")
+	}
+	close(errs)
+	n := 0
+	var last error
+	for err := range errs {
+		n++
+		last = err
+	}
+	// Вызовов ровно по числу неудачных проходов: errored попыток шли с
+	// активной ошибкой (+1 — проход, стартовавший до снятия ошибки, но
+	// прочитавший её позже); успешные проходы хука не добавляют.
+	if n < errored || n > errored+1 {
+		t.Fatalf("вызовов OnError = %d, want %d..%d (по одному на каждый неудачный проход)", n, errored, errored+1)
+	}
+	if last == nil || !strings.Contains(last.Error(), "unexpected EOF") {
+		t.Errorf("OnError получил %v, want ошибку прохода", last)
 	}
 }
 
@@ -1468,8 +1617,8 @@ func TestRetentionOptionsDefaults(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("withDefaults = %+v, want %+v", got, want)
 	}
-	if DefaultRetentionSelectTimeout != 600*time.Second {
-		t.Errorf("DefaultRetentionSelectTimeout = %s, want 600s (2,7× максимума замера T-201)", DefaultRetentionSelectTimeout)
+	if DefaultRetentionSelectTimeout != 3600*time.Second {
+		t.Errorf("DefaultRetentionSelectTimeout = %s, want 3600s (потолок catch-up-прохода с нулевого курсора, T-273: 600 с убивали первый проход до коммита — вечная петля)", DefaultRetentionSelectTimeout)
 	}
 	if DefaultRetentionErrorBackoff != 15*time.Minute {
 		t.Errorf("DefaultRetentionErrorBackoff = %s, want 15m (инцидентный backoff T-271)", DefaultRetentionErrorBackoff)

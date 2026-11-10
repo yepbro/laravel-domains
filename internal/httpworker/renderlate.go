@@ -107,13 +107,18 @@ const (
 	DefaultRenderLateAfter = 6 * time.Hour
 
 	// DefaultRenderLateSelectTimeout — потолок одной выборки пачки
-	// (T-271): серверный statement_timeout в tx-оболочке закрепления
-	// плана и клиентский ctx-дедлайн. Закреплённая форма — index-скан по
-	// PK с LIMIT 1000 (секунды); 60 с — порядок запаса на I/O-голод
-	// рядом с retention-пачками того же сервиса. Превышение — ошибка
+	// (T-271): серверный statement_timeout в tx-оболочке выборки и
+	// клиентский ctx-дедлайн. 300 с (T-273, было 60): catch-up с нулевого
+	// курсора на прод-объёме (domains 43 млн) при любой форме плана
+	// дороже секунд, а дедлайн обязан давать проходу шанс завершиться
+	// и сдвинуть курсор — таймаут меньше реальной стоимости выборки
+	// превращает медленный дренаж в вечную петлю обречённых повторов
+	// (регрессия T-271, инцидент 09–10.11.2026: 60 с < cost закреплённой
+	// формы ≈157 млн — ни одного успешного прохода за 21 ч). Штатные
+	// пачки (курсор в середине таблицы) — секунды. Превышение — ошибка
 	// прохода, backoff и повтор пачки с того же курсора (публикация не
 	// состоялась — дубля нет, ТЗ 3.4).
-	DefaultRenderLateSelectTimeout = 60 * time.Second
+	DefaultRenderLateSelectTimeout = 300 * time.Second
 
 	// DefaultRenderLateErrorBackoff — пауза тикера цикла после
 	// ошибочного прохода (T-271): тик, сработавший за время долгого
@@ -143,12 +148,28 @@ var (
 	// имя для Result.Name (стиль T-027). Курсор row-value > по PK
 	// отсекает пройденное, ORDER BY по тому же ключу — детерминированные
 	// пачки и корректная пагинация; ведущие колонки PK — партиции
-	// LIST/HASH (T-005) режут поиск до листа. Форма плана закреплена
-	// SET LOCAL в tx-оболочке выборки (T-271, latePlanNoSeqScanSQL ниже)
-	// — до T-259 закрепления сознательно не было («планировщик сам»),
-	// инцидент 08–09.11.2026 показал обратное: деградировавший план
-	// (seq scan + hash join + Sort, ≈1 ГиБ) вместе с соседним
-	// retention-сканом положил PostgreSQL пятью OOM-киллами за ночь.
+	// LIST/HASH (T-005) режут поиск до листа.
+	//
+	// Форма плана НЕ закрепляется — сознательно, T-273 (возврат к
+	// решению T-251). Закрепление T-271 (SET LOCAL seq/hash/merge/bitmap
+	// off) оставляло планировщику только Nested Loop, и на прод-объёме
+	// он разворачивал join от domains (43,4 млн строк, cost ≈157 млн) —
+	// всегда за 60-с дедлайн, вечная петля обречённых выборок
+	// (инцидент 09–10.11.2026, расследование T-273). Непиненная форма
+	// работала в проде неделями до T-271 и адаптивна по замерам testbed
+	// (PG 16.15, 2 млн domains / 550 тыс. subdomain_results): нулевой
+	// курсор — Nested Loop от domains с ранним остановом Limit
+	// (19 мс), середина таблицы — Merge Join от subdomain_results по
+	// PK (42 мс), давление domains≫записей — r-driven Merge Join с
+	// хвостом domains (260 мс). Вариант «SET LOCAL join_collapse_limit
+	// = 1» отвергнут замером: GUC держит пары join в порядке FROM, но
+	// не запрещает разворот outer/inner ВНУТРИ пары — план всё равно
+	// разворачивается от domains. Возврат OOM-цикла не ожидается:
+	// рабочие структуры узлов зажаты work_mem 16 МБ (docs/db.md),
+	// совпадение тяжёлых сканов исключает общий гейт, каждая выборка
+	// — под statement_timeout. Потолок statement_timeout остаётся
+	// (tx-оболочка lateSelect), структурная фиксация формы — частичный
+	// индекс + персистентный курсор (follow-up, вариант C исследования).
 	// content_hash и
 	// alias_subdomain_id — вердикт (DetectSPA T-057 / наследование
 	// T-055); hash NULL — тела нет, alias NULL — наследовать не у кого.
@@ -165,35 +186,13 @@ var (
 		"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 		"LIMIT $6"
 
-	// latePlanNoSeqScanSQL / latePlanNoHashJoinSQL / latePlanNoMergeJoinSQL /
-	// latePlanNoBitmapScanSQL —
-	// закрепление формы плана выборки пачки (T-271; образец
-	// renderSelectPending T-181 / retryCandidates T-191): seq scan и
-	// hash/merge join отключаются до оператора выборки, планировщик
-	// держит Index Scan по PK (курсор row-value > и ORDER BY PK — порядок
-	// индекса, сортировка не нужна) + Nested Loop точечных проб
-	// domains/zones + Limit с ранним остановом. Bitmap-скан выключается
-	// туда же (доводка T-271 по интеграционному EXPLAIN): при выключенных
-	// seq/hash/merge планировщик на курсорном предикате выбирает
-	// Bitmap Heap + Bitmap Index Scan по PK — битмап не сохраняет
-	// порядок индекса, ORDER BY PK закрывается явным Sort, и форма
-	// перестаёт быть детерминированной (зависит от того, какой путь
-	// приглянулся планировщику на данном объёме); с выключенным битмэпом
-	// путь один — Index Scan, сортировка не нужна вовсе. enable_sort не
-	// отключается: закреплённая форма сортировку не использует, а
-	// широкий запрет менял бы пространство планов транзакции. Действие
-	// SET LOCAL — только эта транзакция, остальные запросы пула не
-	// затронуты (стиль T-181/T-191).
-	latePlanNoSeqScanSQL    = "SET LOCAL enable_seqscan = off"
-	latePlanNoHashJoinSQL   = "SET LOCAL enable_hashjoin = off"
-	latePlanNoMergeJoinSQL  = "SET LOCAL enable_mergejoin = off"
-	latePlanNoBitmapScanSQL = "SET LOCAL enable_bitmapscan = off"
-
 	// lateSelectTimeoutFmt — серверный потолок выборки той же
 	// tx-оболочкой (T-271): формат '<N>ms' валиден парсеру GUC-времени
 	// при любой длительности (стиль db.lockTimeoutSQLFmt). Значение —
 	// LateOptions.SelectTimeout, текст закрепляется юнит-тестом
-	// (renderlate_test.go).
+	// (renderlate_test.go). Оболочка из одного SET LOCAL — закрепления
+	// плана сняты (T-273), остался потолок: сервер режет сам оператор,
+	// клиентский ctx-дедлайн — оболочку целиком.
 	lateSelectTimeoutFmt = "SET LOCAL statement_timeout = '%dms'"
 
 	// lateRenderAliasSQL — строки субдоменов-оригиналов для наследования
@@ -588,17 +587,16 @@ func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cac
 }
 
 // lateSelect — пачка кандидатов после курсора after (lateRenderRowsSQL).
-// Единая точка тяжёлой выборки: явная транзакция с закреплением формы
-// плана SET LOCAL seq/hash/merge/bitmap off + statement_timeout до SELECT
-// (T-271, образец renderSelectPending T-181 — см. комментарий к
-// latePlanNoSeqScanSQL), клиентский ctx-дедлайн SelectTimeout накрывает
-// и оболочку (BEGIN/SET LOCAL/COMMIT). Транзакция — только оболочка
-// закрепления: SELECT читает зафиксированные данные, фиксация/откат по
-// содержанию равнозначны. Тяжёлый скан под общим гейтом http-worker
-// (o.Gate, T-271): выборка позднего переиздателя и retention не
-// совпадают в PostgreSQL («1+1 ГиБ» поверх shared_buffers — инцидент
-// 08–09.11.2026); гейт занимается ДО Begin — соединение пула не
-// простаивает в очереди.
+// Единая точка тяжёлой выборки: явная транзакция с серверным потолком
+// SET LOCAL statement_timeout до SELECT (T-271; закрепления плана сняты
+// T-273 — см. комментарий к lateRenderRowsSQL: непиненная форма
+// T-251), клиентский ctx-дедлайн SelectTimeout накрывает и оболочку
+// (BEGIN/SET LOCAL/COMMIT). Транзакция — только оболочка потолка:
+// SELECT читает зафиксированные данные, фиксация/откат по содержанию
+// равнозначны. Тяжёлый скан под общим гейтом http-worker (o.Gate,
+// T-271): выборка позднего переиздателя и retention не совпадают в
+// PostgreSQL («1+1 ГиБ» поверх shared_buffers — инцидент 08–09.11.2026);
+// гейт занимается ДО Begin — соединение пула не простаивает в очереди.
 func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.Time, after lateKey) ([]lateRow, error) {
 	o = o.withDefaults()
 	if err := o.Gate.Acquire(ctx); err != nil {
@@ -616,16 +614,11 @@ func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.T
 	// Откат безусловно: после Commit — no-op (стиль T-044).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	for _, pin := range []string{
-		latePlanNoSeqScanSQL,
-		latePlanNoHashJoinSQL,
-		latePlanNoMergeJoinSQL,
-		latePlanNoBitmapScanSQL,
-		fmt.Sprintf(lateSelectTimeoutFmt, o.SelectTimeout.Milliseconds()),
-	} {
-		if _, err := tx.Exec(ctx, pin); err != nil {
-			return nil, fmt.Errorf("httpworker: поздний переиздатель: закрепление плана: %w", err)
-		}
+	// Единственный SET LOCAL — потолок оператора (T-273): закрепление
+	// формы (seq/hash/merge/bitmap off, T-271) разворачивало join от
+	// domains на прод-объёме — вечная петля за дедлайном.
+	if _, err := tx.Exec(ctx, fmt.Sprintf(lateSelectTimeoutFmt, o.SelectTimeout.Milliseconds())); err != nil {
+		return nil, fmt.Errorf("httpworker: поздний переиздатель: потолок выборки: %w", err)
 	}
 
 	rows, err := tx.Query(ctx, lateRenderRowsSQL,
@@ -666,13 +659,13 @@ func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.T
 // часы/дни; стартового дренажа сознательно нет: гонять всю таблицу
 // пачками подряд — часы фонового I/O на старте сервиса). Курсор —
 // состояние цикла (одна горутина, стиль retentionState T-185). Ошибка
-// прохода — Warn, тикер переводится в backoff DefaultRenderLateError
-// Backoff (T-271): тик, сработавший за время долгого ошибочного
-// прохода, не перезапускает проход немедленно в только что поднятый
-// PostgreSQL (инцидент 08–09.11.2026); цикл живёт (контракт OnRun,
-// T-012): курсор стоит на месте, проход после паузы повторит пачку,
-// успех возвращает штатный интервал. Отмена ctx — чистый nil
-// (graceful shutdown, §3.4).
+// прохода — Warn, метрика crawler_render_late_errors_total (T-273) и
+// тикер переводится в backoff DefaultRenderLateErrorBackoff после
+// КАЖДОЙ ошибки (T-271 завёл backoff, T-273 сделал reset на каждую —
+// пауза отсчитывается от конца ошибочного прохода): цикл живёт
+// (контракт OnRun, T-012), курсор стоит на месте, проход после паузы
+// повторит пачку, успех возвращает штатный интервал. Отмена ctx —
+// чистый nil (graceful shutdown, §3.4).
 func RenderLateLoop(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue,
 	pending content.RetentionPending, met *Metrics, opts LateOptions) error {
 	if pool == nil {
@@ -709,12 +702,18 @@ func RenderLateLoop(ctx context.Context, pool RecordDB, contents RenderContent, 
 				// Отмена во время прохода — часть остановки, не тревога.
 				if ctx.Err() == nil {
 					log.Warn("поздний переиздатель рендера", "err", err)
+					met.LateError()
 				}
-				// Backoff после ошибки (T-271): тик интервала не
-				// перезапускает проход немедленно; повтор пачки — первым
-				// тиком паузы, дублей нет (публикация не состоялась),
-				// успех вернёт штатный интервал.
-				if ctx.Err() == nil && !backoff {
+				// Backoff после КАЖДОЙ ошибки (T-271 завёл backoff,
+				// T-273 сделал reset на каждую — якорем тикера был конец
+				// первого ошибочного прохода, повторные ошибки оставляли
+				// паузу «проход минус период», каденс WARN-ов маскировал
+				// длительность): пауза отсчитывается от конца ошибочного
+				// прохода — минимум «проход + backoff» между стартами;
+				// повтор пачки — первым тиком паузы, дублей нет
+				// (публикация не состоялась), успех вернёт штатный
+				// интервал.
+				if ctx.Err() == nil {
 					backoff = true
 					lateResetTicker(ticker, o.ErrorBackoff)
 				}

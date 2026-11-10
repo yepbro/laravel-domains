@@ -13,10 +13,12 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -403,75 +405,116 @@ const latePinSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.varia
 	"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 	"LIMIT 1000"
 
-// TestRenderLateSelectPlanPinned — закрепление формы плана выборки пачки
-// позднего переиздателя (T-271; до задачи форма сознательно не
-// закреплялась — инцидент 08–09.11.2026 показал деградацию до
-// seq scan + hash join + Sort ≈1 ГиБ, вместе с соседним retention-сканом
-// — пять OOM-киллов PostgreSQL за ночь): внутри транзакции закрепления
-// (SET LOCAL seq/hash/merge/bitmap off — те же литералы
-// internal/httpworker/renderlate.go) EXPLAIN показывает Index Scan по
-// PK subdomain_results + Limit, без Hash/Merge Join и Seq Scan (ORDER BY
-// PK — порядок индекса, Sort-узла не ожидается). Bitmap выключен
-// доводкой T-271: битмап-путь не сохраняет порядок PK-курсора → явный
-// Sort, форма недетерминирована.
-func TestRenderLateSelectPlanPinned(t *testing.T) {
+// TestRenderLateSelectPlanUnpinned — форма плана выборки пачки позднего
+// переиздателя (T-273 снял закрепления T-271): на объёме прод-пропорции
+// (домены ≈ 4× записей — прод 43 млн при 11,3 млн) НЕпиненный
+// планировщик обязан собрать ограниченную пачку с ранним остановом —
+// доступ к subdomain_results по индексу + Limit, без полного Sort
+// записей. Закрепление T-271 (SET LOCAL seq/hash/merge/bitmap off) на
+// таком объёме разворачивало join от domains (cost ≈157 млн) — вечная
+// петля за 60-с дедлайном (инцидент 09–10.11.2026); непиненная форма
+// T-251 («планировщик сам») работала в проде неделями. Конкретный путь
+// не закрепляется (Seq/Hash/Merge в руках планировщика — потому
+// фикстура прод-пропорции, а не три строки: на пустой таблице
+// планировщик законно берёт seq scan + Sort). Замер T-273 (testbed
+// PG 16.15, 2 млн domains / 550 тыс. записей): нулевой курсор —
+// Nested Loop от domains с пробами PK записей, 19 мс; середина
+// таблицы — Merge Join от subdomain_results, 42 мс.
+func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
 	var zone int16
 	if err := pool.QueryRow(ctx,
-		"INSERT INTO zones (name) VALUES ('late-pin.test') RETURNING id").Scan(&zone); err != nil {
+		"INSERT INTO zones (name) VALUES ('late-unpin.test') RETURNING id").Scan(&zone); err != nil {
 		t.Fatalf("insert zones: %v", err)
 	}
-	var id int64
-	if err := pool.QueryRow(ctx,
-		"INSERT INTO domains (zone_id, label) VALUES ($1, 'late-pin') RETURNING id", zone,
-	).Scan(&id); err != nil {
-		t.Fatalf("insert domains: %v", err)
+
+	// Прод-пропорция в миниатюре: 480 тыс. доменов, 125 тыс. записей
+	// (1:3,8 ≈ прод 43:11,3 млн) — большинство доменов без записей,
+	// выборка с нулевого курсора предельно несеективна, как в catch-up.
+	const (
+		lateDomains = 480000
+		lateRows    = 125000
+	)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO domains (zone_id, id, label)
+		SELECT $1, g, 'lu' || g FROM generate_series(1, $2) g`, zone, lateDomains); err != nil {
+		t.Fatalf("посев domains: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at)
-		VALUES ($1, $2, 0, 2, 'https://late-pin.test/', now() - interval '7 hours')`,
-		zone, id); err != nil {
-		t.Fatalf("посев результата: %v", err)
+		INSERT INTO subdomain_results
+		    (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at)
+		SELECT $1, g, (g % 63)::smallint, 2, 'https://lu.test/' || g,
+		       now() - interval '7 hours' - (g * interval '1 second')
+		FROM generate_series(1, $2) g`, zone, lateRows); err != nil {
+		t.Fatalf("посев subdomain_results: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "ANALYZE domains"); err != nil {
+		t.Fatalf("ANALYZE domains: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "ANALYZE subdomain_results"); err != nil {
+		t.Fatalf("ANALYZE subdomain_results: %v", err)
 	}
 
+	// Без закреплений — как в боевой tx-оболочке T-273 (единственный
+	// SET LOCAL там — statement_timeout, на форму плана не влияющий).
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	for _, pin := range []string{
-		"SET LOCAL enable_seqscan = off",
-		"SET LOCAL enable_hashjoin = off",
-		"SET LOCAL enable_mergejoin = off",
-		"SET LOCAL enable_bitmapscan = off",
-	} {
-		if _, err := tx.Exec(ctx, pin); err != nil {
-			t.Fatalf("%s: %v", pin, err)
-		}
-	}
-	plan := explainPlan(t, tx, ctx, latePinSelectSQL)
-	if !planIdxScanRe.MatchString(plan) {
-		t.Errorf("закреплённый план без Index Scan по PK subdomain_results:\n%s", plan)
-	}
+
+	// EXPLAIN ANALYZE — форма и факт исполнения: пачка обязана
+	// собраться (rows=1000) за конечное время — ровно того, чего не
+	// случалось у закреплённой формы на прод-объёме.
+	plan := explainAnalyze(t, tx, ctx, latePinSelectSQL)
 	if !strings.Contains(plan, "Limit") {
-		t.Errorf("закреплённый план без Limit (ранний останов пачки):\n%s", plan)
+		t.Errorf("план без Limit (ранний останов пачки):\n%s", plan)
 	}
-	for _, bad := range []string{"Hash Join", "Merge Join", "Seq Scan"} {
-		if strings.Contains(plan, bad) {
-			t.Errorf("закреплённый план содержит %q (SET LOCAL не подействовал):\n%s", bad, plan)
+	if !planIdxScanRe.MatchString(plan) {
+		t.Errorf("план без Index Scan (записи читаются мимо индексов):\n%s", plan)
+	}
+	// Полный Sort записей — форма «сканируй всё и сортируй», её стоимость
+	// приписал инциденту T-271; Incremental Sort поверх порядка индекса
+	// допустим (узел называется «Incremental Sort», якорь badSortRe
+	// его не матчит).
+	if badSortRe.MatchString(plan) {
+		t.Errorf("план содержит полный Sort записей (порядок курсора должен закрываться индексом):\n%s", plan)
+	}
+	if !strings.Contains(plan, "rows=1000 loops=1") {
+		t.Errorf("исполнение не собрало пачку 1000 (rows=1000 loops=1 в Limit-узле):\n%s", plan)
+	}
+}
+
+// badSortRe — полный Sort-узел (не «Incremental Sort» и не строки
+// «Sort Key:»/«Sort Method:») в EXPLAIN-тестах T-273: якорь на начало
+// строки узла и требование скобки/конца строки после имени — Go regexp
+// без lookahead, а «Sort Key» начинается с того же слова.
+var badSortRe = regexp.MustCompile(`(?m)^\s*(?:->\s*)?Sort(\s*\(|$)`)
+
+// explainAnalyze — текст EXPLAIN ANALYZE (COSTS OFF) запроса внутри
+// транзакции (стиль explainPlan; T-273: ANALYZE — замер фактического
+// исполнения ограниченной пачки).
+func explainAnalyze(t *testing.T, tx pgx.Tx, ctx context.Context, sql string) string {
+	t.Helper()
+	rows, err := tx.Query(ctx, "EXPLAIN (ANALYZE, COSTS OFF) "+sql)
+	if err != nil {
+		t.Fatalf("EXPLAIN ANALYZE: %v", err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("EXPLAIN ANALYZE: чтение: %v", err)
 		}
+		plan.WriteString(line)
+		plan.WriteByte('\n')
 	}
-	// Bitmap-путь и Sort — другой диагноз, чем невыключенные GUC:
-	// закрепление действует, но форма не закрыта до конца — битмап не
-	// сохраняет порядок индекса, ORDER BY PK закрывается явным Sort
-	// (доводка T-271). Incremental Sort тут допустимой формы не
-	// составляет: PK-порядок даёт сам индексный скан.
-	for _, bad := range []string{"Sort", "Bitmap Index Scan", "Bitmap Heap Scan"} {
-		if strings.Contains(plan, bad) {
-			t.Errorf("закреплённый план содержит %q (порядок курсора ломается — форма не закреплена до конца):\n%s", bad, plan)
-		}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("EXPLAIN ANALYZE: %v", err)
 	}
+	return plan.String()
 }

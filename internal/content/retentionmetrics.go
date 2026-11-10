@@ -34,6 +34,7 @@ type RetentionMetrics struct {
 	pendingErrors prometheus.Counter     // crawler_content_retention_pending_errors_total
 	badHashes     prometheus.Counter     // crawler_content_retention_bad_hashes_total
 	missing       prometheus.Counter     // crawler_content_retention_missing_refs_total
+	errors        prometheus.Counter     // crawler_content_retention_errors_total (T-273)
 	seconds       prometheus.Observer    // crawler_content_retention_pass_seconds
 	passes        *prometheus.CounterVec // crawler_content_retention_passes_total{result}
 	deferred      *prometheus.CounterVec // crawler_content_retention_deferred_total{stream}
@@ -79,6 +80,10 @@ func NewRetentionMetrics(reg *metrics.Registry) *RetentionMetrics {
 			Name: "crawler_content_retention_missing_refs_total",
 			Help: "Срезанные retention ссылки без строки contents — расхождение учёта refcount (T-044); в норме не растёт: рост = баг учёта, разбираться по инвариантам T-044.",
 		}).WithLabelValues(),
+		errors: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_content_retention_errors_total",
+			Help: "Ошибочные проходы retention (T-273): проход прерван на ошибке — пачки, зафиксированные до неё, остаются в силе (курсор продвинулся частично), остаток множества повторится после backoff. До T-273 ошибки были видны только в журнале (инцидент 09–10.11.2026: сутки WARN-ов при нулевых метриках проходов); рост серии = дренаж стоит, контролировать диск контента и заголовок Warn в journalctl.",
+		}).WithLabelValues(),
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_content_retention_pass_seconds",
 			Help:    "Длительность одного прохода retention (дренаж пачками, T-166).",
@@ -86,7 +91,7 @@ func NewRetentionMetrics(reg *metrics.Registry) *RetentionMetrics {
 		}).WithLabelValues(),
 		passes: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_passes_total",
-			Help: "Проходы retention по итогам: ok — дренаж выполнен (в т.ч. пустой), skipped — интерлок q:analyze (тела ещё нужны), skipped_pending — ошибка чтения непотреблённых q:render/q:analyze (проход отложен); error-проходы не считаются — их видит Warn в логе.",
+			Help: "Проходы retention по итогам: ok — дренаж выполнен (в т.ч. пустой), skipped — интерлок q:analyze (тела ещё нужны), skipped_pending — ошибка чтения непотреблённых q:render/q:analyze (проход отложен); error-проходы здесь не считаются — их считает crawler_content_retention_errors_total (T-273).",
 		}, "result"),
 		deferred: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_deferred_total",
@@ -123,6 +128,17 @@ func (m *RetentionMetrics) Observe(res RetentionStats, d time.Duration) {
 	m.passes.WithLabelValues("ok").Inc()
 	m.seconds.Observe(d.Seconds())
 	m.observeWork(res)
+}
+
+// ObserveError — ошибочный проход (T-273): +1 к
+// crawler_content_retention_errors_total; подключается хуком
+// RetentionOptions.OnError (значение ошибки не классифицируется —
+// текст виден в Warn журнала). nil-приёмник — no-op.
+func (m *RetentionMetrics) ObserveError(error) {
+	if m == nil {
+		return
+	}
+	m.errors.Inc()
 }
 
 // observeWork — счётчики сделанной работы прохода (общая часть веток

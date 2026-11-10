@@ -393,6 +393,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	if retentionWatermark <= 0 {
 		retentionWatermark = int64(cfg.Scheduler.QueueHighWatermark)
 	}
+	// Один экземпляр приборов retention на оба хука: итоги проходов
+	// (OnPass) и ошибки (OnError — crawler_content_retention_errors_
+	// total, T-273: до этого ошибки проходов были видны только в
+	// journalctl, метрики :9104 стояли в нуле при живых WARN-ах).
+	retentionMet := content.NewRetentionMetrics(reg)
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -405,7 +410,8 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			AnalyzeWatermark: retentionWatermark,
 			Gate:             scanGate,
 			Log:              logger,
-			OnPass:           content.NewRetentionMetrics(reg).Observe,
+			OnPass:           retentionMet.Observe,
+			OnError:          retentionMet.ObserveError,
 		})
 	}()
 

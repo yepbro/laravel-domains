@@ -129,6 +129,11 @@ type latePool struct {
 	// rowsBlock — «зависшая» выборка: ответ только по ctx-дедлайну
 	// (тест ctx-таймаута T-271).
 	rowsBlock bool
+	// rowsDelay — задержка тяжёлой выборки (тест семантики backoff
+	// T-273: проход длится дольше тика интервала); beginsAt — метки
+	// времени Begin (старты проходов).
+	rowsDelay time.Duration
+	beginsAt  []time.Time
 }
 
 var _ RecordDB = (*latePool)(nil)
@@ -165,20 +170,22 @@ func (p *latePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	}
 }
 
-// Begin — транзакция закрепления плана (T-271): тяжёлая выборка пачки
+// Begin — транзакция потолка выборки (T-271): тяжёлая выборка пачки
 // идёт через lateTx, точечные запросы остаются в пуле.
 func (p *latePool) Begin(context.Context) (pgx.Tx, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.begins++
+	p.beginsAt = append(p.beginsAt, time.Now())
 	tx := &lateTx{pool: p}
 	p.txs = append(p.txs, tx)
 	return tx, nil
 }
 
-// lateTx — транзакция закрепления плана: SET LOCAL ×4 до SELECT
-// (T-271), calls — упорядоченный журнал операторов (контракт порядка,
-// стиль retentionFakeTx.calls).
+// lateTx — транзакция потолка выборки: единственный SET LOCAL —
+// statement_timeout до SELECT (закрепления плана сняты T-273), calls —
+// упорядоченный журнал операторов (контракт порядка, стиль
+// retentionFakeTx.calls).
 type lateTx struct {
 	pgx.Tx // остальные методы pgx.Tx проход не использует
 
@@ -191,14 +198,13 @@ func (t *lateTx) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTa
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	t.calls = append(t.calls, sql)
-	switch {
-	case sql == latePlanNoSeqScanSQL || sql == latePlanNoHashJoinSQL ||
-		sql == latePlanNoMergeJoinSQL || sql == latePlanNoBitmapScanSQL ||
-		strings.HasPrefix(sql, "SET LOCAL statement_timeout = "):
+	// С T-273 оболочка — только потолок оператора: закрепления формы
+	// (SET LOCAL enable_*) разворачивали join от domains на прод-объёме
+	// (вечная петля за дедлайном) — неожидаемый Exec падает громко.
+	if strings.HasPrefix(sql, "SET LOCAL statement_timeout = ") {
 		return pgconn.NewCommandTag("SET"), nil
-	default:
-		return pgconn.CommandTag{}, fmt.Errorf("lateTx: неожидаемый Exec %q", sql)
 	}
+	return pgconn.CommandTag{}, fmt.Errorf("lateTx: неожидаемый Exec %q", sql)
 }
 
 func (t *lateTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -207,6 +213,16 @@ func (t *lateTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, 
 	if sql == lateRenderRowsSQL && t.pool.rowsBlock {
 		<-ctx.Done()
 		return nil, ctx.Err()
+	}
+	// Задержка тяжёлой выборки (семантика backoff T-273): сон вне
+	// мьютекса — пул остаётся доступен тесту.
+	if sql == lateRenderRowsSQL {
+		t.pool.mu.Lock()
+		delay := t.pool.rowsDelay
+		t.pool.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 	}
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
@@ -431,8 +447,8 @@ func lateOpts() LateOptions { return LateOptions{BatchSize: 100, After: testLate
 // ORDER BY PK, LIMIT, граница возраста параметром; предикаты (rendered,
 // final_url, маркер, возраст, бит render_pending, deleted) — живой
 // смысл фейка проверяется поведением ниже. Выборка идёт в tx-оболочке
-// закрепления плана (T-271) — порядок операторов проверяет
-// TestRenderLateSelectPlan.
+// потолка statement_timeout (T-271/T-273) — порядок операторов
+// проверяет TestRenderLateSelectShell.
 func TestRenderLateSelect(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
@@ -465,15 +481,16 @@ func TestRenderLateSelect(t *testing.T) {
 	}
 }
 
-// TestRenderLateSelectPlan — закрепление формы плана выборки (T-271):
-// пачка читается в явной транзакции строго последовательностью
-// SET LOCAL ×5 (seq/hash/merge/bitmap off + statement_timeout) → SELECT →
-// COMMIT (реплика T-181/T-191; без закрепления деградировавший план —
-// seq scan + hash join + Sort ≈1 ГиБ — клал PostgreSQL OOM, инцидент
-// 08–09.11.2026); выборка идёт через транзакцию, не пул. Bitmap-путь
-// выключен доводкой T-271: битмап ломает порядок PK-курсора → явный
-// Sort, форма перестаёт быть детерминированной.
-func TestRenderLateSelectPlan(t *testing.T) {
+// TestRenderLateSelectShell — tx-оболочка выборки (T-271 завёл
+// закрепление формы, T-273 снял его): пачка читается в явной
+// транзакции строго последовательностью SET LOCAL statement_timeout →
+// SELECT → COMMIT. Закрепления (SET LOCAL enable_seqscan/hashjoin/
+// mergejoin/bitmapscan = off) удалены сознательно — на прод-объёме
+// (domains 43 млн) пин оставлял планировщику только Nested Loop и
+// разворачивал join от domains, cost ≈157 млн при дедлайне 60 с —
+// вечная петля обречённых выборок (инцидент 09–10.11.2026); неожидаемый
+// enable_* в журнале падает громко (фейк не знает такой Exec).
+func TestRenderLateSelectShell(t *testing.T) {
 	f := newLateFixture(t)
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://x/", hash: f.spaHash[:]})
@@ -485,29 +502,26 @@ func TestRenderLateSelectPlan(t *testing.T) {
 		t.Fatalf("транзакций = %d, хочу 1 (tx-оболочка выборки)", len(f.pool.txs))
 	}
 	tx := f.pool.txs[0]
-	// Тексты закрепления — литералы (контракт интеграционного
-	// EXPLAIN-теста, стиль renderq_test.go).
-	if latePlanNoSeqScanSQL != "SET LOCAL enable_seqscan = off" ||
-		latePlanNoHashJoinSQL != "SET LOCAL enable_hashjoin = off" ||
-		latePlanNoMergeJoinSQL != "SET LOCAL enable_mergejoin = off" ||
-		latePlanNoBitmapScanSQL != "SET LOCAL enable_bitmapscan = off" ||
-		lateSelectTimeoutFmt != "SET LOCAL statement_timeout = '%dms'" {
-		t.Fatalf("тексты закрепления плана изменены")
+	// Текст потолка — литерал (контракт интеграционного теста, стиль
+	// renderq_test.go); значение — дефолт 300 с T-273.
+	if lateSelectTimeoutFmt != "SET LOCAL statement_timeout = '%dms'" {
+		t.Fatalf("текст потолка выборки изменён")
 	}
 	want := []string{
-		latePlanNoSeqScanSQL,
-		latePlanNoHashJoinSQL,
-		latePlanNoMergeJoinSQL,
-		latePlanNoBitmapScanSQL,
 		fmt.Sprintf(lateSelectTimeoutFmt, DefaultRenderLateSelectTimeout.Milliseconds()),
 		lateRenderRowsSQL,
 	}
 	if len(tx.calls) != len(want) {
-		t.Fatalf("операторов tx-оболочки = %d, хочу %d (SET LOCAL ×5 + SELECT): %v", len(tx.calls), len(want), tx.calls)
+		t.Fatalf("операторов tx-оболочки = %d, хочу %d (SET LOCAL ×1 + SELECT): %v", len(tx.calls), len(want), tx.calls)
 	}
 	for i, sql := range want {
 		if tx.calls[i] != sql {
-			t.Errorf("шаг %d = %s, хочу %s (порядок SET LOCAL ×5 → SELECT)", i, tx.calls[i], sql)
+			t.Errorf("шаг %d = %s, хочу %s (порядок SET LOCAL statement_timeout → SELECT)", i, tx.calls[i], sql)
+		}
+	}
+	for _, sql := range tx.calls {
+		if strings.HasPrefix(sql, "SET LOCAL enable_") {
+			t.Errorf("оболочка содержит закрепление плана %q — сняты T-273 (вечная петля обречённых выборок)", sql)
 		}
 	}
 	if !tx.committed {
@@ -973,8 +987,8 @@ func TestRenderLateDefaults(t *testing.T) {
 	if DefaultRenderLateAfter != 6*time.Hour {
 		t.Fatalf("окно возраста %s, хочу 6 ч (ФТ-5.3)", DefaultRenderLateAfter)
 	}
-	if DefaultRenderLateSelectTimeout != 60*time.Second {
-		t.Errorf("потолок выборки %s, хочу 60 с (T-271)", DefaultRenderLateSelectTimeout)
+	if DefaultRenderLateSelectTimeout != 300*time.Second {
+		t.Errorf("потолок выборки %s, хочу 300 с (T-273: дедлайн обязан давать catch-up-проходу завершиться и сдвинуть курсор)", DefaultRenderLateSelectTimeout)
 	}
 	if DefaultRenderLateErrorBackoff != 15*time.Minute {
 		t.Errorf("backoff ошибки %s, хочу 15 мин (T-271)", DefaultRenderLateErrorBackoff)
@@ -1094,5 +1108,79 @@ func TestRenderLateLoop_Backoff(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
 		t.Errorf("лог = %q, хочу Warn ошибочного прохода", buf.String())
+	}
+}
+
+// TestRenderLateLoop_BackoffEveryErrorResetsTicker — семантика backoff
+// (T-273, главный диагностический пробел T-271): reset тикера после
+// КАЖДОЙ ошибки, пауза отсчитывается от конца ошибочного прохода.
+// До T-273 reset выполнялся только на первую ошибку (условие
+// !backoff): якорем тикера оставался конец первого прохода, повторные
+// ошибки шли паузой «backoff − длительность прохода» — каденс WARN-ов
+// маскировал длительность (инцидент 09–10.11.2026: «ровно 15 мин»
+// при 600-с проходах — реальная пауза 300 с). Проход здесь длится
+// дольше тика интервала (rowsDelay 150 мс > interval 40 мс) и
+// ошибается: старты проходов обязаны идти с паузой ≥ длительность
+// прохода + backoff. Здесь же — метрика ошибок (T-273): счётчик
+// crawler_render_late_errors_total растёт на каждом неудачном проходе.
+func TestRenderLateLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
+	f := newLateFixture(t)
+	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
+	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://spa/", hash: f.spaHash[:]})
+	f.pool.mu.Lock()
+	f.pool.rowsErr = errors.New("httpworker: поздний переиздатель: выборка: timeout: context deadline exceeded")
+	f.pool.rowsDelay = 150 * time.Millisecond
+	f.pool.mu.Unlock()
+
+	opts := LateOptions{
+		Interval:     40 * time.Millisecond,
+		BatchSize:    100,
+		After:        testLateAfter,
+		ErrorBackoff: 500 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- RenderLateLoop(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, opts) }()
+
+	// Три ЗАВЕРШЁННЫЕ ошибкой попытки за щедрый бюджет (пауза 650 мс:
+	// 150 проход + 500 backoff) — метрика растёт по факту ошибки, по ней
+	// и ждём: старт без ошибки (отмена в середине) не считается.
+	deadline := time.Now().Add(5 * time.Second)
+	var starts []time.Time
+	for {
+		f.pool.mu.Lock()
+		starts = append([]time.Time(nil), f.pool.beginsAt...)
+		f.pool.mu.Unlock()
+		errCount := httpMetricValue(t, f.reg, "crawler_render_late_errors_total", nil)
+		if (len(starts) >= 3 && errCount >= 3) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("цикл не завершился после отмены ctx")
+	}
+	if len(starts) < 3 {
+		t.Fatalf("стартов прохода = %d, хочу ≥3", len(starts))
+	}
+	// Пауза между стартами ≥ проход (150 мс) + backoff (500 мс) − запас
+	// на планировщик (50 мс). Прошлая семантика давала ровно backoff
+	// между повторными ошибками — якорь тикера не переанкорился.
+	const minGap = 150 + 500 - 50
+	for i := 1; i < len(starts); i++ {
+		if gap := starts[i].Sub(starts[i-1]); gap < minGap*time.Millisecond {
+			t.Errorf("пауза между проходами %d→%d = %v, want ≥ %v (проход + backoff: reset после каждой ошибки)",
+				i-1, i, gap, minGap*time.Millisecond)
+		}
+	}
+	// Метрика ошибок (T-273): по одному инкременту на каждый неудачный
+	// проход (цикл остановлен — значение финально; последний старт мог
+	// быть прерван отменой, потому требование «≥3», а не равенство).
+	if v := httpMetricValue(t, f.reg, "crawler_render_late_errors_total", nil); v < 3 {
+		t.Errorf("crawler_render_late_errors_total = %v, хочу ≥3 (по одному на каждый неудачный проход)", v)
 	}
 }

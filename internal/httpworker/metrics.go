@@ -74,6 +74,7 @@ type Metrics struct {
 	cutSkip   prometheus.Counter     // crawler_http_dead_host_cutoff_skipped_checks_total (T-164)
 	dbRetried prometheus.Counter     // crawler_db_deadlock_retried_total (T-268)
 	late      prometheus.Counter     // crawler_render_late_republish_total (T-259)
+	lateErrs  prometheus.Counter     // crawler_render_late_errors_total (T-273)
 }
 
 // NewMetrics регистрирует приборы HTTP-этапа в реестре reg (каррированные
@@ -142,6 +143,10 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		late: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_late_republish_total",
 			Help: "Переиздания q:render поздним переиздателем (T-259, ТЗ-fsm ФТ-5.3): «вечно молодые» записи (rendered = false, final_url не пуст, без маркера render_failed_at) старше 6 ч без бита render_pending и без непотреблённых сообщений q:render/q:render-fallback — потерянные MAXLEN-усечением и сбоями публикации задачи; стационарно не растёт, рост после инцидента — дренаж потерь, спад до нуля — дренаж завершён.",
+		}).WithLabelValues(),
+		lateErrs: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_render_late_errors_total",
+			Help: "Ошибочные проходы позднего переиздателя рендера (T-273): выборка/снимок/издание пачки не завершились — курсор не двигается, пачка повторится после backoff. До T-273 ошибки были видны только в журнале (инцидент 09–10.11.2026: 70+ WARN-ов за сутки при нулевой метрике переизданий); рост = переиздатель не работает, при render_pending > 0 рендер-долг не вернётся в q:render — искать заголовок Warn в journalctl.",
 		}).WithLabelValues(),
 	}
 }
@@ -255,4 +260,14 @@ func (m *Metrics) LateRepublished(n int) {
 		return
 	}
 	m.late.Add(float64(n))
+}
+
+// LateError — ошибочный проход позднего переиздателя (T-273): +1 к
+// crawler_render_late_errors_total; вызывается циклом RenderLateLoop
+// рядом с Warn (отмена ctx — штатная остановка, не считается).
+func (m *Metrics) LateError() {
+	if m == nil {
+		return
+	}
+	m.lateErrs.Inc()
 }
