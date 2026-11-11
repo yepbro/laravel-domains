@@ -78,7 +78,9 @@ func DrainDomain(ctx context.Context, pool RetentionDB, retention time.Duration,
 	if len(batch) == 0 {
 		return RetentionStats{}, nil
 	}
-	st, err := retentionPurge(ctx, pool, o, batch)
+	// Дренаж по месту, без курсора: строки домена адресуются префиксом PK
+	// (T-274 — nil, как у зонда ретраев).
+	st, err := retentionPurge(ctx, pool, o, batch, nil)
 	if err != nil {
 		return st, fmt.Errorf("content: retention: дренаж домена %d/%d: %w", zoneID, domainID, err)
 	}

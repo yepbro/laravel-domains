@@ -665,6 +665,7 @@ Go: без потолка). Замер критерия T-163 сэмплером
 | `block_stylesheet` | `CRAWLER_RENDER_BLOCK_STYLESHEET` | bool | `false` (T-213; включение — после A/B, риск computed styles — ниже) |
 | `block_tracker_domains` | `CRAWLER_RENDER_BLOCK_TRACKER_DOMAINS` | bool | `true` (T-214; список доменов и принцип выбора — ниже и в [`render.md`](render.md)) |
 | `queue_high_watermark` | `CRAWLER_RENDER_QUEUE_HIGH_WATERMARK` | целое | `10000` (0 — общий `scheduler.queue_high_watermark`) |
+| `late_select_timeout` | `CRAWLER_RENDER_LATE_SELECT_TIMEOUT` | длительность | `300s`, диапазон 1m..24h, `0` — дефолт кода (T-274) |
 | `requeue_deprioritized_zones` | `CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES` | список имён зон | `[]` (замена целиком; имена — punycode нижним регистром, как в справочнике zones) |
 | `fallback.enabled` | `CRAWLER_RENDER_FALLBACK_ENABLED` | bool | `false` (включение очереди фолбэка — ниже) |
 | `fallback.worker_rate` | `CRAWLER_RENDER_FALLBACK_WORKER_RATE` | целое | `100` (записей за окно 1 мин; диапазон 1..1000000) |
@@ -889,6 +890,15 @@ Env-форма — список через запятую:
 целиком, имена приводятся к нижнему регистру). Механика прохода и
 память ступеней — [`render.md`](render.md), «Цикл очередей».
 
+`late_select_timeout` — потолок одной выборки пачки позднего
+переиздателя рендера (T-274; сам потолок — T-271/T-273): серверный
+`statement_timeout` tx-оболочки выборки и клиентский ctx-дедлайн.
+Таймаут меньше стоимости первого catch-up-прохода с нулевого курсора
+превращает медленный дренаж в вечную петлю обречённых повторов
+(регрессия T-271, инцидент 09–10.11.2026). Дефолт 300 с: выборка
+переиздателя адаптивная (непиненная форма плана) и быстрая; ручка
+заведена на случай недооценки — смена потолка без деплоя.
+
 `fallback` — подсекция очереди фолбэка на Chromium (ТЗ этапа 35,
 ФТ-6…ФТ-14): задачи, не прошедшие рендер на основном движке по
 движко-зависимой причине (тарпит `timeout_attempts` и класс задачи на
@@ -956,6 +966,7 @@ false` (умолчание) — первичный воркер финализи
 | `retention_interval` | `CRAWLER_CONTENT_RETENTION_INTERVAL` | длительность | `1h`, диапазон 1m..24h |
 | `retention_batch` | `CRAWLER_CONTENT_RETENTION_BATCH` | число | `10000`, диапазон 1000..100000 (рабочая вилка 10–50 тыс.) |
 | `retention_analyze_watermark` | `CRAWLER_CONTENT_RETENTION_ANALYZE_WATERMARK` | число | `0` (общий порог `scheduler.queue_high_watermark`), явное значение 1..10⁸ |
+| `retention_select_timeout` | `CRAWLER_CONTENT_RETENTION_SELECT_TIMEOUT` | длительность | `2h`, диапазон 1m..24h, `0` — дефолт кода (T-274) |
 
 Словарь обучается командой `crawlerctl dict train <файл> [--samples ПУТЬ]…`
 (dev-окружение — `docs/dev-environment.md` §6); отсутствующий файл — не
@@ -987,7 +998,14 @@ false` (умолчание) — первичный воркер финализи
 q:analyze у порога — анализатор не успевает, тела и headers/cookies ещё
 нужны, проход цикла пропускается; 0 — общий порог
 `scheduler.queue_high_watermark` (тем же критерием «строго ниже порога»
-работает гейт публикации q:analyze). Механика, критерии отбора,
+работает гейт публикации q:analyze). `retention_select_timeout` (T-274)
+— потолок одной выборки пачки (серверный statement_timeout tx-оболочки
+и клиентский ctx-дедлайн): дефолт 2 ч — удвоенный запас над прод-замерами
+10–11.11.2026 первого catch-up-прохода с нулевого курсора под
+нагрузкой; ручка на случай недооценки — смена потолка без деплоя.
+Курсор дренажа персистентен (`retention_drain_cursor`, миграция
+000020): рестарт http-worker продолжает дренаж с сохранённой позиции.
+Механика, критерии отбора,
 зафиксированные отступления (переанализ не-находок — на recheck) и
 метрики — [`docs/content.md`](content.md) «Retention контента и трим
 не-находок (T-166)». Цикл запускает http-worker; `0` — retention
@@ -1456,13 +1474,15 @@ loopback-пира (прокси с терминированным TLS — docs/d
   потолка) или (0, 100] (NaN отклоняется), `health_gate_streak` 1..100
   — проверяются при любом `fallback.enabled` (T-233),
   `queue_high_watermark` 0 (общий порог) или 1..10⁸ (T-174),
+  `late_select_timeout` 0 или 1m..24h (T-274),
   `requeue_deprioritized_zones` — имена зон punycode нижним регистром
   (≤ 253 октет, TLD — com, in, IDN — xn--p1ai), без повторов
   после приведения регистра (T-184);
 - `content.pack_size` 1 MiB..8 GiB, `max_store_bytes` 1 байт..16 MiB,
   `disk_free_percent` в (0, 95]; `retention` 0 или 1m..30d,
   `retention_interval` 1m..24h, `retention_batch` 1000..100000,
-  `retention_analyze_watermark` 0 или 1..10⁸ (T-166);
+  `retention_analyze_watermark` 0 или 1..10⁸ (T-166),
+  `retention_select_timeout` 0 или 1m..24h (T-274);
 - `analyzer.laravel_min_score` в (0, 1];
 - `ingest.max_error_ratio` в (0, 1]; `ingest.archive_max_uncompressed`
   1 байт..1 TiB, `ingest.archive_max_files` 1..1000000;

@@ -830,7 +830,9 @@ NULL` старше 6 ч, у домена без бита `render_pending` (до�
 оболочку с закреплением формы плана, T-273 закрепление снял):
 единственный `SET LOCAL statement_timeout = '300000ms'` до SELECT —
 зависший запрос невозможен, клиентский ctx-дедлайн `SelectTimeout`
-накрывает и оболочку. Закрепление `enable_seqscan/hashjoin/mergejoin/
+накрывает и оболочку. Рабочее значение передаёт конфигурация
+(`render.late_select_timeout`, T-274; 0 — дефолт кода 300 с). Закрепление
+`enable_seqscan/hashjoin/mergejoin/
 bitmapscan = off` оказалось регрессией: на прод-объёме (domains 43 млн)
 пин оставлял планировщику только Nested Loop и разворачивал join от
 domains — cost ≈157 млн при дедлайне 60 с, ни одного успешного прохода

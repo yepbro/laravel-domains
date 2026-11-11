@@ -6,13 +6,17 @@
 //
 // Модель «один раз за жизнь» (§3): курсор по (checked_at, PK)
 // инициализируется нулём при старте процесса — первый проход и есть
-// catch-up-круг по накопленному (платится рестартом, не часом) — и
-// продвигается пачками вперёд; очищенная строка остаётся позади курсора,
-// перепроверённая (DELETE+INSERT, fresh checked_at — T-058) входит в
-// дренаж заново, когда состарится. «Неполная пачка» — дренаж до конца
-// текущего окна старения; следующий проход (час) продолжает с места
-// остановки — срез состарившегося за час ≈ приток, окно обслуживает
-// индекс subdomain_results_checked_idx (T-171).
+// catch-up-круг по накопленному — и продвигается пачками вперёд;
+// очищенная строка остаётся позади курсора, перепроверённая (DELETE+
+// INSERT, fresh checked_at — T-058) входит в дренаж заново, когда
+// состарится. С T-274 курсор дополнительно персистентен в БД
+// (retentioncursor.go, миграция 000020): рестарт процесса продолжает
+// дренаж с сохранённой позиции, а не новый catch-up с нуля (штраф
+// рестартов — часовой обход чистого префикса, замеры 10–11.11.2026 —
+// снят). «Неполная пачка» — дренаж до конца текущего окна старения;
+// следующий проход (час) продолжает с места остановки — срез
+// состарившегося за час ≈ приток, окно обслуживает индекс
+// subdomain_results_checked_idx (T-171).
 //
 // Явные ретраи вместо полных кругов (§4.3–4.4): ежечасный круг был
 // одновременно ретраем (подбирал защищённые) и дорожкой (перечитывал
@@ -99,6 +103,15 @@ type retentionState struct {
 	// retryLimit — предел списка ретраев (DefaultRetentionRetryLimit);
 	// поле для юнит-тестов — меньше возиться с сотней тысяч ключей.
 	retryLimit int
+
+	// persist — состояние принадлежит циклу сервиса (RetentionLoop):
+	// курсор пачек фиксируется в БД (retention_drain_cursor, T-274,
+	// миграция 000020), принудительные круги чистят сохранённую позицию.
+	// Разовый RetentionOnce и юнит-тесты критериев отбора работают без
+	// персистентности (поведение до T-274); сброс в false при
+	// отсутствии таблицы (миграция не применена — Info один раз,
+	// стиль noCounterTable).
+	persist bool
 }
 
 // limit — эффективный предел списка ретраев.
@@ -201,16 +214,41 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 		// вернутся точечным предложением (§4.3) — чистка только
 		// не-ожидающих.
 		last, full := batch[len(batch)-1], len(batch) >= o.BatchSize
-		st.deferRetries(batch, pending, log)
+		next := retentionCursor{checkedAt: last.checkedAt, key: last.key}
+		st.deferRetries(ctx, pool, batch, pending, log)
+		selected := len(batch)
 		batch = pending.deferBatch(batch, &out)
 		if len(batch) > 0 {
-			stp, err := retentionPurge(ctx, pool, o, batch)
+			// Персистентный курсор — транзакцией пачки (T-274), но только
+			// если пачка НЕ перешагнула отложенных защитой строк: позиция
+			// в БД не двигается за непочищенные строки — потеря списка
+			// ретраев при рестарте восполняется перечитыванием защитного
+			// окна (ключи отложатся заново), чистые строки выпадут из
+			// отбора сами (ревью T-274, P1). In-memory курсор двигается
+			// как раньше: в пределах жизни процесса ключи вернёт зонд.
+			// Запланированный круг подавляет сохранение (planCircle уже
+			// удалил строку — новая позиция до применения круга воскресила
+			// бы её).
+			var save *retentionCursor
+			if st.persist && !st.circle && len(batch) == selected {
+				save = &next
+			}
+			stp, err := retentionPurge(ctx, pool, o, batch, save)
 			if err != nil {
+				// Таблицы курсора нет (миграция 000020 не применена —
+				// старый стенд): персистентность выключается на процесс,
+				// пачка откатана целиком и повторится следующим проходом
+				// (курсор не двинулся — потери нет).
+				if errors.Is(err, errRetentionNoCursorTable) {
+					st.persist = false
+					log.Info("retention: таблицы персистентного курсора нет — работаем без сохранения (миграция 000020 не применена?)")
+					return out, nil
+				}
 				return out, err
 			}
 			out.add(stp)
 		}
-		st.cursor = retentionCursor{checkedAt: last.checkedAt, key: last.key}
+		st.cursor = next
 		if !full {
 			return out, nil // неполная пачка — дренаж исчерпан
 		}
@@ -245,6 +283,8 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 // курсора), переполнение списка, fallback либо рестарт; триггер
 // «существенное уменьшение долга» отвергнут сознательно: длинный дренаж
 // (443 тыс., этап 25) уменьшался бы каждый час — круги вернулись бы.
+// Персистентное состояние круга чистит planCircle в момент плана
+// (T-274).
 func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *slog.Logger) {
 	if debt, ok, err := retentionDebt(ctx, pool); err != nil && errors.Is(err, errRetentionNoCounterTable) {
 		// Таблицы счётчика нет (миграция 000015 не применена) — штатное
@@ -255,16 +295,16 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 			st.noCounterTable = true
 			log.Info("retention: таблицы счётчика рендер-долга нет — работаем fallback-сутками (миграция 000015 не применена?)")
 		}
-		st.fallbackCircle()
+		st.fallbackCircle(ctx, pool, log)
 	} else if err != nil {
 		if ctx.Err() == nil {
 			log.Warn("retention: счётчик рендер-долга не прочитан — состояние долга держится, страховка fallback-суток",
 				"err", err)
 		}
-		st.fallbackCircle()
+		st.fallbackCircle(ctx, pool, log)
 	} else if !ok {
 		// Строки счётчика нет (БД до деплоя T-175) — тот же fallback.
-		st.fallbackCircle()
+		st.fallbackCircle(ctx, pool, log)
 	} else {
 		st.lastCircle = time.Now() // якорь fallback-суток: чтение удалось
 		if debt < 0 {
@@ -278,7 +318,7 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 		} else if st.debtSeen {
 			// Переход в 0: вся рендер-защита снята — один полный круг
 			// догоняет всё, что копилось за эпоху долга позади курсора.
-			st.planCircle("счётчик рендер-долга обнулился — рендер-защита снята")
+			st.planCircle(ctx, pool, log, "счётчик рендер-долга обнулился — рендер-защита снята")
 		}
 	}
 
@@ -286,7 +326,8 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 		return
 	}
 	// Круг: курсор в начало, список ретраев пересоберёт сам круг
-	// (защищённые им же отложатся), эпоха долга закрыта. Noop-круг
+	// (защищённые им же отложатся), эпоха долга закрыта. Персистентное
+	// состояние уже сброшено в момент плана (planCircle, T-274). Noop-круг
 	// (курсор уже нулевой, списка нет) — Debug: стартовое состояние
 	// свежего процесса, операции он не меняет.
 	why := st.circleWhy
@@ -308,17 +349,40 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 // состояния либо последний круг). «Спокойный час» ТЗ понимается как
 // «сутки от якоря», а не час суток: якорь двигают сами круги, отдельного
 // расписания заведено сознательно не было (конфиг-поле запрещено ТЗ).
-func (st *retentionState) fallbackCircle() {
+func (st *retentionState) fallbackCircle(ctx context.Context, pool RetentionDB, log *slog.Logger) {
 	if time.Since(st.lastCircle) >= DefaultRetentionFallbackCircle {
-		st.planCircle("счётчик рендер-долга недоступен (нет строки/таблицы — миграция 000015) — fallback-сутки")
+		st.planCircle(ctx, pool, log, "счётчик рендер-долга недоступен (нет строки/таблицы — миграция 000015) — fallback-сутки")
 	}
 }
 
 // planCircle — плановый catch-up-круг следующим видом применения
 // (началом текущего прохода); повторные причины не затирают первую.
-func (st *retentionState) planCircle(why string) {
-	if !st.circle {
-		st.circle, st.circleWhy = true, why
+// План НЕМЕДЛЕННО отражается в персистентном состоянии (T-274, ревью
+// P2): строка курсора удаляется в момент плана — рестарт в окне между
+// планом и применением обязан попасть в полный catch-up с нуля, а не
+// продолжить со старой позиции (записи позади неё вычищает именно
+// круг); дальнейшие сохранения позиции подавлены до применения круга
+// (retentionPass). Сбой удаления — Warn без ошибки прохода: круг в
+// памяти состоится, при рестарте в окне цикл деградирует к поведению
+// T-273 (продолжение со старой позиции) — дороже, но без потери данных.
+func (st *retentionState) planCircle(ctx context.Context, pool RetentionDB, log *slog.Logger, why string) {
+	if st.circle {
+		return
+	}
+	st.circle, st.circleWhy = true, why
+	if !st.persist {
+		return
+	}
+	if err := retentionResetCursor(ctx, pool); err != nil {
+		if errors.Is(err, errRetentionNoCursorTable) {
+			st.persist = false
+			log.Info("retention: таблицы персистентного курсора нет — работаем без сохранения (миграция 000020 не применена?)")
+			return
+		}
+		if ctx.Err() == nil {
+			log.Warn("retention: план catch-up-круга не отражён в БД — рестарт в окне продолжит со старого курсора",
+				"reason", why, "err", err)
+		}
 	}
 }
 
@@ -328,7 +392,7 @@ func (st *retentionState) planCircle(why string) {
 // проходом: список ограничен памятью, круг пересоберёт всё множество
 // (превышение — масштаб застоя стримов у watermark'ов, где полные круги
 // всё равно были бы единственным механизмом).
-func (st *retentionState) deferRetries(batch []retentionCandidate, pending *retentionPendingSets, log *slog.Logger) {
+func (st *retentionState) deferRetries(ctx context.Context, pool RetentionDB, batch []retentionCandidate, pending *retentionPendingSets, log *slog.Logger) {
 	if pending == nil {
 		return // защита выключена — отложений нет
 	}
@@ -350,7 +414,7 @@ func (st *retentionState) deferRetries(batch []retentionCandidate, pending *rete
 				log.Warn("retention: список ретраев защиты очередей переполнен — следующий проход catch-up-кругом",
 					"limit", st.limit())
 			}
-			st.planCircle("список ретраев защиты очередей переполнен — круг пересоберёт множество")
+			st.planCircle(ctx, pool, log, "список ретраев защиты очередей переполнен — круг пересоберёт множество")
 			return
 		}
 		st.retries[c.key] = struct{}{}
@@ -395,10 +459,11 @@ func retentionRetryPass(ctx context.Context, pool RetentionDB, o RetentionOption
 	}
 	// Замена списка — только после чистки целиком: сбой среди пачек
 	// держит прежний список (неочищенные ключи не теряются позади
-	// курсора), следующий проход повторит зонд идемпотентно.
+	// курсора), следующий проход повторит зонд идемпотентно. Зонд чистит
+	// по месту — дренажный курсор не двигается (nil, T-274).
 	for i := 0; i < len(purge); i += o.BatchSize {
 		j := min(i+o.BatchSize, len(purge))
-		stp, err := retentionPurge(ctx, pool, o, purge[i:j])
+		stp, err := retentionPurge(ctx, pool, o, purge[i:j], nil)
 		if err != nil {
 			return err
 		}

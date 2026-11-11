@@ -366,7 +366,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	go func() {
 		defer bg.Done()
 		_ = httpworker.RenderLateLoop(ctx, pool, store, renderQ,
-			retentionPending{rdb: rdb}, met, httpworker.LateOptions{Log: logger, Gate: scanGate})
+			retentionPending{rdb: rdb}, met, httpworker.LateOptions{
+				Log:  logger,
+				Gate: scanGate,
+				// Потолок выборки пачки переиздателя (T-274, значение
+				// T-273): конфиг-ручка на случай недооценки — смена
+				// потолка без деплоя.
+				SelectTimeout: cfg.Render.LateSelectTimeout.D(),
+			})
 	}()
 
 	// Retention контента и трим jsonb не-находок (T-166, ТЗ 5.7: контент
@@ -402,9 +409,14 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	go func() {
 		defer bg.Done()
 		_ = content.RetentionLoop(ctx, pool, content.RetentionOptions{
-			Retention:        cfg.Content.Retention.D(),
-			Interval:         cfg.Content.RetentionInterval.D(),
-			BatchSize:        cfg.Content.RetentionBatch,
+			Retention: cfg.Content.Retention.D(),
+			Interval:  cfg.Content.RetentionInterval.D(),
+			BatchSize: cfg.Content.RetentionBatch,
+			// Потолок выборки пачки (T-274): дефолт 7200 с — удвоенный
+			// запас над замерами 10–11.11.2026 первого catch-up-прохода
+			// под нагрузкой (3600 с T-273 хватило только спокойной
+			// системе); 0 в конфиге — дефолт кода (withDefaults).
+			SelectTimeout:    cfg.Content.RetentionSelectTimeout.D(),
 			Depth:            analyzeDepth{gate: gate},
 			Pending:          retentionPending{rdb: rdb},
 			AnalyzeWatermark: retentionWatermark,

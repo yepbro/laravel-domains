@@ -142,6 +142,16 @@ type retentionFakePool struct {
 	deleteErr error
 	commitErr error
 	debtErr   error // отказ чтения счётчика рендер-долга
+	// cursorErr — отказ чтения персистентного курсора при старте цикла
+	// (T-274); cursorSaveErr — отказ upsert'а курсора в транзакции пачки
+	// (атомарность «пачка ⟺ курсор»); cursorRow — строка
+	// retention_drain_cursor (nil — состояния нет), cursorSaves/
+	// cursorDeletes — применённые (закommиченные) upsert'ы и удаления.
+	cursorErr     error
+	cursorSaveErr error
+	cursorRow     *retentionCursor
+	cursorSaves   int
+	cursorDelete  int
 	// planErr — отказ закрепления плана (SET LOCAL, T-271); selectBlock —
 	// «зависший» SELECT выборки: ответ только по ctx-дедлайну (тест
 	// ctx-таймаута T-271); selectBeginErr/selectCommitErr — отказ
@@ -248,9 +258,11 @@ func (p *retentionFakePool) candidate(r *retentionRow, cutoff time.Time) bool {
 }
 
 // Query обслуживает чтения пула: счётчик рендер-долга (точечная строка),
-// зонд ретраев (PK = ANY ключей, фильтры отбора без курсора) и точечный
-// дренаж домена (T-187). Тяжёлая выборка дренажа (retentionSelectSQL) с
-// T-271 идёт в транзакции закрепления плана — tx.Query (retentionFakeTx).
+// персистентный курсор дренажа (T-274, единственная строка — в журнал
+// дренажа не пишется), зонд ретраев (PK = ANY ключей, фильтры отбора без
+// курсора) и точечный дренаж домена (T-187). Тяжёлая выборка дренажа
+// (retentionSelectSQL) с T-271 идёт в транзакции закрепления плана —
+// tx.Query (retentionFakeTx).
 func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -265,6 +277,18 @@ func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (p
 			return retentionResultRows(), nil // строки счётчика нет
 		}
 		return retentionResultRows([]any{n}), nil
+
+	case retentionCursorLoadSQL:
+		if p.cursorErr != nil {
+			return nil, p.cursorErr
+		}
+		if p.cursorRow == nil {
+			return retentionResultRows(), nil // состояния нет
+		}
+		return retentionResultRows([]any{
+			p.cursorRow.checkedAt, p.cursorRow.key.zone, p.cursorRow.key.domain,
+			p.cursorRow.key.sub, p.cursorRow.key.variant,
+		}), nil
 
 	case retentionDomainSQL:
 		p.queries = append(p.queries, retentionCall{sql: sql, args: args})
@@ -362,7 +386,9 @@ func (p *retentionFakePool) Begin(context.Context) (pgx.Tx, error) {
 // обслуживает и tx-оболочку выборки: SET LOCAL закрепления плана
 // (retentionFakeTx.Exec) и SELECT пачки (retentionFakeTx.Query); calls —
 // упорядоченный журнал операторов транзакции (контракт порядка
-// закрепления, стиль retryFakeTx.calls).
+// закрепления, стиль retryFakeTx.calls). С T-274 — upsert/удаление
+// персистентного курсора (savedCursor/deletedCursor применяются в Commit
+// вместе с пачкой — атомарность воспроизводится честно).
 type retentionFakeTx struct {
 	pgx.Tx // остальные методы pgx.Tx проход не использует
 
@@ -370,6 +396,9 @@ type retentionFakeTx struct {
 	purged  map[retentionKey]retentionRow // очищенные строки
 	updated map[Hash]retentionFakeContent // уменьшенные refcount
 	deleted map[Hash]struct{}             // удалённые contents
+
+	savedCursor   *retentionCursor // upsert курсора (T-274)
+	deletedCursor bool             // DELETE строки курсора (catch-up-круг)
 
 	calls      []retentionCall // все операторы транзакции по порядку
 	isSelect   bool            // tx-оболочка закрепления (первый Exec — SET LOCAL)
@@ -574,6 +603,27 @@ func (t *retentionFakeTx) Exec(_ context.Context, sql string, args ...any) (pgco
 			}
 		}
 		return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n)), nil
+	case sql == retentionCursorSaveSQL:
+		// Upsert персистентного курсора (T-274): применяется в Commit
+		// (последняя запись в транзакции выигрывает), отказ — откат
+		// транзакции целиком (атомарность с пачкой).
+		if t.pool.cursorSaveErr != nil {
+			return pgconn.CommandTag{}, t.pool.cursorSaveErr
+		}
+		cur := retentionCursor{
+			checkedAt: args[0].(time.Time),
+			key: retentionKey{
+				zone:    args[1].(int16),
+				domain:  args[2].(int64),
+				sub:     args[3].(int16),
+				variant: args[4].(int16),
+			},
+		}
+		t.savedCursor = &cur
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	case sql == retentionCursorDeleteSQL:
+		t.deletedCursor = true
+		return pgconn.NewCommandTag("DELETE 1"), nil
 	default:
 		return pgconn.CommandTag{}, fmt.Errorf("retention fake: неожидаемый tx-Exec %q", sql)
 	}
@@ -606,6 +656,14 @@ func (t *retentionFakeTx) Commit(context.Context) error {
 		if _, ok := t.pool.contents[h]; ok {
 			t.pool.contents[h] = c
 		}
+	}
+	if t.savedCursor != nil {
+		t.pool.cursorSaves++
+		t.pool.cursorRow = t.savedCursor
+	}
+	if t.deletedCursor {
+		t.pool.cursorDelete++
+		t.pool.cursorRow = nil
 	}
 	return nil
 }
@@ -820,10 +878,10 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 
 	// Оболочка закрепления (T-271): первая транзакция — SET LOCAL ×5 +
 	// SELECT, фиксация без отката; тексты — литералы пакета (потолок
-	// statement_timeout — дефолт 3600 с T-273: таймаут обязан накрывать
-	// первый catch-up-проход с нулевого курсора, а не только штатные
-	// пачки замера T-201; bitmap off — доводка T-271: битмап-путь
-	// ломает порядок курсора).
+	// statement_timeout — дефолт 7200 с T-274, было 3600 у T-273:
+	// таймаут обязан накрывать первый catch-up-проход с нулевого курсора
+	// под нагрузкой, а не только штатные пачки замера T-201; bitmap off —
+	// доводка T-271: битмап-путь ломает порядок курсора).
 	if retentionPlanNoSeqScanSQL != "SET LOCAL enable_seqscan = off" ||
 		retentionPlanNoHashJoinSQL != "SET LOCAL enable_hashjoin = off" ||
 		retentionPlanNoMergeJoinSQL != "SET LOCAL enable_mergejoin = off" ||
@@ -1617,8 +1675,8 @@ func TestRetentionOptionsDefaults(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("withDefaults = %+v, want %+v", got, want)
 	}
-	if DefaultRetentionSelectTimeout != 3600*time.Second {
-		t.Errorf("DefaultRetentionSelectTimeout = %s, want 3600s (потолок catch-up-прохода с нулевого курсора, T-273: 600 с убивали первый проход до коммита — вечная петля)", DefaultRetentionSelectTimeout)
+	if DefaultRetentionSelectTimeout != 7200*time.Second {
+		t.Errorf("DefaultRetentionSelectTimeout = %s, want 7200s (T-274: удвоенный запас над прод-замерами 10–11.11.2026 первого catch-up-прохода под нагрузкой; 3600 с T-273 хватило только спокойной системе — три прохода под фронтом упёрлись)", DefaultRetentionSelectTimeout)
 	}
 	if DefaultRetentionErrorBackoff != 15*time.Minute {
 		t.Errorf("DefaultRetentionErrorBackoff = %s, want 15m (инцидентный backoff T-271)", DefaultRetentionErrorBackoff)

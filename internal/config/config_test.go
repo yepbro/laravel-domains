@@ -104,6 +104,7 @@ func TestDefault(t *testing.T) {
 		{"render.block_stylesheet", c.Render.BlockStylesheet, false},
 		{"render.block_tracker_domains", c.Render.BlockTrackerDomains, true},
 		{"render.queue_high_watermark", c.Render.QueueHighWatermark, 10000},
+		{"render.late_select_timeout", c.Render.LateSelectTimeout.D(), 300 * time.Second},
 		{"render.fallback.enabled", c.Render.Fallback.Enabled, false},
 		{"render.fallback.worker_rate", c.Render.Fallback.WorkerRate, 100},
 		{"render.fallback.share_percent", c.Render.Fallback.SharePercent, 30.0},
@@ -117,6 +118,7 @@ func TestDefault(t *testing.T) {
 		{"content.retention_interval", c.Content.RetentionInterval.D(), time.Hour},
 		{"content.retention_batch", c.Content.RetentionBatch, 10000},
 		{"content.retention_analyze_watermark", c.Content.RetentionAnalyzeWatermark, 0},
+		{"content.retention_select_timeout", c.Content.RetentionSelectTimeout.D(), 7200 * time.Second},
 		{"analyzer.rules_dir", c.Analyzer.RulesDir, "/etc/crawler/rules"},
 		{"analyzer.laravel_min_score", c.Analyzer.LaravelMinScore, 0.6},
 		{"monitor.listen", c.Monitor.Listen, ":9100"},
@@ -262,6 +264,7 @@ render:
   block_stylesheet: true
   block_tracker_domains: false
   queue_high_watermark: 7000
+  late_select_timeout: "480s"
   requeue_deprioritized_zones:
     - "xn--p1ai"
     - "net"
@@ -280,6 +283,7 @@ content:
   retention_interval: "2h"
   retention_batch: 25000
   retention_analyze_watermark: 500000
+  retention_select_timeout: "5400s"
 analyzer:
   rules_dir: "/srv/rules"
   laravel_min_score: 0.75
@@ -383,6 +387,7 @@ log:
 		{"render.block_stylesheet", cfg.Render.BlockStylesheet, true},
 		{"render.block_tracker_domains", cfg.Render.BlockTrackerDomains, false},
 		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
+		{"render.late_select_timeout", cfg.Render.LateSelectTimeout.D(), 480 * time.Second},
 		{"render.fallback.enabled", cfg.Render.Fallback.Enabled, true},
 		{"render.fallback.worker_rate", cfg.Render.Fallback.WorkerRate, 500},
 		{"render.fallback.share_percent", cfg.Render.Fallback.SharePercent, 12.5},
@@ -396,6 +401,7 @@ log:
 		{"content.retention_interval", cfg.Content.RetentionInterval.D(), 2 * time.Hour},
 		{"content.retention_batch", cfg.Content.RetentionBatch, 25000},
 		{"content.retention_analyze_watermark", cfg.Content.RetentionAnalyzeWatermark, 500000},
+		{"content.retention_select_timeout", cfg.Content.RetentionSelectTimeout.D(), 5400 * time.Second},
 		{"analyzer.rules_dir", cfg.Analyzer.RulesDir, "/srv/rules"},
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.75},
 		{"monitor.listen", cfg.Monitor.Listen, "127.0.0.1:9110"},
@@ -678,6 +684,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_RENDER_BLOCK_STYLESHEET":             "true",
 		"CRAWLER_RENDER_BLOCK_TRACKER_DOMAINS":        "false",
 		"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK":         "7000",
+		"CRAWLER_RENDER_LATE_SELECT_TIMEOUT":          "420s",
 		"CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES":  "xn--p1ai, org",
 		"CRAWLER_RENDER_FALLBACK_ENABLED":             "true",
 		"CRAWLER_RENDER_FALLBACK_WORKER_RATE":         "250",
@@ -692,6 +699,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_CONTENT_RETENTION_INTERVAL":          "30m",
 		"CRAWLER_CONTENT_RETENTION_BATCH":             "50000",
 		"CRAWLER_CONTENT_RETENTION_ANALYZE_WATERMARK": "250000",
+		"CRAWLER_CONTENT_RETENTION_SELECT_TIMEOUT":    "90m",
 		"CRAWLER_ANALYZER_RULES_DIR":                  "/env/rules",
 		"CRAWLER_ANALYZER_LARAVEL_MIN_SCORE":          "0.9",
 		"CRAWLER_SUBDOMAINS":                          "www, mail",
@@ -792,6 +800,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"render.block_stylesheet", cfg.Render.BlockStylesheet, true},
 		{"render.block_tracker_domains", cfg.Render.BlockTrackerDomains, false},
 		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
+		{"render.late_select_timeout", cfg.Render.LateSelectTimeout.D(), 420 * time.Second},
 		{"render.fallback.enabled", cfg.Render.Fallback.Enabled, true},
 		{"render.fallback.worker_rate", cfg.Render.Fallback.WorkerRate, 250},
 		{"render.fallback.share_percent", cfg.Render.Fallback.SharePercent, 17.5},
@@ -805,6 +814,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"content.retention_interval", cfg.Content.RetentionInterval.D(), 30 * time.Minute},
 		{"content.retention_batch", cfg.Content.RetentionBatch, 50000},
 		{"content.retention_analyze_watermark", cfg.Content.RetentionAnalyzeWatermark, 250000},
+		{"content.retention_select_timeout", cfg.Content.RetentionSelectTimeout.D(), 90 * time.Minute},
 		{"analyzer.rules_dir", cfg.Analyzer.RulesDir, "/env/rules"},
 		{"analyzer.laravel_min_score", cfg.Analyzer.LaravelMinScore, 0.9},
 		{"monitor.listen", cfg.Monitor.Listen, ":9199"},
@@ -1205,6 +1215,10 @@ func TestValidate(t *testing.T) {
 		{"retention_batch больше 100000", func(c *Config) { c.Content.RetentionBatch = 100001 }, "content.retention_batch"},
 		{"retention_analyze_watermark отрицательный", func(c *Config) { c.Content.RetentionAnalyzeWatermark = -1 }, "content.retention_analyze_watermark"},
 		{"retention_analyze_watermark сверхпотолка", func(c *Config) { c.Content.RetentionAnalyzeWatermark = 100000001 }, "content.retention_analyze_watermark"},
+		{"retention_select_timeout меньше минуты", func(c *Config) { c.Content.RetentionSelectTimeout = Duration(30 * time.Second) }, "content.retention_select_timeout"},
+		{"retention_select_timeout больше суток", func(c *Config) { c.Content.RetentionSelectTimeout = Duration(25 * time.Hour) }, "content.retention_select_timeout"},
+		{"late_select_timeout меньше минуты", func(c *Config) { c.Render.LateSelectTimeout = Duration(30 * time.Second) }, "render.late_select_timeout"},
+		{"late_select_timeout больше суток", func(c *Config) { c.Render.LateSelectTimeout = Duration(25 * time.Hour) }, "render.late_select_timeout"},
 		{"rules_dir пуст", func(c *Config) { c.Analyzer.RulesDir = "" }, "analyzer.rules_dir"},
 		{"min_score 0", func(c *Config) { c.Analyzer.LaravelMinScore = 0 }, "analyzer.laravel_min_score"},
 		{"min_score >1", func(c *Config) { c.Analyzer.LaravelMinScore = 1.5 }, "analyzer.laravel_min_score"},

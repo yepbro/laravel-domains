@@ -1168,6 +1168,153 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 	}
 }
 
+// TestContent_RetentionCursorRestart — главный тест T-274: персистентный
+// курсор дренажа переживает рестарт http-worker. Цикл 1 дренирует окно
+// старения и фиксирует позицию в retention_drain_cursor (миграция 000020,
+// upsert транзакцией пачки); «рестарт» (новый RetentionLoop) читает
+// состояние и продолжает с него: запись, вставленная ПОЗАДИ курсора, не
+// посещается (чистый префикс не обходится — штраф рестарта снят),
+// остаревшая запись ВПЕРЕДИ курсора дренируется штатно. Полный
+// RetentionOnce (нулевой курсор, runbooks T-167 путь А) вычищает и
+// отставшую — потери данных нет, меняется только стоимость прохода.
+// Попутно — контракт одной строки таблицы (CHECK id = 1).
+func TestContent_RetentionCursorRestart(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := migratedSchema(t)
+	ctx := context.Background()
+
+	// Вторая строка состояния невозможна по построению (CHECK миграции).
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO retention_drain_cursor (id, checked_at, zone_id, domain_id, subdomain_id, variant) "+
+			"VALUES (2, now(), 1, 1, 0, 0)"); err == nil {
+		t.Fatal("вторая строка retention_drain_cursor прошла вопреки CHECK (id = 1)")
+	}
+
+	var z int16
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO zones (name) VALUES ('cur-a.test') RETURNING id").Scan(&z); err != nil {
+		t.Fatalf("insert zones: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(
+		"CREATE TABLE subdomain_results_cur_%d PARTITION OF subdomain_results FOR VALUES IN (%d)", z, z)); err != nil {
+		t.Fatalf("партиция зоны %d: %v", z, err)
+	}
+	// Два домена: записи первого дренирует цикл 1; второй — записи
+	// «после рестарта» (одна позади курсора, одна впереди).
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO domains (zone_id, id, label) VALUES ($1, 1, 'first'), ($1, 2, 'second')", z); err != nil {
+		t.Fatalf("посев domains: %v", err)
+	}
+	// Кандидаты первого прохода (окно 6 ч): порядок по checked_at
+	// d1/sub0 (−10 ч) → d1/sub1 (−9 ч) — курсор остановится на d1/sub1.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, variant, scheme, checked_at, headers)
+		VALUES
+		  ($1, 1, 0, 0, 2, now() - interval '10 hours', '{"a":1}'),
+		  ($1, 1, 1, 0, 2, now() - interval '9 hours',  '{"a":1}')`, z); err != nil {
+		t.Fatalf("посев subdomain_results: %v", err)
+	}
+
+	// Цикл 1 («прошлый процесс»): стартовый проход дренирует окно и
+	// фиксирует курсор пачкой.
+	loop := func() (content.RetentionStats, error) {
+		passed := make(chan content.RetentionStats, 1)
+		opts := content.RetentionOptions{
+			Retention: 6 * time.Hour,
+			BatchSize: 100,
+			OnPass:    func(s content.RetentionStats, _ time.Duration) { passed <- s },
+		}
+		loopCtx, cancel := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() { done <- content.RetentionLoop(loopCtx, pool, opts) }()
+		select {
+		case s := <-passed:
+			cancel()
+			<-done
+			return s, nil
+		case <-time.After(time.Minute):
+			cancel()
+			return content.RetentionStats{}, errors.New("стартовый проход цикла не завершился")
+		}
+	}
+	if s, err := loop(); err != nil {
+		t.Fatalf("цикл 1: %v", err)
+	} else if s.Rows != 2 {
+		t.Fatalf("цикл 1: Rows = %d, want 2 (всё окно старения)", s.Rows)
+	}
+
+	// Состояние зафиксировано: позиция — последняя строка прохода 1.
+	var (
+		curChecked      time.Time
+		curZone, curSub int16
+		curDomain       int64
+		curVariant      int16
+	)
+	if err := pool.QueryRow(ctx,
+		"SELECT checked_at, zone_id, domain_id, subdomain_id, variant FROM retention_drain_cursor WHERE id = 1",
+	).Scan(&curChecked, &curZone, &curDomain, &curSub, &curVariant); err != nil {
+		t.Fatalf("строка персистентного курсора: %v", err)
+	}
+	if curZone != z || curDomain != 1 || curSub != 1 || curVariant != 0 {
+		t.Fatalf("курсор = %d/%d/%d/%d, want позиция последней строки прохода 1 (%d/1/1/0)",
+			curZone, curDomain, curSub, curVariant, z)
+	}
+
+	// «Простой + рестарт»: появились кандидаты позади и впереди курсора.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, variant, scheme, checked_at, headers)
+		VALUES
+		  -- позади курсора (−9,5 ч < −9 ч): рестарт с курсора её НЕ видит
+		  ($1, 2, 0, 0, 2, now() - interval '9 hours 30 minutes', '{"b":1}'),
+		  -- впереди курсора (−7 ч): остаревшая — дренаж подберёт
+		  ($1, 2, 1, 0, 2, now() - interval '7 hours', '{"b":1}')`, z); err != nil {
+		t.Fatalf("посев после рестарта: %v", err)
+	}
+
+	// Цикл 2 («рестарт»): продолжает с сохранённого курсора.
+	if s, err := loop(); err != nil {
+		t.Fatalf("цикл 2: %v", err)
+	} else if s.Rows != 1 {
+		t.Fatalf("цикл 2: Rows = %d, want 1 (только запись впереди курсора — рестарт не ходит с нуля)", s.Rows)
+	}
+	var behind, ahead int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FILTER (WHERE domain_id = 2 AND subdomain_id = 0), "+
+			"count(*) FILTER (WHERE domain_id = 2 AND subdomain_id = 1) "+
+			"FROM subdomain_results WHERE headers IS NOT NULL").Scan(&behind, &ahead); err != nil {
+		t.Fatalf("остатки после рестарта: %v", err)
+	}
+	if behind != 1 || ahead != 0 {
+		t.Fatalf("позади курсора headers=%d (want 1 — не посещалась), впереди=%d (want 0 — вычищена)", behind, ahead)
+	}
+
+	// Потери нет: полный проход с нулевого курсора вычищает и отставшую;
+	// разовый проход состояние цикла не пишет — строка курсора цикла 2
+	// (позиция d2/sub1) остаётся на месте.
+	if _, err := pool.Exec(ctx, "ANALYZE subdomain_results"); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+	stats, err := content.RetentionOnce(ctx, pool, content.RetentionOptions{
+		Retention:     6 * time.Hour,
+		BatchSize:     100,
+		SelectTimeout: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RetentionOnce: %v", err)
+	}
+	if stats.Rows != 1 {
+		t.Fatalf("RetentionOnce: Rows = %d, want 1 (запись позади курсора — идемпотентность)", stats.Rows)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT zone_id, domain_id, subdomain_id FROM retention_drain_cursor WHERE id = 1",
+	).Scan(&curZone, &curDomain, &curSub); err != nil {
+		t.Fatalf("строка курсора после RetentionOnce: %v", err)
+	}
+	if curDomain != 2 || curSub != 1 {
+		t.Fatalf("строка курсора = %d/%d, want позиция цикла 2 (2/1) — разовый проход её не трогает", curDomain, curSub)
+	}
+}
+
 // planIdxScanRe — индексная форма доступа (Index Scan / Index Only
 // Scan) в EXPLAIN-тестах закрепления планов (T-271): покрывает обе
 // записи и листовые партиции PG16, и родителей PG17+. Якорь на начало

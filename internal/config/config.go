@@ -475,6 +475,17 @@ type Render struct {
 	// хвост стрима дренируется FIFO как есть. Расширение к минимальному
 	// составу ТЗ 5.10.
 	RequeueDeprioritizedZones []string `yaml:"requeue_deprioritized_zones"`
+	// LateSelectTimeout — потолок одной выборки пачки позднего
+	// переиздателя рендера (T-274; сам потолок — T-271/T-273): серверный
+	// statement_timeout tx-оболочки выборки и клиентский ctx-дедлайн;
+	// таймаут меньше стоимости первого catch-up-прохода с нулевого
+	// курсора превращает медленный дренаж в вечную петлю обречённых
+	// повторов (регрессия T-271, инцидент 09–10.11.2026). Дефолт 300 с
+	// (T-273): выборка переиздателя адаптивная (непиненная форма плана)
+	// и быстрая, catch-up с нуля дорабатывается пачками. Ручка заведена
+	// на случай недооценки — менять потолок без деплоя; 0 — дефолт кода.
+	// Расширение к минимальному составу ТЗ 5.10.
+	LateSelectTimeout Duration `yaml:"late_select_timeout"`
 	// Fallback — подсекция render.fallback: очередь фолбэка на Chromium
 	// (ТЗР §4.1 п.1, ФТ-6…ФТ-14). Поля описывают контракт фичи целиком;
 	// публикация из путей финализации — T-238 (renderworker), health-гейт
@@ -567,6 +578,17 @@ type Content struct {
 	// «строго ниже порога» работает гейт публикации q:analyze, T-026);
 	// интерлок выключается явным большим значением на свой страх.
 	RetentionAnalyzeWatermark int `yaml:"retention_analyze_watermark"`
+	// RetentionSelectTimeout — потолок одной выборки пачки retention
+	// (T-274; сам потолок — T-271/T-273): серверный statement_timeout
+	// tx-оболочки закрепления плана и клиентский ctx-дедлайн. Дефолт
+	// 2 ч — удвоенный запас над прод-замерами 10–11.11.2026 первого
+	// catch-up-прохода с нулевого курсора (предикат «есть что чистить»
+	// вне индекса — heap-визит каждой строки чистого префикса: ~60 мин
+	// на idle, >60 мин под полным фронтом; 3600 с T-273 хватило только
+	// спокойной системе — три прохода под фронтом упёрлись). 0 — дефолт
+	// кода; ручка на случай недооценки — смена потолка без деплоя.
+	// Расширение к минимальному составу ТЗ 5.10.
+	RetentionSelectTimeout Duration `yaml:"retention_select_timeout"`
 }
 
 // Analyzer — анализатор Laravel (ТЗ 5.8).
@@ -984,6 +1006,10 @@ func Default() *Config {
 			// дренажируются одним порядком (T-181); прод ставит сюда
 			// парковочные зоны по замеру T-176 (xn--p1ai).
 			RequeueDeprioritizedZones: nil,
+			// Потолок выборки позднего переиздателя (T-274; значение
+			// T-273): выборка адаптивная и быстрая — обоснование у поля
+			// LateSelectTimeout.
+			LateSelectTimeout: Duration(300 * time.Second),
 			// Очередь фолбэка на Chromium (ФТ-14) выключена: первичный
 			// воркер финализирует без рендера как сегодня — включение
 			// отдельно настраиваемым флагом, без деплоя новых сущностей.
@@ -1020,6 +1046,13 @@ func Default() *Config {
 			// 0 — общий порог scheduler.queue_high_watermark (интерлок
 			// тем же критерием, что гейт публикации q:analyze, T-026).
 			RetentionAnalyzeWatermark: 0,
+			// 2 ч (T-274, было 3600 с константой T-273): удвоенный запас
+			// над прод-замерами 10–11.11.2026 первого catch-up-прохода с
+			// нулевого курсора под нагрузкой — обоснование у поля
+			// RetentionSelectTimeout. Дублирует дефолт кода
+			// (content.DefaultRetentionSelectTimeout) как остальные
+			// retention-ключи (config не импортирует пакеты сервисов).
+			RetentionSelectTimeout: Duration(7200 * time.Second),
 		},
 		Analyzer: Analyzer{
 			RulesDir:        "/etc/crawler/rules",
@@ -1631,6 +1664,14 @@ func (c *Config) Validate() error {
 		problems = append(problems, fmt.Sprintf("render.queue_high_watermark: ожидается 0 (порог scheduler.queue_high_watermark) или %d..%d, задано %d",
 			1, 100000000, w))
 	}
+	// Потолок выборки позднего переиздателя (T-274): 0 — дефолт кода
+	// (300 с, T-273); коридор 1m..24h — минуты не накрывают catch-up
+	// выборку (петля обречённых повторов T-271), сутки и больше не имеют
+	// смысла при минутном тике цикла.
+	if d := c.Render.LateSelectTimeout; d != 0 && (d < Duration(time.Minute) || d > Duration(24*time.Hour)) {
+		problems = append(problems, fmt.Sprintf("render.late_select_timeout: ожидается 0 (дефолт кода) или %s..%s, задано %s",
+			Duration(time.Minute), Duration(24*time.Hour), d))
+	}
 	// Приоритет зон прохода доработки (T-184): синтаксически невозможное
 	// имя ловим здесь (справочник такого имени содержать не может — как у
 	// весов зон T-106); имени может не быть в справочнике — не ошибка
@@ -1714,6 +1755,14 @@ func (c *Config) Validate() error {
 	if w := c.Content.RetentionAnalyzeWatermark; w != 0 && !inRange(w, 1, 100000000) {
 		problems = append(problems, fmt.Sprintf("content.retention_analyze_watermark: ожидается 0 (порог scheduler.queue_high_watermark) или %d..%d, задано %d",
 			1, 100000000, w))
+	}
+	// Потолок выборки пачки retention (T-274): 0 — дефолт кода (7200 с);
+	// коридор 1m..24h: ниже минуты — петля обречённых выборок T-271
+	// (штатная пачка замера T-201 до 222,8 с, catch-up-проход — десятки
+	// минут), выше суток — бессмысленно (интервал проходов час).
+	if d := c.Content.RetentionSelectTimeout; d != 0 && (d < Duration(time.Minute) || d > Duration(24*time.Hour)) {
+		problems = append(problems, fmt.Sprintf("content.retention_select_timeout: ожидается 0 (дефолт кода) или %s..%s, задано %s",
+			Duration(time.Minute), Duration(24*time.Hour), d))
 	}
 
 	// analyzer

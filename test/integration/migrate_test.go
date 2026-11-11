@@ -290,6 +290,9 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		// чтобы повторный Up применил ограничение на чистую таблицу
 		// (иначе ADD CONSTRAINT падает 42710 duplicate_object).
 		"ALTER TABLE contents DROP CONSTRAINT IF EXISTS contents_refcount_check",
+		// 000020 (T-274): таблица персистентного курсора дренажа —
+		// down-эффект, иначе повторный Up падает 42P07 already exists.
+		"DROP TABLE IF EXISTS retention_drain_cursor",
 		"TRUNCATE schema_migrations",
 		"INSERT INTO schema_migrations (version, dirty) VALUES (7, false)",
 	} {
