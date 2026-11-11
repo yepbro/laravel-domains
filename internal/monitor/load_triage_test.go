@@ -911,3 +911,98 @@ func (s *countingLoadSource) Load(context.Context) (LoadStat, error) {
 	s.count++
 	return LoadStat{}, nil
 }
+
+// --- дотриаж CI-прогона 10.11.2026 (остатки после T-270/T-271/T-273) ---------
+
+// TestOSLoadCanceledContext — отмена ctx до прохода: ошибка, а не снимок
+// (мутант вырезания return читал бы фикстуры и возвращал успех).
+func TestOSLoadCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := (OSLoad{Root: fullCPUFixtures(t)}).Load(ctx); err == nil {
+		t.Error("отменённый ctx: хочу ошибку прохода, не снимок")
+	}
+}
+
+// TestReadCPUStat_GuestTailGarbage — поля после восьми (guest-хвост)
+// не парсятся вовсе: мусор в хвосте — не ошибка (мутант ёмкости [9]
+// дотягивался бы до хвоста и ронял разбор длинных строк ядра).
+func TestReadCPUStat_GuestTailGarbage(t *testing.T) {
+	root := fullCPUFixtures(t)
+	writeFix(t, root, "stat",
+		"cpu  11 22 33 44 55 66 77 88 x 100\n"+"cpu0 1 1 1 1 1 1 1 1\n")
+	if _, err := readCPUStat(root + "/stat"); err != nil {
+		t.Errorf("мусор в guest-хвосте: %v (поля после восьми не парсятся)", err)
+	}
+}
+
+// TestReadProcs_NonDirBreaksScan — не-каталог с цифровой головой
+// («0note» сортируется ПЕРЕД всеми PID-каталогами): continue пропускает
+// только его, break (мутант) обрывал бы обход и терял каждый PID ниже.
+func TestReadProcs_NonDirBreaksScan(t *testing.T) {
+	root := fullCPUFixtures(t)
+	writeFix(t, root, "0note", "не каталог")
+	mkdirFix(t, root, "400", "(afterfile) S 1 0 0 0 -1 0 0 0 0 0 7 3 0 0 20 0 9", "1 1\n")
+	procs, err := readProcs(root)
+	if err != nil {
+		t.Fatalf("readProcs: %v", err)
+	}
+	if got := procs["afterfile"]; got.Ticks != 10 {
+		t.Errorf("PID за не-каталогом потерян: %+v, want тики 10 (continue, не break)", got)
+	}
+}
+
+// TestReadProcs_SymlinkNotDir — симлинк-«PID» не читается: IsDir — часть
+// контракта отбора (мутант вырезания continue читал бы stat цели
+// симлинка и агрегировал чужой вклад).
+func TestReadProcs_SymlinkNotDir(t *testing.T) {
+	root := t.TempDir()
+	mkdirFix(t, root, "ghostpkg", "(ghost) S 1 0 0 0 -1 0 0 0 0 0 7 3 0 0 20 0 1", "1 1\n")
+	if err := os.Symlink(root+"/ghostpkg", root+"/500"); err != nil {
+		t.Fatal(err)
+	}
+	procs, err := readProcs(root)
+	if err != nil {
+		t.Fatalf("readProcs: %v", err)
+	}
+	if _, ok := procs["ghost"]; ok {
+		t.Error("симлинк-«PID» прочитан: отбор — только настоящие каталоги (IsDir)")
+	}
+}
+
+// TestParseProcStatLine_NoOpenParen — «)» без «(»: пустой вклад, а не
+// имя-префикс до скобки (мутанты ослабления open < 0 пропускали защиту
+// к строкам без открывающей скобки).
+func TestParseProcStatLine_NoOpenParen(t *testing.T) {
+	if comm, ticks := parseProcStatLine([]byte("1 x) R 1 2 3 4 5 6 7 8 9 10 3 4")); comm != "" || ticks != 0 {
+		t.Errorf("скобка закрытия без открытия = (%q, %d), want пустой вклад", comm, ticks)
+	}
+}
+
+// TestParseProcStatLine_HugeStime — stime 2^63 законен для uint64
+// (мутант bitSize 63 обязан его принять; utime-случай закрыт ранее).
+func TestParseProcStatLine_HugeStime(t *testing.T) {
+	if comm, ticks := parseProcStatLine([]byte(
+		"9 (huge) R 1 2 3 4 5 6 7 8 9 10 5 9223372036854775808")); comm != "huge" || ticks != 9223372036854775813 {
+		t.Errorf("stime 2^63 = (%q, %d), want huge и 2^63+5 (uint64)", comm, ticks)
+	}
+}
+
+// TestRedisQueues_GroupsTextNoSuchKey — стрим исчез между XLEN и XINFO
+// (DEL/обрезка в 0): текстовая форма «no such key» у XINFO GROUPS —
+// «групп нет», глубина остаётся XLEN, секция жива (мутант вырезания
+// второго дизъюнкта ронял бы её; XLEN-ветка закрыта тестом выше).
+func TestRedisQueues_GroupsTextNoSuchKey(t *testing.T) {
+	rdb := &fakeGroupsRedis{
+		groups:    map[string][]redis.XInfoGroup{},
+		xlen:      map[string]int64{queue.StreamDNS: 5},
+		groupErrs: map[string]error{queue.StreamDNS: errors.New("MOVED 1234: no such key")},
+	}
+	q, err := RedisQueues{RDB: rdb}.Queues(context.Background())
+	if err != nil {
+		t.Fatalf("XINFO GROUPS «no such key»: %v (секция обязана жить)", err)
+	}
+	if q[queue.StreamDNS].Len != 5 {
+		t.Errorf("q:dns = %+v, want глубина XLEN 5 (групп нет — XLEN)", q[queue.StreamDNS])
+	}
+}

@@ -112,13 +112,15 @@ func TestVerifyCountersCleanAndDiff(t *testing.T) {
 	statuses := make([]int64, len(statusAggCols))
 	statuses[4] = 5
 	aggRow := aggRowOf(7, 10, 4, 2, 3, statuses, 2)
-	// Совпадают — пустой результат.
-	pool := &zonestatsFakePool{steps: verifySteps(
+	// Совпадают — пустой результат. Шаги держим локально: пул выбирает
+	// их из своей головы по ходу прохода, pool.steps после вызова пуст.
+	steps := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{10, 4, 2, 3, 1}, [5]int64{10, 4, 2, 3, 1})),
 		zonestatsRows(aggRow),
 		zonestatsRows([]any{int64(0), int64(0)}),
 		zonestatsRows(counterRowOf("render_pending", 2), counterRowOf("status_alive", 5)),
-	)}
+	)
+	pool := &zonestatsFakePool{steps: steps}
 	out, err := VerifyCounters(context.Background(), pool, VerifyOptions{})
 	if err != nil {
 		t.Fatalf("VerifyCounters: %v", err)
@@ -126,8 +128,10 @@ func TestVerifyCountersCleanAndDiff(t *testing.T) {
 	if len(out) != 0 {
 		t.Errorf("расхождения при совпадении: %+v", out)
 	}
-	// Все наборы строк закрыты (Close обязан вызываться).
-	for i, step := range pool.steps {
+	// Все наборы строк закрыты Close и на счастливом пути (зоны и
+	// история закрываются явными вызовами после чтения — не только
+	// ошибочными ветками выше).
+	for i, step := range steps {
 		if !step.rows.closed {
 			t.Errorf("строки шага %d не закрыты Close", i)
 		}

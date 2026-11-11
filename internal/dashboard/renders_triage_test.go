@@ -316,6 +316,11 @@ func TestRateOfBoundaries(t *testing.T) {
 	if got := rateOf(10, 20, 10*time.Second); got != 1 {
 		t.Errorf("rateOf = %v, want 1/с", got)
 	}
+	// Окно в одну наносекунду — законное положительное: рост считается
+	// (мутант «dt <= 1» глотал бы его в ноль; 10 за 1 нс = 1e10/с).
+	if got := rateOf(10, 20, time.Nanosecond); got < 1e9 {
+		t.Errorf("rateOf dt=1нс = %v, want ~1e10/с (положительное окно)", got)
+	}
 }
 
 // TestRenderRatesObserve — темп с окном 0 (часы не двигались) — 0, не

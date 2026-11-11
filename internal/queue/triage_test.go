@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -276,6 +277,51 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 	})
 	if err == nil || removed != 0 {
 		t.Errorf("сбой DELCONSUMER: (%d, %v), хочу (0, ошибка)", removed, err)
+	}
+}
+
+// TestConsumersTriageEmptyGroupKnownStream — пустая группа ИЗВЕСТНОГО
+// стрима (ветка group == "" — известность проверяется раньше): пара
+// пропускается с ошибкой, обход продолжается (break рвал бы хвост —
+// кейс «q:aaa» выше закрыл только ветку неизвестного стрима).
+func TestConsumersTriageEmptyGroupKnownStream(t *testing.T) {
+	f := &fakeConsumers{
+		lists: map[string][]redis.XInfoConsumer{
+			StreamHTTP + "|http-worker": {{Name: "http-worker-1", Pending: 0, Idle: 3 * time.Hour}},
+		},
+		pendRes: map[string][]redis.XPendingExt{},
+	}
+	removed, err := CleanupConsumersOnce(context.Background(), f, ConsumerOptions{
+		// q:dns (пустая группа) сортируется раньше q:http: break
+		// остановил бы проход до рабочей пары.
+		Groups: map[string]string{StreamDNS: "", StreamHTTP: "http-worker"},
+		Idle:   time.Hour,
+	})
+	if err == nil || !strings.Contains(err.Error(), StreamDNS) {
+		t.Fatalf("пустая группа q:dns: %v, want ошибку про q:dns", err)
+	}
+	if removed != 1 || len(f.delCalls()) != 1 {
+		t.Errorf("хвост за пустой группой: удалено %d, DELCONSUMER %v — хочу 1/1 (continue, не break)", removed, f.delCalls())
+	}
+}
+
+// TestConsumersTriageSortedStreamOrder — пары обходятся по возрастанию
+// имён стримов (детерминированный порядок ошибок и логов прохода):
+// карта Go итерируется случайно, без сортировки порядок прыгал бы.
+// Проход повторяется: случайный порядок хоть раз даёт сбой
+// (вероятность промаха (1/6)^число повторов).
+func TestConsumersTriageSortedStreamOrder(t *testing.T) {
+	groups := map[string]string{StreamHTTP: "", StreamDNS: "", StreamAnalyze: ""}
+	for i := 0; i < 50; i++ {
+		_, err := CleanupConsumersOnce(context.Background(), &fakeConsumers{}, ConsumerOptions{Groups: groups})
+		if err == nil {
+			t.Fatal("три пустые группы: хочу ошибку прохода")
+		}
+		msg := err.Error()
+		ia, id, ih := strings.Index(msg, StreamAnalyze), strings.Index(msg, StreamDNS), strings.Index(msg, StreamHTTP)
+		if ia < 0 || id < 0 || ih < 0 || ia >= id || id >= ih {
+			t.Fatalf("порядок ошибок не по возрастанию стримов: %q", msg)
+		}
 	}
 }
 

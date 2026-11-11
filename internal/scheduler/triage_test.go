@@ -17,6 +17,7 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -603,6 +604,62 @@ func TestLeaseNullTriageRollback(t *testing.T) {
 	}
 	if n := p.rollbackCount(); n != 1 {
 		t.Errorf("откатов %d, хочу 1", n)
+	}
+}
+
+// TestLeaseTriageSelectSwallow — глушение возвратов ошибок выборки
+// (Scan/rows.Err) обязано ронять проход ДО перевода: ответ перевода
+// здесь подменён успехом, поэтому проглоченная ошибка доводила бы
+// мутанта до фиксации и nil (кейсы выше ловили её только повторной
+// ошибкой валидации пачки в фейке перевода).
+func TestLeaseTriageSelectSwallow(t *testing.T) {
+	ctx := context.Background()
+	_, clock := leaseFixedClock()
+	opts := LeaseOptions{Timeout: 15 * time.Minute, BatchSize: 8, Now: clock}
+
+	// Scan-ошибка (одна колонка на три приёмника): ошибка «выборка пачки».
+	p := &triLeasePool{leaseFakePool: &leaseFakePool{},
+		selectRows: retryRows([]any{int16(1)}), updateRows: retryRows()}
+	if _, err := LeaseOnce(ctx, p, &LeaseCursor{}, opts); err == nil ||
+		!strings.Contains(err.Error(), "выборка пачки") {
+		t.Errorf("глушение Scan выборки: %v, want ошибку выборки пачки", err)
+	}
+
+	// Хвостовая rows.Err: та же ошибка шага, не успех с пачкой.
+	p = &triLeasePool{leaseFakePool: &leaseFakePool{},
+		selectRows: &retryFakeRows{
+			rows: [][]any{{int16(1), int64(1), time.Date(2026, 10, 17, 4, 0, 0, 0, time.UTC)}},
+			err:  errors.New("обрыв"),
+		},
+		updateRows: retryRows()}
+	if _, err := LeaseOnce(ctx, p, &LeaseCursor{}, opts); err == nil ||
+		!strings.Contains(err.Error(), "выборка пачки") {
+		t.Errorf("глушение rows.Err() выборки: %v, want ошибку выборки пачки", err)
+	}
+}
+
+// TestLeaseNullTriageSelectSwallow — то же для выборки ремонтного
+// прохода страховки: перевод подменён успехом — глушение ошибок
+// Scan/rows.Err доводило бы мутанта до фиксации и nil.
+func TestLeaseNullTriageSelectSwallow(t *testing.T) {
+	ctx := context.Background()
+
+	p := &triLeasePool{leaseFakePool: &leaseFakePool{},
+		nullSelectRows: retryRows([]any{int16(1)}), nullUpdateRows: retryRows()}
+	if _, err := LeaseNullOnce(ctx, p, LeaseOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "выборка пачки") {
+		t.Errorf("глушение Scan выборки страховки: %v, want ошибку выборки пачки", err)
+	}
+
+	p = &triLeasePool{leaseFakePool: &leaseFakePool{},
+		nullSelectRows: &retryFakeRows{
+			rows: [][]any{{int16(1), int64(1)}},
+			err:  errors.New("обрыв"),
+		},
+		nullUpdateRows: retryRows()}
+	if _, err := LeaseNullOnce(ctx, p, LeaseOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "выборка пачки") {
+		t.Errorf("глушение rows.Err() выборки страховки: %v, want ошибку выборки пачки", err)
 	}
 }
 

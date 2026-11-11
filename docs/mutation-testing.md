@@ -225,6 +225,24 @@ teardown chromedp, окно негативной проверки расшире
    | `render:whatwg-split-nonempty` | render.go, whatwgParseIPv4 | `len(parts) == 0` недостижим (strings.Split всегда ≥ 1 части): мутанты операнда в false и −1 меняют мёртвый код |
    | `render:octal-leading-zero` | render.go, whatwgIPv4Number | `s[1:] → s[0:]` в октальном ParseUint: ведущий нуль добавляет 0·8^k — значение и множество валидных цифр те же |
 
+   Дотриаж остатков выживших джобов A/B CI-прогона 42842802147
+   (10.11.2026, A 0.993/B 0.993 при пороге 0.98 — хвосты после правок
+   T-270/T-271/T-273 и пропуски первой волны: 35 выживших — 19 закрыты
+   тестами `*_triage_test.go` (load/renders/zonestats/redisuptime/
+   renderdebt/consumers/lease/leasenull), 16 чексумм ниже) по группам:
+
+   | Группа | Где | Обоснование |
+   |---|---|---|
+   | `worker:drain-disabled-log` | analyzer/worker.go, drainUnfound | вырезание Info-строки «дренаж выключен» (retention 0 / шов nil): событие уже наблюдаемо метрикой `met.Unfound()` выше по коду, вырезанный оператор — только журнал (прецедент A `log:side-effect`/`worker:drain-log`) |
+   | `renders:dt-clamp-zero-eq` | dashboard/renders.go, observe | `dt < 0 → dt < 1`: Duration — целые наносекунды, в новой точке 0 кламп 0→0 — no-op (отрицательные и >0 одинаковы в обеих формах) |
+   | `load:readdir-fail-unreach` | load.go, Load | провал листинга root при успешных чтениях его файлов (loadavg/stat/meminfo прочитаны) достижим только по EACCES/EMFILE — юнит-поверхность не доходит (тесты в root-контейнере, fd открываются последовательно); прод-поведение — ошибка прохода как у соседних источников |
+   | `notify:disabled-guard-eq` | notify.go, OnPass | ранний выход при script=="": state-записи ненаблюдаемы (script не меняется после конструктора, других читателей map нет), остальные эффекты — журнал (группа A `log:side-effect`) |
+   | `notify:notmeasured-guard-eq` | notify.go, OnPass | `a.Status == AlertStatusNotMeasured &&`: статусов ровно три (ok/firing/not_measured), первые два закрыты ветками switch выше — до третьей ветки доходит только NotMeasured, операнд всегда true |
+   | `unitevents:ctx-guard-eq` | unitevents.go, UnitEvents | первая проверка ctx.Err() продублирована второй сразу после context.WithTimeout: отмена родителя видна и в производном ctx — обе формы возвращают один и тот же err |
+   | `unitevents:nrestarts-break-eq` | unitevents.go, parseSystemctlShow | `continue → break` внутри case-ветки switch: break прерывает switch, а не цикл, а тело цикла после switch пусто — обе формы переходят к следующей строке |
+   | `zonestats:globals-prezero-retri` | zonestats.go, globalCounters | повторно (сдвиг строк T-271/T-273 сменил чексуммы группы `zonestats:globals-prezero`): предобнуление статусов перед `+=` — потребители читают только фиксированные ключи (CounterNames/driftCounterNames), отсутствующий ключ = 0, наличие ключа ненаблюдаемо |
+   | `trim:err-count-unobs` | trim.go, trimStream (4 сайта × ±1) | `return 0 → ±1` на ошибочных путях (неизвестный стрим, группы, pending, XTRIM): TrimOnce при err отбрасывает n (continue), TrimLoop читает только stuck — значение никем не читается (прецедент B `scheduler:err-count-unobs`) |
+
 Конфиг `test/mutation/go-mutesting.yml` дополнительно отсекает файлы без
 сопутствующего `*_test.go` и файлы, чьи тесты под build-тегом, — убить
 мутанта без исполняемых тестов невозможно.

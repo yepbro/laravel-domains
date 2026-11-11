@@ -320,6 +320,29 @@ func TestRedisUptimeMissingFieldText(t *testing.T) {
 	}
 }
 
+// TestRedisUptimeCmdErrorUnderlying — ошибка команды INFO несёт исходную
+// причину (мутант вырезания return падал бы в разбор пустого ответа —
+// текст был бы «поле отсутствует», без причины команды).
+func TestRedisUptimeCmdErrorUnderlying(t *testing.T) {
+	failing := &fakeInfoRedis{err: errors.New("connection reset")}
+	if _, err := (RedisInfo{RDB: failing}).RedisUptime(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "connection reset") {
+		t.Errorf("ошибка команды: %v, want исходную причину команды", err)
+	}
+}
+
+// TestRenderDebtIterErrorEmptyText — обрыв итерации при НУЛЕ строк
+// (Next ложен сразу, rows.Err ≠ nil): причина — обрыв, а не «строки
+// нет» (мутант глушения возврата подменял текстом отсутствующей строки,
+// уводя диагностику в runbooks — ревью T-175, P3-2).
+func TestRenderDebtIterErrorEmptyText(t *testing.T) {
+	pool := &alertsPool{debtEmpty: true, debtRowsErr: errors.New("обрыв итерации")}
+	_, err := (RenderDebtReader{Pool: pool, Redis: &fakeLener{}}).RenderDebt(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "обрыв итерации") {
+		t.Errorf("обрыв итерации без строк: %v, want причину обрыва (не «строки нет»)", err)
+	}
+}
+
 // TestRedisMemoryMissingFieldText — отсутствующее поле INFO memory —
 // ошибка «поле отсутствует».
 func TestRedisMemoryMissingFieldText(t *testing.T) {
