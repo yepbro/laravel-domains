@@ -57,11 +57,16 @@ package render
 //     InvalidParams на Fetch.enable ушёл — Font/Media в паттернах
 //     приняли фиксы lexmount/moli#2470 (наш PR, форк yepbro/moli) +
 //     парный #2476. Навигация/DOM/cookies/изоляция контекста/UA-override
-//     зелёные. Срез держат красным два дефекта перехвата Fetch:
+//     зелёные. Срез держат красным дефекты перехвата Fetch:
 //     (1) при включённом перехвате синхронный XHR из JS страницы
 //     падает на клиенте NetworkError (лог moli: Uncaught NetworkError:
 //     Failed to execute 'send' on 'XMLHttpRequest') — запрос до
-//     сервера не доходит (block_resources/block_trackers);
+//     сервера не доходит (block_resources); зонды block_trackers
+//     переведены на async-XHR (T-275: реальная аналитика async,
+//     блокируется на всех движках), sync-зонд там — отдельный
+//     движко-ветвленный кейс расхождения #2728/#2729 (moli sync-XHR
+//     не паузится и уходит в сеть, на сборках без #2729 — фабрика
+//     отказа NetworkError);
 //     (2) fetch.failRequest главной навигации не завершает навигацию
 //     ошибкой загрузки — вкладка неотзывчива (classifyCtx → context),
 //     ERR_BLOCKED_BY_CLIENT приходит вне канала loadFailed, кода
@@ -86,7 +91,8 @@ package render
 // Красный срез = регрессия движка против инвариантов этапа (пиновка
 // новой версией — процедура smoke ФТ-17/T-254,
 // docs/dev-environment.md); зелёный chromium — эталон (контроль
-// 2026-11-10: 6/6 подтестов PASS на том же стенде — отказы moli
+// 2026-11-10: 6/6 подтестов PASS; пере-контроль 2026-11-11 после
+// T-275 — снова 6/6, зонды block_trackers async) — отказы moli
 // движковые, не стендовые).
 
 import (

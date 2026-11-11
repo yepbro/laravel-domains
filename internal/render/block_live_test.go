@@ -33,6 +33,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"crawler/internal/config"
 )
 
 // blockLiveCounters — счётчики обращений к ресурсам тестовой страницы.
@@ -48,10 +50,15 @@ type blockLiveCounters struct {
 	// (trackerJS), зонды трекер-доменов через DNS-алиасы compose
 	// (clarityProbe — c.clarity.ms, mcProbe — mc.yandex.ru) и
 	// запрос с доменом трекера в ПУТИ, но своим хостом (trackerTrap).
+	// claritySync — отдельный синхронный зонд c.clarity.ms
+	// (движко-ветвленный кейс, moli#2728): счётчик отдельный от
+	// clarityProbe, иначе «sync доходит» на moli маскировал бы
+	// «async заблокирован».
 	clarityProbe atomic.Int64
 	mcProbe      atomic.Int64
 	trackerJS    atomic.Int64
 	trackerTrap  atomic.Int64
+	claritySync  atomic.Int64
 }
 
 // blockLiveServe — тестовая страница со счётчиками обращений: одна на оба
@@ -113,10 +120,20 @@ x.open('GET','/data.json',false);x.send();`)
 	// tools: www.google-analytics.com и mc.yandex.ru → этот же
 	// run-контейнер): герметичный unbound такие имена не знает, а без
 	// резолва «заблокировано перехватом» было бы неотличимо от
-	// DNS-отказа. Зонды — синхронные XHR с итогом в атрибуте <body>
+	// DNS-отказа. Зонды — асинхронные XHR с итогом в атрибуте <body>
 	// (CORS: читаем и статус): контрольный прогон с выключенной опцией
 	// обязан их ДОГРУЗИТЬ (доказывает резолв+раздачу), рабочий —
 	// оборвать до отправки (доказывает блокировку счётчиком сервера).
+	// Async, а не sync: реальная веб-аналитика (clarity, mc.yandex,
+	// google-analytics) ходит async/fetch/beacon, и только async-XHR
+	// блокируется перехватом на всех движках — sync-XHR под перехватом
+	// moli уходит в сеть мимо паузы (расхождение #2728, отдельный
+	// движко-ветвленный зонд ниже). Итог async-зонда пишется в атрибут
+	// по завершении запроса: гарантия здесь — не механизм ожидания (окно
+	// затишья wait.go отсчитывается от последнего requestWillBeSent и
+	// завершение запроса его не держит), а запас: фикстура отвечает за
+	// миллисекунды, окно Quiet 2 с; «медленный» зонд потребовал бы
+	// явного опроса (стиль blockLiveWaitReady).
 	port := 0 // порт сервера — заполняется после Listen
 	mux.HandleFunc("/tracker.html", func(w http.ResponseWriter, _ *http.Request) {
 		c.page.Add(1)
@@ -133,6 +150,17 @@ x.open('GET','/data.json',false);x.send();`)
 function probe(attr, url) {
   try {
     var x = new XMLHttpRequest();
+    x.open('GET', url, true);
+    x.onload = function () { document.body.setAttribute(attr, 'loaded ' + x.status); };
+    x.onerror = function () { document.body.setAttribute(attr, 'error'); };
+    x.send();
+  } catch (e) {
+    document.body.setAttribute(attr, 'error');
+  }
+}
+function probeSync(attr, url) {
+  try {
+    var x = new XMLHttpRequest();
     x.open('GET', url, false);
     x.send();
     document.body.setAttribute(attr, 'loaded ' + x.status);
@@ -143,6 +171,7 @@ function probe(attr, url) {
 probe('clarity-xhr', 'http://c.clarity.ms:`+"%[1]d"+`/clarity-probe');
 probe('mc-xhr', 'http://mc.yandex.ru:`+"%[1]d"+`/mc-probe');
 probe('path-trap', '/js/google-analytics.com.js');
+probeSync('sync-xhr', 'http://c.clarity.ms:`+"%[1]d"+`/clarity-sync-probe');
 `, port)
 	})
 	clarityProbe := func(w http.ResponseWriter, _ *http.Request) {
@@ -152,6 +181,15 @@ probe('path-trap', '/js/google-analytics.com.js');
 		_, _ = fmt.Fprint(w, "// зонд clarity.ms")
 	}
 	mux.HandleFunc("/clarity-probe", clarityProbe)
+	// Отдельный эндпоинт sync-зонда: счётчик claritySync обязан отличаться
+	// от clarityProbe — на moli sync уходит в сеть (200) при заблокированном
+	// async, общий счётчик скрыл бы это расхождение.
+	mux.HandleFunc("/clarity-sync-probe", func(w http.ResponseWriter, _ *http.Request) {
+		c.claritySync.Add(1)
+		w.Header().Set("Content-Type", "text/javascript")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_, _ = fmt.Fprint(w, "// sync-зонд clarity.ms (движко-ветвленный кейс)")
+	})
 	mux.HandleFunc("/mc-probe", func(w http.ResponseWriter, _ *http.Request) {
 		c.mcProbe.Add(1)
 		w.Header().Set("Content-Type", "text/plain")
@@ -341,6 +379,21 @@ func TestBlockLiveTrackerDomains(t *testing.T) {
 //     наш сервер) проходит: подстрочную паузу urlPattern отпускает
 //     точная хостовая проверка.
 //
+// Зонды — async-XHR: реальная веб-аналитика (clarity, mc.yandex,
+// google-analytics) ходит async/fetch/beacon, и контракт T-214 — именно
+// «попадания трекеров в сеть пресекаются на любом движке». Sync-XHR
+// оставлен отдельным движко-ветвленным зондом: под перехватом moli
+// sync-XHR НЕ паузится и уходит в сеть обычным путём — пауза
+// архитектурно невозможна (дедлок owner-loop), фабрика отказа убрана
+// (lexmount/moli#2728, PR #2729; снимает бан sync-XHR и PR #2704).
+// Задокументированное расхождение с Chromium: там sync-XHR паузится и
+// блокируется полноценно, на moli намеренная блокировка sync-XHR
+// недоступна — потому основные зонды async, а sync-зонд проверяет
+// ожидание ПО ДВИЖКУ (switch по opts.Engine, как в смоук-контрактах):
+// chromium — «заблокирован» (error, счётчик 0), moli — «ушёл в сеть,
+// 200, не блокируется» (счётчик 1); прочие движки — SKIP: семантика
+// sync-XHR под перехватом для них не задокументирована.
+//
 // Зонды: c.clarity.ms — поддомен домена списка (суффиксный матчинг),
 // mc.yandex.ru — точный хост списка. Google-аналитика (google-analytics,
 // googletagmanager, doubleclick) зондируется юнит-тестами, но не live:
@@ -367,6 +420,12 @@ func blockLiveTrackerDomains(t *testing.T, opts Options) {
 	}
 	if attr := domAttr(offOut.DOM, "mc-xhr"); attr != "loaded 200" {
 		t.Errorf("контроль: mc-xhr %q, хочу loaded 200 (блокировки нет)", attr)
+	}
+	// Контрольный sync-зонд на обоих движках доходит и читается: без
+	// включённой блокировки расхождение #2728 не проявляется — ветвление
+	// по движку нужно только в рабочем прогоне ниже.
+	if attr := domAttr(offOut.DOM, "sync-xhr"); attr != "loaded 200" {
+		t.Errorf("контроль: sync-xhr %q, хочу loaded 200 (блокировки нет)", attr)
 	}
 
 	// Рабочий прогон: опция включена.
@@ -415,5 +474,46 @@ func blockLiveTrackerDomains(t *testing.T, opts Options) {
 	}
 	if attr := domAttr(onOut.DOM, "path-trap"); attr != "loaded 200" {
 		t.Errorf("path-trap %q, хочу loaded 200 (хост не трекер — проходит)", attr)
+	}
+
+	// Sync-XHR-зонд — движко-ветвленный кейс (T-275): под перехватом moli
+	// sync-XHR не паузится и уходит в сеть (задокументированное расхождение
+	// lexmount/moli#2728, PR #2729): «ушёл в сеть, 200, не блокируется».
+	// Chromium sync-XHR блокирует полноценно — «заблокирован». Именно
+	// поэтому основные зонды теста async (контракт T-214 на любом движке),
+	// а sync проверяет поведение конкретного движка. Ветвление по
+	// opts.Engine, как в смоук-контрактах. На moli без #2729 (v1.1.23 и
+	// интеграционные сборки до него) sync-XHR под перехватом ронялся
+	// фабрикой отказа «Synchronous XMLHttpRequest interception is not
+	// supported» — там эта ветка красная (срез обязан показывать
+	// движковое расхождение/регрессию до починки); на v1.1.21/1.1.22
+	// красный раньше и по другой причине — InvalidParams на Fetch.enable.
+	// Прочие движки (lightpanda): семантика sync-XHR под перехватом не
+	// задокументирована — честный SKIP вместо непроверенного ассерта.
+	switch opts.Engine {
+	case config.EngineMoli:
+		if got := cOn.claritySync.Load(); got < 1 {
+			t.Errorf("sync-зонд clarity.ms не дошёл до сервера %d раз, хочу >= 1 "+
+				"(moli: sync-XHR не блокируется, расхождение #2728)", got)
+		}
+		if attr := domAttr(onOut.DOM, "sync-xhr"); attr != "loaded 200" {
+			t.Errorf("sync-xhr %q, хочу loaded 200 (moli: sync-XHR уходит в сеть, #2728)", attr)
+		}
+	case "", config.EngineChromium:
+		// Движок %q в подсказке — диагностика запуска одиночного теста с
+		// CRAWLER_RENDER_REMOTE_URL на чужом движке: liveOptions Engine не
+		// заполняет, семантика берётся chromium — красный выглядел бы как
+		// поломка блокировки. moli — только через per-engine срез
+		// (MOLI_WS_URL, EnginesLive).
+		if got := cOn.claritySync.Load(); got != 0 {
+			t.Errorf("sync-зонд clarity.ms дошёл до сервера %d раз, хочу 0 (заблокирован; движок %q — для moli sync-XHR не блокируется, используйте per-engine срез MOLI_WS_URL)",
+				got, opts.Engine)
+		}
+		if attr := domAttr(onOut.DOM, "sync-xhr"); attr != "error" {
+			t.Errorf("sync-xhr %q, хочу error (заблокирован; движок %q — для moli sync-XHR не блокируется, используйте per-engine срез MOLI_WS_URL)",
+				attr, opts.Engine)
+		}
+	default:
+		t.Skipf("поведение sync-XHR под перехватом для движка %q не задокументировано — ассерт только для chromium/moli (#2728)", opts.Engine)
 	}
 }
