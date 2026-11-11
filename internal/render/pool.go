@@ -20,8 +20,13 @@ type Pool struct {
 	// done закрывается при Close: ожидающие слот задачи отходят сразу.
 	done chan struct{}
 	// wg — задачи в полёте; Close их дорабатывает (ТЗ 3.4).
-	wg sync.WaitGroup
-
+	// Инвариант против гонки WaitGroup: wg.Add в Run только под mu и
+	// только при closed=false, а Wait в Close стартует ПОСЛЕ retire —
+	// то есть после того, как mu гарантировал: новых Add не будет (Add
+	// на нулевом счётчике одновременно с Wait запрещён документацией
+	// sync.WaitGroup; инцидент CI 11.11.2026 — race в TestGenStateLifecycle).
+	mu     sync.Mutex
+	wg     sync.WaitGroup
 	closed atomic.Bool
 
 	// newSession — фабрика сессий; подменяется фейками в юнит-тестах.
@@ -60,7 +65,15 @@ func (p *Pool) Browser() *Browser { return p.b }
 // страницы и недоступный браузер возвращаются наверх — повторная доставка
 // остаётся уровню очереди (T-066), перезапуск браузера — T-065.
 func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
+	// Регистрация в полёте — под mu и только живого пула: сериализуется
+	// с retire (см. инвариант wg выше) — Add никогда не гоняется с Wait.
+	p.mu.Lock()
+	if p.closed.Load() {
+		p.mu.Unlock()
+		return RenderOutput{}, &Error{Class: ClassTask, URL: task.URL, Err: ErrClosed}
+	}
 	p.wg.Add(1)
+	p.mu.Unlock()
 	defer p.wg.Done()
 	select {
 	case p.slots <- struct{}{}:
@@ -125,6 +138,11 @@ func (p *Pool) Close() {
 // фоновому Close (гонки «задача попала в закрываемый пул после acquire»
 // закрыты повтором в Manager.Run).
 func (p *Pool) retire() {
+	// Под mu: атомарность CAS + close(done) против wg.Add в Run (см.
+	// инвариант wg у полей пула); Wait в Close стартует после возврата
+	// отсюда — конкурентных Add на нулевом счётчике больше не бывает.
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if !p.closed.CompareAndSwap(false, true) {
 		return
 	}
