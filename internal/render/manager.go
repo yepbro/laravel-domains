@@ -209,14 +209,14 @@ func (m *Manager) restartLocked(reason string) error {
 	if old == nil {
 		// Logging of the chromium start (§4 docs/mutation-testing.md).
 		// mutator-disable-next-line statement/remove
-		slog.Info("chromium запущен", "mode", m.mode(), "pid", b.rootPID)
+		slog.Info("chromium started", "mode", m.mode(), "pid", b.rootPID)
 		return nil
 	}
 	n := m.restarts.Add(1)
 	go old.Close()
 	// Logging of the chromium restart (§4 docs/mutation-testing.md).
 	// mutator-disable-next-line statement/remove
-	slog.Info("chromium перезапущен", "reason", reason,
+	slog.Info("chromium restarted", "reason", reason,
 		"restarts", n, "pid", b.rootPID)
 	return nil
 }
@@ -229,7 +229,7 @@ func (m *Manager) mode() string {
 	if m.opts.RemoteURL != "" {
 		return "remote " + m.opts.RemoteURL
 	}
-	return "локальный процесс"
+	return "local process"
 }
 
 // Close stops the manager: new tasks are rejected (ErrClosed →

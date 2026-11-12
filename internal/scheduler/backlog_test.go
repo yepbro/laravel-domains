@@ -65,11 +65,11 @@ func (r *backlogFakeRows) Next() bool {
 
 func (r *backlogFakeRows) Scan(dest ...any) error {
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
-		return errors.New("backlogFakeRows: Scan без Next")
+		return errors.New("backlogFakeRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("backlogFakeRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("backlogFakeRows: %d sinks, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		target := reflect.ValueOf(d).Elem()
@@ -99,11 +99,11 @@ type backlogFakePool struct {
 }
 
 func (p *backlogFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *backlogFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("Exec must not be called")
 }
 
 func (p *backlogFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -200,14 +200,14 @@ func TestBacklogOnce(t *testing.T) {
 		t.Fatalf("BacklogOnce: %v", err)
 	}
 	if res.Pending != 10 || res.Queued != 7 {
-		t.Errorf("итог = %+v, want pending 10, queued 7", res)
+		t.Errorf("result = %+v, want pending 10, queued 7", res)
 	}
 
 	if len(pool.calls) != 1 || pool.calls[0].sql != wantBacklogSQL {
-		t.Fatalf("SQL = %q, want точный контракт", pool.calls[0].sql)
+		t.Fatalf("SQL = %q, want the exact contract", pool.calls[0].sql)
 	}
 	if len(pool.calls[0].args) != 0 {
-		t.Errorf("args = %v, want пусто (суммы справочника, T-178)", pool.calls[0].args)
+		t.Errorf("args = %v, want empty (reference table sums, T-178)", pool.calls[0].args)
 	}
 
 	for state, want := range map[string]float64{
@@ -234,7 +234,7 @@ func TestBacklogOnceEmptyStates(t *testing.T) {
 		t.Fatalf("BacklogOnce: %v", err)
 	}
 	if res.Pending != 0 || res.Queued != 0 {
-		t.Errorf("итог = %+v, want нули", res)
+		t.Errorf("result = %+v, want zeros", res)
 	}
 	for _, state := range []string{model.CheckStatePending.String(), model.CheckStateQueued.String()} {
 		if v, ok := backlogGaugeValue(t, reg, state); !ok || v != 0 {
@@ -245,26 +245,26 @@ func TestBacklogOnceEmptyStates(t *testing.T) {
 
 func TestBacklogOnceErrors(t *testing.T) {
 	reg := metrics.New("scheduler")
-	boom := errors.New("бд недоступна")
+	boom := errors.New("db unavailable")
 	pool := &backlogFakePool{hook: func() (pgx.Rows, error) { return nil, boom }}
 
 	if _, err := BacklogOnce(context.Background(), pool, NewBacklogGauge(reg)); err == nil ||
 		!errors.Is(err, boom) {
-		t.Fatalf("ошибка = %v, want исходная ошибка БД", err)
+		t.Fatalf("err = %v, want the original DB error", err)
 	}
 	// A pass failure does not touch the gauge: the series keep their previous value
 	// or are absent — but not "reset to zero" (a false "backlog is empty").
 	if _, ok := backlogGaugeValue(t, reg, model.CheckStatePending.String()); ok {
-		t.Error("сбойный проход не должен писать gauge")
+		t.Error("the failed pass must not write the gauge")
 	}
 
 	if _, err := BacklogOnce(context.Background(), nil, NewBacklogGauge(reg)); err == nil ||
-		err.Error() != "scheduler: глубина backlog: пул не задан" {
-		t.Fatalf("nil-пул = %v, want ошибка", err)
+		err.Error() != "scheduler: backlog depth: pool not set" {
+		t.Fatalf("nil pool: err = %v, want an error", err)
 	}
 	if _, err := BacklogOnce(context.Background(), pool, nil); err == nil ||
-		err.Error() != "scheduler: глубина backlog: gauge не задан" {
-		t.Fatalf("nil-gauge = %v, want ошибка", err)
+		err.Error() != "scheduler: backlog depth: gauge not set" {
+		t.Fatalf("nil gauge: err = %v, want an error", err)
 	}
 }
 
@@ -279,11 +279,11 @@ func TestBacklogOptionsDefaults(t *testing.T) {
 		t.Errorf("Interval = %v, want 5m", got)
 	}
 	if got := (BacklogOptions{Interval: time.Second}).withDefaults().Interval; got != time.Second {
-		t.Errorf("кастомный Interval затёрт: %v", got)
+		t.Errorf("a custom Interval overwritten: %v", got)
 	}
 	// 1 ns — a positive value, not replaced by the default.
 	if got := (BacklogOptions{Interval: time.Nanosecond}).withDefaults().Interval; got != time.Nanosecond {
-		t.Errorf("Interval 1нс = %v, want без замены", got)
+		t.Errorf("Interval 1ns = %v, want no replacement", got)
 	}
 }
 
@@ -299,26 +299,26 @@ func TestBacklogOnceRowsErrors(t *testing.T) {
 		return backlogRows([]any{int64(1), int64(2), int64(3)}), nil
 	}}
 	if _, err := BacklogOnce(context.Background(), scanPool, NewBacklogGauge(reg)); err == nil ||
-		!strings.Contains(err.Error(), "чтение") {
-		t.Errorf("ошибка Scan = %v, want контекст «чтение»", err)
+		!strings.Contains(err.Error(), "read") {
+		t.Errorf("the Scan error = %v, want the \"read\" context", err)
 	}
 
 	// rows.Err after a response row.
-	boom := errors.New("бд недоступна")
+	boom := errors.New("db unavailable")
 	errRows := backlogPair(3, 4)
 	errRows.err = boom
 	errPool := &backlogFakePool{hook: func() (pgx.Rows, error) { return errRows, nil }}
 	if _, err := BacklogOnce(context.Background(), errPool, NewBacklogGauge(reg)); err == nil ||
 		!errors.Is(err, boom) {
-		t.Errorf("ошибка rows.Err = %v, want исходная %v", err, boom)
+		t.Errorf("the rows.Err error = %v, want the original %v", err, boom)
 	}
 
 	// An empty response is a form anomaly (an aggregate without GROUP BY answers
 	// with a single row).
 	emptyPool := &backlogFakePool{hook: func() (pgx.Rows, error) { return backlogRows(), nil }}
 	if _, err := BacklogOnce(context.Background(), emptyPool, NewBacklogGauge(reg)); err == nil ||
-		!strings.Contains(err.Error(), "пустой ответ агрегата") {
-		t.Errorf("пустой ответ = %v, want «пустой ответ агрегата»", err)
+		!strings.Contains(err.Error(), "empty aggregate response") {
+		t.Errorf("the empty response = %v, want \"empty aggregate response\"", err)
 	}
 }
 
@@ -349,14 +349,14 @@ func TestBacklogLoop(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	if v, ok := backlogGaugeValue(t, reg, model.CheckStatePending.String()); !ok || v != 3 {
-		t.Fatalf("стартовый проход: pending = (%v, %v), want (3, true)", v, ok)
+		t.Fatalf("the initial pass: pending = (%v, %v), want (3, true)", v, ok)
 	}
 
 	// A pass failure does not stop the loop; recovery — an update.
-	pool.setHook(func() (pgx.Rows, error) { return nil, errors.New("бд недоступна") })
+	pool.setHook(func() (pgx.Rows, error) { return nil, errors.New("db unavailable") })
 	time.Sleep(20 * time.Millisecond) // several failed ticks
 	if v, _ := backlogGaugeValue(t, reg, model.CheckStatePending.String()); v != 3 {
-		t.Errorf("при сбоях pending = %v, want последнее известное 3", v)
+		t.Errorf("on failures pending = %v, want the last known 3", v)
 	}
 	pool.setHook(func() (pgx.Rows, error) {
 		return backlogPair(5, 0), nil
@@ -369,17 +369,17 @@ func TestBacklogLoop(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	if v, _ := backlogGaugeValue(t, reg, model.CheckStatePending.String()); v != 5 {
-		t.Fatal("цикл не восстановился после ошибки")
+		t.Fatal("the loop did not recover after an error")
 	}
 
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("BacklogLoop: %v, want nil (чистый выход по отмене)", err)
+			t.Fatalf("BacklogLoop: %v, want nil (a clean exit on cancellation)", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("BacklogLoop не завершился после отмены ctx")
+		t.Fatal("BacklogLoop did not finish after ctx cancellation")
 	}
 }
 
@@ -411,7 +411,7 @@ func TestBacklogLoopImmediateFirstPass(t *testing.T) {
 	}
 	if v, ok := backlogGaugeValue(t, reg, model.CheckStatePending.String()); !ok || v != 3 {
 		cancel()
-		t.Fatalf("pending = (%v, %v), want (3, true): проход не выполнен без тика", v, ok)
+		t.Fatalf("pending = (%v, %v), want (3, true): the pass did not run without a tick", v, ok)
 	}
 
 	cancel()
@@ -421,10 +421,10 @@ func TestBacklogLoopImmediateFirstPass(t *testing.T) {
 			t.Fatalf("BacklogLoop: %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("BacklogLoop не завершился после отмены ctx")
+		t.Fatal("BacklogLoop did not finish after ctx cancellation")
 	}
 	if n := pool.callsCount(); n != 1 {
-		t.Errorf("проходов = %d, want 1 (стартовый, без тика)", n)
+		t.Errorf("passes = %d, want 1 (initial, without a tick)", n)
 	}
 }
 
@@ -464,12 +464,12 @@ func TestBacklogLoopLogging(t *testing.T) {
 	// switch branch choice (the quiet "cancellation during a pass" branch), the Warn was lost
 	// (a flake of ~1/20). Determinism: we wait for the Warn itself in the log (syncBuf under
 	// a lock), the Warn record strictly before our cancel.
-	pool.setHook(func() (pgx.Rows, error) { return nil, errors.New("бд недоступна") })
+	pool.setHook(func() (pgx.Rows, error) { return nil, errors.New("db unavailable") })
 	deadline = time.Now().Add(2 * time.Second)
-	for !slogBuf.contains("бд недоступна") {
+	for !slogBuf.contains("db unavailable") {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("сбойный проход не выполнен или Warn не записан:\n%s", slogBuf)
+			t.Fatalf("the failed pass did not run or the Warn was not logged:\n%s", slogBuf)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -481,17 +481,17 @@ func TestBacklogLoopLogging(t *testing.T) {
 			t.Fatalf("BacklogLoop: %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("BacklogLoop не завершился после отмены ctx")
+		t.Fatal("BacklogLoop did not finish after ctx cancellation")
 	}
 
 	log := slogBuf.String()
 	for _, want := range []string{
 		"level=DEBUG", // the outcome of a successful pass
 		"level=WARN",  // a pass failure did not kill the loop
-		"бд недоступна",
+		"db unavailable",
 	} {
 		if !strings.Contains(log, want) {
-			t.Errorf("лог не содержит %q:\n%s", want, log)
+			t.Errorf("log does not contain %q:\n%s", want, log)
 		}
 	}
 }
@@ -512,25 +512,25 @@ func TestBacklogLoopCancelDuringPass(t *testing.T) {
 	cancel()
 
 	if err := BacklogLoop(ctx, pool, reg, BacklogOptions{Log: logger}); err != nil {
-		t.Fatalf("BacklogLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("BacklogLoop: %v, want nil on ctx cancellation", err)
 	}
 	if !strings.Contains(buf.String(), "level=DEBUG") {
-		t.Errorf("стартовый проход не логируется при отменённом ctx:\n%s", buf.String())
+		t.Errorf("the initial pass is not logged with a cancelled ctx:\n%s", buf.String())
 	}
 	if v, ok := backlogGaugeValue(t, reg, model.CheckStatePending.String()); !ok || v != 3 {
-		t.Errorf("pending = (%v, %v), want (3, true): стартовый проход выполнен", v, ok)
+		t.Errorf("pending = (%v, %v), want (3, true): the initial pass ran", v, ok)
 	}
 }
 
 func TestBacklogLoopValidation(t *testing.T) {
 	pool := &backlogFakePool{hook: func() (pgx.Rows, error) { return backlogRows(), nil }}
 	if err := BacklogLoop(context.Background(), nil, metrics.New("scheduler"), BacklogOptions{}); err == nil ||
-		err.Error() != "scheduler: цикл backlog: пул не задан" {
-		t.Fatalf("nil-пул = %v, want ошибка", err)
+		err.Error() != "scheduler: backlog loop: pool not set" {
+		t.Fatalf("nil pool: err = %v, want an error", err)
 	}
 	if err := BacklogLoop(context.Background(), pool, nil, BacklogOptions{}); err == nil ||
-		err.Error() != "scheduler: цикл backlog: реестр метрик не задан" {
-		t.Fatalf("nil-реестр = %v, want ошибка", err)
+		err.Error() != "scheduler: backlog loop: metric registry not set" {
+		t.Fatalf("nil registry: err = %v, want an error", err)
 	}
 }
 
@@ -607,10 +607,10 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 
 	// The Warn comes at the end of the slow pass (after the tick drain).
 	deadline := time.Now().Add(2 * time.Second)
-	for !slogBuf.contains("дольше интервала") {
+	for !slogBuf.contains("longer than the interval") {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("медленный проход не зафиксирован:\n%s", slogBuf)
+			t.Fatalf("the slow pass was not recorded:\n%s", slogBuf)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -620,7 +620,7 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 	// The moment of observing the Warn — before the 150 ms tick: the second pass could not
 	// have started yet (the only buffered tick was removed by the drain).
 	if n := pool.callsCount(); n != 1 {
-		t.Errorf("проходов = %d после дренажа, want 1 (тик пропущен)", n)
+		t.Errorf("passes = %d after the drain, want 1 (tick skipped)", n)
 	}
 
 	// Pass 2 is fast: the normal mode is restored, the loop lives.
@@ -631,12 +631,12 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 	for pool.callsCount() < 2 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("проход после пропуска не начался: %d", pool.callsCount())
+			t.Fatalf("the pass after the skip did not start: %d", pool.callsCount())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if got := backlogSkippedValue(t, reg); got != 1 {
-		t.Errorf("skipped_ticks = %v после быстрого прохода, want 1", got)
+		t.Errorf("skipped_ticks = %v after a fast pass, want 1", got)
 	}
 
 	cancel()
@@ -646,10 +646,10 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 			t.Fatalf("BacklogLoop: %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("BacklogLoop не завершился после отмены ctx")
+		t.Fatal("BacklogLoop did not finish after ctx cancellation")
 	}
 	if got := backlogHistogramSamples(t, reg); got < 2 {
-		t.Errorf("наблюдений гистограммы = %d, want ≥ 2 (по одному на проход)", got)
+		t.Errorf("histogram observations = %d, want ≥ 2 (one per pass)", got)
 	}
 }
 
@@ -677,7 +677,7 @@ func TestBacklogLoopFastPassNoSkip(t *testing.T) {
 	for pool.callsCount() < 3 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("проходы не идут")
+			t.Fatal("passes are not running")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -688,12 +688,12 @@ func TestBacklogLoopFastPassNoSkip(t *testing.T) {
 			t.Fatalf("BacklogLoop: %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("BacklogLoop не завершился после отмены ctx")
+		t.Fatal("BacklogLoop did not finish after ctx cancellation")
 	}
 	if got := backlogSkippedValue(t, reg); got != 0 {
-		t.Errorf("skipped_ticks = %v, want 0 (быстрые проходы не пропускаются)", got)
+		t.Errorf("skipped_ticks = %v, want 0 (fast passes are not skipped)", got)
 	}
 	if got := backlogHistogramSamples(t, reg); got < 3 {
-		t.Errorf("наблюдений гистограммы = %d, want ≥ 3", got)
+		t.Errorf("histogram observations = %d, want ≥ 3", got)
 	}
 }

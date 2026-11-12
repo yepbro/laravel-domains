@@ -23,14 +23,14 @@ func TestStartBrowserRemoteUnreachable(t *testing.T) {
 		RestartEveryPages: 1,
 	})
 	if err == nil {
-		t.Fatal("ожидана ошибка недоступного Chromium")
+		t.Fatal("an unavailable-Chromium error was expected")
 	}
 	var e *Error
 	if !errors.As(err, &e) {
-		t.Fatalf("ошибка не *render.Error: %v", err)
+		t.Fatalf("the error is not *render.Error: %v", err)
 	}
 	if e.Class != ClassBrowser {
-		t.Errorf("класс %v, хочу browser", e.Class)
+		t.Errorf("the class %v, want browser", e.Class)
 	}
 }
 
@@ -42,21 +42,21 @@ func TestStartBrowserLocalExecMissing(t *testing.T) {
 		RestartEveryPages: 1,
 	})
 	if err == nil {
-		t.Fatal("ожидана ошибка запуска несуществующего бинарка")
+		t.Fatal("a launch error for a non-existent binary was expected")
 	}
 	var e *Error
 	if !errors.As(err, &e) || e.Class != ClassBrowser {
-		t.Fatalf("хочу *render.Error класса browser, получено: %v", err)
+		t.Fatalf("want a *render.Error of the browser class, got: %v", err)
 	}
 	// The message names the mode and the given path: the path appears in the
 	// text only if ExecPath actually reached the allocator (otherwise chromedp
 	// looks for the binary in PATH and fails with a different text — "google-chrome … PATH").
 	msg := err.Error()
-	if !strings.Contains(msg, "локальный процесс") {
-		t.Errorf("ошибка не называет локальный режим: %v", msg)
+	if !strings.Contains(msg, "local process") {
+		t.Errorf("the error does not mention the local mode: %v", msg)
 	}
 	if !strings.Contains(msg, "/nonexistent/chromium") {
-		t.Errorf("ошибка не называет заданный ExecPath: %v", msg)
+		t.Errorf("the error does not mention the given ExecPath: %v", msg)
 	}
 }
 
@@ -65,10 +65,10 @@ func TestStartBrowserLocalExecMissing(t *testing.T) {
 // deaths); the tab (Session.probe) — short, the generation does not decide.
 func TestProbeTimeout(t *testing.T) {
 	if probeTimeout != 5*time.Second {
-		t.Errorf("probeTimeout = %s, хочу 5s", probeTimeout)
+		t.Errorf("probeTimeout = %s, want 5s", probeTimeout)
 	}
 	if tabProbeTimeout != 2*time.Second {
-		t.Errorf("tabProbeTimeout = %s, хочу 2s", tabProbeTimeout)
+		t.Errorf("tabProbeTimeout = %s, want 2s", tabProbeTimeout)
 	}
 }
 
@@ -79,11 +79,11 @@ func TestStartBrowserValidate(t *testing.T) {
 		Contexts: 0, Timeout: time.Second, RestartEveryPages: 1,
 	})
 	if err == nil {
-		t.Fatal("ожидана ошибка валидации")
+		t.Fatal("a validation error was expected")
 	}
 	var e *Error
 	if errors.As(err, &e) {
-		t.Errorf("ошибка валидации не должна быть классифицирована: %v", err)
+		t.Errorf("the validation error must not be classified: %v", err)
 	}
 }
 
@@ -99,7 +99,7 @@ func TestBrowserCloseNil(t *testing.T) {
 func TestBrowserAliveNil(t *testing.T) {
 	var b *Browser
 	if b.Alive() {
-		t.Error("nil-браузер не жив")
+		t.Error("a nil browser is not alive")
 	}
 }
 
@@ -110,7 +110,7 @@ func TestBrowserAliveNil(t *testing.T) {
 func TestBrowserAliveChromedpContext(t *testing.T) {
 	b := testBrowser(1)
 	if b.Alive() {
-		t.Error("браузер без контекста (юнит-тесты) не жив")
+		t.Error("a browser without a context (unit tests) is not alive")
 	}
 
 	bctx, cancel := chromedp.NewContext(context.Background())
@@ -118,14 +118,14 @@ func TestBrowserAliveChromedpContext(t *testing.T) {
 	b2 := testBrowser(1)
 	b2.ctx = bctx
 	if !b2.Alive() {
-		t.Error("живой контекст без браузерной сессии: Alive")
+		t.Error("a live context without a browser session: Alive")
 	}
 
 	lost := make(chan struct{})
 	close(lost)
 	chromedp.FromContext(bctx).Browser = &chromedp.Browser{LostConnection: lost}
 	if b2.Alive() {
-		t.Error("потерянное соединение при живом контексте: не Alive")
+		t.Error("a lost connection with a live context: not Alive")
 	}
 }
 
@@ -139,9 +139,9 @@ func TestBrowserCloseIdempotent(t *testing.T) {
 	b.Close()
 	b.Close()
 	if cancels != 1 {
-		t.Errorf("cancel вызван %d раз, хочу 1", cancels)
+		t.Errorf("cancel called %d times, want 1", cancels)
 	}
 	if allocCancels != 1 {
-		t.Errorf("cancelAlloc вызван %d раз, хочу 1", allocCancels)
+		t.Errorf("cancelAlloc called %d times, want 1", allocCancels)
 	}
 }

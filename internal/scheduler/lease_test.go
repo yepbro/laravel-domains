@@ -85,15 +85,15 @@ type leaseFakePool struct {
 }
 
 func (p *leaseFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *leaseFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("Exec must not be called")
 }
 
 func (p *leaseFakePool) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("Query через пул не должен вызываться — оба оператора в транзакции")
+	return nil, errors.New("Query via the pool must not be called — both statements are in one transaction")
 }
 
 func (p *leaseFakePool) Begin(context.Context) (pgx.Tx, error) {
@@ -233,20 +233,20 @@ func (t *leaseFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 			return nil, err
 		}
 		if len(args) != 3 {
-			return nil, fmt.Errorf("leaseFakeTx: перевод страховки: параметров %d, нужно 3", len(args))
+			return nil, fmt.Errorf("leaseFakeTx: the guard move: %d parameters, need 3", len(args))
 		}
 		zones, okZ := args[1].([]int16)
 		ids, okI := args[2].([]int64)
 		if !okZ || !okI {
-			return nil, fmt.Errorf("leaseFakeTx: перевод страховки: ключи %T/%T, нужно []int16/[]int64", args[1], args[2])
+			return nil, fmt.Errorf("leaseFakeTx: the guard move: keys %T/%T, need []int16/[]int64", args[1], args[2])
 		}
 		if len(zones) != len(t.nullBatch.rows) || len(ids) != len(t.nullBatch.rows) {
-			return nil, fmt.Errorf("leaseFakeTx: перевод страховки: ключей %d, выбрано %d — пробивать обязано пачку",
+			return nil, fmt.Errorf("leaseFakeTx: the guard move: %d keys, %d selected — it must punch through the batch",
 				len(zones), len(t.nullBatch.rows))
 		}
 		for i, r := range t.nullBatch.rows {
 			if zones[i] != r.zone || ids[i] != r.id {
-				return nil, fmt.Errorf("leaseFakeTx: перевод страховки: ключ %d = (%d,%d), выбран (%d,%d)",
+				return nil, fmt.Errorf("leaseFakeTx: the guard move: key %d = (%d,%d), selected (%d,%d)",
 					i, zones[i], ids[i], r.zone, r.id)
 			}
 		}
@@ -264,20 +264,20 @@ func (t *leaseFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		// The move contract: the unnest keys are exactly the SELECT batch of this same
 		// transaction, in selection order.
 		if len(args) != 5 {
-			return nil, fmt.Errorf("leaseFakeTx: перевод: параметров %d, нужно 5", len(args))
+			return nil, fmt.Errorf("leaseFakeTx: the move: %d parameters, need 5", len(args))
 		}
 		zones, okZ := args[1].([]int16)
 		ids, okI := args[2].([]int64)
 		if !okZ || !okI {
-			return nil, fmt.Errorf("leaseFakeTx: перевод: ключи %T/%T, нужно []int16/[]int64", args[1], args[2])
+			return nil, fmt.Errorf("leaseFakeTx: the move: keys %T/%T, need []int16/[]int64", args[1], args[2])
 		}
 		if len(zones) != len(t.batch.rows) || len(ids) != len(t.batch.rows) {
-			return nil, fmt.Errorf("leaseFakeTx: перевод: ключей %d, выбрано %d — пробивать обязано пачку",
+			return nil, fmt.Errorf("leaseFakeTx: the move: %d keys, %d selected — it must punch through the batch",
 				len(zones), len(t.batch.rows))
 		}
 		for i, r := range t.batch.rows {
 			if zones[i] != r.zone || ids[i] != r.id {
-				return nil, fmt.Errorf("leaseFakeTx: перевод: ключ %d = (%d,%d), выбран (%d,%d)",
+				return nil, fmt.Errorf("leaseFakeTx: the move: key %d = (%d,%d), selected (%d,%d)",
 					i, zones[i], ids[i], r.zone, r.id)
 			}
 		}
@@ -288,7 +288,7 @@ func (t *leaseFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		}
 		return retryRows(rows...), nil
 	default:
-		return nil, fmt.Errorf("leaseFakeTx: неожидаемый SQL в транзакции: %s", sql)
+		return nil, fmt.Errorf("leaseFakeTx: unexpected SQL in a transaction: %s", sql)
 	}
 }
 
@@ -383,15 +383,15 @@ func TestLeaseOnceSQL(t *testing.T) {
 	}
 
 	if ops := pool.opsSnapshot(); !reflect.DeepEqual(ops, []string{"begin", "select", "update", "commit"}) {
-		t.Errorf("порядок операций = %v, want [begin select update commit] — пара операторов в одной транзакции", ops)
+		t.Errorf("the operation order = %v, want [begin select update commit] — the statement pair in one transaction", ops)
 	}
 
 	sel := pool.selectSnapshot()
 	if len(sel) != 1 {
-		t.Fatalf("SELECT-вызовов = %d, want 1", len(sel))
+		t.Fatalf("SELECT calls = %d, want 1", len(sel))
 	}
 	if sel[0].sql != wantLeaseSelect {
-		t.Errorf("SQL выборки:\n%s\nwant:\n%s", sel[0].sql, wantLeaseSelect)
+		t.Errorf("selection SQL:\n%s\nwant:\n%s", sel[0].sql, wantLeaseSelect)
 	}
 	wantSelArgs := []any{
 		&now,                            // the test clocks' "now" (in production NULL → the DB's now())
@@ -400,15 +400,15 @@ func TestLeaseOnceSQL(t *testing.T) {
 		8000, // the batch LIMIT
 	}
 	if !reflect.DeepEqual(sel[0].args, wantSelArgs) {
-		t.Errorf("аргументы выборки = %v, want %v", sel[0].args, wantSelArgs)
+		t.Errorf("selection args = %v, want %v", sel[0].args, wantSelArgs)
 	}
 
 	upd := pool.updateSnapshot()
 	if len(upd) != 1 {
-		t.Fatalf("UPDATE-вызовов = %d, want 1", len(upd))
+		t.Fatalf("UPDATE-calls = %d, want 1", len(upd))
 	}
 	if upd[0].sql != wantLeaseUpdate {
-		t.Errorf("SQL перевода:\n%s\nwant:\n%s", upd[0].sql, wantLeaseUpdate)
+		t.Errorf("move SQL:\n%s\nwant:\n%s", upd[0].sql, wantLeaseUpdate)
 	}
 	wantUpdArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
@@ -418,17 +418,17 @@ func TestLeaseOnceSQL(t *testing.T) {
 		(15 * time.Minute).Seconds(),
 	}
 	if !reflect.DeepEqual(upd[0].args, wantUpdArgs) {
-		t.Errorf("аргументы перевода = %v, want %v", upd[0].args, wantUpdArgs)
+		t.Errorf("move args = %v, want %v", upd[0].args, wantUpdArgs)
 	}
 
 	// Counting by RETURNING: 2 of the selected 3 moved (the guard filtered out one).
 	if res.Domains != 2 || res.Selected != 3 {
-		t.Errorf("итог = %+v, want Domains=2 (RETURNING), Selected=3", res)
+		t.Errorf("result = %+v, want Domains=2 (RETURNING), Selected=3", res)
 	}
 	// The cursor — the last row of the batch (the minute grid of the seed stub).
 	want := leaseSeedBatch(3, 0, base).rows[2]
 	if cursor.queuedAt != want.queuedAt || cursor.zone != want.zone || cursor.id != want.id {
-		t.Errorf("курсор = (%v,%d,%d), want последняя строка пачки (%v,%d,%d)",
+		t.Errorf("cursor = (%v,%d,%d), want the batch's last row (%v,%d,%d)",
 			cursor.queuedAt, cursor.zone, cursor.id, want.queuedAt, want.zone, want.id)
 	}
 }
@@ -443,14 +443,14 @@ func TestLeaseOnceClockIsServer(t *testing.T) {
 	}
 	selArgs := pool.selectSnapshot()[0].args
 	if got, ok := selArgs[0].(*time.Time); !ok || got != nil {
-		t.Errorf("«сейчас» выборки = %v (%T), want nil *time.Time — часы сервера БД", selArgs[0], selArgs[0])
+		t.Errorf("the selection \"now\" = %v (%T), want a nil *time.Time — the DB server clock", selArgs[0], selArgs[0])
 	}
 	if got, ok := selArgs[1].(float64); !ok || got != (30*time.Minute).Seconds() {
-		t.Errorf("срок = %v, want %v секунд дефолта", selArgs[1], (30 * time.Minute).Seconds())
+		t.Errorf("the expiry = %v, want %v seconds of the default", selArgs[1], (30 * time.Minute).Seconds())
 	}
 	updArgs := pool.updateSnapshot()[0].args
 	if got, ok := updArgs[3].(*time.Time); !ok || got != nil {
-		t.Errorf("«сейчас» перевода = %v (%T), want nil *time.Time", updArgs[3], updArgs[3])
+		t.Errorf("the move \"now\" = %v (%T), want nil *time.Time", updArgs[3], updArgs[3])
 	}
 }
 
@@ -467,13 +467,13 @@ func TestLeaseOnceDefaults(t *testing.T) {
 
 	args := pool.selectSnapshot()[0].args
 	if args[5] != DefaultLeaseBatch {
-		t.Errorf("LIMIT = %v, want дефолт %d", args[5], DefaultLeaseBatch)
+		t.Errorf("LIMIT = %v, want the default %d", args[5], DefaultLeaseBatch)
 	}
 	if got, ok := args[0].(*time.Time); !ok || !got.Equal(now) {
-		t.Errorf("«сейчас» = %v, want фиксированные часы %v", args[0], now)
+		t.Errorf("\"now\" = %v, want the fixed clock %v", args[0], now)
 	}
 	if got, ok := args[1].(float64); !ok || got != DefaultLeaseTimeout.Seconds() {
-		t.Errorf("срок = %v, want дефолт %s в секундах", args[1], DefaultLeaseTimeout)
+		t.Errorf("the expiry = %v, want the default %s in seconds", args[1], DefaultLeaseTimeout)
 	}
 }
 
@@ -489,17 +489,17 @@ func TestLeaseOnceEmpty(t *testing.T) {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
 	if res != (LeaseResult{}) {
-		t.Errorf("итог = %+v, want нулевой", res)
+		t.Errorf("result = %+v, want zero", res)
 	}
 	if _, selects, updates, commits := pool.stats(); selects != 1 || updates != 0 || commits != 0 {
-		t.Errorf("selects=%d updates=%d commits=%d, want 1/0/0 — пустая пачка без перевода",
+		t.Errorf("selects=%d updates=%d commits=%d, want 1/0/0 — an empty batch without a move",
 			selects, updates, commits)
 	}
 	if (cursor != LeaseCursor{}) {
-		t.Errorf("курсор = %+v, want нулевой — пустая пачка не двигает", cursor)
+		t.Errorf("cursor = %+v, want zero — an empty batch does not advance", cursor)
 	}
 	if ops := pool.opsSnapshot(); !reflect.DeepEqual(ops, []string{"begin", "select"}) {
-		t.Errorf("порядок операций = %v, want [begin select]", ops)
+		t.Errorf("the operation order = %v, want [begin select]", ops)
 	}
 }
 
@@ -514,11 +514,11 @@ func TestLeaseOnceCursorMoves(t *testing.T) {
 
 	var cursor LeaseCursor
 	if _, err := LeaseOnce(context.Background(), pool, &cursor, LeaseOptions{}); err != nil {
-		t.Fatalf("первый проход: %v", err)
+		t.Fatalf("the first pass: %v", err)
 	}
 	want := first.rows[len(first.rows)-1]
 	if cursor.queuedAt != want.queuedAt || cursor.id != want.id {
-		t.Fatalf("курсор после пачки = (%v,%d), want последняя строка (%v,%d)",
+		t.Fatalf("the cursor after the batch = (%v,%d), want the last row (%v,%d)",
 			cursor.queuedAt, cursor.id, want.queuedAt, want.id)
 	}
 
@@ -526,20 +526,20 @@ func TestLeaseOnceCursorMoves(t *testing.T) {
 	// of the cursor before the second pass — after that it moves past the second batch).
 	cursorAfterFirst := cursor
 	if _, err := LeaseOnce(context.Background(), pool, &cursor, LeaseOptions{}); err != nil {
-		t.Fatalf("второй проход: %v", err)
+		t.Fatalf("the second pass: %v", err)
 	}
 	q, z, i := leaseCursorArgs(pool.selectSnapshot()[1])
 	if q != cursorAfterFirst.queuedAt || z != cursorAfterFirst.zone || i != cursorAfterFirst.id {
-		t.Errorf("курсор второго SELECT = (%v,%d,%d), want переданный (%v,%d,%d)",
+		t.Errorf("the second SELECT's cursor = (%v,%d,%d), want the passed (%v,%d,%d)",
 			q, z, i, cursorAfterFirst.queuedAt, cursorAfterFirst.zone, cursorAfterFirst.id)
 	}
 
 	// An empty batch (the queue ran out) does not move the cursor.
 	if _, err := LeaseOnce(context.Background(), pool, &cursor, LeaseOptions{}); err != nil {
-		t.Fatalf("третий проход: %v", err)
+		t.Fatalf("the third pass: %v", err)
 	}
 	if cursor.queuedAt != second.rows[len(second.rows)-1].queuedAt {
-		t.Errorf("курсор после пустой пачки = %v, want прежний %v",
+		t.Errorf("the cursor after an empty batch = %v, want the previous %v",
 			cursor.queuedAt, second.rows[len(second.rows)-1].queuedAt)
 	}
 }
@@ -559,15 +559,15 @@ func TestLeaseOnceGuardFiltered(t *testing.T) {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
 	if res.Domains != 1 || res.Selected != 5 {
-		t.Fatalf("итог = %+v, want Domains=1 (RETURNING после guard), Selected=5", res)
+		t.Fatalf("result = %+v, want Domains=1 (RETURNING after the guard), Selected=5", res)
 	}
 	upd := pool.updateSnapshot()
 	if got := len(upd[0].args[1].([]int16)); got != 5 {
-		t.Errorf("unnest-ключей перевода = %d, want 5 — пробивается вся выбранная пачка", got)
+		t.Errorf("move unnest keys = %d, want 5 — the whole selected batch is punched through", got)
 	}
 	want := leaseSeedBatch(5, 0, base).rows[4]
 	if cursor.queuedAt != want.queuedAt || cursor.id != want.id {
-		t.Errorf("курсор = (%v,%d), want за последнюю строку пачки (%v,%d)",
+		t.Errorf("cursor = (%v,%d), want past the batch's last row (%v,%d)",
 			cursor.queuedAt, cursor.id, want.queuedAt, want.id)
 	}
 }
@@ -585,22 +585,22 @@ func TestLeaseOnceRepeatPasses(t *testing.T) {
 	var cursor LeaseCursor
 	first, err := LeaseOnce(context.Background(), pool, &cursor, LeaseOptions{})
 	if err != nil {
-		t.Fatalf("первый проход: %v", err)
+		t.Fatalf("the first pass: %v", err)
 	}
 	second, err := LeaseOnce(context.Background(), pool, &cursor, LeaseOptions{})
 	if err != nil {
-		t.Fatalf("второй проход: %v", err)
+		t.Fatalf("the second pass: %v", err)
 	}
 	third, err := LeaseOnce(context.Background(), pool, &cursor, LeaseOptions{})
 	if err != nil {
-		t.Fatalf("третий проход: %v", err)
+		t.Fatalf("the third pass: %v", err)
 	}
 	if first.Domains != 5 || second.Domains != 7 || third.Domains != 0 {
-		t.Errorf("проходы = %d, %d, %d; want 5, 7, 0",
+		t.Errorf("passes = %d, %d, %d; want 5, 7, 0",
 			first.Domains, second.Domains, third.Domains)
 	}
 	if _, selects, _, commits := pool.stats(); selects != 3 || commits != 2 {
-		t.Errorf("selects=%d commits=%d, want 3/2 (пустой проход без фиксации)", selects, commits)
+		t.Errorf("selects=%d commits=%d, want 3/2 (an empty pass without a commit)", selects, commits)
 	}
 }
 
@@ -614,12 +614,12 @@ func TestLeaseOnceNilCursor(t *testing.T) {
 	}}
 	for i := 0; i < 2; i++ {
 		if _, err := LeaseOnce(context.Background(), pool, nil, LeaseOptions{}); err != nil {
-			t.Fatalf("проход %d с nil-курсором: %v", i+1, err)
+			t.Fatalf("pass %d with a nil cursor: %v", i+1, err)
 		}
 	}
 	for i, call := range pool.selectSnapshot() {
 		if q, z, id := leaseCursorArgs(call); !q.IsZero() || z != 0 || id != 0 {
-			t.Errorf("SELECT %d с nil-курсором: курсор (%v,%d,%d), want нулевой", i, q, z, id)
+			t.Errorf("SELECT %d with a nil cursor: the cursor (%v,%d,%d), want zero", i, q, z, id)
 		}
 	}
 }
@@ -632,17 +632,17 @@ func TestLeaseOnceError(t *testing.T) {
 
 	selectPool := &leaseFakePool{
 		batches:    []leaseBatch{leaseSeedBatch(2, 2, base)},
-		selectErrs: []error{errors.New("бд недоступна")},
+		selectErrs: []error{errors.New("db unavailable")},
 	}
 	var cursor LeaseCursor
 	_, err := LeaseOnce(context.Background(), selectPool, &cursor, LeaseOptions{})
 	if err == nil ||
-		!strings.Contains(err.Error(), "scheduler: возврат истёкших lease") ||
-		!strings.Contains(err.Error(), "бд недоступна") {
-		t.Errorf("ошибка выборки = %v, want контекст задачи и исходная ошибка", err)
+		!strings.Contains(err.Error(), "scheduler: expired lease return") ||
+		!strings.Contains(err.Error(), "db unavailable") {
+		t.Errorf("the selection error = %v, want the task context and the original error", err)
 	}
 	if (cursor != LeaseCursor{}) {
-		t.Errorf("курсор сдвинулся при ошибке выборки: %+v", cursor)
+		t.Errorf("the cursor advanced on a selection error: %+v", cursor)
 	}
 
 	cancelPool := &leaseFakePool{
@@ -650,16 +650,16 @@ func TestLeaseOnceError(t *testing.T) {
 		updateErrs: []error{context.Canceled},
 	}
 	if _, err := LeaseOnce(context.Background(), cancelPool, &cursor, LeaseOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка перевода = %v, want context.Canceled", err)
+		t.Errorf("the move error = %v, want context.Canceled", err)
 	}
 	if (cursor != LeaseCursor{}) {
-		t.Errorf("курсор сдвинулся при ошибке перевода: %+v", cursor)
+		t.Errorf("the cursor advanced on a move error: %+v", cursor)
 	}
 
-	beginPool := &leaseFakePool{beginErr: errors.New("нет соединений")}
+	beginPool := &leaseFakePool{beginErr: errors.New("no connections")}
 	if _, err := LeaseOnce(context.Background(), beginPool, &cursor, LeaseOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "транзакция") {
-		t.Errorf("ошибка Begin = %v, want контекст транзакции", err)
+		!strings.Contains(err.Error(), "transaction") {
+		t.Errorf("the Begin error = %v, want the transaction context", err)
 	}
 
 	commitPool := &leaseFakePool{
@@ -667,18 +667,18 @@ func TestLeaseOnceError(t *testing.T) {
 		commitErrs: []error{errors.New("connection refused")},
 	}
 	if _, err := LeaseOnce(context.Background(), commitPool, &cursor, LeaseOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "фиксация") {
-		t.Errorf("ошибка Commit = %v, want контекст фиксации", err)
+		!strings.Contains(err.Error(), "commit") {
+		t.Errorf("the Commit error = %v, want the commit context", err)
 	}
 	if (cursor != LeaseCursor{}) {
-		t.Errorf("курсор сдвинулся при провале фиксации: %+v — пачка обязана повториться", cursor)
+		t.Errorf("the cursor advanced on a commit failure: %+v — the batch must be retried", cursor)
 	}
 }
 
 func TestLeaseOnceNilPool(t *testing.T) {
 	if _, err := LeaseOnce(context.Background(), nil, nil, LeaseOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+		!strings.Contains(err.Error(), "pool not set") {
+		t.Errorf("err = %v, want \"pool not set\"", err)
 	}
 }
 
@@ -706,31 +706,31 @@ func TestLeaseOptionsDefaults(t *testing.T) {
 	got = (LeaseOptions{Timeout: -time.Minute, BatchSize: -1, Interval: -time.Second}).withDefaults()
 	if got.Timeout != DefaultLeaseTimeout || got.BatchSize != DefaultLeaseBatch ||
 		got.Interval != DefaultLeaseTimeout/2 {
-		t.Errorf("withDefaults(отрицательные) = %+v, want дефолты", got)
+		t.Errorf("withDefaults(negatives) = %+v, want the defaults", got)
 	}
 
 	// A short term — the interval shrinks with it: the loop does not
 	// "oversleep" the configurable lease.
 	got = (LeaseOptions{Timeout: 2 * time.Minute}).withDefaults()
 	if got.Interval != time.Minute {
-		t.Errorf("Interval = %v, want 1m (Timeout/2 при Timeout=2m)", got.Interval)
+		t.Errorf("Interval = %v, want 1m (Timeout/2 at Timeout=2m)", got.Interval)
 	}
 
 	// A degenerate Timeout of 1 ns would give 0 by division — the ticker needs a
 	// positive interval.
 	if got := (LeaseOptions{Timeout: time.Nanosecond}).withDefaults(); got.Interval <= 0 {
-		t.Errorf("Interval = %v при Timeout=1ns, want > 0", got.Interval)
+		t.Errorf("Interval = %v at Timeout=1ns, want > 0", got.Interval)
 	}
 
 	// Replacement boundaries: 1 ns and 1 are positive values, not defaults.
 	if got := (LeaseOptions{Timeout: time.Nanosecond, BatchSize: 1}).withDefaults(); got.Timeout != time.Nanosecond || got.BatchSize != 1 {
-		t.Errorf("withDefaults(Timeout=1нс, BatchSize=1) = %+v, want без замены", got)
+		t.Errorf("withDefaults(Timeout=1ns, BatchSize=1) = %+v, want no replacement", got)
 	}
 	// The 1 ns interval is checked with a Timeout of 4 ns: replacing it with the default would
 	// give 2 ns (Timeout/2), while a degenerate Timeout of 1 ns coincides with
 	// the ticker's internal minimum and does not reveal the replacement.
 	if got := (LeaseOptions{Timeout: 4 * time.Nanosecond, Interval: time.Nanosecond}).withDefaults(); got.Interval != time.Nanosecond {
-		t.Errorf("Interval 1нс = %v, want без замены", got.Interval)
+		t.Errorf("Interval 1ns = %v, want no replacement", got.Interval)
 	}
 
 	// Given values are not overwritten; Now is passed as is.
@@ -742,10 +742,10 @@ func TestLeaseOptionsDefaults(t *testing.T) {
 		Now:       now,
 	}.withDefaults()
 	if got.Timeout != time.Hour || got.BatchSize != 10 || got.Interval != time.Minute {
-		t.Errorf("withDefaults затирает значения: %+v", got)
+		t.Errorf("withDefaults overwrites values: %+v", got)
 	}
 	if got.Now == nil || !got.Now().Equal(time.Unix(0, 0)) {
-		t.Errorf("withDefaults затирает Now: nil=%v, значение %v", got.Now == nil, got.Now())
+		t.Errorf("withDefaults overwrites Now: nil=%v, value %v", got.Now == nil, got.Now())
 	}
 }
 
@@ -774,19 +774,19 @@ func TestLeaseWatchImmediateDrain(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("стартовый дренаж не выполнен")
+			t.Fatal("the initial drain did not run")
 		}
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(20 * time.Millisecond)
 	if _, selects, updates, commits := pool.stats(); selects != 1 || updates != 1 || commits != 1 {
-		t.Errorf("selects=%d updates=%d commits=%d, want 1/1/1: без тика повторных дренажей нет",
+		t.Errorf("selects=%d updates=%d commits=%d, want 1/1/1: without a tick there are no repeated drains",
 			selects, updates, commits)
 	}
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("LeaseWatch: %v, want nil при отмене ctx", err)
+		t.Fatalf("LeaseWatch: %v, want nil on ctx cancellation", err)
 	}
 }
 
@@ -805,7 +805,7 @@ func TestLeaseWatchLoop(t *testing.T) {
 			leaseSeedBatch(DefaultLeaseBatch, DefaultLeaseBatch, base),
 			leaseSeedBatch(3, 3, base.Add(time.Hour)),
 		},
-		selectErrs: []error{errors.New("бд недоступна")},
+		selectErrs: []error{errors.New("db unavailable")},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -825,7 +825,7 @@ func TestLeaseWatchLoop(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("цикл не дошёл до третьего прохода: selects=%d", len(pool.selectSnapshot()))
+			t.Fatalf("the loop did not reach the third pass: selects=%d", len(pool.selectSnapshot()))
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -841,7 +841,7 @@ func TestLeaseWatchLoop(t *testing.T) {
 		if time.Now().After(deadline) {
 			cancel()
 			begins, selects, updates, commits := pool.stats()
-			t.Fatalf("дренаж не зафиксировал обе пачки: begins=%d selects=%d updates=%d commits=%d",
+			t.Fatalf("the drain did not commit both batches: begins=%d selects=%d updates=%d commits=%d",
 				begins, selects, updates, commits)
 		}
 		time.Sleep(time.Millisecond)
@@ -850,19 +850,19 @@ func TestLeaseWatchLoop(t *testing.T) {
 	cancel()
 
 	if err := <-done; err != nil {
-		t.Fatalf("LeaseWatch: %v, want nil при отмене ctx", err)
+		t.Fatalf("LeaseWatch: %v, want nil on ctx cancellation", err)
 	}
 
 	log := buf.String()
 	for _, want := range []string{
-		"возврат доменов с истёкшим lease", // the start
+		"returning domains with an expired lease", // the start
 		"interval=20ms", // the default: Timeout/2
 		"level=WARN",    // a drain error did not kill the loop
-		"бд недоступна",
+		"db unavailable",
 		fmt.Sprintf("domains=%d", DefaultLeaseBatch+3), // the drain outcome
 	} {
 		if !strings.Contains(log, want) {
-			t.Errorf("лог не содержит %q:\n%s", want, log)
+			t.Errorf("log does not contain %q:\n%s", want, log)
 		}
 	}
 }
@@ -897,7 +897,7 @@ func TestLeaseWatchGuardFilteredFullBatch(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("дренаж не продолжился после нулевого перевода: selects=%d updates=%d",
+			t.Fatalf("the drain did not continue after a zero move: selects=%d updates=%d",
 				len(pool.selectSnapshot()), len(pool.updateSnapshot()))
 		}
 		time.Sleep(time.Millisecond)
@@ -908,7 +908,7 @@ func TestLeaseWatchGuardFilteredFullBatch(t *testing.T) {
 		t.Fatalf("LeaseWatch: %v", err)
 	}
 	if !strings.Contains(buf.String(), "domains=3") {
-		t.Errorf("дренаж не дошёл до второй пачки (итог 3):\n%s", buf.String())
+		t.Errorf("the drain did not reach the second batch (result 3):\n%s", buf.String())
 	}
 }
 
@@ -939,7 +939,7 @@ func TestLeaseWatchCursorLives(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("первый дренаж не дошёл до второй пачки")
+			t.Fatal("the first drain did not reach the second batch")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -952,7 +952,7 @@ func TestLeaseWatchCursorLives(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("второй дренаж не начался")
+			t.Fatal("the second drain did not start")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -964,18 +964,18 @@ func TestLeaseWatchCursorLives(t *testing.T) {
 	calls := pool.selectSnapshot()
 	// Batch 1 — the zero cursor (start).
 	if q, z, i := leaseCursorArgs(calls[0]); !q.IsZero() || z != 0 || i != 0 {
-		t.Errorf("курсор пачки 1 = (%v,%d,%d), want нулевой", q, z, i)
+		t.Errorf("the batch 1 cursor = (%v,%d,%d), want zero", q, z, i)
 	}
 	// Batch 2 — past the last row of batch 1 (within the drain).
 	want1 := full.rows[1]
 	if q, z, i := leaseCursorArgs(calls[1]); q != want1.queuedAt || z != want1.zone || i != want1.id {
-		t.Errorf("курсор пачки 2 = (%v,%d,%d), want (%v,%d,%d) — за пачку 1",
+		t.Errorf("the batch 2 cursor = (%v,%d,%d), want (%v,%d,%d) — past batch 1",
 			q, z, i, want1.queuedAt, want1.zone, want1.id)
 	}
 	// Drain 2 — past the last row of the previous drain (between drains).
 	want2 := partial.rows[0]
 	if q, z, i := leaseCursorArgs(calls[2]); q != want2.queuedAt || z != want2.zone || i != want2.id {
-		t.Errorf("курсор дренажа 2 = (%v,%d,%d), want (%v,%d,%d) — курсор переживает дренажи",
+		t.Errorf("the drain 2 cursor = (%v,%d,%d), want (%v,%d,%d) — the cursor survives drains",
 			q, z, i, want2.queuedAt, want2.zone, want2.id)
 	}
 }
@@ -999,7 +999,7 @@ func TestLeaseWatchRestartResetsCursor(t *testing.T) {
 			}
 			if time.Now().After(deadline) {
 				cancel()
-				t.Fatal("стартовый дренаж не выполнен")
+				t.Fatal("the initial drain did not run")
 			}
 			time.Sleep(time.Millisecond)
 		}
@@ -1012,11 +1012,11 @@ func TestLeaseWatchRestartResetsCursor(t *testing.T) {
 
 	first := run()
 	if q, z, i := leaseCursorArgs(first[0]); !q.IsZero() || z != 0 || i != 0 {
-		t.Fatalf("первый запуск: стартовый курсор (%v,%d,%d), want нулевой", q, z, i)
+		t.Fatalf("the first run: the initial cursor (%v,%d,%d), want zero", q, z, i)
 	}
 	second := run()
 	if q, z, i := leaseCursorArgs(second[0]); !q.IsZero() || z != 0 || i != 0 {
-		t.Errorf("рестарт: стартовый курсор (%v,%d,%d), want нулевой — полный дренаж старта сохраняется", q, z, i)
+		t.Errorf("restart: the initial cursor (%v,%d,%d), want zero — the full start drain is preserved", q, z, i)
 	}
 }
 
@@ -1034,10 +1034,10 @@ func TestLeaseWatchCancelDuringDrain(t *testing.T) {
 	go func() { done <- LeaseWatch(ctx, pool, LeaseOptions{Log: logger}) }()
 
 	if err := <-done; err != nil {
-		t.Fatalf("LeaseWatch: %v, want nil при отмене ctx", err)
+		t.Fatalf("LeaseWatch: %v, want nil on ctx cancellation", err)
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("отмена во время дренажа — Warn:\n%s", buf.String())
+		t.Errorf("a cancellation during the drain — Warn:\n%s", buf.String())
 	}
 }
 
@@ -1050,9 +1050,9 @@ func TestLeaseWatchDrainTotals(t *testing.T) {
 		wantSelects int    // the number of SELECT passes until the starting drain stops
 		want        string // a substring of the drain's Info outcome; "" — the outcome is not logged
 	}{
-		{"неполная пачка из одного", []leaseBatch{leaseSeedBatch(1, 1, time.Now())}, 1, "domains=1"},
-		{"нулевой дренаж", nil, 1, ""},
-		{"полная пачка, всё отсеял guard", []leaseBatch{leaseSeedBatch(DefaultLeaseBatch, 0, time.Now())}, 2, ""},
+		{"an incomplete batch of one", []leaseBatch{leaseSeedBatch(1, 1, time.Now())}, 1, "domains=1"},
+		{"a zero drain", nil, 1, ""},
+		{"a full batch, the guard filtered everything out", []leaseBatch{leaseSeedBatch(DefaultLeaseBatch, 0, time.Now())}, 2, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1073,7 +1073,7 @@ func TestLeaseWatchDrainTotals(t *testing.T) {
 				}
 				if time.Now().After(deadline) {
 					cancel()
-					t.Fatal("стартовый дренаж не выполнен")
+					t.Fatal("the initial drain did not run")
 				}
 				time.Sleep(time.Millisecond)
 			}
@@ -1084,11 +1084,11 @@ func TestLeaseWatchDrainTotals(t *testing.T) {
 			}
 			log := buf.String()
 			if tt.want == "" {
-				if strings.Contains(log, "дренаж возврата истёкших lease") {
-					t.Errorf("нулевой дренаж подводит итог:\n%s", log)
+				if strings.Contains(log, "expired lease return drain") {
+					t.Errorf("a zero drain summarizes:\n%s", log)
 				}
 			} else if !strings.Contains(log, tt.want) {
-				t.Errorf("лог не содержит %q:\n%s", tt.want, log)
+				t.Errorf("log does not contain %q:\n%s", tt.want, log)
 			}
 		})
 	}
@@ -1096,7 +1096,7 @@ func TestLeaseWatchDrainTotals(t *testing.T) {
 
 func TestLeaseWatchNilPool(t *testing.T) {
 	err := LeaseWatch(context.Background(), nil, LeaseOptions{})
-	if err == nil || !strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+	if err == nil || !strings.Contains(err.Error(), "pool not set") {
+		t.Errorf("err = %v, want \"pool not set\"", err)
 	}
 }

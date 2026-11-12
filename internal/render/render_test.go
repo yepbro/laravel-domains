@@ -65,7 +65,7 @@ func TestNewOptions(t *testing.T) {
 		t.Fatalf("NewOptions:\n got %+v\nwant %+v", got, want)
 	}
 	if got.LookupHost != nil {
-		t.Errorf("NewOptions заполнил LookupHost из конфигурации: %p, хочу nil (дефолт — системный резолвер)", got.LookupHost)
+		t.Errorf("NewOptions filled LookupHost from the configuration: %p, want nil (the default is the system resolver)", got.LookupHost)
 	}
 }
 
@@ -80,7 +80,7 @@ func TestNewOptionsEngine(t *testing.T) {
 		cfg.Render.Engine = engine
 		cfg.Render.RemoteURL = "ws://engine:9222"
 		if got := NewOptions(*cfg).Engine; got != engine {
-			t.Errorf("render.engine %q: NewOptions перенёс %q, хочу как есть", engine, got)
+			t.Errorf("render.engine %q: NewOptions carried over %q, want as is", engine, got)
 		}
 	}
 }
@@ -88,15 +88,15 @@ func TestNewOptionsEngine(t *testing.T) {
 func TestOptionsWithDefaults(t *testing.T) {
 	got := Options{}.withDefaults()
 	if got.DialTimeout != 10*time.Second {
-		t.Errorf("DialTimeout = %s, хочу 10s", got.DialTimeout)
+		t.Errorf("DialTimeout = %s, want 10s", got.DialTimeout)
 	}
 	if got.SessionStartTimeout != 15*time.Second {
-		t.Errorf("SessionStartTimeout = %s, хочу 15s", got.SessionStartTimeout)
+		t.Errorf("SessionStartTimeout = %s, want 15s", got.SessionStartTimeout)
 	}
 	// The other fields — as set: hidden defaults do not mask the
 	// configuration.
 	if got.Contexts != 0 || got.Timeout != 0 {
-		t.Errorf("withDefaults затёр пустые поля: %+v", got)
+		t.Errorf("withDefaults overwrote empty fields: %+v", got)
 	}
 }
 
@@ -108,13 +108,13 @@ func TestOptionsValidate(t *testing.T) {
 		RestartEveryPages: 500,
 	}
 	if err := valid.validate(); err != nil {
-		t.Fatalf("валидные опции отклонены: %v", err)
+		t.Fatalf("valid options rejected: %v", err)
 	}
 	// RemoteURL is not mandatory: empty — the local mode.
 	local := valid
 	local.RemoteURL = ""
 	if err := local.validate(); err != nil {
-		t.Fatalf("локальный режим отклонён: %v", err)
+		t.Fatalf("the local mode rejected: %v", err)
 	}
 
 	// Boolean options without a range: both values are legal — for
@@ -126,7 +126,7 @@ func TestOptionsValidate(t *testing.T) {
 		opt.BlockStylesheet = b
 		opt.BlockTrackerDomains = b
 		if err := opt.validate(); err != nil {
-			t.Errorf("block_stylesheet/block_tracker_domains = %v отклонены: %v", b, err)
+			t.Errorf("block_stylesheet/block_tracker_domains = %v rejected: %v", b, err)
 		}
 	}
 
@@ -136,7 +136,7 @@ func TestOptionsValidate(t *testing.T) {
 		remote := valid
 		remote.RemoteURL = scheme + "://chromium:9222"
 		if err := remote.validate(); err != nil {
-			t.Errorf("remote_url %s:// отклонён: %v", scheme, err)
+			t.Errorf("remote_url %s:// rejected: %v", scheme, err)
 		}
 	}
 
@@ -145,7 +145,7 @@ func TestOptionsValidate(t *testing.T) {
 		bound := valid
 		bound.Contexts = n
 		if err := bound.validate(); err != nil {
-			t.Errorf("contexts = %d отклонён: %v", n, err)
+			t.Errorf("contexts = %d rejected: %v", n, err)
 		}
 	}
 
@@ -153,7 +153,7 @@ func TestOptionsValidate(t *testing.T) {
 	nano := valid
 	nano.Timeout = 1
 	if err := nano.validate(); err != nil {
-		t.Errorf("timeout = 1 нс отклонён: %v", err)
+		t.Errorf("timeout = 1 ns rejected: %v", err)
 	}
 
 	// The memory threshold boundaries: exactly the minimum (256 MiB)
@@ -163,7 +163,7 @@ func TestOptionsValidate(t *testing.T) {
 		bound := valid
 		bound.MemoryThreshold = threshold
 		if err := bound.validate(); err != nil {
-			t.Errorf("memory_threshold = %d отклонён: %v", threshold, err)
+			t.Errorf("memory_threshold = %d rejected: %v", threshold, err)
 		}
 	}
 
@@ -179,7 +179,7 @@ func TestOptionsValidate(t *testing.T) {
 			named.RemoteURL = valid.RemoteURL // the alternatives need an external CDP
 		}
 		if err := named.validate(); err != nil {
-			t.Errorf("движок %s отклонён: %v", engine, err)
+			t.Errorf("the engine %s rejected: %v", engine, err)
 		}
 	}
 	// The combination "engine × remote_url × memory_threshold" (FR-3):
@@ -189,15 +189,15 @@ func TestOptionsValidate(t *testing.T) {
 		noRemote.Engine = engine
 		noRemote.RemoteURL = ""
 		err := noRemote.validate()
-		if err == nil || !strings.Contains(err.Error(), "engine: для "+engine+" обязателен remote_url") {
-			t.Errorf("движок %s без remote_url: хочу ошибку связки, получено %v", engine, err)
+		if err == nil || !strings.Contains(err.Error(), "engine: "+engine+" requires remote_url") {
+			t.Errorf("the engine %s without remote_url: want a wiring error, got %v", engine, err)
 		}
 		withThreshold := valid
 		withThreshold.Engine = engine
 		withThreshold.MemoryThreshold = 256 << 20
 		err = withThreshold.validate()
-		if err == nil || !strings.Contains(err.Error(), "memory_threshold: для движка "+engine+" ожидается 0") {
-			t.Errorf("движок %s с порогом памяти: хочу ошибку связки, получено %v", engine, err)
+		if err == nil || !strings.Contains(err.Error(), "memory_threshold: for the "+engine+" engine 0 is expected") {
+			t.Errorf("the engine %s with a memory threshold: want a wiring error, got %v", engine, err)
 		}
 	}
 	// The remote_url scheme of the alternative engines — ws/wss only
@@ -210,8 +210,8 @@ func TestOptionsValidate(t *testing.T) {
 		badScheme.Engine = engine
 		badScheme.RemoteURL = "http://engine:9222"
 		err := badScheme.validate()
-		if err == nil || !strings.Contains(err.Error(), "remote_url: для движка "+engine+" ожидается ws://") {
-			t.Errorf("движок %s с http-адресом: хочу ошибку схемы, получено %v", engine, err)
+		if err == nil || !strings.Contains(err.Error(), "remote_url: for the "+engine+" engine ws://") {
+			t.Errorf("the engine %s with an http address: want a scheme error, got %v", engine, err)
 		}
 		// An empty host — the error of the "engine × remote_url"
 		// combination, not only of the general host check below: the
@@ -222,14 +222,14 @@ func TestOptionsValidate(t *testing.T) {
 		emptyHost.Engine = engine
 		emptyHost.RemoteURL = "ws://"
 		err = emptyHost.validate()
-		if err == nil || !strings.Contains(err.Error(), "remote_url: для движка "+engine+" ожидается ws://") {
-			t.Errorf("движок %s с ws:// без хоста: хочу ошибку связки, получено %v", engine, err)
+		if err == nil || !strings.Contains(err.Error(), "remote_url: for the "+engine+" engine ws://") {
+			t.Errorf("the engine %s with ws:// without a host: want a wiring error, got %v", engine, err)
 		}
 		wss := valid
 		wss.Engine = engine
 		wss.RemoteURL = "wss://engine:9222"
 		if err := wss.validate(); err != nil {
-			t.Errorf("движок %s с wss-адресом отклонён: %v", engine, err)
+			t.Errorf("the engine %s with a wss address rejected: %v", engine, err)
 		}
 	}
 
@@ -238,28 +238,28 @@ func TestOptionsValidate(t *testing.T) {
 		opts  Options
 		field string
 	}{
-		{"движок неизвестен", Options{Engine: "webkit", RemoteURL: "ws://x:9222", Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}, "engine"},
-		{"схема remote_url", Options{RemoteURL: "ftp://x:9222", Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}, "remote_url"},
-		{"remote_url без хоста", Options{RemoteURL: "ws://", Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}, "remote_url"},
+		{"an unknown engine", Options{Engine: "webkit", RemoteURL: "ws://x:9222", Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}, "engine"},
+		{"the remote_url scheme", Options{RemoteURL: "ftp://x:9222", Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}, "remote_url"},
+		{"remote_url without a host", Options{RemoteURL: "ws://", Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}, "remote_url"},
 		{"contexts 0", Options{Contexts: 0, Timeout: time.Second, RestartEveryPages: 1}, "contexts"},
 		{"contexts 17", Options{Contexts: 17, Timeout: time.Second, RestartEveryPages: 1}, "contexts"},
 		{"timeout 0", Options{Contexts: 2, Timeout: 0, RestartEveryPages: 1}, "timeout"},
-		{"timeout отрицательный", Options{Contexts: 2, Timeout: -time.Second, RestartEveryPages: 1}, "timeout"},
+		{"a negative timeout", Options{Contexts: 2, Timeout: -time.Second, RestartEveryPages: 1}, "timeout"},
 		{"restart_every_pages 0", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 0}, "restart_every_pages"},
-		{"memory_threshold отрицательный", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: -1}, "memory_threshold"},
-		{"memory_threshold ниже минимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 1 << 20}, "memory_threshold"},
-		{"memory_threshold ниже минимума на границу", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 255 << 20}, "memory_threshold"},
-		{"memory_threshold выше максимума", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 17 << 30}, "memory_threshold"},
-		{"max_dom_bytes отрицательный", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MaxDOMBytes: -1}, "max_dom_bytes"},
+		{"a negative memory_threshold", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: -1}, "memory_threshold"},
+		{"memory_threshold below the minimum", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 1 << 20}, "memory_threshold"},
+		{"memory_threshold below the minimum at the boundary", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 255 << 20}, "memory_threshold"},
+		{"memory_threshold above the maximum", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MemoryThreshold: 17 << 30}, "memory_threshold"},
+		{"a negative max_dom_bytes", Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1, MaxDOMBytes: -1}, "max_dom_bytes"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.opts.validate()
 			if err == nil {
-				t.Fatalf("ожидана ошибка, её нет")
+				t.Fatalf("an error was expected, there is none")
 			}
 			if !strings.Contains(err.Error(), tc.field) {
-				t.Fatalf("ошибка не называет поле %s: %v", tc.field, err)
+				t.Fatalf("the error does not mention the field %s: %v", tc.field, err)
 			}
 		})
 	}
@@ -271,14 +271,14 @@ func TestOptionsValidate(t *testing.T) {
 	low.MemoryThreshold = 1 << 20
 	err := low.validate()
 	if err == nil || !strings.Contains(err.Error(),
-		"memory_threshold: ожидается 0 (отключено) или 268435456..17179869184 байт, задано 1048576") {
-		t.Fatalf("текст ошибки порога памяти: %v", err)
+		"memory_threshold: 0 (disabled) or 268435456..17179869184 bytes expected, got 1048576") {
+		t.Fatalf("the memory threshold error text: %v", err)
 	}
 	// 0 — the memory control is off (the remote mode and small
 	// machines), not an error.
 	off := Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}
 	if err := off.validate(); err != nil {
-		t.Fatalf("нулевой порог памяти должен быть допустим: %v", err)
+		t.Fatalf("a zero memory threshold must be allowed: %v", err)
 	}
 }
 
@@ -291,7 +291,7 @@ func TestValidateTaskURL(t *testing.T) {
 		"https://spa.example:8443/",
 	} {
 		if err := validateTaskURL(u); err != nil {
-			t.Errorf("%s: неожиданная ошибка: %v", u, err)
+			t.Errorf("%s: an unexpected error: %v", u, err)
 		}
 	}
 	for _, u := range []string{
@@ -301,11 +301,11 @@ func TestValidateTaskURL(t *testing.T) {
 	} {
 		err := validateTaskURL(u)
 		if err == nil {
-			t.Errorf("%s: ожидалась ошибка схемы", u)
+			t.Errorf("%s: a scheme error was expected", u)
 			continue
 		}
 		if ClassOf(err) != ClassTask {
-			t.Errorf("%s: класс %v, хочу task (повторная доставка уровня очереди)", u, ClassOf(err))
+			t.Errorf("%s: the class %v, want task (a queue-level redelivery)", u, ClassOf(err))
 		}
 	}
 }
@@ -340,11 +340,11 @@ func TestSessionRunBlocksInternalTaskURL(t *testing.T) {
 		s := newSession(Options{Timeout: time.Second, BlockInternalAddrs: true})
 		_, err := s.Run(context.Background(), RenderTask{URL: u})
 		if err == nil {
-			t.Errorf("%s: ожидался отказ задачи с внутренним хостом", u)
+			t.Errorf("%s: a task rejection with an internal host was expected", u)
 			continue
 		}
 		if ClassOf(err) != ClassTask {
-			t.Errorf("%s: класс %v, хочу task (повторная доставка уровня очереди)", u, ClassOf(err))
+			t.Errorf("%s: the class %v, want task (a queue-level redelivery)", u, ClassOf(err))
 		}
 	}
 	// External literals (TEST-NET-3, 2001:db8::/32), "numeric-like but
@@ -357,16 +357,16 @@ func TestSessionRunBlocksInternalTaskURL(t *testing.T) {
 	} {
 		s := newSession(Options{Timeout: time.Second, BlockInternalAddrs: true})
 		_, err := s.Run(context.Background(), RenderTask{URL: u})
-		if err != nil && strings.Contains(err.Error(), "внутренн") {
-			t.Errorf("%s: внешний адрес ошибочно заблокирован: %v", u, err)
+		if err != nil && strings.Contains(err.Error(), "internal") {
+			t.Errorf("%s: an external address is wrongly blocked: %v", u, err)
 		}
 	}
 	// The flag is off — an internal literal is not blocked (dev/testbed):
 	// a failure, if it happens, is about the browser, not the guard.
 	s := newSession(Options{Timeout: time.Second})
 	if _, err := s.Run(context.Background(), RenderTask{URL: "http://127.0.0.1/"}); err != nil &&
-		strings.Contains(err.Error(), "внутренн") {
-		t.Errorf("без флага внутренний адрес не блокируется: %v", err)
+		strings.Contains(err.Error(), "internal") {
+		t.Errorf("without the flag the internal address is not blocked: %v", err)
 	}
 }
 
@@ -409,7 +409,7 @@ func TestRenderHostInternal(t *testing.T) {
 	}
 	for _, tc := range cases {
 		if got := renderHostInternal(tc.host); got != tc.want {
-			t.Errorf("renderHostInternal(%q) = %v, хочу %v", tc.host, got, tc.want)
+			t.Errorf("renderHostInternal(%q) = %v, want %v", tc.host, got, tc.want)
 		}
 	}
 }
@@ -465,12 +465,12 @@ func TestWhatwgParseIPv4(t *testing.T) {
 		ip, ok := whatwgParseIPv4(tc.host)
 		if tc.want == "" {
 			if ok {
-				t.Errorf("whatwgParseIPv4(%q) = %v, хочу не-числоподобный", tc.host, ip)
+				t.Errorf("whatwgParseIPv4(%q) = %v, want non-numeric-looking", tc.host, ip)
 			}
 			continue
 		}
 		if !ok || ip.String() != tc.want {
-			t.Errorf("whatwgParseIPv4(%q) = %v %v, хочу %s", tc.host, ip, ok, tc.want)
+			t.Errorf("whatwgParseIPv4(%q) = %v %v, want %s", tc.host, ip, ok, tc.want)
 		}
 	}
 }

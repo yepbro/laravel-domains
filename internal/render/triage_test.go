@@ -47,7 +47,7 @@ func TestWhatwgIPv4Number(t *testing.T) {
 	for _, tc := range cases {
 		v, ok := whatwgIPv4Number(tc.s)
 		if ok != tc.ok || (ok && v != tc.want) {
-			t.Errorf("whatwgIPv4Number(%q) = %d %v, хочу %d %v",
+			t.Errorf("whatwgIPv4Number(%q) = %d %v, want %d %v",
 				tc.s, v, ok, tc.want, tc.ok)
 		}
 	}
@@ -62,12 +62,12 @@ func TestWhatwgIPv4Number(t *testing.T) {
 func TestValidateTaskURLInternalTriage(t *testing.T) {
 	for _, raw := range []string{"http://[::1", "http:///path", "not a url"} {
 		if err := validateTaskURLInternal(raw); err != nil {
-			t.Errorf("%q: хочу nil (схема/хост отвергнуты раньше), получено %v", raw, err)
+			t.Errorf("%q: want nil (the scheme/host are rejected earlier), got %v", raw, err)
 		}
 	}
 	err := validateTaskURLInternal("http://127.1/")
 	if err == nil || ClassOf(err) != ClassTask {
-		t.Fatalf("внутренний числоподобный хост: хочу task-ошибку, получено %v", err)
+		t.Fatalf("an internal numeric-looking host: want a task error, got %v", err)
 	}
 }
 
@@ -86,24 +86,24 @@ func TestRequestURLInternalTriage(t *testing.T) {
 	ctx := context.Background()
 
 	if requestURLInternal(ctx, "http://[::1", dns) {
-		t.Error("неразбираемый URL: хочу не-внутренний")
+		t.Error("an unparseable URL: want not-internal")
 	}
 	if requestURLInternal(ctx, "http://[2001:db8::1]/", dns) {
-		t.Error("внешний IPv6-литерал: хочу не-внутренний")
+		t.Error("an external IPv6 literal: want not-internal")
 	}
 	if requestURLInternal(ctx, "http://134744072/", dns) {
-		t.Error("внешняя числоподобная форма: хочу не-внутренний")
+		t.Error("an external numeric-looking form: want not-internal")
 	}
 	if n := len(lookup.callsOf()); n != 0 {
-		t.Fatalf("обменов резолвера %d (%v), хочу 0 — литерал не резолвится",
+		t.Fatalf("resolver exchanges %d (%v), want 0 — a literal is not resolved",
 			n, lookup.callsOf())
 	}
 
 	if requestURLInternal(ctx, "http://fallback.example.net/", dns) {
-		t.Error("имя с публичным резолвом: хочу не-внутренний")
+		t.Error("a name with a public resolution: want not-internal")
 	}
 	if n := len(lookup.callsOf()); n != 1 {
-		t.Fatalf("обменов резолвера %d, хочу 1 (имя резолвится)", n)
+		t.Fatalf("resolver exchanges %d, want 1 (the name resolves)", n)
 	}
 }
 
@@ -116,13 +116,13 @@ func TestRequestURLInternalTriage(t *testing.T) {
 func TestDNSCacheDefaultsTriage(t *testing.T) {
 	c := newDNSCache(nil)
 	if c.lookup == nil {
-		t.Fatal("нулевой шов резолва: хочу системный резолвер (lookupHostSystem)")
+		t.Fatal("a nil resolver seam: want the system resolver (lookupHostSystem)")
 	}
 	if c.now == nil {
-		t.Fatal("шов времени не установлен (хочу time.Now по умолчанию)")
+		t.Fatal("the time seam is not set (want time.Now by default)")
 	}
 	if c.timeout != 3*time.Second {
-		t.Fatalf("потолок обмена %s, хочу ровно 3с (dnsLookupTimeout)", c.timeout)
+		t.Fatalf("the exchange cap %s, want exactly 3s (dnsLookupTimeout)", c.timeout)
 	}
 
 	c2 := &dnsCache{
@@ -132,13 +132,13 @@ func TestDNSCacheDefaultsTriage(t *testing.T) {
 		timeout: time.Hour,
 	}
 	if !c2.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("первый резолв: хочу внутренний (169.254.169.254)")
+		t.Fatal("the first resolution: want internal (169.254.169.254)")
 	}
 	if !c2.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("повтор: хочу внутренний (вердикт из кэша)")
+		t.Fatal("a repeat: want internal (the verdict from the cache)")
 	}
 	if len(c2.entries) != 1 {
-		t.Fatalf("записей кэша %d, хочу 1 (вердикт закэширован)", len(c2.entries))
+		t.Fatalf("cache entries %d, want 1 (the verdict is cached)", len(c2.entries))
 	}
 }
 
@@ -163,19 +163,19 @@ func TestDNSCacheExchangeTimeoutTriage(t *testing.T) {
 	direct := newDNSCache(lookup)
 	direct.timeout = 0
 	if !direct.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("timeout=0: прямой резолв без дедлайна — хочу внутренний вердикт")
+		t.Fatal("timeout=0: a direct resolution without a deadline — want an internal verdict")
 	}
 	if len(direct.entries) != 1 {
-		t.Fatalf("timeout=0: записей %d, хочу 1 (успех кэшируется)", len(direct.entries))
+		t.Fatalf("timeout=0: entries %d, want 1 (a success is cached)", len(direct.entries))
 	}
 
 	cut := newDNSCache(lookup)
 	cut.timeout = 1 // 1 ns: a positive cap — the exchange is cut off
 	if cut.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("timeout=1ns: хочу fail-open (дедлайн обгоняет обмен)")
+		t.Fatal("timeout=1ns: want fail-open (the deadline outruns the exchange)")
 	}
 	if len(cut.entries) != 0 {
-		t.Fatalf("timeout=1ns: записей %d, хочу 0 (обрыв не кэшируется)", len(cut.entries))
+		t.Fatalf("timeout=1ns: entries %d, want 0 (a hangup is not cached)", len(cut.entries))
 	}
 }
 
@@ -197,7 +197,7 @@ func TestDNSCacheTTLBoundaryTriage(t *testing.T) {
 	c.now = func() time.Time { return now }
 
 	if !c.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("первый обмен: хочу внутренний")
+		t.Fatal("the first exchange: want internal")
 	}
 
 	// The age of 29.5 s < 30 s: the cache is fresh — the new DNS answer
@@ -205,20 +205,20 @@ func TestDNSCacheTTLBoundaryTriage(t *testing.T) {
 	addrs = []netip.Addr{netip.MustParseAddr("203.0.113.7")}
 	now = now.Add(29500 * time.Millisecond)
 	if !c.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("возраст 29,5с: хочу внутренний из кэша")
+		t.Fatal("age 29.5s: want internal from the cache")
 	}
 	if calls != 1 {
-		t.Fatalf("обменов %d, хочу 1 (свежая запись — без обмена)", calls)
+		t.Fatalf("exchanges %d, want 1 (a fresh entry — no exchange)", calls)
 	}
 
 	// The age of exactly 30 s: expired — the fresh exchange carries the
 	// external answer.
 	now = now.Add(500 * time.Millisecond)
 	if c.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("возраст 30с: хочу внешний по свежему обмену")
+		t.Fatal("age 30s: want external by the fresh exchange")
 	}
 	if calls != 2 {
-		t.Fatalf("обменов %d, хочу 2 (истёкшая запись обновляется)", calls)
+		t.Fatalf("exchanges %d, want 2 (an expired entry is refreshed)", calls)
 	}
 }
 
@@ -240,15 +240,15 @@ func TestDNSCacheCanceledNotCachedTriage(t *testing.T) {
 
 	canceled = true
 	if c.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("обрыв по отмене: хочу fail-open (не внутренний)")
+		t.Fatal("a hangup on cancellation: want fail-open (not internal)")
 	}
 	if len(c.entries) != 0 {
-		t.Fatalf("записей %d, хочу 0 (обрыв не кэшируется)", len(c.entries))
+		t.Fatalf("entries %d, want 0 (a hangup is not cached)", len(c.entries))
 	}
 
 	canceled = false
 	if !c.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("повтор после обрыва: свежий обмен — внутренний адрес")
+		t.Fatal("a repeat after the hangup: a fresh exchange — an internal address")
 	}
 }
 
@@ -261,17 +261,17 @@ func TestDNSCacheCanceledNotCachedTriage(t *testing.T) {
 func TestProbeConnTriage(t *testing.T) {
 	var nilBrowser *Browser
 	if nilBrowser.probeConn() {
-		t.Error("nil-браузер: зонд не проходит")
+		t.Error("a nil browser: the probe fails")
 	}
 
 	lost := testBrowser(1)
 	lost.lost.Store(true)
 	if lost.probeConn() {
-		t.Error("залипшая потеря соединения: зонд не проходит")
+		t.Error("a sticky connection loss: the probe fails")
 	}
 
 	if !testBrowser(1).probeConn() {
-		t.Error("браузер без chromedp-контекста (юнит-фейки): зонду нечего проверять — жив")
+		t.Error("a browser without a chromedp context (unit fakes): the probe has nothing to check — alive")
 	}
 
 	bctx, cancel := chromedp.NewContext(context.Background())
@@ -279,7 +279,7 @@ func TestProbeConnTriage(t *testing.T) {
 	withCtx := testBrowser(1)
 	withCtx.ctx = bctx
 	if !withCtx.probeConn() {
-		t.Error("контекст без браузерной сессии (Browser == nil до Run): зонд не падает")
+		t.Error("a context without a browser session (Browser == nil before Run): the probe does not fail")
 	}
 }
 
@@ -304,11 +304,11 @@ func TestBrowserRSSCacheTriage(t *testing.T) {
 	rss = 777
 	zero := &Browser{rootPID: 1234, rssPID: 1234, rss: 0, rssAt: fakeNow}
 	if got := zero.RSS(); got != 777 {
-		t.Fatalf("нулевой кэш: RSS = %d, хочу 777 (свежий снимок)", got)
+		t.Fatalf("a zero cache: RSS = %d, want 777 (a fresh snapshot)", got)
 	}
 	negative := &Browser{rootPID: 1234, rssPID: 1234, rss: -1, rssAt: fakeNow}
 	if got := negative.RSS(); got != 777 {
-		t.Fatalf("отрицательный кэш: RSS = %d, хочу 777 (свежий снимок)", got)
+		t.Fatalf("a negative cache: RSS = %d, want 777 (a fresh snapshot)", got)
 	}
 
 	// A measurement of 0 (the root disappeared) and -1 (/proc
@@ -317,19 +317,19 @@ func TestBrowserRSSCacheTriage(t *testing.T) {
 	rss = 0
 	gone := &Browser{rootPID: 4242424}
 	if got := gone.RSS(); got != 0 {
-		t.Fatalf("исчезнувший корень: RSS = %d, хочу 0", got)
+		t.Fatalf("a vanished root: RSS = %d, want 0", got)
 	}
 	if !gone.rssAt.IsZero() || gone.rssPID != 0 {
-		t.Fatalf("нулевой снимок закэширован (rssAt=%v, rssPID=%d) — кэш только положительных",
+		t.Fatalf("a zero snapshot is cached (rssAt=%v, rssPID=%d) — only positives are cached",
 			gone.rssAt, gone.rssPID)
 	}
 	rss = -1
 	noProc := &Browser{rootPID: 4242424}
 	if got := noProc.RSS(); got != -1 {
-		t.Fatalf("недоступный /proc: RSS = %d, хочу -1", got)
+		t.Fatalf("an unavailable /proc: RSS = %d, want -1", got)
 	}
 	if !noProc.rssAt.IsZero() {
-		t.Fatalf("снимок -1 закэширован (rssAt=%v) — кэш только положительных", noProc.rssAt)
+		t.Fatalf("the -1 snapshot is cached (rssAt=%v) — only positives are cached", noProc.rssAt)
 	}
 
 	// The boundary positive 1 B: written to the cache and read from it
@@ -337,10 +337,10 @@ func TestBrowserRSSCacheTriage(t *testing.T) {
 	rss = 1
 	one := &Browser{rootPID: 1234}
 	if got := one.RSS(); got != 1 {
-		t.Fatalf("первое чтение: RSS = %d, хочу 1", got)
+		t.Fatalf("the first read: RSS = %d, want 1", got)
 	}
 	rss = 2
 	if got := one.RSS(); got != 1 {
-		t.Fatalf("второе чтение: RSS = %d, хочу 1 из кэша", got)
+		t.Fatalf("the second read: RSS = %d, want 1 from the cache", got)
 	}
 }

@@ -326,7 +326,7 @@ func DispatchBatch(ctx context.Context, pool db.DB, q DispatchQuery) ([]Dispatch
 func dispatchActiveZones(ctx context.Context, pool db.DB) ([]*dispatchZone, error) {
 	rows, err := pool.Query(ctx, dispatchZonesSQL)
 	if err != nil {
-		return nil, fmt.Errorf("scheduler: выборка пачки доменов: активные зоны: %w", err)
+		return nil, fmt.Errorf("scheduler: domain batch selection: active zones: %w", err)
 	}
 	defer rows.Close()
 
@@ -334,12 +334,12 @@ func dispatchActiveZones(ctx context.Context, pool db.DB) ([]*dispatchZone, erro
 	for rows.Next() {
 		var z dispatchZone
 		if err := rows.Scan(&z.id, &z.name); err != nil {
-			return nil, fmt.Errorf("scheduler: выборка пачки доменов: активные зоны: чтение: %w", err)
+			return nil, fmt.Errorf("scheduler: domain batch selection: active zones: read: %w", err)
 		}
 		zones = append(zones, &z)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scheduler: выборка пачки доменов: активные зоны: %w", err)
+		return nil, fmt.Errorf("scheduler: domain batch selection: active zones: %w", err)
 	}
 	return zones, nil
 }
@@ -365,7 +365,7 @@ func ResolveZoneWeights(ctx context.Context, pool db.DB, byName map[string]int) 
 	}
 	rows, err := pool.Query(ctx, resolveZoneWeightsSQL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("scheduler: веса зон: справочник зон: %w", err)
+		return nil, nil, fmt.Errorf("scheduler: zone weights: zone reference table: %w", err)
 	}
 	defer rows.Close()
 
@@ -378,7 +378,7 @@ func ResolveZoneWeights(ctx context.Context, pool db.DB, byName map[string]int) 
 		var id int16
 		var name string
 		if err := rows.Scan(&id, &name); err != nil {
-			return nil, nil, fmt.Errorf("scheduler: веса зон: справочник зон: чтение: %w", err)
+			return nil, nil, fmt.Errorf("scheduler: zone weights: zone reference table: read: %w", err)
 		}
 		if w, ok := rest[name]; ok {
 			weights[id] = w
@@ -386,7 +386,7 @@ func ResolveZoneWeights(ctx context.Context, pool db.DB, byName map[string]int) 
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("scheduler: веса зон: справочник зон: %w", err)
+		return nil, nil, fmt.Errorf("scheduler: zone weights: zone reference table: %w", err)
 	}
 	// Equivalent mutant (T-M05): unknown = nil instead of an empty slice —
 	// when rest has no names; the caller (cmd/scheduler) reads only len and
@@ -407,7 +407,7 @@ func ResolveZoneWeights(ctx context.Context, pool db.DB, byName map[string]int) 
 func dispatchPickZones(ctx context.Context, pool db.DB, zoneIDs, afters []any, limit int) (map[int16][]dispatchPick, error) {
 	rows, err := pool.Query(ctx, dispatchZoneSQL, zoneIDs, afters, limit)
 	if err != nil {
-		return nil, fmt.Errorf("scheduler: выборка пачки доменов: %w", err)
+		return nil, fmt.Errorf("scheduler: domain batch selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -415,12 +415,12 @@ func dispatchPickZones(ctx context.Context, pool db.DB, zoneIDs, afters []any, l
 	for rows.Next() {
 		var p dispatchPick
 		if err := rows.Scan(&p.zoneID, &p.domainID, &p.label); err != nil {
-			return nil, fmt.Errorf("scheduler: выборка пачки доменов: чтение строки: %w", err)
+			return nil, fmt.Errorf("scheduler: domain batch selection: row read: %w", err)
 		}
 		picked[p.zoneID] = append(picked[p.zoneID], p)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scheduler: выборка пачки доменов: %w", err)
+		return nil, fmt.Errorf("scheduler: domain batch selection: %w", err)
 	}
 	for z := range picked {
 		ps := picked[z]
@@ -506,11 +506,11 @@ func dispatchMerge(zones []*dispatchZone, weights map[int16]int, limit int) []di
 // query does not spend a connection.
 func (q DispatchQuery) dispatchValidate() error {
 	if q.Limit < 1 {
-		return fmt.Errorf("scheduler: выборка пачки: Limit = %d, ожидается ≥ 1 (scheduler.batch_size, ТЗ 5.3)", q.Limit)
+		return fmt.Errorf("scheduler: batch selection: Limit = %d, expected ≥ 1 (scheduler.batch_size, spec 5.3)", q.Limit)
 	}
 	for zoneID, w := range q.ZoneWeights {
 		if w < 1 {
-			return fmt.Errorf("scheduler: выборка пачки: вес зоны %d = %d, ожидается ≥ 1", zoneID, w)
+			return fmt.Errorf("scheduler: batch selection: zone %d weight = %d, expected ≥ 1", zoneID, w)
 		}
 	}
 	return nil

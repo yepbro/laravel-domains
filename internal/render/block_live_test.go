@@ -178,7 +178,7 @@ probeSync('sync-xhr', 'http://c.clarity.ms:`+"%[1]d"+`/clarity-sync-probe');
 		c.clarityProbe.Add(1)
 		w.Header().Set("Content-Type", "text/javascript")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		_, _ = fmt.Fprint(w, "// зонд clarity.ms")
+		_, _ = fmt.Fprint(w, "// clarity.ms probe")
 	}
 	mux.HandleFunc("/clarity-probe", clarityProbe)
 	// A separate endpoint of the sync probe: the claritySync counter must differ
@@ -188,7 +188,7 @@ probeSync('sync-xhr', 'http://c.clarity.ms:`+"%[1]d"+`/clarity-sync-probe');
 		c.claritySync.Add(1)
 		w.Header().Set("Content-Type", "text/javascript")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		_, _ = fmt.Fprint(w, "// sync-зонд clarity.ms (движко-ветвленный кейс)")
+		_, _ = fmt.Fprint(w, "// sync probe clarity.ms (the engine-branched case)")
 	})
 	mux.HandleFunc("/mc-probe", func(w http.ResponseWriter, _ *http.Request) {
 		c.mcProbe.Add(1)
@@ -199,7 +199,7 @@ probeSync('sync-xhr', 'http://c.clarity.ms:`+"%[1]d"+`/clarity-sync-probe');
 	mux.HandleFunc("/js/google-analytics.com.js", func(w http.ResponseWriter, _ *http.Request) {
 		c.trackerTrap.Add(1)
 		w.Header().Set("Content-Type", "text/javascript")
-		_, _ = fmt.Fprint(w, "// имя трекер-домена в пути, хост — тестовый сервер")
+		_, _ = fmt.Fprint(w, "// a tracker domain name in the path, the host is the test server")
 	})
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
@@ -259,7 +259,7 @@ func blockLiveWaitReady(t *testing.T, c *blockLiveCounters) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("ресурсы, обязанные дойти, не запрошены за 10 с: page=%d js=%d xhr=%d",
+	t.Fatalf("the resources bound to get through were not requested in 10 s: page=%d js=%d xhr=%d",
 		c.page.Load(), c.js.Load(), c.xhr.Load())
 }
 
@@ -272,33 +272,33 @@ func TestBlockLiveResources(t *testing.T) {
 
 	out := blockLiveRun(t, liveOptions(), pageURL)
 	if out.FinalURL != pageURL {
-		t.Errorf("final URL %q, хочу %q", out.FinalURL, pageURL)
+		t.Errorf("final URL %q, want %q", out.FinalURL, pageURL)
 	}
 
 	blockLiveWaitReady(t, c)
 	if got := c.page.Load(); got < 1 {
-		t.Errorf("страница запрошена %d раз, хочу >= 1", got)
+		t.Errorf("the page was requested %d times, want >= 1", got)
 	}
 	if got := c.css.Load(); got < 1 {
-		t.Errorf("CSS запрошен %d раз, хочу >= 1 (не блокируется)", got)
+		t.Errorf("CSS was requested %d times, want >= 1 (not blocked)", got)
 	}
 	if got := c.js.Load(); got < 1 {
-		t.Errorf("скрипт запрошен %d раз, хочу >= 1 (не блокируется)", got)
+		t.Errorf("the script was requested %d times, want >= 1 (not blocked)", got)
 	}
 	if got := c.xhr.Load(); got < 1 {
-		t.Errorf("XHR запрошен %d раз, хочу >= 1 (JS обязан работать)", got)
+		t.Errorf("XHR was requested %d times, want >= 1 (JS must work)", got)
 	}
 	if got := c.img.Load(); got != 0 {
-		t.Errorf("картинка запрошена %d раз, хочу 0 (заблокирована, ТЗ 5.6)", got)
+		t.Errorf("the image was requested %d times, want 0 (blocked, spec 5.6)", got)
 	}
 	if got := c.font.Load(); got != 0 {
-		t.Errorf("шрифт запрошен %d раз, хочу 0 (заблокирован, ТЗ 5.6)", got)
+		t.Errorf("the font was requested %d times, want 0 (blocked, spec 5.6)", got)
 	}
 	// A favicon initiated by the browser (not the page) may arrive as the
 	// Other type and pass — the pinned decision (see blockBlockedTypes).
 	// In headless-shell there are usually no such requests; the counter is for
 	// diagnostics only.
-	t.Logf("favicon.ico запрошен %d раз (тип Other не блокируется)",
+	t.Logf("favicon.ico was requested %d times (the Other type is not blocked)",
 		c.favicon.Load())
 }
 
@@ -315,27 +315,27 @@ func TestBlockLiveStylesheetBlocked(t *testing.T) {
 	opts.BlockStylesheet = true
 	out := blockLiveRun(t, opts, pageURL)
 	if out.FinalURL != pageURL {
-		t.Errorf("final URL %q, хочу %q", out.FinalURL, pageURL)
+		t.Errorf("final URL %q, want %q", out.FinalURL, pageURL)
 	}
 
 	blockLiveWaitReady(t, c)
 	if got := c.page.Load(); got < 1 {
-		t.Errorf("страница запрошена %d раз, хочу >= 1", got)
+		t.Errorf("the page was requested %d times, want >= 1", got)
 	}
 	if got := c.css.Load(); got != 0 {
-		t.Errorf("CSS запрошен %d раз, хочу 0 (заблокирован опцией, T-213)", got)
+		t.Errorf("CSS was requested %d times, want 0 (blocked by the option, T-213)", got)
 	}
 	if got := c.js.Load(); got < 1 {
-		t.Errorf("скрипт запрошен %d раз, хочу >= 1 (не блокируется)", got)
+		t.Errorf("the script was requested %d times, want >= 1 (not blocked)", got)
 	}
 	if got := c.xhr.Load(); got < 1 {
-		t.Errorf("XHR запрошен %d раз, хочу >= 1 (JS обязан работать)", got)
+		t.Errorf("XHR was requested %d times, want >= 1 (JS must work)", got)
 	}
 	if got := c.img.Load(); got != 0 {
-		t.Errorf("картинка запрошена %d раз, хочу 0 (заблокирована, ТЗ 5.6)", got)
+		t.Errorf("the image was requested %d times, want 0 (blocked, spec 5.6)", got)
 	}
 	if got := c.font.Load(); got != 0 {
-		t.Errorf("шрифт запрошен %d раз, хочу 0 (заблокирован, ТЗ 5.6)", got)
+		t.Errorf("the font was requested %d times, want 0 (blocked, spec 5.6)", got)
 	}
 }
 
@@ -406,25 +406,25 @@ func blockLiveTrackerDomains(t *testing.T, opts Options) {
 	offURL := strings.TrimSuffix(offPage, "page.html") + "tracker.html"
 	offOut := blockLiveRun(t, opts, offURL)
 	if got := cOff.clarityProbe.Load(); got < 1 {
-		t.Fatalf("контроль: зонд clarity.ms не дошёл до сервера (%d; атрибут clarity-xhr %q, mc-xhr %q) — "+
-			"проверьте флаг --use-aliases у compose run и DNS-алиасы сервиса tools (T-214)",
+		t.Fatalf("control: the clarity.ms probe did not reach the server (%d; the clarity-xhr attribute %q, mc-xhr %q) — "+
+			"check the --use-aliases flag of compose run and the tools service DNS aliases (T-214)",
 			got, domAttr(offOut.DOM, "clarity-xhr"), domAttr(offOut.DOM, "mc-xhr"))
 	}
 	if got := cOff.mcProbe.Load(); got < 1 {
-		t.Fatalf("контроль: зонд mc.yandex.ru не дошёл до сервера (%d) — "+
-			"проверьте флаг --use-aliases у compose run и DNS-алиасы сервиса tools (T-214)", got)
+		t.Fatalf("control: the mc.yandex.ru probe did not reach the server (%d) — "+
+			"check the --use-aliases flag of compose run and the tools service DNS aliases (T-214)", got)
 	}
 	if attr := domAttr(offOut.DOM, "clarity-xhr"); attr != "loaded 200" {
-		t.Errorf("контроль: clarity-xhr %q, хочу loaded 200 (блокировки нет)", attr)
+		t.Errorf("control: clarity-xhr %q, want loaded 200 (no blocking)", attr)
 	}
 	if attr := domAttr(offOut.DOM, "mc-xhr"); attr != "loaded 200" {
-		t.Errorf("контроль: mc-xhr %q, хочу loaded 200 (блокировки нет)", attr)
+		t.Errorf("control: mc-xhr %q, want loaded 200 (no blocking)", attr)
 	}
 	// The control sync probe reaches the server and is read on both engines: without
 	// the blocking enabled the #2728 divergence does not manifest — the branching
 	// per engine is needed only in the working run below.
 	if attr := domAttr(offOut.DOM, "sync-xhr"); attr != "loaded 200" {
-		t.Errorf("контроль: sync-xhr %q, хочу loaded 200 (блокировки нет)", attr)
+		t.Errorf("control: sync-xhr %q, want loaded 200 (no blocking)", attr)
 	}
 
 	// The working run: the option is on.
@@ -434,7 +434,7 @@ func blockLiveTrackerDomains(t *testing.T, opts Options) {
 	onOpts.BlockTrackerDomains = true
 	onOut := blockLiveRun(t, onOpts, onURL)
 	if onOut.FinalURL != onURL {
-		t.Errorf("final URL %q, хочу %q", onOut.FinalURL, onURL)
+		t.Errorf("final URL %q, want %q", onOut.FinalURL, onURL)
 	}
 
 	// The must-arrive ones: the page and its own script (JS alive, the site's own
@@ -446,33 +446,33 @@ func blockLiveTrackerDomains(t *testing.T, opts Options) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if got := cOn.page.Load(); got < 1 {
-		t.Fatalf("страница не запрошена за 10 с — тест страницы T-214 не выполнился")
+		t.Fatalf("the page was not requested in 10 s — the T-214 page test did not run")
 	}
 	if got := cOn.trackerJS.Load(); got < 1 {
-		t.Fatalf("собственный скрипт не запрошен за 10 с (блокировка не должна трогать свой домен)")
+		t.Fatalf("the own script was not requested in 10 s (the blocking must not touch its own domain)")
 	}
 
 	// The trackers are cut off before sending: the counters are zero and the attributes are an error.
 	if got := cOn.clarityProbe.Load(); got != 0 {
-		t.Errorf("зонд clarity.ms дошёл до сервера %d раз, хочу 0 (заблокирован, T-214)", got)
+		t.Errorf("the clarity.ms probe reached the server %d times, want 0 (blocked, T-214)", got)
 	}
 	if got := cOn.mcProbe.Load(); got != 0 {
-		t.Errorf("зонд mc.yandex.ru дошёл до сервера %d раз, хочу 0 (заблокирован, T-214)", got)
+		t.Errorf("the mc.yandex.ru probe reached the server %d times, want 0 (blocked, T-214)", got)
 	}
 	if attr := domAttr(onOut.DOM, "clarity-xhr"); attr != "error" {
-		t.Errorf("clarity-xhr %q, хочу error (заблокирован)", attr)
+		t.Errorf("clarity-xhr %q, want error (blocked)", attr)
 	}
 	if attr := domAttr(onOut.DOM, "mc-xhr"); attr != "error" {
-		t.Errorf("mc-xhr %q, хочу error (заблокирован)", attr)
+		t.Errorf("mc-xhr %q, want error (blocked)", attr)
 	}
 
 	// A false positive: the path contains a tracker domain, the host is our
 	// server; the request must arrive (the counter) and be read (200).
 	if got := cOn.trackerTrap.Load(); got != 1 {
-		t.Errorf("запросов к /js/google-analytics.com.js: %d, хочу 1 (хост не трекер — проходит)", got)
+		t.Errorf("requests to /js/google-analytics.com.js: %d, want 1 (the host is not a tracker — it passes)", got)
 	}
 	if attr := domAttr(onOut.DOM, "path-trap"); attr != "loaded 200" {
-		t.Errorf("path-trap %q, хочу loaded 200 (хост не трекер — проходит)", attr)
+		t.Errorf("path-trap %q, want loaded 200 (the host is not a tracker — it passes)", attr)
 	}
 
 	// The sync XHR probe — an engine-branched case (T-275): under the
@@ -492,11 +492,11 @@ func blockLiveTrackerDomains(t *testing.T, opts Options) {
 	switch opts.Engine {
 	case config.EngineMoli:
 		if got := cOn.claritySync.Load(); got < 1 {
-			t.Errorf("sync-зонд clarity.ms не дошёл до сервера %d раз, хочу >= 1 "+
-				"(moli: sync-XHR не блокируется, расхождение #2728)", got)
+			t.Errorf("the sync probe clarity.ms did not reach the server %d times, want >= 1 "+
+				"(moli: sync-XHR is not blocked, discrepancy #2728)", got)
 		}
 		if attr := domAttr(onOut.DOM, "sync-xhr"); attr != "loaded 200" {
-			t.Errorf("sync-xhr %q, хочу loaded 200 (moli: sync-XHR уходит в сеть, #2728)", attr)
+			t.Errorf("sync-xhr %q, want loaded 200 (moli: sync-XHR goes to the network, #2728)", attr)
 		}
 	case "", config.EngineChromium:
 		// The %q engine in the hint — diagnostics of a single-test run with
@@ -505,14 +505,14 @@ func blockLiveTrackerDomains(t *testing.T, opts Options) {
 		// a blocking failure. moli — only via the per-engine slice
 		// (MOLI_WS_URL, EnginesLive).
 		if got := cOn.claritySync.Load(); got != 0 {
-			t.Errorf("sync-зонд clarity.ms дошёл до сервера %d раз, хочу 0 (заблокирован; движок %q — для moli sync-XHR не блокируется, используйте per-engine срез MOLI_WS_URL)",
+			t.Errorf("sync-the clarity.ms probe reached the server %d times, want 0 (blocked; the engine %q — for moli sync-XHR is not blocked, use the per-engine slice MOLI_WS_URL)",
 				got, opts.Engine)
 		}
 		if attr := domAttr(onOut.DOM, "sync-xhr"); attr != "error" {
-			t.Errorf("sync-xhr %q, хочу error (заблокирован; движок %q — для moli sync-XHR не блокируется, используйте per-engine срез MOLI_WS_URL)",
+			t.Errorf("sync-xhr %q, want error (blocked; the engine %q — for moli sync-XHR is not blocked, use the per-engine slice MOLI_WS_URL)",
 				attr, opts.Engine)
 		}
 	default:
-		t.Skipf("поведение sync-XHR под перехватом для движка %q не задокументировано — ассерт только для chromium/moli (#2728)", opts.Engine)
+		t.Skipf("the sync-XHR behavior under interception is not documented for the engine %q — the assert is only for chromium/moli (#2728)", opts.Engine)
 	}
 }

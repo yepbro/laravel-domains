@@ -81,11 +81,11 @@ type staleFakePool struct {
 }
 
 func (p *staleFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *staleFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("Exec must not be called")
 }
 
 // Query — the guard read of the new_done_stale level: the pass's only SELECT
@@ -95,7 +95,7 @@ func (p *staleFakePool) Query(_ context.Context, sql string, args ...any) (pgx.R
 	defer p.mu.Unlock()
 	p.guardQueries = append(p.guardQueries, retryCall{sql: sql, args: args})
 	if sql != staleRequeueGuardSQL {
-		return nil, errStaleUnexpected("пул", sql)
+		return nil, errStaleUnexpected("pool", sql)
 	}
 	if len(p.guardErrs) > 0 {
 		err := p.guardErrs[0]
@@ -133,7 +133,7 @@ func (p *staleFakePool) nextErrLocked(queue *[]error) error {
 }
 
 func errStaleUnexpected(where, sql string) error {
-	return errors.New("staleFakePool: неожидаемый SQL через " + where + ": " + sql)
+	return errors.New("staleFakePool: unexpected SQL via " + where + ": " + sql)
 }
 
 // snapshots of the protocol under the lock (waiting for loop progress in tests).
@@ -194,7 +194,7 @@ func (t *staleFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.C
 		}
 		return pgconn.NewCommandTag("SET"), nil
 	default:
-		return pgconn.CommandTag{}, errStaleUnexpected("Exec транзакции", sql)
+		return pgconn.CommandTag{}, errStaleUnexpected("the transaction's Exec", sql)
 	}
 }
 
@@ -227,7 +227,7 @@ func (t *staleFakeTx) Query(_ context.Context, sql string, args ...any) (pgx.Row
 		}
 		return retryRows(), nil
 	default:
-		return nil, errStaleUnexpected("Query транзакции", sql)
+		return nil, errStaleUnexpected("the transaction's Query", sql)
 	}
 }
 
@@ -294,32 +294,32 @@ func TestStaleRequeueOnceSQL(t *testing.T) {
 
 	want := []string{"begin", "plan", "plan", "plan", "select", "commit", "begin", "update", "commit"}
 	if got := pool.opsSnapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("порядок операций = %v, want %v — выборка и перевод раздельными транзакциями", got, want)
+		t.Fatalf("the operation order = %v, want %v — selection and the move in separate transactions", got, want)
 	}
 
 	guards := pool.guardQueries
 	if len(guards) != 1 || guards[0].sql != wantStaleRequeueGuard || len(guards[0].args) != 0 {
-		t.Errorf("guard-чтение = %+v, want SQL уровня new_done_stale без аргументов", guards)
+		t.Errorf("the guard read = %+v, want the new_done_stale level SQL without arguments", guards)
 	}
 
 	sels := pool.selectSnapshot()
 	if len(sels) != 1 {
-		t.Fatalf("SELECT-вызовов пачки = %d, want 1", len(sels))
+		t.Fatalf("the batch's SELECT calls = %d, want 1", len(sels))
 	}
 	if sels[0].sql != wantStaleRequeueSelect {
-		t.Errorf("SQL выборки:\n%s\nwant:\n%s", sels[0].sql, wantStaleRequeueSelect)
+		t.Errorf("selection SQL:\n%s\nwant:\n%s", sels[0].sql, wantStaleRequeueSelect)
 	}
 	cutoff := staleNow.Add(-StaleRequeueWindow)
 	if len(sels[0].args) != 2 || !sels[0].args[0].(time.Time).Equal(cutoff) || sels[0].args[1] != 7000 {
-		t.Errorf("аргументы выборки = %v, want [порог %v, LIMIT 7000]", sels[0].args, cutoff)
+		t.Errorf("selection args = %v, want [threshold %v, LIMIT 7000]", sels[0].args, cutoff)
 	}
 
 	upds := pool.updateSnapshot()
 	if len(upds) != 1 {
-		t.Fatalf("UPDATE-вызовов перевода = %d, want 1", len(upds))
+		t.Fatalf("the move's UPDATE calls = %d, want 1", len(upds))
 	}
 	if upds[0].sql != wantStaleRequeueUpdate {
-		t.Errorf("SQL перевода:\n%s\nwant:\n%s", upds[0].sql, wantStaleRequeueUpdate)
+		t.Errorf("move SQL:\n%s\nwant:\n%s", upds[0].sql, wantStaleRequeueUpdate)
 	}
 	wantUpdArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
@@ -328,12 +328,12 @@ func TestStaleRequeueOnceSQL(t *testing.T) {
 		cutoff,                         // the threshold — the same as the selection's
 	}
 	if !reflect.DeepEqual(upds[0].args, wantUpdArgs) {
-		t.Errorf("аргументы перевода = %v, want %v", upds[0].args, wantUpdArgs)
+		t.Errorf("move args = %v, want %v", upds[0].args, wantUpdArgs)
 	}
 
 	// Counting by RETURNING: 2 of the selected 3 moved (the guard filtered out one).
 	if res.Domains != 2 || res.Selected != 3 {
-		t.Errorf("итог = %+v, want Domains=2 (RETURNING), Selected=3", res)
+		t.Errorf("result = %+v, want Domains=2 (RETURNING), Selected=3", res)
 	}
 
 	// The plan pinning — only in the selection transaction, by three SET LOCALs
@@ -342,7 +342,7 @@ func TestStaleRequeueOnceSQL(t *testing.T) {
 		plans[0].sql != staleRequeuePlanNoIndexScanSQL ||
 		plans[1].sql != staleRequeuePlanNoBitmapScanSQL ||
 		plans[2].sql != staleRequeuePlanNoIOSQL {
-		t.Errorf("закрепление плана = %v, want SET LOCAL ×3 до SELECT", plans)
+		t.Errorf("the plan pinning = %v, want SET LOCAL ×3 before the SELECT", plans)
 	}
 }
 
@@ -350,7 +350,7 @@ func TestStaleRequeueOnceSQL(t *testing.T) {
 // window (FR-2.2); the selection parameter is now() − 24 h from the pass's time source.
 func TestStaleRequeueOnceWindow(t *testing.T) {
 	if StaleRequeueWindow != 24*time.Hour {
-		t.Fatalf("StaleRequeueWindow = %v, want 24 ч (окно gauge new_done_stale)", StaleRequeueWindow)
+		t.Fatalf("StaleRequeueWindow = %v, want 24 h (the new_done_stale gauge window)", StaleRequeueWindow)
 	}
 	sel, upd := staleSeedBatch([][2]int64{{1, 1}}, 1)
 	pool := &staleFakePool{guardVal: 1, selects: []*retryFakeRows{sel}, updates: []*retryFakeRows{upd}}
@@ -361,10 +361,10 @@ func TestStaleRequeueOnceWindow(t *testing.T) {
 	}
 	sels := pool.selectSnapshot()
 	if len(sels) != 1 {
-		t.Fatalf("SELECT-вызовов = %d, want 1", len(sels))
+		t.Fatalf("SELECT calls = %d, want 1", len(sels))
 	}
 	if got := sels[0].args[0].(time.Time); !got.Equal(staleNow.Add(-24 * time.Hour)) {
-		t.Errorf("порог выборки = %v, want %v (now − 24 ч)", got, staleNow.Add(-24*time.Hour))
+		t.Errorf("the selection threshold = %v, want %v (now − 24 h)", got, staleNow.Add(-24*time.Hour))
 	}
 }
 
@@ -379,14 +379,14 @@ func TestStaleRequeueOnceGuardClosed(t *testing.T) {
 		t.Fatalf("StaleRequeueOnce: %v", err)
 	}
 	if res != (StaleRequeueResult{}) {
-		t.Errorf("итог = %+v, want нулевой", res)
+		t.Errorf("result = %+v, want zero", res)
 	}
 	st := pool.stats()
 	if st.begins != 0 || st.selects != 0 || st.commits != 0 {
-		t.Fatalf("операции = %+v, want ноль транзакций — guard закрыт, domains не тронут", st)
+		t.Fatalf("operations = %+v, want zero transactions — the guard is closed, domains untouched", st)
 	}
 	if st.guards != 1 {
-		t.Errorf("guard-чтений = %d, want 1 (одна дешёвая проба)", st.guards)
+		t.Errorf("guard reads = %d, want 1 (one cheap probe)", st.guards)
 	}
 }
 
@@ -401,11 +401,11 @@ func TestStaleRequeueOnceEmptyBatch(t *testing.T) {
 		t.Fatalf("StaleRequeueOnce: %v", err)
 	}
 	if res != (StaleRequeueResult{}) {
-		t.Errorf("итог = %+v, want нулевой", res)
+		t.Errorf("result = %+v, want zero", res)
 	}
 	want := []string{"begin", "plan", "plan", "plan", "select", "commit"}
 	if got := pool.opsSnapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("порядок операций = %v, want %v — пустая пачка без перевода", got, want)
+		t.Fatalf("the operation order = %v, want %v — an empty batch without a move", got, want)
 	}
 }
 
@@ -423,13 +423,13 @@ func TestStaleRequeueOnceIdempotent(t *testing.T) {
 	}
 	second, err := StaleRequeueOnce(context.Background(), pool, StaleRequeueOptions{Metrics: reg})
 	if err != nil {
-		t.Fatalf("повторный StaleRequeueOnce: %v", err)
+		t.Fatalf("a repeated StaleRequeueOnce: %v", err)
 	}
 	if first.Domains != 2 || second.Domains != 0 {
-		t.Fatalf("проходы = %+v, %+v; want Domains 2, 0 (идемпотентность)", first, second)
+		t.Fatalf("passes = %+v, %+v; want Domains 2, 0 (idempotence)", first, second)
 	}
 	if got := staleRequeuedValue(t, reg); got != 2 {
-		t.Errorf("счётчик после повторного прохода = %v, want 2 (пустой проход не считается)", got)
+		t.Errorf("the counter after the repeated pass = %v, want 2 (an empty pass does not count)", got)
 	}
 }
 
@@ -443,13 +443,13 @@ func TestStaleRequeueOnceDefaults(t *testing.T) {
 	}
 	sels := pool.selectSnapshot()
 	if len(sels) != 1 || sels[0].args[1] != DefaultStaleRequeueBatch {
-		t.Fatalf("LIMIT = %v, want дефолт %d", sels, DefaultStaleRequeueBatch)
+		t.Fatalf("LIMIT = %v, want the default %d", sels, DefaultStaleRequeueBatch)
 	}
 	if DefaultStaleRequeueBatch != 1000 {
-		t.Errorf("DefaultStaleRequeueBatch = %d, want 1000 (задача T-270)", DefaultStaleRequeueBatch)
+		t.Errorf("DefaultStaleRequeueBatch = %d, want 1000 (the T-270 task)", DefaultStaleRequeueBatch)
 	}
 	if DefaultStaleRequeueInterval != time.Hour {
-		t.Errorf("DefaultStaleRequeueInterval = %v, want 1 ч (задача T-270)", DefaultStaleRequeueInterval)
+		t.Errorf("DefaultStaleRequeueInterval = %v, want 1 h (the T-270 task)", DefaultStaleRequeueInterval)
 	}
 }
 
@@ -459,52 +459,52 @@ func TestStaleRequeueOnceDefaults(t *testing.T) {
 func TestStaleRequeueOnceError(t *testing.T) {
 	ctx := context.Background()
 
-	guardPool := &staleFakePool{guardErrs: []error{errors.New("бд недоступна")}}
+	guardPool := &staleFakePool{guardErrs: []error{errors.New("db unavailable")}}
 	if _, err := StaleRequeueOnce(ctx, guardPool, StaleRequeueOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "компенсатор «статус повис»") ||
-		!strings.Contains(err.Error(), "бд недоступна") {
-		t.Errorf("ошибка guard = %v, want контекст компенсатора и исходная ошибка", err)
+		!strings.Contains(err.Error(), "stuck-status compensator") ||
+		!strings.Contains(err.Error(), "db unavailable") {
+		t.Errorf("the guard error = %v, want the compensator context and the original error", err)
 	}
 
 	emptyPool := &staleFakePool{guardEmpty: true}
 	if _, err := StaleRequeueOnce(ctx, emptyPool, StaleRequeueOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пустой ответ агрегата") {
-		t.Errorf("ошибка guard-протокола = %v, want обрыв протокола", err)
+		!strings.Contains(err.Error(), "empty aggregate response") {
+		t.Errorf("the guard protocol error = %v, want a protocol break", err)
 	}
 
-	planPool := &staleFakePool{guardVal: 1, planErr: errors.New("set local отклонён")}
+	planPool := &staleFakePool{guardVal: 1, planErr: errors.New("set local rejected")}
 	if _, err := StaleRequeueOnce(ctx, planPool, StaleRequeueOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "закрепление плана") {
-		t.Errorf("ошибка закрепления = %v, want контекст закрепления", err)
+		!strings.Contains(err.Error(), "plan pinning") {
+		t.Errorf("the pinning error = %v, want the pinning context", err)
 	}
 
 	selectPool := &staleFakePool{guardVal: 1, selectErrs: []error{context.Canceled}}
 	if _, err := StaleRequeueOnce(ctx, selectPool, StaleRequeueOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка выборки = %v, want context.Canceled", err)
+		t.Errorf("the selection error = %v, want context.Canceled", err)
 	}
 
 	sel, _ := staleSeedBatch([][2]int64{{1, 1}}, 1)
-	updatePool := &staleFakePool{guardVal: 1, selects: []*retryFakeRows{sel}, updateErrs: []error{errors.New("deadlock и не только")}}
+	updatePool := &staleFakePool{guardVal: 1, selects: []*retryFakeRows{sel}, updateErrs: []error{errors.New("deadlock and more")}}
 	if _, err := StaleRequeueOnce(ctx, updatePool, StaleRequeueOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "перевод пачки") {
-		t.Errorf("ошибка перевода = %v, want контекст перевода", err)
+		!strings.Contains(err.Error(), "batch move") {
+		t.Errorf("the move error = %v, want the move context", err)
 	}
 
 	commitPool := &staleFakePool{guardVal: 1, commitErrs: []error{errors.New("connection refused")}}
 	if _, err := StaleRequeueOnce(ctx, commitPool, StaleRequeueOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "фиксация выборки") {
-		t.Errorf("ошибка Commit выборки = %v, want контекст фиксации", err)
+		!strings.Contains(err.Error(), "selection commit") {
+		t.Errorf("the selection Commit error = %v, want the commit context", err)
 	}
 
-	beginPool := &staleFakePool{guardVal: 1, beginErr: errors.New("нет соединений")}
+	beginPool := &staleFakePool{guardVal: 1, beginErr: errors.New("no connections")}
 	if _, err := StaleRequeueOnce(ctx, beginPool, StaleRequeueOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "транзакция выборки") {
-		t.Errorf("ошибка Begin = %v, want контекст транзакции", err)
+		!strings.Contains(err.Error(), "selection transaction") {
+		t.Errorf("the Begin error = %v, want the transaction context", err)
 	}
 
 	if _, err := StaleRequeueOnce(ctx, nil, StaleRequeueOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+		!strings.Contains(err.Error(), "pool not set") {
+		t.Errorf("err = %v, want \"pool not set\"", err)
 	}
 }
 
@@ -522,13 +522,13 @@ func TestStaleRequeueOnceDeadlockRetry(t *testing.T) {
 
 	res, err := StaleRequeueOnce(context.Background(), pool, StaleRequeueOptions{})
 	if err != nil {
-		t.Fatalf("StaleRequeueOnce после 40P01: %v", err)
+		t.Fatalf("StaleRequeueOnce after 40P01: %v", err)
 	}
 	if res.Domains != 1 {
-		t.Fatalf("итог = %+v, want Domains=1 — повтор перевёл пачку", res)
+		t.Fatalf("result = %+v, want Domains=1 — the retry moved the batch", res)
 	}
 	if got := len(pool.updateSnapshot()); got != 2 {
-		t.Errorf("UPDATE-попыток = %d, want 2 (повтор после дедлока)", got)
+		t.Errorf("UPDATE attempts = %d, want 2 (a retry after the deadlock)", got)
 	}
 }
 
@@ -544,13 +544,13 @@ func TestStaleRequeueOnceMetrics(t *testing.T) {
 		t.Fatalf("StaleRequeueOnce: %v", err)
 	}
 	if got := staleRequeuedValue(t, reg); got != 2 {
-		t.Errorf("счётчик = %v, want 2 (по RETURNING)", got)
+		t.Errorf("the counter = %v, want 2 (by RETURNING)", got)
 	}
 
 	// Without a registry (nil Metrics) and with a closed guard — a no-op; the pass runs.
 	emptyPool := &staleFakePool{guardVal: 0}
 	if _, err := StaleRequeueOnce(context.Background(), emptyPool, StaleRequeueOptions{}); err != nil {
-		t.Fatalf("StaleRequeueOnce без реестра: %v", err)
+		t.Fatalf("StaleRequeueOnce without the registry: %v", err)
 	}
 }
 
@@ -607,22 +607,22 @@ func TestStaleRequeueLoopDrain(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("дренаж не дошёл до второй пачки: %+v", st)
+			t.Fatalf("the drain did not reach the second batch: %+v", st)
 		}
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(20 * time.Millisecond)
 	if got := staleRequeuedValue(t, reg); got != 3 {
-		t.Errorf("счётчик дренажа = %v, want 3", got)
+		t.Errorf("the drain counter = %v, want 3", got)
 	}
 	// Both batches — by one starting drain: an incomplete batch stops it.
 	if got := len(pool.selectSnapshot()); got != 2 {
-		t.Errorf("SELECT-вызовов = %d, want 2 (неполная пачка останавливает)", got)
+		t.Errorf("SELECT calls = %d, want 2 (an incomplete batch stops)", got)
 	}
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("StaleRequeueLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("StaleRequeueLoop: %v, want nil on ctx cancellation", err)
 	}
 }
 
@@ -638,7 +638,7 @@ func TestStaleRequeueLoopError(t *testing.T) {
 		guardVal:  1,
 		selects:   []*retryFakeRows{sel},
 		updates:   []*retryFakeRows{upd},
-		guardErrs: []error{errors.New("бд недоступна")}, // the first pass fails
+		guardErrs: []error{errors.New("db unavailable")}, // the first pass fails
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -659,23 +659,23 @@ func TestStaleRequeueLoopError(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("очередной тик не повторил дренаж: %+v", pool.stats())
+			t.Fatalf("the next tick did not repeat the drain: %+v", pool.stats())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(30 * time.Millisecond)
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("StaleRequeueLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("StaleRequeueLoop: %v, want nil on ctx cancellation", err)
 	}
 
 	log := buf.String()
 	for _, want := range []string{
 		"level=WARN",
-		"бд недоступна",
+		"db unavailable",
 	} {
 		if !strings.Contains(log, want) {
-			t.Errorf("лог не содержит %q:\n%s", want, log)
+			t.Errorf("log does not contain %q:\n%s", want, log)
 		}
 	}
 }

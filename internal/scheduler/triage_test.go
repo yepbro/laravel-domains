@@ -63,7 +63,7 @@ func (p *triStalePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	n := p.begins
 	p.mu.Unlock()
 	if p.beginFailNth != 0 && n == p.beginFailNth {
-		return nil, errors.New("нет соединений")
+		return nil, errors.New("no connections")
 	}
 	tx, err := p.staleFakePool.Begin(ctx)
 	if err != nil {
@@ -89,7 +89,7 @@ type triStaleTx struct {
 func (t *triStaleTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	t.n++
 	if t.pool.failNthPlan != 0 && t.n == t.pool.failNthPlan {
-		return pgconn.CommandTag{}, errors.New("set local отклонён")
+		return pgconn.CommandTag{}, errors.New("set local rejected")
 	}
 	return t.staleFakeTx.Exec(ctx, sql, args...)
 }
@@ -150,7 +150,7 @@ type triRetryTx struct {
 func (t *triRetryTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	t.n++
 	if t.pool.failNthPlan != 0 && t.n == t.pool.failNthPlan {
-		return pgconn.CommandTag{}, errors.New("set local отклонён")
+		return pgconn.CommandTag{}, errors.New("set local rejected")
 	}
 	return t.retryFakeTx.Exec(ctx, sql, args...)
 }
@@ -240,14 +240,14 @@ func (p *triRecheckPool) Query(ctx context.Context, sql string, args ...any) (pg
 func TestStaleRequeueTriageDefaults(t *testing.T) {
 	o := StaleRequeueOptions{}.withDefaults()
 	if o.BatchSize != DefaultStaleRequeueBatch {
-		t.Errorf("BatchSize по умолчанию = %d, хочу %d", o.BatchSize, DefaultStaleRequeueBatch)
+		t.Errorf("the default BatchSize = %d, want %d", o.BatchSize, DefaultStaleRequeueBatch)
 	}
 	if o.Interval != DefaultStaleRequeueInterval {
-		t.Errorf("Interval по умолчанию = %s, хочу %s", o.Interval, DefaultStaleRequeueInterval)
+		t.Errorf("the default Interval = %s, want %s", o.Interval, DefaultStaleRequeueInterval)
 	}
 	o = StaleRequeueOptions{BatchSize: 1, Interval: time.Nanosecond}.withDefaults()
 	if o.BatchSize != 1 || o.Interval != time.Nanosecond {
-		t.Errorf("единичные значения заменены дефолтами: %+v (дефолт — только для ≤ 0)", o)
+		t.Errorf("unit values replaced with defaults: %+v (the default only for ≤ 0)", o)
 	}
 }
 
@@ -263,14 +263,14 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 	p := &triStalePool{staleFakePool: &staleFakePool{},
 		guardRows: retryRows([]any{int64(1), int64(2)})}
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
-		t.Error("ошибка Scan guard проглочена")
+		t.Error("the guard Scan error swallowed")
 	}
 
 	// Guard: the row is read, but the reading broke off after it.
 	p = &triStalePool{staleFakePool: &staleFakePool{},
-		guardRows: &retryFakeRows{rows: [][]any{{int64(5)}}, err: errors.New("обрыв соединения")}}
+		guardRows: &retryFakeRows{rows: [][]any{{int64(5)}}, err: errors.New("a connection drop")}}
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
-		t.Error("хвостовая ошибка rows.Err() guard проглочена (уровень 5 потерян)")
+		t.Error("the guard's tail rows.Err() error swallowed (level 5 lost)")
 	}
 
 	// Plan pinning: each SET LOCAL failing individually — an error
@@ -279,7 +279,7 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 	for n := 1; n <= 3; n++ {
 		p := &triStalePool{staleFakePool: &staleFakePool{guardVal: 1}, failNthPlan: n}
 		if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
-			t.Errorf("сбой SET LOCAL #%d проглочен", n)
+			t.Errorf("the SET LOCAL #%d failure swallowed", n)
 		}
 	}
 
@@ -287,12 +287,12 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 	p = &triStalePool{staleFakePool: &staleFakePool{guardVal: 1},
 		selectRows: retryRows([]any{int16(1)})} // fewer columns than receivers
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
-		t.Error("ошибка Scan выборки проглочена")
+		t.Error("the selection Scan error swallowed")
 	}
 	p = &triStalePool{staleFakePool: &staleFakePool{guardVal: 1},
-		selectRows: &retryFakeRows{rows: [][]any{{int16(1), int64(1)}}, err: errors.New("обрыв")}}
+		selectRows: &retryFakeRows{rows: [][]any{{int16(1), int64(1)}}, err: errors.New("drop")}}
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
-		t.Error("хвостовая ошибка rows.Err() выборки проглочена")
+		t.Error("the selection's tail rows.Err() error swallowed")
 	}
 
 	// The move: Scan and the trailing Err (the RETURNING rows).
@@ -300,13 +300,13 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 		selects: []*retryFakeRows{retryRows([]any{int16(1), int64(1)})}},
 		updateRows: retryRows([]any{int16(1), int64(2)})}
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
-		t.Error("ошибка Scan перевода проглочена")
+		t.Error("the move Scan error swallowed")
 	}
 	p = &triStalePool{staleFakePool: &staleFakePool{guardVal: 1,
 		selects: []*retryFakeRows{retryRows([]any{int16(1), int64(1)})}},
-		updateRows: &retryFakeRows{rows: [][]any{{int16(1)}}, err: errors.New("обрыв")}}
+		updateRows: &retryFakeRows{rows: [][]any{{int16(1)}}, err: errors.New("drop")}}
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
-		t.Error("хвостовая ошибка rows.Err() перевода проглочена")
+		t.Error("the move's tail rows.Err() error swallowed")
 	}
 
 	// The move transaction's Begin (the pass's second Begin).
@@ -315,7 +315,7 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 		selects: []*retryFakeRows{sel}, updates: []*retryFakeRows{upd}},
 		beginFailNth: 2}
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
-		t.Error("сбой Begin транзакции перевода проглочен")
+		t.Error("the move transaction Begin failure swallowed")
 	}
 
 	// The move's Commit (the pass's second Commit).
@@ -324,7 +324,7 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 		selects: []*retryFakeRows{sel}, updates: []*retryFakeRows{upd},
 		commitErrs: []error{nil, errors.New("connection refused")}}}
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
-		t.Error("сбой Commit перевода проглочен")
+		t.Error("the move Commit failure swallowed")
 	}
 
 	// The loop's nil pool — an immediate error (not a silent hang).
@@ -333,10 +333,10 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 	select {
 	case err := <-loopErr:
 		if err == nil {
-			t.Error("StaleRequeueLoop с nil-пулом не вернул ошибку")
+			t.Error("StaleRequeueLoop with a nil pool did not return an error")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("StaleRequeueLoop с nil-пулом не завершился ошибкой")
+		t.Fatal("StaleRequeueLoop with a nil pool did not finish with an error")
 	}
 }
 
@@ -351,7 +351,7 @@ func TestStaleRequeueTriageRollback(t *testing.T) {
 		t.Fatalf("StaleRequeueOnce: %v", err)
 	}
 	if n := p.rollbackCount(); n != 2 {
-		t.Errorf("откатов %d, хочу 2 (выборка и перевод — каждый закрывается)", n)
+		t.Errorf("rollbacks %d, want 2 (selection and the move — each closes)", n)
 	}
 }
 
@@ -377,7 +377,7 @@ func staleDrainQuiet(t *testing.T, p *triStalePool) {
 			last = st
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("дренаж не успокоился: %+v", st)
+			t.Fatalf("the drain did not settle: %+v", st)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -388,7 +388,7 @@ func staleDrainQuiet(t *testing.T, p *triStalePool) {
 			t.Fatalf("StaleRequeueLoop: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("StaleRequeueLoop не завершился после отмены ctx")
+		t.Fatal("StaleRequeueLoop did not finish after ctx cancellation")
 	}
 }
 
@@ -403,7 +403,7 @@ func TestStaleRequeueTriageDrain(t *testing.T) {
 		selects: []*retryFakeRows{selZero}}}
 	staleDrainQuiet(t, p)
 	if st := p.stats(); st.selects != 1 || st.guards != 1 {
-		t.Errorf("нулевая пачка: проходов (select=%d, guard=%d), хочу 1/1 — множество исчерпано", st.selects, st.guards)
+		t.Errorf("a zero batch: passes (select=%d, guard=%d), want 1/1 — the set is exhausted", st.selects, st.guards)
 	}
 
 	// A full batch with a move: the drain continues — the second (empty)
@@ -413,7 +413,7 @@ func TestStaleRequeueTriageDrain(t *testing.T) {
 		selects: []*retryFakeRows{selFull}, updates: []*retryFakeRows{updFull}}}
 	staleDrainQuiet(t, p)
 	if st := p.stats(); st.selects != 2 || st.guards != 2 {
-		t.Errorf("полная переведённая пачка: проходов (select=%d, guard=%d), хочу 2/2 — дренаж продолжает", st.selects, st.guards)
+		t.Errorf("a full moved batch: passes (select=%d, guard=%d), want 2/2 — the drain continues", st.selects, st.guards)
 	}
 }
 
@@ -423,7 +423,7 @@ func TestStaleRequeueTriageDrain(t *testing.T) {
 // (T-268: three in a row — a persistent failure; no DB hammering until the tick).
 func TestRetryTriageDefaults(t *testing.T) {
 	if DefaultRetryDrainFails != 3 {
-		t.Errorf("DefaultRetryDrainFails = %d, хочу ровно 3 (T-268)", DefaultRetryDrainFails)
+		t.Errorf("DefaultRetryDrainFails = %d, want exactly 3 (T-268)", DefaultRetryDrainFails)
 	}
 }
 
@@ -435,19 +435,19 @@ func TestRetryTriageErrors(t *testing.T) {
 	for n := 1; n <= 3; n++ {
 		p := &triRetryPool{retryFakePool: &retryFakePool{}, failNthPlan: n}
 		if _, err := RetryOnce(ctx, p, RetryOptions{}); err == nil {
-			t.Errorf("сбой SET LOCAL #%d проглочен", n)
+			t.Errorf("the SET LOCAL #%d failure swallowed", n)
 		}
 	}
 
 	p := &triRetryPool{retryFakePool: &retryFakePool{},
 		guardRows: retryRows([]any{int64(1), int64(2)})}
 	if _, err := RetryOnce(ctx, p, RetryOptions{}); err == nil {
-		t.Error("ошибка Scan guard корзин проглочена")
+		t.Error("the bucket guard Scan error swallowed")
 	}
 	p = &triRetryPool{retryFakePool: &retryFakePool{},
-		guardRows: &retryFakeRows{rows: [][]any{{int64(1)}}, err: errors.New("обрыв")}}
+		guardRows: &retryFakeRows{rows: [][]any{{int64(1)}}, err: errors.New("drop")}}
 	if _, err := RetryOnce(ctx, p, RetryOptions{}); err == nil {
-		t.Error("хвостовая ошибка rows.Err() guard проглочена")
+		t.Error("the guard's tail rows.Err() error swallowed")
 	}
 }
 
@@ -469,7 +469,7 @@ func retryDrainRun(t *testing.T, p *retryFakePool, o RetryOptions) {
 			last = st
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("дренаж не успокоился: %+v", st)
+			t.Fatalf("the drain did not settle: %+v", st)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -480,7 +480,7 @@ func retryDrainRun(t *testing.T, p *retryFakePool, o RetryOptions) {
 			t.Fatalf("RetryTempErrors: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("RetryTempErrors не завершился после отмены ctx")
+		t.Fatal("RetryTempErrors did not finish after ctx cancellation")
 	}
 }
 
@@ -488,7 +488,7 @@ func retryDrainRun(t *testing.T, p *retryFakePool, o RetryOptions) {
 // by EVERY success: after a successful batch the limit is exactly three failures
 // in a row (a reset to 0, not ±1 — otherwise the limit fires earlier/later).
 func TestRetryTriageDrainFailCounter(t *testing.T) {
-	dbDown := errors.New("бд недоступна")
+	dbDown := errors.New("db unavailable")
 	full := retryRows([]any{int16(1), int64(10), int16(0)})
 	p := &retryFakePool{
 		// A success, then a persistent guard failure.
@@ -498,7 +498,7 @@ func TestRetryTriageDrainFailCounter(t *testing.T) {
 	}
 	retryDrainRun(t, p, RetryOptions{BatchSize: 1, Interval: time.Hour})
 	if got := len(p.guardQueries); got != 4 {
-		t.Errorf("guard-чтений = %d, хочу 4 (успех + ровно 3 падения подряд до предела)", got)
+		t.Errorf("guard reads = %d, want 4 (a success + exactly 3 failures in a row to the limit)", got)
 	}
 }
 
@@ -506,7 +506,7 @@ func TestRetryTriageDrainFailCounter(t *testing.T) {
 // is exactly of CONSECUTIVE failures (a success resets it) — the drain finishes
 // to the end (the outcome requeued=3, without the limit).
 func TestRetryTriageDrainConsecutiveReset(t *testing.T) {
-	dbDown := errors.New("бд недоступна")
+	dbDown := errors.New("db unavailable")
 	cand := func() *retryFakeRows { return retryRows([]any{int16(1), int64(10), int16(0)}) }
 	ret := func() *retryFakeRows { return retryRows([]any{int16(1), int64(10), retryDay}) }
 	p := &retryFakePool{
@@ -517,7 +517,7 @@ func TestRetryTriageDrainConsecutiveReset(t *testing.T) {
 	}
 	retryDrainRun(t, p, RetryOptions{BatchSize: 1, Interval: time.Hour})
 	if got := len(p.guardQueries); got != 7 {
-		t.Errorf("guard-чтений = %d, хочу 7 (дренаж доработал до пустой пачки)", got)
+		t.Errorf("guard reads = %d, want 7 (the drain worked down to an empty batch)", got)
 	}
 }
 
@@ -534,22 +534,22 @@ func TestLeaseTriageErrors(t *testing.T) {
 
 	p := &triLeasePool{leaseFakePool: &leaseFakePool{}, selectRows: retryRows([]any{int16(1)})}
 	if _, err := LeaseOnce(ctx, p, &LeaseCursor{}, opts); err == nil {
-		t.Error("ошибка Scan выборки lease проглочена")
+		t.Error("the lease selection Scan error swallowed")
 	}
 	p = &triLeasePool{leaseFakePool: &leaseFakePool{},
-		selectRows: &retryFakeRows{rows: [][]any{{int16(1), int64(1), base}}, err: errors.New("обрыв")}}
+		selectRows: &retryFakeRows{rows: [][]any{{int16(1), int64(1), base}}, err: errors.New("drop")}}
 	if _, err := LeaseOnce(ctx, p, &LeaseCursor{}, opts); err == nil {
-		t.Error("хвостовая ошибка rows.Err() выборки lease проглочена")
+		t.Error("the lease selection's tail rows.Err() error swallowed")
 	}
 	p = &triLeasePool{leaseFakePool: &leaseFakePool{}, selectRows: good(),
 		updateRows: retryRows([]any{int16(1), int64(2)})}
 	if _, err := LeaseOnce(ctx, p, &LeaseCursor{}, opts); err == nil {
-		t.Error("ошибка Scan перевода lease проглочена")
+		t.Error("the lease move Scan error swallowed")
 	}
 	p = &triLeasePool{leaseFakePool: &leaseFakePool{}, selectRows: good(),
-		updateRows: &retryFakeRows{rows: [][]any{{int16(1)}}, err: errors.New("обрыв")}}
+		updateRows: &retryFakeRows{rows: [][]any{{int16(1)}}, err: errors.New("drop")}}
 	if _, err := LeaseOnce(ctx, p, &LeaseCursor{}, opts); err == nil {
-		t.Error("хвостовая ошибка rows.Err() перевода lease проглочена")
+		t.Error("the lease move's tail rows.Err() error swallowed")
 	}
 	_ = now
 }
@@ -565,7 +565,7 @@ func TestLeaseTriageRollback(t *testing.T) {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
 	if n := p.rollbackCount(); n != 1 {
-		t.Errorf("откатов %d, хочу 1 (транзакция прохода закрывается)", n)
+		t.Errorf("rollbacks %d, want 1 (the pass transaction closes)", n)
 	}
 }
 
@@ -576,22 +576,22 @@ func TestLeaseNullTriageErrors(t *testing.T) {
 
 	p := &triLeasePool{leaseFakePool: &leaseFakePool{}, nullSelectRows: retryRows([]any{int16(1)})}
 	if _, err := LeaseNullOnce(ctx, p, LeaseOptions{}); err == nil {
-		t.Error("ошибка Scan выборки страховки проглочена")
+		t.Error("the guard selection Scan error swallowed")
 	}
 	p = &triLeasePool{leaseFakePool: &leaseFakePool{},
-		nullSelectRows: &retryFakeRows{rows: [][]any{{int16(1), int64(1)}}, err: errors.New("обрыв")}}
+		nullSelectRows: &retryFakeRows{rows: [][]any{{int16(1), int64(1)}}, err: errors.New("drop")}}
 	if _, err := LeaseNullOnce(ctx, p, LeaseOptions{}); err == nil {
-		t.Error("хвостовая ошибка rows.Err() выборки страховки проглочена")
+		t.Error("the guard selection's tail rows.Err() error swallowed")
 	}
 	p = &triLeasePool{leaseFakePool: &leaseFakePool{}, nullSelectRows: good(),
 		nullUpdateRows: retryRows([]any{int16(1), int64(2)})}
 	if _, err := LeaseNullOnce(ctx, p, LeaseOptions{}); err == nil {
-		t.Error("ошибка Scan перевода страховки проглочена")
+		t.Error("the guard move Scan error swallowed")
 	}
 	p = &triLeasePool{leaseFakePool: &leaseFakePool{}, nullSelectRows: good(),
-		nullUpdateRows: &retryFakeRows{rows: [][]any{{int16(1)}}, err: errors.New("обрыв")}}
+		nullUpdateRows: &retryFakeRows{rows: [][]any{{int16(1)}}, err: errors.New("drop")}}
 	if _, err := LeaseNullOnce(ctx, p, LeaseOptions{}); err == nil {
-		t.Error("хвостовая ошибка rows.Err() перевода страховки проглочена")
+		t.Error("the guard move's tail rows.Err() error swallowed")
 	}
 }
 
@@ -603,7 +603,7 @@ func TestLeaseNullTriageRollback(t *testing.T) {
 		t.Fatalf("LeaseNullOnce: %v", err)
 	}
 	if n := p.rollbackCount(); n != 1 {
-		t.Errorf("откатов %d, хочу 1", n)
+		t.Errorf("rollbacks %d, want 1", n)
 	}
 }
 
@@ -621,20 +621,20 @@ func TestLeaseTriageSelectSwallow(t *testing.T) {
 	p := &triLeasePool{leaseFakePool: &leaseFakePool{},
 		selectRows: retryRows([]any{int16(1)}), updateRows: retryRows()}
 	if _, err := LeaseOnce(ctx, p, &LeaseCursor{}, opts); err == nil ||
-		!strings.Contains(err.Error(), "выборка пачки") {
-		t.Errorf("глушение Scan выборки: %v, want ошибку выборки пачки", err)
+		!strings.Contains(err.Error(), "batch selection") {
+		t.Errorf("muting the selection Scan: %v, want a batch selection error", err)
 	}
 
 	// A trailing rows.Err: the same step error, not a success with a batch.
 	p = &triLeasePool{leaseFakePool: &leaseFakePool{},
 		selectRows: &retryFakeRows{
 			rows: [][]any{{int16(1), int64(1), time.Date(2026, 10, 17, 4, 0, 0, 0, time.UTC)}},
-			err:  errors.New("обрыв"),
+			err:  errors.New("drop"),
 		},
 		updateRows: retryRows()}
 	if _, err := LeaseOnce(ctx, p, &LeaseCursor{}, opts); err == nil ||
-		!strings.Contains(err.Error(), "выборка пачки") {
-		t.Errorf("глушение rows.Err() выборки: %v, want ошибку выборки пачки", err)
+		!strings.Contains(err.Error(), "batch selection") {
+		t.Errorf("muting the selection rows.Err(): %v, want a batch selection error", err)
 	}
 }
 
@@ -647,19 +647,19 @@ func TestLeaseNullTriageSelectSwallow(t *testing.T) {
 	p := &triLeasePool{leaseFakePool: &leaseFakePool{},
 		nullSelectRows: retryRows([]any{int16(1)}), nullUpdateRows: retryRows()}
 	if _, err := LeaseNullOnce(ctx, p, LeaseOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "выборка пачки") {
-		t.Errorf("глушение Scan выборки страховки: %v, want ошибку выборки пачки", err)
+		!strings.Contains(err.Error(), "batch selection") {
+		t.Errorf("muting the guard selection Scan: %v, want a batch selection error", err)
 	}
 
 	p = &triLeasePool{leaseFakePool: &leaseFakePool{},
 		nullSelectRows: &retryFakeRows{
 			rows: [][]any{{int16(1), int64(1)}},
-			err:  errors.New("обрыв"),
+			err:  errors.New("drop"),
 		},
 		nullUpdateRows: retryRows()}
 	if _, err := LeaseNullOnce(ctx, p, LeaseOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "выборка пачки") {
-		t.Errorf("глушение rows.Err() выборки страховки: %v, want ошибку выборки пачки", err)
+		!strings.Contains(err.Error(), "batch selection") {
+		t.Errorf("muting the guard selection rows.Err(): %v, want a batch selection error", err)
 	}
 }
 
@@ -672,12 +672,12 @@ func TestRecheckTriageRowsErrors(t *testing.T) {
 	p := &triRecheckPool{recheckFakePool: &recheckFakePool{},
 		rows: retryRows([]any{int16(1), int64(2)})} // more columns than the receiver
 	if _, err := RecheckOnce(context.Background(), p, RecheckOptions{}); err == nil {
-		t.Error("ошибка Scan перепроверки проглочена")
+		t.Error("the recheck Scan error swallowed")
 	}
 	p = &triRecheckPool{recheckFakePool: &recheckFakePool{},
-		rows: &retryFakeRows{rows: [][]any{{int16(1)}}, err: errors.New("обрыв")}}
+		rows: &retryFakeRows{rows: [][]any{{int16(1)}}, err: errors.New("drop")}}
 	if _, err := RecheckOnce(context.Background(), p, RecheckOptions{}); err == nil {
-		t.Error("хвостовая ошибка rows.Err() перепроверки проглочена")
+		t.Error("the recheck's tail rows.Err() error swallowed")
 	}
 }
 
@@ -688,7 +688,7 @@ func TestRecheckTriageRowsErrors(t *testing.T) {
 // "nil — no-op" contract; isolated assemblies without Prometheus).
 func TestBacklogTriageNilMetrics(t *testing.T) {
 	if m := newBacklogLoopMetrics(nil); m != nil {
-		t.Errorf("newBacklogLoopMetrics(nil) = %v, хочу nil", m)
+		t.Errorf("newBacklogLoopMetrics(nil) = %v, want nil", m)
 	}
 	var m *backlogLoopMetrics
 	m.observe(1.5) // does not panic
@@ -722,12 +722,12 @@ func TestBacklogTriageHistogramBuckets(t *testing.T) {
 		}
 		want := []float64{0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512}
 		if !reflect.DeepEqual(finite, want) {
-			t.Fatalf("конечные границы = %v, хочу %v (0.5…512, фактор 2, 11 корзин)", finite, want)
+			t.Fatalf("the final boundaries = %v, want %v (0.5…512, factor 2, 11 buckets)", finite, want)
 		}
 		if c := mf.GetMetric()[0].GetHistogram().GetSampleCount(); c != 1 {
-			t.Errorf("наблюдение 0.7с не учтено: count=%d", c)
+			t.Errorf("the 0.7s observation not counted: count=%d", c)
 		}
 		return
 	}
-	t.Fatal("метрика crawler_backlog_pass_seconds не найдена в реестре")
+	t.Fatal("the crawler_backlog_pass_seconds metric is not in the registry")
 }

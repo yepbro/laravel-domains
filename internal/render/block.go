@@ -448,7 +448,7 @@ func (c *dnsCache) hostInternal(ctx context.Context, host string) bool {
 	// mutator-disable-next-line branch/if
 	if internal {
 		// mutator-disable-next-line statement/remove
-		slog.Debug("рендер: имя резолвится во внутренний адрес — запрос отклоняется (SSRF)",
+		slog.Debug("render: the name resolves to an internal address — the request is rejected (SSRF)",
 			"host", host)
 	}
 	if definitive {
@@ -505,7 +505,7 @@ func blockRespond(ctx context.Context, sess cdp.Session, ev fetch.EventRequestPa
 	// mutator-disable-next-line branch/if
 	if err != nil {
 		// mutator-disable-next-line statement/remove
-		slog.Debug("рендер: ответ на перехваченный запрос не прошёл",
+		slog.Debug("render: the response to the intercepted request did not go through",
 			"type", ev.ResourceType.String(), "err", err.Error())
 	}
 }
@@ -570,7 +570,7 @@ func blockPump(ctx context.Context,
 func (s *Session) startBlock(ctx context.Context) (stop func(), err error) {
 	c := chromedp.FromContext(s.ctx)
 	if c == nil || c.Target == nil {
-		return nil, errors.New("контекст вкладки не инициализирован")
+		return nil, errors.New("the tab context is not initialized")
 	}
 	tgt := c.Target
 	rules := blockRulesOf(s.b.opts)
@@ -579,7 +579,7 @@ func (s *Session) startBlock(ctx context.Context) (stop func(), err error) {
 	stopListen := blockListen(ctx, tgt, rules)
 	if err := blockEnable(ctx, tgt, rules); err != nil {
 		stopListen()
-		return nil, fmt.Errorf("включение перехвата Fetch: %w", err)
+		return nil, fmt.Errorf("enabling the Fetch interception: %w", err)
 	}
 	return func() {
 		stopListen()

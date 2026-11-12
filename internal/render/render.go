@@ -289,13 +289,13 @@ func (o Options) validate() error {
 	switch o.Engine {
 	case "", config.EngineChromium, config.EngineMoli, config.EngineLightpanda: // "" — as chromium (a config without Default())
 	default:
-		problems = append(problems, fmt.Sprintf("engine: ожидается %s|%s|%s, задано %q",
+		problems = append(problems, fmt.Sprintf("engine: expected %s|%s|%s, got %q",
 			config.EngineChromium, config.EngineMoli, config.EngineLightpanda, o.Engine))
 	}
 	if o.altEngine() {
 		if o.RemoteURL == "" {
 			problems = append(problems, fmt.Sprintf(
-				"engine: для %s обязателен remote_url (внешний CDP-сервер ws://host:9222; собственный процесс браузера — только %s)",
+				"engine: %s requires remote_url (an external CDP server ws://host:9222; a browser process of our own — only %s)",
 				o.Engine, config.EngineChromium))
 		} else if u, err := url.Parse(o.RemoteURL); err != nil || u.Host == "" ||
 			(u.Scheme != "ws" && u.Scheme != "wss") {
@@ -306,11 +306,11 @@ func (o Options) validate() error {
 			// accepts only ws/wss — a rejection at assembly time, not an
 			// obscure handshake.
 			problems = append(problems, fmt.Sprintf(
-				"remote_url: для движка %s ожидается ws://host:9222, задано %q", o.Engine, o.RemoteURL))
+				"remote_url: for the %s engine ws://host:9222 is expected, got %q", o.Engine, o.RemoteURL))
 		}
 		if o.MemoryThreshold != 0 {
 			problems = append(problems, fmt.Sprintf(
-				"memory_threshold: для движка %s ожидается 0 (RSS чужого процесса недоступен), задано %d",
+				"memory_threshold: for the %s engine 0 is expected (the RSS of a foreign process is unavailable), got %d",
 				o.Engine, o.MemoryThreshold))
 		}
 	}
@@ -319,19 +319,19 @@ func (o Options) validate() error {
 		if err != nil || u.Host == "" ||
 			(u.Scheme != "ws" && u.Scheme != "wss" && u.Scheme != "http" && u.Scheme != "https") {
 			problems = append(problems,
-				fmt.Sprintf("remote_url: ожидается ws://host:9222, задано %q", o.RemoteURL))
+				fmt.Sprintf("remote_url: ws://host:9222 is expected, got %q", o.RemoteURL))
 		}
 	}
 	if o.Contexts < 1 || o.Contexts > 16 {
 		problems = append(problems,
-			fmt.Sprintf("contexts: ожидается 1..16 (рекомендация ТЗ 5.6: 2–4), задано %d", o.Contexts))
+			fmt.Sprintf("contexts: 1..16 expected (the spec 5.6 recommendation: 2–4), got %d", o.Contexts))
 	}
 	if o.Timeout <= 0 {
-		problems = append(problems, fmt.Sprintf("timeout: ожидается положительная длительность, задано %s", o.Timeout))
+		problems = append(problems, fmt.Sprintf("timeout: a positive duration is expected, got %s", o.Timeout))
 	}
 	if o.RestartEveryPages < 1 {
 		problems = append(problems,
-			fmt.Sprintf("restart_every_pages: ожидается >= 1, задано %d", o.RestartEveryPages))
+			fmt.Sprintf("restart_every_pages: >= 1 expected, got %d", o.RestartEveryPages))
 	}
 	// The memory threshold range repeats render.restart_memory_bytes of
 	// internal/config: 0 — the control is off; below 256 MiB — below
@@ -352,12 +352,12 @@ func (o Options) validate() error {
 	if o.MemoryThreshold < 0 ||
 		(o.MemoryThreshold != 0 && (o.MemoryThreshold < 256<<20 || o.MemoryThreshold > 16<<30)) {
 		problems = append(problems, fmt.Sprintf(
-			"memory_threshold: ожидается 0 (отключено) или %d..%d байт, задано %d",
+			"memory_threshold: 0 (disabled) or %d..%d bytes expected, got %d",
 			256<<20, 16<<30, o.MemoryThreshold))
 	}
 	if o.MaxDOMBytes < 0 {
 		problems = append(problems,
-			fmt.Sprintf("max_dom_bytes: ожидается 0 (без лимита) или положительное число, задано %d", o.MaxDOMBytes))
+			fmt.Sprintf("max_dom_bytes: 0 (no limit) or a positive number expected, got %d", o.MaxDOMBytes))
 	}
 	if len(problems) > 0 {
 		return errors.New("render: " + strings.Join(problems, "; "))
@@ -377,7 +377,7 @@ func validateTaskURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return &Error{Class: ClassTask, URL: raw,
-			Err: fmt.Errorf("рендер открывает только http/https, задано %q", raw)}
+			Err: fmt.Errorf("render opens only http/https, got %q", raw)}
 	}
 	return nil
 }
@@ -403,7 +403,7 @@ func validateTaskURLInternal(raw string) error {
 	}
 	if renderHostInternal(u.Hostname()) {
 		return &Error{Class: ClassTask, URL: raw,
-			Err: fmt.Errorf("рендер внутренних адресов запрещён (SSRF, http.block_internal_addrs): %q", raw)}
+			Err: fmt.Errorf("rendering internal addresses is forbidden (SSRF, http.block_internal_addrs): %q", raw)}
 	}
 	return nil
 }

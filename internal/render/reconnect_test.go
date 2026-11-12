@@ -106,7 +106,7 @@ func (f *switchableCDP) Write(ctx context.Context, m *cdproto.Message) error {
 	case cmdErr:
 		// A protocol error reply with a live connection (the browser
 		// answered — a transport death is not confirmed by it).
-		reply.Error = &cdproto.Error{Code: -32000, Message: "команда сломана"}
+		reply.Error = &cdproto.Error{Code: -32000, Message: "the command is broken"}
 	case method == "Target.attachToTarget":
 		reply.Result = jsonv2.Value(fmt.Sprintf(`{"sessionId":"sw-session-%d"}`, seq))
 	case method == "Target.createTarget":
@@ -258,7 +258,7 @@ func waitForFor(t *testing.T, d time.Duration, cond func() bool) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("условие не наступило за %s", d)
+	t.Fatalf("the condition was not reached in %s", d)
 }
 
 // bootSession — a pool session with a real context creation
@@ -313,7 +313,7 @@ func switchableBrowser(t *testing.T, tr *switchableCDP, opts Options) *Browser {
 		cancelAlloc()
 	})
 	if err := initBrowserSession(bctx, opts); err != nil {
-		t.Fatalf("bootstrap браузера поверх фейка: %v", err)
+		t.Fatalf("bootstrapping the browser over the fake: %v", err)
 	}
 	return &Browser{opts: opts, ctx: bctx, cancel: cancelBrowser, cancelAlloc: cancelAlloc,
 		probeTimeout: testProbeTimeout}
@@ -361,10 +361,10 @@ func TestManagerRecoversAfterBrowserDeath(t *testing.T) {
 
 	// A live browser: the task passes, one connection.
 	if _, err := m.Run(context.Background(), RenderTask{URL: "https://a.example/"}); err != nil {
-		t.Fatalf("Run на живом браузере: %v", err)
+		t.Fatalf("Run on a live browser: %v", err)
 	}
 	if conns := rec.list(); len(conns) != 1 {
-		t.Fatalf("соединений %d, хочу 1", len(conns))
+		t.Fatalf("connections %d, want 1", len(conns))
 	}
 
 	// The browser death: a host recycle, the connection is half-closed.
@@ -378,37 +378,37 @@ func TestManagerRecoversAfterBrowserDeath(t *testing.T) {
 	// connection probe classifies the death as browser, the manager
 	// swaps the generation, the task passes on a new connection.
 	if _, err := m.Run(context.Background(), RenderTask{URL: "https://a.example/"}); err != nil {
-		t.Fatalf("воркер не восстановился после смерти браузера: %v", err)
+		t.Fatalf("the worker did not recover after the browser's death: %v", err)
 	}
 	if elapsed := time.Since(started); elapsed > time.Minute {
-		t.Errorf("восстановление заняло %s, хочу ≤ минуты", elapsed)
+		t.Errorf("the recovery took %s, want ≤ a minute", elapsed)
 	}
 
 	conns := rec.list()
 	if len(conns) != 2 {
-		t.Fatalf("соединений %d, хочу 2 (реконнект без накопления)", len(conns))
+		t.Fatalf("connections %d, want 2 (a reconnect without accumulation)", len(conns))
 	}
 	// After the connection's death no contexts are created on it at
 	// all (before the fix — a hung createBrowserContext on every
 	// attempt, the Nov 2 incident: ×11,520 WARN over 6 h).
 	if n := conns[0].countOf("Target.createBrowserContext"); n != createdBefore {
-		t.Errorf("createBrowserContext на мёртвом соединении +%d после смерти, хочу 0", n-createdBefore)
+		t.Errorf("createBrowserContext on a dead connection +%d after the death, want 0", n-createdBefore)
 	}
 	// The old socket is closed forcibly (in the background — after the
 	// regular chromedp procedure, within its timeouts), the new live
 	// one — exactly one.
 	waitForFor(t, 10*time.Second, conns[0].isClosed)
 	if conns[1].isClosed() {
-		t.Error("живое соединение закрыто")
+		t.Error("the live connection closed")
 	}
 	// The generation is stable: further tasks do not spawn connections.
 	for range 3 {
 		if _, err := m.Run(context.Background(), RenderTask{URL: "https://a.example/"}); err != nil {
-			t.Fatalf("Run после восстановления: %v", err)
+			t.Fatalf("Run after the recovery: %v", err)
 		}
 	}
 	if got := len(rec.list()); got != 2 {
-		t.Errorf("соединений %d после серии задач, хочу 2", got)
+		t.Errorf("connections %d after a series of tasks, want 2", got)
 	}
 }
 
@@ -471,8 +471,8 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 			return tr, nil
 		})
 		overrideRemoteResolve(t, func(_ context.Context, host string) ([]net.IPAddr, error) {
-			t.Errorf("резолв %s при движке lightpanda: адрес не должен уточняться", host)
-			return nil, errors.New("резолв не ожидается")
+			t.Errorf("resolving %s with the lightpanda engine: the address must not be refined", host)
+			return nil, errors.New("a resolution is not expected")
 		})
 
 		opts := remoteOpts()
@@ -480,7 +480,7 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 		opts.RemoteURL = "ws://engine.example:9222"
 		b, err := StartBrowser(context.Background(), opts)
 		if err != nil {
-			t.Fatalf("подключение к lightpanda по адресу как есть: %v", err)
+			t.Fatalf("connecting to lightpanda by the address as is: %v", err)
 		}
 		b.Close()
 		waitForFor(t, 10*time.Second, tr.isClosed)
@@ -489,7 +489,7 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 		got := dialed
 		mu.Unlock()
 		if got != opts.RemoteURL {
-			t.Errorf("lightpanda: подключение к %q, хочу адрес конфигурации %q как есть", got, opts.RemoteURL)
+			t.Errorf("lightpanda: connecting to %q, want the configuration address %q as is", got, opts.RemoteURL)
 		}
 	})
 
@@ -523,7 +523,7 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 		opts.RemoteURL = strings.Replace(srv.URL, "http://", "ws://", 1) // the ws scheme: the alt-engine validation requires ws/wss
 		b, err := StartBrowser(context.Background(), opts)
 		if err != nil {
-			t.Fatalf("подключение к moli с путём из /json/version: %v", err)
+			t.Fatalf("connecting to moli with the path from /json/version: %v", err)
 		}
 		b.Close()
 		waitForFor(t, 10*time.Second, tr.isClosed)
@@ -533,7 +533,7 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 		got := dialed
 		mu.Unlock()
 		if got != want {
-			t.Errorf("moli: подключение к %q, хочу путь из /json/version с authority конфигурации %q", got, want)
+			t.Errorf("moli: connecting to %q, want the /json/version path with the configuration authority %q", got, want)
 		}
 	})
 
@@ -565,7 +565,7 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 		opts.RemoteURL = srv.URL // http://IP:port without /devtools/browser/ — forces the refinement
 		b, err := StartBrowser(context.Background(), opts)
 		if err != nil {
-			t.Fatalf("подключение к chromium с уточнением адреса: %v", err)
+			t.Fatalf("connecting to chromium with the address refined: %v", err)
 		}
 		b.Close()
 		waitForFor(t, 10*time.Second, tr.isClosed)
@@ -575,7 +575,7 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 		mu.Unlock()
 		const advertised = "ws://127.0.0.1:9222/devtools/browser/adv"
 		if got != advertised {
-			t.Errorf("chromium: подключение к %q, хочу webSocketDebuggerUrl из /json/version %q", got, advertised)
+			t.Errorf("chromium: connecting to %q, want the webSocketDebuggerUrl from /json/version %q", got, advertised)
 		}
 	})
 }
@@ -596,37 +596,37 @@ func TestBrowserProbeConnDeadConnection(t *testing.T) {
 	b := switchableBrowser(t, tr, opts)
 
 	if !b.Alive() {
-		t.Fatal("живое соединение: Alive")
+		t.Fatal("a live connection: Alive")
 	}
 	if !b.probeConn() {
-		t.Fatal("зонд живого соединения не прошёл")
+		t.Fatal("the live connection probe failed")
 	}
 
 	tr.kill()
 	// The first failure: the browser class (the probe failed), but the
 	// generation is alive.
 	if b.probeConn() {
-		t.Fatal("зонд мёртвого соединения прошёл")
+		t.Fatal("the dead connection probe passed")
 	}
 	if !b.Alive() {
-		t.Fatal("одиночный таймаут «чёрной дыры» погасил поколение (T-226: требуется серия)")
+		t.Fatal("a single "black hole" timeout killed the generation (T-226: a series is required)")
 	}
 	// The second in a row — lost stickily; Manager will see the
 	// generation swap.
 	if b.probeConn() {
-		t.Fatal("зонд мёртвого соединения прошёл")
+		t.Fatal("the dead connection probe passed")
 	}
 	if b.Alive() {
-		t.Fatal("мёртвое соединение: Alive обязан быть false (для Manager — смена поколения)")
+		t.Fatal("a dead connection: Alive must be false (for the Manager — a generation swap)")
 	}
 	// Sticking: a repeated probe does not wait for probeTimeout and
 	// does not "revive".
 	started := time.Now()
 	if b.probeConn() {
-		t.Fatal("повторный зонд мёртвого соединения прошёл")
+		t.Fatal("a repeated dead connection probe passed")
 	}
 	if elapsed := time.Since(started); elapsed > probeTimeout/2 {
-		t.Errorf("повторный зонд на залипающем lost занял %s, хочу мгновенно", elapsed)
+		t.Errorf("a repeated probe on a sticky lost took %s, want instant", elapsed)
 	}
 }
 
@@ -648,54 +648,54 @@ func TestProbeConnTimeoutTwoFailures(t *testing.T) {
 	b := switchableBrowser(t, tr, opts)
 
 	if !b.probeConn() {
-		t.Fatal("зонд живого соединения не прошёл")
+		t.Fatal("the live connection probe failed")
 	}
 
 	// A single timeout: a failure without the generation's death.
 	tr.hangMethod("Target.getTargets")
 	started := time.Now()
 	if b.probeConn() {
-		t.Fatal("зонд висящего getTargets прошёл")
+		t.Fatal("the hanging getTargets probe passed")
 	}
 	// The budget substitution pin: the probe must not wait for the
 	// production probeTimeout (without substituting the field this
 	// check would fail at ~5 s).
 	if elapsed := time.Since(started); elapsed >= probeTimeout {
-		t.Errorf("зонд ждал полный продуктовый probeTimeout (%s) — тестовый бюджет не подменён", elapsed)
+		t.Errorf("the probe waited the full production probeTimeout (%s) — the test budget is not replaced", elapsed)
 	}
 	if !b.Alive() {
-		t.Fatal("одиночный таймаут зонда погасил поколение (T-226: ложная смерть на нагруженном воркере)")
+		t.Fatal("a single probe timeout killed the generation (T-226: a false death on a loaded worker)")
 	}
 
 	// A success between failures resets the counter: the next single
 	// timeout is still not a death.
 	tr.unhangMethod("Target.getTargets")
 	if !b.probeConn() {
-		t.Fatal("зонд живого соединения после сброса не прошёл")
+		t.Fatal("the live connection probe after the reset failed")
 	}
 	tr.hangMethod("Target.getTargets")
 	if b.probeConn() {
-		t.Fatal("зонд висящего getTargets прошёл")
+		t.Fatal("the hanging getTargets probe passed")
 	}
 	if !b.Alive() {
-		t.Fatal("таймаут сразу после успеха (сброс счётчика) погасил поколение")
+		t.Fatal("a timeout right after a success (the counter reset) killed the generation")
 	}
 
 	// The second failure in a row: the generation is killed stickily.
 	if b.probeConn() {
-		t.Fatal("зонд висящего getTargets прошёл")
+		t.Fatal("the hanging getTargets probe passed")
 	}
 	if b.Alive() {
-		t.Fatal("двойной таймаут зонда не погасил поколение")
+		t.Fatal("a double probe timeout did not kill the generation")
 	}
 	// Sticking: a repeated probe does not wait for probeTimeout and
 	// does not "revive".
 	started = time.Now()
 	if b.probeConn() {
-		t.Fatal("повторный зонд потерянного браузера прошёл")
+		t.Fatal("a repeated probe of the lost browser passed")
 	}
 	if elapsed := time.Since(started); elapsed > probeTimeout/2 {
-		t.Errorf("повторный зонд на залипающем lost занял %s, хочу мгновенно", elapsed)
+		t.Errorf("a repeated probe on a sticky lost took %s, want instant", elapsed)
 	}
 }
 
@@ -728,16 +728,16 @@ func TestProbeConnTransportDeathInstantLost(t *testing.T) {
 
 	started := time.Now()
 	if b.probeConn() {
-		t.Fatal("зонд закрытого соединения прошёл")
+		t.Fatal("the closed connection probe passed")
 	}
 	if elapsed := time.Since(started); elapsed > probeTimeout/2 {
-		t.Errorf("зонд закрытого соединения ждал %s — смерть транспорта детектится мгновенно, без probeTimeout", elapsed)
+		t.Errorf("the closed connection probe waited %s — a transport death is detected instantly, without probeTimeout", elapsed)
 	}
 	if !b.lost.Load() {
-		t.Fatal("транспортная смерть не залипнула с первой неудачи (ослаблен детект T-218)")
+		t.Fatal("the transport death did not stick from the first failure (the T-218 detection weakened)")
 	}
 	if b.Alive() {
-		t.Fatal("потерянное соединение: Alive обязан быть false")
+		t.Fatal("a lost connection: Alive must be false")
 	}
 }
 
@@ -756,16 +756,16 @@ func TestProbeConnProtocolErrorSeries(t *testing.T) {
 
 	tr.failMethod("Target.getTargets")
 	if b.probeConn() {
-		t.Fatal("зонд с ответом-ошибкой прошёл")
+		t.Fatal("the probe with an error response passed")
 	}
 	if !b.Alive() {
-		t.Fatal("одиночный ошибочный ответ протокола погасил поколение (T-226: соединение живо — браузер ответил)")
+		t.Fatal("a single protocol error response killed the generation (T-226: the connection is alive — the browser answered)")
 	}
 	if b.probeConn() {
-		t.Fatal("зонд с ответом-ошибкой прошёл")
+		t.Fatal("the probe with an error response passed")
 	}
 	if b.Alive() {
-		t.Fatal("серия ошибочных ответов не погасила поколение")
+		t.Fatal("a series of error responses did not kill the generation")
 	}
 }
 
@@ -791,7 +791,7 @@ func TestSessionStartTimeoutDeadConnection(t *testing.T) {
 	err := s.start(context.Background())
 	var e *Error
 	if !errors.As(err, &e) || e.Class != ClassBrowser {
-		t.Fatalf("таймаут создания контекста на мёртвом соединении: класс %v (%v), хочу browser", ClassOf(err), err)
+		t.Fatalf("a context creation timeout on a dead connection: the class %v (%v), want browser", ClassOf(err), err)
 	}
 }
 
@@ -813,7 +813,7 @@ func TestSessionStartTimeoutSlowBrowser(t *testing.T) {
 	err := s.start(context.Background())
 	var e *Error
 	if !errors.As(err, &e) || e.Class != ClassContext {
-		t.Fatalf("таймаут создания контекста при живом соединении: класс %v (%v), хочу context", ClassOf(err), err)
+		t.Fatalf("a context creation timeout with a live connection: the class %v (%v), want context", ClassOf(err), err)
 	}
 }
 
@@ -844,13 +844,13 @@ func TestStartBrowserBootstrapTimeout(t *testing.T) {
 	_, err := StartBrowser(context.Background(), opts)
 	var e *Error
 	if !errors.As(err, &e) || e.Class != ClassBrowser {
-		t.Fatalf("таймаут инициализации: класс %v (%v), хочу browser", ClassOf(err), err)
+		t.Fatalf("the initialization timeout: the class %v (%v), want browser", ClassOf(err), err)
 	}
-	if !strings.Contains(err.Error(), "таймаут инициализации") {
-		t.Errorf("ошибка не называет причину: %v", err)
+	if !strings.Contains(err.Error(), "the initialization timeout") {
+		t.Errorf("the error does not mention the cause: %v", err)
 	}
 	if elapsed := time.Since(started); elapsed > 10*time.Second {
-		t.Errorf("старт висел %s — потолок не работает", elapsed)
+		t.Errorf("the start hung for %s — the cap does not work", elapsed)
 	}
 	// The socket of the hung connection is closed forcibly (the
 	// cancellation hygiene of StartBrowser + the allocator), it does
@@ -862,11 +862,11 @@ func TestStartBrowserBootstrapTimeout(t *testing.T) {
 	// alive.
 	b, err := StartBrowser(context.Background(), opts)
 	if err != nil {
-		t.Fatalf("старт после восстановления: %v", err)
+		t.Fatalf("the start after the recovery: %v", err)
 	}
 	defer b.Close()
 	if !b.Alive() {
-		t.Error("новое поколение живо")
+		t.Error("the new generation is alive")
 	}
 }
 
@@ -885,7 +885,7 @@ func TestSessionRunPageTimeoutDeadConnection(t *testing.T) {
 
 	s, err := b.NewSession(context.Background())
 	if err != nil {
-		t.Fatalf("NewSession на живом соединении: %v", err)
+		t.Fatalf("NewSession on a live connection: %v", err)
 	}
 	defer s.Close()
 
@@ -896,7 +896,7 @@ func TestSessionRunPageTimeoutDeadConnection(t *testing.T) {
 	_, err = s.Run(context.Background(), RenderTask{URL: "https://a.example/"})
 	var e *Error
 	if !errors.As(err, &e) || e.Class != ClassBrowser {
-		t.Fatalf("таймаут страницы на мёртвом соединении: класс %v (%v), хочу browser", ClassOf(err), err)
+		t.Fatalf("a page timeout on a dead connection: the class %v (%v), want browser", ClassOf(err), err)
 	}
 }
 
@@ -910,10 +910,10 @@ func TestResolveRemoteWSURL(t *testing.T) {
 	ready := "ws://127.0.0.1:9222/devtools/browser/abc"
 	ws, err := resolveRemoteWSURL(ctx, ready, time.Second)
 	if err != nil {
-		t.Fatalf("готовый адрес: %v", err)
+		t.Fatalf("the ready address: %v", err)
 	}
 	if ws != ready {
-		t.Errorf("готовый адрес изменён: %s", ws)
+		t.Errorf("the ready address changed: %s", ws)
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -926,7 +926,7 @@ func TestResolveRemoteWSURL(t *testing.T) {
 	defer srv.Close()
 	ws, err = resolveRemoteWSURL(ctx, srv.URL, time.Second)
 	if err != nil {
-		t.Fatalf("уточнение адреса: %v", err)
+		t.Fatalf("the address refinement: %v", err)
 	}
 	if ws != "ws://127.0.0.1:9222/devtools/browser/xyz" {
 		t.Errorf("webSocketDebuggerUrl: %s", ws)
@@ -937,9 +937,9 @@ func TestResolveRemoteWSURL(t *testing.T) {
 	}))
 	defer empty.Close()
 	if _, err := resolveRemoteWSURL(ctx, empty.URL, time.Second); err == nil {
-		t.Error("ответ без webSocketDebuggerUrl обязан ошибкой")
+		t.Error("a response without webSocketDebuggerUrl must be an error")
 	} else if !strings.Contains(err.Error(), "webSocketDebuggerUrl") {
-		t.Errorf("ошибка не называет причину: %v", err)
+		t.Errorf("the error does not mention the cause: %v", err)
 	}
 }
 
@@ -971,13 +971,13 @@ func TestResolveRemoteWSURLPreferIPv4(t *testing.T) {
 		addrs []net.IPAddr
 		want  string
 	}{
-		{"IPv6-first — выбран IPv4", withPath, []net.IPAddr{{IP: v6}, {IP: v4}}, "ws://192.0.2.10:9222/devtools/browser/abc"},
-		{"IPv4-first — он же", withPath, []net.IPAddr{{IP: v4}, {IP: v6}}, "ws://192.0.2.10:9222/devtools/browser/abc"},
-		{"только IPv6 — первый адрес", withPath, []net.IPAddr{{IP: v6}}, "ws://[2001:db8::1]:9222/devtools/browser/abc"},
+		{"IPv6-first — IPv4 chosen", withPath, []net.IPAddr{{IP: v6}, {IP: v4}}, "ws://192.0.2.10:9222/devtools/browser/abc"},
+		{"IPv4-first — the same one", withPath, []net.IPAddr{{IP: v4}, {IP: v6}}, "ws://192.0.2.10:9222/devtools/browser/abc"},
+		{"only IPv6 — the first address", withPath, []net.IPAddr{{IP: v6}}, "ws://[2001:db8::1]:9222/devtools/browser/abc"},
 		// Without a port: v4 — as is, v6 — in brackets (bare colons in
 		// the host would be re-parsed as the port, the review P3-7).
-		{"IPv4 без порта", noPort, []net.IPAddr{{IP: v6}, {IP: v4}}, "ws://192.0.2.10/devtools/browser/abc"},
-		{"IPv6 без порта — в скобках", noPort, []net.IPAddr{{IP: v6}}, "ws://[2001:db8::1]/devtools/browser/abc"},
+		{"IPv4 without a port", noPort, []net.IPAddr{{IP: v6}, {IP: v4}}, "ws://192.0.2.10/devtools/browser/abc"},
+		{"IPv6 without a port — in brackets", noPort, []net.IPAddr{{IP: v6}}, "ws://[2001:db8::1]/devtools/browser/abc"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			overrideRemoteResolve(t, func(_ context.Context, _ string) ([]net.IPAddr, error) {
@@ -985,10 +985,10 @@ func TestResolveRemoteWSURLPreferIPv4(t *testing.T) {
 			})
 			ws, err := resolveRemoteWSURL(ctx, tc.raw, time.Second)
 			if err != nil {
-				t.Fatalf("резолв: %v", err)
+				t.Fatalf("resolution: %v", err)
 			}
 			if ws != tc.want {
-				t.Errorf("адрес %s, хочу %s", ws, tc.want)
+				t.Errorf("the address %s, want %s", ws, tc.want)
 			}
 		})
 	}

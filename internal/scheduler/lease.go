@@ -304,7 +304,7 @@ type leaseRow struct {
 // T-012/T-029 is also preserved by a loop restart.
 func LeaseOnce(ctx context.Context, pool LeaseDB, cursor *LeaseCursor, opts LeaseOptions) (LeaseResult, error) {
 	if pool == nil {
-		return LeaseResult{}, errors.New("scheduler: возврат истёкших lease: пул не задан")
+		return LeaseResult{}, errors.New("scheduler: expired lease return: pool not set")
 	}
 	o := opts.withDefaults()
 	if cursor == nil {
@@ -322,7 +322,7 @@ func LeaseOnce(ctx context.Context, pool LeaseDB, cursor *LeaseCursor, opts Leas
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return LeaseResult{}, fmt.Errorf("scheduler: возврат истёкших lease: транзакция: %w", err)
+		return LeaseResult{}, fmt.Errorf("scheduler: expired lease return: transaction: %w", err)
 	}
 	// The rollback is unconditional: after Commit — a no-op (the T-020/T-044 style).
 	// An interrupted pass leaves no half-done changes.
@@ -344,7 +344,7 @@ func LeaseOnce(ctx context.Context, pool LeaseDB, cursor *LeaseCursor, opts Leas
 		return LeaseResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return LeaseResult{}, fmt.Errorf("scheduler: возврат истёкших lease: фиксация: %w", err)
+		return LeaseResult{}, fmt.Errorf("scheduler: expired lease return: commit: %w", err)
 	}
 	// The cursor — past the last row of the batch, only after a successful commit
 	// (a transaction failure will repeat the whole batch). Batch rows filtered out
@@ -366,7 +366,7 @@ func leaseSelect(ctx context.Context, tx pgx.Tx, o LeaseOptions, after LeaseCurs
 		o.BatchSize,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("scheduler: возврат истёкших lease: выборка пачки: %w", err)
+		return nil, fmt.Errorf("scheduler: expired lease return: batch selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -374,12 +374,12 @@ func leaseSelect(ctx context.Context, tx pgx.Tx, o LeaseOptions, after LeaseCurs
 	for rows.Next() {
 		var r leaseRow
 		if err := rows.Scan(&r.zone, &r.id, &r.queuedAt); err != nil {
-			return nil, fmt.Errorf("scheduler: возврат истёкших lease: выборка пачки: чтение: %w", err)
+			return nil, fmt.Errorf("scheduler: expired lease return: batch selection: read: %w", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scheduler: возврат истёкших lease: выборка пачки: %w", err)
+		return nil, fmt.Errorf("scheduler: expired lease return: batch selection: %w", err)
 	}
 	return out, nil
 }
@@ -401,7 +401,7 @@ func leaseTranslate(ctx context.Context, tx pgx.Tx, o LeaseOptions, batch []leas
 		o.Timeout.Seconds(),
 	)
 	if err != nil {
-		return 0, fmt.Errorf("scheduler: возврат истёкших lease: перевод пачки: %w", err)
+		return 0, fmt.Errorf("scheduler: expired lease return: batch move: %w", err)
 	}
 	defer rows.Close()
 
@@ -409,12 +409,12 @@ func leaseTranslate(ctx context.Context, tx pgx.Tx, o LeaseOptions, batch []leas
 	for rows.Next() {
 		var zoneID int16
 		if err := rows.Scan(&zoneID); err != nil {
-			return 0, fmt.Errorf("scheduler: возврат истёкших lease: перевод пачки: чтение: %w", err)
+			return 0, fmt.Errorf("scheduler: expired lease return: batch move: read: %w", err)
 		}
 		n++
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("scheduler: возврат истёкших lease: перевод пачки: %w", err)
+		return 0, fmt.Errorf("scheduler: expired lease return: batch move: %w", err)
 	}
 	return n, nil
 }
@@ -448,14 +448,14 @@ func leaseTranslate(ctx context.Context, tx pgx.Tx, o LeaseOptions, batch []leas
 // expiry; in total a domain hangs for no longer than one and a half terms.
 func LeaseWatch(ctx context.Context, pool LeaseDB, opts LeaseOptions) error {
 	if pool == nil {
-		return errors.New("scheduler: возврат истёкших lease: пул не задан")
+		return errors.New("scheduler: expired lease return: pool not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("возврат доменов с истёкшим lease",
+	log.Info("returning domains with an expired lease",
 		"interval", o.Interval.String(),
 		"timeout", o.Timeout.String(),
 		"batch", o.BatchSize)
@@ -479,7 +479,7 @@ func LeaseWatch(ctx context.Context, pool LeaseDB, opts LeaseOptions) error {
 				// Cancellation during a pass is part of the stop, not an alarm;
 				// any other error — a Warn, the next drain will retry.
 				if ctx.Err() == nil {
-					log.Warn("дренаж возврата истёкших lease",
+					log.Warn("expired lease return drain",
 						"err", err, "returned", total)
 				}
 				return
@@ -487,7 +487,7 @@ func LeaseWatch(ctx context.Context, pool LeaseDB, opts LeaseOptions) error {
 			total += res.Domains
 			if res.Selected < o.BatchSize {
 				if total > 0 {
-					log.Info("дренаж возврата истёкших lease", "domains", total)
+					log.Info("expired lease return drain", "domains", total)
 				}
 				return
 			}
@@ -508,7 +508,7 @@ func LeaseWatch(ctx context.Context, pool LeaseDB, opts LeaseOptions) error {
 			res, err := LeaseNullOnce(ctx, pool, o)
 			if err != nil {
 				if ctx.Err() == nil {
-					log.Warn("ремонтный проход queued без queued_at",
+					log.Warn("repair pass: queued rows without queued_at",
 						"err", err, "returned", total)
 				}
 				return
@@ -516,7 +516,7 @@ func LeaseWatch(ctx context.Context, pool LeaseDB, opts LeaseOptions) error {
 			total += res.Domains
 			if res.Selected < o.BatchSize {
 				if total > 0 {
-					log.Warn("ремонтный проход: строки queued без queued_at возвращены в pending",
+					log.Warn("repair pass: queued rows without queued_at returned to pending",
 						"domains", total)
 				}
 				return

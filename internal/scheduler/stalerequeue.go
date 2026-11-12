@@ -270,7 +270,7 @@ func newStaleRequeueMetrics(reg *metrics.Registry) *staleRequeueMetrics {
 	return &staleRequeueMetrics{
 		requeued: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_scheduler_stale_requeued_total",
-			Help: "Компенсатор «статус повис» (ФТ-2.2 ТЗ-fsm, T-270, переход Р15 спецификации check_state): перевод check_state done → pending доменов status=new с last_checked_at старше суток — задача q:http потеряна после XADD (рестарт Redis без персистентности, OOM-окно), lease/возрастная перепроверка строку не возвращают. Каждое событие — одна переведённая строка (по RETURNING после охран); стационарно ноль, рост — потери q:http (уровень — gauge crawler_domains_new_done_stale; у границы суток непустой q:http даёт штатный полуночный борт живых доставок — дубль эпизода гасится асимметрией А3, не потери), разбор docs/runbooks.md §2.10.",
+			Help: "The \"stuck status\" compensator (FR-2.2 of the TZ-fsm spec, T-270, the R15 transition of the check_state spec): moving check_state done → pending for status=new domains with last_checked_at older than a day — the q:http task was lost after XADD (a Redis restart without persistence, an OOM window); the lease/age-based recheck do not return the row. Each event is one moved row (by RETURNING after the guards); zero in steady state, growth means lost q:http tasks (the level is the crawler_domains_new_done_stale gauge; at the midnight boundary a non-empty q:http gives the regular midnight influx of live deliveries — an episode duplicate is absorbed by the A3 asymmetry, not a loss), analysis in docs/runbooks.md §2.10.",
 		}).WithLabelValues(),
 	}
 }
@@ -297,7 +297,7 @@ func (m *staleRequeueMetrics) add(n int64) {
 // tick — until the nearest reconciliation).
 func StaleRequeueOnce(ctx context.Context, pool StaleRequeueDB, opts StaleRequeueOptions) (StaleRequeueResult, error) {
 	if pool == nil {
-		return StaleRequeueResult{}, errors.New("scheduler: компенсатор «статус повис»: пул не задан")
+		return StaleRequeueResult{}, errors.New("scheduler: stuck-status compensator: pool not set")
 	}
 	o := opts.withDefaults()
 
@@ -344,21 +344,21 @@ func StaleRequeueOnce(ctx context.Context, pool StaleRequeueDB, opts StaleRequeu
 func staleRequeueGuard(ctx context.Context, pool StaleRequeueDB) (int64, error) {
 	rows, err := pool.Query(ctx, staleRequeueGuardSQL)
 	if err != nil {
-		return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: проба уровня new_done_stale: %w", err)
+		return 0, fmt.Errorf("scheduler: stuck-status compensator: new_done_stale level probe: %w", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
-			return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: проба уровня new_done_stale: %w", err)
+			return 0, fmt.Errorf("scheduler: stuck-status compensator: new_done_stale level probe: %w", err)
 		}
-		return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: проба уровня new_done_stale: пустой ответ агрегата")
+		return 0, fmt.Errorf("scheduler: stuck-status compensator: new_done_stale level probe: empty aggregate response")
 	}
 	var n int64
 	if err := rows.Scan(&n); err != nil {
-		return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: проба уровня new_done_stale: чтение: %w", err)
+		return 0, fmt.Errorf("scheduler: stuck-status compensator: new_done_stale level probe: read: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: проба уровня new_done_stale: %w", err)
+		return 0, fmt.Errorf("scheduler: stuck-status compensator: new_done_stale level probe: %w", err)
 	}
 	return n, nil
 }
@@ -371,24 +371,24 @@ func staleRequeueGuard(ctx context.Context, pool StaleRequeueDB) (int64, error) 
 func staleRequeueBatch(ctx context.Context, pool StaleRequeueDB, cutoff time.Time, limit int) ([]staleRequeueRow, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("scheduler: компенсатор «статус повис»: транзакция выборки: %w", err)
+		return nil, fmt.Errorf("scheduler: stuck-status compensator: selection transaction: %w", err)
 	}
 	// The rollback is unconditional: after Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, staleRequeuePlanNoIndexScanSQL); err != nil {
-		return nil, fmt.Errorf("scheduler: компенсатор «статус повис»: закрепление плана: %w", err)
+		return nil, fmt.Errorf("scheduler: stuck-status compensator: plan pinning: %w", err)
 	}
 	if _, err := tx.Exec(ctx, staleRequeuePlanNoBitmapScanSQL); err != nil {
-		return nil, fmt.Errorf("scheduler: компенсатор «статус повис»: закрепление плана: %w", err)
+		return nil, fmt.Errorf("scheduler: stuck-status compensator: plan pinning: %w", err)
 	}
 	if _, err := tx.Exec(ctx, staleRequeuePlanNoIOSQL); err != nil {
-		return nil, fmt.Errorf("scheduler: компенсатор «статус повис»: закрепление плана: %w", err)
+		return nil, fmt.Errorf("scheduler: stuck-status compensator: plan pinning: %w", err)
 	}
 
 	rows, err := tx.Query(ctx, staleRequeueSelectSQL, cutoff, limit)
 	if err != nil {
-		return nil, fmt.Errorf("scheduler: компенсатор «статус повис»: выборка пачки: %w", err)
+		return nil, fmt.Errorf("scheduler: stuck-status compensator: batch selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -396,15 +396,15 @@ func staleRequeueBatch(ctx context.Context, pool StaleRequeueDB, cutoff time.Tim
 	for rows.Next() {
 		var r staleRequeueRow
 		if err := rows.Scan(&r.zone, &r.id); err != nil {
-			return nil, fmt.Errorf("scheduler: компенсатор «статус повис»: выборка пачки: чтение: %w", err)
+			return nil, fmt.Errorf("scheduler: stuck-status compensator: batch selection: read: %w", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scheduler: компенсатор «статус повис»: выборка пачки: %w", err)
+		return nil, fmt.Errorf("scheduler: stuck-status compensator: batch selection: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("scheduler: компенсатор «статус повис»: фиксация выборки: %w", err)
+		return nil, fmt.Errorf("scheduler: stuck-status compensator: selection commit: %w", err)
 	}
 	return out, nil
 }
@@ -438,7 +438,7 @@ func staleRequeueTranslate(ctx context.Context, pool StaleRequeueDB, batch []sta
 func staleRequeueTranslateOnce(ctx context.Context, pool StaleRequeueDB, zones []int16, ids []int64, cutoff time.Time) (int64, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: транзакция перевода: %w", err)
+		return 0, fmt.Errorf("scheduler: stuck-status compensator: move transaction: %w", err)
 	}
 	// The rollback is unconditional: after Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -449,7 +449,7 @@ func staleRequeueTranslateOnce(ctx context.Context, pool StaleRequeueDB, zones [
 		cutoff,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: перевод пачки: %w", err)
+		return 0, fmt.Errorf("scheduler: stuck-status compensator: batch move: %w", err)
 	}
 	defer rows.Close()
 
@@ -457,15 +457,15 @@ func staleRequeueTranslateOnce(ctx context.Context, pool StaleRequeueDB, zones [
 	for rows.Next() {
 		var zoneID int16
 		if err := rows.Scan(&zoneID); err != nil {
-			return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: перевод пачки: чтение: %w", err)
+			return 0, fmt.Errorf("scheduler: stuck-status compensator: batch move: read: %w", err)
 		}
 		n++
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: перевод пачки: %w", err)
+		return 0, fmt.Errorf("scheduler: stuck-status compensator: batch move: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("scheduler: компенсатор «статус повис»: фиксация перевода: %w", err)
+		return 0, fmt.Errorf("scheduler: stuck-status compensator: move commit: %w", err)
 	}
 	return n, nil
 }
@@ -480,14 +480,14 @@ func staleRequeueTranslateOnce(ctx context.Context, pool StaleRequeueDB, zones [
 // shutdown, spec 3.4).
 func StaleRequeueLoop(ctx context.Context, pool StaleRequeueDB, opts StaleRequeueOptions) error {
 	if pool == nil {
-		return errors.New("scheduler: компенсатор «статус повис»: пул не задан")
+		return errors.New("scheduler: stuck-status compensator: pool not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("компенсатор «статус повис»: ранний recheck new∧done",
+	log.Info("stuck-status compensator: early new∧done recheck",
 		"interval", o.Interval.String(),
 		"batch", o.BatchSize,
 		"window", StaleRequeueWindow.String())
@@ -504,7 +504,7 @@ func StaleRequeueLoop(ctx context.Context, pool StaleRequeueDB, opts StaleRequeu
 				// Cancellation during a pass is part of the stop, not an alarm;
 				// any other error — a Warn, the next drain will retry.
 				if ctx.Err() == nil {
-					log.Warn("дренаж компенсатора «статус повис»",
+					log.Warn("stuck-status compensator drain",
 						"err", err, "requeued", total)
 				}
 				return
@@ -514,7 +514,7 @@ func StaleRequeueLoop(ctx context.Context, pool StaleRequeueDB, opts StaleRequeu
 				if total > 0 {
 					// Each moved row is a lost q:http task:
 					// the event is visible to the counter and the gauge; the drain outcome goes to the log.
-					log.Info("компенсатор «статус повис»: домены возвращены в pending",
+					log.Info("stuck-status compensator: domains returned to pending",
 						"domains", total)
 				}
 				return

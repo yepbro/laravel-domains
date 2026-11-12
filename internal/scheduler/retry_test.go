@@ -82,11 +82,11 @@ func (r *retryFakeRows) Next() bool {
 
 func (r *retryFakeRows) Scan(dest ...any) error {
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
-		return errors.New("retryFakeRows: Scan без Next")
+		return errors.New("retryFakeRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("retryFakeRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("retryFakeRows: %d sinks, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		target := reflect.ValueOf(d).Elem()
@@ -142,11 +142,11 @@ type retryFakePool struct {
 }
 
 func (p *retryFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *retryFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("Exec must not be called")
 }
 
 // nextGuardLocked — the bucket sum value for the next guard read.
@@ -169,7 +169,7 @@ func (p *retryFakePool) Query(_ context.Context, sql string, args ...any) (pgx.R
 	defer p.mu.Unlock()
 	p.guardQueries = append(p.guardQueries, retryCall{sql: sql, args: args})
 	if sql != retryMatureSQL {
-		return nil, fmt.Errorf("retryFakePool: неожидаемый SQL через пул: %s", sql)
+		return nil, fmt.Errorf("retryFakePool: unexpected SQL via the pool: %s", sql)
 	}
 	if len(p.guardErrs) > 0 {
 		err := p.guardErrs[0]
@@ -291,7 +291,7 @@ func (t *retryFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.C
 		}
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	default:
-		return pgconn.CommandTag{}, fmt.Errorf("retryFakeTx: неожидаемый SQL Exec: %s", sql)
+		return pgconn.CommandTag{}, fmt.Errorf("retryFakeTx: unexpected SQL Exec: %s", sql)
 	}
 }
 
@@ -342,7 +342,7 @@ func (t *retryFakeTx) Query(_ context.Context, sql string, args ...any) (pgx.Row
 		}
 		return retryRows(), nil
 	default:
-		return nil, fmt.Errorf("retryFakeTx: неожидаемый SQL в транзакции: %s", sql)
+		return nil, fmt.Errorf("retryFakeTx: unexpected SQL in a transaction: %s", sql)
 	}
 }
 
@@ -425,7 +425,7 @@ func retryCutoffArg(t *testing.T, args []any) time.Time {
 	t.Helper()
 	cutoff, ok := args[2].(time.Time)
 	if !ok {
-		t.Fatalf("аргумент границы окна = %T, want time.Time", args[2])
+		t.Fatalf("the window boundary argument = %T, want time.Time", args[2])
 	}
 	return cutoff
 }
@@ -438,7 +438,7 @@ func retrySelectCall(t *testing.T, tx *retryFakeTx) retryCall {
 			return c
 		}
 	}
-	t.Fatalf("в транзакции %p нет SELECT кандидатов: %v", tx, tx.calls)
+	t.Fatalf("transaction %p has no candidate SELECT: %v", tx, tx.calls)
 	return retryCall{}
 }
 
@@ -456,12 +456,12 @@ func TestRetrySQLContract(t *testing.T) {
 		!strings.Contains(retrySelectSQL, "AND d.last_checked_at < $3") ||
 		!strings.Contains(retrySelectSQL, "LIMIT $4") ||
 		strings.Contains(retrySelectSQL, "ORDER BY") {
-		t.Fatalf("retrySelectSQL разошёлся с контрактом T-191 (без ORDER BY, LIMIT $4):\n%s", retrySelectSQL)
+		t.Fatalf("retrySelectSQL diverged from the T-191 contract (no ORDER BY, LIMIT $4):\n%s", retrySelectSQL)
 	}
 	if retryPlanNoIndexScanSQL != "SET LOCAL enable_indexscan = off" ||
 		retryPlanNoBitmapScanSQL != "SET LOCAL enable_bitmapscan = off" ||
 		retryPlanNoIOSQL != "SET LOCAL enable_indexonlyscan = off" {
-		t.Fatalf("закрепление плана выборки разошлось с контрактом T-191:\n%s\n%s\n%s",
+		t.Fatalf("the selection plan pinning diverged from the T-191 contract:\n%s\n%s\n%s",
 			retryPlanNoIndexScanSQL, retryPlanNoBitmapScanSQL, retryPlanNoIOSQL)
 	}
 	// The maturity buckets guard (T-202): the sum over the PK prefix range;
@@ -472,7 +472,7 @@ func TestRetrySQLContract(t *testing.T) {
 		"WHERE name >= 'retry_mature:' " +
 		"AND name < 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')"
 	if retryMatureSQL != wantGuard {
-		t.Fatalf("retryMatureSQL разошёлся с контрактом T-202:\n%s\nwant:\n%s", retryMatureSQL, wantGuard)
+		t.Fatalf("retryMatureSQL diverged from the T-202 contract:\n%s\nwant:\n%s", retryMatureSQL, wantGuard)
 	}
 	// The finalization maturity bucket decrement — in the statement itself
 	// (the rm CTE, T-202): rm references upd (the only CTE —
@@ -492,7 +492,7 @@ func TestRetrySQLContract(t *testing.T) {
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()) "
 	if !strings.Contains(retryFinalizeSQL, "RETURNING d.zone_id, d.id, d.last_checked_at") ||
 		!strings.Contains(retryFinalizeSQL, wantBasketCTE) {
-		t.Errorf("retryFinalizeSQL без декремента корзины зрелости (CTE rm, T-202):\n%s", retryFinalizeSQL)
+		t.Errorf("retryFinalizeSQL without the maturity bucket decrement (the rm CTE, T-202):\n%s", retryFinalizeSQL)
 	}
 
 	// The retry assignment — WITHOUT counters in the statement (T-267): the statement
@@ -502,10 +502,10 @@ func TestRetrySQLContract(t *testing.T) {
 	// zone holders (runbooks.md §2.8); the decrement — the second statement
 	// of the same transaction over the moved rows' dates.
 	if strings.Contains(retryRequeueSQL, "crawler_counters") {
-		t.Errorf("retryRequeueSQL пишет счётчики в операторе зон (T-267 — вынесено вторым оператором):\n%s", retryRequeueSQL)
+		t.Errorf("retryRequeueSQL writes counters in the zones statement (T-267 — moved out to a second statement):\n%s", retryRequeueSQL)
 	}
 	if retryRequeueMatureSQL != wantRetryRequeueMature {
-		t.Errorf("retryRequeueMatureSQL разошёлся с контрактом T-267:\n%s\nwant:\n%s",
+		t.Errorf("retryRequeueMatureSQL diverged from the T-267 contract:\n%s\nwant:\n%s",
 			retryRequeueMatureSQL, wantRetryRequeueMature)
 	}
 }
@@ -522,8 +522,8 @@ func TestRetryOnceGuardZero(t *testing.T) {
 		name  string
 		value int64
 	}{
-		{"сумма корзин 0", 0},
-		{"сумма корзин отрицательная (дрейф декрементов)", -1},
+		{"bucket sum 0", 0},
+		{"a negative bucket sum (decrement drift)", -1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			pool := &retryFakePool{guardVals: []int64{tt.value}}
@@ -533,13 +533,13 @@ func TestRetryOnceGuardZero(t *testing.T) {
 				t.Fatalf("RetryOnce: %v", err)
 			}
 			if res != (RetryResult{}) {
-				t.Errorf("итог = %+v, want нулевой: кандидатов нет по guard", res)
+				t.Errorf("result = %+v, want zero: no candidates by the guard", res)
 			}
 			if len(pool.guardQueries) != 1 || pool.guardQueries[0].sql != retryMatureSQL {
-				t.Errorf("guard-чтение = %v, want один запрос суммы корзин", pool.guardQueries)
+				t.Errorf("the guard read = %v, want a single bucket sum query", pool.guardQueries)
 			}
 			if st := pool.stats(); st.selects != 0 || st.begins != 0 {
-				t.Errorf("тяжёлая выборка/транзакции при сумме %d: selects=%d begins=%d, want 0 и 0",
+				t.Errorf("heavy selection/transactions at sum %d: selects=%d begins=%d, want 0 and 0",
 					tt.value, st.selects, st.begins)
 			}
 		})
@@ -554,12 +554,12 @@ func TestRetryOnceGuardEmpty(t *testing.T) {
 
 	_, err := RetryOnce(context.Background(), pool, RetryOptions{})
 	if err == nil ||
-		!strings.Contains(err.Error(), "scheduler: повторные проверки temp_error") ||
-		!strings.Contains(err.Error(), "пустой ответ агрегата") {
-		t.Errorf("ошибка = %v, want пустой ответ guard", err)
+		!strings.Contains(err.Error(), "scheduler: temp_error rechecks") ||
+		!strings.Contains(err.Error(), "empty aggregate response") {
+		t.Errorf("err = %v, want the guard's empty response", err)
 	}
 	if st := pool.stats(); st.selects != 0 || st.begins != 0 {
-		t.Errorf("тяжёлая выборка/транзакции при пустом guard: selects=%d begins=%d", st.selects, st.begins)
+		t.Errorf("heavy selection/transactions at an empty guard: selects=%d begins=%d", st.selects, st.begins)
 	}
 }
 
@@ -574,21 +574,21 @@ func TestRetryOnceEmpty(t *testing.T) {
 		t.Fatalf("RetryOnce: %v", err)
 	}
 	if res != (RetryResult{}) {
-		t.Errorf("итог = %+v, want нулевой: назначать нечего", res)
+		t.Errorf("result = %+v, want zero: nothing to assign", res)
 	}
 	st := pool.stats()
 	if st.selects != 1 {
-		t.Errorf("SELECT'ов = %d, want 1 (один холостой проход по счётчику)", st.selects)
+		t.Errorf("SELECTs = %d, want 1 (one idle pass over the counter)", st.selects)
 	}
 	if st.begins != 1 || len(pool.txs) != 1 {
-		t.Fatalf("транзакций = %d, want 1 (только выборка)", st.begins)
+		t.Fatalf("transactions = %d, want 1 (selection only)", st.begins)
 	}
 	tx := pool.txs[0]
 	if !tx.committed {
-		t.Error("транзакция выборки не зафиксирована")
+		t.Error("the selection transaction is not committed")
 	}
 	if !tx.isSelect() {
-		t.Errorf("единственная транзакция содержит UPDATE: %v", tx.calls)
+		t.Errorf("the only transaction contains an UPDATE: %v", tx.calls)
 	}
 }
 
@@ -622,77 +622,77 @@ func TestRetryOnceSQLAndFlow(t *testing.T) {
 
 	// The guard: a maturity bucket sum read via the pool, without parameters.
 	if len(pool.guardQueries) != 1 {
-		t.Fatalf("guard-чтений = %d, want 1", len(pool.guardQueries))
+		t.Fatalf("guard reads = %d, want 1", len(pool.guardQueries))
 	}
 	if pool.guardQueries[0].sql != retryMatureSQL || len(pool.guardQueries[0].args) != 0 {
-		t.Errorf("guard-чтение = %+v, want %s без параметров", pool.guardQueries[0], retryMatureSQL)
+		t.Errorf("the guard read = %+v, want %s without parameters", pool.guardQueries[0], retryMatureSQL)
 	}
 
 	// Three transactions: the selection (plan pinning + SELECT) and two batch
 	// decisions — the retry assignment and the final status separately (the 40P01
 	// deadlock regression, retryDecide).
 	if pool.begins != 3 || len(pool.txs) != 3 {
-		t.Fatalf("транзакций = %d, want 3 (выборка + повтор + итоговый статус)", pool.begins)
+		t.Fatalf("transactions = %d, want 3 (selection + the retry + the final status)", pool.begins)
 	}
 	selTx, requeueTx, finalizeTx := pool.txs[0], pool.txs[1], pool.txs[2]
 
 	// The candidate selection: the temp_error status, the done state, the batch limit.
 	sel := retrySelectCall(t, selTx)
 	if sel.sql != wantRetrySelect {
-		t.Errorf("SQL выборки:\n%s\nwant:\n%s", sel.sql, wantRetrySelect)
+		t.Errorf("selection SQL:\n%s\nwant:\n%s", sel.sql, wantRetrySelect)
 	}
 	gotStatus, gotState, gotLimit := sel.args[0], sel.args[1], sel.args[3]
 	if gotStatus != int16(model.StatusTempError) || gotState != int16(model.CheckStateDone) {
-		t.Errorf("фильтры выборки = статус %v, состояние %v, want temp_error (%d) и done (%d)",
+		t.Errorf("selection filters = status %v, state %v, want temp_error (%d) and done (%d)",
 			gotStatus, gotState, model.StatusTempError, model.CheckStateDone)
 	}
 	if gotLimit != 10 {
-		t.Errorf("лимит пачки = %v, want 10", gotLimit)
+		t.Errorf("the batch limit = %v, want 10", gotLimit)
 	}
 
 	// The decisions — each in its own transaction; the retry is TWO statements
 	// (the move + the tail bucket decrement, T-267); the final status — one.
 	if len(requeueTx.calls) != 2 {
-		t.Fatalf("вызовов в транзакции повтора = %d, want 2 (перевод + декремент корзин)", len(requeueTx.calls))
+		t.Fatalf("calls in the retry transaction = %d, want 2 (the move + the bucket decrement)", len(requeueTx.calls))
 	}
 	if requeueTx.calls[0].sql != wantRetryRequeue {
-		t.Errorf("SQL повтора:\n%s\nwant:\n%s", requeueTx.calls[0].sql, wantRetryRequeue)
+		t.Errorf("retry SQL:\n%s\nwant:\n%s", requeueTx.calls[0].sql, wantRetryRequeue)
 	}
 	if want := []any{
 		[]int16{1, 1, 2}, []int64{10, 11, 20},
 		int16(model.CheckStatePending), int16(model.StatusTempError), int16(model.CheckStateDone),
 	}; !reflect.DeepEqual(requeueTx.calls[0].args, want) {
-		t.Errorf("аргументы повтора = %v, want %v", requeueTx.calls[0].args, want)
+		t.Errorf("retry args = %v, want %v", requeueTx.calls[0].args, want)
 	}
 	if requeueTx.calls[1].sql != wantRetryRequeueMature {
-		t.Errorf("SQL декремента корзин:\n%s\nwant:\n%s", requeueTx.calls[1].sql, wantRetryRequeueMature)
+		t.Errorf("bucket decrement SQL:\n%s\nwant:\n%s", requeueTx.calls[1].sql, wantRetryRequeueMature)
 	}
 	// The decrement — by the episode dates of the moved rows (both dates equal —
 	// one bucket in the batch); the guard has no empty keys — the statement
 	// is executed.
 	if want := []any{[]time.Time{retryDay, retryDay}}; !reflect.DeepEqual(requeueTx.calls[1].args, want) {
-		t.Errorf("аргументы декремента корзин = %v, want %v", requeueTx.calls[1].args, want)
+		t.Errorf("bucket decrement args = %v, want %v", requeueTx.calls[1].args, want)
 	}
 	if len(finalizeTx.calls) != 1 {
-		t.Fatalf("вызовов в транзакции итогового статуса = %d, want 1 (декремент — в самом операторе)", len(finalizeTx.calls))
+		t.Fatalf("calls in the final status transaction = %d, want 1 (the decrement is inside the statement itself)", len(finalizeTx.calls))
 	}
 	if finalizeTx.calls[0].sql != wantRetryFinalize {
-		t.Errorf("SQL итогового статуса:\n%s\nwant:\n%s", finalizeTx.calls[0].sql, wantRetryFinalize)
+		t.Errorf("final status SQL:\n%s\nwant:\n%s", finalizeTx.calls[0].sql, wantRetryFinalize)
 	}
 	if want := []any{
 		[]int16{2, 3}, []int64{21, 30},
 		int16(model.StatusDelegatedNoAddress), int16(model.StatusTempError), int16(model.CheckStateDone),
 	}; !reflect.DeepEqual(finalizeTx.calls[0].args, want) {
-		t.Errorf("аргументы итогового статуса = %v, want %v", finalizeTx.calls[0].args, want)
+		t.Errorf("final status args = %v, want %v", finalizeTx.calls[0].args, want)
 	}
 
 	// The counters — by the rows actually affected (the guard blocked 1/11).
 	if want := (RetryResult{Requeued: 2, Finalized: 2}); res != want {
-		t.Errorf("итог = %+v, want %+v", res, want)
+		t.Errorf("result = %+v, want %+v", res, want)
 	}
 	for _, tx := range []*retryFakeTx{selTx, requeueTx, finalizeTx} {
 		if !tx.committed || tx.rolledBack {
-			t.Errorf("транзакция %p: committed=%v rolledBack=%v, want фиксация без отката", tx, tx.committed, tx.rolledBack)
+			t.Errorf("transaction %p: committed=%v rolledBack=%v, want a commit without a rollback", tx, tx.committed, tx.rolledBack)
 		}
 	}
 }
@@ -723,7 +723,7 @@ func TestRetryOnceSplitTransactions(t *testing.T) {
 	}
 
 	if len(pool.txs) != 3 {
-		t.Fatalf("транзакций = %d, want 3 (выборка + два решения)", len(pool.txs))
+		t.Fatalf("transactions = %d, want 3 (selection + two decisions)", len(pool.txs))
 	}
 	selTx, requeueTx, finalizeTx := pool.txs[0], pool.txs[1], pool.txs[2]
 
@@ -731,7 +731,7 @@ func TestRetryOnceSplitTransactions(t *testing.T) {
 	// one tx is exactly the lock order inversion.
 	for _, tx := range []*retryFakeTx{requeueTx, finalizeTx} {
 		if tx.isSelect() {
-			t.Errorf("транзакция решения содержит SELECT кандидатов: %v", tx.calls)
+			t.Errorf("the decision transaction contains a candidate SELECT: %v", tx.calls)
 		}
 	}
 	// The retry half — the move and the tail bucket decrement (by two
@@ -741,10 +741,10 @@ func TestRetryOnceSplitTransactions(t *testing.T) {
 	if len(requeueTx.calls) != 2 ||
 		requeueTx.calls[0].sql != retryRequeueSQL ||
 		requeueTx.calls[1].sql != retryRequeueMatureSQL {
-		t.Errorf("транзакция повтора = %v, want retryRequeueSQL + retryRequeueMatureSQL", requeueTx.calls)
+		t.Errorf("the retry transaction = %v, want retryRequeueSQL + retryRequeueMatureSQL", requeueTx.calls)
 	}
 	if len(finalizeTx.calls) != 1 || finalizeTx.calls[0].sql != retryFinalizeSQL {
-		t.Errorf("транзакция итогового статуса = %v, want только retryFinalizeSQL", finalizeTx.calls)
+		t.Errorf("the final status transaction = %v, want retryFinalizeSQL only", finalizeTx.calls)
 	}
 
 	// The pool's event order: the retry's Commit strictly before the final
@@ -752,12 +752,12 @@ func TestRetryOnceSplitTransactions(t *testing.T) {
 	// second half's domains row capture.
 	if requeueTx.commitSeq == 0 || finalizeTx.beginSeq == 0 ||
 		requeueTx.commitSeq > finalizeTx.beginSeq {
-		t.Errorf("порядок событий: commit повтора %d, begin итога %d — want commit прежде begin",
+		t.Errorf("the event order: the retry commit %d, the final begin %d — want the commit before the begin",
 			requeueTx.commitSeq, finalizeTx.beginSeq)
 	}
 	for _, tx := range []*retryFakeTx{selTx, requeueTx, finalizeTx} {
 		if !tx.committed || tx.rolledBack {
-			t.Errorf("транзакция %p: committed=%v rolledBack=%v, want фиксация без отката", tx, tx.committed, tx.rolledBack)
+			t.Errorf("transaction %p: committed=%v rolledBack=%v, want a commit without a rollback", tx, tx.committed, tx.rolledBack)
 		}
 	}
 }
@@ -776,21 +776,21 @@ func TestRetryOnceSelectPlan(t *testing.T) {
 		t.Fatalf("RetryOnce: %v", err)
 	}
 	if len(pool.txs) != 2 {
-		t.Fatalf("транзакций = %d, want 2", len(pool.txs))
+		t.Fatalf("transactions = %d, want 2", len(pool.txs))
 	}
 	calls := pool.txs[0].calls
 	if len(calls) != 4 {
-		t.Fatalf("вызовов в транзакции выборки = %d, want 4 (SET LOCAL ×3 + SELECT): %v", len(calls), calls)
+		t.Fatalf("calls in the selection transaction = %d, want 4 (SET LOCAL ×3 + SELECT): %v", len(calls), calls)
 	}
 	if want := []string{retryPlanNoIndexScanSQL, retryPlanNoBitmapScanSQL, retryPlanNoIOSQL, retrySelectSQL}; true {
 		for i, sql := range want {
 			if calls[i].sql != sql {
-				t.Errorf("шаг %d = %s, want %s (порядок SET LOCAL ×3 → SELECT)", i, calls[i].sql, sql)
+				t.Errorf("step %d = %s, want %s (the SET LOCAL ×3 → SELECT order)", i, calls[i].sql, sql)
 			}
 		}
 	}
 	if st := pool.stats(); st.guards != 1 {
-		t.Errorf("guard-чтений = %d, want 1 (guard — до транзакции выборки)", st.guards)
+		t.Errorf("guard reads = %d, want 1 (the guard before the selection transaction)", st.guards)
 	}
 }
 
@@ -804,8 +804,8 @@ func TestRetryOnceCutoff(t *testing.T) {
 		opts       RetryOptions
 		wantWindow time.Duration
 	}{
-		{"дефолт 24ч", RetryOptions{}, DefaultRetryAfter},
-		{"явное окно 2ч", RetryOptions{RetryAfter: 2 * time.Hour}, 2 * time.Hour},
+		{"the 24h default", RetryOptions{}, DefaultRetryAfter},
+		{"an explicit 2h window", RetryOptions{RetryAfter: 2 * time.Hour}, 2 * time.Hour},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -818,7 +818,7 @@ func TestRetryOnceCutoff(t *testing.T) {
 			want := before.Add(-tt.wantWindow)
 			// The pass moment is not deterministic — we check with a tolerance.
 			if cutoff.Before(want.Add(-time.Minute)) || cutoff.After(time.Now().Add(-tt.wantWindow)) {
-				t.Errorf("граница окна = %s, want ≈ now − %s", cutoff, tt.wantWindow)
+				t.Errorf("the window boundary = %s, want ≈ now − %s", cutoff, tt.wantWindow)
 			}
 		})
 	}
@@ -834,12 +834,12 @@ func TestRetryOnceAttemptBoundaries(t *testing.T) {
 		attempts    int16
 		wantRequeue bool
 	}{
-		{"0 из 3", RetryOptions{}, 0, true},
-		{"N−1 из 3", RetryOptions{}, 2, true},
-		{"N из 3", RetryOptions{}, 3, false},
-		{"N+1 из 3 (защита от перебора)", RetryOptions{}, 4, false},
-		{"N−1 из 1", RetryOptions{MaxRetries: 1}, 0, true},
-		{"N из 1", RetryOptions{MaxRetries: 1}, 1, false},
+		{"0 of 3", RetryOptions{}, 0, true},
+		{"N−1 of 3", RetryOptions{}, 2, true},
+		{"N of 3", RetryOptions{}, 3, false},
+		{"N+1 of 3 (an overrun guard)", RetryOptions{}, 4, false},
+		{"N−1 of 1", RetryOptions{MaxRetries: 1}, 0, true},
+		{"N of 1", RetryOptions{MaxRetries: 1}, 1, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -858,18 +858,18 @@ func TestRetryOnceAttemptBoundaries(t *testing.T) {
 			tx := pool.txs[1] // the update transaction — the second one
 			if tt.wantRequeue {
 				if res != (RetryResult{Requeued: 1}) {
-					t.Errorf("итог = %+v, want повтор одной проверки", res)
+					t.Errorf("result = %+v, want one check retried", res)
 				}
 				if len(tx.calls) != 2 || tx.calls[0].sql != wantRetryRequeue ||
 					tx.calls[1].sql != retryRequeueMatureSQL {
-					t.Errorf("вызовы = %d, want перевод + декремент корзин", len(tx.calls))
+					t.Errorf("calls = %d, want the move + the bucket decrement", len(tx.calls))
 				}
 			} else {
 				if res != (RetryResult{Finalized: 1}) {
-					t.Errorf("итог = %+v, want один итоговый статус", res)
+					t.Errorf("result = %+v, want a single final status", res)
 				}
 				if len(tx.calls) != 1 || tx.calls[0].sql != wantRetryFinalize {
-					t.Errorf("вызовы = %d, want только итоговый статус", len(tx.calls))
+					t.Errorf("calls = %d, want the final status only", len(tx.calls))
 				}
 			}
 		})
@@ -884,7 +884,7 @@ func TestRetryOnceDefaultBatch(t *testing.T) {
 		t.Fatalf("RetryOnce: %v", err)
 	}
 	if got := retrySelectCall(t, pool.txs[0]).args[3]; got != DefaultRetryBatch {
-		t.Errorf("лимит пачки = %v, want дефолт %d", got, DefaultRetryBatch)
+		t.Errorf("the batch limit = %v, want the default %d", got, DefaultRetryBatch)
 	}
 }
 
@@ -899,26 +899,26 @@ func TestRetryOnceRepeatPasses(t *testing.T) {
 
 	first, err := RetryOnce(context.Background(), pool, RetryOptions{})
 	if err != nil {
-		t.Fatalf("первый проход: %v", err)
+		t.Fatalf("the first pass: %v", err)
 	}
 	if first.Requeued != 1 {
-		t.Fatalf("первый проход = %+v, want 1 повтор", first)
+		t.Fatalf("the first pass = %+v, want 1 retry", first)
 	}
 
 	second, err := RetryOnce(context.Background(), pool, RetryOptions{})
 	if err != nil {
-		t.Fatalf("второй проход: %v", err)
+		t.Fatalf("the second pass: %v", err)
 	}
 	if second != (RetryResult{}) {
-		t.Errorf("второй проход = %+v, want нулевой", second)
+		t.Errorf("the second pass = %+v, want zero", second)
 	}
 	if st := pool.stats(); st.selects != 2 {
-		t.Errorf("SELECT'ов = %d, want 2 (по одному на проход)", st.selects)
+		t.Errorf("SELECTs = %d, want 2 (one per pass)", st.selects)
 	}
 	// The first pass: the selection and update transactions; the second — only
 	// the selection (empty): rows moved to pending are not candidates.
 	if st := pool.stats(); st.begins != 3 {
-		t.Errorf("транзакций = %d, want 3: повторный проход не открывает обновление", st.begins)
+		t.Errorf("transactions = %d, want 3: a repeated pass does not open an update", st.begins)
 	}
 }
 
@@ -937,13 +937,13 @@ func TestRetryOnceGuardedAway(t *testing.T) {
 		t.Fatalf("RetryOnce: %v", err)
 	}
 	if res != (RetryResult{}) {
-		t.Errorf("итог = %+v, want нулевой: охрана отбила кандидата", res)
+		t.Errorf("result = %+v, want zero: the guard fought off the candidate", res)
 	}
 	if !pool.txs[1].committed {
-		t.Error("транзакция обновления не зафиксирована: пустой RETURNING — не ошибка")
+		t.Error("the update transaction is not committed: an empty RETURNING is not an error")
 	}
 	if len(pool.txs[1].calls) != 1 || pool.txs[1].calls[0].sql != retryRequeueSQL {
-		t.Errorf("транзакция повтора = %v, want только retryRequeueSQL (декремент — по непустым ключам)", pool.txs[1].calls)
+		t.Errorf("the retry transaction = %v, want retryRequeueSQL only (the decrement by non-empty keys)", pool.txs[1].calls)
 	}
 }
 
@@ -960,62 +960,62 @@ func TestRetryOnceErrors(t *testing.T) {
 		pool    *retryFakePool
 		context string // the expected message fragment
 	}{
-		{"ошибка guard", func() *retryFakePool {
-			p := &retryFakePool{guardErrs: []error{errors.New("бд недоступна")}}
+		{"the guard error", func() *retryFakePool {
+			p := &retryFakePool{guardErrs: []error{errors.New("db unavailable")}}
 			return p
-		}(), "корзины зрелости"},
-		{"ошибка закрепления плана", func() *retryFakePool {
+		}(), "maturity buckets"},
+		{"the plan pinning error", func() *retryFakePool {
 			p := newPool()
-			p.planErr = errors.New("бд недоступна")
+			p.planErr = errors.New("db unavailable")
 			return p
-		}(), "закрепление плана"},
-		{"ошибка SELECT", func() *retryFakePool {
+		}(), "plan pinning"},
+		{"the SELECT error", func() *retryFakePool {
 			p := newPool()
-			p.selectErrs = []error{errors.New("бд недоступна")}
+			p.selectErrs = []error{errors.New("db unavailable")}
 			return p
-		}(), "выборка кандидатов"},
-		{"ошибка Begin", func() *retryFakePool {
+		}(), "candidate selection"},
+		{"the Begin error", func() *retryFakePool {
 			p := newPool()
-			p.beginErr = errors.New("бд недоступна")
+			p.beginErr = errors.New("db unavailable")
 			return p
-		}(), "транзакция выборки"},
-		{"ошибка повтора", func() *retryFakePool {
+		}(), "selection transaction"},
+		{"the retry error", func() *retryFakePool {
 			p := newPool()
-			p.requeueErr = errors.New("бд недоступна")
+			p.requeueErr = errors.New("db unavailable")
 			return p
-		}(), "назначение повтора"},
-		{"ошибка декремента корзин", func() *retryFakePool {
+		}(), "retry assignment"},
+		{"the bucket decrement error", func() *retryFakePool {
 			p := newPool()
-			p.matureErr = errors.New("бд недоступна")
+			p.matureErr = errors.New("db unavailable")
 			return p
-		}(), "декремент корзин зрелости"},
-		{"ошибка итога", func() *retryFakePool {
+		}(), "maturity bucket decrement"},
+		{"the final error", func() *retryFakePool {
 			// A candidate with exhausted attempts — the final status
 			// branch runs.
 			p := newPool()
 			p.selects = []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(DefaultRetryMaxRetries)})}
-			p.finalizeErr = errors.New("бд недоступна")
+			p.finalizeErr = errors.New("db unavailable")
 			return p
-		}(), "итоговый статус"},
-		{"ошибка Begin решения", func() *retryFakePool {
+		}(), "final status"},
+		{"the decision Begin error", func() *retryFakePool {
 			// The selection passes; the retry assignment transaction does not
 			// open (after the decision split — an independent
 			// failure point).
 			p := newPool()
-			p.beginErrs = []error{nil, errors.New("бд недоступна")}
+			p.beginErrs = []error{nil, errors.New("db unavailable")}
 			return p
-		}(), "транзакция решения (назначение повтора)"},
-		{"ошибка Commit выборки", func() *retryFakePool {
+		}(), "decision transaction (retry assignment)"},
+		{"the selection Commit error", func() *retryFakePool {
 			p := newPool()
-			p.commitErrs = []error{errors.New("бд недоступна")}
+			p.commitErrs = []error{errors.New("db unavailable")}
 			return p
-		}(), "фиксация выборки"},
-		{"ошибка Commit повтора", func() *retryFakePool {
+		}(), "selection commit"},
+		{"the retry Commit error", func() *retryFakePool {
 			p := newPool()
-			p.commitErrs = []error{nil, errors.New("бд недоступна")}
+			p.commitErrs = []error{nil, errors.New("db unavailable")}
 			return p
-		}(), "фиксация решения (назначение повтора)"},
-		{"ошибка Commit итога", func() *retryFakePool {
+		}(), "decision commit (retry assignment)"},
+		{"the final Commit error", func() *retryFakePool {
 			// A mixed batch: the retry commit passes; the final status
 			// commit — does not; the committed half is not
 			// rolled back (separate decision transactions).
@@ -1024,20 +1024,20 @@ func TestRetryOnceErrors(t *testing.T) {
 				[]any{int16(1), int64(10), int16(0)},
 				[]any{int16(2), int64(20), int16(DefaultRetryMaxRetries)},
 			)}
-			p.commitErrs = []error{nil, nil, errors.New("бд недоступна")}
+			p.commitErrs = []error{nil, nil, errors.New("db unavailable")}
 			return p
-		}(), "фиксация решения (итоговый статус)"},
+		}(), "decision commit (final status)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := RetryOnce(context.Background(), tt.pool, RetryOptions{})
 			if err == nil {
-				t.Fatal("ожидалась ошибка")
+				t.Fatal("an error was expected")
 			}
-			if !strings.Contains(err.Error(), "scheduler: повторные проверки temp_error") ||
+			if !strings.Contains(err.Error(), "scheduler: temp_error rechecks") ||
 				!strings.Contains(err.Error(), tt.context) ||
-				!strings.Contains(err.Error(), "бд недоступна") {
-				t.Errorf("сообщение = %q, want контекст %q и исходная ошибка", err, tt.context)
+				!strings.Contains(err.Error(), "db unavailable") {
+				t.Errorf("message = %q, want the %q context and the original error", err, tt.context)
 			}
 			// Separate decision transactions (the 40P01 regression): on a pass
 			// error only the half BEFORE the failure point can be committed —
@@ -1050,10 +1050,10 @@ func TestRetryOnceErrors(t *testing.T) {
 			// uncommitted ones.
 			for i, tx := range tt.pool.txs {
 				if !tx.committed && !tx.rolledBack {
-					t.Errorf("транзакция не откачена при ошибке %q", tt.name)
+					t.Errorf("the transaction is not rolled back on the %q error", tt.name)
 				}
 				if !tx.committed && !tx.isSelect() && i != len(tt.pool.txs)-1 {
-					t.Errorf("после откаченной транзакции решений открыта ещё одна (кейс %q)", tt.name)
+					t.Errorf("after the rolled back decision transaction another one is open (case %q)", tt.name)
 				}
 			}
 		})
@@ -1072,23 +1072,23 @@ func TestRetryOnceMatureRollback(t *testing.T) {
 			[]any{int16(1), int64(10), int16(0)}, // a retry — the move passes, the decrement fails
 		)},
 		requeues:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
-		matureErr: errors.New("бд недоступна"),
+		matureErr: errors.New("db unavailable"),
 	}
 
 	_, err := RetryOnce(context.Background(), pool, RetryOptions{})
-	if err == nil || !strings.Contains(err.Error(), "декремент корзин зрелости") ||
+	if err == nil || !strings.Contains(err.Error(), "maturity bucket decrement") ||
 		!errors.Is(err, pool.matureErr) {
-		t.Fatalf("ошибка = %v, want «декремент корзин зрелости» и исходная", err)
+		t.Fatalf("err = %v, want \"maturity bucket decrement\" and the original", err)
 	}
 	if len(pool.txs) != 2 {
-		t.Fatalf("транзакций = %d, want 2 (выборка + половина повтора)", len(pool.txs))
+		t.Fatalf("transactions = %d, want 2 (selection + half of the retry)", len(pool.txs))
 	}
 	half := pool.txs[1]
 	if half.committed || !half.rolledBack {
-		t.Error("половина повтора зафиксирована или не откачена при сбое декремента")
+		t.Error("half of the retry is committed or not rolled back on the decrement failure")
 	}
 	if len(half.calls) != 2 || half.calls[0].sql != retryRequeueSQL || half.calls[1].sql != retryRequeueMatureSQL {
-		t.Errorf("транзакция повтора = %v, want перевод + упавший декремент корзин", half.calls)
+		t.Errorf("the retry transaction = %v, want the move + the failed bucket decrement", half.calls)
 	}
 }
 
@@ -1106,24 +1106,24 @@ func TestRetryOnceHalfCommittedOnError(t *testing.T) {
 		)},
 		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
 		// The selection and the retry commit; the final's commit — an error.
-		commitErrs: []error{nil, nil, errors.New("бд недоступна")},
+		commitErrs: []error{nil, nil, errors.New("db unavailable")},
 	}
 
 	res, err := RetryOnce(context.Background(), pool, RetryOptions{})
-	if err == nil || !strings.Contains(err.Error(), "фиксация решения (итоговый статус)") {
-		t.Fatalf("ошибка = %v, want сбой фиксации итогового статуса", err)
+	if err == nil || !strings.Contains(err.Error(), "decision commit (final status)") {
+		t.Fatalf("err = %v, want the final status commit failure", err)
 	}
 	if res != (RetryResult{}) {
-		t.Errorf("итог при ошибке = %+v, want нулевой (вызыватель видит только ошибку)", res)
+		t.Errorf("the result on error = %+v, want zero (the caller sees only the error)", res)
 	}
 	if len(pool.txs) != 3 {
-		t.Fatalf("транзакций = %d, want 3", len(pool.txs))
+		t.Fatalf("transactions = %d, want 3", len(pool.txs))
 	}
 	if !pool.txs[1].committed || pool.txs[1].rolledBack {
-		t.Error("половина повтора не зафиксирована: сбой второй половины не откатывает первую")
+		t.Error("half of the retry is not committed: the second half's failure does not roll back the first")
 	}
 	if pool.txs[2].committed || !pool.txs[2].rolledBack {
-		t.Error("половина итогового статуса зафиксирована или не откачена при сбое Commit")
+		t.Error("half of the final status is committed or not rolled back on the Commit failure")
 	}
 }
 
@@ -1132,12 +1132,12 @@ func TestRetryOnceHalfCommittedOnError(t *testing.T) {
 func TestRetryOnceCtxCanceled(t *testing.T) {
 	guardPool := &retryFakePool{guardErrs: []error{context.Canceled}}
 	if _, err := RetryOnce(context.Background(), guardPool, RetryOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка guard = %v, want context.Canceled", err)
+		t.Errorf("the guard error = %v, want context.Canceled", err)
 	}
 
 	selectPool := &retryFakePool{selectErrs: []error{context.Canceled}}
 	if _, err := RetryOnce(context.Background(), selectPool, RetryOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка выборки = %v, want context.Canceled", err)
+		t.Errorf("the selection error = %v, want context.Canceled", err)
 	}
 
 	requeuePool := &retryFakePool{
@@ -1146,10 +1146,10 @@ func TestRetryOnceCtxCanceled(t *testing.T) {
 	}
 	requeuePool.requeueErr = context.Canceled
 	if _, err := RetryOnce(context.Background(), requeuePool, RetryOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка повтора = %v, want context.Canceled", err)
+		t.Errorf("the retry error = %v, want context.Canceled", err)
 	}
 	if requeuePool.txs[1].committed {
-		t.Error("транзакция обновления закоммичена при отмене контекста")
+		t.Error("the update transaction is committed on a context cancellation")
 	}
 }
 
@@ -1164,18 +1164,18 @@ func TestRetryOnceRowsErrors(t *testing.T) {
 		[]any{int16(2), int64(20)},
 	)}}
 	if _, err := RetryOnce(context.Background(), scanPool, RetryOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "чтение кандидатов") {
-		t.Errorf("ошибка Scan кандидатов = %v, want «чтение кандидатов»", err)
+		!strings.Contains(err.Error(), "candidate read") {
+		t.Errorf("the candidate Scan error = %v, want \"candidate read\"", err)
 	}
 
 	// rows.Err after reading the candidates.
-	boom := errors.New("бд недоступна")
+	boom := errors.New("db unavailable")
 	candRows := retryRows([]any{int16(1), int64(10), int16(0)})
 	candRows.err = boom
 	candPool := &retryFakePool{selects: []*retryFakeRows{candRows}}
 	_, err := RetryOnce(context.Background(), candPool, RetryOptions{})
-	if err == nil || !strings.Contains(err.Error(), "выборка кандидатов") || !errors.Is(err, boom) {
-		t.Errorf("ошибка rows.Err кандидатов = %v, want «выборка кандидатов» и исходная", err)
+	if err == nil || !strings.Contains(err.Error(), "candidate selection") || !errors.Is(err, boom) {
+		t.Errorf("the candidates rows.Err error = %v, want \"candidate selection\" and the original", err)
 	}
 
 	// The RETURNING key Scan: the second row with one column instead of three
@@ -1185,8 +1185,8 @@ func TestRetryOnceRowsErrors(t *testing.T) {
 		requeues: []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay}, []any{int16(2)})},
 	}
 	if _, err := RetryOnce(context.Background(), keyScanPool, RetryOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "чтение ключей") {
-		t.Errorf("ошибка Scan ключей = %v, want «чтение ключей»", err)
+		!strings.Contains(err.Error(), "key read") {
+		t.Errorf("the key Scan error = %v, want \"key read\"", err)
 	}
 
 	// rows.Err after reading the RETURNING keys.
@@ -1197,16 +1197,16 @@ func TestRetryOnceRowsErrors(t *testing.T) {
 		requeues: []*retryFakeRows{keyRows},
 	}
 	_, err = RetryOnce(context.Background(), keyPool, RetryOptions{})
-	if err == nil || !strings.Contains(err.Error(), "назначение повтора") || !errors.Is(err, boom) {
-		t.Errorf("ошибка rows.Err обновления = %v, want «назначение повтора» и исходная", err)
+	if err == nil || !strings.Contains(err.Error(), "retry assignment") || !errors.Is(err, boom) {
+		t.Errorf("the update rows.Err error = %v, want \"retry assignment\" and the original", err)
 	}
 }
 
 // TestRetryOnceNilPool — the pool must be set.
 func TestRetryOnceNilPool(t *testing.T) {
 	if _, err := RetryOnce(context.Background(), nil, RetryOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+		!strings.Contains(err.Error(), "pool not set") {
+		t.Errorf("err = %v, want \"pool not set\"", err)
 	}
 }
 
@@ -1244,28 +1244,28 @@ func TestRetryOnceDeadlockRetry(t *testing.T) {
 
 	res, err := RetryOnce(context.Background(), pool, RetryOptions{Metrics: reg})
 	if err != nil {
-		t.Fatalf("RetryOnce: %v, want nil — дедлок поглощён", err)
+		t.Fatalf("RetryOnce: %v, want nil — the deadlock is absorbed", err)
 	}
 	if res.Requeued != 1 || res.Finalized != 0 {
-		t.Fatalf("итог = %+v, want повтор одного домена", res)
+		t.Fatalf("result = %+v, want one domain retried", res)
 	}
 	// Transactions: the selection + TWO decision attempts — the first rolled back
 	// (no move), the second committed.
 	if len(pool.txs) != 3 {
-		t.Fatalf("транзакций = %d, want 3 (выборка + попытка + повтор)", len(pool.txs))
+		t.Fatalf("transactions = %d, want 3 (selection + the attempt + the retry)", len(pool.txs))
 	}
 	failTx, okTx := pool.txs[1], pool.txs[2]
 	if failTx.committed || !failTx.rolledBack {
-		t.Error("первая попытка не откачена при дедлоке")
+		t.Error("the first attempt is not rolled back on the deadlock")
 	}
 	if len(failTx.calls) != 1 || failTx.calls[0].sql != retryRequeueSQL {
-		t.Errorf("попытка = %v, want только упавший перевод (декремент не открывался)", failTx.calls)
+		t.Errorf("the attempt = %v, want the failed move only (the decrement never opened)", failTx.calls)
 	}
 	if !okTx.committed || okTx.rolledBack {
-		t.Error("повтор не зафиксирован")
+		t.Error("the retry is not committed")
 	}
 	if len(okTx.calls) != 2 || okTx.calls[0].sql != retryRequeueSQL || okTx.calls[1].sql != retryRequeueMatureSQL {
-		t.Errorf("повтор = %v, want перевод + декремент корзин", okTx.calls)
+		t.Errorf("the retry = %v, want the move + the bucket decrement", okTx.calls)
 	}
 	if got := retryDeadlockValue(t, reg); got != 1 {
 		t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
@@ -1285,23 +1285,23 @@ func TestRetryOnceDeadlockExhausted(t *testing.T) {
 
 	res, err := RetryOnce(context.Background(), pool, RetryOptions{Metrics: reg})
 	if err == nil || !db.IsDeadlock(err) ||
-		!strings.Contains(err.Error(), "назначение повтора") {
-		t.Fatalf("ошибка = %v, want 40P01 «назначение повтора» наружу", err)
+		!strings.Contains(err.Error(), "retry assignment") {
+		t.Fatalf("err = %v, want 40P01 \"retry assignment\" outward", err)
 	}
 	if res != (RetryResult{}) {
-		t.Errorf("итог при ошибке = %+v, want нулевой", res)
+		t.Errorf("the result on error = %+v, want zero", res)
 	}
 	// The selection + the first attempt + MaxDeadlockRetries retries — all
 	// rolled back; none reached the bucket decrement.
 	if len(pool.txs) != 2+db.MaxDeadlockRetries {
-		t.Fatalf("транзакций = %d, want %d (выборка + попытки)", len(pool.txs), 2+db.MaxDeadlockRetries)
+		t.Fatalf("transactions = %d, want %d (selection + attempts)", len(pool.txs), 2+db.MaxDeadlockRetries)
 	}
 	for _, tx := range pool.txs[1:] {
 		if tx.committed || !tx.rolledBack {
-			t.Errorf("попытка решения %p: committed=%v rolledBack=%v, want откат", tx, tx.committed, tx.rolledBack)
+			t.Errorf("decision attempt %p: committed=%v rolledBack=%v, want a rollback", tx, tx.committed, tx.rolledBack)
 		}
 		if len(tx.calls) != 1 || tx.calls[0].sql != retryRequeueSQL {
-			t.Errorf("попытка %p = %v, want только упавший перевод", tx, tx.calls)
+			t.Errorf("the attempt %p = %v, want the failed move only", tx, tx.calls)
 		}
 	}
 	if got := retryDeadlockValue(t, reg); got != db.MaxDeadlockRetries {
@@ -1315,7 +1315,7 @@ func TestRetryOptionsDefaults(t *testing.T) {
 	// The defaults are pinned by spec 5.3 literals: the retry window of 24 hours, the batch
 	// of 1000 — comparing with the very constant does not notice mutations.
 	if DefaultRetryAfter != 24*time.Hour {
-		t.Errorf("DefaultRetryAfter = %v, want 24ч", DefaultRetryAfter)
+		t.Errorf("DefaultRetryAfter = %v, want 24h", DefaultRetryAfter)
 	}
 	if DefaultRetryBatch != 1000 {
 		t.Errorf("DefaultRetryBatch = %d, want 1000", DefaultRetryBatch)
@@ -1336,23 +1336,23 @@ func TestRetryOptionsDefaults(t *testing.T) {
 	// A short window shrinks the interval: the loop does not oversleep its retry_after.
 	short := RetryOptions{RetryAfter: time.Minute}.withDefaults()
 	if short.Interval != time.Minute {
-		t.Errorf("интервал при retry_after 1м = %s, want 1м (min окна и часа)", short.Interval)
+		t.Errorf("the interval at retry_after 1m = %s, want 1m (the min of the window and the hour)", short.Interval)
 	}
 
 	set := RetryOptions{
 		RetryAfter: time.Hour, MaxRetries: 5, BatchSize: 7, Interval: 9 * time.Hour,
 	}.withDefaults()
 	if set.RetryAfter != time.Hour || set.MaxRetries != 5 || set.BatchSize != 7 || set.Interval != 9*time.Hour {
-		t.Errorf("withDefaults затирает заданные значения: %+v", set)
+		t.Errorf("withDefaults overwrites the given values: %+v", set)
 	}
 
 	// Replacement boundaries: 1 ns is a positive value, not replaced by a
 	// default (the window and the interval — independently of each other).
 	if got := (RetryOptions{RetryAfter: time.Nanosecond}).withDefaults().RetryAfter; got != time.Nanosecond {
-		t.Errorf("RetryAfter 1нс = %v, want без замены", got)
+		t.Errorf("RetryAfter 1ns = %v, want no replacement", got)
 	}
 	if got := (RetryOptions{Interval: time.Nanosecond}).withDefaults().Interval; got != time.Nanosecond {
-		t.Errorf("Interval 1нс = %v, want без замены", got)
+		t.Errorf("Interval 1ns = %v, want no replacement", got)
 	}
 }
 
@@ -1371,7 +1371,7 @@ func TestRetryTempErrorsLoop(t *testing.T) {
 			retryRows([]any{int16(1), int64(10), int16(0)}),
 			retryRows(),
 		},
-		selectErrs: []error{nil, errors.New("бд недоступна")},
+		selectErrs: []error{nil, errors.New("db unavailable")},
 		requeues: []*retryFakeRows{retryRows(
 			[]any{int16(1), int64(10), retryDay},
 		)},
@@ -1394,14 +1394,14 @@ func TestRetryTempErrorsLoop(t *testing.T) {
 	for pool.stats().selects < 3 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("цикл не дошёл до третьего прохода: %+v", pool.stats())
+			t.Fatalf("the loop did not reach the third pass: %+v", pool.stats())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
 
 	if err := <-done; err != nil {
-		t.Fatalf("RetryTempErrors: %v, want nil при отмене ctx", err)
+		t.Fatalf("RetryTempErrors: %v, want nil on ctx cancellation", err)
 	}
 
 	st := pool.stats()
@@ -1414,22 +1414,22 @@ func TestRetryTempErrorsLoop(t *testing.T) {
 	// The pass discipline is the same in all outcomes: commits ≤ begins,
 	// the spread is exactly that extra pass.
 	if st.begins < 4 || st.begins > 5 {
-		t.Errorf("транзакций %d, want 4–5 (гонка тика с отменой)", st.begins)
+		t.Errorf("transactions %d, want 4–5 (the tick racing the cancellation)", st.begins)
 	}
 	if st.commits < 3 || st.commits > 4 || st.commits > st.begins {
-		t.Errorf("коммитов %d при транзакциях %d, want 3–4 и не больше begins",
+		t.Errorf("commits %d at transactions %d, want 3–4 and no more than begins",
 			st.commits, st.begins)
 	}
 
 	log := buf.String()
 	for _, want := range []string{
-		"фоновые повторные проверки temp_error", // the start
-		"дренаж повторных проверок temp_error",  // the first drain's outcome
+		"background temp_error rechecks", // the start
+		"temp_error recheck drain",  // the first drain's outcome
 		"requeued=1",    // the pass counters
-		"бд недоступна", // the second pass's error
+		"db unavailable", // the second pass's error
 	} {
 		if !strings.Contains(log, want) {
-			t.Errorf("лог не содержит %q:\n%s", want, log)
+			t.Errorf("log does not contain %q:\n%s", want, log)
 		}
 	}
 }
@@ -1466,7 +1466,7 @@ func TestRetryTempErrorsDrain(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for pool.stats().selects < 3 {
 		if time.Now().After(deadline) {
-			t.Fatalf("дренаж не дошёл до исчерпания: %+v", pool.stats())
+			t.Fatalf("the drain did not reach exhaustion: %+v", pool.stats())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1478,7 +1478,7 @@ func TestRetryTempErrorsDrain(t *testing.T) {
 	// Both batches in one drain: three selections + two updates, all
 	// committed.
 	if st.begins != 5 || st.commits != 5 {
-		t.Errorf("транзакций %d, коммитов %d, want 5 и 5", st.begins, st.commits)
+		t.Errorf("transactions %d, commits %d, want 5 and 5", st.begins, st.commits)
 	}
 }
 
@@ -1497,7 +1497,7 @@ func TestRetryTempErrorsDrainTotals(t *testing.T) {
 		want      string // a substring of the drain's Info outcome; "" — the outcome is not logged
 	}{
 		{
-			name: "две полные пачки повторов — сумма 2",
+			name: "two full retry batches — the sum 2",
 			selects: []*retryFakeRows{
 				retryRows([]any{int16(1), int64(10), int16(0)}),
 				retryRows([]any{int16(2), int64(20), int16(0)}),
@@ -1510,7 +1510,7 @@ func TestRetryTempErrorsDrainTotals(t *testing.T) {
 			want: "requeued=2",
 		},
 		{
-			name: "две полные пачки итогов — сумма 2",
+			name: "two full final batches — the sum 2",
 			selects: []*retryFakeRows{
 				retryRows([]any{int16(1), int64(10), int16(3)}),
 				retryRows([]any{int16(2), int64(20), int16(3)}),
@@ -1523,14 +1523,14 @@ func TestRetryTempErrorsDrainTotals(t *testing.T) {
 			want: "finalized=2",
 		},
 		{
-			name:      "одна полная пачка итогов — сумма 1",
+			name:      "one full final batch — the sum 1",
 			selects:   []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(3)})},
 			finalizes: []*retryFakeRows{retryRows([]any{int16(1), int64(10)})},
 			opts:      RetryOptions{BatchSize: 1},
 			want:      "finalized=1",
 		},
 		{
-			name: "пустой дренаж — без итога",
+			name: "an empty drain — no final",
 			want: "",
 		},
 	}
@@ -1556,11 +1556,11 @@ func TestRetryTempErrorsDrainTotals(t *testing.T) {
 			}
 			log := buf.String()
 			if tt.want == "" {
-				if strings.Contains(log, "дренаж повторных проверок temp_error") {
-					t.Errorf("нулевой дренаж подводит итог:\n%s", log)
+				if strings.Contains(log, "temp_error recheck drain") {
+					t.Errorf("a zero drain summarizes:\n%s", log)
 				}
 			} else if !strings.Contains(log, tt.want) {
-				t.Errorf("лог не содержит %q:\n%s", tt.want, log)
+				t.Errorf("log does not contain %q:\n%s", tt.want, log)
 			}
 		})
 	}
@@ -1590,11 +1590,11 @@ func TestRetryTempErrorsCancelDuringDrain(t *testing.T) {
 	}()
 
 	if err := <-done; err != nil {
-		t.Fatalf("RetryTempErrors: %v, want nil при отмене ctx", err)
+		t.Fatalf("RetryTempErrors: %v, want nil on ctx cancellation", err)
 	}
 	log := buf.String()
 	if strings.Contains(log, "level=WARN") || strings.Contains(log, "requeued=") {
-		t.Errorf("отмена во время дренажа — не тревога и не итог:\n%s", log)
+		t.Errorf("a cancellation during the drain — neither an alarm nor a final:\n%s", log)
 	}
 }
 
@@ -1608,14 +1608,14 @@ func TestRetryTempErrorsNilLog(t *testing.T) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			t.Fatalf("паника при Log=nil: %v", r)
+			t.Fatalf("a panic at Log=nil: %v", r)
 		}
 	}()
 	if err := RetryTempErrors(ctx, pool, RetryOptions{}); err != nil {
 		t.Fatalf("RetryTempErrors: %v, want nil", err)
 	}
 	if st := pool.stats(); st.selects != 1 {
-		t.Errorf("SELECT'ов = %d, want 1: стартовый дренаж выполнен", st.selects)
+		t.Errorf("SELECTs = %d, want 1: the initial drain ran", st.selects)
 	}
 }
 
@@ -1643,17 +1643,17 @@ func TestRetryTempErrorsGuardDrainStop(t *testing.T) {
 	}
 	st := pool.stats()
 	if st.selects != 1 {
-		t.Errorf("SELECT'ов = %d, want 1: вторая итерация дренажа — guard", st.selects)
+		t.Errorf("SELECTs = %d, want 1: the second drain iteration — the guard", st.selects)
 	}
 	if st.begins != 2 || st.commits != 2 {
-		t.Errorf("транзакций %d, коммитов %d, want 2 и 2 (выборка + обновление)", st.begins, st.commits)
+		t.Errorf("transactions %d, commits %d, want 2 and 2 (selection + update)", st.begins, st.commits)
 	}
 }
 
 func TestRetryTempErrorsNilPool(t *testing.T) {
 	err := RetryTempErrors(context.Background(), nil, RetryOptions{})
-	if err == nil || !strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+	if err == nil || !strings.Contains(err.Error(), "pool not set") {
+		t.Errorf("err = %v, want \"pool not set\"", err)
 	}
 }
 
@@ -1669,7 +1669,7 @@ func TestRetryTempErrorsDrainContinues(t *testing.T) {
 	// Batch 1 — a guard failure (the DB blinked); batch 2 — full (BatchSize 1);
 	// batch 3 — empty (the set is exhausted, the drain is finished).
 	pool := &retryFakePool{
-		guardErrs: []error{errors.New("бд моргнула")},
+		guardErrs: []error{errors.New("the db blipped")},
 		selects: []*retryFakeRows{
 			retryRows([]any{int16(1), int64(10), int16(0)}),
 			retryRows(),
@@ -1693,7 +1693,7 @@ func TestRetryTempErrorsDrainContinues(t *testing.T) {
 	for !buf.contains("requeued=1") {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("дренаж не дошёл до итога:\n%s", buf.String())
+			t.Fatalf("the drain did not reach the final:\n%s", buf.String())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1704,21 +1704,21 @@ func TestRetryTempErrorsDrainContinues(t *testing.T) {
 
 	log := buf.String()
 	for _, want := range []string{
-		"пачка не прошла — дренаж продолжается", // the batch failure's WARN
-		"бд моргнула",
+		"the batch failed — the drain continues", // the batch failure's WARN
+		"the db blipped",
 		"requeued=1", // the same drain's Info outcome
 	} {
 		if !strings.Contains(log, want) {
-			t.Errorf("лог не содержит %q:\n%s", want, log)
+			t.Errorf("log does not contain %q:\n%s", want, log)
 		}
 	}
-	if strings.Contains(log, "предел упавших пачек") {
-		t.Errorf("единичный сбой остановил дренаж:\n%s", log)
+	if strings.Contains(log, "failed batch limit") {
+		t.Errorf("a single failure stopped the drain:\n%s", log)
 	}
 	// Three passes completed: the failing one (the guard, without a transaction), the working
 	// one (the selection + the decision) and the empty one (the selection).
 	if st := pool.stats(); st.guards != 3 || st.selects != 2 || st.begins != 3 || st.commits != 3 {
-		t.Errorf("статистика = guards=%d selects=%d begins=%d commits=%d, want 3/2/3/3",
+		t.Errorf("stats = guards=%d selects=%d begins=%d commits=%d, want 3/2/3/3",
 			st.guards, st.selects, st.begins, st.commits)
 	}
 }
@@ -1735,7 +1735,7 @@ func TestRetryTempErrorsDrainFailLimit(t *testing.T) {
 	// All batch guard reads fail (a triple FIFO — by the number of attempts
 	// of the limit) — the drain must stop at the limit, not keep
 	// hammering.
-	dbDown := errors.New("бд недоступна")
+	dbDown := errors.New("db unavailable")
 	pool := &retryFakePool{guardErrs: []error{dbDown, dbDown, dbDown}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1748,10 +1748,10 @@ func TestRetryTempErrorsDrainFailLimit(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for !buf.contains("предел упавших пачек") {
+	for !buf.contains("failed batch limit") {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("дренаж не остановился на пределе сбоёв:\n%s", buf.String())
+			t.Fatalf("the drain did not stop at the failure limit:\n%s", buf.String())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1763,9 +1763,9 @@ func TestRetryTempErrorsDrainFailLimit(t *testing.T) {
 	// Exactly DefaultRetryDrainFails attempts — no more: a persistent failure
 	// does not hammer the DB until the tick.
 	if got := len(pool.guardQueries); got != DefaultRetryDrainFails {
-		t.Errorf("guard-чтений = %d, want %d (предел упавших пачек)", got, DefaultRetryDrainFails)
+		t.Errorf("guard reads = %d, want %d (failed batch limit)", got, DefaultRetryDrainFails)
 	}
 	if st := pool.stats(); st.begins != 0 || st.selects != 0 {
-		t.Errorf("транзакций/выборок при сбое guard = %d/%d, want 0/0", st.begins, st.selects)
+		t.Errorf("transactions/selections at a guard failure = %d/%d, want 0/0", st.begins, st.selects)
 	}
 }

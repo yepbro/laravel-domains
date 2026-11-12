@@ -104,7 +104,7 @@ func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 		// observable behavior — killed per §4 of docs/mutation-testing.md
 		// (logging is not tested).
 		// mutator-disable-next-line statement/remove
-		slog.Warn("контекст рендера умер, повтор задачи на новом контексте",
+		slog.Warn("render context died, retrying the task on a new context",
 			"url", task.URL, "err", err.Error())
 		if out, err = p.attempt(ctx, task); err == nil {
 			p.b.pages.Add(1)

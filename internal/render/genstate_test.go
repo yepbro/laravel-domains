@@ -41,7 +41,7 @@ func genCDPBrowser(t *testing.T, opts Options) *Browser {
 		probeTimeout: testProbeTimeout}
 	t.Cleanup(b.Close)
 	if err := chromedp.Do(bctx); err != nil {
-		t.Fatalf("bootstrap браузера поверх fakeCDP: %v", err)
+		t.Fatalf("bootstrapping the browser over fakeCDP: %v", err)
 	}
 	return b
 }
@@ -71,21 +71,21 @@ func TestGenStateNames(t *testing.T) {
 	// "starting" is in the list although the predicate does not return it
 	// (it exists only under m.mu, invariant I2).
 	names := map[genState]string{
-		genAbsent:   "отсутствует",
-		genStarting: "стартующий",
-		genActive:   "активный",
+		genAbsent:   "missing",
+		genStarting: "starting",
+		genActive:   "active",
 		genDraining: "draining",
-		genDead:     "мёртв",
-		genClosed:   "закрыт",
+		genDead:     "dead",
+		genClosed:   "closed",
 	}
 	for g, want := range names {
 		if got := g.String(); got != want {
-			t.Errorf("String(%d) = %q, хочу %q", int(g), got, want)
+			t.Errorf("String(%d) = %q, want %q", int(g), got, want)
 		}
 	}
 	for i := 0; i <= int(genClosed); i++ {
 		if _, ok := names[genState(i)]; !ok {
-			t.Errorf("состояние %d вне перечня автомата (лишнее/незадокументированное)", i)
+			t.Errorf("the state %d is outside the FSM list (extra/undocumented)", i)
 		}
 	}
 }
@@ -98,34 +98,34 @@ func TestGenStateTable(t *testing.T) {
 		setup func(t *testing.T) *Manager
 		want  genState
 	}{
-		{"Г0 отсутствует — до первого старта", func(t *testing.T) *Manager {
+		{"G0 missing — before the first start", func(t *testing.T) *Manager {
 			m, _, _ := managerFor(t, managerOpts())
 			return m
 		}, genAbsent},
-		{"Г0 отсутствует — после неудачного старта (П4)", func(t *testing.T) *Manager {
+		{"G0 missing — after a failed start (T4)", func(t *testing.T) *Manager {
 			m, _, _ := managerFor(t, managerOpts()) // the factory has no browsers — the start fails
 			if err := m.Start(); ClassOf(err) != ClassBrowser {
-				t.Fatalf("Start: %v, хочу ошибку класса browser", err)
+				t.Fatalf("Start: %v, want a browser class error", err)
 			}
 			return m
 		}, genAbsent},
-		{"Г2 активный — живое поколение (П2)", func(t *testing.T) *Manager {
+		{"G2 active — a live generation (T2)", func(t *testing.T) *Manager {
 			m, _ := genStartedWith(t)
 			return m
 		}, genActive},
-		{"Г4 мёртв — браузер поколения погашен (П6)", func(t *testing.T) *Manager {
+		{"G4 dead — the generation's browser is down (T6)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			b.Close()
 			return m
 		}, genDead},
-		{"Г3 draining — пул поколения retired (П8)", func(t *testing.T) *Manager {
+		{"G3 draining — the generation's pool is retired (T8)", func(t *testing.T) *Manager {
 			m, _ := genStartedWith(t)
 			m.mu.Lock()
 			m.p.retire()
 			m.mu.Unlock()
 			return m
 		}, genDraining},
-		{"Г3 draining — слот без пула (страховка рассинхрона)", func(t *testing.T) *Manager {
+		{"G3 draining — a slot without a pool (a desync guard)", func(t *testing.T) *Manager {
 			b := genCDPBrowser(t, managerOpts())
 			m := NewManager(context.Background(), managerOpts())
 			m.mu.Lock()
@@ -133,7 +133,7 @@ func TestGenStateTable(t *testing.T) {
 			m.mu.Unlock()
 			return m
 		}, genDraining},
-		{"Г4 мёртв приоритетнее Г3 draining (И1)", func(t *testing.T) *Manager {
+		{"G4 dead takes precedence over G3 draining (I1)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			m.mu.Lock()
 			m.p.retire()
@@ -141,7 +141,7 @@ func TestGenStateTable(t *testing.T) {
 			b.Close()
 			return m
 		}, genDead},
-		{"Г5 закрыт — Close при живом поколении (П9)", func(t *testing.T) *Manager {
+		{"G5 closed — Close with a live generation (T9)", func(t *testing.T) *Manager {
 			m, _ := genStartedWith(t)
 			m.Close()
 			return m
@@ -151,7 +151,7 @@ func TestGenStateTable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := tc.setup(t)
 			if got := genStateOf(m); got != tc.want {
-				t.Fatalf("состояние поколения %s, хочу %s", got, tc.want)
+				t.Fatalf("the generation state %s, want %s", got, tc.want)
 			}
 		})
 	}
@@ -167,49 +167,49 @@ func TestSwapReasonTable(t *testing.T) {
 		wantSubstr string
 		wantSwap   bool
 	}{
-		{"первый старт (Г0)", func(t *testing.T) *Manager {
+		{"the first start (G0)", func(t *testing.T) *Manager {
 			m, _, _ := managerFor(t, managerOpts())
 			return m
-		}, "первый старт", true},
-		{"браузер недоступен (Г4)", func(t *testing.T) *Manager {
+		}, "the first start", true},
+		{"browser unavailable (G4)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			b.Close()
 			return m
-		}, "браузер недоступен", true},
-		{"мёртвый браузер в закрытом пуле — причина Г4 (И1)", func(t *testing.T) *Manager {
+		}, "browser unavailable", true},
+		{"a dead browser in a closed pool — the cause G4 (I1)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			m.mu.Lock()
 			m.p.retire()
 			m.mu.Unlock()
 			b.Close()
 			return m
-		}, "браузер недоступен", true},
-		{"пул закрыт (Г3 в слоте, П8)", func(t *testing.T) *Manager {
+		}, "browser unavailable", true},
+		{"pool closed (G3 in the slot, T8)", func(t *testing.T) *Manager {
 			m, _ := genStartedWith(t)
 			m.mu.Lock()
 			m.p.retire()
 			m.mu.Unlock()
 			return m
-		}, "пул закрыт", true},
-		{"без замены (Г2, пороги не достигнуты)", func(t *testing.T) *Manager {
+		}, "pool closed", true},
+		{"no swap (G2, no thresholds reached)", func(t *testing.T) *Manager {
 			m, _ := genStartedWith(t)
 			return m
 		}, "", false},
-		{"порог страниц (Г2, П5)", func(t *testing.T) *Manager {
+		{"the page threshold (G2, T5)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			m.mu.Lock()
 			b.opts.RestartEveryPages = 1
 			b.pages.Add(1) // one successful page — the threshold
 			m.mu.Unlock()
 			return m
-		}, "порог страниц", true},
-		{"порог страниц приоритетнее порога памяти", func(t *testing.T) *Manager {
+		}, "the page threshold", true},
+		{"the page threshold takes precedence over the memory threshold", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			m.mu.Lock()
 			b.rootPID = os.Getpid()
 			m.mu.Unlock()
 			if b.RSS() <= 0 {
-				t.Skip("RSS недоступен (нет /proc)")
+				t.Skip("RSS unavailable (no /proc)")
 			}
 			m.mu.Lock()
 			b.opts.RestartEveryPages = 1
@@ -217,21 +217,21 @@ func TestSwapReasonTable(t *testing.T) {
 			b.opts.MemoryThreshold = 1 // both thresholds reached — the first one decides
 			m.mu.Unlock()
 			return m
-		}, "порог страниц", true},
-		{"порог памяти (Г2, П5)", func(t *testing.T) *Manager {
+		}, "the page threshold", true},
+		{"the memory threshold (G2, T5)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			m.mu.Lock()
 			b.rootPID = os.Getpid()
 			m.mu.Unlock()
 			if b.RSS() <= 0 {
-				t.Skip("RSS недоступен (нет /proc)")
+				t.Skip("RSS unavailable (no /proc)")
 			}
 			m.mu.Lock()
 			b.opts.MemoryThreshold = 1 // bytes: any live memory is an excess
 			m.mu.Unlock()
 			return m
-		}, "порог памяти", true},
-		{"мёртвый браузер с достигнутым порогом — состояние важнее порога (И1)", func(t *testing.T) *Manager {
+		}, "the memory threshold", true},
+		{"a dead browser with a reached threshold — the state beats the threshold (I1)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			m.mu.Lock()
 			b.opts.RestartEveryPages = 1
@@ -239,8 +239,8 @@ func TestSwapReasonTable(t *testing.T) {
 			m.mu.Unlock()
 			b.Close()
 			return m
-		}, "браузер недоступен", true},
-		{"закрыт — решений нет (И3)", func(t *testing.T) *Manager {
+		}, "browser unavailable", true},
+		{"closed — no decisions (I3)", func(t *testing.T) *Manager {
 			m, _ := genStartedWith(t)
 			m.Close()
 			return m
@@ -253,10 +253,10 @@ func TestSwapReasonTable(t *testing.T) {
 			reason, swap := m.swapReasonLocked()
 			m.mu.Unlock()
 			if swap != tc.wantSwap {
-				t.Fatalf("решение о смене %v (%q), хочу %v", swap, reason, tc.wantSwap)
+				t.Fatalf("the swap decision %v (%q), want %v", swap, reason, tc.wantSwap)
 			}
 			if tc.wantSubstr != "" && !strings.Contains(reason, tc.wantSubstr) {
-				t.Fatalf("причина %q не содержит %q", reason, tc.wantSubstr)
+				t.Fatalf("the reason %q does not contain %q", reason, tc.wantSubstr)
 			}
 		})
 	}
@@ -278,39 +278,39 @@ func TestGenStateLifecycle(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	if got := genStateOf(m); got != genActive {
-		t.Fatalf("после старта состояние %s, хочу активный", got)
+		t.Fatalf("after the start the state %s, want active", got)
 	}
 	if got, want := calls.Load(), int32(1); got != want {
-		t.Fatalf("стартов %d, хочу %d", got, want)
+		t.Fatalf("starts %d, want %d", got, want)
 	}
 	if got := m.Restarts(); got != 0 {
-		t.Errorf("перезапусков %d, хочу 0 (первый старт — не перезапуск)", got)
+		t.Errorf("restarts %d, want 0 (a first start is not a restart)", got)
 	}
 
 	// T6: the generation's browser dies — dead.
 	b1.Close()
 	if got := genStateOf(m); got != genDead {
-		t.Fatalf("после смерти браузера состояние %s, хочу мёртв", got)
+		t.Fatalf("after the browser's death the state %s, want dead", got)
 	}
 
 	// T1→T3: the probe replaces the dead generation; the old pool is drained (T7).
 	if !m.Alive() {
-		t.Fatal("зонд обязан заменить мёртвое поколение")
+		t.Fatal("the probe must swap the dead generation")
 	}
 	if got := genStateOf(m); got != genActive {
-		t.Fatalf("после замены состояние %s, хочу активный", got)
+		t.Fatalf("after the swap the state %s, want active", got)
 	}
 	if got, want := calls.Load(), int32(2); got != want {
-		t.Fatalf("стартов %d, хочу %d (замена мёртвого поколения)", got, want)
+		t.Fatalf("starts %d, want %d (swapping the dead generation)", got, want)
 	}
 	if got := m.Restarts(); got != 1 {
-		t.Errorf("перезапусков %d, хочу 1", got)
+		t.Errorf("restarts %d, want 1", got)
 	}
 	if !(*pools)[0].closed.Load() {
-		t.Error("пул мёртвого поколения не выведен из работы (retire)")
+		t.Error("the dead generation's pool is not retired")
 	}
 	if _, err := (*pools)[0].Run(context.Background(), RenderTask{URL: "u"}); !errors.Is(err, ErrClosed) {
-		t.Errorf("задача в дренируемый пул: %v, хочу ErrClosed", err)
+		t.Errorf("a task into the draining pool: %v, want ErrClosed", err)
 	}
 
 	// T8: a closed pool in the slot with a live browser — the "pool closed" replacement.
@@ -318,31 +318,31 @@ func TestGenStateLifecycle(t *testing.T) {
 	m.p.retire()
 	m.mu.Unlock()
 	if got := genStateOf(m); got != genDraining {
-		t.Fatalf("после retire пула состояние %s, хочу draining", got)
+		t.Fatalf("after the pool retire the state %s, want draining", got)
 	}
 	if _, err := m.Run(context.Background(), RenderTask{URL: "u"}); err != nil {
-		t.Fatalf("Run после закрытия пула слота: %v", err)
+		t.Fatalf("Run after the slot's pool is closed: %v", err)
 	}
 	if got, want := calls.Load(), int32(3); got != want {
-		t.Fatalf("стартов %d, хочу %d (замена поколения с закрытым пулом)", got, want)
+		t.Fatalf("starts %d, want %d (swapping a generation with a closed pool)", got, want)
 	}
 	if got := m.Restarts(); got != 2 {
-		t.Errorf("перезапусков %d, хочу 2", got)
+		t.Errorf("restarts %d, want 2", got)
 	}
 
 	// T9: Close — terminal: tasks ErrClosed, the probe false, no starts.
 	m.Close()
 	if got := genStateOf(m); got != genClosed {
-		t.Fatalf("после Close состояние %s, хочу закрыт", got)
+		t.Fatalf("after Close the state %s, want closed", got)
 	}
 	if _, err := m.Run(context.Background(), RenderTask{URL: "u"}); !errors.Is(err, ErrClosed) || ClassOf(err) != ClassTask {
-		t.Fatalf("Run после Close: %v (%v), хочу ErrClosed класса task", err, ClassOf(err))
+		t.Fatalf("Run after Close: %v (%v), want an ErrClosed of the task class", err, ClassOf(err))
 	}
 	if m.Alive() {
-		t.Error("зонд после Close: true, хочу false")
+		t.Error("the probe after Close: true, want false")
 	}
 	if got, want := calls.Load(), int32(3); got != want {
-		t.Errorf("стартов после Close %d, хочу %d (из Г5 поколений нет)", got, want)
+		t.Errorf("starts after Close %d, want %d (there are no G5 generations)", got, want)
 	}
 }
 
@@ -357,7 +357,7 @@ func TestGenStateStartingSerialized(t *testing.T) {
 	var calls atomic.Int32
 	m.newBrowser = func(context.Context, Options) (*Browser, error) {
 		if calls.Add(1) > 1 {
-			t.Error("двойной старт поколения — Г1 не изолирован мьютексом")
+			t.Error("a double generation start — G1 is not mutex-isolated")
 			return b, nil
 		}
 		close(entered)
@@ -377,7 +377,7 @@ func TestGenStateStartingSerialized(t *testing.T) {
 	go func() { probeDone <- m.Alive() }()
 	select {
 	case alive := <-probeDone:
-		t.Fatalf("зонд вернулся (%v) во время старта: стартующий не изолирован мьютексом", alive)
+		t.Fatalf("the probe returned (%v) during a start: starting is not mutex-isolated", alive)
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -386,12 +386,12 @@ func TestGenStateStartingSerialized(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if !<-probeDone {
-		t.Fatal("после старта зонд видит живое поколение")
+		t.Fatal("after the start the probe sees a live generation")
 	}
 	if got := genStateOf(m); got != genActive {
-		t.Fatalf("после старта состояние %s, хочу активный", got)
+		t.Fatalf("after the start the state %s, want active", got)
 	}
 	if got, want := calls.Load(), int32(1); got != want {
-		t.Errorf("стартов %d, хочу %d (зонд ждал исхода старта)", got, want)
+		t.Errorf("starts %d, want %d (the probe waited out the start)", got, want)
 	}
 }

@@ -45,11 +45,11 @@ type dispatchPoolQuery struct {
 var _ db.DB = (*dispatchPool)(nil)
 
 func (p *dispatchPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("dispatchPool: CopyFrom не должен вызываться")
+	return 0, errors.New("dispatchPool: CopyFrom must not be called")
 }
 
 func (p *dispatchPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("dispatchPool: Exec не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("dispatchPool: Exec must not be called")
 }
 
 func (p *dispatchPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -67,7 +67,7 @@ func (p *dispatchPool) Query(ctx context.Context, sql string, args ...any) (pgx.
 		return nil, p.err
 	}
 	if len(p.results) == 0 {
-		return nil, errors.New("dispatchPool: результат Query не заготовлен")
+		return nil, errors.New("dispatchPool: the Query result is not stubbed")
 	}
 	rows := p.results[0]
 	p.results = p.results[1:]
@@ -110,14 +110,14 @@ func (r *dispatchRows) Next() bool {
 
 func (r *dispatchRows) Scan(dest ...any) error {
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
-		return errors.New("dispatchRows: Scan без Next")
+		return errors.New("dispatchRows: Scan without Next")
 	}
 	if r.scanErr != nil {
 		return r.scanErr
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return errors.New("dispatchRows: число приёмников не равно числу колонок")
+		return errors.New("dispatchRows: the sink count does not match the column count")
 	}
 	for i := range row {
 		switch d := dest[i].(type) {
@@ -128,7 +128,7 @@ func (r *dispatchRows) Scan(dest ...any) error {
 		case *string:
 			*d = row[i].(string)
 		default:
-			return errors.New("dispatchRows: неизвестный приёмник")
+			return errors.New("dispatchRows: unknown sink")
 		}
 	}
 	return nil
@@ -217,23 +217,23 @@ func TestDispatchBatch(t *testing.T) {
 		{DomainID: 102, ZoneID: 1, Name: "c.example.com"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v (круговой порядок с весами)", batch, want)
+		t.Errorf("batch = %+v, want %+v (round-robin order with weights)", batch, want)
 	}
 
 	if len(pool.queries) != 2 {
-		t.Fatalf("запросов = %d, want 2 (зоны + очереди)", len(pool.queries))
+		t.Fatalf("queries = %d, want 2 (zones + queues)", len(pool.queries))
 	}
 	if pool.queries[0].sql != dispatchZonesSQL || len(pool.queries[0].args) != 0 {
-		t.Errorf("запрос зон: %q args=%v, want dispatchZonesSQL без параметров", pool.queries[0].sql, pool.queries[0].args)
+		t.Errorf("the zones query: %q args=%v, want dispatchZonesSQL without parameters", pool.queries[0].sql, pool.queries[0].args)
 	}
 	if pool.queries[1].sql != dispatchZoneSQL {
-		t.Errorf("запрос очередей: %q, want dispatchZoneSQL", pool.queries[1].sql)
+		t.Errorf("the queues query: %q, want dispatchZoneSQL", pool.queries[1].sql)
 	}
 	// Arguments: zones, keyset cursors (0 — from the head) and the quota —
 	// ceil(L × maxW / ΣW) + 1 = ceil(3 × 3 / 4) + 1 = 4.
 	wantArgs := []any{[]any{int16(1), int16(2)}, []any{int64(0), int64(0)}, 4}
 	if !reflect.DeepEqual(pool.queries[1].args, wantArgs) {
-		t.Errorf("аргументы = %v, want [zone_id[], after[], quota] = %v", pool.queries[1].args, wantArgs)
+		t.Errorf("args = %v, want [zone_id[], after[], quota] = %v", pool.queries[1].args, wantArgs)
 	}
 }
 
@@ -263,17 +263,17 @@ func TestDispatchBatch_Refill(t *testing.T) {
 		{DomainID: 14, ZoneID: 1, Name: "d.example.com"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v", batch, want)
+		t.Errorf("batch = %+v, want %+v", batch, want)
 	}
 
 	if len(pool.queries) != 3 {
-		t.Fatalf("запросов = %d, want 3 (зоны + очереди + дозаполнение)", len(pool.queries))
+		t.Fatalf("queries = %d, want 3 (zones + queues + top-up)", len(pool.queries))
 	}
 	// Top-up: only zone 1, after id 13, the quota — the batch remainder
 	// (4 − 3 = 1): a zone's contribution to the batch does not exceed the remainder (T-183).
 	wantArgs := []any{[]any{int16(1)}, []any{int64(13)}, 1}
 	if !reflect.DeepEqual(pool.queries[2].args, wantArgs) {
-		t.Errorf("аргументы дозаполнения = %v, want %v", pool.queries[2].args, wantArgs)
+		t.Errorf("top-up args = %v, want %v", pool.queries[2].args, wantArgs)
 	}
 }
 
@@ -305,23 +305,23 @@ func TestDispatchBatch_RefillQuotaRemaining(t *testing.T) {
 	// the smaller zone_id; the batch is truncated by Limit = 10.
 	wantIDs := []int64{11, 21, 12, 22, 13, 23, 14, 24, 15, 25}
 	if len(batch) != len(wantIDs) {
-		t.Fatalf("пачка = %d строк, want %d", len(batch), len(wantIDs))
+		t.Fatalf("batch = %d rows, want %d", len(batch), len(wantIDs))
 	}
 	for i, id := range wantIDs {
 		if batch[i].DomainID != id {
-			t.Fatalf("пачка[%d] = домен %d, want %d (круговой порядок)", i, batch[i].DomainID, id)
+			t.Fatalf("batch[%d] = domain %d, want %d (round-robin order)", i, batch[i].DomainID, id)
 		}
 	}
 
 	if len(pool.queries) != 3 {
-		t.Fatalf("запросов = %d, want 3 (зоны + очереди + дозаполнение)", len(pool.queries))
+		t.Fatalf("queries = %d, want 3 (zones + queues + top-up)", len(pool.queries))
 	}
 	// The top-up quota is the batch remainder: 10 − 6 collected = 4 (not
 	// Limit = 10): reading beyond the remainder is pointless — beyond it nothing
 	// gets into the merge.
 	wantArgs := []any{[]any{int16(1), int16(2)}, []any{int64(13), int64(23)}, 4}
 	if !reflect.DeepEqual(pool.queries[2].args, wantArgs) {
-		t.Errorf("аргументы дозаполнения = %v, want [голодные зоны, курсоры, quota=остаток 4] = %v",
+		t.Errorf("top-up args = %v, want [hungry zones, cursors, quota=remainder 4] = %v",
 			pool.queries[2].args, wantArgs)
 	}
 }
@@ -333,13 +333,13 @@ func TestDispatchBatch_Empty(t *testing.T) {
 
 	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 1000})
 	if err != nil {
-		t.Fatalf("пустая выборка: %v", err)
+		t.Fatalf("an empty selection: %v", err)
 	}
 	if len(batch) != 0 {
-		t.Errorf("пачка = %+v, want пустая", batch)
+		t.Errorf("batch = %+v, want empty", batch)
 	}
 	if len(pool.queries) != 1 {
-		t.Errorf("запросов = %d, want 1 (очереди не читаются без зон)", len(pool.queries))
+		t.Errorf("queries = %d, want 1 (queues are not read without zones)", len(pool.queries))
 	}
 }
 
@@ -356,10 +356,10 @@ func TestDispatchBatch_Exhausted(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(batch) != 2 {
-		t.Fatalf("пачка = %+v, want 2 строки (pending исчерпано)", batch)
+		t.Fatalf("batch = %+v, want 2 rows (pending exhausted)", batch)
 	}
 	if len(pool.queries) != 2 {
-		t.Errorf("запросов = %d, want 2 (дозаполнение не нужно: зон без хвоста нет)", len(pool.queries))
+		t.Errorf("queries = %d, want 2 (no top-up needed: no zones with a tail)", len(pool.queries))
 	}
 }
 
@@ -380,13 +380,13 @@ func TestDispatchBatch_QuotaMissingZoneWeight(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(batch) != 1 || batch[0].DomainID != 11 {
-		t.Fatalf("пачка = %+v, want единственная строка зоны 1", batch)
+		t.Fatalf("batch = %+v, want the single row of zone 1", batch)
 	}
 
 	// Quota ceil(7 × 5 / (5 + 1)) + 1 = 7 — the missing zone's weight equals 1.
 	wantArgs := []any{[]any{int16(1), int16(2)}, []any{int64(0), int64(0)}, 7}
 	if !reflect.DeepEqual(pool.queries[1].args, wantArgs) {
-		t.Errorf("аргументы = %v, want [зоны, курсоры, quota=7] = %v (вес зоны без карты — 1)",
+		t.Errorf("args = %v, want [zones, cursors, quota=7] = %v (a zone without a map weighs 1)",
 			pool.queries[1].args, wantArgs)
 	}
 }
@@ -421,10 +421,10 @@ func TestDispatchBatch_FullBatchStopsRefill(t *testing.T) {
 		{DomainID: 21, ZoneID: 1, Name: "d21.example.com"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v", batch, want)
+		t.Errorf("batch = %+v, want %+v", batch, want)
 	}
 	if len(pool.queries) != 3 {
-		t.Fatalf("запросов = %d, want 3: полная пачка останавливает дозаполнение", len(pool.queries))
+		t.Fatalf("queries = %d, want 3: a full batch stops the top-up", len(pool.queries))
 	}
 }
 
@@ -452,15 +452,15 @@ func TestDispatchBatch_RefillStopsAtExhaustedZone(t *testing.T) {
 	// Round-robin order: keys (rn − 0.5)/1, equal ones — the smaller zone_id.
 	wantIDs := []int64{11, 21, 31, 12, 22, 32, 13, 23, 33, 14, 24, 15, 25, 16, 26, 17, 27, 18, 28, 29}
 	if len(batch) != len(wantIDs) {
-		t.Fatalf("пачка = %d строк, want %d (хвост зоны 2 из дозаполнения вошёл)", len(batch), len(wantIDs))
+		t.Fatalf("batch = %d rows, want %d (the tail of zone 2 from the top-up got in)", len(batch), len(wantIDs))
 	}
 	for i, id := range wantIDs {
 		if batch[i].DomainID != id {
-			t.Fatalf("пачка[%d] = домен %d, want %d (круговой порядок с весами 1)", i, batch[i].DomainID, id)
+			t.Fatalf("batch[%d] = domain %d, want %d (round-robin order with weights 1)", i, batch[i].DomainID, id)
 		}
 	}
 	if len(pool.queries) != 3 {
-		t.Fatalf("запросов = %d, want 3 (зоны + очереди + дозаполнение)", len(pool.queries))
+		t.Fatalf("queries = %d, want 3 (zones + queues + top-up)", len(pool.queries))
 	}
 }
 
@@ -482,10 +482,10 @@ func TestDispatchBatch_MergeSkipsEmptyZones(t *testing.T) {
 		{DomainID: 22, ZoneID: 2, Name: "c.example.net"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v (пустая зона не глушит слияние)", batch, want)
+		t.Errorf("batch = %+v, want %+v (an empty zone does not mute the merge)", batch, want)
 	}
 	if len(pool.queries) != 2 {
-		t.Fatalf("запросов = %d, want 2 (дозаполнения нет: зоны не голодные)", len(pool.queries))
+		t.Fatalf("queries = %d, want 2 (no top-up: the zones are not hungry)", len(pool.queries))
 	}
 }
 
@@ -515,7 +515,7 @@ func TestDispatchBatch_MergeNormalizesMissingWeight(t *testing.T) {
 		{DomainID: 12, ZoneID: 1, Name: "d12.example.com"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v (вес зоны без карты — 1)", batch, want)
+		t.Errorf("batch = %+v, want %+v (a zone without a map weighs 1)", batch, want)
 	}
 }
 
@@ -551,7 +551,7 @@ func TestDispatchBatch_MergeAdvanceKey(t *testing.T) {
 		{DomainID: 33, ZoneID: 3, Name: "d33.example.org"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v (ключ продвижения — с нормализованным весом)", batch, want)
+		t.Errorf("batch = %+v, want %+v (the progress key with the normalized weight)", batch, want)
 	}
 }
 
@@ -580,7 +580,7 @@ func TestDispatchBatch_MergeKeyFormula(t *testing.T) {
 		{DomainID: 12, ZoneID: 1, Name: "d12.example.com"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v ((rn − 0.5)/вес)", batch, want)
+		t.Errorf("batch = %+v, want %+v ((rn − 0.5)/weight)", batch, want)
 	}
 }
 
@@ -616,7 +616,7 @@ func TestDispatchBatch_MergeAdvanceShift(t *testing.T) {
 		{DomainID: 12, ZoneID: 1, Name: "d12.example.com"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v (сдвиг ключей продвижения — 0.5)", batch, want)
+		t.Errorf("batch = %+v, want %+v (the progress key shift — 0.5)", batch, want)
 	}
 }
 
@@ -639,7 +639,7 @@ func TestDispatchBatch_MergeTieSmallerZoneFirst(t *testing.T) {
 		{DomainID: 21, ZoneID: 2, Name: "b.example.net"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v (тай-брейк — меньший zone_id)", batch, want)
+		t.Errorf("batch = %+v, want %+v (the tie-break is the smaller zone_id)", batch, want)
 	}
 }
 
@@ -665,7 +665,7 @@ func TestDispatchBatch_MergeKeyBeatsZoneID(t *testing.T) {
 		{DomainID: 11, ZoneID: 1, Name: "a.example.com"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v (меньший ключ — раньше)", batch, want)
+		t.Errorf("batch = %+v, want %+v (the smaller key first)", batch, want)
 	}
 }
 
@@ -690,10 +690,10 @@ func TestDispatchBatch_MergeLimitCap(t *testing.T) {
 		{DomainID: 21, ZoneID: 2, Name: "d21.example.net"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v (Limit = 2)", batch, want)
+		t.Errorf("batch = %+v, want %+v (Limit = 2)", batch, want)
 	}
 	if len(pool.queries) != 2 {
-		t.Fatalf("запросов = %d, want 2: полная пачка — без дозаполнения", len(pool.queries))
+		t.Fatalf("queries = %d, want 2: a full batch — no top-up", len(pool.queries))
 	}
 }
 
@@ -711,7 +711,7 @@ func TestDispatchBatch_LimitOne(t *testing.T) {
 	}
 	want := []DispatchRow{{DomainID: 11, ZoneID: 1, Name: "a.example.com"}}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v", batch, want)
+		t.Errorf("batch = %+v, want %+v", batch, want)
 	}
 }
 
@@ -719,14 +719,14 @@ func TestDispatchBatch_LimitOne(t *testing.T) {
 // (rows.Err after the rows) interrupts the selection with a wrapped "active
 // zones" error.
 func TestDispatchBatch_ZonesIterError(t *testing.T) {
-	boom := errors.New("итерация сорвалась")
+	boom := errors.New("the iteration failed")
 	pool := &dispatchPool{results: []*dispatchRows{
 		{colNames: dispatchZonesCols, rows: [][]any{zrow(1, "example.com")}, err: boom},
 	}}
 
 	_, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 10})
-	if err == nil || !errors.Is(err, boom) || !strings.Contains(err.Error(), "активные зоны") {
-		t.Fatalf("err = %v, want обёрнутая ошибка итерации справочника зон", err)
+	if err == nil || !errors.Is(err, boom) || !strings.Contains(err.Error(), "active zones") {
+		t.Fatalf("err = %v, want the wrapped zone reference table iteration error", err)
 	}
 }
 
@@ -736,36 +736,36 @@ func TestDispatchBatch_Validation(t *testing.T) {
 		q    DispatchQuery
 		want string
 	}{
-		{"лимит 0", DispatchQuery{}, "Limit = 0"},
-		{"лимит отрицательный", DispatchQuery{Limit: -5}, "Limit = -5"},
-		{"вес нулевой", DispatchQuery{Limit: 1000, ZoneWeights: map[int16]int{7: 0}}, "вес зоны 7 = 0"},
-		{"вес отрицательный", DispatchQuery{Limit: 1000, ZoneWeights: map[int16]int{7: -2}}, "вес зоны 7 = -2"},
+		{"limit 0", DispatchQuery{}, "Limit = 0"},
+		{"a negative limit", DispatchQuery{Limit: -5}, "Limit = -5"},
+		{"a zero weight", DispatchQuery{Limit: 1000, ZoneWeights: map[int16]int{7: 0}}, "zone 7 weight = 0"},
+		{"a negative weight", DispatchQuery{Limit: 1000, ZoneWeights: map[int16]int{7: -2}}, "zone 7 weight = -2"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := &dispatchPool{}
 			_, err := DispatchBatch(context.Background(), pool, tc.q)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("err = %v, want описание с %q", err, tc.want)
+				t.Fatalf("err = %v, want the description with %q", err, tc.want)
 			}
 			if !strings.Contains(err.Error(), "scheduler:") {
-				t.Errorf("сообщение = %q, want контекст «scheduler:»", err)
+				t.Errorf("message = %q, want the \"scheduler:\" context", err)
 			}
 			if len(pool.queries) != 0 {
-				t.Errorf("невалидный запрос дошёл до БД: %v", pool.queries)
+				t.Errorf("the invalid query reached the DB: %v", pool.queries)
 			}
 		})
 	}
 }
 
 func TestDispatchBatch_QueryError(t *testing.T) {
-	boom := errors.New("соединение потеряно")
+	boom := errors.New("connection lost")
 
 	// The zones query error.
 	pool := &dispatchPool{err: boom}
 	if _, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 1000}); err == nil ||
-		!errors.Is(err, boom) || !strings.Contains(err.Error(), "активные зоны") {
-		t.Fatalf("err = %v, want обёрнутая ошибка запроса зон", err)
+		!errors.Is(err, boom) || !strings.Contains(err.Error(), "active zones") {
+		t.Fatalf("err = %v, want the wrapped zones query error", err)
 	}
 
 	// The queues query error (the zones are read): the failure is injected by the second
@@ -775,23 +775,23 @@ func TestDispatchBatch_QueryError(t *testing.T) {
 		errs:    []error{nil, boom},
 	}
 	if _, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 1000}); err == nil ||
-		!errors.Is(err, boom) || !strings.Contains(err.Error(), "scheduler: выборка пачки доменов") ||
-		strings.Contains(err.Error(), "активные зоны") {
-		t.Fatalf("err = %v, want обёрнутая «соединение потеряно» запроса очередей", err)
+		!errors.Is(err, boom) || !strings.Contains(err.Error(), "scheduler: domain batch selection") ||
+		strings.Contains(err.Error(), "active zones") {
+		t.Fatalf("err = %v, want the queues query wrapped \"connection lost\"", err)
 	}
 }
 
 // TestDispatchBatch_ReadErrors — a row read error and an iteration error
 // interrupt the selection with a wrapped error (both queries).
 func TestDispatchBatch_ReadErrors(t *testing.T) {
-	boom := errors.New("декодирование сорвалось")
+	boom := errors.New("the decoding failed")
 
 	pool := &dispatchPool{results: []*dispatchRows{
 		{colNames: dispatchZonesCols, rows: [][]any{zrow(1, "example.com")}, scanErr: boom},
 	}}
 	_, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 10})
-	if err == nil || !errors.Is(err, boom) || !strings.Contains(err.Error(), "активные зоны") {
-		t.Fatalf("err = %v, want обёрнутая ошибка чтения зон", err)
+	if err == nil || !errors.Is(err, boom) || !strings.Contains(err.Error(), "active zones") {
+		t.Fatalf("err = %v, want the wrapped zones read error", err)
 	}
 
 	pool = &dispatchPool{results: []*dispatchRows{
@@ -799,8 +799,8 @@ func TestDispatchBatch_ReadErrors(t *testing.T) {
 		{colNames: dispatchDomainCols, rows: [][]any{drow(1, 1, "a"), drow(1, 2, "b")}, scanErr: boom},
 	}}
 	_, err = DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 10})
-	if err == nil || !errors.Is(err, boom) || !strings.Contains(err.Error(), "чтение строки") {
-		t.Fatalf("err = %v, want обёрнутая ошибка чтения строки", err)
+	if err == nil || !errors.Is(err, boom) || !strings.Contains(err.Error(), "row read") {
+		t.Fatalf("err = %v, want the wrapped row read error", err)
 	}
 
 	pool = &dispatchPool{results: []*dispatchRows{
@@ -808,7 +808,7 @@ func TestDispatchBatch_ReadErrors(t *testing.T) {
 		{colNames: dispatchDomainCols, rows: [][]any{drow(1, 1, "a")}, err: boom},
 	}}
 	if _, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 10}); err == nil || !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want ошибка итерации (rows.Err)", err)
+		t.Fatalf("err = %v, want the iteration error (rows.Err)", err)
 	}
 }
 
@@ -824,7 +824,7 @@ func TestDispatchBatch_ContextCanceled(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if len(pool.queries) != 0 {
-		t.Errorf("обращений к БД быть не должно, got %v", pool.queries)
+		t.Errorf("there must be no DB calls, got %v", pool.queries)
 	}
 }
 
@@ -852,7 +852,7 @@ func TestResolveZoneWeights(t *testing.T) {
 	}
 	want := map[int16]int{1: 1, 2: 3, 3: 2}
 	if !reflect.DeepEqual(weights, want) {
-		t.Errorf("веса = %v, want %v (имена → zone_id по справочнику)", weights, want)
+		t.Errorf("weights = %v, want %v (names → zone_id via the reference table)", weights, want)
 	}
 	// Unknown names — ascending: a deterministic Warn.
 	if want := []string{"aaa.missing", "zzz.missing"}; !reflect.DeepEqual(unknown, want) {
@@ -860,10 +860,10 @@ func TestResolveZoneWeights(t *testing.T) {
 	}
 	// The caller's map is not modified (the config lives its own life).
 	if len(byName) != 5 || byName["example.net"] != 3 {
-		t.Errorf("карта вызывающего изменена: %v", byName)
+		t.Errorf("the caller's map was mutated: %v", byName)
 	}
 	if len(pool.queries) != 1 || pool.queries[0].sql != resolveZoneWeightsSQL {
-		t.Errorf("запросы = %v, want один resolveZoneWeightsSQL", pool.queries)
+		t.Errorf("queries = %v, want a single resolveZoneWeightsSQL", pool.queries)
 	}
 
 	// An empty map and nil — nil without touching the DB: equal weights,
@@ -872,10 +872,10 @@ func TestResolveZoneWeights(t *testing.T) {
 		pool := &dispatchPool{}
 		weights, unknown, err := ResolveZoneWeights(context.Background(), pool, m)
 		if err != nil || unknown != nil || weights != nil {
-			t.Fatalf("карта %v: weights=%v unknown=%v err=%v, want nil, nil, nil", m, weights, unknown, err)
+			t.Fatalf("map %v: weights=%v unknown=%v err=%v, want nil, nil, nil", m, weights, unknown, err)
 		}
 		if len(pool.queries) != 0 {
-			t.Errorf("карта %v: обращений к БД быть не должно, got %v", m, pool.queries)
+			t.Errorf("map %v: there must be no DB calls, got %v", m, pool.queries)
 		}
 	}
 }
@@ -900,7 +900,7 @@ func TestResolveZoneWeights_UnknownSorted(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(unknown, want) {
-			t.Fatalf("проход %d: unknown = %v, want %v (по возрастанию)", i, unknown, want)
+			t.Fatalf("pass %d: unknown = %v, want %v (ascending)", i, unknown, want)
 		}
 	}
 }
@@ -909,28 +909,28 @@ func TestResolveZoneWeights_UnknownSorted(t *testing.T) {
 // interrupt the resolution with a wrapped error; a cancelled ctx does not reach the
 // DB (like real pgx).
 func TestResolveZoneWeights_Errors(t *testing.T) {
-	boom := errors.New("справочник недоступен")
+	boom := errors.New("the reference table is unavailable")
 	weights := map[string]int{"example.com": 2}
 
 	pool := &dispatchPool{err: boom}
 	if _, _, err := ResolveZoneWeights(context.Background(), pool, weights); err == nil ||
-		!errors.Is(err, boom) || !strings.Contains(err.Error(), "справочник зон") {
-		t.Fatalf("err = %v, want обёрнутая ошибка запроса справочника", err)
+		!errors.Is(err, boom) || !strings.Contains(err.Error(), "zone reference table") {
+		t.Fatalf("err = %v, want the wrapped reference table query error", err)
 	}
 
 	pool = &dispatchPool{results: []*dispatchRows{
 		{colNames: dispatchZonesCols, rows: [][]any{zrow(1, "example.com")}, scanErr: boom},
 	}}
 	if _, _, err := ResolveZoneWeights(context.Background(), pool, weights); err == nil ||
-		!errors.Is(err, boom) || !strings.Contains(err.Error(), "чтение") {
-		t.Fatalf("err = %v, want обёрнутая ошибка чтения справочника", err)
+		!errors.Is(err, boom) || !strings.Contains(err.Error(), "read") {
+		t.Fatalf("err = %v, want the wrapped reference table read error", err)
 	}
 
 	pool = &dispatchPool{results: []*dispatchRows{
 		{colNames: dispatchZonesCols, rows: [][]any{zrow(1, "example.com")}, err: boom},
 	}}
 	if _, _, err := ResolveZoneWeights(context.Background(), pool, weights); err == nil || !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want ошибка итерации (rows.Err)", err)
+		t.Fatalf("err = %v, want the iteration error (rows.Err)", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -940,7 +940,7 @@ func TestResolveZoneWeights_Errors(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if len(pool.queries) != 0 {
-		t.Errorf("обращений к БД быть не должно, got %v", pool.queries)
+		t.Errorf("there must be no DB calls, got %v", pool.queries)
 	}
 }
 
@@ -961,7 +961,7 @@ func TestResolveZoneWeights_Dispatch(t *testing.T) {
 
 	weights, unknown, err := ResolveZoneWeights(context.Background(), pool, map[string]int{"example.net": 3})
 	if err != nil || len(unknown) != 0 {
-		t.Fatalf("разрешение весов: unknown=%v err=%v", unknown, err)
+		t.Fatalf("weight resolution: unknown=%v err=%v", unknown, err)
 	}
 
 	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 3, ZoneWeights: weights})
@@ -976,7 +976,7 @@ func TestResolveZoneWeights_Dispatch(t *testing.T) {
 		{DomainID: 102, ZoneID: 1, Name: "c.example.com"},
 	}
 	if !reflect.DeepEqual(batch, want) {
-		t.Errorf("пачка = %+v, want %+v (веса из конфигурации влияют на слияние)", batch, want)
+		t.Errorf("batch = %+v, want %+v (configuration weights affect the merge)", batch, want)
 	}
 }
 
@@ -1013,7 +1013,7 @@ func TestDispatch_SQLContract(t *testing.T) {
 	// 6.2): when the codes change the text is rebuilt automatically — the test catches
 	// the desync of a hand-written literal.
 	if int16(model.CheckStatePending) != 0 || int16(model.StatusDeleted) != 6 {
-		t.Errorf("коды модели изменились (pending=%d deleted=%d): обновите литералы в wantDispatchZoneSQL",
+		t.Errorf("the model codes changed (pending=%d deleted=%d): update the literals in wantDispatchZoneSQL",
 			int16(model.CheckStatePending), int16(model.StatusDeleted))
 	}
 
@@ -1023,21 +1023,21 @@ func TestDispatch_SQLContract(t *testing.T) {
 	// LATERAL reads (zone_id, id) WHERE check_state = 0 with a LIMIT.
 	if !strings.Contains(up, "CREATE INDEX domains_pending_idx") ||
 		!strings.Contains(up, "ON domains (zone_id, id) WHERE check_state = 0") {
-		t.Error("в миграции 000001 нет domains_pending_idx (zone_id, id) WHERE check_state = 0 — LATERAL-выборка очереди зоны опирается на него (ТЗ 6.1)")
+		t.Error("migration 000001 has no domains_pending_idx (zone_id, id) WHERE check_state = 0 — the zone queue LATERAL selection relies on it (spec 6.1)")
 	}
 	// The active zones filter — a schema column, not an invention.
 	if !strings.Contains(up, "is_active") {
-		t.Error("в миграции 000001 нет zones.is_active — фильтр активных зон ссылается на схему")
+		t.Error("migration 000001 has no zones.is_active — the active zones filter references the schema")
 	}
 	// The work filter — a T-178 counters column (migration 000016):
 	// the dispatcher's filter relies on a live incremental counter.
 	counters := dispatchReadMigration(t, "000016_zone_pipeline_counters.up.sql")
 	if !strings.Contains(counters, "ADD COLUMN domains_pending bigint NOT NULL DEFAULT 0") {
-		t.Error("в миграции 000016 нет zones.domains_pending — фильтр «только зоны с работой» (T-183) ссылается на счётчик T-178")
+		t.Error("migration 000016 has no zones.domains_pending — the \"only zones with work\" filter (T-183) references the T-178 counter")
 	}
 	// There are no weights in the schema — the only source of weights is DispatchQuery.
 	if strings.Contains(up, "zones.weight") {
-		t.Error("в схеме появилась колонка zones.weight — веса можно брать из БД, а не параметрами")
+		t.Error("the schema gained a zones.weight column — weights can come from the DB instead of parameters")
 	}
 }
 
@@ -1055,7 +1055,7 @@ func TestResolveZoneWeights_SQLContract(t *testing.T) {
 	}
 	up := dispatchReadMigration(t, "000001_init.up.sql")
 	if !strings.Contains(up, "name            text     NOT NULL UNIQUE") {
-		t.Error("в миграции 000001 нет UNIQUE на zones.name — разрешение имён весов опирается на уникальность")
+		t.Error("migration 000001 has no UNIQUE on zones.name — the weight name resolution relies on the uniqueness")
 	}
 }
 
@@ -1066,7 +1066,7 @@ func dispatchReadMigration(t *testing.T, name string) string {
 	t.Helper()
 	raw, err := migrations.FS.ReadFile(name)
 	if err != nil {
-		t.Fatalf("чтение %s из встроенного набора: %v", name, err)
+		t.Fatalf("reading %s from the embedded set: %v", name, err)
 	}
 	return string(raw)
 }

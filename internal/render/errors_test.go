@@ -19,39 +19,39 @@ func TestClassString(t *testing.T) {
 	}
 	for c, want := range cases {
 		if got := c.String(); got != want {
-			t.Errorf("Class(%d).String() = %q, хочу %q", int(c), got, want)
+			t.Errorf("Class(%d).String() = %q, want %q", int(c), got, want)
 		}
 	}
 }
 
 func TestErrorFormatUnwrapClassOf(t *testing.T) {
-	sentinel := errors.New("причина")
+	sentinel := errors.New("cause")
 	e := &Error{Class: ClassContext, URL: "https://a.example/", Err: sentinel}
 
-	if got := e.Error(); got != `render context: причина (url "https://a.example/")` {
+	if got := e.Error(); got != `render context: cause (url "https://a.example/")` {
 		t.Errorf("Error() = %q", got)
 	}
 	if !errors.Is(e, sentinel) {
-		t.Error("errors.Is не проходит к причине")
+		t.Error("errors.Is does not reach the cause")
 	}
 	var target *Error
 	if !errors.As(e, &target) || target.Class != ClassContext {
-		t.Error("errors.As не достал класс")
+		t.Error("errors.As did not extract the class")
 	}
 	// The class is read through third-party wrappers too (fmt.Errorf %w).
-	if got := ClassOf(fmt.Errorf("обёртка: %w", e)); got != ClassContext {
-		t.Errorf("ClassOf через обёртку = %v", got)
+	if got := ClassOf(fmt.Errorf("wrapper: %w", e)); got != ClassContext {
+		t.Errorf("ClassOf through the wrapper = %v", got)
 	}
 	// Without a URL — the short format.
 	if got := (&Error{Class: ClassBrowser, Err: ErrClosed}).Error(); got != "render browser: "+ErrClosed.Error() {
-		t.Errorf("Error() без URL = %q", got)
+		t.Errorf("Error() without a URL = %q", got)
 	}
 	// A foreign error — a page error: no context retries.
 	if got := ClassOf(sentinel); got != ClassTask {
-		t.Errorf("ClassOf(чужая) = %v, хочу task", got)
+		t.Errorf("ClassOf(a foreign error) = %v, want task", got)
 	}
 	if got := ClassOf(nil); got != ClassTask {
-		t.Errorf("ClassOf(nil) = %v, хочу task", got)
+		t.Errorf("ClassOf(nil) = %v, want task", got)
 	}
 }
 
@@ -72,17 +72,17 @@ func TestLoadErrorCode(t *testing.T) {
 		t.Errorf("LoadErrorCode(render.Error) = %q", got)
 	}
 	// Arbitrary %w wrappers — as the worker does on top of render.Error.
-	if got := LoadErrorCode(fmt.Errorf("renderworker: рендер: %w", e)); got != "net::ERR_CERT_AUTHORITY_INVALID" {
-		t.Errorf("LoadErrorCode через обёртки = %q", got)
+	if got := LoadErrorCode(fmt.Errorf("renderworker: render: %w", e)); got != "net::ERR_CERT_AUTHORITY_INVALID" {
+		t.Errorf("LoadErrorCode through the wrappers = %q", got)
 	}
 	for name, err := range map[string]error{
-		"без ошибки":            nil,
-		"не ошибка загрузки":    errors.New("таймаут страницы"),
-		"маркер загрузки":       chromedp.ErrPageLoad,
-		"ошибка другого класса": &Error{Class: ClassBrowser, Err: errors.New("canceled")},
+		"no error":            nil,
+		"not a load error":    errors.New("page timeout"),
+		"a load marker":       chromedp.ErrPageLoad,
+		"an error of another class": &Error{Class: ClassBrowser, Err: errors.New("canceled")},
 	} {
 		if got := LoadErrorCode(err); got != "" {
-			t.Errorf("LoadErrorCode(%s) = %q, хочу пусто", name, got)
+			t.Errorf("LoadErrorCode(%s) = %q, want empty", name, got)
 		}
 	}
 }
@@ -102,79 +102,79 @@ func canceledCtx() context.Context {
 }
 
 func TestClassifyCtx(t *testing.T) {
-	err := errors.New("сбой")
+	err := errors.New("failure")
 
-	t.Run("браузер мёртв", func(t *testing.T) {
+	t.Run("the browser is dead", func(t *testing.T) {
 		b, _ := livePair()
 		b.ctx = canceledCtx()
 		if got := ClassOf(b.classifyCtx(err, "u", nil)); got != ClassBrowser {
-			t.Errorf("класс %v, хочу browser", got)
+			t.Errorf("the class %v, want browser", got)
 		}
 	})
 
-	t.Run("контекст вкладки отменён", func(t *testing.T) {
+	t.Run("the tab context is cancelled", func(t *testing.T) {
 		b, s := livePair()
 		s.ctx = canceledCtx()
 		if got := ClassOf(b.classifyCtx(err, "u", s)); got != ClassContext {
-			t.Errorf("класс %v, хочу context", got)
+			t.Errorf("the class %v, want context", got)
 		}
 	})
 
-	t.Run("ошибка загрузки страницы", func(t *testing.T) {
+	t.Run("a page load error", func(t *testing.T) {
 		b, s := livePair()
 		s.probeFn = func() bool { return true } // must not be needed
 		loadErr := &chromedp.LoadError{ErrorText: "net::ERR_NAME_NOT_RESOLVED"}
 		if got := ClassOf(b.classifyCtx(loadErr, "u", s)); got != ClassTask {
-			t.Errorf("класс %v, хочу task", got)
+			t.Errorf("the class %v, want task", got)
 		}
 	})
 
-	t.Run("вкладка не отвечает — зонд", func(t *testing.T) {
+	t.Run("the tab is not responding — the probe", func(t *testing.T) {
 		b, s := livePair()
 		s.probeFn = func() bool { return false }
 		if got := ClassOf(b.classifyCtx(err, "u", s)); got != ClassContext {
-			t.Errorf("класс %v, хочу context", got)
+			t.Errorf("the class %v, want context", got)
 		}
 	})
 
-	t.Run("зонд жив — ошибка страницы", func(t *testing.T) {
+	t.Run("the probe is alive — a page error", func(t *testing.T) {
 		b, s := livePair()
 		s.probeFn = func() bool { return true }
 		if got := ClassOf(b.classifyCtx(err, "u", s)); got != ClassTask {
-			t.Errorf("класс %v, хочу task", got)
+			t.Errorf("the class %v, want task", got)
 		}
 	})
 
-	t.Run("сессия без контекста", func(t *testing.T) {
+	t.Run("a session without a context", func(t *testing.T) {
 		// A session that never reached tab creation (ctx nil): the nil-guard
 		// of classification must pass it to the probe, not crash.
 		b, _ := livePair()
 		s := &Session{b: b}
 		if got := ClassOf(b.classifyCtx(err, "u", s)); got != ClassContext {
-			t.Errorf("класс %v, хочу context (зонд отвергает)", got)
+			t.Errorf("the class %v, want context (the probe rejects)", got)
 		}
 	})
 
-	t.Run("сессии нет (создание контекста)", func(t *testing.T) {
+	t.Run("no session (context creation)", func(t *testing.T) {
 		b, _ := livePair()
 		if got := ClassOf(b.classifyCtx(err, "u", nil)); got != ClassContext {
-			t.Errorf("класс %v, хочу context", got)
+			t.Errorf("the class %v, want context", got)
 		}
 	})
 }
 
 func TestSessionWrap(t *testing.T) {
-	err := errors.New("сбой")
+	err := errors.New("failure")
 
-	t.Run("отмена вызывающего контекста", func(t *testing.T) {
+	t.Run("the caller's context cancellation", func(t *testing.T) {
 		_, s := livePair()
 		got := s.wrap(err, canceledCtx(), context.Background(), "u")
 		if got.Class != ClassTask || !errors.Is(got.Err, context.Canceled) {
-			t.Errorf("класс %v / %v, хочу task с context.Canceled", got.Class, got.Err)
+			t.Errorf("the class %v / %v, want task with context.Canceled", got.Class, got.Err)
 		}
 	})
 
-	t.Run("таймаут страницы — ошибка задачи", func(t *testing.T) {
+	t.Run("page timeout — a task error", func(t *testing.T) {
 		_, s := livePair()
 		caller := context.Background()
 		opCtx, stop := context.WithTimeout(caller, time.Millisecond)
@@ -183,15 +183,15 @@ func TestSessionWrap(t *testing.T) {
 
 		got := s.wrap(err, caller, opCtx, "u")
 		if got.Class != ClassTask || !errors.Is(got.Err, context.DeadlineExceeded) {
-			t.Errorf("класс %v / %v, хочу task с DeadlineExceeded", got.Class, got.Err)
+			t.Errorf("the class %v / %v, want task with DeadlineExceeded", got.Class, got.Err)
 		}
 	})
 
-	t.Run("живые контексты — классификация браузера", func(t *testing.T) {
+	t.Run("live contexts — the browser classification", func(t *testing.T) {
 		b, s := livePair()
 		b.ctx = canceledCtx()
 		if got := ClassOf(s.wrap(err, context.Background(), context.Background(), "u")); got != ClassBrowser {
-			t.Errorf("класс %v, хочу browser", got)
+			t.Errorf("the class %v, want browser", got)
 		}
 	})
 }

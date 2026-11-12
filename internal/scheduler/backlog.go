@@ -90,7 +90,7 @@ func NewBacklogGauge(reg *metrics.Registry) *prometheus.GaugeVec {
 	}
 	return reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_backlog_domains",
-		Help: "Глубина backlog: домены в ожидании выборки (pending) и в работе с lease (queued) — суммы счётчиков зон (дельты переходов + реконсиляция, T-178), без удалённых.",
+		Help: "Backlog depth: domains awaiting selection (pending) and in flight with a lease (queued) — sums of zone counters (transition deltas + reconciliation, T-178), without deleted ones.",
 	}, metrics.LabelState)
 }
 
@@ -112,12 +112,12 @@ func newBacklogLoopMetrics(reg *metrics.Registry) *backlogLoopMetrics {
 	return &backlogLoopMetrics{
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_backlog_pass_seconds",
-			Help:    "Длительность прохода глубины backlog (суммы счётчиков зон по справочнику, T-077/T-178).",
+			Help:    "Backlog depth pass duration (sums of zone counters over the reference table, T-077/T-178).",
 			Buckets: prometheus.ExponentialBuckets(0.5, 2, 11),
 		}),
 		skipped: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_backlog_skipped_ticks_total",
-			Help: "Пропущенные тики цикла backlog: проход длился дольше интервала, накопившийся тик не запускает новый проход (single-flight, T-161).",
+			Help: "Skipped ticks of the backlog loop: the pass took longer than the interval, the accumulated tick does not start a new pass (single-flight, T-161).",
 		}),
 	}
 }
@@ -143,27 +143,27 @@ func (m *backlogLoopMetrics) skip() {
 // must be exported, not disappear until the next non-empty one).
 func BacklogOnce(ctx context.Context, pool db.DB, gauge *prometheus.GaugeVec) (BacklogResult, error) {
 	if pool == nil {
-		return BacklogResult{}, errors.New("scheduler: глубина backlog: пул не задан")
+		return BacklogResult{}, errors.New("scheduler: backlog depth: pool not set")
 	}
 	if gauge == nil {
-		return BacklogResult{}, errors.New("scheduler: глубина backlog: gauge не задан")
+		return BacklogResult{}, errors.New("scheduler: backlog depth: gauge not set")
 	}
 
 	rows, err := pool.Query(ctx, backlogSQL)
 	if err != nil {
-		return BacklogResult{}, fmt.Errorf("scheduler: глубина backlog: %w", err)
+		return BacklogResult{}, fmt.Errorf("scheduler: backlog depth: %w", err)
 	}
 	defer rows.Close()
 
 	var out BacklogResult
 	if !rows.Next() {
-		return BacklogResult{}, fmt.Errorf("scheduler: глубина backlog: пустой ответ агрегата")
+		return BacklogResult{}, fmt.Errorf("scheduler: backlog depth: empty aggregate response")
 	}
 	if err := rows.Scan(&out.Pending, &out.Queued); err != nil {
-		return BacklogResult{}, fmt.Errorf("scheduler: глубина backlog: чтение: %w", err)
+		return BacklogResult{}, fmt.Errorf("scheduler: backlog depth: read: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return BacklogResult{}, fmt.Errorf("scheduler: глубина backlog: %w", err)
+		return BacklogResult{}, fmt.Errorf("scheduler: backlog depth: %w", err)
 	}
 
 	gauge.WithLabelValues(model.CheckStatePending.String()).Set(float64(out.Pending))
@@ -191,10 +191,10 @@ func BacklogOnce(ctx context.Context, pool db.DB, gauge *prometheus.GaugeVec) (B
 func BacklogLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts BacklogOptions) error {
 	gauge := NewBacklogGauge(reg)
 	if pool == nil {
-		return errors.New("scheduler: цикл backlog: пул не задан")
+		return errors.New("scheduler: backlog loop: pool not set")
 	}
 	if gauge == nil {
-		return errors.New("scheduler: цикл backlog: реестр метрик не задан")
+		return errors.New("scheduler: backlog loop: metric registry not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
@@ -206,7 +206,7 @@ func BacklogLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts Ba
 	// behavior of the loop — suppressed per §4 docs/mutation-testing.md
 	// (logging is not tested).
 	// mutator-disable-next-line statement/remove
-	log.Info("цикл глубины backlog", "interval", o.Interval.String())
+	log.Info("backlog depth loop", "interval", o.Interval.String())
 
 	// Ticker before the starting pass: ticks are counted from the loop start,
 	// so the accumulated-tick drain inside pass sees the same ticker.
@@ -225,9 +225,9 @@ func BacklogLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts Ba
 		case err != nil && ctx.Err() != nil:
 			// Cancellation during a pass is part of the stop, not an alarm.
 		case err != nil:
-			log.Warn("проход глубины backlog", "err", err)
+			log.Warn("backlog depth pass", "err", err)
 		default:
-			log.Debug("проход глубины backlog",
+			log.Debug("backlog depth pass",
 				"pending", res.Pending, "queued", res.Queued)
 		}
 		took := time.Since(started)
@@ -241,7 +241,7 @@ func BacklogLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts Ba
 			case <-ticker.C:
 			default:
 			}
-			log.Warn("проход глубины backlog дольше интервала — накопившийся тик пропущен",
+			log.Warn("backlog depth pass longer than the interval — accumulated tick skipped",
 				"took", took.String(), "interval", o.Interval.String())
 			m.skip()
 		}

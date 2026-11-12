@@ -125,7 +125,7 @@ func newLeaseNullMetrics(reg *metrics.Registry) *leaseNullMetrics {
 	return &leaseNullMetrics{
 		returned: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_scheduler_lease_null_returned_total",
-			Help: "Возврат в pending строк check_state=queued с NULL queued_at ремонтным проходом цикла LeaseWatch (T-255, ФТ-1.2): нарушенный инвариант T-028 «queued ⇒ queued_at NOT NULL» — вне основного lease-прохода навсегда (NULL отсеивается сравнением возраста). Стационарно ноль; ненулевой стационар — ручной SQL или баг писателя постановки: разбор docs/runbooks.md §2.9.",
+			Help: "Return to pending of check_state=queued rows with NULL queued_at by the repair pass of the LeaseWatch cycle (T-255, FR-1.2): a violated T-028 invariant \"queued ⇒ queued_at NOT NULL\" — outside the main lease pass forever (NULL is filtered out by the age comparison). Zero in steady state; a non-zero steady state means manual SQL or a bug in the enqueue writer: analysis in docs/runbooks.md §2.9.",
 		}).WithLabelValues(),
 	}
 }
@@ -149,14 +149,14 @@ func (m *leaseNullMetrics) add(n int64) {
 // The form of the main lease query is not touched (lease.go is unchanged).
 func LeaseNullOnce(ctx context.Context, pool LeaseDB, opts LeaseOptions) (LeaseNullResult, error) {
 	if pool == nil {
-		return LeaseNullResult{}, errors.New("scheduler: страховка queued без queued_at: пул не задан")
+		return LeaseNullResult{}, errors.New("scheduler: queued without queued_at guard: pool not set")
 	}
 	o := opts.withDefaults()
 	met := newLeaseNullMetrics(o.Metrics)
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return LeaseNullResult{}, fmt.Errorf("scheduler: страховка queued без queued_at: транзакция: %w", err)
+		return LeaseNullResult{}, fmt.Errorf("scheduler: queued without queued_at guard: transaction: %w", err)
 	}
 	// The rollback is unconditional: after Commit — a no-op (the T-020/T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -176,7 +176,7 @@ func LeaseNullOnce(ctx context.Context, pool LeaseDB, opts LeaseOptions) (LeaseN
 		return LeaseNullResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return LeaseNullResult{}, fmt.Errorf("scheduler: страховка queued без queued_at: фиксация: %w", err)
+		return LeaseNullResult{}, fmt.Errorf("scheduler: queued without queued_at guard: commit: %w", err)
 	}
 	met.add(n)
 	return LeaseNullResult{Domains: n, Selected: len(batch)}, nil
@@ -187,7 +187,7 @@ func LeaseNullOnce(ctx context.Context, pool LeaseDB, opts LeaseOptions) (LeaseN
 func leaseNullSelect(ctx context.Context, tx pgx.Tx, limit int) ([]leaseNullRow, error) {
 	rows, err := tx.Query(ctx, leaseNullSelectSQL, limit)
 	if err != nil {
-		return nil, fmt.Errorf("scheduler: страховка queued без queued_at: выборка пачки: %w", err)
+		return nil, fmt.Errorf("scheduler: queued without queued_at guard: batch selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -195,12 +195,12 @@ func leaseNullSelect(ctx context.Context, tx pgx.Tx, limit int) ([]leaseNullRow,
 	for rows.Next() {
 		var r leaseNullRow
 		if err := rows.Scan(&r.zone, &r.id); err != nil {
-			return nil, fmt.Errorf("scheduler: страховка queued без queued_at: выборка пачки: чтение: %w", err)
+			return nil, fmt.Errorf("scheduler: queued without queued_at guard: batch selection: read: %w", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scheduler: страховка queued без queued_at: выборка пачки: %w", err)
+		return nil, fmt.Errorf("scheduler: queued without queued_at guard: batch selection: %w", err)
 	}
 	return out, nil
 }
@@ -219,7 +219,7 @@ func leaseNullTranslate(ctx context.Context, tx pgx.Tx, batch []leaseNullRow) (i
 		zones, ids,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("scheduler: страховка queued без queued_at: перевод пачки: %w", err)
+		return 0, fmt.Errorf("scheduler: queued without queued_at guard: batch move: %w", err)
 	}
 	defer rows.Close()
 
@@ -227,12 +227,12 @@ func leaseNullTranslate(ctx context.Context, tx pgx.Tx, batch []leaseNullRow) (i
 	for rows.Next() {
 		var zoneID int16
 		if err := rows.Scan(&zoneID); err != nil {
-			return 0, fmt.Errorf("scheduler: страховка queued без queued_at: перевод пачки: чтение: %w", err)
+			return 0, fmt.Errorf("scheduler: queued without queued_at guard: batch move: read: %w", err)
 		}
 		n++
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("scheduler: страховка queued без queued_at: перевод пачки: %w", err)
+		return 0, fmt.Errorf("scheduler: queued without queued_at guard: batch move: %w", err)
 	}
 	return n, nil
 }

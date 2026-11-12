@@ -67,7 +67,7 @@ func (f *fakeCDPSession) Call(ctx context.Context, method string, params, _ any)
 }
 
 func (f *fakeCDPSession) Subscribe(string) (<-chan jsonv2.Value, func()) {
-	panic("тесты подают события собственным итератором, не через Subscribe")
+	panic("the tests feed events with their own iterator, not via Subscribe")
 }
 
 // calls — a copy of the command journal.
@@ -99,7 +99,7 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("условие не наступило за 2 с")
+	t.Fatal("the condition was not reached in 2 s")
 }
 
 // TestBlockResourceType — the list of the blocked and passing types.
@@ -140,22 +140,22 @@ func TestBlockResourceType(t *testing.T) {
 		types []network.ResourceType
 		want  map[network.ResourceType]bool
 	}{
-		"без опции (T-062)":        {blockTypes(false), baseWant},
+		"without the option (T-062)":        {blockTypes(false), baseWant},
 		"block_stylesheet (T-213)": {blockTypes(true), cssWant},
 	} {
 		t.Run(name, func(t *testing.T) {
 			for _, rt := range all {
 				if got := blockResourceType(tc.types, rt); got != tc.want[rt] {
-					t.Errorf("blockResourceType(%s) = %v, хочу %v", rt, got, tc.want[rt])
+					t.Errorf("blockResourceType(%s) = %v, want %v", rt, got, tc.want[rt])
 				}
 			}
 			// An unknown type — it passes.
 			if blockResourceType(tc.types, network.ResourceType("SomethingNew")) {
-				t.Error("неизвестный тип должен проходить")
+				t.Error("an unknown type must pass")
 			}
 			// An empty type (Chrome does not send it) — it passes.
 			if blockResourceType(tc.types, network.ResourceType("")) {
-				t.Error("пустой тип должен проходить")
+				t.Error("an empty type must pass")
 			}
 		})
 	}
@@ -170,18 +170,18 @@ func TestBlockTypes(t *testing.T) {
 	if !slices.Equal(base, []network.ResourceType{
 		network.ResourceTypeImage, network.ResourceTypeMedia, network.ResourceTypeFont,
 	}) {
-		t.Fatalf("без опции блокируются %v, хочу Image/Media/Font (T-062)", base)
+		t.Fatalf("without the option %v are blocked, want Image/Media/Font (T-062)", base)
 	}
 	css := blockTypes(true)
 	if len(css) != len(base)+1 || css[len(css)-1] != network.ResourceTypeStylesheet {
-		t.Fatalf("с опцией блокируются %v, хочу базовый набор + Stylesheet (T-213)", css)
+		t.Fatalf("with the option %v are blocked, want the base set + Stylesheet (T-213)", css)
 	}
 	if !slices.Equal(css[:len(base)], base) {
-		t.Errorf("с опцией базовая часть %v изменилась, хочу %v", css[:len(base)], base)
+		t.Errorf("with the option the base part %v changed, want %v", css[:len(base)], base)
 	}
 	// A copy, not an append into the shared slice: the base list has not grown.
 	if len(blockBlockedTypes) != 3 {
-		t.Errorf("базовый перечень вырос до %d после blockTypes(true) — общая мутация", len(blockBlockedTypes))
+		t.Errorf("the base list grew to %d after blockTypes(true) — a shared mutation", len(blockBlockedTypes))
 	}
 }
 
@@ -191,30 +191,30 @@ func TestBlockTypes(t *testing.T) {
 // The tracker domain patterns (T-214) — a separate TestBlockPatternsTrackers.
 func TestBlockPatterns(t *testing.T) {
 	for name, types := range map[string][]network.ResourceType{
-		"без опции (T-062)":        blockTypes(false),
+		"without the option (T-062)":        blockTypes(false),
 		"block_stylesheet (T-213)": blockTypes(true),
 	} {
 		t.Run(name, func(t *testing.T) {
 			patterns := blockPatterns(types, false, false)
 			if len(patterns) != len(types) {
-				t.Fatalf("паттернов %d, хочу %d (по числу блокируемых типов)",
+				t.Fatalf("patterns %d, want %d (one per blocked type)",
 					len(patterns), len(types))
 			}
 			seen := make(map[network.ResourceType]bool)
 			for _, p := range patterns {
 				if !blockResourceType(types, p.ResourceType) {
-					t.Errorf("паттерн с незаблокированным типом %s", p.ResourceType)
+					t.Errorf("a pattern with an unblocked type %s", p.ResourceType)
 				}
 				if seen[p.ResourceType] {
-					t.Errorf("дублирующийся тип паттерна %s", p.ResourceType)
+					t.Errorf("a duplicate pattern type %s", p.ResourceType)
 				}
 				seen[p.ResourceType] = true
 				if p.RequestStage != fetch.RequestStageRequest {
-					t.Errorf("стадия паттерна %s: %s, хочу Request",
+					t.Errorf("the pattern stage %s: %s, want Request",
 						p.ResourceType, p.RequestStage)
 				}
 				if p.URLPattern != "" {
-					t.Errorf("URL-фильтр паттерна %s: %q, хочу пусто (только по типу)",
+					t.Errorf("the pattern URL filter %s: %q, want empty (by type only)",
 						p.ResourceType, p.URLPattern)
 				}
 			}
@@ -239,41 +239,41 @@ func TestBlockPatternsTrackers(t *testing.T) {
 		}
 		urlPatterns[p.URLPattern] = true
 		if p.ResourceType != "" {
-			t.Errorf("доменный паттерн %q с типом %s — типом аналитика не ловится",
+			t.Errorf("the domain pattern %q with the type %s — the analytics is not caught by type",
 				p.URLPattern, p.ResourceType)
 		}
 		if p.RequestStage != fetch.RequestStageRequest {
-			t.Errorf("стадия доменного паттерна %q: %s, хочу Request",
+			t.Errorf("the domain pattern stage %q: %s, want Request",
 				p.URLPattern, p.RequestStage)
 		}
 	}
 	if typePatterns != len(blockTypes(false)) {
-		t.Errorf("типовых паттернов %d, хочу %d (доменные — сверх типов)",
+		t.Errorf("type patterns %d, want %d (domain ones on top of types)",
 			typePatterns, len(blockTypes(false)))
 	}
 	if len(urlPatterns) != len(blockTrackerDomains) {
-		t.Errorf("доменных паттернов %d, хочу %d (по числу доменов списка)",
+		t.Errorf("domain patterns %d, want %d (one per list domain)",
 			len(urlPatterns), len(blockTrackerDomains))
 	}
 	for _, d := range blockTrackerDomains {
 		if !urlPatterns["*"+d+"*"] {
-			t.Errorf("домен %s без паттерна *%s*", d, d)
+			t.Errorf("the domain %s without the pattern *%s*", d, d)
 		}
 	}
 
 	for name, types := range map[string][]network.ResourceType{
-		"без опции (T-062)":        blockTypes(false),
+		"without the option (T-062)":        blockTypes(false),
 		"block_stylesheet (T-213)": blockTypes(true),
 	} {
-		t.Run("выключено: "+name, func(t *testing.T) {
+		t.Run("off: "+name, func(t *testing.T) {
 			off := blockPatterns(types, false, false)
 			if len(off) != len(types) {
-				t.Fatalf("паттернов %d, хочу %d (только типы)",
+				t.Fatalf("patterns %d, want %d (types only)",
 					len(off), len(types))
 			}
 			for _, p := range off {
 				if p.URLPattern != "" {
-					t.Errorf("при выключенной опции доменный паттерн %q", p.URLPattern)
+					t.Errorf("with the option off there is a domain pattern %q", p.URLPattern)
 				}
 			}
 		})
@@ -288,28 +288,28 @@ func TestBlockPatternsTrackers(t *testing.T) {
 func TestBlockPatternsInternal(t *testing.T) {
 	on := blockPatterns(blockTypes(false), false, true)
 	if len(on) != len(blockTypes(false))+1 {
-		t.Fatalf("паттернов %d, хочу %d+1 (типы + «всё»)", len(on), len(blockTypes(false)))
+		t.Fatalf("patterns %d, want %d+1 (types + the catch-all)", len(on), len(blockTypes(false)))
 	}
 	catchAll := 0
 	for _, p := range on {
 		if p.URLPattern == "*" {
 			catchAll++
 			if p.ResourceType != "" {
-				t.Errorf("паттерн-«всё» с типом %s — типом контур не ловится", p.ResourceType)
+				t.Errorf("the catch-all pattern with the type %s — the contour does not catch it by type", p.ResourceType)
 			}
 			if p.RequestStage != fetch.RequestStageRequest {
-				t.Errorf("стадия паттерна-«всё»: %s, хочу Request", p.RequestStage)
+				t.Errorf("the catch-all pattern stage: %s, want Request", p.RequestStage)
 			}
 		}
 	}
 	if catchAll != 1 {
-		t.Errorf("паттернов-«всё» %d, хочу 1", catchAll)
+		t.Errorf("catch-all patterns %d, want 1", catchAll)
 	}
 
 	off := blockPatterns(blockTypes(false), false, false)
 	for _, p := range off {
 		if p.URLPattern == "*" {
-			t.Errorf("при выключенном контуре есть паттерн-«всё»: %+v", p)
+			t.Errorf("with the contour off there is a catch-all pattern: %+v", p)
 		}
 	}
 }
@@ -334,10 +334,10 @@ func TestBlockRespondInternal(t *testing.T) {
 		{"Document→[::ffff:169.254.169.254] fail", "http://[::ffff:169.254.169.254]/latest/meta-data/", true, 0},
 		{"Script→10.0.0.1 fail", "http://10.0.0.1/app.js", true, 0},
 		{"XHR→localhost fail", "http://localhost:6379/stats", true, 0},
-		{"WebSocket→127.1 fail (WHATWG-форма)", "ws://127.1/socket", true, 0},
+		{"WebSocket→127.1 fail (the WHATWG form)", "ws://127.1/socket", true, 0},
 		{"Document→site.example continue", "http://site.example/page", false, 1},
 		{"Script→203.0.113.7 continue", "http://203.0.113.7/app.js", false, 0},
-		{"путь с подстрокой 127.0.0.1 continue", "http://site.example/js/127.0.0.1.js", false, 1},
+		{"a path with the 127.0.0.1 substring continue", "http://site.example/js/127.0.0.1.js", false, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			lookup := &fakeLookupHost{addrs: map[string][]netip.Addr{
@@ -355,19 +355,19 @@ func TestBlockRespondInternal(t *testing.T) {
 				want = "Fetch.failRequest"
 			}
 			if len(calls) != 1 || calls[0].Method != want {
-				t.Fatalf("команды %v, хочу одну %s", calls, want)
+				t.Fatalf("commands %v, want one %s", calls, want)
 			}
 			if n := len(lookup.callsOf()); n != tc.lookups {
-				t.Errorf("обменов резолвера %d, хочу %d (вызовы %v)",
+				t.Errorf("resolver exchanges %d, want %d (calls %v)",
 					n, tc.lookups, lookup.callsOf())
 			}
 			if tc.fail {
 				params, ok := calls[0].Params.(fetch.FailRequestParams)
 				if !ok {
-					t.Fatalf("параметры %T, хочу fetch.FailRequestParams", calls[0].Params)
+					t.Fatalf("params %T, want fetch.FailRequestParams", calls[0].Params)
 				}
 				if params.ErrorReason != network.ErrorReasonBlockedByClient {
-					t.Errorf("failRequest %+v, хочу BlockedByClient", params)
+					t.Errorf("failRequest %+v, want BlockedByClient", params)
 				}
 			}
 		})
@@ -379,7 +379,7 @@ func TestBlockRespondInternal(t *testing.T) {
 		RequestID: "anomaly", ResourceType: network.ResourceTypeScript,
 	}, blockRulesOf(Options{BlockInternalAddrs: true}))
 	if calls := fake.callsOf(); len(calls) != 1 || calls[0].Method != "Fetch.continueRequest" {
-		t.Fatalf("команды %v, хочу одну Fetch.continueRequest (событие без request)", calls)
+		t.Fatalf("commands %v, want one Fetch.continueRequest (an event without request)", calls)
 	}
 
 	// The flag is off — an internal host passes (dev/testbed), no resolve.
@@ -390,10 +390,10 @@ func TestBlockRespondInternal(t *testing.T) {
 		Request: &network.Request{URL: "http://127.0.0.1/"},
 	}, blockRulesOf(Options{LookupHost: lookup.lookup}))
 	if calls := fake.callsOf(); len(calls) != 1 || calls[0].Method != "Fetch.continueRequest" {
-		t.Fatalf("команды %v, хочу одну Fetch.continueRequest (флаг выключен)", calls)
+		t.Fatalf("commands %v, want one Fetch.continueRequest (the flag is off)", calls)
 	}
 	if n := len(lookup.callsOf()); n != 0 {
-		t.Errorf("обменов резолвера %d, хочу 0 (контур выключен)", n)
+		t.Errorf("resolver exchanges %d, want 0 (the contour is off)", n)
 	}
 }
 
@@ -407,24 +407,24 @@ func TestBlockTrackerURL(t *testing.T) {
 		url  string
 		want bool
 	}{
-		{"хост трекера", "https://www.google-analytics.com/g/collect?cid=1", true},
-		{"апекс трекера", "https://google-analytics.com/analytics.js", true},
-		{"поддомен трекера", "https://cdn4.mixpanel.com/lib.min.js", true},
-		{"метрика RU", "https://mc.yandex.ru/metrika/tag.js", true},
-		{"метрика международная", "https://mc.yandex.com/watch/12345678", true},
-		{"sentry ingest-поддомен", "https://o123456.ingest.sentry.io/api/1/envelope/", true},
-		{"путь с подстрокой домена", "https://site.example/js/google-analytics.com.js", false},
-		{"query с подстрокой домена", "https://site.example/search?q=doubleclick.net", false},
-		{"userinfo с доменом", "https://google-analytics.com@site.example/collect", false},
-		{"трекер-суффикс чужого хоста", "https://google-analytics.com.evil.example/ga.js", false},
-		{"граница домена (.co ≠ .com)", "https://api.mixpanel.co/track", false},
-		{"обычный сайт", "https://laravel.example/js/app.js", false},
-		{"неразобранный URL", "://нет-схемы", false},
+		{"a tracker host", "https://www.google-analytics.com/g/collect?cid=1", true},
+		{"the tracker apex", "https://google-analytics.com/analytics.js", true},
+		{"a tracker subdomain", "https://cdn4.mixpanel.com/lib.min.js", true},
+		{"a RU metric", "https://mc.yandex.ru/metrika/tag.js", true},
+		{"an international metric", "https://mc.yandex.com/watch/12345678", true},
+		{"the sentry ingest subdomain", "https://o123456.ingest.sentry.io/api/1/envelope/", true},
+		{"a path with the domain substring", "https://site.example/js/google-analytics.com.js", false},
+		{"a query with the domain substring", "https://site.example/search?q=doubleclick.net", false},
+		{"userinfo with a domain", "https://google-analytics.com@site.example/collect", false},
+		{"a tracker suffix of a foreign host", "https://google-analytics.com.evil.example/ga.js", false},
+		{"the domain boundary (.co ≠ .com)", "https://api.mixpanel.co/track", false},
+		{"a regular site", "https://laravel.example/js/app.js", false},
+		{"an unparseable URL", "://no-scheme", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := blockTrackerURL(tc.url); got != tc.want {
-				t.Errorf("blockTrackerURL(%q) = %v, хочу %v", tc.url, got, tc.want)
+				t.Errorf("blockTrackerURL(%q) = %v, want %v", tc.url, got, tc.want)
 			}
 		})
 	}
@@ -436,23 +436,23 @@ func TestBlockTrackerURL(t *testing.T) {
 // (the invariant of the pair "a wide *domain* pattern → the host check").
 func TestBlockTrackerDomainsList(t *testing.T) {
 	if n := len(blockTrackerDomains); n < 12 || n > 16 {
-		t.Errorf("в списке %d доменов — задуман диапазон 12–16", n)
+		t.Errorf("%d domains in the list — the intended range is 12–16", n)
 	}
 	seen := make(map[string]bool, len(blockTrackerDomains))
 	for _, d := range blockTrackerDomains {
 		if d == "" || d != strings.ToLower(d) || !strings.Contains(d, ".") ||
 			strings.ContainsAny(d, "/:?*") {
-			t.Errorf("домен %q — не нижнерегистровый хост без схемы и звёздочек", d)
+			t.Errorf("the domain %q is not a lower-case host without a scheme and asterisks", d)
 		}
 		if seen[d] {
-			t.Errorf("дубль домена %q", d)
+			t.Errorf("a duplicate of the domain %q", d)
 		}
 		seen[d] = true
 		if !blockTrackerURL("https://" + d + "/tag.js") {
-			t.Errorf("апекс %s не опознаётся списком", d)
+			t.Errorf("the apex %s is not recognized by the list", d)
 		}
 		if !blockTrackerURL("https://static." + d + "/tag.js") {
-			t.Errorf("поддомен static.%s не опознаётся списком", d)
+			t.Errorf("the static.%s subdomain is not recognized by the list", d)
 		}
 	}
 }
@@ -460,7 +460,7 @@ func TestBlockTrackerDomainsList(t *testing.T) {
 // TestBlockEnable — enabling the interception with the Fetch.enable command and the
 // patterns by the blocked types; a command error is returned to the caller.
 func TestBlockEnable(t *testing.T) {
-	t.Run("команда и параметры", func(t *testing.T) {
+	t.Run("the command and params", func(t *testing.T) {
 		fake := &fakeCDPSession{}
 		rules := blockRulesOf(Options{BlockStylesheet: true}) // with the option: one more pattern
 		if err := blockEnable(context.Background(), fake, rules); err != nil {
@@ -468,28 +468,28 @@ func TestBlockEnable(t *testing.T) {
 		}
 		calls := fake.callsOf()
 		if len(calls) != 1 || calls[0].Method != "Fetch.enable" {
-			t.Fatalf("команды %v, хочу одну Fetch.enable", calls)
+			t.Fatalf("commands %v, want one Fetch.enable", calls)
 		}
 		params, ok := calls[0].Params.(fetch.EnableParams)
 		if !ok {
-			t.Fatalf("параметры %T, хочу fetch.EnableParams", calls[0].Params)
+			t.Fatalf("params %T, want fetch.EnableParams", calls[0].Params)
 		}
 		if len(params.Patterns) != len(rules.types) {
-			t.Fatalf("паттернов %d, хочу %d", len(params.Patterns), len(rules.types))
+			t.Fatalf("patterns %d, want %d", len(params.Patterns), len(rules.types))
 		}
 		for _, p := range params.Patterns {
 			if !blockResourceType(rules.types, p.ResourceType) || p.RequestStage != fetch.RequestStageRequest {
-				t.Errorf("паттерн %+v вне блокируемого набора", p)
+				t.Errorf("the pattern %+v is outside the blocked set", p)
 			}
 		}
 	})
 
-	t.Run("ошибка CDP прокладывается", func(t *testing.T) {
+	t.Run("the CDP error is propagated", func(t *testing.T) {
 		boom := errors.New("session gone")
 		fake := &fakeCDPSession{fail: map[string]error{"Fetch.enable": boom}}
 		err := blockEnable(context.Background(), fake, blockRulesOf(Options{}))
 		if !errors.Is(err, boom) {
-			t.Fatalf("ошибка %v, хочу %v", err, boom)
+			t.Fatalf("the error %v, want %v", err, boom)
 		}
 	})
 }
@@ -524,33 +524,33 @@ func TestBlockRespond(t *testing.T) {
 
 			calls := fake.callsOf()
 			if len(calls) != 1 {
-				t.Fatalf("команд %d, хочу одну: %v", len(calls), calls)
+				t.Fatalf("commands %d, want one: %v", len(calls), calls)
 			}
 			want := "Fetch.continueRequest"
 			if tc.fail {
 				want = "Fetch.failRequest"
 			}
 			if calls[0].Method != want {
-				t.Fatalf("команда %s, хочу %s", calls[0].Method, want)
+				t.Fatalf("the command %s, want %s", calls[0].Method, want)
 			}
 			if tc.fail {
 				params, ok := calls[0].Params.(fetch.FailRequestParams)
 				if !ok {
-					t.Fatalf("параметры %T, хочу fetch.FailRequestParams", calls[0].Params)
+					t.Fatalf("params %T, want fetch.FailRequestParams", calls[0].Params)
 				}
 				if params.RequestID != ev.RequestID {
-					t.Errorf("RequestID %s, хочу %s", params.RequestID, ev.RequestID)
+					t.Errorf("RequestID %s, want %s", params.RequestID, ev.RequestID)
 				}
 				if params.ErrorReason != network.ErrorReasonBlockedByClient {
-					t.Errorf("ErrorReason %s, хочу BlockedByClient", params.ErrorReason)
+					t.Errorf("ErrorReason %s, want BlockedByClient", params.ErrorReason)
 				}
 			} else {
 				params, ok := calls[0].Params.(fetch.ContinueRequestParams)
 				if !ok {
-					t.Fatalf("параметры %T, хочу fetch.ContinueRequestParams", calls[0].Params)
+					t.Fatalf("params %T, want fetch.ContinueRequestParams", calls[0].Params)
 				}
 				if params.RequestID != ev.RequestID {
-					t.Errorf("RequestID %s, хочу %s", params.RequestID, ev.RequestID)
+					t.Errorf("RequestID %s, want %s", params.RequestID, ev.RequestID)
 				}
 			}
 		})
@@ -558,23 +558,23 @@ func TestBlockRespond(t *testing.T) {
 
 	// Stylesheet with the block_stylesheet option (T-213) — failRequest, as
 	// the base blocked types.
-	t.Run("Stylesheet→fail при опции (T-213)", func(t *testing.T) {
+	t.Run("Stylesheet→fail with the option (T-213)", func(t *testing.T) {
 		fake := &fakeCDPSession{}
 		ev := fetch.EventRequestPaused{RequestID: "css-1", ResourceType: network.ResourceTypeStylesheet}
 		blockRespond(context.Background(), fake, ev, blockRulesOf(Options{BlockStylesheet: true}))
 		calls := fake.callsOf()
 		if len(calls) != 1 || calls[0].Method != "Fetch.failRequest" {
-			t.Fatalf("команды %v, хочу одну Fetch.failRequest", calls)
+			t.Fatalf("commands %v, want one Fetch.failRequest", calls)
 		}
 		params, ok := calls[0].Params.(fetch.FailRequestParams)
 		if !ok {
-			t.Fatalf("параметры %T, хочу fetch.FailRequestParams", calls[0].Params)
+			t.Fatalf("params %T, want fetch.FailRequestParams", calls[0].Params)
 		}
 		if params.RequestID != ev.RequestID {
-			t.Errorf("RequestID %s, хочу %s", params.RequestID, ev.RequestID)
+			t.Errorf("RequestID %s, want %s", params.RequestID, ev.RequestID)
 		}
 		if params.ErrorReason != network.ErrorReasonBlockedByClient {
-			t.Errorf("ErrorReason %s, хочу BlockedByClient", params.ErrorReason)
+			t.Errorf("ErrorReason %s, want BlockedByClient", params.ErrorReason)
 		}
 	})
 
@@ -583,7 +583,7 @@ func TestBlockRespond(t *testing.T) {
 	// type), a path suspended by the substring with a foreign host —
 	// continueRequest (the precision sits in the listener, not in the pattern);
 	// with the option off, a tracker request of a non-blocked type passes.
-	t.Run("трекер-домены (T-214)", func(t *testing.T) {
+	t.Run("tracker domains (T-214)", func(t *testing.T) {
 		on := blockRulesOf(Options{BlockTrackerDomains: true})
 		for _, tc := range []struct {
 			name string
@@ -606,15 +606,15 @@ func TestBlockRespond(t *testing.T) {
 				RequestID: "cl-ping", ResourceType: network.ResourceTypePing,
 				Request: &network.Request{URL: "https://www.clarity.ms/tag/xyz"},
 			}, true},
-			{"Image трекера→fail (тип и домен)", fetch.EventRequestPaused{
+			{"a tracker Image→fail (the type and the domain)", fetch.EventRequestPaused{
 				RequestID: "ga-img", ResourceType: network.ResourceTypeImage,
 				Request: &network.Request{URL: "https://www.google-analytics.com/collect.gif"},
 			}, true},
-			{"Script с доменом в пути→continue", fetch.EventRequestPaused{
+			{"a Script with the domain in the path→continue", fetch.EventRequestPaused{
 				RequestID: "own-js", ResourceType: network.ResourceTypeScript,
 				Request: &network.Request{URL: "https://site.example/js/google-analytics.com.js"},
 			}, false},
-			{"событие без request→continue", fetch.EventRequestPaused{
+			{"an event without request→continue", fetch.EventRequestPaused{
 				RequestID: "anomaly", ResourceType: network.ResourceTypeScript,
 			}, false},
 		} {
@@ -627,18 +627,18 @@ func TestBlockRespond(t *testing.T) {
 					want = "Fetch.failRequest"
 				}
 				if len(calls) != 1 || calls[0].Method != want {
-					t.Fatalf("команды %v, хочу одну %s", calls, want)
+					t.Fatalf("commands %v, want one %s", calls, want)
 				}
 				if tc.fail {
 					params, ok := calls[0].Params.(fetch.FailRequestParams)
 					if !ok {
-						t.Fatalf("параметры %T, хочу fetch.FailRequestParams", calls[0].Params)
+						t.Fatalf("params %T, want fetch.FailRequestParams", calls[0].Params)
 					}
 					if params.RequestID != tc.ev.RequestID {
-						t.Errorf("RequestID %s, хочу %s", params.RequestID, tc.ev.RequestID)
+						t.Errorf("RequestID %s, want %s", params.RequestID, tc.ev.RequestID)
 					}
 					if params.ErrorReason != network.ErrorReasonBlockedByClient {
-						t.Errorf("ErrorReason %s, хочу BlockedByClient", params.ErrorReason)
+						t.Errorf("ErrorReason %s, want BlockedByClient", params.ErrorReason)
 					}
 				}
 			})
@@ -652,11 +652,11 @@ func TestBlockRespond(t *testing.T) {
 			Request: &network.Request{URL: "https://www.google-analytics.com/analytics.js"},
 		}, blockRulesOf(Options{}))
 		if calls := fake.callsOf(); len(calls) != 1 || calls[0].Method != "Fetch.continueRequest" {
-			t.Fatalf("команды %v, хочу одну Fetch.continueRequest (опция выключена)", calls)
+			t.Fatalf("commands %v, want one Fetch.continueRequest (the option is off)", calls)
 		}
 	})
 
-	t.Run("ошибка команды проглатывается", func(t *testing.T) {
+	t.Run("the command error is swallowed", func(t *testing.T) {
 		fake := &fakeCDPSession{fail: map[string]error{"Fetch.failRequest": errors.New("dead")}}
 		ev := fetch.EventRequestPaused{RequestID: "r", ResourceType: network.ResourceTypeImage}
 		blockRespond(context.Background(), fake, ev, blockRulesOf(Options{})) // does not panic
@@ -667,24 +667,24 @@ func TestBlockRespond(t *testing.T) {
 // the own short blockDisableTimeout (a regular CDP call is
 // milliseconds, there is no reason to wait longer), a best-effort error is not returned.
 func TestBlockDisable(t *testing.T) {
-	t.Run("команда и таймаут", func(t *testing.T) {
+	t.Run("the command and the timeout", func(t *testing.T) {
 		fake := &fakeCDPSession{}
 		blockDisable(context.Background(), fake)
 		calls := fake.callsOf()
 		if len(calls) != 1 || calls[0].Method != "Fetch.disable" {
-			t.Fatalf("команды %v, хочу одну Fetch.disable", calls)
+			t.Fatalf("commands %v, want one Fetch.disable", calls)
 		}
 		rem := time.Until(calls[0].Deadline)
 		if rem <= 1500*time.Millisecond || rem > 2500*time.Millisecond {
-			t.Errorf("таймаут Fetch.disable: осталось %s, хочу ≈2 с (границы 1.5–2.5 с)", rem)
+			t.Errorf("the Fetch.disable timeout: %s left, want ≈2 s (the 1.5–2.5 s bounds)", rem)
 		}
 	})
 
-	t.Run("ошибка проглатывается", func(t *testing.T) {
-		fake := &fakeCDPSession{fail: map[string]error{"Fetch.disable": errors.New("вкладка умерла")}}
+	t.Run("the error is swallowed", func(t *testing.T) {
+		fake := &fakeCDPSession{fail: map[string]error{"Fetch.disable": errors.New("the tab died")}}
 		blockDisable(context.Background(), fake) // does not panic
 		if fake.countOf("Fetch.disable") != 1 {
-			t.Error("команда Fetch.disable не выполнена")
+			t.Error("the Fetch.disable command did not run")
 		}
 	})
 }
@@ -742,21 +742,21 @@ func TestBlockPumpLifecycle(t *testing.T) {
 	select {
 	case <-stopped:
 	case <-time.After(2 * time.Second):
-		t.Fatal("stop не дождался выхода слушателя")
+		t.Fatal("stop did not wait out the listener's exit")
 	}
 
 	// After the stop the events are not processed.
 	before := len(fake.callsOf())
 	select {
 	case events <- fetch.EventRequestPaused{RequestID: "late", ResourceType: network.ResourceTypeMedia}:
-		t.Fatal("событие принято после stop")
+		t.Fatal("an event was accepted after stop")
 	default:
 	}
 	if got := len(fake.callsOf()); got != before {
-		t.Errorf("команд после stop: %d (было %d)", got, before)
+		t.Errorf("commands after stop: %d (was %d)", got, before)
 	}
 	if fake.countOf("Fetch.disable") != 0 {
-		t.Error("обычный stop не делает fail-open disable — его делает startBlock")
+		t.Error("a regular stop does not do the fail-open disable — startBlock does")
 	}
 }
 
@@ -781,15 +781,15 @@ func TestBlockPumpCtxDone(t *testing.T) {
 	select {
 	case <-stopped:
 	case <-time.After(2 * time.Second):
-		t.Fatal("насос не вышел по отмене контекста")
+		t.Fatal("the pump did not exit on the context cancellation")
 	}
 	if fake.countOf("Fetch.disable") != 0 {
-		t.Error("отмена контекста не должна звать disable (сессию закрывает пул)")
+		t.Error("the context cancellation must not call disable (the pool closes the session)")
 	}
 	// The iterator's error does not fall through to blockRespond: the zero event
 	// of an error gets no reply (there would be no extra continueRequest either).
 	if got := fake.countOf("Fetch.continueRequest"); got != 0 {
-		t.Errorf("после отмены отвечено на нулевое событие: continueRequest %d, хочу 0", got)
+		t.Errorf("after the cancellation zero events were answered: continueRequest %d, want 0", got)
 	}
 }
 
@@ -824,22 +824,22 @@ func TestBlockPumpEventError(t *testing.T) {
 		entered:   make(chan struct{}),
 		yieldDone: make(chan struct{}),
 	}
-	stop := blockPump(ctx, probe.events(errors.New("событие не разбирается")), fake, blockRulesOf(Options{}))
+	stop := blockPump(ctx, probe.events(errors.New("an event is not parsed")), fake, blockRulesOf(Options{}))
 
 	select {
 	case <-probe.entered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("насос не вошёл в итератор событий")
+		t.Fatal("the pump did not enter the event iterator")
 	}
 	select {
 	case <-probe.yieldDone:
 	case <-time.After(2 * time.Second):
-		t.Fatal("итерация ошибки не завершена (тело насоса не отработало)")
+		t.Fatal("the error iteration did not complete (the pump body did not run)")
 	}
 	stop()
 	if calls := fake.callsOf(); len(calls) != 0 {
-		t.Fatalf("команды %v, хочу ноль: ошибка потока не отвечает на "+
-			"событие и не выключает перехват", calls)
+		t.Fatalf("commands %v, want zero: a stream error does not answer the "+
+			"event and does not turn off the interception", calls)
 	}
 }
 
@@ -902,7 +902,7 @@ func TestBlockPumpStopWaitsForListener(t *testing.T) {
 	}()
 	select {
 	case <-stopped:
-		t.Fatal("stop вернулся до выхода слушателя из blockRespond")
+		t.Fatal("stop returned before the listener exited blockRespond")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -910,7 +910,7 @@ func TestBlockPumpStopWaitsForListener(t *testing.T) {
 	select {
 	case <-stopped:
 	case <-time.After(2 * time.Second):
-		t.Fatal("stop не дождался выхода слушателя после освобождения шлюза")
+		t.Fatal("stop did not wait out the listener's exit after the gate was released")
 	}
 }
 
@@ -928,15 +928,15 @@ func TestStartBlock(t *testing.T) {
 		return &Session{b: &Browser{opts: opts}, ctx: ctx}
 	}
 
-	t.Run("контекст сессии — не chromedp", func(t *testing.T) {
+	t.Run("the session context is not chromedp", func(t *testing.T) {
 		s := newSession(context.Background(), Options{})
 		_, err := s.startBlock(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "контекст вкладки не инициализирован") {
-			t.Fatalf("ошибка %v, хочу «контекст вкладки не инициализирован»", err)
+		if err == nil || !strings.Contains(err.Error(), "the tab context is not initialized") {
+			t.Fatalf("the error %v, want \"the tab context is not initialized\"", err)
 		}
 	})
 
-	t.Run("chromedp-контекст без вкладки", func(t *testing.T) {
+	t.Run("a chromedp context without a tab", func(t *testing.T) {
 		tr := newFakeCDP()
 		allocCtx, cancelAlloc := chromedp.NewAllocatorContext(
 			context.Background(), &fakeCDPAllocator{tr: tr})
@@ -945,31 +945,31 @@ func TestStartBlock(t *testing.T) {
 		defer cancel()
 		s := newSession(sctx, Options{})
 		_, err := s.startBlock(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "контекст вкладки не инициализирован") {
-			t.Fatalf("ошибка %v, хочу «контекст вкладки не инициализирован»", err)
+		if err == nil || !strings.Contains(err.Error(), "the tab context is not initialized") {
+			t.Fatalf("the error %v, want \"the tab context is not initialized\"", err)
 		}
 	})
 
-	t.Run("ошибка Fetch.enable", func(t *testing.T) {
+	t.Run("a Fetch.enable error", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
-		tr.setError("Fetch.enable", &cdproto.Error{Code: -32000, Message: "домен Fetch сломан"})
+		tr.setError("Fetch.enable", &cdproto.Error{Code: -32000, Message: "the Fetch domain is broken"})
 		s := newSession(ctx, Options{})
 		_, err := s.startBlock(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "включение перехвата Fetch") {
-			t.Fatalf("ошибка %v, хочу wrap «включение перехвата Fetch»", err)
+		if err == nil || !strings.Contains(err.Error(), "enabling the Fetch interception") {
+			t.Fatalf("the error %v, want the \"enabling the Fetch interception\" wrap", err)
 		}
-		if !strings.Contains(err.Error(), "домен Fetch сломан") {
-			t.Errorf("исходная ошибка не пробита: %v", err)
+		if !strings.Contains(err.Error(), "the Fetch domain is broken") {
+			t.Errorf("the original error is not punched through: %v", err)
 		}
 		// The listener is killed already on the error path: the interception events get
 		// no replies (a stopListen-removal mutant would leave the pump
 		// alive — an event would get a failRequest/continueRequest).
 		tr.fireSession("Fetch.requestPaused",
 			`{"requestId":"late","resourceType":"Image"}`)
-		assertNoNewCDPCalls(t, tr, "Fetch.requestPaused-после-ошибки")
+		assertNoNewCDPCalls(t, tr, "Fetch.requestPaused-after-error")
 	})
 
-	t.Run("stop гасит слушателя и выключает перехват", func(t *testing.T) {
+	t.Run("stop kills the listener and turns off the interception", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
 		s := newSession(ctx, Options{})
 		stop, err := s.startBlock(context.Background())
@@ -977,7 +977,7 @@ func TestStartBlock(t *testing.T) {
 			t.Fatalf("startBlock: %v", err)
 		}
 		if tr.countOf("Fetch.enable") != 1 {
-			t.Fatalf("Fetch.enable выполнен %d раз, хочу 1", tr.countOf("Fetch.enable"))
+			t.Fatalf("Fetch.enable ran %d times, want 1", tr.countOf("Fetch.enable"))
 		}
 
 		// An interception event gets a reply: the listener works.
@@ -992,12 +992,12 @@ func TestStartBlock(t *testing.T) {
 		// are no new commands.
 		tr.fireSession("Fetch.requestPaused",
 			`{"requestId":"late","resourceType":"Media"}`)
-		assertNoNewCDPCalls(t, tr, "Fetch.requestPaused-после-stop")
+		assertNoNewCDPCalls(t, tr, "Fetch.requestPaused-after-stop")
 	})
 
 	// The BlockStylesheet option (T-213): the Fetch.enable patterns are extended
 	// with Stylesheet, and a suspended Stylesheet gets a failRequest.
-	t.Run("block_stylesheet расширяет перехват (T-213)", func(t *testing.T) {
+	t.Run("block_stylesheet extends the interception (T-213)", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
 		s := newSession(ctx, Options{BlockStylesheet: true})
 		stop, err := s.startBlock(context.Background())
@@ -1015,10 +1015,10 @@ func TestStartBlock(t *testing.T) {
 			}
 		}
 		if n != 1 {
-			t.Fatalf("Fetch.enable выполнен %d раз, хочу 1", n)
+			t.Fatalf("Fetch.enable ran %d times, want 1", n)
 		}
 		if !strings.Contains(params, `"Stylesheet"`) {
-			t.Errorf("паттерны Fetch.enable без Stylesheet: %s", params)
+			t.Errorf("the Fetch.enable patterns without Stylesheet: %s", params)
 		}
 		tr.fireSession("Fetch.requestPaused",
 			`{"requestId":"css-1","resourceType":"Stylesheet"}`)
@@ -1028,7 +1028,7 @@ func TestStartBlock(t *testing.T) {
 	// The BlockTrackerDomains option (T-214): the Fetch.enable patterns are extended
 	// with the domain ones; a suspended Script to a tracker — failRequest, a Script
 	// with a tracker domain in the path of a foreign host — continueRequest.
-	t.Run("block_tracker_domains расширяет перехват (T-214)", func(t *testing.T) {
+	t.Run("block_tracker_domains extends the interception (T-214)", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
 		s := newSession(ctx, Options{BlockTrackerDomains: true})
 		stop, err := s.startBlock(context.Background())
@@ -1046,13 +1046,13 @@ func TestStartBlock(t *testing.T) {
 			}
 		}
 		if n != 1 {
-			t.Fatalf("Fetch.enable выполнен %d раз, хочу 1", n)
+			t.Fatalf("Fetch.enable ran %d times, want 1", n)
 		}
 		if !strings.Contains(params, `"*google-analytics.com*"`) {
-			t.Errorf("паттерны Fetch.enable без домена трекера: %s", params)
+			t.Errorf("the Fetch.enable patterns without the tracker domain: %s", params)
 		}
 		if !strings.Contains(params, `"*mc.yandex.ru*"`) {
-			t.Errorf("паттерны Fetch.enable без mc.yandex.ru: %s", params)
+			t.Errorf("the Fetch.enable patterns without mc.yandex.ru: %s", params)
 		}
 
 		tr.fireSession("Fetch.requestPaused",
@@ -1072,7 +1072,7 @@ func TestStartBlock(t *testing.T) {
 	// at the render moment resolves into an internal address (DNS rebinding) —
 	// failRequest, an external name — continueRequest; a repeated name takes the
 	// verdict from the per-session cache without a new DNS exchange.
-	t.Run("block_internal_addrs резолвит имена в перехвате (T-230)", func(t *testing.T) {
+	t.Run("block_internal_addrs resolves names in the interception (T-230)", func(t *testing.T) {
 		lookup := &fakeLookupHost{addrs: map[string][]netip.Addr{
 			"rebind.example.net": {netip.MustParseAddr("169.254.169.254")},
 			"ok.example.net":     {netip.MustParseAddr("203.0.113.7")},
@@ -1100,14 +1100,14 @@ func TestStartBlock(t *testing.T) {
 				`"request":{"url":"http://rebind.example.net/2"}}`)
 		waitFor(t, func() bool { return tr.countOf("Fetch.failRequest") == 2 })
 		if n := len(lookup.callsOf()); n != 2 {
-			t.Errorf("обменов резолвера %d, хочу 2 (кэш на сессию — по одному на хост; вызовы %v)",
+			t.Errorf("resolver exchanges %d, want 2 (the per-session cache — one per host; calls %v)",
 				n, lookup.callsOf())
 		}
 	})
 
 	// Without the option there are no domain patterns at all — Fetch.enable carries only
 	// the type ones (T-062/T-213).
-	t.Run("без block_tracker_domains доменных паттернов нет (T-214)", func(t *testing.T) {
+	t.Run("without block_tracker_domains there are no domain patterns (T-214)", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
 		s := newSession(ctx, Options{})
 		stop, err := s.startBlock(context.Background())
@@ -1121,7 +1121,7 @@ func TestStartBlock(t *testing.T) {
 				continue
 			}
 			if strings.Contains(c.Params, "urlPattern") {
-				t.Errorf("паттерны Fetch.enable содержат urlPattern: %s", c.Params)
+				t.Errorf("the Fetch.enable patterns contain urlPattern: %s", c.Params)
 			}
 		}
 	})
@@ -1138,7 +1138,7 @@ func TestDNSCacheResolveTTL(t *testing.T) {
 		"rebind.example.net": {netip.MustParseAddr("169.254.169.254")},
 		"ok.example.net":     {netip.MustParseAddr("203.0.113.7")},
 	}, errs: map[string]error{
-		"nx.example.net": errors.New("нет такого хоста"),
+		"nx.example.net": errors.New("no such host"),
 	}}
 	c := newDNSCache(lookup.lookup)
 	now := time.Now()
@@ -1147,13 +1147,13 @@ func TestDNSCacheResolveTTL(t *testing.T) {
 	// The first request — an exchange; the "internal" verdict is cached, a repeat
 	// within the TTL window — without an exchange.
 	if !c.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("первый резолв: хочу внутренний (169.254.169.254)")
+		t.Fatal("the first resolution: want internal (169.254.169.254)")
 	}
 	if !c.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("кэшированный вердикт: хочу внутренний")
+		t.Fatal("the cached verdict: want internal")
 	}
 	if n := len(lookup.callsOf()); n != 1 {
-		t.Fatalf("обменов %d, хочу 1 (повтор в окне TTL — из кэша)", n)
+		t.Fatalf("exchanges %d, want 1 (a repeat within the TTL window — from the cache)", n)
 	}
 
 	// The TTL expiry — a fresh exchange; DNS has changed the answer to a public
@@ -1161,30 +1161,30 @@ func TestDNSCacheResolveTTL(t *testing.T) {
 	lookup.addrs["rebind.example.net"] = []netip.Addr{netip.MustParseAddr("203.0.113.7")}
 	now = now.Add(dnsCacheTTL + time.Second)
 	if c.hostInternal(context.Background(), "rebind.example.net") {
-		t.Fatal("после истечения TTL: хочу внешний по новому ответу")
+		t.Fatal("after the TTL expiry: want external by the new answer")
 	}
 	if n := len(lookup.callsOf()); n != 2 {
-		t.Fatalf("обменов %d, хочу 2 (истёкшая запись обновляется обменом)", n)
+		t.Fatalf("exchanges %d, want 2 (an expired entry is refreshed by an exchange)", n)
 	}
 
 	// The negative and errored verdicts are cached the same way: one
 	// exchange per two calls.
 	for _, host := range []string{"ok.example.net", "nx.example.net"} {
 		if c.hostInternal(context.Background(), host) {
-			t.Fatalf("%s: хочу не-внутренний", host)
+			t.Fatalf("%s: want not-internal", host)
 		}
 		if c.hostInternal(context.Background(), host) {
-			t.Fatalf("%s: кэшированный вердикт — тоже не-внутренний", host)
+			t.Fatalf("%s: the cached verdict is also not-internal", host)
 		}
 	}
 	if n := len(lookup.callsOf()); n != 4 {
-		t.Fatalf("обменов %d, хочу 4 (по одному на хост: негатив и ошибка кэшируются)", n)
+		t.Fatalf("exchanges %d, want 4 (one per host: the negative and the error are cached)", n)
 	}
 
 	// A nil cache (the rules without the contour — the guard) — not internal.
 	var nilCache *dnsCache
 	if nilCache.hostInternal(context.Background(), "any.example.net") {
-		t.Error("нил-кэш: хочу не-внутренний")
+		t.Error("a nil cache: want not-internal")
 	}
 }
 
@@ -1212,31 +1212,31 @@ func TestDNSCacheLookupTimeout(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		if c.hostInternal(context.Background(), "blackhole.example.net") {
-			t.Fatalf("обмен %d: хочу fail-open (не внутренний)", i+1)
+			t.Fatalf("exchange %d: want fail-open (not internal)", i+1)
 		}
 		select {
 		case <-started:
 		case <-time.After(2 * time.Second):
-			t.Fatal("обмен не начался")
+			t.Fatal("the exchange did not start")
 		}
 	}
 	if n := len(c.entries); n != 0 {
-		t.Errorf("кэш после обрывов: %d записей, хочу 0 (обрыв не кэшируется)", n)
+		t.Errorf("the cache after hangups: %d entries, want 0 (a hangup is not cached)", n)
 	}
 
 	// A deterministic resolve error — cached (fail-open).
 	errLookup := &fakeLookupHost{errs: map[string]error{
-		"nx.example.net": errors.New("нет такого хоста"),
+		"nx.example.net": errors.New("no such host"),
 	}}
 	e := newDNSCache(errLookup.lookup)
 	if e.hostInternal(context.Background(), "nx.example.net") {
-		t.Error("NXDOMAIN: хочу не-внутренний")
+		t.Error("NXDOMAIN: want not-internal")
 	}
 	if e.hostInternal(context.Background(), "nx.example.net") {
-		t.Error("NXDOMAIN из кэша: хочу не-внутренний")
+		t.Error("NXDOMAIN from the cache: want not-internal")
 	}
 	if n := len(errLookup.callsOf()); n != 1 {
-		t.Errorf("обменов %d, хочу 1 (ошибка кэшируется)", n)
+		t.Errorf("exchanges %d, want 1 (the error is cached)", n)
 	}
 }
 
@@ -1252,7 +1252,7 @@ func assertNoNewCDPCalls(t *testing.T, tr *fakeCDP, what string) {
 		time.Sleep(time.Millisecond)
 	}
 	if got := len(tr.callsOf()); got != before {
-		t.Errorf("%s: прошли новые команды %+v", what, tr.callsOf()[before:])
+		t.Errorf("%s: unexpected new commands went through %+v", what, tr.callsOf()[before:])
 	}
 }
 
@@ -1301,23 +1301,23 @@ func TestBlockRespondInternalResolve(t *testing.T) {
 		fail     bool
 		lookups  int // the expected number of resolver exchanges
 	}{
-		{"включён: имя → 169.254.169.254 — fail (rebinding)", true,
+		{"on: a name → 169.254.169.254 — fail (rebinding)", true,
 			"http://rebind.example.net/latest/meta-data/", true, 1},
-		{"включён: имя → RFC1918 — fail", true,
+		{"on: a name → RFC1918 — fail", true,
 			"http://intranet.example.net/", true, 1},
-		{"включён: имя → публичный адрес — continue", true,
+		{"on: a name → a public address — continue", true,
 			"http://ok.example.net/app.js", false, 1},
-		{"включён: ошибка резолва — continue (fail-open)", true,
+		{"on: a resolution error — continue (fail-open)", true,
 			"http://nx.example.net/pixel.gif", false, 1},
-		{"включён: IP-литерал внутренний — fail без резолва (T-219)", true,
+		{"on: an internal IP literal — fail without a resolution (T-219)", true,
 			"http://10.0.0.1/admin", true, 0},
-		{"включён: IP-литерал внешний — continue без резолва", true,
+		{"on: an external IP literal — continue without a resolution", true,
 			"http://203.0.113.7/", false, 0},
-		{"включён: числоподобная форма — fail без резолва (WHATWG)", true,
+		{"on: a numeric-looking form — fail without a resolution (WHATWG)", true,
 			"http://127.1/x", true, 0},
-		{"включён: loopback-имя — fail без резолва", true,
+		{"on: a loopback name — fail without a resolution", true,
 			"http://localhost:6379/stats", true, 0},
-		{"выключен: имя → 169.254.169.254 — continue", false,
+		{"off: a name → 169.254.169.254 — continue", false,
 			"http://rebind.example.net/latest/meta-data/", false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1334,7 +1334,7 @@ func TestBlockRespondInternalResolve(t *testing.T) {
 					"ok.example.net":       {netip.MustParseAddr("203.0.113.7")},
 				},
 				errs: map[string]error{
-					"nx.example.net": errors.New("нет такого хоста"),
+					"nx.example.net": errors.New("no such host"),
 				},
 			}
 			fake := &fakeCDPSession{}
@@ -1348,10 +1348,10 @@ func TestBlockRespondInternalResolve(t *testing.T) {
 				want = "Fetch.failRequest"
 			}
 			if len(calls) != 1 || calls[0].Method != want {
-				t.Fatalf("команды %v, хочу одну %s", calls, want)
+				t.Fatalf("commands %v, want one %s", calls, want)
 			}
 			if n := len(lookup.callsOf()); n != tc.lookups {
-				t.Errorf("обменов резолвера %d, хочу %d (вызовы %v)",
+				t.Errorf("resolver exchanges %d, want %d (calls %v)",
 					n, tc.lookups, lookup.callsOf())
 			}
 		})

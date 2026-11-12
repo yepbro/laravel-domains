@@ -88,7 +88,7 @@ func (s *Session) start(ctx context.Context) error {
 		}
 		if ctx.Err() != nil {
 			return &Error{Class: ClassTask,
-				Err: fmt.Errorf("задача отменена: %w: %w", ctx.Err(), r.err)}
+				Err: fmt.Errorf("task cancelled: %w: %w", ctx.Err(), r.err)}
 		}
 		// Classification without the tab probe (the session is not up):
 		// a dead browser versus a failed context.
@@ -105,14 +105,14 @@ func (s *Session) start(ctx context.Context) error {
 		// connection (T-218).
 		if !s.b.probeConn() {
 			return &Error{Class: ClassBrowser,
-				Err: fmt.Errorf("браузер Chromium недоступен: таймаут создания контекста %s",
+				Err: fmt.Errorf("Chromium browser unavailable: context creation timeout %s",
 					s.b.opts.SessionStartTimeout)}
 		}
 		return &Error{Class: ClassContext,
-			Err: fmt.Errorf("таймаут создания контекста %s", s.b.opts.SessionStartTimeout)}
+			Err: fmt.Errorf("context creation timeout %s", s.b.opts.SessionStartTimeout)}
 	case <-ctx.Done():
 		return &Error{Class: ClassTask,
-			Err: fmt.Errorf("задача отменена: %w", ctx.Err())}
+			Err: fmt.Errorf("task cancelled: %w", ctx.Err())}
 	}
 }
 
@@ -245,7 +245,7 @@ func (s *Session) wrap(err error, caller, opCtx context.Context, url string) *Er
 	switch {
 	case caller.Err() != nil:
 		return &Error{Class: ClassTask, URL: url,
-			Err: fmt.Errorf("задача отменена: %w: %w", caller.Err(), err)}
+			Err: fmt.Errorf("task cancelled: %w: %w", caller.Err(), err)}
 	case opCtx.Err() != nil:
 		// The connection probe is cheap on a live browser (getTargets
 		// answers within milliseconds even for a slow page); probeTimeout
@@ -253,11 +253,11 @@ func (s *Session) wrap(err error, caller, opCtx context.Context, url string) *Er
 		// class is needed.
 		if !s.b.probeConn() {
 			return &Error{Class: ClassBrowser, URL: url,
-				Err: fmt.Errorf("браузер Chromium недоступен: таймаут страницы %s: %w: %w",
+				Err: fmt.Errorf("Chromium browser unavailable: page timeout %s: %w: %w",
 					s.b.opts.Timeout, opCtx.Err(), err)}
 		}
 		return &Error{Class: ClassTask, URL: url,
-			Err: fmt.Errorf("таймаут страницы %s: %w: %w", s.b.opts.Timeout, opCtx.Err(), err)}
+			Err: fmt.Errorf("page timeout %s: %w: %w", s.b.opts.Timeout, opCtx.Err(), err)}
 	default:
 		return s.b.classifyCtx(err, url, s)
 	}

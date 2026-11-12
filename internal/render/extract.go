@@ -300,7 +300,7 @@ func newExtractCDP(domLimit int) extractCDP {
 func (e extractCDP) extractResult(ctx context.Context, out *RenderOutput) error {
 	dom, err := e.dom(ctx)
 	if err != nil {
-		return fmt.Errorf("итоговый DOM (%s): %w", extractDOMExpr, err)
+		return fmt.Errorf("the final DOM (%s): %w", extractDOMExpr, err)
 	}
 	out.DOM = truncateDOM(dom, e.domLimit)
 
@@ -308,7 +308,7 @@ func (e extractCDP) extractResult(ctx context.Context, out *RenderOutput) error 
 		(u.Scheme == "http" || u.Scheme == "https") {
 		cs, err := e.cookies(ctx, out.FinalURL)
 		if err != nil {
-			return fmt.Errorf("cookies итоговой страницы %s: %w", out.FinalURL, err)
+			return fmt.Errorf("cookies of the final page %s: %w", out.FinalURL, err)
 		}
 		out.Cookies = extractCookiesFromCDP(cs)
 	}

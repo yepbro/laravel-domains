@@ -59,13 +59,13 @@ func (r *recorder) session(t *testing.T, i int) *fakeSession {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if i >= len(r.sessions) {
-		t.Fatalf("сессия %d не создана (создано %d)", i, len(r.sessions))
+		t.Fatalf("session %d was not created (created %d)", i, len(r.sessions))
 	}
 	return r.sessions[i]
 }
 
 func ctxErr(class Class) error {
-	return &Error{Class: class, Err: errors.New("сбой")}
+	return &Error{Class: class, Err: errors.New("failure")}
 }
 
 func TestPoolRunSuccess(t *testing.T) {
@@ -79,14 +79,14 @@ func TestPoolRunSuccess(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if out.FinalURL != "https://a.example/" || out.Title != "ok" {
-		t.Fatalf("результат %+v", out)
+		t.Fatalf("result %+v", out)
 	}
 	s := rec.session(t, 0)
 	if s.closes.Load() != 1 {
-		t.Errorf("сессия закрыта %d раз, хочу 1 (профиль выкинут)", s.closes.Load())
+		t.Errorf("the session was closed %d times, want 1 (the profile discarded)", s.closes.Load())
 	}
 	if b.Pages() != 1 {
-		t.Errorf("счётчик страниц %d, хочу 1", b.Pages())
+		t.Errorf("the page counter %d, want 1", b.Pages())
 	}
 }
 
@@ -113,19 +113,19 @@ func TestPoolRetryOnDeadContext(t *testing.T) {
 
 	out, err := p.Run(context.Background(), RenderTask{URL: "https://a.example/"})
 	if err != nil {
-		t.Fatalf("повтор не вылечил: %v", err)
+		t.Fatalf("the retry did not heal: %v", err)
 	}
 	if out.Title != "ok" {
-		t.Fatalf("результат %+v", out)
+		t.Fatalf("result %+v", out)
 	}
 	for i := range 2 {
 		if s := rec.session(t, i); s.closes.Load() != 1 {
-			t.Errorf("сессия %d закрыта %d раз", i, s.closes.Load())
+			t.Errorf("session %d was closed %d times", i, s.closes.Load())
 		}
 	}
 	// One task — one page in the restart counter.
 	if b.Pages() != 1 {
-		t.Errorf("счётчик страниц %d, хочу 1", b.Pages())
+		t.Errorf("the page counter %d, want 1", b.Pages())
 	}
 }
 
@@ -147,13 +147,13 @@ func TestPoolContextErrorAfterRetry(t *testing.T) {
 
 	_, err := p.Run(context.Background(), RenderTask{URL: "https://a.example/"})
 	if ClassOf(err) != ClassContext {
-		t.Fatalf("класс %v (%v), хочу context", ClassOf(err), err)
+		t.Fatalf("the class %v (%v), want context", ClassOf(err), err)
 	}
 	if got := b.Pages(); got != 0 {
-		t.Errorf("счётчик страниц %d, хочу 0", got)
+		t.Errorf("the page counter %d, want 0", got)
 	}
 	if n := len(rec.sessions); n != 2 {
-		t.Errorf("создано сессий %d, хочу 2 (ровно один повтор)", n)
+		t.Errorf("sessions created %d, want 2 (exactly one retry)", n)
 	}
 }
 
@@ -177,30 +177,30 @@ func TestPoolNoRetryOnTaskOrBrowserError(t *testing.T) {
 
 			_, err := p.Run(context.Background(), RenderTask{URL: "https://a.example/"})
 			if ClassOf(err) != class {
-				t.Fatalf("класс %v, хочу %v", ClassOf(err), class)
+				t.Fatalf("the class %v, want %v", ClassOf(err), class)
 			}
 			if n := len(rec.sessions); n != 1 {
-				t.Errorf("создано сессий %d, хочу 1 (без повторов)", n)
+				t.Errorf("sessions created %d, want 1 (no retries)", n)
 			}
 		})
 	}
 }
 
 func TestPoolSessionCreateError(t *testing.T) {
-	t.Run("контекст не поднялся — повтор на новом", func(t *testing.T) {
+	t.Run("the context did not come up — a retry on a new one", func(t *testing.T) {
 		b := testBrowser(1)
 		p := NewPool(b)
 		rec := &recorder{fail: map[int]error{0: ctxErr(ClassContext)}}
 		p.newSession = rec.factory
 
 		if _, err := p.Run(context.Background(), RenderTask{URL: "u"}); err != nil {
-			t.Fatalf("повтор не вылечил: %v", err)
+			t.Fatalf("the retry did not heal: %v", err)
 		}
 		if b.Pages() != 1 {
-			t.Errorf("счётчик страниц %d, хочу 1", b.Pages())
+			t.Errorf("the page counter %d, want 1", b.Pages())
 		}
 	})
-	t.Run("браузер недоступен — без повторов", func(t *testing.T) {
+	t.Run("browser unavailable — no retries", func(t *testing.T) {
 		b := testBrowser(1)
 		p := NewPool(b)
 		rec := &recorder{fail: map[int]error{0: ctxErr(ClassBrowser)}}
@@ -208,10 +208,10 @@ func TestPoolSessionCreateError(t *testing.T) {
 
 		_, err := p.Run(context.Background(), RenderTask{URL: "u"})
 		if ClassOf(err) != ClassBrowser {
-			t.Fatalf("класс %v, хочу browser", ClassOf(err))
+			t.Fatalf("the class %v, want browser", ClassOf(err))
 		}
 		if rec.calls != 1 {
-			t.Errorf("попыток создания %d, хочу 1", rec.calls)
+			t.Errorf("creation attempts %d, want 1", rec.calls)
 		}
 	})
 }
@@ -251,12 +251,12 @@ func TestPoolConcurrencyLimit(t *testing.T) {
 	}
 	select {
 	case <-entered:
-		t.Fatal("третья задача вошла при занятых слотах")
+		t.Fatal("the third task got in with the slots busy")
 	default:
 	}
 	select {
 	case p.slots <- struct{}{}:
-		t.Fatal("слот свободен при двух задачах в полёте")
+		t.Fatal("a slot is free with two tasks in flight")
 	default:
 	}
 
@@ -267,7 +267,7 @@ func TestPoolConcurrencyLimit(t *testing.T) {
 	case p.slots <- struct{}{}:
 		<-p.slots
 	default:
-		t.Fatal("слоты не освободились после задач")
+		t.Fatal("the slots were not released after the tasks")
 	}
 }
 
@@ -301,7 +301,7 @@ func TestPoolWaitCanceled(t *testing.T) {
 	cancel()
 	_, err := p.Run(ctx, RenderTask{URL: "waiter"})
 	if ClassOf(err) != ClassTask || !errors.Is(err, context.Canceled) {
-		t.Fatalf("ошибка ожидания слота: %v", err)
+		t.Fatalf("a slot wait error: %v", err)
 	}
 
 	close(release)
@@ -329,10 +329,10 @@ func TestPoolNoRetryAfterRetire(t *testing.T) {
 	}
 	_, err := p.Run(context.Background(), RenderTask{URL: "u"})
 	if ClassOf(err) != ClassContext {
-		t.Fatalf("класс %v (%v), хочу context", ClassOf(err), err)
+		t.Fatalf("the class %v (%v), want context", ClassOf(err), err)
 	}
 	if got := len(rec.sessions); got != 1 {
-		t.Errorf("создано сессий %d, хочу 1 (retired пул не повторяет)", got)
+		t.Errorf("sessions created %d, want 1 (a retired pool does not retry)", got)
 	}
 }
 
@@ -347,7 +347,7 @@ func TestPoolCloseStopsBrowser(t *testing.T) {
 	p := NewPool(b)
 	p.Close()
 	if b.Alive() {
-		t.Error("браузер не остановлен Close пула")
+		t.Error("the browser was not stopped by the pool Close")
 	}
 }
 
@@ -360,13 +360,13 @@ func TestPoolClosed(t *testing.T) {
 
 	_, err := p.Run(context.Background(), RenderTask{URL: "u"})
 	if !errors.Is(err, ErrClosed) {
-		t.Fatalf("ошибка %v, хочу ErrClosed", err)
+		t.Fatalf("the error %v, want ErrClosed", err)
 	}
 	if ClassOf(err) != ClassTask {
-		t.Errorf("класс %v, хочу task", ClassOf(err))
+		t.Errorf("the class %v, want task", ClassOf(err))
 	}
 	if rec.calls != 0 {
-		t.Errorf("после Close создано сессий: %d", rec.calls)
+		t.Errorf("after Close sessions created: %d", rec.calls)
 	}
 	// A repeated Close is harmless.
 	p.Close()
@@ -405,7 +405,7 @@ func TestPoolCloseWaitsInflight(t *testing.T) {
 	}()
 	select {
 	case <-closed:
-		t.Fatal("Close не дождался задачи в полёте")
+		t.Fatal("Close did not wait out the in-flight task")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -414,10 +414,10 @@ func TestPoolCloseWaitsInflight(t *testing.T) {
 	select {
 	case <-closed:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Close не завершился после задач")
+		t.Fatal("Close did not finish after the tasks")
 	}
 	if b.Alive() {
-		t.Error("браузер не остановлен Close")
+		t.Error("the browser was not stopped by Close")
 	}
 }
 
@@ -462,13 +462,13 @@ func TestPoolParallelStress(t *testing.T) {
 	wg.Wait()
 
 	if got := max.Load(); got > contexts {
-		t.Errorf("максимум параллельных задач %d > слотов %d", got, contexts)
+		t.Errorf("max parallel tasks %d > slots %d", got, contexts)
 	}
 	if got := b.Pages(); got != tasks {
-		t.Errorf("счётчик страниц %d, хочу %d", got, tasks)
+		t.Errorf("the page counter %d, want %d", got, tasks)
 	}
 	if got := len(rec.sessions); got != tasks {
-		t.Errorf("создано сессий %d, хочу %d (свежий профиль на задачу)", got, tasks)
+		t.Errorf("sessions created %d, want %d (a fresh profile per task)", got, tasks)
 	}
 }
 
@@ -477,11 +477,11 @@ func TestBrowserNeedsRestart(t *testing.T) {
 	b.opts.RestartEveryPages = 3
 	b.pages.Add(2)
 	if b.NeedsRestart() {
-		t.Error("порог 3 не достигнут (2 страницы)")
+		t.Error("the threshold 3 not reached (2 pages)")
 	}
 	b.pages.Add(1)
 	if !b.NeedsRestart() {
-		t.Error("порог 3 достигнут")
+		t.Error("the threshold 3 reached")
 	}
 }
 
@@ -491,17 +491,17 @@ func TestBrowserRSSUnknown(t *testing.T) {
 	b := testBrowser(1)
 	b.opts.MemoryThreshold = 1
 	if got := b.RSS(); got != -1 {
-		t.Errorf("RSS без процесса = %d, хочу -1", got)
+		t.Errorf("RSS without a process = %d, want -1", got)
 	}
 	if b.OverMemory() {
-		t.Error("неизвестный RSS не должен триггерить перезапуск")
+		t.Error("an unknown RSS must not trigger a restart")
 	}
 	var nilB *Browser
 	if nilB.OverMemory() {
-		t.Error("nil-браузер не должен триггерить перезапуск")
+		t.Error("a nil browser must not trigger a restart")
 	}
 	if got := nilB.RSS(); got != -1 {
-		t.Errorf("RSS(nil) = %d, хочу -1", got)
+		t.Errorf("RSS(nil) = %d, want -1", got)
 	}
 	// rootPID 1 is valid (the "unset" boundary is exactly 0): the pid 1
 	// tree in a container is non-empty.
@@ -509,7 +509,7 @@ func TestBrowserRSSUnknown(t *testing.T) {
 		b1 := testBrowser(1)
 		b1.rootPID = 1
 		if got := b1.RSS(); got <= 0 {
-			t.Errorf("RSS(pid 1) = %d, хочу > 0", got)
+			t.Errorf("RSS(pid 1) = %d, want > 0", got)
 		}
 	}
 }
@@ -525,7 +525,7 @@ func TestBrowserOverMemory(t *testing.T) {
 	b := testBrowser(1)
 	cmd := exec.Command("sleep", "5")
 	if err := cmd.Start(); err != nil {
-		t.Skipf("sleep не запустился: %v", err)
+		t.Skipf("sleep did not start: %v", err)
 	}
 	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
 	b.rootPID = cmd.Process.Pid
@@ -540,10 +540,10 @@ func TestBrowserOverMemory(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if rss <= 0 {
-		t.Skip("RSS недоступен (нет /proc)")
+		t.Skip("RSS unavailable (no /proc)")
 	}
 	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
-		t.Skipf("SIGSTOP не удался: %v", err)
+		t.Skipf("SIGSTOP failed: %v", err)
 	}
 	// The warm-up may have cached the value before the SIGSTOP (T-229)
 	// — the stabilization loop must measure the live /proc after the
@@ -566,19 +566,19 @@ func TestBrowserOverMemory(t *testing.T) {
 	}
 	b.opts.MemoryThreshold = rss // exactly the threshold — over (>=)
 	if !b.OverMemory() {
-		t.Error("RSS равен порогу: перезапуск должен срабатывать")
+		t.Error("the RSS equals the threshold: the restart must fire")
 	}
 	b.opts.MemoryThreshold = 1 // byte: any live memory — over
 	if !b.OverMemory() {
-		t.Error("минимальный порог 1 байт: положительный RSS — превышение")
+		t.Error("the minimal threshold of 1 byte: a positive RSS is an overrun")
 	}
 	b.opts.MemoryThreshold = rss + 1<<30 // clearly above the live RSS
 	if b.OverMemory() {
-		t.Error("RSS ниже порога — без перезапуска")
+		t.Error("the RSS below the threshold — no restart")
 	}
 	b.opts.MemoryThreshold = 0 // the control is off
 	if b.OverMemory() {
-		t.Error("нулевой порог отключает контроль")
+		t.Error("a zero threshold disables the control")
 	}
 
 	// RSS == 0 (the root disappeared from the snapshot) — not over.
@@ -586,10 +586,10 @@ func TestBrowserOverMemory(t *testing.T) {
 		b.rootPID = pid
 		b.opts.MemoryThreshold = 1
 		if got := b.RSS(); got != 0 {
-			t.Fatalf("RSS исчезнувшего корня = %d, хочу 0", got)
+			t.Fatalf("the RSS of a vanished root = %d, want 0", got)
 		}
 		if b.OverMemory() {
-			t.Error("нулевой RSS не должен триггерить перезапуск")
+			t.Error("a zero RSS must not trigger a restart")
 		}
 	}
 }
@@ -602,7 +602,7 @@ func TestBrowserOverMemory(t *testing.T) {
 // not cached. The /proc scan and the time are seams (procRSS, timeNow).
 func TestBrowserRSSCache(t *testing.T) {
 	if rssCacheTTL != 10*time.Second {
-		t.Errorf("rssCacheTTL = %s, хочу 10 с (окно 5–15 с по T-229, закреплено точно — стиль movingDropTimeout)", rssCacheTTL)
+		t.Errorf("rssCacheTTL = %s, want 10 s (a 5–15 s window per T-229, pinned exactly — the movingDropTimeout style)", rssCacheTTL)
 	}
 
 	var reads atomic.Int32
@@ -621,23 +621,23 @@ func TestBrowserRSSCache(t *testing.T) {
 	// The first read — a snapshot; the second within the TTL window —
 	// from the cache, without /proc.
 	if got := b.RSS(); got != rssVal {
-		t.Fatalf("RSS = %d, хочу %d", got, rssVal)
+		t.Fatalf("RSS = %d, want %d", got, rssVal)
 	}
 	if got := b.RSS(); got != rssVal {
-		t.Fatalf("RSS повторно = %d, хочу %d", got, rssVal)
+		t.Fatalf("the RSS again = %d, want %d", got, rssVal)
 	}
 	if n := reads.Load(); n != 1 {
-		t.Errorf("проходов /proc %d, хочу 1 (второе чтение — из кэша)", n)
+		t.Errorf("/proc passes %d, want 1 (the second read — from the cache)", n)
 	}
 
 	// The TTL expired — a fresh snapshot.
 	fakeNow = fakeNow.Add(rssCacheTTL)
 	rssVal = 200 << 20
 	if got := b.RSS(); got != rssVal {
-		t.Fatalf("RSS после TTL = %d, хочу %d", got, rssVal)
+		t.Fatalf("the RSS after the TTL = %d, want %d", got, rssVal)
 	}
 	if n := reads.Load(); n != 2 {
-		t.Errorf("проходов /proc после TTL %d, хочу 2", n)
+		t.Errorf("/proc passes after the TTL %d, want 2", n)
 	}
 
 	// A rootPID change — a foreign snapshot is not read, even within
@@ -645,10 +645,10 @@ func TestBrowserRSSCache(t *testing.T) {
 	b.rootPID = 43
 	rssVal = 300 << 20
 	if got := b.RSS(); got != rssVal {
-		t.Fatalf("RSS после смены rootPID = %d, хочу %d", got, rssVal)
+		t.Fatalf("the RSS after the rootPID change = %d, want %d", got, rssVal)
 	}
 	if n := reads.Load(); n != 3 {
-		t.Errorf("проходов /proc после смены корня %d, хочу 3", n)
+		t.Errorf("/proc passes after the root change %d, want 3", n)
 	}
 
 	// Non-positive measurements are not cached: a zero RSS (the root
@@ -658,13 +658,13 @@ func TestBrowserRSSCache(t *testing.T) {
 	fakeNow = fakeNow.Add(rssCacheTTL)
 	rssVal = 0
 	if got := b.RSS(); got != 0 {
-		t.Fatalf("RSS исчезнувшего корня = %d, хочу 0", got)
+		t.Fatalf("the RSS of a vanished root = %d, want 0", got)
 	}
 	if got := b.RSS(); got != 0 {
-		t.Fatalf("RSS исчезнувшего корня повторно = %d, хочу 0", got)
+		t.Fatalf("the RSS of a vanished root again = %d, want 0", got)
 	}
 	if n := reads.Load(); n != 5 {
-		t.Errorf("проходов /proc с нулевым RSS %d, хочу 5 (ноль не кэшируется)", n)
+		t.Errorf("/proc passes with a zero RSS %d, want 5 (zero is not cached)", n)
 	}
 }
 

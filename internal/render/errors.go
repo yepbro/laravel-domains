@@ -91,8 +91,8 @@ func LoadErrorCode(err error) string {
 
 // ErrClosed — the pool or the browser is stopped, the task did not run.
 // Guarantees moving the task to the redelivery queue (T-066).
-var ErrClosed = errors.New("рендер остановлен")
+var ErrClosed = errors.New("render stopped")
 
 // ErrBrowserDead — the browser session is not initialized or is lost
 // (checked before creating a session, so as not to run commands doomed to fail).
-var ErrBrowserDead = errors.New("браузерная сессия Chromium недоступна")
+var ErrBrowserDead = errors.New("the Chromium browser session is unavailable")

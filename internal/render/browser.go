@@ -152,7 +152,7 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 		// in an unprivileged container (deploy/docker/Dockerfile.render,
 		// USER nobody); the rest — the chromedp default set: headless, without
 		// browser background services.
-		mode = "локальный процесс"
+		mode = "local process"
 		execOpts := append(chromedp.DefaultExecAllocatorOptions[:],
 			chromedp.Flag("no-sandbox", true))
 		if opts.ExecPath != "" {
@@ -192,7 +192,7 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 		cancelAlloc()
 		return nil, &Error{
 			Class: ClassBrowser,
-			Err:   fmt.Errorf("инициализация Chromium (%s): %w", mode, err),
+			Err:   fmt.Errorf("Chromium initialization (%s): %w", mode, err),
 		}
 	}
 
@@ -223,7 +223,7 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 		// mutator-disable-next-line numbers/decrementer, numbers/incrementer, branch/if
 		if b.rootPID == 0 {
 			// mutator-disable-next-line statement/remove
-			slog.Warn("процесс Chromium не определён: перезапуск по памяти отключён")
+			slog.Warn("the Chromium process is not identified: the memory-threshold restart is disabled")
 		}
 	}
 	return b, nil
@@ -248,7 +248,7 @@ func initBrowserSession(bctx context.Context, opts Options) error {
 	case r := <-done:
 		return r.err
 	case <-timer.C:
-		return fmt.Errorf("таймаут инициализации %s", limit)
+		return fmt.Errorf("the initialization timeout %s", limit)
 	}
 }
 
@@ -453,10 +453,10 @@ func (b *Browser) classifyCtx(err error, url string, s *Session) *Error {
 	switch {
 	case !b.Alive():
 		return &Error{Class: ClassBrowser, URL: url,
-			Err: fmt.Errorf("браузер Chromium недоступен: %w", err)}
+			Err: fmt.Errorf("Chromium browser unavailable: %w", err)}
 	case s != nil && s.ctx != nil && s.ctx.Err() != nil:
 		return &Error{Class: ClassContext, URL: url,
-			Err: fmt.Errorf("контекст вкладки отменён: %w", err)}
+			Err: fmt.Errorf("the tab context is cancelled: %w", err)}
 	case errors.Is(err, chromedp.ErrPageLoad):
 		// The page did not load (net::ERR_*): the tab is alive, the profile is intact.
 		return &Error{Class: ClassTask, URL: url, Err: err}
@@ -472,10 +472,10 @@ func (b *Browser) classifyCtx(err error, url string, s *Session) *Error {
 		// generation, a second failure in a row kills it.
 		if !b.probeConn() {
 			return &Error{Class: ClassBrowser, URL: url,
-				Err: fmt.Errorf("браузер Chromium недоступен: %w", err)}
+				Err: fmt.Errorf("Chromium browser unavailable: %w", err)}
 		}
 		return &Error{Class: ClassContext, URL: url,
-			Err: fmt.Errorf("контекст вкладки не отвечает: %w", err)}
+			Err: fmt.Errorf("the tab is not responding: %w", err)}
 	default:
 		return &Error{Class: ClassTask, URL: url, Err: err}
 	}

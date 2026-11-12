@@ -34,7 +34,7 @@ func liveEnabled() bool { return os.Getenv("CRAWLER_RENDER_TEST") == "1" }
 func skipUnlessLive(t *testing.T) {
 	t.Helper()
 	if !liveEnabled() {
-		t.Skip("живой Chromium не включён: CRAWLER_RENDER_TEST=1 (см. докомментарий файла)")
+		t.Skip("live Chromium not enabled: CRAWLER_RENDER_TEST=1 (see the file doc comment)")
 	}
 }
 
@@ -70,7 +70,7 @@ func liveIPv4(t *testing.T) string {
 			return ipn.IP.String()
 		}
 	}
-	t.Fatal("нет не-loopback IPv4: run-контейнер обязан быть в crawler_net")
+	t.Fatal("no non-loopback IPv4: the run container must be in crawler_net")
 	return ""
 }
 
@@ -135,22 +135,22 @@ func TestBrowserLivePoolRender(t *testing.T) {
 
 	for i := range n {
 		if errs[i] != nil {
-			t.Errorf("задача %d: %v", i, errs[i])
+			t.Errorf("task %d: %v", i, errs[i])
 			continue
 		}
 		want := fmt.Sprintf("ok-%d", i)
 		if outs[i].Title != want {
-			t.Errorf("задача %d: title %q, хочу %q", i, outs[i].Title, want)
+			t.Errorf("task %d: title %q, want %q", i, outs[i].Title, want)
 		}
 		if wantURL := fmt.Sprintf("%s/ok-%d", base, i); outs[i].FinalURL != wantURL {
-			t.Errorf("задача %d: final URL %q, хочу %q", i, outs[i].FinalURL, wantURL)
+			t.Errorf("task %d: final URL %q, want %q", i, outs[i].FinalURL, wantURL)
 		}
 	}
 	if got := b.Pages(); got != n {
-		t.Errorf("счётчик страниц %d, хочу %d", got, n)
+		t.Errorf("the page counter %d, want %d", got, n)
 	}
 	if !b.Alive() {
-		t.Error("браузер должен жить после задач")
+		t.Error("the browser must stay alive after the tasks")
 	}
 }
 
@@ -197,25 +197,25 @@ func TestBrowserLiveContextIsolation(t *testing.T) {
 	names, err := chromedp.Run(s1.Context(), getCookieNames)
 	if err != nil {
 		s1.Close()
-		t.Fatalf("GetCookies (та же сессия): %v", err)
+		t.Fatalf("GetCookies (the same session): %v", err)
 	}
 	s1.Close()
 	if len(names) != 1 || names[0] != "isolation" {
-		t.Fatalf("в первой сессии cookies %v, хочу [isolation]", names)
+		t.Fatalf("in the first session cookies %v, want [isolation]", names)
 	}
 
 	// A new session = a new profile: the cookie did not survive the context change.
 	s2, err := b.NewSession(ctx)
 	if err != nil {
-		t.Fatalf("NewSession (вторая): %v", err)
+		t.Fatalf("NewSession (the second): %v", err)
 	}
 	names, err = chromedp.Run(s2.Context(), getCookieNames)
 	s2.Close()
 	if err != nil {
-		t.Fatalf("GetCookies (вторая сессия): %v", err)
+		t.Fatalf("GetCookies (the second session): %v", err)
 	}
 	if len(names) != 0 {
-		t.Fatalf("состояние пережило смену контекста: cookies %v", names)
+		t.Fatalf("the state survived the context change: cookies %v", names)
 	}
 }
 
@@ -241,6 +241,6 @@ func TestBrowserLiveUserAgent(t *testing.T) {
 		t.Fatalf("navigator.userAgent: %v", err)
 	}
 	if ua != opts.UserAgent {
-		t.Fatalf("User-Agent вкладки %q, хочу %q (ТЗ §9)", ua, opts.UserAgent)
+		t.Fatalf("the tab User-Agent %q, want %q (spec §9)", ua, opts.UserAgent)
 	}
 }

@@ -107,7 +107,7 @@ var enqueueUpdate = db.Update("domains").
 var enqueueBatchSQL = func() string {
 	inner, err := enqueueUpdate.SQL()
 	if err != nil {
-		panic("scheduler: построение enqueueUpdate: " + err.Error())
+		panic("scheduler: building enqueueUpdate: " + err.Error())
 	}
 	return "WITH upd AS (" + inner + "), " +
 		"zc AS (UPDATE zones AS z " +
@@ -145,10 +145,10 @@ type EnqueueResult struct {
 // an empty batch is a no-op without touching the DB or the queue.
 func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []DispatchRow) (EnqueueResult, error) {
 	if pool == nil {
-		return EnqueueResult{}, errors.New("scheduler: постановка пачки: пул не задан")
+		return EnqueueResult{}, errors.New("scheduler: batch enqueue: pool not set")
 	}
 	if q == nil {
-		return EnqueueResult{}, errors.New("scheduler: постановка пачки: очередь не задана")
+		return EnqueueResult{}, errors.New("scheduler: batch enqueue: queue not set")
 	}
 	if len(batch) == 0 {
 		// Nothing to move or publish; an empty DNSBatch is also
@@ -173,7 +173,7 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 	// statement (T-178): the move and the deltas are atomic.
 	rows, err := pool.Query(ctx, enqueueBatchSQL, zoneIDs, domainIDs)
 	if err != nil {
-		return EnqueueResult{}, fmt.Errorf("scheduler: постановка пачки (%d доменов): %w", len(batch), err)
+		return EnqueueResult{}, fmt.Errorf("scheduler: batch enqueue (%d domains): %w", len(batch), err)
 	}
 
 	translated := make(map[enqueueKey]struct{}, len(batch))
@@ -184,7 +184,7 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 			// the cursor until the function exits, i.e. also during
 			// publication (the VerifyCounters style, T-217).
 			rows.Close()
-			return EnqueueResult{}, fmt.Errorf("scheduler: постановка пачки: чтение переведённых: %w", err)
+			return EnqueueResult{}, fmt.Errorf("scheduler: batch enqueue: reading moved rows: %w", err)
 		}
 		translated[k] = struct{}{}
 	}
@@ -192,7 +192,7 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 	// (the readDailyValue precedent, T-217).
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return EnqueueResult{}, fmt.Errorf("scheduler: постановка пачки: %w", err)
+		return EnqueueResult{}, fmt.Errorf("scheduler: batch enqueue: %w", err)
 	}
 	// The cursor is closed BEFORE assembling the message and publishing (T-224): Publish is
 	// network I/O to Redis (XADD with retries and pauses up to ~0.75 s on
@@ -229,7 +229,7 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 	if _, err := q.Publish(ctx, queue.StreamDNS, msg); err != nil {
 		// The move is committed and not rolled back (the file comment):
 		// res.Queued rows await the lease return (T-029).
-		return res, fmt.Errorf("scheduler: постановка пачки: публикация %d доменов в q:dns: %w", len(msg.Domains), err)
+		return res, fmt.Errorf("scheduler: batch enqueue: publishing %d domains to q:dns: %w", len(msg.Domains), err)
 	}
 	res.Published = len(msg.Domains)
 	return res, nil
@@ -243,16 +243,16 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 func enqueueValidate(batch []DispatchRow) error {
 	for i, r := range batch {
 		if r.ZoneID <= 0 {
-			return fmt.Errorf("scheduler: постановка пачки: домен №%d: zone_id %d ≤ 0", i+1, r.ZoneID)
+			return fmt.Errorf("scheduler: batch enqueue: domain #%d: zone_id %d ≤ 0", i+1, r.ZoneID)
 		}
 		if r.DomainID <= 0 {
-			return fmt.Errorf("scheduler: постановка пачки: домен №%d: domain_id %d ≤ 0", i+1, r.DomainID)
+			return fmt.Errorf("scheduler: batch enqueue: domain #%d: domain_id %d ≤ 0", i+1, r.DomainID)
 		}
 		if r.Name == "" {
-			return fmt.Errorf("scheduler: постановка пачки: домен №%d: пустое имя", i+1)
+			return fmt.Errorf("scheduler: batch enqueue: domain #%d: empty name", i+1)
 		}
 		if len(r.Name) > enqueueMaxNameLen {
-			return fmt.Errorf("scheduler: постановка пачки: домен №%d: имя длиннее %d октетов", i+1, enqueueMaxNameLen)
+			return fmt.Errorf("scheduler: batch enqueue: domain #%d: name longer than %d octets", i+1, enqueueMaxNameLen)
 		}
 	}
 	return nil
@@ -324,21 +324,21 @@ func (o EnqueueOptions) withDefaults() EnqueueOptions {
 // Logging mutants (T-M05): the loop steps' Warn and the batch outcome's Debug do not
 // change the observable behavior (errors are already handled by wait/continue) —
 // suppressed per docs/mutation-testing.md §4 (logging is not tested).
-// mutator-disable-regexp log\.Warn\("цикл statement/remove
-// mutator-disable-regexp log\.Debug\("пачка statement/remove
+// mutator-disable-regexp log\.Warn\("enqueue loop statement/remove
+// mutator-disable-regexp log\.Debug\("batch enqueued statement/remove
 func EnqueueLoop(ctx context.Context, pool db.DB, q queue.Queue, opts EnqueueOptions) error {
 	if pool == nil {
-		return errors.New("scheduler: цикл постановки: пул не задан")
+		return errors.New("scheduler: enqueue loop: pool not set")
 	}
 	if q == nil {
-		return errors.New("scheduler: цикл постановки: очередь не задана")
+		return errors.New("scheduler: enqueue loop: queue not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("цикл постановки пачек в q:dns",
+	log.Info("batch enqueue loop into q:dns",
 		"batch", o.BatchSize, "interval", o.Interval.String(), "idle_wait", o.IdleWait.String(),
 		"zone_weights", len(o.ZoneWeights))
 
@@ -361,7 +361,7 @@ func EnqueueLoop(ctx context.Context, pool db.DB, q queue.Queue, opts EnqueueOpt
 			if ctx.Err() != nil {
 				return nil
 			}
-			log.Warn("цикл постановки: выборка пачки", "err", err)
+			log.Warn("enqueue loop: batch selection", "err", err)
 			wait(o.IdleWait)
 			continue
 		}
@@ -385,12 +385,12 @@ func EnqueueLoop(ctx context.Context, pool db.DB, q queue.Queue, opts EnqueueOpt
 			// The res.Queued rows left unpublished will be returned
 			// by lease (T-029): the DB state is consistent; the pause does not
 			// push new batches into queued while the queue is unavailable.
-			log.Warn("цикл постановки: постановка пачки",
+			log.Warn("enqueue loop: batch enqueue",
 				"err", err, "batch", len(batch), "queued", res.Queued)
 			wait(o.IdleWait)
 			continue
 		}
-		log.Debug("пачка поставлена в q:dns",
+		log.Debug("batch enqueued into q:dns",
 			"published", res.Published, "skipped", res.Skipped)
 		wait(o.Interval)
 	}

@@ -74,17 +74,17 @@ func TestWaitLiveSettleQuiet(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if out.Title != "settle-quiet" || out.FinalURL != want {
-		t.Fatalf("результат %+v", out)
+		t.Fatalf("result %+v", out)
 	}
 	plan := DefaultWaitPlan(opts.Timeout)
 	if elapsed < plan.Quiet-100*time.Millisecond {
-		t.Errorf("визит %s: окно затишья %s не выдержано (раньше окна)", elapsed, plan.Quiet)
+		t.Errorf("the visit %s: the quiet window %s was not held out (before the window)", elapsed, plan.Quiet)
 	}
 	if elapsed >= plan.Settle {
-		t.Errorf("визит %s дошёл до потолка затишья %s — тихая страница должна заканчиваться окном", elapsed, plan.Settle)
+		t.Errorf("the visit %s reached the quiet cap %s — a quiet page must end with the window", elapsed, plan.Settle)
 	}
 	if elapsed >= opts.Timeout {
-		t.Errorf("визит %s дотянул до общего таймаута %s — тихая страница должна заканчиваться окном", elapsed, opts.Timeout)
+		t.Errorf("the visit %s dragged to the overall timeout %s — a quiet page must end with the window", elapsed, opts.Timeout)
 	}
 }
 
@@ -110,17 +110,17 @@ func TestWaitLiveSettleNoisy(t *testing.T) {
 	out, err := p.Run(ctx, RenderTask{URL: want})
 	elapsed := time.Since(start)
 	if err != nil {
-		t.Fatalf("Run: %v (потолок затишья — не ошибка)", err)
+		t.Fatalf("Run: %v (the quiet cap is not an error)", err)
 	}
 	if out.Title != "noisy" || out.FinalURL != want {
-		t.Fatalf("результат %+v", out)
+		t.Fatalf("result %+v", out)
 	}
 	plan := DefaultWaitPlan(opts.Timeout)
 	if elapsed < plan.Settle-100*time.Millisecond {
-		t.Errorf("визит %s закончился раньше потолка затишья %s — окно подтвердилось при непрерывных запросах", elapsed, plan.Settle)
+		t.Errorf("the visit %s ended before the quiet cap %s — the window confirmed under continuous requests", elapsed, plan.Settle)
 	}
 	if elapsed >= opts.Timeout {
-		t.Errorf("визит %s дотянул до общего таймаута %s", elapsed, opts.Timeout)
+		t.Errorf("the visit %s dragged to the overall timeout %s", elapsed, opts.Timeout)
 	}
 }
 
@@ -146,19 +146,19 @@ func TestWaitLiveOverallTimeout(t *testing.T) {
 	_, err = p.Run(ctx, RenderTask{URL: stuck})
 	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("ожидана ошибка общего таймаута, получен успех")
+		t.Fatal("an overall timeout error was expected, got a success")
 	}
 	if ClassOf(err) != ClassTask {
-		t.Errorf("класс %v (%v), хочу task — таймаут страницы без повторов контекста", ClassOf(err), err)
+		t.Errorf("the class %v (%v), want task — a page timeout without context retries", ClassOf(err), err)
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("ошибка %v не содержит context.DeadlineExceeded", err)
+		t.Errorf("the error %v does not contain context.DeadlineExceeded", err)
 	}
 	if elapsed < opts.Timeout {
-		t.Errorf("визит %s оборван раньше общего таймаута %s", elapsed, opts.Timeout)
+		t.Errorf("the visit %s was cut short before the overall timeout %s", elapsed, opts.Timeout)
 	}
 	// A task error — the page counter does not grow, there is no retry.
 	if got := b.Pages(); got != 0 {
-		t.Errorf("счётчик страниц %d, хочу 0 (неуспешная задача)", got)
+		t.Errorf("the page counter %d, want 0 (an unsuccessful task)", got)
 	}
 }

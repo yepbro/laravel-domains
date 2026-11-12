@@ -133,7 +133,7 @@ func (a *remoteAllocator) Allocate(ctx context.Context, opts ...chromedp.Browser
 	}
 	tr, err := remoteDial(ctx, wsURL, a.dialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("подключение к Chromium %s: %w", a.wsURL, err)
+		return nil, fmt.Errorf("connecting to Chromium %s: %w", a.wsURL, err)
 	}
 	// wctx — the session lifetime context, separate from ctx (as in
 	// remote.Allocator): cancelling the client context must not tear
@@ -188,10 +188,10 @@ func wsURLWithAuthority(wsURL, cfgURL string) (string, error) {
 	}
 	cfg, err := url.Parse(cfgURL)
 	if err != nil {
-		return "", fmt.Errorf("адрес конфигурации %q: %w", cfgURL, err)
+		return "", fmt.Errorf("the configuration address %q: %w", cfgURL, err)
 	}
 	if cfg.Host == "" {
-		return "", fmt.Errorf("адрес конфигурации %q без хоста", cfgURL)
+		return "", fmt.Errorf("the configuration address %q has no host", cfgURL)
 	}
 	ws.Host = cfg.Host
 	return ws.String(), nil
@@ -251,12 +251,12 @@ func resolveRemoteWSURL(ctx context.Context, raw string, timeout time.Duration) 
 	defer cancel()
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("адрес Chromium %q: %w", raw, err)
+		return "", fmt.Errorf("the Chromium address %q: %w", raw, err)
 	}
 	if host := u.Hostname(); host != "localhost" && net.ParseIP(host) == nil {
 		addrs, err := remoteResolve(rctx, host)
 		if err != nil {
-			return "", fmt.Errorf("резолв хоста Chromium %s: %w", host, err)
+			return "", fmt.Errorf("resolving the Chromium host %s: %w", host, err)
 		}
 		ip := preferIPv4(addrs)
 		if port := u.Port(); port != "" {
@@ -285,21 +285,21 @@ func resolveRemoteWSURL(ctx context.Context, raw string, timeout time.Duration) 
 	q.Path = "/json/version"
 	req, err := http.NewRequestWithContext(rctx, http.MethodGet, q.String(), nil)
 	if err != nil {
-		return "", fmt.Errorf("запрос /json/version (%s): %w", q.Host, err)
+		return "", fmt.Errorf("the /json/version request (%s): %w", q.Host, err)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("запрос /json/version (%s): %w", q.Host, err)
+		return "", fmt.Errorf("the /json/version request (%s): %w", q.Host, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var v struct {
 		WS string `json:"webSocketDebuggerUrl"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return "", fmt.Errorf("ответ /json/version (%s): %w", q.Host, err)
+		return "", fmt.Errorf("the /json/version response (%s): %w", q.Host, err)
 	}
 	if v.WS == "" {
-		return "", fmt.Errorf("ответ /json/version (%s) без webSocketDebuggerUrl", q.Host)
+		return "", fmt.Errorf("the /json/version response (%s) has no webSocketDebuggerUrl", q.Host)
 	}
 	return v.WS, nil
 }

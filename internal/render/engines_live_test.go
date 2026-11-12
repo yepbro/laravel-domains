@@ -163,7 +163,7 @@ func engineLiveOptions(tc engineLiveCase) Options {
 func engineLiveVersionURL(ws string) (string, error) {
 	u, err := url.Parse(ws)
 	if err != nil {
-		return "", fmt.Errorf("разбор %q: %w", ws, err)
+		return "", fmt.Errorf("parsing %q: %w", ws, err)
 	}
 	switch u.Scheme {
 	case "ws", "http":
@@ -171,7 +171,7 @@ func engineLiveVersionURL(ws string) (string, error) {
 	case "wss", "https":
 		u.Scheme = "https"
 	default:
-		return "", fmt.Errorf("схема %q (ожидается ws:// или wss://)", u.Scheme)
+		return "", fmt.Errorf("the scheme %q (ws:// or wss:// expected)", u.Scheme)
 	}
 	u.Path = "/json/version"
 	u.RawQuery = ""
@@ -189,26 +189,26 @@ func engineLiveGate(t *testing.T, tc engineLiveCase) {
 	ws, explicit := engineLiveWS(tc)
 	vu, err := engineLiveVersionURL(ws)
 	if err != nil {
-		t.Fatalf("адрес движка %s из %s: %v", ws, tc.env, err)
+		t.Fatalf("the engine %s address from %s: %v", ws, tc.env, err)
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(vu)
 	if err != nil {
 		if explicit {
-			t.Fatalf("движок %s недоступен: %v (%s = %s) — проверьте адрес переменной %s",
+			t.Fatalf("the engine %s is unavailable: %v (%s = %s) — check the address of the %s variable",
 				tc.name, err, tc.env, ws, tc.env)
 		}
-		t.Skipf("движок %s недоступен (%s): %v — контейнер движка не поднят? "+
-			"Подъём: docker compose --profile render-engines up -d moli lightpanda "+
-			"(chromium — профиль app: ... up -d chromium); docs/dev-environment.md, «Движки рендера»",
+		t.Skipf("the engine %s is unavailable (%s): %v — is the engine container up? "+
+			"To bring it up: docker compose --profile render-engines up -d moli lightpanda "+
+			"(chromium — the app profile: ... up -d chromium); docs/dev-environment.md, Render engines",
 			tc.name, vu, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "Browser") {
-		t.Fatalf("ответ /json/version движка %s: %d %s", tc.name, resp.StatusCode, string(body))
+		t.Fatalf("the engine %s /json/version response: %d %s", tc.name, resp.StatusCode, string(body))
 	}
-	t.Logf("движок %s, /json/version: %s", tc.name, strings.TrimSpace(string(body)))
+	t.Logf("the engine %s, /json/version: %s", tc.name, strings.TrimSpace(string(body)))
 }
 
 // engineLiveBrowser — starting the engine's browser for a slice subtest (closing —
@@ -297,24 +297,24 @@ func engineLiveContextIsolation(t *testing.T, opts Options) {
 	names, err := chromedp.Run(s1.Context(), getCookieNames)
 	if err != nil {
 		s1.Close()
-		t.Fatalf("GetCookies (та же сессия): %v", err)
+		t.Fatalf("GetCookies (the same session): %v", err)
 	}
 	s1.Close()
 	if len(names) != 1 || names[0] != "isolation" {
-		t.Fatalf("в первой сессии cookies %v, хочу [isolation]", names)
+		t.Fatalf("in the first session cookies %v, want [isolation]", names)
 	}
 
 	s2, err := b.NewSession(ctx)
 	if err != nil {
-		t.Fatalf("NewSession (вторая): %v", err)
+		t.Fatalf("NewSession (the second): %v", err)
 	}
 	names, err = chromedp.Run(s2.Context(), getCookieNames)
 	s2.Close()
 	if err != nil {
-		t.Fatalf("GetCookies (вторая сессия): %v", err)
+		t.Fatalf("GetCookies (the second session): %v", err)
 	}
 	if len(names) != 0 {
-		t.Fatalf("состояние пережило смену контекста: cookies %v", names)
+		t.Fatalf("the state survived the context change: cookies %v", names)
 	}
 }
 
@@ -351,7 +351,7 @@ func engineLiveNavigateExtract(t *testing.T, opts Options) {
 	})
 	base := liveServe(t, mux)
 
-	t.Run("spa-shell.crawl.test: DOM после JS и JS-cookie", func(t *testing.T) {
+	t.Run("spa-shell.crawl.test: the DOM after JS and the JS cookie", func(t *testing.T) {
 		s, err := b.NewSession(ctx)
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -362,13 +362,13 @@ func engineLiveNavigateExtract(t *testing.T, opts Options) {
 			t.Fatalf("Run: %v", err)
 		}
 		if out.FinalURL != "http://spa-shell.crawl.test/" {
-			t.Errorf("итоговый URL %q", out.FinalURL)
+			t.Errorf("the final URL %q", out.FinalURL)
 		}
 		if !strings.HasPrefix(out.DOM, "<html") {
-			t.Errorf("итоговый DOM не с корневого элемента: %.80q", out.DOM)
+			t.Errorf("the final DOM does not start at the root element: %.80q", out.DOM)
 		}
 		if !strings.Contains(out.DOM, `<div id="root">`) {
-			t.Errorf("итоговый DOM без каркаса SPA: %.120q", out.DOM)
+			t.Errorf("the final DOM has no SPA frame: %.120q", out.DOM)
 		}
 		var js *ExtractCookie
 		for i := range out.Cookies {
@@ -377,20 +377,20 @@ func engineLiveNavigateExtract(t *testing.T, opts Options) {
 			}
 		}
 		if js == nil {
-			t.Fatalf("JS-cookie js_session не снята: %+v", out.Cookies)
+			t.Fatalf("the js_session JS cookie was not captured: %+v", out.Cookies)
 		}
 		if js.Value != "rendered-by-js" || js.Path != "/" || js.Domain != "spa-shell.crawl.test" {
 			t.Errorf("js_session: %+v", js)
 		}
 		if ct := out.ResponseHeaders.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-			t.Errorf("Content-Type %q, хочу text/html…", ct)
+			t.Errorf("Content-Type %q, want text/html…", ct)
 		}
 		if out.ResponseHeaders.Get("Server") == "" {
-			t.Errorf("заголовок Server не снят: %v", out.ResponseHeaders)
+			t.Errorf("the Server header was not captured: %v", out.ResponseHeaders)
 		}
 	})
 
-	t.Run("фикстура: httpOnly-cookie и заголовки ответа", func(t *testing.T) {
+	t.Run("fixture: an httpOnly cookie and the response headers", func(t *testing.T) {
 		s, err := b.NewSession(ctx)
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -402,7 +402,7 @@ func engineLiveNavigateExtract(t *testing.T, opts Options) {
 			t.Fatalf("Run: %v", err)
 		}
 		if out.FinalURL != page {
-			t.Errorf("итоговый URL %q, хочу %q", out.FinalURL, page)
+			t.Errorf("the final URL %q, want %q", out.FinalURL, page)
 		}
 		var httpOnly, js *ExtractCookie
 		for i := range out.Cookies {
@@ -414,22 +414,22 @@ func engineLiveNavigateExtract(t *testing.T, opts Options) {
 			}
 		}
 		if httpOnly == nil {
-			t.Fatalf("httpOnly-cookie engine_httponly не снята из хранилища: %+v", out.Cookies)
+			t.Fatalf("the engine_httponly httpOnly cookie was not captured from the store: %+v", out.Cookies)
 		}
 		if !httpOnly.HTTPOnly || httpOnly.Path != "/" || httpOnly.Value != "1" {
-			t.Errorf("engine_httponly: %+v, хочу httpOnly cookie path=/ value=1", httpOnly)
+			t.Errorf("engine_httponly: %+v, want httpOnly cookie path=/ value=1", httpOnly)
 		}
 		if js == nil || js.Value != "1" {
-			t.Errorf("JS-cookie engine_js: %+v, хочу value=1 (JS обязан работать)", js)
+			t.Errorf("JS-cookie engine_js: %+v, want value=1 (JS must work)", js)
 		}
 		if !strings.HasPrefix(out.DOM, "<html") || !strings.Contains(out.DOM, "ok</body>") {
-			t.Errorf("итоговый DOM неожиданен: %.120q", out.DOM)
+			t.Errorf("the final DOM is unexpected: %.120q", out.DOM)
 		}
 		if got := out.ResponseHeaders.Get("X-Engine-Live"); got != "1" {
-			t.Errorf("X-Engine-Live %q, хочу 1 — заголовки не с реального ответа фикстуры", got)
+			t.Errorf("X-Engine-Live %q, want 1 — the headers are not from the real fixture response", got)
 		}
 		if ct := out.ResponseHeaders.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-			t.Errorf("Content-Type %q, хочу text/html…", ct)
+			t.Errorf("Content-Type %q, want text/html…", ct)
 		}
 	})
 }
@@ -444,27 +444,27 @@ func engineLiveBlockResources(t *testing.T, opts Options) {
 
 	out := blockLiveRun(t, opts, pageURL)
 	if out.FinalURL != pageURL {
-		t.Errorf("final URL %q, хочу %q", out.FinalURL, pageURL)
+		t.Errorf("final URL %q, want %q", out.FinalURL, pageURL)
 	}
 
 	blockLiveWaitReady(t, c)
 	if got := c.page.Load(); got < 1 {
-		t.Errorf("страница запрошена %d раз, хочу >= 1", got)
+		t.Errorf("the page was requested %d times, want >= 1", got)
 	}
 	if got := c.css.Load(); got < 1 {
-		t.Errorf("CSS запрошен %d раз, хочу >= 1 (не блокируется)", got)
+		t.Errorf("CSS was requested %d times, want >= 1 (not blocked)", got)
 	}
 	if got := c.js.Load(); got < 1 {
-		t.Errorf("скрипт запрошен %d раз, хочу >= 1 (не блокируется)", got)
+		t.Errorf("the script was requested %d times, want >= 1 (not blocked)", got)
 	}
 	if got := c.xhr.Load(); got < 1 {
-		t.Errorf("XHR запрошен %d раз, хочу >= 1 (JS обязан работать)", got)
+		t.Errorf("XHR was requested %d times, want >= 1 (JS must work)", got)
 	}
 	if got := c.img.Load(); got != 0 {
-		t.Errorf("картинка запрошена %d раз, хочу 0 (net::ERR_BLOCKED_BY_CLIENT до отправки, T-062)", got)
+		t.Errorf("the image was requested %d times, want 0 (net::ERR_BLOCKED_BY_CLIENT before the request is sent, T-062)", got)
 	}
 	if got := c.font.Load(); got != 0 {
-		t.Errorf("шрифт запрошен %d раз, хочу 0 (net::ERR_BLOCKED_BY_CLIENT до отправки, T-062)", got)
+		t.Errorf("the font was requested %d times, want 0 (net::ERR_BLOCKED_BY_CLIENT before the request is sent, T-062)", got)
 	}
 }
 
@@ -525,8 +525,8 @@ func engineLiveSSRF(t *testing.T, opts Options) {
 		"http://2130706433/",
 	} {
 		if _, err := s.Run(ctx, RenderTask{URL: u}); err == nil ||
-			ClassOf(err) != ClassTask || !strings.Contains(err.Error(), "внутренн") {
-			t.Errorf("%s: ожидался отказ SSRF-контура классом task, получено err=%v", u, err)
+			ClassOf(err) != ClassTask || !strings.Contains(err.Error(), "internal") {
+			t.Errorf("%s: an SSRF contour rejection with the task class was expected, got err=%v", u, err)
 		}
 	}
 
@@ -535,22 +535,22 @@ func engineLiveSSRF(t *testing.T, opts Options) {
 	// must fail.
 	_, err = s.Run(ctx, RenderTask{URL: "http://spa-shell.crawl.test/"})
 	if err == nil {
-		t.Fatal("навигация на приватный адрес testbed прошла сквозь SSRF-контур")
+		t.Fatal("the navigation to a private testbed address went through the SSRF contour")
 	}
 	if ClassOf(err) != ClassTask {
-		t.Errorf("класс %v (%v), хочу task — блокировка контура это ошибка загрузки страницы", ClassOf(err), err)
+		t.Errorf("the class %v (%v), want task — a contour block is a page load error", ClassOf(err), err)
 	}
 	code := LoadErrorCode(err)
 	if code == "" {
 		// Without a load code the reason is invisible (on moli, for example, a
 		// Fetch.enable refusal lands here) — we print the whole error, not an empty code.
-		t.Fatalf("навигация упала без кода ошибки загрузки (хочу net::ERR_BLOCKED_BY_CLIENT от failRequest перехвата): %v", err)
+		t.Fatalf("the navigation failed without a load error code (want net::ERR_BLOCKED_BY_CLIENT from the interception failRequest): %v", err)
 	}
 	if code != "net::ERR_BLOCKED_BY_CLIENT" {
-		t.Errorf("код ошибки загрузки %q, хочу net::ERR_BLOCKED_BY_CLIENT (fetch.failRequest перехвата, T-219)", code)
+		t.Errorf("the load error code %q, want net::ERR_BLOCKED_BY_CLIENT (the interception fetch.failRequest, T-219)", code)
 	}
 	if n := lookups.Load(); n < 1 {
-		t.Errorf("резолв SSRF-контура не вызывался (%d вызовов) — блокировка пришла не из перехвата, код ошибки её не доказывает (T-230)", n)
+		t.Errorf("the SSRF contour resolution was not called (%d calls) — the block did not come from the interception, the error code does not prove it (T-230)", n)
 	}
 }
 
@@ -588,9 +588,9 @@ func engineLiveUAOverride(t *testing.T, opts Options) {
 		t.Fatalf("navigator.userAgent: %v", err)
 	}
 	if ua != opts.UserAgent {
-		t.Errorf("navigator.userAgent %q, хочу %q (ТЗ §9)", ua, opts.UserAgent)
+		t.Errorf("navigator.userAgent %q, want %q (spec §9)", ua, opts.UserAgent)
 	}
 	if sent, _ := gotUA.Load().(string); sent != opts.UserAgent {
-		t.Errorf("User-Agent запроса страницы %q, хочу %q — override не дошёл до сетевого стека движка", sent, opts.UserAgent)
+		t.Errorf("the page request User-Agent %q, want %q — the override did not reach the engine's network stack", sent, opts.UserAgent)
 	}
 }

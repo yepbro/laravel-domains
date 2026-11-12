@@ -65,27 +65,27 @@ func TestExtractLiveStaticPage(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if out.FinalURL != page {
-		t.Errorf("итоговый URL %q, хочу %q", out.FinalURL, page)
+		t.Errorf("the final URL %q, want %q", out.FinalURL, page)
 	}
 	want := "<html><head><title>ext</title></head><body>" +
 		`<div id="d">after-js</div>` +
 		`<script>document.getElementById("d").textContent="after-js";</script>` +
 		"</body></html>"
 	if out.DOM != want {
-		t.Fatalf("итоговый DOM:\n got  %q\nwant %q", out.DOM, want)
+		t.Fatalf("the final DOM:\n got  %q\nwant %q", out.DOM, want)
 	}
 	if len(out.Cookies) != 0 {
-		t.Errorf("cookies у страницы без них: %+v, хочу пусто", out.Cookies)
+		t.Errorf("cookies on a page without them: %+v, want empty", out.Cookies)
 	}
 	// The headers of the real main navigation response: the fixture server's
 	// Content-Type and the signature X-Live-Fixture (the keys are canonical, as in the
 	// HTTP stage; the full set of the network response's headers is not pinned —
 	// Date etc. are added by the server itself).
 	if ct := out.ResponseHeaders.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-		t.Errorf("Content-Type %q, хочу text/html…", ct)
+		t.Errorf("Content-Type %q, want text/html…", ct)
 	}
 	if got := out.ResponseHeaders.Get("X-Live-Fixture"); got != "1" {
-		t.Errorf("X-Live-Fixture %q, хочу 1 — заголовки не с реального ответа фикстуры", got)
+		t.Errorf("X-Live-Fixture %q, want 1 — the headers are not from the real fixture response", got)
 	}
 }
 
@@ -113,7 +113,7 @@ func TestExtractLiveInternalPage(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if out.FinalURL != "http://spa-shell.crawl.test/" {
-		t.Errorf("итоговый URL %q", out.FinalURL)
+		t.Errorf("the final URL %q", out.FinalURL)
 	}
 
 	// The JS cookie is visible in the CDP set: the context store is read by the command,
@@ -125,7 +125,7 @@ func TestExtractLiveInternalPage(t *testing.T) {
 		}
 	}
 	if js == nil {
-		t.Fatalf("JS-cookie js_session не снята: %+v", out.Cookies)
+		t.Fatalf("the js_session JS cookie was not captured: %+v", out.Cookies)
 	}
 	if js.Value != "rendered-by-js" || js.Path != "/" || js.Domain != "spa-shell.crawl.test" {
 		t.Errorf("js_session: %+v", js)
@@ -133,18 +133,18 @@ func TestExtractLiveInternalPage(t *testing.T) {
 
 	// The page tree after the load: the SPA skeleton is in place.
 	if !strings.Contains(out.DOM, `<div id="root">`) {
-		t.Errorf("итоговый DOM без каркаса SPA: %q", out.DOM)
+		t.Errorf("the final DOM has no SPA frame: %q", out.DOM)
 	}
 	if !strings.HasPrefix(out.DOM, "<html") {
-		t.Errorf("итоговый DOM не с корневого элемента: %q", out.DOM)
+		t.Errorf("the final DOM does not start at the root element: %q", out.DOM)
 	}
 
 	// The response headers of the main navigation (spec 5.8): the keys are
 	// canonical, as in the HTTP stage.
 	if ct := out.ResponseHeaders.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-		t.Errorf("Content-Type %q, хочу text/html…", ct)
+		t.Errorf("Content-Type %q, want text/html…", ct)
 	}
 	if out.ResponseHeaders.Get("Server") == "" {
-		t.Errorf("заголовок Server не снят: %v", out.ResponseHeaders)
+		t.Errorf("the Server header was not captured: %v", out.ResponseHeaders)
 	}
 }

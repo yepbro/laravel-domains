@@ -45,12 +45,12 @@ func TestExtractCookieFields(t *testing.T) {
 		want ExtractCookie
 	}{
 		{
-			name: "session-cookie без срока",
+			name: "a session cookie without an expiry",
 			in:   network.Cookie{Name: "a", Value: "1", Session: true, Expires: -1},
 			want: ExtractCookie{Name: "a", Value: "1"},
 		},
 		{
-			name: "отрицательный срок — тоже без expires",
+			name: "a negative expiry — also without expires",
 			in:   network.Cookie{Name: "a", Value: "1", Expires: -1},
 			want: ExtractCookie{Name: "a", Value: "1"},
 		},
@@ -65,21 +65,21 @@ func TestExtractCookieFields(t *testing.T) {
 			want: ExtractCookie{Name: "a", SameSite: "none"},
 		},
 		{
-			name: "samesite не выставлен",
+			name: "samesite is not set",
 			in:   network.Cookie{Name: "a"},
 			want: ExtractCookie{Name: "a"},
 		},
 		{
 			// The Session flag overrides a positive expiry: expires is not
 			// set even with the field filled in.
-			name: "session-cookie со сроком — без expires",
+			name: "a session cookie with an expiry — without expires",
 			in:   network.Cookie{Name: "a", Value: "1", Session: true, Expires: 1792567680},
 			want: ExtractCookie{Name: "a", Value: "1"},
 		},
 		{
 			// The minimal positive expiry: a Unix second reads into RFC
 			// 3339 (the "> 0" boundary — one included).
-			name: "срок 1 — 1970-01-01T00:00:01Z",
+			name: "expiry 1 — 1970-01-01T00:00:01Z",
 			in:   network.Cookie{Name: "a", Value: "1", Expires: 1},
 			want: ExtractCookie{Name: "a", Value: "1", Expires: "1970-01-01T00:00:01Z"},
 		},
@@ -95,7 +95,7 @@ func TestExtractCookieFields(t *testing.T) {
 
 func TestExtractCookiesFromCDP(t *testing.T) {
 	if got := extractCookiesFromCDP(nil); got != nil {
-		t.Fatalf("пустой набор: %+v, хочу nil (NULL в jsonb)", got)
+		t.Fatalf("an empty set: %+v, want nil (NULL in jsonb)", got)
 	}
 	// The order is deterministic (name, domain, path) regardless of the arrival order.
 	got := extractCookiesFromCDP([]*network.Cookie{
@@ -111,11 +111,11 @@ func TestExtractCookiesFromCDP(t *testing.T) {
 		{Name: "b", Domain: ".example.com", Path: "/"},
 	}
 	if len(got) != len(want) {
-		t.Fatalf("размер %d, хочу %d: %+v", len(got), len(want), got)
+		t.Fatalf("the size %d, want %d: %+v", len(got), len(want), got)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("позиция %d: got %+v, want %+v", i, got[i], want[i])
+			t.Errorf("position %d: got %+v, want %+v", i, got[i], want[i])
 		}
 	}
 
@@ -125,11 +125,11 @@ func TestExtractCookiesFromCDP(t *testing.T) {
 	// an insertion sort, Less(1,0) is called exactly once and does not swap
 	// on false); a non-strict `<=` would swap the elements.
 	got = extractCookiesFromCDP([]*network.Cookie{
-		{Name: "a", Domain: ".example.com", Path: "/", Value: "второй"},
-		{Name: "a", Domain: ".example.com", Path: "/", Value: "первый"},
+		{Name: "a", Domain: ".example.com", Path: "/", Value: "second"},
+		{Name: "a", Domain: ".example.com", Path: "/", Value: "first"},
 	})
-	if len(got) != 2 || got[0].Value != "второй" || got[1].Value != "первый" {
-		t.Errorf("порядок равных ключей: %+v", got)
+	if len(got) != 2 || got[0].Value != "second" || got[1].Value != "first" {
+		t.Errorf("the order of equal keys: %+v", got)
 	}
 }
 
@@ -159,7 +159,7 @@ func TestExtractCookieJSONContract(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	if string(got) != `[{"name":"a","value":"1"}]` {
-		t.Fatalf("минимальная запись: %s", got)
+		t.Fatalf("the minimal record: %s", got)
 	}
 }
 
@@ -168,20 +168,20 @@ func TestExtractCookieJSONContract(t *testing.T) {
 // string over the limit through CDP; 0 — the expression without truncation.
 func TestExtractDOMExprLimited(t *testing.T) {
 	if got := extractDOMExprLimited(0); got != extractDOMExpr {
-		t.Errorf("лимит 0: %q, хочу базовое выражение %q", got, extractDOMExpr)
+		t.Errorf("limit 0: %q, want the base expression %q", got, extractDOMExpr)
 	}
 	if got := extractDOMExprLimited(-5); got != extractDOMExpr {
-		t.Errorf("отрицательный лимит: %q, хочу базовое выражение %q", got, extractDOMExpr)
+		t.Errorf("a negative limit: %q, want the base expression %q", got, extractDOMExpr)
 	}
 	// The boundary: a limit of 1 — the minimal valid cap (does not degrade
 	// into the unlimited expression).
 	if got := extractDOMExprLimited(1); got != extractDOMExpr+".substring(0, 1)" {
-		t.Errorf("лимит 1: %q, хочу %q", got, extractDOMExpr+".substring(0, 1)")
+		t.Errorf("limit 1: %q, want %q", got, extractDOMExpr+".substring(0, 1)")
 	}
 	got := extractDOMExprLimited(2048)
 	want := extractDOMExpr + ".substring(0, 2048)"
 	if got != want {
-		t.Errorf("выражение:\n got  %s\nwant %s", got, want)
+		t.Errorf("the expression:\n got  %s\nwant %s", got, want)
 	}
 }
 
@@ -190,15 +190,15 @@ func TestExtractDOMExprLimited(t *testing.T) {
 // multibyte symbol; within the limit and without a limit — unchanged.
 func TestTruncateDOM(t *testing.T) {
 	if got := truncateDOM("<html/>", 0); got != "<html/>" {
-		t.Errorf("без лимита: %q", got)
+		t.Errorf("no limit: %q", got)
 	}
 	if got := truncateDOM("<html/>", 100); got != "<html/>" {
-		t.Errorf("в лимите: %q", got)
+		t.Errorf("within the limit: %q", got)
 	}
 
 	got := truncateDOM(strings.Repeat("a", 100), 50)
 	if len(got) != 50 || !strings.HasSuffix(got, extractDOMTruncated) {
-		t.Errorf("обрезка: %d байт, суффикс %q", len(got), got[len(got)-len(extractDOMTruncated):])
+		t.Errorf("truncation: %d bytes, the suffix %q", len(got), got[len(got)-len(extractDOMTruncated):])
 	}
 
 	// The cut boundary lands inside a multibyte symbol — a rollback to its
@@ -207,13 +207,13 @@ func TestTruncateDOM(t *testing.T) {
 	multi := strings.Repeat("é", 200) // 2 bytes per symbol
 	got = truncateDOM(multi, 100)
 	if !utf8.ValidString(got) {
-		t.Errorf("срез рвёт многобайтный символ: %q (валид: %v)", got, utf8.ValidString(got))
+		t.Errorf("the slice tears a multibyte character: %q (valid: %v)", got, utf8.ValidString(got))
 	}
 	if !strings.HasSuffix(got, extractDOMTruncated) {
-		t.Error("признак обрезки потерян при откате границы")
+		t.Error("the truncation sign is lost on the boundary rollback")
 	}
 	if want := strings.Repeat("é", 34); strings.TrimSuffix(got, extractDOMTruncated) != want {
-		t.Errorf("откат границы: префикс %q, хочу %q", strings.TrimSuffix(got, extractDOMTruncated), want)
+		t.Errorf("the boundary rollback: the prefix %q, want %q", strings.TrimSuffix(got, extractDOMTruncated), want)
 	}
 }
 
@@ -224,45 +224,45 @@ func TestTruncateDOM(t *testing.T) {
 func TestTruncateDOMBoundaries(t *testing.T) {
 	// The length exactly at the limit — unchanged (the strict <= boundary).
 	if got := truncateDOM(strings.Repeat("a", 50), 50); got != strings.Repeat("a", 50) {
-		t.Errorf("ровно в лимите: %q, хочу без изменений", got)
+		t.Errorf("exactly at the limit: %q, want unchanged", got)
 	}
 	// A limit of 1 — the minimal valid cap (smaller than the truncation
 	// marker): the degenerate cut dom[:1].
 	if got := truncateDOM("abc", 1); got != "a" {
-		t.Errorf("лимит 1: %q, хочу %q", got, "a")
+		t.Errorf("limit 1: %q, want %q", got, "a")
 	}
 	// A limit of 31 — exactly the marker length: cut = 0, the degenerate return dom[:31]
 	// without the marker.
 	if got := truncateDOM(strings.Repeat("a", 100), 31); got != strings.Repeat("a", 31) {
-		t.Errorf("лимит 31: %q, хочу %q", got, strings.Repeat("a", 31))
+		t.Errorf("limit 31: %q, want %q", got, strings.Repeat("a", 31))
 	}
 	// A limit of 32 over a single-byte string: cut = 1 lands on the symbol
 	// start — the cut dom[:1] with the truncation marker.
 	if got := truncateDOM(strings.Repeat("a", 100), 32); got != "a"+extractDOMTruncated {
-		t.Errorf("лимит 32: %q, хочу %q", got, "a"+extractDOMTruncated)
+		t.Errorf("limit 32: %q, want %q", got, "a"+extractDOMTruncated)
 	}
 	// A limit of 32, dom[1] is a continuation byte: the boundary rolls back
 	// to the rune start (cut down to 0) — the degenerate return of dom[:32]
 	// in full, without the marker.
 	dom := "a\x80" + strings.Repeat("a", 99)
 	if got := truncateDOM(dom, 32); got != dom[:32] {
-		t.Errorf("лимит 32 с продолжением на dom[1]: %q, хочу %q", got, dom[:32])
+		t.Errorf("limit 32 with a continuation onto dom[1]: %q, want %q", got, dom[:32])
 	}
 	// An invalid UTF-8 of continuation bytes only: the boundary rollback
 	// reaches zero — the degenerate return of dom[:50]; an out-of-bounds
 	// access (dom[-1]) is impermissible.
 	bad := strings.Repeat("\x80", 100)
 	if got := truncateDOM(bad, 50); got != bad[:50] {
-		t.Errorf("невалидный UTF-8: %q, хочу %q", got, bad[:50])
+		t.Errorf("invalid UTF-8: %q, want %q", got, bad[:50])
 	}
 }
 
 func TestExtractResponseHeaders(t *testing.T) {
 	if got := extractResponseHeaders(nil); got != nil {
-		t.Fatalf("nil-заголовки: %+v, хочу nil", got)
+		t.Fatalf("nil headers: %+v, want nil", got)
 	}
 	if got := extractResponseHeaders(network.Headers{}); got != nil {
-		t.Fatalf("пустые заголовки: %+v, хочу nil", got)
+		t.Fatalf("empty headers: %+v, want nil", got)
 	}
 
 	got := extractResponseHeaders(network.Headers{
@@ -288,16 +288,16 @@ func TestExtractResponseHeaders(t *testing.T) {
 		"X-Fraction": []string{"1.25"},
 	}
 	if len(got) != len(want) {
-		t.Fatalf("размер %d, хочу %d: %+v", len(got), len(want), got)
+		t.Fatalf("the size %d, want %d: %+v", len(got), len(want), got)
 	}
 	for k, vs := range want {
 		g := got[k]
 		if len(g) != len(vs) {
-			t.Fatalf("%s = %v, хочу %v", k, g, vs)
+			t.Fatalf("%s = %v, want %v", k, g, vs)
 		}
 		for i := range vs {
 			if g[i] != vs[i] {
-				t.Errorf("%s[%d] = %q, хочу %q", k, i, g[i], vs[i])
+				t.Errorf("%s[%d] = %q, want %q", k, i, g[i], vs[i])
 			}
 		}
 	}
@@ -331,9 +331,9 @@ func (f *fakeExtractCDP) cdp() extractCDP {
 }
 
 func TestExtractResult(t *testing.T) {
-	t.Run("DOM и cookies итоговой страницы", func(t *testing.T) {
+	t.Run("the DOM and cookies of the final page", func(t *testing.T) {
 		f := &fakeExtractCDP{
-			dom:     "<html><body>итог</body></html>",
+			dom:     "<html><body>final</body></html>",
 			cookies: []*network.Cookie{{Name: "js", Value: "1", HTTPOnly: true}},
 		}
 		out := RenderOutput{FinalURL: "https://example.com/final"}
@@ -348,42 +348,42 @@ func TestExtractResult(t *testing.T) {
 		}
 	})
 
-	t.Run("пустая страница — пустой DOM без ошибки", func(t *testing.T) {
+	t.Run("an empty page — an empty DOM without an error", func(t *testing.T) {
 		f := &fakeExtractCDP{}
 		out := RenderOutput{FinalURL: "https://example.com/"}
 		if err := f.cdp().extractResult(context.Background(), &out); err != nil {
 			t.Fatalf("extractResult: %v", err)
 		}
 		if out.DOM != "" {
-			t.Errorf("DOM %q, хочу пустой", out.DOM)
+			t.Errorf("DOM %q, want empty", out.DOM)
 		}
 	})
 
-	t.Run("ошибка evaluate", func(t *testing.T) {
-		f := &fakeExtractCDP{domErr: errors.New("сбой вкладки")}
+	t.Run("an evaluate error", func(t *testing.T) {
+		f := &fakeExtractCDP{domErr: errors.New("a tab failure")}
 		out := RenderOutput{FinalURL: "https://example.com/"}
 		err := f.cdp().extractResult(context.Background(), &out)
-		if err == nil || !strings.Contains(err.Error(), "итоговый DOM") {
-			t.Fatalf("ошибка: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "the final DOM") {
+			t.Fatalf("error: %v", err)
 		}
 		if !errors.Is(err, f.domErr) {
-			t.Errorf("исходная ошибка не пробита: %v", err)
+			t.Errorf("the original error is not punched through: %v", err)
 		}
 		if f.cookieSeen {
-			t.Error("после сбоя DOM cookies не запрашиваются")
+			t.Error("after the failure the DOM cookies are not requested")
 		}
 	})
 
-	t.Run("ошибка cookies", func(t *testing.T) {
-		f := &fakeExtractCDP{cookiesErr: errors.New("cookie store недоступен")}
+	t.Run("a cookies error", func(t *testing.T) {
+		f := &fakeExtractCDP{cookiesErr: errors.New("the cookie store is unavailable")}
 		out := RenderOutput{FinalURL: "https://example.com/"}
 		err := f.cdp().extractResult(context.Background(), &out)
 		if err == nil || !strings.Contains(err.Error(), "cookies") {
-			t.Fatalf("ошибка: %v", err)
+			t.Fatalf("error: %v", err)
 		}
 	})
 
-	t.Run("DOM сверх лимита обрезается с признаком", func(t *testing.T) {
+	t.Run("DOM over the limit is truncated with the sign", func(t *testing.T) {
 		// R-02: a heavy page does not keep a DOM over the limit in the worker's
 		// memory — a cut by the byte limit + the truncation marker.
 		f := &fakeExtractCDP{dom: strings.Repeat("x", 3000), domLimit: 1024}
@@ -392,25 +392,25 @@ func TestExtractResult(t *testing.T) {
 			t.Fatalf("extractResult: %v", err)
 		}
 		if len(out.DOM) != 1024 {
-			t.Fatalf("длина DOM %d, хочу лимит 1024", len(out.DOM))
+			t.Fatalf("the DOM length %d, want the limit 1024", len(out.DOM))
 		}
 		if !strings.HasSuffix(out.DOM, extractDOMTruncated) {
-			t.Fatalf("DOM без признака обрезки: …%q", out.DOM[len(out.DOM)-40:])
+			t.Fatalf("the DOM without the truncation sign: …%q", out.DOM[len(out.DOM)-40:])
 		}
 	})
 
-	t.Run("DOM в лимите — без обрезки и признака", func(t *testing.T) {
+	t.Run("DOM within the limit — no truncation, no sign", func(t *testing.T) {
 		f := &fakeExtractCDP{dom: "<html>ok</html>", domLimit: 1024}
 		out := RenderOutput{FinalURL: "https://example.com/"}
 		if err := f.cdp().extractResult(context.Background(), &out); err != nil {
 			t.Fatalf("extractResult: %v", err)
 		}
 		if out.DOM != f.dom || strings.Contains(out.DOM, "truncated") {
-			t.Fatalf("DOM %q, хочу без изменений", out.DOM)
+			t.Fatalf("DOM %q, want unchanged", out.DOM)
 		}
 	})
 
-	t.Run("без http(s) cookies не запрашиваются", func(t *testing.T) {
+	t.Run("without http(s) cookies are not requested", func(t *testing.T) {
 		for _, final := range []string{"data:text/html,hello", "about:blank"} {
 			f := &fakeExtractCDP{cookies: []*network.Cookie{{Name: "x"}}}
 			out := RenderOutput{FinalURL: final}
@@ -418,15 +418,15 @@ func TestExtractResult(t *testing.T) {
 				t.Fatalf("%s: extractResult: %v", final, err)
 			}
 			if f.cookieSeen {
-				t.Errorf("%s: cookies запрошены для схемы без хранилища", final)
+				t.Errorf("%s: cookies requested for a scheme without a store", final)
 			}
 			if out.Cookies != nil {
-				t.Errorf("%s: cookies %+v, хочу nil", final, out.Cookies)
+				t.Errorf("%s: cookies %+v, want nil", final, out.Cookies)
 			}
 		}
 	})
 
-	t.Run("http-схема — cookies запрашиваются", func(t *testing.T) {
+	t.Run("the http scheme — cookies are requested", func(t *testing.T) {
 		// Both allowed schemes lead into the cookie store: not https only.
 		f := &fakeExtractCDP{cookies: []*network.Cookie{{Name: "h", Value: "1"}}}
 		out := RenderOutput{FinalURL: "http://example.com/page"}
@@ -434,7 +434,7 @@ func TestExtractResult(t *testing.T) {
 			t.Fatalf("extractResult: %v", err)
 		}
 		if !f.cookieSeen {
-			t.Fatal("cookies не запрошены для http-схемы")
+			t.Fatal("cookies were not requested for the http scheme")
 		}
 		if len(out.Cookies) != 1 || out.Cookies[0] != (ExtractCookie{Name: "h", Value: "1"}) {
 			t.Fatalf("cookies %+v", out.Cookies)

@@ -202,7 +202,7 @@ func newFakeCDPContext(t *testing.T) (context.Context, *fakeCDP) {
 		cancelAlloc()
 	})
 	if err := chromedp.Do(tctx); err != nil {
-		t.Fatalf("bootstrap chromedp-контекста поверх фейка: %v", err)
+		t.Fatalf("bootstrapping the chromedp context over the fake: %v", err)
 	}
 	return tctx, tr
 }

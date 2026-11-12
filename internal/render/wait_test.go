@@ -108,7 +108,7 @@ func waitDone(t *testing.T, done <-chan waitResult) waitResult {
 	case r := <-done:
 		return r
 	case <-time.After(5 * time.Second):
-		t.Fatal("waitLoop не завершился")
+		t.Fatal("waitLoop did not finish")
 		return waitResult{}
 	}
 }
@@ -124,7 +124,7 @@ func waitPhase2(t *testing.T, clock *fakeWaitClock) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("фаза затишья не началась: таймеров %d, хочу 3", clock.nTimers())
+	t.Fatalf("the quiet phase did not start: %d timers, want 3", clock.nTimers())
 }
 
 // waitResets waits until the quiet window is reset n times.
@@ -137,7 +137,7 @@ func waitResets(t *testing.T, clock *fakeWaitClock, quiet time.Duration, n int32
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("окно затишья не сброшено %d раз", n)
+	t.Fatalf("the quiet window was not reset %d times", n)
 }
 
 // waitTimerByDur waits for the creation of the phase timer with the
@@ -151,7 +151,7 @@ func waitTimerByDur(t *testing.T, clock *fakeWaitClock, d time.Duration) *fakeWa
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("таймер фазы %s не создан", d)
+	t.Fatalf("the %s phase timer was not created", d)
 	return nil
 }
 
@@ -159,7 +159,7 @@ func TestDefaultWaitPlan(t *testing.T) {
 	got := DefaultWaitPlan(25 * time.Second)
 	want := WaitPlan{Load: 12500 * time.Millisecond, Quiet: 2 * time.Second, Settle: 5 * time.Second}
 	if got != want {
-		t.Fatalf("DefaultWaitPlan(25s) = %+v, хочу %+v", got, want)
+		t.Fatalf("DefaultWaitPlan(25s) = %+v, want %+v", got, want)
 	}
 	// The caps are shares of the budget; the quiet window is the
 	// request-rate constant but at most half of the phase cap
@@ -167,22 +167,22 @@ func TestDefaultWaitPlan(t *testing.T) {
 	got = DefaultWaitPlan(10 * time.Second)
 	want = WaitPlan{Load: 5 * time.Second, Quiet: 1 * time.Second, Settle: 2 * time.Second}
 	if got != want {
-		t.Fatalf("DefaultWaitPlan(10s) = %+v, хочу %+v", got, want)
+		t.Fatalf("DefaultWaitPlan(10s) = %+v, want %+v", got, want)
 	}
 	// A standard budget above the threshold — the window is not
 	// compressed.
 	if q := DefaultWaitPlan(15 * time.Second).Quiet; q != 1500*time.Millisecond {
-		t.Errorf("DefaultWaitPlan(15s).Quiet = %s, хочу 1.5s (половина потолка)", q)
+		t.Errorf("DefaultWaitPlan(15s).Quiet = %s, want 1.5s (half the cap)", q)
 	}
 	// A degenerate tiny budget: the phases are positive, the window is
 	// no longer than half of the cap — the quiet confirmation remains
 	// possible.
 	got = DefaultWaitPlan(time.Second)
 	if got.Load <= 0 || got.Quiet <= 0 || got.Settle <= 0 {
-		t.Fatalf("DefaultWaitPlan(1s) с неположительными фазами: %+v", got)
+		t.Fatalf("DefaultWaitPlan(1s) with non-positive phases: %+v", got)
 	}
 	if got.Quiet > got.Settle/2 {
-		t.Fatalf("DefaultWaitPlan(1s): окно %s > половины потолка %s", got.Quiet, got.Settle/2)
+		t.Fatalf("DefaultWaitPlan(1s): the window %s > half the cap %s", got.Quiet, got.Settle/2)
 	}
 }
 
@@ -203,16 +203,16 @@ func TestWaitLoopLoadThenQuiet(t *testing.T) {
 		t.Fatalf("waitLoop: %v", r.err)
 	}
 	if !r.out.LoadFired || !r.out.Quiet {
-		t.Fatalf("исход %+v, хочу {LoadFired:true Quiet:true}", r.out)
+		t.Fatalf("the outcome %+v, want {LoadFired:true Quiet:true}", r.out)
 	}
 	if q := clock.byDur(plan.Quiet); q.resets.Load() != 0 {
-		t.Errorf("окно сброшено %d раз, хочу 0 (запросов не было)", q.resets.Load())
+		t.Errorf("the window was reset %d times, want 0 (there were no requests)", q.resets.Load())
 	}
 	if c := clock.byDur(plan.Load); !c.stopped.Load() {
-		t.Error("потолок фазы загрузки не остановлен после события load")
+		t.Error("the load phase cap was not stopped after the load event")
 	}
 	if c := clock.byDur(plan.Settle); !c.stopped.Load() {
-		t.Error("потолок фазы затишья не остановлен при подтверждении окна")
+		t.Error("the quiet phase cap was not stopped on the window confirmation")
 	}
 }
 
@@ -234,7 +234,7 @@ func TestWaitLoopLoadCapProceeds(t *testing.T) {
 		t.Fatalf("waitLoop: %v", r.err)
 	}
 	if !r.out.Quiet {
-		t.Fatalf("исход %+v: окно затишья выдержано, Quiet должен быть true", r.out)
+		t.Fatalf("the outcome %+v: the quiet window held out, Quiet must be true", r.out)
 	}
 }
 
@@ -260,10 +260,10 @@ func TestWaitLoopRequestsMoveWindow(t *testing.T) {
 		t.Fatalf("waitLoop: %v", r.err)
 	}
 	if !r.out.Quiet {
-		t.Fatalf("исход %+v: окно выдержано, Quiet должен быть true", r.out)
+		t.Fatalf("the outcome %+v: the window held out, Quiet must be true", r.out)
 	}
 	if q := clock.byDur(plan.Quiet); q.resets.Load() != 2 {
-		t.Errorf("сбросов окна %d, хочу 2", q.resets.Load())
+		t.Errorf("window resets %d, want 2", q.resets.Load())
 	}
 }
 
@@ -283,13 +283,13 @@ func TestWaitLoopSettleCap(t *testing.T) {
 	clock.byDur(plan.Settle).fire()
 	r := waitDone(t, done)
 	if r.err != nil {
-		t.Fatalf("waitLoop: %v (потолок затишья — не ошибка)", r.err)
+		t.Fatalf("waitLoop: %v (the quiet cap is not an error)", r.err)
 	}
 	if r.out.Quiet {
-		t.Fatalf("исход %+v: сеть не затихла, Quiet должен быть false", r.out)
+		t.Fatalf("the outcome %+v: the network did not quiet down, Quiet must be false", r.out)
 	}
 	if q := clock.byDur(plan.Quiet); !q.stopped.Load() {
-		t.Error("окно затишья не остановлено при обрыве по потолку")
+		t.Error("the quiet window was not stopped on the cap hangup")
 	}
 }
 
@@ -311,7 +311,7 @@ func TestWaitLoopSettleCapBelowWindow(t *testing.T) {
 		t.Fatalf("waitLoop: %v", r.err)
 	}
 	if r.out.Quiet {
-		t.Fatalf("исход %+v: потолок короче окна, Quiet должен быть false", r.out)
+		t.Fatalf("the outcome %+v: the cap is shorter than the window, Quiet must be false", r.out)
 	}
 }
 
@@ -333,18 +333,18 @@ func TestWaitLoopStaleRequestsDrained(t *testing.T) {
 	// the counter would have grown.
 	time.Sleep(50 * time.Millisecond)
 	if q := clock.byDur(plan.Quiet); q != nil && q.resets.Load() != 0 {
-		t.Fatalf("старые сигналы двигают окно: сбросов %d, хочу 0", q.resets.Load())
+		t.Fatalf("old signals move the window: resets %d, want 0", q.resets.Load())
 	}
 
 	clock.byDur(plan.Quiet).fire()
 	r := waitDone(t, done)
 	if r.err != nil || !r.out.Quiet {
-		t.Fatalf("исход %+v, err %v: хочу {Quiet:true} без ошибки", r.out, r.err)
+		t.Fatalf("the outcome %+v, err %v: want {Quiet:true} without an error", r.out, r.err)
 	}
 }
 
 func TestWaitLoopContextCanceled(t *testing.T) {
-	t.Run("фаза загрузки", func(t *testing.T) {
+	t.Run("the load phase", func(t *testing.T) {
 		plan := waitTestPlan()
 		evs := waitEvents{load: make(chan struct{}), reqs: make(chan struct{}, waitReqsBuffer)}
 		clock := &fakeWaitClock{}
@@ -355,14 +355,14 @@ func TestWaitLoopContextCanceled(t *testing.T) {
 
 		r := waitDone(t, done)
 		if !errors.Is(r.err, context.Canceled) {
-			t.Fatalf("ошибка %v, хочу context.Canceled", r.err)
+			t.Fatalf("the error %v, want context.Canceled", r.err)
 		}
 		if r.out.LoadFired || r.out.Quiet {
-			t.Fatalf("исход %+v при отмене, хочу нулевой", r.out)
+			t.Fatalf("the outcome %+v on cancellation, want zero", r.out)
 		}
 	})
 
-	t.Run("фаза затишья", func(t *testing.T) {
+	t.Run("the quiet phase", func(t *testing.T) {
 		plan := waitTestPlan()
 		evs := waitEvents{load: make(chan struct{}), reqs: make(chan struct{}, waitReqsBuffer)}
 		clock := &fakeWaitClock{}
@@ -375,7 +375,7 @@ func TestWaitLoopContextCanceled(t *testing.T) {
 
 		r := waitDone(t, done)
 		if !errors.Is(r.err, context.Canceled) {
-			t.Fatalf("ошибка %v, хочу context.Canceled", r.err)
+			t.Fatalf("the error %v, want context.Canceled", r.err)
 		}
 	})
 }
@@ -393,10 +393,10 @@ func TestWaitLoopOverallDeadline(t *testing.T) {
 	done := startWaitLoop(ctx, plan, evs, clock)
 	r := waitDone(t, done)
 	if !errors.Is(r.err, context.DeadlineExceeded) {
-		t.Fatalf("ошибка %v, хочу context.DeadlineExceeded", r.err)
+		t.Fatalf("the error %v, want context.DeadlineExceeded", r.err)
 	}
 	if r.out.Quiet {
-		t.Fatalf("исход %+v: окно не подтверждено", r.out)
+		t.Fatalf("the outcome %+v: the window was not confirmed", r.out)
 	}
 }
 
@@ -408,7 +408,7 @@ func TestWaitLoopOverallDeadline(t *testing.T) {
 // cancellation and an event decoding error produce neither a load
 // closure nor a false reqs signal.
 func TestWaitSubscribe(t *testing.T) {
-	t.Run("событие загрузки закрывает load однократно", func(t *testing.T) {
+	t.Run("the load event closes load exactly once", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
 		wctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -420,7 +420,7 @@ func TestWaitSubscribe(t *testing.T) {
 		select {
 		case <-evs.load:
 		case <-time.After(2 * time.Second):
-			t.Fatal("событие загрузки не закрыло канал load")
+			t.Fatal("the load event did not close the load channel")
 		}
 		// A repeated event — no repeated-close panic (sync.Once).
 		tr.fireSession("Page.loadEventFired", `{}`)
@@ -430,7 +430,7 @@ func TestWaitSubscribe(t *testing.T) {
 		}
 	})
 
-	t.Run("сетевой запрос сигнализируется в reqs", func(t *testing.T) {
+	t.Run("a network request is signaled into reqs", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
 		wctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -442,22 +442,22 @@ func TestWaitSubscribe(t *testing.T) {
 		select {
 		case <-evs.reqs:
 		case <-time.After(2 * time.Second):
-			t.Fatal("сетевой запрос не сигнализирован в reqs")
+			t.Fatal("a network request was not signaled into reqs")
 		}
 	})
 
-	t.Run("отказ Network.enable — ошибка подписки", func(t *testing.T) {
+	t.Run("a Network.enable refusal — a subscription error", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
-		tr.setError("Network.enable", &cdproto.Error{Code: -32000, Message: "сеть недоступна"})
+		tr.setError("Network.enable", &cdproto.Error{Code: -32000, Message: "the network is unavailable"})
 		wctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		_, err := waitSubscribe(wctx)
-		if err == nil || !strings.Contains(err.Error(), "сеть недоступна") {
-			t.Fatalf("ошибка %v, хочу отказ Network.enable", err)
+		if err == nil || !strings.Contains(err.Error(), "the network is unavailable") {
+			t.Fatalf("the error %v, want a Network.enable refusal", err)
 		}
 	})
 
-	t.Run("отмена контекста тихо останавливает насосы", func(t *testing.T) {
+	t.Run("a context cancellation quietly stops the pumps", func(t *testing.T) {
 		ctx, _ := newFakeCDPContext(t)
 		wctx, cancel := context.WithCancel(ctx)
 		evs, err := waitSubscribe(wctx)
@@ -491,7 +491,7 @@ func TestWaitSubscribe(t *testing.T) {
 		// (measured: 35/40 on a quiet machine), whatever the window.
 		select {
 		case <-evs.load:
-			t.Fatal("отмена контекста закрыла канал load")
+			t.Fatal("the context cancellation closed the load channel")
 		case <-time.After(1 * time.Second):
 		}
 		n := 0
@@ -505,11 +505,11 @@ func TestWaitSubscribe(t *testing.T) {
 			}
 		}
 		if n != 0 {
-			t.Errorf("отмена контекста дала %d ложных сигналов reqs, хочу 0", n)
+			t.Errorf("the context cancellation gave %d false reqs signals, want 0", n)
 		}
 	})
 
-	t.Run("ошибка декодирования события останавливает насосы", func(t *testing.T) {
+	t.Run("an event decoding error stops the pumps", func(t *testing.T) {
 		ctx, tr := newFakeCDPContext(t)
 		wctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -539,7 +539,7 @@ func TestWaitSubscribe(t *testing.T) {
 		tr.fireSession("Network.requestWillBeSent", `[1]`)
 		select {
 		case <-evs.load:
-			t.Fatal("ошибка декодирования закрыла канал load")
+			t.Fatal("the decoding error closed the load channel")
 		case <-time.After(1 * time.Second):
 		}
 		n := 0
@@ -553,7 +553,7 @@ func TestWaitSubscribe(t *testing.T) {
 			}
 		}
 		if n != 0 {
-			t.Errorf("ошибка декодирования дала %d ложных сигналов reqs, хочу 0", n)
+			t.Errorf("the decoding error gave %d false reqs signals, want 0", n)
 		}
 	})
 }
@@ -587,7 +587,7 @@ func TestWaitSubscribeReqsBuffer(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	if len(evs.reqs) < 64 {
-		t.Fatalf("буфер reqs не наполнился: %d сигналов из 64", len(evs.reqs))
+		t.Fatalf("the reqs buffer did not fill up: %d signals of 64", len(evs.reqs))
 	}
 	// …and the last event has been given the same interval as between
 	// the events: at the original its send is merged (the buffer is
@@ -605,7 +605,7 @@ func TestWaitSubscribeReqsBuffer(t *testing.T) {
 		}
 	}
 	if n != 64 {
-		t.Errorf("буфер reqs вместил %d сигналов, хочу ровно 64 (65-й слипнут)", n)
+		t.Errorf("the reqs buffer held %d signals, want exactly 64 (the 65th sleeps)", n)
 	}
 }
 
@@ -613,21 +613,21 @@ func TestWaitSubscribeReqsBuffer(t *testing.T) {
 // countdown (the firing moves to the new deadline), Stop kills an
 // unfired one. Real time — milliseconds, no phase-wait pauses.
 func TestWaitRealTimer(t *testing.T) {
-	t.Run("Reset перезапускает отсчёт", func(t *testing.T) {
+	t.Run("Reset restarts the countdown", func(t *testing.T) {
 		timer := waitRealTimerFactory(10 * time.Second)
 		timer.Reset(10 * time.Millisecond)
 		select {
 		case <-timer.C():
 		case <-time.After(2 * time.Second):
-			t.Fatal("после Reset таймер не сработал по новому сроку")
+			t.Fatal("after Reset the timer did not fire on the new deadline")
 		}
 	})
-	t.Run("Stop гасит несработавший", func(t *testing.T) {
+	t.Run("Stop kills an unfired timer", func(t *testing.T) {
 		timer := waitRealTimerFactory(50 * time.Millisecond)
 		timer.Stop()
 		select {
 		case <-timer.C():
-			t.Fatal("таймер сработал после Stop")
+			t.Fatal("the timer fired after Stop")
 		case <-time.After(300 * time.Millisecond):
 		}
 	})

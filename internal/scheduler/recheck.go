@@ -176,7 +176,7 @@ type RecheckResult struct {
 // rows are no longer selected by the subquery.
 func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckResult, error) {
 	if pool == nil {
-		return RecheckResult{}, errors.New("scheduler: перепроверка доменов: пул не задан")
+		return RecheckResult{}, errors.New("scheduler: domain recheck: pool not set")
 	}
 	o := opts.withDefaults()
 	now := time.Now
@@ -191,7 +191,7 @@ func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckR
 		o.BatchSize,
 	)
 	if err != nil {
-		return RecheckResult{}, fmt.Errorf("scheduler: перепроверка доменов: %w", err)
+		return RecheckResult{}, fmt.Errorf("scheduler: domain recheck: %w", err)
 	}
 	defer rows.Close()
 
@@ -199,12 +199,12 @@ func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckR
 	for rows.Next() {
 		var zoneID int16
 		if err := rows.Scan(&zoneID); err != nil {
-			return RecheckResult{}, fmt.Errorf("scheduler: перепроверка доменов: чтение: %w", err)
+			return RecheckResult{}, fmt.Errorf("scheduler: domain recheck: read: %w", err)
 		}
 		n++
 	}
 	if err := rows.Err(); err != nil {
-		return RecheckResult{}, fmt.Errorf("scheduler: перепроверка доменов: %w", err)
+		return RecheckResult{}, fmt.Errorf("scheduler: domain recheck: %w", err)
 	}
 	return RecheckResult{Domains: n}, nil
 }
@@ -220,14 +220,14 @@ func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckR
 // twice. ctx cancellation — a clean exit with nil (graceful shutdown, spec 3.4).
 func RecheckDaily(ctx context.Context, pool db.DB, opts RecheckOptions) error {
 	if pool == nil {
-		return errors.New("scheduler: перепроверка доменов: пул не задан")
+		return errors.New("scheduler: domain recheck: pool not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("суточная перепроверка доменов",
+	log.Info("daily domain recheck",
 		"schedule", o.Schedule.String(),
 		"interval", o.Interval.String(),
 		"batch", o.BatchSize)
@@ -242,7 +242,7 @@ func RecheckDaily(ctx context.Context, pool db.DB, opts RecheckOptions) error {
 				// Cancellation during a pass is part of the stop, not an alarm;
 				// any other error — a Warn, the next drain will retry.
 				if ctx.Err() == nil {
-					log.Warn("суточный дренаж перепроверки доменов",
+					log.Warn("daily domain recheck drain",
 						"err", err, "translated", total)
 				}
 				return
@@ -250,7 +250,7 @@ func RecheckDaily(ctx context.Context, pool db.DB, opts RecheckOptions) error {
 			total += res.Domains
 			if res.Domains < int64(o.BatchSize) {
 				if total > 0 {
-					log.Info("суточный дренаж перепроверки доменов", "domains", total)
+					log.Info("daily domain recheck drain", "domains", total)
 				}
 				return
 			}

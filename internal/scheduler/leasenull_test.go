@@ -71,31 +71,31 @@ func TestLeaseNullOnceSQL(t *testing.T) {
 	ops := pool.opsSnapshot()
 	want := []string{"begin", "null_select", "null_update", "commit"}
 	if len(ops) != len(want) {
-		t.Fatalf("порядок операций = %v, want %v — пара операторов в одной транзакции", ops, want)
+		t.Fatalf("the operation order = %v, want %v — the statement pair in one transaction", ops, want)
 	}
 	for i := range want {
 		if ops[i] != want[i] {
-			t.Fatalf("порядок операций = %v, want %v", ops, want)
+			t.Fatalf("the operation order = %v, want %v", ops, want)
 		}
 	}
 
 	sel := pool.nullSelectSnapshot()
 	if len(sel) != 1 {
-		t.Fatalf("SELECT-вызовов страховки = %d, want 1", len(sel))
+		t.Fatalf("guard SELECT calls = %d, want 1", len(sel))
 	}
 	if sel[0].sql != wantLeaseNullSelect {
-		t.Errorf("SQL выборки страховки:\n%s\nwant:\n%s", sel[0].sql, wantLeaseNullSelect)
+		t.Errorf("guard selection SQL:\n%s\nwant:\n%s", sel[0].sql, wantLeaseNullSelect)
 	}
 	if len(sel[0].args) != 1 || sel[0].args[0] != 7000 {
-		t.Errorf("аргументы выборки = %v, want [7000] (LIMIT пачки)", sel[0].args)
+		t.Errorf("selection args = %v, want [7000] (the batch LIMIT)", sel[0].args)
 	}
 
 	upd := pool.nullUpdateSnapshot()
 	if len(upd) != 1 {
-		t.Fatalf("UPDATE-вызовов страховки = %d, want 1", len(upd))
+		t.Fatalf("guard UPDATE calls = %d, want 1", len(upd))
 	}
 	if upd[0].sql != wantLeaseNullUpdate {
-		t.Errorf("SQL перевода страховки:\n%s\nwant:\n%s", upd[0].sql, wantLeaseNullUpdate)
+		t.Errorf("guard move SQL:\n%s\nwant:\n%s", upd[0].sql, wantLeaseNullUpdate)
 	}
 	wantUpdArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
@@ -103,12 +103,12 @@ func TestLeaseNullOnceSQL(t *testing.T) {
 		[]int64{1, 2, 3},               // the domains of the selected batch
 	}
 	if !reflect.DeepEqual(upd[0].args, wantUpdArgs) {
-		t.Errorf("аргументы перевода = %v, want %v", upd[0].args, wantUpdArgs)
+		t.Errorf("move args = %v, want %v", upd[0].args, wantUpdArgs)
 	}
 
 	// Counting by RETURNING: 2 of the selected 3 moved (the guard filtered out one).
 	if res.Domains != 2 || res.Selected != 3 {
-		t.Errorf("итог = %+v, want Domains=2 (RETURNING), Selected=3", res)
+		t.Errorf("result = %+v, want Domains=2 (RETURNING), Selected=3", res)
 	}
 }
 
@@ -121,7 +121,7 @@ func TestLeaseNullOnceDefaults(t *testing.T) {
 	}
 	sel := pool.nullSelectSnapshot()
 	if len(sel) != 1 || sel[0].args[0] != DefaultLeaseBatch {
-		t.Fatalf("LIMIT = %v, want дефолт %d", sel[0].args, DefaultLeaseBatch)
+		t.Fatalf("LIMIT = %v, want the default %d", sel[0].args, DefaultLeaseBatch)
 	}
 }
 
@@ -135,11 +135,11 @@ func TestLeaseNullOnceEmpty(t *testing.T) {
 		t.Fatalf("LeaseNullOnce: %v", err)
 	}
 	if res != (LeaseNullResult{}) {
-		t.Errorf("итог = %+v, want нулевой", res)
+		t.Errorf("result = %+v, want zero", res)
 	}
 	ops := pool.opsSnapshot()
 	if len(ops) != 2 || ops[0] != "begin" || ops[1] != "null_select" {
-		t.Errorf("порядок операций = %v, want [begin null_select] — пустая пачка без перевода", ops)
+		t.Errorf("the operation order = %v, want [begin null_select] — an empty batch without a move", ops)
 	}
 }
 
@@ -154,11 +154,11 @@ func TestLeaseNullOnceGuardFiltered(t *testing.T) {
 		t.Fatalf("LeaseNullOnce: %v", err)
 	}
 	if res.Domains != 1 || res.Selected != 5 {
-		t.Fatalf("итог = %+v, want Domains=1 (RETURNING после guard), Selected=5", res)
+		t.Fatalf("result = %+v, want Domains=1 (RETURNING after the guard), Selected=5", res)
 	}
 	upd := pool.nullUpdateSnapshot()
 	if got := len(upd[0].args[1].([]int16)); got != 5 {
-		t.Errorf("unnest-ключей перевода = %d, want 5 — пробивается вся выбранная пачка", got)
+		t.Errorf("move unnest keys = %d, want 5 — the whole selected batch is punched through", got)
 	}
 }
 
@@ -167,13 +167,13 @@ func TestLeaseNullOnceGuardFiltered(t *testing.T) {
 func TestLeaseNullOnceError(t *testing.T) {
 	selectPool := &leaseFakePool{
 		nullBatches:    []leaseNullBatch{leaseNullSeedBatch(2, 2)},
-		nullSelectErrs: []error{errors.New("бд недоступна")},
+		nullSelectErrs: []error{errors.New("db unavailable")},
 	}
 	_, err := LeaseNullOnce(context.Background(), selectPool, LeaseOptions{})
 	if err == nil ||
-		!strings.Contains(err.Error(), "scheduler: страховка queued без queued_at") ||
-		!strings.Contains(err.Error(), "бд недоступна") {
-		t.Errorf("ошибка выборки = %v, want контекст страховки и исходная ошибка", err)
+		!strings.Contains(err.Error(), "scheduler: queued without queued_at guard") ||
+		!strings.Contains(err.Error(), "db unavailable") {
+		t.Errorf("the selection error = %v, want the guard context and the original error", err)
 	}
 
 	updatePool := &leaseFakePool{
@@ -181,7 +181,7 @@ func TestLeaseNullOnceError(t *testing.T) {
 		nullUpdateErrs: []error{context.Canceled},
 	}
 	if _, err := LeaseNullOnce(context.Background(), updatePool, LeaseOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка перевода = %v, want context.Canceled", err)
+		t.Errorf("the move error = %v, want context.Canceled", err)
 	}
 
 	commitPool := &leaseFakePool{
@@ -189,19 +189,19 @@ func TestLeaseNullOnceError(t *testing.T) {
 		commitErrs:  []error{errors.New("connection refused")},
 	}
 	if _, err := LeaseNullOnce(context.Background(), commitPool, LeaseOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "фиксация") {
-		t.Errorf("ошибка Commit = %v, want контекст фиксации", err)
+		!strings.Contains(err.Error(), "commit") {
+		t.Errorf("the Commit error = %v, want the commit context", err)
 	}
 
-	beginPool := &leaseFakePool{beginErr: errors.New("нет соединений")}
+	beginPool := &leaseFakePool{beginErr: errors.New("no connections")}
 	if _, err := LeaseNullOnce(context.Background(), beginPool, LeaseOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "транзакция") {
-		t.Errorf("ошибка Begin = %v, want контекст транзакции", err)
+		!strings.Contains(err.Error(), "transaction") {
+		t.Errorf("the Begin error = %v, want the transaction context", err)
 	}
 
 	if _, err := LeaseNullOnce(context.Background(), nil, LeaseOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+		!strings.Contains(err.Error(), "pool not set") {
+		t.Errorf("err = %v, want \"pool not set\"", err)
 	}
 }
 
@@ -221,20 +221,20 @@ func TestLeaseNullOnceMetrics(t *testing.T) {
 	}
 	second, err := LeaseNullOnce(context.Background(), pool, LeaseOptions{Metrics: reg})
 	if err != nil {
-		t.Fatalf("повторный LeaseNullOnce: %v", err)
+		t.Fatalf("a repeated LeaseNullOnce: %v", err)
 	}
 	if first.Domains != 2 || second.Domains != 0 {
-		t.Fatalf("проходы = %+v, %+v; want Domains 2, 0", first, second)
+		t.Fatalf("passes = %+v, %+v; want Domains 2, 0", first, second)
 	}
 
 	if got := leaseNullReturnedValue(t, reg); got != 2 {
-		t.Errorf("счётчик после проходов = %v, want 2 (по RETURNING, пустой проход не считается)", got)
+		t.Errorf("the counter after the passes = %v, want 2 (by RETURNING, an empty pass does not count)", got)
 	}
 
 	// Without a registry — a no-op; the pass runs.
 	noop := &leaseFakePool{nullBatches: []leaseNullBatch{leaseNullSeedBatch(1, 1)}}
 	if _, err := LeaseNullOnce(context.Background(), noop, LeaseOptions{}); err != nil {
-		t.Fatalf("LeaseNullOnce без метрик: %v", err)
+		t.Fatalf("LeaseNullOnce without metrics: %v", err)
 	}
 }
 
@@ -293,22 +293,22 @@ func TestLeaseWatchNullDrain(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("дренаж страховки не дошёл до второй пачки: selects=%d updates=%d", sel, upd)
+			t.Fatalf("the guard drain did not reach the second batch: selects=%d updates=%d", sel, upd)
 		}
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(20 * time.Millisecond)
 	if got := leaseNullReturnedValue(t, reg); got != float64(DefaultLeaseBatch+2) {
-		t.Errorf("счётчик дренажа = %v, want %d", got, DefaultLeaseBatch+2)
+		t.Errorf("the drain counter = %v, want %d", got, DefaultLeaseBatch+2)
 	}
 	// Both passes — by the single start tick: without a tick there are no new selections.
 	if sel := len(pool.nullSelectSnapshot()); sel != 2 {
-		t.Errorf("SELECT-вызовов страховки = %d, want 2 (неполная пачка останавливает)", sel)
+		t.Errorf("guard SELECT calls = %d, want 2 (an incomplete batch stops)", sel)
 	}
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("LeaseWatch: %v, want nil при отмене ctx", err)
+		t.Fatalf("LeaseWatch: %v, want nil on ctx cancellation", err)
 	}
 }
 
@@ -324,7 +324,7 @@ func TestLeaseWatchNullDrainError(t *testing.T) {
 			leaseNullSeedBatch(2, 2),
 			leaseNullSeedBatch(1, 1),
 		},
-		nullSelectErrs: []error{errors.New("бд недоступна")}, // the first pass fails
+		nullSelectErrs: []error{errors.New("db unavailable")}, // the first pass fails
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -345,24 +345,24 @@ func TestLeaseWatchNullDrainError(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("очередной тик не повторил дренаж страховки: updates=%d", len(pool.nullUpdateSnapshot()))
+			t.Fatalf("the next tick did not repeat the guard drain: updates=%d", len(pool.nullUpdateSnapshot()))
 		}
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(30 * time.Millisecond)
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("LeaseWatch: %v, want nil при отмене ctx", err)
+		t.Fatalf("LeaseWatch: %v, want nil on ctx cancellation", err)
 	}
 
 	log := buf.String()
 	for _, want := range []string{
 		"level=WARN",
-		"бд недоступна",
-		"строки queued без queued_at возвращены", // the drain outcome — a Warn (a signal to the operator)
+		"db unavailable",
+		"queued rows without queued_at returned", // the drain outcome — a Warn (a signal to the operator)
 	} {
 		if !strings.Contains(log, want) {
-			t.Errorf("лог не содержит %q:\n%s", want, log)
+			t.Errorf("log does not contain %q:\n%s", want, log)
 		}
 	}
 }

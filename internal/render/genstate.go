@@ -100,19 +100,19 @@ const (
 func (g genState) String() string {
 	switch g {
 	case genAbsent:
-		return "отсутствует"
+		return "missing"
 	case genStarting:
-		return "стартующий"
+		return "starting"
 	case genActive:
-		return "активный"
+		return "active"
 	case genDraining:
 		return "draining"
 	case genDead:
-		return "мёртв"
+		return "dead"
 	case genClosed:
-		return "закрыт"
+		return "closed"
 	default:
-		return fmt.Sprintf("состояние(%d)", int(g))
+		return fmt.Sprintf("state(%d)", int(g))
 	}
 }
 
@@ -156,11 +156,11 @@ func (m *Manager) genStateLocked() genState {
 func (m *Manager) swapReasonLocked() (string, bool) {
 	switch m.genStateLocked() {
 	case genAbsent:
-		return "первый старт", true
+		return "first start", true
 	case genDead:
-		return "браузер недоступен", true
+		return "browser unavailable", true
 	case genDraining:
-		return "пул закрыт", true
+		return "pool closed", true
 	case genActive:
 		return m.activeSwapReasonLocked()
 	default: // genClosed — not classified here: acquire/Alive/Start
@@ -177,7 +177,7 @@ func (m *Manager) swapReasonLocked() (string, bool) {
 // not read at all. An unknown RSS (remote mode) does not trigger.
 func (m *Manager) activeSwapReasonLocked() (string, bool) {
 	if m.b.NeedsRestart() {
-		return fmt.Sprintf("порог страниц %d (отрендерено %d)",
+		return fmt.Sprintf("page threshold %d (rendered %d)",
 			m.b.opts.RestartEveryPages, m.b.Pages()), true
 	}
 	if m.b.opts.MemoryThreshold > 0 {
@@ -200,7 +200,7 @@ func (m *Manager) activeSwapReasonLocked() (string, bool) {
 		// the SIGSTOP-pinned RSS).
 		// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer, numbers/incrementer
 		if rss := m.b.RSS(); rss > 0 && rss >= m.b.opts.MemoryThreshold {
-			return fmt.Sprintf("порог памяти %d MiB (RSS %d MiB)",
+			return fmt.Sprintf("memory threshold %d MiB (RSS %d MiB)",
 				// Logging (§4 docs/mutation-testing.md): shifts and ±1
 				// of the arguments change only the text of the restart
 				// reason message, not the decision to restart.

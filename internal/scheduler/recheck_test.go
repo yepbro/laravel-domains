@@ -45,11 +45,11 @@ type recheckFakePool struct {
 }
 
 func (p *recheckFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *recheckFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("Exec must not be called")
 }
 
 func (p *recheckFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -131,10 +131,10 @@ func TestRecheckOnceSQL(t *testing.T) {
 
 	calls := pool.calls()
 	if len(calls) != 1 {
-		t.Fatalf("вызовов = %d, want 1: проход — один оператор", len(calls))
+		t.Fatalf("calls = %d, want 1: a pass is one statement", len(calls))
 	}
 	if calls[0].sql != wantRecheckUpdate {
-		t.Errorf("SQL прохода:\n%s\nwant:\n%s", calls[0].sql, wantRecheckUpdate)
+		t.Errorf("pass SQL:\n%s\nwant:\n%s", calls[0].sql, wantRecheckUpdate)
 	}
 	wantArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
@@ -142,10 +142,10 @@ func TestRecheckOnceSQL(t *testing.T) {
 		7000,                           // the batch LIMIT
 	}
 	if !reflect.DeepEqual(calls[0].args, wantArgs) {
-		t.Errorf("аргументы = %v, want %v", calls[0].args, wantArgs)
+		t.Errorf("args = %v, want %v", calls[0].args, wantArgs)
 	}
 	if res.Domains != 42 {
-		t.Errorf("итог = %+v, want Domains=42 (строки внешнего SELECT)", res)
+		t.Errorf("result = %+v, want Domains=42 (the outer SELECT rows)", res)
 	}
 }
 
@@ -162,10 +162,10 @@ func TestRecheckOnceDefaults(t *testing.T) {
 
 	args := pool.calls()[0].args
 	if args[2] != DefaultRecheckBatch {
-		t.Errorf("LIMIT = %v, want дефолт %d", args[2], DefaultRecheckBatch)
+		t.Errorf("LIMIT = %v, want the default %d", args[2], DefaultRecheckBatch)
 	}
 	if got, ok := args[1].(time.Time); !ok || !got.Equal(now.Add(-DefaultRecheckInterval)) {
-		t.Errorf("порог = %v, want %v (now − дефолт %s)", args[1], now.Add(-DefaultRecheckInterval), DefaultRecheckInterval)
+		t.Errorf("the threshold = %v, want %v (now − the default %s)", args[1], now.Add(-DefaultRecheckInterval), DefaultRecheckInterval)
 	}
 }
 
@@ -179,10 +179,10 @@ func TestRecheckOnceEmpty(t *testing.T) {
 		t.Fatalf("RecheckOnce: %v", err)
 	}
 	if res != (RecheckResult{}) {
-		t.Errorf("итог = %+v, want нулевой", res)
+		t.Errorf("result = %+v, want zero", res)
 	}
 	if n := pool.stats(); n != 1 {
-		t.Errorf("операторов = %d, want 1", n)
+		t.Errorf("statements = %d, want 1", n)
 	}
 }
 
@@ -194,46 +194,46 @@ func TestRecheckOnceRepeatPasses(t *testing.T) {
 
 	first, err := RecheckOnce(context.Background(), pool, RecheckOptions{})
 	if err != nil {
-		t.Fatalf("первый проход: %v", err)
+		t.Fatalf("the first pass: %v", err)
 	}
 	second, err := RecheckOnce(context.Background(), pool, RecheckOptions{})
 	if err != nil {
-		t.Fatalf("второй проход: %v", err)
+		t.Fatalf("the second pass: %v", err)
 	}
 	third, err := RecheckOnce(context.Background(), pool, RecheckOptions{})
 	if err != nil {
-		t.Fatalf("третий проход: %v", err)
+		t.Fatalf("the third pass: %v", err)
 	}
 	if first.Domains != 5000 || second.Domains != 3 || third.Domains != 0 {
-		t.Errorf("проходы = %d, %d, %d; want 5000, 3, 0",
+		t.Errorf("passes = %d, %d, %d; want 5000, 3, 0",
 			first.Domains, second.Domains, third.Domains)
 	}
 	if n := pool.stats(); n != 3 {
-		t.Errorf("операторов = %d, want 3 (по одному на проход)", n)
+		t.Errorf("statements = %d, want 3 (one per pass)", n)
 	}
 }
 
 // TestRecheckOnceError — a statement error is wrapped with the task
 // context; ctx cancellation is preserved via errors.Is.
 func TestRecheckOnceError(t *testing.T) {
-	pool := &recheckFakePool{execErrs: []error{errors.New("бд недоступна")}}
+	pool := &recheckFakePool{execErrs: []error{errors.New("db unavailable")}}
 	_, err := RecheckOnce(context.Background(), pool, RecheckOptions{})
 	if err == nil ||
-		!strings.Contains(err.Error(), "scheduler: перепроверка доменов") ||
-		!strings.Contains(err.Error(), "бд недоступна") {
-		t.Errorf("ошибка = %v, want контекст задачи и исходная ошибка", err)
+		!strings.Contains(err.Error(), "scheduler: domain recheck") ||
+		!strings.Contains(err.Error(), "db unavailable") {
+		t.Errorf("err = %v, want the task context and the original error", err)
 	}
 
 	cancelPool := &recheckFakePool{execErrs: []error{context.Canceled}}
 	if _, err := RecheckOnce(context.Background(), cancelPool, RecheckOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка = %v, want context.Canceled", err)
+		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }
 
 func TestRecheckOnceNilPool(t *testing.T) {
 	if _, err := RecheckOnce(context.Background(), nil, RecheckOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+		!strings.Contains(err.Error(), "pool not set") {
+		t.Errorf("err = %v, want \"pool not set\"", err)
 	}
 }
 
@@ -253,13 +253,13 @@ func TestRecheckOptionsDefaults(t *testing.T) {
 	// The defaults are pinned by spec literals (3.3: 6 months; 5.3: batches, a day):
 	// comparing with the very constant does not notice mutations.
 	if DefaultRecheckInterval != 4380*time.Hour {
-		t.Errorf("DefaultRecheckInterval = %v, want 4380ч (≈6 месяцев)", DefaultRecheckInterval)
+		t.Errorf("DefaultRecheckInterval = %v, want 4380h (≈6 months)", DefaultRecheckInterval)
 	}
 	if DefaultRecheckBatch != 5000 {
 		t.Errorf("DefaultRecheckBatch = %d, want 5000", DefaultRecheckBatch)
 	}
 	if DefaultRecheckSchedule != 24*time.Hour {
-		t.Errorf("DefaultRecheckSchedule = %v, want сутки", DefaultRecheckSchedule)
+		t.Errorf("DefaultRecheckSchedule = %v, want a day", DefaultRecheckSchedule)
 	}
 
 	// Zero and negative values — the defaults.
@@ -282,7 +282,7 @@ func TestRecheckOptionsDefaults(t *testing.T) {
 	}.withDefaults()
 	recheckCheckDefaults(t, got, time.Hour, 10, time.Minute)
 	if got.Now == nil || !got.Now().Equal(time.Unix(0, 0)) {
-		t.Errorf("withDefaults затирает Now: nil=%v, значение %v", got.Now == nil, got.Now())
+		t.Errorf("withDefaults overwrites Now: nil=%v, value %v", got.Now == nil, got.Now())
 	}
 }
 
@@ -307,18 +307,18 @@ func TestRecheckDailyImmediateDrain(t *testing.T) {
 	for pool.stats() < 1 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("стартовый дренаж не выполнен")
+			t.Fatal("the initial drain did not run")
 		}
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(20 * time.Millisecond)
 	if n := pool.stats(); n != 1 {
-		t.Errorf("операторов = %d, want 1: без тика повторных дренажей нет", n)
+		t.Errorf("statements = %d, want 1: without a tick there are no repeated drains", n)
 	}
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("RecheckDaily: %v, want nil при отмене ctx", err)
+		t.Fatalf("RecheckDaily: %v, want nil on ctx cancellation", err)
 	}
 }
 
@@ -333,7 +333,7 @@ func TestRecheckDailyLoop(t *testing.T) {
 	// an incomplete one — an Info with the sum. Then — empty sets.
 	pool := &recheckFakePool{
 		tags:     []int64{DefaultRecheckBatch, 3},
-		execErrs: []error{errors.New("бд недоступна")},
+		execErrs: []error{errors.New("db unavailable")},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -350,25 +350,25 @@ func TestRecheckDailyLoop(t *testing.T) {
 	for pool.stats() < 3 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("цикл не дошёл до третьего оператора: %d", pool.stats())
+			t.Fatalf("the loop did not reach the third statement: %d", pool.stats())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
 
 	if err := <-done; err != nil {
-		t.Fatalf("RecheckDaily: %v, want nil при отмене ctx", err)
+		t.Fatalf("RecheckDaily: %v, want nil on ctx cancellation", err)
 	}
 
 	log := buf.String()
 	for _, want := range []string{
-		"суточная перепроверка доменов", // the start
+		"daily domain recheck", // the start
 		"level=WARN", // a drain error did not kill the loop
-		"бд недоступна",
+		"db unavailable",
 		fmt.Sprintf("domains=%d", DefaultRecheckBatch+3), // the drain outcome
 	} {
 		if !strings.Contains(log, want) {
-			t.Errorf("лог не содержит %q:\n%s", want, log)
+			t.Errorf("log does not contain %q:\n%s", want, log)
 		}
 	}
 }
@@ -387,10 +387,10 @@ func TestRecheckDailyCancelDuringDrain(t *testing.T) {
 	go func() { done <- RecheckDaily(ctx, pool, RecheckOptions{Log: logger}) }()
 
 	if err := <-done; err != nil {
-		t.Fatalf("RecheckDaily: %v, want nil при отмене ctx", err)
+		t.Fatalf("RecheckDaily: %v, want nil on ctx cancellation", err)
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("отмена во время дренажа — Warn:\n%s", buf.String())
+		t.Errorf("a cancellation during the drain — Warn:\n%s", buf.String())
 	}
 }
 
@@ -404,8 +404,8 @@ func TestRecheckDailyDrainTotals(t *testing.T) {
 		tags []int64
 		want string // a substring of the drain's Info outcome; "" — the outcome is not logged
 	}{
-		{"неполная пачка из одного", []int64{1}, "domains=1"},
-		{"нулевой дренаж", []int64{0}, ""},
+		{"an incomplete batch of one", []int64{1}, "domains=1"},
+		{"a zero drain", []int64{0}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -423,11 +423,11 @@ func TestRecheckDailyDrainTotals(t *testing.T) {
 			}
 			log := buf.String()
 			if tt.want == "" {
-				if strings.Contains(log, "суточный дренаж перепроверки доменов") {
-					t.Errorf("нулевой дренаж подводит итог:\n%s", log)
+				if strings.Contains(log, "daily domain recheck drain") {
+					t.Errorf("a zero drain summarizes:\n%s", log)
 				}
 			} else if !strings.Contains(log, tt.want) {
-				t.Errorf("лог не содержит %q:\n%s", tt.want, log)
+				t.Errorf("log does not contain %q:\n%s", tt.want, log)
 			}
 		})
 	}
@@ -435,7 +435,7 @@ func TestRecheckDailyDrainTotals(t *testing.T) {
 
 func TestRecheckDailyNilPool(t *testing.T) {
 	err := RecheckDaily(context.Background(), nil, RecheckOptions{})
-	if err == nil || !strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+	if err == nil || !strings.Contains(err.Error(), "pool not set") {
+		t.Errorf("err = %v, want \"pool not set\"", err)
 	}
 }

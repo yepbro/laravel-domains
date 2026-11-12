@@ -54,7 +54,7 @@ func managerFor(t *testing.T, opts Options, browsers ...*Browser) (*Manager, *at
 	m.newBrowser = func(context.Context, Options) (*Browser, error) {
 		i := int(calls.Add(1)) - 1
 		if i >= len(browsers) {
-			return nil, &Error{Class: ClassBrowser, Err: errors.New("нет очередного браузера")}
+			return nil, &Error{Class: ClassBrowser, Err: errors.New("no browser is due")}
 		}
 		return browsers[i], nil
 	}
@@ -86,18 +86,18 @@ func TestManagerRunStartsBrowserOnce(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 		if out.FinalURL != "https://a.example/" {
-			t.Fatalf("результат %+v", out)
+			t.Fatalf("result %+v", out)
 		}
 	}
 	if got := calls.Load(); got != 1 {
-		t.Errorf("стартов браузера %d, хочу 1 (один браузер переиспользуется)", got)
+		t.Errorf("browser starts %d, want 1 (one browser is reused)", got)
 	}
 	if got := m.Restarts(); got != 0 {
-		t.Errorf("перезапусков %d, хочу 0", got)
+		t.Errorf("restarts %d, want 0", got)
 	}
 	m.Close()
 	if m.Browser() != nil {
-		t.Error("после Close браузера быть не должно")
+		t.Error("after Close there must be no browser")
 	}
 }
 
@@ -108,26 +108,26 @@ func TestManagerStart(t *testing.T) {
 	b, _ := liveBrowser(1)
 	m, calls, _ := managerFor(t, managerOpts(), b)
 	if m.Browser() != nil {
-		t.Fatal("до Start поколения нет")
+		t.Fatal("before Start there is no generation")
 	}
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("стартов %d, хочу 1", got)
+		t.Fatalf("starts %d, want 1", got)
 	}
 	if m.Browser() != b {
-		t.Fatal("Start не поднял поколение")
+		t.Fatal("Start did not bring up a generation")
 	}
 	if err := m.Start(); err != nil {
-		t.Fatalf("повторный Start: %v", err)
+		t.Fatalf("a repeated Start: %v", err)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Errorf("стартов %d, хочу 1 (живое поколение не трогается)", got)
+		t.Errorf("starts %d, want 1 (a live generation is not touched)", got)
 	}
 	m.Close()
 	if err := m.Start(); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Start после Close: %v, хочу ErrClosed", err)
+		t.Fatalf("Start after Close: %v, want ErrClosed", err)
 	}
 }
 
@@ -140,39 +140,39 @@ func TestManagerAlive(t *testing.T) {
 	b2, _ := liveBrowser(1)
 	m, calls, _ := managerFor(t, managerOpts(), b1, b2)
 	if !m.Alive() {
-		t.Fatal("до старта зонд сам поднимает первое поколение (true)")
+		t.Fatal("before the start the probe brings up the first generation itself (true)")
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("стартов %d, хочу 1 (зонд стартовал первое поколение)", got)
+		t.Fatalf("starts %d, want 1 (the probe started the first generation)", got)
 	}
 	for range 2 {
 		if !m.Alive() {
-			t.Fatal("живое поколение: Alive = true")
+			t.Fatal("a live generation: Alive = true")
 		}
 	}
 	if got := calls.Load(); got != 1 {
-		t.Errorf("стартов %d, хочу 1 (живое поколение не перезапускается)", got)
+		t.Errorf("starts %d, want 1 (a live generation is not restarted)", got)
 	}
 
 	cancel1() // the host restarted Chromium: the connection is lost forever
 	if !m.Alive() {
-		t.Fatal("зонд обязан заменить мёртвое поколение (true)")
+		t.Fatal("the probe must swap the dead generation (true)")
 	}
 	if got := calls.Load(); got != 2 {
-		t.Fatalf("стартов %d, хочу 2 (мертвое поколение заменено зондаом)", got)
+		t.Fatalf("starts %d, want 2 (the dead generation swapped by the probe)", got)
 	}
 	if !m.Browser().Alive() {
-		t.Error("новое поколение живо")
+		t.Error("the new generation is alive")
 	}
 
 	// The first generation's pool is closed by the background Close:
 	// tasks do not go into it.
 	if !m.Alive() {
-		t.Error("после замены зонд видит живое поколение")
+		t.Error("after the swap the probe sees a live generation")
 	}
 	m.Close()
 	if m.Alive() {
-		t.Error("после Close зонд false")
+		t.Error("after Close the probe is false")
 	}
 }
 
@@ -193,20 +193,20 @@ func TestManagerRestartOnPagesThreshold(t *testing.T) {
 	}
 
 	if got := calls.Load(); got != 2 {
-		t.Fatalf("стартов %d, хочу 2 (смена поколения по порогу страниц)", got)
+		t.Fatalf("starts %d, want 2 (a generation swap by the page threshold)", got)
 	}
 	if got := m.Restarts(); got != 1 {
-		t.Errorf("перезапусков %d, хочу 1", got)
+		t.Errorf("restarts %d, want 1", got)
 	}
 	// The new generation's page counter from zero: the threshold is not
 	// reached again.
 	if got := m.Browser().Pages(); got != 1 {
-		t.Errorf("страниц нового поколения %d, хочу 1", got)
+		t.Errorf("the new generation's pages %d, want 1", got)
 	}
 	// The old pool is closed: new tasks do not go into it.
 	_, err := (*pools)[0].Run(context.Background(), RenderTask{URL: "u"})
 	if !errors.Is(err, ErrClosed) {
-		t.Errorf("ошибка старого пула %v, хочу ErrClosed", err)
+		t.Errorf("the old pool's error %v, want ErrClosed", err)
 	}
 }
 
@@ -214,7 +214,7 @@ func TestManagerRestartOnMemoryThreshold(t *testing.T) {
 	b1, _ := liveBrowser(1)
 	b1.rootPID = os.Getpid()
 	if b1.RSS() <= 0 {
-		t.Skip("RSS недоступен (нет /proc)")
+		t.Skip("RSS unavailable (no /proc)")
 	}
 	b1.opts.MemoryThreshold = 1 // byte: any live memory — over
 	b2, _ := liveBrowser(1)     // threshold 0: the control is off, no restart
@@ -228,10 +228,10 @@ func TestManagerRestartOnMemoryThreshold(t *testing.T) {
 		t.Fatalf("Run 2: %v", err)
 	}
 	if got := calls.Load(); got != 2 {
-		t.Fatalf("стартов %d, хочу 2 (смена поколения по порогу памяти)", got)
+		t.Fatalf("starts %d, want 2 (a generation swap by the memory threshold)", got)
 	}
 	if got := m.Restarts(); got != 1 {
-		t.Errorf("перезапусков %d, хочу 1", got)
+		t.Errorf("restarts %d, want 1", got)
 	}
 }
 
@@ -255,10 +255,10 @@ func TestManagerRestartOnDeadBrowserBeforeTask(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("стартов %d, хочу 1 (мертвое поколение заменено)", got)
+		t.Fatalf("starts %d, want 1 (the dead generation swapped)", got)
 	}
 	if got := m.Restarts(); got != 1 {
-		t.Errorf("перезапусков %d, хочу 1", got)
+		t.Errorf("restarts %d, want 1", got)
 	}
 }
 
@@ -287,16 +287,16 @@ func TestManagerRetryAfterBrowserDeathInTask(t *testing.T) {
 
 	out, err := m.Run(context.Background(), RenderTask{URL: "https://a.example/"})
 	if err != nil {
-		t.Fatalf("повтор после смерти браузера не вылечил: %v", err)
+		t.Fatalf("the retry after the browser's death did not heal: %v", err)
 	}
 	if out.Title != "ok" {
-		t.Fatalf("результат %+v", out)
+		t.Fatalf("result %+v", out)
 	}
 	if got := calls.Load(); got != 2 {
-		t.Errorf("стартов %d, хочу 2", got)
+		t.Errorf("starts %d, want 2", got)
 	}
 	if got := m.Restarts(); got != 1 {
-		t.Errorf("перезапусков %d, хочу 1", got)
+		t.Errorf("restarts %d, want 1", got)
 	}
 }
 
@@ -324,17 +324,17 @@ func TestManagerBoundedRestarts(t *testing.T) {
 
 	_, err := m.Run(context.Background(), RenderTask{URL: "u"})
 	if ClassOf(err) != ClassBrowser {
-		t.Fatalf("класс %v (%v), хочу browser", ClassOf(err), err)
+		t.Fatalf("the class %v (%v), want browser", ClassOf(err), err)
 	}
 	// The literal pin (the ±1 mutants of the constant): an attempt +
 	// exactly 2 restarts. Comparing the attempts with
 	// 1+maxRestartsPerTask would mask the mutation — the expectation
 	// would change along with the constant.
 	if maxRestartsPerTask != 2 {
-		t.Fatalf("maxRestartsPerTask = %d, хочу 2", maxRestartsPerTask)
+		t.Fatalf("maxRestartsPerTask = %d, want 2", maxRestartsPerTask)
 	}
 	if got := sessions.Load(); got != 1+maxRestartsPerTask {
-		t.Errorf("попыток %d, хочу %d (попытка + перезапуски)", got, 1+maxRestartsPerTask)
+		t.Errorf("attempts %d, want %d (the attempt + restarts)", got, 1+maxRestartsPerTask)
 	}
 }
 
@@ -348,7 +348,7 @@ func TestManagerBoundedRestarts(t *testing.T) {
 // their own tests — only the relation here).
 func TestRestartBudgetCoversProbeSeries(t *testing.T) {
 	if maxRestartsPerTask < probeFailThreshold {
-		t.Fatalf("maxRestartsPerTask=%d < probeFailThreshold=%d: серия неудач зонда съедает бюджет повторов — восстановление T-218 не укладывается в один Manager.Run",
+		t.Fatalf("maxRestartsPerTask=%d < probeFailThreshold=%d: a series of probe failures eats the retry budget — the T-218 recovery does not fit into one Manager.Run",
 			maxRestartsPerTask, probeFailThreshold)
 	}
 }
@@ -359,7 +359,7 @@ func TestManagerStartFailure(t *testing.T) {
 	fail.Store(true)
 	m.newBrowser = func(context.Context, Options) (*Browser, error) {
 		if fail.Load() {
-			return nil, &Error{Class: ClassBrowser, Err: errors.New("нет бинарка")}
+			return nil, &Error{Class: ClassBrowser, Err: errors.New("no binary")}
 		}
 		b, _ := liveBrowser(1)
 		return b, nil
@@ -368,12 +368,12 @@ func TestManagerStartFailure(t *testing.T) {
 
 	_, err := m.Run(context.Background(), RenderTask{URL: "u"})
 	if ClassOf(err) != ClassBrowser {
-		t.Fatalf("ошибка старта: класс %v (%v), хочу browser", ClassOf(err), err)
+		t.Fatalf("the start error: the class %v (%v), want browser", ClassOf(err), err)
 	}
 	// The start is not postponed: the next task tries again.
 	fail.Store(false)
 	if _, err := m.Run(context.Background(), RenderTask{URL: "u"}); err != nil {
-		t.Fatalf("Run после починки: %v", err)
+		t.Fatalf("Run after the fix: %v", err)
 	}
 }
 
@@ -384,10 +384,10 @@ func TestManagerClosed(t *testing.T) {
 
 	_, err := m.Run(context.Background(), RenderTask{URL: "u"})
 	if !errors.Is(err, ErrClosed) || ClassOf(err) != ClassTask {
-		t.Fatalf("ошибка %v (%v), хочу ErrClosed класса task", err, ClassOf(err))
+		t.Fatalf("the error %v (%v), want an ErrClosed of the task class", err, ClassOf(err))
 	}
 	if got := calls.Load(); got != 0 {
-		t.Errorf("стартов после Close: %d", got)
+		t.Errorf("starts after Close: %d", got)
 	}
 	m.Close() // a repeated call is harmless
 	// And it does not wedge the manager: the mutex is released, tasks
@@ -402,13 +402,13 @@ func TestManagerClosed(t *testing.T) {
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, ErrClosed) {
-			t.Fatalf("ошибка после повторного Close: %v, хочу ErrClosed", err)
+			t.Fatalf("the error after a repeated Close: %v, want ErrClosed", err)
 		}
 		if ClassOf(err) != ClassTask {
-			t.Errorf("класс %v, хочу task", ClassOf(err))
+			t.Errorf("the class %v, want task", ClassOf(err))
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Run завис после повторного Close: мьютекс не освобождён")
+		t.Fatal("Run hung after a repeated Close: the mutex is not released")
 	}
 }
 
@@ -435,16 +435,16 @@ func TestManagerRunRetryOnClosedPool(t *testing.T) {
 
 	out, err := m.Run(context.Background(), RenderTask{URL: "https://a.example/"})
 	if err != nil {
-		t.Fatalf("Run после закрытия поколения: %v", err)
+		t.Fatalf("Run after the generation is closed: %v", err)
 	}
 	if out.Title != "ok" {
-		t.Fatalf("результат %+v", out)
+		t.Fatalf("result %+v", out)
 	}
 	if got := poolCalls.Load(); got != 2 {
-		t.Errorf("поколений %d, хочу 2 (закрытое заменено)", got)
+		t.Errorf("generations %d, want 2 (the closed one swapped)", got)
 	}
 	if got := m.Restarts(); got != 1 {
-		t.Errorf("перезапусков %d, хочу 1", got)
+		t.Errorf("restarts %d, want 1", got)
 	}
 }
 
@@ -479,18 +479,18 @@ func TestManagerCloseWaitsInflight(t *testing.T) {
 	}()
 	select {
 	case <-closed:
-		t.Fatal("Close не дождался задачи в полёте")
+		t.Fatal("Close did not wait out the in-flight task")
 	case <-time.After(100 * time.Millisecond):
 	}
 
 	close(release)
 	if err := <-runDone; err != nil {
-		t.Fatalf("задача в полёте: %v", err)
+		t.Fatalf("the in-flight task: %v", err)
 	}
 	select {
 	case <-closed:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Close не завершился после задач")
+		t.Fatal("Close did not finish after the tasks")
 	}
 }
 
@@ -529,7 +529,7 @@ func TestManagerCloseRejectsTasksWhileDraining(t *testing.T) {
 	// holds it.
 	select {
 	case <-closed:
-		t.Fatal("Close не должен завершиться до конца задач поколения")
+		t.Fatal("Close must not finish before the generation's tasks end")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -541,20 +541,20 @@ func TestManagerCloseRejectsTasksWhileDraining(t *testing.T) {
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, ErrClosed) {
-			t.Fatalf("ошибка %v, хочу ErrClosed сразу, без ожидания дрена", err)
+			t.Fatalf("the error %v, want ErrClosed immediately, without waiting for the drain", err)
 		}
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("новая задача блокируется на дрена Close (мьютекс удерживается?)")
+		t.Fatal("a new task blocks on the Close drain (is the mutex held?)")
 	}
 
 	close(release)
 	if err := <-runDone; err != nil {
-		t.Fatalf("задача в полёте: %v", err)
+		t.Fatalf("the in-flight task: %v", err)
 	}
 	select {
 	case <-closed:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Close не завершился после задач")
+		t.Fatal("Close did not finish after the tasks")
 	}
 }
 
@@ -593,12 +593,12 @@ func TestManagerParallelStress(t *testing.T) {
 		t.Errorf("Run: %v", err)
 	}
 	if got := m.Restarts(); got == 0 {
-		t.Error("перезапусков не было при пороге 1 страница")
+		t.Error("no restarts at the threshold of 1 page")
 	}
 	// Every start after the first is a restart: the generation swap
 	// invariant.
 	if got, want := calls.Load(), int32(m.Restarts())+1; got != want {
-		t.Errorf("стартов %d, хочу перезапусков+1 = %d", got, want)
+		t.Errorf("starts %d, want restarts+1 = %d", got, want)
 	}
 	m.Close()
 }
@@ -628,7 +628,7 @@ func TestManagerDefaultFactories(t *testing.T) {
 		err := m.Start()
 		var e *Error
 		if !errors.As(err, &e) || e.Class != ClassBrowser {
-			t.Fatalf("хочу ошибку класса browser от StartBrowser, получено: %v", err)
+			t.Fatalf("want a browser class error from StartBrowser, got: %v", err)
 		}
 		m.Close()
 	})
@@ -647,7 +647,7 @@ func TestManagerDefaultFactories(t *testing.T) {
 			t.Fatalf("Start: %v", err)
 		}
 		if m.Browser() != b {
-			t.Fatal("Start не поднял поколение с настоящим NewPool")
+			t.Fatal("Start did not bring up a generation with the real NewPool")
 		}
 		m.Close()
 	})
@@ -690,7 +690,7 @@ func TestManagerRunReturnsBrowserErrorAfterClose(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for m.Browser() != nil {
 		if time.Now().After(deadline) {
-			t.Fatal("Close не вошёл в критическую секцию")
+			t.Fatal("Close did not enter the critical section")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -698,12 +698,12 @@ func TestManagerRunReturnsBrowserErrorAfterClose(t *testing.T) {
 
 	err := <-runDone
 	if ClassOf(err) != ClassBrowser {
-		t.Fatalf("класс %v (%v), хочу browser: ошибка задачи не подменяется ErrClosed", ClassOf(err), err)
+		t.Fatalf("the class %v (%v), want browser: the task error is not replaced by ErrClosed", ClassOf(err), err)
 	}
 	select {
 	case <-closed:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Close не завершился после задачи")
+		t.Fatal("Close did not finish after the task")
 	}
 }
 
@@ -713,7 +713,7 @@ func TestManagerRunNoRetryOnTaskError(t *testing.T) {
 	// queue level, T-066).
 	b, _ := liveBrowser(1)
 	m := NewManager(context.Background(), managerOpts())
-	boom := &Error{Class: ClassTask, Err: errors.New("страница не загрузилась")}
+	boom := &Error{Class: ClassTask, Err: errors.New("the page did not load")}
 	var runs atomic.Int32
 	m.newBrowser = func(context.Context, Options) (*Browser, error) { return b, nil }
 	m.newPool = func(b *Browser) *Pool {
@@ -725,13 +725,13 @@ func TestManagerRunNoRetryOnTaskError(t *testing.T) {
 
 	_, err := m.Run(context.Background(), RenderTask{URL: "u"})
 	if !errors.Is(err, boom) {
-		t.Fatalf("ошибка %v, хочу исходную ошибку страницы", err)
+		t.Fatalf("the error %v, want the original page error", err)
 	}
 	if got := runs.Load(); got != 1 {
-		t.Errorf("выполнений задачи %d, хочу 1 (ошибка страницы — без повторов менеджера)", got)
+		t.Errorf("task runs %d, want 1 (a page error — no manager retries)", got)
 	}
 	if got := m.Restarts(); got != 0 {
-		t.Errorf("перезапусков %d, хочу 0", got)
+		t.Errorf("restarts %d, want 0", got)
 	}
 }
 
@@ -750,14 +750,14 @@ func TestManagerAliveAfterCloseNoRestart(t *testing.T) {
 	m.newPool = func(b *Browser) *Pool { return poolOver(b, nil) }
 
 	if !m.Alive() {
-		t.Fatal("зонд поднял первое поколение (true)")
+		t.Fatal("the probe brought up the first generation (true)")
 	}
 	m.Close()
 	if m.Alive() {
-		t.Error("после Close зонд false")
+		t.Error("after Close the probe is false")
 	}
 	if got := calls.Load(); got != 1 {
-		t.Errorf("стартов %d, хочу 1 (закрытый менеджер не поднимает поколения)", got)
+		t.Errorf("starts %d, want 1 (a closed manager does not bring up generations)", got)
 	}
 }
 
@@ -783,7 +783,7 @@ func TestManagerAcquireSwapsMissingPool(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Errorf("стартов %d, хочу 1 (поколение без пула заменено)", got)
+		t.Errorf("starts %d, want 1 (a generation without a pool swapped)", got)
 	}
 }
 
@@ -797,7 +797,7 @@ func TestManagerMemoryRestartBoundaries(t *testing.T) {
 	probe, _ := liveBrowser(1)
 	probe.rootPID = os.Getpid()
 	if probe.RSS() <= 0 {
-		t.Skip("RSS недоступен (нет /proc)")
+		t.Skip("RSS unavailable (no /proc)")
 	}
 	above := probe.RSS() + 1<<30 // clearly above the live tree's RSS
 	newCase := func(t *testing.T, threshold int64) {
@@ -814,14 +814,14 @@ func TestManagerMemoryRestartBoundaries(t *testing.T) {
 			}
 		}
 		if got := calls.Load(); got != 1 {
-			t.Errorf("стартов %d, хочу 1 (порог %d не триггерует перезапуск)", got, threshold)
+			t.Errorf("starts %d, want 1 (the threshold %d does not trigger a restart)", got, threshold)
 		}
 		if got := m.Restarts(); got != 0 {
-			t.Errorf("перезапусков %d, хочу 0", got)
+			t.Errorf("restarts %d, want 0", got)
 		}
 	}
-	t.Run("нулевой порог — контроль отключён", func(t *testing.T) { newCase(t, 0) })
-	t.Run("порог выше живого RSS", func(t *testing.T) { newCase(t, above) })
+	t.Run("a zero threshold — the control is off", func(t *testing.T) { newCase(t, 0) })
+	t.Run("the threshold is above the live RSS", func(t *testing.T) { newCase(t, above) })
 }
 
 func TestManagerRestartFailureDetachesGeneration(t *testing.T) {
@@ -835,18 +835,18 @@ func TestManagerRestartFailureDetachesGeneration(t *testing.T) {
 		t.Fatalf("Run 1: %v", err)
 	}
 	if m.Browser() != b1 {
-		t.Fatal("живое поколение не закреплено")
+		t.Fatal("the live generation is not pinned")
 	}
 	cancel1() // the generation's browser died
 	_, err := m.Run(context.Background(), RenderTask{URL: "u2"})
 	if ClassOf(err) != ClassBrowser {
-		t.Fatalf("ошибка перезапуска: класс %v (%v), хочу browser", ClassOf(err), err)
+		t.Fatalf("the restart error: the class %v (%v), want browser", ClassOf(err), err)
 	}
 	if got := calls.Load(); got != 2 {
-		t.Fatalf("стартов %d, хочу 2", got)
+		t.Fatalf("starts %d, want 2", got)
 	}
 	if m.Browser() != nil {
-		t.Error("после неудачного перезапуска поколение откреплено (Browser nil)")
+		t.Error("after a failed restart the generation is unpinned (Browser nil)")
 	}
 }
 
@@ -875,13 +875,13 @@ func TestManagerRestartClosesOldGeneration(t *testing.T) {
 		}
 		_, err := m.Run(context.Background(), RenderTask{URL: "u2"}) // the page threshold
 		if restartFails && ClassOf(err) != ClassBrowser {
-			t.Fatalf("Run 2: %v, хочу ошибку класса browser", err)
+			t.Fatalf("Run 2: %v, want a browser class error", err)
 		}
 		if !restartFails && err != nil {
 			t.Fatalf("Run 2: %v", err)
 		}
 		if got := calls.Load(); got != 2 {
-			t.Fatalf("стартов %d, хочу 2", got)
+			t.Fatalf("starts %d, want 2", got)
 		}
 		// The background closure of the old generation — wait for the
 		// cancellation.
@@ -890,9 +890,9 @@ func TestManagerRestartClosesOldGeneration(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 		if b1.Alive() {
-			t.Error("браузер старого поколения не остановлен при смене поколения")
+			t.Error("the old generation's browser was not stopped on the generation swap")
 		}
 	}
-	t.Run("удачная смена", func(t *testing.T) { run(t, false) })
-	t.Run("неудачный старт нового", func(t *testing.T) { run(t, true) })
+	t.Run("a successful swap", func(t *testing.T) { run(t, false) })
+	t.Run("a failed start of the new one", func(t *testing.T) { run(t, true) })
 }

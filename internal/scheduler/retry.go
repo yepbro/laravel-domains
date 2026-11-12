@@ -386,7 +386,7 @@ type retryCandidate struct {
 // at the moment of the write.
 func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResult, error) {
 	if pool == nil {
-		return RetryResult{}, errors.New("scheduler: повторные проверки temp_error: пул не задан")
+		return RetryResult{}, errors.New("scheduler: temp_error rechecks: pool not set")
 	}
 	o := opts.withDefaults()
 
@@ -438,7 +438,7 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 	var res RetryResult
 	met := newRetryMetrics(o.Metrics)
 	if len(requeueZones) > 0 {
-		n, err := retryDecide(ctx, pool, retryRequeueSQL, retryRequeueMatureSQL, "назначение повтора", requeueZones, requeueIDs,
+		n, err := retryDecide(ctx, pool, retryRequeueSQL, retryRequeueMatureSQL, "retry assignment", requeueZones, requeueIDs,
 			int16(model.CheckStatePending), int16(model.StatusTempError), int16(model.CheckStateDone), met)
 		if err != nil {
 			return RetryResult{}, err
@@ -446,7 +446,7 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 		res.Requeued = n
 	}
 	if len(finalZones) > 0 {
-		n, err := retryDecide(ctx, pool, retryFinalizeSQL, "", "итоговый статус", finalZones, finalIDs,
+		n, err := retryDecide(ctx, pool, retryFinalizeSQL, "", "final status", finalZones, finalIDs,
 			int16(model.StatusDelegatedNoAddress), int16(model.StatusTempError), int16(model.CheckStateDone), met)
 		if err != nil {
 			return RetryResult{}, err
@@ -543,7 +543,7 @@ func retryDecideOnce(ctx context.Context, pool RetryDB, sql, matureSQL, kind str
 	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16) (int, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: транзакция решения (%s): %w", kind, err)
+		return 0, fmt.Errorf("scheduler: temp_error rechecks: decision transaction (%s): %w", kind, err)
 	}
 	// The rollback is unconditional: after Commit — a no-op (the T-044 style). The interrupted
 	// half leaves no half-done changes inside itself (spec 3.4).
@@ -559,11 +559,11 @@ func retryDecideOnce(ctx context.Context, pool RetryDB, sql, matureSQL, kind str
 			days[i] = k.day
 		}
 		if _, err := tx.Exec(ctx, matureSQL, days); err != nil {
-			return 0, fmt.Errorf("scheduler: повторные проверки temp_error: %s: декремент корзин зрелости: %w", kind, err)
+			return 0, fmt.Errorf("scheduler: temp_error rechecks: %s: maturity bucket decrement: %w", kind, err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: фиксация решения (%s): %w", kind, err)
+		return 0, fmt.Errorf("scheduler: temp_error rechecks: decision commit (%s): %w", kind, err)
 	}
 	return len(keys), nil
 }
@@ -581,26 +581,26 @@ func retryDecideOnce(ctx context.Context, pool RetryDB, sql, matureSQL, kind str
 func retryCandidates(ctx context.Context, pool RetryDB, limit int, retryAfter time.Duration) ([]retryCandidate, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: транзакция выборки: %w", err)
+		return nil, fmt.Errorf("scheduler: temp_error rechecks: selection transaction: %w", err)
 	}
 	// The rollback is unconditional: after Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, retryPlanNoIndexScanSQL); err != nil {
-		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: закрепление плана: %w", err)
+		return nil, fmt.Errorf("scheduler: temp_error rechecks: plan pinning: %w", err)
 	}
 	if _, err := tx.Exec(ctx, retryPlanNoBitmapScanSQL); err != nil {
-		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: закрепление плана: %w", err)
+		return nil, fmt.Errorf("scheduler: temp_error rechecks: plan pinning: %w", err)
 	}
 	if _, err := tx.Exec(ctx, retryPlanNoIOSQL); err != nil {
-		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: закрепление плана: %w", err)
+		return nil, fmt.Errorf("scheduler: temp_error rechecks: plan pinning: %w", err)
 	}
 
 	cutoff := time.Now().Add(-retryAfter)
 	rows, err := tx.Query(ctx, retrySelectSQL,
 		int16(model.StatusTempError), int16(model.CheckStateDone), cutoff, limit)
 	if err != nil {
-		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: выборка кандидатов: %w", err)
+		return nil, fmt.Errorf("scheduler: temp_error rechecks: candidate selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -608,15 +608,15 @@ func retryCandidates(ctx context.Context, pool RetryDB, limit int, retryAfter ti
 	for rows.Next() {
 		var c retryCandidate
 		if err := rows.Scan(&c.zoneID, &c.id, &c.attempts); err != nil {
-			return nil, fmt.Errorf("scheduler: повторные проверки temp_error: чтение кандидатов: %w", err)
+			return nil, fmt.Errorf("scheduler: temp_error rechecks: candidate read: %w", err)
 		}
 		candidates = append(candidates, c)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: выборка кандидатов: %w", err)
+		return nil, fmt.Errorf("scheduler: temp_error rechecks: candidate selection: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: фиксация выборки: %w", err)
+		return nil, fmt.Errorf("scheduler: temp_error rechecks: selection commit: %w", err)
 	}
 	return candidates, nil
 }
@@ -631,7 +631,7 @@ func retryCandidates(ctx context.Context, pool RetryDB, limit int, retryAfter ti
 func retryMatureCount(ctx context.Context, pool RetryDB) (int64, error) {
 	rows, err := pool.Query(ctx, retryMatureSQL)
 	if err != nil {
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: %w", err)
+		return 0, fmt.Errorf("scheduler: temp_error rechecks: maturity buckets: %w", err)
 	}
 	defer rows.Close()
 	var n int64
@@ -639,15 +639,15 @@ func retryMatureCount(ctx context.Context, pool RetryDB) (int64, error) {
 		// The read failure first: a connection break is not "an empty sum"
 		// (the coalesce in the SQL always answers with a row).
 		if err := rows.Err(); err != nil {
-			return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: %w", err)
+			return 0, fmt.Errorf("scheduler: temp_error rechecks: maturity buckets: %w", err)
 		}
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: пустой ответ агрегата")
+		return 0, fmt.Errorf("scheduler: temp_error rechecks: maturity buckets: empty aggregate response")
 	}
 	if err := rows.Scan(&n); err != nil {
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: чтение: %w", err)
+		return 0, fmt.Errorf("scheduler: temp_error rechecks: maturity buckets: read: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: %w", err)
+		return 0, fmt.Errorf("scheduler: temp_error rechecks: maturity buckets: %w", err)
 	}
 	return n, nil
 }
@@ -674,7 +674,7 @@ func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
 	if err != nil {
 		// The result at err != nil is discarded by the caller (RetryOnce
 		// returns RetryResult{}, err) — there are no equivalent mutants.
-		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
+		return nil, fmt.Errorf("scheduler: temp_error rechecks: %s: %w", kind, err)
 	}
 	defer rows.Close()
 
@@ -691,14 +691,14 @@ func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
 		if scanErr != nil {
 			// The keys at a Scan error are not read by the caller (see above),
 			// the return branch is covered by the test TestRetryOnceRowsErrors.
-			return nil, fmt.Errorf("scheduler: повторные проверки temp_error: %s: чтение ключей: %w", kind, scanErr)
+			return nil, fmt.Errorf("scheduler: temp_error rechecks: %s: key read: %w", kind, scanErr)
 		}
 		keys = append(keys, k)
 	}
 	if err := rows.Err(); err != nil {
 		// The keys at a rows.Err() error are not read by the caller (see above),
 		// the return branch is covered by the test TestRetryOnceRowsErrors.
-		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
+		return nil, fmt.Errorf("scheduler: temp_error rechecks: %s: %w", kind, err)
 	}
 	return keys, nil
 }
@@ -713,14 +713,14 @@ func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
 // the next tick (the loop lives, the pass is idempotent, spec 3.4).
 func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error {
 	if pool == nil {
-		return errors.New("scheduler: повторные проверки temp_error: пул не задан")
+		return errors.New("scheduler: temp_error rechecks: pool not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("фоновые повторные проверки temp_error",
+	log.Info("background temp_error rechecks",
 		"interval", o.Interval.String(), "batch", o.BatchSize,
 		"retry_after", o.RetryAfter.String(), "max_retries", o.MaxRetries)
 
@@ -749,12 +749,12 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 			case err != nil:
 				fails++
 				if fails >= DefaultRetryDrainFails {
-					log.Warn("дренаж повторных проверок temp_error: предел упавших пачек — до следующего тика",
+					log.Warn("temp_error recheck drain: failed batch limit — until the next tick",
 						"err", err, "failed_batches", fails,
 						"requeued", total.Requeued, "finalized", total.Finalized)
 					return
 				}
-				log.Warn("дренаж повторных проверок temp_error: пачка не прошла — дренаж продолжается",
+				log.Warn("temp_error recheck drain: batch failed — the drain continues",
 					"err", err, "failed_batches", fails,
 					"requeued", total.Requeued, "finalized", total.Finalized)
 				continue
@@ -764,7 +764,7 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 			total.Finalized += res.Finalized
 			if res.Requeued+res.Finalized < o.BatchSize {
 				if total.Requeued > 0 || total.Finalized > 0 {
-					log.Info("дренаж повторных проверок temp_error",
+					log.Info("temp_error recheck drain",
 						"requeued", total.Requeued, "finalized", total.Finalized)
 				}
 				return // an incomplete batch — the set is exhausted
