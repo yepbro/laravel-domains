@@ -1,21 +1,24 @@
-// Канонический JSON-формат сводки (ТЗД §6.2, T-129): wire-контракт полей
-// зон/итогов/очередей/темпа/скоростей, общий для CLI `crawlerctl status
-// --json` и снимка дашборда /api/status — один источник имён полей и
-// правил округления, чтобы машинные потребители не расходились (заметка
-// ревью T-126). До T-129 DTO жили внутри writeStatusJSON CLI; дашборд
-// сделал расхождение реальным — типы подняты в общую библиотеку сводки.
+// The canonical JSON format of the summary (dashboard spec §6.2, T-129):
+// the wire contract of the zones/totals/queues/throughput/rates fields,
+// shared by the CLI `crawlerctl status --json` and the dashboard snapshot
+// /api/status — a single source of the field names and the rounding
+// rules, so that the machine consumers do not diverge (the T-126 review
+// note). Before T-129 the DTOs lived inside the writeStatusJSON of the
+// CLI; the dashboard made the divergence real — the types were lifted
+// into the shared summary library.
 //
-// «н/д» — null: скорости без окна (domains_per_sec), ETA без скорости
-// (eta_sec), очереди без Redis (queues — nil-карта). Секции целиком
-// (Totals/Throughput/Rates) — указатели: дашборд кладёт nil при ошибке
-// секции (ТЗД §5.9), CLI всегда собирает их полностью.
+// "n/a" — null: the rates without a window (domains_per_sec), the ETA
+// without a rate (eta_sec), the queues without Redis (queues — a nil
+// map). The sections as a whole (Totals/Throughput/Rates) are pointers:
+// the dashboard puts nil on a section error (dashboard spec §5.9), the
+// CLI always assembles them fully.
 package status
 
 import (
 	"math"
 )
 
-// ZoneJSON — строка зоны (§5.3): имена полей CLI --json.
+// ZoneJSON — a zone row (§5.3): the field names of the CLI --json.
 type ZoneJSON struct {
 	Name           string `json:"name"`
 	NameUnicode    string `json:"name_unicode,omitempty"`
@@ -27,7 +30,7 @@ type ZoneJSON struct {
 	Done           int64  `json:"done"`
 }
 
-// TotalsJSON — итоги по зонам (§5.1); поле-в-поле Totals.
+// TotalsJSON — the totals over the zones (§5.1); field-by-field Totals.
 type TotalsJSON struct {
 	DomainsTotal   int64 `json:"domains_total"`
 	DomainsChecked int64 `json:"domains_checked"`
@@ -36,7 +39,8 @@ type TotalsJSON struct {
 	Done           int64 `json:"done"`
 }
 
-// ThroughputJSON — замеры темпа (§5.2); поле-в-поле Throughput.
+// ThroughputJSON — the throughput measurements (§5.2); field-by-field
+// Throughput.
 type ThroughputJSON struct {
 	DoneToday     int64   `json:"done_today"`
 	ElapsedSec    float64 `json:"elapsed_sec"`
@@ -45,8 +49,8 @@ type ThroughputJSON struct {
 	HourWindowSec float64 `json:"hour_window_sec"`
 }
 
-// RatesJSON — производные скорости/ETA (§5.1–5.2); Known-флаги Rates
-// уходят в null-поля (нет окна → domains_per_sec null, нет скорости →
+// RatesJSON — the derived rates/ETA (§5.1–5.2); the Known flags of Rates
+// go into the null fields (no window → domains_per_sec null, no rate →
 // eta_sec null).
 type RatesJSON struct {
 	DomainsPerSec *float64 `json:"domains_per_sec"`
@@ -56,9 +60,10 @@ type RatesJSON struct {
 	ETASec        *int64   `json:"eta_sec"`
 }
 
-// SummaryJSON — общие секции сводки (§5.1–5.4): зоны, итоги, очереди,
-// темп, скорости. Дашборд встраивает структуру в снимок (поля
-// поднимаются на верхний уровень JSON), CLI отдаёт как есть.
+// SummaryJSON — the common summary sections (§5.1–5.4): the zones, the
+// totals, the queues, the throughput, the rates. The dashboard embeds the
+// struct into the snapshot (the fields are lifted to the top level of the
+// JSON), the CLI hands it out as is.
 type SummaryJSON struct {
 	Zones      []ZoneJSON       `json:"zones"`
 	Totals     *TotalsJSON      `json:"totals"`
@@ -67,8 +72,8 @@ type SummaryJSON struct {
 	Rates      *RatesJSON       `json:"rates"`
 }
 
-// ZonesToJSON — строки зон в wire-формат; пустой срез остаётся пустым
-// («[]», не null) — зоны есть, просто их ноль.
+// ZonesToJSON — the zone rows into the wire format; an empty slice stays
+// empty ("[]", not null) — there are zones, just zero of them.
 func ZonesToJSON(zones []ZoneStats) []ZoneJSON {
 	out := make([]ZoneJSON, 0, len(zones))
 	for _, z := range zones {
@@ -81,18 +86,18 @@ func ZonesToJSON(zones []ZoneStats) []ZoneJSON {
 	return out
 }
 
-// TotalsToJSON — итоги в wire-формат.
+// TotalsToJSON — the totals into the wire format.
 func TotalsToJSON(t Totals) TotalsJSON {
 	return TotalsJSON(t)
 }
 
-// ThroughputToJSON — замеры темпа в wire-формат.
+// ThroughputToJSON — the throughput measurements into the wire format.
 func ThroughputToJSON(t Throughput) ThroughputJSON {
 	return ThroughputJSON(t)
 }
 
-// RatesToJSON — скорости/ETA в wire-формат с округлением до трёх знаков
-// (как таблица CLI печатает один знак, машинный вывод — три).
+// RatesToJSON — the rates/ETA into the wire format, rounded to three
+// digits (the CLI table prints one digit, the machine output — three).
 func RatesToJSON(r Rates) RatesJSON {
 	out := RatesJSON{
 		ResultsPerSec: round3(r.ResultsPerSec),
@@ -108,26 +113,28 @@ func RatesToJSON(r Rates) RatesJSON {
 	return out
 }
 
-// BuildSummaryJSON — полный wire-документ CLI status --json: все секции
-// собраны (nil-карта очередей остаётся null). Дашборд собирает SummaryJSON
-// по секциям сам (nil-секции при ошибках, ТЗД §5.9).
+// BuildSummaryJSON — the full wire document of the CLI status --json: all
+// the sections are assembled (a nil queue map stays null). The dashboard
+// assembles SummaryJSON by sections itself (nil sections on errors,
+// dashboard spec §5.9).
 func BuildSummaryJSON(zones []ZoneStats, tot Totals, thr Throughput, rates Rates, lens map[string]int64) SummaryJSON {
 	t, th := TotalsToJSON(tot), ThroughputToJSON(thr)
 	return SummaryJSON{
 		Zones:      ZonesToJSON(zones),
 		Totals:     &t,
-		Queues:     lens, // nil → null (Redis недоступен)
+		Queues:     lens, // nil → null (Redis unavailable)
 		Throughput: &th,
 		Rates:      ptrOf(RatesToJSON(rates)),
 	}
 }
 
-// round3 — округление float до трёх знаков.
+// round3 — rounding a float to three digits.
 func round3(v float64) float64 {
 	return math.Round(v*1000) / 1000
 }
 
-// ptrOf — адрес значения (композиция указательных полей SummaryJSON).
+// ptrOf — the address of the value (the composition of the SummaryJSON
+// pointer fields).
 func ptrOf[T any](v T) *T {
 	return &v
 }

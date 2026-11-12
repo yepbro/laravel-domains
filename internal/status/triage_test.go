@@ -1,10 +1,12 @@
-// Тесты триажа выживших мутантов CI-прогона 10.11.2026 (часть B,
-// score 0.857): добивки покрытия status — часы кэша по умолчанию (nil
-// Now — time.Now, вызов не паникует), защитная копия кэшированной карты
-// полная (обрыв копии портил бы кэш первым же вызовом), единичный TTL —
-// законное явное значение; имя статуса вне легенды не прерывает обход
-// ответа (более поздние легендные строки считаются); окно темпа в
-// одну секунду — реальное окно, а не дефолт.
+// Tests of the triage of the surviving mutants of the CI run of
+// 11/10/2026 (part B, score 0.857): the status coverage supplements —
+// the cache clock by default (nil Now — time.Now, the call does not
+// panic), the defensive copy of the cached map is complete (a cut-short
+// copy would spoil the cache on the very first call), a single-entry TTL
+// is a legal explicit value; a status name outside the legend does not
+// interrupt the walk of the response (the later legend rows are
+// counted); a one-second throughput window is a real window, not the
+// default.
 package status
 
 import (
@@ -15,16 +17,19 @@ import (
 	"crawler/internal/model"
 )
 
-// TestCacheTriage — механика TTL-кэша: часы по умолчанию (nil Now —
-// time.Now), полная защитная копия карты, единичный TTL.
+// TestCacheTriage — the TTL cache mechanics: the clock by default
+// (nil Now — time.Now), a full defensive copy of the map, a single-entry
+// TTL.
 func TestCacheTriage(t *testing.T) {
-	// TTL 1нс — положительное явное значение, дефолт не заменяет.
+	// A TTL of 1ns is a positive explicit value; the default does not
+	// replace it.
 	if o := (CacheOptions{TTL: time.Nanosecond}).withDefaults(); o.TTL != time.Nanosecond {
 		t.Errorf("TTL 1ns заменён дефолтом: %+v (дефолт — только для ≤ 0)", o)
 	}
 
-	// NewCache без часов: nil-Now обязан подмениться time.Now — первый
-	// же вызов не паникует (mutant оставлял nil-функцию).
+	// NewCache without a clock: a nil Now must be replaced with
+	// time.Now — the very first call does not panic (the mutant kept the
+	// nil function).
 	c := NewCache(CacheOptions{})
 	got, err := cached(c, &c.statuses, func() (map[string]int64, error) {
 		return map[string]int64{"new": 1, "alive": 2}, nil
@@ -32,20 +37,21 @@ func TestCacheTriage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cached без явных часов: %v", err)
 	}
-	// Защитная копия ПОЛНАЯ: обрыв/пропуск записи в cloneOf возвращал бы
-	// урезанную карту (мутация результата callers'ом рвала бы кэш).
+	// The defensive copy is COMPLETE: a cut-short/skipped record in
+	// cloneOf would return a trimmed map (a mutation of the result by the
+	// caller would tear the cache).
 	if len(got) != 2 || got["new"] != 1 || got["alive"] != 2 {
 		t.Errorf("копия кэш-значения = %v, хочу обе записи (полная копия)", got)
 	}
 }
 
-// TestFetchDomainStatusesTriageUnknownFirst — имя вне легенды
-// model.Statuses НЕ прерывает обход ответа (continue, не break):
-// легендные строки после него считаются.
+// TestFetchDomainStatusesTriageUnknownFirst — a name outside the
+// model.Statuses legend does NOT interrupt the walk of the response
+// (continue, not break): the legend rows after it are counted.
 func TestFetchDomainStatusesTriageUnknownFirst(t *testing.T) {
 	pool := newStatusPool()
 	pool.domStatuses = []statusStatusSeed{
-		{"unknown-code", 7}, // вне легенды — первой строкой ответа
+		{"unknown-code", 7}, // outside the legend — the first row of the response
 		{model.StatusAlive.String(), 40},
 		{model.StatusNew.String(), 1000},
 	}
@@ -58,9 +64,10 @@ func TestFetchDomainStatusesTriageUnknownFirst(t *testing.T) {
 	}
 }
 
-// TestComputeRatesTriageWindowOne — окно корзин в одну секунду —
-// реальное окно (деление на 1), а не дефолт speedWindowSec: ручной
-// сбор значений с узким окном не занижает темп.
+// TestComputeRatesTriageWindowOne — a one-second bucket window is a real
+// window (dividing by 1), not the speedWindowSec default: a manual
+// assembly of the values with a narrow window does not understate the
+// throughput.
 func TestComputeRatesTriageWindowOne(t *testing.T) {
 	r := ComputeRates(Throughput{HourWindowSec: 1, ResultsHour: 3600, RenderedHour: 60}, 0, 0)
 	if r.ResultsPerSec != 3600 || r.RenderPerSec != 60 {

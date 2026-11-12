@@ -1,7 +1,7 @@
-// Соответствие структур схемы БД: теги db повторяют колонки таблиц
-// миграции 000001 в том же порядке (жёсткая сверка — при изменении схемы
-// тест напоминает обновить структуры); нулевые значения структур —
-// колонкам с DEFAULT.
+// Correspondence of the structs to the DB schema: the db tags repeat the
+// columns of the migration 000001 tables in the same order (a strict
+// cross-check — when the schema changes the test reminds to update the
+// structs); the zero values of the structs match the columns with DEFAULT.
 package model
 
 import (
@@ -10,10 +10,10 @@ import (
 	"testing"
 )
 
-// TestStructColumnsMatchSchema — колонки каждой таблицы перечислены
-// жёстко по migrations/000001_init.up.sql (000002/000003 колонок не
-// меняют, 000005 добавляет domains.temp_attempts). Порядок обязателен:
-// структуры используются с COPY и pgx.RowToStructByName.
+// TestStructColumnsMatchSchema — the columns of each table are listed
+// strictly according to migrations/000001_init.up.sql (000002/000003 do
+// not change the columns, 000005 adds domains.temp_attempts). The order
+// is mandatory: the structs are used with COPY and pgx.RowToStructByName.
 func TestStructColumnsMatchSchema(t *testing.T) {
 	cases := []struct {
 		row     any
@@ -63,7 +63,7 @@ func TestStructColumnsMatchSchema(t *testing.T) {
 	}
 }
 
-// dbTags собирает теги db полей структуры по порядку.
+// dbTags collects the db tags of the struct fields in order.
 func dbTags(t *testing.T, row any) []string {
 	t.Helper()
 	typ := reflect.TypeOf(row)
@@ -82,10 +82,10 @@ func dbTags(t *testing.T, row any) []string {
 	return tags
 }
 
-// TestDomainZeroValueMatchesDefaults — нулевое значение Domain совпадает
-// со строкой, вставленной DEFAULT-ами колонок (миграция 000001:
-// status, check_state, flags, dns_mask DEFAULT 0): значения по умолчанию
-// собирать отдельно не нужно.
+// TestDomainZeroValueMatchesDefaults — the zero value of Domain matches
+// the row inserted with the column DEFAULTs (migration 000001:
+// status, check_state, flags, dns_mask DEFAULT 0): there is no need to
+// collect the default values separately.
 func TestDomainZeroValueMatchesDefaults(t *testing.T) {
 	var d Domain
 	if d.Status != StatusNew {
@@ -102,8 +102,8 @@ func TestDomainZeroValueMatchesDefaults(t *testing.T) {
 	}
 }
 
-// TestSubdomainResultZeroValueMatchesDefaults — DEFAULT колонок
-// subdomain_results: variant 0, alias_kind 0, rendered false.
+// TestSubdomainResultZeroValueMatchesDefaults — the DEFAULTs of the
+// subdomain_results columns: variant 0, alias_kind 0, rendered false.
 func TestSubdomainResultZeroValueMatchesDefaults(t *testing.T) {
 	var r SubdomainResult
 	if r.Variant != VariantMain {
@@ -117,8 +117,9 @@ func TestSubdomainResultZeroValueMatchesDefaults(t *testing.T) {
 	}
 }
 
-// TestSubdomainInitialSet — начальный набор субдоменов из миграции 000001:
-// бит 0 — апекс, 1 www, …; номер бита совпадает с id справочника.
+// TestSubdomainInitialSet — the initial subdomain set from migration
+// 000001: bit 0 is the apex, 1 www, …; the bit number matches the
+// reference table id.
 func TestSubdomainInitialSet(t *testing.T) {
 	want := []Subdomain{
 		{ID: 0, Label: "", Enabled: true},

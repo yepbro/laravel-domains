@@ -1,6 +1,7 @@
-// Юнит-тесты перечислений model: коды и имена статусов домена (ТЗ 6.2,
-// жёсткая сверка с таблицей §6.2 и схемой), check_state, вариант, схема,
-// alias_kind, действие ingest-файла; разбор имён и валидация кодов.
+// Unit tests of the model enumerations: the codes and names of the domain
+// statuses (spec 6.2, a strict cross-check with the §6.2 table and the
+// schema), check_state, variant, scheme, alias_kind, the ingest-file
+// action; name parsing and code validation.
 package model
 
 import (
@@ -9,8 +10,9 @@ import (
 	"testing"
 )
 
-// TestStatusCodes сверяет коды и имена статусов жёстко с таблицей ТЗ 6.2
-// (значения закреплены колонкой domains.status, миграция 000001).
+// TestStatusCodes cross-checks the status codes and names strictly with
+// the spec 6.2 table (the values are pinned by the domains.status column,
+// migration 000001).
 func TestStatusCodes(t *testing.T) {
 	want := []struct {
 		code int16
@@ -23,7 +25,7 @@ func TestStatusCodes(t *testing.T) {
 		{4, "alive"},
 		{5, "temp_error"},
 		{6, "deleted"},
-		{7, "invalid"}, // диагностический, T-109
+		{7, "invalid"}, // diagnostic, T-109
 	}
 	if len(Statuses) != len(want) {
 		t.Fatalf("Statuses: %d статусов, want %d (все статусы ТЗ 6.2)", len(Statuses), len(want))
@@ -68,7 +70,7 @@ func TestParseStatus(t *testing.T) {
 	}{
 		{"new", StatusNew},
 		{"deleted", StatusDeleted},
-		{" alive ", StatusAlive}, // пробелы по краям не важны
+		{" alive ", StatusAlive}, // surrounding whitespace does not matter
 		{"Temp_Error", StatusTempError},
 	}
 	for _, tc := range cases {
@@ -89,18 +91,18 @@ func TestParseStatusErrors(t *testing.T) {
 			t.Errorf("ParseStatus(%q) = nil error, want ошибка", in)
 		}
 	}
-	// Сообщение об ошибке перечисляет допустимые имена — подсказка вызывающему.
+	// The error message lists the valid names — a hint to the caller.
 	_, err := ParseStatus("parked")
 	if err == nil || !strings.Contains(err.Error(), "not_delegated") {
 		t.Errorf("ошибка ParseStatus должна называть допустимые имена, получено: %v", err)
 	}
 }
 
-// TestParseErrorZeroCode — при ошибке разбора возвращается нулевой код
-// (конвенция нулевого значения Go). Для Scheme пин содержателен: 0 —
-// невалидный код, мутант ±1 давал бы валидный SchemeHTTP(1) — ядовито
-// при игнорировании err вызывающим; для Status 0 — валидный new,
-// пин фиксирует только конвенцию (вызывающий обязан проверять err).
+// TestParseErrorZeroCode — on a parse error the zero code is returned
+// (the Go zero-value convention). For Scheme the pin is meaningful: 0 is
+// an invalid code, the ±1 mutant would give the valid SchemeHTTP(1) —
+// poisonous when the caller ignores err; for Status 0 is the valid new,
+// so the pin only fixes the convention (the caller must check err).
 func TestParseErrorZeroCode(t *testing.T) {
 	if got, err := ParseStatus("nope"); err == nil || got != 0 {
 		t.Errorf("ParseStatus(ошибка) = %d, %v, want 0 и ошибка", int16(got), err)
@@ -143,8 +145,8 @@ func TestVariant(t *testing.T) {
 		code int16
 		name string
 	}{
-		{0, "main"}, // основной (https или единственный ответивший протокол)
-		{1, "http"}, // http-вариант, если сайты разные (ТЗ 5.5 п. 5)
+		{0, "main"}, // main (https or the only responding protocol)
+		{1, "http"}, // the http variant when the sites differ (spec 5.5 item 5)
 	}
 	for _, w := range want {
 		v := Variant(w.code)
@@ -213,9 +215,9 @@ func TestAliasKind(t *testing.T) {
 		code int16
 		name string
 	}{
-		{0, "none"},      // нет алиаса
-		{1, "identical"}, // идентичен другому субдомену (ТЗ 5.5 п. 6)
-		{2, "redirect"},  // редирект на другой субдомен
+		{0, "none"},      // no alias
+		{1, "identical"}, // identical to another subdomain (spec 5.5 item 6)
+		{2, "redirect"},  // a redirect to another subdomain
 	}
 	for _, w := range want {
 		a := AliasKind(w.code)
@@ -257,5 +259,5 @@ func TestAction(t *testing.T) {
 	}
 }
 
-// itoa — короткая обёртка для ожидаемых значений вида "Status(7)".
+// itoa — a short wrapper for want values like "Status(7)".
 func itoa(n int16) string { return strconv.Itoa(int(n)) }

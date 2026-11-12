@@ -12,8 +12,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
-// scrape поднимает временный HTTP-сервер с Handler и возвращает тело
-// ответа /metrics.
+// scrape raises a temporary HTTP server with the Handler and returns the
+// body of the /metrics response.
 func scrape(t *testing.T, g prometheus.Gatherer) string {
 	t.Helper()
 	srv := httptest.NewServer(Handler(g))
@@ -54,7 +54,7 @@ func TestHandler(t *testing.T) {
 	for _, want := range []string{
 		`crawler_service_up{service="test-service"} 1`,
 		`crawler_build_info{mode="dev-stub",revision="",service="test-service",version="dev"} 1`,
-		`go_goroutines`, // коллектор Go/runtime
+		`go_goroutines`, // the Go/runtime collector
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("в /metrics нет строки %q", want)
@@ -62,9 +62,9 @@ func TestHandler(t *testing.T) {
 	}
 }
 
-// buildMode/buildVersion/buildRevision — точки инъекции ldflags: подмена
-// переменных меняет метки crawler_build_info (боевая сборка -X
-// ...buildMode=prod, см. TestBuildInfoVersionRevision).
+// buildMode/buildVersion/buildRevision — the ldflags injection points:
+// substituting the variables changes the crawler_build_info labels (the
+// production build -X ...buildMode=prod, see TestBuildInfoVersionRevision).
 func TestBuildInfoMode(t *testing.T) {
 	prev := buildMode
 	buildMode = "prod"
@@ -75,9 +75,10 @@ func TestBuildInfoMode(t *testing.T) {
 	}
 }
 
-// Боевая сборка инъекцирует и version, и revision (git describe и короткий
-// хеш коммита): все три метки попадают в экспозицию; набор имён меток тот
-// же, что и у dev-сборки, — значения подменяются на месте.
+// A production build injects both the version and the revision (git
+// describe and the short commit hash): all three labels get into the
+// exposition; the label name set is the same as that of a dev build —
+// the values are substituted in place.
 func TestBuildInfoVersionRevision(t *testing.T) {
 	prevV, prevR := buildVersion, buildRevision
 	buildVersion = "v1.2.3-4-gabc1234-dirty"
@@ -91,8 +92,8 @@ func TestBuildInfoVersionRevision(t *testing.T) {
 	}
 }
 
-// Handler принимает и голый *prometheus.Registry (Gatherer), не только
-// реестр фабрики.
+// Handler accepts a bare *prometheus.Registry (Gatherer) too, not only a
+// registry of the factory.
 func TestHandlerBareRegistry(t *testing.T) {
 	bare := prometheus.NewRegistry()
 	bare.MustRegister(collectors.NewGoCollector())
@@ -101,9 +102,9 @@ func TestHandlerBareRegistry(t *testing.T) {
 	}
 }
 
-// Фабричные методы подставляют метку service автоматически: вызывающий
-// передаёт значения только остальных метк; HELP/TYPE берутся из Opts
-// (ТЗ 5.9).
+// The factory methods substitute the service label automatically: the
+// caller passes the values of the other labels only; the HELP/TYPE come
+// from the Opts (spec 5.9).
 func TestFactoryAutoServiceLabel(t *testing.T) {
 	reg := New("dns-worker")
 
@@ -119,7 +120,8 @@ func TestFactoryAutoServiceLabel(t *testing.T) {
 	}, LabelQueue)
 	depth.WithLabelValues("q:dns").Set(42)
 
-	// прибор без дополнительных метк: WithLabelValues без аргументов
+	// An instrument without extra labels: WithLabelValues without
+	// arguments
 	memory := reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_worker_memory_bytes",
 		Help: "Память воркеров.",
@@ -141,13 +143,13 @@ func TestFactoryAutoServiceLabel(t *testing.T) {
 
 	text := scrape(t, reg)
 	for _, want := range []string{
-		// метки в экспозиции Prometheus отсортированы по имени;
-		// большие значения форматируются экспонентой (1.048576e+06)
+		// the labels in the Prometheus exposition are sorted by name;
+		// large values are formatted with an exponent (1.048576e+06)
 		`crawler_stage_tasks_total{service="dns-worker",stage="dns"} 1`,
 		`crawler_queue_depth{queue="q:dns",service="dns-worker"} 42`,
 		`crawler_worker_memory_bytes{service="dns-worker"} 1.048576e+06`,
 		`crawler_stage_errors_total{service="dns-worker",stage="dns",type="timeout"} 3`,
-		// документация метрик (HELP/TYPE) — из Opts
+		// the metric documentation (HELP/TYPE) — from the Opts
 		`# HELP crawler_stage_tasks_total Обработанные домены по этапам конвейера.`,
 		`# TYPE crawler_stage_tasks_total counter`,
 		`# TYPE crawler_queue_depth gauge`,
@@ -162,10 +164,10 @@ func TestFactoryAutoServiceLabel(t *testing.T) {
 	}
 }
 
-// Дубль-регистрация идентичной метрики не паникует и не ошибочна:
-// возвращается уже зарегистрированный вектор — вызовы делят один
-// коллектор (конструкторы приборов можно вызывать многократно, как это
-// делают тесты сервисов).
+// A duplicate registration of an identical metric does not panic and is
+// not an error: the already registered vector is returned — the calls
+// share one collector (the instrument constructors may be called
+// repeatedly, as the service tests do).
 func TestReRegistrationSameCollector(t *testing.T) {
 	reg := New("test-svc")
 	counterOpts := prometheus.CounterOpts{
@@ -208,9 +210,9 @@ func TestReRegistrationSameCollector(t *testing.T) {
 	}
 }
 
-// Конфликты описаний — ошибка (не паника), Must-вариант паникует:
-// то же имя с другим help, другим набором меток или другим типом
-// коллектора — программная ошибка.
+// The descriptor conflicts are an error (not a panic); the Must variant
+// panics: the same name with another help, another label set or another
+// collector type is a program error.
 func TestRegistrationConflict(t *testing.T) {
 	reg := New("test-svc")
 	opts := prometheus.CounterOpts{
@@ -228,15 +230,15 @@ func TestRegistrationConflict(t *testing.T) {
 	if _, err := reg.Counter(otherHelp, LabelStage); err == nil {
 		t.Error("другой help: ожидалась ошибка")
 	}
-	// то же имя/help/метки, но gauge: AlreadyRegisteredError с тем же
-	// дескриптором, но коллектор другого типа
+	// the same name/help/labels but a gauge: an AlreadyRegisteredError
+	// with the same descriptor but a collector of another type
 	if _, err := reg.Gauge(prometheus.GaugeOpts{
 		Name: "crawler_stage_tasks_total",
 		Help: "Обработанные домены по этапам конвейера.",
 	}, LabelStage); err == nil {
 		t.Error("другой тип коллектора: ожидалась ошибка")
 	}
-	// histogram против counter — тот же конфликт типа
+	// histogram against counter — the same type conflict
 	if _, err := reg.Histogram(prometheus.HistogramOpts{
 		Name: "crawler_stage_tasks_total",
 		Help: "Обработанные домены по этапам конвейера.",
@@ -244,7 +246,7 @@ func TestRegistrationConflict(t *testing.T) {
 		t.Error("histogram против counter: ожидалась ошибка")
 	}
 
-	// Must-варианты на конфликте паникуют (ошибка программирования)
+	// The Must variants panic on a conflict (a programming error)
 	mustPanic := func(name string, f func()) {
 		defer func() {
 			if recover() == nil {
@@ -273,8 +275,8 @@ func TestRegistrationConflict(t *testing.T) {
 	})
 }
 
-// Зарезервированная метка LabelService и дубликаты меток отклоняются
-// ошибкой, а не паникой prometheus.New*Vec.
+// The reserved LabelService label and duplicate labels are rejected with
+// an error, not a prometheus.New*Vec panic.
 func TestLabelValidation(t *testing.T) {
 	reg := New("test-svc")
 	if _, err := reg.Counter(prometheus.CounterOpts{
@@ -306,9 +308,10 @@ func TestLabelValidation(t *testing.T) {
 	}
 }
 
-// Корзины гистограммы не входят в дескриптор prometheus: повторная
-// регистрация возвращает вектор с корзинами первого вызова — поведение
-// зафиксировано (сравнить корзины зарегистрированного вектора нельзя).
+// The histogram buckets are not part of the prometheus descriptor: a
+// repeated registration returns the vector with the buckets of the first
+// call — the behavior is fixed (the buckets of a registered vector cannot
+// be compared).
 func TestReRegistrationHistogramBuckets(t *testing.T) {
 	reg := New("test-svc")
 	first := reg.MustHistogram(prometheus.HistogramOpts{
@@ -319,7 +322,7 @@ func TestReRegistrationHistogramBuckets(t *testing.T) {
 	second, err := reg.Histogram(prometheus.HistogramOpts{
 		Name:    "crawler_stage_seconds",
 		Help:    "Время обработки этапа.",
-		Buckets: []float64{9, 99}, // проигнорируется: первый вызов выигрывает
+		Buckets: []float64{9, 99}, // ignored: the first call wins
 	}, LabelStage)
 	if err != nil {
 		t.Fatalf("дубль-регистрация histogram: %v", err)
@@ -341,9 +344,9 @@ func TestReRegistrationHistogramBuckets(t *testing.T) {
 	}
 }
 
-// Параллельная регистрация одноимённых метрик и инкременты безопасны:
-// реестр prometheus синхронизирован, каррированные векторы
-// потокобезопасны (прогон с -race ловит гонки).
+	// The parallel registration of same-named metrics and the increments
+	// are safe: the prometheus registry is synchronized, the curried
+	// vectors are thread-safe (a run with -race catches the races).
 func TestConcurrentRegistration(t *testing.T) {
 	reg := New("test-svc")
 	const goroutines = 16
@@ -370,9 +373,9 @@ func TestConcurrentRegistration(t *testing.T) {
 	}
 }
 
-// Реестры сервисов независимы: одноимённые метрики разных сервисов не
-// конфликтуют и не перетекают друг в друга — у каждого сервиса свой
-// /metrics (ТЗ 5.9).
+// The service registries are independent: the same-named metrics of
+// different services do not conflict and do not leak into each other —
+// each service has its own /metrics (spec 5.9).
 func TestRegistriesIndependent(t *testing.T) {
 	regDNS, regHTTP := New("dns-worker"), New("http-worker")
 	opts := prometheus.CounterOpts{

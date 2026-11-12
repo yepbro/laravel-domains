@@ -1,7 +1,7 @@
-// Юнит-тесты счётчика переводов в q:dead (T-154): хук инкрементит
-// counter per-stream (метка queue — стрим-источник), nil-реестр —
-// nil-хук (изолированные сборки), повторная сборка хука делит прибор
-// (идемпотентность T-076).
+// Unit tests of the q:dead move counter (T-154): the hook increments the
+// counter per stream (the queue label is the source stream), a nil
+// registry — a nil hook (isolated builds), a repeated hook assembly
+// shares the instrument (the T-076 idempotency).
 package metrics
 
 import (
@@ -10,8 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// counterValue — текущее значение серии counter по метке queue
-// (нет серии — ok=false); стиль gaugeValue (collect_test.go).
+// counterValue — the current value of the counter series by the queue
+// label (no series — ok=false); the gaugeValue style (collect_test.go).
 func counterValue(t *testing.T, g prometheus.Gatherer, name, queue string) (float64, bool) {
 	t.Helper()
 	families, err := g.Gather()
@@ -33,9 +33,9 @@ func counterValue(t *testing.T, g prometheus.Gatherer, name, queue string) (floa
 	return 0, false
 }
 
-// TestDeadBuriedHook — хук инкрементит crawler_queue_dead_buried_total
-// {queue} по стримам-источникам; nil reg — nil (воркер без реестра
-// работает, bury молчалив — проверяется очередью).
+// TestDeadBuriedHook — the hook increments crawler_queue_dead_buried_total
+// {queue} over the source streams; a nil reg — nil (a worker without a
+// registry works, the bury is silent — checked by the queue).
 func TestDeadBuriedHook(t *testing.T) {
 	if hook := NewDeadBuriedHook(nil); hook != nil {
 		t.Fatalf("nil реестр: хук задан (%T), хочу nil", hook)
@@ -56,20 +56,20 @@ func TestDeadBuriedHook(t *testing.T) {
 		t.Error("серия q:http без смертей не должна существовать")
 	}
 
-	// Повторная сборка хука — тот же прибор (идемпотентность T-076):
-	// инкременты складываются, а не дублируются реестром.
+	// A repeated hook assembly — the same instrument (the T-076
+	// idempotency): the increments add up, not duplicate the registry.
 	NewDeadBuriedHook(reg)("q:dns")
 	if v, _ := counterValue(t, reg, "crawler_queue_dead_buried_total", "q:dns"); v != 3 {
 		t.Errorf("после второго хука q:dns = %v, хочу 3", v)
 	}
 }
 
-// TestDeadUnidentifiedHook — хук инкрементит
-// crawler_queue_dead_unidentified_total{queue} по стримам-источникам
-// (T-260, ФТ-6.1); nil reg — nil; событие не пишет ряд соседнего
-// счётчика смертей dead_buried (смерть задачи и карантин
-// неидентифицируемой записи — разные события); повторная сборка делит
-// прибор (идемпотентность T-076).
+// TestDeadUnidentifiedHook — the hook increments
+// crawler_queue_dead_unidentified_total{queue} over the source streams
+// (T-260, FR-6.1); a nil reg — nil; an event does not write a row of the
+// neighboring dead_buried death counter (the death of a task and the
+// quarantine of an unidentifiable entry are different events); a repeated
+// assembly shares the instrument (the T-076 idempotency).
 func TestDeadUnidentifiedHook(t *testing.T) {
 	if hook := NewDeadUnidentifiedHook(nil); hook != nil {
 		t.Fatalf("nil реестр: хук задан (%T), хочу nil", hook)
@@ -93,7 +93,8 @@ func TestDeadUnidentifiedHook(t *testing.T) {
 		t.Error("карантин неидентифицируемой записи не должен писать dead_buried_total")
 	}
 
-	// Повторная сборка хука — тот же прибор (идемпотентность T-076).
+	// A repeated hook assembly — the same instrument (the T-076
+	// idempotency).
 	NewDeadUnidentifiedHook(reg)("q:http")
 	if v, _ := counterValue(t, reg, "crawler_queue_dead_unidentified_total", "q:http"); v != 3 {
 		t.Errorf("после второго хука q:http = %v, хочу 3", v)

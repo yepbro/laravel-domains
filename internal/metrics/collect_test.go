@@ -1,8 +1,8 @@
-// Юнит-тесты коллектора длин очередей (T-077, ТЗ 5.9) на фейковом
-// источнике XLEN: экспорт значений gauge через Gather, независимость
-// ошибок стримов, дефолты интервала, no-op без реестра, цикл
-// (немедленный первый проход, переживание ошибки, чистый выход по
-// отмене ctx).
+// Unit tests of the queue length collector (T-077, spec 5.9) on a fake
+// XLEN source: the gauge value export through Gather, the independence of
+// the stream errors, the interval defaults, a no-op without a registry,
+// the loop (an immediate first pass, surviving an error, a clean exit on
+// the ctx cancellation).
 package metrics
 
 import (
@@ -16,8 +16,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// fakeLen — LenFunc по карте стримов; errLen — стримы, отвечающие
-// ошибкой. Карта меняется на живом цикле — доступ под замком.
+// fakeLen — a LenFunc over a map of streams; errLen — the streams
+// answering with an error. The map changes on the live loop — the access
+// is under the lock.
 type fakeLen struct {
 	mu     sync.Mutex
 	lens   map[string]int64
@@ -35,14 +36,15 @@ func (f *fakeLen) Len(_ context.Context, stream string) (int64, error) {
 	return f.lens[stream], nil
 }
 
-// set — значение стрима (мутация под замком: цикл читает в горутине).
+// set — the stream value (a mutation under the lock: the loop reads in a
+// goroutine).
 func (f *fakeLen) set(stream string, n int64) {
 	f.mu.Lock()
 	f.lens[stream] = n
 	f.mu.Unlock()
 }
 
-// fail — стрим отвечает ошибкой; пустая ошибка — успех.
+// fail — the stream answers with an error; an empty error — success.
 func (f *fakeLen) fail(stream string, err error) {
 	f.mu.Lock()
 	if err == nil {
@@ -53,7 +55,8 @@ func (f *fakeLen) fail(stream string, err error) {
 	f.mu.Unlock()
 }
 
-// gaugeValue — текущее значение серии gauge (нет серии — ok=false).
+// gaugeValue — the current value of the gauge series (no series —
+// ok=false).
 func gaugeValue(t *testing.T, g prometheus.Gatherer, name, queue string) (float64, bool) {
 	t.Helper()
 	families, err := g.Gather()
@@ -89,7 +92,8 @@ func TestCollectQueueDepths(t *testing.T) {
 		t.Fatalf("ошибка = %v, want сбой q:render", err)
 	}
 
-	// Успешные стримы записаны несмотря на сбой третьего.
+	// The successful streams were recorded despite the failure of the
+	// third.
 	for queue, want := range map[string]float64{"q:dns": 42, "q:http": 7} {
 		if v, ok := gaugeValue(t, reg, "crawler_queue_depth", queue); !ok || v != want {
 			t.Errorf("crawler_queue_depth{queue=%q} = (%v, %v), want (%v, true)", queue, v, ok, want)
@@ -98,7 +102,7 @@ func TestCollectQueueDepths(t *testing.T) {
 	if _, ok := gaugeValue(t, reg, "crawler_queue_depth", "q:render"); ok {
 		t.Error("сбойный стрим не должен получать значение")
 	}
-	// Метка service подставлена фабрикой.
+	// The service label is substituted by the factory.
 	if v, ok := gaugeValue(t, reg, "crawler_queue_depth", "q:dns"); ok && v == 42 {
 		families, _ := reg.Gather()
 		for _, mf := range families {
@@ -118,7 +122,7 @@ func TestCollectQueueDepths(t *testing.T) {
 		}
 	}
 
-	// Повторный проход с новым значением перезаписывает gauge.
+	// A repeated pass with a new value overwrites the gauge.
 	lenOf.set("q:dns", 43)
 	if err := CollectQueueDepths(context.Background(), gauge, lenOf.Len, []string{"q:dns"}); err != nil {
 		t.Fatal(err)
@@ -138,7 +142,8 @@ func TestCollectQueueDepthsValidation(t *testing.T) {
 	}
 }
 
-// waitForGauge — ожидание появления значения (цикл работает в горутине).
+// waitForGauge — waiting for a value to appear (the loop runs in a
+// goroutine).
 func waitForGauge(t *testing.T, g prometheus.Gatherer, queue string, want float64) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -162,10 +167,10 @@ func TestCollectQueueLoop(t *testing.T) {
 		close(done)
 	}()
 
-	// Первый проход — сразу при старте, без ожидания тика.
+	// The first pass — right at the start, without waiting for a tick.
 	waitForGauge(t, reg, "q:http", 5)
 
-	// Проход по тику обновляет значение.
+	// A pass on a tick updates the value.
 	lenOf.set("q:http", 6)
 	waitForGauge(t, reg, "q:http", 6)
 
@@ -178,8 +183,8 @@ func TestCollectQueueLoop(t *testing.T) {
 }
 
 func TestCollectQueueLoopNoop(t *testing.T) {
-	// nil-реестр, nil-источник и пустой набор стримов — no-op без паники
-	// и без обращений к источнику (изолированные сборки).
+	// A nil registry, a nil source and an empty stream set — a no-op
+	// without a panic and without calls to the source (isolated builds).
 	lenOf := &fakeLen{lens: map[string]int64{"q:dns": 1}}
 	for _, tc := range []struct {
 		name    string
@@ -200,7 +205,7 @@ func TestCollectQueueLoopNoop(t *testing.T) {
 	}
 }
 
-// Переживание ошибки: цикл живёт, gauge хранит последнее значение.
+// Surviving an error: the loop lives, the gauge keeps the last value.
 func TestCollectQueueLoopSurvivesError(t *testing.T) {
 	reg := New("render-worker")
 	boom := errors.New("redis недоступен")
@@ -215,7 +220,7 @@ func TestCollectQueueLoopSurvivesError(t *testing.T) {
 	}()
 	waitForGauge(t, reg, "q:render", 9)
 
-	// Несколько неудачных проходов: значение остаётся прежним.
+	// Several failing passes: the value stays the same.
 	lenOf.fail("q:render", boom)
 	deadline := time.Now().Add(50 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -225,7 +230,7 @@ func TestCollectQueueLoopSurvivesError(t *testing.T) {
 		t.Errorf("при сбоях XLEN значение = %v, want последнее известное 9", v)
 	}
 
-	// Восстановление источника — значение обновляется.
+	// The source recovers — the value is updated.
 	lenOf.fail("q:render", nil)
 	lenOf.set("q:render", 11)
 	waitForGauge(t, reg, "q:render", 11)

@@ -1,12 +1,14 @@
-// Юнит-тесты пакета status (T-079 → T-126, ТЗ 5.9 / ТЗД §4.5) на фейковых
-// пуле (db.DB) и клиенте XLEN — без БД и Redis. Проверяются точный
-// SQL-текст выборок (контракт, стиль reanalyze_test.go) и живая семантика
-// фейка: агрегат domains по check_state с исключением deleted из pending,
-// LEFT JOIN зон без доменов, сортировка по имени; окно темпа и защита от
-// деления на ноль в ComputeRates (короткое окно, нулевая скорость,
-// пустой цикл, минимальная ETA); формат интервалов. Вывод (таблица/JSON)
-// и роутинг — тесты CLI (cmd/crawlerctl/status_test.go); поведение против
-// живых PostgreSQL/Redis — dev-окружение (make status).
+// Unit tests of the status package (T-079 → T-126, spec 5.9 / dashboard
+// spec §4.5) on a fake pool (db.DB) and an XLEN client — without the DB
+// and Redis. Both the exact SQL text of the selections (the contract, the
+// reanalyze_test.go style) and the live semantics of the fake are
+// checked: the domains aggregate by check_state with deleted excluded
+// from pending, the LEFT JOIN of zones without domains, the sort by name;
+// the throughput window and the division-by-zero protection in
+// ComputeRates (a short window, a zero rate, an empty circle, the minimum
+// ETA); the interval format. The output (table/JSON) and the routing are
+// the CLI tests (cmd/crawlerctl/status_test.go); the behavior against
+// live PostgreSQL/Redis is the dev environment (make status).
 package status
 
 import (
@@ -29,29 +31,33 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- SQL-контракты ----------------------------------------------------------
+// --- SQL contracts ----------------------------------------------------------
 
-// wantZoneStatsSQL / wantThroughputSQL — ожидаемый текст запросов; фейк
-// сопоставляет SQL точно, неожидаемый запрос валит тест громко.
+// wantZoneStatsSQL / wantThroughputSQL — the expected query texts; the
+// fake matches the SQL exactly, an unexpected query fails the test
+// loudly.
 const wantZoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_unicode, " +
 	"z.is_active, z.domains_total, z.domains_pending, z.domains_queued, z.domains_checked " +
 	"FROM zones AS z ORDER BY z.name"
 
-// wantThroughputSQL — каждое число — точечное чтение/сумма строк
-// crawler_counters, проходов больших таблиц в запросе нет: done_today —
-// суточный счётчик проверок crawler_counters['checks:YYYY-MM-DD']
-// точечным лукапом по PK (T-179), coalesce СНАРУЖИ подзапроса — до
-// первой записи суток подзапрос пуст (NULL), часы простоя показывают
-// честный ноль; имя дня вычисляет БД (current_date) — согласовано с
-// now() записи last_checked_at (T-058) и окном реконсиляции.
-// results_hour/rendered_hour — суммы ЧАСОВЫХ корзин темпа (T-203):
-// прежние живые подзапросы по subdomain_results (окно «последний час»
-// по checked_at) деградировали heap-fetch'ами свежих страниц
-// (контрольная точка этапа 27); корзина — календарный час, читатель
-// суммирует две живые корзины (предыдущий и текущий час, IN-список),
-// hour_window_sec — фактическая длина покрытого окна для честного
-// делителя скорости; имена корзин вычисляет БД (date_trunc от now()) —
-// согласованы с инкрементами записи/рендера и реконсиляцией.
+// wantThroughputSQL — every number is a point read / a sum of
+// crawler_counters rows, there are no passes over large tables in the
+// query: done_today is the daily check counter
+// crawler_counters['checks:YYYY-MM-DD'] by a point lookup over the PK
+// (T-179); the coalesce is OUTSIDE the subquery — before the first record
+// of the day the subquery is empty (NULL), the idle hours show an honest
+// zero; the day name is computed by the DB (current_date) — consistent
+// with the now() of the last_checked_at record (T-058) and the
+// reconciliation window.
+// results_hour/rendered_hour — the sums of the HOURLY throughput buckets
+// (T-203): the former live subqueries over subdomain_results (the "last
+// hour" window over checked_at) degraded with heap fetches of fresh pages
+// (the stage 27 checkpoint); a bucket is a calendar hour, the reader sums
+// two live buckets (the previous and the current hour, an IN list);
+// hour_window_sec is the actual length of the covered window for the
+// honest rate divisor; the bucket names are computed by the DB
+// (date_trunc from now()) — consistent with the record/render increments
+// and the reconciliation.
 const wantThroughputSQL = "SELECT " +
 	"coalesce((SELECT value FROM crawler_counters " +
 	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')), 0) AS done_today, " +
@@ -80,9 +86,10 @@ const wantLaravelRecentSQL = "SELECT d.label || '.' || z.name AS domain, z.name 
 const wantIngestRecentSQL = "SELECT path, action, lines_total, added, existed, deleted, rejected, processed_at " +
 	"FROM ingest_files ORDER BY processed_at DESC NULLS LAST, id DESC LIMIT 10"
 
-// --- фейковый пул (db.DB) ----------------------------------------------------
+// --- fake pool (db.DB) ----------------------------------------------------
 
-// statusZoneSeed — зона в фейке: счётчики и атрибуты отображения.
+// statusZoneSeed — a zone in the fake: the counters and the display
+// attributes.
 type statusZoneSeed struct {
 	id      int16
 	name    string
@@ -92,18 +99,19 @@ type statusZoneSeed struct {
 	pending int64
 	queued  int64
 	checked int64
-	hasUni  bool // name_unicode не NULL (в SQL — coalesce в '')
+	hasUni  bool // name_unicode not NULL (in SQL — coalesce into '')
 }
 
-// statusStatusSeed — строка счётчика распределения статусов (§5.5,
-// T-178): имя статуса легенды и значение строки crawler_counters.
+// statusStatusSeed — a row of the status distribution counter (§5.5,
+// T-178): the legend status name and the crawler_counters row value.
 type statusStatusSeed struct {
 	name  string
 	count int64
 }
 
-// statusLaravelSeed — строка laravel_domains для секции Laravel (§5.6):
-// label домена и его зона — JOIN выборки последних находок.
+// statusLaravelSeed — a laravel_domains row for the Laravel section
+// (§5.6): the domain label and its zone — the JOIN of the recent finds
+// selection.
 type statusLaravelSeed struct {
 	zone      int16
 	domain    int64
@@ -114,8 +122,9 @@ type statusLaravelSeed struct {
 	updatedAt time.Time
 }
 
-// statusIngestSeed — строка ingest_files (§5.7); указатели — NULL-колонки
-// схемы (журнал пишет полными строками, NULL легален для ручных вставок).
+// statusIngestSeed — an ingest_files row (§5.7); the pointers are the
+// NULL schema columns (the log is written with full rows, NULL is legal
+// for manual inserts).
 type statusIngestSeed struct {
 	id          int64
 	path        *string
@@ -128,10 +137,10 @@ type statusIngestSeed struct {
 	processedAt *time.Time
 }
 
-// statusGlitch — деградация формы ответа одного запроса (стиль фейков
-// monitor, T-M01/T-M02): ошибка самого Query, пустой набор строк (Next
-// сразу ложен), нечитаемая колонка первой строки (ошибка Scan), ошибка
-// итерации (rows.Err).
+// statusGlitch — a degradation of the response shape of one query (the
+// monitor fake style, T-M01/T-M02): an error of Query itself, an empty
+// row set (Next is false immediately), an unreadable column of the first
+// row (a Scan error), an iteration error (rows.Err).
 type statusGlitch struct {
 	queryErr error
 	empty    bool
@@ -139,28 +148,29 @@ type statusGlitch struct {
 	rowsErr  error
 }
 
-// statusPool — db.DB без БД: живая семантика zoneStatsSQL (GROUP BY зоны,
-// pending без deleted, queued/done без фильтра статуса, LEFT JOIN — зона
-// без доменов остаётся, ORDER BY name), throughputSQL (готовые значения)
-// и секций дашборда (§5.5–5.7): распределение статусов, счётчики/окно
-// Laravel по часам фейка, сортировка последних находок и ingest-файлов.
+// statusPool — a db.DB without a DB: the live semantics of zoneStatsSQL
+// (a GROUP BY of zones, pending without deleted, queued/done without a
+// status filter, LEFT JOIN — a zone without domains stays, ORDER BY
+// name), throughputSQL (ready values) and the dashboard sections
+// (§5.5–5.7): the status distribution, the Laravel counters/window by
+// the fake clock, the sorting of the recent finds and ingest files.
 type statusPool struct {
 	zones       []statusZoneSeed
 	thr         Throughput
 	domStatuses []statusStatusSeed
 	laravel     []statusLaravelSeed
-	zoneLaravel int64 // сумма zones.domains_laravel (laravelTotalsSQL, T-178)
+	zoneLaravel int64 // the sum of zones.domains_laravel (laravelTotalsSQL, T-178)
 	ingest      []statusIngestSeed
-	now         time.Time // часы сервера БД для окон laravelTotalsSQL
+	now         time.Time // the DB server clock for the laravelTotalsSQL windows
 
-	// glitches — деградации ответов по тексту запроса.
+	// glitches — the response degradations by the query text.
 	glitches map[string]statusGlitch
 
 	mu        sync.Mutex
 	queryErr  error
 	queries   []string
 	execCalls int
-	closes    int // сколько раз закрыты set'ы строк (rows.Close)
+	closes    int // how many times the row sets were closed (rows.Close)
 }
 
 var _ db.DB = (*statusPool)(nil)
@@ -174,7 +184,8 @@ func (p *statusPool) seedZone(id int16, name string, active bool, total, pending
 		total: total, pending: pending, queued: queued, checked: checked})
 }
 
-// seedZoneUnicode — зона с непустым name_unicode (NULL vs значение).
+// seedZoneUnicode — a zone with a non-empty name_unicode (NULL vs a
+// value).
 func (p *statusPool) seedZoneUnicode(id int16, name, unicode string, active bool, total, pending, queued, checked int64) {
 	p.zones = append(p.zones, statusZoneSeed{id: id, name: name, unicode: unicode, active: active,
 		total: total, pending: pending, queued: queued, checked: checked, hasUni: true})
@@ -186,7 +197,7 @@ func (p *statusPool) setQueryErr(err error) {
 	p.mu.Unlock()
 }
 
-// setGlitch — включить деградацию ответа конкретного запроса.
+// setGlitch — enable a degradation of the response of a specific query.
 func (p *statusPool) setGlitch(sql string, g statusGlitch) {
 	p.mu.Lock()
 	if p.glitches == nil {
@@ -196,17 +207,17 @@ func (p *statusPool) setGlitch(sql string, g statusGlitch) {
 	p.mu.Unlock()
 }
 
-// closeCount — сколько раз закрыты set'ы строк: FetchLaravelStats
-// закрывает первый set ДО второго запроса (без defer) — Close каждого
-// пути наблюдаем через счётчик.
+// closeCount — how many times the row sets were closed: FetchLaravelStats
+// closes the first set BEFORE the second query (without defer) — the Close
+// of every path is observable through the counter.
 func (p *statusPool) closeCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.closes
 }
 
-// bumpClose — счётчик Close из statusRows (вызывается вне замка Query:
-// set закрывает вызывающий после возврата Query).
+// bumpClose — the Close counter from statusRows (called outside the
+// Query lock: the caller closes the set after Query returns).
 func (p *statusPool) bumpClose() {
 	p.mu.Lock()
 	p.closes++
@@ -263,10 +274,11 @@ func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows,
 		}
 		return p.decorate(sql, [][]any{{p.zoneLaravel, last24h}}), nil
 	case laravelRecentSQL:
-		// Модель pool_size=1: второй запрос при открытом первом set
-		// занял бы единственное соединение (дедлок, комментарий
-		// FetchLaravelStats) — фейк требует, чтобы первый set был закрыт
-		// ДО второго запроса: порядок, а не только сумма Close.
+		// The pool_size=1 model: a second query with the first set open
+		// would take the only connection (a deadlock, the
+		// FetchLaravelStats comment) — the fake requires the first set to
+		// be closed BEFORE the second query: the order, not just the sum
+		// of the Closes.
 		if p.closes != 1 {
 			return nil, fmt.Errorf("statusPool: laravelRecentSQL при %d закрытых set'ах, want 1 (первый set закрывается до второго запроса)", p.closes)
 		}
@@ -278,14 +290,15 @@ func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows,
 	}
 }
 
-// statusBadColumn — маркер нечитаемой колонки: Scan фейка отвечает
-// ошибкой (как pgx на несовместимый тип приёмника).
+// statusBadColumn — the marker of an unreadable column: the fake's Scan
+// answers with an error (like pgx on an incompatible destination type).
 type statusBadColumn struct{}
 
-// decorate собирает statusRows запроса с его деградацией: empty — набор
-// без строк (Next сразу ложен), badRow — первая строка с нечитаемой
-// колонкой (ошибка Scan), rowsErr — ошибка итерации; Close считается
-// в пул (наблюдаемость закрытия set'а).
+// decorate assembles the statusRows of the query with its degradation:
+// empty — a set without rows (Next is false immediately), badRow — the
+// first row with an unreadable column (a Scan error), rowsErr — an
+// iteration error; Close is counted into the pool (the observability of
+// the set closing).
 func (p *statusPool) decorate(sql string, rows [][]any) *statusRows {
 	r := &statusRows{rows: rows, onClose: p.bumpClose}
 	g := p.glitches[sql]
@@ -301,8 +314,9 @@ func (p *statusPool) decorate(sql string, rows [][]any) *statusRows {
 	return r
 }
 
-// zoneRowsData применяет семантику zoneStatsSQL к сидам: справочник
-// зон с инкрементальными счётчиками (T-178) — без прохода domains.
+// zoneRowsData applies the zoneStatsSQL semantics to the seeds: the zone
+// reference table with incremental counters (T-178) — without a pass over
+// domains.
 func (p *statusPool) zoneRowsData() [][]any {
 	sorted := append([]statusZoneSeed(nil), p.zones...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].name < sorted[j].name })
@@ -317,8 +331,9 @@ func (p *statusPool) zoneRowsData() [][]any {
 	return rows
 }
 
-// laravelRowsData применяет семантику laravelRecentSQL: JOIN домена и
-// зоны по ключу строки, сортировка по updated_at DESC, LIMIT 10.
+// laravelRowsData applies the laravelRecentSQL semantics: a JOIN of the
+// domain and the zone by the row key, the updated_at DESC sort,
+// LIMIT 10.
 func (p *statusPool) laravelRowsData() [][]any {
 	names := make(map[int16]string, len(p.zones))
 	for _, z := range p.zones {
@@ -337,8 +352,8 @@ func (p *statusPool) laravelRowsData() [][]any {
 	return rows
 }
 
-// ingestRowsData применяет семантику ingestRecentSQL: processed_at DESC
-// (NULL последними), id DESC внутри одной секунды, LIMIT 10.
+// ingestRowsData applies the ingestRecentSQL semantics: processed_at DESC
+// (NULL last), id DESC within one second, LIMIT 10.
 func (p *statusPool) ingestRowsData() [][]any {
 	sorted := append([]statusIngestSeed(nil), p.ingest...)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -364,18 +379,18 @@ func (p *statusPool) ingestRowsData() [][]any {
 	return rows
 }
 
-// statusRows — pgx.Rows с заготовленными строками (Scan позиционный,
-// типы int16/string/bool/int64/float32/float64/[]byte и указатели для
-// NULL-колонок — одинарные значения и двойные для разворота NULL).
-// Счётчик Close считает вызовы Close (не состояние соединения): явные
-// закрытия set'ов наблюдаются по одному на каждый путь выхода.
-// Копия общего фейка тестов CLI (cmd/crawlerctl): тест-файлы разных
-// пакетов не импортируют друг друга.
+// statusRows — pgx.Rows over prepared rows (a positional Scan, the types
+// int16/string/bool/int64/float32/float64/[]byte and pointers for the
+// NULL columns — single values and double ones for unfolding NULL).
+// The Close counter counts Close calls (not the connection state): the
+// explicit set closures are observed one per exit path.
+// A copy of the CLI tests' shared fake (cmd/crawlerctl): the test files
+// of different packages do not import each other.
 type statusRows struct {
 	rows    [][]any
 	i       int
-	err     error  // ответ Err — деградация итерации
-	onClose func() // счётчик Close пула
+	err     error  // the Err answer — the iteration degradation
+	onClose func() // the pool Close counter
 }
 
 func (r *statusRows) Close() {
@@ -444,8 +459,8 @@ func (r *statusRows) Scan(dest ...any) error {
 	return nil
 }
 
-// assignPtr — разворот NULL-колонок: значение-указатель из строки фейка
-// (nil — NULL) в приёмник-указатель-на-указатель pgx.
+// assignPtr — the unfolding of NULL columns: a pointer value from a fake
+// row (nil — NULL) into a pointer-to-pointer pgx destination.
 func assignPtr[T any](dst **T, v any) {
 	if p, ok := v.(*T); ok {
 		*dst = p
@@ -454,10 +469,10 @@ func assignPtr[T any](dst **T, v any) {
 	*dst = nil
 }
 
-// --- фейковый XLEN -----------------------------------------------------------
+// --- fake XLEN -----------------------------------------------------------
 
-// statusLenner — StreamLener: длины по стримам (или сбой любой длины),
-// фиксирует порядок опроса.
+// statusLenner — StreamLener: the lengths per stream (or a failure of any
+// length), records the polling order.
 type statusLenner struct {
 	lens  map[string]int64
 	err   error
@@ -481,7 +496,7 @@ func (l *statusLenner) order() []string {
 	return append([]string(nil), l.calls...)
 }
 
-// --- SQL и семантика выборок ---------------------------------------------------
+// --- SQL and selection semantics -------------------------------------------------
 
 func TestStatusSQLContract(t *testing.T) {
 	if zoneStatsSQL != wantZoneStatsSQL {
@@ -504,16 +519,16 @@ func TestStatusSQLContract(t *testing.T) {
 	}
 }
 
-// TestFetchZoneStats — сводка зон из счётчиков справочника (T-178):
-// без JOIN domains; pending/queued/checked — колонки зон (базовое
-// множество status <> deleted ведут дельты и реконсиляция), Done —
-// та же колонка domains_checked; сортировка по имени, unicode и флаг
-// активности дочитываются.
+// TestFetchZoneStats — the zone summary from the reference table counters
+// (T-178): without a JOIN over domains; pending/queued/checked are the
+// zone columns (the base set status <> deleted is fed by the deltas and
+// the reconciliation); Done is the same domains_checked column; the sort
+// by name, the unicode and the active flag are read through.
 func TestFetchZoneStats(t *testing.T) {
 	pool := newStatusPool()
 	pool.seedZoneUnicode(2, "com", "com", true, 1000, 3, 1, 400)
 	pool.seedZone(1, "crawl.test", true, 100, 2, 2, 40)
-	pool.seedZone(3, "empty.test", false, 0, 0, 0, 0) // зона без доменов
+	pool.seedZone(3, "empty.test", false, 0, 0, 0, 0) // a zone without domains
 
 	zones, err := FetchZoneStats(context.Background(), pool)
 	if err != nil {
@@ -534,7 +549,7 @@ func TestFetchZoneStats(t *testing.T) {
 	}
 }
 
-// TestFetchZoneStatsEmpty — зон нет: пустой результат без ошибки.
+// TestFetchZoneStatsEmpty — no zones: an empty result without an error.
 func TestFetchZoneStatsEmpty(t *testing.T) {
 	zones, err := FetchZoneStats(context.Background(), newStatusPool())
 	if err != nil {
@@ -545,8 +560,8 @@ func TestFetchZoneStatsEmpty(t *testing.T) {
 	}
 }
 
-// TestFetchThroughput — одна строка замеров; типы колонок
-// (int64/float64), включая длину окна корзин (T-203).
+// TestFetchThroughput — one row of the measurements; the column types
+// (int64/float64), including the bucket window length (T-203).
 func TestFetchThroughput(t *testing.T) {
 	pool := newStatusPool()
 	pool.thr = Throughput{DoneToday: 2279, ElapsedSec: 3720.5, ResultsHour: 6132, RenderedHour: 1025, HourWindowSec: 5400}
@@ -563,8 +578,8 @@ func TestFetchThroughput(t *testing.T) {
 	}
 }
 
-// TestStatusFetchErrors — ошибки пула возвращаются с контекстом пакета;
-// nil-пул — ошибка, а не паника.
+// TestStatusFetchErrors — the pool errors are returned with the package
+// context; a nil pool is an error, not a panic.
 func TestStatusFetchErrors(t *testing.T) {
 	boom := errors.New("boom")
 	pool := newStatusPool()
@@ -583,12 +598,12 @@ func TestStatusFetchErrors(t *testing.T) {
 	}
 }
 
-// TestFetchRowDegradations — деградации формы ответа на уровне строк
-// (стиль фейков monitor): нечитаемая колонка — ошибка Scan с контекстом
-// «чтение», ошибка итерации (rows.Err) — ошибка выборки целиком с
-// исходным текстом; пустой скалярный агрегат темпа — «пустой ответ»,
-// а не «чтение» (мутанты вырезания return глотали бы ошибку или
-// подменяли её текст).
+// TestFetchRowDegradations — the row-level degradations of the response
+// shape (the monitor fake style): an unreadable column is a Scan error
+// with the "reading" context, an iteration error (rows.Err) is the error
+// of the whole selection with the original text; an empty scalar
+// throughput aggregate is "empty answer", not "reading" (the return-cut
+// mutants would swallow the error or substitute its text).
 func TestFetchRowDegradations(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -631,10 +646,10 @@ func TestFetchRowDegradations(t *testing.T) {
 	}
 }
 
-// --- очереди -------------------------------------------------------------------
+// --- queues -------------------------------------------------------------------
 
-// TestFetchQueueLens — все рабочие стримы в порядке ТЗ 4.2; ошибка
-// останавливает сбор (Redis один); nil-клиент — ошибка.
+// TestFetchQueueLens — all the working streams in the spec 4.2 order; an
+// error stops the collection (a single Redis); a nil client is an error.
 func TestFetchQueueLens(t *testing.T) {
 	lens := map[string]int64{"q:dns": 5, "q:http": 0, "q:render": 12, "q:render-fallback": 2, "q:analyze": 3, "q:dead": 1}
 	lenner := &statusLenner{lens: lens}
@@ -648,10 +663,10 @@ func TestFetchQueueLens(t *testing.T) {
 	if order := lenner.order(); !reflect.DeepEqual(order, Streams) {
 		t.Errorf("порядок опроса = %v, want %v", order, Streams)
 	}
-	// S-P3-1: перечень — производная от единственного источника очереди
-	// (queue.allStreams), порядок конвейера; q:render-fallback (T-237)
-	// входит как рабочий стрим. Копия, не срез источника: мутация
-	// результата на списки пакета не влияет.
+	// S-P3-1: the list is derived from the single source of the queue
+	// (queue.allStreams), the pipeline order; q:render-fallback (T-237)
+	// enters as a working stream. A copy, not a slice of the source: a
+	// mutation of the result does not affect the package lists.
 	if want := []string{"q:dns", "q:http", "q:render", "q:render-fallback", "q:analyze", "q:dead"}; !reflect.DeepEqual(Streams, want) {
 		t.Errorf("Streams = %v, want %v (все стримы ТЗ 4.2 + q:render-fallback)", Streams, want)
 	}
@@ -672,28 +687,30 @@ func TestFetchQueueLens(t *testing.T) {
 	}
 }
 
-// --- секции дашборда (ТЗД §5.5–5.7) ----------------------------------------------
+// --- dashboard sections (dashboard spec §5.5–5.7) ----------------------------------------------
 
-// strPtr — указатель строки (NULL-колонки сидов).
+// strPtr — a string pointer (the NULL columns of the seeds).
 func strPtr(s string) *string { return &s }
 
-// int16Ptr/int64Ptr — указатели чисел (NULL-колонки сидов ingest).
+// int16Ptr/int64Ptr — number pointers (the NULL columns of the ingest
+// seeds).
 func int16Ptr(v int16) *int16 { return &v }
 
 func int64Ptr(v int64) *int64 { return &v }
 
-// TestFetchDomainStatuses — распределение по именам ТЗ 6.2 из строк
-// status_* crawler_counters (T-178): все статусы model.Statuses с нулями
-// (полная легенда), отсутствующие строки — 0; строка с именем вне
-// легенды не отображается (реконсиляция пишет только model.Statuses —
-// чужая строка это ручная правка таблицы); ошибки и nil-пул.
+// TestFetchDomainStatuses — the distribution over the spec 6.2 names from
+// the status_* rows of crawler_counters (T-178): all the model.Statuses
+// statuses with zeros (the full legend), the missing rows are 0; a row
+// with a name outside the legend is not displayed (the reconciliation
+// writes only model.Statuses — a foreign row means a manual fix of the
+// table); the errors and a nil pool.
 func TestFetchDomainStatuses(t *testing.T) {
 	pool := newStatusPool()
 	pool.domStatuses = []statusStatusSeed{
 		{model.StatusNew.String(), 1000},
 		{model.StatusAlive.String(), 40},
 		{model.StatusDeleted.String(), 3},
-		{"unknown", 1}, // имя вне легенды model.Statuses — не отображается
+		{"unknown", 1}, // a name outside the model.Statuses legend — not displayed
 	}
 	got, err := FetchDomainStatuses(context.Background(), pool)
 	if err != nil {
@@ -710,7 +727,7 @@ func TestFetchDomainStatuses(t *testing.T) {
 		t.Errorf("statuses = %v\nwant %v", got, want)
 	}
 
-	// Пустая таблица — легенда из нулей, не пустая карта.
+	// An empty table — a legend of zeros, not an empty map.
 	got, err = FetchDomainStatuses(context.Background(), newStatusPool())
 	if err != nil {
 		t.Fatalf("FetchDomainStatuses (пусто): %v", err)
@@ -724,7 +741,7 @@ func TestFetchDomainStatuses(t *testing.T) {
 		}
 	}
 
-	// Ошибки пула и nil-пул.
+	// The pool errors and a nil pool.
 	pool = newStatusPool()
 	pool.setQueryErr(errors.New("boom"))
 	if _, err := FetchDomainStatuses(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: статусы:") {
@@ -735,13 +752,13 @@ func TestFetchDomainStatuses(t *testing.T) {
 	}
 }
 
-// TestFetchLaravelStats — счётчики (всего и окно 24 ч по updated_at),
-// последние находки: домен label.зона через JOIN, сортировка updated_at
-// DESC, LIMIT 10, ver_min/ver_max NULL → пустые строки.
+// TestFetchLaravelStats — the counters (the total and the 24 h window by
+// updated_at), the recent finds: the domain label.zone via a JOIN, the
+// updated_at DESC sort, LIMIT 10, ver_min/ver_max NULL → empty strings.
 func TestFetchLaravelStats(t *testing.T) {
 	pool := newStatusPool()
 	pool.seedZone(1, "crawl.test", true, 0, 0, 0, 0)
-	pool.zoneLaravel = 3 // сумма zones.domains_laravel (T-178): Total секции
+	pool.zoneLaravel = 3 // the sum of zones.domains_laravel (T-178): the section Total
 	fresh := pool.now.Add(-2 * time.Hour)
 	stale := pool.now.Add(-30 * time.Hour)
 	pool.laravel = []statusLaravelSeed{
@@ -756,9 +773,10 @@ func TestFetchLaravelStats(t *testing.T) {
 	if calls := pool.calls(); !reflect.DeepEqual(calls, []string{wantLaravelTotalsSQL, wantLaravelRecentSQL}) {
 		t.Fatalf("запросы = %q, хочу [laravelTotalsSQL laravelRecentSQL]", calls)
 	}
-	// Первый set закрывается ДО второго запроса, второй — defer: ровно
-	// два Close на успешном проходе (удержание set'а занимало бы
-	// соединение пула — комментарий FetchLaravelStats).
+	// The first set is closed BEFORE the second query, the second one —
+	// with defer: exactly two Closes on a successful pass (holding the
+	// set would occupy a pool connection — the FetchLaravelStats
+	// comment).
 	if n := pool.closeCount(); n != 2 {
 		t.Errorf("закрытий set'ов = %d, want 2 (агрегат до второго запроса + последние через defer)", n)
 	}
@@ -774,7 +792,8 @@ func TestFetchLaravelStats(t *testing.T) {
 		t.Errorf("recent =\n%+v\nwant\n%+v", st.Recent, want)
 	}
 
-	// Пустая таблица: нули и пустой срез последних (не nil — секция жива).
+	// An empty table: zeros and an empty recent slice (not nil — the
+	// section is alive).
 	st, err = FetchLaravelStats(context.Background(), newStatusPool())
 	if err != nil {
 		t.Fatalf("FetchLaravelStats (пусто): %v", err)
@@ -783,7 +802,8 @@ func TestFetchLaravelStats(t *testing.T) {
 		t.Errorf("пустая таблица: %+v, хочу нули и пустой recent", st)
 	}
 
-	// Ошибка любого из двух запросов — ошибка секции целиком.
+	// An error of either of the two queries is the error of the whole
+	// section.
 	pool = newStatusPool()
 	pool.seedZone(1, "crawl.test", true, 0, 0, 0, 0)
 	pool.laravel = []statusLaravelSeed{{zone: 1, domain: 1, label: "shop", updatedAt: fresh}}
@@ -796,12 +816,13 @@ func TestFetchLaravelStats(t *testing.T) {
 	}
 }
 
-// TestFetchLaravelStatsDegradations — деградации обоих запросов секции:
-// пустой агрегат различает rows-ошибку (реальная причина ценнее
-// синтетической) и честное «пусто»; первый set закрывается ДО второго
-// запроса (без defer) — Close каждого пути выхода виден счётчиком
-// фейка (мутанты вырезания rows.Close глотали бы закрытие set'а,
-// вырезание return — ошибку целиком).
+// TestFetchLaravelStatsDegradations — the degradations of both queries of
+// the section: an empty aggregate distinguishes a rows error (the real
+// cause is more valuable than a synthetic one) from an honest "empty";
+// the first set is closed BEFORE the second query (without defer) — the
+// Close of every exit path is visible to the fake's counter (the
+// rows.Close-cut mutants would swallow the set closing, the return-cut —
+// the whole error).
 func TestFetchLaravelStatsDegradations(t *testing.T) {
 	seeded := func(glitches map[string]statusGlitch) *statusPool {
 		pool := newStatusPool()
@@ -814,7 +835,7 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	// Пустой агрегат без rows-ошибки — честное «пусто».
+	// An empty aggregate without a rows error — an honest "empty".
 	pool := seeded(map[string]statusGlitch{laravelTotalsSQL: {empty: true}})
 	_, err := FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: пустой ответ агрегата") {
@@ -824,14 +845,16 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 		t.Errorf("пустой агрегат: Close = %d, want 1 (set закрыт до синтетической ошибки)", n)
 	}
 
-	// Пустой агрегат с rows-ошибкой — ошибка уровня строк ценнее.
+	// An empty aggregate with a rows error — a row-level error is more
+	// valuable.
 	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {empty: true, rowsErr: errors.New("соединение сброшено")}})
 	_, err = FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: соединение сброшено") {
 		t.Fatalf("пустой агрегат с rows-ошибкой: ошибка = %v, want причину уровня строк", err)
 	}
 
-	// Нечитаемая строка агрегата: set закрывается до возврата ошибки.
+	// An unreadable aggregate row: the set is closed before the error is
+	// returned.
 	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {badRow: true}})
 	_, err = FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: чтение:") {
@@ -841,7 +864,8 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 		t.Errorf("нечитаемая строка агрегата: Close = %d, want 1", n)
 	}
 
-	// Ошибка итерации агрегата — после успешного Scan, set закрыт.
+	// An aggregate iteration error — after a successful Scan, the set is
+	// closed.
 	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {rowsErr: errors.New("соединение сброшено")}})
 	_, err = FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: соединение сброшено") {
@@ -851,21 +875,21 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 		t.Errorf("ошибка итерации агрегата: Close = %d, want 1", n)
 	}
 
-	// Ошибка второго запроса — контекст «последние».
+	// An error of the second query — the "recent" context.
 	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {queryErr: errors.New("бд недоступна")}})
 	_, err = FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: последние: бд недоступна") {
 		t.Fatalf("ошибка второго запроса: ошибка = %v, want «последние»", err)
 	}
 
-	// Нечитаемая строка последних находок.
+	// An unreadable row of the recent finds.
 	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {badRow: true}})
 	_, err = FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: последние: чтение:") {
 		t.Fatalf("нечитаемая строка последних: ошибка = %v, want «чтение»", err)
 	}
 
-	// Ошибка итерации последних находок.
+	// An iteration error of the recent finds.
 	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {rowsErr: errors.New("соединение сброшено")}})
 	_, err = FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: последние: соединение сброшено") {
@@ -873,9 +897,9 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 	}
 }
 
-// TestFetchIngestReports — последние файлы: processed_at DESC (NULL
-// последними), id DESC при равенстве, LIMIT 10; действия add/delete
-// по модельным именам, NULL-колонки — нулевые значения.
+// TestFetchIngestReports — the recent files: processed_at DESC (NULL
+// last), id DESC on ties, LIMIT 10; the add/delete actions by the model
+// names, the NULL columns — zero values.
 func TestFetchIngestReports(t *testing.T) {
 	pool := newStatusPool()
 	at := func(h time.Duration) *time.Time {
@@ -883,11 +907,11 @@ func TestFetchIngestReports(t *testing.T) {
 		return &t
 	}
 	pool.ingest = []statusIngestSeed{
-		// NULL processed_at — «последним», несмотря на большой id.
+		// NULL processed_at — "last", despite the large id.
 		{id: 77},
 		{id: 3, path: strPtr("crawl.test/add/three.txt"), action: int16Ptr(int16(model.ActionAdd)),
 			lines: int64Ptr(30), added: int64Ptr(28), existed: int64Ptr(2), rejected: int64Ptr(0), processedAt: at(1)},
-		// Та же секунда, что id 3 — порядок по id DESC.
+		// The same second as id 3 — the id DESC order.
 		{id: 5, path: strPtr("crawl.test/delete/five.txt"), action: int16Ptr(int16(model.ActionDelete)),
 			lines: int64Ptr(50), deleted: int64Ptr(49), rejected: int64Ptr(1), processedAt: at(1)},
 		{id: 4, path: strPtr("crawl.test/add/four.txt"), action: int16Ptr(int16(model.ActionAdd)),
@@ -904,13 +928,14 @@ func TestFetchIngestReports(t *testing.T) {
 		{Path: "crawl.test/delete/five.txt", Action: "delete", LinesTotal: 50, Deleted: 49, Rejected: 1, ProcessedAt: *at(1)},
 		{Path: "crawl.test/add/three.txt", Action: "add", LinesTotal: 30, Added: 28, Existed: 2, ProcessedAt: *at(1)},
 		{Path: "crawl.test/add/four.txt", Action: "add", LinesTotal: 10, Added: 10, ProcessedAt: *at(5)},
-		{}, // NULL processed_at — последняя строка, колонки развёрнуты в нули
+		{}, // NULL processed_at — the last row, the columns unfolded into zeros
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("reports =\n%+v\nwant\n%+v", got, want)
 	}
 
-	// Код действия вне таблицы ТЗ 6.1 — имя Action(N), не паника.
+	// An action code outside the spec 6.1 table — the Action(N) name, not
+	// a panic.
 	pool2 := newStatusPool()
 	pool2.ingest = []statusIngestSeed{{id: 1, action: int16Ptr(7), processedAt: at(1)}}
 	got, err = FetchIngestReports(context.Background(), pool2)
@@ -931,7 +956,7 @@ func TestFetchIngestReports(t *testing.T) {
 	}
 }
 
-// --- расчёты ---------------------------------------------------------------------
+// --- calculations ---------------------------------------------------------------
 
 func TestComputeTotals(t *testing.T) {
 	zones := []ZoneStats{
@@ -947,11 +972,13 @@ func TestComputeTotals(t *testing.T) {
 	}
 }
 
-// TestComputeRates — защита от деления на ноль и коротких окон: скорость
-// доменов только при окне ≥ MinSpeedWindowSec; ETA — при известной
-// ненулевой скорости (или пустом цикле), округление и минимум 1с.
+// TestComputeRates — the division-by-zero and short-window protection:
+// the domain rate only with a window ≥ MinSpeedWindowSec; the ETA — with
+// a known non-zero rate (or an empty circle), the rounding and the
+// minimum of 1s.
 func TestComputeRates(t *testing.T) {
-	// Рабочий случай: 3600 проверок за час → 1/с; остаток 90 → ETA 90с.
+	// A working case: 3600 checks per hour → 1/s; the remainder 90 →
+	// the ETA 90s.
 	r := ComputeRates(Throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600}, 60, 30)
 	if !r.DomainsKnown || r.DomainsPerSec != 1 {
 		t.Errorf("скорость доменов = %v (%v), хочу 1 (известна)", r.DomainsPerSec, r.DomainsKnown)
@@ -966,8 +993,9 @@ func TestComputeRates(t *testing.T) {
 		t.Errorf("ETA = %d (%v), хочу 90 (известна)", r.ETASec, r.ETAKnown)
 	}
 
-	// Окно короче минимума: скорости доменов и ETA нет, часовые считаются
-	// (нулевое окно корзин — фиксированный делитель часа, T-203).
+	// A window shorter than the minimum: no domain rate and no ETA; the
+	// hourly ones are computed (a zero bucket window — the fixed hour
+	// divisor, T-203).
 	r = ComputeRates(Throughput{ElapsedSec: MinSpeedWindowSec - 1, ResultsHour: 3600}, 10, 0)
 	if r.DomainsKnown || r.DomainsPerSec != 0 {
 		t.Errorf("короткое окно: Known=%v speed=%v, хочу неизвестную", r.DomainsKnown, r.DomainsPerSec)
@@ -979,22 +1007,22 @@ func TestComputeRates(t *testing.T) {
 		t.Errorf("результаты/с = %v, хочу 1 (фиксированный делитель при нулевом окне)", r.ResultsPerSec)
 	}
 
-	// Окно корзин темпа (T-203): делитель — фактическая длина покрытого
-	// окна (prev+cur корзины, 1–2 ч), скорость несмещённа: 7200 строк за
-	// 5400 с окна → 4/3 в секунду; нулевое окно ручной сборки — прежний
-	// фиксированный час.
+	// The throughput bucket window (T-203): the divisor is the actual
+	// length of the covered window (the prev+cur buckets, 1–2 h); the
+	// rate is unbiased: 7200 rows over a 5400 s window → 4/3 per second;
+	// a zero window of a manual assembly — the former fixed hour.
 	r = ComputeRates(Throughput{ResultsHour: 7200, RenderedHour: 3600, HourWindowSec: 5400}, 0, 0)
 	if r.ResultsPerSec != 7200.0/5400.0 || r.RenderPerSec != 3600.0/5400.0 {
 		t.Errorf("скорости окна корзин = %v/%v, хочу %v/%v (деление на длину окна)",
 			r.ResultsPerSec, r.RenderPerSec, 7200.0/5400.0, 3600.0/5400.0)
 	}
 
-	// Граница окна ровно на минимуме — скорость известна.
+	// The window boundary exactly at the minimum — the rate is known.
 	if r := ComputeRates(Throughput{DoneToday: MinSpeedWindowSec, ElapsedSec: MinSpeedWindowSec}, 1, 0); !r.DomainsKnown {
 		t.Error("окно = MinSpeedWindowSec: скорость должна быть известна")
 	}
 
-	// Скорость 0 (за окно ни одной проверки): ETA н/д, не паника.
+	// A rate of 0 (no checks in the window): the ETA is n/a, not a panic.
 	r = ComputeRates(Throughput{DoneToday: 0, ElapsedSec: 7200}, 5, 0)
 	if !r.DomainsKnown || r.DomainsPerSec != 0 {
 		t.Errorf("нулевые проверки: Known=%v speed=%v, хочу известную 0", r.DomainsKnown, r.DomainsPerSec)
@@ -1003,15 +1031,16 @@ func TestComputeRates(t *testing.T) {
 		t.Error("скорость 0: ETA не должна быть известна (деление на ноль)")
 	}
 
-	// Пустой цикл: ETA 0 даже без скорости.
+	// An empty circle: the ETA is 0 even without a rate.
 	r = ComputeRates(Throughput{ElapsedSec: 1}, 0, 0)
 	if !r.ETAKnown || r.ETASec != 0 {
 		t.Errorf("пустой цикл: ETA = %d (%v), хочу 0 (известна)", r.ETASec, r.ETAKnown)
 	}
 
-	// Пустой цикл при известной ненулевой скорости: ETA остаётся 0 —
-	// ветка расчёта требует положительный остаток, кламп «минимум 1с»
-	// на нулевом остатке не действует (мутант «> 0 → >= 0» поднял бы 1).
+	// An empty circle with a known non-zero rate: the ETA stays 0 — the
+	// calculation branch requires a positive remainder; the "minimum 1s"
+	// clamp does not act on a zero remainder (the "> 0 → >= 0" mutant
+	// would have lifted a 1).
 	r = ComputeRates(Throughput{DoneToday: 600, ElapsedSec: 600}, 0, 0)
 	if !r.DomainsKnown || r.DomainsPerSec != 1 {
 		t.Errorf("пустой цикл при скорости: Known=%v speed=%v, хочу известную 1", r.DomainsKnown, r.DomainsPerSec)
@@ -1020,7 +1049,7 @@ func TestComputeRates(t *testing.T) {
 		t.Errorf("пустой цикл при скорости: ETA = %d (%v), хочу 0 (известна)", r.ETASec, r.ETAKnown)
 	}
 
-	// Округление вверх/вниз и минимум: 100/3 = 33.3 → 33; 1/3 = 0.3 → 1.
+	// Rounding up/down and the minimum: 100/3 = 33.3 → 33; 1/3 = 0.3 → 1.
 	if r := ComputeRates(Throughput{DoneToday: 3000, ElapsedSec: 1000}, 100, 0); r.ETASec != 33 {
 		t.Errorf("ETA 100/3 = %d, хочу 33", r.ETASec)
 	}
@@ -1029,15 +1058,16 @@ func TestComputeRates(t *testing.T) {
 	}
 }
 
-// TestMinSpeedWindowSec — лимит окна пин литералом: адаптивные проверки
-// TestComputeRates используют константу и мутанта ±1 не замечают.
+// TestMinSpeedWindowSec — the window limit pinned by a literal: the
+// adaptive checks of TestComputeRates use the constant and would not
+// notice the ±1 mutant.
 func TestMinSpeedWindowSec(t *testing.T) {
 	if MinSpeedWindowSec != 600 {
 		t.Errorf("MinSpeedWindowSec = %d, want 600 (10 минут, ТЗ 3.3)", MinSpeedWindowSec)
 	}
 }
 
-// TestFormatDuration — округлые интервалы: секунды/минуты/часы/дни.
+// TestFormatDuration — rounded intervals: seconds/minutes/hours/days.
 func TestFormatDuration(t *testing.T) {
 	cases := []struct {
 		sec  int64
@@ -1047,19 +1077,19 @@ func TestFormatDuration(t *testing.T) {
 		{45, "45с"},
 		{59, "59с"},
 		{60, "1м"},
-		{89, "1м"},    // (89+30)/60 = 1: граница округления к минуте
-		{90, "2м"},    // округление к минуте
-		{3599, "60м"}, // 59м59с → 60м
+		{89, "1м"},    // (89+30)/60 = 1: the rounding boundary to a minute
+		{90, "2м"},    // rounding to a minute
+		{3599, "60м"}, // 59m59s → 60m
 		{3600, "1ч 00м"},
-		{5370, "1ч 29м"}, // 1ч29м30с: минуты от остатка, не от полного числа
-		{7199, "1ч 59м"}, // 1ч59м59с: час — полные 3600-секундные блоки
+		{5370, "1ч 29м"}, // 1h29m30s: the minutes from the remainder, not from the whole number
+		{7199, "1ч 59м"}, // 1h59m59s: an hour is full 3600-second blocks
 		{19200, "5ч 20м"},
-		{86399, "23ч 59м"}, // край ветки часов: сутки ещё не начались
+		{86399, "23ч 59м"}, // the edge of the hours branch: the day has not started yet
 		{86400, "1д 0ч"},
-		{89999, "1д 0ч"},   // 1д 0ч59м59с: час от остатка суток
-		{93599, "1д 1ч"},   // 1д 1ч59м59с
-		{93600, "1д 2ч"},   // ровно 1д 2ч
-		{172799, "1д 23ч"}, // 1д 23ч59м59с: край перед «2д»
+		{89999, "1д 0ч"},   // 1d 0h59m59s: the hour from the day remainder
+		{93599, "1д 1ч"},   // 1d 1h59m59s
+		{93600, "1д 2ч"},   // exactly 1d 2h
+		{172799, "1д 23ч"}, // 1d 23h59m59s: the edge before "2d"
 		{275400, "3д 4ч"},
 	}
 	for _, tc := range cases {

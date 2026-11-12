@@ -1,15 +1,15 @@
-// Юнит-тесты Flags: номера битов (жёсткая сверка с комментарием колонки
-// domains.flags в миграции 000001), Set/Test/Clear, именованные биты
-// is_idn/render_pending, вывод.
+// Unit tests of Flags: the bit numbers (a strict cross-check with the
+// comment of the domains.flags column in migration 000001), Set/Test/Clear,
+// the named is_idn/render_pending bits, the output.
 package model
 
 import "testing"
 
-// TestFlagsBitsMatchSchema — биты зафиксированы: бит 0 is_idn и бит 1
-// render_pending — комментарий миграции 000001; бит 2 http_published —
-// T-108, бит 3 dead_host_cutoff — T-164 (модель и docs/schema.md;
-// миграций не требует — колонка flags изначально допускает
-// дополнительные биты, ТЗ 6.1 «…»).
+// TestFlagsBitsMatchSchema — the bits are pinned: bit 0 is_idn and bit 1
+// render_pending — the comment of migration 000001; bit 2 http_published —
+// T-108, bit 3 dead_host_cutoff — T-164 (the model and docs/schema.md;
+// no migration is needed — the flags column initially allows additional
+// bits, spec 6.1 «…»).
 func TestFlagsBitsMatchSchema(t *testing.T) {
 	if FlagIDN != 1 {
 		t.Errorf("FlagIDN = %d, want 1 (бит 0)", int16(FlagIDN))
@@ -61,8 +61,8 @@ func TestFlagsSetTestClear(t *testing.T) {
 	}
 }
 
-// TestFlagsTestAnyOf — Test с несколькими битами истинен, если установлен
-// хотя бы один (удобно проверять «есть ли что-то из …»).
+// TestFlagsTestAnyOf — Test with several bits is true if at least one is
+// set (a convenient way to check "whether there is anything of …").
 func TestFlagsTestAnyOf(t *testing.T) {
 	f := Flags(0)
 	f.Set(FlagRenderPending)
@@ -115,8 +115,8 @@ func TestFlagsString(t *testing.T) {
 		{FlagIDN | FlagRenderPending | FlagHTTPPublished, "is_idn|render_pending|http_published"},
 		{FlagDeadHostCutoff, "dead_host_cutoff"},
 		{FlagIDN | FlagDeadHostCutoff, "is_idn|dead_host_cutoff"},
-		{Flags(1 << 4), "0x10"},                     // неизвестный бит — остаток hex
-		{FlagIDN | Flags(1<<5|1<<6), "is_idn|0x60"}, // именованный + неизвестные
+		{Flags(1 << 4), "0x10"},                     // an unknown bit — the hex remainder
+		{FlagIDN | Flags(1<<5|1<<6), "is_idn|0x60"}, // named + unknown
 	}
 	for _, tc := range cases {
 		if got := tc.f.String(); got != tc.want {
@@ -125,8 +125,9 @@ func TestFlagsString(t *testing.T) {
 	}
 }
 
-// TestFlagsIDNValue — установленному биту is_idn соответствует значение 1
-// колонки flags (как в БД при вставке домена с меткой xn--…, ТЗ 5.2 п. 9).
+// TestFlagsIDNValue — the set is_idn bit corresponds to the value 1 of the
+// flags column (as in the DB when inserting a domain with an xn--… label,
+// spec 5.2 item 9).
 func TestFlagsIDNValue(t *testing.T) {
 	var f Flags
 	f.Set(FlagIDN)

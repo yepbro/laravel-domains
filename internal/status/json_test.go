@@ -1,9 +1,10 @@
-// Тесты канонического JSON-формата сводки (ТЗД §6.2, T-129): wire-контракт
-// общий для CLI crawlerctl status --json и снимка дашборда — правила
-// null (очереди без Redis, скорость без окна, ETA без скорости),
-// округление до трёх знаков, пустые зоны — «[]», а не null. Полную форму
-// снимка дашборда (встроенные секции + новые §5.5–5.8) проверяют тесты
-// internal/dashboard.
+// Tests of the canonical JSON format of the summary (dashboard spec
+// §6.2, T-129): the wire contract is shared by the CLI crawlerctl status
+// --json and the dashboard snapshot — the null rules (the queues without
+// Redis, a rate without a window, an ETA without a rate), rounding to
+// three digits, empty zones — "[]", not null. The full form of the
+// dashboard snapshot (the embedded sections + the new §5.5–5.8) is
+// checked by the internal/dashboard tests.
 package status
 
 import (
@@ -12,9 +13,9 @@ import (
 	"testing"
 )
 
-// TestBuildSummaryJSON — форма CLI --json: все секции на месте, nil-карта
-// очередей — null, скорости без окна — null-поля, округление до трёх
-// знаков.
+// TestBuildSummaryJSON — the form of the CLI --json: all the sections in
+// place, a nil queue map — null, the rates without a window — null
+// fields, rounding to three digits.
 func TestBuildSummaryJSON(t *testing.T) {
 	zones := []ZoneStats{
 		{ID: 1, Name: "crawl.test", IsActive: true, DomainsTotal: 100, DomainsChecked: 40, Pending: 60, Queued: 2, Done: 38},
@@ -22,7 +23,7 @@ func TestBuildSummaryJSON(t *testing.T) {
 	}
 	tot := ComputeTotals(zones)
 	thr := Throughput{DoneToday: 3599, ElapsedSec: 3600, ResultsHour: 7199, RenderedHour: 1, HourWindowSec: 3600}
-	rates := ComputeRates(thr, tot.Pending, tot.Queued) // ≈0.9997 дом./с
+	rates := ComputeRates(thr, tot.Pending, tot.Queued) // ≈0.9997 domains/s
 
 	doc := BuildSummaryJSON(zones, tot, thr, rates, nil)
 	b, err := json.Marshal(doc)
@@ -31,14 +32,14 @@ func TestBuildSummaryJSON(t *testing.T) {
 	}
 	got := string(b)
 
-	// Имена полей — дословно контракт CLI.
+	// The field names — literally the CLI contract.
 	for _, want := range []string{
 		`"zones":[{`,
 		`"name":"crawl.test"`,
 		`"name_unicode":"проверка.test"`,
 		`"domains_total":10`,
 		`"totals":{"domains_total":110,"domains_checked":40,"pending":60,"queued":2,"done":38}`,
-		`"queues":null`, // Redis недоступен
+		`"queues":null`, // Redis unavailable
 		`"throughput":{"done_today":3599,"elapsed_sec":3600,"results_hour":7199,"rendered_hour":1,"hour_window_sec":3600}`,
 	} {
 		if !strings.Contains(got, want) {
@@ -46,8 +47,8 @@ func TestBuildSummaryJSON(t *testing.T) {
 		}
 	}
 
-	// Округление до трёх знаков: 3599/3600 = 0.99972… → 1.0; часовые
-	// скорости — 7199/3600 = 1.99972… → 2; 1/3600 = 0.00027… → 0.
+	// Rounding to three digits: 3599/3600 = 0.99972… → 1.0; the hourly
+	// rates — 7199/3600 = 1.99972… → 2; 1/3600 = 0.00027… → 0.
 	r := doc.Rates
 	if r.DomainsPerSec == nil || *r.DomainsPerSec != 1 {
 		t.Errorf("domains_per_sec = %v, хочу 1 (3599/3600 округляется до 1)", r.DomainsPerSec)
@@ -62,7 +63,8 @@ func TestBuildSummaryJSON(t *testing.T) {
 		t.Errorf("eta_sec = %v, хочу 62", r.ETASec)
 	}
 
-	// Пустые зоны — «[]», не null; unicode пустой зоны опускается.
+	// Empty zones — "[]", not null; the unicode of an empty zone is
+	// omitted.
 	empty := BuildSummaryJSON(nil, Totals{}, Throughput{ElapsedSec: 300}, ComputeRates(Throughput{ElapsedSec: 300}, 10, 0), nil)
 	if empty.Zones == nil || len(empty.Zones) != 0 {
 		t.Errorf("zones = %v, хочу пустой срез", empty.Zones)
@@ -75,9 +77,9 @@ func TestBuildSummaryJSON(t *testing.T) {
 	}
 }
 
-// TestSummaryJSONFieldNames — имена полей секций закреплены (машинные
-// потребители CLI и дашборда не должны расходиться, ТЗД §6.2): точные
-// ключи JSON каждой секции.
+// TestSummaryJSONFieldNames — the field names of the sections are pinned
+// (the machine consumers of the CLI and the dashboard must not diverge,
+// dashboard spec §6.2): the exact JSON keys of each section.
 func TestSummaryJSONFieldNames(t *testing.T) {
 	cases := []struct {
 		typ  any

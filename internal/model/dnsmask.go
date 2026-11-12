@@ -2,29 +2,31 @@ package model
 
 import "fmt"
 
-// MaxSubdomains — максимум субдоменов (ТЗ 5.10): маска занимает bigint
-// (int8), доступны биты 0..62, бит 63 — знаковый и запрещён. Добавление
-// нового субдомена — новый бит, без миграции данных.
+// MaxSubdomains — the maximum number of subdomains (spec 5.10): the mask
+// occupies a bigint (int8), bits 0..62 are available; bit 63 is the sign
+// bit and is forbidden. Adding a new subdomain means a new bit, with no
+// data migration.
 const MaxSubdomains = 63
 
-// maxSubdomainID — верхняя граница номера бита маски (62).
+// maxSubdomainID — the upper bound of a mask bit number (62).
 const maxSubdomainID = MaxSubdomains - 1
 
-// DNSMask — битовая маска субдоменов: бит с номером subdomains.id
-// означает соответствующий субдомен. Используется в колонках
-// domains.dns_mask (резолвящиеся субдомены, ТЗ 5.4 п. 4) и
-// laravel_domains.found_on_mask (субдомены, где найден Laravel, ТЗ 5.8).
+// DNSMask — a bitmask of subdomains: the bit numbered subdomains.id denotes
+// the corresponding subdomain. Used in the domains.dns_mask column
+// (resolving subdomains, spec 5.4 item 4) and laravel_domains.found_on_mask
+// (the subdomains where Laravel was found, spec 5.8).
 //
-// Номера вне 0..62 запрещены: бит 63 знаковый, его установка сделала бы
-// значение отрицательным и сломала бы сравнения масок в SQL и Go.
-// Set/Unset отвергают такие номера ошибкой (все номера проверяются до
-// изменения — маска не меняется частично), Test для недопустимого номера
-// возвращает false: несуществующий бит не установлен.
+// Numbers outside 0..62 are forbidden: bit 63 is the sign bit; setting it
+// would make the value negative and would break mask comparisons in SQL
+// and Go. Set/Unset reject such numbers with an error (all numbers are
+// validated before any change — the mask is never modified partially),
+// and Test returns false for an invalid number: a nonexistent bit is not
+// set.
 type DNSMask int64
 
-// ValidateSubdomainID проверяет, что id допустим как номер бита маски
-// (целое 0..62). Используется и при добавлении субдоменов в справочник
-// (crawlerctl subdomains add, ТЗ 5.10).
+// ValidateSubdomainID checks that id is valid as a mask bit number
+// (an integer in 0..62). Also used when adding subdomains to the reference
+// table (crawlerctl subdomains add, spec 5.10).
 func ValidateSubdomainID(id int) error {
 	if id < 0 || id > maxSubdomainID {
 		return fmt.Errorf("model: номер субдомена %d вне диапазона 0..%d (максимум %d субдомена, бит 63 маски знаковый; ТЗ 5.10)", id, maxSubdomainID, MaxSubdomains)
@@ -32,7 +34,7 @@ func ValidateSubdomainID(id int) error {
 	return nil
 }
 
-// NewDNSMask строит маску с битами указанных субдоменов.
+// NewDNSMask builds a mask with the bits of the given subdomains.
 func NewDNSMask(ids ...int) (DNSMask, error) {
 	var m DNSMask
 	if err := m.Set(ids...); err != nil {
@@ -41,8 +43,8 @@ func NewDNSMask(ids ...int) (DNSMask, error) {
 	return m, nil
 }
 
-// Set включает биты указанных субдоменов. При любом недопустимом номере —
-// ошибка, маска остаётся без изменений.
+// Set sets the bits of the given subdomains. Any invalid number is an
+// error; the mask remains unchanged.
 func (m *DNSMask) Set(ids ...int) error {
 	for _, id := range ids {
 		if err := ValidateSubdomainID(id); err != nil {
@@ -55,8 +57,8 @@ func (m *DNSMask) Set(ids ...int) error {
 	return nil
 }
 
-// Unset выключает биты указанных субдоменов. При любом недопустимом
-// номере — ошибка, маска остаётся без изменений.
+// Unset clears the bits of the given subdomains. Any invalid number is an
+// error; the mask remains unchanged.
 func (m *DNSMask) Unset(ids ...int) error {
 	for _, id := range ids {
 		if err := ValidateSubdomainID(id); err != nil {
@@ -69,18 +71,20 @@ func (m *DNSMask) Unset(ids ...int) error {
 	return nil
 }
 
-// Test сообщает, установлен ли бит субдомена id (для id вне 0..62 — false).
+// Test reports whether the bit of subdomain id is set (for id outside
+// 0..62 — false).
 func (m DNSMask) Test(id int) bool {
 	return id >= 0 && id <= maxSubdomainID && m&subdomainBit(id) != 0
 }
 
-// IDs возвращает номера установленных битов по возрастанию — расшифровка
-// маски в терминах subdomains.id.
+// IDs returns the numbers of the set bits in ascending order — the mask
+// decoded in terms of subdomains.id.
 func (m DNSMask) IDs() []int {
 	ids := make([]int, 0, MaxSubdomains)
-	// Границы итерации избыточны для результата: недопустимые номера
-	// (-1, 63) Test отсекает проверкой диапазона (false), лишние итерации
-	// цикла ничего не добавляют в ids — оба мутанта строки эквивалентны.
+	// The iteration bounds are redundant for the result: invalid numbers
+	// (-1, 63) are cut off by Test's range check (false), and extra loop
+	// iterations add nothing to ids — both mutants of the line are
+	// equivalent.
 	// mutator-disable-next-line expression/comparison, numbers/decrementer
 	for id := 0; id < MaxSubdomains; id++ {
 		if m.Test(id) {
@@ -90,16 +94,16 @@ func (m DNSMask) IDs() []int {
 	return ids
 }
 
-// Count возвращает число установленных битов (0..63).
+// Count returns the number of set bits (0..63).
 func (m DNSMask) Count() int { return len(m.IDs()) }
 
-// IsEmpty сообщает, что не установлено ни одного бита.
+// IsEmpty reports that no bit is set.
 func (m DNSMask) IsEmpty() bool { return m == 0 }
 
-// Valid проверяет инвариант маски, прочитанной из внешнего источника
-// (БД): значение обязано быть неотрицательным — бит 63 не используется.
+// Valid checks the invariant of a mask read from an external source
+// (the DB): the value must be non-negative — bit 63 is not used.
 func (m DNSMask) Valid() bool { return m >= 0 }
 
-// subdomainBit возвращает маску из одного бита; id обязан быть проверен
-// ValidateSubdomainID заранее.
+// subdomainBit returns a single-bit mask; id must have been validated by
+// ValidateSubdomainID beforehand.
 func subdomainBit(id int) DNSMask { return DNSMask(1) << id }

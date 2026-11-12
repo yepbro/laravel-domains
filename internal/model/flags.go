@@ -5,80 +5,85 @@ import (
 	"strings"
 )
 
-// Flags — битовые признаки домена, колонка domains.flags (smallint,
-// ТЗ 6.1). Занятые биты:
+// Flags — bit flags of a domain, the domains.flags column (smallint,
+// spec 6.1). Occupied bits:
 //
-//	бит 0 — is_idn: метка домена содержит xn--, то есть домен задан
-//	         в unicode-нотации (ТЗ 5.2 п. 9; внутри системы хранится
-//	         punycode, бит — единственный след исходной нотации);
-//	бит 1 — render_pending: домен ждёт рендера — очередь q:render
-//	         переполнилась, домен дорабатывается позже и не задерживает
-//	         остальные этапы (ТЗ 5.6);
-//	бит 2 — http_published: задача q:http текущего DNS-эпизода
-//	         опубликована, а результат эпизода ещё не записан —
-//	         staging-пометка публикации (T-108): повторная доставка пачки
-//	         q:dns не дублирует задачу, а доисходит до записи;
-//	бит 3 — dead_host_cutoff: последний HTTP-эпизод завершён по мёртвой
-//	         сигнатуре apex+www (T-164) — признак для контрольной выборки
-//	         ложных cutoff-ов (запись результата ставит/снимает бит).
+//	bit 0 — is_idn: the domain label contains xn--, i.e. the domain is
+//	         given in unicode notation (spec 5.2 item 9; punycode is
+//	         stored inside the system, and the bit is the only trace of
+//	         the original notation);
+//	bit 1 — render_pending: the domain is waiting for a render — the
+//	         q:render queue has overflowed, the domain is processed
+//	         later and does not hold up the other stages (spec 5.6);
+//	bit 2 — http_published: the q:http task of the current DNS episode
+//	         has been published while the episode result is not recorded
+//	         yet — a publication staging mark (T-108): redelivery of a
+//	         q:dns chunk does not duplicate the task but completes the
+//	         way through to the record;
+//	bit 3 — dead_host_cutoff: the last HTTP episode finished on a dead
+//	         apex+www signature (T-164) — a sign used by the control
+//	         selection of false cutoffs (the result record sets/clears
+//	         the bit).
 //
-// Остальные биты свободны (в ТЗ 6.1 «…») — новые флаги добавляются
-// константами-степенями двойки.
+// The remaining bits are free (in spec 6.1 «…») — new flags are added as
+// powers-of-two constants.
 type Flags int16
 
-// Биты Flags.
+// Flags bits.
 const (
-	// FlagIDN — бит 0: is_idn (ТЗ 5.2 п. 9). Сдвиг на ноль в обе стороны
-	// равен 1 (1<<0 == 1>>0) — битовый мутант строки эквивалентен,
-	// значение бита пинит TestFlagsBitsMatchSchema.
+	// FlagIDN — bit 0: is_idn (spec 5.2 item 9). A shift by zero is 1 in
+	// both directions (1<<0 == 1>>0) — the bitwise mutant of the line is
+	// equivalent; the bit value is pinned by TestFlagsBitsMatchSchema.
 	// mutator-disable-next-line arithmetic/bitwise
 	FlagIDN Flags = 1 << 0
-	// FlagRenderPending — бит 1: render_pending (ТЗ 5.6).
+	// FlagRenderPending — bit 1: render_pending (spec 5.6).
 	FlagRenderPending Flags = 1 << 1
-	// FlagHTTPPublished — бит 2: http_published — staging-пометка
-	// «задача q:http этого эпизода опубликована» (T-108, DNS-04).
-	// Жизненный цикл: dns-worker ставит бит сразу после успешной
-	// публикации q:http (до записи результата эпизода); снимает запись
-	// результата (done) и постановка планировщика (pending → queued —
-	// каждый новый эпизод начинается с чистого бита). Пока бит стоит,
-	// повторная доставка пачки пропускает публикацию — дубль q:http
-	// (полная повторная HTTP-проверка) не создаётся.
+	// FlagHTTPPublished — bit 2: http_published — the staging mark
+	// «the q:http task of this episode has been published» (T-108,
+	// DNS-04). Lifecycle: the dns-worker sets the bit right after a
+	// successful q:http publication (before the episode result is
+	// recorded); it is cleared by the result record (done) and by the
+	// scheduler enqueueing (pending → queued — every new episode starts
+	// with a clean bit). While the bit is set, redelivery of a chunk
+	// skips the publication — a duplicate q:http (a full re-check over
+	// HTTP) is not created.
 	FlagHTTPPublished Flags = 1 << 2
-	// FlagDeadHostCutoff — бит 3: dead_host_cutoff — последний
-	// HTTP-эпизод домена завершён по мёртвой сигнатуре (T-164): apex
-	// и www упали на connect-фазе (connection refused / connect-таймаут,
-	// оба протокола), остальные субдомены не проверялись — записи по §8
-	// («нет ответа»). Бит ставится и снимается записью результата
-	// HTTP-эпизода (флаг последнего эпизода): по нему строится
-	// контрольная выборка ложных cutoff-ов — повторная полная проверка
-	// cutoff-доменов, критерий T-164 «доля ложных < 1%».
+	// FlagDeadHostCutoff — bit 3: dead_host_cutoff — the last HTTP
+	// episode of the domain finished on a dead signature (T-164): apex
+	// and www failed on the connect phase (connection refused /
+	// connect timeout, both protocols), the other subdomains were not
+	// checked — records per §8 («no answer»). The bit is set and cleared
+	// by the HTTP episode result record (the flag of the last episode):
+	// the control selection of false cutoffs is built on it — a full
+	// re-check of cutoff domains, the T-164 criterion «the false share
+	// < 1%».
 	FlagDeadHostCutoff Flags = 1 << 3
 )
 
-// Set включает указанные биты.
+// Set sets the given bits.
 func (f *Flags) Set(flags Flags) { *f |= flags }
 
-// Clear выключает указанные биты.
+// Clear clears the given bits.
 func (f *Flags) Clear(flags Flags) { *f &^= flags }
 
-// Test сообщает, установлен ли хотя бы один из указанных битов.
+// Test reports whether at least one of the given bits is set.
 func (f Flags) Test(flags Flags) bool { return f&flags != 0 }
 
-// IsIDN — установлен ли бит is_idn.
+// IsIDN — is the is_idn bit set.
 func (f Flags) IsIDN() bool { return f.Test(FlagIDN) }
 
-// IsRenderPending — установлен ли бит render_pending.
+// IsRenderPending — is the render_pending bit set.
 func (f Flags) IsRenderPending() bool { return f.Test(FlagRenderPending) }
 
-// IsHTTPPublished — установлен ли бит http_published (T-108).
+// IsHTTPPublished — is the http_published bit set (T-108).
 func (f Flags) IsHTTPPublished() bool { return f.Test(FlagHTTPPublished) }
 
-// IsDeadHostCutoff — установлен ли бит dead_host_cutoff (T-164).
+// IsDeadHostCutoff — is the dead_host_cutoff bit set (T-164).
 func (f Flags) IsDeadHostCutoff() bool { return f.Test(FlagDeadHostCutoff) }
 
-// String возвращает человекочитаемый вид: "is_idn",
-// "is_idn|render_pending|http_published". Пустая маска — "0"; неизвестные
-// биты — шестнадцатеричным остатком "0x…".
+// String returns a human-readable form: "is_idn",
+// "is_idn|render_pending|http_published". An empty mask is "0"; unknown
+// bits are shown as a hexadecimal remainder "0x…".
 func (f Flags) String() string {
 	if f == 0 {
 		return "0"

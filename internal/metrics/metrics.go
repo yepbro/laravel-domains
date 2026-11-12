@@ -1,20 +1,22 @@
-// Package metrics — общая точка регистрации метрик Prometheus всех
-// сервисов Domain Crawler (ТЗ 5.9): фабрика Registry поверх prometheus
-// с единой меткой service.
+// Package metrics — the shared registration point of the Prometheus
+// metrics of all the Domain Crawler services (spec 5.9): a Registry
+// factory over prometheus with a unified service label.
 //
-// Каждый сервис создаёт собственный реестр New(name) — каркас
-// internal/service поднимает его вместе с /livez + /healthz и /metrics: адрес
-// monitor — monitor.listen из конфигурации (ТЗ 5.10), адреса остальных
-// сервисов — METRICS_ADDR; Prometheus скрейпит каждый сервис отдельно,
-// агрегации через monitor нет. Реестр уже несёт метрики каркаса
-// (crawler_service_up, crawler_build_info) и коллекторы Go/runtime и
-// процесса: uptime выводится из process_start_time_seconds в PromQL,
-// отдельная метрика не нужна. Рабочая логика добавляет приборы
-// фабричными методами Counter/Gauge/Histogram (T-076) — метка service
-// подставляется автоматически, единые имена меток зафиксированы
-// константами Label*. Приборы этапов (T-077, ТЗ 5.9) регистрируют
-// сами сервисы через NewMetrics-конструкторы своих пакетов воркеров;
-// коллектор длин очередей — collect.go этого пакета.
+// Each service creates its own registry New(name) — the internal/service
+// framework raises it together with /livez + /healthz and /metrics: the
+// monitor address is monitor.listen from the configuration (spec 5.10),
+// the addresses of the other services are METRICS_ADDR; Prometheus
+// scrapes each service separately, there is no aggregation through
+// monitor. The registry already carries the framework metrics
+// (crawler_service_up, crawler_build_info) and the Go/runtime and process
+// collectors: the uptime is derived from process_start_time_seconds in
+// PromQL, a separate metric is not needed. The working logic adds
+// instruments with the factory methods Counter/Gauge/Histogram (T-076) —
+// the service label is substituted automatically, the unified label
+// names are fixed by the Label* constants. The stage instruments
+// (T-077, spec 5.9) are registered by the services themselves through
+// the NewMetrics constructors of their worker packages; the queue length
+// collector is collect.go of this package.
 package metrics
 
 import (
@@ -28,103 +30,112 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Единые имена меток метрик проекта (ТЗ 5.9): приборы этапов — T-077,
-// имена зафиксированы здесь, чтобы метрики разных сервисов имели
-// одинаковые метки.
+// The unified label names of the project metrics (spec 5.9): the stage
+// instruments are T-077; the names are fixed here so that the metrics of
+// different services have the same labels.
 const (
-	// LabelService — имя сервиса. Подставляется фабрикой автоматически,
-	// вручную не передаётся.
+	// LabelService — the service name. Substituted by the factory
+	// automatically, not passed by hand.
 	LabelService = "service"
-	// LabelStage — этап конвейера (dns, http, render, analyze) для
-	// пропускной способности по этапам и времени ответа.
+	// LabelStage — the pipeline stage (dns, http, render, analyze) for
+	// the per-stage throughput and response time.
 	LabelStage = "stage"
-	// LabelQueue — имя очереди (q:dns, q:http, q:render, q:analyze,
-	// q:dead — internal/queue) для длин очередей и глубины backlog.
+	// LabelQueue — the queue name (q:dns, q:http, q:render, q:analyze,
+	// q:dead — internal/queue) for the queue lengths and the backlog
+	// depth.
 	LabelQueue = "queue"
-	// LabelType — тип ошибки (timeout, tls, network, body, …) для
-	// ошибок по типам; он же — имя статуса домена в счётчике финальных
-	// статусов (not_delegated, temp_error, no_http, …).
+	// LabelType — the error type (timeout, tls, network, body, …) for
+	// the per-type errors; the same label is the domain status name in
+	// the final status counter (not_delegated, temp_error, no_http, …).
 	LabelType = "type"
-	// LabelState — состояние проверки домена (pending, queued) для
-	// глубины backlog из БД: имя метки зафиксировано документацией
-	// (docs/services.md, docs/operations.md, ТЗ 5.9) — отдельное от
-	// LabelType: «type» уже занят типом ошибки/статусом домена.
+	// LabelState — the domain check state (pending, queued) for the
+	// backlog depth from the DB: the label name is fixed by the
+	// documentation (docs/services.md, docs/operations.md, spec 5.9) —
+	// separate from LabelType: "type" is already taken by the error
+	// type / domain status.
 	LabelState = "state"
-	// LabelKind — разновидность ряда внутри одной метрики (например,
-	// effective/configured у потолков лимитёра DNS): значения локальны
-	// для метрики, в отличие от сквозных значений LabelStage/LabelQueue.
+	// LabelKind — the kind of a row within one metric (for example,
+	// effective/configured of the DNS limiter caps): the values are
+	// local to the metric, unlike the end-to-end LabelStage/LabelQueue
+	// values.
 	LabelKind = "kind"
-	// LabelUnit — имя systemd-юнита (crawler-http-worker.service) для
-	// метрик событий юнитов монитора (T-145): системный контур, а не
-	// этап конвейера — отдельное имя от LabelService.
+	// LabelUnit — the systemd unit name (crawler-http-worker.service)
+	// for the monitor unit event metrics (T-145): the system contour,
+	// not a pipeline stage — a separate name from LabelService.
 	LabelUnit = "unit"
-	// LabelEngine — движок рендера сборки render-worker (chromium,
-	// moli, lightpanda — словарь internal/config) для метрик этапа
-	// рендера (T-235, ТЗР движков §4.6 п.1, ФТ-15): серия различает
-	// движки; агрегации без метки (sum by без engine) не меняются.
+	// LabelEngine — the render engine of the render-worker build
+	// (chromium, moli, lightpanda — the internal/config dictionary) for
+	// the render stage metrics (T-235, the engines render spec §4.6
+	// item 1, FR-15): the series distinguishes the engines; the
+	// aggregations without the label (sum by without engine) are
+	// unchanged.
 	LabelEngine = "engine"
 )
 
-// buildMode — значение метки mode метрики crawler_build_info. Боевые
-// сборки инъекцируют его линковщиком:
+// buildMode — the value of the mode label of the crawler_build_info
+// metric. Production builds inject it with the linker:
 //
 //	go build -ldflags "-X crawler/internal/metrics.buildMode=prod"
 //
 // (deploy/docker/Dockerfile.go, Dockerfile.render, docs/deploy.md §4.2).
-// Без инъекции — dev-сборка (go build / air / go test): каркас
-// разработки, значение по умолчанию сохранено, чтобы не ломать dev.
+// Without the injection — a dev build (go build / air / go test): the
+// development framework; the default value is kept so as not to break
+// dev.
 var buildMode = "dev-stub"
 
-// buildVersion/buildRevision — значения меток version/revision метрики
-// crawler_build_info (T-111). Инъекцируются линковщиком тем же способом,
-// что и buildMode:
+// buildVersion/buildRevision — the values of the version/revision labels
+// of the crawler_build_info metric (T-111). Injected by the linker the
+// same way as buildMode:
 //
 //	go build -ldflags "-X crawler/internal/metrics.buildVersion=v1.2.0 \
 //	   -X crawler/internal/metrics.buildRevision=abc1234"
 //
-// Источник — git сборки: buildVersion = git describe --tags --always
-// --dirty (тег либо хеш, с пометкой несохранённых правок), buildRevision
-// = git rev-parse --short HEAD. Контекст Docker-сборки не содержит .git
-// (.dockerignore), поэтому значения вычисляет вызывающая сторона и
-// передаёт build-аргами (make build-runtime, ARG BUILD_VERSION/
-// BUILD_REVISION в Dockerfile); при недоступном git — unknown.
+// The source is the git of the build: buildVersion = git describe --tags
+// --always --dirty (a tag or a hash, with a mark of unsaved edits),
+// buildRevision = git rev-parse --short HEAD. The Docker build context
+// does not contain .git (.dockerignore), so the calling side computes the
+// values and passes them as build args (make build-runtime,
+// ARG BUILD_VERSION/BUILD_REVISION in the Dockerfile); with git
+// unavailable — unknown.
 //
-// Без инъекции — dev-сборка: version=dev, revision пуста. Набор имён меток
-// метрики одинаков для dev и prod (дашборды не зависят от способа сборки);
-// пустое значение метки в PromQL эквивалентно её отсутствию, поэтому
-// dev-сборки не плодят лишнее значение в группировках по revision.
+// Without the injection — a dev build: version=dev, an empty revision.
+// The label name set of the metric is the same for dev and prod (the
+// dashboards do not depend on the build method); an empty label value in
+// PromQL is equivalent to its absence, so dev builds do not spawn an
+// extra value in the groupings by revision.
 var (
 	buildVersion  = "dev"
 	buildRevision = ""
 )
 
-// Значения метки LabelStage — этапы конвейера (ТЗ 4.2, §7). Единые
-// значения фиксируются здесь, чтобы метрики всех сервисов агрегировались
-// в PromQL без нормализации.
+// The LabelStage values — the pipeline stages (spec 4.2, §7). The unified
+// values are fixed here so that the metrics of all the services
+// aggregate in PromQL without normalization.
 const (
-	// StageDNS — DNS-этап (dns-worker).
+	// StageDNS — the DNS stage (the dns-worker).
 	StageDNS = "dns"
-	// StageHTTP — HTTP-этап (http-worker).
+	// StageHTTP — the HTTP stage (the http-worker).
 	StageHTTP = "http"
-	// StageRender — этап рендера (render-worker).
+	// StageRender — the render stage (the render-worker).
 	StageRender = "render"
-	// StageAnalyze — этап анализа (analyzer).
+	// StageAnalyze — the analysis stage (the analyzer).
 	StageAnalyze = "analyze"
 )
 
-// Registry — реестр метрик одного сервиса: собственный
-// *prometheus.Registry (встроен — методы Register/Gather доступны для
-// нестандартных коллекторов) и имя сервиса для автометки service.
-// Реестры сервисов независимы: одноимённые метрики разных сервисов не
-// конфликтуют — у каждого свой /metrics (ТЗ 5.9).
+// Registry — the metrics registry of one service: its own
+// *prometheus.Registry (embedded — the Register/Gather methods are
+// available for non-standard collectors) and the service name for the
+// automatic service label. The service registries are independent: the
+// same-named metrics of different services do not conflict — each has
+// its own /metrics (spec 5.9).
 type Registry struct {
 	*prometheus.Registry
 	service string
 }
 
-// New создаёт реестр Prometheus для сервиса name, регистрирует
-// коллекторы Go/runtime и процесса и базовые метрики каркаса. Для
-// метрик рабочей логики реестр используется как фабрика:
+// New creates a Prometheus registry for the name service, registers the
+// Go/runtime and process collectors and the basic framework metrics. For
+// the working-logic metrics the registry is used as a factory:
 // Counter/Gauge/Histogram.
 func New(name string) *Registry {
 	reg := &Registry{
@@ -151,26 +162,26 @@ func New(name string) *Registry {
 	return reg
 }
 
-// Counter создаёт и регистрирует счётчик с метками [LabelService] +
-// labelNames и возвращает вектор, каррированный по service: вызывающий
-// передаёт значения только остальных метк —
+// Counter creates and registers a counter with the labels [LabelService]
+// + labelNames and returns the vector curried by service: the caller
+// passes the values of the other labels only —
 //
 //	tasks := reg.MustCounter(prometheus.CounterOpts{
 //		Name: "crawler_stage_tasks_total",
 //		Help: "Обработанные домены по этапам конвейера.",
 //	}, LabelStage)
-//	tasks.WithLabelValues("dns").Inc() // service подставится сама
+//	tasks.WithLabelValues("dns").Inc() // the service is substituted automatically
 //
-// HELP/TYPE экспортируются Prometheus из Name/Help: документация метрики
-// пишется там же, где создаётся прибор.
+// The HELP/TYPE are exported by Prometheus from Name/Help: the metric
+// documentation is written where the instrument is created.
 //
-// Зарезервированная метка LabelService и дубликаты меток отклоняются
-// ошибкой (а не паникой prometheus.New*Vec). Повторная регистрация
-// идентичной метрики (то же имя, help и метки) — не ошибка:
-// возвращается уже зарегистрированный вектор, поэтому конструкторы
-// приборов можно вызывать многократно (типовая ловушка
-// AlreadyRegisteredError в тестах не паникует). Конфликт описаний —
-// ошибка.
+// The reserved LabelService label and duplicate labels are rejected with
+// an error (not a prometheus.New*Vec panic). A repeated registration of
+// an identical metric (the same name, help and labels) is not an error:
+// the already registered vector is returned, so the instrument
+// constructors may be called repeatedly (the typical
+// AlreadyRegisteredError trap does not panic in tests). A descriptor
+// conflict is an error.
 func (r *Registry) Counter(opts prometheus.CounterOpts, labelNames ...string) (*prometheus.CounterVec, error) {
 	name := prometheus.BuildFQName(opts.Namespace, opts.Subsystem, opts.Name)
 	labels, err := withServiceLabel(labelNames)
@@ -188,10 +199,10 @@ func (r *Registry) Counter(opts prometheus.CounterOpts, labelNames ...string) (*
 	return vec.CurryWith(r.serviceLabels())
 }
 
-// Gauge — аналог Counter для gauge-метрик (длины очередей, глубина
-// backlog, память воркеров): метки [LabelService] + labelNames, метка
-// service подставляется автоматически, дубль идентичной метрики — не
-// ошибка.
+// Gauge — the Counter counterpart for gauge metrics (the queue lengths,
+// the backlog depth, the worker memory): the labels [LabelService] +
+// labelNames, the service label is substituted automatically, a duplicate
+// of an identical metric is not an error.
 func (r *Registry) Gauge(opts prometheus.GaugeOpts, labelNames ...string) (*prometheus.GaugeVec, error) {
 	name := prometheus.BuildFQName(opts.Namespace, opts.Subsystem, opts.Name)
 	labels, err := withServiceLabel(labelNames)
@@ -209,14 +220,15 @@ func (r *Registry) Gauge(opts prometheus.GaugeOpts, labelNames ...string) (*prom
 	return vec.CurryWith(r.serviceLabels())
 }
 
-// Histogram — аналог Counter для гистограмм (время ответа): метки
-// [LabelService] + labelNames, метка service подставляется
-// автоматически, дубль идентичной метрики — не ошибка. Возвращается
-// интерфейс ObserverVec (CurryWith HistogramVec): наблюдения
-// добавляются WithLabelValues(...).Observe(...), специфика
-// HistogramVec вызывающему не нужна. Корзины (Buckets) не входят в
-// дескриптор prometheus: повторная регистрация с другими корзинами
-// возвращает существующий вектор — корзины первого вызова выигрывают.
+// Histogram — the Counter counterpart for histograms (the response
+// time): the labels [LabelService] + labelNames, the service label is
+// substituted automatically, a duplicate of an identical metric is not an
+// error. The ObserverVec interface is returned (CurryWith of HistogramVec):
+// the observations are added with WithLabelValues(...).Observe(...); the
+// caller does not need the HistogramVec specifics. The buckets (Buckets)
+// are not part of the prometheus descriptor: a repeated registration with
+// other buckets returns the existing vector — the buckets of the first
+// call win.
 func (r *Registry) Histogram(opts prometheus.HistogramOpts, labelNames ...string) (prometheus.ObserverVec, error) {
 	name := prometheus.BuildFQName(opts.Namespace, opts.Subsystem, opts.Name)
 	labels, err := withServiceLabel(labelNames)
@@ -234,10 +246,10 @@ func (r *Registry) Histogram(opts prometheus.HistogramOpts, labelNames ...string
 	return vec.CurryWith(r.serviceLabels())
 }
 
-// MustCounter — Counter с паникой вместо ошибки. Паника — только на
-// реальном конфликте описаний (дубль идентичной метрики — не конфликт);
-// уместен для приборов, создаваемых при старте сервиса, где ошибка —
-// баг программы.
+// MustCounter — Counter with a panic instead of an error. The panic —
+// only on a real descriptor conflict (a duplicate of an identical metric
+// is not a conflict); it suits the instruments created at the service
+// startup, where an error is a program bug.
 func (r *Registry) MustCounter(opts prometheus.CounterOpts, labelNames ...string) *prometheus.CounterVec {
 	vec, err := r.Counter(opts, labelNames...)
 	if err != nil {
@@ -246,7 +258,7 @@ func (r *Registry) MustCounter(opts prometheus.CounterOpts, labelNames ...string
 	return vec
 }
 
-// MustGauge — Gauge с паникой вместо ошибки (см. MustCounter).
+// MustGauge — Gauge with a panic instead of an error (see MustCounter).
 func (r *Registry) MustGauge(opts prometheus.GaugeOpts, labelNames ...string) *prometheus.GaugeVec {
 	vec, err := r.Gauge(opts, labelNames...)
 	if err != nil {
@@ -255,7 +267,8 @@ func (r *Registry) MustGauge(opts prometheus.GaugeOpts, labelNames ...string) *p
 	return vec
 }
 
-// MustHistogram — Histogram с паникой вместо ошибки (см. MustCounter).
+// MustHistogram — Histogram with a panic instead of an error (see
+// MustCounter).
 func (r *Registry) MustHistogram(opts prometheus.HistogramOpts, labelNames ...string) prometheus.ObserverVec {
 	vec, err := r.Histogram(opts, labelNames...)
 	if err != nil {
@@ -264,19 +277,20 @@ func (r *Registry) MustHistogram(opts prometheus.HistogramOpts, labelNames ...st
 	return vec
 }
 
-// Handler возвращает HTTP-хендлер, отдающий метрики реестра в формате
-// Prometheus (эндпоинт /metrics каждого сервиса, ТЗ 5.9). g — любой
-// Gatherer: *Registry фабрики или *prometheus.Registry напрямую.
+// Handler returns an HTTP handler handing out the registry metrics in the
+// Prometheus format (the /metrics endpoint of each service, spec 5.9).
+// g is any Gatherer: a *Registry of the factory or a *prometheus.Registry
+// directly.
 func Handler(g prometheus.Gatherer) http.Handler {
 	return promhttp.HandlerFor(g, promhttp.HandlerOpts{})
 }
 
-// register регистрирует collector в реестре. Идентичная уже
-// зарегистрированная метрика (AlreadyRegisteredError с тем же
-// дескриптором — то же имя, help и метки) — не ошибка: возвращается
-// существующий коллектор, дубль-регистрация идемпотентна. Другие
-// коллизии отклоняет сам prometheus: то же имя с другим help или
-// набором меток — ошибка размерности.
+// register registers the collector in the registry. An identical
+// already-registered metric (an AlreadyRegisteredError with the same
+// descriptor — the same name, help and labels) is not an error: the
+// existing collector is returned, the duplicate registration is
+// idempotent. The other collisions are rejected by prometheus itself:
+// the same name with another help or label set is a dimension error.
 func (r *Registry) register(name string, c prometheus.Collector) (prometheus.Collector, error) {
 	err := r.Register(c)
 	if err == nil {
@@ -292,10 +306,10 @@ func (r *Registry) register(name string, c prometheus.Collector) (prometheus.Col
 	return are.ExistingCollector, nil
 }
 
-// withServiceLabel — имена меток фабричных метрик: LabelService всегда
-// первая, значения остальных передаёт вызывающий. LabelService и
-// дубликаты меток отклоняются ошибкой — prometheus.New*Vec паникует на
-// повторяющихся именах меток.
+// withServiceLabel — the label names of the factory metrics:
+// LabelService is always the first; the caller passes the values of the
+// others. LabelService and duplicate labels are rejected with an error —
+// prometheus.New*Vec panics on repeated label names.
 func withServiceLabel(labelNames []string) ([]string, error) {
 	labels := make([]string, 0, len(labelNames)+1)
 	labels = append(labels, LabelService)
@@ -308,27 +322,27 @@ func withServiceLabel(labelNames []string) ([]string, error) {
 	return labels, nil
 }
 
-// serviceLabels — каррирующий набор метки service.
+// serviceLabels — the currying set of the service label.
 func (r *Registry) serviceLabels() prometheus.Labels {
 	return prometheus.Labels{LabelService: r.service}
 }
 
-// descEqual — совпадают ли дескрипторы двух коллекторов (имя, help,
-// метки). Гистограммные корзины (Buckets) в дескриптор не входят —
-// сравнить их у зарегистрированного вектора нельзя, повторная
-// регистрация гистограммы с другими корзинами отдаёт существующий
-// вектор (см. Histogram).
+// descEqual — whether the descriptors of two collectors match (the name,
+// the help, the labels). The histogram buckets (Buckets) are not part of
+// the descriptor — they cannot be compared for a registered vector; a
+// repeated registration of a histogram with other buckets hands out the
+// existing vector (see Histogram).
 func descEqual(a, b prometheus.Collector) bool {
 	da, oka := descOf(a)
 	db, okb := descOf(b)
 	return oka && okb && da.String() == db.String()
 }
 
-// descOf — первый дескриптор коллектора. Describe выполняется в
-// отдельной горутине и его остаток дренируется: нестандартный
-// коллектор может прислать больше одного дескриптора или ни одного
-// (тогда ok=false) — ни то, ни другое не должно зависывать вызов.
-// Векторы Counter/Gauge/Histogram отдают ровно один дескриптор.
+// descOf — the first descriptor of the collector. Describe runs in a
+// separate goroutine and its remainder is drained: a non-standard
+// collector may send more than one descriptor or none (then ok=false) —
+// neither should hang the call. The Counter/Gauge/Histogram vectors give
+// exactly one descriptor.
 func descOf(c prometheus.Collector) (d *prometheus.Desc, ok bool) {
 	ch := make(chan *prometheus.Desc)
 	go func() {
@@ -339,7 +353,7 @@ func descOf(c prometheus.Collector) (d *prometheus.Desc, ok bool) {
 	if !ok {
 		return nil, false
 	}
-	for range ch { // дренировать остаток дескрипторов
+	for range ch { // drain the descriptor remainder
 	}
 	return d, true
 }

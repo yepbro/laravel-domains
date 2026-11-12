@@ -1,8 +1,8 @@
-// Юнит-тесты TTL-кэша тяжёлых выборок (T-161) на фейковом пуле
-// status_test.go: попадание в окне TTL (без повторного SQL), перечёт по
-// истечении (инвалидация по времени на часах фейка), независимые секции
-// («ключи» кэша), ошибки не кэшируются, копия значения не портит кэш,
-// дефолты опций.
+// Unit tests of the TTL cache of heavy selections (T-161) on the fake
+// pool of status_test.go: a hit within the TTL window (no repeated SQL),
+// a recount after expiry (the time-based invalidation on the fake's
+// clock), independent sections (the cache "keys"), errors are not
+// cached, a value copy does not spoil the cache, the option defaults.
 package status
 
 import (
@@ -16,8 +16,8 @@ import (
 	"crawler/internal/model"
 )
 
-// cacheClock — управляемые часы кэша: тест двигает время мимо TTL без
-// реальных ожиданий.
+// cacheClock — the controlled cache clock: the test moves the time past
+// the TTL without real waiting.
 type cacheClock struct{ now time.Time }
 
 func (c *cacheClock) tick(d time.Duration) { c.now = c.now.Add(d) }
@@ -32,7 +32,7 @@ func newCacheTestPool() *statusPool {
 	return p
 }
 
-// countSQL — сколько раз пул видел запрос с подстрокой what.
+// countSQL — how many times the pool saw a query containing what.
 func countSQL(calls []string, what string) int {
 	n := 0
 	for _, q := range calls {
@@ -43,9 +43,9 @@ func countSQL(calls []string, what string) int {
 	return n
 }
 
-// TestCacheTTLHit — в окне TTL секция отдаётся без обращения к БД;
-// по истечении (граница: now == expiresAt — уже просрочено) — повторная
-// выборка.
+// TestCacheTTLHit — within the TTL window the section is handed out
+// without a DB call; after expiry (the boundary: now == expiresAt is
+// already expired) — a re-selection.
 func TestCacheTTLHit(t *testing.T) {
 	pool := newCacheTestPool()
 	clock := &cacheClock{now: time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)}
@@ -59,7 +59,7 @@ func TestCacheTTLHit(t *testing.T) {
 	if len(z1) != 1 || z1[0].DomainsTotal != 100 {
 		t.Fatalf("зоны = %+v, want одна зона crawl.test", z1)
 	}
-	// Внутри окна — кэш, не SQL.
+	// Within the window — the cache, not SQL.
 	clock.tick(59 * time.Second)
 	if _, err := c.ZoneStats(ctx, pool); err != nil {
 		t.Fatalf("ZoneStats из кэша: %v", err)
@@ -68,8 +68,8 @@ func TestCacheTTLHit(t *testing.T) {
 		t.Errorf("выборок зон = %d, want 1 (внутри TTL)", n)
 	}
 
-	// Ровно на границе TTL запись уже не действует (кэш — strictly
-	// раньше expiresAt), после — повторная выборка.
+	// Exactly at the TTL boundary the entry is no longer valid (the cache
+	// is strictly earlier than expiresAt); after it — a re-selection.
 	clock.tick(time.Second)
 	z2, err := c.ZoneStats(ctx, pool)
 	if err != nil {
@@ -83,8 +83,9 @@ func TestCacheTTLHit(t *testing.T) {
 	}
 }
 
-// TestCacheSectionsIndependent — секции («ключи») независимы: своя
-// запись и свой момент старта TTL — истёкшая одна не трогает другую.
+// TestCacheSectionsIndependent — the sections ("keys") are independent:
+// their own entry and their own TTL start moment — one expired does not
+// touch the other.
 func TestCacheSectionsIndependent(t *testing.T) {
 	pool := newCacheTestPool()
 	clock := &cacheClock{now: time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)}
@@ -94,14 +95,14 @@ func TestCacheSectionsIndependent(t *testing.T) {
 	if _, err := c.ZoneStats(ctx, pool); err != nil {
 		t.Fatalf("ZoneStats: %v", err)
 	}
-	clock.tick(30 * time.Second) // зоны живут до 1:30, темп стартует в 0:30
+	clock.tick(30 * time.Second) // the zones live until 1:30, the throughput starts at 0:30
 	if _, err := c.Throughput(ctx, pool); err != nil {
 		t.Fatalf("Throughput: %v", err)
 	}
 	if _, err := c.DomainStatuses(ctx, pool); err != nil {
 		t.Fatalf("DomainStatuses: %v", err)
 	}
-	clock.tick(45 * time.Second) // 1:15: зоны просрочились, темп/статусы живы
+	clock.tick(45 * time.Second) // 1:15: the zones expired, the throughput/statuses are alive
 
 	if _, err := c.ZoneStats(ctx, pool); err != nil {
 		t.Fatalf("ZoneStats: %v", err)
@@ -120,16 +121,17 @@ func TestCacheSectionsIndependent(t *testing.T) {
 	if n := countSQL(calls, "AS done_today"); n != 1 {
 		t.Errorf("выборок темпа = %d, want 1 (запись жива)", n)
 	}
-	// Маркер статусов — LIKE 'status (domainStatusSQL): throughputSQL
-	// с T-179 тоже читает crawler_counters (счётчик суточных проверок) —
-	// подстрока FROM crawler_counters больше не различает запросы.
+	// The statuses marker is LIKE 'status (domainStatusSQL): with T-179
+	// the throughputSQL also reads crawler_counters (the daily check
+	// counter) — the FROM crawler_counters substring no longer
+	// distinguishes the queries.
 	if n := countSQL(calls, "LIKE 'status"); n != 1 {
 		t.Errorf("выборок статусов = %d, want 1 (запись жива)", n)
 	}
 }
 
-// TestCacheErrorsNotCached — ошибка выборки возвращается и не
-// кэшируется: следующий вызов повторяет обращение к БД.
+// TestCacheErrorsNotCached — a selection error is returned and is not
+// cached: the next call repeats the DB call.
 func TestCacheErrorsNotCached(t *testing.T) {
 	pool := newCacheTestPool()
 	clock := &cacheClock{now: time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)}
@@ -154,8 +156,8 @@ func TestCacheErrorsNotCached(t *testing.T) {
 	}
 }
 
-// TestCacheCloneOnReturn — возвращаемое значение — копия: мутация
-// результата вызова не меняет последующие ответы кэша.
+// TestCacheCloneOnReturn — the returned value is a copy: a mutation of
+// the call result does not change the subsequent cache answers.
 func TestCacheCloneOnReturn(t *testing.T) {
 	pool := newCacheTestPool()
 	clock := &cacheClock{now: time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)}
@@ -189,8 +191,8 @@ func TestCacheCloneOnReturn(t *testing.T) {
 	}
 }
 
-// TestCacheNilPool — nil-пул — ошибка выборки (как FetchZoneStats), не
-// паника и не кэширование ошибки.
+// TestCacheNilPool — a nil pool is a selection error (as FetchZoneStats),
+// not a panic and not a caching of the error.
 func TestCacheNilPool(t *testing.T) {
 	clock := &cacheClock{now: time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)}
 	c := NewCache(CacheOptions{TTL: time.Minute, Now: clock.Now})
@@ -200,9 +202,9 @@ func TestCacheNilPool(t *testing.T) {
 	}
 }
 
-// TestCacheOptionsDefaults — нулевой/отрицательный TTL — дефолт
-// (пин-литерал 60s: сравнение с константой мутируется вместе с ней);
-// заданные значения не затираются.
+// TestCacheOptionsDefaults — a zero/negative TTL — the default
+// (the pin literal 60s: a comparison with the constant mutates together
+// with it); the set values are not overwritten.
 func TestCacheOptionsDefaults(t *testing.T) {
 	if DefaultCacheTTL != time.Minute {
 		t.Errorf("DefaultCacheTTL = %v, want 60s", DefaultCacheTTL)

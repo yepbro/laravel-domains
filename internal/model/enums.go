@@ -5,130 +5,139 @@ import (
 	"strings"
 )
 
-// Status — статус домена, колонка domains.status (smallint, ТЗ 6.2).
-// Коды 0..6 зафиксированы схемой и тестом; код 7 — диагностический
-// invalid (T-109). ТЗ 6.2 допускает дополнительные статусы (например,
-// parked): новая константа расширяет Statuses и таблицу statusNames
-// следующим кодом по порядку.
+// Status — the domain status, the domains.status column (smallint,
+// spec 6.2). Codes 0..6 are fixed by the schema and a test; code 7 is the
+// diagnostic invalid (T-109). Spec 6.2 allows additional statuses (for
+// example, parked): a new constant extends Statuses and the statusNames
+// table with the next code in order.
 //
-// # Автомат status домена: общая таблица решений (T-256, ТЗ-fsm §3 ФТ-2)
+// # The domain status FSM: the shared decision table (T-256, TZ-fsm spec §3 FR-2)
 //
-// Единая точка правды о переходах статуса: таблица «этап × условие →
-// статус» по писателям штатного конвейера (административные пути —
-// импорт fixtures стенда T-242, cmd/crawlerctl, переносит состояние
-// дампа как есть, и ручной SQL — вне таблицы). Формализация не
-// переписывает переходы на FSM-фреймворк — они остаются SQL-операторами
-// с охранными предикатами (ТЗ-fsm §1); спецификация — ниже, писатели
-// ссылаются на неё и не дублируют. Ветки этапов развёрнуты в
-// пакетах-исполнителях: DNS — internal/dnsworker (result.go, у
-// операторов записи), HTTP — internal/httpworker (record.go). Смежный
-// автомат — check_state (internal/scheduler/checkstate.go, T-255):
-// статус — факт последнего эпизода, check_state — состояние цикла;
-// переходы той таблицы, несущие переходы статуса этой как побочное
-// действие, — записи результатов и диагноз (Р2/Р3/Р4/Р13 = О2–О6, О10),
-// ретрай (Р8 = О11), удаление/воскрешение/вставка (Р14/Р9/Р10 =
-// О12/О13/О1).
+// The single source of truth about the status transitions: the table
+// "stage × condition → status" over the writers of the regular pipeline
+// (the administrative paths — the testbed fixture import T-242,
+// cmd/crawlerctl, which carries the dump state as is, and manual SQL — are
+// outside the table). The formalization does not rewrite the transitions
+// onto the FSM framework — they remain SQL statements with guard
+// predicates (TZ-fsm spec §1); the specification is below, the writers
+// reference it and do not duplicate it. The stage branches are expanded in
+// the executor packages: DNS — internal/dnsworker (result.go, at the
+// record operators), HTTP — internal/httpworker (record.go). The adjacent
+// FSM is check_state (internal/scheduler/checkstate.go, T-255): the status
+// is the fact of the last episode, check_state is the state of the cycle;
+// the transitions of that table that carry the status transitions of this
+// one as a side effect are the result records and the diagnosis
+// (R2/R3/R4/R13 = O2–O6, O10), the retry (R8 = O11), and the
+// deletion/revival/insertion (R14/R9/R10 = O12/O13/O1).
 //
-//	| №  | Этап     | Условие                                        | Статус                | Побочные действия                                | Писатель |
-//	|----|----------|------------------------------------------------|-----------------------|--------------------------------------------------|----------|
-//	| О1 | ingest   | вставка нового домена add-файлом               | new (DEFAULT схемы)   | —                                                | ingest/apply_add.go insertAddSQL (T-018) |
-//	| О2 | DNS      | апекс NXDOMAIN (RFC 8020)                      | not_delegated         | dns_mask = 0; temp_attempts = 0                  | dnsworker/result.go resultUpdateStatusSQL |
-//	| О3 | DNS      | апекс SERVFAIL/таймаут после ретраев           | temp_error            | dns_mask = 0; temp_attempts сохраняет            | dnsworker/result.go resultUpdateStatusSQL |
-//	| О4 | DNS      | адресов нет, сбоев резолвера нет (вкл. wildcard-only и дефекты зоны: цикл/глубина CNAME) | delegated_no_address | dns_mask эпизода; temp_attempts = 0 | dnsworker/result.go resultUpdateStatusSQL |
-//	| О5 | DNS      | адресов нет, был сбой резолвера (транспорт / код вне NOERROR и NXDOMAIN) | temp_error | dns_mask эпизода; temp_attempts сохраняет | dnsworker/result.go resultUpdateStatusSQL |
-//	| О6 | DNS      | адреса есть (маска после wildcard-фильтра непуста) | НЕ пишется: статус решает HTTP-этап (О7–О9); до его итога хранится прежний (первая проверка — new) | dns_mask эпизода; temp_attempts = 0; публикация q:http | dnsworker/result.go resultUpdateKeepStatusSQL |
-//	| О7 | HTTP     | есть записи (хоть один субдомен×протокол ответил) | alive              | temp_attempts = 0; строки subdomain_results      | httpworker/record.go recordDomainSQL |
-//	| О8 | HTTP     | записей нет, среди проверок есть таймаут-класс ErrTimeout (вкл. connect-таймаут) | temp_error | temp_attempts сохраняет | httpworker/record.go recordDomainSQL |
-//	| О9 | HTTP     | записей нет, таймаутов нет (вкл. connect-refused — ErrNetwork) | no_http | temp_attempts = 0 | httpworker/record.go recordDomainSQL |
-//	| О10 | DNS     | ядовитая строка: проверка невозможна детерминированно (пустое имя) | invalid (T-109) | temp_attempts = 0; перепроверка не возвращает | dnsworker/result.go resultInvalidSQL |
-//	| О11 | scheduler | temp_error, окно temp_error_retry_after прошло, temp_attempts ≥ max_retries | delegated_no_address (АСИММЕТРИЯ А1) | temp_attempts = 0; check_state остаётся done | scheduler/retry.go retryFinalizeSQL (T-031) |
-//	| О12 | ingest  | delete-файл: домен удалён из зарегистрированных | deleted             | строки результата чистит T-020; флаг render_pending снимает та же транзакция | ingest/apply_delete.go (T-019) |
-//	| О13 | ingest  | воскрешение: deleted-домен в новом add-файле   | new                  | dns_mask/flags/last_checked_at сохраняются (факт прошлой проверки не обнуляется) | ingest/apply_add.go reviveAddSQL (T-018) |
+//	| #   | Stage     | Condition                                        | Status                | Side effects                                      | Writer |
+//	|-----|-----------|--------------------------------------------------|-----------------------|---------------------------------------------------|--------|
+//	| O1  | ingest    | insertion of a new domain by an add-file         | new (the schema DEFAULT) | —                                               | ingest/apply_add.go insertAddSQL (T-018) |
+//	| O2  | DNS       | apex NXDOMAIN (RFC 8020)                         | not_delegated         | dns_mask = 0; temp_attempts = 0                   | dnsworker/result.go resultUpdateStatusSQL |
+//	| O3  | DNS       | apex SERVFAIL/timeout after retries              | temp_error            | dns_mask = 0; temp_attempts is kept               | dnsworker/result.go resultUpdateStatusSQL |
+//	| O4  | DNS       | no addresses, no resolver failures (incl. wildcard-only and zone defects: CNAME loop/depth) | delegated_no_address | the episode dns_mask; temp_attempts = 0 | dnsworker/result.go resultUpdateStatusSQL |
+//	| O5  | DNS       | no addresses, there was a resolver failure (transport / a code outside NOERROR and NXDOMAIN) | temp_error | the episode dns_mask; temp_attempts is kept | dnsworker/result.go resultUpdateStatusSQL |
+//	| O6  | DNS       | addresses exist (the mask is non-empty after the wildcard filter) | NOT written: the HTTP stage decides the status (O7–O9); until its outcome the previous one is kept (the first check — new) | the episode dns_mask; temp_attempts = 0; q:http publication | dnsworker/result.go resultUpdateKeepStatusSQL |
+//	| O7  | HTTP      | records exist (at least one subdomain×protocol responded) | alive       | temp_attempts = 0; subdomain_results rows         | httpworker/record.go recordDomainSQL |
+//	| O8  | HTTP      | no records, among the checks there is the timeout-class ErrTimeout (incl. a connect timeout) | temp_error | temp_attempts is kept | httpworker/record.go recordDomainSQL |
+//	| O9  | HTTP      | no records, no timeouts (incl. connect-refused — ErrNetwork) | no_http | temp_attempts = 0                                 | httpworker/record.go recordDomainSQL |
+//	| O10 | DNS       | poison row: the check is impossible deterministically (an empty name) | invalid (T-109) | temp_attempts = 0; a re-check never returns such rows | dnsworker/result.go resultInvalidSQL |
+//	| O11 | scheduler | temp_error, the temp_error_retry_after window has passed, temp_attempts ≥ max_retries | delegated_no_address (ASYMMETRY A1) | temp_attempts = 0; check_state stays done | scheduler/retry.go retryFinalizeSQL (T-031) |
+//	| O12 | ingest    | delete file: the domain is removed from the registered | deleted       | result rows are cleaned by T-020; the render_pending flag is cleared by the same transaction | ingest/apply_delete.go (T-019) |
+//	| O13 | ingest    | revival: a deleted domain in a new add-file      | new                   | dns_mask/flags/last_checked_at are kept (the fact of the past check is not zeroed) | ingest/apply_add.go reviveAddSQL (T-018) |
 //
-// temp_attempts (T-031): сбрасывается в 0 на каждом не-temp_error итоге
-// записи эпизода (О2, О4, О6, О7, О9, О10) и при финализации ретрая
-// (О11); temp_error-итоги (О3, О5, О8) сохраняют накопленное —
-// наращивает планировщик при назначении повтора (Р8 спецификации
-// check_state); ingest-переходы (О12, О13) счётчик не трогают.
+// temp_attempts (T-031): resets to 0 on every non-temp_error episode-record
+// outcome (O2, O4, O6, O7, O9, O10) and on the retry finalization (O11);
+// the temp_error outcomes (O3, O5, O8) keep the accumulated value — the
+// scheduler increments it when assigning a retry (R8 of the check_state
+// spec); the ingest transitions (O12, O13) do not touch the counter.
 //
-// ## Осознанные асимметрии (решения, НЕ дефекты — не «исправляются»)
+// ## Deliberate asymmetries (decisions, NOT defects — not to be "fixed")
 //
-//	А1  О11: temp_error при исчерпании попыток финализируется в
-//	    delegated_no_address, а не в спец-статус: последняя проверка
-//	    закончилась SERVFAIL/таймаутом — адресов для HTTP-этапа нет,
-//	    это терминальная ветка «нет адресов» алгоритма ТЗ 7;
-//	    not_delegated отвергнут (кодирует именно NXDOMAIN апекса,
-//	    RFC 8020), новых статусов набор не расширяется (семь статусов
-//	    подтверждены заказчиком, ТЗ 13.1). Ошибка самокорректируется
-//	    регулярной перепроверкой T-030 (см. scheduler/retry.go).
-//	А2  О8/О9: connect-refused → no_http против connect-таймаута →
-//	    temp_error: RST на SYN (порт закрыт) — постоянное свойство
-//	    хоста, повтор в ближнем горизонте бессмыслен (ErrNetwork, не
-//	    temp); молчание SYN (connect-таймаут) — транзиент (ErrTimeout).
-//	    Классифицирует httpworker/worker.go workerClassifyError по
+//	A1  O11: temp_error on exhausted attempts is finalized into
+//	    delegated_no_address, not into a special status: the last check
+//	    ended with SERVFAIL/timeout — there are no addresses for the
+//	    HTTP stage; this is the terminal "no addresses" branch of the
+//	    spec 7 algorithm. not_delegated was rejected (it encodes exactly
+//	    an apex NXDOMAIN, RFC 8020), the set does not grow new statuses
+//	    (the seven statuses are confirmed by the customer, spec 13.1).
+//	    The error self-corrects by the regular re-check T-030
+//	    (see scheduler/retry.go).
+//	A2  O8/O9: connect-refused → no_http versus a connect timeout →
+//	    temp_error: an RST to a SYN (the port is closed) is a permanent
+//	    property of the host, a retry in the near horizon is pointless
+//	    (ErrNetwork, not temp); SYN silence (a connect timeout) is
+//	    transient (ErrTimeout).
+//	    httpworker/worker.go workerClassifyError classifies by
 //	    httpfetch.IsTimeout (net.Error.Timeout).
-//	А3  HTTP-этап (О7–О9) пишет итог БЕЗ охраны check_state <> done
-//	    (в отличие от DNS-операторов): повторная доставка обязана
-//	    переиздать q:analyze, фильтр done отбросил бы публикацию
-//	    навсегда (httpworker/record.go, комментарий файла). Плата —
-//	    теоретическая гонка со свежей перепроверкой, окно практически
-//	    недостижимо (попытки доставки исчерпываются за минуты, recheck
-//	    измеряется месяцами; ранний recheck Р15 (T-270) сокращает
-//	    «месяцы» до 24 ч — дубль задачи ожившего стоявшего воркера
-//	    гасится той же идемпотентностью: перезапись эпизода
-//	    DELETE+INSERT, переиздание q:analyze).
+//	A3  The HTTP stage (O7–O9) records the outcome WITHOUT the
+//	    check_state <> done guard (unlike the DNS operators): redelivery
+//	    must re-publish q:analyze — a done filter would drop the
+//	    publication forever (httpworker/record.go, the file comment).
+//	    The price is a theoretical race with a fresh re-check; the window
+//	    is practically unreachable (delivery attempts are exhausted
+//	    within minutes, a recheck takes months; the early recheck R15
+//	    (T-270) shortens the "months" to 24 h — a duplicate task of a
+//	    revived standing worker is absorbed by the same idempotency:
+//	    the episode is rewritten with DELETE+INSERT, q:analyze is
+//	    re-published).
 //
-// ## Наблюдаемость аномалии «статус повис» (ФТ-2.2)
+// ## Observability of the "stuck status" anomaly (FR-2.2)
 //
-// О6 без О7–О9 (задача q:http потеряна после XADD) оставляет домен в
-// status = new ∧ check_state = done: нормой состояние НЕ является
-// (О6 обязан завершиться HTTP-итогом), наблюдается gauge
-// crawler_domains_new_done_stale и алертом domains_new_done_stale
-// (проход monitor/zonestats.go по счётчикам реконсиляции, без seq scan
-// по domains). Лечит компенсатор T-270 — ранний recheck (Р15
-// спецификации check_state, internal/scheduler/stalerequeue.go: часовой
-// проход возвращает new∧done старше 24 ч в pending, дешёвая проба по
-// строке new_done_stale — domains в стационаре не сканируются); домен
-// не ждёт возрастной перепроверки T-030 (recheck_interval, месяцы).
-// Gauge остаётся сигналом оператору о НОВЫХ потерях (класс открыт:
-// рестарт Redis без персистентности — docs/redis.md §5, OOM-окна —
-// docs/load-measurements.md §11.1).
+// O6 without O7–O9 (the q:http task lost after XADD) leaves the domain in
+// status = new ∧ check_state = done: the state is NOT the norm
+// (O6 must end with an HTTP outcome); it is observed by the gauge
+// crawler_domains_new_done_stale and the domains_new_done_stale alert
+// (a pass of monitor/zonestats.go over the reconciliation counters,
+// without a seq scan over domains). The T-270 compensator treats it —
+// the early recheck (R15 of the check_state spec,
+// internal/scheduler/stalerequeue.go: the hourly pass returns new∧done
+// older than 24 h to pending, a cheap probe by the new_done_stale row —
+// domains are not scanned in the steady state); the domain does not wait
+// for the age-based re-check T-030 (recheck_interval, months).
+// The gauge remains a signal to the operator about NEW losses (the class
+// is open: a Redis restart without persistence — docs/redis.md §5,
+// OOM windows — docs/load-measurements.md §11.1).
 type Status int16
 
-// Статусы домена (ТЗ 6.2). Комментарии — значения из таблицы §6.2.
+// Domain statuses (spec 6.2). The comments are the values from the §6.2
+// table.
 const (
-	// StatusNew — ещё не проверялся.
+	// StatusNew — not checked yet.
 	StatusNew Status = 0
-	// StatusNotDelegated — апекс NXDOMAIN; субдомены не проверяются
-	// (RFC 8020, ТЗ 5.4 п. 1).
+	// StatusNotDelegated — the apex is NXDOMAIN; subdomains are not
+	// checked (RFC 8020, spec 5.4 item 1).
 	StatusNotDelegated Status = 1
-	// StatusDelegatedNoAddress — делегирован, но ни у одного субдомена
-	// нет A/AAAA (ТЗ 5.4 п. 5).
+	// StatusDelegatedNoAddress — delegated, but no subdomain has
+	// A/AAAA (spec 5.4 item 5).
 	StatusDelegatedNoAddress Status = 2
-	// StatusNoHTTP — адреса есть, веб не отвечает ни по http, ни по https.
+	// StatusNoHTTP — addresses exist; the web does not respond over
+	// http or https.
 	StatusNoHTTP Status = 3
-	// StatusAlive — хотя бы один субдомен ответил по HTTP(S).
+	// StatusAlive — at least one subdomain responded over HTTP(S).
 	StatusAlive Status = 4
-	// StatusTempError — временная ошибка (SERVFAIL, таймауты), требуется
-	// повтор (ТЗ 5.3: temp_error_retry_after).
+	// StatusTempError — a temporary error (SERVFAIL, timeouts); a retry
+	// is required (spec 5.3: temp_error_retry_after).
 	StatusTempError Status = 5
-	// StatusDeleted — удалён из зарегистрированных по файлу удаления
-	// (ТЗ 5.1, 13.1).
+	// StatusDeleted — removed from the registered by a delete file
+	// (spec 5.1, 13.1).
 	StatusDeleted Status = 6
-	// StatusInvalid — диагностический терминальный статус ядовитой
-	// строки (T-109, остаток DNS-03): проверка невозможна — имя пустое
-	// или пробельное (мусорная/порченая строка domains), повтор эпизода
-	// исход не изменит. Не факт о домене: ставится DNS-этапом вместо
-	// вечного цикла queued→lease→dispatch; перепроверка (recheck) такие
-	// строки не возвращает — выход один: ручной разбор (правка имени или
-	// удаление строки). Код 7 — расширение таблицы §6.2, допущенное ТЗ:
-	// прецедент «семь статусов» (ТЗ 13.1, retry.go T-031) осознанно
-	// переигран: temp_error породил бы ложные повторы с финализацией в
-	// delegated_no_address — обман о домене, а не диагностика.
+	// StatusInvalid — the diagnostic terminal status of a poison row
+	// (T-109, the remainder of DNS-03): the check is impossible — the
+	// name is empty or whitespace (a junk/corrupted domains row),
+	// repeating the episode would not change the outcome. Not a fact
+	// about the domain: it is set by the DNS stage instead of the
+	// eternal queued→lease→dispatch loop; a recheck never returns such
+	// rows — the only way out is manual triage (editing the name or
+	// deleting the row). Code 7 is an extension of the §6.2 table
+	// allowed by the spec: the "seven statuses" precedent (spec 13.1,
+	// retry.go T-031) is deliberately overridden: temp_error would
+	// produce false retries finalized into delegated_no_address — a
+	// deception about the domain, not diagnostics.
 	StatusInvalid Status = 7
 )
 
-// Statuses — все статусы по возрастанию кодов (итерация, вывод в CLI).
+// Statuses — all statuses in ascending code order (iteration, CLI output).
 var Statuses = []Status{
 	StatusNew,
 	StatusNotDelegated,
@@ -140,8 +149,8 @@ var Statuses = []Status{
 	StatusInvalid,
 }
 
-// statusNames — имена статусов: 0..6 — ровно из таблицы ТЗ 6.2,
-// 7 — диагностический invalid (T-109, расширение §6.2).
+// statusNames — the status names: 0..6 — exactly from the spec 6.2 table,
+// 7 — the diagnostic invalid (T-109, an extension of §6.2).
 var statusNames = map[Status]string{
 	StatusNew:                "new",
 	StatusNotDelegated:       "not_delegated",
@@ -153,7 +162,7 @@ var statusNames = map[Status]string{
 	StatusInvalid:            "invalid",
 }
 
-// statusByName — обратное соответствие для ParseStatus.
+// statusByName — the reverse mapping for ParseStatus.
 var statusByName = func() map[string]Status {
 	m := make(map[string]Status, len(statusNames))
 	for s, name := range statusNames {
@@ -162,8 +171,8 @@ var statusByName = func() map[string]Status {
 	return m
 }()
 
-// String возвращает имя статуса из ТЗ 6.2 ("new", "not_delegated", …);
-// для кода вне таблицы — "Status(<код>)".
+// String returns the status name of spec 6.2 ("new", "not_delegated", …);
+// for a code outside the table — "Status(<code>)".
 func (s Status) String() string {
 	if name, ok := statusNames[s]; ok {
 		return name
@@ -171,15 +180,15 @@ func (s Status) String() string {
 	return fmt.Sprintf("Status(%d)", int16(s))
 }
 
-// Valid сообщает, что код входит в таблицу статусов ТЗ 6.2.
+// Valid reports that the code is in the spec 6.2 status table.
 func (s Status) Valid() bool {
 	_, ok := statusNames[s]
 	return ok
 }
 
-// ParseStatus разбирает имя статуса (ТЗ 6.2) в код: "new", "alive", …
-// Регистр и пробелы по краям не важны; неизвестное имя — ошибка со списком
-// допустимых.
+// ParseStatus parses a status name (spec 6.2) into a code: "new",
+// "alive", … Case and surrounding whitespace do not matter; an unknown
+// name is an error with the list of the valid ones.
 func ParseStatus(name string) (Status, error) {
 	s, ok := statusByName[strings.ToLower(strings.TrimSpace(name))]
 	if !ok {
@@ -188,7 +197,7 @@ func ParseStatus(name string) (Status, error) {
 	return s, nil
 }
 
-// statusNamesList — имена по порядку кодов (сообщения об ошибках).
+// statusNamesList — the names in code order (error messages).
 func statusNamesList() []string {
 	names := make([]string, len(Statuses))
 	for i, s := range Statuses {
@@ -197,24 +206,25 @@ func statusNamesList() []string {
 	return names
 }
 
-// CheckState — состояние проверки домена, колонка domains.check_state
-// (smallint, ТЗ 6.1): 0 pending, 1 queued, 2 done. Жизненный цикл задачи
-// планировщика (ТЗ 5.3); смены состояний выполняет планировщик — здесь
-// только значения.
+// CheckState — the check state of a domain, the domains.check_state column
+// (smallint, spec 6.1): 0 pending, 1 queued, 2 done. The lifecycle of the
+// scheduler task (spec 5.3); the scheduler performs the state changes —
+// here only the values.
 type CheckState int16
 
 const (
-	// CheckStatePending — ожидает выборки планировщиком (частичный индекс
-	// domains_pending_idx по check_state = 0).
+	// CheckStatePending — waiting to be selected by the scheduler (the
+	// partial index domains_pending_idx over check_state = 0).
 	CheckStatePending CheckState = 0
-	// CheckStateQueued — взят в работу, действует lease (queued_at).
+	// CheckStateQueued — taken for processing, the lease (queued_at) is
+	// active.
 	CheckStateQueued CheckState = 1
-	// CheckStateDone — DNS/HTTP-этап завершён (ТЗ 7); рендер и анализ
-	// дополняют результат асинхронно.
+	// CheckStateDone — the DNS/HTTP stage is complete (spec 7); the
+	// render and the analysis complement the result asynchronously.
 	CheckStateDone CheckState = 2
 )
 
-// String возвращает имя состояния ("pending", "queued", "done").
+// String returns the state name ("pending", "queued", "done").
 func (cs CheckState) String() string {
 	switch cs {
 	case CheckStatePending:
@@ -228,26 +238,27 @@ func (cs CheckState) String() string {
 	}
 }
 
-// Valid сообщает, что код — 0, 1 или 2.
+// Valid reports that the code is 0, 1, or 2.
 func (cs CheckState) Valid() bool {
 	return cs >= CheckStatePending && cs <= CheckStateDone
 }
 
-// Variant — вариант записи результата, колонка subdomain_results.variant
-// (smallint, ТЗ 6.1): 0 основной, 1 http-вариант (если отличается).
-// Логика выбора — ТЗ 5.5 п. 5.
+// Variant — the record variant, the subdomain_results.variant column
+// (smallint, spec 6.1): 0 main, 1 the http variant (if different).
+// The selection logic is spec 5.5 item 5.
 type Variant int16
 
 const (
-	// VariantMain — основной вариант: оба протокола ведут на один сайт
-	// либо отвечает только один протокол (какой именно — колонка scheme).
+	// VariantMain — the main variant: both protocols lead to the same
+	// site or only one protocol responds (which one — the scheme
+	// column).
 	VariantMain Variant = 0
-	// VariantHTTP — http-вариант: вторая запись, когда http и https ведут
-	// на разные сайты (variant 0 — https-сайт).
+	// VariantHTTP — the http variant: a second record when http and
+	// https lead to different sites (variant 0 is the https site).
 	VariantHTTP Variant = 1
 )
 
-// String возвращает имя варианта ("main", "http").
+// String returns the variant name ("main", "http").
 func (v Variant) String() string {
 	switch v {
 	case VariantMain:
@@ -259,23 +270,23 @@ func (v Variant) String() string {
 	}
 }
 
-// Valid сообщает, что код — 0 или 1.
+// Valid reports that the code is 0 or 1.
 func (v Variant) Valid() bool {
 	return v == VariantMain || v == VariantHTTP
 }
 
-// Scheme — протокол записи результата, колонка subdomain_results.scheme
-// (smallint, ТЗ 6.1): 1 http, 2 https.
+// Scheme — the protocol of the result record, the
+// subdomain_results.scheme column (smallint, spec 6.1): 1 http, 2 https.
 type Scheme int16
 
 const (
-	// SchemeHTTP — запись получена по http.
+	// SchemeHTTP — the record was obtained over http.
 	SchemeHTTP Scheme = 1
-	// SchemeHTTPS — запись получена по https.
+	// SchemeHTTPS — the record was obtained over https.
 	SchemeHTTPS Scheme = 2
 )
 
-// String возвращает имя протокола ("http", "https").
+// String returns the protocol name ("http", "https").
 func (s Scheme) String() string {
 	switch s {
 	case SchemeHTTP:
@@ -287,13 +298,13 @@ func (s Scheme) String() string {
 	}
 }
 
-// Valid сообщает, что код — 1 или 2.
+// Valid reports that the code is 1 or 2.
 func (s Scheme) Valid() bool {
 	return s == SchemeHTTP || s == SchemeHTTPS
 }
 
-// ParseScheme разбирает имя протокола ("http", "https"). Регистр и
-// пробелы по краям не важны.
+// ParseScheme parses a protocol name ("http", "https"). Case and
+// surrounding whitespace do not matter.
 func ParseScheme(name string) (Scheme, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "http":
@@ -305,22 +316,23 @@ func ParseScheme(name string) (Scheme, error) {
 	}
 }
 
-// AliasKind — связь субдомена с другим субдоменом того же домена,
-// колонка subdomain_results.alias_kind (smallint, ТЗ 6.1): 0 нет,
-// 1 идентичен, 2 редирект. Правила определения — ТЗ 5.5 п. 6.
+// AliasKind — the relation of a subdomain to another subdomain of the same
+// domain, the subdomain_results.alias_kind column (smallint, spec 6.1):
+// 0 none, 1 identical, 2 redirect. The detection rules are spec 5.5
+// item 6.
 type AliasKind int16
 
 const (
-	// AliasNone — независимый результат, алиаса нет.
+	// AliasNone — an independent result; no alias.
 	AliasNone AliasKind = 0
-	// AliasIdentical — идентичен другому субдомену: совпадает итоговый URL
-	// или хэш контента; контент хранится один раз.
+	// AliasIdentical — identical to another subdomain: the final URL or
+	// the content hash matches; the content is stored once.
 	AliasIdentical AliasKind = 1
-	// AliasRedirect — редирект на другой субдомен этого домена.
+	// AliasRedirect — a redirect to another subdomain of this domain.
 	AliasRedirect AliasKind = 2
 )
 
-// String возвращает имя связи ("none", "identical", "redirect").
+// String returns the relation name ("none", "identical", "redirect").
 func (a AliasKind) String() string {
 	switch a {
 	case AliasNone:
@@ -334,23 +346,24 @@ func (a AliasKind) String() string {
 	}
 }
 
-// Valid сообщает, что код — 0, 1 или 2.
+// Valid reports that the code is 0, 1, or 2.
 func (a AliasKind) Valid() bool {
 	return a >= AliasNone && a <= AliasRedirect
 }
 
-// Action — действие входного файла, колонка ingest_files.action
-// (smallint, ТЗ 6.1): 1 add, 2 delete (ТЗ 5.1: путь <зона>/add|delete/).
+// Action — the input file action, the ingest_files.action column
+// (smallint, spec 6.1): 1 add, 2 delete (spec 5.1: the path
+// <zone>/add|delete/).
 type Action int16
 
 const (
-	// ActionAdd — файл добавления доменов.
+	// ActionAdd — the domain addition file.
 	ActionAdd Action = 1
-	// ActionDelete — файл удаления доменов.
+	// ActionDelete — the domain deletion file.
 	ActionDelete Action = 2
 )
 
-// String возвращает имя действия ("add", "delete").
+// String returns the action name ("add", "delete").
 func (a Action) String() string {
 	switch a {
 	case ActionAdd:
@@ -362,7 +375,7 @@ func (a Action) String() string {
 	}
 }
 
-// Valid сообщает, что код — 1 или 2.
+// Valid reports that the code is 1 or 2.
 func (a Action) Valid() bool {
 	return a == ActionAdd || a == ActionDelete
 }

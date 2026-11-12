@@ -1,6 +1,6 @@
-// Юнит-тесты DNSMask: установка/снятие/проверка битов по номеру
-// субдомена, границы 0..62 (бит 63 знаковый — запрещён), атомарность при
-// ошибке, итерация установленных битов, полное заполнение.
+// Unit tests of DNSMask: setting/clearing/testing bits by subdomain
+// number, the 0..62 bounds (bit 63 is the sign bit — forbidden), atomicity
+// on error, iteration over the set bits, full filling.
 package model
 
 import (
@@ -35,7 +35,7 @@ func TestDNSMaskSetTestUnset(t *testing.T) {
 		t.Error("Unset(5) снял другие биты")
 	}
 
-	// Повторная установка и снятие неустановленного — идемпотентность.
+	// Setting again and clearing an unset bit — idempotency.
 	before := m
 	if err := m.Set(0); err != nil {
 		t.Fatal(err)
@@ -81,8 +81,8 @@ func TestDNSMaskLimits(t *testing.T) {
 		t.Errorf("после ошибочных операций маска = %d, want 0", int64(m))
 	}
 
-	// Test недопустимого номера — false, не паника: несуществующий бит
-	// не установлен.
+	// Test of an invalid number is false, not a panic: a nonexistent bit
+	// is not set.
 	for _, id := range []int{-1, 63, 100} {
 		if m.Test(id) {
 			t.Errorf("Test(%d) = true, want false", id)
@@ -90,8 +90,8 @@ func TestDNSMaskLimits(t *testing.T) {
 	}
 }
 
-// TestDNSMaskErrorValue — при ошибке конструктор возвращает нулевую
-// маску (конвенция нулевого значения; мутанты ±1 давали бы -1/1).
+// TestDNSMaskErrorValue — on an error the constructor returns a zero
+// mask (the zero-value convention; the ±1 mutants would give -1/1).
 func TestDNSMaskErrorValue(t *testing.T) {
 	m, err := NewDNSMask(63)
 	if err == nil {
@@ -102,17 +102,17 @@ func TestDNSMaskErrorValue(t *testing.T) {
 	}
 }
 
-// TestDNSMaskTestOutsideRange — недопустимый номер не установлен даже у
-// всеединичной (отрицательной) маски: бита 63 не существует, проверка
-// диапазона в Test отсекает его до обращения к маске.
+// TestDNSMaskTestOutsideRange — an invalid number is not set even in an
+// all-ones (negative) mask: bit 63 does not exist, the range check in
+// Test cuts it off before the mask is touched.
 func TestDNSMaskTestOutsideRange(t *testing.T) {
 	if DNSMask(-1).Test(63) {
 		t.Error("DNSMask(-1).Test(63) = true, want false (63 вне 0..62)")
 	}
 }
 
-// TestDNSMaskAtomicOnError — ошибка в любом номере не меняет маску
-// (проверка всех номеров до применения).
+// TestDNSMaskAtomicOnError — an error in any number does not change the
+// mask (all numbers are validated before applying).
 func TestDNSMaskAtomicOnError(t *testing.T) {
 	m, err := NewDNSMask(0, 2)
 	if err != nil {
@@ -132,8 +132,8 @@ func TestDNSMaskAtomicOnError(t *testing.T) {
 	}
 }
 
-// TestDNSMaskAllBits — все 63 допустимых бита: значение положительно
-// (бит 63 не тронут) и равно MaxInt64.
+// TestDNSMaskAllBits — all 63 valid bits: the value is positive (bit 63
+// is untouched) and equals MaxInt64.
 func TestDNSMaskAllBits(t *testing.T) {
 	ids := make([]int, 0, MaxSubdomains)
 	for id := 0; id < MaxSubdomains; id++ {
@@ -194,8 +194,8 @@ func TestDNSMaskEmpty(t *testing.T) {
 	}
 }
 
-// TestDNSMaskValid — значение с битом 63 (отрицательное) не проходит
-// проверку инварианта: такие данные в БД не записываются.
+// TestDNSMaskValid — a value with bit 63 (negative) fails the invariant
+// check: such data is never written to the DB.
 func TestDNSMaskValid(t *testing.T) {
 	if DNSMask(-1).Valid() {
 		t.Error("DNSMask(-1).Valid() = true, want false (бит 63 знаковый)")

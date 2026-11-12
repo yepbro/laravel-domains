@@ -1,57 +1,65 @@
-// Package status — общая библиотека сводки конвейера (ТЗД §4.5, T-126):
-// SQL-выборки, типы и расчёты статуса, используемые и CLI `crawlerctl
-// status` (T-079, ТЗ 5.9), и операторским дашбордом (T-129) — один
-// источник правды о смысле чисел; дублирование SQL между потребителями
-// запрещено (ТЗД §4.5).
+// Package status — the shared library of the pipeline summary (dashboard
+// spec §4.5, T-126): SQL selections, types and status calculations, used
+// both by the CLI `crawlerctl status` (T-079, spec 5.9) and by the
+// operator dashboard (T-129) — a single source of truth about the meaning
+// of the numbers; duplicating the SQL between consumers is forbidden
+// (dashboard spec §4.5).
 //
-// Источники — PostgreSQL (счётчики zones + агрегаты domains + окна
-// темпа) и Redis (глубина стримов — backlog групп потребления); всё
-// читается разово, без состояния. Пакет не знает про вывод: таблица/JSON
-// остаются в CLI, снимки — в дашборде. Секции дашборда без аналога в CLI
-// (распределение статусов, Laravel-находки, журнал ingest — ТЗД §5.5–5.7)
-// живут здесь же: SQL сводки — один источник правды, а деградация секций
-// и снимок целиком — сборка дашборда (ТЗД §4.4, §5.9).
+// The sources are PostgreSQL (the zones counters + the domains aggregates
+// + the throughput windows) and Redis (the stream depth — the backlog of
+// the consumer groups); everything is read ad hoc, statelessly. The
+// package knows nothing about the output: the table/JSON stay in the CLI,
+// the snapshots — in the dashboard. The dashboard sections without a CLI
+// counterpart (the status distribution, the Laravel finds, the ingest log
+// — dashboard spec §5.5–5.7) live here too: the summary SQL is a single
+// source of truth, while the degradation of the sections and the snapshot
+// as a whole belong to the dashboard assembly (dashboard spec §4.4, §5.9).
 //
-// Что измеримо из БД (решения зафиксированы, остальное — честно не
-// показывается, ТЗ 5.9 «скорость… ожидаемое время завершения цикла»):
+// What is measurable from the DB (the decisions are fixed; the rest is
+// honestly not shown, spec 5.9 "the rate… the expected time to complete
+// the circle"):
 //
-//   - прогресс зон — счётчики zones.domains_total/domains_pending/
-//     domains_queued/domains_checked (дельты переходов + реконсиляция
-//     monitor, T-178; базовое множество — status <> deleted, ТЗИ §4.1),
-//     читаются справочником без прохода domains;
-//   - скорость доменов — средняя с начала суток по суточному счётчику
-//     проверок checks:YYYY-MM-DD (T-179; last_checked_at имеет точность
-//     дня, ТЗ 6.1, часового окна нет); короче 10 минут окно не
-//     используется (сразу после полуночи оценка скачет);
-//   - HTTP-результаты и рендеры — часовые корзины темпа
+//   - the zone progress — the zones.domains_total/domains_pending/
+//     domains_queued/domains_checked counters (the transition deltas +
+//     the monitor reconciliation, T-178; the base set is
+//     status <> deleted, incremental-counters spec §4.1), read from the
+//     reference table without a pass over domains;
+//   - the domain rate — the average since the start of the day by the
+//     daily check counter checks:YYYY-MM-DD (T-179; last_checked_at has
+//     day precision, spec 6.1, there is no hourly window); a window
+//     shorter than 10 minutes is not used (right after midnight the
+//     estimate jumps);
+//   - the HTTP results and renders — the hourly throughput buckets
 //     crawler_counters['results:YYYY-MM-DDTHH24'/'rendered:…'] (T-203):
-//     суммируются ДВЕ живые корзины — предыдущий и текущий календарный
-//     час, делитель скорости — фактическая длина покрытого окна
-//     (1–2 ч, HourWindowSec), оценка «в секунду» несмещённа; прежде
-//     живые подзапросы по subdomain_results.checked_at деградировали
-//     heap-fetch'ами свежих страниц (контрольная точка этапа 27);
-//     собственной отметки времени у рендера нет — считается доля
-//     rendered среди результатов окна;
-//   - темп DNS-этапа отдельно и этапа анализа из БД не измерим (нет
-//     отметок времени; завершение DNS+HTTP и есть «доменов/с») — их
-//     метрики в Prometheus (T-076/T-077);
-//   - ETA первого цикла = (pending + queued) / скорость доменов, защита
-//     от деления на ноль — скорости нет или она 0 → «н/д».
+//     TWO live buckets are summed — the previous and the current calendar
+//     hour; the rate divisor is the actual length of the covered window
+//     (1–2 h, HourWindowSec), the "per second" estimate is unbiased;
+//     previously the live subqueries over subdomain_results.checked_at
+//     degraded with heap fetches of fresh pages (the stage 27 checkpoint);
+//     a render has no timestamp of its own — the rendered share among the
+//     results of the window is computed;
+//   - the throughput of the DNS stage separately and of the analysis
+//     stage is not measurable from the DB (no timestamps; finishing
+//     DNS+HTTP is exactly "domains/s") — their metrics are in Prometheus
+//     (T-076/T-077);
+//   - the ETA of the first circle = (pending + queued) / the domain rate;
+//     the division-by-zero protection — there is no rate or it is 0 →
+//     "n/a".
 //
-// Окна и распределения: часовые окна темпа — часовые корзины
-// crawler_counters results:/rendered: (T-203: живые подзапросы по
-// subdomain_results.checked_at деградировали heap-fetch'ами свежих
-// страниц — контрольная точка этапа 27, тот же механизм, что у суточного
-// окна T-179); суточное окно темпа — инкрементальный счётчик
-// checks:YYYY-MM-DD (T-179: живой подсчёт
-// last_checked_at = current_date деградировал heap-fetch'ами свежих
-// страниц — замер §2 TZ_slow_done_today); распределения и состояния —
-// инкрементальные счётчики (T-178: zones + crawler_counters, дельты
-// переходов + реконсиляция раз в monitor.zone_stats_interval — единственный
-// полный проход domains в стационаре). Дашборд кэширует снимки фоновым
-// циклом (ТЗД §4.4, TTL-кэш T-161 — теперь он кэширует дешёвые чтения,
-// защищая от трафика между refresh-циклами), его период
-// (dashboard.refresh) задаёт цену мониторинга.
+// Windows and distributions: the hourly throughput windows are the hourly
+// crawler_counters results:/rendered: buckets (T-203: live subqueries over
+// subdomain_results.checked_at degraded with heap fetches of fresh pages —
+// the stage 27 checkpoint, the same mechanism as the daily window T-179);
+// the daily throughput window is the incremental counter checks:YYYY-MM-DD
+// (T-179: the live count of last_checked_at = current_date degraded with
+// heap fetches of fresh pages — the measurement of §2 TZ_slow_done_today);
+// the distributions and states are incremental counters (T-178: zones +
+// crawler_counters, the transition deltas + reconciliation once per
+// monitor.zone_stats_interval — the only full pass over domains in the
+// steady state). The dashboard caches snapshots with a background loop
+// (dashboard spec §4.4, the TTL cache T-161 — it now caches cheap reads,
+// protecting from traffic between the refresh cycles), and its period
+// (dashboard.refresh) sets the price of the monitoring.
 package status
 
 import (
@@ -69,60 +77,68 @@ import (
 
 // ---------------------------------------------------------------- SQL
 
-// zoneStatsSQL — сводка по зонам из счётчиков справочника (T-178, ТЗИ
-// §8.1): без JOIN domains — полный проход 47 млн строк ушёл из путей
-// чтения, сводка читает тысячи строк зон; счётчики ведут дельты
-// переходов (ТЗИ §6) и реконсиляция monitor (ТЗИ §7). Базовое множество
-// всех колонок — status <> deleted (унификация ТЗИ §4.1: queued/done
-// прежде живого агрегата считались без фильтра статуса — удалённый с
-// зависшей арендой попадал в queued; теперь удалённый домен не является
-// ни работой, ни прогрессом).
+// zoneStatsSQL — the per-zone summary from the reference table counters
+// (T-178, incremental-counters spec §8.1): without a JOIN over domains —
+// the full pass over 47M rows left the read paths, the summary reads
+// thousands of zone rows; the counters keep the transition deltas
+// (incremental-counters spec §6), and the monitor reconciliation does
+// (incremental-counters spec §7). The base set of all columns is
+// status <> deleted (the unification of incremental-counters spec §4.1:
+// queued/done were previously counted by the live aggregate without a
+// status filter — a deleted domain with a stuck lease fell into queued;
+// now a deleted domain is neither work nor progress).
 var zoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_unicode, " +
 	"z.is_active, z.domains_total, z.domains_pending, z.domains_queued, z.domains_checked " +
 	"FROM zones AS z ORDER BY z.name"
 
-// throughputSQL — замеры темпа одним запросом; каждое число — точечное
-// чтение/сумма строк crawler_counters, проходов больших таблиц в пути
-// чтения нет. now() — время транзакции: интервалы согласованы внутри
-// одного выполнения; current_date, date_trunc и now() — одна таймзона
-// сервера БД, как и now() записи last_checked_at/checked_at строк
-// (T-058). done_today — точечное чтение суточного счётчика
-// crawler_counters['checks:YYYY-MM-DD'] (T-179): имя дня
-// вычисляет БД тем же current_date, что и окно реконсиляции, — Go-часы
-// в имени не участвуют; счётчик ведут инкременты записи результата
-// (httpworker/record.go), авторитет — реконсиляция monitor. coalesce
-// СНАРУЖИ подзапроса: до первой записи суток подзапрос пуст (NULL), а не
-// строка с NULL-значением — часы простоя конвейера показывают честный
-// ноль (TZ_slow_done_today §4/§7). done_today считает события записи
-// результатов, а не домены: повторные эпизоды того же домена за сутки
-// сходятся в «темп работы» (расхождение с живым count(*) — §5.1 ТЗ,
-// восстанавливается реконсиляцией).
+// throughputSQL — the throughput measurements in one query; every number
+// is a point read / a sum of crawler_counters rows, there are no passes
+// over large tables in the read path. now() is the transaction time: the
+// intervals are consistent within a single execution; current_date,
+// date_trunc and now() share the time zone of the DB server, the same as
+// the now() of the last_checked_at/checked_at record times (T-058).
+// done_today is a point read of the daily counter
+// crawler_counters['checks:YYYY-MM-DD'] (T-179): the day name is computed
+// by the DB with the same current_date as the reconciliation window —
+// Go clocks do not participate in the name; the counter is fed by the
+// result record increments (httpworker/record.go), the authority is the
+// monitor reconciliation. coalesce is OUTSIDE the subquery: before the
+// first record of the day the subquery is empty (NULL), not a row with a
+// NULL value — the idle pipeline hours show an honest zero
+// (TZ_slow_done_today §4/§7). done_today counts the result record events,
+// not domains: repeated episodes of the same domain within a day converge
+// into the "work throughput" (the discrepancy with the live count(*) —
+// spec §5.1, restored by the reconciliation).
 //
-// results_hour/rendered_hour — суммы ЧАСОВЫХ корзин темпа
+// results_hour/rendered_hour — the sums of the HOURLY throughput buckets
 // crawler_counters['results:YYYY-MM-DD"T"HH24'/'rendered:…'] (T-203):
-// прежние живые подзапросы по subdomain_results (count(*) по
-// checked_at >= now() − 1 ч) деградировали heap-fetch'ами свежих страниц
-// окна — контрольная точка этапа 27 (медиана 6,0 с > 3 с, 108 событий;
-// тот же механизм, что у суточного окна T-179 — замер §2
-// TZ_slow_done_today). Корзина — календарный час, скользящее окно
-// «последний час» точно из корзин не собирается: читатель суммирует ДВЕ
-// живые корзины — предыдущий и текущий час (минимум, покрывающий окно
-// [now() − 1 ч, now()]), а честный делитель скорости — hour_window_sec,
-// фактическая длина покрытого окна [date_trunc('hour', now() − 1 ч),
-// now()] (1–2 ч): деление на 3600 завышало бы темп пилообразно в 1–2
-// раза к границе часа. Инкременты ведут транзакции записи: results —
-// вставка строк результата (httpworker/record.go, дельта — число строк
-// пачки), rendered — выставление флага rendered = true этапом рендера
-// (renderworker/worker.go, той же транзакцией замены контента); корзина
-// rendered-семьи — час checked_at СТРОКИ (час эпизода, не рендера — так
-// считало живое окно: доля rendered среди результатов окна).
-// Сходимость корзин с живым count(*) — по календарному часу
-// (реконсиляция monitor, FILTER-позиции прохода); между проходами
-// расхождение — потоковая разница семантик (дубль-доставки,
-// перезаписи эпизодов), как у суточных строк. coalesce СНАРУЖИ: до
-// первых инкрементов корзин нет — честный ноль. Имена корзин вычисляет
-// БД (date_trunc от now()) — таймзона согласована с инкрементами и
-// реконсиляцией, Go-часы в имени не участвуют (стиль T-179).
+// the former live subqueries over subdomain_results (count(*) over
+// checked_at >= now() − 1 h) degraded with heap fetches of the fresh pages
+// of the window — the stage 27 checkpoint (the median 6.0 s > 3 s, 108
+// events; the same mechanism as the daily window T-179 — the measurement
+// of §2 TZ_slow_done_today). A bucket is a calendar hour; the sliding
+// "last hour" window is not assembled exactly from buckets: the reader
+// sums TWO live buckets — the previous and the current hour (the minimum
+// covering the window [now() − 1 h, now()]), and the honest rate divisor
+// is hour_window_sec, the actual length of the covered window
+// [date_trunc('hour', now() − 1 h), now()] (1–2 h): dividing by 3600 would
+// overestimate the throughput sawtooth-wise 1–2× toward the hour boundary.
+// The increments are fed by the record transactions: results — the
+// insertion of result rows (httpworker/record.go, the delta is the chunk
+// row count), rendered — the rendered = true flag set by the render stage
+// (renderworker/worker.go, by the same content-replacement transaction);
+// the bucket of the rendered family is the checked_at HOUR of the ROW
+// (the hour of the episode, not of the render — that is what the live
+// window counted: the rendered share among the results of the window).
+// The convergence of the buckets with the live count(*) is per calendar
+// hour (the monitor reconciliation, the FILTER positions of the pass);
+// between passes the discrepancy is the streaming difference of the
+// semantics (duplicate deliveries, episode rewrites), as with the daily
+// rows. coalesce OUTSIDE: before the first increments there are no
+// buckets — an honest zero. The bucket names are computed by the DB
+// (date_trunc from now()) — the time zone is consistent with the
+// increments and the reconciliation; Go clocks do not participate in the
+// name (the T-179 style).
 const throughputSQL = "SELECT " +
 	"coalesce((SELECT value FROM crawler_counters " +
 	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')), 0) AS done_today, " +
@@ -135,37 +151,41 @@ const throughputSQL = "SELECT " +
 	"'rendered:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'))) AS rendered_hour, " +
 	"extract(epoch FROM (now() - date_trunc('hour', now() - interval '1 hour')))::float8 AS hour_window_sec"
 
-// domainStatusSQL — распределение domains по статусам (ТЗД §5.5) из
-// строк status_* таблицы crawler_counters (T-178, ТЗИ §8.2): строки
-// пишет реконсиляция monitor (статус-распределение не инкрементируется
-// на переходах — старые статусы не пинируются предикатами операторов,
-// ТЗИ §13.3; FILTER-колонки в реконсиляционном скане бесплатны),
-// свежесть — monitor.zone_stats_interval (30 мин, T-199; прежде живой
-// агрегат кэшировался минутой T-161). LIKE-шаблон с экранированным
-// подчёркиванием: имя строки — status_<имя>, односимвольная маска _
-// ловила бы чужие имена. ORDER BY name — детерминированный порядок
-// строк (имена и полнота легенды — в FetchDomainStatuses).
+// domainStatusSQL — the distribution of domains over statuses (dashboard
+// spec §5.5) from the status_* rows of the crawler_counters table (T-178,
+// incremental-counters spec §8.2): the rows are written by the monitor
+// reconciliation (the status distribution is not incremented on the
+// transitions — the old statuses are not pinned by the operator
+// predicates, incremental-counters spec §13.3; the FILTER columns in the
+// reconciliation scan are free), the freshness is
+// monitor.zone_stats_interval (30 min, T-199; previously the live
+// aggregate was cached for a minute, T-161). A LIKE pattern with an
+// escaped underscore: the row name is status_<name>; a one-character _
+// mask would catch foreign names. ORDER BY name is a deterministic row
+// order (the names and the legend completeness are in FetchDomainStatuses).
 const domainStatusSQL = "SELECT name, value FROM crawler_counters WHERE name LIKE 'status\\_%' ORDER BY name"
 
-// laravelTotalsSQL — счётчики Laravel-находок (ТЗД §5.6): всего — сумма
-// инкрементальных счётчиков зон (T-178, ТЗИ §8.3: sum(zones.
-// domains_laravel), как читает лендинг с T-122; дельты пишет analyzer,
-// авторитет — реконсиляция), окно 24 часа — живой агрегат по
-// laravel_domains (обновлится при пересчёте агрегата, ТЗ 5.8) по индексу
-// laravel_domains_updated_at_idx (T-120): цена пропорциональна окну, а
-// не таблице (рамки ТЗИ §3.1). Окно 24 часа — то же, что у «находок за
-// 24 ч» лендинга (T-118/T-120), но по laravel_domains — ТЗД §5.6 явно
-// называет эту таблицу: секция показывает живой агрегат, а не журнал
-// переходов.
+// laravelTotalsSQL — the Laravel find counters (dashboard spec §5.6):
+// the total — the sum of the incremental zone counters (T-178,
+// incremental-counters spec §8.3: sum(zones.domains_laravel), as the
+// landing reads since T-122; the deltas are written by the analyzer, the
+// authority is the reconciliation); the 24 h window — a live aggregate
+// over laravel_domains (refreshed when the aggregate is recomputed,
+// spec 5.8) by the laravel_domains_updated_at_idx index (T-120): the cost
+// is proportional to the window, not to the table (the bounds of
+// incremental-counters spec §3.1). The 24 h window is the same as the
+// "finds in 24 h" of the landing (T-118/T-120), but over laravel_domains —
+// dashboard spec §5.6 names this table explicitly: the section shows the
+// live aggregate, not the transition log.
 const laravelTotalsSQL = "SELECT (SELECT coalesce(sum(domains_laravel), 0) FROM zones), " +
 	"count(*) FILTER (WHERE updated_at >= now() - interval '24 hours') " +
 	"FROM laravel_domains"
 
-// laravelRecentSQL — последние находки (ТЗД §5.6): домен собирается из
-// label и зоны (JOIN по ключу laravel_domains), сортировка и LIMIT — по
-// индексу laravel_domains_updated_at_idx (T-120). ver_min/ver_max
-// NULL-able (диапазон мог не определиться) — FetchLaravelStats
-// разворачивает в пустые строки.
+// laravelRecentSQL — the recent finds (dashboard spec §5.6): the domain is
+// assembled from the label and the zone (a JOIN by the laravel_domains
+// key); the sorting and the LIMIT go by the laravel_domains_updated_at_idx
+// index (T-120). ver_min/ver_max are NULL-able (the range may have failed
+// to be determined) — FetchLaravelStats unfolds them into empty strings.
 const laravelRecentSQL = "SELECT d.label || '.' || z.name AS domain, z.name AS zone, " +
 	"ld.score, ld.ver_min, ld.ver_max, ld.updated_at " +
 	"FROM laravel_domains AS ld " +
@@ -173,42 +193,44 @@ const laravelRecentSQL = "SELECT d.label || '.' || z.name AS domain, z.name AS z
 	"JOIN zones AS z ON z.id = ld.zone_id " +
 	"ORDER BY ld.updated_at DESC LIMIT 10"
 
-// ingestRecentSQL — последние обработанные файлы (ТЗД §5.7). NULLS LAST
-// обязателен: DESC в PostgreSQL по умолчанию поднимает NULL первыми —
-// строка без processed_at (схема допускает) не должна возглавлять
-// «последние»; id DESC — детерминированный порядок внутри одной секунды.
+// ingestRecentSQL — the recently processed files (dashboard spec §5.7).
+// NULLS LAST is mandatory: DESC in PostgreSQL lifts NULLs to the top by
+// default — a row without processed_at (the schema allows it) must not
+// head the "recent"; id DESC is a deterministic order within one second.
 const ingestRecentSQL = "SELECT path, action, lines_total, added, existed, deleted, rejected, processed_at " +
 	"FROM ingest_files ORDER BY processed_at DESC NULLS LAST, id DESC LIMIT 10"
 
-// ---------------------------------------------------------------- данные
+// ---------------------------------------------------------------- data
 
-// ZoneStats — строка сводки зоны.
+// ZoneStats — a zone summary row.
 type ZoneStats struct {
 	ID             int16
-	Name           string // punycode — каноническая форма (ТЗ 5.2)
-	NameUnicode    string // "" — NULL; только отображение (в JSON)
+	Name           string // punycode — the canonical form (spec 5.2)
+	NameUnicode    string // "" — NULL; display only (in JSON)
 	IsActive       bool
-	DomainsTotal   int64 // счётчик zones.domains_total (дельты + реконсиляция, T-178)
-	DomainsChecked int64 // счётчик zones.domains_checked (дельты + реконсиляция, T-178)
-	Pending        int64 // счётчик zones.domains_pending: ожидает выборки
-	Queued         int64 // счётчик zones.domains_queued: в работе (lease)
-	Done           int64 // DNS/HTTP-этап завершён (ТЗ 7) — теперь тот же
-	// счётчик domains_checked (T-178: прежде живой агрегат считал done
-	// без фильтра статуса — унификация базового множества ТЗИ §4.1
-	// закрыла расхождение в пользу реконсиляции); поле сохранено —
-	// wire-формат JSON (§5.3) показывает обе колонки.
+	DomainsTotal   int64 // the zones.domains_total counter (deltas + reconciliation, T-178)
+	DomainsChecked int64 // the zones.domains_checked counter (deltas + reconciliation, T-178)
+	Pending        int64 // the zones.domains_pending counter: waiting for selection
+	Queued         int64 // the zones.domains_queued counter: in work (lease)
+	Done           int64 // the DNS/HTTP stage is complete (spec 7) — now the same
+	// domains_checked counter (T-178: previously the live aggregate counted
+	// done without a status filter — the unification of the base set of
+	// incremental-counters spec §4.1 closed the discrepancy in favor of the
+	// reconciliation); the field is kept — the JSON wire format (§5.3)
+	// shows both columns.
 }
 
-// Throughput — замеры темпа из БД (одно выполнение throughputSQL).
+// Throughput — the throughput measurements from the DB (one execution of
+// throughputSQL).
 type Throughput struct {
-	DoneToday     int64   // событий записи результатов с начала суток (счётчик checks:, T-179)
-	ElapsedSec    float64 // прошло с начала суток по часам БД
-	ResultsHour   int64   // строк результатов в корзинах окна темпа (results:, T-203): предыдущий + текущий час
-	RenderedHour  int64   // из них с итоговым DOM (корзины rendered:, T-203)
-	HourWindowSec float64 // длина покрытого окна корзин по часам БД: [trunc(now−1ч), now], 1–2 ч (T-203)
+	DoneToday     int64   // the result record events since the start of the day (the checks: counter, T-179)
+	ElapsedSec    float64 // elapsed since the start of the day by the DB clock
+	ResultsHour   int64   // the result rows in the throughput window buckets (results:, T-203): the previous + the current hour
+	RenderedHour  int64   // of those with a final DOM (the rendered: buckets, T-203)
+	HourWindowSec float64 // the covered bucket window length by the DB clock: [trunc(now−1h), now], 1–2 h (T-203)
 }
 
-// FetchZoneStats выполняет zoneStatsSQL и собирает строки зон.
+// FetchZoneStats executes zoneStatsSQL and collects the zone rows.
 func FetchZoneStats(ctx context.Context, pool db.DB) ([]ZoneStats, error) {
 	if pool == nil {
 		return nil, errors.New("status: зоны: пул не задан")
@@ -225,7 +247,7 @@ func FetchZoneStats(ctx context.Context, pool db.DB) ([]ZoneStats, error) {
 			&z.DomainsTotal, &z.Pending, &z.Queued, &z.DomainsChecked); err != nil {
 			return nil, fmt.Errorf("status: зоны: чтение: %w", err)
 		}
-		z.Done = z.DomainsChecked // одна колонка счётчика — обе семантики (T-178)
+		z.Done = z.DomainsChecked // one counter column — both semantics (T-178)
 		zones = append(zones, z)
 	}
 	if err := rows.Err(); err != nil {
@@ -234,8 +256,8 @@ func FetchZoneStats(ctx context.Context, pool db.DB) ([]ZoneStats, error) {
 	return zones, nil
 }
 
-// FetchThroughput выполняет throughputSQL (ровно одна строка — скалярный
-// SELECT без FROM).
+// FetchThroughput executes throughputSQL (exactly one row — a scalar
+// SELECT without FROM).
 func FetchThroughput(ctx context.Context, pool db.DB) (Throughput, error) {
 	if pool == nil {
 		return Throughput{}, errors.New("status: темп: пул не задан")
@@ -258,11 +280,11 @@ func FetchThroughput(ctx context.Context, pool db.DB) (Throughput, error) {
 	return t, nil
 }
 
-// ---------------------------------------------------------------- данные секций дашборда (ТЗД §5.5–5.7)
+// ---------------------------------------------------------------- dashboard section data (dashboard spec §5.5–5.7)
 
-// LaravelRecent — строка «последние находки» (ТЗД §5.6): домен, зона,
-// score, диапазон версий (пустая строка — NULL: диапазон не определён),
-// момент обновления.
+// LaravelRecent — a "recent finds" row (dashboard spec §5.6): the domain,
+// the zone, the score, the version range (an empty string — NULL: the
+// range is undetermined), the update moment.
 type LaravelRecent struct {
 	Domain    string
 	Zone      string
@@ -272,17 +294,18 @@ type LaravelRecent struct {
 	UpdatedAt time.Time
 }
 
-// LaravelStats — секция Laravel-находок (ТЗД §5.6): всего, за 24 часа,
-// последние 10.
+// LaravelStats — the Laravel finds section (dashboard spec §5.6): the
+// total, the last 24 hours, the recent 10.
 type LaravelStats struct {
 	Total   int64
 	Last24h int64
-	Recent  []LaravelRecent // пустой срез — находок нет (не ошибка)
+	Recent  []LaravelRecent // an empty slice — no finds (not an error)
 }
 
-// IngestReport — строка «последние ingest-файлы» (ТЗД §5.7): файл,
-// действие («add»/«delete» по model.Action; код вне таблицы ТЗ 6.1 —
-// имя «Action(N)», NULL — пусто), счётчики строк и момент обработки.
+// IngestReport — a "recent ingest files" row (dashboard spec §5.7): the
+// file, the action ("add"/"delete" per model.Action; a code outside the
+// spec 6.1 table — the name "Action(N)", NULL — empty), the row counters
+// and the processing moment.
 type IngestReport struct {
 	Path        string // "" — NULL
 	Action      string
@@ -294,13 +317,14 @@ type IngestReport struct {
 	ProcessedAt time.Time // zero — NULL
 }
 
-// FetchDomainStatuses — распределение domains по статусам (ТЗД §5.5)
-// из строк status_* crawler_counters (T-178). Ключи — имена по ТЗ 6.2
-// основного ТЗ (model.Statuses); статусы без строк входят с нулём —
-// полная легенда для отображения без знания таблицы на клиенте; строки
-// с именем вне легенды (неизвестный код схемы) не отображаются —
-// реконсиляция пишет только model.Statuses, чужая строка — ручная
-// правка таблицы (runbooks §6).
+// FetchDomainStatuses — the distribution of domains over statuses
+// (dashboard spec §5.5) from the status_* rows of crawler_counters
+// (T-178). The keys are the names of spec 6.2 of the main spec
+// (model.Statuses); the statuses without rows enter with zero — a full
+// legend for display without the client knowing the table; the rows with
+// a name outside the legend (an unknown schema code) are not displayed —
+// the reconciliation writes only model.Statuses; a foreign row means a
+// manual fix of the table (runbooks §6).
 func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, error) {
 	if pool == nil {
 		return nil, errors.New("status: статусы: пул не задан")
@@ -322,7 +346,7 @@ func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, err
 			return nil, fmt.Errorf("status: статусы: чтение: %w", err)
 		}
 		if _, ok := counts[strings.TrimPrefix(name, statusPrefix)]; !ok {
-			continue // имя вне легенды model.Statuses — комментарий выше
+			continue // a name outside the model.Statuses legend — the comment above
 		}
 		counts[strings.TrimPrefix(name, statusPrefix)] = n
 	}
@@ -332,13 +356,14 @@ func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, err
 	return counts, nil
 }
 
-// FetchLaravelStats собирает секцию Laravel-находок (ТЗД §5.6): счётчики
-// одним проходом laravel_domains, последние 10 — отдельным запросом с
-// JOIN (индекс T-120). Ошибка любого запроса — ошибка секции целиком
-// (вызывающий кладёт null, ТЗД §5.9). Первый result set закрывается ДО
-// второго запроса (стиль web.FetchLandingData): скалярный SELECT не
-// дочитывается до конца сам — удержание set'а занимало бы соединение
-// пула на всё время второго запроса (при pool_size=1 — дедлок).
+// FetchLaravelStats collects the Laravel finds section (dashboard spec
+// §5.6): the counters in one pass over laravel_domains, the recent 10 —
+// a separate query with a JOIN (the T-120 index). An error of any query
+// is an error of the whole section (the caller puts null, dashboard spec
+// §5.9). The first result set is closed BEFORE the second query (the
+// web.FetchLandingData style): a scalar SELECT does not finish reading by
+// itself — holding the set would occupy a pool connection for the entire
+// duration of the second query (with pool_size=1 — a deadlock).
 func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
 	if pool == nil {
 		return LaravelStats{}, errors.New("status: laravel: пул не задан")
@@ -349,9 +374,9 @@ func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
 		return LaravelStats{}, fmt.Errorf("status: laravel: %w", err)
 	}
 	if !rows.Next() {
-		// Пустой набор скалярного агрегата — аномалия: различаем ошибку
-		// уровня строк (реальная причина ценнее синтетической) и честное
-		// «пусто».
+		// An empty set of a scalar aggregate is an anomaly: we distinguish
+		// a row-level error (the real cause is more valuable than a
+		// synthetic one) from an honest "empty".
 		err := rows.Err()
 		rows.Close()
 		if err != nil {
@@ -400,11 +425,11 @@ func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
 	return st, nil
 }
 
-// FetchIngestReports — последние 10 записей журнала ingest_files
-// (ТЗД §5.7). NULL-колонки схемы (path/action/счётчики/processed_at)
-// разворачиваются в нулевые значения — журнал пишет конвейер всегда
-// полными строками (internal/ingest RecordFile), NULL легален только
-// для вручную вставленных строк.
+// FetchIngestReports — the recent 10 records of the ingest_files log
+// (dashboard spec §5.7). The NULL schema columns
+// (path/action/counters/processed_at) are unfolded into zero values —
+// the pipeline always writes the log with full rows (internal/ingest
+// RecordFile); NULL is legal only for manually inserted rows.
 func FetchIngestReports(ctx context.Context, pool db.DB) ([]IngestReport, error) {
 	if pool == nil {
 		return nil, errors.New("status: ingest: пул не задан")
@@ -450,7 +475,7 @@ func FetchIngestReports(ctx context.Context, pool db.DB) ([]IngestReport, error)
 	return out, nil
 }
 
-// derefInt64 — значение указателя или 0 (NULL-счётчик ingest_files).
+// derefInt64 — the pointer value or 0 (a NULL ingest_files counter).
 func derefInt64(v *int64) int64 {
 	if v == nil {
 		return 0
@@ -458,26 +483,26 @@ func derefInt64(v *int64) int64 {
 	return *v
 }
 
-// ---------------------------------------------------------------- очереди
+// ---------------------------------------------------------------- queues
 
-// StreamLener — глубина стримов; *queue.BackpressureGate (T-026)
-// удовлетворяет интерфейсу. Отдельный интерфейс, а не go-redis напрямую:
-// тесты подменяют фейком, транспорт заменяем (ТЗ 4.2).
+// StreamLener — the stream depth; *queue.BackpressureGate (T-026)
+// satisfies the interface. A separate interface, not go-redis directly:
+// the tests substitute a fake, the transport is replaceable (spec 4.2).
 type StreamLener interface {
 	Len(ctx context.Context, stream string) (int64, error)
 }
 
-// Streams — рабочие стримы очереди в порядке вывода (ТЗ 4.2):
+// Streams — the working queue streams in the output order (spec 4.2):
 // q:dns → q:http → q:render → q:render-fallback → q:analyze → q:dead.
-// Единый источник — queue.AllStreams (S-P3-1): перечень не расходится с
-// очередью, стрим, добавленный в allStreams, появляется в сводках
-// CLI/дашборда автоматически (обещание T-237 о «мониторинге, подхватывающем
-// автоматически»).
+// The single source is queue.AllStreams (S-P3-1): the list does not
+// diverge from the queue; a stream added to allStreams appears in the
+// CLI/dashboard summaries automatically (the T-237 promise about
+// "monitoring that picks it up automatically").
 var Streams = queue.AllStreams()
 
-// FetchQueueLens собирает глубину очередей. Ошибка любого стрима
-// останавливает сбор: Redis один, повторные обращения к недоступному
-// серверу бессмысленны.
+// FetchQueueLens collects the queue depths. An error of any stream stops
+// the collection: there is a single Redis; repeated calls to an
+// unavailable server are pointless.
 func FetchQueueLens(ctx context.Context, lenner StreamLener) (map[string]int64, error) {
 	if lenner == nil {
 		return nil, errors.New("status: очереди: клиент не задан")
@@ -493,20 +518,23 @@ func FetchQueueLens(ctx context.Context, lenner StreamLener) (map[string]int64, 
 	return lens, nil
 }
 
-// ---------------------------------------------------------------- расчёты
+// ---------------------------------------------------------------- calculations
 
 const (
-	// MinSpeedWindowSec — минимальное окно оценки скорости доменов: сразу
-	// после полуночи среднее «с начала суток» нестабильно (окно в минуты
-	// при тысячах проверок в секунду, ТЗ 3.3).
+	// MinSpeedWindowSec — the minimum window of the domain rate estimate:
+	// right after midnight the "since the start of the day" average is
+	// unstable (a window of minutes at thousands of checks per second,
+	// spec 3.3).
 	MinSpeedWindowSec = 600
-	// speedWindowSec — фиксированный делитель темпа при нулевом
-	// HourWindowSec (ручной сбор Throughput без чтения БД — тесты;
-	// живое чтение приносит фактическую длину окна корзин 1–2 ч, T-203).
+	// speedWindowSec — the fixed throughput divisor when HourWindowSec is
+	// zero (a manual Throughput assembly without reading the DB — the
+	// tests; the live reading brings the actual bucket window length of
+	// 1–2 h, T-203).
 	speedWindowSec = 3600.0
 )
 
-// Totals — суммы по зонам (итого таблицы и вход расчёта ETA).
+// Totals — the sums over the zones (the table totals and the input of the
+// ETA calculation).
 type Totals struct {
 	DomainsTotal   int64
 	DomainsChecked int64
@@ -515,7 +543,7 @@ type Totals struct {
 	Done           int64
 }
 
-// ComputeTotals суммирует строки зон.
+// ComputeTotals sums the zone rows.
 func ComputeTotals(zones []ZoneStats) Totals {
 	var t Totals
 	for _, z := range zones {
@@ -528,27 +556,27 @@ func ComputeTotals(zones []ZoneStats) Totals {
 	return t
 }
 
-// Rates — производные скорости/ETA. Чистая функция от замеров:
-// короткие окна и нулевые скорости не дают «н/д»-оценок (защита от
-// деления на ноль — флаги Known, а не паника).
+// Rates — the derived rates/ETA. A pure function of the measurements:
+// short windows and zero rates do not produce "n/a" estimates (the
+// division-by-zero protection is the Known flags, not a panic).
 type Rates struct {
-	DomainsPerSec float64 // средняя с начала суток
-	DomainsKnown  bool    // окно достаточно (≥ MinSpeedWindowSec)
-	ResultsPerSec float64 // HTTP-результатов/с за час
-	RenderPerSec  float64 // рендеров/с за час
-	Remaining     int64   // pending + queued — объём первого цикла
+	DomainsPerSec float64 // the average since the start of the day
+	DomainsKnown  bool    // the window is sufficient (≥ MinSpeedWindowSec)
+	ResultsPerSec float64 // the HTTP results/s per hour
+	RenderPerSec  float64 // the renders/s per hour
+	Remaining     int64   // pending + queued — the volume of the first circle
 	ETASec        int64
 	ETAKnown      bool
 }
 
-// ComputeRates выводит скорости и ETA первого цикла. Делитель темпа
-// результатов/рендеров — фактическая длина окна корзин HourWindowSec
-// (T-203): корзины календарные, читатель суммирует предыдущий и текущий
-// час — окно 1–2 ч, деление на его длину оставляет «в секунду»
-// несмещённой; нулевое окно (ручной сбор значений) — фиксированный час.
-// Пустой цикл (нечего проверять) завершён независимо от скорости;ETA при
-// остатке не меньше секунды — остаток в одну домену не должен выглядеть
-// «0с».
+// ComputeRates derives the rates and the ETA of the first circle. The
+// throughput divisor of the results/renders is the actual bucket window
+// length HourWindowSec (T-203): the buckets are calendar ones, the reader
+// sums the previous and the current hour — a 1–2 h window; dividing by
+// its length keeps the "per second" unbiased; a zero window (a manual
+// assembly of the values) — a fixed hour. An empty circle (nothing to
+// check) is complete regardless of the rate; the ETA with a remainder is
+// at least a second — a remainder of one domain must not look like "0s".
 func ComputeRates(t Throughput, pending, queued int64) Rates {
 	window := t.HourWindowSec
 	if window <= 0 {
@@ -567,10 +595,10 @@ func ComputeRates(t Throughput, pending, queued int64) Rates {
 		r.DomainsPerSec = float64(t.DoneToday) / t.ElapsedSec
 		if r.Remaining > 0 && r.DomainsPerSec > 0 {
 			r.ETASec = int64(math.Round(float64(r.Remaining) / r.DomainsPerSec))
-			// Кламп «минимум 1с»: до строки ETASec = Round(остаток/
-			// скорость) ≥ 0 при положительных операндах; ноль и единица
-			// дают 1, большее не меняется — «< 1» и «<= 1»/«< 2»
-			// неразличимы ни на одном достижимом значении.
+			// The "minimum 1s" clamp: before the line ETASec =
+			// Round(remainder/rate) ≥ 0 with positive operands; zero and
+			// one give 1, a larger value is unchanged — "< 1" and
+			// "<= 1"/"< 2" are indistinguishable on any reachable value.
 			// mutator-disable-next-line expression/comparison, numbers/incrementer
 			if r.ETASec < 1 {
 				r.ETASec = 1
@@ -581,9 +609,9 @@ func ComputeRates(t Throughput, pending, queued int64) Rates {
 	return r
 }
 
-// FormatDuration — округлый человекочитаемый интервал: «45с», «13м»,
-// «5ч 20м», «3д 4ч» (сутки — потолок единиц: недели скрывают масштаб
-// хуже, чем трёхзначные дни).
+// FormatDuration — a rounded human-readable interval: "45s", "13m",
+// "5h 20m", "3d 4h" (days are the ceiling of the units: weeks hide the
+// scale worse than three-digit days).
 func FormatDuration(sec int64) string {
 	switch {
 	case sec < 60:
