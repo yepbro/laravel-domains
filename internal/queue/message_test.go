@@ -257,15 +257,15 @@ func TestDecodeBadData(t *testing.T) {
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"null", StreamDNS, `null`, "empty batch",
+			"null", StreamDNS, `null`, "empty domain batch",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"a foreign field format", StreamDNS, `{"task_id":"t1","subdomains":[]}`, "empty batch",
+			"a foreign field format", StreamDNS, `{"task_id":"t1","subdomains":[]}`, "empty domain batch",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"empty batch", StreamDNS, `{"task_id":"t1","domains":[]}`, "empty batch",
+			"empty domain batch", StreamDNS, `{"task_id":"t1","domains":[]}`, "empty domain batch",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
@@ -396,7 +396,7 @@ func TestValidateMessages(t *testing.T) {
 		wantErr string
 	}{
 		{"batch ok", DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}, ""},
-		{"batch empty", DNSBatch{}, "empty batch"},
+		{"batch empty", DNSBatch{}, "empty domain batch"},
 		{
 			"http ok",
 			HTTPTask{ZoneID: 1, DomainID: 1, Name: "a.test", Subdomains: []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}},

@@ -199,7 +199,7 @@ func TestRedisQueuePublishError(t *testing.T) {
 		wantErr string
 	}{
 		{"a foreign stream", StreamHTTP, DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}, "published to"},
-		{"an invalid message", StreamDNS, DNSBatch{}, "empty batch"},
+		{"an invalid message", StreamDNS, DNSBatch{}, "empty domain batch"},
 		{"an unknown stream", "q:typo", DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}, "unknown stream"},
 	}
 	for _, c := range cases {
