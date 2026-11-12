@@ -715,7 +715,7 @@ func TestAlertsDeadEpisode(t *testing.T) {
 	// The detail with the depth and the pass counter (a cross-check with the bury counter):
 	// after the steps above the series is 1 observation; this pass is the second.
 	got := m.transition(env.Alerts, ctx, obs(int64(12)))
-	for _, want := range []string{"q:dead=12", "2/3", "crawler_queue_dead_buried_total"} {
+	for _, want := range []string{"q:dead depth=12", "2/3", "crawler_queue_dead_buried_total"} {
 		if !strings.Contains(got.Detail, want) {
 			t.Errorf("the detail %q does not contain %q", got.Detail, want)
 		}
@@ -1108,7 +1108,7 @@ func TestAlertsNVMeWear(t *testing.T) {
 	// An empty list (the source is alive, no devices) — "not measured",
 	// not a panic on the first element.
 	s = m.transition(env.Alerts, ctx, obsReason[[]NVMeWear]("no NVMe devices found"))
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "not found") {
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "no NVMe devices found") {
 		t.Errorf("without devices: status = %s (%s), want not_measured", s.Status, s.Detail)
 	}
 
@@ -1125,7 +1125,7 @@ func TestAlertsNVMeWear(t *testing.T) {
 	// An empty list via a full pass (observeWear: the source is alive,
 	// no devices) — the same "not measured" without a panic.
 	env.wear.wears = nil
-	if s := snapshotOf(t, env.Pass(ctx), AlertNVMeWear); s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "not found") {
+	if s := snapshotOf(t, env.Pass(ctx), AlertNVMeWear); s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "no NVMe devices found") {
 		t.Errorf("without devices (a full pass): status = %s (%s), want not_measured \"not found\"", s.Status, s.Detail)
 	}
 }
@@ -1371,7 +1371,7 @@ func TestOSWearDegradation(t *testing.T) {
 
 	// sysfs without class/nvme — no NVMe at all.
 	_, err := OSWear{SysFS: root, DevFS: root}.Wear(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "not found") {
+	if err == nil || !strings.Contains(err.Error(), "no NVMe devices found") {
 		t.Errorf("an empty sysfs: error = %v, want \"not found\"", err)
 	}
 
@@ -2113,7 +2113,7 @@ func TestAlertsNewDoneStaleEpisode(t *testing.T) {
 	for range 2 {
 		env4.Pass(ctx)
 	}
-	if n := strings.Count(env4.buf.String(), "ALERT: domains \"status hung\""); n != 1 {
+	if n := strings.Count(env4.buf.String(), `ALERT: domains \"status hung\"`); n != 1 {
 		t.Errorf("the firing Warn count = %d, want 1:\n%s", n, env4.buf.String())
 	}
 	env4.pool.stale = []alertStaleSnap{staleSnap(9, 90)}
