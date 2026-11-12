@@ -1,17 +1,17 @@
 package render
 
-// Браузерные (live) тесты — против реального Chromium dev-стека
-// (compose-сервис chromium, ws://172.28.100.14:9222 из сети crawler_net).
-// По умолчанию пропускаются; включаются переменной CRAWLER_RENDER_TEST=1:
+// Browser (live) tests — against the real Chromium of the dev stack
+// (the compose service chromium, ws://172.28.100.14:9222 from the crawler_net
+// network). Skipped by default; enabled by CRAWLER_RENDER_TEST=1:
 //
 //	docker compose --project-directory . -f deploy/docker/compose.yaml \
 //	  run -e CRAWLER_RENDER_TEST=1 --rm tools \
 //	  go test ./internal/render -run BrowserLive -v -count=1
 //
-// Адрес Chromium: CRAWLER_RENDER_REMOTE_URL, затем CHROMIUM_WS_URL
-// (задан в dev-контейнерах compose), иначе адрес стека по умолчанию.
-// Флаг действует и в worktree-агентах следующих задач (T-062…T-067):
-// тот же run из каталога worktree использует основной стек.
+// The Chromium address: CRAWLER_RENDER_REMOTE_URL, then CHROMIUM_WS_URL
+// (set in the dev containers of compose), otherwise the default stack address.
+// The flag also works in the worktree agents of the following tasks (T-062…T-067):
+// the same run from a worktree directory uses the main stack.
 
 import (
 	"context"
@@ -54,10 +54,10 @@ func liveOptions() Options {
 	}
 }
 
-// liveIPv4 — адрес run-контейнера в crawler_net: HTTP-фикстуры live-тестов
-// слушают 0.0.0.0, а Chromium живёт в соседнем контейнере стека — ему нужен
-// не-loopback адрес этого контейнера (первый IPv4 из net.InterfaceAddrs),
-// DNS не требуется.
+// liveIPv4 — the address of the run container in crawler_net: the HTTP fixtures of the
+// live tests listen on 0.0.0.0, and Chromium lives in a neighboring container of the
+// stack — it needs the non-loopback address of this container (the first IPv4 from
+// net.InterfaceAddrs), no DNS required.
 func liveIPv4(t *testing.T) string {
 	t.Helper()
 	addrs, err := net.InterfaceAddrs()
@@ -74,13 +74,13 @@ func liveIPv4(t *testing.T) string {
 	return ""
 }
 
-// liveServe — HTTP-сервер страниц-фикстур live-тестов (паттерн
-// block_live_test.go): слушает 0.0.0.0 — httptest.NewServer с 127.0.0.1 не
-// годится, Chromium из соседнего контейнера не достучится. Возвращает
-// базовый URL (http://<адрес-контейнера>:<порт>); сервер живёт до конца
-// теста (Cleanup). data:-страницы («дешёвая» герметичность ранних
-// live-тестов) невозможны после R-09: validateTaskURL отвергает не-http
-// схемы, поэтому задачи — обычные http-страницы фикстур (T-216).
+// liveServe — the HTTP server of the live tests' page fixtures (the pattern of
+// block_live_test.go): it listens on 0.0.0.0 — httptest.NewServer with 127.0.0.1
+// will not do, Chromium from the neighboring container cannot reach it. Returns
+// the base URL (http://<container-address>:<port>); the server lives until the end
+// of the test (Cleanup). data: pages (the "cheap" hermeticity of the early
+// live tests) are impossible after R-09: validateTaskURL rejects non-http
+// schemes, so the tasks are ordinary http fixture pages (T-216).
 func liveServe(t *testing.T, mux *http.ServeMux) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
@@ -104,7 +104,7 @@ func TestBrowserLivePoolRender(t *testing.T) {
 	skipUnlessLive(t)
 	ctx := context.Background()
 
-	// Фикстуры: title страницы = путь без слэша (/ok-N → «ok-N»).
+	// Fixtures: the page's title = the path without the slash (/ok-N → "ok-N").
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -119,7 +119,7 @@ func TestBrowserLivePoolRender(t *testing.T) {
 	p := NewPool(b)
 	defer p.Close()
 
-	// Больше задач, чем слотов: четвёртая и дальше ждут освобождения.
+	// More tasks than slots: the fourth and onward wait for a free slot.
 	const n = 4
 	var wg sync.WaitGroup
 	errs := make([]error, n)
@@ -185,7 +185,7 @@ func TestBrowserLiveContextIsolation(t *testing.T) {
 		return names, nil
 	}
 
-	// Первая сессия кладёт cookie в свой инкогнито-профиль.
+	// The first session puts the cookie into its own incognito profile.
 	s1, err := b.NewSession(ctx)
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -204,7 +204,7 @@ func TestBrowserLiveContextIsolation(t *testing.T) {
 		t.Fatalf("в первой сессии cookies %v, хочу [isolation]", names)
 	}
 
-	// Новая сессия = новый профиль: cookie не пережила смену контекста.
+	// A new session = a new profile: the cookie did not survive the context change.
 	s2, err := b.NewSession(ctx)
 	if err != nil {
 		t.Fatalf("NewSession (вторая): %v", err)

@@ -1,99 +1,99 @@
 package render
 
-// Per-engine живые тесты рендера (T-254, слой 1) — полный CDP-срез каждого
-// движка (chromium / moli / lightpanda) против dev-стека: инварианты ТЗ 5.6
-// обязаны выполняться на любом движке (ТЗР движков ФТ-5). Срез на движок:
+// Per-engine live tests of the render (T-254, layer 1) — the full CDP slice of each
+// engine (chromium / moli / lightpanda) against the dev stack: the invariants of spec 5.6
+// must hold on any engine (the engines render spec FR-5). The slice per engine:
 //
-//	(а) /json/version доступен и отвечает (общий health-эндпоинт, ФТ-4);
-//	(б) изолированный контекст на задачу: cookie не переживает смену
-//	    контекста (Target.createBrowserContext/disposeBrowserContext);
-//	(в) navigate + съём результата (T-064): итоговый DOM после JS,
-//	    cookies хранилища контекста (JS- и httpOnly) и заголовки ответа
-//	    основной навигации — на внутренних страницах testbed *.crawl.test;
-//	(г) перехват Fetch: блокировка Image/Font не выпускает запрос из
-//	    движка (счётчики сервера, T-062) и доменные паттерны трекеров
-//	    (дифференциал двух прогонов, T-214);
-//	(д) SSRF-контур (T-219/T-230): задача с внутренним хостом отвергается
-//	    до перехода, навигация на приватный адрес testbed обрывается
-//	    перехватом в самом движке — net::ERR_BLOCKED_BY_CLIENT;
-//	(е) UA-override (ТЗ §9): Emulation.setUserAgentOverride виден и в
-//	    navigator.userAgent, и в User-Agent запроса страницы на сервере.
+//	(a) /json/version is available and responds (the common health endpoint, FR-4);
+//	(b) an isolated context per task: a cookie does not survive a context
+//	    change (Target.createBrowserContext/disposeBrowserContext);
+//	(c) navigate + result capture (T-064): the final DOM after JS,
+//	    the cookies of the context store (JS- and httpOnly) and the response
+//	    headers of the main navigation — on the internal testbed pages *.crawl.test;
+//	(d) the Fetch interception: blocking Image/Font does not let a request out of
+//	    the engine (the server's counters, T-062) and the tracker domain patterns
+//	    (the differential of two runs, T-214);
+//	(e) the SSRF contour (T-219/T-230): a task with an internal host is rejected
+//	    before the navigation, navigation to a private testbed address is cut off
+//	    by the interception inside the engine itself — net::ERR_BLOCKED_BY_CLIENT;
+//	(f) the UA override (spec §9): Emulation.setUserAgentOverride is visible both in
+//	    navigator.userAgent and in the User-Agent of the page request on the server.
 //
-// Включение — как у соседних live-тестов (CRAWLER_RENDER_TEST=1, образец
-// browser_live_test.go); штатный make test без стека их пропускает.
-// Подключение движка — переменная окружения строки таблицы, по образцу
-// CHROMIUM_WS_URL: MOLI_WS_URL / LIGHTPANDA_WS_URL (дефолты — статические
-// адреса compose-сервисов: chromium профиля app, moli/lightpanda профиля
-// render-engines, T-241). Общего оверрайда CRAWLER_RENDER_REMOTE_URL
-// (адрес одного движка в остальных live-тестах) срез не читает: таблица
-// различает движки адресами явно. Новый движок добавляется строкой
-// engineLiveCases — код среза один.
+// Enabling — as in the neighboring live tests (CRAWLER_RENDER_TEST=1, the sample
+// in browser_live_test.go); the regular make test without the stack skips them.
+// Connecting an engine — the environment variable of the table row, modeled on
+// CHROMIUM_WS_URL: MOLI_WS_URL / LIGHTPANDA_WS_URL (the defaults are static
+// addresses of the compose services: chromium of the app profile, moli/lightpanda of the
+// render-engines profile, T-241). The common CRAWLER_RENDER_REMOTE_URL
+// override (the address of one engine in the other live tests) is not read by the
+// slice: the table distinguishes the engines by addresses explicitly. A new engine is
+// added by a row in engineLiveCases — the slice code is one.
 //
-// До прогона каждого движка — быстрый зонд /json/version (та же проверка,
-// что healthcheck compose и TestChromium_CDP): недоступен при дефолтном
-// адресе — SKIP с причиной (профиль render-engines не обязан стоять у
-// каждого), при явно заданной переменной — Fatal (оператор направил тест
-// на конкретный адрес, тишина скрывала бы ошибку конфигурации). В
-// tools-контейнере compose всегда задан CHROMIUM_WS_URL — недоступный
-// chromium даёт отказ, а не SKIP: он поднимается вместе со стеком
-// (профиль app) и быть недоступным в рабочем окружении не обязан.
+// Before each engine's run — a quick /json/version probe (the same check as
+// the compose healthcheck and TestChromium_CDP): unavailable at the default
+// address — SKIP with a reason (the render-engines profile is not obliged to be up
+// for everyone); with an explicitly set variable — Fatal (the operator pointed the test
+// at a concrete address, silence would hide a configuration error). In the
+// tools container of compose CHROMIUM_WS_URL is always set — an unavailable
+// chromium gives a failure, not a SKIP: it is raised together with the stack
+// (the app profile) and is not supposed to be unavailable in a working environment.
 //
-// Запуск (moli/lightpanda предварительно подняты профилем render-engines —
-// docs/dev-environment.md, «Движки рендера»; --use-aliases нужен срезу
-// трекеров, как у BlockLive):
+// Running (moli/lightpanda are raised in advance by the render-engines profile —
+// docs/dev-environment.md, "Render engines"; --use-aliases is needed by the
+// tracker slice, as in BlockLive):
 //
 //	docker compose --project-directory . -f deploy/docker/compose.yaml \
 //	  run --use-aliases -e CRAWLER_RENDER_TEST=1 --rm tools \
 //	  go test ./internal/render -run EnginesLive -v -count=1
 //
-// Один движок — фильтром Go: -run 'TestEnginesLiveCDPSlice/moli'.
+// A single engine — with a Go filter: -run 'TestEnginesLiveCDPSlice/moli'.
 //
-// Состояние движков против среза (pinned-версии и пере-тесты:
-// live-прогон 2026-11-06, пере-тест moli v1.1.23 2026-11-10) — moli и
-// lightpanda 1.0.2, обе альтернативы СЛОМАНЫ против среза, срез обязан
-// показывать это красным до починки движков/ядра):
+// The engines' state against the slice (pinned versions and retests:
+// the live run of 2026-11-06, the moli v1.1.23 retest of 2026-11-10) — moli and
+// lightpanda 1.0.2, both alternatives are BROKEN against the slice; the slice must
+// show this in red until the engines/core are fixed):
 //
-//   - moli v1.1.23 (T-272; pinned в репо остаётся v1.1.21):
-//     InvalidParams на Fetch.enable ушёл — Font/Media в паттернах
-//     приняли фиксы lexmount/moli#2470 (наш PR, форк yepbro/moli) +
-//     парный #2476. Навигация/DOM/cookies/изоляция контекста/UA-override
-//     зелёные. Срез держат красным дефекты перехвата Fetch:
-//     (1) при включённом перехвате синхронный XHR из JS страницы
-//     падает на клиенте NetworkError (лог moli: Uncaught NetworkError:
-//     Failed to execute 'send' on 'XMLHttpRequest') — запрос до
-//     сервера не доходит (block_resources); зонды block_trackers
-//     переведены на async-XHR (T-275: реальная аналитика async,
-//     блокируется на всех движках), sync-зонд там — отдельный
-//     движко-ветвленный кейс расхождения #2728/#2729 (moli sync-XHR
-//     не паузится и уходит в сеть, на сборках без #2729 — фабрика
-//     отказа NetworkError);
-//     (2) fetch.failRequest главной навигации не завершает навигацию
-//     ошибкой загрузки — вкладка неотзывчива (classifyCtx → context),
-//     ERR_BLOCKED_BY_CLIENT приходит вне канала loadFailed, кода
-//     загрузки нет (ssrf); (3) Stylesheet в supports_fetch_enable()
-//     v1.1.23 отсутствует (fetch_support.rs: enum тип парсит, но в
-//     supports-список не входит) — паттерн Stylesheet валит весь
-//     Fetch.enable InvalidParams: BlockStylesheet (T-213, CSS-режим)
-//     на moli недоступен; не блокер базового профиля (опция дефолтно
-//     false). Ждём фикс апстрима → пере-тест по
-//     следующему релизу (T-247). История до v1.1.23 (v1.1.21/1.1.22,
-//     прогон 2026-11-06): Fetch.enable с паттернами Media/Font
-//     отвечал InvalidParams — moli различал урезанный набор
-//     resourceType; каждая задача падала на startBlock (0/100 на
-//     посевной сотне).
-//   - lightpanda 1.0.2: один browser context на соединение («Cannot have
-//     more than one browser context at a time», зафиксировано и
-//     сторонними замерами). Служебная вкладка стартового контекста
-//     занимает единственный слот → Target.createBrowserContext сессии
-//     всегда падает: модель «контекст на задачу» (ТЗ 5.6) на pinned-
-//     версии невозможна.
+//   - moli v1.1.23 (T-272; the pinned in the repo stays v1.1.21):
+//     the InvalidParams on Fetch.enable is gone — Font/Media in the patterns
+//     got the fixes of lexmount/moli#2470 (our PR, the yepbro/moli fork) +
+//     the paired #2476. Navigation/DOM/cookies/context isolation/UA override
+//     are green. The slice is held red by the Fetch interception defects:
+//     (1) with the interception enabled a synchronous XHR from the page's JS
+//     fails on the client with NetworkError (the moli log: Uncaught NetworkError:
+//     Failed to execute 'send' on 'XMLHttpRequest') — the request does not reach
+//     the server (block_resources); the block_trackers
+//     probes are switched to async XHR (T-275: real analytics is async,
+//     blocked on all engines); the sync probe there is a separate
+//     engine-branched case of the #2728/#2729 divergence (moli does not pause sync-XHR
+//     and it goes to the network; on builds without #2729 — a
+//     NetworkError failure factory);
+//     (2) the fetch.failRequest of the main navigation does not finish the navigation with
+//     a load error — the tab is unresponsive (classifyCtx → context),
+//     ERR_BLOCKED_BY_CLIENT arrives outside the loadFailed channel, there is no
+//     load code (ssrf); (3) Stylesheet is absent from supports_fetch_enable()
+//     v1.1.23 (fetch_support.rs: the enum type parses, but is not in the
+//     supports list) — the Stylesheet pattern brings down the whole
+//     Fetch.enable with InvalidParams: BlockStylesheet (T-213, the CSS mode)
+//     is unavailable on moli; not a blocker for the base profile (the option defaults to
+//     false). We wait for the upstream fix → a retest with
+//     the next release (T-247). The history before v1.1.23 (v1.1.21/1.1.22,
+//     the run of 2026-11-06): Fetch.enable with Media/Font patterns
+//     answered InvalidParams — moli distinguished a trimmed set of
+//     resourceType; every task failed at startBlock (0/100 on
+//     the seed hundred).
+//   - lightpanda 1.0.2: one browser context per connection ("Cannot have
+//     more than one browser context at a time", also recorded by
+//     third-party measurements). The service tab of the starting context
+//     takes the only slot → the Target.createBrowserContext of a session
+//     always fails: the "a context per task" model (spec 5.6) is impossible on the
+//     pinned version.
 //
-// Красный срез = регрессия движка против инвариантов этапа (пиновка
-// новой версией — процедура smoke ФТ-17/T-254,
-// docs/dev-environment.md); зелёный chromium — эталон (контроль
-// 2026-11-10: 6/6 подтестов PASS; пере-контроль 2026-11-11 после
-// T-275 — снова 6/6, зонды block_trackers async) — отказы moli
-// движковые, не стендовые).
+// A red slice = an engine regression against the stage's invariants (pinning
+// a new version — the smoke procedure of FR-17/T-254,
+// docs/dev-environment.md); a green chromium is the reference (the control
+// of 2026-11-10: 6/6 subtests PASS; the re-check of 2026-11-11 after
+// T-275 — again 6/6, the block_trackers probes async) — the moli failures are
+// engine ones, not bench ones).
 
 import (
 	"context"
@@ -116,25 +116,26 @@ import (
 	"crawler/internal/config"
 )
 
-// engineLiveCase — строка таблицы движков: имя (значение render.engine и
-// сцена теста), переменная окружения с адресом и адрес стека по умолчанию.
+// engineLiveCase — a row of the engines table: the name (the value of render.engine and
+// the scene of the test), the environment variable with the address and the default
+// stack address.
 type engineLiveCase struct {
 	name  string
 	env   string
 	defWS string
 }
 
-// engineLiveCases — таблица движков слоя 1: один код среза × наборы
-// переменных подключения (новый движок — строка).
+// engineLiveCases — the engines table of layer 1: one slice code × the sets of
+// connection variables (a new engine — a row).
 var engineLiveCases = []engineLiveCase{
 	{name: config.EngineChromium, env: "CHROMIUM_WS_URL", defWS: "ws://172.28.100.14:9222"},
 	{name: config.EngineMoli, env: "MOLI_WS_URL", defWS: "ws://172.28.100.17:9222"},
 	{name: config.EngineLightpanda, env: "LIGHTPANDA_WS_URL", defWS: "ws://172.28.100.16:9222"},
 }
 
-// engineLiveWS — адрес движка: переменная окружения строки таблицы, иначе
-// дефолт стека. Второе значение — задана ли переменная явно (оператор
-// направил срез на конкретный адрес).
+// engineLiveWS — the engine's address: the table row's environment variable, otherwise
+// the stack default. The second value — whether the variable is set explicitly (the
+// operator pointed the slice at a concrete address).
 func engineLiveWS(tc engineLiveCase) (string, bool) {
 	if ws := os.Getenv(tc.env); ws != "" {
 		return ws, true
@@ -142,9 +143,9 @@ func engineLiveWS(tc engineLiveCase) (string, bool) {
 	return tc.defWS, false
 }
 
-// engineLiveOptions — Options движка строки таблицы (адрес — engineLiveWS,
-// движок — полем Engine: его видят валидация и remote-аллокатор, ТЗР
-// движков §4.2; ядро пакета движок не различает, ФТ-4).
+// engineLiveOptions — the Options of the table row's engine (the address — engineLiveWS,
+// the engine — by the Engine field: the validation and the remote allocator see it, the
+// engines render spec §4.2; the package core does not distinguish engines, FR-4).
 func engineLiveOptions(tc engineLiveCase) Options {
 	ws, _ := engineLiveWS(tc)
 	return Options{
@@ -156,8 +157,9 @@ func engineLiveOptions(tc engineLiveCase) Options {
 	}
 }
 
-// engineLiveVersionURL — http-адрес /json/version движка из ws-адреса
-// подключения (все три движка отдают общий эндпоинт на том же порту).
+// engineLiveVersionURL — the http address of the engine's /json/version from the ws
+// address of the connection (all three engines serve the common endpoint on the same
+// port).
 func engineLiveVersionURL(ws string) (string, error) {
 	u, err := url.Parse(ws)
 	if err != nil {
@@ -176,11 +178,12 @@ func engineLiveVersionURL(ws string) (string, error) {
 	return u.String(), nil
 }
 
-// engineLiveGate — (а) доступность движка до старта среза: GET /json/version
-// с коротким потолком (быстрый отказ с причиной вместо каскада таймаутов по
-// всем подтестам). 200 + «Browser» в теле — форма ответа всех трёх движков
-// (как healthcheck compose и TestChromium_CDP); тело пишется в лог —
-// версия движка из ответа сверяется с pinned при smoke ФТ-17/T-254.
+// engineLiveGate — (a) the engine's availability before the slice starts: GET
+// /json/version
+// with a short cap (a quick failure with a reason instead of a cascade of timeouts across
+// all subtests). 200 + "Browser" in the body — the response shape of all three engines
+// (as the compose healthcheck and TestChromium_CDP); the body is written to the log —
+// the engine version from the response is cross-checked against the pinned at the FR-17/T-254 smoke.
 func engineLiveGate(t *testing.T, tc engineLiveCase) {
 	t.Helper()
 	ws, explicit := engineLiveWS(tc)
@@ -208,9 +211,9 @@ func engineLiveGate(t *testing.T, tc engineLiveCase) {
 	t.Logf("движок %s, /json/version: %s", tc.name, strings.TrimSpace(string(body)))
 }
 
-// engineLiveBrowser — старт браузера движка для подтеста среза (закрытие —
-// Cleanup): каждая проверка среза живёт своим браузером, сбой одной не
-// рвёт остальные.
+// engineLiveBrowser — starting the engine's browser for a slice subtest (closing —
+// Cleanup): each slice check lives with its own browser, a failure of one does not
+// tear the others.
 func engineLiveBrowser(t *testing.T, opts Options) *Browser {
 	t.Helper()
 	b, err := StartBrowser(context.Background(), opts)
@@ -221,15 +224,15 @@ func engineLiveBrowser(t *testing.T, opts Options) *Browser {
 	return b
 }
 
-// TestEnginesLiveCDPSlice — таблица движков × срез CDP (T-254, слой 1):
-// один код прогоняет (а)–(е) для каждой строки engineLiveCases. Хромиум
-// поднят всегда (профиль app), альтернативы — профиль render-engines;
-// недоступный движок честно скипается гейтом (а) с причиной.
+// TestEnginesLiveCDPSlice — the engines table × the CDP slice (T-254, layer 1):
+// one code runs (a)–(f) for each row of engineLiveCases. Chromium
+// is always up (the app profile), the alternatives — the render-engines profile;
+// an unavailable engine is honestly skipped by the gate (a) with a reason.
 func TestEnginesLiveCDPSlice(t *testing.T) {
 	skipUnlessLive(t)
 	for _, tc := range engineLiveCases {
 		t.Run(tc.name, func(t *testing.T) {
-			engineLiveGate(t, tc) // (а) /json/version: зонд до среза
+			engineLiveGate(t, tc) // (a) /json/version: the probe before the slice
 			t.Run("context_isolation", func(t *testing.T) {
 				engineLiveContextIsolation(t, engineLiveOptions(tc))
 			})
@@ -252,11 +255,11 @@ func TestEnginesLiveCDPSlice(t *testing.T) {
 	}
 }
 
-// engineLiveContextIsolation — (б) изолированный контекст на задачу
-// (инвариант ТЗ 5.6/§9, ФТ-5): cookie, положенная в инкогнито-профиль
-// первой сессии, видна в ней же и не переживает смену контекста (второй
-// NewSession = новый профиль; dispose выкидывает хранилища целиком).
-// Проверка — по TestBrowserLiveContextIsolation, движок — строки таблицы.
+// engineLiveContextIsolation — (b) an isolated context per task
+// (the invariant of spec 5.6/§9, FR-5): a cookie put into the incognito profile
+// of the first session is visible in it and does not survive a context change (a second
+// NewSession = a new profile; dispose throws the stores away entirely).
+// The check — after TestBrowserLiveContextIsolation, the engines — the table rows.
 func engineLiveContextIsolation(t *testing.T, opts Options) {
 	ctx := context.Background()
 
@@ -315,19 +318,19 @@ func engineLiveContextIsolation(t *testing.T, opts Options) {
 	}
 }
 
-// engineLiveNavigateExtract — (в) переход и съём результата (T-064):
-// внутренняя страница testbed (spa-shell.crawl.test — движки резолвят её
-// через unbound стека) даёт итоговый DOM после JS, JS-cookie из хранилища
-// контекста (CDP читает хранилище, document.cookie — нет) и заголовки
-// ответа основной навигации реального Caddy; фикстура среза покрывает
-// httpOnly — cookie, выставленную ответом СЕРВЕРА (document.cookie её не
-// видит вовсе — в хранилище контекста попадает только сетевым стеком
-// движка) и фирменной парой заголовков. Образцы testweb для httpOnly не
-// годятся: фикстуры laravel-сэмплов ставят Set-Cookie с истёкшим сроком
-// (заголовки генерились 2026-10-16 с датой истечения 2026-10-21 — браузер
-// такую cookie отбрасывает сразу), поэтому httpOnly — собственной
-// страницей фикстуры с бессрочной session-cookie. Вторая страница — новой
-// сессией: контекст на задачу, как в пуле.
+// engineLiveNavigateExtract — (c) navigation and result capture (T-064):
+// the internal testbed page (spa-shell.crawl.test — the engines resolve it
+// through the stack's unbound) gives the final DOM after JS, a JS cookie from the
+// context store (CDP reads the store, document.cookie does not) and the headers
+// of the real Caddy's main navigation response; the slice fixture covers
+// httpOnly — a cookie set by the SERVER's response (document.cookie does not
+// see it at all — it gets into the context store only via the engine's network
+// stack) and a signature pair of headers. The testweb samples do not fit for
+// httpOnly: the laravel samples' fixtures set Set-Cookie with an expired date
+// (the headers were generated 2026-10-16 with an expiry of 2026-10-21 — the browser
+// drops such a cookie right away), so httpOnly is covered by a fixture's own
+// page with a non-expiring session cookie. The second page — by a new
+// session: a context per task, as in the pool.
 func engineLiveNavigateExtract(t *testing.T, opts Options) {
 	ctx := context.Background()
 
@@ -336,9 +339,9 @@ func engineLiveNavigateExtract(t *testing.T, opts Options) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/httponly", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		// Фирменный заголовок фикстуры: его наличие в результате доказывает,
-		// что заголовки сняты с реального ответа сервера (равно как
-		// Content-Type мог бы дать и псевдо-ответ).
+		// The fixture's signature header: its presence in the result proves
+		// that the headers were captured from the real server response
+		// (Content-Type alone could have come from a pseudo-response too).
 		w.Header().Set("X-Engine-Live", "1")
 		http.SetCookie(w, &http.Cookie{
 			Name: "engine_httponly", Value: "1", Path: "/",
@@ -431,11 +434,11 @@ func engineLiveNavigateExtract(t *testing.T, opts Options) {
 	})
 }
 
-// engineLiveBlockResources — (г) перехват Fetch по типам ресурсов (T-062):
-// картинка и шрифт не запрошены вовсе (failRequest до отправки — движок
-// отвергает их с net::ERR_BLOCKED_BY_CLIENT, счётчики сервера ноль —
-// независимое от CDP-событий доказательство, фикстура blockLiveServe),
-// CSS/скрипт/XHR проходят (JS обязан работать, ТЗ 5.6).
+// engineLiveBlockResources — (d) the Fetch interception by resource types (T-062):
+// the image and the font are not requested at all (failRequest before sending — the
+// engine rejects them with net::ERR_BLOCKED_BY_CLIENT, the server counters are zero —
+// evidence independent of the CDP events, the blockLiveServe fixture);
+// CSS/script/XHR pass (JS must work, spec 5.6).
 func engineLiveBlockResources(t *testing.T, opts Options) {
 	c, pageURL := blockLiveServe(t)
 
@@ -465,12 +468,13 @@ func engineLiveBlockResources(t *testing.T, opts Options) {
 	}
 }
 
-// engineLiveLookupHost — резолв SSRF-контура среза (шов Options.LookupHost,
-// T-230): unbound стека (172.28.100.10) — тот же резолвер, которым движки
-// резолвят страницы testbed (dns: unbound в compose). Резолвер run-контейнера
-// tools внешний (он качает модули Go) и тестовых зон не знает: без подмены
-// резолв имени зоны в перехвате падал бы с DNS-отказом, контур fail-open'ил
-// навигацию, и проверка перехвата теряла смысл.
+// engineLiveLookupHost — the SSRF contour resolve of the slice (the Options.LookupHost
+// seam, T-230): the stack's unbound (172.28.100.10) — the same resolver the engines
+// use to resolve the testbed pages (dns: unbound in compose). The resolver of the
+// tools run container is external (it downloads the Go modules) and does not know the
+// test zones: without the substitution the zone name resolve in the interception
+// would fail with a DNS failure, the contour would fail-open the navigation, and the
+// interception check would lose its meaning.
 func engineLiveLookupHost(ctx context.Context, host string) ([]netip.Addr, error) {
 	r := &net.Resolver{
 		PreferGo: true,
@@ -482,24 +486,24 @@ func engineLiveLookupHost(ctx context.Context, host string) ([]netip.Addr, error
 	return r.LookupNetIP(ctx, "ip", host)
 }
 
-// engineLiveSSRF — (д) SSRF-контур рендера (T-219/T-230) на живом движке:
-// задача с внутренним хостом (IP-литералы, включая cloud metadata и
-// числоподобные формы WHATWG, loopback-имена — формы юнит-теста
-// TestSessionRunBlocksInternalTaskURL) отвергается классом task до
-// перехода; навигация на приватный адрес testbed (зоны *.crawl.test живут
-// в 172.28.100.0/24) обрывается перехватом Fetch в самом движке —
-// fetch.failRequest даёт net::ERR_BLOCKED_BY_CLIENT (код — LoadError,
-// класс task). Резолв имени зоны идёт резолвером перехвата (dnsCache
-// T-230, здесь — engineLiveLookupHost): имя публичным для задачи
-// остаётся, внутренним для перехвата быть обязано.
+// engineLiveSSRF — (e) the render's SSRF contour (T-219/T-230) on a live engine:
+// a task with an internal host (IP literals, including cloud metadata and
+// the WHATWG number-like forms, loopback names — the forms of the unit test
+// TestSessionRunBlocksInternalTaskURL) is rejected with the task class before
+// the navigation; navigation to a private testbed address (the *.crawl.test zones live
+// in 172.28.100.0/24) is cut off by the Fetch interception in the engine itself —
+// fetch.failRequest gives net::ERR_BLOCKED_BY_CLIENT (the code is a LoadError,
+// the task class). The zone name is resolved by the interception's resolver (the
+// dnsCache of T-230, here — engineLiveLookupHost): the name stays public for the
+// task and must be internal for the interception.
 func engineLiveSSRF(t *testing.T, opts Options) {
 	ctx := context.Background()
 
-	// Счётчик резолвов шва: вердикт о блокировке обязан вынести перехват
-	// (dnsCache через Options.LookupHost, T-230), а не собственная блокировка
-	// приватных сетей движка, если такая есть (у lightpanda — флаг
-	// --block-private-networks): без вызова резолва навигация не дошла бы
-	// до перехвата, и код ERR_BLOCKED_BY_CLIENT ничего не доказывал бы.
+	// The resolve counter of the seam: the blocking verdict must be made by the
+	// interception (the dnsCache via Options.LookupHost, T-230), not by an own
+	// blocking of private networks in the engine, if there is one (lightpanda has the
+	// --block-private-networks flag): without the resolve call the navigation would not
+	// reach the interception, and the ERR_BLOCKED_BY_CLIENT code would prove nothing.
 	var lookups atomic.Int32
 	opts.BlockInternalAddrs = true
 	opts.LookupHost = func(ctx context.Context, host string) ([]netip.Addr, error) {
@@ -526,8 +530,9 @@ func engineLiveSSRF(t *testing.T, opts Options) {
 		}
 	}
 
-	// Перехват: имя зоны проходит адресный контроль задачи, но резолвится
-	// перехватом в приватный адрес testbed — навигация обязана упасть.
+	// The interception: the zone name passes the task's address control but is
+	// resolved by the interception into a private testbed address — the navigation
+	// must fail.
 	_, err = s.Run(ctx, RenderTask{URL: "http://spa-shell.crawl.test/"})
 	if err == nil {
 		t.Fatal("навигация на приватный адрес testbed прошла сквозь SSRF-контур")
@@ -537,8 +542,8 @@ func engineLiveSSRF(t *testing.T, opts Options) {
 	}
 	code := LoadErrorCode(err)
 	if code == "" {
-		// Без кода загрузки причина невидима (на moli, например, сюда падает
-		// отказ Fetch.enable) — печатаем ошибку целиком, а не пустой код.
+		// Without a load code the reason is invisible (on moli, for example, a
+		// Fetch.enable refusal lands here) — we print the whole error, not an empty code.
 		t.Fatalf("навигация упала без кода ошибки загрузки (хочу net::ERR_BLOCKED_BY_CLIENT от failRequest перехвата): %v", err)
 	}
 	if code != "net::ERR_BLOCKED_BY_CLIENT" {
@@ -549,11 +554,11 @@ func engineLiveSSRF(t *testing.T, opts Options) {
 	}
 }
 
-// engineLiveUAOverride — (е) идентифицируемый UA краулера (ТЗ §9):
-// Emulation.setUserAgentOverride в стартовом наборе сессии виден странице
-// дважды — в navigator.userAgent вкладки и в User-Agent HTTP-запроса
-// страницы на сервере фикстуры (второй снимает «движок подменяет только
-// JS-свойство»: заголовок ставит сетевой стек движка).
+// engineLiveUAOverride — (f) the crawler's identifiable UA (spec §9):
+// the Emulation.setUserAgentOverride in the session's starting set is visible to the
+// page twice — in the tab's navigator.userAgent and in the User-Agent of the HTTP
+// request for the page on the fixture server (the second rules out "the engine
+// overrides only the JS property": the header is set by the engine's network stack).
 func engineLiveUAOverride(t *testing.T, opts Options) {
 	ctx := context.Background()
 

@@ -38,15 +38,15 @@ func TestErrorFormatUnwrapClassOf(t *testing.T) {
 	if !errors.As(e, &target) || target.Class != ClassContext {
 		t.Error("errors.As не достал класс")
 	}
-	// Класс читается и через сторонние обёртки (fmt.Errorf %w).
+	// The class is read through third-party wrappers too (fmt.Errorf %w).
 	if got := ClassOf(fmt.Errorf("обёртка: %w", e)); got != ClassContext {
 		t.Errorf("ClassOf через обёртку = %v", got)
 	}
-	// Без URL — краткий формат.
+	// Without a URL — the short format.
 	if got := (&Error{Class: ClassBrowser, Err: ErrClosed}).Error(); got != "render browser: "+ErrClosed.Error() {
 		t.Errorf("Error() без URL = %q", got)
 	}
-	// Посторонняя ошибка — ошибка страницы: без ретраев контекста.
+	// A foreign error — a page error: no context retries.
 	if got := ClassOf(sentinel); got != ClassTask {
 		t.Errorf("ClassOf(чужая) = %v, хочу task", got)
 	}
@@ -55,22 +55,23 @@ func TestErrorFormatUnwrapClassOf(t *testing.T) {
 	}
 }
 
-// TestLoadErrorCode — код ошибки загрузки страницы читается из цепочки
-// структурно (поле chromedp.LoadError.ErrorText, не разбор текста ошибки;
-// потребитель — политика cert-класса renderworker, T-159): прямо, через
-// обёртку render.Error и fmt.Errorf; без LoadError в цепочке — пусто.
+// TestLoadErrorCode — the page load error code is read from the chain
+// structurally (the chromedp.LoadError.ErrorText field, not error text
+// parsing; the consumer is the cert-class policy of renderworker, T-159):
+// directly, through a render.Error wrapper and fmt.Errorf; no LoadError
+// in the chain — empty.
 func TestLoadErrorCode(t *testing.T) {
 	loadErr := &chromedp.LoadError{ErrorText: "net::ERR_CERT_AUTHORITY_INVALID"}
 
 	if got := LoadErrorCode(loadErr); got != "net::ERR_CERT_AUTHORITY_INVALID" {
 		t.Errorf("LoadErrorCode(LoadError) = %q", got)
 	}
-	// Боевой путь: classifyCtx оборачивает сбой навигации в render.Error.
+	// The production path: classifyCtx wraps the navigation failure in render.Error.
 	e := &Error{Class: ClassTask, URL: "https://a.example/", Err: loadErr}
 	if got := LoadErrorCode(e); got != "net::ERR_CERT_AUTHORITY_INVALID" {
 		t.Errorf("LoadErrorCode(render.Error) = %q", got)
 	}
-	// Произвольные обёртки %w — как у воркера поверх render.Error.
+	// Arbitrary %w wrappers — as the worker does on top of render.Error.
 	if got := LoadErrorCode(fmt.Errorf("renderworker: рендер: %w", e)); got != "net::ERR_CERT_AUTHORITY_INVALID" {
 		t.Errorf("LoadErrorCode через обёртки = %q", got)
 	}
@@ -86,9 +87,9 @@ func TestLoadErrorCode(t *testing.T) {
 	}
 }
 
-// livePair — браузер и сессия с живыми (не отменёнными) контекстами для
-// классификации; без реального Chromium (классификация ходит только по
-// состоянию контекстов и зонду, зонд подменяется probeFn).
+// livePair — a browser and a session with live (not canceled) contexts for
+// classification; no real Chromium (classification only walks the state of
+// the contexts and the probe, the probe is substituted by probeFn).
 func livePair() (*Browser, *Session) {
 	b := &Browser{opts: Options{}.withDefaults(), ctx: context.Background()}
 	return b, &Session{b: b, ctx: context.Background()}
@@ -121,7 +122,7 @@ func TestClassifyCtx(t *testing.T) {
 
 	t.Run("ошибка загрузки страницы", func(t *testing.T) {
 		b, s := livePair()
-		s.probeFn = func() bool { return true } // не должен понадобиться
+		s.probeFn = func() bool { return true } // must not be needed
 		loadErr := &chromedp.LoadError{ErrorText: "net::ERR_NAME_NOT_RESOLVED"}
 		if got := ClassOf(b.classifyCtx(loadErr, "u", s)); got != ClassTask {
 			t.Errorf("класс %v, хочу task", got)
@@ -145,8 +146,8 @@ func TestClassifyCtx(t *testing.T) {
 	})
 
 	t.Run("сессия без контекста", func(t *testing.T) {
-		// Сессия, не дошедшая до создания вкладки (ctx nil): nil-guard
-		// классификации обязан пропустить её в зонд, а не упасть.
+		// A session that never reached tab creation (ctx nil): the nil-guard
+		// of classification must pass it to the probe, not crash.
 		b, _ := livePair()
 		s := &Session{b: b}
 		if got := ClassOf(b.classifyCtx(err, "u", s)); got != ClassContext {
@@ -178,7 +179,7 @@ func TestSessionWrap(t *testing.T) {
 		caller := context.Background()
 		opCtx, stop := context.WithTimeout(caller, time.Millisecond)
 		defer stop()
-		<-opCtx.Done() // гарантированно истёк
+		<-opCtx.Done() // expired for sure
 
 		got := s.wrap(err, caller, opCtx, "u")
 		if got.Class != ClassTask || !errors.Is(got.Err, context.DeadlineExceeded) {

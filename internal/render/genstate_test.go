@@ -1,11 +1,12 @@
 package render
 
-// Юнит-тесты автомата поколения браузера (T-263, genstate.go): таблица
-// состояний genStateLocked на cdpfake-браузерах (фейк транспорта
-// cdpfake_test.go: настоящий bootstrap chromedp, живость/смерть видны
-// Browser.Alive), таблица решений swapReasonLocked по всем состояниям и
-// порогам, обход переходов жизненного цикла с побочками (рестарт, дрен,
-// терминальность Close) и изоляция Г1 «стартующий» мьютексом менеджера.
+// Unit tests of the browser generation FSM (T-263, genstate.go): the
+// genStateLocked state table on cdpfake browsers (the transport fake of
+// cdpfake_test.go: a real chromedp bootstrap, liveness/death visible to
+// Browser.Alive), the swapReasonLocked decision table over all states and
+// thresholds, a walkthrough of the lifecycle transitions with side effects
+// (a restart, drain, Close terminality) and the isolation of G1 "starting"
+// by the manager's mutex.
 
 import (
 	"context"
@@ -19,17 +20,17 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// genCDPBrowser — поколение поверх fakeCDP: полный bootstrap chromedp на
-// in-memory транспорте, Alive видит живой браузерный контекст. Смерть
-// поколения в сценариях — b.Close() (отмена контекста: та же ветка
-// Browser.Alive, что LostConnection реального соединения).
+// genCDPBrowser — a generation on top of fakeCDP: a full chromedp bootstrap on
+// an in-memory transport, Alive sees the live browser context. A generation's
+// death in the scenarios — b.Close() (a context cancellation: the same
+// Browser.Alive branch as the LostConnection of a real connection).
 //
-// Освобождение — t.Cleanup(b.Close), не сырые cancel-функции chromedp:
-// обёртка cancelWait (NewContext) для НЕ-attacher аллокатора
-// (fakeCDPAllocator) вычитывает токен семафора c.allocated ровно один
-// раз и никем не закрывается — второй вызов cancel виснет навсегда;
-// Browser.Close идемпотентен (флаг closed) и гасит оба контекста
-// (браузерный и аллокатора) первым вызовом.
+// Cleanup — t.Cleanup(b.Close), not the raw chromedp cancel functions:
+// the cancelWait wrapper (NewContext) for a NON-attacher allocator
+// (fakeCDPAllocator) consumes the c.allocated semaphore token exactly once
+// and is closed by no one — a second cancel call hangs forever;
+// Browser.Close is idempotent (the closed flag) and kills both contexts
+// (the browser's and the allocator's) on the first call.
 func genCDPBrowser(t *testing.T, opts Options) *Browser {
 	t.Helper()
 	tr := newFakeCDP()
@@ -45,16 +46,16 @@ func genCDPBrowser(t *testing.T, opts Options) *Browser {
 	return b
 }
 
-// genStateOf — чтение состояния слота под мьютексом менеджера (как
-// читают acquire/Alive/Start).
+// genStateOf — reading the slot's state under the manager's mutex (as
+// acquire/Alive/Start read it).
 func genStateOf(m *Manager) genState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.genStateLocked()
 }
 
-// genStartedWith — менеджер с поднятым cdpfake-поколением (браузер
-// возвращается сценариям для смерти/порогов).
+// genStartedWith — a manager with a raised cdpfake generation (the browser
+// is returned to the scenarios for death/thresholds).
 func genStartedWith(t *testing.T) (*Manager, *Browser) {
 	t.Helper()
 	b := genCDPBrowser(t, managerOpts())
@@ -66,9 +67,9 @@ func genStartedWith(t *testing.T) (*Manager, *Browser) {
 }
 
 func TestGenStateNames(t *testing.T) {
-	// Шесть состояний автомата (T-263) с именами для диагностики; Г1
-	// «стартующий» входит в перечень, хотя предикат его не возвращает
-	// (существует только под m.mu, инвариант И2).
+	// The six FSM states (T-263) with names for diagnostics; G1
+	// "starting" is in the list although the predicate does not return it
+	// (it exists only under m.mu, invariant I2).
 	names := map[genState]string{
 		genAbsent:   "отсутствует",
 		genStarting: "стартующий",
@@ -90,8 +91,8 @@ func TestGenStateNames(t *testing.T) {
 }
 
 func TestGenStateTable(t *testing.T) {
-	// Таблица состояний (ТЗ-fsm §4): все наблюдаемые извне m.mu
-	// состояния слота — на cdpfake-браузерах; Г1 — отдельный тест.
+	// The state table (TZ-fsm §4): all slot states observable from outside
+	// m.mu — on cdpfake browsers; G1 — a separate test.
 	cases := []struct {
 		name  string
 		setup func(t *testing.T) *Manager
@@ -102,7 +103,7 @@ func TestGenStateTable(t *testing.T) {
 			return m
 		}, genAbsent},
 		{"Г0 отсутствует — после неудачного старта (П4)", func(t *testing.T) *Manager {
-			m, _, _ := managerFor(t, managerOpts()) // фабрика без браузеров — старт падает
+			m, _, _ := managerFor(t, managerOpts()) // the factory has no browsers — the start fails
 			if err := m.Start(); ClassOf(err) != ClassBrowser {
 				t.Fatalf("Start: %v, хочу ошибку класса browser", err)
 			}
@@ -128,7 +129,7 @@ func TestGenStateTable(t *testing.T) {
 			b := genCDPBrowser(t, managerOpts())
 			m := NewManager(context.Background(), managerOpts())
 			m.mu.Lock()
-			m.b = b // пул не подложен — недостижимо штатно (b и p ставятся вместе)
+			m.b = b // no pool planted — unreachable normally (b and p are set together)
 			m.mu.Unlock()
 			return m
 		}, genDraining},
@@ -157,8 +158,9 @@ func TestGenStateTable(t *testing.T) {
 }
 
 func TestSwapReasonTable(t *testing.T) {
-	// Таблица решений swapReasonLocked: причины замены по состояниям
-	// слота + пороги живого поколения (genstate.go, «Причины замены»).
+	// The swapReasonLocked decision table: the replacement reasons by the
+	// slot states + the live generation thresholds (genstate.go,
+	// "Replacement reasons").
 	cases := []struct {
 		name       string
 		setup      func(t *testing.T) *Manager
@@ -197,7 +199,7 @@ func TestSwapReasonTable(t *testing.T) {
 			m, b := genStartedWith(t)
 			m.mu.Lock()
 			b.opts.RestartEveryPages = 1
-			b.pages.Add(1) // одна успешная страница — порог
+			b.pages.Add(1) // one successful page — the threshold
 			m.mu.Unlock()
 			return m
 		}, "порог страниц", true},
@@ -212,7 +214,7 @@ func TestSwapReasonTable(t *testing.T) {
 			m.mu.Lock()
 			b.opts.RestartEveryPages = 1
 			b.pages.Add(1)
-			b.opts.MemoryThreshold = 1 // оба порога достигнуты — решает первый
+			b.opts.MemoryThreshold = 1 // both thresholds reached — the first one decides
 			m.mu.Unlock()
 			return m
 		}, "порог страниц", true},
@@ -225,7 +227,7 @@ func TestSwapReasonTable(t *testing.T) {
 				t.Skip("RSS недоступен (нет /proc)")
 			}
 			m.mu.Lock()
-			b.opts.MemoryThreshold = 1 // байт: любая живая память — превышение
+			b.opts.MemoryThreshold = 1 // bytes: any live memory is an excess
 			m.mu.Unlock()
 			return m
 		}, "порог памяти", true},
@@ -261,16 +263,17 @@ func TestSwapReasonTable(t *testing.T) {
 }
 
 func TestGenStateLifecycle(t *testing.T) {
-	// Обход переходов: П1→П2 (старт), П6 (смерть) → П1→П3 (замена зонда,
-	// П7 дрен старого), П8 (закрытый пул в слоте) → П3, П9 (Close).
-	// Побочки: Restarts, retire старого пула (ErrClosed задач), запрет
-	// новых поколений из Г5.
+	// A walkthrough of the transitions: T1→T2 (a start), T6 (death) →
+	// T1→T3 (a replacement by the probe, T7 drains the old one),
+	// T8 (a closed pool in the slot) → T3, T9 (Close).
+	// Side effects: Restarts, the retire of the old pool (the tasks'
+	// ErrClosed), the ban on new generations from G5.
 	b1 := genCDPBrowser(t, managerOpts())
 	b2 := genCDPBrowser(t, managerOpts())
 	b3 := genCDPBrowser(t, managerOpts())
 	m, calls, pools := managerFor(t, managerOpts(), b1, b2, b3)
 
-	// П1→П2: первое поколение — активный, без перезапусков.
+	// T1→T2: the first generation — active, no restarts.
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -284,13 +287,13 @@ func TestGenStateLifecycle(t *testing.T) {
 		t.Errorf("перезапусков %d, хочу 0 (первый старт — не перезапуск)", got)
 	}
 
-	// П6: смерть браузера поколения — мёртв.
+	// T6: the generation's browser dies — dead.
 	b1.Close()
 	if got := genStateOf(m); got != genDead {
 		t.Fatalf("после смерти браузера состояние %s, хочу мёртв", got)
 	}
 
-	// П1→П3: зонд заменяет мёртвое поколение; старый пул дренирован (П7).
+	// T1→T3: the probe replaces the dead generation; the old pool is drained (T7).
 	if !m.Alive() {
 		t.Fatal("зонд обязан заменить мёртвое поколение")
 	}
@@ -310,7 +313,7 @@ func TestGenStateLifecycle(t *testing.T) {
 		t.Errorf("задача в дренируемый пул: %v, хочу ErrClosed", err)
 	}
 
-	// П8: закрытый пул в слоте при живом браузере — замена «пул закрыт».
+	// T8: a closed pool in the slot with a live browser — the "pool closed" replacement.
 	m.mu.Lock()
 	m.p.retire()
 	m.mu.Unlock()
@@ -327,7 +330,7 @@ func TestGenStateLifecycle(t *testing.T) {
 		t.Errorf("перезапусков %d, хочу 2", got)
 	}
 
-	// П9: Close — терминальное: задачи ErrClosed, зонд false, стартов нет.
+	// T9: Close — terminal: tasks ErrClosed, the probe false, no starts.
 	m.Close()
 	if got := genStateOf(m); got != genClosed {
 		t.Fatalf("после Close состояние %s, хочу закрыт", got)
@@ -344,9 +347,9 @@ func TestGenStateLifecycle(t *testing.T) {
 }
 
 func TestGenStateStartingSerialized(t *testing.T) {
-	// И2/Г1 «стартующий»: старт поколения держит m.mu всё время
-	// StartBrowser — конкурентный зонд ждёт исхода, не наблюдает пустой
-	// слот и не поднимает второй браузер.
+	// I2/G1 "starting": a generation start holds m.mu for the whole
+	// StartBrowser — a concurrent probe waits for the outcome, does not
+	// observe an empty slot and does not raise a second browser.
 	b := genCDPBrowser(t, managerOpts())
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -368,7 +371,7 @@ func TestGenStateStartingSerialized(t *testing.T) {
 		_, err := m.Run(context.Background(), RenderTask{URL: "u"})
 		runDone <- err
 	}()
-	<-entered // Г1 «стартующий»: m.mu удержан restartLocked
+	<-entered // G1 "starting": m.mu is held by restartLocked
 
 	probeDone := make(chan bool, 1)
 	go func() { probeDone <- m.Alive() }()

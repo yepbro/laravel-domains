@@ -7,26 +7,26 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// Class — класс ошибки рендера; определяет реакцию на сбой (ТЗ 5.6, §8):
-// воркер не должен диагностировать Chromium по текстам ошибок библиотеки.
+// Class — a render error class; determines the failure response (spec 5.6, §8):
+// the worker must not diagnose Chromium from the library's error texts.
 type Class int
 
 const (
-	// ClassTask — ошибка страницы: превышен Options.Timeout, отменён
-	// вызывающий контекст, страница не загрузилась (net::ERR_*).
-	// Повтор на новом контексте бессмысленен; повторная доставка —
-	// уровень очереди (T-066).
+	// ClassTask — a page error: Options.Timeout exceeded, the caller's
+	// context canceled, the page failed to load (net::ERR_*).
+	// Retrying on a new context is pointless; redelivery is
+	// the queue's level (T-066).
 	ClassTask Class = iota
-	// ClassContext — умер изолированный контекст (вкладка или рендер
-	// упали, профиль не отвечает): Pool повторяет задачу один раз на
-	// новом контексте.
+	// ClassContext — the isolated context died (the tab or the render
+	// crashed, the profile is unresponsive): the Pool retries the task once on
+	// a new context.
 	ClassContext
-	// ClassBrowser — Chromium недоступен или соединение потеряно: нужен
-	// перезапуск браузера (T-065); Pool не повторяет.
+	// ClassBrowser — Chromium is unavailable or the connection is lost: a
+	// browser restart is required (T-065); the Pool does not retry.
 	ClassBrowser
 )
 
-// String — имя класса для логов и сообщений об ошибках.
+// String — the class name for logs and error messages.
 func (c Class) String() string {
 	switch c {
 	case ClassTask:
@@ -40,18 +40,18 @@ func (c Class) String() string {
 	}
 }
 
-// Error — ошибка рендера с классификацией. errors.As(*Error) даёт класс,
-// Unwrap — исходную причину (включая context.Canceled/DeadlineExceeded).
+// Error — a render error with classification. errors.As(*Error) yields the class,
+// Unwrap — the original cause (including context.Canceled/DeadlineExceeded).
 type Error struct {
-	// Class — реакция на ошибку, см. константы выше.
+	// Class — the response to the error, see the constants above.
 	Class Class
-	// URL — страница задачи (диагностика).
+	// URL — the task's page (diagnostics).
 	URL string
-	// Err — исходная ошибка.
+	// Err — the original error.
 	Err error
 }
 
-// Error реализует error.
+// Error implements error.
 func (e *Error) Error() string {
 	if e.URL != "" {
 		return fmt.Sprintf("render %s: %v (url %q)", e.Class, e.Err, e.URL)
@@ -59,11 +59,11 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("render %s: %v", e.Class, e.Err)
 }
 
-// Unwrap даёт доступ к исходной ошибке (errors.Is/As проходят насквозь).
+// Unwrap gives access to the original error (errors.Is/As pass through).
 func (e *Error) Unwrap() error { return e.Err }
 
-// ClassOf возвращает класс ошибки. Все ошибки этого пакета — *Error;
-// посторонние ошибки трактуются как ошибки страницы (без ретраев).
+// ClassOf returns the error's class. All errors of this package are *Error;
+// foreign errors are treated as page errors (no retries).
 func ClassOf(err error) Class {
 	var e *Error
 	if errors.As(err, &e) {
@@ -72,15 +72,15 @@ func ClassOf(err error) Class {
 	return ClassTask
 }
 
-// LoadErrorCode — код ошибки загрузки страницы из цепочки ошибки: текст
-// браузера из net/base/net_error_list.h (например net::ERR_NAME_NOT_RESOLVED
-// или net::ERR_CERT_AUTHORITY_INVALID), которым chromedp маркирует сбой
-// навигации (тип LoadError, errors.Is с ErrPageLoad; classifyCtx относит
-// его к классу task). Пустая строка — ошибки загрузки страницы в цепочке
-// нет. Код — поле LoadError.ErrorText, а не подстрока текста ошибки:
-// точное сравнение стабильно против формата сообщений библиотеки.
-// Потребители — политики постоянных ошибок сертификата хоста (T-159) и
-// DNS-отказа (T-211) в renderworker: сам код решения не принимает.
+// LoadErrorCode — the page load error code from the error chain: the browser
+// text from net/base/net_error_list.h (e.g. net::ERR_NAME_NOT_RESOLVED
+// or net::ERR_CERT_AUTHORITY_INVALID) with which chromedp marks a navigation
+// failure (the LoadError type, errors.Is with ErrPageLoad; classifyCtx assigns
+// it to the task class). An empty string — there is no page load error in the
+// chain. The code is the LoadError.ErrorText field, not a substring of the
+// error text: exact comparison is stable against the library's message format.
+// Consumers — the host permanent certificate failure (T-159) and DNS failure
+// (T-211) policies in renderworker: the code itself makes no decision.
 func LoadErrorCode(err error) string {
 	var le *chromedp.LoadError
 	if errors.As(err, &le) {
@@ -89,10 +89,10 @@ func LoadErrorCode(err error) string {
 	return ""
 }
 
-// ErrClosed — пул или браузер остановлены, задача не выполнялась.
-// Гарантирует перевод задачи в очередь на повторную доставку (T-066).
+// ErrClosed — the pool or the browser is stopped, the task did not run.
+// Guarantees moving the task to the redelivery queue (T-066).
 var ErrClosed = errors.New("рендер остановлен")
 
-// ErrBrowserDead — браузерная сессия не инициализирована или потеряна
-// (проверка до создания сессии, чтобы не гонять заведомо падающие команды).
+// ErrBrowserDead — the browser session is not initialized or is lost
+// (checked before creating a session, so as not to run commands doomed to fail).
 var ErrBrowserDead = errors.New("браузерная сессия Chromium недоступна")

@@ -1,21 +1,22 @@
 package render
 
-// Герметичная замена Chromium для юнит-тестов подписок и команд вкладки:
-// in-memory chromedp.Transport. Живой браузер не нужен — команды и события
-// ходят каналами, авто-ответы транспорта обслуживают весь bootstrap chromedp
-// (SetDiscoverTargets → Target.targetCreated → attachToTarget → цепочка
-// Runtime/Page/Network/… enable). Приём — экспортированные срезы chromedp:
-// Transport (интерфейс чтения/записи сообщений CDP), NewBrowserTransport и
-// NewAllocatorContext; удалённое соединение (remote.Conn) подменяется
-// транспортным фейком, как в прочих тестах пакета подменяются поля структур
-// (probeFn, eventsOf у blockPump, fakeExtractCDP).
+// A hermetic Chromium replacement for the unit tests of tab subscriptions and
+// commands: an in-memory chromedp.Transport. No live browser is needed — commands and
+// events travel over channels, the transport's auto-replies service the whole chromedp
+// bootstrap
+// (SetDiscoverTargets → Target.targetCreated → attachToTarget → the
+// Runtime/Page/Network/… enable chain). The trick — exported chromedp pieces:
+// Transport (the CDP message read/write interface), NewBrowserTransport and
+// NewAllocatorContext; the remote connection (remote.Conn) is substituted
+// with the transport fake, just as other tests of the package substitute struct fields
+// (probeFn, eventsOf in blockPump, fakeExtractCDP).
 //
-// О чём фейк говорит тестам:
-//   - команды — журнал cmds (метод, сессия, параметры) и счётчики по методам;
-//   - ошибки команд — setError по методу (после bootstrap'а: например, отказ
-//     Network.enable для waitSubscribe);
-//   - события — fireSession/fireBrowser: доставляются подпискам
-//     chromedp.Events ровно как события реальной вкладки.
+// What the fake tells the tests:
+//   - commands — the cmds journal (method, session, params) and per-method counters;
+//   - command errors — setError per method (after the bootstrap: e.g. a
+//     Network.enable refusal for waitSubscribe);
+//   - events — fireSession/fireBrowser: delivered to the chromedp.Events
+//     subscriptions exactly like the events of a real tab.
 
 import (
 	"context"
@@ -28,15 +29,15 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// fakeCDPSessionID/fakeCDPTargetID — фиксированные идентификаторы вкладки
-// фейка: ответ attachToTarget и sessionId событий должны совпадать.
+// fakeCDPSessionID/fakeCDPTargetID — the fixed identifiers of the fake's
+// tab: the attachToTarget reply and the sessionId of events must match.
 const (
 	fakeCDPSessionID = "fake-session"
 	fakeCDPTargetID  = "fake-target"
 )
 
-// fakeCDPCmd — команда, прошедшая через транспорт: идентификатор, метод,
-// сессия и параметры (json-текст) как есть.
+// fakeCDPCmd — a command that went through the transport: the identifier, method,
+// session and params (json text) as-is.
 type fakeCDPCmd struct {
 	ID        int64
 	Method    string
@@ -44,19 +45,19 @@ type fakeCDPCmd struct {
 	Params    string
 }
 
-// fakeCDPReplies — результаты bootstrap-команд chromedp: attachToTarget
-// (идентификатор сессии), Runtime.evaluate «self» (не Worker — ветка
-// isWorker), getTargets (пустой список — waitTargetGone при закрытии
-// заканчивается сразу). Всё прочее получает пустой результат {}.
+// fakeCDPReplies — the results of the chromedp bootstrap commands: attachToTarget
+// (the session identifier), the "self" Runtime.evaluate (not a Worker — the
+// isWorker branch), getTargets (an empty list — the waitTargetGone on closing
+// ends immediately). Everything else gets an empty result {}.
 var fakeCDPReplies = map[string]string{
 	"Target.attachToTarget": `{"sessionId":"` + fakeCDPSessionID + `"}`,
 	"Runtime.evaluate":      `{"result":{"type":"object","className":"Object"}}`,
 	"Target.getTargets":     `{"targetInfos":[]}`,
 }
 
-// fakeCDP — in-memory транспорт CDP: Write принимает команды и отвечает на
-// них (авто-ответ или сконфигурированная ошибка), Read раздаёт ответы и
-// события; inbox общий, порядок доставки FIFO.
+// fakeCDP — an in-memory CDP transport: Write accepts commands and replies to
+// them (an auto-reply or a configured error), Read hands out the replies and
+// events; the inbox is shared, the delivery order is FIFO.
 type fakeCDP struct {
 	mu     sync.Mutex
 	cmds   []fakeCDPCmd
@@ -72,13 +73,13 @@ func newFakeCDP() *fakeCDP {
 	}
 }
 
-// Write удовлетворяет chromedp.Transport: запись команды. Ответ синтезируется
-// синхронно (без реального браузера): результат из fakeCDPReplies либо {},
-// либо ошибка из errors. Посылка в inbox учитывает ctx транспорта: если
-// читатель уже вышел (жизненный цикл браузера погашен), write-loop chromedp
-// не подвисает на полном буфере. На браузерный setDiscoverTargets (первый
-// шаг bootstrap'а вкладки) дополнительно объявляется страница — chromedp
-// ждёт именно этого события.
+// Write satisfies chromedp.Transport: writing a command. The reply is synthesized
+// synchronously (no real browser): the result from fakeCDPReplies or {},
+// or an error from errors. The push into the inbox respects the transport's ctx: if
+// the reader has already exited (the browser lifecycle is killed), the chromedp
+// write-loop does not hang on a full buffer. On the browser-level setDiscoverTargets (the
+// first step of the tab's bootstrap) a page is additionally announced — chromedp
+// waits exactly for this event.
 func (f *fakeCDP) Write(ctx context.Context, m *cdproto.Message) error {
 	f.mu.Lock()
 	f.cmds = append(f.cmds, fakeCDPCmd{
@@ -114,8 +115,8 @@ func (f *fakeCDP) Write(ctx context.Context, m *cdproto.Message) error {
 	return nil
 }
 
-// Read удовлетворяет chromedp.Transport: ожидание сообщения (ответ/событие)
-// до отмены контекста браузера.
+// Read satisfies chromedp.Transport: waiting for a message (a reply/event)
+// until the browser context is canceled.
 func (f *fakeCDP) Read(ctx context.Context, m *cdproto.Message) error {
 	select {
 	case <-ctx.Done():
@@ -126,11 +127,11 @@ func (f *fakeCDP) Read(ctx context.Context, m *cdproto.Message) error {
 	}
 }
 
-// Close удовлетворяет chromedp.Transport.
+// Close satisfies chromedp.Transport.
 func (f *fakeCDP) Close() error { return nil }
 
-// fireSession — событие сессии вкладки: доставляется подпискам
-// chromedp.Events (параметры — валидный json целевого события).
+// fireSession — a tab session event: delivered to the chromedp.Events
+// subscriptions (the params are a valid json of the target event).
 func (f *fakeCDP) fireSession(method, params string) {
 	f.inbox <- &cdproto.Message{
 		Method:    cdproto.MethodType(method),
@@ -139,7 +140,7 @@ func (f *fakeCDP) fireSession(method, params string) {
 	}
 }
 
-// fireBrowser — событие браузерного уровня (без сессии).
+// fireBrowser — a browser-level event (no session).
 func (f *fakeCDP) fireBrowser(method, params string) {
 	f.inbox <- &cdproto.Message{
 		Method: cdproto.MethodType(method),
@@ -147,21 +148,21 @@ func (f *fakeCDP) fireBrowser(method, params string) {
 	}
 }
 
-// setError — отвечать ошибкой на метод (до следующего сброса).
+// setError — reply with an error to the method (until the next reset).
 func (f *fakeCDP) setError(method string, e *cdproto.Error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.errors[method] = e
 }
 
-// callsOf — копия журнала команд.
+// callsOf — a copy of the command journal.
 func (f *fakeCDP) callsOf() []fakeCDPCmd {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]fakeCDPCmd(nil), f.cmds...)
 }
 
-// countOf — число команд с данным методом.
+// countOf — the number of commands with the given method.
 func (f *fakeCDP) countOf(method string) int {
 	n := 0
 	for _, c := range f.callsOf() {
@@ -172,8 +173,8 @@ func (f *fakeCDP) countOf(method string) int {
 	return n
 }
 
-// fakeCDPAllocator — аллокатор поверх fakeCDP: браузер живёт, пока жив
-// контекст аллокатора (как remote.Allocator, но транспорт in-memory).
+// fakeCDPAllocator — an allocator on top of fakeCDP: the browser lives as long as
+// the allocator context lives (like remote.Allocator, but the transport is in-memory).
 type fakeCDPAllocator struct{ tr *fakeCDP }
 
 func (a *fakeCDPAllocator) Allocate(ctx context.Context, opts ...chromedp.BrowserOption) (*chromedp.Browser, error) {
@@ -187,10 +188,10 @@ func (a *fakeCDPAllocator) Allocate(ctx context.Context, opts ...chromedp.Browse
 
 func (a *fakeCDPAllocator) Wait() {}
 
-// newFakeCDPContext — chromedp-контекст с поднятой вкладкой поверх fakeCDP:
-// chromedp.Do проводит полный bootstrap (браузер → targetCreated → attach →
-// домены), все его команды обслуживаются авто-ответами. Контекст
-// освобождается Cleanup теста.
+// newFakeCDPContext — a chromedp context with a raised tab on top of fakeCDP:
+// chromedp.Do performs the full bootstrap (browser → targetCreated → attach →
+// domains), all its commands are serviced by the auto-replies. The context
+// is released by the test's Cleanup.
 func newFakeCDPContext(t *testing.T) (context.Context, *fakeCDP) {
 	t.Helper()
 	tr := newFakeCDP()

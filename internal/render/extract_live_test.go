@@ -1,21 +1,21 @@
 package render
 
-// Live-проверки съёма результата T-064 против реального Chromium dev-стека
-// (включение и адрес — как в browser_live_test.go: CRAWLER_RENDER_TEST=1,
-// compose-сервис chromium). Два уровня:
+// Live checks of the T-064 result capture against the real Chromium of the dev
+// stack (the enabling and the address — as in browser_live_test.go:
+// CRAWLER_RENDER_TEST=1, the compose service chromium). Two levels:
 //
-//   - статическая страница HTTP-фикстуры (liveServe): точный outerHTML
-//     после исполнения скрипта (дерево дорисовано JS), cookies нет,
-//     заголовки ответа основной навигации сняты с реального сетевого
-//     ответа (data:-страницы с псевдо-ответом невозможны после R-09:
-//     validateTaskURL отвергает не-http схемы, T-216);
-//   - внутренняя страница spa-shell.crawl.test (testbed): JS-cookie,
-//     выставленная скриптом синхронно при разборе (document.cookie — до
-//     события load), видна в CDP-наборе; заголовки ответа основной
-//     навигации сняты.
+//   - a static page of the HTTP fixture (liveServe): the exact outerHTML
+//     after the script runs (the tree is finished by JS), no cookies,
+//     the response headers of the main navigation captured from a real network
+//     response (data: pages with a pseudo-response are impossible after R-09:
+//     validateTaskURL rejects non-http schemes, T-216);
+//   - the internal page spa-shell.crawl.test (the testbed): a JS cookie,
+//     set by the script synchronously during parsing (document.cookie — before
+//     the load event), is visible in the CDP set; the response headers of the
+//     main navigation captured.
 //
-// Асинхронный контент spa-shell (setTimeout 150 мс) здесь не проверяется:
-// ожидание «затишья» сети — T-063, без него съём идёт сразу после load.
+// The async content of spa-shell (setTimeout 150 ms) is not checked here:
+// waiting for the network quiet — T-063; without it the capture runs right after load.
 
 import (
 	"context"
@@ -25,20 +25,20 @@ import (
 	"testing"
 )
 
-// TestExtractLiveStaticPage — съём результата на статической странице
-// фикстуры: скрипт меняет текст синхронно — дорисовка обязана попасть в
-// итоговый DOM к моменту съёма (после события load); cookies нет (чистый
-// изолированный контекст, страница их не выставляет); заголовки — с
-// реального ответа сервера фикстуры.
+// TestExtractLiveStaticPage — the result capture on a static fixture
+// page: the script changes the text synchronously — the finishing touches
+// must be in the final DOM by the moment of capture (after the load event);
+// no cookies (a clean isolated context, the page sets none); the headers come from
+// the real response of the fixture server.
 func TestExtractLiveStaticPage(t *testing.T) {
 	skipUnlessLive(t)
 	ctx := context.Background()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dom", func(w http.ResponseWriter, _ *http.Request) {
-		// X-Live-Fixture — фирменный заголовок фикстуры: его наличие в
-		// результате доказывает, что заголовки сняты с реального ответа
-		// сервера (равно как Content-Type мог бы дать и псевдо-ответ).
+		// X-Live-Fixture — the fixture's signature header: its presence in the
+		// result proves that the headers were captured from the real response
+		// of the server (Content-Type alone could have come from a pseudo-response too).
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("X-Live-Fixture", "1")
 		_, _ = fmt.Fprint(w, "<html><head><title>ext</title></head><body>"+
@@ -77,10 +77,10 @@ func TestExtractLiveStaticPage(t *testing.T) {
 	if len(out.Cookies) != 0 {
 		t.Errorf("cookies у страницы без них: %+v, хочу пусто", out.Cookies)
 	}
-	// Заголовки реального ответа основной навигации: Content-Type сервера
-	// фикстуры и фирменный X-Live-Fixture (ключи канонические, как у
-	// HTTP-этапа; полный набор заголовков сетевого ответа не фиксирован —
-	// Date и пр. добавляет сам сервер).
+	// The headers of the real main navigation response: the fixture server's
+	// Content-Type and the signature X-Live-Fixture (the keys are canonical, as in the
+	// HTTP stage; the full set of the network response's headers is not pinned —
+	// Date etc. are added by the server itself).
 	if ct := out.ResponseHeaders.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("Content-Type %q, хочу text/html…", ct)
 	}
@@ -105,9 +105,9 @@ func TestExtractLiveInternalPage(t *testing.T) {
 	}
 	defer s.Close()
 
-	// spa-shell.crawl.test: сценарий testbed «DOM и cookies от JS» — скрипт
-	// выставляет document.cookie синхронно (до load) и рисует контент в
-	// #root по таймеру (после load — территория ожидания T-063).
+	// spa-shell.crawl.test: the testbed scenario "DOM and cookies from JS" — the script
+	// sets document.cookie synchronously (before load) and draws content into
+	// #root on a timer (after load — the T-063 waiting territory).
 	out, err := s.Run(ctx, RenderTask{URL: "http://spa-shell.crawl.test/"})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -116,8 +116,8 @@ func TestExtractLiveInternalPage(t *testing.T) {
 		t.Errorf("итоговый URL %q", out.FinalURL)
 	}
 
-	// JS-cookie видна в CDP-наборе: хранилище контекста читается командой,
-	// а не document.cookie.
+	// The JS cookie is visible in the CDP set: the context store is read by the command,
+	// not document.cookie.
 	var js *ExtractCookie
 	for i := range out.Cookies {
 		if out.Cookies[i].Name == "js_session" {
@@ -131,7 +131,7 @@ func TestExtractLiveInternalPage(t *testing.T) {
 		t.Errorf("js_session: %+v", js)
 	}
 
-	// Дерево страницы после загрузки: каркас SPA на месте.
+	// The page tree after the load: the SPA skeleton is in place.
 	if !strings.Contains(out.DOM, `<div id="root">`) {
 		t.Errorf("итоговый DOM без каркаса SPA: %q", out.DOM)
 	}
@@ -139,8 +139,8 @@ func TestExtractLiveInternalPage(t *testing.T) {
 		t.Errorf("итоговый DOM не с корневого элемента: %q", out.DOM)
 	}
 
-	// Заголовки ответа основной навигации (ТЗ 5.8): ключи канонические,
-	// как у HTTP-этапа.
+	// The response headers of the main navigation (spec 5.8): the keys are
+	// canonical, as in the HTTP stage.
 	if ct := out.ResponseHeaders.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("Content-Type %q, хочу text/html…", ct)
 	}

@@ -10,9 +10,9 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// Стартовые ошибки классифицируются как ClassBrowser — без живого Chromium:
-// удалённый режим бьётся в закрытый порт (отказ соединения мгновенный),
-// локальный — в несуществующий бинарк. Оба случая детерминированы.
+// Start errors are classified as ClassBrowser — without a live Chromium:
+// the remote mode hits a closed port (the connection refusal is instant),
+// the local one — a nonexistent binary. Both cases are deterministic.
 
 func TestStartBrowserRemoteUnreachable(t *testing.T) {
 	_, err := StartBrowser(context.Background(), Options{
@@ -48,9 +48,9 @@ func TestStartBrowserLocalExecMissing(t *testing.T) {
 	if !errors.As(err, &e) || e.Class != ClassBrowser {
 		t.Fatalf("хочу *render.Error класса browser, получено: %v", err)
 	}
-	// Сообщение называет режим и заданный путь: путь в тексте появляется
-	// только если ExecPath действительно дошёл до аллокатора (иначе chromedp
-	// ищет бинар в PATH и падает другим текстом — «google-chrome … PATH»).
+	// The message names the mode and the given path: the path appears in the
+	// text only if ExecPath actually reached the allocator (otherwise chromedp
+	// looks for the binary in PATH and fails with a different text — "google-chrome … PATH").
 	msg := err.Error()
 	if !strings.Contains(msg, "локальный процесс") {
 		t.Errorf("ошибка не называет локальный режим: %v", msg)
@@ -60,9 +60,9 @@ func TestStartBrowserLocalExecMissing(t *testing.T) {
 	}
 }
 
-// TestProbeTimeout пинит литералы зондов: соединение (probeConn) — с
-// запасом на перегруженный Chromium (T-226: 2 с давали ложные смерти
-// поколения); вкладка (Session.probe) — короткий, поколение не решает.
+// TestProbeTimeout pins the probe literals: the connection (probeConn) — with
+// headroom for an overloaded Chromium (T-226: 2s produced false generation
+// deaths); the tab (Session.probe) — short, the generation does not decide.
 func TestProbeTimeout(t *testing.T) {
 	if probeTimeout != 5*time.Second {
 		t.Errorf("probeTimeout = %s, хочу 5s", probeTimeout)
@@ -73,7 +73,7 @@ func TestProbeTimeout(t *testing.T) {
 }
 
 func TestStartBrowserValidate(t *testing.T) {
-	// Неверные опции отклоняются до каких-либо подключений.
+	// Invalid options are rejected before any connections.
 	_, err := StartBrowser(context.Background(), Options{
 		RemoteURL: "ws://127.0.0.1:1", DialTimeout: time.Second,
 		Contexts: 0, Timeout: time.Second, RestartEveryPages: 1,
@@ -87,15 +87,15 @@ func TestStartBrowserValidate(t *testing.T) {
 	}
 }
 
-// TestBrowserCloseNil — Close терпим к nil, как Alive/RSS/OverMemory:
-// контракт «вызов на неинициализированный браузер безвреден» (R-05).
+// TestBrowserCloseNil — Close tolerates nil, as Alive/RSS/OverMemory do:
+// the "a call on an uninitialized browser is harmless" contract (R-05).
 func TestBrowserCloseNil(t *testing.T) {
 	var b *Browser
-	b.Close() // не паникует
-	b.Close() // повторный вызов безвреден
+	b.Close() // does not panic
+	b.Close() // a repeated call is harmless
 }
 
-// TestBrowserAliveNil — nil-браузер мёртв (первая половина nil-guard).
+// TestBrowserAliveNil — a nil browser is dead (the first half of the nil-guard).
 func TestBrowserAliveNil(t *testing.T) {
 	var b *Browser
 	if b.Alive() {
@@ -103,10 +103,10 @@ func TestBrowserAliveNil(t *testing.T) {
 	}
 }
 
-// TestBrowserAliveChromedpContext — Alive по состоянию chromedp-контекста
-// без живого Chromium: контекст NewContext ещё без браузерной сессии
-// (Browser == nil до первого Run) жив; закрытый LostConnection — мёртв
-// даже при живом контексте.
+// TestBrowserAliveChromedpContext — Alive by the chromedp context state
+// without a live Chromium: a NewContext context without a browser session yet
+// (Browser == nil before the first Run) is alive; a closed LostConnection — dead
+// even with a live context.
 func TestBrowserAliveChromedpContext(t *testing.T) {
 	b := testBrowser(1)
 	if b.Alive() {
@@ -129,8 +129,8 @@ func TestBrowserAliveChromedpContext(t *testing.T) {
 	}
 }
 
-// TestBrowserCloseIdempotent — повторный Close не повторяет остановку:
-// cancel-хуки браузера дёргаются ровно один раз.
+// TestBrowserCloseIdempotent — a repeated Close does not repeat the stop:
+// the browser's cancel hooks fire exactly once.
 func TestBrowserCloseIdempotent(t *testing.T) {
 	b := testBrowser(1)
 	var cancels, allocCancels int

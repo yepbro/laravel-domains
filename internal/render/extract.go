@@ -1,42 +1,42 @@
-// Съём результата рендера (T-064; ТЗ 5.6 «Результат: итоговый DOM
-// (document.documentElement.outerHTML) и все cookies (включая выставленные
-// JS) через CDP», критерий приёмки §11.4 п. 3) и заголовки ответа основной
-// навигации. Заголовки — требование ТЗ 5.8 (правила по заголовкам): у
-// отрендеренной страницы итоговый документ не обязан совпадать с тем, что
-// снял HTTP-этап, поэтому рендер обязан отдать свои.
+// Capture of the render result (T-064; spec 5.6 "The result: the final DOM
+// (document.documentElement.outerHTML) and all cookies (including those set
+// by JS) via CDP", acceptance criterion §11.4 item 3) and the response headers of the main
+// navigation. The headers are a requirement of spec 5.8 (header rules): for a
+// rendered page the final document is not obliged to match what the
+// HTTP stage captured, so the render must hand over its own.
 //
-// Выбор способов съёма:
+// The capture methods chosen:
 //
 //   - DOM — chromedp.Evaluate(`document.documentElement.outerHTML`):
-//     сериализация живого дерева после дорисовки JS (внесённые скриптами
-//     элементы, атрибуты и тексты входят в результат), формат — тот же
-//     HTML-сериализатор Chrome, что отдаёт браузер при сохранении страницы,
-//     то есть текстуальный HTML. Результат напрямую ложится в хранилище
-//     контента (замена сырого HTML, T-067) и в матчер правил по HTML/meta
-//     (T-068) без преобразований. Альтернатива DOM.getFlattenedDocument —
-//     размеченное дерево узлов с nodeId, которое пришлось бы обратно
-//     сериализовывать (DOM.getOuterHTML по узлам) — сложнее и не даёт
-//     готового HTML. Ограничение outerHTML — shadow-деревья не
-//     раскрываются, но правила Laravel работают по светлому DOM.
+//     serialization of the live tree after JS finishing touches (elements, attributes and
+//     texts introduced by scripts are part of the result), the format is the same
+//     HTML serializer of Chrome that the browser uses when saving a page,
+//     i.e. textual HTML. The result goes straight into the content
+//     store (replacing the raw HTML, T-067) and into the rule matcher over HTML/meta
+//     (T-068) without transformations. The DOM.getFlattenedDocument alternative —
+//     a node tree with nodeId that would have to be
+//     serialized back (DOM.getOuterHTML per node) — more complex and gives no
+//     ready HTML. The outerHTML limitation — shadow trees are not
+//     expanded, but the Laravel rules work over the light DOM.
 //
-//   - cookies — Network.getCookies (CDP) с URL итоговой страницы: команда
-//     читает хранилище cookies изолированного контекста, а не
-//     document.cookie — видны httpOnly и выставленные страницей через JS
-//     (ТЗ 5.6 «все cookies»; document.cookie httpOnly не отдаёт).
-//     Упомянутый в декомпозиции Network.getAllCookies из актуальной версии
-//     протокола удалён (в cdproto v0.157.8 команды нет); Network.getCookies
-//     над сессией вкладки читает то же хранилище контекста, а явный URL
-//     итоговой страницы даёт набор «cookies этой страницы» без subframe-шума.
+//   - cookies — Network.getCookies (CDP) with the URL of the final page: the command
+//     reads the cookie store of the isolated context, not
+//     document.cookie — httpOnly and the ones set by the page via JS are visible
+//     (spec 5.6 "all cookies"; document.cookie does not return httpOnly).
+//     The Network.getAllCookies mentioned in the decomposition was removed from the current
+//     protocol version (the command is absent in cdproto v0.157.8); Network.getCookies
+//     over the tab's session reads the same context store, and the explicit URL
+//     of the final page yields the "this page's cookies" set without subframe noise.
 //
-//   - заголовки — ответ основной навигации из Network.responseReceived:
-//     chromedp.NavigateResponse (вместо равного ему по ожиданию Navigate)
-//     отслеживает цепочку loader/request через HTTP-редиректы и возвращает
-//     ответ итогового документа. Отдельная подписка на события не нужна.
-//     Речь об ответе самой навигации: JS-редирект после загрузки уже не
-//     отслеживается (его итог виден в FinalURL, а заголовки — документа,
-//     чей контент отрисован). Заголовки из responseReceivedExtraInfo
-//     (report-only набор) не запрашиваются: для правил ТЗ 5.8 достаточно
-//     основного набора.
+//   - headers — the response of the main navigation from Network.responseReceived:
+//     chromedp.NavigateResponse (instead of the expectation-equivalent Navigate)
+//     tracks the loader/request chain across HTTP redirects and returns
+//     the response of the final document. A separate event subscription is not needed.
+//     We mean the response of the navigation itself: a JS redirect after the load is no
+//     longer tracked (its outcome is visible in FinalURL, and the headers are those of the
+//     document whose content is rendered). The headers from responseReceivedExtraInfo
+//     (the report-only set) are not requested: for the spec 5.8 rules the
+//     main set is enough.
 package render
 
 import (
@@ -55,19 +55,19 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// extractDOMExpr — выражение съёма итогового DOM (ТЗ 5.6): outerHTML
-// корневого элемента — полное дерево после дорисовки JS.
+// extractDOMExpr — the final DOM capture expression (spec 5.6): the outerHTML
+// of the root element — the full tree after the JS finishing touches.
 const extractDOMExpr = `document.documentElement.outerHTML`
 
-// extractDOMTruncated — признак обрезки сверхлимитного DOM (R-02):
-// HTML-комментарий в конце документа — анализатор (правила по HTML)
-// и оператор видят, что дерево снято не целиком.
+// extractDOMTruncated — the marker of truncating an over-limit DOM (R-02):
+// an HTML comment at the end of the document — the analyzer (the HTML rules)
+// and the operator see that the tree was not captured in full.
 const extractDOMTruncated = "<!-- crawler: dom truncated -->"
 
-// extractDOMExprLimited — выражение съёма с потолком длины: тяжёлая или
-// враждебная страница (SPA-монстр, раздутый JS) не тянет через CDP строку
-// сверх лимита — обрезка происходит в самом браузере. substring считает
-// UTF-16 единицы, поэтому точный байтовый предел дожимается в Go
+// extractDOMExprLimited — the capture expression with a length cap: a heavy or
+// hostile page (an SPA monster, bloated JS) must not pull a string over the
+// limit through CDP — the truncation happens inside the browser itself. substring counts
+// UTF-16 units, so the exact byte limit is tightened in Go
 // (truncateDOM).
 func extractDOMExprLimited(limit int) string {
 	if limit <= 0 {
@@ -76,41 +76,41 @@ func extractDOMExprLimited(limit int) string {
 	return extractDOMExpr + fmt.Sprintf(".substring(0, %d)", limit)
 }
 
-// truncateDOM — жёсткий байтовый предел итогового DOM в памяти воркера:
-// при MemoryMax=128M и render.contexts=4 неограниченный DOM (плюс
-// transient-буфер chromedp и копии хэша/Put) выбивает cgroup-бюджет
-// OOM-kill'ом. Сверх лимита DOM обрезается и получает признак обрезки;
-// граница среза откатывается на начало многобайтного символа.
+// truncateDOM — the hard byte limit of the final DOM in the worker's memory:
+// at MemoryMax=128M and render.contexts=4 an unlimited DOM (plus
+// the chromedp transient buffer and the hash/Put copies) knocks out the cgroup budget
+// with an OOM kill. Over the limit the DOM is truncated and gets the truncation
+// marker; the cut boundary is rolled back to the start of a multibyte symbol.
 func truncateDOM(dom string, limit int) string {
 	if limit <= 0 || len(dom) <= limit {
 		return dom
 	}
 	cut := limit - len(extractDOMTruncated)
-	// Эквивалентные мутанты строки цикла (T-M09): `cut >= 0` и `cut > -1`
-	// отличаются от `cut > 0` только итерацией при cut == 0 — в ней
-	// проверяется !utf8.RuneStart(dom[0]); для валидного UTF-8 dom[0] —
-	// начало руны, цикл выходит с тем же cut == 0; для невалидного
-	// (dom[0] — байт-продолжение) cut уходит в -1, и ветка cut <= 0 ниже
-	// возвращает то же dom[:limit]. Инкрементер (`cut > 1`) и вырезание
-	// левой половины (`true` — с невалидным UTF-8 уходит в dom[-1]) не
-	// гасим: убиты граничными случаями TestTruncateDOMBoundaries.
+	// Equivalent mutants of the loop line (T-M09): `cut >= 0` and `cut > -1`
+	// differ from `cut > 0` only by the iteration at cut == 0 — there
+	// !utf8.RuneStart(dom[0]) is checked; for a valid UTF-8 dom[0] is
+	// a rune start, the loop exits with the same cut == 0; for an invalid
+	// one (dom[0] is a continuation byte) cut goes to -1, and the cut <= 0 branch below
+	// returns the same dom[:limit]. The incrementer (`cut > 1`) and cutting out
+	// the left half (`true` — with an invalid UTF-8 it goes into dom[-1]) are
+	// not killed here: they are dead via the boundary cases of TestTruncateDOMBoundaries.
 	// mutator-disable-next-line expression/comparison, numbers/decrementer
 	for cut > 0 && !utf8.RuneStart(dom[cut]) {
-		cut-- // не рвать многобайтный символ посередине
+		cut-- // do not tear a multibyte symbol in the middle
 	}
 	if cut <= 0 {
-		return dom[:limit] // вырожденный лимит меньше признака обрезки
+		return dom[:limit] // a degenerate limit smaller than the truncation marker
 	}
 	return dom[:cut] + extractDOMTruncated
 }
 
-// ExtractCookie — cookie итоговой страницы в формате колонки
-// subdomain_results.cookies (jsonb). Форма повторяет запись HTTP-этапа
-// (recordCookie, T-058) — единый контракт хранения: name/value — цели правил
-// анализатора (ТЗ 5.8), атрибуты — те же имена JSON-полей. max_age рендером
-// не заполняется: хранилище браузера (откуда читает CDP) держит только
-// абсолютный срок, относительный Max-Age теряется при сохранении cookie;
-// поле оставлено, чтобы форма записи совпадала с HTTP-этапом полностью.
+// ExtractCookie — a cookie of the final page in the format of the
+// subdomain_results.cookies column (jsonb). The shape mirrors the HTTP stage's
+// record (recordCookie, T-058) — a single storage contract: name/value are the
+// targets of the analyzer rules (spec 5.8), the attributes are the same JSON field
+// names. max_age is not filled in by the render: the browser store (which CDP reads
+// from) keeps only the absolute expiry, a relative Max-Age is lost when the cookie is
+// saved; the field is kept so that the record shape matches the HTTP stage fully.
 type ExtractCookie struct {
 	Name     string `json:"name"`
 	Value    string `json:"value,omitempty"`
@@ -123,8 +123,8 @@ type ExtractCookie struct {
 	SameSite string `json:"same_site,omitempty"`
 }
 
-// extractSameSite — имя атрибута SameSite в кодировке HTTP-этапа
-// (recordSameSite, T-058): не выставлен — пустая строка (omitempty).
+// extractSameSite — the SameSite attribute name in the HTTP stage's encoding
+// (recordSameSite, T-058): not set — an empty string (omitempty).
 func extractSameSite(s network.CookieSameSite) string {
 	switch s {
 	case network.CookieSameSiteLax:
@@ -138,9 +138,9 @@ func extractSameSite(s network.CookieSameSite) string {
 	}
 }
 
-// extractCookieFields — cookie CDP в ExtractCookie. Срок у CDP абсолютный
-// (unix-секунды): session-cookie (без срока) остаётся без expires,
-// отрицательное значение — то же отсутствие срока.
+// extractCookieFields — a CDP cookie into an ExtractCookie. The CDP expiry is
+// absolute (unix seconds): a session cookie (no expiry) stays without expires,
+// a negative value is the same absence of an expiry.
 func extractCookieFields(c *network.Cookie) ExtractCookie {
 	ec := ExtractCookie{
 		Name:     c.Name,
@@ -152,19 +152,19 @@ func extractCookieFields(c *network.Cookie) ExtractCookie {
 		SameSite: extractSameSite(c.SameSite),
 	}
 	if !c.Session && c.Expires > 0 {
-		// Эквивалентный мутант (T-M09): наносекунды в time.Unix ненаблюдаемы
-		// — RFC 3339 секундной гранулярности их отбрасывает (Unix(sec, 0) и
-		// Unix(sec, 1) форматируются одинаково). Граница `Expires > 0`,
-		// вырезание `!c.Session` и секунды закреплены TestExtractCookieFields.
+		// Equivalent mutant (T-M09): the nanoseconds in time.Unix are unobservable
+		// — RFC 3339 of second granularity discards them (Unix(sec, 0) and
+		// Unix(sec, 1) format the same). The `Expires > 0` boundary,
+		// cutting out `!c.Session` and the seconds are pinned by TestExtractCookieFields.
 		// mutator-disable-next-line numbers/incrementer
 		ec.Expires = time.Unix(int64(c.Expires), 0).UTC().Format(time.RFC3339)
 	}
 	return ec
 }
 
-// extractCookiesFromCDP — cookies CDP в запись рендера с детерминированным
-// порядком (name, domain, path): jsonb-набор стабилен независимо от
-// порядка cookie в ответе хранилища. Пустой набор — nil (NULL в jsonb).
+// extractCookiesFromCDP — CDP cookies into the render record with a deterministic
+// order (name, domain, path): the jsonb set is stable regardless of
+// the cookie order in the store's response. An empty set — nil (NULL in jsonb).
 func extractCookiesFromCDP(cs []*network.Cookie) []ExtractCookie {
 	if len(cs) == 0 {
 		return nil
@@ -175,17 +175,17 @@ func extractCookiesFromCDP(cs []*network.Cookie) []ExtractCookie {
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Name != out[j].Name {
-			// Эквивалентный мутант (T-M09): строка достигается только при
-			// разных Name (guard неравенства выше) — для разных строк `<` и
-			// `<=` неразличимы. Финальная тройка (Path ниже) не гасится:
-			// равные пути у неразличимых cookie закреплены тестом
-			// TestExtractCookiesFromCDP.
+			// Equivalent mutant (T-M09): the line is reached only with
+			// different Names (the inequality guard above) — for different strings `<` and
+			// `<=` are indistinguishable. The final one (Path below) is not killed:
+			// equal paths of indistinguishable cookies are pinned by the
+			// TestExtractCookiesFromCDP test.
 			// mutator-disable-next-line expression/comparison
 			return out[i].Name < out[j].Name
 		}
 		if out[i].Domain != out[j].Domain {
-			// Эквивалентный мутант (T-M09): тот же аргумент — guard
-			// неравенства Domain выше оставляет только разные строки.
+			// Equivalent mutant (T-M09): the same argument — the
+			// Domain inequality guard above leaves only different strings.
 			// mutator-disable-next-line expression/comparison
 			return out[i].Domain < out[j].Domain
 		}
@@ -194,15 +194,15 @@ func extractCookiesFromCDP(cs []*network.Cookie) []ExtractCookie {
 	return out
 }
 
-// extractResponseHeaders — заголовки ответа основной навигации в
-// http.Header: единый контракт с HTTP-этапом (subdomain_results.headers,
-// T-058 — канонические имена ключей, значения списком). CDP отдаёт
-// заголовки объектом имя→значение (значения почти всегда строки, числа
-// редки); повторявшиеся заголовки (в первую очередь Set-Cookie) приходят
-// массивом — массив сохраняется поэлементно, как у HTTP-этапа: склейка
-// через запятую необратима (значения cookie содержат запятые —
-// Expires=Wed, 21 Oct 2025 07:28:00 GMT) и расходится с формой jsonb,
-// которую читает анализатор (map[string][]string, T-058/T-069).
+// extractResponseHeaders — the response headers of the main navigation into
+// http.Header: a single contract with the HTTP stage (subdomain_results.headers,
+// T-058 — canonical key names, the values as a list). CDP hands over the
+// headers as a name→value object (the values are almost always strings, numbers
+// are rare); repeated headers (Set-Cookie first of all) arrive
+// as an array — the array is stored element by element, as in the HTTP stage: gluing
+// with a comma is irreversible (cookie values contain commas —
+// Expires=Wed, 21 Oct 2025 07:28:00 GMT) and diverges from the jsonb shape
+// the analyzer reads (map[string][]string, T-058/T-069).
 func extractResponseHeaders(h network.Headers) http.Header {
 	if len(h) == 0 {
 		return nil
@@ -214,10 +214,10 @@ func extractResponseHeaders(h network.Headers) http.Header {
 	return out
 }
 
-// extractHeaderValues — значения заголовка из CDP списком: одиночное
-// значение (string/число) — срез из одного элемента, массив — поэлементно
-// (контракт «значения списком» T-058; рендер повторяет запись HTTP-этапа,
-// где повторяющиеся заголовки — отдельные элементы).
+// extractHeaderValues — header values from CDP as a list: a single
+// value (string/number) — a slice of one element, an array — element by element
+// (the "values as a list" contract of T-058; the render mirrors the HTTP stage's
+// record, where repeated headers are separate elements).
 func extractHeaderValues(v any) []string {
 	arr, ok := v.([]any)
 	if !ok {
@@ -230,8 +230,8 @@ func extractHeaderValues(v any) []string {
 	return out
 }
 
-// extractHeaderString — значение заголовка из CDP в строку (json-декодер
-// даёт string/float64; прочие формы CDP не отдаёт — запасной Sprintf).
+// extractHeaderString — a header value from CDP into a string (the json decoder
+// gives string/float64; CDP does not hand over other shapes — a fallback Sprintf).
 func extractHeaderString(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -240,15 +240,15 @@ func extractHeaderString(v any) string {
 		if x == float64(int64(x)) {
 			return strconv.FormatInt(int64(x), 10)
 		}
-		// Эквивалентный мутант (T-M09): точность -2, как и -1, отрицательна
-		// — реализация Go трактует любую отрицательную точность как
-		// кратчайшую запись (ftoa.go: shortest := prec < 0; документация
-		// strconv специально оговаривает только -1). Гранулярность строки
-		// гасит и инкрементер bitSize 64 → 65 (паника illegal bitSize) —
-		// trade-off §4 docs/mutation-testing.md: класс дефекта прикрыт
-		// декрементером 64 → 63, который не гасится и убит дробным
-		// значением в TestExtractResponseHeaders (вместе с точностью
-		// -1 → 0: «1» вместо «1.25»).
+		// Equivalent mutant (T-M09): a precision of -2, like -1, is negative
+		// — the Go implementation treats any negative precision as
+		// the shortest form (ftoa.go: shortest := prec < 0; the documentation
+		// of strconv specifically mentions only -1). The line granularity
+		// also kills the bitSize 64 → 65 incrementer (an illegal bitSize panic) —
+		// the trade-off of §4 docs/mutation-testing.md: the defect class is covered
+		// by the 64 → 63 decrementer, which is not killed and is dead via the fractional
+		// value in TestExtractResponseHeaders (together with the
+		// -1 → 0 precision: "1" instead of "1.25").
 		// mutator-disable-next-line numbers/incrementer
 		return strconv.FormatFloat(x, 'g', -1, 64)
 	default:
@@ -256,20 +256,21 @@ func extractHeaderString(v any) string {
 	}
 }
 
-// extractCDP — команды CDP съёма результата; структура вместо пакета, чтобы
-// юнит-тесты подменяли поля фейками (тот же приём, что probeFn у Session).
+// extractCDP — the CDP commands of the result capture; a struct instead of a package so
+// that the unit tests substitute the fields with fakes (the same trick as the Session's
+// probeFn).
 type extractCDP struct {
-	// dom — вычисление выражения итогового DOM в контексте вкладки.
+	// dom — evaluating the final DOM expression in the tab's context.
 	dom func(ctx context.Context) (string, error)
-	// cookies — cookies хранилища контекста, применимые к URL.
+	// cookies — the cookies of the context store applicable to the URL.
 	cookies func(ctx context.Context, pageURL string) ([]*network.Cookie, error)
-	// domLimit — потолок длины DOM в байтах, 0 — без лимита: выражение
-	// съёма и truncateDOM (R-02).
+	// domLimit — the DOM length cap in bytes, 0 — no limit: the capture
+	// expression and truncateDOM (R-02).
 	domLimit int
 }
 
-// newExtractCDP — реальные команды CDP (выполняются над контекстом вкладки
-// сессии); domLimit — потолок итогового DOM (Options.MaxDOMBytes).
+// newExtractCDP — the real CDP commands (run over the tab's context of the
+// session); domLimit — the final DOM cap (Options.MaxDOMBytes).
 func newExtractCDP(domLimit int) extractCDP {
 	return extractCDP{
 		domLimit: domLimit,
@@ -290,12 +291,12 @@ func newExtractCDP(domLimit int) extractCDP {
 	}
 }
 
-// extractResult — финальный этап Session.Run (T-064): итоговый DOM и все
-// cookies итоговой страницы в out. DOM обязателен (без него результат не
-// нужен) и ограничен потолком Options.MaxDOMBytes (обрезка с признаком,
-// R-02); cookies снимаются по FinalURL; задачи — только http/https
-// (validateTaskURL, R-09), не-http итоговый URL — оборонительный случай:
-// набора cookies не существует, шаг пропускается без ошибки.
+// extractResult — the final stage of Session.Run (T-064): the final DOM and all
+// cookies of the final page into out. The DOM is mandatory (without it the result is
+// pointless) and bounded by the Options.MaxDOMBytes cap (truncation with the marker,
+// R-02); the cookies are captured by FinalURL; tasks are http/https only
+// (validateTaskURL, R-09); a non-http final URL is a defensive case:
+// no cookie set exists, the step is skipped without an error.
 func (e extractCDP) extractResult(ctx context.Context, out *RenderOutput) error {
 	dom, err := e.dom(ctx)
 	if err != nil {

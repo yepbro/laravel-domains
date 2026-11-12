@@ -2,100 +2,101 @@ package render
 
 import "fmt"
 
-// Автомат поколения браузера (T-263, ТЗ tasks/TZ-fsm.md §3 ФТ-9): единая
-// точка правды о состояниях и переходах поколения «браузер + пул» (слот
-// Manager.b/Manager.p). До T-263 живость поколения сводилась из пяти
-// независимых проверок внутри swapReasonLocked; теперь состояние — один
-// предикат genStateLocked, которым пользуются swapReasonLocked и Alive.
-// Состояние закодировано переменными Manager.b/p/closed ×
-// Browser.lost/ctx (Browser.Alive) × Pool.closed — отдельного поля нет
-// (формализация не переписывает переходы на FSM-фреймворк, ТЗ-fsm §1):
-// предикат — производная, переходы выполняют те же операторы, что и до
-// T-263, поведение не менялось.
+// The browser generation FSM (T-263, the spec tasks/TZ-fsm.md §3 FR-9): the single
+// source of truth on the states and transitions of the "browser + pool" generation
+// (the Manager.b/Manager.p slot). Before T-263 the generation's liveness was folded
+// from five independent checks inside swapReasonLocked; now the state is the one
+// predicate genStateLocked, used by swapReasonLocked and Alive.
+// The state is encoded by the variables Manager.b/p/closed ×
+// Browser.lost/ctx (Browser.Alive) × Pool.closed — there is no separate field
+// (the formalization does not rewrite the transitions onto an FSM framework,
+// TZ-fsm §1):
+// the predicate is a derivative, the transitions are performed by the same
+// operators as before T-263, the behavior did not change.
 //
-// # Состояния
+// # States
 //
-//	Г0 «отсутствует»  слот пуст (m.b == nil, менеджер не закрыт): до
-//	                   первого старта или после неудачного старта (П4).
-//	Г1 «стартующий»   переходное: restartLocked под m.mu вызывает
-//	                   StartBrowser. Существует только для владельца
-//	                   мьютекса: конкурентные acquire/Alive/Start ждут
-//	                   m.mu и наблюдают уже результат (Г2/Г0), поэтому
-//	                   genStateLocked его не возвращает.
-//	Г2 «активный»     браузер жив (Browser.Alive), пул открыт — задачи
-//	                   выполняются. Пороги страниц/памяти — НЕ состояния,
-//	                   а причины плановой замены живого поколения
-//	                   (swapReasonLocked).
-//	Г3 «draining»     пул закрыт (retire): новые задачи — ErrClosed,
-//	                   задачи в полёте дорабатываются фоновой горутиной,
-//	                   браузер гасится её Close. Штатно в этом состоянии
-//	                   живут СМЕНЁННЫЕ поколения (без ссылок из слота);
-//	                   в самом слоте — страховка гонки «поколение сменилось
-//	                   сразу после acquire» и рассинхрона «браузер без
-//	                   пула» (недостижим штатно, b и p ставятся вместе).
-//	Г4 «мёртв»        браузер поколения недоступен (!Browser.Alive):
-//	                   отмена контекста (LostConnection, смерть процесса,
-//	                   Close) либо залипшая отметка зонда lost
-//	                   (T-218/T-226, probeConn).
-//	Г5 «закрыт»       менеджер закрыт (Manager.Close): терминальное —
-//	                   новые поколения не поднимаются, задачи — ErrClosed,
-//	                   зонд — false.
+//	G0 "absent"    the slot is empty (m.b == nil, the manager is not closed): before
+//	               the first start or after a failed start (T4).
+//	G1 "starting"  transient: restartLocked under m.mu calls
+//	               StartBrowser. It exists only for the owner
+//	               of the mutex: concurrent acquire/Alive/Start wait on
+//	               m.mu and observe the result instead (G2/G0), so
+//	               genStateLocked does not return it.
+//	G2 "active"    the browser is alive (Browser.Alive), the pool is open — tasks
+//	               run. The page/memory thresholds are NOT states,
+//	               but reasons for the planned replacement of a live generation
+//	               (swapReasonLocked).
+//	G3 "draining"  the pool is closed (retire): new tasks — ErrClosed,
+//	               in-flight tasks are finished by a background goroutine,
+//	               the browser is killed by its Close. Normally REPLACED
+//	               generations live in this state (with no references from the slot);
+//	               in the slot itself — the guard of the race "the generation was
+//	               replaced right after acquire" and of the desync "a browser without
+//	               a pool" (unreachable normally, b and p are set together).
+//	G4 "dead"      the generation's browser is unavailable (!Browser.Alive):
+//	               a context cancellation (LostConnection, process death,
+//	               Close) or the probe's sticky lost mark
+//	               (T-218/T-226, probeConn).
+//	G5 "closed"    the manager is closed (Manager.Close): terminal —
+//	               new generations are not started, tasks — ErrClosed,
+//	               the probe — false.
 //
-// # Переходы: состояние × событие × охраны × цель × побочные действия
+// # Transitions: state × event × guards × target × side effects
 //
-//	| № | Исходное | Событие | Охраны | Цель | Побочные действия | Исполнитель |
-//	|---|----------|---------|--------|------|-------------------|-------------|
-//	| П1 | Г0, Г4 | потребность в поколении: задача (Run→acquire), зонд (Alive), старт (Start) | менеджер не Г5 | Г1 | — (вход в restartLocked; Г4 — восстановление мёртвого слота, причина «браузер недоступен») | manager.go |
-//	| П2 | Г1 | StartBrowser успешен | слот был без пула (m.p == nil: первый старт или старт после П4) | Г2 | лог «chromium запущен»; счётчик Restarts не растёт | restartLocked |
-//	| П3 | Г1 | StartBrowser успешен | слот имел пул (m.p != nil — замена) | Г2 | retire старого пула синхронно; фоновый Close старого поколения (П7); Restarts+1; лог «chromium перезапущен» с причиной | restartLocked |
-//	| П4 | Г1 | StartBrowser провалился | — | Г0 | старое поколение, если было (m.p != nil), уходит на фоновое закрытие (П7); ошибка — вызывающему (задача/зонд повторят старт) | restartLocked |
-//	| П5 | Г2 | плановая замена: порог страниц (Browser.NeedsRestart) или порог памяти (RSS > 0 и RSS ≥ MemoryThreshold) — проверка перед задачей/зондом | — | Г1 | смена как П3, причина — «порог страниц»/«порог памяти» | swapReasonLocked → restartLocked |
-//	| П6 | Г2 | смерть браузера: отмена контекста, LostConnection (обрыв WebSocket/смерть процесса) или lost зонда (T-218/T-226) | — | Г4 | ошибки задач — класс browser (повтор — Manager.Run); замена — ближайшим П1 | browser.go Alive/probeConn |
-//	| П7 | Г2/Г4 | поколение сменилось (П3/П5/П4) | — | Г3 → исчезло | дрен задач в полёте (каждая ≤ Options.Timeout, ТЗ 3.4), затем закрытие браузера — фон (go Close); слот новое поколение не ждёт | pool.go retire/Close |
-//	| П8 | Г3 (в слоте) | acquire/зонд видит закрытый пул | браузер слота жив | Г1 | замена как П3, причина «пул закрыт»: ошибки ErrClosed задач не копятся до исчерпания попыток | swapReasonLocked |
-//	| П9 | любое, кроме Г5 | Manager.Close | — | Г5 | слот открепляется (b, p = nil); поколение закрывается синхронно вне m.mu (Pool.Close: дрен задач ≤ Options.Timeout, затем браузер); повторный Close безвреден (CAS) | manager.go Close |
+//	| # | From | Event | Guards | Target | Side effects | Executor |
+//	|---|------|-------|--------|--------|--------------|----------|
+//	| T1 | G0, G4 | a generation is needed: a task (Run→acquire), the probe (Alive), a start (Start) | the manager is not G5 | G1 | — (entering restartLocked; G4 — restoring a dead slot, the reason "browser unavailable") | manager.go |
+//	| T2 | G1 | StartBrowser succeeds | the slot had no pool (m.p == nil: the first start or a start after T4) | G2 | the "chromium started" log; the Restarts counter does not grow | restartLocked |
+//	| T3 | G1 | StartBrowser succeeds | the slot had a pool (m.p != nil — a replacement) | G2 | a synchronous retire of the old pool; a background Close of the old generation (T7); Restarts+1; the "chromium restarted" log with the reason | restartLocked |
+//	| T4 | G1 | StartBrowser fails | — | G0 | the old generation, if there was one (m.p != nil), goes to background closing (T7); the error goes to the caller (the task/probe will retry the start) | restartLocked |
+//	| T5 | G2 | a planned replacement: the page threshold (Browser.NeedsRestart) or the memory threshold (RSS > 0 and RSS ≥ MemoryThreshold) — checked before a task/probe | — | G1 | the change as in T3, the reason — "page threshold"/"memory threshold" | swapReasonLocked → restartLocked |
+//	| T6 | G2 | browser death: a context cancellation, LostConnection (a WebSocket drop/process death) or the probe's lost (T-218/T-226) | — | G4 | task errors — the browser class (the retry — Manager.Run); the replacement — by the nearest T1 | browser.go Alive/probeConn |
+//	| T7 | G2/G4 | the generation was replaced (T3/T5/T4) | — | G3 → gone | draining in-flight tasks (each ≤ Options.Timeout, spec 3.4), then closing the browser — in the background (go Close); the slot does not wait for the new generation | pool.go retire/Close |
+//	| T8 | G3 (in the slot) | acquire/the probe sees a closed pool | the slot's browser is alive | G1 | the change as in T3, the reason "pool closed": the tasks' ErrClosed errors do not accumulate until attempts are exhausted | swapReasonLocked |
+//	| T9 | any except G5 | Manager.Close | — | G5 | the slot is detached (b, p = nil); the generation is closed synchronously outside m.mu (Pool.Close: draining tasks ≤ Options.Timeout, then the browser); a repeated Close is harmless (CAS) | manager.go Close |
 //
-// Не-переходы: acquire на Г2 без порогов отдаёт задачу текущему пулу;
-// Browser()/Restarts() читают слот/счётчик под m.mu; дрен сменённого
-// поколения (П7) состояния слота не касается.
+// Non-transitions: acquire on G2 without thresholds hands the task to the current pool;
+// Browser()/Restarts() read the slot/counter under m.mu; draining the replaced
+// generation (T7) does not touch the slot's state.
 //
-// # Причины замены (swapReasonLocked: состояние слота + пороги Г2)
+// # Replacement reasons (swapReasonLocked: the slot's state + the G2 thresholds)
 //
-//	«первый старт»                     Г0
-//	«браузер недоступен»               Г4 (приоритет над пулом: мёртвый
-//	                                   браузер в закрытом пуле — Г4, И1)
-//	«пул закрыт»                       Г3 в слоте (m.p == nil или
-//	                                   Pool.closed)
-//	«порог страниц N (отрендерено M)»  Г2, Pages ≥ RestartEveryPages
-//	«порог памяти N MiB (RSS M MiB)»   Г2, MemoryThreshold > 0 и
-//	                                   RSS ≥ MemoryThreshold (RSS ≤ 0 —
-//	                                   неизвестен, не триггерует)
+//	"first start"                     G0
+//	"browser unavailable"             G4 (priority over the pool: a dead
+//	                                  browser in a closed pool — G4, I1)
+//	"pool closed"                     G3 in the slot (m.p == nil or
+//	                                  Pool.closed)
+//	"page threshold N (rendered M)"   G2, Pages ≥ RestartEveryPages
+//	"memory threshold N MiB (RSS M MiB)"   G2, MemoryThreshold > 0 and
+//	                                  RSS ≥ MemoryThreshold (RSS ≤ 0 —
+//	                                  unknown, does not trigger)
 //
-// # Инварианты
+// # Invariants
 //
-//	И1  Классификация детерминирована приоритетом Г5 > Г0 > Г4 > Г3:
-//	    несколько условий одновременно дают одну строку-причину.
-//	И2  Г1 существует только под m.mu: смена поколения одна, двойного
-//	    старта нет (R-07); читатели сериализуются мьютексом.
-//	И3  Из Г5 переходов нет: acquire — ErrClosed, Alive — false, новое
-//	    поколение не поднимается.
-//	И4  Сменённое поколение (Г3) дорабатывает задачи и закрывается фоном:
-//	    старт нового не ждёт дрена (ТЗ 3.4, T-065).
+//	I1  The classification is deterministic by the priority G5 > G0 > G4 > G3:
+//	    several conditions at once yield one reason line.
+//	I2  G1 exists only under m.mu: the generation change is single, there is no
+//	    double start (R-07); readers are serialized by the mutex.
+//	I3  From G5 there are no transitions: acquire — ErrClosed, Alive — false, a new
+//	    generation is not started.
+//	I4  The replaced generation (G3) finishes its tasks and closes in the background:
+//	    starting a new one does not wait for the drain (spec 3.4, T-065).
 
-// genState — состояние слота поколения браузера менеджера: значения —
-// Г0…Г5 таблицы автомата выше.
+// genState — the state of the manager's browser generation slot: the values are
+// G0…G5 of the FSM table above.
 type genState int
 
 const (
-	genAbsent   genState = iota // Г0 «отсутствует»
-	genStarting                 // Г1 «стартующий» — только внутри restartLocked под m.mu (И2)
-	genActive                   // Г2 «активный»
-	genDraining                 // Г3 «draining»
-	genDead                     // Г4 «мёртв»
-	genClosed                   // Г5 «закрыт»
+	genAbsent   genState = iota // G0 "absent"
+	genStarting                 // G1 "starting" — only inside restartLocked under m.mu (I2)
+	genActive                   // G2 "active"
+	genDraining                 // G3 "draining"
+	genDead                     // G4 "dead"
+	genClosed                   // G5 "closed"
 )
 
-// String — имя состояния автомата (диагностика, тесты).
+// String — the FSM state name (diagnostics, tests).
 func (g genState) String() string {
 	switch g {
 	case genAbsent:
@@ -115,19 +116,20 @@ func (g genState) String() string {
 	}
 }
 
-// genStateLocked — живость/состояние текущего поколения одним значением
-// (предикат автомата T-263, замена пяти независимых проверок). Под m.mu;
-// приоритет ветвления — инвариант И1. Пороги замены живого поколения
-// сюда не входят: это причины, а не состояния (swapReasonLocked).
+// genStateLocked — the liveness/state of the current generation as one value
+// (the T-263 FSM predicate, replacing five independent checks). Under m.mu;
+// the branch priority — invariant I1. The replacement thresholds of a live
+// generation are not included here: those are reasons, not states
+// (swapReasonLocked).
 func (m *Manager) genStateLocked() genState {
 	if m.closed.Load() {
 		return genClosed
 	}
-	// Эквивалентный мутант (T-M08): вырезание проверки m.b == nil
-	// проваливается в !m.b.Alive() — nil-guard Alive возвращает false,
-	// решение о смене поколения то же (Г4 вместо Г0 — обе меняют
-	// поколение); отличается только строка-причина, а она уходит
-	// исключительно в текст slog.Info перезапуска (логирование,
+	// Equivalent mutant (T-M08): cutting out the m.b == nil check falls
+	// through to !m.b.Alive() — the nil-guard of Alive returns false,
+	// the generation change decision is the same (G4 instead of G0 — both change
+	// the generation); only the reason line differs, and it goes
+	// exclusively into the slog.Info text of the restart (logging,
 	// §4 docs/mutation-testing.md).
 	// mutator-disable-next-line branch/if
 	if m.b == nil {
@@ -142,15 +144,15 @@ func (m *Manager) genStateLocked() genState {
 	return genActive
 }
 
-// swapReasonLocked — причина смены поколения, если она нужна:
-// классификация состояния — предикатом автомата (genStateLocked),
-// поверх живого поколения — пороги (activeSwapReasonLocked). Порог
-// памяти проверяется по RSS дерева процессов (Browser.RSS, proc.go);
-// неизвестный RSS (remote-режим dev-стека) не триггерует — там жёсткий
-// потолок держит mem_limit контейнера Chromium (ТЗ 3.2/10.1). Закрытый
-// пул — страховка от гонки «поколение сменилось сразу после acquire»:
-// закрытое поколение заменяется, а ошибки ErrClosed не копятся до
-// исчерпания попыток задачи.
+// swapReasonLocked — the generation change reason, if one is needed:
+// the state classification — by the FSM predicate (genStateLocked),
+// on top of a live generation — the thresholds (activeSwapReasonLocked). The
+// memory threshold is checked by the RSS of the process tree (Browser.RSS,
+// proc.go); an unknown RSS (the dev stack's remote mode) does not trigger — there the hard
+// cap is held by the Chromium container's mem_limit (spec 3.2/10.1). A closed
+// pool — the guard against the race "the generation was replaced right after
+// acquire": the closed generation is replaced, and the ErrClosed errors do not
+// accumulate until the task's attempts are exhausted.
 func (m *Manager) swapReasonLocked() (string, bool) {
 	switch m.genStateLocked() {
 	case genAbsent:
@@ -161,47 +163,47 @@ func (m *Manager) swapReasonLocked() (string, bool) {
 		return "пул закрыт", true
 	case genActive:
 		return m.activeSwapReasonLocked()
-	default: // genClosed — не классифицируется: acquire/Alive/Start
-		// проверяют закрытость раньше (И3); genStarting — только под
-		// m.mu внутри restartLocked (И2), сюда не доходит.
+	default: // genClosed — not classified here: acquire/Alive/Start
+		// check for closure earlier (I3); genStarting — only under
+		// m.mu inside restartLocked (I2), it does not reach here.
 		return "", false
 	}
 }
 
-// activeSwapReasonLocked — причины плановой замены живого поколения
-// (Г2 «активный»: смена — профилактика ресурсных порогов, не реакция на
-// смерть). Порог памяти: RSS читается одним проходом /proc — значение
-// идёт и в проверку, и в сообщение (R-06); контроль отключён — /proc не
-// читается вовсе. Неизвестный RSS (remote-режим) не триггерует.
+// activeSwapReasonLocked — the reasons for the planned replacement of a live
+// generation (G2 "active": the change is prevention via resource thresholds, not a
+// reaction to death). The memory threshold: the RSS is read in one /proc pass — the
+// value goes both into the check and into the message (R-06); control disabled — /proc is
+// not read at all. An unknown RSS (remote mode) does not trigger.
 func (m *Manager) activeSwapReasonLocked() (string, bool) {
 	if m.b.NeedsRestart() {
 		return fmt.Sprintf("порог страниц %d (отрендерено %d)",
 			m.b.opts.RestartEveryPages, m.b.Pages()), true
 	}
 	if m.b.opts.MemoryThreshold > 0 {
-		// Эквивалентны только мутанты левой половины условия (T-M08; тот
-		// же вывод, что у Browser.OverMemory в browser.go): при пороге
-		// >= 1 (guard выше) `rss > 0` неотличимо от `>= 0`/`> -1`/`true`
-		// — rss == 0 и rss == -1 отбрасываются правой половиной (0/-1 >=
-		// порог неверно), rss == 1 недостижим (RSS из /proc кратен
-		// странице). Строчная гранулярность аннотации гасит и двух
-		// убиваемых мутантов правой половины — trade-off §4
-		// docs/mutation-testing.md: вырезание `rss >= порог` (осталось
-		// бы `rss > 0` — перезапуск при любом положительном RSS) и
-		// границу `>= -> >` (равенство RSS == порогу через живой /proc
-		// недетерминированно). Вырезание правой половины закреплено
-		// TestManagerMemoryRestartBoundaries (порог выше живого RSS —
-		// без перезапуска); граница `>= -> >` детерминированного
-		// прикрытия не имеет вовсе (равенство RSS == порогу через живой
-		// /proc недостижимо) — из тестов она закрыта только для копии
-		// выражения в Browser.OverMemory (TestBrowserOverMemory,
-		// SIGSTOP-фиксация RSS).
+		// Only the mutants of the left half of the condition are equivalent
+		// (T-M08; the same conclusion as for Browser.OverMemory in browser.go): at a
+		// threshold >= 1 (the guard above) `rss > 0` is indistinguishable from `>= 0`/`> -1`/`true`
+		// — rss == 0 and rss == -1 are discarded by the right half (0/-1 >=
+		// threshold is false), rss == 1 is unreachable (RSS from /proc is a
+		// multiple of the page). The line granularity of the annotation also kills the
+		// two killable mutants of the right half — the trade-off of §4
+		// docs/mutation-testing.md: cutting out `rss >= threshold` (there would
+		// remain `rss > 0` — a restart at any positive RSS) and
+		// the `>= -> >` boundary (the equality RSS == threshold through a live /proc
+		// is nondeterministic). Cutting out the right half is pinned by
+		// TestManagerMemoryRestartBoundaries (a threshold above the live RSS —
+		// no restart); the `>= -> >` boundary has no deterministic
+		// cover at all (the equality RSS == threshold through a live
+		// /proc is unreachable) — it is covered by tests only for the copy
+		// of the expression in Browser.OverMemory (TestBrowserOverMemory,
+		// the SIGSTOP-pinned RSS).
 		// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer, numbers/incrementer
 		if rss := m.b.RSS(); rss > 0 && rss >= m.b.opts.MemoryThreshold {
 			return fmt.Sprintf("порог памяти %d MiB (RSS %d MiB)",
-				// Логирование (§4 docs/mutation-testing.md): сдвиги и ±1
-				// аргументов меняют только текст сообщения о причине
-				// перезапуска, не решение о нём.
+				// Logging (§4 docs/mutation-testing.md): shifts and ±1
+				// of the arguments change only the text of the restart
+				// reason message, not the decision to restart.
 				// mutator-disable-next-line arithmetic/bitwise, numbers/decrementer, numbers/incrementer
 				m.b.opts.MemoryThreshold>>20, rss>>20), true
 		}
