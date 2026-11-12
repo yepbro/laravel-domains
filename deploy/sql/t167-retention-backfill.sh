@@ -1,57 +1,61 @@
 #!/bin/bash
-# Кампания T-167, путь Б: операционный дренаж накопленного контента и
-# трим jsonb не-находок батчами (runbook docs/runbooks.md §5.3).
+# The T-167 campaign, path B: operational drainage of the accumulated
+# content and trimming the jsonb of non-finds in batches (runbook
+# docs/runbooks.md §5.3).
 #
-# Семантика — та же, что у цикла T-166 (internal/content/retention.go),
-# без изменений кода: критерии отбора (checked_at старше content.retention,
-# не Laravel-находка, не render_pending либо rendered, домен не deleted),
-# охраны UPDATE (повторная проверка возраста + content_hash IS NOT
-# DISTINCT FROM прочитанного), GREATEST(refcount - n, 0), DELETE contents
-# при refcount <= 0. Каждая пачка — отдельная транзакция BEGIN…COMMIT:
-# прерывание (Ctrl-C, рестарт) в любой момент безопасно, незавершённая
-# пачка откатывается целиком; повторный запуск идемпотентен (очищенные
-# строки выпадают из отбора). Параллельно со штатным циклом T-166
-# безопасен (охраны отсекают двойной decref), но бессмыслен — CPU-голод
-# общий, выберите один путь.
+# The semantics are the same as the T-166 loop (internal/content/retention.go),
+# with no code changes: the selection criteria (checked_at older than
+# content.retention, not a Laravel find, not render_pending or rendered, the
+# domain not deleted), the UPDATE guards (an age re-check + content_hash IS
+# NOT DISTINCT FROM the value read), GREATEST(refcount - n, 0), DELETE of
+# contents at refcount <= 0. Each chunk is a separate BEGIN…COMMIT
+# transaction: an interruption (Ctrl-C, a restart) is safe at any moment, an
+# incomplete chunk is rolled back in full; rerunning is idempotent (the
+# trimmed rows drop out of the selection). Running in parallel with the
+# regular T-166 loop is safe (the guards cut off a double decref) but
+# pointless — the CPU starvation is shared; pick one path.
 #
-# Отличия кампании от штатного цикла (постановка T-167): батчи уменьшены
-# под CPU-голодом (T-158 не закрыт), между пачками пауза, перед пачкой —
-# ворота: PSI CPU some avg10 (по умолчанию 95%), глубины q:render/q:analyze
-# двумя уровнями — грубый XLEN (верхняя граница, по умолчанию 100 тыс.) и
-# точный лаг групп потребления (XINFO GROUPS → lag, Redis 7+; недоставленный
-# хвост — именно он держит записи от чистки у цикла T-166, фикс окна
-# q:render/q:analyze). Ворота ждут, а не роняют скрипт.
+# Differences of the campaign from the regular loop (the T-167 assignment):
+# the batches are reduced under CPU starvation (T-158 not closed), a pause
+# between chunks, and gates before a chunk: PSI CPU some avg10 (95% by
+# default), the q:render/q:analyze depths on two levels — a coarse XLEN (an
+# upper bound, 100k by default) and the exact lag of the consumer groups
+# (XINFO GROUPS → lag, Redis 7+; the undelivered tail — it is exactly what
+# keeps the records from being cleaned by the T-166 loop, the q:render/
+# q:analyze window fixation). The gates wait instead of crashing the script.
 #
-# При застое q:render (лаг сильно выше порога — как 23.10, ≈99 тыс.)
-# лаг-ворота не отпустят: скрипт честно остановится по таймауту ворот —
-# дренаж стрима (T-159) вперед, чистка ждущих рендера записей недопустима.
+# With q:render jammed (the lag far above the threshold — like 23.10,
+# ≈99k) the lag gates will not let through: the script stops honestly on the
+# gate timeout — the stream drain (T-159) comes first; cleaning the records
+# waiting for render is not allowed.
 #
-# Запуск на боевом сервере (runbook §5.3): из чекаута репозитория либо
+# Run on the production server (runbook §5.3): from a repository checkout or
 #   ssh root@155.212.174.88 'bash -s' -- < deploy/sql/t167-retention-backfill.sh
-# DSN берётся из CRAWLER_PG_DSN (или стандартных PG* — как runbook §2.5),
-# счётчики — в stdout, итог дублируется в journald (тег crawler-t167).
+# The DSN comes from CRAWLER_PG_DSN (or the standard PG* — like runbook §2.5);
+# the counters go to stdout, the summary is duplicated to journald (the
+# crawler-t167 tag).
 set -euo pipefail
 
 dsn="${CRAWLER_PG_DSN:-}"
-batch="${T167_BATCH:-2000}"            # пачка-транзакция (кампания: меньше дефолта цикла)
-retention="${T167_RETENTION:-6 hours}" # окно жизни, как content.retention
-pause="${T167_PAUSE:-5}"               # пауза между пачками, с
-max_batches="${T167_MAX_BATCHES:-1000}" # страховка: 1000 x 2000 = 2 млн строк
-psi_max="${T167_PSI_MAX:-95}"          # ворота: PSI CPU some avg10, %
-queue_max="${T167_QUEUE_MAX:-100000}"  # ворота: XLEN q:render/q:analyze
-                                      # (грубая верхняя граница глубины)
-render_lag_max="${T167_RENDER_LAG:-1000}"   # ворота: лаг группы q:render
-analyze_lag_max="${T167_ANALYZE_LAG:-1000}" # ворота: лаг группы q:analyze
-gate_max_wait="${T167_GATE_MAX_WAIT:-3600}" # столько ворота ждут до остановки, с
+batch="${T167_BATCH:-2000}"            # a chunk-transaction (campaign: smaller than the loop default)
+retention="${T167_RETENTION:-6 hours}" # the lifetime window, like content.retention
+pause="${T167_PAUSE:-5}"               # the pause between chunks, s
+max_batches="${T167_MAX_BATCHES:-1000}" # a guard: 1000 x 2000 = 2M rows
+psi_max="${T167_PSI_MAX:-95}"          # gates: PSI CPU some avg10, %
+queue_max="${T167_QUEUE_MAX:-100000}"  # gates: XLEN q:render/q:analyze
+                                      # (a coarse upper bound of the depth)
+render_lag_max="${T167_RENDER_LAG:-1000}"   # gates: the q:render group lag
+analyze_lag_max="${T167_ANALYZE_LAG:-1000}" # gates: the q:analyze group lag
+gate_max_wait="${T167_GATE_MAX_WAIT:-3600}" # how long the gates wait before stopping, s
 
 PSQL=(psql -X --no-psqlrc -v ON_ERROR_STOP=1 -Atq)
 [ -n "$dsn" ] && PSQL+=(-d "$dsn")
 
 fail() { echo "ОШИБКА: $*" >&2; exit 2; }
 
-# Валидация подстановок: значения попадают в SQL литералами, поэтому
-# алфавиты закрыты заранее (интервал — буквы/цифры/разделители, без
-# кавычек; остальное — только цифры).
+# Validation of the substitutions: the values reach the SQL as literals, so
+# the alphabets are closed in advance (the interval — letters/digits/
+# separators, no quotes; everything else — digits only).
 [[ "$retention" =~ ^[0-9A-Za-z_[:space:]:.,-]+$ ]] || fail "T167_RETENTION: недопустимые символы: $retention"
 for v in "$batch" "$pause" "$max_batches" "$psi_max" "$queue_max" "$render_lag_max" "$analyze_lag_max" "$gate_max_wait"; do
     [[ "$v" =~ ^[0-9]+$ ]] || fail "ожидается целое число: $v"
@@ -62,14 +66,14 @@ command -v psql >/dev/null 2>&1 || fail "psql не найден"
     || fail "T167_RETENTION не разбирается как interval: $retention"
 "${PSQL[@]}" -c "SELECT 1" >/dev/null || fail "нет соединения с БД (CRAWLER_PG_DSN / PG*)"
 
-# Один запуск: повторный параллельный экземпляр бессмыслен (идемпотентен,
-# но делит CPU) — мягкая блокировка файлом.
+# One instance: a second parallel instance is pointless (idempotent, but it
+# shares the CPU) — a soft file lock.
 exec 9>/tmp/crawler-t167-backfill.lock
 flock -n 9 || fail "уже запущен другой экземпляр (flock /tmp/crawler-t167-backfill.lock)"
 
-# psi_wait — ворота CPU-голода: some avg10 выше порога (замер §12 держал
-# 91–95%) — подождать, пока не отпустит. /proc/pressure нет (старое ядро,
-# контейнер) — предупредить один раз и не блокировать.
+# psi_wait — the CPU-starvation gates: some avg10 above the threshold (the
+# §12 measurement held 91–95%) — wait until it releases. No /proc/pressure
+# (an old kernel, a container) — warn once and do not block.
 psi_missing=0
 psi_wait() {
     local f avg
@@ -87,12 +91,13 @@ psi_wait() {
     return 0
 }
 
-# lag_of — лаг стрима: максимум по группам потребления (XINFO GROUPS →
-# поле lag, Redis 7+; в бою у рабочего стрима одна группа). lag = nil
-# (обрезка срезала недоставленное либо Redis < 7) — лаг недоступен,
-# ответ "unknown": точные ворота по нему невозможны, остаются XLEN.
-# Групп у стрима нет — недоставлено всё содержимое: лаг = XLEN (та же
-# семантика, что глубина гейта T-026 — BackpressureGate.Len).
+# lag_of — the stream lag: the maximum across the consumer groups
+# (XINFO GROUPS → the lag field, Redis 7+; in production a working stream has
+# one group). lag = nil (the trim cut off the undelivered part, or Redis < 7)
+# — the lag is unavailable, the answer is "unknown": exact gates on it are
+# impossible, XLEN remains. No groups on the stream — everything is
+# undelivered: the lag = XLEN (the same semantics as the depth of the T-026
+# gate — BackpressureGate.Len).
 lag_of() {
     local out
     out=$(redis-cli --raw XINFO GROUPS "$1" 2>/dev/null) || return 1
@@ -100,22 +105,23 @@ lag_of() {
         redis-cli --raw XLEN "$1" 2>/dev/null || echo 0
         return
     fi
-    # m == "" — лаг ещё не встречался числом (инициализация отдельной
-    # проверкой: в awk неинициализированная m в сравнении $2+0 > m равна
-    # нулю, и лаг 0 — здоровая очередь — не присвоился бы).
+    # m == "" — the lag has not yet been seen as a number (the initialization
+    # is a separate check: in awk an uninitialized m in the comparison
+    # $2+0 > m equals zero, and a lag of 0 — a healthy queue — would not have
+    # been assigned).
     paste -d' ' - - <<<"$out" \
         | awk '$1 == "lag" && $2 ~ /^[0-9]+$/ { if (m == "" || $2+0 > m) m = $2+0 }
                END { print (m == "" ? "unknown" : m) }'
 }
 
-# queue_wait — ворота стримов, два уровня: XLEN (грубая верхняя граница
-# глубины) и лаг групп (точный недоставленный хвост — именно он держит
-# записи от чистки у цикла T-166: фикс окна q:render/q:analyze). Дефолт
-# порогов лага 1000: приток q:analyze ≈35 сообщ/с (замер §12, 3 млн/сут)
-# — 1000 ≈ полминуты, «потребители практически успевают»; глубже —
-# кампании не место, пусть сначала разберут хвост. redis-cli нет —
-# ворота пропущены (сводка глубин остаётся на операторе: crawlerctl
-# status).
+# queue_wait — the stream gates, two levels: XLEN (a coarse upper bound of
+# the depth) and the group lag (the exact undelivered tail — it is exactly
+# what keeps the records from being cleaned by the T-166 loop: the q:render/
+# q:analyze window fixation). The default lag thresholds of 1000: the
+# q:analyze inflow is ≈35 msg/s (the §12 measurement, 3M/day) — 1000 is about
+# half a minute, "the consumers almost keep up"; deeper — a campaign is out
+# of place, let them triage the tail first. No redis-cli — the gates are
+# skipped (the depth summary stays with the operator: crawlerctl status).
 redis_missing=0
 lag_missing=0
 queue_wait() {
@@ -158,18 +164,19 @@ gates() {
     done
 }
 
-# run_batch — одна пачка-транзакция: курсорная пагинация по PK (стиль
-# retentionSelectSQL), срезание ссылки и jsonb одним UPDATE, уменьшение
-# refcount по агрегированным хэшам, удаление contents без ссылок. Тексты
-# операторов — ручное зеркало retention.go (T-166); отличия только в
-# переносе строк между командами через временные таблицы ON COMMIT DROP
-# (без следов после транзакции) вместо массивов Go.
+# run_batch — one chunk-transaction: cursor pagination by PK (the
+# retentionSelectSQL style), cutting the reference and the jsonb with one
+# UPDATE, decreasing the refcount over the aggregated hashes, deleting
+# contents without references. The statement texts are a manual mirror of
+# retention.go (T-166); the only differences are splitting the work between
+# statements via ON COMMIT DROP temp tables (no traces after the transaction)
+# instead of Go arrays.
 run_batch() {
-    # $1..$4 — курсор (zone, domain, sub, variant)
+    # $1..$4 — the cursor (zone, domain, sub, variant)
     "${PSQL[@]}" -f - <<SQL
 BEGIN;
 
--- Пачка кандидатов: критерии и порядок — retentionSelectSQL (T-166).
+-- The candidate chunk: the criteria and the order — retentionSelectSQL (T-166).
 CREATE TEMP TABLE _t167_batch ON COMMIT DROP AS
 SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, r.content_hash
 FROM subdomain_results AS r
@@ -186,8 +193,8 @@ WHERE r.checked_at < now() - interval '$retention'
 ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant
 LIMIT $batch;
 
--- Срезание ссылки и jsonb одной командой (одна версия строки — один
--- HOT-апдейт); охраны гонок с перезаписью — retentionPurgeSQL (T-166).
+-- Cutting the reference and the jsonb with one statement (one row version —
+-- one HOT update); the overwrite race guards — retentionPurgeSQL (T-166).
 CREATE TEMP TABLE _t167_cut ON COMMIT DROP AS
 WITH purged AS (
     UPDATE subdomain_results AS r
@@ -202,16 +209,16 @@ WITH purged AS (
 )
 SELECT hash FROM purged;
 
--- Уменьшение refcount по фактически срезанным корректным хэшам
--- (агрегированно; GREATEST держит неотрицательным) — retentionDecrefSQL.
+-- Decreasing the refcount over the actually cut, valid hashes
+-- (aggregated; GREATEST keeps it non-negative) — retentionDecrefSQL.
 CREATE TEMP TABLE _t167_dec ON COMMIT DROP AS
 WITH cut AS (
     SELECT hash FROM _t167_cut
     WHERE hash IS NOT NULL AND length(hash) = 16
 ), agg AS (
     SELECT hash, count(*)::int4 AS n FROM cut GROUP BY hash
-    -- детерминированный порядок захвата строчных блокировок contents —
-    -- как сортировка хэшей в retentionDecrease (T-166, стиль T-020)
+    -- a deterministic order of taking the contents row locks —
+    -- like the hash sorting in retentionDecrease (T-166, the T-020 style)
     ORDER BY hash
 ), decref AS (
     UPDATE contents AS c
@@ -222,10 +229,10 @@ WITH cut AS (
 )
 SELECT hash, refcount, len FROM decref;
 
--- Удаление contents, лишившихся последней ссылки (охрана refcount <= 0
--- видит уже новые значения: отдельный оператор после decref). Итоги
--- пачки и курсор следующей (последний кандидат по порядку PK — как
--- RetentionOnce T-166).
+-- Deleting the contents that lost their last reference (the refcount <= 0
+-- guard sees the already-new values: a separate statement after the decref).
+-- The chunk totals and the next chunk's cursor (the last candidate in PK
+-- order — like RetentionOnce of T-166).
 WITH removed AS (
     DELETE FROM contents AS c
     WHERE c.hash IN (SELECT hash FROM _t167_dec WHERE refcount <= 0)
@@ -263,10 +270,10 @@ echo "ворота: PSI some avg10 <= ${psi_max}%, XLEN q:render/q:analyze < $qu
 cz=0 cd=0 cs=0 cv=0
 batches=0
 t_rows=0; t_refs=0; t_bad=0; t_missing=0; t_deleted=0; t_freed=0
-# Код возврата: аварийные остановки (ошибка пачки, таймаут ворот, аномалии
-# учёта) не должны маскироваться нулём — дренаж не завершён, оператор/скрипт
-# цепочки обязан это видеть. Штатные исходы (исчерпание дренажа, потолок
-# max_batches с продолжением повторным запуском) — успех.
+# The return code: emergency stops (a chunk error, a gate timeout, accounting
+# anomalies) must not be masked with zero — the drainage is not finished; the
+# operator/the chain script must see it. Regular outcomes (the drainage
+# exhausted, the max_batches cap with a continuation by rerunning) — success.
 exit_code=0
 while :; do
     if ! gates; then
@@ -290,20 +297,22 @@ while :; do
     echo "пачка $batches: кандидатов=$cand срезано=$trimmed ссылок=$refs удалено contents=$deleted"
     echo "  (${trimmed} строк за $((SECONDS - t0)) с, курсор → ($nz,$nd,$ns,$nv))"
 
-    # Аномалии учёта — стоп-сигнал (аналог retention.go BadHashes/Missing):
-    # refcount по ним не менялся, но рост означает ошибку писателя/учёта.
+    # Accounting anomalies — a stop signal (analogous to retention.go
+    # BadHashes/Missing): the refcount was not changed for them, but growth
+    # means a writer/accounting error.
     if (( bad > 0 || missing > 0 )); then
         echo "ОСТАНОВКА: аномалии учёта (bad_hashes=$bad, missing_refs=$missing) — разберитесь до продолжения (runbook §5.5)"
         exit_code=1
         break
     fi
-    # Неполная пачка — дренаж исчерпан (как RetentionOnce T-166).
+    # An incomplete chunk — the drainage is exhausted (like RetentionOnce of T-166).
     if (( cand < batch )); then
         echo "дренаж исчерпан (кандидатов $cand < $batch)"
         break
     fi
-    # Курсор следующей пачки — тоже числа (при cand >= batch ключ не NULL,
-    # проверка — защита от неожиданного вывода, как у счётчиков выше).
+    # The next chunk's cursor is numbers too (with cand >= batch the keys are
+    # not NULL; the check protects against unexpected output, like the
+    # counters above).
     for v in nz nd ns nv; do
         [[ "${!v}" =~ ^[0-9]+$ ]] || fail "неожидаемый курсор пачки: $line"
     done

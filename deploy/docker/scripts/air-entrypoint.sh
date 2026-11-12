@@ -1,7 +1,7 @@
 #!/bin/sh
-# Точка входа Go-сервисов в dev-режиме.
-# Берёт общий .air.toml из корня репозитория, подставляет имя сервиса
-# из переменной окружения SERVICE и запускает air.
+# The entrypoint of the Go services in dev mode.
+# Takes the shared .air.toml from the repository root, substitutes the
+# service name from the SERVICE environment variable and starts air.
 set -eu
 
 : "${SERVICE:?SERVICE env is required}"

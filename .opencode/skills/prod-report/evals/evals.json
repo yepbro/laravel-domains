@@ -3,26 +3,26 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "Дай отчёт о нагрузке на сервер, скорости работы очередей.",
-      "expected_output": "Отчёт по шаблону скилла выведен в чат полностью и сохранён файлом prod-reports/YYYY-MM-DD-HHMMSS.md (путь назван в ответе): 5 секций, таблицы нагрузка/очереди, lag-остатки (не XLEN), скорости из двух срезов, вердикты-оценки, рекомендации с вопросом перед действиями. Read-only, ничего не перезапущено.",
+      "prompt": "Give a load report for the server and the queue speeds.",
+      "expected_output": "The report per the skill template is output to the chat in full and saved to the file prod-reports/YYYY-MM-DD-HHMMSS.md (the path is named in the reply): 5 sections, the load/queues tables, the lag backlog (not XLEN), the rates from two snapshots, the verdict estimates, recommendations with a question before actions. Read-only, nothing was restarted.",
       "files": []
     },
     {
       "id": 2,
-      "prompt": "Что с продом? Кажется, конвейер затормозил",
-      "expected_output": "Сбор снимка, обнаружение узкого места (например, scheduler inactive или растущий lag) с доказательствами, корневая причина из references/prod-topology.md, вопрос оператору перед исправлением (scheduler может быть остановлен намеренно).",
+      "prompt": "What's up with prod? The pipeline seems to have slowed down",
+      "expected_output": "Snapshot collection, bottleneck detection (e.g., scheduler inactive or a growing lag) with evidence, the root cause from references/prod-topology.md, a question to the operator before fixing (the scheduler may be stopped intentionally).",
       "files": []
     },
     {
       "id": 3,
-      "prompt": "Почему на проду диск заканчивается? Страницы же должны удаляться после рендера",
-      "expected_output": "Разбор дискового расклада (content-паки + PG + логи), объяснение двухфазного освобождения (retention чистит ссылки → часовая компактификация удаляет паки), проверка их логов/метрик http-worker, разбор мифа «после q:render страницы удаляются сразу» (находки хранятся всегда, retention 6ч).",
+      "prompt": "Why is prod running out of disk? Pages are supposed to be deleted after render",
+      "expected_output": "A breakdown of the disk layout (content packs + PG + logs), an explanation of the two-phase freeing (retention clears the references → the hourly compaction deletes the packs), a check of the http-worker logs/metrics for both, a debunk of the myth \"pages are deleted right after q:render\" (finds are always stored, retention 6h).",
       "files": []
     },
     {
       "id": 4,
-      "prompt": "Следи за продом: снимай срез раз в час, можешь сам останавливать и запускать очередь",
-      "expected_output": "Режим standing watch: базовый срез сразу (scripts/hourly-snap.sh — лёгкий, не collect.sh), фоновый таймер sleep 3600 с перезапуском после каждого тика, компактный дифф-отчёт (5–6 строк) в чат без записи в prod-reports на тихих часах, автономия строго по критериям скилла (стоп фронта: OOM ≥1/ч или диск ≥80 %/контент +1 ГБ/ч при стоящем retention; старт: критерий ушёл или inactive без причины), каждое окно остановки — с drain-guard (самозапуск по капу), после рестарта сервера агента — немедленный срез и решение по критериям. Любое действие — с обоснованием в отчёте.",
+      "prompt": "Keep an eye on prod: take a snapshot every hour, you may stop and start the queue yourself",
+      "expected_output": "The standing-watch mode: a baseline snapshot right away (scripts/hourly-snap.sh — light, not collect.sh), a background sleep 3600 timer relaunched after each tick, a compact diff report (5–6 lines) to the chat without writing to prod-reports in quiet hours, autonomy strictly per the skill criteria (front stop: OOM ≥1/h or disk ≥80%/content +1 GB/h with retention stalled; start: the criterion is gone or inactive without a reason), every stop window with drain-guard (self-restart on the cap), after the agent's server restart — an immediate snapshot and a decision per the criteria. Any action — with a justification in the report.",
       "files": []
     }
   ]

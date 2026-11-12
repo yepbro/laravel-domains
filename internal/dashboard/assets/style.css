@@ -1,8 +1,8 @@
 /*
- * style.css — стили операторского дашборда (ТЗД §6.5, T-130):
- * тёмная «консоль», системные шрифты (внешних нет — ТЗД §3.2.2),
- * табличные цифры для счётчиков. Без сборки: только этот файл,
- * подключается страницей /assets/style.css (CSP style-src 'self', §6.3).
+ * style.css — the operator dashboard styles (dashboard spec §6.5, T-130):
+ * a dark "console", system fonts (no external ones — dashboard spec §3.2.2),
+ * tabular figures for the counters. No build: only this file, included by
+ * the page as /assets/style.css (CSP style-src 'self', §6.3).
  */
 
 :root {
@@ -29,7 +29,7 @@ body {
     font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
-/* ---------------------------------------------------------------- шапка */
+/* ---------------------------------------------------------------- header */
 
 .topbar {
     position: sticky;
@@ -90,7 +90,7 @@ body {
     color: var(--warn);
 }
 
-/* ---------------------------------------------------------------- каркас */
+/* ---------------------------------------------------------------- skeleton */
 
 main { display: block; }
 
@@ -117,7 +117,7 @@ section h2 {
     font-size: 12px;
 }
 
-/* ---------------------------------------------------------------- карточки */
+/* ---------------------------------------------------------------- cards */
 
 .cards {
     display: grid;
@@ -155,9 +155,9 @@ section h2 {
     font-size: 12px;
 }
 
-/* прогресс-бары: ширина .bar-fill задаётся из app.js через CSSOM
-   (el.style.width) — CSP style-src 'self' инлайн-стили не пускает,
-   а присвоение свойства CSP не блокирует */
+/* progress bars: the .bar-fill width is set from app.js via CSSOM
+   (el.style.width) — CSP style-src 'self' does not allow inline styles,
+   but property assignment is not blocked by CSP */
 
 .bar {
     height: 6px;
@@ -182,7 +182,7 @@ section h2 {
     font-variant-numeric: tabular-nums;
 }
 
-/* ---------------------------------------------------------------- спарклайны */
+/* ---------------------------------------------------------------- sparklines */
 
 .spark {
     display: block;
@@ -202,7 +202,7 @@ section h2 {
     vector-effect: non-scaling-stroke;
 }
 
-/* ---------------------------------------------------------------- таблицы */
+/* ---------------------------------------------------------------- tables */
 
 .tbl-wrap { overflow-x: auto; }
 
@@ -244,23 +244,23 @@ section h2 {
 
 .hint-time { color: var(--muted); }
 
-/* ---------------------------------------------------------------- очереди (§5.4) */
+/* ---------------------------------------------------------------- queues (§5.4) */
 
 tr.q-warn td { background: rgba(210, 153, 34, 0.08); }
 tr.q-over td { background: rgba(248, 81, 73, 0.10); }
 
 .q-dead-nonzero { color: var(--err); font-weight: 600; }
 
-/* ------------------------------------------------- движки рендера (ТЗ рендера §4.6) */
+/* ------------------------------------------------- render engines (render spec §4.6) */
 
-/* Строка фолбэка панели движков: сводка под таблицей движков. */
+/* The fallback line of the engines panel: a summary under the engines table. */
 .fb {
     margin-top: 8px;
     color: var(--muted);
     font-size: 13px;
 }
 
-/* ---------------------------------------------------------------- зоны (§5.3) */
+/* ---------------------------------------------------------------- zones (§5.3) */
 
 .badge {
     display: inline-block;
@@ -272,7 +272,7 @@ tr.q-over td { background: rgba(248, 81, 73, 0.10); }
 .badge-on { background: rgba(63, 185, 80, 0.15); color: var(--ok); }
 .badge-off { background: rgba(139, 150, 165, 0.15); color: var(--muted); }
 
-/* ------------------------------------------------- статусы доменов (§5.5) */
+/* ------------------------------------------------- domain statuses (§5.5) */
 
 .statusbar {
     display: flex;
@@ -302,7 +302,7 @@ tr.q-over td { background: rgba(248, 81, 73, 0.10); }
     vertical-align: -1px;
 }
 
-/* ------------------------------------------------------ чипы здоровья (§5.8) */
+/* ------------------------------------------------------ health chips (§5.8) */
 
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 
@@ -326,7 +326,7 @@ tr.q-over td { background: rgba(248, 81, 73, 0.10); }
 .chip.down { border-color: rgba(248, 81, 73, 0.5); }
 .chip.down .dot { background: var(--err); }
 
-/* ---------------------------------------------------------------- адаптив */
+/* ---------------------------------------------------------------- responsive */
 
 @media (max-width: 720px) {
     .cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 12px; }

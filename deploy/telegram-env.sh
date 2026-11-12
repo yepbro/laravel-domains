@@ -1,18 +1,19 @@
 #!/bin/bash
-# Доставка Telegram-секретов в EnvironmentFile monitor (T-173; запуск —
-# ops-workflow ops-telegram-env.yml вручную workflow_dispatch: значения
-# живут в секретах GitHub и больше нигде не хранятся, прочитать их из
-# GitHub нельзя — CI единственное место, откуда их можно доставить).
-# Аргументы (передаются по SSH из шага workflow, в логи не печатаются):
+# Delivering the Telegram secrets into the monitor's EnvironmentFile (T-173;
+# launched by the ops workflow ops-telegram-env.yml manually via
+# workflow_dispatch: the values live in GitHub secrets and are stored nowhere
+# else, they cannot be read back from GitHub — CI is the only place they can
+# be delivered from). Arguments (passed over SSH from the workflow step, not
+# printed to the logs):
 #   $1 — TELEGRAM_BOT_TOKEN
 #   $2 — TELEGRAM_CHAT_ID
 #
-# Идемпотентен: существующие ключи заменяются по месту (sed), отсутствующие
-# дописываются; права файла сохраняются (root:crawler 640 — читает только
-# юнит monitor, EnvironmentFile). После записи — рестарт crawler-monitor:
-# EnvironmentFile читается systemd при старте юнита. Результат проверяется
-# по журналу monitor (строка «telegram: доставка алертов включена» из
-# NewTelegramNotifier) — секреты в вывод не попадают.
+# Idempotent: existing keys are replaced in place (sed), missing ones are
+# appended; the file permissions are preserved (root:crawler 640 — only the
+# monitor unit reads it, the EnvironmentFile). After writing — a restart of
+# crawler-monitor: systemd reads the EnvironmentFile at unit start. The
+# result is verified against the monitor's journal (the alert-delivery-
+# enabled line from NewTelegramNotifier) — the secrets never reach the output.
 set -euo pipefail
 
 ENV_FILE=/etc/crawler/crawler.env
@@ -30,8 +31,8 @@ if [ ! -f "$ENV_FILE" ]; then
     exit 4
 fi
 
-# Замена по месту (ключ есть) или дописывание (ключа нет); разделитель |
-# в sed — значения секрета разделителей и перевода строки не содержат.
+# Replace in place (the key exists) or append (no key); the | separator in
+# sed — the secret values contain no separators or newlines.
 upsert() {
     local key="$1" value="$2"
     if grep -q "^${key}=" "$ENV_FILE"; then
@@ -43,21 +44,22 @@ upsert() {
 upsert TELEGRAM_BOT_TOKEN "$token"
 upsert TELEGRAM_CHAT_ID "$chat"
 
-# Права: владелец/группа и режим файла обязан сохраниться (root:crawler
-# 640) — sed -i пересоздаёт файл в tmp той же группы; восстанавливаем
-# явно, случайная замена (umask раннера не действует — локальный root)
-# исключена приписыванием.
+# Permissions: the file's owner/group and mode must be preserved
+# (root:crawler 640) — sed -i recreates the file in tmp with the same group;
+# we restore them explicitly, so an accidental change (the runner's umask
+# does not apply — a local root) is ruled out.
 chown root:crawler "$ENV_FILE"
 chmod 640 "$ENV_FILE"
 
-# Секреты вступают в силу рестартом юнита (EnvironmentFile читается при
-# старте); monitor — служебный сервис без состояния, рестарт безопасен.
+# The secrets take effect on the unit restart (the EnvironmentFile is read
+# at start); monitor is a stateless utility service, a restart is safe.
 systemctl restart "$UNIT"
 
-# Проверка: journal монитора после рестарта содержит строку включения
-# доставки (NewTelegramNotifier, notify.go). 5 с — каркас поднимает
-# рабочую логику почти сразу; без строки не падаем — ран жёлтый по
-# проверке ниже (текст для оператора), состояние видно в journalctl.
+# The check: after the restart the monitor's journal contains the
+# delivery-enabled line (NewTelegramNotifier, notify.go). 5 s — the service
+# framework brings up the working logic almost immediately; without the line
+# we do not fail — the run is yellow on the check below (the text is for the
+# operator), the state is visible in journalctl.
 sleep 5
 if journalctl -u "$UNIT" --since '-2 min' --no-pager | grep -q 'telegram: доставка алертов включена'; then
     echo "telegram-env: секреты доставлены, доставка включена (журнал monitor)"

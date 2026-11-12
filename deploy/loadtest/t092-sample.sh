@@ -1,29 +1,30 @@
 #!/bin/bash
-# T-092/T-093: непрерывный сэмплер метрик нагрузочного прогона на боевом
-# сервере. Запуск (root на сервере):
+# T-092/T-093: a continuous metric sampler of a load run on the production
+# server. Launch (root on the server):
 #
 #   mkdir -p /var/lib/crawler/t092
 #   cp t092-sample.sh /var/lib/crawler/t092/ && chmod +x $_
-#   systemd-run --unit=t092-sampler /var/lib/crawler/t092/t092-sample.sh [интервал_с]
-#   systemctl stop t092-sampler          # останов
+#   systemd-run --unit=t092-sampler /var/lib/crawler/t092/t092-sample.sh [interval_s]
+#   systemctl stop t092-sampler          # stop
 #
-# Выход: /var/lib/crawler/t092/metrics.tsv — по строке на замер; счётчики
-# кумулятивные (counter'ы Prometheus), скорости считаются дельтами при
-# анализе. Память юнитов — MemoryCurrent (байты), размеры — байты.
+# Output: /var/lib/crawler/t092/metrics.tsv — one row per sample; the counters
+# are cumulative (Prometheus counters), the rates are computed as deltas at
+# analysis time. Unit memory — MemoryCurrent (bytes), sizes — bytes.
 #
-# Столбцы этапа 35/36 (движки рендера и фолбэк: fb_*/rend_*/q_render_fb/
-# m_fbworker) до деплоя этапа на проде держат нули: счётчиков в /metrics,
-# глубины q:render-fallback и юнита воркера B ещё нет — это норма, а не
-# деградация (hold/holds держат прошлое значение, mem отдаёт 0).
+# The stage 35/36 columns (render engines and the fallback: fb_*/rend_*/q_render_fb/
+# m_fbworker) hold zeros until the stage is deployed to prod: the counters in
+# /metrics, the q:render-fallback depth and the worker B unit do not exist
+# yet — that is normal, not degradation (hold/holds keep the previous value,
+# mem returns 0).
 set -u
 OUT=/var/lib/crawler/t092/metrics.tsv
 INTERVAL=${1:-15}
 UNITS="crawler-ingest crawler-scheduler crawler-dns-worker crawler-http-worker crawler-render-worker crawler-analyzer crawler-monitor crawler-web crawler-dashboard crawler-chromium crawler-render-fallback-worker.service postgresql@16-main.service redis-server.service unbound.service"
 
-# метрика из экспозиции Prometheus: m <порт> <имя> <лейбл-фильтр>.
-# Пустой ответ (сервис лежит/рестартует) не возвращается — вызывающая
-# сторона держит прошлое значение счётчика (hold-last), чтобы сбой
-#curl не рвал монотонность дельт.
+# a metric from the Prometheus exposition: m <port> <name> <label filter>.
+# An empty response (the service is down/restarting) is not returned — the
+# caller keeps the counter's previous value (hold-last), so a curl failure
+# does not break the monotonicity of the deltas.
 m() { curl -fsS --max-time 3 "127.0.0.1:$1/metrics" 2>/dev/null \
       | awk -v name="$2" -v lbl="$3" '
         index($0, name) == 1 {
@@ -34,35 +35,36 @@ m() { curl -fsS --max-time 3 "127.0.0.1:$1/metrics" 2>/dev/null \
               h = substr(rest, RSTART, RLENGTH); lbl_ok = (index(h, lbl) > 0)
             }
           } else if (substr(rest, 1, 1) == " ") {
-            # за именем обязателен пробел или «{» — префиксные созвучия
-            # (…_total_extra) матчем не считаются
+            # a space or "{" must follow the name — prefix look-alikes
+            # (…_total_extra) do not count as a match
             lbl_ok = (lbl == "")
           }
           if (lbl_ok) { print $NF; exit }
         }'
       }
 
-# mem — MemoryCurrent юнита в байтах; «[not set]» (юнит перезапускается
-# или не существует) и пустой ответ — 0, чтобы строка замера не терялась.
+# mem — a unit's MemoryCurrent in bytes; "[not set]" (the unit is restarting
+# or does not exist) and an empty response — 0, so the sample row is not lost.
 mem() { local v; v=$(systemctl show -p MemoryCurrent --value "$1" 2>/dev/null); \
       case "$v" in ""|"[not set]"|"0") echo 0 ;; *) echo "$v" ;; esac; }
 
-# hold <имя_переменной> <порт> <метрика> <лейбл>: обновляет переменную
-# свежим значением метрики; пустой ответ (сервис лежит/рестартует)
-# оставляет прошлое — счётчик монотонен, сбой curl не рвёт дельты.
-# Вызывать без подстановки команд (держит состояние переменной).
-hold() { # $1 — имя переменной, rest — аргументы m
+# hold <variable name> <port> <metric> <label>: updates the variable with
+# the metric's fresh value; an empty response (the service is down/restarting)
+# keeps the previous one — the counter is monotonic, a curl failure does not
+# break the deltas. Call without command substitution (it holds variable state).
+hold() { # $1 — the variable name, rest — the arguments of m
   local __v
   __v=$(m "$2" "$3" "$4")
   [ -n "$__v" ] && printf -v "$1" '%s' "$__v"
   return 0
 }
 
-# msum — как m, но СУММА всех серий метрики: фолбэк-счётчики этапа 35/36
-# многолейбловые (published{reason}, consumed{result}) — нужна сумма по
-# словарю, а не первая серия. Пустой лейбл-фильтр матчит все серии
-# (у m он матчит только безлейбловую). Пустой ответ не возвращается —
-# вызывающая сторона держит прошлое значение (hold-last), как у m.
+# msum — like m, but the SUM of all the metric's series: the stage 35/36
+# fallback counters are multi-label (published{reason}, consumed{result}) —
+# a sum over the label dictionary is needed, not the first series. An empty
+# label filter matches all series (for m it matches only the label-less one).
+# An empty response is not returned — the caller keeps the previous value
+# (hold-last), like m.
 msum() { curl -fsS --max-time 3 "127.0.0.1:$1/metrics" 2>/dev/null \
       | awk -v name="$2" -v lbl="$3" '
         index($0, name) == 1 {
@@ -80,8 +82,8 @@ msum() { curl -fsS --max-time 3 "127.0.0.1:$1/metrics" 2>/dev/null \
         END { if (found) print s }'
       }
 
-# holds — hold для msum (сумма серий).
-holds() { # $1 — имя переменной, rest — аргументы msum
+# holds — hold for msum (the sum of series).
+holds() { # $1 — the variable name, rest — the arguments of msum
   local __v
   __v=$(msum "$2" "$3" "$4")
   [ -n "$__v" ] && printf -v "$1" '%s' "$__v"
@@ -110,12 +112,13 @@ while :; do
   hold bl_pend  9102 crawler_backlog_domains 'state="pending"'
   hold bl_que   9102 crawler_backlog_domains 'state="queued"'
 
-  # Этап 35/36 — движки рендера и фолбэк (до деплоя на проде сущностей
-  # нет: hold/holds держат нули). Публикации/приостановки экспонирует
-  # воркер A (:9105), потребление и глубина q:render-fallback — сборка
-  # воркера B (:9120); движки — метка engine у записей воркера A.
-  holds fb_pub        9105 crawler_render_fallback_published_total ''  # сумма по reason
-  holds fb_cons       9120 crawler_render_fallback_consumed_total ''   # сумма по result
+  # Stage 35/36 — render engines and the fallback (before the prod deploy
+  # the entities do not exist: hold/holds keep zeros). Publications/
+  # suspensions are exposed by worker A (:9105); consumption and the
+  # q:render-fallback depth — the worker B build (:9120); engines — the
+  # engine label on worker A's records.
+  holds fb_pub        9105 crawler_render_fallback_published_total ''  # the sum over reason
+  holds fb_cons       9120 crawler_render_fallback_consumed_total ''   # the sum over result
   hold  fb_susp_gate   9105 crawler_render_fallback_suspended_total 'reason="gate"'
   hold  fb_susp_budget 9105 crawler_render_fallback_suspended_total 'reason="budget"'
   hold  rend_chromium  9105 crawler_render_records_total 'engine="chromium"'

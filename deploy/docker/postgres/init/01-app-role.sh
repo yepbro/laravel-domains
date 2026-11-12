@@ -1,14 +1,16 @@
 #!/bin/sh
-# Роль приложения + права на БД (ТЗ 4.1: init-скрипты создают БД, роль, расширения).
-# Выполняется postgres-entrypoint от имени POSTGRES_ADMIN_USER при первом старте.
+# The application role + DB grants (spec 4.1: the init scripts create the DB,
+# the role, the extensions). Run by the postgres entrypoint as
+# POSTGRES_ADMIN_USER on the first start.
 #
-# Имя роли и пароль передаются psql-переменными и квотируются самим psql
-# (:'var' — SQL-литерал, :"var" — идентификатор, format %L/%I — в генерируемом
-# операторе): спецсимволы пароля (', \, $) не ломают SQL и не создают пароль,
-# отличный от ожидаемого приложением. CREATE ROLE не имеет IF NOT EXISTS,
-# поэтому оператор генерируется условно и исполняется \gexec (0 строк —
-# роль существует — ничего не исполняется); безусловный ALTER идемпотентно
-# доводит пароль.
+# The role name and the password are passed as psql variables and quoted by
+# psql itself (:'var' — an SQL literal, :"var" — an identifier, format %L/%I —
+# in the generated statement): password special characters (', \, $) do not
+# break the SQL and do not produce a password different from the one the
+# application expects. CREATE ROLE has no IF NOT EXISTS, so the statement is
+# generated conditionally and executed via \gexec (0 rows — the role exists —
+# nothing is executed); the unconditional ALTER brings the password up to
+# date idempotently.
 set -e
 
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \

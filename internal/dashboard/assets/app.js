@@ -1,34 +1,35 @@
 /*
- * app.js — клиент операторского дашборда (ТЗД §5, §6.4–6.5, T-130):
- * периодический опрос GET /api/status и рендер секций снимка. Без
- * зависимостей и сборки (ТЗД §3.2.2 — окружение без интернета; CSP
- * §6.3 пускает только свои скрипты и соединения), стиль landing.js.
+ * app.js — the operator dashboard client (dashboard spec §5, §6.4–6.5, T-130):
+ * periodic polling of GET /api/status and rendering of the snapshot sections.
+ * No dependencies or build (dashboard spec §3.2.2 — an environment without the
+ * internet; CSP §6.3 allows only same-origin scripts and connections), the
+ * landing.js style.
  *
- *  - период опроса — meta[name=dashboard-refresh] в page.html (секунды,
- *    дефолт 5); он не обязан совпадать с dashboard.refresh сервера:
- *    клиент показывает последний готовый снимок;
- *  - спарклайны — SVG polyline по истории опросов в памяти (~120 точек,
- *    ≈10 минут при 5 с) для трёх скоростей и глубин очередей;
- *  - 401 — остановка опроса и location.reload(): fetch не показывает
- *    браузерный Basic-диалог, а повторный запрос самого документа
- *    получает WWW-Authenticate — браузер предлагает повторный вход
- *    (кэшированные креды переотправит молча) — §6.4;
- *  - «н/д» — деградировавшие секции (null + карта errors, §5.9),
- *    значения без окна (скорость/ETA) и «до первого снимка» (503).
+ *  - the poll period — meta[name=dashboard-refresh] in page.html (seconds,
+ *    default 5); it does not have to match the server's dashboard.refresh:
+ *    the client shows the last ready snapshot;
+ *  - sparklines — an SVG polyline over the in-memory polling history
+ *    (~120 points, ≈10 minutes at 5 s) for the three rates and queue depths;
+ *  - 401 — stop polling and location.reload(): fetch does not show the
+ *    browser's Basic dialog, and a repeated request for the document itself
+ *    receives WWW-Authenticate — the browser offers a re-login (it will
+ *    resend the cached credentials silently) — §6.4;
+ *  - "n/a" — degraded sections (null + the errors map, §5.9), values without
+ *    a window (rate/ETA) and "until the first snapshot" (503).
  *
- * Все значения DOM пишутся через textContent/createElement — разметки
- * из данных нет; динамические стили (ширины баров, цвета сегментов) —
- * только присвоением свойств CSSOM, которое CSP style-src не блокирует.
+ * All DOM values are written via textContent/createElement — no markup comes
+ * from the data; dynamic styles (bar widths, segment colors) — only CSSOM
+ * property assignment, which CSP style-src does not block.
  */
 (function () {
     'use strict';
 
     var ND = 'н/д';
-    var HISTORY_LIMIT = 120; // ~10 минут истории при периоде 5 с (§6.4)
+    var HISTORY_LIMIT = 120; // ~10 minutes of history at a 5 s period (§6.4)
 
-    // Легенда статусов ТЗ 6.2 в порядке model.Statuses (порядок ключей
-    // statuses снимка тот же; здесь — порядок полосы и ru-подписи,
-    // неизвестный статус получает резервный цвет и своё имя).
+    // The status legend of spec 6.2 in the model.Statuses order (the snapshot's
+    // statuses key order is the same; here — the band order and the ru labels;
+    // an unknown status gets a fallback color and its own name).
     var STATUS_ORDER = ['new', 'not_delegated', 'delegated_no_address', 'no_http',
         'alive', 'temp_error', 'deleted', 'invalid'];
     var STATUS_LABEL = {
@@ -53,21 +54,21 @@
     };
     var STATUS_FALLBACK_COLOR = '#6e7681';
 
-    // Рабочие стримы в порядке вывода (status.Streams ← queue.AllStreams,
-    // ТЗ 4.2; q:render-fallback — очередь фолбэка рендера, T-237); q:dead —
-    // отдельная строка с собственной подсветкой (ТЗД §5.4).
+    // Working streams in the output order (status.Streams ← queue.AllStreams,
+    // spec 4.2; q:render-fallback — the render fallback queue, T-237); q:dead —
+    // a separate row with its own highlight (dashboard spec §5.4).
     var STREAM_DEAD = 'q:dead';
     var STREAMS = ['q:dns', 'q:http', 'q:render', 'q:render-fallback', 'q:analyze', STREAM_DEAD];
 
-    // Порог подсветки очередей: глубина рабочего стрима считается
-    // приближающейся к его эффективному watermark от 90 % (§5.4
-    // «при приближении»). Пороги приходят в queue_watermarks снимка —
-    // по стриму, с клампом по MAXLEN (как у алерта монитора).
+    // The queue highlight threshold: a working stream's depth is considered
+    // approaching its effective watermark from 90% (§5.4 "approaching").
+    // The thresholds arrive in the snapshot's queue_watermarks — per stream,
+    // clamped by MAXLEN (like the monitor's alert).
     var WATERMARK_WARN = 0.9;
 
     var SVG_NS = 'http://www.w3.org/2000/svg';
 
-    // ------------------------------------------------------------ период опроса
+    // ------------------------------------------------------------ poll period
 
     var refreshSecs = 5;
     var meta = document.querySelector('meta[name="dashboard-refresh"]');
@@ -78,16 +79,16 @@
     var refreshLabel = document.getElementById('refresh-secs');
     if (refreshLabel) refreshLabel.textContent = String(refreshSecs);
 
-    // ------------------------------------------------------------ история
+    // ------------------------------------------------------------ history
 
     var hist = {
         dps: [],
         rps: [],
         renders: [],
-        queues: {} // stream → [глубина]
+        queues: {} // stream → [depth]
     };
 
-    // ------------------------------------------------------------ утилиты
+    // ------------------------------------------------------------ utilities
 
     function el(tag, cls, text) {
         var node = document.createElement(tag);
@@ -100,14 +101,14 @@
         return typeof v === 'number' && isFinite(v);
     }
 
-    // fmtInt — группировка разрядов («1 234 567»); null/undefined — «н/д».
+    // fmtInt — thousands grouping ("1,234,567"); null/undefined — "n/a".
     function fmtInt(v) {
         if (!num(v)) return ND;
         return v.toLocaleString('ru-RU');
     }
 
-    // pluRu — форма русского множественного числа (1 пачка, 2 пачки,
-    // 5 пачек): подсказка порогов называет единицу глубины q:dns.
+    // pluRu — the Russian plural form (1 chunk, 2 chunks, 5 chunks): the
+    // watermark hint names the q:dns depth unit.
     function pluRu(n, one, few, many) {
         var m10 = n % 10;
         var m100 = n % 100;
@@ -116,7 +117,8 @@
         return many;
     }
 
-    // fmtRate — скорость: крупная — целым, мелкая — до трёх знаков.
+    // fmtRate — a rate: large values as an integer, small ones with up to
+    // three decimals.
     function fmtRate(v) {
         if (!num(v)) return ND;
         if (v >= 100) return Math.round(v).toLocaleString('ru-RU');
@@ -124,13 +126,13 @@
         return String(v.toFixed(3)).replace('.', ',');
     }
 
-    // fmtPct — проценты с запятой.
+    // fmtPct — percentages with a decimal comma.
     function fmtPct(v) {
         return String(v.toFixed(1)).replace('.', ',') + '%';
     }
 
-    // fmtBytes — человеко-читаемые байты (1,2 ГиБ / 850 МиБ / 512 КиБ),
-    // как alertBytes монитора; null/undefined — «н/д».
+    // fmtBytes — human-readable bytes (1.2 GiB / 850 MiB / 512 KiB), like the
+    // monitor's alertBytes; null/undefined — "n/a".
     function fmtBytes(v) {
         if (!num(v)) return ND;
         var units = [[1 << 30, 'ГиБ'], [1 << 20, 'МиБ'], [1 << 10, 'КиБ']];
@@ -142,8 +144,8 @@
         return v + ' Б';
     }
 
-    // fmtDur — человекочитаемый интервал, как status.FormatDuration CLI:
-    // «45с», «13м», «5ч 20м», «3д 4ч».
+    // fmtDur — a human-readable duration, like the CLI's status.FormatDuration:
+    // "45s", "13m", "5h 20m", "3d 4h".
     function fmtDur(sec) {
         if (!num(sec)) return ND;
         if (sec < 60) return sec + ' с';
@@ -153,7 +155,7 @@
         return Math.floor(sec / 86400) + ' д ' + Math.floor((sec % 86400) / 3600) + ' ч';
     }
 
-    // fmtTime — RFC3339 снимка в локальное время оператора.
+    // fmtTime — the snapshot's RFC3339 stamp into the operator's local time.
     function fmtTime(iso) {
         if (!iso) return ND;
         var d = new Date(iso);
@@ -172,13 +174,13 @@
         }
     }
 
-    // errTitle — причина деградации секции для подписи «н/д» (§5.9).
+    // errTitle — the reason a section degraded, for the "n/a" caption (§5.9).
     function errTitle(snap, section) {
         var reason = snap && snap.errors ? snap.errors[section] : undefined;
         return reason ? ('секция недоступна: ' + reason) : undefined;
     }
 
-    // ndRow — строка-плейсхолдер «н/д» секции таблицы.
+    // ndRow — the "n/a" placeholder row of a table section.
     function ndRow(body, colSpan, title) {
         var row = el('tr');
         var td = el('td', 'nd', ND);
@@ -188,11 +190,11 @@
         body.appendChild(row);
     }
 
-    // ------------------------------------------------------------ спарклайны
+    // ------------------------------------------------------------ sparklines
 
-    // drawSpark — polyline по истории: нормировка в систему координат
-    // viewBox контейнера; меньше двух точек — пусто (лента только
-    // началась). Плоский ряд рисуется по центру (min == max).
+    // drawSpark — a polyline over the history: normalized into the container's
+    // viewBox coordinate system; fewer than two points — empty (the tape has
+    // just started). A flat series is drawn at the center (min == max).
     function drawSpark(svg, values) {
         if (!svg) return;
         var poly = svg.querySelector('polyline');
@@ -224,15 +226,15 @@
         poly.setAttribute('points', points.join(' '));
     }
 
-    // pushSeries — точка в историю (~120 последних); null пропускает
-    // разрыв (секция деградировала — точки нет).
+    // pushSeries — a point into the history (~120 latest); null skips a gap
+    // (the section degraded — no point).
     function pushSeries(series, v) {
         if (!num(v)) return;
         series.push(v);
         if (series.length > HISTORY_LIMIT) series.shift();
     }
 
-    // ------------------------------------------------------------ карточки (§5.1–5.2)
+    // ------------------------------------------------------------ cards (§5.1–5.2)
 
     function renderCards(snap) {
         var tot = snap.totals;
@@ -285,7 +287,7 @@
         drawSpark(document.getElementById('spark-renders'), hist.renders);
     }
 
-    // ------------------------------------------------------------ Laravel-карточка (§5.6)
+    // ------------------------------------------------------------ Laravel card (§5.6)
 
     function renderLaravelCard(snap) {
         var l = snap.laravel;
@@ -298,7 +300,7 @@
         }
     }
 
-    // ------------------------------------------------------------ очереди (§5.4)
+    // ------------------------------------------------------------ queues (§5.4)
 
     function renderQueues(snap) {
         var body = document.getElementById('queues-body');
@@ -308,19 +310,20 @@
 
         var queues = snap.queues;
 
-        // Эффективные пороги backpressure — по стриму (queue_watermarks:
-        // кламп по MAXLEN, единый расчёт с гейтом и алертом монитора).
-        // Сумма глубин против одного порога не осмысленна: пороги
-        // стримов различаются, а единицы глубин тоже (q:dns — пачки).
-        // Подсказка — данные конфигурации: видна оператору и при «н/д»
-        // глубин (деградации секции очередей).
+        // Effective backpressure thresholds — per stream (queue_watermarks:
+        // clamped by MAXLEN, one calculation shared with the gate and the
+        // monitor's alert). A sum of depths against a single threshold is
+        // meaningless: the stream thresholds differ, and so do the depth
+        // units (q:dns is chunks). The hint is configuration data: visible
+        // to the operator even when the depths are "n/a" (a degraded queues
+        // section).
         var watermarks = snap.queue_watermarks || {};
         var wmParts = [];
         STREAMS.forEach(function (s) {
             if (s === STREAM_DEAD) return;
             var wm = watermarks[s] || 0;
             if (wm > 0) {
-                // q:dns считается пачками, штучные стримы — записями.
+                // q:dns is counted in chunks, the per-item streams in records.
                 wmParts.push(s + ' ' + fmtInt(wm) +
                     (s === 'q:dns' ? ' ' + pluRu(wm, 'пачка', 'пачки', 'пачек') : ''));
             }
@@ -338,7 +341,7 @@
 
         var streams = STREAMS.slice();
         Object.keys(queues).forEach(function (s) {
-            if (streams.indexOf(s) < 0) streams.push(s); // новые стримы не теряем
+            if (streams.indexOf(s) < 0) streams.push(s); // do not drop new streams
         });
 
         streams.forEach(function (s) {
@@ -348,15 +351,15 @@
 
             var row = el('tr');
             if (s !== STREAM_DEAD) {
-                // Подсветка — по своему порогу каждого рабочего стрима
-                // (q:dead гейтом не управляется: мёртвые задачи — разбор
-                // оператора, не отставание конвейера).
+                // Highlighting — by each working stream's own threshold
+                // (q:dead is not driven by the gate: dead tasks are an
+                // operator triage matter, not pipeline lag).
                 var wm = watermarks[s] || 0;
                 if (wm > 0) {
                     if (depth >= wm) {
-                        row.className = 'q-over'; // у порога: backpressure вот-вот
+                        row.className = 'q-over'; // at the threshold: backpressure is imminent
                     } else if (depth >= WATERMARK_WARN * wm) {
-                        row.className = 'q-warn'; // приближение (≥90 %)
+                        row.className = 'q-warn'; // approaching (≥90%)
                     }
                 }
             }
@@ -385,13 +388,14 @@
         });
     }
 
-    // ------------------------------------------------------------ движки рендера (ТЗ рендера §4.6)
+    // ------------------------------------------------------------ render engines (render spec §4.6)
 
-    // renderRender — панель движков: темп/успешность/тарпит-рейт/RSS по
-    // engine (метки метрик этапа, T-235/S-P2-4) и фолбэк — fallback-рейт
-    // (доля published от страниц этапа), consumed/глубина
-    // q:render-fallback. Секция null — адреса не заданы («н/д» без
-    // ошибки) или экспозиции недоступны (причина — в errors).
+    // renderRender — the engines panel: the rate/success/tarpit rate/RSS per
+    // engine (the stage's metric labels, T-235/S-P2-4) and the fallback — the
+    // fallback rate (the published share of stage pages), consumed/depth of
+    // q:render-fallback. A null section — the addresses are not set ("n/a"
+    // without an error) or the exposures are unreachable (the reason is in
+    // errors).
     function renderRender(snap) {
         var body = document.getElementById('render-engines-body');
         var fb = document.getElementById('render-fallback');
@@ -433,8 +437,9 @@
                         '(движко-независимые DNS/cert-финализации не входят)';
                 }
                 row.appendChild(pct);
-                // Тарпит-рейт — доля тарпит-финализаций движка (T-148 —
-                // движко-зависимый отказ, S-P2-4); тултип называет счётчик.
+                // Tarpit rate — the share of the engine's tarpit finalizations
+                // (T-148 — an engine-dependent rejection, S-P2-4); the tooltip
+                // names the counter.
                 var tar = el('td', 'num',
                     num(e.tarpit_pct) ? fmtPct(e.tarpit_pct) : '—');
                 if (num(e.tarpit_pct)) {
@@ -444,8 +449,9 @@
                     tar.title = 'атрибутированных движком завершений ещё нет';
                 }
                 row.appendChild(tar);
-                // RSS — сумма памяти воркеров движка (S-P3-2); 0 —
-                // экспозиция без метки engine (сборка старее T-235).
+                // RSS — the sum of the engine workers' memory (S-P3-2); 0 —
+                // an exposure without the engine label (a build older than
+                // T-235).
                 var rss = el('td', 'num', e.rss_bytes > 0 ? fmtBytes(e.rss_bytes) : '—');
                 rss.title = e.rss_bytes > 0
                     ? 'process_resident_memory_bytes воркеров движка'
@@ -455,14 +461,14 @@
             });
         }
 
-        // Фолбэк: fallback-рейт (доля published от страниц этапа —
-        // контрольные точки ТЗ §5.3), published (воркер A) / consumed по
-        // исходам (воркер B) / глубина q:render-fallback. Темпы — 0 до
-        // первой пары проходов; сравнение темпов публикаций и
-        // потребления — диагностика «воркер B не успевает» (алерт
-        // render_fallback_depth). Исходы consumed — через || 0: серии
-        // предсозданы нулями с T-250, старая экспозиция без серии — 0,
-        // не «н/д» (S-P3-2).
+        // The fallback: the fallback rate (the published share of stage pages —
+        // the spec §5.3 checkpoints), published (worker A) / consumed by
+        // outcome (worker B) / the depth of q:render-fallback. The rates are 0
+        // until the first pair of passes; comparing the publication and
+        // consumption rates diagnoses "worker B cannot keep up" (the
+        // render_fallback_depth alert). The consumed outcomes go through || 0:
+        // the series are pre-created with zeros since T-250; an old exposure
+        // without a series is 0, not "n/a" (S-P3-2).
         var f = r.fallback || {};
         var by = f.consumed_by_result || {};
         var parts = [];
@@ -495,7 +501,7 @@
         }
     }
 
-    // ------------------------------------------------------------ зоны (§5.3)
+    // ------------------------------------------------------------ zones (§5.3)
 
     function renderZones(snap) {
         var body = document.getElementById('zones-body');
@@ -516,7 +522,7 @@
             var row = el('tr');
             var name = el('td', 'mono', z.name);
             if (z.name_unicode && z.name_unicode !== z.name) {
-                name.title = z.name_unicode; // unicode-форма — только отображение (§5.3)
+                name.title = z.name_unicode; // the unicode form is display-only (§5.3)
             }
             row.appendChild(name);
 
@@ -548,7 +554,7 @@
         });
     }
 
-    // ------------------------------------------------------------ статусы (§5.5)
+    // ------------------------------------------------------------ statuses (§5.5)
 
     function renderStatuses(snap) {
         var barEl = document.getElementById('statusbar');
@@ -581,7 +587,7 @@
 
             if (count > 0) {
                 var seg = el('div', 'seg');
-                seg.style.background = color; // CSSOM: CSP-безопасно
+                seg.style.background = color; // CSSOM: CSP-safe
                 seg.style.flexGrow = String(count / total);
                 seg.title = label + ': ' + fmtInt(count);
                 barEl.appendChild(seg);
@@ -601,7 +607,7 @@
         legend.appendChild(summary);
     }
 
-    // ------------------------------------------------------------ находки (§5.6)
+    // ------------------------------------------------------------ finds (§5.6)
 
     function renderLaravel(snap) {
         var body = document.getElementById('laravel-body');
@@ -664,7 +670,7 @@
         });
     }
 
-    // ------------------------------------------------------------ здоровье (§5.8)
+    // ------------------------------------------------------------ health (§5.8)
 
     function renderHealth(snap) {
         var box = document.getElementById('health');
@@ -672,7 +678,7 @@
         box.textContent = '';
 
         if (!snap.health) {
-            // Не ошибка: пробы не заданы (dashboard.probes пуст, §5.9).
+            // Not an error: no probes are set (dashboard.probes is empty, §5.9).
             var nd = el('span', 'nd', ND);
             nd.title = 'пробы не заданы (dashboard.probes пуст)';
             box.appendChild(nd);
@@ -683,12 +689,12 @@
             var chip = el('span', 'chip' + (p.up ? '' : ' down'));
             chip.appendChild(el('span', 'dot'));
             chip.appendChild(document.createTextNode(p.name));
-            if (!p.up && p.error) chip.title = p.error; // причина down
+            if (!p.up && p.error) chip.title = p.error; // the down reason
             box.appendChild(chip);
         });
     }
 
-    // ------------------------------------------------------------ цикл опроса
+    // ------------------------------------------------------------ poll loop
 
     function setConn(text, cls) {
         var conn = document.getElementById('conn');
@@ -716,18 +722,18 @@
         fetch('/api/status', {headers: {Accept: 'application/json'}})
             .then(function (resp) {
                 if (resp.status === 401) {
-                    // §6.4: сессия/креды больше не проходят. fetch не
-                    // вызывает браузерный Basic-диалог — перезагрузка
-                    // страницы переносит 401 на сам документ: браузер
-                    // либо молча переотправит кэшированные креды, либо
-                    // покажет диалог повторного входа.
+                    // §6.4: the session/credentials no longer pass. fetch does
+                    // not trigger the browser's Basic dialog — reloading the
+                    // page moves the 401 onto the document itself: the browser
+                    // either silently resends the cached credentials or shows
+                    // the re-login dialog.
                     if (timer) clearInterval(timer);
                     setConn('требуется повторный вход…', 'conn-err');
                     location.reload();
                     return null;
                 }
                 if (resp.status === 503) {
-                    // §5.9: первый снимок ещё не собран.
+                    // §5.9: the first snapshot has not been collected yet.
                     setConn('снимок готовится…', 'conn-wait');
                     return null;
                 }

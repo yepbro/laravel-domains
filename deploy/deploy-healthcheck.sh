@@ -1,28 +1,28 @@
 #!/bin/bash
-# Проверка боевого набора после деплоя (T-135): все юниты active, healthz
-# зелёный на всех портах метрик (9100…9108), crawlerctl отвечает.
-# Запускается CI (.github/workflows/deploy.yml) по SSH; exit 0 — всё зелёное.
+# Post-deploy check of the production set (T-135): all units active, healthz
+# green on all metric ports (9100…9108), crawlerctl responding.
+# Run by CI (.github/workflows/deploy.yml) over SSH; exit 0 — everything green.
 #
-# Повторы вместо одиночной пробы (инциденты деплоя 23.10, утро и вечер:
-# оба ранна откатывались на «healthz 9104 FAIL» при живом воркере —
-# readiness пингует БД с 1-секундным таймаутом (service.go, healthzHandler)
-# и не успевал за один 5-секундный curl через 8 секунд после рестарта:
-# стартовый шторм соединений к БД + загрузка слотов воркера под
-# MemoryHigh-троттлингом. Юнит при этом работоспособен — откат не требовался).
-# Каждая проба повторяется до успеха в общем бюджете READY_DEADLINE.
+# Retries instead of a single probe (deploy incidents of 23.10, morning and
+# evening: both runs rolled back on "healthz 9104 FAIL" with the worker alive —
+# readiness pings the DB with a 1-second timeout (service.go, healthzHandler)
+# and did not make it within one 5-second curl 8 seconds after the restart:
+# the initial connection storm to the DB + worker slot loading under
+# MemoryHigh throttling. The unit was otherwise operational — no rollback was
+# needed). Each probe repeats until success within the shared READY_DEADLINE budget.
 
 set -euo pipefail
 
-READY_DEADLINE=${READY_DEADLINE:-300} # бюджет готовности healthz, с
-PROBE_TIMEOUT=5                       # curl -m, с
-PROBE_PAUSE=5                         # пауза между попытками, с
+READY_DEADLINE=${READY_DEADLINE:-300} # the healthz readiness budget, s
+PROBE_TIMEOUT=5                       # curl -m, s
+PROBE_PAUSE=5                         # the pause between attempts, s
 
-# Юниты с их портами healthz (docs/deploy.md §5; chromium — только
-# активность юнита, порта метрик нет). Юнит, отключённый на сервере
-# оператором (systemctl disable/mask — например, crawler-scheduler при
-# приостановке постановки задач), исключается из проверки целиком:
-# планово выключенный сервис — не сбой деплоя, healthcheck не должен
-# авто-откатывать релиз из-за него.
+# Units with their healthz ports (docs/deploy.md §5; chromium — unit
+# activity only, no metric port). A unit disabled on the server by the
+# operator (systemctl disable/mask — e.g., crawler-scheduler when enqueueing
+# is suspended) is excluded from the check entirely: a deliberately stopped
+# service is not a deploy failure, and the healthcheck must not auto-rollback
+# the release because of it.
 checked=()
 ports=()
 for spec in crawler-chromium:- crawler-ingest:9101 crawler-scheduler:9102 \
@@ -42,7 +42,7 @@ for spec in crawler-chromium:- crawler-ingest:9101 crawler-scheduler:9102 \
     fi
 done
 
-# Юниты: до 60 секунд на активность (рестарт набора не мгновенный)
+# Units: up to 60 seconds to become active (the set restart is not instantaneous)
 units_deadline=$((SECONDS + 60))
 fail=0
 while :; do
@@ -73,9 +73,9 @@ for p in "${ports[@]}"; do
     done
 done
 
-# crawlerctl status на загруженной БД отвечает небыстро (агрегаты по
-# ~47 млн строк — T-161): таймаут вдвое больше бюджета проб, чтобы шаг
-# не вис бесконечно, но не рвал деплой из-за известной медлительности
+# crawlerctl status answers slowly on a loaded DB (aggregates over
+# ~47M rows — T-161): the timeout is twice the probe budget, so the step
+# neither hangs forever nor breaks the deploy over a known slowness
 if ! timeout $((READY_DEADLINE * 2)) env CRAWLER_CONFIG=/etc/crawler/config.yaml \
     /opt/crawler/bin/crawlerctl status >/dev/null 2>&1; then
     echo "crawlerctl status: FAIL"

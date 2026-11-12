@@ -1,55 +1,58 @@
 #!/bin/bash
-# Замер T-176: доля Laravel-находок, обязанных исключительно DOM-сигналам
-# рендера, в разрезе классов смеси (парковочные .рф против прочих зон).
-# Методика и результаты — docs/render.md, раздел «Вклад DOM-сигналов по
-# классам смеси (T-176)».
+# The T-176 measurement: the share of Laravel finds owed exclusively to the
+# render's DOM signals, by the mixture classes (parking .рф against the other
+# zones). The methodology and the results — docs/render.md, the section
+# "The DOM signal contribution by mixture classes (T-176)".
 #
-# СТРОГО READ-ONLY: только SELECT и EXPLAIN. Никаких изменений данных,
-# очередей и сервисов. Запросы 1–3, 6, 7 идут через laravel_findings
-# (≈91 тыс. строк) с JOIN subdomain_results ПО PK — nested loop
-# принудительно (enable_hashjoin/mergejoin/seqscan = off на сессию):
-# hash join планировщика построил бы seq scan по subdomain_results
-# (≈4,5 млн строк, 4,3 ГБ) — на боевой БД под CPU-голодом (PSI some
-# ~90%, load ~25 на 4 vCPU) это запрещено. Хинты — стоимостный штраф,
-# не запрет: контрольный EXPLAIN (запрос 0) фиксирует факт план в выводе
-# замера. Запрос 4 — выборочный проход TABLESAMPLE SYSTEM (0.5%): читает
-# ~0,5% блоков таблицы (полный count(*) по rendered — seq scan, не
-# делаем; оценка ×200 с биномиальным разбросом ~±5%). Порог 0.6 в
-# запросе 3 — боевое значение analyzer.laravel_min_score; при изменении
-# конфига число в скрипте менять вместе с ним.
-# statement_timeout режет застрявший запрос.
+# STRICTLY READ-ONLY: SELECT and EXPLAIN only. No changes to the data, the
+# queues or the services. Queries 1–3, 6, 7 go through laravel_findings
+# (≈91k rows) with a JOIN of subdomain_results BY PK — a nested loop forced
+# (enable_hashjoin/mergejoin/seqscan = off for the session): the planner's
+# hash join would build a seq scan over subdomain_results (≈4.5M rows,
+# 4.3 GB) — on the production DB under CPU starvation (PSI some ~90%, load
+# ~25 on 4 vCPU) that is forbidden. The hints are a cost penalty, not a ban:
+# the control EXPLAIN (query 0) records the actual plan in the measurement
+# output. Query 4 is a sampling pass of TABLESAMPLE SYSTEM (0.5%): it reads
+# ~0.5% of the table's blocks (a full count(*) over rendered — a seq scan,
+# not done; a ×200 estimate with a binomial spread of ~±5%). The 0.6
+# threshold in query 3 is the production value of analyzer.laravel_min_score;
+# when changing the config, change the number in the script along with it.
+# statement_timeout cuts off a stuck query.
 #
-# Состав замера (вывод в stdout, psql -At):
-#   0. контрольный EXPLAIN основного join (план обязан быть nested loop
-#      с index scan по PK, без seq scan больших таблиц);
-#   1. версии правил в laravel_findings (однородность замера);
-#   2. таблица по зонам: findings / is_laravel / rendered — вход для
-#      выбора зон декомпозиции (rendered > 0);
-#   3. декомпозиция для зон с rendered-находками: dom_only (нет ни одного
-#      header/cookie-сигнала) и needs_dom (noisy-OR score H-сигналов
-#      ниже порога 0.6 — контентные сигналы обязательны);
-#   4. оценка rendered-записей по зонам — TABLESAMPLE SYSTEM (0.5%),
-#      счётчик × 200 (полный count = seq scan, не делаем);
-#   5. частоты правил по rendered-статусу (валидация классификации H/C);
-#   6. доля сырых (rendered=false) is_laravel-находок зоны с парой кук
-#      cookie_xsrf_token + cookie_encrypted_payload — воспроизводимая
-#      часть доказательства «куки доступны и без рендера»;
-#   7. свежесть: rendered-находки, чья строка ещё не переанализирована
-#      после рендера (rules_version IS NULL) — окно «отрендерено, но
-#      q:analyze не доставлен».
+# The measurement contents (output to stdout, psql -At):
+#   0. a control EXPLAIN of the main join (the plan must be a nested loop
+#      with an index scan by PK, no seq scans of the large tables);
+#   1. the rule versions in laravel_findings (the measurement's uniformity);
+#   2. a table by zones: findings / is_laravel / rendered — the input for
+#      picking the decomposition zones (rendered > 0);
+#   3. the decomposition for the zones with rendered finds: dom_only (not a
+#      single header/cookie signal) and needs_dom (the noisy-OR score of the
+#      H-signals below the 0.6 threshold — content signals are mandatory);
+#   4. an estimate of the rendered records by zones — TABLESAMPLE SYSTEM
+#      (0.5%), the counter × 200 (a full count = a seq scan, not done);
+#   5. the rule frequencies by the rendered status (a validation of the H/C
+#      classification);
+#   6. the share of a zone's raw (rendered=false) is_laravel finds with the
+#      cookie pair cookie_xsrf_token + cookie_encrypted_payload — the
+#      reproducible part of the proof that "the cookies are available even
+#      without a render";
+#   7. freshness: rendered finds whose row has not been re-analyzed after
+#      the render yet (rules_version IS NULL) — the "rendered, but
+#      q:analyze not delivered" window.
 #
-# Ворота PSI как у t167: перед каждым запросом some avg10 выше порога —
-# подождать (хронический голод 91–95% держит порог 95 проходимым).
+# The PSI gates as in t167: before each query, some avg10 above the
+# threshold — wait (the chronic starvation of 91–95% keeps the 95 threshold
+# passable).
 #
-# Запуск на боевом сервере (runbook §2.5):
+# Run on the production server (runbook §2.5):
 #   ssh root@155.212.174.88 'bash -s' -- < deploy/sql/t176-dom-share.sh
-# DSN берётся из CRAWLER_PG_DSN (или стандартных PG* — как runbook §2.5).
+# The DSN comes from CRAWLER_PG_DSN (or the standard PG* — like runbook §2.5).
 set -euo pipefail
 
 dsn="${CRAWLER_PG_DSN:-}"
-psi_max="${T176_PSI_MAX:-95}"     # ворота: PSI CPU some avg10, %
-timeout_s="${T176_TIMEOUT:-300}"  # statement_timeout одного запроса, с
-pause="${T176_PAUSE:-5}"          # пауза между запросами, с
+psi_max="${T176_PSI_MAX:-95}"     # gates: PSI CPU some avg10, %
+timeout_s="${T176_TIMEOUT:-300}"  # the statement_timeout of one query, s
+pause="${T176_PAUSE:-5}"          # the pause between queries, s
 
 PSQL=(psql -X --no-psqlrc -v ON_ERROR_STOP=1 -Atq)
 [ -n "$dsn" ] && PSQL+=(-d "$dsn")
@@ -61,8 +64,8 @@ fail() { echo "ОШИБКА: $*" >&2; exit 2; }
 command -v psql >/dev/null 2>&1 || fail "psql не найден"
 "${PSQL[@]}" -c "SELECT 1" >/dev/null || fail "нет соединения с БД (CRAWLER_PG_DSN / PG*)"
 
-# Общие настройки сессии: таймаут и защита планов от seq scan больших
-# таблиц (хинты планировщика действуют только на эту сессию).
+# The shared session settings: the timeout and the plan protection against
+# seq scans of the large tables (the planner hints apply only to this session).
 COMMON="SET statement_timeout = '${timeout_s}s';
 SET enable_seqscan = off;
 SET enable_hashjoin = off;
@@ -97,8 +100,9 @@ gates() {
     done
 }
 
-# H-правила (header/cookie-цели движка internal/rules): классификация по
-# target в rules/laravel.yaml — cookie_name/cookie_value/header_name.
+# H-rules (the header/cookie targets of the internal/rules engine): the
+# classification by target in rules/laravel.yaml —
+# cookie_name/cookie_value/header_name.
 H_RULES="'cookie_xsrf_token','cookie_laravel_session','cookie_cms_session','cookie_session_suffix','cookie_encrypted_payload','cookie_remember_guard','header_php_cli_server'"
 
 echo "T-176: замер DOM-вклада (read-only); timeout=${timeout_s}s pause=${pause}s psi_max=${psi_max}%"
@@ -135,8 +139,9 @@ JOIN zones z ON z.id = f.zone_id
 GROUP BY 1,2 ORDER BY 4 DESC;" | tee /tmp/t176_zones.$$
 sleep "$pause"
 
-# Зоны декомпозиции — те, где rendered > 0 (замер 2026-10-24: основная
-# масса — зоны 5/6, .su и .рф; прочие включаются по мере дренажа долга).
+# The decomposition zones — those with rendered > 0 (the 2026-10-24
+# measurement: the bulk is zones 5/6, .su and .рф; the rest join as the
+# render debt drains).
 zones=$(awk -F'|' '$5 > 0 { print $1 }' /tmp/t176_zones.$$ | paste -sd, -)
 rm -f /tmp/t176_zones.$$
 [ -n "$zones" ] || { echo "rendered-находок нет — декомпозиция не нужна"; exit 0; }
@@ -145,8 +150,9 @@ sleep "$pause"
 
 gates
 echo "=== 3. декомпозиция зон $zones: dom_only / needs_dom"
-# Сначала фильтр rendered (сотни строк), затем jsonb-разбор — на порядок
-# легче разбора всех is_laravel-находок зоны под CPU-голодом.
+# First the rendered filter (hundreds of rows), then the jsonb parsing — an
+# order of magnitude cheaper than parsing all of the zone's is_laravel finds
+# under CPU starvation.
 "${PSQL[@]}" -c "$COMMON
 WITH rend AS (
   SELECT f.zone_id, f.domain_id, f.subdomain_id, f.variant, f.signals
@@ -187,9 +193,9 @@ sleep "$pause"
 
 gates
 echo "=== 5. частоты правил в is_laravel-находках по rendered-статусу (все зоны)"
-# Глобальный счёт — самый тяжёлый запрос замера (jsonb-разбор всех
-# is_laravel-находок); под хроническим голодом занимает 1–3 мин.
-# Терпит таймаут — повторный запуск идемпотентен (read-only).
+# The global count — the measurement's heaviest query (a jsonb parse of all
+# the is_laravel finds); under the chronic starvation it takes 1–3 min.
+# It tolerates a timeout — rerunning is idempotent (read-only).
 "${PSQL[@]}" -c "$COMMON
 SELECT s->>'rule' AS rule,
        count(*) FILTER (WHERE NOT r.rendered) AS raw_cnt,

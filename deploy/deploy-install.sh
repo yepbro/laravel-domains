@@ -1,49 +1,51 @@
 #!/bin/bash
-# Установка бинарников Domain Crawler на боевой сервер (docs/deploy.md §4.2,
-# T-135). Вызывается CI (.github/workflows/deploy.yml) по SSH после загрузки
-# /tmp/crawler-deploy.tar.gz; пригоден и для ручного запуска: положить архив
-# и выполнить этот скрипт от root.
+# Installing the Domain Crawler binaries on the production server
+# (docs/deploy.md §4.2, T-135). Invoked by CI (.github/workflows/deploy.yml)
+# over SSH after /tmp/crawler-deploy.tar.gz is uploaded; also usable
+# manually: put the archive in place and run this script as root.
 #
-# Атомарность: текущий /opt/crawler/bin сохраняется в /opt/crawler/bin.prev
-# (копия во временный каталог + mv — старый бэкап жив, пока новый не готов
-# целиком), набор останавливается, бинарники заменяются, набор стартует.
-# Любая ошибка после успешной остановки — откат на bin.prev и рестарт (trap).
+# Atomicity: the current /opt/crawler/bin is saved to /opt/crawler/bin.prev
+# (a copy into a temporary directory + mv — the old backup lives until the
+# new one is ready in full), the set is stopped, the binaries are replaced,
+# the set starts. Any error after a successful stop — a rollback to bin.prev
+# and a restart (trap).
 #
-# Коды выхода — шаг извещения Telegram в deploy.yml различает их:
-#   0 — установлено;
-#   1/2 и прочие, кроме перечисленных — сбой внутри установки, trap-откат
-#       на bin.prev выполнен, набор перезапущен и active (2 возвращают и
-#       bash при сбое разбора, и tar при битом архиве — в обоих реальных
-#       случаях откат уже выполнен trap'ом);
-#   3 — не остановился набор (до trap: bin не тронут, но состояние юнитов
-#       требует проверки);
-#   4 — нет архива (до trap: сервер не тронут, откат не требовался);
-#   5 — сбой внутри установки, откат на bin.prev выполнен, но набор не
-#       поднялся/поднялся не весь — требуется оператор;
-#   6 — сбой внутри установки, откат сам не удался — состояние требует
-#       оператора;
-#   7 — сбой при подготовке бэкапа: bin не тронут (работает версия до
-#       деплоя), откат не требовался, набор перезапущен;
-#   8 — то же, но старт набора не удался — состояние требует оператора.
-# 255 — транспорт ssh: состояние сервера неизвестно.
+# Exit codes — the Telegram notification step in deploy.yml distinguishes them:
+#   0 — installed;
+#   1/2 and any others not listed — a failure inside the installation, the
+#       trap rollback to bin.prev has run, the set is restarted and active
+#       (2 is returned both by bash on a parse error and by tar on a broken
+#       archive — in both real cases the rollback has already run via the trap);
+#   3 — the set did not stop (before the trap: bin untouched, but the unit
+#       states need checking);
+#   4 — no archive (before the trap: the server untouched, no rollback needed);
+#   5 — a failure inside the installation, the rollback to bin.prev has run,
+#       but the set did not come up / came up only partly — an operator is needed;
+#   6 — a failure inside the installation, the rollback itself failed — the
+#       state needs an operator;
+#   7 — a failure while preparing the backup: bin untouched (the pre-deploy
+#       version is running), no rollback needed, the set restarted;
+#   8 — the same, but starting the set failed — the state needs an operator.
+# 255 — the ssh transport: the server state is unknown.
 set -euo pipefail
 
-# Пути переопределяются окружением при боевых дефолтах — тестируемость
-# локальным harness без root и /opt (как в deploy-rollback.sh, T-137).
+# The paths are overridden by the environment with production defaults —
+# testable by a local harness without root and /opt (like deploy-rollback.sh, T-137).
 BIN_DIR=${BIN_DIR:-/opt/crawler/bin}
 BACKUP=${BACKUP:-/opt/crawler/bin.prev}
 ARCHIVE=${ARCHIVE:-/tmp/crawler-deploy.tar.gz}
 
-# Свежий бэкап построен (rollback имеет смысл); результат trap-отката
-# (0 — выполнен и набор active, 5 — выполнен, набор не весь, 6 — не удался).
+# A fresh backup has been built (a rollback makes sense); the trap rollback
+# result (0 — done and the set active, 5 — done, the set is not fully up, 6 — failed).
 fresh=0
 rollback_rc=0
 
-# Откат — по образцу deploy-rollback.sh (T-137): копия бэкапа во временный
-# соседний каталог ДО rm (сбой cp не уничтожает текущий bin), затем
-# атомарный mv; итог (рестарт + юниты) проверяется и отражается в коде
-# выхода. reset-failed сбрасывает start-limit юнитов, упершихся в него на
-# краш-лупе упавшей версии, — без этого рестарт может отказать.
+# The rollback follows deploy-rollback.sh (T-137): a copy of the backup into
+# a temporary neighboring directory BEFORE the rm (a cp failure does not
+# destroy the current bin), then an atomic mv; the outcome (restart + units)
+# is checked and reflected in the exit code. reset-failed clears the
+# start-limit of units that hit it in the crash loop of the broken version —
+# without it the restart may be refused.
 rollback() {
     echo "ОТКАТ: восстанавливаю $BACKUP -> $BIN_DIR" >&2
     ok=0
@@ -67,16 +69,17 @@ rollback() {
         rollback_rc=6
         return 0
     fi
-    # Лёгкая проверка (как в deploy-rollback.sh): Type=simple даёт active
-    # сразу, сломанный бинарник виден за 3 с как activating/failed.
+    # A light check (like deploy-rollback.sh): Type=simple reports active
+    # right away; a broken binary shows within 3 s as activating/failed.
     sleep 3
     degraded=0
     for u in crawler-chromium crawler-ingest crawler-scheduler crawler-dns-worker \
              crawler-http-worker crawler-render-worker crawler-analyzer \
              crawler-monitor crawler-web crawler-dashboard; do
-        # Отключённый оператором юнит (disable/mask — как в
-        # deploy-healthcheck.sh) планово выключен, а не «не поднялся»:
-        # из проверки исключается, иначе откат ложно репортит degraded.
+        # A unit disabled by the operator (disable/mask — like in
+        # deploy-healthcheck.sh) is deliberately stopped, not "failed to
+        # come up": it is excluded from the check, otherwise the rollback
+        # would falsely report degraded.
         enabled=$(systemctl is-enabled "$u" 2>/dev/null || true)
         if [ "$enabled" = disabled ] || [ "$enabled" = masked ]; then
             continue
@@ -103,9 +106,10 @@ on_exit() {
                 rc=$rollback_rc
             fi
         else
-            # Сбой до построения свежего бэкапа: bin не тронут — откатывать
-            # нечего (bin.prev хранит версию N-1, откат даунгрейдил бы
-            # живую N) — вернуть набор на той же версии.
+            # A failure before the fresh backup was built: bin is untouched —
+            # there is nothing to roll back to (bin.prev holds version N-1;
+            # a rollback would downgrade the live N) — bring the set back
+            # on the same version.
             echo "СБОЙ до построения бэкапа — $BIN_DIR не тронут, стартую набор" >&2
             systemctl reset-failed 'crawler-*' 2>/dev/null || true
             if systemctl start crawler.target; then
@@ -121,16 +125,17 @@ on_exit() {
 
 [ -f "$ARCHIVE" ] || { echo "ОШИБКА: нет архива $ARCHIVE" >&2; exit 4; }
 
-# До trap'а (по коду видно, что откат не выполнялся и не требовался):
-# сбой остановки = bin не тронут, но набор мог остановиться частично.
+# Before the trap (the code shows no rollback ran and none was needed):
+# a stop failure = bin untouched, but the set may have stopped only partly.
 systemctl stop crawler.target || { echo "ОШИБКА: не удалось остановить crawler.target" >&2; exit 3; }
 trap on_exit EXIT
-# Выход по сигналу (обрыв ssh при отмене/таймауте рана, ручное прерывание):
-# без этого $? в EXIT-обработнике равен 0 и откат не запускается.
+# Exit on a signal (ssh dropped on a run cancel/timeout, a manual interrupt):
+# without this $? is 0 in the EXIT handler and the rollback never starts.
 trap 'exit 130' INT TERM HUP
 
-# Свежий бэкап через временный каталог и mv: старый bin.prev жив, пока
-# новый не скопирован целиком (сбой cp не оставляет сервер без бэкапа).
+# A fresh backup via a temporary directory and mv: the old bin.prev lives
+# until the new one is copied in full (a cp failure never leaves the server
+# without a backup).
 bu="$(mktemp -d "${BACKUP}.new.XXXXXX")"
 rmdir "$bu"
 cp -a "$BIN_DIR" "$bu"

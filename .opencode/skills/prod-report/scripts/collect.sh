@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Снимок состояния прода Domain Crawler (larasites). Строго read-only.
-# Использование: collect.sh [--interval SEC] [--host HOST]
+# A snapshot of the Domain Crawler production state (larasites). Strictly read-only.
+# Usage: collect.sh [--interval SEC] [--host HOST]
 set -uo pipefail
 
 INTERVAL=20
@@ -48,7 +48,7 @@ snap() {
     xlen=$(redis-cli XLEN "$s" 2>/dev/null)
     g=$(redis-cli --raw XINFO GROUPS "$s" 2>/dev/null)
     if [[ -z "${g:-}" ]]; then
-      echo "$(date +%s) $s ${xlen:-0} - - -"   # группы нет — только XLEN
+      echo "$(date +%s) $s ${xlen:-0} - - -"   # no groups — XLEN only
     else
       pend=$(sed -n 6p <<<"$g"); rd=$(sed -n 10p <<<"$g"); lag=$(sed -n 12p <<<"$g")
       echo "$(date +%s) $s ${xlen:-0} ${pend:-0} ${rd:-0} ${lag:-0}"
@@ -105,9 +105,10 @@ curl -s -m 3 http://127.0.0.1:9104/metrics 2>/dev/null \
   | grep -E '^crawler_queue_depth|^crawler_content_' | head -15
 echo
 
-# Этап 35/36 (движки рендера + очередь фолбэка). До деплоя этапа на проде
-# этих сущностей нет — каждое поле толерантно к отсутствию и печатает
-# пометку, а не пустоту: «нет (до деплоя)» — норма, не аномалия.
+# Stage 35/36 (render engines + the fallback queue). Before the stage is
+# deployed to prod these entities do not exist — every field tolerates the
+# absence and prints a placeholder marker, not emptiness: a pre-deploy
+# marker is normal, not an anomaly.
 echo "## Рендер: движки и фолбэк (этап 35/36)"
 if systemctl cat crawler-render-fallback-worker.service >/dev/null 2>&1; then
   echo "[юнит воркера B] $(systemctl is-active crawler-render-fallback-worker 2>/dev/null)"

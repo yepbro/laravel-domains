@@ -1,35 +1,38 @@
 #!/usr/bin/env bash
-# Извещения Telegram о событиях конвейера CI/CD (ТЗ §10.4, T-136) и
-# алертах рантайма (T-162, ТЗ §5.9 — доставка monitor).
+# Telegram notifications about the CI/CD pipeline events (spec §10.4, T-136)
+# and runtime alerts (T-162, spec §5.9 — delivered by monitor).
 #
-# Один вызов — одно сообщение в выделенную группу: маркер результата в
-# начале, тип события, workflow и шаг, виновный коммит, ссылка на ран;
-# для деплоя — версия (git describe) и факт отката. Отдельного сервиса
-# нет: CI зовёт скрипт последним шагом из .github/workflows/ci.yml
-# (провалы) и deploy.yml (успех и провал); monitor — exec-ом из цикла
-# алертов (internal/monitor/notify.go) в режиме --message: текст алерта
-# целиком (маркер 🚨/✅ monitor ставит сам), без CI-обвязки (коммит/ран).
+# One invocation — one message into the dedicated group: the outcome marker
+# at the start, the event type, the workflow and the step, the offending
+# commit, a link to the run; for a deploy — the version (git describe) and
+# the rollback fact. There is no separate service: CI calls the script as the
+# last step from .github/workflows/ci.yml (failures) and deploy.yml (success
+# and failure); monitor — via exec from the alert loop
+# (internal/monitor/notify.go) in the --message mode: the alert text in full
+# (monitor puts the 🚨/✅ marker itself), without the CI wrapper (commit/run).
 #
-# Надёжность (§10.4): сбой отправки не влияет на результат конвейера —
-# шаг уведомления в workflow идёт с continue-on-error, а отсутствие
-# секретов (PR из форка, репозиторий без настроенных секретов, хост
-# monitor без TELEGRAM_* в EnvironmentFile) — штатный пропуск с
-# причиной в логе. Значения TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
-# не печатаются: токен не попадает в вывод (curl без -v, ответ API с
-# chat.id отбрасывается), xtrace не включается.
+# Reliability (§10.4): a sending failure does not affect the pipeline
+# outcome — the notification step in the workflow runs with
+# continue-on-error, and missing secrets (a PR from a fork, a repository
+# without configured secrets, a monitor host without TELEGRAM_* in its
+# EnvironmentFile) — a regular skip with the reason in the log. The
+# TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID values are not printed: the token
+# never reaches the output (curl without -v, the API response with chat.id
+# is discarded), xtrace is not enabled.
 #
-# Использование (CI/CD):
-#   deploy/telegram-notify.sh --status ok|fail --event "Деплой успешен" \
-#       --workflow deploy [--step "Установить на сервер"] \
+# Usage (CI/CD):
+#   deploy/telegram-notify.sh --status ok|fail --event "<event type>" \
+#       --workflow deploy [--step "<step>"] \
 #       [--version "$(git describe --tags --always)"] \
 #       [--rollback performed|performed-degraded|nothing-to-rollback|failed|unknown] \
 #       [--sha <SHA>] [--dry-run]
-# Использование (алерты monitor, T-162; текст передаётся как есть):
-#   deploy/telegram-notify.sh --message "🚨 Алерт disk_free_min: …" [--dry-run]
+# Usage (monitor alerts, T-162; the text is passed as is):
+#   deploy/telegram-notify.sh --message "<alert text>" [--dry-run]
 #
-# Коммит и ссылка на ран берутся из чекаута и GITHUB_*-переменных раннера
-# (--sha переопределяет коммит — для PR-ранов, где HEAD это merge-commit);
-# локально с --dry-run недостающие строки просто опускаются.
+# The commit and the run link are taken from the checkout and the runner's
+# GITHUB_* variables (--sha overrides the commit — for PR runs, where HEAD is
+# a merge commit); locally with --dry-run the missing lines are simply
+# omitted.
 set -euo pipefail
 
 usage() {
@@ -60,10 +63,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Режим --message (алерты monitor, T-162): произвольный текст целиком —
-# маркеры и детали уже в нём; CI-аргументы с ним не смешиваются (ошибка,
-# а не тихая интерпретация: рассылка алертов сообщением о деплое хуже
-# падения вызова).
+# The --message mode (monitor alerts, T-162): arbitrary text in full — the
+# markers and the details are already in it; the CI arguments are not mixed
+# with it (an error, not a silent reinterpretation: sending alerts as a
+# deploy message is worse than the invocation failing).
 if [ -n "$message" ]; then
     if [ -n "$status" ] || [ -n "$event" ] || [ -n "$workflow" ] || \
        [ -n "$step" ] || [ -n "$version" ] || [ -n "$rollback" ] || [ -n "$sha" ]; then
@@ -84,8 +87,9 @@ else
     esac
 fi
 
-# Guard секретов: без токена/чата извещений нет — выход 0, ран не красится
-# (dry-run работает и без секретов, подставляя заглушки).
+# The secrets guard: without a token/chat there are no notifications —
+# exit 0, the run is not colored red (dry-run works without secrets too,
+# substituting placeholders).
 if [ "$dry_run" -eq 0 ]; then
     if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
         echo 'telegram: извещение пропущено — не задан TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID (PR из форка или секреты репозитория не настроены)'
@@ -93,14 +97,15 @@ if [ "$dry_run" -eq 0 ]; then
     fi
 fi
 
-# Текст сообщения: в режиме --message (алерты monitor) — переданный
-# целиком; в режиме CI/CD — сборка из маркера события, шапки workflow,
-# отката, коммита и ссылки на ран.
+# The message text: in the --message mode (monitor alerts) — the text passed
+# in full; in the CI/CD mode — an assembly of the event marker, the workflow
+# header, the rollback, the commit and the run link.
 if [ -n "$message" ]; then
     text="$message"
 else
-    # Виновный коммит: --sha (PR-ран: head PR, а не merge-commit), иначе HEAD
-    # чекаута (в deploy это SHA, протестированный ci); вне git — GITHUB_SHA.
+    # The offending commit: --sha (a PR run: the PR head, not the merge
+    # commit), otherwise the checkout's HEAD (in deploy it is the SHA tested
+    # by ci); outside git — GITHUB_SHA.
     short_sha=''
     subject=''
     if [ -n "$sha" ]; then
@@ -118,10 +123,11 @@ else
         run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
     fi
 
-    # Карта маркеров в начале сообщения — выбор заказчика по живому рендеру
-    # Telegram (T-136): разным событиям разные маркеры. ⚠️ для фолбэка
-    # «Ошибка конвейера CI» — решение основной сессии (не совпадает ни с одним
-    # из четырёх заказчика, семантика «инфраструктура/внимание»).
+    # The map of markers at the start of the message — the owner's choice by
+    # a live Telegram render (T-136): different events get different markers.
+    # ⚠️ for the fallback "CI pipeline error" — the main session's decision
+    # (it matches none of the owner's four; the semantics is
+    # "infrastructure/attention").
     marker=''
     case "$event" in
         'Ошибка в коде'*)       marker='🟥 ❌' ;;
@@ -129,7 +135,7 @@ else
         'Ошибка конвейера CI'*) marker='⚠️' ;;
         'Деплой успешен'*)      marker='✅' ;;
         'Деплой не успешен'*)   marker='⛔️' ;;
-        *) # неизвестное событие: прежний статусный маркер
+        *) # unknown event: the previous status marker
            if [ "$status" = ok ]; then marker='✅'; else marker='❌'; fi ;;
     esac
 
@@ -165,9 +171,9 @@ else
     fi
 fi
 
-# dry-run: отдельный маскированный payload (реальный chat id не печатается
-# ни в одном пути) и выход ДО построения боевого payload — маскированное
-# значение никогда не доходит до curl.
+# dry-run: a separate masked payload (the real chat id is not printed on any
+# path) and an exit BEFORE the production payload is built — the masked value
+# never reaches curl.
 if [ "$dry_run" -eq 1 ]; then
     masked_payload="$(jq -cn --arg chat_id '<TELEGRAM_CHAT_ID>' --arg text "$text" \
         '{chat_id: $chat_id, text: $text}')"
@@ -177,13 +183,15 @@ if [ "$dry_run" -eq 1 ]; then
     exit 0
 fi
 
-# Боевой payload: реальный chat id из секрета (в вывод не попадает).
+# The production payload: the real chat id from the secret (it never reaches
+# the output).
 payload="$(jq -cn --arg chat_id "$TELEGRAM_CHAT_ID" --arg text "$text" \
     '{chat_id: $chat_id, text: $text}')"
 
-# Ответ API с chat.id (секрет) не печатаем; при ошибке показываем только
-# error_code и description из тела (chat.id в ошибочные ответы не входит).
-# curl без -v, поэтому токен из URL в его диагностике не появляется.
+# The API response with chat.id (a secret) is not printed; on an error only
+# the error_code and description from the body are shown (chat.id is not part
+# of error responses). curl without -v, so the token from the URL never
+# appears in its diagnostics.
 resp="$(mktemp)"
 trap 'rm -f "$resp"' EXIT
 if ! http_code="$(curl -sS -o "$resp" -w '%{http_code}' \
@@ -191,8 +199,8 @@ if ! http_code="$(curl -sS -o "$resp" -w '%{http_code}' \
         -H 'Content-Type: application/json' \
         -d "$payload" \
         "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage")"; then
-    # Транспортная ошибка: curl сам выводит 000 через -w, его сообщение
-    # об ошибке уже ушло в stderr.
+    # A transport error: curl itself prints 000 via -w, and its error
+    # message has already gone to stderr.
     [ -n "$http_code" ] || http_code=000
 fi
 if [ "$http_code" = 200 ]; then

@@ -1,23 +1,23 @@
 #!/bin/sh
-# Мутационное тестирование go-mutesting (форк avito-tech/go-mutesting
-# инструмента zimmski/go-mutesting; как и зачем — docs/mutation-testing.md).
+# Mutation testing with go-mutesting (the avito-tech/go-mutesting fork of
+# the zimmski/go-mutesting tool; how and why — docs/mutation-testing.md).
 #
-# Запускается через make mutate (контейнер tools, рабочее дерево /src).
-# Что делает:
-#  1. копирует исходники в изолированный каталог внутри контейнера —
-#     go-mutesting подменяет файлы мутантами прямо в дереве, и рабочее
-#     дерево на bind-mount (где его смотрит air/hot-reload) не трогаем;
-#  2. гоняет мутаторов встроенным exec: `go test` пакета на каждого
-#     мутанта (кэши /gomod и /gocache переиспользуются);
-#  3. выгружает отчёты в var/mutation/ (лог, report.json, HTML) и гейтит
-#     итоговый mutation score по порогу MUTATION_MIN_SCORE.
+# Run via make mutate (the tools container, the /src worktree).
+# What it does:
+#  1. copies the sources into an isolated directory inside the container —
+#     go-mutesting replaces files with mutants right in the tree, and the
+#     bind-mounted worktree (where air/hot-reload watches it) is not touched;
+#  2. runs the mutators with the built-in exec: `go test` of a package per
+#     mutant (the /gomod and /gocache caches are reused);
+#  3. exports the reports to var/mutation/ (the log, report.json, HTML) and
+#     gates the final mutation score against the MUTATION_MIN_SCORE threshold.
 #
-# Переменные (задаёт make mutate):
-#   MUTATE_PKGS         — цели, локальные ./-пути пакетов (обязательно);
-#   MUTATE_TIMEOUT      — таймаут go test на одного мутанта, с (60);
-#   MUTATION_MIN_SCORE  — порог mutation score 0..1, ниже — exit 1 (0);
-#   MUTATE_BLACKLIST    — файл с MD5-чексуммами «ложных» мутантов
-#                         (test/mutation/blacklist.txt, если непуст).
+# Variables (set by make mutate):
+#   MUTATE_PKGS         — targets, local ./ package paths (mandatory);
+#   MUTATE_TIMEOUT      — the go test timeout per mutant, s (60);
+#   MUTATION_MIN_SCORE  — the mutation score threshold 0..1, below it — exit 1 (0);
+#   MUTATE_BLACKLIST    — the file with MD5 checksums of "bogus" mutants
+#                         (test/mutation/blacklist.txt, when non-empty).
 set -eu
 
 : "${MUTATE_PKGS:?MUTATE_PKGS env is required (задаётся make mutate)}"
@@ -34,8 +34,8 @@ command -v go-mutesting >/dev/null 2>&1 || {
 	exit 1
 }
 
-# Изолированная копия исходников: .git (не нужен go test), var (данные
-# окружения, сотни МБ) и tmp (мусор air) не копируем.
+# An isolated copy of the sources: .git (go test does not need it), var
+# (environment data, hundreds of MB) and tmp (air junk) are not copied.
 work=/tmp/mutation-src
 rm -rf "$work"
 mkdir -p "$work" "$out_dir"
@@ -49,8 +49,8 @@ if [ -s "$MUTATE_BLACKLIST" ]; then
 	blacklist_args="--blacklist $MUTATE_BLACKLIST"
 fi
 
-# go-mutesting всегда завершается кодом 0 (даже при низком score) —
-# реальный результат узнаём парсингом строки итога; pipefail ловит паники.
+# go-mutesting always exits 0 (even with a low score) — the real result is
+# learned by parsing the summary line; pipefail catches panics.
 set -o pipefail
 go-mutesting \
 	--config test/mutation/go-mutesting.yml \

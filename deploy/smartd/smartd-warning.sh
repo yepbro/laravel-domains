@@ -1,21 +1,23 @@
 #!/bin/sh
-# Обработчик предупреждений smartd для Domain Crawler (T-089, ТЗ §10.3).
+# The smartd warning handler for Domain Crawler (T-089, spec §10.3).
 #
-# Вызывается smartd через /usr/share/smartmontools/smartd_warning.sh при
-# срабатывании любой проверяемой директивы (-H, -l error, -W; конфиг —
-# deploy/smartd/smartd.conf). Аргументов и stdin нет (-m <nomailer>),
-# данные — в переменных окружения SMARTD_* (man smartd.conf(5), «-M exec»).
+# Invoked by smartd via /usr/share/smartmontools/smartd_warning.sh when any
+# checked directive fires (-H, -l error, -W; the config —
+# deploy/smartd/smartd.conf). There are no arguments and no stdin
+# (-m <nomailer>); the data comes in the SMARTD_* environment variables
+# (man smartd.conf(5), "-M exec").
 #
-# Задача одна: записать предупреждение в syslog/journald — в ту же ленту,
-# куда пишут все сервисы краулера (docs/deploy.md, T-085); читает оператор:
+# The task is one: write the warning to syslog/journald — the same tape all
+# the crawler services write to (docs/deploy.md, T-085); the operator reads
+# it with:
 #   journalctl -t smartd -p warning
-# Ничего не печатать в stdout/stderr: smartd трактует вывод как сбой
-# обработчика и дублирует обрывки в syslog.
+# Print nothing to stdout/stderr: smartd treats output as a handler failure
+# and duplicates the fragments into syslog.
 
 set -u
 
-# Приоритет по типу события (SMARTD_FAILTYPE): здоровье/температура — crit,
-# тестовая запись — info, остальное (рост журнала ошибок и т.п.) — warning.
+# The priority by the event type (SMARTD_FAILTYPE): health/temperature —
+# crit, a test record — info, the rest (error log growth and the like) — warning.
 prio=daemon.warning
 case "${SMARTD_FAILTYPE:-}" in
 Health | Temperature) prio=daemon.crit ;;
@@ -23,9 +25,9 @@ EmailTest) prio=daemon.info ;;
 esac
 
 logger -t smartd -p "$prio" \
-    "SMART: ${SMARTD_DEVICESTRING:-${SMARTD_DEVICE:-устройство}}:" \
-    "${SMARTD_MESSAGE:-причина неизвестна};" \
-    "первое срабатывание: ${SMARTD_TFIRST:-?};" \
-    "предыдущих сообщений: ${SMARTD_PREVCNT:-0}"
+    "SMART: ${SMARTD_DEVICESTRING:-${SMARTD_DEVICE:-device}}:" \
+    "${SMARTD_MESSAGE:-cause unknown};" \
+    "first occurrence: ${SMARTD_TFIRST:-?};" \
+    "previous messages: ${SMARTD_PREVCNT:-0}"
 
 exit 0
