@@ -47,11 +47,11 @@ type historystatsFakePool struct {
 }
 
 func (p *historystatsFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *historystatsFakePool) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, fmt.Errorf("historystatsFakePool: неожидаемый Exec: %s", sql)
+	return pgconn.CommandTag{}, fmt.Errorf("historystatsFakePool: unexpected Exec: %s", sql)
 }
 
 func (p *historystatsFakePool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, error) {
@@ -70,7 +70,7 @@ func (p *historystatsFakePool) Query(ctx context.Context, sql string, _ ...any) 
 		return &historyRows{empty: true, err: p.rowsErr}, nil
 	}
 	if p.badRow {
-		return &historyRows{row: []any{"байты", "байты"}, err: p.rowsErr}, nil
+		return &historyRows{row: []any{"bytes", "bytes"}, err: p.rowsErr}, nil
 	}
 	st := [2]int64{}
 	if len(p.stats) > 0 {
@@ -111,15 +111,15 @@ func (r *historyRows) Next() bool {
 
 func (r *historyRows) Scan(dest ...any) error {
 	if !r.next || len(dest) != 2 {
-		return errors.New("historyRows: Scan без Next или приёмников ≠ 2")
+		return errors.New("historyRows: Scan without Next or the destinations ≠ 2")
 	}
 	appeared, ok := r.row[0].(int64)
 	if !ok {
-		return fmt.Errorf("historyRows: колонка 0: %T не int64", r.row[0])
+		return fmt.Errorf("historyRows: column 0: %T is not int64", r.row[0])
 	}
 	lost, ok := r.row[1].(int64)
 	if !ok {
-		return fmt.Errorf("historyRows: колонка 1: %T не int64", r.row[1])
+		return fmt.Errorf("historyRows: column 1: %T is not int64", r.row[1])
 	}
 	*dest[0].(*int64) = appeared
 	*dest[1].(*int64) = lost
@@ -148,13 +148,13 @@ func TestHistoryStatsOnceSQL(t *testing.T) {
 		t.Fatalf("SQL = %v, want %s", calls, wantHistoryStatsSQL)
 	}
 	if st.Appeared != 12 || st.Lost != 3 {
-		t.Errorf("итог = %+v, want {12 3}", st)
+		t.Errorf("the result = %+v, want {12 3}", st)
 	}
 }
 
 func TestHistoryStatsOnceNilPool(t *testing.T) {
 	if _, err := HistoryStatsOnce(context.Background(), nil); err == nil {
-		t.Fatal("HistoryStatsOnce(nil pool) = nil error, хочу ошибку")
+		t.Fatal("HistoryStatsOnce(nil pool) = nil error, want an error")
 	}
 }
 
@@ -168,26 +168,26 @@ func TestHistoryStatsOnceErrors(t *testing.T) {
 		wantErr string
 	}{
 		{
-			"ошибка запроса",
-			&historystatsFakePool{errs: []error{errors.New("бд недоступна")}},
-			"бд недоступна",
+			"a query error",
+			&historystatsFakePool{errs: []error{errors.New("db unavailable")}},
+			"db unavailable",
 		},
-		{"пустой ответ агрегата", &historystatsFakePool{empty: true}, "пустой ответ агрегата"},
-		{"нечитаемая строка", &historystatsFakePool{badRow: true}, "чтение"},
+		{"an empty aggregate response", &historystatsFakePool{empty: true}, "empty aggregate response"},
+		{"an unreadable row", &historystatsFakePool{badRow: true}, "scan"},
 		{
-			"ошибка итерации",
-			&historystatsFakePool{rowsErr: errors.New("соединение сброшено")},
-			"соединение сброшено",
+			"an iteration error",
+			&historystatsFakePool{rowsErr: errors.New("connection reset")},
+			"connection reset",
 		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			st, err := HistoryStatsOnce(context.Background(), tt.pool)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("ошибка = %v, want содержит %q", err, tt.wantErr)
+				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
 			}
 			if st != (HistoryStats{}) {
-				t.Errorf("итог = %+v, want нулевой при ошибке", st)
+				t.Errorf("the result = %+v, want zero on error", st)
 			}
 		})
 	}
@@ -197,10 +197,10 @@ func TestHistoryStatsOnceErrors(t *testing.T) {
 // "≤ 0" boundary: a positive nanosecond interval is not replaced by the default.
 func TestHistoryStatsOptionsDefaults(t *testing.T) {
 	if got := (HistoryStatsOptions{}).withDefaults().Interval; got != DefaultHistoryStatsInterval {
-		t.Errorf("дефолт интервала = %v, want %v", got, DefaultHistoryStatsInterval)
+		t.Errorf("the interval default = %v, want %v", got, DefaultHistoryStatsInterval)
 	}
 	if got := (HistoryStatsOptions{Interval: time.Nanosecond}).withDefaults().Interval; got != time.Nanosecond {
-		t.Errorf("интервал 1нс = %v, want 1нс (заменяется только ≤ 0)", got)
+		t.Errorf("the interval 1ns = %v, want 1ns (only ≤ 0 is replaced)", got)
 	}
 }
 
@@ -221,7 +221,7 @@ func historyGaugeValue(t *testing.T, reg *metrics.Registry, name string) float64
 			}
 		}
 	}
-	t.Fatalf("серия %s не найдена", name)
+	t.Fatalf("the %s series was not found", name)
 	return -1
 }
 
@@ -239,7 +239,7 @@ func TestHistoryStatsLoopImmediatePass(t *testing.T) {
 	for len(pool.statsCalls()) == 0 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("первый проход не выполнен")
+			t.Fatal("the first pass was not performed")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -254,24 +254,24 @@ func TestHistoryStatsLoopImmediatePass(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("HistoryStatsLoop: %v, want nil при отмене", err)
+			t.Fatalf("HistoryStatsLoop: %v, want nil on cancellation", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancellation")
 	}
 }
 
 func TestHistoryStatsLoopNoop(t *testing.T) {
 	pool := &historystatsFakePool{}
 	if err := HistoryStatsLoop(context.Background(), pool, nil, HistoryStatsOptions{}); err != nil {
-		t.Fatalf("nil реестр: %v, want nil", err)
+		t.Fatalf("a nil registry: %v, want nil", err)
 	}
 	reg := metrics.New("monitor-test")
 	if err := HistoryStatsLoop(context.Background(), nil, reg, HistoryStatsOptions{}); err != nil {
-		t.Fatalf("nil пул: %v, want nil", err)
+		t.Fatalf("a nil pool: %v, want nil", err)
 	}
 	if calls := pool.statsCalls(); len(calls) != 0 {
-		t.Errorf("проходов = %d, хочу 0", len(calls))
+		t.Errorf("passes = %d, want 0", len(calls))
 	}
 }
 
@@ -282,7 +282,7 @@ func TestHistoryStatsLoopErrorSurvives(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-	pool := &historystatsFakePool{errs: []error{errors.New("бд недоступна")}}
+	pool := &historystatsFakePool{errs: []error{errors.New("db unavailable")}}
 	reg := metrics.New("monitor-test")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -297,17 +297,17 @@ func TestHistoryStatsLoopErrorSurvives(t *testing.T) {
 	for len(pool.statsCalls()) < 2 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("цикл не дошёл до второго прохода: %d", len(pool.statsCalls()))
+			t.Fatalf("the loop did not reach the second pass: %d", len(pool.statsCalls()))
 		}
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("HistoryStatsLoop: %v, want nil (ошибка прохода — не смерть цикла)", err)
+		t.Fatalf("HistoryStatsLoop: %v, want nil (a pass error is not the loop's death)", err)
 	}
 	log := buf.String()
-	if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "бд недоступна") {
-		t.Errorf("ошибка прохода при живом ctx без Warn:\n%s", log)
+	if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "db unavailable") {
+		t.Errorf("a pass error with a live ctx without a Warn:\n%s", log)
 	}
 }
 
@@ -329,13 +329,13 @@ func TestHistoryStatsLoopPassDuringCancel(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("HistoryStatsLoop: %v, want nil при отмене", err)
+			t.Fatalf("HistoryStatsLoop: %v, want nil on cancellation", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancellation")
 	}
 	if got := historyGaugeValue(t, reg, "crawler_laravel_appeared_total"); got != 7 {
-		t.Errorf("appeared gauge = %v, want 7: успешный проход под отменой — штатный итог", got)
+		t.Errorf("the appeared gauge = %v, want 7: a successful pass under cancellation is the normal outcome", got)
 	}
 	if got := historyGaugeValue(t, reg, "crawler_laravel_lost_total"); got != 2 {
 		t.Errorf("lost gauge = %v, want 2", got)

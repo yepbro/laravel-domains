@@ -71,13 +71,13 @@ func waitSlowPasses(t *testing.T, src *fakeSlowSource, n int, cancel context.Can
 	for src.count() < n {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("цикл не дошёл до прохода %d: %d", n, src.count())
+			t.Fatalf("the loop did not reach pass %d: %d", n, src.count())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 }
 
@@ -86,10 +86,10 @@ func TestSlowQueryKey(t *testing.T) {
 	a := slowQueryAt(7, "scheduler", 5, base, "SELECT 1")
 	b := slowQueryAt(7, "scheduler", 9, base.Add(time.Second), "SELECT 1")
 	if a.key() == b.key() {
-		t.Error("ключ: новый старт того же pid обязан отличаться")
+		t.Error("the key: a new start of the same pid must differ")
 	}
 	if a.key() != slowQueryAt(7, "http-worker", 5, base, "SELECT 2").key() {
-		t.Error("ключ: pid+старт совпали — тот же оператор")
+		t.Error("the key: pid+start matched — the same statement")
 	}
 }
 
@@ -122,19 +122,19 @@ func TestSlowQueryLoop_Passes(t *testing.T) {
 	waitSlowPasses(t, src, len(src.passes), cancel, done)
 
 	if len(reports) != 3 {
-		t.Fatalf("сообщений = %d, want 3 (новый оператор + другой оператор + новый старт)", len(reports))
+		t.Fatalf("messages = %d, want 3 (a new statement + another statement + a new start)", len(reports))
 	}
 	// The header counts the new ones (events), those continuing from
 	// previous passes — by the "total in flight" addition. Pass 5: after
 	// the empty pass 4 both statements are "new" again (the key evicted —
 	// in practice a finished statement does not return).
 	for i, want := range []string{
-		"1 медленный запрос (порог 3с)",
-		"1 медленный запрос (порог 3с), всего в работе 2",
-		"2 медленных запроса (порог 3с)",
+		"1 slow query (threshold 3s)",
+		"1 slow query (threshold 3s), total in flight 2",
+		"2 slow queries (threshold 3s)",
 	} {
 		if !strings.Contains(reports[i], want) {
-			t.Errorf("сообщение %d без %q:\n%s", i, want, reports[i])
+			t.Errorf("message %d without %q:\n%s", i, want, reports[i])
 		}
 	}
 }
@@ -153,7 +153,7 @@ func TestSlowQueryLoop_ErrorKeepsDebounce(t *testing.T) {
 		{long}, // a source error: a Warn without a delivery, the base lives
 		{long}, // the snapshot returns: the same key — silence
 	}}
-	src.errs = []error{nil, nil, errors.New("БД недоступна"), nil}
+	src.errs = []error{nil, nil, errors.New("DB unavailable"), nil}
 
 	opts := SlowQueryOptions{Interval: time.Millisecond, Notify: func(text string) { reports = append(reports, text) }}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -162,7 +162,7 @@ func TestSlowQueryLoop_ErrorKeepsDebounce(t *testing.T) {
 	waitSlowPasses(t, src, len(src.passes), cancel, done)
 
 	if len(reports) != 1 {
-		t.Fatalf("сообщений = %d, want 1 (сбой не роняет базу дебаунса)", len(reports))
+		t.Fatalf("messages = %d, want 1 (a failure does not drop the debounce base)", len(reports))
 	}
 }
 
@@ -186,7 +186,7 @@ func TestSlowQueryLoop_FinishedEvicted(t *testing.T) {
 	waitSlowPasses(t, src, len(src.passes), cancel, done)
 
 	if len(reports) != 2 {
-		t.Fatalf("сообщений = %d, want 2 (новое наблюдение после завершения)", len(reports))
+		t.Fatalf("messages = %d, want 2 (a new observation after completion)", len(reports))
 	}
 }
 
@@ -194,13 +194,13 @@ func TestSlowQueryLoop_Disabled(t *testing.T) {
 	src := &fakeSlowSource{}
 	err := SlowQueryLoop(context.Background(), src, SlowQueryOptions{Interval: 0})
 	if err != nil {
-		t.Fatalf("выключенный цикл: %v", err)
+		t.Fatalf("the disabled loop: %v", err)
 	}
 	if src.count() != 0 {
-		t.Errorf("выключенный цикл: проходов = %d, want 0", src.count())
+		t.Errorf("the disabled loop: passes = %d, want 0", src.count())
 	}
 	if err := SlowQueryLoop(context.Background(), nil, SlowQueryOptions{Interval: time.Minute}); err == nil {
-		t.Error("источник не задан: ожидается ошибка")
+		t.Error("the source is not set: an error is expected")
 	}
 }
 
@@ -208,7 +208,7 @@ func TestSlowQueryLoop_Disabled(t *testing.T) {
 // the loop and does not deliver empty messages.
 func TestSlowQueryLoop_SourceError(t *testing.T) {
 	var reports []string
-	src := &fakeSlowSource{errs: []error{errors.New("БД недоступна")}}
+	src := &fakeSlowSource{errs: []error{errors.New("DB unavailable")}}
 	opts := SlowQueryOptions{Interval: time.Millisecond, Notify: func(text string) { reports = append(reports, text) }}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -216,7 +216,7 @@ func TestSlowQueryLoop_SourceError(t *testing.T) {
 	waitSlowPasses(t, src, 3, cancel, done)
 
 	if len(reports) != 0 {
-		t.Fatalf("сообщений = %d, want 0 (ошибка источника не рассылается)", len(reports))
+		t.Fatalf("messages = %d, want 0 (a source error is not mailed out)", len(reports))
 	}
 }
 
@@ -231,46 +231,46 @@ func TestFormatSlowQueryReport(t *testing.T) {
 	}
 	r := formatSlowQueryReport(fresh, len(fresh), 3*time.Second)
 	for _, want := range []string{
-		"🐌 PostgreSQL: 5 медленных запросов (порог 3с)",
-		"• 42.3с [scheduler] pid 101: UPDATE \"domains\" SET check_state = 1, queued_at = now()", // spaces collapsed
-		"• 7.8с [http-worker] pid 202: SELECT * FROM domains WHERE id = 42",
-		"• 4.2с pid 203: " + strings.Repeat("x", slowQueryMaxChars) + "…", // no label, truncation
-		"…и ещё 2",
+		"🐌 PostgreSQL: 5 slow queries (threshold 3s)",
+		"• 42.3s [scheduler] pid 101: UPDATE \"domains\" SET check_state = 1, queued_at = now()", // spaces collapsed
+		"• 7.8s [http-worker] pid 202: SELECT * FROM domains WHERE id = 42",
+		"• 4.2s pid 203: " + strings.Repeat("x", slowQueryMaxChars) + "…", // no label, truncation
+		"…and 2 more",
 	} {
 		if !strings.Contains(r, want) {
-			t.Errorf("сообщение не содержит %q:\n%s", want, r)
+			t.Errorf("the message does not contain %q:\n%s", want, r)
 		}
 	}
 	if n := strings.Count(r, "pid "); n != 3 {
-		t.Errorf("строк запросов = %d, want 3 (потолок slowQueryTopLines)", n)
+		t.Errorf("query lines = %d, want 3 (the slowQueryTopLines cap)", n)
 	}
-	if s := ", всего в работе"; strings.Contains(r, s) {
-		t.Errorf("тотальное число равно новым — дополнение %q не нужно:\n%s", s, r)
+	if s := ", total in flight"; strings.Contains(r, s) {
+		t.Errorf("the total equals the new count — the %q addition is not needed:\n%s", s, r)
 	}
 
 	// Continuing from previous passes: 2 in flight, 1 new.
 	r = formatSlowQueryReport(fresh[:1], 2, 3*time.Second)
-	if !strings.Contains(r, "1 медленный запрос (порог 3с), всего в работе 2") {
-		t.Errorf("шапка без «всего в работе 2»:\n%s", r)
+	if !strings.Contains(r, "1 slow query (threshold 3s), total in flight 2") {
+		t.Errorf("the header without \"total in flight 2\":\n%s", r)
 	}
 
 	// One query — the singular; a non-whole threshold — as is;
 	// hidden text — the marker.
 	r = formatSlowQueryReport([]SlowQuery{slowQueryAt(7, "monitor-cli", 9.1, t0, "")}, 1, 2500*time.Millisecond)
 	for _, want := range []string{
-		"1 медленный запрос (порог 2.5с",
-		"• 9.1с [monitor-cli] pid 7: (текст недоступен — нет pg_read_all_stats)",
+		"1 slow query (threshold 2.5s",
+		"• 9.1s [monitor-cli] pid 7: (text unavailable — no pg_read_all_stats)",
 	} {
 		if !strings.Contains(r, want) {
-			t.Errorf("сообщение не содержит %q:\n%s", want, r)
+			t.Errorf("the message does not contain %q:\n%s", want, r)
 		}
 	}
 
 	// The numeral agreement: 23 — the paucal form (2–4), 11 and 12 —
 	// the genitive plural (the tens exception), 21 — the singular.
 	for n, want := range map[int]string{
-		2: "медленных запроса", 5: "медленных запросов",
-		11: "медленных запросов", 21: "медленный запрос", 23: "медленных запроса",
+		2: "slow queries", 5: "slow queries",
+		11: "slow queries", 21: "slow query", 23: "slow queries",
 	} {
 		if got := slowQueriesPhrase(n); got != want {
 			t.Errorf("slowQueriesPhrase(%d) = %q, want %q", n, got, want)
@@ -280,15 +280,15 @@ func TestFormatSlowQueryReport(t *testing.T) {
 
 func TestSlowQueryText(t *testing.T) {
 	if got := slowQueryText("  SELECT\t1\n  FROM\tx  "); got != "SELECT 1 FROM x" {
-		t.Errorf("пробелы не схлопнуты: %q", got)
+		t.Errorf("the spaces are not collapsed: %q", got)
 	}
-	if got := slowQueryText(strings.Repeat("б", slowQueryMaxChars+10)); len([]rune(got)) != slowQueryMaxChars+1 {
-		t.Errorf("обрезка: %d рун, want %d (+многоточие)", len([]rune(got)), slowQueryMaxChars)
+	if got := slowQueryText(strings.Repeat("x", slowQueryMaxChars+10)); len([]rune(got)) != slowQueryMaxChars+1 {
+		t.Errorf("truncation: %d runes, want %d (+the ellipsis)", len([]rune(got)), slowQueryMaxChars)
 	}
-	if exact := strings.Repeat("б", slowQueryMaxChars); slowQueryText(exact) != exact {
-		t.Errorf("текст ровно в лимит не обрезается: %q", slowQueryText(exact))
+	if exact := strings.Repeat("x", slowQueryMaxChars); slowQueryText(exact) != exact {
+		t.Errorf("the text exactly at the limit is not truncated: %q", slowQueryText(exact))
 	}
-	if got := slowQueryText("  "); !strings.Contains(got, "текст недоступен") {
-		t.Errorf("пустой текст: %q", got)
+	if got := slowQueryText("  "); !strings.Contains(got, "text unavailable") {
+		t.Errorf("an empty text: %q", got)
 	}
 }

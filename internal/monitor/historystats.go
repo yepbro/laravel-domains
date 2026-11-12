@@ -63,22 +63,22 @@ type HistoryStats struct {
 // (spec 3.4): the journal is append-only; a repeat gives the same values.
 func HistoryStatsOnce(ctx context.Context, pool db.DB) (HistoryStats, error) {
 	if pool == nil {
-		return HistoryStats{}, errors.New("monitor: счётчики истории детекции: пул не задан")
+		return HistoryStats{}, errors.New("monitor: detection history counters: pool not set")
 	}
 	rows, err := pool.Query(ctx, historyStatsSQL)
 	if err != nil {
-		return HistoryStats{}, fmt.Errorf("monitor: счётчики истории детекции: %w", err)
+		return HistoryStats{}, fmt.Errorf("monitor: detection history counters: %w", err)
 	}
 	defer rows.Close()
 	var st HistoryStats
 	if !rows.Next() {
-		return HistoryStats{}, fmt.Errorf("monitor: счётчики истории детекции: пустой ответ агрегата")
+		return HistoryStats{}, fmt.Errorf("monitor: detection history counters: empty aggregate response")
 	}
 	if err := rows.Scan(&st.Appeared, &st.Lost); err != nil {
-		return HistoryStats{}, fmt.Errorf("monitor: счётчики истории детекции: чтение: %w", err)
+		return HistoryStats{}, fmt.Errorf("monitor: detection history counters: scan: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return HistoryStats{}, fmt.Errorf("monitor: счётчики истории детекции: %w", err)
+		return HistoryStats{}, fmt.Errorf("monitor: detection history counters: %w", err)
 	}
 	return st, nil
 }
@@ -94,17 +94,17 @@ func NewHistoryGauges(reg *metrics.Registry) (appeared, lost *prometheus.GaugeVe
 	}
 	appeared = reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_laravel_appeared_total",
-		Help: "Кумулятивное число появлений строк laravel_domains (laravel_history appeared, T-118): монотонный счётчик из append-only журнала.",
+		Help: "Cumulative number of laravel_domains row appearances (laravel_history appeared, T-118): a monotonic counter from the append-only journal.",
 	})
 	lost = reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_laravel_lost_total",
-		Help: "Кумулятивное число исчезновений строк laravel_domains (laravel_history NOT appeared, T-118): монотонный счётчик из append-only журнала.",
+		Help: "Cumulative number of laravel_domains row disappearances (laravel_history NOT appeared, T-118): a monotonic counter from the append-only journal.",
 	})
 	return appeared, lost
 }
 
-// mutator-disable-regexp log\.Info\("цикл statement/remove
-// mutator-disable-regexp log\.Debug\("проход statement/remove
+// mutator-disable-regexp log\.Info\("Laravel statement/remove
+// mutator-disable-regexp log\.Debug\("history statement/remove
 // Justification: the service entries of the history loop (the Info start, the Debug result
 // of a successful pass) — they do not change the counter behavior, damped per
 // docs/mutation-testing.md §4 (logging is not tested).
@@ -131,7 +131,7 @@ func HistoryStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, op
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("цикл счётчиков истории детекции Laravel",
+	log.Info("Laravel detection history counters loop",
 		"interval", o.Interval.String())
 
 	pass := func() {
@@ -145,11 +145,11 @@ func HistoryStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, op
 		case err != nil && ctx.Err() != nil:
 			// A cancellation during the pass — part of the shutdown, not an alarm.
 		case err != nil:
-			log.Warn("проход счётчиков истории детекции", "err", err)
+			log.Warn("history counters pass", "err", err)
 		default:
 			appearedG.WithLabelValues().Set(float64(st.Appeared))
 			lostG.WithLabelValues().Set(float64(st.Lost))
-			log.Debug("проход счётчиков истории детекции",
+			log.Debug("history counters pass",
 				"appeared", st.Appeared, "lost", st.Lost)
 		}
 	}

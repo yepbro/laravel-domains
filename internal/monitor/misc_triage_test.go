@@ -51,17 +51,17 @@ func TestParseSystemctlShowBoundaries(t *testing.T) {
 		"Id=crawler-render-worker.service\nNRestarts=[not set]\n"
 	units := parseSystemctlShow(out)
 	if len(units) != 2 {
-		t.Fatalf("юнитов = %d, want 2", len(units))
+		t.Fatalf("units = %d, want 2", len(units))
 	}
 	if units[0].Unit != "crawler-http-worker.service" || units[0].NRestarts != 123 {
-		t.Errorf("http-worker = %+v, want NRestarts=123 (дес. 123, не 102)", units[0])
+		t.Errorf("http-worker = %+v, want NRestarts=123 (dec 123, not 102)", units[0])
 	}
 	if units[1].NRestarts != 0 {
 		t.Errorf("[not set] = %d, want 0", units[1].NRestarts)
 	}
 	// Empty output — an empty snapshot.
 	if got := parseSystemctlShow(""); len(got) != 0 {
-		t.Errorf("пустой вывод = %+v", got)
+		t.Errorf("an empty output = %+v", got)
 	}
 }
 
@@ -80,25 +80,25 @@ func TestParseMemoryEventsBoundaries(t *testing.T) {
 	}
 	// A non-numeric value — an error.
 	if _, err := parseMemoryEvents("oom x\n"); err == nil {
-		t.Error("нечисловое значение: хочу ошибку")
+		t.Error("a non-numeric value: want an error")
 	}
 	// Missing keys — zeros.
 	ev, err = parseMemoryEvents("low 7\n")
 	if err != nil || ev != (memoryEvents{}) {
-		t.Errorf("нет ключей = (%+v, %v), want нули", ev, err)
+		t.Errorf("no keys = (%+v, %v), want zeros", ev, err)
 	}
 }
 
 func TestReadMemoryEventsFileClasses(t *testing.T) {
 	dir := t.TempDir()
 	// No file — zeros without an error (a unit without a cgroup).
-	ev, err := readMemoryEvents(filepath.Join(dir, "нет"))
+	ev, err := readMemoryEvents(filepath.Join(dir, "missing"))
 	if err != nil || ev != (memoryEvents{}) {
-		t.Errorf("нет файла = (%+v, %v), want нули", ev, err)
+		t.Errorf("no file = (%+v, %v), want zeros", ev, err)
 	}
 	// A directory instead of a file — a read error (not ErrNotExist).
 	if _, err := readMemoryEvents(dir); err == nil {
-		t.Error("каталог вместо файла: хочу ошибку")
+		t.Error("a directory instead of the file: want an error")
 	}
 	// A corrupt file — a format error.
 	p := filepath.Join(dir, "memory.events")
@@ -106,7 +106,7 @@ func TestReadMemoryEventsFileClasses(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := readMemoryEvents(p); err == nil {
-		t.Error("кривой файл: хочу ошибку")
+		t.Error("a broken file: want an error")
 	}
 }
 
@@ -118,19 +118,19 @@ func TestInfoSecondsBoundaries(t *testing.T) {
 	}
 	// A missing field — an error and zero.
 	if v, err := infoSeconds(map[string]string{}, "uptime_in_seconds"); err == nil || v != 0 {
-		t.Errorf("нет поля = (%v, %v), want 0 и ошибка", v, err)
+		t.Errorf("no field = (%v, %v), want 0 and an error", v, err)
 	}
 	// Zero is a valid value (the n < 0 boundary).
 	if v, err := infoSeconds(map[string]string{"k": "0"}, "k"); err != nil || v != 0 {
-		t.Errorf("ноль = (%v, %v), want 0 без ошибки", v, err)
+		t.Errorf("zero = (%v, %v), want 0 without an error", v, err)
 	}
 	// A negative — an error and zero.
 	if v, err := infoSeconds(map[string]string{"k": "-5"}, "k"); err == nil || v != 0 {
-		t.Errorf("отрицательное = (%v, %v), want 0 и ошибка", v, err)
+		t.Errorf("negative = (%v, %v), want 0 and an error", v, err)
 	}
 	// Non-numeric — an error and zero.
 	if v, err := infoSeconds(map[string]string{"k": "x"}, "k"); err == nil || v != 0 {
-		t.Errorf("нечисловое = (%v, %v), want 0 и ошибка", v, err)
+		t.Errorf("non-numeric = (%v, %v), want 0 and an error", v, err)
 	}
 	// 2^63 — valid for int64 (the bitSize boundary).
 	if v, err := infoSeconds(map[string]string{"k": "4611686018427387904"}, "k"); err != nil || v != 4611686018427387904 {
@@ -143,13 +143,13 @@ func TestInfoBytesBoundaries(t *testing.T) {
 		t.Errorf("1024 = (%v, %v)", v, err)
 	}
 	if v, err := infoBytes(map[string]string{}, "maxmemory"); err == nil || v != 0 {
-		t.Errorf("нет поля = (%v, %v), want 0 и ошибка", v, err)
+		t.Errorf("no field = (%v, %v), want 0 and an error", v, err)
 	}
 	if v, err := infoBytes(map[string]string{"k": "0"}, "k"); err != nil || v != 0 {
-		t.Errorf("ноль = (%v, %v), want 0 без ошибки", v, err)
+		t.Errorf("zero = (%v, %v), want 0 without an error", v, err)
 	}
 	if v, err := infoBytes(map[string]string{"k": "-1"}, "k"); err == nil || v != 0 {
-		t.Errorf("отрицательное = (%v, %v), want 0 и ошибка", v, err)
+		t.Errorf("negative = (%v, %v), want 0 and an error", v, err)
 	}
 }
 
@@ -159,19 +159,19 @@ func TestParsePSIValueBoundaries(t *testing.T) {
 	// Zero and 100 are valid shares (the 0..100 boundaries inclusive).
 	for _, v := range []string{"0.00", "100.00"} {
 		if _, err := parsePSI("some avg10=" + v + " avg60=1 avg300=1 total=0\n"); err != nil {
-			t.Errorf("avg10=%s: %v, want валидно", v, err)
+			t.Errorf("avg10=%s: %v, want valid", v, err)
 		}
 	}
 	// 1e308 is a valid number for ParseFloat (the parser does not cut the range
 	// before the 0..100 check — a "not a share" format error, not "not a number").
 	if _, err := parsePSI("some avg10=1e308 avg60=1 avg300=1 total=0\n"); err == nil ||
-		!strings.Contains(err.Error(), "не доля") {
-		t.Errorf("1e308: %v, want «не доля процента»", err)
+		!strings.Contains(err.Error(), "not a percent share") {
+		t.Errorf("1e308: %v, want \"is not a percent share\"", err)
 	}
 	// A missing avg300 field — an error.
 	if _, err := parsePSI("some avg10=1 avg60=1 total=0\n"); err == nil ||
 		!strings.Contains(err.Error(), "avg300") {
-		t.Errorf("нет avg300: %v", err)
+		t.Errorf("no avg300: %v", err)
 	}
 }
 
@@ -191,7 +191,7 @@ func TestStreamGroupsEmptyAndMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(st) != 0 {
-		t.Errorf("снимок = %+v, want пусто (групп нет)", st)
+		t.Errorf("the snapshot = %+v, want empty (no groups)", st)
 	}
 }
 
@@ -203,10 +203,10 @@ func TestTelegramNotifierNilLogNoPanic(t *testing.T) {
 	for _, opts := range []TelegramOptions{
 		{Enabled: false},
 		{Enabled: true, Getenv: func(string) string { return "t" }},
-		{Enabled: true, Getenv: func(string) string { return "t" }, Script: "/нет"},
+		{Enabled: true, Getenv: func(string) string { return "t" }, Script: "/missing"},
 	} {
 		if n := NewTelegramNotifier(opts); n == nil {
-			t.Errorf("%+v: конструктор вернул nil", opts)
+			t.Errorf("%+v: the constructor returned nil", opts)
 		}
 	}
 }
@@ -222,14 +222,14 @@ func TestTelegramNotifierOffReasons(t *testing.T) {
 		Getenv:  func(string) string { return "x" },
 	})
 	if n.script != "" {
-		t.Fatalf("script = %q, want выключен", n.script)
+		t.Fatalf("script = %q, want off", n.script)
 	}
 	log := buf.String()
-	if !strings.Contains(log, "не задан путь скрипта") {
-		t.Errorf("Warn без причины «не задан путь скрипта»:\n%s", log)
+	if !strings.Contains(log, "script path is not set") {
+		t.Errorf("a Warn without the \"script path is not set\" reason:\n%s", log)
 	}
-	if strings.Contains(log, "не доступен") {
-		t.Errorf("причина перепутана с «скрипт не доступен»:\n%s", log)
+	if strings.Contains(log, "unavailable or not executable") {
+		t.Errorf("the reason is mixed up with \"the script is unavailable\":\n%s", log)
 	}
 }
 
@@ -249,13 +249,13 @@ func TestTelegramNotifierDisabledNoSend(t *testing.T) {
 		Getenv:  func(string) string { return "" }, // no secrets
 	})
 	res := AlertsResult{Alerts: []AlertSnapshot{{
-		Name: AlertQueueDead, Status: AlertStatusFiring, Detail: "глубина 5",
+		Name: AlertQueueDead, Status: AlertStatusFiring, Detail: "depth 5",
 	}}}
 	n.OnPass(res)
-	n.Send("отчёт")
+	n.Send("report")
 	time.Sleep(50 * time.Millisecond) // the background send goroutines
-	if log := buf.String(); strings.Contains(log, "отправка") {
-		t.Errorf("выключенная доставка пытается отправить:\n%s", log)
+	if log := buf.String(); strings.Contains(log, "send") {
+		t.Errorf("the disabled delivery tries to send:\n%s", log)
 	}
 }
 
@@ -269,11 +269,11 @@ func TestTelegramNotifierNotMeasuredEpisode(t *testing.T) {
 	pass := func(status, detail string) AlertsResult {
 		return AlertsResult{Alerts: []AlertSnapshot{{Name: AlertQueueDead, Status: status, Detail: detail}}}
 	}
-	n.OnPass(pass(AlertStatusNotMeasured, "Redis не задан")) // the "not measured" base
-	n.OnPass(pass(AlertStatusFiring, "глубина 5"))           // 🚨
-	n.OnPass(pass(AlertStatusNotMeasured, "обрыв"))          // an interruption — without a message
-	n.OnPass(pass(AlertStatusOK, "глубина 0"))               // ✅
-	n.OnPass(pass(AlertStatusOK, "глубина 0"))               // silence
+	n.OnPass(pass(AlertStatusNotMeasured, "Redis not set")) // the "not measured" base
+	n.OnPass(pass(AlertStatusFiring, "depth 5"))           // 🚨
+	n.OnPass(pass(AlertStatusNotMeasured, "drop"))          // an interruption — without a message
+	n.OnPass(pass(AlertStatusOK, "depth 0"))               // ✅
+	n.OnPass(pass(AlertStatusOK, "depth 0"))               // silence
 	waitForJournal(t, journal, "🚨")
 	waitForJournal(t, journal, "✅")
 	b, err := os.ReadFile(journal)
@@ -284,7 +284,7 @@ func TestTelegramNotifierNotMeasuredEpisode(t *testing.T) {
 		t.Errorf("🚨 = %d, want 1", n)
 	}
 	if n := strings.Count(string(b), "✅"); n != 1 {
-		t.Errorf("✅ = %d, want 1 (повторный ok молчит)", n)
+		t.Errorf("✅ = %d, want 1 (a repeated ok stays silent)", n)
 	}
 }
 
@@ -296,14 +296,14 @@ func TestTelegramNotifierNotMeasuredCold(t *testing.T) {
 	script := fakeNotifyScript(t, journal, false)
 	n, buf := notifierEnv(t, script, "token", "chat")
 	n.OnPass(AlertsResult{Alerts: []AlertSnapshot{
-		{Name: AlertQueueDead, Status: AlertStatusNotMeasured, Detail: "Redis не задан"},
+		{Name: AlertQueueDead, Status: AlertStatusNotMeasured, Detail: "Redis not set"},
 	}})
 	time.Sleep(50 * time.Millisecond)
-	if strings.Contains(buf.String(), "больше не измеряется") {
-		t.Errorf("холодное «не измеряется» отмечено в логе:\n%s", buf.String())
+	if strings.Contains(buf.String(), "no longer measured") {
+		t.Errorf("a cold \"not measured\" is noted in the log:\n%s", buf.String())
 	}
 	if b, _ := os.ReadFile(journal); len(b) != 0 {
-		t.Errorf("холодное «не измеряется» разослало сообщение: %s", b)
+		t.Errorf("a cold \"not measured\" mailed out a message: %s", b)
 	}
 }
 
@@ -317,8 +317,8 @@ func TestTelegramNotifierSendDelivers(t *testing.T) {
 	journal := filepath.Join(t.TempDir(), "journal.log")
 	script := fakeNotifyScript(t, journal, false)
 	n, _ := notifierEnv(t, script, "token", "chat")
-	n.Send("произвольный отчёт")
-	waitForJournal(t, journal, "произвольный отчёт")
+	n.Send("arbitrary report")
+	waitForJournal(t, journal, "arbitrary report")
 }
 
 // waitForJournal — waits for a line to appear in the mock journal (a
@@ -333,7 +333,7 @@ func waitForJournal(t *testing.T, journal, want string) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("строка %q не доставлена в журнал", want)
+	t.Fatalf("the line %q was not delivered to the journal", want)
 }
 
 // --- renderdebt ---------------------------------------------------------------------
@@ -352,13 +352,13 @@ func TestRenderDebtOptionsBoundaries(t *testing.T) {
 		t.Errorf("DefaultRenderDebtInterval = %v, want 5m", DefaultRenderDebtInterval)
 	}
 	if got := (RenderDebtOptions{}).withDefaults().Interval; got != DefaultRenderDebtInterval {
-		t.Errorf("нулевой интервал = %v, want дефолт", got)
+		t.Errorf("a zero interval = %v, want the default", got)
 	}
 	if got := (RenderDebtOptions{Interval: -time.Second}).withDefaults().Interval; got != DefaultRenderDebtInterval {
-		t.Errorf("отрицательный интервал = %v, want дефолт", got)
+		t.Errorf("a negative interval = %v, want the default", got)
 	}
 	if got := (RenderDebtOptions{Interval: time.Second}).withDefaults().Interval; got != time.Second {
-		t.Errorf("секундный интервал = %v, want как задан", got)
+		t.Errorf("a one-second interval = %v, want as set", got)
 	}
 }
 
@@ -372,15 +372,15 @@ func TestRenderDebtLoopNilLogAndSourceErrors(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("цикл: %v", err)
+			t.Fatalf("the loop: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не вышел")
+		t.Fatal("the loop did not exit")
 	}
 
 	// The source not set — an error.
 	if err := RenderDebtLoop(context.Background(), nil, RenderDebtOptions{Interval: time.Minute}); err == nil {
-		t.Error("источник не задан: хочу ошибку")
+		t.Error("the source is not set: want an error")
 	}
 }
 
@@ -388,15 +388,15 @@ func TestRenderDebtSourceErrors(t *testing.T) {
 	// The pool/Redis not set — source errors (return-cut
 	// mutants would panic on nil).
 	if _, err := renderDebtOf(context.Background(), nil, nil); err == nil {
-		t.Error("пул не задан: хочу ошибку")
+		t.Error("the pool is not set: want an error")
 	}
 	if _, err := renderDebtOf(context.Background(), &zonestatsFakePool{}, nil); err == nil {
-		t.Error("Redis не задан: хочу ошибку")
+		t.Error("Redis not set: want an error")
 	}
 	// A Query error — a source error.
-	pool := &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("бд недоступна")}}}
+	pool := &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("db unavailable")}}}
 	if _, err := renderDebtOf(context.Background(), pool, &renderLensSource{}); err == nil {
-		t.Error("Query-ошибка: хочу ошибку")
+		t.Error("a Query error: want an error")
 	}
 }
 

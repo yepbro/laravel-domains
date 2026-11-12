@@ -73,52 +73,52 @@ func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
 	// not yet engaged.
 	s := m.transition(env.Alerts, ctx, obs(int64(500)))
 	if s.Status != AlertStatusOK {
-		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
+		t.Fatalf("the base: %s (%s), want ok", s.Status, s.Detail)
 	}
-	for _, want := range []string{"q:render-fallback=500", "порог 1000", "снятие < 900", "у порога 0/2"} {
+	for _, want := range []string{"q:render-fallback=500", "threshold 1000", "clearing < 900", "at the threshold 0/2"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+			t.Errorf("detail = %q, want it to contain %s", s.Detail, want)
 		}
 	}
 	// One growth pass — the series is short (a one-off publication spike is
 	// normal fallback operation of "collect and finish").
 	s = m.transition(env.Alerts, ctx, obs(int64(800)))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
-		t.Fatalf("один проход роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "growth streak 1/2") {
+		t.Fatalf("one growth pass: %s (%s), want ok with the streak 1/2", s.Status, s.Detail)
 	}
 	// The second growth pass with a threshold crossing — firing.
 	s = m.transition(env.Alerts, ctx, obs(int64(1420)))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("второй проход роста: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("the second growth pass: %s (%s), want firing", s.Status, s.Detail)
 	}
-	for _, want := range []string{"q:render-fallback=1420", "+620", "воркера B"} {
+	for _, want := range []string{"q:render-fallback=1420", "+620", "worker B"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+			t.Errorf("detail = %q, want it to contain %s", s.Detail, want)
 		}
 	}
 	// Stagnation above the clearing threshold — a hold (not a repeated Warn;
 	// one episode).
 	if s := m.transition(env.Alerts, ctx, obs(int64(1410))); s.Status != AlertStatusFiring {
-		t.Errorf("стагнация: %s (%s), want firing (удержание)", s.Status, s.Detail)
+		t.Errorf("stagnation: %s (%s), want firing (a hold)", s.Status, s.Detail)
 	}
 	// A drain below 90% of the threshold — clearing.
 	if s := m.transition(env.Alerts, ctx, obs(int64(890))); s.Status != AlertStatusOK {
-		t.Errorf("дренаж: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("the drain: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// The hysteresis corridor (900..1000) without a fired alert — ok: the firing
 	// threshold is strict; growth in the corridor builds the series.
 	if s := m.transition(env.Alerts, ctx, obs(int64(950))); s.Status != AlertStatusOK {
-		t.Errorf("коридор без алерта: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("the corridor without an alert: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// A dip resets the series; re-accumulation is again two
 	// growth passes (growth through the threshold is the same accumulation).
 	_ = m.transition(env.Alerts, ctx, obs(int64(800))) // streak 0
 	s = m.transition(env.Alerts, ctx, obs(int64(1010)))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
-		t.Errorf("первый проход повторного роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "growth streak 1/2") {
+		t.Errorf("the first pass of the re-growth: %s (%s), want ok with the streak 1/2", s.Status, s.Detail)
 	}
 	if s := m.transition(env.Alerts, ctx, obs(int64(1060))); s.Status != AlertStatusFiring {
-		t.Errorf("второй проход повторного роста: %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("the second pass of the re-growth: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
 
@@ -140,31 +140,31 @@ func TestAlertsRenderFallbackDepthStationary(t *testing.T) {
 	// A stationary depth of 9000 without growth: the first pass — the
 	// base (at the threshold 1/2), the second — firing.
 	s := m.transition(env.Alerts, ctx, obs(int64(9000)))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "у порога 1/2") {
-		t.Fatalf("стационарная база: %s (%s), want ok с серией у порога 1/2", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "at the threshold 1/2") {
+		t.Fatalf("the stationary base: %s (%s), want ok with the at-the-threshold streak 1/2", s.Status, s.Detail)
 	}
 	s = m.transition(env.Alerts, ctx, obs(int64(9000)))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("стационарная 9000: %s (%s), want firing со 2-го прохода", s.Status, s.Detail)
+		t.Fatalf("a stationary 9000: %s (%s), want firing from the 2nd pass", s.Status, s.Detail)
 	}
-	for _, want := range []string{"q:render-fallback=9000", "порог 7500", "снятие < 6750", "серия роста 0/2", "у порога 2/2", "стационарно"} {
+	for _, want := range []string{"q:render-fallback=9000", "threshold 7500", "clearing < 6750", "growth streak 0/2", "at the threshold 2/2", "stationary"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+			t.Errorf("detail = %q, want it to contain %s", s.Detail, want)
 		}
 	}
 
 	// Pinning at the MAXLEN cap: the depth does not grow (the trim evicts
 	// the undelivered) — firing and a hold.
 	if s := m.transition(env.Alerts, ctx, obs(int64(15000))); s.Status != AlertStatusFiring {
-		t.Errorf("упор в MAXLEN: %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("pinned at MAXLEN: %s (%s), want firing", s.Status, s.Detail)
 	}
 	if s := m.transition(env.Alerts, ctx, obs(int64(15000))); s.Status != AlertStatusFiring {
-		t.Errorf("упор в MAXLEN, второй проход: %s (%s), want firing (удержание)", s.Status, s.Detail)
+		t.Errorf("pinned at MAXLEN, the second pass: %s (%s), want firing (a hold)", s.Status, s.Detail)
 	}
 
 	// A drain below 90% of the threshold — clearing (the latch is not eternal).
 	if s := m.transition(env.Alerts, ctx, obs(int64(6000))); s.Status != AlertStatusOK {
-		t.Errorf("дренаж: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("the drain: %s (%s), want ok", s.Status, s.Detail)
 	}
 
 	// A one-off spike between the passes (dissolving) — silent: the
@@ -172,8 +172,8 @@ func TestAlertsRenderFallbackDepthStationary(t *testing.T) {
 	_ = m.transition(env.Alerts, ctx, obs(int64(9000))) // at the threshold 1/2, ok
 	_ = m.transition(env.Alerts, ctx, obs(int64(100)))  // dissolved, ok
 	s = m.transition(env.Alerts, ctx, obs(int64(9000)))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "у порога 1/2") {
-		t.Errorf("одиночный всплеск: %s (%s), want ok с серией у порога 1/2 (анти-спайк)", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "at the threshold 1/2") {
+		t.Errorf("a single spike: %s (%s), want ok with the at-the-threshold streak 1/2 (anti-spike)", s.Status, s.Detail)
 	}
 }
 
@@ -189,9 +189,9 @@ func TestAlertsRenderFallbackDepthWatermark(t *testing.T) {
 		maxLen    int64
 		want      int64
 	}{
-		{"дефолт конфигурации: кламп по MAXLEN/2", 100000, 0, 7500},
-		{"заниженный watermark ниже предела", 5000, 0, 5000},
-		{"нестандартный MaxLen: кламп по его половине", 100000, 300, 150},
+		{"the default configuration: the clamp by MAXLEN/2", 100000, 0, 7500},
+		{"a watermark below the limit", 5000, 0, 5000},
+		{"a non-standard MaxLen: the clamp by its half", 100000, 300, 150},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -206,14 +206,14 @@ func TestAlertsRenderFallbackDepthWatermark(t *testing.T) {
 			_ = m.transition(env.Alerts, ctx, obs(tc.want+20)) // growth 1
 			s := m.transition(env.Alerts, ctx, obs(tc.want+30))
 			if s.Status != AlertStatusFiring {
-				t.Fatalf("глубина %d > порога %d: %s (%s), want firing",
+				t.Fatalf("the depth %d > the threshold %d: %s (%s), want firing",
 					tc.want+30, tc.want, s.Status, s.Detail)
 			}
 			if got := queue.StreamWatermark(tc.watermark, tc.maxLen, queue.StreamRenderFallback); got != tc.want {
-				t.Errorf("StreamWatermark = %d, want %d (порог алерта — единый расчёт)", got, tc.want)
+				t.Errorf("StreamWatermark = %d, want %d (the alert threshold — one calculation)", got, tc.want)
 			}
-			if !strings.Contains(s.Detail, "порог ") || !strings.Contains(s.Detail, "серия роста 2/2") {
-				t.Errorf("detail = %q, want порог и готовую серию роста", s.Detail)
+			if !strings.Contains(s.Detail, "threshold ") || !strings.Contains(s.Detail, "growth streak 2/2") {
+				t.Errorf("detail = %q, want the threshold and the ready growth streak", s.Detail)
 			}
 		})
 	}
@@ -227,11 +227,11 @@ func TestAlertsRenderFallbackDepthWatermark(t *testing.T) {
 	m := env.newRenderFbDepthMachine()
 	_ = m.transition(env.Alerts, ctx, obs(int64(1000))) // the base (at the threshold 1/2)
 	if s := m.transition(env.Alerts, ctx, obs(int64(1000))); s.Status != AlertStatusFiring {
-		t.Errorf("глубина == порогу без роста два прохода: %s (%s), want firing (стационарно у порога, S-P2-1)", s.Status, s.Detail)
+		t.Errorf("the depth == the threshold without growth for two passes: %s (%s), want firing (stationary at the threshold, S-P2-1)", s.Status, s.Detail)
 	}
 	_ = m.transition(env.Alerts, ctx, obs(int64(1001))) // growth 1 (hold)
 	if s := m.transition(env.Alerts, ctx, obs(int64(1002))); s.Status != AlertStatusFiring {
-		t.Errorf("рост через порог: %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("growth across the threshold: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
 
@@ -244,7 +244,7 @@ func TestAlertsRenderFallbackDepthDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	a := NewAlerts(AlertsDeps{Pool: env.pool}, env.opts)
 	if s := snapshotOf(t, a.Pass(context.Background()), AlertRenderFbDepth); s.Status != AlertStatusNotMeasured {
-		t.Errorf("Redis не задан: %s, want not_measured", s.Status)
+		t.Errorf("Redis not set: %s, want not_measured", s.Status)
 	}
 
 	// The threshold not set (the gate off) — not measured.
@@ -260,10 +260,10 @@ func TestAlertsRenderFallbackDepthDegradation(t *testing.T) {
 	env3.lener.errs = []error{nil, nil, nil, nil, nil, nil, errors.New("redis: xinfo")}
 	s := snapshotOf(t, env3.Pass(context.Background()), AlertRenderFbDepth)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "redis: xinfo") {
-		t.Errorf("ошибка Len: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+		t.Errorf("a Len error: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if !strings.Contains(env3.buf.String(), "level=WARN") {
-		t.Errorf("ошибка Len без Warn:\n%s", env3.buf.String())
+		t.Errorf("a Len error without a Warn:\n%s", env3.buf.String())
 	}
 
 	// The tracking memory survives the failure: growth is counted from the last
@@ -276,19 +276,19 @@ func TestAlertsRenderFallbackDepthDegradation(t *testing.T) {
 	_ = snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth) // growth
 	setFallbackDepth(env4, 1400)
 	if s := snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
-		t.Fatalf("до сбоя: %s, want firing", s.Status)
+		t.Fatalf("before the failure: %s, want firing", s.Status)
 	}
 	env4.lener.errs = []error{nil, nil, nil, nil, nil, nil, errors.New("redis: xinfo")}
 	if s := snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusNotMeasured {
-		t.Fatalf("сбой источника: %s, want not_measured", s.Status)
+		t.Fatalf("a source failure: %s, want not_measured", s.Status)
 	}
 	setFallbackDepth(env4, 1350) // above the clearing threshold of 900
 	if s := snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
-		t.Errorf("после сбоя, глубина 1350: %s, want firing (эпизод пережил сбой)", s.Status)
+		t.Errorf("after the failure, the depth 1350: %s, want firing (the episode survived the failure)", s.Status)
 	}
 	setFallbackDepth(env4, 100)
 	if s := snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusOK {
-		t.Errorf("дренаж после сбоя: %s, want ok", s.Status)
+		t.Errorf("the drain after the failure: %s, want ok", s.Status)
 	}
 }
 
@@ -306,39 +306,39 @@ func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 	// The base: what accumulated before the monitoring start is not an event.
 	s := m.transition(env.Alerts, ctx, obs(int64(3)))
 	if s.Status != AlertStatusOK {
-		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
+		t.Fatalf("the base: %s (%s), want ok", s.Status, s.Detail)
 	}
-	if !strings.Contains(s.Detail, "события бюджета 3") {
-		t.Errorf("detail = %q, want значение счётчика", s.Detail)
+	if !strings.Contains(s.Detail, "budget events 3") {
+		t.Errorf("detail = %q, want the counter value", s.Detail)
 	}
 	// An event — firing (the threshold 1: every latching is an anomaly).
 	s = m.transition(env.Alerts, ctx, obs(int64(4)))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("событие: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("an event: %s (%s), want firing", s.Status, s.Detail)
 	}
-	for _, want := range []string{"новых за окно", "1 (порог 1)", "share_percent"} {
+	for _, want := range []string{"new over the window", "1 (threshold 1)", "share_percent"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+			t.Errorf("detail = %q, want it to contain %s", s.Detail, want)
 		}
 	}
 	// The window of 6 passes holds the alert by aging: 5 passes without events —
 	// still holding; the sixth evicts the delta — clearing.
 	for range 5 {
 		if got := m.transition(env.Alerts, ctx, obs(int64(4))); got.Status != AlertStatusFiring {
-			t.Fatalf("окно держит событие: %s (%s), want firing", got.Status, got.Detail)
+			t.Fatalf("the window holds the event: %s (%s), want firing", got.Status, got.Detail)
 		}
 	}
 	if got := m.transition(env.Alerts, ctx, obs(int64(4))); got.Status != AlertStatusOK {
-		t.Fatalf("после старения окна: %s (%s), want ok", got.Status, got.Detail)
+		t.Fatalf("after the window aging: %s (%s), want ok", got.Status, got.Detail)
 	}
 	// A worker restart (the counter reset) — a decrease is not a spike.
 	if got := m.transition(env.Alerts, ctx, obs(int64(0))); got.Status != AlertStatusOK {
-		t.Errorf("рестарт воркера: %s (%s), want ok без всплеска", got.Status, got.Detail)
+		t.Errorf("a worker restart: %s (%s), want ok without a spike", got.Status, got.Detail)
 	}
 	// An event flow extends the alert: an event in every pass.
 	for i := int64(1); i <= 3; i++ {
 		if got := m.transition(env.Alerts, ctx, obs(i)); got.Status != AlertStatusFiring {
-			t.Fatalf("поток событий, проход %d: %s, want firing", i, got.Status)
+			t.Fatalf("an event flow, pass %d: %s, want firing", i, got.Status)
 		}
 	}
 }
@@ -356,28 +356,28 @@ func TestAlertsRenderFallbackBudgetPrecreatedSeries(t *testing.T) {
 	// The pre-created series: the probe reads 0 (not "not measured"); prev
 	// is based at zero.
 	if s := m.transition(env.Alerts, ctx, obs(int64(0))); s.Status != AlertStatusOK {
-		t.Fatalf("нулевая серия: %s (%s), want ok (предсоздание T-250)", s.Status, s.Detail)
+		t.Fatalf("a zero series: %s (%s), want ok (the T-250 pre-creation)", s.Status, s.Detail)
 	}
 	// The first event 0→1 — firing: the delta is visible, the window holds it.
 	if s := m.transition(env.Alerts, ctx, obs(int64(1))); s.Status != AlertStatusFiring {
-		t.Fatalf("первое событие 0→1: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("the first event 0→1: %s (%s), want firing", s.Status, s.Detail)
 	}
 	// The window ages: 5 passes hold the event, the sixth evicts — clearing.
 	for range 5 {
 		if got := m.transition(env.Alerts, ctx, obs(int64(1))); got.Status != AlertStatusFiring {
-			t.Fatalf("окно держит событие: %s (%s), want firing", got.Status, got.Detail)
+			t.Fatalf("the window holds the event: %s (%s), want firing", got.Status, got.Detail)
 		}
 	}
 	if got := m.transition(env.Alerts, ctx, obs(int64(1))); got.Status != AlertStatusOK {
-		t.Fatalf("после старения окна: %s (%s), want ok", got.Status, got.Detail)
+		t.Fatalf("after the window aging: %s (%s), want ok", got.Status, got.Detail)
 	}
 	// A worker restart: a process counter — reset; a decrease is not a spike.
 	if got := m.transition(env.Alerts, ctx, obs(int64(0))); got.Status != AlertStatusOK {
-		t.Fatalf("рестарт воркера: %s (%s), want ok без всплеска", got.Status, got.Detail)
+		t.Fatalf("a worker restart: %s (%s), want ok without a spike", got.Status, got.Detail)
 	}
 	// A repeated first event (0→1 of the new process) — firing again.
 	if got := m.transition(env.Alerts, ctx, obs(int64(1))); got.Status != AlertStatusFiring {
-		t.Fatalf("первое событие после рестарта: %s (%s), want firing", got.Status, got.Detail)
+		t.Fatalf("the first event after the restart: %s (%s), want firing", got.Status, got.Detail)
 	}
 }
 
@@ -388,13 +388,13 @@ func TestAlertsRenderFallbackBudgetDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	s := snapshotOf(t, env.Pass(context.Background()), AlertRenderFbBudget)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("источник не задан: %s, want not_measured", s.Status)
+		t.Fatalf("the source is not set: %s, want not_measured", s.Status)
 	}
 	if !strings.Contains(s.Detail, "monitor.render_metrics_url") {
-		t.Errorf("detail = %q, want подсказка адреса", s.Detail)
+		t.Errorf("detail = %q, want the address hint", s.Detail)
 	}
 	if strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("источник не задан дал Warn:\n%s", env.buf.String())
+		t.Errorf("the source not set produced a Warn:\n%s", env.buf.String())
 	}
 
 	env2 := newAlertsTestEnv(t, nil)
@@ -402,10 +402,10 @@ func TestAlertsRenderFallbackBudgetDegradation(t *testing.T) {
 	env2.deps.FallbackBudget = src
 	s = snapshotOf(t, env2.Pass(context.Background()), AlertRenderFbBudget)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "connection refused") {
-		t.Errorf("ошибка зонда: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+		t.Errorf("a probe error: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if !strings.Contains(env2.buf.String(), "level=WARN") {
-		t.Errorf("ошибка зонда без Warn:\n%s", env2.buf.String())
+		t.Errorf("a probe error without a Warn:\n%s", env2.buf.String())
 	}
 
 	// The error queue emptied — the next pass of the live probe works
@@ -413,8 +413,8 @@ func TestAlertsRenderFallbackBudgetDegradation(t *testing.T) {
 	// base without a spike.
 	src.set(5)
 	if s := snapshotOf(t, env2.Pass(context.Background()), AlertRenderFbBudget); s.Status != AlertStatusOK ||
-		!strings.Contains(s.Detail, "события бюджета 5") {
-		t.Errorf("живой зонд после ошибки: %s (%s), want ok с базой кольца", s.Status, s.Detail)
+		!strings.Contains(s.Detail, "budget events 5") {
+		t.Errorf("a live probe after the error: %s (%s), want ok with the ring base", s.Status, s.Detail)
 	}
 }
 
@@ -449,40 +449,40 @@ func TestAlertsRenderBrowserErrors(t *testing.T) {
 
 	// The base: the lazy family — 0 at a live worker without browser errors.
 	s := m.transition(env.Alerts, ctx, obs(int64(0)))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "browser-ошибки рендера 0") {
-		t.Fatalf("база: %s (%s), want ok с нулём", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "render browser errors 0") {
+		t.Fatalf("the base: %s (%s), want ok with zero", s.Status, s.Detail)
 	}
 	// A single error — a series of 1/2, silent (a normal session restart).
 	s = m.transition(env.Alerts, ctx, obs(int64(1)))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
-		t.Fatalf("одиночная: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "growth streak 1/2") {
+		t.Fatalf("a single one: %s (%s), want ok with the streak 1/2", s.Status, s.Detail)
 	}
 	// A series — the second growing pass: firing.
 	s = m.transition(env.Alerts, ctx, obs(int64(3)))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("серия: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("a series: %s (%s), want firing", s.Status, s.Detail)
 	}
-	for _, want := range []string{"browser-ошибки рендера 3", "+2", "движок"} {
+	for _, want := range []string{"render browser errors 3", "+2", "engine"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+			t.Errorf("detail = %q, want it to contain %s", s.Detail, want)
 		}
 	}
 	// The counter stands — the series is reset, the alert cleared (an engine recovery
 	// or the gate hold: no new errors).
 	if s := m.transition(env.Alerts, ctx, obs(int64(3))); s.Status != AlertStatusOK {
-		t.Errorf("стационарно: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("stationary: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// A worker restart (a process counter, reset) — a decrease is not a spike.
 	if s := m.transition(env.Alerts, ctx, obs(int64(0))); s.Status != AlertStatusOK {
-		t.Errorf("рестарт воркера: %s (%s), want ok без всплеска", s.Status, s.Detail)
+		t.Errorf("a worker restart: %s (%s), want ok without a spike", s.Status, s.Detail)
 	}
 	// A new accumulation — again two growing passes.
 	s = m.transition(env.Alerts, ctx, obs(int64(2)))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
-		t.Errorf("первый проход новой серии: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "growth streak 1/2") {
+		t.Errorf("the first pass of the new series: %s (%s), want ok with the streak 1/2", s.Status, s.Detail)
 	}
 	if s := m.transition(env.Alerts, ctx, obs(int64(5))); s.Status != AlertStatusFiring {
-		t.Errorf("второй проход новой серии: %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("the second pass of the new series: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
 
@@ -495,20 +495,20 @@ func TestAlertsRenderBrowserErrorsDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	s := snapshotOf(t, env.Pass(context.Background()), AlertRenderBrowserErr)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "monitor.render_metrics_url") {
-		t.Fatalf("источник не задан: %s (%s), want not_measured с подсказкой", s.Status, s.Detail)
+		t.Fatalf("the source is not set: %s (%s), want not_measured with a hint", s.Status, s.Detail)
 	}
 	if strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("источник не задан дал Warn:\n%s", env.buf.String())
+		t.Errorf("the source not set produced a Warn:\n%s", env.buf.String())
 	}
 
 	env2 := newAlertsTestEnv(t, nil)
 	env2.deps.RenderBrowserErrors = &fakeBrowserErrors{errs: []error{errNotRenderExposition}}
 	s = snapshotOf(t, env2.Pass(context.Background()), AlertRenderBrowserErr)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "не рендер-воркера") {
-		t.Fatalf("чужая экспозиция: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "not a render worker") {
+		t.Fatalf("a foreign exposition: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if strings.Contains(env2.buf.String(), "level=WARN") {
-		t.Errorf("чужая экспозиция дала Warn:\n%s", env2.buf.String())
+		t.Errorf("a foreign exposition produced a Warn:\n%s", env2.buf.String())
 	}
 
 	env3 := newAlertsTestEnv(t, nil)
@@ -516,17 +516,17 @@ func TestAlertsRenderBrowserErrorsDegradation(t *testing.T) {
 	env3.deps.RenderBrowserErrors = src
 	s = snapshotOf(t, env3.Pass(context.Background()), AlertRenderBrowserErr)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "connection refused") {
-		t.Fatalf("сетевая ошибка: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+		t.Fatalf("a network error: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if !strings.Contains(env3.buf.String(), "level=WARN") {
-		t.Errorf("сетевая ошибка без Warn:\n%s", env3.buf.String())
+		t.Errorf("a network error without a Warn:\n%s", env3.buf.String())
 	}
 
 	// The error queue emptied — the live probe reads the lazy series (the
 	// success of observeRenderBrowserErrors with the full stack): 0 without errors — ok.
 	if s := snapshotOf(t, env3.Pass(context.Background()), AlertRenderBrowserErr); s.Status != AlertStatusOK ||
-		!strings.Contains(s.Detail, "browser-ошибки рендера 0") {
-		t.Errorf("живой зонд после ошибки: %s (%s), want ok с нулём", s.Status, s.Detail)
+		!strings.Contains(s.Detail, "render browser errors 0") {
+		t.Errorf("a live probe after the error: %s (%s), want ok with zero", s.Status, s.Detail)
 	}
 }
 
@@ -541,32 +541,32 @@ func TestParseBrowserErrorsExposition(t *testing.T) {
 		want    int64
 		wantErr string
 	}{
-		{"ветка browser", `crawler_stage_errors_total{stage="render",type="browser"} 7`, 7, ""},
-		{"соседние классы этапа не мешают",
+		{"the browser branch", `crawler_stage_errors_total{stage="render",type="browser"} 7`, 7, ""},
+		{"neighboring stage classes do not interfere",
 			"crawler_stage_errors_total{stage=\"render\",type=\"task\"} 3\n" +
 				"crawler_stage_errors_total{stage=\"render\",type=\"context\"} 2\n" +
 				"crawler_stage_errors_total{stage=\"render\",type=\"browser\"} 1\n", 1, ""},
-		{"чужой stage (http-воркер) — чужая экспозиция",
-			"crawler_stage_errors_total{stage=\"http\",type=\"timeout\"} 99", 0, "не рендер-воркера"},
-		{"ленивое семейство у рендер-воркера — 0",
+		{"a foreign stage (the http-worker) — a foreign exposition",
+			"crawler_stage_errors_total{stage=\"http\",type=\"timeout\"} 99", 0, "not a render worker"},
+		{"a lazy family at the render worker — 0",
 			"crawler_stage_tasks_total{stage=\"render\"} 5\n", 0, ""},
-		{"без метрик вовсе — чужая экспозиция", "# HELP x y\n", 0, "не рендер-воркера"},
-		{"не-число", `crawler_stage_errors_total{stage="render",type="browser"} много`, 0, "не счётчик"},
+		{"no metrics at all — a foreign exposition", "# HELP x y\n", 0, "not a render worker"},
+		{"not a number", `crawler_stage_errors_total{stage="render",type="browser"} many`, 0, "is not a counter"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseBrowserErrorsExposition(strings.NewReader(tc.expo))
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("ошибка = %v, want содержит %q", err, tc.wantErr)
+					t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("разбор: %v", err)
+				t.Fatalf("parse: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("значение = %d, want %d", got, tc.want)
+				t.Errorf("the value = %d, want %d", got, tc.want)
 			}
 		})
 	}
@@ -578,7 +578,7 @@ func TestParseBrowserErrorsExposition(t *testing.T) {
 // browser error counter from a live exposition (httptest): gate events and other
 // gauges do not interfere; a 404 path — an error with the address.
 func TestRenderSuspendsHTTP(t *testing.T) {
-	const expo = `# HELP crawler_render_fallback_suspended_total События приостановки
+	const expo = `# HELP crawler_render_fallback_suspended_total Suspension events
 # TYPE crawler_render_fallback_suspended_total counter
 crawler_render_fallback_suspended_total{reason="gate"} 2
 crawler_render_fallback_suspended_total{reason="budget"} 7
@@ -596,7 +596,7 @@ crawler_stage_tasks_total{stage="render"} 123
 		t.Fatalf("FallbackBudget: %v", err)
 	}
 	if got != 7 {
-		t.Errorf("счётчик = %d, want 7 (только ветка budget)", got)
+		t.Errorf("the counter = %d, want 7 (the budget branch only)", got)
 	}
 
 	browser, err := RenderSuspends{URL: srv.URL}.RenderBrowserErrors(context.Background())
@@ -604,7 +604,7 @@ crawler_stage_tasks_total{stage="render"} 123
 		t.Fatalf("RenderBrowserErrors: %v", err)
 	}
 	if browser != 4 {
-		t.Errorf("browser-ошибки = %d, want 4 (ветка browser, соседние классы не мешают)", browser)
+		t.Errorf("browser errors = %d, want 4 (the browser branch, neighboring classes do not interfere)", browser)
 	}
 
 	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -613,11 +613,11 @@ crawler_stage_tasks_total{stage="render"} 123
 	defer broken.Close()
 	if _, err := (RenderSuspends{URL: broken.URL}).FallbackBudget(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "500") {
-		t.Errorf("не-200: %v, want ошибка со статусом", err)
+		t.Errorf("non-200: %v, want an error with the status", err)
 	}
 	if _, err := (RenderSuspends{URL: broken.URL}).RenderBrowserErrors(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "500") {
-		t.Errorf("не-200 (browser): %v, want ошибка со статусом", err)
+		t.Errorf("non-200 (browser): %v, want an error with the status", err)
 	}
 }
 
@@ -633,34 +633,34 @@ func TestParseSuspendExposition(t *testing.T) {
 		want    int64
 		wantErr string
 	}{
-		{"ветка бюджета", `crawler_render_fallback_suspended_total{reason="budget"} 7`, 7, ""},
-		{"предсозданная серия T-250 — 0 с первого старта",
+		{"the budget branch", `crawler_render_fallback_suspended_total{reason="budget"} 7`, 7, ""},
+		{"the pre-created T-250 series — 0 from the first start",
 			"crawler_stage_tasks_total{stage=\"render\"} 123\n" +
 				"crawler_render_fallback_suspended_total{reason=\"budget\"} 0\n", 0, ""},
-		{"семейство есть, ветки budget нет, маркер рендер-воркера — 0 (S-P1-4)",
+		{"the family is there, the budget branch is not, the render-worker marker — 0 (S-P1-4)",
 			"crawler_render_fallback_suspended_total{reason=\"gate\"} 2\n" +
 				"crawler_stage_tasks_total{stage=\"render\"} 123\n", 0, ""},
-		{"старая сборка: маркер есть, семейства нет — 0",
+		{"an old build: the marker is there, the family is not — 0",
 			"crawler_stage_tasks_total{stage=\"render\"} 123\n", 0, ""},
-		{"только gate, маркера нет — чужая экспозиция", `crawler_render_fallback_suspended_total{reason="gate"} 2`, 0, "отсутствует"},
-		{"без метрик вовсе (чужая экспозиция)", "# HELP x y\n", 0, "отсутствует"},
-		{"не-число", `crawler_render_fallback_suspended_total{reason="budget"} много`, 0, "не счётчик"},
-		{"отрицательное", `crawler_render_fallback_suspended_total{reason="budget"} -1`, 0, "не счётчик"},
+		{"only gate, no marker — a foreign exposition", `crawler_render_fallback_suspended_total{reason="gate"} 2`, 0, "is missing"},
+		{"no metrics at all (a foreign exposition)", "# HELP x y\n", 0, "is missing"},
+		{"not a number", `crawler_render_fallback_suspended_total{reason="budget"} many`, 0, "is not a counter"},
+		{"negative", `crawler_render_fallback_suspended_total{reason="budget"} -1`, 0, "is not a counter"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseSuspendExposition(strings.NewReader(tc.expo))
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("ошибка = %v, want содержит %q", err, tc.wantErr)
+					t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("разбор: %v", err)
+				t.Fatalf("parse: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("значение = %d, want %d", got, tc.want)
+				t.Errorf("the value = %d, want %d", got, tc.want)
 			}
 		})
 	}

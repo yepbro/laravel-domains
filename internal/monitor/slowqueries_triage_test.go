@@ -21,7 +21,7 @@ import (
 
 func TestPGSlowQueries_NoPool(t *testing.T) {
 	if _, err := (PGSlowQueries{}).SlowQueries(context.Background(), time.Second); err == nil {
-		t.Error("пул не задан: хочу ошибку источника")
+		t.Error("the pool is not set: want a source error")
 	}
 }
 
@@ -41,12 +41,12 @@ func TestPGSlowQueries_Contract(t *testing.T) {
 	}
 	calls := pool.calls()
 	if len(calls) != 1 || calls[0].sql != slowQuerySQL {
-		t.Fatalf("запросов = %d, want 1 с текстом slowQuerySQL", len(calls))
+		t.Fatalf("queries = %d, want 1 with the slowQuerySQL text", len(calls))
 	}
 	want := []any{"monitor", 3.0, 20}
 	got := calls[0].args
 	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
-		t.Errorf("аргументы = %#v, want %#v (дефолт лимита 20)", got, want)
+		t.Errorf("args = %#v, want %#v (the default limit of 20)", got, want)
 	}
 
 	pool2 := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
@@ -54,7 +54,7 @@ func TestPGSlowQueries_Contract(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := pool2.calls()[0].args[2]; got != 7 {
-		t.Errorf("явный лимит = %v, want 7", got)
+		t.Errorf("an explicit limit = %v, want 7", got)
 	}
 	for _, lim := range []int{0, -1} {
 		pool3 := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
@@ -62,30 +62,30 @@ func TestPGSlowQueries_Contract(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got := pool3.calls()[0].args[2]; got != 20 {
-			t.Errorf("лимит %d → %v, want дефолт 20", lim, got)
+			t.Errorf("the limit %d → %v, want the default 20", lim, got)
 		}
 	}
 }
 
 // TestPGSlowQueries_Errors — Query/Scan/Err errors fail the source.
 func TestPGSlowQueries_Errors(t *testing.T) {
-	src := PGSlowQueries{Pool: &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("бд недоступна")}}}}
+	src := PGSlowQueries{Pool: &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("db unavailable")}}}}
 	if q, err := src.SlowQueries(context.Background(), time.Second); err == nil || q != nil {
-		t.Errorf("Query-ошибка: (%v, %v), want nil и ошибка", q, err)
+		t.Errorf("a Query error: (%v, %v), want nil and an error", q, err)
 	}
 	// A row of the wrong width — a Scan error with the "reading" context.
 	narrow := &zonestatsFakePool{steps: []zonestatsStep{
 		{rows: zonestatsRows([]any{7, "app"})}}}
 	if _, err := (PGSlowQueries{Pool: narrow}).SlowQueries(context.Background(), time.Second); err == nil ||
-		!strings.Contains(err.Error(), "чтение") {
-		t.Errorf("Scan-ошибка = %v, want контекст чтения", err)
+		!strings.Contains(err.Error(), "scan") {
+		t.Errorf("the Scan error = %v, want the scan context", err)
 	}
 	// An iteration error after a row — a source error.
-	r := &zonestatsFakeRows{rows: [][]any{slowScanRow(11, "scheduler", 42.3, "SELECT 1")}, err: errors.New("обрыв")}
+	r := &zonestatsFakeRows{rows: [][]any{slowScanRow(11, "scheduler", 42.3, "SELECT 1")}, err: errors.New("drop")}
 	if _, err := (PGSlowQueries{Pool: &zonestatsFakePool{steps: []zonestatsStep{{rows: r}}}}).
 		SlowQueries(context.Background(), time.Second); err == nil ||
-		!strings.Contains(err.Error(), "обрыв") {
-		t.Errorf("rows.Err = %v, want исходная ошибка", err)
+		!strings.Contains(err.Error(), "drop") {
+		t.Errorf("rows.Err = %v, want the original error", err)
 	}
 }
 
@@ -95,11 +95,11 @@ func TestSlowQueriesPluralAll(t *testing.T) {
 	plural := func(n int) string {
 		switch {
 		case n%10 == 1 && n%100 != 11:
-			return "медленный запрос"
+			return "slow query"
 		case n%10 >= 2 && n%10 <= 4 && (n%100 < 10 || n%100 >= 20):
-			return "медленных запроса"
+			return "slow queries"
 		}
-		return "медленных запросов"
+		return "slow queries"
 	}
 	for n := 0; n <= 300; n++ {
 		if got := slowQueriesPhrase(n); got != plural(n) {

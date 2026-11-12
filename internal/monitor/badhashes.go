@@ -66,15 +66,15 @@ func (s IngestBadHashes) BadHashes(ctx context.Context) (int64, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
 	if err != nil {
-		return 0, fmt.Errorf("monitor: зонд %s: %w", s.URL, err)
+		return 0, fmt.Errorf("monitor: probe %s: %w", s.URL, err)
 	}
 	resp, err := cl.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("monitor: зонд %s: %w", s.URL, err)
+		return 0, fmt.Errorf("monitor: probe %s: %w", s.URL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("monitor: зонд %s: статус %s", s.URL, resp.Status)
+		return 0, fmt.Errorf("monitor: probe %s: status %s", s.URL, resp.Status)
 	}
 	return parseBadHashesExposition(resp.Body)
 }
@@ -106,12 +106,12 @@ func parseBadHashesExposition(r io.Reader) (int64, error) {
 		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 		v, err := strconv.ParseFloat(fields[1], 64)
 		if err != nil || v < 0 {
-			return 0, fmt.Errorf("monitor: %s: значение %q не счётчик", badHashesMetricName, fields[1])
+			return 0, fmt.Errorf("monitor: %s: the value %q is not a counter", badHashesMetricName, fields[1])
 		}
 		return int64(v), nil
 	}
 	if err := sc.Err(); err != nil {
-		return 0, fmt.Errorf("monitor: чтение экспозиции: %w", err)
+		return 0, fmt.Errorf("monitor: exposition read: %w", err)
 	}
-	return 0, fmt.Errorf("monitor: метрика %s отсутствует в экспозиции ingest", badHashesMetricName)
+	return 0, fmt.Errorf("monitor: the %s metric is missing from the ingest exposition", badHashesMetricName)
 }

@@ -24,7 +24,7 @@ func TestParsePSI(t *testing.T) {
 		t.Fatalf("parsePSI: %v", err)
 	}
 	if st.Avg10 != 1.25 || st.Avg60 != 2.5 || st.Avg300 != 3.75 {
-		t.Errorf("средние = %+v, want 1.25/2.5/3.75", st)
+		t.Errorf("the averages = %+v, want 1.25/2.5/3.75", st)
 	}
 
 	// A file with a full line (the kernel returns it for memory/IO —
@@ -38,7 +38,7 @@ func TestParsePSI(t *testing.T) {
 	// An empty file / only full / garbage — there is no some line.
 	for _, bad := range []string{"", "full avg10=0 avg60=0 avg300=0 total=0\n", "garbage\n"} {
 		if _, err := parsePSI(bad); err == nil || !strings.Contains(err.Error(), "some") {
-			t.Errorf("%q: ошибка = %v, want «строка some отсутствует»", bad, err)
+			t.Errorf("%q: error = %v, want \"the some line is missing\"", bad, err)
 		}
 	}
 
@@ -52,7 +52,7 @@ func TestParsePSI(t *testing.T) {
 		"some avg60=1 avg300=1 total=0\n",
 	} {
 		if _, err := parsePSI(bad); err == nil {
-			t.Errorf("%q: ошибки нет, want ошибка формата", bad)
+			t.Errorf("%q: no error, want a format error", bad)
 		}
 	}
 }
@@ -68,26 +68,26 @@ func TestOSPISource(t *testing.T) {
 	}
 	st, err := (OSPSI{Path: file}).PSI(context.Background())
 	if err != nil || st.Avg300 != 4 {
-		t.Errorf("PSI по файлу: (%+v, %v), want avg300=4", st, err)
+		t.Errorf("PSI over the file: (%+v, %v), want avg300=4", st, err)
 	}
 
 	// No file — a kernel without PSI: the quiet class (the alert degrades without a Warn).
-	_, err = (OSPSI{Path: filepath.Join(dir, "нет")}).PSI(context.Background())
+	_, err = (OSPSI{Path: filepath.Join(dir, "missing")}).PSI(context.Background())
 	if !errors.Is(err, errNoPSI) {
-		t.Errorf("нет файла: ошибка = %v, want errNoPSI", err)
+		t.Errorf("no file: error = %v, want errNoPSI", err)
 	}
 
 	// A directory instead of a file — another error (not errNoPSI).
 	_, err = (OSPSI{Path: dir}).PSI(context.Background())
 	if err == nil || errors.Is(err, errNoPSI) {
-		t.Errorf("каталог вместо файла: ошибка = %v, want обычная ошибка чтения", err)
+		t.Errorf("a directory instead of the file: error = %v, want a regular read error", err)
 	}
 
 	// A ctx cancellation — before the file access.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := (OSPSI{Path: file}).PSI(ctx); !errors.Is(err, context.Canceled) {
-		t.Errorf("отмена ctx: ошибка = %v, want context.Canceled", err)
+		t.Errorf("a ctx cancellation: error = %v, want context.Canceled", err)
 	}
 }
 
@@ -100,12 +100,12 @@ func TestOSPSIDefaultPath(t *testing.T) {
 	st, err := (OSPSI{}).PSI(context.Background())
 	if err != nil {
 		if !errors.Is(err, errNoPSI) {
-			t.Errorf("дефолтный путь: ошибка = %v, want errNoPSI или валидный снимок", err)
+			t.Errorf("the default path: error = %v, want errNoPSI or a valid snapshot", err)
 		}
 		return
 	}
 	if st.Avg10 < 0 || st.Avg10 > 100 || st.Avg300 < 0 || st.Avg300 > 100 {
-		t.Errorf("снимок вне 0–100: %+v", st)
+		t.Errorf("a snapshot outside 0–100: %+v", st)
 	}
 }
 
@@ -119,7 +119,7 @@ func TestPSIMetrics(t *testing.T) {
 
 	st, err := m.PSI(context.Background())
 	if err != nil || st.Avg300 != 30 {
-		t.Fatalf("PSI: (%+v, %v), want транзит снимка", st, err)
+		t.Fatalf("PSI: (%+v, %v), want the snapshot transit", st, err)
 	}
 	for kind, want := range map[string]float64{"avg10": 10, "avg60": 20, "avg300": 30} {
 		v, ok := gaugeLabels(t, reg, "crawler_psi_cpu_some_percent", map[string]string{"kind": kind})
@@ -129,19 +129,19 @@ func TestPSIMetrics(t *testing.T) {
 	}
 
 	// A source error: the metrics are untouched, the error is returned.
-	src.err = errors.New("отказ")
+	src.err = errors.New("failure")
 	if _, err := m.PSI(context.Background()); err == nil {
-		t.Error("ошибка источника проглочена")
+		t.Error("the source error was swallowed")
 	}
 	v, ok := gaugeLabels(t, reg, "crawler_psi_cpu_some_percent", map[string]string{"kind": "avg300"})
 	if !ok || v != 30 {
-		t.Errorf("после ошибки avg300 = (%v, %v), want 30 (hold-last)", v, ok)
+		t.Errorf("after the error avg300 = (%v, %v), want 30 (hold-last)", v, ok)
 	}
 
 	// A nil registry — pure transit.
 	src.err = nil
 	plain := NewPSIMetrics(nil, src)
 	if st, err := plain.PSI(context.Background()); err != nil || st.Avg10 != 10 {
-		t.Errorf("транзит без реестра = (%+v, %v), want источник как есть", st, err)
+		t.Errorf("transit without a registry = (%+v, %v), want the source as is", st, err)
 	}
 }

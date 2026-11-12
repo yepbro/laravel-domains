@@ -44,22 +44,22 @@ func TestReportDriftDirect(t *testing.T) {
 	reportDrift(logger, m, ZoneStatsResult{Positions: []CounterPosition{
 		{Counter: "x", Old: 1, New: 2}}}, true)
 	if log := slogBuf.String(); log != "" {
-		t.Fatalf("fillFirst пишет лог:\n%s", log)
+		t.Fatalf("fillFirst writes a log:\n%s", log)
 	}
 	// Steady state (no drift) — silence.
 	reportDrift(logger, m, ZoneStatsResult{Positions: zero}, false)
 	if log := slogBuf.String(); log != "" {
-		t.Fatalf("стационар без дрейфа пишет Warn:\n%s", log)
+		t.Fatalf("a stationary pass without drift writes a Warn:\n%s", log)
 	}
 	// The streaming positions (daily/retry/hourly) do not raise a Warn —
 	// but are written to the gauge.
 	reportDrift(logger, m, ZoneStatsResult{Positions: []CounterPosition{
 		{Counter: dailyChecksCounter, Old: 7, New: 9}}}, false)
 	if log := slogBuf.String(); strings.Contains(log, "level=WARN") {
-		t.Fatalf("потоковая позиция в Warn:\n%s", log)
+		t.Fatalf("a streaming position in the Warn:\n%s", log)
 	}
 	if v := driftGaugeValue(t, reg, dailyChecksCounter); v != 2 {
-		t.Errorf("gauge потоковой позиции = %v, want 2", v)
+		t.Errorf("the streaming position gauge = %v, want 2", v)
 	}
 
 	// Seven drifting positions by 2 each: a Warn with sum_abs=14 and
@@ -72,20 +72,20 @@ func TestReportDriftDirect(t *testing.T) {
 	}
 	reportDrift(logger, m, ZoneStatsResult{Positions: positions}, false)
 	log := slogBuf.String()
-	if !strings.Contains(log, "реконсиляция: дрейф") {
-		t.Fatalf("Warn дрейфа не поднялся:\n%s", log)
+	if !strings.Contains(log, "reconciliation: counter drift") {
+		t.Fatalf("the drift Warn was not raised:\n%s", log)
 	}
 	if !strings.Contains(log, "sum_abs=14") {
-		t.Errorf("Warn без точной суммы (want sum_abs=14):\n%s", log)
+		t.Errorf("the Warn without the exact sum (want sum_abs=14):\n%s", log)
 	}
 	if !strings.Contains(log, "positions=7") {
-		t.Errorf("Warn без счётчика позиций (want positions=7):\n%s", log)
+		t.Errorf("the Warn without the position counter (want positions=7):\n%s", log)
 	}
 	if n := strings.Count(log, " → "); n != 5 {
-		t.Errorf("строк топа = %d, want ровно 5:\n%s", n, log)
+		t.Errorf("top lines = %d, want exactly 5:\n%s", n, log)
 	}
 	if strings.Contains(log, "zone:6:total") || strings.Contains(log, "zone:5:total") {
-		t.Errorf("топ длиннее пяти строк:\n%s", log)
+		t.Errorf("the top is longer than five lines:\n%s", log)
 	}
 }
 
@@ -127,14 +127,14 @@ func TestVerifyCountersCleanAndDiff(t *testing.T) {
 		t.Fatalf("VerifyCounters: %v", err)
 	}
 	if len(out) != 0 {
-		t.Errorf("расхождения при совпадении: %+v", out)
+		t.Errorf("mismatches at equality: %+v", out)
 	}
 	// All the row sets are Closed on the happy path too (zones and history
 	// are closed by explicit calls after reading — not only by the error
 	// branches above).
 	for i, step := range steps {
 		if !step.rows.closed {
-			t.Errorf("строки шага %d не закрыты Close", i)
+			t.Errorf("the rows of step %d are not closed by Close", i)
 		}
 	}
 
@@ -160,10 +160,10 @@ func TestVerifyCountersCleanAndDiff(t *testing.T) {
 		t.Errorf("zone:7:queued = %+v, want old=0 new=2", p)
 	}
 	if p := byName["global:laravel_appeared_total"]; p.Old != 0 || p.New != 1 {
-		t.Errorf("кумулятив appeared = %+v, want old=0 (строки нет) new=1", p)
+		t.Errorf("the appeared cumulative = %+v, want old=0 (no row) new=1", p)
 	}
 	if p := byName["global:laravel_lost_total"]; p.Old != 0 || p.New != 2 {
-		t.Errorf("кумулятив lost = %+v, want old=0 new=2", p)
+		t.Errorf("the lost cumulative = %+v, want old=0 new=2", p)
 	}
 	if p := byName["global:render_pending"]; p.Old != 5 || p.New != 2 {
 		t.Errorf("render_pending = %+v, want old=5 new=2", p)
@@ -178,7 +178,7 @@ func TestVerifyCountersCleanAndDiff(t *testing.T) {
 	)}
 	out, _ = VerifyCounters(context.Background(), pool3, VerifyOptions{Tolerance: 1})
 	if len(out) != 0 {
-		t.Errorf("расхождение в допуске наблюдается: %+v", out)
+		t.Errorf("a mismatch within the tolerance is observed: %+v", out)
 	}
 }
 
@@ -194,10 +194,10 @@ func TestVerifyCountersErrors(t *testing.T) {
 		err  error
 		want string
 	}{
-		{"зоны", 0, errors.New("бд недоступна"), "сверка счётчиков: зоны"},
-		{"агрегат", 1, errors.New("бд недоступна"), "агрегат"},
-		{"история", 2, errors.New("бд недоступна"), "история"},
-		{"сохранённые", 3, errors.New("бд недоступна"), "сохранённые"},
+		{"zones", 0, errors.New("db unavailable"), "counter verify: zones"},
+		{"aggregate", 1, errors.New("db unavailable"), "aggregate"},
+		{"history", 2, errors.New("db unavailable"), "history"},
+		{"stored", 3, errors.New("db unavailable"), "stored"},
 	} {
 		steps := verifySteps(
 			zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
@@ -205,8 +205,8 @@ func TestVerifyCountersErrors(t *testing.T) {
 		steps[tc.step].err = tc.err
 		if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps}, VerifyOptions{}); err == nil ||
 			!strings.Contains(err.Error(), tc.want) ||
-			!strings.Contains(err.Error(), "бд недоступна") {
-			t.Errorf("%s: %v, want контекст %q с исходной", tc.name, err, tc.want)
+			!strings.Contains(err.Error(), "db unavailable") {
+			t.Errorf("%s: %v, want the %q context with the original", tc.name, err, tc.want)
 		}
 	}
 	// An empty history answer — a protocol break.
@@ -214,12 +214,12 @@ func TestVerifyCountersErrors(t *testing.T) {
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow), zonestatsRows(), stored)
 	if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps}, VerifyOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пустой ответ") {
-		t.Errorf("пустая история = %v, want обрыв протокола", err)
+		!strings.Contains(err.Error(), "empty response") {
+		t.Errorf("an empty history = %v, want a protocol break", err)
 	}
 	// Malformed rows (Scan errors) of each set — with the "reading"
 	// context (fresh sets per iteration: the row iterator is one-shot).
-	narrow := [][]any{{int16(7)}, {int64(1)}, {int64(9)}, {"имя"}}
+	narrow := [][]any{{int16(7)}, {int64(1)}, {int64(9)}, {"name"}}
 	for i, row := range narrow {
 		steps := verifySteps(
 			zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
@@ -228,8 +228,8 @@ func TestVerifyCountersErrors(t *testing.T) {
 			zonestatsRows(counterRowOf("render_pending", 0)))
 		steps[i].rows = zonestatsRows(row)
 		if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps}, VerifyOptions{}); err == nil ||
-			!strings.Contains(err.Error(), "чтение") {
-			t.Errorf("шаг %d: %v, want контекст чтения", i, err)
+			!strings.Contains(err.Error(), "scan") {
+			t.Errorf("step %d: %v, want the scan context", i, err)
 		}
 	}
 	// rows.Err after the zone/aggregate/history/stored rows — with the
@@ -240,14 +240,14 @@ func TestVerifyCountersErrors(t *testing.T) {
 			zonestatsRows(aggRow),
 			zonestatsRows([]any{int64(0), int64(0)}),
 			zonestatsRows(counterRowOf("render_pending", 0)))
-		steps[i].rows = &zonestatsFakeRows{rows: steps[i].rows.rows, err: errors.New("обрыв")}
+		steps[i].rows = &zonestatsFakeRows{rows: steps[i].rows.rows, err: errors.New("drop")}
 		_, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps}, VerifyOptions{})
-		if err == nil || !strings.Contains(err.Error(), "обрыв") {
-			t.Errorf("rows.Err шага %d = %v, want исходная", i, err)
+		if err == nil || !strings.Contains(err.Error(), "drop") {
+			t.Errorf("the rows.Err of step %d = %v, want the original", i, err)
 		}
 		// The rows are closed even on an iteration error.
 		if !steps[i].rows.closed && i != 0 {
-			t.Errorf("шаг %d: строки не закрыты", i)
+			t.Errorf("step %d: the rows are not closed", i)
 		}
 	}
 }
@@ -258,27 +258,27 @@ func TestVerifyCountersErrors(t *testing.T) {
 // values (a pin), the errors — with the original reason.
 func TestZoneStatsReaderErrorPins(t *testing.T) {
 	ctx := context.Background()
-	boom := errors.New("бум")
+	boom := errors.New("boom")
 
 	// readHistoryAgg: an empty answer, Scan, rows.Err — zeros.
 	p := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
 	tx, _ := p.Begin(ctx)
 	if a, l, err := readHistoryAgg(ctx, tx); err == nil || a != 0 || l != 0 ||
-		!strings.Contains(err.Error(), "пустой ответ") {
-		t.Errorf("история/пусто: (%v/%v, %v)", a, l, err)
+		!strings.Contains(err.Error(), "empty response") {
+		t.Errorf("history/empty: (%v/%v, %v)", a, l, err)
 	}
 	p = &zonestatsFakePool{steps: []zonestatsStep{{rows: &zonestatsFakeRows{
 		rows: [][]any{{int64(1)}}, scanErr: boom}}}}
 	tx, _ = p.Begin(ctx)
 	if a, l, err := readHistoryAgg(ctx, tx); err == nil || a != 0 || l != 0 ||
-		!strings.Contains(err.Error(), "чтение") {
-		t.Errorf("история/Scan: (%v/%v, %v)", a, l, err)
+		!strings.Contains(err.Error(), "scan") {
+		t.Errorf("history/Scan: (%v/%v, %v)", a, l, err)
 	}
 	p = &zonestatsFakePool{steps: []zonestatsStep{{rows: &zonestatsFakeRows{
 		rows: [][]any{{int64(1), int64(2)}}, err: boom}}}}
 	tx, _ = p.Begin(ctx)
 	if a, l, err := readHistoryAgg(ctx, tx); err == nil || a != 0 || l != 0 {
-		t.Errorf("история/rows.Err: (%v/%v, %v)", a, l, err)
+		t.Errorf("history/rows.Err: (%v/%v, %v)", a, l, err)
 	}
 
 	// readDailyValue: rowsErr before the row, empty-ok (zero/false), Scan,
@@ -295,12 +295,12 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	} {
 		p := &zonestatsFakePool{steps: []zonestatsStep{{rows: tc.rows}}}
 		tx, _ := p.Begin(ctx)
-		v, exists, err := readDailyValue(ctx, tx, readDailyChecksSQL, "суточная")
+		v, exists, err := readDailyValue(ctx, tx, readDailyChecksSQL, "the daily checks row")
 		if tc.wantE && (err == nil || v != 0 || exists) {
-			t.Errorf("readDailyValue %+v: (%v/%v, %v), want 0/false и ошибка", tc.rows, v, exists, err)
+			t.Errorf("readDailyValue %+v: (%v/%v, %v), want 0/false and an error", tc.rows, v, exists, err)
 		}
 		if !tc.wantE && (err != nil || v != 0 || exists) {
-			t.Errorf("readDailyValue пусто: (%v/%v, %v), want 0/false без ошибки", v, exists, err)
+			t.Errorf("readDailyValue empty: (%v/%v, %v), want 0/false without an error", v, exists, err)
 		}
 	}
 
@@ -313,8 +313,8 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	for _, rows := range dailyRows {
 		p := &zonestatsFakePool{steps: []zonestatsStep{{rows: rows}}}
 		tx, _ := p.Begin(ctx)
-		if v, err := writeDailyCounter(ctx, tx, recountDailyChecksSQL, 5, time.Unix(0, 0), "суточная"); err == nil || v != 0 {
-			t.Errorf("writeDailyCounter %+v: (%v, %v), want 0 и ошибка", rows, v, err)
+		if v, err := writeDailyCounter(ctx, tx, recountDailyChecksSQL, 5, time.Unix(0, 0), "the daily checks row"); err == nil || v != 0 {
+			t.Errorf("writeDailyCounter %+v: (%v, %v), want 0 and an error", rows, v, err)
 		}
 	}
 
@@ -326,9 +326,9 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	for _, rows := range cleanupRows {
 		p := &zonestatsFakePool{steps: []zonestatsStep{{rows: rows}}}
 		tx, _ := p.Begin(ctx)
-		if err := cleanupBaskets(ctx, tx, retryMatureCleanupSQL, "очистка корзин ретрая"); err == nil ||
-			!strings.Contains(err.Error(), "очистка корзин ретрая") {
-			t.Errorf("cleanupBaskets %+v: %v, want контекст", rows, err)
+		if err := cleanupBaskets(ctx, tx, retryMatureCleanupSQL, "the retry basket cleanup"); err == nil ||
+			!strings.Contains(err.Error(), "the retry basket cleanup") {
+			t.Errorf("cleanupBaskets %+v: %v, want the context", rows, err)
 		}
 	}
 
@@ -337,22 +337,22 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	p = &zonestatsFakePool{steps: []zonestatsStep{{err: boom}}}
 	tx, _ = p.Begin(ctx)
 	if m, err := readZonePositions(ctx, tx, nil); err == nil || m != nil {
-		t.Errorf("чтение зон/Query: (%v, %v), want nil и ошибка", m, err)
+		t.Errorf("zone read/Query: (%v, %v), want nil and an error", m, err)
 	}
 	p = &zonestatsFakePool{steps: []zonestatsStep{{err: boom}}}
 	tx, _ = p.Begin(ctx)
 	if m, err := readCounterValues(ctx, tx, CounterNames()); err == nil || m != nil {
-		t.Errorf("чтение счётчиков/Query: (%v, %v), want nil и ошибка", m, err)
+		t.Errorf("counter read/Query: (%v, %v), want nil and an error", m, err)
 	}
 	p = &zonestatsFakePool{steps: []zonestatsStep{{err: boom}}}
 	tx, _ = p.Begin(ctx)
 	if m, err := readZoneAgg(ctx, tx); err == nil || m != nil {
-		t.Errorf("агрегат/Query: (%v, %v), want nil и ошибка", m, err)
+		t.Errorf("aggregate/Query: (%v, %v), want nil and an error", m, err)
 	}
 	p = &zonestatsFakePool{steps: []zonestatsStep{{err: boom}}}
 	tx, _ = p.Begin(ctx)
 	if m, err := readLaravelAgg(ctx, tx); err == nil || m != nil {
-		t.Errorf("laravel-агрегат/Query: (%v, %v), want nil и ошибка", m, err)
+		t.Errorf("laravel aggregate/Query: (%v, %v), want nil and an error", m, err)
 	}
 	// rows.Err of each — an error.
 	rowErr := func(rows [][]any) *zonestatsFakeRows {
@@ -362,13 +362,13 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	p = &zonestatsFakePool{steps: []zonestatsStep{{rows: zRow}}}
 	tx, _ = p.Begin(ctx)
 	if m, err := readZonePositions(ctx, tx, nil); err == nil || m != nil {
-		t.Errorf("чтение зон/rows.Err: (%v, %v)", m, err)
+		t.Errorf("zone read/rows.Err: (%v, %v)", m, err)
 	}
 	cRow := rowErr([][]any{counterRowOf("status_alive", 1)})
 	p = &zonestatsFakePool{steps: []zonestatsStep{{rows: cRow}}}
 	tx, _ = p.Begin(ctx)
 	if m, err := readCounterValues(ctx, tx, CounterNames()); err == nil || m != nil {
-		t.Errorf("чтение счётчиков/rows.Err: (%v, %v)", m, err)
+		t.Errorf("counter read/rows.Err: (%v, %v)", m, err)
 	}
 	statuses := make([]int64, len(statusAggCols))
 	aggRow := aggRowOf(7, 10, 4, 2, 3, statuses, 0)
@@ -376,13 +376,13 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	p = &zonestatsFakePool{steps: []zonestatsStep{{rows: aRow}}}
 	tx, _ = p.Begin(ctx)
 	if m, err := readZoneAgg(ctx, tx); err == nil || m != nil {
-		t.Errorf("агрегат/rows.Err: (%v, %v)", m, err)
+		t.Errorf("aggregate/rows.Err: (%v, %v)", m, err)
 	}
 	lRow := rowErr([][]any{{int16(7), int64(1)}})
 	p = &zonestatsFakePool{steps: []zonestatsStep{{rows: lRow}}}
 	tx, _ = p.Begin(ctx)
 	if m, err := readLaravelAgg(ctx, tx); err == nil || m != nil {
-		t.Errorf("laravel-агрегат/rows.Err: (%v, %v)", m, err)
+		t.Errorf("laravel aggregate/rows.Err: (%v, %v)", m, err)
 	}
 }
 
@@ -394,16 +394,16 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 func TestReadMemInfoForeignLines(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "meminfo")
-	content := "посторонняя строка без двоеточия\n" +
+	content := "a foreign line without a colon\n" +
 		"MemTotal: 19 kB\n" +
-		"ПустоеЗначение:\n" +
+		"EmptyValue:\n" +
 		"MemAvailable: 7 kB\n"
 	if err := writeFileForTest(p, content); err != nil {
 		t.Fatal(err)
 	}
 	tt, a, st, sf, err := readMemInfo(p)
 	if err != nil || tt != 19*1024 || a != 7*1024 || st != 0 || sf != 0 {
-		t.Errorf("посторонние строки: (%v/%v/%v/%v, %v), want 19456/7168/0/0",
+		t.Errorf("foreign lines: (%v/%v/%v/%v, %v), want 19456/7168/0/0",
 			tt, a, st, sf, err)
 	}
 	// A 2^63 KiB value in a foreign field — valid for uint64
@@ -412,12 +412,12 @@ func TestReadMemInfoForeignLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, _, _, _, err := readMemInfo(p); err != nil {
-		t.Errorf("постороннее поле 2^63: %v, want валидно (uint64)", err)
+		t.Errorf("a foreign field 2^63: %v, want valid (uint64)", err)
 	}
 	// No file — an error with zeros (a pin).
-	tt, a, st, sf, err = readMemInfo(filepath.Join(dir, "нет"))
+	tt, a, st, sf, err = readMemInfo(filepath.Join(dir, "missing"))
 	if err == nil || tt != 0 || a != 0 || st != 0 || sf != 0 {
-		t.Errorf("нет файла: (%v/%v/%v/%v, %v), want нули и ошибка", tt, a, st, sf, err)
+		t.Errorf("no file: (%v/%v/%v/%v, %v), want zeros and an error", tt, a, st, sf, err)
 	}
 }
 
@@ -429,27 +429,27 @@ func writeFileForTest(p, content string) error {
 // TestReadLoadAvgMissingFilePins — a missing file: zeros (a pin of the
 // values on a read error).
 func TestReadLoadAvgMissingFilePins(t *testing.T) {
-	l1, l5, l15, err := readLoadAvg(filepath.Join(t.TempDir(), "нет"))
+	l1, l5, l15, err := readLoadAvg(filepath.Join(t.TempDir(), "missing"))
 	if err == nil || l1 != 0 || l5 != 0 || l15 != 0 {
-		t.Errorf("нет файла: (%v/%v/%v, %v), want нули и ошибка", l1, l5, l15, err)
+		t.Errorf("no file: (%v/%v/%v, %v), want zeros and an error", l1, l5, l15, err)
 	}
 }
 
 // TestReadProcsMissingRoot — a missing root: an error with the procs
 // context (not an empty snapshot).
 func TestReadProcsMissingRoot(t *testing.T) {
-	if m, err := readProcs(filepath.Join(t.TempDir(), "нет")); err == nil ||
-		!strings.Contains(err.Error(), "процессы") {
-		t.Errorf("нет корня: (%v, %v), want ошибка «процессы»", m, err)
+	if m, err := readProcs(filepath.Join(t.TempDir(), "missing")); err == nil ||
+		!strings.Contains(err.Error(), "processes") {
+		t.Errorf("no root: (%v, %v), want the \"processes\" error", m, err)
 	}
 }
 
 // TestReadCPUStatMissingFileContext — a missing file: an error with the
 // "/proc/stat" context (not the "no cpu line" error).
 func TestReadCPUStatMissingFileContext(t *testing.T) {
-	if _, err := readCPUStat(filepath.Join(t.TempDir(), "нет")); err == nil ||
+	if _, err := readCPUStat(filepath.Join(t.TempDir(), "missing")); err == nil ||
 		!strings.Contains(err.Error(), "/proc/stat") {
-		t.Errorf("нет файла: %v, want контекст /proc/stat", err)
+		t.Errorf("no file: %v, want the /proc/stat context", err)
 	}
 }
 
@@ -458,11 +458,11 @@ func TestReadCPUStatMissingFileContext(t *testing.T) {
 func TestParseProcStatLineLeadingParen(t *testing.T) {
 	line := "(weird) R 1 2 3 4 5 6 7 8 9 10 3 4"
 	if comm, ticks := parseProcStatLine([]byte(line)); comm != "weird" || ticks != 7 {
-		t.Errorf("open==0: (%q, %d), want weird и 7", comm, ticks)
+		t.Errorf("open==0: (%q, %d), want weird and 7", comm, ticks)
 	}
 	// open < 0 → false: lines without an opening paren — no contribution.
 	if comm, _ := parseProcStatLine([]byte("7 no paren R 1 2 3 4 5 6 7 8 9 10 3 4")); comm != "" {
-		t.Errorf("без скобки = %q, want пустой вклад", comm)
+		t.Errorf("without a parenthesis = %q, want an empty contribution", comm)
 	}
 }
 
@@ -474,11 +474,11 @@ func TestSlowQueriesPluralFullRange(t *testing.T) {
 	plural := func(n int) string {
 		switch {
 		case n%10 == 1 && n%100 != 11:
-			return "медленный запрос"
+			return "slow query"
 		case n%10 >= 2 && n%10 <= 4 && (n%100 < 10 || n%100 >= 20):
-			return "медленных запроса"
+			return "slow queries"
 		}
-		return "медленных запросов"
+		return "slow queries"
 	}
 	for n := 0; n <= 3000; n++ {
 		if got := slowQueriesPhrase(n); got != plural(n) {
@@ -491,7 +491,7 @@ func TestSlowQueriesPluralFullRange(t *testing.T) {
 // are not replaced by defaults (the "≤ 0" boundaries).
 func TestSlowQueriesUnitBoundaries(t *testing.T) {
 	if got := (SlowQueryOptions{MinDuration: 1}).withDefaults().MinDuration; got != 1 {
-		t.Errorf("MinDuration=1: %v, want как задан", got)
+		t.Errorf("MinDuration=1: %v, want as set", got)
 	}
 	pool := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
 	if _, err := (PGSlowQueries{Pool: pool, Limit: 1}).SlowQueries(context.Background(), time.Second); err != nil {
@@ -521,11 +521,11 @@ func TestSlowQueryLoopStartupAndMetrics(t *testing.T) {
 	go func() { done <- SlowQueryLoop(ctx, src, opts) }()
 	waitSlowPasses(t, src, 1, cancel, done)
 	if len(reports) != 1 {
-		t.Fatalf("отчётов = %d, want 1 (стартовый проход до тика)", len(reports))
+		t.Fatalf("reports = %d, want 1 (the starting pass before a tick)", len(reports))
 	}
 	// The header ends with a newline (the query lines start on a new line).
-	if !strings.Contains(reports[0], "(порог 3с)\n") {
-		t.Errorf("шапка без перевода строки:\n%q", reports[0])
+	if !strings.Contains(reports[0], "(threshold 3s)\n") {
+		t.Errorf("the header without a newline:\n%q", reports[0])
 	}
 	// The starting pass metrics: the gauge and the counter.
 	if v, ok := gaugeLabels(t, reg, "crawler_pg_slow_queries", nil); !ok || v != 1 {
@@ -549,7 +549,7 @@ func TestSlowQueryLoopStartupAndMetrics(t *testing.T) {
 	go func() { done2 <- SlowQueryLoop(ctx2, src2, opts2) }()
 	waitSlowPasses(t, src2, 1, cancel2, done2)
 	if len(reports2) != 1 {
-		t.Errorf("Interval=1нс: отчётов = %d, want 1 (не выключен)", len(reports2))
+		t.Errorf("Interval=1ns: reports = %d, want 1 (not disabled)", len(reports2))
 	}
 }
 
@@ -563,7 +563,7 @@ func TestPGSlowQueriesRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(out) != 2 || out[0].PID != 11 || out[1].App != "" || out[1].Query != "" {
-		t.Errorf("снимок = %+v, want обе строки как есть", out)
+		t.Errorf("the snapshot = %+v, want both rows as is", out)
 	}
 }
 
@@ -575,8 +575,8 @@ func TestOSPSISourceReadErrorText(t *testing.T) {
 	dir := t.TempDir()
 	_, err := (OSPSI{Path: dir}).PSI(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "PSI: ") ||
-		strings.Contains(err.Error(), "строка") {
-		t.Errorf("каталог: %v, want исходная ошибка чтения (не формат PSI)", err)
+		strings.Contains(err.Error(), "line is missing") {
+		t.Errorf("a directory: %v, want the original read error (not the PSI format)", err)
 	}
 }
 
@@ -584,18 +584,18 @@ func TestOSPSISourceReadErrorText(t *testing.T) {
 // (not a quiet zero snapshot).
 func TestParsePSIMissingFieldKeepsError(t *testing.T) {
 	if st, err := parsePSI("some avg60=1 avg300=1 total=0\n"); err == nil || st != (PSIStat{}) {
-		t.Errorf("нет avg10: (%+v, %v), want нули и ошибка", st, err)
+		t.Errorf("no avg10: (%+v, %v), want zeros and an error", st, err)
 	}
 	if st, err := parsePSI("some avg10=1 total=0\n"); err == nil || st != (PSIStat{}) {
-		t.Errorf("нет avg60: (%+v, %v), want нули и ошибка", st, err)
+		t.Errorf("no avg60: (%+v, %v), want zeros and an error", st, err)
 	}
 }
 
 // TestInfoSecondsMissingField — a missing INFO field is an error (not a
 // silent zero).
 func TestInfoSecondsMissingField(t *testing.T) {
-	if v, err := infoSeconds(map[string]string{"другое": "1"}, "uptime_in_seconds"); err == nil || v != 0 {
-		t.Errorf("нет поля: (%v, %v), want 0 и ошибка", v, err)
+	if v, err := infoSeconds(map[string]string{"other": "1"}, "uptime_in_seconds"); err == nil || v != 0 {
+		t.Errorf("no field: (%v, %v), want 0 and an error", v, err)
 	}
 }
 
@@ -603,13 +603,13 @@ func TestInfoSecondsMissingField(t *testing.T) {
 // boundary (2^62 is valid for int64/64, rejected at 63).
 func TestInfoBytesMissingFieldAndBitSize(t *testing.T) {
 	if v, err := infoBytes(map[string]string{}, "maxmemory"); err == nil || v != 0 {
-		t.Errorf("нет поля: (%v, %v), want 0 и ошибка", v, err)
+		t.Errorf("no field: (%v, %v), want 0 and an error", v, err)
 	}
 	if v, err := infoBytes(map[string]string{"k": "4611686018427387904"}, "k"); err != nil || v != 4611686018427387904 {
-		t.Errorf("2^62: (%v, %v), want как есть", v, err)
+		t.Errorf("2^62: (%v, %v), want as is", v, err)
 	}
 	if v, err := infoSeconds(map[string]string{"k": "4611686018427387904"}, "k"); err != nil || v != 4611686018427387904 {
-		t.Errorf("2^62 сек: (%v, %v), want как есть", v, err)
+		t.Errorf("2^62 s: (%v, %v), want as is", v, err)
 	}
 }
 
@@ -617,7 +617,7 @@ func TestInfoBytesMissingFieldAndBitSize(t *testing.T) {
 func TestRedisUptimeSourceError(t *testing.T) {
 	if _, err := redisUptimeOf(context.Background(), errInfoSource{}); err == nil ||
 		!strings.Contains(err.Error(), "connection refused") {
-		t.Errorf("ошибка INFO: %v, want исходная", err)
+		t.Errorf("an INFO error: %v, want the original", err)
 	}
 }
 
@@ -659,13 +659,13 @@ func parseRedisInfo(raw string) map[string]string {
 // not set, Redis not set, a counter error.
 func TestRenderDebtOfErrors(t *testing.T) {
 	if _, err := renderDebtOf(context.Background(), nil, nil); err == nil ||
-		!strings.Contains(err.Error(), "пул БД не задан") {
-		t.Errorf("пул: %v, want «пул БД не задан»", err)
+		!strings.Contains(err.Error(), "pool is not set") {
+		t.Errorf("the pool: %v, want \"the DB pool is not set\"", err)
 	}
-	pool := &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("бд недоступна")}}}
+	pool := &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("db unavailable")}}}
 	if _, err := renderDebtOf(context.Background(), pool, &renderLensSource{}); err == nil ||
-		!strings.Contains(err.Error(), "бд недоступна") {
-		t.Errorf("счётчик: %v, want исходную", err)
+		!strings.Contains(err.Error(), "db unavailable") {
+		t.Errorf("the counter: %v, want the original", err)
 	}
 }
 
@@ -692,10 +692,10 @@ func TestRenderDebtLoopUnitIntervalAndGauge(t *testing.T) {
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 	if !ok || v != 3 {
-		t.Errorf("gauge рендер-долга = (%v, %v), want 3 (стартовый проход при Interval=1нс)", v, ok)
+		t.Errorf("the render debt gauge = (%v, %v), want 3 (the starting pass at Interval=1ns)", v, ok)
 	}
 }
 
@@ -710,13 +710,13 @@ func TestParseSystemctlShowNRestartsBoundaries(t *testing.T) {
 		"Id=b.service\nNRestarts=9223372036854775808\n"
 	units := parseSystemctlShow(out)
 	if len(units) != 2 {
-		t.Fatalf("юнитов = %d, want 2 (строка до Id не обрывает разбор)", len(units))
+		t.Fatalf("units = %d, want 2 (a line before Id does not break the parse)", len(units))
 	}
 	if units[0].NRestarts != 77 {
-		t.Errorf("NRestarts = %d, want 77 (последняя строка блока)", units[0].NRestarts)
+		t.Errorf("NRestarts = %d, want 77 (the last line of the block)", units[0].NRestarts)
 	}
 	if units[1].NRestarts != 9223372036854775808 {
-		t.Errorf("NRestarts 2^63 = %d, want как есть (uint64)", units[1].NRestarts)
+		t.Errorf("NRestarts 2^63 = %d, want as is (uint64)", units[1].NRestarts)
 	}
 }
 
@@ -725,7 +725,7 @@ func TestParseSystemctlShowNRestartsBoundaries(t *testing.T) {
 func TestParseMemoryEventsForeignLine(t *testing.T) {
 	ev, err := parseMemoryEvents("low\noom 4\n")
 	if err != nil || ev.OOM != 4 {
-		t.Errorf("строка без значения: (%+v, %v), want oom=4", ev, err)
+		t.Errorf("a line without a value: (%+v, %v), want oom=4", ev, err)
 	}
 }
 
@@ -735,7 +735,7 @@ func TestOSUnitEventsCancelledCtx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if units, err := (OSUnitEvents{}).UnitEvents(ctx); err == nil || units != nil {
-		t.Errorf("отмена ctx: (%v, %v), want nil и ошибка", units, err)
+		t.Errorf("a ctx cancellation: (%v, %v), want nil and an error", units, err)
 	}
 }
 
@@ -758,7 +758,7 @@ func TestStreamGroupsSkipEmptyThenRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(st) != 1 || st[0].Stream != alertStreams[1] {
-		t.Errorf("снимок = %+v, want только группы второго стрима", st)
+		t.Errorf("the snapshot = %+v, want only the second stream's groups", st)
 	}
 }
 
@@ -773,19 +773,19 @@ func TestNewDoneStaleInvalidSnapshots(t *testing.T) {
 	// The first pass — the series grows even without a valid stamp.
 	tr := &newDoneStaleTrack{minPasses: 2}
 	if s := tr.decide("", time.Time{}, invalid); !strings.Contains(s.detail, "1/2") {
-		t.Errorf("первый невалидный снапшот: %s, want серию 1/2", s.detail)
+		t.Errorf("the first invalid snapshot: %s, want the streak 1/2", s.detail)
 	}
 	// A repeat of the invalid one is growth too: an invalid stamp is not
 	// counted as matching the previous one (!Valid).
 	if s := tr.decide("", time.Time{}, invalid); !strings.Contains(s.detail, "2/2") {
-		t.Errorf("повтор невалидного: %s, want серию 2/2 (невалидная метка ≠ любой)", s.detail)
+		t.Errorf("an invalid repeat: %s, want the streak 2/2 (an invalid stamp ≠ any)", s.detail)
 	}
 	// A valid stamp equal to the zero time: the first pass — growth
 	// (no base — the series is incremented).
 	zero := staleRow{value: 5, snap: sql.NullTime{Time: time.Time{}, Valid: true}}
 	tr2 := &newDoneStaleTrack{minPasses: 2}
 	if s := tr2.decide("", time.Time{}, zero); !strings.Contains(s.detail, "1/2") {
-		t.Errorf("валидный zero-time снапшот: %s, want серию 1/2", s.detail)
+		t.Errorf("a valid zero-time snapshot: %s, want the streak 1/2", s.detail)
 	}
 }
 
@@ -795,11 +795,11 @@ func TestCounterGrowthFirstPassBase(t *testing.T) {
 	tr := &counterGrowthTrack{minPasses: 2}
 	s := tr.decide("", time.Time{}, 100)
 	if !strings.Contains(s.detail, "0/2") {
-		t.Errorf("база счётчика: %s, want серию 0/2", s.detail)
+		t.Errorf("the counter base: %s, want the streak 0/2", s.detail)
 	}
 	s = tr.decide("", time.Time{}, 150)
 	if !strings.Contains(s.detail, "1/2") {
-		t.Errorf("рост счётчика: %s, want серию 1/2", s.detail)
+		t.Errorf("counter growth: %s, want the streak 1/2", s.detail)
 	}
 }
 
@@ -813,14 +813,14 @@ func TestRenderDebtTrackThresholdExact(t *testing.T) {
 	_ = tr.decide("", time.Time{}, d(5))
 	_ = tr.decide("", time.Time{}, d(8))
 	if s := tr.decide("", time.Time{}, d(10)); s.status != AlertStatusOK {
-		t.Errorf("долг ровно у порога: %s, want ok (строгое >)", s.status)
+		t.Errorf("the debt exactly at the threshold: %s, want ok (a strict >)", s.status)
 	}
 	// Below the threshold with a full series — ok (a "true" mutant would fire).
 	tr2 := &renderDebtTrack{domains: 10, passes: 2}
 	_ = tr2.decide("", time.Time{}, d(6))
 	_ = tr2.decide("", time.Time{}, d(7))
 	if s := tr2.decide("", time.Time{}, d(8)); s.status != AlertStatusOK {
-		t.Errorf("долг ниже порога с серией: %s, want ok", s.status)
+		t.Errorf("the debt below the threshold with a streak: %s, want ok", s.status)
 	}
 	// The ceil boundary of the clearing threshold: the threshold 9 →
 	// clearing < 9 (ceil(8.1)); the level 8 clears, 9 holds.
@@ -828,10 +828,10 @@ func TestRenderDebtTrackThresholdExact(t *testing.T) {
 	_ = tr3.decide("", time.Time{}, d(2))  // the base
 	_ = tr3.decide("", time.Time{}, d(15)) // growth → firing
 	if s := tr3.decide("", time.Time{}, d(9)); s.status != AlertStatusFiring {
-		t.Errorf("удержание на 9 (порог 9): %s, want firing", s.status)
+		t.Errorf("a hold at 9 (the threshold 9): %s, want firing", s.status)
 	}
 	if s := tr3.decide("", time.Time{}, d(8)); s.status != AlertStatusOK {
-		t.Errorf("снятие на 8 (порог снятия <9): %s, want ok (ceil)", s.status)
+		t.Errorf("clearing at 8 (the clearing threshold <9): %s, want ok (ceil)", s.status)
 	}
 }
 
@@ -843,7 +843,7 @@ func TestRenderFbDepthBelowWatermarkAfterDrop(t *testing.T) {
 	_ = tr.decide("", time.Time{}, 90)  // a drop (a loss)
 	_ = tr.decide("", time.Time{}, 91)  // growth 1
 	if s := tr.decide("", time.Time{}, 92); s.status != AlertStatusOK {
-		t.Errorf("ниже порога с серией: %s (%s), want ok", s.status, s.detail)
+		t.Errorf("below the threshold with a streak: %s (%s), want ok", s.status, s.detail)
 	}
 }
 
@@ -854,8 +854,8 @@ func TestQueueFreezeMovingCounter(t *testing.T) {
 	m := env.newQueueFreezeMachine()
 	moving := []StreamGroupState{{Stream: "q:dns", Group: "g", Depth: 5, LastDeliveredID: "1-0"}}
 	s := m.transition(env.Alerts, context.Background(), obs(moving))
-	if !strings.Contains(s.Detail, "1 из 1") {
-		t.Errorf("движущаяся группа: %q, want «1 из 1»", s.Detail)
+	if !strings.Contains(s.Detail, "1 of 1") {
+		t.Errorf("a moving group: %q, want \"1 of 1\"", s.Detail)
 	}
 	// Several groups: an empty one before a frozen one does not break the
 	// parsing — the frozen one behind the empty one is seen.
@@ -873,7 +873,7 @@ func TestQueueFreezeMovingCounter(t *testing.T) {
 	now = now.Add(16 * time.Minute)
 	s2 := m2.transition(env2.Alerts, context.Background(), obs(frozen))
 	if s2.Status != AlertStatusFiring || !strings.Contains(s2.Detail, "q:http/worker") {
-		t.Errorf("замороженная за пустой: %s (%s), want firing с q:http/worker", s2.Status, s2.Detail)
+		t.Errorf("frozen after the empty one: %s (%s), want firing with q:http/worker", s2.Status, s2.Detail)
 	}
 }
 
@@ -917,11 +917,11 @@ func TestLoadReportLoopMetricsAndDebt(t *testing.T) {
 	case r = <-reports:
 	case <-time.After(5 * time.Second):
 		cancel()
-		t.Fatal("второй отчёт не пришёл")
+		t.Fatal("the second report did not arrive")
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 	// The second pass CPU instruments: a delta of 40000 (user 100000,
 	// idle 0) — busy 100%, user 250%.
@@ -931,8 +931,8 @@ func TestLoadReportLoopMetricsAndDebt(t *testing.T) {
 	if v, ok := gaugeLabels(t, reg, "crawler_os_cpu_percent", map[string]string{"kind": "user"}); !ok || v != 250 {
 		t.Errorf("cpu{kind=user} = (%v, %v), want 250", v, ok)
 	}
-	if !strings.Contains(r, "📬 Рендер-долг: флаги 7 + лаг 3 = 10") {
-		t.Errorf("отчёт без строки долга:\n%s", r)
+	if !strings.Contains(r, "📬 Render debt: flags 7 + lag 3 = 10") {
+		t.Errorf("the report without the debt line:\n%s", r)
 	}
 }
 
@@ -945,7 +945,7 @@ func TestReadMemInfoZeroTotal(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, _, _, _, err := readMemInfo(p); err == nil {
-		t.Error("MemTotal 0: хочу ошибку (значение обязательного поля)")
+		t.Error("MemTotal 0: want an error (the value of a required field)")
 	}
 }
 
@@ -962,7 +962,7 @@ func TestRedisQueuesLenNoSuchKeyComplete(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(q) != len(reportStreams) {
-		t.Errorf("стримов = %d, want %d (отсутствующий — нулевым вкладом)", len(q), len(reportStreams))
+		t.Errorf("streams = %d, want %d (a missing one — a zero contribution)", len(q), len(reportStreams))
 	}
 }
 
@@ -989,10 +989,10 @@ func TestLoadReportLoopNanosecondInterval(t *testing.T) {
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 	if reports.Load() < 1 {
-		t.Error("Interval=1нс: стартовый отчёт не построен (цикл принят выключенным)")
+		t.Error("Interval=1ns: the starting report was not built (the loop was taken as disabled)")
 	}
 }
 

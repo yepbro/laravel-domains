@@ -35,14 +35,14 @@ func TestOSLoadSourceErrorTexts(t *testing.T) {
 	writeFix(t, root, "loadavg", "x 1 2\n") // loadavg is not a number
 	_, err := (OSLoad{Root: root}).Load(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "loadavg") {
-		t.Errorf("битый loadavg: %v, want ошибку loadavg", err)
+		t.Errorf("a broken loadavg: %v, want a loadavg error", err)
 	}
 
 	root2 := fullCPUFixtures(t)
 	writeFix(t, root2, "meminfo", "MemTotal: x kB\nMemAvailable: 1 kB\n")
 	_, err = (OSLoad{Root: root2}).Load(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "meminfo") {
-		t.Errorf("битый meminfo: %v, want ошибку meminfo", err)
+		t.Errorf("a broken meminfo: %v, want a meminfo error", err)
 	}
 
 	// A missing file — the "no such file or directory" text (a read
@@ -54,7 +54,7 @@ func TestOSLoadSourceErrorTexts(t *testing.T) {
 		}
 		_, err := (OSLoad{Root: root3}).Load(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "no such file") {
-			t.Errorf("нет %s: %v, want исходную ошибку чтения файла", miss, err)
+			t.Errorf("no %s: %v, want the original file read error", miss, err)
 		}
 	}
 }
@@ -69,23 +69,23 @@ func TestOSLoadBrokenSomeValidFull(t *testing.T) {
 	// A malformed some line fails the pass even at a valid full (a
 	// return cut-out mutant swallowed the error and returned a snapshot).
 	if _, err := (OSLoad{Root: root}).Load(context.Background()); err == nil {
-		t.Error("кривой some при валидной full: хочу ошибку прохода")
+		t.Error("a broken some with a valid full: want a pass error")
 	}
 	root2 := fullCPUFixtures(t)
 	writeFix(t, root2, "pressure/memory",
 		"some avg10=1 avg60=1 avg300=1\nfull avg10=x avg60=1 avg300=1\n")
 	if _, err := (OSLoad{Root: root2}).Load(context.Background()); err == nil {
-		t.Error("кривой full: хочу ошибку")
+		t.Error("a broken full: want an error")
 	}
 }
 
 // TestReadMemInfoNoFileText — a missing meminfo: the "no such file"
 // text, zero values.
 func TestReadMemInfoNoFileText(t *testing.T) {
-	tt, a, st, sf, err := readMemInfo(filepath.Join(t.TempDir(), "нет"))
+	tt, a, st, sf, err := readMemInfo(filepath.Join(t.TempDir(), "missing"))
 	if err == nil || !strings.Contains(err.Error(), "no such file") ||
 		tt != 0 || a != 0 || st != 0 || sf != 0 {
-		t.Errorf("нет файла: (%v/%v/%v/%v, %v), want нули и текст чтения", tt, a, st, sf, err)
+		t.Errorf("no file: (%v/%v/%v/%v, %v), want zeros and the read text", tt, a, st, sf, err)
 	}
 }
 
@@ -99,7 +99,7 @@ func TestReadMemInfoMissingFieldPins(t *testing.T) {
 	}
 	tt, a, st, sf, err := readMemInfo(p)
 	if err == nil || tt != 0 || a != 0 || st != 0 || sf != 0 {
-		t.Errorf("нет обязательных полей: (%v/%v/%v/%v, %v), want нули и ошибку", tt, a, st, sf, err)
+		t.Errorf("no required fields: (%v/%v/%v/%v, %v), want zeros and an error", tt, a, st, sf, err)
 	}
 	// MemTotal 0 — the same error, zeros.
 	if err := writeFileForTest(p, "MemTotal: 0 kB\nMemAvailable: 1 kB\n"); err != nil {
@@ -107,7 +107,7 @@ func TestReadMemInfoMissingFieldPins(t *testing.T) {
 	}
 	tt, a, st, sf, err = readMemInfo(p)
 	if err == nil || tt != 0 || a != 0 || st != 0 || sf != 0 {
-		t.Errorf("MemTotal 0: (%v/%v/%v/%v, %v), want нули и ошибку", tt, a, st, sf, err)
+		t.Errorf("MemTotal 0: (%v/%v/%v/%v, %v), want zeros and an error", tt, a, st, sf, err)
 	}
 	// A value without a unit (one field): a parse error, not a panic on
 	// the index of the neighboring field.
@@ -115,7 +115,7 @@ func TestReadMemInfoMissingFieldPins(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, _, _, _, err := readMemInfo(p); err == nil {
-		t.Error("значение без единицы: want ошибку разбора")
+		t.Error("a value without a unit: want a parse error")
 	}
 }
 
@@ -128,7 +128,7 @@ func TestReadCPUStatFieldsBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := readCPUStat(p); err == nil {
-		t.Error("три числа: хочу ошибку (строка короче пяти полей)")
+		t.Error("three numbers: want an error (the line is shorter than five fields)")
 	}
 	// Four numbers (five fields with "cpu") are valid: missing fields are
 	// read as zeros.
@@ -137,20 +137,20 @@ func TestReadCPUStatFieldsBoundary(t *testing.T) {
 	}
 	st4, err := readCPUStat(p)
 	if err != nil || st4.Idle != 4 || st4.Iowait != 0 {
-		t.Errorf("четыре числа: (%+v, %v), want idle 4 iowait 0", st4, err)
+		t.Errorf("four numbers: (%+v, %v), want idle 4 iowait 0", st4, err)
 	}
 	if err := writeFileForTest(p, "cpu  1 2 3 4 5\ncpu0 1 1 1 1\n"); err != nil {
 		t.Fatal(err)
 	}
 	st, err := readCPUStat(p)
 	if err != nil || st.Idle != 4 || st.Iowait != 5 {
-		t.Errorf("пять полей: (%+v, %v), want idle 4 iowait 5", st, err)
+		t.Errorf("five fields: (%+v, %v), want idle 4 iowait 5", st, err)
 	}
 	if err := writeFileForTest(p, "cpu  1 2 3 4 5 6\ncpu0 1 1 1 1\n"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := readCPUStat(p); err != nil {
-		t.Errorf("шесть полей: %v, want валидно", err)
+		t.Errorf("six fields: %v, want valid", err)
 	}
 }
 
@@ -166,15 +166,15 @@ func TestReadProcsNoEmptyComm(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := procs[""]; ok {
-		t.Errorf("пустое имя в агрегате: %+v", procs[""])
+		t.Errorf("an empty name in the aggregate: %+v", procs[""])
 	}
 }
 
 // TestLoadReportLoopNilSource — the source not set: an error, not a panic.
 func TestLoadReportLoopNilSource(t *testing.T) {
 	if err := LoadReportLoop(context.Background(), nil, LoadReportOptions{Interval: time.Minute}); err == nil ||
-		!strings.Contains(err.Error(), "источник не задан") {
-		t.Errorf("nil источник: %v, want ошибку", err)
+		!strings.Contains(err.Error(), "source is not set") {
+		t.Errorf("a nil source: %v, want an error", err)
 	}
 }
 
@@ -187,11 +187,11 @@ func TestFormatLoadReportTopNotExtended(t *testing.T) {
 	}
 	procCPU := map[string]float64{"a": 2, "b": 1.7, "c": 1.3, "d": 0.9, "e": 0.7}
 	r := formatLoadReport(st, nil, nil, procCPU, nil, nil, false, nil, nil, nil)
-	if strings.Contains(r, "e 0.7я") {
-		t.Errorf("пятый кандидат топа напечатан:\n%s", r)
+	if strings.Contains(r, "e 0.7c") {
+		t.Errorf("the fifth top candidate was printed:\n%s", r)
 	}
-	if want := "🧮 Топ CPU: a 2.0я, b 1.7я, c 1.3я, d 0.9я"; topCPULine(r) != want {
-		t.Errorf("топ CPU = %q, want %q", topCPULine(r), want)
+	if want := "🧮 CPU top: a 2.0c, b 1.7c, c 1.3c, d 0.9c"; topCPULine(r) != want {
+		t.Errorf("the CPU top = %q, want %q", topCPULine(r), want)
 	}
 }
 
@@ -202,10 +202,10 @@ func TestCPUDeltaClampFraction(t *testing.T) {
 	cur := CPUStat{Idle: 300, Total: 300, Cores: 1} // d=200, idle 1.5
 	busy, _, _, _, ok := cpuDelta(prev, cur)
 	if !ok {
-		t.Fatal("дельта не посчитана")
+		t.Fatal("the delta was not computed")
 	}
 	if busy != 0 {
-		t.Errorf("busy = %v, want 0 (кламп дробного перелива)", busy)
+		t.Errorf("busy = %v, want 0 (the fractional overflow clamp)", busy)
 	}
 }
 
@@ -218,8 +218,8 @@ func TestFormatLoadReportTinyDisk(t *testing.T) {
 	}
 	disks := []DiskLine{{Dir: "/tiny", Avail: 1, Total: 1}}
 	r := formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, disks, nil)
-	if !strings.Contains(r, "📀 Диск /tiny: свободно 0 из 0 ГиБ (100%)") {
-		t.Errorf("диск Total 1: %q, want 100%%", r)
+	if !strings.Contains(r, "📀 Disk /tiny: free 0 of 0 GiB (100%)") {
+		t.Errorf("the disk Total 1: %q, want 100%%", r)
 	}
 }
 
@@ -230,7 +230,7 @@ func TestLoadReportLoopSpaceErrorSecondDir(t *testing.T) {
 		MemTotal: 1, MemAvailable: 1}
 	src := &fakeLoadSource{states: []LoadStat{st}}
 	space := &switchSpaceSource{
-		errs:  []error{errors.New("statfs: отказано"), nil},
+		errs:  []error{errors.New("statfs: permission denied"), nil},
 		stats: []SpaceStat{{}, {Avail: 1 << 30, Total: 2 << 30}},
 	}
 	reports := make(chan string, 4)
@@ -247,21 +247,21 @@ func TestLoadReportLoopSpaceErrorSecondDir(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("цикл: %v", err)
+			t.Fatalf("the loop: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не вышел")
+		t.Fatal("the loop did not exit")
 	}
 	select {
 	case r := <-reports:
-		if !strings.Contains(r, "📀 Диск /good:") {
-			t.Errorf("второй каталог пропал после сбоя первого:\n%s", r)
+		if !strings.Contains(r, "📀 Disk /good:") {
+			t.Errorf("the second directory vanished after the first one failed:\n%s", r)
 		}
 		if strings.Contains(r, "/bad") {
-			t.Errorf("сбойный каталог в отчёте:\n%s", r)
+			t.Errorf("the failing directory is in the report:\n%s", r)
 		}
 	default:
-		t.Fatal("отчёт не пришёл")
+		t.Fatal("the report did not arrive")
 	}
 }
 
@@ -295,10 +295,10 @@ func TestNewDoneStaleValueOne(t *testing.T) {
 		return staleRow{value: v, snap: sql.NullTime{Time: at, Valid: true}}
 	}
 	if s := tr.decide("", time.Time{}, row(1, t0)); !strings.Contains(s.detail, "1/2") {
-		t.Errorf("value=1: %s, want серию 1/2", s.detail)
+		t.Errorf("value=1: %s, want the streak 1/2", s.detail)
 	}
 	if s := tr.decide("", time.Time{}, row(1, t0.Add(time.Minute))); s.status != AlertStatusFiring {
-		t.Errorf("value=1 второй снапшот: %s, want firing", s.status)
+		t.Errorf("value=1, the second snapshot: %s, want firing", s.status)
 	}
 }
 
@@ -310,7 +310,7 @@ func TestTelegramNotifierNoGetenv(t *testing.T) {
 	// function).
 	n := NewTelegramNotifier(TelegramOptions{Enabled: true, Script: "/bin/true"})
 	if n == nil {
-		t.Fatal("конструктор без Getenv вернул nil")
+		t.Fatal("the constructor without Getenv returned nil")
 	}
 }
 
@@ -318,8 +318,8 @@ func TestTelegramNotifierNoGetenv(t *testing.T) {
 // missing-field error (not a silent zero).
 func TestRedisUptimeMissingFieldText(t *testing.T) {
 	if _, err := (RedisInfo{RDB: &fakeInfoRedis{info: "# Server\nrun_id:x\n"}}).RedisUptime(context.Background()); err == nil ||
-		!strings.Contains(err.Error(), "uptime_in_seconds отсутствует") {
-		t.Errorf("нет поля: %v, want «поле отсутствует»", err)
+		!strings.Contains(err.Error(), "uptime_in_seconds field is missing") {
+		t.Errorf("no field: %v, want \"the field is missing\"", err)
 	}
 }
 
@@ -331,7 +331,7 @@ func TestRedisUptimeCmdErrorUnderlying(t *testing.T) {
 	failing := &fakeInfoRedis{err: errors.New("connection reset")}
 	if _, err := (RedisInfo{RDB: failing}).RedisUptime(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "connection reset") {
-		t.Errorf("ошибка команды: %v, want исходную причину команды", err)
+		t.Errorf("a command error: %v, want the original command reason", err)
 	}
 }
 
@@ -341,10 +341,10 @@ func TestRedisUptimeCmdErrorUnderlying(t *testing.T) {
 // missing-row text, sending diagnostics to the runbooks — the T-175
 // review, P3-2).
 func TestRenderDebtIterErrorEmptyText(t *testing.T) {
-	pool := &alertsPool{debtEmpty: true, debtRowsErr: errors.New("обрыв итерации")}
+	pool := &alertsPool{debtEmpty: true, debtRowsErr: errors.New("iteration drop")}
 	_, err := (RenderDebtReader{Pool: pool, Redis: &fakeLener{}}).RenderDebt(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "обрыв итерации") {
-		t.Errorf("обрыв итерации без строк: %v, want причину обрыва (не «строки нет»)", err)
+	if err == nil || !strings.Contains(err.Error(), "iteration drop") {
+		t.Errorf("an iteration drop without rows: %v, want the drop reason (not \"the row is missing\")", err)
 	}
 }
 
@@ -352,8 +352,8 @@ func TestRenderDebtIterErrorEmptyText(t *testing.T) {
 // missing-field error.
 func TestRedisMemoryMissingFieldText(t *testing.T) {
 	if _, err := (RedisInfo{RDB: &fakeInfoRedis{info: "# Memory\nused_memory_human:1K\n"}}).RedisMemory(context.Background()); err == nil ||
-		!strings.Contains(err.Error(), "отсутствует") {
-		t.Errorf("нет поля: %v, want «поле отсутствует»", err)
+		!strings.Contains(err.Error(), "is missing") {
+		t.Errorf("no field: %v, want \"the field is missing\"", err)
 	}
 }
 
@@ -362,8 +362,8 @@ func TestRedisMemoryMissingFieldText(t *testing.T) {
 // snapshot).
 func TestParsePSIMissingFieldText(t *testing.T) {
 	if _, err := parsePSI("some avg60=1 avg300=1\n"); err == nil ||
-		!strings.Contains(err.Error(), "avg10 отсутствует") {
-		t.Errorf("нет avg10: %v, want «поле avg10 отсутствует»", err)
+		!strings.Contains(err.Error(), "avg10 field is missing") {
+		t.Errorf("no avg10: %v, want \"the avg10 field is missing\"", err)
 	}
 }
 
@@ -380,7 +380,7 @@ func TestStreamGroupsClosedFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	if rdb.xlenCalls != 0 {
-		t.Errorf("XLEN вызван %d раз при пустых группах, want 0", rdb.xlenCalls)
+		t.Errorf("XLEN was called %d times with empty groups, want 0", rdb.xlenCalls)
 	}
 }
 
@@ -409,10 +409,10 @@ func TestRenderDebtLoopSourceCalls(t *testing.T) {
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 	if src.calls() < 5 {
-		t.Errorf("вызовов источника = %d, want ≥5 (тикер 1нс живой)", src.calls())
+		t.Errorf("source calls = %d, want ≥5 (the 1ns ticker is alive)", src.calls())
 	}
 }
 
@@ -440,13 +440,13 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 	steps := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow),
-		&zonestatsFakeRows{rows: [][]any{{int64(9)}}, scanErr: errors.New("бум")},
+		&zonestatsFakeRows{rows: [][]any{{int64(9)}}, scanErr: errors.New("boom")},
 		zonestatsRows(counterRowOf("render_pending", 0)))
 	if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps}, VerifyOptions{}); err == nil {
-		t.Fatal("Scan-ошибка истории: хочу ошибку")
+		t.Fatal("a history Scan error: want an error")
 	}
 	if !steps[2].rows.closed {
-		t.Error("hrows не закрыты при Scan-ошибке")
+		t.Error("hrows are not closed on a Scan error")
 	}
 	// An empty history answer: hrows.Close was called.
 	steps2 := verifySteps(
@@ -455,70 +455,70 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 		zonestatsRows(),
 		zonestatsRows(counterRowOf("render_pending", 0)))
 	if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps2}, VerifyOptions{}); err == nil {
-		t.Fatal("пустая история: хочу ошибку")
+		t.Fatal("an empty history: want an error")
 	}
 	if !steps2[2].rows.closed {
-		t.Error("hrows не закрыты при пустом ответе")
+		t.Error("hrows are not closed on an empty response")
 	}
 	// A history rows.Err: closed.
 	steps3 := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow),
-		&zonestatsFakeRows{rows: [][]any{{int64(0), int64(0)}}, err: errors.New("обрыв")},
+		&zonestatsFakeRows{rows: [][]any{{int64(0), int64(0)}}, err: errors.New("drop")},
 		zonestatsRows(counterRowOf("render_pending", 0)))
 	if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps3}, VerifyOptions{}); err == nil {
-		t.Fatal("rows.Err истории: хочу ошибку")
+		t.Fatal("a history rows.Err: want an error")
 	}
 	if !steps3[2].rows.closed {
-		t.Error("hrows не закрыты при rows.Err")
+		t.Error("hrows are not closed on rows.Err")
 	}
 	// A zones rows.Err: closed.
 	steps4 := verifySteps(
-		&zonestatsFakeRows{rows: [][]any{verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})}, err: errors.New("обрыв")},
+		&zonestatsFakeRows{rows: [][]any{verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})}, err: errors.New("drop")},
 		zonestatsRows(aggRow),
 		zonestatsRows([]any{int64(0), int64(0)}),
 		zonestatsRows(counterRowOf("render_pending", 0)))
 	if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps4}, VerifyOptions{}); err == nil {
-		t.Fatal("rows.Err зон: хочу ошибку")
+		t.Fatal("a zones rows.Err: want an error")
 	}
 	if !steps4[0].rows.closed {
-		t.Error("rows зон не закрыты при rows.Err")
+		t.Error("the zone rows are not closed on rows.Err")
 	}
 	// A zones Scan error: closed.
 	steps5 := verifySteps(
-		&zonestatsFakeRows{rows: [][]any{{int16(7)}}, scanErr: errors.New("бум")},
+		&zonestatsFakeRows{rows: [][]any{{int16(7)}}, scanErr: errors.New("boom")},
 		zonestatsRows(aggRow),
 		zonestatsRows([]any{int64(0), int64(0)}),
 		zonestatsRows(counterRowOf("render_pending", 0)))
 	if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps5}, VerifyOptions{}); err == nil {
-		t.Fatal("Scan-ошибка зон: хочу ошибку")
+		t.Fatal("a zones Scan error: want an error")
 	}
 	if !steps5[0].rows.closed {
-		t.Error("rows зон не закрыты при Scan-ошибке")
+		t.Error("the zone rows are not closed on a Scan error")
 	}
 	// A stored rows.Err: closed.
 	steps6 := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow),
 		zonestatsRows([]any{int64(0), int64(0)}),
-		&zonestatsFakeRows{rows: [][]any{counterRowOf("render_pending", 0)}, err: errors.New("обрыв")})
+		&zonestatsFakeRows{rows: [][]any{counterRowOf("render_pending", 0)}, err: errors.New("drop")})
 	if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps6}, VerifyOptions{}); err == nil {
-		t.Fatal("rows.Err сохранённых: хочу ошибку")
+		t.Fatal("a stored rows.Err: want an error")
 	}
 	if !steps6[3].rows.closed {
-		t.Error("rows сохранённых не закрыты при rows.Err")
+		t.Error("the stored rows are not closed on rows.Err")
 	}
 	// An aggregate rows.Err (read by readZoneAgg with a defer Close) — closed.
 	steps7 := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
-		&zonestatsFakeRows{rows: [][]any{aggRow}, err: errors.New("обрыв")},
+		&zonestatsFakeRows{rows: [][]any{aggRow}, err: errors.New("drop")},
 		zonestatsRows([]any{int64(0), int64(0)}),
 		zonestatsRows(counterRowOf("render_pending", 0)))
 	if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps7}, VerifyOptions{}); err == nil {
-		t.Fatal("rows.Err агрегата: хочу ошибку")
+		t.Fatal("an aggregate rows.Err: want an error")
 	}
 	if !steps7[1].rows.closed {
-		t.Error("rows агрегата не закрыты при rows.Err")
+		t.Error("the aggregate rows are not closed on rows.Err")
 	}
 }
 
@@ -527,9 +527,9 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 func TestZoneStatsWriteDailyEmptyText(t *testing.T) {
 	p := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
 	tx, _ := p.Begin(context.Background())
-	_, err := writeDailyCounter(context.Background(), tx, recountDailyChecksSQL, 5, time.Unix(0, 0), "суточная")
-	if err == nil || !strings.Contains(err.Error(), "пустой ответ upsert") {
-		t.Errorf("пустой upsert: %v, want «пустой ответ upsert»", err)
+	_, err := writeDailyCounter(context.Background(), tx, recountDailyChecksSQL, 5, time.Unix(0, 0), "the daily checks row")
+	if err == nil || !strings.Contains(err.Error(), "empty upsert response") {
+		t.Errorf("an empty upsert: %v, want \"empty upsert response\"", err)
 	}
 }
 
@@ -540,13 +540,13 @@ func TestOSUnitEventsCtxErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := (OSUnitEvents{}).UnitEvents(ctx); !errors.Is(err, context.Canceled) {
-		t.Errorf("отмена до старта: %v, want context.Canceled", err)
+		t.Errorf("a cancellation before the start: %v, want context.Canceled", err)
 	}
 	// A 1ns Timeout — an expired wrapper: a context error (not the window
 	// default).
 	if _, err := (OSUnitEvents{Timeout: 1}).UnitEvents(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "context deadline exceeded") {
-		t.Errorf("Timeout 1нс: %v, want deadline exceeded", err)
+		t.Errorf("Timeout 1ns: %v, want deadline exceeded", err)
 	}
 }
 
@@ -555,10 +555,10 @@ func TestOSUnitEventsCtxErrors(t *testing.T) {
 // do not pass).
 func TestParseMemoryEventsBareKey(t *testing.T) {
 	if _, err := parseMemoryEvents("oom\n"); err != nil {
-		t.Errorf("ключ без значения: %v, want пропуск", err)
+		t.Errorf("a key without a value: %v, want a skip", err)
 	}
 	if ev, err := parseMemoryEvents("oom\noom 4\n"); err != nil || ev.OOM != 4 {
-		t.Errorf("ключ без значения + валидная строка: (%+v, %v)", ev, err)
+		t.Errorf("a key without a value + a valid line: (%+v, %v)", ev, err)
 	}
 }
 
@@ -567,12 +567,12 @@ func TestParseMemoryEventsBareKey(t *testing.T) {
 func TestAlertDescKnownAndUnknown(t *testing.T) {
 	for name := range alertDescs {
 		if got := alertDesc(name); got == name {
-			t.Errorf("alertDesc(%s) = имя, want описание легенды", name)
+			t.Errorf("alertDesc(%s) = the name, want the legend description", name)
 		}
 		break // one known one is enough
 	}
-	if got := alertDesc("нет-такого-алерта"); got != "нет-такого-алерта" {
-		t.Errorf("alertDesc(неизвестный) = %q, want имя как есть", got)
+	if got := alertDesc("no-such-alert"); got != "no-such-alert" {
+		t.Errorf("alertDesc(unknown) = %q, want the name as is", got)
 	}
 }
 
@@ -590,6 +590,6 @@ func TestOSUnitEventsSingleBrokenEvents(t *testing.T) {
 		Systemctl: fakeSystemctl(t, root, show, ""),
 	}).UnitEvents(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "crawler-http-worker.service") {
-		t.Errorf("кривой memory.events: %v, want ошибку с именем юнита", err)
+		t.Errorf("a broken memory.events: %v, want an error with the unit name", err)
 	}
 }

@@ -53,15 +53,15 @@ func NewUnitEventsMetrics(reg *metrics.Registry, src UnitEventsSource) *UnitEven
 	}
 	m.events = reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_unit_oom_events",
-		Help: "Счётчики memory.events cgroup v2 юнитов crawler (T-145): kind=oom — срабатывания OOM-killer, kind=oom_kill — убитые процессы; обнуляются пересозданием cgroup на рестарте юнита (gauge, не counter). Рост — события OOM, алерт unit_oom монитора.",
+		Help: "The memory.events counters of the crawler units' cgroup v2 (T-145): kind=oom — OOM-killer firings, kind=oom_kill — killed processes; zeroed by the cgroup recreation on a unit restart (gauge, not counter). Growth — OOM events, the monitor unit_oom alert.",
 	}, metrics.LabelUnit, metrics.LabelKind)
 	m.memHigh = reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_unit_memory_high_events",
-		Help: "Счётчик memory.events high юнитов crawler (T-162): попадания за мягкий потолок MemoryHigh (троттлинг reclaim'ом); накапливается за жизнь cgroup (gauge, не counter). Рост между проходами алертов — устойчивый троттлинг, алерт memory_high (предвестник фаталов T-157 у http-worker).",
+		Help: "The memory.events high counter of the crawler units (T-162): hits over the soft MemoryHigh cap (reclaim throttling); accumulates over the cgroup lifetime (gauge, not counter). Growth between the alert passes — sustained throttling, the memory_high alert (the harbinger of the http-worker T-157 fatals).",
 	}, metrics.LabelUnit)
 	m.restarts = reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_unit_restarts",
-		Help: "NRestarts systemd-юнитов crawler (T-145): крэш-рестарты с последнего старта/reset-failed; обнуляются сбросом состояния юнита (gauge, не counter). Рост — падения юнитов, алерт unit_oom монитора.",
+		Help: "NRestarts of the crawler systemd units (T-145): crash restarts since the last start/reset-failed; zeroed by a unit state reset (gauge, not counter). Growth — unit crashes, the monitor unit_oom alert.",
 	}, metrics.LabelUnit)
 	return m
 }

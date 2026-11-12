@@ -160,11 +160,11 @@ func init() {
 	// would drift apart silently and the aggregate would write foreign
 	// values.
 	if len(statusAggCols) != len(model.Statuses) {
-		panic("monitor: statusAggCols не совпадает с model.Statuses по длине — легенда агрегата неполна")
+		panic("monitor: statusAggCols does not match model.Statuses in length — the aggregate legend is incomplete")
 	}
 	for i, c := range statusAggCols {
 		if c.status != model.Statuses[i] {
-			panic(fmt.Sprintf("monitor: statusAggCols[%d] = %v, want %v (порядок model.Statuses)", i, c.status, model.Statuses[i]))
+			panic(fmt.Sprintf("monitor: statusAggCols[%d] = %v, want %v (the model.Statuses order)", i, c.status, model.Statuses[i]))
 		}
 	}
 }
@@ -941,7 +941,7 @@ var zoneColumnPositions = [...]string{"total", "pending", "queued", "checked", "
 // always recomputed (the incremental-counters spec §9).
 func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions) (ZoneStatsResult, error) {
 	if pool == nil {
-		return ZoneStatsResult{}, errors.New("monitor: реконсиляция счётчиков: пул не задан")
+		return ZoneStatsResult{}, errors.New("monitor: counter reconciliation: the pool is not set")
 	}
 	o := opts.withDefaults()
 	now := time.Now
@@ -951,7 +951,7 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return ZoneStatsResult{}, fmt.Errorf("monitor: реконсиляция счётчиков: транзакция: %w", err)
+		return ZoneStatsResult{}, fmt.Errorf("monitor: counter reconciliation: transaction: %w", err)
 	}
 	// An unconditional rollback: after Commit it is a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -967,41 +967,41 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	// The daily rows — in the same block of old reads (one snapshot): the
 	// day name is computed by the DB (T-179/T-182), presence is the fill-in
 	// sign (drift only for an existing row).
-	oldDaily, dailyExists, err := readDailyValue(ctx, tx, readDailyChecksSQL, "суточная строка проверок")
+	oldDaily, dailyExists, err := readDailyValue(ctx, tx, readDailyChecksSQL, "the daily checks row")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	oldTemp, tempExists, err := readDailyValue(ctx, tx, readDailyTempSQL, "суточная строка temp_error")
+	oldTemp, tempExists, err := readDailyValue(ctx, tx, readDailyTempSQL, "the daily temp_error row")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
 	// The retry maturity baskets (T-202) — the same block: presence is
 	// the fill-in sign (the basket is created by an increment or this
 	// pass).
-	oldRetryPast, retryPastExists, err := readDailyValue(ctx, tx, readRetryPastSQL, "зрелая корзина ретрая")
+	oldRetryPast, retryPastExists, err := readDailyValue(ctx, tx, readRetryPastSQL, "the mature retry basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	oldRetryToday, retryTodayExists, err := readDailyValue(ctx, tx, readRetryTodaySQL, "сегодняшняя корзина ретрая")
+	oldRetryToday, retryTodayExists, err := readDailyValue(ctx, tx, readRetryTodaySQL, "today's retry basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
 	// The hourly tempo baskets (T-203) — the same block: presence is the
 	// fill-in sign (the basket is created by a record/render increment or
 	// this pass), the hour name is computed by the DB.
-	oldHourRenderedPrev, hourRenderedPrevExists, err := readDailyValue(ctx, tx, readHourlyRenderedPrevSQL, "корзина rendered-темпа предыдущего часа")
+	oldHourRenderedPrev, hourRenderedPrevExists, err := readDailyValue(ctx, tx, readHourlyRenderedPrevSQL, "the previous-hour rendered-tempo basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	oldHourRenderedCur, hourRenderedCurExists, err := readDailyValue(ctx, tx, readHourlyRenderedCurSQL, "корзина rendered-темпа текущего часа")
+	oldHourRenderedCur, hourRenderedCurExists, err := readDailyValue(ctx, tx, readHourlyRenderedCurSQL, "the current-hour rendered-tempo basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	oldHourResultsPrev, hourResultsPrevExists, err := readDailyValue(ctx, tx, readHourlyResultsPrevSQL, "корзина темпа результатов предыдущего часа")
+	oldHourResultsPrev, hourResultsPrevExists, err := readDailyValue(ctx, tx, readHourlyResultsPrevSQL, "the previous-hour results-tempo basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	oldHourResultsCur, hourResultsCurExists, err := readDailyValue(ctx, tx, readHourlyResultsCurSQL, "корзина темпа результатов текущего часа")
+	oldHourResultsCur, hourResultsCurExists, err := readDailyValue(ctx, tx, readHourlyResultsCurSQL, "the current-hour results-tempo basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -1009,11 +1009,11 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	// the fill-in sign (the basket is created by a record/render
 	// increment, a stamp decrement or this pass), the hour name is
 	// computed by the DB.
-	oldHourReanalyzePrev, hourReanalyzePrevExists, err := readDailyValue(ctx, tx, readHourlyReanalyzePrevSQL, "корзина хвостов переанализа предыдущего часа")
+	oldHourReanalyzePrev, hourReanalyzePrevExists, err := readDailyValue(ctx, tx, readHourlyReanalyzePrevSQL, "the previous-hour re-analysis tail basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	oldHourReanalyzeCur, hourReanalyzeCurExists, err := readDailyValue(ctx, tx, readHourlyReanalyzeCurSQL, "корзина хвостов переанализа текущего часа")
+	oldHourReanalyzeCur, hourReanalyzeCurExists, err := readDailyValue(ctx, tx, readHourlyReanalyzeCurSQL, "the current-hour re-analysis tail basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -1098,11 +1098,11 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		tempToday += agg[i].tempToday
 		newDoneStale += agg[i].newDoneStale
 	}
-	newDaily, err := writeDailyCounter(ctx, tx, recountDailyChecksSQL, checksToday, now(), "суточная строка проверок")
+	newDaily, err := writeDailyCounter(ctx, tx, recountDailyChecksSQL, checksToday, now(), "the daily checks row")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	newTemp, err := writeDailyCounter(ctx, tx, recountDailyTempSQL, tempToday, now(), "суточная строка temp_error")
+	newTemp, err := writeDailyCounter(ctx, tx, recountDailyTempSQL, tempToday, now(), "the daily temp_error row")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -1116,7 +1116,7 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	// retry: the episode date decrement) — no cycles. The guard of the
 	// heavy retry selection sees the sum of the mature baskets right
 	// after the commit.
-	if err := cleanupBaskets(ctx, tx, retryMatureCleanupSQL, "очистка корзин ретрая"); err != nil {
+	if err := cleanupBaskets(ctx, tx, retryMatureCleanupSQL, "the retry basket cleanup"); err != nil {
 		return ZoneStatsResult{}, err
 	}
 	var retryTodaySum, retryPastSum int64
@@ -1124,11 +1124,11 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		retryTodaySum += agg[i].retryToday
 		retryPastSum += agg[i].retryPast
 	}
-	newRetryPast, err := writeDailyCounter(ctx, tx, recountRetryPastSQL, retryPastSum, now(), "зрелая корзина ретрая")
+	newRetryPast, err := writeDailyCounter(ctx, tx, recountRetryPastSQL, retryPastSum, now(), "the mature retry basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	newRetryToday, err := writeDailyCounter(ctx, tx, recountRetryTodaySQL, retryTodaySum, now(), "сегодняшняя корзина ретрая")
+	newRetryToday, err := writeDailyCounter(ctx, tx, recountRetryTodaySQL, retryTodaySum, now(), "today's retry basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -1140,14 +1140,14 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	// working it all through the current hour) and cur. The guard of the
 	// reanalysis tick sees the sums of the live baskets right after the
 	// commit.
-	if err := cleanupBaskets(ctx, tx, hourlyReanalyzeCleanupSQL, "очистка корзин хвостов переанализа"); err != nil {
+	if err := cleanupBaskets(ctx, tx, hourlyReanalyzeCleanupSQL, "the re-analysis tail basket cleanup"); err != nil {
 		return ZoneStatsResult{}, err
 	}
-	newHourReanalyzePrev, err := writeDailyCounter(ctx, tx, recountHourlyReanalyzePrevSQL, hourly.prevReanalyze, now(), "корзина хвостов переанализа предыдущего часа")
+	newHourReanalyzePrev, err := writeDailyCounter(ctx, tx, recountHourlyReanalyzePrevSQL, hourly.prevReanalyze, now(), "the previous-hour re-analysis tail basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	newHourReanalyzeCur, err := writeDailyCounter(ctx, tx, recountHourlyReanalyzeCurSQL, hourly.curReanalyze, now(), "корзина хвостов переанализа текущего часа")
+	newHourReanalyzeCur, err := writeDailyCounter(ctx, tx, recountHourlyReanalyzeCurSQL, hourly.curReanalyze, now(), "the current-hour re-analysis tail basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -1161,30 +1161,30 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	// renderworker: rendered:) — no cycles. The tempo reader
 	// (status.throughputSQL) sees the sums of the live baskets right
 	// after the commit.
-	if err := cleanupBaskets(ctx, tx, hourlyRenderedCleanupSQL, "очистка корзин rendered-темпа"); err != nil {
+	if err := cleanupBaskets(ctx, tx, hourlyRenderedCleanupSQL, "the rendered-tempo basket cleanup"); err != nil {
 		return ZoneStatsResult{}, err
 	}
-	newHourRenderedPrev, err := writeDailyCounter(ctx, tx, recountHourlyRenderedPrevSQL, hourly.prevRendered, now(), "корзина rendered-темпа предыдущего часа")
+	newHourRenderedPrev, err := writeDailyCounter(ctx, tx, recountHourlyRenderedPrevSQL, hourly.prevRendered, now(), "the previous-hour rendered-tempo basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	newHourRenderedCur, err := writeDailyCounter(ctx, tx, recountHourlyRenderedCurSQL, hourly.curRendered, now(), "корзина rendered-темпа текущего часа")
+	newHourRenderedCur, err := writeDailyCounter(ctx, tx, recountHourlyRenderedCurSQL, hourly.curRendered, now(), "the current-hour rendered-tempo basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	if err := cleanupBaskets(ctx, tx, hourlyResultsCleanupSQL, "очистка корзин темпа результатов"); err != nil {
+	if err := cleanupBaskets(ctx, tx, hourlyResultsCleanupSQL, "the results-tempo basket cleanup"); err != nil {
 		return ZoneStatsResult{}, err
 	}
-	newHourResultsPrev, err := writeDailyCounter(ctx, tx, recountHourlyResultsPrevSQL, hourly.prevResults, now(), "корзина темпа результатов предыдущего часа")
+	newHourResultsPrev, err := writeDailyCounter(ctx, tx, recountHourlyResultsPrevSQL, hourly.prevResults, now(), "the previous-hour results-tempo basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	newHourResultsCur, err := writeDailyCounter(ctx, tx, recountHourlyResultsCurSQL, hourly.curResults, now(), "корзина темпа результатов текущего часа")
+	newHourResultsCur, err := writeDailyCounter(ctx, tx, recountHourlyResultsCurSQL, hourly.curResults, now(), "the current-hour results-tempo basket")
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return ZoneStatsResult{}, fmt.Errorf("monitor: реконсиляция счётчиков: фиксация: %w", err)
+		return ZoneStatsResult{}, fmt.Errorf("monitor: counter reconciliation: commit: %w", err)
 	}
 
 	res := ZoneStatsResult{Zones: int64(len(newZones)), NewDoneStale: newDoneStale, Positions: make([]CounterPosition, 0, len(newZones)*len(zoneColumnPositions)+len(driftCounterNames())+len(dailyStreamingPositions())+len(retryMatureStreamingPositions())+len(hourlyStreamingPositions()))}
@@ -1320,7 +1320,7 @@ type laravelAggRow struct {
 func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
 	rows, err := q.Query(ctx, recountAggQuerySQL)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: агрегат: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: aggregate: %w", err)
 	}
 	defer rows.Close()
 	var out []zoneAggRow
@@ -1334,12 +1334,12 @@ func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
 		}
 		dest = append(dest, &r.render, &r.checksToday, &r.tempToday, &r.retryToday, &r.retryPast, &r.newDoneStale)
 		if err := rows.Scan(dest...); err != nil {
-			return nil, fmt.Errorf("monitor: реконсиляция счётчиков: агрегат: чтение: %w", err)
+			return nil, fmt.Errorf("monitor: counter reconciliation: aggregate: scan: %w", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: агрегат: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: aggregate: %w", err)
 	}
 	return out, nil
 }
@@ -1348,19 +1348,19 @@ func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
 func readLaravelAgg(ctx context.Context, tx pgx.Tx) ([]laravelAggRow, error) {
 	rows, err := tx.Query(ctx, laravelAggQuerySQL)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: laravel-агрегат: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: laravel aggregate: %w", err)
 	}
 	defer rows.Close()
 	var out []laravelAggRow
 	for rows.Next() {
 		var r laravelAggRow
 		if err := rows.Scan(&r.zone, &r.laravel); err != nil {
-			return nil, fmt.Errorf("monitor: реконсиляция счётчиков: laravel-агрегат: чтение: %w", err)
+			return nil, fmt.Errorf("monitor: counter reconciliation: laravel aggregate: scan: %w", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: laravel-агрегат: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: laravel aggregate: %w", err)
 	}
 	return out, nil
 }
@@ -1369,17 +1369,17 @@ func readLaravelAgg(ctx context.Context, tx pgx.Tx) ([]laravelAggRow, error) {
 func readHistoryAgg(ctx context.Context, tx pgx.Tx) (appeared, lost int64, err error) {
 	rows, err := tx.Query(ctx, historyAggSQL)
 	if err != nil {
-		return 0, 0, fmt.Errorf("monitor: реконсиляция счётчиков: история: %w", err)
+		return 0, 0, fmt.Errorf("monitor: counter reconciliation: history: %w", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return 0, 0, fmt.Errorf("monitor: реконсиляция счётчиков: история: пустой ответ агрегата")
+		return 0, 0, fmt.Errorf("monitor: counter reconciliation: history: empty aggregate response")
 	}
 	if err := rows.Scan(&appeared, &lost); err != nil {
-		return 0, 0, fmt.Errorf("monitor: реконсиляция счётчиков: история: чтение: %w", err)
+		return 0, 0, fmt.Errorf("monitor: counter reconciliation: history: scan: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, 0, fmt.Errorf("monitor: реконсиляция счётчиков: история: %w", err)
+		return 0, 0, fmt.Errorf("monitor: counter reconciliation: history: %w", err)
 	}
 	return appeared, lost, nil
 }
@@ -1402,19 +1402,19 @@ type hourlyAggRow struct {
 func readHourlyAgg(ctx context.Context, tx pgx.Tx) (hourlyAggRow, error) {
 	rows, err := tx.Query(ctx, hourlyAggSQL)
 	if err != nil {
-		return hourlyAggRow{}, fmt.Errorf("monitor: реконсиляция счётчиков: часовые корзины: %w", err)
+		return hourlyAggRow{}, fmt.Errorf("monitor: counter reconciliation: hourly baskets: %w", err)
 	}
 	defer rows.Close()
 	var r hourlyAggRow
 	if !rows.Next() {
-		return hourlyAggRow{}, fmt.Errorf("monitor: реконсиляция счётчиков: часовые корзины: пустой ответ агрегата")
+		return hourlyAggRow{}, fmt.Errorf("monitor: counter reconciliation: hourly baskets: empty aggregate response")
 	}
 	if err := rows.Scan(&r.prevResults, &r.prevRendered, &r.curResults, &r.curRendered,
 		&r.prevReanalyze, &r.curReanalyze); err != nil {
-		return hourlyAggRow{}, fmt.Errorf("monitor: реконсиляция счётчиков: часовые корзины: чтение: %w", err)
+		return hourlyAggRow{}, fmt.Errorf("monitor: counter reconciliation: hourly baskets: scan: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return hourlyAggRow{}, fmt.Errorf("monitor: реконсиляция счётчиков: часовые корзины: %w", err)
+		return hourlyAggRow{}, fmt.Errorf("monitor: counter reconciliation: hourly baskets: %w", err)
 	}
 	return r, nil
 }
@@ -1428,22 +1428,22 @@ func writeZonePositions(ctx context.Context, tx pgx.Tx, ids []int16, total, pend
 	}
 	rows, err := tx.Query(ctx, recountZonesSQL, ids, total, pending, queued, checked, at, laravel)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: зоны: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: zones: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id int16
 		var r zonePositionRow
 		if err := rows.Scan(&id, &r.total, &r.pending, &r.queued, &r.checked, &r.laravel); err != nil {
-			return nil, fmt.Errorf("monitor: реконсиляция счётчиков: зоны: чтение: %w", err)
+			return nil, fmt.Errorf("monitor: counter reconciliation: zones: scan: %w", err)
 		}
 		out[id] = r
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: зоны: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: zones: %w", err)
 	}
 	if int64(len(out)) != int64(len(ids)) {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: зоны: перезаписано %d из %d (строки зон обязательны)", len(out), len(ids))
+		return nil, fmt.Errorf("monitor: counter reconciliation: zones: %d of %d overwritten (the zone rows are required)", len(out), len(ids))
 	}
 	return out, nil
 }
@@ -1453,7 +1453,7 @@ func writeZonePositions(ctx context.Context, tx pgx.Tx, ids []int16, total, pend
 func writeGlobalCounters(ctx context.Context, tx pgx.Tx, names []string, values []int64, at time.Time) (map[string]int64, error) {
 	rows, err := tx.Query(ctx, recountCountersSQL, names, values, at)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: глобальные: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: globals: %w", err)
 	}
 	defer rows.Close()
 	out := make(map[string]int64, len(names))
@@ -1461,15 +1461,15 @@ func writeGlobalCounters(ctx context.Context, tx pgx.Tx, names []string, values 
 		var name string
 		var v int64
 		if err := rows.Scan(&name, &v); err != nil {
-			return nil, fmt.Errorf("monitor: реконсиляция счётчиков: глобальные: чтение: %w", err)
+			return nil, fmt.Errorf("monitor: counter reconciliation: globals: scan: %w", err)
 		}
 		out[name] = v
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: глобальные: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: globals: %w", err)
 	}
 	if len(out) != len(names) {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: глобальные: перезаписано %d из %d строк", len(out), len(names))
+		return nil, fmt.Errorf("monitor: counter reconciliation: globals: %d of %d rows overwritten", len(out), len(names))
 	}
 	return out, nil
 }
@@ -1483,22 +1483,22 @@ func writeGlobalCounters(ctx context.Context, tx pgx.Tx, names []string, values 
 func readDailyValue(ctx context.Context, tx pgx.Tx, sqlQ, what string) (value int64, exists bool, err error) {
 	rows, err := tx.Query(ctx, sqlQ)
 	if err != nil {
-		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
+		return 0, false, fmt.Errorf("monitor: counter reconciliation: %s: %w", what, err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		// The read failure first: a connection break is not "the row is
 		// missing" (the renderDebtCount style).
 		if err := rows.Err(); err != nil {
-			return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
+			return 0, false, fmt.Errorf("monitor: counter reconciliation: %s: %w", what, err)
 		}
 		return 0, false, nil
 	}
 	if err := rows.Scan(&value); err != nil {
-		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: чтение: %w", what, err)
+		return 0, false, fmt.Errorf("monitor: counter reconciliation: %s: scan: %w", what, err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
+		return 0, false, fmt.Errorf("monitor: counter reconciliation: %s: %w", what, err)
 	}
 	return value, true, nil
 }
@@ -1512,7 +1512,7 @@ func readDailyValue(ctx context.Context, tx pgx.Tx, sqlQ, what string) (value in
 func cleanupBaskets(ctx context.Context, tx pgx.Tx, sqlQ, what string) error {
 	rows, err := tx.Query(ctx, sqlQ)
 	if err != nil {
-		return fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
+		return fmt.Errorf("monitor: counter reconciliation: %s: %w", what, err)
 	}
 	defer rows.Close()
 	var discarded int64
@@ -1520,11 +1520,11 @@ func cleanupBaskets(ctx context.Context, tx pgx.Tx, sqlQ, what string) error {
 		// The deleted basket's value is not read: the live positions are
 		// rewritten by the aggregate in full.
 		if err := rows.Scan(&discarded); err != nil {
-			return fmt.Errorf("monitor: реконсиляция счётчиков: %s: чтение: %w", what, err)
+			return fmt.Errorf("monitor: counter reconciliation: %s: scan: %w", what, err)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
+		return fmt.Errorf("monitor: counter reconciliation: %s: %w", what, err)
 	}
 	return nil
 }
@@ -1537,18 +1537,18 @@ func cleanupBaskets(ctx context.Context, tx pgx.Tx, sqlQ, what string) error {
 func writeDailyCounter(ctx context.Context, tx pgx.Tx, sqlQ string, value int64, at time.Time, what string) (int64, error) {
 	rows, err := tx.Query(ctx, sqlQ, value, at)
 	if err != nil {
-		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
+		return 0, fmt.Errorf("monitor: counter reconciliation: %s: %w", what, err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: %s: пустой ответ upsert", what)
+		return 0, fmt.Errorf("monitor: counter reconciliation: %s: empty upsert response", what)
 	}
 	var fresh int64
 	if err := rows.Scan(&fresh); err != nil {
-		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: %s: чтение: %w", what, err)
+		return 0, fmt.Errorf("monitor: counter reconciliation: %s: scan: %w", what, err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
+		return 0, fmt.Errorf("monitor: counter reconciliation: %s: %w", what, err)
 	}
 	return fresh, nil
 }
@@ -1590,7 +1590,7 @@ type zonePositionRow struct {
 func readZonePositions(ctx context.Context, tx pgx.Tx, zone *int16) (map[int16]zonePositionRow, error) {
 	rows, err := tx.Query(ctx, readZonesSQL, zone)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: чтение зон: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: zone read: %w", err)
 	}
 	defer rows.Close()
 	out := make(map[int16]zonePositionRow)
@@ -1598,12 +1598,12 @@ func readZonePositions(ctx context.Context, tx pgx.Tx, zone *int16) (map[int16]z
 		var id int16
 		var r zonePositionRow
 		if err := rows.Scan(&id, &r.total, &r.pending, &r.queued, &r.checked, &r.laravel); err != nil {
-			return nil, fmt.Errorf("monitor: реконсиляция счётчиков: чтение зон: строка: %w", err)
+			return nil, fmt.Errorf("monitor: counter reconciliation: zone read: row: %w", err)
 		}
 		out[id] = r
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: чтение зон: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: zone read: %w", err)
 	}
 	return out, nil
 }
@@ -1614,7 +1614,7 @@ func readZonePositions(ctx context.Context, tx pgx.Tx, zone *int16) (map[int16]z
 func readCounterValues(ctx context.Context, tx pgx.Tx, names []string) (map[string]int64, error) {
 	rows, err := tx.Query(ctx, readCountersSQL, names)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: чтение счётчиков: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: counter read: %w", err)
 	}
 	defer rows.Close()
 	out := make(map[string]int64, len(names))
@@ -1622,12 +1622,12 @@ func readCounterValues(ctx context.Context, tx pgx.Tx, names []string) (map[stri
 		var name string
 		var v int64
 		if err := rows.Scan(&name, &v); err != nil {
-			return nil, fmt.Errorf("monitor: реконсиляция счётчиков: чтение счётчиков: строка: %w", err)
+			return nil, fmt.Errorf("monitor: counter reconciliation: counter read: row: %w", err)
 		}
 		out[name] = v
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("monitor: реконсиляция счётчиков: чтение счётчиков: %w", err)
+		return nil, fmt.Errorf("monitor: counter reconciliation: counter read: %w", err)
 	}
 	return out, nil
 }
@@ -1656,11 +1656,11 @@ func readCounterValues(ctx context.Context, tx pgx.Tx, names []string) (map[stri
 // instruments).
 func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts ZoneStatsOptions) error {
 	if pool == nil {
-		return errors.New("monitor: реконсиляция счётчиков: пул не задан")
+		return errors.New("monitor: counter reconciliation: the pool is not set")
 	}
 	txPool, ok := pool.(ZoneStatsDB)
 	if !ok {
-		return errors.New("monitor: реконсиляция счётчиков: пул без транзакций (ZoneStatsDB)")
+		return errors.New("monitor: counter reconciliation: the pool has no transactions (ZoneStatsDB)")
 	}
 	o := opts.withDefaults()
 	log := o.Log
@@ -1668,7 +1668,7 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 		log = slog.New(slog.DiscardHandler)
 	}
 	m := newZoneStatsLoopMetrics(reg)
-	log.Info("цикл реконсиляции счётчиков конвейера",
+	log.Info("pipeline counter reconciliation loop",
 		"interval", o.Interval.String())
 
 	// The ticker before the starting pass: the ticks are counted from the
@@ -1690,14 +1690,14 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 		case err != nil && ctx.Err() != nil:
 			// A cancellation during the pass — part of the shutdown, not an alarm.
 		case err != nil:
-			log.Warn("проход реконсиляции счётчиков", "err", err)
+			log.Warn("counter reconciliation pass", "err", err)
 		default:
 			reportDrift(log, m, res, first)
 			// The "status hung" gauge (FR-2.2) — a level, not a drift:
 			// it is set by every successful pass, including the first
 			// filling one (steady state — an honest zero).
 			m.setNewDoneStale(res.NewDoneStale)
-			log.Debug("проход реконсиляции счётчиков", "zones", res.Zones)
+			log.Debug("counter reconciliation pass", "zones", res.Zones)
 			// "First" is cleared only by a successful pass (review P3-5):
 			// a failing start (the DB not ready yet) did not fill the
 			// counters —
@@ -1716,7 +1716,7 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 			case <-ticker.C:
 			default:
 			}
-			log.Warn("проход реконсиляции дольше интервала — накопившийся тик пропущен",
+			log.Warn("the reconciliation pass ran longer than the interval — the accumulated tick skipped",
 				"took", took.String(), "interval", o.Interval.String())
 			m.skip()
 		}
@@ -1784,7 +1784,7 @@ func reportDrift(log *slog.Logger, m *zoneStatsLoopMetrics, res ZoneStatsResult,
 		}
 		top = append(top, fmt.Sprintf("%s: %d → %d", p.Counter, p.Old, p.New))
 	}
-	log.Warn("реконсиляция: дрейф счётчиков (инкременты разошлись с агрегатом; следующий проход уже перезаписал)",
+	log.Warn("reconciliation: counter drift (the increments diverged from the aggregate; the next pass has already overwritten)",
 		"positions", len(drifted), "sum_abs", sum, "top", top)
 }
 
@@ -1818,20 +1818,20 @@ func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
 	return &zoneStatsLoopMetrics{
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_counters_recount_seconds",
-			Help:    "Длительность совмещённого прохода реконсиляции счётчиков (агрегат domains/laravel_domains/laravel_history → zones + crawler_counters, T-078/T-178).",
+			Help:    "Duration of the combined counter reconciliation pass (the domains/laravel_domains/laravel_history aggregate → zones + crawler_counters, T-078/T-178).",
 			Buckets: prometheus.ExponentialBuckets(0.5, 2, 11),
 		}),
 		skipped: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_zonestats_skipped_ticks_total",
-			Help: "Пропущенные тики цикла реконсиляции: проход длился дольше интервала, накопившийся тик не запускает новый проход (single-flight, T-161).",
+			Help: "Skipped ticks of the reconciliation loop: the pass ran longer than the interval, the accumulated tick does not start a new pass (single-flight, T-161).",
 		}),
 		drift: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_counters_drift",
-			Help: "Дрейф инкрементальных счётчиков на проходе реконсиляции: |старое − новое| по позициям (zone:<id>:колонка, global:<имя>; daily:checks и daily:temp_error — суточный темп проверок и его temp_error-числитель, T-179/T-182). Стационар — 0, устойчивый ненулевой дрейф — пропущенный переход или ручной SQL мимо кода (разбор — docs/runbooks.md, T-178); исключения — потоковые позиции (считают события против живых доменов/строк, ненулевые под живой нагрузкой — наблюдаемая величина, в Warn не входят): суточные daily:* (T-179/T-182), корзины зрелости ретрая retry_mature:past/retry_mature:today (T-202), часовые корзины темпа rendered:prev/rendered:cur/results:prev/results:cur (T-203 — prev/cur: предыдущий и текущий календарный час) и хвостов переанализа reanalyze:prev/reanalyze:cur (T-204).",
+			Help: "Incremental counter drift on the reconciliation pass: |old − new| per position (zone:<id>:column, global:<name>; daily:checks and daily:temp_error — the daily checks tempo and its temp_error numerator, T-179/T-182). Steady state — 0, a sustained non-zero drift — a missed transition or manual SQL bypassing the code (triage — docs/runbooks.md, T-178); exceptions — the streaming positions (they count events against the live domains/rows, non-zero under live load — an observable quantity, not in the Warn): the daily daily:* (T-179/T-182), the retry maturity baskets retry_mature:past/retry_mature:today (T-202), the hourly tempo baskets rendered:prev/rendered:cur/results:prev/results:cur (T-203 — prev/cur: the previous and the current calendar hour) and the re-analysis tails reanalyze:prev/reanalyze:cur (T-204).",
 		}, "counter"),
 		newDoneStale: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_domains_new_done_stale",
-			Help: "Домены «статус повис» (ФТ-2.2 ТЗ-fsm, T-256): status = new ∧ check_state = done ∧ last_checked_at старше суток — DNS-этап записал ветку «есть адреса», HTTP-итог не пришёл (потеря задачи q:http). Значение — FILTER-колонка прохода реконсиляции (строка crawler_counters new_done_stale, без seq scan по domains), обновляется раз в monitor.zone_stats_interval. Стационарно 0 в норме; ненулевое — алерт domains_new_done_stale (стрик 2 прохода): когорту лечит компенсатор T-270 (ранний recheck new∧done, crawler_scheduler_stale_requeued_total; спецификация — internal/model/enums.go), gauge — сигнал о новых потерях.",
+			Help: "Domains \"status hung\" (FR-2.2 of the TZ-fsm spec, T-256): status = new ∧ check_state = done ∧ last_checked_at older than a day — the DNS stage wrote the \"has addresses\" branch, the HTTP outcome never arrived (a lost q:http task). The value — a FILTER column of the reconciliation pass (the crawler_counters new_done_stale row, no seq scan over domains), refreshed once per monitor.zone_stats_interval. Stationary 0 normally; non-zero — the domains_new_done_stale alert (a streak of 2 passes): the cohort is healed by the T-270 compensator (the early recheck of new∧done, crawler_scheduler_stale_requeued_total; the specification — internal/model/enums.go), the gauge — the signal about new losses.",
 		}),
 	}
 }
@@ -1910,14 +1910,14 @@ type VerifyOptions struct {
 // closed by the tolerance.
 func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]CounterPosition, error) {
 	if pool == nil {
-		return nil, errors.New("monitor: сверка счётчиков: пул не задан")
+		return nil, errors.New("monitor: counter verify: the pool is not set")
 	}
 
 	var out []CounterPosition
 
 	rows, err := pool.Query(ctx, verifyZonesSQL, opts.Zone)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: сверка счётчиков: зоны: %w", err)
+		return nil, fmt.Errorf("monitor: counter verify: zones: %w", err)
 	}
 	for rows.Next() {
 		var id int16
@@ -1929,7 +1929,7 @@ func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]Coun
 		}
 		if err := rows.Scan(dest...); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("monitor: сверка счётчиков: зоны: чтение: %w", err)
+			return nil, fmt.Errorf("monitor: counter verify: zones: scan: %w", err)
 		}
 		for i, col := range zoneColumnPositions {
 			old, fresh := vals[2*i], vals[2*i+1]
@@ -1944,7 +1944,7 @@ func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]Coun
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return nil, fmt.Errorf("monitor: сверка счётчиков: зоны: %w", err)
+		return nil, fmt.Errorf("monitor: counter verify: zones: %w", err)
 	}
 	rows.Close()
 
@@ -1953,25 +1953,25 @@ func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]Coun
 	// mapping).
 	agg, err := readZoneAgg(ctx, pool)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: сверка счётчиков: глобальные: %w", err)
+		return nil, fmt.Errorf("monitor: counter verify: globals: %w", err)
 	}
 	var appeared, lost int64
 	{
 		hrows, err := pool.Query(ctx, historyAggSQL)
 		if err != nil {
-			return nil, fmt.Errorf("monitor: сверка счётчиков: глобальные: история: %w", err)
+			return nil, fmt.Errorf("monitor: counter verify: globals: history: %w", err)
 		}
 		if !hrows.Next() {
 			hrows.Close()
-			return nil, fmt.Errorf("monitor: сверка счётчиков: глобальные: история: пустой ответ агрегата")
+			return nil, fmt.Errorf("monitor: counter verify: globals: history: empty aggregate response")
 		}
 		if err := hrows.Scan(&appeared, &lost); err != nil {
 			hrows.Close()
-			return nil, fmt.Errorf("monitor: сверка счётчиков: глобальные: история: чтение: %w", err)
+			return nil, fmt.Errorf("monitor: counter verify: globals: history: scan: %w", err)
 		}
 		if err := hrows.Err(); err != nil {
 			hrows.Close()
-			return nil, fmt.Errorf("monitor: сверка счётчиков: глобальные: история: %w", err)
+			return nil, fmt.Errorf("monitor: counter verify: globals: history: %w", err)
 		}
 		hrows.Close()
 	}
@@ -2018,7 +2018,7 @@ const storedCountersSQL = "SELECT name, value FROM crawler_counters"
 func readStoredCounters(ctx context.Context, pool db.DB) (map[string]int64, error) {
 	rows, err := pool.Query(ctx, storedCountersSQL)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: сверка счётчиков: сохранённые: %w", err)
+		return nil, fmt.Errorf("monitor: counter verify: stored: %w", err)
 	}
 	defer rows.Close()
 	out := make(map[string]int64)
@@ -2026,12 +2026,12 @@ func readStoredCounters(ctx context.Context, pool db.DB) (map[string]int64, erro
 		var name string
 		var v int64
 		if err := rows.Scan(&name, &v); err != nil {
-			return nil, fmt.Errorf("monitor: сверка счётчиков: сохранённые: чтение: %w", err)
+			return nil, fmt.Errorf("monitor: counter verify: stored: scan: %w", err)
 		}
 		out[name] = v
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("monitor: сверка счётчиков: сохранённые: %w", err)
+		return nil, fmt.Errorf("monitor: counter verify: stored: %w", err)
 	}
 	return out, nil
 }

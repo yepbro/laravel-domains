@@ -64,7 +64,7 @@ var _ RedisMemorySource = RedisInfo{}
 // RedisMemory reads the memory section of the INFO response and parses it.
 func (s RedisInfo) RedisMemory(ctx context.Context) (RedisMemory, error) {
 	if s.RDB == nil {
-		return RedisMemory{}, fmt.Errorf("monitor: память Redis: клиент не задан")
+		return RedisMemory{}, fmt.Errorf("monitor: Redis memory: the client is not set")
 	}
 	raw, err := s.RDB.Info(ctx, "memory").Result()
 	if err != nil {
@@ -97,7 +97,7 @@ func parseRedisMemoryINFO(raw string) (RedisMemory, error) {
 	}
 	policy := fields["maxmemory_policy"]
 	if policy == "" {
-		return RedisMemory{}, fmt.Errorf("monitor: INFO memory: поле maxmemory_policy отсутствует")
+		return RedisMemory{}, fmt.Errorf("monitor: INFO memory: the maxmemory_policy field is missing")
 	}
 	return RedisMemory{UsedBytes: used, MaxBytes: max, Policy: policy}, nil
 }
@@ -106,11 +106,11 @@ func parseRedisMemoryINFO(raw string) (RedisMemory, error) {
 func infoBytes(fields map[string]string, key string) (int64, error) {
 	v, ok := fields[key]
 	if !ok {
-		return 0, fmt.Errorf("monitor: INFO memory: поле %s отсутствует", key)
+		return 0, fmt.Errorf("monitor: INFO memory: the %s field is missing", key)
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < 0 {
-		return 0, fmt.Errorf("monitor: INFO memory: %s=%q не число байт", key, v)
+		return 0, fmt.Errorf("monitor: INFO memory: %s=%q is not a byte count", key, v)
 	}
 	return n, nil
 }

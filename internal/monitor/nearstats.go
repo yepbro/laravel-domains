@@ -72,26 +72,26 @@ func (o NearStatsOptions) withDefaults() NearStatsOptions {
 // a repeat gives the same value at the same table state.
 func NearStatsOnce(ctx context.Context, pool db.DB, minScore float64) (int64, error) {
 	if pool == nil {
-		return 0, errors.New("monitor: счётчик серой зоны: пул не задан")
+		return 0, errors.New("monitor: gray zone counter: pool not set")
 	}
 	if !(minScore > 0 && minScore < 1) {
-		return 0, fmt.Errorf("monitor: счётчик серой зоны: порог %v вне (0, 1)", minScore)
+		return 0, fmt.Errorf("monitor: gray zone counter: threshold %v outside (0, 1)", minScore)
 	}
 	lo, hi := minScore/2, minScore
 	rows, err := pool.Query(ctx, nearStatsSQL, float32(lo), float32(hi))
 	if err != nil {
-		return 0, fmt.Errorf("monitor: счётчик серой зоны: %w", err)
+		return 0, fmt.Errorf("monitor: gray zone counter: %w", err)
 	}
 	defer rows.Close()
 	var n int64
 	if !rows.Next() {
-		return 0, fmt.Errorf("monitor: счётчик серой зоны: пустой ответ агрегата")
+		return 0, fmt.Errorf("monitor: gray zone counter: empty aggregate response")
 	}
 	if err := rows.Scan(&n); err != nil {
-		return 0, fmt.Errorf("monitor: счётчик серой зоны: чтение: %w", err)
+		return 0, fmt.Errorf("monitor: gray zone counter: scan: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("monitor: счётчик серой зоны: %w", err)
+		return 0, fmt.Errorf("monitor: gray zone counter: %w", err)
 	}
 	return n, nil
 }
@@ -106,12 +106,12 @@ func NewNearGauge(reg *metrics.Registry) *prometheus.GaugeVec {
 	}
 	return reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_laravel_near_findings",
-		Help: "Находки Laravel в серой зоне порога: laravel_findings с min_score/2 <= score < min_score (материал калибровки правил, T-115).",
+		Help: "Laravel findings in the threshold gray zone: laravel_findings with min_score/2 <= score < min_score (rule calibration material, T-115).",
 	})
 }
 
-// mutator-disable-regexp log\.Info\("цикл statement/remove
-// mutator-disable-regexp log\.Debug\("проход statement/remove
+// mutator-disable-regexp log\.Info\("Laravel statement/remove
+// mutator-disable-regexp log\.Debug\("gray statement/remove
 // Justification: the service entries of the gray zone loop (the Info start, the Debug result
 // of a successful pass) — they do not change the counter behavior, damped per
 // docs/mutation-testing.md §4 (logging is not tested).
@@ -133,7 +133,7 @@ func NearStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("цикл счётчика серой зоны Laravel-находок",
+	log.Info("Laravel finding gray zone counter loop",
 		"interval", o.Interval.String(), "min_score", o.MinScore)
 
 	pass := func() {
@@ -147,10 +147,10 @@ func NearStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 		case err != nil && ctx.Err() != nil:
 			// A cancellation during the pass — part of the shutdown, not an alarm.
 		case err != nil:
-			log.Warn("проход счётчика серой зоны", "err", err)
+			log.Warn("gray zone counter pass", "err", err)
 		default:
 			gauge.WithLabelValues().Set(float64(n))
-			log.Debug("проход счётчика серой зоны", "near", n)
+			log.Debug("gray zone counter pass", "near", n)
 		}
 	}
 

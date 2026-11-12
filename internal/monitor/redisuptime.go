@@ -46,7 +46,7 @@ var _ RedisUptimeSource = RedisInfo{}
 // RedisUptime reads the server section of the INFO response and parses it.
 func (s RedisInfo) RedisUptime(ctx context.Context) (RedisUptime, error) {
 	if s.RDB == nil {
-		return RedisUptime{}, fmt.Errorf("monitor: аптайм Redis: клиент не задан")
+		return RedisUptime{}, fmt.Errorf("monitor: Redis uptime: the client is not set")
 	}
 	raw, err := s.RDB.Info(ctx, "server").Result()
 	if err != nil {
@@ -81,11 +81,11 @@ func parseRedisUptimeINFO(raw string) (RedisUptime, error) {
 func infoSeconds(fields map[string]string, key string) (int64, error) {
 	v, ok := fields[key]
 	if !ok {
-		return 0, fmt.Errorf("monitor: INFO server: поле %s отсутствует", key)
+		return 0, fmt.Errorf("monitor: INFO server: the %s field is missing", key)
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < 0 {
-		return 0, fmt.Errorf("monitor: INFO server: %s=%q не число секунд", key, v)
+		return 0, fmt.Errorf("monitor: INFO server: %s=%q is not a seconds count", key, v)
 	}
 	return n, nil
 }

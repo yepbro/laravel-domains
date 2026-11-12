@@ -159,7 +159,7 @@ var _ SlowQuerySource = PGSlowQueries{}
 // unavailable in the message.
 func (s PGSlowQueries) SlowQueries(ctx context.Context, longerThan time.Duration) ([]SlowQuery, error) {
 	if s.Pool == nil {
-		return nil, errors.New("monitor: медленные запросы: пул не задан")
+		return nil, errors.New("monitor: slow queries: the pool is not set")
 	}
 	limit := s.Limit
 	if limit <= 0 {
@@ -167,19 +167,19 @@ func (s PGSlowQueries) SlowQueries(ctx context.Context, longerThan time.Duration
 	}
 	rows, err := s.Pool.Query(ctx, slowQuerySQL, s.ExcludeApp, longerThan.Seconds(), limit)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: медленные запросы: %w", err)
+		return nil, fmt.Errorf("monitor: slow queries: %w", err)
 	}
 	defer rows.Close()
 	var out []SlowQuery
 	for rows.Next() {
 		var q SlowQuery
 		if err := rows.Scan(&q.PID, &q.App, &q.Seconds, &q.StartedAt, &q.Query); err != nil {
-			return nil, fmt.Errorf("monitor: медленные запросы: чтение: %w", err)
+			return nil, fmt.Errorf("monitor: slow queries: scan: %w", err)
 		}
 		out = append(out, q)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("monitor: медленные запросы: %w", err)
+		return nil, fmt.Errorf("monitor: slow queries: %w", err)
 	}
 	return out, nil
 }
@@ -222,7 +222,7 @@ func (o SlowQueryOptions) withDefaults() SlowQueryOptions {
 // (graceful shutdown).
 func SlowQueryLoop(ctx context.Context, src SlowQuerySource, opts SlowQueryOptions) error {
 	if src == nil {
-		return errors.New("monitor: медленные запросы: источник не задан")
+		return errors.New("monitor: slow queries: the source is not set")
 	}
 	if opts.Interval <= 0 {
 		return nil // disabled by configuration (monitor.slow_query_interval)
@@ -233,8 +233,8 @@ func SlowQueryLoop(ctx context.Context, src SlowQuerySource, opts SlowQueryOptio
 		log = slog.New(slog.DiscardHandler)
 	}
 	m := newSlowQueryMetrics(o.Metrics)
-	log.Info("цикл медленных запросов",
-		"interval", o.Interval.String(), "порог", o.MinDuration.String())
+	log.Info("slow queries loop",
+		"interval", o.Interval.String(), "threshold", o.MinDuration.String())
 
 	// seen — currently running (the pid@query_start key): a finished
 	// statement leaves the snapshot and the base at once, the map's
@@ -245,7 +245,7 @@ func SlowQueryLoop(ctx context.Context, src SlowQuerySource, opts SlowQueryOptio
 		queries, err := src.SlowQueries(ctx, o.MinDuration)
 		if err != nil {
 			if ctx.Err() == nil {
-				log.Warn("проход медленных запросов", "err", err)
+				log.Warn("slow queries pass", "err", err)
 			}
 			return
 		}
@@ -265,8 +265,8 @@ func SlowQueryLoop(ctx context.Context, src SlowQuerySource, opts SlowQueryOptio
 			return
 		}
 		report := formatSlowQueryReport(fresh, len(queries), o.MinDuration)
-		log.Warn("медленные запросы",
-			"выполняются", len(queries), "новых", len(fresh),
+		log.Warn("slow queries",
+			"running", len(queries), "new", len(fresh),
 			"report", strings.ReplaceAll(report, "\n", " | "))
 		if o.Notify != nil {
 			o.Notify(report)
@@ -294,18 +294,18 @@ func SlowQueryLoop(ctx context.Context, src SlowQuerySource, opts SlowQueryOptio
 // by duration; fresh is its new elements, the order is preserved.
 func formatSlowQueryReport(fresh []SlowQuery, total int, threshold time.Duration) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "🐌 PostgreSQL: %d %s (порог %sс)",
+	fmt.Fprintf(&b, "🐌 PostgreSQL: %d %s (threshold %ss)",
 		len(fresh), slowQueriesPhrase(len(fresh)), slowDurString(threshold))
 	if total > len(fresh) {
-		fmt.Fprintf(&b, ", всего в работе %d", total)
+		fmt.Fprintf(&b, ", total in flight %d", total)
 	}
 	b.WriteByte('\n')
 	for i, q := range fresh {
 		if i == slowQueryTopLines {
-			fmt.Fprintf(&b, "…и ещё %d\n", len(fresh)-i)
+			fmt.Fprintf(&b, "…and %d more\n", len(fresh)-i)
 			break
 		}
-		fmt.Fprintf(&b, "• %.1fс", q.Seconds)
+		fmt.Fprintf(&b, "• %.1fs", q.Seconds)
 		if q.App != "" {
 			fmt.Fprintf(&b, " [%s]", q.App)
 		}
@@ -320,11 +320,11 @@ func formatSlowQueryReport(fresh []SlowQuery, total int, threshold time.Duration
 func slowQueriesPhrase(n int) string {
 	switch {
 	case n%10 == 1 && n%100 != 11:
-		return "медленный запрос"
+		return "slow query"
 	case n%10 >= 2 && n%10 <= 4 && (n%100 < 10 || n%100 >= 20):
-		return "медленных запроса"
+		return "slow queries"
 	default:
-		return "медленных запросов"
+		return "slow queries"
 	}
 }
 
@@ -345,7 +345,7 @@ func slowDurString(d time.Duration) string {
 // the marker.
 func slowQueryText(q string) string {
 	if strings.TrimSpace(q) == "" {
-		return "(текст недоступен — нет pg_read_all_stats)"
+		return "(text unavailable — no pg_read_all_stats)"
 	}
 	q = strings.Join(strings.Fields(q), " ")
 	if r := []rune(q); len(r) > slowQueryMaxChars {
@@ -375,11 +375,11 @@ func newSlowQueryMetrics(reg *metrics.Registry) *slowQueryMetrics {
 	return &slowQueryMetrics{
 		current: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_pg_slow_queries",
-			Help: "Клиентские запросы PostgreSQL, выполняемые дольше monitor.slow_query_min_duration на момент прохода цикла (pg_stat_activity, T-177); собственные агрегаты monitor исключены.",
+			Help: "PostgreSQL client statements running longer than monitor.slow_query_min_duration at the moment of the loop pass (pg_stat_activity, T-177); monitor's own aggregates are excluded.",
 		}),
 		total: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_pg_slow_queries_total",
-			Help: "Обнаруженные медленные запросы по application_name сервиса (новые операторы дольше порога, дебаунс pid+query_start, T-177).",
+			Help: "Detected slow queries by the service application_name (new statements above the threshold, the pid+query_start debounce, T-177).",
 		}, "app"),
 	}
 }

@@ -81,7 +81,7 @@ func (d RenderDebt) Total() int64 { return d.Flags + d.Lag }
 // String is a one-line summary (the loop log, the alert detail, the
 // load report line — the same text).
 func (d RenderDebt) String() string {
-	return fmt.Sprintf("флаги %d + лаг %d = %d", d.Flags, d.Lag, d.Total())
+	return fmt.Sprintf("flags %d + lag %d = %d", d.Flags, d.Lag, d.Total())
 }
 
 // RenderDebtSource is a render debt source; an interface for
@@ -120,14 +120,14 @@ func (r RenderDebtReader) RenderDebt(ctx context.Context) (RenderDebt, error) {
 // would make the three numbers mutually contradictory).
 func renderDebtOf(ctx context.Context, pool db.DB, redis StreamLener) (RenderDebt, error) {
 	if pool == nil {
-		return RenderDebt{}, errors.New("monitor: рендер-долг: пул БД не задан")
+		return RenderDebt{}, errors.New("monitor: render debt: the DB pool is not set")
 	}
 	if redis == nil {
-		return RenderDebt{}, errors.New("monitor: рендер-долг: источник глубины q:render не задан")
+		return RenderDebt{}, errors.New("monitor: render debt: the q:render depth source is not set")
 	}
 	rows, err := pool.Query(ctx, renderDebtFlagsSQL)
 	if err != nil {
-		return RenderDebt{}, fmt.Errorf("monitor: рендер-долг: счётчик: %w", err)
+		return RenderDebt{}, fmt.Errorf("monitor: render debt: counter: %w", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
@@ -135,20 +135,20 @@ func renderDebtOf(ctx context.Context, pool db.DB, redis StreamLener) (RenderDeb
 		// missing" (T-175 review, P3-2: diagnostics must not send people
 		// to the runbooks on a connection failure).
 		if err := rows.Err(); err != nil {
-			return RenderDebt{}, fmt.Errorf("monitor: рендер-долг: счётчик: %w", err)
+			return RenderDebt{}, fmt.Errorf("monitor: render debt: counter: %w", err)
 		}
-		return RenderDebt{}, errors.New("monitor: рендер-долг: строки 'render_pending' в crawler_counters нет (миграция 000015; ручные операции — runbooks §6)")
+		return RenderDebt{}, errors.New("monitor: render debt: the 'render_pending' row is missing from crawler_counters (migration 000015; manual operations — runbooks §6)")
 	}
 	var d RenderDebt
 	if err := rows.Scan(&d.Flags); err != nil {
-		return RenderDebt{}, fmt.Errorf("monitor: рендер-долг: счётчик: чтение: %w", err)
+		return RenderDebt{}, fmt.Errorf("monitor: render debt: counter: scan: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return RenderDebt{}, fmt.Errorf("monitor: рендер-долг: счётчик: %w", err)
+		return RenderDebt{}, fmt.Errorf("monitor: render debt: counter: %w", err)
 	}
 	lag, err := redis.Len(ctx, queue.StreamRender)
 	if err != nil {
-		return RenderDebt{}, fmt.Errorf("monitor: рендер-долг: глубина q:render: %w", err)
+		return RenderDebt{}, fmt.Errorf("monitor: render debt: the q:render depth: %w", err)
 	}
 	d.Lag = lag
 	return d, nil
@@ -172,7 +172,7 @@ func newRenderDebtMetrics(reg *metrics.Registry) *renderDebtMetrics {
 	return &renderDebtMetrics{
 		flags: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_render_pending_domains",
-			Help: "Рендер-долг (T-175): домены с битом render_pending (счётчик crawler_counters['render_pending'], ведут переходы бита — миграция 000015). Лаг стрима q:render — crawler_queue_depth{queue=\"q:render\"}; долг = сумма. Рост — накопление (алерт render_debt), разбор — docs/runbooks.md.",
+			Help: "Render debt (T-175): domains with the render_pending bit (the crawler_counters['render_pending'] counter, the bit transitions are maintained by migration 000015). The q:render stream lag — crawler_queue_depth{queue=\"q:render\"}; the debt = the sum. Growth — accumulation (the render_debt alert), triage — docs/runbooks.md.",
 		}),
 	}
 }
@@ -219,7 +219,7 @@ func (o RenderDebtOptions) withDefaults() RenderDebtOptions {
 // shutdown, spec 3.4).
 func RenderDebtLoop(ctx context.Context, src RenderDebtSource, opts RenderDebtOptions) error {
 	if src == nil {
-		return errors.New("monitor: рендер-долг: источник не задан")
+		return errors.New("monitor: render debt: the source is not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
@@ -227,18 +227,18 @@ func RenderDebtLoop(ctx context.Context, src RenderDebtSource, opts RenderDebtOp
 		log = slog.New(slog.DiscardHandler)
 	}
 	m := newRenderDebtMetrics(o.Metrics)
-	log.Info("цикл рендер-долга", "interval", o.Interval.String())
+	log.Info("render debt loop", "interval", o.Interval.String())
 
 	pass := func() {
 		d, err := src.RenderDebt(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
-				log.Warn("проход рендер-долга", "err", err)
+				log.Warn("render debt pass", "err", err)
 			}
 			return
 		}
 		m.observe(d)
-		log.Debug("рендер-долг: " + d.String())
+		log.Debug("render debt: " + d.String())
 	}
 
 	pass()

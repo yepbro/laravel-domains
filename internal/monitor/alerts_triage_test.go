@@ -54,7 +54,7 @@ func TestAlertsWithDefaultsBoundaries(t *testing.T) {
 		o.RenderDebtDomains != DefaultRenderDebtDomains || o.PSIWindow != DefaultPSIWindow ||
 		o.Interval != DefaultAlertsInterval || o.ZoneStatsInterval != DefaultZoneStatsInterval ||
 		o.DiskFreeMinBytes != DefaultDiskFreeMinBytes || o.DiskFreeCritBytes != DefaultDiskFreeCritBytes {
-		t.Errorf("нулевые опции не дефолты: %+v", o)
+		t.Errorf("zero options are not the defaults: %+v", o)
 	}
 	// Unit values are working values, not defaults (1ns > 0 — the "≤ 0" boundary
 	// is distinguishable in both directions).
@@ -68,7 +68,7 @@ func TestAlertsWithDefaultsBoundaries(t *testing.T) {
 		o.MemHighMinPasses != 1 || o.RenderDebtDomains != 1 || o.PSIWindow != time.Nanosecond ||
 		o.Interval != time.Nanosecond || o.ZoneStatsInterval != time.Nanosecond ||
 		o.DiskFreeMinBytes != 1 || o.DiskFreeCritBytes != 1 {
-		t.Errorf("единичные значения затёрты дефолтами: %+v", o)
+		t.Errorf("unit values overwritten by the defaults: %+v", o)
 	}
 }
 
@@ -85,19 +85,19 @@ func TestAlertsQueueHotDetailBoundary(t *testing.T) {
 	wmB := queue.StreamWatermark(env.opts.QueueWatermark, env.opts.QueueMaxLen, b)
 	holdB := int64(float64(wmB) * AlertQueueRecoverFactor)
 	if holdB >= wmB {
-		t.Skip("коридор удержания совпадает с watermark — граница неотличима")
+		t.Skip("the hold corridor equals the watermark — the boundary is indistinguishable")
 	}
 	m := env.newQueuesMachine()
 	env.lener.lens = map[string]int64{a: wmA, b: holdB}
 	s := m.transition(env.Alerts, context.Background(), obs(env.lener.lens))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("глубина у watermark: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("the depth at the watermark: %s (%s), want firing", s.Status, s.Detail)
 	}
-	if !strings.Contains(s.Detail, a+"="+strconv.FormatInt(wmA, 10)+" (порог") {
-		t.Errorf("горячий стрим не назван: %s", s.Detail)
+	if !strings.Contains(s.Detail, a+"="+strconv.FormatInt(wmA, 10)+" (threshold") {
+		t.Errorf("the hot stream is not named: %s", s.Detail)
 	}
 	if strings.Contains(s.Detail, b+"=") {
-		t.Errorf("коридорный стрим затопил горячий: %s", s.Detail)
+		t.Errorf("the corridor stream drowned the hot one: %s", s.Detail)
 	}
 
 	// No hot ones, B exactly at the hold threshold — the detail names B
@@ -110,10 +110,10 @@ func TestAlertsQueueHotDetailBoundary(t *testing.T) {
 	env2.lener.lens = map[string]int64{b: holdB}
 	s2 := m2.transition(env2.Alerts, context.Background(), obs(env2.lener.lens))
 	if s2.Status != AlertStatusFiring {
-		t.Fatalf("удержание в коридоре: %s (%s), want firing", s2.Status, s2.Detail)
+		t.Fatalf("a hold in the corridor: %s (%s), want firing", s2.Status, s2.Detail)
 	}
-	if !strings.Contains(s2.Detail, b+"="+strconv.FormatInt(holdB, 10)+" (порог") {
-		t.Errorf("коридорный стрим не назван: %s", s2.Detail)
+	if !strings.Contains(s2.Detail, b+"="+strconv.FormatInt(holdB, 10)+" (threshold") {
+		t.Errorf("the corridor stream is not named: %s", s2.Detail)
 	}
 }
 
@@ -125,13 +125,13 @@ func TestAlertsDiskBytesNABoundary(t *testing.T) {
 	env.space.stat = SpaceStat{Avail: 100 << 30, Total: uint64(total)}
 	mm := env.newDiskBytesMachine(AlertDiskMin, total)
 	s := mm.transition(env.Alerts, context.Background(), obs(env.space.stat))
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "неприменим") {
-		t.Errorf("порог = ёмкости: %s (%s), want not_measured/неприменим", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "inapplicable") {
+		t.Errorf("the threshold = the capacity: %s (%s), want not_measured/inapplicable", s.Status, s.Detail)
 	}
 	mm2 := env.newDiskBytesMachine(AlertDiskMin, total-1)
 	s2 := mm2.transition(env.Alerts, context.Background(), obs(env.space.stat))
 	if s2.Status == AlertStatusNotMeasured {
-		t.Errorf("порог < ёмкости: %s (%s), want измеряется", s2.Status, s2.Detail)
+		t.Errorf("the threshold < the capacity: %s (%s), want measured", s2.Status, s2.Detail)
 	}
 }
 
@@ -142,8 +142,8 @@ func TestAlertsDiskPercentDetail(t *testing.T) {
 	m := env.newDiskMachine()
 	env.space.stat = SpaceStat{Avail: 50 << 30, Total: 200 << 30} // exactly 25%
 	s := m.transition(env.Alerts, context.Background(), obs(env.space.stat))
-	if !strings.Contains(s.Detail, "свободно 25.0%") {
-		t.Errorf("деталь процента = %q, want «свободно 25.0%%»", s.Detail)
+	if !strings.Contains(s.Detail, "free 25.0%") {
+		t.Errorf("the percent detail = %q, want \"free 25.0%%\"", s.Detail)
 	}
 }
 
@@ -158,7 +158,7 @@ func TestAlertsQueueLensObserved(t *testing.T) {
 	env.lener.lens = lens
 	o := env.observeQueues(context.Background())
 	if o.err != nil || o.reason != "" {
-		t.Fatalf("наблюдение: %+v", o)
+		t.Fatalf("the observation: %+v", o)
 	}
 	for _, s := range alertStreams {
 		if o.value[s] != lens[s] {
@@ -174,12 +174,12 @@ func TestAlertsRedisMemoryMaxBytesBoundary(t *testing.T) {
 	env.redisMem.mem = RedisMemory{UsedBytes: 1, MaxBytes: 1, Policy: "noeviction"}
 	o := env.observeRedisMemory(context.Background())
 	if o.err != nil || o.reason != "" {
-		t.Errorf("maxmemory=1: %+v, want измерение", o)
+		t.Errorf("maxmemory=1: %+v, want a measurement", o)
 	}
 	env.redisMem.mem = RedisMemory{UsedBytes: 1, MaxBytes: 0, Policy: "noeviction"}
 	o = env.observeRedisMemory(context.Background())
 	if o.reason == "" {
-		t.Errorf("maxmemory=0: %+v, want неприменимость", o)
+		t.Errorf("maxmemory=0: %+v, want inapplicability", o)
 	}
 }
 
@@ -189,7 +189,7 @@ func TestAlertsRenderFbDepthWatermarkBoundary(t *testing.T) {
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 1 })
 	o := env.observeRenderFallbackDepth(context.Background())
 	if o.err != nil || o.reason != "" {
-		t.Errorf("QueueWatermark=1: %+v, want измерение", o)
+		t.Errorf("QueueWatermark=1: %+v, want a measurement", o)
 	}
 }
 
@@ -199,7 +199,7 @@ func TestAlertsDiskPercentEnabledBoundary(t *testing.T) {
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.DiskFreePercent = 1 })
 	o := env.observeDisk(context.Background())
 	if o.err != nil || o.reason != "" {
-		t.Errorf("DiskFreePercent=1: %+v, want измерение", o)
+		t.Errorf("DiskFreePercent=1: %+v, want a measurement", o)
 	}
 }
 
@@ -209,9 +209,9 @@ func TestDeadStreakNOne(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	m := env.newDeadMachine()
 	got := runSequence(env.Alerts, m, obs(int64(1)), obs(int64(1)), obs(int64(1)))
-	wantSequence(t, "серия единиц", got, []string{AlertStatusOK, AlertStatusOK, AlertStatusFiring})
+	wantSequence(t, "a series of ones", got, []string{AlertStatusOK, AlertStatusOK, AlertStatusFiring})
 	got = runSequence(env.Alerts, m, obs(int64(1)), obs(int64(0)))
-	wantSequence(t, "удержание единицей", got, []string{AlertStatusFiring, AlertStatusOK})
+	wantSequence(t, "a hold by one", got, []string{AlertStatusFiring, AlertStatusOK})
 }
 
 // TestMemHighStreakGrewAndEvict — a High growth builds the series with the
@@ -223,12 +223,12 @@ func TestMemHighStreakGrewAndEvict(t *testing.T) {
 	_ = m.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 100}}))
 	_ = m.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 130}}))
 	s3 := m.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 170}}))
-	if s3.Status != AlertStatusFiring || !strings.Contains(s3.Detail, "+40 за проход") {
-		t.Errorf("серия роста: %s (%s), want firing с «+40 за проход»", s3.Status, s3.Detail)
+	if s3.Status != AlertStatusFiring || !strings.Contains(s3.Detail, "+40 per pass") {
+		t.Errorf("a growth series: %s (%s), want firing with \"+40 per pass\"", s3.Status, s3.Detail)
 	}
 	s4 := m.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 170}}))
 	if s4.Status != AlertStatusOK {
-		t.Errorf("стагнация: %s, want ok", s4.Status)
+		t.Errorf("stagnation: %s, want ok", s4.Status)
 	}
 	// The unit vanished and returned with growth — a fresh base: no series (a
 	// no-cleanup mutant would continue the series and fire falsely).
@@ -238,13 +238,13 @@ func TestMemHighStreakGrewAndEvict(t *testing.T) {
 	_ = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{}))                       // the unit vanished
 	s := m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 160}}))
 	if s.Status != AlertStatusOK {
-		t.Errorf("после исчезновения: %s (%s), want ok (свежая база, серия с нуля)", s.Status, s.Detail)
+		t.Errorf("after vanishing: %s (%s), want ok (a fresh base, the series from zero)", s.Status, s.Detail)
 	}
 	// The series after the return is counted anew: two growths — firing.
 	s = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 200}}))
 	s = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 260}}))
 	if s.Status != AlertStatusFiring {
-		t.Errorf("новая серия после исчезновения не сработала: %s (%s)", s.Status, s.Detail)
+		t.Errorf("the new series after vanishing did not fire: %s (%s)", s.Status, s.Detail)
 	}
 }
 
@@ -256,28 +256,28 @@ func TestRenderDebtTrackBoundaries(t *testing.T) {
 	// A threshold of 10, a clearing < 9 (ceil): a level of 9 holds, 8 clears.
 	tr := &renderDebtTrack{domains: 10, passes: 2}
 	if s := tr.decide("", time.Time{}, d(8)); s.status != AlertStatusOK {
-		t.Errorf("база: %s", s.status)
+		t.Errorf("the base: %s", s.status)
 	}
 	if s := tr.decide("", time.Time{}, d(9)); s.status != AlertStatusOK {
-		t.Errorf("рост до 9: %s, want ok (9 < 10)", s.status)
+		t.Errorf("growth to 9: %s, want ok (9 < 10)", s.status)
 	}
 	if s := tr.decide("", time.Time{}, d(12)); s.status != AlertStatusFiring {
-		t.Errorf("рост выше порога: %s, want firing", s.status)
+		t.Errorf("growth above the threshold: %s, want firing", s.status)
 	}
 	if s := tr.decide("", time.Time{}, d(9)); s.status != AlertStatusFiring {
-		t.Errorf("удержание на 9: %s (%s), want firing", s.status, s.detail)
+		t.Errorf("a hold at 9: %s (%s), want firing", s.status, s.detail)
 	}
 	if s := tr.decide("", time.Time{}, d(8)); s.status != AlertStatusOK {
-		t.Errorf("снятие на 8: %s, want ok", s.status)
+		t.Errorf("clearing at 8: %s, want ok", s.status)
 	}
 	// Stagnation above the threshold without growth — ok.
 	tr2 := &renderDebtTrack{domains: 10, passes: 2}
 	_ = tr2.decide("", time.Time{}, d(5))
 	if s := tr2.decide("", time.Time{}, d(20)); s.status != AlertStatusOK {
-		t.Errorf("первый проход выше порога: %s, want ok (серия 1)", s.status)
+		t.Errorf("the first pass above the threshold: %s, want ok (the streak 1)", s.status)
 	}
 	if s := tr2.decide("", time.Time{}, d(20)); s.status != AlertStatusOK {
-		t.Errorf("стагнация: %s, want ok (нет роста)", s.status)
+		t.Errorf("stagnation: %s, want ok (no growth)", s.status)
 	}
 }
 
@@ -286,23 +286,23 @@ func TestRenderDebtTrackBoundaries(t *testing.T) {
 func TestRenderFbDepthBoundaries(t *testing.T) {
 	tr := &renderFbDepthTrack{wm: 100, passes: 2}
 	if s := tr.decide("", time.Time{}, 100); s.status != AlertStatusOK {
-		t.Errorf("первый у порога: %s, want ok", s.status)
+		t.Errorf("the first at the threshold: %s, want ok", s.status)
 	}
 	s := tr.decide("", time.Time{}, 100)
-	if s.status != AlertStatusFiring || !strings.Contains(s.detail, "стационарно у порога") {
-		t.Errorf("стационарная глубина: %s (%s), want firing «стационарно»", s.status, s.detail)
+	if s.status != AlertStatusFiring || !strings.Contains(s.detail, "stationary at the threshold") {
+		t.Errorf("a stationary depth: %s (%s), want firing \"stationary\"", s.status, s.detail)
 	}
 	if s := tr.decide("", time.Time{}, 90); s.status != AlertStatusFiring {
-		t.Errorf("удержание на 90: %s (%s), want firing", s.status, s.detail)
+		t.Errorf("a hold at 90: %s (%s), want firing", s.status, s.detail)
 	}
 	if s := tr.decide("", time.Time{}, 89); s.status != AlertStatusOK {
-		t.Errorf("снятие на 89: %s, want ok", s.status)
+		t.Errorf("clearing at 89: %s, want ok", s.status)
 	}
 	// 99 is not "at the threshold": hot does not accumulate.
 	tr2 := &renderFbDepthTrack{wm: 100, passes: 2}
 	_ = tr2.decide("", time.Time{}, 99)
 	if s := tr2.decide("", time.Time{}, 99); s.status != AlertStatusOK {
-		t.Errorf("99 два прохода: %s (%s), want ok", s.status, s.detail)
+		t.Errorf("99 for two passes: %s (%s), want ok", s.status, s.detail)
 	}
 }
 
@@ -316,29 +316,29 @@ func TestNewDoneStaleSnapshotBoundaries(t *testing.T) {
 	}
 	tr := &newDoneStaleTrack{minPasses: 2}
 	if s := tr.decide("", time.Time{}, row(5, t0)); !strings.Contains(s.detail, "1/2") {
-		t.Errorf("первый снапшот: %s", s.detail)
+		t.Errorf("the first snapshot: %s", s.detail)
 	}
 	if s := tr.decide("", time.Time{}, row(5, t0)); !strings.Contains(s.detail, "1/2") {
-		t.Errorf("повтор снапшота нарастил серию: %s", s.detail)
+		t.Errorf("a snapshot repeat grew the series: %s", s.detail)
 	}
 	if s := tr.decide("", time.Time{}, row(5, t0.Add(time.Minute))); s.status != AlertStatusFiring {
-		t.Errorf("новый снапшот: %s (%s), want firing", s.status, s.detail)
+		t.Errorf("a new snapshot: %s (%s), want firing", s.status, s.detail)
 	}
 	// An invalid stamp — series growth (the first pass of such a row).
 	tr2 := &newDoneStaleTrack{minPasses: 2}
 	_ = tr2.decide("", time.Time{}, row(5, t0))
 	if s := tr2.decide("", time.Time{}, staleRow{value: 5}); !strings.Contains(s.detail, "2/2") {
-		t.Errorf("невалидная метка не нарастила серию: %s", s.detail)
+		t.Errorf("an invalid stamp did not grow the series: %s", s.detail)
 	}
 	// The fired state is held by a value of one; a zero snapshot clears.
 	tr3 := &newDoneStaleTrack{minPasses: 2}
 	_ = tr3.decide("", time.Time{}, row(5, t0))
 	_ = tr3.decide("", time.Time{}, row(5, t0.Add(time.Minute)))
 	if s := tr3.decide(AlertStatusFiring, time.Time{}, row(1, t0.Add(2*time.Minute))); s.status != AlertStatusFiring {
-		t.Errorf("удержание единицей: %s, want firing", s.status)
+		t.Errorf("a hold by one: %s, want firing", s.status)
 	}
 	if s := tr3.decide(AlertStatusFiring, time.Time{}, row(0, t0.Add(2*time.Minute))); s.status != AlertStatusOK {
-		t.Errorf("нулевой снапшот: %s, want ok", s.status)
+		t.Errorf("a zero snapshot: %s, want ok", s.status)
 	}
 }
 
@@ -348,14 +348,14 @@ func TestPsiWindowBoundary(t *testing.T) {
 	base := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	tr := &psiWindowTrack{percent: 90, window: 30 * time.Minute}
 	s := tr.decide("", base, PSIStat{Avg10: 90, Avg60: 90, Avg300: 90})
-	if s.status != AlertStatusOK || strings.Contains(s.detail, "выше порога") {
-		t.Errorf("ровно на пороге: %s (%s), want ok без накопления", s.status, s.detail)
+	if s.status != AlertStatusOK || strings.Contains(s.detail, "above the threshold") {
+		t.Errorf("exactly at the threshold: %s (%s), want ok without accumulating", s.status, s.detail)
 	}
 	tr2 := &psiWindowTrack{percent: 90, window: 30 * time.Minute}
 	_ = tr2.decide("", base, PSIStat{Avg300: 90.01})
 	s = tr2.decide("", base.Add(31*time.Minute), PSIStat{Avg300: 90.01})
 	if s.status != AlertStatusFiring {
-		t.Errorf("окно закрылось: %s (%s), want firing", s.status, s.detail)
+		t.Errorf("the window closed: %s (%s), want firing", s.status, s.detail)
 	}
 }
 
@@ -364,16 +364,16 @@ func TestPsiWindowBoundary(t *testing.T) {
 func TestDeltaRingSizeOneAndValues(t *testing.T) {
 	w := &deltaRing{size: 1}
 	if got := w.push(100); got != 0 {
-		t.Errorf("база: сумма = %d, want 0", got)
+		t.Errorf("the base: the sum = %d, want 0", got)
 	}
 	if got := w.push(130); got != 30 {
-		t.Errorf("окно 1: сумма = %d, want 30", got)
+		t.Errorf("window 1: the sum = %d, want 30", got)
 	}
 	if got := w.push(10); got != 0 {
-		t.Errorf("рестарт: сумма = %d, want 0", got)
+		t.Errorf("a restart: the sum = %d, want 0", got)
 	}
 	if got := w.push(15); got != 5 {
-		t.Errorf("после рестарта: сумма = %d, want 5", got)
+		t.Errorf("after the restart: the sum = %d, want 5", got)
 	}
 }
 
@@ -387,10 +387,10 @@ func TestQueueFreezeDepthZero(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		s := m.transition(env.Alerts, context.Background(), obs(zero))
 		if s.Status != AlertStatusOK {
-			t.Errorf("глубина 0, проход %d: %s (%s), want ok", i, s.Status, s.Detail)
+			t.Errorf("depth 0, pass %d: %s (%s), want ok", i, s.Status, s.Detail)
 		}
-		if !strings.Contains(s.Detail, "1 из 1") {
-			t.Errorf("деталь окна: %q, want счётчик «1 из 1» (пустая группа — движимая)", s.Detail)
+		if !strings.Contains(s.Detail, "1 of 1") {
+			t.Errorf("the window detail: %q, want the counter \"1 of 1\" (an empty group is moving)", s.Detail)
 		}
 	}
 
@@ -403,14 +403,14 @@ func TestQueueFreezeDepthZero(t *testing.T) {
 	m2 := env2.newQueueFreezeMachine()
 	one := []StreamGroupState{{Stream: "q:dns", Group: "g", Depth: 1, LastDeliveredID: "1-1"}}
 	if s := m2.transition(env2.Alerts, context.Background(), obs(one)); s.Status != AlertStatusOK {
-		t.Fatalf("глубина 1, база: %s", s.Status)
+		t.Fatalf("depth 1, the base: %s", s.Status)
 	}
 	now = now.Add(16 * time.Minute)
 	s := m2.transition(env2.Alerts, context.Background(), obs(one))
 	if s.Status != AlertStatusFiring {
-		t.Errorf("глубина 1 без движения окно: %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("depth 1 without movement over the window: %s (%s), want firing", s.Status, s.Detail)
 	}
-	if !strings.Contains(s.Detail, "глубине 1") {
-		t.Errorf("деталь заморозки: %q, want «глубине 1»", s.Detail)
+	if !strings.Contains(s.Detail, "depth 1") {
+		t.Errorf("the freeze detail: %q, want \"depth 1\"", s.Detail)
 	}
 }

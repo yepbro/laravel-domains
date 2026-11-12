@@ -193,16 +193,16 @@ func (s OSLoad) Load(ctx context.Context) (LoadStat, error) {
 	// only the pressure share; the pass lives.
 	if b, err := os.ReadFile(root + "/pressure/cpu"); err == nil {
 		if st.CPUPSI, err = parsePSI(string(b)); err != nil {
-			return LoadStat{}, fmt.Errorf("monitor: нагрузка: %w", err)
+			return LoadStat{}, fmt.Errorf("monitor: load: %w", err)
 		}
 		st.PSIPresent = true
 	}
 	if b, err := os.ReadFile(root + "/pressure/memory"); err == nil {
 		if st.MemPSISome, err = parsePSIKind(string(b), "some"); err != nil {
-			return LoadStat{}, fmt.Errorf("monitor: нагрузка: память PSI: %w", err)
+			return LoadStat{}, fmt.Errorf("monitor: load: PSI memory: %w", err)
 		}
 		if st.MemPSIFull, err = parsePSIKind(string(b), "full"); err != nil {
-			return LoadStat{}, fmt.Errorf("monitor: нагрузка: память PSI: %w", err)
+			return LoadStat{}, fmt.Errorf("monitor: load: PSI memory: %w", err)
 		}
 		st.PSIPresent = true
 	}
@@ -223,17 +223,17 @@ func (s OSLoad) Load(ctx context.Context) (LoadStat, error) {
 func readLoadAvg(path string) (float64, float64, float64, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("monitor: нагрузка: loadavg: %w", err)
+		return 0, 0, 0, fmt.Errorf("monitor: load: loadavg: %w", err)
 	}
 	fields := strings.Fields(string(b))
 	if len(fields) < 3 {
-		return 0, 0, 0, fmt.Errorf("monitor: нагрузка: loadavg: строка короче трёх чисел: %q", strings.TrimSpace(string(b)))
+		return 0, 0, 0, fmt.Errorf("monitor: load: loadavg: the line is shorter than three numbers: %q", strings.TrimSpace(string(b)))
 	}
 	var v [3]float64
 	for i := range v {
 		n, err := strconv.ParseFloat(fields[i], 64)
 		if err != nil || n < 0 {
-			return 0, 0, 0, fmt.Errorf("monitor: нагрузка: loadavg: %q не число", fields[i])
+			return 0, 0, 0, fmt.Errorf("monitor: load: loadavg: %q is not a number", fields[i])
 		}
 		v[i] = n
 	}
@@ -247,7 +247,7 @@ func readLoadAvg(path string) (float64, float64, float64, error) {
 func readCPUStat(path string) (CPUStat, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return CPUStat{}, fmt.Errorf("monitor: нагрузка: /proc/stat: %w", err)
+		return CPUStat{}, fmt.Errorf("monitor: load: /proc/stat: %w", err)
 	}
 	var st CPUStat
 	for _, line := range strings.Split(string(b), "\n") {
@@ -255,7 +255,7 @@ func readCPUStat(path string) (CPUStat, error) {
 		case strings.HasPrefix(line, "cpu "):
 			fields := strings.Fields(line)
 			if len(fields) < 5 {
-				return CPUStat{}, fmt.Errorf("monitor: нагрузка: строка cpu короче счётчиков: %q", line)
+				return CPUStat{}, fmt.Errorf("monitor: load: the cpu line is shorter than the counters: %q", line)
 			}
 			var c [8]uint64
 			for i, f := range fields[1:] {
@@ -264,7 +264,7 @@ func readCPUStat(path string) (CPUStat, error) {
 				}
 				n, err := strconv.ParseUint(f, 10, 64)
 				if err != nil {
-					return CPUStat{}, fmt.Errorf("monitor: нагрузка: тик CPU %q не число", f)
+					return CPUStat{}, fmt.Errorf("monitor: load: the CPU tick %q is not a number", f)
 				}
 				c[i] = n
 			}
@@ -279,7 +279,7 @@ func readCPUStat(path string) (CPUStat, error) {
 		}
 	}
 	if st.Total == 0 || st.Cores == 0 {
-		return CPUStat{}, errors.New("monitor: нагрузка: /proc/stat без строки cpu/cpuN")
+		return CPUStat{}, errors.New("monitor: load: /proc/stat without a cpu/cpuN line")
 	}
 	return st, nil
 }
@@ -290,7 +290,7 @@ func readCPUStat(path string) (CPUStat, error) {
 func readMemInfo(path string) (total, available, swapTotal, swapFree uint64, err error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("monitor: нагрузка: meminfo: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("monitor: load: meminfo: %w", err)
 	}
 	fields := make(map[string]uint64)
 	for _, line := range strings.Split(string(b), "\n") {
@@ -304,7 +304,7 @@ func readMemInfo(path string) (total, available, swapTotal, swapFree uint64, err
 		}
 		n, perr := strconv.ParseUint(f[0], 10, 64)
 		if perr != nil {
-			return 0, 0, 0, 0, fmt.Errorf("monitor: нагрузка: meminfo: %q не число", f[0])
+			return 0, 0, 0, 0, fmt.Errorf("monitor: load: meminfo: %q is not a number", f[0])
 		}
 		// The unit is always kB, the multiplier 1024; the meminfo values fit
 		// into uint64 without overflow.
@@ -313,7 +313,7 @@ func readMemInfo(path string) (total, available, swapTotal, swapFree uint64, err
 	total, okT := fields["MemTotal"]
 	available, okA := fields["MemAvailable"]
 	if !okT || !okA || total == 0 {
-		return 0, 0, 0, 0, errors.New("monitor: нагрузка: meminfo без MemTotal/MemAvailable")
+		return 0, 0, 0, 0, errors.New("monitor: load: meminfo without MemTotal/MemAvailable")
 	}
 	swapTotal, swapFree = fields["SwapTotal"], fields["SwapFree"]
 	return total, available, swapTotal, swapFree, nil
@@ -326,7 +326,7 @@ func readMemInfo(path string) (total, available, swapTotal, swapFree uint64, err
 func readProcs(root string) (map[string]ProcAgg, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: нагрузка: процессы: %w", err)
+		return nil, fmt.Errorf("monitor: load: processes: %w", err)
 	}
 	page := uint64(os.Getpagesize())
 	procs := make(map[string]ProcAgg, 64)
@@ -435,7 +435,7 @@ var _ QueueSource = RedisQueues{}
 // independent groups read the stream each at its own rate.
 func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
 	if s.RDB == nil {
-		return nil, errors.New("monitor: нагрузка: очереди: клиент Redis не задан")
+		return nil, errors.New("monitor: load: queues: the Redis client is not set")
 	}
 	out := make(map[string]QueueStat, len(reportStreams))
 	for _, stream := range reportStreams {
@@ -447,7 +447,7 @@ func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
 				out[stream] = QueueStat{}
 				continue
 			}
-			return nil, fmt.Errorf("monitor: нагрузка: очереди: %s: %w", stream, err)
+			return nil, fmt.Errorf("monitor: load: queues: %s: %w", stream, err)
 		}
 		groups, err := s.RDB.XInfoGroups(ctx, stream).Result()
 		if err != nil {
@@ -459,7 +459,7 @@ func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
 			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 				groups = nil
 			} else {
-				return nil, fmt.Errorf("monitor: нагрузка: очереди: группы %s: %w", stream, err)
+				return nil, fmt.Errorf("monitor: load: queues: the groups of %s: %w", stream, err)
 			}
 		}
 		st := QueueStat{Len: xlen}
@@ -522,23 +522,23 @@ func NewLoadMetrics(reg *metrics.Registry) *LoadMetrics {
 	return &LoadMetrics{
 		loadavg: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_os_loadavg",
-			Help: "Load average хоста из /proc/loadavg (T-173): kind=1m/5m/15m; сравнивается с числом ядер.",
+			Help: "Host load average from /proc/loadavg (T-173): kind=1m/5m/15m; compare against the number of cores.",
 		}, metrics.LabelKind),
 		cpu: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_os_cpu_percent",
-			Help: "Утилизация CPU хоста, % за окно цикла отчёта нагрузки (дельта /proc/stat; T-173): kind=busy/user/system/iowait. Первый проход после старта — приборы не пишутся (нет дельты).",
+			Help: "Host CPU utilization, % over the load report loop window (the /proc/stat delta; T-173): kind=busy/user/system/iowait. The first pass after the start — the gauges are not written (no delta).",
 		}, metrics.LabelKind),
 		memPSI: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_os_mem_psi_percent",
-			Help: "Давление памяти по PSI, % из /proc/pressure/memory (T-173): kind=some_avg10/some_avg300/full_avg10/full_avg300. Ядро без PSI — приборы не пишутся.",
+			Help: "Memory pressure per PSI, % from /proc/pressure/memory (T-173): kind=some_avg10/some_avg300/full_avg10/full_avg300. A kernel without PSI — the gauges are not written.",
 		}, metrics.LabelKind),
 		mem: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_os_mem_bytes",
-			Help: "Память хоста из /proc/meminfo, байты (T-173): kind=total/available/used (used = total − available).",
+			Help: "Host memory from /proc/meminfo, bytes (T-173): kind=total/available/used (used = total − available).",
 		}, metrics.LabelKind),
 		swap: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_os_swap_bytes",
-			Help: "Своп хоста из /proc/meminfo, байты (T-173): kind=total/used.",
+			Help: "Host swap from /proc/meminfo, bytes (T-173): kind=total/used.",
 		}, metrics.LabelKind),
 	}
 }
@@ -642,7 +642,7 @@ type DiskLine struct {
 // only their section. Returns nil on a ctx cancellation (graceful shutdown).
 func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions) error {
 	if src == nil {
-		return errors.New("monitor: отчёт нагрузки: источник не задан")
+		return errors.New("monitor: load report: the source is not set")
 	}
 	if opts.Interval <= 0 {
 		return nil // disabled by configuration (monitor.load_report_interval)
@@ -652,7 +652,7 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 		log = slog.New(slog.DiscardHandler)
 	}
 	gauges := NewLoadMetrics(opts.Metrics)
-	log.Info("цикл отчётов системной нагрузки",
+	log.Info("system load report loop",
 		"interval", opts.Interval.String(), "queues", opts.Queues != nil, "dirs", len(opts.Dirs))
 
 	var prev loadPassState
@@ -660,7 +660,7 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 		st, err := src.Load(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
-				log.Warn("снимок системы", "err", err)
+				log.Warn("system snapshot", "err", err)
 			}
 			return
 		}
@@ -697,7 +697,7 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 		if opts.Queues != nil {
 			if q, err := opts.Queues.Queues(ctx); err != nil {
 				if ctx.Err() == nil {
-					log.Warn("снимок очередей", "err", err)
+					log.Warn("queues snapshot", "err", err)
 				}
 			} else {
 				queues = q
@@ -720,7 +720,7 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 		if opts.RenderDebt != nil {
 			if d, err := opts.RenderDebt.RenderDebt(ctx); err != nil {
 				if ctx.Err() == nil {
-					log.Warn("снимок рендер-долга", "err", err)
+					log.Warn("render debt snapshot", "err", err)
 				}
 			} else {
 				debt = &d
@@ -734,7 +734,7 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 				space, err := opts.Space.Space(dir)
 				if err != nil {
 					if ctx.Err() == nil {
-						log.Warn("снимок места", "dir", dir, "err", err)
+						log.Warn("space snapshot", "dir", dir, "err", err)
 					}
 					continue
 				}
@@ -745,7 +745,7 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 		gauges.observe(st, busyP, userP, sysP, ioP)
 
 		report := formatLoadReport(st, busyP, ioP, procCPU, queues, rates, prev.started, prev.queues, disks, debt)
-		log.Info("отчёт нагрузки", "report", strings.ReplaceAll(report, "\n", " | "))
+		log.Info("load report", "report", strings.ReplaceAll(report, "\n", " | "))
 		if opts.Notify != nil {
 			opts.Notify(report)
 		}
@@ -781,33 +781,33 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 	queues map[string]QueueStat, rates map[string]float64, prevStarted bool,
 	prevQueues map[string]QueueStat, disks []DiskLine, debt *RenderDebt) string {
 	var b strings.Builder
-	b.WriteString("📊 Нагрузка: CPU ")
+	b.WriteString("📊 Load: CPU ")
 	if busy != nil {
 		fmt.Fprintf(&b, "%d%% (io %d%%)", round(*busy*100), round(*iowait*100))
 	} else {
-		b.WriteString("н/д")
+		b.WriteString("n/a")
 	}
 	if st.PSIPresent {
-		fmt.Fprintf(&b, ", PSI %d%% [5м %d%%]", round(st.CPUPSI.Avg10), round(st.CPUPSI.Avg60))
+		fmt.Fprintf(&b, ", PSI %d%% [5m %d%%]", round(st.CPUPSI.Avg10), round(st.CPUPSI.Avg60))
 	}
-	fmt.Fprintf(&b, "; load %.1f/%.1f/%.1f из %d ядер\n",
+	fmt.Fprintf(&b, "; load %.1f/%.1f/%.1f of %d cores\n",
 		st.Load1, st.Load5, st.Load15, st.CPU.Cores)
 
-	b.WriteString("🧮 Топ CPU: ")
+	b.WriteString("🧮 CPU top: ")
 	if top := topByCPU(procCPU); len(top) == 0 {
-		b.WriteString("н/д")
+		b.WriteString("n/a")
 	} else {
 		for i, it := range top {
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			fmt.Fprintf(&b, "%s %.1fя", it.name, it.value)
+			fmt.Fprintf(&b, "%s %.1fc", it.name, it.value)
 		}
 	}
 
-	b.WriteString("\n🧮 Топ память: ")
+	b.WriteString("\n🧮 Memory top: ")
 	if top := topByRSS(st.Procs); len(top) == 0 {
-		b.WriteString("н/д")
+		b.WriteString("n/a")
 	} else {
 		for i, it := range top {
 			if i > 0 {
@@ -818,12 +818,12 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 			// and chromium have dozens); the per-process peak is looked up with htop.
 			fmt.Fprintf(&b, "%s %s", it.name, fmtMem(uint64(it.value)))
 			if it.count > 1 {
-				fmt.Fprintf(&b, " (%d пр.)", it.count)
+				fmt.Fprintf(&b, " (%d procs)", it.count)
 			}
 		}
 	}
 
-	fmt.Fprintf(&b, "\n💾 RAM: занято %.1f из %.1f ГиБ (доступно %.1f), swap %.0f МиБ",
+	fmt.Fprintf(&b, "\n💾 RAM: used %.1f of %.1f GiB (available %.1f), swap %.0f MiB",
 		gib(st.MemTotal-st.MemAvailable), gib(st.MemTotal), gib(st.MemAvailable),
 		mib(st.SwapTotal-st.SwapFree))
 	if st.PSIPresent {
@@ -832,22 +832,22 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 	}
 
 	if len(disks) == 0 {
-		b.WriteString("\n📀 Диск: н/д")
+		b.WriteString("\n📀 Disk: n/a")
 	} else {
 		for _, d := range disks {
 			pct := 0
 			if d.Total > 0 {
 				pct = round(float64(d.Avail) / float64(d.Total) * 100)
 			}
-			fmt.Fprintf(&b, "\n📀 Диск %s: свободно %.0f из %.0f ГиБ (%d%%)",
+			fmt.Fprintf(&b, "\n📀 Disk %s: free %.0f of %.0f GiB (%d%%)",
 				d.Dir, gib(d.Avail), gib(d.Total), pct)
 		}
 	}
 
 	if queues == nil {
-		b.WriteString("\n📬 Очереди: н/д")
+		b.WriteString("\n📬 Queues: n/a")
 	} else {
-		b.WriteString("\n📬 Очереди: ")
+		b.WriteString("\n📬 Queues: ")
 		first := true
 		for _, stream := range reportStreams {
 			q, ok := queues[stream]
@@ -871,7 +871,7 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 					b.WriteString(" (±0")
 				}
 				if rate := rates[stream]; rate > 0 {
-					fmt.Fprintf(&b, ", %.1f/с", rate)
+					fmt.Fprintf(&b, ", %.1f/s", rate)
 				}
 				b.WriteString(")")
 			}
@@ -883,9 +883,9 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 	// is independent — the queue could be down while the debt is measured); "n/a" — when
 	// the debt source itself is unavailable/not set.
 	if debt == nil {
-		b.WriteString("\n📬 Рендер-долг: н/д")
+		b.WriteString("\n📬 Render debt: n/a")
 	} else {
-		fmt.Fprintf(&b, "\n📬 Рендер-долг: %s", debt.String())
+		fmt.Fprintf(&b, "\n📬 Render debt: %s", debt.String())
 	}
 	return b.String()
 }
@@ -950,9 +950,9 @@ func mib(b uint64) float64 { return float64(b) / (1 << 20) }
 // with frequent "0.0GiB").
 func fmtMem(b uint64) string {
 	if b >= 1<<30 {
-		return fmt.Sprintf("%.1fГиБ", gib(b))
+		return fmt.Sprintf("%.1fGiB", gib(b))
 	}
-	return fmt.Sprintf("%.0fМиБ", mib(b))
+	return fmt.Sprintf("%.0fMiB", mib(b))
 }
 
 // round — rounding to a whole % (a report to the operator, not a metric).

@@ -30,10 +30,10 @@ func writeFix(t *testing.T, root, name, content string) {
 	t.Helper()
 	path := filepath.Join(root, name)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("фикстура %s: каталог: %v", name, err)
+		t.Fatalf("the fixture %s: the directory: %v", name, err)
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("фикстура %s: %v", name, err)
+		t.Fatalf("the fixture %s: %v", name, err)
 	}
 }
 
@@ -105,10 +105,10 @@ func TestOSLoad_Fixtures(t *testing.T) {
 		t.Errorf("loadavg = %v/%v/%v", st.Load1, st.Load5, st.Load15)
 	}
 	if st.CPU.Cores != 4 {
-		t.Errorf("ядер = %d, want 4", st.CPU.Cores)
+		t.Errorf("cores = %d, want 4", st.CPU.Cores)
 	}
 	if want := uint64(28000 + 9600 + 1200 + 200); st.CPU.Total != want {
-		t.Errorf("Total тиков = %d, want %d", st.CPU.Total, want)
+		t.Errorf("the Total ticks = %d, want %d", st.CPU.Total, want)
 	}
 	if !st.PSIPresent || st.CPUPSI.Avg10 != 91.59 {
 		t.Errorf("CPU PSI = %+v present=%v", st.CPUPSI, st.PSIPresent)
@@ -126,16 +126,16 @@ func TestOSLoad_Fixtures(t *testing.T) {
 	// The processes: the aggregates by name — headless-shell merged (2 processes),
 	// the corrupt postgres name with spaces/parentheses parsed whole.
 	if got := st.Procs["monitor"].Ticks; got != 400 {
-		t.Errorf("monitor тики = %d, want 400", got)
+		t.Errorf("monitor ticks = %d, want 400", got)
 	}
 	if got := st.Procs["headless-shell"]; got.Ticks != 2000 || got.Count != 2 {
-		t.Errorf("headless-shell = %+v, want тики 2000, процессов 2", got)
+		t.Errorf("headless-shell = %+v, want ticks 2000, 2 processes", got)
 	}
 	if got := st.Procs["postgres: 1[2] writer"].Ticks; got != 1000 {
-		t.Errorf("postgres тики = %d, want 1000", got)
+		t.Errorf("postgres ticks = %d, want 1000", got)
 	}
 	if _, ok := st.Procs["acpi"]; ok {
-		t.Error("не-PID каталог попал в процессы")
+		t.Error("a non-PID directory got into the processes")
 	}
 }
 
@@ -147,10 +147,10 @@ func TestOSLoad_NoPressureFiles(t *testing.T) {
 	}
 	st, err := OSLoad{Root: root}.Load(context.Background())
 	if err != nil {
-		t.Fatalf("Load без PSI: %v", err)
+		t.Fatalf("Load without PSI: %v", err)
 	}
 	if st.PSIPresent {
-		t.Error("PSIPresent = true без файлов давления")
+		t.Error("PSIPresent = true without the pressure files")
 	}
 }
 
@@ -160,7 +160,7 @@ func TestOSLoad_BrokenMandatory(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := (OSLoad{Root: root}).Load(context.Background()); err == nil {
-		t.Error("Load без meminfo: хочу ошибку прохода")
+		t.Error("Load without meminfo: want a pass error")
 	}
 }
 
@@ -169,7 +169,7 @@ func TestCPUDelta(t *testing.T) {
 	cur := CPUStat{User: 1200, System: 700, Idle: 600, Total: 2500, Cores: 4}
 	busy, user, sys, io, ok := cpuDelta(prev, cur)
 	if !ok {
-		t.Fatal("delta не посчитана на растущих счётчиках")
+		t.Fatal("the delta was not computed on growing counters")
 	}
 	// dTotal=500: user 200/500=0.4, sys 200/500=0.4, idle 100/500=0.2,
 	// iowait 0 → busy 0.8.
@@ -177,10 +177,10 @@ func TestCPUDelta(t *testing.T) {
 		t.Errorf("delta = busy %v user %v sys %v io %v, want 0.8/0.4/0.4/0", busy, user, sys, io)
 	}
 	if _, _, _, _, ok := cpuDelta(CPUStat{}, cur); ok {
-		t.Error("первый проход (prev.Total=0) не «н/д»")
+		t.Error("the first pass (prev.Total=0) is not \"n/a\"")
 	}
 	if _, _, _, _, ok := cpuDelta(cur, cur); ok {
-		t.Error("нулевая дельта не «н/д»")
+		t.Error("a zero delta is not \"n/a\"")
 	}
 }
 
@@ -191,7 +191,7 @@ type fakeLoadSource struct {
 
 func (s *fakeLoadSource) Load(context.Context) (LoadStat, error) {
 	if len(s.states) == 0 {
-		return LoadStat{}, errors.New("источник исчерпан")
+		return LoadStat{}, errors.New("source exhausted")
 	}
 	st := s.states[0]
 	if len(s.states) > 1 {
@@ -221,7 +221,7 @@ func (s fakeLoadSpace) Space(string) (SpaceStat, error) { return s.stat, s.err }
 func TestLoadReportLoop_OnePass(t *testing.T) {
 	st, err := OSLoad{Root: loadFixtures(t)}.Load(context.Background())
 	if err != nil {
-		t.Fatalf("снимок: %v", err)
+		t.Fatalf("the snapshot: %v", err)
 	}
 	src := &fakeLoadSource{states: []LoadStat{st}}
 	// The Len of the fixtures — backlogs (T-188): the line format does not change.
@@ -249,26 +249,26 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("цикл: %v", err)
+			t.Fatalf("the loop: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не вышел по отмене")
+		t.Fatal("the loop did not exit on cancellation")
 	}
 	if len(reports) != 1 {
-		t.Fatalf("отчётов = %d, want 1 (стартовый проход)", len(reports))
+		t.Fatalf("reports = %d, want 1 (the starting pass)", len(reports))
 	}
 	r := reports[0]
 	for _, want := range []string{
-		"📊 Нагрузка: CPU н/д",           // no delta — the base
-		"🧮 Топ CPU: н/д",                // the process rates are also a delta
-		"headless-shell 2.0ГиБ (2 пр.)", // the memory top is full right away
-		"💾 RAM: занято 5.4 из 7.6 ГиБ",  // 7973728−2359296 KiB
-		"swap 198 МиБ",
-		"📀 Диск /var/lib/crawler/content: свободно 44 из 79 ГиБ (56%)",
-		"📬 Очереди: q:dns 121 · q:render 116320", // backlogs without deltas
+		"📊 Load: CPU n/a",           // no delta — the base
+		"🧮 CPU top: n/a",                // the process rates are also a delta
+		"headless-shell 2.0GiB (2 procs)", // the memory top is full right away
+		"💾 RAM: used 5.4 of 7.6 GiB",  // 7973728−2359296 KiB
+		"swap 198 MiB",
+		"📀 Disk /var/lib/crawler/content: free 44 of 79 GiB (56%)",
+		"📬 Queues: q:dns 121 · q:render 116320", // backlogs without deltas
 	} {
 		if !strings.Contains(r, want) {
-			t.Errorf("отчёт не содержит %q:\n%s", want, r)
+			t.Errorf("the report does not contain %q:\n%s", want, r)
 		}
 	}
 }
@@ -323,47 +323,47 @@ func TestLoadReportLoop_ProcRestart(t *testing.T) {
 		case r := <-reports:
 			return r
 		case <-time.After(5 * time.Second):
-			t.Fatalf("проход %s: отчёт не пришёл", step)
+			t.Fatalf("the pass %s: the report did not arrive", step)
 		}
 		return ""
 	}
-	if r := recv("базовый"); !strings.Contains(r, "🧮 Топ CPU: н/д") {
-		t.Errorf("база: топ CPU не «н/д» (дельты нет):\n%s", r)
+	if r := recv("base"); !strings.Contains(r, "🧮 CPU top: n/a") {
+		t.Errorf("the base: the CPU top is not \"n/a\" (no delta):\n%s", r)
 	}
-	r := recv("окно")
+	r := recv("window")
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 
 	// The restarted name skipped, the others correct: headless-shell
 	// 10,000/10,000 = 1.0 (cores); the new cron name — 5,000/10,000 = 0.5
 	// (the full sum: it was not in the base); render-worker 1,000/10,000 = 0.1.
-	if want := "🧮 Топ CPU: headless-shell 1.0я, cron 0.5я, render-worker 0.1я"; !strings.Contains(r, want) {
-		t.Errorf("топ CPU = %q, хочу %q:\n%s", topCPULine(r), want, r)
+	if want := "🧮 CPU top: headless-shell 1.0c, cron 0.5c, render-worker 0.1c"; !strings.Contains(r, want) {
+		t.Errorf("the CPU top = %q, want %q:\n%s", topCPULine(r), want, r)
 	}
 	// The memory top of the name is alive — the restart cures only the CPU delta.
-	if want := "postgres 2.0ГиБ (16 пр.)"; !strings.Contains(r, want) {
-		t.Errorf("postgres исчез из топа памяти (должен остаться):\n%s", r)
+	if want := "postgres 2.0GiB (16 procs)"; !strings.Contains(r, want) {
+		t.Errorf("postgres vanished from the memory top (it must stay):\n%s", r)
 	}
 
 	// No junk values: a name's share is bounded by the cores from above (the tick
 	// sum of all names ≤ the system ticks); everything above is an underflow; the
 	// core × 8 threshold — headroom for counting anomalies; the junk symptom is ~10¹⁴.
-	for _, item := range strings.Split(strings.TrimPrefix(topCPULine(r), "🧮 Топ CPU: "), ", ") {
+	for _, item := range strings.Split(strings.TrimPrefix(topCPULine(r), "🧮 CPU top: "), ", ") {
 		name, v, ok := strings.Cut(item, " ")
 		if !ok {
-			t.Fatalf("строка топа не разбирается: %q", item)
+			t.Fatalf("the top line does not parse: %q", item)
 		}
-		share, err := strconv.ParseFloat(strings.TrimSuffix(v, "я"), 64)
+		share, err := strconv.ParseFloat(strings.TrimSuffix(v, "c"), 64)
 		if err != nil {
-			t.Fatalf("доля топа %q не число: %v", v, err)
+			t.Fatalf("the top share %q is not a number: %v", v, err)
 		}
 		if name == "postgres" {
-			t.Errorf("рестартованное имя в топе: %s %.1fя:\n%s", name, share, r)
+			t.Errorf("a restarted name in the top: %s %.1fc:\n%s", name, share, r)
 		}
 		if share > 4*8 {
-			t.Errorf("мусорная доля топа (андерфлоу): %s %.1fя:\n%s", name, share, r)
+			t.Errorf("a junk top share (an underflow): %s %.1fc:\n%s", name, share, r)
 		}
 	}
 }
@@ -371,7 +371,7 @@ func TestLoadReportLoop_ProcRestart(t *testing.T) {
 // topCPULine — the "CPU top" line of the report (empty — none).
 func topCPULine(report string) string {
 	for _, line := range strings.Split(report, "\n") {
-		if strings.HasPrefix(line, "🧮 Топ CPU: ") {
+		if strings.HasPrefix(line, "🧮 CPU top: ") {
 			return line
 		}
 	}
@@ -381,7 +381,7 @@ func topCPULine(report string) string {
 func TestFormatLoadReport_Deltas(t *testing.T) {
 	st, err := OSLoad{Root: loadFixtures(t)}.Load(context.Background())
 	if err != nil {
-		t.Fatalf("снимок: %v", err)
+		t.Fatalf("the snapshot: %v", err)
 	}
 	busy, io := 0.975, 0.0 // the user/sys shares are not printed by the report — only busy/io
 	procCPU := map[string]float64{
@@ -410,21 +410,21 @@ func TestFormatLoadReport_Deltas(t *testing.T) {
 	r := formatLoadReport(st, &busy, &io, procCPU, queues, rates, true, prevQueues, nil, &debt)
 	for _, want := range []string{
 		"CPU 98% (io 0%)",
-		"PSI 92% [5м 90%]",
-		"load 24.8/22.0/20.7 из 4 ядер",
-		"Топ CPU: postgres 1.9я, headless-shell 1.1я, http-worker 0.5я, analyzer 0.3я",
-		"Топ память: headless-shell 2.0ГиБ (2 пр.)",
+		"PSI 92% [5m 90%]",
+		"load 24.8/22.0/20.7 of 4 cores",
+		"CPU top: postgres 1.9c, headless-shell 1.1c, http-worker 0.5c, analyzer 0.3c",
+		"Memory top: headless-shell 2.0GiB (2 procs)",
 		"PSI mem 8% / full 2%",
-		"q:dns 121 (±0, 3.5/с)",
-		"q:render 115120 (−1200, 2.0/с)",
-		"📬 Рендер-долг: флаги 443000 + лаг 99120 = 542120",
+		"q:dns 121 (±0, 3.5/s)",
+		"q:render 115120 (−1200, 2.0/s)",
+		"📬 Render debt: flags 443000 + lag 99120 = 542120",
 	} {
 		if !strings.Contains(r, want) {
-			t.Errorf("отчёт не содержит %q:\n%s", want, r)
+			t.Errorf("the report does not contain %q:\n%s", want, r)
 		}
 	}
 	if strings.Contains(r, "unbound") {
-		t.Errorf("шум топа CPU (unbound 0.01я) попал в отчёт:\n%s", r)
+		t.Errorf("CPU top noise (unbound 0.01c) got into the report:\n%s", r)
 	}
 }
 
@@ -438,21 +438,21 @@ func TestFormatLoadReport_Degraded(t *testing.T) {
 		Procs: map[string]ProcAgg{"a": {RSS: 1 << 30}},
 	}
 	r := formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, nil, nil)
-	for _, want := range []string{"CPU н/д", "Топ CPU: н/д", "📬 Очереди: н/д", "📀 Диск: н/д", "📬 Рендер-долг: н/д"} {
+	for _, want := range []string{"CPU n/a", "CPU top: n/a", "📬 Queues: n/a", "📀 Disk: n/a", "📬 Render debt: n/a"} {
 		if !strings.Contains(r, want) {
-			t.Errorf("деградированный отчёт не содержит %q:\n%s", want, r)
+			t.Errorf("the degraded report does not contain %q:\n%s", want, r)
 		}
 	}
 	if strings.Contains(r, "PSI") {
-		t.Errorf("PSI попал в отчёт без данных:\n%s", r)
+		t.Errorf("PSI got into the report without data:\n%s", r)
 	}
 
 	// The debt source is independent of the queues (the T-175 review, P3-1): with
 	// unavailable queues the debt line is printed anyway.
 	debt := RenderDebt{Flags: 443000, Lag: 99120}
 	r = formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, nil, &debt)
-	if !strings.Contains(r, "📬 Рендер-долг: флаги 443000 + лаг 99120 = 542120") {
-		t.Errorf("долг не напечатан при н/д очередях:\n%s", r)
+	if !strings.Contains(r, "📬 Render debt: flags 443000 + lag 99120 = 542120") {
+		t.Errorf("the debt was not printed with n/a queues:\n%s", r)
 	}
 }
 
@@ -463,14 +463,14 @@ func TestParseProcStatLine(t *testing.T) {
 		t.Errorf("parseProcStatLine = %q %d", comm, ticks)
 	}
 	if comm, _ := parseProcStatLine([]byte("1 (short) R 1 2 3")); comm != "" {
-		t.Errorf("короткая строка = %q, want пустой вклад", comm)
+		t.Errorf("a short line = %q, want an empty contribution", comm)
 	}
 }
 
 // TestRedisQueues_NoClient — a nil client: a source error.
 func TestRedisQueues_NoClient(t *testing.T) {
 	if _, err := (RedisQueues{}).Queues(context.Background()); err == nil {
-		t.Error("клиент nil: хочу ошибку источника")
+		t.Error("a nil client: want a source error")
 	}
 }
 
@@ -531,11 +531,11 @@ func TestRedisQueues_Backlog(t *testing.T) {
 		queue.StreamDead:           {Len: 1441, Read: 30},
 	}
 	if len(q) != len(want) {
-		t.Fatalf("стримов = %d, хочу %d: %+v", len(q), len(want), q)
+		t.Fatalf("streams = %d, want %d: %+v", len(q), len(want), q)
 	}
 	for s, w := range want {
 		if q[s] != w {
-			t.Errorf("%s = %+v, хочу %+v", s, q[s], w)
+			t.Errorf("%s = %+v, want %+v", s, q[s], w)
 		}
 	}
 
@@ -543,11 +543,11 @@ func TestRedisQueues_Backlog(t *testing.T) {
 	rdb2 := &fakeGroupsRedis{groups: map[string][]redis.XInfoGroup{}, xlen: map[string]int64{}}
 	q2, err := RedisQueues{RDB: rdb2}.Queues(context.Background())
 	if err != nil {
-		t.Fatalf("Queues (пусто): %v", err)
+		t.Fatalf("Queues (empty): %v", err)
 	}
 	for _, s := range reportStreams {
 		if q2[s] != (QueueStat{}) {
-			t.Errorf("%s = %+v, хочу {0 0}", s, q2[s])
+			t.Errorf("%s = %+v, want {0 0}", s, q2[s])
 		}
 	}
 }
@@ -564,7 +564,7 @@ func TestRedisQueues_GroupsError(t *testing.T) {
 	}
 	if _, err := (RedisQueues{RDB: rdb}).Queues(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "q:dns") {
-		t.Errorf("ошибка групп = %v, хочу ошибку с именем q:dns", err)
+		t.Errorf("the groups error = %v, want an error with the q:dns name", err)
 	}
 
 	rdb2 := &fakeGroupsRedis{
@@ -574,9 +574,9 @@ func TestRedisQueues_GroupsError(t *testing.T) {
 	}
 	q, err := RedisQueues{RDB: rdb2}.Queues(context.Background())
 	if err != nil {
-		t.Fatalf("Queues (нет ключа XLEN): %v", err)
+		t.Fatalf("Queues (no XLEN key): %v", err)
 	}
 	if q[queue.StreamDNS] != (QueueStat{}) {
-		t.Errorf("q:dns = %+v, хочу {0 0}", q[queue.StreamDNS])
+		t.Errorf("q:dns = %+v, want {0 0}", q[queue.StreamDNS])
 	}
 }

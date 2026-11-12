@@ -28,7 +28,7 @@ func fakeNotifyScript(t *testing.T, journal string, fail bool) string {
 	oneLine := "line=$(printf '%s' \"$2\" | tr '\\n' '\\t'); printf '%s\\n' \"$line\" >> " + journal + "\n"
 	body := "#!/bin/sh\n" + oneLine
 	if fail {
-		body += "echo 'telegram: ошибка отправки (HTTP 400)' >&2\nexit 1\n"
+		body += "echo 'telegram: send error (HTTP 400)' >&2\nexit 1\n"
 	}
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func waitLines(t *testing.T, journal string, n int) []string {
 			return lines
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("отправок = %d, want ≥ %d (журнал: %q)", len(lines), n, journalLines(t, journal))
+			t.Fatalf("sends = %d, want ≥ %d (the journal: %q)", len(lines), n, journalLines(t, journal))
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -121,32 +121,32 @@ func TestTelegramNotifierTransitions(t *testing.T) {
 
 	pass := func(status string) {
 		n.OnPass(AlertsResult{Alerts: []AlertSnapshot{
-			{Name: AlertDiskMin, Status: status, Detail: "свободно 12.1GiB из 79.0GiB, порог 15.0GiB"},
+			{Name: AlertDiskMin, Status: status, Detail: "free 12.1GiB of 79.0GiB, threshold 15.0GiB"},
 		}})
 	}
 
 	pass(AlertStatusFiring) // the first pass — the base: a pre-start firing is not mailed
 	if lines := journalLines(t, journal); len(lines) != 0 {
-		t.Fatalf("после базы отправок = %d, want 0: %q", len(lines), lines)
+		t.Fatalf("after the base sends = %d, want 0: %q", len(lines), lines)
 	}
 	pass(AlertStatusFiring) // a repeated firing — silence
 	pass(AlertStatusFiring)
 	if lines := journalLines(t, journal); len(lines) != 0 {
-		t.Fatalf("повторные срабатывания дали дубли: %q", lines)
+		t.Fatalf("repeated firings produced duplicates: %q", lines)
 	}
 
 	pass(AlertStatusOK) // clearing — a separate message
 	lines := waitLines(t, journal, 1)
-	if !strings.Contains(lines[0], "✅ Восстановлено") || !strings.Contains(lines[0], AlertDiskMin) ||
+	if !strings.Contains(lines[0], "✅ Recovered") || !strings.Contains(lines[0], AlertDiskMin) ||
 		!strings.Contains(lines[0], "12.1GiB") {
-		t.Errorf("снятие = %q, want «✅ Восстановлено» с именем и деталью", lines[0])
+		t.Errorf("the clearing = %q, want \"✅ Recovered\" with the name and the detail", lines[0])
 	}
 
 	pass(AlertStatusFiring) // a new episode — a new firing
 	lines = waitLines(t, journal, 2)
 	if !strings.Contains(lines[1], "🚨") || !strings.Contains(lines[1], AlertDiskMin) ||
 		!strings.Contains(lines[1], alertDesc(AlertDiskMin)) {
-		t.Errorf("срабатывание = %q, want «🚨» с именем и описанием", lines[1])
+		t.Errorf("the firing = %q, want \"🚨\" with the name and the description", lines[1])
 	}
 
 	// A source failure at a fired alert — without a message ("recovered" would
@@ -155,21 +155,21 @@ func TestTelegramNotifierTransitions(t *testing.T) {
 	pass(AlertStatusNotMeasured)
 	pass(AlertStatusFiring)
 	if lines := journalLines(t, journal); len(lines) != 2 {
-		t.Errorf("пауза источника дала сообщение: %q", lines)
+		t.Errorf("a source pause produced a message: %q", lines)
 	}
 
 	// A recovery of measurements straight to ok — closes the episode with ✅.
 	pass(AlertStatusOK)
 	lines = waitLines(t, journal, 3)
-	if !strings.Contains(lines[2], "✅ Восстановлено") {
-		t.Errorf("восстановление после «не измеряется» = %q, want ✅", lines[2])
+	if !strings.Contains(lines[2], "✅ Recovered") {
+		t.Errorf("a recovery after \"not measured\" = %q, want ✅", lines[2])
 	}
 
 	// A new episode — a new 🚨.
 	pass(AlertStatusFiring)
 	lines = waitLines(t, journal, 4)
 	if !strings.Contains(lines[3], "🚨") {
-		t.Errorf("новый эпизод = %q, want 🚨", lines[3])
+		t.Errorf("a new episode = %q, want 🚨", lines[3])
 	}
 
 	// An unfired alert going to "not measured" and back — silence.
@@ -178,7 +178,7 @@ func TestTelegramNotifierTransitions(t *testing.T) {
 	n2.OnPass(AlertsResult{Alerts: []AlertSnapshot{{Name: AlertPSICPU, Status: AlertStatusNotMeasured}}})
 	n2.OnPass(AlertsResult{Alerts: []AlertSnapshot{{Name: AlertPSICPU, Status: AlertStatusOK}}})
 	if got := len(journalLines(t, journal)); got != 4 {
-		t.Errorf("шум несработавшего алерта: отправок %d, want 4", got)
+		t.Errorf("the noise of an unfired alert: %d sends, want 4", got)
 	}
 }
 
@@ -205,10 +205,10 @@ func TestTelegramNotifierDisabled(t *testing.T) {
 	})
 	send(n)
 	if lines := journalLines(t, journal); len(lines) != 0 {
-		t.Errorf("telegram=false: отправки %q", lines)
+		t.Errorf("telegram=false: sends %q", lines)
 	}
-	if !strings.Contains(buf.String(), "выключена") {
-		t.Errorf("выключение конфигом без записи:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "delivery off") {
+		t.Errorf("a config switch-off without a record:\n%s", buf.String())
 	}
 
 	// No token / no chat / neither.
@@ -217,17 +217,17 @@ func TestTelegramNotifierDisabled(t *testing.T) {
 		token string
 		chat  string
 	}{
-		{"нет токена", "", "чат"},
-		{"нет чата", "токен", ""},
-		{"нет обоих", "", ""},
+		{"no token", "", "chat"},
+		{"no chat", "token", ""},
+		{"neither", "", ""},
 	} {
 		n, buf := notifierEnv(t, script, c.token, c.chat)
 		send(n)
 		if lines := journalLines(t, journal); len(lines) != 0 {
-			t.Errorf("%s: отправки %q", c.name, lines)
+			t.Errorf("%s: sends %q", c.name, lines)
 		}
 		if !strings.Contains(buf.String(), EnvTelegramBotToken) {
-			t.Errorf("%s: причина без имени секрета:\n%s", c.name, buf.String())
+			t.Errorf("%s: the reason without the secret name:\n%s", c.name, buf.String())
 		}
 	}
 
@@ -241,17 +241,17 @@ func TestTelegramNotifierDisabled(t *testing.T) {
 		name string
 		path string
 	}{
-		{"скрипта нет", filepath.Join(dir, "нет")},
-		{"каталог", dir},
-		{"не исполняем", noExec},
+		{"no script", filepath.Join(dir, "missing")},
+		{"a directory", dir},
+		{"not executable", noExec},
 	} {
 		n, buf := notifierEnv(t, c.path, "token", "chat")
 		send(n)
 		if lines := journalLines(t, journal); len(lines) != 0 {
-			t.Errorf("%s: отправки %q", c.name, lines)
+			t.Errorf("%s: sends %q", c.name, lines)
 		}
 		if !strings.Contains(buf.String(), "level=WARN") {
-			t.Errorf("%s: сломанная настройка без Warn:\n%s", c.name, buf.String())
+			t.Errorf("%s: a broken setup without a Warn:\n%s", c.name, buf.String())
 		}
 	}
 }
@@ -272,11 +272,11 @@ func TestTelegramNotifierScriptFailure(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for !strings.Contains(buf.String(), "level=WARN") {
 		if time.Now().After(deadline) {
-			t.Fatalf("сбой отправки без Warn:\n%s", buf.String())
+			t.Fatalf("a send failure without a Warn:\n%s", buf.String())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if !strings.Contains(buf.String(), "HTTP 400") {
-		t.Errorf("Warn без вывода скрипта:\n%s", buf.String())
+		t.Errorf("a Warn without the script output:\n%s", buf.String())
 	}
 }

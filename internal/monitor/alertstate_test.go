@@ -48,11 +48,11 @@ func runSequence[V any](a *Alerts, m *alertMachine[V], list ...observation[V]) [
 func wantSequence(t *testing.T, name string, got, want []string) {
 	t.Helper()
 	if len(got) != len(want) {
-		t.Fatalf("%s: статусов %d (%v), want %d (%v)", name, len(got), got, len(want), want)
+		t.Fatalf("%s: %d statuses (%v), want %d (%v)", name, len(got), got, len(want), want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("%s: шаг %d: статус = %s, want %s (последовательность: %v)",
+			t.Errorf("%s: step %d: status = %s, want %s (the sequence: %v)",
 				name, i, got[i], want[i], got)
 		}
 	}
@@ -75,20 +75,20 @@ func TestAlertMachineTransition(t *testing.T) {
 	// the next live observation continues the count (not "the first").
 	s := m.transition(env.Alerts, ctx, obs(int64(5)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "1/3") {
-		t.Fatalf("первое наблюдение: %s (%s), want ok с серией 1/3", s.Status, s.Detail)
+		t.Fatalf("the first observation: %s (%s), want ok with the streak 1/3", s.Status, s.Detail)
 	}
 	before := env.buf.String()
 	s = m.transition(env.Alerts, ctx, obsErr[int64](errors.New("connection refused")))
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "connection refused") {
-		t.Fatalf("ошибка источника: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+		t.Fatalf("a source error: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if !strings.Contains(env.buf.String()[len(before):], "level=WARN") ||
 		!strings.Contains(env.buf.String()[len(before):], "connection refused") {
-		t.Errorf("ошибка источника без Warn:\n%s", env.buf.String()[len(before):])
+		t.Errorf("a source error without a Warn:\n%s", env.buf.String()[len(before):])
 	}
 	s = m.transition(env.Alerts, ctx, obs(int64(5)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "2/3") {
-		t.Fatalf("после сбоя: %s (%s), want ok с серией 2/3 (память пережила деградацию)", s.Status, s.Detail)
+		t.Fatalf("after the failure: %s (%s), want ok with the streak 2/3 (the memory survived the degradation)", s.Status, s.Detail)
 	}
 
 	// A quiet reason — "not measured" without a Warn; the series, as with
@@ -97,16 +97,16 @@ func TestAlertMachineTransition(t *testing.T) {
 	m2 := env2.newDeadMachine()
 	_ = m2.transition(env2.Alerts, ctx, obs(int64(5))) // series 1/3
 	before = env2.buf.String()
-	s = m2.transition(env2.Alerts, ctx, obsReason[int64]("Redis не задан"))
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "Redis не задан") {
-		t.Fatalf("тихая причина: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+	s = m2.transition(env2.Alerts, ctx, obsReason[int64]("Redis not set"))
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "Redis not set") {
+		t.Fatalf("a quiet reason: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if strings.Contains(env2.buf.String()[len(before):], "level=WARN") {
-		t.Errorf("тихая причина дала Warn:\n%s", env2.buf.String()[len(before):])
+		t.Errorf("a quiet reason produced a Warn:\n%s", env2.buf.String()[len(before):])
 	}
 	s = m2.transition(env2.Alerts, ctx, obs(int64(5)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "2/3") {
-		t.Fatalf("после тихой причины: %s (%s), want ok с серией 2/3 (память пережила)", s.Status, s.Detail)
+		t.Fatalf("after the quiet reason: %s (%s), want ok with the streak 2/3 (the memory survived)", s.Status, s.Detail)
 	}
 
 	// A ctx cancellation during the transition — the Warn is suppressed (part of the shutdown).
@@ -115,9 +115,9 @@ func TestAlertMachineTransition(t *testing.T) {
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
 	before = env3.buf.String()
-	_ = m3.transition(env3.Alerts, cancelled, obsErr[int64](errors.New("бд недоступна")))
+	_ = m3.transition(env3.Alerts, cancelled, obsErr[int64](errors.New("db unavailable")))
 	if strings.Contains(env3.buf.String()[len(before):], "level=WARN") {
-		t.Errorf("отмена ctx дала Warn:\n%s", env3.buf.String()[len(before):])
+		t.Errorf("the ctx cancellation produced a Warn:\n%s", env3.buf.String()[len(before):])
 	}
 
 	// The status is written by the transition: the next pass's prev is the past
@@ -126,7 +126,7 @@ func TestAlertMachineTransition(t *testing.T) {
 	m4 := env4.newDeadMachine()
 	got := runSequence(env4.Alerts, m4,
 		obs(int64(5)), obs(int64(5)), obs(int64(5)), obs(int64(1)), obs(int64(0)))
-	wantSequence(t, "эпизод по prev", got, []string{
+	wantSequence(t, "an episode by prev", got, []string{
 		AlertStatusOK, AlertStatusOK, AlertStatusFiring, AlertStatusFiring, AlertStatusOK,
 	})
 }
@@ -145,22 +145,22 @@ func TestAlertMachineUnitOOM(t *testing.T) {
 	}{
 		{"oom", []UnitEvents{{Unit: "crawler-http-worker.service", OOM: 3}}, AlertStatusFiring},
 		{"oom_kill", []UnitEvents{{Unit: "crawler-render-worker.service", OOMKill: 1}}, AlertStatusFiring},
-		{"рестарты", []UnitEvents{{Unit: "crawler-chromium.service", NRestarts: 2}}, AlertStatusFiring},
-		{"два горячих + здоровый", []UnitEvents{
+		{"restarts", []UnitEvents{{Unit: "crawler-chromium.service", NRestarts: 2}}, AlertStatusFiring},
+		{"two hot + one healthy", []UnitEvents{
 			{Unit: "crawler-http-worker.service", OOMKill: 1},
 			{Unit: "crawler-monitor.service"},
 			{Unit: "crawler-chromium.service", NRestarts: 4},
 		}, AlertStatusFiring},
-		{"все нули", []UnitEvents{
+		{"all zeros", []UnitEvents{
 			{Unit: "crawler-http-worker.service"},
 			{Unit: "crawler-monitor.service"},
 		}, AlertStatusOK},
-		{"сброс состояния юнита", []UnitEvents{{Unit: "crawler-http-worker.service"}}, AlertStatusOK},
+		{"a unit state reset", []UnitEvents{{Unit: "crawler-http-worker.service"}}, AlertStatusOK},
 	}
 	for _, c := range events {
 		s := m.transition(env.Alerts, context.Background(), obs(c.units))
 		if s.Status != c.want {
-			t.Errorf("%s: статус = %s (%s), want %s", c.name, s.Status, s.Detail, c.want)
+			t.Errorf("%s: status = %s (%s), want %s", c.name, s.Status, s.Detail, c.want)
 		}
 	}
 	// The fired detail names every hot unit and its counters,
@@ -169,17 +169,17 @@ func TestAlertMachineUnitOOM(t *testing.T) {
 	m2 := env2.newUnitOOMMachine()
 	s := m2.transition(env2.Alerts, context.Background(), obs(events[3].units))
 	for _, want := range []string{"crawler-http-worker.service", "oom_kill=1",
-		"crawler-chromium.service", "рестартов=4", "эпизод до перезапуска"} {
+		"crawler-chromium.service", "restarts=4", "episode until the unit restart"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail %q не содержит %q", s.Detail, want)
+			t.Errorf("the detail %q does not contain %q", s.Detail, want)
 		}
 	}
 	if strings.Contains(s.Detail, "crawler-monitor.service:") {
-		t.Errorf("detail %q называет здоровый юнит", s.Detail)
+		t.Errorf("the detail %q names a healthy unit", s.Detail)
 	}
 	s = m2.transition(env2.Alerts, context.Background(), obs(events[4].units))
-	if !strings.Contains(s.Detail, "2 юнитов") {
-		t.Errorf("detail ok = %q, want число юнитов", s.Detail)
+	if !strings.Contains(s.Detail, "2 units") {
+		t.Errorf("the ok detail = %q, want the unit count", s.Detail)
 	}
 }
 
@@ -198,7 +198,7 @@ func TestAlertMachineClockUsesDriver(t *testing.T) {
 	_ = mMoved.transition(moved, context.Background(), over) // the window base at t0
 	now = base.Add(31 * time.Minute)
 	if s := mMoved.transition(moved, context.Background(), over); s.Status != AlertStatusFiring {
-		t.Errorf("часы +31м: %s (%s), want firing (окно закрыто по часам драйвера)", s.Status, s.Detail)
+		t.Errorf("the clock +31m: %s (%s), want firing (the window closed by the driver clock)", s.Status, s.Detail)
 	}
 
 	// The clock stands — the window does not tick, the hold does not grow.
@@ -207,6 +207,6 @@ func TestAlertMachineClockUsesDriver(t *testing.T) {
 	mFixed := fixed.newPSIMachine()
 	_ = mFixed.transition(fixed, context.Background(), over)
 	if s := mFixed.transition(fixed, context.Background(), over); s.Status != AlertStatusOK {
-		t.Errorf("часы стоят: %s (%s), want ok (удержание 0 — now из часов драйвера)", s.Status, s.Detail)
+		t.Errorf("the clock stands still: %s (%s), want ok (a hold of 0 — now from the driver clock)", s.Status, s.Detail)
 	}
 }

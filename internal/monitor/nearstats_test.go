@@ -59,11 +59,11 @@ type nearstatsFakePool struct {
 }
 
 func (p *nearstatsFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *nearstatsFakePool) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, fmt.Errorf("nearstatsFakePool: неожидаемый Exec: %s", sql)
+	return pgconn.CommandTag{}, fmt.Errorf("nearstatsFakePool: unexpected Exec: %s", sql)
 }
 
 func (p *nearstatsFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -82,7 +82,7 @@ func (p *nearstatsFakePool) Query(ctx context.Context, sql string, args ...any) 
 		return &nearstatsRows{err: p.rowsErr}, nil
 	}
 	if p.badRow {
-		return &nearstatsRows{rows: [][]any{{"байты"}}, err: p.rowsErr}, nil
+		return &nearstatsRows{rows: [][]any{{"bytes"}}, err: p.rowsErr}, nil
 	}
 	n := int64(0)
 	if len(p.counts) > 0 {
@@ -130,15 +130,15 @@ func (r *nearstatsRows) Next() bool {
 
 func (r *nearstatsRows) Scan(dest ...any) error {
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
-		return errors.New("nearstatsRows: Scan без Next")
+		return errors.New("nearstatsRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("nearstatsRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("nearstatsRows: %d destinations, %d columns", len(dest), len(row))
 	}
 	n, ok := row[0].(int64)
 	if !ok {
-		return fmt.Errorf("nearstatsRows: колонка 0: %T не int64", row[0])
+		return fmt.Errorf("nearstatsRows: column 0: %T is not int64", row[0])
 	}
 	*dest[0].(*int64) = n
 	return nil
@@ -165,7 +165,7 @@ func TestNearStatsOnceSQL(t *testing.T) {
 	}
 	calls := pool.calls()
 	if len(calls) != 1 {
-		t.Fatalf("вызовов = %d, хочу 1", len(calls))
+		t.Fatalf("calls = %d, want 1", len(calls))
 	}
 	if calls[0].sql != wantNearStatsSQL {
 		t.Errorf("SQL:\n%s\nwant:\n%s", calls[0].sql, wantNearStatsSQL)
@@ -186,14 +186,14 @@ func TestNearStatsOnceThreshold(t *testing.T) {
 	for _, m := range []float64{0, -0.1, 1, 1.5} {
 		n, err := NearStatsOnce(context.Background(), pool, m)
 		if err == nil {
-			t.Errorf("NearStatsOnce(%v) = nil error, хочу ошибку порога", m)
+			t.Errorf("NearStatsOnce(%v) = nil error, want a threshold error", m)
 		}
 		if n != 0 {
-			t.Errorf("NearStatsOnce(%v) = %d, want 0 при ошибке", m, n)
+			t.Errorf("NearStatsOnce(%v) = %d, want 0 on error", m, n)
 		}
 	}
 	if pool.stats() != 0 {
-		t.Error("Query не должен вызываться при невалидном пороге")
+		t.Error("Query must not be called with an invalid threshold")
 	}
 }
 
@@ -202,10 +202,10 @@ func TestNearStatsOnceThreshold(t *testing.T) {
 func TestNearStatsOnceNilPool(t *testing.T) {
 	n, err := NearStatsOnce(context.Background(), nil, 0.6)
 	if err == nil {
-		t.Fatal("NearStatsOnce(nil pool) = nil error, хочу ошибку")
+		t.Fatal("NearStatsOnce(nil pool) = nil error, want an error")
 	}
 	if n != 0 {
-		t.Errorf("значение = %d, want 0 при ошибке", n)
+		t.Errorf("the value = %d, want 0 on error", n)
 	}
 }
 
@@ -219,26 +219,26 @@ func TestNearStatsOnceErrors(t *testing.T) {
 		wantErr string
 	}{
 		{
-			"ошибка запроса",
-			&nearstatsFakePool{errs: []error{errors.New("бд недоступна")}},
-			"счётчик серой зоны: бд недоступна",
+			"a query error",
+			&nearstatsFakePool{errs: []error{errors.New("db unavailable")}},
+			"gray zone counter: db unavailable",
 		},
-		{"пустой ответ агрегата", &nearstatsFakePool{empty: true}, "пустой ответ агрегата"},
-		{"нечитаемая строка", &nearstatsFakePool{badRow: true}, "чтение"},
+		{"an empty aggregate response", &nearstatsFakePool{empty: true}, "empty aggregate response"},
+		{"an unreadable row", &nearstatsFakePool{badRow: true}, "scan"},
 		{
-			"ошибка итерации",
-			&nearstatsFakePool{rowsErr: errors.New("соединение сброшено")},
-			"соединение сброшено",
+			"an iteration error",
+			&nearstatsFakePool{rowsErr: errors.New("connection reset")},
+			"connection reset",
 		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			n, err := NearStatsOnce(context.Background(), tt.pool, 0.6)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("ошибка = %v, want содержит %q", err, tt.wantErr)
+				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
 			}
 			if n != 0 {
-				t.Errorf("значение = %d, want 0 при ошибке", n)
+				t.Errorf("the value = %d, want 0 on error", n)
 			}
 		})
 	}
@@ -248,13 +248,13 @@ func TestNearStatsOnceErrors(t *testing.T) {
 // a positive nanosecond interval is not replaced by the default.
 func TestNearStatsOptionsDefaults(t *testing.T) {
 	if got := (NearStatsOptions{}).withDefaults().Interval; got != DefaultNearStatsInterval {
-		t.Errorf("дефолт интервала = %v, want %v", got, DefaultNearStatsInterval)
+		t.Errorf("the interval default = %v, want %v", got, DefaultNearStatsInterval)
 	}
 	if got := (NearStatsOptions{Interval: time.Minute}).withDefaults().Interval; got != time.Minute {
-		t.Errorf("явный интервал = %v, want time.Minute", got)
+		t.Errorf("an explicit interval = %v, want time.Minute", got)
 	}
 	if got := (NearStatsOptions{Interval: time.Nanosecond}).withDefaults().Interval; got != time.Nanosecond {
-		t.Errorf("интервал 1нс = %v, want 1нс (заменяется только ≤ 0)", got)
+		t.Errorf("the interval 1ns = %v, want 1ns (only ≤ 0 is replaced)", got)
 	}
 }
 
@@ -275,7 +275,7 @@ func nearGaugeValue(t *testing.T, reg *metrics.Registry) float64 {
 			}
 		}
 	}
-	t.Fatal("серия crawler_laravel_near_findings не найдена")
+	t.Fatal("the crawler_laravel_near_findings series was not found")
 	return -1
 }
 
@@ -295,7 +295,7 @@ func TestNearStatsLoopImmediatePass(t *testing.T) {
 	for pool.stats() == 0 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("первый проход не выполнен")
+			t.Fatal("the first pass was not performed")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -307,10 +307,10 @@ func TestNearStatsLoopImmediatePass(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("NearStatsLoop: %v, want nil при отмене", err)
+			t.Fatalf("NearStatsLoop: %v, want nil on cancellation", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancellation")
 	}
 }
 
@@ -319,14 +319,14 @@ func TestNearStatsLoopImmediatePass(t *testing.T) {
 func TestNearStatsLoopNoop(t *testing.T) {
 	pool := &nearstatsFakePool{}
 	if err := NearStatsLoop(context.Background(), pool, nil, NearStatsOptions{MinScore: 0.6}); err != nil {
-		t.Fatalf("nil реестр: %v, want nil", err)
+		t.Fatalf("a nil registry: %v, want nil", err)
 	}
 	reg := metrics.New("monitor-test")
 	if err := NearStatsLoop(context.Background(), nil, reg, NearStatsOptions{MinScore: 0.6}); err != nil {
-		t.Fatalf("nil пул: %v, want nil", err)
+		t.Fatalf("a nil pool: %v, want nil", err)
 	}
 	if pool.stats() != 0 {
-		t.Error("проходов быть не должно")
+		t.Error("there must be no passes")
 	}
 }
 
@@ -337,7 +337,7 @@ func TestNearStatsLoopErrorSurvives(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-	pool := &nearstatsFakePool{errs: []error{errors.New("бд недоступна")}}
+	pool := &nearstatsFakePool{errs: []error{errors.New("db unavailable")}}
 	reg := metrics.New("monitor-test")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -352,22 +352,22 @@ func TestNearStatsLoopErrorSurvives(t *testing.T) {
 	for pool.stats() < 2 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("цикл не дошёл до второго прохода: %d", pool.stats())
+			t.Fatalf("the loop did not reach the second pass: %d", pool.stats())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("NearStatsLoop: %v, want nil (ошибка прохода — не смерть цикла)", err)
+		t.Fatalf("NearStatsLoop: %v, want nil (a pass error is not the loop's death)", err)
 	}
 	log := buf.String()
-	if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "бд недоступна") {
-		t.Errorf("ошибка прохода при живом ctx без Warn:\n%s", log)
+	if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "db unavailable") {
+		t.Errorf("a pass error with a live ctx without a Warn:\n%s", log)
 	}
 	if got := nearGaugeValue(t, reg); got != 0 {
 		// The value queue is empty (counts not set) — a successful pass
 		// returned 0; what matters more is that the gauge exists and the loop is alive.
-		t.Logf("gauge = %v после восстановления", got)
+		t.Logf("the gauge = %v after the recovery", got)
 	}
 }
 
@@ -388,12 +388,12 @@ func TestNearStatsLoopPassDuringCancel(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("NearStatsLoop: %v, want nil при отмене", err)
+			t.Fatalf("NearStatsLoop: %v, want nil on cancellation", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancellation")
 	}
 	if got := nearGaugeValue(t, reg); got != 42 {
-		t.Errorf("gauge = %v, want 42: успешный проход под отменой — штатный итог", got)
+		t.Errorf("the gauge = %v, want 42: a successful pass under cancellation is the normal outcome", got)
 	}
 }

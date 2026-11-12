@@ -75,7 +75,7 @@ func TestRedisStreamGroups(t *testing.T) {
 		t.Fatalf("StreamGroups: %v", err)
 	}
 	if len(groups) != 2 {
-		t.Fatalf("групп = %d, want 2 (q:dns/q:http без ключа — пустой вклад): %+v", len(groups), groups)
+		t.Fatalf("groups = %d, want 2 (q:dns/q:http without a key — an empty contribution): %+v", len(groups), groups)
 	}
 	byKey := make(map[string]StreamGroupState, len(groups))
 	for _, g := range groups {
@@ -83,11 +83,11 @@ func TestRedisStreamGroups(t *testing.T) {
 	}
 	rend := byKey["q:render/render-worker"]
 	if rend.Depth != 52 || rend.LastDeliveredID != "1761280800000-0" {
-		t.Errorf("q:render/render-worker = %+v, want depth=52 (кламп 98→50 + 2) и ID как есть", rend)
+		t.Errorf("q:render/render-worker = %+v, want depth=52 (the clamp 98→50 + 2) and the ID as is", rend)
 	}
 	ana := byKey["q:analyze/analyzer"]
 	if ana.Depth != 5 || ana.LastDeliveredID != "0-0" {
-		t.Errorf("q:analyze/analyzer = %+v, want depth=5 (lag −1: только pending) и ID 0-0", ana)
+		t.Errorf("q:analyze/analyzer = %+v, want depth=5 (lag −1: pending only) and the ID 0-0", ana)
 	}
 
 	// A stream with a key but without groups (the consumers were never
@@ -98,7 +98,7 @@ func TestRedisStreamGroups(t *testing.T) {
 		xlen:   map[string]int64{queue.StreamDNS: 10},
 	}
 	if groups, err := (RedisStreamGroups{RDB: rdb2}).StreamGroups(context.Background()); err != nil || len(groups) != 0 {
-		t.Errorf("стрим без групп = (%v, %v), want пусто без ошибки", groups, err)
+		t.Errorf("a stream without groups = (%v, %v), want empty without an error", groups, err)
 	}
 }
 
@@ -108,11 +108,11 @@ func TestRedisStreamGroupsErrors(t *testing.T) {
 	rdb := &fakeGroupsRedis{
 		groups:    map[string][]redis.XInfoGroup{},
 		groupErrs: map[string]error{queue.StreamHTTP: errors.New("connection refused")},
-		lensErrs:  map[string]error{queue.StreamDNS: errors.New("контекст истёк")},
+		lensErrs:  map[string]error{queue.StreamDNS: errors.New("context expired")},
 	}
 	_, err := (RedisStreamGroups{RDB: rdb}).StreamGroups(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "q:http") {
-		t.Errorf("ошибка XINFO = %v, want с именем q:http", err)
+		t.Errorf("an XINFO error = %v, want it with the q:http name", err)
 	}
 
 	rdb2 := &fakeGroupsRedis{
@@ -121,14 +121,14 @@ func TestRedisStreamGroupsErrors(t *testing.T) {
 			queue.StreamDNS: {{Name: "dns-worker", Lag: 1, Pending: 0}},
 		},
 		xlen:     map[string]int64{},
-		lensErrs: map[string]error{queue.StreamDNS: errors.New("контекст истёк")},
+		lensErrs: map[string]error{queue.StreamDNS: errors.New("context expired")},
 	}
 	_, err = (RedisStreamGroups{RDB: rdb2}).StreamGroups(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "q:dns") || !strings.Contains(err.Error(), "XLEN") {
-		t.Errorf("ошибка XLEN = %v, want с именем q:dns и XLEN", err)
+		t.Errorf("an XLEN error = %v, want it with the q:dns name and XLEN", err)
 	}
 
 	if _, err := (RedisStreamGroups{}).StreamGroups(context.Background()); err == nil {
-		t.Error("nil-клиент: ошибки нет")
+		t.Error("a nil client: no error")
 	}
 }

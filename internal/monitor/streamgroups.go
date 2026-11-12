@@ -88,7 +88,7 @@ var _ StreamGroupsSource = RedisStreamGroups{}
 // a frozen group (resetting the tracking in the queue_frozen FSM).
 func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState, error) {
 	if s.RDB == nil {
-		return nil, fmt.Errorf("monitor: группы стримов: клиент Redis не задан")
+		return nil, fmt.Errorf("monitor: stream groups: the Redis client is not set")
 	}
 	var out []StreamGroupState
 	for _, stream := range alertStreams {
@@ -100,7 +100,7 @@ func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState
 			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 				continue
 			}
-			return nil, fmt.Errorf("monitor: группы %s: %w", stream, err)
+			return nil, fmt.Errorf("monitor: the groups of %s: %w", stream, err)
 		}
 		if len(groups) == 0 {
 			continue
@@ -109,7 +109,7 @@ func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState
 		// (the T-168 clamp): undelivered entries live in the stream.
 		xlen, err := s.RDB.XLen(ctx, stream).Result()
 		if err != nil {
-			return nil, fmt.Errorf("monitor: группы %s (XLEN): %w", stream, err)
+			return nil, fmt.Errorf("monitor: the groups of %s (XLEN): %w", stream, err)
 		}
 		for _, g := range groups {
 			out = append(out, StreamGroupState{

@@ -53,10 +53,10 @@ func TestReadCPUStat_AllFieldsNonZero(t *testing.T) {
 	}
 	if st.User != 11 || st.Nice != 22 || st.System != 33 || st.Idle != 44 ||
 		st.Iowait != 55 || st.Irq != 66 || st.Softirq != 77 || st.Steal != 88 {
-		t.Errorf("поля cpu = %+v, want 11/22/33/44/55/66/77/88", st)
+		t.Errorf("the cpu fields = %+v, want 11/22/33/44/55/66/77/88", st)
 	}
 	if want := uint64(11 + 22 + 33 + 44 + 55 + 66 + 77 + 88); st.Total != want {
-		t.Errorf("Total = %d, want %d (сумма всех полей)", st.Total, want)
+		t.Errorf("Total = %d, want %d (the sum of all the fields)", st.Total, want)
 	}
 	if st.Cores != 2 {
 		t.Errorf("Cores = %d, want 2", st.Cores)
@@ -69,12 +69,12 @@ func TestReadCPUStat_MissingAggLine(t *testing.T) {
 	root := fullCPUFixtures(t)
 	writeFix(t, root, "stat", "cpu0 11 22 33 44 55 66 77 88\n")
 	if _, err := readCPUStat(root + "/stat"); err == nil {
-		t.Error("нет строки cpu: хочу ошибку (Total 0)")
+		t.Error("no cpu line: want an error (Total 0)")
 	}
 	// An aggregated line without cpuN lines — also an error (Cores 0).
 	writeFix(t, root, "stat", "cpu  11 22 33 44 55 66 77 88\n")
 	if _, err := readCPUStat(root + "/stat"); err == nil {
-		t.Error("нет строк cpuN: хочу ошибку (Cores 0)")
+		t.Error("no cpuN lines: want an error (Cores 0)")
 	}
 }
 
@@ -83,21 +83,21 @@ func TestReadCPUStat_BrokenLines(t *testing.T) {
 	root := fullCPUFixtures(t)
 	writeFix(t, root, "stat", "cpu  11 22 33\n"+"cpu0 1 1 1 1 1 1 1 1\n")
 	if _, err := readCPUStat(root + "/stat"); err == nil {
-		t.Error("строка cpu короче пяти полей: хочу ошибку")
+		t.Error("the cpu line is shorter than five fields: want an error")
 	}
 	writeFix(t, root, "stat", "cpu  11 22 x 44 55 66 77 88\n"+"cpu0 1 1 1 1 1 1 1 1\n")
 	if _, err := readCPUStat(root + "/stat"); err == nil {
-		t.Error("нечисловой тик: хочу ошибку")
+		t.Error("a non-numeric tick: want an error")
 	}
 	// A tick of 2^63 is legal for uint64 (a bitSize 63 mutant must accept it).
 	writeFix(t, root, "stat", "cpu  9223372036854775808 22 33 44 55 66 77 88\n"+"cpu0 1 1 1 1 1 1 1 1\n")
 	if _, err := readCPUStat(root + "/stat"); err != nil {
-		t.Errorf("тик 2^63: %v (uint64 принимает)", err)
+		t.Errorf("a tick of 2^63: %v (uint64 accepts it)", err)
 	}
 	// An unavailable file — an error with a zero structure (the zeros pin).
-	st, err := readCPUStat(root + "/нет")
+	st, err := readCPUStat(root + "/missing")
 	if err == nil || st != (CPUStat{}) {
-		t.Errorf("нет файла: (%+v, %v), want нули и ошибка", st, err)
+		t.Errorf("no file: (%+v, %v), want zeros and an error", st, err)
 	}
 }
 
@@ -109,26 +109,26 @@ func TestReadLoadAvg_Boundaries(t *testing.T) {
 	file := dir + "/loadavg"
 	writeFix(t, dir, "loadavg", "0 0.5 1\n")
 	if l1, l5, l15, err := readLoadAvg(file); err != nil || l1 != 0 || l5 != 0.5 || l15 != 1 {
-		t.Errorf("ровно три поля/нули: (%v/%v/%v, %v)", l1, l5, l15, err)
+		t.Errorf("exactly three fields/zeros: (%v/%v/%v, %v)", l1, l5, l15, err)
 	}
 	writeFix(t, dir, "loadavg", "1 2\n")
 	if l1, l5, l15, err := readLoadAvg(file); err == nil || l1 != 0 || l5 != 0 || l15 != 0 {
-		t.Errorf("два поля: (%v/%v/%v, %v), want ошибка и нули", l1, l5, l15, err)
+		t.Errorf("two fields: (%v/%v/%v, %v), want an error and zeros", l1, l5, l15, err)
 	}
 	writeFix(t, dir, "loadavg", "1 2 3 4\n")
 	if _, _, _, err := readLoadAvg(file); err != nil {
-		t.Errorf("четыре поля: %v (лишние не мешают)", err)
+		t.Errorf("four fields: %v (extras do not interfere)", err)
 	}
 	writeFix(t, dir, "loadavg", "-1 2 3\n")
 	if l1, _, _, err := readLoadAvg(file); err == nil || l1 != 0 {
-		t.Errorf("отрицательная загрузка: (%v, %v), want ошибка и нули", l1, err)
+		t.Errorf("a negative load: (%v, %v), want an error and zeros", l1, err)
 	}
 	writeFix(t, dir, "loadavg", "x 2 3\n")
 	if l1, l5, l15, err := readLoadAvg(file); err == nil || l1 != 0 || l5 != 0 || l15 != 0 {
-		t.Errorf("нечисловая загрузка: (%v/%v/%v, %v), want ошибка и нули", l1, l5, l15, err)
+		t.Errorf("a non-numeric load: (%v/%v/%v, %v), want an error and zeros", l1, l5, l15, err)
 	}
-	if _, _, _, err := readLoadAvg(dir + "/нет"); err == nil {
-		t.Error("нет файла: хочу ошибку")
+	if _, _, _, err := readLoadAvg(dir + "/missing"); err == nil {
+		t.Error("no file: want an error")
 	}
 }
 
@@ -139,17 +139,17 @@ func TestReadMemInfo_Boundaries(t *testing.T) {
 	writeFix(t, dir, "meminfo", "MemTotal: 100 kB\nMemAvailable: x kB\n")
 	if tt, a, st, sf, err := readMemInfo(dir + "/meminfo"); err == nil ||
 		tt != 0 || a != 0 || st != 0 || sf != 0 {
-		t.Errorf("нечисловое значение: (%v/%v/%v/%v, %v), want ошибка и нули", tt, a, st, sf, err)
+		t.Errorf("a non-numeric value: (%v/%v/%v/%v, %v), want an error and zeros", tt, a, st, sf, err)
 	}
 	writeFix(t, dir, "meminfo", "MemTotal: 100 kB\nMemAvailable:\n")
 	if _, _, _, _, err := readMemInfo(dir + "/meminfo"); err == nil {
-		t.Error("пустое значение: хочу ошибку (поле без числа)")
+		t.Error("an empty value: want an error (a field without a number)")
 	}
 	// kB → bytes exactly; without swap — zeros.
 	writeFix(t, dir, "meminfo", "MemTotal: 1 kB\nMemAvailable: 1 kB\n")
 	if tt, a, st, sf, err := readMemInfo(dir + "/meminfo"); err != nil ||
 		tt != 1024 || a != 1024 || st != 0 || sf != 0 {
-		t.Errorf("без свопа: (%v/%v/%v/%v, %v), want 1024/1024/0/0", tt, a, st, sf, err)
+		t.Errorf("without swap: (%v/%v/%v/%v, %v), want 1024/1024/0/0", tt, a, st, sf, err)
 	}
 }
 
@@ -163,10 +163,10 @@ func TestOSLoad_PSIDegradations(t *testing.T) {
 	}
 	st, err := OSLoad{Root: root}.Load(context.Background())
 	if err != nil {
-		t.Fatalf("только pressure/cpu: %v", err)
+		t.Fatalf("only pressure/cpu: %v", err)
 	}
 	if !st.PSIPresent || st.CPUPSI.Avg10 != 91.59 {
-		t.Errorf("PSI cpu = present=%v %+v, want present и 91.59", st.PSIPresent, st.CPUPSI)
+		t.Errorf("PSI cpu = present=%v %+v, want present and 91.59", st.PSIPresent, st.CPUPSI)
 	}
 	// Only memory: the cpu file removed.
 	root2 := fullCPUFixtures(t)
@@ -175,21 +175,21 @@ func TestOSLoad_PSIDegradations(t *testing.T) {
 	}
 	st, err = OSLoad{Root: root2}.Load(context.Background())
 	if err != nil {
-		t.Fatalf("только pressure/memory: %v", err)
+		t.Fatalf("only pressure/memory: %v", err)
 	}
 	if !st.PSIPresent || st.MemPSISome.Avg10 != 7.85 {
-		t.Errorf("PSI mem = present=%v some=%+v, want present и 7.85", st.PSIPresent, st.MemPSISome)
+		t.Errorf("PSI mem = present=%v some=%+v, want present and 7.85", st.PSIPresent, st.MemPSISome)
 	}
 	// A corrupt cpu file — a pass error (the values do not stay silent).
 	root3 := fullCPUFixtures(t)
 	writeFix(t, root3, "pressure/cpu", "some avg10=999 avg60=1 avg300=1 total=1\n")
 	if _, err := (OSLoad{Root: root3}).Load(context.Background()); err == nil {
-		t.Error("кривой pressure/cpu: хочу ошибку")
+		t.Error("a broken pressure/cpu: want an error")
 	}
 	root4 := fullCPUFixtures(t)
 	writeFix(t, root4, "pressure/memory", "some avg10=x\n")
 	if _, err := (OSLoad{Root: root4}).Load(context.Background()); err == nil {
-		t.Error("кривой pressure/memory: хочу ошибку")
+		t.Error("a broken pressure/memory: want an error")
 	}
 }
 
@@ -208,7 +208,7 @@ func TestOSLoad_MissingSources(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := (OSLoad{Root: root}).Load(context.Background()); err == nil {
-			t.Errorf("нет %s: хочу ошибку прохода", miss)
+			t.Errorf("no %s: want a pass error", miss)
 		}
 	}
 }
@@ -237,17 +237,17 @@ func TestReadProcs_ContinueBoundaries(t *testing.T) {
 		t.Fatalf("readProcs: %v", err)
 	}
 	if got := procs["alpha"]; got.Ticks != 10 || got.Count != 1 {
-		t.Errorf("alpha = %+v, want тики 10 (7+3)", got)
+		t.Errorf("alpha = %+v, want ticks 10 (7+3)", got)
 	}
 	if got := procs["beta"]; got.Ticks != 14 || got.Count != 1 {
-		t.Errorf("beta = %+v, want тики 14 (5+9) — PID с ведущим нулём читается", got)
+		t.Errorf("beta = %+v, want ticks 14 (5+9) — a PID with a leading zero is read", got)
 	}
 	if got := procs["nine"]; got.Ticks != 4 {
-		t.Errorf("nine = %+v, want тики 4 (PID-каталог на границе '9')", got)
+		t.Errorf("nine = %+v, want ticks 4 (a PID directory at the '9' boundary)", got)
 	}
 	for _, ghost := range []string{"broken", "zcfg", "ghost", "spook"} {
 		if _, ok := procs[ghost]; ok {
-			t.Errorf("не-PID/кривой вклад %q попал в агрегат", ghost)
+			t.Errorf("a non-PID/broken contribution %q got into the aggregate", ghost)
 		}
 	}
 }
@@ -266,19 +266,19 @@ func TestParseProcStatLine_Boundaries(t *testing.T) {
 	// Exactly 13 fields: state + 12 (utime — the 12th, stime — the 13th) — valid.
 	line := "7 (ok) R 1 2 3 4 5 6 7 8 9 10 3 4"
 	if comm, ticks := parseProcStatLine([]byte(line)); comm != "ok" || ticks != 7 {
-		t.Errorf("13 полей = %q %d, want ok и 7 (3+4)", comm, ticks)
+		t.Errorf("13 fields = %q %d, want ok and 7 (3+4)", comm, ticks)
 	}
 	// 12 fields — short.
 	if comm, ticks := parseProcStatLine([]byte("7 (short) R 1 2 3 4 5 6 7 8 9 10 3")); comm != "" || ticks != 0 {
-		t.Errorf("12 полей = %q %d, want пустой вклад", comm, ticks)
+		t.Errorf("12 fields = %q %d, want an empty contribution", comm, ticks)
 	}
 	// Counter-oriented parentheses (")(") — an empty contribution.
 	if comm, _ := parseProcStatLine([]byte("1 )( R 1 2 3 4 5 6 7 8 9 10 3 4")); comm != "" {
-		t.Errorf("встречные скобки = %q, want пустой вклад", comm)
+		t.Errorf("opposing parentheses = %q, want an empty contribution", comm)
 	}
 	// An empty name "()" — an empty contribution (and zero ticks).
 	if comm, ticks := parseProcStatLine([]byte("1 () R 1 2 3 4 5 6 7 8 9 10 3 4")); comm != "" || ticks != 0 {
-		t.Errorf("пустое имя = (%q, %d), want пустой вклад с нулём", comm, ticks)
+		t.Errorf("an empty name = (%q, %d), want an empty contribution with zero", comm, ticks)
 	}
 	// A short/corrupt line — zero ticks (the value pin on failure).
 	for _, bad := range []string{
@@ -287,17 +287,17 @@ func TestParseProcStatLine_Boundaries(t *testing.T) {
 		"1 (x) R 1 2 3 4 5 6 7 8 9 10 p q",
 	} {
 		if _, ticks := parseProcStatLine([]byte(bad)); ticks != 0 {
-			t.Errorf("%q: тики = %d, want 0", bad, ticks)
+			t.Errorf("%q: ticks = %d, want 0", bad, ticks)
 		}
 	}
 	// utime of 2^63 — valid for uint64 (a bitSize 63 mutant must accept it).
 	if comm, ticks := parseProcStatLine([]byte(
 		"9 (huge) R 1 2 3 4 5 6 7 8 9 10 9223372036854775808 5")); comm != "huge" || ticks != 9223372036854775813 {
-		t.Errorf("utime 2^63 = (%q, %d), want huge и 2^63+5", comm, ticks)
+		t.Errorf("utime 2^63 = (%q, %d), want huge and 2^63+5", comm, ticks)
 	}
 	// Non-numeric utime/stime — an empty contribution.
 	if comm, _ := parseProcStatLine([]byte("1 (x) R 1 2 3 4 5 6 7 8 9 10 p q")); comm != "" {
-		t.Errorf("нечисловые тики = %q, want пустой вклад", comm)
+		t.Errorf("non-numeric ticks = %q, want an empty contribution", comm)
 	}
 }
 
@@ -305,16 +305,16 @@ func TestParseProcStatLine_Boundaries(t *testing.T) {
 // one field — zero; a value of 2^63 is read.
 func TestParseStatmRSS_Boundaries(t *testing.T) {
 	if got := parseStatmRSS([]byte("100 900 1 1 1 1 1\n")); got != 900 {
-		t.Errorf("resident = %d, want 900 (второе поле)", got)
+		t.Errorf("resident = %d, want 900 (the second field)", got)
 	}
 	if got := parseStatmRSS([]byte("100\n")); got != 0 {
-		t.Errorf("одно поле = %d, want 0", got)
+		t.Errorf("one field = %d, want 0", got)
 	}
 	if got := parseStatmRSS([]byte("x y\n")); got != 0 {
-		t.Errorf("нечисловое = %d, want 0", got)
+		t.Errorf("non-numeric = %d, want 0", got)
 	}
 	if got := parseStatmRSS([]byte("5 9223372036854775808\n")); got != 9223372036854775808 {
-		t.Errorf("2^63 = %d, want как есть (uint64)", got)
+		t.Errorf("2^63 = %d, want as is (uint64)", got)
 	}
 }
 
@@ -325,7 +325,7 @@ func TestCPUDelta_IowaitAndClamp(t *testing.T) {
 	cur := CPUStat{User: 1200, System: 700, Idle: 600, Iowait: 300, Total: 2800, Cores: 4}
 	busy, user, sys, io, ok := cpuDelta(prev, cur)
 	if !ok {
-		t.Fatal("дельта не посчитана")
+		t.Fatal("the delta was not computed")
 	}
 	// dTotal=700: user 200/700, sys 200/700, io 200/700, idle 100/700 →
 	// busy = 1 − 100/700 − 200/700 = 400/700 (a comparison with a tolerance —
@@ -338,22 +338,22 @@ func TestCPUDelta_IowaitAndClamp(t *testing.T) {
 	// prev.Total = 1, d = 1 — a delta is possible (the zero boundaries).
 	_, _, _, _, ok = cpuDelta(CPUStat{Total: 1}, CPUStat{Total: 2})
 	if !ok {
-		t.Error("prev.Total=1, d=1: хочу ok (нулевые границы — только точные нули)")
+		t.Error("prev.Total=1, d=1: want ok (the zero boundaries — exact zeros only)")
 	}
 	// A negative busy (the idle delta above the total) — clamped to zero.
 	busy, _, _, _, ok = cpuDelta(CPUStat{Total: 100}, CPUStat{Total: 200, Idle: 300})
 	if !ok {
-		t.Fatal("кламп: дельта посчитана")
+		t.Fatal("the clamp: the delta was computed")
 	}
 	if busy != 0 {
-		t.Errorf("отрицательный busy не прижат: %v, want 0", busy)
+		t.Errorf("a negative busy is not clamped: %v, want 0", busy)
 	}
 	// No delta — zero values (the zeros pin at "not measured").
 	if b, u2, s2, i2, ok := cpuDelta(cur, cur); ok || b != 0 || u2 != 0 || s2 != 0 || i2 != 0 {
-		t.Errorf("нулевая дельта = (%v/%v/%v/%v, %v), want нули", b, u2, s2, i2, ok)
+		t.Errorf("a zero delta = (%v/%v/%v/%v, %v), want zeros", b, u2, s2, i2, ok)
 	}
 	if b, u2, s2, i2, ok := cpuDelta(CPUStat{}, cur); ok || b != 0 || u2 != 0 || s2 != 0 || i2 != 0 {
-		t.Errorf("первый проход = (%v/%v/%v/%v, %v), want нули", b, u2, s2, i2, ok)
+		t.Errorf("the first pass = (%v/%v/%v/%v, %v), want zeros", b, u2, s2, i2, ok)
 	}
 }
 
@@ -467,15 +467,15 @@ func TestFormatLoadReport_Exact(t *testing.T) {
 	}
 	disks := []DiskLine{{Dir: "/var/lib/crawler/content", Avail: 44 << 30, Total: 80 << 30}}
 	got := formatLoadReport(st, &busy, &io, procCPU, queues, rates, true, prevQueues, disks, nil)
-	want := "📊 Нагрузка: CPU 100% (io 100%), PSI 92% [5м 90%]; load 24.8/22.0/20.7 из 4 ядер\n" +
-		"🧮 Топ CPU: postgres 1.4я, headless-shell 0.1я\n" +
-		"🧮 Топ память: postgres 2.0ГиБ (3 пр.), headless-shell 1.0ГиБ (2 пр.)\n" +
-		"💾 RAM: занято 5.4 из 7.6 ГиБ (доступно 2.2), swap 198 МиБ; PSI mem 8% / full 2%\n" +
-		"📀 Диск /var/lib/crawler/content: свободно 44 из 80 ГиБ (55%)\n" +
-		"📬 Очереди: q:dns 121 (+1, 3.5/с) · q:render 116319 (−1, 0.5/с)\n" +
-		"📬 Рендер-долг: н/д"
+	want := "📊 Load: CPU 100% (io 100%), PSI 92% [5m 90%]; load 24.8/22.0/20.7 of 4 cores\n" +
+		"🧮 CPU top: postgres 1.4c, headless-shell 0.1c\n" +
+		"🧮 Memory top: postgres 2.0GiB (3 procs), headless-shell 1.0GiB (2 procs)\n" +
+		"💾 RAM: used 5.4 of 7.6 GiB (available 2.2), swap 198 MiB; PSI mem 8% / full 2%\n" +
+		"📀 Disk /var/lib/crawler/content: free 44 of 80 GiB (55%)\n" +
+		"📬 Queues: q:dns 121 (+1, 3.5/s) · q:render 116319 (−1, 0.5/s)\n" +
+		"📬 Render debt: n/a"
 	if got != want {
-		t.Errorf("отчёт =\n%s\nwant:\n%s", got, want)
+		t.Errorf("the report =\n%s\nwant:\n%s", got, want)
 	}
 }
 
@@ -498,34 +498,34 @@ func TestFormatLoadReport_EdgeSections(t *testing.T) {
 	prevQueues := map[string]QueueStat{queue.StreamDNS: {Len: 5}}
 	r := formatLoadReport(st, nil, nil, nil, queues, rates, true, prevQueues, nil, nil)
 	if !strings.Contains(r, "q:dns 5 (±0)") {
-		t.Errorf("дельта ±0 не напечатана:\n%s", r)
+		t.Errorf("the ±0 delta was not printed:\n%s", r)
 	}
-	if strings.Contains(r, "/с") {
-		t.Errorf("нулевой темп напечатан:\n%s", r)
+	if strings.Contains(r, "/s") {
+		t.Errorf("a zero rate was printed:\n%s", r)
 	}
 	// A fractional rate of 0.5 is printed; prevQueues without prevStarted — no deltas
 	// (a direct call of the formatter: in the loop the pair always goes together; here
 	// we separate them).
 	rates[queue.StreamDNS] = 0.5
 	r = formatLoadReport(st, nil, nil, nil, queues, rates, true, prevQueues, nil, nil)
-	if !strings.Contains(r, "q:dns 5 (±0, 0.5/с)") {
-		t.Errorf("дробный темп не напечатан:\n%s", r)
+	if !strings.Contains(r, "q:dns 5 (±0, 0.5/s)") {
+		t.Errorf("the fractional rate was not printed:\n%s", r)
 	}
 	r = formatLoadReport(st, nil, nil, nil, queues, rates, false, prevQueues, nil, nil)
-	if strings.Contains(r, "(±0") || strings.Contains(r, "/с") {
-		t.Errorf("дельта/темп без prevStarted напечатаны:\n%s", r)
+	if strings.Contains(r, "(±0") || strings.Contains(r, "/s") {
+		t.Errorf("the delta/rate were printed without prevStarted:\n%s", r)
 	}
 
 	// A disk with a zero Total — a percentage of 0 without a panic.
 	disks := []DiskLine{{Dir: "/x", Avail: 100, Total: 0}}
 	r = formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, disks, nil)
-	if !strings.Contains(r, "📀 Диск /x: свободно 0 из 0 ГиБ (0%)") {
-		t.Errorf("диск с Total 0 = %q", r)
+	if !strings.Contains(r, "📀 Disk /x: free 0 of 0 GiB (0%)") {
+		t.Errorf("the disk with Total 0 = %q", r)
 	}
 
 	// A memory top of zero RSS — "n/a".
-	if !strings.Contains(r, "🧮 Топ память: н/д") {
-		t.Errorf("топ памяти без RSS не «н/д»:\n%s", r)
+	if !strings.Contains(r, "🧮 Memory top: n/a") {
+		t.Errorf("the memory top without RSS is not \"n/a\":\n%s", r)
 	}
 
 	// The CPU top: five names above the threshold — exactly four are
@@ -534,21 +534,21 @@ func TestFormatLoadReport_EdgeSections(t *testing.T) {
 		"a": 2, "b": 1.7, "c": 1.3, "d": 0.9, "e": 0.7, "f": 0.05, "g": 0.04,
 	}
 	r = formatLoadReport(st, nil, nil, procCPU, nil, nil, false, nil, nil, nil)
-	if want := "🧮 Топ CPU: a 2.0я, b 1.7я, c 1.3я, d 0.9я"; !strings.Contains(r, want) {
-		t.Errorf("топ CPU = %q, want %q (ровно 4 строки)", topCPULine(r), want)
+	if want := "🧮 CPU top: a 2.0c, b 1.7c, c 1.3c, d 0.9c"; !strings.Contains(r, want) {
+		t.Errorf("the CPU top = %q, want %q (exactly 4 lines)", topCPULine(r), want)
 	}
-	if strings.Contains(r, "g 0.0я") {
-		t.Errorf("шум ниже порога в топе:\n%s", r)
+	if strings.Contains(r, "g 0.0c") {
+		t.Errorf("noise below the threshold in the top:\n%s", r)
 	}
 	// The threshold boundary: a name exactly at 0.05 — passes (a "≤" mutant would
 	// lose it), below the threshold — no (two names, the top is not cut).
 	r = formatLoadReport(st, nil, nil,
 		map[string]float64{"f": 0.05, "g": 0.04}, nil, nil, false, nil, nil, nil)
-	if !strings.Contains(r, "🧮 Топ CPU: f 0.1я") {
-		t.Errorf("имя ровно в пороге 0.05 исчезло:\n%s", r)
+	if !strings.Contains(r, "🧮 CPU top: f 0.1c") {
+		t.Errorf("the name exactly at the 0.05 threshold vanished:\n%s", r)
 	}
 	if strings.Contains(topCPULine(r), "g") {
-		t.Errorf("шум 0.04 в топе: %q", topCPULine(r))
+		t.Errorf("the 0.04 noise in the top: %q", topCPULine(r))
 	}
 }
 
@@ -557,12 +557,12 @@ func TestFormatLoadReport_EdgeSections(t *testing.T) {
 func TestSortTopOrder(t *testing.T) {
 	items := topByCPU(map[string]float64{"b": 1, "a": 1, "c": 2})
 	if len(items) != 3 || items[0].name != "c" || items[1].name != "a" || items[2].name != "b" {
-		t.Errorf("порядок = %+v, want c,a,b (значение ↓, имя ↑)", items)
+		t.Errorf("the order = %+v, want c,a,b (the value ↓, the name ↑)", items)
 	}
 	// RSS = 1 byte — the name enters the top (the zero boundary).
 	items = topByRSS(map[string]ProcAgg{"tiny": {RSS: 1, Count: 1}})
 	if len(items) != 1 || items[0].name != "tiny" {
-		t.Errorf("RSS 1 байт исчез из топа: %+v", items)
+		t.Errorf("an RSS of 1 byte vanished from the top: %+v", items)
 	}
 	// Count = 1 — without the process suffix; Count = 2 — with it (the
 	// "> 1" boundary is observed by the memory top text).
@@ -571,19 +571,19 @@ func TestSortTopOrder(t *testing.T) {
 		"two": {RSS: 2 << 20, Count: 2},
 	}, MemTotal: 1, MemAvailable: 1}
 	r := formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, nil, nil)
-	if !strings.Contains(r, "two 2МиБ (2 пр.)") || strings.Contains(r, "one 1МиБ (1") {
-		t.Errorf("аннотация числа процессов: %q", r)
+	if !strings.Contains(r, "two 2MiB (2 procs)") || strings.Contains(r, "one 1MiB (1") {
+		t.Errorf("the process count annotation: %q", r)
 	}
 }
 
 // TestFmtMemAndRound — the boundaries of the human-readable sizes and rounding.
 func TestFmtMemAndRound(t *testing.T) {
 	cases := map[uint64]string{
-		0:             "0МиБ",
-		1 << 20:       "1МиБ",
-		(1 << 30) - 1: "1024МиБ",
-		1 << 30:       "1.0ГиБ",
-		5<<30 + 1<<29: "5.5ГиБ",
+		0:             "0MiB",
+		1 << 20:       "1MiB",
+		(1 << 30) - 1: "1024MiB",
+		1 << 30:       "1.0GiB",
+		5<<30 + 1<<29: "5.5GiB",
 	}
 	for b, want := range cases {
 		if got := fmtMem(b); got != want {
@@ -612,7 +612,7 @@ func TestRedisQueues_TextNoSuchKey(t *testing.T) {
 	}
 	q, err := RedisQueues{RDB: rdb}.Queues(context.Background())
 	if err != nil {
-		t.Fatalf("текстовый no such key: %v (секция обязана жить)", err)
+		t.Fatalf("a textual no such key: %v (the section must live)", err)
 	}
 	if q[queue.StreamDNS] != (QueueStat{}) {
 		t.Errorf("q:dns = %+v, want {0 0}", q[queue.StreamDNS])
@@ -628,7 +628,7 @@ func TestRedisQueues_TextNoSuchKey(t *testing.T) {
 	}
 	q2, err := (RedisQueues{RDB: rdb2}).Queues(context.Background())
 	if err != nil {
-		t.Fatalf("ветка «нет ключа» вырезана молча: %v", err)
+		t.Fatalf("the \"no key\" branch was cut silently: %v", err)
 	}
 	if q2[queue.StreamDNS] != (QueueStat{}) {
 		t.Errorf("q:dns = %+v, want {0 0}", q2[queue.StreamDNS])
@@ -662,10 +662,10 @@ func TestRedisQueues_ReadEqualGroups(t *testing.T) {
 func TestLoadReportLoop_DisabledAndRates(t *testing.T) {
 	src := &countingLoadSource{}
 	if err := LoadReportLoop(context.Background(), src, LoadReportOptions{Interval: 0}); err != nil {
-		t.Fatalf("выключенный цикл: %v", err)
+		t.Fatalf("the disabled loop: %v", err)
 	}
 	if src.count != 0 {
-		t.Errorf("выключенный цикл: снимков = %d, want 0", src.count)
+		t.Errorf("the disabled loop: snapshots = %d, want 0", src.count)
 	}
 
 	// The rate: a base snapshot + a window with a delivery delta of 100 at a past
@@ -702,24 +702,24 @@ func TestLoadReportLoop_DisabledAndRates(t *testing.T) {
 	case r = <-reports:
 	case <-time.After(5 * time.Second):
 		cancel()
-		t.Fatal("второй отчёт не пришёл")
+		t.Fatal("the second report did not arrive")
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 	line := ""
 	for _, l := range strings.Split(r, "\n") {
-		if strings.HasPrefix(l, "📬 Очереди: ") {
+		if strings.HasPrefix(l, "📬 Queues: ") {
 			line = l
 		}
 	}
-	if !strings.Contains(line, "/с") {
-		t.Fatalf("темп не напечатан: %q", line)
+	if !strings.Contains(line, "/s") {
+		t.Fatalf("the rate was not printed: %q", line)
 	}
 	// Extract the "N.N/s" rate from the tail "q:dns 2 (+1, N.N/s)".
 	rate := 0.0
-	if i := strings.Index(line, "/с"); i >= 0 {
+	if i := strings.Index(line, "/s"); i >= 0 {
 		j := i
 		for j > 0 && (line[j-1] >= '0' && line[j-1] <= '9' || line[j-1] == '.') {
 			j--
@@ -732,10 +732,10 @@ func TestLoadReportLoop_DisabledAndRates(t *testing.T) {
 	// 333..5000; the mutants: *window ≈ 100*0.02..0.3 = 2..30; +p.Read
 	// ≈ 10100/window ≥ 33666. The corridor [150, 20000] separates them with headroom.
 	if rate < 150 || rate > 20000 {
-		t.Errorf("темп доставок = %v (окно ~20мс, дельта 100), want 150..20000", rate)
+		t.Errorf("the delivery rate = %v (a window of ~20ms, a delta of 100), want 150..20000", rate)
 	}
 	if !strings.Contains(line, "(+1") {
-		t.Errorf("дельта бэклога не напечатана: %q", line)
+		t.Errorf("the backlog delta was not printed: %q", line)
 	}
 }
 
@@ -768,15 +768,15 @@ func TestLoadReportLoop_TinyWindowTopCPU(t *testing.T) {
 	case r = <-reports:
 	case <-time.After(5 * time.Second):
 		cancel()
-		t.Fatal("второй отчёт не пришёл")
+		t.Fatal("the second report did not arrive")
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 	// A window of d=1, perCore=0.25: a's share = 1/0.25 = 4.0 cores.
-	if want := "🧮 Топ CPU: a 4.0я"; !strings.Contains(r, want) {
-		t.Errorf("топ CPU окна в 1 тик = %q, want %q", topCPULine(r), want)
+	if want := "🧮 CPU top: a 4.0c"; !strings.Contains(r, want) {
+		t.Errorf("the CPU top of a 1-tick window = %q, want %q", topCPULine(r), want)
 	}
 }
 
@@ -790,7 +790,7 @@ func TestLoadReportLoop_SourceErrorNoReport(t *testing.T) {
 		Procs: map[string]ProcAgg{"a": {Ticks: 10}},
 	}
 	// The first pass — a snapshot, then — a persistent source error.
-	src := &flakyLoadSource{first: st, err: errors.New("источник недоступен")}
+	src := &flakyLoadSource{first: st, err: errors.New("source unavailable")}
 	// reports is written from the loop goroutine (Notify) and polled here
 	// until the loop stops — access only under a mutex (the race detector).
 	var mu sync.Mutex
@@ -817,19 +817,19 @@ func TestLoadReportLoop_SourceErrorNoReport(t *testing.T) {
 	mu.Unlock()
 	if n != 1 {
 		cancel()
-		t.Fatalf("отчётов = %d, want 1 (успешный старт)", n)
+		t.Fatalf("reports = %d, want 1 (a successful start)", n)
 	}
 	// Wait for a couple of failing passes and cancel: no new reports.
 	time.Sleep(60 * time.Millisecond)
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 	mu.Lock()
 	n = len(reports)
 	mu.Unlock()
 	if n != 1 {
-		t.Errorf("отчётов после сбоев источника = %d, want 1 (сбой не строит отчёт)", n)
+		t.Errorf("reports after the source failures = %d, want 1 (a failure builds no report)", n)
 	}
 }
 
@@ -859,7 +859,7 @@ func TestLoadReportLoop_SpaceErrorNoDiskLine(t *testing.T) {
 	var reports []string
 	opts := LoadReportOptions{
 		Interval: time.Hour, // the only starting pass
-		Space:    fakeLoadSpace{err: errors.New("statfs: отказано")},
+		Space:    fakeLoadSpace{err: errors.New("statfs: permission denied")},
 		Dirs:     []string{"/var/lib/crawler/content"},
 		Notify:   func(text string) { reports = append(reports, text) },
 	}
@@ -870,19 +870,19 @@ func TestLoadReportLoop_SpaceErrorNoDiskLine(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("цикл: %v", err)
+			t.Fatalf("the loop: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не вышел")
+		t.Fatal("the loop did not exit")
 	}
 	if len(reports) != 1 {
-		t.Fatalf("отчётов = %d, want 1", len(reports))
+		t.Fatalf("reports = %d, want 1", len(reports))
 	}
-	if strings.Contains(reports[0], "Диск /var/lib/crawler/content: свободно 0 из 0") {
-		t.Errorf("сбой statfs породил нулевую строку диска:\n%s", reports[0])
+	if strings.Contains(reports[0], "Disk /var/lib/crawler/content: free 0 of 0") {
+		t.Errorf("a statfs failure produced a zero disk line:\n%s", reports[0])
 	}
-	if !strings.Contains(reports[0], "📀 Диск: н/д") {
-		t.Errorf("секция диска не «н/д» при единственном сбойном каталоге:\n%s", reports[0])
+	if !strings.Contains(reports[0], "📀 Disk: n/a") {
+		t.Errorf("the disk section is not \"n/a\" with the single failing directory:\n%s", reports[0])
 	}
 }
 
@@ -920,7 +920,7 @@ func TestOSLoadCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := (OSLoad{Root: fullCPUFixtures(t)}).Load(ctx); err == nil {
-		t.Error("отменённый ctx: хочу ошибку прохода, не снимок")
+		t.Error("a cancelled ctx: want a pass error, not a snapshot")
 	}
 }
 
@@ -932,7 +932,7 @@ func TestReadCPUStat_GuestTailGarbage(t *testing.T) {
 	writeFix(t, root, "stat",
 		"cpu  11 22 33 44 55 66 77 88 x 100\n"+"cpu0 1 1 1 1 1 1 1 1\n")
 	if _, err := readCPUStat(root + "/stat"); err != nil {
-		t.Errorf("мусор в guest-хвосте: %v (поля после восьми не парсятся)", err)
+		t.Errorf("junk in the guest tail: %v (the fields after eight are not parsed)", err)
 	}
 }
 
@@ -941,14 +941,14 @@ func TestReadCPUStat_GuestTailGarbage(t *testing.T) {
 // it; break (a mutant) would cut the walk and lose every PID below.
 func TestReadProcs_NonDirBreaksScan(t *testing.T) {
 	root := fullCPUFixtures(t)
-	writeFix(t, root, "0note", "не каталог")
+	writeFix(t, root, "0note", "not a dir")
 	mkdirFix(t, root, "400", "(afterfile) S 1 0 0 0 -1 0 0 0 0 0 7 3 0 0 20 0 9", "1 1\n")
 	procs, err := readProcs(root)
 	if err != nil {
 		t.Fatalf("readProcs: %v", err)
 	}
 	if got := procs["afterfile"]; got.Ticks != 10 {
-		t.Errorf("PID за не-каталогом потерян: %+v, want тики 10 (continue, не break)", got)
+		t.Errorf("the PID behind a non-directory was lost: %+v, want ticks 10 (continue, not break)", got)
 	}
 }
 
@@ -966,7 +966,7 @@ func TestReadProcs_SymlinkNotDir(t *testing.T) {
 		t.Fatalf("readProcs: %v", err)
 	}
 	if _, ok := procs["ghost"]; ok {
-		t.Error("симлинк-«PID» прочитан: отбор — только настоящие каталоги (IsDir)")
+		t.Error("a symlink-\"PID\" was read: the selection is real directories only (IsDir)")
 	}
 }
 
@@ -975,7 +975,7 @@ func TestReadProcs_SymlinkNotDir(t *testing.T) {
 // lines without an opening parenthesis through).
 func TestParseProcStatLine_NoOpenParen(t *testing.T) {
 	if comm, ticks := parseProcStatLine([]byte("1 x) R 1 2 3 4 5 6 7 8 9 10 3 4")); comm != "" || ticks != 0 {
-		t.Errorf("скобка закрытия без открытия = (%q, %d), want пустой вклад", comm, ticks)
+		t.Errorf("a closing parenthesis without an opening one = (%q, %d), want an empty contribution", comm, ticks)
 	}
 }
 
@@ -984,7 +984,7 @@ func TestParseProcStatLine_NoOpenParen(t *testing.T) {
 func TestParseProcStatLine_HugeStime(t *testing.T) {
 	if comm, ticks := parseProcStatLine([]byte(
 		"9 (huge) R 1 2 3 4 5 6 7 8 9 10 5 9223372036854775808")); comm != "huge" || ticks != 9223372036854775813 {
-		t.Errorf("stime 2^63 = (%q, %d), want huge и 2^63+5 (uint64)", comm, ticks)
+		t.Errorf("stime 2^63 = (%q, %d), want huge and 2^63+5 (uint64)", comm, ticks)
 	}
 }
 
@@ -1000,9 +1000,9 @@ func TestRedisQueues_GroupsTextNoSuchKey(t *testing.T) {
 	}
 	q, err := RedisQueues{RDB: rdb}.Queues(context.Background())
 	if err != nil {
-		t.Fatalf("XINFO GROUPS «no such key»: %v (секция обязана жить)", err)
+		t.Fatalf("XINFO GROUPS \"no such key\": %v (the section must live)", err)
 	}
 	if q[queue.StreamDNS].Len != 5 {
-		t.Errorf("q:dns = %+v, want глубина XLEN 5 (групп нет — XLEN)", q[queue.StreamDNS])
+		t.Errorf("q:dns = %+v, want the XLEN depth 5 (no groups — XLEN)", q[queue.StreamDNS])
 	}
 }

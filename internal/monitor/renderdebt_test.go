@@ -27,12 +27,12 @@ func TestRenderDebtValue(t *testing.T) {
 	if d.Total() != 542120 {
 		t.Errorf("Total = %d, want 542120", d.Total())
 	}
-	want := "флаги 443000 + лаг 99120 = 542120"
+	want := "flags 443000 + lag 99120 = 542120"
 	if d.String() != want {
 		t.Errorf("String = %q, want %q", d.String(), want)
 	}
-	if zero := (RenderDebt{}).String(); zero != "флаги 0 + лаг 0 = 0" {
-		t.Errorf("нулевой долг = %q", zero)
+	if zero := (RenderDebt{}).String(); zero != "flags 0 + lag 0 = 0" {
+		t.Errorf("the zero debt = %q", zero)
 	}
 }
 
@@ -49,51 +49,51 @@ func TestRenderDebtReader(t *testing.T) {
 		t.Fatalf("RenderDebt: %v", err)
 	}
 	if d.Flags != 443000 || d.Lag != 99120 || d.Total() != 542120 {
-		t.Fatalf("снимок = %+v, want флаги 443000 лаг 99120", d)
+		t.Fatalf("the snapshot = %+v, want flags 443000 lag 99120", d)
 	}
 	// The SQL — the exact contract (the fake fails on the unexpected).
 	if calls := pool.calls(); len(calls) != 1 || calls[0].sql != renderDebtFlagsSQL {
-		t.Fatalf("запросов = %+v, want один renderDebtFlagsSQL", calls)
+		t.Fatalf("queries = %+v, want one renderDebtFlagsSQL", calls)
 	}
 	if streams := lener.streams(); len(streams) != 1 || streams[0] != queue.StreamRender {
-		t.Fatalf("Len звали для %v, want только q:render", streams)
+		t.Fatalf("Len was called for %v, want q:render only", streams)
 	}
 
 	// Nil dependencies.
 	if _, err := (RenderDebtReader{}).RenderDebt(ctx); err == nil {
-		t.Error("пул nil: хочу ошибку")
+		t.Error("a nil pool: want an error")
 	}
 	if _, err := (RenderDebtReader{Pool: pool}).RenderDebt(ctx); err == nil {
-		t.Error("Redis nil: хочу ошибку")
+		t.Error("a nil Redis: want an error")
 	}
 
 	// Source errors are errors (a silent zero would make the gauge a lie).
-	poolErr := &alertsPool{debtErrs: []error{errors.New("бд недоступна")}}
+	poolErr := &alertsPool{debtErrs: []error{errors.New("db unavailable")}}
 	if _, err := (RenderDebtReader{Pool: poolErr, Redis: lener}).RenderDebt(ctx); err == nil ||
-		!strings.Contains(err.Error(), "счётчик") {
-		t.Errorf("ошибка запроса счётчика: %v, want ошибка про счётчик", err)
+		!strings.Contains(err.Error(), "counter") {
+		t.Errorf("a counter query error: %v, want an error about the counter", err)
 	}
 
 	poolEmpty := &alertsPool{debtEmpty: true}
 	_, err = (RenderDebtReader{Pool: poolEmpty, Redis: lener}).RenderDebt(ctx)
 	if err == nil || !strings.Contains(err.Error(), "render_pending") {
-		t.Errorf("строки счётчика нет: %v, want ошибка про строку render_pending", err)
+		t.Errorf("the counter row is missing: %v, want an error about the render_pending row", err)
 	}
 
 	poolBad := &alertsPool{debtBadRow: true}
 	if _, err := (RenderDebtReader{Pool: poolBad, Redis: lener}).RenderDebt(ctx); err == nil {
-		t.Error("кривая строка счётчика: хочу ошибку чтения")
+		t.Error("a malformed counter row: want a scan error")
 	}
 
-	poolRows := &alertsPool{debt: []int64{1}, debtRowsErr: errors.New("итерация")}
+	poolRows := &alertsPool{debt: []int64{1}, debtRowsErr: errors.New("iteration")}
 	if _, err := (RenderDebtReader{Pool: poolRows, Redis: lener}).RenderDebt(ctx); err == nil {
-		t.Error("ошибка итерации счётчика: хочу ошибку")
+		t.Error("a counter iteration error: want an error")
 	}
 
 	lenerErr := &fakeLener{lens: map[string]int64{}, errs: []error{errors.New("redis: xlen")}}
 	if _, err := (RenderDebtReader{Pool: pool, Redis: lenerErr}).RenderDebt(ctx); err == nil ||
 		!strings.Contains(err.Error(), "q:render") {
-		t.Errorf("ошибка XLEN: %v, want ошибка про q:render", err)
+		t.Errorf("an XLEN error: %v, want an error about q:render", err)
 	}
 }
 
@@ -122,21 +122,21 @@ func TestRenderDebtLoopOnePass(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("цикл: %v (отмена — чистый nil)", err)
+			t.Fatalf("the loop: %v (a cancellation — a clean nil)", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не вышел по отмене")
+		t.Fatal("the loop did not exit on cancellation")
 	}
 
 	v, ok := gaugeLabels(t, reg, "crawler_render_pending_domains", map[string]string{})
 	if !ok || v != 443000 {
-		t.Fatalf("gauge = %v (found=%v), want 443000 (только флаги; лаг — crawler_queue_depth)", v, ok)
+		t.Fatalf("the gauge = %v (found=%v), want 443000 (the flags only; the lag — crawler_queue_depth)", v, ok)
 	}
-	if !strings.Contains(buf.String(), "рендер-долг: флаги 443000 + лаг 99120 = 542120") {
-		t.Errorf("сводка прохода не в журнале (Debug):\n%s", buf.String())
+	if !strings.Contains(buf.String(), "render debt: flags 443000 + lag 99120 = 542120") {
+		t.Errorf("the pass summary is not in the journal (Debug):\n%s", buf.String())
 	}
-	if strings.Count(buf.String(), "рендер-долг: флаги") != 1 {
-		t.Errorf("сводка пишется не одной строкой на проход:\n%s", buf.String())
+	if strings.Count(buf.String(), "render debt: flags") != 1 {
+		t.Errorf("the summary is not written as one line per pass:\n%s", buf.String())
 	}
 
 	// A source failure — a Warn of each pass, the loop keeps living, the
@@ -144,7 +144,7 @@ func TestRenderDebtLoopOnePass(t *testing.T) {
 	// error and a live ctx (a cancellation mutes the Warn — part of the
 	// shutdown, the ZoneStatsLoop style), the passes are counted by the
 	// source calls.
-	failing := &fakeRenderDebtSource{err: errors.New("бд недоступна")}
+	failing := &fakeRenderDebtSource{err: errors.New("db unavailable")}
 	var buf2 bytes.Buffer
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan error, 1)
@@ -160,26 +160,26 @@ func TestRenderDebtLoopOnePass(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel2()
-			t.Fatal("проходов со сбоем нет — цикл не живёт")
+			t.Fatal("no passes with a failure — the loop does not live")
 		default:
 			time.Sleep(time.Millisecond)
 		}
 	}
 	cancel2()
 	if err := <-done2; err != nil {
-		t.Fatalf("цикл со сбоем: %v (отмена — чистый nil)", err)
+		t.Fatalf("the loop with a failure: %v (a cancellation — a clean nil)", err)
 	}
 	if !strings.Contains(buf2.String(), "level=WARN") {
-		t.Errorf("сбой источника без Warn:\n%s", buf2.String())
+		t.Errorf("a source failure without a Warn:\n%s", buf2.String())
 	}
 	v, ok = gaugeLabels(t, reg, "crawler_render_pending_domains", map[string]string{})
 	if !ok || v != 443000 {
-		t.Errorf("gauge после сбоя = %v (found=%v), want прежние 443000 (hold-last)", v, ok)
+		t.Errorf("the gauge after the failure = %v (found=%v), want the previous 443000 (hold-last)", v, ok)
 	}
 
 	// A nil source — a loop error (the OnRun contract).
 	if err := RenderDebtLoop(context.Background(), nil, RenderDebtOptions{}); err == nil {
-		t.Error("источник nil: хочу ошибку")
+		t.Error("a nil source: want an error")
 	}
 }
 

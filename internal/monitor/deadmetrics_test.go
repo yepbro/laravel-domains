@@ -23,10 +23,10 @@ func TestDeadDepthMetrics(t *testing.T) {
 	// double the PromQL aggregates).
 	n, err := m.Len(context.Background(), queue.StreamHTTP)
 	if n != 3 || err != nil {
-		t.Fatalf("Len(q:http) = (%v, %v), want транзит (3, nil)", n, err)
+		t.Fatalf("Len(q:http) = (%v, %v), want transit (3, nil)", n, err)
 	}
 	if _, ok := gaugeLabels(t, reg, "crawler_queue_depth", map[string]string{"queue": queue.StreamHTTP}); ok {
-		t.Error("рабочий стрим зеркалится в crawler_queue_depth")
+		t.Error("a working stream is mirrored into crawler_queue_depth")
 	}
 
 	// q:dead — pass-through and mirror.
@@ -34,7 +34,7 @@ func TestDeadDepthMetrics(t *testing.T) {
 		t.Fatalf("Len(q:dead) = (%v, %v), want (7, nil)", n, err)
 	}
 	if v, ok := gaugeLabels(t, reg, "crawler_queue_depth", map[string]string{"queue": queue.StreamDead}); !ok || v != 7 {
-		t.Errorf("crawler_queue_depth{queue=q:dead} = (%v, %v), want 7 (monitor — наблюдатель карантина)", v, ok)
+		t.Errorf("crawler_queue_depth{queue=q:dead} = (%v, %v), want 7 (monitor — the quarantine observer)", v, ok)
 	}
 
 	// A new value overwrites the gauge; a read error — holds.
@@ -44,16 +44,16 @@ func TestDeadDepthMetrics(t *testing.T) {
 	}
 	src.errs = []error{errors.New("connection refused")}
 	if _, err := m.Len(context.Background(), queue.StreamDead); err == nil {
-		t.Fatal("ошибка источника не прокинута")
+		t.Fatal("the source error is not propagated")
 	}
 	if v, ok := gaugeLabels(t, reg, "crawler_queue_depth", map[string]string{"queue": queue.StreamDead}); !ok || v != 9 {
-		t.Errorf("после ошибки глубина = (%v, %v), want последняя известная 9", v, ok)
+		t.Errorf("after the error the depth = (%v, %v), want the last known 9", v, ok)
 	}
 
 	// A nil registry — pure pass-through for all streams.
 	plain := NewDeadDepthMetrics(nil, src)
 	src.errs = nil
 	if n, err := plain.Len(context.Background(), queue.StreamDead); n != 9 || err != nil {
-		t.Errorf("транзит без реестра = (%v, %v), want источник как есть", n, err)
+		t.Errorf("transit without a registry = (%v, %v), want the source as is", n, err)
 	}
 }

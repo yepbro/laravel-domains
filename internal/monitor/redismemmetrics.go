@@ -53,11 +53,11 @@ func NewRedisMemoryMetrics(reg *metrics.Registry, src RedisMemorySource) *RedisM
 	}
 	m.ratio = reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_redis_memory_ratio",
-		Help: "Доля памяти Redis used_memory/maxmemory (INFO memory, T-154). При noeviction — прокси-метрика предстоящих OOM-отказов записи (алерт redis_memory монитора при ≥ 0.8). maxmemory не задан (0) — ряд не пишется: доля не определена.",
+		Help: "The Redis memory share used_memory/maxmemory (INFO memory, T-154). With noeviction — a proxy metric of the upcoming OOM write refusals (the monitor redis_memory alert at ≥ 0.8). maxmemory unset (0) — the series is not written: the share is undefined.",
 	})
 	m.bytes = reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_redis_memory_bytes",
-		Help: "Память Redis из INFO memory (T-154): kind=used — used_memory, kind=max — maxmemory (0 — потолка нет).",
+		Help: "Redis memory from INFO memory (T-154): kind=used — used_memory, kind=max — maxmemory (0 — no cap).",
 	}, metrics.LabelKind)
 	return m
 }

@@ -67,7 +67,7 @@ const unitEventsPattern = "crawler-*.service"
 // (like SMART), the other source errors (a production host but a broken
 // systemd/cgroupfs) — a Warn of each pass, the style of the other
 // sources (the ingest probe).
-var errNoSystemd = errors.New("systemd отсутствует (контейнер/dev)")
+var errNoSystemd = errors.New("systemd is missing (container/dev)")
 
 // Values of the kind label of the crawler_unit_oom_events metric (uniteventsmetrics).
 const (
@@ -203,9 +203,9 @@ func (s OSUnitEvents) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 		// error as is, the alert will answer with a Warn.
 		if errors.Is(err, exec.ErrNotFound) ||
 			strings.Contains(errOut.String(), "System has not been booted with systemd") {
-			return nil, fmt.Errorf("monitor: юниты: %w: %w", errNoSystemd, reason)
+			return nil, fmt.Errorf("monitor: units: %w: %w", errNoSystemd, reason)
 		}
-		return nil, fmt.Errorf("monitor: юниты: %w", reason)
+		return nil, fmt.Errorf("monitor: units: %w", reason)
 	}
 	units := parseSystemctlShow(out.String())
 	if len(units) > 0 {
@@ -216,7 +216,7 @@ func (s OSUnitEvents) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 		// ENOENTs below would fold into a false "ok" by zeros.
 		sliceDir := filepath.Join(cgroupFS, "system.slice")
 		if _, err := os.Stat(sliceDir); err != nil {
-			return nil, fmt.Errorf("monitor: юниты: cgroup v2 %s недоступен: %w", sliceDir, err)
+			return nil, fmt.Errorf("monitor: units: cgroup v2 %s is unavailable: %w", sliceDir, err)
 		}
 	}
 	var errs []string
@@ -230,7 +230,7 @@ func (s OSUnitEvents) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 		units[i].OOM, units[i].OOMKill, units[i].High = ev.OOM, ev.OOMKill, ev.High
 	}
 	if len(errs) > 0 {
-		return nil, fmt.Errorf("monitor: юниты: memory.events: %s", strings.Join(errs, "; "))
+		return nil, fmt.Errorf("monitor: units: memory.events: %s", strings.Join(errs, "; "))
 	}
 	return units, nil
 }
@@ -323,7 +323,7 @@ func parseMemoryEvents(data string) (memoryEvents, error) {
 		}
 		n, perr := strconv.ParseUint(val, 10, 64)
 		if perr != nil {
-			return memoryEvents{}, fmt.Errorf("monitor: memory.events: %q: значение %q не число", key, val)
+			return memoryEvents{}, fmt.Errorf("monitor: memory.events: %q: the value %q is not a number", key, val)
 		}
 		*dst = n
 	}

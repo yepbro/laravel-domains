@@ -102,26 +102,26 @@ func NewTelegramNotifier(opts TelegramOptions) *TelegramNotifier {
 	}
 	n := &TelegramNotifier{script: "", log: log, state: make(map[string]notifyEpisode)}
 	if !opts.Enabled {
-		log.Info("telegram: доставка алертов выключена (monitor.alerts.telegram=false)")
+		log.Info("telegram: alert delivery off (monitor.alerts.telegram=false)")
 		return n
 	}
 	if getenv(EnvTelegramBotToken) == "" || getenv(EnvTelegramChatID) == "" {
-		log.Info("telegram: доставка алертов выключена — не задан TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID " +
-			"(EnvironmentFile юнита, deploy/systemd/crawler.env.example); алерты остаются Warn в журнале monitor")
+		log.Info("telegram: alert delivery off — TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set " +
+			"(the unit's EnvironmentFile, deploy/systemd/crawler.env.example); alerts stay Warn in the monitor journal")
 		return n
 	}
 	script := opts.Script
 	if script == "" {
-		log.Warn("telegram: доставка алертов выключена — не задан путь скрипта (monitor.alerts.telegram_script)")
+		log.Warn("telegram: alert delivery off — the script path is not set (monitor.alerts.telegram_script)")
 		return n
 	}
 	if st, err := os.Stat(script); err != nil || st.IsDir() || st.Mode()&0o111 == 0 {
-		log.Warn("telegram: доставка алертов выключена — скрипт не доступен или не исполняем",
+		log.Warn("telegram: alert delivery off — the script is unavailable or not executable",
 			"script", script, "err", err)
 		return n
 	}
 	n.script = script
-	log.Info("telegram: доставка алертов включена", "script", script)
+	log.Info("telegram: alert delivery on", "script", script)
 	return n
 }
 
@@ -142,19 +142,19 @@ func (n *TelegramNotifier) OnPass(res AlertsResult) {
 		switch {
 		case a.Status == AlertStatusFiring:
 			if !st.wasFiring && !firstPass {
-				n.send(fmt.Sprintf("🚨 Алерт %s: %s\n%s", a.Name, alertDesc(a.Name), a.Detail))
+				n.send(fmt.Sprintf("🚨 Alert %s: %s\n%s", a.Name, alertDesc(a.Name), a.Detail))
 			}
 			st.wasFiring = true
 		case a.Status == AlertStatusOK:
 			if st.wasFiring {
-				n.send(fmt.Sprintf("✅ Восстановлено: %s (%s)\n%s", a.Name, alertDesc(a.Name), a.Detail))
+				n.send(fmt.Sprintf("✅ Recovered: %s (%s)\n%s", a.Name, alertDesc(a.Name), a.Detail))
 			}
 			st.wasFiring = false
 		case a.Status == AlertStatusNotMeasured && st.wasFiring:
 			// Without a message — see the file header: a recovery is not proven,
 			// and source flapping must neither spam nor close the episode.
-			n.log.Info("telegram: сработавший алерт больше не измеряется — без сообщения",
-				"alert", a.Name, "причина", a.Detail)
+			n.log.Info("telegram: firing alert no longer measured — no message",
+				"alert", a.Name, "reason", a.Detail)
 		}
 		n.state[a.Name] = st
 	}
@@ -190,13 +190,13 @@ func (n *TelegramNotifier) send(text string) {
 		out, err := exec.CommandContext(ctx, n.script, "--message", text).CombinedOutput()
 		switch {
 		case ctx.Err() != nil:
-			n.log.Warn("telegram: отправка алерта прервана таймаутом",
+			n.log.Warn("telegram: alert send interrupted by the timeout",
 				"script", n.script, "timeout", telegramNotifyTimeout.String())
 		case err != nil:
-			n.log.Warn("telegram: отправка алерта не удалась",
-				"script", n.script, "err", err, "вывод", strings.TrimSpace(string(out)))
+			n.log.Warn("telegram: alert send failed",
+				"script", n.script, "err", err, "output", strings.TrimSpace(string(out)))
 		default:
-			n.log.Debug("telegram: алерт отправлен", "вывод", strings.TrimSpace(string(out)))
+			n.log.Debug("telegram: alert sent", "output", strings.TrimSpace(string(out)))
 		}
 	}()
 }

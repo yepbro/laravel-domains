@@ -77,11 +77,11 @@ type alertStaleSnap struct {
 }
 
 func (p *alertsPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *alertsPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("Exec must not be called")
 }
 
 func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Rows, error) {
@@ -97,7 +97,7 @@ func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Row
 			return &alertRows{err: p.dailyRowsErr}, nil
 		}
 		if p.dailyBadRow {
-			return &alertRows{rows: [][]any{{"байты", "байты"}}, err: p.dailyRowsErr}, nil
+			return &alertRows{rows: [][]any{{"bytes", "bytes"}}, err: p.dailyRowsErr}, nil
 		}
 		d := alertDNSDaily{}
 		if len(p.daily) > 0 {
@@ -113,7 +113,7 @@ func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Row
 			return &alertRows{err: p.freshRowsErr}, nil
 		}
 		if p.freshBadRow {
-			return &alertRows{rows: [][]any{{"байты"}}, err: p.freshRowsErr}, nil
+			return &alertRows{rows: [][]any{{"bytes"}}, err: p.freshRowsErr}, nil
 		}
 		t := sql.NullTime{}
 		if len(p.fresh) > 0 {
@@ -129,7 +129,7 @@ func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Row
 			return &alertRows{err: p.debtRowsErr}, nil
 		}
 		if p.debtBadRow {
-			return &alertRows{rows: [][]any{{"байты"}}, err: p.debtRowsErr}, nil
+			return &alertRows{rows: [][]any{{"bytes"}}, err: p.debtRowsErr}, nil
 		}
 		var v int64
 		if len(p.debt) > 0 {
@@ -145,7 +145,7 @@ func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Row
 			return &alertRows{err: p.staleRowsErr}, nil
 		}
 		if p.staleBadRow {
-			return &alertRows{rows: [][]any{{"байты", "байты"}}, err: p.staleRowsErr}, nil
+			return &alertRows{rows: [][]any{{"bytes", "bytes"}}, err: p.staleRowsErr}, nil
 		}
 		s := alertStaleSnap{}
 		if len(p.stale) > 0 {
@@ -154,7 +154,7 @@ func (p *alertsPool) Query(_ context.Context, sqlQ string, args ...any) (pgx.Row
 		}
 		return &alertRows{rows: [][]any{{s.value, sql.NullTime{Time: s.at, Valid: !s.at.IsZero()}}}, err: p.staleRowsErr}, nil
 	default:
-		return nil, fmt.Errorf("alertsPool: неожидаемый SQL Query: %s", sqlQ)
+		return nil, fmt.Errorf("alertsPool: unexpected SQL Query: %s", sqlQ)
 	}
 }
 
@@ -204,11 +204,11 @@ func (r *alertRows) Next() bool {
 
 func (r *alertRows) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) {
-		return errors.New("alertRows: Scan без Next")
+		return errors.New("alertRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("alertRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("alertRows: %d destinations, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		v := row[i]
@@ -216,17 +216,17 @@ func (r *alertRows) Scan(dest ...any) error {
 		case *int64:
 			n, ok := v.(int64)
 			if !ok {
-				return fmt.Errorf("alertRows: колонка %d: %T не int64", i, v)
+				return fmt.Errorf("alertRows: column %d: %T is not int64", i, v)
 			}
 			*dst = n
 		case *sql.NullTime:
 			t, ok := v.(sql.NullTime)
 			if !ok {
-				return fmt.Errorf("alertRows: колонка %d: %T не sql.NullTime", i, v)
+				return fmt.Errorf("alertRows: column %d: %T is not sql.NullTime", i, v)
 			}
 			*dst = t
 		default:
-			return fmt.Errorf("alertRows: приёмник %d: %T не поддерживается", i, d)
+			return fmt.Errorf("alertRows: destination %d: %T is not supported", i, d)
 		}
 	}
 	return nil
@@ -409,7 +409,7 @@ func snapshotOf(t *testing.T, res AlertsResult, name string) AlertSnapshot {
 			return s
 		}
 	}
-	t.Fatalf("алерт %s отсутствует в снапшоте %+v", name, res.Alerts)
+	t.Fatalf("the alert %s is missing from the snapshot %+v", name, res.Alerts)
 	return AlertSnapshot{}
 }
 
@@ -426,11 +426,11 @@ func TestAlertsDNSContract(t *testing.T) {
 	res := env.Pass(context.Background())
 	s := snapshotOf(t, res, AlertDNSErrors)
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("статус = %s (%s), want firing: доля 35%% ≥ 30%%", s.Status, s.Detail)
+		t.Fatalf("status = %s (%s), want firing: the share 35%% ≥ 30%%", s.Status, s.Detail)
 	}
 	for _, want := range []string{"35.0%", "350", "1000"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail %q не содержит %s", s.Detail, want)
+			t.Errorf("the detail %q does not contain %s", s.Detail, want)
 		}
 	}
 
@@ -442,10 +442,10 @@ func TestAlertsDNSContract(t *testing.T) {
 		}
 	}
 	if len(dns) != 1 {
-		t.Fatalf("запросов dnsDailyCountersSQL = %d, want 1", len(dns))
+		t.Fatalf("dnsDailyCountersSQL queries = %d, want 1", len(dns))
 	}
 	if len(dns[0].args) != 0 {
-		t.Errorf("аргументы = %v, want пусто (имена дней вычисляет БД)", dns[0].args)
+		t.Errorf("args = %v, want empty (the day names are computed by the DB)", dns[0].args)
 	}
 	// The names of the daily rows — DB expressions (current_date); the outer
 	// coalesce gives an honest zero before the first write of the day; there is no
@@ -456,11 +456,11 @@ func TestAlertsDNSContract(t *testing.T) {
 		"coalesce((SELECT value FROM crawler_counters",
 	} {
 		if !strings.Contains(dnsDailyCountersSQL, want) {
-			t.Errorf("dnsDailyCountersSQL без %q:\n%s", want, dnsDailyCountersSQL)
+			t.Errorf("dnsDailyCountersSQL without %q:\n%s", want, dnsDailyCountersSQL)
 		}
 	}
 	if strings.Contains(dnsDailyCountersSQL, "FROM domains") {
-		t.Errorf("dnsDailyCountersSQL читает domains — скан окна суток обязан исчезнуть (T-182):\n%s", dnsDailyCountersSQL)
+		t.Errorf("dnsDailyCountersSQL reads domains — the day-window scan must be gone (T-182):\n%s", dnsDailyCountersSQL)
 	}
 }
 
@@ -484,7 +484,7 @@ func TestAlertsDNSHysteresis(t *testing.T) {
 	for i, s := range steps {
 		got := m.transition(env.Alerts, ctx, obs(dnsShare{temp: s.daily.temp, total: s.daily.total}))
 		if got.Status != s.want {
-			t.Errorf("шаг %d (доля %d/%d): статус = %s (%s), want %s",
+			t.Errorf("step %d (share %d/%d): status = %s (%s), want %s",
 				i, s.daily.temp, s.daily.total, got.Status, got.Detail, s.want)
 		}
 	}
@@ -502,26 +502,26 @@ func TestAlertsDNSMinSamples(t *testing.T) {
 	env.pool.daily = []alertDNSDaily{{temp: 0, total: 0}}
 	s := snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("пустой счётчик: статус = %s (%s), want not_measured", s.Status, s.Detail)
+		t.Fatalf("an empty counter: status = %s (%s), want not_measured", s.Status, s.Detail)
 	}
 	if !strings.Contains(s.Detail, "0") || !strings.Contains(s.Detail, "100") {
-		t.Errorf("detail %q без чисел выборки", s.Detail)
+		t.Errorf("the detail %q has no sample numbers", s.Detail)
 	}
 
 	env.pool.daily = []alertDNSDaily{{temp: 2, total: 50}}
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("статус = %s (%s), want not_measured", s.Status, s.Detail)
+		t.Fatalf("status = %s (%s), want not_measured", s.Status, s.Detail)
 	}
 	if !strings.Contains(s.Detail, "50") || !strings.Contains(s.Detail, "100") {
-		t.Errorf("detail %q без чисел выборки", s.Detail)
+		t.Errorf("the detail %q has no sample numbers", s.Detail)
 	}
 
 	// Exactly the sample threshold — the share is computed (0 of 100 — a correct zero).
 	env.pool.daily = []alertDNSDaily{{temp: 0, total: 100}}
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "из 100") {
-		t.Errorf("ровно 100 проверок: статус = %s (%s), want ok с долей по 100", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "of 100") {
+		t.Errorf("exactly 100 checks: status = %s (%s), want ok with the share over 100", s.Status, s.Detail)
 	}
 }
 
@@ -529,23 +529,23 @@ func TestAlertsDNSMinSamples(t *testing.T) {
 // the next pass works (the loop keeps living).
 func TestAlertsDNSSourceError(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	env.pool.dailyErrs = []error{errors.New("бд недоступна")}
+	env.pool.dailyErrs = []error{errors.New("db unavailable")}
 
 	res := env.Pass(context.Background())
 	s := snapshotOf(t, res, AlertDNSErrors)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("статус = %s, want not_measured", s.Status)
+		t.Fatalf("status = %s, want not_measured", s.Status)
 	}
-	if !strings.Contains(s.Detail, "бд недоступна") {
-		t.Errorf("detail = %q, want причина ошибки источника", s.Detail)
+	if !strings.Contains(s.Detail, "db unavailable") {
+		t.Errorf("detail = %q, want the source error reason", s.Detail)
 	}
-	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "бд недоступна") {
-		t.Errorf("ошибка источника без Warn:\n%s", env.buf.String())
+	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "db unavailable") {
+		t.Errorf("a source error without a Warn:\n%s", env.buf.String())
 	}
 
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
 	if s.Status != AlertStatusOK {
-		t.Errorf("после ошибки статус = %s, want ok (цикл живёт)", s.Status)
+		t.Errorf("after the error status = %s, want ok (the loop lives)", s.Status)
 	}
 }
 
@@ -558,25 +558,25 @@ func TestAlertsDNSSourceErrors(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	env.pool.dailyEmpty = true
 	s := snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "пустой ответ") {
-		t.Errorf("пустой ответ: статус = %s (%s), want not_measured «пустой ответ»", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "empty response") {
+		t.Errorf("an empty response: status = %s (%s), want not_measured \"empty response\"", s.Status, s.Detail)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("пустой ответ без Warn:\n%s", env.buf.String())
+		t.Errorf("an empty response without a Warn:\n%s", env.buf.String())
 	}
 
 	env = newAlertsTestEnv(t, nil)
 	env.pool.dailyBadRow = true
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "чтение") {
-		t.Errorf("ошибка Scan: статус = %s (%s), want not_measured «чтение»", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "scan") {
+		t.Errorf("a Scan error: status = %s (%s), want not_measured \"scan\"", s.Status, s.Detail)
 	}
 
 	env = newAlertsTestEnv(t, nil)
-	env.pool.dailyRowsErr = errors.New("соединение сброшено")
+	env.pool.dailyRowsErr = errors.New("connection reset")
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDNSErrors)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "соединение сброшено") {
-		t.Errorf("rows.Err: статус = %s (%s), want not_measured с ошибкой итерации", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "connection reset") {
+		t.Errorf("rows.Err: status = %s (%s), want not_measured with the iteration error", s.Status, s.Detail)
 	}
 }
 
@@ -605,26 +605,26 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 	for i, s := range steps {
 		got := m.transition(env.Alerts, ctx, obs(s.lens))
 		if got.Status != s.want {
-			t.Errorf("шаг %d (%v): статус = %s (%s), want %s", i, s.lens, got.Status, got.Detail, s.want)
+			t.Errorf("step %d (%v): status = %s (%s), want %s", i, s.lens, got.Status, got.Detail, s.want)
 		}
 		// The hysteresis corridor (no hot stream): the detail names the
 		// holding stream and the depth, not an empty threshold string.
 		if i == 3 && !strings.Contains(got.Detail, "q:http=950") {
-			t.Errorf("коридор гистерезиса: detail = %q, want q:http=950", got.Detail)
+			t.Errorf("the hysteresis corridor: detail = %q, want q:http=950", got.Detail)
 		}
 		if i == 0 && !strings.Contains(got.Detail, "q:dns=0") {
-			t.Errorf("пустые очереди: detail = %q, want макс q:dns=0 (имя стрима, не пустота)", got.Detail)
+			t.Errorf("empty queues: detail = %q, want max q:dns=0 (a stream name, not emptiness)", got.Detail)
 		}
 	}
 
 	// The "ok" detail — the maximum among the working streams: the update in the loop
 	// (the leader is not the first stream) and the starting value (the leader being the first stream
 	// is read from the map, not as the zero of a neighbor).
-	if s := m.transition(env.Alerts, ctx, obs(map[string]int64{queue.StreamDNS: 3})); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "макс q:dns=3") {
-		t.Errorf("максимум q:dns: %s (%s), want ok макс q:dns=3", s.Status, s.Detail)
+	if s := m.transition(env.Alerts, ctx, obs(map[string]int64{queue.StreamDNS: 3})); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "max q:dns=3") {
+		t.Errorf("the q:dns maximum: %s (%s), want ok max q:dns=3", s.Status, s.Detail)
 	}
-	if s := m.transition(env.Alerts, ctx, obs(map[string]int64{queue.StreamHTTP: 5})); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "макс q:http=5") {
-		t.Errorf("максимум q:http: %s (%s), want ok макс q:http=5", s.Status, s.Detail)
+	if s := m.transition(env.Alerts, ctx, obs(map[string]int64{queue.StreamHTTP: 5})); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "max q:http=5") {
+		t.Errorf("the q:http maximum: %s (%s), want ok max q:http=5", s.Status, s.Detail)
 	}
 
 	// The queue alert does not poll q:dead even at a huge quarantine
@@ -638,11 +638,11 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 		}
 	}
 	if deadPolls == 0 {
-		t.Error("алерт queue_dead не опрашивает q:dead (протокол пуст)")
+		t.Error("the queue_dead alert does not poll q:dead (an empty protocol)")
 	}
 	// The detail of the fired step names the stream and the length.
 	if s := m.transition(env.Alerts, ctx, obs(map[string]int64{queue.StreamRender: 4242})); s.Status != AlertStatusFiring || !strings.Contains(s.Detail, "q:render=4242") {
-		t.Errorf("сработавший detail = %q (%s), want q:render=4242 firing", s.Detail, s.Status)
+		t.Errorf("the fired detail = %q (%s), want q:render=4242 firing", s.Detail, s.Status)
 	}
 }
 
@@ -651,20 +651,20 @@ func TestAlertsQueuesThresholds(t *testing.T) {
 func TestAlertsQueuesNotConfigured(t *testing.T) {
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 0 })
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertQueueOverflow); s.Status != AlertStatusNotMeasured {
-		t.Errorf("watermark 0: статус = %s, want not_measured", s.Status)
+		t.Errorf("watermark 0: status = %s, want not_measured", s.Status)
 	}
 
 	env = newAlertsTestEnv(t, nil)
 	env.deps.Redis = nil
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertQueueOverflow); s.Status != AlertStatusNotMeasured {
-		t.Errorf("без Redis: статус = %s, want not_measured", s.Status)
+		t.Errorf("without Redis: status = %s, want not_measured", s.Status)
 	}
 
 	// A threshold of 1 — the minimal valid watermark (a stream of length 1), not
 	// "not set": the alert is measured.
 	env = newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 1 })
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertQueueOverflow); s.Status != AlertStatusOK {
-		t.Errorf("watermark 1: статус = %s (%s), want ok — порог валиден", s.Status, s.Detail)
+		t.Errorf("watermark 1: status = %s (%s), want ok — the threshold is valid", s.Status, s.Detail)
 	}
 }
 
@@ -676,10 +676,10 @@ func TestAlertsQueuesSourceError(t *testing.T) {
 
 	s := snapshotOf(t, env.Pass(context.Background()), AlertQueueOverflow)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("статус = %s, want not_measured", s.Status)
+		t.Fatalf("status = %s, want not_measured", s.Status)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "connection refused") {
-		t.Errorf("ошибка Redis без Warn:\n%s", env.buf.String())
+		t.Errorf("a Redis error without a Warn:\n%s", env.buf.String())
 	}
 }
 
@@ -709,7 +709,7 @@ func TestAlertsDeadEpisode(t *testing.T) {
 	for i, s := range steps {
 		got := m.transition(env.Alerts, ctx, obs(s.dead))
 		if got.Status != s.want {
-			t.Errorf("шаг %d (q:dead=%d): статус = %s (%s), want %s", i, s.dead, got.Status, got.Detail, s.want)
+			t.Errorf("step %d (q:dead=%d): status = %s (%s), want %s", i, s.dead, got.Status, got.Detail, s.want)
 		}
 	}
 	// The detail with the depth and the pass counter (a cross-check with the bury counter):
@@ -717,7 +717,7 @@ func TestAlertsDeadEpisode(t *testing.T) {
 	got := m.transition(env.Alerts, ctx, obs(int64(12)))
 	for _, want := range []string{"q:dead=12", "2/3", "crawler_queue_dead_buried_total"} {
 		if !strings.Contains(got.Detail, want) {
-			t.Errorf("detail %q не содержит %q", got.Detail, want)
+			t.Errorf("the detail %q does not contain %q", got.Detail, want)
 		}
 	}
 
@@ -728,23 +728,23 @@ func TestAlertsDeadEpisode(t *testing.T) {
 		env.lener.lens = map[string]int64{queue.StreamDead: 9}
 		env.Pass(ctx)
 	}
-	if n := strings.Count(env.buf.String(), "АЛЕРТ: мертвые задачи в q:dead"); n != 1 {
-		t.Errorf("Warn срабатывания = %d, want 1:\n%s", n, env.buf.String())
+	if n := strings.Count(env.buf.String(), "ALERT: dead tasks in q:dead"); n != 1 {
+		t.Errorf("the firing Warn count = %d, want 1:\n%s", n, env.buf.String())
 	}
 	env.lener.lens = map[string]int64{queue.StreamDead: 9}
 	if got := snapshotOf(t, env.Pass(ctx), AlertQueueDead); got.Status != AlertStatusFiring {
-		t.Fatalf("устойчивое срабатывание: %s, want firing", got.Status)
+		t.Fatalf("a sustained firing: %s, want firing", got.Status)
 	}
 	before := env.buf.String()
 	env.lener.lens = map[string]int64{}
 	s := snapshotOf(t, env.Pass(ctx), AlertQueueDead)
 	if s.Status != AlertStatusOK {
-		t.Fatalf("пустой карантин: %s, want ok", s.Status)
+		t.Fatalf("an empty quarantine: %s, want ok", s.Status)
 	}
 	if delta := env.buf.String()[len(before):]; strings.Contains(delta, "level=WARN") {
-		t.Errorf("снятие дало Warn:\n%s", delta)
-	} else if !strings.Contains(delta, "level=INFO") || !strings.Contains(delta, "алерт снят") {
-		t.Errorf("снятие без Info:\n%s", delta)
+		t.Errorf("the clearing produced a Warn:\n%s", delta)
+	} else if !strings.Contains(delta, "level=INFO") || !strings.Contains(delta, "alert cleared") {
+		t.Errorf("a clearing without Info:\n%s", delta)
 	}
 }
 
@@ -755,7 +755,7 @@ func TestAlertsDeadDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	env.deps.Redis = nil
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertQueueDead); s.Status != AlertStatusNotMeasured {
-		t.Errorf("без Redis: статус = %s, want not_measured", s.Status)
+		t.Errorf("without Redis: status = %s, want not_measured", s.Status)
 	}
 
 	ctx := context.Background()
@@ -771,20 +771,20 @@ func TestAlertsDeadDegradation(t *testing.T) {
 	}
 	s := snapshotOf(t, env.Pass(ctx), AlertQueueDead)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("ошибка чтения: статус = %s, want not_measured", s.Status)
+		t.Fatalf("a read error: status = %s, want not_measured", s.Status)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "connection refused") {
-		t.Errorf("ошибка чтения q:dead без Warn:\n%s", env.buf.String())
+		t.Errorf("a q:dead read error without a Warn:\n%s", env.buf.String())
 	}
 
 	// An error between observations does not zero the series: two observations,
 	// a failure in the middle, a third live one — firing (3 of 3 observations).
 	env.lener.errs = nil
 	if s := snapshotOf(t, env.Pass(ctx), AlertQueueDead); s.Status != AlertStatusOK {
-		t.Fatalf("первое живое наблюдение: %s, want ok (1/3)", s.Status)
+		t.Fatalf("the first live observation: %s, want ok (1/3)", s.Status)
 	}
 	if s := snapshotOf(t, env.Pass(ctx), AlertQueueDead); s.Status != AlertStatusOK {
-		t.Fatalf("второе живое наблюдение: %s, want ok (2/3)", s.Status)
+		t.Fatalf("the second live observation: %s, want ok (2/3)", s.Status)
 	}
 	env.lener.errs = []error{
 		errors.New("connection refused"), errors.New("connection refused"),
@@ -792,11 +792,11 @@ func TestAlertsDeadDegradation(t *testing.T) {
 		errors.New("connection refused"),
 	}
 	if s := snapshotOf(t, env.Pass(ctx), AlertQueueDead); s.Status != AlertStatusNotMeasured {
-		t.Fatalf("сбой посередине серии: %s, want not_measured", s.Status)
+		t.Fatalf("a failure in the middle of the series: %s, want not_measured", s.Status)
 	}
 	env.lener.errs = nil
 	if s := snapshotOf(t, env.Pass(ctx), AlertQueueDead); s.Status != AlertStatusFiring {
-		t.Fatalf("третье наблюдение после сбоя: %s, want firing (серия сохранена)", s.Status)
+		t.Fatalf("the third observation after the failure: %s, want firing (the series survived)", s.Status)
 	}
 }
 
@@ -824,14 +824,14 @@ func TestAlertsRedisMemoryThreshold(t *testing.T) {
 	for i, s := range steps {
 		got := m.transition(env.Alerts, ctx, obs(RedisMemory{UsedBytes: s.used, MaxBytes: max, Policy: "noeviction"}))
 		if got.Status != s.want {
-			t.Errorf("шаг %d (used %d из %d): статус = %s (%s), want %s", i, s.used, max, got.Status, got.Detail, s.want)
+			t.Errorf("step %d (used %d of %d): status = %s (%s), want %s", i, s.used, max, got.Status, got.Detail, s.want)
 		}
 	}
 	// The detail with absolutes, the share and the policy.
 	s := m.transition(env.Alerts, ctx, obs(RedisMemory{UsedBytes: 800, MaxBytes: 1000, Policy: "noeviction"}))
 	if s.Status != AlertStatusFiring ||
 		!strings.Contains(s.Detail, "80.0%") || !strings.Contains(s.Detail, "noeviction") {
-		t.Errorf("detail = %q (%s), want firing с долей 80.0%% и политикой", s.Detail, s.Status)
+		t.Errorf("detail = %q (%s), want firing with the 80.0%% share and the policy", s.Detail, s.Status)
 	}
 }
 
@@ -842,24 +842,24 @@ func TestAlertsRedisMemoryDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	env.deps.RedisMemory = nil
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertRedisMemory); s.Status != AlertStatusNotMeasured {
-		t.Errorf("без источника: статус = %s, want not_measured", s.Status)
+		t.Errorf("without a source: status = %s, want not_measured", s.Status)
 	}
 
 	env = newAlertsTestEnv(t, nil)
 	env.redisMem.mem = RedisMemory{UsedBytes: 1 << 20, MaxBytes: 0, Policy: "noeviction"}
 	s := snapshotOf(t, env.Pass(context.Background()), AlertRedisMemory)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "maxmemory=0") {
-		t.Errorf("maxmemory 0: %s (%s), want not_measured «без потолка»", s.Status, s.Detail)
+		t.Errorf("maxmemory 0: %s (%s), want not_measured \"no cap\"", s.Status, s.Detail)
 	}
 
 	env = newAlertsTestEnv(t, nil)
 	env.redisMem.errs = []error{errors.New("connection refused")}
 	s = snapshotOf(t, env.Pass(context.Background()), AlertRedisMemory)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("ошибка INFO: статус = %s, want not_measured", s.Status)
+		t.Fatalf("an INFO error: status = %s, want not_measured", s.Status)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "connection refused") {
-		t.Errorf("ошибка INFO без Warn:\n%s", env.buf.String())
+		t.Errorf("an INFO error without a Warn:\n%s", env.buf.String())
 	}
 }
 
@@ -876,34 +876,34 @@ func TestAlertsStallThreshold(t *testing.T) {
 	at := func(age time.Duration) observation[time.Time] { return obs(now.Add(-age)) }
 
 	if s := m.transition(env.Alerts, ctx, at(60*time.Second)); s.Status != AlertStatusOK {
-		t.Errorf("60с: статус = %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("60s: status = %s (%s), want ok", s.Status, s.Detail)
 	}
 
 	// Between 4 and 5 periods (250 s at a 5×60 s threshold) — ok: it pins the
 	// threshold factor, not "one of the neighboring ones".
 	if s := m.transition(env.Alerts, ctx, at(250*time.Second)); s.Status != AlertStatusOK {
-		t.Errorf("250с: статус = %s (%s), want ok (порог 5, не 4 периода)", s.Status, s.Detail)
+		t.Errorf("250s: status = %s (%s), want ok (the threshold is 5, not 4 periods)", s.Status, s.Detail)
 	}
 
 	// Exactly the threshold (300 s = 5 × 60 s) — not a stall yet: strictly greater.
 	if s := m.transition(env.Alerts, ctx, at(5*time.Minute)); s.Status != AlertStatusOK {
-		t.Errorf("ровно 300с: статус = %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("exactly 300s: status = %s (%s), want ok", s.Status, s.Detail)
 	}
 
 	s := m.transition(env.Alerts, ctx, at(301*time.Second))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("301с: статус = %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("301s: status = %s (%s), want firing", s.Status, s.Detail)
 	}
 	for _, want := range []string{"5m1s", "5", "1m0s"} { // age, factor, period
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail %q не содержит %s", s.Detail, want)
+			t.Errorf("the detail %q does not contain %s", s.Detail, want)
 		}
 	}
 
 	// No zones (NULL) — not measured: an observation with a reason.
 	if s := m.transition(env.Alerts, ctx,
-		obsReason[time.Time]("справочник зон пуст — прогресс не отслеживается")); s.Status != AlertStatusNotMeasured {
-		t.Errorf("без зон: статус = %s, want not_measured", s.Status)
+		obsReason[time.Time]("the zone reference table is empty — progress is not tracked")); s.Status != AlertStatusNotMeasured {
+		t.Errorf("without zones: status = %s, want not_measured", s.Status)
 	}
 }
 
@@ -912,34 +912,34 @@ func TestAlertsStallThreshold(t *testing.T) {
 // "not measured" with a reason, the alert loop keeps living.
 func TestAlertsStallSourceErrors(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	env.pool.freshErrs = []error{errors.New("бд недоступна")}
+	env.pool.freshErrs = []error{errors.New("db unavailable")}
 	s := snapshotOf(t, env.Pass(context.Background()), AlertProgressStall)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "бд недоступна") {
-		t.Errorf("ошибка запроса: статус = %s (%s), want not_measured с ошибкой", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "db unavailable") {
+		t.Errorf("a query error: status = %s (%s), want not_measured with the error", s.Status, s.Detail)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("ошибка запроса без Warn:\n%s", env.buf.String())
+		t.Errorf("a query error without a Warn:\n%s", env.buf.String())
 	}
 
 	env = newAlertsTestEnv(t, nil)
 	env.pool.freshEmpty = true
 	s = snapshotOf(t, env.Pass(context.Background()), AlertProgressStall)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "пустой ответ") {
-		t.Errorf("пустой ответ: статус = %s (%s), want not_measured «пустой ответ»", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "empty response") {
+		t.Errorf("an empty response: status = %s (%s), want not_measured \"empty response\"", s.Status, s.Detail)
 	}
 
 	env = newAlertsTestEnv(t, nil)
 	env.pool.freshBadRow = true
 	s = snapshotOf(t, env.Pass(context.Background()), AlertProgressStall)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "чтение") {
-		t.Errorf("ошибка Scan: статус = %s (%s), want not_measured «чтение»", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "scan") {
+		t.Errorf("a Scan error: status = %s (%s), want not_measured \"scan\"", s.Status, s.Detail)
 	}
 
 	env = newAlertsTestEnv(t, nil)
-	env.pool.freshRowsErr = errors.New("соединение сброшено")
+	env.pool.freshRowsErr = errors.New("connection reset")
 	s = snapshotOf(t, env.Pass(context.Background()), AlertProgressStall)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "соединение сброшено") {
-		t.Errorf("rows.Err: статус = %s (%s), want not_measured с ошибкой итерации", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "connection reset") {
+		t.Errorf("rows.Err: status = %s (%s), want not_measured with the iteration error", s.Status, s.Detail)
 	}
 }
 
@@ -952,7 +952,7 @@ func TestAlertsStallDefaultInterval(t *testing.T) {
 	env.pool.fresh = []sql.NullTime{{Time: now.Add(-2 * time.Hour), Valid: true}}
 
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertProgressStall); s.Status != AlertStatusOK {
-		t.Errorf("2ч при дефолтных 5×30м: статус = %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("2h at the default 5×30m: status = %s (%s), want ok", s.Status, s.Detail)
 	}
 }
 
@@ -977,16 +977,16 @@ func TestAlertsDivergedIntervals(t *testing.T) {
 	env.pool.fresh = []sql.NullTime{{Time: now.Add(-2 * time.Hour), Valid: true}}
 	s := snapshotOf(t, env.Pass(ctx), AlertProgressStall)
 	if s.Status != AlertStatusOK {
-		t.Errorf("2ч при реконсиляции 30м: статус = %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("2h at a 30m reconciliation: status = %s (%s), want ok", s.Status, s.Detail)
 	}
 	if !strings.Contains(s.Detail, "2h30m0s") { // a threshold of 5 × 30m
-		t.Errorf("detail %q не содержит порог 2h30m0s (5 × zone_stats_interval)", s.Detail)
+		t.Errorf("the detail %q does not contain the threshold 2h30m0s (5 × zone_stats_interval)", s.Detail)
 	}
 
 	// 2h 31 min — behind the 2.5h threshold.
 	env.pool.fresh = []sql.NullTime{{Time: now.Add(-151 * time.Minute), Valid: true}}
 	if s := snapshotOf(t, env.Pass(ctx), AlertProgressStall); s.Status != AlertStatusFiring {
-		t.Errorf("151м при реконсиляции 30м: статус = %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("151m at a 30m reconciliation: status = %s (%s), want firing", s.Status, s.Detail)
 	}
 
 	// The bad_hashes window — from the alert interval: 15 × 5 min = 1h15m.
@@ -997,13 +997,13 @@ func TestAlertsDivergedIntervals(t *testing.T) {
 	src.set(10)                                  // a single delta of exactly 10
 	s = snapshotOf(t, env.Pass(ctx), AlertBadHashes)
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("сумма 10: статус = %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("a sum of 10: status = %s (%s), want firing", s.Status, s.Detail)
 	}
 	if !strings.Contains(s.Detail, "1h15m0s") {
-		t.Errorf("detail %q не содержит окно 1h15m0s (15 × alerts_interval 5м)", s.Detail)
+		t.Errorf("the detail %q does not contain the window 1h15m0s (15 × alerts_interval 5m)", s.Detail)
 	}
 	if strings.Contains(s.Detail, "7h") {
-		t.Errorf("detail %q содержит окно от 30-мин интервала (7h30m) — окно не отвязано", s.Detail)
+		t.Errorf("the detail %q contains the window of the 30-minute interval (7h30m) — the window is not decoupled", s.Detail)
 	}
 }
 
@@ -1018,28 +1018,28 @@ func TestAlertsDiskThreshold(t *testing.T) {
 
 	s := m.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 4 << 30, Total: 100 << 30})) // 4.0 %
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("4%%: статус = %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("4%%: status = %s (%s), want firing", s.Status, s.Detail)
 	}
 	if !strings.Contains(s.Detail, "4.0%") || !strings.Contains(s.Detail, "5.0%") {
-		t.Errorf("detail %q без доли/порога", s.Detail)
+		t.Errorf("the detail %q has no share/threshold", s.Detail)
 	}
 
 	// Exactly the threshold — not less.
 	if s := m.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 5 << 30, Total: 100 << 30})); s.Status != AlertStatusOK {
-		t.Errorf("ровно порог: статус = %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("exactly the threshold: status = %s (%s), want ok", s.Status, s.Detail)
 	}
 
 	// A threshold of 1% — the minimal valid check, not "off".
 	env = newAlertsTestEnv(t, func(o *AlertsOptions) { o.DiskFreePercent = 1 })
 	m = env.newDiskMachine()
 	if s := m.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 100 << 30, Total: 200 << 30})); s.Status != AlertStatusOK {
-		t.Errorf("порог 1%%: статус = %s (%s), want ok — контроль включён", s.Status, s.Detail)
+		t.Errorf("threshold 1%%: status = %s (%s), want ok — the monitoring is on", s.Status, s.Detail)
 	}
 
 	// The factor 100: 100 free of 10100 bytes — 0.99…% < 1 — an alert;
 	// 101·Avail/Total would give exactly 1.0% and clear the alert.
 	if s := m.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 100, Total: 10100})); s.Status != AlertStatusFiring {
-		t.Errorf("100 из 10100 байт: статус = %s (%s), want firing (0.99%% < 1%%)", s.Status, s.Detail)
+		t.Errorf("100 of 10100 bytes: status = %s (%s), want firing (0.99%% < 1%%)", s.Status, s.Detail)
 	}
 }
 
@@ -1048,28 +1048,28 @@ func TestAlertsDiskThreshold(t *testing.T) {
 func TestAlertsDiskDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.DiskFreePercent = 0 })
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertDiskFree); s.Status != AlertStatusNotMeasured {
-		t.Errorf("контроль выключен: статус = %s, want not_measured", s.Status)
+		t.Errorf("the monitoring is off: status = %s, want not_measured", s.Status)
 	}
 
 	env = newAlertsTestEnv(t, func(o *AlertsOptions) { o.ContentDir = "" })
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertDiskFree); s.Status != AlertStatusNotMeasured {
-		t.Errorf("без каталога: статус = %s, want not_measured", s.Status)
+		t.Errorf("without a directory: status = %s, want not_measured", s.Status)
 	}
 
 	env = newAlertsTestEnv(t, nil)
 	env.space.stat = SpaceStat{Avail: 1 << 30, Total: 0}
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertDiskFree); s.Status != AlertStatusNotMeasured {
-		t.Errorf("total=0: статус = %s, want not_measured", s.Status)
+		t.Errorf("total=0: status = %s, want not_measured", s.Status)
 	}
 
 	env = newAlertsTestEnv(t, nil)
 	env.space.err = errors.New("no such file or directory")
 	s := snapshotOf(t, env.Pass(context.Background()), AlertDiskFree)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("ошибка statfs: статус = %s, want not_measured", s.Status)
+		t.Fatalf("a statfs error: status = %s, want not_measured", s.Status)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("ошибка statfs без Warn:\n%s", env.buf.String())
+		t.Errorf("a statfs error without a Warn:\n%s", env.buf.String())
 	}
 }
 
@@ -1084,10 +1084,10 @@ func TestAlertsNVMeWear(t *testing.T) {
 
 	s := m.transition(env.Alerts, ctx, obs([]NVMeWear{{Device: "nvme0", PercentUsed: 90, DataUnitsWritten: 200_000_000}}))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("90%%: статус = %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("90%%: status = %s (%s), want firing", s.Status, s.Detail)
 	}
-	if !strings.Contains(s.Detail, "nvme0=90%") || !strings.Contains(s.Detail, "ТБ") {
-		t.Errorf("detail %q без устройства/TBW", s.Detail)
+	if !strings.Contains(s.Detail, "nvme0=90%") || !strings.Contains(s.Detail, "TB") {
+		t.Errorf("the detail %q has no device/TBW", s.Detail)
 	}
 
 	s = m.transition(env.Alerts, ctx, obs([]NVMeWear{
@@ -1095,21 +1095,21 @@ func TestAlertsNVMeWear(t *testing.T) {
 		{Device: "nvme1", PercentUsed: 89}, // the worst, but below the threshold
 	}))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "nvme1") || !strings.Contains(s.Detail, "89%") {
-		t.Errorf("89%%: статус = %s (%s), want ok по худшему nvme1", s.Status, s.Detail)
+		t.Errorf("89%%: status = %s (%s), want ok by the worst nvme1", s.Status, s.Detail)
 	}
 
 	// A new drive (0%): the starting value is the first device;
 	// the detail names the name, not an empty string.
 	s = m.transition(env.Alerts, ctx, obs([]NVMeWear{{Device: "nvme0", PercentUsed: 0}}))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "nvme0") || !strings.Contains(s.Detail, "0%") {
-		t.Errorf("0%%: статус = %s (%s), want ok с именем nvme0", s.Status, s.Detail)
+		t.Errorf("0%%: status = %s (%s), want ok with the nvme0 name", s.Status, s.Detail)
 	}
 
 	// An empty list (the source is alive, no devices) — "not measured",
 	// not a panic on the first element.
-	s = m.transition(env.Alerts, ctx, obsReason[[]NVMeWear]("NVMe-устройства не найдены"))
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "не найдены") {
-		t.Errorf("без устройств: статус = %s (%s), want not_measured", s.Status, s.Detail)
+	s = m.transition(env.Alerts, ctx, obsReason[[]NVMeWear]("no NVMe devices found"))
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "not found") {
+		t.Errorf("without devices: status = %s (%s), want not_measured", s.Status, s.Detail)
 	}
 
 	// Equal wear of two devices: the worst is the first (the replacement is strictly on
@@ -1118,15 +1118,15 @@ func TestAlertsNVMeWear(t *testing.T) {
 		{Device: "nvme0", PercentUsed: 50},
 		{Device: "nvme1", PercentUsed: 50},
 	}))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "nvme0: использовано 50%") {
-		t.Errorf("равный износ: %s (%s), want ok по первому nvme0", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "nvme0: 50% of the rated lifespan used") {
+		t.Errorf("equal wear: %s (%s), want ok by the first nvme0", s.Status, s.Detail)
 	}
 
 	// An empty list via a full pass (observeWear: the source is alive,
 	// no devices) — the same "not measured" without a panic.
 	env.wear.wears = nil
-	if s := snapshotOf(t, env.Pass(ctx), AlertNVMeWear); s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "не найдены") {
-		t.Errorf("без устройств (полный проход): статус = %s (%s), want not_measured «не найдены»", s.Status, s.Detail)
+	if s := snapshotOf(t, env.Pass(ctx), AlertNVMeWear); s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "not found") {
+		t.Errorf("without devices (a full pass): status = %s (%s), want not_measured \"not found\"", s.Status, s.Detail)
 	}
 }
 
@@ -1134,17 +1134,17 @@ func TestAlertsNVMeWear(t *testing.T) {
 // measured" without a Warn — an expected state, not an incident; the transition — Debug.
 func TestAlertsNVMeDegradationQuiet(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
-	env.wear.err = errors.New("SMART недоступен: nvme0: permission denied")
+	env.wear.err = errors.New("SMART unavailable: nvme0: permission denied")
 
 	s := snapshotOf(t, env.Pass(context.Background()), AlertNVMeWear)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("статус = %s, want not_measured", s.Status)
+		t.Fatalf("status = %s, want not_measured", s.Status)
 	}
 	if strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("деградация SMART дала Warn:\n%s", env.buf.String())
+		t.Errorf("the SMART degradation produced a Warn:\n%s", env.buf.String())
 	}
-	if !strings.Contains(env.buf.String(), "не измеряется") { // the Debug transition
-		t.Errorf("переход в «не измеряется» не залогирован:\n%s", env.buf.String())
+	if !strings.Contains(env.buf.String(), "not measured") { // the Debug transition
+		t.Errorf("the transition to \"not measured\" is not logged:\n%s", env.buf.String())
 	}
 }
 
@@ -1160,21 +1160,21 @@ func TestAlertsTransitionsLogging(t *testing.T) {
 	// clearing, a sustained "ok" (silent).
 	env.pool.daily = []alertDNSDaily{{temp: 500, total: 1000}, {temp: 500, total: 1000}, {temp: 0, total: 1000}, {temp: 0, total: 1000}}
 	env.Pass(ctx) // firing
-	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "АЛЕРТ: рост доли ошибок DNS") {
-		t.Errorf("срабатывание без Warn-записи:\n%s", env.buf.String())
+	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "ALERT: DNS error share growth") {
+		t.Errorf("a firing without a Warn entry:\n%s", env.buf.String())
 	}
 
 	// A sustained firing — silent: the signal is front-loaded; a repeated Warn
 	// in the same state is not written.
 	beforeHold := env.buf.String()
 	env.Pass(ctx)
-	if delta := env.buf.String()[len(beforeHold):]; strings.Contains(delta, "level=WARN") || strings.Contains(delta, "АЛЕРТ") {
-		t.Errorf("устойчивое срабатывание повторило Warn:\n%s", delta)
+	if delta := env.buf.String()[len(beforeHold):]; strings.Contains(delta, "level=WARN") || strings.Contains(delta, "ALERT") {
+		t.Errorf("a sustained firing repeated the Warn:\n%s", delta)
 	}
 
 	env.Pass(ctx) // clearing
-	if !strings.Contains(env.buf.String(), "level=INFO") || !strings.Contains(env.buf.String(), "алерт снят") {
-		t.Errorf("снятие без Info-записи:\n%s", env.buf.String())
+	if !strings.Contains(env.buf.String(), "level=INFO") || !strings.Contains(env.buf.String(), "alert cleared") {
+		t.Errorf("a clearing without an Info entry:\n%s", env.buf.String())
 	}
 
 	// A sustained state — silent: a repeated pass without a status change does not
@@ -1183,7 +1183,7 @@ func TestAlertsTransitionsLogging(t *testing.T) {
 	before := env.buf.String()
 	env.Pass(ctx)
 	if delta := env.buf.String()[len(before):]; strings.Contains(delta, "level=WARN") || strings.Contains(delta, "level=INFO") {
-		t.Errorf("повторный тихий проход добавил Warn/Info:\n%s", delta)
+		t.Errorf("a repeated quiet pass added a Warn/Info:\n%s", delta)
 	}
 
 	// A fired alert going to "not measured" (a source failure):
@@ -1191,15 +1191,15 @@ func TestAlertsTransitionsLogging(t *testing.T) {
 	// Before the failure the alert fires again — the transition is exactly from firing.
 	env.pool.daily = []alertDNSDaily{{temp: 500, total: 1000}}
 	env.Pass(ctx)
-	if !strings.Contains(env.buf.String(), "АЛЕРТ: рост доли ошибок DNS") {
-		t.Fatalf("повторное срабатывание не залогировано:\n%s", env.buf.String())
+	if !strings.Contains(env.buf.String(), "ALERT: DNS error share growth") {
+		t.Fatalf("a re-firing is not logged:\n%s", env.buf.String())
 	}
 	before2 := env.buf.String()
-	env.pool.dailyErrs = []error{errors.New("бд недоступна")}
+	env.pool.dailyErrs = []error{errors.New("db unavailable")}
 	env.Pass(ctx)
 	delta2 := env.buf.String()[len(before2):]
-	if !strings.Contains(delta2, "сработавший алерт больше не измеряется") || !strings.Contains(delta2, "level=INFO") {
-		t.Errorf("firing→not_measured без Info:\n%s", delta2)
+	if !strings.Contains(delta2, "firing alert no longer measured") || !strings.Contains(delta2, "level=INFO") {
+		t.Errorf("firing→not_measured without Info:\n%s", delta2)
 	}
 }
 
@@ -1221,7 +1221,7 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if len(passes) != 1 {
-		t.Fatalf("OnPass вызовов = %d, want 1", len(passes))
+		t.Fatalf("OnPass calls = %d, want 1", len(passes))
 	}
 	wantNames := []string{AlertDNSErrors, AlertQueueOverflow, AlertProgressStall, AlertDiskFree,
 		AlertDiskMin, AlertDiskCrit, AlertNVMeWear, AlertBadHashes, AlertUnitOOM, AlertMemHigh,
@@ -1229,15 +1229,15 @@ func TestAlertsOnPassSnapshot(t *testing.T) {
 		AlertRenderFbDepth, AlertRenderFbBudget, AlertRenderBrowserErr, AlertDomainsStale,
 		AlertRedisRestart}
 	if len(res.Alerts) != len(wantNames) {
-		t.Fatalf("алертов в снапшоте = %d, want %d", len(res.Alerts), len(wantNames))
+		t.Fatalf("alerts in the snapshot = %d, want %d", len(res.Alerts), len(wantNames))
 	}
 	for i, name := range wantNames {
 		if res.Alerts[i].Name != name {
-			t.Errorf("снапшот[%d] = %s, want %s", i, res.Alerts[i].Name, name)
+			t.Errorf("snapshot[%d] = %s, want %s", i, res.Alerts[i].Name, name)
 		}
 	}
 	if firing := res.Firing(); len(firing) != 1 || firing[0].Name != AlertDNSErrors {
-		t.Errorf("Firing() = %+v, want один dns_temp_error_share", firing)
+		t.Errorf("Firing() = %+v, want one dns_temp_error_share", firing)
 	}
 }
 
@@ -1258,17 +1258,17 @@ func TestAlertsOptionsDefaults(t *testing.T) {
 
 	neg := AlertsOptions{Interval: -time.Second, ZoneStatsInterval: -time.Second}.withDefaults()
 	if neg.Interval != 5*time.Minute || neg.ZoneStatsInterval != DefaultZoneStatsInterval {
-		t.Errorf("отрицательные периоды: %+v, want дефолты", neg)
+		t.Errorf("negative periods: %+v, want the defaults", neg)
 	}
 
 	one := AlertsOptions{Interval: 1, ZoneStatsInterval: 1}.withDefaults()
 	if one.Interval != 1 || one.ZoneStatsInterval != 1 {
-		t.Errorf("единичные периоды затёрты: %+v, want как заданы", one)
+		t.Errorf("unit periods overwritten: %+v, want as set", one)
 	}
 
 	got := AlertsOptions{Interval: 30 * time.Second, ZoneStatsInterval: 45 * time.Second}.withDefaults()
 	if got.Interval != 30*time.Second || got.ZoneStatsInterval != 45*time.Second {
-		t.Errorf("withDefaults затирает заданные: %+v", got)
+		t.Errorf("withDefaults overwrites the set values: %+v", got)
 	}
 
 	a := NewAlerts(AlertsDeps{Pool: &alertsPool{}}, AlertsOptions{})
@@ -1279,7 +1279,7 @@ func TestAlertsOptionsDefaults(t *testing.T) {
 		t.Errorf("Wear = %T, want OSWear", a.deps.Wear)
 	}
 	if a.now == nil || a.log == nil {
-		t.Error("NewAlerts оставил nil часов/логгера")
+		t.Error("NewAlerts left a nil clock/logger")
 	}
 }
 
@@ -1295,10 +1295,10 @@ func TestOSStatfsSpace(t *testing.T) {
 		t.Fatalf("Space: %v", err)
 	}
 	if sp.Total < 1<<20 || sp.Avail < 1<<20 {
-		t.Errorf("статистика без умножения на Bsize (блоки вместо байт): %+v", sp)
+		t.Errorf("the statistics without the Bsize multiplication (blocks instead of bytes): %+v", sp)
 	}
-	if _, err := (OSStatfs{}).Space(filepath.Join(t.TempDir(), "нет-такого")); err == nil {
-		t.Error("несуществующий каталог: ошибки нет")
+	if _, err := (OSStatfs{}).Space(filepath.Join(t.TempDir(), "no-such")); err == nil {
+		t.Error("a non-existent directory: no error")
 	}
 }
 
@@ -1315,30 +1315,30 @@ func TestParseHealthLog(t *testing.T) {
 		t.Fatalf("parseHealthLog: %v", err)
 	}
 	if percent != 42 {
-		t.Errorf("percentage_used = %d, want 42 (байт 5)", percent)
+		t.Errorf("percentage_used = %d, want 42 (byte 5)", percent)
 	}
 	if units != 195_312_500 {
-		t.Errorf("data units written = %d, want 195312500 (байты 48–63 LE)", units)
+		t.Errorf("data units written = %d, want 195312500 (bytes 48–63 LE)", units)
 	}
 	// Exactly 100.0 TB: the product and the division are exact in float64 (195312500 ×
 	// 512000 = 1e14 < 2^53; the quotient 100 is exactly representable) — mutations
 	// of the coefficients (±1 per data unit, ±1 per trillion) are caught
 	// by the exact equality.
 	if tbw := nvmeTBW(NVMeWear{DataUnitsWritten: units}); tbw != 100 {
-		t.Errorf("TBW = %v, want ровно 100 ТБ", tbw)
+		t.Errorf("TBW = %v, want exactly 100 TB", tbw)
 	}
 
 	// A new drive: zero wear decodes as is.
 	zero := make([]byte, nvmeHealthLogSize)
 	if percent, _, _ := parseHealthLog(zero); percent != 0 {
-		t.Errorf("нулевой износ = %d, want 0", percent)
+		t.Errorf("zero wear = %d, want 0", percent)
 	}
 
 	// Values >100% are valid (the lifespan is exhausted) and are not truncated.
 	over := make([]byte, nvmeHealthLogSize)
 	over[5] = 253
 	if percent, _, _ := parseHealthLog(over); percent != 253 {
-		t.Errorf("износ >100%% = %d, want 253", percent)
+		t.Errorf("wear >100%% = %d, want 253", percent)
 	}
 
 	// The page size is fixed by the protocol — 512 bytes: literals (not the
@@ -1348,19 +1348,19 @@ func TestParseHealthLog(t *testing.T) {
 	full[5] = 7
 	binary.LittleEndian.PutUint64(full[48:56], 9)
 	if percent, u, err := parseHealthLog(full); err != nil || percent != 7 || u != 9 {
-		t.Errorf("страница 512 байт: (%d, %d, %v), want (7, 9, nil)", percent, u, err)
+		t.Errorf("a 512-byte page: (%d, %d, %v), want (7, 9, nil)", percent, u, err)
 	}
 	if _, _, err := parseHealthLog(make([]byte, 511)); err == nil {
-		t.Error("страница 511 байт: ошибки нет, want короткая страница")
+		t.Error("a 511-byte page: no error, want a short page")
 	}
 
 	// A short buffer — an error and zero return values.
 	pct, u, err := parseHealthLog(page[:nvmeHealthLogSize-1])
 	if err == nil {
-		t.Error("короткий буфер: ошибки нет")
+		t.Error("a short buffer: no error")
 	}
 	if pct != 0 || u != 0 {
-		t.Errorf("короткий буфер: (%d, %d), want нули при ошибке", pct, u)
+		t.Errorf("a short buffer: (%d, %d), want zeros on error", pct, u)
 	}
 }
 
@@ -1371,8 +1371,8 @@ func TestOSWearDegradation(t *testing.T) {
 
 	// sysfs without class/nvme — no NVMe at all.
 	_, err := OSWear{SysFS: root, DevFS: root}.Wear(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "не обнаружены") {
-		t.Errorf("пустой sysfs: ошибка = %v, want «не обнаружены»", err)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("an empty sysfs: error = %v, want \"not found\"", err)
 	}
 
 	// sysfs sees the controller (as in a container: the host sysfs), but the /dev node
@@ -1381,8 +1381,8 @@ func TestOSWearDegradation(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = OSWear{SysFS: root, DevFS: filepath.Join(root, "dev")}.Wear(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "SMART недоступен") || !strings.Contains(err.Error(), "nvme0") {
-		t.Errorf("недоступный /dev: ошибка = %v, want деградация с nvme0", err)
+	if err == nil || !strings.Contains(err.Error(), "SMART unavailable") || !strings.Contains(err.Error(), "nvme0") {
+		t.Errorf("an unavailable /dev: error = %v, want a degradation with nvme0", err)
 	}
 
 	// Several controllers: all are walked (one error does not stop the
@@ -1392,14 +1392,14 @@ func TestOSWearDegradation(t *testing.T) {
 	}
 	_, err = OSWear{SysFS: root, DevFS: filepath.Join(root, "dev")}.Wear(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "nvme0") || !strings.Contains(err.Error(), "nvme1") {
-		t.Errorf("два недоступных контроллера: ошибка = %v, want причина с nvme0 и nvme1", err)
+		t.Errorf("two unavailable controllers: error = %v, want a reason with nvme0 and nvme1", err)
 	}
 
 	// A ctx cancellation — a context error before touching the devices.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := (OSWear{SysFS: root}).Wear(ctx); !errors.Is(err, context.Canceled) {
-		t.Errorf("отмена ctx: ошибка = %v, want context.Canceled", err)
+		t.Errorf("a ctx cancellation: error = %v, want context.Canceled", err)
 	}
 }
 
@@ -1429,11 +1429,11 @@ func TestAlertsDiskMinThreshold(t *testing.T) {
 		mn := minM.transition(env.Alerts, ctx, sp)
 		cr := critM.transition(env.Alerts, ctx, sp)
 		if mn.Status != s.min {
-			t.Errorf("шаг %d (avail %d): disk_free_min = %s (%s), want %s",
+			t.Errorf("step %d (avail %d): disk_free_min = %s (%s), want %s",
 				i, s.avail, mn.Status, mn.Detail, s.min)
 		}
 		if cr.Status != s.crit {
-			t.Errorf("шаг %d (avail %d): disk_free_crit = %s (%s), want %s",
+			t.Errorf("step %d (avail %d): disk_free_crit = %s (%s), want %s",
 				i, s.avail, cr.Status, cr.Detail, s.crit)
 		}
 	}
@@ -1441,7 +1441,7 @@ func TestAlertsDiskMinThreshold(t *testing.T) {
 	s := critM.transition(env.Alerts, ctx, obs(SpaceStat{Avail: 9 << 30, Total: 79 << 30}))
 	for _, want := range []string{"9.0GiB", "79.0GiB", "10.0GiB"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+			t.Errorf("detail = %q, want it to contain %s", s.Detail, want)
 		}
 	}
 }
@@ -1457,29 +1457,29 @@ func TestAlertsDiskMinCustomAndDegradation(t *testing.T) {
 	env.space.stat = SpaceStat{Avail: 1<<30 + 1, Total: 10 << 30}
 	s := snapshotOf(t, env.Pass(context.Background()), AlertDiskMin)
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("свой минимум 2GiB: %s (%s), want firing при 1GiB+1", s.Status, s.Detail)
+		t.Fatalf("an own minimum of 2GiB: %s (%s), want firing at 1GiB+1", s.Status, s.Detail)
 	}
 	if !strings.Contains(s.Detail, "2.0GiB") {
-		t.Errorf("detail = %q, want порог 2.0GiB из опций", s.Detail)
+		t.Errorf("detail = %q, want the threshold 2.0GiB from the options", s.Detail)
 	}
 	c := snapshotOf(t, env.Pass(context.Background()), AlertDiskCrit)
 	if c.Status != AlertStatusOK || !strings.Contains(c.Detail, "1.0GiB") {
-		t.Errorf("эскалация 1GiB: %s (%s), want ok с порогом 1.0GiB", c.Status, c.Detail)
+		t.Errorf("a 1GiB escalation: %s (%s), want ok with the threshold 1.0GiB", c.Status, c.Detail)
 	}
 
 	// A statfs error — a Warn and "not measured", the loop keeps living.
-	env.space.err = errors.New("отказано в доступе")
+	env.space.err = errors.New("permission denied")
 	s = snapshotOf(t, env.Pass(context.Background()), AlertDiskMin)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "отказано") {
-		t.Errorf("ошибка statfs: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "permission denied") {
+		t.Errorf("a statfs error: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("ошибка statfs без Warn:\n%s", env.buf.String())
+		t.Errorf("a statfs error without a Warn:\n%s", env.buf.String())
 	}
 
 	env2 := newAlertsTestEnv(t, func(o *AlertsOptions) { o.ContentDir = "" })
 	if s := snapshotOf(t, env2.Pass(context.Background()), AlertDiskMin); s.Status != AlertStatusNotMeasured {
-		t.Errorf("без каталога контента: %s, want not_measured", s.Status)
+		t.Errorf("without a content directory: %s, want not_measured", s.Status)
 	}
 	env3 := newAlertsTestEnv(t, nil)
 	env3.space.stat = SpaceStat{Avail: 1 << 30, Total: 0}
@@ -1492,8 +1492,8 @@ func TestAlertsDiskMinCustomAndDegradation(t *testing.T) {
 	env5 := newAlertsTestEnv(t, nil)
 	env5.space.stat = SpaceStat{Avail: 9 << 30, Total: 10 << 30}
 	s = snapshotOf(t, env5.Pass(context.Background()), AlertDiskMin)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "неприменим") {
-		t.Errorf("малый том: %s (%s), want not_measured «неприменим»", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "inapplicable") {
+		t.Errorf("a small volume: %s (%s), want not_measured \"inapplicable\"", s.Status, s.Detail)
 	}
 }
 
@@ -1512,37 +1512,37 @@ func TestAlertsMemHighStreak(t *testing.T) {
 
 	// The first pass — the base (without it the delta cannot be computed).
 	if s := m.transition(env.Alerts, ctx, set(120000)); s.Status != AlertStatusOK {
-		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
+		t.Fatalf("the base: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Growing for one pass — the series is not enough yet.
 	s := m.transition(env.Alerts, ctx, set(120500))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "рост") {
-		t.Fatalf("один проход роста: %s (%s), want ok", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "growth") {
+		t.Fatalf("one growth pass: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// The second growth pass — firing; the detail names the unit and the gain.
 	s = m.transition(env.Alerts, ctx, set(121300))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("второй проход роста: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("the second growth pass: %s (%s), want firing", s.Status, s.Detail)
 	}
 	for _, want := range []string{"crawler-http-worker.service", "800"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+			t.Errorf("detail = %q, want it to contain %s", s.Detail, want)
 		}
 	}
 	// Growth stopped — clearing by the same pass.
 	if s := m.transition(env.Alerts, ctx, set(121300)); s.Status != AlertStatusOK {
-		t.Errorf("без роста: %s (%s), want ok (снятие)", s.Status, s.Detail)
+		t.Errorf("without growth: %s (%s), want ok (clearing)", s.Status, s.Detail)
 	}
 	// A unit restart: the counter at zero — a decrease is not a spike; the series starts from scratch.
 	_ = m.transition(env.Alerts, ctx, set(121300))
 	if s := m.transition(env.Alerts, ctx, set(5)); s.Status != AlertStatusOK {
-		t.Errorf("рестарт юнита: %s (%s), want ok без ложного всплеска", s.Status, s.Detail)
+		t.Errorf("a unit restart: %s (%s), want ok without a false spike", s.Status, s.Detail)
 	}
 	if s := m.transition(env.Alerts, ctx, set(50)); s.Status != AlertStatusOK {
-		t.Errorf("первый проход роста после рестарта: %s (%s), want ok (серия 1 < 2)", s.Status, s.Detail)
+		t.Errorf("the first growth pass after the restart: %s (%s), want ok (the streak 1 < 2)", s.Status, s.Detail)
 	}
 	if s := m.transition(env.Alerts, ctx, set(55)); s.Status != AlertStatusFiring {
-		t.Errorf("рост после рестарта двумя проходами: %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("growth after the restart over two passes: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
 
@@ -1552,7 +1552,7 @@ func TestAlertsMemHighStreak(t *testing.T) {
 func TestAlertsMemHighDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertMemHigh); s.Status != AlertStatusOK {
-		t.Fatalf("здоровые юниты: %s (%s), want ok", s.Status, s.Detail)
+		t.Fatalf("healthy units: %s (%s), want ok", s.Status, s.Detail)
 	}
 
 	// An empty unit list — a VALID memory_high measurement (the asymmetry
@@ -1561,41 +1561,41 @@ func TestAlertsMemHighDegradation(t *testing.T) {
 	// degradation (the T-264 review, P1); the front log is not written in this case.
 	env.units.units = nil
 	s := snapshotOf(t, env.Pass(context.Background()), AlertMemHigh)
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "0 юнитов") {
-		t.Fatalf("пустой список: %s (%s), want ok «0 юнитов» (не not_measured)", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "0 units") {
+		t.Fatalf("an empty list: %s (%s), want ok \"0 units\" (not not_measured)", s.Status, s.Detail)
 	}
 	// The neighboring unit_oom treats an empty list as "not found" — the
 	// machines diverge deliberately.
 	if u := snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM); u.Status != AlertStatusNotMeasured {
-		t.Fatalf("unit_oom на пустом списке: %s, want not_measured (асимметрия машин)", u.Status)
+		t.Fatalf("unit_oom on an empty list: %s, want not_measured (the machine asymmetry)", u.Status)
 	}
 
 	env2 := newAlertsTestEnv(t, nil)
 	// The error queue: unit_oom and memory_high read the source independently
 	// (two calls per pass) — each gets its own error.
-	noSystemd := fmt.Errorf("monitor: юниты: %w: systemctl show: упал", errNoSystemd)
+	noSystemd := fmt.Errorf("monitor: units: %w: systemctl show: crashed", errNoSystemd)
 	env2.units.errs = []error{noSystemd, noSystemd}
 	s = snapshotOf(t, env2.Pass(context.Background()), AlertMemHigh)
 	if s.Status != AlertStatusNotMeasured || strings.Contains(env2.buf.String(), "level=WARN") {
-		t.Errorf("без systemd: %s, want тихое not_measured (лог:\n%s)", s.Status, env2.buf.String())
+		t.Errorf("without systemd: %s, want a quiet not_measured (the log:\n%s)", s.Status, env2.buf.String())
 	}
 
 	env3 := newAlertsTestEnv(t, nil)
-	hardErr := errors.New("monitor: юниты: cgroup v2 недоступен")
+	hardErr := errors.New("monitor: units: cgroup v2 unavailable")
 	env3.units.errs = []error{hardErr, hardErr}
 	s = snapshotOf(t, env3.Pass(context.Background()), AlertMemHigh)
 	if s.Status != AlertStatusNotMeasured {
-		t.Errorf("боевая ошибка: %s, want not_measured", s.Status)
+		t.Errorf("a hard error: %s, want not_measured", s.Status)
 	}
 	if !strings.Contains(env3.buf.String(), "level=WARN") {
-		t.Errorf("боевая ошибка без Warn:\n%s", env3.buf.String())
+		t.Errorf("a hard error without a Warn:\n%s", env3.buf.String())
 	}
 
 	env4 := newAlertsTestEnv(t, nil)
 	n := NewAlerts(AlertsDeps{Pool: env4.pool}, env4.opts)
 	res := n.Pass(context.Background())
 	if s := snapshotOf(t, res, AlertMemHigh); s.Status != AlertStatusNotMeasured {
-		t.Errorf("источник не задан: %s, want not_measured", s.Status)
+		t.Errorf("the source is not set: %s, want not_measured", s.Status)
 	}
 }
 
@@ -1621,37 +1621,37 @@ func TestAlertsQueueFreeze(t *testing.T) {
 
 	// The base: a queue with work, a fresh ID.
 	if s := m.transition(env.Alerts, ctx, g("1761280800000-0", 40)); s.Status != AlertStatusOK {
-		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
+		t.Fatalf("the base: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// An hour without movement at a depth — frozen.
 	now = now.Add(time.Hour)
 	s := m.transition(env.Alerts, ctx, g("1761280800000-0", 40))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("час без доставок: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("an hour without deliveries: %s (%s), want firing", s.Status, s.Detail)
 	}
-	for _, want := range []string{"q:render/render-worker", "глубине 40", "1761280800000-0"} {
+	for _, want := range []string{"q:render/render-worker", "depth 40", "1761280800000-0"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+			t.Errorf("detail = %q, want it to contain %s", s.Detail, want)
 		}
 	}
 	// The queue emptied — clearing; the accumulated time is reset.
 	now = now.Add(time.Minute)
 	if s := m.transition(env.Alerts, ctx, g("1761280800000-0", 0)); s.Status != AlertStatusOK {
-		t.Errorf("пустая очередь: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("an empty queue: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Depth again with the same ID: the idle from the previous round does not count —
 	// the window ticks anew; 14 minutes since the depth returned is not enough.
 	now = now.Add(14 * time.Minute)
 	if s := m.transition(env.Alerts, ctx, g("1761280800000-0", 7)); s.Status != AlertStatusOK {
-		t.Errorf("14 мин новой глубины: %s (%s), want ok (окно сброшено пустой очередью)", s.Status, s.Detail)
+		t.Errorf("14 min at the new depth: %s (%s), want ok (the window was reset by the empty queue)", s.Status, s.Detail)
 	}
 	now = now.Add(15 * time.Minute)
 	if s := m.transition(env.Alerts, ctx, g("1761280800000-0", 7)); s.Status != AlertStatusFiring {
-		t.Errorf("15 мин без движения: %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("15 min without movement: %s (%s), want firing", s.Status, s.Detail)
 	}
 	// A delivery went through — clearing; the moment updated.
 	if s := m.transition(env.Alerts, ctx, g("1761284400000-0", 7)); s.Status != AlertStatusOK {
-		t.Errorf("движение ID: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("an ID movement: %s (%s), want ok", s.Status, s.Detail)
 	}
 }
 
@@ -1662,16 +1662,16 @@ func TestAlertsQueueFreezeDegradation(t *testing.T) {
 	deps := AlertsDeps{Pool: env.pool}
 	a := NewAlerts(deps, env.opts)
 	if s := snapshotOf(t, a.Pass(context.Background()), AlertQueueFreeze); s.Status != AlertStatusNotMeasured {
-		t.Errorf("источник не задан: %s, want not_measured", s.Status)
+		t.Errorf("the source is not set: %s, want not_measured", s.Status)
 	}
 
-	env.groups.err = errors.New("monitor: группы q:http: соединение сброшено")
+	env.groups.err = errors.New("monitor: the groups of q:http: connection reset")
 	s := snapshotOf(t, env.Pass(context.Background()), AlertQueueFreeze)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "сброшено") {
-		t.Errorf("ошибка источника: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "reset") {
+		t.Errorf("a source error: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("ошибка источника без Warn:\n%s", env.buf.String())
+		t.Errorf("a source error without a Warn:\n%s", env.buf.String())
 	}
 
 	// A group vanished from the answer (the stream deleted) — the tracking entry cleaned:
@@ -1694,7 +1694,7 @@ func TestAlertsQueueFreezeDegradation(t *testing.T) {
 	_ = snapshotOf(t, env2.Pass(context.Background()), AlertQueueFreeze) // the entry anew, since=t0+5m
 	now = now.Add(30 * time.Second)
 	if s := snapshotOf(t, env2.Pass(context.Background()), AlertQueueFreeze); s.Status != AlertStatusOK {
-		t.Errorf("30с после возвращения группы: %s, want ok (окно с нуля; выжившая запись дала бы firing)",
+		t.Errorf("30s after the group returned: %s, want ok (the window from zero; a surviving entry would give firing)",
 			s.Status)
 	}
 }
@@ -1718,12 +1718,12 @@ func TestAlertsPSICPU(t *testing.T) {
 	}
 
 	if s := m.transition(env.Alerts, ctx, set(50)); s.Status != AlertStatusOK {
-		t.Fatalf("без давления: %s (%s), want ok", s.Status, s.Detail)
+		t.Fatalf("without pressure: %s (%s), want ok", s.Status, s.Detail)
 	}
 	now = now.Add(10 * time.Minute)
 	s := m.transition(env.Alerts, ctx, set(95))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "накопление") {
-		t.Fatalf("10 мин из 30: %s (%s), want ok с накоплением", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "accumulating") {
+		t.Fatalf("10 min of 30: %s (%s), want ok with accumulating", s.Status, s.Detail)
 	}
 	// A brief dip (avg300 below the threshold) — the window anew: the next
 	// 30 minutes accumulate from scratch, not continuing the accumulated.
@@ -1731,19 +1731,19 @@ func TestAlertsPSICPU(t *testing.T) {
 	_ = m.transition(env.Alerts, ctx, set(95)) // the window started anew (held=0)
 	now = now.Add(29 * time.Minute)
 	if s := m.transition(env.Alerts, ctx, set(95)); s.Status != AlertStatusOK {
-		t.Fatalf("29 мин после провала: %s (%s), want ok (окно перезапущено)", s.Status, s.Detail)
+		t.Fatalf("29 min after a dip: %s (%s), want ok (the window restarted)", s.Status, s.Detail)
 	}
 	now = now.Add(time.Minute)
 	s = m.transition(env.Alerts, ctx, set(95))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("30 мин выше порога: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("30 min above the threshold: %s (%s), want firing", s.Status, s.Detail)
 	}
 	if !strings.Contains(s.Detail, "95.00%") || !strings.Contains(s.Detail, "30m0s") {
-		t.Errorf("detail = %q, want avg300=95.00%% и удержание 30m0s", s.Detail)
+		t.Errorf("detail = %q, want avg300=95.00%% and a 30m0s hold", s.Detail)
 	}
 	// Clearing by returning below the threshold.
 	if s := m.transition(env.Alerts, ctx, set(70)); s.Status != AlertStatusOK {
-		t.Errorf("под порогом: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("below the threshold: %s (%s), want ok", s.Status, s.Detail)
 	}
 }
 
@@ -1754,17 +1754,17 @@ func TestAlertsPSIDegradation(t *testing.T) {
 	env.psi.err = fmt.Errorf("monitor: PSI: %w", errNoPSI)
 	s := snapshotOf(t, env.Pass(context.Background()), AlertPSICPU)
 	if s.Status != AlertStatusNotMeasured || strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("ядро без PSI: %s, want тихое not_measured (лог:\n%s)", s.Status, env.buf.String())
+		t.Errorf("a kernel without PSI: %s, want a quiet not_measured (the log:\n%s)", s.Status, env.buf.String())
 	}
 
 	env2 := newAlertsTestEnv(t, nil)
-	env2.psi.err = errors.New("monitor: PSI: отказано в доступе")
+	env2.psi.err = errors.New("monitor: PSI: permission denied")
 	s = snapshotOf(t, env2.Pass(context.Background()), AlertPSICPU)
 	if s.Status != AlertStatusNotMeasured {
-		t.Errorf("ошибка чтения: %s, want not_measured", s.Status)
+		t.Errorf("a read error: %s, want not_measured", s.Status)
 	}
 	if !strings.Contains(env2.buf.String(), "level=WARN") {
-		t.Errorf("ошибка чтения без Warn:\n%s", env2.buf.String())
+		t.Errorf("a read error without a Warn:\n%s", env2.buf.String())
 	}
 }
 
@@ -1793,68 +1793,68 @@ func TestAlertsRenderDebtGrowth(t *testing.T) {
 	// The base: the debt is already above the threshold, but no growth yet.
 	s := m.transition(env.Alerts, ctx, debt(443000, 99000))
 	if s.Status != AlertStatusOK {
-		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
+		t.Fatalf("the base: %s (%s), want ok", s.Status, s.Detail)
 	}
-	if !strings.Contains(s.Detail, "флаги 443000 + лаг 99000 = 542000") {
-		t.Errorf("detail = %q, want сводка долга одной строкой", s.Detail)
+	if !strings.Contains(s.Detail, "flags 443000 + lag 99000 = 542000") {
+		t.Errorf("detail = %q, want the debt summary on one line", s.Detail)
 	}
-	if !strings.Contains(s.Detail, "снятие < 45000") {
-		t.Errorf("detail = %q, want порог снятия (гистерезис 90%%)", s.Detail)
+	if !strings.Contains(s.Detail, "clearing < 45000") {
+		t.Errorf("detail = %q, want the clearing threshold (the 90%% hysteresis)", s.Detail)
 	}
 	// Growing for one pass — the series is short.
 	s = m.transition(env.Alerts, ctx, debt(445000, 99000))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
-		t.Fatalf("один проход роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "growth streak 1/2") {
+		t.Fatalf("one growth pass: %s (%s), want ok with the streak 1/2", s.Status, s.Detail)
 	}
 	// The second growth pass — firing.
 	s = m.transition(env.Alerts, ctx, debt(447000, 100000))
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("второй проход роста: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("the second growth pass: %s (%s), want firing", s.Status, s.Detail)
 	}
-	for _, want := range []string{"547000", "+3000", "накопление"} {
+	for _, want := range []string{"547000", "+3000", "accumulation"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
+			t.Errorf("detail = %q, want it to contain %s", s.Detail, want)
 		}
 	}
 	// Stagnation (growth stopped) — the alert HOLDS: a clearing "by
 	// no-growth" would swing the episode on the lag swings (the T-175 review, P2-1).
 	if s := m.transition(env.Alerts, ctx, debt(447000, 100000)); s.Status != AlertStatusFiring {
-		t.Errorf("стагнация: %s (%s), want firing (удержание выше порога снятия)", s.Status, s.Detail)
+		t.Errorf("stagnation: %s (%s), want firing (a hold above the clearing threshold)", s.Status, s.Detail)
 	}
 	// Lag swings around a stationary high debt — also a
 	// hold, not a clearing.
 	if s := m.transition(env.Alerts, ctx, debt(446500, 100300)); s.Status != AlertStatusFiring {
-		t.Errorf("колебание лага: %s (%s), want firing (удержание)", s.Status, s.Detail)
+		t.Errorf("a lag swing: %s (%s), want firing (a hold)", s.Status, s.Detail)
 	}
 	// A drain below the clearing threshold (90% of 50k) — clearing; the
 	// hysteresis corridor (45000..50000) would hold the episode.
 	if s := m.transition(env.Alerts, ctx, debt(44680, 300)); s.Status != AlertStatusOK {
-		t.Errorf("ниже порога снятия: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("below the clearing threshold: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// In the hysteresis corridor (without a fired alert) — ok: the firing
 	// threshold is strict.
 	if s := m.transition(env.Alerts, ctx, debt(44680, 400)); s.Status != AlertStatusOK {
-		t.Errorf("коридор гистерезиса без алерта: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("the hysteresis corridor without an alert: %s (%s), want ok", s.Status, s.Detail)
 	}
 	// Re-accumulation: the series was reset by no-growth; two growth passes
 	// above the threshold — both passes are checked (the first — the series is still short).
 	_ = m.transition(env.Alerts, ctx, debt(44650, 0)) // streak 0
 	s = m.transition(env.Alerts, ctx, debt(49800, 600))
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
-		t.Errorf("первый проход повторного роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "growth streak 1/2") {
+		t.Errorf("the first pass of the re-growth: %s (%s), want ok with the streak 1/2", s.Status, s.Detail)
 	}
 	if s := m.transition(env.Alerts, ctx, debt(49900, 800)); s.Status != AlertStatusFiring {
-		t.Errorf("второй проход повторного роста: %s (%s), want firing", s.Status, s.Detail)
+		t.Errorf("the second pass of the re-growth: %s (%s), want firing", s.Status, s.Detail)
 	}
 	// The hold corridor (45–50k at a fired alert): a clearing "below
 	// the firing threshold" does not fire — it holds until 45k.
 	if s := m.transition(env.Alerts, ctx, debt(30000, 18000)); s.Status != AlertStatusFiring {
-		t.Errorf("коридор удержания 48000: %s (%s), want firing (снятие < 45000, не < 50000)", s.Status, s.Detail)
+		t.Errorf("the hold corridor 48000: %s (%s), want firing (clearing < 45000, not < 50000)", s.Status, s.Detail)
 	}
 	// Clearing — only by a drain below the clearing threshold (90% of 50k);
 	// 40k < 45k — recovery.
 	if s := m.transition(env.Alerts, ctx, debt(20000, 20000)); s.Status != AlertStatusOK {
-		t.Errorf("ниже порога снятия: %s (%s), want ok", s.Status, s.Detail)
+		t.Errorf("below the clearing threshold: %s (%s), want ok", s.Status, s.Detail)
 	}
 }
 
@@ -1877,7 +1877,7 @@ func TestAlertsRenderDebtJitter(t *testing.T) {
 		{Flags: 60040}, {Flags: 60020},
 	} {
 		if s := m.transition(env.Alerts, ctx, obs(d)); s.Status != AlertStatusOK {
-			t.Fatalf("дрожание без серии роста: %s (%s), want ok", s.Status, s.Detail)
+			t.Fatalf("flutter without a growth series: %s (%s), want ok", s.Status, s.Detail)
 		}
 	}
 
@@ -1887,11 +1887,11 @@ func TestAlertsRenderDebtJitter(t *testing.T) {
 	_ = m.transition(env.Alerts, ctx, debt(60000))
 	_ = m.transition(env.Alerts, ctx, debt(60100))
 	if s := m.transition(env.Alerts, ctx, debt(60200)); s.Status != AlertStatusFiring {
-		t.Fatalf("рост двумя проходами: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("growth over two passes: %s (%s), want firing", s.Status, s.Detail)
 	}
 	for _, flags := range []int64{60150, 60180, 60120} {
 		if s := m.transition(env.Alerts, ctx, debt(flags)); s.Status != AlertStatusFiring {
-			t.Errorf("дрожание @%d: %s (%s), want firing (снятие — только дренаж)", flags, s.Status, s.Detail)
+			t.Errorf("flutter @%d: %s (%s), want firing (only the drain clears)", flags, s.Status, s.Detail)
 		}
 	}
 }
@@ -1912,11 +1912,11 @@ func TestAlertsRenderDebtBoundary(t *testing.T) {
 	_ = m.transition(env.Alerts, ctx, debt(99000))   // the base
 	s := m.transition(env.Alerts, ctx, debt(100000)) // == the threshold: growth is there, the threshold is not
 	if s.Status != AlertStatusOK {
-		t.Fatalf("долг == порогу: %s (%s), want ok (строгое сравнение)", s.Status, s.Detail)
+		t.Fatalf("the debt == the threshold: %s (%s), want ok (a strict comparison)", s.Status, s.Detail)
 	}
 	s = m.transition(env.Alerts, ctx, debt(100001)) // threshold+1 with a growth series of 2
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("порог+1 с серией 2: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("threshold+1 with a streak of 2: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
 
@@ -1929,18 +1929,18 @@ func TestAlertsRenderDebtDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	a := NewAlerts(AlertsDeps{Pool: env.pool}, env.opts)
 	if s := snapshotOf(t, a.Pass(context.Background()), AlertRenderDebt); s.Status != AlertStatusNotMeasured {
-		t.Errorf("Redis не задан: %s, want not_measured", s.Status)
+		t.Errorf("Redis not set: %s, want not_measured", s.Status)
 	}
 
 	// A counter query error — a Warn.
 	env2 := newAlertsTestEnv(t, nil)
-	env2.pool.debtErrs = []error{errors.New("бд недоступна")}
+	env2.pool.debtErrs = []error{errors.New("db unavailable")}
 	s := snapshotOf(t, env2.Pass(context.Background()), AlertRenderDebt)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "бд недоступна") {
-		t.Errorf("ошибка счётчика: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "db unavailable") {
+		t.Errorf("a counter error: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if !strings.Contains(env2.buf.String(), "level=WARN") {
-		t.Errorf("ошибка счётчика без Warn:\n%s", env2.buf.String())
+		t.Errorf("a counter error without a Warn:\n%s", env2.buf.String())
 	}
 
 	// No counter row (the migration not applied / a manual edit) — an error,
@@ -1949,7 +1949,7 @@ func TestAlertsRenderDebtDegradation(t *testing.T) {
 	env3.pool.debtEmpty = true
 	s = snapshotOf(t, env3.Pass(context.Background()), AlertRenderDebt)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "render_pending") {
-		t.Errorf("строки счётчика нет: %s (%s), want not_measured про строку", s.Status, s.Detail)
+		t.Errorf("the counter row is missing: %s (%s), want not_measured about the row", s.Status, s.Detail)
 	}
 
 	// An XLEN error — a Warn. Before render debt, Len is called 5 more times (4
@@ -1960,10 +1960,10 @@ func TestAlertsRenderDebtDegradation(t *testing.T) {
 	env4.lener.errs = []error{nil, nil, nil, nil, nil, errors.New("redis: xlen")}
 	s = snapshotOf(t, env4.Pass(context.Background()), AlertRenderDebt)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "q:render") {
-		t.Errorf("ошибка XLEN: %s (%s), want not_measured про q:render", s.Status, s.Detail)
+		t.Errorf("an XLEN error: %s (%s), want not_measured about q:render", s.Status, s.Detail)
 	}
 	if !strings.Contains(env4.buf.String(), "level=WARN") {
-		t.Errorf("ошибка XLEN без Warn:\n%s", env4.buf.String())
+		t.Errorf("an XLEN error without a Warn:\n%s", env4.buf.String())
 	}
 
 	// The tracking memory survives an error: after the failure growth is counted from
@@ -1971,12 +1971,12 @@ func TestAlertsRenderDebtDegradation(t *testing.T) {
 	env5 := newAlertsTestEnv(t, func(o *AlertsOptions) { o.RenderDebtPasses = 2 })
 	setRenderDebt(env5, 60000, 0)
 	_ = snapshotOf(t, env5.Pass(context.Background()), AlertRenderDebt) // the base: prev=60000
-	env5.pool.debtErrs = []error{errors.New("бд недоступна")}
+	env5.pool.debtErrs = []error{errors.New("db unavailable")}
 	_ = snapshotOf(t, env5.Pass(context.Background()), AlertRenderDebt) // the failure: the memory untouched
 	setRenderDebt(env5, 61000, 0)
 	if s := snapshotOf(t, env5.Pass(context.Background()), AlertRenderDebt); s.Status != AlertStatusOK ||
-		!strings.Contains(s.Detail, "серия роста 1/2") {
-		t.Errorf("рост после сбоя: %s (%s), want ok с серией 1/2 от последнего снимка", s.Status, s.Detail)
+		!strings.Contains(s.Detail, "growth streak 1/2") {
+		t.Errorf("growth after the failure: %s (%s), want ok with the streak 1/2 from the last snapshot", s.Status, s.Detail)
 	}
 
 	// The fired episode survives a source failure: the hold relies
@@ -1990,19 +1990,19 @@ func TestAlertsRenderDebtDegradation(t *testing.T) {
 	_ = snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt) // growth
 	setRenderDebt(env6, 62000, 0)
 	if s := snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt); s.Status != AlertStatusFiring {
-		t.Fatalf("до сбоя: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("before the failure: %s (%s), want firing", s.Status, s.Detail)
 	}
-	env6.pool.debtErrs = []error{errors.New("бд недоступна")}
+	env6.pool.debtErrs = []error{errors.New("db unavailable")}
 	if s := snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt); s.Status != AlertStatusNotMeasured {
-		t.Fatalf("сбой источника: %s, want not_measured", s.Status)
+		t.Fatalf("a source failure: %s, want not_measured", s.Status)
 	}
 	setRenderDebt(env6, 61500, 0) // a jitter around the same debt, above the clearing threshold
 	if s := snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt); s.Status != AlertStatusFiring {
-		t.Errorf("после сбоя, долг 61500: %s (%s), want firing (удержание пережило сбой — без ложного «восстановлено»)", s.Status, s.Detail)
+		t.Errorf("after the failure, the debt 61500: %s (%s), want firing (the hold survived the failure — no false \"recovered\")", s.Status, s.Detail)
 	}
 	setRenderDebt(env6, 20000, 0) // a drain below the clearing threshold
 	if s := snapshotOf(t, env6.Pass(ctx6), AlertRenderDebt); s.Status != AlertStatusOK {
-		t.Errorf("дренаж после сбоя: %s (%s), want ok (эпизод закрыт честно)", s.Status, s.Detail)
+		t.Errorf("the drain after the failure: %s (%s), want ok (the episode closed honestly)", s.Status, s.Detail)
 	}
 }
 
@@ -2021,18 +2021,18 @@ func TestAlertsRenderDebtTinyThreshold(t *testing.T) {
 	_ = m.transition(env.Alerts, ctx, debt(0))  // the base
 	s := m.transition(env.Alerts, ctx, debt(2)) // a growth of +2, above the threshold of 1
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("порог 1: %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("threshold 1: %s (%s), want firing", s.Status, s.Detail)
 	}
-	if !strings.Contains(s.Detail, "снятие < 1") {
-		t.Errorf("detail = %q, want «снятие < 1» (ceil 90%% от 1)", s.Detail)
+	if !strings.Contains(s.Detail, "clearing < 1") {
+		t.Errorf("detail = %q, want \"clearing < 1\" (the ceil 90%% of 1)", s.Detail)
 	}
 	// Exactly the clearing threshold — a hold.
 	if s := m.transition(env.Alerts, ctx, debt(1)); s.Status != AlertStatusFiring {
-		t.Errorf("долг 1 при пороге снятия 1: %s (%s), want firing (удержание)", s.Status, s.Detail)
+		t.Errorf("the debt 1 at the clearing threshold 1: %s (%s), want firing (a hold)", s.Status, s.Detail)
 	}
 	// Zero — clearing.
 	if s := m.transition(env.Alerts, ctx, debt(0)); s.Status != AlertStatusOK {
-		t.Errorf("нулевой долг: %s (%s), want ok (снятие достижимо)", s.Status, s.Detail)
+		t.Errorf("a zero debt: %s (%s), want ok (the clearing is reachable)", s.Status, s.Detail)
 	}
 }
 
@@ -2078,7 +2078,7 @@ func TestAlertsNewDoneStaleEpisode(t *testing.T) {
 	for i, s := range steps {
 		got := m.transition(env.Alerts, ctx, snap(s.value, s.min))
 		if got.Status != s.want {
-			t.Errorf("шаг %d (new_done_stale=%d@+%dм): статус = %s (%s), want %s",
+			t.Errorf("step %d (new_done_stale=%d@+%dm): status = %s (%s), want %s",
 				i, s.value, s.min, got.Status, got.Detail, s.want)
 		}
 	}
@@ -2088,9 +2088,9 @@ func TestAlertsNewDoneStaleEpisode(t *testing.T) {
 	env2 := newAlertsTestEnv(t, nil)
 	m2 := env2.newDomainsStaleMachine()
 	got := runSequence(env2.Alerts, m2, snap(2, 0), snap(0, 30))
-	wantSequence(t, "пограничный снапшот", got, []string{AlertStatusOK, AlertStatusOK})
-	if strings.Contains(env2.buf.String(), "АЛЕРТ") {
-		t.Errorf("пограничный снапшот дал Warn:\n%s", env2.buf.String())
+	wantSequence(t, "the boundary snapshot", got, []string{AlertStatusOK, AlertStatusOK})
+	if strings.Contains(env2.buf.String(), "ALERT") {
+		t.Errorf("the boundary snapshot produced a Warn:\n%s", env2.buf.String())
 	}
 
 	// The detail with the level, the snapshot counter and the treatment path: the
@@ -2102,7 +2102,7 @@ func TestAlertsNewDoneStaleEpisode(t *testing.T) {
 	g := m3.transition(env3.Alerts, ctx, snap(12, 60))
 	for _, want := range []string{"12", "3/2", "crawler_domains_new_done_stale"} {
 		if !strings.Contains(g.Detail, want) {
-			t.Errorf("detail %q не содержит %q", g.Detail, want)
+			t.Errorf("the detail %q does not contain %q", g.Detail, want)
 		}
 	}
 
@@ -2113,23 +2113,23 @@ func TestAlertsNewDoneStaleEpisode(t *testing.T) {
 	for range 2 {
 		env4.Pass(ctx)
 	}
-	if n := strings.Count(env4.buf.String(), "АЛЕРТ: домены «статус повис»"); n != 1 {
-		t.Errorf("Warn срабатывания = %d, want 1:\n%s", n, env4.buf.String())
+	if n := strings.Count(env4.buf.String(), "ALERT: domains \"status hung\""); n != 1 {
+		t.Errorf("the firing Warn count = %d, want 1:\n%s", n, env4.buf.String())
 	}
 	env4.pool.stale = []alertStaleSnap{staleSnap(9, 90)}
 	if got := snapshotOf(t, env4.Pass(ctx), AlertDomainsStale); got.Status != AlertStatusFiring {
-		t.Fatalf("устойчивое срабатывание: %s, want firing", got.Status)
+		t.Fatalf("a sustained firing: %s, want firing", got.Status)
 	}
 	before := env4.buf.String()
 	env4.pool.stale = nil // zeros by default
 	s := snapshotOf(t, env4.Pass(ctx), AlertDomainsStale)
 	if s.Status != AlertStatusOK {
-		t.Fatalf("нулевая строка: %s, want ok", s.Status)
+		t.Fatalf("a zero row: %s, want ok", s.Status)
 	}
 	if delta := env4.buf.String()[len(before):]; strings.Contains(delta, "level=WARN") {
-		t.Errorf("снятие дало Warn:\n%s", delta)
-	} else if !strings.Contains(delta, "level=INFO") || !strings.Contains(delta, "алерт снят") {
-		t.Errorf("снятие без Info:\n%s", delta)
+		t.Errorf("the clearing produced a Warn:\n%s", delta)
+	} else if !strings.Contains(delta, "level=INFO") || !strings.Contains(delta, "alert cleared") {
+		t.Errorf("a clearing without Info:\n%s", delta)
 	}
 }
 
@@ -2143,24 +2143,24 @@ func TestAlertsNewDoneStaleDegradation(t *testing.T) {
 	env.pool.staleEmpty = true
 	s := snapshotOf(t, env.Pass(context.Background()), AlertDomainsStale)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("строки нет: статус = %s, want not_measured", s.Status)
+		t.Fatalf("no row: status = %s, want not_measured", s.Status)
 	}
 	if strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("гонка старта циклов дала Warn:\n%s", env.buf.String())
+		t.Errorf("the loop-start race produced a Warn:\n%s", env.buf.String())
 	}
 
 	ctx := context.Background()
 	env = newAlertsTestEnv(t, nil)
 	env.pool.stale = []alertStaleSnap{staleSnap(4, 0)}
 	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusOK {
-		t.Fatalf("первое наблюдение: %s, want ok (1/2)", s.Status)
+		t.Fatalf("the first observation: %s, want ok (1/2)", s.Status)
 	}
 	env.pool.staleErrs = []error{errors.New("connection refused")}
 	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusNotMeasured {
-		t.Fatalf("ошибка чтения: %s, want not_measured", s.Status)
+		t.Fatalf("a read error: %s, want not_measured", s.Status)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "connection refused") {
-		t.Errorf("ошибка чтения строки без Warn:\n%s", env.buf.String())
+		t.Errorf("a row read error without a Warn:\n%s", env.buf.String())
 	}
 	// An error does not touch the tracking memory: the same snapshot after the failure —
 	// the series is still 1 (not "the first observation"); a new non-zero
@@ -2168,23 +2168,23 @@ func TestAlertsNewDoneStaleDegradation(t *testing.T) {
 	env.pool.staleErrs = nil
 	env.pool.stale = []alertStaleSnap{staleSnap(4, 0)}
 	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusOK || !strings.Contains(s.Detail, "1/2") {
-		t.Fatalf("тот же снапшот после сбоя: %s (%s), want ok 1/2 (серия сохранена)", s.Status, s.Detail)
+		t.Fatalf("the same snapshot after the failure: %s (%s), want ok 1/2 (the series survived)", s.Status, s.Detail)
 	}
 	env.pool.stale = []alertStaleSnap{staleSnap(4, 30)}
 	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusFiring {
-		t.Fatalf("новый снапшот после сбоя: %s, want firing (серия сохранена)", s.Status)
+		t.Fatalf("a new snapshot after the failure: %s, want firing (the series survived)", s.Status)
 	}
 
 	// An unreadable row and an iteration error — "not measured" with a Warn.
 	env = newAlertsTestEnv(t, nil)
 	env.pool.staleBadRow = true
 	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusNotMeasured {
-		t.Errorf("нечитаемая строка: %s, want not_measured", s.Status)
+		t.Errorf("an unreadable row: %s, want not_measured", s.Status)
 	}
 	env = newAlertsTestEnv(t, nil)
 	env.pool.staleRowsErr = errors.New("iteration failed")
 	if s := snapshotOf(t, env.Pass(ctx), AlertDomainsStale); s.Status != AlertStatusNotMeasured {
-		t.Errorf("ошибка итерации: %s, want not_measured", s.Status)
+		t.Errorf("an iteration error: %s, want not_measured", s.Status)
 	}
 }
 
@@ -2199,7 +2199,7 @@ func TestAlertsLoopPasses(t *testing.T) {
 		o.Interval = 2 * time.Millisecond
 		o.OnPass = func(AlertsResult) { mu.Lock(); passes++; mu.Unlock() }
 	})
-	env.pool.dailyErrs = []error{errors.New("бд недоступна")} // the starting pass — an error
+	env.pool.dailyErrs = []error{errors.New("db unavailable")} // the starting pass — an error
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2220,13 +2220,13 @@ func TestAlertsLoopPasses(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("проходов = %d, want ≥ 3 (цикл живёт после ошибки)", n)
+			t.Fatalf("passes = %d, want ≥ 3 (the loop lives after an error)", n)
 		}
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("AlertsLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("AlertsLoop: %v, want nil on a ctx cancellation", err)
 	}
 }
 
@@ -2246,10 +2246,10 @@ func TestAlertsLoopCancelDuringPass(t *testing.T) {
 	}()
 
 	if err := <-done; err != nil {
-		t.Fatalf("AlertsLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("AlertsLoop: %v, want nil on a ctx cancellation", err)
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("отмена во время прохода — Warn:\n%s", buf.String())
+		t.Errorf("a cancellation during the pass — a Warn:\n%s", buf.String())
 	}
 }
 
@@ -2280,18 +2280,18 @@ func TestAlertsLoopFirstPassImmediate(t *testing.T) {
 	select {
 	case <-passed: // the starting pass — right away
 	case <-time.After(5 * time.Second):
-		t.Fatal("первый проход не выполнен при старте (цикл ждёт тика)")
+		t.Fatal("the first pass was not performed at start (the loop waits for a tick)")
 	}
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("AlertsLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("AlertsLoop: %v, want nil on a ctx cancellation", err)
 	}
 }
 
 func TestAlertsLoopNilPool(t *testing.T) {
 	err := AlertsLoop(context.Background(), AlertsDeps{}, AlertsOptions{})
-	if err == nil || !strings.Contains(err.Error(), "пул БД не задан") {
-		t.Errorf("ошибка = %v, want «пул БД не задан»", err)
+	if err == nil || !strings.Contains(err.Error(), "DB pool not set") {
+		t.Errorf("error = %v, want \"DB pool not set\"", err)
 	}
 }
 
@@ -2304,18 +2304,18 @@ func TestAlertBytes(t *testing.T) {
 		n    uint64
 		want string
 	}{
-		{"ноль", 0, "0B"},
-		{"байты", 1, "1B"},
-		{"килобайт без кибибайта", 1023, "1023B"},
-		{"ровно кибибайт", 1 << 10, "1.0KiB"},
-		{"полтора кибибайта", 1536, "1.5KiB"},
-		{"кибибайт до мибибайта", 1<<20 - 1, "1024.0KiB"},
-		{"ровно мибибайт", 1 << 20, "1.0MiB"},
-		{"полтора мибибайта", 3 << 19, "1.5MiB"},
-		{"мибибайт до гибибайта", 1<<30 - 1, "1024.0MiB"},
-		{"ровно гибибайт", 1 << 30, "1.0GiB"},
-		{"полтора гибибайта", 3 << 29, "1.5GiB"},
-		{"много гибибайт", 5 << 30, "5.0GiB"},
+		{"zero", 0, "0B"},
+		{"bytes", 1, "1B"},
+		{"a kilobyte, not a kibibyte", 1023, "1023B"},
+		{"exactly a kibibyte", 1 << 10, "1.0KiB"},
+		{"one and a half kibibytes", 1536, "1.5KiB"},
+		{"a kibibyte short of a mebibyte", 1<<20 - 1, "1024.0KiB"},
+		{"exactly a mebibyte", 1 << 20, "1.0MiB"},
+		{"one and a half mebibytes", 3 << 19, "1.5MiB"},
+		{"a mebibyte short of a gibibyte", 1<<30 - 1, "1024.0MiB"},
+		{"exactly a gibibyte", 1 << 30, "1.0GiB"},
+		{"one and a half gibibytes", 3 << 29, "1.5GiB"},
+		{"many gibibytes", 5 << 30, "5.0GiB"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

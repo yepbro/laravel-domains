@@ -54,16 +54,16 @@ func TestParseRedisUptimeINFO(t *testing.T) {
 
 	// Without \r (unix output) — the same result.
 	if up, err = parseRedisUptimeINFO(strings.ReplaceAll(raw, "\r", "")); err != nil || up.Seconds != 900 {
-		t.Errorf("без CR: (%+v, %v), want ({900}, nil)", up, err)
+		t.Errorf("without CR: (%+v, %v), want ({900}, nil)", up, err)
 	}
 
 	for name, bad := range map[string]string{
-		"поля нет":      "# Server\nredis_version:7.0.15\n",
-		"не число":      "# Server\nuptime_in_seconds:сутки\n",
-		"отрицательное": "# Server\nuptime_in_seconds:-1\n",
+		"no field":      "# Server\nredis_version:7.0.15\n",
+		"not a number":      "# Server\nuptime_in_seconds:days\n",
+		"negative": "# Server\nuptime_in_seconds:-1\n",
 	} {
 		if _, err := parseRedisUptimeINFO(bad); err == nil {
-			t.Errorf("%s: parse прошёл, want ошибка", name)
+			t.Errorf("%s: parse succeeded, want an error", name)
 		}
 	}
 }
@@ -73,23 +73,23 @@ func TestParseRedisUptimeINFO(t *testing.T) {
 // command error — source errors.
 func TestRedisInfoUptimeClient(t *testing.T) {
 	if _, err := (RedisInfo{}).RedisUptime(context.Background()); err == nil ||
-		!strings.Contains(err.Error(), "клиент не задан") {
-		t.Errorf("nil-клиент: %v, want «клиент не задан»", err)
+		!strings.Contains(err.Error(), "client is not set") {
+		t.Errorf("a nil client: %v, want \"the client is not set\"", err)
 	}
 
 	failing := &fakeInfoRedis{err: errors.New("connection reset")}
 	if _, err := (RedisInfo{RDB: failing}).RedisUptime(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "INFO server") {
-		t.Errorf("ошибка команды: %v, want контекст INFO server", err)
+		t.Errorf("a command error: %v, want the INFO server context", err)
 	}
 
 	ok := &fakeInfoRedis{info: "# Server\nuptime_in_seconds:42\n"}
 	up, err := (RedisInfo{RDB: ok}).RedisUptime(context.Background())
 	if err != nil || up.Seconds != 42 {
-		t.Fatalf("чтение = (%+v, %v), want ({42}, nil)", up, err)
+		t.Fatalf("the read = (%+v, %v), want ({42}, nil)", up, err)
 	}
 	if len(ok.sections) != 1 || ok.sections[0][0] != "server" {
-		t.Errorf("секции запроса = %v, want [[server]]", ok.sections)
+		t.Errorf("the requested sections = %v, want [[server]]", ok.sections)
 	}
 }
 
@@ -101,7 +101,7 @@ func TestRedisInfoUptimeClient(t *testing.T) {
 // monotonic, no machine memory needed).
 func TestAlertsRedisRestartThreshold(t *testing.T) {
 	if AlertRedisRestartWindow != 15*time.Minute {
-		t.Fatalf("AlertRedisRestartWindow = %v, want 15 мин (3 прохода алертов)", AlertRedisRestartWindow)
+		t.Fatalf("AlertRedisRestartWindow = %v, want 15 min (3 alert passes)", AlertRedisRestartWindow)
 	}
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
@@ -119,7 +119,7 @@ func TestAlertsRedisRestartThreshold(t *testing.T) {
 	for i, s := range steps {
 		got := m.transition(env.Alerts, ctx, obs(int64(s.uptime)))
 		if got.Status != s.want {
-			t.Errorf("шаг %d (uptime %d с): статус = %s (%s), want %s", i, s.uptime, got.Status, got.Detail, s.want)
+			t.Errorf("step %d (uptime %d s): status = %s (%s), want %s", i, s.uptime, got.Status, got.Detail, s.want)
 		}
 	}
 	// The detail — the uptime and the stream loss warning.
@@ -127,7 +127,7 @@ func TestAlertsRedisRestartThreshold(t *testing.T) {
 	if hot.Status != AlertStatusFiring ||
 		!strings.Contains(hot.Detail, "30s") ||
 		!strings.Contains(hot.Detail, "T-270") {
-		t.Errorf("detail = %q (%s), want firing с аптаймом и отсылкой к компенсатору", hot.Detail, hot.Status)
+		t.Errorf("the detail = %q (%s), want firing with the uptime and the compensator reference", hot.Detail, hot.Status)
 	}
 }
 
@@ -137,17 +137,17 @@ func TestAlertsRedisRestartThreshold(t *testing.T) {
 func TestAlertsRedisRestartDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil) // the source is not set (no wiring was done)
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertRedisRestart); s.Status != AlertStatusNotMeasured {
-		t.Errorf("без источника: статус = %s, want not_measured", s.Status)
+		t.Errorf("without a source: status = %s, want not_measured", s.Status)
 	}
 
-	env.deps.RedisUptime = &fakeRedisUptime{errs: []error{errors.New("redis закрыт")}}
+	env.deps.RedisUptime = &fakeRedisUptime{errs: []error{errors.New("redis down")}}
 	s := snapshotOf(t, env.Pass(context.Background()), AlertRedisRestart)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "redis закрыт") {
-		t.Errorf("ошибка источника: %+v, want not_measured с причиной", s)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "redis down") {
+		t.Errorf("a source error: %+v, want not_measured with the reason", s)
 	}
 
 	env.deps.RedisUptime = &fakeRedisUptime{up: RedisUptime{Seconds: 86400}}
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertRedisRestart); s.Status != AlertStatusOK {
-		t.Errorf("суточный аптайм: статус = %s, want ok", s.Status)
+		t.Errorf("a day of uptime: status = %s, want ok", s.Status)
 	}
 }

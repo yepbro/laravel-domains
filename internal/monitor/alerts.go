@@ -221,26 +221,26 @@ const (
 
 // alertDescs — human-readable alert descriptions for log entries.
 var alertDescs = map[string]string{
-	AlertDNSErrors:        "рост доли ошибок DNS",
-	AlertQueueOverflow:    "переполнение очередей",
-	AlertProgressStall:    "остановка прогресса",
-	AlertDiskFree:         "нехватка места на диске",
-	AlertNVMeWear:         "износ NVMe (SMART)",
-	AlertBadHashes:        "мусорные content_hash при очистке удалённых доменов",
-	AlertUnitOOM:          "OOM-убийства и крэш-рестарты юнитов crawler",
-	AlertQueueDead:        "мертвые задачи в q:dead не разбираются",
-	AlertRedisMemory:      "память Redis у порога maxmemory",
-	AlertRedisRestart:     "рестарт Redis: недоставленные записи стримов потеряны (персистентности нет)",
-	AlertDiskMin:          "свободное место ниже абсолютного минимума",
-	AlertDiskCrit:         "свободное место ниже порога эскалации",
-	AlertMemHigh:          "троттлинг MemoryHigh юнита (устойчивый рост reclaim-событий)",
-	AlertQueueFreeze:      "замороженная очередь: группа не читает стрим",
-	AlertPSICPU:           "голод CPU (PSI some) устойчиво выше порога",
-	AlertRenderDebt:       "накопление рендер-долга: приток SPA обгоняет дренаж q:render",
-	AlertRenderFbDepth:    "накопление очереди фолбэка q:render-fallback: воркер B не успевает",
-	AlertRenderFbBudget:   "превышение бюджета доли фолбэка: деградация основного движка",
-	AlertRenderBrowserErr: "рост browser-ошибок этапа рендера: движок завис или недоступен",
-	AlertDomainsStale:     "домены «статус повис»: new с завершённой проверкой старше 24 ч",
+	AlertDNSErrors:        "DNS error share growth",
+	AlertQueueOverflow:    "queue overflow",
+	AlertProgressStall:    "progress stall",
+	AlertDiskFree:         "disk space shortage",
+	AlertNVMeWear:         "NVMe wear",
+	AlertBadHashes:        "junk content_hash in deleted-domain cleanup",
+	AlertUnitOOM:          "OOM kills and crash restarts of crawler units",
+	AlertQueueDead:        "dead tasks in q:dead are not triaged",
+	AlertRedisMemory:      "Redis memory near the maxmemory cap",
+	AlertRedisRestart:     "Redis restart: undelivered stream entries lost (no persistence)",
+	AlertDiskMin:          "free space below the absolute minimum",
+	AlertDiskCrit:         "free space below the escalation threshold",
+	AlertMemHigh:          "unit MemoryHigh throttling (sustained growth of reclaim events)",
+	AlertQueueFreeze:      "frozen queue: the group is not reading the stream",
+	AlertPSICPU:           "CPU starvation (PSI some) sustained above the threshold",
+	AlertRenderDebt:       "render debt accumulation: SPA inflow outruns the q:render drain",
+	AlertRenderFbDepth:    "q:render-fallback queue buildup: worker B cannot keep up",
+	AlertRenderFbBudget:   "fallback share budget exceeded: primary engine degradation",
+	AlertRenderBrowserErr: "render stage browser-error growth: the engine is hung or unavailable",
+	AlertDomainsStale:     "domains \"status hung\": new with a finished check older than 24 h",
 }
 
 // Evaluation thresholds. The spec does not set numbers; existing config
@@ -638,10 +638,10 @@ func (w OSWear) Wear(ctx context.Context) ([]NVMeWear, error) {
 	// a malformed pattern) — the branch is unreachable, cannot be killed by a test.
 	// mutator-disable-next-line branch/if
 	if err != nil {
-		return nil, fmt.Errorf("NVMe: обзор %s: %w", sysfs, err)
+		return nil, fmt.Errorf("NVMe: %s scan: %w", sysfs, err)
 	}
 	if len(names) == 0 {
-		return nil, fmt.Errorf("NVMe-устройства не обнаружены (%s)",
+		return nil, fmt.Errorf("no NVMe devices found (%s)",
 			filepath.Join(sysfs, "class", "nvme"))
 	}
 	var wears []NVMeWear
@@ -660,7 +660,7 @@ func (w OSWear) Wear(ctx context.Context) ([]NVMeWear, error) {
 		})
 	}
 	if len(wears) == 0 {
-		return nil, fmt.Errorf("SMART недоступен: %s", strings.Join(errs, "; "))
+		return nil, fmt.Errorf("SMART unavailable: %s", strings.Join(errs, "; "))
 	}
 	return wears, nil
 }
@@ -764,7 +764,7 @@ func wearOf(devPath string) (percent int, unitsWritten uint64, err error) {
 // of offsets without hardware.
 func parseHealthLog(page []byte) (percent int, unitsWritten uint64, err error) {
 	if len(page) < nvmeHealthLogSize {
-		return 0, 0, fmt.Errorf("NVMe: страница health короче %d байт: %d", nvmeHealthLogSize, len(page))
+		return 0, 0, fmt.Errorf("NVMe: the health page is shorter than %d bytes: %d", nvmeHealthLogSize, len(page))
 	}
 	// Equivalent to only the slice-end mutant page[48:57]: Uint64 reads
 	// the first 8 bytes, the ninth has no effect. The annotation applies to the whole
@@ -1082,8 +1082,8 @@ func NewAlerts(deps AlertsDeps, opts AlertsOptions) *Alerts {
 	return a
 }
 
-// mutator-disable-regexp a\.log\.Debug\("проход statement/remove
-// mutator-disable-regexp a\.log\.Info\("цикл statement/remove
+// mutator-disable-regexp a\.log\.Debug\("alert statement/remove
+// mutator-disable-regexp a\.log\.Info\("alert statement/remove
 // Justification: the service entries of the loop (the pass result Debug, the start Info) —
 // they do not change alert behavior, damped per docs/mutation-testing.md §4.
 
@@ -1099,7 +1099,7 @@ func (a *Alerts) Pass(ctx context.Context) AlertsResult {
 	if a.opts.OnPass != nil {
 		a.opts.OnPass(res)
 	}
-	a.log.Debug("проход алертов", "алертов", len(snaps), "сработало", len(res.Firing()))
+	a.log.Debug("alert pass", "alerts", len(snaps), "fired", len(res.Firing()))
 	return res
 }
 
@@ -1119,16 +1119,16 @@ func (a *Alerts) logFront(name, prev, status, detail string) {
 	}
 	switch status {
 	case AlertStatusFiring:
-		a.log.Warn("АЛЕРТ: "+desc, "alert", name, "detail", detail)
+		a.log.Warn("ALERT: "+desc, "alert", name, "detail", detail)
 	case AlertStatusOK:
 		if prev == AlertStatusFiring {
-			a.log.Info("алерт снят: "+desc, "alert", name, "detail", detail)
+			a.log.Info("alert cleared: "+desc, "alert", name, "detail", detail)
 		}
 	case AlertStatusNotMeasured:
 		if prev == AlertStatusFiring {
-			a.log.Info("сработавший алерт больше не измеряется: "+desc, "alert", name, "причина", detail)
+			a.log.Info("firing alert no longer measured: "+desc, "alert", name, "reason", detail)
 		} else {
-			a.log.Debug("алерт не измеряется: "+desc, "alert", name, "причина", detail)
+			a.log.Debug("alert not measured: "+desc, "alert", name, "reason", detail)
 		}
 	}
 }
@@ -1143,22 +1143,22 @@ func (a *Alerts) logFront(name, prev, status, detail string) {
 func (a *Alerts) observeDNS(ctx context.Context) observation[dnsShare] {
 	rows, err := a.deps.Pool.Query(ctx, dnsDailyCountersSQL)
 	if err != nil {
-		return observation[dnsShare]{err: fmt.Errorf("monitor: доля ошибок DNS: %w", err)}
+		return observation[dnsShare]{err: fmt.Errorf("monitor: DNS error share: %w", err)}
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return observation[dnsShare]{err: errors.New("monitor: доля ошибок DNS: пустой ответ")}
+		return observation[dnsShare]{err: errors.New("monitor: DNS error share: empty response")}
 	}
 	var temp, total int64
 	if err := rows.Scan(&temp, &total); err != nil {
-		return observation[dnsShare]{err: fmt.Errorf("monitor: доля ошибок DNS: чтение: %w", err)}
+		return observation[dnsShare]{err: fmt.Errorf("monitor: DNS error share: scan: %w", err)}
 	}
 	if err := rows.Err(); err != nil {
-		return observation[dnsShare]{err: fmt.Errorf("monitor: доля ошибок DNS: %w", err)}
+		return observation[dnsShare]{err: fmt.Errorf("monitor: DNS error share: %w", err)}
 	}
 	if total < AlertDNSMinSamples {
 		return observation[dnsShare]{
-			reason: fmt.Sprintf("проверок за текущие сутки %d < %d — доля не показательна", total, AlertDNSMinSamples),
+			reason: fmt.Sprintf("checks for the current day %d < %d — the share is not meaningful", total, AlertDNSMinSamples),
 		}
 	}
 	return observation[dnsShare]{value: dnsShare{temp: temp, total: total}}
@@ -1174,7 +1174,7 @@ func (a *Alerts) newDNSMachine() *alertMachine[dnsShare] {
 			fire: func(v dnsShare) bool { return v.share() >= AlertDNSFireShare },
 			hold: func(v dnsShare) bool { return v.share() >= AlertDNSRecoverShare },
 			okDetail: func(v dnsShare) string {
-				return fmt.Sprintf("доля temp_error %.1f%% (%d из %d проверок за текущие сутки)",
+				return fmt.Sprintf("temp_error share %.1f%% (%d of %d checks for the current day)",
 					100*v.share(), v.temp, v.total)
 			},
 		},
@@ -1188,18 +1188,18 @@ func (a *Alerts) newDNSMachine() *alertMachine[dnsShare] {
 // (the quarantine depth is read by queue_dead).
 func (a *Alerts) observeQueues(ctx context.Context) observation[map[string]int64] {
 	if a.deps.Redis == nil {
-		return observation[map[string]int64]{reason: "Redis не задан"}
+		return observation[map[string]int64]{reason: "Redis not set"}
 	}
 	if a.opts.QueueWatermark <= 0 {
 		return observation[map[string]int64]{
-			reason: "порог scheduler.queue_high_watermark не задан",
+			reason: "scheduler.queue_high_watermark threshold not set",
 		}
 	}
 	lens := make(map[string]int64, len(alertStreams))
 	for _, s := range alertStreams {
 		n, err := a.deps.Redis.Len(ctx, s)
 		if err != nil {
-			return observation[map[string]int64]{err: fmt.Errorf("monitor: глубина %s: %w", s, err)}
+			return observation[map[string]int64]{err: fmt.Errorf("monitor: %s depth: %w", s, err)}
 		}
 		lens[s] = n
 	}
@@ -1256,7 +1256,7 @@ func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 						maxStream, maxLen = s, lens[s]
 					}
 				}
-				return fmt.Sprintf("макс %s=%d", maxStream, maxLen)
+				return fmt.Sprintf("max %s=%d", maxStream, maxLen)
 			},
 			hotDetail: func(lens map[string]int64) string {
 				// The fired detail names the hot streams; when there are none —
@@ -1266,16 +1266,16 @@ func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 					n := lens[s]
 					switch {
 					case n >= wm[s]:
-						hot = append(hot, fmt.Sprintf("%s=%d (порог %d)", s, n, wm[s]))
+						hot = append(hot, fmt.Sprintf("%s=%d (threshold %d)", s, n, wm[s]))
 					case n >= holdAt(s):
-						hold = append(hold, fmt.Sprintf("%s=%d (порог %d)", s, n, wm[s]))
+						hold = append(hold, fmt.Sprintf("%s=%d (threshold %d)", s, n, wm[s]))
 					}
 				}
 				at := hot
 				if len(at) == 0 {
 					at = hold // hysteresis corridor: below the gate threshold, but close
 				}
-				return strings.Join(at, ", ") + " — глубина у порога"
+				return strings.Join(at, ", ") + " — depth at the threshold"
 			},
 		},
 		eval: a.observeQueues,
@@ -1291,21 +1291,21 @@ func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 func (a *Alerts) observeStall(ctx context.Context) observation[time.Time] {
 	rows, err := a.deps.Pool.Query(ctx, zoneFreshSQL)
 	if err != nil {
-		return observation[time.Time]{err: fmt.Errorf("monitor: остановка прогресса: %w", err)}
+		return observation[time.Time]{err: fmt.Errorf("monitor: progress stall: %w", err)}
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return observation[time.Time]{err: errors.New("monitor: остановка прогресса: пустой ответ")}
+		return observation[time.Time]{err: errors.New("monitor: progress stall: empty response")}
 	}
 	var last sql.NullTime
 	if err := rows.Scan(&last); err != nil {
-		return observation[time.Time]{err: fmt.Errorf("monitor: остановка прогресса: чтение: %w", err)}
+		return observation[time.Time]{err: fmt.Errorf("monitor: progress stall: scan: %w", err)}
 	}
 	if err := rows.Err(); err != nil {
-		return observation[time.Time]{err: fmt.Errorf("monitor: остановка прогресса: %w", err)}
+		return observation[time.Time]{err: fmt.Errorf("monitor: progress stall: %w", err)}
 	}
 	if !last.Valid {
-		return observation[time.Time]{reason: "справочник зон пуст — прогресс не отслеживается"}
+		return observation[time.Time]{reason: "the zone reference table is empty — progress is not tracked"}
 	}
 	return observation[time.Time]{value: last.Time}
 }
@@ -1326,11 +1326,11 @@ func (a *Alerts) newStallMachine() *alertMachine[time.Time] {
 				return now.Sub(last) > stallAfter
 			},
 			okDetail: func(now, last time.Time) string {
-				return fmt.Sprintf("последний пересчёт %s назад (порог %s)",
+				return fmt.Sprintf("the last recount %s ago (threshold %s)",
 					now.Sub(last).Round(time.Second), stallAfter)
 			},
 			hotDetail: func(now, last time.Time) string {
-				return fmt.Sprintf("zones.updated_at старше порога: %s (порог %d × %s)",
+				return fmt.Sprintf("zones.updated_at older than the threshold: %s (threshold %d × %s)",
 					now.Sub(last).Round(time.Second), AlertStallFactor, a.opts.ZoneStatsInterval)
 			},
 		},
@@ -1344,11 +1344,11 @@ func (a *Alerts) newStallMachine() *alertMachine[time.Time] {
 // snapshot observeDiskSpace.
 func (a *Alerts) observeDisk(_ context.Context) observation[SpaceStat] {
 	if a.opts.ContentDir == "" {
-		return observation[SpaceStat]{reason: "каталог контента не задан"}
+		return observation[SpaceStat]{reason: "content directory not set"}
 	}
 	if a.opts.DiskFreePercent <= 0 {
 		return observation[SpaceStat]{
-			reason: "контроль места выключен (content.disk_free_percent ≤ 0)",
+			reason: "space monitoring is off (content.disk_free_percent ≤ 0)",
 		}
 	}
 	return a.observeDiskSpace()
@@ -1362,10 +1362,10 @@ func (a *Alerts) observeDisk(_ context.Context) observation[SpaceStat] {
 func (a *Alerts) observeDiskSpace() observation[SpaceStat] {
 	sp, err := a.deps.Space.Space(a.opts.ContentDir)
 	if err != nil {
-		return observation[SpaceStat]{err: fmt.Errorf("monitor: свободное место %s: %w", a.opts.ContentDir, err)}
+		return observation[SpaceStat]{err: fmt.Errorf("monitor: free space %s: %w", a.opts.ContentDir, err)}
 	}
 	if sp.Total == 0 {
-		return observation[SpaceStat]{reason: "файловая система не сообщает ёмкость (total=0)"}
+		return observation[SpaceStat]{reason: "the file system does not report capacity (total=0)"}
 	}
 	return observation[SpaceStat]{value: sp}
 }
@@ -1375,7 +1375,7 @@ func (a *Alerts) observeDiskSpace() observation[SpaceStat] {
 // measured"; next — the shared snapshot observeDiskSpace.
 func (a *Alerts) observeDiskBytes(_ context.Context) observation[SpaceStat] {
 	if a.opts.ContentDir == "" {
-		return observation[SpaceStat]{reason: "каталог контента не задан"}
+		return observation[SpaceStat]{reason: "content directory not set"}
 	}
 	return a.observeDiskSpace()
 }
@@ -1394,7 +1394,7 @@ func (a *Alerts) newDiskMachine() *alertMachine[SpaceStat] {
 			},
 			okDetail: func(_ time.Time, sp SpaceStat) string {
 				free := 100 * float64(sp.Avail) / float64(sp.Total)
-				return fmt.Sprintf("свободно %.1f%% (%s из %s), порог %.1f%%",
+				return fmt.Sprintf("free %.1f%% (%s of %s), threshold %.1f%%",
 					free, alertBytes(sp.Avail), alertBytes(sp.Total), pct)
 			},
 		},
@@ -1422,13 +1422,13 @@ func (a *Alerts) newDiskBytesMachine(name string, threshold int64) *alertMachine
 			},
 			na: func(sp SpaceStat) string {
 				if threshold >= int64(sp.Total) {
-					return fmt.Sprintf("минимум %s ≥ ёмкости тома %s — порог неприменим, малый том под крылом процентного",
+					return fmt.Sprintf("the minimum %s ≥ the volume capacity %s — the threshold is inapplicable, a small volume stays under the percentage one",
 						alertBytes(uint64(threshold)), alertBytes(sp.Total))
 				}
 				return ""
 			},
 			okDetail: func(_ time.Time, sp SpaceStat) string {
-				return fmt.Sprintf("свободно %s из %s, порог %s",
+				return fmt.Sprintf("free %s of %s, threshold %s",
 					alertBytes(sp.Avail), alertBytes(sp.Total), alertBytes(uint64(threshold)))
 			},
 		},
@@ -1461,7 +1461,7 @@ func (a *Alerts) observeWear(ctx context.Context) observation[[]NVMeWear] {
 		return observation[[]NVMeWear]{reason: err.Error()}
 	}
 	if len(wears) == 0 {
-		return observation[[]NVMeWear]{reason: "NVMe-устройства не найдены"}
+		return observation[[]NVMeWear]{reason: "no NVMe devices found"}
 	}
 	return observation[[]NVMeWear]{value: wears}
 }
@@ -1494,7 +1494,7 @@ func (a *Alerts) newWearMachine() *alertMachine[[]NVMeWear] {
 			},
 			okDetail: func(_ time.Time, wears []NVMeWear) string {
 				worst := worstOf(wears)
-				return fmt.Sprintf("%s: использовано %d%% ресурса, записано %.1f ТБ (TBW)",
+				return fmt.Sprintf("%s: %d%% of the rated lifespan used, %.1f TB written (TBW)",
 					worst.Device, worst.PercentUsed, nvmeTBW(worst))
 			},
 			hotDetail: func(_ time.Time, wears []NVMeWear) string {
@@ -1505,7 +1505,7 @@ func (a *Alerts) newWearMachine() *alertMachine[[]NVMeWear] {
 						hot = append(hot, fmt.Sprintf("%s=%d%%", w.Device, w.PercentUsed))
 					}
 				}
-				return fmt.Sprintf("износ %s ≥ порога %d%% (%s: использовано %d%% ресурса, записано %.1f ТБ (TBW))",
+				return fmt.Sprintf("wear %s ≥ threshold %d%% (%s: %d%% of the rated lifespan used, %.1f TB written (TBW))",
 					strings.Join(hot, ", "), AlertNVMeWearPercent,
 					worst.Device, worst.PercentUsed, nvmeTBW(worst))
 			},
@@ -1529,12 +1529,12 @@ func nvmeTBW(w NVMeWear) float64 {
 func (a *Alerts) observeBadHashes(ctx context.Context) observation[int64] {
 	if a.deps.BadHashes == nil {
 		return observation[int64]{
-			reason: "источник не задан (monitor.ingest_metrics_url)",
+			reason: "source not set (monitor.ingest_metrics_url)",
 		}
 	}
 	cur, err := a.deps.BadHashes.BadHashes(ctx)
 	if err != nil {
-		return observation[int64]{err: fmt.Errorf("monitor: мусорные content_hash: %w", err)}
+		return observation[int64]{err: fmt.Errorf("monitor: junk content_hash: %w", err)}
 	}
 	return observation[int64]{value: cur}
 }
@@ -1551,8 +1551,8 @@ func (a *Alerts) newBadHashesMachine() *alertMachine[int64] {
 			threshold: AlertBadHashesThreshold,
 			passes:    AlertBadHashesWindow,
 			interval:  a.opts.Interval,
-			label:     "счётчик",
-			fireNote:  " — ошибка писателя результатов (T-056), refcount не менялся",
+			label:     "counter",
+			fireNote:  " — result-writer error (T-056), the refcount did not change",
 		},
 		eval: a.observeBadHashes,
 	}
@@ -1567,7 +1567,7 @@ func (a *Alerts) newBadHashesMachine() *alertMachine[int64] {
 // already puts the prefix).
 func (a *Alerts) observeUnitsSource(ctx context.Context) observation[[]UnitEvents] {
 	if a.deps.UnitEvents == nil {
-		return observation[[]UnitEvents]{reason: "источник не задан"}
+		return observation[[]UnitEvents]{reason: "source not set"}
 	}
 	units, err := a.deps.UnitEvents.UnitEvents(ctx)
 	if err != nil {
@@ -1587,7 +1587,7 @@ func (a *Alerts) observeUnitEvents(ctx context.Context) observation[[]UnitEvents
 		return o
 	}
 	if len(o.value) == 0 {
-		return observation[[]UnitEvents]{reason: "юниты " + unitEventsPattern + " не найдены"}
+		return observation[[]UnitEvents]{reason: "units " + unitEventsPattern + " not found"}
 	}
 	return o
 }
@@ -1624,7 +1624,7 @@ func (a *Alerts) newUnitOOMMachine() *alertMachine[[]UnitEvents] {
 				return false
 			},
 			okDetail: func(_ time.Time, units []UnitEvents) string {
-				return fmt.Sprintf("OOM и рестартов нет (%d юнитов)", len(units))
+				return fmt.Sprintf("no OOM or restarts (%d units)", len(units))
 			},
 			hotDetail: func(_ time.Time, units []UnitEvents) string {
 				var hot []string
@@ -1632,10 +1632,10 @@ func (a *Alerts) newUnitOOMMachine() *alertMachine[[]UnitEvents] {
 					if !u.hot() {
 						continue
 					}
-					hot = append(hot, fmt.Sprintf("%s: oom=%d oom_kill=%d рестартов=%d",
+					hot = append(hot, fmt.Sprintf("%s: oom=%d oom_kill=%d restarts=%d",
 						u.Unit, u.OOM, u.OOMKill, u.NRestarts))
 				}
-				return strings.Join(hot, ", ") + " — эпизод до перезапуска юнита (NRestarts — reset-failed, oom/oom_kill — новая cgroup)"
+				return strings.Join(hot, ", ") + " — episode until the unit restart (NRestarts — reset-failed, oom/oom_kill — a new cgroup)"
 			},
 		},
 		eval: a.observeUnitEvents,
@@ -1676,11 +1676,11 @@ func (a *Alerts) newMemHighMachine() *alertMachine[[]UnitEvents] {
 // of triage.
 func (a *Alerts) observeDead(ctx context.Context) observation[int64] {
 	if a.deps.Redis == nil {
-		return observation[int64]{reason: "Redis не задан"}
+		return observation[int64]{reason: "Redis not set"}
 	}
 	n, err := a.deps.Redis.Len(ctx, queue.StreamDead)
 	if err != nil {
-		return observation[int64]{err: fmt.Errorf("monitor: глубина q:dead: %w", err)}
+		return observation[int64]{err: fmt.Errorf("monitor: q:dead depth: %w", err)}
 	}
 	return observation[int64]{value: n}
 }
@@ -1708,7 +1708,7 @@ func (a *Alerts) newDeadMachine() *alertMachine[int64] {
 // machine track.
 func (a *Alerts) observeQueueFreeze(ctx context.Context) observation[[]StreamGroupState] {
 	if a.deps.StreamGroups == nil {
-		return observation[[]StreamGroupState]{reason: "источник не задан"}
+		return observation[[]StreamGroupState]{reason: "source not set"}
 	}
 	groups, err := a.deps.StreamGroups.StreamGroups(ctx)
 	if err != nil {
@@ -1743,15 +1743,15 @@ func (a *Alerts) newQueueFreezeMachine() *alertMachine[[]StreamGroupState] {
 // machine track.
 func (a *Alerts) observeRedisMemory(ctx context.Context) observation[RedisMemory] {
 	if a.deps.RedisMemory == nil {
-		return observation[RedisMemory]{reason: "источник не задан"}
+		return observation[RedisMemory]{reason: "source not set"}
 	}
 	m, err := a.deps.RedisMemory.RedisMemory(ctx)
 	if err != nil {
-		return observation[RedisMemory]{err: fmt.Errorf("monitor: память Redis: %w", err)}
+		return observation[RedisMemory]{err: fmt.Errorf("monitor: Redis memory: %w", err)}
 	}
 	if m.MaxBytes <= 0 {
 		return observation[RedisMemory]{
-			reason: fmt.Sprintf("maxmemory=%d — потолка нет, доля не определена", m.MaxBytes),
+			reason: fmt.Sprintf("maxmemory=%d — no cap, the share is undefined", m.MaxBytes),
 		}
 	}
 	return observation[RedisMemory]{value: m}
@@ -1766,7 +1766,7 @@ func (a *Alerts) observeRedisMemory(ctx context.Context) observation[RedisMemory
 func (a *Alerts) newRedisMemoryMachine() *alertMachine[RedisMemory] {
 	share := func(m RedisMemory) float64 { return float64(m.UsedBytes) / float64(m.MaxBytes) }
 	detail := func(m RedisMemory) string {
-		return fmt.Sprintf("used_memory %s из %s maxmemory (%.1f%%), политика %s",
+		return fmt.Sprintf("used_memory %s of %s maxmemory (%.1f%%), policy %s",
 			alertBytes(uint64(m.UsedBytes)), alertBytes(uint64(m.MaxBytes)), 100*share(m), m.Policy)
 	}
 	return &alertMachine[RedisMemory]{
@@ -1776,7 +1776,7 @@ func (a *Alerts) newRedisMemoryMachine() *alertMachine[RedisMemory] {
 			hold:     func(m RedisMemory) bool { return share(m) >= AlertRedisMemRecoverRatio },
 			okDetail: func(m RedisMemory) string { return detail(m) },
 			hotDetail: func(m RedisMemory) string {
-				return detail(m) + " — при noeviction у порога отказы записи (OOM command not allowed)"
+				return detail(m) + " — with noeviction, write refusals at the cap (OOM command not allowed)"
 			},
 		},
 		eval: a.observeRedisMemory,
@@ -1788,11 +1788,11 @@ func (a *Alerts) newRedisMemoryMachine() *alertMachine[RedisMemory] {
 // catches the event without machine memory.
 func (a *Alerts) observeRedisUptime(ctx context.Context) observation[int64] {
 	if a.deps.RedisUptime == nil {
-		return observation[int64]{reason: "источник не задан"}
+		return observation[int64]{reason: "source not set"}
 	}
 	up, err := a.deps.RedisUptime.RedisUptime(ctx)
 	if err != nil {
-		return observation[int64]{err: fmt.Errorf("monitor: аптайм Redis: %w", err)}
+		return observation[int64]{err: fmt.Errorf("monitor: Redis uptime: %w", err)}
 	}
 	return observation[int64]{value: up.Seconds}
 }
@@ -1810,7 +1810,7 @@ func (a *Alerts) newRedisRestartMachine() *alertMachine[int64] {
 			fire:     func(_ time.Time, v int64) bool { return v < window },
 			okDetail: func(_ time.Time, v int64) string { return "uptime " + uptime(v) },
 			hotDetail: func(_ time.Time, v int64) string {
-				return fmt.Sprintf("Redis запущен %s назад — недоставленные записи стримов потеряны (персистентности нет, docs/redis.md §5); ожидать рост new_done_stale и возврат когорты компенсатором T-270",
+				return fmt.Sprintf("Redis started %s ago — undelivered stream entries lost (no persistence, docs/redis.md §5); expect new_done_stale growth and the cohort returned by the T-270 compensator",
 					uptime(v))
 			},
 		},
@@ -1860,7 +1860,7 @@ func (a *Alerts) newPSIMachine() *alertMachine[PSIStat] {
 // the machine track.
 func (a *Alerts) observeRenderDebt(ctx context.Context) observation[RenderDebt] {
 	if a.deps.Redis == nil {
-		return observation[RenderDebt]{reason: "Redis не задан"}
+		return observation[RenderDebt]{reason: "Redis not set"}
 	}
 	d, err := renderDebtOf(ctx, a.deps.Pool, a.deps.Redis)
 	if err != nil {
@@ -1896,16 +1896,16 @@ func (a *Alerts) newRenderDebtMachine() *alertMachine[RenderDebt] {
 // — the machine track.
 func (a *Alerts) observeRenderFallbackDepth(ctx context.Context) observation[int64] {
 	if a.deps.Redis == nil {
-		return observation[int64]{reason: "Redis не задан"}
+		return observation[int64]{reason: "Redis not set"}
 	}
 	if a.opts.QueueWatermark <= 0 {
 		return observation[int64]{
-			reason: "порог scheduler.queue_high_watermark не задан",
+			reason: "scheduler.queue_high_watermark threshold not set",
 		}
 	}
 	n, err := a.deps.Redis.Len(ctx, queue.StreamRenderFallback)
 	if err != nil {
-		return observation[int64]{err: fmt.Errorf("monitor: глубина %s: %w", queue.StreamRenderFallback, err)}
+		return observation[int64]{err: fmt.Errorf("monitor: %s depth: %w", queue.StreamRenderFallback, err)}
 	}
 	return observation[int64]{value: n}
 }
@@ -1938,12 +1938,12 @@ func (a *Alerts) newRenderFbDepthMachine() *alertMachine[int64] {
 func (a *Alerts) observeRenderFallbackBudget(ctx context.Context) observation[int64] {
 	if a.deps.FallbackBudget == nil {
 		return observation[int64]{
-			reason: "источник не задан (monitor.render_metrics_url)",
+			reason: "source not set (monitor.render_metrics_url)",
 		}
 	}
 	cur, err := a.deps.FallbackBudget.FallbackBudget(ctx)
 	if err != nil {
-		return observation[int64]{err: fmt.Errorf("monitor: бюджет доли фолбэка: %w", err)}
+		return observation[int64]{err: fmt.Errorf("monitor: fallback share budget: %w", err)}
 	}
 	return observation[int64]{value: cur}
 }
@@ -1964,8 +1964,8 @@ func (a *Alerts) newRenderFbBudgetMachine() *alertMachine[int64] {
 			threshold: 1,
 			passes:    AlertFallbackBudgetWindow,
 			interval:  a.opts.Interval,
-			label:     "события бюджета",
-			fireNote:  " — доля фолбэка ушла за потолок render.fallback.share_percent: деградация основного движка (fallback-рейт — панель движков дашборда, причины — crawler_render_task_finalized_total)",
+			label:     "budget events",
+			fireNote:  " — the fallback share went past the render.fallback.share_percent cap: primary engine degradation (the fallback rate — the dashboard engines panel, the reasons — crawler_render_task_finalized_total)",
 		},
 		eval: a.observeRenderFallbackBudget,
 	}
@@ -1985,17 +1985,17 @@ func (a *Alerts) newRenderFbBudgetMachine() *alertMachine[int64] {
 func (a *Alerts) observeRenderBrowserErrors(ctx context.Context) observation[int64] {
 	if a.deps.RenderBrowserErrors == nil {
 		return observation[int64]{
-			reason: "источник не задан (monitor.render_metrics_url)",
+			reason: "source not set (monitor.render_metrics_url)",
 		}
 	}
 	cur, err := a.deps.RenderBrowserErrors.RenderBrowserErrors(ctx)
 	if err != nil {
 		if errors.Is(err, errNotRenderExposition) {
 			return observation[int64]{
-				reason: "экспозиция не рендер-воркера (нет crawler_stage_tasks_total{stage=\"render\"}) — проверьте monitor.render_metrics_url",
+				reason: "the exposition is not a render worker (no crawler_stage_tasks_total{stage=\"render\"}) — check monitor.render_metrics_url",
 			}
 		}
-		return observation[int64]{err: fmt.Errorf("monitor: browser-ошибки рендера: %w", err)}
+		return observation[int64]{err: fmt.Errorf("monitor: render browser errors: %w", err)}
 	}
 	return observation[int64]{value: cur}
 }
@@ -2035,26 +2035,26 @@ func (a *Alerts) newRenderBrowserErrMachine() *alertMachine[int64] {
 func (a *Alerts) observeDomainsNewDoneStale(ctx context.Context) observation[staleRow] {
 	rows, err := a.deps.Pool.Query(ctx, newDoneStaleSQL)
 	if err != nil {
-		return observation[staleRow]{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
+		return observation[staleRow]{err: fmt.Errorf("monitor: \"status hung\" domains: %w", err)}
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		// A dropped connection — not "no row": first a read failure
 		// (the retryMatureCount style).
 		if err := rows.Err(); err != nil {
-			return observation[staleRow]{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
+			return observation[staleRow]{err: fmt.Errorf("monitor: \"status hung\" domains: %w", err)}
 		}
 		return observation[staleRow]{
-			reason: "строки new_done_stale нет — первый проход реконсиляции ещё не завершился",
+			reason: "the new_done_stale row is missing — the first reconciliation pass has not completed yet",
 		}
 	}
 	var n int64
 	var snap sql.NullTime
 	if err := rows.Scan(&n, &snap); err != nil {
-		return observation[staleRow]{err: fmt.Errorf("monitor: домены «статус повис»: чтение: %w", err)}
+		return observation[staleRow]{err: fmt.Errorf("monitor: \"status hung\" domains: scan: %w", err)}
 	}
 	if err := rows.Err(); err != nil {
-		return observation[staleRow]{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
+		return observation[staleRow]{err: fmt.Errorf("monitor: \"status hung\" domains: %w", err)}
 	}
 	return observation[staleRow]{value: staleRow{value: n, snap: snap}}
 }
@@ -2078,11 +2078,11 @@ func (a *Alerts) newDomainsStaleMachine() *alertMachine[staleRow] {
 // shutdown, spec 3.4).
 func AlertsLoop(ctx context.Context, deps AlertsDeps, opts AlertsOptions) error {
 	if deps.Pool == nil {
-		return errors.New("monitor: алерты: пул БД не задан")
+		return errors.New("monitor: alerts: DB pool not set")
 	}
 	a := NewAlerts(deps, opts)
-	a.log.Info("цикл оценки алертов",
-		"interval", a.opts.Interval.String(), "алертов", len(a.machines))
+	a.log.Info("alert evaluation loop",
+		"interval", a.opts.Interval.String(), "alerts", len(a.machines))
 
 	pass := func() { a.Pass(ctx) }
 	pass()

@@ -42,7 +42,7 @@ func NewPSIMetrics(reg *metrics.Registry, src PSISource) *PSIMetrics {
 	}
 	m.gauge = reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_psi_cpu_some_percent",
-		Help: "Доля времени задержки CPU по PSI some (%) из /proc/pressure/cpu (T-162): kind=avg10/avg60/avg300 — средние за окно. Устойчивый avg300 выше ~90 % — голод планировщика, алерт psi_cpu монитора (тонут все этапы; замер §12: some 91–95 %).",
+		Help: "The CPU stall time share per PSI some (%) from /proc/pressure/cpu (T-162): kind=avg10/avg60/avg300 — the window averages. A sustained avg300 above ~90% — scheduler starvation, the monitor psi_cpu alert (all stages drown; measurement §12: some 91–95%).",
 	}, metrics.LabelKind)
 	return m
 }

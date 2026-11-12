@@ -27,7 +27,7 @@ import (
 // built in or disabled by the psi parameter). An expected degradation of some
 // environments, not an incident — the psi_cpu alert is quietly "not measured"
 // on it (the errNoSystemd style of unit events, T-145).
-var errNoPSI = errors.New("PSI не доступен (ядро без CONFIG_PSI или psi=0)")
+var errNoPSI = errors.New("PSI is unavailable (a kernel without CONFIG_PSI or psi=0)")
 
 // PSIStat — the CPU pressure via the some line of /proc/pressure/cpu:
 // the average share of stall time (%) over 10 s / 60 s / 300 s.
@@ -116,15 +116,15 @@ func parsePSIKind(data, kind string) (PSIStat, error) {
 		} {
 			v, ok := fields[f.key]
 			if !ok {
-				return PSIStat{}, fmt.Errorf("monitor: PSI: поле %s отсутствует", f.key)
+				return PSIStat{}, fmt.Errorf("monitor: PSI: the %s field is missing", f.key)
 			}
 			n, err := strconv.ParseFloat(v, 64)
 			if err != nil || n < 0 || n > 100 {
-				return PSIStat{}, fmt.Errorf("monitor: PSI: %s=%q не доля процента", f.key, v)
+				return PSIStat{}, fmt.Errorf("monitor: PSI: %s=%q is not a percent share", f.key, v)
 			}
 			*f.val = n
 		}
 		return st, nil
 	}
-	return PSIStat{}, fmt.Errorf("monitor: PSI: строка %s отсутствует", kind)
+	return PSIStat{}, fmt.Errorf("monitor: PSI: the %s line is missing", kind)
 }

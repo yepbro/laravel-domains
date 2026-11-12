@@ -176,7 +176,7 @@ func (m *alertMachine[V]) transition(a *Alerts, ctx context.Context, o observati
 	switch {
 	case o.err != nil:
 		if ctx.Err() == nil {
-			a.log.Warn("оценка алерта: "+alertDescs[m.name], "alert", m.name, "err", o.err)
+			a.log.Warn("alert evaluation: "+alertDescs[m.name], "alert", m.name, "err", o.err)
 		}
 		status, detail = AlertStatusNotMeasured, o.err.Error()
 	case o.reason != "":
@@ -292,10 +292,10 @@ func (t *deadStreakTrack) decide(prev string, _ time.Time, n int64) decision {
 	} else {
 		t.streak = 0
 	}
-	detail := fmt.Sprintf("глубина q:dead=%d, ненулевых проходов подряд %d/%d; темп смертей — crawler_queue_dead_buried_total",
+	detail := fmt.Sprintf("q:dead depth=%d, %d/%d non-zero passes in a row; the death rate — crawler_queue_dead_buried_total",
 		n, t.streak, t.minPasses)
 	if t.streak >= t.minPasses || (prev == AlertStatusFiring && n > 0) {
-		return decision{AlertStatusFiring, detail + " — разбор: runbooks §2"}
+		return decision{AlertStatusFiring, detail + " — triage: runbooks §2"}
 	}
 	return decision{AlertStatusOK, detail}
 }
@@ -341,7 +341,7 @@ func (t *memHighStreakTrack) decide(_ string, _ time.Time, units []UnitEvents) d
 		tr.seen, tr.prev = true, u.High
 		t.units[u.Unit] = tr
 		if tr.streak >= t.minPasses {
-			hot = append(hot, fmt.Sprintf("%s: +%d за проход, серия %d", u.Unit, grew, tr.streak))
+			hot = append(hot, fmt.Sprintf("%s: +%d per pass, streak %d", u.Unit, grew, tr.streak))
 		}
 	}
 	for name := range t.units { // the unit vanished (renamed/unloaded) — do not accumulate
@@ -352,12 +352,12 @@ func (t *memHighStreakTrack) decide(_ string, _ time.Time, units []UnitEvents) d
 	if len(hot) > 0 {
 		return decision{
 			AlertStatusFiring,
-			strings.Join(hot, ", ") + " — устойчивый троттлинг MemoryHigh (reclaim), предвестник фаталов (T-157)",
+			strings.Join(hot, ", ") + " — sustained MemoryHigh throttling (reclaim), the harbinger of fatals (T-157)",
 		}
 	}
 	return decision{
 		AlertStatusOK,
-		fmt.Sprintf("роста троттлинга MemoryHigh нет (%d юнитов, порог — рост %d проходов подряд)",
+		fmt.Sprintf("no MemoryHigh throttling growth (%d units, the threshold is growth for %d passes in a row)",
 			len(units), t.minPasses),
 	}
 }
@@ -384,12 +384,12 @@ func (t *counterGrowthTrack) decide(_ string, _ time.Time, cur int64) decision {
 		t.streak = 0
 	}
 	t.seen, t.prev = true, cur
-	detail := fmt.Sprintf("browser-ошибки рендера %d, серия роста %d/%d (+%d за проход)",
+	detail := fmt.Sprintf("render browser errors %d, growth streak %d/%d (+%d per pass)",
 		cur, t.streak, t.minPasses, delta)
 	if t.streak >= t.minPasses {
 		return decision{
 			AlertStatusFiring,
-			detail + " — движок рендера завис или недоступен: health-гейт приостановил фолбэк-публикации, браузер-класс в redelivery q:render (откат движка — ТЗ рендера §6.4, разбор — docs/render.md)",
+			detail + " — the render engine is hung or unavailable: the health gate suspended the fallback publications, the browser class waits in the q:render redelivery (engine rollback — the render spec §6.4, triage — docs/render.md)",
 		}
 	}
 	return decision{AlertStatusOK, detail}
@@ -426,12 +426,12 @@ func (t *newDoneStaleTrack) decide(prev string, _ time.Time, row staleRow) decis
 	} else {
 		t.streak = 0
 	}
-	detail := fmt.Sprintf("доменов new∧done старше суток %d, ненулевых снапшотов реконсиляции подряд %d/%d (значение — проход реконсиляции, gauge crawler_domains_new_done_stale)",
+	detail := fmt.Sprintf("new∧done domains older than a day %d, %d/%d non-zero reconciliation snapshots in a row (the value — a reconciliation pass, the gauge crawler_domains_new_done_stale)",
 		n, t.streak, t.minPasses)
 	if t.streak >= t.minPasses || (prev == AlertStatusFiring && n > 0) {
 		return decision{
 			AlertStatusFiring,
-			detail + " — потеря задач q:http: HTTP-итог не записан, когорту вернёт компенсатор T-270 (ранний recheck, stalerequeue.go; спецификация — internal/model/enums.go)",
+			detail + " — lost q:http tasks: the HTTP outcome is not written, the cohort will be returned by the T-270 compensator (the early recheck, stalerequeue.go; the specification — internal/model/enums.go)",
 		}
 	}
 	return decision{AlertStatusOK, detail}
@@ -510,14 +510,14 @@ func (t *renderDebtTrack) decide(_ string, _ time.Time, d RenderDebt) decision {
 	// a corridor ≥ 1 at any valid threshold (the minimum 1) — the fired
 	// alert is always reachable for clearing; at 50k the clearing is below 45k.
 	recoverAt := (t.domains*9 + 9) / 10
-	detail := fmt.Sprintf("рендер-долг: %s, порог %d (снятие < %d), серия роста %d/%d проходов (+%d за проход)",
+	detail := fmt.Sprintf("render debt: %s, threshold %d (clearing < %d), growth streak %d/%d passes (+%d per pass)",
 		d.String(), t.domains, recoverAt, t.mem.streak, t.passes, delta)
 	switch {
 	case total > t.domains && t.mem.streak >= t.passes:
 		t.mem.firing = true
 		return decision{
 			AlertStatusFiring,
-			detail + " — накопление: приток SPA обгоняет дренаж (render.contexts / приток планировщика, разбор — docs/runbooks.md)",
+			detail + " — accumulation: the SPA inflow outruns the drain (render.contexts / the scheduler inflow, triage — docs/runbooks.md)",
 		}
 	case t.mem.firing && total >= recoverAt:
 		// Holding the fired state: lag swings at a stationary debt
@@ -526,7 +526,7 @@ func (t *renderDebtTrack) decide(_ string, _ time.Time, d RenderDebt) decision {
 		// a source failure ("not measured") does not close the episode.
 		return decision{
 			AlertStatusFiring,
-			detail + " — долг держится выше порога снятия (уровень — строка «Рендер-долг» отчёта нагрузки)",
+			detail + " — the debt holds above the clearing threshold (the level — the \"Render debt\" row of the load report)",
 		}
 	default:
 		t.mem.firing = false
@@ -559,7 +559,7 @@ func (t *renderFbDepthTrack) decide(_ string, _ time.Time, n int64) decision {
 	// The clearing threshold — 90% of the firing threshold, an integer ceil
 	// (the render_debt style): a corridor ≥ 1 at any valid watermark.
 	recoverAt := (t.wm*9 + 9) / 10
-	detail := fmt.Sprintf("глубина %s=%d, порог %d (снятие < %d), серия роста %d/%d (+%d за проход), у порога %d/%d проходов",
+	detail := fmt.Sprintf("depth %s=%d, threshold %d (clearing < %d), growth streak %d/%d (+%d per pass), at the threshold %d/%d passes",
 		queue.StreamRenderFallback, n, t.wm, recoverAt, t.mem.streak, t.passes, delta,
 		t.mem.hot, t.passes)
 	switch {
@@ -568,17 +568,17 @@ func (t *renderFbDepthTrack) decide(_ string, _ time.Time, n int64) decision {
 		if t.mem.streak >= t.passes {
 			return decision{
 				AlertStatusFiring,
-				detail + " — накопление: приток фолбэка обгоняет темп воркера B (render.fallback.worker_rate / движок-кандидат, разбор — docs/render.md)",
+				detail + " — accumulation: the fallback inflow outruns worker B's rate (render.fallback.worker_rate / the candidate engine, triage — docs/render.md)",
 			}
 		}
 		return decision{
 			AlertStatusFiring,
-			detail + " — глубина стационарно у порога без роста: воркер B стоит либо очередь упёрлась в предел MAXLEN стрима (XADD вытесняет недоставленное), разбор — docs/render.md",
+			detail + " — the depth is stationary at the threshold without growth: worker B is stopped or the queue hit the MAXLEN limit of the stream (XADD evicts the undelivered), triage — docs/render.md",
 		}
 	case t.mem.firing && n >= recoverAt:
 		return decision{
 			AlertStatusFiring,
-			detail + " — глубина держится выше порога снятия (темп/глубина — панель движков дашборда)",
+			detail + " — the depth holds above the clearing threshold (the rate/depth — the dashboard engines panel)",
 		}
 	default:
 		t.mem.firing = false
@@ -658,7 +658,7 @@ type ringTrack struct {
 // decide — the ring transition: the window sum against the threshold.
 func (t ringTrack) decide(_ string, _ time.Time, cur int64) decision {
 	sum := t.ring.push(cur)
-	detail := fmt.Sprintf("%s %d, новых за окно %s — %d (порог %d)",
+	detail := fmt.Sprintf("%s %d, new over the window %s — %d (threshold %d)",
 		t.label, cur, (time.Duration(t.passes) * t.interval).Round(time.Second), sum, t.threshold)
 	if sum >= t.threshold {
 		return decision{AlertStatusFiring, detail + t.fireNote}
@@ -691,19 +691,19 @@ func (t *psiWindowTrack) decide(_ string, now time.Time, st PSIStat) decision {
 	case t.hot.IsZero():
 		t.hot = now
 	}
-	detail := fmt.Sprintf("some avg10=%.2f%% avg60=%.2f%% avg300=%.2f%%, порог %.0f%% (окно %s)",
+	detail := fmt.Sprintf("some avg10=%.2f%% avg60=%.2f%% avg300=%.2f%%, threshold %.0f%% (window %s)",
 		st.Avg10, st.Avg60, st.Avg300, t.percent, t.window)
 	if over {
 		held := now.Sub(t.hot)
 		if held >= t.window {
 			return decision{
 				AlertStatusFiring,
-				detail + fmt.Sprintf(" — выше порога уже %s", held.Round(time.Second)),
+				detail + fmt.Sprintf(" — above the threshold for %s already", held.Round(time.Second)),
 			}
 		}
 		return decision{
 			AlertStatusOK,
-			detail + fmt.Sprintf(" — выше порога %s из окна, накопление", held.Round(time.Second)),
+			detail + fmt.Sprintf(" — above the threshold %s of the window, accumulating", held.Round(time.Second)),
 		}
 	}
 	return decision{AlertStatusOK, detail}
@@ -756,7 +756,7 @@ func (t *queueFreezeTrack) decide(_ string, now time.Time, groups []StreamGroupS
 		}
 		idle := now.Sub(tr.since)
 		if idle >= t.window {
-			frozen = append(frozen, fmt.Sprintf("%s/%s: доставки нет %s при глубине %d (последний ID %s)",
+			frozen = append(frozen, fmt.Sprintf("%s/%s: no deliveries for %s at depth %d (the last ID %s)",
 				g.Stream, g.Group, idle.Round(time.Second), g.Depth, g.LastDeliveredID))
 		}
 	}
@@ -768,12 +768,12 @@ func (t *queueFreezeTrack) decide(_ string, now time.Time, groups []StreamGroupS
 	if len(frozen) > 0 {
 		return decision{
 			AlertStatusFiring,
-			strings.Join(frozen, "; ") + " — потребитель не читает: лог юнита-воркера и q:dead (яд T-159), перезапуск воркера",
+			strings.Join(frozen, "; ") + " — the consumer is not reading: the worker unit log and q:dead (the T-159 poison), a worker restart",
 		}
 	}
 	return decision{
 		AlertStatusOK,
-		fmt.Sprintf("групп с движением/без backlog — %d из %d (окно %s)",
+		fmt.Sprintf("groups moving/without backlog — %d of %d (window %s)",
 			moving, len(groups), t.window),
 	}
 }

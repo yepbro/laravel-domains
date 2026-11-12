@@ -77,36 +77,36 @@ func TestParseRedisMemoryINFO(t *testing.T) {
 	}
 	want := RedisMemory{UsedBytes: 104857600, MaxBytes: 536870912, Policy: "noeviction"}
 	if m != want {
-		t.Errorf("parse:\n получил  %+v\n хочу     %+v", m, want)
+		t.Errorf("parse:\n got    %+v\n want   %+v", m, want)
 	}
 
 	// Without \r (unix output) — the same result.
 	m, err = parseRedisMemoryINFO(strings.ReplaceAll(raw, "\r", ""))
 	if err != nil || m != want {
-		t.Errorf("без CR: (%+v, %v), хочу (%+v, nil)", m, err, want)
+		t.Errorf("without CR: (%+v, %v), want (%+v, nil)", m, err, want)
 	}
 
 	// maxmemory 0 — a valid "no cap" value (not a parse error:
 	// the share is undefined, but the absolutes and the policy are read).
 	m, err = parseRedisMemoryINFO("# Memory\nused_memory:10\nmaxmemory:0\nmaxmemory_policy:noeviction\n")
 	if err != nil {
-		t.Fatalf("maxmemory 0: %v, want валидный снимок", err)
+		t.Fatalf("maxmemory 0: %v, want a valid snapshot", err)
 	}
 	if m.MaxBytes != 0 || m.UsedBytes != 10 || m.Policy != "noeviction" {
-		t.Errorf("maxmemory 0: %+v, want нулевой потолок с абсолютами", m)
+		t.Errorf("maxmemory 0: %+v, want a zero cap with the absolutes", m)
 	}
 
 	for name, bad := range map[string]string{
-		"нет used_memory":       "# Memory\nmaxmemory:1\nmaxmemory_policy:noeviction\n",
-		"нет maxmemory":         "# Memory\nused_memory:1\nmaxmemory_policy:noeviction\n",
-		"нет политики":          "# Memory\nused_memory:1\nmaxmemory:1\n",
-		"used не число":         "# Memory\nused_memory:100M\nmaxmemory:1\nmaxmemory_policy:noeviction\n",
-		"maxmemory отрицателен": "# Memory\nused_memory:1\nmaxmemory:-1\nmaxmemory_policy:noeviction\n",
-		"пустой ответ":          "",
+		"no used_memory":       "# Memory\nmaxmemory:1\nmaxmemory_policy:noeviction\n",
+		"no maxmemory":         "# Memory\nused_memory:1\nmaxmemory_policy:noeviction\n",
+		"no policy":          "# Memory\nused_memory:1\nmaxmemory:1\n",
+		"used is not a number":         "# Memory\nused_memory:100M\nmaxmemory:1\nmaxmemory_policy:noeviction\n",
+		"maxmemory is negative": "# Memory\nused_memory:1\nmaxmemory:-1\nmaxmemory_policy:noeviction\n",
+		"an empty response":          "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseRedisMemoryINFO(bad); err == nil {
-				t.Fatalf("кривой INFO разобран: %q", bad)
+				t.Fatalf("a malformed INFO was parsed: %q", bad)
 			}
 		})
 	}
@@ -119,8 +119,8 @@ func TestParseRedisMemoryINFO(t *testing.T) {
 // memory section.
 func TestRedisInfoSource(t *testing.T) {
 	if _, err := (RedisInfo{}).RedisMemory(context.Background()); err == nil ||
-		!strings.Contains(err.Error(), "клиент не задан") {
-		t.Errorf("nil клиент: %v, want ошибка источника", err)
+		!strings.Contains(err.Error(), "client is not set") {
+		t.Errorf("a nil client: %v, want a source error", err)
 	}
 
 	fake := &fakeInfoRedis{info: "# Memory\nused_memory:10\nmaxmemory:100\nmaxmemory_policy:noeviction\n"}
@@ -129,16 +129,16 @@ func TestRedisInfoSource(t *testing.T) {
 		t.Fatalf("RedisMemory: %v", err)
 	}
 	if m.UsedBytes != 10 || m.MaxBytes != 100 || m.Policy != "noeviction" {
-		t.Errorf("снимок = %+v, want значения из INFO", m)
+		t.Errorf("the snapshot = %+v, want the values from INFO", m)
 	}
 	if len(fake.sections) != 1 || fake.sections[0][0] != "memory" {
-		t.Errorf("секции запроса = %v, want [memory]", fake.sections)
+		t.Errorf("the requested sections = %v, want [memory]", fake.sections)
 	}
 
 	fake.err = errors.New("connection refused")
 	if _, err := (RedisInfo{RDB: fake}).RedisMemory(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "INFO memory") {
-		t.Errorf("ошибка команды: %v, want обёрнутая ошибка INFO memory", err)
+		t.Errorf("a command error: %v, want a wrapped INFO memory error", err)
 	}
 }
 
@@ -166,12 +166,12 @@ func TestRedisMemoryMetrics(t *testing.T) {
 	}
 
 	// A source error — the error transit, the metrics keep the last values.
-	src.errs = []error{errors.New("redis недоступен")}
+	src.errs = []error{errors.New("redis unavailable")}
 	if _, err := m.RedisMemory(context.Background()); err == nil {
-		t.Error("ошибка источника не прокинута")
+		t.Error("the source error is not propagated")
 	}
 	if v, ok := gaugeLabels(t, reg, "crawler_redis_memory_ratio", nil); !ok || v != 0.5 {
-		t.Errorf("после ошибки ratio = (%v, %v), want прежние 0.5", v, ok)
+		t.Errorf("after the error ratio = (%v, %v), want the previous 0.5", v, ok)
 	}
 
 	// New values overwrite the gauge.
@@ -181,7 +181,7 @@ func TestRedisMemoryMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	if v, _ := gaugeLabels(t, reg, "crawler_redis_memory_ratio", nil); v != 0.75 {
-		t.Errorf("перезапись ratio = %v, want 0.75", v)
+		t.Errorf("the ratio overwrite = %v, want 0.75", v)
 	}
 
 	// maxmemory 0 (no cap) — the ratio is undefined and is not written,
@@ -191,7 +191,7 @@ func TestRedisMemoryMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	if v, _ := gaugeLabels(t, reg, "crawler_redis_memory_ratio", nil); v != 0.75 {
-		t.Errorf("ratio при maxmemory 0 = %v, want прежний (не определён, не пишется)", v)
+		t.Errorf("the ratio at maxmemory 0 = %v, want the previous one (undefined, not written)", v)
 	}
 	if v, _ := gaugeLabels(t, reg, "crawler_redis_memory_bytes", map[string]string{"kind": "max"}); v != 0 {
 		t.Errorf("bytes{max} = %v, want 0", v)
@@ -201,6 +201,6 @@ func TestRedisMemoryMetrics(t *testing.T) {
 	plain := NewRedisMemoryMetrics(nil, &fakeRedisMem{mem: RedisMemory{UsedBytes: 1, MaxBytes: 2, Policy: "noeviction"}})
 	snap, err := plain.RedisMemory(context.Background())
 	if err != nil || snap.UsedBytes != 1 || snap.MaxBytes != 2 {
-		t.Errorf("транзит без реестра = (%+v, %v), want источник как есть", snap, err)
+		t.Errorf("transit without a registry = (%+v, %v), want the source as is", snap, err)
 	}
 }

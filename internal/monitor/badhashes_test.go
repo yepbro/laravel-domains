@@ -70,12 +70,12 @@ func TestAlertsBadHashesThreshold(t *testing.T) {
 	for i, s := range steps {
 		got := m.transition(env.Alerts, ctx, obs(s.cur))
 		if got.Status != s.want {
-			t.Errorf("шаг %d (счётчик %d): статус = %s (%s), want %s", i, s.cur, got.Status, got.Detail, s.want)
+			t.Errorf("step %d (counter %d): status = %s (%s), want %s", i, s.cur, got.Status, got.Detail, s.want)
 		}
 		if i == len(steps)-1 {
 			for _, want := range []string{"112", "12", "10"} { // the counter, the sum, the threshold
 				if !strings.Contains(got.Detail, want) {
-					t.Errorf("detail %q не содержит %s", got.Detail, want)
+					t.Errorf("the detail %q does not contain %s", got.Detail, want)
 				}
 			}
 		}
@@ -83,7 +83,7 @@ func TestAlertsBadHashesThreshold(t *testing.T) {
 
 	// It holds for the next pass (the sum is still in the window)…
 	if got := m.transition(env.Alerts, ctx, obs(int64(112))); got.Status != AlertStatusFiring {
-		t.Errorf("окно ещё держит сумму: статус = %s (%s), want firing", got.Status, got.Detail)
+		t.Errorf("the window still holds the sum: status = %s (%s), want firing", got.Status, got.Detail)
 	}
 
 	// …and ages without new junk rows: after the window of zero deltas
@@ -93,7 +93,7 @@ func TestAlertsBadHashesThreshold(t *testing.T) {
 			return
 		}
 	}
-	t.Fatal("алерт не снят после старения окна без новых мусорных строк")
+	t.Fatal("the alert was not cleared after the window aging without new junk rows")
 }
 
 // TestBadHashesWindow — the delta ring size (deltaRing): the window of exactly 15 values —
@@ -104,25 +104,25 @@ func TestAlertsBadHashesThreshold(t *testing.T) {
 // set of last deltas (see the annotation in push).
 func TestBadHashesWindow(t *testing.T) {
 	if AlertBadHashesWindow != 15 {
-		t.Fatalf("AlertBadHashesWindow = %d, want 15 (окно 15 проходов алертов)", AlertBadHashesWindow)
+		t.Fatalf("AlertBadHashesWindow = %d, want 15 (a window of 15 alert passes)", AlertBadHashesWindow)
 	}
 	w := &deltaRing{}
 	if sum := w.push(0); sum != 0 {
-		t.Fatalf("первое наблюдение (база): сумма = %d, want 0", sum)
+		t.Fatalf("the first observation (the base): the sum = %d, want 0", sum)
 	}
 	if sum := w.push(10); sum != 10 {
-		t.Fatalf("всплеск +10: сумма = %d, want 10", sum)
+		t.Fatalf("a spike of +10: the sum = %d, want 10", sum)
 	}
 	// The window of 15: the spike holds while 14 subsequent deltas have not evicted
 	// it from the ring (without counter growth the deltas are zero).
 	for i := 1; i <= AlertBadHashesWindow-1; i++ {
 		if sum := w.push(10); sum != 10 {
-			t.Fatalf("после %d нулевых дельт: сумма = %d, want 10 (окно ещё держит)", i, sum)
+			t.Fatalf("after %d zero deltas: the sum = %d, want 10 (the window still holds)", i, sum)
 		}
 	}
 	// The 15th zero delta overwrites the spike cell — the sum is 0.
 	if sum := w.push(10); sum != 0 {
-		t.Fatalf("окно освободилось: сумма = %d, want 0", sum)
+		t.Fatalf("the window freed up: the sum = %d, want 0", sum)
 	}
 }
 
@@ -137,11 +137,11 @@ func TestAlertsBadHashesExactThreshold(t *testing.T) {
 	_ = m.transition(env.Alerts, ctx, obs(int64(0)))   // the base
 	s := m.transition(env.Alerts, ctx, obs(int64(10))) // a single delta of exactly 10
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("сумма ровно 10: статус = %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("the sum exactly 10: status = %s (%s), want firing", s.Status, s.Detail)
 	}
 	for _, want := range []string{"1h15m0s", "10"} { // the window of 15 × 5m, the threshold
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail %q не содержит %s", s.Detail, want)
+			t.Errorf("the detail %q does not contain %s", s.Detail, want)
 		}
 	}
 }
@@ -155,18 +155,18 @@ func TestAlertsBadHashesRestart(t *testing.T) {
 
 	_ = m.transition(env.Alerts, ctx, obs(int64(50)))                                      // the base
 	if got := m.transition(env.Alerts, ctx, obs(int64(50))); got.Status != AlertStatusOK { // silence
-		t.Fatalf("тишина: статус = %s (%s), want ok", got.Status, got.Detail)
+		t.Fatalf("silence: status = %s (%s), want ok", got.Status, got.Detail)
 	}
 
 	// An ingest restart: the counter is below the previous one — a decrease gives a zero
 	// delta, no false spike (the counter is counted anew).
 	if got := m.transition(env.Alerts, ctx, obs(int64(3))); got.Status != AlertStatusOK {
-		t.Errorf("рестарт источника: статус = %s (%s), want ok без ложного всплеска", got.Status, got.Detail)
+		t.Errorf("a source restart: status = %s (%s), want ok without a false spike", got.Status, got.Detail)
 	}
 
 	// New growth after the restart is counted from the new base: +17 ≥ the threshold.
 	if got := m.transition(env.Alerts, ctx, obs(int64(20))); got.Status != AlertStatusFiring {
-		t.Errorf("рост после рестарта: статус = %s (%s), want firing", got.Status, got.Detail)
+		t.Errorf("growth after the restart: status = %s (%s), want firing", got.Status, got.Detail)
 	}
 }
 
@@ -176,22 +176,22 @@ func TestAlertsBadHashesRestart(t *testing.T) {
 func TestAlertsBadHashesDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertBadHashes); s.Status != AlertStatusNotMeasured {
-		t.Fatalf("без источника: статус = %s, want not_measured", s.Status)
+		t.Fatalf("without a source: status = %s, want not_measured", s.Status)
 	}
 
 	src := &fakeBadHashes{errs: []error{errors.New("connection refused")}}
 	env.deps.BadHashes = src
 	s := snapshotOf(t, env.Pass(context.Background()), AlertBadHashes)
 	if s.Status != AlertStatusNotMeasured {
-		t.Fatalf("ошибка источника: статус = %s, want not_measured", s.Status)
+		t.Fatalf("a source error: status = %s, want not_measured", s.Status)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "connection refused") {
-		t.Errorf("ошибка источника без Warn:\n%s", env.buf.String())
+		t.Errorf("a source error without a Warn:\n%s", env.buf.String())
 	}
 
 	s = snapshotOf(t, env.Pass(context.Background()), AlertBadHashes)
 	if s.Status != AlertStatusOK {
-		t.Errorf("после ошибки статус = %s, want ok (цикл живёт)", s.Status)
+		t.Errorf("after the error status = %s, want ok (the loop lives)", s.Status)
 	}
 }
 
@@ -201,10 +201,10 @@ func TestAlertsBadHashesDegradation(t *testing.T) {
 // the real format (HELP/TYPE, neighboring metrics with labels) and the
 // status/network errors.
 func TestIngestBadHashesHTTP(t *testing.T) {
-	const exposition = "# HELP crawler_service_up Сервис запущен.\n" +
+	const exposition = "# HELP crawler_service_up The service is up.\n" +
 		"# TYPE crawler_service_up gauge\n" +
 		"crawler_service_up{service=\"ingest\"} 1\n" +
-		"# HELP crawler_ingest_bad_hashes_total Удалённые очисткой результаты.\n" +
+		"# HELP crawler_ingest_bad_hashes_total Results removed by the cleanup.\n" +
 		"# TYPE crawler_ingest_bad_hashes_total counter\n" +
 		"crawler_ingest_bad_hashes_total{service=\"ingest\"} 42\n"
 
@@ -218,14 +218,14 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 		t.Fatalf("BadHashes: %v", err)
 	}
 	if got != 42 {
-		t.Errorf("счётчик = %d, want 42", got)
+		t.Errorf("the counter = %d, want 42", got)
 	}
 
 	// An invalid URL (a control character) — a request build error before
 	// the network; the error value is strictly 0 (not ±1).
 	got, err = (IngestBadHashes{URL: "http://ingest:9101/\n"}).BadHashes(context.Background())
 	if err == nil || got != 0 {
-		t.Errorf("ошибка URL: (%d, %v), want (0, ошибка)", got, err)
+		t.Errorf("a URL error: (%d, %v), want (0, an error)", got, err)
 	}
 
 	// A missing metric (an old ingest) — a source error with the name.
@@ -235,7 +235,7 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 	defer noMetric.Close()
 	if n, err := (IngestBadHashes{URL: noMetric.URL}).BadHashes(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), badHashesMetricName) || n != 0 {
-		t.Errorf("нет метрики: (%d, %v), want (0, ошибка с именем метрики)", n, err)
+		t.Errorf("no metric: (%d, %v), want (0, an error with the metric name)", n, err)
 	}
 
 	// Non-200 — an error with the status.
@@ -245,7 +245,7 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 	defer bad.Close()
 	if n, err := (IngestBadHashes{URL: bad.URL}).BadHashes(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "503") || n != 0 {
-		t.Errorf("статус 503: (%d, %v), want (0, ошибка со статусом)", n, err)
+		t.Errorf("status 503: (%d, %v), want (0, an error with the status)", n, err)
 	}
 
 	// An unreachable server — a transport error.
@@ -253,14 +253,14 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 	url := dead.URL
 	dead.Close()
 	if n, err := (IngestBadHashes{URL: url}).BadHashes(context.Background()); err == nil || n != 0 {
-		t.Errorf("закрытый сервер: (%d, %v), want (0, ошибка)", n, err)
+		t.Errorf("a closed server: (%d, %v), want (0, an error)", n, err)
 	}
 
 	// A ctx cancellation — a context error, not a hang.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := (IngestBadHashes{URL: srv.URL}).BadHashes(ctx); !errors.Is(err, context.Canceled) {
-		t.Errorf("отмена ctx: ошибка = %v, want context.Canceled", err)
+		t.Errorf("a ctx cancellation: error = %v, want context.Canceled", err)
 	}
 }
 
@@ -298,10 +298,10 @@ func TestIngestBadHashesClosesBody(t *testing.T) {
 		t.Fatalf("BadHashes: %v", err)
 	}
 	if got != 42 {
-		t.Errorf("счётчик = %d, want 42", got)
+		t.Errorf("the counter = %d, want 42", got)
 	}
 	if !body.closed {
-		t.Error("тело ответа не закрыто")
+		t.Error("the response body was not closed")
 	}
 }
 
@@ -316,23 +316,23 @@ func TestParseBadHashesExposition(t *testing.T) {
 		wantHas string // the offending value in the error text ("" — does not matter)
 	}{
 		{
-			"ряд с метками",
+			"a row with labels",
 			"crawler_ingest_bad_hashes_total{service=\"ingest\"} 42\n",
 			42, "", "",
 		},
 		{
-			"научная запись",
+			"scientific notation",
 			"crawler_ingest_bad_hashes_total 1.7e+06\n",
 			1700000, "", "",
 		},
 		{
-			"штамп времени после значения игнорируется",
+			"a timestamp after the value is ignored",
 			"crawler_ingest_bad_hashes_total{service=\"ingest\"} 7 1697760000000\n",
 			7, "", "",
 		},
 		{
-			"соседние метрики и HELP/TYPE мимо",
-			"# HELP crawler_stage_tasks_total Задачи.\n" +
+			"neighboring metrics and HELP/TYPE skipped",
+			"# HELP crawler_stage_tasks_total Tasks.\n" +
 				"# TYPE crawler_stage_tasks_total counter\n" +
 				"crawler_stage_tasks_total{service=\"dns-worker\",stage=\"dns\"} 3\n" +
 				"# TYPE crawler_ingest_bad_hashes_total counter\n" +
@@ -342,27 +342,27 @@ func TestParseBadHashesExposition(t *testing.T) {
 		// Zero is a valid counter (an ingest restart): the "v < 0" boundary
 		// is inclusive; negatives and non-numbers — an error naming
 		// the offending value.
-		{"нулевое значение", "crawler_ingest_bad_hashes_total 0\n", 0, "", ""},
-		{"минус один", "crawler_ingest_bad_hashes_total -1\n", 0, "не счётчик", "-1"},
-		{"имя без значения", "crawler_ingest_bad_hashes_total\n", 0, "отсутствует", ""},
-		{"комментарий во втором поле", "crawler_ingest_bad_hashes_total #42\n", 0, "не счётчик", "#42"},
-		{"метрики нет", "crawler_service_up 1\n", 0, "отсутствует", ""},
-		{"значение не число", "crawler_ingest_bad_hashes_total abc\n", 0, "не счётчик", "abc"},
-		{"отрицательное значение", "crawler_ingest_bad_hashes_total -3\n", 0, "не счётчик", "-3"},
-		{"префикс чужого имени", "crawler_ingest_bad_hashes_total_extra 9\n", 0, "отсутствует", ""},
+		{"a zero value", "crawler_ingest_bad_hashes_total 0\n", 0, "", ""},
+		{"minus one", "crawler_ingest_bad_hashes_total -1\n", 0, "is not a counter", "-1"},
+		{"a name without a value", "crawler_ingest_bad_hashes_total\n", 0, "is missing", ""},
+		{"a comment in the second field", "crawler_ingest_bad_hashes_total #42\n", 0, "is not a counter", "#42"},
+		{"no metric", "crawler_service_up 1\n", 0, "is missing", ""},
+		{"a non-numeric value", "crawler_ingest_bad_hashes_total abc\n", 0, "is not a counter", "abc"},
+		{"a negative value", "crawler_ingest_bad_hashes_total -3\n", 0, "is not a counter", "-3"},
+		{"a foreign name prefix", "crawler_ingest_bad_hashes_total_extra 9\n", 0, "is missing", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := parseBadHashesExposition(strings.NewReader(tt.body))
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("ошибка = %v, want содержит %q", err, tt.wantErr)
+					t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
 				}
 				if got != 0 {
-					t.Fatalf("значение при ошибке = %d, want 0", got)
+					t.Fatalf("the value on error = %d, want 0", got)
 				}
 				if tt.wantHas != "" && !strings.Contains(err.Error(), tt.wantHas) {
-					t.Errorf("текст ошибки %q не называет значение-нарушитель %q", err.Error(), tt.wantHas)
+					t.Errorf("the error text %q does not name the offending value %q", err.Error(), tt.wantHas)
 				}
 				return
 			}
@@ -370,7 +370,7 @@ func TestParseBadHashesExposition(t *testing.T) {
 				t.Fatalf("parseBadHashesExposition: %v", err)
 			}
 			if got != tt.want {
-				t.Errorf("значение = %d, want %d", got, tt.want)
+				t.Errorf("the value = %d, want %d", got, tt.want)
 			}
 		})
 	}
@@ -385,14 +385,14 @@ func (r *failReader) Read([]byte) (int, error) { return 0, r.err }
 // TestParseBadHashesExpositionReadError — a body read error bubbles out of the
 // Scanner: "exposition read" with the original reason and a zero value.
 func TestParseBadHashesExpositionReadError(t *testing.T) {
-	got, err := parseBadHashesExposition(&failReader{err: errors.New("сброс соединения")})
+	got, err := parseBadHashesExposition(&failReader{err: errors.New("connection reset")})
 	if err == nil ||
-		!strings.Contains(err.Error(), "чтение экспозиции") ||
-		!strings.Contains(err.Error(), "сброс соединения") {
-		t.Fatalf("ошибка = %v, want «чтение экспозиции» с причиной", err)
+		!strings.Contains(err.Error(), "exposition read") ||
+		!strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("error = %v, want \"exposition read\" with the reason", err)
 	}
 	if got != 0 {
-		t.Errorf("значение = %d, want 0 при ошибке", got)
+		t.Errorf("the value = %d, want 0 on error", got)
 	}
 }
 
@@ -403,7 +403,7 @@ func TestParseBadHashesExpositionReadError(t *testing.T) {
 // mutate together with the mutant and "follow" it (T-M01, alerts).
 func TestParseBadHashesExpositionBodyLimit(t *testing.T) {
 	if badHashesBodyLimit != 4<<20 {
-		t.Fatalf("badHashesBodyLimit = %d, want 4<<20 (4 МиБ)", badHashesBodyLimit)
+		t.Fatalf("badHashesBodyLimit = %d, want 4<<20 (4 MiB)", badHashesBodyLimit)
 	}
 	const filler = "crawler_service_up{service=\"ingest\"} 1\n"
 	const metric = "crawler_ingest_bad_hashes_total{service=\"ingest\"} 42\n"
@@ -423,11 +423,11 @@ func TestParseBadHashesExpositionBodyLimit(t *testing.T) {
 	}
 	b.WriteString(metric)
 	if b.Len() != badHashesBodyLimit {
-		t.Fatalf("тело на границе = %d байт, want %d", b.Len(), badHashesBodyLimit)
+		t.Fatalf("the body at the boundary = %d bytes, want %d", b.Len(), badHashesBodyLimit)
 	}
 	got, err := parseBadHashesExposition(strings.NewReader(b.String()))
 	if err != nil || got != 42 {
-		t.Fatalf("на границе лимита: (%d, %v), want (42, nil)", got, err)
+		t.Fatalf("at the limit boundary: (%d, %v), want (42, nil)", got, err)
 	}
 
 	// Beyond the limit: the metric in the tail beyond badHashesBodyLimit — not read.
@@ -438,7 +438,7 @@ func TestParseBadHashesExpositionBodyLimit(t *testing.T) {
 	over.WriteString(filler) // the tail beyond the limit
 	over.WriteString(metric)
 	if _, err := parseBadHashesExposition(strings.NewReader(over.String())); err == nil ||
-		!strings.Contains(err.Error(), "отсутствует") {
-		t.Fatalf("за лимитом: %v, want «метрика отсутствует»", err)
+		!strings.Contains(err.Error(), "is missing") {
+		t.Fatalf("beyond the limit: %v, want \"the metric is missing\"", err)
 	}
 }

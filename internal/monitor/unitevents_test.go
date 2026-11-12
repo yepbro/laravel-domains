@@ -71,16 +71,16 @@ func TestAlertsUnitOOMFire(t *testing.T) {
 	}{
 		{"oom", []UnitEvents{{Unit: "crawler-http-worker.service", OOM: 3}}},
 		{"oom_kill", []UnitEvents{{Unit: "crawler-render-worker.service", OOMKill: 1}}},
-		{"рестарты", []UnitEvents{{Unit: "crawler-chromium.service", NRestarts: 2}}},
+		{"restarts", []UnitEvents{{Unit: "crawler-chromium.service", NRestarts: 2}}},
 	}
 	for _, c := range cases {
 		env, _ := newUnitEnv(t, c.units)
 		s := snapshotOf(t, env.Pass(ctx), AlertUnitOOM)
 		if s.Status != AlertStatusFiring {
-			t.Errorf("%s: статус = %s (%s), want firing", c.name, s.Status, s.Detail)
+			t.Errorf("%s: status = %s (%s), want firing", c.name, s.Status, s.Detail)
 		}
 		if !strings.Contains(s.Detail, c.units[0].Unit) {
-			t.Errorf("%s: detail %q не называет юнит %s", c.name, s.Detail, c.units[0].Unit)
+			t.Errorf("%s: the detail %q does not name the unit %s", c.name, s.Detail, c.units[0].Unit)
 		}
 	}
 
@@ -92,15 +92,15 @@ func TestAlertsUnitOOMFire(t *testing.T) {
 	})
 	s := snapshotOf(t, env.Pass(ctx), AlertUnitOOM)
 	if s.Status != AlertStatusFiring {
-		t.Fatalf("два горячих: статус = %s (%s), want firing", s.Status, s.Detail)
+		t.Fatalf("two hot ones: status = %s (%s), want firing", s.Status, s.Detail)
 	}
-	for _, want := range []string{"crawler-http-worker.service", "oom_kill=1", "crawler-chromium.service", "рестартов=4"} {
+	for _, want := range []string{"crawler-http-worker.service", "oom_kill=1", "crawler-chromium.service", "restarts=4"} {
 		if !strings.Contains(s.Detail, want) {
-			t.Errorf("detail %q не содержит %q", s.Detail, want)
+			t.Errorf("the detail %q does not contain %q", s.Detail, want)
 		}
 	}
 	if strings.Contains(s.Detail, "crawler-monitor.service") {
-		t.Errorf("detail %q называет здоровый юнит", s.Detail)
+		t.Errorf("the detail %q names a healthy unit", s.Detail)
 	}
 
 	// All zeros — ok; the detail names the number of units.
@@ -109,8 +109,8 @@ func TestAlertsUnitOOMFire(t *testing.T) {
 		{Unit: "crawler-monitor.service"},
 	})
 	s = snapshotOf(t, env.Pass(ctx), AlertUnitOOM)
-	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "2 юнитов") {
-		t.Errorf("здоровые юниты: %s (%s), want ok с числом юнитов", s.Status, s.Detail)
+	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "2 units") {
+		t.Errorf("healthy units: %s (%s), want ok with the unit count", s.Status, s.Detail)
 	}
 }
 
@@ -123,15 +123,15 @@ func TestAlertsUnitOOMEpisode(t *testing.T) {
 
 	env.Pass(ctx)
 	if !strings.Contains(env.buf.String(), "level=WARN") ||
-		!strings.Contains(env.buf.String(), "АЛЕРТ: OOM-убийства и крэш-рестарты юнитов crawler") {
-		t.Fatalf("срабатывание без Warn:\n%s", env.buf.String())
+		!strings.Contains(env.buf.String(), "ALERT: OOM kills and crash restarts of crawler units") {
+		t.Fatalf("a firing without a Warn:\n%s", env.buf.String())
 	}
 
 	// An episode continuation (counters not reset) — silence.
 	before := env.buf.String()
 	env.Pass(ctx)
 	if delta := env.buf.String()[len(before):]; strings.Contains(delta, "level=WARN") || strings.Contains(delta, "level=INFO") {
-		t.Errorf("устойчивое срабатывание повторило сигнал:\n%s", delta)
+		t.Errorf("a sustained firing repeated the signal:\n%s", delta)
 	}
 
 	// A new event of the same unit inside the episode — without a second Warn.
@@ -139,15 +139,15 @@ func TestAlertsUnitOOMEpisode(t *testing.T) {
 	env.Pass(ctx)
 	delta := env.buf.String()[len(before):]
 	if strings.Contains(delta, "level=WARN") || strings.Contains(delta, "level=INFO") {
-		t.Errorf("новое событие внутри эпизода дало второй сигнал:\n%s", delta)
+		t.Errorf("a new event inside the episode produced a second signal:\n%s", delta)
 	}
 
 	// A unit state reset (the cgroup recreated, NRestarts zeroed) — an Info.
 	src.units = []UnitEvents{{Unit: "crawler-http-worker.service"}}
 	before = env.buf.String()
 	env.Pass(ctx)
-	if delta := env.buf.String()[len(before):]; !strings.Contains(delta, "алерт снят") || !strings.Contains(delta, "level=INFO") {
-		t.Errorf("сброс эпизода без Info о снятии:\n%s", delta)
+	if delta := env.buf.String()[len(before):]; !strings.Contains(delta, "alert cleared") || !strings.Contains(delta, "level=INFO") {
+		t.Errorf("an episode reset without a clearing Info:\n%s", delta)
 	}
 }
 
@@ -160,42 +160,42 @@ func TestAlertsUnitOOMDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil) // UnitEvents not set
 	env.deps.UnitEvents = nil       // an explicit absence of a source (T-162 gave env a healthy default)
 	s := snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "источник не задан") {
-		t.Errorf("без источника: %s (%s), want not_measured «источник не задан»", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "source not set") {
+		t.Errorf("without a source: %s (%s), want not_measured \"source not set\"", s.Status, s.Detail)
 	}
 
 	// A dev container without systemd — quiet: a Debug transition, no Warn.
 	env, src := newUnitEnv(t, nil)
-	src.errs = []error{fmt.Errorf("monitor: юниты: %w: systemctl show: %w",
+	src.errs = []error{fmt.Errorf("monitor: units: %w: systemctl show: %w",
 		errNoSystemd, errors.New("exec: systemctl: executable file not found"))}
 	s = snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "systemd отсутствует") {
-		t.Errorf("без systemd: %s (%s), want not_measured с классом errNoSystemd", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "systemd is missing") {
+		t.Errorf("without systemd: %s (%s), want not_measured with the errNoSystemd class", s.Status, s.Detail)
 	}
 	if strings.Contains(env.buf.String(), "level=WARN") {
-		t.Errorf("отсутствие systemd дало Warn (должно быть тихим, как SMART):\n%s", env.buf.String())
+		t.Errorf("the missing systemd produced a Warn (it must be quiet, like SMART):\n%s", env.buf.String())
 	}
 
 	// A production source failure — a Warn of each pass, "not measured"
 	// with the reason; the next pass against a live source works.
 	env, src = newUnitEnv(t, []UnitEvents{{Unit: "crawler-http-worker.service"}})
-	src.errs = []error{errors.New("monitor: юниты: memory.events: EIO")}
+	src.errs = []error{errors.New("monitor: units: memory.events: EIO")}
 	s = snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "EIO") {
-		t.Errorf("боевой отказ: %s (%s), want not_measured с причиной", s.Status, s.Detail)
+		t.Errorf("a hard failure: %s (%s), want not_measured with the reason", s.Status, s.Detail)
 	}
 	if !strings.Contains(env.buf.String(), "level=WARN") || !strings.Contains(env.buf.String(), "EIO") {
-		t.Errorf("боевой отказ без Warn:\n%s", env.buf.String())
+		t.Errorf("a hard failure without a Warn:\n%s", env.buf.String())
 	}
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM); s.Status != AlertStatusOK {
-		t.Errorf("после отказа: %s (%s), want ok (цикл живёт)", s.Status, s.Detail)
+		t.Errorf("after the failure: %s (%s), want ok (the loop lives)", s.Status, s.Detail)
 	}
 
 	// systemd alive, no units loaded — an empty list without an error.
 	src.units = nil
 	s = snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM)
-	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "не найдены") {
-		t.Errorf("без юнитов: %s (%s), want not_measured «не найдены»", s.Status, s.Detail)
+	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "not found") {
+		t.Errorf("without units: %s (%s), want not_measured \"not found\"", s.Status, s.Detail)
 	}
 }
 
@@ -208,17 +208,17 @@ func TestParseSystemctlShow(t *testing.T) {
 	units := parseSystemctlShow("Id=crawler-http-worker.service\nNRestarts=2\n\n" +
 		"Id=crawler-monitor.service\nNRestarts=0\n\n")
 	if len(units) != 2 {
-		t.Fatalf("юнитов = %d, want 2: %+v", len(units), units)
+		t.Fatalf("units = %d, want 2: %+v", len(units), units)
 	}
 	if units[0].Unit != "crawler-http-worker.service" || units[0].NRestarts != 2 {
-		t.Errorf("первый юнит = %+v, want crawler-http-worker.service NRestarts=2", units[0])
+		t.Errorf("the first unit = %+v, want crawler-http-worker.service NRestarts=2", units[0])
 	}
 	if units[1].Unit != "crawler-monitor.service" || units[1].NRestarts != 0 {
-		t.Errorf("второй юнит = %+v, want crawler-monitor.service NRestarts=0", units[1])
+		t.Errorf("the second unit = %+v, want crawler-monitor.service NRestarts=0", units[1])
 	}
 
 	// "[not set]" (the unit never started) and a non-number — zeros, not an error.
-	for _, val := range []string{"[not set]", "мусор"} {
+	for _, val := range []string{"[not set]", "junk"} {
 		units = parseSystemctlShow("Id=crawler-web.service\nNRestarts=" + val + "\n")
 		if len(units) != 1 || units[0].NRestarts != 0 {
 			t.Errorf("NRestarts=%q: %+v, want 0", val, units)
@@ -228,14 +228,14 @@ func TestParseSystemctlShow(t *testing.T) {
 	// An NRestarts before the first Id is discarded; foreign lines do not pass.
 	units = parseSystemctlShow("NRestarts=9\nId=crawler-dns-worker.service\nLoadState=loaded\nNRestarts=1\n")
 	if len(units) != 1 || units[0].Unit != "crawler-dns-worker.service" || units[0].NRestarts != 1 {
-		t.Errorf("странный блок: %+v, want dns-worker NRestarts=1 (ранний NRestarts=9 отброшен)", units)
+		t.Errorf("a weird block: %+v, want dns-worker NRestarts=1 (an early NRestarts=9 discarded)", units)
 	}
 
 	if got := parseSystemctlShow(""); got != nil {
-		t.Errorf("пустой вывод = %+v, want nil", got)
+		t.Errorf("an empty output = %+v, want nil", got)
 	}
 	if got := parseSystemctlShow("\n\n"); got != nil {
-		t.Errorf("только пустые строки = %+v, want nil", got)
+		t.Errorf("only empty lines = %+v, want nil", got)
 	}
 }
 
@@ -247,32 +247,32 @@ func TestParseSystemctlShow(t *testing.T) {
 func TestParseMemoryEvents(t *testing.T) {
 	ev, err := parseMemoryEvents("low 0\nhigh 42\nmax 7\noom 3\noom_kill 1\noom_group 0\n")
 	if err != nil || ev.OOM != 3 || ev.OOMKill != 1 || ev.High != 42 {
-		t.Errorf("полный файл = (%d, %d, %d, %v), want (3, 1, 42, nil)", ev.OOM, ev.OOMKill, ev.High, err)
+		t.Errorf("a full file = (%d, %d, %d, %v), want (3, 1, 42, nil)", ev.OOM, ev.OOMKill, ev.High, err)
 	}
 
 	ev, err = parseMemoryEvents("low 5\nmax 1\n")
 	if err != nil || ev.OOM != 0 || ev.OOMKill != 0 || ev.High != 0 {
-		t.Errorf("без oom/high-строк = (%d, %d, %d, %v), want нули без ошибки", ev.OOM, ev.OOMKill, ev.High, err)
+		t.Errorf("without oom/high lines = (%d, %d, %d, %v), want zeros without an error", ev.OOM, ev.OOMKill, ev.High, err)
 	}
 
 	ev, err = parseMemoryEvents("")
 	if err != nil || ev.OOM != 0 || ev.OOMKill != 0 || ev.High != 0 {
-		t.Errorf("пустой файл = (%d, %d, %d, %v), want нули без ошибки", ev.OOM, ev.OOMKill, ev.High, err)
+		t.Errorf("an empty file = (%d, %d, %d, %v), want zeros without an error", ev.OOM, ev.OOMKill, ev.High, err)
 	}
 
 	// A line without a space — not a key-value, skipped.
 	if _, err := parseMemoryEvents("oomkill\n"); err != nil {
-		t.Errorf("строка без значения: ошибка = %v, want пропуск", err)
+		t.Errorf("a line without a value: error = %v, want a skip", err)
 	}
 
 	if ev, err := parseMemoryEvents("oom -1\n"); err == nil || ev.OOM != 0 {
-		t.Errorf("нечисловое oom: (%d, %v), want ошибка и нуль", ev.OOM, err)
+		t.Errorf("a non-numeric oom: (%d, %v), want an error and zero", ev.OOM, err)
 	}
 	if ev, err := parseMemoryEvents("oom_kill x\n"); err == nil || ev.OOMKill != 0 {
-		t.Errorf("нечисловое oom_kill: (%d, %v), want ошибка и нуль", ev.OOMKill, err)
+		t.Errorf("a non-numeric oom_kill: (%d, %v), want an error and zero", ev.OOMKill, err)
 	}
 	if ev, err := parseMemoryEvents("high y\n"); err == nil || ev.High != 0 {
-		t.Errorf("нечисловое high: (%d, %v), want ошибка и нуль (алерт memory_high, T-162)", ev.High, err)
+		t.Errorf("a non-numeric high: (%d, %v), want an error and zero (the memory_high alert, T-162)", ev.High, err)
 	}
 }
 
@@ -334,7 +334,7 @@ func TestOSUnitEvents(t *testing.T) {
 		t.Fatalf("UnitEvents: %v", err)
 	}
 	if len(units) != 3 {
-		t.Fatalf("юнитов = %d, want 3: %+v", len(units), units)
+		t.Fatalf("units = %d, want 3: %+v", len(units), units)
 	}
 	want := []UnitEvents{
 		{Unit: "crawler-http-worker.service", OOM: 3, OOMKill: 1, High: 12, NRestarts: 2},
@@ -343,7 +343,7 @@ func TestOSUnitEvents(t *testing.T) {
 	}
 	for i, w := range want {
 		if units[i] != w {
-			t.Errorf("юнит[%d] = %+v, want %+v", i, units[i], w)
+			t.Errorf("unit[%d] = %+v, want %+v", i, units[i], w)
 		}
 	}
 }
@@ -361,7 +361,7 @@ func TestOSUnitEventsEmptyShow(t *testing.T) {
 		t.Fatalf("UnitEvents: %v", err)
 	}
 	if len(units) != 0 {
-		t.Errorf("юнитов = %+v, want пусто", units)
+		t.Errorf("units = %+v, want empty", units)
 	}
 }
 
@@ -380,20 +380,20 @@ func TestOSUnitEventsErrors(t *testing.T) {
 		Systemctl: fakeSystemctl(t, root, "", errNoBoot),
 	}).UnitEvents(context.Background())
 	if err == nil || !strings.Contains(err.Error(), errNoBoot) {
-		t.Errorf("PID 1 не systemd: ошибка = %v, want причина systemctl", err)
+		t.Errorf("PID 1 is not systemd: error = %v, want the systemctl reason", err)
 	}
 	if !errors.Is(err, errNoSystemd) {
-		t.Errorf("PID 1 не systemd: ошибка = %v, want класс errNoSystemd", err)
+		t.Errorf("PID 1 is not systemd: error = %v, want the errNoSystemd class", err)
 	}
 
 	// The binary is not in PATH (a dev container, Systemctl="" →
 	// "systemctl") — the quiet errNoSystemd class.
 	_, err = (OSUnitEvents{
 		CgroupFS:  filepath.Join(root, "cg"),
-		Systemctl: "systemctl-точно-отсутствует-t145",
+		Systemctl: "systemctl-definitely-missing-t145",
 	}).UnitEvents(context.Background())
 	if !errors.Is(err, errNoSystemd) {
-		t.Errorf("systemctl отсутствует в PATH: ошибка = %v, want класс errNoSystemd", err)
+		t.Errorf("systemctl is missing from PATH: error = %v, want the errNoSystemd class", err)
 	}
 
 	// The explicitly given path vanished (a production package breakage,
@@ -401,10 +401,10 @@ func TestOSUnitEventsErrors(t *testing.T) {
 	// broken systemctl is not allowed.
 	_, err = (OSUnitEvents{
 		CgroupFS:  filepath.Join(root, "cg"),
-		Systemctl: filepath.Join(root, "исчезнувший-systemctl"),
+		Systemctl: filepath.Join(root, "vanished-systemctl"),
 	}).UnitEvents(context.Background())
 	if err == nil || errors.Is(err, errNoSystemd) {
-		t.Errorf("заданный путь отсутствует: ошибка = %v, want боевая ошибка (не errNoSystemd)", err)
+		t.Errorf("the given path is missing: error = %v, want a hard error (not errNoSystemd)", err)
 	}
 
 	// A production systemctl error (not "no systemd") — not the quiet class.
@@ -413,23 +413,23 @@ func TestOSUnitEventsErrors(t *testing.T) {
 		Systemctl: fakeSystemctl(t, root, "", "Failed to connect to bus"),
 	}).UnitEvents(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "Failed to connect to bus") {
-		t.Errorf("падение systemctl: ошибка = %v, want причина со stderr", err)
+		t.Errorf("a systemctl crash: error = %v, want the reason with stderr", err)
 	}
 	if errors.Is(err, errNoSystemd) {
-		t.Errorf("падение шины: ошибка = %v, не должен быть классом errNoSystemd", err)
+		t.Errorf("a bus failure: error = %v, it must not be the errNoSystemd class", err)
 	}
 
 	// A corrupted memory.events of two units: the traversal continues the
 	// list, the reason names each failed one (no fail-fast on the first).
 	cg := filepath.Join(root, "cg")
 	show := "Id=crawler-http-worker.service\nNRestarts=0\n\nId=crawler-dns-worker.service\nNRestarts=0\n"
-	fakeCgroup(t, cg, "crawler-http-worker.service", "oom много\n")
-	fakeCgroup(t, cg, "crawler-dns-worker.service", "oom_kill тоже\n")
+	fakeCgroup(t, cg, "crawler-http-worker.service", "oom many\n")
+	fakeCgroup(t, cg, "crawler-dns-worker.service", "oom_kill too\n")
 	_, err = (OSUnitEvents{CgroupFS: cg, Systemctl: fakeSystemctl(t, root, show, "")}).
 		UnitEvents(context.Background())
 	for _, unit := range []string{"crawler-http-worker.service", "crawler-dns-worker.service"} {
 		if err == nil || !strings.Contains(err.Error(), unit) {
-			t.Errorf("два испорченных memory.events: ошибка = %v, want имя %s", err, unit)
+			t.Errorf("two corrupted memory.events: error = %v, want the name %s", err, unit)
 		}
 	}
 
@@ -438,7 +438,7 @@ func TestOSUnitEventsErrors(t *testing.T) {
 	cancel()
 	_, err = (OSUnitEvents{Systemctl: fakeSystemctl(t, root, "", "")}).UnitEvents(ctx)
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("отмена ctx: ошибка = %v, want context.Canceled", err)
+		t.Errorf("a ctx cancellation: error = %v, want context.Canceled", err)
 	}
 }
 
@@ -464,20 +464,20 @@ func TestOSUnitEventsTimeout(t *testing.T) {
 		Timeout:   50 * time.Millisecond,
 	}).UnitEvents(context.Background())
 	if err == nil {
-		t.Fatal("зависший systemctl: ошибки нет, want бюджет таймаута")
+		t.Fatal("a hung systemctl: no error, want the timeout budget")
 	}
 	if _, merr := os.Stat(marker); merr != nil {
-		t.Fatalf("заглушка не стартовала (маркер не создан) — таймаут не проверен: %v", merr)
+		t.Fatalf("the stub did not start (the marker was not created) — the timeout was not exercised: %v", merr)
 	}
 	// The error identity is not pinned (the kill by ctx arrives as
 	// "signal: killed", not a DeadlineExceeded wrapper) — what matters is
 	// the budget cut-off itself and the non-quiet class (a production
 	// failure, not "no systemd").
 	if errors.Is(err, errNoSystemd) {
-		t.Errorf("зависший systemctl: ошибка = %v, не класс errNoSystemd", err)
+		t.Errorf("a hung systemctl: error = %v, not the errNoSystemd class", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("бюджет не срезал зависание: %s", elapsed)
+		t.Errorf("the budget did not cut the hang: %s", elapsed)
 	}
 }
 
@@ -494,10 +494,10 @@ func TestOSUnitEventsNoCgroupRoot(t *testing.T) {
 		Systemctl: fakeSystemctl(t, root, show, ""),
 	}).UnitEvents(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "system.slice") {
-		t.Errorf("корень cgroup v2 отсутствует: ошибка = %v, want ошибка про system.slice", err)
+		t.Errorf("the cgroup v2 root is missing: error = %v, want an error about system.slice", err)
 	}
 	if errors.Is(err, errNoSystemd) {
-		t.Errorf("корень cgroup v2 отсутствует: ошибка = %v, не класс errNoSystemd (systemctl-то ответил)", err)
+		t.Errorf("the cgroup v2 root is missing: error = %v, not the errNoSystemd class (systemctl did answer)", err)
 	}
 
 	// An empty unit list with the same missing root — without an error:
@@ -507,7 +507,7 @@ func TestOSUnitEventsNoCgroupRoot(t *testing.T) {
 		Systemctl: fakeSystemctl(t, root, "", ""),
 	}).UnitEvents(context.Background())
 	if err != nil {
-		t.Errorf("пустой список без корня cgroup: ошибка = %v, want nil", err)
+		t.Errorf("an empty list without a cgroup root: error = %v, want nil", err)
 	}
 }
 
@@ -583,12 +583,12 @@ func TestUnitEventsMetrics(t *testing.T) {
 	}
 
 	// A source error — the error transit, the metrics untouched (hold-last).
-	src.errs = []error{errors.New("контейнер без systemd")}
+	src.errs = []error{errors.New("container without systemd")}
 	if _, err := m.UnitEvents(context.Background()); err == nil {
-		t.Error("ошибка источника не прокинута")
+		t.Error("the source error is not propagated")
 	}
 	if v, ok := gaugeLabels(t, reg, "crawler_unit_restarts", map[string]string{"unit": "crawler-http-worker.service"}); !ok || v != 2 {
-		t.Errorf("после ошибки restarts = (%v, %v), want прежние 2", v, ok)
+		t.Errorf("after the error restarts = (%v, %v), want the previous 2", v, ok)
 	}
 
 	// New values overwrite the gauge (they do not accumulate as rows).
@@ -598,16 +598,16 @@ func TestUnitEventsMetrics(t *testing.T) {
 		t.Fatalf("UnitEvents: %v", err)
 	}
 	if v, _ := gaugeLabels(t, reg, "crawler_unit_oom_events", map[string]string{"unit": "crawler-http-worker.service", "kind": "oom"}); v != 4 {
-		t.Errorf("перезапись gauge: oom = %v, want 4", v)
+		t.Errorf("the gauge overwrite: oom = %v, want 4", v)
 	}
 	if v, _ := gaugeLabels(t, reg, "crawler_unit_restarts", map[string]string{"unit": "crawler-http-worker.service"}); v != 3 {
-		t.Errorf("перезапись gauge: restarts = %v, want 3", v)
+		t.Errorf("the gauge overwrite: restarts = %v, want 3", v)
 	}
 
 	// A nil registry — transit without instruments (isolated builds).
 	plain := NewUnitEventsMetrics(nil, &fakeUnitEvents{units: []UnitEvents{{Unit: "u.service"}}})
 	units, err := plain.UnitEvents(context.Background())
 	if err != nil || len(units) != 1 || units[0].Unit != "u.service" {
-		t.Errorf("транзит без реестра = (%+v, %v), want источник как есть", units, err)
+		t.Errorf("transit without a registry = (%+v, %v), want the source as is", units, err)
 	}
 }

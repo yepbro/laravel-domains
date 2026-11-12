@@ -47,7 +47,7 @@ func main() {
 	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("[monitor] конфигурация: %v", err)
+		log.Fatalf("[monitor] configuration: %v", err)
 	}
 	logger := service.NewLogger("monitor", cfg)
 	// The monitoring address — monitor.listen from the configuration
@@ -100,7 +100,7 @@ func main() {
 // background one (the cmd/scheduler style).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
-		return errors.New("monitor: пул БД не получен (postgres.dsn обязателен)")
+		return errors.New("monitor: the DB pool was not received (postgres.dsn is required)")
 	}
 
 	// The depth of the streams for the queue alert — via BackpressureGate

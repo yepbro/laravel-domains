@@ -107,15 +107,15 @@ func (s RenderSuspends) fetch(ctx context.Context) (io.ReadCloser, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: зонд %s: %w", s.URL, err)
+		return nil, fmt.Errorf("monitor: probe %s: %w", s.URL, err)
 	}
 	resp, err := cl.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("monitor: зонд %s: %w", s.URL, err)
+		return nil, fmt.Errorf("monitor: probe %s: %w", s.URL, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("monitor: зонд %s: статус %s", s.URL, resp.Status)
+		return nil, fmt.Errorf("monitor: probe %s: status %s", s.URL, resp.Status)
 	}
 	return resp.Body, nil
 }
@@ -173,7 +173,7 @@ func parseSuspendExposition(r io.Reader) (int64, error) {
 	if renderExposition(body) {
 		return 0, nil // render-worker, no series yet — 0 (S-P1-4)
 	}
-	return 0, fmt.Errorf("monitor: метрика %s{%s} отсутствует в экспозиции рендер-воркера",
+	return 0, fmt.Errorf("monitor: the %s{%s} metric is missing from the render-worker exposition",
 		suspendedMetricName, suspendedBudgetPair)
 }
 
@@ -183,7 +183,7 @@ func parseSuspendExposition(r io.Reader) (int64, error) {
 func readExposition(r io.Reader) ([]byte, error) {
 	body, err := io.ReadAll(io.LimitReader(r, suspendedBodyLimit))
 	if err != nil {
-		return nil, fmt.Errorf("monitor: чтение экспозиции: %w", err)
+		return nil, fmt.Errorf("monitor: exposition read: %w", err)
 	}
 	return body, nil
 }
@@ -218,13 +218,13 @@ func findPromSeries(body []byte, metric string, pairs ...string) (float64, bool,
 		}
 		v, err := strconv.ParseFloat(fields[1], 64)
 		if err != nil || v < 0 {
-			return 0, false, fmt.Errorf("monitor: %s{%s}: значение %q не счётчик",
+			return 0, false, fmt.Errorf("monitor: %s{%s}: the value %q is not a counter",
 				metric, labelPart, fields[1])
 		}
 		return v, true, nil
 	}
 	if err := sc.Err(); err != nil {
-		return 0, false, fmt.Errorf("monitor: чтение экспозиции: %w", err)
+		return 0, false, fmt.Errorf("monitor: exposition read: %w", err)
 	}
 	return 0, false, nil
 }
@@ -264,7 +264,7 @@ func renderExposition(body []byte) bool {
 // A quiet "not measured" without Warn (S-P2-6): the probe is alive at
 // that moment (200 OK) — this is a configuration problem, not a source
 // failure; the reason is visible in the alert's detail.
-var errNotRenderExposition = errors.New("monitor: экспозиция не рендер-воркера")
+var errNotRenderExposition = errors.New("monitor: the exposition is not a render worker")
 
 // parseBrowserErrorsExposition — the value of the
 // crawler_stage_errors_total{stage="render",type="browser"} counter: the
