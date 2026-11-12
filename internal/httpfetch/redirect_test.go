@@ -1,8 +1,8 @@
-// Тесты прохода цепочки редиректов (T-048). httptest-серверы на петле
-// (127.0.0.1); стартовый хост URL подменяется именем, которого нет ни в
-// одном резолвере (hostURL из transport_test.go): подключение идёт по
-// адресам DNS-этапа или резолвера-заглушки, а хосты реальных запросов
-// проверяются по Host-заголовку и журналу резолвера.
+// Redirect chain pass tests (T-048). httptest servers on the loopback
+// (127.0.0.1); the URL's starting host is swapped for a name that no
+// resolver knows (hostURL from transport_test.go): the connection goes by
+// the DNS stage addresses or the stub resolver, while the hosts of real
+// requests are checked via the Host header and the resolver log.
 
 package httpfetch
 
@@ -28,9 +28,10 @@ import (
 	"crawler/internal/idn"
 )
 
-// --- вспомогательные --------------------------------------------------------
+// --- helpers -----------------------------------------------------------------
 
-// redirectResolverStub — резолвер-заглушка: адрес петли + журнал хостов.
+// redirectResolverStub is a stub resolver: the loopback address + a host
+// log.
 type redirectResolverStub struct {
 	mu    sync.Mutex
 	hosts []string
@@ -49,25 +50,26 @@ func (r *redirectResolverStub) calls() []string {
 	return append([]string(nil), r.hosts...)
 }
 
-// redirectResolverFail — резолвер, чей вызов означает ошибку теста:
-// пути без резолва (адреса DNS-этапа) не должны его звать.
+// redirectResolverFail is a resolver whose invocation means a test error:
+// paths without resolving (the DNS stage addresses) must not call it.
 var redirectResolverFail = ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
 	return nil, fmt.Errorf("неожидаемый резолв %q", host)
 })
 
-// redirectReqURL — URL тестового сервера с подменённым хостом и путём.
+// redirectReqURL is the test server URL with a swapped host and a path.
 func redirectReqURL(base, host, path string) *url.URL {
 	u := hostURL(base, host)
 	u.Path = path
 	return u
 }
 
-// redirectTestURL — строковая форма redirectReqURL (ожидания цепочки).
+// redirectTestURL is the string form of redirectReqURL (the chain
+// expectations).
 func redirectTestURL(base, host, path string) string {
 	return redirectReqURL(base, host, path).String()
 }
 
-// redirectReadBody читает и закрывает тело итогового ответа.
+// redirectReadBody reads and closes the final response body.
 func redirectReadBody(t *testing.T, res *ChainResult) string {
 	t.Helper()
 	b, err := io.ReadAll(res.Result.Body)
@@ -78,11 +80,11 @@ func redirectReadBody(t *testing.T, res *ChainResult) string {
 	return string(b)
 }
 
-// --- HTTP-редиректы ----------------------------------------------------------
+// --- HTTP redirects ----------------------------------------------------------
 
-// TestFetchChainThreeSteps: цепочка из трёх ответов (301 → 302 → 200),
-// итоговая страница — конец цепочки: тело, статус и URL последнего
-// ответа (ТЗ 5.5 п. 4).
+// TestFetchChainThreeSteps: a chain of three responses (301 → 302 → 200);
+// the final page is the end of the chain: the body, status and URL of the
+// last response (spec 5.5 item 4).
 func TestFetchChainThreeSteps(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -126,9 +128,9 @@ func TestFetchChainThreeSteps(t *testing.T) {
 	}
 }
 
-// TestFetchChainRedirectCodes: за 301/302/303/307/308 следуем, следующий
-// запрос — GET (303 требует смены метода на GET — все запросы цепочки
-// и так GET); 300 без статуса перехода не следуется.
+// TestFetchChainRedirectCodes: we follow 301/302/303/307/308, the next
+// request is GET (303 requires switching the method to GET — all chain
+// requests are GET anyway); 300 without a hop status is not followed.
 func TestFetchChainRedirectCodes(t *testing.T) {
 	for _, code := range []int{301, 302, 303, 307, 308} {
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
@@ -193,20 +195,21 @@ func TestFetchChainRedirectCodes(t *testing.T) {
 	})
 }
 
-// TestFetchChainRelativeLocation: относительный Location разрешается по
-// базе текущего ответа — абсолютный путь, путь относительно каталога и
-// protocol-relative форма.
+// TestFetchChainRelativeLocation: a relative Location is resolved against
+// the current response as the base — an absolute path, a path relative to
+// the directory, and the protocol-relative form.
 func TestFetchChainRelativeLocation(t *testing.T) {
 	cases := []struct {
 		name     string
 		basePath string
-		location string // {port} — порт тестового сервера
+		location string // {port} — the test server's port
 		wantPath string
 	}{
 		{"абсолютный-путь", "/dir/page", "/land", "/land"},
 		{"относительный-путь", "/dir/page", "sub/land", "/dir/sub/land"},
-		// Protocol-relative наследует только схему — порт обязан быть
-		// в самом Location, иначе переход уйдёт на стандартный :80.
+		// Protocol-relative inherits only the scheme — the port must be in
+		// the Location itself, otherwise the hop would go to the standard
+		// :80.
 		{"protocol-relative", "/dir/page", "//rel.example.net:{port}/land", "/land"},
 	}
 	for _, c := range cases {
@@ -240,7 +243,7 @@ func TestFetchChainRelativeLocation(t *testing.T) {
 	}
 }
 
-// TestFetchChainLoop: A → B → A — повторное появление URL, ErrTooManyRedirects.
+// TestFetchChainLoop: A → B → A — a URL reappearing, ErrTooManyRedirects.
 func TestFetchChainLoop(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -268,7 +271,8 @@ func TestFetchChainLoop(t *testing.T) {
 	}
 }
 
-// TestFetchChainSelfRedirect: редирект на самого себя — цикл на первом шаге.
+// TestFetchChainSelfRedirect: a redirect to itself — a cycle on the first
+// step.
 func TestFetchChainSelfRedirect(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "/self")
@@ -287,9 +291,9 @@ func TestFetchChainSelfRedirect(t *testing.T) {
 	}
 }
 
-// TestFetchChainQueryInCycleKey: query входит в ключ цикла — точное
-// повторение URL с query цикл, уникальные query — нет (счётчиковые
-// редиректы легитимны).
+// TestFetchChainQueryInCycleKey: the query is part of the cycle key — an
+// exact repetition of a URL with the query is a cycle, unique queries are
+// not (counter redirects are legitimate).
 func TestFetchChainQueryInCycleKey(t *testing.T) {
 	t.Run("повтор-query-цикл", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -340,8 +344,9 @@ func TestFetchChainQueryInCycleKey(t *testing.T) {
 	})
 }
 
-// TestFetchChainLimitExceeded: явный MaxRedirects — переходов не больше
-// лимита, запросов на один больше; итога нет, ошибка классификации.
+// TestFetchChainLimitExceeded: an explicit MaxRedirects — no more hops
+// than the limit, one more request than that; no outcome, the error is
+// classified.
 func TestFetchChainLimitExceeded(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -369,8 +374,8 @@ func TestFetchChainLimitExceeded(t *testing.T) {
 	}
 }
 
-// TestFetchChainDefaultLimit: FetchChain без опций — дефолт таблицы
-// лимитов ТЗ 5.5: 8 переходов.
+// TestFetchChainDefaultLimit: FetchChain without options — the default of
+// the spec 5.5 limits table: 8 hops.
 func TestFetchChainDefaultLimit(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -394,8 +399,9 @@ func TestFetchChainDefaultLimit(t *testing.T) {
 	}
 }
 
-// TestFetchChainZeroLimit: MaxRedirects 0 и отрицательный — режим «не
-// следовать» (семантика http.max_redirects, T-006): итог — первый ответ.
+// TestFetchChainZeroLimit: MaxRedirects 0 and negative — the "do not
+// follow" mode (the semantics of http.max_redirects, T-006): the outcome
+// is the first response.
 func TestFetchChainZeroLimit(t *testing.T) {
 	var lands atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -429,9 +435,9 @@ func TestFetchChainZeroLimit(t *testing.T) {
 	}
 }
 
-// TestFetchChainZeroLimitNoMetaScan: при max_redirects=0 мета-скан тела
-// не выполняется вовсе (тело не оборачивается redirectBody): без
-// переходов чтение до 256 КБ на meta refresh — лишний I/O.
+// TestFetchChainZeroLimitNoMetaScan: at max_redirects=0 the body meta scan
+// is not performed at all (the body is not wrapped in redirectBody):
+// without hops, reading up to 256 KB for meta refresh is needless I/O.
 func TestFetchChainZeroLimitNoMetaScan(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -454,10 +460,9 @@ func TestFetchChainZeroLimitNoMetaScan(t *testing.T) {
 
 // --- meta refresh -------------------------------------------------------------
 
-// TestFetchChainMetaRefresh: разбор content мета-тега — обычный,
-// нулевая задержка, регистр/пробелы/кавычки, порядок атрибутов,
-// самозакрытый тег; без url (refresh самого себя) и невалидные формы —
-// игнор (ТЗ 5.5 п. 4).
+// TestFetchChainMetaRefresh: parsing the meta tag content — ordinary,
+// zero delay, case/spaces/quotes, attribute order, self-closing tag; no
+// url (a self-refresh) and invalid forms are ignored (spec 5.5 item 4).
 func TestFetchChainMetaRefresh(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -518,10 +523,11 @@ func TestFetchChainMetaRefresh(t *testing.T) {
 	}
 }
 
-// TestFetchChainMetaRefreshContentTypes: мета-скан — только HTML-документы
-// (Content-Type с html); прочие типы — итог без перехода, тело не трогается.
-// Ответ совсем без Content-Type httptest не отдаёт (Go-сервер ставит его
-// автодетектом содержимого) — ветка покрыта юнит-проверкой redirectNext.
+// TestFetchChainMetaRefreshContentTypes: the meta scan applies only to
+// HTML documents (a Content-Type with html); other types — a no-hop
+// outcome, the body untouched. httptest never serves a response without a
+// Content-Type at all (the Go server sets it by content autodetection) —
+// that branch is covered by the unit check of redirectNext.
 func TestFetchChainMetaRefreshContentTypes(t *testing.T) {
 	cases := []struct {
 		ct     string
@@ -571,9 +577,10 @@ func TestFetchChainMetaRefreshContentTypes(t *testing.T) {
 	}
 }
 
-// TestRedirectNextNoContentType: ответ без Content-Type не сканируется на
-// meta refresh (заголовок решает; httptest такой ответ не отдаёт —
-// Go-сервер подставляет автодетект, поэтому ветка проверяется напрямую).
+// TestRedirectNextNoContentType: a response without Content-Type is not
+// scanned for meta refresh (the header decides; httptest cannot serve such
+// a response — the Go server substitutes the autodetect, so the branch is
+// checked directly).
 func TestRedirectNextNoContentType(t *testing.T) {
 	html := `<html><head><meta http-equiv="refresh" content="0; url=/after"></head><body>RAW</body></html>`
 	base, _ := url.Parse("http://noct.example.net/page")
@@ -593,8 +600,8 @@ func TestRedirectNextNoContentType(t *testing.T) {
 	}
 }
 
-// TestFetchChainMetaRefreshStatuses: мета-скан действует только на 200 —
-// 404 с мета-тегом не переходит; у 3xx приоритет у Location.
+// TestFetchChainMetaRefreshStatuses: the meta scan applies only to 200 —
+// a 404 with a meta tag does not hop; for 3xx Location has priority.
 func TestFetchChainMetaRefreshStatuses(t *testing.T) {
 	const meta = `<meta http-equiv="refresh" content="0; url=/after">`
 	t.Run("404-не-сканируется", func(t *testing.T) {
@@ -642,11 +649,11 @@ func TestFetchChainMetaRefreshStatuses(t *testing.T) {
 	})
 }
 
-// TestFetchChainMetaRefreshBigBody: границы кусков сканирования — мета-тег
-// за пределами одного чтения; без мета-тега итоговое тело возвращается
-// полностью (префикс сканирования + остаток потока).
+// TestFetchChainMetaRefreshBigBody: the scan chunk boundaries — a meta tag
+// beyond a single read; without a meta tag the final body is returned in
+// full (the scan prefix + the rest of the stream).
 func TestFetchChainMetaRefreshBigBody(t *testing.T) {
-	pad := strings.Repeat("<!-- padding-padding-padding -->", 1200) // ~35 КиБ
+	pad := strings.Repeat("<!-- padding-padding-padding -->", 1200) // ~35 KiB
 	t.Run("мета-за-границей-чанка", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/after" {
@@ -692,8 +699,8 @@ func TestFetchChainMetaRefreshBigBody(t *testing.T) {
 	})
 }
 
-// TestFetchChainMetaRefreshSelfURL: мета-тег с url на саму страницу —
-// цикл (точное повторение URL).
+// TestFetchChainMetaRefreshSelfURL: a meta tag with a url pointing to the
+// page itself — a cycle (an exact URL repetition).
 func TestFetchChainMetaRefreshSelfURL(t *testing.T) {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -715,15 +722,15 @@ func TestFetchChainMetaRefreshSelfURL(t *testing.T) {
 	}
 }
 
-// TestFetchChainMetaRefreshUnfollowableURLKeepsBody: мета-скан нашёл url,
-// по которому нельзя идти (чужая схема — redirectResolve даёт false), —
-// ответ остаётся итоговым, и прочитанный сканом префикс тела обязан
-// вернуться потребителю: контент/хэш не должны видеть «дыру» или пустоту
-// на месте первых килобайт страницы.
+// TestFetchChainMetaRefreshUnfollowableURLKeepsBody: the meta scan found a
+// url that cannot be followed (a foreign scheme — redirectResolve gives
+// false) — the response stays final, and the prefix read by the scan must
+// reach the consumer: content/hash must not see a "hole" or emptiness in
+// place of the page's first kilobytes.
 func TestFetchChainMetaRefreshUnfollowableURLKeepsBody(t *testing.T) {
 	want := fmt.Sprintf(
 		`<html><head><meta http-equiv="refresh" content="0; url=ftp://elsewhere.example/"></head><body>%s</body></html>`,
-		strings.Repeat("page-body ", 8<<10)) // ~80 КиБ: заведомо больше чанков скана
+		strings.Repeat("page-body ", 8<<10)) // ~80 KiB: well beyond the scan chunks
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = fmt.Fprint(w, want)
@@ -744,9 +751,10 @@ func TestFetchChainMetaRefreshUnfollowableURLKeepsBody(t *testing.T) {
 	}
 }
 
-// TestFetchChainMetaRefreshZeroLimitKeepsBody: валидный meta refresh при
-// MaxRedirects 0 — «не следовать» (T-006): итог — первый ответ, и его
-// тело возвращается целиком, хотя скан уже прочёл начало.
+// TestFetchChainMetaRefreshZeroLimitKeepsBody: a valid meta refresh at
+// MaxRedirects 0 — "do not follow" (T-006): the outcome is the first
+// response, and its body comes back in full even though the scan has
+// already read its start.
 func TestFetchChainMetaRefreshZeroLimitKeepsBody(t *testing.T) {
 	want := `<html><head><meta http-equiv="refresh" content="0; url=/after"></head><body>ZERO-STAY</body></html>`
 	var lands atomic.Int32
@@ -776,11 +784,11 @@ func TestFetchChainMetaRefreshZeroLimitKeepsBody(t *testing.T) {
 	}
 }
 
-// --- хосты переходов ----------------------------------------------------------
+// --- hop hosts ----------------------------------------------------------------
 
-// TestFetchChainUnicodeHostInLocation: unicode-хост в Location приводится
-// к punycode до резолва и запроса (ТЗ 5.2 п. 8): резолвер и Host-заголовок
-// видят ASCII-форму.
+// TestFetchChainUnicodeHostInLocation: a unicode host in Location is
+// converted to punycode before resolving and the request (spec 5.2
+// item 8): the resolver and the Host header see the ASCII form.
 func TestFetchChainUnicodeHostInLocation(t *testing.T) {
 	const unicodeHost = "пример.испытание"
 	asciiHost, err := idn.HostToASCII(unicodeHost)
@@ -824,8 +832,9 @@ func TestFetchChainUnicodeHostInLocation(t *testing.T) {
 	}
 }
 
-// TestFetchChainSchemeSwitchHTTPToHTTPS: http → https на том же хосте —
-// обычный шаг; адреса DNS-этапа действуют и на него (резолвер не зовётся).
+// TestFetchChainSchemeSwitchHTTPToHTTPS: http → https on the same host is
+// an ordinary step; the DNS stage addresses apply to it too (the resolver
+// is not called).
 func TestFetchChainSchemeSwitchHTTPToHTTPS(t *testing.T) {
 	tlsSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, "secure page")
@@ -863,8 +872,8 @@ func TestFetchChainSchemeSwitchHTTPToHTTPS(t *testing.T) {
 	}
 }
 
-// TestFetchChainOtherHostResolves: переход на другой хост — резолв через
-// резолвер транспорта (адреса DNS-этапа на него не действуют).
+// TestFetchChainOtherHostResolves: a hop to another host — resolving via
+// the transport's resolver (the DNS stage addresses do not apply to it).
 func TestFetchChainOtherHostResolves(t *testing.T) {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -896,9 +905,9 @@ func TestFetchChainOtherHostResolves(t *testing.T) {
 	}
 }
 
-// TestFetchChainInvalidLocation: битый URL, чужая схема и невалидный хост
-// в Location — переход невозможен, итог — сам ответ (как браузер без
-// перехода).
+// TestFetchChainInvalidLocation: a broken URL, a foreign scheme and an
+// invalid host in Location — no hop possible, the outcome is the response
+// itself (like a browser without a hop).
 func TestFetchChainInvalidLocation(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -932,10 +941,10 @@ func TestFetchChainInvalidLocation(t *testing.T) {
 	}
 }
 
-// --- отмена контекста ---------------------------------------------------------
+// --- context cancellation -----------------------------------------------------
 
-// TestFetchChainContextCancel: отмена ctx в середине цепочки (второй шаг
-// молчит) — ошибка отмены пробрасывается.
+// TestFetchChainContextCancel: a ctx cancellation in the middle of the
+// chain (the second step is silent) — the cancellation error propagates.
 func TestFetchChainContextCancel(t *testing.T) {
 	stall := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -981,12 +990,12 @@ func TestFetchChainContextCancel(t *testing.T) {
 	}
 }
 
-// --- бюджет цепочки -------------------------------------------------------
+// --- the chain budget -----------------------------------------------------
 
-// TestFetchChainBudget: общий бюджет цепочки (ChainOptions.TotalTimeout)
-// ограничивает все хопы вместе, а не по одному: молчащий хоп и цепочка
-// медленных хопов прерываются тайм-классифицированной ошибкой (temp_error
-// у потребителя, ТЗ 6.2), не занимая слот воркера минуты.
+// TestFetchChainBudget: the total chain budget (ChainOptions.TotalTimeout)
+// bounds all hops together, not one by one: a silent hop and a chain of
+// slow hops are interrupted with a timeout-classified error (temp_error at
+// the consumer, spec 6.2) without holding a worker slot for minutes.
 func TestFetchChainBudget(t *testing.T) {
 	t.Run("молчаливый хоп прерывается бюджетом", func(t *testing.T) {
 		stall := make(chan struct{})
@@ -1011,8 +1020,8 @@ func TestFetchChainBudget(t *testing.T) {
 			srv.Close()
 		}()
 
-		// Слои хопа не срабатывают (5 с), прервать запрос обязан
-		// именно бюджет цепочки.
+		// The hop layers do not fire (5 s); the chain budget itself is the
+		// one that must interrupt the request.
 		f := NewFetcher(Options{HeaderTimeout: 5 * time.Second, TotalTimeout: 5 * time.Second})
 		start := time.Now()
 		got, err := FetchChainOpts(context.Background(), f, FetchRequest{
@@ -1031,10 +1040,10 @@ func TestFetchChainBudget(t *testing.T) {
 	})
 
 	t.Run("бюджет копится по хопам", func(t *testing.T) {
-		// Каждый хоп укладывается в свои таймауты (400 мс < 5 с), но
-		// три хопа не влезают в бюджет 1 с: третий прерывается на
-		// середине. Поля допуска по 200 мс в обе стороны — устойчиво
-		// к джиттеру под нагрузкой прогона.
+		// Each hop fits into its own timeouts (400 ms < 5 s), but three
+		// hops do not fit into the 1 s budget: the third is interrupted
+		// mid-way. The margins are 200 ms in both directions — robust to
+		// jitter under the load of the run.
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			time.Sleep(400 * time.Millisecond)
 			w.Header().Set("Location", r.URL.Path+"x")
@@ -1055,13 +1064,13 @@ func TestFetchChainBudget(t *testing.T) {
 	})
 }
 
-// --- IP-литералы в переходах ----------------------------------------------
+// --- IP literals in hops --------------------------------------------------
 
-// TestRedirectResolveIPLiteral: IP-литералы в Location проходят как
-// есть — без punycode (Hostname() срезает скобки, прежняя проверка
-// префикса "[" никогда не срабатывала, а HostToASCII падает на IPv6 —
-// переход не выполнялся), с портом и без, IPv4 и IPv6; чужая схема —
-// по-прежнему false.
+// TestRedirectResolveIPLiteral: IP literals in Location pass as is —
+// without punycode (Hostname() strips the brackets, the former "[" prefix
+// check never fired, and HostToASCII fails on IPv6 — the hop never
+// happened), with and without a port, IPv4 and IPv6; a foreign scheme is
+// still false.
 func TestRedirectResolveIPLiteral(t *testing.T) {
 	base := &url.URL{Scheme: "http", Host: "start.example-test.net", Path: "/page"}
 	cases := []struct {
@@ -1086,9 +1095,9 @@ func TestRedirectResolveIPLiteral(t *testing.T) {
 	}
 }
 
-// TestFetchChainIPv6LiteralLocation: Location с IPv6-литералом —
-// обычный переход цепочки: хост [::1] берётся литералом (lookup не
-// трогает резолвер), итог — страница по IPv6.
+// TestFetchChainIPv6LiteralLocation: a Location with an IPv6 literal is an
+// ordinary chain hop: the [::1] host is taken literally (lookup does not
+// touch the resolver), the outcome is the page over IPv6.
 func TestFetchChainIPv6LiteralLocation(t *testing.T) {
 	ln, err := net.Listen("tcp", "[::1]:0")
 	if err != nil {

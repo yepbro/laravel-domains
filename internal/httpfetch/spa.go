@@ -1,81 +1,81 @@
-// Эвристика SPA-оболочки (T-057; ТЗ 5.5 п. 8 «решение о рендере»,
-// ТЗ 13.2 «эвристика определения SPA-оболочки — на усмотрение
-// разработки»). Чистая функция над итоговым телом страницы (UTF-8
-// гарантирован T-051, потолок 2 МБ — T-049): по набору признаков
-// решает, нужен ли рендер в Chromium (публикацию в q:render делает
-// потребитель T-053 — здесь только вердикт и сработавшие признаки).
+// The SPA shell heuristic (T-057; spec 5.5 item 8 "the render decision",
+// spec 13.2 "the SPA shell detection heuristic is at the developer's
+// discretion"). A pure function over the page's final body (UTF-8 is
+// guaranteed by T-051, the 2 MB cap by T-049): by the set of signs it
+// decides whether a render in Chromium is needed (publishing to q:render
+// is done by the T-053 consumer — here only the verdict and the fired
+// signs).
 //
-// Признаки:
+// The signs:
 //
-//   - мало видимого текста — видимые символы (байты) после грубого
-//     удаления тегов и содержимого script/style/noscript меньше
-//     SPAVisibleTextMax;
-//   - корневой контейнер — атрибут id="root|app|__next|__nuxt" (в
-//     любых кавычках и регистре) у любого тега: точка монтирования
-//     фреймворка (React/Vue/Next/Nuxt, «и т. п.» ТЗ 5.5 п. 8);
-//   - noscript с требованием JS — <noscript>, чей текст просит
-//     включить JavaScript/JS (список ключей — spaNoScriptKeys);
-//   - JS-редирект — строковый скан на location.replace/location.assign/
-//     location.href=…/location=… (window.location и document.location —
-//     частные случаи «голого» location; исполнение не выполняется);
-//   - meta refresh — <meta http-equiv="refresh"> в итоговом HTML.
+//   - little visible text — the visible characters (bytes) after the
+//     coarse removal of tags and the content of script/style/noscript is
+//     less than SPAVisibleTextMax;
+//   - a root container — the attribute id="root|app|__next|__nuxt" (in
+//     any quotes and case) on any tag: the framework's mount point
+//     (React/Vue/Next/Nuxt, the "and the like" of spec 5.5 item 8);
+//   - a noscript demanding JS — a <noscript> whose text asks to enable
+//     JavaScript/JS (the key list is spaNoScriptKeys);
+//   - a JS redirect — a string scan for location.replace/location.assign/
+//     location.href=…/location=… (window.location and document.location
+//     are special cases of "bare" location; no execution is performed);
+//   - meta refresh — <meta http-equiv="refresh"> in the final HTML.
 //
-// Таблица решений (прочтение ТЗ 5.5 п. 8: перечень через «;» даёт
-// самодостаточные признаки, «мало видимого текста + корневой
-// контейнер» — парное условие, noscript — усиливающий):
+// The decision table (a reading of spec 5.5 item 8: the ";"-separated list
+// gives self-sufficient signs, "little visible text + a root container" is
+// a paired condition, noscript is a reinforcing sign):
 //
-//	#  текст  контейнер  noscript  JS-редирект  meta refresh  SPA
-//	1  *      *          *         да           *             да
-//	2  *      *          *         *            да            да
-//	3  мало   да         *         нет          нет           да
-//	4  мало   нет        да        нет          нет           да
-//	5  мало   нет        нет       нет          нет           нет
-//	6  много  да         да        нет          нет           нет
-//	7  много  нет        да        нет          нет           нет
-//	8  много  нет        нет       нет          нет           нет
+//	#  text  container  noscript  JS-redirect  meta refresh  SPA
+//	1  *      *          *         yes          *             yes
+//	2  *      *          *         *            yes           yes
+//	3  low    yes        *         no           no            yes
+//	4  low    no         yes       no           no            yes
+//	5  low    no         no        no           no            no
+//	6  rich   yes        yes       no           no            no
+//	7  rich   no         yes       no           no            no
+//	8  rich   no         no        no           no            no
 //
-// Обоснования:
+// Rationale:
 //
-//   - JS-редирект достаточен один (строка 1): страница собственным
-//     кодом уводит браузер на другой адрес — сырой HTML по замыслу
-//     никогда не был итоговым содержимым, это трамплин.
-//   - meta refresh достаточен один (строка 2): T-048 уже прошёл все
-//     переходы по meta refresh с url, поэтому в итоговом HTML
-//     остаётся только обновление без перехода — «сам на себя»
-//     (включая цикл, оборванный детектом) или с недоступным для
-//     следования url. Страница, обновляющая сама себя, рассчитана на
-//     повторное исполнение в браузере (JS-логика, cookies), ТЗ
-//     называет meta refresh отдельным признаком. Ложное срабатывание
-//     (классическая страница с content="300") стоит один рендер,
-//     ложный пропуск оставил бы заглушку итоговым контентом до
-//     перепроверки домена.
-//   - пара «мало текста + контейнер» (строка 3) — формулировка ТЗ:
-//     контейнер в одиночку не показатель (id="app" встречается в
-//     вёрстке классических сайтов), малый текст в одиночку — тоже
-//     (парковочные и пустые дефолтные страницы: рендер бессмыслен,
-//     добавлять нечего); вместе — каркас фреймворка без контента.
-//   - noscript усиливающий (строка 4): «включите JavaScript» при
-//     пустой странице — оболочка с любым, в т. ч. нестандартным,
-//     контейнером («и т. п.» ТЗ). В одиночку (строка 7) — не
-//     показатель: классические сайты ставят вежливое предупреждение,
-//     работая и без JS; при богатом тексте (строки 6–8) рендер не
-//     нужен — SSR/классика уже отдали контент.
+//   - a JS redirect alone is sufficient (row 1): the page's own code
+//     takes the browser to another address — by design the raw HTML was
+//     never meant to be the final content, it is a springboard.
+//   - meta refresh alone is sufficient (row 2): T-048 has already
+//     followed all meta refresh hops with a url, so the final HTML only
+//     retains a refresh without a hop — "self-refresh" (including a cycle
+//     cut off by the cycle detect) or one with a url that cannot be
+//     followed. A page refreshing itself is designed for repeated
+//     execution in the browser (JS logic, cookies); the spec lists meta
+//     refresh as a separate sign. A false positive (a classic page with
+//     content="300") costs one render, a false negative would leave a
+//     placeholder as the final content until the domain is rechecked.
+//   - the pair "little text + a container" (row 3) is the spec's
+//     wording: a container alone is not indicative (id="app" occurs in
+//     classic sites' markup), and so is little text alone (parking and
+//     empty default pages: a render is pointless, there is nothing to
+//     add); together — a framework shell without content.
+//   - noscript is reinforcing (row 4): "enable JavaScript" on an empty
+//     page means a shell with any container, including a non-standard
+//     one (the "and the like" of the spec). Alone (row 7) it is not
+//     indicative: classic sites show a polite warning while working
+//     without JS; with rich text (rows 6–8) no render is needed — SSR/
+//     classic pages have already delivered the content.
 //
-// Цена ошибки асимметрична (§5.6, T-066): ложное срабатывание — один
-// ограниченный рендер в очереди, пропуск — пустой контент в хранилище
-// до следующей перепроверки. Поэтому сканеры признаков нарочито
-// минимальны и терпимы к ложным срабатываниям.
+// The error cost is asymmetric (§5.6, T-066): a false positive is one
+// bounded render in the queue, a miss is empty content in the storage
+// until the next recheck. That is why the sign scanners are deliberately
+// minimal and tolerant of false positives.
 //
-// Реализация — один линейный проход по телу без копий и аллокаций
-// на «тихих» страницах (нулевые аллокации закреплены тестом):
-// подсчёт видимого текста чередуется с разбором тегов, содержимое
-// script/style пропускается до закрывающего тега, noscript
-// проверяется по ключевым словам в первых spaNoScriptLimit байтах.
-// JS-редирект — независимый скан по всему документу (ловит и inline
-// обработчики вроде onclick="location.href=…"); HTML-парсер не
-// используется: признаки описываются байтовыми маркерами, полный
-// разбор недоверенной разметки ради эвристики избыточен (§9 —
-// ограниченные парсеры; стиль T-048).
+// The implementation is a single linear pass over the body with no copies
+// or allocations on "quiet" pages (zero allocations are pinned by a
+// test): counting visible text alternates with tag parsing, the content
+// of script/style is skipped to the closing tag, noscript is checked for
+// keywords in the first spaNoScriptLimit bytes. The JS redirect is an
+// independent scan over the whole document (it also catches inline
+// handlers like onclick="location.href=…"); no HTML parser is used: the
+// signs are described by byte markers, and full parsing of untrusted
+// markup for the sake of a heuristic is redundant (§9 — bounded parsers;
+// the T-048 style).
 
 package httpfetch
 
@@ -84,63 +84,66 @@ import (
 	"strings"
 )
 
-// SPAVisibleTextMax — порог «мало видимого текста»: видимые символы
-// (байты, не руны: кириллица считается двойным весом — консервативная
-// сторона) после грубого удаления тегов, script, style и noscript.
-// Порог из практики каркасов: заглушки React (create-react-app),
-// Next/Nuxt/Vue несут 0–~200 видимых байт — весь текст вынесен в
-// noscript (не отображается при включённом JS) и в JS-бандлы;
-// осмысленные главные страницы — от сотен байт. 300 разделяет классы
-// с запасом в обе стороны; настраивается пересборкой константы
-// (ТЗ 13.2 — эвристика на усмотрении разработки, отдельный конфиг-ключ
-// не заводится до данных нагрузочных замеров §11.3).
+// SPAVisibleTextMax is the "little visible text" threshold: the visible
+// characters (bytes, not runes: Cyrillic counts double weight — the
+// conservative side) after the coarse removal of tags, script, style and
+// noscript. The threshold comes from shell practice: React stubs
+// (create-react-app), Next/Nuxt/Vue carry 0–~200 visible bytes — all the
+// text is moved into noscript (not shown when JS is on) and into JS
+// bundles; meaningful main pages start at hundreds of bytes. 300 separates
+// the classes with margin in both directions; it is tuned by rebuilding
+// the constant (spec 13.2 — the heuristic is at the developer's
+// discretion; no separate config key until the load measurement data of
+// §11.3 exists).
 const SPAVisibleTextMax = 300
 
-// spaNoScriptLimit — сколько байтов текста <noscript> просматривать
-// на требование JS: реальные предупреждения — одно-два предложения,
-// длинные noscript (разметка-фолбэк) на признак не влияют.
+// spaNoScriptLimit — how many bytes of <noscript> text to scan for a JS
+// demand: real warnings are one or two sentences; long noscripts (a
+// fallback markup) do not affect the sign.
 const spaNoScriptLimit = 4096
 
-// SPAReason — один сработавший признак SPA-оболочки (ТЗ 5.5 п. 8).
-// Значения — стабильные строки: потребитель (T-053) кладёт их в
-// задачу q:render и журналирует.
+// SPAReason is one fired SPA shell sign (spec 5.5 item 8). The values are
+// stable strings: the consumer (T-053) puts them into the q:render task
+// and logs them.
 type SPAReason string
 
-// Признаки эвристики. Порядок объявления — порядок перечисления в ТЗ.
+// The heuristic's signs. The declaration order is the spec's list order.
 const (
-	// SPAReasonLowText — видимого текста меньше SPAVisibleTextMax.
+	// SPAReasonLowText — the visible text is less than SPAVisibleTextMax.
 	SPAReasonLowText SPAReason = "low_text"
-	// SPAReasonRootContainer — найден корневой контейнер фреймворка
+	// SPAReasonRootContainer — a framework root container was found
 	// (id=root/app/__next/__nuxt).
 	SPAReasonRootContainer SPAReason = "root_container"
-	// SPAReasonNoScriptJS — <noscript> требует включить JavaScript.
+	// SPAReasonNoScriptJS — a <noscript> demands enabling JavaScript.
 	SPAReasonNoScriptJS SPAReason = "noscript_js"
-	// SPAReasonJSRedirect — строковый след JS-редиректа
+	// SPAReasonJSRedirect — a string trace of a JS redirect
 	// (location=…, location.href=…, location.replace(…, location.assign(…).
 	SPAReasonJSRedirect SPAReason = "js_redirect"
-	// SPAReasonMetaRefresh — meta refresh в итоговом HTML (без
-	// перехода: переходы съел T-048, осталось «сам на себя»).
+	// SPAReasonMetaRefresh — a meta refresh in the final HTML (without a
+	// hop: T-048 consumed the hops, only "self-refresh" remains).
 	SPAReasonMetaRefresh SPAReason = "meta_refresh"
 )
 
-// SPAVerdict — решение о рендере итоговой страницы (ТЗ 5.5 п. 8).
-// SPA=true — страница похожа на SPA-оболочку, потребитель публикует
-// задачу в q:render (T-053); SPA=false — сырой HTML итоговый.
-// Reasons — все сработавшие признаки (не только решающие), VisibleText
-// — насчитанные видимые символы (байты) для метрик и настройки порога.
+// SPAVerdict is the render decision for the final page (spec 5.5 item 8).
+// SPA=true — the page looks like an SPA shell; the consumer publishes a
+// task to q:render (T-053); SPA=false — the raw HTML is final.
+// Reasons — all fired signs (not only the deciding ones); VisibleText —
+// the counted visible characters (bytes), for metrics and threshold
+// tuning.
 type SPAVerdict struct {
 	SPA         bool        `json:"spa"`
 	Reasons     []SPAReason `json:"reasons,omitempty"`
 	VisibleText int         `json:"visible_text"`
 }
 
-// DetectSPA решает, похож ли итоговый HTML на SPA-оболочку (ТЗ 5.5
-// п. 8). Аргумент — тело итогового ответа цепочки (T-048) в UTF-8
-// (T-051); контекст URL не нужен: признаки не зависят от адреса, а
-// переходы по Location и meta refresh уже выполнены цепочкой — здесь
-// фиксируется только «нужен ли рендер», цель перехода неважна.
-// Функция чистая: не изменяет и не копирует вход, решения принимает
-// по таблице решений из комментария пакета.
+// DetectSPA decides whether the final HTML looks like an SPA shell
+// (spec 5.5 item 8). The argument is the body of the chain's final
+// response (T-048) in UTF-8 (T-051); the URL context is not needed: the
+// signs do not depend on the address, and the Location and meta refresh
+// hops have already been performed by the chain — only "is a render
+// needed" is recorded here, the hop target does not matter. The function
+// is pure: it neither modifies nor copies the input, and makes decisions
+// by the decision table from the package comment.
 func DetectSPA(html []byte) SPAVerdict {
 	s := spaScan(html)
 	v := SPAVerdict{VisibleText: s.visibleText}
@@ -160,25 +163,25 @@ func DetectSPA(html []byte) SPAVerdict {
 	if s.metaRefresh {
 		v.Reasons = append(v.Reasons, SPAReasonMetaRefresh)
 	}
-	// Таблица решений: сильные признаки (JS-редирект, meta refresh)
-	// достаточны в одиночку; пара «мало текста + (контейнер или
-	// noscript)» — по формулировке ТЗ; контейнер/noscript при богатом
-	// тексте рендера не требуют (строки 6–7).
+	// The decision table: the strong signs (a JS redirect, meta refresh)
+	// suffice alone; the pair "little text + (a container or noscript)"
+	// follows the spec's wording; a container/noscript with rich text
+	// needs no render (rows 6–7).
 	v.SPA = s.jsRedirect || s.metaRefresh || (low && (s.container || s.noscript))
 	return v
 }
 
-// spaSigns — признаки, насчитанные сканом.
+// spaSigns is the signs counted by the scan.
 type spaSigns struct {
-	visibleText int  // видимые символы (байты) вне тегов/script/style/noscript
-	container   bool // корневой контейнер root/app/__next/__nuxt
-	noscript    bool // <noscript> с требованием JS
-	jsRedirect  bool // строковый след JS-редиректа
-	metaRefresh bool // <meta http-equiv="refresh"> в итоговом HTML
+	visibleText int  // the visible characters (bytes) outside tags/script/style/noscript
+	container   bool // the root container root/app/__next/__nuxt
+	noscript    bool // a <noscript> demanding JS
+	jsRedirect  bool // a string trace of a JS redirect
+	metaRefresh bool // a <meta http-equiv="refresh"> in the final HTML
 }
 
-// Маркеры сканера (байтовые — для EqualFold без конвертаций, стиль
-// redirect.go).
+// Scanner markers (byte-based — for EqualFold without conversions, the
+// redirect.go style).
 var (
 	spaCommentOpen = []byte("<!--")
 	spaCommentEnd  = []byte("-->")
@@ -195,23 +198,23 @@ var (
 	spaAttrID    = []byte("id")
 	spaAttrEquiv = []byte("http-equiv")
 
-	// spaJSReplace/spaJSAssign/spaJSHref — члены location, означающие
-	// переход; строковые литералы не сравниваются, чтобы не аллоцировать.
+	// spaJSReplace/spaJSAssign/spaJSHref — members of location meaning a
+	// hop; string literals are not compared so as not to allocate.
 	spaJSReplace = []byte("replace")
 	spaJSAssign  = []byte("assign")
 	spaJSHref    = []byte("href")
 
 	spaRootIDs = []string{"root", "app", "__next", "__nuxt"}
 
-	// spaNoScriptKeys — ключевые слова требования JS в <noscript>.
-	// Слово «JavaScript» пишется одинаково в любом языке и покрывает
-	// большинство формулировок (EN/DE/FR/ES/RU: «Включите JavaScript»,
-	// «JavaScript is required»); остальные ключи — короткие формы с
-	// «JS» типовых фраз RU/EN. Поиск регистронезависим (включая
-	// кириллицу — bytes.EqualFold), поэтому достаточно строчных
-	// вариантов. Список минимальный: расширение экзотикой не окупается,
-	// noscript — усиливающий признак, его пропуск компенсируется парой
-	// «текст + контейнер».
+	// spaNoScriptKeys is the keyword list for JS demands in <noscript>.
+	// The word "JavaScript" is spelled the same in any language and covers
+	// most wordings (EN/DE/FR/ES/RU: "Включите JavaScript", "JavaScript is
+	// required"); the other keys are short "JS" forms of typical RU/EN
+	// phrases. The search is case-insensitive (including Cyrillic —
+	// bytes.EqualFold), so lower-case variants suffice. The list is
+	// minimal: extending it with exotics does not pay off, noscript is a
+	// reinforcing sign, and missing it is compensated by the pair
+	// "text + container".
 	spaNoScriptKeys = [][]byte{
 		[]byte("javascript"),
 		[]byte("enable js"),
@@ -223,15 +226,14 @@ var (
 	}
 )
 
-// spaScan — один проход по HTML: текст между тегами считается
-// видимым (байты, кроме пробельных), теги разбираются по мере
-// встречаемости. Содержимое script/style пропускается до
-// закрывающего тега (не видимый текст), noscript — проверяется на
-// требование JS (тоже не видимый: браузер с включённым JS его не
-// показывает), комментарии пропускаются. Незакрытые script/style/
-// комментарий съедают остаток документа (хвост — не текст).
-// Переиспользует примитивы T-048: redirectTagEnd (учёт кавычек),
-// redirectIndexFold, redirectIsSpace.
+// spaScan is a single pass over the HTML: the text between tags counts as
+// visible (bytes, except whitespace), tags are parsed as encountered. The
+// content of script/style is skipped to the closing tag (not visible
+// text), noscript is checked for a JS demand (also not visible: a browser
+// with JS on does not show it), comments are skipped. An unclosed
+// script/style/comment consumes the rest of the document (the tail is not
+// text). It reuses the T-048 primitives: redirectTagEnd (quote
+// accounting), redirectIndexFold, redirectIsSpace.
 func spaScan(b []byte) spaSigns {
 	var s spaSigns
 	s.jsRedirect = spaHasJSRedirect(b)
@@ -247,19 +249,19 @@ func spaScan(b []byte) spaSigns {
 		if bytes.HasPrefix(b[lt:], spaCommentOpen) {
 			e := bytes.Index(b[lt+len(spaCommentOpen):], spaCommentEnd)
 			if e < 0 {
-				return s // незакрытый комментарий — остаток не текст
+				return s // an unclosed comment — the rest is not text
 			}
 			i = lt + len(spaCommentOpen) + e + len(spaCommentEnd)
 			continue
 		}
 		end := redirectTagEnd(b, lt)
 		if end < 0 {
-			return s // тег не закрыт — остаток считаем разметкой
+			return s // the tag is not closed — count the rest as markup
 		}
 		closing := false
 		nameStart := lt + 1
 		if b[nameStart] == '/' {
-			closing = true // закрывающий: содержимое за ним уже пропущено
+			closing = true // closing: its content has already been skipped
 			nameStart++
 		}
 		nameEnd := nameStart
@@ -269,9 +271,9 @@ func spaScan(b []byte) spaSigns {
 		name := b[nameStart:nameEnd]
 		switch {
 		case !closing && bytes.EqualFold(name, spaNameScript):
-			// Содержимое скрипта не видимо; незакрытый — до конца.
+			// Script content is not visible; unclosed — until the end.
 			if ce := redirectIndexFold(b, end+1, spaScriptEnd); ce >= 0 {
-				i = ce // разбор продолжится с закрывающего тега
+				i = ce // parsing continues from the closing tag
 			} else {
 				return s
 			}
@@ -301,10 +303,10 @@ func spaScan(b []byte) spaSigns {
 		default:
 			if bytes.EqualFold(name, spaNameMeta) &&
 				strings.EqualFold(spaTagAttr(b, nameEnd, end, spaAttrEquiv), "refresh") {
-				// Признак ловится по всему документу, не только в head:
-				// T-048 ограничен head по HTML-спецификации действия
-				// тега, здесь признак описывает замысел страницы —
-				// битая вёрстка его не отменяет.
+				// The sign is caught over the whole document, not only in
+				// head: T-048 is bounded to head by the HTML spec of the
+				// tag's action, while here the sign describes the page's
+				// intent — broken markup does not cancel it.
 				s.metaRefresh = true
 			}
 			if spaIsRootID(spaTagAttr(b, nameEnd, end, spaAttrID)) {
@@ -316,10 +318,10 @@ func spaScan(b []byte) spaSigns {
 	return s
 }
 
-// spaVisibleCount — видимые символы (байты) фрагмента текста:
-// всё, кроме пробельных (HTML-пробелы redirectIsSpace). Сущности не
-// разворачиваются: «грубое удаление тегов» по ТЗ 13.2, порог с
-// запасом переживает инфляцию &nbsp;.
+// spaVisibleCount is the visible characters (bytes) of a text fragment:
+// everything except whitespace (the HTML spaces of redirectIsSpace).
+// Entities are not expanded: "coarse tag removal" per spec 13.2; the
+// threshold with margin survives &nbsp; inflation.
 func spaVisibleCount(b []byte) int {
 	n := 0
 	for _, c := range b {
@@ -330,8 +332,8 @@ func spaVisibleCount(b []byte) int {
 	return n
 }
 
-// spaNoScriptDemand — есть ли в тексте <noscript> требование JS
-// (ключи spaNoScriptKeys, регистр не важен).
+// spaNoScriptDemand is there a JS demand in the <noscript> text (the
+// spaNoScriptKeys, case-insensitive).
 func spaNoScriptDemand(region []byte) bool {
 	for _, k := range spaNoScriptKeys {
 		if redirectIndexFold(region, 0, k) >= 0 {
@@ -341,10 +343,10 @@ func spaNoScriptDemand(region []byte) bool {
 	return false
 }
 
-// spaIsRootID — значение атрибута id из списка корневых контейнеров
-// (сравнение без учёта регистра: HTML id регистрозависимы, но
-// «ROOT» вместо «root» на признак не влияет, ложных срабатываний
-// практически нет).
+// spaIsRootID — the id attribute value from the root container list (a
+// case-insensitive comparison: HTML ids are case-sensitive, but "ROOT"
+// instead of "root" does not affect the sign, and false positives are
+// practically nonexistent).
 func spaIsRootID(id string) bool {
 	for _, want := range spaRootIDs {
 		if strings.EqualFold(id, want) {
@@ -354,10 +356,10 @@ func spaIsRootID(id string) bool {
 	return false
 }
 
-// spaTagAttr — значение атрибута want тега в диапазоне [p, end)
-// (стиль redirectTagAttrs: имена без учёта регистра, значения в
-// '…'/"…"/без кавычек, '/' между атрибутами пропускается). Аллокация
-// только на найденном значении; "" — атрибута нет.
+// spaTagAttr is the value of the want attribute of the tag in the
+// [p, end) range (the redirectTagAttrs style: case-insensitive names,
+// values in '…'/"…"/unquoted, '/' between attributes skipped). An
+// allocation happens only on a found value; "" — the attribute is absent.
 func spaTagAttr(b []byte, p, end int, want []byte) string {
 	for p < end {
 		for p < end && (redirectIsSpace(b[p]) || b[p] == '/') {
@@ -372,7 +374,7 @@ func spaTagAttr(b []byte, p, end int, want []byte) string {
 		}
 		name := b[ns:p]
 		for p < end && redirectIsSpace(b[p]) {
-			p++ // HTML5 допускает пробелы вокруг '=': id = "root"
+			p++ // HTML5 allows spaces around '=': id = "root"
 		}
 		vs, ve := p, p
 		if p < end && b[p] == '=' {
@@ -389,7 +391,7 @@ func spaTagAttr(b []byte, p, end int, want []byte) string {
 				}
 				ve = p
 				if p < end {
-					p++ // закрывающая кавычка
+					p++ // the closing quote
 				}
 			} else {
 				vs = p
@@ -406,25 +408,26 @@ func spaTagAttr(b []byte, p, end int, want []byte) string {
 	return ""
 }
 
-// spaHasJSRedirect — строковый скан документа на JS-редирект:
-// слово «location» (регистр важен: в JS идентификаторы
-// регистрозависимы, window.Location — не существует), перед которым
-// нет байта имени JS и байта URL-контекста (?location=…,
-// &location=…, /location=…), с продолжением:
+// spaHasJSRedirect is a string scan of the document for a JS redirect:
+// the word "location" (case matters: JS identifiers are case-sensitive,
+// window.Location does not exist), not preceded by a JS-name byte or a
+// URL-context byte (?location=…, &location=…, /location=…), with a
+// continuation:
 //
-//	= «не ==»      — location = "https://…" (и window.location = …)
+//	= (not ==)     — location = "https://…" (and window.location = …)
 //	.replace( …    — location.replace('/login')
 //	.assign(  …    — location.assign('/login')
-//	.href = «не ==» — location.href = '/login' (window/document —
-//	                 частные случаи «голого» location)
+//	.href = (not ==) — location.href = '/login' (window/document are
+//	                 special cases of "bare" location)
 //
-// Сканируется весь HTML, а не только <script>: inline-обработчики
-// (onclick="location.href='/x'") — тот же трамплин. Исполнение не
-// выполняется (§9): это след замысла, а не доказательство перехода.
-// Минимализм осознан: ложное срабатывание (статья с примером
-// window.location в видимом тексте) стоит один рендер, пропуск —
-// пустой контент как итог страницы. Члены вида location.pathname=…,
-// сравнения ==/=== и взятие в кавычки-примеры без «=» не считаются.
+// The whole HTML is scanned, not only <script>: inline handlers
+// (onclick="location.href='/x'") are the same springboard. No execution is
+// performed (§9): this is a trace of intent, not proof of a hop. The
+// minimalism is deliberate: a false positive (an article with a
+// window.location example in the visible text) costs one render, a miss —
+// empty content as the page's outcome. Members like
+// location.pathname=…, ==/=== comparisons and quoted examples without "="
+// do not count.
 func spaHasJSRedirect(b []byte) bool {
 	for from := 0; from < len(b); {
 		j := bytes.Index(b[from:], spaJSWord)
@@ -436,11 +439,11 @@ func spaHasJSRedirect(b []byte) bool {
 		if j > 0 {
 			c := b[j-1]
 			if spaJSNameByte(c) {
-				continue // xlocation, location_ — не цель перехода
+				continue // xlocation, location_ — not a hop target
 			}
 			switch c {
 			case '=', '?', '&', '/', '#':
-				continue // URL-контекст: ?location=…, /location/…
+				continue // URL context: ?location=…, /location/…
 			}
 		}
 		m := j + len(spaJSWord)
@@ -454,7 +457,7 @@ func spaHasJSRedirect(b []byte) bool {
 		case '.':
 			m++
 			for m < len(b) && spaJSBlank(b[m]) {
-				m++ // location . href — пробелы вокруг точки допустимы
+				m++ // location . href — spaces around the dot are allowed
 			}
 			ns := m
 			ne := ns
@@ -483,14 +486,14 @@ func spaHasJSRedirect(b []byte) bool {
 	return false
 }
 
-// spaJSNameByte — байт, входящий в JS-идентификатор (латиница,
-// цифры, _, $).
+// spaJSNameByte is a byte belonging to a JS identifier (Latin letters,
+// digits, _, $).
 func spaJSNameByte(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
 		c >= '0' && c <= '9' || c == '_' || c == '$'
 }
 
-// spaJSBlank — пробелы, допустимые в JS между токенами.
+// spaJSBlank is the whitespace allowed in JS between tokens.
 func spaJSBlank(c byte) bool {
 	switch c {
 	case ' ', '\t', '\n', '\r', '\f', '\v':

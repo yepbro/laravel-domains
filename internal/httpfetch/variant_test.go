@@ -1,7 +1,8 @@
-// Юнит-тесты логики вариантов http/https (T-054; ТЗ 5.5 п. 5, §7).
-// Сценарии §11.1 («http → https, http ведёт на другой сайт») и список
-// T-059: bare→www — территория алиасов T-055 (разные субдомены), здесь
-// проверяются варианты одного субдомена по обоим протоколам.
+// Unit tests of the http/https variant logic (T-054; spec 5.5 item 5,
+// §7). The scenarios of §11.1 ("http → https, http leads to another site")
+// and the T-059 list: bare→www is the T-055 aliases' territory (different
+// subdomains); here the variants of one subdomain over both protocols are
+// checked.
 
 package httpfetch
 
@@ -13,25 +14,27 @@ import (
 	"crawler/internal/model"
 )
 
-// variantCheck — доступный итог проверки с итоговым host+path.
+// variantCheck is an available check outcome with a final host+path.
 func variantCheck(scheme model.Scheme, host, path string, hash *content.Hash) VariantInput {
 	return VariantInput{Scheme: scheme, Available: true, Host: host, Path: path, ContentHash: hash}
 }
 
-// variantDown — недоступный итог проверки (сетевая ошибка/таймаут/
-// лимит редиректов — классификация за T-058, здесь только доступность).
+// variantDown is an unavailable check outcome (a network error/timeout/
+// the redirect limit — the classification belongs to T-058; only
+// availability matters here).
 func variantDown(scheme model.Scheme) VariantInput {
 	return VariantInput{Scheme: scheme}
 }
 
-// variantHash — хэш контента для входа; важно nil-представление
-// «контент не сохранён», значение — идентификатор сравнения.
+// variantHash is a content hash for the input; the nil representation of
+// "content not stored" matters, the value is a comparison identifier.
 func variantHash(s string) *content.Hash {
 	h := content.HashOf([]byte(s))
 	return &h
 }
 
-// variantRecordsEqual — сравнение без reflect: записи сравнимы целиком.
+// variantRecordsEqual is a comparison without reflect: records are
+// comparable in full.
 func variantRecordsEqual(got, want []VariantRecord) bool {
 	if len(got) != len(want) {
 		return false
@@ -44,10 +47,10 @@ func variantRecordsEqual(got, want []VariantRecord) bool {
 	return true
 }
 
-// TestDecideVariants — таблица решений по §5.5 п. 5: оба недоступны,
-// один протокол, один сайт (host+путь либо хэш), разные сайты. Каждый
-// кейс прогоняется дважды с переставленными аргументами — пара
-// различается полем Scheme, а не позицией.
+// TestDecideVariants is the decision table per §5.5 item 5: both
+// unavailable, one protocol, one site (host+path or hash), different
+// sites. Each case runs twice with swapped arguments — the pair is
+// distinguished by the Scheme field, not by position.
 func TestDecideVariants(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -170,9 +173,9 @@ func TestDecideVariants(t *testing.T) {
 	}
 }
 
-// TestDecideVariantsOneProtocolFinalURL — scheme записи = схема
-// ПРОВЕРКИ: http-проверка могла закончиться на https-странице, запись
-// всё равно несёт scheme=http (данные из http-проверки).
+// TestDecideVariantsOneProtocolFinalURL — the record's scheme is the
+// CHECK's scheme: an http check may have ended on an https page, and the
+// record still carries scheme=http (the data from the http check).
 func TestDecideVariantsOneProtocolFinalURL(t *testing.T) {
 	https, http := variantDown(model.SchemeHTTPS), variantCheck(model.SchemeHTTP,
 		"example.com", "/", nil)
@@ -186,9 +189,9 @@ func TestDecideVariantsOneProtocolFinalURL(t *testing.T) {
 	}
 }
 
-// TestDecideVariantsBadPair — аргументы обязаны образовывать пару
-// http+https по полю Scheme: одинаковые или некорректные схемы — ошибка
-// (молча перепутанные итоги дали бы неверные variant/scheme в БД).
+// TestDecideVariantsBadPair — the arguments must form an http+https pair
+// by the Scheme field: equal or incorrect schemes are an error (silently
+// mixed-up outcomes would give wrong variant/scheme in the DB).
 func TestDecideVariantsBadPair(t *testing.T) {
 	cases := []struct {
 		name string
@@ -228,8 +231,8 @@ func TestDecideVariantsBadPair(t *testing.T) {
 	}
 }
 
-// TestVariantSameSite — критерий одинаковости: обе ветки ИЛИ по
-// отдельности и обязательная доступность итогов.
+// TestVariantSameSite — the sameness criterion: both OR branches on
+// their own and the mandatory availability of the outcomes.
 func TestVariantSameSite(t *testing.T) {
 	cases := []struct {
 		name string
@@ -307,9 +310,10 @@ func TestVariantSameSite(t *testing.T) {
 	}
 }
 
-// TestNewVariantInput — представление итогового URL в логике вариантов:
-// хост без порта, путь без query и фрагмента, percent-декодирование
-// url.URL.Path, nil-URL недоступной проверки.
+// TestNewVariantInput — the representation of the final URL in the
+// variant logic: the host without the port, the path without the query
+// and fragment, the percent-decoding of url.URL.Path, and the nil URL of
+// an unavailable check.
 func TestNewVariantInput(t *testing.T) {
 	parse := func(t *testing.T, raw string) *url.URL {
 		t.Helper()

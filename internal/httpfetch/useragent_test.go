@@ -1,11 +1,12 @@
 package httpfetch
 
-// Тесты T-052: честный User-Agent с контактами из конфигурации и
-// контракт «минимум запросов» (ТЗ 5.5, §9):
-//   - UA из http.user_agent (в т.ч. дефолт) доходит до сервера;
-//   - ровно один GET «/» на Fetch, /robots.txt не запрашивается;
-//   - UA стоит на каждом запросе цепочки редиректов, новые пути —
-//     только по Location сервера (его инициатива, §9).
+// T-052 tests: an honest User-Agent with contacts from the configuration
+// and the "minimum of requests" contract (spec 5.5, §9):
+//   - the UA from http.user_agent (including the default) reaches the
+//     server;
+//   - exactly one GET "/" per Fetch, /robots.txt is never requested;
+//   - the UA is on every request of the redirect chain, new paths come
+//     only from the server's Location (its initiative, §9).
 
 import (
 	"context"
@@ -18,15 +19,16 @@ import (
 	"crawler/internal/config"
 )
 
-// uaRequest — метод, путь и User-Agent одного запроса тестового сервера.
+// uaRequest is the method, path and User-Agent of one request the test
+// server received.
 type uaRequest struct {
 	method string
 	path   string
 	ua     string
 }
 
-// uaLog — потокобезопасная запись всех запросов тестового сервера:
-// контракт «минимум запросов» проверяется по полному журналу.
+// uaLog is a thread-safe record of all the test server's requests: the
+// "minimum of requests" contract is verified against the full log.
 type uaLog struct {
 	mu   sync.Mutex
 	reqs []uaRequest
@@ -48,8 +50,9 @@ func (l *uaLog) all() []uaRequest {
 	return append([]uaRequest(nil), l.reqs...)
 }
 
-// TestUserAgentFromConfigReachesServer: UA секции http доходит до
-// сервера — и заданный оператором, и дефолт config.DefaultUserAgent.
+// TestUserAgentFromConfigReachesServer: the UA of the http section
+// reaches the server — both the operator-set one and the
+// config.DefaultUserAgent default.
 func TestUserAgentFromConfigReachesServer(t *testing.T) {
 	custom := "OpCrawler/2.0 (+https://operator.example/contact; noc@example.example)"
 	for _, tc := range []struct {
@@ -88,9 +91,9 @@ func TestUserAgentFromConfigReachesServer(t *testing.T) {
 	}
 }
 
-// TestNewOptionsUserAgentFallback: пустое поле конфигурации (секция,
-// собранная руками, без Default/Validate) не оставляет транспорт
-// анонимным — подставляется дефолт с контактами-заглушками.
+// TestNewOptionsUserAgentFallback: an empty configuration field (a
+// section assembled by hand, without Default/Validate) does not leave the
+// transport anonymous — the default with stub contacts is substituted.
 func TestNewOptionsUserAgentFallback(t *testing.T) {
 	o := NewOptions(config.HTTP{})
 	if o.UserAgent != config.DefaultUserAgent {
@@ -101,9 +104,10 @@ func TestNewOptionsUserAgentFallback(t *testing.T) {
 	}
 }
 
-// TestFetchRootOnlyNoRobots: контракт «минимум запросов» (ТЗ 5.5, §9) —
-// один Fetch = ровно один GET «/»; URL без пути и с путём «/» — один и
-// тот же запрос; никаких /robots.txt и иных путей транспорт не делает.
+// TestFetchRootOnlyNoRobots: the "minimum of requests" contract
+// (spec 5.5, §9) — one Fetch = exactly one GET "/"; a URL without a path
+// and with the path "/" are the same request; the transport makes no
+// /robots.txt or other paths at all.
 func TestFetchRootOnlyNoRobots(t *testing.T) {
 	log := &uaLog{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -114,7 +118,7 @@ func TestFetchRootOnlyNoRobots(t *testing.T) {
 
 	f := NewFetcher(Options{UserAgent: "RootCrawler/1.0 (+https://example.example/contact; admin@example.example)"})
 
-	// URL из хоста без пути.
+	// A URL from the host, no path.
 	u := hostURL(srv.URL, "www.example-test.net")
 	res, err := f.Fetch(context.Background(), FetchRequest{URL: u, Addrs: loopbackAddr()})
 	if err != nil {
@@ -122,7 +126,7 @@ func TestFetchRootOnlyNoRobots(t *testing.T) {
 	}
 	_ = res.Body.Close()
 
-	// Тот же URL с явным «/» — эквивалентный запрос главной страницы.
+	// The same URL with an explicit "/" — an equivalent main page request.
 	u2 := *u
 	u2.Path = "/"
 	res, err = f.Fetch(context.Background(), FetchRequest{URL: &u2, Addrs: loopbackAddr()})
@@ -148,9 +152,9 @@ func TestFetchRootOnlyNoRobots(t *testing.T) {
 	}
 }
 
-// TestUserAgentOnRedirectChain: цепочка редиректов T-048 — UA стоит на
-// каждом запросе; путь меняется только по Location сервера (инициатива
-// сайта, §9), а не по решению краулера.
+// TestUserAgentOnRedirectChain: the T-048 redirect chain — the UA is on
+// every request; the path changes only by the server's Location (the
+// site's initiative, §9), not by the crawler's decision.
 func TestUserAgentOnRedirectChain(t *testing.T) {
 	const chainUA = "ChainCrawler/1.0 (+https://example.example/contact; admin@example.example)"
 	log := &uaLog{}
@@ -199,9 +203,9 @@ func TestUserAgentOnRedirectChain(t *testing.T) {
 	}
 }
 
-// TestUserAgentConfigValidation: http.user_agent непуст, без переводов
-// строк и управляющих символов (значение идёт в заголовок), разумной
-// длины (до 512 байт).
+// TestUserAgentConfigValidation: http.user_agent is non-empty, without
+// line breaks and control characters (the value goes into a header), and
+// of a reasonable length (up to 512 bytes).
 func TestUserAgentConfigValidation(t *testing.T) {
 	base := func() *config.Config {
 		c := config.Default()
@@ -229,7 +233,8 @@ func TestUserAgentConfigValidation(t *testing.T) {
 		}
 	}
 
-	// Граница длины допустима: 512 байт — ещё валидное значение.
+	// The length boundary is acceptable: 512 bytes is still a valid
+	// value.
 	c := base()
 	c.HTTP.UserAgent = strings.Repeat("a", 512)
 	if err := c.Validate(); err != nil {

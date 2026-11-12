@@ -1,6 +1,6 @@
-// Тесты резолв-хука: адаптер ResolverFunc, системный резолвер и кэш
-// (hit/miss, TTL, выселение, ошибки, конкурентность) на фейковом
-// внутреннем резолвере и инъекции часов.
+// Resolve-hook tests: the ResolverFunc adapter, the system resolver and
+// the cache (hit/miss, TTL, eviction, errors, concurrency) on a fake inner
+// resolver and injected clocks.
 
 package httpfetch
 
@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// fakeResolver — заглушка резолвера с подсчётом вызовов.
+// fakeResolver is a resolver stub with call counting.
 type fakeResolver struct {
 	calls atomic.Int32
 	addrs []netip.Addr
@@ -28,8 +28,8 @@ func (f *fakeResolver) LookupNetIP(_ context.Context, host string) ([]netip.Addr
 
 var testAddrs = []netip.Addr{netip.MustParseAddr("192.0.2.10"), netip.MustParseAddr("2001:db8::10")}
 
-// TestCachingResolverHitMissTTL: промах идёт в резолвер, попадание —
-// нет, истёкшая запись — снова промах.
+// TestCachingResolverHitMissTTL: a miss goes to the resolver, a hit does
+// not, an expired entry is a miss again.
 func TestCachingResolverHitMissTTL(t *testing.T) {
 	inner := &fakeResolver{addrs: testAddrs}
 	clock := fakeClock(time.Unix(0, 0))
@@ -38,7 +38,7 @@ func TestCachingResolverHitMissTTL(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Промах: первое обращение — к резолверу.
+	// A miss: the first call goes to the resolver.
 	addrs, err := c.LookupNetIP(ctx, "redirect.example.net")
 	if err != nil || len(addrs) != 2 {
 		t.Fatalf("первый резолв: %v %v", addrs, err)
@@ -47,7 +47,7 @@ func TestCachingResolverHitMissTTL(t *testing.T) {
 		t.Fatalf("обращений к резолверу: %d, ожидалось 1", got)
 	}
 
-	// Попадание: в пределах TTL резолвер не трогаем.
+	// A hit: within the TTL the resolver is not touched.
 	clock.advance(59 * time.Second)
 	if _, err := c.LookupNetIP(ctx, "redirect.example.net"); err != nil {
 		t.Fatalf("резолв из кэша: %v", err)
@@ -56,8 +56,8 @@ func TestCachingResolverHitMissTTL(t *testing.T) {
 		t.Fatalf("кэш не сработал: обращений %d, ожидалось 1", got)
 	}
 
-	// Истечение: запись старше TTL — снова резолвер.
-	clock.advance(2 * time.Second) // суммарно 61 с > 60 с
+	// Expiry: an entry older than the TTL — the resolver again.
+	clock.advance(2 * time.Second) // 61 s in total > 60 s
 	if _, err := c.LookupNetIP(ctx, "redirect.example.net"); err != nil {
 		t.Fatalf("резолв после истечения: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestCachingResolverHitMissTTL(t *testing.T) {
 		t.Errorf("записей в кэше: %d, ожидалась 1", len(c.entries))
 	}
 
-	// Ключ регистронезависим: тот же хост в другом регистре — попадание.
+	// The key is case-insensitive: the same host in another case is a hit.
 	if _, err := c.LookupNetIP(ctx, "  Redirect.Example.NET "); err != nil {
 		t.Fatalf("резолв в другом регистре: %v", err)
 	}
@@ -77,8 +77,8 @@ func TestCachingResolverHitMissTTL(t *testing.T) {
 	}
 }
 
-// TestCachingResolverErrorsNotCached: отказ резолвера повторяется
-// реальным запросом, пустой успешный ответ кэшируется.
+// TestCachingResolverErrorsNotCached: a resolver failure is retried by a
+// real request, an empty successful response is cached.
 func TestCachingResolverErrorsNotCached(t *testing.T) {
 	boom := errors.New("резолвер недоступен")
 	inner := &fakeResolver{err: boom}
@@ -94,8 +94,8 @@ func TestCachingResolverErrorsNotCached(t *testing.T) {
 		t.Errorf("ошибка не должна кэшироваться: обращений %d, ожидалось 2", got)
 	}
 
-	// Пустой успешный ответ — легальный итог (NODATA): кэшируем, чтобы
-	// не дёргать резолвер на каждом шаге цепочки.
+	// An empty successful response is a legal outcome (NODATA): cache it
+	// so as not to poke the resolver on every chain step.
 	inner.err = nil
 	inner.addrs = nil
 	if addrs, err := c.LookupNetIP(ctx, "nodata.example.net"); err != nil || addrs != nil {
@@ -109,8 +109,8 @@ func TestCachingResolverErrorsNotCached(t *testing.T) {
 	}
 }
 
-// TestCachingResolverEviction: предел записей удерживается; при
-// заполнении сперва вычищаются истёкшие.
+// TestCachingResolverEviction: the entry limit is held; when full, the
+// expired entries are purged first.
 func TestCachingResolverEviction(t *testing.T) {
 	inner := &fakeResolver{addrs: testAddrs}
 	clock := fakeClock(time.Unix(0, 0))
@@ -128,8 +128,8 @@ func TestCachingResolverEviction(t *testing.T) {
 		t.Fatalf("записей: %d, ожидалось 2", len(c.entries))
 	}
 
-	// Третья запись при живых двух: одна выселена (какая — политика
-	// произвольная), новая сохранена, предел удержан.
+	// A third entry with two live ones: one was evicted (which one is
+	// arbitrary policy), the new one stored, the limit held.
 	if _, err := c.LookupNetIP(ctx, "c.example.net"); err != nil {
 		t.Fatal(err)
 	}
@@ -140,8 +140,8 @@ func TestCachingResolverEviction(t *testing.T) {
 		t.Error("новая запись вытеснена вместо старой")
 	}
 
-	// После истечения TTL переполнение вычищает просроченные, а не
-	// живые записи.
+	// After the TTL expires, an overflow purges the expired entries, not
+	// the live ones.
 	clock.advance(2 * time.Minute)
 	if _, err := c.LookupNetIP(ctx, "d.example.net"); err != nil {
 		t.Fatal(err)
@@ -154,8 +154,8 @@ func TestCachingResolverEviction(t *testing.T) {
 	}
 }
 
-// TestCachingResolverConcurrent: конкурентные запросы одного хоста
-// корректны (гонки ловит -race).
+// TestCachingResolverConcurrent: concurrent requests of one host are
+// correct (-race catches races).
 func TestCachingResolverConcurrent(t *testing.T) {
 	inner := &fakeResolver{addrs: testAddrs}
 	c := NewCachingResolver(inner, CacheOptions{})
@@ -176,7 +176,7 @@ func TestCachingResolverConcurrent(t *testing.T) {
 	}
 }
 
-// TestResolverFunc — адаптер функции под интерфейс.
+// TestResolverFunc is the function adapter for the interface.
 func TestResolverFunc(t *testing.T) {
 	var fn ResolverFunc = func(ctx context.Context, host string) ([]netip.Addr, error) {
 		if host != "fn.example.net" {
@@ -184,15 +184,15 @@ func TestResolverFunc(t *testing.T) {
 		}
 		return testAddrs, nil
 	}
-	var r Resolver = fn // компиляция интерфейса — отдельная проверка не нужна
+	var r Resolver = fn // interface compilation needs no separate check
 	addrs, err := r.LookupNetIP(context.Background(), "fn.example.net")
 	if err != nil || len(addrs) != len(testAddrs) {
 		t.Fatalf("адаптер: %v %v", addrs, err)
 	}
 }
 
-// TestSystemResolverLocalhost — системный резолвер жив и возвращает
-// адреса (localhost из /etc/hosts; среда Docker его содержит).
+// TestSystemResolverLocalhost — the system resolver is alive and returns
+// addresses (localhost from /etc/hosts; the Docker environment has it).
 func TestSystemResolverLocalhost(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -205,9 +205,9 @@ func TestSystemResolverLocalhost(t *testing.T) {
 	}
 }
 
-// --- фейковые часы -------------------------------------------------------------
+// --- fake clocks ----------------------------------------------------------------
 
-// fakeClock — детерминированное время для тестов TTL.
+// fakeClock is deterministic time for the TTL tests.
 type fakeClock time.Time
 
 func (c *fakeClock) now() time.Time          { return time.Time(*c) }

@@ -1,24 +1,24 @@
-// Кодировки и сжатие ответов (ТЗ 5.5):
+// Charsets and response compression (spec 5.5):
 //
-//   - «Поддерживается Accept-Encoding: gzip, br; распаковка — с
-//     ограничением размера (защита от zip-бомб)»: транспорт отправляет
-//     gzip, br сам (явный заголовок отключает прозрачную распаковку
-//     net/http, у которой нет потолка) и оборачивает тело читателем с
-//     потолком распакованного размера;
-//   - «Кодировка ответа определяется (заголовок, meta charset, детект) и
-//     приводится к UTF-8»: ToUTF8 — BOM → Content-Type charset → meta
-//     charset (первые 1024 байта) → детект (валидный UTF-8, частотная
-//     оценка кириллицы) → умолчание windows-1252 (WHATWG).
+//   - "Accept-Encoding: gzip, br is supported; decompression with a size
+//     cap (protection against zip bombs)": the transport sends gzip and br
+//     itself (an explicit header disables net/http's transparent
+//     decompression, which has no cap) and wraps the body in a reader with
+//     a cap on the decompressed size;
+//   - "The response charset is determined (header, meta charset, detect)
+//     and converted to UTF-8": ToUTF8 — BOM → Content-Type charset → meta
+//     charset (first 1024 bytes) → detect (valid UTF-8, Cyrillic frequency
+//     score) → the windows-1252 default (WHATWG).
 //
-// Цепочка чтения тела: сеть → распаковка Content-Encoding (одна
-// кодировка или составная «gzip, br» — цепочка слоёв RFC 9110,
-// потолок MaxBodyBytes на каждый слой, T-100) → [лимит читаемого тела
-// T-049] → потребитель; приведение к UTF-8 — поверх прочитанных байтов
-// через ToUTF8 (потребитель всё равно буферизует тело для хэша дедупа
-// и хранения, потоковая замена ридера выигрыша не даёт, а двойного
-// чтения — добавляет). Всё ниже по конвейеру (лимит T-049, хэш,
-// raw_len хранилища T-042) видит уже несжатые байты — распакованный
-// поток и есть тело ответа.
+// The body reading chain: network → Content-Encoding decompression (a
+// single coding or a compound "gzip, br" — a chain of layers per RFC 9110,
+// the MaxBodyBytes cap per layer, T-100) → [the readable body limit,
+// T-049] → the consumer; the UTF-8 conversion runs on top of the read
+// bytes via ToUTF8 (the consumer buffers the body anyway for the dedup
+// hash and storage; a streaming reader swap gains nothing and adds a
+// second read). Everything further down the pipeline (the T-049 limit, the
+// hash, the storage raw_len of T-042) sees already uncompressed bytes —
+// the decompressed stream is the response body.
 package httpfetch
 
 import (
@@ -47,54 +47,57 @@ import (
 )
 
 const (
-	// acceptEncoding — значение заголовка Accept-Encoding запросов
-	// (ТЗ 5.5: «Поддерживается Accept-Encoding: gzip, br»). Ставит
-	// транспорт (Fetch и RoundTrip), а не net/http: ручной заголовок
-	// отключает прозрачную распаковку транспорта Go — сжатые байты
-	// приходят как есть и распаковываются здесь, с потолком.
+	// acceptEncoding is the Accept-Encoding header value of requests
+	// (spec 5.5: "Accept-Encoding: gzip, br is supported"). It is set by
+	// the transport (Fetch and RoundTrip), not net/http: a manual header
+	// disables the Go transport's transparent decompression — compressed
+	// bytes arrive as is and are decompressed here, with a cap.
 	acceptEncoding = "gzip, br"
 
-	// defaultDecompressLimit — потолок распакованного тела, когда
-	// Options.MaxBodyBytes не задан: 2 МБ из таблицы лимитов ТЗ 5.5
-	// («макс. размер читаемого тела»). Потолок распаковки равен лимиту
-	// тела, а не отдельному числу: распакованный поток и есть тело, и
-	// «2 МБ читаемого» обязано означать и «2 МБ распакованного» — без
-	// этого чтение до конца (хэш дедупа) потребляло бы гигабайты
-	// zip-бомбы. Отдельное имя, а не DefaultMaxBodyBytes — не спорим с
-	// T-049 за константу дефолта лимита тела.
+	// defaultDecompressLimit is the cap on the decompressed body when
+	// Options.MaxBodyBytes is not set: 2 MB from the spec 5.5 limits
+	// table ("max readable body size"). The decompression cap equals the
+	// body limit rather than being a separate number: the decompressed
+	// stream is the body, so "2 MB readable" must also mean
+	// "2 MB decompressed" — otherwise reading to the end (the dedup
+	// hash) would consume gigabytes of a zip bomb. A separate name, not
+	// DefaultMaxBodyBytes, to avoid arguing with T-049 over the body
+	// limit default constant.
 	defaultDecompressLimit = 2 << 20
 
-	// charsetPreview — окно определения кодировки по содержимому: BOM
-	// всегда в начале, meta charset — по первым 1024 байтам (окно WHATWG,
-	// то же число использует x/net/html/charset).
+	// charsetPreview is the content-based charset detection window: the
+	// BOM is always at the start, meta charset is looked up in the first
+	// 1024 bytes (the WHATWG window; x/net/html/charset uses the same
+	// number).
 	charsetPreview = 1024
 
-	// cyrillicMinLetters — минимальное число кириллических букв для
-	// доверия частотному детекту: меньше — сигнала не хватает, остаётся
-	// умолчание windows-1252.
+	// cyrillicMinLetters is the minimum number of Cyrillic letters to
+	// trust the frequency detect: fewer means not enough signal, and the
+	// windows-1252 default remains.
 	cyrillicMinLetters = 32
 
-	// cyrillicMinAvgFreq — порог средней (геометрической) частоты букв
-	// decoded-текста: русский текст даёт 0.04–0.07 (частые о/е/а),
-	// случайное прочтение — 0.01 и ниже. Отсекает латиницу с
-	// диакритикой, неверно прочитанную как кириллицу.
+	// cyrillicMinAvgFreq is the threshold on the average (geometric)
+	// letter frequency of the decoded text: Russian text gives
+	// 0.04–0.07 (frequent о/е/а), a random reading gives 0.01 and below.
+	// It cuts off Latin text with diacritics misread as Cyrillic.
 	cyrillicMinAvgFreq = 0.02
 )
 
-// ErrDecompressTooLarge — распакованное тело превысило потолок
-// (защита от zip-бомб, ТЗ 5.5). Тело ответа при этом остаётся
-// читаемым до потолка; ошибка возвращается чтением за пределом.
+// ErrDecompressTooLarge — the decompressed body exceeded the cap
+// (protection against zip bombs, spec 5.5). The response body remains
+// readable up to the cap; the error is returned by reading beyond it.
 var ErrDecompressTooLarge = errors.New("httpfetch: распакованное тело превышает потолок распаковки")
 
-// --- сжатие: Accept-Encoding и распаковка с потолком ------------------------
+// --- compression: Accept-Encoding and capped decompression ------------------
 
-// parseContentCodings разбирает значение Content-Encoding в список
-// кодировок: RFC 9110 перечисляет их через запятую в порядке применения
-// сервером (первая — внутренний слой, последняя — внешний), регистр и
-// пробелы вокруг имён не значимы. Пустое значение — пустой список (нет
-// кодировки). Пустой элемент («gzip,,br», «gzip,») или кодировка вне
-// {gzip, x-gzip, br, deflate, identity} — ошибка: сломанному серверу
-// честный отказ, а не молчаливая выдача сжатых байтов телом.
+// parseContentCodings parses the Content-Encoding value into a list of
+// codings: RFC 9110 lists them comma-separated in the order the server
+// applied them (the first is the innermost layer, the last the outermost);
+// the case and spaces around names are not significant. An empty value is
+// an empty list (no coding). An empty element ("gzip,,br", "gzip,") or a
+// coding outside {gzip, x-gzip, br, deflate, identity} is an error: a
+// broken server gets an honest rejection instead of a silent delivery of
+// compressed bytes as the body.
 func parseContentCodings(contentEncoding string) ([]string, error) {
 	if strings.TrimSpace(contentEncoding) == "" {
 		return nil, nil
@@ -113,10 +116,10 @@ func parseContentCodings(contentEncoding string) ([]string, error) {
 	return codings, nil
 }
 
-// identityOnlyContentEncoding — сводится ли значение Content-Encoding
-// к identity/пусто (одиночное «identity» или составное «identity,
-// identity»): тело не преобразовано, кодирующие заголовки остаются
-// правдивыми — снимать их (decodeResponseBody) не нужно.
+// identityOnlyContentEncoding reports whether the Content-Encoding value
+// reduces to identity/empty (a single "identity" or a compound
+// "identity, identity"): the body is untransformed, the coding headers
+// stay truthful — there is no need to strip them (decodeResponseBody).
 func identityOnlyContentEncoding(ce string) bool {
 	for _, part := range strings.Split(ce, ",") {
 		switch strings.ToLower(strings.TrimSpace(part)) {
@@ -128,26 +131,27 @@ func identityOnlyContentEncoding(ce string) bool {
 	return true
 }
 
-// decodeContentEncoding оборачивает сжатое тело по значению
-// Content-Encoding (gzip и алиас x-gzip, br, deflate, identity/пусто)
-// читателем с потолком распакованного размера limit (<= 0 —
-// defaultDecompressLimit). deflate краулер не рекламирует
-// (Accept-Encoding: gzip, br), но часть серверов отдаёт его
-// незапрошенным — поток принимается оборонительно: zlib-обёртка
-// (RFC 1950) или сырой deflate (RFC 1951), форма различается по
-// заголовку. Составные значения («gzip, br», T-100) распаковываются
-// цепочкой слоёв по RFC 9110: кодировки применяются сервером в порядке
-// перечисления, поэтому последняя в списке образует внешний слой, и
-// цепочка строится от неё к первой. Потолок limit — на каждый слой, а
-// не произведение: суммарная работа распаковки одного ответа ограничена
-// числом слоёв × (limit + decompressTailMargin) — каждый слой ограничен
-// как единственный, защита от бомб не слабеет. Классификация хвоста
-// (обрезка против ErrDecompressTooLarge) выполняется итоговым слоем по
-// последнему декодированному потоку — семантика однослойных кодировок
-// не меняется. Accept-Encoding составные значения по-прежнему не
-// рекламирует — значение приходит только от сломанного сервера и
-// обрабатывается оборонительно, как одиночный deflate. Возвращает
-// читатель, закрывающий исходное тело (цепочка Close каскадом до него).
+// decodeContentEncoding wraps a compressed body according to the
+// Content-Encoding value (gzip and its x-gzip alias, br, deflate,
+// identity/empty) with a reader capped at the decompressed size limit
+// (<= 0 means defaultDecompressLimit). The crawler does not advertise
+// deflate (Accept-Encoding: gzip, br), but some servers send it
+// unrequested — the stream is accepted defensively: a zlib wrapper
+// (RFC 1950) or raw deflate (RFC 1951), the form is told apart by the
+// header. Compound values ("gzip, br", T-100) are decompressed as a chain
+// of layers per RFC 9110: the codings are applied by the server in
+// enumeration order, so the last one in the list forms the outermost
+// layer, and the chain is built from it back to the first. The limit cap
+// applies per layer, not to the product: the total decompression work for
+// one response is bounded by the number of layers × (limit +
+// decompressTailMargin) — each layer is limited as if it were the only
+// one, and the bomb protection does not weaken. The tail classification
+// (truncation vs ErrDecompressTooLarge) is performed by the final layer on
+// the last decoded stream — single-coding semantics do not change.
+// Accept-Encoding still does not advertise compound values — the value
+// comes only from a broken server and is handled defensively, like a
+// single deflate. Returns a reader that closes the original body (the
+// Close chain cascades down to it).
 func decodeContentEncoding(rc io.ReadCloser, contentEncoding string, limit int64) (io.ReadCloser, error) {
 	if limit <= 0 {
 		limit = defaultDecompressLimit
@@ -156,20 +160,20 @@ func decodeContentEncoding(rc io.ReadCloser, contentEncoding string, limit int64
 	if err != nil {
 		return nil, err
 	}
-	// Строим от внешнего слоя (последняя кодировка) к внутреннему
-	// (первая): каждый читатель снимает один слой, decompressCap поверх
-	// ставит потолок limit. identity слоя не строит (пустая операция);
-	// цепочка из одних identity или пустой список возвращают тело как
-	// есть.
-	var cur = rc // io.ReadCloser — статический тип из параметра
+	// Built from the outermost layer (the last coding) to the innermost
+	// (the first): each reader strips one layer, decompressCap on top
+	// applies the limit cap. identity builds no layer (a no-op); a chain
+	// of only identities or an empty list return the body as is.
+	var cur = rc // io.ReadCloser — the static type from the parameter
 	for i := len(codings) - 1; i >= 0; i-- {
 		switch codings[i] {
 		case "identity":
 			continue
 		case "gzip", "x-gzip":
-			// gzip.NewReader читает заголовок немедленно: пустое сжатое
-			// тело возвращает io.EOF — это не ошибка, тело просто пустое
-			// (слой ниже уже отдал всё — возвращаем его как есть).
+			// gzip.NewReader reads the header immediately: an empty
+			// compressed body returns io.EOF — that is not an error, the
+			// body is simply empty (the layer below has already given
+			// everything — return it as is).
 			gz, err := gzip.NewReader(cur)
 			if err == io.EOF {
 				return cur, nil
@@ -179,7 +183,7 @@ func decodeContentEncoding(rc io.ReadCloser, contentEncoding string, limit int64
 			}
 			cur = &decompressCap{dec: gz, src: cur, left: limit}
 		case "br":
-			// brotli.NewReader заголовок валидирует лениво, при чтении.
+			// brotli.Reader validates the header lazily, on read.
 			cur = &decompressCap{dec: brotli.NewReader(cur), src: cur, left: limit}
 		case "deflate":
 			cur = &decompressCap{dec: newDeflateReader(cur), src: cur, left: limit}
@@ -188,14 +192,14 @@ func decodeContentEncoding(rc io.ReadCloser, contentEncoding string, limit int64
 	return cur, nil
 }
 
-// newDeflateReader — читатель deflate-потока: zlib-обёртка (RFC 1950)
-// или сырой поток (RFC 1951); в реальном «Content-Encoding: deflate»
-// встречаются обе формы (историческая двусмысленность HTTP-серверов,
-// ту же развилку проходят браузеры и curl). Заголовок zlib различается
-// по двум байтам: метод deflate (CM=8), окно ≤ 32 КБ (CINFO ≤ 7), без
-// предустановленного словаря (FDICT=0) и контрольная сумма заголовка
-// кратна 31. Чтение лениво: данные источника не теряются (reader
-// держит peek-буфер).
+// newDeflateReader is a deflate stream reader: a zlib wrapper (RFC 1950)
+// or a raw stream (RFC 1951); both forms occur in real
+// "Content-Encoding: deflate" (a historical ambiguity of HTTP servers;
+// browsers and curl go through the same fork). The zlib header is told
+// apart by two bytes: the deflate method (CM=8), a window of ≤ 32 KB
+// (CINFO ≤ 7), no preset dictionary (FDICT=0), and the header checksum
+// divisible by 31. Reading is lazy: no source data is lost (the reader
+// keeps a peek buffer).
 func newDeflateReader(rc io.ReadCloser) io.Reader {
 	br := bufio.NewReader(rc)
 	if hdr, err := br.Peek(2); err == nil && looksLikeZlib(hdr) {
@@ -206,7 +210,7 @@ func newDeflateReader(rc io.ReadCloser) io.Reader {
 	return flate.NewReader(br)
 }
 
-// looksLikeZlib — правдоподобный zlib-заголовок (см. newDeflateReader).
+// looksLikeZlib — a plausible zlib header (see newDeflateReader).
 func looksLikeZlib(hdr []byte) bool {
 	if len(hdr) < 2 {
 		return false
@@ -216,24 +220,24 @@ func looksLikeZlib(hdr []byte) bool {
 		(int(cmf)*256+int(flg))%31 == 0
 }
 
-// decompressTailMargin — сколько распакованных байтов за потолком
-// читается для классификации хвоста: конец потока в пределах маржи —
-// честная обрезка (живой сайт чуть больше лимита), продолжение за
-// маржой — zip-бомба (ErrDecompressTooLarge, ТЗ 5.5/Т-051).
+// decompressTailMargin — how many decompressed bytes beyond the cap are
+// read to classify the tail: the end of the stream within the margin is
+// an honest truncation (a live site slightly over the limit), continuation
+// beyond the margin is a zip bomb (ErrDecompressTooLarge, spec 5.5/T-051).
 const decompressTailMargin = 64 << 10
 
-// decompressCap — распакованный поток с потолком (защита от zip-бомб).
-// В составной упаковке (T-100) экземпляры стоят на каждый слой: src
-// тогда — decompressCap слоя ниже, Close каскадом доходит до тела
-// ответа, закрывая каждый слой ровно один раз. Отдельного Close у
-// brotli-ридера нет, а у gzip он не трогает источник — достаточно
-// одного src.Close.
+// decompressCap is a decompressed stream with a cap (zip-bomb protection).
+// In compound packaging (T-100) an instance sits on every layer: src is
+// then the decompressCap of the layer below, Close cascades down to the
+// response body, closing each layer exactly once. The brotli reader has no
+// separate Close, and gzip's does not touch the source — a single
+// src.Close is enough.
 type decompressCap struct {
-	dec      io.Reader     // распакованный поток (gzip.Reader / brotli.Reader)
-	src      io.ReadCloser // сжатое тело ответа
-	left     int64         // остаток потолка в байтах
-	tailDone bool          // хвост за потолком уже классифицирован
-	tailErr  error         // итог классификации хвоста (повторные чтения его повторяют)
+	dec      io.Reader     // the decompressed stream (gzip.Reader / brotli.Reader)
+	src      io.ReadCloser // the compressed response body
+	left     int64         // the remaining cap in bytes
+	tailDone bool          // the tail beyond the cap has been classified already
+	tailErr  error         // the tail classification verdict (repeated reads repeat it)
 }
 
 func (c *decompressCap) Read(p []byte) (int, error) {
@@ -246,13 +250,13 @@ func (c *decompressCap) Read(p []byte) (int, error) {
 		return n, err
 	}
 	if len(p) == 0 {
-		return 0, nil // контракт io.Reader; классификация — при следующем чтении
+		return 0, nil // the io.Reader contract; classification on the next read
 	}
 	if !c.tailDone {
 		c.tailDone = true
 		n, err := c.classifyTail(p)
 		if n > 0 {
-			c.tailErr = io.EOF // первый байт хвоста отдан — дальше конец потока
+			c.tailErr = io.EOF // the first tail byte is given out — the stream ends after it
 		} else {
 			c.tailErr = err
 		}
@@ -261,13 +265,14 @@ func (c *decompressCap) Read(p []byte) (int, error) {
 	return 0, c.tailErr
 }
 
-// classifyTail — классификация хвоста за потолком (выполняется один раз):
-// EOF сразу — тело ровно в потолке (не ошибка); данные, конец которых
-// укладывается в decompressTailMargin, — обрезка: первый байт хвоста
-// копируется в p как признак «тело длиннее потолка» (BodyLimiter по нему
-// ставит Truncated, H-2), остальной хвост дочитывается и отбрасывается;
-// поток, продолжающийся за маржу, — zip-бомба: ErrDecompressTooLarge,
-// чтение останавливается, не расходуя бомбу дальше (Т-051).
+// classifyTail classifies the tail beyond the cap (performed once):
+// EOF right away — the body is exactly at the cap (not an error); data
+// ending within decompressTailMargin — truncation: the first tail byte is
+// copied into p as the "body is longer than the cap" marker (BodyLimiter
+// sets Truncated based on it, H-2), the rest of the tail is read out and
+// discarded; a stream continuing beyond the margin is a zip bomb:
+// ErrDecompressTooLarge, reading stops without spending more of the bomb
+// (T-051).
 func (c *decompressCap) classifyTail(p []byte) (int, error) {
 	var buf [4096]byte
 	read := int64(0)
@@ -275,57 +280,58 @@ func (c *decompressCap) classifyTail(p []byte) (int, error) {
 		n, err := c.dec.Read(buf[:])
 		read += int64(n)
 		if n > 0 {
-			p[0] = buf[0] // признак хвоста потребителю
+			p[0] = buf[0] // the tail marker for the consumer
 			for read < decompressTailMargin {
 				n2, err2 := c.dec.Read(buf[:])
 				read += int64(n2)
 				if err2 == io.EOF {
-					return 1, nil // конец в пределах маржи — обрезка
+					return 1, nil // the end is within the margin — truncation
 				}
 				if err2 != nil {
-					return 1, err2 // хвост начался, но оборвался ошибкой сети
+					return 1, err2 // the tail started but broke off with a network error
 				}
 			}
-			return 0, ErrDecompressTooLarge // поток продолжается — бомба
+			return 0, ErrDecompressTooLarge // the stream continues — a bomb
 		}
 		if err == io.EOF {
-			return 0, io.EOF // тело ровно в потолке
+			return 0, io.EOF // the body is exactly at the cap
 		}
 		if err != nil {
 			return 0, err
 		}
-		// (0, nil) — допустимый редкий случай; продолжаем до маржи
+		// (0, nil) is an allowed rare case; keep going until the margin
 	}
 	return 0, ErrDecompressTooLarge
 }
 
 func (c *decompressCap) Close() error { return c.src.Close() }
 
-// --- кодировки: определение и приведение к UTF-8 -----------------------------
+// --- charsets: detection and conversion to UTF-8 ----------------------------
 
-// CharsetSource — на каком шаге решилась кодировка тела. Наблюдаемость
-// для воркера (лог/метрики «откуда узнали»), на декод не влияет.
+// CharsetSource is the step at which the body charset was decided.
+// Observability for the worker (logs/metrics "how we learned it"); it does
+// not affect decoding.
 type CharsetSource int
 
 const (
-	// CharsetNone — тело пустое, кодировки нет.
+	// CharsetNone — the body is empty, there is no charset.
 	CharsetNone CharsetSource = iota
-	// CharsetBOM — метка порядка байтов (сильнейший сигнал, WHATWG).
+	// CharsetBOM — the byte order mark (the strongest signal, WHATWG).
 	CharsetBOM
-	// CharsetHeader — параметр charset заголовка Content-Type.
+	// CharsetHeader — the charset parameter of the Content-Type header.
 	CharsetHeader
-	// CharsetMeta — meta charset в первых 1024 байтах (оба вида:
-	// <meta charset> и <meta http-equiv="Content-Type">).
+	// CharsetMeta — a meta charset in the first 1024 bytes (both kinds:
+	// <meta charset> and <meta http-equiv="Content-Type">).
 	CharsetMeta
-	// CharsetDetect — детект: валидный UTF-8 или частотная оценка
-	// кириллицы (koi8-r / windows-1251 / iso-8859-5).
+	// CharsetDetect — detection: valid UTF-8 or a Cyrillic frequency
+	// score (koi8-r / windows-1251 / iso-8859-5).
 	CharsetDetect
-	// CharsetDefault — умолчание WHATWG windows-1252 (надмножество
-	// latin-1): не определили никак.
+	// CharsetDefault — the WHATWG windows-1252 default (a superset of
+	// latin-1): nothing was determined.
 	CharsetDefault
 )
 
-// String — короткое имя источника (bom/header/meta/detect/default/none).
+// String is the short name of the source (bom/header/meta/detect/default/none).
 func (s CharsetSource) String() string {
 	switch s {
 	case CharsetBOM:
@@ -343,51 +349,52 @@ func (s CharsetSource) String() string {
 	}
 }
 
-// CharsetResult — итог приведения тела к UTF-8.
+// CharsetResult is the outcome of converting the body to UTF-8.
 type CharsetResult struct {
-	// UTF8 — тело в UTF-8. Некорректные последовательности заменяются
-	// U+FFFD (RuneError), а не ошибкой. Для уже-UTF-8 тела байты могут
-	// разделять память с входом ToUTF8 (быстрый путь без копии). Пустое
-	// тело — пустой не-nil слайс: пустой ответ валиден, а nil вниз по
-	// конвейеру означал бы «тела нет» и лишил бы запись content_hash
-	// (T-138).
+	// UTF8 is the body in UTF-8. Invalid sequences are replaced with
+	// U+FFFD (RuneError), not an error. For an already-UTF-8 body the
+	// bytes may share memory with ToUTF8's input (the fast no-copy path).
+	// An empty body is an empty non-nil slice: an empty response is
+	// valid, while nil further down the pipeline would mean "no body" and
+	// would deprive the record of content_hash (T-138).
 	UTF8 []byte
-	// Charset — каноническое имя исходной кодировки (WHATWG: "utf-8",
-	// "windows-1251", "koi8-r", …); "" только для пустого тела.
+	// Charset is the canonical name of the source charset (WHATWG:
+	// "utf-8", "windows-1251", "koi8-r", …); "" only for an empty body.
 	Charset string
-	// Source — шаг, на котором кодировка определена.
+	// Source is the step at which the charset was determined.
 	Source CharsetSource
 }
 
-// ToUTF8 приводит тело ответа к UTF-8 по приоритету ТЗ 5.5
-// («заголовок, meta charset, детект»), с BOM впереди:
+// ToUTF8 converts the response body to UTF-8 by the spec 5.5 priority
+// ("header, meta charset, detect"), with the BOM first:
 //
-//	BOM → Content-Type charset → meta charset (первые 1024 байта) →
-//	детект (валидный UTF-8; кириллическая частотная оценка) →
-//	умолчание windows-1252 (WHATWG, надмножество latin-1).
+//	BOM → Content-Type charset → meta charset (first 1024 bytes) →
+//	detect (valid UTF-8; the Cyrillic frequency score) →
+//	the windows-1252 default (WHATWG, a superset of latin-1).
 //
-// Неизвестная метка charset в заголовке пропускается («лучшая попытка»:
-// страница о своей кодировке знает больше сломанного заголовка), а
-// meta-декларация windows-1252/latin-1 неотличима от умолчания — такие
-// тела всё равно проходят детект. Функция не возвращает ошибку:
-// нераспознанное — windows-1252, невалидные последовательности — U+FFFD.
+// An unknown charset label in the header is skipped ("best effort": the
+// page knows its own charset better than a broken header), and a
+// windows-1252/latin-1 meta declaration is indistinguishable from the
+// default — such bodies go through detect anyway. The function returns no
+// error: unrecognized means windows-1252, invalid sequences mean U+FFFD.
 func ToUTF8(h http.Header, body []byte) CharsetResult {
 	if len(body) == 0 {
-		// Пустое тело — валидное тело (T-138): UTF8 — пустой, но не
-		// nil слайс. nil ниже по конвейеру читается как «тела нет
-		// вовсе» (предохранитель ContentSaver гасит content_hash),
-		// а пустой ответ (200/400/404/500 с Content-Length: 0)
-		// обязан дойти до Put с хэшем пустых байтов: HashOf(nil) ==
-		// HashOf([]byte{}), дедуп и классы эквивалентности пустых
-		// страниц работают как у любого контента.
+		// An empty body is a valid body (T-138): UTF8 is an empty but
+		// non-nil slice. nil further down the pipeline reads as "no body
+		// at all" (the ContentSaver fuse zeroes out content_hash), while
+		// an empty response (200/400/404/500 with Content-Length: 0)
+		// must reach Put with the hash of empty bytes: HashOf(nil) ==
+		// HashOf([]byte{}), so dedup and the equivalence classes of empty
+		// pages work like for any content.
 		return CharsetResult{UTF8: []byte{}, Source: CharsetNone}
 	}
 
-	// BOM перекрывает всё (WHATWG): у сервера была последняя попытка
-	// в charset заголовка, фактические байты — финальная инстанция.
-	// UTF-32 BOM не детектируем (как WHATWG/браузеры): UTF-32LE-префикс
-	// FF FE 00 00 примет за UTF-16LE. Декодер unicode.UTF8 BOM не
-	// убирает — снимаем сами; UTF-16 декодер с UseBOM потребляет.
+	// The BOM overrides everything (WHATWG): the server had the last word
+	// in the charset header, the actual bytes are the final authority.
+	// UTF-32 BOMs are not detected (like WHATWG/browsers): a UTF-32LE
+	// prefix FF FE 00 00 is taken for UTF-16LE. The unicode.UTF8 decoder
+	// does not strip the BOM — we strip it ourselves; the UTF-16 decoder
+	// consumes it with UseBOM.
 	switch {
 	case bytes.HasPrefix(body, []byte{0xEF, 0xBB, 0xBF}):
 		return CharsetResult{
@@ -407,18 +414,19 @@ func ToUTF8(h http.Header, body []byte) CharsetResult {
 			name, _ := htmlindex.Name(enc)
 			return decodeAs(enc, name, CharsetHeader, body)
 		}
-		// Неизвестная метка: пропускаем к meta/детекту.
+		// An unknown label: skip to meta/detect.
 	}
 
-	// meta charset. Prescan x/net/html/charset (html.Tokenizer, оба
-	// вида meta, нормализация utf-16→utf-8) — battle-tested разбор;
-	// свой писали бы хуже. Заголовок пуст (уже прошли), BOM нет —
-	// ветки BOM/заголовка внутри не сработают.
+	// meta charset. The x/net/html/charset prescan (html.Tokenizer, both
+	// meta kinds, utf-16→utf-8 normalization) is battle-tested parsing;
+	// we would write our own worse. The header is empty (already handled),
+	// there is no BOM — the BOM/header branches inside will not fire.
 	enc, name, _ := charset.DetermineEncoding(previewBytes(body), "")
 	metaMark := metaCharsetRe.Match(previewBytes(body))
 	if enc == encoding.Nop {
-		// utf-8: meta так объявила (включая нормализацию utf-16) или
-		// превью — валидный UTF-8; источник различает только пометка.
+		// utf-8: the meta declared it (including utf-16 normalization) or
+		// the preview is valid UTF-8; only the mark tells the sources
+		// apart.
 		src := CharsetDetect
 		if metaMark {
 			src = CharsetMeta
@@ -426,18 +434,20 @@ func ToUTF8(h http.Header, body []byte) CharsetResult {
 		return CharsetResult{UTF8: sanitizeUTF8(body), Charset: "utf-8", Source: src}
 	}
 	if name != "windows-1252" {
-		// Конкретная не-умолчальная кодировка — это prescan (meta).
+		// A concrete non-default charset means the prescan (meta).
 		return decodeAs(enc, name, CharsetMeta, body)
 	}
 
-	// x/net вернулся с windows-1252 — то ли meta его объявила, то ли
-	// умолчание. Детект по всему телу: валидный UTF-8 (x/net смотрел
-	// только превью и ASCII-тело не проверял на UTF-8 вовсе)…
+	// x/net came back with windows-1252 — either the meta declared it or
+	// it is the default. Detect over the whole body: valid UTF-8 (x/net
+	// only looked at the preview and never checked an ASCII body for
+	// UTF-8)…
 	if utf8.Valid(body) {
 		return CharsetResult{UTF8: sanitizeUTF8(body), Charset: "utf-8", Source: CharsetDetect}
 	}
-	// …частотная оценка кириллицы: спасает и немаркированный легаси
-	// (koi8-r без указаний), и перепутанные meta charset="windows-1252".
+	// …the Cyrillic frequency score: it rescues both unmarked legacy
+	// content (koi8-r with no hints) and mangled
+	// meta charset="windows-1252" pages.
 	if enc, name := detectCyrillic(body); enc != nil {
 		return decodeAs(enc, name, CharsetDetect, body)
 	}
@@ -448,27 +458,27 @@ func ToUTF8(h http.Header, body []byte) CharsetResult {
 	return decodeAs(charmap.Windows1252, "windows-1252", src, body)
 }
 
-// decodeAs декодирует тело известной кодировкой: результат UTF-8,
-// некорректные последовательности — U+FFFD, не ошибка (ТЗ 5.5 не
-// квалифицирует битые байты как отказ загрузки).
+// decodeAs decodes the body with a known charset: the result is UTF-8,
+// invalid sequences become U+FFFD, not an error (spec 5.5 does not
+// qualify broken bytes as a fetch failure).
 func decodeAs(enc encoding.Encoding, name string, src CharsetSource, body []byte) CharsetResult {
 	out, err := enc.NewDecoder().Bytes(body)
 	if err != nil {
-		// Декодеры x/text заменяют невалидные байты на U+FFFD без
-		// ошибки; сюда ведут только обрывы последовательностей
-		// (нечётная длина UTF-16 и т.п.) — сохраняем готовый префикс
-		// и ставим U+FFFD на месте обрыва (дописанные байты — не nil).
+		// x/text decoders replace invalid bytes with U+FFFD without an
+		// error; only truncated sequences lead here (an odd UTF-16 length
+		// and the like) — keep the ready prefix and put U+FFFD at the
+		// truncation point (the appended bytes are not nil).
 		return CharsetResult{UTF8: append(out, "\uFFFD"...), Charset: name, Source: src}
 	}
 	return CharsetResult{UTF8: emptyIfNil(out), Charset: name, Source: src}
 }
 
-// emptyIfNil — нормализация пустого декодированного выхода в не-nil
-// слайс: тело из одного UTF-16 BOM декодируется в ноль байтов, и будущая
-// версия x/text может отдать такой выход nil-ом (текущая возвращает
-// make-буфер). Пустое тело — валидное тело, nil ниже по конвейеру
-// означает «тела нет» (T-138) — контракт ToUTF8 не держится на детали
-// реализации библиотеки.
+// emptyIfNil normalizes an empty decoded output into a non-nil slice: a
+// body of a single UTF-16 BOM decodes to zero bytes, and a future x/text
+// version may return such output as nil (the current one returns a
+// make-allocated buffer). An empty body is a valid body; nil further down
+// the pipeline means "no body" (T-138) — the ToUTF8 contract does not rely
+// on library implementation details.
 func emptyIfNil(b []byte) []byte {
 	if b == nil {
 		return []byte{}
@@ -476,9 +486,9 @@ func emptyIfNil(b []byte) []byte {
 	return b
 }
 
-// sanitizeUTF8 — замена некорректных последовательностей на U+FFFD
-// (максимальные подпоследовательности, семантика WHATWG/Go): валидное
-// тело возвращается как есть, без копии.
+// sanitizeUTF8 replaces invalid sequences with U+FFFD (maximal
+// subpartitions, the WHATWG/Go semantics): a valid body is returned as is,
+// without a copy.
 func sanitizeUTF8(b []byte) []byte {
 	if utf8.Valid(b) {
 		return b
@@ -497,9 +507,9 @@ func sanitizeUTF8(b []byte) []byte {
 	return out
 }
 
-// headerCharset извлекает параметр charset из Content-Type; пусто при
-// отсутствии или неразборном заголовке (битый заголовок — нет
-// информации, не повод отказываться от тела).
+// headerCharset extracts the charset parameter from Content-Type; empty
+// when the header is missing or unparseable (a broken header means no
+// information, not a reason to give up the body).
 func headerCharset(contentType string) string {
 	if contentType == "" {
 		return ""
@@ -511,7 +521,8 @@ func headerCharset(contentType string) string {
 	return params["charset"]
 }
 
-// previewBytes — первые charsetPreview байт тела (окно meta/BOM).
+// previewBytes is the first charsetPreview bytes of the body (the
+// meta/BOM window).
 func previewBytes(b []byte) []byte {
 	if len(b) > charsetPreview {
 		return b[:charsetPreview]
@@ -519,20 +530,21 @@ func previewBytes(b []byte) []byte {
 	return b
 }
 
-// metaCharsetRe — грубая пометка «в окне есть meta charset». Нужна
-// только для поля Source (мета объявила utf-8/1252 или детект без
-// указаний): на выбор кодировки не влияет — prescan уже вернул бы
-// конкретную кодировку, если бы meta её корректно объявила.
+// metaCharsetRe is a rough mark of "there is a meta charset in the
+// window". Needed only for the Source field (the meta declared
+// utf-8/1252, or a detect with no hints): it does not affect the charset
+// choice — the prescan would already have returned the concrete charset
+// if the meta had declared it correctly.
 var metaCharsetRe = regexp.MustCompile(`(?i)<meta[^>]*\bcharset`)
 
-// --- детект кириллицы --------------------------------------------------------
+// --- Cyrillic detect ---------------------------------------------------------
 
-// cyrCharsets — кандидаты частотного детекта. x/net/html/charset
-// контентной эвристики не имеет (meta-prescan, проверка UTF-8 и
-// умолчание windows-1252), а ТЗ 5.5 требует «детект»: типичный
-// немаркированный не-UTF-8 контент — кириллический легаси
-// (koi8-r, windows-1251, iso-8859-5), прочие письменности оставляем
-// умолчанию WHATWG.
+// cyrCharsets is the candidate list for the frequency detect.
+// x/net/html/charset has no content heuristic (meta prescan, the UTF-8
+// check and the windows-1252 default), while spec 5.5 requires a
+// "detect": typical unmarked non-UTF-8 content is Cyrillic legacy
+// (koi8-r, windows-1251, iso-8859-5); other scripts are left to the
+// WHATWG default.
 var cyrCharsets = []struct {
 	enc  encoding.Encoding
 	name string
@@ -543,9 +555,10 @@ var cyrCharsets = []struct {
 	{charmap.ISO8859_5, "iso-8859-5", charmap.ISO8859_5},
 }
 
-// ruLetterFreq — частоты строчных букв русского языка (доли). Правильная
-// кодировка набирает частые о/е/а/и — сумма логарифмов частот различает
-// кандидатов: неверное прочтение даёт редкие буквы.
+// ruLetterFreq is the frequencies of Russian lower-case letters (shares).
+// The correct charset accumulates the frequent о/е/а/и — the sum of
+// logarithms of frequencies tells the candidates apart: a wrong reading
+// yields rare letters.
 var ruLetterFreq = map[rune]float64{
 	'о': 0.110, 'е': 0.085, 'а': 0.080, 'и': 0.074, 'н': 0.066,
 	'т': 0.064, 'с': 0.051, 'р': 0.047, 'в': 0.045, 'л': 0.044,
@@ -556,11 +569,11 @@ var ruLetterFreq = map[rune]float64{
 	'ъ': 0.0002, 'ё': 0.0002, 'ь': 0.014,
 }
 
-// detectCyrillic ищет однобайтовую кириллическую кодировку по частотам
-// букв: декодирует байты >= 0x80 каждым кандидатом и сравнивает сумму
-// логарифмов частот букв. Возвращает nil, если кириллического сигнала
-// не хватает (мало букв или текст скорее латинский с диакритикой) —
-// остаётся умолчание windows-1252.
+// detectCyrillic looks for a single-byte Cyrillic charset by letter
+// frequencies: it decodes bytes >= 0x80 with each candidate and compares
+// the sum of letter frequency logarithms. It returns nil when the
+// Cyrillic signal is not enough (too few letters, or the text is more
+// likely Latin with diacritics) — the windows-1252 default remains.
 func detectCyrillic(body []byte) (encoding.Encoding, string) {
 	best := -1
 	bestScore := 0.0
@@ -586,17 +599,17 @@ func detectCyrillic(body []byte) (encoding.Encoding, string) {
 	if best < 0 {
 		return nil, ""
 	}
-	// Порог средней (геометрической) частоты буквы: русский текст даёт
-	// ~0.04–0.07 (частые гласные), латиница с диакритикой, прочитанная
-	// как кириллица, — набор редких букв и < 0.02.
+	// The threshold on the average (geometric) letter frequency: Russian
+	// text gives ~0.04–0.07 (frequent vowels), Latin with diacritics read
+	// as Cyrillic is a set of rare letters and < 0.02.
 	if avg := math.Exp(bestScore / float64(letters)); avg < cyrillicMinAvgFreq {
 		return nil, ""
 	}
 	return cyrCharsets[best].enc, cyrCharsets[best].name
 }
 
-// letterFreq — частота буквы русского языка (неизвестные буквы — редкий
-// штраф, чтобы странные прочтения не набирали очки).
+// letterFreq is the frequency of a Russian letter (unknown letters get a
+// rare penalty so that odd readings do not score points).
 func letterFreq(r rune) float64 {
 	if f, ok := ruLetterFreq[r]; ok {
 		return f
@@ -604,7 +617,7 @@ func letterFreq(r rune) float64 {
 	return 0.0005
 }
 
-// isCyrillic — основная кириллица без расширений (А-я, Ё, ё).
+// isCyrillic — the main Cyrillic block without extensions (А-я, Ё, ё).
 func isCyrillic(r rune) bool {
 	return (r >= 0x0410 && r <= 0x044F) || r == 0x0401 || r == 0x0451
 }

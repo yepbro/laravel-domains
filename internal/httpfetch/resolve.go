@@ -9,88 +9,90 @@ import (
 	"time"
 )
 
-// Resolver — резолв имён хостов, у которых нет адресов DNS-этапа
-// (ТЗ 5.5 п. 2: «для редиректов на другие хосты — резолв через тот же
-// резолвер с кэшем»). «Тот же резолвер» — резолвер DNS-этапа
-// (internal/dnsclient поверх Unbound): адаптер Exchange(A/AAAA) →
-// адреса собирается при wiring воркера (T-053), где известен флаг
-// dns.ipv6 и политика fallback-резолверов; транспорт зависит от
-// интерфейса, а не от DNS-клиента.
+// Resolver resolves the names of hosts that have no DNS stage addresses
+// (spec 5.5 item 2: "for redirects to other hosts — resolve via the same
+// resolver with the cache"). "The same resolver" is the DNS stage resolver
+// (internal/dnsclient over Unbound): the Exchange(A/AAAA) → addresses
+// adapter is assembled at worker wiring time (T-053), where the dns.ipv6
+// flag and the fallback-resolver policy are known; the transport depends
+// on the interface, not on the DNS client.
 //
-// IP-литералы сюда не попадают: транспорт обрабатывает их сам (lookup).
+// IP literals never get here: the transport handles them itself (lookup).
 type Resolver interface {
-	// LookupNetIP возвращает IP-адреса хоста (A/AAAA в порядке ответа
-	// резолвера). Возвращённый срез потребитель не изменяет.
+	// LookupNetIP returns the host's IP addresses (A/AAAA in the resolver
+	// response order). The consumer does not modify the returned slice.
 	LookupNetIP(ctx context.Context, host string) ([]netip.Addr, error)
 }
 
-// ResolverFunc — адаптер функции под Resolver (как http.HandlerFunc):
-// заглушки юнит-тестов и адаптеры резолвера этапа.
+// ResolverFunc is a function adapter for Resolver (like http.HandlerFunc):
+// unit-test stubs and the stage's resolver adapters.
 type ResolverFunc func(ctx context.Context, host string) ([]netip.Addr, error)
 
-// LookupNetIP реализует Resolver.
+// LookupNetIP implements Resolver.
 func (fn ResolverFunc) LookupNetIP(ctx context.Context, host string) ([]netip.Addr, error) {
 	return fn(ctx, host)
 }
 
-// SystemResolver — системный резолвер (net.DefaultResolver): дефолт
-// транспорта, когда резолвер этапа не подключён (локальная разработка,
-// юнит-тесты). В боевом воркере заменяется адаптером dnsclient.
+// SystemResolver is the system resolver (net.DefaultResolver): the
+// transport default when the stage resolver is not wired in (local
+// development, unit tests). In the production worker it is replaced by the
+// dnsclient adapter.
 var SystemResolver Resolver = ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
 	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 })
 
-// Параметры кэша по умолчанию.
+// The default cache parameters.
 const (
-	// DefaultCacheTTL — время жизни записи. Не выше типичного
-	// минимального TTL публичных зон (60 с): редирект-хост повторно
-	// резолвится в пределах цепочки и соседних задач, а изменение
-	// адреса подхватывается минутой позже — некритично для краулера
-	// (проверки периодические, §3.3). Кэш экономит поход к резолверу,
-	// но не подменяет его: сам Unbound кэширует по настоящим TTL.
+	// DefaultCacheTTL is the entry lifetime. Never above the typical
+	// minimum TTL of public zones (60 s): a redirect host is resolved
+	// again within the chain and neighboring tasks, and an address change
+	// is picked up a minute later — not critical for the crawler (checks
+	// are periodic, §3.3). The cache saves a trip to the resolver but does
+	// not replace it: Unbound itself caches by the real TTLs.
 	DefaultCacheTTL = 60 * time.Second
-	// DefaultCacheEntries — предел записей: ~4096 хостов редиректов
-	// с срезом адресов — единицы мегабайт памяти воркера (§3.2).
+	// DefaultCacheEntries is the entry limit: ~4096 redirect hosts with
+	// address slices — a few megabytes of worker memory (§3.2).
 	DefaultCacheEntries = 4096
 )
 
-// CacheOptions — параметры CachingResolver. Нулевые значения
-// заменяются дефолтами. Параметры кэша в конфигурации не вынесены:
-// в таблице лимитов ТЗ 5.5 их нет, это деталь транспорта.
+// CacheOptions are the CachingResolver parameters. Zero values are
+// replaced with defaults. The cache parameters are not exposed in the
+// configuration: they are not in the spec 5.5 limits table — a transport
+// detail.
 type CacheOptions struct {
 	TTL        time.Duration
 	MaxEntries int
 }
 
-// cacheEntry — запись кэша: адреса и момент истечения.
+// cacheEntry is a cache record: the addresses and the expiry moment.
 type cacheEntry struct {
 	addrs  []netip.Addr
 	expiry time.Time
 }
 
-// CachingResolver — обёртка-кэш поверх резолвера: попадание в
-// неистёкшую запись не обращается к резолверу.
+// CachingResolver is a cache wrapper over a resolver: a hit on a
+// non-expired entry never touches the resolver.
 //
-// Кэш — отдельный слой-декоратор над Resolver, а не поле транспорта:
-// T-048 резолвит хосты Location и meta refresh тем же кэшем (meta
-// refresh — уровень контента, мимо диала транспорта), а транспорт
-// остаётся зависящим от одного интерфейса. Ошибки не кэшируются —
-// отказ резолвера повторяется реальным запросом (клиппер зацикливания
-// «негативный ответ навсегда» не нужен: деградация резолвера —
-// сигнал мониторинга, а не штатный режим). Одновременные промахи по
-// одному хосту оба идут в резолвер (singleflight не заводился:
-// редирект-хосты в пределах задачи почти не пересекаются, экономия
-// редкая, а сложность координации — реальная).
+// The cache is a separate decorator layer over Resolver, not a transport
+// field: T-048 resolves Location and meta refresh hosts with the same
+// cache (meta refresh is the content level, bypassing the transport's
+// dial), while the transport stays dependent on a single interface. Errors
+// are not cached — a resolver failure is retried by a real request (the
+// "negative answer forever" loop clipper is not needed: resolver
+// degradation is a monitoring signal, not a normal mode). Concurrent
+// misses on one host both go to the resolver (singleflight was not
+// introduced: redirect hosts within a task barely overlap, the savings
+// are rare, and the coordination complexity is real).
 type CachingResolver struct {
 	inner   Resolver
 	ttl     time.Duration
 	max     int
 	mu      sync.Mutex
 	entries map[string]cacheEntry
-	now     func() time.Time // для детерминизма тестов TTL
+	now     func() time.Time // for the determinism of the TTL tests
 }
 
-// NewCachingResolver оборачивает inner кэшем с TTL и пределом записей.
+// NewCachingResolver wraps inner with a TTL- and entry-limit cache.
 func NewCachingResolver(inner Resolver, opts CacheOptions) *CachingResolver {
 	if opts.TTL <= 0 {
 		opts.TTL = DefaultCacheTTL
@@ -107,9 +109,9 @@ func NewCachingResolver(inner Resolver, opts CacheOptions) *CachingResolver {
 	}
 }
 
-// LookupNetIP резолвит хост с кэшем: hit в пределах TTL — без обращения
-// к резолверу; истёкшая запись удаляется, miss идёт в inner и
-// успешно сохраняется.
+// LookupNetIP resolves the host with the cache: a hit within the TTL —
+// without touching the resolver; an expired entry is deleted, a miss goes
+// to inner and is stored on success.
 func (c *CachingResolver) LookupNetIP(ctx context.Context, host string) ([]netip.Addr, error) {
 	key := strings.ToLower(strings.TrimSpace(host))
 	now := c.now()
@@ -120,7 +122,7 @@ func (c *CachingResolver) LookupNetIP(ctx context.Context, host string) ([]netip
 			c.mu.Unlock()
 			return e.addrs, nil
 		}
-		delete(c.entries, key) // истекла
+		delete(c.entries, key) // expired
 	}
 	c.mu.Unlock()
 
@@ -132,12 +134,12 @@ func (c *CachingResolver) LookupNetIP(ctx context.Context, host string) ([]netip
 	return addrs, nil
 }
 
-// store сохраняет запись; при достижении предела сперва вычищаются
-// истёкшие, а если место не освободилось — выселяется произвольная
-// запись (порядок обхода map в Go случаен). Политике точного
-// выселения (LRU) здесь взяты простота и предсказуемая память: адреса
-// редирект-хостов дёшевы, вытеснение живой записи стоит одного
-// резолва, а не корректности (ТЗ 3.2 — память ограничена).
+// store saves an entry; when the limit is reached the expired entries are
+// purged first, and if that freed no room an arbitrary entry is evicted
+// (Go's map traversal order is random). For a precise eviction policy
+// (LRU) this traded simplicity and predictable memory: redirect-host
+// addresses are cheap, evicting a live entry costs one resolve, not
+// correctness (spec 3.2 — memory is bounded).
 func (c *CachingResolver) store(key string, addrs []netip.Addr, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

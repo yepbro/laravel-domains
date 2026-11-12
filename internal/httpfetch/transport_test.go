@@ -1,12 +1,13 @@
-// Тесты транспорта. Три уровня:
+// Transport tests. Three levels:
 //
-//   - шов dialFunc — гонка адресов (happy-eyeballs-подобная), фолбэк,
-//     connect-таймаут, без сети вообще;
-//   - httptest.Server на 127.0.0.1 (петля, не внешний стек) — базовый
-//     GET, подключение по IP с чужим Host/SNI (TLS), резолв-хук
-//     редиректов, таймауты слоёв (тарпиты на заголовках и теле),
-//     отмена ctx, отказ соединения;
-//   - сырой net.Listener для TLS-тарпита (рукопожатие без ответа).
+//   - the dialFunc seam — the address race (happy-eyeballs-like), the
+//     fallback, the connect timeout, with no network at all;
+//   - httptest.Server on 127.0.0.1 (the loopback, not the external
+//     stack) — a basic GET, connecting by IP with a foreign Host/SNI
+//     (TLS), the redirect resolve hook, the layer timeouts (tarpits on
+//     headers and body), a ctx cancellation, a connection refusal;
+//   - a raw net.Listener for the TLS tarpit (a handshake with no
+//     answer).
 
 package httpfetch
 
@@ -32,17 +33,17 @@ import (
 	"crawler/internal/config"
 )
 
-// --- вспомогательные --------------------------------------------------------
+// --- helpers -----------------------------------------------------------------
 
-// loopbackAddr — адрес предрезолвленного хоста в тестах: httptest и
-// сырые слушатели живут на петле.
+// loopbackAddr is the pre-resolved host address in tests: httptest and
+// raw listeners live on the loopback.
 func loopbackAddr() []netip.Addr {
 	return []netip.Addr{netip.MustParseAddr("127.0.0.1")}
 }
 
-// hostURL заменяет хост в базовом URL тестового сервера на имя,
-// которого нет ни в одном резолвере: подключение обязано идти по
-// переданным адресам, а не по DNS. Порт сохраняется.
+// hostURL replaces the host in the test server's base URL with a name no
+// resolver knows: the connection must go by the passed addresses, not by
+// DNS. The port is preserved.
 func hostURL(base, host string) *url.URL {
 	u, err := url.Parse(base)
 	if err != nil {
@@ -56,8 +57,9 @@ func hostURL(base, host string) *url.URL {
 	return u
 }
 
-// newTestFetcher — транспорт с подменённым диалом (шов тестов) и
-// записью попыток (потокобезопасной: попытки стартуют горутинами).
+// newTestFetcher is a transport with a swapped dial (the tests' seam) and
+// a record of the attempts (thread-safe: attempts are started by
+// goroutines).
 func newTestFetcher(t *testing.T, opts Options, dial dialFunc) (*Fetcher, func() []netip.Addr) {
 	t.Helper()
 	f := NewFetcher(opts)
@@ -76,11 +78,11 @@ func newTestFetcher(t *testing.T, opts Options, dial dialFunc) (*Fetcher, func()
 	}
 }
 
-// --- шов диала: гонка адресов ------------------------------------------------
+// --- the dial seam: the address race -----------------------------------------
 
-// TestDialAddrsFallback: первый адрес молчит (SYN в пустоту), второй
-// жив — подключение проходит после паузы FallbackDelay, висящая
-// попытка отменяется.
+// TestDialAddrsFallback: the first address is silent (a SYN into the
+// void), the second is alive — the connection goes through after the
+// FallbackDelay pause, and the hanging attempt is canceled.
 func TestDialAddrsFallback(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -94,8 +96,8 @@ func TestDialAddrsFallback(t *testing.T) {
 		ConnectTimeout: 2 * time.Second,
 		FallbackDelay:  40 * time.Millisecond,
 	}, func(ctx context.Context, addr netip.Addr, port string) (net.Conn, error) {
-		if addr == netip.MustParseAddr("203.0.113.1") { // TEST-NET-3: чёрная дыра
-			<-ctx.Done() // молчим до отмены попытки
+		if addr == netip.MustParseAddr("203.0.113.1") { // TEST-NET-3: a black hole
+			<-ctx.Done() // stay silent until the attempt is canceled
 			once.Do(func() { close(released) })
 			return nil, ctx.Err()
 		}
@@ -118,7 +120,7 @@ func TestDialAddrsFallback(t *testing.T) {
 	if len(got) != 2 {
 		t.Errorf("попытки подключения: ожидалось 2 адреса, получено %v", got)
 	}
-	// Висящая попытка обязана отмениться возвратом победителя.
+	// The hanging attempt must be canceled by the winner's return.
 	select {
 	case <-released:
 	case <-time.After(2 * time.Second):
@@ -126,7 +128,8 @@ func TestDialAddrsFallback(t *testing.T) {
 	}
 }
 
-// TestDialAddrsFirstWins: успешный первый адрес — второй не стартует.
+// TestDialAddrsFirstWins: a successful first address — the second never
+// starts.
 func TestDialAddrsFirstWins(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -136,7 +139,7 @@ func TestDialAddrsFirstWins(t *testing.T) {
 
 	f, calls := newTestFetcher(t, Options{
 		ConnectTimeout: 2 * time.Second,
-		FallbackDelay:  250 * time.Millisecond, // успели бы запустить второй
+		FallbackDelay:  250 * time.Millisecond, // the second would have been launched
 	}, func(ctx context.Context, addr netip.Addr, port string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", ln.Addr().String())
@@ -153,13 +156,14 @@ func TestDialAddrsFirstWins(t *testing.T) {
 	}
 }
 
-// TestDialAddrsAllFailImmediate: падение всех запущенных попыток
-// стартует следующую без паузы — последовательный фолбэк без латентности.
+// TestDialAddrsAllFailImmediate: the failure of all launched attempts
+// starts the next one without a pause — a sequential fallback with no
+// latency.
 func TestDialAddrsAllFailImmediate(t *testing.T) {
 	boom := errors.New("сеть недоступна")
 	f, calls := newTestFetcher(t, Options{
 		ConnectTimeout: 2 * time.Second,
-		FallbackDelay:  500 * time.Millisecond, // пауза не должна сработать
+		FallbackDelay:  500 * time.Millisecond, // the pause must not fire
 	}, func(ctx context.Context, addr netip.Addr, port string) (net.Conn, error) {
 		return nil, boom
 	})
@@ -179,9 +183,9 @@ func TestDialAddrsAllFailImmediate(t *testing.T) {
 	}
 }
 
-// TestDialAddrsConnectTimeout: слой connect-таймаута — попытка,
-// не уложившаяся в ConnectTimeout, прерывается (детерминированно через
-// диал, уважающий ctx).
+// TestDialAddrsConnectTimeout: the connect-timeout layer — an attempt that
+// misses ConnectTimeout is interrupted (deterministically via a ctx-aware
+// dial).
 func TestDialAddrsConnectTimeout(t *testing.T) {
 	f, calls := newTestFetcher(t, Options{
 		ConnectTimeout: 80 * time.Millisecond,
@@ -213,11 +217,12 @@ func TestDialAddrsConnectTimeout(t *testing.T) {
 	}
 }
 
-// TestDialAddrsCancelAfterWinner: отмена ctx в момент победы попытки —
-// select может взять ветку отмены уже после того, как попытка положила
-// соединение в winner. Проигравший выход обязан закрыть это соединение
-// (вместе со слотами лимитов limitConn), а не утекать: слоты глобального
-// семафора GC не собирает, накопившись, они останавливают транспорт.
+// TestDialAddrsCancelAfterWinner: a ctx cancellation at the moment an
+// attempt wins — the select may take the cancellation branch after the
+// attempt has already put the connection into winner. The losing exit
+// must close that connection (together with the limitConn limit slots),
+// not leak: the global semaphore's slots are not collected by the GC and,
+// accumulating, they stall the transport.
 func TestDialAddrsCancelAfterWinner(t *testing.T) {
 	var mu sync.Mutex
 	created, closed := 0, 0
@@ -234,9 +239,9 @@ func TestDialAddrsCancelAfterWinner(t *testing.T) {
 	}
 	f, _ := newTestFetcher(t, Options{
 		ConnectTimeout: 2 * time.Second,
-		FallbackDelay:  time.Hour, // второй адрес не стартует — в гонке одна попытка
+		FallbackDelay:  time.Hour, // the second address never starts — one attempt in the race
 	}, func(ctx context.Context, addr netip.Addr, port string) (net.Conn, error) {
-		<-ctx.Done() // «победа» прибывает вместе с отменой — окно утечки
+		<-ctx.Done() // the "win" arrives together with the cancellation — the leak window
 		return newConn(), nil
 	})
 
@@ -254,15 +259,16 @@ func TestDialAddrsCancelAfterWinner(t *testing.T) {
 			cancelled++
 			continue
 		}
-		_ = conn.Close() // победитель отдан вызывающему — закрывает он
+		_ = conn.Close() // the winner was handed to the caller — they close it
 		cancel()
 	}
 	if cancelled == 0 {
 		t.Fatal("гонка не выполнилась: ни одного выхода по отмене")
 	}
-	// Закрытие проигравших/победителя отмены асинхронно: attempt-горутина
-	// последней итерации может закрывать соединение уже после возврата
-	// dialAddrs. ждём дренажа, а не фиксируем мгновенный срез.
+	// Closing the losers/the cancellation winner is asynchronous: the
+	// attempt goroutine of the last iteration may be closing the
+	// connection after dialAddrs has already returned. Wait for the drain
+	// instead of pinning an instant snapshot.
 	deadline := time.Now().Add(2 * time.Second)
 	mu.Lock()
 	for closed != created && time.Now().Before(deadline) {
@@ -277,7 +283,8 @@ func TestDialAddrsCancelAfterWinner(t *testing.T) {
 	}
 }
 
-// closeCountingConn — соединение с подсчётом Close (утечки по отмене).
+// closeCountingConn is a connection that counts Close calls (cancellation
+// leaks).
 type closeCountingConn struct {
 	net.Conn
 	onClose func()
@@ -288,7 +295,7 @@ func (c *closeCountingConn) Close() error {
 	return c.Conn.Close()
 }
 
-// TestDialAddrsEmptyAndSingle — границы списка адресов.
+// TestDialAddrsEmptyAndSingle — the boundaries of the address list.
 func TestDialAddrsEmptyAndSingle(t *testing.T) {
 	f := NewFetcher(Options{})
 	if _, err := f.dialAddrs(context.Background(), nil, "80"); err == nil {
@@ -308,7 +315,7 @@ func TestDialAddrsEmptyAndSingle(t *testing.T) {
 	_ = conn.Close()
 }
 
-// --- базовый GET -------------------------------------------------------------
+// --- a basic GET -------------------------------------------------------------
 
 func TestFetchBasic(t *testing.T) {
 	var gotHost, gotUA atomicString
@@ -350,7 +357,8 @@ func TestFetchBasic(t *testing.T) {
 	if res.Elapsed <= 0 || res.Elapsed > 2*time.Second {
 		t.Errorf("время ответа вне разумных границ: %s", res.Elapsed)
 	}
-	// Хост запроса — из URL, подключение — по адресу DNS-этапа.
+	// The request host comes from the URL, the connection — by the DNS
+	// stage address.
 	if host, _, _ := net.SplitHostPort(gotHost.Load()); host != "www.example-test.net" {
 		t.Errorf("Host-заголовок: %q, ожидался www.example-test.net", gotHost.Load())
 	}
@@ -359,8 +367,8 @@ func TestFetchBasic(t *testing.T) {
 	}
 }
 
-// TestFetchUsesProvidedAddrs: адреса DNS-этапа доходят до диала,
-// резолвер не вызывается вовсе.
+// TestFetchUsesProvidedAddrs: the DNS stage addresses reach the dial, the
+// resolver is never called.
 func TestFetchUsesProvidedAddrs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
@@ -388,7 +396,7 @@ func TestFetchUsesProvidedAddrs(t *testing.T) {
 	}
 }
 
-// --- Host/SNI поверх предрезолвленного IP (TLS) ------------------------------
+// --- Host/SNI over a pre-resolved IP (TLS) -----------------------------------
 
 func TestFetchHTTPS_HostAndSNIOverResolvedIP(t *testing.T) {
 	sniCh := make(chan string, 1)
@@ -403,15 +411,16 @@ func TestFetchHTTPS_HostAndSNIOverResolvedIP(t *testing.T) {
 			case sniCh <- hello.ServerName:
 			default:
 			}
-			return nil, nil // конфиг сервера не меняем
+			return nil, nil // the server's config is left unchanged
 		},
 	}
 	srv.StartTLS()
 	defer srv.Close()
 
 	f := NewFetcher(Options{
-		// Проверка сертификата не предмет теста: SNI до него не доходит,
-		// а InsecureSkipVerify не отключает отправку имени (T-050).
+		// The certificate check is not the test's subject: SNI never gets
+		// that far, and InsecureSkipVerify does not disable sending the
+		// name (T-050).
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	})
 	u := hostURL(srv.URL, "sni-probe.example.net")
@@ -441,12 +450,12 @@ func TestFetchHTTPS_HostAndSNIOverResolvedIP(t *testing.T) {
 	}
 }
 
-// --- резолв-хук редирект-хостов ----------------------------------------------
+// --- the redirect-host resolve hook ------------------------------------------
 
-// TestRoundTripResolvesHostsWithoutStageAddrs: запрос без адресов
-// DNS-этапа в ctx (редирект на другой хост — T-048, или http.Client
-// поверх транспорта) подключается через Resolver; кэш сворачивает
-// повторные запросы к одному хосту в один резолв.
+// TestRoundTripResolvesHostsWithoutStageAddrs: a request without DNS
+// stage addresses in the ctx (a redirect to another host — T-048, or an
+// http.Client over the transport) connects via the Resolver; the cache
+// folds repeated requests to one host into a single resolve.
 func TestRoundTripResolvesHostsWithoutStageAddrs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
@@ -499,8 +508,8 @@ func TestRoundTripResolvesHostsWithoutStageAddrs(t *testing.T) {
 	}
 }
 
-// TestDialContextRedirectIPLiteral: Location с IP-литералом не трогает
-// резолвер.
+// TestDialContextRedirectIPLiteral: a Location with an IP literal never
+// touches the resolver.
 func TestDialContextRedirectIPLiteral(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
@@ -527,17 +536,19 @@ func TestDialContextRedirectIPLiteral(t *testing.T) {
 	}
 }
 
-// --- SSRF-контур (T-219) -------------------------------------------------------
+// --- the SSRF circuit (T-219) ---------------------------------------------------
 
-// ssrfDialSeam — шов диала для SSRF-тестов: подключение к любому адресу
-// ведёт к локальному тестовому серверу (порт попытки сохраняется), а
-// адреса попыток записываются — тесты утверждают, что внутренние адреса
-// до диала не дошли (воронка filterInternalAddrs сидит раньше шва).
-// Воронка срабатывает до диала, поэтому шов не мешает блокировке, но
-// делает «прошло бы без фильтра» наблюдаемым успехом запроса (без шова
-// литерал вида ::ffff:169.254.169.254 просто не дозвонился бы — тест не
-// отличил бы блок от таймаута). Запись потокобезопасна: попытки dialAddrs
-// стартуют горутинами (стиль newTestFetcher).
+// ssrfDialSeam is the dial seam for the SSRF tests: connecting to any
+// address leads to the local test server (the attempt's port is
+// preserved), and the attempt addresses are recorded — the tests assert
+// that internal addresses never reached the dial (the filterInternalAddrs
+// funnel sits before the seam). The funnel fires before the dial, so the
+// seam does not interfere with blocking but makes "it would pass without
+// the filter" an observable request success (without the seam a literal
+// like ::ffff:169.254.169.254 would simply fail to connect — the test
+// could not tell a block from a timeout). The recording is thread-safe:
+// dialAddrs attempts are started by goroutines (the newTestFetcher
+// style).
 func ssrfDialSeam() (dialFunc, func() []netip.Addr) {
 	var mu sync.Mutex
 	calls := []netip.Addr{}
@@ -554,11 +565,11 @@ func ssrfDialSeam() (dialFunc, func() []netip.Addr) {
 		}
 }
 
-// TestAddrIsInternal — предикат единой воронки (T-219): внутренние
-// диапазоны, включая IPv4-в-IPv6 (замер: ::ffff:0.0.0.0 ловит только
-// Unmap — IsUnspecified 4-in-6 не разворачивает; остальные предикаты
-// разворачивают сами, Unmap даёт одну семантику любому литералу);
-// внешние адреса и документационные сети — нет.
+// TestAddrIsInternal is the predicate of the single funnel (T-219): the
+// internal ranges, including IPv4-in-IPv6 (a measurement: only Unmap
+// catches ::ffff:0.0.0.0 — IsUnspecified does not unwrap 4-in-6; the other
+// predicates unwrap themselves, Unmap gives one semantics to any literal);
+// external addresses and documentation networks are not.
 func TestAddrIsInternal(t *testing.T) {
 	internal := []string{
 		"127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1",
@@ -583,17 +594,17 @@ func TestAddrIsInternal(t *testing.T) {
 	}
 }
 
-// TestLookupBlocksInternalAddrs: Options.BlockInternalAddrs отбраковывает
-// в воронке lookup внутренние адреса — литералы из Location (SSRF:
-// loopback, RFC1918, cloud metadata, включая IPv4-в-IPv6 — Unmap в
-// AddrIsInternal) и адреса резолва; внешний адрес смешанного ответа
-// остаётся.
+// TestLookupBlocksInternalAddrs: Options.BlockInternalAddrs rejects
+// internal addresses in the lookup funnel — literals from Location (SSRF:
+// loopback, RFC1918, cloud metadata, including IPv4-in-IPv6 — Unmap in
+// AddrIsInternal) and resolve addresses; the external address of a mixed
+// answer stays.
 func TestLookupBlocksInternalAddrs(t *testing.T) {
 	f := NewFetcher(Options{
 		BlockInternalAddrs: true,
 		Resolver: ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
 			return []netip.Addr{
-				netip.MustParseAddr("192.0.2.10"),      // TEST-NET-1 — не внутренний
+				netip.MustParseAddr("192.0.2.10"),      // TEST-NET-1 — not internal
 				netip.MustParseAddr("10.0.0.5"),        // RFC1918
 				netip.MustParseAddr("169.254.169.254"), // cloud metadata
 			}, nil
@@ -610,9 +621,9 @@ func TestLookupBlocksInternalAddrs(t *testing.T) {
 
 	for _, host := range []string{
 		"127.0.0.1", "10.0.0.5", "169.254.169.254", "::1", "fd00::1", "192.168.1.1",
-		// IPv4-в-IPv6: часть предикатов netip 4-in-6 не разворачивает
-		// (IsUnspecified — ::ffff:0.0.0.0); единая семантика — Unmap
-		// в AddrIsInternal (T-219).
+		// IPv4-in-IPv6: some netip predicates do not unwrap 4-in-6
+		// (IsUnspecified — ::ffff:0.0.0.0); a single semantics — Unmap in
+		// AddrIsInternal (T-219).
 		"::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.5", "::ffff:0.0.0.0",
 	} {
 		if _, err := f.lookup(context.Background(), host); err == nil {
@@ -629,7 +640,7 @@ func TestLookupBlocksInternalAddrs(t *testing.T) {
 		t.Error("ответ только с внутренними адресами не заблокирован")
 	}
 
-	// Флаг выключен — прежнее поведение: адреса проходят как есть.
+	// The flag off — the previous behavior: the addresses pass as is.
 	f3 := NewFetcher(Options{
 		Resolver: ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
 			return []netip.Addr{netip.MustParseAddr("10.0.0.5")}, nil
@@ -640,12 +651,12 @@ func TestLookupBlocksInternalAddrs(t *testing.T) {
 	}
 }
 
-// TestFetchBlocksInternalDNSAddrs: с включённым контуром адреса DNS-этапа
-// (FetchRequest.Addrs) проходят ту же воронку, что и редиректы, —
-// стартовый запрос к A-записи из внутренней сети (SSRF: подложный DNS
-// или локальный резолвер) не выполняется. До T-219 красный: Fetch
-// подключался по внутренним адресам без проверки (диал шёл в локальный
-// сервер — успех вместо отказа).
+// TestFetchBlocksInternalDNSAddrs: with the circuit enabled, the DNS stage
+// addresses (FetchRequest.Addrs) pass the same funnel as redirects — a
+// starting request to an A record from an internal network (SSRF: a
+// planted DNS or a local resolver) never happens. Before T-219 this was
+// red: the Fetch connected by internal addresses without checking (the
+// dial went to the local server — success instead of a refusal).
 func TestFetchBlocksInternalDNSAddrs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
@@ -662,14 +673,14 @@ func TestFetchBlocksInternalDNSAddrs(t *testing.T) {
 			t.Errorf("%s: ожидалась блокировка внутренних адресов DNS-этапа, получено: %v", addr, err)
 		}
 	}
-	// Смешанный список оставляет внешние — семантика воронки; внутренний
-	// адрес до диала не доходит вовсе (пин против регрессии «фильтровать
-	// только когда все внутренние»).
+	// A mixed list leaves the external ones — the funnel's semantics; the
+	// internal address never reaches the dial at all (a pin against the
+	// "filter only when all are internal" regression).
 	res, err := f.Fetch(context.Background(), FetchRequest{
 		URL: redirectReqURL(srv.URL, "ssrf.example.net", "/start"),
 		Addrs: []netip.Addr{
-			netip.MustParseAddr("10.0.0.5"),     // внутренний — отброшен
-			netip.MustParseAddr("203.0.113.10"), // TEST-NET-3 — внешний
+			netip.MustParseAddr("10.0.0.5"),     // internal — rejected
+			netip.MustParseAddr("203.0.113.10"), // TEST-NET-3 — external
 		},
 	})
 	if err != nil {
@@ -681,7 +692,7 @@ func TestFetchBlocksInternalDNSAddrs(t *testing.T) {
 		t.Errorf("до диала дошли адреса %v, хочу только 203.0.113.10", attempts)
 	}
 
-	// Флаг выключен — адреса DNS-этапа проходят как есть (dev/testbed).
+	// The flag off — the DNS stage addresses pass as is (dev/testbed).
 	f2 := NewFetcher(Options{Resolver: redirectResolverFail})
 	f2.dial, _ = ssrfDialSeam()
 	res2, err := f2.Fetch(context.Background(), FetchRequest{
@@ -692,11 +703,12 @@ func TestFetchBlocksInternalDNSAddrs(t *testing.T) {
 	_ = res2.Body.Close()
 }
 
-// TestFetchChainBlocksInternalRedirect: Location на внутренний адрес —
-// переход не выполняется (ошибка воронки, цепочка — выполненная часть).
-// Стартовый хост — внешний адрес (шов диала ведёт к локальному
-// серверу): с T-219 фильтруется и стартовый диал, петля в
-// FetchRequest.Addrs блокировала бы запрос до ответа 302.
+// TestFetchChainBlocksInternalRedirect: a Location to an internal address
+// — no hop happens (a funnel error, the chain holds the completed part).
+// The starting host is an external address (the dial seam leads to the
+// local server): since T-219 the starting dial is filtered too — the
+// loopback in FetchRequest.Addrs would have blocked the request before
+// the 302 response.
 func TestFetchChainBlocksInternalRedirect(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "http://169.254.169.254/latest/meta-data/")
@@ -717,12 +729,13 @@ func TestFetchChainBlocksInternalRedirect(t *testing.T) {
 	}
 }
 
-// TestFetchChainBlocksInternalRedirect4in6: Location с IPv4-в-IPv6
-// литералом внутреннего диапазона — тот же отказ. ::ffff:0.0.0.0 —
-// единственная форма, ловимая именно Unmap (замер T-219: предикаты
-// IsLoopback/IsPrivate/IsLinkLocalUnicast 4-in-6 разворачивают сами,
-// IsUnspecified — нет): без Unmap шов диала довёл бы запрос до
-// успеха. ::ffff:169.254.169.254 — пин cloud-metadata формы.
+// TestFetchChainBlocksInternalRedirect4in6: a Location with an IPv4-in-
+// IPv6 literal of an internal range — the same refusal. ::ffff:0.0.0.0 is
+// the only form caught by Unmap specifically (the T-219 measurement: the
+// IsLoopback/IsPrivate/IsLinkLocalUnicast predicates unwrap 4-in-6
+// themselves, IsUnspecified does not): without Unmap the dial seam would
+// have carried the request to success. ::ffff:169.254.169.254 pins the
+// cloud-metadata form.
 func TestFetchChainBlocksInternalRedirect4in6(t *testing.T) {
 	for _, location := range []string{
 		"http://[::ffff:169.254.169.254]/latest/meta-data/",
@@ -751,11 +764,11 @@ func TestFetchChainBlocksInternalRedirect4in6(t *testing.T) {
 	}
 }
 
-// --- таймауты слоёв ------------------------------------------------------------
+// --- the layer timeouts ----------------------------------------------------------
 
-// stallServer — «тарпит»: обработчик отвечает только после закрытия
-// канала stall (или страховочного таймаута) — тест не ждёт спящего
-// обработчика при закрытии сервера.
+// stallServer is a "tarpit": the handler answers only after the stall
+// channel is closed (or the guard timeout fires) — the test does not wait
+// for a sleeping handler when closing the server.
 func stallServer(t *testing.T, handler func(w http.ResponseWriter, stall <-chan struct{})) (*httptest.Server, func()) {
 	t.Helper()
 	stall := make(chan struct{})
@@ -764,7 +777,7 @@ func stallServer(t *testing.T, handler func(w http.ResponseWriter, stall <-chan 
 	}))
 	return srv, func() {
 		select {
-		case <-stall: // уже закрыт вторым вызовом — не страшно
+		case <-stall: // already closed by a second call — no harm
 		default:
 			close(stall)
 		}
@@ -772,8 +785,9 @@ func stallServer(t *testing.T, handler func(w http.ResponseWriter, stall <-chan 
 	}
 }
 
-// TestFetchHeaderTimeout: сервер молчит до заголовков — срабатывает
-// ожидание заголовков (10 с из ТЗ; здесь укорочено), не общий таймаут.
+// TestFetchHeaderTimeout: the server stays silent until the headers — the
+// header wait fires (10 s per the spec; shortened here), not the total
+// timeout.
 func TestFetchHeaderTimeout(t *testing.T) {
 	srv, done := stallServer(t, func(w http.ResponseWriter, stall <-chan struct{}) {
 		select {
@@ -799,8 +813,8 @@ func TestFetchHeaderTimeout(t *testing.T) {
 	}
 }
 
-// TestFetchTotalTimeoutBodyTarpit: заголовки пришли, тело капает
-// медленнее общего таймаута — чтение тела прерывается.
+// TestFetchTotalTimeoutBodyTarpit: the headers arrived, the body trickles
+// slower than the total timeout — reading the body is interrupted.
 func TestFetchTotalTimeoutBodyTarpit(t *testing.T) {
 	srv, done := stallServer(t, func(w http.ResponseWriter, stall <-chan struct{}) {
 		w.Header().Set("Content-Length", "1000000")
@@ -833,8 +847,8 @@ func TestFetchTotalTimeoutBodyTarpit(t *testing.T) {
 	}
 }
 
-// TestFetchTLSHandshakeTimeout: TCP установлен, сервер не отвечает на
-// ClientHello — срабатывает таймаут рукопожатия TLS.
+// TestFetchTLSHandshakeTimeout: the TCP connection is up, the server does
+// not answer the ClientHello — the TLS handshake timeout fires.
 func TestFetchTLSHandshakeTimeout(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -847,7 +861,7 @@ func TestFetchTLSHandshakeTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conns <- c // приняли и молчим
+			conns <- c // accepted and staying silent
 		}
 	}()
 	defer func() {
@@ -883,7 +897,7 @@ func TestFetchTLSHandshakeTimeout(t *testing.T) {
 	}
 }
 
-// --- отмена и отказ соединения ---------------------------------------------------
+// --- cancellation and connection refusal -----------------------------------------
 
 func TestFetchContextCancel(t *testing.T) {
 	srv, done := stallServer(t, func(w http.ResponseWriter, stall <-chan struct{}) {
@@ -895,8 +909,8 @@ func TestFetchContextCancel(t *testing.T) {
 	})
 	defer done()
 
-	// Слои ниже отмены не срабатывают: заголовки 10 с, общий 20 с —
-	// прервать запрос должен именно ctx вызывающего.
+	// The layers below the cancellation do not fire: headers 10 s, total
+	// 20 s — it is the caller's ctx that must interrupt the request.
 	f := NewFetcher(Options{HeaderTimeout: 10 * time.Second, TotalTimeout: 20 * time.Second})
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(120*time.Millisecond, cancel)
@@ -915,8 +929,8 @@ func TestFetchContextCancel(t *testing.T) {
 }
 
 func TestFetchConnectionRefused(t *testing.T) {
-	// Порт, на котором никто не слушает: слушатель закрывается сразу,
-	// порт остаётся в адресе запроса.
+	// A port nobody listens on: the listener is closed at once, the port
+	// stays in the request address.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("слушатель: %v", err)
@@ -945,7 +959,7 @@ func TestFetchConnectionRefused(t *testing.T) {
 	}
 }
 
-// --- валидация запроса и опции из конфигурации ---------------------------------
+// --- request validation and the options from the configuration -----------------
 
 func TestFetchValidation(t *testing.T) {
 	f := NewFetcher(Options{})
@@ -985,7 +999,7 @@ func TestOptionsFromConfig(t *testing.T) {
 		t.Errorf("лимит тела и UA из конфигурации: %+v", o)
 	}
 
-	// Нулевые Options — дефолты таблицы лимитов ТЗ 5.5.
+	// Zero Options — the defaults of the spec 5.5 limits table.
 	d := Options{}.withDefaults()
 	if d.ConnectTimeout != DefaultConnectTimeout || d.TLSHandshakeTimeout != DefaultTLSHandshakeTimeout ||
 		d.HeaderTimeout != DefaultHeaderTimeout || d.TotalTimeout != DefaultTotalTimeout ||
@@ -994,7 +1008,7 @@ func TestOptionsFromConfig(t *testing.T) {
 	}
 }
 
-// TestIsTimeout — распознавание таймаутов по категориям ошибок.
+// TestIsTimeout — recognizing timeouts by error categories.
 func TestIsTimeout(t *testing.T) {
 	if !IsTimeout(context.DeadlineExceeded) {
 		t.Error("DeadlineExceeded — таймаут")
@@ -1013,7 +1027,7 @@ func TestIsTimeout(t *testing.T) {
 	}
 }
 
-// dialRefusedErr — ошибка connect-фазы реального диала: RST на SYN.
+// dialRefusedErr is a connect-phase error of a real dial: an RST on SYN.
 func dialRefusedErr() error {
 	return &net.OpError{
 		Op: "dial", Net: "tcp",
@@ -1022,7 +1036,8 @@ func dialRefusedErr() error {
 	}
 }
 
-// dialTimeoutErr — connect-таймаут реального диала: дедлайн попытки.
+// dialTimeoutErr is a connect timeout of a real dial: the attempt's
+// deadline.
 func dialTimeoutErr() error {
 	return &net.OpError{
 		Op: "dial", Net: "tcp",
@@ -1031,9 +1046,9 @@ func dialTimeoutErr() error {
 	}
 }
 
-// TestIsConnectFailure — распознавание отказов connect-фазы (dead-host
-// cutoff, T-164): только dial-OpError с ECONNREFUSED или таймаутом;
-// прочие слои и обёртки цепочки — нет.
+// TestIsConnectFailure — recognizing connect-phase failures (the dead-host
+// cutoff, T-164): only a dial OpError with ECONNREFUSED or a timeout; the
+// other layers and chain wrappers are not.
 func TestIsConnectFailure(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1070,7 +1085,7 @@ func TestIsConnectFailure(t *testing.T) {
 	}
 }
 
-// atomicString — строка, записываемая горутиной обработчика.
+// atomicString is a string written by the handler goroutine.
 type atomicString struct {
 	mu sync.Mutex
 	s  string

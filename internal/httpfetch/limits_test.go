@@ -1,16 +1,18 @@
-// Тесты лимитов T-049. Уровни:
+// T-049 limits tests. Levels:
 //
-//   - чистые единичные: математика дедлайна анти-тарпита, токен-ведро
-//     (темп), семафоры per-IP и глобальный (очередь, отмена, очистка
-//     карты), опции из конфигурации и дефолты; override-лимиты per-IP
-//     по префиксам и наблюдение ожидания слота (T-165);
-//   - httptest-серверы на петле: потолок тела (ровно в лимит / сверх —
-//     truncated, в т.ч. chunked), тарпит тела (нарушение скорости после
-//     первого байта), темп без ложных срабатываний, лимит соединений
-//     на один IP (третий запрос ждёт очереди), отмена в очереди,
-//     темп RoundTrip, keep-alive (соединение не переиспользуется);
-//   - переиспользуются помощники transport_test.go: loopbackAddr,
-//     hostURL, stallServer.
+//   - clean unit tests: the anti-tarpit deadline math, the token bucket
+//     (rate), the per-IP and global semaphores (queue, cancellation, map
+//     cleanup), the options from the configuration and the defaults; the
+//     per-IP override limits by prefixes and the slot-wait observation
+//     (T-165);
+//   - httptest servers on the loopback: the body cap (exactly at the
+//     limit / over — truncated, including chunked), the body tarpit (a
+//     speed violation after the first byte), the rate without false
+//     triggers, the connection limit per IP (the third request waits in
+//     the queue), cancellation in the queue, the RoundTrip rate,
+//     keep-alive (the connection is not reused);
+//   - the helpers of transport_test.go are reused: loopbackAddr, hostURL,
+//     stallServer.
 
 package httpfetch
 
@@ -32,10 +34,11 @@ import (
 	"crawler/internal/config"
 )
 
-// --- опции и математика ------------------------------------------------------
+// --- options and math --------------------------------------------------------
 
-// TestLimitOptionsFromConfigAndDefaults: перенос полей секции http,
-// дефолты таблицы лимитов ТЗ 5.5, включение лимитов в NewOptions.
+// TestLimitOptionsFromConfigAndDefaults: carrying over the fields of the
+// http section, the spec 5.5 limits table defaults, enabling limits in
+// NewOptions.
 func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 	cfg := config.HTTP{
 		Concurrency:    777,
@@ -53,9 +56,9 @@ func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 		lo.GlobalConns != 777 || lo.MaxRPS != 500 {
 		t.Errorf("перенос из секции http: %+v", lo)
 	}
-	// Карта префиксов (T-165) разбирается в override-лимиты
-	// (нормализация маскированием); мусор в ручной сборке отключает
-	// список целиком (валидный путь отсекает мусор раньше).
+	// The prefix map (T-165) is parsed into override limits (masking
+	// normalization); junk in manual assembly disables the whole list (the
+	// valid path cuts junk off earlier).
 	if len(lo.PerIPOverrides) != 1 {
 		t.Fatalf("override-лимиты: %v, want один префикс", lo.PerIPOverrides)
 	}
@@ -67,7 +70,8 @@ func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 		t.Errorf("мусорная карта: %v, want nil (отключение целиком)", bad.PerIPOverrides)
 	}
 
-	// NewOptions включает лимиты всегда (бойовый транспорт — с лимитами).
+	// NewOptions always enables limits (the production transport comes
+	// with limits).
 	o := NewOptions(cfg)
 	if o.Limits == nil {
 		t.Fatal("NewOptions: лимиты не включены")
@@ -76,7 +80,8 @@ func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 		t.Errorf("лимиты NewOptions: %+v", o.Limits)
 	}
 
-	// Дефолты: таблица лимитов ТЗ 5.5 + выведенные (RPS, окно скорости).
+	// Defaults: the spec 5.5 limits table + the derived ones (RPS, the
+	// speed window).
 	d := LimitOptions{}.withDefaults()
 	if d.MaxBodyBytes != DefaultLimitBodyBytes || d.MinBodySpeed != DefaultLimitBodySpeed ||
 		d.MinSpeedWindow != DefaultLimitSpeedWindow || d.PerIPConns != DefaultLimitPerIPConns ||
@@ -88,8 +93,9 @@ func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 	}
 }
 
-// TestBodyLimiterDeadline: дедлайн дочитания остатка — now+remain/speed,
-// но не короче окна-пола; выключенная скорость — без дедлайна.
+// TestBodyLimiterDeadline: the deadline for finishing the remainder is
+// now+remain/speed but never shorter than the window floor; speed off —
+// no deadline.
 func TestBodyLimiterDeadline(t *testing.T) {
 	b := &BodyLimiter{speed: 2048, window: 500 * time.Millisecond}
 	if d := b.deadlineLocked(4096); d != 2*time.Second {
@@ -102,14 +108,14 @@ func TestBodyLimiterDeadline(t *testing.T) {
 	if d := b.deadlineLocked(4096); d != 0 {
 		t.Errorf("выключенный анти-тарпит не должен давать дедлайн: %s", d)
 	}
-	// Большой остаток при скорости 1 байт/с не переполняет time.Duration.
+	// A large remainder at 1 byte/s does not overflow time.Duration.
 	b.speed = 1
 	if d := b.deadlineLocked(2 << 20); d <= 0 {
 		t.Errorf("большой остаток: неожиданный дедлайн %s", d)
 	}
 }
 
-// TestBodyLimiterClosedRead: чтение после Close — ошибка.
+// TestBodyLimiterClosedRead: reading after Close is an error.
 func TestBodyLimiterClosedRead(t *testing.T) {
 	b := newBodyLimiter(io.NopCloser(strings.NewReader("abc")), func() {},
 		LimitOptions{MaxBodyBytes: 10, MinBodySpeed: 1, MinSpeedWindow: time.Hour})
@@ -121,8 +127,8 @@ func TestBodyLimiterClosedRead(t *testing.T) {
 	}
 }
 
-// readCountingRC — источник с подсчётом Read (нулевые буферы и повторные
-// чтения не должны трогать источник).
+// readCountingRC is a source that counts Read calls (zero-length buffers
+// and repeated reads must not touch the source).
 type readCountingRC struct {
 	io.Reader
 	reads *int
@@ -135,16 +141,16 @@ func (r *readCountingRC) Read(p []byte) (int, error) {
 
 func (r *readCountingRC) Close() error { return nil }
 
-// TestBodyLimiterZeroBufAndRepeatRead: буфер длины 0 не читает источник
-// (контракт io.Reader); после классификации хвоста за потолком
-// повторные чтения возвращают запомненный итог (io.EOF или ошибку),
-// не перечитывая пробный байт.
+// TestBodyLimiterZeroBufAndRepeatRead: a zero-length buffer does not read
+// the source (the io.Reader contract); after the tail beyond the cap has
+// been classified, repeated reads return the remembered verdict (io.EOF or
+// an error) without re-reading the probe byte.
 func TestBodyLimiterZeroBufAndRepeatRead(t *testing.T) {
 	run := func(t *testing.T, size, limit int, wantTrunc bool) {
 		t.Helper()
 		var reads int
 		bl := newBodyLimiter(&readCountingRC{Reader: bytes.NewReader(bytes.Repeat([]byte("a"), size)), reads: &reads},
-			func() {}, LimitOptions{MaxBodyBytes: int64(limit)}) // speed 0 — сторож выключен
+			func() {}, LimitOptions{MaxBodyBytes: int64(limit)}) // speed 0 — the watchdog is off
 
 		if n, err := bl.Read(nil); n != 0 || err != nil {
 			t.Errorf("Read(nil) = (%d, %v), ожидалось (0, nil)", n, err)
@@ -186,12 +192,12 @@ func TestBodyLimiterZeroBufAndRepeatRead(t *testing.T) {
 	t.Run("ровно в лимит", func(t *testing.T) { run(t, 5, 5, false) })
 }
 
-// --- токен-ведро темпа -------------------------------------------------------
+// --- the rate token bucket ---------------------------------------------------
 
-// TestLimitBucketPacing: всплеск до burst уходит сразу, дальнейшие
-// токены — темпом rate; ожидание прерывается отменой ctx.
+// TestLimitBucketPacing: a burst up to burst goes out at once, further
+// tokens at the rate pace; the wait is interrupted by a ctx cancellation.
 func TestLimitBucketPacing(t *testing.T) {
-	b := newLimitBucket(25, 2) // 25 токенов/с, всплеск 2
+	b := newLimitBucket(25, 2) // 25 tokens/s, burst 2
 	start := time.Now()
 	for i := 0; i < 5; i++ {
 		if err := b.take(context.Background()); err != nil {
@@ -199,7 +205,7 @@ func TestLimitBucketPacing(t *testing.T) {
 		}
 	}
 	elapsed := time.Since(start)
-	// 2 мгновенно + 3 по 40 мс ≈ 120 мс; нижняя граница с допуском.
+	// 2 instantly + 3 × 40 ms ≈ 120 ms; the lower bound with a margin.
 	if elapsed < 100*time.Millisecond {
 		t.Errorf("темп ведра не выдержан: 5 токенов за %s (ожидалось ≥100ms)", elapsed)
 	}
@@ -207,7 +213,7 @@ func TestLimitBucketPacing(t *testing.T) {
 		t.Errorf("темп ведра затянут: %s", elapsed)
 	}
 
-	// Пустое ведро: ожидание прерывается отменой ctx.
+	// An empty bucket: the wait is interrupted by a ctx cancellation.
 	slow := newLimitBucket(0.001, 1)
 	if err := slow.take(context.Background()); err != nil {
 		t.Fatalf("burst-токен: %v", err)
@@ -219,11 +225,11 @@ func TestLimitBucketPacing(t *testing.T) {
 	}
 }
 
-// --- семафоры соединений -----------------------------------------------------
+// --- connection semaphores ---------------------------------------------------
 
-// TestLimitIPMapQueueAndCancel: потолок на один IP, очередь пробуждается
-// освобождением, отменённый ждущий не занимает слот, опустевшая запись
-// удаляется из карты.
+// TestLimitIPMapQueueAndCancel: the per-IP cap, the queue is woken by a
+// release, a cancelled waiter takes no slot, an emptied entry is removed
+// from the map.
 func TestLimitIPMapQueueAndCancel(t *testing.T) {
 	m := limitIPMap{limit: 2, entries: make(map[netip.Addr]*limitIPEntry)}
 	ip := netip.MustParseAddr("192.0.2.1")
@@ -238,7 +244,7 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 		t.Fatalf("слот 2: %v", err)
 	}
 
-	// Третий — в очереди (не возвращается, пока слоты заняты).
+	// The third one queues (does not return while the slots are taken).
 	queued := make(chan error, 1)
 	var release3 func()
 	go func() {
@@ -254,7 +260,7 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Освобождение будит ждущего.
+	// A release wakes the waiter.
 	r1()
 	select {
 	case err := <-queued:
@@ -265,14 +271,14 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 		t.Fatal("очередь не пробудилась освобождением слота")
 	}
 
-	// Отмена ждущего — ошибка, слот не занимается.
+	// A cancelled waiter gets an error and takes no slot.
 	cctx, cancel := context.WithCancel(ctx)
 	cancelled := make(chan error, 1)
 	go func() {
 		_, err := m.acquire(cctx, ip)
 		cancelled <- err
 	}()
-	// Слоты снова полны (r2 +release3): ждущий блокируется.
+	// The slots are full again (r2 + release3): the waiter blocks.
 	time.Sleep(50 * time.Millisecond)
 	cancel()
 	select {
@@ -284,7 +290,7 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 		t.Fatal("отмена не разбудила ждущего")
 	}
 
-	// Опустевшая карта чистится: записей по IP нет.
+	// The emptied map is cleaned: no per-IP entries.
 	r2()
 	release3()
 	m.mu.Lock()
@@ -295,9 +301,8 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 	}
 }
 
-// TestLimitStateAcquireDial: порядок per-IP → глобальный; глобальный
-// потолок ставит в очередь; отмена в очереди — ошибка; освобождение
-// будит.
+// TestLimitStateAcquireDial: the per-IP → global order; the global cap
+// queues; a cancellation in the queue is an error; a release wakes.
 func TestLimitStateAcquireDial(t *testing.T) {
 	st := newLimitState(LimitOptions{
 		PerIPConns: 4, GlobalConns: 2, MaxRPS: 1000, Burst: 10,
@@ -317,7 +322,7 @@ func TestLimitStateAcquireDial(t *testing.T) {
 		t.Fatalf("соединение 2: %v", err)
 	}
 
-	// Глобальный потолок исчерпан (per-IP — нет): третий в очереди.
+	// The global cap is exhausted (per-IP is not): the third one queues.
 	queued := make(chan struct{ rel func() }, 1)
 	go func() {
 		rel, err := st.acquireDial(ctx, ip3)
@@ -334,7 +339,7 @@ func TestLimitStateAcquireDial(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Отмена ждущего — ошибка, слоты не занимаются.
+	// A cancelled waiter gets an error and takes no slots.
 	cctx, cancel := context.WithCancel(ctx)
 	cancelled := make(chan error, 1)
 	go func() {
@@ -351,7 +356,7 @@ func TestLimitStateAcquireDial(t *testing.T) {
 		t.Fatal("отмена не разбудила ждущего соединения")
 	}
 
-	// Освобождение глобального слота будит очередь.
+	// Releasing a global slot wakes the queue.
 	r1()
 	select {
 	case got := <-queued:
@@ -362,11 +367,12 @@ func TestLimitStateAcquireDial(t *testing.T) {
 	r2()
 }
 
-// --- override-лимиты per-IP и наблюдение ожидания (T-165) ---------------------
+// --- per-IP override limits and wait observation (T-165) ---------------------
 
-// TestParsePerIPOverrides: разбор карты «CIDR → лимит» — нормализация
-// маскированием («195.208.9.9/16» — сеть 195.208.0.0/16), IPv4 и IPv6;
-// ошибки: мусорный CIDR, лимит < 1, дубль сети после маскирования.
+// TestParsePerIPOverrides: parsing the "CIDR → limit" map — masking
+// normalization ("195.208.9.9/16" is the network 195.208.0.0/16), IPv4 and
+// IPv6; errors: a junk CIDR, a limit < 1, a duplicate network after
+// masking.
 func TestParsePerIPOverrides(t *testing.T) {
 	overrides, err := parsePerIPOverrides(map[string]int{
 		"195.208.9.9/16": 12,
@@ -400,9 +406,10 @@ func TestParsePerIPOverrides(t *testing.T) {
 	}
 }
 
-// TestLimitIPMapLimitFor: эффективный лимит IP — самый длинный совпавший
-// префикс (longest-prefix, независимо от порядка карты), вне префиксов —
-// общий; IPv4-в-IPv6 размапливается, семейства не пересекаются.
+// TestLimitIPMapLimitFor: the effective IP limit is the longest matching
+// prefix (longest-prefix, regardless of the map order); outside the
+// prefixes — the common one; IPv4-in-IPv6 is unmapped, the families do not
+// overlap.
 func TestLimitIPMapLimitFor(t *testing.T) {
 	overrides, err := parsePerIPOverrides(map[string]int{
 		"195.208.0.0/16": 5,
@@ -421,12 +428,12 @@ func TestLimitIPMapLimitFor(t *testing.T) {
 		ip   string
 		want int
 	}{
-		{"195.208.7.1", 3},        // /24 длиннее /16
+		{"195.208.7.1", 3},        // /24 is longer than /16
 		{"195.208.9.9", 5},        // /16
-		{"195.209.0.1", 2},        // вне префиксов — общий
-		{"2a02:6b8::1", 4},        // IPv6-префикс
-		{"2001:db8::1", 2},        // IPv6 вне
-		{"::ffff:195.208.7.1", 3}, // IPv4-в-IPv6 — Unmap, семантически IPv4
+		{"195.209.0.1", 2},        // outside the prefixes — the common limit
+		{"2a02:6b8::1", 4},        // an IPv6 prefix
+		{"2001:db8::1", 2},        // outside the IPv6 prefixes
+		{"::ffff:195.208.7.1", 3}, // IPv4-in-IPv6 — Unmap, semantically IPv4
 	} {
 		if got := st.ips.limitFor(netip.MustParseAddr(tc.ip)); got != tc.want {
 			t.Errorf("limitFor(%s) = %d, want %d", tc.ip, got, tc.want)
@@ -434,8 +441,9 @@ func TestLimitIPMapLimitFor(t *testing.T) {
 	}
 }
 
-// TestLimitIPMapOverrideCapacity: семафор IP внутри префикса держит лимит
-// префикса (пятое соединение ждёт), IP вне — общий лимит (третье ждёт).
+// TestLimitIPMapOverrideCapacity: an IP semaphore inside a prefix holds
+// the prefix limit (the fifth connection waits), an IP outside — the
+// common limit (the third one waits).
 func TestLimitIPMapOverrideCapacity(t *testing.T) {
 	st := newLimitState(LimitOptions{
 		PerIPConns: 2, GlobalConns: 64, MaxRPS: 1000, Burst: 64,
@@ -444,7 +452,7 @@ func TestLimitIPMapOverrideCapacity(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	// IP парковщика: 4 слота лимита префикса.
+	// A parker IP: 4 slots of the prefix limit.
 	park := netip.MustParseAddr("195.208.0.1")
 	parkRel := make([]func(), 0, 4)
 	for i := 0; i < 4; i++ {
@@ -469,7 +477,7 @@ func TestLimitIPMapOverrideCapacity(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Обычный IP: общий лимит 2.
+	// An ordinary IP: the common limit of 2.
 	plain := netip.MustParseAddr("192.0.2.7")
 	r1, err := st.ips.acquire(ctx, plain)
 	if err != nil {
@@ -494,7 +502,7 @@ func TestLimitIPMapOverrideCapacity(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Освобождение будит соответствующую очередь (перекрёстно молчат).
+	// A release wakes the matching queue (the cross queues stay silent).
 	parkRel[0]()
 	select {
 	case rel := <-parkQueued:
@@ -515,9 +523,9 @@ func TestLimitIPMapOverrideCapacity(t *testing.T) {
 	r2()
 }
 
-// TestLimitIPMapWaitObserved: ожидание слота наблюдается onWait после
-// выдачи (мгновенный слот — тоже, ≈0), отменённое ожидание наблюдением
-// не становится; ждущий под держателем получает ненулевое ожидание.
+// TestLimitIPMapWaitObserved: a slot wait is observed by onWait after the
+// grant (an instant slot too, ≈0); a cancelled wait does not become an
+// observation; a waiter behind a holder gets a non-zero wait.
 func TestLimitIPMapWaitObserved(t *testing.T) {
 	var mu sync.Mutex
 	waits := make([]time.Duration, 0, 2)
@@ -534,7 +542,7 @@ func TestLimitIPMapWaitObserved(t *testing.T) {
 		t.Fatalf("слот 1: %v", err)
 	}
 
-	// Ждущий под держателем: не возвращается, пока слот занят.
+	// A waiter behind a holder: does not return while the slot is taken.
 	got := make(chan func(), 1)
 	go func() {
 		rel, err := m.acquire(ctx, ip)
@@ -550,8 +558,8 @@ func TestLimitIPMapWaitObserved(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Отменённое ожидание наблюдением не становится (классификацию
-	// ошибки этапа делает потребитель).
+	// A cancelled wait does not become an observation (the stage error
+	// classification is done by the consumer).
 	cctx, cancel := context.WithCancel(ctx)
 	cancelled := make(chan error, 1)
 	go func() {
@@ -574,7 +582,7 @@ func TestLimitIPMapWaitObserved(t *testing.T) {
 		t.Fatalf("после отмены наблюдений %d, want 1 (только мгновенный слот)", n)
 	}
 
-	// Выдача будится освобождением; ожидание очереди наблюдено.
+	// The grant is woken by a release; the queue wait is observed.
 	r1()
 	select {
 	case rel := <-got:
@@ -595,8 +603,9 @@ func TestLimitIPMapWaitObserved(t *testing.T) {
 	}
 }
 
-// holdServer — сервер, обработчики которого живут до release: занятые
-// соединения держат слоты лимитов, число вошедших видно вызывающему.
+// holdServer is a server whose handlers live until release: occupied
+// connections hold the limit slots, and the caller can see how many
+// entered.
 func holdServer(t *testing.T) (srv *httptest.Server, entered func() int64, release func()) {
 	t.Helper()
 	var n atomic.Int64
@@ -610,14 +619,14 @@ func holdServer(t *testing.T) (srv *httptest.Server, entered func() int64, relea
 		}
 		select {
 		case <-ch:
-		case <-time.After(10 * time.Second): // страховка от вечного зависания
+		case <-time.After(10 * time.Second): // a guard against hanging forever
 		}
 		_, _ = fmt.Fprint(w, "done")
 	}))
 	return srv, n.Load, func() { once.Do(func() { close(ch) }) }
 }
 
-// waitCount ждёт значения счётчика (диалог с тестовым сервером).
+// waitCount waits for the counter value (a dialog with the test server).
 func waitCount(t *testing.T, entered func() int64, want int64) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -630,8 +639,8 @@ func waitCount(t *testing.T, entered func() int64, want int64) {
 	t.Fatalf("счётчик вошедших %d, ожидался %d", entered(), want)
 }
 
-// smallLimits — лимиты для интеграционных тестов: потолки соединений
-// меньше числа запросов, темп не мешает.
+// smallLimits is the limits for the integration tests: the connection caps
+// are below the request count, the rate does not interfere.
 func smallLimits(perIP, global int) *LimitOptions {
 	return &LimitOptions{
 		PerIPConns:     perIP,
@@ -643,11 +652,11 @@ func smallLimits(perIP, global int) *LimitOptions {
 	}
 }
 
-// TestFetcherPerIPLimitQueue: два соединения к одному IP держат слоты,
-// третий запрос ждёт очереди per-IP и проходит после освобождения.
+// TestFetcherPerIPLimitQueue: two connections to one IP hold slots, the
+// third request waits in the per-IP queue and passes after a release.
 func TestFetcherPerIPLimitQueue(t *testing.T) {
 	srv, entered, release := holdServer(t)
-	defer srv.Close() // LIFO: release ниже закроет обработчики раньше
+	defer srv.Close() // LIFO: the release below closes the handlers earlier
 	defer release()
 
 	f := NewFetcher(Options{
@@ -682,14 +691,14 @@ func TestFetcherPerIPLimitQueue(t *testing.T) {
 		third <- result{res, err}
 	}()
 
-	// Слоты заняты: третий не диалится — обработчиков по-прежнему два.
+	// The slots are taken: the third does not dial — still two handlers.
 	time.Sleep(300 * time.Millisecond)
 	if got := entered(); got != 2 {
 		t.Fatalf("лимит per-IP пропущен: вошло обработчиков %d (ожидалось 2)", got)
 	}
 
-	// Освобождение: тела дочитываются, соединения закрываются, слоты
-	// уходят ждущему третьему запросу.
+	// Release: the bodies are read out, the connections close, the slots
+	// go to the waiting third request.
 	release()
 	if _, err := io.ReadAll(res1.Body); err != nil {
 		t.Fatalf("тело 1: %v", err)
@@ -717,8 +726,8 @@ func TestFetcherPerIPLimitQueue(t *testing.T) {
 	waitCount(t, entered, 3)
 }
 
-// TestFetcherPerIPQueueCancelled: ждущий в очереди per-IP запрос
-// прерывается отменой ctx (таймаут вызывающего).
+// TestFetcherPerIPQueueCancelled: a request waiting in the per-IP queue is
+// interrupted by a ctx cancellation (the caller's timeout).
 func TestFetcherPerIPQueueCancelled(t *testing.T) {
 	srv, entered, release := holdServer(t)
 	defer srv.Close()
@@ -763,11 +772,12 @@ func TestFetcherPerIPQueueCancelled(t *testing.T) {
 	}
 }
 
-// --- потолок тела --------------------------------------------------------------
+// --- the body cap ------------------------------------------------------------
 
-// TestFetchBodyLimitExactAndTruncated: тело ровно в лимит читается
-// целиком без признака обрезки; сверх лимита — обрезается с признаком
-// Truncated (не ошибка сети), включая ответы без Content-Length.
+// TestFetchBodyLimitExactAndTruncated: a body exactly at the limit is read
+// in full without the truncation flag; over the limit — truncated with the
+// Truncated flag (not a network error), including responses without
+// Content-Length.
 func TestFetchBodyLimitExactAndTruncated(t *testing.T) {
 	body := func(size int, contentLength bool) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -821,19 +831,19 @@ func TestFetchBodyLimitExactAndTruncated(t *testing.T) {
 	t.Run("сверх лимита chunked", func(t *testing.T) { run(t, body(4096, false), 4096, 1024, true) })
 }
 
-// --- анти-тарпит ----------------------------------------------------------------
+// --- the anti-tarpit ---------------------------------------------------------
 
-// TestFetchBodyTarpitSpeed: заголовки и первый кусок тела пришли, хвост
-// молчит — дедлайн дочитания остатка (продлеваемый по мере чтения)
-// истекает, чтение прерывается таймаут-классифицированной ошибкой,
-// соединение закрывается.
+// TestFetchBodyTarpitSpeed: the headers and the first body chunk arrived,
+// the tail is silent — the deadline for finishing the remainder (renewed
+// as reading progresses) expires, the read is interrupted with a
+// timeout-classified error, the connection closes.
 func TestFetchBodyTarpitSpeed(t *testing.T) {
 	srv, done := stallServer(t, func(w http.ResponseWriter, stall <-chan struct{}) {
 		w.Header().Set("Content-Length", "8192")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(bytes.Repeat([]byte("x"), 1024))
 		if f, ok := w.(http.Flusher); ok {
-			f.Flush() // первый байт у клиента — дальше тарпит
+			f.Flush() // the first byte is at the client — the tarpit starts
 		}
 		select {
 		case <-stall:
@@ -870,15 +880,16 @@ func TestFetchBodyTarpitSpeed(t *testing.T) {
 	if elapsed < 150*time.Millisecond || elapsed >= 2*time.Second {
 		t.Errorf("нарушение скорости сработало вне границ окна: %s", elapsed)
 	}
-	// Соединение закрыто: повторное чтение — та же ошибка, не блокировка.
+	// The connection is closed: a repeated read gets the same error, not a
+	// block.
 	if _, err := res.Body.Read(make([]byte, 16)); err == nil || !IsTimeout(err) {
 		t.Errorf("чтение после нарушения: %v", err)
 	}
 	_ = res.Body.Close()
 }
 
-// TestFetchBodySpeedPacedOK: тело капает быстрее минимальной скорости —
-// продлеваемый дедлайн не срабатывает, тело читается целиком.
+// TestFetchBodySpeedPacedOK: the body trickles faster than the minimum
+// speed — the renewable deadline never fires, the body is read in full.
 func TestFetchBodySpeedPacedOK(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "4096")
@@ -888,7 +899,7 @@ func TestFetchBodySpeedPacedOK(t *testing.T) {
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
-			time.Sleep(60 * time.Millisecond) // ~17 КиБ/с > минимума 4 КиБ/с
+			time.Sleep(60 * time.Millisecond) // ~17 KiB/s > the minimum of 4 KiB/s
 		}
 	}))
 	defer srv.Close()
@@ -918,10 +929,10 @@ func TestFetchBodySpeedPacedOK(t *testing.T) {
 	}
 }
 
-// --- темп запросов и keep-alive ---------------------------------------------------
+// --- the request rate and keep-alive -----------------------------------------
 
-// TestRoundTripRPSPacing: токен-ведро темпа в RoundTrip — запросы сверх
-// всплеска выдерживают интервал темпа.
+// TestRoundTripRPSPacing: the rate token bucket in RoundTrip — requests
+// beyond the burst keep the rate interval.
 func TestRoundTripRPSPacing(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, "ok")
@@ -949,7 +960,7 @@ func TestRoundTripRPSPacing(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 	elapsed := time.Since(start)
-	// Всплеск 1 + 2 токена по 50 мс ≈ 100 мс.
+	// Burst 1 + 2 tokens of 50 ms ≈ 100 ms.
 	if elapsed < 90*time.Millisecond {
 		t.Errorf("темп RPS не выдержан: 3 запроса за %s (ожидалось ≥90ms)", elapsed)
 	}
@@ -958,10 +969,10 @@ func TestRoundTripRPSPacing(t *testing.T) {
 	}
 }
 
-// TestKeepAliveConnectionNotReused: keep-alive отключён (ТЗ 5.5: «отключён
-// или очень короткий idle»; выбор T-047/T-049) — два последовательных
-// запроса к одному хосту идут по разным соединениям, клиент шлёт
-// Connection: close.
+// TestKeepAliveConnectionNotReused: keep-alive is disabled (spec 5.5:
+// "disabled or a very short idle"; the T-047/T-049 choice) — two
+// sequential requests to one host go over different connections, the
+// client sends Connection: close.
 func TestKeepAliveConnectionNotReused(t *testing.T) {
 	var mu sync.Mutex
 	remotes := make(map[string]bool)
@@ -998,8 +1009,8 @@ func TestKeepAliveConnectionNotReused(t *testing.T) {
 	}
 }
 
-// TestFetchWithoutLimitsNoLimiter: без Options.Limits поведение T-047
-// сохраняется — BodyLimiter nil, тело без обёртки.
+// TestFetchWithoutLimitsNoLimiter: without Options.Limits the T-047
+// behavior is preserved — BodyLimiter is nil, the body has no wrapper.
 func TestFetchWithoutLimitsNoLimiter(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, "plain")

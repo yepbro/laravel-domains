@@ -1,43 +1,47 @@
-// Лимиты и защита HTTP-этапа (ТЗ 5.5, таблица лимитов; ТЗ 8: «тарпиты,
-// бесконечные редиректы, огромные ответы, zip-бомбы — прерываются по
-// лимитам из 5.5»). Пять механизмов:
+// Limits and protections of the HTTP stage (spec 5.5, the limits table;
+// spec 8: "tarpits, endless redirects, huge responses, zip bombs —
+// interrupted by the 5.5 limits"). Five mechanisms:
 //
-//   - потолок тела MaxBodyBytes («макс. размер читаемого тела | 2 МБ»):
-//     превышение — не ошибка сети: тело обрезается, признак «данные
-//     частичны» выставляется в BodyLimiter.Truncated — решение за
-//     потребителем (T-058), транспорт лишь сигналит;
-//   - анти-тарпит («мин. скорость 2 КБ/с после первого байта»): сторож
-//     с продлеваемым дедлайном — перед каждым чтением тела дедлайн
-//     дочитывания остатка пересчитывается как now + remain/speed;
-//     инвариант: суммарное время чтения не превосходит начальный
-//     остаток/скорость, то есть средняя скорость от любого момента до
-//     конца — не ниже минимальной. Нарушение — таймаут-классификация
-//     (limitBodySpeedError → net.Error) и закрытие соединения отменой
-//     контекста запроса; дедлайн не короче MinSpeedWindow — пол
-//     закрывает джиттер планировщика и RTT последнего сегмента;
-//   - соединения на один IP («одновременных соединений на один IP |
-//     3–4»): семафор-карта по диалимому IP (адрес DNS-этапа или резолва
-//     редиректа, не хост URL) — limitIPMap; ожидающие стоят в очереди
-//     с отменой ctx. Префиксам парковщиков — повышенный лимит
-//     (PerIPOverrides, T-165), ожидание очереди наблюдаемо
-//     (OnPerIPWait, T-165 — гистограмма :9104);
-//   - глобальное число соединений и темп запросов («ограничение
-//     исходящей нагрузки по глобальному числу соединений и RPS»):
-//     счётный семафор на всё соединение и токен-ведро на запрос —
-//     limitBucket, механика и обоснование как у dnsclient.limitBucket
-//     (единый стиль пакетов лимитов): средний темп max_rps, короткий
-//     всплеск до burst — «пачка уходит сразу, темп выравнивается»;
-//     фиксированное окно резало бы естественные всплески конвейера.
+//   - the body cap MaxBodyBytes ("max readable body size | 2 MB"):
+//     exceeding it is not a network error: the body is truncated, the
+//     "data is partial" flag is set in BodyLimiter.Truncated — the
+//     decision belongs to the consumer (T-058), the transport only
+//     signals;
+//   - the anti-tarpit ("min speed of 2 KB/s after the first byte"): a
+//     watchdog with a renewable deadline — before each body read, the
+//     deadline for finishing the remainder is recomputed as
+//     now + remain/speed; the invariant: the total reading time never
+//     exceeds the initial remainder/speed, that is, the average speed
+//     from any moment to the end is never below the minimum. A violation
+//     means timeout classification (limitBodySpeedError → net.Error) and
+//     closing the connection by canceling the request context; the
+//     deadline is never shorter than MinSpeedWindow — the floor absorbs
+//     scheduler jitter and the RTT of the last segment;
+//   - connections per IP ("concurrent connections per IP | 3–4"): a
+//     semaphore map keyed by the dialed IP (the DNS stage address or the
+//     redirect resolve, not the URL host) — limitIPMap; waiters queue
+//     with ctx cancellation. Parker prefixes get a raised limit
+//     (PerIPOverrides, T-165), the queue wait is observable
+//     (OnPerIPWait, T-165 — a :9104 histogram);
+//   - the global connection count and request rate ("outbound load
+//     limited by the global connection count and RPS"): a counting
+//     semaphore for the whole connection and a token bucket per request —
+//     limitBucket, the mechanics and rationale are the same as
+//     dnsclient.limitBucket (a unified limits-package style): an average
+//     rate of max_rps with a short burst up to burst — "a batch goes out
+//     at once, the rate evens out"; a fixed window would cut the
+//     pipeline's natural bursts.
 //
-// Интеграция — через Options.Limits (nil — транспорт без лимитов:
-// изолированные тесты слоёв T-047; NewOptions включает лимиты из
-// секции http конфигурации всегда). Слоты соединений занимаются в
-// dialLimited до старта connect-таймаута: ожидание в очереди — не
-// часть установки соединения; высвобождаются закрытием соединения
-// (limitConn). Keep-alive остаётся отключённым (выбор T-047 из
-// «отключён или очень короткий idle» ТЗ 5.5, зафиксирован в T-049:
-// одна главная страница на сайт, пул по хосту переживал бы перерезолв
-// и держал тысячи неактивных соединений при concurrency 2000).
+// Integration goes through Options.Limits (nil — a transport without
+// limits: the isolated layer tests of T-047; NewOptions always enables
+// the limits from the http config section). Connection slots are taken in
+// dialLimited before the connect timeout starts: waiting in the queue is
+// not part of establishing the connection; the slots are released by
+// closing the connection (limitConn). Keep-alive stays disabled (the
+// T-047 choice from the "disabled or a very short idle" option of
+// spec 5.5, pinned in T-049: one main page per site — a per-host pool
+// would ride out a re-resolve and hold thousands of idle connections at
+// concurrency 2000).
 
 package httpfetch
 
@@ -56,102 +60,106 @@ import (
 	"crawler/internal/config"
 )
 
-// Значения по умолчанию — таблица лимитов ТЗ 5.5 («все настраиваются»)
-// и ТЗ 5.10. Числа без ТЗ (RPS, окно скорости) — дефолты выведены из
-// свойств этапа, переопределяются в LimitOptions и конфигурации.
+// The defaults — the spec 5.5 limits table ("all are configurable") and
+// spec 5.10. Numbers without a spec entry (RPS, the speed window) —
+// defaults derived from the stage's properties; overridden in LimitOptions
+// and the configuration.
 const (
-	// DefaultLimitBodyBytes — потолок читаемого тела («макс. размер
-	// читаемого тела | 2 МБ», ТЗ 5.5; http.max_body_bytes).
+	// DefaultLimitBodyBytes is the readable body cap ("max readable body
+	// size | 2 MB", spec 5.5; http.max_body_bytes).
 	DefaultLimitBodyBytes = int64(2 << 20)
-	// DefaultLimitBodySpeed — мин. скорость чтения тела после первого
-	// байта («защита от тарпитов | мин. скорость 2 КБ/с», ТЗ 5.5;
-	// http.min_body_speed), байт/с.
+	// DefaultLimitBodySpeed is the min body reading speed after the first
+	// byte ("tarpit protection | min speed 2 KB/s", spec 5.5;
+	// http.min_body_speed), bytes/s.
 	DefaultLimitBodySpeed = int64(2 << 10)
-	// DefaultLimitSpeedWindow — пол дедлайна анти-тарпита: дедлайн
-	// дочитания остатка не короче этого окна. Джиттер планирования
-	// горутин и сетевой RTT последнего сегмента не должны давать ложных
-	// срабатываний у серверов, держащих скорость; на защиту пол не
-	// влияет: остановка тела ловится окном вместо нулевого дедлайна.
+	// DefaultLimitSpeedWindow is the floor of the anti-tarpit deadline:
+	// the deadline for finishing the remainder is never shorter than this
+	// window. Goroutine scheduling jitter and the network RTT of the last
+	// segment must not cause false triggers at servers that hold the
+	// speed; the protection is unaffected: a stalled body is caught by
+	// the window instead of a zero deadline.
 	DefaultLimitSpeedWindow = 500 * time.Millisecond
-	// DefaultLimitPerIPConns — одновременных соединений на один IP
-	// (рекомендация ТЗ 5.5 — 3–4; http.per_ip_limit): верх диапазона.
+	// DefaultLimitPerIPConns — concurrent connections per IP
+	// (spec 5.5 recommends 3–4; http.per_ip_limit): the top of the range.
 	DefaultLimitPerIPConns = 4
-	// DefaultLimitGlobalConns — глобальный потолок соединений
-	// (http.concurrency, ТЗ 5.10): счётчик соединений — та же величина,
-	// что плановый параллелизм воркеров.
+	// DefaultLimitGlobalConns is the global connection cap
+	// (http.concurrency, spec 5.10): a connection counter — the same
+	// quantity as the planned worker parallelism.
 	DefaultLimitGlobalConns = 2000
-	// DefaultLimitRPS — средний темп запросов (http.max_rps). ТЗ числа
-	// не задаёт: страница занимает ~1–2 с, при concurrency 2000
-	// естественный темп ~1000–2000 запросов/с — дефолт 1000 держит
-	// порядок исходящей нагрузки одного IP (тюнинг сети под неё —
-	// ТЗ 10.2), не резать ниже — настройкой.
+	// DefaultLimitRPS is the average request rate (http.max_rps). The spec
+	// sets no number: a page takes ~1–2 s, so at concurrency 2000 the
+	// natural rate is ~1000–2000 requests/s — the default of 1000 keeps
+	// the order of the outbound load of a single IP (network tuning for
+	// it is spec 10.2); lowering it further is a configuration matter.
 	DefaultLimitRPS = 1000
 )
 
-// PerIPOverride — лимит per-IP семафора для префикса (T-165, часть 2b):
-// соединения с IP внутри Prefix идут с Limit одновременных вместо
-// PerIPConns. Источник — карта «CIDR → лимит» конфигурации
-// (http.per_ip_overrides, префиксы парковщиков); эффективный лимит IP —
-// по самому длинному совпавшему префиксу. Override может быть и ниже
-// дефолта (мягкий хостер) — семантика едина.
+// PerIPOverride is the per-IP semaphore limit for a prefix (T-165, part
+// 2b): connections to an IP inside Prefix run with the Limit of
+// concurrent connections instead of PerIPConns. The source is the
+// config's "CIDR → limit" map (http.per_ip_overrides, parker prefixes);
+// the effective IP limit is by the longest matching prefix. An override
+// may also be below the default (a soft hoster) — the semantics are
+// uniform.
 type PerIPOverride struct {
 	Prefix netip.Prefix
 	Limit  int
 }
 
-// LimitOptions — параметры лимитов T-049. Нулевые значения заменяются
-// дефолтами (withDefaults, стиль Options: «0 — значение по умолчанию»).
+// LimitOptions is the T-049 limits parameters. Zero values are replaced
+// with defaults (withDefaults, the Options style: "0 means the default").
 type LimitOptions struct {
-	// MaxBodyBytes — потолок читаемого тела (http.max_body_bytes).
-	// Превышение — обрезка и признак BodyLimiter.Truncated, не ошибка
-	// сети (ТЗ 8: решение за потребителем T-058).
+	// MaxBodyBytes is the readable body cap (http.max_body_bytes).
+	// Exceeding it means truncation and the BodyLimiter.Truncated flag,
+	// not a network error (spec 8: the decision belongs to the consumer,
+	// T-058).
 	MaxBodyBytes int64
-	// MinBodySpeed — мин. скорость чтения тела после первого байта,
-	// байт/с (http.min_body_speed). Нарушение — таймаут, соединение
-	// закрывается.
+	// MinBodySpeed is the min body reading speed after the first byte,
+	// bytes/s (http.min_body_speed). A violation is a timeout, the
+	// connection is closed.
 	MinBodySpeed int64
-	// MinSpeedWindow — пол дедлайна анти-тарпита (см.
+	// MinSpeedWindow is the floor of the anti-tarpit deadline (see
 	// DefaultLimitSpeedWindow).
 	MinSpeedWindow time.Duration
-	// PerIPConns — одновременных соединений на один диалимый IP
+	// PerIPConns is the number of concurrent connections per dialed IP
 	// (http.per_ip_limit).
 	PerIPConns int
-	// PerIPOverrides — override-лимиты per-IP по префиксам парковщиков
-	// (T-165, http.per_ip_overrides): IP внутри префикса получает лимит
-	// префикса вместо PerIPConns — самый длинный совпавший префикс
-	// (longest-prefix; одна сеть дважды не валидна — конфигурация
-	// отклоняет дубли после маскирования). Пусто — один лимит на все IP
-	// (прежнее поведение).
+	// PerIPOverrides are per-IP override limits by parker prefixes
+	// (T-165, http.per_ip_overrides): an IP inside a prefix gets the
+	// prefix's limit instead of PerIPConns — the longest matching prefix
+	// (longest-prefix; one network listed twice is invalid — the
+	// configuration rejects duplicates after masking). Empty — one limit
+	// for all IPs (the previous behavior).
 	PerIPOverrides []PerIPOverride
-	// GlobalConns — глобальный потолок одновременных соединений
+	// GlobalConns is the global cap on concurrent connections
 	// (http.concurrency).
 	GlobalConns int
-	// MaxRPS — средний темп запросов, токен-ведро (http.max_rps).
+	// MaxRPS is the average request rate, a token bucket (http.max_rps).
 	MaxRPS int
-	// Burst — ёмкость токен-ведра: запросов подряд без ожидания
-	// (короткий всплеск конвейера). По умолчанию GlobalConns — «полная
-	// волна» всех воркеров разом; больше бессмысленно: одновременно
-	// летит не больше соединений.
+	// Burst is the token bucket capacity: requests in a row without
+	// waiting (a short pipeline burst). The default is GlobalConns — a
+	// "full wave" of all workers at once; more is pointless: no more
+	// connections fly at once.
 	Burst int
-	// OnPerIPWait — наблюдение ожидания слота per-IP семафора (T-165,
-	// часть 1): вызывается после каждой успешной выдачи слота с чистым
-	// временем ожидания в очереди (свободный слот — микросекунды).
-	// Отменённое ctx ожидание наблюдением не становится — его уже
-	// учитывает классификация ошибки этапа. nil — без наблюдений
-	// (транспорт вне http-worker: CLI, изолированные тесты). Подключает
-	// сборка сервиса к гистограмме crawler_http_per_ip_wait_seconds
-	// (:9104) — доля ожиданий > 2 с читается по корзинам (критерий
-	// T-165: < 5 % на смеси боя).
+	// OnPerIPWait observes the wait for a per-IP semaphore slot (T-165,
+	// part 1): called after each successful slot grant with the pure
+	// queue wait time (a free slot is microseconds). A ctx-cancelled wait
+	// does not become an observation — the stage error classification
+	// already accounts for it. nil — no observations (a transport outside
+	// the http-worker: the CLI, isolated tests). The service assembly
+	// wires it to the crawler_http_per_ip_wait_seconds histogram (:9104)
+	// — the share of waits > 2 s is read from the buckets (the T-165
+	// criterion: < 5% on the production mix).
 	OnPerIPWait func(wait time.Duration)
 }
 
-// NewLimitOptions собирает лимиты из секции http: потолок тела и
-// per-IP есть с T-006, скорость тела и RPS — поля T-049; глобальный
-// потолок соединений — http.concurrency; префиксы парковщиков (карта
-// «CIDR → лимит») — T-165. Ошибка разбора карты невозможна после
-// config.Validate (Load отклоняет конфиг); при ручной сборке мусорная
-// запись отключает overrides целиком — безопаснее молчаливого
-// частичного применения: все IP остаются на PerIPLimit.
+// NewLimitOptions assembles the limits from the http section: the body cap
+// and per-IP exist since T-006, body speed and RPS are T-049 fields; the
+// global connection cap is http.concurrency; parker prefixes (the
+// "CIDR → limit" map) are T-165. A map parse error is impossible after
+// config.Validate (Load rejects a broken config); in manual assembly a
+// junk entry disables overrides entirely — safer than a silent partial
+// application: all IPs stay on PerIPLimit.
 func NewLimitOptions(cfg config.HTTP) LimitOptions {
 	overrides, err := parsePerIPOverrides(cfg.PerIPOverrides)
 	if err != nil {
@@ -167,11 +175,12 @@ func NewLimitOptions(cfg config.HTTP) LimitOptions {
 	}
 }
 
-// parsePerIPOverrides разбирает карту «CIDR → лимит» (формат
-// http.per_ip_overrides): CIDR IPv4/IPv6, лимит ≥ 1, одна сеть (после
-// маскирования) не встречается дважды — дубль делал бы выбор лимита
-// неоднозначным (longest-prefix не различает равную длину). Порядок
-// результата не определён (карта) — сортировку делает newLimitState.
+// parsePerIPOverrides parses the "CIDR → limit" map (the
+// http.per_ip_overrides format): an IPv4/IPv6 CIDR, a limit >= 1, one
+// network (after masking) never appears twice — a duplicate would make
+// the limit choice ambiguous (longest-prefix cannot tell equal lengths
+// apart). The result order is undefined (a map) — newLimitState does the
+// sorting.
 func parsePerIPOverrides(m map[string]int) ([]PerIPOverride, error) {
 	if len(m) == 0 {
 		return nil, nil
@@ -197,7 +206,7 @@ func parsePerIPOverrides(m map[string]int) ([]PerIPOverride, error) {
 	return out, nil
 }
 
-// withDefaults заменяет нулевые и отрицательные значения дефолтами.
+// withDefaults replaces zero and negative values with defaults.
 func (o LimitOptions) withDefaults() LimitOptions {
 	if o.MaxBodyBytes <= 0 {
 		o.MaxBodyBytes = DefaultLimitBodyBytes
@@ -223,9 +232,9 @@ func (o LimitOptions) withDefaults() LimitOptions {
 	return o
 }
 
-// limitState — активные лимиты одного Fetcher: глобальный семафор
-// соединений, токен-ведро темпа и семафоры по IP. Потокобезопасно,
-// переживает все запросы транспорта.
+// limitState is the active limits of one Fetcher: the global connection
+// semaphore, the rate token bucket and the per-IP semaphores.
+// Thread-safe, outlives all transport requests.
 type limitState struct {
 	opt    LimitOptions
 	global chan struct{}
@@ -233,13 +242,13 @@ type limitState struct {
 	ips    limitIPMap
 }
 
-// newLimitState строит состояние из опций (вызывающий уже подставил
-// дефолты). Override-префиксы per-IP (T-165) сортируются по убыванию
-// длины: limitFor берёт первый совпавший — это и есть самый длинный
-// (longest-prefix); равные длины не пересекаются после запрета дублей
-// сетей (parsePerIPOverrides/валидация конфигурации), порядок внутри
-// одной длины сохраняется стабильной сортировкой (детерминизм и для
-// вручную собранных списков).
+// newLimitState builds the state from the options (the caller has already
+// applied the defaults). The per-IP override prefixes (T-165) are sorted
+// by descending length: limitFor takes the first match — which is the
+// longest one (longest-prefix); equal lengths do not overlap after the
+// duplicate-network ban (parsePerIPOverrides/config validation), and the
+// order within one length is kept by the stable sort (determinism for
+// manually assembled lists too).
 func newLimitState(opt LimitOptions) *limitState {
 	overrides := make([]PerIPOverride, len(opt.PerIPOverrides))
 	copy(overrides, opt.PerIPOverrides)
@@ -259,10 +268,11 @@ func newLimitState(opt LimitOptions) *limitState {
 	}
 }
 
-// acquireDial занимает слоты одного соединения к addr: сперва per-IP
-// (узкий ресурс — их 3–4), затем глобальный — порядок исключает
-// простой глобального слота в ожидании узкого. Очередь ждёт
-// освобождения или отмены ctx; отменившийся слотов не занимает.
+// acquireDial takes the slots of one connection to addr: first per-IP
+// (the narrow resource — there are only 3–4), then the global one — the
+// order rules out a global slot idling while waiting for a narrow one.
+// The queue waits for a release or a ctx cancellation; a cancelled
+// caller takes no slots.
 func (l *limitState) acquireDial(ctx context.Context, addr netip.Addr) (func(), error) {
 	releaseIP, err := l.ips.acquire(ctx, addr)
 	if err != nil {
@@ -281,9 +291,9 @@ func (l *limitState) acquireDial(ctx context.Context, addr netip.Addr) (func(), 
 	}, nil
 }
 
-// limitChanAcquire занимает слот семафора-канала; ожидание прерывается
-// отменой ctx. Канал будит ждущих в порядке поступления (FIFO) —
-// очередь справедлива без дополнительного кода.
+// limitChanAcquire takes a slot of a channel semaphore; the wait is
+// interrupted by a ctx cancellation. The channel wakes waiters in arrival
+// order (FIFO) — the queue is fair with no extra code.
 func limitChanAcquire(ctx context.Context, ch chan struct{}) error {
 	select {
 	case ch <- struct{}{}:
@@ -293,39 +303,42 @@ func limitChanAcquire(ctx context.Context, ch chan struct{}) error {
 	}
 }
 
-// limitChanRelease возвращает слот семафора-канала.
+// limitChanRelease returns a slot of the channel semaphore.
 func limitChanRelease(ch chan struct{}) { <-ch }
 
-// limitIPMap — семафоры «соединений на один IP» (ТЗ 5.5): запись на IP
-// создаётся по требованию и удаляется, когда её никто не держит и
-// никто не ждёт (refs) — карта не растёт с числом проверенных IP,
-// размер ограничен активностью (конкурентностью) транспорта.
+// limitIPMap is the "connections per IP" semaphores (spec 5.5): an entry
+// per IP is created on demand and removed when nobody holds it and nobody
+// waits for it (refs) — the map does not grow with the number of checked
+// IPs; its size is bounded by transport activity (concurrency).
 //
-// Override-префиксы (T-165): запись создаётся с лимитом префикса,
-// содержащего IP (limitFor, longest-prefix), вместо общего limit —
-// ожидание очереди к парковочным IP наблюдаемо (onWait, T-165 часть 1).
+// Override prefixes (T-165): an entry is created with the limit of the
+// prefix containing the IP (limitFor, longest-prefix) instead of the
+// common limit — the queue wait for parking IPs is observable (onWait,
+// T-165 part 1).
 type limitIPMap struct {
 	limit     int
-	overrides []PerIPOverride // убывание длины префикса (newLimitState)
+	overrides []PerIPOverride // prefix length descending (newLimitState)
 	onWait    func(wait time.Duration)
 	mu        sync.Mutex
 	entries   map[netip.Addr]*limitIPEntry
 }
 
-// limitIPEntry — семафор одного IP и счётчик интересантов (держащих
-// слот и стоящих в очереди): каждый acquire увеличивает refs, отпускание
-// слота или отмена ожидания уменьшают; по нулю запись исчезает из карты.
+// limitIPEntry is a single-IP semaphore and an interest counter (slot
+// holders and queue waiters): every acquire increments refs; a slot
+// release or a cancelled wait decrements it; at zero the entry leaves the
+// map.
 type limitIPEntry struct {
 	sem  chan struct{}
 	refs int
 }
 
-// limitFor — эффективный лимит соединений для IP (T-165): лимит самого
-// длинного префикса, содержащего IP, иначе общий m.limit. Диалимый
-// адрес размапливается (Unmap): IPv4-в-IPv6 адрес семантически IPv4,
-// префиксы IPv4 должны матчиться; префиксы разных семейств не
-// пересекаются (netip.Contains между семьями — false), поэтому перебор
-// до первого совпадения в порядке убывания длины однозначен.
+// limitFor is the effective connection limit for an IP (T-165): the limit
+// of the longest prefix containing the IP, otherwise the common m.limit.
+// The dialed address is unmapped (Unmap): an IPv4-in-IPv6 address is
+// semantically IPv4 and IPv4 prefixes must match; prefixes of different
+// families do not overlap (netip.Contains across families is false), so
+// scanning until the first match in descending length order is
+// unambiguous.
 func (m *limitIPMap) limitFor(ip netip.Addr) int {
 	a := ip.Unmap()
 	for _, o := range m.overrides {
@@ -336,11 +349,12 @@ func (m *limitIPMap) limitFor(ip netip.Addr) int {
 	return m.limit
 }
 
-// acquire занимает слот соединения с IP; при исчерпании — очередь до
-// освобождения или отмены ctx. Возвращаемая функция потокобезопасна и
-// идемпотентна (повторный вызов ничего не портит). Ожидание в очереди
-// (включая мгновенное) наблюдается onWait после успешной выдачи слота
-// (T-165): отменённое ожидание наблюдением не становится.
+// acquire takes a connection slot for an IP; when exhausted — a queue
+// until a release or a ctx cancellation. The returned function is
+// thread-safe and idempotent (calling it twice breaks nothing). The queue
+// wait (including an instant one) is observed by onWait after a
+// successful slot grant (T-165): a cancelled wait does not become an
+// observation.
 func (m *limitIPMap) acquire(ctx context.Context, ip netip.Addr) (func(), error) {
 	m.mu.Lock()
 	e, ok := m.entries[ip]
@@ -370,9 +384,10 @@ func (m *limitIPMap) acquire(ctx context.Context, ip netip.Addr) (func(), error)
 	}
 }
 
-// drop уменьшает счётчик интересантов записи и удаляет опустевшую из
-// карты. Удаление по тождеству записи: между нулем refs и удалением
-// по тому же IP могла быть создана новая запись.
+// drop decrements the entry's interest counter and removes the emptied
+// entry from the map. Removal is by entry identity: between refs hitting
+// zero and the removal, a new entry for the same IP could have been
+// created.
 func (m *limitIPMap) drop(ip netip.Addr, e *limitIPEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -382,22 +397,22 @@ func (m *limitIPMap) drop(ip netip.Addr, e *limitIPEntry) {
 	}
 }
 
-// limitBucket — токен-ведро темпа запросов с ленивым пополнением:
-// токены начисляются в момент обращения за (now−last)×rate, без
-// фоновых горутин. Выбор против фиксированного окна «N в секунду» —
-// как у dnsclient.limitBucket (единый стиль): ведро держит средний
-// темп и допускает короткий всплеск до burst, окно резало бы пачки
-// субдоменов и добавляло джиттер на границах.
+// limitBucket is a request-rate token bucket with lazy refills: tokens
+// are credited at access time for (now−last)×rate, with no background
+// goroutines. The choice against a fixed "N per second" window is the
+// same as dnsclient.limitBucket (a unified style): the bucket holds the
+// average rate and allows a short burst up to burst, while a window would
+// cut subdomain batches and add jitter at the boundaries.
 type limitBucket struct {
 	mu     sync.Mutex
-	rate   float64 // токенов в секунду (эффективный RPS)
-	burst  float64 // ёмкость ведра
+	rate   float64 // tokens per second (the effective RPS)
+	burst  float64 // the bucket capacity
 	tokens float64
-	last   time.Time // момент последнего начисления
+	last   time.Time // the moment of the last credit
 }
 
-// newLimitBucket создаёт полное ведро (burst токенов): плановая волна
-// старта конвейера уходит без ожидания.
+// newLimitBucket creates a full bucket (burst tokens): the planned startup
+// wave of the pipeline goes out without waiting.
 func newLimitBucket(rps float64, burst int) *limitBucket {
 	return &limitBucket{
 		rate:   rps,
@@ -407,8 +422,8 @@ func newLimitBucket(rps float64, burst int) *limitBucket {
 	}
 }
 
-// take забирает токен; при пустом ведре ждёт начисления следующего или
-// отмены ctx (ожидающий не занимает токен навсегда).
+// take takes a token; with an empty bucket it waits for the next credit
+// or a ctx cancellation (a waiter does not hold a token forever).
 func (b *limitBucket) take(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -424,8 +439,8 @@ func (b *limitBucket) take(ctx context.Context) error {
 	}
 }
 
-// tryTake забирает токен без ожидания; при нехватке возвращает время
-// до следующего токена.
+// tryTake takes a token without waiting; on shortage it returns the time
+// until the next token.
 func (b *limitBucket) tryTake() (time.Duration, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -434,9 +449,9 @@ func (b *limitBucket) tryTake() (time.Duration, bool) {
 		b.tokens--
 		return 0, true
 	}
-	// (1 − tokens)/rate секунд до целого токена; минимум 1 нс — защита
-	// от нулевого ожидания на округлении (иначе take крутился бы
-	// вхолостую).
+	// (1 − tokens)/rate seconds until a whole token; a minimum of 1 ns —
+	// protection against a zero wait from rounding (otherwise take would
+	// spin idly).
 	wait := time.Duration((1 - b.tokens) / b.rate * float64(time.Second))
 	if wait < 1 {
 		wait = 1
@@ -444,7 +459,7 @@ func (b *limitBucket) tryTake() (time.Duration, bool) {
 	return wait, false
 }
 
-// refill начисляет токены по прошедшему времени; вызывающий держит b.mu.
+// refill credits tokens for the elapsed time; the caller holds b.mu.
 func (b *limitBucket) refill() {
 	if now := time.Now(); now.After(b.last) {
 		b.tokens = math.Min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
@@ -452,7 +467,7 @@ func (b *limitBucket) refill() {
 	}
 }
 
-// limitSleep — пауза, прерываемая отменой ctx.
+// limitSleep is a pause interruptible by a ctx cancellation.
 func limitSleep(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return nil
@@ -467,10 +482,10 @@ func limitSleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// limitConn — соединение со слотами лимитов (per-IP и глобальный):
-// слоты живут ровно пока живо соединение, Close их возвращает. Слоты
-// у одного соединения — единственный владелец, повторный Close
-// (транспорт может звать) не высвобождает дважды.
+// limitConn is a connection with limit slots (per-IP and global): the
+// slots live exactly as long as the connection does, Close returns them.
+// The slots of one connection have a single owner; a repeated Close (the
+// transport may call it) does not release twice.
 type limitConn struct {
 	net.Conn
 	release func()
@@ -483,11 +498,12 @@ func (c *limitConn) Close() error {
 	return err
 }
 
-// dialLimited — попытка подключения под лимитами соединений T-049:
-// слоты per-IP и глобальный занимаются до старта connect-таймаута
-// (ожидание в очереди — не часть установки соединения), успешное
-// соединение оборачивается в limitConn. Без Options.Limits — прямой
-// проход к dialTimed (транспорт без лимитов, T-047).
+// dialLimited is a connection attempt under the T-049 connection limits:
+// the per-IP slots and the global one are taken before the connect
+// timeout starts (a queue wait is not part of establishing the
+// connection); a successful connection is wrapped in limitConn. Without
+// Options.Limits — a direct pass to dialTimed (a transport without
+// limits, T-047).
 func (f *Fetcher) dialLimited(ctx context.Context, addr netip.Addr, port string) (net.Conn, error) {
 	if f.lim == nil {
 		return f.dialTimed(ctx, addr, port)
@@ -504,41 +520,42 @@ func (f *Fetcher) dialLimited(ctx context.Context, addr netip.Addr, port string)
 	return &limitConn{Conn: conn, release: release}, nil
 }
 
-// errLimitBodyClosed — чтение после закрытия тела.
+// errLimitBodyClosed — reading after the body was closed.
 var errLimitBodyClosed = errors.New("httpfetch: чтение закрытого тела")
 
-// BodyLimiter — тело ответа под лимитами T-049: потолок MaxBodyBytes
-// (обрезка с признаком Truncated, не ошибка сети) и анти-тарпит
-// (мин. скорость после первого байта). Реализует io.ReadCloser; в
-// FetchResult дублируется полем BodyLimiter — признак обрезки виден
-// потребителю (T-058) без привязки к фактическому типу Body.
+// BodyLimiter is a response body under the T-049 limits: the MaxBodyBytes
+// cap (truncation with the Truncated flag, not a network error) and the
+// anti-tarpit (a min speed after the first byte). It implements
+// io.ReadCloser; in FetchResult it is duplicated by the BodyLimiter field
+// — the truncation flag is visible to the consumer (T-058) without tying
+// to the concrete Body type.
 //
-// Анти-тарпит: перед каждым чтением взводится сторож с дедлайном
-// дочитания остатка now + remain/speed (продлевается по мере чтения —
-// инвариант «средняя скорость до конца не ниже минимальной»);
-// нарушение — отмена контекста запроса: соединение закрывается,
-// блокированное чтение возвращается, Read отдаёт limitBodySpeedError
-// (тайм-классификация по IsTimeout). Сторож — time.AfterFunc без
-// горутин ожидания: снятие чтением, утечек нет.
+// Anti-tarpit: before each read a watchdog is armed with the deadline for
+// finishing the remainder of now + remain/speed (renewed as reading
+// progresses — the invariant "the average speed to the end is never below
+// the minimum"); a violation cancels the request context: the connection
+// closes, the blocked read returns, and Read yields limitBodySpeedError
+// (timeout classification via IsTimeout). The watchdog is time.AfterFunc
+// with no waiting goroutines: disarmed by reading, no leaks.
 type BodyLimiter struct {
 	rc     io.ReadCloser
 	cancel context.CancelFunc
 
-	speed    int64         // байт/с; 0 — анти-тарпит выключен
-	window   time.Duration // пол дедлайна (MinSpeedWindow)
-	remain   int64         // осталось до потолка MaxBodyBytes
-	trunc    bool          // тело длиннее потолка — данные частичны
-	probed   bool          // хвост за потолком уже классифицирован
-	probeErr error         // итог классификации хвоста (повторные чтения источник не трогают)
+	speed    int64         // bytes/s; 0 — the anti-tarpit is off
+	window   time.Duration // the deadline floor (MinSpeedWindow)
+	remain   int64         // remaining until the MaxBodyBytes cap
+	trunc    bool          // the body is longer than the cap — the data is partial
+	probed   bool          // the tail beyond the cap has been classified already
+	probeErr error         // the tail classification verdict (repeated reads do not touch the source)
 
 	mu     sync.Mutex
 	timer  *time.Timer
-	fired  bool // сторож сработал — нарушение скорости
+	fired  bool // the watchdog fired — a speed violation
 	closed bool
 }
 
-// newBodyLimiter оборачивает rc (тело с общей отменой запроса —
-// cancelBody); cancel закрывает соединение при нарушении скорости.
+// newBodyLimiter wraps rc (a body with the shared request cancellation —
+// cancelBody); cancel closes the connection on a speed violation.
 func newBodyLimiter(rc io.ReadCloser, cancel context.CancelFunc, opt LimitOptions) *BodyLimiter {
 	return &BodyLimiter{
 		rc:     rc,
@@ -549,13 +566,14 @@ func newBodyLimiter(rc io.ReadCloser, cancel context.CancelFunc, opt LimitOption
 	}
 }
 
-// Read читает тело не дальше потолка MaxBodyBytes. Когда потолок отдан,
-// единственный пробный байт решает, длиннее ли тело лимита: байт есть —
-// truncated=true и io.EOF (обрезка, не ошибка), сразу io.EOF — тело
-// ровно в лимите; итог пробы запоминается — повторные чтения возвращают
-// его, не трогая источник. Буфер длины 0 не читает источник вовсе
-// (контракт io.Reader). Проба идёт под тем же сторожем скорости:
-// молчащий хвост — то же нарушение темпа.
+// Read reads the body no further than the MaxBodyBytes cap. Once the cap
+// has been given out, a single probe byte decides whether the body is
+// longer than the limit: a byte exists — truncated=true and io.EOF
+// (truncation, not an error), an immediate io.EOF — the body is exactly
+// at the limit; the probe verdict is remembered — repeated reads return
+// it without touching the source. A zero-length buffer does not read the
+// source at all (the io.Reader contract). The probe runs under the same
+// speed watchdog: a silent tail is the same rate violation.
 func (b *BodyLimiter) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -579,7 +597,7 @@ func (b *BodyLimiter) Read(p []byte) (int, error) {
 		return b.probeTail()
 	}
 	if int64(len(p)) > b.remain {
-		p = p[:int(b.remain)] // за потолок не читаем
+		p = p[:int(b.remain)] // never read beyond the cap
 	}
 	b.armLocked()
 	b.mu.Unlock()
@@ -600,15 +618,15 @@ func (b *BodyLimiter) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// probeTail — классификация хвоста после исчерпания потолка (см. Read);
-// выполняется один раз, итог запоминается (probed/probeErr).
+// probeTail classifies the tail after the cap is exhausted (see Read);
+// performed once, the verdict is remembered (probed/probeErr).
 func (b *BodyLimiter) probeTail() (int, error) {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
 		return 0, errLimitBodyClosed
 	}
-	b.armLocked() // remain = 0: дедлайн — только пол окна
+	b.armLocked() // remain = 0: the deadline is only the window floor
 	b.mu.Unlock()
 
 	var one [1]byte
@@ -620,9 +638,9 @@ func (b *BodyLimiter) probeTail() (int, error) {
 	b.probed = true
 	if n > 0 {
 		b.trunc = true
-		b.probeErr = io.EOF // классифицировано как обрезка
+		b.probeErr = io.EOF // classified as truncation
 	} else {
-		b.probeErr = err // io.EOF — ровно в лимите; ошибка сети — как есть
+		b.probeErr = err // io.EOF — exactly at the limit; a network error — as is
 	}
 	b.mu.Unlock()
 
@@ -630,12 +648,12 @@ func (b *BodyLimiter) probeTail() (int, error) {
 		return 0, b.speedError()
 	}
 	if n > 0 {
-		return 0, io.EOF // тело обрезано потолком
+		return 0, io.EOF // the body was truncated by the cap
 	}
-	return 0, err // io.EOF — ровно в лимите; ошибка сети — как есть
+	return 0, err // io.EOF — exactly at the limit; a network error — as is
 }
 
-// Close останавливает сторож и закрывает тело.
+// Close stops the watchdog and closes the body.
 func (b *BodyLimiter) Close() error {
 	b.mu.Lock()
 	if b.closed {
@@ -648,18 +666,18 @@ func (b *BodyLimiter) Close() error {
 	return b.rc.Close()
 }
 
-// Truncated — тело превысило потолок MaxBodyBytes и обрезано: данные
-// частичны, не ошибка сети (ТЗ 8). Признак выставляется чтением к
-// моменту io.EOF от Body.
+// Truncated — the body exceeded the MaxBodyBytes cap and was truncated:
+// the data is partial, not a network error (spec 8). The flag is set by
+// reading by the time Body returns io.EOF.
 func (b *BodyLimiter) Truncated() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.trunc
 }
 
-// armLocked взводит сторож анти-тарпита: дедлайн дочитания остатка
-// remain/speed от текущего момента (ТЗ 5.5: мин. скорость после
-// первого байта). Вызывающий держит b.mu.
+// armLocked arms the anti-tarpit watchdog: the deadline for finishing the
+// remainder of remain/speed from the current moment (spec 5.5: a min
+// speed after the first byte). The caller holds b.mu.
 func (b *BodyLimiter) armLocked() {
 	if b.speed <= 0 {
 		return
@@ -672,8 +690,9 @@ func (b *BodyLimiter) armLocked() {
 	b.timer.Reset(d)
 }
 
-// deadlineLocked — дедлайн дочитания остатка; не короче окна-пола
-// (джиттер планировщика, RTT последнего сегмента).
+// deadlineLocked is the deadline for finishing the remainder; never
+// shorter than the window floor (scheduler jitter, the RTT of the last
+// segment).
 func (b *BodyLimiter) deadlineLocked(remain int64) time.Duration {
 	if b.speed <= 0 {
 		return 0
@@ -685,17 +704,18 @@ func (b *BodyLimiter) deadlineLocked(remain int64) time.Duration {
 	return d
 }
 
-// disarmLocked снимает сторож (чтение вернулось). Вызывающий держит b.mu.
+// disarmLocked disarms the watchdog (the read returned). The caller holds
+// b.mu.
 func (b *BodyLimiter) disarmLocked() {
 	if b.timer != nil {
 		b.timer.Stop()
 	}
 }
 
-// onDeadline — дедлайн истёк: скорость нарушена. Отмена контекста
-// запроса закрывает соединение — блокированное чтение возвращается
-// ошибкой, слоты лимитов соединений освобождаются (ТЗ 5.5: «нарушение
-// — соединение закрывается»).
+// onDeadline — the deadline expired: the speed is violated. Canceling the
+// request context closes the connection — the blocked read returns with
+// an error and the connection limit slots are freed (spec 5.5: "on a
+// violation the connection is closed").
 func (b *BodyLimiter) onDeadline() {
 	b.mu.Lock()
 	b.fired = true
@@ -703,7 +723,8 @@ func (b *BodyLimiter) onDeadline() {
 	b.cancel()
 }
 
-// speedError — ошибка нарушения скорости с параметрами на момент.
+// speedError is a speed violation error with the parameters at the
+// moment.
 func (b *BodyLimiter) speedError() error {
 	b.mu.Lock()
 	speed, remain := b.speed, b.remain
@@ -711,12 +732,13 @@ func (b *BodyLimiter) speedError() error {
 	return &limitBodySpeedError{speed: speed, remain: remain}
 }
 
-// limitBodySpeedError — нарушение мин. скорости чтения тела (тарпит,
-// ТЗ 5.5). net.Error с Timeout()=true: классификация потребителя —
-// таймаут (temp_error, как у прочих слоёв — IsTimeout), не «нет сайта».
+// limitBodySpeedError is a violation of the min body reading speed (a
+// tarpit, spec 5.5). A net.Error with Timeout()=true: the consumer
+// classifies it as a timeout (temp_error, like the other layers —
+// IsTimeout), not "no site".
 type limitBodySpeedError struct {
-	speed  int64 // настройка, байт/с
-	remain int64 // байт оставалось дочитать
+	speed  int64 // the setting, bytes/s
+	remain int64 // the bytes that were left to read
 }
 
 func (e *limitBodySpeedError) Error() string {
@@ -726,5 +748,5 @@ func (e *limitBodySpeedError) Error() string {
 func (e *limitBodySpeedError) Timeout() bool   { return true }
 func (e *limitBodySpeedError) Temporary() bool { return true }
 
-// compile-time check: *limitBodySpeedError — net.Error (IsTimeout).
+// compile-time check: *limitBodySpeedError is a net.Error (IsTimeout).
 var _ net.Error = (*limitBodySpeedError)(nil)

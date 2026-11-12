@@ -1,13 +1,13 @@
-// Тесты кодировок и сжатия (T-051, T-100, ТЗ 5.5). Два блока:
+// Charset and compression tests (T-051, T-100, spec 5.5). Two blocks:
 //
-//   - ToUTF8: приоритеты определения (BOM → заголовок → meta → детект →
-//     умолчание), замена невалидных последовательностей, пустое тело;
-//   - сжатие: decodeContentEncoding (gzip/br/deflate/identity, битые
-//     значения, составные значения — цепочка слоёв RFC 9110 с потолком
-//     на слой, потолок против zip-бомб, закрытие источника) и сквозной
-//     путь Fetch/RoundTrip — Accept-Encoding доходит до сервера, тело
-//     распаковывается, кодирующие заголовки снимаются, цепочка
-//     «сжатие + кодировка» работает вместе.
+//   - ToUTF8: detection priorities (BOM → header → meta → detect →
+//     default), invalid sequence replacement, an empty body;
+//   - compression: decodeContentEncoding (gzip/br/deflate/identity, broken
+//     values, compound values — an RFC 9110 layer chain with a per-layer
+//     cap, the cap against zip bombs, closing the source) and the
+//     end-to-end Fetch/RoundTrip path — Accept-Encoding reaches the
+//     server, the body is decompressed, the coding headers are stripped,
+//     the "compression + charset" chain works together.
 
 package httpfetch
 
@@ -31,14 +31,14 @@ import (
 	xunicode "golang.org/x/text/encoding/unicode"
 )
 
-// --- вспомогательные --------------------------------------------------------
+// --- helpers -----------------------------------------------------------------
 
-// ruSample — естественный русский текст для частотного детекта: длины
-// хватает на уверенный сигнал (>= cyrillicMinLetters), частые буквы
-// присутствуют.
+// ruSample is natural Russian text for the frequency detect: the length is
+// enough for a confident signal (>= cyrillicMinLetters), and the frequent
+// letters are present.
 const ruSample = "Сервис массовой проверки доменов ищет сайты на фреймворке Laravel: транспорт скачивает главную страницу, определяет кодировку ответа и приводит содержимое к универсальному формату, анализатор применяет правила и сохраняет результат проверки в хранилище."
 
-// encodeBytes кодирует UTF-8 текст в однобайтовую кодировку charmap.
+// encodeBytes encodes UTF-8 text into a single-byte charmap charset.
 func encodeBytes(t *testing.T, cm *charmap.Charmap, s string) []byte {
 	t.Helper()
 	b, err := cm.NewEncoder().Bytes([]byte(s))
@@ -48,7 +48,7 @@ func encodeBytes(t *testing.T, cm *charmap.Charmap, s string) []byte {
 	return b
 }
 
-// gzipBytes сжимает данные (обычный случай и zip-бомбы в тестах).
+// gzipBytes compresses data (the common case and zip bombs in tests).
 func gzipBytes(t *testing.T, b []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -62,8 +62,8 @@ func gzipBytes(t *testing.T, b []byte) []byte {
 	return buf.Bytes()
 }
 
-// brotliBytes сжимает данные brotli (минимальное качество — тесту
-// важна корректность, не степень сжатия).
+// brotliBytes compresses data with brotli (the lowest quality — the test
+// cares about correctness, not the compression ratio).
 func brotliBytes(t *testing.T, b []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -77,8 +77,8 @@ func brotliBytes(t *testing.T, b []byte) []byte {
 	return buf.Bytes()
 }
 
-// utf16leBytes кодирует текст в UTF-16LE и prepends BOM (как это делают
-// серверы, отдающие UTF-16).
+// utf16leBytes encodes text into UTF-16LE and prepends the BOM (as servers
+// serving UTF-16 do).
 func utf16leBytes(t *testing.T, s string) []byte {
 	t.Helper()
 	b, err := xunicode.UTF16(xunicode.LittleEndian, xunicode.UseBOM).NewEncoder().Bytes([]byte(s))
@@ -91,11 +91,12 @@ func utf16leBytes(t *testing.T, s string) []byte {
 	return b
 }
 
-// utf16beBytes кодирует текст в UTF-16BE с BOM — перестановкой байтов
-// LE-представления (отдельного BE-энкодера тесту не нужно).
+// utf16beBytes encodes text into UTF-16BE with a BOM — by swapping the
+// bytes of the LE representation (the test does not need a separate BE
+// encoder).
 func utf16beBytes(t *testing.T, s string) []byte {
 	t.Helper()
-	le := utf16leBytes(t, s)[2:] // LE-байты без BOM
+	le := utf16leBytes(t, s)[2:] // LE bytes without the BOM
 	be := make([]byte, 2+len(le))
 	be[0], be[1] = 0xFE, 0xFF
 	for i := 0; i+1 < len(le); i += 2 {
@@ -104,7 +105,7 @@ func utf16beBytes(t *testing.T, s string) []byte {
 	return be
 }
 
-// headerOf — http.Header из одного Content-Type.
+// headerOf is an http.Header from a single Content-Type.
 func headerOf(contentType string) http.Header {
 	h := http.Header{}
 	if contentType != "" {
@@ -113,12 +114,12 @@ func headerOf(contentType string) http.Header {
 	return h
 }
 
-// --- ToUTF8: определение кодировки ------------------------------------------
+// --- ToUTF8: charset detection ----------------------------------------------
 
-// TestToUTF8EmptyBody: пустое тело — валидное тело (T-138): пустой, но
-// не nil UTF8-слайс (nil ниже по конвейеру — «тела нет», ContentSaver
-// гасит content_hash) без кодировки, каким бы ни был вход — nil или
-// пустой слайс.
+// TestToUTF8EmptyBody: an empty body is a valid body (T-138): an empty but
+// non-nil UTF8 slice (nil further down the pipeline means "no body";
+// ContentSaver zeroes out content_hash) with no charset, whatever the
+// input — nil or an empty slice.
 func TestToUTF8EmptyBody(t *testing.T) {
 	for name, body := range map[string][]byte{"nil": nil, "пустой слайс": {}} {
 		got := ToUTF8(headerOf("text/html; charset=windows-1251"), body)
@@ -131,10 +132,10 @@ func TestToUTF8EmptyBody(t *testing.T) {
 	}
 }
 
-// TestToUTF8BOMOnlyBody: тело из одного BOM декодируется в ноль байтов —
-// результат обязан остаться валидным пустым телом (не nil, T-138): UTF-8
-// BOM снимается срезом, UTF-16 — декодером с UseBOM, пустой выход
-// нормализуется emptyIfNil.
+// TestToUTF8BOMOnlyBody: a body of a single BOM decodes to zero bytes —
+// the result must remain a valid empty body (not nil, T-138): a UTF-8 BOM
+// is stripped with a slice, UTF-16 with the UseBOM decoder, and an empty
+// output is normalized by emptyIfNil.
 func TestToUTF8BOMOnlyBody(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -155,8 +156,8 @@ func TestToUTF8BOMOnlyBody(t *testing.T) {
 	}
 }
 
-// TestToUTF8HeaderCharset: Content-Type charset=windows-1251 — русский
-// текст декодируется, источник header.
+// TestToUTF8HeaderCharset: Content-Type charset=windows-1251 — Russian
+// text decodes, the source is header.
 func TestToUTF8HeaderCharset(t *testing.T) {
 	got := ToUTF8(headerOf("text/html; charset=windows-1251"),
 		encodeBytes(t, charmap.Windows1251, ruSample))
@@ -168,8 +169,8 @@ func TestToUTF8HeaderCharset(t *testing.T) {
 	}
 }
 
-// TestToUTF8HeaderAliasAndCase: метки-алиасы и регистр (CP1251) дают
-// каноническое имя.
+// TestToUTF8HeaderAliasAndCase: alias labels and case (CP1251) produce the
+// canonical name.
 func TestToUTF8HeaderAliasAndCase(t *testing.T) {
 	got := ToUTF8(headerOf(`text/html; charset="CP1251"`),
 		encodeBytes(t, charmap.Windows1251, ruSample))
@@ -179,7 +180,7 @@ func TestToUTF8HeaderAliasAndCase(t *testing.T) {
 	}
 }
 
-// TestToUTF8BOMUTF8: BOM UTF-8 перекрывает заголовок и снимается.
+// TestToUTF8BOMUTF8: a UTF-8 BOM overrides the header and is stripped.
 func TestToUTF8BOMUTF8(t *testing.T) {
 	body := append([]byte{0xEF, 0xBB, 0xBF}, ruSample...)
 	got := ToUTF8(headerOf("text/html; charset=koi8-r"), body)
@@ -191,8 +192,9 @@ func TestToUTF8BOMUTF8(t *testing.T) {
 	}
 }
 
-// TestToUTF8BOMUTF16: UTF-16LE/BE с BOM декодируются (BOM потребляет
-// декодер), заголовок противоречит — не важно, BOM сильнее.
+// TestToUTF8BOMUTF16: UTF-16LE/BE with a BOM decode (the decoder consumes
+// the BOM), the header contradicts — it does not matter, the BOM is
+// stronger.
 func TestToUTF8BOMUTF16(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -214,8 +216,8 @@ func TestToUTF8BOMUTF16(t *testing.T) {
 	}
 }
 
-// TestToUTF8MetaCharset: страница без charset в заголовке объявляет
-// кодировку через <meta charset> (первые 1024 байта).
+// TestToUTF8MetaCharset: a page without a charset in the header declares
+// it via <meta charset> (the first 1024 bytes).
 func TestToUTF8MetaCharset(t *testing.T) {
 	body := encodeBytes(t, charmap.Windows1251,
 		"<html><head><meta charset=\"windows-1251\"><title>Проверка</title></head><body>"+ruSample+"</body></html>")
@@ -229,7 +231,7 @@ func TestToUTF8MetaCharset(t *testing.T) {
 }
 
 // TestToUTF8MetaHTTPEquiv: <meta http-equiv="Content-Type"
-// content="...; charset=..."> — второй вид декларации.
+// content="...; charset=..."> — the second kind of declaration.
 func TestToUTF8MetaHTTPEquiv(t *testing.T) {
 	body := encodeBytes(t, charmap.KOI8R,
 		`<html><head><meta http-equiv="Content-Type" content="text/html; charset=koi8-r"></head><body>`+ruSample+`</body></html>`)
@@ -242,7 +244,8 @@ func TestToUTF8MetaHTTPEquiv(t *testing.T) {
 	}
 }
 
-// TestToUTF8HeaderBeatsMeta: заголовок приоритетнее meta (ТЗ 5.5).
+// TestToUTF8HeaderBeatsMeta: the header takes priority over meta
+// (spec 5.5).
 func TestToUTF8HeaderBeatsMeta(t *testing.T) {
 	body := encodeBytes(t, charmap.KOI8R,
 		`<html><head><meta charset="windows-1251"></head><body>`+ruSample+`</body></html>`)
@@ -252,8 +255,8 @@ func TestToUTF8HeaderBeatsMeta(t *testing.T) {
 	}
 }
 
-// TestToUTF8UnknownHeaderLabel: неизвестная метка заголовка — «лучшая
-// попытка»: пропускаем, декларация страницы решает.
+// TestToUTF8UnknownHeaderLabel: an unknown header label — "best effort":
+// skip it, the page's declaration decides.
 func TestToUTF8UnknownHeaderLabel(t *testing.T) {
 	body := encodeBytes(t, charmap.KOI8R,
 		`<html><head><meta charset="koi8-r"></head><body>`+ruSample+`</body></html>`)
@@ -263,8 +266,8 @@ func TestToUTF8UnknownHeaderLabel(t *testing.T) {
 	}
 }
 
-// TestToUTF8DetectUTF8: без указаний валидный UTF-8 (и чистый ASCII)
-// детектируется как utf-8, байты проходят без искажения.
+// TestToUTF8DetectUTF8: with no hints, valid UTF-8 (and clean ASCII) is
+// detected as utf-8, the bytes pass through undistorted.
 func TestToUTF8DetectUTF8(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -285,9 +288,9 @@ func TestToUTF8DetectUTF8(t *testing.T) {
 	}
 }
 
-// TestToUTF8DetectKOI8R: русский текст в koi8-r без каких-либо указаний
-// — частотный детект (x/net контентной эвристики не имеет, умолчанием
-// отдал бы windows-1252 и кракозябры).
+// TestToUTF8DetectKOI8R: Russian text in koi8-r with no hints at all — the
+// frequency detect (x/net has no content heuristic; the default would
+// give windows-1252 and mojibake).
 func TestToUTF8DetectKOI8R(t *testing.T) {
 	got := ToUTF8(headerOf(""), encodeBytes(t, charmap.KOI8R, ruSample))
 	if got.Charset != "koi8-r" || got.Source != CharsetDetect {
@@ -298,8 +301,9 @@ func TestToUTF8DetectKOI8R(t *testing.T) {
 	}
 }
 
-// TestToUTF8DetectWindows1251: аналогично для windows-1251 (частый
-// легаси ру-сегмента) — детект различает koi8-r и cp1251.
+// TestToUTF8DetectWindows1251: likewise for windows-1251 (a frequent
+// legacy charset of the RU segment) — the detect tells koi8-r and cp1251
+// apart.
 func TestToUTF8DetectWindows1251(t *testing.T) {
 	got := ToUTF8(headerOf(""), encodeBytes(t, charmap.Windows1251, ruSample))
 	if got.Charset != "windows-1251" || got.Source != CharsetDetect {
@@ -310,9 +314,9 @@ func TestToUTF8DetectWindows1251(t *testing.T) {
 	}
 }
 
-// TestToUTF8DetectRescuesMislabeledMeta: meta врёт (windows-1252), тело
-// — windows-1251: детект включается для невалидного UTF-8 и спасает
-// содержимое.
+// TestToUTF8DetectRescuesMislabeledMeta: the meta lies (windows-1252), the
+// body is windows-1251: detect kicks in for invalid UTF-8 and rescues the
+// content.
 func TestToUTF8DetectRescuesMislabeledMeta(t *testing.T) {
 	body := encodeBytes(t, charmap.Windows1251,
 		`<html><head><meta charset="windows-1252"></head><body>`+ruSample+`</body></html>`)
@@ -325,9 +329,9 @@ func TestToUTF8DetectRescuesMislabeledMeta(t *testing.T) {
 	}
 }
 
-// TestToUTF8DefaultWindows1252: латиница с диакритикой без указаний —
-// кириллического сигнала не хватает, умолчание WHATWG windows-1252
-// (надмножество latin-1).
+// TestToUTF8DefaultWindows1252: Latin with diacritics and no hints — the
+// Cyrillic signal is not enough, the WHATWG windows-1252 default (a
+// superset of latin-1).
 func TestToUTF8DefaultWindows1252(t *testing.T) {
 	got := ToUTF8(headerOf(""), encodeBytes(t, charmap.Windows1252, "École naïve café"))
 	if got.Charset != "windows-1252" || got.Source != CharsetDefault {
@@ -338,8 +342,8 @@ func TestToUTF8DefaultWindows1252(t *testing.T) {
 	}
 }
 
-// TestToUTF8InvalidUTF8Replaced: заявлен utf-8, байты битые — замена
-// U+FFFD вместо ошибки, валидная часть сохраняется.
+// TestToUTF8InvalidUTF8Replaced: utf-8 is declared, the bytes are broken —
+// U+FFFD replacement instead of an error, the valid part survives.
 func TestToUTF8InvalidUTF8Replaced(t *testing.T) {
 	body := []byte("текст\xff\xfe и \xc3 конец")
 	got := ToUTF8(headerOf("text/html; charset=utf-8"), body)
@@ -354,10 +358,10 @@ func TestToUTF8InvalidUTF8Replaced(t *testing.T) {
 	}
 }
 
-// --- сжатие: decodeContentEncoding ------------------------------------------
+// --- compression: decodeContentEncoding -------------------------------------
 
-// TestDecodeContentEncoding: identity/пусто — тело как есть; gzip и br
-// распаковываются; потолок по умолчанию не режет обычные тела.
+// TestDecodeContentEncoding: identity/empty — the body as is; gzip and br
+// decompress; the default cap does not cut ordinary bodies.
 func TestDecodeContentEncoding(t *testing.T) {
 	plain := []byte(ruSample)
 
@@ -414,11 +418,11 @@ func TestDecodeContentEncoding(t *testing.T) {
 	}
 }
 
-// TestDecodeContentEncodingUnsupported: экзотика и битые составные
-// значения — ошибка (краулер рекламирует только gzip и br; одиночный
-// deflate и корректные составные значения принимаются оборонительно —
-// незапрошенно их присылает сломанный сервер, пустой или неизвестный
-// элемент в составе разобрать нельзя).
+// TestDecodeContentEncodingUnsupported: exotic and broken compound values
+// are an error (the crawler advertises only gzip and br; a single deflate
+// and correct compound values are accepted defensively — a broken server
+// sends them unrequested, and an empty or unknown element within the
+// value cannot be parsed).
 func TestDecodeContentEncodingUnsupported(t *testing.T) {
 	for _, ce := range []string{
 		"compress", "zstd", "*", "gzip, zstd", "zstd, gzip",
@@ -430,12 +434,13 @@ func TestDecodeContentEncodingUnsupported(t *testing.T) {
 	}
 }
 
-// TestDecodeContentEncodingLayered: составные Content-Encoding (T-100,
-// остаток H-10) — цепочка распаковки в порядке RFC 9110: кодировки
-// применяются сервером в порядке перечисления, последняя в списке
-// образует внешний слой («gzip, br» = сервер сжал gzip, затем поверх
-// br — тело br(gzip(data))). identity в составе — пустая операция,
-// слоя не строит; потолок на каждый слой обычные тела не режет.
+// TestDecodeContentEncodingLayered: compound Content-Encoding values
+// (T-100, remainder H-10) — a decompression chain in RFC 9110 order: the
+// codings are applied by the server in enumeration order, the last one in
+// the list forms the outermost layer ("gzip, br" = the server compressed
+// with gzip, then wrapped in br — the body is br(gzip(data))). identity in
+// a compound value is a no-op and builds no layer; the per-layer cap does
+// not cut ordinary bodies.
 func TestDecodeContentEncodingLayered(t *testing.T) {
 	plain := []byte(ruSample)
 	for _, tc := range []struct {
@@ -468,11 +473,11 @@ func TestDecodeContentEncodingLayered(t *testing.T) {
 	}
 }
 
-// TestDecodeContentEncodingLayeredBomb: сжатое-в-сжатом сверх потолка —
-// ErrDecompressTooLarge, байты до потолка доступны (контракт T-051
-// сохраняется в цепочке: итоговый слой останавливается на
-// limit + decompressTailMargin, промежуточные слои ограничены тем же
-// потолком на слой — суммарная защита от бомб не слабеет).
+// TestDecodeContentEncodingLayeredBomb: compressed-in-compressed beyond
+// the cap — ErrDecompressTooLarge, the bytes up to the cap are available
+// (the T-051 contract holds in the chain: the final layer stops at
+// limit + decompressTailMargin, intermediate layers are bounded by the
+// same per-layer cap — the total bomb protection does not weaken).
 func TestDecodeContentEncodingLayeredBomb(t *testing.T) {
 	bomb := bytes.Repeat([]byte("A"), 1<<20)
 	got, err := decodeContentEncoding(
@@ -490,7 +495,7 @@ func TestDecodeContentEncodingLayeredBomb(t *testing.T) {
 	}
 }
 
-// zlibBytes — zlib-обёртка (RFC 1950) поверх deflate.
+// zlibBytes is a zlib wrapper (RFC 1950) over deflate.
 func zlibBytes(t *testing.T, b []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -504,9 +509,9 @@ func zlibBytes(t *testing.T, b []byte) []byte {
 	return buf.Bytes()
 }
 
-// flateRawBytes — сырой deflate-поток (RFC 1951, без zlib-заголовка):
-// такую форму «Content-Encoding: deflate» отдают серверы, не читавшие
-// RFC 1950.
+// flateRawBytes is a raw deflate stream (RFC 1951, no zlib header): this
+// is the form of "Content-Encoding: deflate" served by servers that never
+// read RFC 1950.
 func flateRawBytes(t *testing.T, b []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -520,10 +525,10 @@ func flateRawBytes(t *testing.T, b []byte) []byte {
 	return buf.Bytes()
 }
 
-// TestDecodeContentEncodingBomb: распакованный поток сверх потолка —
-// ErrDecompressTooLarge, байты до потолка доступны.
+// TestDecodeContentEncodingBomb: a decompressed stream beyond the cap —
+// ErrDecompressTooLarge, the bytes up to the cap are available.
 func TestDecodeContentEncodingBomb(t *testing.T) {
-	bomb := bytes.Repeat([]byte("A"), 1<<20) // распакуется в 1 МБ
+	bomb := bytes.Repeat([]byte("A"), 1<<20) // decompresses to 1 MB
 	got, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(gzipBytes(t, bomb))), "gzip", 4096)
 	if err != nil {
 		t.Fatalf("обёртка бомбы: %v", err)
@@ -538,8 +543,8 @@ func TestDecodeContentEncodingBomb(t *testing.T) {
 	}
 }
 
-// TestDecodeContentEncodingExactLimit: тело ровно в потолок — не
-// ошибка: пробный байт за пределом получает EOF.
+// TestDecodeContentEncodingExactLimit: a body exactly at the cap is not an
+// error: the probe byte beyond it gets EOF.
 func TestDecodeContentEncodingExactLimit(t *testing.T) {
 	plain := bytes.Repeat([]byte("B"), 1000)
 	got, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(gzipBytes(t, plain))), "gzip", 1000)
@@ -553,8 +558,8 @@ func TestDecodeContentEncodingExactLimit(t *testing.T) {
 	_ = got.Close()
 }
 
-// TestDecodeContentEncodingClosesSource: Close обёртки закрывает
-// исходное тело ровно один раз (и на ошибке распаковки тоже).
+// TestDecodeContentEncodingClosesSource: the wrapper's Close closes the
+// original body exactly once (also on a decompression error).
 func TestDecodeContentEncodingClosesSource(t *testing.T) {
 	var mu sync.Mutex
 	closed := 0
@@ -575,15 +580,15 @@ func TestDecodeContentEncodingClosesSource(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	// Ошибка распаковки (битый поток) тоже обязана закрыть источник —
-	// это делает вызывающий (decodeResponseBody), проверяем договор
-	// обёртки: после чтения с ошибкой Close работает.
+	// A decompression error (a broken stream) must close the source too —
+	// the caller does it (decodeResponseBody); we check the wrapper's
+	// contract: after a read with an error, Close still works.
 	bad := append(gzipBytes(t, []byte("x")), 0xFF, 0xFF, 0xFF)
 	got2, err := decodeContentEncoding(newRC(bad), "gzip", 1<<20)
 	if err != nil {
 		t.Fatalf("обёртка битого: %v", err)
 	}
-	_, _ = io.ReadAll(got2) // ошибка потока — не важна для теста
+	_, _ = io.ReadAll(got2) // the stream error does not matter for the test
 	_ = got2.Close()
 
 	mu.Lock()
@@ -593,7 +598,7 @@ func TestDecodeContentEncodingClosesSource(t *testing.T) {
 	}
 }
 
-// countingCloser — источник с подсчётом Close.
+// countingCloser is a source that counts Close calls.
 type countingCloser struct {
 	io.Reader
 	onClose func()
@@ -604,10 +609,11 @@ func (c *countingCloser) Close() error {
 	return nil
 }
 
-// --- сжатие: сквозной путь Fetch --------------------------------------------
+// --- compression: the end-to-end Fetch path ---------------------------------
 
-// encodingServer — httptest-сервер, отдающий тело с заданным
-// Content-Encoding/Content-Type и запоминающий Accept-Encoding запроса.
+// encodingServer is an httptest server serving a body with the given
+// Content-Encoding/Content-Type and remembering the request's
+// Accept-Encoding.
 func encodingServer(t *testing.T, body []byte, hdr map[string]string) (*httptest.Server, *syncValue) {
 	t.Helper()
 	ae := &syncValue{}
@@ -622,7 +628,7 @@ func encodingServer(t *testing.T, body []byte, hdr map[string]string) (*httptest
 	return srv, ae
 }
 
-// syncValue — строка, записываемая из горутины сервера.
+// syncValue is a string written from the server goroutine.
 type syncValue struct {
 	mu sync.Mutex
 	v  string
@@ -640,7 +646,7 @@ func (s *syncValue) Get() string {
 	return s.v
 }
 
-// fetchFrom — Fetch к тестовому серверу по адресу петли.
+// fetchFrom is a Fetch to the test server at the loopback address.
 func fetchFrom(t *testing.T, f *Fetcher, rawurl string) *FetchResult {
 	t.Helper()
 	u, err := url.Parse(rawurl)
@@ -654,7 +660,7 @@ func fetchFrom(t *testing.T, f *Fetcher, rawurl string) *FetchResult {
 	return res
 }
 
-// TestFetchAcceptEncoding: транспорт отправляет Accept-Encoding: gzip, br.
+// TestFetchAcceptEncoding: the transport sends Accept-Encoding: gzip, br.
 func TestFetchAcceptEncoding(t *testing.T) {
 	srv, ae := encodingServer(t, []byte("ok"), nil)
 	f := NewFetcher(Options{})
@@ -665,9 +671,10 @@ func TestFetchAcceptEncoding(t *testing.T) {
 	}
 }
 
-// TestFetchGzipRoundtrip: сервер отдаёт gzip — потребитель читает
-// распакованное тело, кодирующие заголовки сняты (правдивый gzip-length
-// Content-Length сервера исчезает вместе с Content-Encoding).
+// TestFetchGzipRoundtrip: the server serves gzip — the consumer reads the
+// decompressed body, the coding headers are stripped (the server's
+// truthful gzip-length Content-Length disappears together with
+// Content-Encoding).
 func TestFetchGzipRoundtrip(t *testing.T) {
 	plain := "<html><body>" + ruSample + "</body></html>"
 	gz := gzipBytes(t, []byte(plain))
@@ -695,9 +702,9 @@ func TestFetchGzipRoundtrip(t *testing.T) {
 	}
 }
 
-// TestFetchBrotliRoundtrip: br распаковывается сквозным путём
-// (зависимость andybalholm/brotli: в stdlib brotli нет, а ТЗ 5.5
-// требует «Accept-Encoding: gzip, br»).
+// TestFetchBrotliRoundtrip: br decompresses through the end-to-end path
+// (the andybalholm/brotli dependency: stdlib has no brotli, while
+// spec 5.5 requires "Accept-Encoding: gzip, br").
 func TestFetchBrotliRoundtrip(t *testing.T) {
 	plain := "<html><body>" + ruSample + "</body></html>"
 	srv, _ := encodingServer(t, brotliBytes(t, []byte(plain)), map[string]string{
@@ -716,7 +723,8 @@ func TestFetchBrotliRoundtrip(t *testing.T) {
 	}
 }
 
-// TestFetchIdentityKeepsHeaders: без сжатия заголовки не трогаются.
+// TestFetchIdentityKeepsHeaders: without compression the headers are left
+// alone.
 func TestFetchIdentityKeepsHeaders(t *testing.T) {
 	srv, _ := encodingServer(t, []byte("plain"), map[string]string{
 		"Content-Type":   "text/plain",
@@ -734,11 +742,11 @@ func TestFetchIdentityKeepsHeaders(t *testing.T) {
 	}
 }
 
-// TestFetchMultiLineContentEncoding: списочный Content-Encoding,
-// разнесённый на несколько строк (RFC 9110 §5.3 — эквивалент списка
-// через запятую), собирается в одно значение: «gzip» + «br» двумя
-// строками читается как составная упаковка (Get взял бы только первую
-// строку и споткнулся о заголовок второго слоя; P2 ревью T-100).
+// TestFetchMultiLineContentEncoding: a list-form Content-Encoding spread
+// over several lines (RFC 9110 §5.3 — equivalent to the comma-separated
+// list) is assembled into a single value: "gzip" + "br" on two lines is
+// read as compound packaging (Get would take only the first line and trip
+// over the second layer's header; P2 review of T-100).
 func TestFetchMultiLineContentEncoding(t *testing.T) {
 	plain := "<html><body>" + ruSample + "</body></html>"
 	body := brotliBytes(t, gzipBytes(t, []byte(plain)))
@@ -764,9 +772,10 @@ func TestFetchMultiLineContentEncoding(t *testing.T) {
 	}
 }
 
-// TestFetchIdentityCompositeKeepsHeaders: составное значение из одних
-// identity не преобразует тело — кодирующие заголовки остаются правдой
-// и не снимаются (как у одиночного identity; P3 ревью T-100).
+// TestFetchIdentityCompositeKeepsHeaders: a compound value of only
+// identities does not transform the body — the coding headers remain
+// truthful and are not stripped (as with a single identity; P3 review of
+// T-100).
 func TestFetchIdentityCompositeKeepsHeaders(t *testing.T) {
 	body := []byte("plain-identity")
 	srv, _ := encodingServer(t, body, map[string]string{
@@ -789,8 +798,8 @@ func TestFetchIdentityCompositeKeepsHeaders(t *testing.T) {
 	}
 }
 
-// TestFetchGzipEmptyBody: Content-Encoding: gzip с пустым телом — не
-// ошибка (gzip.NewReader вернёт EOF), читается пустота.
+// TestFetchGzipEmptyBody: Content-Encoding: gzip with an empty body is not
+// an error (gzip.NewReader returns EOF); emptiness is read.
 func TestFetchGzipEmptyBody(t *testing.T) {
 	srv, _ := encodingServer(t, nil, map[string]string{"Content-Encoding": "gzip"})
 	f := NewFetcher(Options{})
@@ -805,8 +814,8 @@ func TestFetchGzipEmptyBody(t *testing.T) {
 	}
 }
 
-// TestFetchUnsupportedEncoding: сервер прислал незапрашиваемое
-// Content-Encoding — честная ошибка, не сжатые байты телом.
+// TestFetchUnsupportedEncoding: the server sent an unrequested
+// Content-Encoding — an honest error, not compressed bytes as the body.
 func TestFetchUnsupportedEncoding(t *testing.T) {
 	srv, _ := encodingServer(t, []byte("x"), map[string]string{
 		"Content-Encoding": "compress",
@@ -819,10 +828,10 @@ func TestFetchUnsupportedEncoding(t *testing.T) {
 	}
 }
 
-// TestFetchDeflateRoundtrip: незапрошенный deflate (zlib-обёртка и
-// сырой поток — историческая двусмысленность серверов) распаковывается:
-// страница не проваливается ошибкой запроса, кодирующие заголовки
-// снимаются; Accept-Encoding по-прежнему рекламирует только gzip и br.
+// TestFetchDeflateRoundtrip: an unrequested deflate (a zlib wrapper and a
+// raw stream — the historical ambiguity of servers) decompresses: the page
+// does not fail with a fetch error, the coding headers are stripped;
+// Accept-Encoding still advertises only gzip and br.
 func TestFetchDeflateRoundtrip(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -856,9 +865,10 @@ func TestFetchDeflateRoundtrip(t *testing.T) {
 	}
 }
 
-// TestFetchGzipBomb: распакованный поток превышает MaxBodyBytes —
-// чтение тела возвращает ErrDecompressTooLarge (потолок распаковки
-// стоит до лимита читаемого тела T-049, но проверяется тем же числом).
+// TestFetchGzipBomb: the decompressed stream exceeds MaxBodyBytes —
+// reading the body returns ErrDecompressTooLarge (the decompression cap
+// sits before the readable body limit of T-049 but is checked with the
+// same number).
 func TestFetchGzipBomb(t *testing.T) {
 	bomb := bytes.Repeat([]byte("A"), 1<<20)
 	srv, _ := encodingServer(t, gzipBytes(t, bomb), map[string]string{
@@ -876,10 +886,10 @@ func TestFetchGzipBomb(t *testing.T) {
 	}
 }
 
-// runBodyLimitCase — общий прогон кейса «тело vs лимит» (encodingServer
-// + Fetch + проверки обрезки): используется однослойным gzip и составной
-// упаковкой (T-100) — семантика обрезки едина, классификация хвоста идёт
-// по итоговому декодированному потоку.
+// runBodyLimitCase is a shared run of the "body vs limit" case
+// (encodingServer + Fetch + truncation checks): used by single-layer gzip
+// and compound packaging (T-100) — the truncation semantics are uniform,
+// the tail classification runs on the final decoded stream.
 func runBodyLimitCase(t *testing.T, ce string, wrap func([]byte) []byte, size, limit int, wantTrunc bool) {
 	t.Helper()
 	srv, _ := encodingServer(t, wrap(bytes.Repeat([]byte("z"), size)), map[string]string{
@@ -903,13 +913,15 @@ func runBodyLimitCase(t *testing.T, ce string, wrap func([]byte) []byte, size, l
 	}
 }
 
-// TestFetchGzipJustOverLimit: сжатое тело чуть больше лимита ведёт себя
-// как несжатое сверх лимита (TestFetchBodyLimitExactAndTruncated в
-// limits_test.go): обрезка по лимиту с Truncated и чтение без ошибки
-// (ТЗ 8 «данные частичны, статус получен»), а не ErrDecompressTooLarge,
-// который воркер прочёл бы как read-ошибку и погасил бы Available
-// живого сайта. Потолки распаковки и чтения равны (боевая сборка
-// NewOptions ставит оба из http.max_body_bytes).
+// TestFetchGzipJustOverLimit: a compressed body slightly over the limit
+// behaves like an uncompressed one over the limit
+// (TestFetchBodyLimitExactAndTruncated in limits_test.go): truncation at
+// the limit with Truncated and a read without error
+// (spec 8, "the data is partial, the status is known"), not
+// ErrDecompressTooLarge, which the worker would read as a read error and
+// zero out the Available of a live site. The decompression and read caps
+// are equal (the production NewOptions sets both from
+// http.max_body_bytes).
 func TestFetchGzipJustOverLimit(t *testing.T) {
 	run := func(t *testing.T, size, limit int, wantTrunc bool) {
 		t.Helper()
@@ -920,11 +932,11 @@ func TestFetchGzipJustOverLimit(t *testing.T) {
 	t.Run("заметно больше", func(t *testing.T) { run(t, 64<<10, 1000, true) })
 }
 
-// TestFetchLayeredJustOverLimit: составная упаковка «чуть больше
-// лимита» — как однослойная (TestFetchGzipJustOverLimit): обрезка с
-// Truncated и чтение без ошибки; классификация хвоста проходит по
-// итоговому (последнему декодированному) потоку — семантика H-2 не
-// меняется от числа слоёв.
+// TestFetchLayeredJustOverLimit: compound packaging "slightly over the
+// limit" behaves like the single-layer one (TestFetchGzipJustOverLimit):
+// truncation with Truncated and a read without error; the tail
+// classification runs on the final (last decoded) stream — the H-2
+// semantics do not depend on the number of layers.
 func TestFetchLayeredJustOverLimit(t *testing.T) {
 	run := func(t *testing.T, size, limit int, wantTrunc bool) {
 		t.Helper()
@@ -937,12 +949,13 @@ func TestFetchLayeredJustOverLimit(t *testing.T) {
 	t.Run("заметно больше", func(t *testing.T) { run(t, 64<<10, 1000, true) })
 }
 
-// TestFetchGzipBombUnderLimiter: бомба при включённых лимитах T-049 —
-// ErrDecompressTooLarge (контракт T-051: страница-бомба — ошибка тела,
-// воркер не пишет записи и гасит Available); классификация хвоста не
-// расходует бомбу дальше лимита+decompressTailMargin, тело до лимита
-// доступно. Обрезка без ошибки — только хвост в пределах маржи
-// (TestFetchGzipJustOverLimit), не бомба.
+// TestFetchGzipBombUnderLimiter: a bomb with the T-049 limits enabled —
+// ErrDecompressTooLarge (the T-051 contract: a bomb page is a body error,
+// the worker writes no records and zeroes Available); the tail
+// classification spends no more of the bomb than limit +
+// decompressTailMargin, the body up to the limit is available. Truncation
+// without an error is only a tail within the margin
+// (TestFetchGzipJustOverLimit), not a bomb.
 func TestFetchGzipBombUnderLimiter(t *testing.T) {
 	bomb := bytes.Repeat([]byte("A"), 1<<20)
 	srv, _ := encodingServer(t, gzipBytes(t, bomb), map[string]string{
@@ -964,14 +977,15 @@ func TestFetchGzipBombUnderLimiter(t *testing.T) {
 	}
 }
 
-// TestFetchLayeredRoundtrip: составное Content-Encoding сквозным путём —
-// тело распаковывается цепочкой слоёв (RFC 9110: последняя кодировка в
-// списке — внешний слой), кодирующие заголовки сняты; Accept-Encoding
-// по-прежнему рекламирует только gzip и br — составные значения не
-// запрашиваем, их присылает сломанный сервер.
+// TestFetchLayeredRoundtrip: compound Content-Encoding through the
+// end-to-end path — the body is decompressed by a chain of layers
+// (RFC 9110: the last coding in the list is the outermost layer), the
+// coding headers are stripped; Accept-Encoding still advertises only gzip
+// and br — compound values are not requested, they come from a broken
+// server.
 func TestFetchLayeredRoundtrip(t *testing.T) {
 	plain := "<html><body>" + ruSample + "</body></html>"
-	body := brotliBytes(t, gzipBytes(t, []byte(plain))) // «gzip, br»
+	body := brotliBytes(t, gzipBytes(t, []byte(plain))) // "gzip, br"
 	srv, ae := encodingServer(t, body, map[string]string{
 		"Content-Encoding": "gzip, br",
 		"Content-Type":     "text/html",
@@ -998,10 +1012,10 @@ func TestFetchLayeredRoundtrip(t *testing.T) {
 	}
 }
 
-// TestFetchLayeredBombUnderLimiter: бомба в составной упаковке при
-// включённых лимитах T-049 — ErrDecompressTooLarge, тело до лимита
-// доступно (контракт T-051 не зависит от числа слоёв: потолок на
-// каждый слой один и тот же bodyCeiling).
+// TestFetchLayeredBombUnderLimiter: a bomb in compound packaging with the
+// T-049 limits enabled — ErrDecompressTooLarge, the body up to the limit
+// is available (the T-051 contract does not depend on the number of
+// layers: the per-layer cap is the same bodyCeiling).
 func TestFetchLayeredBombUnderLimiter(t *testing.T) {
 	bomb := bytes.Repeat([]byte("A"), 1<<20)
 	srv, _ := encodingServer(t, brotliBytes(t, gzipBytes(t, bomb)), map[string]string{
@@ -1023,18 +1037,19 @@ func TestFetchLayeredBombUnderLimiter(t *testing.T) {
 	}
 }
 
-// TestFetchDecompressCeilingFollowsLimiter: потолок распаковки и лимит
-// чтения — одно число из одного источника: при включённых лимитах
-// T-049 это Limits.MaxBodyBytes, Options.MaxBodyBytes на распаковку не
-// влияет (два независимых поля в ручной сборке Options расходились —
-// распаковка резала тело по своему числу до лимитёра).
+// TestFetchDecompressCeilingFollowsLimiter: the decompression cap and the
+// read limit are one number from one source: with the T-049 limits
+// enabled it is Limits.MaxBodyBytes; Options.MaxBodyBytes does not affect
+// decompression (two independent fields diverged in a manually assembled
+// Options — decompression cut the body by its own number before the
+// limiter).
 func TestFetchDecompressCeilingFollowsLimiter(t *testing.T) {
-	page := bytes.Repeat([]byte("q"), 1000) // меньше лимита лимитёра
+	page := bytes.Repeat([]byte("q"), 1000) // below the limiter's limit
 	srv, _ := encodingServer(t, gzipBytes(t, page), map[string]string{
 		"Content-Encoding": "gzip",
 	})
 	f := NewFetcher(Options{
-		MaxBodyBytes: 500, // ловушка: не источник при включённых Limits
+		MaxBodyBytes: 500, // a trap: not the source when Limits is set
 		Limits:       &LimitOptions{MaxBodyBytes: 1500},
 	})
 	res := fetchFrom(t, f, srv.URL)
@@ -1051,10 +1066,10 @@ func TestFetchDecompressCeilingFollowsLimiter(t *testing.T) {
 	}
 }
 
-// TestFetchGzipCharsetChain: сжатие + кодировка вместе: gzip поверх
-// windows-1251, заголовок объявляет charset — после Fetch и ToUTF8
-// потребитель видит русский UTF-8 (хэш дедупа и raw_len хранилища
-// считаются по этим байтам).
+// TestFetchGzipCharsetChain: compression + charset together: gzip over
+// windows-1251, the header declares the charset — after Fetch and ToUTF8
+// the consumer sees Russian UTF-8 (the dedup hash and the storage raw_len
+// are computed over these bytes).
 func TestFetchGzipCharsetChain(t *testing.T) {
 	page := `<html><head><meta charset="windows-1251"></head><body>` + ruSample + `</body></html>`
 	srv, _ := encodingServer(t, gzipBytes(t, encodeBytes(t, charmap.Windows1251, page)), map[string]string{
@@ -1078,9 +1093,9 @@ func TestFetchGzipCharsetChain(t *testing.T) {
 	}
 }
 
-// TestRoundTripDecompresses: прямой RoundTrip (путь http.Client/T-048)
-// тоже ставит Accept-Encoding и распаковывает; собственное значение
-// Accept-Encoding запроса не затирается.
+// TestRoundTripDecompresses: a direct RoundTrip (the
+// http.Client/T-048 path) also sets Accept-Encoding and decompresses; the
+// caller's own Accept-Encoding value is not overwritten.
 func TestRoundTripDecompresses(t *testing.T) {
 	ae := &syncValue{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1108,8 +1123,8 @@ func TestRoundTripDecompresses(t *testing.T) {
 		t.Errorf("Accept-Encoding: %q", ae.Get())
 	}
 
-	// Свой Accept-Encoding вызывающего не трогаем (клонируем запрос,
-	// не переписываем): identity остаётся identity.
+	// The caller's own Accept-Encoding is left alone (the request is
+	// cloned, not rewritten): identity stays identity.
 	ae2 := &syncValue{}
 	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ae2.Set(r.Header.Get("Accept-Encoding"))

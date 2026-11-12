@@ -1,8 +1,9 @@
-// Тесты эвристики SPA-оболочки (T-057; ТЗ 5.5 п. 8, ТЗ 13.2).
-// Чистая функция: входы — типовые каркасы фреймворков, классические
-// страницы и комбинации таблицы решений; отдельные проверки — порог
-// видимого текста, варианты написания атрибутов, отрицательные формы
-// JS-редиректа, не-HTML мусор и нулевые аллокации скана.
+// SPA shell heuristic tests (T-057; spec 5.5 item 8, spec 13.2).
+// A pure function: the inputs are typical framework shells, classic
+// pages, and the decision table combinations; separate checks — the
+// visible text threshold, attribute spelling variants, the negative
+// forms of a JS redirect, non-HTML junk, and the scan's zero
+// allocations.
 
 package httpfetch
 
@@ -13,12 +14,12 @@ import (
 	"testing"
 )
 
-// --- вспомогательные --------------------------------------------------------
+// --- helpers -----------------------------------------------------------------
 
-// spaTablePage — страница с контролируемыми признаками: visible —
-// точное число видимых символов (текст одного <p>; других видимых
-// узлов нет), container/noscript/jsRedirect/metaRefresh — включение
-// соответствующего признака.
+// spaTablePage is a page with controlled signs: visible is the exact
+// number of visible characters (the text of a single <p>; no other
+// visible nodes), container/noscript/jsRedirect/metaRefresh switch the
+// corresponding sign on.
 func spaTablePage(visible int, container, noscript, jsRedirect, metaRefresh bool) []byte {
 	var sb strings.Builder
 	sb.WriteString("<!DOCTYPE html><html><head><title></title>")
@@ -45,8 +46,8 @@ func spaTablePage(visible int, container, noscript, jsRedirect, metaRefresh bool
 	return []byte(sb.String())
 }
 
-// spaReasonsOf — ожидаемые признаки в каноническом порядке DetectSPA
-// (порядок перечисления ТЗ 5.5 п. 8).
+// spaReasonsOf is the expected signs in DetectSPA's canonical order (the
+// enumeration order of spec 5.5 item 8).
 func spaCheckVerdict(t *testing.T, html []byte, wantSPA bool, wantReasons ...SPAReason) SPAVerdict {
 	t.Helper()
 	v := DetectSPA(html)
@@ -61,7 +62,7 @@ func spaCheckVerdict(t *testing.T, html []byte, wantSPA bool, wantReasons ...SPA
 	return v
 }
 
-// --- каркасы фреймворков ----------------------------------------------------
+// --- framework shells -------------------------------------------------------
 
 func TestDetectSPAFrameworkShells(t *testing.T) {
 	t.Run("React create-react-app", func(t *testing.T) {
@@ -79,7 +80,7 @@ func TestDetectSPAFrameworkShells(t *testing.T) {
   </body>
 </html>`)
 		v := spaCheckVerdict(t, html, true, SPAReasonLowText, SPAReasonRootContainer, SPAReasonNoScriptJS)
-		if v.VisibleText != 8 { // «ReactApp» без пробела: 5 + 3
+		if v.VisibleText != 8 { // "ReactApp" without a space: 5 + 3
 			t.Errorf("VisibleText = %d, ожидалось 8", v.VisibleText)
 		}
 	})
@@ -90,7 +91,8 @@ func TestDetectSPAFrameworkShells(t *testing.T) {
 <body><div id="__next"></div><script id="__NEXT_DATA__" type="application/json">
 {"props":{"pageProps":{"items":[]}},"page":"/","query":{},"buildId":"Xy9_"}</script>
 <script src="/_next/static/chunks/main.js" async=""></script></body></html>`)
-		// Контент целиком в __NEXT_DATA__ (script — не видимый текст).
+		// The content is entirely in __NEXT_DATA__ (script — not visible
+		// text).
 		spaCheckVerdict(t, html, true, SPAReasonLowText, SPAReasonRootContainer)
 	})
 
@@ -108,7 +110,7 @@ func TestDetectSPAFrameworkShells(t *testing.T) {
 	})
 
 	t.Run("фикстура стенда spa-shell (deploy/docker/testbed)", func(t *testing.T) {
-		// Каноническая форма интеграционного стенда (T-060/T-090).
+		// The canonical form of the integration bench (T-060/T-090).
 		html := []byte(`<!DOCTYPE html>
 <html lang="ru">
 <head><meta charset="utf-8"><title>spa-shell.crawl.test</title></head>
@@ -125,17 +127,17 @@ func TestDetectSPAFrameworkShells(t *testing.T) {
 </body>
 </html>`)
 		v := spaCheckVerdict(t, html, true, SPAReasonLowText, SPAReasonRootContainer, SPAReasonNoScriptJS)
-		if v.VisibleText != 20 { // «spa-shell.crawl.test»
+		if v.VisibleText != 20 { // "spa-shell.crawl.test"
 			t.Errorf("VisibleText = %d, ожидалось 20", v.VisibleText)
 		}
 	})
 }
 
-// --- таблица решений ---------------------------------------------------------
+// --- the decision table -------------------------------------------------------
 
 func TestDetectSPADecisionTable(t *testing.T) {
-	const rich = 5000 // заведомо много текста
-	const poor = 50   // заведомо мало
+	const rich = 5000 // deliberately a lot of text
+	const poor = 50   // deliberately little
 	t.Run("1 JS-редирект достаточен при богатом тексте", func(t *testing.T) {
 		spaCheckVerdict(t, spaTablePage(rich, false, false, true, false), true, SPAReasonJSRedirect)
 	})
@@ -170,15 +172,15 @@ func TestDetectSPADecisionTable(t *testing.T) {
 	})
 }
 
-// --- порог видимого текста ---------------------------------------------------
+// --- the visible text threshold ---------------------------------------------
 
 func TestDetectSPAVisibleThreshold(t *testing.T) {
 	for _, tc := range []struct {
 		n       int
 		wantSPA bool
 	}{
-		{299, true},  // меньше порога — «мало»
-		{300, false}, // равно порогу — уже не «меньше»
+		{299, true},  // below the threshold — "little"
+		{300, false}, // at the threshold — no longer "less"
 		{301, false},
 	} {
 		html := []byte(`<html><body><div id="app">` + strings.Repeat("a", tc.n) + `</div></body></html>`)
@@ -192,7 +194,7 @@ func TestDetectSPAVisibleThreshold(t *testing.T) {
 	}
 }
 
-// --- корневой контейнер: написание атрибута ----------------------------------
+// --- the root container: attribute spelling ----------------------------------
 
 func TestDetectSPARootContainerAttrForms(t *testing.T) {
 	for _, tc := range []struct {
@@ -211,8 +213,8 @@ func TestDetectSPARootContainerAttrForms(t *testing.T) {
 		{"id не корневой", `<div id="content">`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Богатый текст: изолирует проверку атрибута от пары
-			// «мало текста + контейнер» (строка 3 таблицы решений).
+			// Rich text: isolates the attribute check from the pair
+			// "little text + a container" (row 3 of the decision table).
 			html := []byte(`<html><body>` + tc.tag + `<p>` +
 				strings.Repeat("a", 500) + `</p></body></html>`)
 			var want []SPAReason
@@ -244,8 +246,8 @@ func TestDetectSPANoScript(t *testing.T) {
 		spaCheckVerdict(t, html, false, SPAReasonLowText)
 	})
 	t.Run("текст требования за пределами лимита не читается", func(t *testing.T) {
-		// Первые spaNoScriptLimit байтов — без ключей (длинный фолбэк),
-		// требование JS — в самом конце за окном скана.
+		// The first spaNoScriptLimit bytes hold no keys (a long fallback);
+		// the JS demand sits at the very end, outside the scan window.
 		filler := strings.Repeat("ф", spaNoScriptLimit)
 		html := []byte(`<html><body><p>ок</p><noscript>` + filler +
 			` включите js</noscript></body></html>`)
@@ -253,7 +255,7 @@ func TestDetectSPANoScript(t *testing.T) {
 	})
 }
 
-// --- JS-редирект --------------------------------------------------------------
+// --- JS redirect ---------------------------------------------------------------
 
 func TestDetectSPAJSRedirect(t *testing.T) {
 	tail := `</p>` + strings.Repeat("b", 5000) + `</body></html>`
@@ -322,7 +324,7 @@ func TestDetectSPAMetaRefresh(t *testing.T) {
 	})
 }
 
-// --- не-HTML и вырожденные входы -----------------------------------------------
+// --- non-HTML and degenerate inputs --------------------------------------------
 
 func TestDetectSPADegenerate(t *testing.T) {
 	t.Run("пустое тело", func(t *testing.T) {
@@ -335,11 +337,11 @@ func TestDetectSPADegenerate(t *testing.T) {
 		spaCheckVerdict(t, []byte(" \n\t\r\n "), false, SPAReasonLowText)
 	})
 	t.Run("бинарный мусор", func(t *testing.T) {
-		// Детерминированный псевдослучайный буфер с байтами разметки;
-		// UTF-8 входу обеспечивает T-051, скан не должен паниковать.
-		// «Не SPA» безусловно: ни контейнера, ни noscript, ни
-		// location-слова (шаг арифметики 7 ≠ 3 не даёт «lo»),
-		// ни meta; «мало текста» в одиночку не решает (строка 5).
+		// A deterministic pseudo-random buffer with markup bytes; UTF-8 of
+		// the input is guaranteed by T-051, the scan must not panic.
+		// "Not SPA" unconditionally: no container, no noscript, no
+		// location word (the arithmetic step 7 ≠ 3 yields no "lo"), and no
+		// meta; "little text" alone does not decide (row 5).
 		garbage := make([]byte, 512)
 		for i := range garbage {
 			garbage[i] = byte((i*7 + 3) % 256)
@@ -367,22 +369,22 @@ func TestDetectSPADegenerate(t *testing.T) {
 	})
 }
 
-// --- подсчёт видимого текста ----------------------------------------------------
+// --- visible text counting ------------------------------------------------------
 
 func TestDetectSPAVisibleCounting(t *testing.T) {
 	t.Run("script, style, noscript, комментарии — не текст", func(t *testing.T) {
 		html := []byte(`<html><head><style>body { color: red; }</style></head>` +
 			`<body><!-- служебный комментарий --><script>var x = "текст в скрипте";</script>` +
 			`<noscript>enable js</noscript><p>abc</p></body></html>`)
-		// «мало текста + noscript» — строка 4 таблицы решений: SPA.
+		// "little text + noscript" — row 4 of the decision table: SPA.
 		v := spaCheckVerdict(t, html, true, SPAReasonLowText, SPAReasonNoScriptJS)
 		if v.VisibleText != 3 {
 			t.Errorf("VisibleText = %d, ожидалось 3", v.VisibleText)
 		}
 	})
 	t.Run("кириллица считается байтами", func(t *testing.T) {
-		// 150 кириллических символов = 300 байт: порог по байтам
-		// консервативнее, чем по рунам.
+		// 150 Cyrillic characters = 300 bytes: a byte-based threshold is
+		// more conservative than a rune-based one.
 		html := []byte(`<html><body><p>` + strings.Repeat("ф", 150) + `</p></body></html>`)
 		v := DetectSPA(html)
 		if v.VisibleText != 300 {
@@ -407,13 +409,13 @@ func TestDetectSPAVisibleCounting(t *testing.T) {
 	})
 }
 
-// --- производительность: один проход без аллокаций -------------------------------
+// --- performance: a single pass with no allocations -----------------------------
 
 func TestDetectSPAScanAllocations(t *testing.T) {
-	// Тихая страница (без признаков): нет причин для append, нет
-	// найденных атрибутов — скан не аллоцирует вообще. Закрепляет
-	// «один проход без копий тела» (ТЗ 13.2 — деталь реализации).
-	page := bytes.Repeat([]byte("<p>обычный текст без признаков</p>"), 40000) // ~1.2 МБ
+	// A quiet page (no signs): no reason to append, no attributes found —
+	// the scan allocates nothing at all. It pins the "single pass with no
+	// body copies" behavior (spec 13.2 — an implementation detail).
+	page := bytes.Repeat([]byte("<p>обычный текст без признаков</p>"), 40000) // ~1.2 MB
 	if v := DetectSPA(page); v.SPA || len(v.Reasons) != 0 {
 		t.Fatalf("тихая страница дала признаки: %v", v.Reasons)
 	}

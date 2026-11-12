@@ -1,12 +1,12 @@
-// Тесты TLS-разбора (T-050, ТЗ 5.5 п. 3, §8). Два уровня:
+// TLS parsing tests (T-050, spec 5.5 item 3, §8). Two levels:
 //
-//   - прямые вызовы newTLSInfoAt на рукотворных tls.ConnectionState:
-//     заглушаемые часы (expired/not_yet_valid), SAN-матч/мисматч
-//     (VerifyHostname, включая CN-fallback и wildcard), самоподписанность,
-//     извлечение полей и цепочки;
-//   - сквозной Fetch через httptest TLS-серверы с сертификатами,
-//     выпущенными собственным мини-CA (crypto/x509.CreateCertificate):
-//     самоподписанный сервер, цепочка лист+CA, http без TLS.
+//   - direct newTLSInfoAt calls on handmade tls.ConnectionState values:
+//     mockable clocks (expired/not_yet_valid), SAN match/mismatch
+//     (VerifyHostname, including the CN fallback and wildcards),
+//     self-signedness, field and chain extraction;
+//   - an end-to-end Fetch through httptest TLS servers with certificates
+//     issued by the tests' own mini-CA (crypto/x509.CreateCertificate):
+//     a self-signed server, a leaf+CA chain, http without TLS.
 
 package httpfetch
 
@@ -31,16 +31,16 @@ import (
 	"time"
 )
 
-// --- вспомогательные: собственный мини-PKI -----------------------------------
+// --- helpers: the tests' own mini-PKI ----------------------------------------
 
-// tlsTestCA — самодельный удостоверяющий центр тестов: выпускает
-// листовые сертификаты без внешних зависимостей и сети.
+// tlsTestCA is the tests' homemade certificate authority: it issues leaf
+// certificates without external dependencies or the network.
 type tlsTestCA struct {
 	cert *x509.Certificate
 	key  ed25519.PrivateKey
 }
 
-// newTLSTestCA — самоподписанный CA (CN cn, O "tlsinfo tests").
+// newTLSTestCA is a self-signed CA (CN cn, O "tlsinfo tests").
 func newTLSTestCA(t *testing.T, cn string) *tlsTestCA {
 	t.Helper()
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
@@ -67,9 +67,9 @@ func newTLSTestCA(t *testing.T, cn string) *tlsTestCA {
 	return &tlsTestCA{cert: cert, key: key}
 }
 
-// issueTLSLeaf выпускает листовой сертификат (SAN dnsNames/ips, окно
-// действия notBefore…notAfter, O "Leaf Org", серийный 0x2a). Подпись —
-// родителем; parent nil — самоподписанный.
+// issueTLSLeaf issues a leaf certificate (the SAN dnsNames/ips, the
+// validity window notBefore…notAfter, O "Leaf Org", serial 0x2a). Signed
+// by the parent; a nil parent means self-signed.
 func issueTLSLeaf(t *testing.T, parent *x509.Certificate, parentKey crypto.Signer, cn string,
 	dnsNames []string, ips []net.IP, notBefore, notAfter time.Time,
 ) (*x509.Certificate, ed25519.PrivateKey) {
@@ -104,13 +104,15 @@ func issueTLSLeaf(t *testing.T, parent *x509.Certificate, parentKey crypto.Signe
 	return cert, key
 }
 
-// tlsChainState — состояние соединения с цепочкой сервера (лист первый).
+// tlsChainState is a connection state with a server chain (the leaf
+// first).
 func tlsChainState(certs ...*x509.Certificate) *tls.ConnectionState {
 	return &tls.ConnectionState{PeerCertificates: certs}
 }
 
-// tlsServerWithChain — httptest TLS-сервер, отдающий заданную цепочку
-// (Certificate[0] — лист, далее посредники; как реальный веб-сервер).
+// tlsServerWithChain is an httptest TLS server serving the given chain
+// (Certificate[0] is the leaf, then intermediaries; like a real web
+// server).
 func tlsServerWithChain(t *testing.T, chain tls.Certificate) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -122,8 +124,8 @@ func tlsServerWithChain(t *testing.T, chain tls.Certificate) *httptest.Server {
 	return srv
 }
 
-// fetchInsecure — Fetch с InsecureSkipVerify (ТЗ 5.5 п. 3: коннект
-// всегда незащищённо-верифицируемый, проверку делает NewTLSInfo).
+// fetchInsecure is a Fetch with InsecureSkipVerify (spec 5.5 item 3: the
+// connect is always insecurely verified; NewTLSInfo does the checking).
 func fetchInsecure(t *testing.T, rawurl string) *FetchResult {
 	t.Helper()
 	u, err := url.Parse(rawurl)
@@ -139,11 +141,11 @@ func fetchInsecure(t *testing.T, rawurl string) *FetchResult {
 	return res
 }
 
-// --- заглушаемые часы: окно действия ------------------------------------------
+// --- mockable clocks: the validity window ------------------------------------
 
-// TestTLSInfoVerificationWindow: сертификат в окне — valid; до NotBefore
-// — not_yet_valid; после NotAfter — expired. Часы подменяются
-// (newTLSInfoAt), реальное время теста не влияет.
+// TestTLSInfoVerificationWindow: a certificate within the window is
+// valid; before NotBefore — not_yet_valid; after NotAfter — expired. The
+// clocks are mocked (newTLSInfoAt); the test's real time has no effect.
 func TestTLSInfoVerificationWindow(t *testing.T) {
 	ca := newTLSTestCA(t, "Window CA")
 	notBefore := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -155,7 +157,7 @@ func TestTLSInfoVerificationWindow(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		now  time.Time
-		want TLSProblem // "" — без причин
+		want TLSProblem // "" — no reasons
 	}{
 		{"до окна", notBefore.Add(-time.Hour), TLSProblemNotYetValid},
 		{"внутри окна", notBefore.Add(12 * time.Hour), ""},
@@ -182,10 +184,11 @@ func TestTLSInfoVerificationWindow(t *testing.T) {
 	}
 }
 
-// --- домен в SAN/CN -----------------------------------------------------------
+// --- the domain in SAN/CN -----------------------------------------------------
 
-// TestTLSInfoHostnameMatch: SAN-матч (включая wildcard и IP) — valid;
-// мисматч — hostname_mismatch; без SAN имя ищется в CN.
+// TestTLSInfoHostnameMatch: an SAN match (including wildcard and IP) is
+// valid; a mismatch is hostname_mismatch; without SAN the name is looked
+// up in the CN.
 func TestTLSInfoHostnameMatch(t *testing.T) {
 	ca := newTLSTestCA(t, "Hostname CA")
 	now := time.Now()
@@ -195,7 +198,7 @@ func TestTLSInfoHostnameMatch(t *testing.T) {
 
 	for _, tc := range []struct {
 		host     string
-		wantProb TLSProblem // "" — без причин
+		wantProb TLSProblem // "" — no reasons
 	}{
 		{"other.example.net", ""},
 		{"sub.wild.example.net", ""},
@@ -213,7 +216,8 @@ func TestTLSInfoHostnameMatch(t *testing.T) {
 		}
 	}
 
-	// SAN-миссия и CN-fallback: без SAN совсем имя берётся из CN.
+	// A SAN miss and the CN fallback: with no SAN at all the name is taken
+	// from the CN.
 	cnLeaf, _ := issueTLSLeaf(t, ca.cert, ca.key, "legacy.example.net",
 		nil, nil, now.Add(-time.Hour), now.Add(time.Hour))
 	for host, wantValid := range map[string]bool{
@@ -226,7 +230,7 @@ func TestTLSInfoHostnameMatch(t *testing.T) {
 		}
 	}
 
-	// IP-хост (подключение к IP-литералу): SAN iPAddress.
+	// An IP host (connecting to an IP literal): the SAN iPAddress.
 	ipLeaf, _ := issueTLSLeaf(t, ca.cert, ca.key, "ip.example.net",
 		nil, []net.IP{net.ParseIP("127.0.0.1")}, now.Add(-time.Hour), now.Add(time.Hour))
 	for host, wantValid := range map[string]bool{
@@ -240,11 +244,11 @@ func TestTLSInfoHostnameMatch(t *testing.T) {
 	}
 }
 
-// --- самоподписанность --------------------------------------------------------
+// --- self-signedness ---------------------------------------------------------
 
-// TestTLSInfoSelfSigned: лист подписан собственным ключом — invalid с
-// причиной self_signed (стандартная верификация такой сертификат не
-// пропускает), поле SelfSigned выставлено.
+// TestTLSInfoSelfSigned: a leaf signed by its own key is invalid with the
+// self_signed reason (standard verification does not let such a
+// certificate through) and the SelfSigned field is set.
 func TestTLSInfoSelfSigned(t *testing.T) {
 	now := time.Now()
 	leaf, _ := issueTLSLeaf(t, nil, nil, "self.example.net",
@@ -267,11 +271,11 @@ func TestTLSInfoSelfSigned(t *testing.T) {
 	}
 }
 
-// --- извлечение полей ---------------------------------------------------------
+// --- field extraction ---------------------------------------------------------
 
-// TestTLSInfoFields: издатель/субъект (CN, O), серийный номер (hex),
-// окно действия, SAN (DNS и IP), цепочка (длина, субъекты), JSON-теги
-// для колонки subdomain_results.tls (ТЗ 6.1).
+// TestTLSInfoFields: issuer/subject (CN, O), the serial number (hex), the
+// validity window, the SAN (DNS and IP), the chain (length, subjects), and
+// the JSON tags for the subdomain_results.tls column (spec 6.1).
 func TestTLSInfoFields(t *testing.T) {
 	ca := newTLSTestCA(t, "Fields CA")
 	notBefore := time.Date(2031, 6, 1, 0, 0, 0, 0, time.UTC)
@@ -315,8 +319,8 @@ func TestTLSInfoFields(t *testing.T) {
 		t.Errorf("CA-подписанный сертификат в окне: valid=%v self_signed=%v, ожидалось true/false", info.Valid, info.SelfSigned)
 	}
 
-	// JSON-теги: колонка subdomain_results.tls (jsonb) — сериализация
-	// стабильна, пустые проблемы опускаются (omitempty).
+	// JSON tags: the subdomain_results.tls column (jsonb) — the
+	// serialization is stable, empty problems are omitted (omitempty).
 	b, err := json.Marshal(info)
 	if err != nil {
 		t.Fatalf("json: %v", err)
@@ -335,8 +339,8 @@ func TestTLSInfoFields(t *testing.T) {
 	}
 }
 
-// TestTLSInfoNoTLS: соединение без TLS (http) или без сертификатов
-// сервера — nil, не ошибка (§8).
+// TestTLSInfoNoTLS: a connection without TLS (http) or without server
+// certificates is nil, not an error (§8).
 func TestTLSInfoNoTLS(t *testing.T) {
 	if got := NewTLSInfo(nil, "x.example.net"); got != nil {
 		t.Errorf("nil-состояние: получено %v", got)
@@ -346,11 +350,11 @@ func TestTLSInfoNoTLS(t *testing.T) {
 	}
 }
 
-// --- сквозной Fetch ------------------------------------------------------------
+// --- end-to-end Fetch -----------------------------------------------------------
 
-// TestFetchTLSInfoSelfSigned: самоподписанный сервер — соединение
-// установлено (InsecureSkipVerify), TLSInfo собран и помечает причину
-// self_signed.
+// TestFetchTLSInfoSelfSigned: a self-signed server — the connection is
+// established (InsecureSkipVerify), the TLSInfo is assembled and marks the
+// self_signed reason.
 func TestFetchTLSInfoSelfSigned(t *testing.T) {
 	now := time.Now()
 	leaf, key := issueTLSLeaf(t, nil, nil, "self.example.net",
@@ -376,9 +380,9 @@ func TestFetchTLSInfoSelfSigned(t *testing.T) {
 	}
 }
 
-// TestFetchTLSInfoChainAndHostname: сервер с цепочкой лист+CA —
-// Fetch заполняет TLSInfo по хосту URL (SNI/Host): матч — valid,
-// цепочка видна целиком; мисматч — hostname_mismatch.
+// TestFetchTLSInfoChainAndHostname: a server with a leaf+CA chain — the
+// Fetch fills TLSInfo by the URL's host (SNI/Host): a match is valid, the
+// chain is visible in full; a mismatch is hostname_mismatch.
 func TestFetchTLSInfoChainAndHostname(t *testing.T) {
 	ca := newTLSTestCA(t, "Chain CA")
 	now := time.Now()
@@ -421,7 +425,7 @@ func TestFetchTLSInfoChainAndHostname(t *testing.T) {
 	}
 }
 
-// TestFetchTLSInfoPlainHTTP: http-ответ — TLS и TLSInfo отсутствуют.
+// TestFetchTLSInfoPlainHTTP: an http response has no TLS and no TLSInfo.
 func TestFetchTLSInfoPlainHTTP(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprint(w, "plain")
@@ -434,17 +438,17 @@ func TestFetchTLSInfoPlainHTTP(t *testing.T) {
 	}
 }
 
-// --- классификация ошибок (§8) --------------------------------------------------
+// --- error classification (§8) --------------------------------------------------
 
-// tlsTestNetError — сетевая ошибка (таймаут) для классификации.
+// tlsTestNetError is a network error (a timeout) for classification.
 type tlsTestNetError struct{}
 
 func (tlsTestNetError) Error() string   { return "i/o timeout" }
 func (tlsTestNetError) Timeout() bool   { return true }
 func (tlsTestNetError) Temporary() bool { return true }
 
-// TestIsTLSCertError: ошибки сертификата/протокола TLS отличимы от
-// сетевых (таймауты, отмена) и прочих.
+// TestIsTLSCertError: certificate/TLS protocol errors are distinguishable
+// from network ones (timeouts, cancellation) and others.
 func TestIsTLSCertError(t *testing.T) {
 	cert := &x509.Certificate{}
 	verifyErr := &tls.CertificateVerificationError{Err: errors.New("проверка не прошла")}

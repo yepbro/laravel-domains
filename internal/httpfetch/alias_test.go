@@ -7,7 +7,7 @@ import (
 	"crawler/internal/model"
 )
 
-// aliasHash — тестовый хэш контента (16 байт, как content.HashOf).
+// aliasHash is a test content hash (16 bytes, like content.HashOf).
 func aliasHash(b byte) []byte {
 	h := make([]byte, 16)
 	for i := range h {
@@ -16,8 +16,8 @@ func aliasHash(b byte) []byte {
 	return h
 }
 
-// aliasGot — компактное представление решения для сравнения:
-// kind, субдомен-оригинал (−1 — nil), признак хранения контента.
+// aliasGot is a compact representation of a decision for comparison:
+// the kind, the original subdomain (−1 is nil), and the store-content flag.
 type aliasGot struct {
 	kind  model.AliasKind
 	orig  int
@@ -49,9 +49,10 @@ func aliasResults(t *testing.T, domain string, in []AliasInput) []aliasGot {
 }
 
 func TestDetectAliasesBareToWWW(t *testing.T) {
-	// Классика ТЗ 11.1/тестбед (ApexRedirect): bare редиректит на www,
-	// итоговый URL обоих — адрес www. www — оригинал (дома), bare —
-	// редирект на другой субдомен: alias_kind = 2, контент один раз.
+	// The classic spec 11.1/testbed case (ApexRedirect): bare redirects to
+	// www, the final URL of both is www's address. www is the original (at
+	// home), bare is a redirect to another subdomain: alias_kind = 2,
+	// content stored once.
 	in := []AliasInput{
 		{SubdomainID: 0, Label: "", FinalHost: "www.example.com", FinalPath: "/",
 			Scheme: model.SchemeHTTPS, Variant: model.VariantMain, ContentHash: aliasHash(1)},
@@ -68,7 +69,7 @@ func TestDetectAliasesBareToWWW(t *testing.T) {
 }
 
 func TestDetectAliasesWWWToBare(t *testing.T) {
-	// Обратная классика (тестбед WWWRedirect): www редиректит на bare.
+	// The reverse classic (testbed WWWRedirect): www redirects to bare.
 	in := []AliasInput{
 		{SubdomainID: 0, Label: "", FinalHost: "example.com", FinalPath: "/",
 			Scheme: model.SchemeHTTPS, Variant: model.VariantMain, ContentHash: aliasHash(2)},
@@ -85,9 +86,9 @@ func TestDetectAliasesWWWToBare(t *testing.T) {
 }
 
 func TestDetectAliasesSameHashDifferentURLs(t *testing.T) {
-	// Парковка/заглушка (ТЗ 5.7, §8): разные итоговые адреса (каждый
-	// у себя), одинаковый хэш — идентичны, оригинал — минимальный
-	// subdomain_id (апекс приоритетен), контент один раз.
+	// Parking/placeholder (spec 5.7, §8): different final addresses (each
+	// at its own), the same hash — identical, the original is the minimal
+	// subdomain_id (the apex has priority), content stored once.
 	in := []AliasInput{
 		{SubdomainID: 0, Label: "", FinalHost: "example.com", FinalPath: "/",
 			Scheme: model.SchemeHTTP, Variant: model.VariantMain, ContentHash: aliasHash(7)},
@@ -105,8 +106,8 @@ func TestDetectAliasesSameHashDifferentURLs(t *testing.T) {
 
 func TestDetectAliasesChainOfThree(t *testing.T) {
 	t.Run("редирект-цепочка a→b→c", func(t *testing.T) {
-		// a и b съезжаются на адрес c, c дома: оригинал один (c),
-		// оба алиаса — редиректы на него.
+		// a and b converge on c's address, c is at home: a single original
+		// (c), both aliases are redirects to it.
 		in := []AliasInput{
 			{SubdomainID: 2, Label: "admin", FinalHost: "api.example.com", FinalPath: "/",
 				Scheme: model.SchemeHTTPS, Variant: model.VariantMain, ContentHash: aliasHash(3)},
@@ -126,8 +127,8 @@ func TestDetectAliasesChainOfThree(t *testing.T) {
 	})
 
 	t.Run("хэш-цепочка a=b=c", func(t *testing.T) {
-		// Все трое дома с одинаковым контентом: класс один, оригинал —
-		// минимальный subdomain_id, остальные идентичны.
+		// All three are at home with identical content: one class, the
+		// original is the minimal subdomain_id, the rest are identical.
 		in := []AliasInput{
 			{SubdomainID: 3, Label: "api", FinalHost: "api.example.com", FinalPath: "/",
 				Scheme: model.SchemeHTTP, Variant: model.VariantMain, ContentHash: aliasHash(5)},
@@ -148,7 +149,8 @@ func TestDetectAliasesChainOfThree(t *testing.T) {
 }
 
 func TestDetectAliasesNilHashURLCriterion(t *testing.T) {
-	// Субдомены без контента (хэш nil у обоих): работает URL-критерий.
+	// Subdomains without content (nil hash for both): the URL criterion
+	// applies.
 	in := []AliasInput{
 		{SubdomainID: 0, Label: "", FinalHost: "www.example.com", FinalPath: "/en",
 			Scheme: model.SchemeHTTPS, Variant: model.VariantMain},
@@ -157,7 +159,7 @@ func TestDetectAliasesNilHashURLCriterion(t *testing.T) {
 	}
 	want := []aliasGot{
 		{kind: model.AliasRedirect, orig: 1, store: false},
-		{kind: model.AliasNone, orig: -1, store: false}, // контента нет — хранить нечего
+		{kind: model.AliasNone, orig: -1, store: false}, // no content — nothing to store
 	}
 	if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
 		t.Errorf("nil-хэш, URL-критерий: got %+v, want %+v", got, want)
@@ -165,8 +167,8 @@ func TestDetectAliasesNilHashURLCriterion(t *testing.T) {
 }
 
 func TestDetectAliasesNoMatches(t *testing.T) {
-	// Независимые субдомены: alias_kind 0, без ссылок; контент —
-	// каждый свой; запись без хэша не хранит ничего.
+	// Independent subdomains: alias_kind 0, no references; the content
+	// belongs to each; a record without a hash stores nothing.
 	in := []AliasInput{
 		{SubdomainID: 0, Label: "", FinalHost: "example.com", FinalPath: "/",
 			Scheme: model.SchemeHTTPS, Variant: model.VariantMain, ContentHash: aliasHash(1)},
@@ -187,8 +189,8 @@ func TestDetectAliasesNoMatches(t *testing.T) {
 
 func TestDetectAliasesOriginChoice(t *testing.T) {
 	t.Run("одинаковый контент без редиректа — оригинал апекс", func(t *testing.T) {
-		// Тестбед WWWSame: оба дома, один хэш. Минимальный
-		// subdomain_id — апекс (0), www идентичен ему.
+		// Testbed WWWSame: both at home, one hash. The minimal
+		// subdomain_id is the apex (0), www is identical to it.
 		in := []AliasInput{
 			{SubdomainID: 1, Label: "www", FinalHost: "www.example.com", FinalPath: "/",
 				Scheme: model.SchemeHTTP, Variant: model.VariantMain, ContentHash: aliasHash(9)},
@@ -205,8 +207,8 @@ func TestDetectAliasesOriginChoice(t *testing.T) {
 	})
 
 	t.Run("результат не зависит от порядка входа", func(t *testing.T) {
-		// Параллельные загрузки субдоменов завершаются в произвольном
-		// порядке — решения обязаны совпадать.
+		// Parallel subdomain fetches complete in arbitrary order — the
+		// decisions must match.
 		inA := []AliasInput{
 			{SubdomainID: 0, Label: "", FinalHost: "www.example.com", FinalPath: "/",
 				Scheme: model.SchemeHTTPS, Variant: model.VariantMain, ContentHash: aliasHash(4)},
@@ -230,8 +232,9 @@ func TestDetectAliasesOriginChoice(t *testing.T) {
 	})
 
 	t.Run("общий внешний URL — оригинал минимальный subdomain_id", func(t *testing.T) {
-		// Оба уехали на парковку хостинга: «дома» никого, оригинал —
-		// минимальный id, второй идентичен (не редирект на субдомен).
+		// Both moved to the hosting parking page: nobody is "at home", the
+		// original is the minimal id, the second is identical (not a
+		// redirect to a subdomain).
 		in := []AliasInput{
 			{SubdomainID: 1, Label: "www", FinalHost: "park.hosting.example.net", FinalPath: "/site",
 				Scheme: model.SchemeHTTPS, Variant: model.VariantMain, ContentHash: aliasHash(6)},
@@ -249,8 +252,8 @@ func TestDetectAliasesOriginChoice(t *testing.T) {
 }
 
 func TestDetectAliasesNormalization(t *testing.T) {
-	// Нормализация итогового URL: регистр хоста, завершающая точка
-	// (FQDN), пустой путь = «/» — записи совпадают и без неё.
+	// Final URL normalization: host case, the trailing dot (FQDN), an
+	// empty path = "/" — the records match without it.
 	in := []AliasInput{
 		{SubdomainID: 0, Label: "", FinalHost: "WWW.Example.COM.", FinalPath: "",
 			Scheme: model.SchemeHTTPS, Variant: model.VariantMain, ContentHash: aliasHash(1)},
@@ -274,8 +277,8 @@ func TestDetectAliasesDegenerate(t *testing.T) {
 	})
 
 	t.Run("запись без итогового URL независима", func(t *testing.T) {
-		// Хост пуст — страницы нет (ошибка загрузки): ни URL-критерия,
-		// ни алиаса, контент не хранится.
+		// The host is empty — there is no page (fetch error): no URL
+		// criterion, no alias, no content stored.
 		in := []AliasInput{
 			{SubdomainID: 0, Label: "", FinalHost: "", FinalPath: "",
 				Scheme: model.SchemeHTTP, Variant: model.VariantMain},
@@ -292,10 +295,11 @@ func TestDetectAliasesDegenerate(t *testing.T) {
 	})
 
 	t.Run("варианты одного субдомена алиасами не бывают", func(t *testing.T) {
-		// Контракт вариант-логики (T-054): варианты одного субдомена —
-		// разные сайты. Даже если они транзитивно попали в один класс
-		// (через хэш третьего субдомена), ссылка на свой субдомен
-		// запрещена (ТЗ п. 6 «другого субдомена») — запись независима.
+		// The folding contract (T-054): variants of one subdomain are
+		// different sites. Even if they end up in one class transitively
+		// (via the hash of a third subdomain), a reference to their own
+		// subdomain is forbidden (spec item 6 "another subdomain") — the
+		// record stays independent.
 		in := []AliasInput{
 			{SubdomainID: 2, Label: "admin", FinalHost: "admin.example.com", FinalPath: "/",
 				Scheme: model.SchemeHTTPS, Variant: model.VariantMain, ContentHash: aliasHash(5)},
@@ -305,8 +309,8 @@ func TestDetectAliasesDegenerate(t *testing.T) {
 				Scheme: model.SchemeHTTP, Variant: model.VariantMain, ContentHash: aliasHash(5)},
 		}
 		want := []aliasGot{
-			{kind: model.AliasNone, orig: -1, store: true}, // оригинал класса (мин id)
-			{kind: model.AliasNone, orig: -1, store: true}, // тот же субдомен — независим
+			{kind: model.AliasNone, orig: -1, store: true}, // the class original (minimal id)
+			{kind: model.AliasNone, orig: -1, store: true}, // the same subdomain — independent
 			{kind: model.AliasIdentical, orig: 2, store: false},
 		}
 		if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
