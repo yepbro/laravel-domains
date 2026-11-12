@@ -43,7 +43,7 @@ func TestParseProcStat(t *testing.T) {
 	// ppid here is 0, not 7.
 	lead := ")7 R " + strings.Repeat("0 ", 20) + "128"
 	if st, ok := parseProcStat([]byte(lead)); !ok || st.ppid != 0 {
-		t.Errorf("")" as the first character: %+v ok=%v, want ok with ppid 0", st, ok)
+		t.Errorf("the lead with ')' as the first character: %+v ok=%v, want ok with ppid 0", st, ok)
 	}
 
 	// rss of 2^62 pages: the 64-bit parse is mandatory (63 bits — a

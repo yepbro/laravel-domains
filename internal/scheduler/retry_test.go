@@ -1704,7 +1704,7 @@ func TestRetryTempErrorsDrainContinues(t *testing.T) {
 
 	log := buf.String()
 	for _, want := range []string{
-		"the batch failed — the drain continues", // the batch failure's WARN
+		"batch failed — the drain continues", // the batch failure's WARN
 		"the db blipped",
 		"requeued=1", // the same drain's Info outcome
 	} {
