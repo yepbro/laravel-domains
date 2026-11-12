@@ -100,7 +100,7 @@ type ContentSaver struct {
 // would lose content unnoticed).
 func NewContentSaver(store content.ContentStore, log *slog.Logger) (*ContentSaver, error) {
 	if store == nil {
-		return nil, errors.New("httpworker: сохранение контента: хранилище не задано")
+		return nil, errors.New("httpworker: content saving: the store is not set")
 	}
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -191,11 +191,11 @@ func (s *ContentSaver) Save(ctx context.Context, res *DomainResult) error {
 				//			// re-delivery of the same task, T-025): the integrity
 				//			// counter is not broken, a Warn for analysis — the block may still be live
 				//			// by other references.
-				s.log.Warn("снятие ссылки раннего Put: ссылки уже нет (гонка повторной доставки?)",
+				s.log.Warn("early Put reference release: the reference is already gone (a re-delivery race?)",
 					"domain", res.Name, "hash", p.hash.String())
 				continue
 			}
-			return fmt.Errorf("httpworker: домен %s: снятие ссылки несохранённого контента %s: %w",
+			return fmt.Errorf("httpworker: domain %s: releasing the unstored content reference %s: %w",
 				res.Name, p.hash, err)
 		}
 	}
@@ -206,17 +206,17 @@ func (s *ContentSaver) Save(ctx context.Context, res *DomainResult) error {
 	//	// first swap (T-044). A loud delivery failure is better than a silent corruption.
 	for h, n := range claims {
 		if n > 0 {
-			return fmt.Errorf("httpworker: домен %s: записи требуют %s ×%d без раннего Put (рассинхронизация воркера и хранилища)",
+			return fmt.Errorf("httpworker: domain %s: records claim %s ×%d without an early Put (a worker/store desync)",
 				res.Name, h, n)
 		}
 	}
 
 	if stats.unstored > 0 {
-		s.log.Warn("контент части записей не сохранён (пауза записи контента/лимит; Warn о причине — при получении страниц)",
+		s.log.Warn("content of some records not stored (the content write pause/the limit; the reason Warn is at the page fetch)",
 			"domain", res.Name, "records", stats.unstored)
 	}
 	if stats.stored+stats.released+stats.unstored+stats.truncated > 0 {
-		s.log.Debug("контент результата домена",
+		s.log.Debug("domain result content",
 			"domain", res.Name, "stored", stats.stored, "created", stats.created,
 			"released", stats.released, "skipped_unstored", stats.unstored, "skipped_truncated", stats.truncated)
 	}

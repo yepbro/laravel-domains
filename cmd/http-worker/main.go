@@ -96,7 +96,7 @@ func main() {
 	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("[http-worker] конфигурация: %v", err)
+		log.Fatalf("[http-worker] configuration: %v", err)
 	}
 	logger := service.NewLogger("http-worker", cfg)
 
@@ -111,7 +111,7 @@ func main() {
 	// 768 MiB against 850M/900M). 0 — off.
 	if limit := cfg.HTTP.MemLimit; limit > 0 {
 		debug.SetMemoryLimit(limit.B())
-		logger.Info("мягкий потолок памяти Go-рантайма", "limit", limit.String())
+		logger.Info("the Go runtime soft memory cap", "limit", limit.String())
 	}
 
 	// The pool comes from the framework after the migrations (OnDBPool)
@@ -166,7 +166,7 @@ func main() {
 // (Processing, T-025).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
-		return errors.New("http-worker: пул БД не получен (postgres.dsn обязателен)")
+		return errors.New("http-worker: the DB pool is not provided (postgres.dsn is required)")
 	}
 
 	client, err := dnsclient.NewClient(ctx, dnsclient.NewOptions(cfg.DNS))
@@ -600,7 +600,7 @@ func (p retentionPending) PendingKeys(ctx context.Context, stream string) (map[c
 		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 			return keys, nil
 		}
-		return nil, fmt.Errorf("http-worker: защита retention: группы %s: %w", stream, err)
+		return nil, fmt.Errorf("http-worker: the retention guard: groups of %s: %w", stream, err)
 	}
 	if len(groups) == 0 {
 		if err := scanPendingKeys(ctx, p.rdb, stream, "-", keys); err != nil {
@@ -649,7 +649,7 @@ func pendingIDLess(a, b string) bool {
 func splitPendingID(id string) (ms, seq int64, err error) {
 	s1, s2, ok := strings.Cut(id, "-")
 	if !ok {
-		return 0, 0, fmt.Errorf("http-worker: защита retention: идентификатор записи %q не вида ms-seq", id)
+		return 0, 0, fmt.Errorf("http-worker: the retention guard: the record id %q is not of the ms-seq form", id)
 	}
 	if ms, err = strconv.ParseInt(s1, 10, 64); err != nil {
 		return 0, 0, err
@@ -666,7 +666,7 @@ func scanPendingKeys(ctx context.Context, rdb retentionPendingRedis, stream, sta
 	for {
 		msgs, err := rdb.XRangeN(ctx, stream, start, "+", pendingScanBatch).Result()
 		if err != nil {
-			return fmt.Errorf("http-worker: защита retention: xrange %s: %w", stream, err)
+			return fmt.Errorf("http-worker: the retention guard: xrange %s: %w", stream, err)
 		}
 		for _, m := range msgs {
 			var raw []byte

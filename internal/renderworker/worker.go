@@ -718,16 +718,16 @@ type Worker struct {
 // is invisible to the operator (the T-058 style).
 func New(db RenderDB, q queue.Queue, contents ContentStore, renderer Renderer, opts Options) (*Worker, error) {
 	if db == nil {
-		return nil, errors.New("renderworker: пул БД не задан")
+		return nil, errors.New("renderworker: the DB pool is not set")
 	}
 	if q == nil {
-		return nil, errors.New("renderworker: очередь не задана")
+		return nil, errors.New("renderworker: the queue is not set")
 	}
 	if contents == nil {
-		return nil, errors.New("renderworker: хранилище контента не задано")
+		return nil, errors.New("renderworker: the content store is not set")
 	}
 	if renderer == nil {
-		return nil, errors.New("renderworker: пул рендера не задан")
+		return nil, errors.New("renderworker: the render pool is not set")
 	}
 	return &Worker{db: db, q: q, contents: contents, renderer: renderer,
 		opt: opts.withDefaults(), met: NewMetrics(opts.Metrics, opts.Engine), fbDedup: newFallbackDedup(),
@@ -1223,7 +1223,7 @@ func (w *Worker) fbObserveOutcome(err error, rendered bool) {
 		w.fbGate.streak++
 		if w.fbGate.Threshold > 0 && w.fbGate.streak == w.fbGate.Threshold {
 			w.met.FallbackSuspended(fbReasonGate)
-			w.opt.log().Warn("фолбэк приостановлен: health-гейт — стрик инфра-ошибок класса браузера (основной движок недоступен)",
+			w.opt.log().Warn("fallback suspended: the health gate — the browser-class infra error streak (the primary engine unavailable)",
 				"streak", w.fbGate.streak, "threshold", w.fbGate.Threshold)
 		}
 	}
@@ -1251,7 +1251,7 @@ func (w *Worker) fbObserveTask() {
 		over := w.fbBudget.overCeiling()
 		if over {
 			w.met.FallbackSuspended(fbReasonBudget)
-			w.opt.log().Warn("фолбэк приостановлен: бюджет доли — окно перерасходовало потолок",
+			w.opt.log().Warn("fallback suspended: the share budget — the window exceeded the cap",
 				"published", w.fbBudget.published, "window", w.fbBudget.tasks,
 				"ceiling_percent", w.fbBudget.Ceiling)
 		}
@@ -1322,7 +1322,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	if !found || target.finalURL == "" {
 		// No row (the domain deleted/rechecked without this key) or
 		// no final URL — nothing to render; a regular rejection without an error.
-		w.opt.log().Debug("рендер не требуется — строки нет или без итогового URL",
+		w.opt.log().Debug("render not needed — no row or no final URL",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 		return false, nil
@@ -1340,21 +1340,21 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		// markers — finalize the entry without a render or
 		// retry with a delivery.
 		if isCertError(err) {
-			return false, fmt.Errorf("renderworker: %s: рендер: %w", name, &certError{err: err})
+			return false, fmt.Errorf("renderworker: %s: render: %w", name, &certError{err: err})
 		}
 		if isDNSError(err) {
-			return false, fmt.Errorf("renderworker: %s: рендер: %w", name, &dnsError{err: err})
+			return false, fmt.Errorf("renderworker: %s: render: %w", name, &dnsError{err: err})
 		}
 		if isPageTimeout(err) {
-			return false, fmt.Errorf("renderworker: %s: рендер: %w", name, &tarpitError{err: err})
+			return false, fmt.Errorf("renderworker: %s: render: %w", name, &tarpitError{err: err})
 		}
-		return false, fmt.Errorf("renderworker: %s: рендер: %w", name, err)
+		return false, fmt.Errorf("renderworker: %s: render: %w", name, err)
 	}
 	if out.DOM == "" || out.FinalURL == "" {
 		// The T-064 contract guard: a live page always has
 		// documentElement and location; empty values are an abnormal
 		// result, the row is not touched.
-		return false, fmt.Errorf("renderworker: %s: пустой результат рендера (DOM %d байт, final_url %q)",
+		return false, fmt.Errorf("renderworker: %s: an empty render result (DOM %d bytes, final_url %q)",
 			name, len(out.DOM), out.FinalURL)
 	}
 	// The DOM — a single copy of the bytes (R-02): the hash and Put from one slice, the
@@ -1380,7 +1380,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// triage (T-025) — a signal to the operator to raise content.max_store_bytes.
 	if !hasOld || newHash != oldHash {
 		if _, err := w.contents.Put(ctx, dom); err != nil {
-			return false, fmt.Errorf("renderworker: %s: сохранение DOM: %w", name, err)
+			return false, fmt.Errorf("renderworker: %s: DOM saving: %w", name, err)
 		}
 	}
 	cookies, err := renderCookiesJSON(out.Cookies)
@@ -1389,12 +1389,12 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	}
 	headers, err := renderHeadersJSON(out.ResponseHeaders)
 	if err != nil {
-		return false, fmt.Errorf("renderworker: %s: заголовки: %w", name, err)
+		return false, fmt.Errorf("renderworker: %s: headers: %w", name, err)
 	}
 
 	tx, err := w.db.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("renderworker: %s: замена контента: транзакция: %w", name, err)
+		return false, fmt.Errorf("renderworker: %s: content replacement: transaction: %w", name, err)
 	}
 	// Rollback unconditionally: after Commit — a no-op (the T-044/T-058 style).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -1419,16 +1419,16 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 			_ = tx.Rollback(ctx)
 			if !hasOld || newHash != oldHash {
 				if err := w.contents.Delete(ctx, newHash); err != nil && !errors.Is(err, content.ErrNotFound) {
-					w.opt.log().Warn("рендер: ссылка контента не снята (строка ушла из-под задачи)",
+					w.opt.log().Warn("render: the content reference was not released (the row slipped out from under the task)",
 						"domain", name, "hash", newHash.String(), "err", err)
 				}
 			}
-			w.opt.log().Debug("рендер не записан — строка перезаписана другим эпизодом",
+			w.opt.log().Debug("render not written — the row was rewritten by another episode",
 				"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID,
 				"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 			return false, nil
 		}
-		return false, fmt.Errorf("renderworker: %s: замена контента: %w", name, err)
+		return false, fmt.Errorf("renderworker: %s: content replacement: %w", name, err)
 	}
 
 	// −1 to the old content (spec 5.7 "on a result rewrite the reference counter
@@ -1460,7 +1460,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	if err := tx.Commit(ctx); err != nil {
 		// The rollback will return the row; the +1 from Put will remain a space leak —
 		// the safe side (T-044), a re-delivery will rewrite it.
-		return false, fmt.Errorf("renderworker: %s: замена контента: фиксация: %w", name, err)
+		return false, fmt.Errorf("renderworker: %s: content replacement: commit: %w", name, err)
 	}
 
 	// The q:analyze publication after the write (§7): the Result points at the row —
@@ -1479,11 +1479,11 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		// DOM — by a Warn log (the Rendered metric counts only fully
 		// finished tasks, a failure will go into the stage error counter in
 		// processDelivery).
-		w.opt.log().Warn("DOM записан, публикация q:analyze не удалась — повторная доставка опубликует заново",
+		w.opt.log().Warn("DOM written, the q:analyze publication failed — a re-delivery will publish again",
 			"domain", name, "final_url", out.FinalURL, "err", err)
-		return false, fmt.Errorf("renderworker: %s: публикация q:analyze: %w", name, err)
+		return false, fmt.Errorf("renderworker: %s: q:analyze publication: %w", name, err)
 	}
-	w.opt.log().Debug("DOM записан",
+	w.opt.log().Debug("DOM written",
 		"domain", name, "final_url", out.FinalURL, "dom_bytes", len(out.DOM),
 		"cookies", len(out.Cookies))
 	return true, nil
@@ -1502,10 +1502,10 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 func renderBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, checkedAt time.Time) error {
 	tag, err := tx.Exec(ctx, renderBumpReanalyzeSQL, checkedAt, int64(1))
 	if err != nil {
-		return fmt.Errorf("корзина хвостов переанализа: %w", err)
+		return fmt.Errorf("reanalysis tails bucket: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("корзина хвостов переанализа: затронуто %d строк (upsert корзины часа обязан 1)",
+		return fmt.Errorf("reanalysis tails bucket: %d rows affected (the hour bucket upsert must affect 1)",
 			tag.RowsAffected())
 	}
 	return nil
@@ -1522,10 +1522,10 @@ func renderBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, checkedAt time.T
 func renderBumpRenderedCounter(ctx context.Context, tx pgx.Tx, checkedAt time.Time) error {
 	tag, err := tx.Exec(ctx, renderBumpRenderedSQL, checkedAt, int64(1))
 	if err != nil {
-		return fmt.Errorf("корзина rendered-темпа: %w", err)
+		return fmt.Errorf("rendered rate bucket: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("корзина rendered-темпа: затронуто %d строк (upsert корзины часа обязан 1)",
+		return fmt.Errorf("rendered rate bucket: %d rows affected (the hour bucket upsert must affect 1)",
 			tag.RowsAffected())
 	}
 	return nil
@@ -1539,7 +1539,7 @@ func (w *Worker) selectTarget(ctx context.Context, task queue.Result) (renderTar
 	rows, err := w.db.Query(ctx, renderSelectSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant))
 	if err != nil {
-		return renderTarget{}, false, fmt.Errorf("renderworker: чтение строки результата: %w", err)
+		return renderTarget{}, false, fmt.Errorf("renderworker: result row read: %w", err)
 	}
 	defer rows.Close()
 
@@ -1547,7 +1547,7 @@ func (w *Worker) selectTarget(ctx context.Context, task queue.Result) (renderTar
 	if rows.Next() {
 		var finalURL *string
 		if err := rows.Scan(&finalURL, &t.hash, &t.rendered, &t.checkedAt); err != nil {
-			return renderTarget{}, false, fmt.Errorf("renderworker: чтение строки результата: %w", err)
+			return renderTarget{}, false, fmt.Errorf("renderworker: result row read: %w", err)
 		}
 		if finalURL != nil {
 			t.finalURL = *finalURL
@@ -1555,7 +1555,7 @@ func (w *Worker) selectTarget(ctx context.Context, task queue.Result) (renderTar
 		return t, true, nil // the PK — no more than one row
 	}
 	if err := rows.Err(); err != nil {
-		return renderTarget{}, false, fmt.Errorf("renderworker: чтение строки результата: %w", err)
+		return renderTarget{}, false, fmt.Errorf("renderworker: result row read: %w", err)
 	}
 	return renderTarget{}, false, nil
 }
@@ -1663,11 +1663,11 @@ func renderFailBackoff(streak int) time.Duration {
 // the transition table there.
 func Run(ctx context.Context, w *Worker, opts Options) error {
 	if w == nil {
-		return errors.New("renderworker: цикл воркера: воркер не задан")
+		return errors.New("renderworker: the worker loop: the worker is not set")
 	}
 	o := opts.withDefaults()
 	log := o.log()
-	log.Info("цикл render-worker",
+	log.Info("render-worker loop",
 		"stream", o.Stream, "group", o.Group, "consumer", o.Consumer,
 		"concurrency", o.Concurrency, "consume", o.Consume, "alive", o.Alive != nil)
 
@@ -1733,7 +1733,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 	var rateLim *rateWindow
 	if o.Rate > 0 {
 		rateLim = newRateWindow(o.Rate, renderRateWindow)
-		log.Info("потолок темпа потребления",
+		log.Info("the consumption rate cap",
 			"stream", o.Stream, "rate", o.Rate, "window", renderRateWindow.String())
 	}
 	// infraDown — a sustained infrastructure publication error
@@ -1787,7 +1787,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				// in the PEL until a claim — like the window of the former barrier
 				// loop, the behavior is no worse. The manager's probes replace the generations
 				// themselves (a reconnect, T-065).
-				log.Warn("Chromium недоступен — стрим потребления не читается (перезапуск — менеджер, T-065)",
+				log.Warn("Chromium unavailable — the consumption stream is not read (the restart is the manager's job, T-065)",
 					"stream", o.Stream)
 				wait(DefaultErrorWait)
 				if ctx.Err() != nil {
@@ -1801,7 +1801,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				// would read chunks between pauses).
 				infraStreak++
 				pause := renderFailBackoff(infraStreak)
-				log.Warn("пауза чтения: публикация результатов падает об инфраструктуру Redis (OOM/соединение) — новые доставки не читаются (T-152)",
+				log.Warn("reading pause: the result publication hits the Redis infrastructure (OOM/connection) — new deliveries are not read (T-152)",
 					"stream", o.Stream, "streak", infraStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
@@ -1827,7 +1827,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				// The downtime observability: the pause stops the stage's reading
 				// — a Warn with the series and the failure count (the
 				// frequency is bounded by the pause doubling, no more often than ~2/min per series).
-				log.Warn("пауза предохранителя чтения: доставки падают подряд",
+				log.Warn("reading fuse pause: deliveries fail in a row",
 					"stream", o.Stream, "failed", obs.failed, "streak", failStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
@@ -1853,7 +1853,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 			if obs.infra && infraDown.Swap(false) {
 				infraStreak = 0
 				if o.Recover != nil {
-					log.Info("запись в Redis восстановлена — чтение возобновляется", "stream", o.Stream)
+					log.Info("the Redis write is back — reading resumes", "stream", o.Stream)
 				}
 			}
 			// The fuse pause series is reset by the observation
@@ -1874,7 +1874,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				now := time.Now()
 				if allow := rateLim.allowance(now); allow <= 0 {
 					pause := rateLim.retry(now)
-					log.Debug("потолок темпа потребления исчерпан — чтение ждёт окно",
+					log.Debug("the consumption rate cap is exhausted — reading waits for the window",
 						"stream", o.Stream, "rate", o.Rate,
 						"window", renderRateWindow.String(), "wait", pause.String())
 					wait(pause)
@@ -1891,7 +1891,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				if ctx.Err() != nil {
 					return // graceful shutdown
 				}
-				log.Warn("цикл render-worker: чтение стрима потребления", "stream", o.Stream, "err", err)
+				log.Warn("render-worker loop: reading the consumption stream", "stream", o.Stream, "err", err)
 				wait(DefaultErrorWait)
 				continue
 			}
@@ -1948,7 +1948,7 @@ dispatch:
 			defer func() {
 				if r := recover(); r != nil {
 					failed.Add(1)
-					log.Error("паника обработки доставки",
+					log.Error("delivery processing panic",
 						"stream", o.Stream, "entry", d.ID, "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
@@ -1963,7 +1963,7 @@ dispatch:
 					infraDown.Store(true)
 				}
 				if ctx.Err() == nil {
-					log.Warn("задача не подтверждена — вернётся повторной доставкой",
+					log.Warn("the task is not acknowledged — it will come back with a re-delivery",
 						"stream", o.Stream, "entry", d.ID, "err", err)
 				}
 			} else {
@@ -2031,7 +2031,7 @@ func (w *Worker) tarpitsExhausted(ctx context.Context, task queue.Result, del qu
 	}
 	n, err := w.opt.Tarpits.Track(ctx, task.TaskID, tarpitDeliveryID(del, attempts), DefaultTarpitTTL)
 	if err != nil {
-		w.opt.log().Warn("тарпит-счётчик недоступен — решение деградирует к номеру доставки PEL (T-261)",
+		w.opt.log().Warn("the tarpit counter is unavailable — the decision degrades to the PEL delivery number (T-261)",
 			"stream", del.Stream, "entry", del.ID, "attempts", attempts, "err", err)
 		return attempts >= w.opt.TimeoutAttempts
 	}
@@ -2099,7 +2099,7 @@ func (w *Worker) tarpitsExhausted(ctx context.Context, task queue.Result, del qu
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attempts int) (err error) {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
-		return fmt.Errorf("renderworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
+		return fmt.Errorf("renderworker: entry %s of stream %s: %w", del.ID, del.Stream, err)
 	}
 	start := time.Now()
 	// The fallback share budget (T-239): the window's denominator — deliveries
@@ -2132,7 +2132,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			// HTML of the HTTP phase, the pipeline continues with analysis (q:analyze),
 			// the delivery is acknowledged.
 			if ferr := w.finalizeCertError(ctx, task, ce); ferr != nil {
-				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+				return fmt.Errorf("renderworker: domain %s: %w", task.Name, ferr)
 			}
 			w.met.Task(time.Since(start))
 			w.met.Error(render.ClassTask)
@@ -2150,7 +2150,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			// HTML of the HTTP phase, the pipeline continues with analysis (q:analyze),
 			// the delivery is acknowledged.
 			if ferr := w.finalizeDNSError(ctx, task, de); ferr != nil {
-				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+				return fmt.Errorf("renderworker: domain %s: %w", task.Name, ferr)
 			}
 			w.met.Task(time.Since(start))
 			w.met.Error(render.ClassTask)
@@ -2166,7 +2166,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			// worker B does the rework and the finalization, FR-10).
 			fb, ferr := w.publishFallback(ctx, task, tp)
 			if ferr != nil {
-				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+				return fmt.Errorf("renderworker: domain %s: %w", task.Name, ferr)
 			}
 			if fb {
 				w.met.Task(time.Since(start))
@@ -2177,7 +2177,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			// a render — the result is the raw HTML of the HTTP phase, the pipeline continues
 			// with analysis (q:analyze), the delivery is acknowledged.
 			if ferr := w.finalizeSkipRender(ctx, task, tp, attempts); ferr != nil {
-				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+				return fmt.Errorf("renderworker: domain %s: %w", task.Name, ferr)
 			}
 			w.met.Task(time.Since(start))
 			w.met.Error(render.ClassTask)
@@ -2197,7 +2197,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			// instead of a finalization (the marker — to worker B, FR-10).
 			fb, ferr := w.publishFallback(ctx, task, err)
 			if ferr != nil {
-				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+				return fmt.Errorf("renderworker: domain %s: %w", task.Name, ferr)
 			}
 			if fb {
 				w.met.Task(time.Since(start))
@@ -2205,7 +2205,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 				return nil // in the fallback: no marker, no q:analyze (worker B)
 			}
 			if ferr := w.finalizeTaskError(ctx, task, err, attempts); ferr != nil {
-				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
+				return fmt.Errorf("renderworker: domain %s: %w", task.Name, ferr)
 			}
 			w.met.Task(time.Since(start))
 			w.met.Error(render.ClassTask)
@@ -2214,7 +2214,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			return nil
 		}
 		w.met.Error(render.ClassOf(err))
-		return fmt.Errorf("renderworker: домен %s: замена контента: %w", task.Name, err)
+		return fmt.Errorf("renderworker: domain %s: content replacement: %w", task.Name, err)
 	}
 	w.met.Task(time.Since(start))
 	if processed {
@@ -2253,12 +2253,12 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 func (w *Worker) finalizeNoRender(ctx context.Context, task queue.Result, msg string, fields ...any) error {
 	target, found, err := w.selectTarget(ctx, task)
 	if err != nil {
-		return fmt.Errorf("финализация без рендера: чтение строки результата: %w", err)
+		return fmt.Errorf("finalize without render: result row read: %w", err)
 	}
 	if !found || target.finalURL == "" {
 		// Nothing to render/analyze: no row or it slipped out from under
 		// the task (the recheck) — a success without a publication.
-		w.opt.log().Debug("финализация без рендера не требуется — строки нет или без итогового URL",
+		w.opt.log().Debug("finalize without render not needed — no row or no final URL",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 		return nil
@@ -2269,15 +2269,15 @@ func (w *Worker) finalizeNoRender(ctx context.Context, task queue.Result, msg st
 	// addresses the current row, the stamp does not belong to it.
 	if tag, err := w.db.Exec(ctx, renderFailMarkerSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant), target.hash); err != nil {
-		return fmt.Errorf("финализация без рендера: маркер render_failed_at: %w", err)
+		return fmt.Errorf("finalize without render: the render_failed_at marker: %w", err)
 	} else if tag.RowsAffected() == 0 {
-		w.opt.log().Debug("финализация без рендера: строка ушла из-под задачи — маркер не ставится",
+		w.opt.log().Debug("finalize without render: the row slipped out from under the task — no marker",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 	}
 	task.Fresh = true
 	if _, err := w.q.Publish(ctx, queue.StreamAnalyze, task); err != nil {
-		return fmt.Errorf("финализация без рендера: публикация q:analyze: %w", err)
+		return fmt.Errorf("finalize without render: q:analyze publication: %w", err)
 	}
 	args := append([]any{"domain", renderLogName(task, target.finalURL), "final_url", target.finalURL}, fields...)
 	w.opt.log().Warn(msg, args...)
@@ -2302,7 +2302,7 @@ func (w *Worker) finalizeNoRender(ctx context.Context, task queue.Result, msg st
 // The mechanics and idempotency — finalizeNoRender.
 func (w *Worker) finalizeSkipRender(ctx context.Context, task queue.Result, cause *tarpitError, attempts int) error {
 	return w.finalizeNoRender(ctx, task,
-		"рендер-тарпит: запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
+		"render tarpit: the record finalized without render (the outcome is the raw HTML of the HTTP phase)",
 		"attempts", attempts, "timeout_attempts", w.opt.TimeoutAttempts,
 		"err", cause.Error())
 }
@@ -2323,7 +2323,7 @@ func (w *Worker) finalizeSkipRender(ctx context.Context, task queue.Result, caus
 // entry does not reach q:dead. The mechanics and idempotency — finalizeNoRender.
 func (w *Worker) finalizeCertError(ctx context.Context, task queue.Result, cause *certError) error {
 	return w.finalizeNoRender(ctx, task,
-		"рендер невозможен: постоянная ошибка сертификата хоста — запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
+		"render impossible: a permanent host certificate error — the record finalized without render (the outcome is the raw HTML of the HTTP phase)",
 		"err", cause.Error())
 }
 
@@ -2345,7 +2345,7 @@ func (w *Worker) finalizeCertError(ctx context.Context, task queue.Result, cause
 // idempotency — finalizeNoRender.
 func (w *Worker) finalizeDNSError(ctx context.Context, task queue.Result, cause *dnsError) error {
 	return w.finalizeNoRender(ctx, task,
-		"рендер невозможен: DNS-отказ хоста (имя не резолвится) — запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
+		"render impossible: a host DNS failure (the name does not resolve) — the record finalized without render (the outcome is the raw HTML of the HTTP phase)",
 		"err", cause.Error())
 }
 
@@ -2376,7 +2376,7 @@ func (w *Worker) finalizeDNSError(ctx context.Context, task queue.Result, cause 
 // idempotency — finalizeNoRender.
 func (w *Worker) finalizeTaskError(ctx context.Context, task queue.Result, cause error, attempts int) error {
 	return w.finalizeNoRender(ctx, task,
-		"рендер невозможен: ошибка класса задачи исчерпала доставки — запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
+		"render impossible: a task class error exhausted the deliveries — the record finalized without render (the outcome is the raw HTML of the HTTP phase)",
 		"attempts", attempts, "max_attempts", w.opt.MaxAttempts,
 		"err", cause.Error())
 }
@@ -2451,7 +2451,7 @@ func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause e
 	}
 	target, found, err := w.selectTarget(ctx, task)
 	if err != nil {
-		return false, fmt.Errorf("фолбэк-публикация: чтение строки результата: %w", err)
+		return false, fmt.Errorf("fallback publication: result row read: %w", err)
 	}
 	if !found || target.finalURL == "" {
 		// The fallback has nothing to rework: the caller finalizes the entry —
@@ -2462,7 +2462,7 @@ func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause e
 		// The row is already rendered (worker B reworked it, a concurrent
 		// render): neither the fallback nor the finalization is needed — the
 		// delivery is acknowledged without publications and a marker.
-		w.opt.log().Debug("фолбэк: строка уже отрендерена — публикация не требуется",
+		w.opt.log().Debug("fallback: the row is already rendered — no publication needed",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 		return true, nil
@@ -2475,7 +2475,7 @@ func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause e
 	// after the decision: a claim without a publication would close the row's fallback.
 	key := fallbackDedupKey(task, target.checkedAt)
 	if w.fbDedup.known(key) {
-		w.opt.log().Debug("фолбэк: запись уже опубликована в q:render-fallback — дубль доставки подтверждается",
+		w.opt.log().Debug("fallback: the record is already published to q:render-fallback — a duplicate delivery is acknowledged",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 		return true, nil
@@ -2491,7 +2491,7 @@ func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause e
 		// A duplicate: the episode's entry is already in the stream (an XACK failure
 		// after the publication) — a second entry is not needed (spec §4.4 item 5), the
 		// delivery is acknowledged.
-		w.opt.log().Debug("фолбэк: запись уже опубликована в q:render-fallback — дубль доставки подтверждается",
+		w.opt.log().Debug("fallback: the record is already published to q:render-fallback — a duplicate delivery is acknowledged",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 		return true, nil
@@ -2505,12 +2505,12 @@ func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause e
 		// the task between the filter and the stream; no marker, no XACK —
 		// the entry's state did not change, a repeat replays everything.
 		w.fbDedup.release(key)
-		return false, fmt.Errorf("фолбэк-публикация q:render-fallback: %w", err)
+		return false, fmt.Errorf("the fallback publication to q:render-fallback: %w", err)
 	}
 	w.met.FallbackPublished(cand.reason)
 	// The budget share's numerator (T-239): the publication actually went to the queue.
 	w.fbRecordPublish()
-	w.opt.log().Warn("рендер-фолбэк: задача опубликована в q:render-fallback — дорабатывает chromium-воркер B, запись без маркера",
+	w.opt.log().Warn("render fallback: the task published to q:render-fallback — chromium worker B reworks it, the record stays without the marker",
 		"domain", renderLogName(task, target.finalURL), "final_url", target.finalURL,
 		"reason", cand.reason, "err", cause.Error())
 	return true, nil

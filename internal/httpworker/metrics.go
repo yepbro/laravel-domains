@@ -87,66 +87,66 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 	return &Metrics{
 		tasks: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_stage_tasks_total",
-			Help: "Обработанные задачи этапов конвейера: dns — домены, http — домены, render/analyze — записи субдомен×вариант.",
+			Help: "Pipeline stage tasks processed: dns — domains, http — domains, render/analyze — subdomain×variant rows.",
 		}, metrics.LabelStage).WithLabelValues(metrics.StageHTTP),
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_stage_seconds",
-			Help:    "Длительность обработки одной задачи этапа (эпизод домена/записи).",
+			Help:    "Duration of processing one stage task (a domain/record episode).",
 			Buckets: httpSecondsBuckets,
 		}, metrics.LabelStage).WithLabelValues(metrics.StageHTTP),
 		errors: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_stage_errors_total",
-			Help: "Ошибки этапов по типам: http — классы проверок (timeout, redirects, tls, body, network), render — классы рендера (task, context, browser).",
+			Help: "Stage errors by type: http — check classes (timeout, redirects, tls, body, network), render — render classes (task, context, browser).",
 		}, metrics.LabelStage, metrics.LabelType),
 		statuses: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_domain_status_total",
-			Help: "Финальные статусы доменов по итогам эпизодов (ТЗ 6.2): DNS-этап — not_delegated/delegated_no_address/temp_error, HTTP-этап — alive/no_http/temp_error.",
+			Help: "Final domain statuses by episode outcomes (spec 6.2): DNS stage — not_delegated/delegated_no_address/temp_error, HTTP stage — alive/no_http/temp_error.",
 		}, metrics.LabelType),
 		response: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_http_response_seconds",
-			Help:    "Время ответа итоговой страницы HTTP-проверки (до заголовков, без кэш-попаданий).",
+			Help:    "Response time of the HTTP check final page (to the headers, without cache hits).",
 			Buckets: httpResponseBuckets,
 		}).WithLabelValues(),
 		rendered: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_records_total",
-			Help: "Записи результатов по признаку rendered: false пишет HTTP-этап, true — render-worker; доля рендера — отношение rate.",
+			Help: "Result records by the rendered flag: false is written by the HTTP stage, true — by the render-worker; the render share is the rate ratio.",
 		}, "rendered"),
 		slots: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_http_tasks_inflight",
-			Help: "Занятые слоты задач q:http прямо сейчас (обработки в полёте, включая клеймы RecoverLoop): знаменатель арифметики «память юнита / слот» при замере критерия T-163.",
+			Help: "q:http task slots occupied right now (in-flight processing, including RecoverLoop claims): the denominator of the unit-memory-per-slot arithmetic when measuring the T-163 criterion.",
 		}).WithLabelValues(),
 		bodyHold: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_http_body_bytes_inflight",
-			Help: "Байты тел страниц, находящихся в обработке прямо сейчас (чтение→UTF-8→хэш→SPA→ранний Put, T-147/T-163): транзитная составляющая памяти слота; удерживаемых тел нет — пики этой метрики и есть буферы чтения.",
+			Help: "Bytes of page bodies in processing right now (read→UTF-8→hash→SPA→early Put, T-147/T-163): the transit part of the slot memory; no bodies are held — the peaks of this metric are the read buffers.",
 		}).WithLabelValues(),
 		bodySize: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_http_body_bytes",
-			Help:    "Размеры прочитанных тел итоговых страниц (байт): смесь, определяющая пик транзитных буферов слота (T-163); хвост обрезан http.max_body_bytes.",
+			Help:    "Sizes of the read final-page bodies (bytes): the mix defining the slot transit buffer peak (T-163); the tail is truncated by http.max_body_bytes.",
 			Buckets: httpBodyBuckets,
 		}).WithLabelValues(),
 		perIPWait: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_http_per_ip_wait_seconds",
-			Help:    "Ожидание слота per-IP семафора соединений перед установкой соединения (T-165): каждое успешное взятие слота, включая мгновенное. Доля ожиданий > 2 с (критерий T-165: < 5% на смеси боя) — 1 − rate(…_bucket{le=\"2\"})/rate(…_count); корзина le=2 — граница критерия. Диал — единица наблюдения: задача домена делает несколько подключений (субдомены × протоколы × ходы цепочки).",
+			Help:    "Wait for a per-IP connection semaphore slot before dialing (T-165): every successful slot grant, including instant ones. The share of waits > 2 s (the T-165 criterion: < 5% on the production mix) is 1 − rate(…_bucket{le=\"2\"})/rate(…_count); the le=2 bucket is the criterion boundary. A dial is the observation unit: a domain task makes several connections (subdomains × protocols × chain hops).",
 			Buckets: httpPerIPWaitBuckets,
 		}).WithLabelValues(),
 		cutoff: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_http_dead_host_cutoff_tasks_total",
-			Help: "Задачи q:http, завершённые dead-host cutoff (T-164): apex и www упали на connect-фазе (connection refused/connect-таймаут, оба протокола), остальные субдомены не проверялись; записи — по §8, домен несёт бит dead_host_cutoff. Контроль критерия mean задачи ≤ 7 с — crawler_stage_seconds{stage=\"http\"}.",
+			Help: "q:http tasks completed by the dead-host cutoff (T-164): apex and www failed on the connect phase (connection refused/connect timeout, both protocols), the remaining subdomains were not checked; records per §8, the domain carries the dead_host_cutoff bit. Controlling the task mean ≤ 7 s criterion — crawler_stage_seconds{stage=\"http\"}.",
 		}).WithLabelValues(),
 		cutSkip: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_http_dead_host_cutoff_skipped_checks_total",
-			Help: "Проверки (субдомен × протокол), не выполненные из-за dead-host cutoff (T-164), — сэкономленный пул задачи. Доля ложных cutoff (<1%, критерий T-164) меряется контрольной выборкой по битам dead_host_cutoff в domains.flags.",
+			Help: "Checks (subdomain × protocol) not performed because of the dead-host cutoff (T-164) — the saved pool of the task. The share of false cutoffs (<1%, the T-164 criterion) is measured by a control sample over the dead_host_cutoff bits in domains.flags.",
 		}).WithLabelValues(),
 		//		// The 40P01 transaction-retry counter (T-268): the name/HELP
 		//		// shared by all services — the internal/metrics constructor.
 		dbRetried: metrics.NewDBDeadlockRetried(reg),
 		late: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_late_republish_total",
-			Help: "Переиздания q:render поздним переиздателем (T-259, ТЗ-fsm ФТ-5.3): «вечно молодые» записи (rendered = false, final_url не пуст, без маркера render_failed_at) старше 6 ч без бита render_pending и без непотреблённых сообщений q:render/q:render-fallback — потерянные MAXLEN-усечением и сбоями публикации задачи; стационарно не растёт, рост после инцидента — дренаж потерь, спад до нуля — дренаж завершён.",
+			Help: "q:render republications by the late re-publisher (T-259, TZ-fsm FR-5.3): forever-young records (rendered = false, final_url non-empty, no render_failed_at marker) older than 6 h without the render_pending bit and without unconsumed q:render/q:render-fallback messages — tasks lost to MAXLEN truncation and publication failures; stationary it does not grow, growth after an incident — the drain of losses, a fall to zero — the drain is complete.",
 		}).WithLabelValues(),
 		lateErrs: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_late_errors_total",
-			Help: "Ошибочные проходы позднего переиздателя рендера (T-273): выборка/снимок/издание пачки не завершились — курсор не двигается, пачка повторится после backoff. До T-273 ошибки были видны только в журнале (инцидент 09–10.11.2026: 70+ WARN-ов за сутки при нулевой метрике переизданий); рост = переиздатель не работает, при render_pending > 0 рендер-долг не вернётся в q:render — искать заголовок Warn в journalctl.",
+			Help: "Failed passes of the render late re-publisher (T-273): the batch selection/snapshot/publication did not finish — the cursor does not move, the batch repeats after a backoff. Before T-273 the errors were visible only in the log (the 09–10 Nov 2026 incident: 70+ WARNs a day at a zero republication metric); growth = the re-publisher is not working, with render_pending > 0 the render debt will not return to q:render — look for the Warn heading in journalctl.",
 		}).WithLabelValues(),
 	}
 }

@@ -58,7 +58,7 @@ func main() {
 	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("[render-worker] конфигурация: %v", err)
+		log.Fatalf("[render-worker] configuration: %v", err)
 	}
 	logger := service.NewLogger("render-worker", cfg)
 
@@ -99,7 +99,7 @@ func main() {
 // cancellation and joined before the defer-closes of rdb/store (T-232).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
-		return errors.New("render-worker: пул БД не получен (postgres.dsn обязателен)")
+		return errors.New("render-worker: the DB pool is not provided (postgres.dsn is required)")
 	}
 
 	// Chromium — the generation manager (T-065): it owns the current
@@ -233,7 +233,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// worker B — render-fallback-worker.
 	stream := service.EnvOr("RENDER_WORKER_STREAM", renderworker.DefaultStream)
 	if stream != renderworker.DefaultStream && stream != queue.StreamRenderFallback {
-		return fmt.Errorf("render-worker: стрим потребления %q недопустим: стримы рендер-воркера — q:render (основная сборка) и q:render-fallback (воркер B, ФТ-12/T-237)", stream)
+		return fmt.Errorf("render-worker: the consumption stream %q is invalid: the render-worker streams are q:render (the primary build) and q:render-fallback (worker B, FR-12/T-237)", stream)
 	}
 	group := queue.WorkingGroups()[stream]
 

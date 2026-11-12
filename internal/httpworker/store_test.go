@@ -76,7 +76,7 @@ func (f *storeFake) Put(ctx context.Context, data []byte) (content.PutResult, er
 	f.refs[h] = 1
 	f.writes++
 	if f.badHash {
-		return content.PutResult{Hash: content.HashOf([]byte("чужой хэш"))}, nil
+		return content.PutResult{Hash: content.HashOf([]byte("a foreign hash"))}, nil
 	}
 	return content.PutResult{Hash: h, Created: true}, nil
 }
@@ -145,7 +145,7 @@ func storeWorker(t *testing.T, script map[string]*workerPageScript, st content.C
 
 // storePageBody — distinguishable page bodies for the scenarios.
 func storePageBody(label string) string {
-	return "<html><body>" + strings.Repeat("текст страницы "+label+" для сохранения в хранилище контента ", 24) + "</body></html>"
+	return "<html><body>" + strings.Repeat("the page text "+label+" for storing in the content store ", 24) + "</body></html>"
 }
 
 // storeRun — a single domain task with the "label" subdomains in the id 0..N order.
@@ -195,7 +195,7 @@ func TestStoreOriginalsClaimEarlyPuts(t *testing.T) {
 	bare, www, apiSub := &res.Subdomains[0], &res.Subdomains[1], &res.Subdomains[2]
 	//	// Before Save the alias's hash is still in place (the variant logic's material, T-053).
 	if bare.Records[0].ContentHash == nil {
-		t.Fatal("до Save хэш алиаса отсутствует (сломан сценарий)")
+		t.Fatal("before Save the alias hash is absent (the scenario is broken)")
 	}
 	if err := storeSaver(t, st, &bytes.Buffer{}).Save(context.Background(), res); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -205,25 +205,25 @@ func TestStoreOriginalsClaimEarlyPuts(t *testing.T) {
 	//	// old and api — once each; three new blocks.
 	puts, writes, deletes, refs := st.snapshot()
 	if puts != 4 || writes != 3 {
-		t.Fatalf("Put: вызовов %d, новых блоков %d — ожидалось 4 и 3 (home скачана дважды)", puts, writes)
+		t.Fatalf("Put: %d calls, %d new blocks — expected 4 and 3 (home was fetched twice)", puts, writes)
 	}
 	//	// The reconciliation removed the extra home reference: one reference per record.
 	homeHash := content.HashOf([]byte(home))
 	if refs[homeHash] != 1 {
-		t.Errorf("refcount home: %d, ожидалась 1 ссылка (лишнее скачивание снято Delete)", refs[homeHash])
+		t.Errorf("the home refcount: %d, one reference expected (the extra fetch was released by Delete)", refs[homeHash])
 	}
 	if refs[content.HashOf([]byte(old))] != 1 || refs[content.HashOf([]byte(api))] != 1 {
-		t.Error("независимые записи не владеют своими ссылками")
+		t.Error("the independent records do not own their references")
 	}
 	if deletes != 1 {
-		t.Errorf("Delete: вызовов %d, ожидался 1 (второе скачивание home)", deletes)
+		t.Errorf("Delete: %d calls, 1 expected (the second home fetch)", deletes)
 	}
 
 	//	// The alias: content_hash removed (NULL in the DB), the "not stored" sign is NOT
 	//	// set — the class's content is stored by the original record.
 	bareRec := &bare.Records[0]
 	if bareRec.ContentHash != nil || bareRec.ContentNotStored {
-		t.Errorf("алиас: hash=%v not_stored=%v (ожидалось nil/false — контент у оригинала)",
+		t.Errorf("the alias: hash=%v not_stored=%v (nil/false expected — the content is at the original)",
 			bareRec.ContentHash, bareRec.ContentNotStored)
 	}
 	//	// The originals: the hash = HashOf(body), the content is available from the store.
@@ -240,11 +240,11 @@ func TestStoreOriginalsClaimEarlyPuts(t *testing.T) {
 			t.Fatalf("%s: hash=%v not_stored=%v", c.name, c.rec.ContentHash, c.rec.ContentNotStored)
 		}
 		if *c.rec.ContentHash != content.HashOf([]byte(c.body)) {
-			t.Errorf("%s: хэш записи ≠ HashOf(тела)", c.name)
+			t.Errorf("%s: the record hash ≠ HashOf(the body)", c.name)
 		}
 		got, err := st.Get(context.Background(), *c.rec.ContentHash)
 		if err != nil || string(got) != c.body {
-			t.Errorf("%s: Get по хэшу записи: %v (байты совпадают: %v)", c.name, err, string(got) == c.body)
+			t.Errorf("%s: Get by the record hash: %v (the bytes match: %v)", c.name, err, string(got) == c.body)
 		}
 	}
 }
@@ -255,7 +255,7 @@ func TestStoreOriginalsClaimEarlyPuts(t *testing.T) {
 // one reference; both records hold a live hash. The task level (one block
 // per class) — TestStoreOriginalsClaimEarlyPuts.
 func TestStoreDedupAcrossDomains(t *testing.T) {
-	parking := storePageBody("парковка")
+	parking := storePageBody("parking")
 	script := func(host string) map[string]*workerPageScript {
 		return map[string]*workerPageScript{
 			host:                   {status: 200, body: parking},
@@ -281,19 +281,19 @@ func TestStoreDedupAcrossDomains(t *testing.T) {
 	puts, writes, deletes, refs := st.snapshot()
 	h := content.HashOf([]byte(parking))
 	if puts != 4 || writes != 1 {
-		t.Fatalf("Put: вызовов %d, новых блоков %d — ожидалось 4 и 1 (дедуп между доменами)", puts, writes)
+		t.Fatalf("Put: %d calls, %d new blocks — expected 4 and 1 (the cross-domain dedup)", puts, writes)
 	}
 	if deletes != 2 {
-		t.Fatalf("Delete: вызовов %d, ожидалось 2 (лишние скачивания своих протоколов)", deletes)
+		t.Fatalf("Delete: %d calls, 2 expected (the extra fetches of its own protocols)", deletes)
 	}
 	if refs[h] != 2 {
-		t.Errorf("refcount парковки: %d, ожидался 2 (по ссылке на домен)", refs[h])
+		t.Errorf("the parking refcount: %d, 2 expected (one reference per domain)", refs[h])
 	}
 	if res1.Subdomains[0].Records[0].ContentHash == nil || *res1.Subdomains[0].Records[0].ContentHash != h {
-		t.Error("первая запись не держит хэш парковки")
+		t.Error("the first record does not hold the parking hash")
 	}
 	if res2.Subdomains[0].Records[0].ContentHash == nil || *res2.Subdomains[0].Records[0].ContentHash != h {
-		t.Error("вторая запись не держит хэш парковки")
+		t.Error("the second record does not hold the parking hash")
 	}
 }
 
@@ -306,7 +306,7 @@ func TestStoreDedupAcrossDomains(t *testing.T) {
 // (PackStore runs the UPDATE before the disk threshold, T-046): a record with
 // an existing hash is stored the usual way.
 func TestStoreFullResultAlive(t *testing.T) {
-	warm, fresh := storePageBody("тёплая"), storePageBody("свежая")
+	warm, fresh := storePageBody("warm"), storePageBody("fresh")
 	page := func(host, body string) map[string]*workerPageScript {
 		return map[string]*workerPageScript{
 			host:                   {status: 200, body: body},
@@ -319,7 +319,7 @@ func TestStoreFullResultAlive(t *testing.T) {
 	//	// the worker distinguishes the branches by errors.Is, not by the text (T-041).
 	st.newErr = func([]byte) error {
 		if full {
-			return errors.Join(content.ErrStoreFull, errors.New("свободно 0 байт"))
+			return errors.Join(content.ErrStoreFull, errors.New("0 bytes free"))
 		}
 		return nil
 	}
@@ -336,11 +336,11 @@ func TestStoreFullResultAlive(t *testing.T) {
 	full = true
 	resWarm2 := storeRun(t, storeWorker(t, page("warm2.test", warm), st, nil), "warm2.test", "")
 	if err := saver.Save(context.Background(), resWarm2); err != nil {
-		t.Fatalf("Save(warm2): %v (дедуп-ссылка обязана проходить при полном диске)", err)
+		t.Fatalf("Save(warm2): %v (the dedup reference must pass at a full disk)", err)
 	}
 	rec := &resWarm2.Subdomains[0].Records[0]
 	if rec.ContentHash == nil || rec.ContentNotStored {
-		t.Errorf("дедуп-ссылка при полном диске: hash=%v not_stored=%v", rec.ContentHash, rec.ContentNotStored)
+		t.Errorf("the dedup reference at a full disk: hash=%v not_stored=%v", rec.ContentHash, rec.ContentNotStored)
 	}
 
 	//	// 3) new content on a full disk — an early Put skip: the
@@ -349,21 +349,21 @@ func TestStoreFullResultAlive(t *testing.T) {
 	resFresh := storeRun(t, storeWorker(t, page("fresh.test", fresh), st, &wlog), "fresh.test", "")
 	flog := &bytes.Buffer{}
 	if err := storeSaver(t, st, flog).Save(context.Background(), resFresh); err != nil {
-		t.Fatalf("Save(fresh): %v — переполнение не роняет результат (ТЗ 8)", err)
+		t.Fatalf("Save(fresh): %v — the overflow does not fail the result (spec 8)", err)
 	}
 	rec = &resFresh.Subdomains[0].Records[0]
 	if rec.ContentHash != nil || !rec.ContentNotStored {
-		t.Errorf("запись при полном диске: hash=%v not_stored=%v (ожидался nil/true)",
+		t.Errorf("the record at a full disk: hash=%v not_stored=%v (nil/true expected)",
 			rec.ContentHash, rec.ContentNotStored)
 	}
 	if _, _, _, refs := st.snapshot(); refs[content.HashOf([]byte(fresh))] != 0 {
-		t.Error("контент fresh попал в хранилище при переполнении")
+		t.Error("the fresh content got into the store at the overflow")
 	}
-	if msg := wlog.String(); !strings.Contains(msg, "не сохранён") || !strings.Contains(msg, "переполнено") {
-		t.Errorf("Warn воркера о переполнении не записан: %q", msg)
+	if msg := wlog.String(); !strings.Contains(msg, "not stored") || !strings.Contains(msg, "unavailable") {
+		t.Errorf("the worker overflow Warn is not written: %q", msg)
 	}
-	if msg := flog.String(); !strings.Contains(msg, "не сохранён") {
-		t.Errorf("Warn сверки о записях без контента не записан: %q", msg)
+	if msg := flog.String(); !strings.Contains(msg, "not stored") {
+		t.Errorf("the reconciliation Warn about records without content is not written: %q", msg)
 	}
 }
 
@@ -372,8 +372,8 @@ func TestStoreFullResultAlive(t *testing.T) {
 // the record is alive, content_hash = nil, ContentNotStored, the worker's Warn;
 // Save does not fail.
 func TestStoreTooLarge(t *testing.T) {
-	small := storePageBody("малая")
-	big := storePageBody("большая страница")
+	small := storePageBody("small")
+	big := storePageBody("a large page")
 	script := map[string]*workerPageScript{
 		"big.test":         {status: 200, body: big},
 		"http://big.test/": {status: 200, body: big},
@@ -381,7 +381,7 @@ func TestStoreTooLarge(t *testing.T) {
 	st := newStoreFake()
 	st.newErr = func(data []byte) error {
 		if len(data) > len(small) {
-			return errors.Join(content.ErrTooLarge, errors.New("300 байт при лимите 100"))
+			return errors.Join(content.ErrTooLarge, errors.New("300 bytes at the limit of 100"))
 		}
 		return nil
 	}
@@ -397,17 +397,17 @@ func TestStoreTooLarge(t *testing.T) {
 	res := storeRun(t, w, "big.test", "")
 
 	if err := storeSaver(t, st, &bytes.Buffer{}).Save(context.Background(), res); err != nil {
-		t.Fatalf("Save: %v — сверхлимитный контент не роняет результат", err)
+		t.Fatalf("Save: %v — the over-limit content does not fail the result", err)
 	}
 	rec := &res.Subdomains[0].Records[0]
 	if rec.ContentHash != nil || !rec.ContentNotStored {
-		t.Errorf("запись: hash=%v not_stored=%v (ожидался nil/true)", rec.ContentHash, rec.ContentNotStored)
+		t.Errorf("the record: hash=%v not_stored=%v (nil/true expected)", rec.ContentHash, rec.ContentNotStored)
 	}
 	if _, writes, _, _ := st.snapshot(); writes != 0 {
-		t.Errorf("сверхлимитный контент записан: %d блоков", writes)
+		t.Errorf("the over-limit content was stored: %d blocks", writes)
 	}
-	if msg := wlog.String(); !strings.Contains(msg, "не сохранён") {
-		t.Errorf("Warn воркера о лимите не записан: %q", msg)
+	if msg := wlog.String(); !strings.Contains(msg, "not stored") {
+		t.Errorf("the worker limit Warn is not written: %q", msg)
 	}
 }
 
@@ -417,7 +417,7 @@ func TestStoreTooLarge(t *testing.T) {
 // record is stored.
 func TestStoreTruncatedNotStored(t *testing.T) {
 	huge := strings.Repeat("a", int(httpfetch.DefaultLimitBodyBytes)+128)
-	normal := storePageBody("обычная")
+	normal := storePageBody("normal")
 	script := map[string]*workerPageScript{
 		"huge.test":            {status: 200, body: huge},
 		"http://huge.test/":    {status: 200, body: huge},
@@ -428,27 +428,27 @@ func TestStoreTruncatedNotStored(t *testing.T) {
 	res := storeRun(t, storeWorker(t, script, st, nil), "huge.test", "", "ok")
 	hugeRec := &res.Subdomains[0].Records[0]
 	if !hugeRec.Truncated || hugeRec.ContentHash == nil {
-		t.Fatalf("сценарий сломан: truncated=%v hash=%v", hugeRec.Truncated, hugeRec.ContentHash)
+		t.Fatalf("the scenario is broken: truncated=%v hash=%v", hugeRec.Truncated, hugeRec.ContentHash)
 	}
 	if hugeRec.ContentStored {
-		t.Fatal("обрезанная страница помечена сохранённой")
+		t.Fatal("the truncated page is marked stored")
 	}
 
 	if err := storeSaver(t, st, &bytes.Buffer{}).Save(context.Background(), res); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	if hugeRec.ContentHash != nil || !hugeRec.ContentNotStored {
-		t.Errorf("обрезанная запись: hash=%v not_stored=%v (ожидался nil/true)",
+		t.Errorf("the truncated record: hash=%v not_stored=%v (nil/true expected)",
 			hugeRec.ContentHash, hugeRec.ContentNotStored)
 	}
 	//	// ok was downloaded twice (both protocols, one site → 1 record): 2 early
 	//	// Puts, the reconciliation removed the extra one — exactly one block and one reference.
 	_, writes, deletes, refs := st.snapshot()
 	if writes != 1 || refs[content.HashOf([]byte(normal))] != 1 {
-		t.Errorf("сохранена только нормальная запись: блоков %d, ссылок normal %d", writes, refs[content.HashOf([]byte(normal))])
+		t.Errorf("only the normal record was stored: %d blocks, %d normal references", writes, refs[content.HashOf([]byte(normal))])
 	}
 	if deletes != 1 {
-		t.Errorf("Delete: вызовов %d, ожидался 1 (лишнее скачивание normal)", deletes)
+		t.Errorf("Delete: %d calls, 1 expected (the extra normal fetch)", deletes)
 	}
 }
 
@@ -465,23 +465,23 @@ func TestStoreWorkerPutErrors(t *testing.T) {
 			"http://" + host + "/": {status: 200, body: storePageBody(host)},
 		}
 	}
-	t.Run("сторонняя ошибка Put", func(t *testing.T) {
+	t.Run("a foreign Put error", func(t *testing.T) {
 		st := newStoreFake()
-		st.newErr = func([]byte) error { return errors.New("БД недоступна") }
+		st.newErr = func([]byte) error { return errors.New("the DB is unavailable") }
 		_, err := storeRunErr(t, storeWorker(t, script("boom.test"), st, nil), "boom.test")
-		if err == nil || !strings.Contains(err.Error(), "сохранение контента") {
-			t.Fatalf("ProcessDomain при сбое хранилища: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "content saving") {
+			t.Fatalf("ProcessDomain at a store failure: %v", err)
 		}
 	})
-	t.Run("чужой хэш Put", func(t *testing.T) {
+	t.Run("a foreign Put hash", func(t *testing.T) {
 		st := newStoreFake()
 		st.badHash = true
 		_, err := storeRunErr(t, storeWorker(t, script("hash.test"), st, nil), "hash.test")
 		if err == nil || !strings.Contains(err.Error(), "HashOf") {
-			t.Fatalf("ProcessDomain при чужом хэше: %v", err)
+			t.Fatalf("ProcessDomain at a foreign hash: %v", err)
 		}
 	})
-	t.Run("отмена ctx", func(t *testing.T) {
+	t.Run("the ctx cancellation", func(t *testing.T) {
 		st := newStoreFake()
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -491,7 +491,7 @@ func TestStoreWorkerPutErrors(t *testing.T) {
 			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")},
 		})
 		if err == nil {
-			t.Fatal("ProcessDomain при отмене ctx прошёл")
+			t.Fatal("ProcessDomain passed at the ctx cancellation")
 		}
 	})
 }
@@ -540,7 +540,7 @@ func storeManualResult(name string, body string, stored bool) (*DomainResult, co
 // removing an already non-existent reference — a Warn without an error (a re-delivery
 // race); a nil store is rejected by the constructor.
 func TestStoreSaveErrors(t *testing.T) {
-	t.Run("сбой Delete", func(t *testing.T) {
+	t.Run("a Delete failure", func(t *testing.T) {
 		//		// A scenario with a slice: both checks of the domain download one content,
 		//		// the folded record requires one Delete — it is the one that fails.
 		body := storePageBody("del")
@@ -549,53 +549,53 @@ func TestStoreSaveErrors(t *testing.T) {
 			"http://del.test/": {status: 200, body: body},
 		}
 		st := newStoreFake()
-		st.delErr = errors.New("БД недоступна")
+		st.delErr = errors.New("the DB is unavailable")
 		res := storeRun(t, storeWorker(t, script, st, nil), "del.test", "")
 		err := storeSaver(t, st, &bytes.Buffer{}).Save(context.Background(), res)
-		if err == nil || !strings.Contains(err.Error(), "снятие ссылки") {
-			t.Fatalf("Save при сбое Delete: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "releasing the reference") {
+			t.Fatalf("Save at a Delete failure: %v", err)
 		}
 	})
-	t.Run("отмена ctx", func(t *testing.T) {
-		res, _ := storeManualResult("cancel-save.test", "тело", false)
+	t.Run("the ctx cancellation", func(t *testing.T) {
+		res, _ := storeManualResult("cancel-save.test", "a body", false)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		err := storeSaver(t, newStoreFake(), &bytes.Buffer{}).Save(ctx, res)
 		if err != nil {
-			t.Fatalf("Save без обращений к хранилищу при отмене: %v", err)
+			t.Fatalf("Save without store calls at the cancellation: %v", err)
 		}
 	})
-	t.Run("ссылки уже нет", func(t *testing.T) {
+	t.Run("the reference is already gone", func(t *testing.T) {
 		//		// A re-delivery race: the extra early Put's reference was removed by
 		//		// a competitor — a Warn, Save does not fail (the counter is intact at the winning
 		//		// delivery).
-		res, h := storeManualResult("gone.test", "тело", true)
+		res, h := storeManualResult("gone.test", "a body", true)
 		res.puts = append(res.puts, workerPut{hash: h}) // an extra Put without a record
 		st := &storeFake{blocks: map[content.Hash][]byte{}, refs: map[content.Hash]int{}, delMissing: true}
 		var logBuf bytes.Buffer
 		if err := storeSaver(t, st, &logBuf).Save(context.Background(), res); err != nil {
-			t.Fatalf("Save при снятой ссылке: %v", err)
+			t.Fatalf("Save at a released reference: %v", err)
 		}
-		if !strings.Contains(logBuf.String(), "ссылки уже нет") {
-			t.Errorf("Warn о гонке не записан: %q", logBuf.String())
+		if !strings.Contains(logBuf.String(), "the reference is already gone") {
+			t.Errorf("the race Warn is not written: %q", logBuf.String())
 		}
 	})
-	t.Run("запись без раннего Put", func(t *testing.T) {
+	t.Run("a record without an early Put", func(t *testing.T) {
 		//		// A desynchronization: a record demands a reference nobody put —
 		//		// a reference without a counter would drop the accounting on a swap (T-044).
-		res, _ := storeManualResult("desync.test", "тело", true)
+		res, _ := storeManualResult("desync.test", "a body", true)
 		res.puts = nil
 		err := storeSaver(t, newStoreFake(), &bytes.Buffer{}).Save(context.Background(), res)
-		if err == nil || !strings.Contains(err.Error(), "без раннего Put") {
-			t.Fatalf("Save при рассинхронизации: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "without an early Put") {
+			t.Fatalf("Save at a desync: %v", err)
 		}
 	})
-	t.Run("хранилище не задано", func(t *testing.T) {
+	t.Run("the store is not set", func(t *testing.T) {
 		if _, err := NewContentSaver(nil, nil); err == nil {
-			t.Fatal("NewContentSaver(nil) прошёл")
+			t.Fatal("NewContentSaver(nil) passed")
 		}
 	})
-	t.Run("nil-результат", func(t *testing.T) {
+	t.Run("a nil result", func(t *testing.T) {
 		if err := storeSaver(t, newStoreFake(), &bytes.Buffer{}).Save(context.Background(), nil); err != nil {
 			t.Fatalf("Save(nil): %v", err)
 		}
@@ -609,7 +609,7 @@ func TestStoreSaveErrors(t *testing.T) {
 // OnResult (Save before the XACK) → Ack; the content in the store, the record's hash is live,
 // the extra references are removed by the reconciliation.
 func TestStoreOnResultIntegration(t *testing.T) {
-	page := storePageBody("интеграция")
+	page := storePageBody("integration")
 	script := map[string]*workerPageScript{
 		"ack.test":         {status: 200, body: page},
 		"http://ack.test/": {status: 200, body: page},
@@ -646,7 +646,7 @@ func TestStoreOnResultIntegration(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatal("доставка не подтверждена за отведённое время")
+			t.Fatal("the delivery was not acknowledged within the allotted time")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -654,31 +654,31 @@ func TestStoreOnResultIntegration(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 
 	if stored == nil || stored.RecordCount() != 1 {
-		t.Fatalf("OnResult: результат %v", stored)
+		t.Fatalf("OnResult: the result %v", stored)
 	}
 	rec := &stored.Subdomains[0].Records[0]
 	h := content.HashOf([]byte(page))
 	if rec.ContentHash == nil || *rec.ContentHash != h || rec.ContentNotStored {
-		t.Fatalf("запись после Save: hash=%v not_stored=%v", rec.ContentHash, rec.ContentNotStored)
+		t.Fatalf("the record after Save: hash=%v not_stored=%v", rec.ContentHash, rec.ContentNotStored)
 	}
 	//	// Both downloads of the page (https and http) passed as early Puts, the reconciliation
 	//	// left one reference to the record.
 	_, writes, deletes, refs := st.snapshot()
 	if writes != 1 || refs[h] != 1 || deletes != 1 {
-		t.Fatalf("хранилище: блоков %d, ссылок %d, Delete %d — ожидались 1/1/1", writes, refs[h], deletes)
+		t.Fatalf("the store: %d blocks, %d references, %d Deletes — 1/1/1 expected", writes, refs[h], deletes)
 	}
 	if got, err := st.Get(context.Background(), h); err != nil || string(got) != page {
-		t.Errorf("Get сохранённого контента: %v", err)
+		t.Errorf("Get of the stored content: %v", err)
 	}
 	if q.ackedCount() != 1 {
-		t.Errorf("подтверждений %d, ожидалось 1", q.ackedCount())
+		t.Errorf("%d acknowledgments, 1 expected", q.ackedCount())
 	}
 }
 
@@ -718,43 +718,43 @@ func TestStoreEmptyBodyKeepsHash(t *testing.T) {
 			t.Fatalf("ProcessDomain(%s): %v", name, err)
 		}
 		if len(res.Subdomains[0].Records) != 1 {
-			t.Fatalf("%s: записей %d, ожидалась 1 (оба протокола — один пустой сайт)", name, len(res.Subdomains[0].Records))
+			t.Fatalf("%s: %d records, 1 expected (both protocols — one empty site)", name, len(res.Subdomains[0].Records))
 		}
 		rec := &res.Subdomains[0].Records[0]
 		if rec.HTTPStatus < 200 || rec.ErrClass != ErrNone {
-			t.Fatalf("%s: сломан сценарий — статус %d, ошибка %v", name, rec.HTTPStatus, rec.ErrClass)
+			t.Fatalf("%s: the scenario is broken — status %d, error %v", name, rec.HTTPStatus, rec.ErrClass)
 		}
 		if rec.ContentHash == nil || *rec.ContentHash != emptyHash {
-			t.Fatalf("%s: хэш записи %v, ожидался хэш пустого тела %s", name, rec.ContentHash, emptyHash)
+			t.Fatalf("%s: the record hash %v, the empty body hash %s expected", name, rec.ContentHash, emptyHash)
 		}
 		if !rec.ContentStored {
-			t.Fatalf("%s: пустое тело не сохранено ранним Put — пустое тело валидно (T-138)", name)
+			t.Fatalf("%s: the empty body was not stored by the early Put — an empty body is valid (T-138)", name)
 		}
 		if err := saver.Save(context.Background(), res); err != nil {
 			t.Fatalf("Save(%s): %v", name, err)
 		}
 	}
-	if strings.Contains(logBuf.String(), "недоступно") {
-		t.Errorf("предохранитель сработал на пустом теле:\n%s", logBuf.String())
+	if strings.Contains(logBuf.String(), "unavailable") {
+		t.Errorf("the fuse tripped on an empty body:\n%s", logBuf.String())
 	}
 
 	//	// Each domain downloaded the empty page twice (both protocols), the record
 	//	// is one — the reconciliation removed the extra references; one block for all the empty pages.
 	puts, writes, deletes, refs := st.snapshot()
 	if puts != 2*len(domains) {
-		t.Fatalf("Put: вызовов %d, ожидалось %d (по два скачивания на домен)", puts, 2*len(domains))
+		t.Fatalf("Put: %d calls, %d expected (two fetches per domain)", puts, 2*len(domains))
 	}
 	if writes != 1 {
-		t.Fatalf("новых блоков %d, ожидался 1 (пустые страницы — один блок)", writes)
+		t.Fatalf("%d new blocks, 1 expected (the empty pages — one block)", writes)
 	}
 	if deletes != len(domains) {
-		t.Fatalf("Delete: вызовов %d, ожидалось %d (лишнее скачивание каждого домена)", deletes, len(domains))
+		t.Fatalf("Delete: %d calls, %d expected (an extra fetch of each domain)", deletes, len(domains))
 	}
 	if refs[emptyHash] != len(domains) {
-		t.Errorf("refcount пустого блока: %d, ожидался %d", refs[emptyHash], len(domains))
+		t.Errorf("the empty block refcount: %d, %d expected", refs[emptyHash], len(domains))
 	}
 	if got, err := st.Get(context.Background(), emptyHash); err != nil || len(got) != 0 {
-		t.Errorf("Get пустого блока: %v, байтов %d (ожидалось 0)", err, len(got))
+		t.Errorf("Get of the empty block: %v, %d bytes (0 expected)", err, len(got))
 	}
 }
 
@@ -792,28 +792,28 @@ func TestStoreEmptyBodyCachePath(t *testing.T) {
 	//	// A cache hit: the empty www-https page was downloaded once
 	//	// (by the bare check), there was no network for www-https.
 	if n := log.countHost("www.example.com"); n != 1 {
-		t.Fatalf("скачиваний www: %d, ожидалось 1 (https — из кэша итоговых URL)", n)
+		t.Fatalf("www fetches: %d, 1 expected (https — from the final URL cache)", n)
 	}
 	bare, www := &res.Subdomains[0], &res.Subdomains[1]
 	if len(bare.Records) != 1 || len(www.Records) != 2 {
-		t.Fatalf("записей: bare %d, www %d — ожидались 1 и 2", len(bare.Records), len(www.Records))
+		t.Fatalf("records: bare %d, www %d — 1 and 2 expected", len(bare.Records), len(www.Records))
 	}
 	//	// The class's original (www v0, the cache record) inherits the stored empty
 	//	// content (T-138): the early Put passed, the reference waits for the record.
 	wwwHome := &www.Records[0]
 	if wwwHome.ContentHash == nil || *wwwHome.ContentHash != content.HashOf(nil) {
-		t.Fatalf("кэш-запись: hash=%v, ожидался хэш пустого тела", wwwHome.ContentHash)
+		t.Fatalf("the cache-hit record: hash=%v, the empty body hash expected", wwwHome.ContentHash)
 	}
 	if !wwwHome.ContentStored {
-		t.Fatal("кэш-запись: пустой контент не сохранён ранним Put (T-138)")
+		t.Fatal("the cache-hit record: the empty content was not stored by the early Put (T-138)")
 	}
 
 	var logBuf bytes.Buffer
 	if err := storeSaver(t, st, &logBuf).Save(context.Background(), res); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if strings.Contains(logBuf.String(), "недоступно") {
-		t.Errorf("предохранитель сработал на пустом теле кэш-записи:\n%s", logBuf.String())
+	if strings.Contains(logBuf.String(), "unavailable") {
+		t.Errorf("the fuse tripped on the empty body of the cache-hit record:\n%s", logBuf.String())
 	}
 
 	//	// Early Puts: the empty page was downloaded twice (both bare checks), old
@@ -823,23 +823,23 @@ func TestStoreEmptyBodyCachePath(t *testing.T) {
 	puts, writes, deletes, refs := st.snapshot()
 	emptyHash, oldHash := content.HashOf(nil), content.HashOf([]byte(old))
 	if puts != 3 || writes != 2 {
-		t.Fatalf("Put: вызовов %d, новых блоков %d — ожидалось 3 и 2", puts, writes)
+		t.Fatalf("Put: %d calls, %d new blocks — expected 3 and 2", puts, writes)
 	}
 	if deletes != 1 {
-		t.Fatalf("Delete: вызовов %d, ожидался 1 (второе скачивание пустой страницы)", deletes)
+		t.Fatalf("Delete: %d calls, 1 expected (the second empty-page fetch)", deletes)
 	}
 	if refs[emptyHash] != 1 || refs[oldHash] != 1 {
-		t.Errorf("refcount: пустой %d, старый %d — ожидались 1 и 1", refs[emptyHash], refs[oldHash])
+		t.Errorf("the refcount: empty %d, old %d — 1 and 1 expected", refs[emptyHash], refs[oldHash])
 	}
 	if wwwHome.ContentHash == nil || *wwwHome.ContentHash != emptyHash || wwwHome.ContentNotStored {
-		t.Errorf("оригинал после Save: hash=%v not_stored=%v", wwwHome.ContentHash, wwwHome.ContentNotStored)
+		t.Errorf("the original after Save: hash=%v not_stored=%v", wwwHome.ContentHash, wwwHome.ContentNotStored)
 	}
 	if bare.Records[0].ContentHash != nil || bare.Records[0].ContentNotStored {
-		t.Errorf("алиас: hash=%v not_stored=%v — контент класса у оригинала",
+		t.Errorf("the alias: hash=%v not_stored=%v — the class content is at the original",
 			bare.Records[0].ContentHash, bare.Records[0].ContentNotStored)
 	}
 	if got, err := st.Get(context.Background(), emptyHash); err != nil || len(got) != 0 {
-		t.Errorf("Get пустого блока: %v, байтов %d (ожидалось 0)", err, len(got))
+		t.Errorf("Get of the empty block: %v, %d bytes (0 expected)", err, len(got))
 	}
 }
 
@@ -859,7 +859,7 @@ func TestStoreNoBodyFieldsInResult(t *testing.T) {
 		for i := 0; i < tp.NumField(); i++ {
 			f := tp.Field(i)
 			if f.Type.Kind() == reflect.Slice && f.Type.Elem().Kind() == reflect.Uint8 {
-				t.Errorf("%s.%s: поле []byte в структуре результата (тела удерживаются памятью слота — T-147)",
+				t.Errorf("%s.%s: a []byte field in the result structure (the bodies are held by the slot memory — T-147)",
 					tp.Name(), f.Name)
 			}
 		}

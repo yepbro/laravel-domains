@@ -149,11 +149,11 @@ func (p *latePool) seedDomain(zone int16, id int64, label string, flags model.Fl
 func (p *latePool) seedRow(r lateSeedRow) { p.rows = append(p.rows, r) }
 
 func (p *latePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("latePool: CopyFrom не должен вызываться")
+	return 0, errors.New("latePool: CopyFrom must not be called")
 }
 
 func (p *latePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("latePool: Exec не должен вызываться (проход БД не пишет)")
+	return pgconn.CommandTag{}, errors.New("latePool: Exec must not be called (the DB pass does not write)")
 }
 
 func (p *latePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -166,7 +166,7 @@ func (p *latePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	case lateRenderAliasSQL:
 		return p.queryAlias(args)
 	default:
-		return nil, fmt.Errorf("latePool: неожидаемый SQL Query: %s", sql)
+		return nil, fmt.Errorf("latePool: an unexpected SQL Query: %s", sql)
 	}
 }
 
@@ -204,7 +204,7 @@ func (t *lateTx) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTa
 	if strings.HasPrefix(sql, "SET LOCAL statement_timeout = ") {
 		return pgconn.NewCommandTag("SET"), nil
 	}
-	return pgconn.CommandTag{}, fmt.Errorf("lateTx: неожидаемый Exec %q", sql)
+	return pgconn.CommandTag{}, fmt.Errorf("lateTx: an unexpected Exec %q", sql)
 }
 
 func (t *lateTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -228,7 +228,7 @@ func (t *lateTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, 
 	defer t.pool.mu.Unlock()
 	t.calls = append(t.calls, sql)
 	if sql != lateRenderRowsSQL {
-		return nil, fmt.Errorf("lateTx: неожидаемый SQL Query: %s", sql)
+		return nil, fmt.Errorf("lateTx: an unexpected SQL Query: %s", sql)
 	}
 	return t.pool.queryRows(args)
 }
@@ -247,22 +247,22 @@ func (p *latePool) queryRows(args []any) (pgx.Rows, error) {
 		return nil, p.rowsErr
 	}
 	if len(args) != 6 {
-		return nil, fmt.Errorf("latePool: выборка: параметров %d, нужно 6", len(args))
+		return nil, fmt.Errorf("latePool: selection: %d parameters, 6 needed", len(args))
 	}
 	before, ok := args[0].(time.Time)
 	if !ok {
-		return nil, fmt.Errorf("latePool: выборка: граница возраста %T, нужно time.Time", args[0])
+		return nil, fmt.Errorf("latePool: selection: the age boundary %T, time.Time needed", args[0])
 	}
 	if before.IsZero() || before.After(time.Now()) {
-		return nil, fmt.Errorf("latePool: выборка: граница возраста %v вне окна (now−After)", before)
+		return nil, fmt.Errorf("latePool: selection: the age boundary %v outside the window (now−After)", before)
 	}
 	cur, ok := lateKeyOf(args[1], args[2], args[3], args[4])
 	if !ok {
-		return nil, fmt.Errorf("latePool: выборка: курсор %T/%T/%T/%T", args[1], args[2], args[3], args[4])
+		return nil, fmt.Errorf("latePool: selection: the cursor %T/%T/%T/%T", args[1], args[2], args[3], args[4])
 	}
 	limit, ok := args[5].(int)
 	if !ok || limit <= 0 {
-		return nil, fmt.Errorf("latePool: выборка: LIMIT %v (%T)", args[5], args[5])
+		return nil, fmt.Errorf("latePool: selection: LIMIT %v (%T)", args[5], args[5])
 	}
 	p.rowsCalls++
 
@@ -313,13 +313,13 @@ func (p *latePool) queryAlias(args []any) (pgx.Rows, error) {
 		return nil, p.aliasErr
 	}
 	if len(args) != 3 {
-		return nil, fmt.Errorf("latePool: алиасы: параметров %d, нужно 3", len(args))
+		return nil, fmt.Errorf("latePool: aliases: %d parameters, 3 needed", len(args))
 	}
 	zone, okZ := args[0].(int16)
 	id, okI := args[1].(int64)
 	subs, okS := args[2].([]int16)
 	if !okZ || !okI || !okS {
-		return nil, fmt.Errorf("latePool: алиасы: параметры %T/%T/%T", args[0], args[1], args[2])
+		return nil, fmt.Errorf("latePool: aliases: the parameters %T/%T/%T", args[0], args[1], args[2])
 	}
 	p.aliasLast = append(p.aliasLast[:0], subs...)
 
@@ -455,10 +455,10 @@ func TestRenderLateSelect(t *testing.T) {
 	cur := &RenderLateCursor{}
 	rows, err := lateSelect(ctx, f.pool, lateOpts(), time.Now().Add(-testLateAfter), cur.key)
 	if err != nil {
-		t.Fatalf("lateSelect пустого пула: %v", err)
+		t.Fatalf("lateSelect of an empty pool: %v", err)
 	}
 	if len(rows) != 0 {
-		t.Fatalf("пустой пул: строк %d, хочу 0", len(rows))
+		t.Fatalf("an empty pool: %d rows, want 0", len(rows))
 	}
 
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
@@ -468,16 +468,16 @@ func TestRenderLateSelect(t *testing.T) {
 		t.Fatalf("lateSelect: %v", err)
 	}
 	if len(rows) != 1 || rows[0].name != "spa.zone" {
-		t.Fatalf("строки %+v, хочу одну с именем spa.zone", rows)
+		t.Fatalf("the rows %+v, one with the name spa.zone expected", rows)
 	}
 	if rows[0].hash == nil || rows[0].aliasSub != nil {
-		t.Fatalf("hash/alias строки: %+v", rows[0])
+		t.Fatalf("the row hash/alias: %+v", rows[0])
 	}
 
 	// The cursor: a row behind the cursor is not selected.
 	cur.key = rows[0].key
 	if rows, err = lateSelect(ctx, f.pool, lateOpts(), time.Now().Add(-testLateAfter), cur.key); err != nil || len(rows) != 0 {
-		t.Fatalf("выборка за курсором: %d строк (err=%v), хочу 0", len(rows), err)
+		t.Fatalf("the selection beyond the cursor: %d rows (err=%v), want 0", len(rows), err)
 	}
 }
 
@@ -499,33 +499,33 @@ func TestRenderLateSelectShell(t *testing.T) {
 		t.Fatalf("LateOnce: %v", err)
 	}
 	if len(f.pool.txs) != 1 {
-		t.Fatalf("транзакций = %d, хочу 1 (tx-оболочка выборки)", len(f.pool.txs))
+		t.Fatalf("transactions = %d, want 1 (the selection tx wrapper)", len(f.pool.txs))
 	}
 	tx := f.pool.txs[0]
 	// The cap's text — a literal (the integration test's contract, the
 	// renderq_test.go style); the value — the T-273 default of 300 s.
 	if lateSelectTimeoutFmt != "SET LOCAL statement_timeout = '%dms'" {
-		t.Fatalf("текст потолка выборки изменён")
+		t.Fatalf("the selection timeout text changed")
 	}
 	want := []string{
 		fmt.Sprintf(lateSelectTimeoutFmt, DefaultRenderLateSelectTimeout.Milliseconds()),
 		lateRenderRowsSQL,
 	}
 	if len(tx.calls) != len(want) {
-		t.Fatalf("операторов tx-оболочки = %d, хочу %d (SET LOCAL ×1 + SELECT): %v", len(tx.calls), len(want), tx.calls)
+		t.Fatalf("the tx wrapper statements = %d, want %d (SET LOCAL ×1 + SELECT): %v", len(tx.calls), len(want), tx.calls)
 	}
 	for i, sql := range want {
 		if tx.calls[i] != sql {
-			t.Errorf("шаг %d = %s, хочу %s (порядок SET LOCAL statement_timeout → SELECT)", i, tx.calls[i], sql)
+			t.Errorf("step %d = %s, want %s (the SET LOCAL statement_timeout → SELECT order)", i, tx.calls[i], sql)
 		}
 	}
 	for _, sql := range tx.calls {
 		if strings.HasPrefix(sql, "SET LOCAL enable_") {
-			t.Errorf("оболочка содержит закрепление плана %q — сняты T-273 (вечная петля обречённых выборок)", sql)
+			t.Errorf("the wrapper contains the plan pinning %q — removed by T-273 (the endless loop of doomed selections)", sql)
 		}
 	}
 	if !tx.committed {
-		t.Error("tx-оболочка выборки не зафиксирована")
+		t.Error("the selection tx wrapper is not committed")
 	}
 }
 
@@ -542,14 +542,14 @@ func TestRenderLateSelectCtxTimeout(t *testing.T) {
 	opts.SelectTimeout = 40 * time.Millisecond
 	cur := &RenderLateCursor{}
 	_, err := LateOnce(context.Background(), f.pool, f.bodies, f.renderQ(t), f.pending, f.met, opts, cur)
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "выборка") {
-		t.Fatalf("ошибка = %v, хочу обёрнутый context.DeadlineExceeded «выборка»", err)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "selection") {
+		t.Fatalf("the error = %v, the wrapped context.DeadlineExceeded \"selection\" expected", err)
 	}
 	if cur.key != (lateKey{}) {
-		t.Fatalf("курсор при таймауте = %+v, хочу нулевой (пачка повторится)", cur.key)
+		t.Fatalf("the cursor at the timeout = %+v, the zero value expected (the batch will repeat)", cur.key)
 	}
 	if len(f.published()) != 0 {
-		t.Fatalf("публикаций = %d, хочу 0", len(f.published()))
+		t.Fatalf("publications = %d, want 0", len(f.published()))
 	}
 }
 
@@ -563,7 +563,7 @@ func TestRenderLateSelectGate(t *testing.T) {
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://x/", hash: f.spaHash[:]})
 	gate := make(db.ScanGate, 1)
 	if err := gate.Acquire(context.Background()); err != nil {
-		t.Fatalf("занятие гейта тестом: %v", err)
+		t.Fatalf("holding the gate by the test: %v", err)
 	}
 	opts := lateOpts()
 	opts.Gate = gate
@@ -575,23 +575,23 @@ func TestRenderLateSelectGate(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		t.Fatalf("выборка прошла под занятым гейтом: %v", err)
+		t.Fatalf("the selection passed under a held gate: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 	f.pool.mu.Lock()
 	begins := f.pool.begins
 	f.pool.mu.Unlock()
 	if begins != 0 {
-		t.Fatalf("Begin под занятым гейтом: транзакций %d, хочу 0 (гейт до Begin)", begins)
+		t.Fatalf("Begin under a held gate: %d transactions, want 0 (the gate precedes Begin)", begins)
 	}
 	gate.Release()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("выборка после освобождения гейта: %v", err)
+			t.Fatalf("the selection after the gate release: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("выборка не прошла после освобождения гейта")
+		t.Fatal("the selection did not pass after the gate release")
 	}
 }
 
@@ -624,21 +624,21 @@ func TestRenderLateLostRowPublished(t *testing.T) {
 	// a non-SPA): the fresh/marked/rendered ones are cut off by the SQL; of the chunk
 	// one is published, two are skipped by the verdict (no body / non-SPA).
 	if res.Selected != 3 || res.Published != 1 || res.Skipped != 2 {
-		t.Fatalf("итог %+v, хочу selected=3 published=1 skipped=2", res)
+		t.Fatalf("the outcome %+v, want selected=3 published=1 skipped=2", res)
 	}
 	if !res.Wrapped || cur.key != (lateKey{}) {
-		t.Fatalf("курсор после короткой пачки = %+v, wrapped=%v — хочу замыкание", cur.key, res.Wrapped)
+		t.Fatalf("the cursor after a short batch = %+v, wrapped=%v — the wrap expected", cur.key, res.Wrapped)
 	}
 	pub := f.published()
 	if len(pub) != 1 || pub[0].stream != queue.StreamRender {
-		t.Fatalf("публикации %+v, хочу одну в %s", pub, queue.StreamRender)
+		t.Fatalf("the publications %+v, one into %s expected", pub, queue.StreamRender)
 	}
 	want := queue.Result{ZoneID: 1, DomainID: 10, SubdomainID: 0, Variant: 0, Name: "lost.zone"}
 	if pub[0].msg != want {
-		t.Fatalf("сообщение %+v, хочу %+v", pub[0].msg, want)
+		t.Fatalf("the message %+v, want %+v", pub[0].msg, want)
 	}
 	if v := httpMetricValue(t, f.reg, "crawler_render_late_republish_total", nil); v != 1 {
-		t.Fatalf("crawler_render_late_republish_total = %v, хочу 1", v)
+		t.Fatalf("crawler_render_late_republish_total = %v, want 1", v)
 	}
 }
 
@@ -657,10 +657,10 @@ func TestRenderLateBitAndDeleted(t *testing.T) {
 		t.Fatalf("LateOnce: %v", err)
 	}
 	if res.Selected != 0 || res.Published != 0 || res.Skipped != 0 {
-		t.Fatalf("итог %+v, хочу пустой (бит и deleted исключены выборкой)", res)
+		t.Fatalf("the outcome %+v, want empty (the bit and deleted are excluded by the selection)", res)
 	}
 	if got := len(f.published()); got != 0 {
-		t.Fatalf("публикаций %d, хочу 0", got)
+		t.Fatalf("%d publications, want 0", got)
 	}
 }
 
@@ -683,15 +683,15 @@ func TestRenderLateInterlock(t *testing.T) {
 		t.Fatalf("LateOnce: %v", err)
 	}
 	if res.Selected != 2 || res.Published != 0 || res.Skipped != 2 {
-		t.Fatalf("итог %+v, хочу selected=2 published=0 skipped=2 (живые задачи не трогаются)", res)
+		t.Fatalf("the outcome %+v, want selected=2 published=0 skipped=2 (live tasks are not touched)", res)
 	}
 	if len(f.published()) != 0 {
-		t.Fatalf("публикаций %d, хочу 0", len(f.published()))
+		t.Fatalf("%d publications, want 0", len(f.published()))
 	}
 	// The chunk is shorter than the limit — the cursor is closed (the holders'
 	// excluded ones decide themselves, the next cycle will come back to them from the start).
 	if cur.key != (lateKey{}) || !res.Wrapped {
-		t.Fatalf("курсор = %+v wrapped=%v, хочу замыкание после короткой пачки", cur.key, res.Wrapped)
+		t.Fatalf("the cursor = %+v wrapped=%v, the wrap after a short batch expected", cur.key, res.Wrapped)
 	}
 
 	// A snapshot error — a pass error, the cursor in place (the next tick
@@ -699,10 +699,10 @@ func TestRenderLateInterlock(t *testing.T) {
 	f.pending.errOn[queue.StreamRender] = errors.New("xinfo: connection reset")
 	cur2 := &RenderLateCursor{}
 	if _, err := LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, lateOpts(), cur2); err == nil {
-		t.Fatal("ошибка снимка не возвращена ошибкой прохода")
+		t.Fatal("the snapshot error is not returned by the pass error")
 	}
 	if cur2.key != (lateKey{}) {
-		t.Fatalf("курсор при ошибке снимка = %+v, хочу нулевой", cur2.key)
+		t.Fatalf("the cursor at a snapshot error = %+v, the zero value expected", cur2.key)
 	}
 }
 
@@ -722,11 +722,11 @@ func TestRenderLateAlias(t *testing.T) {
 		t.Fatalf("LateOnce: %v", err)
 	}
 	if res.Published != 2 || res.Skipped != 0 {
-		t.Fatalf("итог %+v, хочу published=2 (оригинал + алиас)", res)
+		t.Fatalf("the outcome %+v, want published=2 (the original + the alias)", res)
 	}
 	pub := f.published()
 	if len(pub) != 2 || pub[0].msg.SubdomainID != 5 || pub[1].msg.SubdomainID != 7 {
-		t.Fatalf("публикации %+v, хочу оригинал (sub=5) и алиас (sub=7) по порядку PK", pub)
+		t.Fatalf("the publications %+v, the original (sub=5) and the alias (sub=7) in PK order expected", pub)
 	}
 
 	// A non-SPA original — an alias without a verdict: both rows are skipped.
@@ -736,10 +736,10 @@ func TestRenderLateAlias(t *testing.T) {
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10, sub: 7}, old: true, finalURL: "https://alias/", aliasSub: &orig})
 	res, err = LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, lateOpts(), &RenderLateCursor{})
 	if err != nil {
-		t.Fatalf("LateOnce (не-SPA): %v", err)
+		t.Fatalf("LateOnce (non-SPA): %v", err)
 	}
 	if res.Published != 0 || res.Skipped != 2 {
-		t.Fatalf("итог %+v, хочу published=0 skipped=2", res)
+		t.Fatalf("the outcome %+v, want published=0 skipped=2", res)
 	}
 }
 
@@ -772,10 +772,10 @@ func TestRenderLateCursorDiscipline(t *testing.T) {
 		t.Fatalf("LateOnce Full: %v", err)
 	}
 	if !res.Full || res.Selected != 0 || cur.key != (lateKey{}) {
-		t.Fatalf("итог %+v курсор %+v: хочу Full без выборки и без движения курсора", res, cur.key)
+		t.Fatalf("the outcome %+v cursor %+v: want Full without a selection and without cursor movement", res, cur.key)
 	}
 	if f.pool.rowsCalls != 0 {
-		t.Fatalf("выборок при полной очереди: %d, хочу 0", f.pool.rowsCalls)
+		t.Fatalf("selections at a full queue: %d, want 0", f.pool.rowsCalls)
 	}
 
 	// A publication error: the cursor in place, a repeated pass re-publishes
@@ -784,18 +784,18 @@ func TestRenderLateCursorDiscipline(t *testing.T) {
 	f.q.errs = []error{errors.New("xadd: oops")}
 	res, err = LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, lateOpts(), cur)
 	if err == nil {
-		t.Fatal("ошибка публикации не возвращена")
+		t.Fatal("the publication error is not returned")
 	}
 	if cur.key != (lateKey{}) {
-		t.Fatalf("курсор при ошибке публикации = %+v, хочу нулевой", cur.key)
+		t.Fatalf("the cursor at a publication error = %+v, the zero value expected", cur.key)
 	}
 	f.q.errs = nil
 	res, err = LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, lateOpts(), cur)
 	if err != nil {
-		t.Fatalf("повторный проход: %v", err)
+		t.Fatalf("the repeated pass: %v", err)
 	}
 	if res.Published != 1 {
-		t.Fatalf("повторный проход: published=%d, хочу 1 (пачка повторена)", res.Published)
+		t.Fatalf("the repeated pass: published=%d, want 1 (the batch was repeated)", res.Published)
 	}
 
 	// A long chunk (the LIMIT fired): the cursor behind the last row,
@@ -810,23 +810,23 @@ func TestRenderLateCursorDiscipline(t *testing.T) {
 	opts := LateOptions{BatchSize: 2, After: testLateAfter}
 	res, err = LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, opts, cur)
 	if err != nil {
-		t.Fatalf("проход с LIMIT=2: %v", err)
+		t.Fatalf("the pass with LIMIT=2: %v", err)
 	}
 	if res.Selected != 2 || res.Wrapped {
-		t.Fatalf("итог %+v, хочу selected=2 без замыкания (пачка полная)", res)
+		t.Fatalf("the outcome %+v, want selected=2 without a wrap (a full batch)", res)
 	}
 	if cur.key != (lateKey{zone: 1, domain: 2}) {
-		t.Fatalf("курсор = %+v, хочу вторую строку", cur.key)
+		t.Fatalf("the cursor = %+v, the second row expected", cur.key)
 	}
 	res, err = LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, opts, cur)
 	if err != nil {
-		t.Fatalf("вторая пачка: %v", err)
+		t.Fatalf("the second batch: %v", err)
 	}
 	if res.Selected != 1 || !res.Wrapped {
-		t.Fatalf("итог %+v, хочу selected=1 wrapped=true (хвост исчерпан)", res)
+		t.Fatalf("the outcome %+v, want selected=1 wrapped=true (the tail is exhausted)", res)
 	}
 	if cur.key != (lateKey{}) {
-		t.Fatalf("курсор после замыкания = %+v, хочу нулевой", cur.key)
+		t.Fatalf("the cursor after the wrap = %+v, the zero value expected", cur.key)
 	}
 }
 
@@ -843,7 +843,7 @@ func TestRenderLateMetricAndNil(t *testing.T) {
 		t.Fatalf("LateOnce: %v", err)
 	}
 	if v := httpMetricValue(t, f.reg, "crawler_render_late_republish_total", nil); v != 2 {
-		t.Fatalf("метрика = %v, хочу 2", v)
+		t.Fatalf("the metric = %v, want 2", v)
 	}
 
 	// nil metrics — a no-op without a panic.
@@ -851,10 +851,10 @@ func TestRenderLateMetricAndNil(t *testing.T) {
 	f.pool.seedDomain(2, 10, "spa2", 0, model.StatusAlive)
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 2, domain: 10}, old: true, finalURL: "https://c/", hash: f.spaHash[:]})
 	if _, err := LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, nil, lateOpts(), &RenderLateCursor{}); err != nil {
-		t.Fatalf("LateOnce с nil-метриками: %v", err)
+		t.Fatalf("LateOnce with nil metrics: %v", err)
 	}
 	if v := httpMetricValue(t, f.reg, "crawler_render_late_republish_total", nil); v != 2 {
-		t.Fatalf("метрика после nil-прохода = %v, хочу прежние 2", v)
+		t.Fatalf("the metric after the nil pass = %v, the previous 2 expected", v)
 	}
 }
 
@@ -878,11 +878,11 @@ func TestRenderLateAliasRenderedOrigin(t *testing.T) {
 		t.Fatalf("LateOnce: %v", err)
 	}
 	if res.Selected != 1 || res.Published != 1 || res.Skipped != 0 {
-		t.Fatalf("итог %+v, хочу selected=1 published=1 (алиас наследует вердикт от rendered-оригинала)", res)
+		t.Fatalf("the outcome %+v, want selected=1 published=1 (the alias inherits the verdict from the rendered original)", res)
 	}
 	pub := f.published()
 	if len(pub) != 1 || pub[0].msg.SubdomainID != 7 {
-		t.Fatalf("публикации %+v, хочу алиас (sub=7)", pub)
+		t.Fatalf("the publications %+v, the alias (sub=7) expected", pub)
 	}
 }
 
@@ -907,13 +907,13 @@ func TestRenderLateSecondCapacityFull(t *testing.T) {
 		t.Fatalf("LateOnce: %v", err)
 	}
 	if !res.Full || res.Published != 0 || res.Selected != 1 {
-		t.Fatalf("итог %+v, хочу full selected=1 published=0", res)
+		t.Fatalf("the outcome %+v, want full selected=1 published=0", res)
 	}
 	if cur.key != (lateKey{}) {
-		t.Fatalf("курсор при Full = %+v, хочу нулевой (пачка повторится)", cur.key)
+		t.Fatalf("the cursor at Full = %+v, the zero value expected (the batch will repeat)", cur.key)
 	}
 	if n := len(f.published()); n != 0 {
-		t.Fatalf("публикаций %d, хочу 0", n)
+		t.Fatalf("%d publications, want 0", n)
 	}
 }
 
@@ -931,14 +931,14 @@ func TestRenderLateTransientContentError(t *testing.T) {
 
 	res, err := LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, lateOpts(), &RenderLateCursor{})
 	if err != nil {
-		t.Fatalf("LateOnce: %v (сбой чтения — не ошибка прохода)", err)
+		t.Fatalf("LateOnce: %v (a read failure is not a pass error)", err)
 	}
 	if res.Selected != 2 || res.Published != 1 || res.Skipped != 1 {
-		t.Fatalf("итог %+v, хочу selected=2 published=1 skipped=1", res)
+		t.Fatalf("the outcome %+v, want selected=2 published=1 skipped=1", res)
 	}
 	pub := f.published()
 	if len(pub) != 1 || pub[0].msg.DomainID != 10 {
-		t.Fatalf("публикации %+v, хочу здоровую строку (домен 10)", pub)
+		t.Fatalf("the publications %+v, the healthy row expected (domain 10)", pub)
 	}
 }
 
@@ -951,19 +951,19 @@ func TestRenderLateValidation(t *testing.T) {
 		name string
 		call func() error
 	}{
-		{"пул", func() error { _, err := LateOnce(ctx, nil, f.bodies, rq, f.pending, nil, lateOpts(), nil); return err }},
-		{"контент", func() error { _, err := LateOnce(ctx, f.pool, nil, rq, f.pending, nil, lateOpts(), nil); return err }},
-		{"очередь", func() error {
+		{"pool", func() error { _, err := LateOnce(ctx, nil, f.bodies, rq, f.pending, nil, lateOpts(), nil); return err }},
+		{"content", func() error { _, err := LateOnce(ctx, f.pool, nil, rq, f.pending, nil, lateOpts(), nil); return err }},
+		{"queue", func() error {
 			_, err := LateOnce(ctx, f.pool, f.bodies, nil, f.pending, nil, lateOpts(), nil)
 			return err
 		}},
-		{"снимок", func() error { _, err := LateOnce(ctx, f.pool, f.bodies, rq, nil, nil, lateOpts(), nil); return err }},
-		{"цикл: пул", func() error { return RenderLateLoop(ctx, nil, f.bodies, rq, f.pending, nil, lateOpts()) }},
-		{"цикл: снимок", func() error { return RenderLateLoop(ctx, f.pool, f.bodies, rq, nil, nil, lateOpts()) }},
+		{"snapshot", func() error { _, err := LateOnce(ctx, f.pool, f.bodies, rq, nil, nil, lateOpts(), nil); return err }},
+		{"loop: pool", func() error { return RenderLateLoop(ctx, nil, f.bodies, rq, f.pending, nil, lateOpts()) }},
+		{"loop: snapshot", func() error { return RenderLateLoop(ctx, f.pool, f.bodies, rq, nil, nil, lateOpts()) }},
 	}
 	for _, c := range cases {
 		if err := c.call(); err == nil {
-			t.Errorf("%s: nil-зависимость не отвергнута", c.name)
+			t.Errorf("%s: a nil dependency not rejected", c.name)
 		}
 	}
 }
@@ -973,29 +973,29 @@ func TestRenderLateValidation(t *testing.T) {
 func TestRenderLateDefaults(t *testing.T) {
 	o := LateOptions{}.withDefaults()
 	if o.Interval != DefaultRenderLateInterval || o.BatchSize != DefaultRenderLateBatch || o.After != DefaultRenderLateAfter {
-		t.Fatalf("дефолты %+v", o)
+		t.Fatalf("the defaults %+v", o)
 	}
 	if o.SelectTimeout != DefaultRenderLateSelectTimeout {
-		t.Errorf("SelectTimeout = %s, хочу %s (T-271)", o.SelectTimeout, DefaultRenderLateSelectTimeout)
+		t.Errorf("SelectTimeout = %s, want %s (T-271)", o.SelectTimeout, DefaultRenderLateSelectTimeout)
 	}
 	if o.ErrorBackoff != DefaultRenderLateErrorBackoff {
-		t.Errorf("ErrorBackoff = %s, хочу %s (T-271)", o.ErrorBackoff, DefaultRenderLateErrorBackoff)
+		t.Errorf("ErrorBackoff = %s, want %s (T-271)", o.ErrorBackoff, DefaultRenderLateErrorBackoff)
 	}
 	if DefaultRenderLateInterval != time.Minute {
-		t.Fatalf("интервал %s, хочу минуту (стиль прохода доработки)", DefaultRenderLateInterval)
+		t.Fatalf("the interval %s, a minute expected (the rework pass style)", DefaultRenderLateInterval)
 	}
 	if DefaultRenderLateAfter != 6*time.Hour {
-		t.Fatalf("окно возраста %s, хочу 6 ч (ФТ-5.3)", DefaultRenderLateAfter)
+		t.Fatalf("the age window %s, 6 h expected (FR-5.3)", DefaultRenderLateAfter)
 	}
 	if DefaultRenderLateSelectTimeout != 300*time.Second {
-		t.Errorf("потолок выборки %s, хочу 300 с (T-273: дедлайн обязан давать catch-up-проходу завершиться и сдвинуть курсор)", DefaultRenderLateSelectTimeout)
+		t.Errorf("the selection timeout %s, 300 s expected (T-273: the deadline must let the catch-up pass finish and move the cursor)", DefaultRenderLateSelectTimeout)
 	}
 	if DefaultRenderLateErrorBackoff != 15*time.Minute {
-		t.Errorf("backoff ошибки %s, хочу 15 мин (T-271)", DefaultRenderLateErrorBackoff)
+		t.Errorf("the error backoff %s, 15 min expected (T-271)", DefaultRenderLateErrorBackoff)
 	}
 	want := []string{queue.StreamRender, queue.StreamRenderFallback}
 	if len(lateRenderStreams) != 2 || lateRenderStreams[0] != want[0] || lateRenderStreams[1] != want[1] {
-		t.Fatalf("стримы интерлока %v, хочу %v", lateRenderStreams, want)
+		t.Fatalf("the interlock streams %v, want %v", lateRenderStreams, want)
 	}
 }
 
@@ -1022,7 +1022,7 @@ func TestRenderLateLoop(t *testing.T) {
 	for len(f.published()) == 0 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("цикл не опубликовал потерянную запись за 10 с")
+			t.Fatal("the loop did not publish the lost record within 10 s")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -1039,13 +1039,13 @@ func TestRenderLateLoop(t *testing.T) {
 	n2 := len(f.published())
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("цикл: %v", err)
+		t.Fatalf("the loop: %v", err)
 	}
 	if n1 < 1 {
-		t.Fatalf("публикаций %d, хочу ≥1", n1)
+		t.Fatalf("%d publications, want ≥1", n1)
 	}
 	if n2 != n1 {
-		t.Fatalf("публикации растут после интерлока: %d → %d, хочу стабилизацию", n1, n2)
+		t.Fatalf("the publications grow after the interlock: %d → %d, stabilization expected", n1, n2)
 	}
 }
 
@@ -1058,7 +1058,7 @@ func TestRenderLateLoop_Backoff(t *testing.T) {
 	f := newLateFixture(t)
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://spa/", hash: f.spaHash[:]})
-	f.pool.rowsErr = errors.New("потеря соединения: unexpected EOF")
+	f.pool.rowsErr = errors.New("a connection loss: unexpected EOF")
 
 	var buf bytes.Buffer
 	opts := LateOptions{
@@ -1083,7 +1083,7 @@ func TestRenderLateLoop_Backoff(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	if n := attempts(); n != 1 {
 		cancel()
-		t.Fatalf("попыток за паузу backoff = %d, хочу 1 (без backoff ~8)", n)
+		t.Fatalf("attempts during the backoff pause = %d, want 1 (without a backoff ~8)", n)
 	}
 	// The pause's tick repeats the pass (the error persists — the pause is kept).
 	deadline := time.Now().Add(3 * time.Second)
@@ -1092,11 +1092,11 @@ func TestRenderLateLoop_Backoff(t *testing.T) {
 	}
 	if n := attempts(); n < 2 {
 		cancel()
-		t.Fatalf("повтора после паузы нет: попыток %d, хочу ≥2", n)
+		t.Fatalf("no repeat after the pause: %d attempts, want ≥2", n)
 	}
 	if pub := len(f.published()); pub != 0 {
 		cancel()
-		t.Fatalf("публикаций = %d, хочу 0 (проходы ошибаются до издания)", pub)
+		t.Fatalf("publications = %d, want 0 (the passes fail before the publication)", pub)
 	}
 	// The log is read only after the loop's stop: the loop's goroutine writes into
 	// the same buffer (the T-271 P2-1 review — bytes.Buffer is not concurrency-safe).
@@ -1104,10 +1104,10 @@ func TestRenderLateLoop_Backoff(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancellation")
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("лог = %q, хочу Warn ошибочного прохода", buf.String())
+		t.Errorf("the log = %q, the Warn of a failed pass expected", buf.String())
 	}
 }
 
@@ -1128,7 +1128,7 @@ func TestRenderLateLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://spa/", hash: f.spaHash[:]})
 	f.pool.mu.Lock()
-	f.pool.rowsErr = errors.New("httpworker: поздний переиздатель: выборка: timeout: context deadline exceeded")
+	f.pool.rowsErr = errors.New("httpworker: late re-publisher: selection: timeout: context deadline exceeded")
 	f.pool.rowsDelay = 150 * time.Millisecond
 	f.pool.mu.Unlock()
 
@@ -1162,10 +1162,10 @@ func TestRenderLateLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancellation")
 	}
 	if len(starts) < 3 {
-		t.Fatalf("стартов прохода = %d, хочу ≥3", len(starts))
+		t.Fatalf("pass starts = %d, want ≥3", len(starts))
 	}
 	// The pause between the starts ≥ the pass (150 ms) + the backoff (500 ms) − headroom
 	// for the scheduler (50 ms). The former semantics gave exactly the backoff
@@ -1173,7 +1173,7 @@ func TestRenderLateLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	const minGap = 150 + 500 - 50
 	for i := 1; i < len(starts); i++ {
 		if gap := starts[i].Sub(starts[i-1]); gap < minGap*time.Millisecond {
-			t.Errorf("пауза между проходами %d→%d = %v, want ≥ %v (проход + backoff: reset после каждой ошибки)",
+			t.Errorf("the pause between passes %d→%d = %v, want ≥ %v (a pass + a backoff: the reset after each error)",
 				i-1, i, gap, minGap*time.Millisecond)
 		}
 	}
@@ -1181,6 +1181,6 @@ func TestRenderLateLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	// pass (the loop is stopped — the value is final; the last start could
 	// have been interrupted by the cancellation, hence the "≥3" requirement, not an equality).
 	if v := httpMetricValue(t, f.reg, "crawler_render_late_errors_total", nil); v < 3 {
-		t.Errorf("crawler_render_late_errors_total = %v, хочу ≥3 (по одному на каждый неудачный проход)", v)
+		t.Errorf("crawler_render_late_errors_total = %v, want ≥3 (one per each failed pass)", v)
 	}
 }

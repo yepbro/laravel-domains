@@ -16,37 +16,37 @@ func TestRenderWorker_ReaderDecide(t *testing.T) {
 		obs  readerObs
 		want readerMode
 	}{
-		{"штатное чтение: всё живо",
+		{"normal reading: everything is alive",
 			readerObs{browser: true, alive: true, failed: 0, batch: batch, rate: true, allowance: batch}, modeConsume},
-		{"П1: мёртвый браузер перекрывает все паузы",
+		{"T1: a dead browser overrides all pauses",
 			readerObs{browser: true, alive: false, infra: true, writable: false, failed: 100, batch: batch, rate: true, allowance: 0}, modePauseBrowser},
-		{"нет датчика браузера — alive не наблюдается",
+		{"no browser sensor — alive is not observed",
 			readerObs{browser: false, alive: false, failed: 0, batch: batch}, modeConsume},
-		{"П2: инфра-пауза перекрывает предохранитель и темп",
+		{"T2: the infra pause overrides the fuse and the rate",
 			readerObs{browser: true, alive: true, infra: true, writable: false, failed: 100, batch: batch, rate: true, allowance: 0}, modePauseInfra},
-		{"флаг инфра-сбоя горит, проба записи прошла",
+		{"the infra failure flag is lit, the write probe passed",
 			readerObs{browser: true, alive: true, infra: true, writable: true, failed: 0, batch: batch}, modeConsume},
-		{"флаг не горит — writable не наблюдается (failed ниже порога)",
+		{"the flag is not lit — writable is not observed (failed below the threshold)",
 			readerObs{infra: false, writable: false, failed: 3, batch: batch}, modeConsume},
-		{"П3: предохранитель перекрывает темп",
+		{"T3: the fuse overrides the rate",
 			readerObs{alive: true, infra: false, failed: batch, batch: batch, rate: true, allowance: 0}, modePauseFail},
-		{"неудачи ниже пачки чтения — предохранитель молчит",
+		{"failures below the read chunk — the fuse is silent",
 			readerObs{failed: batch - 1, batch: batch}, modeConsume},
-		{"нулевой счётчик — не пауза (ветка сброса серии)",
+		{"a zero counter — not a pause (the series reset branch)",
 			readerObs{failed: 0, batch: batch}, modeConsume},
-		{"нулевой счётчик при вырожденной пачке — не пауза",
+		{"a zero counter with a degenerate chunk — not a pause",
 			readerObs{failed: 0, batch: 0}, modeConsume},
-		{"П4: окно темпа исчерпано",
+		{"T4: the rate window is exhausted",
 			readerObs{failed: 0, batch: batch, rate: true, allowance: 0}, modePauseRate},
-		{"П4: окно темпа в долге (allowance < 0)",
+		{"T4: the rate window in debt (allowance < 0)",
 			readerObs{failed: 0, batch: batch, rate: true, allowance: -2}, modePauseRate},
-		{"нет датчика темпа — allowance не наблюдается",
+		{"no rate sensor — allowance is not observed",
 			readerObs{failed: 0, batch: batch, rate: false, allowance: 0}, modeConsume},
-		{"свободные слоты темпа урезают пачку — это чтение, не пауза",
+		{"free rate slots trim the chunk — it is a read, not a pause",
 			readerObs{failed: 0, batch: batch, rate: true, allowance: 2}, modeConsume},
 	} {
 		if got := readerDecide(c.obs); got != c.want {
-			t.Errorf("%s: режим %s, хочу %s (наблюдения: %+v)", c.name, got, c.want, c.obs)
+			t.Errorf("%s: mode %s, want %s (observations: %+v)", c.name, got, c.want, c.obs)
 		}
 	}
 }

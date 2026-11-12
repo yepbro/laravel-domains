@@ -40,59 +40,59 @@ func TestRenderWorker_TaskFinalizedOnLastAttempt(t *testing.T) {
 	// the T-148 territory: a re-delivery error.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err == nil {
-		t.Fatal("таймаут ниже тарпит-лимита — ошибка повторной доставки (T-148)")
+		t.Fatal("a timeout below the tarpit limit — a re-delivery error (T-148)")
 	}
 
 	// Delivery 2: a connection refusal — an early attempt, the host may come up
 	// (the measurement: recovery is observed) — a re-delivery error.
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err == nil {
-		t.Fatal("отказ соединения до последней попытки — ошибка (хосту даётся шанс подняться)")
+		t.Fatal("a connection refusal before the last attempt — an error (the host is given a chance to come up)")
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Fatalf("публикаций до финализации быть не должно: %+v", pubs)
+		t.Fatalf("there must be no publications before the finalization: %+v", pubs)
 	}
 
 	// Delivery 3 = MaxAttempts: the same error — a finalization without a render.
 	err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 3, f.w.processDelivery)
 	if err != nil {
-		t.Fatalf("ошибка класса задачи на последней попытке обязана финализироваться без ошибки (не q:dead): %v", err)
+		t.Fatalf("the task class error on the last attempt must be finalized without an error (not q:dead): %v", err)
 	}
 
 	acked := f.q.ackedSnapshot()
 	if len(acked) != 1 || acked[0] != "e1" {
-		t.Errorf("XACK = %v, нужна e1 (финализация подтверждает доставку)", acked)
+		t.Errorf("XACK = %v, e1 is needed (the finalization acknowledges the delivery)", acked)
 	}
 	row := rwRowSnapshot(f.pool, rwKey)
 	if row.rendered {
-		t.Error("rendered должен остаться false — итог записи сырой HTML HTTP-фазы")
+		t.Error("rendered must stay false — the record outcome is the raw HTML of the HTTP phase")
 	}
 	if row.failedAt == nil {
-		t.Error("render_failed_at обязан ставиться финализацией (T-210) — иначе проход доработки переиздаёт запись")
+		t.Error("render_failed_at must be set by the finalization (T-210) — otherwise the rework pass republishes the record")
 	}
 	if row.hash == nil || string(row.hash) != string(raw[:]) {
-		t.Errorf("content_hash = %v, нужна прежняя ссылка на сырой HTML %s", row.hash, raw)
+		t.Errorf("content_hash = %v, the previous raw HTML reference is needed %s", row.hash, raw)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v, нужна одна q:analyze (конвейер продолжается анализом)", pubs)
+		t.Fatalf("the publications %+v, one q:analyze is needed (the pipeline continues with analysis)", pubs)
 	}
 	if !pubs[0].msg.Fresh {
-		t.Error("q:analyze Fresh=true — финализация дорабатывает текущий эпизод, как успешный рендер")
+		t.Error("q:analyze Fresh=true — the finalization reworks the current episode, like a successful render")
 	}
 	if pubs[0].msg.ZoneID != rwTask.ZoneID || pubs[0].msg.DomainID != rwTask.DomainID ||
 		pubs[0].msg.SubdomainID != rwTask.SubdomainID || pubs[0].msg.Variant != rwTask.Variant {
-		t.Errorf("q:analyze ключ %+v не совпадает с задачей", pubs[0].msg)
+		t.Errorf("the q:analyze key %+v does not match the task", pubs[0].msg)
 	}
 	if puts := f.store.putsSnapshot(); len(puts) != 0 {
-		t.Errorf("Put не должен вызываться: %d", len(puts))
+		t.Errorf("Put must not be called: %d", len(puts))
 	}
 	if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
-		t.Errorf("транзакция не должна открываться (событие на %d)", i)
+		t.Errorf("a transaction must not open (an event on %d)", i)
 	}
 	// The refcount is untouched: the raw HTML stays the entry's final content.
 	if refc := rwRefc(f.pool)[raw]; refc != 1 {
-		t.Errorf("refcount сырого HTML = %d, нужен 1 (ссылка жива)", refc)
+		t.Errorf("the raw HTML refcount = %d, 1 needed (the reference is alive)", refc)
 	}
 }
 
@@ -108,14 +108,14 @@ func TestRenderWorker_TaskBelowLastAttemptRetries(t *testing.T) {
 	for attempt := 1; attempt <= 2; attempt++ {
 		err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), attempt, f.w.processDelivery)
 		if err == nil {
-			t.Fatalf("attempts=%d < MaxAttempts=3: ошибка повторяема (путь q:dead не заменён раньше времени)", attempt)
+			t.Fatalf("attempts=%d < MaxAttempts=3: the error is retryable (the q:dead path is not replaced prematurely)", attempt)
 		}
 	}
 	if acked := f.q.ackedSnapshot(); len(acked) != 0 {
-		t.Errorf("XACK = %v — до последней попытки подтверждения нет", acked)
+		t.Errorf("XACK = %v — before the last attempt there is no acknowledgment", acked)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно: %+v", pubs)
+		t.Errorf("there must be no publications: %+v", pubs)
 	}
 }
 
@@ -136,22 +136,22 @@ func TestRenderWorker_TaskFinalizeBoundary(t *testing.T) {
 		}
 		return f
 	}
-	t.Run("лимит 1 — финализация на первой доставке", func(t *testing.T) {
+	t.Run("limit 1 — a finalization on the first delivery", func(t *testing.T) {
 		f := newFix(t, 1)
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
-			t.Fatalf("лимит 1: первая доставка — задача-класс — финализация: %v", err)
+			t.Fatalf("limit 1: the first delivery — the task class — a finalization: %v", err)
 		}
 		if pubs := f.q.publishesSnapshot(); len(pubs) != 1 {
-			t.Errorf("публикаций q:analyze = %d, нужна 1", len(pubs))
+			t.Errorf("q:analyze publications = %d, 1 is needed", len(pubs))
 		}
 	})
-	t.Run("лимит 5 — четвёртая доставка ещё повторяема", func(t *testing.T) {
+	t.Run("limit 5 — the fourth delivery is still retryable", func(t *testing.T) {
 		f := newFix(t, 5)
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 4); err == nil {
-			t.Fatal("лимит 5: четвёртая доставка ниже лимита — ошибка повторной доставки")
+			t.Fatal("limit 5: the fourth delivery is below the limit — a re-delivery error")
 		}
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 5); err != nil {
-			t.Fatalf("лимит 5: пятая доставка — финализация: %v", err)
+			t.Fatalf("limit 5: the fifth delivery — a finalization: %v", err)
 		}
 	})
 }
@@ -172,29 +172,29 @@ func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 		// even a failed attempt): the "no publications" check does not apply.
 		pubAttempted bool
 	}{
-		{"браузер", func(f *rwFixture) {
+		{"browser", func(f *rwFixture) {
 			f.renderer.err = &render.Error{Class: render.ClassBrowser, URL: "https://spa.example/", Err: errors.New("canceled")}
 		}, false},
-		{"контекст", func(f *rwFixture) {
+		{"context", func(f *rwFixture) {
 			f.renderer.err = &render.Error{Class: render.ClassContext, URL: "https://spa.example/", Err: errors.New("Session not found")}
 		}, false},
-		{"отмена вызывающего контекста (класс task, но не свойство хоста)", func(f *rwFixture) {
+		{"the caller context cancellation (the task class, but not a host property)", func(f *rwFixture) {
 			f.renderer.err = &render.Error{Class: render.ClassTask, URL: "https://spa.example/",
-				Err: fmt.Errorf("задача отменена: %w: %w", context.Canceled, errors.New("canceled"))}
+				Err: fmt.Errorf("the task is cancelled: %w: %w", context.Canceled, errors.New("canceled"))}
 		}, false},
-		{"сбой БД (не ошибка рендера)", func(f *rwFixture) {
-			f.pool.queryErr = errors.New("база недоступна")
+		{"a DB failure (not a render error)", func(f *rwFixture) {
+			f.pool.queryErr = errors.New("the database is unavailable")
 		}, false},
-		{"сбой хранилища (не ошибка рендера)", func(f *rwFixture) {
+		{"a store failure (not a render error)", func(f *rwFixture) {
 			f.renderer.output = rwOutput("<html>dom</html>")
-			f.store.putErr = errors.New("диск полон")
+			f.store.putErr = errors.New("the disk is full")
 		}, false},
-		{"пустой результат рендера (контракт T-064)", func(f *rwFixture) {
+		{"an empty render result (the T-064 contract)", func(f *rwFixture) {
 			f.renderer.output = render.RenderOutput{FinalURL: "https://spa.example/x"} // the DOM is empty
 		}, false},
-		{"сбой публикации q:analyze (Commit прошёл, T-225)", func(f *rwFixture) {
+		{"a q:analyze publication failure (the Commit passed, T-225)", func(f *rwFixture) {
 			f.renderer.output = rwOutput("<html>dom</html>")
-			f.q.publishErrs = []error{errors.New("redis недоступен")}
+			f.q.publishErrs = []error{errors.New("redis unavailable")}
 		}, true},
 	}
 	for _, c := range cases {
@@ -208,14 +208,14 @@ func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 			// must return — the q:dead path is the former one.
 			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 3, f.w.processDelivery)
 			if err == nil {
-				t.Fatal("инфраструктурная ошибка обязана возвращаться и на последней попытке (путь q:dead)")
+				t.Fatal("an infra error must be returned on the last attempt too (the q:dead path)")
 			}
 			if acked := f.q.ackedSnapshot(); len(acked) != 0 {
-				t.Errorf("XACK = %v — инфраструктурная ошибка не подтверждается", acked)
+				t.Errorf("XACK = %v — an infra error is not acknowledged", acked)
 			}
 			if !c.pubAttempted {
 				if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-					t.Errorf("публикаций быть не должно: %+v", pubs)
+					t.Errorf("there must be no publications: %+v", pubs)
 				}
 			}
 			if c.pubAttempted {
@@ -225,10 +225,10 @@ func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 				// will rewrite and publish again.
 				row := rwRowSnapshot(f.pool, rwKey)
 				if !row.rendered {
-					t.Error("строка должна быть записана (Commit до сбоя публикации)")
+					t.Error("the row must be written (the Commit precedes the publication failure)")
 				}
 				if row.failedAt != nil {
-					t.Error("маркер render_failed_at не ставится: сбой публикации — не финализация без рендера")
+					t.Error("the render_failed_at marker is not set: a publication failure is not a finalize-without-render")
 				}
 			}
 		})
@@ -244,15 +244,15 @@ func TestRenderWorker_TaskFinalizeNoRow(t *testing.T) {
 
 	// There is no row at all.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
-		t.Fatalf("строки нет — не ошибка: %v", err)
+		t.Fatalf("no row — not an error: %v", err)
 	}
 	// A row without a final URL.
 	f.pool.seedRow(rwKey, "", nil)
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 3); err != nil {
-		t.Fatalf("без итогового URL — не ошибка: %v", err)
+		t.Fatalf("no final URL — not an error: %v", err)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно: %+v", pubs)
+		t.Errorf("there must be no publications: %+v", pubs)
 	}
 }
 
@@ -265,27 +265,27 @@ func TestRenderWorker_TaskFinalizePublishError(t *testing.T) {
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")
-	f.q.publishErrs = []error{errors.New("redis недоступен")}
+	f.q.publishErrs = []error{errors.New("redis unavailable")}
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err == nil {
-		t.Fatal("сбой публикации q:analyze при финализации — ошибка (повторная доставка)")
+		t.Fatal("a q:analyze publication failure at the finalization — an error (a re-delivery)")
 	}
 	if acked := f.q.ackedSnapshot(); len(acked) != 0 {
-		t.Errorf("XACK = %v — подтверждения быть не должно", acked)
+		t.Errorf("XACK = %v — there must be no acknowledgment", acked)
 	}
 	// The repeat is idempotent: the same finalization, the publication goes through.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
-		t.Fatalf("повторная доставка после сбоя публикации обязана финализироваться: %v", err)
+		t.Fatalf("the re-delivery after a publication failure must be finalized: %v", err)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 2 || pubs[0].stream != queue.StreamAnalyze || pubs[1].stream != queue.StreamAnalyze {
-		t.Errorf("публикации %+v, нужны две q:analyze (до сбоя и на повторе)", pubs)
+		t.Errorf("the publications %+v, two q:analyze needed (before the failure and on the repeat)", pubs)
 	}
 	if !pubs[1].msg.Fresh {
-		t.Error("q:analyze Fresh=true — доработка текущего эпизода")
+		t.Error("q:analyze Fresh=true — the current episode rework")
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.rendered {
-		t.Error("rendered должен остаться false")
+		t.Error("rendered must stay false")
 	}
 }
 
@@ -306,11 +306,11 @@ func TestRenderWorker_TaskFinalizeMetrics(t *testing.T) {
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
-		t.Fatalf("финализация: %v", err)
+		t.Fatalf("finalization: %v", err)
 	}
 	stage := map[string]string{"stage": "render"}
 	if got := rwMetricValue(t, reg, "crawler_stage_tasks_total", stage); got != 1 {
-		t.Errorf("crawler_stage_tasks_total = %v, want 1 (финализация — обработанная задача)", got)
+		t.Errorf("crawler_stage_tasks_total = %v, want 1 (a finalization is a processed task)", got)
 	}
 	labels := map[string]string{"stage": "render", "type": render.ClassTask.String()}
 	if got := rwMetricValue(t, reg, "crawler_stage_errors_total", labels); got != 1 {
@@ -322,17 +322,17 @@ func TestRenderWorker_TaskFinalizeMetrics(t *testing.T) {
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total",
 		map[string]string{"reason": "net::ERR_NAME_NOT_RESOLVED"}); got != -1 {
-		t.Errorf("чужая метка причины = %v, want −1 (нет серии)", got)
+		t.Errorf("a foreign reason label = %v, want −1 (no series)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
 		map[string]string{"engine": config.EngineChromium}); got != -1 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, want −1 (не тарпит, серия не создаётся)", got)
+		t.Errorf("crawler_render_tarpit_finalized_total = %v, want −1 (not a tarpit, the series is not created)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 0 {
-		t.Errorf("crawler_render_cert_finalized_total = %v, want 0 (не cert)", got)
+		t.Errorf("crawler_render_cert_finalized_total = %v, want 0 (not cert)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true"}); got != 0 {
-		t.Errorf("crawler_render_records_total{rendered=true} = %v, want 0 (DOM не записан)", got)
+		t.Errorf("crawler_render_records_total{rendered=true} = %v, want 0 (the DOM is not written)", got)
 	}
 }
 
@@ -374,14 +374,14 @@ func TestRenderWorker_TaskFinalizeTarpitPriority(t *testing.T) {
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
-		t.Fatalf("финализация: %v", err)
+		t.Fatalf("finalization: %v", err)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
 		map[string]string{"engine": config.EngineChromium}); got != 1 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 1 (таймаут — территория T-148)", got)
+		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 1 (a timeout is the T-148 territory)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", nil); got != -1 {
-		t.Errorf("crawler_render_task_finalized_total имеет серии без причины: %v", got)
+		t.Errorf("crawler_render_task_finalized_total has series without a reason: %v", got)
 	}
 }
 
@@ -402,19 +402,19 @@ func TestRenderWorker_DateInvalidCertFromFirstDelivery(t *testing.T) {
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CERT_DATE_INVALID")
 
 	if err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 1, f.w.processDelivery); err != nil {
-		t.Fatalf("DATE_INVALID первой доставки — cert-финализация (не q:dead): %v", err)
+		t.Fatalf("the first delivery DATE_INVALID — a cert finalization (not q:dead): %v", err)
 	}
 	if acked := f.q.ackedSnapshot(); len(acked) != 1 || acked[0] != "e1" {
-		t.Errorf("XACK = %v, нужна e1", acked)
+		t.Errorf("XACK = %v, e1 is needed", acked)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Errorf("публикации %+v, нужна одна q:analyze", pubs)
+		t.Errorf("the publications %+v, one q:analyze is needed", pubs)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 1 {
-		t.Errorf("crawler_render_cert_finalized_total = %v, want 1 (cert-класс)", got)
+		t.Errorf("crawler_render_cert_finalized_total = %v, want 1 (the cert class)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", nil); got != -1 {
-		t.Errorf("crawler_render_task_finalized_total не должен расти: %v", got)
+		t.Errorf("crawler_render_task_finalized_total must not grow: %v", got)
 	}
 }
 
@@ -425,6 +425,6 @@ func TestRenderWorker_DateInvalidCertFromFirstDelivery(t *testing.T) {
 func TestRenderWorker_MaxAttemptsDefault(t *testing.T) {
 	o := Options{}.withDefaults()
 	if o.MaxAttempts != queue.DefaultMaxAttempts {
-		t.Errorf("withDefaults: max_attempts=%d, дефолт очереди %d", o.MaxAttempts, queue.DefaultMaxAttempts)
+		t.Errorf("withDefaults: max_attempts=%d, the queue default %d", o.MaxAttempts, queue.DefaultMaxAttempts)
 	}
 }

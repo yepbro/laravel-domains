@@ -56,7 +56,7 @@ func newRWGateFixture(t *testing.T, threshold int, ceiling float64) (*rwFixture,
 // (T-065) — an infra error for the health gate streak (T-239).
 func rwBrowserErr(url string) error {
 	return &render.Error{Class: render.ClassBrowser, URL: url,
-		Err: errors.New("браузер недоступен: соединение потеряно")}
+		Err: errors.New("the browser is unavailable: the connection is lost")}
 }
 
 // rwGateSuspended — the value of crawler_render_fallback_suspended_total
@@ -94,15 +94,15 @@ func TestRenderWorker_FallbackDecision(t *testing.T) {
 		budget FallbackBudget
 		want   bool
 	}{
-		{"здоров (нулевые состояния)", FallbackGate{}, FallbackBudget{}, true},
-		{"гейт выключен (порог 0), стрик есть", FallbackGate{Threshold: 0, streak: 5}, FallbackBudget{}, true},
-		{"стрик ниже порога", FallbackGate{Threshold: 3, streak: 2}, FallbackBudget{}, true},
-		{"стрик на пороге", FallbackGate{Threshold: 3, streak: 3}, FallbackBudget{}, false},
-		{"стрик за порогом", FallbackGate{Threshold: 3, streak: 7}, FallbackBudget{}, false},
-		{"бюджет без потолка, окно тратилось", FallbackGate{}, FallbackBudget{Ceiling: 0, tasks: 999, published: 999}, true},
-		{"доля окна на потолке — не сверх", FallbackGate{}, FallbackBudget{Ceiling: 30, tasks: 1000, published: 300}, true},
-		{"окно бюджета приостановлено", FallbackGate{}, FallbackBudget{Ceiling: 30, hold: true}, false},
-		{"гейт и бюджет одновременно", FallbackGate{Threshold: 1, streak: 1}, FallbackBudget{Ceiling: 30, hold: true}, false},
+		{"healthy (zero states)", FallbackGate{}, FallbackBudget{}, true},
+		{"the gate is off (threshold 0), a streak exists", FallbackGate{Threshold: 0, streak: 5}, FallbackBudget{}, true},
+		{"the streak below the threshold", FallbackGate{Threshold: 3, streak: 2}, FallbackBudget{}, true},
+		{"the streak at the threshold", FallbackGate{Threshold: 3, streak: 3}, FallbackBudget{}, false},
+		{"the streak beyond the threshold", FallbackGate{Threshold: 3, streak: 7}, FallbackBudget{}, false},
+		{"a budget without a cap, the window was spent", FallbackGate{}, FallbackBudget{Ceiling: 0, tasks: 999, published: 999}, true},
+		{"the window share at the cap — not over", FallbackGate{}, FallbackBudget{Ceiling: 30, tasks: 1000, published: 300}, true},
+		{"the budget window suspended", FallbackGate{}, FallbackBudget{Ceiling: 30, hold: true}, false},
+		{"the gate and the budget at once", FallbackGate{Threshold: 1, streak: 1}, FallbackBudget{Ceiling: 30, hold: true}, false},
 	}
 	cand := fallbackCandidate{task: rwTask, reason: "timeout"}
 	for _, c := range cases {
@@ -131,11 +131,11 @@ func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 	// the browser class is not covered by a finalization), no event.
 	for i := 1; i <= 2; i++ {
 		if err := f.w.processDelivery(context.Background(), rwDelivery(fmt.Sprintf("e%d", i)), 1); err == nil {
-			t.Fatalf("инфра-ошибка класса браузера — ошибка доставки (redelivery), доставка %d", i)
+			t.Fatalf("a browser class infra error — a delivery error (redelivery), delivery %d", i)
 		}
 	}
 	if got := rwGateSuspended(t, reg); got != 0 {
-		t.Errorf("crawler_render_fallback_suspended_total{gate} до порога = %v, want 0 (серия предсоздана нулём, S-P1-4)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{gate} before the threshold = %v, want 0 (the series is pre-created as zero, S-P1-4)", got)
 	}
 
 	// A candidate between the infra errors (the streak 2 < 3): the publication goes,
@@ -143,17 +143,17 @@ func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 	// flow's tarpits would open the gate for a down engine.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
-		t.Fatalf("кандидат при открытом гейте — публикация, не ошибка: %v", err)
+		t.Fatalf("a candidate with the gate open — a publication, not an error: %v", err)
 	}
 	if n := rwFBCount(t, f); n != 1 {
-		t.Fatalf("публикаций q:render-fallback = %d, нужна 1 (гейт открыт)", n)
+		t.Fatalf("q:render-fallback publications = %d, 1 is needed (the gate is open)", n)
 	}
 
 	// The third infra error — the threshold (the config default 3): the
 	// suspension event, one per the "open → closed" transition.
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e3"), 1); err == nil {
-		t.Fatal("третья инфра-ошибка — ошибка доставки (redelivery)")
+		t.Fatal("the third infra error — a delivery error (redelivery)")
 	}
 	if got := rwGateSuspended(t, reg); got != 1 {
 		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 1", got)
@@ -170,24 +170,24 @@ func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(),
 		rwKeyDelivery(t, "t2", key2, "spa.example"), 2); err != nil {
-		t.Fatalf("кандидат при закрытом гейте — штатная финализация, не ошибка: %v", err)
+		t.Fatalf("a candidate with the gate closed — a normal finalization, not an error: %v", err)
 	}
 	if n := rwFBCount(t, f); n != 1 {
-		t.Errorf("публикаций q:render-fallback = %d, want 1 (гейт закрыт — новой быть не должно)", n)
+		t.Errorf("q:render-fallback publications = %d, want 1 (the gate is closed — there must be no new one)", n)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 2 || pubs[1].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v, нужна q:analyze финализации (как при выключенном фолбэке)", pubs)
+		t.Fatalf("the publications %+v, the finalization q:analyze is needed (as with the fallback off)", pubs)
 	}
 	if row := rwRowSnapshot(f.pool, key2); row.failedAt == nil {
-		t.Error("маркер render_failed_at обязан ставиться (приостановка = сегодняшняя финализация, ТЗ §4.4 п.3)")
+		t.Error("the render_failed_at marker must be set (a suspension = the finalization of today, spec §4.4 item 3)")
 	}
 
 	// An infra error beyond the threshold: the event is not multiplied (the streak 4).
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 	_ = f.w.processDelivery(context.Background(), rwDelivery("e4"), 1)
 	if got := rwGateSuspended(t, reg); got != 1 {
-		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (одно событие на защёлкивание)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (one event per latching)", got)
 	}
 }
 
@@ -207,7 +207,7 @@ func TestRenderWorker_FallbackGateRecoversOnSuccess(t *testing.T) {
 		_ = f.w.processDelivery(context.Background(), rwDelivery(fmt.Sprintf("e%d", i)), 1)
 	}
 	if got := rwGateSuspended(t, reg); got != 1 {
-		t.Fatalf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (порог достигнут)", got)
+		t.Fatalf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (the threshold reached)", got)
 	}
 
 	// The recovery: a successful render of another row (the manager
@@ -217,25 +217,25 @@ func TestRenderWorker_FallbackGateRecoversOnSuccess(t *testing.T) {
 	f.renderer.err = nil
 	f.renderer.output = rwOutput("<html><body>dom</body></html>")
 	if err := f.w.processDelivery(context.Background(), rwKeyDelivery(t, "ok1", key2, "ok.example"), 1); err != nil {
-		t.Fatalf("успешный рендер после восстановления: %v", err)
+		t.Fatalf("a successful render after the recovery: %v", err)
 	}
 	if row := rwRowSnapshot(f.pool, key2); !row.rendered {
-		t.Fatal("успешный рендер обязан записать DOM (движок жив)")
+		t.Fatal("a successful render must write the DOM (the engine is alive)")
 	}
 
 	// The gate is open: the candidate is published to the fallback, no marker.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
-		t.Fatalf("кандидат после восстановления — публикация, не ошибка: %v", err)
+		t.Fatalf("a candidate after the recovery — a publication, not an error: %v", err)
 	}
 	if n := rwFBCount(t, f); n != 1 {
-		t.Errorf("публикаций q:render-fallback = %d, нужна 1 (гейт открыт восстановлением)", n)
+		t.Errorf("q:render-fallback publications = %d, 1 is needed (the gate is opened by the recovery)", n)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt != nil {
-		t.Error("маркер не ставится — запись ждёт фолбэка (ФТ-10)")
+		t.Error("the marker is not set — the record waits for the fallback (FR-10)")
 	}
 	if got := rwGateSuspended(t, reg); got != 1 {
-		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (события восстановления нет)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (there is no recovery event)", got)
 	}
 }
 
@@ -261,15 +261,15 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 		f.pool.seedRow(key, "https://spa.example/", &raw)
 		if err := f.w.processDelivery(context.Background(),
 			rwKeyDelivery(t, fmt.Sprintf("a%d", i), key, "spa.example"), 2); err != nil {
-			t.Fatalf("кандидат %d: публикация: %v", i, err)
+			t.Fatalf("candidate %d: the publication: %v", i, err)
 		}
 		pubs++
 	}
 	if n := rwFBCount(t, f); n != pubs {
-		t.Fatalf("публикаций q:render-fallback = %d, want %d", n, pubs)
+		t.Fatalf("q:render-fallback publications = %d, want %d", n, pubs)
 	}
 	if got := rwBudgetSuspended(t, reg); got != 0 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} до закрытия окна = %v, want 0 (серия предсоздана нулём)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{budget} before the window closes = %v, want 0 (the series is pre-created as zero)", got)
 	}
 
 	// Phase B — filler up to 1000 acknowledged deliveries: deliveries
@@ -281,13 +281,13 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 			key := rwRowKey{zone: 9, domain: int64(50000 + from + i), subdomain: 1, variant: 0}
 			if err := f.w.processDelivery(context.Background(),
 				rwKeyDelivery(t, fmt.Sprintf("b%d", from+i), key, "missing.example"), 1); err != nil {
-				t.Fatalf("наполнитель %d: строки нет — не ошибка: %v", from+i, err)
+				t.Fatalf("filler %d: no row — not an error: %v", from+i, err)
 			}
 		}
 	}
 	filler(0, 899)
 	if got := rwBudgetSuspended(t, reg); got != 1 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 1 (окно перерасходовало потолок)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 1 (the window exceeded the cap)", got)
 	}
 
 	// Phase C — a candidate in the suspended window: a finalization with the marker
@@ -296,13 +296,13 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 	f.pool.seedRow(key, "https://spa.example/", &raw)
 	if err := f.w.processDelivery(context.Background(),
 		rwKeyDelivery(t, "c1", key, "spa.example"), 2); err != nil {
-		t.Fatalf("кандидат в приостановленном окне — штатная финализация, не ошибка: %v", err)
+		t.Fatalf("a candidate in the suspended window — a normal finalization, not an error: %v", err)
 	}
 	if n := rwFBCount(t, f); n != pubs {
-		t.Errorf("публикаций q:render-fallback = %d, want %d (бюджет исчерпан — окно держит)", n, pubs)
+		t.Errorf("q:render-fallback publications = %d, want %d (the budget is exhausted — the window holds)", n, pubs)
 	}
 	if row := rwRowSnapshot(f.pool, key); row.failedAt == nil {
-		t.Error("после исчерпания бюджета маркер render_failed_at ставится (ТЗ §4.4 п.4)")
+		t.Error("after the budget is exhausted the render_failed_at marker is set (spec §4.4 item 4)")
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_published_total",
 		map[string]string{"reason": "timeout"}); got != float64(pubs) {
@@ -314,7 +314,7 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 	// publications: the estimate returns the fallback.
 	filler(899, fallbackBudgetWindow-1)
 	if got := rwBudgetSuspended(t, reg); got != 1 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 1 (одно событие на защёлкивание)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 1 (one event per latching)", got)
 	}
 
 	// Phase E — the next window publishes again (self-reset).
@@ -322,13 +322,13 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 	f.pool.seedRow(key2, "https://spa.example/", &raw)
 	if err := f.w.processDelivery(context.Background(),
 		rwKeyDelivery(t, "e1", key2, "spa.example"), 2); err != nil {
-		t.Fatalf("кандидат после окна — публикация, не ошибка: %v", err)
+		t.Fatalf("a candidate after the window — a publication, not an error: %v", err)
 	}
 	if n := rwFBCount(t, f); n != pubs+1 {
-		t.Errorf("публикаций q:render-fallback = %d, want %d (окно возобновило публикации)", n, pubs+1)
+		t.Errorf("q:render-fallback publications = %d, want %d (the window resumed the publications)", n, pubs+1)
 	}
 	if got := rwBudgetSuspended(t, reg); got != 1 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 1 (возобновление события не рождает)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 1 (the resumption does not bear an event)", got)
 	}
 }
 
@@ -346,28 +346,28 @@ func TestRenderWorker_FallbackBudgetExactCeilingNotSuspended(t *testing.T) {
 		f.pool.seedRow(key, "https://spa.example/", &raw)
 		if err := f.w.processDelivery(context.Background(),
 			rwKeyDelivery(t, fmt.Sprintf("a%d", i), key, "spa.example"), 2); err != nil {
-			t.Fatalf("кандидат %d: публикация: %v", i, err)
+			t.Fatalf("candidate %d: the publication: %v", i, err)
 		}
 	}
 	for i := 0; i < 900; i++ {
 		key := rwRowKey{zone: 9, domain: int64(80000 + i), subdomain: 1, variant: 0}
 		if err := f.w.processDelivery(context.Background(),
 			rwKeyDelivery(t, fmt.Sprintf("b%d", i), key, "missing.example"), 1); err != nil {
-			t.Fatalf("наполнитель %d: %v", i, err)
+			t.Fatalf("filler %d: %v", i, err)
 		}
 	}
 	if got := rwBudgetSuspended(t, reg); got != 0 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 0 (доля на потолке, не сверх; серия предсоздана нулём)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 0 (the share at the cap, not over; the series is pre-created as zero)", got)
 	}
 	// The next candidate is published: the window was not suspended.
 	key := rwRowKey{zone: 3, domain: 31000, subdomain: 1, variant: 0}
 	f.pool.seedRow(key, "https://spa.example/", &raw)
 	if err := f.w.processDelivery(context.Background(),
 		rwKeyDelivery(t, "c1", key, "spa.example"), 2); err != nil {
-		t.Fatalf("кандидат после окна на потолке: %v", err)
+		t.Fatalf("a candidate after the window at the cap: %v", err)
 	}
 	if n := rwFBCount(t, f); n != 101 {
-		t.Errorf("публикаций q:render-fallback = %d, want 101", n)
+		t.Errorf("q:render-fallback publications = %d, want 101", n)
 	}
 }
 
@@ -391,25 +391,25 @@ func TestRenderWorker_FallbackGateNoOpDoesNotReset(t *testing.T) {
 	missing := rwRowKey{zone: 9, domain: 99999, subdomain: 1, variant: 0}
 	if err := f.w.processDelivery(context.Background(),
 		rwKeyDelivery(t, "noop", missing, "missing.example"), 1); err != nil {
-		t.Fatalf("no-op — не ошибка: %v", err)
+		t.Fatalf("a no-op — not an error: %v", err)
 	}
 
 	// The third infra error — the threshold is reached (the no-op did not reset the streak).
 	_ = f.w.processDelivery(context.Background(), rwDelivery("e3"), 1)
 	if got := rwGateSuspended(t, reg); got != 1 {
-		t.Fatalf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (no-op без рендера стрик не сбрасывает)", got)
+		t.Fatalf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (a no-op without a render does not reset the streak)", got)
 	}
 
 	// A candidate with the gate closed — the marker, without a publication.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
-		t.Fatalf("кандидат при закрытом гейте — штатная финализация: %v", err)
+		t.Fatalf("a candidate with the gate closed — a normal finalization: %v", err)
 	}
 	if n := rwFBCount(t, f); n != 0 {
-		t.Errorf("публикаций q:render-fallback = %d, хочу 0", n)
+		t.Errorf("q:render-fallback publications = %d, want 0", n)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt == nil {
-		t.Error("маркер render_failed_at ставится (приостановка = сегодняшняя финализация)")
+		t.Error("the render_failed_at marker is set (a suspension = the finalization of today)")
 	}
 }
 
@@ -426,10 +426,10 @@ func TestRenderWorker_FallbackDuplicateDuringSuspension(t *testing.T) {
 	// The publication happened; the XACK was lost — the delivery will return as a duplicate.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
-		t.Fatalf("фолбэк-публикация: %v", err)
+		t.Fatalf("the fallback publication: %v", err)
 	}
 	if n := rwFBCount(t, f); n != 1 {
-		t.Fatalf("публикаций q:render-fallback = %d, нужна 1", n)
+		t.Fatalf("q:render-fallback publications = %d, 1 is needed", n)
 	}
 
 	// The engine fell: the gate is closed by the streak.
@@ -442,17 +442,17 @@ func TestRenderWorker_FallbackDuplicateDuringSuspension(t *testing.T) {
 	// without q:analyze — worker B reworks the entry.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1dup"), 2); err != nil {
-		t.Fatalf("дубль в приостановке подтверждается без ошибки: %v", err)
+		t.Fatalf("a duplicate within the suspension is acknowledged without an error: %v", err)
 	}
 	if n := rwFBCount(t, f); n != 1 {
-		t.Errorf("публикаций q:render-fallback = %d, want 1 (дубль не дублирует стрим)", n)
+		t.Errorf("q:render-fallback publications = %d, want 1 (a duplicate does not duplicate the stream)", n)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt != nil {
-		t.Error("дублю маркер не нужен — запись уже ждёт воркера B (ФТ-10)")
+		t.Error("a duplicate needs no marker — the record already waits for worker B (FR-10)")
 	}
 	for _, p := range f.q.publishesSnapshot() {
 		if p.stream == queue.StreamAnalyze {
-			t.Errorf("q:analyze дублю не положен: %+v", p)
+			t.Errorf("no q:analyze is due for a duplicate: %+v", p)
 		}
 	}
 }
@@ -486,18 +486,18 @@ func TestRenderWorker_FallbackStatesParallel(t *testing.T) {
 	// All the publications went through: the numerator = n (the accounting without races),
 	// the window's share n/n below the 30% cap never latched — the window is not closed yet.
 	if got := rwFBCount(t, f); got != n {
-		t.Errorf("публикаций q:render-fallback = %d, want %d", got, n)
+		t.Errorf("q:render-fallback publications = %d, want %d", got, n)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_published_total",
 		map[string]string{"reason": "timeout"}); got != float64(n) {
 		t.Errorf("crawler_render_fallback_published_total{timeout} = %v, want %d", got, n)
 	}
 	if got := rwBudgetSuspended(t, reg); got != 0 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 0 (окно не закрывалось; серия предсоздана нулём)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 0 (the window never closed; the series is pre-created as zero)", got)
 	}
 	_, budget := f.w.fallbackStates()
 	if budget.tasks != n || budget.published != n {
-		t.Errorf("окно бюджета: tasks=%d published=%d, want %d/%d (учёт без гонок)", budget.tasks, budget.published, n, n)
+		t.Errorf("the budget window: tasks=%d published=%d, want %d/%d (the accounting without races)", budget.tasks, budget.published, n, n)
 	}
 }
 
@@ -531,16 +531,16 @@ func TestRenderWorker_FallbackWorkerBNoState(t *testing.T) {
 	_ = f.w.processDelivery(context.Background(), rwDelivery("e1"), 1)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
-		t.Fatalf("воркер B: кандидат — финализация (рекурсия запрещена): %v", err)
+		t.Fatalf("worker B: the candidate — a finalization (the recursion is forbidden): %v", err)
 	}
 	gate, budget := f.w.fallbackStates()
 	if gate.streak != 0 || budget.tasks != 0 || budget.published != 0 || budget.hold {
-		t.Errorf("состояния воркера B: gate=%+v budget=%+v, хочу нулевые (наблюдения только в вооружённой сборке)", gate, budget)
+		t.Errorf("the worker B states: gate=%+v budget=%+v, want zeros (the observations only in the armed build)", gate, budget)
 	}
 	// The series are pre-created with zeros in all builds (S-P1-4): worker B
 	// has the family, but it does not grow — no suspension events.
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_suspended_total", nil); got != 0 {
-		t.Errorf("crawler_render_fallback_suspended_total = %v, want 0 (серии предсозданы нулями, не растут)", got)
+		t.Errorf("crawler_render_fallback_suspended_total = %v, want 0 (the series are pre-created as zeros, they do not grow)", got)
 	}
 	if got := rwGateSuspended(t, reg); got != 0 {
 		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 0", got)
@@ -580,18 +580,18 @@ func TestRenderWorker_FallbackEngineDownScenario(t *testing.T) {
 	for i, k := range keys {
 		del := rwKeyDelivery(t, fmt.Sprintf("d%d", i), k, "spa.example")
 		if err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", del, 1, f.w.processDelivery); err == nil {
-			t.Fatalf("движок лёг: доставка %d обязана вернуться ошибкой (redelivery)", i)
+			t.Fatalf("the engine fell: delivery %d must come back as an error (redelivery)", i)
 		}
 	}
 	if acked := f.q.ackedSnapshot(); len(acked) != 0 {
-		t.Errorf("XACK = %v, хочу пусто (задачи в redelivery, попытки не жгутся)", acked)
+		t.Errorf("XACK = %v, want empty (the tasks in redelivery, the attempts are not burned)", acked)
 	}
 	if n := rwFBCount(t, f); n != 0 {
-		t.Fatalf("публикаций q:render-fallback = %d, хочу 0 (движок лёг — перелива нет)", n)
+		t.Fatalf("q:render-fallback publications = %d, want 0 (the engine fell — no overflow)", n)
 	}
 	// The streak reached the threshold — the gate event (the engine degradation alert).
 	if got := rwGateSuspended(t, reg); got != 1 {
-		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (стрик инфра-ошибок)", got)
+		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (the infra error streak)", got)
 	}
 
 	// A mixed candidate with the engine down: the engine-branched task
@@ -601,20 +601,20 @@ func TestRenderWorker_FallbackEngineDownScenario(t *testing.T) {
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	del := rwKeyDelivery(t, "c1", keys[0], "spa.example")
 	if err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", del, 2, f.w.processDelivery); err != nil {
-		t.Fatalf("кандидат при лежачем движке — штатная финализация, не ошибка: %v", err)
+		t.Fatalf("a candidate with the engine down — a normal finalization, not an error: %v", err)
 	}
 	if n := rwFBCount(t, f); n != 0 {
-		t.Errorf("публикаций q:render-fallback = %d, хочу 0 (гейт закрыт)", n)
+		t.Errorf("q:render-fallback publications = %d, want 0 (the gate is closed)", n)
 	}
 	if row := rwRowSnapshot(f.pool, keys[0]); row.failedAt == nil {
-		t.Error("маркер render_failed_at ставится — приостановка = сегодняшняя финализация")
+		t.Error("the render_failed_at marker is set — a suspension = the finalization of today")
 	}
 	acked := f.q.ackedSnapshot()
 	if len(acked) != 1 || acked[0] != "c1" {
-		t.Errorf("XACK = %v, хочу [c1] (финализация подтверждает доставку)", acked)
+		t.Errorf("XACK = %v, want [c1] (the finalization acknowledges the delivery)", acked)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v, нужна одна q:analyze (конвейер доходит до анализа)", pubs)
+		t.Fatalf("the publications %+v, one q:analyze is needed (the pipeline reaches the analysis)", pubs)
 	}
 }

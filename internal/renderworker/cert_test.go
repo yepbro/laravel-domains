@@ -53,43 +53,43 @@ func TestRenderWorker_CertFinalizedWithoutRender(t *testing.T) {
 			// a nil return.
 			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 1, f.w.processDelivery)
 			if err != nil {
-				t.Fatalf("cert-ошибка первой доставки обязана финализироваться без ошибки (не q:dead): %v", err)
+				t.Fatalf("the first delivery cert error must be finalized without an error (not q:dead): %v", err)
 			}
 
 			acked := f.q.ackedSnapshot()
 			if len(acked) != 1 || acked[0] != "e1" {
-				t.Errorf("XACK = %v, нужна e1 (финализация подтверждает доставку)", acked)
+				t.Errorf("XACK = %v, e1 is needed (the finalization acknowledges the delivery)", acked)
 			}
 			row := rwRowSnapshot(f.pool, rwKey)
 			if row.rendered {
-				t.Error("rendered должен остаться false — итог записи сырой HTML HTTP-фазы")
+				t.Error("rendered must stay false — the record outcome is the raw HTML of the HTTP phase")
 			}
 			if row.failedAt == nil {
-				t.Error("render_failed_at обязан ставиться финализацией (T-210) — иначе проход доработки переиздаёт запись")
+				t.Error("render_failed_at must be set by the finalization (T-210) — otherwise the rework pass republishes the record")
 			}
 			if row.hash == nil || string(row.hash) != string(raw[:]) {
-				t.Errorf("content_hash = %v, нужна прежняя ссылка на сырой HTML %s", row.hash, raw)
+				t.Errorf("content_hash = %v, the previous raw HTML reference is needed %s", row.hash, raw)
 			}
 			pubs := f.q.publishesSnapshot()
 			if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-				t.Fatalf("публикации %+v, нужна одна q:analyze (конвейер продолжается анализом)", pubs)
+				t.Fatalf("the publications %+v, one q:analyze is needed (the pipeline continues with analysis)", pubs)
 			}
 			if !pubs[0].msg.Fresh {
-				t.Error("q:analyze Fresh=true — финализация дорабатывает текущий эпизод, как успешный рендер")
+				t.Error("q:analyze Fresh=true — the finalization reworks the current episode, like a successful render")
 			}
 			if pubs[0].msg.ZoneID != rwTask.ZoneID || pubs[0].msg.DomainID != rwTask.DomainID ||
 				pubs[0].msg.SubdomainID != rwTask.SubdomainID || pubs[0].msg.Variant != rwTask.Variant {
-				t.Errorf("q:analyze ключ %+v не совпадает с задачей", pubs[0].msg)
+				t.Errorf("the q:analyze key %+v does not match the task", pubs[0].msg)
 			}
 			if puts := f.store.putsSnapshot(); len(puts) != 0 {
-				t.Errorf("Put не должен вызываться: %d", len(puts))
+				t.Errorf("Put must not be called: %d", len(puts))
 			}
 			if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
-				t.Errorf("транзакция не должна открываться (событие на %d)", i)
+				t.Errorf("a transaction must not open (an event on %d)", i)
 			}
 			// The refcount is untouched: the raw HTML stays the entry's final content.
 			if refc := rwRefc(f.pool)[raw]; refc != 1 {
-				t.Errorf("refcount сырого HTML = %d, нужен 1 (ссылка жива)", refc)
+				t.Errorf("the raw HTML refcount = %d, 1 needed (the reference is alive)", refc)
 			}
 		})
 	}
@@ -107,14 +107,14 @@ func TestRenderWorker_CertFinalizeAnyAttempt(t *testing.T) {
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), attempt); err != nil {
-			t.Fatalf("attempts=%d: cert-класс финализируется на любом номере доставки: %v", attempt, err)
+			t.Fatalf("attempts=%d: the cert class is finalized at any delivery number: %v", attempt, err)
 		}
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 3 {
-		t.Errorf("публикаций q:analyze = %d, нужно 3 (по одной на доставку)", len(pubs))
+		t.Errorf("q:analyze publications = %d, 3 needed (one per delivery)", len(pubs))
 	}
 	if acks := len(f.q.ackedSnapshot()); acks != 0 {
-		t.Errorf("XACK = %d — processDelivery не подтверждает сам (XACK — Processing)", acks)
+		t.Errorf("XACK = %d — processDelivery does not acknowledge itself (the XACK is Processings)", acks)
 	}
 }
 
@@ -127,15 +127,15 @@ func TestRenderWorker_CertFinalizeNoRow(t *testing.T) {
 
 	// There is no row at all.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
-		t.Fatalf("строки нет — не ошибка: %v", err)
+		t.Fatalf("no row — not an error: %v", err)
 	}
 	// A row without a final URL.
 	f.pool.seedRow(rwKey, "", nil)
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 1); err != nil {
-		t.Fatalf("без итогового URL — не ошибка: %v", err)
+		t.Fatalf("no final URL — not an error: %v", err)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно: %+v", pubs)
+		t.Errorf("there must be no publications: %+v", pubs)
 	}
 }
 
@@ -148,28 +148,28 @@ func TestRenderWorker_CertFinalizePublishError(t *testing.T) {
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CERT_AUTHORITY_INVALID")
-	f.q.publishErrs = []error{errors.New("redis недоступен")}
+	f.q.publishErrs = []error{errors.New("redis unavailable")}
 
 	// A re-delivery after the publication failure (a claim, attempts grew).
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err == nil {
-		t.Fatal("сбой публикации q:analyze при финализации — ошибка (повторная доставка)")
+		t.Fatal("a q:analyze publication failure at the finalization — an error (a re-delivery)")
 	}
 	if acked := f.q.ackedSnapshot(); len(acked) != 0 {
-		t.Errorf("XACK = %v — подтверждения быть не должно", acked)
+		t.Errorf("XACK = %v — there must be no acknowledgment", acked)
 	}
 	// The repeat is idempotent: the same finalization, the publication goes through.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
-		t.Fatalf("повторная доставка после сбоя публикации обязана финализироваться: %v", err)
+		t.Fatalf("the re-delivery after a publication failure must be finalized: %v", err)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 2 || pubs[0].stream != queue.StreamAnalyze || pubs[1].stream != queue.StreamAnalyze {
-		t.Errorf("публикации %+v, нужны две q:analyze (до сбоя и на повторе)", pubs)
+		t.Errorf("the publications %+v, two q:analyze needed (before the failure and on the repeat)", pubs)
 	}
 	if !pubs[1].msg.Fresh {
-		t.Error("q:analyze Fresh=true — доработка текущего эпизода")
+		t.Error("q:analyze Fresh=true — the current episode rework")
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.rendered {
-		t.Error("rendered должен остаться false")
+		t.Error("rendered must stay false")
 	}
 }
 
@@ -185,14 +185,14 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"отказ соединения (может быть временным)", rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")},
-		{"таймаут соединения (может быть временным)", rwCertErr("https://spa.example/", "net::ERR_CONNECTION_TIMED_OUT")},
-		{"код сертификата в чужом классе (контекст умер)", &render.Error{
+		{"a connection refusal (may be temporary)", rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")},
+		{"a connection timeout (may be temporary)", rwCertErr("https://spa.example/", "net::ERR_CONNECTION_TIMED_OUT")},
+		{"a certificate code in a foreign class (the context died)", &render.Error{
 			Class: render.ClassContext, URL: "https://spa.example/",
 			Err: &chromedp.LoadError{ErrorText: "net::ERR_CERT_AUTHORITY_INVALID"}}},
-		{"обычная ошибка страницы без кода загрузки", &render.Error{
+		{"an ordinary page error without a load code", &render.Error{
 			Class: render.ClassTask, URL: "https://spa.example/", Err: errors.New("session crashed")}},
-		{"браузер", &render.Error{
+		{"the browser", &render.Error{
 			Class: render.ClassBrowser, URL: "https://spa.example/", Err: errors.New("canceled")}},
 	}
 	for _, c := range cases {
@@ -208,16 +208,16 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 			// delivery is the T-172 policy, taskfinal_test.go).
 			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 2, f.w.processDelivery)
 			if err == nil {
-				t.Fatal("ошибка вне cert-класса обязана возвращаться (путь q:dead прежний)")
+				t.Fatal("an error outside the cert class must be returned (the q:dead path is the same as before)")
 			}
 			if acked := f.q.ackedSnapshot(); len(acked) != 0 {
-				t.Errorf("XACK = %v — ошибка вне cert-класса не подтверждается", acked)
+				t.Errorf("XACK = %v — an error outside the cert class is not acknowledged", acked)
 			}
 			if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-				t.Errorf("публикаций быть не должно: %+v", pubs)
+				t.Errorf("there must be no publications: %+v", pubs)
 			}
 			if row := rwRowSnapshot(f.pool, rwKey); row.rendered {
-				t.Error("rendered должен остаться false")
+				t.Error("rendered must stay false")
 			}
 		})
 	}
@@ -225,7 +225,7 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 	// A certificate code in a foreign class is not finalized on the last
 	// delivery either: the context class — infrastructure (T-172 finalizes
 	// only the task class).
-	t.Run("код сертификата в чужом классе на последней доставке", func(t *testing.T) {
+	t.Run("a certificate code in a foreign class on the last delivery", func(t *testing.T) {
 		f := newRWFixture(t)
 		raw := rwTestHash(1)
 		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
@@ -235,17 +235,17 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 
 		err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 3, f.w.processDelivery)
 		if err == nil {
-			t.Fatal("ошибка чужого класса обязана возвращаться и на последней доставке")
+			t.Fatal("a foreign class error must be returned on the last delivery too")
 		}
 		if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-			t.Errorf("публикаций быть не должно: %+v", pubs)
+			t.Errorf("there must be no publications: %+v", pubs)
 		}
 	})
 
 	// A page timeout stays the territory of T-148: the cert recognition
 	// (ProcessResult checks it first) must not swallow timeouts —
 	// below the tarpit limit it is a retryable error.
-	t.Run("таймаут ниже тарпит-лимита (территория T-148)", func(t *testing.T) {
+	t.Run("a timeout below the tarpit limit (the T-148 territory)", func(t *testing.T) {
 		f := newRWFixture(t)
 		raw := rwTestHash(1)
 		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
@@ -253,10 +253,10 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 
 		err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 1, f.w.processDelivery)
 		if err == nil {
-			t.Fatal("таймаут ниже тарпит-лимита — ошибка повторной доставки (T-148), не cert-финализация")
+			t.Fatal("a timeout below the tarpit limit — a re-delivery error (T-148), not a cert finalization")
 		}
 		if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-			t.Errorf("публикаций быть не должно: %+v", pubs)
+			t.Errorf("there must be no publications: %+v", pubs)
 		}
 	})
 }
@@ -277,11 +277,11 @@ func TestRenderWorker_CertMetrics(t *testing.T) {
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CERT_AUTHORITY_INVALID")
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
-		t.Fatalf("финализация: %v", err)
+		t.Fatalf("finalization: %v", err)
 	}
 	stage := map[string]string{"stage": "render"}
 	if got := rwMetricValue(t, reg, "crawler_stage_tasks_total", stage); got != 1 {
-		t.Errorf("crawler_stage_tasks_total = %v, want 1 (финализация — обработанная задача)", got)
+		t.Errorf("crawler_stage_tasks_total = %v, want 1 (a finalization is a processed task)", got)
 	}
 	labels := map[string]string{"stage": "render", "type": render.ClassTask.String()}
 	if got := rwMetricValue(t, reg, "crawler_stage_errors_total", labels); got != 1 {
@@ -292,9 +292,9 @@ func TestRenderWorker_CertMetrics(t *testing.T) {
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
 		map[string]string{"engine": config.EngineChromium}); got != -1 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, want −1 (cert ≠ тарпит, серия не создаётся)", got)
+		t.Errorf("crawler_render_tarpit_finalized_total = %v, want −1 (cert ≠ tarpit, the series is not created)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true"}); got != 0 {
-		t.Errorf("crawler_render_records_total{rendered=true} = %v, want 0 (DOM не записан)", got)
+		t.Errorf("crawler_render_records_total{rendered=true} = %v, want 0 (the DOM is not written)", got)
 	}
 }

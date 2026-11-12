@@ -218,7 +218,7 @@ func (p *rwFakePool) seedRowMarked(key rwRowKey, finalURL string, hash *content.
 }
 
 func (p *rwFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("rwFakePool: CopyFrom не должен вызываться")
+	return 0, errors.New("rwFakePool: CopyFrom must not be called")
 }
 
 // Exec — the "render impossible" marker (T-210, renderFailMarkerSQL):
@@ -232,7 +232,7 @@ func (p *rwFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if sql != renderFailMarkerSQL {
-		return pgconn.CommandTag{}, errors.New("rwFakePool: неожидаемый Exec вне транзакции: " + sql)
+		return pgconn.CommandTag{}, errors.New("rwFakePool: an unexpected Exec outside a transaction: " + sql)
 	}
 	if p.mutateBeforeMark != nil {
 		p.mutateBeforeMark(p)
@@ -241,7 +241,7 @@ func (p *rwFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.
 		return pgconn.CommandTag{}, p.markErr
 	}
 	if len(args) != 5 {
-		return pgconn.CommandTag{}, fmt.Errorf("rwFakePool: маркер: параметров %d, нужно 5", len(args))
+		return pgconn.CommandTag{}, fmt.Errorf("rwFakePool: marker: %d parameters, 5 needed", len(args))
 	}
 	key := rwRowKey{zone: args[0].(int16), domain: args[1].(int64), subdomain: args[2].(int16), variant: args[3].(int16)}
 	oldHash := args[4].([]byte)
@@ -282,7 +282,7 @@ func (r *rwFakeRows) Next() bool {
 
 func (r *rwFakeRows) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) || len(dest) != 4 {
-		return fmt.Errorf("rwFakeRows: Scan без Next или приёмников %d (нужно 4)", len(dest))
+		return fmt.Errorf("rwFakeRows: Scan without Next or %d destinations (4 needed)", len(dest))
 	}
 	row := r.rows[r.i-1]
 	// NULL columns leave the destination untouched (the pgx semantics:
@@ -291,25 +291,25 @@ func (r *rwFakeRows) Scan(dest ...any) error {
 		if d, ok := dest[0].(**string); ok {
 			*d = row[0].(*string)
 		} else {
-			return fmt.Errorf("rwFakeRows: приёмник[0] %T, ожидается **string", dest[0])
+			return fmt.Errorf("rwFakeRows: destination[0] %T, a **string expected", dest[0])
 		}
 	}
 	if row[1] != nil {
 		if d, ok := dest[1].(*[]byte); ok {
 			*d = row[1].([]byte)
 		} else {
-			return fmt.Errorf("rwFakeRows: приёмник[1] %T, ожидается *[]byte", dest[1])
+			return fmt.Errorf("rwFakeRows: destination[1] %T, a *[]byte expected", dest[1])
 		}
 	}
 	if d, ok := dest[2].(*bool); ok {
 		*d = row[2].(bool)
 	} else {
-		return fmt.Errorf("rwFakeRows: приёмник[2] %T, ожидается *bool", dest[2])
+		return fmt.Errorf("rwFakeRows: destination[2] %T, a *bool expected", dest[2])
 	}
 	if d, ok := dest[3].(*time.Time); ok {
 		*d = row[3].(time.Time)
 	} else {
-		return fmt.Errorf("rwFakeRows: приёмник[3] %T, ожидается *time.Time", dest[3])
+		return fmt.Errorf("rwFakeRows: destination[3] %T, a *time.Time expected", dest[3])
 	}
 	return nil
 }
@@ -326,7 +326,7 @@ func (p *rwFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if sql != renderSelectSQL {
-		return nil, fmt.Errorf("rwFakePool: неожидаемый SQL: %s", sql)
+		return nil, fmt.Errorf("rwFakePool: an unexpected SQL: %s", sql)
 	}
 	if p.queryErr != nil {
 		return nil, p.queryErr
@@ -402,13 +402,13 @@ func (r rwUpdateRow) Scan(dest ...any) error {
 		return r.err
 	}
 	if len(dest) != 1 {
-		return fmt.Errorf("rwUpdateRow: приёмников %d, нужно 1", len(dest))
+		return fmt.Errorf("rwUpdateRow: %d destinations, 1 needed", len(dest))
 	}
 	if d, ok := dest[0].(*time.Time); ok {
 		*d = r.checkedAt
 		return nil
 	}
-	return fmt.Errorf("rwUpdateRow: приёмник %T, ожидается *time.Time", dest[0])
+	return fmt.Errorf("rwUpdateRow: the destination %T, a *time.Time expected", dest[0])
 }
 
 // QueryRow — the content replacement UPDATE (renderUpdateSQL, T-203): the live
@@ -418,7 +418,7 @@ func (t *rwFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row 
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	if sql != renderUpdateSQL {
-		return rwUpdateRow{err: fmt.Errorf("rwFakePool: неожидаемый QueryRow: %s", sql)}
+		return rwUpdateRow{err: fmt.Errorf("rwFakePool: an unexpected QueryRow: %s", sql)}
 	}
 	if t.pool.updateErr != nil {
 		return rwUpdateRow{err: t.pool.updateErr}
@@ -490,7 +490,7 @@ func (t *rwFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		t.pool.j.record(rwEvSwap)
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	default:
-		return pgconn.CommandTag{}, fmt.Errorf("rwFakePool: неожидаемый SQL: %s", sql)
+		return pgconn.CommandTag{}, fmt.Errorf("rwFakePool: an unexpected SQL: %s", sql)
 	}
 }
 
@@ -622,7 +622,7 @@ func (r *rwFakeRenderer) Run(ctx context.Context, task render.RenderTask) (rende
 		return render.RenderOutput{}, err
 	}
 	if r.panicOn != "" && task.URL == r.panicOn {
-		panic("фейк рендера: паника в задаче " + task.URL)
+		panic("the render fake: a panic in the task " + task.URL)
 	}
 	if r.blockOn[task.URL] {
 		<-ctx.Done() // the slot is busy until cancellation — the stage's duration tail
@@ -688,7 +688,7 @@ func (q *rwFakeQueue) Publish(ctx context.Context, stream string, msg queue.Mess
 	}
 	res, ok := msg.(queue.Result)
 	if !ok {
-		return "", fmt.Errorf("rwFakeQueue: неожидаемое сообщение %T (нужен queue.Result)", msg)
+		return "", fmt.Errorf("rwFakeQueue: an unexpected message %T (a queue.Result is needed)", msg)
 	}
 	q.mu.Lock()
 	i := len(q.publishes)
@@ -876,54 +876,54 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if !written {
-		t.Fatal("строка должна быть записана (written=true)")
+		t.Fatal("the row must be written (written=true)")
 	}
 
 	// The render got the row's final URL.
 	tasks := f.renderer.tasksSnapshot()
 	if len(tasks) != 1 || tasks[0].URL != "https://spa.example/" {
-		t.Fatalf("рендер: задачи %+v, нужен один URL https://spa.example/", tasks)
+		t.Fatalf("the render: tasks %+v, one URL https://spa.example/ needed", tasks)
 	}
 
 	// The row: rendered=true, the DOM hash, the final URL and the render data.
 	domHash := content.HashOf([]byte(dom))
 	row := rwRowSnapshot(f.pool, rwKey)
 	if !row.rendered {
-		t.Error("rendered должен быть true (ТЗ 5.6)")
+		t.Error("rendered must be true (spec 5.6)")
 	}
 	if row.finalURL == nil || *row.finalURL != "https://spa.example/home" {
-		t.Errorf("final_url = %v, нужен итоговый URL рендера (JS-редиректы)", row.finalURL)
+		t.Errorf("final_url = %v, the render final URL is needed (JS redirects)", row.finalURL)
 	}
 	if row.hash == nil || string(row.hash) != string(domHash[:]) {
-		t.Errorf("content_hash = %v, нужен хэш DOM %s", row.hash, domHash)
+		t.Errorf("content_hash = %v, the DOM hash is needed %s", row.hash, domHash)
 	}
 	if row.cookies == nil || !strings.Contains(*row.cookies, "js_session") {
-		t.Errorf("cookies = %v, нужен набор рендера (все cookies, ТЗ 5.6)", row.cookies)
+		t.Errorf("cookies = %v, the render set is needed (all the cookies, spec 5.6)", row.cookies)
 	}
 	if row.headers == nil || !strings.Contains(*row.headers, "X-Rendered") {
-		t.Errorf("headers = %v, нужны заголовки итоговой навигации (ТЗ 5.8)", row.headers)
+		t.Errorf("headers = %v, the headers of the final navigation are needed (spec 5.8)", row.headers)
 	}
 
 	// The refcount balance: the raw HTML −1 (was 1 → 0), the DOM +1.
 	refc := rwRefc(f.pool)
 	if refc[raw] != 0 {
-		t.Errorf("refcount сырого HTML = %d, нужен 0 (ссылка снята, ТЗ 5.7)", refc[raw])
+		t.Errorf("the raw HTML refcount = %d, 0 needed (the reference was released, spec 5.7)", refc[raw])
 	}
 	if refc[domHash] != 1 {
-		t.Errorf("refcount DOM = %d, нужен 1", refc[domHash])
+		t.Errorf("the DOM refcount = %d, 1 needed", refc[domHash])
 	}
 
 	// The q:analyze publication — with the same key, after the Commit.
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v, нужна одна q:analyze", pubs)
+		t.Fatalf("the publications %+v, one q:analyze is needed", pubs)
 	}
 	if pubs[0].msg.ZoneID != rwTask.ZoneID || pubs[0].msg.DomainID != rwTask.DomainID ||
 		pubs[0].msg.SubdomainID != rwTask.SubdomainID || pubs[0].msg.Variant != rwTask.Variant {
-		t.Errorf("q:analyze ключ %+v не совпадает с задачей", pubs[0].msg)
+		t.Errorf("the q:analyze key %+v does not match the task", pubs[0].msg)
 	}
 	if i, j := f.pool.j.indexOf(rwEvCommit), f.pool.j.indexOf(rwEvPublish); i < 0 || j < 0 || i > j {
-		t.Errorf("публикация до Commit: commit=%d publish=%d", i, j)
+		t.Errorf("a publication before the Commit: commit=%d publish=%d", i, j)
 	}
 	// The order: render → Put → transaction.
 	ev := f.pool.j.snapshot()
@@ -932,10 +932,10 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 	for _, w := range wantOrder {
 		i := f.pool.j.indexOf(w)
 		if i < 0 {
-			t.Fatalf("событие %s не наступило: %v", w, ev)
+			t.Fatalf("the event %s did not happen: %v", w, ev)
 		}
 		if i < last {
-			t.Fatalf("нарушен порядок %v: %s на позиции %d после %d", ev, w, i, last)
+			t.Fatalf("the order of %v is violated: %s at position %d after %d", ev, w, i, last)
 		}
 		last = i
 	}
@@ -951,7 +951,7 @@ func TestRenderWorker_SQLContract(t *testing.T) {
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
 		"AND subdomain_id = $3::int2 AND variant = $4::int2"
 	if renderSelectSQL != selectWant {
-		t.Errorf("renderSelectSQL =\n%s\nхочу\n%s", renderSelectSQL, selectWant)
+		t.Errorf("renderSelectSQL =\n%s\nwant\n%s", renderSelectSQL, selectWant)
 	}
 	updateWant := "UPDATE subdomain_results AS r " +
 		"SET rendered = true, final_url = $5::text, content_hash = $6::bytea, " +
@@ -961,7 +961,7 @@ func TestRenderWorker_SQLContract(t *testing.T) {
 		"AND r.content_hash IS NOT DISTINCT FROM $9::bytea " +
 		"RETURNING r.checked_at"
 	if renderUpdateSQL != updateWant {
-		t.Errorf("renderUpdateSQL =\n%s\nхочу\n%s", renderUpdateSQL, updateWant)
+		t.Errorf("renderUpdateSQL =\n%s\nwant\n%s", renderUpdateSQL, updateWant)
 	}
 	markerWant := "UPDATE subdomain_results AS r " +
 		"SET render_failed_at = coalesce(r.render_failed_at, now()) " +
@@ -970,21 +970,21 @@ func TestRenderWorker_SQLContract(t *testing.T) {
 		"AND r.rendered = false " +
 		"AND r.content_hash IS NOT DISTINCT FROM $5::bytea"
 	if renderFailMarkerSQL != markerWant {
-		t.Errorf("renderFailMarkerSQL =\n%s\nхочу\n%s", renderFailMarkerSQL, markerWant)
+		t.Errorf("renderFailMarkerSQL =\n%s\nwant\n%s", renderFailMarkerSQL, markerWant)
 	}
 	bumpWant := "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('rendered:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 	if renderBumpRenderedSQL != bumpWant {
-		t.Errorf("renderBumpRenderedSQL =\n%s\nхочу\n%s", renderBumpRenderedSQL, bumpWant)
+		t.Errorf("renderBumpRenderedSQL =\n%s\nwant\n%s", renderBumpRenderedSQL, bumpWant)
 	}
 	tailWant := "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('reanalyze:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 	if renderBumpReanalyzeSQL != tailWant {
-		t.Errorf("renderBumpReanalyzeSQL =\n%s\nхочу\n%s", renderBumpReanalyzeSQL, tailWant)
+		t.Errorf("renderBumpReanalyzeSQL =\n%s\nwant\n%s", renderBumpReanalyzeSQL, tailWant)
 	}
 }
 
@@ -1004,15 +1004,15 @@ func TestRenderWorker_RenderedCounter(t *testing.T) {
 		t.Fatalf("ProcessResult: ok=%v err=%v", written, err)
 	}
 	if got := f.pool.renderedValue(); got != 1 {
-		t.Fatalf("после рендера корзина rendered-темпа = %d, want 1", got)
+		t.Fatalf("after the render the rendered rate bucket = %d, want 1", got)
 	}
 	if got := f.pool.reanalyzeValue(); got != 1 {
-		t.Fatalf("после рендера корзина хвостов = %d, want 1 (rules_version → NULL вернул строку в неанализированные, T-204)", got)
+		t.Fatalf("after the render the tails bucket = %d, want 1 (rules_version → NULL returned the row into the unanalyzed, T-204)", got)
 	}
 	update, tail, bump, commit := f.pool.j.indexOf(rwEvUpdate), f.pool.j.indexOf(rwEvTail),
 		f.pool.j.indexOf(rwEvBump), f.pool.j.indexOf(rwEvCommit)
 	if tail < update || bump < tail || bump > commit {
-		t.Fatalf("порядок: update=%d tail=%d bump=%d commit=%d (флаг → хвосты → rendered → фиксация)",
+		t.Fatalf("the order: update=%d tail=%d bump=%d commit=%d (the flag → the tails → rendered → the commit)",
 			update, tail, bump, commit)
 	}
 
@@ -1020,10 +1020,10 @@ func TestRenderWorker_RenderedCounter(t *testing.T) {
 	// guard lets the rewrite through, rendered is already true; the +1 event to the
 	// live zero — reconciliation reconciles the semantic difference.
 	if written, err := f.w.ProcessResult(context.Background(), rwTask); err != nil || !written {
-		t.Fatalf("повтор ProcessResult: ok=%v err=%v", written, err)
+		t.Fatalf("the ProcessResult repeat: ok=%v err=%v", written, err)
 	}
 	if got := f.pool.renderedValue(); got != 2 {
-		t.Fatalf("после повтора корзина = %d, want 2 (событие на каждую запись флага)", got)
+		t.Fatalf("after the repeat the bucket = %d, want 2 (an event per flag write)", got)
 	}
 
 	// An increment failure rolls back the transaction: the flag and the bucket change
@@ -1031,18 +1031,18 @@ func TestRenderWorker_RenderedCounter(t *testing.T) {
 	f2 := newRWFixture(t)
 	f2.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f2.renderer.output = rwOutput("<html><body>b</body></html>")
-	f2.pool.bumpErr = errors.New("счётчики недоступны")
+	f2.pool.bumpErr = errors.New("the counters are unavailable")
 	if _, err := f2.w.ProcessResult(context.Background(), rwTask); err == nil {
-		t.Fatal("сбой корзины обязан вернуть ошибку")
+		t.Fatal("a bucket failure must return an error")
 	}
 	if f2.pool.renderedValue() != 0 {
-		t.Fatalf("корзина = %d после отката, want 0", f2.pool.renderedValue())
+		t.Fatalf("the bucket = %d after the rollback, want 0", f2.pool.renderedValue())
 	}
 	if rwRowSnapshot(f2.pool, rwKey).rendered {
-		t.Error("флаг rendered не откатился вместе с корзиной")
+		t.Error("the rendered flag did not roll back with the bucket")
 	}
 	if n := f2.pool.j.countEvents(rwEvCommit); n != 0 {
-		t.Errorf("фиксаций = %d, want 0", n)
+		t.Errorf("commits = %d, want 0", n)
 	}
 
 	// The row slipped out from under the task (the guard): the buckets are untouched.
@@ -1056,10 +1056,10 @@ func TestRenderWorker_RenderedCounter(t *testing.T) {
 		}
 	}
 	if written, err := f3.w.ProcessResult(context.Background(), rwTask); err != nil || written {
-		t.Fatalf("ProcessResult охраны: ok=%v err=%v, хочу (false, nil)", written, err)
+		t.Fatalf("the ProcessResult of the guard: ok=%v err=%v, want (false, nil)", written, err)
 	}
 	if got := f3.pool.renderedValue(); got != 0 {
-		t.Fatalf("корзина = %d при охране, want 0 (строку не перевели)", got)
+		t.Fatalf("the bucket = %d at the guard, want 0 (the row was not converted)", got)
 	}
 }
 
@@ -1068,19 +1068,19 @@ func TestRenderWorker_NoRow(t *testing.T) {
 	f := newRWFixture(t)
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err != nil {
-		t.Fatalf("ProcessResult: %v (строки нет — не ошибка)", err)
+		t.Fatalf("ProcessResult: %v (no row is not an error)", err)
 	}
 	if written {
-		t.Error("written должен быть false")
+		t.Error("written must be false")
 	}
 	if tasks := f.renderer.tasksSnapshot(); len(tasks) != 0 {
-		t.Errorf("ренер не должен запускаться: %+v", tasks)
+		t.Errorf("the render must not run: %+v", tasks)
 	}
 	if puts := f.store.putsSnapshot(); len(puts) != 0 {
-		t.Errorf("Put не должен вызываться: %d", len(puts))
+		t.Errorf("Put must not be called: %d", len(puts))
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно: %+v", pubs)
+		t.Errorf("there must be no publications: %+v", pubs)
 	}
 }
 
@@ -1094,10 +1094,10 @@ func TestRenderWorker_NoFinalURL(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if written {
-		t.Error("written должен быть false")
+		t.Error("written must be false")
 	}
 	if tasks := f.renderer.tasksSnapshot(); len(tasks) != 0 {
-		t.Errorf("рендер не должен запускаться: %+v", tasks)
+		t.Errorf("the render must not run: %+v", tasks)
 	}
 }
 
@@ -1115,20 +1115,20 @@ func TestRenderWorker_SameContent(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if !written {
-		t.Fatal("written должен быть true")
+		t.Fatal("written must be true")
 	}
 	if puts := f.store.putsSnapshot(); len(puts) != 0 {
-		t.Errorf("Put не нужен при том же контенте: %d вызовов", len(puts))
+		t.Errorf("no Put is needed with the same content: %d calls", len(puts))
 	}
 	if i := f.pool.j.indexOf(rwEvSwap); i >= 0 {
-		t.Errorf("своп ссылок не нужен при том же контенте (событие на %d)", i)
+		t.Errorf("no reference swap is needed with the same content (an event on %d)", i)
 	}
 	refc := rwRefc(f.pool)
 	if refc[domHash] != 1 {
-		t.Errorf("refcount = %d, нужен 1 (без лишних +1)", refc[domHash])
+		t.Errorf("the refcount = %d, 1 needed (no extra +1s)", refc[domHash])
 	}
 	if !rwRowSnapshot(f.pool, rwKey).rendered {
-		t.Error("rendered должен быть true")
+		t.Error("rendered must be true")
 	}
 }
 
@@ -1146,15 +1146,15 @@ func TestRenderWorker_AliasRow(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if !written {
-		t.Fatal("written должен быть true")
+		t.Fatal("written must be true")
 	}
 	if i := f.pool.j.indexOf(rwEvSwap); i >= 0 {
-		t.Errorf("своп при NULL старой ссылки не нужен (событие на %d)", i)
+		t.Errorf("no swap is needed with a NULL old reference (an event on %d)", i)
 	}
 	refc := rwRefc(f.pool)
 	domHash := content.HashOf([]byte(dom))
 	if refc[domHash] != 1 {
-		t.Errorf("refcount DOM = %d, нужен 1", refc[domHash])
+		t.Errorf("the DOM refcount = %d, 1 needed", refc[domHash])
 	}
 }
 
@@ -1179,31 +1179,31 @@ func TestRenderWorker_StaleRow(t *testing.T) {
 
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err != nil {
-		t.Fatalf("ProcessResult: %v (строка ушла из-под задачи — не ошибка)", err)
+		t.Fatalf("ProcessResult: %v (the row slipped out from under the task is not an error)", err)
 	}
 	if written {
-		t.Error("written должен быть false")
+		t.Error("written must be false")
 	}
 	// The Put reference is removed: the DOM does not hang, the foreign content is intact.
 	refc := rwRefc(f.pool)
 	domHash := content.HashOf([]byte(dom))
 	if refc[domHash] != 0 {
-		t.Errorf("refcount DOM = %d, нужен 0 (ссылка Put снята Delete)", refc[domHash])
+		t.Errorf("the DOM refcount = %d, 0 needed (the Put reference released by Delete)", refc[domHash])
 	}
 	if refc[fresh] != 1 {
-		t.Errorf("refcount чужого контента = %d, нужен 1", refc[fresh])
+		t.Errorf("the foreign content refcount = %d, 1 needed", refc[fresh])
 	}
 	if refc[raw] != 0 {
-		t.Errorf("refcount старого контента = %d, нужен 0 (снят эпизодом перепроверки)", refc[raw])
+		t.Errorf("the old content refcount = %d, 0 needed (released by the recheck episode)", refc[raw])
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно: %+v", pubs)
+		t.Errorf("there must be no publications: %+v", pubs)
 	}
 	if i := f.pool.j.indexOf(rwEvCommit); i >= 0 {
-		t.Errorf("Commit не должен выполняться (событие на %d)", i)
+		t.Errorf("the Commit must not run (an event on %d)", i)
 	}
 	if deletes := f.store.deletesSnapshot(); len(deletes) != 1 || deletes[0] != domHash {
-		t.Errorf("Delete: %+v, нужен один %s", deletes, domHash)
+		t.Errorf("Delete: %+v, one %s needed", deletes, domHash)
 	}
 }
 
@@ -1218,34 +1218,34 @@ func TestRenderWorker_RepeatDelivery(t *testing.T) {
 	dom1 := "<html>render 1</html>"
 	f.renderer.output = rwOutput(dom1)
 	if _, err := f.w.ProcessResult(context.Background(), rwTask); err != nil {
-		t.Fatalf("первая обработка: %v", err)
+		t.Fatalf("the first processing: %v", err)
 	}
 	dom2 := "<html>render 2</html>"
 	f.renderer.output = rwOutput(dom2)
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err != nil {
-		t.Fatalf("повторная обработка: %v", err)
+		t.Fatalf("the repeated processing: %v", err)
 	}
 	if !written {
-		t.Fatal("повторная обработка должна записать строку")
+		t.Fatal("the repeated processing must write the row")
 	}
 
 	refc := rwRefc(f.pool)
 	h1, h2 := content.HashOf([]byte(dom1)), content.HashOf([]byte(dom2))
 	if refc[raw] != 0 {
-		t.Errorf("refcount сырого HTML = %d, нужен 0", refc[raw])
+		t.Errorf("the raw HTML refcount = %d, 0 needed", refc[raw])
 	}
 	if refc[h1] != 0 {
-		t.Errorf("refcount DOM первой доставки = %d, нужен 0 (снят при перезаписи)", refc[h1])
+		t.Errorf("the first delivery DOM refcount = %d, 0 needed (released at the rewrite)", refc[h1])
 	}
 	if refc[h2] != 1 {
-		t.Errorf("refcount DOM второй доставки = %d, нужен 1", refc[h2])
+		t.Errorf("the second delivery DOM refcount = %d, 1 needed", refc[h2])
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 2 {
-		t.Errorf("публикаций q:analyze = %d, нужно 2 (после каждой записи)", len(pubs))
+		t.Errorf("q:analyze publications = %d, 2 needed (after each write)", len(pubs))
 	}
 	if !rwRowSnapshot(f.pool, rwKey).rendered {
-		t.Error("rendered должен быть true")
+		t.Error("rendered must be true")
 	}
 }
 
@@ -1255,23 +1255,23 @@ func TestRenderWorker_RenderError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
-	f.renderer.err = &render.Error{Class: render.ClassTask, URL: "https://spa.example/", Err: errors.New("таймаут")}
+	f.renderer.err = &render.Error{Class: render.ClassTask, URL: "https://spa.example/", Err: errors.New("timeout")}
 
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err == nil {
-		t.Fatal("ошибка рендера обязана возвращаться")
+		t.Fatal("a render error must be returned")
 	}
 	if written {
-		t.Error("written должен быть false")
+		t.Error("written must be false")
 	}
 	if puts := f.store.putsSnapshot(); len(puts) != 0 {
-		t.Errorf("Put не должен вызываться: %d", len(puts))
+		t.Errorf("Put must not be called: %d", len(puts))
 	}
 	if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
-		t.Errorf("транзакция не должна открываться (событие на %d)", i)
+		t.Errorf("a transaction must not open (an event on %d)", i)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно: %+v", pubs)
+		t.Errorf("there must be no publications: %+v", pubs)
 	}
 }
 
@@ -1284,14 +1284,14 @@ func TestRenderWorker_EmptyOutput(t *testing.T) {
 	f.renderer.output = render.RenderOutput{FinalURL: "https://spa.example/x"} // the DOM is empty
 
 	if _, err := f.w.ProcessResult(context.Background(), rwTask); err == nil {
-		t.Fatal("пустой DOM — ошибка")
+		t.Fatal("an empty DOM is an error")
 	}
 	f.renderer.output = render.RenderOutput{DOM: "<html/>"} // the FinalURL is empty
 	if _, err := f.w.ProcessResult(context.Background(), rwTask); err == nil {
-		t.Fatal("пустой итоговый URL — ошибка")
+		t.Fatal("an empty final URL is an error")
 	}
 	if rwRowSnapshot(f.pool, rwKey).rendered {
-		t.Error("rendered должен остаться false")
+		t.Error("rendered must stay false")
 	}
 }
 
@@ -1303,17 +1303,17 @@ func TestRenderWorker_PutError(t *testing.T) {
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.output = rwOutput("<html>big dom</html>")
-	f.store.putErr = fmt.Errorf("%w: DOM больше лимита", content.ErrTooLarge)
+	f.store.putErr = fmt.Errorf("%w: the DOM is over the limit", content.ErrTooLarge)
 
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err == nil || !errors.Is(err, content.ErrTooLarge) {
-		t.Fatalf("Put ErrTooLarge обязан возвращаться: %v", err)
+		t.Fatalf("the Put ErrTooLarge must be returned: %v", err)
 	}
 	if written {
-		t.Error("written должен быть false")
+		t.Error("written must be false")
 	}
 	if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
-		t.Errorf("транзакция не должна открываться (событие на %d)", i)
+		t.Errorf("a transaction must not open (an event on %d)", i)
 	}
 }
 
@@ -1325,22 +1325,22 @@ func TestRenderWorker_UpdateError(t *testing.T) {
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	dom := "<html>dom</html>"
 	f.renderer.output = rwOutput(dom)
-	f.pool.updateErr = errors.New("нет соединения")
+	f.pool.updateErr = errors.New("no connection")
 
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err == nil {
-		t.Fatal("ошибка UPDATE обязана возвращаться")
+		t.Fatal("an UPDATE error must be returned")
 	}
 	if written {
-		t.Error("written должен быть false")
+		t.Error("written must be false")
 	}
 	if rwRowSnapshot(f.pool, rwKey).rendered {
-		t.Error("строка не изменилась (откат)")
+		t.Error("the row did not change (the rollback)")
 	}
 	refc := rwRefc(f.pool)
 	domHash := content.HashOf([]byte(dom))
 	if refc[domHash] != 1 || refc[raw] != 1 {
-		t.Errorf("refcount после отката: dom=%d raw=%d, хочу 1/1 (Put не откатывается — безопасная утечка)",
+		t.Errorf("the refcount after the rollback: dom=%d raw=%d, want 1/1 (a Put does not roll back — a safe leak)",
 			refc[domHash], refc[raw])
 	}
 }
@@ -1356,10 +1356,10 @@ func TestRenderWorker_SwapIntegrity(t *testing.T) {
 
 	_, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err == nil || !errors.Is(err, content.ErrRefIntegrity) {
-		t.Fatalf("ожидался ErrRefIntegrity: %v", err)
+		t.Fatalf("ErrRefIntegrity expected: %v", err)
 	}
 	if rwRowSnapshot(f.pool, rwKey).rendered {
-		t.Error("строка не изменилась (откат ErrRefIntegrity)")
+		t.Error("the row did not change (the ErrRefIntegrity rollback)")
 	}
 }
 
@@ -1370,20 +1370,20 @@ func TestRenderWorker_CommitError(t *testing.T) {
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.output = rwOutput("<html>dom</html>")
-	f.pool.commitErr = errors.New("сервер закрыл соединение")
+	f.pool.commitErr = errors.New("the server closed the connection")
 
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err == nil {
-		t.Fatal("ошибка Commit обязана возвращаться")
+		t.Fatal("a Commit error must be returned")
 	}
 	if written {
-		t.Error("written должен быть false")
+		t.Error("written must be false")
 	}
 	if rwRowSnapshot(f.pool, rwKey).rendered {
-		t.Error("строка не изменилась (откат)")
+		t.Error("the row did not change (the rollback)")
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикации после Commit не должно быть: %+v", pubs)
+		t.Errorf("there must be no publication after the Commit: %+v", pubs)
 	}
 }
 
@@ -1397,17 +1397,17 @@ func TestRenderWorker_PublishError(t *testing.T) {
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.output = rwOutput("<html>dom</html>")
-	f.q.publishErrs = []error{errors.New("redis недоступен")}
+	f.q.publishErrs = []error{errors.New("redis unavailable")}
 
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err == nil {
-		t.Fatal("ошибка публикации обязана возвращаться")
+		t.Fatal("a publication error must be returned")
 	}
 	if written {
-		t.Error("written должен быть false — публикация не состоялась, запись не обработана целиком (T-225)")
+		t.Error("written must be false — the publication did not happen, the record was not processed entirely (T-225)")
 	}
 	if !rwRowSnapshot(f.pool, rwKey).rendered {
-		t.Error("строка записана (Commit до публикации)")
+		t.Error("the row was written (the Commit precedes the publication)")
 	}
 }
 
@@ -1428,47 +1428,47 @@ func TestProcessResult_WrittenContract(t *testing.T) {
 		wantOK  bool
 		wantErr bool
 	}{
-		{"сбой чтения строки", func(f *rwFixture) {
-			f.pool.queryErr = errors.New("база недоступна")
+		{"a row read failure", func(f *rwFixture) {
+			f.pool.queryErr = errors.New("the database is unavailable")
 		}, false, true},
-		{"ошибка рендера", func(f *rwFixture) {
+		{"a render error", func(f *rwFixture) {
 			seed(f)
-			f.renderer.err = errors.New("страница не загрузилась")
+			f.renderer.err = errors.New("the page did not load")
 		}, false, true},
-		{"пустой результат рендера", func(f *rwFixture) {
+		{"an empty render result", func(f *rwFixture) {
 			seed(f)
 			f.renderer.output = render.RenderOutput{FinalURL: "https://spa.example/"}
 		}, false, true},
-		{"сбой сохранения DOM", func(f *rwFixture) {
+		{"a DOM saving failure", func(f *rwFixture) {
 			seed(f)
-			f.store.putErr = errors.New("хранилище переполнено")
+			f.store.putErr = errors.New("the store is full")
 		}, false, true},
-		{"сбой транзакции", func(f *rwFixture) {
+		{"a transaction failure", func(f *rwFixture) {
 			seed(f)
-			f.pool.beginErr = errors.New("пул соединений исчерпан")
+			f.pool.beginErr = errors.New("the connection pool is exhausted")
 		}, false, true},
-		{"сбой UPDATE строки", func(f *rwFixture) {
+		{"a row UPDATE failure", func(f *rwFixture) {
 			seed(f)
 			f.pool.updateErr = errors.New("serialize failure")
 		}, false, true},
-		{"сбой фиксации", func(f *rwFixture) {
+		{"a commit failure", func(f *rwFixture) {
 			seed(f)
-			f.pool.commitErr = errors.New("сервер закрыл соединение")
+			f.pool.commitErr = errors.New("the server closed the connection")
 		}, false, true},
-		{"сбой корзины rendered-темпа", func(f *rwFixture) {
+		{"a rendered rate bucket failure", func(f *rwFixture) {
 			seed(f)
-			f.pool.bumpErr = errors.New("счётчики недоступны")
+			f.pool.bumpErr = errors.New("the counters are unavailable")
 		}, false, true},
-		{"расхождение учёта ссылок", func(f *rwFixture) {
+		{"a reference accounting mismatch", func(f *rwFixture) {
 			seed(f)
 			f.pool.refc[raw] = 0
 		}, false, true},
-		{"сбой публикации q:analyze", func(f *rwFixture) {
+		{"a q:analyze publication failure", func(f *rwFixture) {
 			seed(f)
-			f.q.publishErrs = []error{errors.New("redis недоступен")}
+			f.q.publishErrs = []error{errors.New("redis unavailable")}
 		}, false, true},
-		{"успех", seed, true, false},
-		{"штатный отказ — строки нет", func(f *rwFixture) {}, false, false},
+		{"a success", seed, true, false},
+		{"a normal refusal — no row", func(f *rwFixture) {}, false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1476,13 +1476,13 @@ func TestProcessResult_WrittenContract(t *testing.T) {
 			c.setup(f)
 			written, err := f.w.ProcessResult(context.Background(), rwTask)
 			if (err != nil) != c.wantErr {
-				t.Fatalf("ошибка = %v, wantErr = %v", err, c.wantErr)
+				t.Fatalf("the error = %v, wantErr = %v", err, c.wantErr)
 			}
 			if written != c.wantOK {
 				t.Errorf("written = %v, want %v", written, c.wantOK)
 			}
 			if written && err != nil {
-				t.Errorf("written=true при ошибке %v — контракт «true только при err == nil» нарушен", err)
+				t.Errorf("written=true at an error %v — the true-only-at-err-nil contract is violated", err)
 			}
 		})
 	}
@@ -1491,12 +1491,12 @@ func TestProcessResult_WrittenContract(t *testing.T) {
 // TestRenderWorker_SelectError — a target read failure: an error without a render.
 func TestRenderWorker_SelectError(t *testing.T) {
 	f := newRWFixture(t)
-	f.pool.queryErr = errors.New("база недоступна")
+	f.pool.queryErr = errors.New("the database is unavailable")
 	if _, err := f.w.ProcessResult(context.Background(), rwTask); err == nil {
-		t.Fatal("ошибка SELECT обязана возвращаться")
+		t.Fatal("a SELECT error must be returned")
 	}
 	if tasks := f.renderer.tasksSnapshot(); len(tasks) != 0 {
-		t.Errorf("рендер не должен запускаться: %+v", tasks)
+		t.Errorf("the render must not run: %+v", tasks)
 	}
 }
 
@@ -1513,14 +1513,14 @@ func TestRenderWorker_NewValidation(t *testing.T) {
 		s    ContentStore
 		r    Renderer
 	}{
-		{"без БД", nil, q, store, renderer},
-		{"без очереди", pool, nil, store, renderer},
-		{"без хранилища", pool, q, nil, renderer},
-		{"без рендера", pool, q, store, nil},
+		{"no DB", nil, q, store, renderer},
+		{"no queue", pool, nil, store, renderer},
+		{"no store", pool, q, nil, renderer},
+		{"no render", pool, q, store, nil},
 	}
 	for _, c := range cases {
 		if _, err := New(c.db, c.q, c.s, c.r, Options{}); err == nil {
-			t.Errorf("%s: New должен отклонять nil-зависимость", c.name)
+			t.Errorf("%s: New must reject a nil dependency", c.name)
 		}
 	}
 }
@@ -1545,7 +1545,7 @@ func TestRenderWorker_RunSmoke(t *testing.T) {
 	f.pool.j.ackNotify = make(chan struct{}, 4)
 	f.q.deliveries = []queue.Delivery{
 		rwDelivery("e1"),
-		{Stream: queue.StreamRender, ID: "e2", Payload: []byte("{битый json")},
+		{Stream: queue.StreamRender, ID: "e2", Payload: []byte("{broken json")},
 		{Stream: queue.StreamRender, ID: "e3", Payload: payload2},
 	}
 
@@ -1559,7 +1559,7 @@ func TestRenderWorker_RunSmoke(t *testing.T) {
 		case <-f.pool.j.ackNotify:
 			want--
 		case <-time.After(5 * time.Second):
-			t.Fatal("XACK не наступил")
+			t.Fatal("the XACK did not happen")
 		}
 	}
 	cancel()
@@ -1569,23 +1569,23 @@ func TestRenderWorker_RunSmoke(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 
 	acked := f.q.ackedSnapshot()
 	if len(acked) != 2 {
-		t.Fatalf("XACK = %v, нужны e1 и e3 (e2 ядовитая — без XACK)", acked)
+		t.Fatalf("XACK = %v, e1 and e3 are needed (the poisonous e2 — without an XACK)", acked)
 	}
 	got := map[string]bool{acked[0]: true, acked[1]: true}
 	if !got["e1"] || !got["e3"] {
-		t.Errorf("XACK = %v, нужны e1 и e3 (e2 ядовитая — без XACK)", acked)
+		t.Errorf("XACK = %v, e1 and e3 are needed (the poisonous e2 — without an XACK)", acked)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 2 {
-		t.Fatalf("публикаций q:analyze = %d, нужно 2", len(pubs))
+		t.Fatalf("q:analyze publications = %d, 2 needed", len(pubs))
 	}
 	if i, j := f.pool.j.indexOf(rwEvPublish), f.pool.j.indexOf(rwEvAck); i < 0 || j < 0 || i > j {
-		t.Errorf("XACK должен следовать за публикацией: publish=%d ack=%d", i, j)
+		t.Errorf("the XACK must follow the publication: publish=%d ack=%d", i, j)
 	}
 }
 
@@ -1609,13 +1609,13 @@ func TestRenderWorker_RunBrowserDead(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if n := f.q.consumesCount(); n != 0 {
-		t.Errorf("Consume вызван %d раз при мёртвом браузере — очередь читаться не должна", n)
+		t.Errorf("Consume was called %d times with a dead browser — the queue must not be read", n)
 	}
 	if tasks := f.renderer.tasksSnapshot(); len(tasks) != 0 {
-		t.Errorf("рендер не должен запускаться: %+v", tasks)
+		t.Errorf("the render must not run: %+v", tasks)
 	}
 }
 
@@ -1657,7 +1657,7 @@ func TestRenderWorker_RunPanicRecovered(t *testing.T) {
 	select {
 	case <-f.pool.j.ackNotify:
 	case <-time.After(5 * time.Second):
-		t.Fatal("XACK здоровой доставки не наступил (паника убила цикл?)")
+		t.Fatal("the healthy delivery XACK did not happen (did the panic kill the loop?)")
 	}
 	cancel()
 	select {
@@ -1666,24 +1666,24 @@ func TestRenderWorker_RunPanicRecovered(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	acked := f.q.ackedSnapshot()
 	if len(acked) != 1 || acked[0] != "e2" {
-		t.Errorf("XACK = %v, нужен только e2 (паникующая e1 — без XACK)", acked)
+		t.Errorf("XACK = %v, only e2 is needed (the panicking e1 — without an XACK)", acked)
 	}
 	if !rwRowSnapshot(f.pool, key2).rendered {
-		t.Error("здоровая доставка не записана")
+		t.Error("the healthy delivery was not written")
 	}
 	if rwRowSnapshot(f.pool, rwKey).rendered {
-		t.Error("паникующая доставка не должна записывать строку")
+		t.Error("a panicking delivery must not write a row")
 	}
 }
 
 // TestRenderWorker_RunValidation — a nil worker is rejected.
 func TestRenderWorker_RunValidation(t *testing.T) {
 	if err := Run(context.Background(), nil, Options{}); err == nil {
-		t.Fatal("Run должен отклонять nil-воркер")
+		t.Fatal("Run must reject a nil worker")
 	}
 }
 
@@ -1710,16 +1710,16 @@ func TestRenderWorker_RunCancelWhileWaitingSlot(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if n := f.renderer.tasksCountURL(s.bufURLs[0]); n != 0 {
-		t.Errorf("доставка запущена после отмены ctx: рендер вызван %d раз", n)
+		t.Errorf("a delivery started after the ctx cancellation: the render was called %d times", n)
 	}
 	if acks := len(f.q.ackedSnapshot()); acks != 0 {
-		t.Errorf("подтверждений %d — окно обязано вернуться очереди", acks)
+		t.Errorf("%d acknowledgments — the window must return to the queue", acks)
 	}
 }
 
@@ -1735,16 +1735,16 @@ func TestRenderWorker_RunCancelWhileWaitingSlot(t *testing.T) {
 func TestRenderWorker_OptionsDefaults(t *testing.T) {
 	o := Options{}.withDefaults()
 	if o.Concurrency != DefaultConcurrency || o.Consume != DefaultConsume {
-		t.Errorf("withDefaults: concurrency=%d consume=%d, дефолты %d/%d",
+		t.Errorf("withDefaults: concurrency=%d consume=%d, the defaults %d/%d",
 			o.Concurrency, o.Consume, DefaultConcurrency, DefaultConsume)
 	}
 	cfg := config.Default()
 	if cfg.Render.Contexts < DefaultConcurrency {
-		t.Errorf("render.contexts=%d ниже DefaultConcurrency=%d: max() боевой сборки превысил бы слоты пула",
+		t.Errorf("render.contexts=%d is below DefaultConcurrency=%d: the production build max() would exceed the pool slots",
 			cfg.Render.Contexts, DefaultConcurrency)
 	}
 	if cfg.Render.TimeoutAttempts != DefaultTimeoutAttempts {
-		t.Errorf("render.timeout_attempts=%d расходится с DefaultTimeoutAttempts=%d (боевая сборка передаёт поле воркеру)",
+		t.Errorf("render.timeout_attempts=%d diverges from DefaultTimeoutAttempts=%d (the production build passes the field to the worker)",
 			cfg.Render.TimeoutAttempts, DefaultTimeoutAttempts)
 	}
 }
@@ -1799,7 +1799,7 @@ func rwWaitURL(t *testing.T, r *rwFakeRenderer, url string) {
 	for r.tasksCountURL(url) == 0 {
 		select {
 		case <-deadline:
-			t.Fatalf("доставка %s не дошла до рендера", url)
+			t.Fatalf("the delivery %s did not reach the render", url)
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -1812,10 +1812,10 @@ func rwStopLoop(t *testing.T, cancel context.CancelFunc, done <-chan error) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run после отмены: %v", err)
+			t.Fatalf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 }
 
@@ -1847,7 +1847,7 @@ func TestRenderWorker_RunSlidingConsumption(t *testing.T) {
 			acks++
 		case <-deadline:
 			cancel()
-			t.Fatalf("скользящее потребление не подхватило хвост: подтверждено %d из 4 быстрых", acks)
+			t.Fatalf("the sliding consumption did not pick up the tail: %d of the 4 fast ones acknowledged", acks)
 		}
 	}
 
@@ -1856,7 +1856,7 @@ func TestRenderWorker_RunSlidingConsumption(t *testing.T) {
 	// re-delivery (at-least-once, spec 3.4), the fast ones are acknowledged.
 	acked := f.q.ackedSnapshot()
 	if len(acked) != 4 {
-		t.Fatalf("XACK = %v, нужны 4 быстрые (блокирующая — без XACK)", acked)
+		t.Fatalf("XACK = %v, the 4 fast ones are needed (the blocking one — without an XACK)", acked)
 	}
 	got := make(map[string]bool, len(acked))
 	for _, id := range acked {
@@ -1864,12 +1864,12 @@ func TestRenderWorker_RunSlidingConsumption(t *testing.T) {
 	}
 	for _, id := range []string{"f0", "f1", "f2", "f3"} {
 		if !got[id] {
-			t.Errorf("XACK = %v, нет быстрой %s", acked, id)
+			t.Errorf("XACK = %v, the fast %s is missing", acked, id)
 		}
 	}
 	for i, key := range s.bufKeys {
 		if !rwRowSnapshot(f.pool, key).rendered {
-			t.Errorf("быстрая доставка f%d не записана", i)
+			t.Errorf("the fast delivery f%d was not written", i)
 		}
 	}
 }
@@ -1906,7 +1906,7 @@ func TestRenderWorker_RunCancelKeepsBufferUnacked(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatalf("предвыборка не состоялась: чтений %d, нужно ≥2 (хвост окна обязан читаться до завершения первой пачки)", f.q.consumesCount())
+			t.Fatalf("the prefetch did not happen: %d reads, ≥2 needed (the window tail must be read before the first batch finishes)", f.q.consumesCount())
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -1915,21 +1915,21 @@ func TestRenderWorker_RunCancelKeepsBufferUnacked(t *testing.T) {
 	// never reaching the render however long the loop runs.
 	for i, url := range s.bufURLs {
 		if n := f.renderer.tasksCountURL(url); n != 0 {
-			t.Errorf("буферная доставка f%d запущена при занятых слотах: рендер вызван %d раз", i, n)
+			t.Errorf("the buffered delivery f%d started with busy slots: the render was called %d times", i, n)
 		}
 	}
 	if acks := len(f.q.ackedSnapshot()); acks != 0 {
-		t.Errorf("подтверждений %d до отмены — не должно быть", acks)
+		t.Errorf("%d acknowledgments before the cancellation — there must be none", acks)
 	}
 
 	rwStopLoop(t, cancel, done)
 	for i, url := range s.bufURLs {
 		if n := f.renderer.tasksCountURL(url); n != 0 {
-			t.Errorf("буферная доставка f%d запущена после отмены: рендер вызван %d раз", i, n)
+			t.Errorf("the buffered delivery f%d started after the cancellation: the render was called %d times", i, n)
 		}
 	}
 	if acks := len(f.q.ackedSnapshot()); acks != 0 {
-		t.Errorf("подтверждений %d — не начатые доставки обязаны вернуться очереди", acks)
+		t.Errorf("%d acknowledgments — the unstarted deliveries must return to the queue", acks)
 	}
 }
 
@@ -2019,7 +2019,7 @@ func TestRenderWorker_RunBackoffOnFailures(t *testing.T) {
 			}
 			select {
 			case <-deadline:
-				t.Fatalf("чтений %d, ждалось ≥%d — предохранитель заблокировал цикл", got, n)
+				t.Fatalf("%d reads, wanted ≥%d — the fuse blocked the loop", got, n)
 			case <-time.After(2 * time.Millisecond):
 			}
 		}
@@ -2028,22 +2028,22 @@ func TestRenderWorker_RunBackoffOnFailures(t *testing.T) {
 	time.Sleep(450 * time.Millisecond)
 	first := q.consumeCount()
 	if first > 10 {
-		t.Errorf("чтений %d за 450 мс — предохранитель не душит темп (ждалось ≤10)", first)
+		t.Errorf("%d reads in 450 ms — the fuse does not throttle the rate (wanted ≤10)", first)
 	}
 
 	// The pauses double: the next interval adds a few reads,
 	// not tens. The growth between two measurements — no more than a couple of reads.
 	time.Sleep(450 * time.Millisecond)
 	if grew := q.consumeCount() - first; grew > 2 {
-		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией неудач", grew)
+		t.Errorf("%d more reads in the next 450 ms — the pause does not grow with the failure series", grew)
 	}
 
 	rwStopLoop(t, cancel, done)
 	if q.ackedCount() != 0 {
-		t.Errorf("подтверждений %d при ядовитых доставках", q.ackedCount())
+		t.Errorf("%d acknowledgments with poison deliveries", q.ackedCount())
 	}
 	if tasks := f.renderer.tasksSnapshot(); len(tasks) != 0 {
-		t.Errorf("рендер не должен запускаться: %+v", tasks)
+		t.Errorf("the render must not run: %+v", tasks)
 	}
 }
 
@@ -2077,7 +2077,7 @@ func (q *rwPanicQueue) Consume(_ context.Context, _, _, _ string, n int) ([]queu
 }
 
 func (q *rwPanicQueue) Ack(context.Context, string, string, ...string) error {
-	panic("rwPanicQueue: Ack недостижим — паникующие доставки не подтверждаются")
+	panic("rwPanicQueue: Ack is unreachable — panicking deliveries are not acknowledged")
 }
 
 func (q *rwPanicQueue) consumeCount() int {
@@ -2122,7 +2122,7 @@ func TestRenderWorker_RunPanicBackoff(t *testing.T) {
 			}
 			select {
 			case <-deadline:
-				t.Fatalf("чтений %d, ждалось ≥%d — предохранитель заблокировал цикл", got, n)
+				t.Fatalf("%d reads, wanted ≥%d — the fuse blocked the loop", got, n)
 			case <-time.After(2 * time.Millisecond):
 			}
 		}
@@ -2131,16 +2131,16 @@ func TestRenderWorker_RunPanicBackoff(t *testing.T) {
 	time.Sleep(450 * time.Millisecond)
 	first := q.consumeCount()
 	if first > 10 {
-		t.Errorf("чтений %d за 450 мс — паники не душат темп (ждалось ≤10)", first)
+		t.Errorf("%d reads in 450 ms — the panics do not throttle the rate (wanted ≤10)", first)
 	}
 	time.Sleep(450 * time.Millisecond)
 	if grew := q.consumeCount() - first; grew > 2 {
-		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией паник", grew)
+		t.Errorf("%d more reads in the next 450 ms — the pause does not grow with the panic series", grew)
 	}
 
 	rwStopLoop(t, cancel, done)
 	if n := f.renderer.tasksCountURL("https://spa.example/"); n == 0 {
-		t.Error("паникующая доставка не дошла до рендера — тест ничего не проверил")
+		t.Error("the panicking delivery did not reach the render — the test checked nothing")
 	}
 }
 
@@ -2247,7 +2247,7 @@ func TestRenderWorker_RunInfraPause(t *testing.T) {
 
 	q := &rwInfraQueue{}
 	q.setPublishErr(&queue.InfraError{
-		Op:  "publish в q:analyze",
+		Op:  "publish to q:analyze",
 		Err: errors.New("OOM command not allowed when used memory > 'maxmemory'"),
 	})
 	probe := &rwProbeRedis{}
@@ -2270,16 +2270,16 @@ func TestRenderWorker_RunInfraPause(t *testing.T) {
 	for q.consumeCount() == 0 {
 		select {
 		case <-deadline:
-			t.Fatal("первое чтение q:render не состоялось")
+			t.Fatal("the first q:render read did not happen")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
 	time.Sleep(300 * time.Millisecond)
 	if n := q.consumeCount(); n > 6 {
-		t.Errorf("чтений %d за 300 мс инфраструктурной паузы — чтение не остановлено (ждалось ≤6)", n)
+		t.Errorf("%d reads in the 300 ms infra pause — the reading is not stopped (wanted ≤6)", n)
 	}
 	if q.ackedCount() != 0 {
-		t.Errorf("подтверждений %d при падающей публикации", q.ackedCount())
+		t.Errorf("%d acknowledgments with a failing publication", q.ackedCount())
 	}
 
 	// The write recovered: the read resumes, the deliveries are brought
@@ -2290,7 +2290,7 @@ func TestRenderWorker_RunInfraPause(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatalf("после восстановления записи подтверждено %d, хочу ≥2", q.ackedCount())
+			t.Fatalf("after the write recovery %d acknowledged, want ≥2", q.ackedCount())
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -2320,7 +2320,7 @@ func TestRenderFailBackoff(t *testing.T) {
 		{100, 30 * time.Second}, // the series does not grow beyond the cap
 	} {
 		if got := renderFailBackoff(c.streak); got != c.want {
-			t.Errorf("renderFailBackoff(%d) = %s, хочу %s", c.streak, got, c.want)
+			t.Errorf("renderFailBackoff(%d) = %s, want %s", c.streak, got, c.want)
 		}
 	}
 }

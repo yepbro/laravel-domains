@@ -116,18 +116,18 @@ func TestPendingKeys_LastDelivered(t *testing.T) {
 		t.Fatalf("PendingKeys: %v", err)
 	}
 	if len(f.froms) != 1 || f.froms[0] != "(5-0" {
-		t.Fatalf("нижние края XRANGE = %v, want [(5-0]", f.froms)
+		t.Fatalf("the XRANGE lower edges = %v, want [(5-0]", f.froms)
 	}
 	want := map[content.RetentionPendingKey]struct{}{
 		wantKey(1, 10, 2, 1): {},
 		wantKey(2, 20, 0, 0): {},
 	}
 	if len(keys) != len(want) {
-		t.Fatalf("ключей = %v, want %v", keys, want)
+		t.Fatalf("the keys = %v, want %v", keys, want)
 	}
 	for k := range want {
 		if _, ok := keys[k]; !ok {
-			t.Errorf("ключ %v отсутствует во множестве %v", k, keys)
+			t.Errorf("the key %v is missing from the set %v", k, keys)
 		}
 	}
 }
@@ -144,7 +144,7 @@ func TestPendingKeys_MinDelivered(t *testing.T) {
 		},
 		xrange: func(start string) ([]redis.XMessage, error) {
 			if start != "(999-0" {
-				return nil, fmt.Errorf("неожиданный нижний край %q", start)
+				return nil, fmt.Errorf("an unexpected lower edge %q", start)
 			}
 			return []redis.XMessage{pendingMsg("1001-0", 1, 10, 0, 0)}, nil
 		},
@@ -154,10 +154,10 @@ func TestPendingKeys_MinDelivered(t *testing.T) {
 		t.Fatalf("PendingKeys: %v", err)
 	}
 	if len(f.froms) != 1 || f.froms[0] != "(999-0" {
-		t.Fatalf("нижние края XRANGE = %v, want один [(999-0] — минимум численный", f.froms)
+		t.Fatalf("the XRANGE lower edges = %v, want a single [(999-0] — the numeric minimum", f.froms)
 	}
 	if _, ok := keys[wantKey(1, 10, 0, 0)]; !ok {
-		t.Fatalf("ключи = %v, want ключ записи отставшей группы", keys)
+		t.Fatalf("the keys = %v, want the record key of the lagging group", keys)
 	}
 }
 
@@ -174,10 +174,10 @@ func TestPendingKeys_NoGroups(t *testing.T) {
 		t.Fatalf("PendingKeys: %v", err)
 	}
 	if len(f.froms) != 1 || f.froms[0] != "-" {
-		t.Fatalf("нижние края XRANGE = %v, want [-]", f.froms)
+		t.Fatalf("the XRANGE lower edges = %v, want [-]", f.froms)
 	}
 	if _, ok := keys[wantKey(1, 10, 0, 0)]; !ok {
-		t.Fatalf("ключи = %v, want ключ записи 1/10/0/0", keys)
+		t.Fatalf("the keys = %v, want the record key 1/10/0/0", keys)
 	}
 }
 
@@ -188,15 +188,15 @@ func TestPendingKeys_NoStream(t *testing.T) {
 	f := &fakePendingRedis{groupsErr: redis.Nil}
 	keys, err := retentionPending{rdb: f}.PendingKeys(context.Background(), "q:render")
 	if err != nil {
-		t.Fatalf("PendingKeys: %v, want пустое множество без ошибки", err)
+		t.Fatalf("PendingKeys: %v, want an empty set without an error", err)
 	}
 	if len(keys) != 0 || len(f.froms) != 0 {
-		t.Fatalf("keys = %v, froms = %v, want пусто (XRANGE не нужен)", keys, f.froms)
+		t.Fatalf("keys = %v, froms = %v, want empty (no XRANGE needed)", keys, f.froms)
 	}
 
 	f = &fakePendingRedis{groupsErr: errors.New("ERR no such key")}
 	if _, err := (retentionPending{rdb: f}).PendingKeys(context.Background(), "q:render"); err != nil {
-		t.Fatalf("текстовая форма no such key: %v", err)
+		t.Fatalf("the no such key text form: %v", err)
 	}
 }
 
@@ -223,13 +223,13 @@ func TestPendingKeys_Pagination(t *testing.T) {
 		t.Fatalf("PendingKeys: %v", err)
 	}
 	if len(f.froms) != 2 || f.froms[0] != "(0-0" || f.froms[1] != "(1-"+fmt.Sprint(pendingScanBatch-1) {
-		t.Fatalf("нижние края XRANGE = %v, want [(0-0, (1-%d]", f.froms, pendingScanBatch-1)
+		t.Fatalf("the XRANGE lower edges = %v, want [(0-0, (1-%d]", f.froms, pendingScanBatch-1)
 	}
 	if int64(len(keys)) != pendingScanBatch+1 {
-		t.Fatalf("ключей = %d, want %d (весь хвост)", len(keys), pendingScanBatch+1)
+		t.Fatalf("the keys = %d, want %d (the whole tail)", len(keys), pendingScanBatch+1)
 	}
 	if _, ok := keys[wantKey(1, 10, pendingScanBatch, 0)]; !ok {
-		t.Error("запись второй страницы не попала во множество")
+		t.Error("the record of the second page did not get into the set")
 	}
 }
 
@@ -239,7 +239,7 @@ func TestPendingKeys_Pagination(t *testing.T) {
 func TestPendingKeys_Errors(t *testing.T) {
 	f := &fakePendingRedis{groupsErr: errors.New("connection refused")}
 	if _, err := (retentionPending{rdb: f}).PendingKeys(context.Background(), "q:render"); err == nil {
-		t.Fatal("ошибка XINFO GROUPS не проброшена")
+		t.Fatal("the XINFO GROUPS error is not propagated")
 	}
 
 	f = &fakePendingRedis{
@@ -247,7 +247,7 @@ func TestPendingKeys_Errors(t *testing.T) {
 		xrange: func(string) ([]redis.XMessage, error) { return nil, errors.New("OOM") },
 	}
 	if _, err := (retentionPending{rdb: f}).PendingKeys(context.Background(), "q:analyze"); err == nil {
-		t.Fatal("ошибка XRANGE не проброшена")
+		t.Fatal("the XRANGE error is not propagated")
 	}
 }
 
@@ -262,7 +262,7 @@ func TestPendingKeys_ForeignPayload(t *testing.T) {
 			return []redis.XMessage{
 				pendingMsg("1-0", 1, 10, 0, 0),
 				{ID: "2-0", Values: map[string]any{"not-data": "x"}},
-				{ID: "3-0", Values: map[string]any{"data": "не json"}},
+				{ID: "3-0", Values: map[string]any{"data": "not json"}},
 				{ID: "4-0", Values: map[string]any{"data": `{"task_id":"t","zone_id":0,"domain_id":0,"subdomain_id":0,"variant":0}`}},
 			}, nil
 		},
@@ -272,10 +272,10 @@ func TestPendingKeys_ForeignPayload(t *testing.T) {
 		t.Fatalf("PendingKeys: %v", err)
 	}
 	if len(keys) != 1 {
-		t.Fatalf("ключей = %v, want только валидное сообщение", keys)
+		t.Fatalf("the keys = %v, want only the valid message", keys)
 	}
 	if _, ok := keys[wantKey(1, 10, 0, 0)]; !ok {
-		t.Error("валидное сообщение потерялось среди чужих тел")
+		t.Error("the valid message got lost among the foreign bodies")
 	}
 }
 
@@ -297,14 +297,14 @@ func TestPendingKeys_ForeignPayload(t *testing.T) {
 // *pgx.Conn); here only the composition is pinned.
 func TestAfterConnectHooks(t *testing.T) {
 	if len(afterConnectHooks) != 2 {
-		t.Fatalf("AfterConnect-хуков пула = %d, want 2 (NoParallelGather T-201 + LockTimeout T-192)", len(afterConnectHooks))
+		t.Fatalf("the pool AfterConnect hooks = %d, want 2 (NoParallelGather T-201 + LockTimeout T-192)", len(afterConnectHooks))
 	}
 	// NoParallelGather — a named function of the db package: a code
 	// pointer identifies it unambiguously among the hooks (the LockTimeout
 	// closure — a different code); the regression of T-201 — a return to
 	// LockTimeout-without-seriality — is caught exactly here.
 	if reflect.ValueOf(afterConnectHooks[0]).Pointer() != reflect.ValueOf(db.NoParallelGather).Pointer() {
-		t.Error("первый AfterConnect-хук не db.NoParallelGather — retention-дренаж снова соберёт Gather Merge (T-201)")
+		t.Error("the first AfterConnect hook is not db.NoParallelGather — the retention drain would assemble a Gather Merge again (T-201)")
 	}
 	// LockTimeout — a closure: a code pointer cannot be compared — the
 	// compiler specializes the closure per call-site (init/main — different
@@ -318,11 +318,11 @@ func TestAfterConnectHooks(t *testing.T) {
 	// The argument of 30 s — the contract of TestLockTimeout_HookSQL in
 	// internal/db.
 	if name := runtime.FuncForPC(reflect.ValueOf(afterConnectHooks[1]).Pointer()).Name(); !strings.HasSuffix(name, "LockTimeout.func1") {
-		t.Errorf("второй AfterConnect-хук — %s, want замыкание db.LockTimeout (T-192)", name)
+		t.Errorf("the second AfterConnect hook is %s, want the db.LockTimeout closure (T-192)", name)
 	}
 	for i, h := range afterConnectHooks {
 		if h == nil {
-			t.Errorf("AfterConnect-хук #%d — nil: настройка сессии потеряна", i)
+			t.Errorf("the AfterConnect hook #%d is nil: the session setup is lost", i)
 		}
 	}
 }
@@ -341,10 +341,10 @@ func TestAfterConnectHooks(t *testing.T) {
 // the loop packages.
 func TestScanGate(t *testing.T) {
 	if scanGate == nil {
-		t.Fatal("scanGate = nil: гейт тяжёлых сканов не создан — циклы уйдут без сериализации (T-271)")
+		t.Fatal("scanGate = nil: the heavy scan gate is not created — the loops would go without serialization (T-271)")
 	}
 	if cap(scanGate) != 1 {
-		t.Fatalf("ёмкость scanGate = %d, want 1 (один тяжёлый скан на сервис)", cap(scanGate))
+		t.Fatalf("the scanGate capacity = %d, want 1 (one heavy scan per service)", cap(scanGate))
 	}
 }
 
@@ -364,7 +364,7 @@ func TestScanGateLoopWiring(t *testing.T) {
 	fset := token.NewFileSet()
 	parsed, err := parser.ParseFile(fset, "main.go", nil, 0)
 	if err != nil {
-		t.Fatalf("разбор main.go: %v", err)
+		t.Fatalf("parsing main.go: %v", err)
 	}
 	literals := map[string]int{ // the literals of the loop options by the types
 		"httpworker.LateOptions":   0,
@@ -395,17 +395,17 @@ func TestScanGateLoopWiring(t *testing.T) {
 			}
 			if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "Gate" {
 				if val, ok := kv.Value.(*ast.Ident); !ok || val.Name != "scanGate" {
-					t.Errorf("%s: Gate = %s, want scanGate — цикл уйдёт без гейта (T-271)", typ, types.ExprString(kv.Value))
+					t.Errorf("%s: Gate = %s, want scanGate — the loop would go without the gate (T-271)", typ, types.ExprString(kv.Value))
 				}
 				return true
 			}
 		}
-		t.Errorf("%s{...}: поле Gate отсутствует — тяжёлый скан цикла без single-flight (T-271)", typ)
+		t.Errorf("%s{...}: the Gate field is missing — the loop heavy scan without single-flight (T-271)", typ)
 		return true
 	})
 	for typ, n := range literals {
 		if n != 1 {
-			t.Errorf("литералов %s в main.go = %d, want 1 (цикл запускается ровно один раз)", typ, n)
+			t.Errorf("%s literals in main.go = %d, want 1 (the loop is started exactly once)", typ, n)
 		}
 	}
 }
@@ -430,20 +430,20 @@ func TestRenderQueueWatermark(t *testing.T) {
 		// The configuration defaults: 10k < 75k (half of
 		// DefaultStreamMaxLen(q:render) = 150k, T-025) — the clamp is not
 		// active, the gate fires at the configured value.
-		{"дефолт: кламп не активен", 10000, 100000, 0, 10000},
-		{"явное значение ниже клампа", 7000, 100000, 0, 7000},
+		{"the default: the clamp is inactive", 10000, 100000, 0, 10000},
+		{"an explicit value below the clamp", 7000, 100000, 0, 7000},
 		// 0 — the common threshold; the clamp caps it to 75k: the raw
 		// comparison of T-066 (without the clamp) kept the gate open at a
 		// lag of 98.4k out of 100k — the equilibrium of 24.10.
-		{"0 — общий порог с клампом", 0, 100000, 0, 75000},
-		{"явное значение выше клампа ограничивается", 200000, 100000, 0, 75000},
+		{"0 — the common threshold with the clamp", 0, 100000, 0, 75000},
+		{"an explicit value above the clamp is bounded", 200000, 100000, 0, 75000},
 		// An explicit redis.maxlen cuts the clamp ceiling for all the
 		// cases.
-		{"0 — общий при явном redis.maxlen", 0, 100000, 10000, 5000},
-		{"явное при явном redis.maxlen", 10000, 100000, 10000, 5000},
+		{"0 — the common one with an explicit redis.maxlen", 0, 100000, 10000, 5000},
+		{"an explicit one with an explicit redis.maxlen", 10000, 100000, 10000, 5000},
 		// The negative ones (past the validation) — StreamWatermark gives
 		// 0: the gate is off, the documented semantics of ≤ 0.
-		{"отрицательные — гейт отключён", -5, 0, 0, 0},
+		{"negatives — the gate is off", -5, 0, 0, 0},
 	}
 	for _, tc := range cases {
 		cfg := &config.Config{}
@@ -451,7 +451,7 @@ func TestRenderQueueWatermark(t *testing.T) {
 		cfg.Scheduler.QueueHighWatermark = tc.scheduler
 		cfg.Redis.MaxLen = tc.redisLen
 		if got := renderQueueWatermark(cfg); got != tc.want {
-			t.Errorf("%s: renderQueueWatermark = %d, хочу %d", tc.name, got, tc.want)
+			t.Errorf("%s: renderQueueWatermark = %d, want %d", tc.name, got, tc.want)
 		}
 	}
 
@@ -461,10 +461,10 @@ func TestRenderQueueWatermark(t *testing.T) {
 	// not make it in time to close before the trim.
 	def := renderQueueWatermark(config.Default())
 	if def != 10000 {
-		t.Errorf("дефолт эффективного порога q:render = %d, хочу 10000 (T-174)", def)
+		t.Errorf("the default effective q:render threshold = %d, want 10000 (T-174)", def)
 	}
 	if half := queue.DefaultStreamMaxLen(queue.StreamRender) / 2; def > half {
-		t.Errorf("дефолт %d выше DefaultStreamMaxLen(q:render)/2 = %d — ворота не сработают до обрезки", def, half)
+		t.Errorf("the default %d is above DefaultStreamMaxLen(q:render)/2 = %d — the gate would not trip before the trimming", def, half)
 	}
 }
 

@@ -723,10 +723,10 @@ type Worker struct {
 // New creates the worker over the fetch load seam (production — ChainFetch).
 func New(fetch FetchFunc, opts Options) (*Worker, error) {
 	if fetch == nil {
-		return nil, errors.New("httpworker: шов загрузки не задан (ChainFetch)")
+		return nil, errors.New("httpworker: the fetch seam is not set (ChainFetch)")
 	}
 	if opts.Store == nil {
-		return nil, errors.New("httpworker: хранилище контента не задано (раннее сохранение тел, T-147)")
+		return nil, errors.New("httpworker: the content store is not set (the early body saving, T-147)")
 	}
 	return &Worker{fetch: fetch, opt: opts.withDefaults(), met: NewMetrics(opts.Metrics)}, nil
 }
@@ -744,23 +744,23 @@ type workerSub struct {
 // the loop — here the guard of direct ProcessDomain calls) and parses the addresses.
 func workerPrepareTask(task queue.HTTPTask) ([]workerSub, error) {
 	if strings.TrimSpace(task.Name) == "" {
-		return nil, errors.New("httpworker: задача без имени домена")
+		return nil, errors.New("httpworker: the task has no domain name")
 	}
 	if len(task.Subdomains) == 0 {
-		return nil, errors.New("httpworker: задача без субдоменов (пустая q:http не публикуется, T-024)")
+		return nil, errors.New("httpworker: the task has no subdomains (an empty q:http is not published, T-024)")
 	}
 	seen := make(map[int16]struct{}, len(task.Subdomains))
 	subs := make([]workerSub, 0, len(task.Subdomains))
 	for i, s := range task.Subdomains {
 		if err := model.ValidateSubdomainID(int(s.SubdomainID)); err != nil {
-			return nil, fmt.Errorf("httpworker: субдомен №%d: %w", i+1, err)
+			return nil, fmt.Errorf("httpworker: subdomain #%d: %w", i+1, err)
 		}
 		if _, dup := seen[s.SubdomainID]; dup {
-			return nil, fmt.Errorf("httpworker: субдомен №%d: дубликат subdomain_id %d", i+1, s.SubdomainID)
+			return nil, fmt.Errorf("httpworker: subdomain #%d: a duplicate subdomain_id %d", i+1, s.SubdomainID)
 		}
 		seen[s.SubdomainID] = struct{}{}
 		if strings.ContainsAny(s.Label, ". ") {
-			return nil, fmt.Errorf("httpworker: субдомен №%d: метка %q — одна DNS-метка", i+1, s.Label)
+			return nil, fmt.Errorf("httpworker: subdomain #%d: label %q — a single DNS label", i+1, s.Label)
 		}
 		host := task.Name
 		if s.Label != "" {
@@ -770,12 +770,12 @@ func workerPrepareTask(task queue.HTTPTask) ([]workerSub, error) {
 		for _, a := range s.Addrs {
 			addr, err := netip.ParseAddr(a)
 			if err != nil {
-				return nil, fmt.Errorf("httpworker: субдомен №%d: адрес %q: %w", i+1, a, err)
+				return nil, fmt.Errorf("httpworker: subdomain #%d: address %q: %w", i+1, a, err)
 			}
 			addrs = append(addrs, addr)
 		}
 		if len(addrs) == 0 {
-			return nil, fmt.Errorf("httpworker: субдомен №%d: нет адресов", i+1)
+			return nil, fmt.Errorf("httpworker: subdomain #%d: no addresses", i+1)
 		}
 		subs = append(subs, workerSub{id: s.SubdomainID, label: s.Label, host: host, addrs: addrs, cname: s.CNAME})
 	}
@@ -854,7 +854,7 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 			for _, i := range rest {
 				workerSkipSubdomain(&res.Subdomains[i], subs[i])
 			}
-			w.opt.log().Info("dead-host cutoff: apex и www не прошли connect-фазу — субдомены не проверяются",
+			w.opt.log().Info("dead-host cutoff: apex and www failed the connect phase — the subdomains are not checked",
 				"domain", task.Name, "skipped_subdomains", len(rest), "skipped_checks", 2*len(rest))
 		} else {
 			for _, i := range rest {
@@ -873,7 +873,7 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 	// checks would look like "the web is silent" and give a false no_http;
 	// an honest failure will return the task with a repeated delivery (spec 3.4).
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("httpworker: домен %s: отмена: %w", task.Name, err)
+		return nil, fmt.Errorf("httpworker: domain %s: cancellation: %w", task.Name, err)
 	}
 
 	// An early Put failure that is not the content write pause (a
@@ -886,7 +886,7 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 	for i := range res.Subdomains {
 		for _, c := range []*SchemeCheck{&res.Subdomains[i].HTTPS, &res.Subdomains[i].HTTP} {
 			if c.storeErr != nil {
-				return nil, fmt.Errorf("httpworker: домен %s: сохранение контента: %w", task.Name, c.storeErr)
+				return nil, fmt.Errorf("httpworker: domain %s: content saving: %w", task.Name, c.storeErr)
 			}
 		}
 	}
@@ -906,7 +906,7 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 		httpIn := httpfetch.NewVariantInput(model.SchemeHTTP, sub.HTTP.Available, sub.HTTP.FinalURL, sub.HTTP.ContentHash)
 		variants, err := httpfetch.DecideVariants(httpsIn, httpIn)
 		if err != nil {
-			return nil, fmt.Errorf("httpworker: домен %s: субдомен %s: %w", task.Name, sub.Hostname, err)
+			return nil, fmt.Errorf("httpworker: domain %s: subdomain %s: %w", task.Name, sub.Hostname, err)
 		}
 		recs := make([]Record, 0, len(variants))
 		for _, vr := range variants {
@@ -969,7 +969,7 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 	// construction bug: the q:http delivery returns without an XACK
 	// (spec 3.4), garbage does not reach the DB.
 	if err := validateResult(res); err != nil {
-		return nil, fmt.Errorf("httpworker: домен %s: %w", task.Name, err)
+		return nil, fmt.Errorf("httpworker: domain %s: %w", task.Name, err)
 	}
 
 	// The early Put registry (T-147) — into the result: ContentSaver.Save will reconcile
@@ -1037,7 +1037,7 @@ func workerDeadHostHead(res *DomainResult, head []int) bool {
 // unavailable → no records; the contribution into the domain's status — the T-058
 // aggregator decides over the performed apex/www checks).
 func workerSkipSubdomain(dst *SubdomainResult, sub workerSub) {
-	const note = "dead-host cutoff (T-164): apex и www не прошли connect-фазу — субдомен не проверялся"
+	const note = "dead-host cutoff (T-164): apex and www failed the connect phase — the subdomain was not checked"
 	dst.SubdomainID = sub.id
 	dst.Label = sub.label
 	dst.Hostname = sub.host
@@ -1186,7 +1186,7 @@ func (w *Worker) checkScheme(
 	if truncated {
 		check.Truncated = true
 		check.ErrClass = ErrBody
-		check.ErrText = "тело обрезано потолком max_body_bytes (данные частичны)"
+		check.ErrText = "the body is truncated by the max_body_bytes cap (the data is partial)"
 	}
 
 	// The body hold window (T-163): from completing the read to the end of the
@@ -1226,7 +1226,7 @@ func (w *Worker) checkScheme(
 		switch {
 		case err == nil:
 			if pr.Hash != hash {
-				check.storeErr = fmt.Errorf("хранилище вернуло хэш %s, воркер вычислил %s (контракт HashOf, T-041)",
+				check.storeErr = fmt.Errorf("the store returned hash %s, the worker computed %s (the HashOf contract, T-041)",
 					pr.Hash, hash)
 				return check
 			}
@@ -1235,7 +1235,7 @@ func (w *Worker) checkScheme(
 		case errors.Is(err, content.ErrStoreFull), errors.Is(err, content.ErrTooLarge):
 			// The content is not stored, the result record lives with
 			// content_hash = nil (ContentSaver normalizes it, spec 8).
-			w.opt.log().Warn("контент страницы не сохранён — запись будет без content_hash",
+			w.opt.log().Warn("the page content is not stored — the record will have no content_hash",
 				"url", res.FinalURL.String(), "err", err.Error())
 		default:
 			check.storeErr = err
@@ -1333,14 +1333,14 @@ func workerReadBody(res *httpfetch.FetchResult) ([]byte, error) {
 // the observations, the pause priority order — by the transition table there.
 func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	if q == nil {
-		return errors.New("httpworker: цикл воркера: очередь не задана")
+		return errors.New("httpworker: the worker loop: the queue is not set")
 	}
 	if w == nil {
-		return errors.New("httpworker: цикл воркера: воркер не задан")
+		return errors.New("httpworker: the worker loop: the worker is not set")
 	}
 	o := opts.withDefaults()
 	log := o.log()
-	log.Info("цикл http-worker",
+	log.Info("http-worker loop",
 		"group", o.Group, "consumer", o.Consumer,
 		"concurrency", o.Concurrency, "consume", o.Consume, "per_domain", o.PerDomain,
 		"max_redirects", o.MaxRedirects, "on_result", o.OnResult != nil)
@@ -1433,7 +1433,7 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 				// would read chunks between the pauses).
 				infraStreak++
 				pause := workerFailBackoff(infraStreak)
-				log.Warn("пауза чтения q:http: публикация результатов падает об инфраструктуру Redis (OOM/соединение) — новые доставки не читаются (T-152)",
+				log.Warn("q:http reading pause: the result publication hits the Redis infrastructure (OOM/connection) — new deliveries are not read (T-152)",
 					"streak", infraStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
@@ -1460,7 +1460,7 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 				// DefaultErrorWait stops the whole stage's reading —
 				// a Warn with the series and the failure count (the frequency is bounded
 				// by the pause doubling, no more often than ~2/min on series).
-				log.Warn("пауза предохранителя чтения q:http: доставки падают подряд",
+				log.Warn("q:http reading fuse pause: deliveries fail in a row",
 					"failed", obs.failed, "streak", failStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
@@ -1476,7 +1476,7 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 			if obs.infra && infraDown.Swap(false) {
 				infraStreak = 0
 				if o.Recover != nil {
-					log.Info("запись в Redis восстановлена — чтение q:http возобновляется")
+					log.Info("the Redis write is back — the q:http reading resumes")
 				}
 			}
 			// The fuse pause series is reset by the observation
@@ -1489,7 +1489,7 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 				if ctx.Err() != nil {
 					return // graceful shutdown
 				}
-				log.Warn("цикл http-worker: чтение q:http", "err", err)
+				log.Warn("http-worker loop: reading q:http", "err", err)
 				wait(DefaultErrorWait)
 				continue
 			}
@@ -1543,7 +1543,7 @@ dispatch:
 			defer func() {
 				if r := recover(); r != nil {
 					failed.Add(1)
-					log.Error("паника обработки доставки",
+					log.Error("delivery processing panic",
 						"entry", d.ID, "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
@@ -1558,7 +1558,7 @@ dispatch:
 					infraDown.Store(true)
 				}
 				if ctx.Err() == nil {
-					log.Warn("задача q:http не подтверждена — вернётся повторной доставкой",
+					log.Warn("the q:http task is not acknowledged — it will come back with a re-delivery",
 						"entry", d.ID, "err", err)
 				}
 			} else {
@@ -1587,7 +1587,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, o Opti
 	if err != nil {
 		// A poison record: a repeated delivery is pointless, the queue
 		// will exhaust the attempts and carry it into q:dead (T-025).
-		return fmt.Errorf("httpworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
+		return fmt.Errorf("httpworker: entry %s of stream %s: %w", del.ID, del.Stream, err)
 	}
 	// The slot is taken until the end of the processing (T-163): both entry points (the Run
 	// dispatcher and the RecoverLoop claims) go through here — the occupancy
@@ -1597,15 +1597,15 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, o Opti
 	start := time.Now()
 	res, err := w.ProcessDomain(ctx, task)
 	if err != nil {
-		return fmt.Errorf("httpworker: домен %s: %w", task.Name, err)
+		return fmt.Errorf("httpworker: domain %s: %w", task.Name, err)
 	}
 	if o.OnResult != nil {
 		if err := o.OnResult(ctx, res); err != nil {
-			return fmt.Errorf("httpworker: домен %s: обработка результата: %w", task.Name, err)
+			return fmt.Errorf("httpworker: domain %s: result processing: %w", task.Name, err)
 		}
 	}
 	w.met.Episode(res, time.Since(start))
-	o.log().Debug("HTTP-задача обработана",
+	o.log().Debug("HTTP task processed",
 		"domain", task.Name, "subdomains", len(res.Subdomains), "records", res.RecordCount())
 	return nil
 }
@@ -1689,7 +1689,7 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 		if firstErr != nil {
 			return nil, firstErr
 		}
-		return nil, fmt.Errorf("httpworker: резолв %q: пустой ответ", host)
+		return nil, fmt.Errorf("httpworker: resolve %q: an empty answer", host)
 	}
 	return out, nil
 }
@@ -1707,9 +1707,9 @@ func (d *DNSLookup) lookupType(ctx context.Context, host string, t uint16) worke
 	res, err := d.resolve.Exchange(ctx, dnsclient.Question{Name: host, Type: t})
 	switch {
 	case err != nil:
-		return workerDNSAnswer{err: fmt.Errorf("httpworker: резолв %q %s: %w", host, dns.TypeToString[t], err)}
+		return workerDNSAnswer{err: fmt.Errorf("httpworker: resolve %q %s: %w", host, dns.TypeToString[t], err)}
 	case res.RCode != dnsclient.RCodeNOERROR:
-		return workerDNSAnswer{err: fmt.Errorf("httpworker: резолв %q %s: %s", host, dns.TypeToString[t], res.RCode.String())}
+		return workerDNSAnswer{err: fmt.Errorf("httpworker: resolve %q %s: %s", host, dns.TypeToString[t], res.RCode.String())}
 	}
 	var addrs []netip.Addr
 	for _, rr := range res.RecordsOf(t) {

@@ -381,10 +381,10 @@ type Recorder struct {
 // is assembled by NewRenderRecorder.
 func NewRecorder(pool RecordDB, q queue.Queue, met *Metrics, log *slog.Logger) (*Recorder, error) {
 	if pool == nil {
-		return nil, errors.New("httpworker: запись результата: пул не задан")
+		return nil, errors.New("httpworker: result write: pool is not set")
 	}
 	if q == nil {
-		return nil, errors.New("httpworker: запись результата: очередь не задана")
+		return nil, errors.New("httpworker: result write: queue is not set")
 	}
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -434,7 +434,7 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 				// flag preserves the render tasks, the episode is not delayed;
 				// a real Redis unavailability will still return
 				// the delivery at the q:analyze publication below.
-				r.log.Warn("ёмкость q:render не проверена — домен помечен render_pending",
+				r.log.Warn("q:render capacity not checked — the domain is flagged render_pending",
 					"domain", res.Name, "err", err)
 				free = false
 			}
@@ -471,7 +471,7 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	// not a filter here.
 	for i := range batch.pub {
 		if _, err := r.q.Publish(ctx, queue.StreamAnalyze, batch.pub[i]); err != nil {
-			return true, fmt.Errorf("httpworker: домен %s: публикация q:analyze (запись %d/%d): %w",
+			return true, fmt.Errorf("httpworker: domain %s: q:analyze publication (record %d/%d): %w",
 				res.Name, i+1, len(batch.pub), err)
 		}
 	}
@@ -483,11 +483,11 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	// would delay the XACK (§5.6).
 	if len(renderKeys) > 0 && !renderPending {
 		if err := r.render.Publish(ctx, renderKeys); err != nil {
-			return true, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return true, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 		}
 	}
 
-	r.log.Debug("HTTP-результат записан",
+	r.log.Debug("HTTP result written",
 		"domain", res.Name, "status", status.String(), "records", len(batch.zone),
 		"swapped_refs", swapped, "cutoff", res.Cutoff,
 		"render_pending", renderPending, "q_render", len(renderKeys))
@@ -507,7 +507,7 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recordBatch, status model.Status, renderPending bool) (bool, int, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: транзакция: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: domain %s: result write: transaction: %w", res.Name, err)
 	}
 	// The rollback unconditionally: after the Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -523,14 +523,14 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	err = tx.QueryRow(ctx, recordSelectStateSQL, res.ZoneID, res.DomainID).Scan(&oldStatus, &oldState)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			r.log.Debug("результат не записан — домен отсутствует",
+			r.log.Debug("result not written — the domain is absent",
 				"domain", res.Name, "zone_id", res.ZoneID, "domain_id", res.DomainID)
 			return false, 0, nil
 		}
-		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: строка: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: domain %s: result write: row read: %w", res.Name, err)
 	}
 	if model.Status(oldStatus) == model.StatusDeleted {
-		r.log.Debug("результат не записан — домен удалён",
+		r.log.Debug("result not written — the domain is deleted",
 			"domain", res.Name, "zone_id", res.ZoneID, "domain_id", res.DomainID)
 		return false, 0, nil
 	}
@@ -541,13 +541,13 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	// bit of the last episode (T-164).
 	tag, err := tx.Exec(ctx, recordDomainSQL, res.ZoneID, res.DomainID, int16(status), res.Cutoff)
 	if err != nil {
-		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: статус: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: domain %s: result write: status: %w", res.Name, err)
 	}
 	if tag.RowsAffected() != 1 {
 		// The row is locked and not deleted — unreachable (a guard
 		// for direct calls/manual edits); a silent skip of the deltas would make
 		// the counters a lie.
-		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: статус: затронуто %d строк", res.Name, tag.RowsAffected())
+		return false, 0, fmt.Errorf("httpworker: domain %s: result write: status: %d rows affected", res.Name, tag.RowsAffected())
 	}
 	// The final UPDATE's RowsAffected — the daily checks counter's delta
 	// (T-179, TZ_slow_done_today §5): not the number of the chunk's
@@ -574,10 +574,10 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	if renderPending {
 		tag, err := tx.Exec(ctx, renderSetPendingSQL, res.ZoneID, res.DomainID)
 		if err != nil {
-			return false, 0, fmt.Errorf("httpworker: домен %s: флаг render_pending: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: domain %s: render_pending flag: %w", res.Name, err)
 		}
 		if tag.RowsAffected() > 1 {
-			return false, 0, fmt.Errorf("httpworker: домен %s: флаг render_pending: затронуто %d строк", res.Name, tag.RowsAffected())
+			return false, 0, fmt.Errorf("httpworker: domain %s: render_pending flag: %d rows affected", res.Name, tag.RowsAffected())
 		}
 		bumpDebt = tag.RowsAffected() == 1
 	}
@@ -591,7 +591,7 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	}
 	for _, h := range oldHashes {
 		if err := content.SwapRefTx(ctx, tx, h, content.Hash{}); err != nil {
-			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 		}
 	}
 
@@ -603,10 +603,10 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	if len(batch.zone) > 0 {
 		tag, err := tx.Exec(ctx, recordInsertSQL, batch.args()...)
 		if err != nil {
-			return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: строки: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: domain %s: result write: rows: %w", res.Name, err)
 		}
 		if int(tag.RowsAffected()) != len(batch.zone) {
-			return false, 0, fmt.Errorf("httpworker: домен %s: вставлено %d строк из %d", res.Name, tag.RowsAffected(), len(batch.zone))
+			return false, 0, fmt.Errorf("httpworker: domain %s: inserted %d of %d rows", res.Name, tag.RowsAffected(), len(batch.zone))
 		}
 		// The episode's rows — the hourly throughput bucket's delta (T-203): all
 		// the inserted rows carry checked_at = the transaction's now() — the
@@ -631,25 +631,25 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 		default:
 			// A code outside the enum — garbage in the schema; a silent skip
 			// of the deltas would make the counters a lie, the error is louder.
-			return fmt.Errorf("старое состояние %d вне перечисления check_state", oldState)
+			return fmt.Errorf("old state %d is outside the check_state enum", oldState)
 		}
 		tag, err := tx.Exec(ctx, recordZoneShiftSQL, res.ZoneID, dPending, dQueued, dChecked)
 		if err != nil {
-			return fmt.Errorf("счётчики зоны: %w", err)
+			return fmt.Errorf("zone counters: %w", err)
 		}
 		if tag.RowsAffected() != 1 {
-			return fmt.Errorf("счётчики зоны: затронуто %d строк (строка зоны %d обязательна)", tag.RowsAffected(), res.ZoneID)
+			return fmt.Errorf("zone counters: %d rows affected (the zone row %d is required)", tag.RowsAffected(), res.ZoneID)
 		}
 		return nil
 	}
 	if err := shiftZone(); err != nil {
-		return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 	}
 	// The debt counter — the transaction's last step (the same commit, §3.4:
 	// a rollback rolls back the pair; the counter row's lock window — a minimum).
 	if bumpDebt {
 		if err := renderBumpDebtCounter(ctx, tx, 1); err != nil {
-			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 		}
 	}
 	// The daily checks counter — the same "tail" step (T-179):
@@ -664,7 +664,7 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	// together (§3.4); an XACK failure will return the delivery — a repeated write
 	// will add one more event (§5.1, the reconciliation levels it out).
 	if err := recordBumpChecksCounter(ctx, tx, recorded); err != nil {
-		return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 	}
 	// The temp_error share numerator (T-182) — right after the checks denominator:
 	// the delta — only at a temp_error episode (the final UPDATE's
@@ -675,7 +675,7 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	// cycles; a rollback rolls back the result and both deltas together (§3.4).
 	if status == model.StatusTempError {
 		if err := recordBumpTempErrCounter(ctx, tx, recorded); err != nil {
-			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 		}
 		// The maturity bucket (T-202) — closes the delta chain: the last
 		// among the counter rows (the reconciliation order "… → temp_error: →
@@ -684,7 +684,7 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 		// DNS stage (dnsworker/result.go) and by this operator: both write
 		// the same name from current_date of the same write transaction.
 		if err := recordBumpRetryMatureCounter(ctx, tx, recorded); err != nil {
-			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 		}
 	}
 	// The reanalysis tails' hourly bucket (T-204) — after the retry bucket,
@@ -694,7 +694,7 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	// episode without records) — the operator does not run at all.
 	if inserted > 0 {
 		if err := recordBumpReanalyzeCounter(ctx, tx, inserted); err != nil {
-			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 		}
 	}
 	// The hourly throughput bucket (T-203) — the finale of the counter delta chain:
@@ -706,11 +706,11 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	// empty upsert passes do not warm the bucket's lock.
 	if inserted > 0 {
 		if err := recordBumpResultsCounter(ctx, tx, inserted); err != nil {
-			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+			return false, 0, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: фиксация: %w", res.Name, err)
+		return false, 0, fmt.Errorf("httpworker: domain %s: result write: commit: %w", res.Name, err)
 	}
 	return true, len(oldHashes), nil
 }
@@ -722,7 +722,7 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 func recordDeleteOld(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int64) ([]content.Hash, error) {
 	rows, err := tx.Query(ctx, recordDeleteSQL, zoneID, domainID)
 	if err != nil {
-		return nil, fmt.Errorf("httpworker: домен %d/%d: удаление старых строк: %w", zoneID, domainID, err)
+		return nil, fmt.Errorf("httpworker: domain %d/%d: deleting old rows: %w", zoneID, domainID, err)
 	}
 	defer rows.Close()
 
@@ -730,7 +730,7 @@ func recordDeleteOld(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	for rows.Next() {
 		var hash []byte
 		if err := rows.Scan(&hash); err != nil {
-			return nil, fmt.Errorf("httpworker: домен %d/%d: удаление старых строк: чтение: %w", zoneID, domainID, err)
+			return nil, fmt.Errorf("httpworker: domain %d/%d: deleting old rows: scan: %w", zoneID, domainID, err)
 		}
 		if hash == nil {
 			continue // a row without content — nothing to remove
@@ -740,7 +740,7 @@ func recordDeleteOld(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 		counts[h]++
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("httpworker: домен %d/%d: удаление старых строк: %w", zoneID, domainID, err)
+		return nil, fmt.Errorf("httpworker: domain %d/%d: deleting old rows: %w", zoneID, domainID, err)
 	}
 
 	out := make([]content.Hash, 0, len(counts))
@@ -763,10 +763,10 @@ func recordDeleteOld(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 func recordBumpChecksCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordChecksBumpSQL, delta)
 	if err != nil {
-		return fmt.Errorf("суточный счётчик проверок: %w", err)
+		return fmt.Errorf("daily checks counter: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("суточный счётчик проверок: затронуто %d строк (upsert строки дня обязан 1)",
+		return fmt.Errorf("daily checks counter: %d rows affected (the day row upsert must affect 1)",
 			tag.RowsAffected())
 	}
 	return nil
@@ -783,10 +783,10 @@ func recordBumpChecksCounter(ctx context.Context, tx pgx.Tx, delta int64) error 
 func recordBumpTempErrCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordTempErrBumpSQL, delta)
 	if err != nil {
-		return fmt.Errorf("суточный числитель temp_error: %w", err)
+		return fmt.Errorf("daily temp_error numerator: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("суточный числитель temp_error: затронуто %d строк (upsert строки дня обязан 1)",
+		return fmt.Errorf("daily temp_error numerator: %d rows affected (the day row upsert must affect 1)",
 			tag.RowsAffected())
 	}
 	return nil
@@ -804,10 +804,10 @@ func recordBumpTempErrCounter(ctx context.Context, tx pgx.Tx, delta int64) error
 func recordBumpRetryMatureCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordRetryMatureBumpSQL, delta)
 	if err != nil {
-		return fmt.Errorf("корзина зрелости temp_error: %w", err)
+		return fmt.Errorf("temp_error maturity bucket: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("корзина зрелости temp_error: затронуто %d строк (upsert корзины суток обязан 1)",
+		return fmt.Errorf("temp_error maturity bucket: %d rows affected (the day bucket upsert must affect 1)",
 			tag.RowsAffected())
 	}
 	return nil
@@ -824,10 +824,10 @@ func recordBumpRetryMatureCounter(ctx context.Context, tx pgx.Tx, delta int64) e
 func recordBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordReanalyzeBumpSQL, delta)
 	if err != nil {
-		return fmt.Errorf("корзина хвостов переанализа: %w", err)
+		return fmt.Errorf("reanalysis tails bucket: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("корзина хвостов переанализа: затронуто %d строк (upsert корзины часа обязан 1)",
+		return fmt.Errorf("reanalysis tails bucket: %d rows affected (the hour bucket upsert must affect 1)",
 			tag.RowsAffected())
 	}
 	return nil
@@ -845,10 +845,10 @@ func recordBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, delta int64) err
 func recordBumpResultsCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordResultsBumpSQL, delta)
 	if err != nil {
-		return fmt.Errorf("часовая корзина темпа: %w", err)
+		return fmt.Errorf("hourly rate bucket: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("часовая корзина темпа: затронуто %d строк (upsert корзины часа обязан 1)",
+		return fmt.Errorf("hourly rate bucket: %d rows affected (the hour bucket upsert must affect 1)",
 			tag.RowsAffected())
 	}
 	return nil
@@ -908,7 +908,7 @@ func (b *recordBatch) args() []any {
 // the transaction, the DB is not touched.
 func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 	if res.ZoneID <= 0 || res.DomainID <= 0 {
-		return nil, fmt.Errorf("httpworker: запись результата: зона %d, домен %d — идентификаторы положительны", res.ZoneID, res.DomainID)
+		return nil, fmt.Errorf("httpworker: result write: zone %d, domain %d — the identifiers must be positive", res.ZoneID, res.DomainID)
 	}
 	n := res.RecordCount()
 	b := &recordBatch{
@@ -931,7 +931,7 @@ func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 			rec := &sub.Records[j]
 			key := recordKey{sub: sub.SubdomainID, variant: rec.Variant}
 			if _, dup := seen[key]; dup {
-				return nil, fmt.Errorf("httpworker: домен %s: субдомен %d, вариант %d: дубликат ключа subdomain_results", res.Name, sub.SubdomainID, int16(rec.Variant))
+				return nil, fmt.Errorf("httpworker: domain %s: subdomain %d, variant %d: a duplicate subdomain_results key", res.Name, sub.SubdomainID, int16(rec.Variant))
 			}
 			seen[key] = struct{}{}
 			// The stage boundary (T-266, TZ-fsm spec §3 FR-12): the record's content part
@@ -940,7 +940,7 @@ func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 			// are checked by the automaton's centralized validator
 			// (schemestate.go), formerly — recordValidateRow.
 			if err := rec.validate(); err != nil {
-				return nil, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
+				return nil, fmt.Errorf("httpworker: domain %s: %w", res.Name, err)
 			}
 
 			var httpStatus *int16
@@ -958,19 +958,19 @@ func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 			}
 			tls, err := recordJSON(rec.TLS != nil, rec.TLS)
 			if err != nil {
-				return nil, fmt.Errorf("httpworker: домен %s: субдомен %s: TLS: %w", res.Name, sub.Hostname, err)
+				return nil, fmt.Errorf("httpworker: domain %s: subdomain %s: TLS: %w", res.Name, sub.Hostname, err)
 			}
 			redirects, err := recordJSON(len(rec.Redirects) > 0, rec.Redirects)
 			if err != nil {
-				return nil, fmt.Errorf("httpworker: домен %s: субдомен %s: цепочка редиректов: %w", res.Name, sub.Hostname, err)
+				return nil, fmt.Errorf("httpworker: domain %s: subdomain %s: the redirect chain: %w", res.Name, sub.Hostname, err)
 			}
 			headers, err := recordJSON(len(rec.Header) > 0, rec.Header)
 			if err != nil {
-				return nil, fmt.Errorf("httpworker: домен %s: субдомен %s: заголовки: %w", res.Name, sub.Hostname, err)
+				return nil, fmt.Errorf("httpworker: domain %s: subdomain %s: headers: %w", res.Name, sub.Hostname, err)
 			}
 			cookies, err := recordCookies(rec.Cookies)
 			if err != nil {
-				return nil, fmt.Errorf("httpworker: домен %s: субдомен %s: cookies: %w", res.Name, sub.Hostname, err)
+				return nil, fmt.Errorf("httpworker: domain %s: subdomain %s: cookies: %w", res.Name, sub.Hostname, err)
 			}
 			var errCode *int16
 			if rec.ErrClass != ErrNone {

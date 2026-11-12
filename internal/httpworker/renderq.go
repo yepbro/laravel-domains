@@ -429,10 +429,10 @@ type RenderQueue struct {
 // of publications is invisible to the operator.
 func NewRenderQueue(q queue.Queue, lenner RenderLen, watermark int64, log *slog.Logger) (*RenderQueue, error) {
 	if q == nil {
-		return nil, errors.New("httpworker: очередь рендера: очередь не задана")
+		return nil, errors.New("httpworker: render queue: the queue is not set")
 	}
 	if lenner == nil {
-		return nil, errors.New("httpworker: очередь рендера: источник длины стрима не задан (BackpressureGate, T-026)")
+		return nil, errors.New("httpworker: render queue: the stream length source is not set (BackpressureGate, T-026)")
 	}
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -462,7 +462,7 @@ func (rq *RenderQueue) HasCapacity(ctx context.Context) (bool, error) {
 func (rq *RenderQueue) Publish(ctx context.Context, msgs []queue.Result) error {
 	for i := range msgs {
 		if _, err := rq.q.Publish(ctx, queue.StreamRender, msgs[i]); err != nil {
-			return fmt.Errorf("httpworker: публикация q:render (запись %d/%d): %w", i+1, len(msgs), err)
+			return fmt.Errorf("httpworker: q:render publication (record %d/%d): %w", i+1, len(msgs), err)
 		}
 	}
 	return nil
@@ -599,13 +599,13 @@ type renderPendingRow struct {
 // (renderStage, saving an idle full seq scan).
 func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, opts RequeueOptions) (RequeueResult, error) {
 	if pool == nil {
-		return RequeueResult{}, errors.New("httpworker: проход рендера: пул не задан")
+		return RequeueResult{}, errors.New("httpworker: render rework pass: the pool is not set")
 	}
 	if contents == nil {
-		return RequeueResult{}, errors.New("httpworker: проход рендера: хранилище контента не задано")
+		return RequeueResult{}, errors.New("httpworker: render rework pass: the content store is not set")
 	}
 	if render == nil {
-		return RequeueResult{}, errors.New("httpworker: проход рендера: очередь рендера не задана")
+		return RequeueResult{}, errors.New("httpworker: render rework pass: the render queue is not set")
 	}
 	o := opts.withDefaults()
 	if o.Log == nil {
@@ -657,7 +657,7 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 	// the loop's next tick.
 	free, err := render.HasCapacity(ctx)
 	if err != nil {
-		return out, fmt.Errorf("httpworker: проход рендера: ёмкость q:render: %w", err)
+		return out, fmt.Errorf("httpworker: render rework pass: q:render capacity: %w", err)
 	}
 	if !free {
 		return RequeueResult{Full: true}, nil
@@ -675,7 +675,7 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		return out, err
 	}
 	if debt < 0 {
-		o.Log.Warn("проход рендера: отрицательный счётчик рендер-долга — рассинхрон (runbooks §6)", "debt", debt)
+		o.Log.Warn("render rework pass: negative render debt counter — a desync (runbooks §6)", "debt", debt)
 	}
 	if debt <= 0 {
 		return out, nil
@@ -712,7 +712,7 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 			// new orphans do not accumulate, the tail before T-186 is cleaned once
 			// (runbooks §6). The drainage pays a full pass without an early
 			// stop per tick — the operator must see this.
-			o.Log.Warn("проход рендера: счётчик долга > 0, выборка пуста — биты-«сироты» либо рассинхрон счётчика (runbooks §6)",
+			o.Log.Warn("render rework pass: debt counter > 0, the selection is empty — orphan bits or a counter desync (runbooks §6)",
 				"debt", debt)
 			return out, nil
 		}
@@ -762,7 +762,7 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		out.Selected = len(domains)
 		if len(domains) == 0 {
 			// Both stages are empty — the same diagnostics as in the one-stage mode.
-			o.Log.Warn("проход рендера: счётчик долга > 0, выборка пуста — биты-«сироты» либо рассинхрон счётчика (runbooks §6)",
+			o.Log.Warn("render rework pass: debt counter > 0, the selection is empty — orphan bits or a counter desync (runbooks §6)",
 				"debt", debt)
 			return out, nil
 		}
@@ -770,7 +770,7 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 
 	for i := range domains {
 		if err := ctx.Err(); err != nil {
-			return out, fmt.Errorf("httpworker: проход рендера: %w", err)
+			return out, fmt.Errorf("httpworker: render rework pass: %w", err)
 		}
 		d := &domains[i]
 		keys, keep, err := renderDomainKeys(ctx, pool, contents, d, o.Log)
@@ -780,14 +780,14 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		if len(keys) > 0 {
 			free, err := render.HasCapacity(ctx)
 			if err != nil {
-				return out, fmt.Errorf("httpworker: проход рендера: ёмкость q:render: %w", err)
+				return out, fmt.Errorf("httpworker: render rework pass: q:render capacity: %w", err)
 			}
 			if !free {
 				out.Full = true
 				return out, nil
 			}
 			if err := render.Publish(ctx, keys); err != nil {
-				return out, fmt.Errorf("httpworker: проход рендера: домен %s: %w", d.name, err)
+				return out, fmt.Errorf("httpworker: render rework pass: domain %s: %w", d.name, err)
 			}
 			out.Published += len(keys)
 		}
@@ -803,7 +803,7 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		// with the debt counter by one transaction (T-175).
 		cleared, err := renderClearPendingTx(ctx, pool, d.zone, d.id)
 		if err != nil {
-			return out, fmt.Errorf("httpworker: проход рендера: домен %s: снятие флага: %w", d.name, err)
+			return out, fmt.Errorf("httpworker: render rework pass: domain %s: clearing the flag: %w", d.name, err)
 		}
 		if i < firstN {
 			// There is no flag anymore (cleared by us or by a competitor — the bit guard):
@@ -832,7 +832,7 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 func renderClearPendingTx(ctx context.Context, pool RecordDB, zone int16, id int64) (int64, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("httpworker: транзакция снятия: %w", err)
+		return 0, fmt.Errorf("httpworker: the clearing transaction: %w", err)
 	}
 	// The rollback unconditionally: after the Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -847,7 +847,7 @@ func renderClearPendingTx(ctx context.Context, pool RecordDB, zone int16, id int
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("httpworker: фиксация снятия: %w", err)
+		return 0, fmt.Errorf("httpworker: the clearing commit: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }
@@ -862,10 +862,10 @@ func renderClearPendingTx(ctx context.Context, pool RecordDB, zone int16, id int
 func renderBumpDebtCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, renderCounterDeltaSQL, delta)
 	if err != nil {
-		return fmt.Errorf("счётчик рендер-долга: %w", err)
+		return fmt.Errorf("render debt counter: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("счётчик рендер-долга: затронуто %d строк (строка 'render_pending' обязательна, миграция 000015)",
+		return fmt.Errorf("render debt counter: %d rows affected (the 'render_pending' row is required, migration 000015)",
 			tag.RowsAffected())
 	}
 	return nil
@@ -881,7 +881,7 @@ func renderBumpDebtCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 func renderDebtCount(ctx context.Context, pool RecordDB) (int64, error) {
 	rows, err := pool.Query(ctx, renderDebtCounterSQL)
 	if err != nil {
-		return 0, fmt.Errorf("httpworker: проход рендера: счётчик долга: %w", err)
+		return 0, fmt.Errorf("httpworker: render rework pass: debt counter: %w", err)
 	}
 	defer rows.Close()
 	var n int64
@@ -890,15 +890,15 @@ func renderDebtCount(ctx context.Context, pool RecordDB) (int64, error) {
 		// the absence diagnosis must be honest (runbooks §6
 		// leads the operator to do an INSERT).
 		if err := rows.Err(); err != nil {
-			return 0, fmt.Errorf("httpworker: проход рендера: счётчик долга: %w", err)
+			return 0, fmt.Errorf("httpworker: render rework pass: debt counter: %w", err)
 		}
-		return 0, errors.New("httpworker: проход рендера: строка счётчика 'render_pending' отсутствует (миграция 000015, runbooks §6)")
+		return 0, errors.New("httpworker: render rework pass: the counter row 'render_pending' is missing (migration 000015, runbooks §6)")
 	}
 	if err := rows.Scan(&n); err != nil {
-		return 0, fmt.Errorf("httpworker: проход рендера: счётчик долга: чтение: %w", err)
+		return 0, fmt.Errorf("httpworker: render rework pass: debt counter: scan: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("httpworker: проход рендера: счётчик долга: %w", err)
+		return 0, fmt.Errorf("httpworker: render rework pass: debt counter: %w", err)
 	}
 	return n, nil
 }
@@ -922,19 +922,19 @@ func renderDebtCount(ctx context.Context, pool RecordDB) (int64, error) {
 func renderSelectPending(ctx context.Context, pool RecordDB, limit int, zoneNames []string, inList bool) ([]renderPendingDomain, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("httpworker: проход рендера: транзакция выборки: %w", err)
+		return nil, fmt.Errorf("httpworker: render rework pass: selection transaction: %w", err)
 	}
 	// The rollback unconditionally: after the Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, renderPlanNoIndexScanSQL); err != nil {
-		return nil, fmt.Errorf("httpworker: проход рендера: закрепление плана: %w", err)
+		return nil, fmt.Errorf("httpworker: render rework pass: plan pinning: %w", err)
 	}
 	if _, err := tx.Exec(ctx, renderPlanNoBitmapScanSQL); err != nil {
-		return nil, fmt.Errorf("httpworker: проход рендера: закрепление плана: %w", err)
+		return nil, fmt.Errorf("httpworker: render rework pass: plan pinning: %w", err)
 	}
 	if _, err := tx.Exec(ctx, renderPlanNoIOSQL); err != nil {
-		return nil, fmt.Errorf("httpworker: проход рендера: закрепление плана: %w", err)
+		return nil, fmt.Errorf("httpworker: render rework pass: plan pinning: %w", err)
 	}
 
 	sql, args := renderPendingDomainsSQL, []any{limit}
@@ -948,7 +948,7 @@ func renderSelectPending(ctx context.Context, pool RecordDB, limit int, zoneName
 
 	rows, err := tx.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("httpworker: проход рендера: выборка доменов: %w", err)
+		return nil, fmt.Errorf("httpworker: render rework pass: domain selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -956,15 +956,15 @@ func renderSelectPending(ctx context.Context, pool RecordDB, limit int, zoneName
 	for rows.Next() {
 		var d renderPendingDomain
 		if err := rows.Scan(&d.zone, &d.id, &d.name); err != nil {
-			return nil, fmt.Errorf("httpworker: проход рендера: выборка доменов: чтение: %w", err)
+			return nil, fmt.Errorf("httpworker: render rework pass: domain selection: scan: %w", err)
 		}
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("httpworker: проход рендера: выборка доменов: %w", err)
+		return nil, fmt.Errorf("httpworker: render rework pass: domain selection: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("httpworker: проход рендера: фиксация выборки: %w", err)
+		return nil, fmt.Errorf("httpworker: render rework pass: selection commit: %w", err)
 	}
 	return out, nil
 }
@@ -983,7 +983,7 @@ func renderSelectPending(ctx context.Context, pool RecordDB, limit int, zoneName
 func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d *renderPendingDomain, log *slog.Logger) (keys []queue.Result, keep bool, err error) {
 	rows, err := pool.Query(ctx, renderPendingRowsSQL, d.zone, d.id)
 	if err != nil {
-		return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: записи: %w", d.name, err)
+		return nil, false, fmt.Errorf("httpworker: render rework pass: domain %s: records: %w", d.name, err)
 	}
 	defer rows.Close()
 
@@ -996,13 +996,13 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 			aliasSub *int16
 		)
 		if err := rows.Scan(&r.subdomain, &variant, &hash, &aliasSub); err != nil {
-			return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: записи: чтение: %w", d.name, err)
+			return nil, false, fmt.Errorf("httpworker: render rework pass: domain %s: records: scan: %w", d.name, err)
 		}
 		r.variant, r.hash, r.aliasSub = model.Variant(variant), hash, aliasSub
 		recs = append(recs, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: записи: %w", d.name, err)
+		return nil, false, fmt.Errorf("httpworker: render rework pass: domain %s: records: %w", d.name, err)
 	}
 
 	// The own verdicts — by the content; the keys' order is deterministic
@@ -1025,11 +1025,11 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 		body, err := contents.Get(ctx, h)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: чтение контента: %w", d.name, err)
+				return nil, false, fmt.Errorf("httpworker: render rework pass: domain %s: content read: %w", d.name, err)
 			}
 			// A transient failure: the domain's flag is preserved (keep),
 			// the next pass will repeat the read.
-			log.Warn("проход рендера: контент записи недоступен — домен останется с флагом",
+			log.Warn("render rework pass: the record content is unavailable — the domain will keep the flag",
 				"domain", d.name, "subdomain_id", r.subdomain, "err", err)
 			keep = true
 			continue
@@ -1072,13 +1072,13 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 // a clean nil (graceful shutdown, §3.4).
 func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, opts RequeueOptions) error {
 	if pool == nil {
-		return errors.New("httpworker: проход рендера: пул не задан")
+		return errors.New("httpworker: render rework pass: the pool is not set")
 	}
 	if contents == nil {
-		return errors.New("httpworker: проход рендера: хранилище контента не задано")
+		return errors.New("httpworker: render rework pass: the content store is not set")
 	}
 	if render == nil {
-		return errors.New("httpworker: проход рендера: очередь рендера не задана")
+		return errors.New("httpworker: render rework pass: the render queue is not set")
 	}
 	o := opts.withDefaults()
 	if o.Log == nil {
@@ -1087,7 +1087,7 @@ func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderCon
 		o.Log = slog.New(slog.DiscardHandler)
 	}
 	log := o.Log
-	log.Info("проход доработки рендера запущен",
+	log.Info("render rework pass started",
 		"interval", o.Interval.String(), "batch", o.BatchSize,
 		"deprioritized_zones", o.DeprioritizedZones)
 
@@ -1101,7 +1101,7 @@ func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderCon
 			if err != nil {
 				// A cancellation during the pass — part of the stop, not an alarm.
 				if ctx.Err() == nil {
-					log.Warn("проход доработки рендера", "err", err)
+					log.Warn("render rework pass", "err", err)
 				}
 				return
 			}
@@ -1110,7 +1110,7 @@ func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderCon
 				// 0 in the drainage window — the priority works, the publications go
 				// by the zones NOT from the list first (an order control without
 				// a manual SQL).
-				log.Info("проход доработки рендера",
+				log.Info("render rework pass",
 					"domains", res.Cleared, "published", res.Published,
 					"deprioritized", res.Deprioritized, "full", res.Full)
 			}

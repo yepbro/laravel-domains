@@ -16,33 +16,33 @@ func TestWorkerReaderDecide(t *testing.T) {
 		obs  readerObs
 		want readerMode
 	}{
-		{"П5: штатное чтение",
+		{"T5: normal reading",
 			readerObs{failed: 0, batch: batch}, modeConsume},
-		{"П2: инфра-пауза перекрывает предохранитель",
+		{"T2: the infra pause overrides the fuse",
 			readerObs{infra: true, writable: false, failed: 100, batch: batch}, modePauseInfra},
-		{"флаг инфра-сбоя горит, проба записи прошла — ниже предохранитель",
+		{"the infra failure flag is lit, the write probe passed — the fuse is next",
 			readerObs{infra: true, writable: true, failed: batch, batch: batch}, modePauseFail},
-		{"флаг не горит — writable не наблюдается, работает предохранитель",
+		{"the flag is not lit — writable is not observed, the fuse works",
 			readerObs{infra: false, writable: false, failed: batch, batch: batch}, modePauseFail},
-		{"П3: предохранитель на пороге пачки",
+		{"T3: the fuse at the chunk threshold",
 			readerObs{failed: batch, batch: batch}, modePauseFail},
-		{"неудачи ниже пачки чтения — предохранитель молчит",
+		{"failures below the read chunk — the fuse is silent",
 			readerObs{failed: batch - 1, batch: batch}, modeConsume},
-		{"нулевой счётчик — не пауза (ветка сброса серии)",
+		{"a zero counter — not a pause (the series reset branch)",
 			readerObs{failed: 0, batch: batch}, modeConsume},
-		{"нулевой счётчик при вырожденной пачке — не пауза",
+		{"a zero counter with a degenerate chunk — not a pause",
 			readerObs{failed: 0, batch: 0}, modeConsume},
-		{"недостижимая пауза-браузер: датчика в q:http нет",
+		{"the unreachable browser pause: no sensor in q:http",
 			readerObs{browser: false, alive: false, failed: 0, batch: batch}, modeConsume},
-		{"недостижимая пауза-темп: датчика в q:http нет",
+		{"the unreachable rate pause: no sensor in q:http",
 			readerObs{rate: false, allowance: 0, failed: 0, batch: batch}, modeConsume},
-		{"тотальность enum'а: смонтированный датчик браузера выбрал бы Б",
+		{"the enum totality: a mounted browser sensor would choose B",
 			readerObs{browser: true, alive: false, failed: 0, batch: batch}, modePauseBrowser},
-		{"тотальность enum'а: смонтированный датчик темпа выбрал бы Т",
+		{"the enum totality: a mounted rate sensor would choose R",
 			readerObs{failed: 0, batch: batch, rate: true, allowance: 0}, modePauseRate},
 	} {
 		if got := readerDecide(c.obs); got != c.want {
-			t.Errorf("%s: режим %s, хочу %s (наблюдения: %+v)", c.name, got, c.want, c.obs)
+			t.Errorf("%s: mode %s, want %s (observations: %+v)", c.name, got, c.want, c.obs)
 		}
 	}
 }

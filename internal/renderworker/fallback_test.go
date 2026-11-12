@@ -85,43 +85,43 @@ func TestRenderWorker_TarpitFallbackPublish(t *testing.T) {
 
 	// Delivery #2 of 2 (DefaultTimeoutAttempts).
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("тарпит с фолбэком — публикация, не ошибка: %v", err)
+		t.Fatalf("a tarpit with the fallback — a publication, not an error: %v", err)
 	}
 	pubs := rwFallbackPublishes(t, f)
 	if len(pubs) != 1 {
-		t.Fatalf("публикации q:render-fallback: %d, нужна 1 (всего %+v)", len(pubs), f.q.publishesSnapshot())
+		t.Fatalf("q:render-fallback publications: %d, 1 is needed (in total %+v)", len(pubs), f.q.publishesSnapshot())
 	}
 	if !pubs[0].msg.Fresh {
-		t.Error("фолбэк-сообщение Fresh=true — доработка текущего эпизода, как у финализации")
+		t.Error("the fallback message Fresh=true — the current episode rework, like the finalization")
 	}
 	if pubs[0].msg.ZoneID != rwTask.ZoneID || pubs[0].msg.DomainID != rwTask.DomainID ||
 		pubs[0].msg.SubdomainID != rwTask.SubdomainID || pubs[0].msg.Variant != rwTask.Variant {
-		t.Errorf("фолбэк-ключ %+v не совпадает с задачей", pubs[0].msg)
+		t.Errorf("the fallback key %+v does not match the task", pubs[0].msg)
 	}
 	// Neither q:analyze nor a marker: the entry waits for worker B (FR-10).
 	for _, p := range f.q.publishesSnapshot() {
 		if p.stream == queue.StreamAnalyze {
-			t.Errorf("q:analyze публикует воркер B после фолбэка, не первичный: %+v", p)
+			t.Errorf("q:analyze is published by worker B after the fallback, not the primary: %+v", p)
 		}
 	}
 	row := rwRowSnapshot(f.pool, rwKey)
 	if row.failedAt != nil {
-		t.Error("маркер render_failed_at ставить нельзя — запись ждёт фолбэка (ФТ-10), маркер поставит воркер B")
+		t.Error("the render_failed_at marker must not be set — the record waits for the fallback (FR-10), worker B will set the marker")
 	}
 	if row.rendered {
-		t.Error("rendered должен остаться false")
+		t.Error("rendered must stay false")
 	}
 	if row.hash == nil || string(row.hash) != string(raw[:]) {
-		t.Errorf("content_hash = %v, нужна прежняя ссылка на сырой HTML %s", row.hash, raw)
+		t.Errorf("content_hash = %v, the previous raw HTML reference is needed %s", row.hash, raw)
 	}
 	if puts := f.store.putsSnapshot(); len(puts) != 0 {
-		t.Errorf("Put не должен вызываться: %d", len(puts))
+		t.Errorf("Put must not be called: %d", len(puts))
 	}
 	if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
-		t.Errorf("транзакция не должна открываться (событие на %d)", i)
+		t.Errorf("a transaction must not open (an event on %d)", i)
 	}
 	if refc := rwRefc(f.pool)[raw]; refc != 1 {
-		t.Errorf("refcount сырого HTML = %d, нужен 1 (ссылка жива)", refc)
+		t.Errorf("the raw HTML refcount = %d, 1 needed (the reference is alive)", refc)
 	}
 	// The metrics: a publication with the timeout reason, no finalizations.
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_published_total",
@@ -130,10 +130,10 @@ func TestRenderWorker_TarpitFallbackPublish(t *testing.T) {
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
 		map[string]string{"engine": rwFBCandidateEngine}); got != -1 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, want -1 (не финализация — серия не создаётся)", got)
+		t.Errorf("crawler_render_tarpit_finalized_total = %v, want -1 (not a finalization — the series is not created)", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", nil); got != -1 {
-		t.Errorf("crawler_render_task_finalized_total не должен иметь серий: %v", got)
+		t.Errorf("crawler_render_task_finalized_total must have no series: %v", got)
 	}
 }
 
@@ -156,24 +156,24 @@ func TestRenderWorker_TaskFallbackPublish(t *testing.T) {
 	// Delivery #3 of 3 (DefaultMaxAttempts): after the tarpit branch —
 	// the T-172 last attempt branch.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
-		t.Fatalf("класс задачи на последней попытке с фолбэком — публикация, не ошибка: %v", err)
+		t.Fatalf("the task class on the last attempt with the fallback — a publication, not an error: %v", err)
 	}
 	pubs := rwFallbackPublishes(t, f)
 	if len(pubs) != 1 {
-		t.Fatalf("публикации q:render-fallback: %d, нужна 1 (всего %+v)", len(pubs), f.q.publishesSnapshot())
+		t.Fatalf("q:render-fallback publications: %d, 1 is needed (in total %+v)", len(pubs), f.q.publishesSnapshot())
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt != nil {
-		t.Error("маркер render_failed_at ставить нельзя — запись ждёт фолбэка (ФТ-10)")
+		t.Error("the render_failed_at marker must not be set — the record waits for the fallback (FR-10)")
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_published_total",
 		map[string]string{"reason": "net::ERR_CONNECTION_REFUSED"}); got != 1 {
 		t.Errorf("crawler_render_fallback_published_total{net::ERR_CONNECTION_REFUSED} = %v, want 1", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total", nil); got != -1 {
-		t.Errorf("crawler_render_task_finalized_total не должен иметь серий: %v", got)
+		t.Errorf("crawler_render_task_finalized_total must have no series: %v", got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 0 {
-		t.Errorf("crawler_render_cert_finalized_total = %v, want 0 (не cert-финализация)", got)
+		t.Errorf("crawler_render_cert_finalized_total = %v, want 0 (not a cert finalization)", got)
 	}
 }
 
@@ -188,17 +188,17 @@ func TestRenderWorker_FallbackDisabledTodayBehavior(t *testing.T) {
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("тарпит без фолбэка — финализация: %v", err)
+		t.Fatalf("a tarpit without the fallback — a finalization: %v", err)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v, нужна одна q:analyze (поведение до T-238)", pubs)
+		t.Fatalf("the publications %+v, one q:analyze is needed (the behavior before T-238)", pubs)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt == nil {
-		t.Error("маркер render_failed_at обязан ставиться (T-210) при выключенном фолбэке")
+		t.Error("the render_failed_at marker must be set (T-210) with the fallback off")
 	}
 	if fb := rwFallbackPublishes(t, f); len(fb) != 0 {
-		t.Errorf("публикаций q:render-fallback быть не должно: %+v", fb)
+		t.Errorf("there must be no q:render-fallback publications: %+v", fb)
 	}
 }
 
@@ -217,8 +217,8 @@ func TestRenderWorker_FallbackChromiumEngineNotArmed(t *testing.T) {
 		name   string
 		engine string
 	}{
-		{"движок chromium", config.EngineChromium},
-		{"движок не задан — дефолт chromium", ""},
+		{"the chromium engine", config.EngineChromium},
+		{"no engine set — the chromium default", ""},
 	}
 	paths := []struct {
 		name    string
@@ -227,13 +227,13 @@ func TestRenderWorker_FallbackChromiumEngineNotArmed(t *testing.T) {
 		reason  string
 	}{
 		{
-			name:    "тарпит T-148 (исчерпание render.timeout_attempts)",
+			name:    "the tarpit T-148 (the render.timeout_attempts exhaustion)",
 			err:     rwTarpitErr("https://spa.example/"),
 			attempt: 2, // DefaultTimeoutAttempts
 			reason:  "timeout",
 		},
 		{
-			name:    "класс задачи T-172 (последняя доставка)",
+			name:    "the task class T-172 (the last delivery)",
 			err:     rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED"),
 			attempt: 3, // DefaultMaxAttempts
 			reason:  "net::ERR_CONNECTION_REFUSED",
@@ -258,21 +258,21 @@ func TestRenderWorker_FallbackChromiumEngineNotArmed(t *testing.T) {
 				f.renderer.err = p.err
 
 				if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), p.attempt); err != nil {
-					t.Fatalf("chromium: кандидат — штатная финализация, не ошибка: %v", err)
+					t.Fatalf("chromium: the candidate — a normal finalization, not an error: %v", err)
 				}
 				if fb := rwFallbackPublishes(t, f); len(fb) != 0 {
-					t.Errorf("публикаций q:render-fallback быть не должно: %+v", fb)
+					t.Errorf("there must be no q:render-fallback publications: %+v", fb)
 				}
 				pubs := f.q.publishesSnapshot()
 				if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-					t.Fatalf("публикации %+v, нужна одна q:analyze (как при выключенном фолбэке)", pubs)
+					t.Fatalf("the publications %+v, one q:analyze is needed (as with the fallback off)", pubs)
 				}
 				if row := rwRowSnapshot(f.pool, rwKey); row.failedAt == nil {
-					t.Error("маркер render_failed_at обязан ставиться — chromium не публикует, финализация по-сегодняшнему")
+					t.Error("the render_failed_at marker must be set — chromium does not publish, the finalization as today")
 				}
 				if got := rwMetricValue(t, reg, "crawler_render_fallback_published_total",
 					map[string]string{"reason": p.reason}); got != -1 {
-					t.Errorf("crawler_render_fallback_published_total{%s} = %v, want -1 (публикаций не было)", p.reason, got)
+					t.Errorf("crawler_render_fallback_published_total{%s} = %v, want -1 (there were no publications)", p.reason, got)
 				}
 			})
 		}
@@ -289,8 +289,8 @@ func TestRenderWorker_DNSCertNoFallback(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"DNS-класс (T-211)", rwCertErr("https://spa.example/", "net::ERR_NAME_NOT_RESOLVED")},
-		{"cert-класс (T-159)", rwCertErr("https://spa.example/", "net::ERR_CERT_AUTHORITY_INVALID")},
+		{"the DNS class (T-211)", rwCertErr("https://spa.example/", "net::ERR_NAME_NOT_RESOLVED")},
+		{"the cert class (T-159)", rwCertErr("https://spa.example/", "net::ERR_CERT_AUTHORITY_INVALID")},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -301,17 +301,17 @@ func TestRenderWorker_DNSCertNoFallback(t *testing.T) {
 
 			// Both classes are finalized from the very first delivery.
 			if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
-				t.Fatalf("движко-независимый класс — финализация с первой доставки: %v", err)
+				t.Fatalf("an engine-independent class — a finalization from the first delivery: %v", err)
 			}
 			if fb := rwFallbackPublishes(t, f); len(fb) != 0 {
-				t.Errorf("фолбэк не положен: %+v", fb)
+				t.Errorf("no fallback is due: %+v", fb)
 			}
 			pubs := f.q.publishesSnapshot()
 			if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-				t.Fatalf("публикации %+v, нужна одна q:analyze (финализация как сегодня)", pubs)
+				t.Fatalf("the publications %+v, one q:analyze is needed (the finalization as today)", pubs)
 			}
 			if row := rwRowSnapshot(f.pool, rwKey); row.failedAt == nil {
-				t.Error("маркер render_failed_at обязан ставиться (T-210)")
+				t.Error("the render_failed_at marker must be set (T-210)")
 			}
 		})
 	}
@@ -337,17 +337,17 @@ func TestRenderWorker_FallbackNoRecursionWorkerB(t *testing.T) {
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("воркер B: тарпит на исчерпании — финализация (не рекурсивный фолбэк): %v", err)
+		t.Fatalf("worker B: the tarpit at the exhaustion — a finalization (not a recursive fallback): %v", err)
 	}
 	if fb := rwFallbackPublishes(t, f); len(fb) != 0 {
-		t.Errorf("рекурсивный фолбэк запрещён: %+v", fb)
+		t.Errorf("a recursive fallback is forbidden: %+v", fb)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v, нужна одна q:analyze (финализация воркера B, ТЗ §4.5 п.2)", pubs)
+		t.Fatalf("the publications %+v, one q:analyze is needed (the worker B finalization, spec §4.5 item 2)", pubs)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt == nil {
-		t.Error("воркер B ставит маркер после исчерпания фолбэка (ФТ-10)")
+		t.Error("worker B sets the marker after the fallback is exhausted (FR-10)")
 	}
 }
 
@@ -362,22 +362,22 @@ func TestRenderWorker_FallbackPublishErrorNoMarker(t *testing.T) {
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
-	f.q.publishErrs = []error{errors.New("redis недоступен")}
+	f.q.publishErrs = []error{errors.New("redis unavailable")}
 
 	// A publication failure: an error, the delivery will return (a redelivery).
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err == nil {
-		t.Fatal("сбой публикации q:render-fallback — ошибка (повторная доставка)")
+		t.Fatal("a q:render-fallback publication failure — an error (a re-delivery)")
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt != nil {
-		t.Error("маркер render_failed_at не ставится: запись не финализирована — публикация не состоялась")
+		t.Error("the render_failed_at marker is not set: the record is not finalized — the publication did not happen")
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.rendered {
-		t.Error("rendered должен остаться false")
+		t.Error("rendered must stay false")
 	}
 
 	// A re-delivery: the publication goes through, still no marker.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("повтор после сбоя публикации обязан опубликовать фолбэк: %v", err)
+		t.Fatalf("the repeat after a publication failure must publish the fallback: %v", err)
 	}
 	pubs := f.q.publishesSnapshot()
 	fb := 0
@@ -386,16 +386,16 @@ func TestRenderWorker_FallbackPublishErrorNoMarker(t *testing.T) {
 		case queue.StreamRenderFallback:
 			fb++
 		case queue.StreamAnalyze:
-			t.Error("q:analyze публикует воркер B, не первичный воркер")
+			t.Error("q:analyze is published by worker B, not the primary worker")
 		}
 	}
 	if fb != 2 {
 		// The first (failed) attempt is also recorded by the fake: there is one
 		// successful publication — the dedup filter did not eat the retry after the failure.
-		t.Errorf("попыток публикации q:render-fallback = %d, нужно 2 (сбой + успех), в стриме — одна", fb)
+		t.Errorf("q:render-fallback publication attempts = %d, 2 needed (a failure + a success), one in the stream", fb)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt != nil {
-		t.Error("маркер не ставится и после успешной фолбэк-публикации (ФТ-10)")
+		t.Error("the marker is not set after a successful fallback publication either (FR-10)")
 	}
 }
 
@@ -419,11 +419,11 @@ func TestRenderWorker_FallbackDuplicateDelivery(t *testing.T) {
 
 	// The first delivery: a fallback publication.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("фолбэк-публикация: %v", err)
+		t.Fatalf("the fallback publication: %v", err)
 	}
 	// A duplicate: the same key, the same content (the XACK lost after the publication).
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("дубль доставки подтверждается без ошибки: %v", err)
+		t.Fatalf("a duplicate delivery is acknowledged without an error: %v", err)
 	}
 	pubs := f.q.publishesSnapshot()
 	fb := 0
@@ -433,14 +433,14 @@ func TestRenderWorker_FallbackDuplicateDelivery(t *testing.T) {
 		}
 	}
 	if fb != 1 {
-		t.Errorf("записей q:render-fallback = %d, нужна 1 (дубль доставки не дублирует стрим)", fb)
+		t.Errorf("q:render-fallback records = %d, 1 is needed (a duplicate delivery does not duplicate the stream)", fb)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt != nil {
-		t.Error("маркер не ставится ни на публикации, ни на дубле (ФТ-10)")
+		t.Error("the marker is not set on the publication or on the duplicate (FR-10)")
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_published_total",
 		map[string]string{"reason": "timeout"}); got != 1 {
-		t.Errorf("метрика публикаций = %v, want 1 (дубль публикацией не считается)", got)
+		t.Errorf("the publication metric = %v, want 1 (a duplicate does not count as a publication)", got)
 	}
 }
 
@@ -457,7 +457,7 @@ func TestRenderWorker_FallbackNewEpisodeNotFiltered(t *testing.T) {
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("фолбэк-публикация (эпизод 1): %v", err)
+		t.Fatalf("the fallback publication (episode 1): %v", err)
 	}
 	// A new episode: the T-058 row rewrite — a new checked_at; the content
 	// is byte-identical (the content_hash matched — the content dedup T-056):
@@ -466,7 +466,7 @@ func TestRenderWorker_FallbackNewEpisodeNotFiltered(t *testing.T) {
 	f.pool.rows[rwKey].checkedAt = fresh
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 2); err != nil {
-		t.Fatalf("фолбэк-публикация (эпизод 2, тот же контент): %v", err)
+		t.Fatalf("the fallback publication (episode 2, the same content): %v", err)
 	}
 	fb := 0
 	for _, p := range f.q.publishesSnapshot() {
@@ -475,7 +475,7 @@ func TestRenderWorker_FallbackNewEpisodeNotFiltered(t *testing.T) {
 		}
 	}
 	if fb != 2 {
-		t.Errorf("записей q:render-fallback = %d, нужно 2 (эпизоды различаются checked_at, не хэшем)", fb)
+		t.Errorf("q:render-fallback records = %d, 2 needed (the episodes differ by checked_at, not by the hash)", fb)
 	}
 }
 
@@ -492,13 +492,13 @@ func TestRenderWorker_FallbackRenderedRowSkipsPublish(t *testing.T) {
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("отрендеренная строка — не ошибка: %v", err)
+		t.Fatalf("a rendered row — not an error: %v", err)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно (строка готова): %+v", pubs)
+		t.Errorf("there must be no publications (the row is ready): %+v", pubs)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt != nil {
-		t.Error("маркер отрендеренной строке не нужен")
+		t.Error("a rendered row needs no marker")
 	}
 }
 
@@ -513,27 +513,27 @@ func TestRenderWorker_FallbackNoRowNoURL(t *testing.T) {
 
 	// The composite: ProcessResult exits before the render — not an error.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("строки нет — не ошибка: %v", err)
+		t.Fatalf("no row — not an error: %v", err)
 	}
 	f.pool.seedRow(rwKey, "", nil)
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 2); err != nil {
-		t.Fatalf("без итогового URL — не ошибка: %v", err)
+		t.Fatalf("no final URL — not an error: %v", err)
 	}
 	// The direct publishFallback guards (the recheck removed the row after
 	// the render error): (false, nil) — the caller finalizes, the same
 	// rejection there.
 	delete(f.pool.rows, rwKey)
-	handled, err := f.w.publishFallback(context.Background(), rwTask, errors.New("тарпит"))
+	handled, err := f.w.publishFallback(context.Background(), rwTask, errors.New("tarpit"))
 	if err != nil || handled {
-		t.Fatalf("publishFallback без строки = (%v, %v), хочу (false, nil)", handled, err)
+		t.Fatalf("publishFallback without a row = (%v, %v), want (false, nil)", handled, err)
 	}
 	f.pool.seedRow(rwKey, "", nil)
-	handled, err = f.w.publishFallback(context.Background(), rwTask, errors.New("тарпит"))
+	handled, err = f.w.publishFallback(context.Background(), rwTask, errors.New("tarpit"))
 	if err != nil || handled {
-		t.Fatalf("publishFallback без итогового URL = (%v, %v), хочу (false, nil)", handled, err)
+		t.Fatalf("publishFallback without a final URL = (%v, %v), want (false, nil)", handled, err)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно: %+v", pubs)
+		t.Errorf("there must be no publications: %+v", pubs)
 	}
 }
 
@@ -547,21 +547,21 @@ func TestRenderWorker_FallbackNoRowNoURL(t *testing.T) {
 func TestRenderWorker_FallbackDedupEviction(t *testing.T) {
 	d := newFallbackDedup()
 	if !d.claim("a") {
-		t.Fatal("первая фиксация «a» обязана проходить")
+		t.Fatal("the first latching of a must pass")
 	}
 	for i := 0; i < fallbackDedupCap; i++ {
 		if !d.claim(fmt.Sprintf("k%d", i)) {
-			t.Fatalf("фиксация k%d не должна вытеснять соседей", i)
+			t.Fatalf("the latching of k%d must not evict the neighbors", i)
 		}
 	}
 	if !d.claim("a") {
-		t.Error("«a» вытеснена (старейшая) — повторная фиксация проходит, дубль становится допустимым (ФТ-11)")
+		t.Error("a is evicted (the oldest) — a repeated latching passes, a duplicate becomes allowed (FR-11)")
 	}
 	if !d.claim("b") {
-		t.Fatal("первая фиксация «b» обязана проходить")
+		t.Fatal("the first latching of b must pass")
 	}
 	if d.claim("b") {
-		t.Fatal("повторная фиксация «b» — дубль, обязана быть отклонена")
+		t.Fatal("the repeated latching of b — a duplicate, it must be rejected")
 	}
 }
 
@@ -573,14 +573,14 @@ func TestRenderWorker_FallbackDedupRelease(t *testing.T) {
 	d := newFallbackDedup()
 	d.release("unknown") // a no-op, does not panic
 	if !d.claim("k") {
-		t.Fatal("первая фиксация обязана проходить")
+		t.Fatal("the first latching must pass")
 	}
 	d.release("k")
 	if !d.claim("k") {
-		t.Fatal("после release повторная публикация обязана проходить")
+		t.Fatal("after a release the repeated publication must pass")
 	}
 	if d.claim("k") {
-		t.Fatal("без release повторная фиксация — дубль")
+		t.Fatal("without a release the repeated latching is a duplicate")
 	}
 }
 
@@ -592,13 +592,13 @@ func TestRenderWorker_FallbackDedupKey(t *testing.T) {
 	other := rwTask
 	other.DomainID++
 	if fallbackDedupKey(rwTask, ts) == fallbackDedupKey(other, ts) {
-		t.Error("разные записи — разные идентификаторы")
+		t.Error("different records — different identifiers")
 	}
 	if fallbackDedupKey(rwTask, ts) == fallbackDedupKey(rwTask, ts.Add(time.Second)) {
-		t.Error("разные эпизоды (checked_at) — разные идентификаторы")
+		t.Error("different episodes (checked_at) — different identifiers")
 	}
 	if fallbackDedupKey(rwTask, ts) == fallbackDedupKey(rwTask, time.Time{}) {
-		t.Error("нулевой checked_at — тоже значение идентификатора (не совпадает)")
+		t.Error("a zero checked_at is also a value of the identifier (it does not match)")
 	}
 }
 
@@ -622,7 +622,7 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		return rwMetricValue(t, g, "crawler_render_fallback_consumed_total", map[string]string{"result": result})
 	}
 
-	t.Run("успех доработки — rendered", func(t *testing.T) {
+	t.Run("a rework success — rendered", func(t *testing.T) {
 		f := newRWFixture(t)
 		reg := metrics.New("render-fallback-worker")
 		var err error
@@ -645,12 +645,12 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		}
 		for _, result := range []string{fbResultFinalized, fbResultSkipped} {
 			if got := consumedSeries(t, reg, result); got != 0 {
-				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want 0 (серия предсоздана нулём — S-P1-4, исхода не было)", result, got)
+				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want 0 (the series is pre-created as zero — S-P1-4, there was no outcome)", result, got)
 			}
 		}
 	})
 
-	t.Run("исчерпание фолбэка — finalized", func(t *testing.T) {
+	t.Run("the fallback exhaustion — finalized", func(t *testing.T) {
 		f := newRWFixture(t)
 		reg := metrics.New("render-fallback-worker")
 		var err error
@@ -678,14 +678,14 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 			t.Fatalf("processDelivery (cert): %v", err)
 		}
 		if got := consumedSeries(t, reg, fbResultFinalized); got != 2 {
-			t.Errorf("crawler_render_fallback_consumed_total{finalized} = %v, want 2 (тарпит + cert)", got)
+			t.Errorf("crawler_render_fallback_consumed_total{finalized} = %v, want 2 (a tarpit + a cert)", got)
 		}
 		if got := consumedSeries(t, reg, fbResultRendered); got != 0 {
-			t.Errorf("crawler_render_fallback_consumed_total{rendered} = %v, want 0 (серия предсоздана нулём, исхода не было)", got)
+			t.Errorf("crawler_render_fallback_consumed_total{rendered} = %v, want 0 (the series is pre-created as zero, there was no outcome)", got)
 		}
 	})
 
-	t.Run("ошибка доставки не считается", func(t *testing.T) {
+	t.Run("a delivery error is not counted", func(t *testing.T) {
 		f := newRWFixture(t)
 		reg := metrics.New("render-fallback-worker")
 		var err error
@@ -703,19 +703,19 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		// it is not counted as consumption — the key invariant of the
 		// published = consumed + remainder balance (acceptance step 4, spec §6.2).
 		f.renderer.err = &render.Error{Class: render.ClassBrowser, URL: "https://spa.example/",
-			Err: errors.New("chromium недоступен")}
+			Err: errors.New("chromium is unavailable")}
 
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err == nil {
-			t.Fatal("ошибка класса браузера — ошибка доставки (повторная доставка), не успех")
+			t.Fatal("a browser class error — a delivery error (a re-delivery), not a success")
 		}
 		for _, result := range []string{fbResultRendered, fbResultFinalized, fbResultSkipped} {
 			if got := consumedSeries(t, reg, result); got != 0 {
-				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want 0 (ошибочная доставка не считается; серия предсоздана нулём)", result, got)
+				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want 0 (a failed delivery is not counted; the series is pre-created as zero)", result, got)
 			}
 		}
 	})
 
-	t.Run("строки нет — skipped", func(t *testing.T) {
+	t.Run("no row — skipped", func(t *testing.T) {
 		f := newRWFixture(t)
 		reg := metrics.New("render-fallback-worker")
 		var err error
@@ -737,7 +737,7 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		}
 	})
 
-	t.Run("основная сборка (q:render) потребление не считает", func(t *testing.T) {
+	t.Run("the primary build (q:render) does not count the consumption", func(t *testing.T) {
 		f := newRWFixture(t)
 		reg := metrics.New("render-worker")
 		var err error
@@ -757,7 +757,7 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		}
 		for _, result := range []string{fbResultRendered, fbResultFinalized, fbResultSkipped} {
 			if got := consumedSeries(t, reg, result); got != 0 {
-				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want 0 (считает только воркер B; серии предсозданы нулями у всех сборок)", result, got)
+				t.Errorf("crawler_render_fallback_consumed_total{%s} = %v, want 0 (only worker B counts; the series are pre-created as zeros in all builds)", result, got)
 			}
 		}
 	})

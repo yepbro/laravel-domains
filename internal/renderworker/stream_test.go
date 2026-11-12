@@ -106,14 +106,14 @@ func (f *rwClaimSpy) firstClaimStream() string {
 // today's build), the override is not wiped by the field.
 func TestRenderWorker_StreamDefaults(t *testing.T) {
 	if DefaultStream != queue.StreamRender {
-		t.Errorf("DefaultStream = %q, хочу %q (дефолт — q:render: ноль изменений поведения)",
+		t.Errorf("DefaultStream = %q, want %q (the default is q:render: zero behavior change)",
 			DefaultStream, queue.StreamRender)
 	}
 	if o := (Options{}).withDefaults(); o.Stream != DefaultStream {
-		t.Errorf("withDefaults: Stream = %q, хочу дефолт %q", o.Stream, DefaultStream)
+		t.Errorf("withDefaults: Stream = %q, the default %q expected", o.Stream, DefaultStream)
 	}
 	if o := (Options{Stream: queue.StreamAnalyze}).withDefaults(); o.Stream != queue.StreamAnalyze {
-		t.Errorf("withDefaults: переопределение Stream = %q затёрто (хочу %q)",
+		t.Errorf("withDefaults: the Stream override = %q was wiped (want %q)",
 			o.Stream, queue.StreamAnalyze)
 	}
 }
@@ -149,7 +149,7 @@ func TestRenderWorker_RunConsumesConfiguredStream(t *testing.T) {
 			}
 			select {
 			case <-deadline:
-				t.Fatal("цикл Run не прочитал стрим (первый Consume не состоялся)")
+				t.Fatal("the Run loop did not read the stream (the first Consume did not happen)")
 			case <-time.After(2 * time.Millisecond):
 			}
 		}
@@ -163,13 +163,13 @@ func TestRenderWorker_RunConsumesConfiguredStream(t *testing.T) {
 			}
 			select {
 			case <-deadline:
-				t.Fatal("RecoverLoop не сделал ни одного клейма")
+				t.Fatal("RecoverLoop made no claims")
 			case <-time.After(2 * time.Millisecond):
 			}
 		}
 	}
 
-	t.Run("переопределение — стрим и группа сборки", func(t *testing.T) {
+	t.Run("the override — the build stream and group", func(t *testing.T) {
 		q := &rwStreamQueue{}
 		spy := &rwClaimSpy{}
 		reliab := queue.NewReliab(spy, q, queue.ReliabOptions{MinIdle: time.Hour})
@@ -188,22 +188,22 @@ func TestRenderWorker_RunConsumesConfiguredStream(t *testing.T) {
 
 		got := waitConsume(t, q)
 		if got.stream != opts.Stream {
-			t.Errorf("Consume: стрим %q, хочу %q (Options.Stream — точка проводки потребления)",
+			t.Errorf("Consume: the stream %q, want %q (Options.Stream is the consumption wiring point)",
 				got.stream, opts.Stream)
 		}
 		if got.group != opts.Group || got.consumer != opts.Consumer {
-			t.Errorf("Consume: группа/консьюмер %q/%q, хочу %q/%q (Options.Group/Consumer)",
+			t.Errorf("Consume: the group/consumer %q/%q, want %q/%q (Options.Group/Consumer)",
 				got.group, got.consumer, opts.Group, opts.Consumer)
 		}
 		// The RecoverLoop claim — over the same stream (the first claim before the tick).
 		if s := waitClaim(t, spy); s != opts.Stream {
-			t.Errorf("клейм RecoverLoop: стрим %q, хочу %q (Options.Stream)", s, opts.Stream)
+			t.Errorf("the RecoverLoop claim: the stream %q, want %q (Options.Stream)", s, opts.Stream)
 		}
 
 		rwStopLoop(t, cancel, done)
 	})
 
-	t.Run("дефолт — q:render группой DefaultGroup", func(t *testing.T) {
+	t.Run("the default — q:render with the DefaultGroup group", func(t *testing.T) {
 		q := &rwStreamQueue{}
 		w := newStreamWorker(t, q)
 
@@ -214,14 +214,14 @@ func TestRenderWorker_RunConsumesConfiguredStream(t *testing.T) {
 
 		got := waitConsume(t, q)
 		if got.stream != queue.StreamRender {
-			t.Errorf("Consume: стрим %q, хочу дефолт %q (нулевые Options = сегодняшняя сборка)",
+			t.Errorf("Consume: the stream %q, the default %q expected (zero Options = the current build)",
 				got.stream, queue.StreamRender)
 		}
 		if got.group != DefaultGroup {
-			t.Errorf("Consume: группа %q, хочу DefaultGroup %q", got.group, DefaultGroup)
+			t.Errorf("Consume: the group %q, the DefaultGroup %q expected", got.group, DefaultGroup)
 		}
 		if !strings.HasPrefix(got.consumer, "render-worker-") {
-			t.Errorf("Consume: консьюмер %q, хочу дефолтный render-worker-<pid>", got.consumer)
+			t.Errorf("Consume: the consumer %q, the default render-worker-<pid> expected", got.consumer)
 		}
 
 		rwStopLoop(t, cancel, done)

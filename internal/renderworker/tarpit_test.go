@@ -34,7 +34,7 @@ func rwTarpitMetric(t *testing.T, reg *metrics.Registry, engine string) float64 
 // the expiry of the overall page timeout render.timeout is marked).
 func rwTarpitErr(url string) error {
 	return &render.Error{Class: render.ClassTask, URL: url,
-		Err: fmt.Errorf("таймаут страницы %s: %w: %w",
+		Err: fmt.Errorf("page timeout %s: %w: %w",
 			25*time.Second, context.DeadlineExceeded, errors.New("navigation timeout"))}
 }
 
@@ -54,43 +54,43 @@ func TestRenderWorker_TarpitFinalizedWithoutRender(t *testing.T) {
 	// timeout — ProcessingAttempt acknowledges after a nil return.
 	err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 2, f.w.processDelivery)
 	if err != nil {
-		t.Fatalf("тарпит на исчерпании лимита обязан финализироваться без ошибки (не q:dead): %v", err)
+		t.Fatalf("the tarpit at the limit exhaustion must be finalized without an error (not q:dead): %v", err)
 	}
 
 	acked := f.q.ackedSnapshot()
 	if len(acked) != 1 || acked[0] != "e1" {
-		t.Errorf("XACK = %v, нужна e1 (финализация подтверждает доставку)", acked)
+		t.Errorf("XACK = %v, e1 is needed (the finalization acknowledges the delivery)", acked)
 	}
 	row := rwRowSnapshot(f.pool, rwKey)
 	if row.rendered {
-		t.Error("rendered должен остаться false — итог записи сырой HTML HTTP-фазы")
+		t.Error("rendered must stay false — the record outcome is the raw HTML of the HTTP phase")
 	}
 	if row.failedAt == nil {
-		t.Error("render_failed_at обязан ставиться финализацией (T-210) — иначе проход доработки переиздаёт запись")
+		t.Error("render_failed_at must be set by the finalization (T-210) — otherwise the rework pass republishes the record")
 	}
 	if row.hash == nil || string(row.hash) != string(raw[:]) {
-		t.Errorf("content_hash = %v, нужна прежняя ссылка на сырой HTML %s", row.hash, raw)
+		t.Errorf("content_hash = %v, the previous raw HTML reference is needed %s", row.hash, raw)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v, нужна одна q:analyze (конвейер продолжается анализом)", pubs)
+		t.Fatalf("the publications %+v, one q:analyze is needed (the pipeline continues with analysis)", pubs)
 	}
 	if !pubs[0].msg.Fresh {
-		t.Error("q:analyze Fresh=true — финализация дорабатывает текущий эпизод, как успешный рендер")
+		t.Error("q:analyze Fresh=true — the finalization reworks the current episode, like a successful render")
 	}
 	if pubs[0].msg.ZoneID != rwTask.ZoneID || pubs[0].msg.DomainID != rwTask.DomainID ||
 		pubs[0].msg.SubdomainID != rwTask.SubdomainID || pubs[0].msg.Variant != rwTask.Variant {
-		t.Errorf("q:analyze ключ %+v не совпадает с задачей", pubs[0].msg)
+		t.Errorf("the q:analyze key %+v does not match the task", pubs[0].msg)
 	}
 	if puts := f.store.putsSnapshot(); len(puts) != 0 {
-		t.Errorf("Put не должен вызываться: %d", len(puts))
+		t.Errorf("Put must not be called: %d", len(puts))
 	}
 	if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
-		t.Errorf("транзакция не должна открываться (событие на %d)", i)
+		t.Errorf("a transaction must not open (an event on %d)", i)
 	}
 	// The refcount is untouched: the raw HTML stays the entry's final content.
 	if refc := rwRefc(f.pool)[raw]; refc != 1 {
-		t.Errorf("refcount сырого HTML = %d, нужен 1 (ссылка жива)", refc)
+		t.Errorf("the raw HTML refcount = %d, 1 needed (the reference is alive)", refc)
 	}
 }
 
@@ -106,13 +106,13 @@ func TestRenderWorker_TarpitBelowLimitRetries(t *testing.T) {
 
 	err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 1, f.w.processDelivery)
 	if err == nil {
-		t.Fatal("тарпит до исчерпания лимита — ошибка: доставка вернётся повторной доставкой")
+		t.Fatal("a tarpit before the limit exhaustion — an error: the delivery will come back with a re-delivery")
 	}
 	if acked := f.q.ackedSnapshot(); len(acked) != 0 {
-		t.Errorf("XACK = %v — до исчерпания лимита подтверждения нет", acked)
+		t.Errorf("XACK = %v — before the limit exhaustion there is no acknowledgment", acked)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно: %+v", pubs)
+		t.Errorf("there must be no publications: %+v", pubs)
 	}
 }
 
@@ -125,18 +125,18 @@ func TestRenderWorker_RetryableErrorKeepsDeadPath(t *testing.T) {
 		name string
 		set  func(f *rwFixture)
 	}{
-		{"браузер", func(f *rwFixture) {
+		{"browser", func(f *rwFixture) {
 			f.renderer.err = &render.Error{Class: render.ClassBrowser, URL: "https://spa.example/", Err: errors.New("canceled")}
 		}},
-		{"контекст", func(f *rwFixture) {
+		{"context", func(f *rwFixture) {
 			f.renderer.err = &render.Error{Class: render.ClassContext, URL: "https://spa.example/", Err: errors.New("Session not found")}
 		}},
-		{"отмена вызывающего контекста (не тарпит)", func(f *rwFixture) {
+		{"the caller context cancellation (not a tarpit)", func(f *rwFixture) {
 			f.renderer.err = &render.Error{Class: render.ClassTask, URL: "https://spa.example/",
-				Err: fmt.Errorf("задача отменена: %w: %w", context.Canceled, errors.New("canceled"))}
+				Err: fmt.Errorf("the task is cancelled: %w: %w", context.Canceled, errors.New("canceled"))}
 		}},
-		{"сбой БД", func(f *rwFixture) {
-			f.pool.queryErr = errors.New("база недоступна")
+		{"a DB failure", func(f *rwFixture) {
+			f.pool.queryErr = errors.New("the database is unavailable")
 		}},
 	}
 	for _, c := range cases {
@@ -150,13 +150,13 @@ func TestRenderWorker_RetryableErrorKeepsDeadPath(t *testing.T) {
 			// returned anyway: the finalization is only for timeouts.
 			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 3, f.w.processDelivery)
 			if err == nil {
-				t.Fatal("повторимая ошибка обязана возвращаться (путь q:dead прежний)")
+				t.Fatal("a retryable error must be returned (the q:dead path is the same as before)")
 			}
 			if acked := f.q.ackedSnapshot(); len(acked) != 0 {
-				t.Errorf("XACK = %v — повторимая ошибка не подтверждается", acked)
+				t.Errorf("XACK = %v — a retryable error is not acknowledged", acked)
 			}
 			if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-				t.Errorf("публикаций быть не должно: %+v", pubs)
+				t.Errorf("there must be no publications: %+v", pubs)
 			}
 		})
 	}
@@ -171,15 +171,15 @@ func TestRenderWorker_TarpitFinalizeNoRow(t *testing.T) {
 
 	// There is no row at all.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("строки нет — не ошибка: %v", err)
+		t.Fatalf("no row — not an error: %v", err)
 	}
 	// A row without a final URL.
 	f.pool.seedRow(rwKey, "", nil)
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 2); err != nil {
-		t.Fatalf("без итогового URL — не ошибка: %v", err)
+		t.Fatalf("no final URL — not an error: %v", err)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Errorf("публикаций быть не должно: %+v", pubs)
+		t.Errorf("there must be no publications: %+v", pubs)
 	}
 }
 
@@ -191,13 +191,13 @@ func TestRenderWorker_TarpitFinalizePublishError(t *testing.T) {
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
-	f.q.publishErrs = []error{errors.New("redis недоступен")}
+	f.q.publishErrs = []error{errors.New("redis unavailable")}
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err == nil {
-		t.Fatal("сбой публикации q:analyze при финализации — ошибка (повторная доставка)")
+		t.Fatal("a q:analyze publication failure at the finalization — an error (a re-delivery)")
 	}
 	if acked := f.q.ackedSnapshot(); len(acked) != 0 {
-		t.Errorf("XACK = %v — подтверждения быть не должно", acked)
+		t.Errorf("XACK = %v — there must be no acknowledgment", acked)
 	}
 }
 
@@ -219,22 +219,22 @@ func TestRenderWorker_TarpitAttemptsBoundary(t *testing.T) {
 		}
 		return f
 	}
-	t.Run("лимит 1 — финализация на первой доставке", func(t *testing.T) {
+	t.Run("limit 1 — a finalization on the first delivery", func(t *testing.T) {
 		f := newFix(t, 1)
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
-			t.Fatalf("лимит 1: первая доставка — тарпит — финализация: %v", err)
+			t.Fatalf("limit 1: the first delivery — a tarpit — a finalization: %v", err)
 		}
 		if pubs := f.q.publishesSnapshot(); len(pubs) != 1 {
-			t.Errorf("публикаций q:analyze = %d, нужна 1", len(pubs))
+			t.Errorf("q:analyze publications = %d, 1 is needed", len(pubs))
 		}
 	})
-	t.Run("лимит 3 — вторая доставка ещё повторяема", func(t *testing.T) {
+	t.Run("limit 3 — the second delivery is still retryable", func(t *testing.T) {
 		f := newFix(t, 3)
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err == nil {
-			t.Fatal("лимит 3: вторая доставка ниже лимита — ошибка повторной доставки")
+			t.Fatal("limit 3: the second delivery is below the limit — a re-delivery error")
 		}
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
-			t.Fatalf("лимит 3: третья доставка — финализация: %v", err)
+			t.Fatalf("limit 3: the third delivery — a finalization: %v", err)
 		}
 	})
 }
@@ -256,11 +256,11 @@ func TestRenderWorker_TarpitMetrics(t *testing.T) {
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-		t.Fatalf("финализация: %v", err)
+		t.Fatalf("finalization: %v", err)
 	}
 	stage := map[string]string{"stage": "render"}
 	if got := rwMetricValue(t, reg, "crawler_stage_tasks_total", stage); got != 1 {
-		t.Errorf("crawler_stage_tasks_total = %v, want 1 (финализация — обработанная задача)", got)
+		t.Errorf("crawler_stage_tasks_total = %v, want 1 (a finalization is a processed task)", got)
 	}
 	labels := map[string]string{"stage": "render", "type": render.ClassTask.String()}
 	if got := rwMetricValue(t, reg, "crawler_stage_errors_total", labels); got != 1 {
@@ -270,10 +270,10 @@ func TestRenderWorker_TarpitMetrics(t *testing.T) {
 		t.Errorf("crawler_render_tarpit_finalized_total{engine=%s} = %v, want 1", config.EngineChromium, got)
 	}
 	if got := rwTarpitMetric(t, reg, config.EngineMoli); got != -1 {
-		t.Errorf("crawler_render_tarpit_finalized_total{engine=%s} = %v, want -1 (серия чужого движка)", config.EngineMoli, got)
+		t.Errorf("crawler_render_tarpit_finalized_total{engine=%s} = %v, want -1 (a series of a foreign engine)", config.EngineMoli, got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true"}); got != 0 {
-		t.Errorf("crawler_render_records_total{rendered=true} = %v, want 0 (DOM не записан)", got)
+		t.Errorf("crawler_render_records_total{rendered=true} = %v, want 0 (the DOM is not written)", got)
 	}
 }
 
@@ -283,6 +283,6 @@ func TestRenderWorker_TarpitMetrics(t *testing.T) {
 func TestRenderWorker_TarpitTimeoutAttemptsDefault(t *testing.T) {
 	o := Options{}.withDefaults()
 	if o.TimeoutAttempts != DefaultTimeoutAttempts {
-		t.Errorf("withDefaults: timeout_attempts=%d, дефолт %d", o.TimeoutAttempts, DefaultTimeoutAttempts)
+		t.Errorf("withDefaults: timeout_attempts=%d, the default %d", o.TimeoutAttempts, DefaultTimeoutAttempts)
 	}
 }

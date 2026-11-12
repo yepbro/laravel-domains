@@ -153,50 +153,50 @@ func TestRenderWorker_TarpitCountMixedSeries(t *testing.T) {
 
 	// Delivery #1 — an infrastructure failure (the DB unavailable): a retryable
 	// error, the tarpit counter does not see it.
-	f.pool.queryErr = errors.New("база недоступна")
+	f.pool.queryErr = errors.New("the database is unavailable")
 	if err := f.w.processDelivery(ctx, rwTaskIDDelivery(t, queue.StreamRender, "e1", "t1"), 1); err == nil {
-		t.Fatal("инфра-сбой — ошибка повторной доставки")
+		t.Fatal("an infra failure — a re-delivery error")
 	}
 	if n := tp.callsCount(); n != 0 {
-		t.Errorf("Track вызван %d раз — инфра-доставка не тарпит-классифицирована", n)
+		t.Errorf("Track was called %d times — an infra delivery is not tarpit-classified", n)
 	}
 	f.pool.queryErr = nil
 
 	// Delivery #2 — a tarpit: the count 1 < 2, NO finalization (the delivery
 	// number 2 ≥ TimeoutAttempts — the behavior before T-261 would have finalized here).
 	if err := f.w.processDelivery(ctx, rwTaskIDDelivery(t, queue.StreamRender, "e1", "t1"), 2); err == nil {
-		t.Fatal("тарпит №1 из 2 — ошибка повторной доставки (смешанная серия не финализирует на попытку раньше)")
+		t.Fatal("tarpit #1 of 2 — a re-delivery error (a mixed series does not finalize an attempt earlier)")
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Fatalf("публикаций быть не должно: %+v", pubs)
+		t.Fatalf("there must be no publications: %+v", pubs)
 	}
 
 	// Delivery #3 — a tarpit: the count 2 ≥ 2, a finalization without a render.
 	if err := f.w.processDelivery(ctx, rwTaskIDDelivery(t, queue.StreamRender, "e1", "t1"), 3); err != nil {
-		t.Fatalf("тарпит №2 из 2 — финализация: %v", err)
+		t.Fatalf("tarpit #2 of 2 — a finalization: %v", err)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v, нужна одна q:analyze (финализация)", pubs)
+		t.Fatalf("the publications %+v, one q:analyze is needed (the finalization)", pubs)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.rendered || row.failedAt == nil {
-		t.Errorf("строка после финализации: rendered=%v failedAt=%v — жду false/маркер", row.rendered, row.failedAt)
+		t.Errorf("the row after the finalization: rendered=%v failedAt=%v — expecting false/marker", row.rendered, row.failedAt)
 	}
 	// The set counted exactly the tarpit deliveries: the infra failure is not in it.
 	if got := tp.count("t1"); got != 2 {
-		t.Errorf("мощность множества t1 = %d, хочу 2 (только тарпит-доставки)", got)
+		t.Errorf("the t1 set cardinality = %d, want 2 (only tarpit deliveries)", got)
 	}
 	if tp.has("t1", "e1#1") {
-		t.Error("инфра-доставка e1#1 не должна попадать в тарпит-множество")
+		t.Error("the infra delivery e1#1 must not get into the tarpit set")
 	}
 	if !tp.has("t1", "e1#2") || !tp.has("t1", "e1#3") {
-		t.Error("тарпит-доставки e1#2/e1#3 обязаны быть в множестве")
+		t.Error("the tarpit deliveries e1#2/e1#3 must be in the set")
 	}
 	if got := tp.ttlOf("t1"); got != DefaultTarpitTTL {
-		t.Errorf("TTL ключа = %s, хочу %s (DefaultTarpitTTL)", got, DefaultTarpitTTL)
+		t.Errorf("the key TTL = %s, want %s (DefaultTarpitTTL)", got, DefaultTarpitTTL)
 	}
 	if got := rwTarpitMetric(t, reg, config.EngineChromium); got != 1 {
-		t.Errorf("crawler_render_tarpit_finalized_total = %v, хочу 1 (финализация — тарпит-ветка, не T-172)", got)
+		t.Errorf("crawler_render_tarpit_finalized_total = %v, want 1 (the finalization is the tarpit branch, not T-172)", got)
 	}
 }
 
@@ -213,20 +213,20 @@ func TestRenderWorker_TarpitCountPureSeriesBoundary(t *testing.T) {
 
 	// Delivery #1 (TimeoutAttempts 2): the count 1 — a retry, as before T-261.
 	if err := f.w.processDelivery(ctx, del, 1); err == nil {
-		t.Fatal("чистая серия, доставка №1 — ошибка повторной доставки")
+		t.Fatal("a pure series, delivery #1 — a re-delivery error")
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Fatalf("публикаций быть не должно: %+v", pubs)
+		t.Fatalf("there must be no publications: %+v", pubs)
 	}
 	// Delivery #2: the count 2 — a finalization exactly on the threshold delivery.
 	if err := f.w.processDelivery(ctx, del, 2); err != nil {
-		t.Fatalf("чистая серия, доставка №2 — финализация: %v", err)
+		t.Fatalf("a pure series, delivery #2 — a finalization: %v", err)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v, нужна одна q:analyze", pubs)
+		t.Fatalf("the publications %+v, one q:analyze is needed", pubs)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.rendered || row.failedAt == nil {
-		t.Errorf("строка после финализации: rendered=%v failedAt=%v — жду false/маркер", row.rendered, row.failedAt)
+		t.Errorf("the row after the finalization: rendered=%v failedAt=%v — expecting false/marker", row.rendered, row.failedAt)
 	}
 }
 
@@ -243,28 +243,28 @@ func TestRenderWorker_TarpitCountIdempotentReplay(t *testing.T) {
 
 	// The first processing of delivery #2 — a tarpit, the count 1.
 	if err := f.w.processDelivery(ctx, del, 2); err == nil {
-		t.Fatal("тарпит №1 из 2 — ошибка повторной доставки")
+		t.Fatal("tarpit #1 of 2 — a re-delivery error")
 	}
 	// A replay of the same number (the processing happened, no XACK — the
 	// delivery counter returned the same number): the count stays 1, the duplicate does not finalize.
 	if err := f.w.processDelivery(ctx, del, 2); err == nil {
-		t.Fatal("replay доставки №2 — счёт не вырос (1 < 2), обязана быть ошибка повторной доставки")
+		t.Fatal("the delivery #2 replay — the count did not grow (1 < 2), it must be a re-delivery error")
 	}
 	if got := tp.count("t1"); got != 1 {
-		t.Errorf("мощность множества после replay = %d, хочу 1 (SADD идемпотентен)", got)
+		t.Errorf("the set cardinality after the replay = %d, want 1 (SADD is idempotent)", got)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-		t.Fatalf("публикаций быть не должно: %+v", pubs)
+		t.Fatalf("there must be no publications: %+v", pubs)
 	}
 	// A new delivery #3 — a new member, the count 2 ≥ 2, a finalization.
 	if err := f.w.processDelivery(ctx, del, 3); err != nil {
-		t.Fatalf("доставка №3 — финализация: %v", err)
+		t.Fatalf("delivery #3 — a finalization: %v", err)
 	}
 	if got := tp.count("t1"); got != 2 {
-		t.Errorf("мощность множества = %d, хочу 2", got)
+		t.Errorf("the set cardinality = %d, want 2", got)
 	}
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Errorf("публикации %+v, нужна одна q:analyze", pubs)
+		t.Errorf("the publications %+v, one q:analyze is needed", pubs)
 	}
 }
 
@@ -274,7 +274,7 @@ func TestRenderWorker_TarpitCountIdempotentReplay(t *testing.T) {
 // losing the set with Redis alive (D3) — the count starts over, the finalization
 // is postponed until a new threshold and does not happen before the threshold.
 func TestRenderWorker_TarpitCounterRedisLoss(t *testing.T) {
-	t.Run("сбой Redis — решение по номеру доставки", func(t *testing.T) {
+	t.Run("a Redis failure — the decision by the delivery number", func(t *testing.T) {
 		tp := newRWFakeTarpits()
 		tp.err = errors.New("redis: connection reset by peer")
 		f := newRWTarpitFixture(t, tp)
@@ -283,19 +283,19 @@ func TestRenderWorker_TarpitCounterRedisLoss(t *testing.T) {
 		// finalizes by the delivery number — as before T-261; at #1 — it does not.
 		del := rwTaskIDDelivery(t, queue.StreamRender, "e1", "t1")
 		if err := f.w.processDelivery(context.Background(), del, 1); err == nil {
-			t.Fatal("доставка №1 при сбое Redis — ошибка повторной доставки (номер ниже порога)")
+			t.Fatal("delivery #1 at a Redis failure — a re-delivery error (the number is below the threshold)")
 		}
 		if err := f.w.processDelivery(context.Background(), del, 2); err != nil {
-			t.Fatalf("доставка №2 при сбое Redis — финализация по номеру доставки (деградация): %v", err)
+			t.Fatalf("delivery #2 at a Redis failure — a finalization by the delivery number (the degradation): %v", err)
 		}
 		if pubs := f.q.publishesSnapshot(); len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-			t.Fatalf("публикации %+v, нужна одна q:analyze", pubs)
+			t.Fatalf("the publications %+v, one q:analyze is needed", pubs)
 		}
 		if row := rwRowSnapshot(f.pool, rwKey); row.failedAt == nil {
-			t.Error("маркер render_failed_at обязан стоять — финализация состоялась")
+			t.Error("the render_failed_at marker must be in place — the finalization happened")
 		}
 	})
-	t.Run("потеря множества — счёт заново", func(t *testing.T) {
+	t.Run("a set loss — the count anew", func(t *testing.T) {
 		tp := newRWFakeTarpits()
 		f := newRWTarpitFixture(t, tp)
 		ctx := context.Background()
@@ -303,23 +303,23 @@ func TestRenderWorker_TarpitCounterRedisLoss(t *testing.T) {
 
 		// Tarpit #1 (delivery #2): the count 1, a retry.
 		if err := f.w.processDelivery(ctx, del, 2); err == nil {
-			t.Fatal("тарпит №1 из 2 — ошибка повторной доставки")
+			t.Fatal("tarpit #1 of 2 — a re-delivery error")
 		}
 		// The set is lost (a cleanup/a Redis restart): the count starts
 		// over — delivery #3 does not finalize (the new count 1 < 2).
 		tp.flush()
 		if err := f.w.processDelivery(ctx, del, 3); err == nil {
-			t.Fatal("после потери множества счёт заново — delivery №3 не финализирует (1 < 2)")
+			t.Fatal("after the set loss the count starts anew — delivery #3 does not finalize (1 < 2)")
 		}
 		if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
-			t.Fatalf("публикаций быть не должно: %+v", pubs)
+			t.Fatalf("there must be no publications: %+v", pubs)
 		}
 		// The next tarpit brings the new count to the threshold — a finalization.
 		if err := f.w.processDelivery(ctx, del, 4); err != nil {
-			t.Fatalf("новый счёт достиг порога — финализация: %v", err)
+			t.Fatalf("the new count reached the threshold — a finalization: %v", err)
 		}
 		if pubs := f.q.publishesSnapshot(); len(pubs) != 1 {
-			t.Errorf("публикаций = %d, нужна 1 q:analyze", len(pubs))
+			t.Errorf("publications = %d, 1 q:analyze is needed", len(pubs))
 		}
 	})
 }
@@ -329,27 +329,27 @@ func TestRenderWorker_TarpitCounterRedisLoss(t *testing.T) {
 // (the formats before T-024): the D2 degradation — the decision by the PEL delivery
 // number, Track is not called at all.
 func TestRenderWorker_TarpitCounterNotMounted(t *testing.T) {
-	t.Run("счётчик не смонтирован", func(t *testing.T) {
+	t.Run("the counter is not mounted", func(t *testing.T) {
 		f := newRWTarpitFixture(t, nil)
 		if err := f.w.processDelivery(context.Background(),
 			rwTaskIDDelivery(t, queue.StreamRender, "e1", "t1"), 2); err != nil {
-			t.Fatalf("nil-счётчик: доставка №2 — финализация по номеру (поведение до T-261): %v", err)
+			t.Fatalf("a nil counter: delivery #2 — a finalization by the number (the behavior before T-261): %v", err)
 		}
 		if pubs := f.q.publishesSnapshot(); len(pubs) != 1 {
-			t.Errorf("публикаций = %d, нужна 1 q:analyze", len(pubs))
+			t.Errorf("publications = %d, 1 q:analyze is needed", len(pubs))
 		}
 	})
-	t.Run("сообщение без task_id", func(t *testing.T) {
+	t.Run("a message without a task_id", func(t *testing.T) {
 		tp := newRWFakeTarpits()
 		f := newRWTarpitFixture(t, tp)
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
-			t.Fatalf("без task_id: доставка №2 — финализация по номеру (идентификатора множества нет): %v", err)
+			t.Fatalf("without a task_id: delivery #2 — a finalization by the number (there is no set identifier): %v", err)
 		}
 		if n := tp.callsCount(); n != 0 {
-			t.Errorf("Track вызван %d раз — без task_id счётчик не адресуется", n)
+			t.Errorf("Track was called %d times — without a task_id the counter is not addressable", n)
 		}
 		if pubs := f.q.publishesSnapshot(); len(pubs) != 1 {
-			t.Errorf("публикаций = %d, нужна 1 q:analyze", len(pubs))
+			t.Errorf("publications = %d, 1 q:analyze is needed", len(pubs))
 		}
 	})
 }
@@ -387,39 +387,39 @@ func TestRenderWorker_TarpitEpisodeBudgetThroughFallback(t *testing.T) {
 	// publication instead of the marker (T-238).
 	a1 := rwTaskIDDelivery(t, queue.StreamRender, "e1", "tp1")
 	if err := wA.processDelivery(ctx, a1, 1); err == nil {
-		t.Fatal("тарпит №1 из 2 — ошибка повторной доставки")
+		t.Fatal("tarpit #1 of 2 — a re-delivery error")
 	}
 	if err := wA.processDelivery(ctx, a1, 2); err != nil {
-		t.Fatalf("тарпит №2 из 2 — публикация фолбэка: %v", err)
+		t.Fatalf("tarpit #2 of 2 — the fallback publication: %v", err)
 	}
 	fbs := rwFallbackPublishes(t, f)
 	if len(fbs) != 1 {
-		t.Fatalf("публикации q:render-fallback = %d, нужна 1", len(fbs))
+		t.Fatalf("q:render-fallback publications = %d, 1 is needed", len(fbs))
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt != nil {
-		t.Error("маркер ставит воркер B после исчерпания фолбэка (ФТ-10) — тут его быть не должно")
+		t.Error("worker B sets the marker after the fallback is exhausted (FR-10) — it must not be here")
 	}
 
 	// Worker B (q:render-fallback, the same task): the very first tarpit sees
 	// the cardinality 3 ≥ 2 — the episode's budget is exhausted on engine A, a finalization.
 	b1 := rwTaskIDDelivery(t, queue.StreamRenderFallback, "f1", "tp1")
 	if err := wB.processDelivery(ctx, b1, 1); err != nil {
-		t.Fatalf("тарпит воркера B — финализация (бюджет эпизода общий): %v", err)
+		t.Fatalf("the worker B tarpit — a finalization (the episode budget is shared): %v", err)
 	}
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 2 || pubs[1].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации %+v: фолбэк (воркер A) + q:analyze (финализация B)", pubs)
+		t.Fatalf("the publications %+v: the fallback (worker A) + q:analyze (the B finalization)", pubs)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt == nil {
-		t.Error("маркер render_failed_at ставит финализация воркера B")
+		t.Error("the worker B finalization sets the render_failed_at marker")
 	}
 	// The streams' members differ by entry-id: 3 deliveries, no double counting.
 	if got := tp.count("tp1"); got != 3 {
-		t.Errorf("мощность множества эпизода = %d, хочу 3 (e1#1, e1#2, f1#1)", got)
+		t.Errorf("the episode set cardinality = %d, want 3 (e1#1, e1#2, f1#1)", got)
 	}
 	for _, m := range []string{"e1#1", "e1#2", "f1#1"} {
 		if !tp.has("tp1", m) {
-			t.Errorf("член %s отсутствует во множестве эпизода", m)
+			t.Errorf("the member %s is missing from the episode set", m)
 		}
 	}
 }

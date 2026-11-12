@@ -36,23 +36,23 @@ func TestSchemeCheckValidateMatrix(t *testing.T) {
 		check SchemeCheck
 	}{
 		{
-			"С1 живая, ранний Put прошёл",
+			"S1 alive, the early Put passed",
 			SchemeCheck{Scheme: model.SchemeHTTPS, Available: true, FinalURL: matrixURL("https://x.example/"),
 				Status: 200, ResponseMS: 40, ContentHash: &h, ContentStored: true, SPA: &spa},
 		},
 		{
-			"С2 живая, пауза записи контента",
+			"S2 alive, the content write pause",
 			SchemeCheck{Scheme: model.SchemeHTTP, Available: true, FinalURL: matrixURL("http://x.example/"),
 				Status: 200, ResponseMS: 40, ContentHash: &h, SPA: &spa},
 		},
 		{
-			"С3 живая, тело обрезано",
+			"S3 alive, the body truncated",
 			SchemeCheck{Scheme: model.SchemeHTTPS, Available: true, FinalURL: matrixURL("https://x.example/"),
 				Status: 200, ResponseMS: 40, ContentHash: &h, Truncated: true,
-				ErrClass: ErrBody, ErrText: "тело обрезано потолком max_body_bytes (данные частичны)", SPA: &spa},
+				ErrClass: ErrBody, ErrText: "the body is truncated by the max_body_bytes cap (the data is partial)", SPA: &spa},
 		},
 		{
-			"С4 кэш-попадание страницы С1",
+			"S4 the cache hit of page S1",
 			SchemeCheck{Scheme: model.SchemeHTTPS, Available: true, Cached: true,
 				//				// FinalURL — the check's starting URL: a deliberate
 				//				// distortion on a cache hit (schemestate.go).
@@ -61,45 +61,45 @@ func TestSchemeCheckValidateMatrix(t *testing.T) {
 				Redirects: []httpfetch.RedirectStep{{URL: "https://x.example/", Status: 200}}},
 		},
 		{
-			"С5 кэш-попадание страницы С2 (пауза записи наследуется)",
+			"S5 the cache hit of page S2 (the write pause is inherited)",
 			SchemeCheck{Scheme: model.SchemeHTTP, Available: true, Cached: true,
 				FinalURL: matrixURL("http://x.example/"), Status: 200, ResponseMS: 40,
 				ContentHash: &h, SPA: &spa,
 				Redirects: []httpfetch.RedirectStep{{URL: "http://x.example/", Status: 200}}},
 		},
 		{
-			"С6 кэш-попадание страницы С3 (обрезка переносится)",
+			"S6 the cache hit of page S3 (the truncation carries over)",
 			SchemeCheck{Scheme: model.SchemeHTTPS, Available: true, Cached: true,
 				FinalURL: matrixURL("https://x.example/"), Status: 200, ResponseMS: 40,
 				ContentHash: &h, Truncated: true, ErrClass: ErrBody,
-				ErrText: "тело обрезано потолком max_body_bytes (данные частичны)", SPA: &spa,
+				ErrText: "the body is truncated by the max_body_bytes cap (the data is partial)", SPA: &spa,
 				Redirects: []httpfetch.RedirectStep{{URL: "https://x.example/", Status: 200}}},
 		},
 		{
-			"С7 мёртвый диал: connection refused",
+			"S7 dead dial: connection refused",
 			SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrNetwork, ErrText: "dial tcp: connection refused", DeadDial: true},
 		},
 		{
-			"С8 мёртвый диал: connect-таймаут",
+			"S8 dead dial: connect timeout",
 			SchemeCheck{Scheme: model.SchemeHTTP, ErrClass: ErrTimeout, ErrText: "dial tcp: i/o timeout", DeadDial: true},
 		},
 		{
-			"С9 таймаут чтения тела с частичным итогом",
+			"S9 a body read timeout with a partial outcome",
 			SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrTimeout, ErrText: "timeout awaiting response body",
 				FinalURL: matrixURL("https://x.example/"), Status: 200,
 				Redirects: []httpfetch.RedirectStep{{URL: "https://x.example/", Status: 200}}},
 		},
 		{
-			"С10 сбой TLS-рукопожатия",
+			"S10 a TLS handshake failure",
 			SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrTLS, ErrText: "tls: handshake failure"},
 		},
 		{
-			"С11 сбой хопа редиректа (цепочка непуста — не dead-host)",
+			"S11 a redirect hop failure (the chain is non-empty — not dead-host)",
 			SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrNetwork, ErrText: "dial tcp: lookup hop.example: no such host",
 				Redirects: []httpfetch.RedirectStep{{URL: "https://x.example/", Status: 302}}},
 		},
 		{
-			"С12 лимит редиректов",
+			"S12 the redirect limit",
 			SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrRedirects, ErrText: httpfetch.ErrTooManyRedirects.Error(),
 				Redirects: []httpfetch.RedirectStep{
 					{URL: "https://x.example/", Status: 301},
@@ -107,20 +107,20 @@ func TestSchemeCheckValidateMatrix(t *testing.T) {
 				}},
 		},
 		{
-			"С13 ошибка чтения тела после заголовков",
-			SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrBody, ErrText: "gzip: данные превышают лимит",
+			"S13 a body read error after the headers",
+			SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrBody, ErrText: "gzip: the data exceeds the limit",
 				FinalURL: matrixURL("https://x.example/"), Status: 200},
 		},
 		{
-			"С14 синтетика dead-host cutoff",
+			"S14 the dead-host cutoff synthetic",
 			SchemeCheck{Scheme: model.SchemeHTTP, ErrClass: ErrCutoff,
-				ErrText: "dead-host cutoff (T-164): apex и www не прошли connect-фазу — субдомен не проверялся"},
+				ErrText: "dead-host cutoff (T-164): apex and www failed the connect phase — the subdomain was not checked"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := tc.check.validate(); err != nil {
-				t.Fatalf("легальная комбинация отклонена: %v", err)
+				t.Fatalf("a legal combination rejected: %v", err)
 			}
 		})
 	}
@@ -143,46 +143,46 @@ func TestSchemeCheckValidateIllegal(t *testing.T) {
 		name   string
 		mutate func(*SchemeCheck)
 	}{
-		{"И1: класс вне перечисления", func(c *SchemeCheck) { c.ErrClass = ErrorClass(9) }},
-		{"И1: схема вне перечисления", func(c *SchemeCheck) { c.Scheme = model.Scheme(9) }},
-		{"И8: успех с текстом ошибки", func(c *SchemeCheck) { c.ErrText = "лишний текст" }},
-		{"И8: ошибка без текста", func(c *SchemeCheck) {
+		{"I1: the class outside the enum", func(c *SchemeCheck) { c.ErrClass = ErrorClass(9) }},
+		{"I1: the scheme outside the enum", func(c *SchemeCheck) { c.Scheme = model.Scheme(9) }},
+		{"I8: a success with an error text", func(c *SchemeCheck) { c.ErrText = "an extra text" }},
+		{"I8: an error without a text", func(c *SchemeCheck) {
 			c.ErrClass, c.ErrText = ErrTimeout, ""
 			c.Available, c.ContentHash, c.ContentStored, c.SPA = false, nil, false, nil
 		}},
-		{"И5: недоступная с хэшем", func(c *SchemeCheck) {
+		{"I5: unavailable with a hash", func(c *SchemeCheck) {
 			c.Available, c.ContentStored, c.SPA, c.FinalURL = false, false, nil, nil
 		}},
-		{"И5: недоступная с обрезкой", func(c *SchemeCheck) {
+		{"I5: unavailable with a truncation", func(c *SchemeCheck) {
 			c.Available, c.ContentStored, c.SPA, c.FinalURL = false, false, nil, nil
-			c.Truncated, c.ErrClass, c.ErrText = true, ErrBody, "тело обрезано"
+			c.Truncated, c.ErrClass, c.ErrText = true, ErrBody, "the body is truncated"
 		}},
-		{"И5: недоступная с сохранённым телом", func(c *SchemeCheck) {
+		{"I5: unavailable with a stored body", func(c *SchemeCheck) {
 			c.Available, c.SPA, c.FinalURL = false, nil, nil
 		}},
-		{"И4: доступная без хэша", func(c *SchemeCheck) { c.ContentHash = nil }},
-		{"И4: доступная без итогового URL", func(c *SchemeCheck) { c.FinalURL = nil }},
-		{"И4: доступная без SPA-вердикта", func(c *SchemeCheck) { c.SPA = nil }},
-		{"И4: ErrNone при обрезке", func(c *SchemeCheck) { c.Truncated = true }},
-		{"И4: ErrBody без обрезки", func(c *SchemeCheck) { c.ErrClass, c.ErrText = ErrBody, "битая кодировка" }},
-		{"И3: кэш-попадание без хэша", func(c *SchemeCheck) { c.Cached, c.ContentHash = true, nil }},
-		{"И3: кэш-попадание недоступной проверки", func(c *SchemeCheck) {
+		{"I4: available without a hash", func(c *SchemeCheck) { c.ContentHash = nil }},
+		{"I4: available without a final URL", func(c *SchemeCheck) { c.FinalURL = nil }},
+		{"I4: available without an SPA verdict", func(c *SchemeCheck) { c.SPA = nil }},
+		{"I4: ErrNone at a truncation", func(c *SchemeCheck) { c.Truncated = true }},
+		{"I4: ErrBody without a truncation", func(c *SchemeCheck) { c.ErrClass, c.ErrText = ErrBody, "a broken encoding" }},
+		{"I3: a cache hit without a hash", func(c *SchemeCheck) { c.Cached, c.ContentHash = true, nil }},
+		{"I3: a cache hit of an unavailable check", func(c *SchemeCheck) {
 			c.Cached = true
 			c.Available, c.ContentStored, c.SPA, c.FinalURL = false, false, nil, nil
 		}},
-		{"И6: сохранено при обрезке", func(c *SchemeCheck) {
-			c.Truncated, c.ErrClass, c.ErrText = true, ErrBody, "тело обрезано"
+		{"I6: stored at a truncation", func(c *SchemeCheck) {
+			c.Truncated, c.ErrClass, c.ErrText = true, ErrBody, "the body is truncated"
 		}},
-		{"И7: ErrCutoff у доступной", func(c *SchemeCheck) {
+		{"I7: ErrCutoff on an available check", func(c *SchemeCheck) {
 			c.ErrClass, c.ErrText = ErrCutoff, "dead-host cutoff"
 		}},
-		{"И2: DeadDial у доступной", func(c *SchemeCheck) { c.DeadDial = true }},
-		{"И2: DeadDial с непустой цепочкой", func(c *SchemeCheck) {
+		{"I2: DeadDial on an available check", func(c *SchemeCheck) { c.DeadDial = true }},
+		{"I2: DeadDial with a non-empty chain", func(c *SchemeCheck) {
 			c.ErrClass, c.ErrText, c.DeadDial = ErrNetwork, "dial tcp: connection refused", true
 			c.Available, c.ContentHash, c.ContentStored, c.SPA, c.FinalURL = false, nil, false, nil, nil
 			c.Redirects = []httpfetch.RedirectStep{{URL: "https://x.example/", Status: 302}}
 		}},
-		{"И2: DeadDial с классом TLS", func(c *SchemeCheck) {
+		{"I2: DeadDial with the TLS class", func(c *SchemeCheck) {
 			c.ErrClass, c.ErrText, c.DeadDial = ErrTLS, "tls: handshake failure", true
 			c.Available, c.ContentHash, c.ContentStored, c.SPA, c.FinalURL = false, nil, false, nil, nil
 		}},
@@ -192,7 +192,7 @@ func TestSchemeCheckValidateIllegal(t *testing.T) {
 			c := live()
 			tc.mutate(&c)
 			if err := c.validate(); err == nil {
-				t.Fatal("нелегальная комбинация принята")
+				t.Fatal("an illegal combination accepted")
 			}
 		})
 	}
@@ -211,71 +211,71 @@ func TestRecordValidateMatrix(t *testing.T) {
 		rec  Record
 	}{
 		{
-			"Р1 оригинал с контентом (обе границы)",
+			"R1 an original with content (both boundaries)",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 0,
 				FinalURL: "https://x.example/", ContentHash: &h, ContentStored: true, StoreContent: true},
 		},
 		{
-			"Р2 до Save: оригинал в паузе записи контента",
+			"R2 before Save: an original in the content write pause",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 0,
 				FinalURL: "https://x.example/", ContentHash: &h, StoreContent: true},
 		},
 		{
-			"Р3 до Save: оригинал с обрезкой",
+			"R3 before Save: an original with a truncation",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 0,
 				FinalURL: "https://x.example/", ContentHash: &h, Truncated: true,
 				ErrClass: ErrBody, StoreContent: true},
 		},
 		{
-			"Р4 до Save: алиас сохранённого оригинала",
+			"R4 before Save: an alias of a stored original",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 1,
 				FinalURL: "https://x.example/", ContentHash: &h, ContentStored: true,
 				AliasKind: model.AliasRedirect, AliasSubdomainID: &aliasTo},
 		},
 		{
-			"Р4 до Save: алиас оригинала в паузе записи",
+			"R4 before Save: an alias of an original in the write pause",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 1,
 				FinalURL: "https://x.example/", ContentHash: &h,
 				AliasKind: model.AliasIdentical, AliasSubdomainID: &aliasTo},
 		},
 		{
-			"Р5 до Save: алиас обрезанной страницы",
+			"R5 before Save: an alias of a truncated page",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 1,
 				FinalURL: "https://x.example/", ContentHash: &h, Truncated: true, ErrClass: ErrBody,
 				AliasKind: model.AliasRedirect, AliasSubdomainID: &aliasTo},
 		},
 		{
-			"Р6 после Save: контент не сохранён",
+			"R6 after Save: the content is not stored",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 0,
 				FinalURL: "https://x.example/", ContentNotStored: true, StoreContent: true},
 		},
 		{
-			"Р7 после Save: обрезанный оригинал без хэша",
+			"R7 after Save: a truncated original without a hash",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 0,
 				FinalURL: "https://x.example/", ContentNotStored: true, Truncated: true,
 				ErrClass: ErrBody, StoreContent: true},
 		},
 		{
-			"Р8 после Save: алиас (Truncated/ContentStored — копия src)",
+			"R8 after Save: an alias (Truncated/ContentStored — a copy of src)",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 1,
 				FinalURL: "https://x.example/", ContentStored: true,
 				AliasKind: model.AliasRedirect, AliasSubdomainID: &aliasTo},
 		},
 		{
-			"Р8 после Save: алиас обрезанной страницы",
+			"R8 after Save: an alias of a truncated page",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 1,
 				FinalURL: "https://x.example/", Truncated: true, ErrClass: ErrBody,
 				AliasKind: model.AliasRedirect, AliasSubdomainID: &aliasTo},
 		},
 		{
-			"минимальная запись прямого вызова (частичные фикстуры)",
+			"a minimal direct-call record (partial fixtures)",
 			Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 0},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := tc.rec.validate(); err != nil {
-				t.Fatalf("легальная комбинация отклонена: %v", err)
+				t.Fatalf("a legal combination rejected: %v", err)
 			}
 		})
 	}
@@ -303,33 +303,33 @@ func TestRecordValidateIllegal(t *testing.T) {
 		base   func() Record
 		mutate func(*Record)
 	}{
-		{"П1: вариант вне перечисления", origin, func(r *Record) { r.Variant = model.Variant(7) }},
-		{"П1: схема вне перечисления", origin, func(r *Record) { r.Scheme = model.Scheme(9) }},
-		{"П1: вид алиаса вне перечисления", origin, func(r *Record) { r.AliasKind = model.AliasKind(5) }},
-		{"П2: AliasNone с ссылкой", origin, func(r *Record) { r.AliasSubdomainID = &aliasTo }},
-		{"П2: алиас без ссылки", alias, func(r *Record) { r.AliasSubdomainID = nil }},
-		{"П3: StoreContent у алиаса", alias, func(r *Record) { r.StoreContent = true }},
-		{"П4: ContentNotStored с хэшем", origin, func(r *Record) { r.ContentNotStored = true }},
-		{"П4: ContentNotStored с сохранённым телом", origin, func(r *Record) {
+		{"P1: the variant outside the enum", origin, func(r *Record) { r.Variant = model.Variant(7) }},
+		{"P1: the scheme outside the enum", origin, func(r *Record) { r.Scheme = model.Scheme(9) }},
+		{"P1: the alias kind outside the enum", origin, func(r *Record) { r.AliasKind = model.AliasKind(5) }},
+		{"P2: AliasNone with a reference", origin, func(r *Record) { r.AliasSubdomainID = &aliasTo }},
+		{"P2: an alias without a reference", alias, func(r *Record) { r.AliasSubdomainID = nil }},
+		{"P3: StoreContent on an alias", alias, func(r *Record) { r.StoreContent = true }},
+		{"P4: ContentNotStored with a hash", origin, func(r *Record) { r.ContentNotStored = true }},
+		{"P4: ContentNotStored with a stored body", origin, func(r *Record) {
 			r.ContentHash, r.ContentNotStored, r.ContentStored = nil, true, true
 		}},
-		{"П4: ContentNotStored у алиаса", alias, func(r *Record) {
+		{"P4: ContentNotStored on an alias", alias, func(r *Record) {
 			r.ContentHash, r.ContentNotStored = nil, true
 		}},
-		{"П5: оригинал без хэша и признака", origin, func(r *Record) { r.ContentHash = nil }},
-		{"П6: обрезка с сохранением", origin, func(r *Record) {
+		{"P5: an original without a hash and the sign", origin, func(r *Record) { r.ContentHash = nil }},
+		{"P6: a truncation with storing", origin, func(r *Record) {
 			r.Truncated, r.ErrClass = true, ErrBody
 		}},
-		{"П7: класс записи вне доступной проверки", origin, func(r *Record) { r.ErrClass = ErrTimeout }},
-		{"П7: ErrBody без обрезки", origin, func(r *Record) { r.ErrClass = ErrBody }},
-		{"П7: обрезка без ErrBody", alias, func(r *Record) { r.Truncated = true }},
+		{"P7: a record class outside an available check", origin, func(r *Record) { r.ErrClass = ErrTimeout }},
+		{"P7: ErrBody without a truncation", origin, func(r *Record) { r.ErrClass = ErrBody }},
+		{"P7: a truncation without ErrBody", alias, func(r *Record) { r.Truncated = true }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := tc.base()
 			tc.mutate(&r)
 			if err := r.validate(); err == nil {
-				t.Fatal("нелегальная комбинация принята")
+				t.Fatal("an illegal combination accepted")
 			}
 		})
 	}
@@ -375,18 +375,18 @@ func TestValidateResult(t *testing.T) {
 	}
 
 	if err := validateResult(legal); err != nil {
-		t.Fatalf("легальный результат отклонён: %v", err)
+		t.Fatalf("a legal result rejected: %v", err)
 	}
 
 	badCheck := clone(legal)
 	badCheck.Subdomains[0].HTTPS.ContentHash = nil // I4: Available without a hash
 	if err := validateResult(badCheck); err == nil || !strings.Contains(err.Error(), "ok.example") {
-		t.Fatalf("ожидалась ошибка валидации проверки с контекстом субдомена: %v", err)
+		t.Fatalf("a check validation error with the subdomain context expected: %v", err)
 	}
 
 	badRecord := clone(legal)
 	badRecord.Subdomains[0].Records[0].ContentNotStored = true // P4: with a live hash
 	if err := validateResult(badRecord); err == nil || !strings.Contains(err.Error(), "T-056") {
-		t.Fatalf("ожидалась ошибка валидации записи: %v", err)
+		t.Fatalf("a record validation error expected: %v", err)
 	}
 }

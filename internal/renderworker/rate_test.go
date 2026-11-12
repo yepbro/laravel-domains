@@ -27,43 +27,43 @@ func TestRenderWorker_RateWindowMechanics(t *testing.T) {
 
 	// An empty window — the full budget.
 	if a := w.allowance(start); a != 3 {
-		t.Errorf("allowance пустого окна = %d, хочу 3", a)
+		t.Errorf("the empty window allowance = %d, want 3", a)
 	}
 	// An empty read — a no-op: calling an empty queue does not spend the
 	// cap (idleness does not burn the budget).
 	w.record(start, 0)
 	if a := w.allowance(start); a != 3 {
-		t.Errorf("после record(0) allowance = %d, хочу 3 (пустое чтение — no-op)", a)
+		t.Errorf("after record(0) the allowance = %d, want 3 (an empty read is a no-op)", a)
 	}
 
 	// A chunk of two entries — one slot.
 	w.record(start, 2)
 	if a := w.allowance(start); a != 1 {
-		t.Errorf("после record(2) allowance = %d, хочу 1", a)
+		t.Errorf("after record(2) the allowance = %d, want 1", a)
 	}
 
 	// One more entry — the cap is exhausted, retry leads to the window's oldest mark.
 	w.record(start.Add(2*time.Second), 1)
 	now := start.Add(2 * time.Second)
 	if a := w.allowance(now); a != 0 {
-		t.Errorf("у потолка allowance = %d, хочу 0", a)
+		t.Errorf("at the cap the allowance = %d, want 0", a)
 	}
 	if d := w.retry(now); d != 8*time.Second {
-		t.Errorf("retry = %v, хочу 8s (старейшая метка start + окно 10s − now)", d)
+		t.Errorf("retry = %v, want 8s (the oldest start stamp + the 10s window − now)", d)
 	}
 
 	// The window slides: the first chunk (start) left by age — the slot
 	// freed up, only the start+2s chunk is alive.
 	if a := w.allowance(start.Add(10 * time.Second)); a != 2 {
-		t.Errorf("через окно allowance = %d, хочу 2 (пачка start истекла, start+2s жива)", a)
+		t.Errorf("after the window the allowance = %d, want 2 (the start batch expired, start+2s is alive)", a)
 	}
 	if d := w.retry(start.Add(10 * time.Second)); d != 2*time.Second {
-		t.Errorf("retry = %v, хочу 2s (до выхода пачки start+2s)", d)
+		t.Errorf("retry = %v, want 2s (until the start+2s batch exits)", d)
 	}
 
 	// Both chunks left — the window is empty, the full budget.
 	if a := w.allowance(start.Add(12 * time.Second)); a != 3 {
-		t.Errorf("после выхода всех меток allowance = %d, хочу 3", a)
+		t.Errorf("after all the stamps exit the allowance = %d, want 3", a)
 	}
 }
 
@@ -72,13 +72,13 @@ func TestRenderWorker_RateWindowMechanics(t *testing.T) {
 // change), a set value is not wiped, a negative one is reset.
 func TestRenderWorker_RateOptionsDefaults(t *testing.T) {
 	if o := (Options{}).withDefaults(); o.Rate != 0 {
-		t.Errorf("дефолт Rate = %d, хочу 0 (основная сборка читает без потолка)", o.Rate)
+		t.Errorf("the default Rate = %d, want 0 (the primary build reads without a cap)", o.Rate)
 	}
 	if o := (Options{Rate: 7}).withDefaults(); o.Rate != 7 {
-		t.Errorf("withDefaults затёр Rate: %d, хочу 7", o.Rate)
+		t.Errorf("withDefaults wiped the Rate: %d, want 7", o.Rate)
 	}
 	if o := (Options{Rate: -1}).withDefaults(); o.Rate != 0 {
-		t.Errorf("отрицательный Rate = %d, хочу 0", o.Rate)
+		t.Errorf("a negative Rate = %d, want 0", o.Rate)
 	}
 }
 
@@ -182,7 +182,7 @@ func (q *rateQueue) waitConsume(t *testing.T, i int, d time.Duration) int {
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("чтение №%d не состоялось (%d чтений)", i+1, q.consumesCount())
+			t.Fatalf("read #%d did not happen (%d reads)", i+1, q.consumesCount())
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -201,7 +201,7 @@ func (q *rateQueue) waitAcks(t *testing.T, want int, d time.Duration) {
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("подтверждений %d, хочу ≥ %d", n, want)
+			t.Fatalf("%d acknowledgments, want ≥ %d", n, want)
 		case <-q.ackCh:
 		}
 	}
@@ -241,7 +241,7 @@ func TestRenderWorker_RunRateCeiling(t *testing.T) {
 
 	// The first chunk is trimmed by the cap: 3 entries, not Consume=6.
 	if got := q.waitConsume(t, 0, 5*time.Second); got != 3 {
-		t.Errorf("первая пачка чтения = %d, хочу 3 (потолок окна; не Consume=6)", got)
+		t.Errorf("the first read batch = %d, want 3 (the window cap; not Consume=6)", got)
 	}
 	q.waitAcks(t, 3, 5*time.Second)
 
@@ -249,14 +249,14 @@ func TestRenderWorker_RunRateCeiling(t *testing.T) {
 	// no more than the cap is consumed over the window.
 	time.Sleep(200 * time.Millisecond)
 	if n := q.consumesCount(); n != 1 {
-		t.Errorf("чтений внутри окна = %d, хочу 1 — потолок Rate=3 держит чтение до скольжения окна", n)
+		t.Errorf("reads inside the window = %d, want 1 — the Rate=3 cap holds the read until the window slides", n)
 	}
 
 	// The window slid — the reading resumed and finishes the rest:
 	// all 6 deliveries are handed out and acknowledged.
 	q.waitAcks(t, 6, 10*time.Second)
 	if left := q.left(); left != 0 {
-		t.Errorf("нерозданных доставок %d, хочу 0 (воркер дорабатывает очередь в темпе потолка)", left)
+		t.Errorf("%d undelivered deliveries, want 0 (the worker drains the queue at the cap rate)", left)
 	}
 	rwStopLoop(t, cancel, done)
 }
@@ -282,13 +282,13 @@ func TestRenderWorker_RunRateIdleKeepsBudget(t *testing.T) {
 	// rate pause between them); the working request takes the full cap, not
 	// the remainder "minus the empty reads".
 	if got := q.waitConsume(t, 0, 5*time.Second); got != 3 {
-		t.Errorf("первая пачка = %d, хочу 3 (урезана потолком, не Consume=6)", got)
+		t.Errorf("the first batch = %d, want 3 (trimmed by the cap, not Consume=6)", got)
 	}
 	if got := q.waitConsume(t, 1, 5*time.Second); got != 3 {
-		t.Errorf("вторая пачка = %d, хочу 3 (пустая очередь — no-op темпа)", got)
+		t.Errorf("the second batch = %d, want 3 (an empty queue — a rate no-op)", got)
 	}
 	if got := q.waitConsume(t, 2, 5*time.Second); got != 3 {
-		t.Errorf("третья пачка = %d, хочу 3 (полный бюджет после простоя)", got)
+		t.Errorf("the third batch = %d, want 3 (the full budget after an idle)", got)
 	}
 	q.waitAcks(t, 3, 5*time.Second)
 	rwStopLoop(t, cancel, done)

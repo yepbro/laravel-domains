@@ -62,7 +62,7 @@ func httpMetricValue(t *testing.T, g prometheus.Gatherer, name string, labels ma
 
 func TestMetricsNilSafe(t *testing.T) {
 	if NewMetrics(nil) != nil {
-		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
+		t.Fatal("NewMetrics(nil) != nil — isolated builds without a registry")
 	}
 	var m *Metrics
 	m.Episode(&DomainResult{Name: "x"}, time.Second) // no-op, no panic
@@ -91,7 +91,7 @@ func TestMetricsSlotBody(t *testing.T) {
 	m.SlotLeave()
 	m.SlotLeave()
 	if got := httpMetricValue(t, reg, "crawler_http_tasks_inflight", nil); got != 0 {
-		t.Errorf("crawler_http_tasks_inflight после выходов = %v, want 0", got)
+		t.Errorf("crawler_http_tasks_inflight after the exits = %v, want 0", got)
 	}
 
 	m.BodyHeld(65536)
@@ -101,7 +101,7 @@ func TestMetricsSlotBody(t *testing.T) {
 	}
 	m.BodyHeld(-69632)
 	if got := httpMetricValue(t, reg, "crawler_http_body_bytes_inflight", nil); got != 0 {
-		t.Errorf("crawler_http_body_bytes_inflight после выхода окна = %v, want 0", got)
+		t.Errorf("crawler_http_body_bytes_inflight after the window exit = %v, want 0", got)
 	}
 
 	m.BodySize(20000)
@@ -142,13 +142,13 @@ func TestMetricsPerIPWait(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatal("crawler_http_per_ip_wait_seconds не экспортирована")
+		t.Fatal("crawler_http_per_ip_wait_seconds is not exported")
 	}
 	if count != 2 {
 		t.Errorf("crawler_http_per_ip_wait_seconds (count) = %d, want 2", count)
 	}
 	if le2 != 1 {
-		t.Errorf("корзина le=2 = %d, want 1 (ожидание 3 с лежит выше границы)", le2)
+		t.Errorf("the le=2 bucket = %d, want 1 (a 3 s wait lies above the boundary)", le2)
 	}
 }
 
@@ -197,7 +197,7 @@ func TestMetricsEpisode(t *testing.T) {
 		}
 	}
 	if got := httpMetricValue(t, reg, "crawler_domain_status_total", map[string]string{"type": model.StatusAlive.String()}); got != 1 {
-		t.Errorf("crawler_domain_status_total{alive} = %v, want 1 (записи есть)", got)
+		t.Errorf("crawler_domain_status_total{alive} = %v, want 1 (there are records)", got)
 	}
 	// The response time: only the available non-cached check (the cache did
 	// not touch the network, ResponseMS = 0).
@@ -209,7 +209,7 @@ func TestMetricsEpisode(t *testing.T) {
 		t.Errorf("crawler_render_records_total{rendered=\"false\"} = %v, want 2", got)
 	}
 	if got := httpMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true"}); got != -1 {
-		t.Errorf("crawler_render_records_total{rendered=\"true\"} = %v, want серия отсутствует (ветка рендера)", got)
+		t.Errorf("crawler_render_records_total{rendered=\"true\"} = %v, want the series missing (the render branch)", got)
 	}
 }
 
@@ -252,18 +252,18 @@ func TestMetricsEpisodeCutoff(t *testing.T) {
 	}
 	cutLabels := map[string]string{"stage": metrics.StageHTTP, "type": ErrCutoff.String()}
 	if got := httpMetricValue(t, reg, "crawler_stage_errors_total", cutLabels); got != -1 {
-		t.Errorf("crawler_stage_errors_total{type=cutoff} = %v, want серия отсутствует (проверка не выполнялась)", got)
+		t.Errorf("crawler_stage_errors_total{type=cutoff} = %v, want the series missing (the check was not performed)", got)
 	}
 	netLabels := map[string]string{"stage": metrics.StageHTTP, "type": ErrNetwork.String()}
 	if got := httpMetricValue(t, reg, "crawler_stage_errors_total", netLabels); got != 4 {
-		t.Errorf("crawler_stage_errors_total{type=network} = %v, want 4 (проверки головы)", got)
+		t.Errorf("crawler_stage_errors_total{type=network} = %v, want 4 (the head checks)", got)
 	}
 }
 
 // TestMetricsRunSmoke — the instruments are incremented by the typical path of the loop:
 // a q:http delivery → checks → OnResult → Episode (before the XACK).
 func TestMetricsRunSmoke(t *testing.T) {
-	body := "<html>" + strings.Repeat("страница для дымового теста метрик http ", 30) + "</html>"
+	body := "<html>" + strings.Repeat("a page for the http metrics smoke test ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"metrics.test":         {status: 200, body: body},
 		"http://metrics.test/": {status: 200, body: body},
@@ -304,10 +304,10 @@ func TestMetricsRunSmoke(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if q.ackedCount() != 1 {
-		t.Fatalf("XACK = %d, want 1 — обработка не дошла до подтверждения", q.ackedCount())
+		t.Fatalf("XACK = %d, want 1 — the processing did not reach the acknowledgment", q.ackedCount())
 	}
 
 	stage := map[string]string{"stage": metrics.StageHTTP}
@@ -344,7 +344,7 @@ func TestMetricsRunSmoke(t *testing.T) {
 // checks read the body, the final URLs' cache does not spread
 // across schemes).
 func TestMetricsSlotMemoryRun(t *testing.T) {
-	body := "<html>" + strings.Repeat("страница для замера памяти слота ", 30) + "</html>"
+	body := "<html>" + strings.Repeat("a page for the slot memory measurement ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"mem.test": {status: 200, body: body},
 	})
@@ -382,24 +382,24 @@ func TestMetricsSlotMemoryRun(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 
 	if inSlots != 1 {
-		t.Errorf("crawler_http_tasks_inflight внутри обработки = %v, want 1", inSlots)
+		t.Errorf("crawler_http_tasks_inflight inside the processing = %v, want 1", inSlots)
 	}
 	// The bodies are read and released before OnResult (the early Put of T-147): the
 	// hold window is closed in checkScheme.
 	if inBodyHeld != 0 {
-		t.Errorf("crawler_http_body_bytes_inflight внутри OnResult = %v, want 0 (тела уже отпущены)", inBodyHeld)
+		t.Errorf("crawler_http_body_bytes_inflight inside OnResult = %v, want 0 (the bodies are already released)", inBodyHeld)
 	}
 	if got := httpMetricValue(t, reg, "crawler_http_tasks_inflight", nil); got != 0 {
-		t.Errorf("crawler_http_tasks_inflight после обработки = %v, want 0", got)
+		t.Errorf("crawler_http_tasks_inflight after the processing = %v, want 0", got)
 	}
 	if got := httpMetricValue(t, reg, "crawler_http_body_bytes_inflight", nil); got != 0 {
-		t.Errorf("crawler_http_body_bytes_inflight после обработки = %v, want 0", got)
+		t.Errorf("crawler_http_body_bytes_inflight after the processing = %v, want 0", got)
 	}
 	if got := httpMetricValue(t, reg, "crawler_http_body_bytes", nil); got != 2 {
-		t.Errorf("crawler_http_body_bytes (count) = %v, want 2 (https и http)", got)
+		t.Errorf("crawler_http_body_bytes (count) = %v, want 2 (https and http)", got)
 	}
 }

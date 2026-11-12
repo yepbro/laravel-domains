@@ -145,38 +145,38 @@ import (
 func (c *SchemeCheck) validate() error {
 	//	// I1: the enum codes — the model's scheme and the stage error class.
 	if !c.Scheme.Valid() {
-		return fmt.Errorf("проверка: схема %d", int16(c.Scheme))
+		return fmt.Errorf("check: scheme %d", int16(c.Scheme))
 	}
 	if c.ErrClass < ErrNone || c.ErrClass > ErrCutoff {
-		return fmt.Errorf("проверка %s: класс ошибки %d вне перечисления ErrorClass", c.Scheme, int16(c.ErrClass))
+		return fmt.Errorf("check %s: error class %d is outside the ErrorClass enum", c.Scheme, int16(c.ErrClass))
 	}
 	//	// I8: the class and the error text agree — an error is always with text
 	//	// (the parsing §8), a success without.
 	if (c.ErrClass == ErrNone) != (c.ErrText == "") {
-		return fmt.Errorf("проверка %s: класс %s при тексте ошибки %q", c.Scheme, c.ErrClass, c.ErrText)
+		return fmt.Errorf("check %s: class %s with an error text %q", c.Scheme, c.ErrClass, c.ErrText)
 	}
 	//	// I3 (checked before I5/I4 — the only owner of the Cached branch):
 	//	// a cache hit — a live check with a hash, the cache stores only
 	//	// read pages.
 	if c.Cached && (!c.Available || c.ContentHash == nil) {
-		return fmt.Errorf("проверка %s: кэш-попадание без тела страницы (available=%v hash=%v)",
+		return fmt.Errorf("check %s: a cache hit without a page body (available=%v hash=%v)",
 			c.Scheme, c.Available, c.ContentHash != nil)
 	}
 	//	// I5: the content part — only of an available check (the load
 	//	// and body read errors do not fill it; Cached is excluded by I3).
 	if !c.Available && (c.ContentHash != nil || c.Truncated || c.ContentStored) {
-		return fmt.Errorf("проверка %s: недоступна, но несёт контентную часть (hash=%v truncated=%v stored=%v)",
+		return fmt.Errorf("check %s: unavailable but carries the content part (hash=%v truncated=%v stored=%v)",
 			c.Scheme, c.ContentHash != nil, c.Truncated, c.ContentStored)
 	}
 	//	// I4: an available check read the body — the hash, the final URL and
 	//	// the SPA verdict are there; ErrBody exactly at a truncation.
 	if c.Available {
 		if c.ContentHash == nil || c.FinalURL == nil || c.SPA == nil {
-			return fmt.Errorf("проверка %s: доступна без контентной части (hash=%v final_url=%v spa=%v)",
+			return fmt.Errorf("check %s: available without the content part (hash=%v final_url=%v spa=%v)",
 				c.Scheme, c.ContentHash != nil, c.FinalURL != nil, c.SPA != nil)
 		}
 		if (c.ErrClass == ErrBody) != c.Truncated {
-			return fmt.Errorf("проверка %s: класс %s при Truncated=%v (ErrBody доступной проверки — только обрезка)",
+			return fmt.Errorf("check %s: class %s at Truncated=%v (the ErrBody of an available check is only a truncation)",
 				c.Scheme, c.ErrClass, c.Truncated)
 		}
 	}
@@ -184,18 +184,18 @@ func (c *SchemeCheck) validate() error {
 	//	// hash absence at ContentStored are cut off by I5/I4; a truncated body does
 	//	// not get the early Put, T-049).
 	if c.ContentStored && c.Truncated {
-		return fmt.Errorf("проверка %s: ContentStored при обрезанном теле (T-049)", c.Scheme)
+		return fmt.Errorf("check %s: ContentStored with a truncated body (T-049)", c.Scheme)
 	}
 	//	// I7: a cutoff — the synthetics of a skipped subdomain (workerSkipSubdomain),
 	//	// never an available check.
 	if c.ErrClass == ErrCutoff && c.Available {
-		return fmt.Errorf("проверка %s: ErrCutoff у доступной проверки", c.Scheme)
+		return fmt.Errorf("check %s: ErrCutoff on an available check", c.Scheme)
 	}
 	//	// I2: a dead dial — an unavailable check with an empty chain and a
 	//	// connect-phase refusal class (T-164).
 	if c.DeadDial && (c.Available || c.Cached || c.ContentHash != nil || len(c.Redirects) > 0 ||
 		(c.ErrClass != ErrNetwork && c.ErrClass != ErrTimeout)) {
-		return fmt.Errorf("проверка %s: DeadDial без сигнатуры мёртвого connect (класс %s, шагов цепочки %d)",
+		return fmt.Errorf("check %s: DeadDial without the dead-connect signature (class %s, %d chain hops)",
 			c.Scheme, c.ErrClass, len(c.Redirects))
 	}
 	return nil
@@ -209,53 +209,53 @@ func (c *SchemeCheck) validate() error {
 func (r *Record) validate() error {
 	//	// P1: the model codes (§6.1).
 	if !r.Variant.Valid() {
-		return fmt.Errorf("субдомен %d: вариант %d", r.SubdomainID, int16(r.Variant))
+		return fmt.Errorf("subdomain %d: variant %d", r.SubdomainID, int16(r.Variant))
 	}
 	if !r.Scheme.Valid() {
-		return fmt.Errorf("субдомен %d: схема %d", r.SubdomainID, int16(r.Scheme))
+		return fmt.Errorf("subdomain %d: scheme %d", r.SubdomainID, int16(r.Scheme))
 	}
 	if !r.AliasKind.Valid() {
-		return fmt.Errorf("субдомен %d: вид алиаса %d", r.SubdomainID, int16(r.AliasKind))
+		return fmt.Errorf("subdomain %d: alias kind %d", r.SubdomainID, int16(r.AliasKind))
 	}
 	//	// P2: the alias link is self-consistent (the T-055 contract).
 	if (r.AliasKind == model.AliasNone) != (r.AliasSubdomainID == nil) {
-		return fmt.Errorf("субдомен %d: alias_kind %d ⟺ alias_subdomain_id (контракт T-055)",
+		return fmt.Errorf("subdomain %d: alias_kind %d ⟺ alias_subdomain_id (the T-055 contract)",
 			r.SubdomainID, int16(r.AliasKind))
 	}
 	//	// P3: the class's content is stored once at the original — StoreContent
 	//	// only at an independent record.
 	if r.StoreContent && r.AliasKind != model.AliasNone {
-		return fmt.Errorf("субдомен %d: StoreContent у алиаса (контент класса — у оригинала, T-055)", r.SubdomainID)
+		return fmt.Errorf("subdomain %d: StoreContent on an alias (the class content belongs to the original, T-055)", r.SubdomainID)
 	}
 	//	// P4: the "not stored" sign — only of an original, only without a hash and
 	//	// without a stored body (it is not set for aliases).
 	if r.ContentNotStored && (r.ContentHash != nil || !r.StoreContent || r.ContentStored) {
-		return fmt.Errorf("субдомен %d: ContentNotStored при живом content_hash/алиасе/сохранённом теле (контракт T-056)",
+		return fmt.Errorf("subdomain %d: ContentNotStored with a live content_hash/alias/stored body (the T-056 contract)",
 			r.SubdomainID)
 	}
 	//	// P5: the hash — a full content.Hash; the original carries a hash or the sign of
 	//	// its absence (typed as content.Hash — the length check is a guard
 	//	// for direct calls).
 	if r.ContentHash != nil && len(*r.ContentHash) != content.HashLen {
-		return fmt.Errorf("субдомен %d: content_hash %d байт (нужно %d)",
+		return fmt.Errorf("subdomain %d: content_hash is %d bytes (want %d)",
 			r.SubdomainID, len(*r.ContentHash), content.HashLen)
 	}
 	if r.StoreContent && r.ContentHash == nil && !r.ContentNotStored {
-		return fmt.Errorf("субдомен %d: оригинал без контента обязан нести хэш или ContentNotStored (контракт T-056)",
+		return fmt.Errorf("subdomain %d: an original without content must carry a hash or ContentNotStored (the T-056 contract)",
 			r.SubdomainID)
 	}
 	//	// P6: a truncated body is not stored (T-049).
 	if r.Truncated && r.ContentStored {
-		return fmt.Errorf("субдомен %d: Truncated при ContentStored (обрезанное не сохраняется, T-049)", r.SubdomainID)
+		return fmt.Errorf("subdomain %d: Truncated with ContentStored (a truncated body is not stored, T-049)", r.SubdomainID)
 	}
 	//	// P7: a record is created only by an available check — the class ErrNone or
 	//	// ErrBody (a truncation), the other classes live in the checks, not in the records.
 	if r.ErrClass != ErrNone && r.ErrClass != ErrBody {
-		return fmt.Errorf("субдомен %d: класс ошибки записи %s (запись создаётся только доступной проверкой)",
+		return fmt.Errorf("subdomain %d: record error class %s (a record is created only by an available check)",
 			r.SubdomainID, r.ErrClass)
 	}
 	if (r.ErrClass == ErrBody) != r.Truncated {
-		return fmt.Errorf("субдомен %d: класс %s при Truncated=%v (ErrBody записи — только обрезка)",
+		return fmt.Errorf("subdomain %d: class %s at Truncated=%v (the ErrBody of a record is only a truncation)",
 			r.SubdomainID, r.ErrClass, r.Truncated)
 	}
 	return nil
@@ -272,12 +272,12 @@ func validateResult(res *DomainResult) error {
 		sub := &res.Subdomains[i]
 		for _, c := range []*SchemeCheck{&sub.HTTPS, &sub.HTTP} {
 			if err := c.validate(); err != nil {
-				return fmt.Errorf("httpworker: субдомен %s: %w", sub.Hostname, err)
+				return fmt.Errorf("httpworker: subdomain %s: %w", sub.Hostname, err)
 			}
 		}
 		for j := range sub.Records {
 			if err := sub.Records[j].validate(); err != nil {
-				return fmt.Errorf("httpworker: субдомен %s: %w", sub.Hostname, err)
+				return fmt.Errorf("httpworker: subdomain %s: %w", sub.Hostname, err)
 			}
 		}
 	}

@@ -87,15 +87,15 @@ const (
 func (m readerMode) String() string {
 	switch m {
 	case modeConsume:
-		return "чтение"
+		return "reading"
 	case modePauseBrowser:
-		return "пауза-браузер"
+		return "browser pause"
 	case modePauseInfra:
-		return "пауза-инфра"
+		return "infra pause"
 	case modePauseFail:
-		return "пауза-предохранитель"
+		return "fuse pause"
 	case modePauseRate:
-		return "пауза-темп"
+		return "rate pause"
 	}
 	return fmt.Sprintf("readerMode(%d)", int8(m))
 }

@@ -106,7 +106,7 @@ func workerFakeFetch(script map[string]*workerPageScript) (FetchFunc, *workerFet
 		log.add(req.URL.Scheme + "://" + host + "/")
 		p := lookup(req.URL.Scheme, host)
 		if p == nil {
-			return nil, fmt.Errorf("httpfetch: GET %s: нет сценария", req.URL)
+			return nil, fmt.Errorf("httpfetch: GET %s: no scenario", req.URL)
 		}
 		if p.blockCtx {
 			<-ctx.Done()
@@ -117,7 +117,7 @@ func workerFakeFetch(script map[string]*workerPageScript) (FetchFunc, *workerFet
 		}
 		if p.tooMany {
 			return &httpfetch.ChainResult{Chain: p.steps},
-				fmt.Errorf("%w: лимит превышен", httpfetch.ErrTooManyRedirects)
+				fmt.Errorf("%w: the limit is exceeded", httpfetch.ErrTooManyRedirects)
 		}
 		final := p.final
 		if final == "" {
@@ -186,8 +186,8 @@ func workerSubMsg(id int16, label string) queue.HTTPSubdomain {
 // URL → an equivalence class, the original — the www "home" record, the apex
 // is marked by a redirect to the www subdomain.
 func TestWorkerProcessDomain(t *testing.T) {
-	home := "<html><body>" + strings.Repeat("достаточно видимого текста главной страницы сайта ", 12) + "</body></html>"
-	old := "<html><body>совсем другой сайт на старом адресе, много текста</body></html>"
+	home := "<html><body>" + strings.Repeat("enough visible text of the site home page ", 12) + "</body></html>"
+	old := "<html><body>a completely different site at the old address, a lot of text</body></html>"
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
 		"example.com": { // both bare checks: a redirect to www
 			status: 301, body: home, final: "https://www.example.com/",
@@ -219,86 +219,86 @@ func TestWorkerProcessDomain(t *testing.T) {
 		"example.com": 2, "www.example.com": 1, "api.example.com": 2,
 	} {
 		if got := log.countHost(host); got != want {
-			t.Errorf("загрузок %s: %d, ожидалось %d", host, got, want)
+			t.Errorf("%s fetches: %d, %d expected", host, got, want)
 		}
 	}
 
 	if !res.HasRecords() || res.RecordCount() != 4 {
-		t.Fatalf("RecordCount: %d (HasRecords %v), ожидалось 4 (bare 1 + www 2 + api 1)",
+		t.Fatalf("RecordCount: %d (HasRecords %v), 4 expected (bare 1 + www 2 + api 1)",
 			res.RecordCount(), res.HasRecords())
 	}
 	bare, www, api := &res.Subdomains[0], &res.Subdomains[1], &res.Subdomains[2]
 
 	// The cache hit is marked; the final URL and the synthetic chain are in place.
 	if !www.HTTPS.Cached {
-		t.Error("https-проверка www не взята из кэша итоговых URL")
+		t.Error("the www https check was not taken from the final URL cache")
 	}
 	if bare.HTTP.Cached {
-		t.Error("http-проверка bare стартует на своём URL — кэш неприменим")
+		t.Error("the bare http check starts at its own URL — the cache does not apply")
 	}
 	if bare.HTTPS.FinalURL == nil || bare.HTTPS.FinalURL.String() != "https://www.example.com/" {
-		t.Errorf("итоговый URL bare https: %v", bare.HTTPS.FinalURL)
+		t.Errorf("the bare https final URL: %v", bare.HTTPS.FinalURL)
 	}
 	if len(bare.HTTPS.Redirects) != 2 { // start + outcome
-		t.Errorf("цепочка bare https: %d шагов, ожидалось 2", len(bare.HTTPS.Redirects))
+		t.Errorf("the bare https chain: %d hops, 2 expected", len(bare.HTTPS.Redirects))
 	}
 	if len(www.HTTPS.Redirects) != 1 { // a synthetic single step
-		t.Errorf("цепочка кэш-итога www https: %d шагов, ожидался 1", len(www.HTTPS.Redirects))
+		t.Errorf("the www https cache-hit chain: %d hops, 1 expected", len(www.HTTPS.Redirects))
 	}
 
 	// bare: both protocols — one site (the same final host+path) → 1 record.
 	if len(bare.Records) != 1 || bare.Records[0].Variant != model.VariantMain ||
 		bare.Records[0].Scheme != model.SchemeHTTPS {
-		t.Fatalf("записи bare: %+v", bare.Records)
+		t.Fatalf("the bare records: %+v", bare.Records)
 	}
 	// www: two variants — 0 (https, the cache outcome) and 1 (http, another site).
 	if len(www.Records) != 2 {
-		t.Fatalf("записи www: %d, ожидалось 2", len(www.Records))
+		t.Fatalf("the www records: %d, 2 expected", len(www.Records))
 	}
 	if www.Records[0].Variant != model.VariantMain || www.Records[0].Scheme != model.SchemeHTTPS {
-		t.Errorf("вариант 0 www: variant=%v scheme=%v", www.Records[0].Variant, www.Records[0].Scheme)
+		t.Errorf("the www variant 0: variant=%v scheme=%v", www.Records[0].Variant, www.Records[0].Scheme)
 	}
 	if www.Records[1].Variant != model.VariantHTTP || www.Records[1].Scheme != model.SchemeHTTP {
-		t.Errorf("вариант 1 www: variant=%v scheme=%v", www.Records[1].Variant, www.Records[1].Scheme)
+		t.Errorf("the www variant 1: variant=%v scheme=%v", www.Records[1].Variant, www.Records[1].Scheme)
 	}
 	if www.Records[1].Host != "old.example.com" || www.Records[1].FinalURL != "http://old.example.com/" {
-		t.Errorf("итог варианта 1 www: host=%q url=%q", www.Records[1].Host, www.Records[1].FinalURL)
+		t.Errorf("the www variant 1 outcome: host=%q url=%q", www.Records[1].Host, www.Records[1].FinalURL)
 	}
 	// api: only http → one variant 0 scheme http record.
 	if len(api.Records) != 1 || api.Records[0].Scheme != model.SchemeHTTP ||
 		api.Records[0].Variant != model.VariantMain {
-		t.Fatalf("записи api: %+v", api.Records)
+		t.Fatalf("the api records: %+v", api.Records)
 	}
 	if api.HTTPS.ErrClass != ErrTimeout || !api.HTTPS.ErrClass.IsTemp() {
-		t.Errorf("класс ошибки api https: %v", api.HTTPS.ErrClass)
+		t.Errorf("the api https error class: %v", api.HTTPS.ErrClass)
 	}
 
 	// The aliases: bare v0 and www v0 — one final URL; the original — www
 	// ("at home"), bare — a redirect to the www subdomain; the original stores the content.
 	bareRec, wwwMain := &bare.Records[0], &www.Records[0]
 	if bareRec.AliasKind != model.AliasRedirect || bareRec.AliasSubdomainID == nil || *bareRec.AliasSubdomainID != 1 {
-		t.Errorf("алиас bare: kind=%v id=%v", bareRec.AliasKind, bareRec.AliasSubdomainID)
+		t.Errorf("the bare alias: kind=%v id=%v", bareRec.AliasKind, bareRec.AliasSubdomainID)
 	}
 	if bareRec.StoreContent {
-		t.Error("контент алиаса не хранится (StoreContent у не-оригинала)")
+		t.Error("the alias content is not stored (StoreContent on a non-original)")
 	}
 	if wwwMain.AliasKind != model.AliasNone || wwwMain.AliasSubdomainID != nil {
-		t.Errorf("алиас www v0: kind=%v id=%v", wwwMain.AliasKind, wwwMain.AliasSubdomainID)
+		t.Errorf("the www v0 alias: kind=%v id=%v", wwwMain.AliasKind, wwwMain.AliasSubdomainID)
 	}
 	if !wwwMain.StoreContent || wwwMain.ContentHash == nil {
-		t.Error("оригинал класса обязан хранить контент с ненулевым хэшем")
+		t.Error("the class original must store content with a non-zero hash")
 	}
 	// The cache outcome's hash matches the primary source's hash (the same body).
 	if bareRec.ContentHash == nil || *bareRec.ContentHash != *wwwMain.ContentHash {
-		t.Error("хэши одной страницы (первоисточник и кэш) расходятся")
+		t.Error("the hashes of one page (the primary source and the cache) diverge")
 	}
 	// The www variant 1 and api are independent.
 	if www.Records[1].AliasKind != model.AliasNone || api.Records[0].AliasKind != model.AliasNone {
-		t.Error("чужие записи помечены алиасами")
+		t.Error("the foreign records are marked with aliases")
 	}
 	// The DNS stage's data carried into the result (spec 5.5 item 7).
 	if len(api.Addrs) != 1 || api.Addrs[0].String() != "192.0.2.1" {
-		t.Errorf("адреса api: %v", api.Addrs)
+		t.Errorf("the api addresses: %v", api.Addrs)
 	}
 }
 
@@ -322,7 +322,7 @@ func TestWorkerCacheKey(t *testing.T) {
 			t.Fatal(err)
 		}
 		if workerCacheKey(u) != workerCacheKey(base) {
-			t.Errorf("ключ %q ≠ ключу базы", raw)
+			t.Errorf("the key %q ≠ the base key", raw)
 		}
 	}
 	httpBase, err := url.Parse("http://www.example.com/some/path")
@@ -334,7 +334,7 @@ func TestWorkerCacheKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	if workerCacheKey(u) != workerCacheKey(httpBase) {
-		t.Error("ключ с явным дефолтным портом :80 ≠ ключу без порта")
+		t.Error("the key with an explicit default port :80 ≠ the key without a port")
 	}
 	for _, raw := range []string{
 		"http://www.example.com/some/path",          // another scheme
@@ -349,11 +349,11 @@ func TestWorkerCacheKey(t *testing.T) {
 			t.Fatal(err)
 		}
 		if workerCacheKey(u) == workerCacheKey(base) {
-			t.Errorf("ключ %q совпал с ключом базы", raw)
+			t.Errorf("the key %q matched the base key", raw)
 		}
 	}
 	if workerCacheKey(nil) != "" {
-		t.Error("ключ nil-URL не пуст")
+		t.Error("the nil-URL key is not empty")
 	}
 }
 
@@ -362,7 +362,7 @@ func TestWorkerCacheKey(t *testing.T) {
 // park check's start without a query hits the cache. The cache lives one task: a second
 // task of the same domain downloads anew.
 func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
-	body := "<html>" + strings.Repeat("текст парковочной страницы для проверки кэша ", 40) + "</html>"
+	body := "<html>" + strings.Repeat("the parking page text for the cache check ", 40) + "</html>"
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
 		"bare.test":              {status: 301, body: body, final: "https://park.bare.test/?i=1"},
 		"park.bare.test":         {status: 200, body: body, final: "https://park.bare.test/"},
@@ -384,10 +384,10 @@ func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
 	// starts exactly at it → the cache, without the network. Only the http
 	// request went to the network over park.
 	if !res1.Subdomains[1].HTTPS.Cached {
-		t.Error("итог с query не найден в кэше по ключу без query")
+		t.Error("the outcome with a query was not found in the cache by the key without a query")
 	}
 	if got := log.countHost("park.bare.test"); got != 1 {
-		t.Errorf("обращений к park в первой задаче: %d, ожидался 1 (только http)", got)
+		t.Errorf("park calls in the first task: %d, 1 expected (http only)", got)
 	}
 
 	// A per-task cache: the second task WITHOUT bare — its cache is empty at the start,
@@ -401,10 +401,10 @@ func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
 		t.Fatalf("ProcessDomain(2): %v", err)
 	}
 	if res2.Subdomains[0].HTTPS.Cached {
-		t.Error("кэш пережил задачу домена")
+		t.Error("the cache survived the domain task")
 	}
 	if got := log.countHost("park.bare.test"); got != 3 { // 1 (the first's http) + https + http of the second
-		t.Errorf("обращений к park после второй задачи: %d, ожидалось 3", got)
+		t.Errorf("park calls after the second task: %d, 3 expected", got)
 	}
 }
 
@@ -432,24 +432,24 @@ func TestWorkerCacheHitKeepsErrorClass(t *testing.T) {
 	}
 	www := &res.Subdomains[1]
 	if !www.HTTPS.Cached || !www.HTTPS.Truncated {
-		t.Fatalf("https www — не кэш-итог обрезанной страницы: cached=%v truncated=%v",
+		t.Fatalf("the https www is not the cache outcome of the truncated page: cached=%v truncated=%v",
 			www.HTTPS.Cached, www.HTTPS.Truncated)
 	}
 	if www.HTTPS.ErrClass != ErrBody || www.HTTPS.ErrText == "" {
-		t.Errorf("кэш-попадание потеряло класс ошибки обрезанной страницы: %v текст %q",
+		t.Errorf("the cache hit lost the truncated page error class: %v text %q",
 			www.HTTPS.ErrClass, www.HTTPS.ErrText)
 	}
 	// Cached=true — the network was not touched at all (the www http check at
 	// the error scenario honestly carries ErrNetwork, not substituted by the cache).
 	if www.HTTP.ErrClass != ErrNetwork {
-		t.Errorf("http www: класс %v (ожидался ErrNetwork)", www.HTTP.ErrClass)
+		t.Errorf("the http www: class %v (ErrNetwork expected)", www.HTTP.ErrClass)
 	}
 	// The class reaches the cache source's record too.
 	if len(www.Records) == 0 {
-		t.Fatal("у www нет записей, хотя https-итог доступен")
+		t.Fatal("www has no records although the https outcome is available")
 	}
 	if www.Records[0].ErrClass != ErrBody {
-		t.Errorf("запись кэш-источника: класс %v (ожидался ErrBody)", www.Records[0].ErrClass)
+		t.Errorf("the cache-source record: class %v (ErrBody expected)", www.Records[0].ErrClass)
 	}
 }
 
@@ -459,7 +459,7 @@ func TestWorkerCacheHitKeepsErrorClass(t *testing.T) {
 // zero with a live measurement. The cache hit metrics still do not
 // observe it (Cached).
 func TestWorkerCacheHitResponseMS(t *testing.T) {
-	body := "<html>" + strings.Repeat("страница для теста времени ответа кэша ", 30) + "</html>"
+	body := "<html>" + strings.Repeat("a page for the cache response time test ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"rt.test": {status: 200, body: body, final: "https://www.rt.test/", elapsed: 150 * time.Millisecond},
 		// the apex's http check — another outcome (not the cache), its own time.
@@ -475,23 +475,23 @@ func TestWorkerCacheHitResponseMS(t *testing.T) {
 	}
 	bare, www := &res.Subdomains[0], &res.Subdomains[1]
 	if !www.HTTPS.Cached {
-		t.Fatal("https www — не кэш-итог (порядок проверок сломан)")
+		t.Fatal("the https www is not a cache outcome (the check order is broken)")
 	}
 	if got := www.HTTPS.ResponseMS; got != 150 {
-		t.Errorf("ResponseMS кэш-попадания: %d, ожидалось измерение первоисточника 150", got)
+		t.Errorf("the cache hit ResponseMS: %d, the primary source measurement of 150 expected", got)
 	}
 	if got := bare.HTTPS.ResponseMS; got != 150 {
-		t.Errorf("ResponseMS первоисточника: %d, ожидалось 150", got)
+		t.Errorf("the primary source ResponseMS: %d, 150 expected", got)
 	}
 	if got := bare.HTTP.ResponseMS; got != 40 {
-		t.Errorf("ResponseMS собственной (некэшовой) проверки: %d, ожидалось 40", got)
+		t.Errorf("the own (non-cached) check ResponseMS: %d, 40 expected", got)
 	}
 	// The cache source's record carries the response time into subdomain_results.
 	if len(www.Records) == 0 {
-		t.Fatal("у www нет записей")
+		t.Fatal("www has no records")
 	}
 	if got := www.Records[0].ResponseMS; got != 150 {
-		t.Errorf("ResponseMS записи кэш-источника: %d, ожидалось 150", got)
+		t.Errorf("the cache-source record ResponseMS: %d, 150 expected", got)
 	}
 }
 
@@ -508,7 +508,7 @@ func TestWorkerErrorsClassified(t *testing.T) {
 		}},
 		"http://test/": {err: errors.New("connection refused")},
 		"big.test":     {status: 200, body: huge},
-		"http://big.test/": {status: 200, body: "<html>зеркало на старом адресе с обычным текстом</html>",
+		"http://big.test/": {status: 200, body: "<html>a mirror at the old address with ordinary text</html>",
 			final: "http://old.big.test/"},
 	})
 	w := workerWorker(t, fetch, nil)
@@ -522,22 +522,22 @@ func TestWorkerErrorsClassified(t *testing.T) {
 
 	apex := &res.Subdomains[0]
 	if apex.HTTPS.ErrClass != ErrRedirects || apex.HTTPS.Available {
-		t.Errorf("https апекса: класс %v available %v (ожидался redirects/недоступен)",
+		t.Errorf("the apex https: class %v available %v (redirects/unavailable expected)",
 			apex.HTTPS.ErrClass, apex.HTTPS.Available)
 	}
 	if len(apex.HTTPS.Redirects) != 2 {
-		t.Errorf("выполненная часть цепочки потеряна: %d шагов", len(apex.HTTPS.Redirects))
+		t.Errorf("the executed part of the chain is lost: %d hops", len(apex.HTTPS.Redirects))
 	}
 	if apex.HTTP.ErrClass != ErrNetwork || apex.HTTP.ErrText == "" {
-		t.Errorf("http апекса: класс %v текст %q", apex.HTTP.ErrClass, apex.HTTP.ErrText)
+		t.Errorf("the apex http: class %v text %q", apex.HTTP.ErrClass, apex.HTTP.ErrText)
 	}
 	if len(apex.Records) != 0 {
-		t.Errorf("записей у молчащего апекса: %d", len(apex.Records))
+		t.Fatalf("%d records at the silent apex", len(apex.Records))
 	}
 
 	big := &res.Subdomains[1]
 	if !big.HTTPS.Available || !big.HTTPS.Truncated || big.HTTPS.ErrClass != ErrBody {
-		t.Errorf("обрезанное тело: available=%v truncated=%v класс=%v",
+		t.Errorf("the truncated body: available=%v truncated=%v class=%v",
 			big.HTTPS.Available, big.HTTPS.Truncated, big.HTTPS.ErrClass)
 	}
 	if !big.HTTP.Available || big.HTTP.Truncated {
@@ -546,17 +546,17 @@ func TestWorkerErrorsClassified(t *testing.T) {
 	// big: https — a truncated body, http — another site → 2 records; the
 	// source check's error class reaches the record.
 	if len(big.Records) != 2 {
-		t.Fatalf("записей big: %d, ожидалось 2", len(big.Records))
+		t.Fatalf("big records: %d, 2 expected", len(big.Records))
 	}
 	if big.Records[0].ErrClass != ErrBody || !big.Records[0].Truncated {
-		t.Errorf("класс ошибки не дошёл до записи: %v truncated=%v",
+		t.Errorf("the error class did not reach the record: %v truncated=%v",
 			big.Records[0].ErrClass, big.Records[0].Truncated)
 	}
 	if !res.HasRecords() {
-		t.Error("домен без записей, хотя big ответил")
+		t.Error("the domain has no records although big answered")
 	}
 	if res.AnyTimeout() {
-		t.Error("таймаутов в задаче не было")
+		t.Error("there were no timeouts in the task")
 	}
 }
 
@@ -599,24 +599,24 @@ func TestWorkerBodyLimiterCeiling(t *testing.T) {
 		}
 		return &res.Subdomains[0].HTTP, []byte(strings.Repeat("a", int(wantLen))) // the httptest server is http
 	}
-	t.Run("3 МиБ при потолке 4 МиБ — целая", func(t *testing.T) {
+	t.Run("3 MiB at a 4 MiB cap — whole", func(t *testing.T) {
 		check, want := caseRun(t, 3<<20, 4<<20)
 		if !check.Available || check.Truncated || check.ErrClass != ErrNone || check.ErrText != "" {
-			t.Fatalf("available=%v truncated=%v класс=%v текст=%q — страница ниже потолка читается целиком",
+			t.Fatalf("available=%v truncated=%v class=%v text=%q — a page below the cap is read whole",
 				check.Available, check.Truncated, check.ErrClass, check.ErrText)
 		}
 		if check.ContentHash == nil || *check.ContentHash != content.HashOf(want) {
-			t.Error("хэш тела не совпадает с хэшем целой страницы (обрезка страховкой 2 МиБ?)")
+			t.Error("the body hash does not match the whole page hash (a truncation by the 2 MiB guard?)")
 		}
 	})
-	t.Run("5 МиБ при потолке 4 МиБ — обрезка лимитёром", func(t *testing.T) {
+	t.Run("5 MiB at a 4 MiB cap — a truncation by the limiter", func(t *testing.T) {
 		check, want := caseRun(t, 5<<20, 4<<20)
 		if !check.Available || !check.Truncated || check.ErrClass != ErrBody {
-			t.Fatalf("available=%v truncated=%v класс=%v — обрезка настроенным max_body_bytes",
+			t.Fatalf("available=%v truncated=%v class=%v — a truncation by the configured max_body_bytes",
 				check.Available, check.Truncated, check.ErrClass)
 		}
 		if check.ContentHash == nil || *check.ContentHash != content.HashOf(want) {
-			t.Errorf("хэш тела не совпадает с хэшем обрезанной до потолка страницы (%d байт)", len(want))
+			t.Errorf("the body hash does not match the hash of the page truncated to the cap (%d bytes)", len(want))
 		}
 	})
 }
@@ -651,13 +651,13 @@ func TestWorkerReadBody(t *testing.T) {
 		// allocation by Content-Length plus the ReadFrom's service slack
 		// (minRead 512), without the io.ReadAll doublings
 	}{
-		{"Content-Length честен", "9", "", "123456789", "123456789", 9 + 512},
-		{"сервер недослал", "100", "", "коротко", "коротко", 100 + 512},
-		{"тело 64 КиБ одним буфером", "65536", "", strings.Repeat("z", 65536), strings.Repeat("z", 65536), 65536 + 512},
-		{"сервер переслал", "2", "", "длиннее заявленного", "длиннее заявленного", 0},
-		{"без Content-Length", "", "", "чанкованный ответ", "чанкованный ответ", 0},
-		{"сжатый ответ", "4", "gzip", "распакованные байты", "распакованные байты", 0},
-		{"кривой Content-Length", "много", "", "тело", "тело", 0},
+		{"an honest Content-Length", "9", "", "123456789", "123456789", 9 + 512},
+		{"the server under-sent", "100", "", "short", "short", 100 + 512},
+		{"a 64 KiB body in one buffer", "65536", "", strings.Repeat("z", 65536), strings.Repeat("z", 65536), 65536 + 512},
+		{"the server over-sent", "2", "", "longer than declared", "longer than declared", 0},
+		{"without Content-Length", "", "", "a chunked response", "a chunked response", 0},
+		{"a compressed response", "4", "gzip", "the uncompressed bytes", "the uncompressed bytes", 0},
+		{"a broken Content-Length", "many", "", "a body", "a body", 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -666,10 +666,10 @@ func TestWorkerReadBody(t *testing.T) {
 				t.Fatalf("workerReadBody: %v", err)
 			}
 			if string(got) != c.want {
-				t.Errorf("тело %q, ожидалось %q", got, c.want)
+				t.Errorf("the body %q, %q expected", got, c.want)
 			}
 			if c.maxCap > 0 && cap(got) > c.maxCap {
-				t.Errorf("ёмкость буфера %d — выше выделения по Content-Length+%d (удвоения ReadAll?)", cap(got), 512)
+				t.Errorf("the buffer capacity %d — above the Content-Length+%d allocation (ReadAll doublings?)", cap(got), 512)
 			}
 		})
 	}
@@ -678,16 +678,16 @@ func TestWorkerReadBody(t *testing.T) {
 	res := mkRes("1073741824", "", strings.Repeat("x", 128), nil)
 	got, err := workerReadBody(res)
 	if err != nil || len(got) != 128 {
-		t.Fatalf("гигантский Content-Length: байтов %d, ошибка %v", len(got), err)
+		t.Fatalf("a giant Content-Length: %d bytes, error %v", len(got), err)
 	}
 	// Without a BodyLimiter the read is bounded by the worker's guard cap.
 	big := strings.Repeat("y", int(workerBodyHardLimit)+64)
 	got, err = workerReadBody(mkRes("", "", big, nil))
 	if err != nil {
-		t.Fatalf("workerReadBody без лимитёра: %v", err)
+		t.Fatalf("workerReadBody without a limiter: %v", err)
 	}
 	if int64(len(got)) != workerBodyHardLimit+1 {
-		t.Errorf("прочитано %d байт, ожидалось %d (LimitReader потолка+1)", len(got), workerBodyHardLimit+1)
+		t.Errorf("%d bytes read, %d expected (the cap LimitReader+1)", len(got), workerBodyHardLimit+1)
 	}
 }
 
@@ -710,10 +710,10 @@ func TestWorkerAllFailedNoHTTP(t *testing.T) {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
 	if res.HasRecords() || res.RecordCount() != 0 {
-		t.Fatalf("все проверки упали, а записи есть: %d", res.RecordCount())
+		t.Fatalf("all the checks failed yet there are records: %d", res.RecordCount())
 	}
 	if !res.AnyTimeout() {
-		t.Error("таймаут-класс не виден в агрегате")
+		t.Error("the timeout class is not visible in the aggregate")
 	}
 }
 
@@ -752,7 +752,7 @@ func workerDeadDialScript(deadErr func() error, alive string) map[string]*worker
 		script[host] = &workerPageScript{err: deadErr()}
 	}
 	if alive != "" {
-		script[alive] = &workerPageScript{status: 200, body: "<html>живой субдомен с обычным текстом страницы</html>"}
+		script[alive] = &workerPageScript{status: 200, body: "<html>a live subdomain with ordinary page text</html>"}
 	}
 	return script
 }
@@ -777,7 +777,7 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 			t.Fatalf("ProcessDomain: %v", err)
 		}
 		if !res.Cutoff {
-			t.Fatal("cutoff не сработал: оба головных хоста TCP-мёртвы")
+			t.Fatal("the cutoff did not trip: both head hosts are TCP-dead")
 		}
 		// The network: only the head (4 checks), the tail was not checked.
 		for host, want := range map[string]int{
@@ -785,7 +785,7 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 			"blog.example.net": 0, "shop.example.net": 0,
 		} {
 			if got := log.countHost(host); got != want {
-				t.Errorf("загрузок %s: %d, ожидалось %d", host, got, want)
+				t.Errorf("%s fetches: %d, %d expected", host, got, want)
 			}
 		}
 		// The head: the real error class (refused — network) + the dead
@@ -794,7 +794,7 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 			sub := &res.Subdomains[i]
 			for _, c := range []SchemeCheck{sub.HTTPS, sub.HTTP} {
 				if c.Available || c.DeadDial != true || c.ErrClass != ErrNetwork {
-					t.Errorf("голова %q %v: available=%v deadDial=%v класс=%v, ожидалось false/true/network",
+					t.Errorf("the head %q %v: available=%v deadDial=%v class=%v, false/true/network expected",
 						sub.Hostname, c.Scheme, c.Available, c.DeadDial, c.ErrClass)
 				}
 			}
@@ -804,27 +804,27 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 		for i := 2; i < len(res.Subdomains); i++ {
 			sub := &res.Subdomains[i]
 			if sub.SubdomainID == 0 || sub.Hostname == "" || len(sub.Addrs) == 0 {
-				t.Fatalf("хвост #%d: идентичность потеряна: %+v", i, sub)
+				t.Fatalf("the tail #%d: the identity is lost: %+v", i, sub)
 			}
 			for _, c := range []SchemeCheck{sub.HTTPS, sub.HTTP} {
 				if c.ErrClass != ErrCutoff || c.ErrText == "" || c.Available || c.DeadDial {
-					t.Errorf("хвост %q %v: класс=%v available=%v deadDial=%v, ожидался cutoff/false/false",
+					t.Errorf("the tail %q %v: class=%v available=%v deadDial=%v, cutoff/false/false expected",
 						sub.Hostname, c.Scheme, c.ErrClass, c.Available, c.DeadDial)
 				}
 			}
 			if len(sub.Records) != 0 {
-				t.Errorf("хвост %q: записи пропущенного субдомена: %d", sub.Hostname, len(sub.Records))
+				t.Errorf("the tail %q: records of the skipped subdomain: %d", sub.Hostname, len(sub.Records))
 			}
 		}
 		if res.HasRecords() {
-			t.Error("записи у целиком мёртвого домена")
+			t.Error("records at a fully dead domain")
 		}
 		if res.AnyTimeout() {
-			t.Error("refused — не таймаут, temp_error быть не должно")
+			t.Error("refused is not a timeout, there must be no temp_error")
 		}
 	})
 
-	t.Run("connect-таймауты — temp_error-семантика сохранена", func(t *testing.T) {
+	t.Run("connect timeouts — the temp_error semantics kept", func(t *testing.T) {
 		fetch, _ := workerFakeFetch(workerDeadDialScript(workerDialTimeoutErr, "blog.example.net"))
 		w := workerWorker(t, fetch, func(o *Options) { o.DeadHostCutoff = true })
 		res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
@@ -837,17 +837,17 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 			t.Fatalf("ProcessDomain: %v", err)
 		}
 		if !res.Cutoff || res.HasRecords() {
-			t.Fatalf("cutoff=%v записей=%d, ожидалось true/0", res.Cutoff, res.RecordCount())
+			t.Fatalf("cutoff=%v records=%d, true/0 expected", res.Cutoff, res.RecordCount())
 		}
 		apex := &res.Subdomains[0]
 		if apex.HTTPS.ErrClass != ErrTimeout || !apex.HTTPS.DeadDial {
-			t.Errorf("apex https: класс=%v deadDial=%v, ожидался timeout/true",
+			t.Errorf("the apex https: class=%v deadDial=%v, timeout/true expected",
 				apex.HTTPS.ErrClass, apex.HTTPS.DeadDial)
 		}
 		// The performed checks' timeouts decide the episode's repeat (T-031),
 		// the tail's ErrCutoff gives no temp_error.
 		if !res.AnyTimeout() {
-			t.Error("connect-таймауты головы не видны в AnyTimeout (temp_error)")
+			t.Error("the head connect timeouts are not visible in AnyTimeout (temp_error)")
 		}
 	})
 }
@@ -857,7 +857,7 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 // timeout, the redirect host's fall) or the www's absence in the task —
 // the domain is checked in full, the tail sees the network.
 func TestWorkerDeadHostCutoffStrict(t *testing.T) {
-	alive := "<html>страница живого апекса с достаточным текстом</html>"
+	alive := "<html>the live apex page with enough text</html>"
 	cases := []struct {
 		name   string
 		script map[string]*workerPageScript
@@ -866,7 +866,7 @@ func TestWorkerDeadHostCutoffStrict(t *testing.T) {
 		checkApexDeadDialFalse bool
 	}{
 		{
-			name: "apex https жив — www мёртв не сигнатура",
+			name: "the apex https is alive — a dead www is not the signature",
 			script: func() map[string]*workerPageScript {
 				s := workerDeadDialScript(nil, "blog.example.net")
 				s["example.net"] = &workerPageScript{status: 200, body: alive}
@@ -874,7 +874,7 @@ func TestWorkerDeadHostCutoffStrict(t *testing.T) {
 			}(),
 		},
 		{
-			name: "TLS-сбой после connect — соединение было",
+			name: "a TLS failure after connect — there was a connection",
 			script: func() map[string]*workerPageScript {
 				s := workerDeadDialScript(nil, "blog.example.net")
 				s["https://example.net/"] = &workerPageScript{err: x509.UnknownAuthorityError{}}
@@ -883,7 +883,7 @@ func TestWorkerDeadHostCutoffStrict(t *testing.T) {
 			checkApexDeadDialFalse: true,
 		},
 		{
-			name: "таймаут заголовков — connect прошёл",
+			name: "a header timeout — the connect passed",
 			script: func() map[string]*workerPageScript {
 				s := workerDeadDialScript(nil, "blog.example.net")
 				s["example.net"] = &workerPageScript{err: workerTimeoutErr{}}
@@ -892,7 +892,7 @@ func TestWorkerDeadHostCutoffStrict(t *testing.T) {
 			checkApexDeadDialFalse: true,
 		},
 		{
-			name: "падение хоста редиректа — выполненная часть цепочки не пуста",
+			name: "a redirect host fall — the executed part of the chain is not empty",
 			script: func() map[string]*workerPageScript {
 				s := workerDeadDialScript(nil, "blog.example.net")
 				// the apex https answered 301 and led to a dead host: the dial
@@ -920,18 +920,18 @@ func TestWorkerDeadHostCutoffStrict(t *testing.T) {
 				t.Fatalf("ProcessDomain: %v", err)
 			}
 			if res.Cutoff {
-				t.Error("cutoff сработал без полной сигнатуры")
+				t.Error("the cutoff tripped without the full signature")
 			}
 			if got := log.countHost("blog.example.net"); got != 2 {
-				t.Errorf("загрузок blog: %d, ожидалось 2 — хвост обязан проверяться", got)
+				t.Errorf("blog fetches: %d, 2 expected — the tail must be checked", got)
 			}
 			if tc.checkApexDeadDialFalse && res.Subdomains[0].HTTPS.DeadDial {
-				t.Error("DeadDial у проверки, чей сбой не connect-фаза стартового хоста")
+				t.Error("DeadDial on a check whose failure is not the starting host connect phase")
 			}
 		})
 	}
 
-	t.Run("www нет в задаче — сигнатура не собрана", func(t *testing.T) {
+	t.Run("no www in the task — the signature is not assembled", func(t *testing.T) {
 		script := workerDeadDialScript(nil, "blog.example.net")
 		delete(script, "www.example.net")
 		fetch, log := workerFakeFetch(script)
@@ -944,10 +944,10 @@ func TestWorkerDeadHostCutoffStrict(t *testing.T) {
 			t.Fatalf("ProcessDomain: %v", err)
 		}
 		if res.Cutoff {
-			t.Error("cutoff без www в задаче")
+			t.Error("the cutoff without www in the task")
 		}
 		if got := log.countHost("blog.example.net"); got != 2 {
-			t.Errorf("загрузок blog: %d, ожидалось 2", got)
+			t.Errorf("blog fetches: %d, 2 expected", got)
 		}
 	})
 }
@@ -967,14 +967,14 @@ func TestWorkerDeadHostCutoffDisabled(t *testing.T) {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
 	if res.Cutoff {
-		t.Error("cutoff при выключенном флаге")
+		t.Error("the cutoff with the flag off")
 	}
 	if got := log.countHost("blog.example.net"); got != 2 {
-		t.Errorf("загрузок blog: %d, ожидалось 2 (проверка как раньше)", got)
+		t.Errorf("blog fetches: %d, 2 expected (the check as before)", got)
 	}
 	blog := &res.Subdomains[2]
 	if !blog.HTTPS.Available || blog.HTTPS.ErrClass != ErrNone || len(blog.Records) != 1 {
-		t.Errorf("blog: available=%v класс=%v записей=%d — живой субдомен обязан проверяться",
+		t.Errorf("blog: available=%v class=%v records=%d — a live subdomain must be checked",
 			blog.HTTPS.Available, blog.HTTPS.ErrClass, len(blog.Records))
 	}
 }
@@ -992,10 +992,10 @@ func TestWorkerDeadHostCutoffEmptyTail(t *testing.T) {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
 	if res.Cutoff {
-		t.Error("cutoff без хвоста — экономить нечего")
+		t.Error("the cutoff without a tail — nothing to save")
 	}
 	if got := log.countHost("example.net") + log.countHost("www.example.net"); got != 4 {
-		t.Errorf("загрузок головы: %d, ожидалось 4", got)
+		t.Errorf("head fetches: %d, 4 expected", got)
 	}
 }
 
@@ -1003,8 +1003,8 @@ func TestWorkerDeadHostCutoffEmptyTail(t *testing.T) {
 // a shell with a root container and a JS requirement gets SPA=true.
 func TestWorkerSPADetect(t *testing.T) {
 	spa := `<!DOCTYPE html><html><head><title>x</title></head>` +
-		`<body><noscript>Для работы сайта включите JavaScript</noscript><div id="root"></div></body></html>`
-	plain := "<html><body>" + strings.Repeat("Обычный сайт с большим количеством видимого текста. ", 20) + "</body></html>"
+		`<body><noscript>Please enable JavaScript to run this site</noscript><div id="root"></div></body></html>`
+	plain := "<html><body>" + strings.Repeat("An ordinary site with a lot of visible text. ", 20) + "</body></html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"spa.test":              {status: 200, body: spa},
 		"http://spa.test/":      {status: 200, body: spa},
@@ -1021,11 +1021,11 @@ func TestWorkerSPADetect(t *testing.T) {
 	}
 	// Both apex protocols — one body at one host+path → 1 record.
 	if len(res.Subdomains[0].Records) != 1 {
-		t.Fatalf("записей spa: %d", len(res.Subdomains[0].Records))
+		t.Fatalf("spa records: %d", len(res.Subdomains[0].Records))
 	}
 	rec := &res.Subdomains[0].Records[0]
 	if rec.SPA == nil || !rec.SPA.SPA {
-		t.Fatalf("SPA-флаг оболочки не поднят: %+v", rec.SPA)
+		t.Fatalf("the shell SPA flag is not raised: %+v", rec.SPA)
 	}
 	found := false
 	for _, r := range rec.SPA.Reasons {
@@ -1034,18 +1034,18 @@ func TestWorkerSPADetect(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("признак root_container не зафиксирован: %v", rec.SPA.Reasons)
+		t.Errorf("the root_container sign is not recorded: %v", rec.SPA.Reasons)
 	}
 	flat := &res.Subdomains[1].Records[0]
 	if flat.SPA == nil || flat.SPA.SPA {
-		t.Errorf("обычная страница помечена SPA: %+v", flat.SPA)
+		t.Errorf("an ordinary page marked SPA: %+v", flat.SPA)
 	}
 }
 
 // TestWorkerCookies — the final answer's cookies are parsed into the result
 // (spec 5.5 item 7 "cookies"), the final page's headers are carried by the record.
 func TestWorkerCookies(t *testing.T) {
-	page := "<html>магазин с сессией и достаточным текстом страницы</html>"
+	page := "<html>a shop with a session and enough page text</html>"
 	h := http.Header{}
 	h.Add("Content-Type", "text/html; charset=utf-8")
 	h.Add("Set-Cookie", "XSRF-TOKEN=abc; Path=/")
@@ -1065,17 +1065,17 @@ func TestWorkerCookies(t *testing.T) {
 	rec := &res.Subdomains[0].Records[0]
 	if len(rec.Cookies) != 2 ||
 		rec.Cookies[0].Name != "XSRF-TOKEN" || rec.Cookies[1].Name != "laravel_session" {
-		t.Errorf("cookies записи: %+v", rec.Cookies)
+		t.Errorf("the record cookies: %+v", rec.Cookies)
 	}
 	if got := rec.Header.Get("Content-Type"); got != "text/html; charset=utf-8" {
-		t.Errorf("Content-Type записи: %q", got)
+		t.Errorf("the record Content-Type: %q", got)
 	}
 	// A scenario without a TLS connection — the record's TLSInfo is nil (not an error, §8).
 	if rec.TLS != nil {
-		t.Errorf("TLS без TLS-соединения: %+v", rec.TLS)
+		t.Errorf("TLS without a TLS connection: %+v", rec.TLS)
 	}
 	if rec.Charset != "utf-8" {
-		t.Errorf("кодировка: %q", rec.Charset)
+		t.Errorf("the charset: %q", rec.Charset)
 	}
 }
 
@@ -1097,13 +1097,13 @@ func TestWorkerContextCancel(t *testing.T) {
 		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")},
 	})
 	if err == nil {
-		t.Fatal("ожидалась ошибка отменённого эпизода")
+		t.Fatal("a cancelled episode error expected")
 	}
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка не про отмену: %v", err)
+		t.Errorf("the error is not about a cancellation: %v", err)
 	}
 	if res != nil {
-		t.Error("отменённый эпизод вернул результат")
+		t.Error("the cancelled episode returned a result")
 	}
 }
 
@@ -1115,41 +1115,41 @@ func TestWorkerTaskValidation(t *testing.T) {
 		name string
 		task queue.HTTPTask
 	}{
-		{"без имени", queue.HTTPTask{Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}},
-		{"без субдоменов", queue.HTTPTask{Name: "a.test"}},
-		{"дубликат id", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
+		{"no name", queue.HTTPTask{Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}},
+		{"no subdomains", queue.HTTPTask{Name: "a.test"}},
+		{"a duplicate id", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
 			workerSubMsg(1, "www"), workerSubMsg(1, "www"),
 		}}},
-		{"id вне диапазона", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
+		{"an id out of range", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
 			{SubdomainID: 63, Label: "x", Addrs: []string{"192.0.2.1"}},
 		}}},
-		{"метка с точкой", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
+		{"a label with a dot", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
 			{SubdomainID: 2, Label: "a.b", Addrs: []string{"192.0.2.1"}},
 		}}},
-		{"кривой адрес", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
-			{SubdomainID: 2, Label: "x", Addrs: []string{"не-адрес"}},
+		{"a broken address", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
+			{SubdomainID: 2, Label: "x", Addrs: []string{"not-an-address"}},
 		}}},
-		{"без адресов", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
+		{"no addresses", queue.HTTPTask{Name: "a.test", Subdomains: []queue.HTTPSubdomain{
 			{SubdomainID: 2, Label: "x"},
 		}}},
 	}
 	for _, c := range cases {
 		if _, err := w.ProcessDomain(context.Background(), c.task); err == nil {
-			t.Errorf("%s: задача принята", c.name)
+			t.Errorf("%s: the task was accepted", c.name)
 		}
 	}
 	if _, err := New(nil, Options{}); err == nil {
-		t.Error("New без шва загрузки прошёл")
+		t.Error("New without the fetch seam passed")
 	}
 	if _, err := New(workerFakeFetchNoop(), Options{}); err == nil {
-		t.Error("New без хранилища контента прошёл (ранний Put T-147 обязателен)")
+		t.Error("New without the content store passed (the early Put T-147 is required)")
 	}
 }
 
 // workerFakeFetchNoop — a minimal load seam for the constructor's checks.
 func workerFakeFetchNoop() FetchFunc {
 	return func(context.Context, httpfetch.FetchRequest, httpfetch.ChainOptions) (*httpfetch.ChainResult, error) {
-		return nil, errors.New("нет сценария")
+		return nil, errors.New("no scenario")
 	}
 }
 
@@ -1227,7 +1227,7 @@ func workerDelivery(t *testing.T, task queue.HTTPTask) queue.Delivery {
 // Options.OnResult (the T-058 write's connection point, before the XACK) → Ack;
 // a ctx cancellation — a clean nil return.
 func TestWorkerRunSmoke(t *testing.T) {
-	body := "<html>" + strings.Repeat("страница для дымового теста цикла воркера http ", 30) + "</html>"
+	body := "<html>" + strings.Repeat("a page for the http worker loop smoke test ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"smoke.test":         {status: 200, body: body},
 		"http://smoke.test/": {status: 200, body: body},
@@ -1260,7 +1260,7 @@ func TestWorkerRunSmoke(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatal("доставка не подтверждена за отведённое время")
+			t.Fatal("the delivery was not acknowledged within the allotted time")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -1269,7 +1269,7 @@ func TestWorkerRunSmoke(t *testing.T) {
 		t.Errorf("OnResult: zone=%d name=%q", gotZone, gotName)
 	}
 	if records != 1 {
-		t.Errorf("OnResult: записей %d, ожидалась 1 (одно тело — один сайт)", records)
+		t.Errorf("OnResult: %d records, 1 expected (one body — one site)", records)
 	}
 	mu.Unlock()
 
@@ -1277,13 +1277,13 @@ func TestWorkerRunSmoke(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if q.ackedCount() != 1 {
-		t.Errorf("подтверждений %d, ожидалось 1", q.ackedCount())
+		t.Errorf("%d acknowledgments, 1 expected", q.ackedCount())
 	}
 }
 
@@ -1291,7 +1291,7 @@ func TestWorkerRunSmoke(t *testing.T) {
 // T-058 write) — a delivery without an XACK: it will return with a repeated delivery
 // (at-least-once, spec 3.4).
 func TestWorkerRunOnResultError(t *testing.T) {
-	body := "<html>" + strings.Repeat("страница для проверки отказа обработки результата ", 30) + "</html>"
+	body := "<html>" + strings.Repeat("a page for the result processing failure check ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"err.test":         {status: 200, body: body},
 		"http://err.test/": {status: 200, body: body},
@@ -1302,7 +1302,7 @@ func TestWorkerRunOnResultError(t *testing.T) {
 		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")},
 	})}}
 	opts := Options{OnResult: func(context.Context, *DomainResult) error {
-		return errors.New("БД недоступна")
+		return errors.New("the DB is unavailable")
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1314,21 +1314,21 @@ func TestWorkerRunOnResultError(t *testing.T) {
 	for q.consumeCount() < 2 {
 		select {
 		case <-deadline:
-			t.Fatal("цикл не дошёл до повторного чтения")
+			t.Fatal("the loop did not reach the repeated read")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
 	if q.ackedCount() != 0 {
-		t.Error("доставка подтверждена при ошибке обработчика результата")
+		t.Error("the delivery was acknowledged at a result handler error")
 	}
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 }
 
@@ -1417,7 +1417,7 @@ func TestWorkerRunBackoffOnFailures(t *testing.T) {
 			}
 			select {
 			case <-deadline:
-				t.Fatalf("чтений %d, ждалось ≥%d — предохранитель заблокировал цикл", got, n)
+				t.Fatalf("%d reads, wanted ≥%d — the fuse blocked the loop", got, n)
 			case <-time.After(2 * time.Millisecond):
 			}
 		}
@@ -1426,27 +1426,27 @@ func TestWorkerRunBackoffOnFailures(t *testing.T) {
 	time.Sleep(450 * time.Millisecond)
 	first := q.consumeCount()
 	if first > 10 {
-		t.Errorf("чтений %d за 450 мс — предохранитель не душит темп (ждалось ≤10)", first)
+		t.Errorf("%d reads in 450 ms — the fuse does not throttle the rate (wanted ≤10)", first)
 	}
 
 	// The pauses double: the next interval adds a few reads,
 	// not tens. The growth between the two measurements — no more than a couple of reads.
 	time.Sleep(450 * time.Millisecond)
 	if grew := q.consumeCount() - first; grew > 2 {
-		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией неудач", grew)
+		t.Errorf("%d more reads in the next 450 ms — the pause does not grow with the failure series", grew)
 	}
 
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if q.ackedCount() != 0 {
-		t.Errorf("подтверждений %d при ядовитых доставках", q.ackedCount())
+		t.Errorf("%d acknowledgments with poison deliveries", q.ackedCount())
 	}
 }
 
@@ -1547,7 +1547,7 @@ func TestWorkerRunInfraPause(t *testing.T) {
 	t.Cleanup(func() { workerFailWaitBase = old })
 
 	infraErr := &queue.InfraError{
-		Op:  "publish в q:analyze",
+		Op:  "publish to q:analyze",
 		Err: errors.New("OOM command not allowed when used memory > 'maxmemory'"),
 	}
 	var failMu sync.Mutex
@@ -1561,7 +1561,7 @@ func TestWorkerRunInfraPause(t *testing.T) {
 		return nil
 	}
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
-		"infra.test": {status: 200, body: "<html>страница инфраструктурной паузы</html>"},
+		"infra.test": {status: 200, body: "<html>the infra pause page</html>"},
 	})
 	// OnResult is set in the Run options (not New): the loop passes its opts
 	// into processDelivery — as the cmd/http-worker build does.
@@ -1584,16 +1584,16 @@ func TestWorkerRunInfraPause(t *testing.T) {
 	for q.consumeCount() == 0 {
 		select {
 		case <-deadline:
-			t.Fatal("первое чтение q:http не состоялось")
+			t.Fatal("the first q:http read did not happen")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
 	time.Sleep(300 * time.Millisecond)
 	if n := q.consumeCount(); n > 6 {
-		t.Errorf("чтений %d за 300 мс инфраструктурной паузы — чтение не остановлено (ждалось ≤6)", n)
+		t.Errorf("%d reads in the 300 ms infra pause — the reading is not stopped (wanted ≤6)", n)
 	}
 	if q.ackedCount() != 0 {
-		t.Errorf("подтверждений %d при падающей публикации", q.ackedCount())
+		t.Errorf("%d acknowledgments with a failing publication", q.ackedCount())
 	}
 
 	// The write recovered (the memory drainage in the incident): the reading
@@ -1606,7 +1606,7 @@ func TestWorkerRunInfraPause(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatalf("после восстановления записи подтверждено %d, хочу ≥2", q.ackedCount())
+			t.Fatalf("after the write recovery %d acknowledged, want ≥2", q.ackedCount())
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -1615,10 +1615,10 @@ func TestWorkerRunInfraPause(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 }
 
@@ -1632,8 +1632,8 @@ func TestWorkerRunInfraPause(t *testing.T) {
 // (A panic in the load seam lives in the PerDomain goroutines — this
 // recover never covered those; not modeled here.)
 func TestWorkerRunPanicRecovered(t *testing.T) {
-	panicBody := "<html>" + strings.Repeat("страница паникующей доставки ", 30) + "</html>"
-	okBody := "<html>" + strings.Repeat("страница здоровой доставки цикла ", 30) + "</html>"
+	panicBody := "<html>" + strings.Repeat("a panicking delivery page ", 30) + "</html>"
+	okBody := "<html>" + strings.Repeat("a healthy loop delivery page ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"panic.test": {status: 200, body: panicBody},
 		"ok.test":    {status: 200, body: okBody},
@@ -1663,7 +1663,7 @@ func TestWorkerRunPanicRecovered(t *testing.T) {
 			case panicHit <- struct{}{}:
 			default:
 			}
-			panic("обработка результата упала: запись в БД")
+			panic("the result processing fell: the DB write")
 		}
 		return nil
 	}}
@@ -1677,7 +1677,7 @@ func TestWorkerRunPanicRecovered(t *testing.T) {
 	case <-panicHit:
 	case <-deadline:
 		cancel()
-		t.Fatal("паникующая доставка не дошла до обработки результата")
+		t.Fatal("the panicking delivery did not reach the result processing")
 	}
 
 	// The neighboring delivery must finish and be acknowledged despite
@@ -1686,7 +1686,7 @@ func TestWorkerRunPanicRecovered(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatal("XACK здоровой доставки не наступил (паника убила цикл?)")
+			t.Fatal("the healthy delivery XACK did not happen (did the panic kill the loop?)")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -1694,13 +1694,13 @@ func TestWorkerRunPanicRecovered(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if acked := q.ackedSnapshot(); len(acked) != 1 || acked[0] != "e2" {
-		t.Errorf("XACK = %v, нужен только e2 (паникующая e1 — без XACK)", acked)
+		t.Errorf("XACK = %v, only e2 needed (the panicking e1 — without an XACK)", acked)
 	}
 }
 
@@ -1735,7 +1735,7 @@ func (q *workerPanicQueue) Consume(_ context.Context, _, _, _ string, n int) ([]
 }
 
 func (q *workerPanicQueue) Ack(context.Context, string, string, ...string) error {
-	panic("workerPanicQueue: Ack недостижим — паникующие доставки не подтверждаются")
+	panic("workerPanicQueue: Ack is unreachable — panicking deliveries are not acknowledged")
 }
 
 func (q *workerPanicQueue) consumeCount() int {
@@ -1756,7 +1756,7 @@ func TestWorkerRunPanicBackoff(t *testing.T) {
 	workerFailWaitBase = 100 * time.Millisecond
 	t.Cleanup(func() { workerFailWaitBase = old })
 
-	panicBody := "<html>" + strings.Repeat("страница серии паник цикла ", 30) + "</html>"
+	panicBody := "<html>" + strings.Repeat("a loop panic series page ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"panic.test": {status: 200, body: panicBody},
 	})
@@ -1779,7 +1779,7 @@ func TestWorkerRunPanicBackoff(t *testing.T) {
 		case panicHit <- struct{}{}:
 		default:
 		}
-		panic("обработка результата упала: запись в БД")
+		panic("the result processing fell: the DB write")
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1792,7 +1792,7 @@ func TestWorkerRunPanicBackoff(t *testing.T) {
 	select {
 	case <-panicHit:
 	case <-time.After(5 * time.Second):
-		t.Fatal("паникующая доставка не дошла до обработки результата — тест ничего не проверил")
+		t.Fatal("the panicking delivery did not reach the result processing — the test checked nothing")
 	}
 	deadline := time.After(5 * time.Second)
 	waitCount := func(n int) int {
@@ -1803,7 +1803,7 @@ func TestWorkerRunPanicBackoff(t *testing.T) {
 			}
 			select {
 			case <-deadline:
-				t.Fatalf("чтений %d, ждалось ≥%d — предохранитель заблокировал цикл", got, n)
+				t.Fatalf("%d reads, wanted ≥%d — the fuse blocked the loop", got, n)
 			case <-time.After(2 * time.Millisecond):
 			}
 		}
@@ -1812,21 +1812,21 @@ func TestWorkerRunPanicBackoff(t *testing.T) {
 	time.Sleep(450 * time.Millisecond)
 	first := q.consumeCount()
 	if first > 10 {
-		t.Errorf("чтений %d за 450 мс — паники не душат темп (ждалось ≤10)", first)
+		t.Errorf("%d reads in 450 ms — the panics do not throttle the rate (wanted ≤10)", first)
 	}
 	time.Sleep(450 * time.Millisecond)
 	if grew := q.consumeCount() - first; grew > 2 {
-		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией паник", grew)
+		t.Errorf("%d more reads in the next 450 ms — the pause does not grow with the panic series", grew)
 	}
 
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 }
 
@@ -1841,10 +1841,10 @@ func TestWorkerRunPanicBackoff(t *testing.T) {
 func TestWorkerRunSlidingConsumption(t *testing.T) {
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
 		"block.test": {blockCtx: true},
-		"f1.test":    {status: 200, body: "<html>страница 1 скользящего потребления</html>"},
-		"f2.test":    {status: 200, body: "<html>страница 2 скользящего потребления</html>"},
-		"f3.test":    {status: 200, body: "<html>страница 3 скользящего потребления</html>"},
-		"f4.test":    {status: 200, body: "<html>страница 4 скользящего потребления</html>"},
+		"f1.test":    {status: 200, body: "<html>the sliding consumption page 1</html>"},
+		"f2.test":    {status: 200, body: "<html>the sliding consumption page 2</html>"},
+		"f3.test":    {status: 200, body: "<html>the sliding consumption page 3</html>"},
+		"f4.test":    {status: 200, body: "<html>the sliding consumption page 4</html>"},
 	})
 	w := workerWorker(t, fetch, nil)
 	task := func(id int64, name string) queue.Delivery {
@@ -1869,7 +1869,7 @@ func TestWorkerRunSlidingConsumption(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatal("блокирующая доставка не дошла до сети")
+			t.Fatal("the blocking delivery did not reach the network")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -1877,7 +1877,7 @@ func TestWorkerRunSlidingConsumption(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatalf("скользящее потребление не подхватило хвост пачки: подтверждено %d из 4 быстрых", q.ackedCount())
+			t.Fatalf("the sliding consumption did not pick up the batch tail: %d of the 4 fast ones acknowledged", q.ackedCount())
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -1886,16 +1886,16 @@ func TestWorkerRunSlidingConsumption(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	// The blocking delivery is not acknowledged — it will return with a repeated
 	// delivery (at-least-once, spec 3.4), the fast ones are acknowledged exactly
 	// once each.
 	if got := q.ackedCount(); got != 4 {
-		t.Errorf("подтверждений %d, ожидалось 4 (блокирующая — без XACK)", got)
+		t.Errorf("%d acknowledgments, 4 expected (the blocking one — without an XACK)", got)
 	}
 }
 
@@ -1910,8 +1910,8 @@ func TestWorkerRunCancelKeepsBufferUnacked(t *testing.T) {
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
 		"block1.test": {blockCtx: true},
 		"block2.test": {blockCtx: true},
-		"buf1.test":   {status: 200, body: "<html>буферная доставка 1</html>"},
-		"buf2.test":   {status: 200, body: "<html>буферная доставка 2</html>"},
+		"buf1.test":   {status: 200, body: "<html>the buffered delivery 1</html>"},
+		"buf2.test":   {status: 200, body: "<html>the buffered delivery 2</html>"},
 	})
 	w := workerWorker(t, fetch, nil)
 	task := func(id int64, name string) queue.Delivery {
@@ -1940,33 +1940,33 @@ func TestWorkerRunCancelKeepsBufferUnacked(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatal("блокирующиеся доставки не дошли до сети")
+			t.Fatal("the blocking deliveries did not reach the network")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
 	time.Sleep(50 * time.Millisecond) // the loop has time to read the chunk and hit the slots
 
 	if got := log.countHost("buf1.test") + log.countHost("buf2.test"); got != 0 {
-		t.Errorf("буферные доставки запущены при занятых слотах: обращений %d", got)
+		t.Errorf("the buffered deliveries started with busy slots: %d calls", got)
 	}
 	if q.ackedCount() != 0 {
-		t.Errorf("подтверждений %d до отмены — не должно быть", q.ackedCount())
+		t.Errorf("%d acknowledgments before the cancellation — there must be none", q.ackedCount())
 	}
 
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if got := log.countHost("buf1.test") + log.countHost("buf2.test"); got != 0 {
-		t.Errorf("буферные доставки запущены после отмены: обращений %d", got)
+		t.Errorf("the buffered deliveries started after the cancellation: %d calls", got)
 	}
 	if q.ackedCount() != 0 {
-		t.Errorf("подтверждений %d — не начатые доставки обязаны вернуться очереди", q.ackedCount())
+		t.Errorf("%d acknowledgments — the unstarted deliveries must return to the queue", q.ackedCount())
 	}
 }
 
@@ -1978,23 +1978,23 @@ func TestWorkerRunCancelKeepsBufferUnacked(t *testing.T) {
 func TestWorkerOptionsDefaults(t *testing.T) {
 	o := Options{}.withDefaults()
 	if o.Concurrency != DefaultConcurrency || o.Consume != DefaultConsume || o.PerDomain != DefaultPerDomain {
-		t.Errorf("withDefaults: concurrency=%d consume=%d per_domain=%d, дефолты %d/%d/%d",
+		t.Errorf("withDefaults: concurrency=%d consume=%d per_domain=%d, the defaults %d/%d/%d",
 			o.Concurrency, o.Consume, o.PerDomain, DefaultConcurrency, DefaultConsume, DefaultPerDomain)
 	}
 	cfg := config.Default()
 	if cfg.HTTP.TaskConcurrency != DefaultConcurrency {
-		t.Errorf("http.task_concurrency=%d расходится с DefaultConcurrency=%d", cfg.HTTP.TaskConcurrency, DefaultConcurrency)
+		t.Errorf("http.task_concurrency=%d diverges from DefaultConcurrency=%d", cfg.HTTP.TaskConcurrency, DefaultConcurrency)
 	}
 	if cfg.HTTP.TaskConsume != DefaultConsume {
-		t.Errorf("http.task_consume=%d расходится с DefaultConsume=%d", cfg.HTTP.TaskConsume, DefaultConsume)
+		t.Errorf("http.task_consume=%d diverges from DefaultConsume=%d", cfg.HTTP.TaskConsume, DefaultConsume)
 	}
 	if cfg.HTTP.TaskPerDomain != DefaultPerDomain {
-		t.Errorf("http.task_per_domain=%d расходится с DefaultPerDomain=%d", cfg.HTTP.TaskPerDomain, DefaultPerDomain)
+		t.Errorf("http.task_per_domain=%d diverges from DefaultPerDomain=%d", cfg.HTTP.TaskPerDomain, DefaultPerDomain)
 	}
 	// Explicit values are not overwritten by the defaults.
 	o = Options{Concurrency: 3, Consume: 2, PerDomain: 1}.withDefaults()
 	if o.Concurrency != 3 || o.Consume != 2 || o.PerDomain != 1 {
-		t.Errorf("withDefaults перетёр явные значения: %+v", o)
+		t.Errorf("withDefaults overwrote the explicit values: %+v", o)
 	}
 }
 
@@ -2006,7 +2006,7 @@ func TestWorkerOptionsDefaults(t *testing.T) {
 func TestWorkerRunCancelWhileWaitingSlot(t *testing.T) {
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
 		"block.test": {blockCtx: true},
-		"next.test":  {status: 200, body: "<html>страница второй доставки окна</html>"},
+		"next.test":  {status: 200, body: "<html>the window second delivery page</html>"},
 	})
 	w := workerWorker(t, fetch, nil)
 	q := &workerFakeQueue{deliveries: []queue.Delivery{
@@ -2029,7 +2029,7 @@ func TestWorkerRunCancelWhileWaitingSlot(t *testing.T) {
 	for log.countHost("block.test") == 0 {
 		select {
 		case <-deadline:
-			t.Fatal("первая доставка не дошла до сети")
+			t.Fatal("the first delivery did not reach the network")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -2038,16 +2038,16 @@ func TestWorkerRunCancelWhileWaitingSlot(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run после отмены: %v", err)
+			t.Errorf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if got := log.countHost("next.test"); got != 0 {
-		t.Errorf("доставка запущена после отмены ctx: обращений к next.test %d", got)
+		t.Errorf("a delivery started after the ctx cancellation: %d next.test calls", got)
 	}
 	if q.ackedCount() != 0 {
-		t.Errorf("подтверждений %d — окно обязано вернуться очереди", q.ackedCount())
+		t.Errorf("%d acknowledgments — the window must return to the queue", q.ackedCount())
 	}
 }
 
@@ -2208,7 +2208,7 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 func TestWorkerDNSLookup(t *testing.T) {
-	t.Run("A и AAAA при ipv6", func(t *testing.T) {
+	t.Run("A and AAAA with ipv6", func(t *testing.T) {
 		d := &workerFakeDNS{
 			a:    []netip.Addr{workerAddr(t, "192.0.2.10")},
 			aaaa: []netip.Addr{workerAddr(t, "2001:db8::1")},
@@ -2218,69 +2218,69 @@ func TestWorkerDNSLookup(t *testing.T) {
 			t.Fatalf("LookupNetIP: %v", err)
 		}
 		if len(got) != 2 || got[0].String() != "192.0.2.10" || got[1].String() != "2001:db8::1" {
-			t.Errorf("адреса: %v (порядок стабилен: A, затем AAAA — T-101)", got)
+			t.Errorf("the addresses: %v (the order is stable: A, then AAAA — T-101)", got)
 		}
 		// The polling is concurrent (T-101): the questions' arrival order at
 		// the resolver is non-deterministic — both types are checked as
 		// a set, not a sequence (two different of the two
 		// possible = exactly A and AAAA).
 		if asked := d.asked(); len(asked) != 2 || asked[0] == asked[1] {
-			t.Errorf("вопросы: %v (ожидались A и AAAA в любом порядке)", asked)
+			t.Errorf("the queries: %v (A and AAAA expected in any order)", asked)
 		}
 	})
-	t.Run("только A без ipv6", func(t *testing.T) {
+	t.Run("A only without ipv6", func(t *testing.T) {
 		d := &workerFakeDNS{a: []netip.Addr{workerAddr(t, "192.0.2.10")}}
 		got, err := NewDNSLookup(d, false).LookupNetIP(context.Background(), "redirect.example")
 		if err != nil {
 			t.Fatalf("LookupNetIP: %v", err)
 		}
 		if len(got) != 1 || got[0].String() != "192.0.2.10" {
-			t.Errorf("адреса: %v", got)
+			t.Errorf("the addresses: %v", got)
 		}
 		if asked := d.asked(); len(asked) != 1 || asked[0] != dns.TypeA {
-			t.Errorf("вопросы: %v (AAAA отключён конфигом)", asked)
+			t.Errorf("the queries: %v (AAAA is off by the config)", asked)
 		}
 	})
-	t.Run("CNAME в ответе отфильтрован", func(t *testing.T) {
+	t.Run("a CNAME in the answer is filtered", func(t *testing.T) {
 		d := &workerFakeDNS{a: []netip.Addr{workerAddr(t, "192.0.2.11")}, withCNAME: true}
 		got, err := NewDNSLookup(d, false).LookupNetIP(context.Background(), "alias.example")
 		if err != nil {
 			t.Fatalf("LookupNetIP: %v", err)
 		}
 		if len(got) != 1 || got[0].String() != "192.0.2.11" {
-			t.Errorf("адреса: %v (CNAME не должен попасть в итог)", got)
+			t.Errorf("the addresses: %v (a CNAME must not get into the outcome)", got)
 		}
 	})
-	t.Run("IP-литерал без обмена", func(t *testing.T) {
+	t.Run("an IP literal without exchanges", func(t *testing.T) {
 		d := &workerFakeDNS{}
 		got, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "192.0.2.7")
 		if err != nil {
 			t.Fatalf("LookupNetIP: %v", err)
 		}
 		if len(got) != 1 || got[0].String() != "192.0.2.7" {
-			t.Errorf("адреса: %v", got)
+			t.Errorf("the addresses: %v", got)
 		}
 		if len(d.asked()) != 0 {
-			t.Errorf("резолвер опрошен для IP-литерала: %v", d.asked())
+			t.Errorf("the resolver was asked for an IP literal: %v", d.asked())
 		}
 	})
-	t.Run("сбой AAAA не роняет резолв с живым A", func(t *testing.T) {
+	t.Run("an AAAA failure does not fail the resolve with a live A", func(t *testing.T) {
 		d := &workerFakeDNS{
 			a:       []netip.Addr{workerAddr(t, "192.0.2.10")},
 			aaaaErr: errors.New("servfail"),
 		}
 		got, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "mixed.example")
 		if err != nil {
-			t.Fatalf("LookupNetIP: %v (сбой AAAA при живом A — резолв работает)", err)
+			t.Fatalf("LookupNetIP: %v (an AAAA failure with a live A — the resolve works)", err)
 		}
 		if len(got) != 1 || got[0].String() != "192.0.2.10" {
-			t.Errorf("адреса: %v (ожидался только A)", got)
+			t.Errorf("the addresses: %v (only A expected)", got)
 		}
 		if asked := d.asked(); len(asked) != 2 {
-			t.Errorf("вопросы: %v (оба типа опрошены)", asked)
+			t.Errorf("the queries: %v (both types were asked)", asked)
 		}
 	})
-	t.Run("сбой A при живом AAAA — адреса AAAA", func(t *testing.T) {
+	t.Run("an A failure with a live AAAA — the AAAA addresses", func(t *testing.T) {
 		d := &workerFakeDNS{
 			aErr: errors.New("servfail"),
 			aaaa: []netip.Addr{workerAddr(t, "2001:db8::2")},
@@ -2290,47 +2290,47 @@ func TestWorkerDNSLookup(t *testing.T) {
 			t.Fatalf("LookupNetIP: %v", err)
 		}
 		if len(got) != 1 || got[0].String() != "2001:db8::2" {
-			t.Errorf("адреса: %v (ожидался только AAAA)", got)
+			t.Errorf("the addresses: %v (only AAAA expected)", got)
 		}
 	})
-	t.Run("оба типа упали — ошибка", func(t *testing.T) {
-		d := &workerFakeDNS{err: errors.New("сеть")}
+	t.Run("both types failed — an error", func(t *testing.T) {
+		d := &workerFakeDNS{err: errors.New("the network")}
 		if _, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "down2.example"); err == nil {
-			t.Error("резолв без единого ответа прошёл как успех")
+			t.Error("the resolve without a single answer passed as a success")
 		}
 	})
-	t.Run("NXDOMAIN — ошибка", func(t *testing.T) {
+	t.Run("NXDOMAIN — an error", func(t *testing.T) {
 		d := &workerFakeDNS{rcode: dnsclient.RCodeNXDOMAIN}
 		if _, err := NewDNSLookup(d, false).LookupNetIP(context.Background(), "nx.example"); err == nil {
-			t.Error("NXDOMAIN принят как успех")
+			t.Error("NXDOMAIN accepted as a success")
 		}
 	})
-	t.Run("пустой ответ — ошибка", func(t *testing.T) {
+	t.Run("an empty answer — an error", func(t *testing.T) {
 		d := &workerFakeDNS{}
 		if _, err := NewDNSLookup(d, false).LookupNetIP(context.Background(), "empty.example"); err == nil {
-			t.Error("пустой ответ принят как успех")
+			t.Error("an empty answer accepted as a success")
 		}
 	})
-	t.Run("сбой резолвера — ошибка", func(t *testing.T) {
-		d := &workerFakeDNS{err: errors.New("сеть")}
+	t.Run("a resolver failure — an error", func(t *testing.T) {
+		d := &workerFakeDNS{err: errors.New("the network")}
 		if _, err := NewDNSLookup(d, false).LookupNetIP(context.Background(), "down.example"); err == nil {
-			t.Error("сбой резолвера принят как успех")
+			t.Error("a resolver failure accepted as a success")
 		}
 	})
-	t.Run("отказ обоих — первая по порядку типов ошибка (A)", func(t *testing.T) {
+	t.Run("both refused — the first error by the type order (A)", func(t *testing.T) {
 		d := &workerFakeDNS{
 			aErr:    errors.New("a-servfail"),
 			aaaaErr: errors.New("aaaa-servfail"),
 		}
 		_, err := NewDNSLookup(d, true).LookupNetIP(context.Background(), "both-down.example")
 		if err == nil {
-			t.Fatal("резолв без единого ответа прошёл как успех")
+			t.Fatal("the resolve without a single answer passed as a success")
 		}
 		if !strings.Contains(err.Error(), "a-servfail") {
-			t.Errorf("ошибка: %v (детерминизм T-101 — ошибка A, ранняя по порядку типов, а не прибывшая первой)", err)
+			t.Errorf("the error: %v (the T-101 determinism — the A error, earlier by the type order, not the first to arrive)", err)
 		}
 	})
-	t.Run("параллельный опрос — латентность max, не сумма", func(t *testing.T) {
+	t.Run("a parallel poll — the max latency, not the sum", func(t *testing.T) {
 		// A slow A + a fast AAAA: at a sequential polling
 		// the exchanges' intervals do not overlap and the delays' sum is eaten
 		// entirely; the concurrent one — the exchanges overlap, the overall time ≈
@@ -2356,23 +2356,23 @@ func TestWorkerDNSLookup(t *testing.T) {
 		// The outcome's order is stable regardless of the completion: A first,
 		// even though it answered longer.
 		if len(got) != 2 || got[0].String() != "192.0.2.20" || got[1].String() != "2001:db8::20" {
-			t.Errorf("адреса: %v (порядок A, затем AAAA — как при последовательном опросе)", got)
+			t.Errorf("the addresses: %v (the order A, then AAAA — as with a sequential poll)", got)
 		}
 		// AAAA was asked while A was still in flight — the exchanges are concurrent.
 		if !(d.entered[dns.TypeAAAA].Before(d.exited[dns.TypeA])) {
-			t.Errorf("обмены не перекрываются: A [%v..%v], AAAA [%v..%v] — опрос последовательный",
+			t.Errorf("the exchanges do not overlap: A [%v..%v], AAAA [%v..%v] — the poll is sequential",
 				d.entered[dns.TypeA], d.exited[dns.TypeA], d.entered[dns.TypeAAAA], d.exited[dns.TypeAAAA])
 		}
 		// The overall time ≈ max(A, AAAA), not the sum: not faster than the slow
 		// type (it must finish) and with headroom below the sum.
 		if elapsed < aDelay {
-			t.Errorf("время %v < задержки медленного типа %v — быстрый ответ не ждёт медленного соседа... или фейка", elapsed, aDelay)
+			t.Errorf("the time %v < the slow type delay %v — the fast answer does not wait for the slow neighbor... or the fake", elapsed, aDelay)
 		}
 		if sum := aDelay + aaaaDelay; elapsed >= sum {
-			t.Errorf("время %v ≥ суммы задержек %v — опрос последовательный", elapsed, sum)
+			t.Errorf("the time %v ≥ the delay sum %v — the poll is sequential", elapsed, sum)
 		}
 	})
-	t.Run("отмена ctx — оба обмена отменяются", func(t *testing.T) {
+	t.Run("the ctx cancellation — both exchanges are cancelled", func(t *testing.T) {
 		d := &workerBlockDNS{}
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
@@ -2383,18 +2383,18 @@ func TestWorkerDNSLookup(t *testing.T) {
 		_, err := NewDNSLookup(d, true).LookupNetIP(ctx, "block.example")
 		elapsed := time.Since(start)
 		if err == nil {
-			t.Fatal("отменённый резолв прошёл как успех")
+			t.Fatal("the cancelled resolve passed as a success")
 		}
 		if !errors.Is(err, context.Canceled) {
-			t.Errorf("ошибка: %v (ожидалась отмена ctx, завёрнутая в сбой обмена)", err)
+			t.Errorf("the error: %v (the ctx cancellation expected, wrapped into an exchange failure)", err)
 		}
 		if n := d.asked(); n != 2 {
-			t.Errorf("обменов %d — опрошены оба типа с общим ctx", n)
+			t.Errorf("%d exchanges — both types were asked with the shared ctx", n)
 		}
 		// The return — by the cancellation, not a foreign timeout: with headroom below
 		// a second against the dnsclient timeouts (T-035).
 		if elapsed > time.Second {
-			t.Errorf("время %v — резолв не отменился сразу", elapsed)
+			t.Errorf("the time %v — the resolve did not cancel immediately", elapsed)
 		}
 	})
 }

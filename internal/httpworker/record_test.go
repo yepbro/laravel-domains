@@ -278,15 +278,15 @@ func (p *recordFakePool) recordSeedDomain(zone int16, id int64, status model.Sta
 }
 
 func (p *recordFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("recordFakePool: CopyFrom не должен вызываться (INSERT — unnest-пачкой)")
+	return 0, errors.New("recordFakePool: CopyFrom must not be called (the INSERT is done by an unnest chunk)")
 }
 
 func (p *recordFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("recordFakePool: Exec вне транзакции")
+	return pgconn.CommandTag{}, errors.New("recordFakePool: Exec outside a transaction")
 }
 
 func (p *recordFakePool) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("recordFakePool: Query вне транзакции")
+	return nil, errors.New("recordFakePool: Query outside a transaction")
 }
 
 func (p *recordFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -363,7 +363,7 @@ func (r recordStateRow) Scan(dest ...any) error {
 		return r.err
 	}
 	if len(dest) != 2 {
-		return fmt.Errorf("recordStateRow: приёмников %d, нужно 2", len(dest))
+		return fmt.Errorf("recordStateRow: %d destinations, 2 needed", len(dest))
 	}
 	*dest[0].(*int16) = r.status
 	*dest[1].(*int16) = r.state
@@ -377,7 +377,7 @@ func (t *recordFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	if sql != recordSelectStateSQL {
-		return recordStateRow{err: fmt.Errorf("recordFakePool: неожидаемый QueryRow: %s", sql)}
+		return recordStateRow{err: fmt.Errorf("recordFakePool: an unexpected QueryRow: %s", sql)}
 	}
 	key := recordDomainKey{zone: args[0].(int16), id: args[1].(int64)}
 	d, ok := t.pool.domains[key]
@@ -439,7 +439,7 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	case recordInsertSQL:
 		if len(args) != 18 {
-			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: INSERT: параметров %d, нужно 18", len(args))
+			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: INSERT: %d parameters, 18 needed", len(args))
 		}
 		zone := args[0].([]int16)
 		domain := args[1].([]int64)
@@ -547,7 +547,7 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	default:
 		if !strings.HasPrefix(sql, recordDelRefSQLPrefix) {
-			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: неожидаемый SQL: %s", sql)
+			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: an unexpected SQL: %s", sql)
 		}
 		// sqlMetaDelRef (SwapRefTx, T-044): −1 with the refcount > 0 guard.
 		var h content.Hash
@@ -568,7 +568,7 @@ func (t *recordFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	if sql != recordDeleteSQL {
-		return nil, fmt.Errorf("recordFakePool: неожидаемый SQL: %s", sql)
+		return nil, fmt.Errorf("recordFakePool: an unexpected SQL: %s", sql)
 	}
 	if t.pool.deleteErr != nil {
 		return nil, t.pool.deleteErr
@@ -640,10 +640,10 @@ func (r *recordFakeRows) Next() bool {
 
 func (r *recordFakeRows) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) {
-		return errors.New("recordFakeRows: Scan без Next")
+		return errors.New("recordFakeRows: Scan without Next")
 	}
 	if len(dest) != 1 {
-		return fmt.Errorf("recordFakeRows: приёмников %d, колонка одна (content_hash)", len(dest))
+		return fmt.Errorf("recordFakeRows: %d destinations, one column (content_hash)", len(dest))
 	}
 	switch d := dest[0].(type) {
 	case *[]byte:
@@ -653,7 +653,7 @@ func (r *recordFakeRows) Scan(dest ...any) error {
 			*d = r.rows[r.i-1][0].([]byte)
 		}
 	default:
-		return fmt.Errorf("recordFakeRows: приёмник %T, ожидается *[]byte", dest[0])
+		return fmt.Errorf("recordFakeRows: the destination %T, a *[]byte expected", dest[0])
 	}
 	return nil
 }
@@ -694,7 +694,7 @@ func (q *recordFakeQueue) Publish(ctx context.Context, stream string, msg queue.
 	}
 	res, ok := msg.(queue.Result)
 	if !ok {
-		return "", fmt.Errorf("recordFakeQueue: неожидаемое сообщение %T (нужен queue.Result)", msg)
+		return "", fmt.Errorf("recordFakeQueue: an unexpected message %T (a queue.Result is needed)", msg)
 	}
 	q.mu.Lock()
 	i := len(q.publishes)
@@ -892,7 +892,7 @@ func TestRecordWritesAllColumns(t *testing.T) {
 	// The zone counters' delta by the same transaction (T-178, incremental-counters spec §6.4): the domain
 	// was queued → queued −1, checked +1, total/pending untouched.
 	if zone.queued != 2 || zone.checked != 6 || zone.total != 10 || zone.pending != 2 {
-		t.Fatalf("счётчики зоны = %+v, want {10 2 2 6} (queued −1, checked +1)", *zone)
+		t.Fatalf("the zone counters = %+v, want {10 2 2 6} (queued −1, checked +1)", *zone)
 	}
 
 	// The daily checks counter (T-179): one episode — +1, not +2 by
@@ -902,107 +902,107 @@ func TestRecordWritesAllColumns(t *testing.T) {
 	// live (alive) episode — only temp_error
 	// outcomes run the operator.
 	if got := pool.checksValue(); got != 1 {
-		t.Fatalf("суточный счётчик = %d, want 1 (один эпизод из двух записей)", got)
+		t.Fatalf("the daily counter = %d, want 1 (one episode of two records)", got)
 	}
 	if got := pool.tempErrValue(); got != 0 {
-		t.Fatalf("суточный числитель temp_error = %d, want 0 (эпизод alive)", got)
+		t.Fatalf("the daily temp_error numerator = %d, want 0 (an alive episode)", got)
 	}
 	if shift, checks := pool.j.indexOf(recordEvShift), pool.j.indexOf(recordEvChecks); shift > checks || checks > pool.j.indexOf(recordEvCommit) {
-		t.Fatalf("порядок счётчиков: shift=%d checks=%d commit=%d (зона → checks → фиксация)",
+		t.Fatalf("the counter order: shift=%d checks=%d commit=%d (the zone → checks → commit)",
 			shift, checks, pool.j.indexOf(recordEvCommit))
 	}
 
 	dom := pool.domains[recordDomainKey{zone: 7, id: 91}]
 	if dom.status != model.StatusAlive || dom.checkState != model.CheckStateDone {
-		t.Fatalf("домен: status=%v check_state=%v, ожидалось alive/done", dom.status, dom.checkState)
+		t.Fatalf("the domain: status=%v check_state=%v, alive/done expected", dom.status, dom.checkState)
 	}
 	if dom.queuedAt != nil || !dom.lastChecked {
-		t.Fatalf("домен: queued_at=%v last_checked=%v, ожидался NULL/заполнен", dom.queuedAt, dom.lastChecked)
+		t.Fatalf("the domain: queued_at=%v last_checked=%v, NULL/filled expected", dom.queuedAt, dom.lastChecked)
 	}
 	if dom.tempAttempts != 0 {
-		t.Fatalf("temp_attempts=%d, ожидался сброс в 0 (контракт T-031)", dom.tempAttempts)
+		t.Fatalf("temp_attempts=%d, a reset to 0 expected (the T-031 contract)", dom.tempAttempts)
 	}
 
 	rows := pool.rows[recordDomainKey{zone: 7, id: 91}]
 	if len(rows) != 2 {
-		t.Fatalf("строк %d, ожидалось 2", len(rows))
+		t.Fatalf("%d rows, 2 expected", len(rows))
 	}
 	apex, www := rows[0], rows[1]
 
 	if apex.subdomainID != 0 || apex.variant != model.VariantMain || apex.scheme != model.SchemeHTTPS {
-		t.Fatalf("апекс: ключ (%d,%v,%v)", apex.subdomainID, apex.variant, apex.scheme)
+		t.Fatalf("the apex: the key (%d,%v,%v)", apex.subdomainID, apex.variant, apex.scheme)
 	}
 	if apex.httpStatus == nil || *apex.httpStatus != 200 {
-		t.Fatalf("апекс: http_status=%v", apex.httpStatus)
+		t.Fatalf("the apex: http_status=%v", apex.httpStatus)
 	}
 	if apex.finalURL == nil || *apex.finalURL != "https://rich.example/" {
-		t.Fatalf("апекс: final_url=%v", apex.finalURL)
+		t.Fatalf("the apex: final_url=%v", apex.finalURL)
 	}
 	if apex.aliasKind != model.AliasNone || apex.aliasSub != nil {
-		t.Fatalf("апекс: алиасы %v/%v", apex.aliasKind, apex.aliasSub)
+		t.Fatalf("the apex: aliases %v/%v", apex.aliasKind, apex.aliasSub)
 	}
 	// addrs: v4-mapped (::ffff:192.0.2.1) + IPv6, 16 octets each.
 	if len(apex.addrs) != 32 {
-		t.Fatalf("апекс: addrs %d байт, ожидалось 32 (2×16)", len(apex.addrs))
+		t.Fatalf("the apex: addrs %d bytes, 32 expected (2×16)", len(apex.addrs))
 	}
 	want4 := netip.MustParseAddr("192.0.2.1").As16()
 	want6 := netip.MustParseAddr("2001:db8::1").As16()
 	if string(apex.addrs[:16]) != string(want4[:]) || string(apex.addrs[16:]) != string(want6[:]) {
-		t.Fatalf("апекс: addrs не совпали с упаковкой v4-mapped+IPv6: %x", apex.addrs)
+		t.Fatalf("the apex: addrs did not match the v4-mapped+IPv6 packing: %x", apex.addrs)
 	}
 	if apex.cname != nil {
-		t.Fatalf("апекс: cname=%v, ожидался NULL", *apex.cname)
+		t.Fatalf("the apex: cname=%v, NULL expected", *apex.cname)
 	}
 	for col, v := range map[string]*string{"tls": apex.tls, "redirects": apex.redirects, "headers": apex.headers, "cookies": apex.cookies} {
 		if v == nil {
-			t.Fatalf("апекс: %s = NULL, ожидался jsonb", col)
+			t.Fatalf("the apex: %s = NULL, a jsonb expected", col)
 		}
 	}
 	if !strings.Contains(*apex.tls, `"subject_cn":"rich.example"`) || !strings.Contains(*apex.tls, `"dns_names"`) {
-		t.Fatalf("апекс: tls jsonb: %s", *apex.tls)
+		t.Fatalf("the apex: the tls jsonb: %s", *apex.tls)
 	}
 	if !strings.Contains(*apex.redirects, `"url":"http://rich.example/","status":301`) {
-		t.Fatalf("апекс: redirects jsonb: %s", *apex.redirects)
+		t.Fatalf("the apex: the redirects jsonb: %s", *apex.redirects)
 	}
 	if !strings.Contains(*apex.headers, `"Content-Type":["text/html; charset=utf-8"]`) {
-		t.Fatalf("апекс: headers jsonb: %s", *apex.headers)
+		t.Fatalf("the apex: the headers jsonb: %s", *apex.headers)
 	}
 	if !strings.Contains(*apex.cookies, `"name":"laravel_session"`) || !strings.Contains(*apex.cookies, `"http_only":true`) {
-		t.Fatalf("апекс: cookies jsonb: %s", *apex.cookies)
+		t.Fatalf("the apex: the cookies jsonb: %s", *apex.cookies)
 	}
 	if apex.rendered {
-		t.Fatal("апекс: rendered=true, рендер — T-067")
+		t.Fatal("the apex: rendered=true, the render is T-067")
 	}
 	wantApex := hashes["apex"]
 	if string(apex.contentHash) != string(wantApex[:]) {
-		t.Fatalf("апекс: content_hash %x, ожидался %x", apex.contentHash, wantApex)
+		t.Fatalf("the apex: content_hash %x, %x expected", apex.contentHash, wantApex)
 	}
 	if apex.errCode != nil {
-		t.Fatalf("апекс: error=%v, ожидался NULL (ErrNone)", *apex.errCode)
+		t.Fatalf("the apex: error=%v, NULL expected (ErrNone)", *apex.errCode)
 	}
 	if apex.responseMS == nil || *apex.responseMS != 123 {
-		t.Fatalf("апекс: response_ms=%v", apex.responseMS)
+		t.Fatalf("the apex: response_ms=%v", apex.responseMS)
 	}
 
 	// www: an alias redirect to the apex, a CNAME, a truncated body — the error
 	// code and the NULL hash (T-056).
 	if www.aliasKind != model.AliasRedirect || www.aliasSub == nil || *www.aliasSub != 0 {
-		t.Fatalf("www: алиас %v/%v", www.aliasKind, www.aliasSub)
+		t.Fatalf("www: the alias %v/%v", www.aliasKind, www.aliasSub)
 	}
 	if www.cname == nil || *www.cname != "rich.example" {
 		t.Fatalf("www: cname=%v", www.cname)
 	}
 	if www.contentHash != nil {
-		t.Fatal("www: content_hash у обрезанного тела, ожидался NULL")
+		t.Fatal("www: content_hash of a truncated body, NULL expected")
 	}
 	if www.errCode == nil || *www.errCode != int16(ErrBody) {
-		t.Fatalf("www: error=%v, ожидался ErrBody", www.errCode)
+		t.Fatalf("www: error=%v, ErrBody expected", www.errCode)
 	}
 	if www.responseMS == nil || *www.responseMS != 456 {
 		t.Fatalf("www: response_ms=%v", www.responseMS)
 	}
 	if len(www.addrs) != 16 {
-		t.Fatalf("www: addrs %d байт, ожидалось 16", len(www.addrs))
+		t.Fatalf("www: addrs %d bytes, 16 expected", len(www.addrs))
 	}
 
 	// The SQL contract: the schema literals and the operators' structure.
@@ -1011,26 +1011,26 @@ func TestRecordWritesAllColumns(t *testing.T) {
 		!strings.Contains(recordDomainSQL, "last_checked_at = now()") ||
 		!strings.Contains(recordDomainSQL, "t.status <> 6") ||
 		!strings.Contains(recordDomainSQL, "temp_attempts = CASE") {
-		t.Fatalf("recordDomainSQL разошёлся с контрактом §6.1/T-031:\n%s", recordDomainSQL)
+		t.Fatalf("recordDomainSQL diverged from the §6.1/T-031 contract:\n%s", recordDomainSQL)
 	}
 	if !strings.Contains(recordInsertSQL, "false, z.content_hash, z.error, z.response_ms, now(), NULL") ||
 		!strings.Contains(recordInsertSQL, "::jsonb[]") || !strings.Contains(recordInsertSQL, "::bytea[]") {
-		t.Fatalf("recordInsertSQL разошёлся с колонками §6.1:\n%s", recordInsertSQL)
+		t.Fatalf("recordInsertSQL diverged from the §6.1 columns:\n%s", recordInsertSQL)
 	}
 	// T-210: render_failed_at is not in the INSERT — the episode's
 	// rewrite (DELETE + INSERT) resets the "render impossible" marker: the new
 	// content has the right to a render (DEFAULT NULL).
 	if strings.Contains(recordInsertSQL, "render_failed_at") {
-		t.Fatalf("recordInsertSQL пишет render_failed_at — маркер T-210 обязан сбрасываться перезаписью эпизода (DEFAULT NULL):\n%s", recordInsertSQL)
+		t.Fatalf("recordInsertSQL writes render_failed_at — the T-210 marker must be reset by the episode rewrite (DEFAULT NULL):\n%s", recordInsertSQL)
 	}
 	if !strings.Contains(recordDeleteSQL, "RETURNING content_hash") {
-		t.Fatalf("recordDeleteSQL без RETURNING content_hash (своп ссылок T-044):\n%s", recordDeleteSQL)
+		t.Fatalf("recordDeleteSQL without RETURNING content_hash (the T-044 reference swap):\n%s", recordDeleteSQL)
 	}
 
 	// The publication: after the transaction's commit, one message per record.
 	pubs := q.publishesSnapshot()
 	if len(pubs) != 2 {
-		t.Fatalf("публикаций q:analyze %d, ожидалось 2", len(pubs))
+		t.Fatalf("%d q:analyze publications, 2 expected", len(pubs))
 	}
 	for i, want := range []struct {
 		sub     int16
@@ -1038,11 +1038,11 @@ func TestRecordWritesAllColumns(t *testing.T) {
 	}{{0, model.VariantMain}, {1, model.VariantMain}} {
 		got := pubs[i]
 		if got.stream != queue.StreamAnalyze {
-			t.Fatalf("публикация %d: стрим %s", i, got.stream)
+			t.Fatalf("publication %d: the stream %s", i, got.stream)
 		}
 		if got.msg.ZoneID != 7 || got.msg.DomainID != 91 || got.msg.SubdomainID != want.sub ||
 			got.msg.Variant != want.variant || got.msg.Name != "rich.example" {
-			t.Fatalf("публикация %d: %+v", i, got.msg)
+			t.Fatalf("publication %d: %+v", i, got.msg)
 		}
 	}
 	ev := pool.j.snapshot()
@@ -1051,7 +1051,7 @@ func TestRecordWritesAllColumns(t *testing.T) {
 		{recordEvInsert, recordEvCommit}, {recordEvCommit, recordEvPublish},
 	} {
 		if pool.j.indexOf(pair[0]) > pool.j.indexOf(pair[1]) {
-			t.Fatalf("порядок событий нарушен: %v после %v (%v)", pair[0], pair[1], ev)
+			t.Fatalf("the event order is violated: %v after %v (%v)", pair[0], pair[1], ev)
 		}
 	}
 }
@@ -1083,22 +1083,22 @@ func TestRecordStatusDecision(t *testing.T) {
 		res  *DomainResult
 		want model.Status
 	}{
-		{"В1 (О7): есть записи — alive", &DomainResult{Subdomains: []SubdomainResult{recorded}}, model.StatusAlive},
-		{"В2 (О8): записей нет, connect-таймаут — temp_error (асимметрия А2)",
+		{"V1 (O7): there are records — alive", &DomainResult{Subdomains: []SubdomainResult{recorded}}, model.StatusAlive},
+		{"V2 (O8): no records, a connect timeout — temp_error (the A2 asymmetry)",
 			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrTimeout, ErrNetwork)}}, model.StatusTempError},
-		{"В2 (О8): таймаут второго протокола тоже temp_error",
+		{"V2 (O8): a timeout of the second protocol is temp_error too",
 			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrNone, ErrTimeout)}}, model.StatusTempError},
-		{"В3 (О9): записей нет, connect-refused — no_http (асимметрия А2)",
+		{"V3 (O9): no records, connection refused — no_http (the A2 asymmetry)",
 			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrNetwork, ErrNetwork)}}, model.StatusNoHTTP},
-		{"В3 (О9): сбой TLS-рукопожатия — no_http",
+		{"V3 (O9): a TLS handshake failure — no_http",
 			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrTLS, ErrNone)}}, model.StatusNoHTTP},
-		{"В3 (О9): лимит редиректов — no_http",
+		{"V3 (O9): the redirect limit — no_http",
 			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrRedirects, ErrRedirects)}}, model.StatusNoHTTP},
-		{"В3 (О9): обрезка тела — no_http",
+		{"V3 (O9): a body truncation — no_http",
 			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrBody, ErrNone)}}, model.StatusNoHTTP},
-		{"В3 (О9): dead-host cutoff синтетик — no_http (ErrCutoff не temp)",
+		{"V3 (O9): the dead-host cutoff synthetic — no_http (ErrCutoff is not temp)",
 			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrCutoff, ErrCutoff)}}, model.StatusNoHTTP},
-		{"В2 доминирует над В3 у разных субдоменов: таймаут одного — temp_error",
+		{"V2 dominates V3 across subdomains: a timeout of one — temp_error",
 			&DomainResult{Subdomains: []SubdomainResult{recordClassSub(ErrNone, ErrNone), recordClassSub(ErrTimeout, ErrTimeout)}}, model.StatusTempError},
 	}
 	for _, tc := range cases {
@@ -1116,9 +1116,9 @@ func TestRecordStatuses(t *testing.T) {
 		res  *DomainResult
 		want model.Status
 	}{
-		{"записи есть — alive", func() *DomainResult { r, _ := recordRichResult(); return r }(), model.StatusAlive},
-		{"молчит постоянно — no_http", recordSilentResult(false), model.StatusNoHTTP},
-		{"молчит с таймаутами — temp_error", recordSilentResult(true), model.StatusTempError},
+		{"there are records — alive", func() *DomainResult { r, _ := recordRichResult(); return r }(), model.StatusAlive},
+		{"silent constantly — no_http", recordSilentResult(false), model.StatusNoHTTP},
+		{"silent with timeouts — temp_error", recordSilentResult(true), model.StatusTempError},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1130,15 +1130,15 @@ func TestRecordStatuses(t *testing.T) {
 			}
 			dom := pool.domains[recordDomainKey{zone: tc.res.ZoneID, id: tc.res.DomainID}]
 			if dom.status != tc.want {
-				t.Fatalf("status=%v, ожидался %v", dom.status, tc.want)
+				t.Fatalf("status=%v, %v expected", dom.status, tc.want)
 			}
 			if dom.tempAttempts != 0 && tc.want != model.StatusTempError {
-				t.Fatalf("temp_attempts=%d при не-temp_error итоге", dom.tempAttempts)
+				t.Fatalf("temp_attempts=%d at a non-temp_error outcome", dom.tempAttempts)
 			}
 		})
 	}
 
-	t.Run("temp_error сохраняет счётчик повторов", func(t *testing.T) {
+	t.Run("temp_error keeps the retry counter", func(t *testing.T) {
 		pool := newRecordFakePool()
 		res := recordSilentResult(true)
 		pool.recordSeedDomain(res.ZoneID, res.DomainID, model.StatusNew, 4)
@@ -1147,11 +1147,11 @@ func TestRecordStatuses(t *testing.T) {
 			t.Fatalf("RecordAndPublish: %v", err)
 		}
 		if got := pool.domains[recordDomainKey{zone: res.ZoneID, id: res.DomainID}].tempAttempts; got != 4 {
-			t.Fatalf("temp_attempts=%d, temp_error обязан сохранить накопленное (T-031)", got)
+			t.Fatalf("temp_attempts=%d, temp_error must keep the accumulated value (T-031)", got)
 		}
 	})
 
-	t.Run("без записей строки не вставляются, старые вычищаются", func(t *testing.T) {
+	t.Run("without records no rows are inserted, the old ones are cleaned", func(t *testing.T) {
 		pool := newRecordFakePool()
 		res := recordSilentResult(false)
 		key := recordDomainKey{zone: res.ZoneID, id: res.DomainID}
@@ -1164,16 +1164,16 @@ func TestRecordStatuses(t *testing.T) {
 			t.Fatalf("RecordAndPublish: %v", err)
 		}
 		if len(pool.rows[key]) != 0 {
-			t.Fatalf("строк после no_http: %d, ожидалось 0 (§3.5 — только последний результат)", len(pool.rows[key]))
+			t.Fatalf("rows after no_http: %d, 0 expected (§3.5 — only the last result)", len(pool.rows[key]))
 		}
 		if pool.j.count(recordEvInsert) != 0 {
-			t.Fatal("INSERT при пустом результате не нужен")
+			t.Fatal("no INSERT is needed with an empty result")
 		}
 		if pool.refc[oldHash] != 0 {
-			t.Fatalf("refcount старого контента %d, ожидался 0", pool.refc[oldHash])
+			t.Fatalf("the old content refcount %d, 0 expected", pool.refc[oldHash])
 		}
 		if got := len(q.publishesSnapshot()); got != 0 {
-			t.Fatalf("публикаций %d — публиковать нечего", got)
+			t.Fatalf("%d publications — there is nothing to publish", got)
 		}
 	})
 }
@@ -1194,28 +1194,28 @@ func TestRecordCutoffFlag(t *testing.T) {
 		t.Fatalf("RecordAndPublish (cutoff): %v", err)
 	}
 	if !dom.cutoff || !dom.flags.IsDeadHostCutoff() {
-		t.Fatalf("после cutoff-эпизода бит dead_host_cutoff не стоит: flags=%s", dom.flags)
+		t.Fatalf("after the cutoff episode the dead_host_cutoff bit is not set: flags=%s", dom.flags)
 	}
 	if !dom.flags.IsRenderPending() {
-		t.Fatalf("CASE flags снял чужой бит render_pending: flags=%s", dom.flags)
+		t.Fatalf("the CASE flags wiped a foreign render_pending bit: flags=%s", dom.flags)
 	}
 
 	// A usual episode (a full check at the T-030 recheck) removes the bit.
 	full := recordSilentResult(false)
 	if _, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), full); err != nil {
-		t.Fatalf("RecordAndPublish (полный эпизод): %v", err)
+		t.Fatalf("RecordAndPublish (a full episode): %v", err)
 	}
 	if dom.cutoff || dom.flags.IsDeadHostCutoff() {
-		t.Fatalf("после полного эпизода бит dead_host_cutoff стоит: flags=%s", dom.flags)
+		t.Fatalf("after the full episode the dead_host_cutoff bit is set: flags=%s", dom.flags)
 	}
 	if !dom.flags.IsRenderPending() {
-		t.Fatalf("CASE flags снял чужой бит render_pending: flags=%s", dom.flags)
+		t.Fatalf("the CASE flags wiped a foreign render_pending bit: flags=%s", dom.flags)
 	}
 
 	// The SQL contract: the bit and the mask — as the model's literals.
 	if !strings.Contains(recordDomainSQL, fmt.Sprintf("(t.flags | %d)::int2", int16(model.FlagDeadHostCutoff))) ||
 		!strings.Contains(recordDomainSQL, fmt.Sprintf("(t.flags & %d)::int2", int16(^int16(model.FlagDeadHostCutoff)))) {
-		t.Fatalf("recordDomainSQL без CASE битa dead_host_cutoff (T-164):\n%s", recordDomainSQL)
+		t.Fatalf("recordDomainSQL without the dead_host_cutoff bit CASE (T-164):\n%s", recordDomainSQL)
 	}
 }
 
@@ -1238,21 +1238,21 @@ func TestRecordTempErrCounter(t *testing.T) {
 	temp := recordSilentResult(true)
 	pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
 	if ok, err := r.RecordAndPublish(context.Background(), temp); err != nil || !ok {
-		t.Fatalf("temp_error-эпизод: ok=%v err=%v", ok, err)
+		t.Fatalf("the temp_error episode: ok=%v err=%v", ok, err)
 	}
 	if got := pool.checksValue(); got != 1 {
-		t.Fatalf("после temp_error-эпизода checks = %d, want 1", got)
+		t.Fatalf("after the temp_error episode checks = %d, want 1", got)
 	}
 	if got := pool.tempErrValue(); got != 1 {
-		t.Fatalf("после temp_error-эпизода temp_error = %d, want 1", got)
+		t.Fatalf("after the temp_error episode temp_error = %d, want 1", got)
 	}
 	if got := pool.retryMatureValue(); got != 1 {
-		t.Fatalf("после temp_error-эпизода retry_mature = %d, want 1", got)
+		t.Fatalf("after the temp_error episode retry_mature = %d, want 1", got)
 	}
 	checks, tempBump := pool.j.indexOf(recordEvChecks), pool.j.indexOf(recordEvTempErr)
 	matureBump, commit := pool.j.indexOf(recordEvMature), pool.j.indexOf(recordEvCommit)
 	if tempBump < checks || matureBump < tempBump || matureBump > commit {
-		t.Fatalf("порядок: checks=%d temp=%d mature=%d commit=%d (checks → temp_error → retry_mature → фиксация)",
+		t.Fatalf("the order: checks=%d temp=%d mature=%d commit=%d (checks → temp_error → retry_mature → commit)",
 			checks, tempBump, matureBump, commit)
 	}
 
@@ -1261,38 +1261,38 @@ func TestRecordTempErrCounter(t *testing.T) {
 	silent := recordSilentResult(false)
 	pool.recordSeedDomain(silent.ZoneID, silent.DomainID, model.StatusNew, 0)
 	if ok, err := r.RecordAndPublish(context.Background(), silent); err != nil || !ok {
-		t.Fatalf("no_http-эпизод: ok=%v err=%v", ok, err)
+		t.Fatalf("the no_http episode: ok=%v err=%v", ok, err)
 	}
 	if got := pool.checksValue(); got != 2 {
-		t.Fatalf("после no_http-эпизода checks = %d, want 2", got)
+		t.Fatalf("after the no_http episode checks = %d, want 2", got)
 	}
 	if got := pool.tempErrValue(); got != 1 {
-		t.Fatalf("после no_http-эпизода temp_error = %d, want 1 (не temp_error-итог не инкрементирует)", got)
+		t.Fatalf("after the no_http episode temp_error = %d, want 1 (a non-temp_error outcome does not increment)", got)
 	}
 	if got := pool.retryMatureValue(); got != 1 {
-		t.Fatalf("после no_http-эпизода retry_mature = %d, want 1 (зреют только temp_error-эпизоды)", got)
+		t.Fatalf("after the no_http episode retry_mature = %d, want 1 (only temp_error episodes ripen)", got)
 	}
 	if n := pool.j.count(recordEvTempErr); n != 1 {
-		t.Fatalf("инкрементов temp_error = %d, want 1", n)
+		t.Fatalf("%d temp_error increments, want 1", n)
 	}
 	if n := pool.j.count(recordEvMature); n != 1 {
-		t.Fatalf("инкрементов корзины = %d, want 1", n)
+		t.Fatalf("%d bucket increments, want 1", n)
 	}
 
 	// A temp_error episode's duplicate delivery: +1 into the numerator, the denominator and
 	// the bucket together — a write event; the reconciliation levels
 	// the drift against the live domain count (T-202).
 	if ok, err := r.RecordAndPublish(context.Background(), temp); err != nil || !ok {
-		t.Fatalf("повтор temp_error-эпизода: ok=%v err=%v", ok, err)
+		t.Fatalf("the temp_error episode repeat: ok=%v err=%v", ok, err)
 	}
 	if got := pool.checksValue(); got != 3 {
-		t.Fatalf("после повтора checks = %d, want 3", got)
+		t.Fatalf("after the repeat checks = %d, want 3", got)
 	}
 	if got := pool.tempErrValue(); got != 2 {
-		t.Fatalf("после повтора temp_error = %d, want 2 (по одному событию на запись)", got)
+		t.Fatalf("after the repeat temp_error = %d, want 2 (one event per record)", got)
 	}
 	if got := pool.retryMatureValue(); got != 2 {
-		t.Fatalf("после повтора retry_mature = %d, want 2 (по одному событию на запись)", got)
+		t.Fatalf("after the repeat retry_mature = %d, want 2 (one event per record)", got)
 	}
 }
 
@@ -1312,19 +1312,19 @@ func TestRecordResultsCounter(t *testing.T) {
 	rich, _ := recordRichResult()
 	pool.recordSeedDomain(rich.ZoneID, rich.DomainID, model.StatusNew, 0)
 	if ok, err := r.RecordAndPublish(context.Background(), rich); err != nil || !ok {
-		t.Fatalf("богатый эпизод: ok=%v err=%v", ok, err)
+		t.Fatalf("the rich episode: ok=%v err=%v", ok, err)
 	}
 	if got := pool.resultsValue(); got != 2 {
-		t.Fatalf("после богатого эпизода results = %d, want 2 (две вставленные строки)", got)
+		t.Fatalf("after the rich episode results = %d, want 2 (two inserted rows)", got)
 	}
 	if got := pool.reanalyzeValue(); got != 2 {
-		t.Fatalf("после богатого эпизода reanalyze = %d, want 2 (каждая вставленная строка — хвост до штампа, T-204)", got)
+		t.Fatalf("after the rich episode reanalyze = %d, want 2 (each inserted row is a tail until the stamp, T-204)", got)
 	}
 	resultsBump, commit := pool.j.indexOf(recordEvResults), pool.j.indexOf(recordEvCommit)
 	matureBump := pool.j.indexOf(recordEvMature)
 	reanBump := pool.j.indexOf(recordEvRean)
 	if resultsBump > commit || (matureBump >= 0 && resultsBump < matureBump) || reanBump > resultsBump {
-		t.Fatalf("порядок: mature=%d reanalyze=%d results=%d commit=%d (… → retry_mature: → reanalyze: → results: → фиксация)",
+		t.Fatalf("the order: mature=%d reanalyze=%d results=%d commit=%d (… → retry_mature: → reanalyze: → results: → commit)",
 			matureBump, reanBump, resultsBump, commit)
 	}
 
@@ -1334,19 +1334,19 @@ func TestRecordResultsCounter(t *testing.T) {
 	silent := recordSilentResult(true)
 	pool.recordSeedDomain(silent.ZoneID, silent.DomainID, model.StatusNew, 1)
 	if ok, err := r.RecordAndPublish(context.Background(), silent); err != nil || !ok {
-		t.Fatalf("молчаливый эпизод: ok=%v err=%v", ok, err)
+		t.Fatalf("the silent episode: ok=%v err=%v", ok, err)
 	}
 	if got := pool.resultsValue(); got != 2 {
-		t.Fatalf("после молчаливого эпизода results = %d, want 2 (эпизод без строк корзину не трогает)", got)
+		t.Fatalf("after the silent episode results = %d, want 2 (an episode without rows does not touch the bucket)", got)
 	}
 	if got := pool.reanalyzeValue(); got != 2 {
-		t.Fatalf("после молчаливого эпизода reanalyze = %d, want 2 (эпизод без строк корзину не трогает)", got)
+		t.Fatalf("after the silent episode reanalyze = %d, want 2 (an episode without rows does not touch the bucket)", got)
 	}
 	if n := pool.j.count(recordEvResults); n != 1 {
-		t.Fatalf("инкрементов корзины темпа = %d, want 1 (нулевая дельта не выполняется)", n)
+		t.Fatalf("%d rate bucket increments, want 1 (a zero delta is not executed)", n)
 	}
 	if n := pool.j.count(recordEvRean); n != 1 {
-		t.Fatalf("инкрементов корзины хвостов = %d, want 1 (нулевая дельта не выполняется)", n)
+		t.Fatalf("%d tails bucket increments, want 1 (a zero delta is not executed)", n)
 	}
 
 	// A rich episode repeat (a duplicate delivery): two more insertion events into
@@ -1357,13 +1357,13 @@ func TestRecordResultsCounter(t *testing.T) {
 	_, hashes := recordRichResult()
 	pool.refc[hashes["apex"]] = 2
 	if ok, err := r.RecordAndPublish(context.Background(), rich); err != nil || !ok {
-		t.Fatalf("повтор богатого эпизода: ok=%v err=%v", ok, err)
+		t.Fatalf("the rich episode repeat: ok=%v err=%v", ok, err)
 	}
 	if got := pool.resultsValue(); got != 4 {
-		t.Fatalf("после повтора results = %d, want 4 (по событиям вставки на доставку)", got)
+		t.Fatalf("after the repeat results = %d, want 4 (an insert event per delivery)", got)
 	}
 	if got := pool.reanalyzeValue(); got != 4 {
-		t.Fatalf("после повтора reanalyze = %d, want 4 (по событиям вставки на доставку)", got)
+		t.Fatalf("after the repeat reanalyze = %d, want 4 (an insert event per delivery)", got)
 	}
 }
 
@@ -1378,14 +1378,14 @@ func TestRecordReanalyzeCounterErrors(t *testing.T) {
 	q := &recordFakeQueue{j: pool.j}
 
 	ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), rich)
-	if err == nil || !strings.Contains(err.Error(), "корзина хвостов переанализа") {
-		t.Fatalf("ошибка = %v, want контекст корзины хвостов", err)
+	if err == nil || !strings.Contains(err.Error(), "reanalysis tails bucket") {
+		t.Fatalf("the error = %v, want the tails bucket context", err)
 	}
 	if ok {
-		t.Fatal("при сбое оператора результат не считается записанным")
+		t.Fatal("at a statement failure the result does not count as written")
 	}
 	if _, exists := pool.rows[recordDomainKey{zone: rich.ZoneID, id: rich.DomainID}]; exists {
-		t.Fatal("строки эпизода записаны при сбое корзины (откат §3.4)")
+		t.Fatal("the episode rows were written at a bucket failure (the §3.4 rollback)")
 	}
 }
 
@@ -1402,32 +1402,32 @@ func TestRecordDeletedGuard(t *testing.T) {
 
 	ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 	if err != nil {
-		t.Fatalf("удалённый домен — не ошибка: %v", err)
+		t.Fatalf("a deleted domain — not an error: %v", err)
 	}
 	if ok {
-		t.Fatal("запись обязана сообщить «не записано»")
+		t.Fatal("the write must report \"not written\"")
 	}
 	if dom.status != model.StatusDeleted || dom.checkState != model.CheckStateQueued {
-		t.Fatalf("домен изменён: %v/%v", dom.status, dom.checkState)
+		t.Fatalf("the domain was changed: %v/%v", dom.status, dom.checkState)
 	}
 	if len(pool.rows[key]) != 1 {
-		t.Fatalf("старые строки тронуты (%d), удалённому результат не пишется", len(pool.rows[key]))
+		t.Fatalf("the old rows were touched (%d), no result is written for a deleted domain", len(pool.rows[key]))
 	}
 	if pool.j.count(recordEvInsert) != 0 || pool.j.count(recordEvDelete) != 0 {
-		t.Fatal("транзакция обязана остановиться на охране UPDATE")
+		t.Fatal("the transaction must stop at the UPDATE guard")
 	}
 	// No result is written to the deleted — the daily counter does not grow either
 	// (T-179: the delta only at an UPDATE RowsAffected > 0, incremental-counters spec §6.1.3);
 	// the temp_error numerator — all the more (T-182).
 	if pool.j.count(recordEvChecks) != 0 || pool.checksValue() != 0 ||
 		pool.j.count(recordEvTempErr) != 0 || pool.tempErrValue() != 0 {
-		t.Fatal("суточные счётчики тронуты при охране deleted")
+		t.Fatal("the daily counters were touched at the deleted guard")
 	}
 	if got := len(q.publishesSnapshot()); got != 0 {
-		t.Fatalf("публикаций %d — без записи публиковать нельзя", got)
+		t.Fatalf("%d publications — publishing without a write is forbidden", got)
 	}
 
-	t.Run("отсутствующий домен — тот же путь", func(t *testing.T) {
+	t.Run("an absent domain — the same path", func(t *testing.T) {
 		ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), &DomainResult{
 			ZoneID: 7, DomainID: 999, Name: "ghost.example",
 			Subdomains: []SubdomainResult{{
@@ -1436,7 +1436,7 @@ func TestRecordDeletedGuard(t *testing.T) {
 			}},
 		})
 		if err != nil || ok {
-			t.Fatalf("ok=%v err=%v, ожидалось false/nil", ok, err)
+			t.Fatalf("ok=%v err=%v, false/nil expected", ok, err)
 		}
 	})
 }
@@ -1470,18 +1470,18 @@ func TestRecordRewriteSwapsRefs(t *testing.T) {
 	}
 
 	if pool.refc[h1] != 0 || pool.refc[h2] != 0 {
-		t.Fatalf("старые ссылки: H1=%d H2=%d, ожидался 0/0 (строка мёртвая — T-042)", pool.refc[h1], pool.refc[h2])
+		t.Fatalf("the old references: H1=%d H2=%d, 0/0 expected (the row is dead — T-042)", pool.refc[h1], pool.refc[h2])
 	}
 	if pool.refc[h3] != 1 {
-		t.Fatalf("refcount нового контента %d, ожидался 1 (+1 Put уже был, −новых не нужно)", pool.refc[h3])
+		t.Fatalf("the new content refcount %d, 1 expected (+1 Put already existed, no new ones needed)", pool.refc[h3])
 	}
 	rows := pool.rows[key]
 	if len(rows) != 2 {
-		t.Fatalf("строк %d — перезапись удаляет и исчезнувшие ключи (§3.5)", len(rows))
+		t.Fatalf("%d rows — the rewrite also deletes the disappeared keys (§3.5)", len(rows))
 	}
 	for _, r := range rows {
 		if r.finalURL != nil && *r.finalURL == oldFinal {
-			t.Fatal("старая строка пережила перезапись")
+			t.Fatal("an old row survived the rewrite")
 		}
 	}
 	// The operator order: −1 of the old ones — before the INSERT, everything after the domain's UPDATE.
@@ -1489,7 +1489,7 @@ func TestRecordRewriteSwapsRefs(t *testing.T) {
 		{recordEvDomains, recordEvSwap}, {recordEvSwap, recordEvInsert}, {recordEvInsert, recordEvCommit},
 	} {
 		if pool.j.indexOf(pair[0]) > pool.j.indexOf(pair[1]) {
-			t.Fatalf("порядок нарушен: %v после %v", pair[0], pair[1])
+			t.Fatalf("the order is violated: %v after %v", pair[0], pair[1])
 		}
 	}
 }
@@ -1507,35 +1507,35 @@ func TestRecordIdempotentRepeat(t *testing.T) {
 	r := recordRecorder(t, pool, q)
 
 	if ok, err := r.RecordAndPublish(context.Background(), res); err != nil || !ok {
-		t.Fatalf("первая запись: ok=%v err=%v", ok, err)
+		t.Fatalf("the first write: ok=%v err=%v", ok, err)
 	}
 	if pool.refc[hApex] != 1 {
-		t.Fatalf("после первой записи refcount=%d, ожидался 1", pool.refc[hApex])
+		t.Fatalf("after the first write refcount=%d, 1 expected", pool.refc[hApex])
 	}
 
 	// The recheck scenario: the Put added the reference anew (refcount 2), the
 	// rewrite removes the old row's reference — the outcome is balanced.
 	pool.refc[hApex] = 2
 	if ok, err := r.RecordAndPublish(context.Background(), res); err != nil || !ok {
-		t.Fatalf("повторная запись: ok=%v err=%v (идемпотентность, ТЗ 3.4)", ok, err)
+		t.Fatalf("the repeated write: ok=%v err=%v (the idempotency, spec 3.4)", ok, err)
 	}
 	if pool.refc[hApex] != 1 {
-		t.Fatalf("refcount после повтора=%d, двойное снятие ушло бы в минус (T-044)", pool.refc[hApex])
+		t.Fatalf("the refcount after the repeat=%d, a double release would go negative (T-044)", pool.refc[hApex])
 	}
 	if len(pool.rows[key]) != 2 {
-		t.Fatalf("строк %d — повтор обязан перезаписать, не дублировать", len(pool.rows[key]))
+		t.Fatalf("%d rows — the repeat must rewrite, not duplicate", len(pool.rows[key]))
 	}
 	// A repeat after a successful write publishes q:analyze anew: the
 	// "written, not published" window is closed by the repeated delivery.
 	if got := len(q.publishesSnapshot()); got != 4 {
-		t.Fatalf("публикаций суммарно %d, ожидалось 4 (2×2)", got)
+		t.Fatalf("%d publications in total, 4 expected (2×2)", got)
 	}
 	// The daily counter counts the write events (T-179, TZ_slow_done_today
 	// §5.1): a repeated delivery — one more event, +1 (not ×2 per
 	// delivery); they converge to the live window by the reconciliation (the
 	// integration scenario — TestCounters_RecordDoubleDelivery).
 	if got := pool.checksValue(); got != 2 {
-		t.Fatalf("суточный счётчик = %d, want 2 (по одному событию на запись)", got)
+		t.Fatalf("the daily counter = %d, want 2 (one event per write)", got)
 	}
 }
 
@@ -1553,95 +1553,95 @@ func TestRecordTransactionFailures(t *testing.T) {
 	assertRolledBack := func(t *testing.T, pool *recordFakePool, q *recordFakeQueue, err error, oldRows int) {
 		t.Helper()
 		if err == nil {
-			t.Fatal("ожидалась ошибка шага")
+			t.Fatal("a step error expected")
 		}
 		key := recordDomainKey{zone: 7, id: 91}
 		if dom := pool.domains[key]; dom.checkState != model.CheckStateQueued || dom.status != model.StatusNew {
-			t.Fatalf("домен изменён при сбое: %v/%v — транзакция обязана откатиться", dom.status, dom.checkState)
+			t.Fatalf("the domain was changed at a failure: %v/%v — the transaction must roll back", dom.status, dom.checkState)
 		}
 		if len(pool.rows[key]) != oldRows {
-			t.Fatalf("строк %d после сбоя, ожидалось %d — откат к снапшоту не сработал", len(pool.rows[key]), oldRows)
+			t.Fatalf("%d rows after the failure, %d expected — the snapshot rollback did not work", len(pool.rows[key]), oldRows)
 		}
 		if got := len(q.publishesSnapshot()); got != 0 {
-			t.Fatalf("публикаций %d при незаписанном результате", got)
+			t.Fatalf("%d publications with an unwritten result", got)
 		}
 	}
 
 	t.Run("Begin", func(t *testing.T) {
 		pool, q := seed(t)
-		pool.beginErr = errors.New("соединение недоступно")
+		pool.beginErr = errors.New("the connection is unavailable")
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
 	})
 	t.Run("UPDATE domains", func(t *testing.T) {
 		pool, q := seed(t)
-		pool.failExec = map[string]error{recordDomainSQL: errors.New("блокировка")}
+		pool.failExec = map[string]error{recordDomainSQL: errors.New("a lock")}
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
 	})
-	t.Run("DELETE старых строк", func(t *testing.T) {
+	t.Run("DELETE of the old rows", func(t *testing.T) {
 		pool, q := seed(t)
-		pool.deleteErr = errors.New("сбой чтения")
+		pool.deleteErr = errors.New("a read failure")
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
 	})
 	t.Run("INSERT", func(t *testing.T) {
 		pool, q := seed(t)
-		pool.failExec = map[string]error{recordInsertSQL: errors.New("нарушение PK")}
+		pool.failExec = map[string]error{recordInsertSQL: errors.New("a PK violation")}
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
 	})
-	t.Run("суточный счётчик проверок", func(t *testing.T) {
+	t.Run("the daily checks counter", func(t *testing.T) {
 		// T-179: an increment failure rolls back the transaction entirely —
 		// the result and the counter change only together.
 		pool, q := seed(t)
-		pool.failExec = map[string]error{recordChecksBumpSQL: errors.New("счётчики недоступны")}
+		pool.failExec = map[string]error{recordChecksBumpSQL: errors.New("the counters are unavailable")}
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
 		if got := pool.checksValue(); got != 0 {
-			t.Fatalf("суточный счётчик = %d после отката, want 0", got)
+			t.Fatalf("the daily counter = %d after the rollback, want 0", got)
 		}
 	})
-	t.Run("суточный числитель temp_error", func(t *testing.T) {
+	t.Run("the daily temp_error numerator", func(t *testing.T) {
 		// T-182: a numerator increment failure rolls back both the result and
 		// the denominator — the counter pair changes only together with the write.
 		temp := recordSilentResult(true)
 		pool, q := seed(t)
 		pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
-		pool.failExec = map[string]error{recordTempErrBumpSQL: errors.New("счётчики недоступны")}
+		pool.failExec = map[string]error{recordTempErrBumpSQL: errors.New("the counters are unavailable")}
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), temp)
 		assertRolledBack(t, pool, q, err, 0)
 		dom := pool.domains[recordDomainKey{zone: temp.ZoneID, id: temp.DomainID}]
 		if dom.status != model.StatusNew || dom.checkState != model.CheckStateQueued {
-			t.Fatalf("temp_error-домен изменён при сбое числителя: %v/%v — транзакция обязана откатиться",
+			t.Fatalf("the temp_error domain was changed at a numerator failure: %v/%v — the transaction must roll back",
 				dom.status, dom.checkState)
 		}
 		if got := pool.checksValue(); got != 0 {
-			t.Fatalf("суточный счётчик = %d после отката на числителе, want 0", got)
+			t.Fatalf("the daily counter = %d after the rollback at the numerator, want 0", got)
 		}
 		if got := pool.tempErrValue(); got != 0 {
-			t.Fatalf("суточный числитель temp_error = %d после отката, want 0", got)
+			t.Fatalf("the daily temp_error numerator = %d after the rollback, want 0", got)
 		}
 	})
-	t.Run("корзина зрелости ретрая", func(t *testing.T) {
+	t.Run("the retry maturity bucket", func(t *testing.T) {
 		// T-202: a bucket increment failure rolls back the transaction entirely —
 		// an episode without the bucket would open the retry guard a day less.
 		temp := recordSilentResult(true)
 		pool, q := seed(t)
 		pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
-		pool.failExec = map[string]error{recordRetryMatureBumpSQL: errors.New("счётчики недоступны")}
+		pool.failExec = map[string]error{recordRetryMatureBumpSQL: errors.New("the counters are unavailable")}
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), temp)
 		assertRolledBack(t, pool, q, err, 0)
 		dom := pool.domains[recordDomainKey{zone: temp.ZoneID, id: temp.DomainID}]
 		if dom.status != model.StatusNew || dom.checkState != model.CheckStateQueued {
-			t.Fatalf("temp_error-домен изменён при сбое корзины: %v/%v — транзакция обязана откатиться",
+			t.Fatalf("the temp_error domain was changed at a bucket failure: %v/%v — the transaction must roll back",
 				dom.status, dom.checkState)
 		}
 		if got := pool.retryMatureValue(); got != 0 {
-			t.Fatalf("корзина зрелости = %d после отката, want 0", got)
+			t.Fatalf("the maturity bucket = %d after the rollback, want 0", got)
 		}
 	})
-	t.Run("корзина зрелости: RowsAffected ≠ 1", func(t *testing.T) {
+	t.Run("the maturity bucket: RowsAffected ≠ 1", func(t *testing.T) {
 		// T-202, the P3-2 review: the upsert's guard branch — "a silent
 		// must be an error and a rollback (silence — a counter bug).
 		// must be an error and a rollback (silence — a counter bug).
@@ -1651,46 +1651,46 @@ func TestRecordTransactionFailures(t *testing.T) {
 		pool.matureTag = 2 // INSERT 0 2 — a foreign SQL/a protocol decay
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), temp)
 		assertRolledBack(t, pool, q, err, 0)
-		if err == nil || !strings.Contains(err.Error(), "затронуто 2 строк (upsert корзины суток обязан 1)") {
-			t.Fatalf("ошибка = %v, want RowsAffected-гард корзины зрелости", err)
+		if err == nil || !strings.Contains(err.Error(), "2 rows affected (the day bucket upsert must affect 1)") {
+			t.Fatalf("the error = %v, want the maturity bucket RowsAffected guard", err)
 		}
 		if got := pool.retryMatureValue(); got != 0 {
-			t.Fatalf("корзина зрелости = %d после отката, want 0", got)
+			t.Fatalf("the maturity bucket = %d after the rollback, want 0", got)
 		}
 	})
-	t.Run("часовая корзина темпа", func(t *testing.T) {
+	t.Run("the hourly rate bucket", func(t *testing.T) {
 		// T-203: a bucket increment failure rolls back the transaction entirely —
 		// undercounted silently).
 		// undercounted silently).
 		pool, q := seed(t)
-		pool.failExec = map[string]error{recordResultsBumpSQL: errors.New("счётчики недоступны")}
+		pool.failExec = map[string]error{recordResultsBumpSQL: errors.New("the counters are unavailable")}
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
 		if got := pool.resultsValue(); got != 0 {
-			t.Fatalf("часовая корзина темпа = %d после отката, want 0", got)
+			t.Fatalf("the hourly rate bucket = %d after the rollback, want 0", got)
 		}
 	})
-	t.Run("часовая корзина темпа: RowsAffected ≠ 1", func(t *testing.T) {
+	t.Run("the hourly rate bucket: RowsAffected ≠ 1", func(t *testing.T) {
 		// T-203: the upsert's guard branch (the maturity bucket's style,
 		// the T-202 P3-2 review) — a silent delta loss would understate the throughput.
 		pool, q := seed(t)
 		pool.resultsTag = 2 // INSERT 0 2 — a foreign SQL/a protocol decay
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
-		if err == nil || !strings.Contains(err.Error(), "затронуто 2 строк (upsert корзины часа обязан 1)") {
-			t.Fatalf("ошибка = %v, want RowsAffected-гард корзины темпа", err)
+		if err == nil || !strings.Contains(err.Error(), "2 rows affected (the hour bucket upsert must affect 1)") {
+			t.Fatalf("the error = %v, want the rate bucket RowsAffected guard", err)
 		}
 		if got := pool.resultsValue(); got != 0 {
-			t.Fatalf("часовая корзина темпа = %d после отката, want 0", got)
+			t.Fatalf("the hourly rate bucket = %d after the rollback, want 0", got)
 		}
 	})
 	t.Run("Commit", func(t *testing.T) {
 		pool, q := seed(t)
-		pool.commitErr = errors.New("сервер упал на фиксации")
+		pool.commitErr = errors.New("the server crashed at the commit")
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
 	})
-	t.Run("ErrRefIntegrity откатывает всё", func(t *testing.T) {
+	t.Run("ErrRefIntegrity rolls everything back", func(t *testing.T) {
 		pool, q := seed(t)
 		h := recordTestHash(5)
 		pool.rows[recordDomainKey{zone: 7, id: 91}] = []recordFakeRow{
@@ -1699,21 +1699,21 @@ func TestRecordTransactionFailures(t *testing.T) {
 		// The hash's refcount is zero (a dead row) — the accounting diverged.
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		if !errors.Is(err, content.ErrRefIntegrity) {
-			t.Fatalf("ожидался ErrRefIntegrity: %v", err)
+			t.Fatalf("ErrRefIntegrity expected: %v", err)
 		}
 		assertRolledBack(t, pool, q, err, 1)
 		// The old row is intact: the deletion rolled back together with the transaction.
 		if rows := pool.rows[recordDomainKey{zone: 7, id: 91}]; len(rows) != 1 || string(rows[0].contentHash) != string(h[:]) {
-			t.Fatalf("старая строка обязана пережить откат: %+v", rows)
+			t.Fatalf("the old row must survive the rollback: %+v", rows)
 		}
 	})
-	t.Run("отмена ctx", func(t *testing.T) {
+	t.Run("the ctx cancellation", func(t *testing.T) {
 		pool, q := seed(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(ctx, res)
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("ожидалась отмена ctx: %v", err)
+			t.Fatalf("the ctx cancellation expected: %v", err)
 		}
 		assertRolledBack(t, pool, q, err, 0)
 	})
@@ -1734,7 +1734,7 @@ func TestRecordDeadlockRetry(t *testing.T) {
 		return pool, &recordFakeQueue{j: pool.j}
 	}
 
-	t.Run("дедлок поглощён — транзакция повторена целиком", func(t *testing.T) {
+	t.Run("a deadlock absorbed — the transaction repeated entirely", func(t *testing.T) {
 		pool, q := seed(t)
 		reg := metrics.New("http-worker")
 		pool.failExecOnce = map[string]error{recordDomainSQL: deadlock}
@@ -1744,30 +1744,30 @@ func TestRecordDeadlockRetry(t *testing.T) {
 		}
 		ok, err := r.RecordAndPublish(context.Background(), res)
 		if err != nil || !ok {
-			t.Fatalf("RecordAndPublish = (%v, %v), want (true, nil) — дедлок поглощён", ok, err)
+			t.Fatalf("RecordAndPublish = (%v, %v), want (true, nil) — the deadlock is absorbed", ok, err)
 		}
 		// Two transaction attempts: the first rolled back at the UPDATE, the second
 		// passed to the Commit; the publications — after the commit, one
 		// chunk (one per subdomain×variant record, no attempt's duplicate).
 		if pool.begins != 2 {
-			t.Errorf("транзакций-попыток = %d, want 2 (повтор целиком)", pool.begins)
+			t.Errorf("transaction attempts = %d, want 2 (a full repeat)", pool.begins)
 		}
 		if got := pool.j.count(recordEvCommit); got != 1 {
-			t.Errorf("Commit = %d, want 1 (зафиксирована только вторая попытка)", got)
+			t.Errorf("Commit = %d, want 1 (only the second attempt was committed)", got)
 		}
 		if got, want := len(q.publishesSnapshot()), res.RecordCount(); got != want {
-			t.Errorf("публикаций q:analyze = %d, want %d (одна пачка после фиксации)", got, want)
+			t.Errorf("q:analyze publications = %d, want %d (one batch after the commit)", got, want)
 		}
 		// An honest repeat: attempt 1 committed nothing, the counters are not doubled.
 		if got := pool.checksValue(); got != 1 {
-			t.Errorf("суточный счётчик = %d, want 1 (без задвоения дельт)", got)
+			t.Errorf("the daily counter = %d, want 1 (no delta duplication)", got)
 		}
 		if got := httpMetricValue(t, reg, "crawler_db_deadlock_retried_total", nil); got != 1 {
 			t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
 		}
 	})
 
-	t.Run("дедлок корзины счётчиков — тот же ретрай транзакции", func(t *testing.T) {
+	t.Run("a deadlock of the counters bucket — the same transaction retry", func(t *testing.T) {
 		pool, q := seed(t)
 		pool.failExecOnce = map[string]error{recordChecksBumpSQL: deadlock}
 		ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
@@ -1775,11 +1775,11 @@ func TestRecordDeadlockRetry(t *testing.T) {
 			t.Fatalf("RecordAndPublish = (%v, %v), want (true, nil)", ok, err)
 		}
 		if pool.begins != 2 || pool.checksValue() != 1 {
-			t.Errorf("попыток %d, счётчик %d — want 2 и 1 (хвостовые дельты в повторе)", pool.begins, pool.checksValue())
+			t.Errorf("%d attempts, the counter %d — want 2 and 1 (the tail deltas in the repeat)", pool.begins, pool.checksValue())
 		}
 	})
 
-	t.Run("исчерпание повторов — ошибка наружу, состояние откатано", func(t *testing.T) {
+	t.Run("the retries exhausted — an error outward, the state rolled back", func(t *testing.T) {
 		pool, q := seed(t)
 		reg := metrics.New("http-worker")
 		pool.failExec = map[string]error{recordDomainSQL: deadlock}
@@ -1789,17 +1789,17 @@ func TestRecordDeadlockRetry(t *testing.T) {
 		}
 		ok, err := r.RecordAndPublish(context.Background(), res)
 		if err == nil || !db.IsDeadlock(err) || ok {
-			t.Fatalf("RecordAndPublish = (%v, %v), want (false, 40P01) наружу", ok, err)
+			t.Fatalf("RecordAndPublish = (%v, %v), want (false, 40P01) outward", ok, err)
 		}
 		if want := 1 + db.MaxDeadlockRetries; pool.begins != want {
-			t.Errorf("попыток = %d, want %d (первая + повторы)", pool.begins, want)
+			t.Errorf("attempts = %d, want %d (the first + the retries)", pool.begins, want)
 		}
 		if dom := pool.domains[recordDomainKey{zone: 7, id: 91}]; dom.status != model.StatusNew ||
 			dom.checkState != model.CheckStateQueued {
-			t.Errorf("домен изменён: %v/%v — все попытки обязаны откатиться", dom.status, dom.checkState)
+			t.Errorf("the domain was changed: %v/%v — all the attempts must roll back", dom.status, dom.checkState)
 		}
 		if got := len(q.publishesSnapshot()); got != 0 {
-			t.Errorf("публикаций %d при незаписанном результате", got)
+			t.Errorf("%d publications with an unwritten result", got)
 		}
 		if got := httpMetricValue(t, reg, "crawler_db_deadlock_retried_total", nil); got != db.MaxDeadlockRetries {
 			t.Errorf("crawler_db_deadlock_retried_total = %v, want %d", got, db.MaxDeadlockRetries)
@@ -1811,7 +1811,7 @@ func TestRecordDeadlockRetry(t *testing.T) {
 // transaction's deadlock in the OnResult chain is absorbed by the repeat — the
 // q:http delivery is acknowledged (XACK), the task does not burn in the redelivery.
 func TestRecordDeadlockRunAck(t *testing.T) {
-	body := "<html>" + strings.Repeat("страница для проверки ретрая дедлока ", 30) + "</html>"
+	body := "<html>" + strings.Repeat("a page for the deadlock retry check ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"deadlock.test":         {status: 200, body: body},
 		"http://deadlock.test/": {status: 200, body: body},
@@ -1845,7 +1845,7 @@ func TestRecordDeadlockRunAck(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatal("XACK не дождались: дедлок не поглощён — задача сгорает в ределивери")
+			t.Fatal("no XACK seen: the deadlock is not absorbed — the task burns in the redelivery")
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
@@ -1856,10 +1856,10 @@ func TestRecordDeadlockRunAck(t *testing.T) {
 			t.Fatalf("Run: %v, want nil", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if pool.begins != 2 {
-		t.Errorf("попыток транзакции = %d, want 2", pool.begins)
+		t.Errorf("transaction attempts = %d, want 2", pool.begins)
 	}
 	if got := httpMetricValue(t, reg, "crawler_db_deadlock_retried_total", nil); got != 1 {
 		t.Errorf("crawler_db_deadlock_retried_total = %v, want 1", got)
@@ -1869,30 +1869,30 @@ func TestRecordDeadlockRunAck(t *testing.T) {
 // --- the publication: after the write, errors are not silent -------------------------------
 
 func TestRecordPublishFailures(t *testing.T) {
-	t.Run("сбой публикации — результат записан, доставка вернётся", func(t *testing.T) {
+	t.Run("a publication failure — the result is written, the delivery will come back", func(t *testing.T) {
 		pool := newRecordFakePool()
 		pool.recordSeedDomain(7, 91, model.StatusNew, 0)
-		q := &recordFakeQueue{j: pool.j, publishErrs: []error{nil, errors.New("Redis отвалился")}}
+		q := &recordFakeQueue{j: pool.j, publishErrs: []error{nil, errors.New("Redis fell off")}}
 		res, _ := recordRichResult()
 
 		ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
-		if err == nil || !strings.Contains(err.Error(), "публикация q:analyze") {
-			t.Fatalf("ожидалась ошибка публикации: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "q:analyze publication") {
+			t.Fatalf("a publication error expected: %v", err)
 		}
 		if !ok {
-			t.Fatal("запись состоялась до публикации — recorded=true")
+			t.Fatal("the write happened before the publication — recorded=true")
 		}
 		if len(pool.rows[recordDomainKey{zone: 7, id: 91}]) != 2 {
-			t.Fatal("строки обязаны остаться: публикация повторной доставкой допишет хвост")
+			t.Fatal("the rows must stay: a re-delivery publication will append the tail")
 		}
 	})
-	t.Run("первое же сообщение не уходит", func(t *testing.T) {
+	t.Run("the very first message does not go out", func(t *testing.T) {
 		pool := newRecordFakePool()
 		pool.recordSeedDomain(7, 91, model.StatusNew, 0)
-		q := &recordFakeQueue{j: pool.j, publishErrs: []error{errors.New("нет")}}
+		q := &recordFakeQueue{j: pool.j, publishErrs: []error{errors.New("no")}}
 		res, _ := recordRichResult()
 		if _, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res); err == nil {
-			t.Fatal("ожидалась ошибка публикации")
+			t.Fatal("a publication error expected")
 		}
 	})
 }
@@ -1912,19 +1912,19 @@ func TestRecordValidation(t *testing.T) {
 		res  *DomainResult
 		frag string
 	}{
-		{"нулевая зона", &DomainResult{ZoneID: 0, DomainID: 1, Name: "x.test", Subdomains: []SubdomainResult{{Records: []Record{{}}}}}, "идентификаторы"},
-		{"невалидный вариант", newRes(func(r *Record) { r.Variant = model.Variant(7) }), "вариант"},
-		{"невалидная схема", newRes(func(r *Record) { r.Scheme = model.Scheme(9) }), "схема"},
-		{"алиас без ссылки", newRes(func(r *Record) { r.AliasKind = model.AliasIdentical }), "T-055"},
-		{"дубликат ключа", func() *DomainResult {
+		{"a zero zone", &DomainResult{ZoneID: 0, DomainID: 1, Name: "x.test", Subdomains: []SubdomainResult{{Records: []Record{{}}}}}, "identifiers"},
+		{"an invalid variant", newRes(func(r *Record) { r.Variant = model.Variant(7) }), "variant"},
+		{"an invalid scheme", newRes(func(r *Record) { r.Scheme = model.Scheme(9) }), "scheme"},
+		{"an alias without a reference", newRes(func(r *Record) { r.AliasKind = model.AliasIdentical }), "T-055"},
+		{"a duplicate key", func() *DomainResult {
 			res, _ := recordRichResult()
 			rec := res.Subdomains[0].Records[0]
 			res.Subdomains[1].Records = append(res.Subdomains[1].Records, rec)
 			res.Subdomains[1].Records[1].SubdomainID = 0
 			return res
-		}(), "дубликат"},
-		{"ContentNotStored с хэшем", newRes(func(r *Record) { r.ContentNotStored = true }), "T-056"},
-		{"ContentNotStored у алиаса", newRes(func(r *Record) {
+		}(), "duplicate"},
+		{"ContentNotStored with a hash", newRes(func(r *Record) { r.ContentNotStored = true }), "T-056"},
+		{"ContentNotStored on an alias", newRes(func(r *Record) {
 			r.AliasKind = model.AliasRedirect
 			id := int16(1)
 			r.AliasSubdomainID = &id
@@ -1932,14 +1932,14 @@ func TestRecordValidation(t *testing.T) {
 			r.StoreContent = false
 			r.ContentNotStored = true
 		}), "T-056"},
-		{"оригинал без контента и признака", newRes(func(r *Record) { r.ContentHash = nil }), "T-056"},
-		{"алиас с StoreContent", newRes(func(r *Record) {
+		{"an original without content and the sign", newRes(func(r *Record) { r.ContentHash = nil }), "T-056"},
+		{"an alias with StoreContent", newRes(func(r *Record) {
 			r.AliasKind = model.AliasRedirect
 			id := int16(1)
 			r.AliasSubdomainID = &id
 			r.StoreContent = true
 		}), "T-055"},
-		{"класс записи вне доступной проверки", newRes(func(r *Record) { r.ErrClass = ErrTimeout }), "доступной"},
+		{"a record class outside an available check", newRes(func(r *Record) { r.ErrClass = ErrTimeout }), "available"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1948,25 +1948,25 @@ func TestRecordValidation(t *testing.T) {
 			q := &recordFakeQueue{j: pool.j}
 			_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), tc.res)
 			if err == nil || !strings.Contains(err.Error(), tc.frag) {
-				t.Fatalf("ожидалась ошибка валидации с %q: %v", tc.frag, err)
+				t.Fatalf("a validation error with %q expected: %v", tc.frag, err)
 			}
 			if pool.begins != 0 {
-				t.Fatal("валидация обязана отсекать до открытия транзакции")
+				t.Fatal("the validation must cut off before the transaction opens")
 			}
 		})
 	}
 
-	t.Run("nil-результат и зависимости", func(t *testing.T) {
+	t.Run("a nil result and dependencies", func(t *testing.T) {
 		pool := newRecordFakePool()
 		q := &recordFakeQueue{j: pool.j}
 		if ok, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), nil); err != nil || ok {
 			t.Fatalf("nil: ok=%v err=%v", ok, err)
 		}
 		if _, err := NewRecorder(nil, q, nil, nil); err == nil {
-			t.Fatal("NewRecorder без пула прошёл")
+			t.Fatal("NewRecorder without a pool passed")
 		}
 		if _, err := NewRecorder(pool, nil, nil, nil); err == nil {
-			t.Fatal("NewRecorder без очереди прошёл")
+			t.Fatal("NewRecorder without a queue passed")
 		}
 	})
 }
@@ -2019,7 +2019,7 @@ func TestRecordOnResultSmoke(t *testing.T) {
 	case <-q.j.ackNotify:
 	case <-time.After(5 * time.Second):
 		cancel()
-		t.Fatal("доставка не подтверждена за 5 с")
+		t.Fatal("the delivery was not acknowledged within 5 s")
 	}
 	cancel()
 	if err := <-done; err != nil {
@@ -2028,21 +2028,21 @@ func TestRecordOnResultSmoke(t *testing.T) {
 
 	dom := pool.domains[recordDomainKey{zone: 5, id: 42}]
 	if dom.status != model.StatusAlive || dom.checkState != model.CheckStateDone {
-		t.Fatalf("домен: %v/%v, ожидался alive/done", dom.status, dom.checkState)
+		t.Fatalf("the domain: %v/%v, alive/done expected", dom.status, dom.checkState)
 	}
 	rows := pool.rows[recordDomainKey{zone: 5, id: 42}]
 	if len(rows) != 1 || rows[0].contentHash == nil {
-		t.Fatalf("строки: %+v — контент оригинала записан ссылкой", rows)
+		t.Fatalf("the rows: %+v — the original content was written by a reference", rows)
 	}
 	pubs := q.publishesSnapshot()
 	if len(pubs) != 1 || pubs[0].msg.SubdomainID != 0 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации q:analyze: %+v", pubs)
+		t.Fatalf("the q:analyze publications: %+v", pubs)
 	}
 	if q.j.indexOf(recordEvPublish) > q.j.indexOf(recordEvAck) {
-		t.Fatal("XACK раньше публикации q:analyze — нарушен порядок ТЗ 4.2/5.5 п. 9")
+		t.Fatal("the XACK precedes the q:analyze publication — the order of spec 4.2/5.5 item 9 is violated")
 	}
 	if _, err := st.Get(context.Background(), content.HashOf([]byte(page))); err != nil {
-		t.Fatalf("контент не сохранён: %v", err)
+		t.Fatalf("the content was not stored: %v", err)
 	}
 }
 
@@ -2059,7 +2059,7 @@ func TestRecordOnResultPublishErrorNoAck(t *testing.T) {
 	q := &recordFakeQueue{j: pool.j, deliveries: []queue.Delivery{workerDelivery(t, queue.HTTPTask{
 		TaskID: "task-1", ZoneID: 5, DomainID: 43, Name: "pub.test",
 		Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")},
-	})}, publishErrs: []error{errors.New("Redis недоступен")}}
+	})}, publishErrs: []error{errors.New("Redis is unavailable")}}
 
 	recorder := recordRecorder(t, pool, q)
 	opts := Options{OnResult: func(c context.Context, res *DomainResult) error {
@@ -2081,21 +2081,21 @@ func TestRecordOnResultPublishErrorNoAck(t *testing.T) {
 		select {
 		case <-deadline:
 			cancel()
-			t.Fatal("публикация не попыталась выполниться за 5 с")
+			t.Fatal("the publication did not attempt to run within 5 s")
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
 	// The delivery must stay unacknowledged.
 	time.Sleep(50 * time.Millisecond)
 	if got := q.j.count(recordEvAck); got != 0 {
-		t.Fatalf("XACK %d при сбое публикации — доставка обязана вернуться (ТЗ 3.4)", got)
+		t.Fatalf("XACK %d at a publication failure — the delivery must come back (spec 3.4)", got)
 	}
 	if len(q.ackedSnapshot()) != 0 {
-		t.Fatal("ack зафиксирован при ошибке OnResult")
+		t.Fatal("the ack was performed at an OnResult error")
 	}
 	// The write did happen at that: the repeat will only finish publishing.
 	if len(pool.rows[recordDomainKey{zone: 5, id: 43}]) != 1 {
-		t.Fatal("результат не записан перед публикацией")
+		t.Fatal("the result was not written before the publication")
 	}
 	cancel()
 	if err := <-done; err != nil {

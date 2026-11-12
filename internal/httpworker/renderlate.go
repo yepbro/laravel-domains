@@ -344,16 +344,16 @@ type LateResult struct {
 func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue,
 	pending content.RetentionPending, met *Metrics, opts LateOptions, cursor *RenderLateCursor) (LateResult, error) {
 	if pool == nil {
-		return LateResult{}, errors.New("httpworker: поздний переиздатель: пул не задан")
+		return LateResult{}, errors.New("httpworker: late re-publisher: the pool is not set")
 	}
 	if contents == nil {
-		return LateResult{}, errors.New("httpworker: поздний переиздатель: хранилище контента не задано")
+		return LateResult{}, errors.New("httpworker: late re-publisher: the content store is not set")
 	}
 	if render == nil {
-		return LateResult{}, errors.New("httpworker: поздний переиздатель: очередь рендера не задана")
+		return LateResult{}, errors.New("httpworker: late re-publisher: the render queue is not set")
 	}
 	if pending == nil {
-		return LateResult{}, errors.New("httpworker: поздний переиздатель: источник непотреблённых ключей стримов не задан (интерлок обязателен, образец retentionpending.go)")
+		return LateResult{}, errors.New("httpworker: late re-publisher: the unconsumed stream keys source is not set (the interlock is required, see retentionpending.go)")
 	}
 	if cursor == nil {
 		cursor = &RenderLateCursor{} // a one-shot call: the cursor without saving
@@ -369,7 +369,7 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 	// a MAXLEN trim again); the "it freed up" signal — the next tick.
 	free, err := render.HasCapacity(ctx)
 	if err != nil {
-		return out, fmt.Errorf("httpworker: поздний переиздатель: ёмкость q:render: %w", err)
+		return out, fmt.Errorf("httpworker: late re-publisher: q:render capacity: %w", err)
 	}
 	if !free {
 		return LateResult{Full: true}, nil
@@ -396,7 +396,7 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 	for _, s := range lateRenderStreams {
 		ks, err := pending.PendingKeys(ctx, s)
 		if err != nil {
-			return out, fmt.Errorf("httpworker: поздний переиздатель: непотреблённые %s: %w", s, err)
+			return out, fmt.Errorf("httpworker: late re-publisher: unconsumed %s: %w", s, err)
 		}
 		for k := range ks {
 			keys[k] = struct{}{}
@@ -478,14 +478,14 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 		// pass checks the same way before every domain).
 		free, err := render.HasCapacity(ctx)
 		if err != nil {
-			return out, fmt.Errorf("httpworker: поздний переиздатель: ёмкость q:render: %w", err)
+			return out, fmt.Errorf("httpworker: late re-publisher: q:render capacity: %w", err)
 		}
 		if !free {
 			out.Full = true
 			return out, nil
 		}
 		if err := render.Publish(ctx, publish); err != nil {
-			return out, fmt.Errorf("httpworker: поздний переиздатель: %w", err)
+			return out, fmt.Errorf("httpworker: late re-publisher: %w", err)
 		}
 		out.Published = len(publish)
 		met.LateRepublished(out.Published)
@@ -522,9 +522,9 @@ func lateBodySPA(ctx context.Context, contents RenderContent, cache map[content.
 	body, err := contents.Get(ctx, h)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return false, fmt.Errorf("httpworker: поздний переиздатель: чтение контента: %w", err)
+			return false, fmt.Errorf("httpworker: late re-publisher: content read: %w", err)
 		}
-		log.Warn("поздний переиздатель: контент записи недоступен — строка пропущена",
+		log.Warn("late re-publisher: the record content is unavailable — the row is skipped",
 			"domain", r.name, "subdomain_id", r.key.sub, "err", err)
 		cache[h] = false // a failure is not a verdict: unreadability is not "non-SPA",
 		// but a repeated read in this chunk is pointless; the skip's price —
@@ -550,7 +550,7 @@ func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cac
 	dom lateKey, subs []int16, log *slog.Logger) (map[int16]bool, error) {
 	rows, err := pool.Query(ctx, lateRenderAliasSQL, dom.zone, dom.domain, subs)
 	if err != nil {
-		return nil, fmt.Errorf("httpworker: поздний переиздатель: оригиналы алиасов: %w", err)
+		return nil, fmt.Errorf("httpworker: late re-publisher: alias originals: %w", err)
 	}
 	defer rows.Close()
 	out := make(map[int16]bool, len(subs))
@@ -562,7 +562,7 @@ func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cac
 			rendered bool
 		)
 		if err := rows.Scan(&sub, &variant, &hash, &rendered); err != nil {
-			return nil, fmt.Errorf("httpworker: поздний переиздатель: оригиналы алиасов: чтение: %w", err)
+			return nil, fmt.Errorf("httpworker: late re-publisher: alias originals: scan: %w", err)
 		}
 		if rendered {
 			out[sub] = true // the render happened — the class was SPA, the body is not read
@@ -583,7 +583,7 @@ func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cac
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("httpworker: поздний переиздатель: оригиналы алиасов: %w", err)
+		return nil, fmt.Errorf("httpworker: late re-publisher: alias originals: %w", err)
 	}
 	return out, nil
 }
@@ -602,7 +602,7 @@ func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cac
 func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.Time, after lateKey) ([]lateRow, error) {
 	o = o.withDefaults()
 	if err := o.Gate.Acquire(ctx); err != nil {
-		return nil, fmt.Errorf("httpworker: поздний переиздатель: выборка: %w", err)
+		return nil, fmt.Errorf("httpworker: late re-publisher: selection: %w", err)
 	}
 	defer o.Gate.Release()
 
@@ -611,7 +611,7 @@ func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.T
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("httpworker: поздний переиздатель: транзакция выборки: %w", err)
+		return nil, fmt.Errorf("httpworker: late re-publisher: selection transaction: %w", err)
 	}
 	// The rollback unconditionally: after the Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -620,7 +620,7 @@ func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.T
 	// pinning (seq/hash/merge/bitmap off, T-271) unrolled the join from
 	// domains at the production volume — the eternal loop over the deadline.
 	if _, err := tx.Exec(ctx, fmt.Sprintf(lateSelectTimeoutFmt, o.SelectTimeout.Milliseconds())); err != nil {
-		return nil, fmt.Errorf("httpworker: поздний переиздатель: потолок выборки: %w", err)
+		return nil, fmt.Errorf("httpworker: late re-publisher: selection cap: %w", err)
 	}
 
 	rows, err := tx.Query(ctx, lateRenderRowsSQL,
@@ -629,7 +629,7 @@ func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.T
 		o.BatchSize,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("httpworker: поздний переиздатель: выборка: %w", err)
+		return nil, fmt.Errorf("httpworker: late re-publisher: selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -642,16 +642,16 @@ func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.T
 			aliasSub *int16
 		)
 		if err := rows.Scan(&r.key.zone, &r.key.domain, &r.key.sub, &variant, &hash, &aliasSub, &r.name); err != nil {
-			return nil, fmt.Errorf("httpworker: поздний переиздатель: выборка: чтение: %w", err)
+			return nil, fmt.Errorf("httpworker: late re-publisher: selection: scan: %w", err)
 		}
 		r.key.variant, r.hash, r.aliasSub = model.Variant(variant), hash, aliasSub
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("httpworker: поздний переиздатель: выборка: %w", err)
+		return nil, fmt.Errorf("httpworker: late re-publisher: selection: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("httpworker: поздний переиздатель: фиксация выборки: %w", err)
+		return nil, fmt.Errorf("httpworker: late re-publisher: selection commit: %w", err)
 	}
 	return out, nil
 }
@@ -671,23 +671,23 @@ func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.T
 func RenderLateLoop(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue,
 	pending content.RetentionPending, met *Metrics, opts LateOptions) error {
 	if pool == nil {
-		return errors.New("httpworker: поздний переиздатель: пул не задан")
+		return errors.New("httpworker: late re-publisher: the pool is not set")
 	}
 	if contents == nil {
-		return errors.New("httpworker: поздний переиздатель: хранилище контента не задано")
+		return errors.New("httpworker: late re-publisher: the content store is not set")
 	}
 	if render == nil {
-		return errors.New("httpworker: поздний переиздатель: очередь рендера не задана")
+		return errors.New("httpworker: late re-publisher: the render queue is not set")
 	}
 	if pending == nil {
-		return errors.New("httpworker: поздний переиздатель: источник непотреблённых ключей стримов не задан")
+		return errors.New("httpworker: late re-publisher: the unconsumed stream keys source is not set")
 	}
 	o := opts.withDefaults()
 	if o.Log == nil {
 		o.Log = slog.New(slog.DiscardHandler)
 	}
 	log := o.Log
-	log.Info("поздний переиздатель рендера запущен",
+	log.Info("render late re-publisher started",
 		"interval", o.Interval.String(), "batch", o.BatchSize, "after", o.After.String())
 
 	cursor := &RenderLateCursor{}
@@ -703,7 +703,7 @@ func RenderLateLoop(ctx context.Context, pool RecordDB, contents RenderContent, 
 			if err != nil {
 				// A cancellation during the pass — part of the stop, not an alarm.
 				if ctx.Err() == nil {
-					log.Warn("поздний переиздатель рендера", "err", err)
+					log.Warn("render late re-publisher", "err", err)
 					met.LateError()
 				}
 				// A backoff after EVERY error (T-271 introduced the backoff,
@@ -729,11 +729,11 @@ func RenderLateLoop(ctx context.Context, pool RecordDB, contents RenderContent, 
 			// not noted by a log line (the T-259 P3-2 review), only
 			// Debug; the significant events — publications and a stalled queue.
 			if res.Published > 0 || res.Full {
-				log.Info("поздний переиздатель рендера",
+				log.Info("render late re-publisher",
 					"selected", res.Selected, "skipped", res.Skipped,
 					"published", res.Published, "full", res.Full, "wrapped", res.Wrapped)
 			} else if res.Wrapped {
-				log.Debug("поздний переиздатель рендера: множество исчерпано, цикл замкнут")
+				log.Debug("render late re-publisher: the set is exhausted, the cycle is wrapped")
 			}
 		}
 	}

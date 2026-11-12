@@ -64,7 +64,7 @@ func rwMetricValue(t *testing.T, g prometheus.Gatherer, name string, labels map[
 
 func TestMetricsNilSafe(t *testing.T) {
 	if NewMetrics(nil, config.EngineChromium) != nil {
-		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
+		t.Fatal("NewMetrics(nil) != nil — isolated builds without a registry")
 	}
 	var m *Metrics
 	m.Task(time.Second)                  // a no-op, does not panic
@@ -121,7 +121,7 @@ func TestMetricsMethods(t *testing.T) {
 	// the one without a label are not exported by the worker — cardinality 3 is kept by
 	// initialization, not the caller.
 	if got := rwMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "true", "engine": config.EngineChromium}); got != -1 {
-		t.Errorf("crawler_render_records_total{engine=%s} = %v, want -1 (серия чужого движка)", config.EngineChromium, got)
+		t.Errorf("crawler_render_records_total{engine=%s} = %v, want -1 (a series of a foreign engine)", config.EngineChromium, got)
 	}
 	// Tarpit finalizations with the build's engine label (S-P2-4): another
 	// engine's series is not created — the vocabulary is lazy (no open codes, but
@@ -132,7 +132,7 @@ func TestMetricsMethods(t *testing.T) {
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total",
 		map[string]string{"engine": config.EngineChromium}); got != -1 {
-		t.Errorf("crawler_render_tarpit_finalized_total{engine=%s} = %v, want -1 (серия чужого движка)", config.EngineChromium, got)
+		t.Errorf("crawler_render_tarpit_finalized_total{engine=%s} = %v, want -1 (a series of a foreign engine)", config.EngineChromium, got)
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_cert_finalized_total", nil); got != 1 {
 		t.Errorf("crawler_render_cert_finalized_total = %v, want 1", got)
@@ -152,7 +152,7 @@ func TestMetricsMethods(t *testing.T) {
 	}
 	if got := rwMetricValue(t, reg, "crawler_render_task_finalized_total",
 		map[string]string{"reason": "other", "engine": config.EngineMoli}); got != -1 {
-		t.Errorf("crawler_render_task_finalized_total{engine=%s} = %v, want -1 (серия чужого движка)", config.EngineMoli, got)
+		t.Errorf("crawler_render_task_finalized_total{engine=%s} = %v, want -1 (a series of a foreign engine)", config.EngineMoli, got)
 	}
 	for reason, want := range map[string]float64{
 		"timeout":                     2,
@@ -210,13 +210,13 @@ func TestMetricsPrecreatedClosedSeries(t *testing.T) {
 	for _, reason := range []string{fbReasonGate, fbReasonBudget} {
 		if got := rwMetricValue(t, reg, "crawler_render_fallback_suspended_total",
 			map[string]string{"reason": reason}); got != 0 {
-			t.Errorf("crawler_render_fallback_suspended_total{%s} после NewMetrics = %v, want 0 (серия предсоздана)", reason, got)
+			t.Errorf("crawler_render_fallback_suspended_total{%s} after NewMetrics = %v, want 0 (the series is pre-created)", reason, got)
 		}
 	}
 	for _, result := range []string{fbResultRendered, fbResultFinalized, fbResultSkipped} {
 		if got := rwMetricValue(t, reg, "crawler_render_fallback_consumed_total",
 			map[string]string{"result": result}); got != 0 {
-			t.Errorf("crawler_render_fallback_consumed_total{%s} после NewMetrics = %v, want 0 (серия предсоздана)", result, got)
+			t.Errorf("crawler_render_fallback_consumed_total{%s} after NewMetrics = %v, want 0 (the series is pre-created)", result, got)
 		}
 	}
 
@@ -225,12 +225,12 @@ func TestMetricsPrecreatedClosedSeries(t *testing.T) {
 	m.FallbackSuspended(fbReasonBudget)
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_suspended_total",
 		map[string]string{"reason": fbReasonBudget}); got != 1 {
-		t.Errorf("crawler_render_fallback_suspended_total{budget} после первого события = %v, want 1", got)
+		t.Errorf("crawler_render_fallback_suspended_total{budget} after the first event = %v, want 1", got)
 	}
 	m.FallbackConsumed(fbResultRendered)
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_consumed_total",
 		map[string]string{"result": fbResultRendered}); got != 1 {
-		t.Errorf("crawler_render_fallback_consumed_total{rendered} после первого события = %v, want 1", got)
+		t.Errorf("crawler_render_fallback_consumed_total{rendered} after the first event = %v, want 1", got)
 	}
 }
 
@@ -262,7 +262,7 @@ func TestMetricsEngineDefault(t *testing.T) {
 func TestMetricsProcessDelivery(t *testing.T) {
 	reg := metrics.New("render-worker")
 
-	t.Run("успех", func(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
 		pool := newRWFakePool()
 		store := &rwFakeStore{j: pool.j, p: pool}
 		renderer := &rwFakeRenderer{j: pool.j, output: rwOutput("<html><body>dom</body></html>")}
@@ -291,11 +291,11 @@ func TestMetricsProcessDelivery(t *testing.T) {
 		}
 	})
 
-	t.Run("ошибка рендера — класс в счётчик ошибок", func(t *testing.T) {
+	t.Run("a render error — the class into the error counter", func(t *testing.T) {
 		pool := newRWFakePool()
 		store := &rwFakeStore{j: pool.j, p: pool}
 		renderer := &rwFakeRenderer{j: pool.j,
-			err: &render.Error{Class: render.ClassTask, URL: "https://spa.example/", Err: errors.New("таймаут")}}
+			err: &render.Error{Class: render.ClassTask, URL: "https://spa.example/", Err: errors.New("timeout")}}
 		q := &rwFakeQueue{j: pool.j}
 		w, err := New(pool, q, store, renderer, Options{Metrics: reg})
 		if err != nil {
@@ -304,11 +304,11 @@ func TestMetricsProcessDelivery(t *testing.T) {
 		pool.seedRow(rwKey, "https://spa.example/", nil)
 
 		if err := w.processDelivery(context.Background(), rwDelivery("e2"), 1); err == nil {
-			t.Fatal("processDelivery ошибочного рендера = nil, want ошибка")
+			t.Fatal("processDelivery of a failed render = nil, want an error")
 		}
 		stage := map[string]string{"stage": metrics.StageRender}
 		if got := rwMetricValue(t, reg, "crawler_stage_tasks_total", stage); got != 1 {
-			t.Errorf("crawler_stage_tasks_total = %v, want по-прежнему 1 (ошибка не считается задачей)", got)
+			t.Errorf("crawler_stage_tasks_total = %v, want still 1 (an error does not count as a task)", got)
 		}
 		labels := map[string]string{"stage": metrics.StageRender, "type": render.ClassTask.String()}
 		if got := rwMetricValue(t, reg, "crawler_stage_errors_total", labels); got != 1 {
