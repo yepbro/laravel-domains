@@ -1,9 +1,9 @@
-// Юнит-тесты метрик цикла retention (T-166): накопление итогов проходов
-// в счётчики (строки/ссылки/contents/байты), пропуски интерлока меткой
-// passes{result}, ошибки чтения защиты очередей (passes{skipped_pending}
-// + pending_errors), исключённые защитой записи по стримам
-// (deferred{stream}), аномалии учёта, no-op без реестра, идемпотентность
-// конструктора (T-076).
+// Unit tests of the retention cycle metrics (T-166): accumulation of pass
+// outcomes in counters (rows/refs/contents/bytes), interlock skips via the
+// passes{result} label, queue-guard read errors (passes{skipped_pending}
+// + pending_errors), records excluded by the guard per stream
+// (deferred{stream}), bookkeeping anomalies, no-op without a registry,
+// constructor idempotency (T-076).
 package content
 
 import (
@@ -15,9 +15,9 @@ import (
 	"crawler/internal/metrics"
 )
 
-// retentionCounterValue — значение счётчика name (без меток, кроме
-// сервисной): первый ряд семейства; -1, если метрика не экспортирована
-// (стиль cleanupCounterValue в ingest).
+// retentionCounterValue — the value of the counter name (no labels except
+// the service one): the first series of the family; -1 if the metric is not
+// exported (the style of cleanupCounterValue in ingest).
 func retentionCounterValue(t *testing.T, g prometheus.Gatherer, name string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -37,8 +37,8 @@ func retentionCounterValue(t *testing.T, g prometheus.Gatherer, name string) flo
 	return -1
 }
 
-// retentionCounterByLabels — значение счётчика name с точным набором
-// меток (кроме сервисной); -1, если ряд не найден.
+// retentionCounterByLabels — the value of the counter name with an exact
+// label set (except the service label); -1 if no series is found.
 func retentionCounterByLabels(t *testing.T, g prometheus.Gatherer, name string, labels map[string]string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -74,14 +74,14 @@ func retentionCounterByLabels(t *testing.T, g prometheus.Gatherer, name string, 
 	return -1
 }
 
-// TestRetentionMetricsObserve — итоги проходов накапливаются в счётчики,
-// нулевые значения не меняют, интерлок считается отдельно (skips +
-// passes{result="skipped"}), рабочие проходы — passes{result="ok"}.
+// TestRetentionMetricsObserve — pass outcomes accumulate in counters,
+// zero values change nothing, the interlock is counted separately (skips +
+// passes{result="skipped"}), working passes go to passes{result="ok"}.
 func TestRetentionMetricsObserve(t *testing.T) {
 	reg := metrics.New("http-worker")
 	m := NewRetentionMetrics(reg)
 
-	m.Observe(RetentionStats{}, time.Second) // пустой проход: счётчики не растут
+	m.Observe(RetentionStats{}, time.Second) // empty pass: counters do not grow
 	for _, name := range []string{
 		"crawler_content_retention_rows_total",
 		"crawler_content_retention_refs_total",
@@ -122,8 +122,8 @@ func TestRetentionMetricsObserve(t *testing.T) {
 		t.Errorf("skips = %v, want 0", got)
 	}
 
-	// Пропуск интерлока: счётчики работы не растут (работы не было),
-	// skips и метка skipped.
+	// Interlock skip: work counters do not grow (there was no work),
+	// skips and the skipped label.
 	m.Observe(RetentionStats{Skipped: true, Depth: 150}, time.Second)
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 15 {
 		t.Errorf("rows после пропуска = %v, want прежние 15", got)
@@ -135,9 +135,9 @@ func TestRetentionMetricsObserve(t *testing.T) {
 		t.Errorf("passes{skipped} = %v, want 1", got)
 	}
 
-	// Пропуск посреди дренажа НЕ теряет сделанной работы (fix ревью:
-	// пачки-то зафиксированы в БД): интерлок после части пачек —
-	// счётчики работы зачитываются и в пропущенном проходе.
+	// A skip in the middle of a drain does NOT lose the work already done
+	// (review fix: the batches are committed in the DB): an interlock after
+	// some batches — the work counters are credited in the skipped pass too.
 	m.Observe(RetentionStats{Skipped: true, Depth: 150, Rows: 7, Refs: 7, Contents: 5, FreedBytes: 1000}, time.Second)
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 22 {
 		t.Errorf("rows = %v, want 22 (15 + 7 из пропущенного посреди дренажа)", got)
@@ -146,9 +146,10 @@ func TestRetentionMetricsObserve(t *testing.T) {
 		t.Errorf("contents = %v, want 15 (10 + 5)", got)
 	}
 
-	// Пропуск по ошибке чтения стримов защиты (T-166/T-167): отдельная
-	// метка passes{skipped_pending} и счётчик ошибок; skips интерлока
-	// не растёт — причины разные, алерты раздельные.
+	// Skip due to a guard stream read error (T-166/T-167): a separate
+	// passes{skipped_pending} label and an error counter; the interlock
+	// skips counter does not grow — the causes differ, the alerts are
+	// separate.
 	m.Observe(RetentionStats{SkippedPending: true}, time.Second)
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_pending_errors_total"); got != 1 {
 		t.Errorf("pending_errors = %v, want 1", got)
@@ -160,8 +161,8 @@ func TestRetentionMetricsObserve(t *testing.T) {
 		t.Errorf("skips = %v, want прежние 2 (интерлок ни при чём)", got)
 	}
 
-	// Исключённые защитой записи — по стримам: запись, ждущая оба стрима,
-	// считается в каждом; работающие счётчики не трогают.
+	// Records excluded by the guard — per stream: a record waiting on both
+	// streams is counted in each; the working counters are not touched.
 	m.Observe(RetentionStats{
 		Rows:     2,
 		Deferred: map[string]int64{"q:render": 1, "q:analyze": 2},
@@ -177,13 +178,13 @@ func TestRetentionMetricsObserve(t *testing.T) {
 	}
 }
 
-// TestRetentionMetricsNoRegistry — без реестра коллектора нет (изолированные
-// сборки), вызовы Observe — no-op без паники.
+// TestRetentionMetricsNoRegistry — without a registry there is no collector
+// (isolated builds); Observe calls are a no-op without a panic.
 func TestRetentionMetricsNoRegistry(t *testing.T) {
 	if m := NewRetentionMetrics(nil); m != nil {
 		t.Fatalf("NewRetentionMetrics(nil) = %v, want nil", m)
 	}
-	NewRetentionMetrics(nil).Observe(RetentionStats{Rows: 7}, time.Second) // не паникует
+	NewRetentionMetrics(nil).Observe(RetentionStats{Rows: 7}, time.Second) // does not panic
 
 	families, err := metrics.New("http-worker").Gather()
 	if err != nil {
@@ -196,8 +197,8 @@ func TestRetentionMetricsNoRegistry(t *testing.T) {
 	}
 }
 
-// TestRetentionMetricsIdempotent — повторная регистрация делит те же
-// коллекторы (T-076): конструктор можно вызывать на каждом цикле.
+// TestRetentionMetricsIdempotent — a repeated registration shares the same
+// collectors (T-076): the constructor may be called on every cycle.
 func TestRetentionMetricsIdempotent(t *testing.T) {
 	reg := metrics.New("http-worker")
 	first := NewRetentionMetrics(reg)
@@ -209,19 +210,19 @@ func TestRetentionMetricsIdempotent(t *testing.T) {
 	}
 }
 
-// TestRetentionMetricsErrorsCounter — счётчик ошибочных проходов
-// crawler_content_retention_errors_total (T-273): экспонируется, растёт
-// на ObserveError (по одному на неудачный проход — хук RetentionOptions.
-// OnError), успешный/пропущенный проход его не трогает; nil-приёмник —
-// no-op. До T-273 ошибки проходов были видны только в journalctl
-// (инцидент 09–10.11.2026: сутки WARN-ов при нулевых метриках).
+// TestRetentionMetricsErrorsCounter — the failed-pass counter
+// crawler_content_retention_errors_total (T-273): exported, grows on
+// ObserveError (one per failed pass — the RetentionOptions.OnError hook),
+// a successful/skipped pass does not touch it; a nil receiver is a no-op.
+// Before T-273 pass errors were visible only in journalctl
+// (the 2026-11-09/10 incident: a day of WARNs with zero pass metrics).
 func TestRetentionMetricsErrorsCounter(t *testing.T) {
 	reg := metrics.New("http-worker")
 	m := NewRetentionMetrics(reg)
 	const name = "crawler_content_retention_errors_total"
 
-	m.Observe(RetentionStats{}, time.Second)              // успешный (пустой) проход
-	m.Observe(RetentionStats{Skipped: true}, time.Second) // пропуск интерлока
+	m.Observe(RetentionStats{}, time.Second)              // successful (empty) pass
+	m.Observe(RetentionStats{Skipped: true}, time.Second) // interlock skip
 	if got := retentionCounterValue(t, reg, name); got != 0 {
 		t.Fatalf("%s до ошибок = %v, want 0 (успех/пропуск не считаются)", name, got)
 	}
@@ -231,6 +232,6 @@ func TestRetentionMetricsErrorsCounter(t *testing.T) {
 		t.Fatalf("%s после двух ошибочных проходов = %v, want 2", name, got)
 	}
 
-	// nil-приёмник (сервис без реестра) — no-op, не паникует.
+	// A nil receiver (a service without a registry) — a no-op, no panic.
 	NewRetentionMetrics(nil).ObserveError(nil)
 }

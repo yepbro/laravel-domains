@@ -1,10 +1,10 @@
 package content
 
-// Фиксация алгоритма идентификации контента (HashOf, ТЗ 5.7) и
-// hex-представления для логов. Эталонная in-memory реализация и прогон
-// на ней контрактного набора StoreContract — в пакете contenttest
-// (T-228): набор импортирует testing и не должен попадать в нетестовую
-// сборку пакета content (аналог stdlib testing/fstest).
+// Pinning of the content identification algorithm (HashOf, spec 5.7) and
+// the hex representation for logs. The reference in-memory implementation and
+// running the StoreContract contract suite against it live in the contenttest
+// package (T-228): the suite imports testing and must not end up in the
+// non-test build of the content package (analogous to stdlib testing/fstest).
 
 import (
 	"crypto/sha256"
@@ -12,9 +12,10 @@ import (
 	"testing"
 )
 
-// TestHashOf — фиксация алгоритма идентификации (ТЗ 5.7): SHA-256,
-// усечённый до первых HashLen байт. Ожидание считается напрямую
-// crypto/sha256, чтобы смена алгоритма в HashOf не прошла незамеченной.
+// TestHashOf pins the identification algorithm (spec 5.7): SHA-256,
+// truncated to the first HashLen bytes. The expectation is computed directly
+// with crypto/sha256, so that changing the algorithm in HashOf cannot pass
+// unnoticed.
 func TestHashOf(t *testing.T) {
 	cases := [][]byte{
 		nil,
@@ -42,7 +43,7 @@ func TestHashOf(t *testing.T) {
 	}
 }
 
-// TestHashString — hex-представление для логов и сообщений об ошибках.
+// TestHashString — the hex representation for logs and error messages.
 func TestHashString(t *testing.T) {
 	h := HashOf([]byte("контент"))
 	want := hex.EncodeToString(h[:])

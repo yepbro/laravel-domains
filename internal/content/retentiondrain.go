@@ -1,44 +1,44 @@
-// Состояние дренажа retention, переживающее проходы (T-185; ТЗ
-// TZ_slow_retention_drain.md §4.2–4.4 — диагноз запроса №13 журнала
-// медленных 24.10: ежечасные полные круги по PK перечитывали heap всей
-// пройденной истории, дорожка росла с таблицей ≈3 млн строк/сут, медиана
-// 76 с, 63 мин времени БД за 2,4 ч).
+// Retention drain state that survives passes (T-185; spec
+// TZ_slow_retention_drain.md §4.2–4.4 — the diagnosis of slow-query log
+// entry #13 of Oct 24: hourly full circles over PK re-read the heap of the
+// entire traversed history; the trail grew with the table at ≈3M rows per
+// day, the median 76 s, 63 min of DB time over 2.4 h).
 //
-// Модель «один раз за жизнь» (§3): курсор по (checked_at, PK)
-// инициализируется нулём при старте процесса — первый проход и есть
-// catch-up-круг по накопленному — и продвигается пачками вперёд;
-// очищенная строка остаётся позади курсора, перепроверённая (DELETE+
-// INSERT, fresh checked_at — T-058) входит в дренаж заново, когда
-// состарится. С T-274 курсор дополнительно персистентен в БД
-// (retentioncursor.go, миграция 000020): рестарт процесса продолжает
-// дренаж с сохранённой позиции, а не новый catch-up с нуля (штраф
-// рестартов — часовой обход чистого префикса, замеры 10–11.11.2026 —
-// снят). «Неполная пачка» — дренаж до конца текущего окна старения;
-// следующий проход (час) продолжает с места остановки — срез
-// состарившегося за час ≈ приток, окно обслуживает индекс
-// subdomain_results_checked_idx (T-171).
+// The "once in a lifetime" model (§3): a cursor over (checked_at, PK) is
+// initialized to zero at process start — the first pass is the catch-up
+// circle over what has accumulated — and advances batch by batch; a
+// trimmed row stays behind the cursor, and a re-checked one (DELETE+INSERT,
+// fresh checked_at — T-058) enters the drain again when it ages. Since
+// T-274 the cursor is additionally persisted in the DB (retentioncursor.go,
+// migration 000020): a process restart continues the drain from the saved
+// position rather than a new catch-up from zero (the restart penalty — an
+// hourly traversal of the clean prefix, measurements 2026-11-10/11 — is
+// gone). An "incomplete batch" means the drain ran to the end of the
+// current aging window; the next pass (an hour later) continues from the
+// stop point — the slice that ages over an hour ≈ the inflow, and the
+// window is served by the subdomain_results_checked_idx index (T-171).
 //
-// Явные ретраи вместо полных кругов (§4.3–4.4): ежечасный круг был
-// одновременно ретраем (подбирал защищённые) и дорожкой (перечитывал
-// историю) — замена:
+// Explicit retries instead of full circles (§4.3–4.4): the hourly circle
+// was at once a retry (picking up protected records) and a trail
+// (re-reading history) — the replacement:
 //
-//   - bounded-список ключей, отложенных защитой очередей
-//     (retentionpending.go): следующий проход предлагает их точечным
-//     зондом по PK (retentionProbeSQL), всё ещё защищённые остаются в
-//     списке; потеря списка (рестарт) покрывается catch-up-кругом
-//     старта; переполнение — Warn и консервативный catch-up-круг;
-//   - catch-up-круг по обнулению счётчика рендер-долга
-//     crawler_counters['render_pending'] (T-175): записи под флагом
-//     render_pending молча отфильтровываются JOIN'ом — курсор по времени
-//     их проходит; переход счётчика в 0 (вся рендер-защита снята разом)
-//     читается точечно в начале каждого прохода и планирует один полный
-//     круг с нулевого курсора. Отсутствие строки счётчика (БД до
-//     деплоя T-175) — fallback: круг раз в сутки (константа, конфиг-поле
-//     не заводится, ТЗ §4.4).
+//   - a bounded list of keys deferred by the queue guards
+//     (retentionpending.go): the next pass offers them with a point probe
+//     by PK (retentionProbeSQL); still-protected keys stay in the list;
+//     the loss of the list (a restart) is covered by the catch-up circle of
+//     the start; an overflow — a Warn and a conservative catch-up circle;
+//   - a catch-up circle on the render-debt counter
+//     crawler_counters['render_pending'] reset to zero (T-175): records
+//     under the render_pending flag are silently filtered out by a JOIN —
+//     the time cursor passes them; the counter's transition to 0 (all
+//     render protection lifted at once) is read point-wise at the start of
+//     every pass and plans one full circle from the zero cursor. A missing
+//     counter row (the DB before the T-175 deploy) — a fallback: a circle
+//     once per day (a constant; no config knob is introduced, spec §4.4).
 //
-// Что не меняется (§4.5): purge/decref/delete с охранными повторными
-// проверками, интерлок retentionBlocked, снимки retentionPendingSnapshot
-// и их обновление длинного дренажа, статистики и метрики OnPass.
+// What does not change (§4.5): purge/decref/delete with guard re-checks,
+// the retentionBlocked interlock, the retentionPendingSnapshot snapshots
+// and their long-drain refresh, the statistics and OnPass metrics.
 package content
 
 import (
@@ -52,69 +52,71 @@ import (
 )
 
 const (
-	// DefaultRetentionRetryLimit — предел списка ключей ретраев защиты
-	// очередей (T-185): порядок глубин стримов у watermark'ов (гейт
-	// T-026: 100 тыс.; render-порог T-174: 10 тыс.) — застой большего
-	// масштаба упразднёнными кругами не вылечить, интерлок глубины
-	// останавливает проходы раньше. Память ключа ≈ десятки байт —
-	// сотни тысяч строк списка остаются дёшевы; превышение — Warn и
-	// консервативный catch-up-круг следующим проходом (круг пересоберёт
-	// список сам). Тесты подменяют полем retentionState.retryLimit.
+	// DefaultRetentionRetryLimit — the limit of the queue-guard retry key
+	// list (T-185): the order of the stream depths at the watermarks (the
+	// T-026 gate: 100k; the T-174 render threshold: 10k) — a standstill of
+	// a larger scale cannot be cured by the abolished circles; the depth
+	// interlock stops the passes earlier. A key costs ≈ tens of bytes —
+	// hundreds of thousands of list rows stay cheap; an overflow — a Warn
+	// and a conservative catch-up circle on the next pass (the circle will
+	// rebuild the list itself). Tests substitute it with the
+	// retentionState.retryLimit field.
 	DefaultRetentionRetryLimit = 100000
 
-	// DefaultRetentionFallbackCircle — период fallback-круга при
-	// недоступном счётчике рендер-долга (нет строки либо таблицы —
-	// БД до деплоя T-175, сбой чтения; ТЗ §4.4): сутки — «раз в
-	// спокойный час» без конфиг-поля; якорь двигают успешные чтения
-	// счётчика и выполненные круги. «Спокойный час» ТЗ понимается как
-	// «сутки от якоря», а не час суток: отдельное расписание заведено
-	// сознательно не было (конфиг-поле запрещено ТЗ).
+	// DefaultRetentionFallbackCircle — the fallback circle period when the
+	// render-debt counter is unavailable (no row or no table — the DB
+	// before the T-175 deploy, a read failure; spec §4.4): a day means
+	// "once per quiet hour" without a config knob; the anchor is moved by
+	// successful counter reads and completed circles. The spec's "quiet
+	// hour" is understood as "a day from the anchor", not an hour of the
+	// day: a separate schedule was deliberately not introduced (a config
+	// knob is forbidden by the spec).
 	DefaultRetentionFallbackCircle = 24 * time.Hour
 )
 
-// retentionState — дренажное состояние цикла, переживающее проходы
-// (T-185). Владелец — цикл RetentionLoop (одна горутина тикера);
-// разовый RetentionOnce работает с чистым состоянием. Nil-карта
-// retries — «ретраев нет».
+// retentionState — the drain state of the cycle that survives passes
+// (T-185). The owner is the RetentionLoop cycle (a single ticker
+// goroutine); the one-off RetentionOnce works with a clean state. A nil
+// retries map means "no retries".
 type retentionState struct {
-	// cursor — курсор дренажа по времени (§4.2): последняя посещённая
-	// строка; продвигается только зафиксированными пачками.
+	// cursor — the time-based drain cursor (§4.2): the last visited row;
+	// advanced only by committed batches.
 	cursor retentionCursor
-	// retries — bounded-множество ключей, отложенных защитой очередей
-	// (§4.3): следующий проход предлагает их зондом retentionProbeSQL.
+	// retries — the bounded set of keys deferred by the queue guards
+	// (§4.3): the next pass offers them with the retentionProbeSQL probe.
 	retries map[retentionKey]struct{}
-	// debtSeen — счётчик рендер-долга наблюдался > 0 после последнего
-	// круга (§4.4): переход следующего чтения в 0 — catch-up-круг.
+	// debtSeen — the render-debt counter was observed > 0 after the last
+	// circle (§4.4): the next read's transition to 0 — a catch-up circle.
 	debtSeen bool
-	// lastCircle — якорь fallback-суток: успешные чтения счётчика долга
-	// и выполненные круги (fallback значит «счётчик недоступен сутки
-	// ПОДРЯД», транзиентный блип круга не поднимает); начальный якорь —
-	// создание состояния (стартовый дренаж и так с нуля).
+	// lastCircle — the anchor of the fallback day: successful debt counter
+	// reads and completed circles (fallback means "unavailable for a day
+	// IN A ROW"; a transient blip does not move it); the initial anchor is
+	// the state creation (the starting drain goes from zero anyway).
 	lastCircle time.Time
-	// noCounterTable — таблицы crawler_counters ещё не было (Info один
-	// раз на процесс, ревью T-185, P3-4 R3).
+	// noCounterTable — the crawler_counters table was not there yet (one
+	// Info per process, review of T-185, P3-4 R3).
 	noCounterTable bool
-	// circle — следующий проход стартует с нулевого курсора (§4.2–4.4):
-	// снятие рендер-долга, переполнение списка ретраев, fallback-сутки;
-	// circleWhy — причина для журнала.
+	// circle — the next pass starts from the zero cursor (§4.2–4.4):
+	// the render-debt lift, the retry list overflow, the fallback day;
+	// circleWhy — the reason for the journal.
 	circle    bool
 	circleWhy string
 
-	// retryLimit — предел списка ретраев (DefaultRetentionRetryLimit);
-	// поле для юнит-тестов — меньше возиться с сотней тысяч ключей.
+	// retryLimit — the retry list limit (DefaultRetentionRetryLimit);
+	// a field for unit tests — less fiddling with a hundred thousand keys.
 	retryLimit int
 
-	// persist — состояние принадлежит циклу сервиса (RetentionLoop):
-	// курсор пачек фиксируется в БД (retention_drain_cursor, T-274,
-	// миграция 000020), принудительные круги чистят сохранённую позицию.
-	// Разовый RetentionOnce и юнит-тесты критериев отбора работают без
-	// персистентности (поведение до T-274); сброс в false при
-	// отсутствии таблицы (миграция не применена — Info один раз,
-	// стиль noCounterTable).
+	// persist — the state belongs to the service cycle (RetentionLoop):
+	// the batch cursor is committed to the DB (retention_drain_cursor,
+	// T-274, migration 000020); forced circles clear the saved position.
+	// The one-off RetentionOnce and the unit tests of the selection
+	// criteria work without persistence (the pre-T-274 behavior); reset to
+	// false when the table is missing (the migration not applied — one
+	// Info, the noCounterTable style).
 	persist bool
 }
 
-// limit — эффективный предел списка ретраев.
+// limit — the effective retry list limit.
 func (st *retentionState) limit() int {
 	if st.retryLimit > 0 {
 		return st.retryLimit
@@ -122,12 +124,13 @@ func (st *retentionState) limit() int {
 	return DefaultRetentionRetryLimit
 }
 
-// retentionPass — один проход цикла с состоянием st (ТЗ §5.1):
-// catch-up-решение по счётчику рендер-долга в начале прохода, точечные
-// предложения ретраев, дренаж пачками от курсора st.cursor до
-// исчерпания окна старения, остановки интерлоком, ошибки защиты очередей
-// или отмены ctx. Остановки сохраняют прогресс: курсор и список ретраев
-// переживут проход — следующий продолжит с места остановки.
+// retentionPass — one pass of the cycle with the state st (spec §5.1):
+// the catch-up decision on the render-debt counter at the start of the
+// pass, point retry offers, the drain in batches from the st.cursor cursor
+// until the aging window is exhausted, stops by the interlock, the
+// queue-guard errors, or a ctx cancellation. Stops keep the progress: the
+// cursor and the retry list will survive the pass — the next one continues
+// from the stop point.
 func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions, st *retentionState) (RetentionStats, error) {
 	if pool == nil {
 		return RetentionStats{}, errors.New("content: retention: пул не задан")
@@ -135,10 +138,11 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 	if st == nil {
 		st = &retentionState{}
 	}
-	// Якорь fallback-суток — момент создания состояния: стартовый дренаж
-	// и так идёт с нулевого курсора («круг только что был»); без якоря
-	// первый же транзиентный сбой чтения счётчика считался бы «сутки
-	// истекли» и немедленно поднимал полный круг (ревью T-185, P3-3).
+	// The fallback-day anchor is the moment of state creation: the starting
+	// drain goes from the zero cursor anyway ("the circle has just
+	// happened"); without an anchor, the very first transient counter read
+	// failure would count as "the day has elapsed" and immediately raise a
+	// full circle (review of T-185, P3-3).
 	if st.lastCircle.IsZero() {
 		st.lastCircle = time.Now()
 	}
@@ -149,23 +153,24 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 	}
 	st.catchUp(ctx, pool, log)
 	var out RetentionStats
-	// Снимок защиты — лениво, ПОСЛЕ первой проверки интерлока: интерлок
-	// «анализатор не успевает» закрывает и q:analyze, и q:render шире
-	// снимка — гонять тяжёлый XRANGE ради тут же выброшенного прохода
-	// незачем; кроме того, таймаут чтения зависшего стрима при закрытом
-	// интерлоке дал бы ложный SkippedPending вместо честного Skipped.
-	// Ошибка чтения — не ошибка прохода, а его отмена (данные не тронуты):
-	// см. шапку retentionpending.go.
+	// The protection snapshot is lazy, AFTER the first interlock check: the
+	// "the analyzer cannot keep up" interlock covers both q:analyze and
+	// q:render wider than the snapshot — there is no point in running the
+	// heavy XRANGE for a pass that is immediately abandoned; besides, a
+	// read timeout of a stuck stream with the interlock closed would yield
+	// a false SkippedPending instead of an honest Skipped.
+	// A read error is not a pass error but its cancellation (the data is
+	// untouched): see the retentionpending.go header.
 	var pending *retentionPendingSets
-	selects := 0 // выборок пачек с момента снимка (обновление длинного дренажа)
+	selects := 0 // batch selections since the snapshot (the long-drain refresh)
 	probed := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return out, fmt.Errorf("content: retention: %w", err)
 		}
-		// Интерлок: анализатор не успевает — тела и headers/cookies
-		// записей очереди ещё нужны; проверяется на каждой пачке —
-		// длинный дренаж видит свежую глубину.
+		// The interlock: the analyzer cannot keep up — the bodies and
+		// headers/cookies of queued records are still needed; checked on
+		// every batch — a long drain sees the fresh depth.
 		n, blocked, err := retentionBlocked(ctx, o)
 		if err != nil {
 			return out, fmt.Errorf("content: retention: интерлок q:analyze: %w", err)
@@ -175,8 +180,9 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 			out.Depth = n
 			return out, nil
 		}
-		// Первый снимок — после интерлока, до первой выборки: чистка
-		// начинается только когда известно, какие записи ждут очередей.
+		// The first snapshot — after the interlock, before the first
+		// selection: the purge starts only once it is known which records
+		// the queues are waiting on.
 		if o.Pending != nil && pending == nil {
 			p, err := retentionPendingSnapshot(ctx, o.Pending)
 			if err != nil {
@@ -189,9 +195,9 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 			pending = p
 		}
 
-		// Точечные предложения ретраев (§4.3) — строго один раз за проход,
-		// до дренажа: список ниже курсора, зонд не зависит от пачек; ключи,
-		// отложенные этим же проходом, предлагаются следующим.
+		// Point retry offers (§4.3) — strictly once per pass, before the
+		// drain: the list is below the cursor, the probe does not depend on
+		// batches; keys deferred by this same pass are offered by the next.
 		if !probed {
 			probed = true
 			if len(st.retries) > 0 {
@@ -206,39 +212,40 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 			return out, err
 		}
 		if len(batch) == 0 {
-			return out, nil // окно старения исчерпано — курсор ждёт следующего часа
+			return out, nil // the aging window is exhausted — the cursor waits for the next hour
 		}
 		selects++
-		// Курсор и решение об исчерпании — по исходной выборке: исключённые
-		// защитой записи этим проходом пропускаются (курсор за ними) и
-		// вернутся точечным предложением (§4.3) — чистка только
-		// не-ожидающих.
+		// The cursor and the exhaustion decision — over the original
+		// selection: records excluded by the guards are skipped by this
+		// pass (the cursor goes past them) and will come back as point
+		// offers (§4.3) — only non-waiting records are purged.
 		last, full := batch[len(batch)-1], len(batch) >= o.BatchSize
 		next := retentionCursor{checkedAt: last.checkedAt, key: last.key}
 		st.deferRetries(ctx, pool, batch, pending, log)
 		selected := len(batch)
 		batch = pending.deferBatch(batch, &out)
 		if len(batch) > 0 {
-			// Персистентный курсор — транзакцией пачки (T-274), но только
-			// если пачка НЕ перешагнула отложенных защитой строк: позиция
-			// в БД не двигается за непочищенные строки — потеря списка
-			// ретраев при рестарте восполняется перечитыванием защитного
-			// окна (ключи отложатся заново), чистые строки выпадут из
-			// отбора сами (ревью T-274, P1). In-memory курсор двигается
-			// как раньше: в пределах жизни процесса ключи вернёт зонд.
-			// Запланированный круг подавляет сохранение (planCircle уже
-			// удалил строку — новая позиция до применения круга воскресила
-			// бы её).
+			// The persistent cursor — by the batch transaction (T-274), but
+			// only if the batch did NOT jump over rows deferred by the
+			// guards: the position in the DB does not move past unpurged
+			// rows — the loss of the retry list on a restart is compensated
+			// by re-reading the guard window (the keys will be deferred
+			// again), and the trimmed rows fall out of the selection on
+			// their own (review of T-274, P1). The in-memory cursor moves
+			// as before: within the process lifetime the probe will return
+			// the keys. A planned circle suppresses the saving (planCircle
+			// has already deleted the row — a new position before the
+			// circle apply would resurrect it).
 			var save *retentionCursor
 			if st.persist && !st.circle && len(batch) == selected {
 				save = &next
 			}
 			stp, err := retentionPurge(ctx, pool, o, batch, save)
 			if err != nil {
-				// Таблицы курсора нет (миграция 000020 не применена —
-				// старый стенд): персистентность выключается на процесс,
-				// пачка откатана целиком и повторится следующим проходом
-				// (курсор не двинулся — потери нет).
+				// The cursor table is missing (migration 000020 not
+				// applied — an old bench): persistence is disabled for the
+				// process, the batch is rolled back as a whole and retried
+				// by the next pass (the cursor did not move — no loss).
 				if errors.Is(err, errRetentionNoCursorTable) {
 					st.persist = false
 					log.Info("retention: таблицы персистентного курсора нет — работаем без сохранения (миграция 000020 не применена?)")
@@ -250,11 +257,12 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 		}
 		st.cursor = next
 		if !full {
-			return out, nil // неполная пачка — дренаж исчерпан
+			return out, nil // an incomplete batch — the drain is exhausted
 		}
-		// Длинный дренаж: снимок устарел (гонка переиздания T-066) —
-		// перечитать дешевле, чем допустить окно; обновление покрывает
-		// только будущие пачки, пройденное не пересматривается.
+		// A long drain: the snapshot is stale (the T-066 re-publication
+		// race) — re-reading it is cheaper than allowing a window; the
+		// refresh covers only future batches, what has been passed is not
+		// revisited.
 		if o.Pending != nil && selects >= DefaultRetentionPendingRefresh {
 			p, err := retentionPendingSnapshot(ctx, o.Pending)
 			if err != nil {
@@ -269,28 +277,29 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 	}
 }
 
-// catchUp — решение о catch-up-круге в начале прохода (§4.4): точечное
-// чтение счётчика рендер-долга и применение отложенного круга
-// (переполнение списка ретраев, fallback-сутки). Недоступный счётчик —
-// нет строки, нет таблицы (42P01: БД до деплоя миграции 000015 —
-// трактуется как «счётчика нет», без Warn) либо сбой чтения: fallback
-// страховкой-сутками, якорь которых двигают успешные чтения — fallback
-// значит «недоступен сутки ПОДРЯД», транзиентный блип после недель
-// здоровой работы полного круга не поднимает (ревью T-185, P3-2 R3).
-// Дискретизация часа: эпоха долга, целиком вместившаяся между чтениями
-// (набрал и дренировал в ноль), перехода в 0 не увидит — её записи
-// догоняет первый наблюдаемый ноль после (круг с нуля чистит всё позади
-// курсора), переполнение списка, fallback либо рестарт; триггер
-// «существенное уменьшение долга» отвергнут сознательно: длинный дренаж
-// (443 тыс., этап 25) уменьшался бы каждый час — круги вернулись бы.
-// Персистентное состояние круга чистит planCircle в момент плана
-// (T-274).
+// catchUp — the catch-up circle decision at the start of a pass (§4.4):
+// a point read of the render-debt counter and the application of a deferred
+// circle (the retry list overflow, the fallback day). An unavailable
+// counter — no row, no table (42P01: the DB before the migration 000015
+// deploy — treated as "no counter", without a Warn) or a read failure: the
+// fallback is a guard day whose anchor is moved by successful reads —
+// fallback means "unavailable for a day IN A ROW"; a transient blip after
+// weeks of healthy operation does not raise a full circle (review of
+// T-185, P3-2 R3). The hour discretization: a debt era that fit entirely
+// between reads (accumulated and drained to zero) will not see the
+// transition to 0 — its records are caught up by the first observed zero
+// after it (a circle from zero trims everything behind the cursor), the
+// list overflow, the fallback, or a restart. The trigger "a substantial
+// debt decrease" was rejected deliberately: a long drain (443k, stage 25)
+// would decrease every hour — the circles would come back. The persistent
+// circle state is cleared by planCircle at the moment of the plan (T-274).
 func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *slog.Logger) {
 	if debt, ok, err := retentionDebt(ctx, pool); err != nil && errors.Is(err, errRetentionNoCounterTable) {
-		// Таблицы счётчика нет (миграция 000015 не применена) — штатное
-		// состояние старого стенда: один Info на процесс, дальше тишина
-		// (ревью T-185, P3-4 R3: полное молчание отложило бы диагноз
-		// «миграция не применилась» на сутки до первого круга).
+		// The counter table is missing (migration 000015 not applied) — a
+		// normal state of an old bench: one Info per process, then silence
+		// (review of T-185, P3-4 R3: full silence would postpone the
+		// diagnosis "the migration was not applied" by a day, until the
+		// first circle).
 		if !st.noCounterTable {
 			st.noCounterTable = true
 			log.Info("retention: таблицы счётчика рендер-долга нет — работаем fallback-сутками (миграция 000015 не применена?)")
@@ -303,21 +312,23 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 		}
 		st.fallbackCircle(ctx, pool, log)
 	} else if !ok {
-		// Строки счётчика нет (БД до деплоя T-175) — тот же fallback.
+		// The counter row is missing (the DB before the T-175 deploy) — the
+		// same fallback.
 		st.fallbackCircle(ctx, pool, log)
 	} else {
-		st.lastCircle = time.Now() // якорь fallback-суток: чтение удалось
+		st.lastCircle = time.Now() // the fallback-day anchor: the read succeeded
 		if debt < 0 {
-			// Кодом не порождается (переходы бита ведут пару ±1, T-175) —
-			// рассинхрон ручного SQL (runbooks §6); трактуется как «долга
-			// нет», но громко (стиль renderDebtCount T-181).
+			// Not produced by code (the bit transitions are a ±1 pair,
+			// T-175) — a manual SQL desync (runbooks §6); treated as "no
+			// debt", but loudly (the renderDebtCount style, T-181).
 			log.Warn("retention: отрицательный счётчик рендер-долга — рассинхрон (runbooks §6)", "debt", debt)
 		}
 		if debt > 0 {
 			st.debtSeen = true
 		} else if st.debtSeen {
-			// Переход в 0: вся рендер-защита снята — один полный круг
-			// догоняет всё, что копилось за эпоху долга позади курсора.
+			// The transition to 0: all render protection is lifted — one
+			// full circle catches up everything that accumulated over the
+			// debt era behind the cursor.
 			st.planCircle(ctx, pool, log, "счётчик рендер-долга обнулился — рендер-защита снята")
 		}
 	}
@@ -325,11 +336,12 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 	if !st.circle {
 		return
 	}
-	// Круг: курсор в начало, список ретраев пересоберёт сам круг
-	// (защищённые им же отложатся), эпоха долга закрыта. Персистентное
-	// состояние уже сброшено в момент плана (planCircle, T-274). Noop-круг
-	// (курсор уже нулевой, списка нет) — Debug: стартовое состояние
-	// свежего процесса, операции он не меняет.
+	// The circle: the cursor to the start, the retry list will be rebuilt
+	// by the circle itself (protected keys are deferred by it too), the
+	// debt era is closed. The persistent state has already been reset at
+	// the moment of the plan (planCircle, T-274). A noop circle (the cursor
+	// is already zero, no list) — Debug: the starting state of a fresh
+	// process; it changes no operations.
 	why := st.circleWhy
 	noop := st.cursor == (retentionCursor{}) && len(st.retries) == 0
 	st.cursor = retentionCursor{}
@@ -344,27 +356,29 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 	log.Info("retention: catch-up-круг с нулевого курсора", "reason", why)
 }
 
-// fallbackCircle — страховка-сутки при недоступном счётчике долга
-// (§4.4): круг раз в DefaultRetentionFallbackCircle от якоря (создание
-// состояния либо последний круг). «Спокойный час» ТЗ понимается как
-// «сутки от якоря», а не час суток: якорь двигают сами круги, отдельного
-// расписания заведено сознательно не было (конфиг-поле запрещено ТЗ).
+// fallbackCircle — the guard day when the debt counter is unavailable
+// (§4.4): a circle once per DefaultRetentionFallbackCircle from the anchor
+// (the state creation or the last circle). The spec's "quiet hour" is
+// understood as "a day from the anchor", not an hour of the day: the anchor
+// is moved by the circles themselves, and a separate schedule was
+// deliberately not introduced (a config knob is forbidden by the spec).
 func (st *retentionState) fallbackCircle(ctx context.Context, pool RetentionDB, log *slog.Logger) {
 	if time.Since(st.lastCircle) >= DefaultRetentionFallbackCircle {
 		st.planCircle(ctx, pool, log, "счётчик рендер-долга недоступен (нет строки/таблицы — миграция 000015) — fallback-сутки")
 	}
 }
 
-// planCircle — плановый catch-up-круг следующим видом применения
-// (началом текущего прохода); повторные причины не затирают первую.
-// План НЕМЕДЛЕННО отражается в персистентном состоянии (T-274, ревью
-// P2): строка курсора удаляется в момент плана — рестарт в окне между
-// планом и применением обязан попасть в полный catch-up с нуля, а не
-// продолжить со старой позиции (записи позади неё вычищает именно
-// круг); дальнейшие сохранения позиции подавлены до применения круга
-// (retentionPass). Сбой удаления — Warn без ошибки прохода: круг в
-// памяти состоится, при рестарте в окне цикл деградирует к поведению
-// T-273 (продолжение со старой позиции) — дороже, но без потери данных.
+// planCircle — a planned catch-up circle for the next apply turn (the
+// start of the current pass); repeated reasons do not overwrite the first
+// one. The plan is reflected in the persistent state IMMEDIATELY (T-274,
+// review P2): the cursor row is deleted at the moment of the plan — a
+// restart in the window between the plan and the apply must land in a full
+// catch-up from zero, not continue from the old position (it is exactly the
+// circle that trims the records behind it); further position saves are
+// suppressed until the circle apply (retentionPass). A deletion failure is
+// a Warn without a pass error: the circle will still happen in memory; on a
+// restart in the window the cycle degrades to the T-273 behavior
+// (continuing from the old position) — costlier, but without data loss.
 func (st *retentionState) planCircle(ctx context.Context, pool RetentionDB, log *slog.Logger, why string) {
 	if st.circle {
 		return
@@ -386,15 +400,16 @@ func (st *retentionState) planCircle(ctx context.Context, pool RetentionDB, log 
 	}
 }
 
-// deferRetries — пополнение списка ретраев ключами пачки, отложенными
-// защитой очередей (§4.3): следующий проход предложит их точечно.
-// Переполнение — Warn и консервативный catch-up-круг следующим
-// проходом: список ограничен памятью, круг пересоберёт всё множество
-// (превышение — масштаб застоя стримов у watermark'ов, где полные круги
-// всё равно были бы единственным механизмом).
+// deferRetries — replenishing the retry list with the batch keys deferred
+// by the queue guards (§4.3): the next pass will offer them point-wise.
+// An overflow — a Warn and a conservative catch-up circle on the next
+// pass: the list is bounded by memory, and the circle will rebuild the
+// whole set (an overflow means a standstill of the scale of the stream
+// depths at the watermarks, where full circles would be the only mechanism
+// anyway).
 func (st *retentionState) deferRetries(ctx context.Context, pool RetentionDB, batch []retentionCandidate, pending *retentionPendingSets, log *slog.Logger) {
 	if pending == nil {
-		return // защита выключена — отложений нет
+		return // the protection is off — no deferrals
 	}
 	for _, c := range batch {
 		if !pending.waiting(c.key) {
@@ -407,9 +422,10 @@ func (st *retentionState) deferRetries(ctx context.Context, pool RetentionDB, ba
 			continue
 		}
 		if len(st.retries) >= st.limit() {
-			// Warn — один раз за эпизод (до применения круга): дальше
-			// план уже стоит, тишина до следующего переполнения (ревью
-			// T-185, P3-1 — не шуметь каждой пачкой застоя).
+			// The Warn — once per episode (until the circle apply): the
+			// plan is already set, and it stays silent until the next
+			// overflow (review of T-185, P3-1 — do not be noisy with every
+			// standstill batch).
 			if !st.circle {
 				log.Warn("retention: список ретраев защиты очередей переполнен — следующий проход catch-up-кругом",
 					"limit", st.limit())
@@ -421,16 +437,17 @@ func (st *retentionState) deferRetries(ctx context.Context, pool RetentionDB, ba
 	}
 }
 
-// retentionRetryPass — точечные предложения ключей ретраев (§4.3):
-// зонд retentionProbeSQL по PK возвращает ещё кандидатов очистки;
-// свежий снимок защиты отфильтровывает всё ещё ждущих (ключ остаётся в
-// списке на следующий проход), остальные чистятся пачками BatchSize.
-// Ключи, не вернувшиеся зондом, из списка выпадают: защита ушла и
-// очистка прошла иным механизмом (круг), строка переписана (fresh
-// checked_at — вернётся в дренаж, когда состарится), стала находкой
-// либо ждёт рендера (догонит catch-up-круг по счётчику долга).
-// Идемпотентно: сбой чистки — зафиксированные пачки остаются, зонд
-// следующего прохода не вернёт уже очищенное.
+// retentionRetryPass — point offers of the retry keys (§4.3): the
+// retentionProbeSQL probe by PK returns those still purge candidates; a
+// fresh protection snapshot filters out those still waiting (the key stays
+// in the list for the next pass), the rest are purged in BatchSize batches.
+// Keys not returned by the probe fall out of the list: the protection is
+// gone and the purge happened by another mechanism (a circle), the row was
+// rewritten (a fresh checked_at — it will return to the drain when it
+// ages), it became a find, or it waits for the render (the catch-up circle
+// on the debt counter will catch up with it).
+// Idempotent: a purge failure — the committed batches stand, and the next
+// pass's probe will not return the already-trimmed rows.
 func retentionRetryPass(ctx context.Context, pool RetentionDB, o RetentionOptions, st *retentionState, pending *retentionPendingSets, out *RetentionStats) error {
 	keys := make([]retentionKey, 0, len(st.retries))
 	for k := range st.retries {
@@ -440,10 +457,10 @@ func retentionRetryPass(ctx context.Context, pool RetentionDB, o RetentionOption
 	if err != nil {
 		return err
 	}
-	// Новый список — всё ещё защищённые; чистке — остальные. Исключение
-	// зонда считается в Deferred по стримам-держателям — та же
-	// наблюдаемость, что у пачек дренажа (ключ честно ждёт потребителей,
-	// сколько бы проходов его ни предлагали).
+	// The new list — those still protected; the purge — the rest. The
+	// probe's exclusions are counted in Deferred by the holding streams —
+	// the same observability as the drain batches (the key honestly waits
+	// for consumers, no matter how many passes have offered it).
 	next := make(map[retentionKey]struct{}, len(st.retries))
 	var waiting, purge []retentionCandidate
 	for _, c := range cands {
@@ -453,14 +470,15 @@ func retentionRetryPass(ctx context.Context, pool RetentionDB, o RetentionOption
 		}
 		purge = append(purge, c)
 	}
-	_ = pending.deferBatch(waiting, out) // исключает все (ждущие) и считает Deferred
+	_ = pending.deferBatch(waiting, out) // excludes all of them (waiting) and counts Deferred
 	for _, c := range waiting {
 		next[c.key] = struct{}{}
 	}
-	// Замена списка — только после чистки целиком: сбой среди пачек
-	// держит прежний список (неочищенные ключи не теряются позади
-	// курсора), следующий проход повторит зонд идемпотентно. Зонд чистит
-	// по месту — дренажный курсор не двигается (nil, T-274).
+	// The list is replaced only after the purge as a whole: a failure among
+	// the batches keeps the previous list (unpurged keys are not lost
+	// behind the cursor), and the next pass repeats the probe
+	// idempotently. The probe purges in place — the drain cursor does not
+	// move (nil, T-274).
 	for i := 0; i < len(purge); i += o.BatchSize {
 		j := min(i+o.BatchSize, len(purge))
 		stp, err := retentionPurge(ctx, pool, o, purge[i:j], nil)
@@ -473,28 +491,29 @@ func retentionRetryPass(ctx context.Context, pool RetentionDB, o RetentionOption
 	return nil
 }
 
-// errRetentionNoCounterTable — таблицы crawler_counters нет (SQLSTATE
-// 42P01, БД до деплоя миграции 000015): сентинел для catchUp —
-// обрабатывается как «счётчика нет» с одним Info на процесс, а не как
-// сбой чтения с Warn (ревью T-185, P3-2/P3-4 R3).
+// errRetentionNoCounterTable — the crawler_counters table is missing
+// (SQLSTATE 42P01, the DB before the migration 000015 deploy): a sentinel
+// for catchUp — handled as "no counter" with one Info per process, not as a
+// read failure with a Warn (review of T-185, P3-2/P3-4 R3).
 var errRetentionNoCounterTable = errors.New("content: retention: таблицы счётчика рендер-долга нет (миграция 000015 не применена)")
 
-// retentionDebt — точечное чтение счётчика рендер-долга
+// retentionDebt — a point read of the render-debt counter
 // crawler_counters['render_pending'] (retentionDebtSQL, T-175).
-// Второй возврат ok=false — счётчика нет: строки (БД до деплоя T-175)
-// либо таблицы — тогда err = errRetentionNoCounterTable (42P01).
-// Не ошибка прохода: caller уходит в fallback-сутки (ТЗ §4.4); в
-// отличие от guard прохода доработки (renderDebtCount, T-181), для
-// которого отсутствие строки — ошибка: здесь чтение оптимизационное,
-// круг дороже пустого промаха.
+// The second return ok=false — there is no counter: no row (the DB before
+// the T-175 deploy) or no table — then err = errRetentionNoCounterTable
+// (42P01). Not a pass error: the caller goes to the fallback day (spec
+// §4.4); unlike the guard of the rework pass (renderDebtCount, T-181), for
+// which a missing row is an error: here the read is an optimization, and a
+// circle is costlier than an empty miss.
 func retentionDebt(ctx context.Context, pool RetentionDB) (n int64, ok bool, err error) {
 	rows, err := pool.Query(ctx, retentionDebtSQL)
 	if err != nil {
-		// Таблицы нет — БД до деплоя миграции 000015 (SQLSTATE 42P01,
-		// undefined_table — литералом, коды схемы в проекте пишутся
-		// литералами, стиль record.go): штатное переходное состояние
-		// «счётчика нет», как отсутствие строки (ревью T-185, P3-2:
-		// Warn на каждый часовой проход старого стенда — шум).
+		// The table is missing — the DB before the migration 000015 deploy
+		// (SQLSTATE 42P01, undefined_table — as a literal; schema codes in
+		// the project are written as literals, the record.go style): a
+		// normal transient state of "no counter", like a missing row
+		// (review of T-185, P3-2: a Warn on every hourly pass of an old
+		// bench — noise).
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
 			return 0, false, errRetentionNoCounterTable
@@ -503,8 +522,8 @@ func retentionDebt(ctx context.Context, pool RetentionDB) (n int64, ok bool, err
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		// Сначала сбой чтения: обрыв соединения — не «строки нет»
-		// (стиль renderDebtCount T-181).
+		// A read failure first: a dropped connection is not "no row"
+		// (the renderDebtCount style, T-181).
 		if err := rows.Err(); err != nil {
 			return 0, false, fmt.Errorf("content: retention: %w", err)
 		}

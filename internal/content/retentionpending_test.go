@@ -1,10 +1,11 @@
-// Юнит-тесты точной защиты retention — исключения из пачек записей,
-// чьи сообщения ждут потребителей q:render/q:analyze (T-166/T-167,
-// retentionpending.go): фейковый источник ключей поверх фейкового пула
-// retention_test.go. Проверяются исключение ключей обоих стримов (в т.ч.
-// когда SQL уже вернул записи кандидатами), пропуск пачки целиком без
-// транзакции, обновление снимка при длинном дренаже, консервативный
-// пропуск прохода при ошибке чтения стримов (первый снимок и обновление).
+// Unit tests of the exact retention protection — the exclusion from
+// batches of records whose messages wait on q:render/q:analyze consumers
+// (T-166/T-167, retentionpending.go): a fake key source over the fake pool
+// of retention_test.go. Checked: excluding the keys of both streams
+// (including when the SQL has already returned the records as candidates),
+// skipping a whole batch without a transaction, snapshot refresh during a
+// long drain, and the conservative skip of the pass on a stream read error
+// (the first snapshot and the refresh).
 package content
 
 import (
@@ -17,17 +18,17 @@ import (
 	"crawler/internal/queue"
 )
 
-// retentionTestNow — фиксированное «сейчас» проходов (стиль retention_test.go).
+// retentionTestNow — the fixed "now" of the passes (the retention_test.go
+// style).
 func retentionTestNow() time.Time {
 	return time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 }
 
-// fakePending — источник непотреблённых ключей с заготовленными
-// снимками: render/fallback/analyze — последовательности множеств по
-// снимкам (последний повторяется), errFrom — с какого снимка (1-based,
-// снимок считается по обращению к q:render — первый стрим чтения)
-// отвечать ошибкой Redis; 0 — никогда. calls — порядок обращений по
-// стримам.
+// fakePending — a source of unconsumed keys with pre-prepared snapshots:
+// render/fallback/analyze — sequences of sets per snapshot (the last one
+// repeats); errFrom — from which snapshot (1-based; the snapshot is counted
+// by the q:render access — the first stream read) to answer with a Redis
+// error; 0 — never. calls — the order of accesses by stream.
 type fakePending struct {
 	mu       sync.Mutex
 	render   []map[RetentionPendingKey]struct{}
@@ -38,7 +39,7 @@ type fakePending struct {
 	calls    []string
 }
 
-// compile-time: фейк — источник защиты для тестов без Redis.
+// compile-time: the fake is a protection source for tests without Redis.
 var _ RetentionPending = (*fakePending)(nil)
 
 func (f *fakePending) PendingKeys(_ context.Context, stream string) (map[RetentionPendingKey]struct{}, error) {
@@ -68,28 +69,29 @@ func (f *fakePending) PendingKeys(_ context.Context, stream string) (map[Retenti
 	return m, nil
 }
 
-// pendingKey — ключ защиты из координат записи.
+// pendingKey — a protection key from the record's coordinates.
 func pendingKey(zone int16, domain int64, sub, variant int16) map[RetentionPendingKey]struct{} {
 	return map[RetentionPendingKey]struct{}{{
 		Zone: zone, Domain: domain, Sub: sub, Variant: variant,
 	}: {}}
 }
 
-// TestRetentionOnce_PendingExclude — записи, чьи сообщения ждут
-// потребителей q:render/q:render-fallback/q:analyze, исключаются из
-// чистки, хотя выборка вернула их кандидатами: контент, jsonb и
-// refcount не тронуты; запись, ждущая несколько стримов сразу,
-// считается в каждом (наблюдаемость «кто держит»); не-ожидающие записи
-// пачки чистятся штатно.
+// TestRetentionOnce_PendingExclude — records whose messages wait on the
+// q:render/q:render-fallback/q:analyze consumers are excluded from the
+// purge even though the selection returned them as candidates: the
+// content, jsonb, and refcount are untouched; a record waiting on several
+// streams at once is counted in each (the observability of "who holds");
+// non-waiting records of the batch are purged normally.
 func TestRetentionOnce_PendingExclude(t *testing.T) {
 	now := retentionTestNow()
 	pool := retentionSeedPool(now)
 	old := now.Add(-2 * DefaultRetention)
-	// Три дополнительных кандидата: (10,1,0) ждёт q:render и q:analyze,
-	// (10,2,1) — только q:analyze, (10,3,0) — только q:render-fallback
-	// (запись ушла в фолбэк рендера, T-238: темп воркера B ограничен,
-	// сырой контент нужен при финализации после исчерпания фолбэка);
-	// чистые кандидаты seed — (10,0,0) и rendered-запись домена 40.
+	// Three more candidates: (10,1,0) waits on q:render and q:analyze,
+	// (10,2,1) — on q:analyze only, (10,3,0) — on q:render-fallback only
+	// (the record went to the render fallback, T-238: worker B's pace is
+	// limited, raw content is needed at finalization after the fallback is
+	// exhausted); the clean seed candidates — (10,0,0) and the rendered
+	// record of domain 40.
 	pool.results = append(pool.results,
 		retentionRow{key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}, checkedAt: old, hash: retentionHash16(0x11), jsonb: true},
 		retentionRow{key: retentionKey{zone: 1, domain: 10, sub: 2, variant: 1}, checkedAt: old, hash: retentionHash16(0x22), jsonb: true},
@@ -100,8 +102,8 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 	pool.contents[retentionHash(0x33)] = retentionFakeContent{refc: 1, clen: 1000}
 
 	opts := retentionDefaultOpts()
-	// Снимок 1 (единственный): (10,1,0) ждёт q:render и q:analyze,
-	// (10,2,1) — q:analyze, (10,3,0) — q:render-fallback.
+	// Snapshot 1 (the only one): (10,1,0) waits on q:render and q:analyze,
+	// (10,2,1) — on q:analyze, (10,3,0) — on q:render-fallback.
 	opts.Pending = &fakePending{
 		render:   []map[RetentionPendingKey]struct{}{pendingKey(1, 10, 1, 0)},
 		fallback: []map[RetentionPendingKey]struct{}{pendingKey(1, 10, 3, 0)},
@@ -121,8 +123,8 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 	if stats.Skipped || stats.SkippedPending {
 		t.Fatalf("stats = %+v, want проход без пропусков", stats)
 	}
-	// Записи, ждущие очередей, не тронуты: контент и jsonb на месте,
-	// refcount живых строк не менялся.
+	// Records waiting on the queues are untouched: the content and jsonb
+	// are in place, the refcount of the live rows did not change.
 	for _, key := range []retentionKey{
 		{zone: 1, domain: 10, sub: 1, variant: 0},
 		{zone: 1, domain: 10, sub: 2, variant: 1},
@@ -141,20 +143,21 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 	if _, ok := pool.contents[retentionHash(0x33)]; !ok {
 		t.Error("contents 0x33 (ждёт q:render-fallback) удалён")
 	}
-	// SQL вернул ждущие записи кандидатами — исключение сделала защита.
+	// The SQL returned the waiting records as candidates — the exclusion
+	// was done by the protection.
 	if len(pool.queries) == 0 {
 		t.Fatal("выборок нет — тест не проверил исключение кандидатов")
 	}
 }
 
-// TestRetentionOnce_PendingAllExcluded — пачка целиком ждёт очередей:
-// транзакция чистки не открывается (единственная транзакция —
-// tx-оболочка закрепления выборки, T-271), дренаж завершается штатно
-// (курсор прошёл выборку), записи не тронуты.
+// TestRetentionOnce_PendingAllExcluded — the whole batch waits on the
+// queues: the purge transaction is not opened (the only transaction is the
+// selection pinning wrapper tx, T-271), the drain completes normally (the
+// cursor went past the selection), the records are untouched.
 func TestRetentionOnce_PendingAllExcluded(t *testing.T) {
 	now := retentionTestNow()
 	pool := retentionSeedPool(now)
-	// Один кандидат, и его сообщение ждёт q:render.
+	// One candidate, and its message waits on q:render.
 	pool.results = pool.results[:1]
 	opts := retentionDefaultOpts()
 	opts.Pending = &fakePending{
@@ -170,8 +173,8 @@ func TestRetentionOnce_PendingAllExcluded(t *testing.T) {
 	if stats.Deferred[queue.StreamRender] != 1 {
 		t.Fatalf("Deferred = %v, want q:render=1", stats.Deferred)
 	}
-	// Единственная транзакция — tx-оболочка закрепления выборки (T-271);
-	// транзакции чистки нет: чистить нечего.
+	// The only transaction is the selection pinning wrapper tx (T-271);
+	// there is no purge transaction: nothing to purge.
 	if pool.begins != 1 {
 		t.Fatalf("транзакций = %d, want 1 (только tx-оболочка выборки, чистки нет)", pool.begins)
 	}
@@ -180,10 +183,11 @@ func TestRetentionOnce_PendingAllExcluded(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_PendingRefresh — снимок обновляется при длинном
-// дренаже (DefaultRetentionPendingRefresh выборок): запись, сообщение
-// которой попало в стрим после первого снимка, защищена обновлением —
-// без него чистилась бы (гонка переиздания T-066, retentionpending.go).
+// TestRetentionOnce_PendingRefresh — the snapshot is refreshed during a
+// long drain (DefaultRetentionPendingRefresh selections): a record whose
+// message entered the stream after the first snapshot is protected by the
+// refresh — without it, it would have been purged (the T-066
+// re-publication race, retentionpending.go).
 func TestRetentionOnce_PendingRefresh(t *testing.T) {
 	now := retentionTestNow()
 	pool := newRetentionFakePool(now)
@@ -200,20 +204,21 @@ func TestRetentionOnce_PendingRefresh(t *testing.T) {
 	pool.results = rows
 
 	opts := retentionDefaultOpts()
-	opts.BatchSize = 1 // дренаж пачками-строками: 26 выборок
+	opts.BatchSize = 1 // a drain in row-sized batches: 26 selections
 	second := mergePending(pendingKey(1, 10, 0, 0), pendingKey(1, 10, 25, 0))
 	opts.Pending = &fakePending{
 		render: []map[RetentionPendingKey]struct{}{
-			pendingKey(1, 10, 0, 0), // снимок 1: ждёт первая запись
-			second,                  // снимок 2 (обновление): и последняя — сообщение опубликовано после первого снимка
+			pendingKey(1, 10, 0, 0), // snapshot 1: the first record waits
+			second,                  // snapshot 2 (the refresh): the last one too — its message was published after the first snapshot
 		},
 	}
 	stats, err := RetentionOnce(context.Background(), pool, opts)
 	if err != nil {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
-	// Чистятся 24 записи: sub 1..24; sub 0 — первый снимок, sub 25 —
-	// обновлённый (сообщение опубликовано после первого снимка).
+	// 24 records are purged: sub 1..24; sub 0 — the first snapshot, sub 25
+	// — the refreshed one (its message was published after the first
+	// snapshot).
 	if stats.Rows != 24 {
 		t.Fatalf("Rows = %d, want 24 (исключены sub=0 и sub=25)", stats.Rows)
 	}
@@ -231,10 +236,11 @@ func TestRetentionOnce_PendingRefresh(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_PendingAfterInterlock — порядок проверок: интерлок
-// q:analyze раньше первого снимка стримов — при закрытом интерлоке
-// тяжёлое чтение хвостов не выполняется вовсе (и его таймаут не даёт
-// ложного SkippedPending вместо честного Skipped).
+// TestRetentionOnce_PendingAfterInterlock — the order of the checks: the
+// q:analyze interlock comes before the first streams snapshot — with the
+// interlock closed, the heavy tail reading is not performed at all (and its
+// timeout does not yield a false SkippedPending instead of an honest
+// Skipped).
 func TestRetentionOnce_PendingAfterInterlock(t *testing.T) {
 	now := retentionTestNow()
 	pool := retentionSeedPool(now)
@@ -242,7 +248,7 @@ func TestRetentionOnce_PendingAfterInterlock(t *testing.T) {
 	opts.AnalyzeWatermark = 100
 	depth := &fakeDepth{n: 150}
 	opts.Depth = depth
-	pending := &fakePending{errFrom: 1} // даже недоступный источник не читается
+	pending := &fakePending{errFrom: 1} // even an unavailable source is not read
 	opts.Pending = pending
 
 	stats, err := RetentionOnce(context.Background(), pool, opts)
@@ -260,15 +266,16 @@ func TestRetentionOnce_PendingAfterInterlock(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_PendingReadError — ошибка чтения стримов ДО первой
-// выборки: консервативный пропуск прохода — не ошибка, БД не тронута,
-// итог уходит в OnPass (SkippedPending — метрика passes{skipped_pending}
-// и pending_errors_total, Warn в цикле).
+// TestRetentionOnce_PendingReadError — a stream read error BEFORE the
+// first selection: a conservative skip of the pass — not an error, the DB
+// is untouched, the outcome goes to OnPass (SkippedPending — the
+// passes{skipped_pending} metric and pending_errors_total, a Warn in the
+// cycle).
 func TestRetentionOnce_PendingReadError(t *testing.T) {
 	now := retentionTestNow()
 	pool := retentionSeedPool(now)
 	opts := retentionDefaultOpts()
-	opts.Pending = &fakePending{errFrom: 1} // первый же снимок — ошибка
+	opts.Pending = &fakePending{errFrom: 1} // the very first snapshot — an error
 
 	stats, err := RetentionOnce(context.Background(), pool, opts)
 	if err != nil {
@@ -282,9 +289,9 @@ func TestRetentionOnce_PendingReadError(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_PendingRefreshError — ошибка обновления снимка среди
-// дренажа: сделанные пачки остаются (пачки атомарны сами по себе),
-// остаток прохода пропущен консервативно.
+// TestRetentionOnce_PendingRefreshError — a snapshot refresh error in the
+// middle of the drain: the batches already made stand (batches are atomic
+// in themselves); the remainder of the pass is skipped conservatively.
 func TestRetentionOnce_PendingRefreshError(t *testing.T) {
 	now := retentionTestNow()
 	pool := newRetentionFakePool(now)
@@ -302,7 +309,7 @@ func TestRetentionOnce_PendingRefreshError(t *testing.T) {
 
 	opts := retentionDefaultOpts()
 	opts.BatchSize = 1
-	opts.Pending = &fakePending{errFrom: 2} // снимок 1 пуст, обновление — ошибка
+	opts.Pending = &fakePending{errFrom: 2} // snapshot 1 empty, the refresh — an error
 
 	stats, err := RetentionOnce(context.Background(), pool, opts)
 	if err != nil {
@@ -311,15 +318,15 @@ func TestRetentionOnce_PendingRefreshError(t *testing.T) {
 	if stats.Rows != 25 || !stats.SkippedPending {
 		t.Fatalf("stats = %+v, want 25 зафиксированных пачек и SkippedPending", stats)
 	}
-	// 25-я запись (sub=24) чистилась, 26-я (sub=25) не тронута — проход
-	// остановлен до её пачки.
+	// The 25th record (sub=24) was purged; the 26th (sub=25) is untouched —
+	// the pass was stopped before its batch.
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 25, variant: 0}); r.hash == nil {
 		t.Error("запись после точки ошибки очищена — остаток обязан ждать следующего прохода")
 	}
 }
 
-// TestRetentionOnce_PendingDisabled — nil-источник: защита выключена,
-// поведение прохода прежнее (все кандидаты чистятся).
+// TestRetentionOnce_PendingDisabled — a nil source: the protection is off,
+// the pass behavior is the previous one (all candidates are purged).
 func TestRetentionOnce_PendingDisabled(t *testing.T) {
 	now := retentionTestNow()
 	pool := retentionSeedPool(now)
@@ -332,7 +339,7 @@ func TestRetentionOnce_PendingDisabled(t *testing.T) {
 	}
 }
 
-// mergePending объединяет множества ключей (снимок фейка).
+// mergePending merges key sets (the fake's snapshot).
 func mergePending(ms ...map[RetentionPendingKey]struct{}) map[RetentionPendingKey]struct{} {
 	out := make(map[RetentionPendingKey]struct{})
 	for _, m := range ms {

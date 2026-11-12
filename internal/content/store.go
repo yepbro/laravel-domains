@@ -1,10 +1,10 @@
 package content
 
-// Контракт внешнего хранилища контента (ТЗ 5.7: «доступ через интерфейс
-// ContentStore (Put, Get, Delete), чтобы позднее можно было заменить
-// реализацию (например, S3)»). Здесь зафиксирован тонкий контракт байтов
-// и идентичность контента; реализация на пак-файлах с метаданными в
-// PostgreSQL — T-042…T-046.
+// Contract of the external content store (spec 5.7: "access through the
+// ContentStore interface (Put, Get, Delete) so that the implementation can be
+// replaced later (for example, with S3)"). This file pins the thin byte
+// contract and content identity; the implementation on pack files with
+// metadata in PostgreSQL is T-042...T-046.
 
 import (
 	"context"
@@ -13,32 +13,33 @@ import (
 	"errors"
 )
 
-// HashLen — размер идентификатора контента: 16 байт (128 бит), как
-// contents.hash и subdomain_results.content_hash в схеме (ТЗ 6.1).
+// HashLen is the content identifier size: 16 bytes (128 bits), same as
+// contents.hash and subdomain_results.content_hash in the schema (spec 6.1).
 const HashLen = 16
 
-// Hash — идентификатор контента: HashLen байт SHA-256 от нормализованного
-// содержимого, усечённые до 128 бит (ТЗ 5.7 «дедупликация по 128-битному
-// хэшу»). Массив фиксированной длины нельзя получить «почти правильного»
-// размера, и он пригоден как ключ отображения.
+// Hash is the content identifier: HashLen bytes of SHA-256 over the normalized
+// contents, truncated to 128 bits (spec 5.7 "deduplication by a 128-bit
+// hash"). A fixed-size array cannot be "almost the right" size, and it works
+// as a map key.
 type Hash [HashLen]byte
 
-// String возвращает hex-представление идентификатора для логов и ошибок.
+// String returns the hex representation of the identifier for logs and errors.
 func (h Hash) String() string {
 	return hex.EncodeToString(h[:])
 }
 
-// HashOf вычисляет идентификатор контента: SHA-256 от data, усечённый до
-// первых HashLen байт. Алгоритм из ТЗ 5.7/6.1 зафиксирован в одном месте:
-// Put обязан вернуть HashOf(data), а потребители сравнивают контент по
-// хэшу, не обращаясь к хранилищу (логика вариантов T-054 и алиасов T-055
-// — «одинаковый хэш контента», ТЗ 5.5 п. 5–6).
+// HashOf computes the content identifier: SHA-256 over data, truncated to
+// the first HashLen bytes. The algorithm from spec 5.7/6.1 is pinned in a
+// single place: Put must return HashOf(data), and consumers compare content
+// by hash without touching the store (the variant logic of T-054 and the
+// aliases of T-055 — "same content hash", spec 5.5 items 5-6).
 //
-// «Нормализованное содержимое» (ТЗ 5.7) — байты, уже приведённые конвейером
-// к итоговому виду: кодировка UTF-8 и страница в конце цепочки редиректов
-// (ТЗ 5.5 п. 4, 8). Само хранилище нормализацией не занимается: Put
-// принимает и Get возвращает ровно переданные байты — иначе roundtrip
-// Get(Put(x)) == x и дедупликация были бы неопределимы на уровне контракта.
+// "Normalized contents" (spec 5.7) are bytes already brought to their final
+// form by the pipeline: UTF-8 encoding and the page at the end of the
+// redirect chain (spec 5.5 items 4, 8). The store itself does not normalize:
+// Put accepts and Get returns exactly the bytes passed — otherwise the
+// roundtrip Get(Put(x)) == x and deduplication would be undefinable at the
+// contract level.
 func HashOf(data []byte) Hash {
 	sum := sha256.Sum256(data)
 	var h Hash
@@ -46,84 +47,89 @@ func HashOf(data []byte) Hash {
 	return h
 }
 
-// Ошибки контракта: реализации возвращают их напрямую или в обёртке
-// (доступны через errors.Is), воркера различают ветки по сентинелам,
-// а не по тексту сообщения.
+// Contract errors: implementations return them directly or wrapped
+// (reachable via errors.Is); workers tell branches apart by sentinels,
+// not by message text.
 var (
-	// ErrNotFound — Get/Delete: контента с таким Hash нет — ни разу не
-	// записывался или все ссылки уже сняты Delete.
+	// ErrNotFound — Get/Delete: no content with this Hash exists — it was
+	// never written, or all references have already been removed by Delete.
 	ErrNotFound = errors.New("content: контент не найден")
 
-	// ErrStoreFull — Put: хранилище достигло предела (переполнение диска,
-	// ТЗ 8). Данные не записаны и не испорчены: воркер приостанавливает
-	// запись контента и сигналит алертом (T-046, T-080), повтор — позже.
+	// ErrStoreFull — Put: the store has reached its limit (disk overflow,
+	// spec 8). The data is neither written nor corrupted: the worker pauses
+	// content writing and raises an alert (T-046, T-080), retrying later.
 	ErrStoreFull = errors.New("content: хранилище переполнено")
 
-	// ErrTooLarge — Put: контент больше лимита max_store_bytes —
-	// «макс. размер хранимого HTML» (ТЗ 5.5, 5.10). Отвергается целиком;
-	// воркер сохраняет результат без контента (T-056).
+	// ErrTooLarge — Put: content larger than the max_store_bytes limit —
+	// "max stored HTML size" (spec 5.5, 5.10). Rejected as a whole;
+	// the worker keeps the result without content (T-056).
 	ErrTooLarge = errors.New("content: контент больше лимита хранения")
 
-	// ErrCorrupted — Get: строка метаданных жива, а её блок нечитаем
-	// (потеря/порча байтов пака: сбой диска, обрыв записи, окно до
-	// fsync). Отличим от ErrNotFound: чтение не маскирует порчу под
-	// «не записывался», а компактификация такие блоки вычищает (строка
-	// помечается мёртвой, пак освобождается) — после этого Get отвечает
-	// уже ErrNotFound.
+	// ErrCorrupted — Get: the metadata row is alive but its block is
+	// unreadable (loss/corruption of pack bytes: disk failure, interrupted
+	// write, the window before fsync). Distinguishable from ErrNotFound:
+	// reading does not mask corruption as "never written", and compaction
+	// purges such blocks (the row is marked dead, the pack is freed) —
+	// after that Get answers ErrNotFound.
 	ErrCorrupted = errors.New("content: контент повреждён")
 )
 
-// PutResult — итог Put: ключ для subdomain_results.content_hash (T-056,
-// T-058) и факт записи для метрик доли дедупликации (ТЗ 11.4 п. 3).
+// PutResult is the outcome of Put: the key for subdomain_results.content_hash
+// (T-056, T-058) and the write fact for the deduplication share metrics
+// (spec 11.4 item 3).
 type PutResult struct {
-	Hash    Hash // идентификатор контента — всегда HashOf(data)
-	Created bool // true — записаны новые байты; false — дедупликация: байты уже были, добавлена ссылка
+	Hash    Hash // content identifier — always HashOf(data)
+	Created bool // true — new bytes were written; false — deduplication: the bytes already existed, another reference was added
 }
 
-// ContentStore — внешнее хранилище итогового содержимого страниц (ТЗ 5.7):
-// сырой HTML пишет http-worker (T-056), итоговый DOM рендера — render-worker
-// (T-067), читают анализатор и crawlerctl domain --content (T-074, T-081),
-// ссылки снимаются при перезаписи и удалении результатов (T-020, T-044).
+// ContentStore is the external store of final page contents (spec 5.7):
+// raw HTML is written by the http-worker (T-056), the final render DOM by the
+// render-worker (T-067); the analyzer and crawlerctl domain --content read it
+// (T-074, T-081); references are removed on result overwrite and deletion
+// (T-020, T-044).
 //
-// Граница контракта — тонкий слой байтов:
-//   - сжатие zstd с обученным словарём (ТЗ 5.7, T-043) — деталь реализации:
-//     Put принимает и Get возвращает несжатые байты;
-//   - счётчик ссылок contents.refcount не раскрыт методами: пара «Put добавил
-//     ссылку — Delete снял» фиксируется семантикой методов, счётчик ведёт
-//     реализация (T-044). Потребителю счётчик не нужен — воркер знает только
-//     собственные контенты; правило «перезапись результата уменьшает refcount
-//     старого» — поведение слоя результатов над БД (T-044, T-058), а не
-//     операция хранилища. Физическое освобождение байтов — тоже деталь
-//     реализации: пак-файлы append-only, место возвращается компактификацией
-//     (T-045).
+// The contract boundary is a thin layer of bytes:
+//   - zstd compression with a trained dictionary (spec 5.7, T-043) is an
+//     implementation detail: Put accepts and Get returns uncompressed bytes;
+//   - the contents.refcount reference counter is not exposed by methods: the
+//     pair "Put added a reference — Delete removed one" is pinned by the
+//     method semantics; the counter is maintained by the implementation
+//     (T-044). The consumer does not need the counter — the worker knows only
+//     its own contents; the rule "overwriting a result decreases the refcount
+//     of the old one" is the behavior of the results layer above the DB
+//     (T-044, T-058), not a store operation. Physical freeing of bytes is also
+//     an implementation detail: pack files are append-only, space is returned
+//     by compaction (T-045).
 //
-// Все методы готовы к отмене контекста: отмена возвращает ошибку контекста
-// (errors.Is), операция считается несостоявшейся — ссылка не добавляется
-// и не снимается.
+// All methods are ready for context cancellation: cancellation returns a
+// context error (errors.Is), the operation is considered not to have
+// happened — no reference is added or removed.
 type ContentStore interface {
-	// Put сохраняет data и возвращает идентификатор контента. Контент
-	// трактуется как нормализованный (см. HashOf); пустые данные —
-	// допустимый контент. Идемпотентен по содержимому: те же байты — тот
-	// же Hash, повторная запись не дублирует байты на диске
-	// (Created = false) и добавляет ещё одну ссылку — пару снимет Delete.
-	// Так работает дедупликация T-044: парковки и заглушки хостингов
-	// хранятся один раз (ТЗ 5.7, 8).
+	// Put stores data and returns the content identifier. The content is
+	// treated as normalized (see HashOf); empty data is valid content.
+	// Idempotent by contents: the same bytes yield the same Hash; writing
+	// again neither duplicates bytes on disk (Created = false) nor adds
+	// anything but one more reference — a pair that Delete will remove.
+	// This is how T-044 deduplication works: parking pages and hosting
+	// stubs are stored once (spec 5.7, 8).
 	//
-	// Put либо добавляет ссылку и возвращает PutResult, либо возвращает
-	// ошибку: ErrTooLarge — больше лимита max_store_bytes; ErrStoreFull —
-	// хранилище переполнено, повторить позже; ошибка контекста — отмена.
+	// Either Put adds a reference and returns PutResult, or it returns an
+	// error: ErrTooLarge — larger than the max_store_bytes limit;
+	// ErrStoreFull — the store is full, retry later; context error —
+	// cancellation.
 	Put(ctx context.Context, data []byte) (PutResult, error)
 
-	// Get возвращает байты, переданные в Put (распаковка — внутри
-	// реализации), независимой копией: изменение результата не влияет на
-	// хранилище. Отсутствующий контент — ErrNotFound.
+	// Get returns the bytes passed to Put (decompression happens inside
+	// the implementation) as an independent copy: mutating the result does
+	// not affect the store. Missing content — ErrNotFound.
 	Get(ctx context.Context, hash Hash) ([]byte, error)
 
-	// Delete снимает одну ссылку, добавленную Put: пока ссылки есть, Get
-	// продолжает возвращать контент; после последней контент недоступен
-	// (ErrNotFound), место освобождает реализация (компактификация T-045).
-	// Снятие несуществующей ссылки — ErrNotFound, а не молчание: в конвейере
-	// с повторной доставкой (ТЗ 3.4) двойное снятие — симптом ошибки учёта;
-	// лучше увидеть его сразу, чем уронить чужой refcount молча.
+	// Delete removes one reference added by Put: while references remain,
+	// Get keeps returning the content; after the last one the content is
+	// unavailable (ErrNotFound), and the implementation frees the space
+	// (compaction T-045). Removing a nonexistent reference is ErrNotFound,
+	// not silence: in a pipeline with redelivery (spec 3.4) a double
+	// removal is a symptom of a bookkeeping bug; better to see it right
+	// away than silently ruin someone else's refcount.
 	Delete(ctx context.Context, hash Hash) error
 }

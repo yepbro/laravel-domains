@@ -1,36 +1,37 @@
-// Персистентный курсор дренажа retention (T-274; миграция 000020 —
-// таблица retention_drain_cursor): позиция дренажа «один раз за жизнь»
-// (T-185) переживает не только проходы цикла, но и РЕСТАРТ процесса
-// http-worker — деплой, внешний power-cycle виртуалы (прецедент
-// 11.11 11:03), потенциальный OOM-килл. До T-274 рестарт сбрасывал
-// курсор в ноль: первый проход заново обходил «чистый префикс» истории
-// subdomain_results (предикат «есть что чистить» вне индекса —
-// heap-визит каждой строки; замеры 10–11.11.2026: ~60 мин на idle,
-// >60 мин под полным фронтом), три прохода под фронтом не влезли в
-// потолок SelectTimeout 3600 с (инцидент T-273) — дренаж вставал до
-// спокойного окна.
+// Persistent retention drain cursor (T-274; migration 000020 — the
+// retention_drain_cursor table): the drain position "once in a lifetime"
+// (T-185) survives not only the cycle passes but also a RESTART of the
+// http-worker process — a deploy, an external power-cycle of the VM
+// (precedent Nov 11 11:03), a potential OOM kill. Before T-274 a restart
+// reset the cursor to zero: the first pass re-traversed the "clean prefix"
+// of subdomain_results history (the "anything to purge" predicate is not
+// index-backed — a heap visit of every row; measurements 2026-11-10/11:
+// ~60 min idle, >60 min under full front load), three passes under front
+// load did not fit into the SelectTimeout cap of 3600 s (the T-273
+// incident) — the drain stood still until the quiet window.
 //
-// Контракт атомарности: upsert курсора исполняется в транзакции чистки
-// пачки (retentionPurge) — сохранённая позиция не может опередить
-// зафиксированную пачку; сбой пачки оставляет прежний курсор, повтор
-// прохода идемпотентно перечитает уже чистые строки (ТЗ 3.4). Пачка с
-// отложенными защитой очередей строками позицию в БД НЕ двигает (ревью
-// T-274, P1): потеря списка ретраев при рестарте восполняется
-// перечитыванием защитного окна — ключи отложатся заново, чистые строки
-// выпадут из отбора сами; in-memory курсор двигается как раньше (зонд
-// ретраев возвращает ключи в пределах жизни процесса). Принудительные
-// catch-up-круги (retentiondrain.go planCircle) удаляют строку DELETE'ом
-// в момент плана: рестарт в окне между планом и применением попадает в
-// полный catch-up с нуля, а не продолжение со старой позиции — записи
-// позади неё вычищает именно круг.
+// Atomicity contract: the cursor upsert runs in the batch purge
+// transaction (retentionPurge) — the saved position cannot overtake the
+// committed batch; a batch failure keeps the previous cursor, and a pass
+// retry idempotently re-reads the already-trimmed rows (spec 3.4). A batch
+// with rows deferred by the queue guards does NOT move the position in the
+// DB (review of T-274, P1): the loss of the retry list on a restart is
+// compensated by re-reading the guard window — the keys will be deferred
+// again, and the trimmed rows fall out of the selection on their own; the
+// in-memory cursor moves as before (the retry probe returns keys within
+// the process lifetime). Forced catch-up circles (retentiondrain.go
+// planCircle) delete the row with a DELETE at the moment of the plan: a
+// restart in the window between the plan and the apply lands in a full
+// catch-up from zero rather than a continuation from the old position —
+// it is exactly the circle that trims the records behind it.
 //
-// Отсутствие/некорректность состояния — старт с нуля (поведение до
-// T-274: один полный catch-up-проход). Таблицы нет (БД до миграции
-// 000020) — сентинел errRetentionNoCursorTable: один Info на процесс и
-// работа без персистентности (стиль errRetentionNoCounterTable, T-185);
-// владелец состояния — только цикл RetentionLoop http-worker, разовый
-// RetentionOnce (runbooks T-167, изолированные сборки) его не читает и
-// не пишет.
+// Missing/invalid state — start from zero (the pre-T-274 behavior: one
+// full catch-up pass). No table (DB before migration 000020) — the
+// sentinel errRetentionNoCursorTable: one Info per process and operation
+// without persistence (the style of errRetentionNoCounterTable, T-185);
+// the state's owner is only the RetentionLoop cycle of http-worker; the
+// one-off RetentionOnce (runbooks T-167, isolated builds) neither reads
+// nor writes it.
 package content
 
 import (
@@ -43,20 +44,20 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// SQL персистентного курсора. Строка одна (id = 1, CHECK миграции 000020),
-// писатель один (цикл http-worker) — конфликтов нет; тексты закреплены
-// юнит-тестами (retentioncursor_test.go).
+// SQL of the persistent cursor. There is one row (id = 1, the CHECK of
+// migration 000020) and one writer (the http-worker cycle) — no conflicts;
+// the texts are pinned by unit tests (retentioncursor_test.go).
 var (
-	// retentionCursorLoadSQL — чтение курсора при старте цикла: точечный
-	// Lookup по PK единственной строки.
+	// retentionCursorLoadSQL — reading the cursor at cycle start: a point
+	// lookup by the PK of the single row.
 	retentionCursorLoadSQL = "SELECT checked_at, zone_id, domain_id, subdomain_id, variant " +
 		"FROM retention_drain_cursor WHERE id = 1"
 
-	// retentionCursorSaveSQL — upsert курсора (в транзакции пачки):
-	// INSERT … ON CONFLICT по PK единственной строки; updated_at = now() —
-	// диагностика последнего движения. Пачки с отложенными защитой
-	// строками позицию не пишут (курсор не двигается за непочищенное —
-	// ревью T-274, P1).
+	// retentionCursorSaveSQL — the cursor upsert (in the batch
+	// transaction): INSERT … ON CONFLICT by the PK of the single row;
+	// updated_at = now() — diagnostics of the last movement. Batches with
+	// rows deferred by the guards do not write the position (the cursor
+	// does not move past unpurged data — review of T-274, P1).
 	retentionCursorSaveSQL = "INSERT INTO retention_drain_cursor " +
 		"(id, checked_at, zone_id, domain_id, subdomain_id, variant, updated_at) " +
 		"VALUES (1, $1, $2, $3, $4, $5, now()) " +
@@ -65,45 +66,46 @@ var (
 		"domain_id = EXCLUDED.domain_id, subdomain_id = EXCLUDED.subdomain_id, " +
 		"variant = EXCLUDED.variant, updated_at = EXCLUDED.updated_at"
 
-	// retentionCursorDeleteSQL — сброс персистентного состояния при
-	// принудительном catch-up-круге (catchUp): круг обязан пережить
-	// рестарт — обходит всё позади прежнего курсора, сохранённая позиция
-	// ему мешает.
+	// retentionCursorDeleteSQL — resetting the persistent state on a
+	// forced catch-up circle (catchUp): the circle must survive a restart —
+	// it traverses everything behind the previous cursor; the saved
+	// position is in its way.
 	retentionCursorDeleteSQL = "DELETE FROM retention_drain_cursor WHERE id = 1"
 )
 
-// Сентинелы состояния курсора (обрабатываются вызывающими, не ошибками
-// прохода — стиль errRetentionNoCounterTable).
+// Cursor state sentinels (handled by the callers, not pass errors —
+// the style of errRetentionNoCounterTable).
 var (
-	// errRetentionNoCursorTable — таблицы retention_drain_cursor нет
-	// (SQLSTATE 42P01, БД до миграции 000020): штатное переходное
-	// состояние старого стенда — персистентность выключается на процесс.
+	// errRetentionNoCursorTable — the retention_drain_cursor table does
+	// not exist (SQLSTATE 42P01, DB before migration 000020): a normal
+	// transient state of an old bench — persistence is disabled for the
+	// process.
 	errRetentionNoCursorTable = errors.New("content: retention: таблицы персистентного курсора нет (миграция 000020 не применена)")
 
-	// errRetentionCursorInvalid — сохранённое состояние некорректно
-	// (отметка в будущем сверх допуска часов — рассинхрон ручного SQL):
-	// старт с нулевого курсора, Warn в журнал.
+	// errRetentionCursorInvalid — the saved state is invalid (a stamp in
+	// the future beyond the hourly allowance — a desync of manual SQL):
+	// start from the zero cursor, a Warn to the journal.
 	errRetentionCursorInvalid = errors.New("content: retention: сохранённый курсор некорректен (отметка в будущем)")
 )
 
-// retentionCursorSkew — допуск расхождения часов приложения и БД при
-// валидации загруженного курсора: checked_at пишет now() сервера БД
-// (T-058), сверяется с часами процесса.
+// retentionCursorSkew — the allowed clock skew between the application and
+// the DB when validating the loaded cursor: checked_at is written by the
+// DB server's now() (T-058) and compared against the process clock.
 const retentionCursorSkew = time.Minute
 
-// retentionNoTable — SQLSTATE 42P01 (undefined_table) в ошибке пула:
-// литералом кода схемы, как в retentionDebt (стиль record.go).
+// retentionNoTable — SQLSTATE 42P01 (undefined_table) in a pool error:
+// the schema code as a literal, as in retentionDebt (the record.go style).
 func retentionNoTable(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
 }
 
-// retentionLoadCursor — чтение персистентного курсора при старте цикла.
-// ok=false: строки нет (первый запуск, круг сбросил состояние) —
-// err = nil; состояние некорректно — err = errRetentionCursorInvalid.
-// Таблицы нет — сентинел errRetentionNoCursorTable (caller: Info и работа
-// без персистентности). Нулевая отметка строки (все-нулевой ручной SQL)
-// трактуется как «состояния нет».
+// retentionLoadCursor — reading the persistent cursor at cycle start.
+// ok=false: no row (first run, a circle reset the state) — err = nil;
+// invalid state — err = errRetentionCursorInvalid. No table — the sentinel
+// errRetentionNoCursorTable (caller: an Info and operation without
+// persistence). A zero row stamp (an all-zero manual SQL) is treated as
+// "no state".
 func retentionLoadCursor(ctx context.Context, pool RetentionDB) (cur retentionCursor, ok bool, err error) {
 	rows, err := pool.Query(ctx, retentionCursorLoadSQL)
 	if err != nil {
@@ -114,8 +116,8 @@ func retentionLoadCursor(ctx context.Context, pool RetentionDB) (cur retentionCu
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		// Сначала сбой чтения: обрыв соединения — не «строки нет»
-		// (стиль retentionDebt).
+		// A read failure first: a dropped connection is not "no row"
+		// (the retentionDebt style).
 		if err := rows.Err(); err != nil {
 			return retentionCursor{}, false, fmt.Errorf("content: retention: чтение персистентного курсора: %w", err)
 		}
@@ -138,8 +140,8 @@ func retentionLoadCursor(ctx context.Context, pool RetentionDB) (cur retentionCu
 	return cur, true, nil
 }
 
-// retentionSaveCursorTx — upsert курсора в ОТКРЫТОЙ транзакции пачки
-// (retentionPurge): атомарность «пачка закоммичена ⟺ курсор сохранён».
+// retentionSaveCursorTx — the cursor upsert in the OPEN batch transaction
+// (retentionPurge): the atomicity of "batch committed ⟺ cursor saved".
 func retentionSaveCursorTx(ctx context.Context, tx pgx.Tx, cur retentionCursor) error {
 	if _, err := tx.Exec(ctx, retentionCursorSaveSQL,
 		cur.checkedAt, cur.key.zone, cur.key.domain, cur.key.sub, cur.key.variant,
@@ -152,11 +154,11 @@ func retentionSaveCursorTx(ctx context.Context, tx pgx.Tx, cur retentionCursor) 
 	return nil
 }
 
-// retentionResetCursor — удаление персистентного состояния при
-// принудительном catch-up-круге (planCircle): круг обязан пережить
-// рестарт — обойти всё позади прежнего курсора; сохранённая позиция ему
-// мешает. Отдельная короткая транзакция, выполняется в момент плана
-// (до применения круга).
+// retentionResetCursor — deleting the persistent state on a forced
+// catch-up circle (planCircle): the circle must survive a restart — it has
+// to traverse everything behind the previous cursor; the saved position is
+// in its way. A separate short transaction, executed at the moment of the
+// plan (before the circle apply).
 func retentionResetCursor(ctx context.Context, pool RetentionDB) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {

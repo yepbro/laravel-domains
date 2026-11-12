@@ -1,12 +1,14 @@
-// Метрики цикла retention (T-166, ТЗ 5.9): счётчики очищенных строк
-// и байтов, гистограмма длительности прохода и счётчик пропусков
-// интерлока — материал алертов «диск растёт» и «анализатор не успевает».
+// Metrics of the retention cycle (T-166, spec 5.9): counters of purged rows
+// and bytes, a pass duration histogram, and an interlock skip counter —
+// the material for the "disk is growing" and "the analyzer cannot keep up"
+// alerts.
 //
-// Архитектурно — push, не полл: итоги проходов — возвращаемые значения
-// RetentionOnce, долговременного состояния нет. Цикл RetentionLoop
-// отдаёт итог хуком RetentionOptions.OnPass, коллектор переводит его в
-// приборы — тот же шов, что CleanupOptions.OnPass (T-020/T-099),
-// пакет retention.go зависимостей на метрики не получает.
+// Architecturally it is push, not poll: pass outcomes are the return values
+// of RetentionOnce; there is no long-lived state. The RetentionLoop cycle
+// hands the outcome over via the RetentionOptions.OnPass hook, and the
+// collector turns it into instruments — the same seam as
+// CleanupOptions.OnPass (T-020/T-099); the retention.go package picks up no
+// dependency on metrics.
 package content
 
 import (
@@ -17,14 +19,14 @@ import (
 	"crawler/internal/metrics"
 )
 
-// retentionSecondsBuckets — корзины длительности прохода: пачка до
-// 50 тыс. строк (content.retention_batch) — секунды на живой БД, дренаж
-// из ~13 пачек — десятки секунд; хвост (бэкфилл T-167, VACUUM-соседство)
-// закрывают минуты.
+// retentionSecondsBuckets — the pass duration buckets: a batch of up to
+// 50k rows (content.retention_batch) takes seconds on a live DB, draining
+// ~13 batches takes tens of seconds; the tail (the T-167 backfill,
+// VACUUM neighborhood) is covered by minutes.
 var retentionSecondsBuckets = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300}
 
-// RetentionMetrics — приборы цикла retention: счётчики монотонно растут
-// итогами проходов, гистограмма наблюдается каждый проход.
+// RetentionMetrics — the instruments of the retention cycle: counters grow
+// monotonically with pass outcomes; the histogram is observed on every pass.
 type RetentionMetrics struct {
 	rows          prometheus.Counter     // crawler_content_retention_rows_total
 	refs          prometheus.Counter     // crawler_content_retention_refs_total
@@ -40,9 +42,9 @@ type RetentionMetrics struct {
 	deferred      *prometheus.CounterVec // crawler_content_retention_deferred_total{stream}
 }
 
-// NewRetentionMetrics регистрирует приборы retention в реестре reg;
-// nil — nil (сервис без реестра — изолированные сборки). Идемпотентен
-// (T-076): повторный вызов делит те же коллекторы.
+// NewRetentionMetrics registers the retention instruments in the reg
+// registry; nil in — nil out (a service without a registry — isolated
+// builds). Idempotent (T-076): a repeated call shares the same collectors.
 func NewRetentionMetrics(reg *metrics.Registry) *RetentionMetrics {
 	if reg == nil {
 		return nil
@@ -100,15 +102,16 @@ func NewRetentionMetrics(reg *metrics.Registry) *RetentionMetrics {
 	}
 }
 
-// Observe — итог одного прохода (подключается хуком
-// RetentionOptions.OnPass): счётчики и длительность. Нулевой итог
-// значения не меняет; nil-приёмник — no-op (сервис без реестра), чтобы
-// сборка подключала хук безусловно. Skipped учитывается меткой
-// passes{result="skipped"} и счётчиком skips, SkippedPending — меткой
-// passes{result="skipped_pending"} и счётчиком pendingErrors; пропуски
-// посреди дренажа (интерлок/ошибка после части пачек) не теряют уже
-// сделанной работы — Rows/Refs/Contents/Freed/Deferred зачитываются и
-// в них, пачки-то зафиксированы в БД.
+// Observe — the outcome of one pass (wired in via the
+// RetentionOptions.OnPass hook): counters and duration. A zero outcome
+// changes nothing; a nil receiver is a no-op (a service without a registry)
+// so that the build can wire the hook unconditionally. Skipped is counted by
+// the passes{result="skipped"} label and the skips counter, SkippedPending —
+// by the passes{result="skipped_pending"} label and the pendingErrors
+// counter; skips in the middle of a drain (an interlock/error after some
+// batches) do not lose the work already done — Rows/Refs/Contents/Freed/
+// Deferred are credited in them too, since the batches are committed in the
+// DB.
 func (m *RetentionMetrics) Observe(res RetentionStats, d time.Duration) {
 	if m == nil {
 		return
@@ -130,10 +133,10 @@ func (m *RetentionMetrics) Observe(res RetentionStats, d time.Duration) {
 	m.observeWork(res)
 }
 
-// ObserveError — ошибочный проход (T-273): +1 к
-// crawler_content_retention_errors_total; подключается хуком
-// RetentionOptions.OnError (значение ошибки не классифицируется —
-// текст виден в Warn журнала). nil-приёмник — no-op.
+// ObserveError — a failed pass (T-273): +1 to
+// crawler_content_retention_errors_total; wired in via the
+// RetentionOptions.OnError hook (the error value is not classified —
+// the text is visible in the journal Warn). A nil receiver is a no-op.
 func (m *RetentionMetrics) ObserveError(error) {
 	if m == nil {
 		return
@@ -141,8 +144,9 @@ func (m *RetentionMetrics) ObserveError(error) {
 	m.errors.Inc()
 }
 
-// observeWork — счётчики сделанной работы прохода (общая часть веток
-// ok/skipped/skipped_pending; BadHashes/Missing — только при наличии).
+// observeWork — the counters of the work done by the pass (the common part
+// of the ok/skipped/skipped_pending branches; BadHashes/Missing — only when
+// present).
 func (m *RetentionMetrics) observeWork(res RetentionStats) {
 	m.rows.Add(float64(res.Rows))
 	m.refs.Add(float64(res.Refs))

@@ -1,11 +1,12 @@
-// Юнит-тесты состояния дренажа retention (T-185, retentiondrain.go):
-// курсор по времени переживает проходы (строка посещается один раз за
-// жизнь, следующий проход продолжает с места остановки), точечные
-// предложения ретраев защиты очередей (зонд по PK, эвикция
-// не-кандидатов, bound списка), catch-up-круги (обнуление счётчика
-// рендер-долга T-175, fallback-сутки при отсутствии строки, переполнение
-// списка), возврат перепроверённой строки в дренаж после старения.
-// Фейковый пул — retention_test.go (включая счётчик crawler_counters).
+// Unit tests of the retention drain state (T-185, retentiondrain.go):
+// the time cursor survives passes (a row is visited once in its lifetime,
+// the next pass continues from the stop point), point offers of the
+// queue-guard retries (the PK probe, eviction of non-candidates, the list
+// bound), catch-up circles (the T-175 render-debt counter reset to zero,
+// the fallback day on a missing row, the list overflow), and the return of
+// a re-checked row to the drain after aging.
+// The fake pool lives in retention_test.go (including the crawler_counters
+// counter).
 package content
 
 import (
@@ -23,8 +24,8 @@ import (
 	"crawler/internal/queue"
 )
 
-// drainPool — пул с одним живым доменом zone=1 (без флагов) и двумя
-// остаревшими кандидатами sub=0/sub=1: база сценариев дренажа.
+// drainPool — a pool with one live domain zone=1 (no flags) and two aged
+// candidates sub=0/sub=1: the base of the drain scenarios.
 func drainPool(now time.Time) *retentionFakePool {
 	pool := newRetentionFakePool(now)
 	old := now.Add(-2 * DefaultRetention)
@@ -38,21 +39,22 @@ func drainPool(now time.Time) *retentionFakePool {
 	return pool
 }
 
-// zeroArgs — ожидаемые аргументы выборки с нулевого курсора.
+// zeroArgs — the expected arguments of a selection from the zero cursor.
 func zeroArgs(limit int) []any {
 	return []any{DefaultRetention.String(), time.Time{}, int16(0), int64(0), int16(0), int16(0), limit}
 }
 
-// --- курсор цикла (ТЗ §4.2) ---------------------------------------------------
+// --- the cycle cursor (spec §4.2) ---------------------------------------------
 
-// TestRetentionPass_CursorAcrossPasses — курсор переживает проходы:
-// первый дренаж останавливается на последней строке окна, часовой
-// проход продолжает с места остановки и не перечитывает пройденное;
-// состарившаяся за час запись подбирается без полного круга.
+// TestRetentionPass_CursorAcrossPasses — the cursor survives passes:
+// the first drain stops at the last row of the window; the hourly pass
+// continues from the stop point and does not re-read what has been passed;
+// a record that aged over the hour is picked up without a full circle.
 func TestRetentionPass_CursorAcrossPasses(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
-	// Третья запись свежа (5,5 ч < 6 ч окна) — не кандидат первого прохода.
+	// The third record is fresh (5.5 h < the 6 h window) — not a candidate
+	// of the first pass.
 	pool.results = append(pool.results, retentionRow{
 		key:       retentionKey{zone: 1, domain: 10, sub: 2, variant: 0},
 		checkedAt: now.Add(-5*time.Hour - 30*time.Minute), hash: retentionHash16(0x33), jsonb: true,
@@ -72,8 +74,8 @@ func TestRetentionPass_CursorAcrossPasses(t *testing.T) {
 		t.Fatalf("курсор после прохода 1 = %+v, want %+v (последняя строка окна)", st.cursor, want)
 	}
 
-	// Час спустя sub=2 состарилась (5,5 ч > 6 ч − 1 ч окна) — проход
-	// продолжает от курсора, без полного круга.
+	// An hour later sub=2 has aged (5.5 h > 6 h − 1 h of the window) — the
+	// pass continues from the cursor, without a full circle.
 	pool.now = now.Add(time.Hour)
 	pool.queries = nil
 	stats, err = retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
@@ -92,9 +94,9 @@ func TestRetentionPass_CursorAcrossPasses(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_InterlockKeepsCursor — остановка интерлоком среди
-// дренажа сохраняет прогресс: зафиксированные пачки продвинули курсор,
-// следующий проход продолжает за ними, а не с нуля.
+// TestRetentionPass_InterlockKeepsCursor — an interlock stop in the middle
+// of a drain keeps the progress: the committed batches advanced the
+// cursor; the next pass continues after them, not from zero.
 func TestRetentionPass_InterlockKeepsCursor(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
@@ -105,7 +107,7 @@ func TestRetentionPass_InterlockKeepsCursor(t *testing.T) {
 	pool.contents[retentionHash(0x33)] = retentionFakeContent{refc: 1, clen: 3000}
 
 	opts := retentionDefaultOpts()
-	opts.BatchSize = 1 // пачка = строка
+	opts.BatchSize = 1 // a batch = a row
 	depth := &fakeDepth{n: 0}
 	opts.Depth = depth
 	opts.AnalyzeWatermark = 100
@@ -114,7 +116,7 @@ func TestRetentionPass_InterlockKeepsCursor(t *testing.T) {
 		selects++
 		if selects >= 1 {
 			depth.mu.Lock()
-			depth.n = 150 // анализатор перестал успевать после первой пачки
+			depth.n = 150 // the analyzer stopped keeping up after the first batch
 			depth.mu.Unlock()
 		}
 	}
@@ -132,11 +134,11 @@ func TestRetentionPass_InterlockKeepsCursor(t *testing.T) {
 		t.Fatalf("курсор после остановки = %+v, want %+v (первая строка)", st.cursor, want)
 	}
 
-	// Глубина спала: дренаж продолжается с курсора — строки 1 и 2.
+	// The depth dipped: the drain continues from the cursor — rows 1 and 2.
 	depth.mu.Lock()
 	depth.n = 0
 	depth.mu.Unlock()
-	pool.onSelect = nil // час глубины прошёл — гонки больше нет
+	pool.onSelect = nil // the depth hour has passed — no more race
 	pool.queries = nil
 	stats, err = retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
@@ -151,10 +153,10 @@ func TestRetentionPass_InterlockKeepsCursor(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_RewrittenReEnters — перезапись recheck (DELETE+INSERT,
-// fresh checked_at и новый контент, T-058) пропускается охраной в текущем
-// окне и входит в дренаж заново, когда состарится: fresh отметка всегда
-// впереди курсора (ТЗ §3.2).
+// TestRetentionPass_RewrittenReEnters — a recheck rewrite (DELETE+INSERT,
+// a fresh checked_at and new content, T-058) is skipped by the guard in the
+// current window and enters the drain again when it ages: a fresh stamp is
+// always ahead of the cursor (spec §3.2).
 func TestRetentionPass_RewrittenReEnters(t *testing.T) {
 	now := retentionTestNow()
 	pool := newRetentionFakePool(now)
@@ -164,7 +166,8 @@ func TestRetentionPass_RewrittenReEnters(t *testing.T) {
 		{key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0x11), jsonb: true},
 	}
 	pool.contents[retentionHash(0x11)] = retentionFakeContent{refc: 1, clen: 1000}
-	// Перезапись между выборкой и чисткой: свежая отметка, новый контент.
+	// A rewrite between the selection and the purge: a fresh stamp, new
+	// content.
 	pool.onSelect = func() {
 		r := pool.results[0]
 		r.checkedAt, r.hash = now.Add(-time.Hour), retentionHash16(0x99)
@@ -181,7 +184,7 @@ func TestRetentionPass_RewrittenReEnters(t *testing.T) {
 		t.Fatalf("проход 1: Rows = %d, want 0 (охрана возраста)", stats.Rows)
 	}
 
-	// Шесть часов спустя перезапись состарилась — дренаж подбирает её.
+	// Six hours later the rewrite has aged — the drain picks it up.
 	pool.now = now.Add(6*time.Hour + time.Minute)
 	pool.onSelect = nil
 	stats, err = retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
@@ -193,20 +196,20 @@ func TestRetentionPass_RewrittenReEnters(t *testing.T) {
 	}
 }
 
-// --- ретраи защиты очередей (ТЗ §4.3) -----------------------------------------
+// --- queue guard retries (spec §4.3) ------------------------------------------
 
-// TestRetentionPass_RetryOffer — ключ, отложенный снимком q:render,
-// предлагается точечным зондом в следующем проходе: защита ушла —
-// чистится по месту, список пустеет; Forward-дренаж при этом продолжает
-// от своего курсора.
+// TestRetentionPass_RetryOffer — a key deferred by the q:render snapshot is
+// offered by the point probe in the next pass: the protection is gone —
+// it is purged in place and the list empties; the forward drain meanwhile
+// continues from its own cursor.
 func TestRetentionPass_RetryOffer(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
 	opts := retentionDefaultOpts()
 	opts.Pending = &fakePending{
 		render: []map[RetentionPendingKey]struct{}{
-			pendingKey(1, 10, 0, 0), // снимок 1: sub=0 ждёт q:render
-			{},                      // снимок 2: защита ушла
+			pendingKey(1, 10, 0, 0), // snapshot 1: sub=0 waits on q:render
+			{},                      // snapshot 2: the protection is gone
 		},
 		analyze: []map[RetentionPendingKey]struct{}{{}, {}},
 	}
@@ -226,7 +229,8 @@ func TestRetentionPass_RetryOffer(t *testing.T) {
 		t.Fatal("защищённая запись очищена в проходе 1")
 	}
 
-	// Проход 2: зонд предложил ключ, защита ушла — чистка на месте.
+	// Pass 2: the probe offered the key, the protection is gone — purged
+	// in place.
 	pool.queries = nil
 	stats, err = retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
@@ -252,16 +256,17 @@ func TestRetentionPass_RetryOffer(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_RetryStillProtected — ключ, всё ещё ждущий
-// потребителей, зондом не чистится и остаётся в списке на следующий
-// проход (до снятия защиты); исключение наблюдаемо в Deferred.
+// TestRetentionPass_RetryStillProtected — a key still waiting for
+// consumers is not purged by the probe and stays in the list for the next
+// pass (until the protection is lifted); the exclusion is observable in
+// Deferred.
 func TestRetentionPass_RetryStillProtected(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
 	opts := retentionDefaultOpts()
 	protected := pendingKey(1, 10, 0, 0)
 	opts.Pending = &fakePending{
-		render:  []map[RetentionPendingKey]struct{}{protected, protected}, // снимки 1 и 2
+		render:  []map[RetentionPendingKey]struct{}{protected, protected}, // snapshots 1 and 2
 		analyze: []map[RetentionPendingKey]struct{}{{}, {}},
 	}
 
@@ -287,10 +292,11 @@ func TestRetentionPass_RetryStillProtected(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_RetryEviction — ключ, переставший быть кандидатом
-// (домен стал Laravel-находкой), зонд не возвращает — ключ выпадает из
-// списка, чистки нет (ТЗ §4.3: «исключая из предложения те, чья защита
-// ушла и очистка прошла» — и симметричные случаи).
+// TestRetentionPass_RetryEviction — a key that stopped being a candidate
+// (the domain became a Laravel find) is not returned by the probe — the key
+// falls out of the list, no purge (spec §4.3: "excluding from the offers
+// those whose protection is gone and the purge has happened" — and the
+// symmetric cases).
 func TestRetentionPass_RetryEviction(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
@@ -308,7 +314,8 @@ func TestRetentionPass_RetryEviction(t *testing.T) {
 		t.Fatalf("список ретраев = %d, want 1 после прохода 1", len(st.retries))
 	}
 
-	// Домен стал находкой: зонд не вернёт ключ — эвикция без чистки.
+	// The domain became a find: the probe will not return the key —
+	// eviction without a purge.
 	pool.laravel[retentionDomKey{zone: 1, id: 10}] = true
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
@@ -325,9 +332,9 @@ func TestRetentionPass_RetryEviction(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_RetryBound — переполнение списка ретраев: Warn и
-// консервативный catch-up-круг следующим проходом (список пересоберёт
-// сам круг); новый список ключей не растёт сверх предела.
+// TestRetentionPass_RetryBound — the retry list overflow: a Warn and a
+// conservative catch-up circle on the next pass (the circle will rebuild
+// the list itself); the new key list does not grow beyond the limit.
 func TestRetentionPass_RetryBound(t *testing.T) {
 	now := retentionTestNow()
 	pool := newRetentionFakePool(now)
@@ -350,26 +357,28 @@ func TestRetentionPass_RetryBound(t *testing.T) {
 	var buf bytes.Buffer
 	opts.Log = retentionTestLogger(&buf)
 	st := &retentionState{retryLimit: 1}
-	opts.BatchSize = 1 // пачка = строка: переполнение встречается в нескольких пачках
+	opts.BatchSize = 1 // a batch = a row: the overflow is met across several batches
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
 		t.Fatalf("проход 1: %v", err)
 	}
 	if !st.circle || len(st.retries) != 1 {
 		t.Fatalf("после прохода 1: circle=%v, retries=%d (want запланированный круг, предел 1)", st.circle, len(st.retries))
 	}
-	// Warn — ровно один за эпизод переполнения (ревью T-185, P3-1 R2):
-	// вторая и третья пачки с ждущими ключами молчат, план уже стоит.
-	// Считается текст Warn: причина круга в Info-строке прохода 2 тоже
-	// содержит слово «переполнен» — это не Warn.
+	// The Warn — exactly one per overflow episode (review of T-185, P3-1
+	// R2): the second and third batches with waiting keys stay silent, the
+	// plan is already set. Counted is the Warn text: the circle reason in
+	// the Info line of pass 2 quotes the same overflow word (see
+	// warnOverflow below) — that is not a Warn.
 	const warnOverflow = "переполнен — следующий проход catch-up-кругом"
 	if got := strings.Count(buf.String(), warnOverflow); got != 1 {
 		t.Fatalf("Warn о переполнении = %d за проход 1, want 1", got)
 	}
 
-	// Следующий проход — catch-up-круг с нулевого курсора: список
-	// очищен, выборка снова с начала; застой держится — ключи
-	// откладываются заново (регресс полных кругов ограничен эпизодами
-	// застоя у watermark'ов), новый эпизод — новый Warn.
+	// The next pass — a catch-up circle from the zero cursor: the list is
+	// cleared, the selection starts from the beginning again; the standstill
+	// holds — the keys are deferred anew (the regression of full circles is
+	// limited to standstill episodes at the watermarks); a new episode — a
+	// new Warn.
 	pool.queries = nil
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
 		t.Fatalf("проход 2: %v", err)
@@ -388,18 +397,18 @@ func TestRetentionPass_RetryBound(t *testing.T) {
 	}
 }
 
-// --- catch-up по рендер-долгу (ТЗ §4.4) ---------------------------------------
+// --- render-debt catch-up (spec §4.4) -----------------------------------------
 
-// TestRetentionPass_DebtCatchUp — записи под флагом render_pending молча
-// отфильтровываются выборкой (курсор проходит их): обнуление счётчика
-// долга T-175 — переход в 0 — планирует catch-up-круг с нулевого
-// курсора, догоняющий всё, что копилось за эпоху долга.
+// TestRetentionPass_DebtCatchUp — records under the render_pending flag are
+// silently filtered out by the selection (the cursor passes them): the
+// T-175 debt counter's transition to 0 plans a catch-up circle from the
+// zero cursor, catching up everything that accumulated over the debt era.
 func TestRetentionPass_DebtCatchUp(t *testing.T) {
 	now := retentionTestNow()
 	pool := newRetentionFakePool(now)
 	old := now.Add(-2 * DefaultRetention)
-	// 10 — под рендер-долгом (флаг, не rendered): запись защищена;
-	// 20 — обычная не-находка.
+	// 10 — under render debt (the flag, not rendered): the record is
+	// protected; 20 — a regular non-find.
 	pool.domains[retentionDomKey{zone: 1, id: 10}] = retentionFakeDomain{flags: int16(model.FlagRenderPending)}
 	pool.domains[retentionDomKey{zone: 1, id: 20}] = retentionFakeDomain{}
 	pool.results = []retentionRow{
@@ -422,7 +431,8 @@ func TestRetentionPass_DebtCatchUp(t *testing.T) {
 		t.Fatalf("проход 1 = %+v (debtSeen=%v): только домен 20, круг не планируется", stats, st.debtSeen)
 	}
 
-	// Долг дренирован: флаг снят, счётчик обнулился.
+	// The debt has been drained: the flag is lifted, the counter reset to
+	// zero.
 	pool.domains[retentionDomKey{zone: 1, id: 10}] = retentionFakeDomain{}
 	pool.counters["render_pending"] = 0
 	pool.queries = nil
@@ -444,9 +454,10 @@ func TestRetentionPass_DebtCatchUp(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_DebtFallback — строки счётчика нет (БД до деплоя
-// T-175): fallback — круг раз в сутки от последнего круга, между ними
-// проходы продолжают от курсора; якорь — стартовый круг процесса.
+// TestRetentionPass_DebtFallback — the counter row is missing (the DB
+// before the T-175 deploy): the fallback — a circle once per day from the
+// last circle; in between, the passes continue from the cursor; the anchor
+// is the starting circle of the process.
 func TestRetentionPass_DebtFallback(t *testing.T) {
 	now := retentionTestNow()
 	pool := newRetentionFakePool(now)
@@ -468,13 +479,13 @@ func TestRetentionPass_DebtFallback(t *testing.T) {
 		t.Fatal("стартовый круг не зафиксирован якорем fallback-суток")
 	}
 
-	// Час спустя: новой записи нет, круг НЕ планируется (сутки не вышли)
-	// — проход один пустой SELECT от курсора.
+	// An hour later: there is no new record, a circle is NOT planned (the
+	// day has not elapsed) — the pass is one empty SELECT from the cursor.
 	pool.now = now.Add(time.Hour)
 	pool.results = append(pool.results, retentionRow{
 		key: retentionKey{zone: 1, domain: 10, sub: 2, variant: 0},
-		// Остарела к этому моменту (11,5 ч > 5 ч границы), но сидит ПОЗАДИ
-		// курсора прохода 1 (11 ч): до круга не трогается вовсе.
+		// Aged by this moment (11.5 h > the 5 h boundary), but sits BEHIND
+		// the pass 1 cursor (11 h): not touched at all until the circle.
 		checkedAt: now.Add(-11*time.Hour - 30*time.Minute), hash: retentionHash16(0x33), jsonb: true,
 	})
 	pool.contents[retentionHash(0x33)] = retentionFakeContent{refc: 1, clen: 3000}
@@ -490,7 +501,8 @@ func TestRetentionPass_DebtFallback(t *testing.T) {
 		t.Fatal("проход 2 пошёл с нулевого курсора вопреки неистёкшим суткам fallback")
 	}
 
-	// Сутки спустя — fallback-круг с нулевого курсора подбирает хвост.
+	// A day later — the fallback circle from the zero cursor picks up the
+	// tail.
 	st.lastCircle = time.Now().Add(-DefaultRetentionFallbackCircle - time.Hour)
 	pool.queries = nil
 	stats, err = retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
@@ -502,9 +514,9 @@ func TestRetentionPass_DebtFallback(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_DebtReadError — ошибка чтения счётчика — не ошибка
-// прохода: Warn, состояние долга держится (якорь fallback свеж — круг не
-// срабатывает), дренаж идёт штатно.
+// TestRetentionPass_DebtReadError — a counter read error is not a pass
+// error: a Warn; the debt state is kept (the fallback anchor is fresh — the
+// circle does not fire), and the drain proceeds normally.
 func TestRetentionPass_DebtReadError(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
@@ -514,10 +526,10 @@ func TestRetentionPass_DebtReadError(t *testing.T) {
 	var buf bytes.Buffer
 	opts := retentionDefaultOpts()
 	opts.Log = retentionTestLogger(&buf)
-	// Якорь не ставится вручную: его обязана поставить инициализация
-	// состояния в retentionPass — иначе (мутация «убрать блок») fallback
-	// немедленно применяет круг и сбрасывает debtSeen (ревью T-185,
-	// P3-1 R3).
+	// The anchor is not set manually: the state initialization in
+	// retentionPass must set it — otherwise (the "remove the block"
+	// mutation) the fallback would immediately apply a circle and reset
+	// debtSeen (review of T-185, P3-1 R3).
 	st := &retentionState{debtSeen: true}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
@@ -537,18 +549,19 @@ func TestRetentionPass_DebtReadError(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_DebtAnchorRefresh — якорь fallback-суток двигают
-// успешные чтения счётчика: сутки «с прошлого круга» истекли, но чтение
-// удалось — круг не поднимается, курсор не сбрасывается; транзиентный
-// сбой следующего прохода тоже (якорь свеж) — fallback значит
-// «недоступен сутки ПОДРЯД» (ревью T-185, P3-2 R3).
+// TestRetentionPass_DebtAnchorRefresh — the fallback-day anchor is moved by
+// successful counter reads: the day "since the last circle" has elapsed,
+// but the read succeeded — no circle is raised, the cursor is not reset;
+// a transient failure of the next pass does not either (the anchor is
+// fresh) — fallback means "unavailable for a day IN A ROW" (review of
+// T-185, P3-2 R3).
 func TestRetentionPass_DebtAnchorRefresh(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
 	anchor := retentionCursor{checkedAt: now.Add(-time.Hour), key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}}
 	st := &retentionState{
-		cursor:     anchor,                                                      // дренаж уже прошёл эту точку
-		lastCircle: time.Now().Add(-DefaultRetentionFallbackCircle - time.Hour), // «сутки истекли»
+		cursor:     anchor,                                                      // the drain has already passed this point
+		lastCircle: time.Now().Add(-DefaultRetentionFallbackCircle - time.Hour), // "the day has elapsed"
 	}
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
 		t.Fatalf("проход 1: %v", err)
@@ -557,7 +570,8 @@ func TestRetentionPass_DebtAnchorRefresh(t *testing.T) {
 		t.Fatalf("после прохода 1: circle=%v cursor=%+v — успешное чтение обязано обновить якорь, круг не поднимается", st.circle, st.cursor)
 	}
 
-	// Следующий час — сбой чтения: якорь свеж, круг не поднимается.
+	// The next hour — a read failure: the anchor is fresh, no circle is
+	// raised.
 	pool.debtErr = errors.New("бд недоступна")
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
 		t.Fatalf("проход 2: %v", err)
@@ -567,10 +581,10 @@ func TestRetentionPass_DebtAnchorRefresh(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_DebtReadErrorFallback — стойко недоступный счётчик
-// (сбой чтения) включает страховку fallback-суток: якорь истёк — круг с
-// нулевого курсора подбирает и строку, утраченную позади курсора (ревью
-// T-185, P3-3/P2-1 R2).
+// TestRetentionPass_DebtReadErrorFallback — a persistently unavailable
+// counter (a read failure) engages the fallback-day guard: the anchor has
+// expired — a circle from the zero cursor picks up also the row lost behind
+// the cursor (review of T-185, P3-3/P2-1 R2).
 func TestRetentionPass_DebtReadErrorFallback(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
@@ -583,11 +597,11 @@ func TestRetentionPass_DebtReadErrorFallback(t *testing.T) {
 		t.Fatal("проход 1 не продвинул курсор")
 	}
 
-	// Строка позади курсора (класс утечки P1-1): круг страховки обязан
-	// её вычистить.
+	// A row behind the cursor (the P1-1 leak class): the guard circle must
+	// trim it.
 	pool.results = append(pool.results, retentionRow{
 		key:       retentionKey{zone: 1, domain: 10, sub: 2, variant: 0},
-		checkedAt: now.Add(-11*time.Hour - 30*time.Minute), // позади курсора прохода 1
+		checkedAt: now.Add(-11*time.Hour - 30*time.Minute), // behind the pass 1 cursor
 		hash:      retentionHash16(0x33), jsonb: true,
 	})
 	pool.contents[retentionHash(0x33)] = retentionFakeContent{refc: 1, clen: 3000}
@@ -605,17 +619,18 @@ func TestRetentionPass_DebtReadErrorFallback(t *testing.T) {
 	if len(pool.queries) != 1 || !reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
 		t.Fatalf("args прохода 2 = %v, want выборка fallback-круга с нулевого курсора", pool.queries[0].args)
 	}
-	// Курсор после круга — на подобранной строке (дренаж продолжился
-	// штатно с нулевой точки).
+	// The cursor after the circle — on the picked-up row (the drain
+	// continued normally from the zero point).
 	want := retentionCursor{checkedAt: pool.results[2].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 2, variant: 0}}
 	if st.cursor != want {
 		t.Fatalf("курсор после прохода 2 = %+v, want %+v (подобранная строка круга)", st.cursor, want)
 	}
 }
 
-// TestRetentionPass_DebtTableMissing — БД до деплоя миграции 000015:
-// undefined_table (42P01) — не сбой чтения, а «счётчика нет» — ветка
-// fallback без Warn, один Info на процесс (ревью T-185, P3-2/P3-4).
+// TestRetentionPass_DebtTableMissing — the DB before the migration 000015
+// deploy: undefined_table (42P01) — not a read failure but "no counter" —
+// the fallback branch without a Warn, one Info per process (review of
+// T-185, P3-2/P3-4).
 func TestRetentionPass_DebtTableMissing(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
@@ -632,7 +647,7 @@ func TestRetentionPass_DebtTableMissing(t *testing.T) {
 	if stats.Rows != 2 {
 		t.Fatalf("проход 1: stats = %+v, want штатный дренаж", stats)
 	}
-	// Второй проход того же стенда — Info не повторяется.
+	// The second pass of the same bench — the Info is not repeated.
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
 		t.Fatalf("проход 2: %v", err)
 	}
@@ -644,21 +659,21 @@ func TestRetentionPass_DebtTableMissing(t *testing.T) {
 	}
 }
 
-// --- контракты ----------------------------------------------------------------
+// --- contracts -----------------------------------------------------------------
 
-// TestRetentionDebtSQLContract — точечное чтение счётчика — тот же
-// оператор, что guard прохода доработки рендера (renderDebtCounterSQL,
-// T-181/T-175): литерал дублирован якорем, расхождение контракта
-// ловится здесь.
+// TestRetentionDebtSQLContract — the point read of the counter is the same
+// statement as the render rework pass guard (renderDebtCounterSQL,
+// T-181/T-175): the literal is duplicated with an anchor; a contract
+// divergence is caught here.
 func TestRetentionDebtSQLContract(t *testing.T) {
 	if retentionDebtSQL != "SELECT value FROM crawler_counters WHERE name = 'render_pending'" {
 		t.Fatalf("retentionDebtSQL разошёлся с контрактом T-175/T-181:\n%s", retentionDebtSQL)
 	}
 }
 
-// TestRetentionOnce_EachFromZero — разовый RetentionOnce состояния не
-// держит: каждый вызов начинает с нулевого курсора (первая выборка
-// каждого прохода — ноль; runbooks T-167 путь А, изолированные сборки).
+// TestRetentionOnce_EachFromZero — the one-off RetentionOnce keeps no
+// state: every call starts from the zero cursor (the first selection of
+// every pass is zero; the runbooks T-167 path A, isolated builds).
 func TestRetentionOnce_EachFromZero(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
@@ -674,11 +689,12 @@ func TestRetentionOnce_EachFromZero(t *testing.T) {
 	}
 }
 
-// TestRetentionSQLShape — регрессионный якорь формы SQL дренажа (ТЗ §5.1
-// «текст retentionSelectSQL»; ревью T-185, P3-4): курсор row-value по
-// ВРЕМЕНИ с PK-хвостом, ORDER BY тем же ключом, LIMIT последним; зонд —
-// LATERAL по PK с LIMIT 1 (закрепление точечного плана). Возврат к
-// PK-порядку (диагноз запроса №13) или потеря детерминизма ловится тут.
+// TestRetentionSQLShape — a regression anchor of the drain SQL shape
+// (spec §5.1 "the retentionSelectSQL text"; review of T-185, P3-4): the
+// cursor is a row-value over TIME with a PK tail, ORDER BY by the same
+// key, LIMIT last; the probe — LATERAL by PK with LIMIT 1 (pinning the
+// point plan). A return to PK order (the diagnosis of entry #13) or a loss
+// of determinism is caught here.
 func TestRetentionSQLShape(t *testing.T) {
 	for _, want := range []string{
 		"WHERE r.checked_at < now() - $1::interval",
@@ -691,7 +707,7 @@ func TestRetentionSQLShape(t *testing.T) {
 			t.Errorf("retentionSelectSQL потерял фрагмент дренажа по времени:\n%s\n--- нет:\n%s", retentionSelectSQL, want)
 		}
 	}
-	// Курсор по PK (прежний порядок) обязан уйти.
+	// The PK cursor (the old order) must be gone.
 	if strings.Contains(retentionSelectSQL, "ORDER BY r.zone_id, r.domain_id") {
 		t.Errorf("retentionSelectSQL вернул PK-порядок (диагноз запроса №13):\n%s", retentionSelectSQL)
 	}
@@ -710,10 +726,11 @@ func TestRetentionSQLShape(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_EqualTimestampsBoundary — главный риск потери строк
-// пагинации: пачки строк одной транзакции делят отметку checked_at
-// (T-058), граница пачки режет такую группу — PK-хвост курсора обязан
-// вернуть остаток группы следующей пачкой (ревью T-185, P3-4).
+// TestRetentionPass_EqualTimestampsBoundary — the main risk of losing rows
+// to pagination: batches of rows of one transaction share the checked_at
+// stamp (T-058), and the batch boundary cuts such a group — the PK tail of
+// the cursor must return the rest of the group with the next batch
+// (review of T-185, P3-4).
 func TestRetentionPass_EqualTimestampsBoundary(t *testing.T) {
 	now := retentionTestNow()
 	pool := newRetentionFakePool(now)
@@ -722,13 +739,13 @@ func TestRetentionPass_EqualTimestampsBoundary(t *testing.T) {
 	for sub := int16(0); sub < 3; sub++ {
 		pool.results = append(pool.results, retentionRow{
 			key:       retentionKey{zone: 1, domain: 10, sub: sub, variant: 0},
-			checkedAt: old, hash: retentionHash16(byte(0x10 + sub)), jsonb: true, // одна отметка на всех
+			checkedAt: old, hash: retentionHash16(byte(0x10 + sub)), jsonb: true, // one stamp for all
 		})
 		pool.contents[retentionHash(byte(0x10+sub))] = retentionFakeContent{refc: 1, clen: 1000}
 	}
 
 	opts := retentionDefaultOpts()
-	opts.BatchSize = 1 // пачка = строка: группа режется дважды
+	opts.BatchSize = 1 // a batch = a row: the group is cut twice
 	st := &retentionState{}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
@@ -737,11 +754,12 @@ func TestRetentionPass_EqualTimestampsBoundary(t *testing.T) {
 	if stats.Rows != 3 {
 		t.Fatalf("Rows = %d, want 3 (все строки равной отметки подобраны)", stats.Rows)
 	}
-	if len(pool.queries) != 4 { // три пачки + пустая выборка конца
+	if len(pool.queries) != 4 { // three batches + the empty end selection
 		t.Fatalf("SELECT'ов = %d, want 4", len(pool.queries))
 	}
-	// Курсоры пачек 2 и 3 — та же отметка, ключ строго растёт: курсор
-	// выборки i+1 — последняя строка пачки i (sub = 0, затем 1).
+	// The cursors of batches 2 and 3 — the same stamp, the key strictly
+	// grows: the cursor of selection i+1 is the last row of batch i
+	// (sub = 0, then 1).
 	for i := 1; i < 3; i++ {
 		args := pool.queries[i].args
 		if !args[1].(time.Time).Equal(old) {
@@ -753,10 +771,10 @@ func TestRetentionPass_EqualTimestampsBoundary(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_RetryPurgeFailureKeepsList — сбой чистки зонда
-// сохраняет прежний список ретраев: неочищенные ключи не теряются позади
-// курсора, следующий проход повторит зонд идемпотентно (утверждение
-// сообщения коммита; ревью T-185, P3-4).
+// TestRetentionPass_RetryPurgeFailureKeepsList — a probe purge failure
+// keeps the previous retry list: unpurged keys are not lost behind the
+// cursor, and the next pass repeats the probe idempotently (the assertion
+// of the commit message; review of T-185, P3-4).
 func TestRetentionPass_RetryPurgeFailureKeepsList(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
@@ -774,7 +792,7 @@ func TestRetentionPass_RetryPurgeFailureKeepsList(t *testing.T) {
 		t.Fatalf("список ретраев = %d, want 1 после прохода 1", len(st.retries))
 	}
 
-	// Чистка зонда падает: список обязан уцелеть до следующего прохода.
+	// The probe purge fails: the list must survive until the next pass.
 	pool.purgeErr = errors.New("бд недоступна")
 	if _, err := retentionPass(context.Background(), pool, opts, st); err == nil {
 		t.Fatal("проход 2 обязан упасть ошибкой чистки")
@@ -784,9 +802,10 @@ func TestRetentionPass_RetryPurgeFailureKeepsList(t *testing.T) {
 	}
 }
 
-// TestRetentionPass_NoMidPassProbe — зонд предлагается строго в начале
-// прохода: ключи, отложенные текущим проходом, предлагаются следующим
-// (ревью T-185, P3-2 — контракт комментария retentionPass).
+// TestRetentionPass_NoMidPassProbe — the probe is offered strictly at the
+// start of a pass: keys deferred by the current pass are offered by the
+// next one (review of T-185, P3-2 — the contract of the retentionPass
+// comment).
 func TestRetentionPass_NoMidPassProbe(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)

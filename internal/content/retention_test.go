@@ -1,12 +1,13 @@
-// Юнит-тесты retention контента и трима jsonb не-находок (T-166; ТЗ 5.7,
-// 5.5, 6.1, 3.4) на фейковом pgx-пуле с транзакциями: критерии отбора
-// (возраст, Laravel-находка, render_pending/rendered, deleted), точные
-// SQL-тексты и параметры, агрегация decref, инварианты refcount под
-// сбоем между UPDATE и decref (образец T-044), интерлок q:analyze,
-// дренаж пачками, цикл. ТЗ T-271: tx-оболочка закрепления плана выборки
-// (SET LOCAL ×4 → SELECT → COMMIT), потолок SelectTimeout, гейт тяжёлых
-// сканов и backoff цикла после ошибки. Поведение против живой БД —
-// интеграционные тесты (test/integration).
+// Unit tests of content retention and jsonb trimming of non-finds (T-166;
+// specs 5.7, 5.5, 6.1, 3.4) on a fake pgx pool with transactions: the
+// selection criteria (age, Laravel find, render_pending/rendered,
+// deleted), exact SQL texts and parameters, decref aggregation, refcount
+// invariants under a failure between UPDATE and decref (the T-044 sample),
+// the q:analyze interlock, draining in batches, the cycle. Spec T-271: the
+// plan-pinning tx wrapper of the selection (SET LOCAL ×4 → SELECT →
+// COMMIT), the SelectTimeout cap, the heavy-scan gate, and the cycle
+// backoff after an error. The behavior against a live DB — integration
+// tests (test/integration).
 package content
 
 import (
@@ -29,16 +30,16 @@ import (
 	"crawler/internal/model"
 )
 
-// --- фейковый пул с транзакциями retention ------------------------------------
+// --- fake pool with retention transactions -------------------------------------
 
-// retentionCall — записанный SQL-вызов с аргументами.
+// retentionCall — a recorded SQL call with arguments.
 type retentionCall struct {
 	sql  string
 	args []any
 }
 
-// retentionRows — pgx.Rows с заготовленными строками; Scan позиционный,
-// в порядке колонок SQL (стиль cleanupFakeRows).
+// retentionRows — pgx.Rows with pre-prepared rows; Scan is positional, in
+// the SQL column order (the cleanupFakeRows style).
 type retentionRows struct {
 	rows   [][]any
 	i      int
@@ -89,51 +90,53 @@ func (r *retentionRows) Values() ([]any, error) { return r.rows[r.i-1], nil }
 
 func (r *retentionRows) RawValues() [][]byte { return nil }
 
-// Conn и TypeMap — часть pgx.Rows, не используемая позиционным Scan.
+// Conn and TypeMap — the part of pgx.Rows unused by the positional Scan.
 func (r *retentionRows) Conn() *pgx.Conn      { return nil }
 func (r *retentionRows) TypeMap() *pgtype.Map { return nil }
 
-// retentionRow — строка subdomain_results: возраст, ссылка на контент,
-// признак наличия тяжёлых jsonb (любая из колонок) и rendered.
+// retentionRow — a subdomain_results row: the age, the content reference,
+// whether the heavy jsonb is present (any of the columns), and rendered.
 type retentionRow struct {
 	key       retentionKey
 	checkedAt time.Time
-	hash      []byte // nil — ссылки нет (T-056)
-	jsonb     bool   // есть headers/cookies/tls/redirects/addrs/cname
+	hash      []byte // nil — no reference (T-056)
+	jsonb     bool   // headers/cookies/tls/redirects/addrs/cname present
 	rendered  bool
 }
 
-// retentionDomKey — ключ домена.
+// retentionDomKey — the domain key.
 type retentionDomKey struct {
 	zone int16
 	id   int64
 }
 
-// retentionFakeDomain — строка domains, нужная выборке: флаги и статус.
+// retentionFakeDomain — the domains row the selection needs: flags and
+// status.
 type retentionFakeDomain struct {
 	flags  int16
 	status int16
 }
 
-// retentionFakeContent — строка contents.
+// retentionFakeContent — a contents row.
 type retentionFakeContent struct {
 	refc int32
 	clen int32
 }
 
-// retentionFakePool — RetentionDB без БД: таблицы subdomain_results/
-// domains/laravel_domains/contents в памяти, операторы retention —
-// по семантике SQL (охраны, RETURNING, GREATEST), транзакции копят
-// изменения и применяют их только в Commit (откат честно отменяет).
-// Отказы по шагам — краш-окна инвариантов T-044.
+// retentionFakePool — RetentionDB without a DB: the subdomain_results/
+// domains/laravel_domains/contents tables in memory; the retention
+// statements follow the SQL semantics (guards, RETURNING, GREATEST), and
+// transactions accumulate changes applying them only in Commit (a rollback
+// honestly cancels). Step failures — the crash windows of the T-044
+// invariants.
 type retentionFakePool struct {
 	mu       sync.Mutex
-	now      time.Time // серверное now() для границ старения
+	now      time.Time // the server-side now() for the aging boundaries
 	results  []retentionRow
 	domains  map[retentionDomKey]retentionFakeDomain
 	laravel  map[retentionDomKey]bool
 	contents map[Hash]retentionFakeContent
-	counters map[string]int64 // crawler_counters (T-175); nil-значения не поддерживаются — нет строки = нет ключа
+	counters map[string]int64 // crawler_counters (T-175); nil values are not supported — no row = no key
 
 	selectErr error
 	beginErr  error
@@ -141,48 +144,50 @@ type retentionFakePool struct {
 	decrefErr error
 	deleteErr error
 	commitErr error
-	debtErr   error // отказ чтения счётчика рендер-долга
-	// cursorErr — отказ чтения персистентного курсора при старте цикла
-	// (T-274); cursorSaveErr — отказ upsert'а курсора в транзакции пачки
-	// (атомарность «пачка ⟺ курсор»); cursorRow — строка
-	// retention_drain_cursor (nil — состояния нет), cursorSaves/
-	// cursorDeletes — применённые (закommиченные) upsert'ы и удаления.
+	debtErr   error // the render-debt counter read failure
+	// cursorErr — the persistent cursor read failure at cycle start
+	// (T-274); cursorSaveErr — the cursor upsert failure in the batch
+	// transaction (the "batch ⟺ cursor" atomicity); cursorRow — the
+	// retention_drain_cursor row (nil — no state); cursorSaves/
+	// cursorDelete — the applied (committed) upserts and deletions.
 	cursorErr     error
 	cursorSaveErr error
 	cursorRow     *retentionCursor
 	cursorSaves   int
 	cursorDelete  int
-	// planErr — отказ закрепления плана (SET LOCAL, T-271); selectBlock —
-	// «зависший» SELECT выборки: ответ только по ctx-дедлайну (тест
-	// ctx-таймаута T-271); selectBeginErr/selectCommitErr — отказ
-	// Begin/Commit tx-оболочки выборки («транзакция/фиксация выборки»).
+	// planErr — the plan pinning failure (SET LOCAL, T-271); selectBlock —
+	// a "stuck" SELECT of the selection: it answers only after the ctx
+	// deadline (the T-271 ctx timeout test);
+	// selectBeginErr/selectCommitErr — the Begin/Commit failure of the
+	// selection tx wrapper ("selection transaction/commit").
 	//
-	// beginErr/commitErr — инъекции транзакции ЧИСТКИ, не tx-оболочки
-	// выборки (ревью T-271 P2-2): с T-271 первой транзакцией прохода
-	// стала оболочка закрепления, и без разведения ролей кейс «сбой
-	// фиксации» TestRetentionOnce_FailureRollback падал бы на Commit
-	// оболочки — до чистки, выхолащивая инвариант T-044 (проверки
-	// «строки/refcount/contents целы» проходили бы тривиально, на пустой
-	// пачке). Ветки оболочки — selectBeginErr/selectCommitErr здесь же,
-	// кейсы TestRetentionOnceErrors.
+	// beginErr/commitErr — injections into the PURGE transaction, not the
+	// selection tx wrapper (review of T-271 P2-2): since T-271 the first
+	// transaction of a pass is the pinning wrapper, and without separating
+	// the roles the "commit failure" case of TestRetentionOnce_FailureRollback
+	// would fail on the wrapper's Commit — before the purge, hollowing out
+	// the T-044 invariant (the "rows/refcount/contents intact" checks
+	// would pass trivially, on an empty batch). The wrapper branches are
+	// selectBeginErr/selectCommitErr here; the cases — TestRetentionOnceErrors.
 	planErr         error
 	selectBlock     bool
 	selectBeginErr  error
 	selectCommitErr error
 
-	// selectDelay — задержка тяжёлой выборки (тест семантики backoff
-	// T-273: проход длится дольше тика интервала); selectsAt — метки
-	// времени вызовов выборки дренажа (старты проходов).
+	// selectDelay — the heavy selection delay (the T-273 backoff semantics
+	// test: the pass lasts longer than the interval tick); selectsAt — the
+	// timestamps of the drain selection calls (the pass starts).
 	selectDelay time.Duration
 	selectsAt   []time.Time
 
-	// onSelect — хук между выборкой и чисткой (гонки перезаписи): вызывается
-	// после отбора кандидатов, до возврата строк.
+	// onSelect — the hook between the selection and the purge (the rewrite
+	// races): called after the candidates are chosen, before the rows are
+	// returned.
 	onSelect func()
 
-	queries   []retentionCall // SELECT'ы дренажа/зонда (в tx-оболочке закрепления — T-271; без чтения счётчика)
-	debtReads int             // обращения к счётчику рендер-долга
-	txCalls   []retentionCall // операторы чистки через транзакции (purge/decref/delete)
+	queries   []retentionCall // the drain/probe SELECTs (in the plan-pinning tx wrapper — T-271; without the counter read)
+	debtReads int             // the render-debt counter accesses
+	txCalls   []retentionCall // the purge statements via transactions (purge/decref/delete)
 	txs       []*retentionFakeTx
 	begins    int
 	commits   int
@@ -195,26 +200,27 @@ func newRetentionFakePool(now time.Time) *retentionFakePool {
 		domains:  make(map[retentionDomKey]retentionFakeDomain),
 		laravel:  make(map[retentionDomKey]bool),
 		contents: make(map[Hash]retentionFakeContent),
-		// Строка счётчика есть (миграция 000015): ноль долга — дефолт
-		// боевой БД после деплоя T-175.
+		// The counter row exists (migration 000015): a zero debt — the
+		// default of the production DB after the T-175 deploy.
 		counters: map[string]int64{"render_pending": 0},
 	}
 }
 
-// compile-time: фейковый пул — RetentionDB для тестов без БД.
+// compile-time: the fake pool is a RetentionDB for tests without a DB.
 var _ RetentionDB = (*retentionFakePool)(nil)
 
 func (p *retentionFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
 	return 0, errors.New("CopyFrom не должен вызываться")
 }
 
-// Exec через пул retention не использует — все операторы в транзакции.
+// The retention pool path uses no Exec — all statements go inside a
+// transaction.
 func (p *retentionFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, errors.New("Exec через пул не должен вызываться")
 }
 
-// cutoff — граница старения «now() − interval» (Duration.String()
-// круглится через ParseDuration — roundtrip-свойство).
+// cutoff — the aging boundary "now() − interval" (Duration.String()
+// round-trips through ParseDuration — the roundtrip property).
 func (p *retentionFakePool) cutoff(interval string) time.Time {
 	d, err := time.ParseDuration(interval)
 	if err != nil {
@@ -232,8 +238,8 @@ func (p *retentionFakePool) row(key retentionKey) *retentionRow {
 	return nil
 }
 
-// candidate — проходит ли строка фильтрам выборки (JOIN domains, возраст,
-// наличие контента/jsonb, рендер, удалённость, Laravel-находка).
+// candidate — whether the row passes the selection filters (JOIN domains,
+// age, presence of content/jsonb, render, deletion, Laravel find).
 func (p *retentionFakePool) candidate(r *retentionRow, cutoff time.Time) bool {
 	d, ok := p.domains[retentionDomKey{zone: r.key.zone, id: r.key.domain}]
 	if !ok {
@@ -243,10 +249,10 @@ func (p *retentionFakePool) candidate(r *retentionRow, cutoff time.Time) bool {
 		return false
 	}
 	if r.hash == nil && !r.jsonb {
-		return false // чистить нечего
+		return false // nothing to purge
 	}
 	if !r.rendered && (d.flags&int16(model.FlagRenderPending)) != 0 {
-		return false // ждёт рендера (проход доработки T-066 перечитает контент)
+		return false // waiting for the render (the T-066 rework pass will re-read the content)
 	}
 	if d.status == int16(model.StatusDeleted) {
 		return false
@@ -257,12 +263,12 @@ func (p *retentionFakePool) candidate(r *retentionRow, cutoff time.Time) bool {
 	return true
 }
 
-// Query обслуживает чтения пула: счётчик рендер-долга (точечная строка),
-// персистентный курсор дренажа (T-274, единственная строка — в журнал
-// дренажа не пишется), зонд ретраев (PK = ANY ключей, фильтры отбора без
-// курсора) и точечный дренаж домена (T-187). Тяжёлая выборка дренажа
-// (retentionSelectSQL) с T-271 идёт в транзакции закрепления плана —
-// tx.Query (retentionFakeTx).
+// Query serves the pool reads: the render-debt counter (a point row), the
+// persistent drain cursor (T-274, a single row — not written to the drain
+// journal), the retry probe (PK = ANY of the keys, selection filters
+// without a cursor), and the point drain of a domain (T-187). Since T-271
+// the heavy drain selection (retentionSelectSQL) runs inside the plan
+// pinning transaction — tx.Query (retentionFakeTx).
 func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -274,7 +280,7 @@ func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (p
 		}
 		n, ok := p.counters["render_pending"]
 		if !ok {
-			return retentionResultRows(), nil // строки счётчика нет
+			return retentionResultRows(), nil // the counter row is missing
 		}
 		return retentionResultRows([]any{n}), nil
 
@@ -283,7 +289,7 @@ func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (p
 			return nil, p.cursorErr
 		}
 		if p.cursorRow == nil {
-			return retentionResultRows(), nil // состояния нет
+			return retentionResultRows(), nil // no state
 		}
 		return retentionResultRows([]any{
 			p.cursorRow.checkedAt, p.cursorRow.key.zone, p.cursorRow.key.domain,
@@ -301,14 +307,14 @@ func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (p
 		for i := range p.results {
 			r := &p.results[i]
 			if r.key.zone != zone || r.key.domain != domain {
-				continue // префикс PK (zone_id, domain_id)
+				continue // the PK prefix (zone_id, domain_id)
 			}
 			if !p.candidate(r, cutoff) {
 				continue
 			}
 			sel = append(sel, r)
 		}
-		// ORDER BY PK — детерминированные аргументы пачки.
+		// ORDER BY PK — deterministic batch arguments.
 		sorted := make([]*retentionRow, len(sel))
 		copy(sorted, sel)
 		for i := 1; i < len(sorted); i++ {
@@ -330,11 +336,11 @@ func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (p
 		subs := args[2].([]int16)
 		variants := args[3].([]int16)
 		var rows [][]any
-		for i := range zones { // порядок входных ключей (сортирует зонд)
+		for i := range zones { // the input key order (the probe sorts)
 			key := retentionKey{zone: zones[i], domain: domains[i], sub: subs[i], variant: variants[i]}
 			r := p.row(key)
 			if r == nil || !p.candidate(r, cutoff) {
-				continue // не кандидат: чистить нечего / fresh / находка / рендер
+				continue // not a candidate: nothing to purge / fresh / a find / a render
 			}
 			rows = append(rows, []any{r.key.zone, r.key.domain, r.key.sub, r.key.variant, r.hash})
 		}
@@ -345,8 +351,8 @@ func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (p
 	}
 }
 
-// retentionRowLess/After — сравнение строки с курсором по (checked_at, PK),
-// row-value порядок выборки (T-185).
+// retentionRowLess/After — comparing a row with a cursor over
+// (checked_at, PK), the row-value order of the selection (T-185).
 func retentionRowLess(a, b *retentionRow) bool {
 	if !a.checkedAt.Equal(b.checkedAt) {
 		return a.checkedAt.Before(b.checkedAt)
@@ -365,10 +371,11 @@ func (p *retentionFakePool) Begin(context.Context) (pgx.Tx, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.begins++
-	// Разведение инъекций по ролям транзакций (ревью T-271 P2-2): первая
-	// транзакция прохода — tx-оболочка выборки (selectBeginErr), вторая —
-	// транзакция чистки пачки (beginErr). Счётчик корректен на свежем
-	// фейке: RetentionOnce открывает оболочку, затем чистку.
+	// Separating the injections by transaction roles (review of T-271
+	// P2-2): the first transaction of a pass is the selection tx wrapper
+	// (selectBeginErr), the second — the batch purge transaction (beginErr).
+	// The counter is correct on a fresh fake: RetentionOnce opens the
+	// wrapper, then the purge.
 	if p.begins == 1 && p.selectBeginErr != nil {
 		return nil, p.selectBeginErr
 	}
@@ -380,33 +387,34 @@ func (p *retentionFakePool) Begin(context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
-// retentionFakeTx — транзакция: чистки/уменьшения копятся в оверлее и
-// применяются только в Commit (PostgreSQL видит собственные изменения,
-// потому операторы транзакции читают оверлей). С T-271 транзакция
-// обслуживает и tx-оболочку выборки: SET LOCAL закрепления плана
-// (retentionFakeTx.Exec) и SELECT пачки (retentionFakeTx.Query); calls —
-// упорядоченный журнал операторов транзакции (контракт порядка
-// закрепления, стиль retryFakeTx.calls). С T-274 — upsert/удаление
-// персистентного курсора (savedCursor/deletedCursor применяются в Commit
-// вместе с пачкой — атомарность воспроизводится честно).
+// retentionFakeTx — a transaction: the purges/decreases accumulate in an
+// overlay and apply only in Commit (PostgreSQL sees its own changes, hence
+// the transaction statements read the overlay). Since T-271 the transaction
+// also serves the selection tx wrapper: the plan pinning SET LOCAL
+// (retentionFakeTx.Exec) and the batch SELECT (retentionFakeTx.Query);
+// calls — the ordered journal of the transaction's statements (the pinning
+// order contract, the retryFakeTx.calls style). Since T-274 — the
+// upsert/deletion of the persistent cursor (savedCursor/deletedCursor are
+// applied in Commit together with the batch — the atomicity is reproduced
+// honestly).
 type retentionFakeTx struct {
-	pgx.Tx // остальные методы pgx.Tx проход не использует
+	pgx.Tx // the pass does not use the rest of the pgx.Tx methods
 
 	pool    *retentionFakePool
-	purged  map[retentionKey]retentionRow // очищенные строки
-	updated map[Hash]retentionFakeContent // уменьшенные refcount
-	deleted map[Hash]struct{}             // удалённые contents
+	purged  map[retentionKey]retentionRow // trimmed rows
+	updated map[Hash]retentionFakeContent // decreased refcounts
+	deleted map[Hash]struct{}             // deleted contents
 
-	savedCursor   *retentionCursor // upsert курсора (T-274)
-	deletedCursor bool             // DELETE строки курсора (catch-up-круг)
+	savedCursor   *retentionCursor // the cursor upsert (T-274)
+	deletedCursor bool             // the DELETE of the cursor row (a catch-up circle)
 
-	calls      []retentionCall // все операторы транзакции по порядку
-	isSelect   bool            // tx-оболочка закрепления (первый Exec — SET LOCAL)
+	calls      []retentionCall // all the transaction statements in order
+	isSelect   bool            // the plan-pinning tx wrapper (the first Exec is a SET LOCAL)
 	committed  bool
 	rolledBack bool
 }
 
-// view-доступ к состоянию с учётом собственных изменений транзакции.
+// A view of the state accounting for the transaction's own changes.
 func (t *retentionFakeTx) row(key retentionKey) *retentionRow {
 	if r, ok := t.purged[key]; ok {
 		return &r
@@ -425,19 +433,21 @@ func (t *retentionFakeTx) content(h Hash) (retentionFakeContent, bool) {
 	return c, ok
 }
 
-// Query — операторы с RETURNING (retentionPurgeSQL, retentionDecrefSQL)
-// и тяжёлая выборка дренажа (retentionSelectSQL — с T-271 в транзакции
-// закрепления плана; фильтры, курсор row-value, LIMIT — та же семантика).
+// Query — the statements with RETURNING (retentionPurgeSQL,
+// retentionDecrefSQL) and the heavy drain selection (retentionSelectSQL —
+// since T-271 inside the plan pinning transaction; the filters, the
+// row-value cursor, the LIMIT — the same semantics).
 func (t *retentionFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	// «Зависший» SELECT (тест ctx-таймаута T-271): ответ только по
-	// дедлайну выборки, до журналов и семантики.
+	// A "stuck" SELECT (the T-271 ctx timeout test): it answers only after
+	// the selection deadline, before the journals and the semantics.
 	if sql == retentionSelectSQL && t.pool.selectBlock {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 	if sql == retentionSelectSQL {
-		// Момент старта прохода и задержка выборки (семантика backoff
-		// T-273): сон вне мьютекса — пул остаётся доступен тесту.
+		// The pass start moment and the selection delay (the T-273 backoff
+		// semantics): the sleep is outside the mutex — the pool stays
+		// available to the test.
 		t.pool.mu.Lock()
 		t.pool.selectsAt = append(t.pool.selectsAt, time.Now())
 		delay := t.pool.selectDelay
@@ -478,7 +488,7 @@ func (t *retentionFakeTx) Query(ctx context.Context, sql string, args ...any) (p
 			}
 			sel = append(sel, r)
 		}
-		// ORDER BY (checked_at, PK) — детерминированные пачки (T-185).
+		// ORDER BY (checked_at, PK) — deterministic batches (T-185).
 		sorted := make([]*retentionRow, len(sel))
 		copy(sorted, sel)
 		for i := 1; i < len(sorted); i++ {
@@ -489,14 +499,15 @@ func (t *retentionFakeTx) Query(ctx context.Context, sql string, args ...any) (p
 		if len(sorted) > limit {
 			sorted = sorted[:limit]
 		}
-		// Снимок SELECT материализуется ДО хука: перезапись в окне гонки
-		// меняет строки после чтения (как в реальном конвейере recheck).
+		// The SELECT snapshot is materialized BEFORE the hook: a rewrite in
+		// the race window changes the rows after the read (as in the real
+		// recheck pipeline).
 		rows := make([][]any, len(sorted))
 		for i, r := range sorted {
 			rows[i] = []any{r.key.zone, r.key.domain, r.key.sub, r.key.variant, r.hash, r.checkedAt}
 		}
 		if t.pool.onSelect != nil {
-			t.pool.onSelect() // гонка перезаписи между выборкой и чисткой
+			t.pool.onSelect() // the rewrite race between the selection and the purge
 		}
 		return retentionResultRows(rows...), nil
 
@@ -516,13 +527,13 @@ func (t *retentionFakeTx) Query(ctx context.Context, sql string, args ...any) (p
 			key := retentionKey{zone: zones[i], domain: domains[i], sub: subs[i], variant: variants[i]}
 			r := t.row(key)
 			if r == nil {
-				continue // строка исчезла (перепроверка переписала) — охрана
+				continue // the row vanished (a recheck rewrote it) — the guard
 			}
 			if !r.checkedAt.Before(cutoff) {
-				continue // перезаписана свежим эпизодом — охрана возраста
+				continue // rewritten by a fresh episode — the age guard
 			}
 			if !retentionBytesEqual(r.hash, hashes[i]) {
-				continue // контент сменился — охрана content_hash
+				continue // the content changed — the content_hash guard
 			}
 			if t.purged == nil {
 				t.purged = make(map[retentionKey]retentionRow)
@@ -547,7 +558,7 @@ func (t *retentionFakeTx) Query(ctx context.Context, sql string, args ...any) (p
 			copy(h[:], hashes[i])
 			c, ok := t.content(h)
 			if !ok {
-				continue // нет строки contents — Missing (расхождение учёта)
+				continue // no contents row — Missing (a bookkeeping divergence)
 			}
 			refc := c.refc - counts[i] // GREATEST(..., 0)
 			if refc < 0 {
@@ -566,8 +577,8 @@ func (t *retentionFakeTx) Query(ctx context.Context, sql string, args ...any) (p
 	}
 }
 
-// Exec — SET LOCAL закрепления плана выборки (T-271) и удаление contents
-// без ссылок (retentionDeleteSQL).
+// Exec — the SET LOCAL of the selection plan pinning (T-271) and the
+// deletion of contents without references (retentionDeleteSQL).
 func (t *retentionFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
@@ -576,9 +587,10 @@ func (t *retentionFakeTx) Exec(_ context.Context, sql string, args ...any) (pgco
 	case sql == retentionPlanNoSeqScanSQL || sql == retentionPlanNoHashJoinSQL ||
 		sql == retentionPlanNoMergeJoinSQL || sql == retentionPlanNoBitmapScanSQL ||
 		strings.HasPrefix(sql, "SET LOCAL statement_timeout = "):
-		// Закрепление плана (T-271): потолок statement_timeout — Sprintf
-		// по SelectTimeout, потому префиксом. Исполнивший SET LOCAL —
-		// tx-оболочка выборки (метка для commitErr-инъекции чистки).
+		// The plan pinning (T-271): the statement_timeout cap is Sprintf'd
+		// from SelectTimeout, hence the prefix. The one that executed a SET
+		// LOCAL is the selection tx wrapper (the marker for the purge's
+		// commitErr injection).
 		t.isSelect = true
 		if t.pool.planErr != nil {
 			return pgconn.CommandTag{}, t.pool.planErr
@@ -604,9 +616,9 @@ func (t *retentionFakeTx) Exec(_ context.Context, sql string, args ...any) (pgco
 		}
 		return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n)), nil
 	case sql == retentionCursorSaveSQL:
-		// Upsert персистентного курсора (T-274): применяется в Commit
-		// (последняя запись в транзакции выигрывает), отказ — откат
-		// транзакции целиком (атомарность с пачкой).
+		// The persistent cursor upsert (T-274): applied in Commit (the
+		// last write in the transaction wins); a failure rolls back the
+		// whole transaction (the atomicity with the batch).
 		if t.pool.cursorSaveErr != nil {
 			return pgconn.CommandTag{}, t.pool.cursorSaveErr
 		}
@@ -632,10 +644,10 @@ func (t *retentionFakeTx) Exec(_ context.Context, sql string, args ...any) (pgco
 func (t *retentionFakeTx) Commit(context.Context) error {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
-	// Разведение инъекций по ролям (ревью T-271 P2-2): tx-оболочка
-	// выборки (isSelect — исполненный SET LOCAL) — selectCommitErr,
-	// фиксация транзакции чистки — commitErr (инвариант T-044: сбой
-	// Commit откатывает purge/decref/delete).
+	// Separating the injections by roles (review of T-271 P2-2): the
+	// selection tx wrapper (isSelect — a SET LOCAL was executed) —
+	// selectCommitErr; the purge transaction commit — commitErr (the T-044
+	// invariant: a Commit failure rolls back purge/decref/delete).
 	if t.isSelect && t.pool.selectCommitErr != nil {
 		return t.pool.selectCommitErr
 	}
@@ -671,9 +683,10 @@ func (t *retentionFakeTx) Commit(context.Context) error {
 func (t *retentionFakeTx) Rollback(context.Context) error {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
-	// Откат после Commit — ErrTxClosed, как у pgx (ревью T-271 P3-3):
-	// defer Rollback есть у каждой транзакции прохода, успешные проходы
-	// откатами не считаются (прод-код ошибку игнорирует — `_ =`).
+	// A rollback after Commit — ErrTxClosed, as in pgx (review of T-271
+	// P3-3): every transaction of a pass has a defer Rollback; successful
+	// passes do not count as rollbacks (the prod code ignores the error —
+	// `_ =`).
 	if t.committed {
 		return pgx.ErrTxClosed
 	}
@@ -682,7 +695,7 @@ func (t *retentionFakeTx) Rollback(context.Context) error {
 	return nil
 }
 
-// retentionBytesEqual — семантика IS NOT DISTINCT FROM для bytea.
+// retentionBytesEqual — the IS NOT DISTINCT FROM semantics for bytea.
 func retentionBytesEqual(a, b []byte) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
@@ -690,7 +703,7 @@ func retentionBytesEqual(a, b []byte) bool {
 	return string(a) == string(b)
 }
 
-// retentionHash16 — тестовый 16-октетный хэш с байтом-заполнителем.
+// retentionHash16 — a test 16-octet hash with a filler byte.
 func retentionHash16(b byte) []byte {
 	h := make([]byte, HashLen)
 	for i := range h {
@@ -699,13 +712,14 @@ func retentionHash16(b byte) []byte {
 	return h
 }
 
-// retentionTestLogger — логгер в буфер (проверка Warn/Info цикла).
+// retentionTestLogger — a logger into a buffer (checking the cycle's
+// Warn/Info).
 func retentionTestLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
-// retentionSeed — типовой набор: старая не-находка с контентом и jsonb,
-// домен-находка, render_pending, deleted, свежая запись.
+// retentionSeed — the typical set: an old non-find with content and jsonb,
+// a find domain, render_pending, deleted, a fresh record.
 func retentionSeedPool(now time.Time) *retentionFakePool {
 	pool := newRetentionFakePool(now)
 	old := now.Add(-2 * DefaultRetention)
@@ -717,17 +731,18 @@ func retentionSeedPool(now time.Time) *retentionFakePool {
 	pool.domains[retentionDomKey{zone: 1, id: 60}] = retentionFakeDomain{flags: 0, status: int16(model.StatusAlive)}
 	pool.laravel[retentionDomKey{zone: 1, id: 20}] = true
 	pool.results = []retentionRow{
-		// 10: обычная не-находка — чистится.
+		// 10: a regular non-find — purged.
 		{key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xAA), jsonb: true},
-		// 20: Laravel-находка — контент хранится всегда.
+		// 20: a Laravel find — its content is kept always.
 		{key: retentionKey{zone: 1, domain: 20, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xBB), jsonb: true},
-		// 30: render_pending и не rendered — ждёт рендера.
+		// 30: render_pending and not rendered — waiting for the render.
 		{key: retentionKey{zone: 1, domain: 30, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xCC), jsonb: true},
-		// 40: render_pending, но rendered — рендер уже заменил контент.
+		// 40: render_pending but rendered — the render already replaced the
+		// content.
 		{key: retentionKey{zone: 1, domain: 40, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xDD), jsonb: true, rendered: true},
-		// 50: deleted — территория очистки T-020.
+		// 50: deleted — T-020 cleanup territory.
 		{key: retentionKey{zone: 1, domain: 50, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0xEE), jsonb: true},
-		// 60: свежая запись — не остарела.
+		// 60: a fresh record — not aged.
 		{key: retentionKey{zone: 1, domain: 60, sub: 0, variant: 0}, checkedAt: now.Add(-time.Minute), hash: retentionHash16(0xFF), jsonb: true},
 	}
 	pool.contents[retentionHash(0xAA)] = retentionFakeContent{refc: 1, clen: 7000}
@@ -739,7 +754,7 @@ func retentionSeedPool(now time.Time) *retentionFakePool {
 	return pool
 }
 
-// retentionHash — Hash из байта-заполнителя.
+// retentionHash — a Hash from a filler byte.
 func retentionHash(b byte) Hash {
 	var h Hash
 	for i := range h {
@@ -748,17 +763,17 @@ func retentionHash(b byte) Hash {
 	return h
 }
 
-// retentionDefaultOpts — типовые параметры прохода с выключенным
-// интерлоком (тесты критериев отбора и SQL).
+// retentionDefaultOpts — typical pass parameters with the interlock off
+// (the tests of the selection criteria and the SQL).
 func retentionDefaultOpts() RetentionOptions {
 	return RetentionOptions{Retention: DefaultRetention, BatchSize: 100}
 }
 
-// --- критерии отбора ---------------------------------------------------------
+// --- selection criteria --------------------------------------------------------
 
-// TestRetentionOnce_Selection — критерии T-166: чистятся только остаревшие
-// записи не-находок, не ждущие рендера, у живых доменов; паспортные
-// колонки не восстанавливаются (строка остаётся).
+// TestRetentionOnce_Selection — the T-166 criteria: only aged records of
+// non-finds not waiting for a render, on live domains, are purged; the
+// passport columns are not restored (the row remains).
 func TestRetentionOnce_Selection(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
@@ -799,12 +814,13 @@ func TestRetentionOnce_Selection(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_OnlyJSONB — запись без контента (T-056), но с jsonb:
-// трим идёт, refcount не трогается, транзакция фиксируется.
+// TestRetentionOnce_OnlyJSONB — a record without content (T-056) but with
+// jsonb: the trim proceeds, the refcount is not touched, the transaction
+// commits.
 func TestRetentionOnce_OnlyJSONB(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
-	pool.results[0].hash = nil // у первой записи контента нет
+	pool.results[0].hash = nil // the first record has no content
 	_, err := RetentionOnce(context.Background(), pool, retentionDefaultOpts())
 	if err != nil {
 		t.Fatalf("RetentionOnce: %v", err)
@@ -820,9 +836,9 @@ func TestRetentionOnce_OnlyJSONB(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_AlreadyClean — пустая выборка (всё чисто): один
-// SELECT в tx-оболочке закрепления плана (T-271), транзакция чистки
-// не открывается.
+// TestRetentionOnce_AlreadyClean — an empty selection (all clean): one
+// SELECT in the plan-pinning tx wrapper (T-271); the purge transaction is
+// not opened.
 func TestRetentionOnce_AlreadyClean(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
@@ -840,20 +856,21 @@ func TestRetentionOnce_AlreadyClean(t *testing.T) {
 	}
 }
 
-// --- SQL-контракт ------------------------------------------------------------
+// --- SQL contract ----------------------------------------------------------------
 
-// TestRetentionOnce_SQLContract — точные тексты операторов и параметры:
-// граница старения interval, курсор row-value, LIMIT пачки; ключи и
-// прочитанные хэши — в UPDATE; агрегация decref — по хэшам. С T-271
-// выборка идёт в tx-оболочке закрепления плана: строгий порядок
+// TestRetentionOnce_SQLContract — exact statement texts and parameters:
+// the aging boundary as an interval, the row-value cursor, the batch
+// LIMIT; the keys and the read hashes go into the UPDATE; the decref
+// aggregation is by hashes. Since T-271 the selection runs in the
+// plan-pinning tx wrapper: the strict order
 // BEGIN → SET LOCAL seq/hash/merge/bitmap off → SET LOCAL statement_timeout
-// → SELECT → COMMIT (реплика T-191 retry_test.go / T-181 renderq_test.go;
-// без закрепления деградировавший план клал PostgreSQL OOM — инцидент
-// 08–09.11.2026).
+// → SELECT → COMMIT (a replica of T-191 retry_test.go / T-181
+// renderq_test.go; without pinning a degraded plan OOM-killed PostgreSQL —
+// the 2026-11-08/09 incident).
 func TestRetentionOnce_SQLContract(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
-	// Оставить двух кандидатов с разными хэшами — проверить пачку.
+	// Keep two candidates with different hashes — to check the batch.
 	keep := []retentionRow{pool.results[0], pool.results[3]}
 	pool.results = keep
 
@@ -869,19 +886,20 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 	}
 	wantArgs := []any{
 		DefaultRetention.String(),
-		time.Time{}, int16(0), int64(0), int16(0), int16(0), // нулевой курсор первой пачки (время + PK)
+		time.Time{}, int16(0), int64(0), int16(0), int16(0), // the zero cursor of the first batch (time + PK)
 		100,
 	}
 	if !reflect.DeepEqual(sel.args, wantArgs) {
 		t.Errorf("args выборки = %v, want %v", sel.args, wantArgs)
 	}
 
-	// Оболочка закрепления (T-271): первая транзакция — SET LOCAL ×5 +
-	// SELECT, фиксация без отката; тексты — литералы пакета (потолок
-	// statement_timeout — дефолт 7200 с T-274, было 3600 у T-273:
-	// таймаут обязан накрывать первый catch-up-проход с нулевого курсора
-	// под нагрузкой, а не только штатные пачки замера T-201; bitmap off —
-	// доводка T-271: битмап-путь ломает порядок курсора).
+	// The pinning wrapper (T-271): the first transaction is SET LOCAL ×5 +
+	// a SELECT, committed without a rollback; the texts are the package
+	// literals (the statement_timeout cap — the 7200 s default of T-274,
+	// formerly 3600 in T-273: the timeout must cover the first catch-up
+	// pass from the zero cursor under load, not only the regular batches of
+	// the T-201 measurement; the bitmap off — the T-271 fine-tuning: the
+	// bitmap path breaks the cursor order).
 	if retentionPlanNoSeqScanSQL != "SET LOCAL enable_seqscan = off" ||
 		retentionPlanNoHashJoinSQL != "SET LOCAL enable_hashjoin = off" ||
 		retentionPlanNoMergeJoinSQL != "SET LOCAL enable_mergejoin = off" ||
@@ -955,11 +973,12 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 	}
 }
 
-// --- закрепление плана, таймауты, гейт (T-271) ---------------------------------
+// --- plan pinning, timeouts, gate (T-271) ---------------------------------------
 
-// TestRetentionOnce_PlanError — сбой закрепления плана (SET LOCAL) —
-// ошибка прохода ДО выборки: SELECT не выполнялся, пачка не коммитится,
-// чистка не открывается (стиль renderq_test.go TestRequeueOncePlanError).
+// TestRetentionOnce_PlanError — the plan pinning failure (SET LOCAL) — a
+// pass error BEFORE the selection: the SELECT did not run, the batch does
+// not commit, and no purge is opened (the style of renderq_test.go
+// TestRequeueOncePlanError).
 func TestRetentionOnce_PlanError(t *testing.T) {
 	now := time.Date(2026, 11, 8, 20, 43, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
@@ -977,13 +996,13 @@ func TestRetentionOnce_PlanError(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_SelectCtxTimeout — зависшая выборка режется
-// клиентским ctx-дедлайном SelectTimeout (T-271): серверный
-// statement_timeout и ctx — один потолок двумя уровнями; обёрнутая
-// ошибка с контекстом «выборка кандидатов», повтор идемпотентен.
+// TestRetentionOnce_SelectCtxTimeout — a stuck selection is cut by the
+// client-side ctx deadline of SelectTimeout (T-271): the server-side
+// statement_timeout and ctx are one cap by two levels; the wrapped error
+// carries the "candidate selection" context, and the retry is idempotent.
 func TestRetentionOnce_SelectCtxTimeout(t *testing.T) {
 	pool := retentionSeedPool(time.Now())
-	pool.selectBlock = true // SELECT не отвечает до отмены ctx
+	pool.selectBlock = true // the SELECT does not answer until ctx is cancelled
 
 	opts := retentionDefaultOpts()
 	opts.SelectTimeout = 40 * time.Millisecond
@@ -994,10 +1013,11 @@ func TestRetentionOnce_SelectCtxTimeout(t *testing.T) {
 	}
 }
 
-// TestRetentionSelectGate — тяжёлая выборка под общим гейтом сканов
-// (db.ScanGate, T-271): занятый гейт держит выборку ДО Begin (соединение
-// пула не занимается в очереди), освобождение пропускает её; взаимное
-// исключение двух держателей — TestScanGate в internal/db.
+// TestRetentionSelectGate — the heavy selection under the common scan gate
+// (db.ScanGate, T-271): a busy gate holds the selection BEFORE Begin (a
+// pool connection does not idle in the queue), and releasing it lets the
+// selection through; the mutual exclusion of two holders — TestScanGate in
+// internal/db.
 func TestRetentionSelectGate(t *testing.T) {
 	pool := retentionSeedPool(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
 	gate := make(db.ScanGate, 1)
@@ -1034,11 +1054,11 @@ func TestRetentionSelectGate(t *testing.T) {
 	}
 }
 
-// TestRetentionLoop_Backoff — ошибка прохода переводит тикер в backoff
-// (T-271): тик интервала больше не перезапускает проход
-// немедленно (инцидент 08–09.11.2026 — проход в только что поднятый
-// после OOM-килла PostgreSQL); после паузы проход повторяется, успех
-// возвращает штатный интервал.
+// TestRetentionLoop_Backoff — a pass error switches the ticker to backoff
+// (T-271): the interval tick no longer restarts the pass immediately
+// (the 2026-11-08/09 incident — a pass into a PostgreSQL just booted after
+// an OOM kill); after the pause the pass retries, and a success returns
+// the regular interval.
 func TestRetentionLoop_Backoff(t *testing.T) {
 	var buf bytes.Buffer
 	pool := retentionSeedPool(time.Date(2026, 11, 8, 20, 43, 0, 0, time.UTC))
@@ -1047,30 +1067,30 @@ func TestRetentionLoop_Backoff(t *testing.T) {
 	pool.mu.Unlock()
 	opts := RetentionOptions{
 		Retention:    DefaultRetention,
-		Interval:     10 * time.Millisecond,  // без backoff — ~10 проходов на 100 мс
-		ErrorBackoff: 250 * time.Millisecond, // пауза ошибочного тика
+		Interval:     10 * time.Millisecond,  // without backoff — ~10 passes per 100 ms
+		ErrorBackoff: 250 * time.Millisecond, // the failed tick's pause
 		BatchSize:    100,
 		Log:          retentionTestLogger(&buf),
 	}
 	passes := func() int {
 		pool.mu.Lock()
 		defer pool.mu.Unlock()
-		return pool.debtReads // одно чтение счётчика = один стартовавший проход
+		return pool.debtReads // one counter read = one started pass
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- RetentionLoop(ctx, pool, opts) }()
 
-	// Стартовый проход ошибся; тики минутного... 10-мс интервала не
-	// перезапускают его в пределах паузы backoff.
+	// The starting pass failed; the ticks of the ... 10-ms interval do not
+	// restart it within the backoff pause.
 	time.Sleep(80 * time.Millisecond)
 	if n := passes(); n != 1 {
 		cancel()
 		t.Fatalf("проходов за паузу backoff = %d, want 1 (только стартовый; без backoff ~8)", n)
 	}
-	// Ошибка снята: тик паузы повторяет проход, успех возвращает
-	// штатный интервал — проходы идут дальше.
+	// The error is lifted: the pause tick retries the pass, and a success
+	// returns the regular interval — the passes continue.
 	pool.mu.Lock()
 	pool.selectErr = nil
 	pool.mu.Unlock()
@@ -1082,8 +1102,9 @@ func TestRetentionLoop_Backoff(t *testing.T) {
 		cancel()
 		t.Fatalf("проходов после паузы = %d, want ≥3 (успех возвращает штатный интервал)", n)
 	}
-	// Лог читается только после остановки цикла: горутина цикла пишет в
-	// тот же буфер (ревью T-271 P2-1 — bytes.Buffer не потокобезопасен).
+	// The log is read only after the cycle stops: the cycle goroutine
+	// writes into the same buffer (review of T-271 P2-1 — bytes.Buffer is
+	// not goroutine-safe).
 	cancel()
 	select {
 	case <-done:
@@ -1095,16 +1116,16 @@ func TestRetentionLoop_Backoff(t *testing.T) {
 	}
 }
 
-// TestRetentionLoop_BackoffEveryErrorResetsTicker — семантика backoff
-// (T-273, главный диагностический пробел T-271): reset тикера после
-// КАЖДОЙ ошибки. До T-273 reset выполнялся только на первую (условие
-// !backoff): якорем тикера оставался конец первого ошибочного прохода,
-// и повторные ошибки шли паузой «backoff − длительность прохода»
-// (проход 600 с при backoff 15 мин — реальная пауза 300 с), каденс
-// WARN-ов маскировал длительность проходов. Проход здесь длится дольше
-// тика интервала (selectDelay 150 мс > interval 40 мс) и ошибается:
-// старты проходов обязаны идти с паузой ≥ длительность прохода +
-// backoff (гарантия снизу: сон и тикер не заканчиваются раньше срока).
+// TestRetentionLoop_BackoffEveryErrorResetsTicker — the backoff semantics
+// (T-273, the main diagnostic gap of T-271): the ticker reset after EVERY
+// error. Before T-273 the reset ran only on the first one (the !backoff
+// condition): the ticker's anchor stayed at the end of the first failed
+// pass, and repeated errors went with a pause of "backoff − pass duration"
+// (a 600 s pass at a 15 min backoff — a real pause of 300 s); the WARN
+// cadence masked the pass durations. Here the pass lasts longer than the
+// interval tick (selectDelay 150 ms > interval 40 ms) and fails: the pass
+// starts must be spaced by ≥ pass duration + backoff (a bottom guarantee:
+// the sleep and the ticker do not end early).
 func TestRetentionLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	pool := retentionSeedPool(time.Date(2026, 11, 9, 14, 13, 0, 0, time.UTC))
 	pool.mu.Lock()
@@ -1127,7 +1148,8 @@ func TestRetentionLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- RetentionLoop(ctx, pool, opts) }()
 
-	// Стартовый проход + два повторных за щедрый бюджет (пауза 650 мс).
+	// The starting pass + two retries within a generous budget (a 650 ms
+	// pause).
 	deadline := time.Now().Add(5 * time.Second)
 	var starts []time.Time
 	for {
@@ -1146,9 +1168,10 @@ func TestRetentionLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	if len(starts) < 3 {
 		t.Fatalf("стартов прохода = %d, want ≥3 (стартовый + два повторных)", len(starts))
 	}
-	// Пауза между стартами ≥ проход (150 мс) + backoff (500 мс) − запас
-	// на планировщик (50 мс). Прошлая семантика давала ровно backoff
-	// (500 мс) между повторными ошибками — якорь тикера не переанкорился.
+	// The gap between the starts ≥ pass (150 ms) + backoff (500 ms) − a
+	// scheduler margin (50 ms). The old semantics gave exactly the backoff
+	// (500 ms) between repeated errors — the ticker anchor was not
+	// re-anchored.
 	const minGap = 150 + 500 - 50
 	for i := 1; i < len(starts); i++ {
 		if gap := starts[i].Sub(starts[i-1]); gap < minGap*time.Millisecond {
@@ -1158,11 +1181,11 @@ func TestRetentionLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	}
 }
 
-// TestRetentionLoop_OnError — хук ошибки прохода (T-273): вызывается на
-// каждом неудачном проходе (вместе с Warn), на успешных — нет; счётчик
-// ошибок цикла (crawler_content_retention_errors_total) растёт ровно на
-// число неудачных проходов — до T-273 ошибки были видны только в
-// journalctl (метрики :9104 — нули при 70+ WARN-ах за сутки).
+// TestRetentionLoop_OnError — the pass error hook (T-273): called on every
+// failed pass (together with the Warn), not on successful ones; the cycle
+// error counter (crawler_content_retention_errors_total) grows by exactly
+// the number of failed passes — before T-273 the errors were visible only
+// in journalctl (the :9104 metrics were zeros at 70+ WARNs per day).
 func TestRetentionLoop_OnError(t *testing.T) {
 	pool := retentionSeedPool(time.Date(2026, 11, 9, 14, 13, 0, 0, time.UTC))
 	pool.mu.Lock()
@@ -1187,12 +1210,13 @@ func TestRetentionLoop_OnError(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- RetentionLoop(ctx, pool, opts) }()
 
-	// Стартовый проход и первый повтор — ошибки: по вызову хука на each.
+	// The starting pass and the first retry — errors: one hook call per
+	// each.
 	deadline := time.Now().Add(3 * time.Second)
 	for count() < 2 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	// Ошибка снята: успешные проходы хук не зовут.
+	// The error is lifted: successful passes do not call the hook.
 	pool.mu.Lock()
 	pool.selectErr = nil
 	pool.mu.Unlock()
@@ -1214,9 +1238,9 @@ func TestRetentionLoop_OnError(t *testing.T) {
 		n++
 		last = err
 	}
-	// Вызовов ровно по числу неудачных проходов: errored попыток шли с
-	// активной ошибкой (+1 — проход, стартовавший до снятия ошибки, но
-	// прочитавший её позже); успешные проходы хука не добавляют.
+	// Exactly as many calls as failed passes: errored attempts ran with the
+	// error active (+1 — a pass that started before the error was lifted
+	// but read it later); successful passes add no hook calls.
 	if n < errored || n > errored+1 {
 		t.Fatalf("вызовов OnError = %d, want %d..%d (по одному на каждый неудачный проход)", n, errored, errored+1)
 	}
@@ -1225,9 +1249,9 @@ func TestRetentionLoop_OnError(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_DedupAggregation — один контент у нескольких записей
-// (дедупликация, ТЗ 5.7): уменьшение кратно числу срезанных ссылок,
-// строка contents умирает только с последней.
+// TestRetentionOnce_DedupAggregation — one content shared by several
+// records (deduplication, spec 5.7): the decrease is by the number of cut
+// references, and the contents row dies only with the last one.
 func TestRetentionOnce_DedupAggregation(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := newRetentionFakePool(now)
@@ -1251,16 +1275,17 @@ func TestRetentionOnce_DedupAggregation(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_ClampDesync — клэмп GREATEST при рассинхроне учёта
-// (T-265, инвариант И1 автомата refcount, спецификация — doc-комментарий
-// pack.go, переход П9): агрегированное срезание больше фактического
-// refcount (две остаревшие ссылки на контент со счётчиком 1) не уводит
-// счётчик в минус: 1 − 2 клэмпится в 0, строка удаляется как лишившаяся
-// последней ссылки (retention минует tombstone), проход не падает.
-// Отрицательный refcount отвергал бы и CHECK contents_refcount_check
-// (миграция 000019) — клэмп гарантирует, что массовый проход его не
-// триггерит. Поведение GREATEST против живой PostgreSQL —
-// test/integration (TestContent_RefcountClampDesync).
+// TestRetentionOnce_ClampDesync — the GREATEST clamp on a bookkeeping
+// desync (T-265, invariant I1 of the refcount automaton; the specification
+// is the doc comment of pack.go, transition T9): an aggregated cut larger
+// than the actual refcount (two aged references to content with a counter
+// of 1) does not push the counter negative: 1 − 2 clamps to 0, and the row
+// is deleted as one that lost its last reference (retention skips the
+// tombstone); the pass does not fail.
+// A negative refcount would also be rejected by the CHECK
+// contents_refcount_check (migration 000019) — the clamp guarantees that
+// the mass pass does not trigger it. The GREATEST behavior against a live
+// PostgreSQL — test/integration (TestContent_RefcountClampDesync).
 func TestRetentionOnce_ClampDesync(t *testing.T) {
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
 	pool := newRetentionFakePool(now)
@@ -1270,7 +1295,8 @@ func TestRetentionOnce_ClampDesync(t *testing.T) {
 		{key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0x22)},
 		{key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}, checkedAt: old, hash: retentionHash16(0x22)},
 	}
-	// Рассинхрон: держателей 2, счётчик 1 (ссылка уже снята иным путём).
+	// The desync: 2 holders, the counter 1 (the reference was already
+	// removed by another path).
 	pool.contents[retentionHash(0x22)] = retentionFakeContent{refc: 1, clen: 5000}
 
 	stats, err := RetentionOnce(context.Background(), pool, retentionDefaultOpts())
@@ -1291,12 +1317,12 @@ func TestRetentionOnce_ClampDesync(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_SharedContentLives — контент, на который ссылается
-// ещё не остаревшая запись, не умирает (refcount > 0 после decref).
+// TestRetentionOnce_SharedContentLives — content referenced by a not-yet-
+// aged record does not die (refcount > 0 after the decref).
 func TestRetentionOnce_SharedContentLives(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
-	// Свежая запись 60 делит контент 0xAA с остаревшей 10.
+	// The fresh record 60 shares the 0xAA content with the aged 10.
 	pool.results[5].hash = retentionHash16(0xAA)
 	pool.contents[retentionHash(0xAA)] = retentionFakeContent{refc: 2, clen: 7000}
 
@@ -1312,15 +1338,15 @@ func TestRetentionOnce_SharedContentLives(t *testing.T) {
 	}
 }
 
-// --- аномалии учёта ----------------------------------------------------------
+// --- bookkeeping anomalies -----------------------------------------------------
 
-// TestRetentionOnce_BadHashes — срезанная ссылка неверной длины: строка
-// очищена, refcount по ней не менялся, проход не роняется (poison pill,
-// стиль ING-P2-4).
+// TestRetentionOnce_BadHashes — a cut reference of invalid length: the row
+// is trimmed, its refcount was not changed, the pass is not dropped
+// (a poison pill, the ING-P2-4 style).
 func TestRetentionOnce_BadHashes(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
-	pool.results[0].hash = make([]byte, 9) // 9 октет вместо 16 (ТЗ 6.1)
+	pool.results[0].hash = make([]byte, 9) // 9 octets instead of 16 (spec 6.1)
 
 	stats, err := RetentionOnce(context.Background(), pool, retentionDefaultOpts())
 	if err != nil {
@@ -1342,12 +1368,12 @@ func TestRetentionOnce_BadHashes(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_Missing — срезанная ссылка без строки contents:
-// расхождение учёта — счётчик, не ошибка пачки.
+// TestRetentionOnce_Missing — a cut reference without a contents row: a
+// bookkeeping divergence — a counter, not a batch error.
 func TestRetentionOnce_Missing(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
-	delete(pool.contents, retentionHash(0xAA)) // ссылка есть, contents нет
+	delete(pool.contents, retentionHash(0xAA)) // the reference is there, no contents
 
 	stats, err := RetentionOnce(context.Background(), pool, retentionDefaultOpts())
 	if err != nil {
@@ -1356,30 +1382,32 @@ func TestRetentionOnce_Missing(t *testing.T) {
 	if stats.Missing != 1 {
 		t.Fatalf("stats = %+v, want Missing=1", stats)
 	}
-	if stats.Contents != 1 { // 0xDD домена 40 удалён штатно
+	if stats.Contents != 1 { // the 0xDD of domain 40 deleted normally
 		t.Errorf("Contents = %d, want 1", stats.Contents)
 	}
 }
 
-// --- инварианты refcount под сбоем (T-044) -----------------------------------
+// --- refcount invariants under a failure (T-044) -------------------------------
 
-// TestRetentionOnce_FailureRollback — краш-окна транзакции пачки: сбой
-// любого шага (purge / decref / delete / commit) откатывает всё —
-// строки и refcount не расходятся. Сбой именно МЕЖДУ UPDATE и decref
-// (decrefErr) — предмет инварианта T-044: срезанная без decref ссылка
-// навсегда ломала бы учёт. Overlay-глубины (ревью T-271 P2-2) —
-// «сколько чистка успела наработать в транзакции до сбоя»: без них
-// кейс «сбой фиксации» мог падать на Commit tx-оболочки выборки (до
-// чистки), и проверки «строки/refcount/contents целы» проходили бы
-// тривиально, на пустой пачке — ожидаемые глубины закрепляют шаг сбоя.
+// TestRetentionOnce_FailureRollback — the crash windows of the batch
+// transaction: a failure of any step (purge / decref / delete / commit)
+// rolls everything back — the rows and the refcount do not diverge.
+// A failure exactly BETWEEN the UPDATE and the decref (decrefErr) is the
+// subject of the T-044 invariant: a reference cut without a decref would
+// break the bookkeeping forever. The overlay depths (review of T-271
+// P2-2) — "how much work the purge managed to do in the transaction before
+// the failure": without them the "commit failure" case could fail on the
+// selection wrapper's Commit (before the purge), and the "rows/refcount/
+// contents intact" checks would pass trivially, on an empty batch — the
+// expected depths pin the failure step.
 func TestRetentionOnce_FailureRollback(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name    string
 		mut     func(*retentionFakePool)
-		purged  int // строки, срезанные до сбоя (overlay tx чистки)
-		decrefd int // contents с уменьшенным refcount
-		deleted int // contents, намеченные к удалению
+		purged  int // rows trimmed before the failure (the purge tx overlay)
+		decrefd int // contents with a decreased refcount
+		deleted int // contents slated for deletion
 	}{
 		{"сбой purge", func(p *retentionFakePool) { p.purgeErr = errors.New("бд") }, 0, 0, 0},
 		{"сбой между UPDATE и decref", func(p *retentionFakePool) { p.decrefErr = errors.New("бд") }, 2, 0, 0},
@@ -1393,10 +1421,11 @@ func TestRetentionOnce_FailureRollback(t *testing.T) {
 			if _, err := RetentionOnce(context.Background(), pool, retentionDefaultOpts()); err == nil {
 				t.Fatalf("ожидается ошибка прохода")
 			}
-			// Структура прохода (T-271): tx-оболочка выборки, затем
-			// транзакция чистки; инъекции чистки (ревью P2-2) обязаны
-			// падать во второй — сбой в оболочке оставил бы чистку
-			// неоткрытой, а проверки ниже — тривиально пустыми.
+			// The pass structure (T-271): the selection tx wrapper, then
+			// the purge transaction; the purge injections (review P2-2)
+			// must fail in the second one — a failure in the wrapper would
+			// leave the purge unopened and the checks below trivially
+			// empty.
 			if len(pool.txs) != 2 {
 				t.Fatalf("транзакций прохода = %d, want 2 (оболочка выборки + чистка)", len(pool.txs))
 			}
@@ -1408,8 +1437,9 @@ func TestRetentionOnce_FailureRollback(t *testing.T) {
 			if !tx.rolledBack {
 				t.Fatal("транзакция чистки не откачена после сбоя")
 			}
-			// Инвариант: ничего не изменилось — строки целы (контент и
-			// jsonb на месте), refcount цел, contents живы.
+			// Invariant: nothing changed — the rows are intact (content and
+			// jsonb in place), the refcount is intact, the contents are
+			// alive.
 			for _, r := range pool.results {
 				if r.hash == nil || !r.jsonb {
 					t.Fatalf("строка %v очищена при откаченной транзакции", r.key)
@@ -1427,12 +1457,12 @@ func TestRetentionOnce_FailureRollback(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_RaceRewritten — перезапись результата между выборкой
-// и чисткой (recheck T-030): двойная охрана (возраст + content_hash)
-// отсекает чужой эпизод — 0 затронутых строк, ничего не сломано.
+// TestRetentionOnce_RaceRewritten — a result rewrite between the selection
+// and the purge (the T-030 recheck): the double guard (age + content_hash)
+// screens out the foreign episode — 0 touched rows, nothing broken.
 func TestRetentionOnce_RaceRewritten(t *testing.T) {
-	fresh := func(r *retentionRow) { // перезапись DELETE+INSERT (T-058)
-		r.checkedAt = r.checkedAt.Add(3 * DefaultRetention) // fresh now()
+	fresh := func(r *retentionRow) { // the DELETE+INSERT rewrite (T-058)
+		r.checkedAt = r.checkedAt.Add(3 * DefaultRetention) // a fresh now()
 	}
 	t.Run("свежий эпизод", func(t *testing.T) {
 		now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
@@ -1465,9 +1495,9 @@ func TestRetentionOnce_RaceRewritten(t *testing.T) {
 	})
 }
 
-// --- интерлок q:analyze ------------------------------------------------------
+// --- the q:analyze interlock ----------------------------------------------------
 
-// fakeDepth — источник глубины q:analyze с заготовленным ответом.
+// fakeDepth — a source of the q:analyze depth with a pre-prepared answer.
 type fakeDepth struct {
 	mu    sync.Mutex
 	n     int64
@@ -1482,9 +1512,10 @@ func (f *fakeDepth) AnalyzeDepth(context.Context) (int64, error) {
 	return f.n, f.err
 }
 
-// TestRetentionOnce_Interlock — глубина q:analyze у порога: проход
-// пропущен, БД не тронута; ниже порога — работа идёт; ошибка чтения —
-// ошибка прохода (консервативно); порог ≤ 0 / nil-источник — выключен.
+// TestRetentionOnce_Interlock — the q:analyze depth at the threshold: the
+// pass is skipped, the DB is untouched; below the threshold — the work
+// proceeds; a read error — a pass error (conservatively); a threshold ≤ 0 /
+// a nil source — off.
 func TestRetentionOnce_Interlock(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	opts := retentionDefaultOpts()
@@ -1505,7 +1536,7 @@ func TestRetentionOnce_Interlock(t *testing.T) {
 	}
 
 	pool = retentionSeedPool(now)
-	depth = &fakeDepth{n: 99} // строго ниже порога — как гейт T-026
+	depth = &fakeDepth{n: 99} // strictly below the threshold — like the T-026 gate
 	opts.Depth = depth
 	if stats, err := RetentionOnce(context.Background(), pool, opts); err != nil {
 		t.Fatalf("RetentionOnce: %v", err)
@@ -1524,7 +1555,7 @@ func TestRetentionOnce_Interlock(t *testing.T) {
 		t.Fatalf("ошибка глубины: БД не трогать (SELECT'ов %d)", len(pool.queries))
 	}
 
-	// Выключенный интерлок: порог ≤ 0 — источник не опрашивается вовсе.
+	// The interlock off: a threshold ≤ 0 — the source is not polled at all.
 	pool = retentionSeedPool(now)
 	depth = &fakeDepth{n: 1 << 30}
 	opts.Depth = depth
@@ -1537,14 +1568,15 @@ func TestRetentionOnce_Interlock(t *testing.T) {
 	}
 }
 
-// TestRetentionOnce_InterlockMidDrain — интерлок проверяется на каждой
-// пачке дренажа: глубина выросла посреди прохода — сделанное остаётся
-// (пачки атомарны сами по себе), остаток ждёт следующего прохода.
+// TestRetentionOnce_InterlockMidDrain — the interlock is checked on every
+// drain batch: the depth grew in the middle of a pass — what was done
+// stands (the batches are atomic in themselves), and the remainder waits
+// for the next pass.
 func TestRetentionOnce_InterlockMidDrain(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
 	opts := retentionDefaultOpts()
-	opts.BatchSize = 1 // пачка = строка: первая чистится, вторая — интерлок
+	opts.BatchSize = 1 // a batch = a row: the first is purged, the second — the interlock
 	depth := &fakeDepth{n: 0}
 	opts.Depth = depth
 	opts.AnalyzeWatermark = 100
@@ -1553,7 +1585,7 @@ func TestRetentionOnce_InterlockMidDrain(t *testing.T) {
 		selects++
 		if selects >= 1 {
 			depth.mu.Lock()
-			depth.n = 150 // анализатор перестал успевать после первой пачки
+			depth.n = 150 // the analyzer stopped keeping up after the first batch
 			depth.mu.Unlock()
 		}
 	}
@@ -1566,10 +1598,11 @@ func TestRetentionOnce_InterlockMidDrain(t *testing.T) {
 	}
 }
 
-// --- дренаж ------------------------------------------------------------------
+// --- drain ----------------------------------------------------------------------
 
-// TestRetentionOnce_Drain — дренаж пачками: полная пачка → следующая
-// с курсором за последней строкой; неполная — стоп; LIMIT — размер пачки.
+// TestRetentionOnce_Drain — draining in batches: a full batch → the next
+// one with the cursor past the last row; an incomplete one — stop; LIMIT —
+// the batch size.
 func TestRetentionOnce_Drain(t *testing.T) {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pool := newRetentionFakePool(now)
@@ -1597,8 +1630,9 @@ func TestRetentionOnce_Drain(t *testing.T) {
 	if len(pool.queries) != 2 {
 		t.Fatalf("SELECT'ов = %d, want 2", len(pool.queries))
 	}
-	// Курсор второй пачки — (checked_at, PK) за последней строкой первой
-	// (sub=1): время ведёт, PK детерминирует порядок равных отметок.
+	// The second batch's cursor — (checked_at, PK) past the last row of the
+	// first (sub=1): time leads, the PK determines the order of equal
+	// stamps.
 	second := pool.queries[1]
 	want := []any{DefaultRetention.String(), old, int16(1), int64(10), int16(1), int16(0), 2}
 	if !reflect.DeepEqual(second.args, want) {
@@ -1606,7 +1640,7 @@ func TestRetentionOnce_Drain(t *testing.T) {
 	}
 }
 
-// --- ошибки и отмена ---------------------------------------------------------
+// --- errors and cancellation ----------------------------------------------------
 
 func TestRetentionOnceErrors(t *testing.T) {
 	if _, err := RetentionOnce(context.Background(), nil, retentionDefaultOpts()); err == nil ||
@@ -1622,11 +1656,13 @@ func TestRetentionOnceErrors(t *testing.T) {
 		t.Errorf("ошибка = %v, want контекст выборки", err)
 	}
 
-	// Отказ Begin транзакции ЧИСТКИ (второй транзакции прохода; первая —
-	// tx-оболочка выборки; разведение инъекций, ревью T-271 P2-2):
-	// префикс «retention: транзакция:» отличает ветку чистки от
-	// «транзакции выборки» — старая проверка Contains("транзакция")
-	// маскировала, какая из транзакций отказала.
+	// The Begin failure of the PURGE transaction (the second transaction of
+	// a pass; the first is the selection tx wrapper; the injection
+	// separation, review of T-271 P2-2): the purge-branch error prefix
+	// asserted below (the HasPrefix) tells the purge branch apart from the
+	// selection-transaction error — the old generic Contains check (the
+	// Russian word for "transaction") masked which of the transactions
+	// failed.
 	boom = retentionSeedPool(now)
 	boom.beginErr = errors.New("бд недоступна")
 	if _, err := RetentionOnce(context.Background(), boom, retentionDefaultOpts()); err == nil ||
@@ -1634,7 +1670,8 @@ func TestRetentionOnceErrors(t *testing.T) {
 		t.Errorf("ошибка = %v, want отказ Begin транзакции чистки («retention: транзакция:»)", err)
 	}
 
-	// Отказ Begin tx-оболочки выборки (первая транзакция прохода, T-271).
+	// The Begin failure of the selection tx wrapper (the first transaction
+	// of a pass, T-271).
 	boom = retentionSeedPool(now)
 	boom.selectBeginErr = errors.New("бд недоступна")
 	if _, err := RetentionOnce(context.Background(), boom, retentionDefaultOpts()); err == nil ||
@@ -1642,8 +1679,8 @@ func TestRetentionOnceErrors(t *testing.T) {
 		t.Errorf("ошибка = %v, want «транзакция выборки»", err)
 	}
 
-	// Отказ Commit tx-оболочки: пачка не закоммичена, чистка не
-	// открывается — повтор идемпотентен (курсор не двигался).
+	// The wrapper's Commit failure: the batch is not committed and no purge
+	// is opened — the retry is idempotent (the cursor did not move).
 	boom = retentionSeedPool(now)
 	boom.selectCommitErr = errors.New("бд недоступна")
 	if _, err := RetentionOnce(context.Background(), boom, retentionDefaultOpts()); err == nil ||
@@ -1662,7 +1699,7 @@ func TestRetentionOnceErrors(t *testing.T) {
 	}
 }
 
-// --- опции и цикл ------------------------------------------------------------
+// --- options and cycle -----------------------------------------------------------
 
 func TestRetentionOptionsDefaults(t *testing.T) {
 	got := RetentionOptions{}.withDefaults()
@@ -1689,8 +1726,8 @@ func TestRetentionOptionsDefaults(t *testing.T) {
 	}
 }
 
-// TestRetentionLoop_Disabled — retention = 0: цикл не поднимается,
-// возвращает nil (контракт OnRun).
+// TestRetentionLoop_Disabled — retention = 0: the cycle does not start and
+// returns nil (the OnRun contract).
 func TestRetentionLoop_Disabled(t *testing.T) {
 	var buf bytes.Buffer
 	pool := retentionSeedPool(time.Now())
@@ -1705,14 +1742,15 @@ func TestRetentionLoop_Disabled(t *testing.T) {
 	}
 }
 
-// TestRetentionLoop — стартовый дренаж сразу, итог прохода уходит хуком
-// OnPass (метрики), отмена ctx возвращает nil (контракт OnRun, T-012).
+// TestRetentionLoop — the starting drain runs immediately, the pass
+// outcome goes to the OnPass hook (the metrics), and a ctx cancellation
+// returns nil (the OnRun contract, T-012).
 func TestRetentionLoop(t *testing.T) {
 	var buf bytes.Buffer
 	pool := retentionSeedPool(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
 	opts := RetentionOptions{
 		Retention: DefaultRetention,
-		Interval:  time.Hour, // тикера не ждём — проверяем стартовый дренаж
+		Interval:  time.Hour, // no ticker wait — the starting drain is what is checked
 		BatchSize: 100,
 		Log:       retentionTestLogger(&buf),
 	}
@@ -1722,7 +1760,8 @@ func TestRetentionLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- RetentionLoop(ctx, pool, opts) }()
-	// Стартовый дренаж завершён до отмены — итог детерминирован.
+	// The starting drain finished before the cancellation — the outcome is
+	// deterministic.
 	select {
 	case s := <-passed:
 		if s.Rows != 2 {
@@ -1739,14 +1778,15 @@ func TestRetentionLoop(t *testing.T) {
 		!strings.Contains(buf.String(), "проход retention контента") {
 		t.Errorf("лог = %q, want старт цикла и итог прохода", buf.String())
 	}
-	// Две фиксации: tx-оболочка закрепления выборки (T-271) + tx чистки.
+	// Two commits: the plan-pinning tx wrapper of the selection (T-271) +
+	// the purge tx.
 	if pool.commits != 2 {
 		t.Errorf("фиксаций = %d, want 2 (закрепление + чистка)", pool.commits)
 	}
 }
 
-// TestRetentionLoop_NilPool — nil-пул — ошибка запуска (сборка сервиса
-// обязана упасть заметно, не молча).
+// TestRetentionLoop_NilPool — a nil pool — a startup error (the service
+// build must fail loudly, not silently).
 func TestRetentionLoop_NilPool(t *testing.T) {
 	if err := RetentionLoop(context.Background(), nil, RetentionOptions{}); err == nil ||
 		!strings.Contains(err.Error(), "пул не задан") {

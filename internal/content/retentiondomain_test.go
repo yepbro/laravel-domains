@@ -1,10 +1,11 @@
-// Юнит-тесты точечного дренажа контента домена (T-187, retentiondomain.go):
-// закрытие остаточного класса потери за курсором — снятие Laravel-находки
-// переанализом возвращает остаревшие записи домена в кандидаты retention
-// позади курсора (T-185), дренаж чистит их по префиксу PK
-// (zone_id, domain_id) штатной purge-механикой T-166. Фейковый пул —
-// retention_test.go. Контрольный сценарий задачи: после дренажа у домена
-// не остаётся кандидатов (позади курсора и вообще).
+// Unit tests of the point drain of a domain's content (T-187,
+// retentiondomain.go): closing the residual loss class behind the cursor —
+// removing a Laravel find by re-analysis returns the domain's aged records
+// to the retention candidates behind the cursor (T-185); the drain purges
+// them by the PK prefix (zone_id, domain_id) with the regular T-166 purge
+// machinery. The fake pool lives in retention_test.go. The task's control
+// scenario: after the drain the domain has no candidates left (behind the
+// cursor and at all).
 package content
 
 import (
@@ -19,13 +20,13 @@ import (
 	"crawler/internal/model"
 )
 
-// --- SQL-контракт --------------------------------------------------------------
+// --- SQL contract ---------------------------------------------------------------
 
-// TestDrainDomain_SQLContract — точный текст выборки дренажа домена:
-// адресация префиксом PK (без курсора и LIMIT — строки домена
-// ограничены субдоменами 0..62 × варианты), те же фильтры отбора, что у
-// retentionSelectSQL (возраст, контент/jsonb, рендер-флаг, deleted,
-// не-находка), детерминизм пачки порядком PK.
+// TestDrainDomain_SQLContract — the exact text of the domain drain
+// selection: addressing by the PK prefix (no cursor and no LIMIT — the
+// domain's rows are bounded by subdomains 0..62 × variants), the same
+// selection filters as retentionSelectSQL (age, content/jsonb, render
+// flag, deleted, non-find), batch determinism by PK order.
 func TestDrainDomain_SQLContract(t *testing.T) {
 	renderPending := fmt.Sprintf("AND (r.rendered OR (d.flags & %d) = 0)", int16(model.FlagRenderPending))
 	deleted := fmt.Sprintf("AND d.status <> %d", int16(model.StatusDeleted))
@@ -52,25 +53,26 @@ func TestDrainDomain_SQLContract(t *testing.T) {
 	}
 }
 
-// --- контрольный сценарий задачи ----------------------------------------------
+// --- the task's control scenario -----------------------------------------------
 
-// TestDrainDomain_ControlScenario — переанализ снял находку домена: его
-// остаревшие записи (позади курсора дренажа — курсор цикла их не
-// вернёт) чистятся точечно — ссылка и jsonb срезаны, refcount уменьшен,
-// contents без ссылок удалён; чужие домены не тронуты.
+// TestDrainDomain_ControlScenario — re-analysis removed the domain's find:
+// its aged records (behind the drain cursor — the cycle cursor will not
+// return to them) are purged point-wise — the reference and jsonb trimmed,
+// refcount decreased, contents without references deleted; other domains
+// are untouched.
 func TestDrainDomain_ControlScenario(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	pool := newRetentionFakePool(now)
 	old := now.Add(-2 * DefaultRetention)
-	// Домен 10 — бывшая находка (строку laravel_domains снял переанализ),
-	// три остаревшие записи: две с контентом (делят один — дедупликация),
-	// одна только с jsonb.
+	// Domain 10 — a former find (its laravel_domains row was removed by
+	// re-analysis), three aged records: two with content (sharing one —
+	// deduplication), one with jsonb only.
 	pool.domains[retentionDomKey{zone: 1, id: 10}] = retentionFakeDomain{status: int16(model.StatusAlive)}
 	pool.results = []retentionRow{
 		{key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0x11), jsonb: true},
 		{key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}, checkedAt: old.Add(time.Hour), hash: retentionHash16(0x11), jsonb: true},
 		{key: retentionKey{zone: 1, domain: 10, sub: 2, variant: 1}, checkedAt: old.Add(2 * time.Hour), jsonb: true},
-		// Соседний домен 20 той же зоны — не трогается.
+		// The neighboring domain 20 of the same zone — untouched.
 		{key: retentionKey{zone: 1, domain: 20, sub: 0, variant: 0}, checkedAt: old, hash: retentionHash16(0x33), jsonb: true},
 	}
 	pool.domains[retentionDomKey{zone: 1, id: 20}] = retentionFakeDomain{status: int16(model.StatusAlive)}
@@ -99,8 +101,8 @@ func TestDrainDomain_ControlScenario(t *testing.T) {
 	if c, ok := pool.contents[retentionHash(0x33)]; !ok || c.refc != 1 {
 		t.Errorf("contents 0x33 (чужой домен) тронут: %+v", c)
 	}
-	// Контрольный критерий: у домена не осталось кандидатов ВООБЩЕ —
-	// повторный дренаж пуст, транзакция не открывается.
+	// Control criterion: the domain has no candidates left AT ALL —
+	// a repeated drain is empty, no transaction is opened.
 	pool.queries, pool.txCalls = nil, nil
 	stats, err = DrainDomain(context.Background(), pool, DefaultRetention, 1, 10)
 	if err != nil {
@@ -111,11 +113,12 @@ func TestDrainDomain_ControlScenario(t *testing.T) {
 	}
 }
 
-// --- фильтры отбора -------------------------------------------------------------
+// --- selection filters -----------------------------------------------------------
 
-// TestDrainDomain_Filters — критерии T-166 в точечной выборке: находка
-// хранит контент всегда, render_pending без rendered ждёт рендера,
-// deleted — территория T-020, свежие и уже очищенные записи не кандидаты.
+// TestDrainDomain_Filters — the T-166 criteria in the point selection:
+// a find keeps its content always, render_pending without rendered waits
+// for the render, deleted is T-020 territory, fresh and already trimmed
+// records are not candidates.
 func TestDrainDomain_Filters(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
@@ -129,7 +132,8 @@ func TestDrainDomain_Filters(t *testing.T) {
 		{"уже очищенная — чистить нечего", 70},
 	}
 	pool := retentionSeedPool(now)
-	// 70: остаревшая запись без ссылки и jsonb (например, прошлый дренаж).
+	// 70: an aged record without a reference and jsonb (e.g. a previous
+	// drain).
 	pool.domains[retentionDomKey{zone: 1, id: 70}] = retentionFakeDomain{status: int16(model.StatusAlive)}
 	pool.results = append(pool.results, retentionRow{
 		key: retentionKey{zone: 1, domain: 70, sub: 0, variant: 0}, checkedAt: now.Add(-2 * DefaultRetention),
@@ -148,11 +152,12 @@ func TestDrainDomain_Filters(t *testing.T) {
 	}
 }
 
-// TestDrainDomain_ArgsAndNoCursor — параметры выборки: ключи домена и
-// граница старения интервалом; курсор дренажа цикла не участвует.
+// TestDrainDomain_ArgsAndNoCursor — the selection parameters: the domain
+// keys and the aging boundary as an interval; the cycle's drain cursor is
+// not involved.
 func TestDrainDomain_ArgsAndNoCursor(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
-	pool := drainPool(now) // домен 1/10, два остаревших кандидата
+	pool := drainPool(now) // domain 1/10, two aged candidates
 
 	if _, err := DrainDomain(context.Background(), pool, DefaultRetention, 1, 10); err != nil {
 		t.Fatalf("DrainDomain: %v", err)
@@ -164,7 +169,7 @@ func TestDrainDomain_ArgsAndNoCursor(t *testing.T) {
 	if !reflect.DeepEqual(pool.queries[0].args, want) {
 		t.Fatalf("args = %v, want %v (зона, домен, окно)", pool.queries[0].args, want)
 	}
-	// Пачка purge — ключи домена в порядке PK, граница та же.
+	// The purge batch — the domain keys in PK order, the same boundary.
 	if len(pool.txCalls) == 0 || pool.txCalls[0].sql != retentionPurgeSQL {
 		t.Fatalf("первый оператор транзакции = %+v, want purge", pool.txCalls[0])
 	}
@@ -177,10 +182,10 @@ func TestDrainDomain_ArgsAndNoCursor(t *testing.T) {
 	}
 }
 
-// --- пустой итог и сбои --------------------------------------------------------
+// --- empty outcome and failures --------------------------------------------------
 
-// TestDrainDomain_EmptyNoTx — кандидатов нет: один SELECT, транзакция не
-// открывается (чистить нечего).
+// TestDrainDomain_EmptyNoTx — no candidates: a single SELECT, no
+// transaction is opened (nothing to purge).
 func TestDrainDomain_EmptyNoTx(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
@@ -199,9 +204,9 @@ func TestDrainDomain_EmptyNoTx(t *testing.T) {
 	}
 }
 
-// TestDrainDomain_Errors — сбои шагов: ошибка выборки и чистки
-// возвращается (вызывающий логирует, не роняя доставку — T-187),
-// выключенное окно и пустой пул — громкая ошибка использования.
+// TestDrainDomain_Errors — step failures: the selection and purge errors
+// are returned (the caller logs them without bringing the delivery down —
+// T-187); a disabled window and a nil pool are a loud usage error.
 func TestDrainDomain_Errors(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 
@@ -225,7 +230,8 @@ func TestDrainDomain_Errors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "дренаж домена 1/10") {
 		t.Fatalf("ошибка чистки = %v, want контекст с ключом домена", err)
 	}
-	// Охраны T-044: сбой чистки откатил транзакцию — строки не тронуты.
+	// The T-044 guards: the purge failure rolled the transaction back —
+	// the rows are untouched.
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r == nil || r.hash == nil {
 		t.Error("сбой пачки оставил изменения в строках (транзакция не откатилась)")
 	}
