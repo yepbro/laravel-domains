@@ -1,14 +1,16 @@
-// Package auth — хранение и сверка пароля операторского дашборда
-// (ТЗД §7.2–7.4, T-127): формат строки password_hash, генерация
-// (crawlerctl dashboard-secret), разбор и сверка с постоянным временем.
-// Пакет не знает про HTTP: middleware Basic и cookie-сессии — задача
-// cmd/dashboard (T-128); для подписи cookie-сессии используется Derive —
-// производный ключ KDF (ТЗД §7.5: смена пароля инвалидирует сессии).
+// Package auth — storing and verifying the operator dashboard password
+// (dashboard spec §7.2–7.4, T-127): the password_hash string format,
+// generation (crawlerctl dashboard-secret), parsing and constant-time
+// verification. The package knows nothing about HTTP: the Basic
+// middleware and cookie sessions belong to cmd/dashboard (T-128);
+// Derive — a KDF-derived key — is used to sign cookie sessions
+// (dashboard spec §7.5: a password change invalidates sessions).
 //
-// KDF — PBKDF2-HMAC-SHA256 из stdlib crypto/pbkdf2 (Go 1.24+, ТЗД §3.2:
-// новых зависимостей нет). Формат строки (ТЗД §7.2, b64 — std encoding):
+// The KDF is PBKDF2-HMAC-SHA256 from stdlib crypto/pbkdf2 (Go 1.24+,
+// dashboard spec §3.2: no new dependencies). The string format
+// (dashboard spec §7.2, b64 — std encoding):
 //
-//	pbkdf2-sha256$<итерации>$<соль-b64>$<ключ-b64>
+//	pbkdf2-sha256$<iterations>$<salt-b64>$<key-b64>
 package auth
 
 import (
@@ -22,23 +24,25 @@ import (
 	"strings"
 )
 
-// Параметры схемы (ТЗД §7.2).
+// Scheme parameters (dashboard spec §7.2).
 const (
-	// Scheme — имя схемы в первой компоненте строки password_hash.
+	// Scheme — the scheme name in the first component of the
+	// password_hash string.
 	Scheme = "pbkdf2-sha256"
-	// DefaultIterations — рекомендуемое число итераций при генерации
-	// (OWASP для PBKDF2-HMAC-SHA256; ТЗД §7.2).
+	// DefaultIterations — the recommended number of iterations when
+	// generating (OWASP for PBKDF2-HMAC-SHA256; dashboard spec §7.2).
 	DefaultIterations = 600_000
-	// MinSaltLen — минимальная соль в байтах (ТЗД §7.2: ≥ 16).
+	// MinSaltLen — the minimum salt in bytes (dashboard spec §7.2: ≥ 16).
 	MinSaltLen = 16
-	// KeyLen — длина производного ключа в байтах (ТЗД §7.2: 32).
+	// KeyLen — the derived key length in bytes (dashboard spec §7.2: 32).
 	KeyLen = 32
 )
 
-// Generate возвращает строку password_hash для пароля: PBKDF2-HMAC-SHA256,
-// соль MinSaltLen байт из crypto/rand, ключ KeyLen байт. iterations <= 0 —
-// DefaultIterations (младшие значения — тесты). Пустой пароль — ошибка:
-// креды оператора обязательны (ТЗД §7.7).
+// Generate returns the password_hash string for a password:
+// PBKDF2-HMAC-SHA256, a MinSaltLen-byte salt from crypto/rand, a
+// KeyLen-byte key. iterations <= 0 means DefaultIterations (lower
+// values are for tests). An empty password is an error: operator
+// credentials are mandatory (dashboard spec §7.7).
 func Generate(password string, iterations int) (string, error) {
 	if password == "" {
 		return "", fmt.Errorf("пароль пуст")
@@ -47,20 +51,21 @@ func Generate(password string, iterations int) (string, error) {
 		iterations = DefaultIterations
 	}
 	salt := make([]byte, MinSaltLen)
-	// Ветка недостижима (T-M11): crypto/rand.Read в Go ≥ 1.24 не
-	// возвращает ошибок — «never returns an error, and always fills b
-	// entirely» (документация stdlib); отказ источника энтропии —
-	// фатальный краш процесса, а не ошибка Generate.
+	// Unreachable branch (T-M11): crypto/rand.Read in Go ≥ 1.24 does
+	// not return errors — "never returns an error, and always fills b
+	// entirely" (stdlib documentation); an entropy source failure is
+	// a fatal process crash, not a Generate error.
 	// mutator-disable-next-line branch/if
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("соль: %w", err)
 	}
 	key, err := pbkdf2.Key(sha256.New, password, salt, iterations, KeyLen)
-	// Ветка недостижима (T-M11): pbkdf2.Key ошибается только при
-	// keyLength вне [1, (2^32-1)×h.Size()] либо в FIPS-only-сборке
-	// (GOEXPERIMENT=fips140 — проектом не используется, и даже в ней
-	// соль 16 байт и ключ 32 байта проходят ограничения), а keyLength
-	// здесь — константа KeyLen=32; итерации к этому моменту уже ≥ 1.
+	// Unreachable branch (T-M11): pbkdf2.Key fails only when keyLength
+	// is outside [1, (2^32-1)×h.Size()] or in a FIPS-only build
+	// (GOEXPERIMENT=fips140 — not used by this project, and even there
+	// a 16-byte salt and a 32-byte key pass the constraints), while
+	// keyLength here is the KeyLen=32 constant; by this point the
+	// iterations are already ≥ 1.
 	// mutator-disable-next-line branch/if
 	if err != nil {
 		return "", fmt.Errorf("pbkdf2: %w", err)
@@ -73,20 +78,21 @@ func Generate(password string, iterations int) (string, error) {
 	}, "$"), nil
 }
 
-// PasswordHash — разобранная строка password_hash: параметры схемы и
-// ожидаемый производный ключ. Неизменяемость не гарантируется — копия
-// значения после Parse, а не защитная структура.
+// PasswordHash — a parsed password_hash string: the scheme parameters
+// and the expected derived key. Immutability is not guaranteed — it is
+// a copy of the value after Parse, not a defensive structure.
 type PasswordHash struct {
 	Iterations int
 	Salt       []byte
 	Key        []byte
 }
 
-// Parse разбирает строку формата ТЗД §7.2. Формат строгий: 4 компоненты,
-// имя схемы, положительные целые итерации (читаются из строки — сверка
-// считается с ними, ТЗД §7.2), соль ≥ MinSaltLen байт, ключ ровно KeyLen
-// байт, base64 std encoding. Ошибки парсятся по компонентам — текст
-// указывает, что именно неверно.
+// Parse parses a string in the dashboard spec §7.2 format. The format is
+// strict: 4 components, the scheme name, positive integer iterations
+// (read from the string — verification uses them, dashboard spec §7.2),
+// a salt ≥ MinSaltLen bytes, a key of exactly KeyLen bytes, base64 std
+// encoding. Errors are parsed per component — the text states what
+// exactly is wrong.
 func Parse(s string) (PasswordHash, error) {
 	parts := strings.Split(s, "$")
 	if len(parts) != 4 || parts[0] != Scheme {
@@ -113,26 +119,26 @@ func Parse(s string) (PasswordHash, error) {
 	return PasswordHash{Iterations: iter, Salt: salt, Key: key}, nil
 }
 
-// Derive — производный ключ пароля: KDF с параметрами хэша (итерации и
-// соль из строки, длина KeyLen). Тот же ключ — HMAC cookie-сессии
-// дашборда (ТЗД §7.5). Ошибка возможна только при отрицательных
-// параметрах (после Parse недостижимо).
+// Derive — the password-derived key: the KDF with the hash parameters
+// (iterations and salt from the string, KeyLen length). The same key
+// signs the dashboard cookie session (dashboard spec §7.5). An error is
+// possible only with negative parameters (unreachable after Parse).
 func (h PasswordHash) Derive(password string) ([]byte, error) {
 	return pbkdf2.Key(sha256.New, password, h.Salt, h.Iterations, KeyLen)
 }
 
-// Verify — сверка пароля с хэшем в постоянном времени
-// (subtle.ConstantTimeCompare, ТЗД §7.4). Ошибка деривации (после Parse
-// недостижима) — не совпадение.
+// Verify — constant-time password-to-hash verification
+// (subtle.ConstantTimeCompare, dashboard spec §7.4). A derivation error
+// (unreachable after Parse) counts as a mismatch.
 func (h PasswordHash) Verify(password string) bool {
 	key, err := h.Derive(password)
-	// Ветка недостижима (T-M11): Derive = pbkdf2.Key с keyLength =
-	// константе KeyLen=32 — условия ошибок stdlib (keyLength ≤ 0 или
-	// слишком длинный) невозможны при любом значении h в обычной
-	// сборке; единственное исключение — FIPS-only-сборка
-	// (GOEXPERIMENT=fips140, проектом не используется) с вручную
-	// сконструированной солью < 16 байт — продовый путь через Parse
-	// исключён (Parse требует соль ≥ MinSaltLen).
+	// Unreachable branch (T-M11): Derive is pbkdf2.Key with keyLength =
+	// the KeyLen=32 constant — the stdlib error conditions (keyLength
+	// ≤ 0 or too long) are impossible for any h value in a normal
+	// build; the only exception is a FIPS-only build
+	// (GOEXPERIMENT=fips140, not used by this project) with a manually
+	// constructed salt < 16 bytes — the production path through Parse
+	// is excluded (Parse requires a salt ≥ MinSaltLen).
 	// mutator-disable-next-line branch/if
 	if err != nil {
 		return false

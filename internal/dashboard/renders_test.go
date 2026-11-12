@@ -1,9 +1,10 @@
-// Юнит-тесты панели движков рендера (T-246, renders.go): разбор
-// exposition text format (метки, кавычки/запятые в значениях, деградации
-// формы), агрегация экспозиций двух сборок воркера по движкам и исходам,
-// темпы между проходами (часы CollectorOptions.Now, рестарт воркера —
-// нулевая дельта), глубина q:render-fallback, деградации секции
-// (адреса не заданы — «н/д» без ошибки; экспозиция недоступна — ошибка).
+// Unit tests of the render engines panel (T-246, renders.go):
+// exposition text format parsing (labels, quotes/commas in values,
+// shape degradations), aggregation of the two worker build exposures
+// per engines and outcomes, rates between passes (the
+// CollectorOptions.Now clock, a worker restart — a zero delta), the
+// q:render-fallback depth, section degradations (addresses not set —
+// "n/a" without an error; an exposure unavailable — an error).
 package dashboard
 
 import (
@@ -21,10 +22,10 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- разбор exposition -----------------------------------------------------------
+// --- exposition parsing -----------------------------------------------------------
 
-// TestParsePromExposition — минимальный парсер: сэмплы с метками и без,
-// HELP/TYPE пропускаются, экраны значений, табличные ошибки формы.
+// TestParsePromExposition — a minimal parser: samples with and without
+// labels, HELP/TYPE skipped, value escapes, tabular shape errors.
 func TestParsePromExposition(t *testing.T) {
 	expo := `# HELP crawler_render_records_total Записи по признаку rendered
 # TYPE crawler_render_records_total counter
@@ -54,8 +55,8 @@ weird_metric{a="x,y",b="q\"r"} 1.5
 	if s := byName["crawler_render_tarpit_finalized_total|"]; s.Value != 7 {
 		t.Errorf("сэмпл без меток = %+v, want 7", s)
 	}
-	// Запятая внутри кавычек — часть значения, экранированная кавычка —
-	// раскрывается.
+	// A comma inside quotes is part of the value, an escaped quote is
+	// unescaped.
 	w := byName["weird_metric|"]
 	if w.Labels["a"] != "x,y" || w.Labels["b"] != `q"r` || w.Value != 1.5 {
 		t.Errorf("метки с запятой/кавычкой = %+v", w.Labels)
@@ -76,10 +77,11 @@ weird_metric{a="x,y",b="q\"r"} 1.5
 	}
 }
 
-// --- сборка секции ---------------------------------------------------------------
+// --- section assembly ---------------------------------------------------------------
 
-// renderLens — StreamLener по карте глубин (глубина q:render-fallback
-// панели не обязана следовать seq fakeLenner секции очередей).
+// renderLens — a StreamLener over a depth map (the panel's
+// q:render-fallback depth does not have to follow the seq fakeLenner
+// of the queues section).
 type renderLens struct {
 	lens map[string]int64
 	err  error
@@ -92,8 +94,9 @@ func (l *renderLens) Len(_ context.Context, stream string) (int64, error) {
 	return l.lens[stream], nil
 }
 
-// renderWorkerExpo — маленькая управляемая экспозиция /metrics рендер-
-// воркера: значения меняются между проходами (темп), рестарт — сброс.
+// renderWorkerExpo — a small controllable /metrics exposure of a
+// render worker: values change between passes (the rate), a restart —
+// a reset.
 type renderWorkerExpo struct {
 	engine            string
 	rendered          float64
@@ -117,8 +120,9 @@ func (w renderWorkerExpo) exposition() string {
 		formatFloat(w.tasks) + "\n")
 	b.WriteString("crawler_render_task_finalized_total{reason=\"timeout\",engine=\"" + w.engine + "\"} " +
 		formatFloat(w.finalized) + "\n")
-	// Тарпиты и RSS — как в живой экспозиции: тарпит-семейство ленивое
-	// (без событий серии нет), process_resident_memory_bytes — всегда.
+	// Tarpits and RSS — as in a live exposure: the tarpit family is
+	// lazy (no series without events), process_resident_memory_bytes —
+	// always.
 	if w.tarpits > 0 {
 		b.WriteString("crawler_render_tarpit_finalized_total{engine=\"" + w.engine + "\"} " +
 			formatFloat(w.tarpits) + "\n")
@@ -141,14 +145,15 @@ func (w renderWorkerExpo) exposition() string {
 	return b.String()
 }
 
-// formatFloat — компактная запись числа для экспозиции (целые без
-// хвоста, дроби как есть).
+// formatFloat — a compact number notation for the exposure (integers
+// without a tail, fractions as is).
 func formatFloat(v float64) string {
 	return strconv.FormatFloat(v, 'g', -1, 64)
 }
 
-// newRenderCollector — сборщик с управляемыми часами (темпы считаются
-// между проходами) и картой глубин; set — перевод часов.
+// newRenderCollector — a collector with a controllable clock (rates
+// are computed between passes) and a depth map; set — the clock
+// advance.
 func newRenderCollector(t *testing.T, lens *renderLens, urls []string) (*Collector, func(time.Time)) {
 	t.Helper()
 	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
@@ -156,7 +161,7 @@ func newRenderCollector(t *testing.T, lens *renderLens, urls []string) (*Collect
 	set := func(t time.Time) { now = t }
 	coll := newSnapCollector(t, healthyPool(), lens, func(o *CollectorOptions) {
 		if urls == nil {
-			urls = []string{} // «адреса не заданы»: nil подтянул бы дефолт cfg
+			urls = []string{} // "addresses not set": nil would pull the cfg default
 		}
 		o.RenderMetrics = urls
 		o.Now = clock
@@ -164,13 +169,13 @@ func newRenderCollector(t *testing.T, lens *renderLens, urls []string) (*Collect
 	return coll, set
 }
 
-// TestCollectRenderPanel — агрегация двух сборок воркера: движки по
-// метке engine (сортировка по имени), успешность по атрибутированным
-// завершениям, фолбэк published/consumed/глубина, темпы — дельта между
-// проходами (первый проход — база, темпы 0).
+// TestCollectRenderPanel — aggregation of two worker builds: engines
+// by the engine label (sorted by name), success over attributed
+// finalizations, the fallback published/consumed/depth, rates — the
+// delta between passes (the first pass — the baseline, rates 0).
 func TestCollectRenderPanel(t *testing.T) {
-	// Экспозиции читаются горутинами сервера, тест мутирует значения
-	// между проходами — замок (гонка под -race).
+	// Exposures are read by the server goroutines, the test mutates
+	// the values between passes — a lock (a race under -race).
 	var mu sync.Mutex
 	workerA := renderWorkerExpo{engine: "moli", rendered: 1000, finalized: 100,
 		tarpits: 25, published: 10, tasks: 2000, rss: 512 << 20}
@@ -206,8 +211,8 @@ func TestCollectRenderPanel(t *testing.T) {
 	coll, setClock := newRenderCollector(t, lens, []string{srvA.URL, srvB.URL})
 	ctx := context.Background()
 
-	// Первый проход: база темпов (0), движки отсортированы, успешность
-	// moli = 1000/1100.
+	// The first pass: the rate baseline (0), engines sorted, moli
+	// success = 1000/1100.
 	snap := coll.CollectOnce(ctx)
 	if snap.Render == nil {
 		t.Fatal("render = nil, want секция собрана")
@@ -227,8 +232,9 @@ func TestCollectRenderPanel(t *testing.T) {
 	if moli.SuccessPct == nil || math.Abs(*moli.SuccessPct-1000.0/1100*100) > 1e-9 {
 		t.Errorf("moli success = %v, want 1000/1100", moli.SuccessPct)
 	}
-	// S-P3-2: тарпит-рейт — доля тарпитов среди завершений движка
-	// (25/(1000+100+25)), успешность знаменатель не меняет.
+	// S-P3-2: the tarpit rate — the share of tarpits among the engine
+	// finalizations (25/(1000+100+25)), success does not change the
+	// denominator.
 	if moli.TarpitTotal != 25 || moli.TarpitPct == nil ||
 		math.Abs(*moli.TarpitPct-25.0/1125*100) > 1e-9 {
 		t.Errorf("moli тарпиты = %+v (%v), want 25 и 25/1125", moli.TarpitTotal, moli.TarpitPct)
@@ -240,8 +246,8 @@ func TestCollectRenderPanel(t *testing.T) {
 	if chromium.RenderedTotal != 50 || chromium.FinalizedTotal != 0 || chromium.SuccessPct == nil || *chromium.SuccessPct != 100 {
 		t.Errorf("chromium = %+v, want 50/0 и 100%%", chromium)
 	}
-	// Ленивое тарпит-семейство (серии нет) — 0 и рейт 0 при имеющихся
-	// завершениях, не «—» и не отсутствие движка.
+	// The lazy tarpit family (no series) — 0 and a rate of 0 given
+	// existing finalizations, not "—" and not a missing engine.
 	if chromium.TarpitTotal != 0 || chromium.TarpitPct == nil || *chromium.TarpitPct != 0 {
 		t.Errorf("chromium тарпиты = %d (%v), want 0 и 0%%", chromium.TarpitTotal, chromium.TarpitPct)
 	}
@@ -257,8 +263,8 @@ func TestCollectRenderPanel(t *testing.T) {
 	if fb.PublishedTotal != 10 || fb.PublishedPerSec != 0 {
 		t.Errorf("published = %+v, want 10 и темп 0 (база)", fb)
 	}
-	// S-P3-2: fallback-рейт — доля published от страниц этапа
-	// (10/(2000+300), знаменатель — обе экспозиции).
+	// S-P3-2: the fallback rate — the share of published of stage
+	// pages (10/(2000+300), the denominator — both exposures).
 	if fb.RatePct == nil || math.Abs(*fb.RatePct-10.0/2300*100) > 1e-9 {
 		t.Errorf("rate_pct = %v, want 10/2300", fb.RatePct)
 	}
@@ -273,11 +279,12 @@ func TestCollectRenderPanel(t *testing.T) {
 		t.Errorf("depth = %v, want 3", fb.Depth)
 	}
 
-	// Второй проход через 10 с: moli +100 рендеров и +2 публикации —
-	// темпы 10/с и 0.2/с; воркер B доработал 2 записи — темп потребления
-	// 0.2/с (пара темпов — диагностика «воркер B не успевает», ревью
-	// T-246); rendered движков без движения — 0; fallback-рейт — по
-	// кумулятивам (12/2400).
+	// The second pass after 10 s: moli +100 renders and +2
+	// publications — rates of 10/s and 0.2/s; worker B processed 2
+	// records — a consumption rate of 0.2/s (the rate pair — the
+	// "worker B cannot keep up" diagnostics, T-246 review); the
+	// engines' rendered without movement — 0; the fallback rate — by
+	// cumulatives (12/2400).
 	setA(renderWorkerExpo{engine: "moli", rendered: 1100, finalized: 100,
 		tarpits: 25, published: 12, tasks: 2100, rss: 512 << 20})
 	setB(renderWorkerExpo{engine: "chromium", rendered: 50,
@@ -308,9 +315,10 @@ func TestCollectRenderPanel(t *testing.T) {
 		t.Errorf("rate_pct второго прохода = %v, want 12/2400", pct)
 	}
 
-	// Рестарт воркера A (кумулятив упал) — нулевая дельта, не отрицательная;
-	// B без движения — темп потребления тоже 0; страницы этапа B ещё
-	// есть — fallback-рейт честный 0 (публикаций нет), не «—».
+	// Worker A restart (the cumulative dropped) — a zero delta, not a
+	// negative one; B without movement — the consumption rate is 0
+	// too; B's stage pages are still there — the fallback rate is an
+	// honest 0 (no publications), not "—".
 	setA(renderWorkerExpo{engine: "moli", rendered: 5, tasks: 10})
 	setClock(time.Date(2026, 11, 6, 12, 0, 20, 0, time.UTC))
 	snap = coll.CollectOnce(ctx)
@@ -328,11 +336,12 @@ func TestCollectRenderPanel(t *testing.T) {
 	}
 }
 
-// TestCollectRenderDegradation — адреса не заданы — секция «н/д» без
-// ошибки (стиль health); недоступная экспозиция — секция деградирована
-// с причиной, остальные секции живы; битая экспозиция — ошибка разбора.
+// TestCollectRenderDegradation — addresses not set — the section is
+// "n/a" without an error (the health style); an unavailable exposure —
+// the section degraded with a reason, the other sections alive; a
+// broken exposure — a parse error.
 func TestCollectRenderDegradation(t *testing.T) {
-	// Не настроено — не ошибка.
+	// Not configured — not an error.
 	coll, _ := newRenderCollector(t, &renderLens{}, nil)
 	snap := coll.CollectOnce(context.Background())
 	if snap.Render != nil {
@@ -342,8 +351,8 @@ func TestCollectRenderDegradation(t *testing.T) {
 		t.Errorf("адреса не заданы — ошибка секции: %v", snap.Errors)
 	}
 
-	// Экспозиция недоступна (закрытый сервер) — деградация секции,
-	// очереди/зоны живы (§5.9).
+	// The exposure unavailable (a closed server) — the section
+	// degrades, queues/zones alive (§5.9).
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	deadURL := dead.URL
 	dead.Close()
@@ -359,7 +368,8 @@ func TestCollectRenderDegradation(t *testing.T) {
 		t.Errorf("деградация задела чужие секции: %v", snap.Errors)
 	}
 
-	// Битая экспозиция (метки не закрыты) — ошибка разбора с причиной.
+	// A broken exposure (labels not closed) — a parse error with a
+	// reason.
 	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("m{x=\"1\" 5\n"))
 	}))
@@ -370,8 +380,9 @@ func TestCollectRenderDegradation(t *testing.T) {
 		t.Errorf("битая экспозиция: render=%v errors=%v, want деградация", snap.Render, snap.Errors)
 	}
 
-	// Глубина недоступна (Redis лежит) — Depth nil, секция жива: панель
-	// без остатка очереди лучше отсутствия панели.
+	// The depth unavailable (Redis down) — Depth nil, the section
+	// alive: a panel without the queue remainder is better than no
+	// panel.
 	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(renderWorkerExpo{engine: "chromium", rendered: 10}.exposition()))
 	}))
@@ -381,8 +392,8 @@ func TestCollectRenderDegradation(t *testing.T) {
 	if snap.Render == nil || snap.Render.Fallback.Depth != nil {
 		t.Errorf("render=%v depth=%v, want секция жива с Depth nil", snap.Render, snap.Render.Fallback.Depth)
 	}
-	// Экспозиция без stage_tasks (страниц этапа нет) — fallback-рейт
-	// «—» (nil), не паника и не 0.
+	// An exposure without stage_tasks (no stage pages) — the fallback
+	// rate is "—" (nil), not a panic and not 0.
 	if snap.Render.Fallback.RatePct != nil {
 		t.Errorf("rate_pct без страниц этапа = %v, want nil", *snap.Render.Fallback.RatePct)
 	}
@@ -391,9 +402,10 @@ func TestCollectRenderDegradation(t *testing.T) {
 	}
 }
 
-// TestCollectRenderNotConfiguredByDefault — сборщик без опций (конфиг
-// по умолчанию: адресов нет) — render всегда nil, /api/status отдаёт
-// null; JSON-поле присутствует (контракт фронта).
+// TestCollectRenderNotConfiguredByDefault — a collector without
+// options (the default config: no addresses) — render always nil,
+// /api/status serves null; the JSON field is present (the front
+// contract).
 func TestCollectRenderNotConfiguredByDefault(t *testing.T) {
 	coll := newSnapCollector(t, healthyPool(), &fakeLenner{}, nil)
 	snap := coll.CollectOnce(context.Background())

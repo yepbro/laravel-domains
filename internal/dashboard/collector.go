@@ -1,39 +1,43 @@
-// Сборщик снимков (ТЗД §4.3–4.4, T-129): фоновый цикл с периодом
-// dashboard.refresh — первый сбор сразу при старте (свежий снимок после
-// простоя/рестарта, стиль monitor.ZoneStatsLoop), далее по ticker;
-// собранный снимок атомарно заменяет предыдущий (atomic.Pointer —
-// хендлеры читают без блокировок).
+// Snapshot collector (dashboard spec §4.3–4.4, T-129): a background
+// loop with a dashboard.refresh period — the first collection right at
+// startup (a fresh snapshot after idle/restart, monitor.ZoneStatsLoop
+// style), then on a ticker; the collected snapshot atomically replaces
+// the previous one (atomic.Pointer — handlers read without locks).
 //
-// Источники (ТЗД §4.3, все read-only):
+// Sources (dashboard spec §4.3, all read-only):
 //
-//   - PostgreSQL — секции internal/status (зоны/темп — те же SQL, что у
-//     crawlerctl status, T-126; статусы/Laravel/ingest — §5.5–5.7);
-//     тяжёлые проходы domains (зоны/темп/статусы) идут через TTL-кэш
-//     status.Cache (T-161): в окне dashboard.status_cache_ttl проходы
-//     refresh не платят полный агрегат, лёгкие секции остаются живыми;
-//   - Redis — глубина пяти стримов через тот же узкий API Len
-//     (BackpressureGate, ТЗД §4.3.2): клиент собирает cmd/dashboard по
-//     конфигу redis — как cmd/monitor; порог гейта не участвует (только
-//     Len, стиль crawlerctl status);
-//   - HTTP-экспозиции /metrics рендер-воркеров (T-246, renders.go) —
-//     панель движков: темп/успешность по engine (метка T-235) и
-//     фолбэк published/consumed; глубина q:render-fallback — тем же
-//     Len по Redis;
-//   - пробы /livez сервисов конвейера из dashboard.probes — параллельно
-//     (горутины + WaitGroup; errgroup не используется — golang.org/x/sync
-//     в go.mod косвенная, ТЗД §3.2.1 новых зависимостей не вводит),
-//     таймаут 2 с на пробу (§5.8).
+//   - PostgreSQL — internal/status sections (zones/throughput — the
+//     same SQL as crawlerctl status, T-126; statuses/Laravel/ingest —
+//     §5.5–5.7); the heavy domains passes (zones/throughput/statuses)
+//     go through the status.Cache TTL cache (T-161): within
+//     dashboard.status_cache_ttl the refresh passes do not pay the
+//     full aggregate, light sections stay live;
+//   - Redis — the depth of five streams via the same narrow Len API
+//     (BackpressureGate, dashboard spec §4.3.2): the client is
+//     assembled by cmd/dashboard from the redis config — like
+//     cmd/monitor; the gate threshold takes no part (Len only,
+//     crawlerctl status style);
+//   - HTTP exposures /metrics of render workers (T-246, renders.go) —
+//     the engines panel: per-engine rate/success (the T-235 metric)
+//     and the published/consumed fallback; the q:render-fallback
+//     depth — the same Len over Redis;
+//   - /livez probes of pipeline services from dashboard.probes — in
+//     parallel (goroutines + WaitGroup; errgroup is not used —
+//     golang.org/x/sync in go.mod is indirect, dashboard spec §3.2.1
+//     introduces no new dependencies), a 2 s timeout per probe (§5.8).
 //
-// Ошибка секции прерывает только её (снимок публикуется с деградацией,
-// §5.9); ошибка прохода целиком — только отмена ctx (остановка сервиса).
-// «Успешный сбор» (ТЗД §5.9: до первого /api/status отвечает 503) —
-// первый проход с живым каркасом сводки (зоны/итоги §5.1): иерархия та
-// же, что у crawlerctl status — недоступный Redis не прячет сводку по
-// БД (очереди «н/д», приёмка §12.3 работает и для рестарта при лежащем
-// Redis), лежащая БД держит 503 и метрику result=error до
-// восстановления — снимок без каркаса зон бессодержателен. Latch
-// готовности срабатывает один раз — позже деградированные снимки
-// обслуживаются (§4.4 атомарная замена + §5.9 не роняет выдачу).
+// A section error interrupts only that section (the snapshot is
+// published degraded, §5.9); an error of the whole pass comes only
+// from ctx cancellation (service shutdown). "Successful collection"
+// (dashboard spec §5.9: until the first one /api/status answers 503) —
+// the first pass with a live summary skeleton (zones/totals §5.1): the
+// hierarchy is the same as crawlerctl status — an unavailable Redis
+// does not hide the DB summary (queues "n/a", the §12.3 acceptance
+// also works for a restart with Redis down), a down DB holds 503 and
+// the result=error metric until recovery — a snapshot without the
+// zone skeleton is meaningless. The readiness latch fires once —
+// later degraded snapshots are still served (§4.4 atomic replacement
+// + §5.9 does not take down the response).
 package dashboard
 
 import (
@@ -58,81 +62,89 @@ import (
 	"crawler/internal/status"
 )
 
-// DefaultRefreshInterval — период сборки при нулевом Interval (зеркалит
-// дефолт dashboard.refresh, ТЗД §8.1).
+// DefaultRefreshInterval — the collection period for a zero Interval
+// (mirrors the dashboard.refresh default, dashboard spec §8.1).
 const DefaultRefreshInterval = 5 * time.Second
 
-// DefaultStatusCacheTTL — TTL кэша тяжёлых агрегатов при нулевом
-// StatusCacheTTL (зеркалит дефолт dashboard.status_cache_ttl, T-161):
-// нижняя граница коридора постановки 1–5 мин — при дефолтном refresh 5 с
-// один полный проход domains в минуту вместо двенадцати.
+// DefaultStatusCacheTTL — the TTL of the heavy-aggregate cache for a
+// zero StatusCacheTTL (mirrors the dashboard.status_cache_ttl default,
+// T-161): the lower bound of the 1–5 min enqueue corridor — with the
+// default refresh of 5 s one full domains pass per minute instead of
+// twelve.
 const DefaultStatusCacheTTL = time.Minute
 
-// probeTimeout — бюджет одной пробы /livez (ТЗД §5.8: 2 с).
+// probeTimeout — the budget of one /livez probe (dashboard spec §5.8: 2 s).
 const probeTimeout = 2 * time.Second
 
-// queueFetchTimeout — бюджет секции очередей (§5.4). Остановленный
-// контейнер Redis не отдаёт RST (сетевой endpoint сохраняется за
-// остановленным контейнером), поэтому dial до таймаутов go-redis по
-// умолчанию (DialTimeout 5 с × ретраи) висит десятки секунд и блокирует
-// цикл сборки целиком — деградация «н/д» (§5.9) не наступает за
-// разумные ~2 цикла refresh. Бюджет режет зависший опрос стримов:
-// секция деградирует, остальные собираются. Переменная (не const) —
-// чтобы юнит-тесты не ждали реальные секунды.
+// queueFetchTimeout — the budget of the queues section (§5.4). A
+// stopped Redis container does not answer with RST (the network
+// endpoint persists behind the stopped container), so a dial waits for
+// the default go-redis timeouts (DialTimeout 5 s × retries) and hangs
+// for tens of seconds, blocking the collection loop entirely — the
+// "n/a" degradation (§5.9) does not arrive within a reasonable ~2
+// refresh cycles. The budget cuts off a hung stream poll: the section
+// degrades, the rest are collected. A variable (not a const) so that
+// unit tests do not wait real seconds.
 var queueFetchTimeout = 2 * time.Second
 
-// probeBodyLimit — сколько тела пробы вычитать до закрытия (connection
-// reuse; /livez каркаса — байты «ok»).
+// probeBodyLimit — how much of a probe body to read before closing
+// (connection reuse; the framework /livez — the "ok" bytes).
 const probeBodyLimit = 4 << 10
 
-// Метки результата сборки (§10).
+// Collection result labels (§10).
 const (
 	snapshotResultOK    = "ok"
 	snapshotResultError = "error"
 )
 
-// CollectorOptions — параметры сборщика; нулевые значения заменяются
-// дефолтами (стиль monitor.ZoneStatsOptions).
+// CollectorOptions — collector parameters; zero values are replaced
+// with defaults (monitor.ZoneStatsOptions style).
 type CollectorOptions struct {
-	// Interval — период цикла (DefaultRefreshInterval); рабочее значение —
-	// dashboard.refresh из конфига.
+	// Interval — the cycle period (DefaultRefreshInterval); the
+	// working value — dashboard.refresh from the config.
 	Interval time.Duration
-	// StatusCacheTTL — TTL кэша тяжёлых агрегатов status
-	// (DefaultStatusCacheTTL); рабочее значение —
-	// dashboard.status_cache_ttl из конфига. 0 внутри TTL — секции
-	// зон/темпа/статусов собираются кэшем без обращения к БД (T-161,
-	// замер §12: полные проходы domains каждые refresh — большая статья
-	// CPU postgres), по истечении — одна выборка на секцию.
+	// StatusCacheTTL — the TTL of the status heavy-aggregate cache
+	// (DefaultStatusCacheTTL); the working value —
+	// dashboard.status_cache_ttl from the config. 0 within the TTL —
+	// the zones/throughput/statuses sections are collected from the
+	// cache without hitting the DB (T-161, the §12 measurement: full
+	// domains passes every refresh are a large share of postgres CPU);
+	// after expiry — one selection per section.
 	StatusCacheTTL time.Duration
-	// Probes — имя → базовый URL метрик сервиса (dashboard.probes): проба
-	// идёт на base + "/livez" (каркас internal/service, ТЗД §4.3.3).
-	// nil/пусто — секция здоровья «н/д» (Health = nil, не ошибка).
+	// Probes — service name → base metrics URL (dashboard.probes): the
+	// probe goes to base + "/livez" (the internal/service framework,
+	// dashboard spec §4.3.3). nil/empty — the health section is "n/a"
+	// (Health = nil, not an error).
 	Probes map[string]string
-	// QueueWatermark — порог backpressure scheduler.queue_high_watermark:
-	// база эффективных порогов подсветки очередей (§5.4); ≤ 0 — гейт
-	// отключён (все пороги 0, подсветки нет). Эффективный порог стрима —
-	// queue.StreamWatermark(Watermark, MaxLen, стрим): не выше половины
-	// предела MAXLEN стрима — тот же единый расчёт, что у гейта
-	// публикации (T-026) и алерта переполнения очередей монитора
-	// (T-080).
+	// QueueWatermark — the scheduler.queue_high_watermark backpressure
+	// threshold: the base of the effective queue highlight thresholds
+	// (§5.4); ≤ 0 — the gate is off (all thresholds 0, no highlight).
+	// The effective stream threshold is
+	// queue.StreamWatermark(Watermark, MaxLen, stream): no higher than
+	// half the MAXLEN limit of the stream — the same single
+	// computation as in the publication gate (T-026) and the monitor queue
+	// overflow alert (T-080).
 	QueueWatermark int64
-	// QueueMaxLen — предел длины стримов MAXLEN (зеркалит redis.maxlen;
-	// 0 — пределы по стримам политики T-025): нужен для эффективного
-	// порога стрима (см. QueueWatermark).
+	// QueueMaxLen — the stream length limit MAXLEN (mirrors
+	// redis.maxlen; 0 — per-stream policy limits T-025): needed for the
+	// effective stream threshold (see QueueWatermark).
 	QueueMaxLen int64
-	// RenderMetrics — адреса /metrics рендер-воркеров для панели движков
-	// (T-246; рабочее значение — dashboard.render_metrics_urls): nil/
-	// пусто — секция render «н/д» (не ошибка, стиль Probes).
+	// RenderMetrics — /metrics addresses of render workers for the
+	// engines panel (T-246; the working value —
+	// dashboard.render_metrics_urls): nil/empty — the render section is
+	// "n/a" (not an error, Probes style).
 	RenderMetrics []string
-	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
+	// Log — the loop logger; nil — records suppressed
+	// (slog.DiscardHandler).
 	Log *slog.Logger
-	// Metrics — реестр сервиса (метрики §10); nil — без метрик (шов
-	// тестов; прецедент monitor.NewNearGauge).
+	// Metrics — the service registry (§10 metrics); nil — no metrics
+	// (a test seam; the monitor.NewNearGauge precedent).
 	Metrics *metrics.Registry
-	// Now — часы момента сборки (built_at); nil — time.Now.
+	// Now — the collection moment clock (built_at); nil — time.Now.
 	Now func() time.Time
-	// HTTPClient — клиент проб; nil — свой с таймаутом probeTimeout.
-	// Шов тестов: короткий таймаут вместо ожидания двух секунд.
+	// HTTPClient — the probe client; nil — own one with the
+	// probeTimeout timeout. A test seam: a short timeout instead of
+	// waiting two seconds.
 	HTTPClient *http.Client
 }
 
@@ -152,9 +164,9 @@ func (o CollectorOptions) withDefaults() CollectorOptions {
 	return o
 }
 
-// Collector — фоновый сборщик снимков: собирает секции независимо,
-// публикует атомарно. Безопасен для одновременного использования: Loop
-// пишет, Current читают хендлеры.
+// Collector — the background snapshot collector: collects sections
+// independently, publishes atomically. Safe for concurrent use: Loop
+// writes, Current is read by handlers.
 type Collector struct {
 	pool    db.DB
 	lens    status.StreamLener
@@ -162,18 +174,20 @@ type Collector struct {
 	client  *http.Client
 	metrics *collectorMetrics
 	cache   *status.Cache
-	// rates — память темпов панели движков между проходами (кумулятивы
-	// экспозиций воркеров и момент прошлого скрейпа, T-246); пишется
-	// только Loop/CollectOnce — одиночным владельцем, без замка.
+	// rates — the engines-panel rate memory between passes (worker
+	// exposure cumulatives and the moment of the previous scrape,
+	// T-246); written only by Loop/CollectOnce — a single owner, no
+	// lock.
 	rates renderRateState
 
 	snap  atomic.Pointer[Snapshot]
 	ready atomic.Bool
 }
 
-// NewCollector собирает сборщик: pool — пул БД (обязателен), lens —
-// глубины стримов Redis (nil — секция очередей всегда деградирована:
-// FetchQueueLens честно откажет), cfg — секция dashboard (период/пробы).
+// NewCollector assembles the collector: pool — the DB pool (required),
+// lens — the Redis stream depths (nil — the queues section is always
+// degraded: FetchQueueLens will honestly fail), cfg — the dashboard
+// section (period/probes).
 func NewCollector(pool db.DB, lens status.StreamLener, cfg config.Dashboard, opts CollectorOptions) (*Collector, error) {
 	if pool == nil {
 		return nil, errors.New("dashboard: сборщик снимков: пул БД не задан")
@@ -195,10 +209,11 @@ func NewCollector(pool db.DB, lens status.StreamLener, cfg config.Dashboard, opt
 	if client == nil {
 		client = &http.Client{
 			Timeout: probeTimeout,
-			// Проба не следует редиректам: /livez отвечает 200 прямо,
-			// а чужой Location не должен уводить исходящее соединение
-			// на неконфигурированный хост (ТЗД §9.3 — только настроенные
-			// пробы); редирект остаётся ответом != 200 → down с причиной.
+			// The probe does not follow redirects: /livez answers 200
+			// directly, and someone else's Location must not steer the
+			// outgoing connection to an unconfigured host (dashboard
+			// spec §9.3 — configured probes only); a redirect stays a
+			// != 200 response → down with a reason.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		}
 	}
@@ -208,14 +223,15 @@ func NewCollector(pool db.DB, lens status.StreamLener, cfg config.Dashboard, opt
 		opt:     o,
 		client:  client,
 		metrics: newCollectorMetrics(o.Metrics),
-		// Кэш тяжёлых агрегатов (T-161): экземпляр на процесс сборщика —
-		// один и тот же для всех проходов Loop.
+		// The heavy-aggregate cache (T-161): one instance per collector
+		// process — the same one for all Loop passes.
 		cache: status.NewCache(status.CacheOptions{TTL: o.StatusCacheTTL}),
 	}, nil
 }
 
-// Current — последний снимок для /api/status; nil, пока не было ни
-// одного успешного сбора (§5.9 — каркас сводки ещё не собирался).
+// Current — the latest snapshot for /api/status; nil until at least one
+// successful collection (§5.9 — the summary skeleton has not been
+// collected yet).
 func (c *Collector) Current() *Snapshot {
 	if !c.ready.Load() {
 		return nil
@@ -223,23 +239,25 @@ func (c *Collector) Current() *Snapshot {
 	return c.snap.Load()
 }
 
-// CollectOnce — один проход сборки: секции независимо (§5.9), готовый к
-// отдаче снимок. Отмена ctx посреди прохода оставляет собранные секции
-// с ошибками контекста в карте errors — Loop такой снимок не публикует.
+// CollectOnce — one collection pass: sections independently (§5.9), a
+// snapshot ready for serving. A ctx cancellation in the middle of a
+// pass leaves the collected sections with context errors in the errors
+// map — Loop does not publish such a snapshot.
 func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 	now := c.opt.Now()
 	snap := &Snapshot{
 		Errors:          map[string]string{},
 		BuiltAt:         rfc3339(now),
-		QueueWatermarks: c.queueWatermarks(), // §5.4: пороги подсветки — данные, не секция
+		QueueWatermarks: c.queueWatermarks(), // §5.4: highlight thresholds — data, not a section
 	}
 
-	// Зоны (§5.1/§5.3) → зоны + итоги; вход скоростей (pending+queued).
-	// SummaryJSON встроена в Snapshot — поля присваиваются напрямую.
-	// Тяжёлые секции (T-161) идут через TTL-кэш status.Cache: в окне
-	// TTL проходы refresh переиспользуют последний ответ БД — ошибка
-	// кэша и есть ошибка выборки (не кэшируется, деградация секции
-	// остаётся видимой), отменённый ctx — как без кэша.
+	// Zones (§5.1/§5.3) → zones + totals; the input of rates
+	// (pending+queued). SummaryJSON is embedded in Snapshot — fields
+	// are assigned directly. Heavy sections (T-161) go through the
+	// status.Cache TTL cache: within the TTL window the refresh passes
+	// reuse the last DB answer — a cache error is the selection error
+	// (not cached, the section degradation stays visible), a cancelled
+	// ctx behaves as without the cache.
 	var tot status.Totals
 	zonesOK := false
 	zones, err := c.cache.ZoneStats(ctx, c.pool)
@@ -253,7 +271,7 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 		snap.Totals = &t
 	}
 
-	// Темп (§5.2).
+	// Throughput (§5.2).
 	var thr status.Throughput
 	thrOK := false
 	thr, err = c.cache.Throughput(ctx, c.pool)
@@ -265,16 +283,17 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 		snap.Throughput = &t
 	}
 
-	// Скорости/ETA (§5.1–5.2): производные обеих секций — деградация
-	// любой оставляет rates null.
+	// Rates/ETA (§5.1–5.2): derivatives of both sections — the
+	// degradation of either leaves rates null.
 	if zonesOK && thrOK {
 		r := status.RatesToJSON(status.ComputeRates(thr, tot.Pending, tot.Queued))
 		snap.Rates = &r
 	}
 
-	// Очереди (§5.4): nil-карта → null в JSON. Отдельный бюджет
-	// queueFetchTimeout — см. комментарий у переменной: зависший опрос
-	// Redis не должен блокировать цикл сборки и остальные секции.
+	// Queues (§5.4): a nil map → null in JSON. A separate
+	// queueFetchTimeout budget — see the comment at the variable: a
+	// hung Redis poll must not block the collection loop and the other
+	// sections.
 	qctx, cancel := context.WithTimeout(ctx, queueFetchTimeout)
 	lens, err := status.FetchQueueLens(qctx, c.lens)
 	cancel()
@@ -284,13 +303,13 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 		snap.Queues = lens
 	}
 
-	// Статусы доменов (§5.5) — тоже проход domains, кэш (T-161).
+	// Domain statuses (§5.5) — also a domains pass, the cache (T-161).
 	if snap.Statuses, err = c.cache.DomainStatuses(ctx, c.pool); err != nil {
 		snap.Statuses = nil
 		snap.Errors["statuses"] = err.Error()
 	}
 
-	// Laravel-находки (§5.6).
+	// Laravel finds (§5.6).
 	if laravel, err := status.FetchLaravelStats(ctx, c.pool); err != nil {
 		snap.Errors["laravel"] = err.Error()
 	} else {
@@ -307,7 +326,7 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 		}
 	}
 
-	// Журнал ingest (§5.7).
+	// Ingest log (§5.7).
 	if reports, err := status.FetchIngestReports(ctx, c.pool); err != nil {
 		snap.Errors["ingest"] = err.Error()
 	} else {
@@ -317,38 +336,39 @@ func (c *Collector) CollectOnce(ctx context.Context) *Snapshot {
 				Path: r.Path, Action: r.Action,
 				LinesTotal: r.LinesTotal, Added: r.Added, Existed: r.Existed,
 				Deleted: r.Deleted, Rejected: r.Rejected,
-				ProcessedAt: rfc3339Zero(r.ProcessedAt), // NULL processed_at — пусто
+				ProcessedAt: rfc3339Zero(r.ProcessedAt), // NULL processed_at — empty
 			})
 		}
 	}
 
-	// Панель движков рендера и фолбэка (ТЗ рендера §4.6 п.4, T-246):
-	// экспозиции /metrics рендер-воркеров + глубина q:render-fallback.
-	// Адреса не заданы — Render nil («н/д», не ошибка, стиль Health);
-	// ошибка сбора деградирует секцию (причина — в errors), остальные
-	// секции живут.
+	// Render engines panel and fallback (render spec §4.6 item 4,
+	// T-246): /metrics exposures of render workers + the
+	// q:render-fallback depth. Addresses not set — Render nil ("n/a",
+	// not an error, Health style); a collection error degrades the
+	// section (the reason is in errors), the other sections live.
 	if r, rerr := c.collectRender(ctx); rerr != nil {
 		snap.Errors["render"] = rerr.Error()
 	} else {
 		snap.Render = r
 	}
 
-	// Здоровье сервисов (§5.8): пробы параллельно; пустой список проб —
-	// секция «н/д» (null), не ошибка.
+	// Service health (§5.8): probes in parallel; an empty probe list —
+	// the section is "n/a" (null), not an error.
 	snap.Health = c.probeAll(ctx)
 	return snap
 }
 
-// queueWatermarks — эффективные пороги backpressure рабочих стримов для
-// подсветки очередей (§5.4): queue.StreamWatermark по каждому стриму
-// без q:dead (гейтом не ограничивается — backpressure.go). Тот же
-// единый расчёт, что у гейта публикации (T-026) и алерта переполнения
-// очередей монитора (T-080, T-144): порог стрима не выше половины его
-// предела MAXLEN — после T-141 это разные числа для разных стримов
-// (q:dns — 125 пачек, штучные — 75 000 при дефолтах), поэтому сумма
-// глубин против одного порога больше не осмысленна. Пересчитывается на
-// каждом проходе — снимок честен к текущим значениям опций.
-// Watermark ≤ 0 — все пороги 0 (гейт отключён).
+// queueWatermarks — the effective backpressure thresholds of the
+// working streams for queue highlighting (§5.4): queue.StreamWatermark
+// per stream except q:dead (not limited by the gate —
+// backpressure.go). The same single computation as in the publication gate
+// (T-026) and the monitor queue overflow alert (T-080, T-144): a
+// stream threshold is no higher than half its MAXLEN limit — after
+// T-141 these are different numbers for different streams (q:dns —
+// 125 chunks, single items — 75,000 at defaults), so the sum of
+// depths against a single threshold no longer makes sense. Recomputed
+// on every pass — the snapshot is honest to the current option values.
+// Watermark ≤ 0 — all thresholds 0 (the gate is off).
 func (c *Collector) queueWatermarks() map[string]int64 {
 	wm := make(map[string]int64, len(status.Streams))
 	for _, s := range status.Streams {
@@ -360,10 +380,11 @@ func (c *Collector) queueWatermarks() map[string]int64 {
 	return wm
 }
 
-// probeAll — пробы всех сервисов параллельно (§5.8), ответ отсортирован
-// по имени пробы (детерминированный JSON). Отмена ctx прерывает и сами
-// пробы (контекст запроса): собранные down-записи уходят вместе
-// с отменённым проходом — он не публикуется.
+// probeAll — probes of all services in parallel (§5.8), the response
+// sorted by probe name (deterministic JSON). A ctx cancellation
+// interrupts the probes themselves too (the request context): the
+// collected down records go away with the cancelled pass — it is not
+// published.
 func (c *Collector) probeAll(ctx context.Context) []ProbeJSON {
 	if len(c.opt.Probes) == 0 {
 		return nil
@@ -387,11 +408,12 @@ func (c *Collector) probeAll(ctx context.Context) []ProbeJSON {
 	return out
 }
 
-// probeOne — одна проба: GET base+"/livez" с таймаутом клиента
-// (probeTimeout). up — 200 OK; недоступность, таймаут и не-200 — down
-// с причиной (§5.8 «недоступен или таймаут»). URL собирается
-// JoinPath'ом: корректно и для базы с хвостовым слэшем, и для базы
-// с путём/query (валидация конфигурации допускает).
+// probeOne — a single probe: GET base+"/livez" with the client timeout
+// (probeTimeout). up — 200 OK; unavailability, timeout and non-200 —
+// down with a reason (§5.8 "unavailable or timed out"). The URL is
+// assembled with JoinPath: correct both for a base with a trailing
+// slash and for a base with a path/query (config validation allows
+// that).
 func (c *Collector) probeOne(ctx context.Context, name, base string) ProbeJSON {
 	u, err := url.Parse(base)
 	if err != nil {
@@ -413,11 +435,13 @@ func (c *Collector) probeOne(ctx context.Context, name, base string) ProbeJSON {
 	return ProbeJSON{Name: name, Up: true}
 }
 
-// Loop — фоновый цикл сборки (ТЗД §4.4): первый сбор сразу, далее с
-// периодом Interval; снимок атомарно заменяется. Ошибки секций — Warn с
-// картой причин и метрика result=error, цикл живёт (контракт OnRun);
-// отмена ctx — чистый nil (graceful shutdown). Сборка длиннее периода
-// просто сдвигает следующий тик (ticker не накапливает пропуски).
+// Loop — the background collection cycle (dashboard spec §4.4): the
+// first collection immediately, then with the Interval period; the
+// snapshot is replaced atomically. Section errors — Warn with a reason
+// map and the result=error metric, the loop lives (the OnRun
+// contract); a ctx cancellation — a clean nil (graceful shutdown). A
+// collection longer than the period simply shifts the next tick (the
+// ticker does not accumulate misses).
 func (c *Collector) Loop(ctx context.Context) error {
 	c.opt.Log.Info("цикл сборки снимков дашборда",
 		"interval", c.opt.Interval.String(), "probes", len(c.opt.Probes), "render_metrics", len(c.opt.RenderMetrics))
@@ -426,15 +450,15 @@ func (c *Collector) Loop(ctx context.Context) error {
 		started := time.Now()
 		snap := c.CollectOnce(ctx)
 		if ctx.Err() != nil {
-			return // отмена посреди прохода — часть остановки, не снимок
+			return // cancellation mid-pass — part of shutdown, not a snapshot
 		}
 		result := snapshotResultOK
 		if len(snap.Errors) > 0 {
 			result = snapshotResultError
 		}
-		// Успешный сбор — жив каркас сводки (Totals есть ⇔ секция зон
-		// собрана): очереди/пробы могут деградировать и дальше — их «н/д»
-		// обслуживаются (§5.9), а не держат 503.
+		// Successful collection — the summary skeleton is live (Totals
+		// exists ⇔ the zones section collected): queues/probes may keep
+		// degrading — their "n/a" is served (§5.9), not held at 503.
 		if snap.Totals != nil {
 			c.ready.Store(true)
 		}
@@ -460,20 +484,21 @@ func (c *Collector) Loop(ctx context.Context) error {
 	}
 }
 
-// --- метрики собственного сервиса (ТЗД §10) -----------------------------------
+// --- own-service metrics (dashboard spec §10) ----------------------------------
 
-// collectorMetrics — crawler_dashboard_snapshots_total{result} и
-// crawler_dashboard_snapshot_seconds; nil-приёмник — no-op (сборщик без
-// реестра, стиль monitor.NewNearGauge).
+// collectorMetrics — crawler_dashboard_snapshots_total{result} and
+// crawler_dashboard_snapshot_seconds; a nil receiver — no-op (a
+// collector without a registry, monitor.NewNearGauge style).
 type collectorMetrics struct {
 	snapshots *prometheus.CounterVec
 	seconds   prometheus.ObserverVec
 }
 
-// newCollectorMetrics — приборы в реестре reg (nil — nil). Корзины
-// гистограммы — экспонента от 50 мс до ~3 минут: сборка — это полные
-// проходы агрегатов (status §«агрегаты и окна»), на боевом корпусе
-// секунды, дефолтные корзины prometheus (потолок 10 с) малы.
+// newCollectorMetrics — the instruments in the reg registry
+// (nil — nil). The histogram buckets — exponent from 50 ms to ~3
+// minutes: a collection is full aggregate passes (status
+// §"aggregates and windows"), seconds on the production corpus — the
+// default prometheus buckets (a 10 s ceiling) are too small.
 func newCollectorMetrics(reg *metrics.Registry) *collectorMetrics {
 	if reg == nil {
 		return nil
@@ -491,7 +516,7 @@ func newCollectorMetrics(reg *metrics.Registry) *collectorMetrics {
 	}
 }
 
-// observe — фиксация прохода; nil — no-op.
+// observe — record a pass; nil — no-op.
 func (m *collectorMetrics) observe(result string, seconds float64) {
 	if m == nil {
 		return

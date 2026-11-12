@@ -1,8 +1,9 @@
-// Юнит-тесты фронта дашборда (T-130, ТЗД §6.1, §6.4–6.5): рендер
-// страницы за авторизацией (секции ru-разметки §5.1–5.9, подключение
-// статики, период опроса), роуты статики из embed (Content-Type,
-// ненулевые тела, 404 вне карты файлов), отсутствие внешних источников
-// (§3.2.2). Заголовки всех ответов — §6.3 (TestSecurityHeaders,
+// Unit tests of the dashboard front end (T-130, dashboard spec §6.1,
+// §6.4–6.5): rendering of the page behind authorization (the sections
+// of the ru markup §5.1–5.9, statics wiring, the polling period), the
+// statics routes from embed (Content-Type, non-empty bodies, 404
+// outside the file map), the absence of external sources (§3.2.2).
+// The headers of all responses — §6.3 (TestSecurityHeaders,
 // dashboard_test.go).
 package dashboard
 
@@ -14,13 +15,14 @@ import (
 	"testing"
 )
 
-// pageWants — обязательные строки разметки страницы: карточки итогов и
-// скоростей (§5.1–5.2), заголовки секций (§5.3–5.8), «н/д» до первого
-// снимка (§5.9), подключение статики и период опроса (§6.4).
+// pageWants — the mandatory strings of the page markup: totals and
+// rates cards (§5.1–5.2), section headings (§5.3–5.8), "n/a" before
+// the first snapshot (§5.9), statics wiring and the polling period
+// (§6.4).
 var pageWants = []string{
-	`<html lang="ru">`, // §6.5: русский язык интерфейса
+	`<html lang="ru">`, // §6.5: Russian interface language
 	"Дашборд Domain Crawler",
-	// Карточки §5.1–5.2.
+	// §5.1–5.2 cards.
 	"Всего доменов",
 	"Проверено",
 	"В работе",
@@ -29,25 +31,25 @@ var pageWants = []string{
 	"Ренд./с",
 	"ETA цикла",
 	"Laravel-находок",
-	// Секции §5.3–5.8.
+	// §5.3–5.8 sections.
 	"Очереди",
 	"Зоны",
 	"Статусы доменов",
 	"Последние находки Laravel",
 	"Последние ingest-файлы",
 	"Здоровье сервисов",
-	// §5.9: плейсхолдеры деградации до первого снимка/секции.
+	// §5.9: degradation placeholders before the first snapshot/section.
 	"н/д",
-	// Панель движков рендера (T-246).
+	// The render engines panel (T-246).
 	"Движки рендера",
-	// §6.4: конфигурация опроса и стили/скрипт только свои.
+	// §6.4: polling configuration and styles/script of our own only.
 	`<meta name="dashboard-refresh" content="5">`,
 	`<link rel="stylesheet" href="/assets/style.css">`,
 	`<script src="/assets/app.js" defer></script>`,
 }
 
-// TestIndexPage — GET / за авторизацией: страница дашборда из embed —
-// 200, text/html, все секции ru-разметки на месте.
+// TestIndexPage — GET / behind authorization: the dashboard page from
+// embed — 200, text/html, all ru markup sections in place.
 func TestIndexPage(t *testing.T) {
 	h := newTestServer(t, nil).Handler()
 
@@ -67,15 +69,15 @@ func TestIndexPage(t *testing.T) {
 			t.Errorf("GET /: разметка без %q:\n%s", want, body)
 		}
 	}
-	// Спарклайны скоростей — SVG polyline (§6.4).
+	// Rate sparklines — an SVG polyline (§6.4).
 	if !strings.Contains(body, "<polyline") {
 		t.Error("GET /: нет SVG polyline спарклайнов (§6.4)")
 	}
 }
 
-// TestIndexNoExternalSources — ТЗД §3.2.2: без внешних CDN, шрифтов
-// и счётчиков — в разметке нет ни одного внешнего адреса (свои
-// артефакты и API — относительные пути).
+// TestIndexNoExternalSources — dashboard spec §3.2.2: no external
+// CDNs, fonts or counters — the markup has not a single external
+// address (own artifacts and the API — relative paths).
 func TestIndexNoExternalSources(t *testing.T) {
 	h := newTestServer(t, nil).Handler()
 	body := doReq(h, http.MethodGet, "/", "10.0.0.30:3031", authed()).Body.String()
@@ -86,9 +88,10 @@ func TestIndexNoExternalSources(t *testing.T) {
 	}
 }
 
-// TestAssets — GET /assets/{app.js,style.css} за авторизацией: 200,
-// явные Content-Type (карта assetTypes, не системный mime-файл) и
-// ненулевые тела; имена вне карты и каталог — 404 без листинга.
+// TestAssets — GET /assets/{app.js,style.css} behind authorization:
+// 200, explicit Content-Type (the assetTypes map, not the system mime
+// file) and non-empty bodies; names outside the map and a directory —
+// 404 without listing.
 func TestAssets(t *testing.T) {
 	h := newTestServer(t, nil).Handler()
 
@@ -123,11 +126,12 @@ func TestAssets(t *testing.T) {
 	}
 }
 
-// TestServeAssetMissing — артефакт вне embed (ошибка сборки, а не
-// запроса): честный 500 «asset unavailable» и Error в лог с именем
-// артефакта. Белый ящик: через /assets/* ветку не достичь — имена
-// фильтруются картой assetTypes (404 раньше), поэтому serveAsset
-// вызывается напрямую с именем, которого нет в embed.
+// TestServeAssetMissing — an artifact outside embed (a build error,
+// not a request error): an honest 500 "asset unavailable" and an
+// Error in the log with the artifact name. White box: the /assets/*
+// branch cannot reach it — names are filtered by the assetTypes map
+// (404 earlier), so serveAsset is called directly with a name that is
+// not in embed.
 func TestServeAssetMissing(t *testing.T) {
 	var logs syncBuf
 	srv := newTestServer(t, func(o *Options) { o.Log = slog.New(slog.NewTextHandler(&logs, nil)) })

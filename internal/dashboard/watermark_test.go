@@ -1,13 +1,15 @@
-// Юнит-тесты эффективных порогов очередей снимка (T-144, ТЗД §5.4):
-// пороги подсветки дашборда — queue.StreamWatermark по каждому рабочему
-// стриму, тот же единый расчёт, что у алерта переполнения очередей
-// монитора (T-080: wm[s] = queue.StreamWatermark(QueueWatermark,
-// QueueMaxLen, s)) и гейта публикации (T-026) — второй копии формулы
-// нет, порог дашборда обязан равняться порогу монитора при любых
-// связках конфиг×MAXLEN: дефолты (кламп по T-141: q:dns — 125 пачек,
-// штучные — 75 000), явно заниженный watermark, нестандартный MaxLen,
-// отключённый гейт. Пороги — данные конфигурации: деградация Redis
-// (секция очередей) их не трогает.
+// Unit tests of the snapshot's effective queue thresholds (T-144,
+// dashboard spec §5.4): the dashboard highlight thresholds —
+// queue.StreamWatermark per each working stream, the same single
+// computation as the monitor queue overflow alert (T-080:
+// wm[s] = queue.StreamWatermark(QueueWatermark, QueueMaxLen, s)) and
+// the publication gate (T-026) — there is no second copy of the formula,
+// the dashboard threshold must equal the monitor threshold for any
+// config×MAXLEN combination: defaults (the T-141 clamp: q:dns — 125
+// chunks, single items — 75,000), an explicitly lowered watermark, a
+// non-standard MaxLen, a disabled gate. The thresholds are
+// configuration data: a Redis degradation (the queues section) does
+// not touch them.
 package dashboard
 
 import (
@@ -19,12 +21,13 @@ import (
 	"crawler/internal/status"
 )
 
-// TestQueueWatermarksSync — порог дашборда == порогу монитора: для
-// каждой связки QueueWatermark×QueueMaxLen и каждого рабочего стрима
-// значение снимка равно queue.StreamWatermark с теми же опциями
-// (ровно так считает алерт монитора, T-080); точные числа ключевых
-// связок — против ожиданий, чтобы связка с политикой T-141 не молчала
-// при регрессии. q:dead порога не имеет (гейтом не ограничивается).
+// TestQueueWatermarksSync — the dashboard threshold == the monitor
+// threshold: for every QueueWatermark×QueueMaxLen combination and each
+// working stream the snapshot value equals queue.StreamWatermark with
+// the same options (exactly how the monitor alert computes it, T-080);
+// the exact numbers of the key combinations are asserted against, so
+// that the combination with the T-141 policy does not stay silent on
+// regression. q:dead has no threshold (not limited by the gate).
 func TestQueueWatermarksSync(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -38,7 +41,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			map[string]int64{
 				queue.StreamDNS: 125, queue.StreamHTTP: 75000,
 				queue.StreamRender: 75000, queue.StreamAnalyze: 75000,
-				// q:render-fallback: MAXLEN 15 000 (политика T-237) → 7 500.
+				// q:render-fallback: MAXLEN 15,000 (the T-237 policy) → 7,500.
 				queue.StreamRenderFallback: 7500,
 			},
 		},
@@ -93,8 +96,9 @@ func TestQueueWatermarksSync(t *testing.T) {
 					}
 					continue
 				}
-				// Порог монитора: queue.StreamWatermark с теми же
-				// опциями (alerts.go, машина queue_overflow, T-080).
+				// The monitor threshold: queue.StreamWatermark with the
+				// same options (alerts.go, the queue_overflow machine,
+				// T-080).
 				monitorWM := queue.StreamWatermark(tc.watermark, tc.maxLen, s)
 				if got := snap.QueueWatermarks[s]; got != monitorWM {
 					t.Errorf("queue_watermarks[%s] = %d, хочу %d (порог монитора)", s, got, monitorWM)
@@ -107,10 +111,10 @@ func TestQueueWatermarksSync(t *testing.T) {
 	}
 }
 
-// TestQueueWatermarksNotSection — пороги подсветки не секция: отказ
-// Redis (деградация очередей) не трогает их — подсказка секции остаётся
-// оператору и при «н/д» глубин (§5.9: данные конфигурации, деградировать
-// не могут).
+// TestQueueWatermarksNotSection — highlight thresholds are not a
+// section: a Redis refusal (queue degradation) does not touch them —
+// the section hint stays with the operator even at "n/a" depths (§5.9:
+// configuration data, cannot degrade).
 func TestQueueWatermarksNotSection(t *testing.T) {
 	lens := &fakeLenner{}
 	lens.err.Store(errors.New("redis: timeout"))

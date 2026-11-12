@@ -1,6 +1,7 @@
-// Тесты хранения пароля дашборда (ТЗД §7.2–7.4): раундтрип
-// «генерация → разбор → сверка», неверный пароль, строгий разбор
-// формата, несовместимые параметры строки (итерации/длина ключа).
+// Tests of dashboard password storage (dashboard spec §7.2–7.4): the
+// "generate → parse → verify" roundtrip, a wrong password, strict
+// format parsing, incompatible string parameters (iterations/key
+// length).
 package auth
 
 import (
@@ -11,14 +12,16 @@ import (
 	"testing"
 )
 
-// fastIterations — итерации для тестов: раундтрип проверяет формат и
-// деривацию, а не стоимость KDF (600 000 итераций ≈ полсекунды).
+// fastIterations — test iterations: the roundtrip checks the format
+// and derivation, not the KDF cost (600,000 iterations ≈ half a
+// second).
 const fastIterations = 1000
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
-// Раундтрип: сгенерированная строка имеет форму ТЗД §7.2, разбирается
-// с исходными параметрами и сверяется только со своим паролем.
+// Roundtrip: the generated string has the dashboard spec §7.2 shape,
+// parses with the original parameters and verifies only against its
+// own password.
 func TestGenerateParseVerify(t *testing.T) {
 	const password = "правильный пароль s3cret!"
 	hash, err := Generate(password, fastIterations)
@@ -58,9 +61,10 @@ func TestGenerateParseVerify(t *testing.T) {
 	}
 }
 
-// iterations <= 0 — DefaultIterations (600 000, OWASP; ТЗД §7.2).
-// Сверка не повторяется: раундтрип сверен в TestGenerateParseVerify,
-// здесь — только заявленные при генерации итерации.
+// iterations <= 0 — DefaultIterations (600,000, OWASP; dashboard spec
+// §7.2). Verification is not repeated: the roundtrip is verified in
+// TestGenerateParseVerify, here — only the iterations declared at
+// generation.
 func TestGenerateDefaultIterations(t *testing.T) {
 	hash, err := Generate("пароль", 0)
 	if err != nil {
@@ -75,7 +79,7 @@ func TestGenerateDefaultIterations(t *testing.T) {
 	}
 }
 
-// Соль случайна: два хэша одного пароля различаются, оба сверяются.
+// The salt is random: two hashes of one password differ, both verify.
 func TestGenerateUniqueSalt(t *testing.T) {
 	h1, err := Generate("пароль", fastIterations)
 	if err != nil {
@@ -97,15 +101,16 @@ func TestGenerateUniqueSalt(t *testing.T) {
 	}
 }
 
-// Пустой пароль не хэшируется: креды обязательны (ТЗД §7.7).
+// An empty password is not hashed: credentials are mandatory
+// (dashboard spec §7.7).
 func TestGenerateEmptyPassword(t *testing.T) {
 	if _, err := Generate("", fastIterations); err == nil {
 		t.Errorf("Generate(пустой пароль): ожидалась ошибка")
 	}
 }
 
-// Строгий разбор: битые варианты строки отвергаются с указанием
-// компоненты (схема/итерации/соль/ключ).
+// Strict parsing: broken string variants are rejected with the
+// component named (scheme/iterations/salt/key).
 func TestParseErrors(t *testing.T) {
 	salt := b64(bytes.Repeat([]byte{0xAB}, MinSaltLen))
 	key := b64(bytes.Repeat([]byte{0xAB}, KeyLen))
@@ -142,11 +147,12 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
-// Несовместимые параметры строки. Подменённые итерации синтаксически
-// корректны (ТЗД §7.2: итерации читаются из строки) — но деривация
-// другая, сверки нет; это защита от «обновления» стойкости правкой
-// числа. Соль длиннее минимума — валидный формат (≥ 16 байт), сверка
-// работает.
+// Incompatible string parameters. Tampered iterations are
+// syntactically correct (dashboard spec §7.2: iterations are read
+// from the string) — but the derivation differs, there is no match;
+// this is protection against "upgrading" the strength by editing the
+// number. A salt longer than the minimum is a valid format (≥ 16
+// bytes), verification works.
 func TestVerifyIncompatibleParams(t *testing.T) {
 	hash, err := Generate("пароль", fastIterations)
 	if err != nil {
@@ -164,8 +170,8 @@ func TestVerifyIncompatibleParams(t *testing.T) {
 		t.Errorf("хэш с чужими итерациями сверился с паролем — деривация обязана отличаться")
 	}
 
-	// Соль 24 байта (≥ минимума) — допустимый формат: сборка строки из
-	// Derive сворачивается обратно.
+	// A 24-byte salt (≥ the minimum) is an acceptable format: the
+	// Derive string assembly folds back.
 	long := PasswordHash{Iterations: fastIterations, Salt: bytes.Repeat([]byte{7}, 24)}
 	key, err := long.Derive("пароль")
 	if err != nil {
@@ -190,10 +196,11 @@ func mustParse(t *testing.T, s string) PasswordHash {
 	return ph
 }
 
-// --- границы параметров (ТЗД §7.2: соль ≥ 16, итерации ≥ 1) ------------------
+// --- parameter boundaries (dashboard spec §7.2: salt ≥ 16, iterations ≥ 1) ----
 
-// TestGenerateSaltLen — соль генерации ровно 16 байт, литералом: символ
-// MinSaltLen следовал бы за мутантом константы и не фиксировал бы длину.
+// TestGenerateSaltLen — the generation salt is exactly 16 bytes, by a
+// literal: the MinSaltLen symbol would follow the constant's mutant
+// and would not fix the length.
 func TestGenerateSaltLen(t *testing.T) {
 	hash, err := Generate("пароль", fastIterations)
 	if err != nil {
@@ -208,9 +215,10 @@ func TestGenerateSaltLen(t *testing.T) {
 	}
 }
 
-// TestParseSaltBounds — граница минимума соли при разборе: ровно 16 байт —
-// валидна, 15 — отказ с порогом в тексте. Литералы 16/15 держат мутанты
-// MinSaltLen±1 (символ константы в тесте следовал бы за мутантом).
+// TestParseSaltBounds — the minimum salt boundary at parsing: exactly
+// 16 bytes is valid, 15 is a refusal with the threshold in the text.
+// The 16/15 literals hold the MinSaltLen±1 mutants (the constant's
+// symbol in the test would follow the mutant).
 func TestParseSaltBounds(t *testing.T) {
 	key := b64(bytes.Repeat([]byte{0xAB}, 32))
 	exact := Scheme + "$1000$" + b64(bytes.Repeat([]byte{0xC1}, 16)) + "$" + key
@@ -223,9 +231,9 @@ func TestParseSaltBounds(t *testing.T) {
 	}
 }
 
-// TestGenerateOneIteration — итерации 1: уже положительное целое, дефолт
-// не включается (граница «<= 0» против «<= 1»); сверка с одной итерацией
-// работает.
+// TestGenerateOneIteration — iterations 1: already a positive integer,
+// the default does not kick in (the "<= 0" boundary against "<= 1");
+// verification with one iteration works.
 func TestGenerateOneIteration(t *testing.T) {
 	hash, err := Generate("пароль", 1)
 	if err != nil {
@@ -240,11 +248,11 @@ func TestGenerateOneIteration(t *testing.T) {
 	}
 }
 
-// TestParseIterationBounds — границы итераций при разборе: ровно 1 —
-// валидно (мутанты «< 1» → «<= 1»/«< 2»); переполнение Atoi — отказ
-// (вырезание «err != nil» пропускало бы зажатый к MaxInt64 интервал);
-// текст ошибки называет компоненту итераций (мутанты parts[1] → parts[0]
-// и parts[2]).
+// TestParseIterationBounds — iteration boundaries at parsing: exactly
+// 1 is valid (the "< 1" → "<= 1"/"< 2" mutants); an Atoi overflow is
+// a refusal (cutting "err != nil" would let through the interval
+// clamped to MaxInt64); the error text names the iterations component
+// (the parts[1] → parts[0] and parts[2] mutants).
 func TestParseIterationBounds(t *testing.T) {
 	salt := b64(bytes.Repeat([]byte{0xC1}, 16))
 	key := b64(bytes.Repeat([]byte{0xAB}, 32))
@@ -263,9 +271,9 @@ func TestParseIterationBounds(t *testing.T) {
 	}
 }
 
-// TestVerifyZeroHash — нулевой PasswordHash (сконструирован вне Parse)
-// никогда не сверяется: вырожденная деривация не совпадает с пустым
-// ключом (subtle сравнивает длины — 32 против 0).
+// TestVerifyZeroHash — a zero PasswordHash (constructed outside Parse)
+// never verifies: the degenerate derivation does not match an empty
+// key (subtle compares lengths — 32 against 0).
 func TestVerifyZeroHash(t *testing.T) {
 	if (PasswordHash{}).Verify("пароль") {
 		t.Error("Verify на нулевом хэше = true, хочу false")

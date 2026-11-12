@@ -1,30 +1,34 @@
-// Панель движков рендера и фолбэка (ТЗ рендера §4.6 п.4, T-246; полнота
-// ТЗ — S-P3-2): темп, успешность и тарпит-рейт рендера по движкам
-// (метки engine счётчиков этапа, T-235/S-P2-4), RSS воркеров движка,
-// fallback-рейт — published/страницы этапа — и потребление
-// (consumed/глубина q:render-fallback).
+// The render engines panel and fallback (render spec §4.6 item 4,
+// T-246; the S-P3-2 completeness): render rate, success and tarpit
+// rate per engines (the engine labels of stage counters,
+// T-235/S-P2-4), the RSS of the engine's workers, the fallback rate —
+// published/stage pages — and consumption (consumed/the
+// q:render-fallback depth).
 //
-// Источники — HTTP-экспозиции /metrics рендер-воркеров
-// (dashboard.render_metrics_urls: основная сборка — движок этапа,
-// сборка воркера B — потребление фолбэка): те же адреса, что скрейпит
-// Prometheus (прецедент — зонд ingest у monitor, T-099), без
-// промежуточной БД — счётчики живут у владельца данных, атрибуция по
-// движкам существует только там (схема БД движка не знает, ТЗ рендера
-// §4.8). Глубина q:render-fallback — тот же общий расчёт глубины, что у
-// секции очередей (c.lens, GroupDepth через гейт), не метрика сборки B:
-// при остановленном B ряд отсутствует, а остаток очереди — именно то,
-// что оператору нужно видеть.
+// The sources are HTTP /metrics exposures of render workers
+// (dashboard.render_metrics_urls: the main build — the stage engine,
+// the worker B build — the fallback consumption): the same addresses
+// Prometheus scrapes (the precedent — the monitor ingest probe,
+// T-099), without an intermediate DB — the counters live with the
+// data owner, and the per-engine attribution exists only there (the
+// DB schema does not know engines, render spec §4.8). The
+// q:render-fallback depth — the same common depth computation as the
+// queues section (c.lens, GroupDepth via the gate), not a build-B
+// metric: with B stopped the series is absent, and the queue
+// remainder is exactly what the operator needs to see.
 //
-// Темп (ренд./с, публикации/с) — дельта кумулятивов между проходами
-// сборщика в памяти Collector'а: окно = период refresh (5 с на
-// дефолте), фронт сглаживает историей опросов. Рестарт воркера
-// (кумулятив упал) даёт нулевую дельту — серии не рвутся, всплеска нет.
+// The rate (renders/s, publications/s) — the delta of cumulatives
+// between collector passes in the Collector's memory: the window =
+// the refresh period (5 s at the default), the front smooths with the
+// polling history. A worker restart (the cumulative dropped) yields a
+// zero delta — the series are not broken, no spike.
 //
-// Деградация — как у секций снимка (§5.9): список адресов пуст —
-// Render = nil («н/д», не ошибка — стиль Health без проб); ошибка
-// любого воркера деградирует секцию целиком (причина — в errors):
-// полупустая панель вводила бы в заблуждение (движок «пропал» из
-// агрегата неотличим от нулевого потока).
+// Degradation — like the snapshot sections (§5.9): the address list
+// is empty — Render = nil ("n/a", not an error — Health style without
+// probes); an error of any worker degrades the whole section (the
+// reason is in errors): a half-empty panel would be misleading (an
+// engine "missing" from the aggregate is indistinguishable from a
+// zero flow).
 package dashboard
 
 import (
@@ -44,37 +48,40 @@ import (
 	"crawler/internal/queue"
 )
 
-// Имена приборов этапа рендера в экспозиции (internal/renderworker/
-// metrics.go): фиксированный срез — полноценный парсер экспозиции
-// (expfmt) не окупает зависимость (прецедент — monitor/badhashes.go).
+// The names of the stage render instruments in the exposure
+// (internal/renderworker/metrics.go): a fixed slice — a full-fledged
+// exposure parser (expfmt) does not pay for the dependency (the
+// precedent — monitor/badhashes.go).
 const (
 	renderRecordsMetric   = "crawler_render_records_total"            // {rendered,engine} (T-235)
 	renderFinalizedMetric = "crawler_render_task_finalized_total"     // {reason,engine} (T-172/T-235)
 	renderTarpitMetric    = "crawler_render_tarpit_finalized_total"   // {engine} (T-148/S-P2-4)
 	fbPublishedMetric     = "crawler_render_fallback_published_total" // {reason} (T-238)
 	fbConsumedMetric      = "crawler_render_fallback_consumed_total"  // {result} (T-245)
-	stageTasksMetric      = "crawler_stage_tasks_total"               // {stage} — знаменатель fallback-рейта (S-P3-2)
-	processRSSMetric      = "process_resident_memory_bytes"           // стандартный process-collector — RSS воркера (S-P3-2)
+	stageTasksMetric      = "crawler_stage_tasks_total"               // {stage} — the fallback rate denominator (S-P3-2)
+	processRSSMetric      = "process_resident_memory_bytes"           // the standard process collector — the worker RSS (S-P3-2)
 )
 
-// renderBodyLimit — потолок чтения тела /metrics: реестр воркера несёт
-// коллекторы Go/runtime и процесса (десятки КиБ), потолок — защита от
-// неадекватного ответа, не оценка размера (стиль monitor.badHashesBodyLimit).
+// renderBodyLimit — the ceiling for reading the /metrics body: the
+// worker registry carries Go/runtime and process collectors (tens of
+// KiB), the ceiling — protection against an inadequate response, not
+// a size estimate (monitor.badHashesBodyLimit style).
 const renderBodyLimit = 4 << 20
 
-// promSample — сэмпл exposition text format: имя, метки, значение.
+// promSample — an exposition text format sample: the name, labels,
+// value.
 type promSample struct {
 	Name   string
 	Labels map[string]string
 	Value  float64
 }
 
-// parsePromExposition — минимальный разбор exposition text format
-// (сэмплы с метками и без; HELP/TYPE пропускаются). Свой парсер вместо
-// expfmt: зависимость prometheus/common в графе модуля indirect, панели
-// достаточно фиксированного среза приборов (подход — fixturesParseProm
-// Metrics инструмента сравнения движков T-244, своя копия: пакет main не
-// импортируется).
+// parsePromExposition — a minimal exposition text format parse
+// (samples with and without labels; HELP/TYPE skipped). An own parser
+// instead of expfmt: the prometheus/common dependency in the module
+// graph is indirect, the panel needs only the fixed instrument slice
+// (the approach — fixturesParseProm Metrics of the T-244 engine
+// comparison tool, own copy: the main package is not imported).
 func parsePromExposition(r io.Reader) ([]promSample, error) {
 	var out []promSample
 	sc := bufio.NewScanner(io.LimitReader(r, renderBodyLimit))
@@ -101,8 +108,9 @@ func parsePromExposition(r io.Reader) ([]promSample, error) {
 			name = fields[0]
 			rest = strings.TrimPrefix(strings.TrimSpace(line), name)
 		}
-		// Значение — первый токен после имени/меток; таймстамп и
-		// exemplar-хвост OpenMetrics не наш случай, отрезаются.
+		// The value — the first token after the name/labels; the
+		// timestamp and OpenMetrics exemplar tail are not our case and
+		// are cut off.
 		if i := strings.Index(rest, " #"); i >= 0 {
 			rest = rest[:i]
 		}
@@ -126,8 +134,9 @@ func parsePromExposition(r io.Reader) ([]promSample, error) {
 	return out, nil
 }
 
-// promLabelsEnd — индекс '}' закрывающей список меток (start — индекс
-// открывающей '{'); '}' и '{' внутри кавычек значений — часть значения.
+// promLabelsEnd — the index of the '}' closing the label list (start —
+// the index of the opening '{'); '}' and '{' inside value quotes are
+// part of the value.
 func promLabelsEnd(s string, start int) int {
 	inQuote := false
 	for i := start + 1; i < len(s); i++ {
@@ -143,9 +152,9 @@ func promLabelsEnd(s string, start int) int {
 	return -1
 }
 
-// parsePromLabels — список меток name="value" через запятую (пустая
-// строка — без меток). Разделитель — запятая вне кавычек: запятая внутри
-// значения легальна (text format).
+// parsePromLabels — a list of name="value" labels separated by commas
+// (an empty string — no labels). The separator is a comma outside
+// quotes: a comma inside a value is legal (text format).
 func parsePromLabels(s string) (map[string]string, error) {
 	if strings.TrimSpace(s) == "" {
 		return nil, nil
@@ -178,7 +187,7 @@ func parsePromLabels(s string) (map[string]string, error) {
 	return labels, nil
 }
 
-// promLabelPair — одна пара name="value" в карту меток.
+// promLabelPair — one name="value" pair into the label map.
 func promLabelPair(pair string, labels map[string]string) error {
 	pair = strings.TrimSpace(pair)
 	if pair == "" {
@@ -192,8 +201,8 @@ func promLabelPair(pair string, labels map[string]string) error {
 	return nil
 }
 
-// promUnescape — экраны значений меток text format: \\, \" и \n;
-// неизвестный экран сохраняется буквально (обратный слэш + символ).
+// promUnescape — the text format label value escapes: \\, \" and \n;
+// an unknown escape is kept literally (a backslash + the character).
 func promUnescape(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
@@ -212,22 +221,23 @@ func promUnescape(s string) string {
 	return b.String()
 }
 
-// renderCounters — агрегированные кумулятивы панели со всех воркеров:
-// суммирование по движкам/исходам (несколько сборок одного движка —
-// один браузерный стек класса, панель показывает движок, не воркера).
+// renderCounters — the panel's aggregated cumulatives across all
+// workers: summing per engines/outcomes (several builds of one engine
+// — one browser stack of the class, the panel shows the engine, not
+// the worker).
 type renderCounters struct {
 	rendered  map[string]float64 // engine → rendered="true" (T-235)
-	finalized map[string]float64 // engine → Σ task_finalized по причинам
+	finalized map[string]float64 // engine → Σ task_finalized over reasons
 	tarpits   map[string]float64 // engine → tarpit_finalized (T-148/S-P2-4)
-	published float64            // Σ fallback_published по причинам (T-238)
+	published float64            // Σ fallback_published over reasons (T-238)
 	consumed  map[string]float64 // result → fallback_consumed (T-245)
-	tasks     float64            // Σ stage_tasks{stage="render"} — страницы этапа (S-P3-2)
-	rss       map[string]float64 // engine → Σ RSS воркеров движка (S-P3-2)
+	tasks     float64            // Σ stage_tasks{stage="render"} — stage pages (S-P3-2)
+	rss       map[string]float64 // engine → Σ RSS of the engine's workers (S-P3-2)
 }
 
-// collectRenderCounters — скрейп всех экспозиций параллельно (стиль
-// probeAll: таймаут клиента probeTimeout, не сумма N запросов) и
-// сведение сэмплов в агрегат.
+// collectRenderCounters — a scrape of all exposures in parallel (the
+// probeAll style: the probeTimeout client timeout, not the sum of N
+// requests) and a reduction of the samples into an aggregate.
 func (c *Collector) collectRenderCounters(ctx context.Context) (renderCounters, error) {
 	urls := c.opt.RenderMetrics
 	if len(urls) == 0 {
@@ -270,9 +280,9 @@ func (c *Collector) collectRenderCounters(ctx context.Context) (renderCounters, 
 	return agg, nil
 }
 
-// fetchRenderMetrics — GET одной экспозиции (клиент проб: таймаут
-// probeTimeout, без редиректов — исходящие соединения только на
-// настроенные адреса, ТЗД §9.3).
+// fetchRenderMetrics — a GET of one exposure (the probe client: the
+// probeTimeout timeout, no redirects — outgoing connections to the
+// configured addresses only, dashboard spec §9.3).
 func (c *Collector) fetchRenderMetrics(ctx context.Context, raw string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
@@ -293,15 +303,17 @@ func (c *Collector) fetchRenderMetrics(ctx context.Context, raw string) ([]byte,
 	return body, nil
 }
 
-// add — сведение сэмплов одной экспозиции в агрегат: знакомые приборы
-// по именам, ветки — по меткам (rendered="true"; engine у доли рендера,
-// тарпитов и финализаций класса задачи; reason у публикаций не
-// различается — публике нужен темп; result у потребления; stage="render"
-// у страниц этапа). RSS экспозиции (process_resident_memory_bytes, без
-// меток) атрибутируется движку сборки воркера — метке engine
-// предсозданной серии rendered="true" (NewMetrics, T-235: серия в
-// экспозиции с первого старта); сборка без метки (старее T-235) — RSS
-// не атрибутируется, пропускается.
+// add — a reduction of one exposure's samples into the aggregate:
+// familiar instruments by name, branches — by labels
+// (rendered="true"; engine for the render share, tarpits and the task
+// class finalizations; reason of publications is not distinguished —
+// the public needs the rate; result for consumption; stage="render"
+// for stage pages). The exposure RSS
+// (process_resident_memory_bytes, unlabeled) is attributed to the
+// build engine of the worker — the engine label of the pre-created
+// rendered="true" series (NewMetrics, T-235: the series is in the
+// exposure from the first start); a build without the label (older
+// than T-235) — the RSS is not attributed, skipped.
 func (a *renderCounters) add(samples []promSample) {
 	engine := ""
 	for _, s := range samples {
@@ -346,9 +358,10 @@ func (a *renderCounters) add(samples []promSample) {
 	}
 }
 
-// renderRateState — память темпов панели между проходами: прошлый
-// агрегат и момент. Живёт в Collector (не в снимке), первый проход —
-// база (темпы 0), рестарт воркера (кумулятив упал) — нулевая дельта.
+// renderRateState — the panel rate memory between passes: the previous
+// aggregate and moment. Lives in the Collector (not in the snapshot),
+// the first pass — the baseline (rates 0), a worker restart (the
+// cumulative dropped) — a zero delta.
 type renderRateState struct {
 	seen      bool
 	at        time.Time
@@ -357,8 +370,8 @@ type renderRateState struct {
 	consumed  float64
 }
 
-// rateOf — дельта кумулятива за Δt; prev < cur — рост (делится на окно),
-// иначе 0 (нет базы / рестарт / стагнация).
+// rateOf — the cumulative delta over Δt; prev < cur — growth (divided
+// by the window), otherwise 0 (no baseline / restart / stagnation).
 func rateOf(prev, cur float64, dt time.Duration) float64 {
 	if dt <= 0 || cur <= prev {
 		return 0
@@ -366,9 +379,9 @@ func rateOf(prev, cur float64, dt time.Duration) float64 {
 	return (cur - prev) / dt.Seconds()
 }
 
-// observe — темпы прохода: дельты агрегата к прошлому проходу и
-// обновление базы. Движок, отсутствовавший в базе, темпа не имеет
-// (нулевой), но базируется на текущем значении.
+// observe — the pass rates: the aggregate deltas to the previous pass
+// and a baseline update. An engine missing from the baseline has no
+// rate (zero) but is based on the current value.
 func (s *renderRateState) observe(cur renderCounters, now time.Time) renderRates {
 	dt := time.Duration(0)
 	if s.seen {
@@ -401,18 +414,19 @@ func (s *renderRateState) observe(cur renderCounters, now time.Time) renderRates
 	return out
 }
 
-// renderRates — темпы одного прохода (ренд./с по движкам, публикации/с,
-// потребление/с).
+// renderRates — the rates of one pass (renders/s per engines,
+// publications/s, consumption/s).
 type renderRates struct {
 	rendered  map[string]float64
 	published float64
 	consumed  float64
 }
 
-// collectRender — секция панели движков: агрегат экспозиций + темпы +
-// глубина q:render-fallback (тем же lens, что у секции очередей; ошибка
-// глубины не роняет секцию — Depth = nil «н/д», причина видна в errors
-// секции queues). nil-возврат без ошибки — адреса не заданы («н/д»).
+// collectRender — the engines panel section: the exposure aggregate +
+// rates + the q:render-fallback depth (the same lens as the queues
+// section; a depth error does not take down the section — Depth = nil
+// "n/a", the reason is visible in the errors of the queues section).
+// A nil return without an error — addresses not set ("n/a").
 func (c *Collector) collectRender(ctx context.Context) (*RenderJSON, error) {
 	if len(c.opt.RenderMetrics) == 0 {
 		return nil, nil
@@ -453,15 +467,17 @@ func (c *Collector) collectRender(ctx context.Context) (*RenderJSON, error) {
 			RSSBytes:       int64(agg.rss[e]),
 			RenderedPerSec: rates.rendered[e],
 		}
-		// Успешность — знаменатель прежний (rendered+finalized,
-		// решение оператора по S-P2-4): тарпит — отдельной колонкой.
+		// Success — the same denominator (rendered+finalized, the
+		// operator decision on S-P2-4): the tarpit is a separate
+		// column.
 		if denom := agg.rendered[e] + agg.finalized[e]; denom > 0 {
 			pct := 100 * agg.rendered[e] / denom
 			row.SuccessPct = &pct
 		}
-		// Тарпит-рейт — доля тарпит-финализаций среди всех завершений
-		// движка с меткой engine (кумулятивы, как успешность: свежий
-		// воркер без завершений — nil «—»).
+		// The tarpit rate — the share of tarpit finalizations among all
+		// finalizations of the engine with the engine label
+		// (cumulatives, like success: a fresh worker without
+		// finalizations — nil "—").
 		if denom := agg.rendered[e] + agg.finalized[e] + agg.tarpits[e]; denom > 0 {
 			pct := 100 * agg.tarpits[e] / denom
 			row.TarpitPct = &pct
@@ -472,17 +488,18 @@ func (c *Collector) collectRender(ctx context.Context) (*RenderJSON, error) {
 		out.Fallback.ConsumedByResult[r] = int64(v)
 		out.Fallback.ConsumedTotal += int64(v)
 	}
-	// Fallback-рейт — доля публикаций от страниц этапа: числитель —
-	// published воркера A, знаменатель — Σ stage_tasks{stage="render"}
-	// всех экспозиций (воркеры A+B, те же единицы, что окно бюджета
-	// T-239); nil — этап ещё не обработал ни одной страницы.
+	// The fallback rate — the share of publications of stage pages:
+	// the numerator — worker A published, the denominator — Σ
+	// stage_tasks{stage="render"} of all exposures (workers A+B, the
+	// same units as the T-239 budget window); nil — the stage has not
+	// processed a single page yet.
 	if agg.tasks > 0 {
 		pct := 100 * agg.published / agg.tasks
 		out.Fallback.RatePct = &pct
 	}
 
-	// Глубина q:render-fallback — тем же lens и бюджетом, что секция
-	// очередей: ошибка — Depth nil («н/д»), секция жива.
+	// The q:render-fallback depth — the same lens and budget as the
+	// queues section: an error — Depth nil ("n/a"), the section alive.
 	if c.lens != nil {
 		qctx, cancel := context.WithTimeout(ctx, queueFetchTimeout)
 		depth, derr := c.lens.Len(qctx, queue.StreamRenderFallback)
