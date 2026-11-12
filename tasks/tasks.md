@@ -1,312 +1,316 @@
-# Декомпозиция ТЗ «Сервис массовой проверки доменов и поиска сайтов на Laravel»
+# Breakdown of the Specification “Mass Domain Verification and Laravel Site Search Service”
 
-Источник: [`TZ_domain_crawler.md`](./TZ_domain_crawler.md) (версия 1.2).
-Дополнительные ТЗ этапов: [`TZ_dashboard.md`](./TZ_dashboard.md) —
-операторский веб-дашборд конвейера (этап 15);
-[`TZ_render_engines.md`](./TZ_render_engines.md) — выбор движка рендера
-(Chromium/Moli/Lightpanda) и очередь фолбэка (этап 35);
-[`TZ-fsm.md`](./TZ-fsm.md) — формализация неявных конечных автоматов
-конвейера (этап 37, аудит 2026-11-06).
+Source: [`TZ_domain_crawler.md`](./TZ_domain_crawler.md) (version 1.2).
+Additional stage specs: [`TZ_dashboard.md`](./TZ_dashboard.md) —
+the operator web dashboard of the pipeline (stage 15);
+[`TZ_render_engines.md`](./TZ_render_engines.md) — render engine selection
+(Chromium/Moli/Lightpanda) and the fallback queue (stage 35);
+[`TZ-fsm.md`](./TZ-fsm.md) — formalization of the pipeline's implicit
+finite-state machines (stage 37, audit 2026-11-06).
 
-## Как работать с файлом
+## How to work with this file
 
-- Задачи пронумерованы `T-001…T-249` и упорядочены по выполнению (сверху вниз).
-- Статус задачи — метка в квадратных скобках, меняется редактированием:
-  - `[новая]` — задача не начата;
-  - `[в работе]` — задача выполняется;
-  - `[сделана]` — задача завершена; по завершении волны строка задачи
-    переносится в архив [`tasks_done.md`](./tasks_done.md) — здесь остаются
-    только незавершённые задачи.
-- Пример: `- **T-001** [в работе] — …`
-- Внутри этапа задачи по возможности выполняются параллельно; между этапами — последовательно.
-- Отступление от порядка этапов ТЗ §12: **хранилище контента** (этап 4, архив)
-  реализовано до HTTP-этапа, т.к. `http-worker` сохраняет контент через
-  `ContentStore` (ТЗ §5.5, §5.7).
+- Tasks are numbered `T-001…T-249` and ordered by execution (top to bottom).
+- A task status is a bracketed label, changed by editing:
+  - `[new]` — task not started;
+  - `[in progress]` — task underway;
+  - `[done]` — task completed; when a wave finishes, its task lines move
+    to the archive [`tasks_done.md`](./tasks_done.md) — only unfinished
+    tasks remain here.
+- Example: `- **T-001** [in progress] — …`
+- Within a stage, tasks run in parallel where possible; between stages — sequentially.
+- Deviation from the spec §12 stage order: the **content store** (stage 4, archive)
+  was implemented before the HTTP stage, since `http-worker` saves content through
+  `ContentStore` (spec §5.5, §5.7).
 
-## Оглавление этапов
+## Stage index
 
-Завершены и перенесены в архив [`tasks_done.md`](tasks_done.md): этапы
-0–34 (перенос 2026-11-03), кодовая часть этапа 35 (T-233…T-246 —
-движки рендера и очередь фолбэка), этап 36 (T-250…T-254 — фиксы
-сверхраунда ревью), этап 37 (T-255…T-266 — формализация неявных
-конечных автоматов, ТЗ [`TZ-fsm.md`](TZ-fsm.md)), этап 38
-(T-267…T-268 — дедлоки зон × счётчиков, инциденты 40P01 07.11.2026)
-и этап 39 (T-269 — рассинхрон счётчика render_pending, инцидент
-08.11.2026); последний перенос 2026-11-08. В активной работе —
-только операционные задачи этапа 35: **T-247…T-249** (стендовые
-прогоны движков, разворачивание на проде, канарейка —
-последовательны), этап 40: **T-270** — компенсатор «статус повис»
-new∧done (по итогам анализа прод-инцидента 22–29.10.2026, датчик
-T-256) и этап 41: **T-271** — хотфикс OOM PG из-за курсорных
-выборок retention/render-late (прод-инцидент 08–09.11.2026, цикл
- hourly-киллов активен). Этап 42: **T-272** — пере-тест moli v1.1.23
- (upstream-фикс Fetch.enable Font — наш PR #2470 — вышел в релизе
- 09.11.2026; план пере-теста из T-247). Этап 43: **T-273** — хотфикс
- регрессии T-271: вечная петля обречённых курсорных выборок
- retention/render-late (прод-инцидент 09–10.11.2026, retention мёртв).
- Этап 44: **T-274** — устойчивость retention к рестартам: конфиг-ключ
- потолка выборки (7200 с) + персистентный курсор дренажа (каждый
- рестарт http-worker сейчас = новый часовой catch-up с нуля).
+Completed and moved to the archive [`tasks_done.md`](tasks_done.md): stages
+0–34 (moved 2026-11-03), the code part of stage 35 (T-233…T-246 —
+render engines and the fallback queue), stage 36 (T-250…T-254 — extra
+review-round fixes), stage 37 (T-255…T-266 — formalization of implicit
+finite-state machines, spec [`TZ-fsm.md`](TZ-fsm.md)), stage 38
+(T-267…T-268 — zone × counter deadlocks, the 40P01 incidents of 07.11.2026)
+and stage 39 (T-269 — render_pending counter desync, incident
+08.11.2026); last move 2026-11-08. Active work covers
+only the operational tasks of stage 35: **T-247…T-249** (bench
+runs of the engines, production rollout, the canary —
+sequential), stage 40: **T-270** — the “stuck status” new∧done
+compensator (based on the analysis of the production incident of 22–29.10.2026,
+the T-256 gauge) and stage 41: **T-271** — the hotfix for PG OOM caused by
+cursor selects of retention/render-late (production incident 08–09.11.2026, the
+hourly-kill cycle is active). Stage 42: **T-272** — the moli v1.1.23
+re-test (the upstream fix for Fetch.enable Font — our PR #2470 — shipped in
+the release of 09.11.2026; re-test plan from T-247). Stage 43: **T-273** — the
+hotfix for the T-271 regression: the eternal loop of doomed cursor
+selects of retention/render-late (production incident 09–10.11.2026, retention is dead).
+Stage 44: **T-274** — retention restart resilience: the select
+cap config key (7200 s) + a persistent drain cursor (every
+http-worker restart currently means a new hour-long catch-up from scratch).
 
-## Этап 35: выбор движка рендера и очередь фолбэка (T-233…T-249)
+## Stage 35: render engine selection and the fallback queue (T-233…T-249)
 
-Источник: [`TZ_render_engines.md`](./TZ_render_engines.md) (версия 0.1).
-Ссылки «§» и «ФТ» в задачах — на разделы и функциональные требования
-этого ТЗ. Волны параллельности: A (T-233/236/237/241/242 — независимы,
-запускаются одновременно в отдельных worktree), B (T-234/238/243),
-C (T-235/239/240/244), D (T-245/246), затем операционные T-247…T-249
-(последовательны). Каждая задача атомарна: один mergeable блок,
-зелёные `make test`/`make lint` до передачи в ревью.
+Source: [`TZ_render_engines.md`](./TZ_render_engines.md) (version 0.1).
+The “§” and “FR” references in tasks point to the sections and functional
+requirements of that spec. Parallelism waves: A (T-233/236/237/241/242 — independent,
+started simultaneously in separate worktrees), B (T-234/238/243),
+C (T-235/239/240/244), D (T-245/246), then operational T-247…T-249
+(sequential). Each task is atomic: one mergeable block,
+green `make test`/`make lint` before handing off to review.
 
 
-*(кодовая часть T-233…T-246 — волны A–D — перенесена в архив [`tasks_done.md`](tasks_done.md) 2026-11-08; ниже — только операционные задачи)*
+*(the code part of T-233…T-246 — waves A–D — moved to the archive [`tasks_done.md`](tasks_done.md) on 2026-11-08; only operational tasks below)*
 
-### Операционные (последовательные)
+### Operational (sequential)
 
-- **T-247** [новая] — P1, стендовое сравнение движков и вердикты
-  готовности к канарейке (ТЗ §5.1; зависит от T-234, T-241, T-243,
-  T-244; T-254 — smoke-прологи движков). Не код: прогоны трёх движков ×
-  выборка 3000 дважды (контроль вариативности), baseline — свежий
-  chromium-прогон на той же выборке; отчёты T-244 против порогов §5.1
-  п.4 (детекция <1%, успешность «движок+фолбэк» ≥ baseline минус
-  движко-независимые потери, темп не хуже, память <⅓ бюджета chromium,
-  0 crashes); по каждому кандидату — вердикт «готов/не готов сейчас» с
-  метриками (prod-reports/ или docs). Кандидаты НЕ отсекаются (решение
-  оператора 2026-11-06, ТЗ v0.3): оба движка — постоянные кандидаты,
-  неготовые получают план пере-теста с новыми pinned-версиями (smoke
-  ФТ-17/T-254), периодичность — по релизам движков.
-  Критерий: отчёты сохранены, вердикт по каждому кандидату явно
-  зафиксирован против порогов; для неготовых — записан план пере-теста.
+- **T-247** [new] — P1, bench comparison of the engines and canary-readiness
+  verdicts (spec §5.1; depends on T-234, T-241, T-243,
+  T-244; T-254 — engine smoke preliminaries). Not code: runs of the three engines ×
+  a 3000-domain sample twice (variability control), baseline — a fresh
+  chromium run on the same sample; the T-244 reports against the §5.1
+  item 4 thresholds (detection <1%, “engine+fallback” success ≥ baseline minus
+  engine-independent losses, throughput no worse, memory <⅓ of the chromium
+  budget, 0 crashes); per candidate — a “ready/not ready now” verdict with
+  metrics (prod-reports/ or docs). Candidates are NOT cut (operator decision
+  2026-11-06, spec v0.3): both engines stay permanent candidates,
+  unready ones get a re-test plan with new pinned versions (smoke
+  FR-17/T-254), the cadence follows engine releases.
+  Criterion: the reports are saved, a verdict per candidate is explicitly
+  recorded against the thresholds; for the unready ones — a re-test plan written down.
 
-- **T-248** [новая] — P1, развёртывание на проде контейнеров ОБОИХ
-  движков и воркера B (ТЗ §4.7 п.2–3 v0.3, §6.2 п.1; зависит от T-247,
-  T-239, T-240, T-245, T-246). Не код: контейнеры moli и lightpanda с
-  pinned-версиями из T-241 (оба — независимо от того, какой кандидат
-  первым пойдёт в канарейку; развёрнуты для окон и пере-тестов без
-  новых деплоев), egress-политика обоих контейнеров (обязательна — ТЗ
-  §4.7 п.2), mem_limit из замеров T-247 × запас (стартово ≤1 ГБ
-  каждый); воркер B на q:render-fallback (профиль T-240) работает по
-  пустой очереди — проверка проводки (шаг 1 ТЗ §6.2); алерты T-246 в
-  боевом режиме; базовое окно метрик этапа зафиксировано (≥48 ч); откат
-  ТЗ §6.4 отрепетирован на стенде.
-  Критерий: healthcheck обоих движков и воркера B зелёные, алерты
-  активны, базовое окно зафиксировано.
+- **T-248** [new] — P1, production rollout of BOTH engine containers and
+  worker B (spec §4.7 items 2–3 v0.3, §6.2 item 1; depends on T-247,
+  T-239, T-240, T-245, T-246). Not code: moli and lightpanda containers with
+  pinned versions from T-241 (both — regardless of which candidate goes to
+  canary first; deployed for windows and re-tests without
+  new deploys), the egress policy of both containers (mandatory — spec
+  §4.7 item 2), mem_limit from the T-247 measurements × headroom (initially ≤1 GB
+  each); worker B on q:render-fallback (the T-240 profile) runs against an
+  empty queue — the wiring check (step 1 of spec §6.2); the T-246 alerts
+  live in production; the stage baseline metric window recorded (≥48 h); the
+  spec §6.4 rollback rehearsed on the bench.
+  Criterion: healthchecks of both engines and worker B green, alerts
+  active, the baseline window recorded.
 
-- **T-249** [новая] — P1, канареечные окна, приёмка и фиксация перевода
-  (ТЗ §5.2, §5.3 v0.3, §6.2–6.4; зависит от T-248). Канарейка — перевод
-  основного воркера на кандидата, признанного готовым по T-247; при
-  неготовости обоих сейчас — T-249 не стартует, назначается пере-тест
-  T-247 (оба движка остаются кандидатами, отсева нет). Не код, операторский
-  прогон по шагам ТЗ §6.2: включение фолбэка без смены движка (пустая
-  очередь — контроль проводки) → окно 1 (один воркер на кандидате,
-  контрольные точки каждые 4 ч: fallback-рейт, доля Laravel-вердиктов
-  против базового окна, глубина q:render-fallback, RSS/стабильность
-  движка, PEL обоих стримов) → окно 2 (100% воркеров, 48 ч) → приёмка
-  §6.3: сверка баланса фолбэка (опубликовано = потреблено + PEL,
-  0 расхождений), пороги §5.3, журнал T-177 без новых патологий →
-  фиксация: конфиг профиля прода (движок, потолки из фактического
-  рейта), docs/render.md (профиль, runbook отката, процедура смены
-  версии движка), docs/operations.md (журнал), pinned-версии. Критерий:
-  чек-лист §6.2 пройден полностью, повторные 48 ч подтверждают
-  стабильность, решение зафиксировано в доках; при провале порогов —
-  откат §6.4 выполнен и задокументирован (валидный исход «остаться на
-  chromium», ТЗ §5.3 п.2).
+- **T-249** [new] — P1, canary windows, acceptance and locking in the switch
+  (spec §5.2, §5.3 v0.3, §6.2–6.4; depends on T-248). The canary is switching
+  the main worker to a candidate found ready by T-247; if neither is
+  ready now — T-249 does not start, a T-247 re-test is scheduled
+  (both engines stay candidates, no cut). Not code: an operator
+  run following the steps of spec §6.2: enabling fallback without an engine
+  switch (empty queue — the wiring check) → window 1 (one worker on the candidate,
+  checkpoints every 4 h: the fallback rate, the share of Laravel verdicts
+  against the baseline window, the q:render-fallback depth, engine
+  RSS/stability, the PEL of both streams) → window 2 (100% of workers, 48 h) →
+  §6.3 acceptance: the fallback balance reconciliation (published = consumed + PEL,
+  0 mismatches), the §5.3 thresholds, the T-177 log without new pathologies →
+  locking in: the production profile config (engine, caps from the actual
+  rate), docs/render.md (profile, rollback runbook, engine version change
+  procedure), docs/operations.md (the log), pinned versions. Criterion:
+  the §6.2 checklist passed in full, a repeated 48 h confirms
+  stability, the decision recorded in the docs; on a threshold failure —
+  the §6.4 rollback executed and documented (a valid outcome is “stay on
+  chromium”, spec §5.3 item 2).
 
-## Этап 40: компенсатор «статус повис» new∧done (T-270)
+## Stage 40: the “stuck status” new∧done compensator (T-270)
 
-Источник: gauge T-256 (деплой 08.11.2026) вскрыл хвост инцидентной недели
-22–29.10.2026 — 1865 доменов в недопустимом состоянии ФТ-2.2 ТЗ-fsm
+Source: the T-256 gauge (deployed 08.11.2026) exposed the tail of the incident
+week of 22–29.10.2026 — 1865 domains in the FR-2.2-invalid state of TZ-fsm
 (`status = new ∧ check_state = done ∧ last_checked_at < current_date`):
-задачи q:http потеряны после XADD при уже записанном done. Главные причины
-(анализ 08.11.2026 по коду и пост-мортемам): рестарт Redis 22.10 08:17 без
-персистентности (осознанный выбор — `docs/redis.md` §5,
-потери q:dns самолечились lease, q:http — нет) и гибель 2786 q:http-задач
-в q:dead в OOM-окно 22.10 16:00–18:15 (`docs/load-measurements.md` §11.1).
-Lease-проход T-029 такие строки не видит (вне queued), возрастная
-перепроверка T-030 созревает при `recheck_interval` 4380 ч — только к
-22–29.04.2027; класс потерь открыт для повторения (следующий рестарт
-Redis). Когорта стабильна (ноль новых после 29.10), 0,004 % корпуса.
+q:http tasks lost after XADD with done already recorded. Main causes
+(the 08.11.2026 analysis over code and post-mortems): the Redis restart of 22.10
+08:17 without persistence (a deliberate choice — `docs/redis.md` §5;
+q:dns losses self-healed via lease, q:http did not) and the death of 2786
+q:http tasks into q:dead during the OOM window of 22.10 16:00–18:15
+(`docs/load-measurements.md` §11.1). The T-029 lease
+pass does not see such rows (outside queued), the T-030 age
+recheck matures at `recheck_interval` 4380 h — only by
+22–29.04.2027; the loss class stays open to recurrence (the next Redis
+restart). The cohort is stable (zero new after 29.10), 0.004 % of the corpus.
 
-- **T-270** [сделана] — P1, scheduler + monitor + docs: компенсатор «статус
-  повис» — ранний recheck доменов new∧done (ФТ-2.2 ТЗ-fsm, датчик T-256;
-  контекст — шапка этапа; разовое ручное лечение когорты `crawlerctl
-  recheck` — прод-операция вне задачи). Фоновый проход цикла планировщика
-  (образцы: leasenull.go T-255, renderlate.go T-259, RecheckDaily T-030):
-  guarded-UPDATE `check_state: done → pending` для `status = new ∧
-  check_state = done ∧ last_checked_at < now() − 24 ч`, пачками ≤1000,
-  интервал 1 ч; порог 24 ч согласован с окном gauge (моложе — задачу ещё
-  может доставить клейм PEL, ретраи — минуты); идемпотентность — охраной
-  перехода; дубль q:http после оживания стоявшего >24 ч воркера гасится
-  идемпотентностью записи HTTP-этапа (асимметрия А3). Переиздание
-  сообщения q:http невозможно (HTTPTask несёт адреса субдоменов, нигде не
-  хранятся, `internal/queue/message.go`) — только возврат в pending через
-  штатный конвейер. Спецификация: новая строка Р15 таблицы check_state
-  (`internal/scheduler/checkstate.go`), правка ФТ-2.2 в
-  `internal/model/enums.go` и `tasks/TZ-fsm.md` («автолечения нет» →
-  «лечит проход»), уточнение runbooks §2.3 (lease не возвращает done) +
-  раздел ручных операций; пустое множество — одна дешёвая проба по
-  счётчику/gauge (стиль guard T-181, без seq scan). Метрика
-  `crawler_scheduler_stale_requeued_total` (стационарно 0). Критерий:
-  юнит-тесты перехода/порога/идемпотентности/пустого множества;
-  интеграционный тест: искусственно потерянная q:http (XTRIM
-  недоставленного) → проход вернул домен в pending → эпизод завершён,
-  `new_done_stale` → 0; `make test`/`make lint` зелёные,
-  `make test-integration` после вливания (затронут scheduler и БД).
-  Опционально (по решению оператора): алерт на рестарт Redis
-  (ActiveEnterTimestamp/uptime) — главная причина класса потерь.
+- **T-270** [done] — P1, scheduler + monitor + docs: the “stuck status”
+  compensator — an early recheck of new∧done domains (FR-2.2 of TZ-fsm, the
+  T-256 gauge; context — the stage header; the one-off manual treatment of the
+  cohort with `crawlerctl recheck` — a production operation outside the task).
+  A background pass of the scheduler loop (samples: leasenull.go T-255,
+  renderlate.go T-259, RecheckDaily T-030): a guarded UPDATE
+  `check_state: done → pending` for `status = new ∧
+  check_state = done ∧ last_checked_at < now() − 24 h`, in batches ≤1000,
+  interval 1 h; the 24 h threshold is aligned with the gauge window (younger —
+  the task can still be delivered by a PEL claim, retries take minutes);
+  idempotency via the transition guard; a duplicate q:http after a worker down
+  for >24 h comes back is absorbed by the idempotency of the HTTP-stage
+  record (asymmetry A3). Republishing the q:http
+  message is impossible (HTTPTask carries subdomain addresses, stored nowhere,
+  `internal/queue/message.go`) — only a return to pending through the regular
+  pipeline. Specification: a new row R15 in the check_state table
+  (`internal/scheduler/checkstate.go`), an FR-2.2 edit in
+  `internal/model/enums.go` and `tasks/TZ-fsm.md` (“no self-healing” →
+  “healed by the pass”), runbook §2.3 refinement (lease does not return done) +
+  a manual operations section; the empty set — one cheap probe over the
+  counter/gauge (the guard style of T-181, no seq scan). Metric
+  `crawler_scheduler_stale_requeued_total` (stationarily 0). Criterion:
+  unit tests of the transition/threshold/idempotency/empty set;
+  an integration test: an artificially lost q:http (XTRIM of the undelivered)
+  → the pass returned the domain to pending → the episode closed,
+  `new_done_stale` → 0; `make test`/`make lint` green,
+  `make test-integration` after the merge (scheduler and DB affected).
+  Optional (operator decision): an alert on a Redis restart
+  (ActiveEnterTimestamp/uptime) — the main cause of the loss class.
 
-## Этап 41: стабилизация PG — закрепление планов курсорных выборок retention/render-late (T-271)
+## Stage 41: PG stabilization — pinning the plans of the retention/render-late cursor selects (T-271)
 
-Источник: прод-инцидент 08–09.11.2026 — 5 OOM-киллов PostgreSQL за ночь
-(`oom-kill: CONSTRAINT_MEMCG`, MemoryMax 3 Ги, NRestarts=5; 20:43, 23:39,
-04:30, 07:30, 08:30), каждому секунд-в-секунду соответствует WARN
-`проход retention контента … unexpected EOF`; retention ни одного успешного
-прохода (метрики :9104 нулевые), контент растёт (13→16 Г за ночь), киллы
-самоподдерживают retry-шторм temp_error (+6.5/с) и рост q:dead. Исследование
-(2026-11-09): деградация планов двух курсорных SELECT http-worker до
-«seq scan 9 млн строк + hash join domains + Sort» по ~1 ГиБ каждый поверх
-`shared_buffers=2 ГиБ` — `retentionSelectSQL` (`internal/content/retention.go`)
-и `lateRenderRowsSQL` (`internal/httpworker/renderlate.go`, T-259 — форма
-плана сознательно не закреплялась, «контролировать журналом медленных»).
-Курсор двигается только закоммиченной пачкой (`retentiondrain.go`) → ни одной
-успешной пачки → каждый проход catch-up с нулевого курсора (лог 08:30:49:
-«catch-up-круг с нулевого курсора … рендер-защита снята»); buffered-тик тикера
-немедленно перезапускает проход в только что поднявшийся PG — backoff и
-single-flight отсутствуют. Отягчающие: generic-планы prepared statements
-(после 5 выполнений селективность row-value курсора неизвестна) и устаревшая
-статистика (ANALYZE не успевает за 2–3 млн вставок/сут).
+Source: the production incident of 08–09.11.2026 — 5 PostgreSQL OOM kills
+overnight (`oom-kill: CONSTRAINT_MEMCG`, MemoryMax 3 GiB, NRestarts=5; 20:43, 23:39,
+04:30, 07:30, 08:30), each matched second-for-second by a WARN
+`content retention pass … unexpected EOF`; retention without a single successful
+pass (the :9104 metrics are zero), content growing (13→16 GB overnight), the
+kills self-sustain a temp_error retry storm (+6.5/s) and q:dead growth. Investigation
+(2026-11-09): the plans of the two http-worker cursor SELECTs degraded
+to “seq scan of 9M rows + hash join domains + Sort”, ~1 GiB each on top of
+`shared_buffers=2 GiB` — `retentionSelectSQL` (`internal/content/retention.go`)
+and `lateRenderRowsSQL` (`internal/httpworker/renderlate.go`, T-259 — the plan
+shape deliberately not pinned, “control via the slow-query log”).
+The cursor moves only with a committed batch (`retentiondrain.go`) → not a single
+successful batch → every pass is a catch-up from the zero cursor (log 08:30:49:
+“catch-up circle from the zero cursor … render protection lifted”); a buffered
+ticker tick immediately restarts the pass into the just-restarted PG — backoff and
+single-flight are absent. Aggravators: generic plans of prepared statements
+(after 5 executions the selectivity of the row-value cursor is unknown) and stale
+statistics (ANALYZE cannot keep up with 2–3M inserts/day).
 
-- **T-271** [сделана] — P0, http-worker + content: хотфикс цикла OOM —
-  закрепление планов тяжёлых курсорных выборок + таймауты + backoff/
-  single-flight (контекст — шапка этапа). Состав:
-  1. Закрепление планов `retentionSelectSQL` и `lateRenderRowsSQL`
-     tx-оболочкой по образцу T-191 (`internal/scheduler/retry.go` —
-     SET LOCAL enable_seqscan/hashjoin/mergejoin=off); `enable_sort` НЕ
-     отключать (нужен Incremental Sort); желаемая форма — Index Scan
-     (`subdomain_results_checked_idx` / PK) + Nested Loop проб + Limit
-     с ранним остановом; SQL-тексты не меняются.
-  2. `SET LOCAL statement_timeout` в той же оболочке: 600 с retention
-     (замер T-201: медиана 13,8 с, max 222,8 с), 60 с render-late; плюс
-     клиентский ctx-таймаут (`context.WithTimeout`) на выборку — зависший
-     запрос невозможен; повтор идемпотентен (пачка не закоммичена).
-  3. Backoff после ошибки прохода в `RetentionLoop` и `RenderLateLoop`
-     (пропуск тиков / сброс тикера на 15–30 мин) — убрать немедленный
-     buffered-тик в только что перезапущенный PG.
-  4. Single-flight тяжёлых фоновых сканов http-worker: общий семафор
-     retention ↔ render-late (исключает совпадение «1+1 ГиБ»).
-  Вне задачи (кандидаты следующих): двухфазная выборка «ключи → PK-зонд»
-  (TZ_slow_retention_residual §5.2 п.2 — правильный фикс под ~47 млн,
-  M), пересмотр бюджета памяти PG (shared_buffers/MemoryHigh, с замерами),
-  `plan_cache_mode=force_custom_plan`. Не делать: рестарт http-worker как
-  «лечение» (сброс курсоров = самый дорогой catch-up, runbook §5.2),
-  уменьшение retention_batch (T-201), индексы по payload/rendered
-  (HOT-инвариант, TZ §4.3/§6).
-  Тесты: SQL-контракт `TestRetentionOnce_SQLContract` — дополнить
-  SET LOCAL-порядком `BEGIN → SET LOCAL … → SELECT → COMMIT` (образец
-  `retry_test.go`, закрепление T-191); ctx-таймаут — зависший fake-Query
-  + дедлайн → обёрнутая ошибка; backoff — после ошибки тикер не
-  перезапускает немедленно (`TestRetentionLoop`); single-flight — два
-  цикла на одном гейте, взаимное исключение; интеграционный EXPLAIN-тест
-  формы плана на наполненной таблице (нет Hash Join / Sort над
-  JOIN-результатом, есть Index Scan + Limit; образцы schema_test.go /
+- **T-271** [done] — P0, http-worker + content: the hotfix for the OOM cycle —
+  pinning the plans of the heavy cursor selects + timeouts + backoff/
+  single-flight (context — the stage header). Scope:
+  1. Pin the plans of `retentionSelectSQL` and `lateRenderRowsSQL`
+     with a tx wrapper following the T-191 pattern (`internal/scheduler/retry.go` —
+     SET LOCAL enable_seqscan/hashjoin/mergejoin=off); do NOT disable
+     `enable_sort` (Incremental Sort is needed); the desired shape — Index Scan
+     (`subdomain_results_checked_idx` / PK) + Nested Loop probes + Limit
+     with an early stop; the SQL texts are unchanged.
+  2. `SET LOCAL statement_timeout` in the same wrapper: 600 s for retention
+     (the T-201 measurement: median 13.8 s, max 222.8 s), 60 s for render-late; plus
+     a client-side ctx timeout (`context.WithTimeout`) on the select — a hung
+     query becomes impossible; a retry is idempotent (the batch is not committed).
+  3. Backoff after a failed pass in `RetentionLoop` and `RenderLateLoop`
+     (skipping ticks / resetting the ticker for 15–30 min) — remove the immediate
+     buffered tick into the just-restarted PG.
+  4. Single-flight for the heavy http-worker background scans: a shared semaphore
+     retention ↔ render-late (rules out the “1+1 GiB” coincidence).
+  Out of scope (candidates for follow-ups): the two-phase select “keys →
+  PK probe” (TZ_slow_retention_residual §5.2 item 2 — the right fix for ~47M,
+  M), revisiting the PG memory budget (shared_buffers/MemoryHigh, with
+  measurements), `plan_cache_mode=force_custom_plan`. Do not: restart
+  http-worker as a “treatment” (a cursor reset = the most expensive catch-up,
+  runbook §5.2), reduce retention_batch (T-201), indexes on payload/rendered
+  (the HOT invariant, TZ §4.3/§6).
+  Tests: the SQL contract `TestRetentionOnce_SQLContract` — extend with the
+  SET LOCAL order `BEGIN → SET LOCAL … → SELECT → COMMIT` (sample
+  `retry_test.go`, the T-191 pinning); ctx timeout — a hung fake Query
+  + a deadline → a wrapped error; backoff — after an error the ticker does not
+  restart immediately (`TestRetentionLoop`); single-flight — two
+  loops on one gate, mutual exclusion; an integration EXPLAIN test
+  of the plan shape on a populated table (no Hash Join / Sort over the
+  JOIN result, Index Scan + Limit present; samples schema_test.go /
   render_late_test.go).
-  Критерий: `make test`/`make lint` зелёные, `make test-integration`
-  после вливания (затронут http-worker и БД); прод-приёмка после деплоя:
-  `crawler_content_retention_*` оживает (успешные проходы), оба SELECT
-  уходят из журнала медленных (порог 3 с, T-177), MemoryCurrent PG
-  устойчиво < 2,5 Ги, NRestarts PG не растёт, бэклог ~9 млн строк
-  дренируется пачками (≈900 × 10–25 с, размазано часовыми проходами).
+  Criterion: `make test`/`make lint` green, `make test-integration`
+  after the merge (http-worker and DB affected); production acceptance after
+  the deploy: `crawler_content_retention_*` comes alive (successful passes), both
+  SELECTs leave the slow-query log (threshold 3 s, T-177), PG
+  MemoryCurrent steadily < 2.5 GiB, PG NRestarts not growing, the ~9M-row
+  backlog drains in batches (≈900 × 10–25 s, spread across hourly passes).
 
-## Этап 42: пере-тест moli v1.1.23 — upstream-фикс Fetch.enable Font (T-272)
+## Stage 42: the moli v1.1.23 re-test — the upstream fix for Fetch.enable Font (T-272)
 
-Источник: релиз moli
+Source: the moli release
 [v1.1.23](https://github.com/lexmount/moli/releases/tag/v1.1.23)
-(2026-11-09, commit `ee0652d`) с нашим PR
+(2026-11-09, commit `ee0652d`) carrying our PR
 [lexmount/moli#2470](https://github.com/lexmount/moli/pull/2470)
-«fix(fetch): accept the Font resourceType in Fetch.enable patterns» (форк
-`yepbro/moli`, ветка `fix/fetch-enable-font-resource-type`, коммит
-`4729723`; отправлен 2026-11-06, мейнтейнеры пометили целевым релизом
-1.1.23) и парным мейнтейнерским #2476 «intercept font and media loads
-with shared admission». Причина фикса: на pinned v1.1.21/1.1.22 CDP-срез
-`TestEnginesLiveCDPSlice/moli` красный — `Fetch.enable` с паттернами
-базового набора блокировки T-062 (Image+Media+Font) отвечает
-InvalidParams → каждая задача падает на startBlock, engine=moli
-неработоспособен (live-прогон 2026-11-06: 0/100 из-за паттерна Font;
-прецеденты — докомментарий `internal/render/engines_live_test.go`,
-журнал `.opencode/skills/prod-report/references/prod-topology.md` от
-06.11). Процедура — план пере-теста из T-247 (решение оператора
-2026-11-06, ТЗ v0.3 «watch + smoke по релизам»), шаги —
-docs/dev-environment.md, «Смена pinned-версии движка» (smoke ФТ-17/
-T-254). Операционная задача (не код), как T-247…T-249; lightpanda вне
-задачи (ждёт апстрим #4151 — один browser context на соединение).
+“fix(fetch): accept the Font resourceType in Fetch.enable patterns” (fork
+`yepbro/moli`, branch `fix/fetch-enable-font-resource-type`, commit
+`4729723`; submitted 2026-11-06, the maintainers tagged it for release
+1.1.23) and the paired maintainer #2476 “intercept font and media loads
+with shared admission”. Reason for the fix: on pinned v1.1.21/1.1.22 the
+CDP slice `TestEnginesLiveCDPSlice/moli` is red — `Fetch.enable` with the
+patterns of the T-062 base blocking set (Image+Media+Font) answers
+InvalidParams → every task fails at startBlock, engine=moli is
+unusable (live run 2026-11-06: 0/100 because of the Font pattern;
+precedents — the doc comment of `internal/render/engines_live_test.go`,
+the log `.opencode/skills/prod-report/references/prod-topology.md` dated
+06.11). Procedure — the re-test plan from T-247 (operator decision
+2026-11-06, spec v0.3 “watch + smoke per release”), steps —
+docs/dev-environment.md, “Changing a pinned engine version” (smoke FR-17/
+T-254). An operational task (not code), like T-247…T-249; lightpanda is out
+of scope (waiting for upstream #4151 — one browser context per connection).
 
-- **T-272** [сделана] — P1, операционный: bump пина moli до v1.1.23, CDP-срез,
-  smoke на посевной сотне, вердикт кандидата (вход для T-247/T-249;
-  инфраструктура пина и smoke-процедуры — T-241/T-254). Шаги:
-  1. Bump пина парой `MOLI_VERSION=v1.1.23` + `MOLI_SHA256` (релизный ассет
-     `moli-x86_64-unknown-linux-gnu.tar.gz`, sha256
+- **T-272** [done] — P1, operational: bump the moli pin to v1.1.23, the CDP
+  slice, a smoke run on the seed hundred, a candidate verdict (input for
+  T-247/T-249; the pin infrastructure and smoke procedures — T-241/T-254). Steps:
+  1. Bump the pin with the pair `MOLI_VERSION=v1.1.23` + `MOLI_SHA256` (release
+     asset `moli-x86_64-unknown-linux-gnu.tar.gz`, sha256
      `df360c04e567ce2e56a8391a03dc677d794465848b5821f944d2de10f3f1f430`)
-     во всех местах дефолта: `deploy/docker/.env.example`,
-     `deploy/docker/compose.yaml` (два литерала — ARG и тег образа),
-     `deploy/docker/Dockerfile.moli` (ARG-дефолты); на стенде — пара в
-     `.env` (сейчас пин задан дефолтами compose, пары в `.env` нет).
-  2. Пересборка/переподъём: `dc --profile render-engines up -d moli` →
-     образ `crawler/moli:v1.1.23` (тег с версией), healthcheck
-     `/json/version` зелёный, версия в ответе совпадает с пином (гейт
-     среза печатает её сам).
-  3. Слой 1 — CDP-срез: `dc run --use-aliases -e CRAWLER_RENDER_TEST=1
+     in every default location: `deploy/docker/.env.example`,
+     `deploy/docker/compose.yaml` (two literals — ARG and the image tag),
+     `deploy/docker/Dockerfile.moli` (ARG defaults); on the bench — the pair in
+     `.env` (the pin is currently set by the compose defaults; no pair in `.env`).
+  2. Rebuild/re-up: `dc --profile render-engines up -d moli` →
+     the `crawler/moli:v1.1.23` image (a version tag), the healthcheck
+     `/json/version` green, the version in the response matches the pin (the
+     slice gate prints it itself).
+  3. Layer 1 — the CDP slice: `dc run --use-aliases -e CRAWLER_RENDER_TEST=1
      --rm tools go test ./internal/render
-     -run 'TestEnginesLiveCDPSlice/moli' -v -count=1`. Ожидание:
-     позеленеет (InvalidParams на Fetch.enable уходит с #2470+#2476;
-     инварианты этапа — ТЗ 5.6/ФТ-5). Дополнительно прогнать набор с
-     `BlockStylesheet` (T-213): если Stylesheet в moli так и не приняли —
-     НЕ блокер базового профиля (опция опциональна, дефолт false),
-     зафиксировать отдельной строкой для CSS-режима. Красный срез —
-     стоп-сигнал: откат переменной на v1.1.21, разбор причины, при
-     движковой причине — issue в апстрим.
-  4. Слой 2 (при зелёном слое 1) — smoke на посевной сотне по процедуре
-     docs/dev-environment.md (шаги 3–4 «Реальный smoke»): `fixtures
-     import --force --publish smoke` → render-worker стенда в профиле
-     moli (engine: moli + ws://172.28.100.17:9222) → дренирование
+     -run 'TestEnginesLiveCDPSlice/moli' -v -count=1`. Expectation:
+     it goes green (InvalidParams on Fetch.enable goes away with
+     #2470+#2476; the stage invariants — spec 5.6/FR-5). Additionally run the set with
+     `BlockStylesheet` (T-213): if Stylesheet was still not accepted in moli —
+     NOT a blocker for the base profile (the option is optional, default false),
+     record it as a separate line for the CSS mode. A red slice is a
+     stop signal: revert the variable to v1.1.21, analyze the cause; if
+     engine-side — an upstream issue.
+  4. Layer 2 (with layer 1 green) — a smoke run on the seed hundred per the
+     docs/dev-environment.md procedure (steps 3–4 “Real smoke”): `fixtures
+     import --force --publish smoke` → the bench render-worker in the
+     moli profile (engine: moli + ws://172.28.100.17:9222) → drain
      q:render → `fixtures snapshot --label moli-v1.1.23 --engine moli` →
-     `fixtures report` против baseline-chromium. Пороги §5.1 п.4 ТЗР
-     движков (на сотне индикативны; полное сравнение 3000×2 — T-247);
-     критерий smoke: успешность/темп без деградации против baseline,
-     0 crashes ядра движка, память в порядке; между baseline и
-     кандидатом — рестарт render-worker и повторный `import --force` +
-     `--publish`.
-  5. Вердикт и фиксация: «готов/не готов сейчас» против порогов — вход
-     для T-247 (полное стендовое сравнение) и T-249 (канарейка);
-     обновить докомментарий-прецеденты `internal/render/
-     engines_live_test.go` (moli v1.1.23 — зелёный/красный), строку
-     журнала prod-topology.md (06.11 «ждём 1.1.23» → факт), журнал
-     docs/operations.md.
-  Критерий: пин v1.1.23 закоммичен во всех местах дефолта, срез и smoke
-  зафиксированы (снапшоты/отчёты в var/fixtures-render), вердикт и
-  правки доков закоммичены; при красном — откат на v1.1.21 и записан
-  план следующего пере-теста (по следующему релизу движка).
+     `fixtures report` against baseline-chromium. The §5.1 item 4 thresholds
+     of the render engines spec (indicative on a hundred; the full 3000×2
+     comparison — T-247); the smoke criterion: success rate/throughput without
+     degradation against baseline, 0 crashes of the engine core, memory fine;
+     between baseline and candidate — restart render-worker and re-run
+     `import --force` + `--publish`.
+  5. Verdict and recording: “ready/not ready now” against the thresholds — the
+     input for T-247 (the full bench comparison) and T-249 (the canary);
+     update the precedent doc comment of `internal/render/
+     engines_live_test.go` (moli v1.1.23 — green/red), the prod-topology.md
+     log line (06.11 “waiting for 1.1.23” → the fact), the
+     docs/operations.md log.
+  Criterion: the v1.1.23 pin committed in every default location, the slice
+  and smoke recorded (snapshots/reports in var/fixtures-render), the verdict and
+  doc edits committed; on red — a revert to v1.1.21 and the next
+  re-test plan written down (on the next engine release).
 
 
 
-## Этап 43: хотфикс регрессии T-271 — обречённые курсорные выборки retention/render-late (T-273)
+## Stage 43: hotfix for the T-271 regression — the doomed retention/render-late cursor selects (T-273)
 
-- **T-273** [сделана] — P0, хотфикс вечной петли обречённых курсорных
-  выборок retention/render-late — регрессия T-271, прод-инцидент
-  09–10.11.2026 (retention мёртв с деплоя T-271) —
-  [подробности](task/T-273-retention-catchup-hotfix.md).
+- **T-273** [done] — P0, the hotfix for the eternal loop of doomed retention/render-late
+  cursor selects — a T-271 regression, production incident
+  09–10.11.2026 (retention dead since the T-271 deploy) —
+  [details](task/T-273-retention-catchup-hotfix.md).
 
-## Этап 44: устойчивость retention к рестартам (T-274)
+## Stage 44: retention restart resilience (T-274)
 
-- **T-274** [сделана] — P1, конфиг-ключ потолка выборки retention (7200 с)
-  + персистентный курсор дренажа — снимает штраф рестартов http-worker
-  (каждый сейчас = новый часовой catch-up с нуля, следствие T-273) —
-  [подробности](task/T-274-retention-restart-resilience.md).
+- **T-274** [done] — P1, a config key for the retention select cap (7200 s)
+  + a persistent drain cursor — removes the http-worker restart penalty
+  (each restart currently means a new hour-long catch-up from scratch, a
+  consequence of T-273) —
+  [details](task/T-274-retention-restart-resilience.md).
 
-## Этап 45: block_trackers — async-зонды после апстрим-фиксов moli (T-275)
+## Stage 45: block_trackers — async probes after the moli upstream fixes (T-275)
 
-- **T-275** [сделана] — P1, перевод зондов `blockLiveTrackerDomains` на
-  async-XHR: после апстрим-фиксов moli (#2729 — sync-XHR под перехватом
-  уходит в сеть, блокировка sync-XHR на moli недоступна) синхронные зонды
-  дают ложные срабатывания; sync-зонд сохранить как движко-ветвленный кейс —
-  [подробности](task/T-275-block-trackers-async-probes.md).
-
+- **T-275** [done] — P1, switching the `blockLiveTrackerDomains` probes to
+  async XHR: after the moli upstream fixes (#2729 — sync XHR under
+  interception goes out to the network, sync-XHR blocking is unavailable on
+  moli) the synchronous probes give false positives; keep the sync probe as
+  an engine-branched case —
+  [details](task/T-275-block-trackers-async-probes.md).

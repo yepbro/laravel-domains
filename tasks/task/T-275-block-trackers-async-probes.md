@@ -1,69 +1,77 @@
-# T-275: block_trackers — перевод зондов на async-XHR (следствие апстрим-фиксов moli ①/④)
+# T-275: block_trackers — switching the probes to async XHR (a consequence of the moli upstream fixes ①/④)
 
-## Контекст
+## Context
 
-Тест `TestEnginesLiveCDPSlice/*/block_trackers` (`internal/render/block_live_test.go`,
-`blockLiveTrackerDomains`) проверяет доменную блокировку трекеров T-214 зондами
-страницы. Все зонды (контрольные clarity.ms/mc.yandex.ru, path-trap
-`/js/google-analytics.com.js`) выполняются **синхронным XHR**
-(`x.open('GET', url, false)` — probe-хелпер, block_live_test.go:~130–146).
+The `TestEnginesLiveCDPSlice/*/block_trackers` test
+(`internal/render/block_live_test.go`, `blockLiveTrackerDomains`) checks
+the T-214 domain-level tracker blocking with page probes. All probes (the
+clarity.ms/mc.yandex.ru controls, the path-trap
+`/js/google-analytics.com.js`) run via **synchronous XHR**
+(`x.open('GET', url, false)` — the probe helper, block_live_test.go:~130–146).
 
-В апстриме moli изменилось поведение синхронного XHR под перехватом:
+The upstream moli changed the synchronous XHR behavior under interception:
 
 - ① PR [lexmount/moli#2704](https://github.com/lexmount/moli/pull/2704) —
-  перехват скоупится множеством классов (гетерогенные типовые паттерны больше
-  не роняют sync-XHR);
+  interception is scoped by a set of classes (heterogeneous typed patterns no
+  longer crash sync XHR);
 - ④ issue
   [lexmount/moli#2728](https://github.com/lexmount/moli/issues/2728) + PR
-  [lexmount/moli#2729](https://github.com/lexmount/moli/pull/2729) — sync-XHR
-  под перехватом уходит **обычным сетевым путём**: пауза архитектурно
-  невозможна (дедлок owner-loop), фабрика отказа убрана. Как следствие,
-  **намеренная блокировка sync-XHR на moli недоступна** (задокументированное
-  расхождение с Chromium); async-XHR паузится и блокируется полноценно.
+  [lexmount/moli#2729](https://github.com/lexmount/moli/pull/2729) — sync XHR
+  under interception goes **the regular network path**: pausing is
+  architecturally impossible (an owner-loop deadlock), the failure factory
+  was removed. As a consequence, **deliberate sync-XHR blocking is
+  unavailable on moli** (a documented divergence from Chromium); async XHR
+  pauses and blocks fully.
 
-До фиксов (v1.1.21/1.1.23) тест на moli падал раньше — контрольные sync-зонды
-умирали от бана «interception is not supported» (t.Fatalf на контроле). С
-фиксами контроль проходит, path-trap проходит (запрос в сеть → 200), но
-ассерты «трекеры оборваны» (0 попаданий, атрибут `error`) становятся ложными:
-sync-зонды трекеров уходят в сеть и получают 200 — движок не может их
-заблокировать.
+Before the fixes (v1.1.21/1.1.23) the test failed earlier on moli — the
+control sync probes died from the “interception is not supported” ban
+(t.Fatalf on a control). With the fixes the control passes, the path-trap
+passes (the request goes to the network → 200), but the “trackers were cut
+off” asserts (0 hits, the `error` attribute) become false: the tracker
+sync probes go to the network and get 200 — the engine cannot block them.
 
-## Корневая причина
+## Root cause
 
-Зонды теста синхронны, а реальная веб-аналитика (clarity.ms, mc.yandex.ru,
-google-analytics) ходит async-XHR/`fetch()`/Image/beacon. Тест проверял
-движко-специфичное поведение (бан sync-XHR), а не контракт T-214.
+The test probes are synchronous, while real web analytics (clarity.ms,
+mc.yandex.ru, google-analytics) use async XHR/`fetch()`/Image/beacon. The
+test checked an engine-specific behavior (the sync-XHR ban) rather than
+the T-214 contract.
 
-## Требования
+## Requirements
 
-1. Перевести зонды `blockLiveTrackerDomains` (контроль clarity/mc, path-trap,
-   трекерные проверки) на **async-XHR** с ожиданием результата (атрибуты
-   страницы, стиль существующего probe-механизма). Синхронный вариант зонда
-   можно сохранить как явно движко-ветвленный кейс: на moli — «ушёл в сеть,
-   200, не блокируется» (задокументированное расхождение #2728), на chromium —
-   «заблокирован»; ожидания ветвятся по движку, как в смоук-контрактах moli.
-2. Инварианты теста после переработки:
-   - контрольные зонды (без блокировки) доходят на обоих движках;
-   - настоящие трекер-домены (async) блокируются на обоих движках
-     (0 попаданий, `error`);
-   - path-trap (домен трекера в пути, чужой хост) проходит на обоих;
-   - sync-XHR-зонд: chromium — блокируется, moli — проходит в сеть
-     (расхождение #2728, комментарий в тесте со ссылкой).
-3. Прогон против интеграционной сборки moli (①+④; ② уже в main) и против
-   chromium — оба зелёные (с движко-ветвлением для sync-зонда).
+1. Switch the `blockLiveTrackerDomains` probes (the clarity/mc controls, the
+   path-trap, the tracker checks) to **async XHR** with awaiting the result
+   (page attributes, in the style of the existing probe mechanism). The
+   synchronous probe variant may be kept as an explicitly engine-branched
+   case: on moli — “went to the network, 200, not blocked” (the documented
+   divergence #2728), on chromium — “blocked”; the expectations branch by
+   engine, as in the moli smoke contracts.
+2. The test invariants after the rework:
+   - the control probes (no blocking) get through on both engines;
+   - real tracker domains (async) are blocked on both engines
+     (0 hits, `error`);
+   - the path-trap (a tracker domain in the path, a foreign host) passes on
+     both;
+   - the sync-XHR probe: chromium — blocked, moli — goes to the network
+     (the #2728 divergence, a comment in the test with a reference).
+3. A run against the integration build of moli (①+④; ② already in main)
+   and against chromium — both green (with the engine branching for the sync
+   probe).
 
-## Критерии приёмки
+## Acceptance criteria
 
-- `TestEnginesLiveCDPSlice/moli/block_trackers` зелёный на интеграционной
-  сборке moli (ветки #2704+#2729) и на `chromium`-строке среза.
-- Юнит-инварианты probe-механизма не ослаблены; `make test`/`make lint`
-  зелёные (затронут только `internal/render`).
-- Комментарий в тесте фиксирует расхождение sync-XHR (#2728) и причину
-  перевода зондов на async.
+- `TestEnginesLiveCDPSlice/moli/block_trackers` green on the moli
+  integration build (the #2704+#2729 branches) and on the `chromium` line
+  of the slice.
+- The unit invariants of the probe mechanism are not weakened; `make
+  test`/`make lint` green (only `internal/render` affected).
+- A comment in the test records the sync-XHR divergence (#2728) and the
+  reason for switching the probes to async.
 
-## Ссылки
+## References
 
 - moli-analysis: `/home/brooks/projects/opensources/moli-analysis/04-path-trap-continue-request.md`
-- Апстрим: #2728 (issue), #2729 (PR ④), #2704 (PR ①), #2696 (②, влито).
-- Интеграционный прогон 2026-11-11 (сессия T-272→④): срез 5/6 на ①+②,
-  block_trackers — единственный красный, профиль «sync-зонды в сеть».
+- Upstream: #2728 (issue), #2729 (PR ④), #2704 (PR ①), #2696 (②, merged).
+- Integration run 2026-11-11 (the T-272→④ session): the slice 5/6 on ①+②,
+  block_trackers — the only red one, the “sync probes to the network”
+  profile.
