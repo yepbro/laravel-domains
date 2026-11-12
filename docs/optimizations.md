@@ -1,180 +1,180 @@
-# Проверенные методы оптимизации рендер-конвейера
+# Production-verified render pipeline optimization methods
 
-Отчёт по методам, **проверенным на боевом сервере** (4 vCPU / 8 ГБ RAM,
-155.212.174.88) в ходе дренажа рендер-долга после окна сворачивания зон
-(T-198, 29.10–01.11.2026). Контекст: ~980 тыс. доменов с флагом
-`render_pending`, планировщик остановлен, q:render у watermark 10000,
-2 инстанса render-worker (9105, 9109) на одном chromium :9222.
+A report on the methods **verified on the production server** (4 vCPU / 8 GB RAM,
+155.212.174.88) during the render debt drain after the zone collapse window
+(T-198, 2026-10-29–11-01). Context: ~980k domains with the `render_pending`
+flag, the scheduler stopped, q:render at the watermark of 10000,
+2 render-worker instances (9105, 9109) on a single chromium :9222.
 
-Каждый метод проверялся A/B-замером на проде (метрика — доменов/мин по
-renderq-проходам, deliveries/min по XINFO, таймауты/10 мин по журналу,
-chromium CPU/MemoryCurrent, PSI). Итоговая динамика недели: **37 →
-96–106 доменов/мин (×2,7)**, ETA долга с ~17 до ~6 суток.
+Each method was verified with an A/B measurement on production (the metric —
+domains/min over renderq passes, deliveries/min over XINFO, timeouts/10 min
+over the journal, chromium CPU/MemoryCurrent, PSI). The week's final dynamics:
+**37 → 96–106 domains/min (×2.7)**, the debt ETA from ~17 down to ~6 days.
 
-Связанные задачи: T-198, T-207…T-214; журнал замеров —
+Related tasks: T-198, T-207…T-214; the measurement log —
 [`load-measurements.md`](load-measurements.md).
 
-## Успешные (применены на проде)
+## Successful (applied on production)
 
-### 1. `render.timeout` 15 с → 10 с (31.10)
+### 1. `render.timeout` 15 s → 10 s (Oct 31)
 
-Тарпит-когорта долга: таймауты 340–660/10 мин при **простаивающем** CPU
-(chromium 74–190 %/400) — слоты стояли в 15-с ожиданиях. Снижение
-таймаута обрезало слот-время тарпитов на треть (цена — ~13 % медленных
-успешных рендеров уходят в тарпит-финализацию, замер T-207).
+The tarpit cohort of the debt: 340–660 timeouts/10 min with **idle** CPU
+(chromium 74–190 %/400) — slots were sitting in 15 s waits. Lowering the
+timeout cut the slot time of tarpits by a third (the price — ~13 % of slow
+successful renders go into tarpit finalization, the T-207 measurement).
 
-Эффект: открыл дорогу разгону contexts (метод 3); сам по себе темп в
-полосе, но слоты освободились. Конфиг `/etc/crawler/config.yaml`,
-введено деплоем.
+Effect: opened the way for the contexts speed-up (method 3); on its own the
+rate stayed in the band, but the slots were freed. Config `/etc/crawler/config.yaml`,
+introduced by the deploy.
 
-### 2. `render.contexts` 4 → 6 (29.10)
+### 2. `render.contexts` 4 → 6 (Oct 29)
 
-A/B: 80 → 112–144 доставок/мин. При 15-с таймауте — потолок для одного
-chromium (6 вкладок × 2 воркера = 12). Зафиксировано как промежуточный
-оптимум эпохи «15 с».
+A/B: 80 → 112–144 deliveries/min. With the 15 s timeout — the cap for a single
+chromium (6 tabs × 2 workers = 12). Pinned as the intermediate optimum of the
+"15 s" era.
 
-### 3. `render.contexts` 6 → 8 при timeout=10 с (31.10, A/B №2)
+### 3. `render.contexts` 6 → 8 with timeout=10 s (Oct 31, A/B #2)
 
-Повтор A/B после снижения таймаута: **41 → 106 дом/мин (×2,6)**,
-таймауты вниз 662 → 384, chromium 226 %/400, память в норме. При 15 с
-та же конфигурация проваливалась (см. «Неуспешные» №1) — слоты
-освобождались слишком медленно, и 16 вкладок душили один процесс.
+An A/B repeat after the timeout reduction: **41 → 106 domains/min (×2.6)**,
+timeouts down 662 → 384, chromium 226 %/400, memory within limits. At 15 s the
+same configuration failed (see "Unsuccessful" #1) — slots were freed too
+slowly, and 16 tabs choked the single process.
 
-Вывод: связка «короткий таймаут + больше слотов» синергична; итоговая
-конфигурация прод: `timeout: 10s`, `contexts: 8`.
+Conclusion: the "short timeout + more slots" pair is synergistic; the final
+production configuration: `timeout: 10s`, `contexts: 8`.
 
-### 4. Таймер ресайкла chromium каждые 2 ч (30.10, T-208)
+### 4. Chromium recycling timer every 2 h (Oct 30, T-208)
 
-В remote-режиме воркер не может перезапустить чужой браузер (T-065):
-без ресайкла chromium копит память 400 → 950+ МиБ за ~2 ч и таймауты
-удваиваются. Ресайкл (systemd-таймер `crawler-chromium-recycle`)
-в тот же час **уполовинил таймауты** (227 → 110). Цена — до ~10
-орфанённых в-полёте доставок на рестарт (возвращаются клеймами;
-накопление attempts при частых рестартах даёт единичный рост q:dead —
-наблюдаемо, приемлемо). Юниты в `deploy/systemd/` (T-208).
+In remote mode a worker cannot restart someone else's browser (T-065):
+without recycling chromium accumulates memory 400 → 950+ MiB over ~2 h and
+the timeouts double. The recycling (the systemd timer `crawler-chromium-recycle`)
+in the same hour **halved the timeouts** (227 → 110). The price — up to ~10
+orphaned in-flight deliveries per restart (they come back as claims;
+attempts accumulating over frequent restarts give a single-step growth of
+q:dead — observable, acceptable). The units are in `deploy/systemd/` (T-208).
 
-### 5. Флаги chromium (31.10)
+### 5. Chromium flags (Oct 31)
 
 `--disable-features=SitePerProcess,Translate,BlinkGenPropertyTrees`
-(имя фичи именно `SitePerProcess` с Chrome 96 — chromedp#1605 шлёт
-устаревшее `site-per-process`), `--disable-crash-reporter
+(the feature name is exactly `SitePerProcess` since Chrome 96 — chromedp#1605 sends
+the outdated `site-per-process`), `--disable-crash-reporter
 --disable-breakpad --no-crash-upload`, `--disable-background-networking
 --disable-sync --disable-default-apps
 --disable-client-side-phishing-detection --metrics-recording-only`,
 `--disable-background-timer-throttling
 --disable-backgrounding-occluded-windows --disable-renderer-backgrounding`
-(не душить таймеры невидимых вкладок — SPA-гидрация полным ходом).
+(do not throttle the timers of invisible tabs — SPA hydration in full swing).
 
-A/B: память chromium 528 → 458 МиБ (−13 %, site-isolation-off — меньше
-renderer-процессов), темп без изменений, крашей 0. Оставлены.
+A/B: chromium memory 528 → 458 MiB (−13 %, site-isolation-off — fewer
+renderer processes), the rate unchanged, 0 crashes. Kept.
 
-### 6. Блокировка CSS — `render.block_stylesheet: true` (31.10, T-213)
+### 6. CSS blocking — `render.block_stylesheet: true` (Oct 31, T-213)
 
-A/B: **PSI CPU 66–71 → 47–59 %** (−15–20 п.п. — режется style/layout),
-доля kernel-CPU впоследствии 47 → 23 %, детекция **без расхождений**
-(findings laravel+ и laravel_domains идентичны до/после ~50 мин
-ререндеров: 78 957 / 44 291), темп в полосе шума. Прирост темпа
-отсутствует (лимит — 16 слотов и сеть/JS страницы), ценность — запас
-CPU для прочих сервисов. Механика — расширение перечня Fetch-перехвата
-T-062 на ResourceType Stylesheet.
+A/B: **PSI CPU 66–71 → 47–59 %** (−15–20 pp — style/layout is cut),
+the kernel-CPU share afterwards 47 → 23 %, detection **without
+discrepancies** (the laravel+ and laravel_domains findings identical before/after ~50 min
+of re-renders: 78,957 / 44,291), the rate within the noise band. No rate gain
+(the limit — 16 slots and the page's network/JS), the value — CPU headroom
+for the other services. The mechanism — extending the T-062 Fetch-interception
+list with the ResourceType Stylesheet.
 
-### 7. Блокировка трекер-доменов — `render.block_tracker_domains: true` (31.10, T-214)
+### 7. Tracker domain blocking — `render.block_tracker_domains: true` (Oct 31, T-214)
 
-Аналитика приходит Script/XHR-типом (типом не режется — SPA-скрипты
-нужны), поэтому 15 специализированных доменов
-(google-analytics/googletagmanager/doubleclick/mc.yandex/…) блокируются
-парой «широкий CDP-паттерн `*домен*` → точный хостовый вердикт» в
-механике T-062, инвариант fail-open сохранён. Замеры источников: 5–15
-запросов / 100–500 КБ аналитики на страницу. Вклад в минимумы таймаутов
-(195–217/10 мин после включения).
+Analytics arrives as the Script/XHR type (it cannot be cut by type — SPA scripts
+are needed), so 15 specialized domains
+(google-analytics/googletagmanager/doubleclick/mc.yandex/…) are blocked
+by the pair "a broad CDP pattern `*domain*` → an exact host verdict" in
+the T-062 mechanics, the fail-open invariant preserved. Source measurements: 5–15
+requests / 100–500 KB of analytics per page. Contributed to the timeout minima
+(195–217/10 min after enabling).
 
-### 8. Маркер «рендер невозможен» — `render_failed_at` (31.10, T-210, миграция 000017)
+### 8. The "render impossible" marker — `render_failed_at` (Oct 31, T-210, migration 000017)
 
-Финализированные-без-рендера строки (тарпит/cert/DNS-класс;
-~180–220 тыс. по замеру T-207) прежде переиздавались проходом при
-каждом повторном флаге. Штамп в `subdomain_results` исключает их из
-выборки до смены контента (сброс — новый эпизод: починившийся хост
-отрендерится). Отштамповано 15+ тыс. строк за первые сутки.
+Rows finalized without a render (tarpit/cert/DNS class;
+~180–220k per the T-207 measurement) were previously re-published by a pass
+at every re-flag. The stamp in `subdomain_results` excludes them from the
+selection until the content changes (a reset — a new episode: a repaired host
+will get rendered). 15k+ rows stamped over the first day.
 
-### 9. DNS-финализация с первой доставки (31.10, T-211)
+### 9. DNS finalization from the first delivery (Oct 31, T-211)
 
-`net::ERR_NAME_NOT_RESOLVED` — постоянное свойство хоста: финализация
-без ретраев по механике cert-класса (замер T-207: мёртвый хост ел
-3 доставки и ~20 мин в PEL). Счётчик
+`net::ERR_NAME_NOT_RESOLVED` — a permanent property of the host: finalization
+without retries per the cert-class mechanics (the T-207 measurement: a dead host ate
+3 deliveries and ~20 min in PEL). The counter
 `crawler_render_dns_finalized_total`.
 
-### 10. PostgreSQL: `max_locks_per_transaction` 64 → 512 (29.10)
+### 10. PostgreSQL: `max_locks_per_transaction` 64 → 512 (Oct 29)
 
-Инфраструктурное: после окна T-198 (~700 партиций × hash-листья ×
-индексы ≈ 2,7 тыс. отношений) retention/count/`domain_info` падали
-`out of shared memory` — без этого фикса очистка контента не
-начиналась вовсе. ALTER SYSTEM + рестарт PG в окне.
+Infrastructure: after the T-198 window (~700 partitions × hash leaves ×
+indexes ≈ 2.7k relations) retention/count/`domain_info` fell with
+`out of shared memory` — without this fix the content cleanup did not
+start at all. ALTER SYSTEM + a PG restart in the window.
 
-## Неуспешные (проверены и отклонены)
+## Unsuccessful (verified and rejected)
 
-### 1. `render.contexts` 6 → 8 при timeout=15 с (29.10, A/B №1)
+### 1. `render.contexts` 6 → 8 with timeout=15 s (Oct 29, A/B #1)
 
-**85 против 73 дом/мин** — хуже базы: 16 вкладок насытили один
-chromium (381 %/400), таймауты ×3 (83 → 264), память браузера к 1,4 ГБ.
-Откат в тот же день. Причина провала понята позже (см. «Успешные» №3):
-при длинном таймауте слоты заняты ожиданиями, и добавка вкладок только
-усиливает конкуренцию. Урок: **contexts и timeout — связанная пара,
-A/B contexts без контекста таймаута невалиден**.
+**85 versus 73 domains/min** — worse than the baseline: 16 tabs saturated the single
+chromium (381 %/400), the timeouts ×3 (83 → 264), browser memory up to 1.4 GB.
+Rolled back the same day. The failure cause was understood later (see "Successful" #3):
+with a long timeout the slots are busy with waits, and adding tabs only
+increases the competition. Lesson: **contexts and timeout are a coupled pair,
+an A/B of contexts without the timeout context is invalid**.
 
-### 2. Второй chromium (:9223) с переводом `render-worker@9109` на него (29.10)
+### 2. A second chromium (:9223) with `render-worker@9109` moved onto it (Oct 29)
 
-**96 против 112–144 дом/мин** у одного браузера: два процесса chromium
-суммарно вышли на 400 %/400 (все ядра), темп не вырос, MemAvailable
-упал до 2,1 ГиБ. Откат (env-файл удалён, юнит disable; сам юнит с
-фиксом `ReadWritePaths` сохранён в комплекте — T-209). Диагноз:
-узкое место — 4 vCPU, а не процесс браузера; второй браузер делит те
-же ядра. Имеет смысл только на расширенном железе.
+**96 versus 112–144 domains/min** for a single browser: the two chromium
+processes together reached 400 %/400 (all cores), the rate did not grow, MemAvailable
+fell to 2.1 GiB. Rolled back (the env file removed, the unit disabled; the unit itself
+with the `ReadWritePaths` fix kept in the set — T-209). Diagnosis:
+the bottleneck is the 4 vCPU, not the browser process; the second browser shares
+the same cores. Makes sense only on extended hardware.
 
-### 3. Третий инстанс render-worker (29.10)
+### 3. A third render-worker instance (Oct 29)
 
-Отклонён без прогона: оба воркера делят один chromium (насыщен уже на
-12 вкладках), второй chromium не влезал по памяти (MemAvailable
-1,9 ГиБ < бюджета ~2 ГБ). Условие пересмотра — расширение RAM.
+Rejected without a run: both workers share one chromium (already saturated at
+12 tabs), the second chromium did not fit in memory (MemAvailable
+1.9 GiB < the ~2 GB budget). The reconsideration condition — extended RAM.
 
-### 4. `redis.max_attempts` 3 → 2 (31.10, отклонено анализом)
+### 4. `redis.max_attempts` 3 → 2 (Oct 31, rejected by analysis)
 
-Половины «потерь» не существовало (единицы: 1 домен ≈ 1,9 доставки —
-T-207), ретраи — 5–10 % доставок; таймауты и DNS-классы финализируются
-с первой доставки, попытки тут не участвуют. Минусы: таймер ресайкла
-гарантированно орфанит доставки (при 2 попытках меньше запас на
-клейм), теряются 6,6 % успешных ретраев транзиентных классов
-(CONNECTION_REFUSED, T-172), настройка глобальна на все очереди
-(DNS-пачка = 5000 доменов). Отклонено без A/B.
+Half of the "losses" did not exist (units: 1 domain ≈ 1.9 deliveries —
+T-207), retries are 5–10 % of deliveries; timeouts and DNS classes are finalized
+from the first delivery, attempts do not participate here. Cons: the recycling timer
+orphans deliveries for sure (with 2 attempts less margin for a
+claim), 6.6 % of successful retries of transient classes are lost
+(CONNECTION_REFUSED, T-172), the setting is global across all queues
+(a DNS batch = 5000 domains). Rejected without an A/B.
 
-### 5. `ERR_CONNECTION_REFUSED` в класс финализации с 1-й доставки (31.10, T-211)
+### 5. `ERR_CONNECTION_REFUSED` into the finalize-from-first-delivery class (Oct 31, T-211)
 
-Сознательно НЕ включён: по замеру T-172 у класса **6,6 % успешных
-ретраев** (0/321 у cert-кодов) — транзиентный (порт/фильтр/рестарт
-сервиса), ретраи дают реальный DOM.
+Deliberately NOT enabled: per the T-172 measurement the class has **6.6 % successful
+retries** (0/321 for cert codes) — it is transient (a port/filter/service
+restart), retries yield a real DOM.
 
-### 6. Lightpanda (CDP-браузер без рендеринга, 3–5× быстрее — по ресёрчу)
+### 6. Lightpanda (a CDP browser without rendering, 3–5× faster — per research)
 
-Отклонено по фидельности: детекция Laravel зависит от реальной гидрации
-SPA в настоящем Blink; проект молодой. Ресёрч-альтернатива зафиксирована
-как «экзотика» (источники: lightpanda.io, сравнения CDP-клиентов).
+Rejected on fidelity grounds: Laravel detection depends on the real SPA hydration
+in a real Blink; the project is young. The research alternative is pinned
+as "exotic" (sources: lightpanda.io, CDP client comparisons).
 
-## Сводная таблица
+## Summary table
 
-| # | Метод | Результат | Статус |
+| # | Method | Result | Status |
 |---|---|---|---|
-| 1 | timeout 15→10 с | слоты освобождены, тарпиты −треть | ✅ прод |
-| 2 | contexts 4→6 (при 15 с) | 80→112–144 delivery/мин | ✅ прод (эпоха 15 с) |
-| 3 | contexts 6→8 (при 10 с) | 41→106 дом/мин (×2,6) | ✅ прод |
-| 4 | ресайкл chromium 2 ч | таймауты ×0.5, память стабильна | ✅ прод |
-| 5 | флаги chromium (SitePerProcess-off и др.) | память −13 % | ✅ прод |
-| 6 | block_stylesheet | PSI CPU −15–20 п.п., детекция 0 расх. | ✅ прод |
-| 7 | block_tracker_domains | таймауты к минимумам | ✅ прод |
-| 8 | render_failed_at (T-210) | переиздания прекращены | ✅ прод |
-| 9 | DNS-финализация 1-й доставкой (T-211) | −2 доставки/−20 мин PEL на хост | ✅ прод |
-| 10 | max_locks_per_transaction 512 | retention работает | ✅ прод |
-| 11 | contexts 8 при 15 с | 73 против 85 — хуже | ❌ откат |
-| 12 | второй chromium :9223 | 96 против 112–144 — хуже | ❌ откат |
-| 13 | третий render-worker | нет CPU/RAM запаса | ❌ отклонён |
-| 14 | max_attempts 3→2 | эффект ~0, риски потери работы | ❌ отклонён |
-| 15 | CONNECTION_REFUSED → 1-я доставка | 6,6 % успешных ретраев | ❌ отклонён |
-| 16 | Lightpanda | фидельность детекции | ❌ отклонён |
+| 1 | timeout 15→10 s | slots freed, tarpits −a third | ✅ prod |
+| 2 | contexts 4→6 (at 15 s) | 80→112–144 deliveries/min | ✅ prod (the 15 s era) |
+| 3 | contexts 6→8 (at 10 s) | 41→106 domains/min (×2.6) | ✅ prod |
+| 4 | chromium recycling 2 h | timeouts ×0.5, memory stable | ✅ prod |
+| 5 | chromium flags (SitePerProcess-off etc.) | memory −13 % | ✅ prod |
+| 6 | block_stylesheet | PSI CPU −15–20 pp, detection 0 discrepancies | ✅ prod |
+| 7 | block_tracker_domains | timeouts at the minima | ✅ prod |
+| 8 | render_failed_at (T-210) | re-publishing stopped | ✅ prod |
+| 9 | DNS finalization from the 1st delivery (T-211) | −2 deliveries/−20 min PEL per host | ✅ prod |
+| 10 | max_locks_per_transaction 512 | retention works | ✅ prod |
+| 11 | contexts 8 at 15 s | 73 versus 85 — worse | ❌ rollback |
+| 12 | second chromium :9223 | 96 versus 112–144 — worse | ❌ rollback |
+| 13 | third render-worker | no CPU/RAM headroom | ❌ rejected |
+| 14 | max_attempts 3→2 | ~0 effect, work-loss risks | ❌ rejected |
+| 15 | CONNECTION_REFUSED → 1st delivery | 6.6 % successful retries | ❌ rejected |
+| 16 | Lightpanda | detection fidelity | ❌ rejected |
