@@ -1,88 +1,91 @@
-// Backpressure по глубине очереди (ТЗ 4.2: «планировщик публикует новые
-// задачи только когда длина очереди ниже порога (backpressure)», §5.3:
-// «публикует новые задачи только если длина очереди ниже порога»).
+// Backpressure by queue depth (spec 4.2: "the scheduler publishes new
+// tasks only when the queue length is below the threshold (backpressure)",
+// §5.3: "publishes new tasks only if the queue length is below the threshold").
 //
-// Механизм: перед публикацией продюсер проверяет глубину стрима и
-// публикует, только пока она ниже порога scheduler.queue_high_watermark
-// (конфиг; значение передаётся в BackpressureOptions). Гейт закрыт —
-// пауза Interval и повторная проверка; отмена ctx — чистый выход с
-// ошибкой контекста (graceful shutdown, ТЗ 3.4).
+// Mechanism: before publishing, the producer checks the stream depth and
+// publishes only while it is below the scheduler.queue_high_watermark
+// threshold (config; the value is passed via BackpressureOptions). The gate is
+// closed — pause for Interval and re-check; ctx cancellation — a clean exit
+// with a context error (graceful shutdown, spec 3.4).
 //
-// К чему применяется порог — общий для гейтируемых стримов:
-//   - q:dns — планировщик (T-028): единица стрима — пачка доменов
-//     (ТЗ 4.2), поэтому проверка перед каждым сообщением и есть
-//     «проверка перед публикацией пачки»;
-//   - q:http, q:analyze — воркеры: одна пачка q:dns порождает
-//     до scheduler.batch_size задач q:http и по задаче q:analyze на
-//     субдомен, без гейта эти стримы растут кратно быстрее q:dns и
-//     угрожают бюджету памяти Redis (≤ 0,5 ГБ, ТЗ 3.2);
-//   - q:render — публикация всегда мимо гейта (T-066: ожидание
-//     задержало бы XACK задачи q:http), ёмкость проверяет отдельно
-//     RenderQueue по порогу render.queue_high_watermark (T-174;
-//     0 — общий scheduler.queue_high_watermark): глубину стрима читает
-//     тот же BackpressureGate.Len, кламп порога — тот же
-//     StreamWatermark (проводка cmd/http-worker);
-//   - q:render-fallback не гейтируется (ТЗ 4.3 п.3): публикация —
-//     часть финализации рендер-воркера, ожидание ёмкости задержало бы
-//     XACK задачи q:render (та же патология, что убрала T-066); поток
-//     в фолбэк ограничен бюджетом доли и темпом воркера B, память —
-//     потолком MAXLEN (T-237);
-//   - q:dead не ограничивается: перенос исчерпавших попытки задач
-//     (T-025) — часть механизма надёжности и блокироваться
-//     переполнением не должен.
+// What the threshold applies to — common to all gated streams:
+//   - q:dns — the scheduler (T-028): the stream unit is a batch of domains
+//     (spec 4.2), so the check before each message is exactly the
+//     "check before publishing a batch";
+//   - q:http, q:analyze — workers: one q:dns batch produces up to
+//     scheduler.batch_size q:http tasks and one q:analyze task per
+//     subdomain; without the gate these streams grow several times faster
+//     than q:dns and threaten the Redis memory budget (≤ 0.5 GB, spec 3.2);
+//   - q:render — publication always bypasses the gate (T-066: waiting
+//     would delay the XACK of a q:http task); capacity is checked
+//     separately for RenderQueue against the render.queue_high_watermark
+//     threshold (T-174; 0 — the common scheduler.queue_high_watermark):
+//     the stream depth is read by the same BackpressureGate.Len, the
+//     threshold clamp — the same StreamWatermark (wiring in
+//     cmd/http-worker);
+//   - q:render-fallback is not gated (spec 4.3 p.3): publication is part
+//     of the render worker's finalization, waiting for capacity would
+//     delay the XACK of a q:render task (the same pathology T-066
+//     removed); the flow into the fallback is limited by the share budget
+//     and the pace of worker B, memory — by the MAXLEN cap (T-237);
+//   - q:dead is not limited: moving tasks that exhausted their attempts
+//     (T-025) is part of the reliability mechanism and must not be
+//     blocked by overflow.
 //
-// Порог живёт в секции scheduler по месту из ТЗ 5.10 (состав секций
-// фиксирован, переименование ломало бы конфиги); исключение — порог
-// ёмкости q:render: render.queue_high_watermark, T-174 (см. пункт
-// выше). Семантика зафиксирована в docs/configuration.md.
+// The threshold lives in the scheduler section, at the place from spec 5.10
+// (the set of sections is fixed, renaming would break configs); exception —
+// the q:render capacity threshold: render.queue_high_watermark, T-174 (see
+// the item above). The semantics are fixed in docs/configuration.md.
 //
-// Глубина стрима — непрочитанный группой потребителей остаток плюс
-// неподтверждённые доставки: XINFO GROUPS отдаёт по каждой группе lag
-// (записи, ещё не доставленные потребителям, Redis ≥ 7.0 — docs/redis.md
-// фиксирует 7.4) и pending (доставленные без XACK). Обе составляющие
-// убывают по мере вычитывания и подтверждения — гейт открывается
-// вместе с прогрессом потребителей. «Сырой» XLEN вместо них не годится:
-// между обрезками MAXLEN длина стрима монотонна (XACK её не уменьшает),
-// а порог ниже предела обрезки — после watermark публикация
-// останавливалась бы навсегда (защёлкивание); даже выше предела XLEN
-// считает и уже подтверждённую историю, т.е. не измеряет очередь вовсе.
+// The stream depth is the group consumers' unread remainder plus
+// unacknowledged deliveries: XINFO GROUPS returns, for each group, lag
+// (entries not yet delivered to consumers, Redis ≥ 7.0 — docs/redis.md
+// fixes 7.4) and pending (delivered without XACK). Both components
+// decrease as entries are read and acknowledged — the gate opens together
+// with consumer progress. "Raw" XLEN instead of them is no good: between
+// MAXLEN trims the stream length is monotonic (XACK does not decrease it),
+// and the threshold is below the trim cap — after the watermark, publication
+// would stop forever (latching); even above the cap, XLEN counts the
+// already acknowledged history too, i.e. it does not measure the queue at
+// all.
 //
-// Кламп лага по XLEN (T-168): lag = entries_added − entries_read и не
-// вычитает записи, срезанные XTRIM'ом/XDEL'ем недоставленными. Redis
-// 7.0.x (прод 7.0.15) в этом сценарии держит положительный фантомный
-// лаг вечно — инцидент 22–23.10.2026: после дренажа легаси-пачек T-149
-// (XTRIM q:dns MAXLEN) лаг группы dns-worker застыл на 1753 при
-// единственной записи в стриме и навсегда закрыл гейт q:dns (эффективный
-// порог 125) — планировщик молчал ~15,5 ч при 40,3 млн pending. Redis
-// 7.4+ корректирует лаг при обрезке сам, но гейт не зависит от версии
-// сервера. Недоставленные записи — подмножество записей стрима: реальный
-// непрочитанный остаток группы не больше XLEN, поэтому глубина считает
-// min(lag, XLEN) по каждой группе. Кламп никогда не занижает реальный
-// бэклог (пока недоставленные записи в стриме, lag ≤ XLEN и кламп
-// неактивен), а фантом отсекается (min(1753, 1) = 1). Pending не
-// клампится: счётчик неподтверждённых доставок всегда точен.
+// Lag clamp by XLEN (T-168): lag = entries_added − entries_read and does
+// not subtract entries cut off by XTRIM/XDEL while undelivered. Redis
+// 7.0.x (production 7.0.15) holds a positive phantom lag forever in this
+// scenario — incident of Oct 22–23, 2026: after the drain of the legacy
+// batches of T-149 (XTRIM q:dns MAXLEN) the lag of the dns-worker group
+// froze at 1753 with a single entry in the stream and closed the q:dns gate
+// forever (effective threshold 125) — the scheduler was silent for ~15.5 h
+// with 40.3M pending. Redis 7.4+ adjusts the lag on trim itself, but the
+// gate does not depend on the server version. Undelivered entries are a
+// subset of the stream entries: a group's real unread remainder is not
+// greater than XLEN, so the depth counts min(lag, XLEN) for each group.
+// The clamp never understates the real backlog (while undelivered entries
+// are in the stream, lag ≤ XLEN and the clamp is inactive), and the phantom
+// is cut off (min(1753, 1) = 1). Pending is not clamped: the
+// unacknowledged-delivery counter is always exact.
 //
-// Частные случаи глубины:
-//   - групп у стрима нет (потребители ещё не создавали): ни одна запись
-//     не доставлена — глубина равна длине стрима (XLEN);
-//   - lag неопределён (−1: обрезка MAXLEN срезала недоставленные записи
-//     или Redis < 7.0) — учитывается только pending: срезанное из стрима
-//     уже не очередь (потерю восстанавливает lease, ТЗ 3.4), а счётчик
-//     неподтверждённых доставок всегда точен.
+// Special cases of depth:
+//   - the stream has no groups (consumers have not created them yet): no
+//     entry has been delivered — the depth equals the stream length (XLEN);
+//   - lag is undefined (−1: a MAXLEN trim cut off undelivered entries or
+//     Redis < 7.0) — only pending is counted: what was cut from the stream
+//     is no longer a queue (the loss is restored by lease, spec 3.4), and
+//     the unacknowledged-delivery counter is always exact.
 //
-// Отношение порога к MAXLEN: гейт обязан срабатывать ДО обрезки —
-// обрезка удаляет записи независимо от того, прочитаны они (мягкое
-// регулирование превращается в молчаливую потерю задач). Эффективный
-// порог стрима не поднимается выше половины его предела MAXLEN
-// (watermarkFor): запас в полпредела покрывает записи, опубликованные
-// между проверкой гейта и срабатыванием обрезки. Для q:dns это
-// заодно делает порог достижимым: 100 000 записей в стриме пределом
-// 250 недостижимы — без ограничения порога гейт для q:dns не
-// включался бы никогда (регулятор — только молчаливая обрезка).
+// Relation of the threshold to MAXLEN: the gate must fire BEFORE the trim —
+// the trim removes entries regardless of whether they have been read (soft
+// regulation turns into silent task loss). The effective threshold of a
+// stream does not rise above half of its MAXLEN cap (watermarkFor): a
+// margin of half a cap covers entries published between the gate check and
+// the trim firing. For q:dns this also makes the threshold reachable:
+// 100,000 entries in the stream cannot be reached with a cap of 250 —
+// without clamping the threshold the q:dns gate would never engage at all
+// (the regulator would be only silent trimming).
 //
-// Сам гейт — мягкое регулирование (между проверкой и публикацией другие
-// продюсеры могут добавить записи); жёсткий потолок длины — MAXLEN ~
-// того же T-025.
+// The gate itself is soft regulation (between the check and the publication
+// other producers may add entries); the hard cap on length is MAXLEN ~ of
+// the same T-025.
 
 package queue
 
@@ -97,56 +100,59 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// DefaultBackpressureInterval — пауза между повторными проверками глубины
-// стрима, пока гейт закрыт (BackpressureOptions.Interval). Секунда:
-// этапы пропускают тысячи задач в секунду (ТЗ 3.3), более длинное окно
-// зря держит продюсера, более короткое — лишние обращения к Redis.
+// DefaultBackpressureInterval — the pause between repeated stream depth
+// checks while the gate is closed (BackpressureOptions.Interval). One
+// second: the stages push thousands of tasks per second (spec 3.3); a
+// longer window needlessly holds the producer, a shorter one — extra calls
+// to Redis.
 const DefaultBackpressureInterval = time.Second
 
-// redisDepth — окно в go-redis для глубины стрима: XINFO GROUPS (lag и
-// pending групп) и XLEN (запас «групп ещё нет»); узкое, как redisStreams
-// (redisq.go): юнит-тесты подменяют фейком, реальные *redis.Client и
-// *redis.ClusterClient удовлетворяют интерфейсу.
+// redisDepth — the go-redis window for stream depth: XINFO GROUPS (group
+// lag and pending) and XLEN (the fallback for "no groups yet"); narrow,
+// like redisStreams (redisq.go): unit tests substitute a fake, real
+// *redis.Client and *redis.ClusterClient satisfy the interface.
 type redisDepth interface {
 	XLen(ctx context.Context, key string) *redis.IntCmd
 	XInfoGroups(ctx context.Context, key string) *redis.XInfoGroupsCmd
 }
 
-// BackpressureOptions — параметры гейта; неположительные Interval и
-// nil Log заменяются дефолтами в конструкторе (стиль RedisOptions).
+// BackpressureOptions — gate parameters; non-positive Interval and nil Log
+// are replaced with defaults in the constructor (RedisOptions style).
 type BackpressureOptions struct {
-	// Watermark — порог глубины стрима (scheduler.queue_high_watermark):
-	// публикация разрешена при depth < Watermark, depth == Watermark —
-	// гейт закрыт («строго ниже порога», ТЗ 4.2/5.3). Значение ≤ 0 отключает
-	// гейт (публикация без ожидания) — как MaxLen = 0 в RedisOptions.
-	// Эффективный порог конкретного стрима не выше половины его предела
-	// MAXLEN (см. шапку файла и watermarkFor).
+	// Watermark — the stream depth threshold (scheduler.queue_high_watermark):
+	// publication is allowed when depth < Watermark, depth == Watermark —
+	// the gate is closed ("strictly below the threshold", spec 4.2/5.3). A
+	// value ≤ 0 disables the gate (publication without waiting) — like
+	// MaxLen = 0 in RedisOptions. The effective threshold of a specific
+	// stream is no higher than half of its MAXLEN cap (see the file header
+	// and watermarkFor).
 	Watermark int64
-	// MaxLen — предел длины стримов политики MAXLEN, зеркалит
-	// RedisOptions.MaxLen (0 — пределы по стримам T-025,
-	// queue.DefaultStreamMaxLen). Гейту нужен, чтобы порог не поднялся
-	// выше предела обрезки стрима.
+	// MaxLen — the stream length cap of the MAXLEN policy, mirrors
+	// RedisOptions.MaxLen (0 — per-stream caps of T-025,
+	// queue.DefaultStreamMaxLen). The gate needs it so that the threshold
+	// does not rise above the stream trim cap.
 	MaxLen int64
-	// Interval — пауза между повторными проверками при закрытом гейте;
-	// 0 — DefaultBackpressureInterval.
+	// Interval — the pause between repeated checks while the gate is
+	// closed; 0 — DefaultBackpressureInterval.
 	Interval time.Duration
-	// Log — логгер гейта: одна запись Warn при входе в ожидание
-	// (переполнение очередей видно в логах рядом с метриками ТЗ 5.9);
-	// nil — записи подавлены (slog.DiscardHandler, стиль RecheckOptions).
+	// Log — the gate logger: one Warn entry when entering the wait (queue
+	// overflow is visible in the logs next to the spec 5.9 metrics); nil —
+	// entries are suppressed (slog.DiscardHandler, RecheckOptions style).
 	Log *slog.Logger
 }
 
-// BackpressureGate — гейт ёмкости стрима: ждёт, пока глубина стрима
-// опустится ниже порога (backpressure, ТЗ 4.2/5.3). Применяется сам по
-// себе (планировщику T-028 выгодно проверить ёмкость до выборки пачки
-// из БД: полон стрим — пачка не выбирается) и внутри WatermarkPublisher.
+// BackpressureGate — the stream capacity gate: waits until the stream depth
+// drops below the threshold (backpressure, spec 4.2/5.3). Used on its own
+// (for the scheduler of T-028 it pays to check capacity before selecting a
+// batch from the DB: the stream is full — the batch is not selected) and
+// inside WatermarkPublisher.
 type BackpressureGate struct {
 	rdb redisDepth
 	opt BackpressureOptions
 }
 
-// NewBackpressureGate строит гейт поверх клиента go-redis — того же,
-// что у RedisQueue (одна точка правды о глубине стримов).
+// NewBackpressureGate builds the gate on top of the go-redis client — the
+// same one as RedisQueue (a single source of truth about stream depth).
 func NewBackpressureGate(rdb redisDepth, opt BackpressureOptions) *BackpressureGate {
 	if opt.Interval <= 0 {
 		opt.Interval = DefaultBackpressureInterval
@@ -157,8 +163,9 @@ func NewBackpressureGate(rdb redisDepth, opt BackpressureOptions) *BackpressureG
 	return &BackpressureGate{rdb: rdb, opt: opt}
 }
 
-// streamMaxLen — предел длины стрима политики MAXLEN: явный из опций
-// (RedisOptions.MaxLen того же сервиса) или по стримам T-025.
+// streamMaxLen — the stream length cap of the MAXLEN policy: explicit from
+// the options (RedisOptions.MaxLen of the same service) or per-stream of
+// T-025.
 func (g *BackpressureGate) streamMaxLen(stream string) int64 {
 	if g.opt.MaxLen > 0 {
 		return g.opt.MaxLen
@@ -166,27 +173,28 @@ func (g *BackpressureGate) streamMaxLen(stream string) int64 {
 	return DefaultStreamMaxLen(stream)
 }
 
-// watermarkFor — эффективный порог стрима: настроенный Watermark, но не
-// выше половины предела MAXLEN стрима (гейт срабатывает до обрезки,
-// см. шапку файла). Watermark ≤ 0 — гейт отключён (0).
+// watermarkFor — the effective stream threshold: the configured Watermark,
+// but no higher than half of the stream MAXLEN cap (the gate fires before
+// the trim, see the file header). Watermark ≤ 0 — the gate is disabled (0).
 func (g *BackpressureGate) watermarkFor(stream string) int64 {
 	return StreamWatermark(g.opt.Watermark, g.streamMaxLen(stream), stream)
 }
 
-// StreamWatermark — эффективный порог глубины стрима: настроенный
-// watermark, ограниченный половиной предела длины стрима maxLen
-// (0 — предел по стримам политики T-025, DefaultStreamMaxLen). Гейт
-// обязан срабатывать ДО обрезки MAXLEN: обрезка удаляет записи независимо
-// от того, прочитаны они, — порог выше предела превращал бы мягкое
-// регулирование в молчаливую потерю задач. Экспортировано для мониторинга
-// (алерт переполнения очередей, T-080): порог алерта совпадает с порогом
-// гейта по каждому стриму. watermark ≤ 0 — 0 (гейт отключён).
+// StreamWatermark — the effective stream depth threshold: the configured
+// watermark capped at half of the stream length cap maxLen (0 — per-stream
+// caps of the T-025 policy, DefaultStreamMaxLen). The gate must fire BEFORE
+// the MAXLEN trim: the trim removes entries regardless of whether they have
+// been read — a threshold above the cap would turn soft regulation into
+// silent task loss. Exported for monitoring (the queue overflow alert,
+// T-080): the alert threshold coincides with the gate threshold for each
+// stream. watermark ≤ 0 — 0 (the gate is disabled).
 func StreamWatermark(watermark, maxLen int64, stream string) int64 {
-	// Эквивалентные мутанты (T-M04): `<= 0` → `< 0`/`<= -1` неотличимы —
-	// watermark 0 без раннего возврата даёт min(0, maxLen/2) = 0 (maxLen
-	// после замены ≤ 0 — положительный предел политики), отрицательные
-	// возвращаются нулём в обеих ветках. `<= 1` (numbers/incrementer)
-	// отличим тестом на watermark 1 и не гасится.
+	// Equivalent mutants (T-M04): `<= 0` → `< 0`/`<= -1` are
+	// indistinguishable — watermark 0 without the early return gives
+	// min(0, maxLen/2) = 0 (maxLen after the replacement ≤ 0 — a positive
+	// policy cap), negative values return zero in both branches. `<= 1`
+	// (numbers/incrementer) is distinguishable by a test on watermark 1
+	// and is not suppressed.
 	// mutator-disable-next-line expression/comparison, numbers/decrementer
 	if watermark <= 0 {
 		return 0
@@ -197,36 +205,37 @@ func StreamWatermark(watermark, maxLen int64, stream string) int64 {
 	return min(watermark, maxLen/2)
 }
 
-// GroupDepth — глубина одной группы потребления: непрочитанный остаток
-// (min(lag, xlen) — кламп T-168, см. шапку файла) плюс неподтверждённые
-// доставки (pending). Общая точка правды формулы глубины: гейт
-// (BackpressureGate.Len), алерт замороженной очереди (T-162,
-// monitor.RedisStreamGroups) и строка «Очереди» отчёта нагрузки (T-173,
-// monitor.RedisQueues) считают глубину только через неё — наблюдение
-// (status, crawler_queue_depth, отчёт) и гейт не имеют права разойтись
-// о том, есть ли работа. lag < 0 (−1 — неопределён: обрезка срезала
-// недоставленное или Redis < 7.0) — вклад только pending: срезанное из
-// стрима уже не очередь, а счётчик неподтверждённых доставок всегда точен.
+// GroupDepth — the depth of a single consumer group: the unread remainder
+// (min(lag, xlen) — the T-168 clamp, see the file header) plus
+// unacknowledged deliveries (pending). The common source of truth of the
+// depth formula: the gate (BackpressureGate.Len), the frozen-queue alert
+// (T-162, monitor.RedisStreamGroups) and the "Queues" line of the load
+// report (T-173, monitor.RedisQueues) compute depth only through it — the
+// observation (status, crawler_queue_depth, the report) and the gate must
+// not disagree about whether there is work. lag < 0 (−1 — undefined: the
+// trim cut off undelivered entries or Redis < 7.0) — only the pending
+// contribution: what was cut from the stream is no longer a queue, and the
+// unacknowledged-delivery counter is always exact.
 func GroupDepth(g redis.XInfoGroup, xlen int64) int64 {
-	depth := g.Pending // доставленные без XACK — тоже очередь
-	// Эквивалентные мутанты (T-M04): `>= 0` → `> 0`/`>= 1` отличаются
-	// только при Lag == 0 — прибавка нуля сумму не меняет. `>= -1`
-	// (numbers/decrementer) отличим при Lag == −1 (неопределён) и
-	// не гасится.
+	depth := g.Pending // delivered without XACK — queue as well
+	// Equivalent mutants (T-M04): `>= 0` → `> 0`/`>= 1` differ only when
+	// Lag == 0 — adding zero does not change the sum. `>= -1`
+	// (numbers/decrementer) is distinguishable at Lag == −1 (undefined)
+	// and is not suppressed.
 	// mutator-disable-next-line expression/comparison, numbers/incrementer
-	if g.Lag >= 0 { // −1 — неопределён (обрезка недоставленного)
+	if g.Lag >= 0 { // −1 — undefined (trim of undelivered entries)
 		depth += min(g.Lag, xlen)
 	}
 	return depth
 }
 
-// Len возвращает глубину стрима — backlog его групп потребителей:
-// непрочитанный остаток (lag, ограниченный длиной стрима — кламп T-168,
-// см. шапку файла и GroupDepth) плюс неподтверждённые доставки (pending),
-// по всем группам стрима (в бою у рабочего стрима одна группа —
-// потребители этапа). Групп нет — глубина равна длине стрима (XLEN): ни
-// одна запись не доставлена. Подробности и обоснование метрики — в
-// шапке файла.
+// Len returns the stream depth — the backlog of its consumer groups: the
+// unread remainder (lag, capped by the stream length — the T-168 clamp, see
+// the file header and GroupDepth) plus unacknowledged deliveries (pending),
+// across all groups of the stream (in production a working stream has one
+// group — the stage's consumers). No groups — the depth equals the stream
+// length (XLEN): no entry has been delivered. Details and the rationale of
+// the metric — in the file header.
 func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error) {
 	if !knownStream(stream) {
 		return 0, fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
@@ -236,9 +245,10 @@ func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error
 	}
 	groups, err := g.rdb.XInfoGroups(ctx, stream).Result()
 	if err != nil {
-		// Стрима ещё нет — Redis отвечает ошибкой no such key (а не
-		// пустым списком): групп нет, глубина без доставок равна длине
-		// стрима, XLEN несуществующего ключа вернёт 0.
+		// The stream does not exist yet — Redis answers with the no such
+		// key error (not an empty list): no groups, depth without
+		// deliveries equals the stream length, XLEN of a nonexistent key
+		// returns 0.
 		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 			groups = nil
 		} else {
@@ -252,15 +262,15 @@ func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error
 		}
 		return n, nil
 	}
-	// Кламп лага (T-168) — в GroupDepth: XLEN — верхняя грань
-	// непрочитанного остатка каждой группы (недоставленные записи живут
-	// в стриме). Читается один раз на вызов и клампует каждую группу
-	// общим XLEN: несколько групп стрима читают одни и те же записи,
-	// сумма их недоставленных может перекрываться, но каждая — честный
-	// бэклог своей группы; группа без доставок (lag = entries_added)
-	// ограничивается тем, что физически осталось в стриме. Стрим,
-	// исчезнувший между XINFO и XLEN (DEL/обрезка в 0), даёт XLEN 0 —
-	// глубина вырождается в pending, консервативно.
+	// The lag clamp (T-168) — in GroupDepth: XLEN is the upper bound of
+	// each group's unread remainder (undelivered entries live in the
+	// stream). It is read once per call and clamps every group with the
+	// common XLEN: several groups of a stream read the same entries, the
+	// sum of their undelivered may overlap, but each is an honest backlog
+	// of its own group; a group without deliveries (lag = entries_added)
+	// is limited by what physically remains in the stream. A stream that
+	// disappeared between XINFO and XLEN (DEL/trim to 0) gives XLEN 0 —
+	// the depth degenerates into pending, conservatively.
 	xlen, err := g.rdb.XLen(ctx, stream).Result()
 	if err != nil {
 		return 0, fmt.Errorf("queue: глубина %s (кламп лага, XLEN): %w", stream, err)
@@ -272,15 +282,15 @@ func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error
 	return depth, nil
 }
 
-// AwaitCapacity ждёт, пока глубина стрима станет ниже порога, и
-// возвращает nil — публиковать можно. Стрим не ниже порога — пауза
-// Interval и повтор; отмена ctx — ошибка контекста (чистый выход,
-// ТЗ 3.4). Ошибка чтения глубины возвращается сразу: гейт не гадает о
-// глубине (недоступный Redis — не «очередь пуста»), решение о повторе
-// принимает вызывающий цикл.
+// AwaitCapacity waits until the stream depth drops below the threshold and
+// returns nil — publishing is allowed. The stream is at or above the
+// threshold — pause Interval and retry; ctx cancellation — a context error
+// (clean exit, spec 3.4). A depth read error returns immediately: the gate
+// does not guess the depth (an unavailable Redis is not "the queue is
+// empty"), the calling loop decides whether to retry.
 //
-// Отключённый гейт (Watermark ≤ 0), q:dead и q:render-fallback (ТЗ 4.3
-// п.3) проходят без обращения к Redis (см. шапку файла).
+// A disabled gate (Watermark ≤ 0), q:dead and q:render-fallback (spec 4.3
+// p.3) pass without touching Redis (see the file header).
 func (g *BackpressureGate) AwaitCapacity(ctx context.Context, stream string) error {
 	watermark := g.watermarkFor(stream)
 	if watermark <= 0 || stream == StreamDead || stream == StreamRenderFallback {
@@ -308,31 +318,31 @@ func (g *BackpressureGate) AwaitCapacity(ctx context.Context, stream string) err
 	}
 }
 
-// WatermarkPublisher — обёртка над Queue: публикация проходит только под
-// водяным знаком (backpressure, ТЗ 4.2/5.3). Сам реализует интерфейс
-// Queue (декоратор): Consume и Ack передаются обёрнутой очереди без
-// изменений — гейт касается только производителей; планировщик (T-028)
-// и воркеры работают с обычной Queue, не зная о Redis-специфике глубины
-// (транспорт заменяем, ТЗ 4.2 — потому гейт и не встроен в
-// RedisQueue.Publish).
+// WatermarkPublisher — a wrapper over Queue: publication passes only under
+// the watermark (backpressure, spec 4.2/5.3). It implements the Queue
+// interface itself (a decorator): Consume and Ack are passed to the wrapped
+// queue unchanged — the gate concerns only producers; the scheduler (T-028)
+// and workers work with the usual Queue, unaware of the Redis-specific
+// depth (the transport is replaceable, spec 4.2 — that is why the gate is
+// not built into RedisQueue.Publish).
 type WatermarkPublisher struct {
 	Queue
 	gate *BackpressureGate
 }
 
-// NewWatermarkPublisher оборачивает очередь q гейтом gate: каждый вызов
-// Publish сначала ждёт ёмкости стрима, затем публикует. Гейт nil —
-// публикация ошибкой: обёртка без контроля потока бессмысленна, молча
-// терять его хуже.
+// NewWatermarkPublisher wraps the queue q with the gate gate: every
+// Publish call first waits for stream capacity, then publishes. A nil gate
+// — publication is an error: a wrapper without flow control is meaningless,
+// and silently losing it is worse.
 func NewWatermarkPublisher(q Queue, gate *BackpressureGate) *WatermarkPublisher {
 	return &WatermarkPublisher{Queue: q, gate: gate}
 }
 
-// Publish публикует сообщение после ожидания ёмкости стрима
-// (AwaitCapacity): q:dead и отключённый гейт публикуют сразу. Цена —
-// одно дополнительное чтение глубины на публикацию: локальный Redis
-// держит десятки тысяч операций в секунду, а свежая глубина важнее кэша
-// (порог могут закрыть и другие продюсеры).
+// Publish publishes the message after waiting for stream capacity
+// (AwaitCapacity): q:dead and a disabled gate publish immediately. The cost
+// is one extra depth read per publication: the local Redis handles tens of
+// thousands of operations per second, and a fresh depth matters more than a
+// cache (other producers can close the threshold too).
 func (p *WatermarkPublisher) Publish(ctx context.Context, stream string, msg Message) (string, error) {
 	if p.gate == nil {
 		return "", fmt.Errorf("queue: публикация %s: гейт не задан (NewWatermarkPublisher)", stream)

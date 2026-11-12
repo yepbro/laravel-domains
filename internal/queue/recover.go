@@ -1,23 +1,24 @@
-// Возврат зависших доставок в работу (T-025, ТЗ 4.2: «зависшие сообщения
-// забираются через XAUTOCLAIM»): фоновый цикл RecoverLoop рядом с
-// потреблением воркера. Reliab.Claim возвращает записи, зависшие в
-// pending группы (прочитаны и не подтверждены — воркер пал или завис),
-// RecoverLoop обрабатывает их тем же паттерном Processing — обработка и
-// запись результата в БД → XACK, — каким воркер берёт свежие доставки:
-// идемпотентность записей (ТЗ 3.4) позволяет смешивать повторы со
-// свежими задачами без отдельного обработчика.
+// Returning stalled deliveries to work (T-025, spec 4.2: "stalled
+// messages are taken over via XAUTOCLAIM"): the RecoverLoop background
+// loop next to the worker's consumption. Reliab.Claim returns entries
+// stalled in the group's pending (read and not acknowledged — the worker
+// died or hung), RecoverLoop processes them with the same Processing
+// pattern — processing and writing the result to the DB → XACK — the
+// worker uses for fresh deliveries: the idempotence of the entries
+// (spec 3.4) allows mixing repeats with fresh tasks without a separate
+// handler.
 //
-// Записи, исчерпавшие лимит попыток (redis.max_attempts), Claim переводит
-// в q:dead сам (T-025) — RecoverLoop их не видит. Восстановитель
-// запускается в каждом экземпляре воркера от имени его же потребителя:
-// клейм конкурентен и безопасен (XAUTOCLAIM атомарно перезакрепляет
-// запись), единственный владелец не нужен.
+// Entries that exhausted the attempt limit (redis.max_attempts) Claim
+// moves to q:dead itself (T-025) — RecoverLoop does not see them. The
+// recoverer is started in every worker instance on behalf of its own
+// consumer: the claim is concurrent and safe (XAUTOCLAIM atomically
+// re-pins the entry), a single owner is not needed.
 //
-// До включения восстановителя запись, не подтверждённая крашем воркера,
-// оставалась в PEL навсегда: повторной доставки не было, q:dead был
-// недостижим, а lease (T-029) возвращает только задачи q:dns — домены
-// остальных этапов уже в check_state = done (ТЗ 7) и восстановления не
-// имеют.
+// Before the recoverer existed, an entry left unacknowledged by a worker
+// crash stayed in the PEL forever: there was no redelivery, q:dead was
+// unreachable, and lease (T-029) returns only q:dns tasks — the domains
+// of the other stages are already in check_state = done (spec 7) and
+// have no recovery.
 
 package queue
 
@@ -28,67 +29,74 @@ import (
 	"time"
 )
 
-// DefaultRecoverInterval — период опроса зависших записей. Один
-// XAUTOCLAIM на воркер за период — дёшев; латентность возврата —
-// MinIdle плюс до одного интервала (запись становится доступной клейму
-// только после MinIdle простоя, чаще опрашивать незачем). Настройка —
+// DefaultRecoverInterval — the polling period for stalled entries. One
+// XAUTOCLAIM per worker per period — cheap; the return latency is MinIdle
+// plus up to one interval (an entry becomes eligible for a claim only
+// after MinIdle of idleness, polling more often is pointless). Setting —
 // redis.recover_interval (T-153).
 const DefaultRecoverInterval = 30 * time.Second
 
-// DefaultRecoverBatch — пачка клейма за один проход. T-025 брал окно
-// потребления воркеров (16 записей) — восстановитель жил в темпе
-// основного цикла; T-153 поднимает пачку до 64 и выносит темп обхода
-// (batch/interval) в redis.recover_batch/recover_interval: при 16/30 с
-// обход PEL ~5К записей занимает ≈2,6 ч — в инциденте 22.10 (OOM Redis)
-// дожигание попыток одной когорты растянулось на 12 ч (этап 23,
-// tasks.md), здоровые задачи ждали возврата часами. Стоимость
-// повторной обработки клеймнутых ограничена идемпотентностью (ТЗ 3.4:
-// повтор Processing — то же «результат в БД → XACK») — подъём пачки
-// стоит только времени этапа, не корректности.
+// DefaultRecoverBatch — the claim batch per pass. T-025 took the workers'
+// consumption window (16 entries) — the recoverer lived at the pace of
+// the main loop; T-153 raises the batch to 64 and takes the traversal
+// pace (batch/interval) out to redis.recover_batch/recover_interval: at
+// 16/30 s a PEL traversal of ~5k entries takes ≈2.6 h — in the Oct 22
+// incident (Redis OOM) the attempt burn-down of a single cohort stretched
+// to 12 h (stage 23, tasks.md), healthy tasks waited hours for their
+// return. The cost of re-processing claimed entries is bounded by
+// idempotence (spec 3.4: a repeat of Processing — the same "result in
+// the DB → XACK") — raising the batch costs only stage time, not
+// correctness.
 //
-// Инвариант выбора: RecoverLoop обходит пачку последовательно и держит
-// её записи в PEL всё время обхода, поэтому время обработки пачки
-// (худшая запись × batch) должно оставаться меньше claim_min_idle
-// (10 мин), иначе хвост пачки перехватывается RecoverLoop соседнего
-// воркера (+1 попытка за круг — тот же механизм дожигания). Типовая
-// запись рендера ~5 с (замер T-092 §4: 4 контекста ≈ 0,78 стр/с):
-// 64 × 5 с ≈ 5,3 мин < 10 мин — запас ×1,9. Предельная запись
-// (тарпит, render.timeout 25 с): 64 × 25 с ≈ 26,7 мин — пачка целиком
-// из тарпитов перклеймится в хвосте, осознанный предел дефолта (не 128+:
-// 128 × 5 с ≈ 10,7 мин уже не укладывается и типовым случаем); при
-// подъёме batch пропорционально поднимают claim_min_idle — расчёт
-// в docs/configuration.md, раздел redis.
+// Selection invariant: RecoverLoop traverses the batch sequentially and
+// keeps its entries in the PEL for the whole traversal, so the batch
+// processing time (the worst entry × batch) must stay below
+// claim_min_idle (10 min), otherwise the batch tail is intercepted by the
+// neighbouring worker's RecoverLoop (+1 attempt per round — the same
+// burn-down mechanism). A typical render entry is ~5 s (the measurement
+// T-092 §4: 4 contexts ≈ 0.78 pages/s): 64 × 5 s ≈ 5.3 min < 10 min — a
+// ×1.9 margin. A limiting entry (tarpit, render.timeout 25 s): 64 × 25 s
+// ≈ 26.7 min — a batch made entirely of tarpits will be re-claimed in the
+// tail, a deliberate limit of the default (not 128+: 128 × 5 s ≈ 10.7 min
+// no longer fits the typical case either); when raising batch, raise
+// claim_min_idle proportionally — the calculation is in
+// docs/configuration.md, the redis section.
 const DefaultRecoverBatch = 64
 
-// refundTimeout — бюджет возвратов попыток одного прохода клейма
-// (T-222/T-260): отдельный контекст по образцу discardTimeout (ingest,
-// pipeline.discard) — возврат обязан переживать отмену контекста цикла
-// (уже отменён), но не висеть дольше бюджета graceful shutdown (10 с,
-// service.DefaultShutdownTimeout). Бюджет один на все возвраты прохода
-// — необработанный хвост при отмене И записи без классификации
-// (RefundUnclassified, T-260): независимые бюджеты суммировались бы
-// до 2 × 5 с — весь бюджет остановки; одна-две команды Redis на
-// возврат укладываются в общий бюджет с большим запасом.
+// refundTimeout — the budget of attempt refunds of one claim pass
+// (T-222/T-260): a separate context modeled after discardTimeout (ingest,
+// pipeline.discard) — the refund must survive the cancellation of the
+// loop's context (already cancelled), but must not hang longer than the
+// graceful shutdown budget (10 s, service.DefaultShutdownTimeout). The
+// budget is one for all refunds of the pass — the unprocessed tail on
+// cancellation AND entries without classification (RefundUnclassified,
+// T-260): independent budgets would sum up to 2 × 5 s — the whole stop
+// budget; one or two Redis commands per refund fit into the common
+// budget with a wide margin.
 const refundTimeout = 5 * time.Second
 
-// RecoverOptions — параметры цикла RecoverLoop; нулевые значения
-// заменяются дефолтами (withDefaults, стиль ReliabOptions).
+// RecoverOptions — the RecoverLoop parameters; zero values are replaced
+// with defaults (withDefaults, the ReliabOptions style).
 type RecoverOptions struct {
-	// Stream — рабочий стрим потребления воркера (константы пакета).
+	// Stream — the worker's working consumption stream (package
+	// constants).
 	Stream string
-	// Group — группа потребителей стрима (та же, что у Consume воркера).
+	// Group — the stream's consumer group (the same as the worker's
+	// Consume).
 	Group string
-	// Consumer — имя потребителя: то же, что у Consume воркера, — клейм
-	// закрепляет записи за ним же, PEL не расползается по именам.
+	// Consumer — the consumer name: the same as the worker's Consume —
+	// the claim pins the entries to it too, the PEL does not sprawl
+	// across names.
 	Consumer string
-	// Batch — размер пачки клейма; 0 — DefaultRecoverBatch. Настройка
-	// боевых сборок — redis.recover_batch (T-153); инвариант выбора
-	// дефолта — DefaultRecoverBatch выше.
+	// Batch — the claim batch size; 0 — DefaultRecoverBatch. Setting
+	// production builds — redis.recover_batch (T-153); the default
+	// selection invariant — DefaultRecoverBatch above.
 	Batch int
-	// Interval — период опроса при пустом клейме; 0 —
-	// DefaultRecoverInterval. Настройка — redis.recover_interval (T-153).
+	// Interval — the polling period on an empty claim; 0 —
+	// DefaultRecoverInterval. Setting — redis.recover_interval (T-153).
 	Interval time.Duration
-	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
+	// Log — the loop logger; nil — entries are suppressed
+	// (slog.DiscardHandler).
 	Log *slog.Logger
 }
 
@@ -102,20 +110,22 @@ func (o RecoverOptions) withDefaults() RecoverOptions {
 	return o
 }
 
-// RecoverLoop — фоновый цикл возврата зависших доставок (T-025): тик —
-// Claim пачки → Processing каждой записи с обработчиком process (тем же,
-// что у основного цикла воркера). Полная пачка — немедленный повтор
-// (дренаж зависшего за простой), неполная/пустая — ожидание тика: живой
-// PEL невелик. Ошибка клейма или обработки не останавливает цикл:
-// логируется Warn, очередной тик повторит (контракт OnRun каркаса,
-// T-012; не подтверждённая обработкой запись вернётся следующим клеймом,
-// счётчик попыток ускорит перевод в q:dead). Работает до отмены ctx и
-// возвращает nil — graceful shutdown (ТЗ 3.4): начатая обработка
-// дорабатывает или остаётся неподтверждённой, а необработанный хвост
-// пачки получает попытку назад (Refund, T-222) — отмена не сжигает
-// доставку записи, до которой обход не дошёл; записи без завершённой
-// классификации (сбой чтения счётчика после клейма) получают попытку
-// назад тем же проходом (RefundUnclassified, T-260/ФТ-6.2).
+// RecoverLoop — the background loop returning stalled deliveries (T-025):
+// a tick — a batch Claim → Processing of each entry with the process
+// handler (the same one as the worker's main loop). A full batch — an
+// immediate repeat (draining what stalled during idleness), a partial/
+// empty one — wait for a tick: a live PEL is small. A claim or processing
+// error does not stop the loop: it is logged as Warn, the next tick will
+// retry (the OnRun contract of the framework, T-012; an entry not
+// confirmed by processing will come back with the next claim, the attempt
+// counter will speed up the move to q:dead). It runs until ctx is
+// cancelled and returns nil — graceful shutdown (spec 3.4): processing
+// already started finishes or stays unacknowledged, and the unprocessed
+// batch tail gets its attempt back (Refund, T-222) — cancellation does
+// not burn the delivery of an entry the traversal did not reach; entries
+// without a finished classification (a counter read failure after the
+// claim) get their attempt back in the same pass (RefundUnclassified,
+// T-260/FR-6.2).
 func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, Delivery) error, opt RecoverOptions) error {
 	if process == nil {
 		return errors.New("queue: цикл возврата зависших: обработчик не задан")
@@ -125,23 +135,24 @@ func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, D
 	}, opt)
 }
 
-// RecoverLoopAttempt — RecoverLoop для обработчика с номером попытки
-// доставки (T-148): каждой клеймнутой записи передаётся Claimed.Attempts
-// (счётчик доставок PEL: первое чтение группы + каждый клейм; свежей
-// доставке соответствовал бы 1). Обработчик видит, какая это по счёту
-// доставка, и применяет раздельную политику ошибок (таймаут-тарпит против
-// повторимой, T-148), не храня состояние между доставками: счётчик живёт
-// в Redis и переживает рестарты воркеров.
+// RecoverLoopAttempt — RecoverLoop for a handler with the delivery
+// attempt number (T-148): each claimed entry is passed Claimed.Attempts
+// (the PEL delivery counter: the group's first read + each claim; a fresh
+// delivery would correspond to 1). The handler sees which delivery this
+// is and applies a split error policy (a timeout tarpit vs a retryable
+// one, T-148) without keeping state between deliveries: the counter lives
+// in Redis and survives worker restarts.
 //
-// Гейт записи (T-152): перед каждым проходом клейма проверяется
-// доступность Redis на запись (Reliab.Writable — SET короткоживущего
-// ключа). Недоступный для записи Redis (OOM noeviction, обрыв) делает
-// клейм бессмысленным: обработка зависшей записи вернётся той же ошибкой
-// публикации результата, а счётчик доставок вырастет — клейм без шанса
-// записать результат только жжёт попытки к q:dead (корень инцидента
-// 22–23.10: 5507 смертей при исправной обработке, §11.1). Проход
-// пропускается до следующего тика; запись восстановилась — клейм и
-// обработка продолжаются, попытки не потеряны (at-least-once, ТЗ 3.4).
+// The entry gate (T-152): before each claim pass, Redis write
+// availability is checked (Reliab.Writable — a SET of a short-lived
+// key). A Redis unavailable for writing (OOM noeviction, a drop) makes
+// the claim pointless: processing a stalled entry would come back with
+// the same result publication error, and the delivery counter would grow
+// — a claim with no chance to write the result only burns attempts
+// toward q:dead (the root of the Oct 22–23 incident: 5,507 deaths with
+// healthy processing, §11.1). The pass is skipped until the next tick;
+// if Redis recovered — the claim and processing continue, attempts are
+// not lost (at-least-once, spec 3.4).
 func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Context, Delivery, int) error, opt RecoverOptions) error {
 	if r == nil {
 		return errors.New("queue: цикл возврата зависших: слой надёжности не задан (NewReliab)")
@@ -158,25 +169,26 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 		"stream", o.Stream, "group", o.Group, "consumer", o.Consumer,
 		"batch", o.Batch, "interval", o.Interval.String())
 
-	// claim — один проход: клейм пачки и обработка каждой записи
-	// паттерном Processing (результат в БД → XACK). Возвращает размер
-	// пачки клейма для решения «дренаж или тик». Частичный сбой Claim
-	// (счётчик одной записи) не отменяет валидную часть — она
-	// обрабатывается, ошибка логируется. Курсор обхода PEL переносится
-	// между проходами: большой PEL перечитывается страницами, а не с
-	// начала на каждом тике (Q-07).
+	// claim — one pass: the claim of a batch and processing of each
+	// entry with the Processing pattern (the result in the DB → XACK).
+	// Returns the claim batch size for the "drain or tick" decision. A
+	// partial Claim failure (one entry's counter) does not cancel the
+	// valid part — it is processed, the error is logged. The PEL
+	// traversal cursor is carried between passes: a large PEL is re-read
+	// in pages, not from the start on every tick (Q-07).
 	cursor := "0-0"
-	// refund — возврат попыток необработанному хвосту пачки при отмене
-	// (T-222): XAUTOCLAIM инкрементирует счётчик доставок всей пачке в
-	// момент клейма, а отмена посреди обхода (graceful shutdown: бюджет
-	// остановки меньше времени обработки пачки) оставляла записи, до
-	// которых обход не дошёл, с сожжённой попыткой без единого вызова
-	// обработчика — по попытке за рестарт, до q:dead без обработки.
-	// Возврат — XCLAIM JUSTID RETRYCOUNT (Reliab.Refund) под коротким
-	// ctx: контекст цикла к этому моменту уже отменён. Запись, начатая
-	// обработкой (ProcessAttempt успел вернуться), попытку расходует —
-	// доставка состоялась; попытку возвращает только запись, чья
-	// обработка не начиналась.
+	// refund — returning attempts to the unprocessed batch tail on
+	// cancellation (T-222): XAUTOCLAIM increments the delivery counter of
+	// the whole batch at the moment of the claim, and a cancellation in
+	// the middle of the traversal (graceful shutdown: the stop budget is
+	// smaller than the batch processing time) left entries the traversal
+	// did not reach with a burned attempt and not a single handler call —
+	// an attempt per restart, toward q:dead without processing. The
+	// refund — XCLAIM JUSTID RETRYCOUNT (Reliab.Refund) under a short
+	// ctx: the loop's context is already cancelled by then. An entry
+	// started by processing (ProcessAttempt had time to return) spends
+	// the attempt — the delivery happened; only an entry whose
+	// processing did not start gets the attempt back.
 	refund := func(rctx context.Context, rest []Claimed) {
 		if err := r.Refund(rctx, o.Group, o.Consumer, rest); err != nil {
 			log.Warn("возврат зависших доставок: попытки необработанного хвоста не возвращены — записи уязвимы к дожиганию до q:dead (T-222)",
@@ -185,14 +197,15 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 			log.Info("возврат зависших доставок: попытки необработанного хвоста возвращены", "n", len(rest))
 		}
 	}
-	// refundUnclassified — возврат попыток записям без классификации
-	// (T-260, ФТ-6.2): клейм XAUTOCLAIM списал попытку, а чтение
-	// счётчика XPENDING сбойнуло — до фикса такая попытка сгорала
-	// бесследно (Refund требует известный счётчик). Вызывается
-	// немедленно после Claim тем же проходом цикла: окно T-222
-	// расширено с «отмена ctx» на «любая незавершённая классификация».
-	// Контекст — общий с refund бюджет прохода (см. claim), контекст
-	// цикла к этому моменту мог уже отмениться.
+	// refundUnclassified — returning attempts to entries without
+	// classification (T-260, FR-6.2): the XAUTOCLAIM claim debited the
+	// attempt, and the XPENDING counter read failed — before the fix
+	// such an attempt burned without a trace (Refund requires a known
+	// counter). It is called immediately after Claim in the same loop
+	// pass: the T-222 window is widened from "ctx cancellation" to "any
+	// unfinished classification". The context — the pass budget common
+	// with refund (see claim), the loop's context may already be
+	// cancelled by then.
 	refundUnclassified := func(rctx context.Context, rest []Delivery) {
 		if err := r.RefundUnclassified(rctx, o.Group, o.Consumer, rest); err != nil {
 			log.Warn("возврат зависших доставок: попытки записей без классификации не возвращены — записи уязвимы к дожиганию до q:dead (T-260)",
@@ -202,18 +215,20 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 		}
 	}
 	claim := func() int {
-		// Эквивалентный мутант (T-M04): minIdle 0 → −1 неотличим — Claim
-		// заменяет любое неположительное значение опцией слоя. Единицу
-		// (numbers/incrementer) отличим тестом по MinIdle XAUTOCLAIM.
+		// Equivalent mutant (T-M04): minIdle 0 → −1 is indistinguishable
+		// — Claim replaces any non-positive value with the layer option.
+		// One (numbers/incrementer) is distinguishable by a test on the
+		// MinIdle of XAUTOCLAIM.
 		// mutator-disable-next-line numbers/decrementer
-		claimAt := time.Now() // начало простоя записей пачки (idle сброшен клеймом)
-		// Бюджет возвратов прохода — ОДИН refundTimeout на все возвраты
-		// (записи без классификации и необработанный хвост при отмене):
-		// независимые бюджеты суммировались бы до 2 × 5 с и выходили за
-		// бюджет graceful shutdown 10 с (P3-5 ревью T-260); каждый
-		// возврат — одна-две команды Redis, общего бюджета достаточно
-		// с запасом. Контекст отдельный от ctx цикла: к моменту возврата
-		// хвоста тот уже отменён.
+		claimAt := time.Now() // the start of the batch entries' idleness (idle reset by the claim)
+		// The pass refund budget — ONE refundTimeout for all refunds
+		// (entries without classification and the unprocessed tail on
+		// cancellation): independent budgets would sum up to 2 × 5 s and
+		// exceed the graceful shutdown budget of 10 s (P3-5 of the T-260
+		// review); each refund is one or two Redis commands, the common
+		// budget is enough with a margin. The context is separate from
+		// the loop's ctx: by the moment of the tail refund it is already
+		// cancelled.
 		rctx, cancelRefunds := context.WithTimeout(context.Background(), refundTimeout)
 		defer cancelRefunds()
 		claimed, unclassified, next, err := r.Claim(ctx, o.Stream, o.Group, o.Consumer, 0, o.Batch, cursor)
@@ -222,12 +237,14 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 		}
 		cursor = next
 		if len(unclassified) > 0 {
-			// Инвариант T-153 — тот же, что у возврата хвоста при
-			// отмене: возврат гасит ровно свой инкремент клейма, вне
-			// окна claim_min_idle запись мог переклеймить соседний
-			// воркер — его инкремент погашать нельзя (P2-1 ревью T-222).
+			// The T-153 invariant — the same as the tail refund on
+			// cancellation: the refund extinguishes exactly its own
+			// claim increment; outside the claim_min_idle window the
+			// entry could have been re-claimed by a neighbouring
+			// worker — its increment must not be extinguished (P2-1 of
+			// the T-222 review).
 			if elapsed := time.Since(claimAt); elapsed < r.opt.MinIdle {
-				refundUnclassified(rctx, unclassified) // ФТ-6.2: классификация не завершена — попытка назад
+				refundUnclassified(rctx, unclassified) // FR-6.2: classification not finished — attempt back
 			} else {
 				log.Warn("возврат зависших доставок: классификация дольше claim_min_idle — записи могли быть переклеймлены соседним воркером, возврат попыток пропущен (T-260)",
 					"n", len(unclassified), "elapsed", elapsed.String(), "min_idle", r.opt.MinIdle.String())
@@ -235,15 +252,17 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 		}
 		for i, c := range claimed {
 			if ctx.Err() != nil {
-				// Инвариант T-153: batch × худшее время записи <
-				// claim_min_idle (Claim вызван с minIdle 0 — эффективен
-				// r.opt.MinIdle). Пока он держится, хвост пачки не мог
-				// быть переклеймлен RecoverLoop соседнего воркера, и
-				// возврат гасит ровно свой инкремент; вне инварианта
-				// возврат погасил бы и чужой клейм (занижение счётчика,
-				// P2-1 ревью) — пропустить, как до T-222.
+				// The T-153 invariant: batch × the worst entry time <
+				// claim_min_idle (Claim is called with minIdle 0 —
+				// r.opt.MinIdle is effective). While it holds, the
+				// batch tail cannot have been re-claimed by the
+				// neighbouring worker's RecoverLoop, and the refund
+				// extinguishes exactly its own increment; outside the
+				// invariant the refund would also extinguish somebody
+				// else's claim (understating the counter, P2-1 of the
+				// review) — skip, as before T-222.
 				if elapsed := time.Since(claimAt); elapsed < r.opt.MinIdle {
-					refund(rctx, claimed[i:]) // T-222: хвост не начинался — попытка назад
+					refund(rctx, claimed[i:]) // T-222: the tail did not start — attempt back
 				} else {
 					log.Warn("возврат зависших доставок: обход пачки дольше claim_min_idle — хвост мог быть переклеймлен соседним воркером, возврат попыток пропущен (T-222)",
 						"n", len(claimed)-i, "elapsed", elapsed.String(), "min_idle", r.opt.MinIdle.String())
@@ -261,17 +280,18 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 	ticker := time.NewTicker(o.Interval)
 	defer ticker.Stop()
 	for {
-		// Отмена между проходами (в т.ч. сразу после возврата хвоста
-		// полной пачки выше) — чистый выход без пробы записи: SET по
-		// отменённому ctx падал бы и логировал бы «Redis не доступен
-		// на запись» на каждом останове посреди полной пачки.
+		// Cancellation between passes (including right after the tail
+		// refund of a full batch above) — a clean exit without a write
+		// probe: a SET on a cancelled ctx would fail and would log
+		// "Redis is not available for writing" on every stop in the
+		// middle of a full batch.
 		if ctx.Err() != nil {
 			return nil
 		}
-		// Гейт записи (T-152): пока Redis отвергает записи, клейм
-		// пропускается — попытки доставок не расходуются. Проба —
-		// один SET (Reliab.Writable); при неподдерживаемой пробе
-		// гейт прозрачен (true — поведение до T-152).
+		// The write gate (T-152): while Redis rejects entries, the claim
+		// is skipped — delivery attempts are not spent. The probe is one
+		// SET (Reliab.Writable); if the probe is unsupported the gate is
+		// transparent (true — the pre-T-152 behavior).
 		if !r.Writable(ctx) {
 			log.Warn("возврат зависших доставок: Redis не доступен на запись (OOM/соединение) — клейм пропущен, попытки доставок не расходуются (T-152)")
 			select {
@@ -282,9 +302,9 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 			continue
 		}
 		if n := claim(); n < o.Batch {
-			// Нечего дренировать — ждать тика (полная пачка — сразу
-			// следующий клейм: зависший за простой PEL разбирается без
-			// пауз).
+			// Nothing to drain — wait for a tick (a full batch — the
+			// next claim immediately: a PEL stalled during idleness is
+			// processed without pauses).
 			select {
 			case <-ctx.Done():
 				return nil

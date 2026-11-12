@@ -1,8 +1,9 @@
-// Пин-тест соответствия групп воркеров (T-155): WorkingGroups зеркалит
-// DefaultGroup пакетов воркеров — пакет queue не может импортировать их
-// напрямую (воркеры строятся поверх queue, цикл импорта), поэтому имена
-// продублированы строками и сверяются здесь. Внешний тест-пакет
-// queue_test импортирует и queue, и воркеров без цикла.
+// The worker group match pin test (T-155): WorkingGroups mirrors the
+// DefaultGroup of the worker packages — the queue package cannot import
+// them directly (workers are built on top of queue, an import cycle), so
+// the names are duplicated as strings and checked here. The external
+// test package queue_test imports both queue and the workers without a
+// cycle.
 
 package queue_test
 
@@ -16,12 +17,13 @@ import (
 	"crawler/internal/renderworker"
 )
 
-// TestWorkingGroupsMatchWorkerDefaults — смена DefaultGroup воркера
-// (или стрима этапа) обязана попасть в queue.WorkingGroups, иначе группы
-// этого этапа молча не чистятся. Пара q:render-fallback сверяется
-// литералом: группа render-fallback-worker — профиль воркера B (ФТ-12/
-// T-240: тот же бинарь renderworker, отдельная группа), а не DefaultGroup
-// рендер-воркера.
+// TestWorkingGroupsMatchWorkerDefaults — a change of a worker's
+// DefaultGroup (or of a stage's stream) must get into
+// queue.WorkingGroups, otherwise that stage's groups are silently not
+// cleaned. The q:render-fallback pair is checked by a literal: the
+// render-fallback-worker group — the worker B profile (FR-12/T-240: the
+// same renderworker binary, a separate group), not the render worker's
+// DefaultGroup.
 func TestWorkingGroupsMatchWorkerDefaults(t *testing.T) {
 	want := map[string]string{
 		queue.StreamDNS:     dnsworker.DefaultGroup,
@@ -30,7 +32,7 @@ func TestWorkingGroupsMatchWorkerDefaults(t *testing.T) {
 		queue.StreamAnalyze: analyzer.DefaultGroup,
 	}
 	got := queue.WorkingGroups()
-	if len(got) != len(want)+1 { // + пара q:render-fallback (профиль воркера B)
+	if len(got) != len(want)+1 { // + the q:render-fallback pair (the worker B profile)
 		t.Fatalf("WorkingGroups = %v, хочу пары %v + q:render-fallback=render-fallback-worker (лишний/недостающий стрим — обновите очередь и воркеров согласованно)", got, want)
 	}
 	for stream, group := range want {

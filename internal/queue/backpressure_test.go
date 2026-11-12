@@ -1,13 +1,14 @@
-// Тесты backpressure-гейта (T-026) без живого Redis (стиль redisq_test.go):
-// фейк расширяет fakeRedis окном глубины redisDepth — XINFO GROUPS (lag и
-// pending групп) и XLEN (запас «групп нет» и кламп лага, T-168).
-// Проверяются суммирование глубины (lag + pending, неопределённый lag,
-// отсутствие групп → XLEN, кламп фантомного лага по XLEN — T-168),
-// границы порога (ниже/ровно/выше), ограничение порога половиной MAXLEN
-// стрима, ожидание с повтором через интервал, пачечная публикация с
-// проверкой перед каждым сообщением, отмена ctx, ошибки чтения, q:dead и
-// отключённый гейт. Реальная семантика XINFO GROUPS — интеграционные
-// тесты T-032/T-168 (resilience_test.go).
+// Backpressure gate tests (T-026) without a live Redis (the
+// redisq_test.go style): the fake extends fakeRedis with the depth window
+// redisDepth — XINFO GROUPS (group lag and pending) and XLEN (the
+// fallback for "no groups" and the lag clamp, T-168). Checked: depth
+// summing (lag + pending, an undefined lag, no groups → XLEN, the
+// phantom lag clamp by XLEN — T-168), threshold boundaries
+// (below/exactly/above), the threshold cap at half of the stream's
+// MAXLEN, waiting with a retry after the interval, batch publication with
+// a check before each message, ctx cancellation, read errors, q:dead and
+// the disabled gate. The real XINFO GROUPS semantics — the integration
+// tests T-032/T-168 (resilience_test.go).
 
 package queue
 
@@ -25,11 +26,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// fakeBackpressure — fakeRedis (redisq_test.go) плюс окно глубины:
-// seq — ответы XINFO GROUPS по очереди проверок (последний повторяется;
-// nil-элемент — групп нет), xlen — ответ XLEN (глубина без групп и
-// кламп лага групп, T-168), log — порядок обращений к Redis (глубина до
-// xadd — сам предмет проверки).
+// fakeBackpressure — fakeRedis (redisq_test.go) plus the depth window:
+// seq — the XINFO GROUPS answers in the order of the checks (the last one
+// repeats; a nil element — no groups), xlen — the XLEN answer (the depth
+// without groups and the group lag clamp, T-168), log — the order of the
+// Redis accesses (depth before xadd — the very subject of the check).
 type fakeBackpressure struct {
 	*fakeRedis
 	seq       [][]redis.XInfoGroup
@@ -37,9 +38,9 @@ type fakeBackpressure struct {
 	xlen      int64
 	xlenErr   error
 
-	infos []string // ключи XINFO GROUPS
-	xlens []string // ключи XLEN
-	log   []string // порядок команд: "xinfo:<стрим>" / "xlen:<стрим>" / "xadd:<стрим>"
+	infos []string // the XINFO GROUPS keys
+	xlens []string // the XLEN keys
+	log   []string // the command order: "xinfo:<stream>" / "xlen:<stream>" / "xadd:<stream>"
 }
 
 func (f *fakeBackpressure) XInfoGroups(ctx context.Context, key string) *redis.XInfoGroupsCmd {
@@ -69,8 +70,9 @@ func (f *fakeBackpressure) XAdd(ctx context.Context, a *redis.XAddArgs) *redis.S
 	return f.fakeRedis.XAdd(ctx, a)
 }
 
-// Компиляционные проверки: фейк взаимозаменяем с реальным клиентом
-// в окне глубины и в окне очереди, обёртка — полноценная Queue.
+// Compile-time checks: the fake is interchangeable with the real client
+// in the depth window and in the queue window, the wrapper is a full
+// Queue.
 var (
 	_ redisDepth   = (*redis.Client)(nil)
 	_ redisDepth   = (*fakeBackpressure)(nil)
@@ -78,37 +80,37 @@ var (
 	_ Queue        = (*WatermarkPublisher)(nil)
 )
 
-// grp — ответ XINFO GROUPS с одной группой (lag, pending).
+// grp — an XINFO GROUPS answer with one group (lag, pending).
 func grp(lag, pending int64) []redis.XInfoGroup {
 	return []redis.XInfoGroup{{Name: "g", Lag: lag, Pending: pending}}
 }
 
-// newFakeBackpressure — фейк с инициализированной очередью и
-// заготовленной последовательностью ответов глубины (последний
-// повторяется; nil — групп нет).
+// newFakeBackpressure — a fake with an initialized queue and a prepared
+// sequence of depth answers (the last one repeats; nil — no groups).
 func newFakeBackpressure(seq ...[]redis.XInfoGroup) *fakeBackpressure {
 	return &fakeBackpressure{fakeRedis: &fakeRedis{}, seq: seq}
 }
 
-// newTestGate — гейт над фейком: порог watermark, интервал повтора 1 мс.
+// newTestGate — a gate over the fake: the watermark threshold, a 1 ms
+// retry interval.
 func newTestGate(f *fakeBackpressure, watermark int64) *BackpressureGate {
 	return NewBackpressureGate(f, BackpressureOptions{Watermark: watermark, Interval: time.Millisecond})
 }
 
-// newTestPublisher — обёртка RedisQueue над тем же фейком: гейт с порогом
-// 100 против глубин из f.seq.
+// newTestPublisher — a RedisQueue wrapper over the same fake: a gate with
+// the threshold 100 against the depths from f.seq.
 func newTestPublisher(f *fakeBackpressure) *WatermarkPublisher {
 	return NewWatermarkPublisher(NewRedisQueue(f, RedisOptions{}), newTestGate(f, 100))
 }
 
-// dnsBatch — валидное сообщение q:dns на один домен.
+// dnsBatch — a valid q:dns message for one domain.
 func dnsBatch() DNSBatch {
 	return DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}
 }
 
-// TestNewBackpressureGateIntervalDefault — интервал повтора: 0
-// и отрицательные — DefaultBackpressureInterval, положительное
-// наносекундное ожидание валидно и не заменяется.
+// TestNewBackpressureGateIntervalDefault — the retry interval: 0 and
+// negative — DefaultBackpressureInterval, a positive nanosecond wait is
+// valid and is not replaced.
 func TestNewBackpressureGateIntervalDefault(t *testing.T) {
 	for _, interval := range []time.Duration{0, -time.Second} {
 		g := NewBackpressureGate(nil, BackpressureOptions{Watermark: 1, Interval: interval})
@@ -122,9 +124,9 @@ func TestNewBackpressureGateIntervalDefault(t *testing.T) {
 	}
 }
 
-// TestBackpressureStreamMaxLen — предел стрима: 0 и отрицательные
-// MaxLen — политика DefaultStreamMaxLen, явный предел 1 — валиден
-// и не подменяется политикой.
+// TestBackpressureStreamMaxLen — the stream cap: 0 and negative MaxLen —
+// the DefaultStreamMaxLen policy, an explicit cap of 1 is valid and is
+// not substituted by the policy.
 func TestBackpressureStreamMaxLen(t *testing.T) {
 	g := NewBackpressureGate(nil, BackpressureOptions{})
 	if got := g.streamMaxLen(StreamDNS); got != 250 {
@@ -143,9 +145,9 @@ func TestBackpressureStreamMaxLen(t *testing.T) {
 	}
 }
 
-// TestStreamWatermark — эффективный порог: ≤0 отключает гейт (0),
-// maxLen ≤ 0 — предел политики стрима, порог — минимум watermark
-// и половины предела.
+// TestStreamWatermark — the effective threshold: ≤0 disables the gate
+// (0), maxLen ≤ 0 — the stream's policy cap, the threshold is the
+// minimum of the watermark and half of the cap.
 func TestStreamWatermark(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -172,10 +174,11 @@ func TestStreamWatermark(t *testing.T) {
 	}
 }
 
-// TestGroupDepth — общая точка правды глубины группы (T-188): чистая
-// функция от lag/pending/XLEN, её суммируют гейт (Len), алерт T-162
-// (monitor.RedisStreamGroups) и строка «Очереди» отчёта нагрузки
-// (monitor.RedisQueues) — формулы не имеют права разойтись.
+// TestGroupDepth — the common source of truth of the group depth
+// (T-188): a pure function of lag/pending/XLEN; the gate (Len), the
+// T-162 alert (monitor.RedisStreamGroups) and the "Queues" line of the
+// load report (monitor.RedisQueues) sum it — the formulas must not
+// diverge.
 func TestGroupDepth(t *testing.T) {
 	cases := []struct {
 		name string
@@ -201,10 +204,11 @@ func TestGroupDepth(t *testing.T) {
 }
 
 func TestBackpressureLen(t *testing.T) {
-	// Глубина группы — lag (клампнутый XLEN стрима, T-168) плюс
-	// неподтверждённые; групп несколько — суммируются (у рабочих стримов
-	// группа одна, обобщённо — все). XLEN выше лагов — кламп не меняет
-	// сумму (предмет этого кейса — суммирование).
+	// The group depth — the lag (clamped by the stream's XLEN, T-168)
+	// plus unacknowledged; several groups — summed (working streams have
+	// one group, generalized — all of them). XLEN above the lags — the
+	// clamp does not change the sum (the subject of this case is
+	// summing).
 	fake := newFakeBackpressure(
 		[]redis.XInfoGroup{{Name: "a", Lag: 30, Pending: 12}, {Name: "b", Lag: 7, Pending: 3}},
 	)
@@ -225,8 +229,8 @@ func TestBackpressureLen(t *testing.T) {
 		t.Errorf("XLEN ключи: %v, хочу %v (один вызов — кламп лага групп, T-168)", fake.xlens, want)
 	}
 
-	// lag неопределён (−1: обрезка срезала недоставленное) — считается
-	// только pending, XLEN клампа не участвует.
+	// lag is undefined (−1: the trim cut off the undelivered) — only
+	// pending is counted, XLEN does not participate in the clamp.
 	fake = newFakeBackpressure(grp(-1, 8))
 	fake.xlen = 3
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
@@ -234,7 +238,7 @@ func TestBackpressureLen(t *testing.T) {
 		t.Errorf("Len при неопределённом lag: (%d, %v), хочу (8, nil)", n, err)
 	}
 
-	// Групп нет — ни одна запись не доставлена: глубина равна XLEN.
+	// No groups — no entry has been delivered: the depth equals XLEN.
 	fake = newFakeBackpressure(nil)
 	fake.xlen = 34
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
@@ -245,16 +249,16 @@ func TestBackpressureLen(t *testing.T) {
 		t.Errorf("XLEN ключи: %v, хочу %v", fake.xlens, want)
 	}
 
-	// Стрима ещё нет (redis.Nil / «no such key») — групп нет: глубина
-	// без доставок равна XLEN, значение XINFO GROUPS при ошибке
-	// не используется.
+	// The stream does not exist yet (redis.Nil / "no such key") — no
+	// groups: depth without deliveries equals XLEN, the XINFO GROUPS
+	// value on error is not used.
 	for name, groupsErr := range map[string]error{
 		"redis.Nil":   redis.Nil,
 		"no such key": errors.New("ERR no such key"),
 	} {
 		fake = &fakeBackpressure{
 			fakeRedis: &fakeRedis{},
-			seq:       [][]redis.XInfoGroup{grp(5, 7)}, // val при err не используется
+			seq:       [][]redis.XInfoGroup{grp(5, 7)}, // the val is not used on err
 			groupsErr: groupsErr,
 			xlen:      34,
 		}
@@ -268,7 +272,7 @@ func TestBackpressureLen(t *testing.T) {
 		}
 	}
 
-	// Ошибки — нулевая глубина и точный текст.
+	// Errors — a zero depth and the exact text.
 	if n, err := gate.Len(context.Background(), "q:typo"); err == nil || n != 0 ||
 		!strings.Contains(err.Error(), "неизвестный стрим") {
 		t.Errorf("Len чужого стрима: (%d, %v), хочу (0, неизвестный стрим)", n, err)
@@ -290,8 +294,8 @@ func TestBackpressureLen(t *testing.T) {
 		t.Errorf("Len при недоступном Redis: (%d, %v), хочу (0, ошибка глубины)", n, err)
 	}
 
-	// Ошибка XLEN при отсутствии групп возвращается (гейт не гадает
-	// о глубине несуществующего ключа).
+	// An XLEN error with no groups is returned (the gate does not guess
+	// the depth of a nonexistent key).
 	fake = newFakeBackpressure(nil)
 	fake.xlenErr = errors.New("ERR connection refused")
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
@@ -301,21 +305,21 @@ func TestBackpressureLen(t *testing.T) {
 	}
 }
 
-// TestBackpressureLenClampsTrimmedLag — кламп лага по XLEN (T-168):
-// lag группы (entries_added − entries_read) не вычитает записи,
-// срезанные XTRIM'ом/XDEL'ем недоставленными, — на Redis 7.0.x (прод
-// 7.0.15) счётчик застывает положительным навсегда. Инцидент
-// 22–23.10.2026: после дренажа T-149 (XTRIM q:dns MAXLEN) лаг dns-worker
-// застыл на 1753 при XLEN 1 — гейт q:dns (эффективный порог 125) был
-// заморожен ~15,5 ч при 40,3 млн pending. Недоставленные записи —
-// подмножество стрима: глубина = min(lag, XLEN) + pending, реальный
-// бэклог не занижается никогда (пока недоставленные в стриме,
-// lag ≤ XLEN — кламп неактивен).
+// TestBackpressureLenClampsTrimmedLag — the lag clamp by XLEN (T-168):
+// a group's lag (entries_added − entries_read) does not subtract entries
+// cut off by XTRIM/XDEL while undelivered — on Redis 7.0.x (production
+// 7.0.15) the counter freezes positive forever. The incident of
+// Oct 22–23, 2026: after the T-149 drain (XTRIM q:dns MAXLEN) the
+// dns-worker lag froze at 1753 with XLEN 1 — the q:dns gate (effective
+// threshold 125) was frozen for ~15.5 h with 40.3M pending. Undelivered
+// entries are a subset of the stream: depth = min(lag, XLEN) + pending,
+// the real backlog is never understated (while the undelivered are in
+// the stream, lag ≤ XLEN — the clamp is inactive).
 func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 	ctx := context.Background()
 
-	// Фантом прода: лаг 1753 при единственной записи в стриме —
-	// глубина равна XLEN, а не лагу.
+	// The production phantom: a lag of 1753 with a single entry in the
+	// stream — the depth equals XLEN, not the lag.
 	fake := newFakeBackpressure(grp(1753, 0))
 	fake.xlen = 1
 	gate := NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
@@ -323,8 +327,8 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 		t.Errorf("Len фантома: (%d, %v), хочу (1, nil) — min(1753, XLEN 1)", n, err)
 	}
 
-	// Реальный бэклог не искажается: живой замер q:http 23.10 —
-	// lag 98931 при XLEN 107367, кламп неактивен.
+	// The real backlog is not distorted: the live q:http measurement of
+	// Oct 23 — lag 98931 with XLEN 107367, the clamp is inactive.
 	fake = newFakeBackpressure(grp(98_931, 0))
 	fake.xlen = 107_367
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
@@ -332,8 +336,9 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 		t.Errorf("Len реального бэклога: (%d, %v), хочу (98931, nil)", n, err)
 	}
 
-	// Кламп не трогает pending: счётчик неподтверждённых доставок всегда
-	// точен — это доставленная работа независимо от длины стрима.
+	// The clamp does not touch pending: the unacknowledged-delivery
+	// counter is always exact — it is delivered work regardless of the
+	// stream length.
 	fake = newFakeBackpressure(grp(1753, 30))
 	fake.xlen = 1
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
@@ -341,7 +346,7 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 		t.Errorf("Len фантома с pending: (%d, %v), хочу (31, nil) — min(1753,1)+30", n, err)
 	}
 
-	// lag 0 — кламп нуля не меняет: глубина = pending.
+	// lag 0 — clamping zero changes nothing: the depth = pending.
 	fake = newFakeBackpressure(grp(0, 12))
 	fake.xlen = 5
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
@@ -349,9 +354,10 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 		t.Errorf("Len при lag 0: (%d, %v), хочу (12, nil)", n, err)
 	}
 
-	// Несколько групп — кламп по каждой общим XLEN стрима: недоставленные
-	// разных групп могут перекрываться (сумма выше XLEN — честный бэклог
-	// каждой группы), но ни одна не выйдет за пределы стрима.
+	// Several groups — the clamp per each with the stream's common XLEN:
+	// the undelivered of different groups may overlap (the sum above
+	// XLEN — an honest backlog of each group), but none exceeds the
+	// stream.
 	fake = newFakeBackpressure([]redis.XInfoGroup{
 		{Name: "a", Lag: 2000, Pending: 0},
 		{Name: "b", Lag: 5, Pending: 2},
@@ -362,9 +368,10 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 		t.Errorf("Len нескольких групп: (%d, %v), хочу (17, nil) — min(2000,10)+min(5,10)+2", n, err)
 	}
 
-	// Гейт с фантомом открыт: порог q:dns = min(100000, 250/2) = 125,
-	// клампнутая глубина 1 ниже — публикация проходит без ожидания
-	// (заморозка инцидента не воспроизводится).
+	// The gate with the phantom is open: the q:dns threshold =
+	// min(100000, 250/2) = 125, the clamped depth of 1 is below —
+	// publication passes without waiting (the incident freeze does not
+	// reproduce).
 	fake = newFakeBackpressure(grp(1753, 0))
 	fake.xlen = 1
 	g := newTestGate(fake, 100000)
@@ -375,8 +382,9 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 		t.Errorf("проверок %d, хочу 1 (клампнутая глубина ниже порога): %v", len(fake.infos), fake.infos)
 	}
 
-	// Ошибка XLEN при живых группах — гейт не гадает о глубине: кламп
-	// без XLEN невозможен, ошибка возвращается сразу.
+	// An XLEN error with live groups — the gate does not guess the
+	// depth: the clamp is impossible without XLEN, the error returns
+	// immediately.
 	fake = newFakeBackpressure(grp(5, 0))
 	fake.xlenErr = errors.New("ERR connection refused")
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
@@ -386,15 +394,17 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 	}
 }
 
-// TestBackpressureWatermarkCappedByMaxLen — эффективный порог стрима не
-// выше половины его предела MAXLEN: гейт обязан срабатывать до обрезки.
-// Для q:dns настроенные 100 000 записей недостижимы (MAXLEN 250, T-141) —
-// порог ограничивается 125, гейт становится рабочим; у штучных стримов
-// половина предела политики (150 000 / 2 = 75 000) ниже watermark —
-// порог тоже ограничивается.
+// TestBackpressureWatermarkCappedByMaxLen — the effective stream
+// threshold is no higher than half of its MAXLEN cap: the gate must fire
+// before the trim. For q:dns the configured 100,000 entries are
+// unreachable (MAXLEN 250, T-141) — the threshold is capped at 125 and
+// the gate becomes functional; for one-off streams half of the policy
+// cap (150,000 / 2 = 75,000) is below the watermark — the threshold is
+// capped too.
 func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
-	// q:dns: MAXLEN по политике 250 → порог 125. XLEN стрима — реалистично
-	// у потолка политики (обрезка XADD MAXLEN ~ держит длину у предела).
+	// q:dns: MAXLEN by policy 250 → threshold 125. The stream's XLEN —
+	// realistically at the policy cap (the XADD MAXLEN ~ trim keeps the
+	// length at the cap).
 	fake := newFakeBackpressure(grp(124, 0))
 	fake.xlen = 125
 	gate := newTestGate(fake, 100000)
@@ -412,8 +422,8 @@ func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
 		t.Errorf("проверок %d, хочу 2 (125 ≥ порог 125 — гейт закрыт): %v", len(fake.infos), fake.infos)
 	}
 
-	// Штучный стрим: половина предела политики (150 000 / 2) ниже
-	// watermark 100 000 — порог ограничивается 75 000.
+	// A one-off stream: half of the policy cap (150,000 / 2) is below
+	// the watermark of 100,000 — the threshold is capped at 75,000.
 	fake = newFakeBackpressure(grp(74_999, 0))
 	fake.xlen = 75_000
 	gate = newTestGate(fake, 100000)
@@ -430,8 +440,8 @@ func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
 		t.Errorf("проверок %d, хочу 2 (75 000 ≥ порог 75 000 — гейт закрыт): %v", len(fake.infos), fake.infos)
 	}
 
-	// Явный предел из опций (redis.maxlen, Q-03) с половиной выше
-	// watermark — порог не ограничивается (100 000).
+	// An explicit cap from the options (redis.maxlen, Q-03) with a half
+	// above the watermark — the threshold is not capped (100,000).
 	fake = newFakeBackpressure(grp(99_999, 0))
 	fake.xlen = 100_000
 	gate = NewBackpressureGate(fake, BackpressureOptions{
@@ -441,7 +451,7 @@ func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
 		t.Fatalf("AwaitCapacity ниже порога 100 000: %v", err)
 	}
 
-	// Явный предел из опций ограничивает и его.
+	// An explicit cap from the options caps it too.
 	fake = newFakeBackpressure(grp(2000, 0), grp(1999, 0))
 	fake.xlen = 2000
 	gate = NewBackpressureGate(fake, BackpressureOptions{
@@ -469,8 +479,8 @@ func TestBackpressureGateBelowWatermark(t *testing.T) {
 }
 
 func TestBackpressureGateAtWatermark(t *testing.T) {
-	// depth == watermark — «строго ниже порога» не выполнено: гейт закрыт,
-	// публикация ждёт, пока глубина не опустится (99 < 100).
+	// depth == watermark — "strictly below the threshold" is not met: the
+	// gate is closed, publication waits until the depth drops (99 < 100).
 	fake := newFakeBackpressure(grp(100, 0), grp(100, 0), grp(99, 0))
 	fake.xlen = 100
 	gate := newTestGate(fake, 100)
@@ -497,9 +507,9 @@ func TestBackpressureGateAboveWatermark(t *testing.T) {
 }
 
 func TestBackpressureGateRetriesOverInterval(t *testing.T) {
-	// Гейт закрыт (5 ≥ 1 всё время): повторные проверки идут с интервалом;
-	// ctx истекает в ожидании — ошибка контекста. За 100 мс при интервале
-	// 40 мс обязано случиться не меньше двух проверок.
+	// The gate is closed (5 ≥ 1 the whole time): the checks repeat with
+	// the interval; ctx expires while waiting — a context error. In
+	// 100 ms with a 40 ms interval there must be at least two checks.
 	fake := newFakeBackpressure(grp(5, 0))
 	fake.xlen = 5
 	gate := NewBackpressureGate(fake, BackpressureOptions{Watermark: 1, Interval: 40 * time.Millisecond})
@@ -523,8 +533,8 @@ func TestBackpressureGateRetriesOverInterval(t *testing.T) {
 }
 
 func TestBackpressureGateCanceledContext(t *testing.T) {
-	// Отмена до вызова: первая проверка, затем выход по ctx без ожидания
-	// интервала (чистый выход, ТЗ 3.4).
+	// Cancelled before the call: the first check, then an exit by ctx
+	// without waiting for the interval (a clean exit, spec 3.4).
 	fake := newFakeBackpressure(grp(100, 0))
 	fake.xlen = 100
 	gate := NewBackpressureGate(fake, BackpressureOptions{Watermark: 10, Interval: time.Minute})
@@ -557,7 +567,8 @@ func TestBackpressureGateDepthError(t *testing.T) {
 }
 
 func TestBackpressureGateUngated(t *testing.T) {
-	// Отключённый гейт, q:dead и чужой стрим — без обращения к Redis.
+	// A disabled gate, q:dead and a foreign stream — without touching
+	// Redis.
 	fake := newFakeBackpressure(grp(1000, 0))
 	disabled := NewBackpressureGate(fake, BackpressureOptions{Watermark: 0})
 	if err := disabled.AwaitCapacity(context.Background(), StreamDNS); err != nil {
@@ -575,9 +586,10 @@ func TestBackpressureGateUngated(t *testing.T) {
 		t.Errorf("q:dead не должен гейтироваться: %v %v", fake.infos, fake.xlens)
 	}
 
-	// q:render-fallback — публикация из финализации рендера без ожидания
-	// ёмкости (ТЗ 4.3 п.3): ожидание задержало бы XACK задачи q:render
-	// (патология T-066); поток держат бюджет доли и темп воркера B.
+	// q:render-fallback — publication from render finalization without
+	// waiting for capacity (spec 4.3 p.3): waiting would delay the XACK
+	// of a q:render task (the T-066 pathology); the flow is held by the
+	// share budget and the pace of worker B.
 	if err := gate.AwaitCapacity(context.Background(), StreamRenderFallback); err != nil {
 		t.Errorf("q:render-fallback: %v", err)
 	}
@@ -595,8 +607,8 @@ func TestBackpressureGateUngated(t *testing.T) {
 }
 
 func TestBackpressureGateLogsWait(t *testing.T) {
-	// Два закрытых прохода (100 и 100 на пороге 100) — запись о
-	// приостановке одна: лог не спамится на каждый повтор.
+	// Two closed passes (100 and 100 against a threshold of 100) — one
+	// suspension entry: the log is not spammed on every retry.
 	var buf bytes.Buffer
 	fake := newFakeBackpressure(grp(100, 0), grp(100, 0), grp(50, 0))
 	fake.xlen = 100
@@ -653,8 +665,8 @@ func TestWatermarkPublisherWaitsThenPublishes(t *testing.T) {
 		t.Fatalf("Publish после ожидания: %v", err)
 	}
 	want := []string{
-		"xinfo:" + StreamDNS, "xlen:" + StreamDNS, // закрыт: глубина 100 ≥ 100
-		"xinfo:" + StreamDNS, "xlen:" + StreamDNS, // повтор: 3 < 100
+		"xinfo:" + StreamDNS, "xlen:" + StreamDNS, // closed: depth 100 ≥ 100
+		"xinfo:" + StreamDNS, "xlen:" + StreamDNS, // retry: 3 < 100
 		"xadd:" + StreamDNS,
 	}
 	if !reflect.DeepEqual(fake.log, want) {
@@ -663,11 +675,11 @@ func TestWatermarkPublisherWaitsThenPublishes(t *testing.T) {
 }
 
 func TestWatermarkPublisherChecksBeforeEveryBatch(t *testing.T) {
-	// Пачечная публикация: перед каждым сообщением (для q:dns сообщение —
-	// пачка, ТЗ 4.2) своя проверка ёмкости — «публикует новые задачи
-	// только если длина очереди ниже порога» (ТЗ 5.3), а не один раз
-	// перед серией.
-	fake := newFakeBackpressure(grp(7, 0)) // последний ответ повторяется
+	// Batch publication: each message (for q:dns a message is a batch,
+	// spec 4.2) gets its own capacity check — "publishes new tasks only
+	// if the queue length is below the threshold" (spec 5.3), not once
+	// before the series.
+	fake := newFakeBackpressure(grp(7, 0)) // the last answer repeats
 	fake.xlen = 7
 	fake.addID = "1720-0"
 	pub := newTestPublisher(fake)
@@ -713,7 +725,7 @@ func TestWatermarkPublisherDeadNotGated(t *testing.T) {
 func TestWatermarkPublisherErrors(t *testing.T) {
 	ctx := context.Background()
 
-	// Ошибка гейта — публикация не доходит до XADD.
+	// A gate error — the publication does not reach XADD.
 	fake := &fakeBackpressure{
 		fakeRedis: &fakeRedis{},
 		groupsErr: errors.New("ERR connection refused"),
@@ -727,7 +739,7 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 		t.Errorf("при ошибке гейта публикация не выполняется: %+v", fake.adds)
 	}
 
-	// Отмена ctx в гейте — чистый выход без публикации.
+	// A ctx cancellation in the gate — a clean exit without publication.
 	fake = newFakeBackpressure(grp(100, 0))
 	fake.xlen = 100
 	pub = newTestPublisher(fake)
@@ -740,7 +752,7 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 		t.Errorf("при отмене ctx публикация не выполняется: %+v", fake.adds)
 	}
 
-	// Ошибка самой публикации — после пройденного гейта.
+	// An error of the publication itself — after the passed gate.
 	fake = &fakeBackpressure{
 		fakeRedis: &fakeRedis{addErr: errors.New("connection refused")},
 		seq:       [][]redis.XInfoGroup{grp(5, 0)},
@@ -751,7 +763,8 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 		t.Error("ошибка XADD не возвращена")
 	}
 
-	// Невалидное сообщение — ошибка обёрнутой очереди (гейт пройден).
+	// An invalid message — an error of the wrapped queue (the gate
+	// passed).
 	fake = newFakeBackpressure(grp(5, 0))
 	fake.xlen = 5
 	pub = newTestPublisher(fake)
@@ -762,7 +775,8 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 		t.Errorf("невалидное сообщение дошло до XADD: %+v", fake.adds)
 	}
 
-	// Обёртка без гейта — явная ошибка: контроль потока не теряется молча.
+	// A wrapper without a gate — an explicit error: flow control is not
+	// lost silently.
 	fake = newFakeBackpressure(grp(5, 0))
 	pub = NewWatermarkPublisher(NewRedisQueue(fake, RedisOptions{}), nil)
 	if _, err := pub.Publish(ctx, StreamDNS, dnsBatch()); err == nil ||
@@ -772,8 +786,8 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 }
 
 func TestWatermarkPublisherPassthrough(t *testing.T) {
-	// Consume и Ack продюсера не касаются: гейт открывается только
-	// публикациям.
+	// Consume and Ack do not concern the producer: the gate opens only
+	// for publications.
 	fake := &fakeBackpressure{fakeRedis: &fakeRedis{readErr: redis.Nil}}
 	pub := newTestPublisher(fake)
 

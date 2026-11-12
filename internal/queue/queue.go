@@ -1,72 +1,75 @@
-// Package queue — очередь задач на Redis Streams с consumer groups
-// (ТЗ 4.2).
+// Package queue — a task queue on Redis Streams with consumer groups
+// (spec 4.2).
 //
-// Состав пакета:
+// Package contents:
 //
-//   - queue.go — имена стримов и создание клиента Redis;
-//   - stream.go — интерфейс Queue (транспорт заменяем: допустима замена
-//     на RabbitMQ за тем же интерфейсом, ТЗ 4.2) и Delivery;
-//   - message.go — форматы сообщений стримов: только идентификаторы и
-//     минимальные данные (имя домена), JSON в единственном поле data;
-//   - redisq.go — реализация RedisQueue: XADD, XREADGROUP ">", XACK,
-//     ленивое создание группы (XGROUP CREATE MKSTREAM, BUSYGROUP —
-//     не ошибка);
-//   - reliab.go — надёжность доставки (T-025): политика усечения MAXLEN
-//     (DefaultStreamMaxLen), паттерн Processing (XACK только после записи
-//     результата в БД), возврат зависших записей XAUTOCLAIM со счётчиком
-//     попыток (Reliab.Claim) и переводом исчерпавших попытки в q:dead.
-//   - trim.go — освобождение подтверждённого префикса стримов (T-141,
-//     ТЗ 4.2 «Дополнение 2026-10-23»): XTRIM MINID по старейшей записи,
-//     обязанной остаться (старейшая pending группы / last-delivered-id), —
-//     подтверждённая история не копится до потолка MAXLEN и бюджета
-//     Redis (ТЗ 3.2).
-//   - consumers.go — гигиена консьюмеров групп (T-155): XGROUP
-//     DELCONSUMER строго пустых (pending = 0) и неактивных (idle ≥
-//     redis.consumer_idle) консьюмеров, накопившихся после рестартов
-//     воркеров; pending-записи не трогаются (DELCONSUMER с pending
-//     теряет их навсегда).
+//   - queue.go — stream names and creation of the Redis client;
+//   - stream.go — the Queue interface (the transport is replaceable:
+//     replacing it with RabbitMQ behind the same interface is allowed,
+//     spec 4.2) and Delivery;
+//   - message.go — stream message formats: only identifiers and minimal
+//     data (the domain name), JSON in the single data field;
+//   - redisq.go — the RedisQueue implementation: XADD, XREADGROUP ">",
+//     XACK, lazy group creation (XGROUP CREATE MKSTREAM, BUSYGROUP —
+//     not an error);
+//   - reliab.go — delivery reliability (T-025): the MAXLEN truncation
+//     policy (DefaultStreamMaxLen), the Processing pattern (XACK only
+//     after the result is written to the DB), returning stalled entries
+//     with XAUTOCLAIM and an attempt counter (Reliab.Claim) and moving
+//     those that exhausted their attempts to q:dead.
+//   - trim.go — freeing the acknowledged prefix of the streams (T-141,
+//     spec 4.2 "Addition 2026-10-23"): XTRIM MINID by the oldest entry
+//     that must remain (the group's oldest pending / last-delivered-id) —
+//     the acknowledged history does not accumulate up to the MAXLEN cap
+//     and the Redis budget (spec 3.2).
+//   - consumers.go — consumer group hygiene (T-155): XGROUP DELCONSUMER
+//     for strictly empty (pending = 0) and inactive (idle ≥
+//     redis.consumer_idle) consumers accumulated after worker restarts;
+//     pending entries are not touched (DELCONSUMER with pending loses
+//     them forever).
 //
-// Backpressure по длине очереди — T-026. Живой Redis в юнит-тестах
-// не используется (интеграционные тесты очередей — T-032).
+// Backpressure by queue length — T-026. A live Redis is not used in unit
+// tests (the queue integration tests — T-032).
 package queue
 
 import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Имена стримов Redis Streams (ТЗ 4.2).
+// Redis Streams stream names (spec 4.2).
 const (
-	StreamDNS            = "q:dns"             // пачка доменов (id + имя) → dns-worker
-	StreamHTTP           = "q:http"            // домен с DNS-живыми субдоменами → http-worker
-	StreamRender         = "q:render"          // результат для рендера → render-worker
-	StreamRenderFallback = "q:render-fallback" // результат, не прошедший рендер на основном движке, → chromium-воркер B (ТЗ 4.3, ФТ-6)
-	StreamAnalyze        = "q:analyze"         // результат на анализ → analyzer
-	StreamDead           = "q:dead"            // задачи, исчерпавшие попытки (ручной разбор)
+	StreamDNS            = "q:dns"             // a batch of domains (id + name) → dns-worker
+	StreamHTTP           = "q:http"            // a domain with DNS-live subdomains → http-worker
+	StreamRender         = "q:render"          // a result for render → render-worker
+	StreamRenderFallback = "q:render-fallback" // a result that failed render on the main engine → chromium worker B (spec 4.3, FR-6)
+	StreamAnalyze        = "q:analyze"         // a result for analysis → analyzer
+	StreamDead           = "q:dead"            // tasks that exhausted their attempts (manual triage)
 )
 
-// allStreams — все стримы очереди: единственный источник имён, по нему
-// строятся knownStream (принадлежность очереди) и workingStreams
-// (освобождение подтверждённого префикса, trim.go) — новый стрим
-// добавляется одной строкой и сразу известен всей очереди.
+// allStreams — all the queue streams: the single source of the names;
+// knownStream (queue membership) and workingStreams (freeing the
+// acknowledged prefix, trim.go) are built from it — a new stream is added
+// with one line and is immediately known to the whole queue.
 var allStreams = []string{StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead}
 
-// AllStreams — копия полного списка стримов очереди (allStreams) для
-// потребителей наблюдаемости: перечень вывода status/crawlerctl, отчёт
-// нагрузки монитора. Один источник вместо расходящихся копий (S-P3-1:
-// q:render-fallback T-237 выпадал из сводок, пока списки писались
-// руками): стрим, добавленный в allStreams, автоматически виден во всех
-// перечнях наблюдаемости. Подмножества с иной семантикой (alertStreams —
-// только стримы, ограниченные гейтом backpressure) остаются у
-// владельцев. Копия, а не срез: список — значение, вызывающий не может
-// изменить константы пакета.
+// AllStreams — a copy of the full stream list of the queue (allStreams)
+// for the observability consumers: the status/crawlerctl output list, the
+// monitor's load report. One source instead of diverging copies (S-P3-1:
+// the q:render-fallback of T-237 dropped out of the summaries while the
+// lists were written by hand): a stream added to allStreams is
+// automatically visible in all observability lists. Subsets with a
+// different semantics (alertStreams — only the streams limited by the
+// backpressure gate) stay with their owners. A copy, not a slice: the
+// list is a value, the caller cannot change the package constants.
 func AllStreams() []string {
 	return append([]string(nil), allStreams...)
 }
 
-// NewClient создаёт клиент Redis по адресу addr (например "127.0.0.1:6379";
-// секция redis конфигурации, T-006). Пул подключений и таймауты — настройки
-// go-redis по умолчанию. Клиент передаётся NewRedisQueue; закрытие —
-// забота владельца клиента (каркас сервиса).
+// NewClient creates a Redis client at the address addr (e.g.
+// "127.0.0.1:6379"; the redis configuration section, T-006). The
+// connection pool and timeouts — go-redis defaults. The client is passed
+// to NewRedisQueue; closing it is the client owner's concern (the service
+// framework).
 func NewClient(addr string) *redis.Client {
 	return redis.NewClient(&redis.Options{Addr: addr})
 }

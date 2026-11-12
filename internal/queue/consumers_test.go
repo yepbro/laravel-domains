@@ -1,12 +1,13 @@
-// Тесты гигиены консьюмеров групп (T-155) без живого Redis (стиль
-// trim_test.go): фейк с заготовленными ответами XINFO CONSUMERS /
-// XPENDING EXTENDED / XGROUP DELCONSUMER. Проверяются инварианты выбора
-// жертв (консьюмер с pending не удаляется независимо от простоя; пустой
-// неактивный удаляется; активный не трогается), перепроверка pending
-// перед удалением (гонка оживления), реакция на отсутствие стрима и
-// группы, частичный сбой (валидные группы чистятся), детектор унесённого
-// PEL, дефолты опций и завершение цикла по отмене ctx. Реальная
-// семантика DELCONSUMER — интеграционные тесты T-032.
+// Consumer group hygiene tests (T-155) without a live Redis (the
+// trim_test.go style): a fake with prepared XINFO CONSUMERS / XPENDING
+// EXTENDED / XGROUP DELCONSUMER answers. Checked: the victim selection
+// invariants (a consumer with pending is not deleted regardless of
+// idleness; an empty inactive one is deleted; an active one is not
+// touched), the pending re-check before deletion (the revival race), the
+// reaction to a missing stream and group, a partial failure (valid
+// groups are cleaned), the carried-away PEL detector, the option
+// defaults and the loop termination on ctx cancellation. The real
+// DELCONSUMER semantics — the integration tests T-032.
 
 package queue
 
@@ -21,21 +22,22 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// fakeConsumers — окно consumerGroups с заготовленными ответами: список
-// консьюмеров группы, ответ XPENDING по кандидату («stream|group|name»)
-// и число PEL-записей, которое «унесло» удаление. Вызовы записываются
-// для проверок аргументов; методы дергаются и из фонового цикла — доступ
-// к журналам под мьютексом (стиль fakeTrim, корректно под -race).
+// fakeConsumers — the consumerGroups window with prepared answers: the
+// group's consumer list, the XPENDING answer for a candidate
+// ("stream|group|name") and the number of PEL entries the deletion
+// "carried away". The calls are recorded for argument checks; the
+// methods are also called from the background loop — access to the
+// journals under a mutex (the fakeTrim style, correct under -race).
 type fakeConsumers struct {
-	lists    map[string][]redis.XInfoConsumer // ключ "stream|group"
+	lists    map[string][]redis.XInfoConsumer // the "stream|group" key
 	listsErr map[string]error
-	pendRes  map[string][]redis.XPendingExt // ответ XPENDING по кандидату
+	pendRes  map[string][]redis.XPendingExt // the XPENDING answer for a candidate
 	pendErr  map[string]error
-	delPEL   int64 // ответ DELCONSUMER: PEL-записей, унесённых с консьюмером
+	delPEL   int64 // the DELCONSUMER answer: PEL entries carried away with the consumer
 
 	mu       sync.Mutex
 	pendArgs []redis.XPendingExtArgs
-	dels     []string // "stream|group|consumer" по порядку удаления
+	dels     []string // "stream|group|consumer" in deletion order
 }
 
 func (f *fakeConsumers) XInfoConsumers(ctx context.Context, key, group string) *redis.XInfoConsumersCmd {
@@ -67,7 +69,8 @@ func (f *fakeConsumers) XGroupDelConsumer(ctx context.Context, stream, group, co
 	return redis.NewIntResult(f.delPEL, nil)
 }
 
-// delCalls — снимок удалений (копия — для проверок вне мьютекса).
+// delCalls — a snapshot of the deletions (a copy — for checks outside
+// the mutex).
 func (f *fakeConsumers) delCalls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -76,24 +79,25 @@ func (f *fakeConsumers) delCalls() []string {
 	return out
 }
 
-// Компиляционные проверки: фейк взаимозаменяем с реальным клиентом
-// в окне гигиены.
+// Compile-time checks: the fake is interchangeable with the real client
+// in the hygiene window.
 var _ consumerGroups = (*redis.Client)(nil)
 var _ consumerGroups = (*fakeConsumers)(nil)
 
-// TestCleanupConsumersOnceSelection — инварианты выбора жертв одного
-// прохода: консьюмер с pending не удаляется независимо от простоя
-// (DELCONSUMER с pending теряет PEL — недоставка навсегда); пустой,
-// неактивный дольше порога — удаляется; активный (idle меньше порога) —
-// не трогается; перед удалением подтверждается пустота PEL кандидата.
+// TestCleanupConsumersOnceSelection — the victim selection invariants of
+// one pass: a consumer with pending is not deleted regardless of
+// idleness (DELCONSUMER with pending loses the PEL — an undelivery
+// forever); an empty one, inactive longer than the threshold — deleted;
+// an active one (idle below the threshold) — not touched; before the
+// deletion the candidate's PEL emptiness is confirmed.
 func TestCleanupConsumersOnceSelection(t *testing.T) {
 	idle := 2 * time.Hour
 	f := &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
 			StreamHTTP + "|http-worker": {
-				{Name: "http-worker-455745", Pending: 430, Idle: 72 * time.Hour}, // мёртвый с висящим pending
-				{Name: "http-worker-461002", Pending: 0, Idle: 26 * time.Hour},   // мёртвый пустой
-				{Name: "http-worker-461003", Pending: 0, Idle: 30 * time.Second}, // живой активный
+				{Name: "http-worker-455745", Pending: 430, Idle: 72 * time.Hour}, // dead with dangling pending
+				{Name: "http-worker-461002", Pending: 0, Idle: 26 * time.Hour},   // dead and empty
+				{Name: "http-worker-461003", Pending: 0, Idle: 30 * time.Second}, // alive and active
 			},
 		},
 		pendRes: map[string][]redis.XPendingExt{},
@@ -117,10 +121,10 @@ func TestCleanupConsumersOnceSelection(t *testing.T) {
 	}
 }
 
-// TestCleanupConsumersOnceRaceyPEL — перепроверка пустоты PEL перед
-// удалением: консьюмер, получивший доставки между XINFO CONSUMERS
-// (пуст) и XPENDING (уже держит записи), не удаляется — гонка
-// оживления не теряет PEL.
+// TestCleanupConsumersOnceRaceyPEL — the PEL emptiness re-check before
+// deletion: a consumer that received deliveries between XINFO CONSUMERS
+// (empty) and XPENDING (already holding entries) is not deleted — the
+// revival race does not lose the PEL.
 func TestCleanupConsumersOnceRaceyPEL(t *testing.T) {
 	f := &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
@@ -128,7 +132,8 @@ func TestCleanupConsumersOnceRaceyPEL(t *testing.T) {
 				{Name: "render-worker-101", Pending: 0, Idle: 3 * time.Hour},
 			},
 		},
-		// «Оживление» между XINFO и перепроверкой: PEL уже не пуст.
+		// A "revival" between XINFO and the re-check: the PEL is no
+		// longer empty.
 		pendRes: map[string][]redis.XPendingExt{
 			StreamRender + "|render-worker|render-worker-101": {{ID: "5-0"}},
 		},
@@ -148,9 +153,10 @@ func TestCleanupConsumersOnceRaceyPEL(t *testing.T) {
 	}
 }
 
-// TestCleanupConsumersOnceCarriedPEL — детектор сработавшей гонки:
-// DELCONSUMER ответил числом унесённых PEL-записей (> 0) — проход
-// возвращает ошибку для Warn-лога цикла, консьюмер при этом удалён.
+// TestCleanupConsumersOnceCarriedPEL — the detector of a fired race:
+// DELCONSUMER answered with the number of carried-away PEL entries
+// (> 0) — the pass returns an error for the loop's Warn log, the
+// consumer is nevertheless deleted.
 func TestCleanupConsumersOnceCarriedPEL(t *testing.T) {
 	f := &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
@@ -173,9 +179,10 @@ func TestCleanupConsumersOnceCarriedPEL(t *testing.T) {
 	}
 }
 
-// TestCleanupConsumersOnceNoStreamAndNoGroup — стрим без ключа (ещё не
-// создавался) и группа без ключа (ленивое создание при первом чтении):
-// пустой проход без ошибки, DELCONSUMER не выполняется.
+// TestCleanupConsumersOnceNoStreamAndNoGroup — a stream without a key
+// (not created yet) and a group without a key (lazy creation at the
+// first read): an empty pass without an error, DELCONSUMER is not
+// executed.
 func TestCleanupConsumersOnceNoStreamAndNoGroup(t *testing.T) {
 	f := &fakeConsumers{
 		listsErr: map[string]error{
@@ -200,9 +207,9 @@ func TestCleanupConsumersOnceNoStreamAndNoGroup(t *testing.T) {
 	}
 }
 
-// TestCleanupConsumersOncePartialFailure — ошибка одной группы (чтение
-// списка, перепроверка pending, удаление) не отменяет остальные:
-// валидные чистятся, ошибки собираются в возврат.
+// TestCleanupConsumersOncePartialFailure — one group's error (a list
+// read, a pending re-check, a deletion) does not cancel the others: the
+// valid ones are cleaned, the errors are collected into the return.
 func TestCleanupConsumersOncePartialFailure(t *testing.T) {
 	f := &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
@@ -241,8 +248,9 @@ func TestCleanupConsumersOncePartialFailure(t *testing.T) {
 	}
 }
 
-// TestCleanupConsumersOnceUnknownStreamAndNilClient — неизвестное имя
-// стрима в карте групп и пустая группа — ошибки; nil-клиент — ошибка.
+// TestCleanupConsumersOnceUnknownStreamAndNilClient — an unknown stream
+// name in the group map and an empty group — errors; a nil client — an
+// error.
 func TestCleanupConsumersOnceUnknownStreamAndNilClient(t *testing.T) {
 	f := &fakeConsumers{}
 	if _, err := CleanupConsumersOnce(context.Background(), f, ConsumerOptions{
@@ -263,12 +271,13 @@ func TestCleanupConsumersOnceUnknownStreamAndNilClient(t *testing.T) {
 	}
 }
 
-// TestConsumerOptionsDefaults — нулевые Groups/Idle/Interval заменяются
-// дефолтами: рабочие пары задач (WorkingGroups — все пять рабочих
-// стримов, без q:dead), DefaultConsumerIdle и DefaultConsumerInterval.
-// Пин-тест: новый рабочий стрим обязан попасть в WorkingGroups, иначе
-// его группы молча не чистятся; соответствие имён групп константам
-// воркеров сверяет consumers_pin_test.go.
+// TestConsumerOptionsDefaults — zero Groups/Idle/Interval are replaced
+// with defaults: the working task pairs (WorkingGroups — all five
+// working streams, without q:dead), DefaultConsumerIdle and
+// DefaultConsumerInterval. The pin: a new working stream must get into
+// WorkingGroups, otherwise its groups are silently not cleaned; the
+// match of the group names to the worker constants is checked by
+// consumers_pin_test.go.
 func TestConsumerOptionsDefaults(t *testing.T) {
 	o := ConsumerOptions{}.withDefaults()
 	if !reflect.DeepEqual(o.Groups, WorkingGroups()) {
@@ -298,9 +307,10 @@ func TestConsumerOptionsDefaults(t *testing.T) {
 	}
 }
 
-// TestCleanupConsumersLoopCancel — цикл делает первый проход сразу
-// (удаление фиксируется журналом фейка) и завершается nil по отмене ctx
-// (контракт OnRun, T-012), не дожидаясь тика.
+// TestCleanupConsumersLoopCancel — the loop makes the first pass
+// immediately (the deletion is recorded in the fake's journal) and
+// finishes with nil on ctx cancellation (the OnRun contract, T-012),
+// without waiting for a tick.
 func TestCleanupConsumersLoopCancel(t *testing.T) {
 	f := &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
@@ -319,7 +329,8 @@ func TestCleanupConsumersLoopCancel(t *testing.T) {
 			Interval: time.Hour,
 		})
 	}()
-	// Первый проход асинхронного цикла: фиксируется вызовом DELCONSUMER.
+	// The first pass of the asynchronous loop: recorded by a DELCONSUMER
+	// call.
 	deadline := time.After(2 * time.Second)
 	for len(f.delCalls()) == 0 {
 		select {

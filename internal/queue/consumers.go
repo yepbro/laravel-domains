@@ -1,53 +1,57 @@
-// Гигиена консьюмеров групп (T-155): каждое чтение XREADGROUP закрепляет
-// записи за потребителем группы (имя — процесс воркера с pid), и Redis
-// не вычищает консьюмеры сам — после рестартов (деплои волн, падения,
-// OOM-киллеры) они копятся в группах навсегда: 4 деплоя волны 21
-// оставили 11 мёртвых pid-консьюмеров в q:render и 13 в q:http
-// (docs/operations.md §5). Сами по себе они — строки метаданных
-// (копейки памяти), но засоряют разбор XINFO CONSUMERS/XPENDING при
-// инцидентах, а часть мёртвых консьюмеров держит висящий pending
-// (430 записей на http-worker-455745): такие записи спасаются только
-// клеймом живого воркера (XAUTOCLAIM, T-153) — чистка их НЕ трогает.
+// Consumer group hygiene (T-155): every XREADGROUP read pins entries to
+// a group consumer (the name — the worker process with a pid), and Redis
+// does not clean consumers up itself — after restarts (wave deploys,
+// crashes, OOM killers) they accumulate in the groups forever: 4 deploys
+// of wave 21 left 11 dead pid-consumers in q:render and 13 in q:http
+// (docs/operations.md §5). On their own they are metadata strings
+// (pennies of memory), but they pollute the XINFO CONSUMERS/XPENDING
+// triage during incidents, and some dead consumers hold dangling pending
+// (430 entries on http-worker-455745): such entries are saved only by a
+// live worker's claim (XAUTOCLAIM, T-153) — the cleanup does NOT touch
+// them.
 //
-// Механизм — периодический XGROUP DELCONSUMER строго пустых консьюмеров
-// (pending = 0 и неактивны ≥ redis.consumer_idle):
+// The mechanism — a periodic XGROUP DELCONSUMER of strictly empty
+// consumers (pending = 0 and inactive ≥ redis.consumer_idle):
 //
-//   - pending ≠ 0 — никогда: DELCONSUMER удаляет консьюмера вместе с его
-//     PEL-записями — недоставка навсегда (штучные задачи q:http/q:render/
-//     q:analyze не восстанавливаются lease — только клеймом из PEL;
-//     источник истины PostgreSQL спасает лишь будущую перепроверку
-//     recheck, месяцы). Висящий pending мёртвого консьюмера разбору
-//     клеймом не мешает (XAUTOCLAIM перезакрепляет записи на живого
-//     независимо от владельца) — удалять его незачем;
-//   - неактивность (Idle из XINFO CONSUMERS, время с последнего
-//     взаимодействия консьюмера) — защита от удаления консьюмера живого
-//     воркера под нагрузкой: активный этап трогает консьюмера пачками
-//     чтений, затишье между доставками — секунды. Порог 2 ч закрывает
-//     всё, кроме честного простоя этапа; живой консьюмер пустого стрима
-//     может простаивать дольше (XREADGROUP без записей консьюмера не
-//     трогает — idle растёт), но его удаление безвредно: имя
-//     пересоздаётся первым же чтением с записями, а пустых чтений
-//     консьюмер не порождает.
+//   - pending ≠ 0 — never: DELCONSUMER removes the consumer together
+//     with its PEL entries — an undelivery forever (the one-off tasks of
+//     q:http/q:render/q:analyze are not restored by lease — only by a
+//     claim from the PEL; PostgreSQL as the source of truth saves only a
+//     future recheck re-check, months away). A dead consumer's dangling
+//     pending does not hinder the claim triage (XAUTOCLAIM re-pins
+//     entries to the live one regardless of the owner) — there is no
+//     reason to delete it;
+//   - inactivity (Idle from XINFO CONSUMERS, the time since the
+//     consumer's last interaction) — protection against deleting a live
+//     worker's consumer under load: an active stage touches the consumer
+//     in batches of reads, the lull between deliveries is seconds. The
+//     2 h threshold covers everything except an honest stage idle; a
+//     live consumer of an empty stream may idle longer (XREADGROUP
+//     without entries does not touch the consumer — idle grows), but
+//     deleting it is harmless: the name is recreated by the first read
+//     with entries, and the consumer produces no empty reads.
 //
-// Гонка «оживления»: между XINFO CONSUMERS и DELCONSUMER затаившийся
-// воркер может получить доставку (появилась запись, XREADGROUP закрепил
-// её за консьюмером-кандидатом) — DELCONSUMER унёс бы его PEL. Окно
-// сужено перепроверкой: непосредственно перед удалением XPENDING EXTENDED
-// по одному консьюмеру (Start «-», End «+», Count 1, фильтр Consumer)
-// подтверждает пустоту PEL — окно «оживления» из всего прохода XINFO по
-// группе сжимается до пары команд на кандидата. Ответ DELCONSUMER
-// (число удалённых вместе с консьюмером PEL-записей) проверяется: > 0 —
-// гонка всё же случилась, возвращается ошибкой для Warn-лога цикла —
-// записи требуют ручного разбора (перевыпуска по идентификаторам из
-// задачи нет, см. выше про недоставку).
+// The "revival" race: between XINFO CONSUMERS and DELCONSUMER a lurking
+// worker may receive a delivery (an entry appeared, XREADGROUP pinned it
+// to the candidate consumer) — DELCONSUMER would take away its PEL. The
+// window is narrowed by a re-check: immediately before the deletion,
+// XPENDING EXTENDED for one consumer (Start "-", End "+", Count 1, the
+// Consumer filter) confirms the PEL is empty — the "revival" window of
+// the whole XINFO pass over the group shrinks to a couple of commands
+// per candidate. The DELCONSUMER answer (the number of PEL entries
+// removed together with the consumer) is checked: > 0 — the race did
+// happen anyway, an error is returned for the loop's Warn log — the
+// entries need manual triage (there is no re-issue by the identifiers
+// from the task, see above about the undelivery).
 //
-// Цикл CleanupConsumersLoop — сиблинг TrimLoop (T-141): живёт в сервисе
-// scheduler (одиночный хозяин гигиены стримов очередей), период — тот же
-// redis.trim_interval (проход дёшев: XINFO CONSUMERS на стрим × группу,
-// остальные команды — только по консьюмерам-кандидатам, поэтому
-// отдельная ручка темпа не нужна), порог неактивности —
-// redis.consumer_idle. Пока планировщик остановлен, мёртвые консьюмеры
-// копятся безвредно (метаданные; чистка догонит).
+// The CleanupConsumersLoop loop — a sibling of TrimLoop (T-141): it
+// lives in the scheduler service (a single owner of queue stream
+// hygiene), the period is the same redis.trim_interval (the pass is
+// cheap: XINFO CONSUMERS per stream × group, the other commands — only
+// for candidate consumers, so a separate pace knob is not needed), the
+// inactivity threshold — redis.consumer_idle. While the scheduler is
+// stopped, dead consumers accumulate harmlessly (metadata; the cleanup
+// will catch up).
 
 package queue
 
@@ -63,68 +67,72 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// DefaultConsumerIdle — порог неактивности консьюмера для удаления
-// (T-155): 2 ч с запасом поверх затишья между доставками активного этапа
-// (секунды) и короче междеплойного интервала (мёртвый после рестарта
-// консьюмер вычищается в ближайшие проходы). Настройка —
-// redis.consumer_idle.
+// DefaultConsumerIdle — the consumer inactivity threshold for deletion
+// (T-155): 2 h with a margin above the lull between deliveries of an
+// active stage (seconds) and shorter than the between-deploy interval
+// (a consumer dead after a restart is cleaned up in the nearest passes).
+// Setting — redis.consumer_idle.
 const DefaultConsumerIdle = 2 * time.Hour
 
-// DefaultConsumerInterval — период проходов чистки (CleanupConsumersLoop).
-// Минута — та же ценовая категория гигиены, что у освобождения префикса
-// (DefaultTrimInterval): проход — XINFO CONSUMERS на стрим × группу плюс
-// команды только по консьюмерам-кандидатам; боевая проводка передаёт
-// redis.trim_interval явно (один темп дворников планировщика).
+// DefaultConsumerInterval — the cleanup pass period
+// (CleanupConsumersLoop). A minute — the same price category of hygiene
+// as freeing the prefix (DefaultTrimInterval): a pass — XINFO CONSUMERS
+// per stream × group plus commands only for candidate consumers;
+// production wiring passes redis.trim_interval explicitly (one pace for
+// the scheduler's sweepers).
 const DefaultConsumerInterval = time.Minute
 
-// WorkingGroups — рабочие пары стрим → группа потребителей (T-155): у
-// каждого этапа одна группа на стрим (ТЗ 4.2; инвариант механизма
-// освобождения T-141 «одна consumer group на рабочий стрим»,
-// docs/redis.md §2). Имена зеркалируют DefaultGroup пакетов воркеров
-// (пакет queue не может импортировать их напрямую — воркеры строятся
-// поверх queue, цикл импорта); соответствие сверяет пин-тест
-// consumers_pin_test.go (внешний пакет queue_test). q:render-fallback —
-// группа render-fallback-worker профиля воркера B (ФТ-12: тот же бинарь
-// renderworker, отдельная группа). q:dead не входит:
-// стрим без группы (ручной разбор) — консьюмеров нет.
+// WorkingGroups — the working stream → consumer group pairs (T-155):
+// each stage has one group per stream (spec 4.2; the invariant of the
+// freeing mechanism of T-141 "one consumer group per working stream",
+// docs/redis.md §2). The names mirror the DefaultGroup of the worker
+// packages (the queue package cannot import them directly — workers are
+// built on top of queue, an import cycle); the match is checked by the
+// pin test consumers_pin_test.go (the external queue_test package).
+// q:render-fallback — the render-fallback-worker group of the worker B
+// profile (FR-12: the same renderworker binary, a separate group).
+// q:dead is not included: a stream without a group (manual triage) — no
+// consumers.
 func WorkingGroups() map[string]string {
 	return map[string]string{
 		StreamDNS:            "dns-worker",             // dnsworker.DefaultGroup
 		StreamHTTP:           "http-worker",            // httpworker.DefaultGroup
 		StreamRender:         "render-worker",          // renderworker.DefaultGroup
-		StreamRenderFallback: "render-fallback-worker", // профиль воркера B (T-240, ФТ-12)
+		StreamRenderFallback: "render-fallback-worker", // the worker B profile (T-240, FR-12)
 		StreamAnalyze:        "analyzer",               // analyzer.DefaultGroup
 	}
 }
 
-// consumerGroups — окно go-redis для гигиены консьюмеров: XINFO CONSUMERS
-// (список группы с pending и idle каждого), XPENDING EXTENDED
-// (перепроверка пустоты PEL кандидата) и XGROUP DELCONSUMER. Узкое, как
-// trimStreams (trim.go): *redis.Client и *redis.ClusterClient
-// удовлетворяют интерфейсу, тесты подменяют фейком.
+// consumerGroups — the go-redis window for consumer hygiene: XINFO
+// CONSUMERS (the group's list with each member's pending and idle),
+// XPENDING EXTENDED (re-checking the emptiness of a candidate's PEL) and
+// XGROUP DELCONSUMER. Narrow, like trimStreams (trim.go): *redis.Client
+// and *redis.ClusterClient satisfy the interface, tests substitute a
+// fake.
 type consumerGroups interface {
 	XInfoConsumers(ctx context.Context, key, group string) *redis.XInfoConsumersCmd
 	XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd
 	XGroupDelConsumer(ctx context.Context, stream, group, consumer string) *redis.IntCmd
 }
 
-// ConsumerOptions — параметры гигиены консьюмеров; нулевые значения
-// заменяются дефолтами (withDefaults, стиль TrimOptions).
+// ConsumerOptions — the consumer hygiene parameters; zero values are
+// replaced with defaults (withDefaults, the TrimOptions style).
 type ConsumerOptions struct {
-	// Groups — чистимые пары стрим → группа; nil — рабочие пары
-	// задач (WorkingGroups). Пара с неизвестным пакету стримом —
-	// ошибка прохода (как у TrimOnce: имена — константы пакета).
+	// Groups — the stream → group pairs to clean; nil — the working task
+	// pairs (WorkingGroups). A pair with a stream unknown to the package
+	// — a pass error (as in TrimOnce: the names are package constants).
 	Groups map[string]string
-	// Idle — порог неактивности консьюмера для удаления; 0 —
-	// DefaultConsumerIdle. Консьюмеры с pending ≠ 0 не удаляются
-	// при любом пороге.
+	// Idle — the consumer inactivity threshold for deletion; 0 —
+	// DefaultConsumerIdle. Consumers with pending ≠ 0 are not deleted at
+	// any threshold.
 	Idle time.Duration
-	// Interval — период проходов CleanupConsumersLoop; 0 —
-	// DefaultConsumerInterval. Поле управляет только циклом,
-	// CleanupConsumersOnce выполняет один проход всегда.
+	// Interval — the CleanupConsumersLoop pass period; 0 —
+	// DefaultConsumerInterval. The field controls only the loop,
+	// CleanupConsumersOnce always performs a single pass.
 	Interval time.Duration
-	// Log — логгер цикла CleanupConsumersLoop; nil — записи подавлены
-	// (slog.DiscardHandler, стиль RecoverOptions). Once не логирует.
+	// Log — the CleanupConsumersLoop loop logger; nil — entries are
+	// suppressed (slog.DiscardHandler, the RecoverOptions style). Once
+	// does not log.
 	Log *slog.Logger
 }
 
@@ -141,23 +149,25 @@ func (o ConsumerOptions) withDefaults() ConsumerOptions {
 	return o
 }
 
-// CleanupConsumersOnce — один проход гигиены по парам опций: XINFO
-// CONSUMERS каждой группы, XGROUP DELCONSUMER строго пустых и
-// неактивных консьюмеров (см. шапку файла). Возвращает число удалённых
-// по всем группам. Ошибка одной группы не отменяет остальные (стиль
-// Reliab.Claim/TrimOnce): ошибки собираются в возврат (errors.Join),
-// валидная часть отрабатывает — следующий проход повторит сбойную.
+// CleanupConsumersOnce — one hygiene pass over the option pairs: XINFO
+// CONSUMERS of each group, XGROUP DELCONSUMER of strictly empty and
+// inactive consumers (see the file header). Returns the number removed
+// across all groups. One group's error does not cancel the others (the
+// Reliab.Claim/TrimOnce style): the errors are collected into the return
+// (errors.Join), the valid part is processed — the next pass will retry
+// the failed one.
 //
-// Стрим без ключа (ещё не создавался) и группа без ключа (ленивое
-// создание при первом чтении, redisq.go) — пустой проход без ошибки:
-// чистить нечего.
+// A stream without a key (not created yet) and a group without a key
+// (lazy creation at the first read, redisq.go) — an empty pass without
+// an error: nothing to clean.
 func CleanupConsumersOnce(ctx context.Context, rdb consumerGroups, opt ConsumerOptions) (int, error) {
 	if rdb == nil {
 		return 0, errors.New("queue: чистка консьюмеров: клиент Redis не задан")
 	}
 	o := opt.withDefaults()
-	// Пары обходятся по возрастанию имён стримов — детерминированный
-	// порядок ошибок и логов прохода (карта в Go итерируется случайно).
+	// The pairs are traversed in ascending stream-name order — a
+	// deterministic order of the pass's errors and logs (a Go map is
+	// iterated in random order).
 	streams := make([]string, 0, len(o.Groups))
 	for s := range o.Groups {
 		streams = append(streams, s)
@@ -177,9 +187,10 @@ func CleanupConsumersOnce(ctx context.Context, rdb consumerGroups, opt ConsumerO
 			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров %s: не задана группа", stream))
 			continue
 		}
-		// Счётчик группы точен при любом исходе: инкремент только после
-		// успешного DELCONSUMER — засчитываем и при ошибке соседних
-		// консьюмеров (стиль «валидная часть отрабатывает»).
+		// The group counter is exact under any outcome: the increment
+		// only after a successful DELCONSUMER — it is counted even when
+		// neighbouring consumers error (the "valid part is processed"
+		// style).
 		n, err := cleanupGroup(ctx, rdb, stream, group, o)
 		removed += n
 		if err != nil {
@@ -189,18 +200,18 @@ func CleanupConsumersOnce(ctx context.Context, rdb consumerGroups, opt ConsumerO
 	return removed, errors.Join(errs...)
 }
 
-// cleanupGroup вычищает строго пустых консьюмеров одной группы:
-// кандидат — pending = 0 и idle ≥ порога (XINFO CONSUMERS); удалению
-// предшествует перепроверка PEL кандидата (гонка оживления — шапка
-// файла). Ответ DELCONSUMER — число удалённых PEL-записей: ноль
-// обязателен по построению, ненулевой — случившаяся гонка, ошибка
-// для сигнала оператору.
+// cleanupGroup cleans the strictly empty consumers of one group: a
+// candidate — pending = 0 and idle ≥ the threshold (XINFO CONSUMERS);
+// the deletion is preceded by a PEL re-check of the candidate (the
+// revival race — the file header). The DELCONSUMER answer is the number
+// of PEL entries removed: zero is required by construction, non-zero —
+// the race happened, an error to signal the operator.
 func cleanupGroup(ctx context.Context, rdb consumerGroups, stream, group string, opt ConsumerOptions) (int, error) {
 	consumers, err := rdb.XInfoConsumers(ctx, stream, group).Result()
 	if err != nil {
-		// Нет стрима (ещё не создавался) или группы (создаётся лениво
-		// при первом чтении, redisq.go) — чистить нечего, не ошибка
-		// (как отсутствие ключа у TrimOnce).
+		// No stream (not created yet) or no group (created lazily at the
+		// first read, redisq.go) — nothing to clean, not an error (as a
+		// missing key in TrimOnce).
 		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") || isNoGroup(err) {
 			return 0, nil
 		}
@@ -212,7 +223,7 @@ func cleanupGroup(ctx context.Context, rdb consumerGroups, stream, group string,
 	)
 	for _, c := range consumers {
 		if c.Pending != 0 || c.Idle < opt.Idle {
-			continue // держит PEL или активен — не трогаем (шапка файла)
+			continue // holds a PEL or is active — not touched (the file header)
 		}
 		pend, err := rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 			Stream:   stream,
@@ -220,17 +231,18 @@ func cleanupGroup(ctx context.Context, rdb consumerGroups, stream, group string,
 			Start:    "-",
 			End:      "+",
 			Count:    1,
-			Consumer: c.Name, // ровно этот консьюмер: подтверждение пустоты PEL перед удалением
+			Consumer: c.Name, // exactly this consumer: confirming the PEL is empty before the deletion
 		}).Result()
 		if err != nil {
-			// Не подтвердили пустоту — не удаляем: следующий проход
-			// повторит (консьюмер остаётся в группе, ничего не теряем).
+			// Emptiness not confirmed — do not delete: the next pass
+			// will retry (the consumer stays in the group, nothing is
+			// lost).
 			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров %s (группа %s): проверка pending %s: %w", stream, group, c.Name, err))
 			continue
 		}
 		if len(pend) > 0 {
-			// Получил доставки между XINFO и перепроверкой — теперь
-			// держит PEL, не кандидат.
+			// It received deliveries between XINFO and the re-check —
+			// now it holds a PEL, not a candidate.
 			continue
 		}
 		pel, err := rdb.XGroupDelConsumer(ctx, stream, group, c.Name).Result()
@@ -240,23 +252,24 @@ func cleanupGroup(ctx context.Context, rdb consumerGroups, stream, group string,
 		}
 		removed++
 		if pel > 0 {
-			// Гонка оживления состоялась: PEL-записи удалены вместе
-			// с консьюмером — недоставка навсегда (шапка файла),
-			// требуется разбор по журналу.
+			// The revival race did happen: PEL entries were removed
+			// together with the consumer — an undelivery forever (the
+			// file header), triage by the journal is required.
 			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров %s (группа %s): удаление %s унесло %d pending-записей (гонка оживления) — записи не будут доставлены, разберите вручную по идентификаторам предмета", stream, group, c.Name, pel))
 		}
 	}
 	return removed, errors.Join(errs...)
 }
 
-// CleanupConsumersLoop — фоновый цикл гигиены консьюмеров (T-155):
-// проход CleanupConsumersOnce при старте (рестарт планировщика сразу
-// вычищает накопленное рестартами воркеров) и далее каждый Interval.
-// Удалённые за проход считаются суммарно и логируются Info (проход
-// без жертв молчит — норма); ошибка прохода не останавливает цикл:
-// логируется Warn, следующий проход повторит — опоздание чистки стоит
-// только строк метаданных в группах. Работает до отмены ctx и возвращает
-// nil — контракт OnRun каркаса (T-012, graceful shutdown, ТЗ 3.4).
+// CleanupConsumersLoop — the background consumer hygiene loop (T-155):
+// a CleanupConsumersOnce pass at start (a scheduler restart immediately
+// cleans up what worker restarts accumulated) and then every Interval.
+// The entries removed per pass are summed and logged as Info (a pass
+// without victims is silent — the norm); a pass error does not stop the
+// loop: it is logged as Warn, the next pass will retry — a late cleanup
+// costs only metadata strings in the groups. It runs until ctx is
+// cancelled and returns nil — the OnRun contract of the framework
+// (T-012, graceful shutdown, spec 3.4).
 func CleanupConsumersLoop(ctx context.Context, rdb consumerGroups, opt ConsumerOptions) error {
 	if rdb == nil {
 		return errors.New("queue: цикл чистки консьюмеров: клиент Redis не задан")

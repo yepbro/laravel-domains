@@ -1,18 +1,20 @@
-// Форматы сообщений стримов (ТЗ 4.2: «сообщение содержит только
-// идентификаторы и минимально необходимые данные (имя домена)»).
+// Stream message formats (spec 4.2: "the message contains only
+// identifiers and the minimally necessary data (the domain name)").
 //
-// Запись стрима хранит единственное поле data — JSON-представление
-// сообщения (запись/чтение — redisq.go). JSON, а не побитовая упаковка:
-// сообщения крошечные (идентификаторы и имя домена, десятки байт),
-// выигрыш компактного формата — проценты, а читаемость в redis-cli
-// (XRANGE показывает готовый JSON) и свобода эволюции важнее: добавление
-// поля не ломает читателей — неизвестные поля JSON игнорируются, поэтому
-// T-025 введёт счётчик попыток доставки тем же форматом.
+// A stream entry stores a single field data — the JSON representation of
+// the message (write/read — redisq.go). JSON, not bitwise packing: the
+// messages are tiny (identifiers and the domain name, tens of bytes), the
+// gain of a compact format is percent-level, while readability in
+// redis-cli (XRANGE shows ready JSON) and freedom of evolution matter
+// more: adding a field does not break readers — unknown JSON fields are
+// ignored, so T-025 introduced the delivery attempt counter in the same
+// format.
 //
-// Первое поле каждого сообщения — task_id, уникальный идентификатор
-// задачи (NewTaskID). Он переживает запись стрима: при исчерпании
-// попыток сообщение переносится в q:dead с тем же task_id (T-025), что
-// связывает исходную задачу, повторные доставки и ручной разбор.
+// The first field of every message is task_id, a unique task identifier
+// (NewTaskID). It survives the stream entry: when the attempts are
+// exhausted, the message is moved to q:dead with the same task_id (T-025),
+// which ties together the original task, repeated deliveries and manual
+// triage.
 
 package queue
 
@@ -27,53 +29,54 @@ import (
 	"crawler/internal/model"
 )
 
-// Максимумы имён по ТЗ 5.2 (п. 4): метка ≤ 63, полное имя ≤ 253 октета
-// в ASCII-форме. Очередь не нормализует имена повторно (это сделано
-// на входе — internal/idn), а только отвергает заведомо невозможные.
+// Name maxima per spec 5.2 (p. 4): label ≤ 63, full name ≤ 253 octets in
+// ASCII form. The queue does not normalize names again (that is done at
+// the input — internal/idn), it only rejects clearly impossible ones.
 const (
 	maxLabelLen = 63
 	maxNameLen  = 253
 )
 
-// Message — сообщение одного из стримов очереди: DNSBatch (q:dns),
+// Message — a message of one of the queue streams: DNSBatch (q:dns),
 // HTTPTask (q:http), Result (q:render, q:render-fallback, q:analyze),
-// Dead (q:dead). Интерфейс запечатан неэкспортируемым методом validate:
-// форматы стримов вводит только пакет queue, сторонние типы публиковать
-// нельзя.
+// Dead (q:dead). The interface is sealed by an unexported validate method:
+// the stream formats are introduced only by the queue package, third-party
+// types must not be published.
 //
-// Имена — ASCII-форма (punycode, ТЗ 5.2): в очереди, как и во всей
-// системе, ходят только ASCII-имена.
+// The names are the ASCII form (punycode, spec 5.2): in the queue, as in
+// the whole system, only ASCII names circulate.
 type Message interface {
-	// Streams возвращает стримы, в которые допустима публикация
-	// сообщения (ТЗ 4.2). У Result их три: q:render, q:render-fallback
-	// (очередь фолбэка движка, ТЗ 4.3) и q:analyze используют один
-	// формат «один результат».
+	// Streams returns the streams the message may be published to
+	// (spec 4.2). Result has three of them: q:render, q:render-fallback
+	// (the engine fallback queue, spec 4.3) and q:analyze share the same
+	// "one result" format.
 	Streams() []string
 
-	// validate проверяет минимальную допустимость значений перед
-	// публикацией и после декодирования.
+	// validate checks the minimal admissibility of values before
+	// publication and after decoding.
 	validate() error
 }
 
-// DNSDomain — домен пачки q:dns: идентификаторы строки domains и имя
-// (ТЗ 4.2: «пачка доменов (id + имя)»). dns-worker делает запросы по
-// имени, результаты пишет по идентификаторам; zone_id включён как
-// идентификатор записи — он нужен партиционированным таблицам результатов
-// и избавляет воркер от обратного чтения domains.
+// DNSDomain — a domain of the q:dns batch: the identifiers of the domains
+// row and the name (spec 4.2: "a batch of domains (id + name)"). dns-worker
+// makes queries by name, writes results by identifiers; zone_id is included
+// as the row identifier — the partitioned result tables need it and it
+// spares the worker a backward read of domains.
 type DNSDomain struct {
 	ZoneID   int16  `json:"zone_id"`
 	DomainID int64  `json:"domain_id"`
-	Name     string `json:"name"` // полное имя, punycode
+	Name     string `json:"name"` // full name, punycode
 }
 
-// DNSBatch — сообщение q:dns: пачка доменов на DNS-проверку (ТЗ 4.2,
-// §5.3 — планировщик публикует пачками; размер пачки — scheduler.batch_size).
+// DNSBatch — a q:dns message: a batch of domains for the DNS check
+// (spec 4.2, §5.3 — the scheduler publishes in batches; the batch size is
+// scheduler.batch_size).
 type DNSBatch struct {
 	TaskID  string      `json:"task_id"`
 	Domains []DNSDomain `json:"domains"`
 }
 
-// Streams — стрим пачки DNS-задач.
+// Streams — the stream of DNS task batches.
 func (DNSBatch) Streams() []string { return []string{StreamDNS} }
 
 func (b DNSBatch) validate() error {
@@ -94,30 +97,30 @@ func (b DNSBatch) validate() error {
 	return nil
 }
 
-// HTTPSubdomain — DNS-живой субдомен задачи q:http: номер бита dns_mask
-// (subdomains.id), метка ("" — апекс домена) и адреса с CNAME из
-// DNS-этапа.
+// HTTPSubdomain — a DNS-live subdomain of a q:http task: the bit number of
+// dns_mask (subdomains.id), the label ("" — the domain apex) and the
+// addresses with CNAME from the DNS stage.
 type HTTPSubdomain struct {
 	SubdomainID int16    `json:"subdomain_id"`
-	Label       string   `json:"label"`           // "" — апекс
-	Addrs       []string `json:"addrs"`           // A/AAAA, уже резолвлены
-	CNAME       string   `json:"cname,omitempty"` // если субдомен — CNAME
+	Label       string   `json:"label"`           // "" — the apex
+	Addrs       []string `json:"addrs"`           // A/AAAA, already resolved
+	CNAME       string   `json:"cname,omitempty"` // when the subdomain is a CNAME
 }
 
-// HTTPTask — сообщение q:http: один домен со списком DNS-живых
-// субдоменов (ТЗ 4.2). Адреса и CNAME включены по ТЗ 5.4 (п. 4: «адреса
-// и CNAME передаются в задачу q:http») — http-worker подключается к
-// заранее резолвленным IP (ТЗ 5.5, п. 2) и не делает повторных DNS-
-// запросов для субдоменов задачи.
+// HTTPTask — a q:http message: one domain with the list of its DNS-live
+// subdomains (spec 4.2). Addresses and CNAME are included per spec 5.4
+// (p. 4: "the addresses and CNAME are passed in the q:http task") —
+// http-worker connects to pre-resolved IPs (spec 5.5, p. 2) and makes no
+// repeated DNS queries for the task's subdomains.
 type HTTPTask struct {
 	TaskID     string          `json:"task_id"`
 	ZoneID     int16           `json:"zone_id"`
 	DomainID   int64           `json:"domain_id"`
-	Name       string          `json:"name"` // полное имя домена, punycode
+	Name       string          `json:"name"` // full domain name, punycode
 	Subdomains []HTTPSubdomain `json:"subdomains"`
 }
 
-// Streams — стрим HTTP-задач.
+// Streams — the stream of HTTP tasks.
 func (HTTPTask) Streams() []string { return []string{StreamHTTP} }
 
 func (t HTTPTask) validate() error {
@@ -155,32 +158,34 @@ func (t HTTPTask) validate() error {
 	return nil
 }
 
-// Result — сообщение q:render, q:render-fallback и q:analyze (T-237,
-// ТЗ 4.3 п.1: фолбэк-очередь использует тот же контракт — сообщение
-// самодостаточно, конвертация не нужна): один результат — ключ строки
-// subdomain_results (домен, субдомен, вариант; ТЗ 4.2, §6.1). Сам
-// результат остаётся в БД, сообщение только указывает, какую запись
-// обрабатывать (рендер берёт итоговый URL, анализатор — контент по ключу);
-// имя домена — минимальное данное для логов и ручного разбора (ТЗ 4.2).
+// Result — a message of q:render, q:render-fallback and q:analyze (T-237,
+// spec 4.3 p.1: the fallback queue uses the same contract — the message is
+// self-sufficient, no conversion is needed): one result — the key of a
+// subdomain_results row (domain, subdomain, variant; spec 4.2, §6.1). The
+// result itself stays in the DB, the message only says which record to
+// process (render takes the final URL, the analyzer — the content by key);
+// the domain name is the minimal datum for logs and manual triage
+// (spec 4.2).
 type Result struct {
 	TaskID      string        `json:"task_id"`
 	ZoneID      int16         `json:"zone_id"`
 	DomainID    int64         `json:"domain_id"`
 	SubdomainID int16         `json:"subdomain_id"`
-	Variant     model.Variant `json:"variant"`        // 0 основной, 1 http (ТЗ 6.1)
-	Name        string        `json:"name,omitempty"` // полное имя, punycode
-	// Fresh — строка записана новым эпизодом HTTP-проверки (T-118):
-	// публикация HTTP/рендер-этапом (в той же транзакции эпизода) — true,
-	// переанализ по сохранённому контенту (ReanalyzeLoop, T-074) — false.
-	// Читает анализатор: история детекции laravel_history (appeared/lost)
-	// пишется только по свежим эпизодам — смена правил не факт о сайте.
-	// omitempty: записи до T-118 читаются как false (переанализ), старые
-	// и новые форматы совместимы без миграции стрима.
+	Variant     model.Variant `json:"variant"`        // 0 main, 1 http (spec 6.1)
+	Name        string        `json:"name,omitempty"` // full name, punycode
+	// Fresh — the row was written by a new HTTP check episode (T-118):
+	// publication by the HTTP/render stage (in the same transaction as the
+	// episode) — true, re-analysis over the stored content (ReanalyzeLoop,
+	// T-074) — false. The analyzer reads it: the laravel_history detection
+	// history (appeared/lost) is written only for fresh episodes — a rule
+	// change is not a fact about the site. omitempty: entries written
+	// before T-118 are read as false (re-analysis); the old and new
+	// formats are compatible without a stream migration.
 	Fresh bool `json:"fresh,omitempty"`
 }
 
-// Streams — стримы результата: формат один, рендер (основной движок и
-// фолбэк-воркер B) и анализ публикуют одинаковое сообщение.
+// Streams — the result streams: one format; render (the main engine and
+// the fallback worker B) and analysis publish the same message.
 func (Result) Streams() []string {
 	return []string{StreamRender, StreamRenderFallback, StreamAnalyze}
 }
@@ -204,41 +209,43 @@ func (r Result) validate() error {
 	return nil
 }
 
-// Dead — сообщение q:dead: задача, исчерпавшая число попыток (ТЗ 4.2),
-// для ручного разбора. Продюсер — T-025 (счётчик попыток и перевод
-// в q:dead); формат зафиксирован здесь заранее, чтобы эволюция доставки
-// не меняла контракт стрима. Записи несут идентификаторы предмета
-// задачи, а не исходное сообщение (T-105): payload пачек q:dns эпохи
-// batch_size 5000 (~250 КБ на запись) при потолке 10 000 записей давал
-// worst-case ~2,5 ГБ против бюджета Redis ≤ 0,5 ГБ (ТЗ 3.2,
-// docs/redis.md §3), а ручному разбору
-// хватает идентификаторов (docs/runbooks.md §2: домен — name/domain_id,
-// ключ строки — zone/domain/subdomain/variant; домены пачки q:dns
-// переиздаст lease-проход планировщика). Payload сохранено только для
-// чтения старых записей (до T-105) — новые его не публикуют.
+// Dead — a q:dead message: a task that exhausted its attempt count
+// (spec 4.2), for manual triage. The producer is T-025 (the attempt counter
+// and the move to q:dead); the format is fixed here in advance so that the
+// evolution of delivery does not change the stream contract. The entries
+// carry the identifiers of the task's subject, not the original message
+// (T-105): the payload of q:dns batches of the batch_size 5000 era (~250 KB
+// per entry) with a cap of 10,000 entries gave a worst case of ~2.5 GB
+// against the Redis budget of ≤ 0.5 GB (spec 3.2, docs/redis.md §3), while
+// manual triage has enough with the identifiers (docs/runbooks.md §2:
+// domain — name/domain_id, the row key — zone/domain/subdomain/variant;
+// the q:dns batch domains will be re-published by the scheduler's lease
+// pass). Payload is kept only for reading old entries (before T-105) —
+// new ones do not publish it.
 type Dead struct {
-	TaskID   string `json:"task_id"`          // task_id исходной задачи
-	Stream   string `json:"stream"`           // стрим-источник
-	EntryID  string `json:"entry_id"`         // запись-источник
-	Attempts int    `json:"attempts"`         // число попыток доставки
-	Reason   string `json:"reason,omitempty"` // причина исчерпания попыток
+	TaskID   string `json:"task_id"`          // task_id of the original task
+	Stream   string `json:"stream"`           // source stream
+	EntryID  string `json:"entry_id"`         // source entry
+	Attempts int    `json:"attempts"`         // number of delivery attempts
+	Reason   string `json:"reason,omitempty"` // reason the attempts ran out
 
-	// Идентификаторы предмета задачи (T-105) — выжимка исходного
-	// сообщения (deadSubjectOf). Опциональны: перенос в q:dead не обязан
-	// падать на тело, не разбирающееся как сообщение стрима.
-	ZoneID      int16         `json:"zone_id,omitempty"`      // штучные задачи: зона домена
-	DomainID    int64         `json:"domain_id,omitempty"`    // штучные задачи: домен
-	SubdomainID int16         `json:"subdomain_id,omitempty"` // q:render/q:analyze: ключ строки
-	Variant     model.Variant `json:"variant,omitempty"`      // q:render/q:analyze: 0 опускается (основной)
-	Name        string        `json:"name,omitempty"`         // имя домена, punycode
-	Domains     int           `json:"domains,omitempty"`      // q:dns: размер пачки
+	// The identifiers of the task's subject (T-105) — a distillation of the
+	// original message (deadSubjectOf). Optional: the move to q:dead must
+	// not fail on a body that does not parse as a stream message.
+	ZoneID      int16         `json:"zone_id,omitempty"`      // one-off tasks: the domain's zone
+	DomainID    int64         `json:"domain_id,omitempty"`    // one-off tasks: the domain
+	SubdomainID int16         `json:"subdomain_id,omitempty"` // q:render/q:analyze: the row key
+	Variant     model.Variant `json:"variant,omitempty"`      // q:render/q:analyze: 0 is omitted (main)
+	Name        string        `json:"name,omitempty"`         // the domain name, punycode
+	Domains     int           `json:"domains,omitempty"`      // q:dns: the batch size
 
-	// Payload — исходное сообщение записи до T-105; новыми записями не
-	// публикуется, читается для истории разбора и разбором игнорируется.
+	// Payload — the original message of the entry, pre-T-105; it is not
+	// published by new entries, it is read for triage history and ignored
+	// by triage.
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
-// Streams — стрим мёртвых задач.
+// Streams — the dead-task stream.
 func (Dead) Streams() []string { return []string{StreamDead} }
 
 func (d Dead) validate() error {
@@ -246,11 +253,12 @@ func (d Dead) validate() error {
 		return fmt.Errorf("queue: q:dead: пустой task_id")
 	}
 	switch d.Stream {
-	// Тело ветки пустое (валидные стримы проверять нечего): branch/case
-	// подменяет его на noop-EmptyStmt, печать которого идентична
-	// оригиналу, — мутант с пустым диффом, тестом не убить; подавление
-	// генерации — альтернатива блэклисту чексумм (docs/mutation-testing.md §4).
-	// Снять аннотацию, если у ветки появится тело.
+	// The branch body is empty (valid streams have nothing to check):
+	// branch/case replaces it with a noop EmptyStmt whose printout is
+	// identical to the original — a mutant with an empty diff that no test
+	// can kill; suppressing the generation — an alternative to the
+	// checksum blacklist (docs/mutation-testing.md §4). Remove the
+	// annotation if the branch ever gains a body.
 	// mutator-disable-next-line branch/case
 	case StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze:
 	default:
@@ -262,8 +270,8 @@ func (d Dead) validate() error {
 	if d.Attempts < 1 {
 		return fmt.Errorf("queue: q:dead: attempts %d < 1", d.Attempts)
 	}
-	// Идентификаторы предмета (T-105) опциональны (deadSubjectOf —
-	// best-effort), заданные обязаны быть допустимыми.
+	// The subject identifiers (T-105) are optional (deadSubjectOf is
+	// best-effort); the ones that are set must be valid.
 	if d.ZoneID < 0 || d.DomainID < 0 {
 		return fmt.Errorf("queue: q:dead: идентификаторы домена %d/%d отрицательны", d.ZoneID, d.DomainID)
 	}
@@ -285,20 +293,20 @@ func (d Dead) validate() error {
 	return nil
 }
 
-// deadSubjectOf выжимает из тела исходного сообщения идентификаторы
-// предмета задачи в запись Dead (T-105): q:dns — размер пачки (список
-// доменов не переносится — до ~250 КБ на запись, см. Dead), q:http —
-// домен, q:render/q:render-fallback/q:analyze (тело Result) — ключ
-// строки subdomain_results.
-// Best-effort: тело, не разбирающееся как сообщение стрима, оставляет
-// поля нулевыми; разобравшееся, но чужое (недопустимые значения) bury
-// откатывает к записи без идентификаторов — перенос в q:dead не падает
-// и не застревает ни на каком теле с task_id.
+// deadSubjectOf distills from the body of the original message the
+// identifiers of the task's subject into a Dead entry (T-105): q:dns — the
+// batch size (the list of domains is not carried — up to ~250 KB per
+// entry, see Dead), q:http — the domain, q:render/q:render-fallback/
+// q:analyze (a Result body) — the subdomain_results row key.
+// Best-effort: a body that does not parse as a stream message leaves the
+// fields zero; one that parses but is foreign (invalid values) — bury
+// falls back to an entry without identifiers — so the move to q:dead
+// neither fails nor gets stuck on any body with a task_id.
 func deadSubjectOf(d *Dead, stream string, payload []byte) {
 	switch stream {
 	case StreamDNS:
-		// Элементы пачки не читаются — только их число: []struct{}
-		// разбирает массив, не аллоцируя имена и идентификаторы.
+		// The batch elements are not read — only their number: []struct{}
+		// parses the array without allocating names and identifiers.
 		var m struct {
 			Domains []struct{} `json:"domains"`
 		}
@@ -319,23 +327,24 @@ func deadSubjectOf(d *Dead, stream string, payload []byte) {
 	}
 }
 
-// NewTaskID генерирует уникальный идентификатор задачи: 16 случайных
-// байт (crypto/rand) в hex — 128 бит случайности, коллизии практически
-// исключены. Идентификатор живёт в сообщении (не в записи стрима):
-// перенос задачи в q:dead (T-025) сохраняет его для связи с исходной
-// задачей и логами.
+// NewTaskID generates a unique task identifier: 16 random bytes
+// (crypto/rand) in hex — 128 bits of randomness, collisions are practically
+// excluded. The identifier lives in the message (not in the stream entry):
+// moving a task to q:dead (T-025) keeps it to link with the original task
+// and the logs.
 func NewTaskID() string {
 	var b [16]byte
-	// С Go 1.24 crypto/rand.Read не возвращает ошибок (заполняет буфер
-	// целиком или паникует).
+	// Since Go 1.24 crypto/rand.Read returns no errors (it fills the
+	// buffer completely or panics).
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
 
-// marshalMessage сериализует сообщение в JSON-поле data. Пустой TaskID
-// заменяется новым (копия сообщения — изменение не видно вызывающему;
-// идентификатор остаётся внутри записи очереди). Нужен идентификатор
-// заранее — заполните поле NewTaskID() до публикации.
+// marshalMessage serializes the message into the JSON data field. An empty
+// TaskID is replaced with a new one (a copy of the message — the change is
+// invisible to the caller; the identifier stays inside the queue entry).
+// If the identifier is needed in advance — fill the field with NewTaskID()
+// before publishing.
 func marshalMessage(msg Message) ([]byte, error) {
 	switch m := msg.(type) {
 	case DNSBatch:
@@ -383,13 +392,13 @@ func marshalMessage(msg Message) ([]byte, error) {
 	}
 }
 
-// Decode декодирует полезную нагрузку доставки в сообщение типа T,
-// проверяя стрим доставки и допустимость значений:
+// Decode decodes the delivery payload into a message of type T, checking
+// the delivery stream and the admissibility of the values:
 //
 //	batch, err := queue.Decode[queue.DNSBatch](d)
 //
-// Неизвестные поля JSON игнорируются — новые поля будущих версий
-// (счётчик попыток T-025) не ломают чтение.
+// Unknown JSON fields are ignored — new fields of future versions (the
+// T-025 attempt counter) do not break reading.
 func Decode[T Message](d Delivery) (T, error) {
 	var m T
 	if len(d.Payload) == 0 {
@@ -408,7 +417,7 @@ func Decode[T Message](d Delivery) (T, error) {
 	return m, nil
 }
 
-// streamAllowed сообщает, что сообщение msg может лежать в стриме stream.
+// streamAllowed reports that the message msg may sit in the stream stream.
 func streamAllowed(msg Message, stream string) bool {
 	for _, s := range msg.Streams() {
 		if s == stream {
@@ -418,9 +427,9 @@ func streamAllowed(msg Message, stream string) bool {
 	return false
 }
 
-// checkName проверяет полное имя домена: непустое и в пределах лимита
-// ТЗ 5.2 (п. 4). Имя ожидается уже нормализованным (punycode); глубокая
-// проверка синтаксиса — территория internal/idn на входе в систему.
+// checkName checks the full domain name: non-empty and within the spec 5.2
+// limit (p. 4). The name is expected to be already normalized (punycode);
+// a deep syntax check is the territory of internal/idn at the system input.
 func checkName(name string) error {
 	if name == "" {
 		return fmt.Errorf("пустое имя домена")

@@ -1,17 +1,19 @@
-// Классификация инфраструктурных ошибок очереди (T-152, пост-мортем
-// docs/load-measurements.md §11.1): сбой самого Redis — OOM при
-// noeviction («OOM command not allowed …», инцидент 22–23.10.2026),
-// обрыв соединения, таймаут транспорта — в отличие от ошибок обработки
-// (бизнес-логика задачи). До T-152 ошибка публикации результата (XADD)
-// обрабатывалась как ошибка самой задачи: доставка оставалась без XACK,
-// RecoverLoop клеймила её по кругу, попытки сгорали — одно OOM-окно
-// 2,25 ч дало 5507 мёртвых задач при полностью исправной обработке.
+// Classification of the queue's infrastructure errors (T-152, the post-
+// mortem docs/load-measurements.md §11.1): a failure of Redis itself —
+// OOM under noeviction ("OOM command not allowed …", the incident of
+// Oct 22–23, 2026), a connection drop, a transport timeout — as opposed
+// to processing errors (the task's business logic). Before T-152, a
+// result publication error (XADD) was handled as an error of the task
+// itself: the delivery stayed without XACK, RecoverLoop claimed it in a
+// circle, attempts burned — one OOM window of 2.25 h produced 5,507 dead
+// tasks with fully healthy processing.
 //
-// Маркер InfraError навешивается на ошибки транспорта в Publish/Ack и
-// прозрачно проходит через %w-обёртки воркеров (IsInfra): потребитель
-// ошибки отличает «Redis не смог записать» от «задача не обработалась» —
-// первое лечится паузой потребления и повтором записи (результат уже
-// вычислен), а не расходом попыток доставки.
+// The InfraError marker is attached to transport errors in Publish/Ack
+// and passes transparently through the workers' %w wrappers (IsInfra):
+// the error consumer distinguishes "Redis failed to write" from "the
+// task was not processed" — the former is treated by pausing consumption
+// and re-writing (the result is already computed), not by spending
+// delivery attempts.
 
 package queue
 
@@ -26,26 +28,28 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// InfraError — маркер инфраструктурного сбоя очереди: Redis не смог
-// выполнить команду по собственной причине (OOM noeviction, обрыв
-// соединения, таймаут транспорта, LOADING после рестарта), задача
-// непричастна. Определяет поведение потребителей ошибки (T-152):
+// InfraError — the marker of a queue infrastructure failure: Redis could
+// not execute the command for its own reason (OOM noeviction, a
+// connection drop, a transport timeout, LOADING after a restart), the
+// task is not at fault. It determines the behavior of error consumers
+// (T-152):
 //
-//   - воркеры по маркеру приостанавливают чтение новых доставок
-//     (fuse-паттерн T-139/T-142): Redis всё равно отвергает записи,
-//     черпать задачи бессмысленно;
-//   - семантика at-least-once не меняется: InfraError ≠ успех, XACK
-//     после успешной публикации — но и попытки доставок не расходуются
-//     клеймами без шанса записать результат (гейт RecoverLoop).
+//   - workers pause reading new deliveries on the marker (the fuse
+//     pattern of T-139/T-142): Redis rejects entries anyway, drawing
+//     tasks is pointless;
+//   - the at-least-once semantics do not change: InfraError ≠ success,
+//     XACK after a successful publication — but delivery attempts are
+//     also not spent by claims with no chance to write the result (the
+//     RecoverLoop gate).
 //
-// Ошибки обработки (бизнес-логика: декодирование, БД результата, рендер)
-// маркером не оборачиваются — их повторная доставка осмысленна и жжёт
-// попытки по общей политике redis.max_attempts → q:dead (T-025).
+// Processing errors (business logic: decoding, the result DB, render) are
+// not wrapped with the marker — their redelivery is meaningful and burns
+// attempts by the common redis.max_attempts policy → q:dead (T-025).
 type InfraError struct {
-	// Op — операция очереди, которая не смогла («publish в q:http»,
-	// «ack q:render (группа render-worker)») — контекст в сообщении.
+	// Op — the queue operation that failed ("publish to q:http",
+	// "ack q:render (the render-worker group)") — context in the message.
 	Op string
-	// Err — исходная ошибка транспорта/сервера.
+	// Err — the original transport/server error.
 	Err error
 }
 
@@ -55,22 +59,23 @@ func (e *InfraError) Error() string {
 
 func (e *InfraError) Unwrap() error { return e.Err }
 
-// IsInfra сообщает, что в цепочке ошибки (включая %w-обёртки воркеров —
-// от OnResult до Processing) есть инфраструктурный сбой очереди.
+// IsInfra reports that the error chain (including the workers' %w
+// wrappers — from OnResult to Processing) contains a queue infrastructure
+// failure.
 func IsInfra(err error) bool {
 	var ie *InfraError
 	return errors.As(err, &ie)
 }
 
-// infraCause классифицирует ошибку go-redis как сбой инфраструктуры:
-// ответы сервера о собственной недоступности (OOM — предмет инцидента
-// T-152; LOADING — старт после рестарта; READONLY/MASTERDOWN/CLUSTERDOWN/
-// TRYAGAIN — топология и реплики) и транспорт (обрыв соединения, таймаут
-// чтения/записи, исчерпание пула). Классификация типизированная: реальных
-// нетипизированных ошибок у go-redis нет, а текстовые маркеры ошибочно
-// ловили бы бизнес-тексты. Отмена/дедлайн контекста вызывающего — не сбой
-// Redis (context.DeadlineExceeded реализует net.Error и обязан
-// отсекаться раньше сетевой проверки).
+// infraCause classifies a go-redis error as an infrastructure failure:
+// server answers about its own unavailability (OOM — the subject of the
+// T-152 incident; LOADING — a start after a restart; READONLY/
+// MASTERDOWN/CLUSTERDOWN/TRYAGAIN — topology and replicas) and transport
+// (a connection drop, a read/write timeout, pool exhaustion). The
+// classification is typed: go-redis has no real untyped errors, and text
+// markers would wrongly catch business texts. The caller's context
+// cancellation/deadline is not a Redis failure (context.DeadlineExceeded
+// implements net.Error and must be cut off before the network check).
 func infraCause(err error) bool {
 	if err == nil {
 		return false
@@ -78,15 +83,15 @@ func infraCause(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	// Ответы сервера (Is*-хелперы go-redis понимают обёртки, включая
-	// строковый fallback тестовых ошибок «OOM …»).
+	// Server answers (the go-redis Is* helpers understand wrappers,
+	// including the string fallback of the test errors "OOM …").
 	if redis.IsOOMError(err) || redis.IsLoadingError(err) || redis.IsReadOnlyError(err) ||
 		redis.IsMasterDownError(err) || redis.IsClusterDownError(err) || redis.IsTryAgainError(err) {
 		return true
 	}
-	// Ответ в обёртке стороннего типа с сохранением интерфейса
-	// redis.Error (Is*-хелперы ищут конкретный proto.RedisError и голую
-	// строку — интерфейсный обход закрывает %w-цепочки).
+	// An answer wrapped in a foreign type preserving the redis.Error
+	// interface (the Is* helpers look for a concrete proto.RedisError and
+	// a bare string — the interface walk covers %w chains).
 	var rErr redis.Error
 	if errors.As(err, &rErr) {
 		m := rErr.Error()
@@ -96,13 +101,13 @@ func infraCause(err error) bool {
 			}
 		}
 	}
-	// Транспорт: закрытое соединение и пул.
+	// Transport: a closed connection and the pool.
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, redis.ErrPoolTimeout) || errors.Is(err, redis.ErrClosed) {
 		return true
 	}
-	// *net.OpError (отказ/обрыв/сброс соединения) и таймауты сокета
-	// реализуют net.Error.
+	// *net.OpError (a refusal/drop/reset of the connection) and socket
+	// timeouts implement net.Error.
 	var netErr net.Error
 	return errors.As(err, &netErr)
 }

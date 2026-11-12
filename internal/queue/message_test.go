@@ -1,6 +1,6 @@
-// Тесты форматов сообщений стримов (T-024, ТЗ 4.2): wire-формат
-// зафиксирован точными JSON-строками, roundtrip — через Decode, кривые
-// данные — ошибками декодирования/валидации.
+// Stream message format tests (T-024, spec 4.2): the wire format is
+// fixed by exact JSON strings, the roundtrip — through Decode, malformed
+// data — by decoding/validation errors.
 
 package queue
 
@@ -30,9 +30,9 @@ func TestMessageStreams(t *testing.T) {
 	}
 }
 
-// TestMessageWireFormat фиксирует точный JSON-формат сообщений всех
-// стримов: имена и порядок полей закреплены, эволюция — только добавлением
-// полей (неизвестные поля читатели игнорируют).
+// TestMessageWireFormat fixes the exact JSON format of the messages of
+// all streams: the field names and order are pinned, evolution — only by
+// adding fields (readers ignore unknown fields).
 func TestMessageWireFormat(t *testing.T) {
 	cases := []struct {
 		name string
@@ -120,8 +120,8 @@ func TestMessageWireFormat(t *testing.T) {
 	}
 }
 
-// TestMessageRoundtrip — marshal → Decode по каждому стриму сообщения
-// (Result читается и из q:render, и из q:analyze).
+// TestMessageRoundtrip — marshal → Decode for each stream of the message
+// (Result is read both from q:render and from q:analyze).
 func TestMessageRoundtrip(t *testing.T) {
 	batch := DNSBatch{
 		TaskID: "rt1",
@@ -170,11 +170,11 @@ func TestMessageRoundtrip(t *testing.T) {
 	}
 }
 
-// TestMarshalFillsTaskID — пустой task_id заменяется новым при
-// сериализации: у всех четырёх форматов и у значений, и у указателей.
-// Значение мутируется в копии (вызывающий не видит), указатель — в
-// объекте вызывающего; тест смотрит только JSON — идентификатор в
-// записи новый в обоих случаях.
+// TestMarshalFillsTaskID — an empty task_id is replaced with a new one
+// at serialization: in all four formats, for both values and pointers.
+// The value is mutated in a copy (the caller does not see it), the
+// pointer — in the caller's object; the test looks only at the JSON —
+// the identifier in the entry is new in both cases.
 func TestMarshalFillsTaskID(t *testing.T) {
 	domains := []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}
 	subdomains := []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}
@@ -225,8 +225,8 @@ func TestNewTaskID(t *testing.T) {
 	}
 }
 
-// TestDecodeUnknownFields — новые поля будущих версий формата (например,
-// счётчик попыток T-025) не ломают чтение.
+// TestDecodeUnknownFields — new fields of future format versions (for
+// example, the T-025 attempt counter) do not break reading.
 func TestDecodeUnknownFields(t *testing.T) {
 	data := []byte(`{"task_id":"t1","attempts":2,"domains":[{"zone_id":3,"domain_id":42,"name":"example.com"}]}`)
 	got, err := Decode[DNSBatch](Delivery{Stream: StreamDNS, ID: "1-0", Payload: data})
@@ -238,8 +238,8 @@ func TestDecodeUnknownFields(t *testing.T) {
 	}
 }
 
-// TestDecodeBadData — кривые данные отвергаются с указанием стрима и записи;
-// каждая пачка декодируется типом своего стрима.
+// TestDecodeBadData — malformed data is rejected with the stream and
+// entry named; each batch is decoded by its stream's type.
 func TestDecodeBadData(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -349,9 +349,9 @@ func TestDecodeBadData(t *testing.T) {
 	}
 }
 
-// TestDecodeWrongStream — сообщение не декодируется из чужого стрима
-// (Result допустим в q:render и q:analyze, но не в q:dns; DNSBatch —
-// только в q:dns); запись без поля data — ошибка.
+// TestDecodeWrongStream — a message is not decoded from a foreign
+// stream (Result is allowed in q:render and q:analyze, but not in q:dns;
+// DNSBatch — only in q:dns); an entry without the data field — an error.
 func TestDecodeWrongStream(t *testing.T) {
 	resultJSON := `{"task_id":"t1","zone_id":1,"domain_id":1,"subdomain_id":0,"variant":0}`
 	if _, err := Decode[Result](Delivery{Stream: StreamDNS, ID: "1-0", Payload: []byte(resultJSON)}); err == nil {
@@ -365,9 +365,10 @@ func TestDecodeWrongStream(t *testing.T) {
 	}
 }
 
-// TestDecodeEmptyPayload — запись без поля data отвергается ошибкой
-// «без поля data» с именем стрима и записи (а не ошибкой разбора пустого
-// JSON, которой мутант проверки длины payload подменяет её).
+// TestDecodeEmptyPayload — an entry without the data field is rejected
+// with the "no data field" error naming the stream and entry (not by the
+// empty-JSON parse error that the payload length check mutant would
+// substitute for it).
 func TestDecodeEmptyPayload(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -386,8 +387,8 @@ func TestDecodeEmptyPayload(t *testing.T) {
 	}
 }
 
-// TestValidateMessages — проверка значений перед публикацией (Publish
-// вызывает validate до обращения к Redis).
+// TestValidateMessages — the value check before publication (Publish
+// calls validate before touching Redis).
 func TestValidateMessages(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -422,10 +423,10 @@ func TestValidateMessages(t *testing.T) {
 			Dead{TaskID: "t", Stream: StreamRender, EntryID: "1-0", Attempts: 1, Variant: model.Variant(5)},
 			"вариант",
 		},
-		// Границы идентификаторов «≤ 0»: ноль недопустим так же, как
-		// отрицательные (мутанты «< 0» и «≤ -1» пропускали бы его).
-		// Каждый случай портит ровно одно поле — остальное валидно,
-		// чтобы ошибка называла именно его.
+		// The identifier boundaries "≤ 0": zero is invalid just like the
+		// negatives (the mutants "< 0" and "≤ -1" would let it through).
+		// Each case corrupts exactly one field — the rest is valid, so
+		// that the error names exactly that field.
 		{
 			"http zone_id 0",
 			HTTPTask{ZoneID: 0, DomainID: 1, Name: "a.test", Subdomains: []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}},
@@ -438,7 +439,8 @@ func TestValidateMessages(t *testing.T) {
 		},
 		{"результат zone_id 0", Result{ZoneID: 0, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain}, "zone_id 0 ≤ 0"},
 		{"результат domain_id 0", Result{ZoneID: 1, DomainID: 0, SubdomainID: 0, Variant: model.VariantMain}, "domain_id 0 ≤ 0"},
-		// Бит 63 маски знаковый — единственная невалидность сообщения.
+		// Bit 63 of the mask is signed — the only invalidity of the
+		// message.
 		{"результат бит 63", Result{ZoneID: 1, DomainID: 1, SubdomainID: 63, Variant: model.VariantMain}, "вне диапазона"},
 		{
 			"результат имя длиннее 253",
@@ -446,9 +448,9 @@ func TestValidateMessages(t *testing.T) {
 			"имя длиннее 253",
 		},
 		{"dead пустой entry_id", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "", Attempts: 1}, "пустой entry_id"},
-		// Идентификаторы предмета q:dead опциональны, но заданный
-		// обязан быть неотрицательным: -1 — ошибка (0 — допустим,
-		// «не задан», см. «dead ок» выше).
+		// The q:dead subject identifiers are optional, but a set one
+		// must be non-negative: -1 is an error (0 is allowed, "not set",
+		// see "dead ok" above).
 		{"dead zone_id -1", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, ZoneID: -1}, "отрицательны"},
 		{"dead domain_id -1", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, DomainID: -1}, "отрицательны"},
 	}
@@ -468,9 +470,9 @@ func TestValidateMessages(t *testing.T) {
 	}
 }
 
-// TestValidateDNSBatchItemNumber — номер домена в ошибке пачки: счёт
-// с единицы (i+1); невалидный ВТОРОЙ элемент даёт «№2» — мутанты
-// i-1/i+0/i+2 напечатали бы №0/№1/№3.
+// TestValidateDNSBatchItemNumber — the domain number in the batch
+// error: counting from one (i+1); an invalid SECOND element gives "#2" —
+// the mutants i-1/i+0/i+2 would print #0/#1/#3.
 func TestValidateDNSBatchItemNumber(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -492,10 +494,10 @@ func TestValidateDNSBatchItemNumber(t *testing.T) {
 	}
 }
 
-// TestValidateHTTPTaskSubdomainItemNumber — номер субдомена в ошибке
-// задачи q:http (счёт с единицы): невалидный ВТОРОЙ субдомен даёт «№2»
-// по каждой проверке цикла; тексты содержат и лимиты-литералы
-// (63 октета метки, 253 октета CNAME).
+// TestValidateHTTPTaskSubdomainItemNumber — the subdomain number in the
+// q:http task error (counting from one): an invalid SECOND subdomain
+// gives "#2" in every loop check; the texts contain the literal limits
+// too (63 octets of the label, 253 octets of the CNAME).
 func TestValidateHTTPTaskSubdomainItemNumber(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -548,10 +550,11 @@ func TestValidateHTTPTaskSubdomainItemNumber(t *testing.T) {
 	}
 }
 
-// TestValidateExactLimits — граничные длины ТЗ 5.2 (п. 4): лимиты
-// включающие — метка ровно 63 октета и имена/CNAME ровно 253 октета
-// валидны во всех форматах, где проверяются. Запредельные длины —
-// в TestValidateMessages и TestValidateHTTPTaskSubdomainItemNumber.
+// TestValidateExactLimits — the boundary lengths of spec 5.2 (p. 4):
+// the limits are inclusive — a label of exactly 63 octets and names/
+// CNAME of exactly 253 octets are valid in every format where they are
+// checked. The over-limit lengths — in TestValidateMessages and
+// TestValidateHTTPTaskSubdomainItemNumber.
 func TestValidateExactLimits(t *testing.T) {
 	name253 := strings.Repeat("a", 253)
 	if err := (DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: name253}}}).validate(); err != nil {
@@ -578,11 +581,12 @@ func TestValidateExactLimits(t *testing.T) {
 	}
 }
 
-// TestDeadSubjectOf (T-105) — выжимка идентификаторов предмета задачи
-// из тела исходного сообщения: пачка q:dns — размер (список не
-// переносится), штучные задачи — домен, q:render/q:analyze — ключ
-// строки subdomain_results; неразбирающееся тело оставляет поля
-// нулевыми — перенос в q:dead не падает на чужом формате.
+// TestDeadSubjectOf (T-105) — the distillation of the task subject
+// identifiers from the original message body: a q:dns batch — the size
+// (the list is not carried), one-off tasks — the domain,
+// q:render/q:analyze — the subdomain_results row key; a body that does
+// not parse leaves the fields zero — the move to q:dead does not fail
+// on a foreign format.
 func TestDeadSubjectOf(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -623,10 +627,10 @@ func TestDeadSubjectOf(t *testing.T) {
 	}
 }
 
-// TestDecodeDeadLegacyPayload — записи q:dead до T-105 несли payload
-// исходного сообщения: поле сохранено (omitempty) для чтения истории —
-// Decode старых записей работает, новые payload не публикуют (bury,
-// TestReliabClaimDeadByteGuard).
+// TestDecodeDeadLegacyPayload — q:dead entries before T-105 carried the
+// payload of the original message: the field is kept (omitempty) for
+// history reading — Decode of old entries works, new ones do not
+// publish payload (bury, TestReliabClaimDeadByteGuard).
 func TestDecodeDeadLegacyPayload(t *testing.T) {
 	legacy := `{"task_id":"t1","stream":"q:dns","entry_id":"1-0","attempts":4,` +
 		`"reason":"исчерпан лимит попыток 3: доставок без подтверждения — 4",` +

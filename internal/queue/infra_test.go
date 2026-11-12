@@ -1,9 +1,10 @@
-// Тесты инфраструктурных ошибок очереди (T-152) без живого Redis:
-// классификация сбоев транспорта/сервера (infraCause), маркер InfraError
-// через %w-обёртки, повторы публикации XADD при инфраструктурном сбое,
-// классификация Ack, проба записи Reliab.Writable (SET) и гейт клейма
-// RecoverLoop по пробе. Реальная семантика OOM (noeviction, XPENDING
-// RetryCount) — интеграционный тест TestResilience_OOMDoesNotBurnAttempts.
+// Queue infrastructure error tests (T-152) without a live Redis: the
+// classification of transport/server failures (infraCause), the
+// InfraError marker through %w wrappers, XADD publication retries on an
+// infrastructure failure, the Ack classification, the Reliab.Writable
+// write probe (SET) and the RecoverLoop claim gate by the probe. The
+// real OOM semantics (noeviction, XPENDING RetryCount) — the integration
+// test TestResilience_OOMDoesNotBurnAttempts.
 
 package queue
 
@@ -21,22 +22,23 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// testRedisError — ошибка сервера Redis как тип (redis.Error): реальные
-// ответы go-redis отдаёт типизированными proto.RedisError, строковый
-// fallback Is*-хелперов — только для голых строк.
+// testRedisError — a Redis server error as a type (redis.Error): real
+// go-redis answers are typed proto.RedisError, the string fallback of
+// the Is* helpers is only for bare strings.
 type testRedisError string
 
 func (e testRedisError) Error() string { return string(e) }
 func (e testRedisError) RedisError()   {}
 
-// oomErr — ошибка OOM как из журналов инцидента 22–23.10 (тип
-// redis.Error, как отдаёт go-redis).
+// oomErr — an OOM error as from the incident journals of Oct 22–23 (the
+// redis.Error type, as go-redis returns it).
 var oomErr error = testRedisError("OOM command not allowed when used memory > 'maxmemory'")
 
-// TestInfraCause — классификация сбоев инфраструктуры: ответы сервера о
-// собственной недоступности (OOM/LOADING/READONLY), транспорт (обрыв
-// соединения, таймаут сокета, пул) — инфраструктурные; ошибки обработки,
-// ответы о самой команде, отмена/дедлайн контекста вызывающего — нет.
+// TestInfraCause — the infrastructure failure classification: server
+// answers about its own unavailability (OOM/LOADING/READONLY) and
+// transport (a connection drop, a socket timeout, the pool) are
+// infrastructure; processing errors, answers about the command itself,
+// the caller's context cancellation/deadline are not.
 func TestInfraCause(t *testing.T) {
 	netTimeout := &net.DNSError{Err: "i/o timeout", IsTimeout: true} // net.Error
 	connReset := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
@@ -68,9 +70,9 @@ func TestInfraCause(t *testing.T) {
 	}
 }
 
-// TestInfraErrorIsInfra — маркер проходит через цепочки %w-обёрток
-// воркеров (Processing → OnResult → Publish) и не возникает у ошибок
-// обработки.
+// TestInfraErrorIsInfra — the marker passes through the workers' %w
+// wrapper chains (Processing → OnResult → Publish) and does not arise
+// for processing errors.
 func TestInfraErrorIsInfra(t *testing.T) {
 	infra := &InfraError{Op: "publish в q:analyze", Err: oomErr}
 	if !IsInfra(infra) {
@@ -92,8 +94,9 @@ func TestInfraErrorIsInfra(t *testing.T) {
 	}
 }
 
-// TestPublishRetryDefaults — литеральные пины констант и нормализация
-// опций (сравнение с самой константой мутанта не замечает).
+// TestPublishRetryDefaults — literal pins of the constants and the
+// normalization of options (a comparison against the constant does not
+// notice the mutant).
 func TestPublishRetryDefaults(t *testing.T) {
 	if DefaultPublishRetries != 2 {
 		t.Errorf("DefaultPublishRetries = %d, хочу 2 (T-152: короткая серия повторов)", DefaultPublishRetries)
@@ -111,14 +114,16 @@ func TestPublishRetryDefaults(t *testing.T) {
 	}
 }
 
-// TestPublishRetriesInfra — повтор XADD при инфраструктурном сбое
-// (T-152): результат уже вычислен, короткая серия повторов закрывает
-// флап; устойчивый сбой — InfraError после исчерпания повторов;
-// не-инфраструктурная ошибка не повторяется; отмена ctx прерывает паузу.
+// TestPublishRetriesInfra — an XADD retry on an infrastructure failure
+// (T-152): the result is already computed, a short retry series closes
+// the flap; a persistent failure — InfraError after the retries are
+// exhausted; a non-infrastructure error is not retried; a ctx
+// cancellation interrupts the pause.
 func TestPublishRetriesInfra(t *testing.T) {
 	msg := DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}
 
-	// Два OOM, третий вызов проходит: публикация успешна, всего 3 XADD.
+	// Two OOMs, the third call passes: the publication succeeds, 3 XADD
+	// in total.
 	fake := &fakeRedis{addErrs: []error{oomErr, oomErr}}
 	q := NewRedisQueue(fake, RedisOptions{PublishRetryPause: time.Nanosecond})
 	if _, err := q.Publish(context.Background(), StreamDNS, msg); err != nil {
@@ -128,7 +133,8 @@ func TestPublishRetriesInfra(t *testing.T) {
 		t.Errorf("вызовов XADD: %d, хочу 3 (1 + 2 повтора)", len(fake.adds))
 	}
 
-	// Устойчивый OOM: InfraError, повторы исчерпаны (1 + PublishRetries).
+	// A persistent OOM: InfraError, the retries are exhausted
+	// (1 + PublishRetries).
 	fake = &fakeRedis{addErr: oomErr}
 	q = NewRedisQueue(fake, RedisOptions{PublishRetries: 2, PublishRetryPause: time.Nanosecond})
 	_, err := q.Publish(context.Background(), StreamDNS, msg)
@@ -142,8 +148,8 @@ func TestPublishRetriesInfra(t *testing.T) {
 		t.Errorf("вызовов XADD: %d, хочу 3 (1 + PublishRetries 2)", len(fake.adds))
 	}
 
-	// Не-инфраструктурная ошибка XADD — без повторов (повтор дал бы тот
-	// же ответ).
+	// A non-infrastructure XADD error — without retries (a retry would
+	// give the same answer).
 	fake = &fakeRedis{addErr: errors.New("ERR wrong number of arguments")}
 	q = NewRedisQueue(fake, RedisOptions{PublishRetryPause: time.Nanosecond})
 	_, err = q.Publish(context.Background(), StreamDNS, msg)
@@ -154,8 +160,8 @@ func TestPublishRetriesInfra(t *testing.T) {
 		t.Errorf("вызовов XADD: %d, хочу 1 (повтора нет)", len(fake.adds))
 	}
 
-	// Отмена ctx в паузе между повторами: без нового XADD, ошибка
-	// инфраструктурная (публикация не состоялась).
+	// A ctx cancellation in the pause between retries: no new XADD, the
+	// error is infrastructure (the publication did not happen).
 	fake = &fakeRedis{addErr: oomErr}
 	q = NewRedisQueue(fake, RedisOptions{PublishRetryPause: time.Hour})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -164,7 +170,7 @@ func TestPublishRetriesInfra(t *testing.T) {
 		_, err := q.Publish(ctx, StreamDNS, msg)
 		done <- err
 	}()
-	time.Sleep(50 * time.Millisecond) // первый XADD упал, цикл в паузе
+	time.Sleep(50 * time.Millisecond) // the first XADD failed, the loop is in the pause
 	cancel()
 	select {
 	case err := <-done:
@@ -179,9 +185,10 @@ func TestPublishRetriesInfra(t *testing.T) {
 	}
 }
 
-// TestAckInfraError — XACK при инфраструктурном сбое классифицируется
-// маркером (результат уже записан — это не ошибка обработки), прочая
-// ошибка — прежним текстом без маркера.
+// TestAckInfraError — an XACK on an infrastructure failure is
+// classified by the marker (the result is already written — this is not
+// a processing error), any other error keeps the old text without the
+// marker.
 func TestAckInfraError(t *testing.T) {
 	fake := &fakeRedis{ackErr: oomErr}
 	q := NewRedisQueue(fake, RedisOptions{})
@@ -201,10 +208,10 @@ func TestAckInfraError(t *testing.T) {
 	}
 }
 
-// probeClaimRedis — fakeClaimRedis плюс SET-проба записи (T-152):
-// переключаемая ошибка SET и потокобезопасное наблюдение клеймов
-// (цикл клеймит в своей горутине — доступ под мьютексом, стиль
-// pacingClaimRedis).
+// probeClaimRedis — fakeClaimRedis plus a SET write probe (T-152): a
+// switchable SET error and a thread-safe observation of claims (the loop
+// claims in its own goroutine — access under a mutex, the
+// pacingClaimRedis style).
 type probeClaimRedis struct {
 	*fakeClaimRedis
 	mu     sync.Mutex
@@ -250,9 +257,9 @@ func (f *probeClaimRedis) setProbeErr(err error) {
 	f.mu.Unlock()
 }
 
-// TestReliabWritable — проба записи: клиент с SET отвечает по ошибке
-// пробы, клиент без SET (фейки юнит-тестов) — true (гейт выключен,
-// поведение до T-152).
+// TestReliabWritable — the write probe: a client with SET answers by the
+// probe's error, a client without SET (the unit-test fakes) — true (the
+// gate is off, the pre-T-152 behavior).
 func TestReliabWritable(t *testing.T) {
 	fake := &probeClaimRedis{fakeClaimRedis: &fakeClaimRedis{}}
 	r := NewReliab(fake, NewRedisQueue(fake, RedisOptions{}), ReliabOptions{})
@@ -269,16 +276,16 @@ func TestReliabWritable(t *testing.T) {
 		t.Errorf("проб выполнено %d, хочу 2", fake.setCount())
 	}
 
-	// Без пробы (клиент не умеет SET) гейт прозрачен.
+	// Without the probe (the client cannot SET) the gate is transparent.
 	r2 := NewReliab(&fakeClaimRedis{}, NewRedisQueue(&fakeClaimRedis{}, RedisOptions{}), ReliabOptions{})
 	if !r2.Writable(context.Background()) {
 		t.Error("Writable без пробы = false (гейт обязан быть прозрачным)")
 	}
 }
 
-// TestRecoverLoopGatedByProbe — гейт клейма (T-152): пока проба записи
-// падает (OOM), RecoverLoop не клеймит — попытки доставок не расходуются;
-// запись восстановилась — клейм и обработка продолжаются.
+// TestRecoverLoopGatedByProbe — the claim gate (T-152): while the write
+// probe fails (OOM), RecoverLoop does not claim — delivery attempts are
+// not spent; Redis recovered — the claim and processing continue.
 func TestRecoverLoopGatedByProbe(t *testing.T) {
 	fake := &probeClaimRedis{fakeClaimRedis: &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -314,8 +321,8 @@ func TestRecoverLoopGatedByProbe(t *testing.T) {
 	}
 	defer stop()
 
-	// OOM-окно: несколько тиков — пробы падают, клейма нет, обработка
-	// не зовётся.
+	// The OOM window: several ticks — the probes fail, no claims,
+	// processing is not called.
 	time.Sleep(250 * time.Millisecond)
 	if n := fake.setCount(); n < 2 {
 		t.Fatalf("проб записи %d, хочу ≥2 (гейт вообще не опрашивает пробу)", n)
@@ -329,8 +336,9 @@ func TestRecoverLoopGatedByProbe(t *testing.T) {
 	default:
 	}
 
-	// Запись восстановилась: клейм берёт запись, обработка завершается
-	// XACK — цикл доводит зависшие доставки.
+	// Redis recovered: the claim takes the entry, the processing
+	// finishes with an XACK — the loop carries the stalled deliveries
+	// through.
 	fake.setProbeErr(nil)
 	select {
 	case d := <-processed:
