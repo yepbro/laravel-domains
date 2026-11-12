@@ -214,7 +214,7 @@ func TestVerifyCountersErrors(t *testing.T) {
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow), zonestatsRows(), stored)
 	if _, err := VerifyCounters(context.Background(), &zonestatsFakePool{steps: steps}, VerifyOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "empty response") {
+		!strings.Contains(err.Error(), "empty aggregate response") {
 		t.Errorf("an empty history = %v, want a protocol break", err)
 	}
 	// Malformed rows (Scan errors) of each set — with the "reading"
@@ -264,7 +264,7 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	p := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
 	tx, _ := p.Begin(ctx)
 	if a, l, err := readHistoryAgg(ctx, tx); err == nil || a != 0 || l != 0 ||
-		!strings.Contains(err.Error(), "empty response") {
+		!strings.Contains(err.Error(), "empty aggregate response") {
 		t.Errorf("history/empty: (%v/%v, %v)", a, l, err)
 	}
 	p = &zonestatsFakePool{steps: []zonestatsStep{{rows: &zonestatsFakeRows{
