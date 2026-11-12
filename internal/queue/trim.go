@@ -1,55 +1,62 @@
-// Освобождение подтверждённого префикса стримов (T-141, ТЗ 4.2
-// «Дополнение 2026-10-23»): XACK убирает запись из pending-списка группы,
-// но не из стрима — подтверждённая история копилась бы до потолка MAXLEN
-// (T-025) и переполняла бюджет Redis ≤ 0,5 ГБ (ТЗ 3.2): суточный прогон
-// T-093 встал на «OOM command not allowed» при стоке q:dns 1735 пачек
-// ≈ 410 МиБ (docs/load-measurements.md §11). Освобождение — периодический
-// XTRIM MINID по старейшей записи, которая обязана остаться в стриме:
-// удаляется только доставленное и подтверждённое, необработанные задачи
-// и зависшие PEL-записи не трогаются.
+// Releasing the acknowledged prefix of streams (T-141, spec 4.2
+// "Addendum 2026-10-23"): XACK removes an entry from the group's pending
+// list, but not from the stream — the acknowledged history would
+// accumulate up to the MAXLEN cap (T-025) and overflow the Redis budget
+// of ≤ 0.5 GB (spec 3.2): the daily run of T-093 hit
+// "OOM command not allowed" with the q:dns sink at 1735 batches
+// ≈ 410 MiB (docs/load-measurements.md §11). The release is a periodic
+// XTRIM MINID at the oldest entry that must remain in the stream: only
+// delivered and acknowledged data is removed, unprocessed tasks and
+// stuck PEL entries are not touched.
 //
-// Точка обрезки — минимум по группам стрима (в бою у рабочего стрима одна
-// группа — потребители этапа, docs/redis.md §2):
+// The trim point is the minimum across the groups of the stream (in
+// production a working stream has one group — the stage's consumers,
+// docs/redis.md §2):
 //
-//   - группа с зависшими записями (pending без XACK): старейшая pending-
-//     запись. Всё ниже её уже доставлено — XREADGROUP «>» раздаёт записи
-//     по порядку id — и подтверждено (иначе была бы в pending): зависший
-//     PEL не удаляется никогда;
-//   - группа с пустым pending: последний доставленный id (XINFO GROUPS
-//     last-delivered-id). Всё ниже доставлено и подтверждено, всё выше
-//     ещё не доставлено — и остаётся.
+//   - a group with stuck entries (pending without XACK): the oldest
+//     pending entry. Everything below it is already delivered —
+//     XREADGROUP ">" hands out entries in id order — and acknowledged
+//     (otherwise it would be in pending): a stuck PEL entry is never
+//     removed;
+//   - a group with an empty pending: the last delivered id (XINFO GROUPS
+//     last-delivered-id). Everything below is delivered and
+//     acknowledged, everything above is not delivered yet — and stays.
 //
-// Почему XTRIM MINID, а не XDEL после каждого Ack (ТЗ 4.2 допускает оба):
+// Why XTRIM MINID and not XDEL after every Ack (spec 4.2 allows both):
 //
-//   - нагрузка на Redis: один проход — XINFO GROUPS + XPENDING (по группам
-//     с pending) + XTRIM на стрим, ~15 команд в минуту на пять стримов,
-//     против дополнительной команды XDEL на каждую подтверждённую запись
-//     (тысячи в минуту на пике HTTP-этапа, замер T-139);
-//   - атомарность: XTRIM — одна команда, точка обрезки вычисляется по
-//     данным, которые не могут стать хуже к моменту выполнения: новые
-//     pending появляются только у записей выше last-delivered (id записей
-//     монотонны), ниже вычисленной точки подтверждённый префикс только
-//     растёт. Гонка «прочитали точку → обрезаем» безопасна без транзакции;
-//   - consumer groups: PEL не затрагивается (записей ниже старейшей pending
-//     в нём нет по построению), lag не искажается (недоставленное не
-//     обрезается). Группа, созданная позже со стартом "0" (ленивое
-//     создание, redisq.go), не увидит обрезанное — но это уже подтверждённая
-//     работа с результатом в БД: повторная доставка не нужна (источник
-//     истины PostgreSQL, ТЗ 3.4).
+//   - the load on Redis: one pass — XINFO GROUPS + XPENDING (for groups
+//     with pending) + XTRIM per stream, ~15 commands per minute across
+//     five streams, versus an extra XDEL command per acknowledged entry
+//     (thousands per minute at the HTTP stage's peak, the T-139
+//     measurement);
+//   - atomicity: XTRIM is one command, the trim point is computed from
+//     data that cannot get worse by the time it executes: new pending
+//     appear only on entries above last-delivered (entry ids are
+//     monotonic), below the computed point the acknowledged prefix only
+//     grows. The race "read the point → trim" is safe without a
+//     transaction;
+//   - consumer groups: the PEL is not touched (by construction it holds
+//     no entries below the oldest pending), lag is not distorted
+//     (undelivered data is not trimmed). A group created later with the
+//     start "0" (lazy creation, redisq.go) will not see the trimmed
+//     data — but that is already acknowledged work with the result in
+//     the DB: redelivery is not needed (the source of truth is
+//     PostgreSQL, spec 3.4).
 //
-// Механизм повторяет проверенное серверное решение инцидента (юнит
-// t092-trimhist: XTRIM MINID старейшего pending раз в 2 мин) — T-141
-// встраивает его в код: цикл TrimLoop живёт в сервисе scheduler (одиночный
-// хозяин стримов очередей, рядом с lease-проходом и гейтом backpressure;
-// redis.trim_interval). Пока планировщик остановлен, подтверждённая
-// история копится не выше потолков MAXLEN — сумма потолков в бюджете
-// (reliab.go, T-141).
+// The mechanism repeats the proven server-side incident fix (the unit
+// t092-trimhist: XTRIM MINID at the oldest pending every 2 min) — T-141
+// builds it into the code: the TrimLoop loop lives in the scheduler
+// service (the single owner of the queue streams, next to the lease pass
+// and the backpressure gate; redis.trim_interval). While the scheduler
+// is stopped, the acknowledged history accumulates no higher than the
+// MAXLEN caps — the sum of the caps fits the budget (reliab.go, T-141).
 //
-// Стрим без групп не освобождается и ошибкой не считается: подтверждений
-// не бывает (q:dead — ручной разбор без consumer group), потолок стрима —
-// MAXLEN с крошечными записями (T-105). XTRIM по такому стриму не
-// выполняется вовсе — стримы между рестартами сервисов живут с группами,
-// создаваемыми лениво, и обрезка от них не зависит.
+// A stream without groups is not released and does not count as an
+// error: acknowledgments never happen (q:dead — manual triage without a
+// consumer group), the stream cap is MAXLEN with tiny entries (T-105).
+// XTRIM is not run against such a stream at all — between service
+// restarts the streams live with lazily created groups, and the trim
+// does not depend on them.
 
 package queue
 
@@ -64,19 +71,20 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// DefaultTrimInterval — период проходов освобождения (TrimLoop). Минута
-// балансирует память и нагрузку: между проходами копится не больше минуты
-// подтверждённых записей (при текущих темпах этапов: q:dns ≤ 60 пачек/мин
-// ≈ 3,8 МиБ при постановке пачки в секунду, штучные ≈ 2 МиБ на стрим) —
-// единицы процентов бюджета ТЗ 3.2, а цена прохода — три команды на стрим.
+// DefaultTrimInterval — the period of release passes (TrimLoop). A minute
+// balances memory and load: between passes at most a minute of
+// acknowledged entries accumulates (at the current stage rates:
+// q:dns ≤ 60 batches/min ≈ 3.8 MiB with a batch published every second,
+// unit ≈ 2 MiB per stream) — single-digit percentages of the spec 3.2
+// budget, while a pass costs three commands per stream.
 const DefaultTrimInterval = time.Minute
 
-// workingStreams — рабочие стримы задач (ТЗ 4.2), освобождаемые
-// подтверждением: allStreams без q:dead (без consumer группы
-// подтверждённого префикса не бывает — потолок стрима MAXLEN с крошечными
-// записями T-105). Фильтр по allStreams — новый рабочий стрим,
-// добавленный в allStreams, освобождается автоматически (пин-тест
-// TestTrimOptionsDefaults сверяет множества).
+// workingStreams — the working task streams (spec 4.2) released by
+// acknowledgement: allStreams without q:dead (without a consumer group
+// there is no acknowledged prefix — the stream cap is MAXLEN with tiny
+// entries, T-105). Filtering over allStreams — a new working stream added
+// to allStreams is released automatically (the pin test
+// TestTrimOptionsDefaults cross-checks the sets).
 func workingStreams() []string {
 	out := make([]string, 0, len(allStreams)-1)
 	for _, s := range allStreams {
@@ -87,11 +95,12 @@ func workingStreams() []string {
 	return out
 }
 
-// trimStreams — окно go-redis для освобождения подтверждённого префикса:
-// XINFO GROUPS (pending и last-delivered-id групп), XPENDING (старейшая
-// pending-запись), XTRIM MINID и XLEN (сигнал застрявшего префикса).
-// Узкое, как redisStreams (redisq.go): *redis.Client и *redis.ClusterClient
-// удовлетворяют интерфейсу, тесты подменяют фейком.
+// trimStreams — the go-redis window for releasing the acknowledged
+// prefix: XINFO GROUPS (the groups' pending and last-delivered-id),
+// XPENDING (the oldest pending entry), XTRIM MINID and XLEN (the stuck
+// prefix signal). Narrow, like redisStreams (redisq.go): *redis.Client
+// and *redis.ClusterClient satisfy the interface, tests substitute a
+// fake.
 type trimStreams interface {
 	XInfoGroups(ctx context.Context, key string) *redis.XInfoGroupsCmd
 	XPending(ctx context.Context, stream, group string) *redis.XPendingCmd
@@ -99,25 +108,27 @@ type trimStreams interface {
 	XLen(ctx context.Context, key string) *redis.IntCmd
 }
 
-// TrimOptions — параметры освобождения; нулевые значения заменяются
-// дефолтами (withDefaults, стиль RecoverOptions).
+// TrimOptions — the release parameters; zero values are replaced with
+// defaults (withDefaults, the RecoverOptions style).
 type TrimOptions struct {
-	// Streams — освобождаемые стримы; nil — рабочие стримы задач
-	// (q:dns, q:http, q:render, q:render-fallback, q:analyze). q:dead
-	// не входит: без consumer group подтверждённого префикса не бывает.
+	// Streams — the streams to release; nil — the working task streams
+	// (q:dns, q:http, q:render, q:render-fallback, q:analyze). q:dead is
+	// not included: without a consumer group there is no acknowledged
+	// prefix.
 	Streams []string
-	// Interval — период проходов TrimLoop; 0 — DefaultTrimInterval.
-	// TrimOnce проход и так делает — поле управляет только циклом.
+	// Interval — the period of TrimLoop passes; 0 — DefaultTrimInterval.
+	// TrimOnce makes a pass anyway — the field only controls the loop.
 	Interval time.Duration
-	// MaxLen — предел длины стримов для сигнала застрявшего префикса
-	// (TrimLoop): длина стрима выше трёх четвертей предела при живых
-	// группах — точка обрезки не двигается (например, осиротевшая группа
-	// с замороженным last-delivered-id держит минимум по группам).
-	// Зеркалит redis.maxlen; 0 — пределы по стримам политики T-025/T-141
-	// (DefaultStreamMaxLen).
+	// MaxLen — the stream length limit for the stuck prefix signal
+	// (TrimLoop): a stream length above three quarters of the limit with
+	// live groups — the trim point is not advancing (for example, an
+	// orphaned group with a frozen last-delivered-id holds the minimum
+	// across groups). Mirrors redis.maxlen; 0 — the per-stream limits of
+	// the T-025/T-141 policy (DefaultStreamMaxLen).
 	MaxLen int64
-	// Log — логгер цикла TrimLoop; nil — записи подавлены
-	// (slog.DiscardHandler, стиль RecoverOptions). TrimOnce не логирует.
+	// Log — the logger of the TrimLoop loop; nil — records are suppressed
+	// (slog.DiscardHandler, the RecoverOptions style). TrimOnce does not
+	// log.
 	Log *slog.Logger
 }
 
@@ -131,8 +142,9 @@ func (o TrimOptions) withDefaults() TrimOptions {
 	return o
 }
 
-// streamMaxLen — предел длины стрима для сигнала застрявшего префикса:
-// явный из опций или политика по стримам (DefaultStreamMaxLen).
+// streamMaxLen — the stream length limit for the stuck prefix signal:
+// explicit from the options or the per-stream policy
+// (DefaultStreamMaxLen).
 func (o TrimOptions) streamMaxLen(stream string) int64 {
 	if o.MaxLen > 0 {
 		return o.MaxLen
@@ -140,20 +152,20 @@ func (o TrimOptions) streamMaxLen(stream string) int64 {
 	return DefaultStreamMaxLen(stream)
 }
 
-// TrimOnce — один проход освобождения по стримам опций: для каждого
-// вычисляет безопасную точку обрезки (минимум по группам — см. шапку
-// файла) и выполняет XTRIM MINID. Возвращает число удалённых записей по
-// всем стримам и список застрявших стримов — длина (XLEN) выше трёх
-// четвертей предела при живых группах: подтверждённый префикс растёт,
-// а точка не двигается (сигнал оператору — TrimLoop логирует Warn;
-// глубина гейта (min(lag, XLEN) + pending, T-168) такое не видит:
-// backlog групп у нуля).
-// Ошибка одного стрима не отменяет остальные (стиль Reliab.Claim):
-// ошибки собираются в возврат (errors.Join), валидная часть отрабатывает —
-// следующий проход повторит сбойный.
+// TrimOnce — one release pass over the option streams: for each it
+// computes the safe trim point (the minimum across groups — see the file
+// header) and runs XTRIM MINID. Returns the number of removed entries
+// across all streams and the list of stuck streams — a length (XLEN)
+// above three quarters of the limit with live groups: the acknowledged
+// prefix grows while the point is not advancing (a signal to the
+// operator — TrimLoop logs a Warn; the gate depth (min(lag, XLEN) +
+// pending, T-168) does not see this: the groups' backlog is at zero).
+// An error of one stream does not cancel the others (the Reliab.Claim
+// style): errors are collected into the return (errors.Join), the valid
+// part is processed — the next pass will repeat the failed one.
 //
-// Стрим без ключа (ещё не создавался) и стрим без групп — пустой проход
-// без ошибки: освобождать нечего.
+// A stream without a key (never created yet) and a stream without groups
+// — an empty pass without an error: there is nothing to release.
 func TrimOnce(ctx context.Context, rdb trimStreams, opt TrimOptions) (int64, []string, error) {
 	if rdb == nil {
 		return 0, nil, errors.New("queue: освобождение стримов: клиент Redis не задан")
@@ -178,30 +190,31 @@ func TrimOnce(ctx context.Context, rdb trimStreams, opt TrimOptions) (int64, []s
 	return trimmed, stuck, errors.Join(errs...)
 }
 
-// trimStream освобождает подтверждённый префикс одного стрима: точка
-// обрезки — старейшая запись, которая обязана остаться (минимум по
-// группам), XTRIM MINID удаляет строго ниже неё. pending-записи и
-// недоставленный хвост не удаляются никогда (at-least-once, ТЗ 3.4).
-// isStuck — длина стрима выше трёх четвертей предела opt.streamMaxLen
-// при живых группах: точка обрезки не двигается и префикс копится —
-// обычная обрезка такое не лечит, нужен разбор групп стрима.
+// trimStream releases the acknowledged prefix of one stream: the trim
+// point is the oldest entry that must remain (the minimum across
+// groups), XTRIM MINID removes strictly below it. Pending entries and
+// the undelivered tail are never removed (at-least-once, spec 3.4).
+// isStuck — the stream length above three quarters of the
+// opt.streamMaxLen limit with live groups: the trim point is not
+// advancing and the prefix accumulates — a regular trim does not cure
+// this, the stream's groups need triage.
 func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOptions) (int64, bool, error) {
 	if !knownStream(stream) {
 		return 0, false, fmt.Errorf("queue: освобождение: неизвестный стрим %q (стримы очереди — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
 	}
 	groups, err := rdb.XInfoGroups(ctx, stream).Result()
 	if err != nil {
-		// Стрима ещё нет — Redis отвечает ошибкой no such key, а не пустым
-		// списком (как у глубины гейта, backpressure.go): освобождать
-		// нечего, не ошибка.
+		// The stream does not exist yet — Redis answers with a no such key
+		// error, not an empty list (as with the gate depth,
+		// backpressure.go): there is nothing to release, not an error.
 		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 			return 0, false, nil
 		}
 		return 0, false, fmt.Errorf("queue: освобождение %s: группы: %w", stream, err)
 	}
 	if len(groups) == 0 {
-		// Групп нет (как у q:dead): подтверждённого префикса не бывает,
-		// потолок стрима — MAXLEN. Пустой проход, не ошибка.
+		// No groups (as with q:dead): there is no acknowledged prefix, the
+		// stream cap is MAXLEN. An empty pass, not an error.
 		return 0, false, nil
 	}
 	safe := ""
@@ -210,23 +223,24 @@ func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOpt
 		if g.Pending > 0 {
 			p, err := rdb.XPending(ctx, stream, g.Name).Result()
 			if err != nil {
-				// Ошибка чтения PEL — обрезка по last-delivered-id
-				// небезопасна: pending-записи могут лежать ниже его.
-				// Стрим пропускается целиком: следующий проход повторит.
+				// A PEL read error — trimming by last-delivered-id is
+				// unsafe: pending entries may sit below it. The stream
+				// is skipped entirely: the next pass will retry.
 				return 0, false, fmt.Errorf("queue: освобождение %s (группа %s): pending: %w", stream, g.Name, err)
 			}
 			if p.Count > 0 {
-				// Гонка: между XINFO и XPENDING всё подтвердили — точка
-				// остаётся last-delivered-id (доставленное подтверждено).
+				// A race: between XINFO and XPENDING everything was
+				// acknowledged — the point stays at last-delivered-id
+				// (delivered data is acknowledged).
 				cand = p.Lower
 			}
 		}
 		if cand == "" {
-			continue // группа ничего не доставляла — ограничения нет
+			continue // the group delivered nothing — no constraint
 		}
 		if safe == "" || streamIDGreater(safe, cand) {
-			// Численно меньший id: лексикографический порядок "999-0" >
-			// "1000-0" обманчив (trackProgress, redisq.go).
+			// The numerically smaller id: the lexicographic order "999-0" >
+			// "1000-0" is deceptive (trackProgress, redisq.go).
 			safe = cand
 		}
 	}
@@ -240,13 +254,15 @@ func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOpt
 			return 0, false, fmt.Errorf("queue: освобождение %s (XTRIM MINID %s): %w", stream, safe, err)
 		}
 	}
-	// Застрявший префикс: группы живы (есть), а длина у потолка — глубина
-	// backlog при этом может быть нулевой, и гейт с алертами молчат:
-	// точка обрезки заморожена (минимум по группам держит осиротевшая
-	// группа или зависшая last-delivered-id).
+	// A stuck prefix: the groups are alive (they exist) while the length
+	// is at the cap — the backlog depth can be zero at the same time, and
+	// the gate with the alerts stay silent: the trim point is frozen (the
+	// minimum across groups is held by an orphaned group or a stuck
+	// last-delivered-id).
 	length, err := rdb.XLen(ctx, stream).Result()
 	if err != nil {
-		// Длина — сигнал, не инвариант: ошибка XLEN не отменяет обрезку.
+		// The length is a signal, not an invariant: an XLEN error does not
+		// cancel the trim.
 		return n, false, fmt.Errorf("queue: освобождение %s: длина: %w", stream, err)
 	}
 	if limit := opt.streamMaxLen(stream); length*4 >= limit*3 {
@@ -255,18 +271,19 @@ func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOpt
 	return n, isStuck, nil
 }
 
-// TrimLoop — фоновый цикл освобождения подтверждённого префикса (T-141):
-// проход TrimOnce при старте (рестарт сервиса сразу освобождает
-// накопленную историю) и далее каждый Interval. Ошибка прохода не
-// останавливает цикл: логируется Warn, следующий проход повторит —
-// неподтверждённое не удаляется, опоздание обрезки стоит только памяти
-// до потолков MAXLEN. Застрявший стрим (длина у потолка при живых
-// группах — точка обрезки заморожена, см. TrimOnce) сигнализируется
-// Warn один раз за эпизод: подтверждённый префикс не виден глубине
-// гейта (min(lag, XLEN) + pending — backlog групп у нуля, T-168), и без
-// сигнала молчаливый рост повторил бы T-093.
-// Работает до отмены ctx и возвращает nil — контракт OnRun каркаса
-// (T-012, graceful shutdown, ТЗ 3.4).
+// TrimLoop — the background loop releasing the acknowledged prefix
+// (T-141): a TrimOnce pass at startup (a service restart immediately
+// releases the accumulated history) and then every Interval. A pass
+// error does not stop the loop: a Warn is logged, the next pass will
+// retry — unacknowledged data is not removed, a late trim only costs
+// memory up to the MAXLEN caps. A stuck stream (the length at the cap
+// with live groups — the trim point is frozen, see TrimOnce) is
+// signaled with a Warn once per episode: the acknowledged prefix is not
+// visible to the gate depth (min(lag, XLEN) + pending — the groups'
+// backlog is at zero, T-168), and without the signal the silent growth
+// would repeat T-093.
+// Runs until ctx is canceled and returns nil — the OnRun contract of the
+// service framework (T-012, graceful shutdown, spec 3.4).
 func TrimLoop(ctx context.Context, rdb trimStreams, opt TrimOptions) error {
 	if rdb == nil {
 		return errors.New("queue: цикл освобождения: клиент Redis не задан")
@@ -279,7 +296,7 @@ func TrimLoop(ctx context.Context, rdb trimStreams, opt TrimOptions) error {
 	log.Info("цикл освобождения подтверждённого префикса стримов",
 		"streams", strings.Join(o.Streams, ","), "interval", o.Interval.String())
 
-	warned := make(map[string]bool, len(o.Streams)) // Warn один раз за эпизод застревания
+	warned := make(map[string]bool, len(o.Streams)) // a Warn once per stuck episode
 	trim := func() {
 		_, stuck, err := TrimOnce(ctx, rdb, o)
 		if err != nil && ctx.Err() == nil {
@@ -294,7 +311,7 @@ func TrimLoop(ctx context.Context, rdb trimStreams, opt TrimOptions) error {
 					"stream", s, "maxlen", o.streamMaxLen(s))
 			}
 		}
-		for s := range warned { // эпизод закончился — снова сможем предупредить
+		for s := range warned { // the episode is over — we can warn again
 			if !stuckSet[s] {
 				delete(warned, s)
 			}

@@ -1,12 +1,13 @@
-// Тесты освобождения подтверждённого префикса стримов (T-141) без живого
-// Redis (стиль redisq_test.go): фейк с заготовленными ответами XINFO
-// GROUPS / XPENDING / XTRIM. Проверяются выбор точки обрезки (старейшая
-// pending группы; при пустом pending — last-delivered-id; минимум по
-// нескольким группам с численным сравнением id), пропуск стрима без
-// групп и без ключа (q:dead-случай), ошибки чтения (небезопасный проход
-// пропускается целиком, остальные стримы освобождаются), сумма удалённого
-// и дефолты опций. Реальная семантика XTRIM MINID и деградация памяти —
-// интеграционный тест TestResilience_TrimConfirmedPrefix (T-141).
+// Tests of releasing the acknowledged prefix of streams (T-141) without
+// a live Redis (the redisq_test.go style): a fake with stubbed XINFO
+// GROUPS / XPENDING / XTRIM responses. Covered: the choice of the trim
+// point (the group's oldest pending; with an empty pending —
+// last-delivered-id; the minimum across several groups with a numeric id
+// comparison), skipping a stream without groups and without a key (the
+// q:dead case), read errors (an unsafe pass is skipped entirely, the
+// other streams are released), the removed total and the option
+// defaults. The real XTRIM MINID semantics and the memory degradation —
+// the integration test TestResilience_TrimConfirmedPrefix (T-141).
 
 package queue
 
@@ -21,22 +22,23 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// fakeTrim — окно trimStreams с заготовленными ответами: группы стрима,
-// сводка XPENDING по группе (старейшая pending) и результат XTRIM.
-// Вызовы записываются для проверок аргументов; методы дергаются и из
-// фонового цикла TrimLoop — доступ к журналам вызовов под мьютексом
-// (стиль recover_test.go, корректно под -race).
+// fakeTrim — a trimStreams window with stubbed responses: the stream's
+// groups, the per-group XPENDING summary (the oldest pending) and the
+// XTRIM result. Calls are recorded for argument checks; the methods are
+// also invoked from the background TrimLoop loop — access to the call
+// logs is under a mutex (the recover_test.go style, correct under
+// -race).
 type fakeTrim struct {
 	groups    map[string][]redis.XInfoGroup
 	groupsErr map[string]error
-	pend      map[string]redis.XPending // ключ "stream|group"
+	pend      map[string]redis.XPending // the "stream|group" key
 	pendErr   map[string]error
-	xlen      map[string]int64 // длина стрима (сигнал застрявшего префикса)
-	trimCount int64            // ответ XTRIM (число удалённых)
+	xlen      map[string]int64 // the stream length (the stuck prefix signal)
+	trimCount int64            // the XTRIM response (the removed count)
 
 	mu    sync.Mutex
-	infos []string            // ключи XINFO GROUPS по порядку
-	pends []string            // ключи XPENDING по порядку
+	infos []string            // the XINFO GROUPS keys in call order
+	pends []string            // the XPENDING keys in call order
 	trims []map[string]string // XTRIM: {"stream": …, "minid": …}
 }
 
@@ -75,7 +77,8 @@ func (f *fakeTrim) XTrimMinID(ctx context.Context, key, minID string) *redis.Int
 	return redis.NewIntResult(f.trimCount, nil)
 }
 
-// trimCalls — снимок вызовов XTRIM (копия — для проверок вне мьютекса).
+// trimCalls — a snapshot of the XTRIM calls (a copy — for checks outside
+// the mutex).
 func (f *fakeTrim) trimCalls() []map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -88,14 +91,15 @@ func (f *fakeTrim) XLen(ctx context.Context, key string) *redis.IntCmd {
 	return redis.NewIntResult(f.xlen[key], nil)
 }
 
-// Компиляционные проверки: фейк взаимозаменяем с реальным клиентом
-// в окне освобождения.
+// Compile-time checks: the fake is interchangeable with the real client
+// in the release window.
 var _ trimStreams = (*redis.Client)(nil)
 var _ trimStreams = (*fakeTrim)(nil)
 
-// TestTrimOncePendingKept — точка обрезки по группе с зависшими записями:
-// XTRIM MINID — старейшая pending (всё ниже доставлено и подтверждено,
-// сама pending и хвост выше остаются).
+// TestTrimOncePendingKept — the trim point for a group with stuck
+// entries: XTRIM MINID — the oldest pending (everything below is
+// delivered and acknowledged, the pending itself and the tail above
+// stay).
 func TestTrimOncePendingKept(t *testing.T) {
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{
@@ -118,8 +122,9 @@ func TestTrimOncePendingKept(t *testing.T) {
 	}
 }
 
-// TestTrimOnceEmptyPEL — пустой pending группы: точка — last-delivered-id
-// (всё ниже доставлено и подтверждено, недоставленный хвост выше остаётся).
+// TestTrimOnceEmptyPEL — an empty group pending: the point —
+// last-delivered-id (everything below is delivered and acknowledged, the
+// undelivered tail above stays).
 func TestTrimOnceEmptyPEL(t *testing.T) {
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{
@@ -137,12 +142,13 @@ func TestTrimOnceEmptyPEL(t *testing.T) {
 	}
 }
 
-// TestTrimOnceMinAcrossGroups — несколько групп: точка — численный минимум
-// по группам ("999-0" < "1000-0", лексикографический порядок обманчив).
-// Свежая группа со стартом "0" (last-delivered-id "0-0", ещё не читала)
-// держит точку на "0-0" — консервативно: обрезка выше была бы потерей
-// истории для неё (XTRIM MINID 0-0 не удаляет ничего, TrimOnce просто
-// не освобождает такой стрим до прогресса группы).
+// TestTrimOnceMinAcrossGroups — several groups: the point — the numeric
+// minimum across groups ("999-0" < "1000-0", the lexicographic order is
+// deceptive). A fresh group started at "0" (last-delivered-id "0-0", it
+// has not read yet) holds the point at "0-0" — conservatively: trimming
+// above would be a history loss for it (XTRIM MINID 0-0 removes nothing,
+// TrimOnce simply does not release such a stream until the group makes
+// progress).
 func TestTrimOnceMinAcrossGroups(t *testing.T) {
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{
@@ -178,9 +184,9 @@ func TestTrimOnceMinAcrossGroups(t *testing.T) {
 	}
 }
 
-// TestTrimOnceNoGroupsAndNoKey — стрим без групп (q:dead-случай: групп
-// нет — подтверждённого префикса не бывает) и несуществующий ключ:
-// пустой проход без ошибки, XTRIM не выполняется.
+// TestTrimOnceNoGroupsAndNoKey — a stream without groups (the q:dead
+// case: no groups — there is no acknowledged prefix) and a nonexistent
+// key: an empty pass without an error, XTRIM is not run.
 func TestTrimOnceNoGroupsAndNoKey(t *testing.T) {
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{StreamDead: {}},
@@ -206,9 +212,9 @@ func TestTrimOnceNoGroupsAndNoKey(t *testing.T) {
 	}
 }
 
-// TestTrimOncePendingErrorSkipsStream — ошибка чтения PEL делает обрезку
-// по last-delivered-id небезопасной (pending может лежать ниже): стрим
-// пропускается с ошибкой, остальные освобождаются.
+// TestTrimOncePendingErrorSkipsStream — a PEL read error makes trimming
+// by last-delivered-id unsafe (pending may sit below it): the stream is
+// skipped with an error, the others are released.
 func TestTrimOncePendingErrorSkipsStream(t *testing.T) {
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{
@@ -235,8 +241,8 @@ func TestTrimOncePendingErrorSkipsStream(t *testing.T) {
 	}
 }
 
-// TestTrimOnceUnknownStreamAndNilClient — неизвестное имя стрима и nil-
-// клиент — ошибки; XTRIM не выполняется.
+// TestTrimOnceUnknownStreamAndNilClient — an unknown stream name and a
+// nil client — errors; XTRIM is not run.
 func TestTrimOnceUnknownStreamAndNilClient(t *testing.T) {
 	f := &fakeTrim{}
 	if _, _, err := TrimOnce(context.Background(), f, TrimOptions{Streams: []string{"q:unknown"}}); err == nil {
@@ -250,18 +256,19 @@ func TestTrimOnceUnknownStreamAndNilClient(t *testing.T) {
 	}
 }
 
-// TestTrimOnceStuckSignal — сигнал застрявшего префикса: длина стрима
-// (XLEN) ≥ ¾ предела при живых группах — точка обрезки заморожена
-// (минимум по группам держит осиротевшая группа), подтверждённый
-// префикс копится, а глубина lag+pending молчит; ниже порога и явный
-// MaxLen из опций — сигнала нет / считается от явного предела.
+// TestTrimOnceStuckSignal — the stuck prefix signal: a stream length
+// (XLEN) ≥ 3/4 of the limit with live groups — the trim point is frozen
+// (the minimum across groups is held by an orphaned group), the
+// acknowledged prefix accumulates, while the lag+pending depth is
+// silent; below the threshold and with an explicit MaxLen from the
+// options — no signal / computed from the explicit limit.
 func TestTrimOnceStuckSignal(t *testing.T) {
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{
 			StreamAnalyze: {{Name: "an", Pending: 0, LastDeliveredID: "5-0"}},
 		},
 		pend: map[string]redis.XPending{},
-		xlen: map[string]int64{StreamAnalyze: 120_000}, // ¾ от 150 000 = 112 500
+		xlen: map[string]int64{StreamAnalyze: 120_000}, // 3/4 of 150,000 = 112,500
 	}
 	_, stuck, err := TrimOnce(context.Background(), f, TrimOptions{Streams: []string{StreamAnalyze}})
 	if err != nil {
@@ -271,14 +278,14 @@ func TestTrimOnceStuckSignal(t *testing.T) {
 		t.Fatalf("застрявшие = %v, хочу [%s] (XLEN 120 000 ≥ ¾ предела 150 000)", stuck, StreamAnalyze)
 	}
 
-	// Ниже порога — сигнала нет.
+	// Below the threshold — no signal.
 	f.xlen[StreamAnalyze] = 100_000
 	if _, stuck, _ := TrimOnce(context.Background(), f, TrimOptions{Streams: []string{StreamAnalyze}}); len(stuck) != 0 {
 		t.Errorf("застрявшие при XLEN 100 000 < 112 500: %v", stuck)
 	}
 
-	// Явный предел из опций: порог считается от него (гейт-подобно
-	// BackpressureOptions.MaxLen).
+	// An explicit limit from the options: the threshold is computed from
+	// it (gate-like, BackpressureOptions.MaxLen).
 	if _, stuck, _ := TrimOnce(context.Background(), f, TrimOptions{
 		Streams: []string{StreamAnalyze}, MaxLen: 120_000,
 	}); len(stuck) != 1 || stuck[0] != StreamAnalyze {
@@ -286,10 +293,11 @@ func TestTrimOnceStuckSignal(t *testing.T) {
 	}
 }
 
-// TestTrimOptionsDefaults — нулевые Streams/Interval заменяются дефолтами:
-// рабочие стримы задач (workingStreams — всё известное knownStream, кроме
-// q:dead) и DefaultTrimInterval. Пин-тест: новый рабочий стрим обязан
-// попасть в workingStreams, иначе молча не освобождается.
+// TestTrimOptionsDefaults — zero Streams/Interval are replaced with the
+// defaults: the working task streams (workingStreams — everything
+// knownStream knows, except q:dead) and DefaultTrimInterval. A pin test:
+// a new working stream must land in workingStreams, otherwise it is
+// silently never released.
 func TestTrimOptionsDefaults(t *testing.T) {
 	o := TrimOptions{}.withDefaults()
 	want := workingStreams()
@@ -313,10 +321,11 @@ func TestTrimOptionsDefaults(t *testing.T) {
 	}
 }
 
-// TestTrimLoopCancel — цикл делает первый проход сразу и завершается
-// nil по отмене ctx (контракт OnRun, T-012), не дожидаясь тика. Журнал
-// вызовов читается через снимок fakeTrim.trimCalls — цикл живёт в другой
-// горутине (доступ под мьютексом фейка).
+// TestTrimLoopCancel — the loop makes the first pass immediately and
+// finishes with nil on ctx cancellation (the OnRun contract, T-012),
+// without waiting for a tick. The call log is read through the
+// fakeTrim.trimCalls snapshot — the loop lives in another goroutine
+// (access under the fake's mutex).
 func TestTrimLoopCancel(t *testing.T) {
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{
@@ -326,7 +335,8 @@ func TestTrimLoopCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- TrimLoop(ctx, f, TrimOptions{Interval: time.Hour}) }()
-	// Первый проход асинхронного цикла: точка фиксируется вызовом XTRIM.
+	// The first pass of the asynchronous loop: the point is fixed by an
+	// XTRIM call.
 	deadline := time.After(2 * time.Second)
 	for len(f.trimCalls()) == 0 {
 		select {

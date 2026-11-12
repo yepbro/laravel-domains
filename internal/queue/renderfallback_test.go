@@ -1,11 +1,13 @@
-// Тесты стрима очереди фолбэка рендера q:render-fallback (T-237, ТЗ 4.3,
-// ФТ-6) без живого Redis: пин allStreams-инварианта (стрим известен всей
-// очереди — knownStream/workingStreams/WorkingGroups), потолок MAXLEN
-// политики (свой, не штучной сотни тысяч — бюджет, docs/redis.md §3.1),
-// освобождение подтверждённого префикса (TrimOnce, trim_test.go) и
-// возврат зависших с переводом в q:dead (Reliab.Claim, reliab_test.go).
-// Формат сообщения — существующий контракт Result, отдельной таблицы не
-// нужно: roundtrip q:render-fallback — в message_test.go.
+// Tests of the render fallback queue stream q:render-fallback (T-237,
+// spec 4.3, FR-6) without a live Redis: the pin of the allStreams
+// invariant (the stream is known to the whole queue —
+// knownStream/workingStreams/WorkingGroups), the policy MAXLEN cap (its
+// own, not the unit hundred-thousands — the budget, docs/redis.md §3.1),
+// the release of the acknowledged prefix (TrimOnce, trim_test.go) and
+// the return of stuck entries with a move to q:dead (Reliab.Claim,
+// reliab_test.go). The message format — the existing Result contract, no
+// separate table is needed: the q:render-fallback roundtrip is in
+// message_test.go.
 
 package queue
 
@@ -18,11 +20,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// TestRenderFallbackAllStreamsInvariant — allStreams-инвариант: состав
-// стримов очереди — ровно константы пакета, q:render-fallback включён
-// (ТЗ 4.1 п.3: попадание в allStreams даёт trim/claim/надёжность
-// автоматически). Новый стрим без allStreams молча выпадает из
-// освобождения и клейма — пин ловит.
+// TestRenderFallbackAllStreamsInvariant — the allStreams invariant: the
+// composition of the queue streams is exactly the package constants,
+// q:render-fallback included (spec 4.1 item 3: landing in allStreams
+// gives trim/claim/reliability automatically). A new stream without
+// allStreams silently drops out of the release and the claim — the pin
+// catches that.
 func TestRenderFallbackAllStreamsInvariant(t *testing.T) {
 	want := []string{StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead}
 	if !reflect.DeepEqual(allStreams, want) {
@@ -31,8 +34,8 @@ func TestRenderFallbackAllStreamsInvariant(t *testing.T) {
 	if !knownStream(StreamRenderFallback) {
 		t.Errorf("knownStream(%q) = false: стрим вне allStreams — Publish/Consume/Claim его отвергнут", StreamRenderFallback)
 	}
-	// Рабочий стрим (без q:dead): освобождается TrimLoop и чистится
-	// по группам — группа фолбэка есть (воркер B, ФТ-12).
+	// A working stream (without q:dead): released by TrimLoop and cleaned
+	// up by groups — the fallback group exists (worker B, FR-12).
 	working := false
 	for _, s := range workingStreams() {
 		if s == StreamRenderFallback {
@@ -47,10 +50,11 @@ func TestRenderFallbackAllStreamsInvariant(t *testing.T) {
 	}
 }
 
-// TestRenderFallbackMaxLen — потолок политики T-025 для фолбэк-стрима:
-// собственный (бюджетная доля штучного потока, docs/redis.md §3.1), а не
-// штучные 150 000 (пробивал бы бюджет Redis при худшей пачке q:dns) и не
-// потолок q:dead; Publish усекает стрим им (XADD MAXLEN ~).
+// TestRenderFallbackMaxLen — the T-025 policy cap for the fallback
+// stream: its own (the budget share of the unit flow, docs/redis.md
+// §3.1), not the unit 150,000 (it would break the Redis budget with the
+// worst q:dns batch) and not the q:dead cap; Publish trims the stream
+// with it (XADD MAXLEN ~).
 func TestRenderFallbackMaxLen(t *testing.T) {
 	if got := DefaultStreamMaxLen(StreamRenderFallback); got != defaultMaxLenRenderFallback {
 		t.Errorf("DefaultStreamMaxLen(%s) = %d, хочу %d (политика T-025)", StreamRenderFallback, got, defaultMaxLenRenderFallback)
@@ -76,10 +80,10 @@ func TestRenderFallbackMaxLen(t *testing.T) {
 	}
 }
 
-// TestRenderFallbackTrim — освобождение подтверждённого префикса
-// фолбэк-стрима (по образцу TestTrimOncePendingKept): точка обрезки —
-// старейшая pending группы (зависший PEL не удаляется), дефолтные Streams
-// TrimOptions стрим покрывают (workingStreams).
+// TestRenderFallbackTrim — the release of the acknowledged prefix of the
+// fallback stream (modeled after TestTrimOncePendingKept): the trim
+// point — the group's oldest pending (a stuck PEL entry is not removed),
+// the default Streams of TrimOptions cover the stream (workingStreams).
 func TestRenderFallbackTrim(t *testing.T) {
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{
@@ -112,12 +116,12 @@ func TestRenderFallbackTrim(t *testing.T) {
 	}
 }
 
-// TestRenderFallbackClaim — возврат зависших фолбэк-записей (по образцу
-// TestReliabClaim/TestReliabClaimDead): счётчик попыток из PEL
-// возвращается в работу; исчерпавшая попытки запись уходит в q:dead —
-// Dead валиден с источником q:render-fallback и идентификаторами
-// предмета, выжатыми из тела Result (deadSubjectOf), исходная запись
-// подтверждается.
+// TestRenderFallbackClaim — the return of stuck fallback entries
+// (modeled after TestReliabClaim/TestReliabClaimDead): the attempt
+// counter from the PEL goes back into the work; an entry that exhausted
+// its attempts moves to q:dead — the Dead is valid with the source
+// q:render-fallback and the subject identifiers extracted from the
+// Result body (deadSubjectOf), the original entry is acknowledged.
 func TestRenderFallbackClaim(t *testing.T) {
 	fresh := `{"task_id":"t1"}`
 	subject := `{"task_id":"t2","zone_id":3,"domain_id":42,"subdomain_id":1,"variant":1,"name":"www.example.com"}`
@@ -128,8 +132,8 @@ func TestRenderFallbackClaim(t *testing.T) {
 		},
 		claimNext: "303-0",
 		pendRes: map[string][]redis.XPendingExt{
-			"301-0": {{ID: "301-0", RetryCount: 2}}, // попытки остаются — в работу
-			"302-0": {{ID: "302-0", RetryCount: 4}}, // лимит 3 исчерпан — q:dead
+			"301-0": {{ID: "301-0", RetryCount: 2}}, // attempts remain — back into the work
+			"302-0": {{ID: "302-0", RetryCount: 4}}, // the limit of 3 is exhausted — q:dead
 		},
 	}
 	r := newTestReliab(fake, ReliabOptions{})
@@ -149,7 +153,8 @@ func TestRenderFallbackClaim(t *testing.T) {
 		t.Errorf("Claim:\n получил  %+v\n хочу     %+v", got, want)
 	}
 
-	// Исчерпавшая — q:dead: источник фолбэк-стрима, предмет из тела Result.
+	// The exhausted one — q:dead: the fallback stream as the source, the
+	// subject from the Result body.
 	if len(fake.adds) != 1 || fake.adds[0].Stream != StreamDead {
 		t.Fatalf("публикаций в q:dead: %+v, хочу одну", fake.adds)
 	}
@@ -174,7 +179,8 @@ func TestRenderFallbackClaim(t *testing.T) {
 		t.Errorf("Dead:\n получил  %+v\n хочу     %+v", dead, wantDead)
 	}
 
-	// Исходная запись покидает pending: XACK из фолбэк-стрима.
+	// The original entry leaves the pending: XACK from the fallback
+	// stream.
 	if want := []ackCall{{StreamRenderFallback, "render-fallback-worker", []string{"302-0"}}}; !reflect.DeepEqual(fake.acks, want) {
 		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
 	}

@@ -1,9 +1,10 @@
-// Тесты цикла возврата зависших доставок (RecoverLoop, T-025) без живого
-// Redis: фейк reliab_test.go (одноразовый клейм — как живой PEL, idle
-// сбрасывается). Проверяются клейм → обработка → XACK, ядовитая обработка
-// без подтверждения, дренаж полной пачки без ожидания тика, перевод
-// исчерпавших попытки в q:dead (обработчик не зовётся), темп обхода
-// batch/interval (T-153), дефолты опций, чистый выход по отмене ctx.
+// Tests of the stuck delivery return loop (RecoverLoop, T-025) without a
+// live Redis: the reliab_test.go fake (a one-shot claim — like a live
+// PEL, the idle is reset). Covered: claim → processing → XACK, poisonous
+// processing without acknowledgement, the drain of a full batch without
+// waiting for a tick, moving the attempts-exhausted entries to q:dead
+// (the handler is not called), the batch/interval walk pace (T-153), the
+// option defaults, a clean exit on ctx cancel.
 
 package queue
 
@@ -21,8 +22,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// runRecoverLoop — RecoverLoop в горутине; возвращает канал обработанных
-// доставок, канал результата и функцию остановки.
+// runRecoverLoop — RecoverLoop in a goroutine; returns the channel of
+// processed deliveries, the result channel and the stop function.
 func runRecoverLoop(t *testing.T, fake *fakeClaimRedis, opt RecoverOptions, process func(context.Context, Delivery) error) (processed chan Delivery, done chan error, stop func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -46,8 +47,8 @@ func runRecoverLoop(t *testing.T, fake *fakeClaimRedis, opt RecoverOptions, proc
 	}
 }
 
-// sameAcks — сравнение протокола XACK (срез в структуре не сравним
-// напрямую).
+// sameAcks — a comparison of the XACK protocol (a slice inside a struct
+// is not directly comparable).
 func sameAcks(got, want []ackCall) bool {
 	if len(got) != len(want) {
 		return false
@@ -68,7 +69,7 @@ func sameAcks(got, want []ackCall) bool {
 	return true
 }
 
-// waitProcessed — первая обработанная доставка или таймаут.
+// waitProcessed — the first processed delivery or a timeout.
 func waitProcessed(t *testing.T, processed chan Delivery) Delivery {
 	t.Helper()
 	select {
@@ -98,9 +99,10 @@ func TestRecoverLoopClaimProcess(t *testing.T) {
 	if d.ID != "1718-0" || d.Stream != StreamHTTP {
 		t.Errorf("обработана чужая доставка: %+v", d)
 	}
-	stop() // ожидание выхода — внутри runRecoverLoop
+	stop() // waiting for the exit — inside runRecoverLoop
 
-	// Клейм от имени потребителя цикла, XACK — после обработки.
+	// The claim on behalf of the loop's consumer, the XACK — after
+	// processing.
 	if len(fake.claims) != 1 {
 		t.Fatalf("вызовов XAUTOCLAIM: %d, хочу 1", len(fake.claims))
 	}
@@ -108,21 +110,23 @@ func TestRecoverLoopClaimProcess(t *testing.T) {
 	if c.Stream != StreamHTTP || c.Group != "http" || c.Consumer != "recover-1" || c.Count != 4 {
 		t.Errorf("XAUTOCLAIM: стрим/группа/потребитель/пачка: %+v", c)
 	}
-	// minIdle 0 из цикла — опция слоя надёжности (MinIdle воркера).
+	// A minIdle of 0 from the loop — the reliability layer's option (the
+	// worker's MinIdle).
 	if c.MinIdle != time.Minute {
 		t.Errorf("XAUTOCLAIM MinIdle: %s, хочу 1m (из ReliabOptions теста)", c.MinIdle)
 	}
 	if want := []ackCall{{StreamHTTP, "http", []string{"1718-0"}}}; !sameAcks(fake.acks, want) {
 		t.Errorf("XACK после обработки: %+v, хочу %+v", fake.acks, want)
 	}
-	// Рабочая запись не уходит в q:dead.
+	// A working entry does not go to q:dead.
 	if len(fake.adds) != 0 {
 		t.Errorf("публикаций в q:dead быть не должно: %+v", fake.adds)
 	}
 }
 
-// TestRecoverLoopProcessError — ошибка обработки: без XACK (запись
-// вернётся следующим клеймом), цикл жив, чистый выход по отмене.
+// TestRecoverLoopProcessError — a processing error: without an XACK (the
+// entry will come back with the next claim), the loop is alive, a clean
+// exit on cancel.
 func TestRecoverLoopProcessError(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -137,7 +141,7 @@ func TestRecoverLoopProcessError(t *testing.T) {
 		Stream: StreamHTTP, Group: "http", Consumer: "recover-1",
 		Batch: 4, Interval: time.Hour,
 	}, func(context.Context, Delivery) error { return errors.New("db: write result: timeout") })
-	// Дать циклу обработать запись (клейм + Processing).
+	// Let the loop process the entry (the claim + Processing).
 	time.Sleep(50 * time.Millisecond)
 	stop()
 
@@ -149,16 +153,17 @@ func TestRecoverLoopProcessError(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopDrainsFullBatch — полная пачка клейма дренируется без
-// ожидания тика: при Batch 1 и Interval час обе записи обрабатываются
-// подряд (вторая — без тика), пустой клейм — затем ожидание.
+// TestRecoverLoopDrainsFullBatch — a full claim batch is drained without
+// waiting for a tick: at Batch 1 and an Interval of an hour both entries
+// are processed back to back (the second — without a tick), an empty
+// claim — then the wait.
 func TestRecoverLoopDrainsFullBatch(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
 			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
 			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
 		},
-		claimNext: "1720-0", // курсор следующего сканирования из ответа
+		claimNext: "1720-0", // the next-scan cursor from the answer
 		pendRes: map[string][]redis.XPendingExt{
 			"1718-0": {{ID: "1718-0", RetryCount: 1}},
 			"1719-0": {{ID: "1719-0", RetryCount: 1}},
@@ -170,12 +175,13 @@ func TestRecoverLoopDrainsFullBatch(t *testing.T) {
 		Batch: 1, Interval: time.Hour,
 	}, nil)
 	first := waitProcessed(t, processed)
-	second := waitProcessed(t, processed) // тик — час: вторая только дренажом
+	second := waitProcessed(t, processed) // the tick — an hour: the second only via the drain
 	stop()
 	if first.ID != "1718-0" || second.ID != "1719-0" {
 		t.Errorf("дренаж: %+v затем %+v, хочу 1718-0 и 1719-0", first, second)
 	}
-	// Второй клейм продолжает с курсора первого, а не с начала PEL.
+	// The second claim continues from the first one's cursor, not from
+	// the beginning of the PEL.
 	if len(fake.claims) < 2 {
 		t.Fatalf("клеймов %d, хочу ≥ 2", len(fake.claims))
 	}
@@ -190,15 +196,16 @@ func TestRecoverLoopDrainsFullBatch(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopDead — запись, исчерпавшая попытки, в обработку не
-// попадает: Claim переводит её в q:dead и подтверждает в исходном стриме.
+// TestRecoverLoopDead — an entry that exhausted its attempts does not
+// get into processing: Claim moves it to q:dead and acknowledges it in
+// the source stream.
 func TestRecoverLoopDead(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
 			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
 		},
 		pendRes: map[string][]redis.XPendingExt{
-			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // лимит 3 исчерпан
+			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // the limit of 3 is exhausted
 		},
 	}
 
@@ -206,7 +213,7 @@ func TestRecoverLoopDead(t *testing.T) {
 		Stream: StreamRender, Group: "render", Consumer: "recover-1",
 		Batch: 4, Interval: time.Hour,
 	}, nil)
-	// Дать циклу клейм (перевод в q:dead происходит в Claim).
+	// Let the loop claim (the move to q:dead happens in Claim).
 	time.Sleep(50 * time.Millisecond)
 	stop()
 
@@ -223,7 +230,8 @@ func TestRecoverLoopDead(t *testing.T) {
 	}
 }
 
-// recoverLogOpts — опции цикла с логгером в буфер (проверка записей).
+// recoverLogOpts — the loop options with a logger into a buffer (record
+// checks).
 func recoverLogOpts(buf *bytes.Buffer, interval time.Duration) RecoverOptions {
 	return RecoverOptions{
 		Stream: StreamHTTP, Group: "http", Consumer: "recover-1",
@@ -232,8 +240,9 @@ func recoverLogOpts(buf *bytes.Buffer, interval time.Duration) RecoverOptions {
 	}
 }
 
-// TestRecoverLoopLogs — успешный проход: стартовая запись Info есть,
-// предупреждений нет (ошибок не было — Warn с err=nil не пишется).
+// TestRecoverLoopLogs — a successful pass: the startup Info record is
+// there, no warnings (there were no errors — a Warn with err=nil is not
+// written).
 func TestRecoverLoopLogs(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -260,25 +269,26 @@ func TestRecoverLoopLogs(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopLogsErrors — ошибки клейма и обработки логируются
-// Warn (очередной тик повторит), цикл не падает.
+// TestRecoverLoopLogsErrors — claim and processing errors are logged as
+// Warn (the next tick will retry), the loop does not crash.
 func TestRecoverLoopLogsErrors(t *testing.T) {
-	// Ошибка клейма: тик 1 мс, даём циклу несколько проходов (сигнал из
-	// фейка потребовал бы его расширения; стиль — как в соседних
-	// TestRecoverLoopProcessError/TestRecoverLoopDead).
+	// A claim error: a tick of 1 ms, let the loop make several passes (a
+	// signal from the fake would require extending it; the style — as in
+	// the neighboring TestRecoverLoopProcessError/TestRecoverLoopDead).
 	fake := &fakeClaimRedis{claimErr: errors.New("ERR connection refused")}
 	var buf bytes.Buffer
 	_, _, stop := runRecoverLoop(t, fake, recoverLogOpts(&buf, time.Millisecond), nil)
-	time.Sleep(50 * time.Millisecond) // хотя бы один тик с ошибкой
+	time.Sleep(50 * time.Millisecond) // at least one tick with an error
 	stop()
 	if !strings.Contains(buf.String(), "возврат зависших доставок: клейм") {
 		t.Errorf("ошибка клейма не записана: %q", buf.String())
 	}
 
-	// Ошибка обработки: без XACK, с записью о возврате клеймом. Warn
-	// пишется только при живом ctx — «сигнал → отмена» пропускала бы
-	// его по условию ctx.Err() == nil; даём циклу отработать (первый
-	// клейм и Warn — в первые миллисекунды), стиль — как в соседних
+	// A processing error: without an XACK, with a record about the return
+	// by a claim. The Warn is written only with a live ctx — "signal →
+	// cancel" would skip it under the ctx.Err() == nil condition; let the
+	// loop run (the first claim and the Warn — in the first milliseconds),
+	// the style — as in the neighboring
 	// TestRecoverLoopProcessError/TestRecoverLoopDead.
 	fake = &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -301,9 +311,10 @@ func TestRecoverLoopLogsErrors(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopCanceledContext — отмена ctx до старта: клейм
-// с ошибкой при уже отменённом контексте не пишется предупреждением
-// (выполнено указание остановки, а не сбой), выход чистый.
+// TestRecoverLoopCanceledContext — a ctx cancel before the start: a
+// claim error under an already canceled context is not logged as a
+// warning (the shutdown instruction was carried out, not a failure), the
+// exit is clean.
 func TestRecoverLoopCanceledContext(t *testing.T) {
 	fake := &fakeClaimRedis{claimErr: errors.New("ERR connection refused")}
 	var buf bytes.Buffer
@@ -320,9 +331,10 @@ func TestRecoverLoopCanceledContext(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopCanceledMidBatch — отмена ctx посреди пачки: текущая
-// запись дорабатывает или возвращается клейму, остальные не начинаются;
-// ошибка обработки при отменённом ctx не пишется предупреждением.
+// TestRecoverLoopCanceledMidBatch — a ctx cancel in the middle of a
+// batch: the current entry finishes its work or returns to the claim,
+// the others do not start; a processing error under a canceled ctx is
+// not logged as a warning.
 func TestRecoverLoopCanceledMidBatch(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -337,8 +349,9 @@ func TestRecoverLoopCanceledMidBatch(t *testing.T) {
 	var mu sync.Mutex
 	handled := make([]string, 0, 2)
 	started := make(chan struct{}, 2)
-	// release не закрывается: обработка снимается только отменой ctx —
-	// детерминированно вторая запись не начинается до отмены.
+	// release is never closed: the processing is released only by a ctx
+	// cancel — deterministically the second entry does not start before
+	// the cancel.
 	release := make(chan struct{})
 	process := func(ctx context.Context, d Delivery) error {
 		mu.Lock()
@@ -354,8 +367,8 @@ func TestRecoverLoopCanceledMidBatch(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	_, _, stop := runRecoverLoop(t, fake, recoverLogOpts(&buf, time.Hour), process)
-	<-started // первая запись в работе
-	stop()    // отмена ctx: первая возвращается ошибкой, вторая не начинается
+	<-started // the first entry in the work
+	stop()    // a ctx cancel: the first returns with an error, the second does not start
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -367,16 +380,17 @@ func TestRecoverLoopCanceledMidBatch(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopCancelRefundsUnprocessed — отмена ctx посреди пачки
-// (T-222, критерий задачи): XAUTOCLAIM инкрементирует счётчик доставок
-// всей пачке в момент клейма, а не начала обработки; записи, до которых
-// обход не дошёл, получают попытку назад — XCLAIM JUSTID RETRYCOUNT
-// <attempts-1> (до T-222 хвост пачки терял по попытке на каждом
-// рестарте — бюджет graceful shutdown меньше времени обхода пачки —
-// и после max_attempts уходил в q:dead без единой обработки).
+// TestRecoverLoopCancelRefundsUnprocessed — a ctx cancel in the middle
+// of a batch (T-222, the task's criterion): XAUTOCLAIM increments the
+// delivery counter of the whole batch at the moment of the claim, not
+// the start of processing; the entries the walk did not reach get their
+// attempt back — XCLAIM JUSTID RETRYCOUNT <attempts-1> (before T-222 the
+// batch tail lost an attempt on every restart — the graceful shutdown
+// budget is less than the batch walk time — and after max_attempts went
+// to q:dead without a single processing).
 func TestRecoverLoopCancelRefundsUnprocessed(t *testing.T) {
-	// Пачка из 4 записей, счётчик каждой после клейма — 2 (доставка +
-	// клейм): до клейма было 1, возврат — RETRYCOUNT 1.
+	// A batch of 4 entries, each counter after the claim — 2 (a delivery
+	// + a claim): before the claim it was 1, the refund — RETRYCOUNT 1.
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
 			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
@@ -392,8 +406,9 @@ func TestRecoverLoopCancelRefundsUnprocessed(t *testing.T) {
 		},
 	}
 
-	// Обработчик дорабатывает две записи, вторая отменяет ctx («SIGTERM
-	// между записями пачки»): третья и четвёртая не начинаются.
+	// The handler reworks two entries, the second one cancels the ctx
+	// ("a SIGTERM between the batch entries"): the third and the fourth
+	// do not start.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var mu sync.Mutex
@@ -429,8 +444,9 @@ func TestRecoverLoopCancelRefundsUnprocessed(t *testing.T) {
 	if want := []string{"1-1", "1-2"}; !reflect.DeepEqual(handled, want) {
 		t.Fatalf("обработаны %v, хочу %v (после отмены пачка не продолжается)", handled, want)
 	}
-	// Критерий T-222: попытки необработанных (4 − 2) записей не растут —
-	// одна команда возврата хвоста пачки со счётчиком до клейма.
+	// The T-222 criterion: the attempts of the unprocessed (4 − 2)
+	// entries do not grow — one refund command for the batch tail with
+	// the pre-claim counter.
 	if len(fake.dos) != 1 {
 		t.Fatalf("команд возврата: %d, хочу 1 (хвост 1-3, 1-4 одной группой)", len(fake.dos))
 	}
@@ -438,10 +454,11 @@ func TestRecoverLoopCancelRefundsUnprocessed(t *testing.T) {
 	if got := fake.dos[0]; !reflect.DeepEqual(got, want) {
 		t.Errorf("возврат:\n получил  %v\n хочу     %v", got, want)
 	}
-	// Доработанные до отмены записи: первая подтверждена до отмены.
-	// Подтверждение второй идёт по уже отменённому ctx и не отправляется
-	// (живой клиент — как и фейк, P3-4 ревью): запись остаётся в PEL
-	// без подтверждения — повторная доставка идемпотентна (ТЗ 3.4).
+	// The entries reworked before the cancel: the first is acknowledged
+	// before the cancel. The acknowledgement of the second goes over the
+	// already canceled ctx and is not sent (the live client — like the
+	// fake, the P3-4 review): the entry stays in the PEL unacknowledged —
+	// the redelivery is idempotent (spec 3.4).
 	if !sameAcks(fake.acks, []ackCall{
 		{StreamHTTP, "http", []string{"1-1"}},
 	}) {
@@ -449,26 +466,26 @@ func TestRecoverLoopCancelRefundsUnprocessed(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopRefundsUnclassified — сбой классификации одной записи
-// пачки (T-260, ФТ-6.2): клейм XAUTOCLAIM списал попытку, а чтение
-// счётчика XPENDING сбойнуло (transient). RecoverLoop возвращает попытку
-// немедленно тем же проходом (RefundUnclassified: повторное чтение
-// счётчика + XCLAIM JUSTID RETRYCOUNT до клейма), валидная часть пачки
-// обрабатывается как обычно. До T-260 попытка такой записи сгорала
-// бесследно — окно T-222 («отмена ctx») не покрывало незавершённую
-// классификацию.
+// TestRecoverLoopRefundsUnclassified — a classification failure of one
+// batch entry (T-260, FR-6.2): the XAUTOCLAIM claim spent the attempt,
+// while the XPENDING counter read failed (transient). RecoverLoop
+// refunds the attempt immediately in the same pass (RefundUnclassified:
+// a repeated counter read + XCLAIM JUSTID RETRYCOUNT to the pre-claim
+// value), the valid part of the batch is processed as usual. Before
+// T-260 the attempt of such an entry burned without a trace — the T-222
+// window ("ctx cancel") did not cover an unfinished classification.
 func TestRecoverLoopRefundsUnclassified(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
-			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}, // классификация сбойна (однократно)
+			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}, // the classification fails (once)
 			{ID: "1-2", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
 		},
 		pendRes: map[string][]redis.XPendingExt{
-			"1-1": {{ID: "1-1", RetryCount: 2}}, // счётчик после клейма
+			"1-1": {{ID: "1-1", RetryCount: 2}}, // the counter after the claim
 			"1-2": {{ID: "1-2", RetryCount: 2}},
 		},
 		pendFailOnce: map[string]error{
-			"1-1": errors.New("ERR connection refused"), // только классификация
+			"1-1": errors.New("ERR connection refused"), // only the classification
 		},
 	}
 
@@ -476,14 +493,14 @@ func TestRecoverLoopRefundsUnclassified(t *testing.T) {
 		Stream: StreamHTTP, Group: "http", Consumer: "recover-1",
 		Batch: 4, Interval: time.Hour,
 	}, nil)
-	d := waitProcessed(t, processed) // валидная часть пачки — в работу
+	d := waitProcessed(t, processed) // the valid part of the batch — into the work
 	if d.ID != "1-2" {
 		t.Errorf("обработана доставка %s, хочу 1-2 (валидная часть пачки)", d.ID)
 	}
 	stop()
 
-	// Попытка 1-1 возвращена: счётчик после клейма 2, откат к 1 —
-	// одной командой на ту же группу/потребителя.
+	// The attempt of 1-1 is refunded: the counter after the claim is 2,
+	// the rollback to 1 — one command for the same group/consumer.
 	if len(fake.dos) != 1 {
 		t.Fatalf("команд возврата: %d, хочу 1 (запись без классификации)", len(fake.dos))
 	}
@@ -491,7 +508,8 @@ func TestRecoverLoopRefundsUnclassified(t *testing.T) {
 	if got := fake.dos[0]; !reflect.DeepEqual(got, want) {
 		t.Errorf("возврат:\n получил  %v\n хочу     %v", got, want)
 	}
-	// Счётчик 1-1 читался дважды: классификация (сбой) и возврат (успех).
+	// The counter of 1-1 was read twice: the classification (a failure)
+	// and the refund (a success).
 	reads := 0
 	for _, p := range fake.pends {
 		if p.Start == "1-1" {
@@ -501,8 +519,8 @@ func TestRecoverLoopRefundsUnclassified(t *testing.T) {
 	if reads != 2 {
 		t.Errorf("чтений счётчика 1-1: %d, хочу 2 (классификация + возврат)", reads)
 	}
-	// Валидная запись обработана и подтверждена; запись без классификации
-	// попыткой — ничего не уходит в q:dead.
+	// The valid entry is processed and acknowledged; the unclassified
+	// entry gets its attempt back — nothing goes to q:dead.
 	if want := []ackCall{{StreamHTTP, "http", []string{"1-2"}}}; !sameAcks(fake.acks, want) {
 		t.Errorf("XACK валидной записи: %+v, хочу %+v", fake.acks, want)
 	}
@@ -511,12 +529,14 @@ func TestRecoverLoopRefundsUnclassified(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopUnclassifiedOutOfInvariantSkipsRefund — классификация
-// дольше claim_min_idle (инвариант T-153 нарушен): запись без счётчика
-// могла быть переклеймлена соседним воркером за время классификации,
-// и возврат погасил бы чужой инкремент — возврат пропускается, Warn
-// (зеркало TestRecoverLoopCancelOutOfInvariantSkipsRefund для ветки
-// ФТ-6.2). MinIdle наносекунда делает «обгон» детерминированным.
+// TestRecoverLoopUnclassifiedOutOfInvariantSkipsRefund — the
+// classification takes longer than claim_min_idle (the T-153 invariant
+// violated): an entry without a counter could have been re-claimed by a
+// neighboring worker during the classification, and the refund would
+// undo a foreign increment — the refund is skipped, a Warn (the mirror
+// of TestRecoverLoopCancelOutOfInvariantSkipsRefund for the FR-6.2
+// branch). A MinIdle of a nanosecond makes the "overtake"
+// deterministic.
 func TestRecoverLoopUnclassifiedOutOfInvariantSkipsRefund(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -525,8 +545,8 @@ func TestRecoverLoopUnclassifiedOutOfInvariantSkipsRefund(t *testing.T) {
 		pendRes: map[string][]redis.XPendingExt{
 			"1-1": {{ID: "1-1", RetryCount: 2}},
 		},
-		// Классификация сбойна постоянно: возврат не должен случиться
-		// вовсе (охрана инварианта — до чтения счётчика возврата).
+		// The classification fails constantly: the refund must not happen
+		// at all (the invariant guard — before the refund counter read).
 		pendOneErr: map[string]error{"1-1": errors.New("ERR connection refused")},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -538,7 +558,7 @@ func TestRecoverLoopUnclassifiedOutOfInvariantSkipsRefund(t *testing.T) {
 		done <- RecoverLoop(ctx, r, func(context.Context, Delivery) error { return nil },
 			recoverLogOpts(&buf, time.Hour))
 	}()
-	time.Sleep(50 * time.Millisecond) // клейм и классификация прошли
+	time.Sleep(50 * time.Millisecond) // the claim and the classification are done
 	cancel()
 	select {
 	case err := <-done:
@@ -556,12 +576,13 @@ func TestRecoverLoopUnclassifiedOutOfInvariantSkipsRefund(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopCancelOutOfInvariantSkipsRefund — обход пачки дольше
-// claim_min_idle (инвариант T-153 нарушен — пачка тарпитов рендера):
-// хвост мог быть переклеймлен RecoverLoop соседнего воркера, и возврат
-// погасил бы чужой инкремент счётчика — возврат пропускается, Warn,
-// поведение до T-222 (P2-1 ревью). Минимальный MinIdle делает «обгон»
-// детерминированным: время обхода всегда больше него.
+// TestRecoverLoopCancelOutOfInvariantSkipsRefund — the batch walk takes
+// longer than claim_min_idle (the T-153 invariant violated — a batch of
+// render tarpits): the tail could have been re-claimed by a neighboring
+// worker's RecoverLoop, and the refund would undo a foreign counter
+// increment — the refund is skipped, a Warn, the behavior before T-222
+// (the P2-1 review). A minimal MinIdle makes the "overtake"
+// deterministic: the walk time is always above it.
 func TestRecoverLoopCancelOutOfInvariantSkipsRefund(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -577,12 +598,13 @@ func TestRecoverLoopCancelOutOfInvariantSkipsRefund(t *testing.T) {
 	defer cancel()
 	var buf bytes.Buffer
 	done := make(chan error, 1)
-	// MinIdle наносекунда: Claim вызван с minIdle 0 → эффективна опция,
-	// а time.Since(claimAt) к отмене всегда больше наносекунды.
+	// A MinIdle of a nanosecond: Claim is called with minIdle 0 → the
+	// option is in effect, and time.Since(claimAt) by the cancel is
+	// always above a nanosecond.
 	r := newTestReliab(fake, ReliabOptions{MinIdle: time.Nanosecond})
 	go func() {
 		done <- RecoverLoop(ctx, r, func(_ context.Context, d Delivery) error {
-			cancel() // отмена на первой записи: хвост — вся вторая запись
+			cancel() // the cancel on the first entry: the tail — the whole second entry
 			return nil
 		}, recoverLogOpts(&buf, time.Hour))
 	}()
@@ -602,10 +624,10 @@ func TestRecoverLoopCancelOutOfInvariantSkipsRefund(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopCancelRefundFails — сбой возврата попыток (Redis
-// недоступен на остановке) не роняет цикл: Warn с контекстом, выход
-// чистый; попытки хвоста остаются расходованы — best effort, не хуже
-// поведения до T-222.
+// TestRecoverLoopCancelRefundFails — a refund failure (Redis unavailable
+// at shutdown) does not crash the loop: a Warn with context, a clean
+// exit; the tail's attempts stay spent — best effort, no worse than the
+// behavior before T-222.
 func TestRecoverLoopCancelRefundFails(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -625,7 +647,7 @@ func TestRecoverLoopCancelRefundFails(t *testing.T) {
 	r := newTestReliab(fake, ReliabOptions{MinIdle: time.Minute})
 	go func() {
 		done <- RecoverLoop(ctx, r, func(_ context.Context, d Delivery) error {
-			cancel() // отмена на первой записи: хвост — вся вторая запись
+			cancel() // the cancel on the first entry: the tail — the whole second entry
 			return nil
 		}, recoverLogOpts(&buf, time.Hour))
 	}()
@@ -645,8 +667,8 @@ func TestRecoverLoopCancelRefundFails(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopValidation — nil слоя и обработчика: ошибка до старта
-// (сборка сервиса падает внятно, Redis не трогается).
+// TestRecoverLoopValidation — a nil layer and handler: an error before
+// the start (the service assembly fails clearly, Redis is not touched).
 func TestRecoverLoopValidation(t *testing.T) {
 	fake := &fakeClaimRedis{}
 	if err := RecoverLoop(context.Background(), nil, func(context.Context, Delivery) error { return nil }, RecoverOptions{
@@ -665,9 +687,9 @@ func TestRecoverLoopValidation(t *testing.T) {
 	}
 }
 
-// TestRecoverOptionsDefaults — нулевые опции: пачка и интервал дефолтные
-// (литеральные пины констант — сравнение с самой константой мутанта
-// не замечает), единичные значения не заменяются.
+// TestRecoverOptionsDefaults — zero options: the default batch and
+// interval (literal pins of the constants — comparing with the constant
+// itself, the mutant goes unnoticed), single values are not replaced.
 func TestRecoverOptionsDefaults(t *testing.T) {
 	o := RecoverOptions{}.withDefaults()
 	if DefaultRecoverBatch != 64 {
@@ -691,11 +713,12 @@ func TestRecoverOptionsDefaults(t *testing.T) {
 	}
 }
 
-// --- обработчик с номером попытки доставки (T-148) ---------------------------
+// --- a handler with the delivery attempt number (T-148) ----------------------
 
-// TestProcessingAttempt — паттерн Processing для обработчика с номером
-// попытки: число доставляется как есть, успешная обработка → XACK, ошибка
-// → без XACK (повторная доставка), nil-обработчик — ошибка.
+// TestProcessingAttempt — the Processing pattern for a handler with the
+// attempt number: the number is delivered as is, successful processing →
+// XACK, an error → without an XACK (redelivery), a nil handler — an
+// error.
 func TestProcessingAttempt(t *testing.T) {
 	fake := &fakeClaimRedis{}
 	r := newTestReliab(fake, ReliabOptions{})
@@ -717,7 +740,8 @@ func TestProcessingAttempt(t *testing.T) {
 		t.Errorf("XACK после успешной обработки: %+v, хочу %+v", fake.acks, want)
 	}
 
-	// Ошибка обработки — без XACK, номер попытки не теряется в сообщении.
+	// A processing error — without an XACK, the attempt number is not
+	// lost in the message.
 	fake2 := &fakeClaimRedis{}
 	r2 := newTestReliab(fake2, ReliabOptions{})
 	err = r2.ProcessAttempt(context.Background(), "render-worker", d, 2,
@@ -729,15 +753,15 @@ func TestProcessingAttempt(t *testing.T) {
 		t.Errorf("XACK при ошибке: %+v", fake2.acks)
 	}
 
-	// nil-обработчик — ошибка до Redis.
+	// A nil handler — an error before Redis.
 	if err := ProcessingAttempt(context.Background(), NewRedisQueue(&fakeClaimRedis{}, RedisOptions{}), "g", d, 1, nil); err == nil {
 		t.Error("nil обработчик: ожидалась ошибка")
 	}
 }
 
-// TestRecoverLoopAttempt — RecoverLoopAttempt передаёт обработчику
-// Claimed.Attempts (счётчик доставок PEL записи): обработчик видит,
-// какая это по счёту доставка, без собственного состояния.
+// TestRecoverLoopAttempt — RecoverLoopAttempt passes Claimed.Attempts
+// (the entry's PEL delivery counter) to the handler: the handler sees
+// which delivery this is by count, without its own state.
 func TestRecoverLoopAttempt(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -785,8 +809,9 @@ func TestRecoverLoopAttempt(t *testing.T) {
 	}
 }
 
-// TestRecoverLoopAttemptValidation — nil обработчика RecoverLoopAttempt
-// отклоняет до старта; RecoverLoop (адаптер) — по-прежнему тоже.
+// TestRecoverLoopAttemptValidation — a nil handler is rejected by
+// RecoverLoopAttempt before the start; RecoverLoop (the adapter) — still
+// too.
 func TestRecoverLoopAttemptValidation(t *testing.T) {
 	fake := &fakeClaimRedis{}
 	r := newTestReliab(fake, ReliabOptions{})
@@ -805,17 +830,17 @@ func TestRecoverLoopAttemptValidation(t *testing.T) {
 	}
 }
 
-// pacingClaimRedis — fakeClaimRedis с потокобезопасным наблюдением
-// клеймов: цикл клеймит в своей горутине, тест темпа читает счётчик
-// на лету (T-153), не останавливая цикл (стиль наблюдения — как канал
-// processed runRecoverLoop, а не после stop). Встроенный протокол
-// claims трогает только горутина цикла — тест читает лишь поля под
-// мьютексом.
+// pacingClaimRedis — a fakeClaimRedis with thread-safe observation of
+// the claims: the loop claims in its own goroutine, the pace test reads
+// the counter on the fly (T-153) without stopping the loop (the
+// observation style — like the processed channel of runRecoverLoop, not
+// after stop). The embedded claims protocol is touched only by the
+// loop's goroutine — the test reads only the fields under the mutex.
 type pacingClaimRedis struct {
 	fakeClaimRedis
 	mu     sync.Mutex
 	nclaim int
-	count  int64 // Count последнего XAUTOCLAIM (пачка из опций)
+	count  int64 // the Count of the last XAUTOCLAIM (the batch from the options)
 }
 
 func (f *pacingClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
@@ -832,18 +857,20 @@ func (f *pacingClaimRedis) claims() int {
 	return f.nclaim
 }
 
-// batch — фактическая пачка клейма (Count XAUTOCLAIM из опций).
+// batch — the actual claim batch (the XAUTOCLAIM Count from the
+// options).
 func (f *pacingClaimRedis) batch() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.count
 }
 
-// TestRecoverLoopIntervalPaces — темп обхода (T-153): неполная пачка —
-// следующий клейм не раньше Interval (тик), полная — дренируется без
-// паузы (TestRecoverLoopDrainsFullBatch). Цикл собирается вручную, а не
-// runRecoverLoop: хелпер типизирован под *fakeClaimRedis, а наблюдение
-// клеймов на лету требует переопределения XAutoClaim (pacing-фейк).
+// TestRecoverLoopIntervalPaces — the walk pace (T-153): an incomplete
+// batch — the next claim no earlier than the Interval (a tick), a full
+// one — drained without a pause (TestRecoverLoopDrainsFullBatch). The
+// loop is assembled manually, not by runRecoverLoop: the helper is
+// typed for *fakeClaimRedis, and observing the claims on the fly
+// requires overriding XAutoClaim (the pacing fake).
 func TestRecoverLoopIntervalPaces(t *testing.T) {
 	fake := &pacingClaimRedis{fakeClaimRedis: fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -876,8 +903,9 @@ func TestRecoverLoopIntervalPaces(t *testing.T) {
 	}
 	defer stop()
 
-	waitProcessed(t, processed) // первая пачка: 1 запись < Batch 2 → тик
-	// Пачка из опций применена к первому клейму (Count = Batch).
+	waitProcessed(t, processed) // the first batch: 1 entry < Batch 2 → a tick
+	// The batch from the options is applied to the first claim
+	// (Count = Batch).
 	if c := fake.batch(); c != 2 {
 		t.Errorf("XAUTOCLAIM Count = %d, хочу 2 (Batch из опций)", c)
 	}
@@ -885,7 +913,7 @@ func TestRecoverLoopIntervalPaces(t *testing.T) {
 	if n := fake.claims(); n != 1 {
 		t.Errorf("клеймов до тика: %d, хочу 1 (неполная пачка ждёт Interval, не клейм сразу)", n)
 	}
-	time.Sleep(400 * time.Millisecond) // > 2 тиков по 120 мс
+	time.Sleep(400 * time.Millisecond) // > 2 ticks of 120 ms each
 	if n := fake.claims(); n < 2 {
 		t.Errorf("клеймов после тиков: %d, хочу ≥ 2 (тик задаёт темп, обход не прекращается)", n)
 	}

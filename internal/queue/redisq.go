@@ -1,7 +1,8 @@
-// Реализация Queue на Redis Streams (ТЗ 4.2): публикация XADD, чтение
-// пачками XREADGROUP ">" через consumer group, подтверждение XACK.
-// Команды go-redis не выходят за пределы узкого интерфейса redisStreams —
-// очередь можно подменить фейком в юнит-тестах (без живого Redis).
+// The Queue implementation on Redis Streams (spec 4.2): publishing via
+// XADD, batch reads via XREADGROUP ">" through a consumer group,
+// acknowledgement via XACK. The go-redis commands stay within the narrow
+// redisStreams interface — the queue can be replaced with a fake in unit
+// tests (without a live Redis).
 
 package queue
 
@@ -17,31 +18,33 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// fieldData — единственное поле записи стрима: JSON-сообщение (message.go).
+// fieldData — the only field of a stream entry: a JSON message
+// (message.go).
 const fieldData = "data"
 
-// DefaultRedisBlock — интервал ожидания новых записей в одном вызове
-// Consume по умолчанию. Небольшой, а не бесконечный: цикл воркера
-// регулярно просыпается (контекст отменяется между итерациями), а доля
-// «пустых» пробуждений мала относительно времени обработки пачки.
+// DefaultRedisBlock — the default wait interval for new entries in one
+// Consume call. Small rather than infinite: the worker loop wakes up
+// regularly (the context is canceled between iterations), and the share
+// of "empty" wake-ups is small relative to the batch processing time.
 const DefaultRedisBlock = 2 * time.Second
 
-// DefaultPublishRetries — дополнительные попытки XADD при инфраструктурном
-// сбое Redis (T-152): результат уже вычислен, короткая серия повторов
-// закрывает секундные флапы соединения и пограничные OOM-моменты, не
-// отдавая доставку в круг клейм (каждый клейм — +1 попытки к q:dead).
+// DefaultPublishRetries — extra XADD attempts on a Redis infrastructure
+// failure (T-152): the result is already computed, a short retry series
+// covers second-long connection flaps and borderline OOM moments without
+// handing the delivery into the claim circle (every claim is +1 attempt
+// toward q:dead).
 const DefaultPublishRetries = 2
 
-// DefaultPublishRetryPause — пауза перед первой повторной попыткой XADD
-// (удвоение на каждую следующую, сдвиг ограничен — переполнение Duration):
-// 250 мс + 500 мс ≈ 0,75 с худший случай поверх публикации — ничто против
-// времени обработки задачи любого этапа (секунды).
+// DefaultPublishRetryPause — the pause before the first XADD retry
+// (doubling on each next one, the shift is capped — Duration overflow):
+// 250 ms + 500 ms ≈ 0.75 s worst case on top of publishing — nothing
+// against the processing time of a task of any stage (seconds).
 const DefaultPublishRetryPause = 250 * time.Millisecond
 
-// redisStreams — окно в go-redis: только команды стримов, нужные
-// очереди. *redis.Client (queue.NewClient) и *redis.ClusterClient
-// удовлетворяют интерфейсу; тесты подменяют фейком — cmd-результаты
-// go-redis строятся фабриками New*Result без соединения.
+// redisStreams — a window into go-redis: only the stream commands the
+// queue needs. *redis.Client (queue.NewClient) and *redis.ClusterClient
+// satisfy the interface; tests substitute a fake — the go-redis cmd
+// results are built by the New*Result factories without a connection.
 type redisStreams interface {
 	XAdd(ctx context.Context, a *redis.XAddArgs) *redis.StringCmd
 	XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd
@@ -49,46 +52,49 @@ type redisStreams interface {
 	XAck(ctx context.Context, stream, group string, ids ...string) *redis.IntCmd
 }
 
-// RedisOptions — параметры Redis-реализации очереди.
+// RedisOptions — the parameters of the queue's Redis implementation.
 type RedisOptions struct {
-	// Block — время ожидания новых записей в одном вызове Consume
+	// Block — the wait time for new entries in one Consume call
 	// (XREADGROUP BLOCK); 0 — DefaultRedisBlock.
 	Block time.Duration
-	// MaxLen — явный предел длины всех стримов при публикации
-	// (XADD MAXLEN ~); 0 — пределы политики надёжности по стримам
-	// (DefaultStreamMaxLen, T-025: ТЗ 4.2 требует MAXLEN на каждом
-	// стриме, поэтому режим «не обрезать» не предусмотрен — источник
-	// истины PostgreSQL, усечение восстановимо по lease, ТЗ 3.4).
+	// MaxLen — an explicit length limit for all streams at publishing
+	// (XADD MAXLEN ~); 0 — the per-stream limits of the reliability
+	// policy (DefaultStreamMaxLen, T-025: spec 4.2 requires MAXLEN on
+	// every stream, so a "do not trim" mode is not provided — the source
+	// of truth is PostgreSQL, truncation is recoverable via lease,
+	// spec 3.4).
 	MaxLen int64
-	// PublishRetries — дополнительные попытки XADD при инфраструктурном
-	// сбое Redis (T-152, InfraError); 0 и меньше — DefaultPublishRetries.
-	// Ошибки значений/сериализации не повторяются: повтор дал бы тот же
-	// ответ.
+	// PublishRetries — extra XADD attempts on a Redis infrastructure
+	// failure (T-152, InfraError); 0 and below — DefaultPublishRetries.
+	// Value/serialization errors are not retried: a retry would produce
+	// the same answer.
 	PublishRetries int
-	// PublishRetryPause — пауза перед первой повторной попыткой XADD
-	// (удвоение на каждую следующую); 0 и меньше —
+	// PublishRetryPause — the pause before the first XADD retry
+	// (doubling on each next one); 0 and below —
 	// DefaultPublishRetryPause.
 	PublishRetryPause time.Duration
 }
 
-// RedisQueue — реализация Queue на Redis Streams. Группа потребителей
-// создаётся лениво при первом чтении стрима: XGROUP CREATE c MKSTREAM
-// (стрим создаётся пустым) и стартовым идентификатором "0" — первые
-// потребители получают и записи, опубликованные до их запуска; ответ
-// BUSYGROUP (группу уже создал другой воркер) — не ошибка. При потере
-// группы (NOGROUP: удалили группу/стрим, рестарт Redis без персистентности)
-// группа пересоздаётся с последнего прочитанного этим экземпляром id —
-// не с "0": переигрывать до миллиона уже обработанных записей стрима
-// (MAXLEN штучных стримов) не нужно, дубли с другими экземплярами
-// ограничены их окном чтения и гасятся идемпотентностью (ТЗ 3.4).
+// RedisQueue — the Queue implementation on Redis Streams. The consumer
+// group is created lazily on the first read of a stream: XGROUP CREATE
+// with MKSTREAM (the stream is created empty) and the start identifier
+// "0" — the first consumers also receive the entries published before
+// they started; a BUSYGROUP answer (another worker already created the
+// group) is not an error. When the group is lost (NOGROUP: the group or
+// stream was deleted, a Redis restart without persistence) the group is
+// recreated from the last id read by this instance — not from "0":
+// replaying up to a million already processed entries of the stream
+// (the MAXLEN of unit streams) is not needed, duplicates with other
+// instances are bounded by their read window and absorbed by
+// idempotency (spec 3.4).
 type RedisQueue struct {
 	rdb    redisStreams
 	opt    RedisOptions
-	groups sync.Map // "stream|group" → последний прочитанный id ("0" — с начала; группа создана)
+	groups sync.Map // "stream|group" → the last read id ("0" — from the start; the group is created)
 }
 
-// NewRedisQueue строит очередь поверх клиента go-redis (NewClient или
-// готовый *redis.Client / *redis.ClusterClient).
+// NewRedisQueue builds the queue on top of a go-redis client (NewClient
+// or a ready-made *redis.Client / *redis.ClusterClient).
 func NewRedisQueue(rdb redisStreams, opt RedisOptions) *RedisQueue {
 	if opt.Block <= 0 {
 		opt.Block = DefaultRedisBlock
@@ -102,14 +108,15 @@ func NewRedisQueue(rdb redisStreams, opt RedisOptions) *RedisQueue {
 	return &RedisQueue{rdb: rdb, opt: opt}
 }
 
-// Publish сериализует сообщение (поле data) и добавляет запись в стрим
-// командой XADD, возвращая её идентификатор. Каждый XADD усекает стрим
-// приблизительным пределом MAXLEN ~ (ТЗ 4.2): явным из RedisOptions.MaxLen
-// или пределом стрима по политике T-025 (DefaultStreamMaxLen). Стрим обязан
-// соответствовать типу сообщения, значения проходят проверку до записи
-// (ошибка — сообщение не публикуется). Инфраструктурный сбой XADD
-// (OOM/соединение, T-152) повторяется PublishRetries раз с удвоением
-// паузы; устойчивая недоступность — InfraError.
+// Publish serializes the message (the data field) and appends an entry
+// to the stream with XADD, returning its identifier. Every XADD trims
+// the stream with the approximate MAXLEN ~ limit (spec 4.2): the
+// explicit one from RedisOptions.MaxLen or the stream limit of the
+// T-025 policy (DefaultStreamMaxLen). The stream must match the message
+// type, the values are validated before writing (an error — the message
+// is not published). An infrastructure failure of XADD (OOM/connection,
+// T-152) is retried PublishRetries times with a doubling pause;
+// sustained unavailability — InfraError.
 func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (string, error) {
 	if !knownStream(stream) {
 		return "", fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
@@ -130,18 +137,19 @@ func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (s
 	}
 	maxLen := q.opt.MaxLen
 	if maxLen == 0 {
-		maxLen = DefaultStreamMaxLen(stream) // политика T-025 (ТЗ 4.2)
+		maxLen = DefaultStreamMaxLen(stream) // the T-025 policy (spec 4.2)
 	}
 	args.MaxLen = maxLen
-	args.Approx = true // MAXLEN ~: обрезка без точного подсчёта (T-025)
+	args.Approx = true // MAXLEN ~: trimming without an exact count (T-025)
 	id, err := q.rdb.XAdd(ctx, args).Result()
 	if err != nil && infraCause(err) {
-		// Инфраструктурный сбой (T-152): результат уже вычислен —
-		// короткая серия повторов XADD с удвоением паузы закрывает
-		// флапы соединения и пограничные OOM-моменты, не отдавая
-		// доставку в круг клейм (каждый клейм — +1 попытки к q:dead,
-		// инцидент 22.10). Не-инфраструктурные ошибки не повторяются:
-		// повтор дал бы тот же ответ.
+		// An infrastructure failure (T-152): the result is already
+		// computed — a short series of XADD retries with a doubling pause
+		// covers connection flaps and borderline OOM moments without
+		// handing the delivery into the claim circle (every claim is +1
+		// attempt toward q:dead, the October 22 incident).
+		// Non-infrastructure errors are not retried: a retry would produce
+		// the same answer.
 		for attempt := 1; err != nil && attempt <= q.opt.PublishRetries && ctx.Err() == nil; attempt++ {
 			pause := q.opt.PublishRetryPause << min(attempt-1, 5)
 			select {
@@ -159,9 +167,9 @@ func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (s
 	}
 	if err != nil {
 		if infraCause(err) {
-			// Устойчивая недоступность записи: маркер InfraError —
-			// воркеры по нему останавливают чтение, RecoverLoop не
-			// клеймит (T-152); XACK нет — публикация не состоялась.
+			// Sustained write unavailability: the InfraError marker —
+			// workers stop reading on it, RecoverLoop does not claim
+			// (T-152); no XACK — the publication did not happen.
 			return "", &InfraError{Op: "publish в " + stream, Err: err}
 		}
 		return "", fmt.Errorf("queue: publish в %s: %w", stream, err)
@@ -169,9 +177,9 @@ func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (s
 	return id, nil
 }
 
-// Consume читает до n записей стрима, ещё не прочитанных группой
-// (XREADGROUP … ">"), от имени потребителя consumer. Новых записей нет —
-// пустой результат без ошибки (истёк Block).
+// Consume reads up to n entries of the stream not yet read by the group
+// (XREADGROUP … ">") on behalf of the consumer consumer. No new entries
+// — an empty result without an error (the Block expired).
 func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string, n int) ([]Delivery, error) {
 	if !knownStream(stream) {
 		return nil, fmt.Errorf("queue: неизвестный стрим %q", stream)
@@ -197,17 +205,18 @@ func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string
 	}
 	res, err := q.rdb.XReadGroup(ctx, read).Result()
 	if isNoGroup(err) {
-		// Потеря Redis при живых воркерах (ТЗ 3.4): группа исчезла вместе
-		// со стримом, а кэш созданных групп устарел. Пересоздаём группу —
-		// с последнего прочитанного этим экземпляром id (не с "0":
-		// история до него уже обработана, переигрывать её лавиной
-		// дублирующей работы не нужно, недостающее переиздаст планировщик
-		// по lease) — и читаем повторно: потребитель продолжает работу
-		// без рестарта процесса.
+		// Losing Redis with live workers (spec 3.4): the group disappeared
+		// together with the stream, and the cache of created groups is
+		// stale. We recreate the group — from the last id read by this
+		// instance (not from "0": the history before it is already
+		// processed, replaying it as an avalanche of duplicate work is not
+		// needed, the missing part will be re-published by the scheduler
+		// via lease) — and read again: the consumer keeps working without
+		// a process restart.
 		last, _ := q.groups.Load(groupKey(stream, group))
 		start, _ := last.(string)
 		if start == "" {
-			start = "0" // ни одного чтения — как первое создание
+			start = "0" // not a single read — as the first creation
 		}
 		q.groups.Delete(groupKey(stream, group))
 		if err := q.ensureGroup(ctx, stream, group, start); err != nil {
@@ -215,7 +224,7 @@ func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string
 		}
 		res, err = q.rdb.XReadGroup(ctx, read).Result()
 	}
-	if isNil(err) { // истёк интервал ожидания — новых записей нет
+	if isNil(err) { // the wait interval expired — no new entries
 		return nil, nil
 	}
 	if err != nil {
@@ -235,19 +244,19 @@ func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string
 	return out, nil
 }
 
-// Ack подтверждает обработку записей (XACK). Подтверждать следует только
-// после записи результата в БД (ТЗ 4.2): неподтверждённая запись будет
-// доставлена повторно (возврат зависших — XAUTOCLAIM, T-025).
+// Ack acknowledges entry processing (XACK). Acknowledge only after the
+// result is written to the DB (spec 4.2): an unacknowledged entry will
+// be redelivered (the return of stuck entries — XAUTOCLAIM, T-025).
 func (q *RedisQueue) Ack(ctx context.Context, stream, group string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	if err := q.rdb.XAck(ctx, stream, group, ids...).Err(); err != nil {
 		if infraCause(err) {
-			// Инфраструктурный сбой (T-152): результат уже записан,
-			// запись осталась в pending и вернётся повторной доставкой
-			// (идемпотентность, ТЗ 3.4); маркер даёт воркеру понять,
-			// что это не ошибка обработки.
+			// An infrastructure failure (T-152): the result is already
+			// written, the entry stayed in pending and will come back via
+			// redelivery (idempotency, spec 3.4); the marker tells the
+			// worker this is not a processing error.
 			return &InfraError{Op: fmt.Sprintf("ack %s (группа %s)", stream, group), Err: err}
 		}
 		return fmt.Errorf("queue: ack %s (группа %s): %w", stream, group, err)
@@ -255,13 +264,14 @@ func (q *RedisQueue) Ack(ctx context.Context, stream, group string, ids ...strin
 	return nil
 }
 
-// ensureGroup создаёт группу потребителей при первом обращении
-// (XGROUP CREATE … MKSTREAM): start — идентификатор, с которого группа
-// доставляет записи ("0" — с начала: первое создание получает и записи,
-// опубликованные до запуска потребителей; последний прочитанный id —
-// восстановление после NOGROUP, см. Consume). Повторные создания группы
-// (BUSYGROUP от другого воркера) — не ошибка. Созданные группы
-// запоминаются, чтобы не тратить круг обращения на каждый Consume.
+// ensureGroup creates the consumer group on first use
+// (XGROUP CREATE … MKSTREAM): start — the identifier from which the
+// group delivers entries ("0" — from the beginning: the first creation
+// also receives the entries published before the consumers started; the
+// last read id — recovery after NOGROUP, see Consume). Repeated group
+// creations (BUSYGROUP from another worker) are not an error. Created
+// groups are remembered so as not to spend a round of requests on every
+// Consume.
 func (q *RedisQueue) ensureGroup(ctx context.Context, stream, group, start string) error {
 	key := groupKey(stream, group)
 	if _, ok := q.groups.Load(key); ok {
@@ -275,11 +285,11 @@ func (q *RedisQueue) ensureGroup(ctx context.Context, stream, group, start strin
 	return nil
 }
 
-// trackProgress запоминает последний прочитанный id группы — стартовая
-// точка пересоздания группы после NOGROUP (см. Consume). Идентификаторы
-// записей растут (ms-seq), сравнение числовое: лексикографический
-// порядок "999-0" > "1000-0" ошибочен. Ошибки парсинга тихо пропускаются:
-// прогресс — оптимизация восстановления, а не инвариант.
+// trackProgress remembers the group's last read id — the starting point
+// for recreating the group after NOGROUP (see Consume). Entry ids grow
+// (ms-seq), the comparison is numeric: the lexicographic order
+// "999-0" > "1000-0" is wrong. Parse errors are silently skipped:
+// progress is a recovery optimization, not an invariant.
 func (q *RedisQueue) trackProgress(stream, group string, msgs []redis.XMessage) {
 	if len(msgs) == 0 {
 		return
@@ -288,7 +298,7 @@ func (q *RedisQueue) trackProgress(stream, group string, msgs []redis.XMessage) 
 	last, _ := q.groups.LoadOrStore(key, "0")
 	cur, _ := last.(string)
 	if cur == "" || cur == "0" {
-		cur = "0-0" // стартовые отметки — в форме ms-seq для сравнения
+		cur = "0-0" // start marks — in ms-seq form for comparison
 	}
 	for _, m := range msgs {
 		if streamIDGreater(m.ID, cur) {
@@ -300,8 +310,8 @@ func (q *RedisQueue) trackProgress(stream, group string, msgs []redis.XMessage) 
 	}
 }
 
-// streamIDGreater сравнивает идентификаторы записей стрима "ms-seq"
-// численно по частям.
+// streamIDGreater compares stream entry identifiers "ms-seq" numerically
+// by parts.
 func streamIDGreater(a, b string) bool {
 	ams, aseq, err := splitStreamID(a)
 	if err != nil {
@@ -312,15 +322,16 @@ func streamIDGreater(a, b string) bool {
 		return false
 	}
 	if ams != bms {
-		// Эквивалентный мутант (T-M04): `>` → `>=` неотличим — ветка
-		// достижима только при ams != bms, где сравнения совпадают.
+		// An equivalent mutant (T-M04): `>` → `>=` is indistinguishable —
+		// the branch is reachable only when ams != bms, where the
+		// comparisons agree.
 		// mutator-disable-next-line expression/comparison
 		return ams > bms
 	}
 	return aseq > bseq
 }
 
-// splitStreamID разбирает "ms-seq" в пару int64.
+// splitStreamID parses "ms-seq" into an int64 pair.
 func splitStreamID(id string) (ms, seq int64, err error) {
 	s1, s2, ok := strings.Cut(id, "-")
 	if !ok {
@@ -335,8 +346,8 @@ func splitStreamID(id string) (ms, seq int64, err error) {
 	return ms, seq, nil
 }
 
-// payloadBytes достаёт поле data из значений записи: go-redis возвращает
-// строки; []byte поддержан на случай прямой записи в стрим.
+// payloadBytes extracts the data field from the entry values: go-redis
+// returns strings; []byte is supported for direct writes to a stream.
 func payloadBytes(values map[string]any) []byte {
 	switch v := values[fieldData].(type) {
 	case string:
@@ -348,11 +359,12 @@ func payloadBytes(values map[string]any) []byte {
 	}
 }
 
-// groupKey — ключ кэша созданных групп.
+// groupKey — the key of the created-groups cache.
 func groupKey(stream, group string) string { return stream + "|" + group }
 
-// knownStream сообщает, что имя — один из рабочих стримов очереди
-// (ТЗ 4.2): список имён — allStreams (queue.go), единственный источник.
+// knownStream reports that the name is one of the queue's working
+// streams (spec 4.2): the list of names is allStreams (queue.go), the
+// single source.
 func knownStream(stream string) bool {
 	for _, s := range allStreams {
 		if s == stream {
@@ -362,16 +374,18 @@ func knownStream(stream string) bool {
 	return false
 }
 
-// isBusyGroup распознаёт ответ BUSYGROUP — группа уже существует.
+// isBusyGroup recognizes the BUSYGROUP answer — the group already
+// exists.
 func isBusyGroup(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "BUSYGROUP")
 }
 
-// isNoGroup распознаёт ответ NOGROUP — группа потребителей отсутствует:
-// стрим или группу удалили (потеря/очистка Redis при живых воркерах).
+// isNoGroup recognizes the NOGROUP answer — the consumer group is
+// missing: the stream or the group was deleted (Redis loss/cleanup with
+// live workers).
 func isNoGroup(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "NOGROUP")
 }
 
-// isNil — «ничего не прочитано» (в том числе таймаут BLOCK).
+// isNil — "nothing was read" (including a BLOCK timeout).
 func isNil(err error) bool { return errors.Is(err, redis.Nil) }

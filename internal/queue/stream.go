@@ -1,56 +1,58 @@
 package queue
 
-// Контракт очереди задач, не привязанный к транспортному протоколу
-// (ТЗ 4.2: «Redis Streams с consumer groups (допустима замена на
-// RabbitMQ за интерфейсом Queue)»). Реализация на Redis Streams —
-// redisq.go, форматы сообщений — message.go.
+// Task queue contract, not tied to a transport protocol
+// (spec 4.2: "Redis Streams with consumer groups (replacing it with
+// RabbitMQ behind the Queue interface is allowed)"). The Redis Streams
+// implementation — redisq.go, the message formats — message.go.
 
 import "context"
 
-// Queue — транспорт задач между сервисами (ТЗ 4.2): планировщик (T-028)
-// публикует сообщения, воркеры читают пачками через consumer group и
-// подтверждают обработку. Методы не раскрывают специфику Redis, чтобы
-// бэкенд можно было заменить, не меняя потребителей.
+// Queue — the task transport between services (spec 4.2): the scheduler
+// (T-028) publishes messages, workers read them in batches through a
+// consumer group and acknowledge processing. The methods do not expose
+// Redis specifics so the backend can be replaced without changing the
+// consumers.
 //
-// Контракт доставки — at-least-once (ТЗ 3.4): запись, прочитанная
-// Consume, закреплена за потребителем группы до подтверждения Ack;
-// падение воркера или разрыв связи приводит к повторной доставке, поэтому
-// обработка обязана быть идемпотентной (все записи результатов в БД
-// идемпотентны по ТЗ 3.4).
+// The delivery contract is at-least-once (spec 3.4): an entry read by
+// Consume stays assigned to the group consumer until Ack confirms it;
+// a worker crash or a connection loss leads to redelivery, so processing
+// must be idempotent (all result records in the DB are idempotent per
+// spec 3.4).
 //
-// Чтение и подтверждение разделены намеренно: по ТЗ 4.2 XACK выполняется
-// только после записи результата в БД. Воркеры строят цикл
-// «Consume → обработка и запись в БД → Ack»; неподтверждённая запись
-// возвращается повторной доставкой.
+// Reading and acknowledging are separated deliberately: per spec 4.2,
+// XACK runs only after the result is written to the DB. Workers build
+// the cycle "Consume → processing and writing to the DB → Ack"; an
+// unacknowledged entry comes back through redelivery.
 type Queue interface {
-	// Publish публикует сообщение msg в стрим stream и возвращает
-	// идентификатор записи. Ошибка, если стрим не соответствует типу
-	// сообщения (Message.Streams) или значения не прошли проверку, —
-	// сообщение не публикуется.
+	// Publish publishes the message msg to the stream stream and returns
+	// the entry identifier. It is an error if the stream does not match
+	// the message type (Message.Streams) or the values fail validation —
+	// the message is not published.
 	Publish(ctx context.Context, stream string, msg Message) (string, error)
 
-	// Consume читает до n ещё не прочитанных группой записей стрима от
-	// имени потребителя consumer. Группа group создаётся автоматически
-	// при первом чтении (с начала стрима). Пустой результат без ошибки —
-	// новых записей нет (истёк интервал ожидания); отменённый контекст
-	// прерывает ожидание.
+	// Consume reads up to n entries of the stream not yet read by the
+	// group, on behalf of the consumer consumer. The group group is
+	// created automatically on the first read (from the start of the
+	// stream). An empty result without an error — there are no new
+	// entries (the wait interval expired); a canceled context interrupts
+	// the wait.
 	Consume(ctx context.Context, stream, group, consumer string, n int) ([]Delivery, error)
 
-	// Ack подтверждает записи с идентификаторами ids после завершения
-	// обработки (по ТЗ 4.2 — после записи результата в БД).
+	// Ack acknowledges the entries with identifiers ids after processing
+	// completes (per spec 4.2 — after the result is written to the DB).
 	Ack(ctx context.Context, stream, group string, ids ...string) error
 }
 
-// Delivery — запись, доставленная из стрима. Полезная нагрузка — сырые
-// байты поля data (JSON-сообщение, message.go); декодирование — Decode
-// по типу сообщения стрима:
+// Delivery — an entry delivered from a stream. The payload is the raw
+// bytes of the data field (a JSON message, message.go); decoding is
+// Decode by the message type of the stream:
 //
 //	batch, err := queue.Decode[queue.DNSBatch](d)
 //
-// Идентификатор записи нужен подтверждению Ack и возврату зависших
-// сообщений (XAUTOCLAIM — T-025).
+// The entry identifier is needed by the Ack acknowledgement and by the
+// return of stuck messages (XAUTOCLAIM — T-025).
 type Delivery struct {
-	Stream  string // стрим-источник
-	ID      string // идентификатор записи (XACK; XAUTOCLAIM в T-025)
-	Payload []byte // JSON-сообщение — значение поля data записи
+	Stream  string // source stream
+	ID      string // entry identifier (XACK; XAUTOCLAIM in T-025)
+	Payload []byte // JSON message — the value of the entry's data field
 }

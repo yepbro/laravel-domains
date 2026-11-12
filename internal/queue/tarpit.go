@@ -1,15 +1,16 @@
-// Счётчик тарпит-классифицированных доставок задач рендера (T-261,
-// ТЗ tasks/TZ-fsm.md §3 ФТ-7): прикладной ключ Redis render:tarpit:{task_id}
-// — множество идентификаторов доставок, завершившихся таймаутом страницы
-// (render.timeout, tarpitError воркера). Решение тарпит-финализации
-// принимается по мощности множества (SCARD ≥ render.timeout_attempts),
-// а не по общему номеру доставки PEL: смешанные серии (тарпит чередуется
-// с инфраструктурными сбоями) перестают финализировать «на попытку»
-// раньше — номер доставки растёт от каждой доставки, множество — только
-// от тарпит-классифицированных. Потребитель — internal/renderworker
-// (шов TarpitStore, воркер монтирует его через Options.Tarpits;
-// спецификация автомата политики исходов — doc-комментарий пакета
-// internal/renderworker); здесь — только механизм ключа.
+// Counter of tarpit-classified deliveries of render tasks (T-261,
+// FR-7 of tasks/TZ-fsm.md §3): the application-level Redis key
+// render:tarpit:{task_id} is a set of delivery identifiers that ended
+// with a page timeout (render.timeout, the worker's tarpitError). The
+// tarpit finalization decision is made by the set cardinality
+// (SCARD ≥ render.timeout_attempts), not by the raw PEL delivery number:
+// mixed series (tarpit alternating with infrastructure failures) stop
+// finalizing "by attempt" prematurely — the delivery number grows on
+// every delivery, the set only on tarpit-classified ones. The consumer
+// is internal/renderworker (the TarpitStore seam, the worker mounts it
+// through Options.Tarpits; the specification of the outcome policy
+// machine is the doc comment of the internal/renderworker package);
+// here — only the key mechanism.
 
 package queue
 
@@ -21,64 +22,70 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// TarpitKey — ключ множества тарпит-классифицированных доставок задачи
-// taskID: render:tarpit:{task_id}. Идентификатор задачи (message.go)
-// переживает запись стрима и переносится публикацией фолбэка (T-238
-// передаёт сообщение целиком) — счётчик один на все доставки задачи:
-// основной стрим q:render и доработка воркером B в q:render-fallback
-// (бюджет тарпитов — на эпизод задачи, не на стрим; члены множества —
-// id доставок — различают записи стримов). Переиздания эпизода (проход
-// доработки T-066, поздний переиздатель T-259) публикуют НОВЫЙ task_id —
-// их счётчик начинается с нуля.
+// TarpitKey — the key of the set of tarpit-classified deliveries of the
+// task taskID: render:tarpit:{task_id}. The task identifier (message.go)
+// survives the stream entry and is carried over by the fallback
+// publication (T-238 forwards the message whole) — the counter is one
+// for all deliveries of the task: the main q:render stream and the
+// rework by worker B in q:render-fallback (the tarpit budget is per task
+// episode, not per stream; the set members — delivery ids — distinguish
+// the entries of the streams). Episode re-publications (the T-066 rework
+// pass, the late re-publisher T-259) publish a NEW task_id — their
+// counter starts from zero.
 func TarpitKey(taskID string) string {
 	return "render:tarpit:" + taskID
 }
 
-// tarpitClient — окно go-redis для счётчика тарпитов: SADD/EXPIRE/SCard.
-// Отдельный интерфейс по образцу claimStreams (reliab.go): *redis.Client
-// (queue.NewClient), *redis.ClusterClient и фейки юнит-тестов
-// удовлетворяют ему без раскрытия всего Cmdable.
+// tarpitClient — the go-redis window for the tarpit counter:
+// SADD/EXPIRE/SCard. A separate interface modeled after claimStreams
+// (reliab.go): *redis.Client (queue.NewClient), *redis.ClusterClient and
+// the unit-test fakes satisfy it without exposing the whole Cmdable.
 type tarpitClient interface {
 	SAdd(ctx context.Context, key string, members ...interface{}) *redis.IntCmd
 	Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd
 	SCard(ctx context.Context, key string) *redis.IntCmd
 }
 
-// TarpitCounter — счётчик тарпит-классифицированных доставок задач
-// рендера (T-261, ФТ-7) поверх прикладного ключа render:tarpit:{task_id}
-// (TarpitKey). Множество ведёт сам Redis (SADD идемпотентен по члену),
-// TTL освежается каждой отметкой — ключ живёт ttl после ПОСЛЕДНЕЙ
-// тарпит-доставки задачи: эпизод не может закончиться раньше TTL
-// (горизонт ретраев — часы), а забытые ключи убирает Redis, не оператор.
-// Потеря ключа/Redis не портит решение потребителя: Track возвращает
-// ошибку или меньшую мощность — воркер деградирует к номеру доставки
-// PEL (поведение до T-261), раньше порога не финализирует (ТЗ 3.4 —
-// потеря Redis не фатальна, источник истины — PostgreSQL).
+// TarpitCounter — the counter of tarpit-classified deliveries of render
+// tasks (T-261, FR-7) on top of the application-level key
+// render:tarpit:{task_id} (TarpitKey). The set is maintained by Redis
+// itself (SADD is idempotent per member), the TTL is refreshed by every
+// mark — the key lives ttl past the LAST tarpit delivery of the task: an
+// episode cannot end earlier than the TTL (the retry horizon is hours),
+// and forgotten keys are removed by Redis, not an operator. Losing the
+// key/Redis does not corrupt the consumer's decision: Track returns an
+// error or a smaller cardinality — the worker degrades to the PEL
+// delivery number (the behavior before T-261) and does not finalize
+// before the threshold (spec 3.4 — losing Redis is not fatal, the source
+// of truth is PostgreSQL).
 type TarpitCounter struct {
 	rdb tarpitClient
 }
 
-// NewTarpitCounter строит счётчик поверх клиента rdb — того же, что и
-// очередь воркера (NewClient/NewReliab): команды точечные, пул общий.
+// NewTarpitCounter builds the counter on top of the client rdb — the
+// same one as the worker's queue (NewClient/NewReliab): the commands are
+// targeted, the pool is shared.
 func NewTarpitCounter(rdb tarpitClient) *TarpitCounter {
 	return &TarpitCounter{rdb: rdb}
 }
 
-// Track помечает доставку delivery задачи taskID тарпит-классифицированной
-// и возвращает мощность множества задачи — сколько доставок (включая
-// текущую) классифицировано тарпитом. Идемпотентность — семантика SADD:
-// повторная отметка той же доставки (replay номера после возврата
-// попытки, T-222; повторная обработка зависшей) счётчик не растит.
-// Идентификатор доставки строит потребитель (запись стрима × номер
-// доставки PEL) — здесь это непрозрачная строка.
+// Track marks the delivery delivery of the task taskID as
+// tarpit-classified and returns the task's set cardinality — how many
+// deliveries (including the current one) are classified as tarpit.
+// Idempotency — the SADD semantics: marking the same delivery again (a
+// delivery-number replay after an attempt refund, T-222; reprocessing of
+// a stuck entry) does not grow the counter. The delivery identifier is
+// built by the consumer (stream entry × PEL delivery number) — here it
+// is an opaque string.
 //
-// Ошибка любой команды — ошибка всего вызова: потребитель деградирует к
-// решению по номеру доставки PEL. Часть команд могла примениться
-// (SADD без EXPIRE при обрыве между ними) — ключ без TTL переживёт
-// очистку; следующая отметка той же задачи поставит TTL заново
-// (EXPIRE освежается каждой отметкой), осиротевший ключ одиночной
-// доставки — единицы инцидентов обрыва соединения, ограничение сверху —
-// бюджет прикладных ключей (docs/redis.md §2).
+// An error of any command is the error of the whole call: the consumer
+// degrades to the decision by the PEL delivery number. Part of the
+// commands may have applied (SADD without EXPIRE on a break between
+// them) — a key without a TTL would survive the cleanup; the next mark
+// of the same task sets the TTL again (EXPIRE is refreshed by every
+// mark), and the orphaned key of a single delivery is a handful of
+// connection-break incidents, with the application-key budget as the
+// upper bound (docs/redis.md §2).
 func (c *TarpitCounter) Track(ctx context.Context, taskID, delivery string, ttl time.Duration) (int, error) {
 	if taskID == "" {
 		return 0, fmt.Errorf("queue: тарпит-счётчик: пустой task_id")

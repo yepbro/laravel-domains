@@ -1,9 +1,10 @@
-// Тесты счётчика тарпит-классифицированных доставок (T-261, ФТ-7) без
-// живого Redis: фейк эмулирует семантику множества (SADD идемпотентен
-// по члену, SCARD — мощность) и TTL, проверяются аргументы команд,
-// формат ключа, валидация и деградация по ошибкам команд. Живая
-// семантика ключа render:tarpit:* (SADD/EXPIRE/SCARD против настоящего
-// Redis) — test/integration/render_tarpit_test.go.
+// Tests of the counter of tarpit-classified deliveries (T-261, FR-7)
+// without a live Redis: the fake emulates the set semantics (SADD is
+// idempotent per member, SCARD — the cardinality) and the TTL, covered
+// are the command arguments, the key format, the validation and the
+// degradation on command errors. The live semantics of the
+// render:tarpit:* key (SADD/EXPIRE/SCARD against a real Redis) —
+// test/integration/render_tarpit_test.go.
 
 package queue
 
@@ -16,9 +17,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// fakeTarpitRedis — эмуляция множеств Redis для счётчика тарпитов:
-// SAdd добавляет членов (повторный — no-op), Expire запоминает TTL,
-// SCard отвечает мощностью. Ошибки команд — заготовки.
+// fakeTarpitRedis — an emulation of Redis sets for the tarpit counter:
+// SAdd adds members (a repeated one — a no-op), Expire remembers the
+// TTL, SCard answers with the cardinality. Command errors — stubs.
 type fakeTarpitRedis struct {
 	sets map[string]map[string]struct{}
 	ttls map[string]time.Duration
@@ -27,7 +28,7 @@ type fakeTarpitRedis struct {
 	expireErr error
 	scardErr  error
 
-	sadds  []string // зафиксированные члены SADD в порядке вызовов
+	sadds  []string // the recorded SADD members in call order
 	expiry []time.Duration
 }
 
@@ -82,21 +83,22 @@ func (f *fakeTarpitRedis) SCard(_ context.Context, key string) *redis.IntCmd {
 	return cmd
 }
 
-// Компиляционная проверка: фейк взаимозаменяем с реальным клиентом.
+// A compile-time check: the fake is interchangeable with the real
+// client.
 var _ tarpitClient = (*fakeTarpitRedis)(nil)
 
-// TestTarpitKey — формат ключа прикладного счётчика: render:tarpit:
-// {task_id} (контракт документации docs/redis.md §2 и ручного разбора
-// redis-cli).
+// TestTarpitKey — the format of the application counter key:
+// render:tarpit:{task_id} (the contract of the docs/redis.md §2
+// documentation and of manual redis-cli triage).
 func TestTarpitKey(t *testing.T) {
 	if got, want := TarpitKey("abc123"), "render:tarpit:abc123"; got != want {
 		t.Errorf("TarpitKey = %q, хочу %q", got, want)
 	}
 }
 
-// TestTarpitCounterTrack — отметка доставки возвращает мощность множества
-// и освежает TTL ключа: первая доставка — 1, другая доставка той же
-// задачи — 2, отметка другой задачи не смешивается.
+// TestTarpitCounterTrack — a delivery mark returns the set cardinality
+// and refreshes the key's TTL: the first delivery — 1, another delivery
+// of the same task — 2, a mark of another task does not mix in.
 func TestTarpitCounterTrack(t *testing.T) {
 	f := newFakeTarpitRedis()
 	c := NewTarpitCounter(f)
@@ -124,9 +126,9 @@ func TestTarpitCounterTrack(t *testing.T) {
 	}
 }
 
-// TestTarpitCounterTrackIdempotent — семантика SADD: повторная отметка
-// ТОЙ ЖЕ доставки (replay номера после возврата попытки, T-222) мощность
-// не растит — одна доставка один член множества.
+// TestTarpitCounterTrackIdempotent — the SADD semantics: marking THE SAME
+// delivery again (a delivery-number replay after an attempt refund,
+// T-222) does not grow the cardinality — one delivery, one set member.
 func TestTarpitCounterTrackIdempotent(t *testing.T) {
 	f := newFakeTarpitRedis()
 	c := NewTarpitCounter(f)
@@ -142,8 +144,9 @@ func TestTarpitCounterTrackIdempotent(t *testing.T) {
 	}
 }
 
-// TestTarpitCounterTrackValidation — пустой task_id/доставка и неположительный
-// TTL — ошибка до команд Redis (EXPIRE с TTL ≤ 0 удалил бы ключ).
+// TestTarpitCounterTrackValidation — an empty task_id/delivery and a
+// non-positive TTL — an error before the Redis commands (an EXPIRE with
+// a TTL ≤ 0 would delete the key).
 func TestTarpitCounterTrackValidation(t *testing.T) {
 	f := newFakeTarpitRedis()
 	c := NewTarpitCounter(f)
@@ -172,9 +175,10 @@ func TestTarpitCounterTrackValidation(t *testing.T) {
 	}
 }
 
-// TestTarpitCounterTrackErrors — сбой любой команды (SADD/EXPIRE/SCARD)
-// — ошибка вызова: потребитель деградирует к решению по номеру доставки
-// PEL, частично применённое состояние не искажает мощность в ответе.
+// TestTarpitCounterTrackErrors — a failure of any command
+// (SADD/EXPIRE/SCARD) — an error of the call: the consumer degrades to
+// the decision by the PEL delivery number, the partially applied state
+// does not distort the cardinality in the answer.
 func TestTarpitCounterTrackErrors(t *testing.T) {
 	cases := []struct {
 		name   string

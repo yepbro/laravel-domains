@@ -1,9 +1,10 @@
-// Тесты реализации RedisQueue без живого Redis (T-024): фейк реализует
-// то же узкое окно команд redisStreams, что и *redis.Client, — результаты
-// команд go-redis строятся фабриками New*Result. Проверяется маппинг
-// аргументов и результатов: XADD (поле data, MAXLEN ~), ленивое создание
-// группы с поглощением BUSYGROUP, XREADGROUP ">", XACK. Реальная
-// семантика Redis — интеграционные тесты T-032.
+// Tests of the RedisQueue implementation without a live Redis (T-024):
+// the fake implements the same narrow redisStreams command window as
+// *redis.Client — the go-redis command results are built by the
+// New*Result factories. Covered: the mapping of arguments and results —
+// XADD (the data field, MAXLEN ~), lazy group creation with BUSYGROUP
+// absorption, XREADGROUP ">", XACK. The real Redis semantics — the
+// integration tests of T-032.
 
 package queue
 
@@ -19,30 +20,30 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// fakeRedis — запись вызовов команд + заготовленные результаты.
+// fakeRedis — a record of command calls + stubbed results.
 type fakeRedis struct {
 	adds   []redis.XAddArgs
 	addID  string
 	addErr error
-	// addErrs — ошибки XADD по вызовам подряд (очередь); пусто —
-	// постоянная addErr. Нужно сценариям повторов публикации при
-	// инфраструктурном сбое (T-152): первые вызовы падают OOM,
-	// следующий проходит.
+	// addErrs — XADD errors call after call (a queue); empty — the
+	// permanent addErr. Needed by the publish-retry scenarios on an
+	// infrastructure failure (T-152): the first calls fail with OOM, the
+	// next one goes through.
 	addErrs []error
 
-	creates   []string // "stream group start" на каждый вызов
+	creates   []string // "stream group start" on every call
 	createErr error
-	// createErrs — ошибки создания группы по вызовам подряд (очередь);
-	// пусто — постоянная createErr. Нужно сценариям, где пересоздание
-	// после NOGROUP падает, а первое создание — нет.
+	// createErrs — group creation errors call after call (a queue);
+	// empty — the permanent createErr. Needed by the scenarios where the
+	// recreation after NOGROUP fails while the first creation does not.
 	createErrs []error
 
 	reads   []redis.XReadGroupArgs
 	readRes []redis.XStream
 	readErr error
-	// readErrs — ошибки чтения по вызовам подряд (очередь); пусто —
-	// постоянная readErr. Нужно сценариям с меняющимся ответом Redis
-	// (NOGROUP после потери стрима, T-032).
+	// readErrs — read errors call after call (a queue); empty — the
+	// permanent readErr. Needed by the scenarios with a changing Redis
+	// answer (NOGROUP after a stream loss, T-032).
 	readErrs []error
 
 	acks     []ackCall
@@ -50,7 +51,7 @@ type fakeRedis struct {
 	ackErr   error
 }
 
-// ackCall — зафиксированный вызов XACK.
+// ackCall — a recorded XACK call.
 type ackCall struct {
 	stream, group string
 	ids           []string
@@ -88,26 +89,28 @@ func (f *fakeRedis) XReadGroup(ctx context.Context, a *redis.XReadGroupArgs) *re
 
 func (f *fakeRedis) XAck(ctx context.Context, stream, group string, ids ...string) *redis.IntCmd {
 	if err := ctx.Err(); err != nil {
-		// Живой клиент не отправляет команду по отменённому ctx (T-222,
-		// P3-4 ревью) — фейк тоже не записывает её в протокол.
+		// The live client does not send the command on a canceled ctx
+		// (T-222, the P3-4 review) — the fake does not record it in the
+		// protocol either.
 		return redis.NewIntResult(0, err)
 	}
 	f.acks = append(f.acks, ackCall{stream, group, ids})
 	return redis.NewIntResult(f.ackCount, f.ackErr)
 }
 
-// Компиляционные проверки: фейк и реальный клиент взаимозаменяемы,
-// RedisQueue реализует Queue.
+// Compile-time checks: the fake and the real client are interchangeable,
+// RedisQueue implements Queue.
 var (
 	_ redisStreams = (*fakeRedis)(nil)
 	_ redisStreams = (*redis.Client)(nil)
 	_ Queue        = (*RedisQueue)(nil)
 )
 
-// TestRedisQueueBlockDefault — константа и границы замены Block в
-// конструкторе: 0 и отрицательные — DefaultRedisBlock (литеральный пин
-// константы: сравнение с самой константой мутанта не замечает), единичный
-// наносекундный интервал — валильное ожидание, а не «ноль».
+// TestRedisQueueBlockDefault — the constant and the boundaries of the
+// Block replacement in the constructor: 0 and negatives —
+// DefaultRedisBlock (a literal pin of the constant: comparing with the
+// constant itself, the mutant goes unnoticed), a single nanosecond
+// interval — a valid wait, not "zero".
 func TestRedisQueueBlockDefault(t *testing.T) {
 	if DefaultRedisBlock != 2*time.Second {
 		t.Errorf("DefaultRedisBlock = %s, хочу 2s (литерал — пин константы)", DefaultRedisBlock)
@@ -144,7 +147,8 @@ func TestRedisQueuePublish(t *testing.T) {
 	if add.Stream != StreamDNS {
 		t.Errorf("XADD в стрим %q, хочу %q", add.Stream, StreamDNS)
 	}
-	// Политика T-025: без явного предела применяется предел стрима.
+	// The T-025 policy: without an explicit limit the stream limit
+	// applies.
 	if add.MaxLen != DefaultStreamMaxLen(StreamDNS) || !add.Approx {
 		t.Errorf("XADD без MaxLen в опциях: MaxLen=%d Approx=%v, хочу MAXLEN ~ %d",
 			add.MaxLen, add.Approx, DefaultStreamMaxLen(StreamDNS))
@@ -186,8 +190,8 @@ func TestRedisQueuePublishMaxLen(t *testing.T) {
 }
 
 func TestRedisQueuePublishError(t *testing.T) {
-	// wantErr — точная подстрока: ветки ошибок различимы текстом
-	// (проверка стрима против проверки типа и значений).
+	// wantErr — an exact substring: the error branches are distinguishable
+	// by text (the stream check versus the type and values check).
 	cases := []struct {
 		name    string
 		stream  string
@@ -219,17 +223,18 @@ func TestRedisQueuePublishError(t *testing.T) {
 	}
 }
 
-// alienMessage — сообщение вне форматов пакета: интерфейс Message запечатан
-// методом validate, поэтому реализация возможна только внутри пакета.
-// Проходит проверки стрима и значений, но не сериализуется marshalMessage —
-// проверка ветки ошибки сериализации в Publish.
+// alienMessage — a message outside the package formats: the Message
+// interface is sealed by the validate method, so an implementation is
+// possible only inside the package. It passes the stream and values
+// checks but is not serialized by marshalMessage — covering the
+// serialization error branch in Publish.
 type alienMessage struct{}
 
 func (alienMessage) Streams() []string { return []string{StreamDNS} }
 func (alienMessage) validate() error   { return nil }
 
-// TestRedisQueuePublishMarshalError — несериализуемое сообщение: ошибка
-// с типом в тексте, до XADD.
+// TestRedisQueuePublishMarshalError — an unserializable message: an
+// error with the type in the text, before XADD.
 func TestRedisQueuePublishMarshalError(t *testing.T) {
 	fake := &fakeRedis{}
 	q := NewRedisQueue(fake, RedisOptions{})
@@ -250,7 +255,7 @@ func TestRedisQueueConsume(t *testing.T) {
 			Messages: []redis.XMessage{
 				{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
 				{ID: "1719-0", Values: map[string]any{fieldData: []byte(`{"task_id":"t2"}`)}},
-				{ID: "1720-0", Values: map[string]any{"other": "x"}}, // без поля data
+				{ID: "1720-0", Values: map[string]any{"other": "x"}}, // without the data field
 			},
 		}},
 	}
@@ -261,12 +266,14 @@ func TestRedisQueueConsume(t *testing.T) {
 		t.Fatalf("Consume: %v", err)
 	}
 
-	// Группа создаётся при первом чтении: с начала стрима, MKSTREAM.
+	// The group is created on the first read: from the start of the
+	// stream, MKSTREAM.
 	if want := []string{StreamDNS + " dns 0"}; !reflect.DeepEqual(fake.creates, want) {
 		t.Errorf("XGROUP CREATE: %v, хочу %v", fake.creates, want)
 	}
 
-	// Аргументы XREADGROUP: только новые записи группы, пачка и ожидание.
+	// The XREADGROUP arguments: only the group's new entries, the batch
+	// and the wait.
 	if len(fake.reads) != 1 {
 		t.Fatalf("вызовов XREADGROUP: %d, хочу 1", len(fake.reads))
 	}
@@ -309,7 +316,7 @@ func TestRedisQueueConsumeGroupCached(t *testing.T) {
 		t.Errorf("XREADGROUP вызван %d раз, хочу 3", len(fake.reads))
 	}
 
-	// Другая группа того же стрима — отдельное создание.
+	// Another group of the same stream — a separate creation.
 	if _, err := q.Consume(context.Background(), StreamHTTP, "http-2", "http-1", 5); err != nil {
 		t.Fatalf("Consume другой группы: %v", err)
 	}
@@ -329,24 +336,25 @@ func TestRedisQueueConsumeBusyGroup(t *testing.T) {
 	}
 }
 
-// TestRedisQueueConsumeGroupLost — потеря Redis при живом воркере
-// (ТЗ 3.4, T-032): группа исчезла вместе со стримом, кэш созданных групп
-// устарел — XREADGROUP отвечает NOGROUP. Consume пересоздаёт группу
-// (XGROUP CREATE MKSTREAM) и повторяет чтение, а не падает до рестарта
-// процесса; задачи в это время переиздаёт планировщик по lease.
+// TestRedisQueueConsumeGroupLost — losing Redis with a live worker
+// (spec 3.4, T-032): the group disappeared together with the stream, the
+// cache of created groups is stale — XREADGROUP answers NOGROUP. Consume
+// recreates the group (XGROUP CREATE MKSTREAM) and repeats the read
+// instead of failing until a process restart; in the meantime the tasks
+// are re-published by the scheduler via lease.
 func TestRedisQueueConsumeGroupLost(t *testing.T) {
 	fake := &fakeRedis{readErrs: []error{
-		nil, // чтение до потери: пусто, без ошибки
+		nil, // the read before the loss: empty, without an error
 		errors.New("NOGROUP No such consumer group 'dns' for key name 'q:dns'"),
-		redis.Nil, // повторное чтение: новых записей нет
+		redis.Nil, // the repeated read: no new entries
 	}}
 	q := NewRedisQueue(fake, RedisOptions{})
 
-	// Первое чтение создаёт группу и попадает в кэш.
+	// The first read creates the group and lands in the cache.
 	if _, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1); err != nil {
 		t.Fatalf("Consume до потери: %v", err)
 	}
-	// Второе — после «потери» стрима: NOGROUP, пересоздание, повтор.
+	// The second — after the stream "loss": NOGROUP, recreation, retry.
 	got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1)
 	if err != nil || got != nil {
 		t.Fatalf("Consume после потери: (%v, %v), хочу (nil, nil)", got, err)
@@ -359,10 +367,10 @@ func TestRedisQueueConsumeGroupLost(t *testing.T) {
 	}
 }
 
-// TestRedisQueueConsumeGroupLostAtProgress — NOGROUP после успешно
-// прочитанных записей: группа пересоздаётся с последнего прочитанного id,
-// а не с "0" — переигрывать обработанную историю стрима (до MAXLEN
-// записей) лавиной дублей не нужно (Q-06).
+// TestRedisQueueConsumeGroupLostAtProgress — NOGROUP after successfully
+// read entries: the group is recreated from the last read id, not from
+// "0" — replaying the processed history of the stream (up to MAXLEN
+// entries) as an avalanche of duplicates is not needed (Q-06).
 func TestRedisQueueConsumeGroupLostAtProgress(t *testing.T) {
 	fake := &fakeRedis{
 		readRes: []redis.XStream{{
@@ -373,9 +381,9 @@ func TestRedisQueueConsumeGroupLostAtProgress(t *testing.T) {
 			},
 		}},
 		readErrs: []error{
-			nil, // первое чтение: две записи (прогресс — 1719-0)
+			nil, // the first read: two entries (the progress — 1719-0)
 			errors.New("NOGROUP No such consumer group 'dns' for key name 'q:dns'"),
-			redis.Nil, // повторное чтение: новых записей нет
+			redis.Nil, // the repeated read: no new entries
 		},
 	}
 	q := NewRedisQueue(fake, RedisOptions{})
@@ -383,30 +391,31 @@ func TestRedisQueueConsumeGroupLostAtProgress(t *testing.T) {
 	if got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 10); err != nil || len(got) != 2 {
 		t.Fatalf("первое чтение: (%v, %v)", got, err)
 	}
-	// «Потеря» группы: пересоздание с прогресса первого чтения.
+	// The group "loss": recreation from the progress of the first read.
 	if got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 10); err != nil || got != nil {
 		t.Fatalf("чтение после потери: (%v, %v), хочу (nil, nil)", got, err)
 	}
 	want := []string{
-		StreamDNS + " dns 0",      // первое создание — с начала стрима
-		StreamDNS + " dns 1719-0", // восстановление — с последнего прочитанного
+		StreamDNS + " dns 0",      // the first creation — from the start of the stream
+		StreamDNS + " dns 1719-0", // the recovery — from the last read
 	}
 	if !reflect.DeepEqual(fake.creates, want) {
 		t.Errorf("XGROUP CREATE: %v, хочу %v", fake.creates, want)
 	}
 }
 
-// TestRedisQueueConsumeGroupLostNoCache — NOGROUP без прогресса в кэше
-// (белое поле: в кэше групп нет отметки «до куда прочитано») — группа
-// пересоздаётся с "0", как первое создание, а не с пустым стартом.
+// TestRedisQueueConsumeGroupLostNoCache — NOGROUP without progress in
+// the cache (a blank spot: the group cache has no "read up to here"
+// mark) — the group is recreated from "0", as the first creation, not
+// from an empty start.
 func TestRedisQueueConsumeGroupLostNoCache(t *testing.T) {
 	fake := &fakeRedis{readErrs: []error{
 		errors.New("NOGROUP No such consumer group 'dns' for key name 'q:dns'"),
-		redis.Nil, // повторное чтение: новых записей нет
+		redis.Nil, // the repeated read: no new entries
 	}}
 	q := NewRedisQueue(fake, RedisOptions{})
-	// Пустая отметка прогресса: группу считаем созданной, но «до куда
-	// прочитано» неизвестно (защитное значение — см. trackProgress).
+	// An empty progress mark: the group is considered created, but "read
+	// up to here" is unknown (the guard value — see trackProgress).
 	q.groups.Store(groupKey(StreamDNS, "dns"), "")
 
 	got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1)
@@ -421,9 +430,9 @@ func TestRedisQueueConsumeGroupLostNoCache(t *testing.T) {
 	}
 }
 
-// TestRedisQueueConsumeGroupRecreateError — ошибка пересоздания группы
-// после NOGROUP возвращается вызывающему, а не глотается: потребитель
-// видит недоступность Redis, а не пустой результат.
+// TestRedisQueueConsumeGroupRecreateError — a group recreation error
+// after NOGROUP is returned to the caller, not swallowed: the consumer
+// sees the Redis unavailability, not an empty result.
 func TestRedisQueueConsumeGroupRecreateError(t *testing.T) {
 	fake := &fakeRedis{
 		createErrs: []error{nil, errors.New("ERR connection refused")},
@@ -511,7 +520,7 @@ func TestRedisQueueAck(t *testing.T) {
 		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
 	}
 
-	// Без идентификаторов — обращение к Redis не нужно.
+	// Without identifiers — no Redis call is needed.
 	fake.acks = nil
 	if err := q.Ack(context.Background(), StreamDNS, "dns"); err != nil {
 		t.Fatalf("Ack без ids: %v", err)
@@ -526,19 +535,20 @@ func TestRedisQueueAck(t *testing.T) {
 	}
 }
 
-// TestRedisQueueTrackProgress — контракт кэша прогресса: пустая пачка
-// не трогает кэш (ни записи «0»); стартовые отметки ("", "0")
-// нормализуются в "0-0", прогресс — максимум прочитанных id.
+// TestRedisQueueTrackProgress — the progress cache contract: an empty
+// batch does not touch the cache (no "0" record at all); start marks
+// ("", "0") are normalized into "0-0", the progress is the maximum of
+// the read ids.
 func TestRedisQueueTrackProgress(t *testing.T) {
-	// Пустая пачка — никаких записей в кэше.
+	// An empty batch — no records in the cache at all.
 	q := NewRedisQueue(&fakeRedis{}, RedisOptions{})
 	q.trackProgress(StreamDNS, "dns", nil)
 	if _, ok := q.groups.Load(groupKey(StreamDNS, "dns")); ok {
 		t.Error("пустая пачка создала запись в кэше групп")
 	}
 
-	// Пустая стартовая отметка (белое поле: защитное значение кэша) —
-	// нормализация в "0-0" и прогресс от неё, а не молчаливый пропуск.
+	// An empty start mark (a blank spot: the cache guard value) —
+	// normalization into "0-0" and progress from it, not a silent skip.
 	q.groups.Store(groupKey(StreamDNS, "dns"), "")
 	q.trackProgress(StreamDNS, "dns", []redis.XMessage{
 		{ID: "1718-0", Values: map[string]any{fieldData: "x"}},
@@ -550,10 +560,10 @@ func TestRedisQueueTrackProgress(t *testing.T) {
 	}
 }
 
-// TestStreamIDGreater — числовое сравнение идентификаторов "ms-seq":
-// равные ms решает seq, полностью равные — не больше, нечисловые части —
-// не больше (никогда), лексикографический порядок "999-*" > "1000-*"
-// ошибочен.
+// TestStreamIDGreater — the numeric comparison of "ms-seq" identifiers:
+// with equal ms the seq decides, fully equal — not greater, non-numeric
+// parts — not greater (never), the lexicographic order "999-*" >
+// "1000-*" is wrong.
 func TestStreamIDGreater(t *testing.T) {
 	cases := []struct {
 		name string
@@ -565,10 +575,10 @@ func TestStreamIDGreater(t *testing.T) {
 		{"равные ms, больше по seq", "5-2", "5-1", true},
 		{"равные ms, меньше по seq", "5-0", "5-1", false},
 		{"полностью равные", "5-0", "5-0", false},
-		// b с отрицательным seq — единственная форма, где пропуск
-		// проверки a различим: ams/aseq нулевые, равенство ms уводит
-		// сравнение в seq (0 > −1), тогда как корректный код с
-		// неразбираемым a всегда false.
+		// b with a negative seq — the only form where skipping the a check
+		// is distinguishable: ams/aseq are zero, the ms equality sends the
+		// comparison into seq (0 > −1), whereas the correct code with an
+		// unparseable a is always false.
 		{"a не вида ms-seq", "junk", "0--1", false},
 		{"b не вида ms-seq", "5-0", "junk", false},
 		{"оба не вида ms-seq", "junk", "junk", false},
@@ -582,15 +592,15 @@ func TestStreamIDGreater(t *testing.T) {
 	}
 }
 
-// TestSplitStreamID — разбор "ms-seq": десятичная база (не 9/11),
-// разрядность int64 (2⁶³−1 парсится), ошибочный формат и не-числа —
-// ошибка с нулевыми частями и точным текстом.
+// TestSplitStreamID — parsing "ms-seq": the decimal base (not 9/11),
+// the int64 width (2⁶³−1 parses), a bad format and non-numbers — an
+// error with zero parts and the exact text.
 func TestSplitStreamID(t *testing.T) {
 	cases := []struct {
 		name    string
 		id      string
 		ms, seq int64
-		wantErr string // "" — без ошибки
+		wantErr string // "" — without an error
 	}{
 		{"нулевой seq", "1718-0", 1718, 0, ""},
 		{"ненулевой seq", "1718-42", 1718, 42, ""},
@@ -626,8 +636,8 @@ func TestSplitStreamID(t *testing.T) {
 	}
 }
 
-// TestIsBusyGroup — nil не является BUSYGROUP (и не паникует):
-// единственный вызов — ensureGroup — защищать нечем.
+// TestIsBusyGroup — nil is not a BUSYGROUP (and does not panic): the
+// only caller — ensureGroup — has nothing to protect.
 func TestIsBusyGroup(t *testing.T) {
 	if isBusyGroup(nil) {
 		t.Error("isBusyGroup(nil) = true, хочу false")

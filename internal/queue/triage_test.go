@@ -1,18 +1,20 @@
-// Тесты триажа выживших мутантов CI-прогона 10.11.2026 (часть B,
-// score 0.857): добивки покрытия queue по группам разбора — точные
-// значения констант и границ withDefaults (литеральные пины, сравнение
-// с самой константой мутанта не замечает), ошибки шагов проходов
-// (глушение возвратов, счёт при ошибке обязан быть нулём), разрывы
-// циклов (break вместо continue), границы порогов чистки консьюмеров,
-// текстовые ошибки Redis («no such key», префиксы ответов сервера на
-// голых строках — строковый fallback Is*-хелперов), остановка повторов
-// XADD после успеха/не-инфраструктурной ошибки, аргументы
-// перепроверки PEL (окно гонки сжато до одной записи), клампы и
-// защитные ветки возврата попыток, границы точки обрезки (гонка
-// «XINFO→XPENDING», ровно 3/4 потолка), сигналы застрявшего префикса,
-// нулевой счёт тарпит-счётчика на ошибках валидации/команд и выход
-// RecoverLoop без клейма после отмены ctx. Логирование и эквивалентные
-// мутанты — вне тестов (блэклист, docs/mutation-testing.md §4).
+// Tests of the triage of the surviving mutants of the CI run of
+// Nov 10, 2026 (part B, score 0.857): coverage top-ups of queue by
+// triage groups — the exact values of the constants and the withDefaults
+// boundaries (literal pins, comparing with the constant itself the
+// mutant goes unnoticed), pass step errors (muting returns, the count on
+// an error must be zero), loop breaks (break instead of continue), the
+// consumer cleanup threshold boundaries, textual Redis errors ("no such
+// key", server answer prefixes on bare strings — the string fallback of
+// the Is* helpers), stopping the XADD retries after a success or a
+// non-infrastructure error, the PEL recheck arguments (the race window
+// shrunk to a single entry), the clamps and the guard branches of the
+// attempt refunds, the trim point boundaries (the "XINFO→XPENDING"
+// race, exactly 3/4 of the cap), the stuck prefix signals, the zero
+// tarpit counter count on validation/command errors and the RecoverLoop
+// exit without a claim after a ctx cancel. Logging and equivalent
+// mutants are out of scope of the tests (the blacklist,
+// docs/mutation-testing.md §4).
 package queue
 
 import (
@@ -29,25 +31,27 @@ import (
 
 // --- consumers.go ----------------------------------------------------------
 
-// triConsumersFake — fakeConsumers с заготовленными ошибками DELCONSUMER
-// по кандидату «stream|group|consumer» (базовый фейк отвечает успехом
-// всегда): глушение возврата ошибки удаления и разрыв цикла по кандидату.
+// triConsumersFake — a fakeConsumers with stubbed DELCONSUMER errors by
+// the "stream|group|consumer" candidate (the base fake always answers
+// with success): muting the deletion error return and breaking the loop
+// per candidate.
 type triConsumersFake struct {
 	*fakeConsumers
 	delErrs map[string]error
 }
 
 func (f *triConsumersFake) XGroupDelConsumer(ctx context.Context, stream, group, consumer string) *redis.IntCmd {
-	f.fakeConsumers.XGroupDelConsumer(ctx, stream, group, consumer) // запись протокола
+	f.fakeConsumers.XGroupDelConsumer(ctx, stream, group, consumer) // the protocol recording
 	if err, ok := f.delErrs[stream+"|"+group+"|"+consumer]; ok {
 		return redis.NewIntResult(0, err)
 	}
 	return redis.NewIntResult(f.delPEL, nil)
 }
 
-// TestConsumersTriagePins — литеральные пины констант гигиены и границы
-// withDefaults: порог DefaultConsumerIdle — ровно 2 ч; единичные
-// (1 нс) Idle/Interval — законные явные значения, дефолт не заменяет их.
+// TestConsumersTriagePins — literal pins of the hygiene constants and
+// the withDefaults boundaries: the DefaultConsumerIdle threshold —
+// exactly 2 h; single (1 ns) Idle/Interval — legitimate explicit values,
+// the default does not replace them.
 func TestConsumersTriagePins(t *testing.T) {
 	if DefaultConsumerIdle != 2*time.Hour {
 		t.Errorf("DefaultConsumerIdle = %s, хочу ровно 2ч (T-155: суровые рестарты волн)", DefaultConsumerIdle)
@@ -58,13 +62,14 @@ func TestConsumersTriagePins(t *testing.T) {
 	}
 }
 
-// TestConsumersTriageIdleBoundary — неактивность ровно в пороге:
-// консьюмер с idle == Idle — кандидат (порог «неактивен ≥»), удаляется.
+// TestConsumersTriageIdleBoundary — inactivity exactly at the threshold:
+// a consumer with idle == Idle is a candidate (the "idle ≥" threshold),
+// it is removed.
 func TestConsumersTriageIdleBoundary(t *testing.T) {
 	f := &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
 			StreamHTTP + "|http-worker": {
-				{Name: "http-worker-1", Pending: 0, Idle: 2 * time.Hour}, // ровно порог
+				{Name: "http-worker-1", Pending: 0, Idle: 2 * time.Hour}, // exactly the threshold
 			},
 		},
 		pendRes: map[string][]redis.XPendingExt{},
@@ -81,14 +86,15 @@ func TestConsumersTriageIdleBoundary(t *testing.T) {
 	}
 }
 
-// TestConsumersTriageXInfoErrors — ошибка чтения списка консьюмеров
-// группы: нет стрима/группы (все три формы — redis.Nil, текст «no such
-// key», NOGROUP) — пустой проход без ошибки; прочая ошибка — ошибка
-// прохода (глушение возврата молчало бы: счёт 0, DELCONSUMER нет).
+// TestConsumersTriageXInfoErrors — an error reading the group's consumer
+// list: no stream/group (all three forms — redis.Nil, the "no such key"
+// text, NOGROUP) — an empty pass without an error; any other error — a
+// pass error (a muted return would stay silent: a count of 0, no
+// DELCONSUMER).
 func TestConsumersTriageXInfoErrors(t *testing.T) {
 	quiet := map[string]error{
 		"redis.Nil":         redis.Nil,
-		"текст no such key": errors.New("ERR no such key"), // текстовая форма ответа Redis
+		"текст no such key": errors.New("ERR no such key"), // the textual form of the Redis answer
 		"NOGROUP":           errors.New("NOGROUP No such consumer group 'x' for key name 'y'"),
 	}
 	for name, err := range quiet {
@@ -116,8 +122,8 @@ func TestConsumersTriageXInfoErrors(t *testing.T) {
 	}
 }
 
-// TestConsumersTriageNilClientCounts — nil-клиент: ошибка с НУЛЕВЫМ
-// счётом удаления (Once) и немедленная ошибка цикла (Loop).
+// TestConsumersTriageNilClientCounts — a nil client: an error with a
+// ZERO removal count (Once) and an immediate loop error (Loop).
 func TestConsumersTriageNilClientCounts(t *testing.T) {
 	removed, err := CleanupConsumersOnce(context.Background(), nil, ConsumerOptions{})
 	if err == nil {
@@ -138,13 +144,14 @@ func TestConsumersTriageNilClientCounts(t *testing.T) {
 	}
 }
 
-// TestConsumersTriageStreamLoopBreaks — ошибка пары (неизвестный стрим,
-// пустая группа) и сбой кандидата (перепроверка pending, гонка
-// оживления, сбой DELCONSUMER) не разрывают проход: группы после
-// сбойной чистятся, второй кандидат сбойной группы тоже обрабатывается.
+// TestConsumersTriageStreamLoopBreaks — a pair error (an unknown stream,
+// an empty group) and a candidate failure (a pending recheck, a revival
+// race, a DELCONSUMER failure) do not break the pass: the groups after
+// the failed one are cleaned up, the second candidate of the failed
+// group is processed too.
 func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
-	// Неизвестный стрим сортируется РАНЬШЕ рабочего: break остановил бы
-	// проход до рабочей группы.
+	// The unknown stream sorts BEFORE the working one: a break would
+	// stop the pass before the working group.
 	f := &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
 			StreamDNS + "|dns-worker": {{Name: "dns-worker-1", Pending: 0, Idle: 3 * time.Hour}},
@@ -162,7 +169,7 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		t.Errorf("после сбойной пары: удалено %d, DELCONSUMER %v — рабочий стрим обязан чиститься", removed, f.delCalls())
 	}
 
-	// Пустая группа той же карты — тоже не разрывает обход.
+	// An empty group of the same map — also does not break the walk.
 	f = &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
 			StreamDNS + "|dns-worker": {{Name: "dns-worker-1", Pending: 0, Idle: 3 * time.Hour}},
@@ -180,8 +187,8 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		t.Errorf("после пустой группы: удалено %d, хочу 1", removed)
 	}
 
-	// Внутри группы: сбой перепроверки у первого кандидата — второй всё
-	// равно удаляется; ошибка первого возвращается.
+	// Inside a group: a recheck failure at the first candidate — the
+	// second is removed anyway; the first one's error is returned.
 	f = &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
 			StreamHTTP + "|http-worker": {
@@ -203,8 +210,8 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		t.Errorf("удалено %d, хочу 1 (второй кандидат после сбойной перепроверки)", removed)
 	}
 
-	// Гонка оживления у первого (перепроверка увидела pending) — второй
-	// кандидат удаляется.
+	// A revival race at the first one (the recheck saw pending) — the
+	// second candidate is removed.
 	f = &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
 			StreamHTTP + "|http-worker": {
@@ -227,8 +234,9 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		t.Errorf("удалено %d, хочу 1 (после гонки оживления первого)", removed)
 	}
 
-	// Сбой DELCONSUMER первого — ошибка с нулевым счётом этой попытки;
-	// второй кандидат удаляется (continue, не break).
+	// A DELCONSUMER failure of the first one — an error with a zero count
+	// of this attempt; the second candidate is removed (continue, not
+	// break).
 	tf := &triConsumersFake{
 		fakeConsumers: &fakeConsumers{
 			lists: map[string][]redis.XInfoConsumer{
@@ -258,8 +266,8 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		t.Errorf("DELCONSUMER %v, хочу обе попытки", dels)
 	}
 
-	// Одиночный кандидат со сбоем DELCONSUMER: ошибка, счёт строго 0
-	// (инкремент — только после успеха).
+	// A single candidate with a DELCONSUMER failure: an error, the count
+	// is strictly 0 (the increment — only after a success).
 	tf = &triConsumersFake{
 		fakeConsumers: &fakeConsumers{
 			lists: map[string][]redis.XInfoConsumer{
@@ -280,10 +288,11 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 	}
 }
 
-// TestConsumersTriageEmptyGroupKnownStream — пустая группа ИЗВЕСТНОГО
-// стрима (ветка group == "" — известность проверяется раньше): пара
-// пропускается с ошибкой, обход продолжается (break рвал бы хвост —
-// кейс «q:aaa» выше закрыл только ветку неизвестного стрима).
+// TestConsumersTriageEmptyGroupKnownStream — an empty group of a KNOWN
+// stream (the group == "" branch — the known-ness is checked earlier):
+// the pair is skipped with an error, the walk continues (a break would
+// tear the tail — the "q:aaa" case above covered only the unknown stream
+// branch).
 func TestConsumersTriageEmptyGroupKnownStream(t *testing.T) {
 	f := &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
@@ -292,8 +301,8 @@ func TestConsumersTriageEmptyGroupKnownStream(t *testing.T) {
 		pendRes: map[string][]redis.XPendingExt{},
 	}
 	removed, err := CleanupConsumersOnce(context.Background(), f, ConsumerOptions{
-		// q:dns (пустая группа) сортируется раньше q:http: break
-		// остановил бы проход до рабочей пары.
+		// q:dns (an empty group) sorts before q:http: a break would stop
+		// the pass before the working pair.
 		Groups: map[string]string{StreamDNS: "", StreamHTTP: "http-worker"},
 		Idle:   time.Hour,
 	})
@@ -305,11 +314,11 @@ func TestConsumersTriageEmptyGroupKnownStream(t *testing.T) {
 	}
 }
 
-// TestConsumersTriageSortedStreamOrder — пары обходятся по возрастанию
-// имён стримов (детерминированный порядок ошибок и логов прохода):
-// карта Go итерируется случайно, без сортировки порядок прыгал бы.
-// Проход повторяется: случайный порядок хоть раз даёт сбой
-// (вероятность промаха (1/6)^число повторов).
+// TestConsumersTriageSortedStreamOrder — the pairs are walked in
+// ascending stream name order (a deterministic order of the pass errors
+// and logs): a Go map iterates randomly, without sorting the order would
+// jump. The pass is repeated: a random order fails at least once (the
+// miss probability (1/6)^number of repeats).
 func TestConsumersTriageSortedStreamOrder(t *testing.T) {
 	groups := map[string]string{StreamHTTP: "", StreamDNS: "", StreamAnalyze: ""}
 	for i := 0; i < 50; i++ {
@@ -325,10 +334,10 @@ func TestConsumersTriageSortedStreamOrder(t *testing.T) {
 	}
 }
 
-// TestConsumersTriagePendingWindow — перепроверка PEL кандидата: окно
-// гонки сжато до ОДНОЙ записи (Count 1, диапазон «-»…«+», ровно этот
-// консьюмер); унесённый DELCONSUMER-ом pending в одну запись — уже
-// гонка (ошибка оператору).
+// TestConsumersTriagePendingWindow — the candidate's PEL recheck: the
+// race window is shrunk to ONE entry (Count 1, the "-"…"+" range,
+// exactly this consumer); a pending of one entry carried away by a
+// DELCONSUMER is already a race (an error to the operator).
 func TestConsumersTriagePendingWindow(t *testing.T) {
 	f := &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
@@ -350,7 +359,8 @@ func TestConsumersTriagePendingWindow(t *testing.T) {
 		t.Errorf("XPENDING EXTENDED %+v: хочу Count=1 Start=- End=+ (минимальное окно гонки)", a)
 	}
 
-	// Одна унесённая PEL-запись — уже недоставка навсегда: ошибка.
+	// One PEL entry carried away is already an undeliverable-forever
+	// case: an error.
 	f = &fakeConsumers{
 		lists: map[string][]redis.XInfoConsumer{
 			StreamDNS + "|dns-worker": {{Name: "dns-worker-1", Pending: 0, Idle: 3 * time.Hour}},
@@ -368,10 +378,11 @@ func TestConsumersTriagePendingWindow(t *testing.T) {
 
 // --- infra.go --------------------------------------------------------------
 
-// TestInfraCauseTriagePlainStrings — ответы сервера на ГОЛЫХ строках:
-// Is*-хелперы go-redis имеют строковый fallback, а обход префиксов в
-// infraCause требует интерфейса redis.Error — классификация голых строк
-// держится ровно дизъюнктами Is*-цепочки (их удаление молчало бы).
+// TestInfraCauseTriagePlainStrings — server answers on BARE strings: the
+// go-redis Is* helpers have a string fallback, while the prefix walk in
+// infraCause requires the redis.Error interface — the classification of
+// bare strings rests exactly on the disjuncts of the Is* chain (removing
+// them would stay silent).
 func TestInfraCauseTriagePlainStrings(t *testing.T) {
 	cases := []struct {
 		text string
@@ -390,7 +401,7 @@ func TestInfraCauseTriagePlainStrings(t *testing.T) {
 			t.Errorf("infraCause(%q) = %v, хочу %v", c.text, got, c.want)
 		}
 	}
-	// Транспорт в обёртке: неожиданный EOF и закрытый клиент.
+	// Transport inside a wrapper: an unexpected EOF and a closed client.
 	if !infraCause(fmt.Errorf("queue: publish: %w", io.ErrUnexpectedEOF)) {
 		t.Error("io.ErrUnexpectedEOF в обёртке — инфраструктурный сбой")
 	}
@@ -401,14 +412,16 @@ func TestInfraCauseTriagePlainStrings(t *testing.T) {
 
 // --- redisq.go -------------------------------------------------------------
 
-// TestPublishRetryTriageStops — повторы XADD: успех раньше исчерпания
-// повторов останавливает серию (лишних XADD нет); не-инфраструктурная
-// ошибка в середине серии — останов без дожигания попыток.
+// TestPublishRetryTriageStops — the XADD retries: a success before the
+// retries are exhausted stops the series (no extra XADDs); a
+// non-infrastructure error in the middle of the series — a stop without
+// an attempt burn-down.
 func TestPublishRetryTriageStops(t *testing.T) {
 	msg := DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}
 
-	// Первый XADD — OOM, второй проходит: серия закончена, третий вызов
-	// не нужен (останов по успеху, а не по исчерпанию).
+	// The first XADD — OOM, the second goes through: the series is
+	// finished, the third call is not needed (a stop by success, not by
+	// exhaustion).
 	fake := &fakeRedis{addErrs: []error{oomErr}}
 	q := NewRedisQueue(fake, RedisOptions{PublishRetries: 2, PublishRetryPause: time.Nanosecond})
 	if _, err := q.Publish(context.Background(), StreamDNS, msg); err != nil {
@@ -418,8 +431,9 @@ func TestPublishRetryTriageStops(t *testing.T) {
 		t.Errorf("вызовов XADD %d, хочу 2 (успех второго — серия остановлена)", len(fake.adds))
 	}
 
-	// OOM, затем не-инфраструктурная ошибка: повтор бессмыслен — серия
-	// остановлена на ней, итог — та же ошибка без маркера InfraError.
+	// OOM, then a non-infrastructure error: a retry is pointless — the
+	// series is stopped on it, the result — the same error without the
+	// InfraError marker.
 	fake = &fakeRedis{addErrs: []error{oomErr, errors.New("ERR wrong number of arguments")}}
 	q = NewRedisQueue(fake, RedisOptions{PublishRetries: 2, PublishRetryPause: time.Nanosecond})
 	_, err := q.Publish(context.Background(), StreamDNS, msg)
@@ -433,10 +447,11 @@ func TestPublishRetryTriageStops(t *testing.T) {
 
 // --- reliab.go -------------------------------------------------------------
 
-// TestReliabTriagePins — литеральные пины констант: TTL пробы записи (с
-// запасом больше максимума redis.recover_interval 1 ч) и бюджетные
-// оценки байта на запись (замер MEMORY USAGE T-141/T-092 — основание
-// потолков DefaultStreamMaxLen, docs/redis.md §3.1).
+// TestReliabTriagePins — literal pins of the constants: the write probe
+// TTL (with a margin above the redis.recover_interval maximum of 1 h)
+// and the budget per-entry byte estimates (the MEMORY USAGE measurement
+// of T-141/T-092 — the basis of the DefaultStreamMaxLen caps,
+// docs/redis.md §3.1).
 func TestReliabTriagePins(t *testing.T) {
 	if writeProbeTTL != 2*time.Hour {
 		t.Errorf("writeProbeTTL = %s, хочу ровно 2ч", writeProbeTTL)
@@ -452,10 +467,11 @@ func TestReliabTriagePins(t *testing.T) {
 	}
 }
 
-// TestReliabTriageRefundArgs — защита аргументов возврата попыток:
-// пустая группа/потребитель при непустой пачке — ошибка ДО Redis;
-// пустая пачка — прозрачный nil независимо от группы; Refund без окна
-// Do и RefundUnclassified без окна — прозрачный nil без команд.
+// TestReliabTriageRefundArgs — the argument guards of the attempt
+// refund: an empty group/consumer with a non-empty batch — an error
+// BEFORE Redis; an empty batch — a transparent nil regardless of the
+// group; Refund without the Do window and RefundUnclassified without it
+// — a transparent nil without commands.
 func TestReliabTriageRefundArgs(t *testing.T) {
 	claimed := []Claimed{{Delivery{StreamHTTP, "1-1", []byte(`{"task_id":"t1"}`)}, 2}}
 
@@ -475,7 +491,7 @@ func TestReliabTriageRefundArgs(t *testing.T) {
 		t.Errorf("Refund(nil-пачка): %v, хочу nil", err)
 	}
 
-	// RefundUnclassified: те же защиты.
+	// RefundUnclassified: the same guards.
 	ds := []Delivery{{Stream: StreamHTTP, ID: "1-1", Payload: []byte(`{"task_id":"t1"}`)}}
 	fake = &fakeClaimRedis{}
 	r = newTestReliab(fake, ReliabOptions{})
@@ -489,8 +505,8 @@ func TestReliabTriageRefundArgs(t *testing.T) {
 		t.Errorf("RefundUnclassified пустой пачки: %v, хочу прозрачный nil", err)
 	}
 
-	// Клиент без окна Do: оба возврата прозрачны, попытки расходованы
-	// как до T-222 — ни команд, ни чтений.
+	// A client without the Do window: both refunds are transparent, the
+	// attempts are spent as before T-222 — no commands, no reads.
 	claimOnly := struct{ claimStreams }{&fakeClaimRedis{}}
 	ro := NewReliab(claimOnly, NewRedisQueue(claimOnly.claimStreams.(*fakeClaimRedis), RedisOptions{}), ReliabOptions{})
 	emptyFake := claimOnly.claimStreams.(*fakeClaimRedis)
@@ -505,12 +521,12 @@ func TestReliabTriageRefundArgs(t *testing.T) {
 	}
 }
 
-// TestReliabTriageUnclassifiedContinue — классификация не обрывается на
-// первой записи: сбой чтения счётчика или покинувшая PEL запись
-// пропускаются, остальные записи получают возврат попытки.
+// TestReliabTriageUnclassifiedContinue — the classification does not
+// break at the first entry: a counter read failure or an entry that left
+// the PEL is skipped, the other entries get their attempt refund.
 func TestReliabTriageUnclassifiedContinue(t *testing.T) {
-	// Первый — сбой чтения счётчика: ошибка в возврате, второй всё
-	// равно возвращён (continue, не break).
+	// The first — a counter read failure: an error in the return, the
+	// second is refunded anyway (continue, not break).
 	fake := &fakeClaimRedis{
 		pendOneErr: map[string]error{"1-1": errors.New("connection reset")},
 		pendRes:    map[string][]redis.XPendingExt{"1-2": {{ID: "1-2", RetryCount: 2}}},
@@ -527,8 +543,8 @@ func TestReliabTriageUnclassifiedContinue(t *testing.T) {
 		t.Errorf("возврат %v, хочу команду только для 1-2", fake.dos)
 	}
 
-	// Первая запись покинула PEL (пустой ответ): возврата не требует,
-	// вторая возвращена.
+	// The first entry left the PEL (an empty answer): it needs no refund,
+	// the second is refunded.
 	fake = &fakeClaimRedis{
 		pendRes: map[string][]redis.XPendingExt{"1-2": {{ID: "1-2", RetryCount: 2}}},
 	}
@@ -542,9 +558,9 @@ func TestReliabTriageUnclassifiedContinue(t *testing.T) {
 
 // --- trim.go ---------------------------------------------------------------
 
-// triTrimFake — fakeTrim с ошибками XTRIM/XLEN и подсчётом вызовов XLEN
-// (базовый фейк не умеет ни того, ни другого): глушение ошибок команд и
-// лишние чтения длины.
+// triTrimFake — a fakeTrim with XTRIM/XLEN errors and an XLEN call count
+// (the base fake can do neither): muting the command errors and extra
+// length reads.
 type triTrimFake struct {
 	*fakeTrim
 	trimErr   error
@@ -572,7 +588,7 @@ func (f *triTrimFake) XLen(ctx context.Context, key string) *redis.IntCmd {
 	return redis.NewIntResult(f.xlen[key], nil)
 }
 
-// triTrimStreamOnce — TrimOnce по одному стриму (сокращение).
+// triTrimStreamOnce — TrimOnce over a single stream (a shorthand).
 func triTrimStreamOnce(t *testing.T, rdb trimStreams, opts TrimOptions) (int64, []string, error) {
 	t.Helper()
 	o := opts
@@ -580,11 +596,12 @@ func triTrimStreamOnce(t *testing.T, rdb trimStreams, opts TrimOptions) (int64, 
 	return TrimOnce(context.Background(), rdb, o)
 }
 
-// TestTrimTriageErrors — ошибки шагов прохода: чтение групп (кроме
-// «нет ключа»), pending, XTRIM, XLEN — ошибки прохода с нулевым (или
-// точным для XLEN) счётом; после сбоя XTRIM длина не читается.
+// TestTrimTriageErrors — pass step errors: reading the groups (except
+// "no key"), pending, XTRIM, XLEN — pass errors with a zero count (or
+// the exact one for XLEN); after an XTRIM failure the length is not
+// read.
 func TestTrimTriageErrors(t *testing.T) {
-	// Прочая ошибка XINFO GROUPS — ошибка (нет ключа — нет, см. ниже).
+	// Any other XINFO GROUPS error — an error (no key — no, see below).
 	f := &triTrimFake{fakeTrim: &fakeTrim{
 		groupsErr: map[string]error{StreamDNS: errors.New("connection reset")},
 	}}
@@ -596,7 +613,8 @@ func TestTrimTriageErrors(t *testing.T) {
 		t.Errorf("удалено %d при ошибке, хочу 0", n)
 	}
 
-	// Ошибка XPENDING группы — стрим пропущен с ошибкой, счёт 0.
+	// An XPENDING error of the group — the stream is skipped with an
+	// error, the count is 0.
 	f = &triTrimFake{fakeTrim: &fakeTrim{
 		groups:  map[string][]redis.XInfoGroup{StreamDNS: {{Name: "dns", Pending: 3, LastDeliveredID: "105-0"}}},
 		pendErr: map[string]error{StreamDNS + "|dns": errors.New("connection reset")},
@@ -609,8 +627,8 @@ func TestTrimTriageErrors(t *testing.T) {
 		t.Errorf("удалено %d при ошибке pending, хочу 0", n)
 	}
 
-	// Ошибка XTRIM — ошибка прохода, счёт 0, XLEN не читается
-	// (возвращение раньше чтения сигнала).
+	// An XTRIM error — a pass error, the count is 0, the XLEN is not
+	// read (returning before the signal read).
 	f = &triTrimFake{fakeTrim: &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{StreamDNS: {{Name: "dns", Pending: 0, LastDeliveredID: "42-1"}}},
 	}, trimErr: errors.New("OOM command not allowed")}
@@ -622,8 +640,9 @@ func TestTrimTriageErrors(t *testing.T) {
 		t.Errorf("XTRIM-сбой: (удалено %d, XLEN %d), хочу (0, 0)", n, f.xlenCalls)
 	}
 
-	// Ошибка XLEN — ошибка прохода (счёт стрима при ошибке пассом не
-	// принимается: trimmed не растёт, длина — сигнал, не инвариант).
+	// An XLEN error — a pass error (the stream's count is not accepted
+	// by the pass on an error: trimmed does not grow, the length is a
+	// signal, not an invariant).
 	f = &triTrimFake{fakeTrim: &fakeTrim{
 		groups:    map[string][]redis.XInfoGroup{StreamDNS: {{Name: "dns", Pending: 0, LastDeliveredID: "42-1"}}},
 		trimCount: 7,
@@ -635,12 +654,13 @@ func TestTrimTriageErrors(t *testing.T) {
 	if n != 0 {
 		t.Errorf("удалено %d при ошибке XLEN, хочу 0 (счёт сбойного стрима не принимается)", n)
 	}
-	// Сам XTRIM до ошибки длины выполнен.
+	// The XTRIM itself ran before the length error.
 	if len(f.trims) != 1 {
 		t.Errorf("XTRIM до ошибки XLEN: %+v, хочу одну обрезку", f.trims)
 	}
 
-	// nil-клиент: ошибка с нулевым счётом; цикл — немедленная ошибка.
+	// A nil client: an error with a zero count; the loop — an immediate
+	// error.
 	n, _, err = TrimOnce(context.Background(), nil, TrimOptions{})
 	if err == nil || n != 0 {
 		t.Errorf("nil-клиент TrimOnce: (%d, %v), хочу (0, ошибка)", n, err)
@@ -657,14 +677,15 @@ func TestTrimTriageErrors(t *testing.T) {
 	}
 }
 
-// TestTrimTriagePointAndStuck — точка обрезки на границах: pending
-// ровно в одну запись (XINFO Pending 1 и XPENDING Count 1) — точка по
-// старейшей pending; гонка «всё подтвердили между XINFO и XPENDING»
-// (Count 0) — точка остаётся last-delivered-id группы; сумма обрезки —
-// по всем стримам; сигнал застрявшего префикса — ровно на 3/4 предела
-// и при явном пределе 1.
+// TestTrimTriagePointAndStuck — the trim point at the boundaries: a
+// pending of exactly one entry (XINFO Pending 1 and XPENDING Count 1) —
+// the point at the oldest pending; the race "everything was acknowledged
+// between XINFO and XPENDING" (Count 0) — the point stays at the group's
+// last-delivered-id; the trim total — across all streams; the stuck
+// prefix signal — exactly at 3/4 of the limit and with an explicit
+// limit of 1.
 func TestTrimTriagePointAndStuck(t *testing.T) {
-	// Pending == 1 (граничит с пропуском проверки PEL).
+	// Pending == 1 (borders on skipping the PEL check).
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{StreamDNS: {{Name: "dns", Pending: 1, LastDeliveredID: "105-0"}}},
 		pend:   map[string]redis.XPending{StreamDNS + "|dns": {Count: 1, Lower: "101-0"}},
@@ -676,15 +697,16 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 		t.Errorf("XTRIM %+v, хочу MINID 101-0 (pending в одну запись — тоже PEL)", f.trims)
 	}
 
-	// Гонка: XINFO показал pending, XPENDING — уже пусто (Count 0):
-	// cand остаётся last-delivered-id гоночной группы (меньший id —
-	// именно он обязан выиграть минимум; пустой Lower его не затирает).
+	// A race: XINFO showed pending, XPENDING — already empty (Count 0):
+	// cand stays at the racing group's last-delivered-id (the smaller id
+	// — exactly it must win the minimum; an empty Lower does not wipe
+	// it).
 	f = &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{StreamDNS: {
 			{Name: "a", Pending: 1, LastDeliveredID: "50-0"},
 			{Name: "b", Pending: 0, LastDeliveredID: "105-0"},
 		}},
-		pend: map[string]redis.XPending{StreamDNS + "|a": {}}, // Count 0 — гонка
+		pend: map[string]redis.XPending{StreamDNS + "|a": {}}, // Count 0 — the race
 	}
 	if _, _, err := triTrimStreamOnce(t, f, TrimOptions{}); err != nil {
 		t.Fatalf("TrimOnce: %v", err)
@@ -693,7 +715,8 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 		t.Errorf("XTRIM %+v, хочу MINID 50-0 (пустая перепроверка не сбрасывает точку)", f.trims)
 	}
 
-	// Сумма по стримам: два стрима по 7 удалённых — итого 14.
+	// The sum across streams: two streams of 7 removed each — 14 in
+	// total.
 	f = &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{
 			StreamDNS:    {{Name: "dns", Pending: 0, LastDeliveredID: "42-1"}},
@@ -712,7 +735,8 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 		t.Errorf("удалено %d, хочу 21 (сумма по трём стримам)", n)
 	}
 
-	// Ровно 3/4 предела — уже застрявший префикс (length*4 == limit*3).
+	// Exactly 3/4 of the limit — already a stuck prefix
+	// (length*4 == limit*3).
 	f = &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{StreamDNS: {{Name: "dns", Pending: 0, LastDeliveredID: "42-1"}}},
 		xlen:   map[string]int64{StreamDNS: 3},
@@ -725,7 +749,8 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 		t.Errorf("застрявшие %v при XLEN 3/4 = потолок 4, хочу сигнал", stuck)
 	}
 
-	// Явный предел 1 — законное значение (дефолт только для 0).
+	// An explicit limit of 1 — a legitimate value (the default only for
+	// 0).
 	f = &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{StreamDNS: {{Name: "dns", Pending: 0, LastDeliveredID: "42-1"}}},
 		xlen:   map[string]int64{StreamDNS: 2},
@@ -739,9 +764,10 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 	}
 }
 
-// TestTrimTriageNoGroupsNoXLen — стрим без групп (как q:dead): пустой
-// проход БЕЗ чтения длины — сигналящий XLEN не зовётся (после удаления
-// раннего возврата проход шёл бы читать длину пустому стриму).
+// TestTrimTriageNoGroupsNoXLen — a stream without groups (like q:dead):
+// an empty pass WITHOUT a length read — the signaling XLEN is not called
+// (after removing the early return the pass would go read the length of
+// an empty stream).
 func TestTrimTriageNoGroupsNoXLen(t *testing.T) {
 	f := &triTrimFake{fakeTrim: &fakeTrim{groups: map[string][]redis.XInfoGroup{}}}
 	n, stuck, err := triTrimStreamOnce(t, f, TrimOptions{})
@@ -755,7 +781,7 @@ func TestTrimTriageNoGroupsNoXLen(t *testing.T) {
 		t.Errorf("XLEN без групп: %d вызовов, хочу 0", f.xlenCalls)
 	}
 
-	// Неизвестный стрим — ошибка с нулевым счётом.
+	// An unknown stream — an error with a zero count.
 	f2 := &triTrimFake{fakeTrim: &fakeTrim{}}
 	n, _, err = TrimOnce(context.Background(), f2, TrimOptions{Streams: []string{"q:typo"}})
 	if err == nil || n != 0 {
@@ -763,13 +789,14 @@ func TestTrimTriageNoGroupsNoXLen(t *testing.T) {
 	}
 }
 
-// TestTrimTriageLateGroupContributes — группа без доставок (cand == "")
-// не ограничивает точку и не прекращает обход: более поздняя группа
-// даёт XTRIM по своей точке (break после пустого cand молчал бы).
+// TestTrimTriageLateGroupContributes — a group without deliveries
+// (cand == "") does not constrain the point and does not stop the walk:
+// a later group gives an XTRIM at its point (a break after an empty cand
+// would stay silent).
 func TestTrimTriageLateGroupContributes(t *testing.T) {
 	f := &fakeTrim{
 		groups: map[string][]redis.XInfoGroup{StreamDNS: {
-			{Name: "a", Pending: 0, LastDeliveredID: ""}, // ничего не доставляла
+			{Name: "a", Pending: 0, LastDeliveredID: ""}, // delivered nothing
 			{Name: "b", Pending: 0, LastDeliveredID: "5-0"},
 		}},
 	}
@@ -783,9 +810,9 @@ func TestTrimTriageLateGroupContributes(t *testing.T) {
 
 // --- tarpit.go -------------------------------------------------------------
 
-// TestTarpitTriageZeroCountOnErrors — все ошибки Track (валидация и
-// команды) возвращают строго нулевую мощность: потребитель решает по
-// номеру доставки PEL, положительный счёт при ошибке лгал бы.
+// TestTarpitTriageZeroCountOnErrors — all Track errors (validation and
+// commands) return a strictly zero cardinality: the consumer decides by
+// the PEL delivery number, a positive count on an error would lie.
 func TestTarpitTriageZeroCountOnErrors(t *testing.T) {
 	ctx := context.Background()
 	validation := []struct {
@@ -822,7 +849,7 @@ func TestTarpitTriageZeroCountOnErrors(t *testing.T) {
 		}
 	}
 
-	// TTL в 1 нс — законное положительное значение: отметка ставится.
+	// A TTL of 1 ns — a legitimate positive value: the mark is set.
 	f := newFakeTarpitRedis()
 	if n, err := NewTarpitCounter(f).Track(ctx, "t1", "e1#1", time.Nanosecond); err != nil || n != 1 {
 		t.Errorf("TTL 1ns: (%d, %v), хочу (1, nil) — положительный TTL не отбрасывается", n, err)
@@ -831,10 +858,11 @@ func TestTarpitTriageZeroCountOnErrors(t *testing.T) {
 
 // --- recover.go ------------------------------------------------------------
 
-// TestRecoverLoopTriageNoClaimAfterCancel — полная пачка (n == Batch)
-// ведёт цикл сразу к следующему проходу: после отмены ctx обработчиком
-// следующий клейм НЕ выполняется — возврат по ctx до пробы и клейма
-// (глушение проверки гнало бы клейм по отменённому контексту).
+// TestRecoverLoopTriageNoClaimAfterCancel — a full batch (n == Batch)
+// leads the loop straight to the next pass: after the handler cancels
+// the ctx, the next claim is NOT executed — the return by ctx before the
+// probe and the claim (muting the check would drive a claim on a
+// canceled context).
 func TestRecoverLoopTriageNoClaimAfterCancel(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -851,12 +879,12 @@ func TestRecoverLoopTriageNoClaimAfterCancel(t *testing.T) {
 	started := make(chan struct{})
 	go func() {
 		done <- RecoverLoop(ctx, r, func(c context.Context, _ Delivery) error {
-			close(started) // единственная доставка начата
-			<-c.Done()     // блокируемся до отмены — цикл в проходе полной пачки
+			close(started) // the only delivery has started
+			<-c.Done()     // block until the cancel — the loop is in a full-batch pass
 			return nil
 		}, RecoverOptions{
 			Stream: StreamHTTP, Group: "http", Consumer: "recover-1",
-			Batch: 1, Interval: time.Hour, // тик не наступит: выход — только по ctx
+			Batch: 1, Interval: time.Hour, // the tick will not fire: the exit — only via ctx
 		})
 	}()
 	<-started
@@ -869,7 +897,7 @@ func TestRecoverLoopTriageNoClaimAfterCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("RecoverLoop не завершился после отмены ctx")
 	}
-	// Клейм ровно один: повторного клейма по отменённому ctx нет.
+	// Exactly one claim: no repeated claim on the canceled ctx.
 	time.Sleep(50 * time.Millisecond)
 	if n := fake.claimsCount(); n != 1 {
 		t.Errorf("клеймов после отмены ctx: %d, хочу 1 (выход до пробы записи и клейма)", n)
@@ -879,6 +907,7 @@ func TestRecoverLoopTriageNoClaimAfterCancel(t *testing.T) {
 	}
 }
 
-// claimsCount — снимок числа клеймов (fakeClaimRedis.claims без мьютекса
-// читается только после завершения горутины цикла — гонки нет).
+// claimsCount — a snapshot of the claim count (fakeClaimRedis.claims
+// without a mutex is read only after the loop goroutine finishes — no
+// race).
 func (f *fakeClaimRedis) claimsCount() int { return len(f.claims) }

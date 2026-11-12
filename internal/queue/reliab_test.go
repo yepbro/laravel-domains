@@ -1,10 +1,11 @@
-// Тесты надёжности доставки (T-025) без живого Redis: фейк расширяет окно
-// команд redisq_test.go командами claimStreams — XAUTOCLAIM и XPENDING
-// EXTENDED. У этих команд go-redis не имеет фабрик New*Result, поэтому фейк
-// строит команды redis.NewXAutoClaimCmd/NewXPendingExtCmd и заполняет их
-// SetVal/SetErr. Проверяются аргументы команд, счётчик попыток, перевод в
-// q:dead (формат Dead), порядок «обработка → БД → XACK». Реальная
-// семантика Redis — интеграционные тесты T-032.
+// Tests of delivery reliability (T-025) without a live Redis: the fake
+// extends the redisq_test.go command window with the claimStreams
+// commands — XAUTOCLAIM and XPENDING EXTENDED. go-redis has no
+// New*Result factories for these commands, so the fake builds the
+// redis.NewXAutoClaimCmd/NewXPendingExtCmd commands and fills them with
+// SetVal/SetErr. Covered: the command arguments, the attempt counter,
+// the move to q:dead (the Dead format), the "processing → DB → XACK"
+// order. The real Redis semantics — the integration tests of T-032.
 
 package queue
 
@@ -21,31 +22,34 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// fakeClaimRedis — фейк redisq_test.go плюс команды возврата зависших.
+// fakeClaimRedis — the redisq_test.go fake plus the stuck-entry return
+// commands.
 type fakeClaimRedis struct {
 	fakeRedis
 
 	claims    []redis.XAutoClaimArgs
 	claimMsgs []redis.XMessage
-	claimNext string // курсор следующего сканирования из ответа
+	claimNext string // the next-scan cursor from the answer
 	claimErr  error
 
 	pends      []redis.XPendingExtArgs
-	pendRes    map[string][]redis.XPendingExt // ответ XPENDING по Start-идентификатору
+	pendRes    map[string][]redis.XPendingExt // the XPENDING answer by the Start identifier
 	pendErr    error
-	pendOneErr map[string]error // ошибка XPENDING по конкретному Start-идентификатору
-	// pendFailOnce — одноразовая ошибка XPENDING по Start-идентификатору:
-	// первый вызов падает, последующие отвечают заготовкой. Модель
-	// transient-сбоя классификации (ФТ-6.2): чтение счётчика при клейме
-	// сбойнуло, повторное чтение при возврате попытки — успешно.
+	pendOneErr map[string]error // an XPENDING error for a specific Start identifier
+	// pendFailOnce — a one-shot XPENDING error by the Start identifier:
+	// the first call fails, the subsequent ones answer with the stub. A
+	// model of the transient classification failure (FR-6.2): the counter
+	// read at the claim failed, the repeated read at the attempt refund —
+	// succeeded.
 	pendFailOnce map[string]error
-	// pendCtxFail — XPENDING по отменённому ctx отвечает ошибкой ctx
-	// (как живый клиент): тесты классификации после отмены (T-222).
+	// pendCtxFail — XPENDING on a canceled ctx answers with the ctx error
+	// (like the live client): the tests of classification after a cancel
+	// (T-222).
 	pendCtxFail bool
 
-	// dos — зафиксированные вызовы Do (возврат попыток, T-222): сырые
-	// аргументы команды XCLAIM … JUSTID RETRYCOUNT; doErr — заготовленная
-	// ошибка всех вызовов.
+	// dos — the recorded Do calls (attempt refunds, T-222): the raw
+	// arguments of the XCLAIM … JUSTID RETRYCOUNT command; doErr — the
+	// stubbed error of all calls.
 	dos   [][]interface{}
 	doErr error
 }
@@ -54,9 +58,9 @@ func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs
 	f.claims = append(f.claims, *a)
 	msgs := f.claimMsgs
 	if f.claimErr == nil && len(msgs) > 0 {
-		// Живой клейм возвращает до Count записей и закрепляет их
-		// (idle сброшен — повторный вызов не вернёт); остаток PEL —
-		// следующим вызовам.
+		// A live claim returns up to Count entries and assigns them (the
+		// idle is reset — a repeated call will not return them); the rest
+		// of the PEL — to the next calls.
 		if int64(len(msgs)) > a.Count {
 			msgs = msgs[:a.Count]
 			f.claimMsgs = f.claimMsgs[a.Count:]
@@ -84,7 +88,7 @@ func (f *fakeClaimRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtAr
 		return cmd
 	}
 	if err, ok := f.pendFailOnce[a.Start]; ok {
-		delete(f.pendFailOnce, a.Start) // одноразовая: следующий вызов успешен
+		delete(f.pendFailOnce, a.Start) // one-shot: the next call succeeds
 		cmd.SetVal(nil)
 		cmd.SetErr(err)
 		return cmd
@@ -94,9 +98,9 @@ func (f *fakeClaimRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtAr
 	return cmd
 }
 
-// Do — окно возврата попыток (claimRefunder, T-222): записывает сырые
-// аргументы команды (XCLAIM … JUSTID RETRYCOUNT) и отвечает заготовкой
-// (возврату достаточно Err).
+// Do — the refund window (claimRefunder, T-222): records the raw
+// arguments of the command (XCLAIM … JUSTID RETRYCOUNT) and answers with
+// the stub (the refund only needs Err).
 func (f *fakeClaimRedis) Do(ctx context.Context, args ...interface{}) *redis.Cmd {
 	f.dos = append(f.dos, args)
 	cmd := redis.NewCmd(ctx)
@@ -104,8 +108,8 @@ func (f *fakeClaimRedis) Do(ctx context.Context, args ...interface{}) *redis.Cmd
 	return cmd
 }
 
-// Компиляционные проверки: расширенный фейк взаимозаменяем с реальным
-// клиентом, Reliab собирается из клиента и Queue.
+// Compile-time checks: the extended fake is interchangeable with the
+// real client, Reliab is assembled from the client and the Queue.
 var (
 	_ claimStreams  = (*fakeClaimRedis)(nil)
 	_ claimStreams  = (*redis.Client)(nil)
@@ -113,8 +117,8 @@ var (
 	_ claimRefunder = (*redis.Client)(nil)
 )
 
-// newTestReliab — связка как в бою: очередь и слой надёжности на одном
-// фейковом клиенте.
+// newTestReliab — the wiring as in production: the queue and the
+// reliability layer on one fake client.
 func newTestReliab(fake *fakeClaimRedis, opt ReliabOptions) *Reliab {
 	return NewReliab(fake, NewRedisQueue(fake, RedisOptions{}), opt)
 }
@@ -133,7 +137,7 @@ func TestNewReliabDefaults(t *testing.T) {
 	if r.opt.MinIdle != DefaultClaimMinIdle {
 		t.Errorf("MinIdle: %s, хочу %s", r.opt.MinIdle, DefaultClaimMinIdle)
 	}
-	// Единичные значения валидны и не заменяются дефолтами.
+	// Single values are valid and are not replaced with the defaults.
 	r = newTestReliab(&fakeClaimRedis{}, ReliabOptions{MaxAttempts: 1, MinIdle: time.Nanosecond})
 	if r.opt.MaxAttempts != 1 {
 		t.Errorf("MaxAttempts = %d, хочу 1 (одна попытка — валидная настройка)", r.opt.MaxAttempts)
@@ -143,21 +147,21 @@ func TestNewReliabDefaults(t *testing.T) {
 	}
 }
 
-// TestStreamPolicyFitsBudget — инвариант бюджета стримов (T-141, ТЗ 3.2):
-// сумма аварийных потолков политики MAXLEN обязана укладываться в бюджет
-// Redis ≤ 512 МиБ (с запасом на служебную память) даже при большой
-// пачке q:dns — при noeviction потолок выше бюджета означал бы отказ
-// записи (OOM) раньше обрезки, как в инциденте T-093. Литерал пачки
-// здесь — верх нормативной вилки ТЗ 5.3; связка с фактической границей
-// валидации конфигурации — пин-тестом
-// config.TestSchedulerBatchFitsStreamBudget (config_test.go), который
-// считает от maxSchedulerBatchSize. Дефолт (пачка 1000): q:dns
-// 250 × 1000 × 66 Б ≈ 16 МиБ + 3 × 103 МиБ + фолбэк 15 000 ≈ 10 МиБ +
-// 2 МиБ ≈ 337 МиБ; худший случай (пачка 10 000) ≈ 478 МиБ — оба ниже
-// предела 480 МиБ.
+// TestStreamPolicyFitsBudget — the stream budget invariant (T-141,
+// spec 3.2): the sum of the MAXLEN policy emergency caps must fit the
+// Redis budget of ≤ 512 MiB (with a margin for the overhead memory) even
+// with a large q:dns batch — with noeviction a cap above the budget
+// would mean a write rejection (OOM) before the trim, as in the T-093
+// incident. The batch literal here — the top of the normative range of
+// spec 5.3; the link with the actual configuration validation boundary —
+// by the pin test config.TestSchedulerBatchFitsStreamBudget
+// (config_test.go), which computes from maxSchedulerBatchSize. The
+// default (a batch of 1000): q:dns 250 × 1000 × 66 B ≈ 16 MiB + 3 ×
+// 103 MiB + the fallback 15,000 ≈ 10 MiB + 2 MiB ≈ 337 MiB; the worst
+// case (a batch of 10,000) ≈ 478 MiB — both below the 480 MiB limit.
 func TestStreamPolicyFitsBudget(t *testing.T) {
 	const (
-		worstBatch  = 10_000 // верх нормативной вилки ТЗ 5.3
+		worstBatch  = 10_000 // the top of the normative range of spec 5.3
 		streamLimit = 480 << 20
 	)
 	total := DefaultStreamMaxLen(StreamDNS)*worstBatch*DNSStreamBytesPerDomain +
@@ -168,7 +172,8 @@ func TestStreamPolicyFitsBudget(t *testing.T) {
 		t.Errorf("сумма потолков стримов при пачке %d ≈ %d МиБ > %d МиБ — бюджет Redis 512 МиБ (ТЗ 3.2) пробит: пересогласуйте defaultMaxLen* / scheduler.batch_size (docs/redis.md §3.1)",
 			worstBatch, total>>20, streamLimit>>20)
 	}
-	// Дефолтная пачка — на порядок свободнее: проконтролировать запас.
+	// The default batch has an order of magnitude more headroom: check
+	// the margin.
 	def := DefaultStreamMaxLen(StreamDNS)*1000*DNSStreamBytesPerDomain +
 		3*DefaultStreamMaxLen(StreamHTTP)*UnitStreamBytesWorst +
 		DefaultStreamMaxLen(StreamRenderFallback)*UnitStreamBytesWorst +
@@ -178,8 +183,8 @@ func TestStreamPolicyFitsBudget(t *testing.T) {
 	}
 }
 
-// TestReliabClaim — аргументы XAUTOCLAIM и XPENDING, возврат записей с их
-// счётчиками попыток.
+// TestReliabClaim — the XAUTOCLAIM and XPENDING arguments, the return of
+// entries with their attempt counters.
 func TestReliabClaim(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -189,7 +194,7 @@ func TestReliabClaim(t *testing.T) {
 		claimNext: "1720-0",
 		pendRes: map[string][]redis.XPendingExt{
 			"1718-0": {{ID: "1718-0", Consumer: "dead-1", RetryCount: 2}},
-			"1719-0": {{ID: "1719-0", Consumer: "dead-1", RetryCount: 3}}, // последняя попытка — ещё в работу
+			"1719-0": {{ID: "1719-0", Consumer: "dead-1", RetryCount: 3}}, // the last attempt — still into the work
 		},
 	}
 	r := newTestReliab(fake, ReliabOptions{})
@@ -202,8 +207,8 @@ func TestReliabClaim(t *testing.T) {
 		t.Errorf("курсор следующего сканирования = %q, хочу %q (из ответа XAUTOCLAIM)", next, "1720-0")
 	}
 
-	// XAUTOCLAIM: тот же стрим/группа, закрепление за восстановителем,
-	// фильтр по простою, сканирование PEL с начала, лимит пачки.
+	// XAUTOCLAIM: the same stream/group, assignment to the recovery loop,
+	// the idle filter, the PEL scan from the beginning, the batch limit.
 	if len(fake.claims) != 1 {
 		t.Fatalf("вызовов XAUTOCLAIM: %d, хочу 1", len(fake.claims))
 	}
@@ -218,8 +223,8 @@ func TestReliabClaim(t *testing.T) {
 		t.Errorf("XAUTOCLAIM Start/Count: %q/%d, хочу 0-0/10", args.Start, args.Count)
 	}
 
-	// Явный курсор передаётся в XAUTOCLAIM без искажений (Q-07):
-	// вызывающий цикл продолжает обход PEL с сохранённой позиции.
+	// The explicit cursor is passed to XAUTOCLAIM undistorted (Q-07): the
+	// calling loop continues the PEL walk from the kept position.
 	if _, _, _, err := r.Claim(context.Background(), StreamHTTP, "http", "recover-1", 15*time.Minute, 10, "1750-3"); err != nil {
 		t.Fatalf("Claim с курсором: %v", err)
 	}
@@ -227,8 +232,8 @@ func TestReliabClaim(t *testing.T) {
 		t.Errorf("XAUTOCLAIM Start с курсором: %q, хочу 1750-3", got)
 	}
 
-	// Счётчик попыток — XPENDING EXTENDED по каждой записи (ровно её
-	// диапазон), поле RetryCount (deliveries-счётчик PEL).
+	// The attempt counter — XPENDING EXTENDED per entry (exactly its
+	// range), the RetryCount field (the entry's PEL deliveries counter).
 	if len(fake.pends) != 2 {
 		t.Fatalf("вызовов XPENDING: %d, хочу 2", len(fake.pends))
 	}
@@ -250,16 +255,17 @@ func TestReliabClaim(t *testing.T) {
 		t.Errorf("Claim:\n получил  %+v\n хочу     %+v", got, want)
 	}
 
-	// Обработанные записи не трогают q:dead и не подтверждаются клеймом:
-	// XACK — забота Processing после записи результата в БД.
+	// The processed entries do not touch q:dead and are not acknowledged
+	// by the claim: the XACK is Processing's job after the result is
+	// written to the DB.
 	if len(fake.adds) != 0 || len(fake.acks) != 0 {
 		t.Errorf("Claim не публикует и не подтверждает рабочие записи: %+v %+v", fake.adds, fake.acks)
 	}
 }
 
-// TestReliabClaimMinIdleDefault — minIdle 0 заменяется опцией, опция 0 —
-// значением по умолчанию; пустой старт нормализуется в "0-0", явный
-// минимальный minIdle не заменяется.
+// TestReliabClaimMinIdleDefault — a minIdle of 0 is replaced by the
+// option, an option of 0 — by the default; an empty start is normalized
+// into "0-0", an explicit minimum minIdle is not replaced.
 func TestReliabClaimMinIdleDefault(t *testing.T) {
 	fake := &fakeClaimRedis{}
 	r := newTestReliab(fake, ReliabOptions{})
@@ -282,7 +288,8 @@ func TestReliabClaimMinIdleDefault(t *testing.T) {
 		t.Errorf("MinIdle: %s, хочу 2m из опции", got)
 	}
 
-	// Явный minIdle 1нс валиден и не подменяется опцией слоя.
+	// An explicit minIdle of 1ns is valid and is not replaced by the
+	// layer's option.
 	fake = &fakeClaimRedis{}
 	r = newTestReliab(fake, ReliabOptions{MinIdle: time.Hour})
 	if _, _, _, err := r.Claim(context.Background(), StreamDNS, "dns", "recover-1", time.Nanosecond, 1, ""); err != nil {
@@ -293,10 +300,10 @@ func TestReliabClaimMinIdleDefault(t *testing.T) {
 	}
 }
 
-// TestReliabClaimDead — запись, чей счётчик выше лимита, не возвращается,
-// а переносится в q:dead (Dead с идентификаторами предмета задачи,
-// выжатыми из тела, без payload — T-105) и подтверждается в исходном
-// стриме.
+// TestReliabClaimDead — an entry whose counter is above the limit is not
+// returned but moved to q:dead (a Dead with the task's subject
+// identifiers extracted from the body, without payload — T-105) and is
+// acknowledged in the source stream.
 func TestReliabClaimDead(t *testing.T) {
 	origPayload := `{"task_id":"t1","zone_id":3,"domain_id":42,"name":"example.com"}`
 	fake := &fakeClaimRedis{
@@ -304,7 +311,7 @@ func TestReliabClaimDead(t *testing.T) {
 			{ID: "1718-0", Values: map[string]any{fieldData: []byte(origPayload)}},
 		},
 		pendRes: map[string][]redis.XPendingExt{
-			"1718-0": {{ID: "1718-0", Consumer: "old", RetryCount: 4}}, // лимит 3 исчерпан
+			"1718-0": {{ID: "1718-0", Consumer: "old", RetryCount: 4}}, // the limit of 3 is exhausted
 		},
 	}
 	r := newTestReliab(fake, ReliabOptions{})
@@ -317,7 +324,8 @@ func TestReliabClaimDead(t *testing.T) {
 		t.Errorf("исчерпавшая попытки запись возвращена в работу: %+v", got)
 	}
 
-	// Dead публикуется в q:dead до XACK исходной записи.
+	// The Dead is published to q:dead before the XACK of the original
+	// entry.
 	if len(fake.adds) != 1 {
 		t.Fatalf("публикаций в q:dead: %d, хочу 1", len(fake.adds))
 	}
@@ -345,23 +353,24 @@ func TestReliabClaimDead(t *testing.T) {
 		t.Errorf("Dead:\n получил  %+v\n хочу     %+v", dead, wantDead)
 	}
 
-	// Исходная запись покидает pending: XACK из стрима-источника.
+	// The original entry leaves the pending: XACK from the source stream.
 	if want := []ackCall{{StreamRender, "render", []string{"1718-0"}}}; !reflect.DeepEqual(fake.acks, want) {
 		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
 	}
 }
 
-// TestReliabClaimDeadByteGuard (T-105) — запись q:dead не раздувается
-// payload исходной задачи: пачка q:dns (~250 КБ worst-case) переносится
-// идентификаторами (task_id, стрим, запись, размер пачки), байты записи —
-// сотни, а не сотни тысяч. Потолок 10 000 записей с payload пачек давал
-// worst-case ~2,5 ГБ против бюджета Redis 0,5 ГБ (docs/redis.md §3);
-// идентификаторов хватает оператору для разбора (docs/runbooks.md §2).
+// TestReliabClaimDeadByteGuard (T-105) — a q:dead entry does not balloon
+// with the original task's payload: a q:dns batch (~250 KB worst-case)
+// is carried by identifiers (task_id, stream, entry, batch size), the
+// entry's bytes — hundreds, not hundreds of thousands. A cap of 10,000
+// entries with batch payloads would give a worst-case ~2.5 GB against
+// the Redis budget of 0.5 GB (docs/redis.md §3); the identifiers are
+// enough for the operator's triage (docs/runbooks.md §2).
 func TestReliabClaimDeadByteGuard(t *testing.T) {
 	big := DNSBatch{TaskID: "big", Domains: make([]DNSDomain, 2000)}
 	for i := range big.Domains {
 		big.Domains[i] = DNSDomain{
-			ZoneID:   int16(i%3 + 1), // пачка многозонная (T-027)
+			ZoneID:   int16(i%3 + 1), // the batch is multi-zone (T-027)
 			DomainID: int64(i + 1),
 			Name:     fmt.Sprintf("domain%04d.example.com", i),
 		}
@@ -370,7 +379,7 @@ func TestReliabClaimDeadByteGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("сериализация пачки: %v", err)
 	}
-	if len(payload) < 100_000 { // ~70 Б на домен с JSON-обвязкой
+	if len(payload) < 100_000 { // ~70 B per domain with the JSON envelope
 		t.Fatalf("пачка неожиданно мала: %d байт — тест не про worst-case", len(payload))
 	}
 	fake := &fakeClaimRedis{
@@ -378,7 +387,7 @@ func TestReliabClaimDeadByteGuard(t *testing.T) {
 			{ID: "1718-0", Values: map[string]any{fieldData: payload}},
 		},
 		pendRes: map[string][]redis.XPendingExt{
-			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // лимит 3 исчерпан
+			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // the limit of 3 is exhausted
 		},
 	}
 
@@ -403,7 +412,7 @@ func TestReliabClaimDeadByteGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("поле data не декодируется как Dead: %v\n%s", err, data)
 	}
-	// Идентификаторы для операторского разбора на месте, payload нет.
+	// The identifiers for the operator's triage are in place, no payload.
 	if dead.TaskID != "big" || dead.Stream != StreamDNS || dead.EntryID != "1718-0" || dead.Attempts != 9 {
 		t.Errorf("идентификаторы записи q:dead: %+v", dead)
 	}
@@ -414,26 +423,27 @@ func TestReliabClaimDeadByteGuard(t *testing.T) {
 		t.Errorf("payload перенесён в q:dead: %d байт", len(dead.Payload))
 	}
 
-	// Исходная запись покидает pending: XACK из стрима-источника.
+	// The original entry leaves the pending: XACK from the source stream.
 	if want := []ackCall{{StreamDNS, "dns", []string{"1718-0"}}}; !reflect.DeepEqual(fake.acks, want) {
 		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
 	}
 }
 
-// TestReliabClaimDeadPoisonBody (T-105, P2 ревью) — выжимка из чужого
-// тела не должна делать запись q:dead невалидной: иначе Publish отклонил
-// бы Dead, XACK не состоялся бы, и «ядовитая» задача навсегда застряла
-// бы в pending вместо карантина. Идентификаторы отбрасываются, перенос
-// идёт: task_id/стрим/запись/попытки/причина всегда достаточны разбору.
+// TestReliabClaimDeadPoisonBody (T-105, the P2 review) — an extraction
+// from a foreign body must not make the q:dead entry invalid: otherwise
+// Publish would reject the Dead, the XACK would not happen, and the
+// "poisonous" task would stay stuck in pending forever instead of the
+// quarantine. The identifiers are dropped, the move goes through:
+// task_id/stream/entry/attempts/reason are always enough for triage.
 func TestReliabClaimDeadPoisonBody(t *testing.T) {
 	poison := `{"task_id":"t1","zone_id":3,"domain_id":42,"subdomain_id":1,"variant":5,"name":"` +
-		strings.Repeat("a", 254) + `"}` // вариант вне 0/1, имя длиннее 253
+		strings.Repeat("a", 254) + `"}` // a variant outside 0/1, a name longer than 253
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
 			{ID: "1718-0", Values: map[string]any{fieldData: []byte(poison)}},
 		},
 		pendRes: map[string][]redis.XPendingExt{
-			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // лимит 3 исчерпан
+			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // the limit of 3 is exhausted
 		},
 	}
 
@@ -468,23 +478,24 @@ func TestReliabClaimDeadPoisonBody(t *testing.T) {
 	}
 }
 
-// TestReliabClaimDeadUnidentified (T-260, ФТ-6.1) — терминальная ветка
-// записи PEL без task_id: до T-260 bury отклонял перенос ошибкой, запись
-// оставалась в pending и крутилась вечным циклом клейма (каждый проход
-// RecoverLoop — клейм +1 к счётчику и та же ошибка, XACK не наступал).
-// Теперь Dead публикуется с синтетическим идентификатором
-// unknown:<stream>:<entry-id>, без предметных полей (тело вне форматов
-// пакета — выжимке предмета не доверять), исходная запись подтверждается:
-// запись покидает pending, разбор остаётся ручным (q:dead — карантин).
+// TestReliabClaimDeadUnidentified (T-260, FR-6.1) — the terminal branch
+// of a PEL entry without a task_id: before T-260 bury rejected the move
+// with an error, the entry stayed in pending and spun in an eternal
+// claim loop (every RecoverLoop pass — a claim +1 to the counter and the
+// same error, the XACK never happened). Now the Dead is published with
+// the synthetic identifier unknown:<stream>:<entry-id>, without subject
+// fields (the body is outside the package formats — do not trust the
+// subject extraction), the original entry is acknowledged: the entry
+// leaves the pending, the triage stays manual (q:dead — quarantine).
 func TestReliabClaimDeadUnidentified(t *testing.T) {
-	// Тело несёт zone_id — постороннее для идентификации поле обязано
-	// остаться неперенесённым: субъект записи не идентифицируется.
+	// The body carries a zone_id — a field foreign to identification that
+	// must stay unmoved: the entry's subject is not identified.
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
 			{ID: "1718-0", Values: map[string]any{fieldData: `{"no_task":"id","zone_id":3}`}},
 		},
 		pendRes: map[string][]redis.XPendingExt{
-			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // лимит 3 исчерпан
+			"1718-0": {{ID: "1718-0", RetryCount: 9}}, // the limit of 3 is exhausted
 		},
 	}
 	got, _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
@@ -496,7 +507,7 @@ func TestReliabClaimDeadUnidentified(t *testing.T) {
 		t.Errorf("исчерпавшая попытки запись возвращена в работу: %+v", got)
 	}
 
-	// Dead в q:dead: синтетический task_id, без предметных полей.
+	// The Dead in q:dead: a synthetic task_id, without subject fields.
 	if len(fake.adds) != 1 || fake.adds[0].Stream != StreamDead {
 		t.Fatalf("публикаций в q:dead: %d, хочу 1", len(fake.adds))
 	}
@@ -516,14 +527,15 @@ func TestReliabClaimDeadUnidentified(t *testing.T) {
 		t.Errorf("Dead неидентифицируемой записи:\n получил  %+v\n хочу     %+v (синтетический id, без предметных полей)", dead, want)
 	}
 
-	// Запись покидает pending: XACK исходной — цикл клейма разомкнут.
+	// The entry leaves the pending: XACK of the original — the claim loop
+	// is broken open.
 	if want := []ackCall{{StreamHTTP, "http", []string{"1718-0"}}}; !reflect.DeepEqual(fake.acks, want) {
 		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
 	}
 
-	// Смешанная пачка: запись с task_id хоронится как раньше (своей
-	// веткой, OnBury), запись без task_id — синтетической; обе покидают
-	// pending за один проход.
+	// A mixed batch: the entry with a task_id is buried as before (by its
+	// own branch, OnBury), the entry without a task_id — by the synthetic
+	// one; both leave the pending in one pass.
 	fake = &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
 			{ID: "1-1", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
@@ -553,8 +565,8 @@ func TestReliabClaimDeadUnidentified(t *testing.T) {
 	}
 }
 
-// TestReliabClaimBoundary — граница счётчика: MaxAttempts — ещё в работу,
-// больше — в q:dead.
+// TestReliabClaimBoundary — the counter boundary: MaxAttempts — still
+// into the work, more — to q:dead.
 func TestReliabClaimBoundary(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -595,18 +607,19 @@ func TestReliabClaimBoundary(t *testing.T) {
 	}
 }
 
-// TestReliabClaimSkips — записи без тела (усечены MAXLEN — XAUTOCLAIM уже
-// вычистил их из PEL) и записи, покинувшие PEL между командами, не
-// обрабатываются и не переводятся в q:dead.
+// TestReliabClaimSkips — entries without a body (truncated by MAXLEN —
+// XAUTOCLAIM has already purged them from the PEL) and entries that left
+// the PEL between the commands are not processed and are not moved to
+// q:dead.
 func TestReliabClaimSkips(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
-			{ID: "1718-0"}, // усечена MAXLEN: значений нет
+			{ID: "1718-0"}, // truncated by MAXLEN: no values
 			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
 		},
 		pendRes: map[string][]redis.XPendingExt{
-			// "1718-0" — XPENDING не вызывается вовсе (тело пустое)
-			"1719-0": nil, // запись уже покинула PEL — подтверждена другим
+			// "1718-0" — XPENDING is not called at all (the body is empty)
+			"1719-0": nil, // the entry has already left the PEL — acknowledged by someone else
 		},
 	}
 	got, _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
@@ -625,12 +638,13 @@ func TestReliabClaimSkips(t *testing.T) {
 	}
 }
 
-// TestReliabClaimErrors — ошибки команд и аргументов; сбой публикации в
-// q:dead не подтверждает исходную запись (XACK только после Dead).
+// TestReliabClaimErrors — command and argument errors; a publication
+// failure to q:dead does not acknowledge the original entry (the XACK
+// only after the Dead).
 func TestReliabClaimErrors(t *testing.T) {
 	ctx := context.Background()
 
-	// Плохие аргументы — без обращения к Redis.
+	// Bad arguments — without touching Redis.
 	for name, call := range map[string]func(r *Reliab) error{
 		"неизвестный стрим": func(r *Reliab) error {
 			_, _, _, err := r.Claim(ctx, "q:typo", "g", "c", time.Minute, 1, "0-0")
@@ -660,14 +674,14 @@ func TestReliabClaimErrors(t *testing.T) {
 		})
 	}
 
-	// Ошибка XAUTOCLAIM.
+	// An XAUTOCLAIM error.
 	fake := &fakeClaimRedis{claimErr: errors.New("ERR connection refused")}
 	if _, _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamDNS, "dns", "recover-1", time.Minute, 1, "0-0"); err == nil ||
 		!contains(err, "claim") {
 		t.Errorf("ошибка XAUTOCLAIM: %v", err)
 	}
 
-	// Ошибка XPENDING.
+	// An XPENDING error.
 	fake = &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
 		pendErr:   errors.New("ERR connection refused"),
@@ -677,8 +691,8 @@ func TestReliabClaimErrors(t *testing.T) {
 		t.Errorf("ошибка XPENDING: %v", err)
 	}
 
-	// Сбой публикации в q:dead — запись остаётся в pending (без XACK):
-	// перевод повторится на следующем проходе.
+	// A publication failure to q:dead — the entry stays in pending
+	// (without an XACK): the move will repeat on the next pass.
 	fake = &fakeClaimRedis{
 		fakeRedis: fakeRedis{addErr: errors.New("connection refused")},
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
@@ -692,8 +706,9 @@ func TestReliabClaimErrors(t *testing.T) {
 		t.Errorf("XACK после сбоя публикации Dead: %+v", fake.acks)
 	}
 
-	// Сбой XACK перенесённой записи — Dead уже опубликован (дубль на
-	// следующем проходе предпочтительнее потери), запись в pending.
+	// An XACK failure of the moved entry — the Dead is already published
+	// (a duplicate on the next pass is preferable to a loss), the entry
+	// in pending.
 	fake = &fakeClaimRedis{
 		fakeRedis: fakeRedis{ackErr: errors.New("ERR connection refused")},
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
@@ -707,16 +722,16 @@ func TestReliabClaimErrors(t *testing.T) {
 		t.Errorf("Dead должен быть опубликован до XACK: %+v", fake.adds)
 	}
 
-	// Запись без task_id больше не ошибка bury — терминальная ветка
-	// ФТ-6.1 (синтетический идентификатор, XACK) покрыта отдельным
-	// TestReliabClaimDeadUnidentified.
+	// An entry without a task_id is no longer a bury error — the terminal
+	// branch of FR-6.1 (a synthetic identifier, XACK) is covered by the
+	// separate TestReliabClaimDeadUnidentified.
 }
 
-// TestReliabRefund — возврат попыток необработанным записям (T-222):
-// XCLAIM … JUSTID RETRYCOUNT <attempts-1> тому же потребителю, записи
-// с разными счётчиками — отдельными командами (RETRYCOUNT один на
-// команду); клиент без окна Do — прозрачный nil; ошибки команд
-// возвращаются, остальные группы возвращаются всё равно.
+// TestReliabRefund — refunding attempts to unprocessed entries (T-222):
+// XCLAIM … JUSTID RETRYCOUNT <attempts-1> to the same consumer, entries
+// with different counters — by separate commands (one RETRYCOUNT per
+// command); a client without the Do window — a transparent nil; command
+// errors are returned, the other groups are refunded anyway.
 func TestReliabRefund(t *testing.T) {
 	fake := &fakeClaimRedis{}
 	r := newTestReliab(fake, ReliabOptions{})
@@ -728,8 +743,8 @@ func TestReliabRefund(t *testing.T) {
 	if err := r.Refund(context.Background(), "http", "recover-1", claimed); err != nil {
 		t.Fatalf("Refund: %v", err)
 	}
-	// Две группы по счётчику: {1-1, 1-2} → retrycount 1, {1-3} → 2.
-	// Порядок групп не определён (map) — сопоставление по содержимому.
+	// Two groups by counter: {1-1, 1-2} → retrycount 1, {1-3} → 2. The
+	// order of the groups is undefined (map) — matched by content.
 	if len(fake.dos) != 2 {
 		t.Fatalf("команд возврата: %d, хочу 2 (группы по счётчику)", len(fake.dos))
 	}
@@ -758,7 +773,8 @@ func TestReliabRefund(t *testing.T) {
 		t.Errorf("группа retrycount 2: %v, хочу [1-3] (счётчик 3 до клейма-1)", ids)
 	}
 
-	// Пустой возврат — нет команд; nil-окно (клиент без Do) прозрачно.
+	// An empty refund — no commands; a nil window (a client without Do)
+	// is transparent.
 	fake = &fakeClaimRedis{}
 	if err := newTestReliab(fake, ReliabOptions{}).Refund(context.Background(), "g", "c", nil); err != nil {
 		t.Errorf("Refund без записей: %v, хочу nil", err)
@@ -775,16 +791,16 @@ func TestReliabRefund(t *testing.T) {
 		t.Errorf("команд без окна Do: %d, хочу 0", len(fake.dos))
 	}
 
-	// Ошибка команды — в возврате с контекстом записей; второй группы
-	// не отменяет (здесь она одна).
+	// A command error — in the return with the entries' context; it does
+	// not cancel the second group (here there is only one).
 	fake = &fakeClaimRedis{doErr: errors.New("ERR no such key")}
 	err := newTestReliab(fake, ReliabOptions{}).Refund(context.Background(), "http", "recover-1", claimed[:1])
 	if err == nil || !contains(err, "возврат попыток") || !contains(err, "1-1") {
 		t.Errorf("ошибка возврата: %v, хочу ошибку с записью 1-1", err)
 	}
 
-	// Кламп нулевого счётчика: Attempts 0 → retrycount 0, не −1
-	// (отрицательный RETRYCOUNT — ошибка сервера).
+	// The zero counter clamp: Attempts 0 → retrycount 0, not −1 (a
+	// negative RETRYCOUNT — a server error).
 	fake = &fakeClaimRedis{}
 	zero := []Claimed{{Delivery{StreamHTTP, "9-9", []byte(`{"task_id":"t9"}`)}, 0}}
 	if err := newTestReliab(fake, ReliabOptions{}).Refund(context.Background(), "http", "recover-1", zero); err != nil {
@@ -794,7 +810,7 @@ func TestReliabRefund(t *testing.T) {
 		t.Errorf("retrycount нулевого счётчика: %v, хочу 0", rc)
 	}
 
-	// Неизвестный стрим — ошибка до Redis (стиль Claim).
+	// An unknown stream — an error before Redis (the Claim style).
 	fake = &fakeClaimRedis{}
 	bad := []Claimed{{Delivery{"q:typo", "1-1", []byte(`{"task_id":"t1"}`)}, 2}}
 	if err := newTestReliab(fake, ReliabOptions{}).Refund(context.Background(), "http", "recover-1", bad); err == nil || !contains(err, "неизвестный стрим") {
@@ -805,17 +821,18 @@ func TestReliabRefund(t *testing.T) {
 	}
 }
 
-// TestReliabRefundUnclassified (T-260, ФТ-6.2) — возврат попыток записям
-// без классификации (клейм XAUTOCLAIM списал попытку, чтение счётчика
-// XPENDING сбойнуло): счётчик читается в момент возврата (повторное
-// чтение по каждой записи), откат — тем же механизмом XCLAIM JUSTID
-// RETRYCOUNT <счётчик-1>, записи с разными счётчиками — группами;
-// покинувшая PEL запись возврата не требует; повторный сбой чтения —
-// ошибка без команд; окно Do недоступно — прозрачный nil.
+// TestReliabRefundUnclassified (T-260, FR-6.2) — refunding attempts to
+// entries without classification (the XAUTOCLAIM claim spent the
+// attempt, the XPENDING counter read failed): the counter is read at the
+// moment of the refund (a repeated read per entry), the rollback — by
+// the same XCLAIM JUSTID RETRYCOUNT <counter-1> mechanism, entries with
+// different counters — by groups; an entry that left the PEL needs no
+// refund; a repeated read failure — an error without commands; the Do
+// window unavailable — a transparent nil.
 func TestReliabRefundUnclassified(t *testing.T) {
 	ctx := context.Background()
 
-	// Две записи с разными счётчиками: 1-1 → retrycount 1, 1-2 → 4.
+	// Two entries with different counters: 1-1 → retrycount 1, 1-2 → 4.
 	fake := &fakeClaimRedis{
 		pendRes: map[string][]redis.XPendingExt{
 			"1-1": {{ID: "1-1", RetryCount: 2}},
@@ -829,8 +846,8 @@ func TestReliabRefundUnclassified(t *testing.T) {
 	if err := newTestReliab(fake, ReliabOptions{}).RefundUnclassified(ctx, "http", "recover-1", ds); err != nil {
 		t.Fatalf("RefundUnclassified: %v", err)
 	}
-	// Счётчик каждой записи прочитан повторно — диапазон ровно её id
-	// (как классификация Claim).
+	// Each entry's counter is read again — the range is exactly its id
+	// (like the Claim classification).
 	if len(fake.pends) != 2 {
 		t.Fatalf("чтений XPENDING: %d, хочу 2 (по каждой записи)", len(fake.pends))
 	}
@@ -867,12 +884,12 @@ func TestReliabRefundUnclassified(t *testing.T) {
 		t.Errorf("группа retrycount 4: %v, хочу [1-2] (счётчик 5 − клейм)", ids)
 	}
 
-	// Запись, покинувшая PEL между клеймом и возвратом, возврата не
-	// требует: без команды на неё, ошибки нет.
+	// An entry that left the PEL between the claim and the refund needs
+	// no refund: no command for it, no error.
 	fake = &fakeClaimRedis{
 		pendRes: map[string][]redis.XPendingExt{
 			"1-1": {{ID: "1-1", RetryCount: 2}},
-			"1-2": nil, // подтверждена тем, кто обрабатывал
+			"1-2": nil, // acknowledged by whoever processed it
 		},
 	}
 	if err := newTestReliab(fake, ReliabOptions{}).RefundUnclassified(ctx, "http", "recover-1", ds); err != nil {
@@ -885,9 +902,9 @@ func TestReliabRefundUnclassified(t *testing.T) {
 		t.Errorf("возвращена не та запись: %v, хочу [1-1]", ids)
 	}
 
-	// Повторный сбой чтения счётчика — ошибка с контекстом записи,
-	// команд возврата нет (попытка остаётся израсходованной — не хуже
-	// поведения до T-260).
+	// A repeated counter read failure — an error with the entry's
+	// context, no refund commands (the attempt stays spent — no worse
+	// than the behavior before T-260).
 	fake = &fakeClaimRedis{
 		pendOneErr: map[string]error{"1-1": errors.New("ERR connection refused")},
 	}
@@ -899,8 +916,8 @@ func TestReliabRefundUnclassified(t *testing.T) {
 		t.Errorf("команд при повторном сбое: %d, хочу 0", len(fake.dos))
 	}
 
-	// Пустой список — nil; окно Do недоступно — прозрачный nil (стиль
-	// Refund: попытки расходованы, как до T-222).
+	// An empty list — nil; the Do window unavailable — a transparent nil
+	// (the Refund style: the attempts spent, as before T-222).
 	fake = &fakeClaimRedis{}
 	if err := newTestReliab(fake, ReliabOptions{}).RefundUnclassified(ctx, "g", "c", nil); err != nil {
 		t.Errorf("RefundUnclassified без записей: %v, хочу nil", err)
@@ -917,7 +934,7 @@ func TestReliabRefundUnclassified(t *testing.T) {
 		t.Errorf("команд без окна Do: %d, хочу 0", len(fake.dos))
 	}
 
-	// Плохие аргументы — ошибка до Redis (стиль Refund/Claim).
+	// Bad arguments — an error before Redis (the Refund/Claim style).
 	fake = &fakeClaimRedis{}
 	if err := newTestReliab(fake, ReliabOptions{}).RefundUnclassified(ctx, "", "c", ds); err == nil || !contains(err, "возврат попыток") {
 		t.Errorf("RefundUnclassified без группы: %v, хочу ошибку", err)
@@ -931,13 +948,14 @@ func TestReliabRefundUnclassified(t *testing.T) {
 	}
 }
 
-// TestReliabClaimClassifiesAfterCancel — отмена ctx после успешного
-// клейма не прерывает классификацию счётчиков (T-222, P2-2 ревью):
-// XAUTOCLAIM уже закрепил записи и списал попытки — записи без
-// прочитанного счётчика RecoverLoop не сможет вернуть (Refund не знает
-// их ID). Классификация идёт под отдельным ctx без отмены вызывающего;
-// отмену уважает сам XAUTOCLAIM (новое изъятие из PEL после останова
-// не начинается — TestRecoverLoopCanceledContext).
+// TestReliabClaimClassifiesAfterCancel — a ctx cancel after a successful
+// claim does not interrupt the counter classification (T-222, the P2-2
+// review): XAUTOCLAIM has already assigned the entries and spent the
+// attempts — RecoverLoop will not be able to return the entries without
+// a read counter (Refund does not know their IDs). The classification
+// runs under a separate ctx without the caller's cancel; XAUTOCLAIM
+// itself respects the cancel (a new taking out of the PEL after the
+// shutdown does not start — TestRecoverLoopCanceledContext).
 func TestReliabClaimClassifiesAfterCancel(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -948,10 +966,11 @@ func TestReliabClaimClassifiesAfterCancel(t *testing.T) {
 			"1-1": {{ID: "1-1", RetryCount: 2}},
 			"1-2": {{ID: "1-2", RetryCount: 2}},
 		},
-		pendCtxFail: true, // XPENDING по отменённому ctx падал бы (живой клиент)
+		pendCtxFail: true, // XPENDING on a canceled ctx would fail (the live client)
 	}
-	// Клейм «успел» до отмены: фейк XAUTOCLAIM от ctx не зависит —
-	// модель гонки «сервер выполнил команду, отмена пришла следом».
+	// The claim "made it" before the cancel: the fake XAUTOCLAIM does not
+	// depend on ctx — a model of the race "the server executed the
+	// command, the cancel arrived after it".
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	got, _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(ctx, StreamHTTP, "http", "recover-1", time.Minute, 5, "0-0")
@@ -967,8 +986,8 @@ func TestReliabClaimClassifiesAfterCancel(t *testing.T) {
 	}
 }
 
-// TestReliabClaimEmpty — зависших записей нет: пустой результат без
-// ошибки, курсор следующего прохода — с начала PEL.
+// TestReliabClaimEmpty — no stuck entries: an empty result without an
+// error, the next pass's cursor — from the beginning of the PEL.
 func TestReliabClaimEmpty(t *testing.T) {
 	fake := &fakeClaimRedis{}
 	got, _, next, err := newTestReliab(fake, ReliabOptions{}).Claim(
@@ -984,9 +1003,10 @@ func TestReliabClaimEmpty(t *testing.T) {
 	}
 }
 
-// TestReliabClaimContinuesAfterSpecial — специальная запись в начале
-// пачки (сбой счётчика, уход из PEL, исчерпание попыток) не обрывает
-// обход: валидные записи следом возвращаются в работу.
+// TestReliabClaimContinuesAfterSpecial — a special entry at the start of
+// the batch (a counter failure, leaving the PEL, exhausted attempts)
+// does not break the walk: the valid entries after it return into the
+// work.
 func TestReliabClaimContinuesAfterSpecial(t *testing.T) {
 	msgs := []redis.XMessage{
 		{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
@@ -996,8 +1016,8 @@ func TestReliabClaimContinuesAfterSpecial(t *testing.T) {
 		name     string
 		pendRes  map[string][]redis.XPendingExt
 		pendErr  map[string]error
-		wantErr  string // подстрока ошибки по первой записи ("" — без ошибки)
-		wantBury bool   // первая запись переводится в q:dead
+		wantErr  string // a substring of the error for the first entry ("" — without an error)
+		wantBury bool   // the first entry is moved to q:dead
 	}{
 		{
 			name: "сбой счётчика первой записи",
@@ -1010,14 +1030,14 @@ func TestReliabClaimContinuesAfterSpecial(t *testing.T) {
 		{
 			name: "первая покинула PEL",
 			pendRes: map[string][]redis.XPendingExt{
-				"1718-0": nil, // подтверждена между командами
+				"1718-0": nil, // acknowledged between the commands
 				"1719-0": {{ID: "1719-0", RetryCount: 2}},
 			},
 		},
 		{
 			name: "первая исчерпала попытки",
 			pendRes: map[string][]redis.XPendingExt{
-				"1718-0": {{ID: "1718-0", RetryCount: 9}}, // лимит 3 исчерпан
+				"1718-0": {{ID: "1718-0", RetryCount: 9}}, // the limit of 3 is exhausted
 				"1719-0": {{ID: "1719-0", RetryCount: 2}},
 			},
 			wantBury: true,
@@ -1055,10 +1075,11 @@ func TestReliabClaimContinuesAfterSpecial(t *testing.T) {
 	}
 }
 
-// TestReliabClaimPartialError — сбой XPENDING одной записи не рушит
-// пачку: записи с известным счётчиком возвращаются, ошибки собраны
-// в возврат (Q-04: XAUTOCLAIM уже закрепил записи — терять пачку на
-// сбое одной проверки значило бы лишний MinIdle простоя всем).
+// TestReliabClaimPartialError — an XPENDING failure for one entry does
+// not wreck the batch: the entries with a known counter are returned,
+// the errors are collected into the return (Q-04: XAUTOCLAIM has already
+// assigned the entries — losing the batch over one failed check would
+// mean an extra MinIdle of downtime for everyone).
 func TestReliabClaimPartialError(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
@@ -1067,7 +1088,8 @@ func TestReliabClaimPartialError(t *testing.T) {
 		},
 		pendRes: map[string][]redis.XPendingExt{
 			"1718-0": {{ID: "1718-0", RetryCount: 2}},
-			// "1719-0" — счётчик недоступен (сбой чтения по записи).
+			// "1719-0" — the counter is unavailable (a per-entry read
+			// failure).
 		},
 		pendOneErr: map[string]error{
 			"1719-0": errors.New("ERR connection refused"),
@@ -1085,9 +1107,9 @@ func TestReliabClaimPartialError(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("валидная часть:\n получил  %+v\n хочу     %+v", got, want)
 	}
-	// Запись без счётчика возвращается вторым результатом для возврата
-	// попытки (ФТ-6.2): клейм уже списал её — не теряется и не попадает
-	// в работу со счётчиком неизвестным.
+	// The entry without a counter is returned as the second result for
+	// the attempt refund (FR-6.2): the claim already spent it — it is
+	// neither lost nor let into the work with an unknown counter.
 	wantUnclassified := []Delivery{
 		{Stream: StreamHTTP, ID: "1719-0", Payload: []byte(`{"task_id":"t2"}`)},
 	}
@@ -1099,21 +1121,22 @@ func TestReliabClaimPartialError(t *testing.T) {
 	}
 }
 
-// TestReliabClaimDeadOnBury (T-154) — хук OnBury зовётся на завершённый
-// перевод (Dead опубликован и исходная запись подтверждена) с именем
-// стрима-источника; записи в работе и незавершённые переводы (сбой
-// публикации Dead, сбой XACK) хук не трогают. Запись без task_id —
-// отдельное событие OnBuryUnidentified (T-260, ФТ-6.1): OnBury молчит.
+// TestReliabClaimDeadOnBury (T-154) — the OnBury hook is called on a
+// completed move (the Dead published and the original entry
+// acknowledged) with the source stream name; entries in the work and
+// unfinished moves (a Dead publication failure, an XACK failure) are not
+// touched by the hook. An entry without a task_id — a separate
+// OnBuryUnidentified event (T-260, FR-6.1): OnBury stays silent.
 func TestReliabClaimDeadOnBury(t *testing.T) {
 	var buried []string
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
-			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}, // ещё в работу
-			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}}, // смерть
+			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}, // still into the work
+			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}}, // death
 		},
 		pendRes: map[string][]redis.XPendingExt{
 			"1718-0": {{ID: "1718-0", RetryCount: 2}},
-			"1719-0": {{ID: "1719-0", RetryCount: 9}}, // лимит 3 исчерпан
+			"1719-0": {{ID: "1719-0", RetryCount: 9}}, // the limit of 3 is exhausted
 		},
 	}
 	r := NewReliab(fake, NewRedisQueue(fake, RedisOptions{}), ReliabOptions{
@@ -1127,8 +1150,8 @@ func TestReliabClaimDeadOnBury(t *testing.T) {
 		t.Errorf("OnBury: %v, хочу ровно один вызов с именем стрима-источника %q", buried, StreamHTTP)
 	}
 
-	// Сбой публикации Dead — перевода не было (запись в pending,
-	// повторится на следующем проходе): хук молчит.
+	// A Dead publication failure — no move happened (the entry in
+	// pending, it will repeat on the next pass): the hook stays silent.
 	fake = &fakeClaimRedis{
 		fakeRedis: fakeRedis{addErr: errors.New("connection refused")},
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
@@ -1144,8 +1167,9 @@ func TestReliabClaimDeadOnBury(t *testing.T) {
 		t.Errorf("OnBury при сбое публикации Dead: %v, хочу пусто", buried)
 	}
 
-	// Сбой XACK — Dead опубликован, но исходная запись не покинула pending
-	// (перевод повторится, дав дубль в q:dead): смерти ещё нет, хук молчит.
+	// An XACK failure — the Dead is published, but the original entry did
+	// not leave the pending (the move will repeat, giving a duplicate in
+	// q:dead): no death yet, the hook stays silent.
 	fake = &fakeClaimRedis{
 		fakeRedis: fakeRedis{ackErr: errors.New("connection refused")},
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
@@ -1164,10 +1188,10 @@ func TestReliabClaimDeadOnBury(t *testing.T) {
 		t.Errorf("OnBury при сбое XACK: %v, хочу пусто (перевод не завершён)", buried)
 	}
 
-	// Запись без task_id — терминальная ветка ФТ-6.1: перевод
-	// завершается (Dead + XACK), но событие иное — OnBury молчит,
-	// OnBuryUnidentified зовётся (отдельные события: смерть задачи
-	// и карантин неидентифицируемой записи).
+	// An entry without a task_id — the terminal branch of FR-6.1: the
+	// move completes (the Dead + the XACK), but the event is different —
+	// OnBury stays silent, OnBuryUnidentified is called (separate events:
+	// the death of a task and the quarantine of an unidentifiable entry).
 	fake = &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"no_task":"id"}`}}},
 		pendRes:   map[string][]redis.XPendingExt{"1-0": {{ID: "1-0", RetryCount: 9}}},
@@ -1191,8 +1215,8 @@ func TestReliabClaimDeadOnBury(t *testing.T) {
 	}
 }
 
-// TestReliabClaimDeadNoHook — nil-хук (изолированные сборки и тесты без
-// реестра): bury работает как раньше, без паники.
+// TestReliabClaimDeadNoHook — a nil hook (isolated builds and tests
+// without the registry): bury works as before, without a panic.
 func TestReliabClaimDeadNoHook(t *testing.T) {
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{{ID: "1-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}}},
@@ -1208,12 +1232,13 @@ func TestReliabClaimDeadNoHook(t *testing.T) {
 	}
 }
 
-// TestProcessing — XACK только после успешной обработки и записи в БД.
+// TestProcessing — the XACK only after successful processing and the DB
+// write.
 func TestProcessing(t *testing.T) {
 	ctx := context.Background()
 	d := Delivery{Stream: StreamDNS, ID: "1718-0", Payload: []byte(`{"task_id":"t1"}`)}
 
-	// Успех: обработчик записал результат — запись подтверждена.
+	// Success: the handler wrote the result — the entry is acknowledged.
 	fake := &fakeRedis{addID: "1-1"}
 	q := NewRedisQueue(fake, RedisOptions{})
 	dbWritten := false
@@ -1221,7 +1246,7 @@ func TestProcessing(t *testing.T) {
 		if got.ID != d.ID {
 			t.Errorf("обработчику передана чужая запись: %+v", got)
 		}
-		dbWritten = true // «запись результата в БД»
+		dbWritten = true // "writing the result to the DB"
 		return nil
 	})
 	if err != nil {
@@ -1234,8 +1259,8 @@ func TestProcessing(t *testing.T) {
 		t.Errorf("XACK после обработки: %+v, хочу %+v", fake.acks, want)
 	}
 
-	// Ошибка обработки (БД не записана) — без XACK: запись вернётся
-	// повторной доставкой (Claim).
+	// A processing error (the DB not written) — without an XACK: the
+	// entry will come back via redelivery (Claim).
 	fake = &fakeRedis{}
 	q = NewRedisQueue(fake, RedisOptions{})
 	err = Processing(ctx, q, "dns", d, func(context.Context, Delivery) error {
@@ -1248,8 +1273,8 @@ func TestProcessing(t *testing.T) {
 		t.Errorf("XACK после сбоя обработки: %+v", fake.acks)
 	}
 
-	// Ошибка XACK возвращается: результат в БД, запись в pending —
-	// повторная доставка пройдёт по идемпотентности (ТЗ 3.4).
+	// An XACK error is returned: the result in the DB, the entry in
+	// pending — the redelivery will go through by idempotency (spec 3.4).
 	fake = &fakeRedis{ackErr: errors.New("ERR connection refused")}
 	err = Processing(ctx, NewRedisQueue(fake, RedisOptions{}), "dns", d,
 		func(context.Context, Delivery) error { return nil })
@@ -1257,7 +1282,7 @@ func TestProcessing(t *testing.T) {
 		t.Fatalf("ошибка XACK не возвращена: %v", err)
 	}
 
-	// Без обработчика — программная ошибка, Redis не трогается.
+	// Without a handler — a programming error, Redis is not touched.
 	fake = &fakeRedis{}
 	if err := Processing(ctx, NewRedisQueue(fake, RedisOptions{}), "dns", d, nil); err == nil {
 		t.Fatal("ожидалась ошибка отсутствия обработчика")
@@ -1267,8 +1292,9 @@ func TestProcessing(t *testing.T) {
 	}
 }
 
-// TestPublishMaxLenPolicy — без явного предела каждый стрим усекается
-// своим пределом политики T-025, явный предел перекрывает все стримы.
+// TestPublishMaxLenPolicy — without an explicit limit every stream is
+// truncated by its own T-025 policy limit, an explicit limit overrides
+// all streams.
 func TestPublishMaxLenPolicy(t *testing.T) {
 	msgs := []struct {
 		stream string
@@ -1285,7 +1311,7 @@ func TestPublishMaxLenPolicy(t *testing.T) {
 	}
 
 	fake := &fakeRedis{}
-	q := NewRedisQueue(fake, RedisOptions{}) // предел не задан — политика
+	q := NewRedisQueue(fake, RedisOptions{}) // no limit set — the policy
 	for _, m := range msgs {
 		if _, err := q.Publish(context.Background(), m.stream, m.msg); err != nil {
 			t.Fatalf("Publish в %s: %v", m.stream, err)
@@ -1298,7 +1324,7 @@ func TestPublishMaxLenPolicy(t *testing.T) {
 		}
 	}
 
-	// Явный предел — один на все стримы.
+	// An explicit limit — one for all streams.
 	fake = &fakeRedis{}
 	q = NewRedisQueue(fake, RedisOptions{MaxLen: 50000})
 	for _, m := range msgs {
