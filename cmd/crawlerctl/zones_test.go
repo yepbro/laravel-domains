@@ -47,7 +47,7 @@ func TestZonesSQLContract(t *testing.T) {
 		zoneSetActiveSQL: wantZoneSetActive,
 	} {
 		if sql != want {
-			t.Errorf("SQL-контракт:\nполучен %s\nожидался %s", sql, want)
+			t.Errorf("the SQL contract:\ngot %s\nwant %s", sql, want)
 		}
 	}
 }
@@ -80,14 +80,14 @@ func newZonesPool() *zonesPool {
 }
 
 func (p *zonesPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("zonesPool: CopyFrom не должен вызываться")
+	return 0, errors.New("zonesPool: CopyFrom must not be called")
 }
 
 func (p *zonesPool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.execs = append(p.execs, subCall{sql, append([]any(nil), args...)})
-	return pgconn.CommandTag{}, errors.New("zonesPool: неожидаемый Exec: " + sql)
+	return pgconn.CommandTag{}, errors.New("zonesPool: unexpected Exec: " + sql)
 }
 
 func (p *zonesPool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -124,7 +124,7 @@ func (p *zonesPool) Query(_ context.Context, sql string, args ...any) (pgx.Rows,
 		}
 		return statusRowsOf(), nil
 	default:
-		return nil, errors.New("zonesPool: неожидаемый SQL Query: " + sql)
+		return nil, errors.New("zonesPool: unexpected SQL Query: " + sql)
 	}
 }
 
@@ -144,42 +144,42 @@ func TestZonesListRun(t *testing.T) {
 	// act — the last character of the row.
 	lines := strings.Split(strings.TrimSpace(got), "\n")
 	if len(lines) != 1+len(pool.zones)+1 { // header + zones + totals
-		t.Fatalf("строк %d, хочу %d:\n%s", len(lines), len(pool.zones)+2, got)
+		t.Fatalf("lines %d, want %d:\n%s", len(lines), len(pool.zones)+2, got)
 	}
-	if !strings.HasPrefix(lines[0], "id") || !strings.Contains(lines[0], "зона") {
-		t.Errorf("строка 0 = %q, хочу заголовок таблицы", lines[0])
+	if !strings.HasPrefix(lines[0], "id") || !strings.Contains(lines[0], "zone") {
+		t.Errorf("line 0 = %q, want the table header", lines[0])
 	}
 	if !strings.Contains(lines[1], "7") || !strings.Contains(lines[1], "crawl.test") {
-		t.Errorf("строка 1 = %q, хочу зону id 7 crawl.test", lines[1])
+		t.Errorf("line 1 = %q, want the zone id 7 crawl.test", lines[1])
 	}
 	if !strings.Contains(lines[1], "—") || strings.Contains(lines[1], "москва") {
-		t.Errorf("unicode-колонка ASCII-зоны должна быть «—»: %q", lines[1])
+		t.Errorf("the ASCII zone's unicode column must be a dash: %q", lines[1])
 	}
 	// "act" — the column after unicode; total/checked come further, so
 	// the mark is looked up by the row fields.
 	if fields := strings.Fields(lines[1]); len(fields) < 4 || fields[3] != "+" {
-		t.Errorf("активная зона — акт «+»: %q", lines[1])
+		t.Errorf("an active zone — the act \"+\": %q", lines[1])
 	}
 	if fields := strings.Fields(lines[2]); len(fields) < 4 || fields[3] != "-" {
-		t.Errorf("выключенная зона — акт «-»: %q", lines[2])
+		t.Errorf("a disabled zone — the act \"-\": %q", lines[2])
 	}
 	if !strings.Contains(lines[3], "xn--80adxhks") || !strings.Contains(lines[3], "москва") {
-		t.Errorf("unicode-зона показывает обе формы: %q", lines[3])
+		t.Errorf("the unicode zone shows both forms: %q", lines[3])
 	}
-	if !strings.Contains(got, "зон 3, включено 2, доменов всего 133, проверено 83") {
-		t.Errorf("вывод без итога:\n%s", got)
+	if !strings.Contains(got, "zones 3, enabled 2, domains total 133, checked 83") {
+		t.Errorf("the output without the totals:\n%s", got)
 	}
 	if len(pool.execs) != 0 {
-		t.Errorf("list только читает, Exec не ждали: %v", pool.execs)
+		t.Errorf("list only reads, Exec was not expected: %v", pool.execs)
 	}
 }
 
 func TestZonesListRunQueryError(t *testing.T) {
 	pool := newZonesPool()
-	pool.queryErr = errors.New("бой соединения")
+	pool.queryErr = errors.New("connection failure")
 	err := zonesListRun(context.Background(), pool, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "справочник зон") {
-		t.Fatalf("ошибка = %v, хочу контекст справочника", err)
+	if err == nil || !strings.Contains(err.Error(), "zones catalog") {
+		t.Fatalf("err = %v, want the catalog context", err)
 	}
 }
 
@@ -193,22 +193,22 @@ func TestZonesToggleRun(t *testing.T) {
 	if err := zonesToggleRun(context.Background(), pool, "disable", "crawl.test", &stdout); err != nil {
 		t.Fatalf("zonesToggleRun disable: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "crawl.test (id 7) выключена") {
-		t.Errorf("вывод disable не содержит итог:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "crawl.test (id 7) disabled") {
+		t.Errorf("the disable output without the totals:\n%s", stdout.String())
 	}
 	if pool.zones[0].active {
-		t.Error("crawl.test должна быть выключена после disable")
+		t.Error("crawl.test must be disabled after disable")
 	}
 	// Domains are not touched: no UPDATE domains was executed at all
 	// (only the lookup by name and the UPDATE zones).
 	for _, c := range pool.queries {
 		if strings.Contains(c.sql, "FROM domains") {
-			t.Errorf("toggle не должен трогать domains: %v", c)
+			t.Errorf("the toggle must not touch domains: %v", c)
 		}
 	}
 	upd := pool.queries[len(pool.queries)-1]
 	if upd.sql != zoneSetActiveSQL || upd.args[0] != false || upd.args[1] != int16(7) {
-		t.Errorf("UPDATE = %v %v, хочу is_active=false, id=7", upd.sql, upd.args)
+		t.Errorf("UPDATE = %v %v, want is_active=false, id=7", upd.sql, upd.args)
 	}
 
 	// Enabling a disabled zone — with the unicode name in the message.
@@ -216,11 +216,11 @@ func TestZonesToggleRun(t *testing.T) {
 	if err := zonesToggleRun(context.Background(), pool, "enable", "example.test", &stdout); err != nil {
 		t.Fatalf("zonesToggleRun enable: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "example.test (id 9) включена") {
-		t.Errorf("вывод enable не содержит итог:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "example.test (id 9) enabled") {
+		t.Errorf("the enable output without the totals:\n%s", stdout.String())
 	}
 	if !pool.zones[1].active {
-		t.Error("example.test должна быть включена после enable")
+		t.Error("example.test must be enabled after enable")
 	}
 }
 
@@ -233,13 +233,13 @@ func TestZonesToggleRunUnicodeZone(t *testing.T) {
 	if err := zonesToggleRun(context.Background(), pool, "enable", "xn--80adxhks", &stdout); err != nil {
 		t.Fatalf("zonesToggleRun: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "xn--80adxhks (москва) (id 11) уже включена") {
-		t.Errorf("вывод не содержит «уже включена» с unicode-именем:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "xn--80adxhks (москва) (id 11) already enabled") {
+		t.Errorf("the output does not contain \"already enabled\" with the unicode name:\n%s", stdout.String())
 	}
 	// The state matches — no UPDATE was executed (idempotency).
 	last := pool.queries[len(pool.queries)-1]
 	if last.sql == zoneSetActiveSQL {
-		t.Errorf("повторный enable не должен обновлять: %v", last)
+		t.Errorf("a repeated enable must not update: %v", last)
 	}
 }
 
@@ -248,32 +248,32 @@ func TestZonesToggleRunAlready(t *testing.T) {
 
 	var stdout bytes.Buffer
 	if err := zonesToggleRun(context.Background(), pool, "disable", "example.test", &stdout); err != nil {
-		t.Fatalf("повторный disable — не ошибка: %v", err)
+		t.Fatalf("a repeated disable — not an error: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "уже выключена") {
-		t.Errorf("вывод не сообщает «уже выключена»:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "already disabled") {
+		t.Errorf("the output does not report \"already disabled\":\n%s", stdout.String())
 	}
 }
 
 func TestZonesToggleRunNotFound(t *testing.T) {
 	pool := newZonesPool()
 	err := zonesToggleRun(context.Background(), pool, "enable", "nope.test", &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "зона nope.test не найдена в справочнике") {
-		t.Fatalf("ошибка = %v, хочу «не найдена в справочнике»", err)
+	if err == nil || !strings.Contains(err.Error(), "zone nope.test is not in the catalog") {
+		t.Fatalf("err = %v, want \"not in the catalog\"", err)
 	}
 	for _, c := range pool.queries {
 		if c.sql == zoneSetActiveSQL {
-			t.Errorf("неизвестная зона не должна обновляться: %v", c)
+			t.Errorf("an unknown zone must not be updated: %v", c)
 		}
 	}
 }
 
 func TestZonesToggleRunQueryError(t *testing.T) {
 	pool := newZonesPool()
-	pool.queryErr = errors.New("нет соединения")
+	pool.queryErr = errors.New("no connection")
 	err := zonesToggleRun(context.Background(), pool, "disable", "crawl.test", &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "зона по имени crawl.test") {
-		t.Fatalf("ошибка = %v, хочу контекст поиска зоны", err)
+	if err == nil || !strings.Contains(err.Error(), "the zone by name crawl.test") {
+		t.Fatalf("err = %v, want the zone lookup context", err)
 	}
 }
 
@@ -286,25 +286,25 @@ func TestRunZonesExecution(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
 	cases := []runCase{
-		{name: "list — нет конфигурации", args: []string{"zones", "list"}, code: exitError, inErr: "zones list: config:"},
-		{name: "enable — нет конфигурации", args: []string{"zones", "enable", "crawl.test"}, code: exitError, inErr: "zones enable crawl.test: config:"},
-		{name: "disable — нет конфигурации", args: []string{"zones", "disable", "crawl.test"}, code: exitError, inErr: "zones disable crawl.test: config:"},
-		{name: "enable — зона нормализуется до конфигурации", args: []string{"zones", "enable", "МосквА."}, code: exitError, inErr: "zones enable xn--80adxhks: config:"},
-		{name: "list лишний аргумент", args: []string{"zones", "list", "foo"}, code: exitUsage, inErr: "лишние аргументы"},
-		{name: "enable без зоны", args: []string{"zones", "enable"}, code: exitUsage, inErr: "укажите зону"},
-		{name: "enable две зоны", args: []string{"zones", "disable", "a.test", "b.test"}, code: exitUsage, inErr: "укажите зону"},
-		{name: "enable невалидная зона", args: []string{"zones", "enable", "bad!!zone"}, code: exitUsage, inErr: "некорректное имя зоны"},
-		{name: "enable неизвестный флаг", args: []string{"zones", "enable", "--nope", "crawl.test"}, code: exitUsage, inErr: "zones enable:"},
+		{name: "list — no configuration", args: []string{"zones", "list"}, code: exitError, inErr: "zones list: config:"},
+		{name: "enable — no configuration", args: []string{"zones", "enable", "crawl.test"}, code: exitError, inErr: "zones enable crawl.test: config:"},
+		{name: "disable — no configuration", args: []string{"zones", "disable", "crawl.test"}, code: exitError, inErr: "zones disable crawl.test: config:"},
+		{name: "enable — the zone normalizes before the configuration", args: []string{"zones", "enable", "МосквА."}, code: exitError, inErr: "zones enable xn--80adxhks: config:"},
+		{name: "list extra argument", args: []string{"zones", "list", "foo"}, code: exitUsage, inErr: "extra arguments"},
+		{name: "enable without a zone", args: []string{"zones", "enable"}, code: exitUsage, inErr: "specify a zone"},
+		{name: "enable two zones", args: []string{"zones", "disable", "a.test", "b.test"}, code: exitUsage, inErr: "specify a zone"},
+		{name: "enable invalid zone", args: []string{"zones", "enable", "bad!!zone"}, code: exitUsage, inErr: "invalid zone name"},
+		{name: "enable unknown flag", args: []string{"zones", "enable", "--nope", "crawl.test"}, code: exitUsage, inErr: "zones enable:"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.args, &stdout, &stderr)
 			if code != tc.code {
-				t.Errorf("run(%q) код = %d, хочу %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
+				t.Errorf("run(%q) code = %d, want %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
 			}
 			if tc.inErr != "" && !strings.Contains(stderr.String(), tc.inErr) {
-				t.Errorf("run(%q) stderr не содержит %q:\n%s", tc.args, tc.inErr, stderr.String())
+				t.Errorf("run(%q) stderr does not contain %q:\n%s", tc.args, tc.inErr, stderr.String())
 			}
 		})
 	}

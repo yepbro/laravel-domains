@@ -46,32 +46,32 @@ func TestSeedBulk(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 	if code := run(args, &stdout, &stderr); code != exitOK {
-		t.Fatalf("seed --bulk: код = %d, stderr:\n%s", code, stderr.String())
+		t.Fatalf("seed --bulk: code = %d, stderr:\n%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "bulk 1000 доменов") {
-		t.Errorf("stdout без итога bulk:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "bulk %d domains", bulk) {
+		t.Errorf("stdout without the bulk total:\n%s", stdout.String())
 	}
 
 	raw, err := os.ReadFile(filepath.Join(incoming, "crawl.test", "add", "seed-bulk.txt"))
 	if err != nil {
-		t.Fatalf("seed-bulk.txt не создан: %v", err)
+		t.Fatalf("seed-bulk.txt was not created: %v", err)
 	}
 	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
 	if len(lines) != bulk {
-		t.Fatalf("строк %d, хочу %d", len(lines), bulk)
+		t.Fatalf("lines %d, want %d", len(lines), bulk)
 	}
 	if lines[0] != "b00000000.crawl.test" || lines[bulk-1] != "b00000999.crawl.test" {
-		t.Errorf("края набора = %q..%q, хочу b00000000..b00000999", lines[0], lines[bulk-1])
+		t.Errorf("the set edges = %q..%q, want b00000000..b00000999", lines[0], lines[bulk-1])
 	}
 	// All lines are unique and within the zone.
 	seen := make(map[string]bool, bulk)
 	for _, l := range lines {
 		if seen[l] {
-			t.Fatalf("дубль строки %q", l)
+			t.Fatalf("a duplicate line %q", l)
 		}
 		seen[l] = true
 		if !strings.HasSuffix(l, ".crawl.test") {
-			t.Fatalf("строка %q не в зоне crawl.test", l)
+			t.Fatalf("the line %q is not in the zone crawl.test", l)
 		}
 	}
 }
@@ -110,23 +110,23 @@ func TestSeedZonesAllowedInDevConfig(t *testing.T) {
 		t.Fatalf("scenarios.yaml: %v", err)
 	}
 	if len(sc.Zones) == 0 {
-		t.Fatal("scenarios.yaml: нет зон")
+		t.Fatal("scenarios.yaml: no zones")
 	}
 
 	base, err := idn.NormalizeZone(sc.Zones[0])
 	if err != nil {
-		t.Fatalf("базовая зона %q: %v", sc.Zones[0], err)
+		t.Fatalf("the base zone %q: %v", sc.Zones[0], err)
 	}
 	if !allowed[base] {
-		t.Errorf("базовая зона сценариев %q отсутствует в ingest.allowed_zone_paths config.dev.yaml — файлы seed уйдут в failed/", base)
+		t.Errorf("the scenarios base zone %q is missing from ingest.allowed_zone_paths config.dev.yaml — the seed files would land in failed/", base)
 	}
 	for _, p := range sc.Plain {
 		zone, err := idn.NormalizeZone(p.Zone)
 		if err != nil {
-			t.Fatalf("зона plain %q: %v", p.Zone, err)
+			t.Fatalf("the plain zone %q: %v", p.Zone, err)
 		}
 		if !allowed[zone] {
-			t.Errorf("зона plain-блока %q отсутствует в ingest.allowed_zone_paths config.dev.yaml — файлы seed уйдут в failed/", zone)
+			t.Errorf("the plain-block zone %q is missing from ingest.allowed_zone_paths config.dev.yaml — the seed files would land in failed/", zone)
 		}
 	}
 }

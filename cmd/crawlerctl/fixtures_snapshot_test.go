@@ -28,7 +28,7 @@ import (
 // skipped, broken lines are errors.
 func TestFixturesParsePromMetrics(t *testing.T) {
 	data := []byte(strings.Join([]string{
-		`# HELP crawler_stage_tasks_total Задачи этапов.`,
+		`# HELP crawler_stage_tasks_total The stage tasks.`,
 		`# TYPE crawler_stage_tasks_total counter`,
 		`crawler_stage_tasks_total{stage="dns"} 12`,
 		`crawler_stage_tasks_total{stage="render"} 34`,
@@ -44,7 +44,7 @@ func TestFixturesParsePromMetrics(t *testing.T) {
 	}, "\n"))
 	samples, err := fixturesParsePromMetrics(data)
 	if err != nil {
-		t.Fatalf("разбор: %v", err)
+		t.Fatalf("parsing: %v", err)
 	}
 	byName := map[string][]fixturesPromSample{}
 	for _, s := range samples {
@@ -63,26 +63,26 @@ func TestFixturesParsePromMetrics(t *testing.T) {
 		t.Errorf("bucket +Inf = %+v", got)
 	}
 	if got := byName["crawler_render_records_total"][0]; got.Value != 42 {
-		t.Errorf("records (с таймстампом в хвосте) = %+v", got)
+		t.Errorf("records (with a timestamp tail) = %+v", got)
 	}
 	if got := byName["weird_label"][0]; got.Labels["path"] != `C:\dir\"file` || got.Labels["mode"] != "a\nb" {
-		t.Errorf("экраны меток = %q / %q", got.Labels["path"], got.Labels["mode"])
+		t.Errorf("the label escapes = %q / %q", got.Labels["path"], got.Labels["mode"])
 	}
 	if got := byName["comma_label"][0]; got.Labels["list"] != "a,b,c" || got.Value != 7 {
-		t.Errorf("запятая в значении метки = %+v", got)
+		t.Errorf("a comma in the label value = %+v", got)
 	}
 	if got := byName["exemplar_metric"][0]; got.Value != 5 {
-		t.Errorf("сэмпл с exemplar-хвостом = %+v, хочу значение 5", got)
+		t.Errorf("the sample with an exemplar tail = %+v, want the value 5", got)
 	}
 
 	if _, err := fixturesParsePromMetrics([]byte("metric{bad 1\n")); err == nil {
-		t.Errorf("битые метки не пойманы")
+		t.Errorf("broken labels were not caught")
 	}
 	if _, err := fixturesParsePromMetrics([]byte("metric\n")); err == nil {
-		t.Errorf("сэмпл без значения не пойман")
+		t.Errorf("a sample without a value was not caught")
 	}
 	if _, err := fixturesParsePromMetrics([]byte("metric xyz\n")); err == nil {
-		t.Errorf("нечисловое значение не поймано")
+		t.Errorf("a non-numeric value was not caught")
 	}
 }
 
@@ -110,22 +110,22 @@ func TestFixturesMetricsFromSamples(t *testing.T) {
 	}
 	m := fixturesMetricsFromSamples(samples)
 	if m.Tasks != 77 {
-		t.Errorf("tasks = %v, хочу 77", m.Tasks)
+		t.Errorf("tasks = %v, want 77", m.Tasks)
 	}
 	if m.SecondsSum != 210 || m.SecondsCount != 70 {
-		t.Errorf("seconds = %v/%v, хочу 210/70", m.SecondsSum, m.SecondsCount)
+		t.Errorf("seconds = %v/%v, want 210/70", m.SecondsSum, m.SecondsCount)
 	}
 	if len(m.Buckets) != 3 || m.Buckets[0].LE != 1 || m.Buckets[2].LE != math.MaxFloat64 {
-		t.Errorf("корзины не отсортированы/без сентинела +Inf: %+v", m.Buckets)
+		t.Errorf("the buckets are not sorted/without the +Inf sentinel: %+v", m.Buckets)
 	}
 	if m.Errors["browser"] != 2 || m.Errors["timeout"] != 0 {
-		t.Errorf("errors = %v (http-стадия должна была отфильтроваться)", m.Errors)
+		t.Errorf("errors = %v (the http stage should have been filtered out)", m.Errors)
 	}
 	if m.TaskFinalized["net::ERR_TIMED_OUT"] != 6 || m.TaskFinalized["timeout"] != 4 {
 		t.Errorf("task_finalized = %v", m.TaskFinalized)
 	}
 	if m.FallbackPublished["timeout"] != 3 || m.TarpitFinalized != 1 || m.DNSFinalized != 2 || m.CertFinalized != 3 {
-		t.Errorf("фолбэк/тарпит/dns/cert = %v/%v/%v/%v", m.FallbackPublished, m.TarpitFinalized, m.DNSFinalized, m.CertFinalized)
+		t.Errorf("fallback/tarpit/dns/cert = %v/%v/%v/%v", m.FallbackPublished, m.TarpitFinalized, m.DNSFinalized, m.CertFinalized)
 	}
 	if m.ProcessStartSeconds != 1000 {
 		t.Errorf("process_start = %v", m.ProcessStartSeconds)
@@ -163,22 +163,22 @@ func TestFixturesSnapshotStreams(t *testing.T) {
 	}
 	s, err := fixturesSnapshotTakeStreams(context.Background(), fake)
 	if err != nil {
-		t.Fatalf("стримы: %v", err)
+		t.Fatalf("the streams: %v", err)
 	}
 	if s.RenderLen != 0 || s.FallbackLen != 2 || s.AnalyzeLen != 500 || s.DeadLen != 1 {
-		t.Fatalf("длины = %+v", s)
+		t.Fatalf("the lengths = %+v", s)
 	}
 	if s.AnalyzeFirstMs != 1762000000000 || s.AnalyzeLastMs != 1762000300000 {
-		t.Fatalf("границы q:analyze = %d..%d", s.AnalyzeFirstMs, s.AnalyzeLastMs)
+		t.Fatalf("the q:analyze boundaries = %d..%d", s.AnalyzeFirstMs, s.AnalyzeLastMs)
 	}
 
 	fake.lens["q:analyze"] = 0
 	s, err = fixturesSnapshotTakeStreams(context.Background(), fake)
 	if err != nil {
-		t.Fatalf("стримы: %v", err)
+		t.Fatalf("the streams: %v", err)
 	}
 	if s.AnalyzeFirstMs != 0 || s.AnalyzeLastMs != 0 {
-		t.Fatalf("пустой q:analyze с границами: %+v", s)
+		t.Fatalf("an empty q:analyze with boundaries: %+v", s)
 	}
 }
 
@@ -190,7 +190,7 @@ func TestFixturesStreamIDMs(t *testing.T) {
 	}
 	for _, bad := range []string{"1762000000123", "0-0", "-1-0", "x-1"} {
 		if _, ok := fixturesStreamIDMs(bad); ok {
-			t.Errorf("ID %q принят", bad)
+			t.Errorf("the ID %q accepted", bad)
 		}
 	}
 }
@@ -199,20 +199,20 @@ func TestFixturesStreamIDMs(t *testing.T) {
 // structure, not bytes (a normalized comparison of the live DOM).
 func TestFixturesSnapshotDOMStats(t *testing.T) {
 	dom := []byte(`<!DOCTYPE html><html><head><script>1</script></head>` +
-		`<body><p>текст</p><script>2</script><!--комментарий--><div><span/></div></body></html>`)
+		`<body><p>text</p><script>2</script><!--a comment--><div><span/></div></body></html>`)
 	nodes, scripts := fixturesSnapshotDOMStats(dom)
 	// The tree: document, html, head, script, text, body, p, text,
 	// script, text (the comment), div, span — the exact number is not
 	// hardcoded, we check the order and the non-zero parts; exactly 2
 	// scripts.
 	if scripts != 2 {
-		t.Errorf("скриптов %d, хочу 2", scripts)
+		t.Errorf("scripts %d, want 2", scripts)
 	}
 	if nodes <= scripts {
-		t.Errorf("узлов %d ≤ скриптов", nodes)
+		t.Errorf("nodes %d ≤ scripts", nodes)
 	}
 	if n, s := fixturesSnapshotDOMStats(nil); n != 0 || s != 0 {
-		t.Errorf("пустой DOM = %d/%d, хочу 0/0", n, s)
+		t.Errorf("an empty DOM = %d/%d, want 0/0", n, s)
 	}
 }
 
@@ -222,7 +222,7 @@ type fakeContentGetter map[string][]byte
 func (f fakeContentGetter) Get(_ context.Context, hash content.Hash) ([]byte, error) {
 	dom, ok := f[hash.String()]
 	if !ok {
-		return nil, errors.New("нет контента")
+		return nil, errors.New("no content")
 	}
 	return dom, nil
 }
@@ -240,13 +240,13 @@ func TestFixturesSnapshotParseDOM(t *testing.T) {
 
 	skipped := fixturesSnapshotParseDOM(context.Background(), store, rows)
 	if skipped != 2 {
-		t.Fatalf("пропусков %d, хочу 2 (нет контента, битый hex)", skipped)
+		t.Fatalf("skips %d, want 2 (no content, a broken hex)", skipped)
 	}
 	if !rows[0].DOMParsed || rows[0].DOMScripts != 1 || rows[0].DOMNodes == 0 {
-		t.Fatalf("строка 0 не разобрана: %+v", rows[0])
+		t.Fatalf("row 0 was not parsed: %+v", rows[0])
 	}
 	if rows[1].DOMParsed || rows[2].DOMParsed || rows[3].DOMParsed {
-		t.Fatalf("лишние строки разобраны: %+v", rows)
+		t.Fatalf("extra rows were parsed: %+v", rows)
 	}
 }
 
@@ -263,7 +263,7 @@ func TestFixturesSnapshotRowsSQLContract(t *testing.T) {
 		"f.is_laravel, f.score, f.rules_version",
 	} {
 		if !strings.Contains(fixturesSnapshotRowsSQL, want) {
-			t.Errorf("SQL снапшота без %q:\n%s", want, fixturesSnapshotRowsSQL)
+			t.Errorf("the snapshot SQL without %q:\n%s", want, fixturesSnapshotRowsSQL)
 		}
 	}
 }
@@ -296,47 +296,47 @@ func TestFixturesSnapshotFileRoundtrip(t *testing.T) {
 	}
 	path := filepath.Join(dir, "moli-1"+fixturesSnapshotFileSuffix)
 	if err := fixturesWriteSnapshotFile(path, snap); err != nil {
-		t.Fatalf("запись: %v", err)
+		t.Fatalf("writing: %v", err)
 	}
 	if _, err := os.Stat(path + ".tmp"); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("tmp-файл остался: %v", err)
+		t.Errorf("the tmp file remained: %v", err)
 	}
 
 	got, err := fixturesReadSnapshot(path)
 	if err != nil {
-		t.Fatalf("чтение: %v", err)
+		t.Fatalf("reading: %v", err)
 	}
 	if got.Label != snap.Label || got.Engine != snap.Engine || len(got.Rows) != 2 {
-		t.Fatalf("roundtrip полей: %+v", got)
+		t.Fatalf("the fields roundtrip: %+v", got)
 	}
 	if got.Rows[0].ContentHash != "aabb" || got.Rows[0].FindingRulesVersion == nil || *got.Rows[0].FindingRulesVersion != 7 {
-		t.Fatalf("roundtrip строки: %+v", got.Rows[0])
+		t.Fatalf("the row roundtrip: %+v", got.Rows[0])
 	}
 	if got.Rows[0].RulesVersion == nil || *got.Rows[0].RulesVersion != 3 {
-		t.Fatalf("roundtrip штампа строки (rules_version): %+v", got.Rows[0])
+		t.Fatalf("the row stamp roundtrip (rules_version): %+v", got.Rows[0])
 	}
 	if got.Streams == nil || got.Metrics == nil || got.EngineRSSMax == nil || *got.EngineRSSMax != rss {
-		t.Fatalf("roundtrip источников: %+v", got)
+		t.Fatalf("the sources roundtrip: %+v", got)
 	}
 	if got.Metrics.TaskFinalized["timeout"] != 1 {
-		t.Fatalf("roundtrip словаря причин: %+v", got.Metrics.TaskFinalized)
+		t.Fatalf("the reason dictionary roundtrip: %+v", got.Metrics.TaskFinalized)
 	}
 
 	snap.FormatVersion = 99
 	if err := fixturesWriteSnapshotFile(path, snap); err != nil {
-		t.Fatalf("запись v99: %v", err)
+		t.Fatalf("writing v99: %v", err)
 	}
 	if _, err := fixturesReadSnapshot(path); err == nil {
-		t.Errorf("чужая версия формата принята")
+		t.Errorf("a foreign format version was accepted")
 	}
 
 	snap.FormatVersion = fixturesSnapshotVersion
 	snap.Rows = nil
 	if err := fixturesWriteSnapshotFile(path, snap); err != nil {
-		t.Fatalf("запись пустого: %v", err)
+		t.Fatalf("writing an empty one: %v", err)
 	}
 	if _, err := fixturesReadSnapshot(path); err == nil {
-		t.Errorf("снапшот без строк принят")
+		t.Errorf("a snapshot without rows was accepted")
 	}
 }
 
@@ -349,29 +349,29 @@ func TestRunFixturesSnapshotAndReport(t *testing.T) {
 
 	cases := []runCase{
 		{name: "snapshot --help", args: []string{"fixtures", "snapshot", "--help"}, code: exitOK, inOut: "--engine-rss-max"},
-		{name: "snapshot help", args: []string{"fixtures", "snapshot", "help"}, code: exitOK, inOut: "--label ИМЯ"},
+		{name: "snapshot help", args: []string{"fixtures", "snapshot", "help"}, code: exitOK, inOut: "--label NAME"},
 		{name: "report --help", args: []string{"fixtures", "report", "--help"}, code: exitOK, inOut: "--fail-exit"},
-		{name: "snapshot без --dir", args: []string{"fixtures", "snapshot", "--label", "x", "--engine", "moli"},
-			code: exitUsage, inErr: "укажите каталог дампа"},
-		{name: "snapshot без --label", args: []string{"fixtures", "snapshot", "--dir", "d", "--engine", "moli"},
+		{name: "snapshot without --dir", args: []string{"fixtures", "snapshot", "--label", "x", "--engine", "moli"},
+			code: exitUsage, inErr: "specify the dump directory"},
+		{name: "snapshot without --label", args: []string{"fixtures", "snapshot", "--dir", "d", "--engine", "moli"},
 			code: exitUsage, inErr: "--label"},
-		{name: "snapshot метка с путём", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "a/b", "--engine", "moli"},
+		{name: "snapshot a label with a path", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "a/b", "--engine", "moli"},
 			code: exitUsage, inErr: "--label"},
-		{name: "snapshot движок мусор", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "x", "--engine", "gecko"},
+		{name: "snapshot junk engine", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "x", "--engine", "gecko"},
 			code: exitUsage, inErr: "--engine"},
-		{name: "snapshot rss отрицательный", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "x", "--engine", "moli", "--engine-rss-max", "-1"},
+		{name: "snapshot a negative rss", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "x", "--engine", "moli", "--engine-rss-max", "-1"},
 			code: exitUsage, inErr: "--engine-rss-max"},
-		{name: "snapshot лишний аргумент", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "x", "--engine", "moli", "stray"},
-			code: exitUsage, inErr: "лишние аргументы"},
-		{name: "snapshot валидный — нет конфигурации", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "x", "--engine", "moli"},
+		{name: "snapshot an extra argument", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "x", "--engine", "moli", "stray"},
+			code: exitUsage, inErr: "extra arguments"},
+		{name: "snapshot valid — no configuration", args: []string{"fixtures", "snapshot", "--dir", "d", "--label", "x", "--engine", "moli"},
 			code: exitError, inErr: "fixtures snapshot:"},
-		{name: "report без --candidate", args: []string{"fixtures", "report", "--baseline", "b.json"},
-			code: exitUsage, inErr: "укажите оба снапшота"},
-		{name: "report бюджет нулевой", args: []string{"fixtures", "report", "--baseline", "b", "--candidate", "c", "--memory-budget", "0"},
+		{name: "report without --candidate", args: []string{"fixtures", "report", "--baseline", "b.json"},
+			code: exitUsage, inErr: "specify both snapshots"},
+		{name: "report a zero budget", args: []string{"fixtures", "report", "--baseline", "b", "--candidate", "c", "--memory-budget", "0"},
 			code: exitUsage, inErr: "--memory-budget"},
-		{name: "report лишний аргумент", args: []string{"fixtures", "report", "--baseline", "b", "--candidate", "c", "stray"},
-			code: exitUsage, inErr: "лишние аргументы"},
-		{name: "report снапшот не найден", args: []string{"fixtures", "report", "--baseline", "nope.json", "--candidate", "nope2.json"},
+		{name: "report an extra argument", args: []string{"fixtures", "report", "--baseline", "b", "--candidate", "c", "stray"},
+			code: exitUsage, inErr: "extra arguments"},
+		{name: "report a missing snapshot", args: []string{"fixtures", "report", "--baseline", "nope.json", "--candidate", "nope2.json"},
 			code: exitError, inErr: "fixtures report:"},
 	}
 	for _, tc := range cases {
@@ -379,13 +379,13 @@ func TestRunFixturesSnapshotAndReport(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.args, &stdout, &stderr)
 			if code != tc.code {
-				t.Errorf("run(%q) код = %d, хочу %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
+				t.Errorf("run(%q) code = %d, want %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
 			}
 			if tc.inErr != "" && !strings.Contains(stderr.String(), tc.inErr) {
-				t.Errorf("run(%q) stderr не содержит %q:\n%s", tc.args, tc.inErr, stderr.String())
+				t.Errorf("run(%q) stderr does not contain %q:\n%s", tc.args, tc.inErr, stderr.String())
 			}
 			if tc.inOut != "" && !strings.Contains(stdout.String(), tc.inOut) {
-				t.Errorf("run(%q) stdout не содержит %q:\n%s", tc.args, tc.inOut, stdout.String())
+				t.Errorf("run(%q) stdout does not contain %q:\n%s", tc.args, tc.inOut, stdout.String())
 			}
 		})
 	}
@@ -405,33 +405,33 @@ func TestRunFixturesSnapshotAndReport(t *testing.T) {
 	pathBad := filepath.Join(dir, "bad.snapshot.json")
 	for p, s := range map[string]*fixturesSnapshot{pathB: b, pathGood: cGood, pathBad: cBad} {
 		if err := fixturesWriteSnapshotFile(p, s); err != nil {
-			t.Fatalf("запись %s: %v", p, err)
+			t.Fatalf("writing %s: %v", p, err)
 		}
 	}
 	outPath := filepath.Join(dir, "report.txt")
 
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"fixtures", "report", "--baseline", pathB, "--candidate", pathGood, "--out", outPath}, &stdout, &stderr); code != exitOK {
-		t.Fatalf("report: код %d, stderr:\n%s", code, stderr.String())
+		t.Fatalf("report: code %d, stderr:\n%s", code, stderr.String())
 	}
-	for _, want := range []string{"Вердикты против порогов §5.1 п.4", "детекция Laravel < 1%"} {
+	for _, want := range []string{"Verdicts against the §5.1 item 4 thresholds", "Laravel detection < 1%"} {
 		if !strings.Contains(stdout.String(), want) {
-			t.Errorf("stdout без %q:\n%s", want, stdout.String())
+			t.Errorf("stdout without %q:\n%s", want, stdout.String())
 		}
 	}
 	if _, err := os.Stat(outPath); err != nil {
-		t.Errorf("отчёт не записан в --out: %v", err)
+		t.Errorf("the report was not written to --out: %v", err)
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	if code := run([]string{"fixtures", "report", "--baseline", pathB, "--candidate", pathBad, "--fail-exit"}, &stdout, &stderr); code != exitError {
-		t.Fatalf("report --fail-exit: код %d, хочу 1; stdout:\n%s", code, stdout.String())
+		t.Fatalf("report --fail-exit: code %d, want 1; stdout:\n%s", code, stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "НЕ ПРОЙДЕН") {
-		t.Errorf("stderr без вердикта:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "FAILED") {
+		t.Errorf("stderr without the verdict:\n%s", stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "НЕ ПРОЙДЕН") {
-		t.Errorf("stdout без строк вердикта:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "FAILED") {
+		t.Errorf("stdout without the verdict rows:\n%s", stdout.String())
 	}
 }

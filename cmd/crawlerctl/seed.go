@@ -22,15 +22,15 @@ import (
 )
 
 // seedHelp — the crawlerctl seed --help text.
-const seedHelp = `crawlerctl seed — тестовые списки доменов для dev-окружения
+const seedHelp = `crawlerctl seed — test domain lists for the dev environment
 
-Использование:
+Usage:
   crawlerctl seed [--incoming DIR] [--scenarios FILE] [--bulk N]
 
-Пишет в incoming/<зона>/add/ домены сценариев testbed (scenarios.yaml),
-«плохие» строки для проверки rejected-лога ingest и (с --bulk) большой
-синтетический набор для замеров. Запись идемпотентна: повторный вызов
-перезаписывает файлы.
+Writes the testbed scenario domains (scenarios.yaml) into incoming/<zone>/add/,
+the "bad" lines for checking the ingest rejected log and (with --bulk) a large
+synthetic set for measurements. The writing is idempotent: a repeated run
+overwrites the files.
 `
 
 type seedScenarios struct {
@@ -49,9 +49,9 @@ type seedScenarios struct {
 
 func cmdSeed(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("seed")
-	incoming := fs.String("incoming", "/data/incoming", "каталог incoming")
-	scenariosFile := fs.String("scenarios", "deploy/docker/testbed/scenarios.yaml", "файл сценариев testbed")
-	bulk := fs.Int("bulk", 0, "сгенерировать N синтетических доменов (seed-bulk)")
+	incoming := fs.String("incoming", "/data/incoming", "the incoming directory")
+	scenariosFile := fs.String("scenarios", "deploy/docker/testbed/scenarios.yaml", "the testbed scenarios file")
+	bulk := fs.Int("bulk", 0, "generate N synthetic domains (seed-bulk)")
 	if handled, err := parseFlags(fs, seedHelp, args, stdout); handled {
 		return err
 	}
@@ -65,11 +65,11 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("seed: scenarios.yaml: %w", err)
 	}
 	if len(sc.Zones) == 0 {
-		return fmt.Errorf("seed: в сценариях нет зон")
+		return fmt.Errorf("seed: no zones in the scenarios")
 	}
 	baseZone, err := idn.NormalizeZone(sc.Zones[0])
 	if err != nil {
-		return fmt.Errorf("seed: базовая зона: %w", err)
+		return fmt.Errorf("seed: base zone: %w", err)
 	}
 
 	total := 0
@@ -80,12 +80,12 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 		zone := baseZone
 		if s.Zone != "" {
 			if zone, err = idn.NormalizeZone(s.Zone); err != nil {
-				return fmt.Errorf("seed: зона сценария %s: %w", s.Zone, err)
+				return fmt.Errorf("seed: scenario zone %s: %w", s.Zone, err)
 			}
 		}
 		full, err := idn.HostToASCII(s.Name + "." + zone)
 		if err != nil {
-			return fmt.Errorf("seed: домен сценария %s: %w", s.Name, err)
+			return fmt.Errorf("seed: scenario domain %s: %w", s.Name, err)
 		}
 		lines = append(lines, full)
 	}
@@ -103,7 +103,7 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 		for _, nm := range p.Names {
 			full, err := idn.HostToASCII(nm.Label + "." + p.Zone)
 			if err != nil {
-				return fmt.Errorf("seed: домен %s: %w", nm.Label, err)
+				return fmt.Errorf("seed: domain %s: %w", nm.Label, err)
 			}
 			zoneLines = append(zoneLines, nm.Label+"."+p.Zone, full) // both forms
 		}
@@ -117,7 +117,7 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 
 	// 3. "Bad" lines for the rejection check (ingest).
 	bad := []string{
-		"# невалидные строки: ingest должен отклонить их с указанием причины",
+		"# invalid lines: ingest must reject them with a reason",
 		"не-из-этой-зоны.ru",
 		"-leading-dash." + baseZone,
 		"trailing-dash-." + baseZone,
@@ -143,7 +143,7 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		total += n
-		out(stdout, "seed: bulk %d доменов → %s\n", *bulk, path)
+		out(stdout, "seed: bulk %d domains → %s\n", *bulk, path)
 	}
 
 	// processed/failed directories next to incoming.
@@ -153,7 +153,7 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 
-	out(stdout, "seed: готово, строк записано: %d (каталог %s)\n", total, *incoming)
+	out(stdout, "seed: done, lines written: %d (directory %s)\n", total, *incoming)
 	return nil
 }
 

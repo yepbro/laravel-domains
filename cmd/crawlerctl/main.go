@@ -65,69 +65,70 @@ var commands = map[string]commandFunc{
 // their numbers.
 const usageText = `crawlerctl — CLI Domain Crawler
 
-Команды управления (основное ТЗ, 4.1):
-  status                        сводка по зонам, очередям, скорости (T-079)
-  domain <имя> [--json] [--content]
-                                информация о домене: статус, признаки
-                                Laravel, контент (ТЗ 5.11)
+Management commands (the main spec, 4.1):
+  status                        a summary over zones, queues, rates (T-079)
+  domain <name> [--json] [--content]
+                                the domain info: the status, the Laravel
+                                findings, the content (spec 5.11)
   subdomains list|add|disable|recheck
-                                 управление проверяемыми субдоменами
+                                 management of the checked subdomains
                                  (T-083)
   zones list|enable|disable|sync|collapse
-                                  управление зонами (T-084), наполнение
-                                  справочника из реестра IANA (T-125),
-                                  сворачивание 2LD-зон в TLD (T-196)
-  reanalyze [--zone ИМЯ]        переанализ результатов по новым правилам (T-074)
-  recheck <домен> [домен …]     принудительная постановка домена на
-                                проверку (T-084)
-  dict train <файл> [--samples ПУТЬ]…
-                                обучение/переобучение словаря сжатия zstd
-                                по HTML-образцам (ТЗ 5.7)
-  dashboard-secret [ПАРОЛЬ]     хэш пароля операторского дашборда
-                                (dashboard.password_hash, дашборд ТЗД);
-                                пароль — аргумент или stdin
+                                  zone management (T-084), populating
+                                  the catalog from the IANA registry (T-125),
+                                  collapsing 2LD zones into TLD (T-196)
+  reanalyze [--zone NAME]        re-analysis of the results under the new rules (T-074)
+  recheck <domain> [domain …]    force-scheduling a domain
+                                for a check (T-084)
+  dict train <file> [--samples PATH]…
+                                training/retraining the zstd compression
+                                dictionary over HTML samples (spec 5.7)
+  dashboard-secret [PASSWORD]   the operator dashboard's password hash
+                                (dashboard.password_hash, the dashboard spec);
+                                the password — an argument or stdin
 
-Команды разбора:
-  near [--zone ИМЯ] [--min-score F]
-                                 находки Laravel в серой зоне порога —
-                                 материал калибровки правил (T-115)
-  check <домен>                  живая проверка домена конвейером:
-                                 DNS → HTTP (+рендер SPA) → анализ,
+Triage commands:
+  near [--zone NAME] [--min-score F]
+                                 Laravel finds in the threshold gray zone —
+                                 rule calibration material (T-115)
+  check <domain>                 a live domain check by the pipeline:
+                                 DNS → HTTP (+SPA render) → analysis,
                                  read-only (T-119)
 
-Команды счётчиков (T-178):
+Counter commands (T-178):
   counters list|recount|verify
-                                 инкрементальные счётчики конвейера:
-                                 значения, ручная реконсиляция (--zone),
-                                 сверка с живыми агрегатами (код 0/1)
+                                 the pipeline's incremental counters:
+                                 values, a manual reconciliation (--zone),
+                                 a cross-check against live aggregates (code 0/1)
 
-Команды dev-окружения:
+Dev-environment commands:
   seed [--incoming DIR] [--scenarios FILE] [--bulk N]
-                                тестовые списки доменов в incoming
+                                test domain lists into incoming
   test-rules [--rules DIR] [--samples DIR] [--min-score F]
-                                прогон правил Laravel по корпусу образцов
-  fixtures export --out КАТАЛОГ [--ok N] [--failed N] [--heavy N]
+                                a run of the Laravel rules over the sample corpus
+  fixtures export --out DIR [--ok N] [--failed N] [--heavy N]
                                  [--smoke N] [--weeks N] [--seed N]
-                                 выгрузка фикстуры рендера (zones/domains/
-                                 subdomain_results без контента) для
-                                 стенда движков (ТЗ рендера §6.1, T-242)
-  fixtures import --dir КАТАЛОГ [--force] [--publish all|smoke]
-                                 накат дампа фикстуры в тестовую БД
-                                 (идемпотентно по PK; без --force —
-                                 dry-run: цель из DSN и план без записи)
-                                 и публикация задач
-                                 прямо в q:render без DNS/HTTP (ТЗ
-                                 рендера §6.1, T-243)
-  fixtures snapshot --dir КАТАЛОГ --label ИМЯ --engine ИМЯ
-                                  фиксация результатов прогона стенда
-                                  (строки БД по фикстуре, темп по q:analyze,
-                                  метрики этапа) в JSON-снимок (T-244)
-  fixtures report --baseline ФАЙЛ --candidate ФАЙЛ
-                                  отчёт сравнения движков по ТЗ §5.1:
-                                  метрики п.3 и явные вердикты против
-                                  порогов п.4 (T-244)
+                                 the render fixture export (zones/domains/
+                                 subdomain_results without content) for
+                                 the engine bench (the render spec §6.1, T-242)
+  fixtures import --dir DIR [--force] [--publish all|smoke]
+                                  the fixture dump import into a test DB
+                                  (idempotent by PK; without --force —
+                                  dry-run: the target from the DSN and the
+                                  plan without writes)
+                                  and publishing the tasks
+                                  straight into q:render without DNS/HTTP (the
+                                  render spec §6.1, T-243)
+  fixtures snapshot --dir DIR --label NAME --engine NAME
+                                   capturing the bench run results
+                                   (the DB rows per fixture, the pace over q:analyze,
+                                   the stage metrics) into a JSON snapshot (T-244)
+  fixtures report --baseline FILE --candidate FILE
+                                   the engine comparison report per spec §5.1:
+                                   the item 3 metrics and explicit verdicts against
+                                   the item 4 thresholds (T-244)
 
-Справка по команде: crawlerctl <команда> --help
+Command help: crawlerctl <command> --help
 `
 
 func main() {
@@ -149,7 +150,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	cmd, ok := commands[args[0]]
 	if !ok {
-		out(stderr, "crawlerctl: неизвестная команда %q\n\n%s", args[0], usageText)
+		out(stderr, "crawlerctl: unknown command %q\n\n%s", args[0], usageText)
 		return exitUsage
 	}
 	err := cmd(args[1:], stdout, stderr)

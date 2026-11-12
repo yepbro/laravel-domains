@@ -48,9 +48,9 @@ const fixturesDefaultMemoryBudget = 2 << 30
 
 // Verdict line statuses.
 const (
-	verdictPass = "ПРОЙДЕН"
-	verdictFail = "НЕ ПРОЙДЕН"
-	verdictNone = "НЕТ ДАННЫХ"
+	verdictPass = "PASSED"
+	verdictFail = "FAILED"
+	verdictNone = "NO DATA"
 )
 
 // fixturesReportVerdict — one verdict line against a §5.1 item 4
@@ -375,7 +375,7 @@ func fixturesFinalizedSum(m map[string]float64) float64 {
 func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport, error) {
 	rowsB, rowsC := fixturesRowMap(b), fixturesRowMap(c)
 	if onlyB, onlyC := fixturesKeysUnionMismatch(rowsB, rowsC); onlyB+onlyC > 0 {
-		return nil, fmt.Errorf("снапшоты сняты по разным выборкам: %d ключей только в baseline, %d только в candidate (дампы/страты расходятся — сравнение недействительно)", onlyB, onlyC)
+		return nil, fmt.Errorf("the snapshots were taken over different selections: %d keys only in baseline, %d only in candidate (the dumps/strata diverge — the comparison is invalid)", onlyB, onlyC)
 	}
 
 	r := &fixturesReport{
@@ -388,7 +388,7 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 		Budget:          budget,
 	}
 	if b.Dump.Seed != c.Dump.Seed {
-		r.Warnings = append(r.Warnings, fmt.Sprintf("seed дампов расходится: baseline %d, candidate %d — выборки могли собраться из разных состояний БД", b.Dump.Seed, c.Dump.Seed))
+		r.Warnings = append(r.Warnings, fmt.Sprintf("the dump seeds diverge: baseline %d, candidate %d — the selections could have been assembled from different DB states", b.Dump.Seed, c.Dump.Seed))
 	}
 	// Selection cross-checks: a snapshot with a truncated set of rows
 	// (dump rows vanished from the DB) would silently understate the
@@ -400,18 +400,18 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 		{"baseline", b}, {"candidate", c},
 	} {
 		if s.snap.Dump.Keys > 0 && s.snap.Dump.Keys != len(s.snap.Rows) {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: в снапшоте %d строк при %d ключах дампа — знаменатель успешности усечён", s.name, len(s.snap.Rows), s.snap.Dump.Keys))
+			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: %d rows in the snapshot with %d dump keys — the success denominator is truncated", s.name, len(s.snap.Rows), s.snap.Dump.Keys))
 		}
 	}
 	if b.Label == c.Label {
-		r.Warnings = append(r.Warnings, "метки снапшотов совпадают — убедитесь, что это разные прогоны, а не один файл")
+		r.Warnings = append(r.Warnings, "the snapshot labels are the same — make sure these are different runs, not one file")
 	}
 	if b.Engine != "chromium" {
-		r.Warnings = append(r.Warnings, fmt.Sprintf("baseline-движок %q — ТЗ §5.1 требует baseline-chromium (свежий прогон chromium на той же выборке)", b.Engine))
+		r.Warnings = append(r.Warnings, fmt.Sprintf("the baseline engine %q — spec §5.1 requires baseline-chromium (a fresh chromium run over the same selection)", b.Engine))
 	}
 	cumulative := fixturesMetricsCumulative(b, c)
 	if cumulative {
-		r.Warnings = append(r.Warnings, "воркер не перезапускался между прогонами (process_start_time совпадает): счётчики candidate накопительные — причины финализаций, время страницы и browser-ошибки включают baseline-прогон, вердикты по ним деградированы; темп по стримам q:analyze и успешность по строкам БД валидны")
+		r.Warnings = append(r.Warnings, "the worker was not restarted between the runs (process_start_time matches): the candidate counters are cumulative — the finalization reasons, the page time and the browser errors include the baseline run, the verdicts over them are degraded; the pace over the q:analyze streams and the success over the DB rows are valid")
 	}
 	// Run incompleteness is visible from the stream leftovers; BOTH runs
 	// are checked: an incomplete baseline would weaken the success
@@ -427,13 +427,13 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 			continue
 		}
 		if s.snap.Streams.RenderLen > 0 {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("q:render %s не пуста (%d записей) — прогон не завершён (или Trim не дошёл), темп и успешность отражают недоработанный прогон", s.name, s.snap.Streams.RenderLen))
+			r.Warnings = append(r.Warnings, fmt.Sprintf("q:render %s is not empty (%d records) — the run is not finished (or Trim did not reach it), the pace and the success reflect an unfinished run", s.name, s.snap.Streams.RenderLen))
 		}
 		if s.snap.Streams.FallbackLen > 0 {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("фолбэк %s не доработан (q:render-fallback: %d записей) — успешность занижена, снимайте снапшот после доработки", s.name, s.snap.Streams.FallbackLen))
+			r.Warnings = append(r.Warnings, fmt.Sprintf("the fallback %s is not drained (q:render-fallback: %d records) — the success is understated, take the snapshot after the drain", s.name, s.snap.Streams.FallbackLen))
 		}
 		if s.snap.Streams.DeadLen > 0 {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("q:dead %s: %d записей — задачи исчерпали доставки, успешность и причины стоит разобрать", s.name, s.snap.Streams.DeadLen))
+			r.Warnings = append(r.Warnings, fmt.Sprintf("q:dead %s: %d records — the tasks exhausted their deliveries, the success and the reasons are worth triaging", s.name, s.snap.Streams.DeadLen))
 		}
 	}
 
@@ -468,12 +468,12 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 		c.Metrics.Tasks == 0 && c.Metrics.SecondsCount == 0
 	r.MetricsValidC = c.Metrics != nil && !cumulative && !r.MetricsEmptyC
 	if r.MetricsEmptyC {
-		r.Warnings = append(r.Warnings, "метрики candidate без событий (задач и наблюдений времени 0): --metrics указывает на пустой/чужой воркер или воркер перезапущен после прогона — вердикты по метрикам деградированы")
+		r.Warnings = append(r.Warnings, "the candidate metrics have no events (0 tasks and time observations): --metrics points at an empty/foreign worker or the worker was restarted after the run — the metric verdicts are degraded")
 	}
 	if r.MetricsValidC {
 		r.BrowserErrC = c.Metrics.Errors["browser"]
 		if fb := fixturesFinalizedSum(c.Metrics.FallbackPublished); fb > 0 {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("публикаций в фолбэк за прогон candidate: %.0f — при доработанном воркером B они уже входят в успешность (снимайте снапшот после дренажа q:render-fallback); без B вердикт успешности — «движок без фолбэка», строже порога ТЗ §5.1 п. 4", fb))
+			r.Warnings = append(r.Warnings, fmt.Sprintf("fallback publications during the candidate run: %.0f — with the worker B drained they already count into the success (take the snapshot after the q:render-fallback drain); without B the success verdict is \"the engine without a fallback\", stricter than the spec §5.1 item 4 threshold", fb))
 		}
 	}
 
@@ -494,7 +494,7 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 		}
 	}
 	if rulesDiffer {
-		r.Warnings = append(r.Warnings, "версии правил анализатора в прогонах расходятся (rules_version) — порог детекции <1% сравнивает разные наборы правил, вердикт деградирован")
+		r.Warnings = append(r.Warnings, "the analyzer rule versions diverge between the runs (rules_version) — the <1% detection threshold compares different rule sets, the verdict is degraded")
 	}
 
 	// Structural DOM metrics.
@@ -521,82 +521,82 @@ func fixturesReportVerdicts(r *fixturesReport, rulesDiffer bool) []fixturesRepor
 	// Laravel detection < 1% (T-213).
 	switch {
 	case r.DetectionComparable == 0:
-		out = append(out, fixturesReportVerdict{Name: "детекция Laravel < 1%",
-			Status: verdictNone, Detail: "нет сравнимых строк (прогон не записал DOM или анализатор не проштамповал results.rules_version — дождитесь доработки analyzer)"})
+		out = append(out, fixturesReportVerdict{Name: "Laravel detection < 1%",
+			Status: verdictNone, Detail: "no comparable rows (the run wrote no DOM or the analyzer has not stamped results.rules_version — wait for the analyzer drain)"})
 	case rulesDiffer:
-		out = append(out, fixturesReportVerdict{Name: "детекция Laravel < 1%",
-			Status: verdictNone, Detail: fmt.Sprintf("правила анализатора менялись между прогонами; расхождений %s (%d из %d)", pctf(r.DetectionRatePct), r.DetectionDiff, r.DetectionComparable)})
+		out = append(out, fixturesReportVerdict{Name: "Laravel detection < 1%",
+			Status: verdictNone, Detail: fmt.Sprintf("the analyzer rules changed between the runs; %s divergences (%d of %d)", pctf(r.DetectionRatePct), r.DetectionDiff, r.DetectionComparable)})
 	case r.DetectionRatePct < 1:
-		out = append(out, fixturesReportVerdict{Name: "детекция Laravel < 1%",
-			Status: verdictPass, Detail: fmt.Sprintf("%s расхождений (%d из %d сравнимых)", pctf(r.DetectionRatePct), r.DetectionDiff, r.DetectionComparable)})
+		out = append(out, fixturesReportVerdict{Name: "Laravel detection < 1%",
+			Status: verdictPass, Detail: fmt.Sprintf("%s divergences (%d of %d comparable)", pctf(r.DetectionRatePct), r.DetectionDiff, r.DetectionComparable)})
 	default:
-		out = append(out, fixturesReportVerdict{Name: "детекция Laravel < 1%",
-			Status: verdictFail, Detail: fmt.Sprintf("%s расхождений (%d из %d сравнимых)", pctf(r.DetectionRatePct), r.DetectionDiff, r.DetectionComparable)})
+		out = append(out, fixturesReportVerdict{Name: "Laravel detection < 1%",
+			Status: verdictFail, Detail: fmt.Sprintf("%s divergences (%d of %d comparable)", pctf(r.DetectionRatePct), r.DetectionDiff, r.DetectionComparable)})
 	}
 
 	// Success: candidate ≥ baseline − engine-independent losses (DNS/cert).
 	switch {
 	case r.IndepLossPctC != nil && r.SuccessPctC >= r.SuccessPctB-*r.IndepLossPctC:
-		out = append(out, fixturesReportVerdict{Name: "успешность ≥ baseline − движко-независимые потери",
+		out = append(out, fixturesReportVerdict{Name: "success ≥ baseline − engine-independent losses",
 			Status: verdictPass, Detail: fmt.Sprintf("%s ≥ %s − %s", pctf(r.SuccessPctC), pctf(r.SuccessPctB), pctf(*r.IndepLossPctC))})
 	case r.IndepLossPctC != nil:
-		out = append(out, fixturesReportVerdict{Name: "успешность ≥ baseline − движко-независимые потери",
+		out = append(out, fixturesReportVerdict{Name: "success ≥ baseline − engine-independent losses",
 			Status: verdictFail, Detail: fmt.Sprintf("%s < %s − %s (DNS/cert)", pctf(r.SuccessPctC), pctf(r.SuccessPctB), pctf(*r.IndepLossPctC))})
 	case r.SuccessPctC >= r.SuccessPctB:
 		// The losses are unknown (no metrics) — a strict comparison: it
 		// raises the bar for the candidate but lets no regression
 		// through.
-		out = append(out, fixturesReportVerdict{Name: "успешность ≥ baseline (строго: потери DNS/cert неизвестны)",
+		out = append(out, fixturesReportVerdict{Name: "success ≥ baseline (strict: the DNS/cert losses are unknown)",
 			Status: verdictPass, Detail: fmt.Sprintf("%s ≥ %s", pctf(r.SuccessPctC), pctf(r.SuccessPctB))})
 	default:
-		out = append(out, fixturesReportVerdict{Name: "успешность ≥ baseline (строго: потери DNS/cert неизвестны)",
-			Status: verdictFail, Detail: fmt.Sprintf("%s < %s; снимите --metrics прогона для вычета движко-независимых потерь", pctf(r.SuccessPctC), pctf(r.SuccessPctB))})
+		out = append(out, fixturesReportVerdict{Name: "success ≥ baseline (strict: the DNS/cert losses are unknown)",
+			Status: verdictFail, Detail: fmt.Sprintf("%s < %s; take the run's --metrics to subtract the engine-independent losses", pctf(r.SuccessPctC), pctf(r.SuccessPctB))})
 	}
 
 	// Pace not worse than baseline.
 	switch {
 	case r.PaceB == nil || r.PaceC == nil:
-		out = append(out, fixturesReportVerdict{Name: "темп не хуже базового",
-			Status: verdictNone, Detail: "темп не снят (Redis недоступен при снапшоте или q:analyze < 2 записей)"})
+		out = append(out, fixturesReportVerdict{Name: "pace not worse than baseline",
+			Status: verdictNone, Detail: "no pace captured (Redis was unavailable at the snapshot or q:analyze < 2 records)"})
 	case *r.PaceC >= *r.PaceB:
-		out = append(out, fixturesReportVerdict{Name: "темп не хуже базового",
-			Status: verdictPass, Detail: fmt.Sprintf("%.2f ≥ %.2f стр/с", *r.PaceC, *r.PaceB)})
+		out = append(out, fixturesReportVerdict{Name: "pace not worse than baseline",
+			Status: verdictPass, Detail: fmt.Sprintf("%.2f ≥ %.2f rows/s", *r.PaceC, *r.PaceB)})
 	default:
-		out = append(out, fixturesReportVerdict{Name: "темп не хуже базового",
-			Status: verdictFail, Detail: fmt.Sprintf("%.2f < %.2f стр/с", *r.PaceC, *r.PaceB)})
+		out = append(out, fixturesReportVerdict{Name: "pace not worse than baseline",
+			Status: verdictFail, Detail: fmt.Sprintf("%.2f < %.2f rows/s", *r.PaceC, *r.PaceB)})
 	}
 
 	// Memory < ⅓ of the chromium budget.
 	switch {
 	case r.RSSC == nil:
-		out = append(out, fixturesReportVerdict{Name: "память < ⅓ бюджета chromium",
-			Status: verdictNone, Detail: "RSS движка не задан (--engine-rss-max при снапшоте кандидата)"})
+		out = append(out, fixturesReportVerdict{Name: "memory < ⅓ of the chromium budget",
+			Status: verdictNone, Detail: "the engine RSS is not set (--engine-rss-max at the candidate's snapshot)"})
 	case *r.RSSC*3 < r.Budget:
-		out = append(out, fixturesReportVerdict{Name: "память < ⅓ бюджета chromium",
-			Status: verdictPass, Detail: fmt.Sprintf("%s < ⅓ от %s", fixturesFormatBytes(*r.RSSC), fixturesFormatBytes(r.Budget))})
+		out = append(out, fixturesReportVerdict{Name: "memory < ⅓ of the chromium budget",
+			Status: verdictPass, Detail: fmt.Sprintf("%s < ⅓ of %s", fixturesFormatBytes(*r.RSSC), fixturesFormatBytes(r.Budget))})
 	default:
-		out = append(out, fixturesReportVerdict{Name: "память < ⅓ бюджета chromium",
-			Status: verdictFail, Detail: fmt.Sprintf("%s ≥ ⅓ от %s", fixturesFormatBytes(*r.RSSC), fixturesFormatBytes(r.Budget))})
+		out = append(out, fixturesReportVerdict{Name: "memory < ⅓ of the chromium budget",
+			Status: verdictFail, Detail: fmt.Sprintf("%s ≥ ⅓ of %s", fixturesFormatBytes(*r.RSSC), fixturesFormatBytes(r.Budget))})
 	}
 
 	// 0 engine core crashes.
 	switch {
 	case r.CrashesC != nil:
-		status, word := verdictPass, "0 падений ядра движка"
+		status, word := verdictPass, "0 engine core crashes"
 		if *r.CrashesC > 0 {
-			status, word = verdictFail, fmt.Sprintf("%d падений ядра движка", *r.CrashesC)
+			status, word = verdictFail, fmt.Sprintf("%d engine core crashes", *r.CrashesC)
 		}
-		out = append(out, fixturesReportVerdict{Name: "0 crashes движка",
-			Status: status, Detail: word + " (операторский вход --engine-crashes)"})
+		out = append(out, fixturesReportVerdict{Name: "0 engine crashes",
+			Status: status, Detail: word + " (the --engine-crashes operator input)"})
 	case r.BrowserErrC > 0:
-		out = append(out, fixturesReportVerdict{Name: "0 crashes движка",
-			Status: verdictFail, Detail: fmt.Sprintf("%.0f событий browser-класса (движок недоступен) — прокси падений/недоступности ядра", r.BrowserErrC)})
+		out = append(out, fixturesReportVerdict{Name: "0 engine crashes",
+			Status: verdictFail, Detail: fmt.Sprintf("%.0f browser-class events (the engine unavailable) — a proxy for crashes/core unavailability", r.BrowserErrC)})
 	case r.MetricsValidC:
-		out = append(out, fixturesReportVerdict{Name: "0 crashes движка",
-			Status: verdictPass, Detail: "0 событий browser-класса по метрикам этапа (прокси; точный вход --engine-crashes)"})
+		out = append(out, fixturesReportVerdict{Name: "0 engine crashes",
+			Status: verdictPass, Detail: "0 browser-class events by the stage metrics (a proxy; the exact input is --engine-crashes)"})
 	default:
-		out = append(out, fixturesReportVerdict{Name: "0 crashes движка",
-			Status: verdictNone, Detail: "нет ни операторского входа (--engine-crashes), ни валидных метрик этапа"})
+		out = append(out, fixturesReportVerdict{Name: "0 engine crashes",
+			Status: verdictNone, Detail: "neither the operator input (--engine-crashes) nor valid stage metrics"})
 	}
 	return out
 }
@@ -631,45 +631,45 @@ func ratioOrNone(v *float64) string {
 // fixturesReportPrint — the report text: the §5.1 item 3 metrics and the
 // item 4 verdicts (--out gets the same text).
 func fixturesReportPrint(w io.Writer, r *fixturesReport) {
-	out(w, "Отчёт сравнения движков рендера (ТЗ рендера §5.1; T-244)\n")
-	out(w, "Выборка: %d задач фикстуры (дамп seed %d)\n", r.Keys, r.Seed)
-	out(w, "baseline:  %s (движок %s)\n", r.BaselineLabel, r.BaselineEngine)
-	out(w, "candidate: %s (движок %s)\n", r.CandidateLabel, r.CandidateEngine)
+	out(w, "Render engine comparison report (the render spec §5.1; T-244)\n")
+	out(w, "Selection: %d fixture tasks (dump seed %d)\n", r.Keys, r.Seed)
+	out(w, "baseline:  %s (engine %s)\n", r.BaselineLabel, r.BaselineEngine)
+	out(w, "candidate: %s (engine %s)\n", r.CandidateLabel, r.CandidateEngine)
 	for _, warn := range r.Warnings {
-		out(w, "предупреждение: %s\n", warn)
+		out(w, "warning: %s\n", warn)
 	}
 	out(w, "\n")
 
-	out(w, "Успешность рендеров\n")
+	out(w, "Render success\n")
 	out(w, "  baseline:  %d/%d (%s)", r.SuccessRenderedB, r.Keys, pctf(r.SuccessPctB))
 	if r.FinalizeB != nil && r.FinalizeB.RenderedRecords > 0 {
-		out(w, " [по метрикам этапа: rendered-записей %.0f]", r.FinalizeB.RenderedRecords)
+		out(w, " [by the stage metrics: %.0f rendered records]", r.FinalizeB.RenderedRecords)
 	}
 	out(w, "\n")
 	out(w, "  candidate: %d/%d (%s)", r.SuccessRenderedC, r.Keys, pctf(r.SuccessPctC))
 	if r.FinalizeC != nil && r.FinalizeC.RenderedRecords > 0 {
-		out(w, " [по метрикам этапа: rendered-записей %.0f]", r.FinalizeC.RenderedRecords)
+		out(w, " [by the stage metrics: %.0f rendered records]", r.FinalizeC.RenderedRecords)
 	}
 	if r.IndepLossPctC != nil {
-		out(w, "; движко-независимые потери (DNS/cert): %s", pctf(*r.IndepLossPctC))
+		out(w, "; engine-independent losses (DNS/cert): %s", pctf(*r.IndepLossPctC))
 	}
 	out(w, "\n\n")
 
-	out(w, "Темп и время страницы\n")
+	out(w, "Pace and page time\n")
 	paceLine := func(name string, pace *float64, tasks int64, sec float64, avg, p95 *float64) {
 		if pace != nil {
-			out(w, "  %s: %.2f стр/с (%d записей q:analyze за %.0f с)", name, *pace, tasks, sec)
+			out(w, "  %s: %.2f rows/s (%d q:analyze records over %.0f s)", name, *pace, tasks, sec)
 		} else {
-			out(w, "  %s: темп нет данных (стримы q:analyze не сняты или < 2 записей)", name)
+			out(w, "  %s: no pace data (the q:analyze streams were not captured or < 2 records)", name)
 		}
 		// Page time is a §5.1 item 3 metric of its own (the stage's
 		// histogram): printed even without a pace — the metrics could have
 		// been taken without Redis (review T-244 P2-2).
 		if avg != nil {
-			out(w, "; ср. %.2f с", *avg)
+			out(w, "; avg %.2f s", *avg)
 		}
 		if p95 != nil {
-			out(w, "; p95 %.2f с", *p95)
+			out(w, "; p95 %.2f s", *p95)
 		}
 		out(w, "\n")
 	}
@@ -677,50 +677,50 @@ func fixturesReportPrint(w io.Writer, r *fixturesReport) {
 	paceLine("candidate", r.PaceC, r.PaceTasksC, r.PaceSecC, r.AvgC, r.P95C)
 	out(w, "\n")
 
-	out(w, "Причины финализаций без рендера (метрики этапа, словарь taskFinalizeReason)\n")
+	out(w, "Finalization reasons without a render (the stage metrics, the taskFinalizeReason dictionary)\n")
 	finalizeLine := func(name string, m *fixturesSnapshotMetrics) {
 		if m == nil {
-			out(w, "  %s: нет данных (снапшот без --metrics)\n", name)
+			out(w, "  %s: no data (a snapshot without --metrics)\n", name)
 			return
 		}
-		out(w, "  %s: тарпит %.0f, cert %.0f, dns %.0f, класс задачи %.0f",
+		out(w, "  %s: tarpit %.0f, cert %.0f, dns %.0f, task class %.0f",
 			name, m.TarpitFinalized, m.CertFinalized, m.DNSFinalized, fixturesFinalizedSum(m.TaskFinalized))
 		if len(m.TaskFinalized) > 0 {
 			out(w, " (%s)", fixturesReasonList(m.TaskFinalized))
 		}
 		if fb := fixturesFinalizedSum(m.FallbackPublished); fb > 0 {
-			out(w, "; публикаций в фолбэк %.0f (%s)", fb, fixturesReasonList(m.FallbackPublished))
+			out(w, "; fallback publications %.0f (%s)", fb, fixturesReasonList(m.FallbackPublished))
 		}
 		out(w, "\n")
 	}
 	finalizeLine("baseline", r.FinalizeB)
 	finalizeLine("candidate", r.FinalizeC)
 	if r.Cumulative {
-		out(w, "  (воркер не перезапускался: счётчики candidate включают baseline-прогон)\n")
+		out(w, "  (the worker was not restarted: the candidate counters include the baseline run)\n")
 	}
 	out(w, "\n")
 
-	out(w, "Диф детекции Laravel (протокол T-213)\n")
-	out(w, "  сравнимые вердикты: %d из %d; Laravel-вердиктов baseline %d, candidate %d\n",
+	out(w, "Laravel detection diff (the T-213 protocol)\n")
+	out(w, "  comparable verdicts: %d of %d; Laravel verdicts baseline %d, candidate %d\n",
 		r.DetectionComparable, r.Keys, r.DetectionFoundB, r.DetectionFoundC)
-	out(w, "  расхождения вердиктов: %d (%s)\n\n", r.DetectionDiff, pctf(r.DetectionRatePct))
+	out(w, "  verdict divergences: %d (%s)\n\n", r.DetectionDiff, pctf(r.DetectionRatePct))
 
-	out(w, "Структурные метрики DOM (нормализованное сравнение)\n")
-	out(w, "  пары с DOM обоих прогонов: %d; идентичный DOM (content_hash): %d (%s)\n",
+	out(w, "Structural DOM metrics (normalized comparison)\n")
+	out(w, "  pairs with DOM in both runs: %d; identical DOM (content_hash): %d (%s)\n",
 		r.DOMPairs, r.DOMIdentical, pctf(r.DOMIdenticalPct))
-	out(w, "  медианы отношений candidate/baseline: длина %s, узлы %s, скрипты %s\n",
+	out(w, "  medians of the candidate/baseline ratios: length %s, nodes %s, scripts %s\n",
 		ratioOrNone(r.DOMMedLenRatio), ratioOrNone(r.DOMMedNodesRatio), ratioOrNone(r.DOMMedScriptsRatio))
-	out(w, "  аномальные пары по длине (вне ×0.5…×2): %d (%s)", r.DOMAnomalousPairs, pctf(r.DOMAnomalousPct))
+	out(w, "  anomalous pairs by length (outside ×0.5…×2): %d (%s)", r.DOMAnomalousPairs, pctf(r.DOMAnomalousPct))
 	if r.DOMScriptZeroPairs > 0 {
-		out(w, "; пар, где один из прогонов не выполнил ни одного <script>: %d", r.DOMScriptZeroPairs)
+		out(w, "; pairs where one of the runs executed no <script>: %d", r.DOMScriptZeroPairs)
 	}
 	out(w, "\n\n")
 
-	out(w, "Память RSS движка\n")
-	out(w, "  baseline: %s; candidate: %s; бюджет chromium %s (⅓ = %s)\n\n",
+	out(w, "Engine RSS memory\n")
+	out(w, "  baseline: %s; candidate: %s; the chromium budget %s (⅓ = %s)\n\n",
 		rssOrNone(r.RSSB), rssOrNone(r.RSSC), fixturesFormatBytes(r.Budget), fixturesFormatBytes(r.Budget/3))
 
-	out(w, "Вердикты против порогов §5.1 п.4\n")
+	out(w, "Verdicts against the §5.1 item 4 thresholds\n")
 	for _, v := range r.Verdicts {
 		out(w, "  [%s] %s: %s\n", v.Status, v.Name, v.Detail)
 	}
@@ -729,7 +729,7 @@ func fixturesReportPrint(w io.Writer, r *fixturesReport) {
 // rssOrNone — RSS as a string or "no data".
 func rssOrNone(v *int64) string {
 	if v == nil {
-		return "нет данных"
+		return "no data"
 	}
 	return fixturesFormatBytes(*v)
 }
@@ -770,22 +770,22 @@ func fixturesReasonList(m map[string]float64) string {
 // T-247 cycle's scripts.
 func fixturesReportCmd(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("fixtures report")
-	baseline := fs.String("baseline", "", "снапшот baseline-chromium (обязателен)")
-	candidate := fs.String("candidate", "", "снапшот движка-кандидата (обязателен)")
-	outPath := fs.String("out", "", "файл отчёта (кроме stdout; для протокола T-247)")
-	budget := fs.Int64("memory-budget", fixturesDefaultMemoryBudget, "бюджет памяти chromium для порога ⅓, байты")
-	failExit := fs.Bool("fail-exit", false, "код 1 при любом вердикте НЕ ПРОЙДЕН (для скриптов)")
+	baseline := fs.String("baseline", "", "the baseline-chromium snapshot (required)")
+	candidate := fs.String("candidate", "", "the candidate engine's snapshot (required)")
+	outPath := fs.String("out", "", "the report file (besides stdout; for the T-247 protocol)")
+	budget := fs.Int64("memory-budget", fixturesDefaultMemoryBudget, "the chromium memory budget for the ⅓ threshold, bytes")
+	failExit := fs.Bool("fail-exit", false, "exit code 1 on any FAILED verdict (for scripts)")
 	if handled, err := parseFlags(fs, fixturesHelp, args, stdout); handled {
 		return err
 	}
 	if strings.TrimSpace(*baseline) == "" || strings.TrimSpace(*candidate) == "" {
-		return usagef("укажите оба снапшота: crawlerctl fixtures report --baseline A.snapshot.json --candidate B.snapshot.json")
+		return usagef("specify both snapshots: crawlerctl fixtures report --baseline A.snapshot.json --candidate B.snapshot.json")
 	}
 	if *budget <= 0 {
-		return usagef("fixtures report: --memory-budget: положительное значение, получено %d", *budget)
+		return usagef("fixtures report: --memory-budget: a positive value, got %d", *budget)
 	}
 	if fs.NArg() > 0 {
-		return usagef("fixtures report: лишние аргументы %v (команда принимает только флаги)", fs.Args())
+		return usagef("fixtures report: extra arguments %v (the command takes only flags)", fs.Args())
 	}
 
 	snapB, err := fixturesReadSnapshot(*baseline)
@@ -812,16 +812,16 @@ func fixturesReportCmd(args []string, stdout, stderr io.Writer) error {
 		// P3-5).
 		tmp := *outPath + ".tmp"
 		if err := os.WriteFile(tmp, []byte(text), 0o644); err != nil {
-			return fmt.Errorf("fixtures report: запись %s: %w", *outPath, err)
+			return fmt.Errorf("fixtures report: writing %s: %w", *outPath, err)
 		}
 		if err := os.Rename(tmp, *outPath); err != nil {
 			_ = os.Remove(tmp)
-			return fmt.Errorf("fixtures report: запись %s: %w", *outPath, err)
+			return fmt.Errorf("fixtures report: writing %s: %w", *outPath, err)
 		}
-		_, _ = fmt.Fprintf(stderr, "отчёт записан: %s\n", *outPath)
+		_, _ = fmt.Fprintf(stderr, "report written: %s\n", *outPath)
 	}
 	if *failExit && report.Fail {
-		return fmt.Errorf("fixtures report: вердикт НЕ ПРОЙДЕН по %s", strings.Join(failedVerdictNames(report), ", "))
+		return fmt.Errorf("fixtures report: a FAILED verdict on %s", strings.Join(failedVerdictNames(report), ", "))
 	}
 	return nil
 }

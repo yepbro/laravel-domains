@@ -27,110 +27,110 @@ type runCase struct {
 func TestRun(t *testing.T) {
 	cases := []runCase{
 		// Top-level routing.
-		{name: "без аргументов — справка и код 2", args: nil, code: exitUsage, inErr: "crawlerctl — CLI Domain Crawler"},
+		{name: "no arguments — help and code 2", args: nil, code: exitUsage, inErr: "crawlerctl — CLI Domain Crawler"},
 		{name: "help", args: []string{"help"}, code: exitOK, inOut: "crawlerctl — CLI Domain Crawler"},
 		{name: "--help", args: []string{"--help"}, code: exitOK, inOut: "crawlerctl — CLI"},
-		{name: "неизвестная команда", args: []string{"nope"}, code: exitUsage, inErr: `неизвестная команда "nope"`},
+		{name: "unknown command", args: []string{"nope"}, code: exitUsage, inErr: `unknown command "nope"`},
 
 		// status — a functional command (T-079): it needs configuration
 		// (DB/Redis); the execution path without infrastructure is
 		// TestRunStatus in status_test.go; here — usage and help.
-		{name: "status лишний аргумент", args: []string{"status", "foo"}, code: exitUsage, inErr: "лишние аргументы"},
-		{name: "status неизвестный флаг", args: []string{"status", "--nope"}, code: exitUsage, inErr: "status: "},
-		{name: "status --help", args: []string{"status", "--help"}, code: exitOK, inOut: "сводка по зонам"},
+		{name: "status extra argument", args: []string{"status", "foo"}, code: exitUsage, inErr: "extra arguments"},
+		{name: "status unknown flag", args: []string{"status", "--nope"}, code: exitUsage, inErr: "status: "},
+		{name: "status --help", args: []string{"status", "--help"}, code: exitOK, inOut: "a summary over zones"},
 
 		// domain — a functional command (T-081): it needs configuration
 		// (PostgreSQL, and the content directory for --content); the
 		// execution path without infrastructure is TestRunDomain in
 		// domain_test.go; here — usage and help.
-		{name: "domain без имени", args: []string{"domain"}, code: exitUsage, inErr: "укажите имя домена"},
-		{name: "domain два имени", args: []string{"domain", "a.test", "b.test"}, code: exitUsage, inErr: "укажите имя домена"},
-		{name: "domain --json --content несовместимы", args: []string{"domain", "--json", "--content", "x.crawl.test"},
-			code: exitUsage, inErr: "несовместимы"},
-		{name: "domain невалидное имя (до конфигурации)", args: []string{"domain", "bad!!name.test"}, code: exitUsage,
-			inErr: "некорректное имя домена"},
-		{name: "domain help первым аргументом", args: []string{"domain", "help"}, code: exitOK, inOut: "crawlerctl domain"},
-		{name: "domain help после флага — позиционный аргумент", args: []string{"domain", "--json", "help"},
-			code: exitUsage, inErr: "некорректное имя домена"},
-		{name: "domain неизвестный флаг", args: []string{"domain", "--nope", "x.test"}, code: exitUsage,
+		{name: "domain without a name", args: []string{"domain"}, code: exitUsage, inErr: "specify a domain name"},
+		{name: "domain two names", args: []string{"domain", "a.test", "b.test"}, code: exitUsage, inErr: "specify a domain name"},
+		{name: "domain --json --content incompatible", args: []string{"domain", "--json", "--content", "x.crawl.test"},
+			code: exitUsage, inErr: "incompatible"},
+		{name: "domain invalid name (before the configuration)", args: []string{"domain", "bad!!name.test"}, code: exitUsage,
+			inErr: "invalid domain name"},
+		{name: "domain help as the first argument", args: []string{"domain", "help"}, code: exitOK, inOut: "crawlerctl domain"},
+		{name: "domain help after a flag — a positional argument", args: []string{"domain", "--json", "help"},
+			code: exitUsage, inErr: "invalid domain name"},
+		{name: "domain unknown flag", args: []string{"domain", "--nope", "x.test"}, code: exitUsage,
 			inErr: "domain: "},
-		{name: "domain --help", args: []string{"domain", "--help"}, code: exitOK, inOut: "ТЗ 5.11"},
+		{name: "domain --help", args: []string{"domain", "--help"}, code: exitOK, inOut: "spec 5.11"},
 
 		// subdomains — a functional command (T-083): it needs
 		// configuration (the DB) — the execution path without
 		// infrastructure is checked by the separate
 		// TestRunSubdomainsExecution and the subdomains_test.go subtests;
 		// here — usage and help.
-		{name: "subdomains без действия", args: []string{"subdomains"}, code: exitUsage, inErr: "укажите действие"},
-		{name: "subdomains неизвестное действие", args: []string{"subdomains", "fly"}, code: exitUsage, inErr: `допустимы: list, add, disable, recheck`},
-		{name: "subdomains add без метки", args: []string{"subdomains", "add"}, code: exitUsage, inErr: "укажите метку"},
-		{name: "subdomains add пустая метка", args: []string{"subdomains", "add", ""}, code: exitUsage, inErr: "апекс"},
-		{name: "subdomains add дефис по краям (после --)", args: []string{"subdomains", "add", "--", "-bad-"}, code: exitUsage, inErr: "некорректная метка субдомена"},
-		{name: "subdomains add метка 64", args: []string{"subdomains", "add", strings.Repeat("a", 64)}, code: exitUsage, inErr: "некорректная метка субдомена"},
-		{name: "subdomains add метка с точкой", args: []string{"subdomains", "add", "a.b"}, code: exitUsage, inErr: "некорректная метка субдомена"},
-		{name: "subdomains disable без метки", args: []string{"subdomains", "disable"}, code: exitUsage, inErr: "укажите субдомен"},
+		{name: "subdomains without an action", args: []string{"subdomains"}, code: exitUsage, inErr: "specify an action"},
+		{name: "subdomains unknown action", args: []string{"subdomains", "fly"}, code: exitUsage, inErr: `valid: list, add, disable, recheck`},
+		{name: "subdomains add without a label", args: []string{"subdomains", "add"}, code: exitUsage, inErr: "specify a subdomain label"},
+		{name: "subdomains add empty label", args: []string{"subdomains", "add", ""}, code: exitUsage, inErr: "apex"},
+		{name: "subdomains add a hyphen at the edges (after --)", args: []string{"subdomains", "add", "--", "-bad-"}, code: exitUsage, inErr: "invalid subdomain label"},
+		{name: "subdomains add label 64", args: []string{"subdomains", "add", strings.Repeat("a", 64)}, code: exitUsage, inErr: "invalid subdomain label"},
+		{name: "subdomains add label with a dot", args: []string{"subdomains", "add", "a.b"}, code: exitUsage, inErr: "invalid subdomain label"},
+		{name: "subdomains disable without a label", args: []string{"subdomains", "disable"}, code: exitUsage, inErr: "specify a subdomain"},
 		{name: "subdomains --help", args: []string{"subdomains", "--help"}, code: exitOK, inOut: "subdomains list"},
-		{name: "subdomains add --help", args: []string{"subdomains", "add", "--help"}, code: exitOK, inOut: "управление проверяемыми субдоменами"},
+		{name: "subdomains add --help", args: []string{"subdomains", "add", "--help"}, code: exitOK, inOut: "managing the checked subdomains"},
 
 		// zones — a functional command (T-084): it needs configuration
 		// (the DB) — the execution path without infrastructure is checked
 		// by the separate TestRunZonesExecution and the zones_test.go
 		// subtests; here — usage and help.
-		{name: "zones без действия", args: []string{"zones"}, code: exitUsage, inErr: "укажите действие"},
-		{name: "zones неизвестное действие", args: []string{"zones", "fly"}, code: exitUsage, inErr: `допустимы: list, enable, disable, sync, collapse`},
-		{name: "zones enable без зоны", args: []string{"zones", "enable"}, code: exitUsage, inErr: "укажите зону"},
-		{name: "zones enable невалидная зона", args: []string{"zones", "enable", "bad!!zone"}, code: exitUsage, inErr: "некорректное имя зоны"},
+		{name: "zones without an action", args: []string{"zones"}, code: exitUsage, inErr: "specify an action"},
+		{name: "zones unknown action", args: []string{"zones", "fly"}, code: exitUsage, inErr: `valid: list, enable, disable, sync, collapse`},
+		{name: "zones enable without a zone", args: []string{"zones", "enable"}, code: exitUsage, inErr: "specify a zone"},
+		{name: "zones enable invalid zone", args: []string{"zones", "enable", "bad!!zone"}, code: exitUsage, inErr: "invalid zone name"},
 		{name: "zones --help", args: []string{"zones", "--help"}, code: exitOK, inOut: "zones list"},
-		{name: "zones enable --help", args: []string{"zones", "enable", "--help"}, code: exitOK, inOut: "управление зонами проверки"},
+		{name: "zones enable --help", args: []string{"zones", "enable", "--help"}, code: exitOK, inOut: "managing the check zones"},
 		{name: "zones sync --help", args: []string{"zones", "sync", "--help"}, code: exitOK, inOut: "tlds-alpha-by-domain.txt"},
 
 		// reanalyze — a functional command (T-074): it needs configuration
 		// (DB/Redis) — the execution path with infrastructure is checked
 		// by the separate TestRunReanalyze; here — usage and help.
-		{name: "reanalyze --zone невалидная", args: []string{"reanalyze", "--zone", "bad!!zone"}, code: exitUsage, inErr: "некорректное имя зоны"},
-		{name: "reanalyze --zone без значения", args: []string{"reanalyze", "--zone"}, code: exitUsage, inErr: "reanalyze: "},
-		{name: "reanalyze лишний аргумент", args: []string{"reanalyze", "foo"}, code: exitUsage, inErr: "лишние аргументы"},
-		{name: "reanalyze --help", args: []string{"reanalyze", "--help"}, code: exitOK, inOut: "переанализ сохранённых результатов"},
+		{name: "reanalyze --zone invalid", args: []string{"reanalyze", "--zone", "bad!!zone"}, code: exitUsage, inErr: "invalid zone name"},
+		{name: "reanalyze --zone without a value", args: []string{"reanalyze", "--zone"}, code: exitUsage, inErr: "reanalyze: "},
+		{name: "reanalyze extra argument", args: []string{"reanalyze", "foo"}, code: exitUsage, inErr: "extra arguments"},
+		{name: "reanalyze --help", args: []string{"reanalyze", "--help"}, code: exitOK, inOut: "re-analysis of the stored results"},
 
 		// recheck — a functional command (T-084): it needs configuration
 		// (the DB) — the execution path without infrastructure is checked
 		// by the separate TestRunRecheckExecution and the recheck_test.go
 		// subtests; here — usage and help.
-		{name: "recheck без домена", args: []string{"recheck"}, code: exitUsage, inErr: "укажите домен"},
-		{name: "recheck невалидное имя", args: []string{"recheck", "ok.crawl.test", "bad!!name"}, code: exitUsage, inErr: "некорректное имя домена"},
-		{name: "recheck --help", args: []string{"recheck", "--help"}, code: exitOK, inOut: "принудительная постановка"},
+		{name: "recheck without a domain", args: []string{"recheck"}, code: exitUsage, inErr: "specify a domain"},
+		{name: "recheck invalid name", args: []string{"recheck", "ok.crawl.test", "bad!!name"}, code: exitUsage, inErr: "invalid domain name"},
+		{name: "recheck --help", args: []string{"recheck", "--help"}, code: exitOK, inOut: "force-scheduling"},
 
 		// dict — zstd dictionary training (T-043).
-		{name: "dict без действия", args: []string{"dict"}, code: exitUsage, inErr: "укажите действие"},
-		{name: "dict неизвестное действие", args: []string{"dict", "fly"}, code: exitUsage, inErr: `допустимы: train`},
-		{name: "dict --help", args: []string{"dict", "--help"}, code: exitOK, inOut: "словарём сжатия zstd"},
+		{name: "dict without an action", args: []string{"dict"}, code: exitUsage, inErr: "specify an action"},
+		{name: "dict unknown action", args: []string{"dict", "fly"}, code: exitUsage, inErr: `valid: train`},
+		{name: "dict --help", args: []string{"dict", "--help"}, code: exitOK, inOut: "zstd compression dictionary"},
 		{name: "dict train --help", args: []string{"dict", "train", "--help"}, code: exitOK, inOut: "crawlerctl dict"},
-		{name: "dict train без файла", args: []string{"dict", "train"}, code: exitUsage, inErr: "укажите выходной файл"},
-		{name: "dict train два позиционных", args: []string{"dict", "train", "a.zst", "b.zst"}, code: exitUsage,
-			inErr: "укажите выходной файл"},
-		{name: "dict train несуществующие образцы", args: []string{"dict", "train", "d.zst", "--samples", "/nonexistent"},
-			code: exitError, inErr: "dict train: образцы /nonexistent:"},
-		{name: "dict train --help значением --samples — не справка, а путь образцов",
+		{name: "dict train without a file", args: []string{"dict", "train"}, code: exitUsage, inErr: "specify the output file"},
+		{name: "dict train two positionals", args: []string{"dict", "train", "a.zst", "b.zst"}, code: exitUsage,
+			inErr: "specify the output file"},
+		{name: "dict train nonexistent samples", args: []string{"dict", "train", "d.zst", "--samples", "/nonexistent"},
+			code: exitError, inErr: "dict train: samples /nonexistent:"},
+		{name: "dict train --help as a --samples value — not help but a samples path",
 			args: []string{"dict", "train", "d.zst", "--samples", "--help"},
-			code: exitError, inErr: "dict train: образцы --help:", noOut: "словарём сжатия zstd"},
-		{name: "dict train неизвестный флаг", args: []string{"dict", "train", "--nope", "d.zst"}, code: exitUsage,
+			code: exitError, inErr: "dict train: samples --help:", noOut: "zstd compression dictionary"},
+		{name: "dict train unknown flag", args: []string{"dict", "train", "--nope", "d.zst"}, code: exitUsage,
 			inErr: "dict train: "},
 
 		// dashboard-secret — dashboard password hash generation (dashboard
 		// spec §7.3): it runs without infrastructure; the functional tests
 		// and the roundtrip — TestRunDashboardSecret* in
 		// dashboardsecret_test.go.
-		{name: "dashboard-secret пустой аргумент", args: []string{"dashboard-secret", ""}, code: exitUsage, inErr: "пустой пароль"},
-		{name: "dashboard-secret два аргумента", args: []string{"dashboard-secret", "a", "b"}, code: exitUsage, inErr: "лишние аргументы"},
-		{name: "dashboard-secret неизвестный флаг", args: []string{"dashboard-secret", "--nope"}, code: exitUsage,
+		{name: "dashboard-secret empty argument", args: []string{"dashboard-secret", ""}, code: exitUsage, inErr: "empty password"},
+		{name: "dashboard-secret two arguments", args: []string{"dashboard-secret", "a", "b"}, code: exitUsage, inErr: "extra arguments"},
+		{name: "dashboard-secret unknown flag", args: []string{"dashboard-secret", "--nope"}, code: exitUsage,
 			inErr: "dashboard-secret: "},
 		{name: "dashboard-secret --help", args: []string{"dashboard-secret", "--help"}, code: exitOK,
-			inOut: "истории shell"},
+			inOut: "shell history"},
 
 		// dev commands: routing and help (the functional tests live with
 		// the commands themselves).
 		{name: "seed --help", args: []string{"seed", "--help"}, code: exitOK, inOut: "crawlerctl seed"},
-		{name: "seed несуществующий сценарий", args: []string{"seed", "--scenarios", "/nonexistent/scenarios.yaml"},
+		{name: "seed nonexistent scenario", args: []string{"seed", "--scenarios", "/nonexistent/scenarios.yaml"},
 			code: exitError, inErr: "seed:"},
 		{name: "test-rules --help", args: []string{"test-rules", "--help"}, code: exitOK, inOut: "crawlerctl test-rules"},
 	}
@@ -140,16 +140,16 @@ func TestRun(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.args, &stdout, &stderr)
 			if code != tc.code {
-				t.Errorf("run(%q) код = %d, хочу %d", tc.args, code, tc.code)
+				t.Errorf("run(%q) code = %d, want %d", tc.args, code, tc.code)
 			}
 			if tc.inOut != "" && !strings.Contains(stdout.String(), tc.inOut) {
-				t.Errorf("run(%q) stdout не содержит %q;\nstdout:\n%s", tc.args, tc.inOut, stdout.String())
+				t.Errorf("run(%q) stdout does not contain %q;\nstdout:\n%s", tc.args, tc.inOut, stdout.String())
 			}
 			if tc.noOut != "" && strings.Contains(stdout.String(), tc.noOut) {
-				t.Errorf("run(%q) stdout содержит %q, чего не ждали;\nstdout:\n%s", tc.args, tc.noOut, stdout.String())
+				t.Errorf("run(%q) stdout contains %q, which was not expected;\nstdout:\n%s", tc.args, tc.noOut, stdout.String())
 			}
 			if tc.inErr != "" && !strings.Contains(stderr.String(), tc.inErr) {
-				t.Errorf("run(%q) stderr не содержит %q;\nstderr:\n%s", tc.args, tc.inErr, stderr.String())
+				t.Errorf("run(%q) stderr does not contain %q;\nstderr:\n%s", tc.args, tc.inErr, stderr.String())
 			}
 		})
 	}
@@ -172,10 +172,10 @@ func TestRunReanalyze(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"reanalyze"}, &stdout, &stderr)
 	if code != exitError {
-		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitError, stderr.String())
+		t.Fatalf("code = %d, want %d; stderr:\n%s", code, exitError, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "reanalyze: config:") {
-		t.Errorf("stderr не содержит контекст конфигурации:\n%s", stderr.String())
+		t.Errorf("stderr does not contain the configuration context:\n%s", stderr.String())
 	}
 
 	// A valid zone — the same configuration error (the input check
@@ -184,10 +184,10 @@ func TestRunReanalyze(t *testing.T) {
 	stderr.Reset()
 	code = run([]string{"reanalyze", "--zone", "Crawl.Test."}, &stdout, &stderr)
 	if code != exitError || !strings.Contains(stderr.String(), "reanalyze: config:") {
-		t.Errorf("код = %d, stderr:\n%s; хочу ошибку конфигурации (код 1)", code, stderr.String())
+		t.Errorf("code = %d, stderr:\n%s; want a configuration error (code 1)", code, stderr.String())
 	}
 	if stdout.Len() != 0 {
-		t.Errorf("stdout до соединения не пуст:\n%s", stdout.String())
+		t.Errorf("stdout before the connection is not empty:\n%s", stdout.String())
 	}
 }
 
@@ -196,12 +196,12 @@ func TestRunReanalyze(t *testing.T) {
 func TestUsageTextListsCommands(t *testing.T) {
 	for name := range commands {
 		if !strings.Contains(usageText, name) {
-			t.Errorf("usageText не упоминает команду %q", name)
+			t.Errorf("usageText does not mention the command %q", name)
 		}
 	}
 	for _, want := range []string{"--json", "--content", "--zone", "--bulk", "--min-score", "--samples", "list|add|disable|recheck", "list|enable|disable"} {
 		if !strings.Contains(usageText, want) {
-			t.Errorf("usageText не упоминает %q", want)
+			t.Errorf("usageText does not mention %q", want)
 		}
 	}
 }
@@ -214,14 +214,14 @@ func TestRunHelpPerCommand(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run([]string{name, "--help"}, &stdout, &stderr)
 			if code != exitOK {
-				t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitOK, stderr.String())
+				t.Fatalf("code = %d, want %d; stderr:\n%s", code, exitOK, stderr.String())
 			}
 			out := stdout.String()
 			if !strings.HasPrefix(out, "crawlerctl "+name) {
-				t.Errorf("справка не начинается с имени команды:\n%s", out)
+				t.Errorf("the help does not start with the command name:\n%s", out)
 			}
-			if !strings.Contains(out, "Использование") {
-				t.Errorf("в справке нет раздела «Использование»:\n%s", out)
+			if !strings.Contains(out, "Usage") {
+				t.Errorf("the help has no Usage section:\n%s", out)
 			}
 		})
 	}
@@ -236,68 +236,68 @@ func TestParseFlags(t *testing.T) {
 	t.Run("help", func(t *testing.T) {
 		fs := newFlagSet("x")
 		fs.Bool("json", false, "")
-		handled, err := parseFlags(fs, "СПРАВКА x", []string{"--json", "--help"}, &stdout)
+		handled, err := parseFlags(fs, "HELP x", []string{"--json", "--help"}, &stdout)
 		if !handled || err != flag.ErrHelp {
-			t.Fatalf("handled=%v err=%v, хочу (true, flag.ErrHelp)", handled, err)
+			t.Fatalf("handled=%v err=%v, want (true, flag.ErrHelp)", handled, err)
 		}
-		if !strings.Contains(stdout.String(), "СПРАВКА x") {
-			t.Errorf("справка не напечатана:\n%s", stdout.String())
+		if !strings.Contains(stdout.String(), "HELP x") {
+			t.Errorf("the help was not printed:\n%s", stdout.String())
 		}
 	})
 
 	// The value of a flag that takes a value is not a help request, even
 	// when it is the --help token itself (CLI-03).
-	t.Run("help значением флага", func(t *testing.T) {
+	t.Run("help as a flag value", func(t *testing.T) {
 		fs := newFlagSet("x")
 		fs.String("incoming", "", "")
 		stdout.Reset()
-		handled, err := parseFlags(fs, "СПРАВКА x", []string{"--incoming", "--help"}, &stdout)
+		handled, err := parseFlags(fs, "HELP x", []string{"--incoming", "--help"}, &stdout)
 		if handled || err != nil {
-			t.Fatalf("handled=%v err=%v, хочу успех без справки", handled, err)
+			t.Fatalf("handled=%v err=%v, want success without help", handled, err)
 		}
 		if stdout.Len() != 0 {
-			t.Errorf("справка напечатана:\n%s", stdout.String())
+			t.Errorf("the help was printed:\n%s", stdout.String())
 		}
 		if got := fs.Lookup("incoming").Value.String(); got != "--help" {
-			t.Errorf("--incoming = %q, хочу значение %q", got, "--help")
+			t.Errorf("--incoming = %q, want the value %q", got, "--help")
 		}
 	})
 
-	t.Run("help после терминатора и позиционного", func(t *testing.T) {
+	t.Run("help after the terminator and a positional", func(t *testing.T) {
 		for _, args := range [][]string{{"--", "--help"}, {"pos", "--help"}} {
 			fs := newFlagSet("x")
 			stdout.Reset()
-			handled, err := parseFlags(fs, "СПРАВКА x", args, &stdout)
+			handled, err := parseFlags(fs, "HELP x", args, &stdout)
 			if handled || err != nil {
-				t.Fatalf("parseFlags(%q): handled=%v err=%v, хочу успех без справки", args, handled, err)
+				t.Fatalf("parseFlags(%q): handled=%v err=%v, want success without help", args, handled, err)
 			}
 			if stdout.Len() != 0 {
-				t.Errorf("parseFlags(%q): справка напечатана:\n%s", args, stdout.String())
+				t.Errorf("parseFlags(%q): the help was printed:\n%s", args, stdout.String())
 			}
 		}
 	})
 
-	t.Run("ошибка парсинга — usage", func(t *testing.T) {
+	t.Run("a parsing error — usage", func(t *testing.T) {
 		fs := newFlagSet("x")
 		fs.Bool("json", false, "")
 		handled, err := parseFlags(fs, "", []string{"--nope"}, &stdout)
 		if !handled || err == nil {
-			t.Fatalf("handled=%v err=%v, хочу ошибка использования", handled, err)
+			t.Fatalf("handled=%v err=%v, want a usage error", handled, err)
 		}
 		if !isUsageErr(err) {
-			t.Errorf("err = %T, хочу usageErr", err)
+			t.Errorf("err = %T, want usageErr", err)
 		}
 	})
 
-	t.Run("позиционные аргументы", func(t *testing.T) {
+	t.Run("positional arguments", func(t *testing.T) {
 		fs := newFlagSet("x")
 		fs.String("zone", "", "")
 		handled, err := parseFlags(fs, "", []string{"--zone", "z", "pos1", "pos2"}, &stdout)
 		if handled || err != nil {
-			t.Fatalf("handled=%v err=%v, хочу успех", handled, err)
+			t.Fatalf("handled=%v err=%v, want success", handled, err)
 		}
 		if fs.NArg() != 2 || fs.Arg(0) != "pos1" {
-			t.Errorf("позиционные: NArg=%d Arg(0)=%q", fs.NArg(), fs.Arg(0))
+			t.Errorf("positionals: NArg=%d Arg(0)=%q", fs.NArg(), fs.Arg(0))
 		}
 	})
 }
@@ -315,13 +315,13 @@ func TestNormalizeSubdomainLabel(t *testing.T) {
 	}
 	for in, want := range ok {
 		if got, err := normalizeSubdomainLabel(in); err != nil || got != want {
-			t.Errorf("normalizeSubdomainLabel(%q) = %q, %v; хочу %q", in, got, err, want)
+			t.Errorf("normalizeSubdomainLabel(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
 	bad := []string{"", "   ", "-lead", "trail-", "a.b", "bad!!", strings.Repeat("a", 64), "ап..рель"}
 	for _, in := range bad {
 		if got, err := normalizeSubdomainLabel(in); err == nil {
-			t.Errorf("normalizeSubdomainLabel(%q) = %q, хочу ошибку", in, got)
+			t.Errorf("normalizeSubdomainLabel(%q) = %q, want an error", in, got)
 		}
 	}
 }
@@ -334,9 +334,9 @@ func dictTrainSamplePages(n int) []string {
 	for i := 0; i < n; i++ {
 		pages[i] = fmt.Sprintf(
 			"<!DOCTYPE html><html><head><title>site %d</title></head>"+
-				"<body><header class=\"site-header\">шапка парковки</header>"+
-				"<main><p>уникальный текст страницы %d</p></main>"+
-				"<footer class=\"site-footer\">продаётся: admin@example.invalid</footer>"+
+				"<body><header class=\"site-header\">parking page header</header>"+
+				"<main><p>unique page text %d</p></main>"+
+				"<footer class=\"site-footer\">for sale: admin@example.invalid</footer>"+
 				"</body></html>", i, i)
 	}
 	return pages
@@ -386,11 +386,11 @@ func TestRunDictTrainRetiresPrevious(t *testing.T) {
 	// The first training.
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"dict", "train", dictPath, "--samples", samplesA}, &stdout, &stderr); code != exitOK {
-		t.Fatalf("первый train: код = %d, stderr:\n%s", code, stderr.String())
+		t.Fatalf("the first train: code = %d, stderr:\n%s", code, stderr.String())
 	}
 	first, err := content.NewDict(mustReadFile(t, dictPath))
 	if err != nil {
-		t.Fatalf("словарь первого train: %v", err)
+		t.Fatalf("the first train's dictionary: %v", err)
 	}
 	// A frame compressed by the first dictionary (content "before
 	// retraining").
@@ -401,26 +401,26 @@ func TestRunDictTrainRetiresPrevious(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	if code := run([]string{"dict", "train", dictPath, "--samples", samplesB}, &stdout, &stderr); code != exitOK {
-		t.Fatalf("второй train: код = %d, stderr:\n%s", code, stderr.String())
+		t.Fatalf("the second train: code = %d, stderr:\n%s", code, stderr.String())
 	}
 	outStr := stdout.String()
-	if !strings.Contains(outStr, "в реестре") || !strings.Contains(outStr, fmt.Sprintf("%08x", first.ID())) {
-		t.Errorf("stdout не сообщает об архивации прежнего словаря:\n%s", outStr)
+	if !strings.Contains(outStr, "in the registry") || !strings.Contains(outStr, fmt.Sprintf("%08x", first.ID())) {
+		t.Errorf("stdout does not report archiving the previous dictionary:\n%s", outStr)
 	}
 	regPath := content.DictRegistryPath(dir, first.ID())
 	retired, err := content.NewDict(mustReadFile(t, regPath))
 	if err != nil {
-		t.Fatalf("файл реестра %s: %v", regPath, err)
+		t.Fatalf("the registry file %s: %v", regPath, err)
 	}
 	if retired.ID() != first.ID() {
-		t.Errorf("словарь в реестре ID %08x, хочу %08x", retired.ID(), first.ID())
+		t.Errorf("the registry dictionary ID %08x, want %08x", retired.ID(), first.ID())
 	}
 	second, err := content.NewDict(mustReadFile(t, dictPath))
 	if err != nil {
-		t.Fatalf("новый активный словарь: %v", err)
+		t.Fatalf("the new active dictionary: %v", err)
 	}
 	if second.ID() == first.ID() {
-		t.Fatal("переобучение не сменило ID словаря — тест ничего не проверяет")
+		t.Fatal("retraining did not change the dictionary ID — the test checks nothing")
 	}
 
 	// The old frame is readable after retraining: the registry is loaded
@@ -431,7 +431,7 @@ func TestRunDictTrainRetiresPrevious(t *testing.T) {
 	defer func() { _, _ = content.SetDictFile("", nil) }()
 	got, err := content.DecompressWithDict(frame)
 	if err != nil || !strings.Contains(string(got), "site 100") {
-		t.Errorf("кадр прежнего словаря после переобучения: err=%v, содержит=%q", err, string(got))
+		t.Errorf("the previous dictionary's frame after retraining: err=%v, contains=%q", err, string(got))
 	}
 }
 
@@ -440,7 +440,7 @@ func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("чтение %s: %v", path, err)
+		t.Fatalf("reading %s: %v", path, err)
 	}
 	return raw
 }
@@ -468,27 +468,27 @@ func TestRunDictTrain(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"dict", "train", dictPath, "--samples", samples}, &stdout, &stderr)
 	if code != exitOK {
-		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitOK, stderr.String())
+		t.Fatalf("code = %d, want %d; stderr:\n%s", code, exitOK, stderr.String())
 	}
 	outStr := stdout.String()
 	// meta.yaml is not included: the collector takes only *.html/*.htm.
-	for _, want := range []string{"файлов-образцов 10 из 10", "словарь обучен", "словарь записан"} {
+	for _, want := range []string{"sample files 10 of 10 found", "the dictionary trained", "the dictionary written"} {
 		if !strings.Contains(outStr, want) {
-			t.Errorf("stdout не содержит %q:\n%s", want, outStr)
+			t.Errorf("stdout does not contain %q:\n%s", want, outStr)
 		}
 	}
 
 	raw, err := os.ReadFile(dictPath)
 	if err != nil {
-		t.Fatalf("файл словаря не создан: %v", err)
+		t.Fatalf("the dictionary file was not created: %v", err)
 	}
 	d, err := content.NewDict(raw)
 	if err != nil {
-		t.Fatalf("словарь невалиден: %v", err)
+		t.Fatalf("the dictionary is invalid: %v", err)
 	}
 	page := dictTrainSamplePages(101)[100] // a fresh page, not from the training set
 	if _, err := d.Decompress(d.Compress([]byte(page))); err != nil {
-		t.Errorf("roundtrip со словарём команды: %v", err)
+		t.Errorf("roundtrip with the command's dictionary: %v", err)
 	}
 
 	// A directory without HTML — an execution error (code 1), not usage.
@@ -499,7 +499,7 @@ func TestRunDictTrain(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	code = run([]string{"dict", "train", dictPath, "--samples", empty}, &stdout, &stderr)
-	if code != exitError || !strings.Contains(stderr.String(), "нет HTML-образцов") {
-		t.Errorf("пустой каталог: код = %d, stderr:\n%s", code, stderr.String())
+	if code != exitError || !strings.Contains(stderr.String(), "no HTML samples") {
+		t.Errorf("empty directory: code = %d, stderr:\n%s", code, stderr.String())
 	}
 }

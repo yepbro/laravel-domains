@@ -79,19 +79,19 @@ func TestRunTestRulesMinScore(t *testing.T) {
 
 	// Default — the threshold from the configuration: 0.9 is above score 0.7 → FAIL.
 	code, out := runCorpus(testRulesConfig(t, "0.9"))
-	if code != exitError || !strings.Contains(out, "порог 0.90") || !strings.Contains(out, "FAIL") {
-		t.Errorf("конфиг 0.9 без флага: код = %d, хочу exitError с порогом 0.90 и FAIL:\n%s", code, out)
+	if code != exitError || !strings.Contains(out, "threshold 0.90") || !strings.Contains(out, "FAIL") {
+		t.Errorf("the config 0.9 without the flag: code = %d, want exitError with the threshold 0.90 and FAIL:\n%s", code, out)
 	}
 
 	// An explicit flag takes precedence over the configuration: 0.6 → OK.
 	code, out = runCorpus(testRulesConfig(t, "0.9"), "--min-score", "0.6")
-	if code != exitOK || !strings.Contains(out, "порог 0.60") || !strings.Contains(out, "OK") {
-		t.Errorf("флаг 0.6 при конфиге 0.9: код = %d, хочу exitOK с порогом 0.60:\n%s", code, out)
+	if code != exitOK || !strings.Contains(out, "threshold 0.60") || !strings.Contains(out, "OK") {
+		t.Errorf("the flag 0.6 with the config 0.9: code = %d, want exitOK with the threshold 0.60:\n%s", code, out)
 	}
 
 	// No configuration (a local run without the stack) — the flag default 0.6.
 	code, out = runCorpus("")
-	if code != exitOK || !strings.Contains(out, "порог 0.60") || !strings.Contains(out, "OK") {
-		t.Errorf("без конфигурации: код = %d, хочу exitOK с порогом 0.60 (дефолт):\n%s", code, out)
+	if code != exitOK || !strings.Contains(out, "threshold 0.60") || !strings.Contains(out, "OK") {
+		t.Errorf("without a configuration: code = %d, want exitOK with the threshold 0.60 (the default):\n%s", code, out)
 	}
 }

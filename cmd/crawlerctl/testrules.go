@@ -18,27 +18,29 @@ import (
 )
 
 // testRulesHelp — the crawlerctl test-rules --help text.
-const testRulesHelp = `crawlerctl test-rules — прогон правил Laravel по корпусу образцов
+const testRulesHelp = `crawlerctl test-rules — a run of the Laravel rules over the sample corpus
 
-Использование:
+Usage:
   crawlerctl test-rules [--rules DIR] [--samples DIR] [--min-score F]
 
-Оценивает каждую страницу из samples правилами из rules и сверяет
-is_laravel (score >= min-score), диапазон версий и состав сработавших
-правил с ожиданиями meta.yaml. Несовпадения — ошибка выполнения (код 1).
+Evaluates every page from samples with the rules from rules and cross-checks
+is_laravel (score >= min-score), the version range and the set of fired
+rules against the meta.yaml expectations. Mismatches — an execution error
+(exit code 1).
 
-Порог is_laravel по умолчанию — analyzer.laravel_min_score из конфигурации
-(боевой порог записи в laravel_domains, ТЗ 5.8/13.1): офлайн-проверка
-калибруется тем же порогом, что и analyzer; без конфигурации — 0.6.
-Явный --min-score переопределяет оба источника.
+The default is_laravel threshold is analyzer.laravel_min_score from the
+configuration (the production threshold for writing into laravel_domains,
+spec 5.8/13.1): the offline check is calibrated by the same threshold as the
+analyzer; without the configuration — 0.6. An explicit --min-score overrides
+both sources.
 `
 
 func cmdTestRules(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("test-rules")
-	rulesDir := fs.String("rules", "/rules", "каталог правил")
-	samplesDir := fs.String("samples", "/testdata/laravel-samples", "каталог образцов")
+	rulesDir := fs.String("rules", "/rules", "the rules directory")
+	samplesDir := fs.String("samples", "/testdata/laravel-samples", "the samples directory")
 	minScore := fs.Float64("min-score", 0.6,
-		"порог is_laravel (по умолчанию analyzer.laravel_min_score из конфигурации, без неё 0.6)")
+		"the is_laravel threshold (default analyzer.laravel_min_score from the configuration, 0.6 without it)")
 	if handled, err := parseFlags(fs, testRulesHelp, args, stdout); handled {
 		return err
 	}
@@ -58,14 +60,14 @@ func cmdTestRules(args []string, stdout, stderr io.Writer) error {
 	}
 	samples, err := rules.LoadSamples(*samplesDir)
 	if err != nil {
-		return fmt.Errorf("корпус образцов недоступен: %w", err)
+		return fmt.Errorf("the sample corpus is unavailable: %w", err)
 	}
 	if len(samples) == 0 {
-		out(stdout, "test-rules: корпус образцов пуст — нечего проверять (ok)\n")
+		out(stdout, "test-rules: the sample corpus is empty — nothing to check (ok)\n")
 		return nil
 	}
 
-	out(stdout, "test-rules: набор правил v%d (%d правил), образцов: %d, порог %.2f\n\n",
+	out(stdout, "test-rules: ruleset v%d (%d rules), samples: %d, threshold %.2f\n\n",
 		set.Version, len(set.Rules), len(samples), *minScore)
 
 	failed := 0
@@ -95,24 +97,24 @@ func cmdTestRules(args []string, stdout, stderr io.Writer) error {
 			if !slices.Equal(fired, want) {
 				status = "FAIL"
 				failed++
-				out(stdout, "     ! правила: в meta.yaml %v, сработали %v\n", want, fired)
+				out(stdout, "     ! rules: in meta.yaml %v, fired %v\n", want, fired)
 			}
 		}
 
 		ver := fmt.Sprintf("[%s..%s]", orDash(res.VerMin), orDash(res.VerMax))
 		if res.Conflict {
-			ver = "[конфликт]"
+			ver = "[conflict]"
 		}
-		out(stdout, "%s %-28s laravel=%-5v score=%.3f ver=%-14s правил=%d\n",
+		out(stdout, "%s %-28s laravel=%-5v score=%.3f ver=%-14s rules=%d\n",
 			status, s.ID, isLaravel, res.Score, ver, len(res.Signals))
 		for _, ev := range res.Signals {
 			out(stdout, "     - %-26s w=%.2f  %s\n", ev.Rule, ev.Weight, ev.Evidence)
 		}
 	}
 
-	out(stdout, "\nтестов: %d, ошибок: %d\n", len(samples), failed)
+	out(stdout, "\ntests: %d, failures: %d\n", len(samples), failed)
 	if failed > 0 {
-		return fmt.Errorf("test-rules: %d несовпадений с ожиданиями meta.yaml", failed)
+		return fmt.Errorf("test-rules: %d mismatches against the meta.yaml expectations", failed)
 	}
 	return nil
 }

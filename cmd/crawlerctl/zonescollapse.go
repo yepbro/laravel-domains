@@ -27,17 +27,17 @@ import (
 // also needed for the allowlist — read here, counters.go style).
 func zonesCollapse(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("zones collapse")
-	apply := fs.Bool("apply", false, "выполнить перенос (без флага — dry-run: инвентаризация и план)")
-	skipReconcile := fs.Bool("skip-reconcile", false, "пропустить реконсиляцию счётчиков после переноса (только с --apply)")
-	force := fs.Bool("force", false, "игнорировать домены в очереди (check_state = 1) в затрагиваемых зонах")
+	apply := fs.Bool("apply", false, "perform the move (without the flag — dry-run: inventory and plan)")
+	skipReconcile := fs.Bool("skip-reconcile", false, "skip the counter reconciliation after the move (only with --apply)")
+	force := fs.Bool("force", false, "ignore the domains in the queue (check_state = 1) in the affected zones")
 	if handled, err := parseFlags(fs, zonesHelp, args, stdout); handled {
 		return err
 	}
 	if fs.NArg() > 0 {
-		return usagef("zones collapse: лишние аргументы %v (зоны выбирает инвентаризация, команда без позиционных аргументов)", fs.Args())
+		return usagef("zones collapse: extra arguments %v (the inventory selects the zones, the command takes no positional arguments)", fs.Args())
 	}
 	if *skipReconcile && !*apply {
-		return usagef("zones collapse: --skip-reconcile дополняет --apply (dry-run ничего не переносит и не реконсилярует)")
+		return usagef("zones collapse: --skip-reconcile complements --apply (dry-run moves and reconciles nothing)")
 	}
 
 	// A one-off CLI command: Ctrl-C/SIGTERM interrupt the move — completed

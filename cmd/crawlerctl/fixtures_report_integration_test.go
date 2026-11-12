@@ -23,7 +23,7 @@ import (
 // verdict.
 func TestFixturesSnapshotReportLive(t *testing.T) {
 	if os.Getenv("CRAWLER_INTEGRATION") != "1" {
-		t.Skip("интеграционный тест снапшота/отчёта: запустите make test-integration")
+		t.Skip("the snapshot/report integration test: run make test-integration")
 	}
 	ctx := context.Background()
 	pool, cleanup := t243Schema(t)
@@ -45,7 +45,7 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 		})
 	}
 	if _, err := fixturesImportRun(ctx, pool, dump, os.Stdout); err != nil {
-		t.Fatalf("накат: %v", err)
+		t.Fatalf("the import: %v", err)
 	}
 
 	// simulateRun — a run: success/finalize/verdicts. The worker contract
@@ -60,7 +60,7 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 			if finalized[sub] {
 				if _, err := pool.Exec(ctx,
 					"UPDATE subdomain_results SET render_failed_at = now() WHERE zone_id = 9 AND domain_id = 77 AND subdomain_id = $1 AND variant = 0", sub); err != nil {
-					t.Fatalf("финализация %d: %v", sub, err)
+					t.Fatalf("finalization %d: %v", sub, err)
 				}
 				continue
 			}
@@ -68,12 +68,12 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 			if _, err := pool.Exec(ctx,
 				"INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) VALUES ($1, 0, 0, $2, $2, 1) ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + 1",
 				hash, domLen[sub]); err != nil {
-				t.Fatalf("сид контента %d: %v", sub, err)
+				t.Fatalf("the content seed %d: %v", sub, err)
 			}
 			if _, err := pool.Exec(ctx,
 				"UPDATE subdomain_results SET rendered = true, content_hash = $1, rules_version = NULL WHERE zone_id = 9 AND domain_id = 77 AND subdomain_id = $2 AND variant = 0",
 				hash, sub); err != nil {
-				t.Fatalf("рендер %d: %v", sub, err)
+				t.Fatalf("the render %d: %v", sub, err)
 			}
 			isLaravel, ok := laravel[sub]
 			if !ok {
@@ -81,7 +81,7 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 			}
 			if _, err := pool.Exec(ctx,
 				"UPDATE subdomain_results SET rules_version = 7 WHERE zone_id = 9 AND domain_id = 77 AND subdomain_id = $1 AND variant = 0", sub); err != nil {
-				t.Fatalf("штамп анализатора %d: %v", sub, err)
+				t.Fatalf("the analyzer stamp %d: %v", sub, err)
 			}
 			if *isLaravel {
 				if _, err := pool.Exec(ctx,
@@ -89,11 +89,11 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 						"VALUES (9, 77, $1, 0, 0.9, true, '[]'::jsonb, 7) ON CONFLICT (zone_id, domain_id, subdomain_id, variant) "+
 						"DO UPDATE SET is_laravel = true, rules_version = 7",
 					sub); err != nil {
-					t.Fatalf("вердикт анализатора %d: %v", sub, err)
+					t.Fatalf("the analyzer verdict %d: %v", sub, err)
 				}
 			} else if _, err := pool.Exec(ctx,
 				"DELETE FROM laravel_findings WHERE zone_id = 9 AND domain_id = 77 AND subdomain_id = $1 AND variant = 0", sub); err != nil {
-				t.Fatalf("удаление findings %d: %v", sub, err)
+				t.Fatalf("the findings deletion %d: %v", sub, err)
 			}
 		}
 	}
@@ -106,7 +106,7 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 		t.Helper()
 		rows, err := fixturesSnapshotReadRows(ctx, pool, keys)
 		if err != nil {
-			t.Fatalf("снапшот %s: %v", label, err)
+			t.Fatalf("the snapshot %s: %v", label, err)
 		}
 		return &fixturesSnapshot{
 			FormatVersion: fixturesSnapshotVersion,
@@ -121,7 +121,7 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 	// on all successes, Laravel on 1 and 4.
 	reset := func() {
 		if _, err := fixturesImportRun(ctx, pool, dump, os.Stdout); err != nil {
-			t.Fatalf("повторный накат: %v", err)
+			t.Fatalf("the repeated import: %v", err)
 		}
 	}
 	reset()
@@ -148,22 +148,22 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 
 	report, err := fixturesReportBuild(snapChromium, snapMoli, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	if report.SuccessRenderedB != 5 || report.SuccessRenderedC != 5 {
-		t.Fatalf("успешность прогонов = %d/%d, хочу 5/5", report.SuccessRenderedB, report.SuccessRenderedC)
+		t.Fatalf("the runs success = %d/%d, want 5/5", report.SuccessRenderedB, report.SuccessRenderedC)
 	}
 	if report.DetectionComparable != 5 || report.DetectionDiff != 0 {
-		t.Fatalf("детекция = %d сравнимых / %d расхождений, хочу 5/0", report.DetectionComparable, report.DetectionDiff)
+		t.Fatalf("detection = %d comparable / %d divergences, want 5/0", report.DetectionComparable, report.DetectionDiff)
 	}
-	if v := verdictOf(t, report, "детекция"); v == nil || v.Status != verdictPass {
-		t.Fatalf("вердикт детекции = %+v, хочу ПРОЙДЕН", v)
+	if v := verdictOf(t, report, "detection"); v == nil || v.Status != verdictPass {
+		t.Fatalf("the detection verdict = %+v, want PASSED", v)
 	}
 	if report.DOMPairs != 5 || report.DOMIdentical != 4 {
-		t.Fatalf("DOM-пары = %d, идентичных %d, хочу 5/4", report.DOMPairs, report.DOMIdentical)
+		t.Fatalf("DOM pairs = %d, identical %d, want 5/4", report.DOMPairs, report.DOMIdentical)
 	}
 	if report.DOMMedLenRatio == nil || *report.DOMMedLenRatio != 1 {
-		t.Fatalf("медиана длины DOM = %v, хочу 1", report.DOMMedLenRatio)
+		t.Fatalf("the DOM length median = %v, want 1", report.DOMMedLenRatio)
 	}
 
 	// Corrupted run: subdomain 1's signal VANISHED entirely (the analyzer
@@ -180,13 +180,13 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 	snapCorrupted := take("moli-2", "moli")
 	report, err = fixturesReportBuild(snapChromium, snapCorrupted, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт (испорченный): %v", err)
+		t.Fatalf("the report (corrupted): %v", err)
 	}
 	if report.DetectionDiff != 2 || report.DetectionRatePct != 40 {
-		t.Fatalf("расхождения = %d (%.2f%%), хочу 2 (40%%)", report.DetectionDiff, report.DetectionRatePct)
+		t.Fatalf("divergences = %d (%.2f%%), want 2 (40%%)", report.DetectionDiff, report.DetectionRatePct)
 	}
-	if v := verdictOf(t, report, "детекция"); v == nil || v.Status != verdictFail {
-		t.Fatalf("вердикт детекции = %+v, хочу НЕ ПРОЙДЕН", v)
+	if v := verdictOf(t, report, "detection"); v == nil || v.Status != verdictFail {
+		t.Fatalf("the detection verdict = %+v, want FAILED", v)
 	}
 
 	// The q:analyze tail: subdomain 4's DOM is written but the analyzer
@@ -204,13 +204,13 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 	snapTail := take("moli-3", "moli")
 	report, err = fixturesReportBuild(snapChromium, snapTail, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт (хвост analyzer): %v", err)
+		t.Fatalf("the report (the analyzer tail): %v", err)
 	}
 	if report.DetectionComparable != 4 {
-		t.Fatalf("сравнимых %d, хочу 4 (строка без штампа анализатора исключена)", report.DetectionComparable)
+		t.Fatalf("comparable %d, want 4 (a row without the analyzer stamp is excluded)", report.DetectionComparable)
 	}
 	if report.DetectionDiff != 0 {
-		t.Fatalf("расхождений %d, хочу 0", report.DetectionDiff)
+		t.Fatalf("divergences %d, want 0", report.DetectionDiff)
 	}
 }
 

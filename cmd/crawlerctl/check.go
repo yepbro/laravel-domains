@@ -19,24 +19,25 @@ import (
 )
 
 // checkHelp — help text for crawlerctl check --help.
-const checkHelp = `crawlerctl check — живая проверка домена конвейером (T-119)
+const checkHelp = `crawlerctl check — a live domain check by the pipeline (T-119)
 
-Использование:
-  crawlerctl check <домен>
+Usage:
+  crawlerctl check <domain>
 
-Полный цикл для одного имени: DNS (справочник subdomains из БД) → HTTP
-обоих схем DNS-живых субдоменов (рендер SPA-страниц при настроенном
-render.remote_url) → пассивный анализ правилами Laravel. Вывод по
-субдоменам: статус, цепочка редиректов, сводка TLS, сработавшие правила
-с evidence, score, диапазон версий.
+The full cycle for one name: DNS (the subdomains catalog from the DB) →
+HTTP of both schemes of the DNS-alive subdomains (an SPA page render with
+render.remote_url configured) → passive analysis with the Laravel rules.
+The per-subdomain output: the status, the redirect chain, the TLS summary,
+the fired rules with evidence, the score, the version range.
 
-Read-only: ничего не пишет в БД и не публикует в очереди — постановка
-домена на штатную проверку отдельной командой (crawlerctl recheck).
-User-Agent, таймауты и лимиты — из конфигурации (секции dns/http/render);
-анализ — актуальный набор правил analyzer.rules_dir и порог
-analyzer.laravel_min_score. Никаких активных зондов: только GET /
-живых субдоменов (пассивная этика ТЗ §5.8/§9).
-Коды возврата: 0 — проверка выполнена, 1 — ошибка, 2 — использование.
+Read-only: nothing is written into the DB and nothing is published into
+the queues — scheduling a domain for the regular check is a separate
+command (crawlerctl recheck). The User-Agent, timeouts and limits come
+from the configuration (the dns/http/render sections); the analysis — the
+current analyzer.rules_dir rule set and the analyzer.laravel_min_score
+threshold. No active probes: only GET / of the alive subdomains (the
+passive ethics, spec §5.8/§9).
+Exit codes: 0 — the check was performed, 1 — error, 2 — usage.
 `
 
 func cmdCheck(args []string, stdout, stderr io.Writer) error {
@@ -45,10 +46,10 @@ func cmdCheck(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return usagef("укажите ровно один домен: crawlerctl check example.com")
+		return usagef("specify exactly one domain: crawlerctl check example.com")
 	}
 	if _, err := idn.Normalize(fs.Arg(0)); err != nil {
-		return usagef("check: некорректное имя домена %q: %v", fs.Arg(0), err)
+		return usagef("check: invalid domain name %q: %v", fs.Arg(0), err)
 	}
 
 	cfg, err := config.Load()
@@ -89,14 +90,14 @@ func (l checkLog) Info(msg string, args ...any) {}
 
 // checkPrintResult — prints the check result.
 func checkPrintResult(w io.Writer, res *checker.Result, minScore float64, rulesDir string) {
-	out(w, "check: %s (зона %s", res.Domain, res.Zone)
+	out(w, "check: %s (zone %s", res.Domain, res.Zone)
 	if res.Unicode != res.Domain {
 		out(w, ", unicode %s", res.Unicode)
 	}
-	out(w, ") — правила %s, порог %.2f, DNS %s\n\n", rulesDir, minScore, res.Apex)
+	out(w, ") — rules %s, threshold %.2f, DNS %s\n\n", rulesDir, minScore, res.Apex)
 
 	if res.Terminal != "" {
-		out(w, "итог: терминальный статус DNS-этапа — %s (адресов нет)\n", res.Terminal)
+		out(w, "result: the DNS stage terminal status — %s (no addresses)\n", res.Terminal)
 		return
 	}
 
@@ -104,11 +105,11 @@ func checkPrintResult(w io.Writer, res *checker.Result, minScore float64, rulesD
 		r := &res.Records[i]
 		label := r.Label
 		if label == "" {
-			label = "(апекс)"
+			label = "(apex)"
 		}
-		out(w, "%s [%s] запись %s/%s: %s %s\n", r.Host, label, r.Variant, r.Scheme, r.Status, r.FinalURL)
+		out(w, "%s [%s] record %s/%s: %s %s\n", r.Host, label, r.Variant, r.Scheme, r.Status, r.FinalURL)
 		if len(r.Redirects) > 1 {
-			out(w, "    редиректы:")
+			out(w, "    redirects:")
 			for j, step := range r.Redirects {
 				if j == len(r.Redirects)-1 {
 					break
@@ -118,22 +119,22 @@ func checkPrintResult(w io.Writer, res *checker.Result, minScore float64, rulesD
 			out(w, "\n")
 		}
 		if r.HasTLS {
-			verdict := "валиден"
+			verdict := "valid"
 			if !r.TLSValid {
-				verdict = "ПРОБЛЕМЫ"
+				verdict = "PROBLEMS"
 			}
-			out(w, "    TLS: %s, истекает %s\n", verdict, r.TLSNotAfter.Format("2006-01-02"))
+			out(w, "    TLS: %s, expires %s\n", verdict, r.TLSNotAfter.Format("2006-01-02"))
 		}
-		src := "исходный HTML"
+		src := "raw HTML"
 		if r.Rendered {
-			src = "DOM после рендера"
+			src = "DOM after render"
 		}
-		out(w, "    laravel: score=%.3f ver=[%s..%s] правил=%d (%s)\n",
+		out(w, "    laravel: score=%.3f ver=[%s..%s] rules=%d (%s)\n",
 			r.Score, orDash(r.VerMin), orDash(r.VerMax), len(r.Signals), src)
 		for _, ev := range r.Signals {
-			out(w, "      - %-28s w=%.2f  «%s»\n", ev.Rule, ev.Weight, ev.Evidence)
+			out(w, "      - %-28s w=%.2f  \"%s\"\n", ev.Rule, ev.Weight, ev.Evidence)
 		}
 	}
-	out(w, "\ncheck: %s — итог score=%.3f found=%v, DNS %d мс, всего %d мс (ничего не записано)\n",
+	out(w, "\ncheck: %s — final score=%.3f found=%v, DNS %d ms, total %d ms (nothing written)\n",
 		res.Domain, res.Score, res.Found, res.DNSMS, res.TotalMS)
 }

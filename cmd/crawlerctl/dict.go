@@ -25,21 +25,22 @@ import (
 )
 
 // dictHelp — help text for crawlerctl dict --help.
-const dictHelp = `crawlerctl dict — управление словарём сжатия zstd (ТЗ 5.7)
+const dictHelp = `crawlerctl dict — managing the zstd compression dictionary (spec 5.7)
 
-Использование:
-  crawlerctl dict train <выходной-файл> [--samples ПУТЬ]…
+Usage:
+  crawlerctl dict train <output-file> [--samples PATH]…
 
-Обучает словарь zstd по HTML-образцам (повторяющиеся шаблоны парковок и
-заглушек уходят в словарь и не кодируются в каждой странице) и записывает
-его в выходной файл атомарно. Путь --samples — файл *.html/*.htm или
-каталог (обход рекурсивный); флаг можно повторять. По умолчанию образцы —
-testdata/laravel-samples. Переобучение — повторный запуск команды.
+Trains a zstd dictionary over HTML samples (the repeated patterns of
+parkings and stubs go into the dictionary and are not encoded in every
+page) and writes it to the output file atomically. The --samples path is
+a *.html/*.htm file or a directory (a recursive walk); the flag can be
+repeated. The default samples are testdata/laravel-samples. Retraining —
+running the command again.
 
-Словарь подключается конфигурацией content.zstd_dictionary. При
-переобучении прежний словарь автоматически архивируется в реестр прежних
-словарей (файл dict-<id>.zstd рядом с новым): записанные им паки
-остаются читаемыми.
+The dictionary is wired in by the content.zstd_dictionary configuration.
+On retraining the previous dictionary is automatically archived into the
+previous-dictionaries registry (a dict-<id>.zstd file next to the new one):
+the packs written with it stay readable.
 `
 
 // dictTrainSampleDefault — default sample directory (same as test-rules):
@@ -48,7 +49,7 @@ const dictTrainSampleDefault = "testdata/laravel-samples"
 
 func cmdDict(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usagef("укажите действие: crawlerctl dict train")
+		return usagef("specify an action: crawlerctl dict train")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
@@ -58,7 +59,7 @@ func cmdDict(args []string, stdout, stderr io.Writer) error {
 		out(stdout, "%s", dictHelp)
 		return flag.ErrHelp
 	default:
-		return usagef("неизвестное действие %q (допустимы: train)", action)
+		return usagef("unknown action %q (valid: train)", action)
 	}
 }
 
@@ -69,7 +70,7 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 	}
 	fs := newFlagSet("dict train")
 	var samplePaths []string
-	fs.Func("samples", "файл или каталог с HTML-образцами (можно повторять)",
+	fs.Func("samples", "a file or directory with HTML samples (repeatable)",
 		func(v string) error {
 			samplePaths = append(samplePaths, v)
 			return nil
@@ -90,7 +91,7 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 			pass = append(pass, a)
 		case a == "-samples" || a == "--samples":
 			if i+1 >= len(args) {
-				return usagef("dict train: флаг --samples требует значение")
+				return usagef("dict train: the --samples flag requires a value")
 			}
 			i++
 			pass = append(pass, "--samples", args[i])
@@ -106,7 +107,7 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if len(pos) != 1 {
-		return usagef("укажите выходной файл: crawlerctl dict train <файл> [--samples ПУТЬ]…")
+		return usagef("specify the output file: crawlerctl dict train <file> [--samples PATH]…")
 	}
 	outPath := pos[0]
 	if len(samplePaths) == 0 {
@@ -118,21 +119,21 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("dict train: %w", err)
 	}
 	if len(files) == 0 {
-		return fmt.Errorf("dict train: в %s нет HTML-образцов (*.html, *.htm)",
+		return fmt.Errorf("dict train: no HTML samples in %s (*.html, *.htm)",
 			strings.Join(samplePaths, ", "))
 	}
 	samples, read := readSamples(files, content.DefaultTrainCorpusLimit)
 	if len(samples) == 0 {
-		return fmt.Errorf("dict train: образцы пусты")
+		return fmt.Errorf("dict train: the samples are empty")
 	}
-	out(stdout, "dict train: файлов-образцов %d из %d найденных, корпус %d байт (лимит обучения %d байт)\n",
+	out(stdout, "dict train: sample files %d of %d found, corpus %d bytes (the training limit %d bytes)\n",
 		len(samples), len(files), read, content.DefaultTrainCorpusLimit)
 
 	d, err := content.TrainDict(samples, content.TrainOptions{})
 	if err != nil {
 		return fmt.Errorf("dict train: %w", err)
 	}
-	out(stdout, "dict train: словарь обучен: %d байт, ID %08x\n", len(d.Raw()), d.ID())
+	out(stdout, "dict train: the dictionary trained: %d bytes, ID %08x\n", len(d.Raw()), d.ID())
 
 	// Measurement on the training corpus — a reference point for the
 	// operator (the real effect is measured on fresh pages of the same
@@ -143,7 +144,7 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 		dictSum += len(d.Compress(s))
 		evalBytes += len(s)
 	}
-	out(stdout, "dict train: оценка сжатия корпуса %d байт: без словаря %d, со словарём %d\n",
+	out(stdout, "dict train: the corpus compression estimate over %d bytes: without the dictionary %d, with it %d\n",
 		evalBytes, plainSum, dictSum)
 
 	// The previous dictionary goes to the retired registry (T-103) before
@@ -155,23 +156,23 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 		if prev.ID() != d.ID() {
 			regPath := content.DictRegistryPath(filepath.Dir(outPath), prev.ID())
 			if err := content.RetireDict(prev, filepath.Dir(outPath)); err != nil {
-				return fmt.Errorf("dict train: архивация прежнего словаря %08x в %s: %w",
+				return fmt.Errorf("dict train: archiving the previous dictionary %08x into %s: %w",
 					prev.ID(), regPath, err)
 			}
-			out(stdout, "dict train: прежний словарь ID %08x — в реестре: %s\n", prev.ID(), regPath)
+			out(stdout, "dict train: the previous dictionary ID %08x — in the registry: %s\n", prev.ID(), regPath)
 		}
 	} else if !errors.Is(err, iofs.ErrNotExist) {
 		// The previous file is not a dictionary: it cannot make old packs
 		// readable, and the new one will be written over it — the
 		// operator should know.
-		out(stderr, "dict train: прежний файл %s не является словарём zstd (%v), архивация пропущена\n",
+		out(stderr, "dict train: the previous file %s is not a zstd dictionary (%v), archiving skipped\n",
 			outPath, err)
 	}
 
 	if err := d.Save(outPath); err != nil {
 		return fmt.Errorf("dict train: %w", err)
 	}
-	out(stdout, "dict train: словарь записан: %s\n", outPath)
+	out(stdout, "dict train: the dictionary written: %s\n", outPath)
 	return nil
 }
 
@@ -186,7 +187,7 @@ func collectSampleFiles(paths []string) ([]string, error) {
 			// The samples path is named in the error, not the raw os error:
 			// "stat …: no such file" without context does not say it is
 			// --samples.
-			return nil, fmt.Errorf("образцы %s: %w", p, err)
+			return nil, fmt.Errorf("samples %s: %w", p, err)
 		}
 		if !st.IsDir() {
 			if isHTMLFile(p) {

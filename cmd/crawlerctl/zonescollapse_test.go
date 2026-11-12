@@ -20,21 +20,21 @@ func TestRunZonesCollapseExecution(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
 	cases := []runCase{
-		{name: "collapse — нет конфигурации", args: []string{"zones", "collapse"},
+		{name: "collapse — no configuration", args: []string{"zones", "collapse"},
 			code: exitError, inErr: "zones collapse: config:"},
-		{name: "collapse --apply — нет конфигурации", args: []string{"zones", "collapse", "--apply"},
+		{name: "collapse --apply — no configuration", args: []string{"zones", "collapse", "--apply"},
 			code: exitError, inErr: "zones collapse: config:"},
-		{name: "collapse --force — нет конфигурации", args: []string{"zones", "collapse", "--force"},
+		{name: "collapse --force — no configuration", args: []string{"zones", "collapse", "--force"},
 			code: exitError, inErr: "zones collapse: config:"},
-		{name: "collapse --skip-reconcile без --apply", args: []string{"zones", "collapse", "--skip-reconcile"},
-			code: exitUsage, inErr: "--skip-reconcile дополняет --apply"},
-		{name: "collapse лишний аргумент", args: []string{"zones", "collapse", "5g.in"},
-			code: exitUsage, inErr: "лишние аргументы"},
-		{name: "collapse неизвестный флаг", args: []string{"zones", "collapse", "--nope"},
+		{name: "collapse --skip-reconcile without --apply", args: []string{"zones", "collapse", "--skip-reconcile"},
+			code: exitUsage, inErr: "--skip-reconcile complements --apply"},
+		{name: "collapse extra argument", args: []string{"zones", "collapse", "5g.in"},
+			code: exitUsage, inErr: "extra arguments"},
+		{name: "collapse unknown flag", args: []string{"zones", "collapse", "--nope"},
 			code: exitUsage, inErr: "zones collapse:"},
 		{name: "collapse --help", args: []string{"zones", "collapse", "--help"},
-			code: exitOK, inOut: "перенести данные 2LD-зон в TLD-зоны"},
-		{name: "zones help упоминает collapse", args: []string{"zones", "--help"},
+			code: exitOK, inOut: "move the 2LD zone data into TLD zones"},
+		{name: "zones help mentions collapse", args: []string{"zones", "--help"},
 			code: exitOK, inOut: "collapse [--apply]"},
 	}
 	for _, tc := range cases {
@@ -42,13 +42,13 @@ func TestRunZonesCollapseExecution(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.args, &stdout, &stderr)
 			if code != tc.code {
-				t.Errorf("run(%q) код = %d, хочу %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
+				t.Errorf("run(%q) code = %d, want %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
 			}
 			if tc.inErr != "" && !strings.Contains(stderr.String(), tc.inErr) {
-				t.Errorf("run(%q) stderr не содержит %q:\n%s", tc.args, tc.inErr, stderr.String())
+				t.Errorf("run(%q) stderr does not contain %q:\n%s", tc.args, tc.inErr, stderr.String())
 			}
 			if tc.inOut != "" && !strings.Contains(stdout.String(), tc.inOut) {
-				t.Errorf("run(%q) stdout не содержит %q:\n%s", tc.args, tc.inOut, stdout.String())
+				t.Errorf("run(%q) stdout does not contain %q:\n%s", tc.args, tc.inOut, stdout.String())
 			}
 		})
 	}

@@ -32,23 +32,23 @@ import (
 // ---------------------------------------------------------------- reanalyze
 
 // reanalyzeHelp — the crawlerctl reanalyze --help text.
-const reanalyzeHelp = `crawlerctl reanalyze — переанализ сохранённых результатов (ТЗ 5.8)
+const reanalyzeHelp = `crawlerctl reanalyze — re-analysis of the stored results (spec 5.8)
 
-Использование:
-  crawlerctl reanalyze [--zone ИМЯ]
+Usage:
+  crawlerctl reanalyze [--zone NAME]
 
-Находит subdomain_results с устаревшим rules_version (включая никогда не
-анализированные) и ставит их в q:analyze пачками — повторное скачивание
-не выполняется, анализ идёт по сохранённому контенту. Без --zone — все
-зоны. Версия набора правил берётся из каталога analyzer.rules_dir на
-момент запуска (живой сервис analyzer перезагружает правила SIGHUP и
-переанализирует сам); воркер analyzer фиксирует новые результаты.
-Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
+Finds subdomain_results with a stale rules_version (including the never
+analyzed ones) and enqueues them into q:analyze in batches — no re-download
+happens, the analysis goes over the stored content. Without --zone — all
+zones. The rule set version is read from the analyzer.rules_dir catalog at
+the moment of the run (the live analyzer service reloads the rules on SIGHUP
+and re-analyzes on its own); the analyzer worker records the new results.
+Exit codes: 0 — success, 1 — error, 2 — usage.
 `
 
 func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("reanalyze")
-	zone := fs.String("zone", "", "переанализ по зоне (пусто — все)")
+	zone := fs.String("zone", "", "re-analysis by zone (empty — all)")
 	if handled, err := parseFlags(fs, reanalyzeHelp, args, stdout); handled {
 		return err
 	}
@@ -58,12 +58,12 @@ func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
 		// directories (internal/idn.NormalizeZone): the zone is stored in punycode.
 		normalized, err := idn.NormalizeZone(*zone)
 		if err != nil {
-			return usagef("reanalyze: некорректное имя зоны %q: %v", *zone, err)
+			return usagef("reanalyze: invalid zone name %q: %v", *zone, err)
 		}
 		zoneName = normalized
 	}
 	if fs.NArg() > 0 {
-		return usagef("reanalyze: лишние аргументы %v (команда принимает только --zone)", fs.Args())
+		return usagef("reanalyze: extra arguments %v (the command takes only --zone)", fs.Args())
 	}
 
 	// The configuration — a single YAML + environment (internal/config):
@@ -95,7 +95,7 @@ func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
 	}
 	defer pool.Close()
 
-	zoneDesc := "все"
+	zoneDesc := "all"
 	var zoneID *int16
 	if zoneName != "" {
 		id, found, err := analyzer.ZoneIDByName(ctx, pool, zoneName)
@@ -103,7 +103,7 @@ func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("reanalyze: %w", err)
 		}
 		if !found {
-			return fmt.Errorf("reanalyze: зона %s не найдена в справочнике (зоны создаёт ingest при первом файле)", zoneName)
+			return fmt.Errorf("reanalyze: zone %s is not in the catalog (ingest creates zones on the first file)", zoneName)
 		}
 		zoneID, zoneDesc = &id, zoneName
 	}
@@ -123,16 +123,16 @@ func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
 		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ on each stream (T-025)
 	}), gate)
 
-	out(stdout, "reanalyze: набор правил v%d, зона: %s\n", set.Version, zoneDesc)
+	out(stdout, "reanalyze: ruleset v%d, zone: %s\n", set.Version, zoneDesc)
 	res, err := analyzer.ReanalyzeDrain(ctx, pool, q, set.Version, zoneID, analyzer.ReanalyzeOptions{})
 	if err != nil {
-		return fmt.Errorf("reanalyze: поставлено в q:analyze %d, прервано: %w", res.Published, err)
+		return fmt.Errorf("reanalyze: enqueued into q:analyze %d, interrupted: %w", res.Published, err)
 	}
 	if res.Published == 0 {
-		out(stdout, "reanalyze: устаревших результатов нет — переанализ не требуется\n")
+		out(stdout, "reanalyze: no stale results — re-analysis not required\n")
 		return nil
 	}
-	out(stdout, "reanalyze: поставлено в q:analyze: %d\n", res.Published)
+	out(stdout, "reanalyze: enqueued into q:analyze: %d\n", res.Published)
 	return nil
 }
 
@@ -157,43 +157,44 @@ func cmdReanalyze(args []string, stdout, stderr io.Writer) error {
 
 // subdomainsHelp — the crawlerctl subdomains [--help] text; the same text is
 // printed for subdomains <action> --help.
-const subdomainsHelp = `crawlerctl subdomains — управление проверяемыми субдоменами (ТЗ 5.10)
+const subdomainsHelp = `crawlerctl subdomains — managing the checked subdomains (spec 5.10)
 
-Использование:
+Usage:
   crawlerctl subdomains list
-  crawlerctl subdomains add <метка>
-  crawlerctl subdomains disable <метка|бит>
-  crawlerctl subdomains recheck <метка> [--zone ИМЯ]
+  crawlerctl subdomains add <label>
+  crawlerctl subdomains disable <label|bit>
+  crawlerctl subdomains recheck <label> [--zone NAME]
 
-Справочник субдоменов — таблица subdomains: каждый субдомен занимает бит
-dns_mask (id = номер бита, максимум 63 — бит 63 знаковый), '' — апекс
-(бит 0). Добавление субдомена — новая строка со свободным битом, миграция
-данных не нужна (ТЗ 13.1); dns-worker перечитывает справочник на каждую
-пачку — изменения подхватываются без рестарта сервисов.
+The subdomains catalog — the subdomains table: every subdomain occupies a
+dns_mask bit (id = the bit number, at most 63 — bit 63 is the sign bit),
+'' — the apex (bit 0). Adding a subdomain — a new row with a free bit, no
+data migration needed (spec 13.1); the dns-worker re-reads the catalog on
+every batch — the changes are picked up without a service restart.
 
-  list                таблица справочника: бит, метка, состояние
-  add <метка>         добавить субдомен (enabled = true); метка — короткое
-                      имя без точек (www, admin, …), unicode приводится
-                      к punycode
-  disable <метка|бит> выключить проверку (enabled = false): бит dns_mask
-                      и накопленные результаты не меняются — маски
-                      стабильны (ТЗ 13.1); апекс (бит 0) — основа
-                      проверки домена, выключить нельзя. Аргумент сперва
-                      ищется как метка, затем — как номер бита
-  recheck <метка> [--zone ИМЯ]
-                      проверка субдомена по уже проверенным доменам
-                      (ТЗ 13.1): done-домены зоны (--zone) или всех зон
-                      (deleted исключаются) пачками переводятся в pending
-                      и проходят DNS/HTTP-этап заново уже с новым
-                      субдоменом; домены в pending/queued проверятся с ним
-                      и так. Темп задаёт планировщик (backpressure q:dns)
+  list                the catalog table: bit, label, state
+  add <label>         add a subdomain (enabled = true); the label is a short
+                      name without dots (www, admin, …), unicode is converted
+                      to punycode
+  disable <label|bit> disable the check (enabled = false): the dns_mask bit
+                      and the accumulated results are not changed — the masks
+                      are stable (spec 13.1); the apex (bit 0) is the basis
+                      of a domain check, it cannot be disabled. The argument
+                      is first looked up as a label, then as a bit number
+  recheck <label> [--zone NAME]
+                      checking a subdomain over the already checked domains
+                      (spec 13.1): the zone's done domains (--zone) or those
+                      of all zones (deleted excluded) are moved in batches
+                      to pending and pass the DNS/HTTP stage again already
+                      with the new subdomain; the domains in pending/queued
+                      will be checked with it anyway. The pace is set by the
+                      scheduler (the q:dns backpressure)
 
-Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
+Exit codes: 0 — success, 1 — error, 2 — usage.
 `
 
 func cmdSubdomains(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usagef("укажите действие: crawlerctl subdomains list|add|disable|recheck")
+		return usagef("specify an action: crawlerctl subdomains list|add|disable|recheck")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
@@ -209,7 +210,7 @@ func cmdSubdomains(args []string, stdout, stderr io.Writer) error {
 		out(stdout, "%s", subdomainsHelp)
 		return flag.ErrHelp
 	default:
-		return usagef("неизвестное действие %q (допустимы: list, add, disable, recheck)", action)
+		return usagef("unknown action %q (valid: list, add, disable, recheck)", action)
 	}
 }
 
@@ -307,19 +308,19 @@ type subdomainRow struct {
 func fetchSubdomains(ctx context.Context, pool db.DB) ([]subdomainRow, error) {
 	rows, err := pool.Query(ctx, subdomainsSelectSQL)
 	if err != nil {
-		return nil, fmt.Errorf("справочник субдоменов: %w", err)
+		return nil, fmt.Errorf("subdomains catalog: %w", err)
 	}
 	defer rows.Close()
 	var subs []subdomainRow
 	for rows.Next() {
 		var s subdomainRow
 		if err := rows.Scan(&s.id, &s.label, &s.enabled); err != nil {
-			return nil, fmt.Errorf("справочник субдоменов: чтение: %w", err)
+			return nil, fmt.Errorf("subdomains catalog: reading: %w", err)
 		}
 		subs = append(subs, s)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("справочник субдоменов: %w", err)
+		return nil, fmt.Errorf("subdomains catalog: %w", err)
 	}
 	return subs, nil
 }
@@ -328,18 +329,18 @@ func fetchSubdomains(ctx context.Context, pool db.DB) ([]subdomainRow, error) {
 func lookupSubdomainLabel(ctx context.Context, pool db.DB, label string) (subdomainRow, bool, error) {
 	rows, err := pool.Query(ctx, subdomainByLabelSQL, label)
 	if err != nil {
-		return subdomainRow{}, false, fmt.Errorf("субдомен по метке %q: %w", label, err)
+		return subdomainRow{}, false, fmt.Errorf("subdomain by label %q: %w", label, err)
 	}
 	defer rows.Close()
 	if rows.Next() {
 		var s subdomainRow
 		if err := rows.Scan(&s.id, &s.label, &s.enabled); err != nil {
-			return subdomainRow{}, false, fmt.Errorf("субдомен по метке %q: чтение: %w", label, err)
+			return subdomainRow{}, false, fmt.Errorf("subdomain by label %q: reading: %w", label, err)
 		}
 		return s, true, nil
 	}
 	if err := rows.Err(); err != nil {
-		return subdomainRow{}, false, fmt.Errorf("субдомен по метке %q: %w", label, err)
+		return subdomainRow{}, false, fmt.Errorf("subdomain by label %q: %w", label, err)
 	}
 	return subdomainRow{}, false, nil
 }
@@ -348,18 +349,18 @@ func lookupSubdomainLabel(ctx context.Context, pool db.DB, label string) (subdom
 func lookupSubdomainID(ctx context.Context, pool db.DB, id int16) (subdomainRow, bool, error) {
 	rows, err := pool.Query(ctx, subdomainByIDSQL, id)
 	if err != nil {
-		return subdomainRow{}, false, fmt.Errorf("субдомен по биту %d: %w", id, err)
+		return subdomainRow{}, false, fmt.Errorf("subdomain by bit %d: %w", id, err)
 	}
 	defer rows.Close()
 	if rows.Next() {
 		var s subdomainRow
 		if err := rows.Scan(&s.id, &s.label, &s.enabled); err != nil {
-			return subdomainRow{}, false, fmt.Errorf("субдомен по биту %d: чтение: %w", id, err)
+			return subdomainRow{}, false, fmt.Errorf("subdomain by bit %d: reading: %w", id, err)
 		}
 		return s, true, nil
 	}
 	if err := rows.Err(); err != nil {
-		return subdomainRow{}, false, fmt.Errorf("субдомен по биту %d: %w", id, err)
+		return subdomainRow{}, false, fmt.Errorf("subdomain by bit %d: %w", id, err)
 	}
 	return subdomainRow{}, false, nil
 }
@@ -368,18 +369,18 @@ func lookupSubdomainID(ctx context.Context, pool db.DB, id int16) (subdomainRow,
 func nextSubdomainBit(ctx context.Context, pool db.DB) (int, error) {
 	rows, err := pool.Query(ctx, subdomainNextIDSQL)
 	if err != nil {
-		return 0, fmt.Errorf("следующий бит субдомена: %w", err)
+		return 0, fmt.Errorf("next subdomain bit: %w", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return 0, fmt.Errorf("следующий бит субдомена: пустой ответ")
+		return 0, fmt.Errorf("next subdomain bit: empty response")
 	}
 	var next int16
 	if err := rows.Scan(&next); err != nil {
-		return 0, fmt.Errorf("следующий бит субдомена: чтение: %w", err)
+		return 0, fmt.Errorf("next subdomain bit: reading: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("следующий бит субдомена: %w", err)
+		return 0, fmt.Errorf("next subdomain bit: %w", err)
 	}
 	return int(next), nil
 }
@@ -388,15 +389,15 @@ func nextSubdomainBit(ctx context.Context, pool db.DB) (int, error) {
 func insertSubdomain(ctx context.Context, pool db.DB, id int, label string) error {
 	rows, err := pool.Query(ctx, subdomainInsertSQL, int16(id), label)
 	if err != nil {
-		return fmt.Errorf("вставка субдомена (бит %d): %w", id, err)
+		return fmt.Errorf("subdomain insert (bit %d): %w", id, err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return fmt.Errorf("вставка субдомена (бит %d): строка не вставлена", id)
+		return fmt.Errorf("subdomain insert (bit %d): row not inserted", id)
 	}
 	var got int16
 	if err := rows.Scan(&got); err != nil {
-		return fmt.Errorf("вставка субдомена (бит %d): чтение: %w", id, err)
+		return fmt.Errorf("subdomain insert (bit %d): reading: %w", id, err)
 	}
 	return rows.Err()
 }
@@ -407,15 +408,15 @@ func insertSubdomain(ctx context.Context, pool db.DB, id int, label string) erro
 func disableSubdomainByID(ctx context.Context, pool db.DB, id int16) (subdomainRow, error) {
 	rows, err := pool.Query(ctx, subdomainDisableSQL, id)
 	if err != nil {
-		return subdomainRow{}, fmt.Errorf("выключение субдомена (бит %d): %w", id, err)
+		return subdomainRow{}, fmt.Errorf("subdomain disable (bit %d): %w", id, err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return subdomainRow{}, fmt.Errorf("выключение субдомена (бит %d): строка не обновлена", id)
+		return subdomainRow{}, fmt.Errorf("subdomain disable (bit %d): row not updated", id)
 	}
 	var s subdomainRow
 	if err := rows.Scan(&s.id, &s.label, &s.enabled); err != nil {
-		return subdomainRow{}, fmt.Errorf("выключение субдомена (бит %d): чтение: %w", id, err)
+		return subdomainRow{}, fmt.Errorf("subdomain disable (bit %d): reading: %w", id, err)
 	}
 	return s, rows.Err()
 }
@@ -453,7 +454,7 @@ func subdomainsListRun(ctx context.Context, pool db.DB, stdout io.Writer) error 
 		return err
 	}
 	enabled := 0
-	out(stdout, "бит  метка              акт\n")
+	out(stdout, "bit  label              act\n")
 	for _, s := range subs {
 		mark := "-"
 		if s.enabled {
@@ -462,11 +463,11 @@ func subdomainsListRun(ctx context.Context, pool db.DB, stdout io.Writer) error 
 		}
 		label := s.label
 		if label == "" {
-			label = "(апекс)"
+			label = "(apex)"
 		}
 		out(stdout, "%3d  %-18s  %s\n", s.id, label, mark)
 	}
-	out(stdout, "всего %d из %d, включено %d\n", len(subs), model.MaxSubdomains, enabled)
+	out(stdout, "total %d of %d, enabled %d\n", len(subs), model.MaxSubdomains, enabled)
 	return nil
 }
 
@@ -477,11 +478,11 @@ func subdomainsAddRun(ctx context.Context, pool db.DB, label string, stdout io.W
 	if s, found, err := lookupSubdomainLabel(ctx, pool, label); err != nil {
 		return err
 	} else if found {
-		state := "включён"
+		state := "enabled"
 		if !s.enabled {
-			state = "выключен"
+			state = "disabled"
 		}
-		return fmt.Errorf("метка уже есть в справочнике: бит %d, %s", s.id, state)
+		return fmt.Errorf("the label is already in the catalog: bit %d, %s", s.id, state)
 	}
 	// The free bit: max(id)+1, the 0..62 range — bit 63 is the sign bit
 	// (model.ValidateSubdomainID, spec 5.10).
@@ -495,8 +496,8 @@ func subdomainsAddRun(ctx context.Context, pool db.DB, label string, stdout io.W
 	if err := insertSubdomain(ctx, pool, id, label); err != nil {
 		return err
 	}
-	out(stdout, "субдомен %s добавлен: бит %d\n", label, id)
-	out(stdout, "проверка уже проверенных доменов: crawlerctl subdomains recheck %s [--zone ИМЯ]\n", label)
+	out(stdout, "subdomain %s added: bit %d\n", label, id)
+	out(stdout, "checking the already checked domains: crawlerctl subdomains recheck %s [--zone NAME]\n", label)
 	return nil
 }
 
@@ -504,7 +505,7 @@ func subdomainsAddRun(ctx context.Context, pool db.DB, label string, stdout io.W
 // of the apex the NXDOMAIN branch and the wildcard detect are impossible
 // (spec 5.4 items 1, 3) — the apex is the basis of a domain check.
 func subdomainApexGuard() error {
-	return fmt.Errorf("апекс (бит 0) — основа проверки домена (ТЗ 5.4 п. 1), выключение не предусмотрено")
+	return fmt.Errorf("the apex (bit 0) is the basis of a domain check (spec 5.4 item 1), disabling is not provided")
 }
 
 // subdomainsDisableRun — disables a subdomain (enabled = false).
@@ -517,7 +518,7 @@ func subdomainsDisableRun(ctx context.Context, pool db.DB, arg string, stdout io
 		return err
 	}
 	if !found {
-		return fmt.Errorf("субдомен %q не найден в справочнике (см. subdomains list)", arg)
+		return fmt.Errorf("subdomain %q not found in the catalog (see subdomains list)", arg)
 	}
 	if s.id == 0 {
 		return subdomainApexGuard()
@@ -526,14 +527,14 @@ func subdomainsDisableRun(ctx context.Context, pool db.DB, arg string, stdout io
 	// no UPDATE (an extra write is pointless, the message matches the
 	// lookup state).
 	if !s.enabled {
-		out(stdout, "субдомен %s (бит %d) уже выключен\n", s.label, s.id)
+		out(stdout, "subdomain %s (bit %d) already disabled\n", s.label, s.id)
 		return nil
 	}
 	after, err := disableSubdomainByID(ctx, pool, s.id)
 	if err != nil {
 		return err
 	}
-	out(stdout, "субдомен %s (бит %d) выключен: бит и накопленные маски/результаты не меняются (ТЗ 13.1)\n",
+	out(stdout, "subdomain %s (bit %d) disabled: the bit and the accumulated masks/results are not changed (spec 13.1)\n",
 		after.label, after.id)
 	return nil
 }
@@ -550,26 +551,26 @@ func subdomainsRecheckRun(ctx context.Context, pool db.DB, label string, zoneID 
 		return err
 	}
 	if !found {
-		return fmt.Errorf("субдомена %s нет в справочнике — сначала subdomains add %s (ТЗ 5.10)", label, label)
+		return fmt.Errorf("subdomain %s is not in the catalog — run subdomains add %s first (spec 5.10)", label, label)
 	}
 	if !s.enabled {
-		return fmt.Errorf("субдомен %s (бит %d) выключен — DNS-воркер его не проверяет (ТЗ 5.4 п. 2)", label, s.id)
+		return fmt.Errorf("subdomain %s (bit %d) is disabled — the DNS worker does not check it (spec 5.4 item 2)", label, s.id)
 	}
 
-	out(stdout, "субдомен %s (бит %d), зона: %s\n", label, s.id, zoneDesc)
+	out(stdout, "subdomain %s (bit %d), zone: %s\n", label, s.id, zoneDesc)
 	total, err := drainSubdomainRecheck(ctx, pool, zoneID)
 	if err != nil {
 		if total > 0 {
-			return fmt.Errorf("переведено в pending %d доменов, прервано: %w", total, err)
+			return fmt.Errorf("moved to pending %d domains, interrupted: %w", total, err)
 		}
 		return err
 	}
 	if total == 0 {
-		out(stdout, "готовых к перепроверке доменов нет (done-домены, кроме deleted)\n")
+		out(stdout, "no done domains to recheck (done domains, except deleted)\n")
 		return nil
 	}
-	out(stdout, "переведено в проверку (pending): %d доменов\n", total)
-	out(stdout, "домены пройдут DNS/HTTP-этап заново с текущим справочником; темп задаёт планировщик (backpressure q:dns)\n")
+	out(stdout, "moved to pending: %d domains\n", total)
+	out(stdout, "the domains will pass the DNS/HTTP stage again with the current catalog; the scheduler sets the pace (the q:dns backpressure)\n")
 	return nil
 }
 
@@ -595,7 +596,7 @@ func drainSubdomainRecheck(ctx context.Context, pool db.DB, zoneID *int16) (int6
 // subdomainRecheckOnce — a single pass moving a batch done → pending
 // (the SQL — subdomainRecheckAllSQL/subdomainRecheckZoneSQL).
 func subdomainRecheckOnce(ctx context.Context, pool db.DB, zoneID *int16) (int64, error) {
-	what := "перевод done → pending"
+	what := "moving done → pending"
 	var sql string
 	var args []any
 	if zoneID == nil {
@@ -604,7 +605,7 @@ func subdomainRecheckOnce(ctx context.Context, pool db.DB, zoneID *int16) (int64
 			int16(model.StatusDeleted), subdomainRecheckBatch}
 	} else {
 		z := *zoneID
-		what = fmt.Sprintf("перевод done → pending (зона %d)", z)
+		what = fmt.Sprintf("moving done → pending (zone %d)", z)
 		sql = subdomainRecheckZoneSQL
 		args = []any{int16(model.CheckStatePending), int16(model.CheckStateDone),
 			int16(model.StatusDeleted), z, subdomainRecheckBatch}
@@ -643,7 +644,7 @@ func subdomainsList(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if fs.NArg() > 0 {
-		return usagef("subdomains list: лишние аргументы %v (команда без аргументов)", fs.Args())
+		return usagef("subdomains list: extra arguments %v (the command takes no arguments)", fs.Args())
 	}
 	ctx, stop := signalCtx()
 	defer stop()
@@ -664,7 +665,7 @@ func subdomainsAdd(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return usagef("укажите метку субдомена: crawlerctl subdomains add www")
+		return usagef("specify a subdomain label: crawlerctl subdomains add www")
 	}
 	label, err := normalizeSubdomainLabel(fs.Arg(0))
 	if err != nil {
@@ -689,7 +690,7 @@ func subdomainsDisable(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return usagef("укажите субдомен: crawlerctl subdomains disable www|бит")
+		return usagef("specify a subdomain: crawlerctl subdomains disable www|bit")
 	}
 	ctx, stop := signalCtx()
 	defer stop()
@@ -708,12 +709,12 @@ func subdomainsDisable(args []string, stdout, stderr io.Writer) error {
 // check over a zone / all domains (spec 13.1).
 func subdomainsRecheckCmd(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("subdomains recheck")
-	zone := fs.String("zone", "", "зона проверки (пусто — все зоны)")
+	zone := fs.String("zone", "", "check zone (empty — all zones)")
 	if handled, err := parseFlags(fs, subdomainsHelp, args, stdout); handled {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return usagef("укажите метку субдомена: crawlerctl subdomains recheck www [--zone ИМЯ]")
+		return usagef("specify a subdomain label: crawlerctl subdomains recheck www [--zone NAME]")
 	}
 	label, err := normalizeSubdomainLabel(fs.Arg(0))
 	if err != nil {
@@ -725,7 +726,7 @@ func subdomainsRecheckCmd(args []string, stdout, stderr io.Writer) error {
 		// (internal/idn.NormalizeZone): the zone is stored in punycode.
 		normalized, zerr := idn.NormalizeZone(*zone)
 		if zerr != nil {
-			return usagef("subdomains recheck: некорректное имя зоны %q: %v", *zone, zerr)
+			return usagef("subdomains recheck: invalid zone name %q: %v", *zone, zerr)
 		}
 		zoneName = normalized
 	}
@@ -742,7 +743,7 @@ func subdomainsRecheckCmd(args []string, stdout, stderr io.Writer) error {
 	}
 	defer pool.Close()
 
-	zoneDesc := "все"
+	zoneDesc := "all"
 	var zoneID *int16
 	if zoneName != "" {
 		id, found, zerr := analyzer.ZoneIDByName(ctx, pool, zoneName)
@@ -750,7 +751,7 @@ func subdomainsRecheckCmd(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("subdomains recheck %s: %w", label, zerr)
 		}
 		if !found {
-			return fmt.Errorf("subdomains recheck %s: зона %s не найдена в справочнике (зоны создаёт ingest при первом файле)", label, zoneName)
+			return fmt.Errorf("subdomains recheck %s: zone %s is not in the catalog (ingest creates zones on the first file)", label, zoneName)
 		}
 		zoneID, zoneDesc = &id, zoneName
 	}
@@ -768,14 +769,14 @@ func subdomainsRecheckCmd(args []string, stdout, stderr io.Writer) error {
 // reference table and cannot be added.
 func normalizeSubdomainLabel(label string) (string, error) {
 	if strings.TrimSpace(label) == "" {
-		return "", fmt.Errorf("метка субдомена пуста: апекс '' уже есть в справочнике (id 0)")
+		return "", fmt.Errorf("the subdomain label is empty: the apex '' is already in the catalog (id 0)")
 	}
 	ascii, err := idn.HostToASCII(label)
 	if err != nil {
-		return "", fmt.Errorf("некорректная метка субдомена %q: %v", label, err)
+		return "", fmt.Errorf("invalid subdomain label %q: %v", label, err)
 	}
 	if !validSubdomainLabel(ascii) {
-		return "", fmt.Errorf("некорректная метка субдомена %q: допустимы a-z, 0-9 и дефис внутри, длина 1..63", label)
+		return "", fmt.Errorf("invalid subdomain label %q: allowed are a-z, 0-9 and a hyphen inside, length 1..63", label)
 	}
 	return ascii, nil
 }

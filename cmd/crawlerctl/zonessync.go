@@ -127,7 +127,7 @@ func parseZoneList(data []byte) (zoneListFile, error) {
 		firstComment = false // data started — the file header is over
 		zone, err := idn.NormalizeZone(s)
 		if err != nil {
-			return zoneListFile{}, fmt.Errorf("строка %d: %q: %v", num, s, err)
+			return zoneListFile{}, fmt.Errorf("line %d: %q: %v", num, s, err)
 		}
 		if seen[zone] {
 			res.Duplicates++
@@ -140,7 +140,7 @@ func parseZoneList(data []byte) (zoneListFile, error) {
 	// is pointless, and --deactivate-missing with an empty list would
 	// disable all zones at once.
 	if len(res.Zones) == 0 {
-		return zoneListFile{}, errors.New("зон в файле нет (только комментарии и пустые строки)")
+		return zoneListFile{}, errors.New("no zones in the file (only comments and empty lines)")
 	}
 	return res, nil
 }
@@ -172,23 +172,23 @@ func zoneListVersion(comment string) string {
 func fetchZoneList(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("загрузка %s: %w", url, err)
+		return nil, fmt.Errorf("download %s: %w", url, err)
 	}
 	client := &http.Client{Timeout: zoneSyncHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("загрузка %s: %w", url, err)
+		return nil, fmt.Errorf("download %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("загрузка %s: HTTP %s", url, resp.Status)
+		return nil, fmt.Errorf("download %s: HTTP %s", url, resp.Status)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, zoneListMaxBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("загрузка %s: чтение тела: %w", url, err)
+		return nil, fmt.Errorf("download %s: body reading: %w", url, err)
 	}
 	if len(data) > zoneListMaxBytes {
-		return nil, fmt.Errorf("загрузка %s: файл больше лимита %d байт", url, zoneListMaxBytes)
+		return nil, fmt.Errorf("download %s: the file exceeds the limit of %d bytes", url, zoneListMaxBytes)
 	}
 	return data, nil
 }
@@ -208,7 +208,7 @@ func readZoneListFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	if len(data) > zoneListMaxBytes {
-		return nil, fmt.Errorf("файл больше лимита %d байт", zoneListMaxBytes)
+		return nil, fmt.Errorf("the file exceeds the limit of %d bytes", zoneListMaxBytes)
 	}
 	return data, nil
 }
@@ -231,7 +231,7 @@ func zonesSyncInsert(ctx context.Context, pool db.DB, list zoneListFile) (int64,
 	}
 	tag, err := pool.Exec(ctx, zonesSyncInsertSQL, names, unicodes)
 	if err != nil {
-		return 0, fmt.Errorf("вставка зон: %w", err)
+		return 0, fmt.Errorf("zone insert: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }
@@ -242,7 +242,7 @@ func zonesSyncInsert(ctx context.Context, pool db.DB, list zoneListFile) (int64,
 func zonesDeactivateMissing(ctx context.Context, pool db.DB, names []string) ([]zoneRow, error) {
 	rows, err := pool.Query(ctx, zonesDeactivateMissingSQL, names)
 	if err != nil {
-		return nil, fmt.Errorf("выключение отсутствующих в срезе: %w", err)
+		return nil, fmt.Errorf("disabling the zones missing from the slice: %w", err)
 	}
 	defer rows.Close()
 	var off []zoneRow
@@ -252,12 +252,12 @@ func zonesDeactivateMissing(ctx context.Context, pool db.DB, names []string) ([]
 		// is always false.
 		var z zoneRow
 		if err := rows.Scan(&z.id, &z.name, &z.nameUnicode); err != nil {
-			return nil, fmt.Errorf("выключение отсутствующих в срезе: чтение: %w", err)
+			return nil, fmt.Errorf("disabling the zones missing from the slice: reading: %w", err)
 		}
 		off = append(off, z)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("выключение отсутствующих в срезе: %w", err)
+		return nil, fmt.Errorf("disabling the zones missing from the slice: %w", err)
 	}
 	sort.Slice(off, func(i, j int) bool { return off[i].name < off[j].name })
 	return off, nil
@@ -272,7 +272,7 @@ func zonesSyncRun(ctx context.Context, pool db.DB, list zoneListFile, deactivate
 		return err
 	}
 	existed := int64(len(list.Zones)) - inserted
-	out(stdout, "прочитано зон %d (дублей в файле %d), добавлено %d, уже было %d\n",
+	out(stdout, "zones read %d (duplicates in the file %d), added %d, already existed %d\n",
 		len(list.Zones), list.Duplicates, inserted, existed)
 	if !deactivateMissing {
 		return nil
@@ -282,16 +282,16 @@ func zonesSyncRun(ctx context.Context, pool db.DB, list zoneListFile, deactivate
 		return err
 	}
 	if len(off) == 0 {
-		out(stdout, "отсутствующих в срезе активных зон нет\n")
+		out(stdout, "no active zones missing from the slice\n")
 		return nil
 	}
 	names := make([]string, len(off))
 	for i, z := range off {
 		names[i] = zoneDesc(z)
 	}
-	out(stdout, "выключено отсутствующих в срезе (retired TLD): %d: %s\n",
+	out(stdout, "disabled missing from the slice (retired TLD): %d: %s\n",
 		len(off), strings.Join(names, ", "))
-	out(stdout, "домены выключенных зон не выбираются планировщиком до crawlerctl zones enable <зона>\n")
+	out(stdout, "the domains of the disabled zones are not selected by the scheduler until crawlerctl zones enable <zone>\n")
 	return nil
 }
 
@@ -304,18 +304,18 @@ func zonesSyncRun(ctx context.Context, pool db.DB, list zoneListFile, deactivate
 // a source failure / a junk line do not touch the configuration and the pool.
 func zonesSync(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("zones sync")
-	file := fs.String("file", "", "файл среза реестра IANA (офлайн; вместо --url)")
-	listURL := fs.String("url", "", "URL среза реестра (по умолчанию "+zoneListURL+")")
+	file := fs.String("file", "", "the IANA registry slice file (offline; instead of --url)")
+	listURL := fs.String("url", "", "the registry slice URL (default "+zoneListURL+")")
 	deactivate := fs.Bool("deactivate-missing", false,
-		"выключить зоны БД, отсутствующие в срезе (retired TLD)")
+		"disable the DB zones missing from the slice (retired TLD)")
 	if handled, err := parseFlags(fs, zonesHelp, args, stdout); handled {
 		return err
 	}
 	if fs.NArg() > 0 {
-		return usagef("zones sync: лишние аргументы %v (источник задаётся флагами --file/--url)", fs.Args())
+		return usagef("zones sync: extra arguments %v (the source is set by the --file/--url flags)", fs.Args())
 	}
 	if *file != "" && *listURL != "" {
-		return usagef("zones sync: --file и --url несовместимы — укажите один источник")
+		return usagef("zones sync: --file and --url are incompatible — specify one source")
 	}
 
 	// A one-off CLI command: Ctrl-C/SIGTERM interrupt the download/write.
@@ -328,7 +328,7 @@ func zonesSync(args []string, stdout, stderr io.Writer) error {
 		src = *file
 		raw, err := readZoneListFile(*file)
 		if err != nil {
-			return fmt.Errorf("zones sync: чтение %s: %w", *file, err)
+			return fmt.Errorf("zones sync: reading %s: %w", *file, err)
 		}
 		data = raw
 	} else {
@@ -347,9 +347,9 @@ func zonesSync(args []string, stdout, stderr io.Writer) error {
 	}
 	version := list.Version
 	if version == "" {
-		version = "неизвестна (комментария версии нет)"
+		version = "unknown (no version comment)"
 	}
-	out(stdout, "источник: %s, версия файла: %s\n", src, version)
+	out(stdout, "source: %s, file version: %s\n", src, version)
 
 	pool, err := openManagePool(ctx)
 	if err != nil {

@@ -264,7 +264,7 @@ func fixturesReadNDJSON[T any](path string) ([]T, error) {
 			return out, nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%s: запись %d: %w", path, n, err)
+			return nil, fmt.Errorf("%s: row %d: %w", path, n, err)
 		}
 		out = append(out, row)
 	}
@@ -304,14 +304,14 @@ func fixturesDedup[T any, K comparable](rows []T, dups *int, key func(T) K) []T 
 func fixturesReadDump(dir string) (*fixturesDump, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
-		return nil, fmt.Errorf("дамп %s: манифест: %w (без manifest.json дамп не завершён — контракт экспорта)", dir, err)
+		return nil, fmt.Errorf("dump %s: manifest: %w (without manifest.json the dump is incomplete — the export contract)", dir, err)
 	}
 	var manifest fixturesManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return nil, fmt.Errorf("дамп %s: manifest.json: %w", dir, err)
+		return nil, fmt.Errorf("dump %s: manifest.json: %w", dir, err)
 	}
 	if manifest.FormatVersion != fixturesFormatVersion {
-		return nil, fmt.Errorf("дамп %s: формат v%d не поддерживается (инструмент понимает v%d)",
+		return nil, fmt.Errorf("dump %s: format v%d is not supported (the tool understands v%d)",
 			dir, manifest.FormatVersion, fixturesFormatVersion)
 	}
 
@@ -341,10 +341,10 @@ func fixturesReadDump(dir string) (*fixturesDump, error) {
 	}
 	for _, f := range files {
 		if _, err := os.Stat(filepath.Join(dir, f.name)); err != nil {
-			return nil, fmt.Errorf("дамп %s: %w", dir, err)
+			return nil, fmt.Errorf("dump %s: %w", dir, err)
 		}
 		if err := f.read(); err != nil {
-			return nil, fmt.Errorf("дамп %s: %w", dir, err)
+			return nil, fmt.Errorf("dump %s: %w", dir, err)
 		}
 	}
 	for _, f := range files {
@@ -361,10 +361,10 @@ func fixturesReadDump(dir string) (*fixturesDump, error) {
 		}
 		want, ok := manifest.Files[f.name]
 		if !ok {
-			return nil, fmt.Errorf("дамп %s: манифест без счётчика строк %s (формат v1 его требует)", dir, f.name)
+			return nil, fmt.Errorf("dump %s: the manifest has no row counter for %s (format v1 requires it)", dir, f.name)
 		}
 		if want != got {
-			return nil, fmt.Errorf("дамп %s: %s: строк %d, манифест насчитал %d — дамп обрезан или пересобран",
+			return nil, fmt.Errorf("dump %s: %s: %d rows, the manifest counted %d — the dump is truncated or reassembled",
 				dir, f.name, got, want)
 		}
 	}
@@ -383,10 +383,10 @@ func fixturesReadDump(dir string) (*fixturesDump, error) {
 	seenNames := make(map[string]bool, len(dump.Zones))
 	for _, z := range dump.Zones {
 		if z.ID <= 0 {
-			return nil, fmt.Errorf("дамп %s: zones.ndjson: id %d ≤ 0", dir, z.ID)
+			return nil, fmt.Errorf("dump %s: zones.ndjson: id %d ≤ 0", dir, z.ID)
 		}
 		if seenNames[z.Name] {
-			return nil, fmt.Errorf("дамп %s: zones.ndjson: имя %s дважды с разными id (UNIQUE zones.name — предпроверка наката здесь бессильна)", dir, z.Name)
+			return nil, fmt.Errorf("dump %s: zones.ndjson: the name %s twice with different ids (UNIQUE zones.name — the import pre-check is powerless here)", dir, z.Name)
 		}
 		seenNames[z.Name] = true
 	}
@@ -397,14 +397,14 @@ func fixturesReadDump(dir string) (*fixturesDump, error) {
 	seenLabels := make(map[string]bool, len(dump.Domains))
 	for _, d := range dump.Domains {
 		if d.ID <= 0 {
-			return nil, fmt.Errorf("дамп %s: domains.ndjson: домен %d/%d: id ≤ 0", dir, d.ZoneID, d.ID)
+			return nil, fmt.Errorf("dump %s: domains.ndjson: domain %d/%d: id ≤ 0", dir, d.ZoneID, d.ID)
 		}
 		if !zoneIDs[d.ZoneID] {
-			return nil, fmt.Errorf("дамп %s: domains.ndjson: домен %d/%d ссылается на зону, которой нет в zones.ndjson", dir, d.ZoneID, d.ID)
+			return nil, fmt.Errorf("dump %s: domains.ndjson: domain %d/%d references a zone missing from zones.ndjson", dir, d.ZoneID, d.ID)
 		}
 		label := strconv.Itoa(int(d.ZoneID)) + ":" + d.Label
 		if seenLabels[label] {
-			return nil, fmt.Errorf("дамп %s: domains.ndjson: домен с меткой %s в зоне %d дважды с разными id (UNIQUE (zone_id, label))", dir, d.Label, d.ZoneID)
+			return nil, fmt.Errorf("dump %s: domains.ndjson: the domain with the label %s in zone %d twice with different ids (UNIQUE (zone_id, label))", dir, d.Label, d.ZoneID)
 		}
 		seenLabels[label] = true
 	}
@@ -414,7 +414,7 @@ func fixturesReadDump(dir string) (*fixturesDump, error) {
 	}
 	for _, r := range dump.Results {
 		if !domainKeys[fixturesDomainKey{r.ZoneID, r.DomainID}] {
-			return nil, fmt.Errorf("дамп %s: subdomain_results.ndjson: строка %d/%d/%d/%v ссылается на домен, которого нет в domains.ndjson",
+			return nil, fmt.Errorf("dump %s: subdomain_results.ndjson: row %d/%d/%d/%v references a domain missing from domains.ndjson",
 				dir, r.ZoneID, r.DomainID, r.SubdomainID, r.Variant)
 		}
 	}
@@ -473,20 +473,20 @@ func fixturesImportRun(ctx context.Context, pool db.DB, dump *fixturesDump, stdo
 	if len(dump.Results) > 0 {
 		tag, err := pool.Exec(ctx, fixturesSweepContentsSQL)
 		if err != nil {
-			return nil, fmt.Errorf("накат: уборка осиротевшего контента: %w", err)
+			return nil, fmt.Errorf("import: orphaned content cleanup: %w", err)
 		}
 		swept = tag.RowsAffected()
 		if swept > 0 {
-			out(stdout, "осиротевший контент прогона убран: %d строк contents\n", swept)
+			out(stdout, "the run's orphaned content swept: %d contents rows\n", swept)
 		}
 	}
 
-	out(stdout, "накат: зоны %d, домены %d, строки результатов %d\n", stats.Zones, stats.Domains, stats.Results)
+	out(stdout, "import: zones %d, domains %d, result rows %d\n", stats.Zones, stats.Domains, stats.Results)
 	if dump.DupZones+dump.DupDomains+dump.DupResults > 0 {
-		out(stdout, "дубли ключей в дампе (схлопнуты): зоны %d, домены %d, результаты %d\n",
+		out(stdout, "duplicate keys in the dump (folded): zones %d, domains %d, results %d\n",
 			dump.DupZones, dump.DupDomains, dump.DupResults)
 	}
-	out(stdout, "последовательности: zones.id → %d, domain_id_seq → %d\n", stats.ZoneSeq, stats.DomainSeq)
+	out(stdout, "sequences: zones.id → %d, domain_id_seq → %d\n", stats.ZoneSeq, stats.DomainSeq)
 	return stats, nil
 }
 
@@ -505,7 +505,7 @@ func fixturesCheckNaturalKeys(ctx context.Context, pool db.DB, dump *fixturesDum
 		}
 		rows, err := pool.Query(ctx, fixturesZoneByNameSQL, names)
 		if err != nil {
-			return fmt.Errorf("накат: проверка имён зон: %w", err)
+			return fmt.Errorf("import: zone name check: %w", err)
 		}
 		defer rows.Close()
 		var conflicts []string
@@ -513,17 +513,17 @@ func fixturesCheckNaturalKeys(ctx context.Context, pool db.DB, dump *fixturesDum
 			var id int16
 			var name string
 			if err := rows.Scan(&id, &name); err != nil {
-				return fmt.Errorf("накат: проверка имён зон: чтение: %w", err)
+				return fmt.Errorf("import: zone name check: reading: %w", err)
 			}
 			if want, ok := dumpID[name]; ok && want != id {
-				conflicts = append(conflicts, fmt.Sprintf("%s (id дампа %d, id БД %d)", name, want, id))
+				conflicts = append(conflicts, fmt.Sprintf("%s (dump id %d, DB id %d)", name, want, id))
 			}
 		}
 		if err := rows.Err(); err != nil {
-			return fmt.Errorf("накат: проверка имён зон: %w", err)
+			return fmt.Errorf("import: zone name check: %w", err)
 		}
 		if len(conflicts) > 0 {
-			return fmt.Errorf("накат: зоны с тем же именем уже в БД с другими id: %s — тестовая БД должна быть чистой (миграции без данных, ТЗ §6.1 п. 3)",
+			return fmt.Errorf("import: zones with the same name are already in the DB with different ids: %s — the test DB must be clean (migrations without data, spec §6.1 item 3)",
 				strings.Join(conflicts, ", "))
 		}
 	}
@@ -542,7 +542,7 @@ func fixturesCheckNaturalKeys(ctx context.Context, pool db.DB, dump *fixturesDum
 		}
 		rows, err := pool.Query(ctx, fixturesDomainByLabelSQL, zones, labels)
 		if err != nil {
-			return fmt.Errorf("накат: проверка меток доменов: %w", err)
+			return fmt.Errorf("import: domain label check: %w", err)
 		}
 		defer rows.Close()
 		var conflicts []string
@@ -551,17 +551,17 @@ func fixturesCheckNaturalKeys(ctx context.Context, pool db.DB, dump *fixturesDum
 			var label string
 			var id int64
 			if err := rows.Scan(&zone, &label, &id); err != nil {
-				return fmt.Errorf("накат: проверка меток доменов: чтение: %w", err)
+				return fmt.Errorf("import: domain label check: reading: %w", err)
 			}
 			if want, ok := byLabel[strconv.Itoa(int(zone))+":"+label]; ok && want != id {
-				conflicts = append(conflicts, fmt.Sprintf("зона %d/%s (id дампа %d, id БД %d)", zone, label, want, id))
+				conflicts = append(conflicts, fmt.Sprintf("zone %d/%s (dump id %d, DB id %d)", zone, label, want, id))
 			}
 		}
 		if err := rows.Err(); err != nil {
-			return fmt.Errorf("накат: проверка меток доменов: %w", err)
+			return fmt.Errorf("import: domain label check: %w", err)
 		}
 		if len(conflicts) > 0 {
-			return fmt.Errorf("накат: домены с той же меткой уже в БД с другими id: %s — тестовая БД должна быть чистой (миграции без данных, ТЗ §6.1 п. 3)",
+			return fmt.Errorf("import: domains with the same label are already in the DB with different ids: %s — the test DB must be clean (migrations without data, spec §6.1 item 3)",
 				strings.Join(conflicts, ", "))
 		}
 	}
@@ -598,10 +598,10 @@ func fixturesImportZones(ctx context.Context, pool db.DB, zones []fixturesZone) 
 		tag, err := pool.Exec(ctx, fixturesImportZonesSQL,
 			ids, names, unicode, active, total, checked, updated)
 		if err != nil {
-			return applied, fmt.Errorf("накат зон (пачка %d…%d): %w", start, end, err)
+			return applied, fmt.Errorf("zone import (batch %d…%d): %w", start, end, err)
 		}
 		if int(tag.RowsAffected()) != len(part) {
-			return applied, fmt.Errorf("накат зон (пачка %d…%d): применено %d строк из %d", start, end, tag.RowsAffected(), len(part))
+			return applied, fmt.Errorf("zone import (batch %d…%d): applied %d of %d rows", start, end, tag.RowsAffected(), len(part))
 		}
 		applied += len(part)
 	}
@@ -640,10 +640,10 @@ func fixturesImportDomains(ctx context.Context, pool db.DB, domains []fixturesDo
 		tag, err := pool.Exec(ctx, fixturesImportDomainsSQL,
 			zones, ids, labels, status, checkState, flags, dnsMask, queued, lastChecked, tempAttempts)
 		if err != nil {
-			return applied, fmt.Errorf("накат доменов (пачка %d…%d): %w", start, end, err)
+			return applied, fmt.Errorf("domain import (batch %d…%d): %w", start, end, err)
 		}
 		if int(tag.RowsAffected()) != len(part) {
-			return applied, fmt.Errorf("накат доменов (пачка %d…%d): применено %d строк из %d", start, end, tag.RowsAffected(), len(part))
+			return applied, fmt.Errorf("domain import (batch %d…%d): applied %d of %d rows", start, end, tag.RowsAffected(), len(part))
 		}
 		applied += len(part)
 	}
@@ -719,10 +719,10 @@ func fixturesImportResults(ctx context.Context, pool db.DB, rowsIn []fixturesRes
 			headers, cookies, rendered, errCode, responseMS,
 			checkedAt, rulesVersion, renderFailedAt)
 		if err != nil {
-			return applied, fmt.Errorf("накат результатов (пачка %d…%d): %w", start, end, err)
+			return applied, fmt.Errorf("result import (batch %d…%d): %w", start, end, err)
 		}
 		if int(tag.RowsAffected()) != n {
-			return applied, fmt.Errorf("накат результатов (пачка %d…%d): применено %d строк из %d", start, end, tag.RowsAffected(), n)
+			return applied, fmt.Errorf("result import (batch %d…%d): applied %d of %d rows", start, end, tag.RowsAffected(), n)
 		}
 		applied += n
 	}
@@ -744,15 +744,15 @@ func fixturesJSONText(raw json.RawMessage) *string {
 func fixturesSetval(ctx context.Context, pool db.DB, sql string, maxID int64) (int64, error) {
 	rows, err := pool.Query(ctx, sql, maxID)
 	if err != nil {
-		return 0, fmt.Errorf("накат: последовательность: %w", err)
+		return 0, fmt.Errorf("import: sequence: %w", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return 0, fmt.Errorf("накат: последовательность: пустой ответ setval")
+		return 0, fmt.Errorf("import: sequence: empty setval response")
 	}
 	var v int64
 	if err := rows.Scan(&v); err != nil {
-		return 0, fmt.Errorf("накат: последовательность: чтение: %w", err)
+		return 0, fmt.Errorf("import: sequence: reading: %w", err)
 	}
 	return v, rows.Err()
 }
@@ -811,7 +811,7 @@ type fixturesImportPlan struct {
 func fixturesImportTarget(dsn string) string {
 	u, err := url.Parse(dsn)
 	if err != nil || u.Host == "" || u.Path == "" {
-		return db.RedactDSN(dsn, "DSN postgres без host/dbname — см. postgres.dsn (конфигурация)")
+		return db.RedactDSN(dsn, "a postgres DSN without host/dbname — see postgres.dsn (the configuration)")
 	}
 	user := ""
 	if u.User != nil {
@@ -847,7 +847,7 @@ func fixturesImportPlanBuild(ctx context.Context, pool db.DB, dump *fixturesDump
 		}
 		n, err := fixturesCountRows(ctx, pool, fixturesPlanZonesExistSQL, ids)
 		if err != nil {
-			return nil, fmt.Errorf("план наката: существующие зоны: %w", err)
+			return nil, fmt.Errorf("import plan: existing zones: %w", err)
 		}
 		plan.ZonesExist = int(n)
 	}
@@ -859,14 +859,14 @@ func fixturesImportPlanBuild(ctx context.Context, pool db.DB, dump *fixturesDump
 		}
 		n, err := fixturesCountRows(ctx, pool, fixturesPlanDomainsExistSQL, zones, ids)
 		if err != nil {
-			return nil, fmt.Errorf("план наката: существующие домены: %w", err)
+			return nil, fmt.Errorf("import plan: existing domains: %w", err)
 		}
 		plan.DomainsExist = int(n)
 	}
 	if len(dump.Results) > 0 {
 		n, err := fixturesCountRows(ctx, pool, fixturesPlanSweepCountSQL)
 		if err != nil {
-			return nil, fmt.Errorf("план наката: уборка контента: %w", err)
+			return nil, fmt.Errorf("import plan: content cleanup: %w", err)
 		}
 		plan.SweepContents = n
 		zones := make([]int16, len(dump.Results))
@@ -877,7 +877,7 @@ func fixturesImportPlanBuild(ctx context.Context, pool db.DB, dump *fixturesDump
 			zones[i], domains[i], subs[i], variants[i] = r.ZoneID, r.DomainID, r.SubdomainID, r.Variant
 		}
 		if n, err = fixturesCountRows(ctx, pool, fixturesPlanResultsExistSQL, zones, domains, subs, variants); err != nil {
-			return nil, fmt.Errorf("план наката: существующие строки результатов: %w", err)
+			return nil, fmt.Errorf("import plan: existing result rows: %w", err)
 		}
 		plan.ResultsExist = int(n)
 	}
@@ -892,11 +892,11 @@ func fixturesCountRows(ctx context.Context, pool db.DB, sql string, args ...any)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return 0, errors.New("пустой ответ count")
+		return 0, errors.New("empty count response")
 	}
 	var n int64
 	if err := rows.Scan(&n); err != nil {
-		return 0, fmt.Errorf("чтение count: %w", err)
+		return 0, fmt.Errorf("count reading: %w", err)
 	}
 	return n, rows.Err()
 }
@@ -906,17 +906,17 @@ func fixturesCountRows(ctx context.Context, pool db.DB, sql string, args ...any)
 // breakdown, the sequences, the dump's duplicate keys, the swept
 // content.
 func fixturesPrintPlan(w io.Writer, plan *fixturesImportPlan, mode string) {
-	out(w, "цель наката: %s (режим: %s)\n", plan.Target, mode)
-	out(w, "план: зоны %d (вставка %d, обновление %d), домены %d (вставка %d, обновление %d), "+
-		"строки результатов %d (вставка %d, обновление %d)\n",
+	out(w, "import target: %s (mode: %s)\n", plan.Target, mode)
+	out(w, "plan: zones %d (insert %d, update %d), domains %d (insert %d, update %d), "+
+		"result rows %d (insert %d, update %d)\n",
 		plan.Zones, plan.Zones-plan.ZonesExist, plan.ZonesExist,
 		plan.Domains, plan.Domains-plan.DomainsExist, plan.DomainsExist,
 		plan.Results, plan.Results-plan.ResultsExist, plan.ResultsExist)
-	out(w, "последовательности: zones.id → не ниже %d, domain_id_seq → не ниже %d\n",
+	out(w, "sequences: zones.id → at least %d, domain_id_seq → at least %d\n",
 		plan.MaxZoneID, plan.MaxDomainID)
-	out(w, "дубли ключей дампа (схлопнуты): зоны %d, домены %d, результаты %d\n",
+	out(w, "dump duplicate keys (folded): zones %d, domains %d, results %d\n",
 		plan.DupZones, plan.DupDomains, plan.DupResults)
-	out(w, "выметается из contents: %d строк без живых ссылок\n", plan.SweepContents)
+	out(w, "swept from contents: %d rows without live references\n", plan.SweepContents)
 }
 
 // fixturesPublishCount — the publishing tasks per mode (a plan line):
@@ -963,11 +963,11 @@ func fixturesImportApply(ctx context.Context, pool db.DB, dump *fixturesDump, op
 	}
 	fixturesPrintPlan(stdout, plan, mode)
 	if opts.Publish != "" {
-		out(stdout, "план публикации q:render (%s): задач %d → Redis %s\n",
+		out(stdout, "q:render publishing plan (%s): tasks %d → Redis %s\n",
 			opts.Publish, fixturesPublishCount(dump, opts.Publish), opts.RedisAddr)
 	}
 	if !opts.Force {
-		out(stdout, "dry-run: БД не изменена — накат выполнит та же команда с --force\n")
+		out(stdout, "dry-run: the DB is not changed — the same command with --force will import\n")
 		return nil
 	}
 	_, err = fixturesImportRun(ctx, pool, dump, stdout)
@@ -996,7 +996,7 @@ type fixturesPublishStats struct {
 // concern, not an isolated run's).
 func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, mode string, stdout io.Writer) (*fixturesPublishStats, error) {
 	if mode != fixturesPublishAll && mode != fixturesPublishSmoke {
-		return nil, fmt.Errorf("публикация: неизвестный режим %q (допустимы: %s, %s)", mode, fixturesPublishAll, fixturesPublishSmoke)
+		return nil, fmt.Errorf("publishing: unknown mode %q (valid: %s, %s)", mode, fixturesPublishAll, fixturesPublishSmoke)
 	}
 
 	// The domain name — from the dump rows (label.zone, punycode): the
@@ -1043,7 +1043,7 @@ func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, 
 			// the operator from a working run (a degraded dump, the wrong
 			// directory) — an honest refusal: the calling script must not
 			// count the run as having happened.
-			return stats, fmt.Errorf("публикация: smoke-подвыборка пуста (доменов %d, задач 0) — публиковать нечего", stats.SmokeDomains)
+			return stats, fmt.Errorf("publishing: the smoke subsample is empty (%d domains, 0 tasks) — nothing to publish", stats.SmokeDomains)
 		}
 	}
 
@@ -1065,7 +1065,7 @@ func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, 
 			Name:        nameOf(r),
 		}
 		if _, err := q.Publish(ctx, queue.StreamRender, msg); err != nil {
-			return stats, fmt.Errorf("публикация q:render: опубликовано %d, прервано (зона %d, домен %d): %w",
+			return stats, fmt.Errorf("q:render publishing: published %d, interrupted (zone %d, domain %d): %w",
 				stats.Published, r.ZoneID, r.DomainID, err)
 		}
 		stats.Published++
@@ -1074,14 +1074,14 @@ func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, 
 
 	switch mode {
 	case fixturesPublishSmoke:
-		out(stdout, "публикация q:render (smoke, домены %d): опубликовано %d (ok %d, failed %d, heavy %d)\n",
+		out(stdout, "q:render publishing (smoke, %d domains): published %d (ok %d, failed %d, heavy %d)\n",
 			stats.SmokeDomains, stats.Published, stats.Strata["ok"], stats.Strata["failed"], stats.Strata["heavy"])
 	default:
-		out(stdout, "публикация q:render: опубликовано %d (ok %d, failed %d, heavy %d)\n",
+		out(stdout, "q:render publishing: published %d (ok %d, failed %d, heavy %d)\n",
 			stats.Published, stats.Strata["ok"], stats.Strata["failed"], stats.Strata["heavy"])
 	}
 	if stats.SkippedDups > 0 {
-		out(stdout, "дубли ключей задач пропущены: %d\n", stats.SkippedDups)
+		out(stdout, "duplicate task keys skipped: %d\n", stats.SkippedDups)
 	}
 	return stats, nil
 }
@@ -1096,28 +1096,28 @@ func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, 
 // spec 6.3 budget), Redis — the redis section's address.
 func fixturesImportCmd(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("fixtures import")
-	dir := fs.String("dir", "", "каталог дампа формата v1 (обязателен)")
-	publish := fs.String("publish", "", "публикация задач фикстуры в q:render без DNS/HTTP: "+fixturesPublishAll+
-		" — все записи дампа, "+fixturesPublishSmoke+" — домены smoke-подвыборки (только с --force)")
+	dir := fs.String("dir", "", "the format v1 dump directory (required)")
+	publish := fs.String("publish", "", "publishing the fixture tasks into q:render without DNS/HTTP: "+fixturesPublishAll+
+		" — all the dump rows, "+fixturesPublishSmoke+" — the smoke subsample domains (only with --force)")
 	force := fs.Bool("force", false,
-		"выполнить накат (без флага — dry-run: цель из DSN и полный план без записи)")
+		"perform the import (without the flag — dry-run: the target from the DSN and the full plan without writes)")
 	if handled, err := parseFlags(fs, fixturesHelp, args, stdout); handled {
 		return err
 	}
 	if strings.TrimSpace(*dir) == "" {
-		return usagef("укажите каталог дампа: crawlerctl fixtures import --dir /path/to/fixtures")
+		return usagef("specify the dump directory: crawlerctl fixtures import --dir /path/to/fixtures")
 	}
 	switch *publish {
 	case "", fixturesPublishAll, fixturesPublishSmoke:
 	default:
-		return usagef("fixtures import: --publish: неизвестный режим %q (допустимы: %s, %s)",
+		return usagef("fixtures import: --publish: unknown mode %q (valid: %s, %s)",
 			*publish, fixturesPublishAll, fixturesPublishSmoke)
 	}
 	if *publish != "" && !*force {
-		return usagef("fixtures import: --publish дополняет --force (dry-run ничего не накатывает и не публикует)")
+		return usagef("fixtures import: --publish complements --force (dry-run imports and publishes nothing)")
 	}
 	if fs.NArg() > 0 {
-		return usagef("fixtures import: лишние аргументы %v (команда принимает только флаги)", fs.Args())
+		return usagef("fixtures import: extra arguments %v (the command takes only flags)", fs.Args())
 	}
 
 	ctx, stop := signalCtx()

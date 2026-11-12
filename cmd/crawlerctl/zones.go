@@ -34,64 +34,65 @@ import (
 )
 
 // zonesHelp — the crawlerctl zones [--help] text and per-action help.
-const zonesHelp = `crawlerctl zones — управление зонами проверки (ТЗ 4.1, 5.3)
+const zonesHelp = `crawlerctl zones — managing the check zones (spec 4.1, 5.3)
 
-Использование:
+Usage:
   crawlerctl zones list
-  crawlerctl zones enable <зона>
-  crawlerctl zones disable <зона>
-  crawlerctl zones sync [--file ПУТЬ] [--url URL] [--deactivate-missing]
+  crawlerctl zones enable <zone>
+  crawlerctl zones disable <zone>
+  crawlerctl zones sync [--file PATH] [--url URL] [--deactivate-missing]
   crawlerctl zones collapse [--apply] [--skip-reconcile] [--force]
 
-Зона — имя в любой форме (unicode/punycode, регистр, точка на конце),
-как каталог incoming/<зона>; в БД хранится punycode (ТЗ 5.2).
+A zone — a name in any form (unicode/punycode, case, a trailing dot),
+like the incoming/<zone> directory; punycode is stored in the DB (spec 5.2).
 
-  list                таблица зон: id, имя (punycode и unicode), флаг
-                      активности, счётчики всего/проверено (обновляет
-                      monitor, ТЗ 5.9)
-  enable <зона>       включить проверку зоны (is_active = true): домены
-                      зоны возвращаются в выборку планировщика — те, что
-                      накопились pending за время паузы, проверяются
-                      в общем порядке
-  disable <зона>      приостановить проверку зоны (is_active = false):
-                      планировщик не выбирает домены зоны; сами домены,
-                      их состояния и результаты не меняются (ТЗ 13.1),
-                      приём файлов зоны работает как прежде
-  sync [--file ПУТЬ] [--url URL] [--deactivate-missing]
-                      наполнить справочник зон из среза реестра корневой
-                      зоны IANA (tlds-alpha-by-domain.txt, ~1460 TLD,
-                      IDN уже в punycode). Новые зоны добавляются
-                      включёнными (is_active = true — как автосоздание
-                      ingest'ом, ТЗ 5.1), существующие строки не меняются
-                      (is_active — владение оператора, счётчики —
-                      monitor), повторный запуск ничего не меняет.
-                      Источник: --url (по умолчанию data.iana.org) или
-                      заранее скачанный файл --file (офлайн-режим, прод
-                      без исходящего интернета). --deactivate-missing
-                      дополнительно выключает зоны БД, отсутствующие
-                      в срезе (retired TLD), с их списком в отчёте.
-                      Это справочник имён TLD, а не источник доменов:
-                      домены — только через ingest (var/incoming)
+  list                the zone table: id, name (punycode and unicode), the
+                      active flag, the total/checked counters (updated by
+                      monitor, spec 5.9)
+  enable <zone>       enable the zone's check (is_active = true): the zone's
+                      domains return into the scheduler selection — the ones
+                      that accumulated in pending during the pause are checked
+                      in the general order
+  disable <zone>      pause the zone's check (is_active = false):
+                      the scheduler does not select the zone's domains; the
+                      domains themselves, their states and results are not
+                      changed (spec 13.1), the zone's file ingest keeps
+                      working as before
+  sync [--file PATH] [--url URL] [--deactivate-missing]
+                      populate the zone catalog from the slice of the IANA
+                      root zone registry (tlds-alpha-by-domain.txt, ~1460
+                      TLDs, IDNs already in punycode). New zones are added
+                      enabled (is_active = true — like the ingest
+                      auto-creation, spec 5.1), existing rows are not changed
+                      (is_active is the operator's ownership, the counters —
+                      monitor), a repeated run changes nothing.
+                      The source: --url (the default data.iana.org) or a
+                      pre-downloaded file --file (offline mode, production
+                      without outbound internet). --deactivate-missing
+                      additionally disables the DB zones missing from the
+                      slice (retired TLD), with their list in the report.
+                      This is a catalog of TLD names, not a source of domains:
+                      domains — only through ingest (var/incoming)
   collapse [--apply] [--skip-reconcile] [--force]
-                      перенести данные 2LD-зон в TLD-зоны (T-196, окно
-                      обслуживания): зона — последняя метка имени
-                      (example.5g.in → зона in, label example.5g). Без
-                      флагов — dry-run: инвентаризация и план, ничего не
-                      меняет. --apply выполняет перенос батчами по всем
-                      таблицам с zone_id (домены с доклейкой префикса к
-                      label, результаты, находки, история), перепривязывает
-                      ingest_files с разруливанием дедупа, дропает партиции
-                      2LD и удаляет их строки; идемпотентно и возобновляемо
-                      (повтор продолжает с места остановки). После переноса
-                      — реконсиляция счётчиков (общая с monitor);
-                      --skip-reconcile её пропускает, --force игнорирует
-                      домены в очереди (check_state = 1). Зоны
-                      ingest.allowed_zone_paths (тестовые) не сворачиваются.
-                      Перенос необратим: откат — восстановление бэкапа
-                      (runbook — docs/runbooks.md)
+                      move the 2LD zone data into TLD zones (T-196, a
+                      maintenance window): the zone is the name's last label
+                      (example.5g.in → the zone in, the label example.5g).
+                      Without the flags — dry-run: inventory and plan, changes
+                      nothing. --apply performs the move in batches over all
+                      the tables with zone_id (domains with the prefix glued
+                      to the label, results, findings, history), rebinds
+                      ingest_files with dedup handling, drops the 2LD
+                      partitions and deletes their rows; idempotent and
+                      resumable (a repeat continues from where it stopped).
+                      After the move — the counter reconciliation (shared
+                      with monitor); --skip-reconcile skips it, --force
+                      ignores the domains in the queue (check_state = 1). The
+                      ingest.allowed_zone_paths zones (test ones) are not
+                      collapsed. The move is irreversible: the way back is a
+                      backup restore (runbook — docs/runbooks.md)
 
-Коды возврата: 0 — успех, 1 — ошибка (неизвестная зона, БД, источник
-среза, мусорная строка), 2 — использование.
+Exit codes: 0 — success, 1 — error (an unknown zone, the DB, the slice
+source, a junk line), 2 — usage.
 `
 
 // ---------------------------------------------------------------- SQL
@@ -143,19 +144,19 @@ func scanZoneRow(scan func(dest ...any) error) (zoneRow, error) {
 func fetchZones(ctx context.Context, pool db.DB) ([]zoneRow, error) {
 	rows, err := pool.Query(ctx, zonesSelectSQL)
 	if err != nil {
-		return nil, fmt.Errorf("справочник зон: %w", err)
+		return nil, fmt.Errorf("zones catalog: %w", err)
 	}
 	defer rows.Close()
 	var zones []zoneRow
 	for rows.Next() {
 		z, err := scanZoneRow(rows.Scan)
 		if err != nil {
-			return nil, fmt.Errorf("справочник зон: чтение: %w", err)
+			return nil, fmt.Errorf("zones catalog: reading: %w", err)
 		}
 		zones = append(zones, z)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("справочник зон: %w", err)
+		return nil, fmt.Errorf("zones catalog: %w", err)
 	}
 	return zones, nil
 }
@@ -164,18 +165,18 @@ func fetchZones(ctx context.Context, pool db.DB) ([]zoneRow, error) {
 func lookupZoneByName(ctx context.Context, pool db.DB, name string) (zoneRow, bool, error) {
 	rows, err := pool.Query(ctx, zoneByNameSQL, name)
 	if err != nil {
-		return zoneRow{}, false, fmt.Errorf("зона по имени %s: %w", name, err)
+		return zoneRow{}, false, fmt.Errorf("zone by name %s: %w", name, err)
 	}
 	defer rows.Close()
 	if rows.Next() {
 		z, err := scanZoneRow(rows.Scan)
 		if err != nil {
-			return zoneRow{}, false, fmt.Errorf("зона по имени %s: чтение: %w", name, err)
+			return zoneRow{}, false, fmt.Errorf("zone by name %s: reading: %w", name, err)
 		}
 		return z, true, nil
 	}
 	if err := rows.Err(); err != nil {
-		return zoneRow{}, false, fmt.Errorf("зона по имени %s: %w", name, err)
+		return zoneRow{}, false, fmt.Errorf("zone by name %s: %w", name, err)
 	}
 	return zoneRow{}, false, nil
 }
@@ -187,18 +188,18 @@ func lookupZoneByName(ctx context.Context, pool db.DB, name string) (zoneRow, bo
 func setZoneActive(ctx context.Context, pool db.DB, id int16, active bool) (zoneRow, error) {
 	rows, err := pool.Query(ctx, zoneSetActiveSQL, active, id)
 	if err != nil {
-		return zoneRow{}, fmt.Errorf("переключение зоны (id %d): %w", id, err)
+		return zoneRow{}, fmt.Errorf("zone toggle (id %d): %w", id, err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return zoneRow{}, fmt.Errorf("переключение зоны (id %d): строка не обновлена", id)
+		return zoneRow{}, fmt.Errorf("zone toggle (id %d): row not updated", id)
 	}
 	var z zoneRow
 	if err := rows.Scan(&z.id, &z.name, &z.nameUnicode, &z.active); err != nil {
-		return zoneRow{}, fmt.Errorf("переключение зоны (id %d): чтение: %w", id, err)
+		return zoneRow{}, fmt.Errorf("zone toggle (id %d): reading: %w", id, err)
 	}
 	if err := rows.Err(); err != nil {
-		return zoneRow{}, fmt.Errorf("переключение зоны (id %d): %w", id, err)
+		return zoneRow{}, fmt.Errorf("zone toggle (id %d): %w", id, err)
 	}
 	return z, nil
 }
@@ -222,7 +223,7 @@ func zonesListRun(ctx context.Context, pool db.DB, stdout io.Writer) error {
 	}
 	active := 0
 	var total, checked int64
-	head := []string{"id", "зона", "unicode", "акт", "всего", "проверено"}
+	head := []string{"id", "zone", "unicode", "act", "total", "checked"}
 	rows := [][]string{head}
 	for _, z := range zones {
 		mark := "-"
@@ -269,7 +270,7 @@ func zonesListRun(ctx context.Context, pool db.DB, stdout io.Writer) error {
 		}
 		out(stdout, "%s\n", b.String())
 	}
-	out(stdout, "зон %d, включено %d, доменов всего %d, проверено %d\n",
+	out(stdout, "zones %d, enabled %d, domains total %d, checked %d\n",
 		len(zones), active, total, checked)
 	return nil
 }
@@ -283,15 +284,15 @@ func zonesToggleRun(ctx context.Context, pool db.DB, action string, name string,
 		return err
 	}
 	if !found {
-		return fmt.Errorf("зона %s не найдена в справочнике (зоны создаёт ingest при первом файле; см. crawlerctl zones list)", name)
+		return fmt.Errorf("zone %s is not in the catalog (ingest creates zones on the first file; see crawlerctl zones list)", name)
 	}
 	want := action == "enable"
 	if z.active == want {
-		state := "включена"
+		state := "enabled"
 		if !z.active {
-			state = "выключена"
+			state = "disabled"
 		}
-		out(stdout, "зона %s (id %d) уже %s\n", zoneDesc(z), z.id, state)
+		out(stdout, "zone %s (id %d) already %s\n", zoneDesc(z), z.id, state)
 		return nil
 	}
 	after, err := setZoneActive(ctx, pool, z.id, want)
@@ -299,11 +300,11 @@ func zonesToggleRun(ctx context.Context, pool db.DB, action string, name string,
 		return err
 	}
 	if want {
-		out(stdout, "зона %s (id %d) включена: домены возвращаются в выборку планировщика (pending проверяется в общем порядке)\n",
+		out(stdout, "zone %s (id %d) enabled: the domains return into the scheduler selection (pending is checked in the general order)\n",
 			zoneDesc(after), after.id)
 		return nil
 	}
-	out(stdout, "зона %s (id %d) выключена: проверка доменов приостановлена; домены, состояния и результаты не меняются (ТЗ 13.1)\n",
+	out(stdout, "zone %s (id %d) disabled: the domain check is paused; the domains, their states and results are not changed (spec 13.1)\n",
 		zoneDesc(after), after.id)
 	return nil
 }
@@ -314,7 +315,7 @@ func zonesToggleRun(ctx context.Context, pool db.DB, action string, name string,
 // (sync — T-125, zonessync.go) / collapse (T-196, zonescollapse.go).
 func cmdZones(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usagef("укажите действие: crawlerctl zones list|enable|disable|sync|collapse")
+		return usagef("specify an action: crawlerctl zones list|enable|disable|sync|collapse")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
@@ -330,7 +331,7 @@ func cmdZones(args []string, stdout, stderr io.Writer) error {
 		out(stdout, "%s", zonesHelp)
 		return flag.ErrHelp
 	default:
-		return usagef("неизвестное действие %q (допустимы: list, enable, disable, sync, collapse)", action)
+		return usagef("unknown action %q (valid: list, enable, disable, sync, collapse)", action)
 	}
 }
 
@@ -340,7 +341,7 @@ func zonesList(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if fs.NArg() > 0 {
-		return usagef("zones list: лишние аргументы %v (команда без аргументов)", fs.Args())
+		return usagef("zones list: extra arguments %v (the command takes no arguments)", fs.Args())
 	}
 	ctx, stop := signalCtx()
 	defer stop()
@@ -361,14 +362,14 @@ func zonesToggle(action string, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return usagef("укажите зону: crawlerctl zones %s crawl.test", action)
+		return usagef("specify a zone: crawlerctl zones %s crawl.test", action)
 	}
 	// Input validation — through the same pipeline as the incoming
 	// directories (internal/idn.NormalizeZone): the zone is stored in
 	// punycode (spec 5.2).
 	zone, err := idn.NormalizeZone(fs.Arg(0))
 	if err != nil {
-		return usagef("zones %s: некорректное имя зоны %q: %v", action, fs.Arg(0), err)
+		return usagef("zones %s: invalid zone name %q: %v", action, fs.Arg(0), err)
 	}
 	ctx, stop := signalCtx()
 	defer stop()

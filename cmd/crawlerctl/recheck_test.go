@@ -59,13 +59,13 @@ const wantRecheckStates = "SELECT d.zone_id, d.id, d.check_state " +
 
 func TestRecheckSQLContract(t *testing.T) {
 	if recheckLookupSQL != wantRecheckLookup {
-		t.Errorf("SQL-контракт lookup:\nполучен %s\nожидался %s", recheckLookupSQL, wantRecheckLookup)
+		t.Errorf("the lookup SQL contract:\ngot %s\nwant %s", recheckLookupSQL, wantRecheckLookup)
 	}
 	if recheckUpdateSQL != wantRecheckUpdate {
-		t.Errorf("SQL-контракт update:\nполучен %s\nожидался %s", recheckUpdateSQL, wantRecheckUpdate)
+		t.Errorf("the update SQL contract:\ngot %s\nwant %s", recheckUpdateSQL, wantRecheckUpdate)
 	}
 	if recheckStatesSQL != wantRecheckStates {
-		t.Errorf("SQL-контракт состояний:\nполучен %s\nожидался %s", recheckStatesSQL, wantRecheckStates)
+		t.Errorf("the states SQL contract:\ngot %s\nwant %s", recheckStatesSQL, wantRecheckStates)
 	}
 }
 
@@ -120,13 +120,13 @@ func (p *recheckPool) seed(zone int16, id int64, label string, st model.CheckSta
 }
 
 func (p *recheckPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("recheckPool: CopyFrom не должен вызываться")
+	return 0, errors.New("recheckPool: CopyFrom must not be called")
 }
 
 func (p *recheckPool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return pgconn.CommandTag{}, fmt.Errorf("recheckPool: неожидаемый Exec: %s", sql)
+	return pgconn.CommandTag{}, fmt.Errorf("recheckPool: unexpected Exec: %s", sql)
 }
 
 func (p *recheckPool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -147,7 +147,7 @@ func (p *recheckPool) Query(_ context.Context, sql string, args ...any) (pgx.Row
 		}
 		return p.updateRows(args[0].(int16), args[1].([]int16), args[2].([]int64), args[3].(int16)), nil
 	default:
-		return nil, fmt.Errorf("recheckPool: неожидаемый SQL Query: %s", sql)
+		return nil, fmt.Errorf("recheckPool: unexpected SQL Query: %s", sql)
 	}
 }
 
@@ -175,7 +175,7 @@ func (t *recheckPoolTx) Exec(_ context.Context, sql string, args ...any) (pgconn
 	defer t.pool.mu.Unlock()
 	t.pool.execs = append(t.pool.execs, subCall{sql, append([]any(nil), args...)})
 	if sql != db.ZoneCounterShiftSQL {
-		return pgconn.CommandTag{}, fmt.Errorf("recheckPool: неожидаемый SQL Exec: %s", sql)
+		return pgconn.CommandTag{}, fmt.Errorf("recheckPool: unexpected SQL Exec: %s", sql)
 	}
 	ids := args[0].([]int16)
 	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", len(ids))), nil
@@ -260,7 +260,7 @@ func namesOf(names ...string) []string {
 	for i, n := range names {
 		r, err := idn.Normalize(n)
 		if err != nil {
-			panic(fmt.Sprintf("тестовое имя %q: %v", n, err))
+			panic(fmt.Sprintf("the test name %q: %v", n, err))
 		}
 		res[i] = r.ASCII
 	}
@@ -281,8 +281,8 @@ func TestRecheckRunTranslate(t *testing.T) {
 	err := recheckRun(context.Background(), pool,
 		namesOf("done.crawl.test", "pending.crawl.test", "queued.crawl.test", "temp.crawl.test", "gone.crawl.test"),
 		&stdout)
-	if err == nil || !strings.Contains(err.Error(), "не поставлены: gone.crawl.test") {
-		t.Fatalf("ошибка = %v, хочу отказ по gone.crawl.test (частичный успех)", err)
+	if err == nil || !strings.Contains(err.Error(), "not scheduled: gone.crawl.test") {
+		t.Fatalf("err = %v, want a refusal for gone.crawl.test (a partial success)", err)
 	}
 	got := stdout.String()
 
@@ -293,15 +293,15 @@ func TestRecheckRunTranslate(t *testing.T) {
 		"queued.crawl.test":  "queued",
 		"temp.crawl.test":    "done",
 	} {
-		if !strings.Contains(got, fmt.Sprintf("%s: поставлен на проверку (было check_state: %s)", name, was)) {
-			t.Errorf("вывод не содержит «%s … было %s»:\n%s", name, was, got)
+		if !strings.Contains(got, fmt.Sprintf("%s: scheduled for a check (was check_state: %s)", name, was)) {
+			t.Errorf("the output does not contain \"%s ... was %s\":\n%s", name, was, got)
 		}
 	}
-	if !strings.Contains(got, "gone.crawl.test: удалён (deleted)") {
-		t.Errorf("вывод не содержит отказ deleted:\n%s", got)
+	if !strings.Contains(got, "gone.crawl.test: deleted") {
+		t.Errorf("the output does not contain the deleted refusal:\n%s", got)
 	}
-	if !strings.Contains(got, "переведено в проверку (pending): 4 из 5") {
-		t.Errorf("вывод без итога:\n%s", got)
+	if !strings.Contains(got, "moved to pending: 4 of 5") {
+		t.Errorf("the output without the total:\n%s", got)
 	}
 
 	// Move semantics: check_state = pending, queued_at reset
@@ -309,32 +309,32 @@ func TestRecheckRunTranslate(t *testing.T) {
 	for i, want := range []model.CheckState{model.CheckStatePending, model.CheckStatePending,
 		model.CheckStatePending, model.CheckStatePending, model.CheckStateDone} {
 		if d := pool.domains[i]; d.state != want {
-			t.Errorf("домен %d: check_state = %v, хочу %v", i+1, d.state, want)
+			t.Errorf("domain %d: check_state = %v, want %v", i+1, d.state, want)
 		}
 	}
 	if pool.domains[2].queuedAt {
-		t.Error("queued_at не сброшен у переведённого из queued")
+		t.Error("queued_at is not reset for the one moved from queued")
 	}
 	if !pool.domains[4].queuedAt && pool.domains[4].state != model.CheckStateDone {
-		t.Errorf("deleted-домен изменился: %+v", pool.domains[4])
+		t.Errorf("the deleted domain changed: %+v", pool.domains[4])
 	}
 
 	// The UPDATE parameter contract: the pending code, the PK keys, the deleted guard.
 	upd := pool.queries[len(pool.queries)-1]
 	if upd.sql != recheckUpdateSQL {
-		t.Fatalf("SQL = %s, хочу перевод", upd.sql)
+		t.Fatalf("SQL = %s, want the move", upd.sql)
 	}
 	if got, want := upd.args[0], int16(model.CheckStatePending); got != want {
-		t.Errorf("args[0] = %v, хочу %v", got, want)
+		t.Errorf("args[0] = %v, want %v", got, want)
 	}
 	if got, want := upd.args[1], []int16{7, 7, 7, 7}; fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("args[1] = %v, хочу зоны %v", got, want)
+		t.Errorf("args[1] = %v, want the zones %v", got, want)
 	}
 	if got, want := upd.args[2], []int64{1, 2, 3, 4}; fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("args[2] = %v, хочу id %v", got, want)
+		t.Errorf("args[2] = %v, want the id %v", got, want)
 	}
 	if got, want := upd.args[3], int16(model.StatusDeleted); got != want {
-		t.Errorf("args[3] = %v, хочу %v", got, want)
+		t.Errorf("args[3] = %v, want %v", got, want)
 	}
 }
 
@@ -344,17 +344,17 @@ func TestRecheckRunAllTranslated(t *testing.T) {
 
 	var stdout bytes.Buffer
 	if err := recheckRun(context.Background(), pool, namesOf("EXAMPLE.Crawl.Test."), &stdout); err != nil {
-		t.Fatalf("recheckRun: %v (нормализованное имя должно находиться)", err)
+		t.Fatalf("recheckRun: %v (the normalized name must be found)", err)
 	}
 	got := stdout.String()
-	if !strings.Contains(got, "example.crawl.test: поставлен на проверку (было check_state: done)") {
-		t.Errorf("вывод не содержит итог:\n%s", got)
+	if !strings.Contains(got, "example.crawl.test: scheduled for a check (was check_state: done)") {
+		t.Errorf("the output does not contain the total:\n%s", got)
 	}
-	if !strings.Contains(got, "переведено в проверку (pending): 1 из 1") {
-		t.Errorf("вывод без итога 1 из 1:\n%s", got)
+	if !strings.Contains(got, "moved to pending: 1 of 1") {
+		t.Errorf("the output without the total 1 of 1:\n%s", got)
 	}
-	if !strings.Contains(got, "домены проверит планировщик") {
-		t.Errorf("вывод без подсказки о планировщике:\n%s", got)
+	if !strings.Contains(got, "the scheduler will check the domains") {
+		t.Errorf("the output without the scheduler hint:\n%s", got)
 	}
 }
 
@@ -364,22 +364,22 @@ func TestRecheckRunNotFound(t *testing.T) {
 
 	var stdout bytes.Buffer
 	err := recheckRun(context.Background(), pool, namesOf("ghost.crawl.test", "x.nowhere.test"), &stdout)
-	if err == nil || !strings.Contains(err.Error(), "не поставлены: ghost.crawl.test, x.nowhere.test") {
-		t.Fatalf("ошибка = %v, хочу список не найденных", err)
+	if err == nil || !strings.Contains(err.Error(), "not scheduled: ghost.crawl.test, x.nowhere.test") {
+		t.Fatalf("err = %v, want the not-found list", err)
 	}
 	got := stdout.String()
-	if !strings.Contains(got, "ghost.crawl.test: не найден: в зоне crawl.test нет домена с меткой ghost") {
-		t.Errorf("вывод не уточняет «нет метки в зоне»:\n%s", got)
+	if !strings.Contains(got, "ghost.crawl.test: not found: the zone crawl.test has no domain with the label ghost") {
+		t.Errorf("the output does not clarify \"no label in the zone\":\n%s", got)
 	}
-	if !strings.Contains(got, "x.nowhere.test: не найден: зоны nowhere.test нет в справочнике") {
-		t.Errorf("вывод не уточняет «нет зоны» (длиннейший суффикс имени):\n%s", got)
+	if !strings.Contains(got, "x.nowhere.test: not found: the zone nowhere.test is not in the catalog") {
+		t.Errorf("the output does not clarify \"no zone\" (the name's longest suffix):\n%s", got)
 	}
-	if !strings.Contains(got, "переведено в проверку (pending): 0 из 2") {
-		t.Errorf("вывод без итога 0 из 2:\n%s", got)
+	if !strings.Contains(got, "moved to pending: 0 of 2") {
+		t.Errorf("the output without the total 0 of 2:\n%s", got)
 	}
 	// No move happened — the name resolution only.
 	if len(pool.queries) != 1 {
-		t.Errorf("обращений = %d, хочу 1 (только lookup)", len(pool.queries))
+		t.Errorf("calls = %d, want 1 (the lookup only)", len(pool.queries))
 	}
 }
 
@@ -391,14 +391,14 @@ func TestRecheckRunInactiveZone(t *testing.T) {
 
 	var stdout bytes.Buffer
 	if err := recheckRun(context.Background(), pool, namesOf("paused.off.test"), &stdout); err != nil {
-		t.Fatalf("recheckRun: %v (перевод выключенной зоны — не ошибка)", err)
+		t.Fatalf("recheckRun: %v (moving a disabled zone is not an error)", err)
 	}
 	got := stdout.String()
-	if !strings.Contains(got, "зона выключена, домен ждёт включения (crawlerctl zones enable off.test)") {
-		t.Errorf("вывод без предупреждения о выключенной зоне:\n%s", got)
+	if !strings.Contains(got, "the zone is disabled, the domain awaits the zone being enabled (crawlerctl zones enable off.test)") {
+		t.Errorf("the output without the disabled-zone warning:\n%s", got)
 	}
 	if pool.domains[0].state != model.CheckStatePending {
-		t.Errorf("домен не переведён: %+v", pool.domains[0])
+		t.Errorf("the domain was not moved: %+v", pool.domains[0])
 	}
 }
 
@@ -413,11 +413,11 @@ func TestRecheckRunDuplicates(t *testing.T) {
 		t.Fatalf("recheckRun: %v", err)
 	}
 	got := stdout.String()
-	if strings.Count(got, "dup.crawl.test: поставлен на проверку") != 2 {
-		t.Errorf("вывод без построчного итога для каждого аргумента:\n%s", got)
+	if strings.Count(got, "dup.crawl.test: scheduled for a check") != 2 {
+		t.Errorf("the output without the per-line total for every argument:\n%s", got)
 	}
-	if !strings.Contains(got, "переведено в проверку (pending): 1 из 2") {
-		t.Errorf("итог должен считать переведённые строки, не аргументы:\n%s", got)
+	if !strings.Contains(got, "moved to pending: 1 of 2") {
+		t.Errorf("the total must count the moved rows, not the arguments:\n%s", got)
 	}
 }
 
@@ -431,11 +431,11 @@ func TestRecheckRunRaceDeleted(t *testing.T) {
 
 	var stdout bytes.Buffer
 	err := recheckRun(context.Background(), pool, namesOf("racy.crawl.test"), &stdout)
-	if err == nil || !strings.Contains(err.Error(), "не поставлены: racy.crawl.test") {
-		t.Fatalf("ошибка = %v, хочу отказ из-за гонки с delete", err)
+	if err == nil || !strings.Contains(err.Error(), "not scheduled: racy.crawl.test") {
+		t.Fatalf("err = %v, want a refusal because of the race with delete", err)
 	}
-	if !strings.Contains(stdout.String(), "не поставлен: статус изменился на deleted") {
-		t.Errorf("вывод не объясняет пропуск:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "not scheduled: the status changed to deleted") {
+		t.Errorf("the output does not explain the skip:\n%s", stdout.String())
 	}
 }
 
@@ -443,18 +443,18 @@ func TestRecheckRunErrors(t *testing.T) {
 	pool := newRecheckPool()
 	pool.seed(7, 1, "example", model.CheckStateDone, model.StatusAlive)
 
-	pool.queryErr = errors.New("нет соединения")
+	pool.queryErr = errors.New("no connection")
 	err := recheckRun(context.Background(), pool, namesOf("example.crawl.test"), &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "разрешение имён доменов") {
-		t.Fatalf("ошибка = %v, хочу контекст разрешения имён", err)
+	if err == nil || !strings.Contains(err.Error(), "domain name resolution") {
+		t.Fatalf("err = %v, want the resolution context", err)
 	}
 
 	pool2 := newRecheckPool()
 	pool2.seed(7, 1, "example", model.CheckStateDone, model.StatusAlive)
-	pool2.queryErrAfter, pool2.queryErr = 1, errors.New("нет соединения")
+	pool2.queryErrAfter, pool2.queryErr = 1, errors.New("no connection")
 	err = recheckRun(context.Background(), pool2, namesOf("example.crawl.test"), &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "перевод доменов в pending") {
-		t.Fatalf("ошибка = %v, хочу контекст перевода", err)
+	if err == nil || !strings.Contains(err.Error(), "moving domains to pending") {
+		t.Fatalf("err = %v, want the move context", err)
 	}
 }
 
@@ -472,7 +472,7 @@ func TestJoinNames(t *testing.T) {
 	}
 	for _, tc := range cases {
 		if got := joinNames(tc.in); got != tc.want {
-			t.Errorf("joinNames(%q) = %q, хочу %q", tc.in, got, tc.want)
+			t.Errorf("joinNames(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -486,22 +486,22 @@ func TestRunRecheckExecution(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
 	cases := []runCase{
-		{name: "нет конфигурации", args: []string{"recheck", "example.crawl.test"}, code: exitError, inErr: "recheck example.crawl.test: config:"},
-		{name: "имя нормализуется до конфигурации", args: []string{"recheck", "МосквА.рф"}, code: exitError, inErr: "recheck xn--80adxhks.xn--p1ai: config:"},
-		{name: "список имён в контексте", args: []string{"recheck", "a.crawl.test", "b.crawl.test"}, code: exitError, inErr: "recheck a.crawl.test, b.crawl.test: config:"},
-		{name: "без домена", args: []string{"recheck"}, code: exitUsage, inErr: "укажите домен"},
-		{name: "невалидное имя", args: []string{"recheck", "ok.crawl.test", "bad!!name"}, code: exitUsage, inErr: "некорректное имя домена"},
-		{name: "неизвестный флаг", args: []string{"recheck", "--nope", "a.crawl.test"}, code: exitUsage, inErr: "recheck:"},
+		{name: "no configuration", args: []string{"recheck", "example.crawl.test"}, code: exitError, inErr: "recheck example.crawl.test: config:"},
+		{name: "the name normalizes before the configuration", args: []string{"recheck", "МосквА.рф"}, code: exitError, inErr: "recheck xn--80adxhks.xn--p1ai: config:"},
+		{name: "the name list in the context", args: []string{"recheck", "a.crawl.test", "b.crawl.test"}, code: exitError, inErr: "recheck a.crawl.test, b.crawl.test: config:"},
+		{name: "without a domain", args: []string{"recheck"}, code: exitUsage, inErr: "specify a domain"},
+		{name: "an invalid name", args: []string{"recheck", "ok.crawl.test", "bad!!name"}, code: exitUsage, inErr: "invalid domain name"},
+		{name: "an unknown flag", args: []string{"recheck", "--nope", "a.crawl.test"}, code: exitUsage, inErr: "recheck:"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.args, &stdout, &stderr)
 			if code != tc.code {
-				t.Errorf("run(%q) код = %d, хочу %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
+				t.Errorf("run(%q) code = %d, want %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
 			}
 			if tc.inErr != "" && !strings.Contains(stderr.String(), tc.inErr) {
-				t.Errorf("run(%q) stderr не содержит %q:\n%s", tc.args, tc.inErr, stderr.String())
+				t.Errorf("run(%q) stderr does not contain %q:\n%s", tc.args, tc.inErr, stderr.String())
 			}
 		})
 	}

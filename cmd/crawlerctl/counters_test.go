@@ -28,15 +28,15 @@ func TestCountersHelp(t *testing.T) {
 	} {
 		var stdout, stderr bytes.Buffer
 		if code := run(args, &stdout, &stderr); code != exitOK {
-			t.Fatalf("%v: код = %d, хочу 0; stderr:\n%s", args, code, stderr.String())
+			t.Fatalf("%v: code = %d, want 0; stderr:\n%s", args, code, stderr.String())
 		}
 		out := stdout.String()
 		if !strings.HasPrefix(out, "crawlerctl counters") {
-			t.Errorf("%v: справка не начинается с имени команды:\n%s", args, out)
+			t.Errorf("%v: the help does not start with the command name:\n%s", args, out)
 		}
-		for _, want := range []string{"Использование", "counters"} {
+		for _, want := range []string{"Usage", "counters"} {
 			if !strings.Contains(out, want) {
-				t.Errorf("%v: в справке нет %q:\n%s", args, want, out)
+				t.Errorf("%v: the help has no %q:\n%s", args, want, out)
 			}
 		}
 	}
@@ -51,21 +51,21 @@ func TestCountersRouting(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"без подкоманды", []string{"counters"}, "укажите подкоманду"},
-		{"неизвестная", []string{"counters", "drop"}, "неизвестная подкоманда"},
-		{"list с аргументом", []string{"counters", "list", "x"}, "лишние аргументы"},
-		{"recount с аргументом", []string{"counters", "recount", "x"}, "лишние аргументы"},
-		{"verify с аргументом", []string{"counters", "verify", "x"}, "лишние аргументы"},
+		{"without a subcommand", []string{"counters"}, "specify a subcommand"},
+		{"unknown", []string{"counters", "drop"}, "unknown subcommand"},
+		{"list with an argument", []string{"counters", "list", "x"}, "extra arguments"},
+		{"recount with an argument", []string{"counters", "recount", "x"}, "extra arguments"},
+		{"verify with an argument", []string{"counters", "verify", "x"}, "extra arguments"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.args, &stdout, &stderr)
 			if code != exitUsage {
-				t.Fatalf("код = %d, хочу 2; stderr:\n%s", code, stderr.String())
+				t.Fatalf("code = %d, want 2; stderr:\n%s", code, stderr.String())
 			}
 			if !strings.Contains(stderr.String(), tc.want) {
-				t.Errorf("stderr не содержит %q:\n%s", tc.want, stderr.String())
+				t.Errorf("stderr does not contain %q:\n%s", tc.want, stderr.String())
 			}
 		})
 	}
@@ -77,10 +77,10 @@ func TestCountersVerifyUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"counters", "verify", "--tolerance", "-1"}, &stdout, &stderr)
 	if code != exitUsage {
-		t.Fatalf("код = %d, хочу 2; stderr:\n%s", code, stderr.String())
+		t.Fatalf("code = %d, want 2; stderr:\n%s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "допуск") {
-		t.Errorf("stderr без упоминания допуска:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "tolerance") {
+		t.Errorf("stderr without mentioning the tolerance:\n%s", stderr.String())
 	}
 }
 
@@ -94,10 +94,10 @@ func TestCountersZoneFlagUsage(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		code := run([]string{"counters", sub, "--zone", "a_b.test"}, &stdout, &stderr)
 		if code != exitUsage {
-			t.Fatalf("%s: код = %d, хочу 2; stderr:\n%s", sub, code, stderr.String())
+			t.Fatalf("%s: code = %d, want 2; stderr:\n%s", sub, code, stderr.String())
 		}
-		if msg := stderr.String(); !strings.Contains(msg, "некорректное имя зоны") {
-			t.Errorf("%s: stderr без причины:\n%s", sub, msg)
+		if msg := stderr.String(); !strings.Contains(msg, "invalid zone name") {
+			t.Errorf("%s: stderr without the reason:\n%s", sub, msg)
 		}
 	}
 }
@@ -106,26 +106,26 @@ func TestCountersZoneFlagUsage(t *testing.T) {
 // hours, days.
 func TestCountersAge(t *testing.T) {
 	if got := countersAge(time.Time{}); got != "—" {
-		t.Errorf("нулевое время = %q, хочу «—»", got)
+		t.Errorf("the zero time = %q, want a dash", got)
 	}
 	now := time.Now()
 	cases := []struct {
 		ago  time.Duration
 		want string
 	}{
-		{5 * time.Second, "5с назад"},
-		{90 * time.Second, "2м назад"},
-		{2 * time.Hour, "2ч 00м назад"},
-		{26 * time.Hour, "1д 2ч назад"},
+		{5 * time.Second, "5s ago"},
+		{90 * time.Second, "2m ago"},
+		{2 * time.Hour, "2h 00m ago"},
+		{26 * time.Hour, "1d 2h ago"},
 	}
 	for _, tc := range cases {
 		if got := countersAge(now.Add(-tc.ago)); got != tc.want {
-			t.Errorf("возраст(%v) = %q, хочу %q", tc.ago, got, tc.want)
+			t.Errorf("age(%v) = %q, want %q", tc.ago, got, tc.want)
 		}
 	}
 	// Negative age (the future) is clamped — not "-3s ago".
-	if got := countersAge(now.Add(time.Minute)); !strings.HasSuffix(got, "назад") || strings.HasPrefix(got, "-") {
-		t.Errorf("будущее = %q, хочу кламп", got)
+	if got := countersAge(now.Add(time.Minute)); !strings.HasSuffix(got, "ago") || strings.HasPrefix(got, "-") {
+		t.Errorf("the future = %q, want a clamp", got)
 	}
 }
 
@@ -137,9 +137,9 @@ func TestCountersFlagHelpRequested(t *testing.T) {
 	fs.Int64("tolerance", 0, "")
 	args := []string{"verify", "--tolerance", "3"}
 	if handled, err := parseFlags(fs, countersHelp, args, &bytes.Buffer{}); handled || err != nil {
-		t.Fatalf("parseFlags = (%v, %v), хочу (false, nil) для обычных аргументов", handled, err)
+		t.Fatalf("parseFlags = (%v, %v), want (false, nil) for ordinary arguments", handled, err)
 	}
 	if !errors.Is(flag.ErrHelp, flag.ErrHelp) {
-		t.Fatal("недостижимо: санити errors.Is")
+		t.Fatal("unreachable: the errors.Is sanity check")
 	}
 }

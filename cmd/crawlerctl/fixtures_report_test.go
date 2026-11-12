@@ -73,17 +73,17 @@ func TestFixturesReportDetectionSanity(t *testing.T) {
 	c := snapOf("chromium-2", "chromium", snapRows(300, nil))
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	if r.DetectionComparable != 300 || r.DetectionDiff != 0 {
-		t.Fatalf("детекция: сравнимо %d, расхождений %d — хочу 300/0", r.DetectionComparable, r.DetectionDiff)
+		t.Fatalf("detection: %d comparable, %d divergences — want 300/0", r.DetectionComparable, r.DetectionDiff)
 	}
 	if r.DetectionRatePct != 0 {
-		t.Errorf("доля расхождений = %v, хочу 0", r.DetectionRatePct)
+		t.Errorf("the divergence share = %v, want 0", r.DetectionRatePct)
 	}
-	v := verdictOf(t, r, "детекция")
+	v := verdictOf(t, r, "detection")
 	if v == nil || v.Status != verdictPass {
-		t.Fatalf("вердикт детекции = %+v, хочу ПРОЙДЕН", v)
+		t.Fatalf("the detection verdict = %+v, want PASSED", v)
 	}
 }
 
@@ -99,20 +99,20 @@ func TestFixturesReportDetectionCorrupted(t *testing.T) {
 	}))
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	if r.DetectionDiff != 6 || r.DetectionRatePct != 2 {
-		t.Fatalf("расхождения = %d (%.2f%%), хочу 6 (2.00%%)", r.DetectionDiff, r.DetectionRatePct)
+		t.Fatalf("divergences = %d (%.2f%%), want 6 (2.00%%)", r.DetectionDiff, r.DetectionRatePct)
 	}
-	v := verdictOf(t, r, "детекция")
+	v := verdictOf(t, r, "detection")
 	if v == nil || v.Status != verdictFail {
-		t.Fatalf("вердикт детекции = %+v, хочу НЕ ПРОЙДЕН", v)
+		t.Fatalf("the detection verdict = %+v, want FAILED", v)
 	}
 	var buf bytes.Buffer
 	fixturesReportPrint(&buf, r)
-	for _, want := range []string{"2.00%", "6", "НЕ ПРОЙДЕН"} {
+	for _, want := range []string{"2.00%", "6", "FAILED"} {
 		if !strings.Contains(buf.String(), want) {
-			t.Errorf("текст отчёта без %q:\n%s", want, buf.String())
+			t.Errorf("the report text without %q:\n%s", want, buf.String())
 		}
 	}
 }
@@ -121,23 +121,23 @@ func TestFixturesReportDetectionCorrupted(t *testing.T) {
 // the analyzer has not finished (rows without a stamp), the rules
 // changed; and "all signs lost" is caught as a divergence (P1-1).
 func TestFixturesReportDetectionDegradations(t *testing.T) {
-	t.Run("анализатор не доработал — строка без штампа", func(t *testing.T) {
+	t.Run("the analyzer has not finished — a row without a stamp", func(t *testing.T) {
 		b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 		c := snapOf("moli-1", "moli", snapRows(10, func(i int, r *fixturesSnapshotRow) {
 			r.RulesVersion = nil // the render passed, the analyzer has not passed over this DOM
 		}))
 		r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
 		if r.DetectionComparable != 0 {
-			t.Fatalf("сравнимых %d, хочу 0 (без штампа анализатора)", r.DetectionComparable)
+			t.Fatalf("comparable %d, want 0 (without the analyzer stamp)", r.DetectionComparable)
 		}
-		if v := verdictOf(t, r, "детекция"); v == nil || v.Status != verdictNone {
-			t.Fatalf("вердикт детекции = %+v, хочу НЕТ ДАННЫХ", v)
+		if v := verdictOf(t, r, "detection"); v == nil || v.Status != verdictNone {
+			t.Fatalf("the detection verdict = %+v, want NO DATA", v)
 		}
 	})
-	t.Run("finding_rules_version разошёлся", func(t *testing.T) {
+	t.Run("finding_rules_version diverged", func(t *testing.T) {
 		other := int32(9)
 		b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 		c := snapOf("moli-1", "moli", snapRows(10, func(i int, r *fixturesSnapshotRow) {
@@ -145,16 +145,16 @@ func TestFixturesReportDetectionDegradations(t *testing.T) {
 		}))
 		r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
-		if v := verdictOf(t, r, "детекция"); v == nil || v.Status != verdictNone {
-			t.Fatalf("вердикт детекции = %+v, хочу НЕТ ДАННЫХ (правила менялись)", v)
+		if v := verdictOf(t, r, "detection"); v == nil || v.Status != verdictNone {
+			t.Fatalf("the detection verdict = %+v, want NO DATA (the rules changed)", v)
 		}
 		if len(r.Warnings) == 0 {
-			t.Errorf("нет предупреждения о версиях правил")
+			t.Errorf("no warning about the rule versions")
 		}
 	})
-	t.Run("потеря всех признаков — расхождение, а не пропуск", func(t *testing.T) {
+	t.Run("the loss of all signs is a divergence, not a skip", func(t *testing.T) {
 		b := snapOf("chromium-1", "chromium", snapRows(100, nil))
 		c := snapOf("moli-1", "moli", snapRows(100, func(i int, r *fixturesSnapshotRow) {
 			if i%10 == 0 { // all baseline-Laravel rows
@@ -165,16 +165,16 @@ func TestFixturesReportDetectionDegradations(t *testing.T) {
 		}))
 		r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
 		if r.DetectionComparable != 100 || r.DetectionDiff != 10 {
-			t.Fatalf("сравнимых %d, расхождений %d — хочу 100/10 (пропадание сигналов — расхождение)", r.DetectionComparable, r.DetectionDiff)
+			t.Fatalf("comparable %d, divergences %d — want 100/10 (the signals vanishing is a divergence)", r.DetectionComparable, r.DetectionDiff)
 		}
 		if r.DetectionFoundB != 10 || r.DetectionFoundC != 0 {
-			t.Fatalf("Laravel-вердиктов %d/%d, хочу 10/0", r.DetectionFoundB, r.DetectionFoundC)
+			t.Fatalf("Laravel verdicts %d/%d, want 10/0", r.DetectionFoundB, r.DetectionFoundC)
 		}
-		if v := verdictOf(t, r, "детекция"); v == nil || v.Status != verdictFail {
-			t.Fatalf("вердикт детекции = %+v, хочу НЕ ПРОЙДЕН (10%%)", v)
+		if v := verdictOf(t, r, "detection"); v == nil || v.Status != verdictFail {
+			t.Fatalf("the detection verdict = %+v, want FAILED (10%%)", v)
 		}
 	})
 }
@@ -191,21 +191,21 @@ func TestFixturesReportSuccess(t *testing.T) {
 		}
 	}))
 
-	t.Run("без метрик — строгое сравнение", func(t *testing.T) {
+	t.Run("no metrics — the strict comparison", func(t *testing.T) {
 		r, err := fixturesReportBuild(base, cand, fixturesDefaultMemoryBudget)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
 		if r.SuccessPctB != 100 || r.SuccessPctC != 90 {
-			t.Fatalf("успешность = %v/%v, хочу 100/90", r.SuccessPctB, r.SuccessPctC)
+			t.Fatalf("success = %v/%v, want 100/90", r.SuccessPctB, r.SuccessPctC)
 		}
-		v := verdictOf(t, r, "успешность")
+		v := verdictOf(t, r, "success")
 		if v == nil || v.Status != verdictFail {
-			t.Fatalf("вердикт успешности = %+v, хочу НЕ ПРОЙДЕН (строгое сравнение)", v)
+			t.Fatalf("the success verdict = %+v, want FAILED (the strict comparison)", v)
 		}
 	})
 
-	t.Run("с метриками — вычет DNS/cert потерь", func(t *testing.T) {
+	t.Run("with metrics — subtracting the DNS/cert losses", func(t *testing.T) {
 		b := *base // a copy: the sub-test's metrics do not leak into others
 		b.Streams = &fixturesSnapshotStreams{AnalyzeLen: 100, AnalyzeFirstMs: 1000, AnalyzeLastMs: 21000}
 		b.Metrics = &fixturesSnapshotMetrics{ProcessStartSeconds: 1, Tasks: 100, SecondsCount: 100, SecondsSum: 300}
@@ -217,17 +217,17 @@ func TestFixturesReportSuccess(t *testing.T) {
 		}
 		r, err := fixturesReportBuild(&b, &c, fixturesDefaultMemoryBudget)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
 		if r.IndepLossPctC == nil || *r.IndepLossPctC != 11 {
-			t.Fatalf("потери = %v, хочу 11%%", r.IndepLossPctC)
+			t.Fatalf("the losses = %v, want 11%%", r.IndepLossPctC)
 		}
-		v := verdictOf(t, r, "успешность")
+		v := verdictOf(t, r, "success")
 		if v == nil || v.Status != verdictPass {
-			t.Fatalf("вердикт успешности = %+v, хочу ПРОЙДЕН (90 ≥ 100 − 11)", v)
+			t.Fatalf("the success verdict = %+v, want PASSED (90 ≥ 100 − 11)", v)
 		}
 		if !strings.Contains(v.Detail, "11.00%") {
-			t.Errorf("детали вердикта без доли потерь: %s", v.Detail)
+			t.Errorf("the verdict details without the loss share: %s", v.Detail)
 		}
 	})
 }
@@ -239,39 +239,39 @@ func TestFixturesReportPace(t *testing.T) {
 	b.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 1000, AnalyzeLastMs: 11000} // 5 rows/s
 	c := snapOf("moli-1", "moli", snapRows(50, nil))
 
-	t.Run("кандидат быстрее", func(t *testing.T) {
+	t.Run("the candidate is faster", func(t *testing.T) {
 		c2 := *c                                                                                         // a copy of the struct, not the pointer: mutations do not leak into neighboring sub-tests
 		c2.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 2000, AnalyzeLastMs: 8200} // 8.06 rows/s
 		r, err := fixturesReportBuild(b, &c2, fixturesDefaultMemoryBudget)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
 		if r.PaceB == nil || *r.PaceB != 5 {
-			t.Fatalf("темп baseline = %v, хочу 5", r.PaceB)
+			t.Fatalf("the baseline pace = %v, want 5", r.PaceB)
 		}
-		v := verdictOf(t, r, "темп")
+		v := verdictOf(t, r, "pace")
 		if v == nil || v.Status != verdictPass {
-			t.Fatalf("вердикт темпа = %+v, хочу ПРОЙДЕН", v)
+			t.Fatalf("the pace verdict = %+v, want PASSED", v)
 		}
 	})
-	t.Run("кандидат медленнее", func(t *testing.T) {
+	t.Run("the candidate is slower", func(t *testing.T) {
 		c2 := *c
 		c2.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 1000, AnalyzeLastMs: 26000} // 2 rows/s
 		r, err := fixturesReportBuild(b, &c2, fixturesDefaultMemoryBudget)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
-		if v := verdictOf(t, r, "темп"); v == nil || v.Status != verdictFail {
-			t.Fatalf("вердикт темпа = %+v, хочу НЕ ПРОЙДЕН", v)
+		if v := verdictOf(t, r, "pace"); v == nil || v.Status != verdictFail {
+			t.Fatalf("the pace verdict = %+v, want FAILED", v)
 		}
 	})
-	t.Run("стримы не сняты", func(t *testing.T) {
+	t.Run("the streams were not captured", func(t *testing.T) {
 		r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
-		if v := verdictOf(t, r, "темп"); v == nil || v.Status != verdictNone {
-			t.Fatalf("вердикт темпа = %+v, хочу НЕТ ДАННЫХ", v)
+		if v := verdictOf(t, r, "pace"); v == nil || v.Status != verdictNone {
+			t.Fatalf("the pace verdict = %+v, want NO DATA", v)
 		}
 	})
 }
@@ -283,21 +283,21 @@ func TestFixturesHistQuantile(t *testing.T) {
 		{0.5, 10}, {1, 20}, {2.5, 50}, {5, 90}, {10, 100},
 	}
 	if got := fixturesHistQuantile(buckets, 100, 0.5); got == nil || *got != 2.5 {
-		t.Errorf("p50 = %v, хочу 2.5", got)
+		t.Errorf("p50 = %v, want 2.5", got)
 	}
 	// p95: rank 95 — the [5,10) bucket with 90..100 → 5 + (95-90)/10*5 = 7.5.
 	if got := fixturesHistQuantile(buckets, 100, 0.95); got == nil || *got != 7.5 {
-		t.Errorf("p95 = %v, хочу 7.5", got)
+		t.Errorf("p95 = %v, want 7.5", got)
 	}
 	// p10 — exactly at the first bucket's bound.
 	if got := fixturesHistQuantile(buckets, 100, 0.10); got == nil || *got != 0.5 {
-		t.Errorf("p10 = %v, хочу 0.5", got)
+		t.Errorf("p10 = %v, want 0.5", got)
 	}
 	if got := fixturesHistQuantile(nil, 100, 0.95); got != nil {
-		t.Errorf("пустая гистограмма = %v, хочу nil", got)
+		t.Errorf("an empty histogram = %v, want nil", got)
 	}
 	if got := fixturesHistQuantile(buckets, 0, 0.95); got != nil {
-		t.Errorf("нулевая счётность = %v, хочу nil", got)
+		t.Errorf("a zero count = %v, want nil", got)
 	}
 }
 
@@ -316,22 +316,22 @@ func TestFixturesReportDOM(t *testing.T) {
 	}))
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	if r.DOMPairs != 100 || r.DOMIdentical != 90 {
-		t.Fatalf("пары/идентичные = %d/%d, хочу 100/90", r.DOMPairs, r.DOMIdentical)
+		t.Fatalf("pairs/identical = %d/%d, want 100/90", r.DOMPairs, r.DOMIdentical)
 	}
 	if r.DOMAnomalousPairs != 5 || r.DOMAnomalousPct != 5 {
-		t.Fatalf("аномальные = %d (%.2f%%), хочу 5 (5%%)", r.DOMAnomalousPairs, r.DOMAnomalousPct)
+		t.Fatalf("anomalous = %d (%.2f%%), want 5 (5%%)", r.DOMAnomalousPairs, r.DOMAnomalousPct)
 	}
 	if r.DOMMedLenRatio == nil || *r.DOMMedLenRatio != 1 {
-		t.Fatalf("медиана длины = %v, хочу 1", r.DOMMedLenRatio)
+		t.Fatalf("the length median = %v, want 1", r.DOMMedLenRatio)
 	}
 	var buf bytes.Buffer
 	fixturesReportPrint(&buf, r)
-	for _, want := range []string{"×1.00", "90.00%", "идентичный DOM"} {
+	for _, want := range []string{"×1.00", "90.00%", "an identical DOM"} {
 		if !strings.Contains(buf.String(), want) {
-			t.Errorf("текст отчёта без %q:\n%s", want, buf.String())
+			t.Errorf("the report text without %q:\n%s", want, buf.String())
 		}
 	}
 }
@@ -347,62 +347,62 @@ func TestFixturesReportMemoryAndCrashes(t *testing.T) {
 	}
 	b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 
-	t.Run("память в допуске", func(t *testing.T) {
+	t.Run("memory within the threshold", func(t *testing.T) {
 		rss := int64(300 << 20)
 		r, err := fixturesReportBuild(b, newSnap("moli-1", &rss, nil, nil), 2<<30)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
-		if v := verdictOf(t, r, "память"); v == nil || v.Status != verdictPass {
-			t.Fatalf("вердикт памяти = %+v, хочу ПРОЙДЕН", v)
+		if v := verdictOf(t, r, "memory"); v == nil || v.Status != verdictPass {
+			t.Fatalf("the memory verdict = %+v, want PASSED", v)
 		}
 	})
-	t.Run("память за допуском", func(t *testing.T) {
+	t.Run("memory over the threshold", func(t *testing.T) {
 		rss := int64(800 << 20)
 		r, err := fixturesReportBuild(b, newSnap("moli-1", &rss, nil, nil), 2<<30)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
-		if v := verdictOf(t, r, "память"); v == nil || v.Status != verdictFail {
-			t.Fatalf("вердикт памяти = %+v, хочу НЕ ПРОЙДЕН (800 MiB ≥ ⅓×2 GiB)", v)
+		if v := verdictOf(t, r, "memory"); v == nil || v.Status != verdictFail {
+			t.Fatalf("the memory verdict = %+v, want FAILED (800 MiB ≥ ⅓×2 GiB)", v)
 		}
 	})
-	t.Run("память не задана", func(t *testing.T) {
+	t.Run("memory not set", func(t *testing.T) {
 		r, err := fixturesReportBuild(b, newSnap("moli-1", nil, nil, nil), 2<<30)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
-		if v := verdictOf(t, r, "память"); v == nil || v.Status != verdictNone {
-			t.Fatalf("вердикт памяти = %+v, хочу НЕТ ДАННЫХ", v)
+		if v := verdictOf(t, r, "memory"); v == nil || v.Status != verdictNone {
+			t.Fatalf("the memory verdict = %+v, want NO DATA", v)
 		}
 	})
-	t.Run("crashes оператором", func(t *testing.T) {
+	t.Run("crashes by the operator", func(t *testing.T) {
 		two := int64(2)
 		r, err := fixturesReportBuild(b, newSnap("moli-1", nil, &two, nil), 2<<30)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
 		if v := verdictOf(t, r, "crashes"); v == nil || v.Status != verdictFail {
-			t.Fatalf("вердикт crashes = %+v, хочу НЕ ПРОЙДЕН", v)
+			t.Fatalf("the crashes verdict = %+v, want FAILED", v)
 		}
 	})
-	t.Run("crashes по browser-классу", func(t *testing.T) {
+	t.Run("crashes by the browser class", func(t *testing.T) {
 		m := &fixturesSnapshotMetrics{ProcessStartSeconds: 5, Tasks: 10, SecondsCount: 10, Errors: map[string]float64{"browser": 3}}
 		r, err := fixturesReportBuild(b, newSnap("moli-1", nil, nil, m), 2<<30)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
 		if v := verdictOf(t, r, "crashes"); v == nil || v.Status != verdictFail {
-			t.Fatalf("вердикт crashes = %+v, хочу НЕ ПРОЙДЕН (browser=3)", v)
+			t.Fatalf("the crashes verdict = %+v, want FAILED (browser=3)", v)
 		}
 	})
-	t.Run("crashes без источников", func(t *testing.T) {
+	t.Run("crashes without sources", func(t *testing.T) {
 		r, err := fixturesReportBuild(b, newSnap("moli-1", nil, nil, nil), 2<<30)
 		if err != nil {
-			t.Fatalf("отчёт: %v", err)
+			t.Fatalf("the report: %v", err)
 		}
 		if v := verdictOf(t, r, "crashes"); v == nil || v.Status != verdictNone {
-			t.Fatalf("вердикт crashes = %+v, хочу НЕТ ДАННЫХ", v)
+			t.Fatalf("the crashes verdict = %+v, want NO DATA", v)
 		}
 	})
 }
@@ -418,19 +418,19 @@ func TestFixturesReportCumulative(t *testing.T) {
 	c.Metrics = &fixturesSnapshotMetrics{ProcessStartSeconds: 42, Tasks: 15, Errors: map[string]float64{"browser": 7}}
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	if !r.Cumulative {
-		t.Fatalf("счётчики не распознаны накопительными")
+		t.Fatalf("the counters were not recognized as cumulative")
 	}
 	if len(r.Warnings) == 0 {
-		t.Errorf("нет предупреждения о накопительных счётчиках")
+		t.Errorf("no warning about the cumulative counters")
 	}
 	if r.IndepLossPctC != nil {
-		t.Errorf("потери по накопительным счётчикам = %v, хочу nil", r.IndepLossPctC)
+		t.Errorf("the losses over the cumulative counters = %v, want nil", r.IndepLossPctC)
 	}
 	if v := verdictOf(t, r, "crashes"); v == nil || v.Status != verdictNone {
-		t.Fatalf("вердикт crashes = %+v, хочу НЕТ ДАННЫХ (накопительные метрики)", v)
+		t.Fatalf("the crashes verdict = %+v, want NO DATA (cumulative metrics)", v)
 	}
 }
 
@@ -443,7 +443,7 @@ func TestFixturesReportKeysMismatch(t *testing.T) {
 		r.DomainID += 100 // a different dump
 	}))
 	if _, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget); err == nil {
-		t.Fatalf("отчёт по разным выборкам не отказался")
+		t.Fatalf("the report over different selections did not refuse")
 	}
 }
 
@@ -455,12 +455,12 @@ func TestFixturesReportPendingWork(t *testing.T) {
 	c.Streams = &fixturesSnapshotStreams{RenderLen: 4, FallbackLen: 2}
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	joined := strings.Join(r.Warnings, "\n")
 	for _, want := range []string{"q:render-fallback: 2", "q:render"} {
 		if !strings.Contains(joined, want) {
-			t.Errorf("предупреждения без %q: %s", want, joined)
+			t.Errorf("the warnings without %q: %s", want, joined)
 		}
 	}
 }
@@ -475,19 +475,19 @@ func TestFixturesReportEmptyMetrics(t *testing.T) {
 	c.Metrics = &fixturesSnapshotMetrics{ProcessStartSeconds: 2} // Tasks=0, SecondsCount=0
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	if !r.MetricsEmptyC || r.MetricsValidC {
-		t.Fatalf("пустые метрики не распознаны: empty=%v valid=%v", r.MetricsEmptyC, r.MetricsValidC)
+		t.Fatalf("the empty metrics were not recognized: empty=%v valid=%v", r.MetricsEmptyC, r.MetricsValidC)
 	}
 	if r.IndepLossPctC != nil {
-		t.Errorf("потери по пустым метрикам = %v, хочу nil", r.IndepLossPctC)
+		t.Errorf("the losses over the empty metrics = %v, want nil", r.IndepLossPctC)
 	}
 	if v := verdictOf(t, r, "crashes"); v == nil || v.Status != verdictNone {
-		t.Fatalf("вердикт crashes = %+v, хочу НЕТ ДАННЫХ (метрики без событий)", v)
+		t.Fatalf("the crashes verdict = %+v, want NO DATA (metrics without events)", v)
 	}
-	if !strings.Contains(strings.Join(r.Warnings, "\n"), "без событий") {
-		t.Errorf("нет предупреждения о пустых метриках")
+	if !strings.Contains(strings.Join(r.Warnings, "\n"), "without events") {
+		t.Errorf("no warning about the empty metrics")
 	}
 }
 
@@ -507,20 +507,20 @@ func TestFixturesReportPaceWithoutStreams(t *testing.T) {
 	}
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	if r.PaceB != nil || r.PaceC != nil {
-		t.Fatalf("темп без стримов = %v/%v, хочу nil/nil", r.PaceB, r.PaceC)
+		t.Fatalf("the pace without streams = %v/%v, want nil/nil", r.PaceB, r.PaceC)
 	}
 	var buf bytes.Buffer
 	fixturesReportPrint(&buf, r)
 	text := buf.String()
-	if !strings.Contains(text, "темп нет данных") {
-		t.Errorf("текст без честной деградации темпа:\n%s", text)
+	if !strings.Contains(text, "the pace no data") {
+		t.Errorf("the text without the honest pace degradation:\n%s", text)
 	}
-	for _, want := range []string{"ср. 4.00 с", "p95 4.75 с", "ср. 3.00 с"} {
+	for _, want := range []string{"avg 4.00 s", "p95 4.75 s", "avg 3.00 s"} {
 		if !strings.Contains(text, want) {
-			t.Errorf("текст без %q (время страницы потерялось без темпа):\n%s", want, text)
+			t.Errorf("the text without %q (the page time was lost without the pace):\n%s", want, text)
 		}
 	}
 }
@@ -537,18 +537,18 @@ func TestFixturesReportDOMScriptZero(t *testing.T) {
 	}))
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	if r.DOMScriptZeroPairs != 3 {
-		t.Fatalf("пар с нулём скриптов %d, хочу 3", r.DOMScriptZeroPairs)
+		t.Fatalf("pairs with zero scripts %d, want 3", r.DOMScriptZeroPairs)
 	}
 	if r.DOMMedScriptsRatio == nil || *r.DOMMedScriptsRatio != 1 {
-		t.Fatalf("медиана скриптов = %v, хочу 1 (нули в медиану не входят)", r.DOMMedScriptsRatio)
+		t.Fatalf("the scripts median = %v, want 1 (zeros do not enter the median)", r.DOMMedScriptsRatio)
 	}
 	var buf bytes.Buffer
 	fixturesReportPrint(&buf, r)
-	if !strings.Contains(buf.String(), "ни одного <script>: 3") {
-		t.Errorf("текст без метрики потерянных скриптов:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "no <script> at all: 3") {
+		t.Errorf("the text without the lost scripts metric:\n%s", buf.String())
 	}
 }
 
@@ -561,14 +561,14 @@ func TestFixturesReportTruncatedKeys(t *testing.T) {
 	c := snapOf("moli-1", "moli", snapRows(10, nil))
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	joined := strings.Join(r.Warnings, "\n")
-	if !strings.Contains(joined, "10 строк при 12 ключах") {
-		t.Errorf("нет предупреждения об усечении выборки: %s", joined)
+	if !strings.Contains(joined, "10 rows with 12 keys") {
+		t.Errorf("no warning about the selection truncation: %s", joined)
 	}
 	if r.Keys != 10 {
-		t.Errorf("знаменатель = %d, хочу 10", r.Keys)
+		t.Errorf("the denominator = %d, want 10", r.Keys)
 	}
 }
 
@@ -579,14 +579,14 @@ func TestFixturesReportPairSanity(t *testing.T) {
 	c := snapOf("run", "moli", snapRows(10, nil))
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	joined := strings.Join(r.Warnings, "\n")
-	if !strings.Contains(joined, "метки снапшотов совпадают") {
-		t.Errorf("нет предупреждения о совпадении меток: %s", joined)
+	if !strings.Contains(joined, "the snapshot labels are the same") {
+		t.Errorf("no warning about the same labels: %s", joined)
 	}
 	if !strings.Contains(joined, "baseline-chromium") {
-		t.Errorf("нет предупреждения о baseline-движке: %s", joined)
+		t.Errorf("no warning about the baseline engine: %s", joined)
 	}
 }
 
@@ -599,10 +599,10 @@ func TestFixturesHistQuantileSentinelTail(t *testing.T) {
 	}
 	got := fixturesHistQuantile(buckets, 70, 0.99)
 	if got == nil || *got != 5 {
-		t.Fatalf("p99 = %v, хочу 5 (не сентинел)", got)
+		t.Fatalf("p99 = %v, want 5 (not the sentinel)", got)
 	}
 	if got := fixturesHistQuantile([]fixturesHistBucket{{math.MaxFloat64, 5}}, 5, 0.5); got != nil {
-		t.Fatalf("единственная корзина-сентинел = %v, хочу nil", got)
+		t.Fatalf("the only sentinel bucket = %v, want nil", got)
 	}
 }
 
@@ -638,29 +638,29 @@ func TestFixturesReportFullText(t *testing.T) {
 	}
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
-		t.Fatalf("отчёт: %v", err)
+		t.Fatalf("the report: %v", err)
 	}
 	var buf bytes.Buffer
 	fixturesReportPrint(&buf, r)
 	text := buf.String()
 	for _, want := range []string{
-		"Успешность рендеров",
-		"Темп и время страницы",
-		"Причины финализаций",
+		"Render success",
+		"Pace and page time",
+		"Finalization reasons",
 		"net::ERR_CONNECTION_REFUSED",
-		"Диф детекции Laravel",
-		"Структурные метрики DOM",
-		"Память RSS движка",
-		"Вердикты против порогов §5.1 п.4",
-		"детекция Laravel < 1%",
-		"успешность",
-		"темп не хуже базового",
-		"память < ⅓ бюджета chromium",
-		"0 crashes движка",
-		"публикаций в фолбэк",
+		"Laravel detection diff",
+		"Structural DOM metrics",
+		"Engine RSS memory",
+		"Verdicts against the §5.1 item 4 thresholds",
+		"Laravel detection < 1%",
+		"success",
+		"pace not worse than baseline",
+		"memory < ⅓ of the chromium budget",
+		"0 engine crashes",
+		"fallback publications",
 	} {
 		if !strings.Contains(text, want) {
-			t.Errorf("текст отчёта без %q:\n%s", want, text)
+			t.Errorf("the report text without %q:\n%s", want, text)
 		}
 	}
 }
@@ -673,7 +673,7 @@ func TestFixturesReasonList(t *testing.T) {
 		t.Errorf("reasonList = %q", got)
 	}
 	if got := fixturesReasonList(nil); got != "—" {
-		t.Errorf("пустой словарь = %q", got)
+		t.Errorf("the empty dictionary = %q", got)
 	}
 }
 
@@ -688,7 +688,7 @@ func TestFixturesFormatBytes(t *testing.T) {
 	}
 	for v, want := range cases {
 		if got := fixturesFormatBytes(v); got != want {
-			t.Errorf("formatBytes(%d) = %q, хочу %q", v, got, want)
+			t.Errorf("formatBytes(%d) = %q, want %q", v, got, want)
 		}
 	}
 }

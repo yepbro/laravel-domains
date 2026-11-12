@@ -54,11 +54,11 @@ func (r *statusRows) Next() bool {
 
 func (r *statusRows) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) {
-		return errors.New("statusRows: Scan без Next")
+		return errors.New("statusRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("statusRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("statusRows: %d destinations, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		v := row[i]
@@ -78,7 +78,7 @@ func (r *statusRows) Scan(dest ...any) error {
 		case *[]byte:
 			*dst = v.([]byte)
 		default:
-			return fmt.Errorf("statusRows: приёмник %T не поддерживается", d)
+			return fmt.Errorf("statusRows: the destination %T is not supported", d)
 		}
 	}
 	return nil
@@ -131,17 +131,17 @@ func TestWriteStatusTable(t *testing.T) {
 	got := b.String()
 
 	for _, want := range []string{
-		"зона", "pending", "queued", "done", // header
+		"zone", "pending", "queued", "done", // header
 		"crawl.test +", "empty.test -",
-		"60", "38", "итого", "40%", // aggregates and totals
+		"60", "38", "total", "40%", // aggregates and totals
 		"q:dns 5", "q:render 12", "q:dead 1", // queues
-		"доменов/с          1.0   (3600 проверено с начала суток, прошло 1h 00m)",
-		"HTTP-результатов/с 2.0   (7200 за окно темпа 1h 00m)",
-		"рендеров/с         1.0   (3600 с итоговым DOM за то же окно)",
-		"цикл: осталось 62 (pending+queued); ETA ≈ 1m (по 1.0 дом./с)",
+		"domains/s          1.0   (3600 checked since the start of the day, elapsed 1h 00m)",
+		"HTTP results/s     2.0   (7200 over the rate window 1h 00m)",
+		"renders/s          1.0   (3600 with a final DOM over the same window)",
+		"cycle: 62 remaining (pending+queued); ETA ≈ 1m (at 1.0 domains/s)",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("таблица не содержит %q:\n%s", want, got)
+			t.Errorf("the table does not contain %q:\n%s", want, got)
 		}
 	}
 
@@ -149,12 +149,12 @@ func TestWriteStatusTable(t *testing.T) {
 	// of the total column is at least the longest value (100); the
 	// totals (110) widen it; the totals row ends with the done numbers.
 	for _, line := range strings.Split(got, "\n") {
-		if strings.HasPrefix(line, "итого") {
+		if strings.HasPrefix(line, "total") {
 			if !strings.HasSuffix(line, "38") {
-				t.Errorf("строка итога не кончается done: %q", line)
+				t.Errorf("the totals row does not end with done: %q", line)
 			}
 			if !strings.Contains(line, "110") {
-				t.Errorf("строка итога без суммы всего: %q", line)
+				t.Errorf("the totals row without the total sum: %q", line)
 			}
 		}
 	}
@@ -170,13 +170,13 @@ func TestWriteStatusTableDegraded(t *testing.T) {
 	writeStatusTable(&b, nil, tot, thr, rates, nil)
 	got := b.String()
 	for _, want := range []string{
-		"н/д (Redis недоступен)",
-		"итого",
-		"доменов/с          1.0",
-		"цикл: осталось 0 (pending и queued пусты) — проверять нечего",
+		"n/a (Redis unavailable)",
+		"total",
+		"domains/s          1.0",
+		"cycle: 0 remaining (pending and queued are empty) — nothing to check",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("деградированный вывод не содержит %q:\n%s", want, got)
+			t.Errorf("the degraded output does not contain %q:\n%s", want, got)
 		}
 	}
 
@@ -187,11 +187,11 @@ func TestWriteStatusTableDegraded(t *testing.T) {
 	writeStatusTable(&b, nil, status.Totals{}, thr, rates, nil)
 	got = b.String()
 	for _, want := range []string{
-		"н/д   (окно с начала суток короче 10m)",
-		"ETA н/д (скорость неизвестна или 0)",
+		"n/a   (the window since the start of the day is shorter than 10m)",
+		"ETA n/a (the rate is unknown or 0)",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("вывод без скорости не содержит %q:\n%s", want, got)
+			t.Errorf("the output without rates does not contain %q:\n%s", want, got)
 		}
 	}
 }
@@ -236,13 +236,13 @@ func TestWriteStatusJSON(t *testing.T) {
 		} `json:"rates"`
 	}
 	if err := json.Unmarshal(b.Bytes(), &doc); err != nil {
-		t.Fatalf("вывод не json: %v;\n%s", err, b.String())
+		t.Fatalf("the output is not json: %v;\n%s", err, b.String())
 	}
 	if len(doc.Zones) != 2 || doc.Zones[0].Name != "crawl.test" || !doc.Zones[0].Active {
 		t.Errorf("zones = %+v", doc.Zones)
 	}
 	if doc.Zones[1].NameUnicode != "" {
-		t.Errorf("name_unicode пустой зоны = %q, хочу \"\" (omitempty вне теста)", doc.Zones[1].NameUnicode)
+		t.Errorf("the empty zone's name_unicode = %q, want \"\" (omitempty outside the test)", doc.Zones[1].NameUnicode)
 	}
 	if doc.Totals["pending"] != 60 || doc.Totals["domains_total"] != 110 {
 		t.Errorf("totals = %v", doc.Totals)
@@ -256,16 +256,16 @@ func TestWriteStatusJSON(t *testing.T) {
 	// The length of the rate bucket window is in the wire format (T-203):
 	// a machine consumer sees what the results_hour sum is a multiple of.
 	if doc.Throughput.HourWindowSec != 3600 {
-		t.Errorf("hour_window_sec = %v, хочу 3600", doc.Throughput.HourWindowSec)
+		t.Errorf("hour_window_sec = %v, want 3600", doc.Throughput.HourWindowSec)
 	}
 	if doc.Rates.DomainsPerSec == nil || *doc.Rates.DomainsPerSec != 1 {
-		t.Errorf("domains_per_sec = %v, хочу 1", doc.Rates.DomainsPerSec)
+		t.Errorf("domains_per_sec = %v, want 1", doc.Rates.DomainsPerSec)
 	}
 	if doc.Rates.ResultsPerSec != 2 {
-		t.Errorf("results_per_sec = %v, хочу 2", doc.Rates.ResultsPerSec)
+		t.Errorf("results_per_sec = %v, want 2", doc.Rates.ResultsPerSec)
 	}
 	if doc.Rates.ETASec == nil || *doc.Rates.ETASec != 62 {
-		t.Errorf("eta_sec = %v, хочу 62", doc.Rates.ETASec)
+		t.Errorf("eta_sec = %v, want 62", doc.Rates.ETASec)
 	}
 
 	// Degradation: a short window + unavailable Redis → null fields, the
@@ -286,19 +286,19 @@ func TestWriteStatusJSON(t *testing.T) {
 		} `json:"rates"`
 	}
 	if err := json.Unmarshal(b.Bytes(), &deg); err != nil {
-		t.Fatalf("вывод не json: %v;\n%s", err, b.String())
+		t.Fatalf("the output is not json: %v;\n%s", err, b.String())
 	}
 	if len(deg.Zones) != 0 {
-		t.Errorf("zones = %d, хочу пустой массив", len(deg.Zones))
+		t.Errorf("zones = %d, want an empty array", len(deg.Zones))
 	}
 	if deg.Queues != nil {
-		t.Errorf("queues = %v, хочу null", deg.Queues)
+		t.Errorf("queues = %v, want null", deg.Queues)
 	}
 	if deg.Rates.DomainsPerSec != nil || deg.Rates.ETASec != nil {
-		t.Errorf("rates = %+v, хочу null/null", deg.Rates)
+		t.Errorf("rates = %+v, want null/null", deg.Rates)
 	}
 	if deg.Rates.Remaining != 10 {
-		t.Errorf("remaining = %d, хочу 10", deg.Rates.Remaining)
+		t.Errorf("remaining = %d, want 10", deg.Rates.Remaining)
 	}
 }
 
@@ -318,23 +318,23 @@ func TestRunStatus(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"status"}, &stdout, &stderr)
 	if code != exitError {
-		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitError, stderr.String())
+		t.Fatalf("code = %d, want %d; stderr:\n%s", code, exitError, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "status: config:") {
-		t.Errorf("stderr не содержит контекст конфигурации:\n%s", stderr.String())
+		t.Errorf("stderr does not contain the configuration context:\n%s", stderr.String())
 	}
 	if stdout.Len() != 0 {
-		t.Errorf("stdout до соединения не пуст:\n%s", stdout.String())
+		t.Errorf("stdout before the connection is not empty:\n%s", stdout.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	code = run([]string{"status", "--json"}, &stdout, &stderr)
 	if code != exitError || !strings.Contains(stderr.String(), "status: config:") {
-		t.Errorf("--json: код = %d, stderr:\n%s; хочу ошибку конфигурации (код 1)", code, stderr.String())
+		t.Errorf("--json: code = %d, stderr:\n%s; want a configuration error (code 1)", code, stderr.String())
 	}
 	if stdout.Len() != 0 {
-		t.Errorf("--json: stdout до соединения не пуст:\n%s", stdout.String())
+		t.Errorf("--json: stdout before the connection is not empty:\n%s", stdout.String())
 	}
 }
 
@@ -346,16 +346,16 @@ func TestRunStatus(t *testing.T) {
 func TestStatusHelpMentionsStreams(t *testing.T) {
 	for _, s := range status.Streams {
 		if !strings.Contains(statusHelp, s) {
-			t.Errorf("statusHelp не упоминает стрим %q", s)
+			t.Errorf("statusHelp does not mention the stream %q", s)
 		}
 	}
 	if !strings.Contains(statusHelp, "ETA") {
-		t.Error("statusHelp не описывает ETA цикла")
+		t.Error("statusHelp does not describe the cycle ETA")
 	}
-	if !strings.Contains(statusHelp, "часовые корзины crawler_counters") {
-		t.Error("statusHelp не описывает источник темпа (часовые корзины, T-203)")
+	if !strings.Contains(statusHelp, "crawler_counters hourly buckets") {
+		t.Error("statusHelp does not describe the rate source (the hourly buckets, T-203)")
 	}
-	if strings.Contains(statusHelp, "последний час") {
-		t.Error("statusHelp обещает «последний час» — окно темпа 1–2 ч из корзин (T-203)")
+	if strings.Contains(statusHelp, "last hour") {
+		t.Error("statusHelp promises a \"last hour\" — the 1–2 h rate window comes from the buckets (T-203)")
 	}
 }

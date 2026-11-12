@@ -112,84 +112,84 @@ func importDumpFixture() (zones []fixturesZone, domains []fixturesDomain, result
 func TestFixturesReadDump(t *testing.T) {
 	zones, domains, results, smoke := importDumpFixture()
 
-	t.Run("полный дамп", func(t *testing.T) {
+	t.Run("the full dump", func(t *testing.T) {
 		dir := t.TempDir()
 		writeDumpDir(t, dir, &fixturesManifest{FormatVersion: 1, Seed: 242}, zones, domains, results, smoke)
 		dump, err := fixturesReadDump(dir)
 		if err != nil {
-			t.Fatalf("чтение: %v", err)
+			t.Fatalf("reading: %v", err)
 		}
 		if len(dump.Zones) != 1 || len(dump.Domains) != 1 || len(dump.Results) != 2 || len(dump.Smoke) != 1 {
-			t.Fatalf("счётчики дампа: зоны %d, домены %d, результаты %d, smoke %d",
+			t.Fatalf("the dump counters: zones %d, domains %d, results %d, smoke %d",
 				len(dump.Zones), len(dump.Domains), len(dump.Results), len(dump.Smoke))
 		}
 		if dump.Manifest.Seed != 242 {
-			t.Errorf("манифест не прочитан: %+v", dump.Manifest)
+			t.Errorf("the manifest was not read: %+v", dump.Manifest)
 		}
 		if dump.Results[0].Stratum != "ok" || dump.Results[0].Headers == nil {
-			t.Errorf("строка результата потеряла поля: %+v", dump.Results[0])
+			t.Errorf("a result row lost fields: %+v", dump.Results[0])
 		}
 	})
 
-	t.Run("нет манифеста — дамп не завершён", func(t *testing.T) {
+	t.Run("no manifest — the dump is incomplete", func(t *testing.T) {
 		dir := t.TempDir()
 		writeDumpDir(t, dir, nil, zones, domains, results, smoke)
 		if err := os.Remove(filepath.Join(dir, "manifest.json")); err != nil {
 			t.Fatal(err)
 		}
 		_, err := fixturesReadDump(dir)
-		if err == nil || !strings.Contains(err.Error(), "не завершён") {
-			t.Errorf("ошибка без манифеста = %v, хочу «дамп не завершён»", err)
+		if err == nil || !strings.Contains(err.Error(), "incomplete") {
+			t.Errorf("the error without a manifest = %v, want \"the dump is incomplete\"", err)
 		}
 	})
 
-	t.Run("версия формата из будущего", func(t *testing.T) {
+	t.Run("a format version from the future", func(t *testing.T) {
 		dir := t.TempDir()
 		writeDumpDir(t, dir, &fixturesManifest{FormatVersion: fixturesFormatVersion + 1}, zones, domains, results, smoke)
 		_, err := fixturesReadDump(dir)
-		if err == nil || !strings.Contains(err.Error(), "формат v2 не поддерживается") {
-			t.Errorf("ошибка версии = %v, хочу отказ по версии", err)
+		if err == nil || !strings.Contains(err.Error(), "format v2 is not supported") {
+			t.Errorf("the version error = %v, want a version refusal", err)
 		}
 	})
 
-	t.Run("счётчик манифеста не сходится — дамп обрезан", func(t *testing.T) {
+	t.Run("the manifest counter does not match — the dump is truncated", func(t *testing.T) {
 		dir := t.TempDir()
 		writeDumpDir(t, dir, &fixturesManifest{FormatVersion: fixturesFormatVersion,
 			Files: map[string]int{"zones.ndjson": 1, "domains.ndjson": 1,
 				"subdomain_results.ndjson": len(results) + 5, "smoke.ndjson": len(smoke)}}, zones, domains, results, smoke)
 		_, err := fixturesReadDump(dir)
-		if err == nil || !strings.Contains(err.Error(), "манифест насчитал") {
-			t.Errorf("ошибка сверки манифеста = %v, хочу отказ по счётчику строк", err)
+		if err == nil || !strings.Contains(err.Error(), "the manifest counted") {
+			t.Errorf("the manifest cross-check error = %v, want a row counter refusal", err)
 		}
 	})
 
-	t.Run("манифест без счётчика файла", func(t *testing.T) {
+	t.Run("the manifest without a file counter", func(t *testing.T) {
 		dir := t.TempDir()
 		writeDumpDir(t, dir, &fixturesManifest{FormatVersion: fixturesFormatVersion,
 			Files: map[string]int{"zones.ndjson": 1}}, zones, domains, results, smoke)
 		_, err := fixturesReadDump(dir)
-		if err == nil || !strings.Contains(err.Error(), "без счётчика строк domains.ndjson") {
-			t.Errorf("ошибка отсутствия счётчика = %v", err)
+		if err == nil || !strings.Contains(err.Error(), "no row counter for domains.ndjson") {
+			t.Errorf("the missing counter error = %v", err)
 		}
 	})
 
-	t.Run("дубли естественных ключей внутри дампа — ошибка до БД", func(t *testing.T) {
+	t.Run("duplicate natural keys inside the dump — an error before the DB", func(t *testing.T) {
 		dir := t.TempDir()
 		dupZones := []fixturesZone{zones[0], {ID: zones[0].ID + 1, Name: zones[0].Name}}
 		writeDumpDir(t, dir, nil, dupZones, domains, results, smoke)
-		if _, err := fixturesReadDump(dir); err == nil || !strings.Contains(err.Error(), "имя su дважды") {
-			t.Errorf("дубль имени зоны = %v, хочу отказ (UNIQUE zones.name)", err)
+		if _, err := fixturesReadDump(dir); err == nil || !strings.Contains(err.Error(), "the name su twice") {
+			t.Errorf("a duplicate zone name = %v, want a refusal (UNIQUE zones.name)", err)
 		}
 
 		dir = t.TempDir()
 		dupDomains := []fixturesDomain{domains[0], {ZoneID: domains[0].ZoneID, ID: domains[0].ID + 1, Label: domains[0].Label}}
 		writeDumpDir(t, dir, nil, zones, dupDomains, results, smoke)
-		if _, err := fixturesReadDump(dir); err == nil || !strings.Contains(err.Error(), "меткой ok в зоне 7 дважды") {
-			t.Errorf("дубль метки домена = %v, хочу отказ (UNIQUE (zone_id, label))", err)
+		if _, err := fixturesReadDump(dir); err == nil || !strings.Contains(err.Error(), "the label ok in zone 7 twice") {
+			t.Errorf("a duplicate domain label = %v, want a refusal (UNIQUE (zone_id, label))", err)
 		}
 	})
 
-	t.Run("файл дампа отсутствует", func(t *testing.T) {
+	t.Run("the dump file is missing", func(t *testing.T) {
 		dir := t.TempDir()
 		writeDumpDir(t, dir, nil, zones, domains, results, smoke)
 		if err := os.Remove(filepath.Join(dir, "subdomain_results.ndjson")); err != nil {
@@ -197,23 +197,23 @@ func TestFixturesReadDump(t *testing.T) {
 		}
 		_, err := fixturesReadDump(dir)
 		if err == nil || !strings.Contains(err.Error(), "subdomain_results.ndjson") {
-			t.Errorf("ошибка отсутствующего файла = %v, хочу имя файла", err)
+			t.Errorf("the missing file error = %v, want the file name", err)
 		}
 	})
 
-	t.Run("битая строка NDJSON — номер записи", func(t *testing.T) {
+	t.Run("a broken NDJSON line — the row number", func(t *testing.T) {
 		dir := t.TempDir()
 		writeDumpDir(t, dir, nil, zones, domains, results, smoke)
 		if err := os.WriteFile(filepath.Join(dir, "zones.ndjson"), []byte("{\"id\": 1,}\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		_, err := fixturesReadDump(dir)
-		if err == nil || !strings.Contains(err.Error(), "запись 1") {
-			t.Errorf("ошибка битой строки = %v, хочу номер записи", err)
+		if err == nil || !strings.Contains(err.Error(), "row 1") {
+			t.Errorf("the broken line error = %v, want the row number", err)
 		}
 	})
 
-	t.Run("дубли ключей — последняя запись побеждает", func(t *testing.T) {
+	t.Run("duplicate keys — the last entry wins", func(t *testing.T) {
 		dir := t.TempDir()
 		dupResults := append(append([]fixturesResult{}, results...), results[0])
 		dupResults[2].Stratum = "failed" // a duplicate of the first row's key — harder to tell apart
@@ -222,41 +222,41 @@ func TestFixturesReadDump(t *testing.T) {
 		writeDumpDir(t, dir, nil, zones, dupDomains, dupResults, smoke)
 		dump, err := fixturesReadDump(dir)
 		if err != nil {
-			t.Fatalf("чтение: %v", err)
+			t.Fatalf("reading: %v", err)
 		}
 		if len(dump.Results) != 2 || dump.DupResults != 1 {
-			t.Errorf("результаты %d (дублей %d), хочу 2 (дублей 1)", len(dump.Results), dump.DupResults)
+			t.Errorf("results %d (duplicates %d), want 2 (1 duplicate)", len(dump.Results), dump.DupResults)
 		}
 		if dump.Results[0].Stratum != "failed" {
-			t.Errorf("дубль не перезаписал первую запись: страта %q", dump.Results[0].Stratum)
+			t.Errorf("the duplicate did not overwrite the first entry: stratum %q", dump.Results[0].Stratum)
 		}
 		if len(dump.Domains) != 1 || dump.DupDomains != 1 {
-			t.Errorf("домены %d (дублей %d), хочу 1/1 — ключ (zone,id) один, метка менялась", len(dump.Domains), dump.DupDomains)
+			t.Errorf("domains %d (duplicates %d), want 1/1 — one (zone,id) key, the label changed", len(dump.Domains), dump.DupDomains)
 		}
 		if dump.Domains[0].Label != "other" {
-			t.Errorf("дубль домена не перезаписал метку: %q", dump.Domains[0].Label)
+			t.Errorf("the duplicate domain did not overwrite the label: %q", dump.Domains[0].Label)
 		}
 	})
 
-	t.Run("строка без домена дампа — ошибка до БД", func(t *testing.T) {
+	t.Run("a row without the dump's domain — an error before the DB", func(t *testing.T) {
 		dir := t.TempDir()
 		orphan := append(append([]fixturesResult{}, results...),
 			fixturesResult{ZoneID: 7, DomainID: 999, SubdomainID: 0, Variant: 0, Scheme: 2, CheckedAt: time.Now()})
 		writeDumpDir(t, dir, nil, zones, domains, orphan, smoke)
 		_, err := fixturesReadDump(dir)
-		if err == nil || !strings.Contains(err.Error(), "домен, которого нет") {
-			t.Errorf("ошибка сироты = %v, хочу отказ по ссылочной целостности", err)
+		if err == nil || !strings.Contains(err.Error(), "a domain that does not exist") {
+			t.Errorf("the orphan error = %v, want a referential integrity refusal", err)
 		}
 	})
 
-	t.Run("домен без зоны дампа — ошибка до БД", func(t *testing.T) {
+	t.Run("a domain without the dump's zone — an error before the DB", func(t *testing.T) {
 		dir := t.TempDir()
 		orphanDomains := append(append([]fixturesDomain{}, domains...),
 			fixturesDomain{ZoneID: 9, ID: 1, Label: "stray"})
 		writeDumpDir(t, dir, nil, zones, orphanDomains, results, smoke)
 		_, err := fixturesReadDump(dir)
-		if err == nil || !strings.Contains(err.Error(), "зону, которой нет") {
-			t.Errorf("ошибка домена без зоны = %v", err)
+		if err == nil || !strings.Contains(err.Error(), "a zone that does not exist") {
+			t.Errorf("the domain without a zone error = %v", err)
 		}
 	})
 }
@@ -288,7 +288,7 @@ type importPool struct {
 }
 
 func (p *importPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("importPool: CopyFrom не вызывается")
+	return 0, errors.New("importPool: CopyFrom is not called")
 }
 
 func (p *importPool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -296,7 +296,7 @@ func (p *importPool) Exec(ctx context.Context, sql string, args ...any) (pgconn.
 	defer p.mu.Unlock()
 	p.execSQL = append(p.execSQL, sql)
 	if p.failOn != "" && strings.Contains(sql, p.failOn) {
-		return pgconn.CommandTag{}, fmt.Errorf("фиктивный сбой БД (%s)", p.failOn)
+		return pgconn.CommandTag{}, fmt.Errorf("a fake DB failure (%s)", p.failOn)
 	}
 	// RowsAffected = rows in the batch: the first column of every import
 	// INSERT is the zone_id array.
@@ -313,7 +313,7 @@ func (p *importPool) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, e
 	defer p.mu.Unlock()
 	p.querySQL = append(p.querySQL, sql)
 	if p.failOn != "" && strings.Contains(sql, p.failOn) {
-		return nil, fmt.Errorf("фиктивный сбой БД (%s)", p.failOn)
+		return nil, fmt.Errorf("a fake DB failure (%s)", p.failOn)
 	}
 	switch {
 	case strings.Contains(sql, "count(*) FROM zones AS z"): // plan: existing PKs
@@ -331,7 +331,7 @@ func (p *importPool) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, e
 	case strings.Contains(sql, "SELECT setval("):
 		return &fixturesRows{rows: [][]any{{p.setvalVal}}}, nil
 	default:
-		return nil, fmt.Errorf("importPool: неизвестный Query: %s", sql)
+		return nil, fmt.Errorf("importPool: unknown Query: %s", sql)
 	}
 }
 
@@ -367,42 +367,42 @@ func importDump(t *testing.T) *fixturesDump {
 // repeated run executes the same idempotent statements (ON CONFLICT by
 // PK).
 func TestFixturesImportRun(t *testing.T) {
-	t.Run("успех: порядок и счётчики", func(t *testing.T) {
+	t.Run("success: the order and the counters", func(t *testing.T) {
 		pool := &importPool{setvalVal: 7}
 		dump := importDump(t)
 		var out bytes.Buffer
 		stats, err := fixturesImportRun(context.Background(), pool, dump, &out)
 		if err != nil {
-			t.Fatalf("накат: %v", err)
+			t.Fatalf("the import: %v", err)
 		}
 		if stats.Zones != 1 || stats.Domains != 1 || stats.Results != 2 {
-			t.Errorf("счётчики наката: %+v", stats)
+			t.Errorf("the import counters: %+v", stats)
 		}
 		if stats.ZoneSeq != 7 || stats.DomainSeq != 7 {
-			t.Errorf("последовательности не выставлены: %+v", stats)
+			t.Errorf("the sequences were not set: %+v", stats)
 		}
 		exec, query := pool.calls()
 		// Order: the pre-checks (Query) before the INSERT; setval (Query)
 		// and the orphaned content cleanup (an Exec without parameters) —
 		// after.
 		if n := len(exec); n != 4 { // zones, domains, results, contents cleanup
-			t.Errorf("Exec-вызовов %d (%v), хочу 4", n, exec)
+			t.Errorf("Exec calls %d (%v), want 4", n, exec)
 		}
 		if n := len(query); n != 4 { // 2 pre-checks + 2 setval
-			t.Errorf("Query-вызовов %d (%v), хочу 4", n, query)
+			t.Errorf("Query calls %d (%v), want 4", n, query)
 		}
-		if !strings.Contains(out.String(), "накат: зоны 1, домены 1, строки результатов 2") {
-			t.Errorf("отчёт наката:\n%s", out.String())
+		if !strings.Contains(out.String(), "import: zones 1, domains 1, result rows 2") {
+			t.Errorf("the import report:\n%s", out.String())
 		}
 	})
 
-	t.Run("повторный накат — те же идемпотентные операторы", func(t *testing.T) {
+	t.Run("a repeated import — the same idempotent statements", func(t *testing.T) {
 		pool := &importPool{setvalVal: 7}
 		dump := importDump(t)
 		for run := 1; run <= 2; run++ {
 			var out bytes.Buffer
 			if _, err := fixturesImportRun(context.Background(), pool, dump, &out); err != nil {
-				t.Fatalf("прогон %d: %v", run, err)
+				t.Fatalf("run %d: %v", run, err)
 			}
 		}
 		// Both runs — INSERT with ON CONFLICT by PK (idempotency is not
@@ -419,16 +419,16 @@ func TestFixturesImportRun(t *testing.T) {
 			"GREATEST((SELECT coalesce(max(id), 0) FROM domains)",
 		} {
 			if n := pool.countSQL(substr); n != 2 {
-				t.Errorf("оператор %q выполнен %d раз за 2 прогона, хочу 2", substr, n)
+				t.Errorf("the statement %q executed %d times over 2 runs, want 2", substr, n)
 			}
 		}
 		// The import makes no plain INSERT without a conflict at all.
 		if pool.countSQL("ON CONFLICT") != pool.countSQL("INSERT INTO") {
-			t.Errorf("есть INSERT без ON CONFLICT — повторный накат дублировал бы строки")
+			t.Errorf("there is an INSERT without ON CONFLICT — a repeated import would duplicate rows")
 		}
 	})
 
-	t.Run("пачки: больше fixturesImportBatch строк — несколько операторов", func(t *testing.T) {
+	t.Run("batches: more than fixturesImportBatch rows — several statements", func(t *testing.T) {
 		pool := &importPool{setvalVal: 1}
 		zones, domains, _, _ := importDumpFixture()
 		var results []fixturesResult
@@ -441,69 +441,69 @@ func TestFixturesImportRun(t *testing.T) {
 		var out bytes.Buffer
 		stats, err := fixturesImportRun(context.Background(), pool, dump, &out)
 		if err != nil {
-			t.Fatalf("накат: %v", err)
+			t.Fatalf("the import: %v", err)
 		}
 		if stats.Results != fixturesImportBatch+1 {
-			t.Errorf("накатано %d строк, хочу %d", stats.Results, fixturesImportBatch+1)
+			t.Errorf("imported %d rows, want %d", stats.Results, fixturesImportBatch+1)
 		}
 		if n := pool.countSQL("INSERT INTO subdomain_results"); n != 2 {
-			t.Errorf("пачек результатов %d, хочу 2", n)
+			t.Errorf("result batches %d, want 2", n)
 		}
 	})
 
-	t.Run("конфликт имени зоны — отказ до записи", func(t *testing.T) {
+	t.Run("a zone name conflict — a refusal before writing", func(t *testing.T) {
 		pool := &importPool{zoneRows: [][]any{{int16(3), "su"}}} // in the dump su = id 7
 		var out bytes.Buffer
 		_, err := fixturesImportRun(context.Background(), pool, importDump(t), &out)
-		if err == nil || !strings.Contains(err.Error(), "su (id дампа 7, id БД 3)") {
-			t.Errorf("ошибка конфликта зоны = %v, хочу перечень зон с id", err)
+		if err == nil || !strings.Contains(err.Error(), "su (dump id 7, DB id 3)") {
+			t.Errorf("the zone conflict error = %v, want the list of zones with ids", err)
 		}
 		if n := pool.countSQL("INSERT INTO"); n != 0 {
-			t.Errorf("после отказа предпроверки выполнено %d INSERT — запись не должна была начаться", n)
+			t.Errorf("after the pre-check refusal %d INSERTs were executed — the writing must not have started", n)
 		}
 	})
 
-	t.Run("конфликт метки домена — отказ до записи", func(t *testing.T) {
+	t.Run("a domain label conflict — a refusal before writing", func(t *testing.T) {
 		pool := &importPool{domainRows: [][]any{{int16(7), "ok", int64(5)}}} // in the dump ok = id 42
 		var out bytes.Buffer
 		_, err := fixturesImportRun(context.Background(), pool, importDump(t), &out)
-		if err == nil || !strings.Contains(err.Error(), "id дампа 42, id БД 5") {
-			t.Errorf("ошибка конфликта домена = %v, хочу перечень доменов с id", err)
+		if err == nil || !strings.Contains(err.Error(), "dump id 42, DB id 5") {
+			t.Errorf("the domain conflict error = %v, want the list of domains with ids", err)
 		}
 		if n := pool.countSQL("INSERT INTO subdomain_results"); n != 0 {
-			t.Errorf("после отказа предпроверки доменов накат продолжился (%d INSERT результатов)", n)
+			t.Errorf("after the domain pre-check refusal the import continued (%d result INSERTs)", n)
 		}
 	})
 
-	t.Run("совпадающий id — не конфликт (повторный накат)", func(t *testing.T) {
+	t.Run("a matching id — not a conflict (a repeated import)", func(t *testing.T) {
 		pool := &importPool{zoneRows: [][]any{{int16(7), "su"}}, domainRows: [][]any{{int16(7), "ok", int64(42)}}, setvalVal: 7}
 		var out bytes.Buffer
 		if _, err := fixturesImportRun(context.Background(), pool, importDump(t), &out); err != nil {
-			t.Fatalf("накат при совпадающих id: %v", err)
+			t.Fatalf("the import with matching ids: %v", err)
 		}
 	})
 
-	t.Run("сбой БД посреди наката — ошибка с таблицей", func(t *testing.T) {
+	t.Run("a DB failure mid-import — an error with the table", func(t *testing.T) {
 		pool := &importPool{failOn: "INSERT INTO domains", setvalVal: 7}
 		var out bytes.Buffer
 		if _, err := fixturesImportRun(context.Background(), pool, importDump(t), &out); err == nil ||
-			!strings.Contains(err.Error(), "накат доменов") {
-			t.Errorf("сбой наката доменов = %v, хочу ошибку шага", err)
+			!strings.Contains(err.Error(), "domain import") {
+			t.Errorf("the domain import failure = %v, want a step error", err)
 		}
 	})
 
-	t.Run("пустой дамп — БД не трогается вовсе", func(t *testing.T) {
+	t.Run("an empty dump — the DB is not touched at all", func(t *testing.T) {
 		pool := &importPool{}
 		var out bytes.Buffer
 		stats, err := fixturesImportRun(context.Background(), pool, &fixturesDump{}, &out)
 		if err != nil {
-			t.Fatalf("пустой дамп: %v", err)
+			t.Fatalf("the empty dump: %v", err)
 		}
 		if stats.Zones+stats.Domains+stats.Results != 0 || stats.ZoneSeq != 0 || stats.DomainSeq != 0 {
-			t.Errorf("пустой дамп вернул счётчики: %+v", stats)
+			t.Errorf("the empty dump returned counters: %+v", stats)
 		}
 		if exec, query := pool.calls(); len(exec) != 0 || len(query) != 0 {
-			t.Errorf("пустой дамп выполняет операторы: exec %v, query %v", exec, query)
+			t.Errorf("the empty dump executes statements: exec %v, query %v", exec, query)
 		}
 	})
 }
@@ -516,7 +516,7 @@ func TestFixturesImportRun(t *testing.T) {
 func TestFixturesImportForceGate(t *testing.T) {
 	dsn := "postgres://crawler:secret@127.0.0.1:5432/stand?sslmode=disable"
 
-	t.Run("без --force — только план, БД не тронута", func(t *testing.T) {
+	t.Run("without --force — the plan only, the DB untouched", func(t *testing.T) {
 		pool := &importPool{setvalVal: 7, zonesExist: 1, domainsExist: 0, resultsExist: 1, sweepVal: 3}
 		var out bytes.Buffer
 		if err := fixturesImportApply(context.Background(), pool, importDump(t),
@@ -525,24 +525,24 @@ func TestFixturesImportForceGate(t *testing.T) {
 		}
 		s := out.String()
 		for _, need := range []string{
-			"цель наката: crawler@127.0.0.1:5432/stand (режим: dry-run)",
-			"план: зоны 1 (вставка 0, обновление 1)",
-			"домены 1 (вставка 1, обновление 0)",
-			"строки результатов 2 (вставка 1, обновление 1)",
-			"последовательности: zones.id → не ниже 7, domain_id_seq → не ниже 42",
-			"дубли ключей дампа (схлопнуты): зоны 0, домены 0, результаты 0",
-			"выметается из contents: 3 строк без живых ссылок",
-			"dry-run: БД не изменена",
+			"import target: crawler@127.0.0.1:5432/stand (mode: dry-run)",
+			"plan: zones 1 (insert 0, update 1)",
+			"domains 1 (insert 1, update 0)",
+			"result rows 2 (insert 1, update 1)",
+			"sequences: zones.id → at least 7, domain_id_seq → at least 42",
+			"dump duplicate keys (folded): zones 0, domains 0, results 0",
+			"swept from contents: 3 rows without live references",
+			"dry-run: the DB is not changed",
 		} {
 			if !strings.Contains(s, need) {
-				t.Errorf("план без %q:\n%s", need, s)
+				t.Errorf("the plan without %q:\n%s", need, s)
 			}
 		}
-		if strings.Contains(s, "накат: зоны") {
-			t.Errorf("dry-run выполнил накат:\n%s", s)
+		if strings.Contains(s, "import: zones") {
+			t.Errorf("the dry-run performed the import:\n%s", s)
 		}
 		if exec, _ := pool.calls(); len(exec) != 0 {
-			t.Errorf("dry-run записал в БД: %d Exec-операторов", len(exec))
+			t.Errorf("the dry-run wrote into the DB: %d Exec statements", len(exec))
 		}
 		// The plan runs on SELECTs: the pre-checks and the existing-PK counters.
 		_, query := pool.calls()
@@ -555,41 +555,41 @@ func TestFixturesImportForceGate(t *testing.T) {
 			"count(*) FROM contents",
 		} {
 			if !strings.Contains(joined, substr) {
-				t.Errorf("план без запроса %q (запросы: %v)", substr, query)
+				t.Errorf("the plan without the query %q (the queries: %v)", substr, query)
 			}
 		}
 	})
 
-	t.Run("с --force — план и накат", func(t *testing.T) {
+	t.Run("with --force — the plan and the import", func(t *testing.T) {
 		pool := &importPool{setvalVal: 7, zonesExist: 1}
 		var out bytes.Buffer
 		if err := fixturesImportApply(context.Background(), pool, importDump(t),
 			fixturesImportOpts{Force: true, DSN: dsn}, &out); err != nil {
-			t.Fatalf("накат: %v", err)
+			t.Fatalf("the import: %v", err)
 		}
 		s := out.String()
-		if !strings.Contains(s, "цель наката: crawler@127.0.0.1:5432/stand (режим: force)") ||
-			!strings.Contains(s, "накат: зоны 1, домены 1, строки результатов 2") {
-			t.Errorf("вывод --force без цели/наката:\n%s", s)
+		if !strings.Contains(s, "import target: crawler@127.0.0.1:5432/stand (mode: force)") ||
+			!strings.Contains(s, "import: zones 1, domains 1, result rows 2") {
+			t.Errorf("the --force output without the target/import:\n%s", s)
 		}
 		if n := pool.countSQL("INSERT INTO zones"); n != 1 {
-			t.Errorf("INSERT зон %d, хочу 1 (накат идёт)", n)
+			t.Errorf("zone INSERTs %d, want 1 (the import goes)", n)
 		}
 	})
 
-	t.Run("план публикации при --publish", func(t *testing.T) {
+	t.Run("the publishing plan with --publish", func(t *testing.T) {
 		pool := &importPool{}
 		var out bytes.Buffer
 		if err := fixturesImportApply(context.Background(), pool, importDump(t),
 			fixturesImportOpts{DSN: dsn, Publish: fixturesPublishSmoke, RedisAddr: "127.0.0.1:6379"}, &out); err != nil {
-			t.Fatalf("план публикации: %v", err)
+			t.Fatalf("the publishing plan: %v", err)
 		}
-		if !strings.Contains(out.String(), "план публикации q:render (smoke): задач 2 → Redis 127.0.0.1:6379") {
-			t.Errorf("план без строки публикации:\n%s", out.String())
+		if !strings.Contains(out.String(), "q:render publishing plan (smoke): tasks 2 → Redis 127.0.0.1:6379") {
+			t.Errorf("the plan without the publishing line:\n%s", out.String())
 		}
 	})
 
-	t.Run("цель без секрета DSN — любая форма DSN", func(t *testing.T) {
+	t.Run("the target without the DSN secret — any DSN form", func(t *testing.T) {
 		pool := &importPool{}
 		for _, dsn := range []string{
 			"postgres://crawler:hunter2@db.prod.example:5432/crawler?sslmode=disable",
@@ -599,24 +599,24 @@ func TestFixturesImportForceGate(t *testing.T) {
 			var out bytes.Buffer
 			if err := fixturesImportApply(context.Background(), pool, &fixturesDump{},
 				fixturesImportOpts{DSN: dsn}, &out); err != nil {
-				t.Fatalf("пустой дамп (%s): %v", dsn, err)
+				t.Fatalf("the empty dump (%s): %v", dsn, err)
 			}
 			if s := out.String(); strings.Contains(s, "hunter2") {
-				t.Errorf("вывод цели содержит пароль DSN (%s):\n%s", dsn, s)
+				t.Errorf("the target output contains the DSN password (%s):\n%s", dsn, s)
 			}
 		}
 	})
 
-	t.Run("конфликт имени зоны виден в dry-run — до записи", func(t *testing.T) {
+	t.Run("a zone name conflict is visible in dry-run — before writing", func(t *testing.T) {
 		pool := &importPool{zoneRows: [][]any{{int16(3), "su"}}} // in the dump su = id 7
 		var out bytes.Buffer
 		if err := fixturesImportApply(context.Background(), pool, importDump(t),
 			fixturesImportOpts{DSN: dsn}, &out); err == nil ||
-			!strings.Contains(err.Error(), "id дампа 7, id БД 3") {
-			t.Errorf("ошибка dry-run = %v, хочу отказ предпроверки до записи", err)
+			!strings.Contains(err.Error(), "dump id 7, DB id 3") {
+			t.Errorf("the dry-run error = %v, want the pre-check refusal before writing", err)
 		}
 		if exec, _ := pool.calls(); len(exec) != 0 {
-			t.Errorf("после отказа предпроверки выполнено %d Exec", len(exec))
+			t.Errorf("after the pre-check refusal %d Execs were executed", len(exec))
 		}
 	})
 }
@@ -632,12 +632,12 @@ func TestFixturesImportTarget(t *testing.T) {
 		{"postgres://u:p@h/db?password=also-secret", "u@h/db"},
 	} {
 		if got := fixturesImportTarget(c.dsn); got != c.want {
-			t.Errorf("target(%s) = %q, хочу %q", c.dsn, got, c.want)
+			t.Errorf("target(%s) = %q, want %q", c.dsn, got, c.want)
 		}
 	}
 	for _, dsn := range []string{"host=h user=u password=hunter2", "not a dsn", ""} {
 		if got := fixturesImportTarget(dsn); got == dsn || strings.Contains(got, "hunter2") {
-			t.Errorf("target(%q) = %q — DSN раскрыт как есть или с паролем", dsn, got)
+			t.Errorf("target(%q) = %q — the DSN is exposed as-is or with the password", dsn, got)
 		}
 	}
 }
@@ -647,25 +647,25 @@ func TestFixturesImportTarget(t *testing.T) {
 // updatable columns in DO UPDATE, the T-242 contract's sequence notes.
 func TestFixturesImportSQLContract(t *testing.T) {
 	if !strings.Contains(fixturesImportZonesSQL, "OVERRIDING SYSTEM VALUE") {
-		t.Errorf("зоны: нет OVERRIDING SYSTEM VALUE (identity, контракт T-242): %s", fixturesImportZonesSQL)
+		t.Errorf("zones: no OVERRIDING SYSTEM VALUE (the identity, the T-242 contract): %s", fixturesImportZonesSQL)
 	}
 	for _, need := range []string{"$1::int2[]", "$2::text[]", "$7::timestamptz[]", "ON CONFLICT (id) DO UPDATE"} {
 		if !strings.Contains(fixturesImportZonesSQL, need) {
-			t.Errorf("зоны: нет %s: %s", need, fixturesImportZonesSQL)
+			t.Errorf("zones: %s is missing: %s", need, fixturesImportZonesSQL)
 		}
 	}
 	if strings.Count(fixturesImportDomainsSQL, "::") < 10 {
-		t.Errorf("домены: не все колонки — unnest-массивы: %s", fixturesImportDomainsSQL)
+		t.Errorf("domains: not all columns are unnest arrays: %s", fixturesImportDomainsSQL)
 	}
 	if !strings.Contains(fixturesImportDomainsSQL, "(d.last_checked_at AT TIME ZONE 'UTC')::date") {
-		t.Errorf("домены: date-колонка без сдвига UTC — TZ сессии сдвигала бы дату: %s", fixturesImportDomainsSQL)
+		t.Errorf("domains: the date column without the UTC shift — the session TZ would slide the date: %s", fixturesImportDomainsSQL)
 	}
 	for _, need := range []string{
 		"$10::jsonb[]", "$11::jsonb[]", "$15::timestamptz[]", "$17::timestamptz[]",
 		"rendered = EXCLUDED.rendered", "render_failed_at = EXCLUDED.render_failed_at",
 	} {
 		if !strings.Contains(fixturesImportResultsSQL, need) {
-			t.Errorf("результаты: нет %s: %s", need, fixturesImportResultsSQL)
+			t.Errorf("results: %s is missing: %s", need, fixturesImportResultsSQL)
 		}
 	}
 	// The content reference is not imported and is reset: contents was
@@ -674,17 +674,17 @@ func TestFixturesImportSQLContract(t *testing.T) {
 	// (SwapRefTx).
 	if strings.Contains(fixturesImportResultsSQL, "content_hash = EXCLUDED.content_hash") ||
 		!strings.Contains(fixturesImportResultsSQL, "content_hash = NULL") {
-		t.Errorf("результаты: content_hash обязан сбрасываться в NULL: %s", fixturesImportResultsSQL)
+		t.Errorf("results: content_hash must be reset to NULL: %s", fixturesImportResultsSQL)
 	}
 	// The import does not reassemble columns outside the dump (T-242
 	// de-identification).
 	for _, banned := range []string{"addrs", "cname", "tls", "redirects", "stratum"} {
 		if strings.Contains(fixturesImportResultsSQL, banned) {
-			t.Errorf("результаты: колонка %s вне контракта дампа: %s", banned, fixturesImportResultsSQL)
+			t.Errorf("results: the column %s is outside the dump contract: %s", banned, fixturesImportResultsSQL)
 		}
 	}
 	if !strings.Contains(fixturesDomainsSeqSQL, "GREATEST((SELECT coalesce(max(id), 0) FROM domains)") {
-		t.Errorf("domain_id_seq: setval не выше максимума таблицы: %s", fixturesDomainsSeqSQL)
+		t.Errorf("domain_id_seq: setval is not above the table's maximum: %s", fixturesDomainsSeqSQL)
 	}
 	// Orphaned content cleanup: only rows without a live reference
 	// (review T-243 P2-1 — refcount is not decremented by resetting
@@ -692,7 +692,7 @@ func TestFixturesImportSQLContract(t *testing.T) {
 	if !strings.Contains(fixturesSweepContentsSQL, "DELETE FROM contents") ||
 		!strings.Contains(fixturesSweepContentsSQL, "NOT EXISTS") ||
 		strings.Contains(fixturesSweepContentsSQL, "refcount") {
-		t.Errorf("уборка контента: не выметание сирот по ссылкам: %s", fixturesSweepContentsSQL)
+		t.Errorf("content cleanup: not sweeping the orphans by references: %s", fixturesSweepContentsSQL)
 	}
 }
 
@@ -712,11 +712,11 @@ type publishQueue struct {
 
 func (q *publishQueue) Publish(_ context.Context, stream string, msg queue.Message) (string, error) {
 	if stream != queue.StreamRender {
-		return "", fmt.Errorf("publishQueue: стрим %q — тест публикует только q:render", stream)
+		return "", fmt.Errorf("publishQueue: the stream %q — the test publishes only q:render", stream)
 	}
 	r, ok := msg.(queue.Result)
 	if !ok {
-		return "", fmt.Errorf("publishQueue: сообщение %T — тест ждёт queue.Result", msg)
+		return "", fmt.Errorf("publishQueue: the message %T — the test expects queue.Result", msg)
 	}
 	if q.failAt > 0 && len(q.published)+1 == q.failAt {
 		return "", q.failErr
@@ -727,11 +727,11 @@ func (q *publishQueue) Publish(_ context.Context, stream string, msg queue.Messa
 }
 
 func (q *publishQueue) Consume(context.Context, string, string, string, int) ([]queue.Delivery, error) {
-	return nil, errors.New("publishQueue: Consume не вызывается")
+	return nil, errors.New("publishQueue: Consume is not called")
 }
 
 func (q *publishQueue) Ack(context.Context, string, string, ...string) error {
-	return errors.New("publishQueue: Ack не вызывается")
+	return errors.New("publishQueue: Ack is not called")
 }
 
 // TestFixturesPublishRun — publishing the fixture tasks: the all mode
@@ -739,35 +739,35 @@ func (q *publishQueue) Ack(context.Context, string, string, ...string) error {
 // the smoke mode (subsample domains), duplicate keys, a publishing
 // failure.
 func TestFixturesPublishRun(t *testing.T) {
-	t.Run("all: все записи с именами", func(t *testing.T) {
+	t.Run("all: all the rows with names", func(t *testing.T) {
 		q := &publishQueue{}
 		var out bytes.Buffer
 		stats, err := fixturesPublishRun(context.Background(), q, importDump(t), fixturesPublishAll, &out)
 		if err != nil {
-			t.Fatalf("публикация: %v", err)
+			t.Fatalf("publishing: %v", err)
 		}
 		if stats.Published != 2 || len(q.published) != 2 {
-			t.Fatalf("опубликовано %d (счётчик %d), хочу 2", len(q.published), stats.Published)
+			t.Fatalf("published %d (the counter %d), want 2", len(q.published), stats.Published)
 		}
 		if stats.Strata["ok"] != 1 || stats.Strata["heavy"] != 1 {
-			t.Errorf("разбивка страт: %+v", stats.Strata)
+			t.Errorf("the strata breakdown: %+v", stats.Strata)
 		}
 		first := q.published[0]
 		if first.Name != "ok.su" {
-			t.Errorf("имя задачи %q, хочу ok.su (label.zone)", first.Name)
+			t.Errorf("the task name %q, want ok.su (label.zone)", first.Name)
 		}
 		if first.ZoneID != 7 || first.DomainID != 42 || first.SubdomainID != 0 || first.Variant != 0 {
-			t.Errorf("ключи задачи: %+v", first)
+			t.Errorf("the task keys: %+v", first)
 		}
 		if first.Fresh {
-			t.Errorf("Fresh задан публикацией фикстуры — его ставит воркер при публикации q:analyze")
+			t.Errorf("Fresh is set by the fixture publishing — the worker sets it when publishing into q:analyze")
 		}
-		if !strings.Contains(out.String(), "опубликовано 2") {
-			t.Errorf("отчёт публикации:\n%s", out.String())
+		if !strings.Contains(out.String(), "published 2") {
+			t.Errorf("the publishing report:\n%s", out.String())
 		}
 	})
 
-	t.Run("smoke: только домены подвыборки", func(t *testing.T) {
+	t.Run("smoke: only the subsample domains", func(t *testing.T) {
 		dump := importDump(t)
 		// The second domain is outside smoke: its subdomain's row is not
 		// published.
@@ -778,69 +778,69 @@ func TestFixturesPublishRun(t *testing.T) {
 		var out bytes.Buffer
 		stats, err := fixturesPublishRun(context.Background(), q, dump, fixturesPublishSmoke, &out)
 		if err != nil {
-			t.Fatalf("публикация smoke: %v", err)
+			t.Fatalf("the smoke publishing: %v", err)
 		}
 		if stats.Published != 2 || stats.SmokeDomains != 1 {
-			t.Fatalf("smoke: опубликовано %d, доменов %d, хочу 2 задачи 1 домена", stats.Published, stats.SmokeDomains)
+			t.Fatalf("smoke: published %d, %d domains, want 2 tasks of 1 domain", stats.Published, stats.SmokeDomains)
 		}
 		for _, r := range q.published {
 			if r.DomainID != 42 {
-				t.Errorf("опубликована задача вне smoke-подвыборки: %+v", r)
+				t.Errorf("a task outside the smoke subsample was published: %+v", r)
 			}
 		}
-		if !strings.Contains(out.String(), "smoke, домены 1") {
-			t.Errorf("отчёт smoke:\n%s", out.String())
+		if !strings.Contains(out.String(), "smoke, 1 domain") {
+			t.Errorf("the smoke report:\n%s", out.String())
 		}
 	})
 
-	t.Run("дубли ключей задач пропускаются с подсчётом", func(t *testing.T) {
+	t.Run("duplicate task keys are skipped with a count", func(t *testing.T) {
 		dump := importDump(t)
 		dump.Results = append(dump.Results, dump.Results[0]) // a duplicate key
 		q := &publishQueue{}
 		var out bytes.Buffer
 		stats, err := fixturesPublishRun(context.Background(), q, dump, fixturesPublishAll, &out)
 		if err != nil {
-			t.Fatalf("публикация: %v", err)
+			t.Fatalf("publishing: %v", err)
 		}
 		if stats.Published != 2 || stats.SkippedDups != 1 {
-			t.Errorf("опубликовано %d, дублей пропущено %d, хочу 2/1", stats.Published, stats.SkippedDups)
+			t.Errorf("published %d, duplicates skipped %d, want 2/1", stats.Published, stats.SkippedDups)
 		}
-		if !strings.Contains(out.String(), "дубли ключей задач пропущены: 1") {
-			t.Errorf("отчёт дублей:\n%s", out.String())
+		if !strings.Contains(out.String(), "duplicate task keys skipped: 1") {
+			t.Errorf("the duplicates report:\n%s", out.String())
 		}
 	})
 
-	t.Run("сбой публикации — ошибка с прогрессом", func(t *testing.T) {
-		q := &publishQueue{failAt: 2, failErr: errors.New("redis ушёл на обед")}
+	t.Run("a publishing failure — an error with the progress", func(t *testing.T) {
+		q := &publishQueue{failAt: 2, failErr: errors.New("redis went to lunch")}
 		var out bytes.Buffer
 		stats, err := fixturesPublishRun(context.Background(), q, importDump(t), fixturesPublishAll, &out)
-		if err == nil || !strings.Contains(err.Error(), "опубликовано 1") || !strings.Contains(err.Error(), "redis ушёл") {
-			t.Errorf("сбой публикации = %v, хочу прогресс и причину", err)
+		if err == nil || !strings.Contains(err.Error(), "published 1") || !strings.Contains(err.Error(), "redis went") {
+			t.Errorf("the publishing failure = %v, want the progress and the reason", err)
 		}
 		if stats.Published != 1 {
-			t.Errorf("прогресс публикации %d, хочу 1", stats.Published)
+			t.Errorf("the publishing progress %d, want 1", stats.Published)
 		}
 	})
 
-	t.Run("пустая smoke-подвыборка — отказ, а не пустой прогон", func(t *testing.T) {
+	t.Run("an empty smoke subsample — a refusal, not an empty run", func(t *testing.T) {
 		dump := importDump(t)
 		dump.Smoke = nil // a degraded dump / the wrong directory
 		q := &publishQueue{}
 		var out bytes.Buffer
 		if _, err := fixturesPublishRun(context.Background(), q, dump, fixturesPublishSmoke, &out); err == nil ||
-			!strings.Contains(err.Error(), "smoke-подвыборка пуста") {
-			t.Errorf("пустой smoke = %v, хочу отказ (оператор не должен принимать его за рабочий прогон)", err)
+			!strings.Contains(err.Error(), "the smoke subsample is empty") {
+			t.Errorf("the empty smoke = %v, want a refusal (the operator must not mistake it for a working run)", err)
 		}
 		if len(q.published) != 0 {
-			t.Errorf("пустой smoke что-то опубликовал: %d", len(q.published))
+			t.Errorf("the empty smoke published something: %d", len(q.published))
 		}
 	})
 
-	t.Run("неизвестный режим", func(t *testing.T) {
+	t.Run("an unknown mode", func(t *testing.T) {
 		var out bytes.Buffer
 		if _, err := fixturesPublishRun(context.Background(), &publishQueue{}, importDump(t), "some", &out); err == nil ||
-			!strings.Contains(err.Error(), "неизвестный режим") {
-			t.Errorf("мусорный режим = %v, хочу отказ", err)
+			!strings.Contains(err.Error(), "an unknown mode") {
+			t.Errorf("the junk mode = %v, want a refusal", err)
 		}
 	})
 }

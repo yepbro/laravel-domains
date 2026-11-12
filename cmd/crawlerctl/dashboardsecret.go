@@ -20,27 +20,27 @@ import (
 )
 
 // dashboardSecretHelp — help text for crawlerctl dashboard-secret --help.
-const dashboardSecretHelp = `crawlerctl dashboard-secret — генерация хэша пароля дашборда
+const dashboardSecretHelp = `crawlerctl dashboard-secret — generating the dashboard password hash
 
-Использование:
-  crawlerctl dashboard-secret [ПАРОЛЬ]
+Usage:
+  crawlerctl dashboard-secret [PASSWORD]
 
-Печатает строку для dashboard.password_hash операторского дашборда
-(ТЗД §7.2):
+Prints the string for dashboard.password_hash of the operator dashboard
+(the dashboard spec §7.2):
 
-  pbkdf2-sha256$<итерации>$<соль base64>$<ключ base64>
+  pbkdf2-sha256$<iterations>$<salt base64>$<key base64>
 
-PBKDF2-HMAC-SHA256, 600000 итераций (OWASP), соль 16 байт, ключ 32 байта;
-разбор и сверка — cmd/dashboard (T-128).
+PBKDF2-HMAC-SHA256, 600000 iterations (OWASP), a 16-byte salt, a 32-byte
+key; the parsing and verification — cmd/dashboard (T-128).
 
-Пароль — единственный позиционный аргумент или stdin. Рекомендуется stdin:
-аргумент остаётся в истории shell и виден в списке процессов.
+The password — the only positional argument or stdin. stdin is recommended:
+an argument stays in the shell history and is visible in the process list.
 
   crawlerctl dashboard-secret < password.txt
-  printf 'пароль' | crawlerctl dashboard-secret
+  printf 'password' | crawlerctl dashboard-secret
 
-Из stdin читается первая строка, перевод строки отбрасывается. Пустой
-пароль — ошибка использования (код 2).
+The first line is read from stdin, the newline is discarded. An empty
+password — a usage error (exit code 2).
 `
 
 // stdin — the command's password source (test seam; in-process — os.Stdin).
@@ -52,7 +52,7 @@ func cmdDashboardSecret(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if fs.NArg() > 1 {
-		return usagef("dashboard-secret: лишние аргументы — пароль задаётся одним аргументом или stdin")
+		return usagef("dashboard-secret: extra arguments — the password is given by one argument or stdin")
 	}
 	var password string
 	if fs.NArg() == 1 {
@@ -63,12 +63,12 @@ func cmdDashboardSecret(args []string, stdout, stderr io.Writer) error {
 		// newline; empty input (EOF right away) becomes an empty
 		// password below.
 		if err != nil && err != io.EOF {
-			return fmt.Errorf("dashboard-secret: чтение пароля из stdin: %w", err)
+			return fmt.Errorf("dashboard-secret: reading the password from stdin: %w", err)
 		}
 		password = strings.TrimRight(line, "\r\n")
 	}
 	if password == "" {
-		return usagef("dashboard-secret: пустой пароль — подайте строку в stdin или аргументом")
+		return usagef("dashboard-secret: empty password — supply the string via stdin or as an argument")
 	}
 	hash, err := auth.Generate(password, 0)
 	if err != nil {

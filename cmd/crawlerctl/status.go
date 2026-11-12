@@ -28,23 +28,23 @@ import (
 )
 
 // statusHelp — the crawlerctl status --help text.
-const statusHelp = `crawlerctl status — сводка по зонам, очередям, скорости (ТЗ 5.9)
+const statusHelp = `crawlerctl status — a summary over zones, queues, rates (spec 5.9)
 
-Использование:
+Usage:
   crawlerctl status [--json]
 
-Сводка: по каждой зоне — счётчики domains_total/domains_checked (обновляет
-monitor) и агрегат domains по check_state (pending без учёта deleted,
-queued, done); длины очередей q:dns/q:http/q:render/q:render-fallback/
-q:analyze/q:dead (XLEN); скорость проверок (доменов/с — средняя с начала суток:
-last_checked_at имеет точность дня; HTTP-результаты и рендеры — за окно
-темпа 1–2 ч: часовые корзины crawler_counters, T-203) и ETA завершения
-первого цикла: (pending + queued) / скорость. Темп этапов DNS и анализа
-из БД не
-измерим — их видно в Prometheus. --json — машинный вывод. Команда работает
-на стеке dev-окружения (PostgreSQL/Redis); при недоступном Redis сводка
-по БД печатается, код возврата — 1.
-Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
+The summary: per zone — the domains_total/domains_checked counters (updated
+by monitor) and the domains aggregate over check_state (pending not counting
+deleted, queued, done); the depths of the q:dns/q:http/q:render/q:render-fallback/
+q:analyze/q:dead queues (XLEN); the check rate (domains/s — the average since
+the start of the day: last_checked_at has day precision; the HTTP results
+and renders — over the 1–2 h rate window: the crawler_counters hourly
+buckets, T-203) and the ETA of the first cycle's completion:
+(pending + queued) / rate. The DNS and analysis stage rates are not
+measurable from the DB — their metrics are in Prometheus. --json — machine
+output. The command runs on the dev environment stack (PostgreSQL/Redis);
+with Redis unavailable the DB summary is still printed, the exit code is 1.
+Exit codes: 0 — success, 1 — error, 2 — usage.
 `
 
 // ---------------------------------------------------------------- output
@@ -69,13 +69,13 @@ func percentMark(checked, total int64) string {
 // (text columns left-aligned, numbers right-aligned), queues, rate, cycle.
 // lens == nil — Redis is unavailable, queues are "n/a".
 func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, thr status.Throughput, rates status.Rates, lens map[string]int64) {
-	out(w, "зоны: всего/проверено/pending/queued/done — инкрементальные счётчики zones\n"+
-		"(дельты переходов + реконсиляция monitor, T-178; deleted вне базового множества)\n\n")
+	out(w, "zones: total/checked/pending/queued/done — the incremental counters of zones\n"+
+		"(transition deltas + the monitor reconciliation, T-178; deleted is outside the base set)\n\n")
 
 	// Columns: zone and act — text, the rest — numbers (right-aligned).
 	// The zone name is punycode (the canonical form, like the
 	// incoming/<zone> directory); the unicode form — in --json.
-	head := []string{"зона", "акт", "всего", "проверено", "%", "pending", "queued", "done"}
+	head := []string{"zone", "act", "total", "checked", "%", "pending", "queued", "done"}
 	rows := [][]string{head}
 	row := func(cells ...string) []string { return cells }
 	for _, z := range zones {
@@ -84,7 +84,7 @@ func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, 
 			percentMark(z.DomainsChecked, z.DomainsTotal),
 			strconv.FormatInt(z.Pending, 10), strconv.FormatInt(z.Queued, 10), strconv.FormatInt(z.Done, 10)))
 	}
-	rows = append(rows, row("итого", "",
+	rows = append(rows, row("total", "",
 		strconv.FormatInt(tot.DomainsTotal, 10), strconv.FormatInt(tot.DomainsChecked, 10),
 		percentMark(tot.DomainsChecked, tot.DomainsTotal),
 		strconv.FormatInt(tot.Pending, 10), strconv.FormatInt(tot.Queued, 10), strconv.FormatInt(tot.Done, 10)))
@@ -112,9 +112,9 @@ func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, 
 		out(w, "%s\n", b.String())
 	}
 
-	out(w, "\nочереди (глубина): ")
+	out(w, "\nqueues (depth): ")
 	if lens == nil {
-		out(w, "н/д (Redis недоступен)\n")
+		out(w, "n/a (Redis unavailable)\n")
 	} else {
 		parts := make([]string, 0, len(status.Streams))
 		for _, s := range status.Streams {
@@ -123,12 +123,12 @@ func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, 
 		out(w, "%s\n", strings.Join(parts, "   "))
 	}
 
-	out(w, "\nскорость:\n")
+	out(w, "\nrates:\n")
 	if rates.DomainsKnown {
-		out(w, "  доменов/с          %.1f   (%d проверено с начала суток, прошло %s)\n",
+		out(w, "  domains/s          %.1f   (%d checked since the start of the day, elapsed %s)\n",
 			rates.DomainsPerSec, thr.DoneToday, status.FormatDuration(int64(thr.ElapsedSec)))
 	} else {
-		out(w, "  доменов/с          н/д   (окно с начала суток короче %s)\n", status.FormatDuration(status.MinSpeedWindowSec))
+		out(w, "  domains/s          n/a   (the window since the start of the day is shorter than %s)\n", status.FormatDuration(status.MinSpeedWindowSec))
 	}
 	// The results/renders rate window — calendar hour buckets (T-203): the
 	// actual length of the covered 1-2 h window is printed next to it —
@@ -139,19 +139,19 @@ func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, 
 	if window <= 0 {
 		window = 3600
 	}
-	out(w, "  HTTP-результатов/с %.1f   (%d за окно темпа %s)\n",
+	out(w, "  HTTP results/s     %.1f   (%d over the rate window %s)\n",
 		rates.ResultsPerSec, thr.ResultsHour, status.FormatDuration(int64(window)))
-	out(w, "  рендеров/с         %.1f   (%d с итоговым DOM за то же окно)\n",
+	out(w, "  renders/s          %.1f   (%d with a final DOM over the same window)\n",
 		rates.RenderPerSec, thr.RenderedHour)
 
 	out(w, "\n")
 	switch {
 	case rates.Remaining == 0:
-		out(w, "цикл: осталось 0 (pending и queued пусты) — проверять нечего\n")
+		out(w, "cycle: 0 remaining (pending and queued are empty) — nothing to check\n")
 	case !rates.ETAKnown:
-		out(w, "цикл: осталось %d (pending+queued); ETA н/д (скорость неизвестна или 0)\n", rates.Remaining)
+		out(w, "cycle: %d remaining (pending+queued); ETA n/a (the rate is unknown or 0)\n", rates.Remaining)
 	default:
-		out(w, "цикл: осталось %d (pending+queued); ETA ≈ %s (по %.1f дом./с)\n",
+		out(w, "cycle: %d remaining (pending+queued); ETA ≈ %s (at %.1f domains/s)\n",
 			rates.Remaining, status.FormatDuration(rates.ETASec), rates.DomainsPerSec)
 	}
 }
@@ -173,12 +173,12 @@ func writeStatusJSON(w io.Writer, zones []status.ZoneStats, tot status.Totals, t
 // cmdStatus — crawlerctl status: builds the summary from the DB and Redis and prints it.
 func cmdStatus(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("status")
-	asJSON := fs.Bool("json", false, "машинный вывод (для скриптов)")
+	asJSON := fs.Bool("json", false, "machine output (for scripts)")
 	if handled, err := parseFlags(fs, statusHelp, args, stdout); handled {
 		return err
 	}
 	if fs.NArg() > 0 {
-		return usagef("status: лишние аргументы %v (сводка берётся целиком, без позиционных аргументов)", fs.Args())
+		return usagef("status: extra arguments %v (the summary is taken as a whole, no positional arguments)", fs.Args())
 	}
 
 	// The configuration — a single YAML + environment (internal/config):
@@ -224,13 +224,13 @@ func cmdStatus(args []string, stdout, stderr io.Writer) error {
 
 	if *asJSON {
 		if err := writeStatusJSON(stdout, zones, tot, thr, rates, lens); err != nil {
-			return fmt.Errorf("status: вывод json: %w", err)
+			return fmt.Errorf("status: json output: %w", err)
 		}
 	} else {
 		writeStatusTable(stdout, zones, tot, thr, rates, lens)
 	}
 	if qErr != nil {
-		return fmt.Errorf("status: очереди: %w", qErr)
+		return fmt.Errorf("status: queues: %w", qErr)
 	}
 	return nil
 }

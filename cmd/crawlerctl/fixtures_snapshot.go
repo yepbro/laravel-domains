@@ -222,7 +222,7 @@ func fixturesSnapshotReadRows(ctx context.Context, pool db.DB, keys []fixturesKe
 	}
 	rows, err := pool.Query(ctx, fixturesSnapshotRowsSQL, zones, domains, subs, variants)
 	if err != nil {
-		return nil, fmt.Errorf("снапшот: чтение строк фикстуры: %w", err)
+		return nil, fmt.Errorf("snapshot: fixture row reading: %w", err)
 	}
 	defer rows.Close()
 	out := make([]fixturesSnapshotRow, 0, len(keys))
@@ -235,7 +235,7 @@ func fixturesSnapshotReadRows(ctx context.Context, pool db.DB, keys []fixturesKe
 		if err := rows.Scan(&r.ZoneID, &r.DomainID, &r.SubdomainID, &r.Variant,
 			&r.Rendered, &contentHash, &rawLen, &r.RulesVersion,
 			&isLaravel, &score, &r.FindingRulesVersion); err != nil {
-			return nil, fmt.Errorf("снапшот: чтение строк фикстуры: %w", err)
+			return nil, fmt.Errorf("snapshot: fixture row reading: %w", err)
 		}
 		r.HasContent = contentHash != nil
 		if r.HasContent {
@@ -254,7 +254,7 @@ func fixturesSnapshotReadRows(ctx context.Context, pool db.DB, keys []fixturesKe
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("снапшот: чтение строк фикстуры: %w", err)
+		return nil, fmt.Errorf("snapshot: fixture row reading: %w", err)
 	}
 	return out, nil
 }
@@ -339,25 +339,25 @@ func fixturesSnapshotTakeStreams(ctx context.Context, rdb redisStreamClient) (*f
 	} {
 		n, err := rdb.XLen(ctx, st.stream).Result()
 		if err != nil {
-			return nil, fmt.Errorf("снапшот: XLEN %s: %w", st.stream, err)
+			return nil, fmt.Errorf("snapshot: XLEN %s: %w", st.stream, err)
 		}
 		*st.dst = n
 	}
 	if s.AnalyzeLen > 0 {
 		first, err := rdb.XRangeN(ctx, queue.StreamAnalyze, "-", "+", 1).Result()
 		if err != nil {
-			return nil, fmt.Errorf("снапшот: XRANGE %s: %w", queue.StreamAnalyze, err)
+			return nil, fmt.Errorf("snapshot: XRANGE %s: %w", queue.StreamAnalyze, err)
 		}
 		last, err := rdb.XRevRangeN(ctx, queue.StreamAnalyze, "+", "-", 1).Result()
 		if err != nil {
-			return nil, fmt.Errorf("снапшот: XREVRANGE %s: %w", queue.StreamAnalyze, err)
+			return nil, fmt.Errorf("snapshot: XREVRANGE %s: %w", queue.StreamAnalyze, err)
 		}
 		if len(first) > 0 && len(last) > 0 {
 			var ok1, ok2 bool
 			s.AnalyzeFirstMs, ok1 = fixturesStreamIDMs(first[0].ID)
 			s.AnalyzeLastMs, ok2 = fixturesStreamIDMs(last[0].ID)
 			if !ok1 || !ok2 {
-				return nil, fmt.Errorf("снапшот: ID %s/%s без миллисекунд — темп не снимается", first[0].ID, last[0].ID)
+				return nil, fmt.Errorf("snapshot: the IDs %s/%s without milliseconds — the pace cannot be captured", first[0].ID, last[0].ID)
 			}
 		}
 	}
@@ -414,12 +414,12 @@ func fixturesParsePromMetrics(data []byte) ([]fixturesPromSample, error) {
 		if i := strings.IndexByte(line, '{'); i >= 0 {
 			end := fixturesLabelsEnd(line, i)
 			if end < 0 {
-				return nil, fmt.Errorf("метрики: строка %d: метки без закрывающей скобки", n+1)
+				return nil, fmt.Errorf("metrics: line %d: labels without a closing brace", n+1)
 			}
 			name = line[:i]
 			parsed, err := fixturesParsePromLabels(line[i+1 : end])
 			if err != nil {
-				return nil, fmt.Errorf("метрики: строка %d: %w", n+1, err)
+				return nil, fmt.Errorf("metrics: line %d: %w", n+1, err)
 			}
 			labels = parsed
 			rest = line[end+1:]
@@ -435,11 +435,11 @@ func fixturesParsePromMetrics(data []byte) ([]fixturesPromSample, error) {
 		}
 		restFields := strings.Fields(rest)
 		if len(restFields) == 0 {
-			return nil, fmt.Errorf("метрики: строка %d: нет значения", n+1)
+			return nil, fmt.Errorf("metrics: line %d: no value", n+1)
 		}
 		v, err := strconv.ParseFloat(restFields[0], 64)
 		if err != nil {
-			return nil, fmt.Errorf("метрики: строка %d: значение %q: %w", n+1, restFields[0], err)
+			return nil, fmt.Errorf("metrics: line %d: value %q: %w", n+1, restFields[0], err)
 		}
 		out = append(out, fixturesPromSample{Name: name, Labels: labels, Value: v})
 	}
@@ -477,7 +477,7 @@ func fixturesParsePromLabels(s string) (map[string]string, error) {
 		}
 		k, v, found := strings.Cut(pair, "=")
 		if !found || len(v) < 2 || v[0] != '"' || v[len(v)-1] != '"' {
-			return nil, fmt.Errorf("метка %q без значения в кавычках", pair)
+			return nil, fmt.Errorf("label %q without a quoted value", pair)
 		}
 		labels[strings.TrimSpace(k)] = fixturesUnescapeProm(v[1 : len(v)-1])
 	}
@@ -548,24 +548,24 @@ func fixturesUnescapeProm(s string) string {
 func fixturesSnapshotMetricsURL(ctx context.Context, url string) (*fixturesSnapshotMetrics, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("метрики %s: %w", url, err)
+		return nil, fmt.Errorf("metrics %s: %w", url, err)
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("метрики %s: %w", url, err)
+		return nil, fmt.Errorf("metrics %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("метрики %s: статус %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("metrics %s: status %d", url, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, fmt.Errorf("метрики %s: чтение: %w", url, err)
+		return nil, fmt.Errorf("metrics %s: reading: %w", url, err)
 	}
 	samples, err := fixturesParsePromMetrics(body)
 	if err != nil {
-		return nil, fmt.Errorf("метрики %s: %w", url, err)
+		return nil, fmt.Errorf("metrics %s: %w", url, err)
 	}
 	return fixturesMetricsFromSamples(samples), nil
 }
@@ -667,16 +667,16 @@ func fixturesMetricsFromSamples(samples []fixturesPromSample) *fixturesSnapshotM
 func fixturesWriteSnapshotFile(path string, snap *fixturesSnapshot) error {
 	raw, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return fmt.Errorf("снапшот %s: кодирование: %w", path, err)
+		return fmt.Errorf("snapshot %s: encoding: %w", path, err)
 	}
 	raw = append(raw, '\n')
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("снапшот %s: %w", path, err)
+		return fmt.Errorf("snapshot %s: %w", path, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("снапшот %s: переименование: %w", path, err)
+		return fmt.Errorf("snapshot %s: renaming: %w", path, err)
 	}
 	return nil
 }
@@ -686,18 +686,18 @@ func fixturesWriteSnapshotFile(path string, snap *fixturesSnapshot) error {
 func fixturesReadSnapshot(path string) (*fixturesSnapshot, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("снапшот %s: %w", path, err)
+		return nil, fmt.Errorf("snapshot %s: %w", path, err)
 	}
 	var snap fixturesSnapshot
 	if err := json.Unmarshal(raw, &snap); err != nil {
-		return nil, fmt.Errorf("снапшот %s: %w", path, err)
+		return nil, fmt.Errorf("snapshot %s: %w", path, err)
 	}
 	if snap.FormatVersion != fixturesSnapshotVersion {
-		return nil, fmt.Errorf("снапшот %s: формат v%d не поддерживается (инструмент понимает v%d)",
+		return nil, fmt.Errorf("snapshot %s: format v%d is not supported (the tool understands v%d)",
 			path, snap.FormatVersion, fixturesSnapshotVersion)
 	}
 	if len(snap.Rows) == 0 {
-		return nil, fmt.Errorf("снапшот %s: без строк — пустой дамп или чужой файл", path)
+		return nil, fmt.Errorf("snapshot %s: no rows — an empty dump or a foreign file", path)
 	}
 	return &snap, nil
 }
@@ -709,34 +709,34 @@ func fixturesReadSnapshot(path string) (*fixturesSnapshot, error) {
 // snapshot's sources), assembly and file writing.
 func fixturesSnapshotCmd(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("fixtures snapshot")
-	dir := fs.String("dir", "", "каталог дампа фикстуры (ключи прогона; обязателен)")
-	label := fs.String("label", "", "метка снапшота/прогона (обязательна; файл — <dir>/<label>.snapshot.json)")
-	engine := fs.String("engine", "", "движок прогона: chromium|moli|lightpanda (обязателен)")
-	metricsURL := fs.String("metrics", "", "URL /metrics render-worker стенда (пусто — без метрик этапа)")
-	rssMax := fs.Int64("engine-rss-max", 0, "макс. RSS движка за прогон, байты (docker stats; 0 — не задан)")
-	crashes := fs.Int64("engine-crashes", -1, "падения ядра движка за прогон (>= 0 — задано)")
-	outPath := fs.String("out", "", "файл снапшота (по умолчанию <dir>/<label>.snapshot.json)")
-	noDOM := fs.Bool("no-dom", false, "не читать DOM хранилища (без узлов/скриптов)")
+	dir := fs.String("dir", "", "the fixture dump directory (the run's keys; required)")
+	label := fs.String("label", "", "the snapshot/run label (required; the file is <dir>/<label>.snapshot.json)")
+	engine := fs.String("engine", "", "the run engine: chromium|moli|lightpanda (required)")
+	metricsURL := fs.String("metrics", "", "the bench render-worker's /metrics URL (empty — no stage metrics)")
+	rssMax := fs.Int64("engine-rss-max", 0, "the engine's max RSS over the run, bytes (docker stats; 0 — not set)")
+	crashes := fs.Int64("engine-crashes", -1, "engine core crashes over the run (>= 0 — set)")
+	outPath := fs.String("out", "", "the snapshot file (the default <dir>/<label>.snapshot.json)")
+	noDOM := fs.Bool("no-dom", false, "do not read the store DOM (no nodes/scripts)")
 	if handled, err := parseFlags(fs, fixturesHelp, args, stdout); handled {
 		return err
 	}
 	if strings.TrimSpace(*dir) == "" {
-		return usagef("укажите каталог дампа: crawlerctl fixtures snapshot --dir /path/to/fixtures")
+		return usagef("specify the dump directory: crawlerctl fixtures snapshot --dir /path/to/fixtures")
 	}
 	if *label == "" || !fixturesLabelRe.MatchString(*label) {
-		return usagef("укажите метку снапшота --label ИМЯ (буквы/цифры/._-, без разделителей пути)")
+		return usagef("specify the snapshot label --label NAME (letters/digits/._-, no path separators)")
 	}
 	switch *engine {
 	case config.EngineChromium, config.EngineMoli, config.EngineLightpanda:
 	default:
-		return usagef("fixtures snapshot: --engine: ожидается %s|%s|%s, задано %q",
+		return usagef("fixtures snapshot: --engine: expected %s|%s|%s, got %q",
 			config.EngineChromium, config.EngineMoli, config.EngineLightpanda, *engine)
 	}
 	if *rssMax < 0 {
-		return usagef("fixtures snapshot: --engine-rss-max: отрицательное значение %d", *rssMax)
+		return usagef("fixtures snapshot: --engine-rss-max: negative value %d", *rssMax)
 	}
 	if fs.NArg() > 0 {
-		return usagef("fixtures snapshot: лишние аргументы %v (команда принимает только флаги)", fs.Args())
+		return usagef("fixtures snapshot: extra arguments %v (the command takes only flags)", fs.Args())
 	}
 
 	ctx, stop := signalCtx()
@@ -772,7 +772,7 @@ func fixturesSnapshotCmd(args []string, stdout, stderr io.Writer) error {
 		// Dump rows missing from the DB (deleted between the export and
 		// the run) would silently reduce the success denominator — a
 		// warning instead of an unnoticed truncation (review T-244 P2-4).
-		out(stdout, "снапшот: предупреждение: в БД %d строк из %d ключей дампа — знаменатель успешности усечён\n",
+		out(stdout, "snapshot: warning: %d rows in the DB of %d dump keys — the success denominator is truncated\n",
 			len(rows), len(keys))
 	}
 
@@ -804,13 +804,13 @@ func fixturesSnapshotCmd(args []string, stdout, stderr io.Writer) error {
 	if !*noDOM {
 		logger := slog.New(slog.NewTextHandler(stderr, nil))
 		if _, err := content.SetDictFile(cfg.Content.ZstdDictionary, logger); err != nil {
-			out(stdout, "снапшот: хранилище контента недоступно (%v) — без узлов/скриптов DOM\n", err)
+			out(stdout, "snapshot: the content store is unavailable (%v) — no DOM nodes/scripts\n", err)
 		} else if store, err := content.OpenPackStore(pool, content.PackOptions{Dir: cfg.Content.Dir, ReadOnly: true}); err != nil {
-			out(stdout, "снапшот: хранилище контента недоступно (%v) — без узлов/скриптов DOM\n", err)
+			out(stdout, "snapshot: the content store is unavailable (%v) — no DOM nodes/scripts\n", err)
 		} else {
 			content.WarnDictMismatch(store.Dir(), logger)
 			if skipped := fixturesSnapshotParseDOM(ctx, store, snap.Rows); skipped > 0 {
-				out(stdout, "снапшот: DOM не прочитан у %d строк (контент выметен/отсутствует) — без узлов/скриптов\n", skipped)
+				out(stdout, "snapshot: the DOM was not read for %d rows (the content swept/absent) — no nodes/scripts\n", skipped)
 			}
 			_ = store.Close()
 		}
@@ -820,12 +820,12 @@ func fixturesSnapshotCmd(args []string, stdout, stderr io.Writer) error {
 	// — a degradation.
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	if streams, err := fixturesSnapshotTakeStreams(ctx, rdb); err != nil {
-		out(stdout, "снапшот: Redis недоступен (%v) — без темпа и остатков очередей\n", err)
+		out(stdout, "snapshot: Redis is unavailable (%v) — no pace or queue leftovers\n", err)
 	} else {
 		snap.Streams = streams
 	}
 	if err := rdb.Close(); err != nil {
-		out(stdout, "снапшот: закрытие Redis: %v\n", err)
+		out(stdout, "snapshot: Redis closing: %v\n", err)
 	}
 
 	// Stage metrics: the URL is given explicitly — unavailability is an
@@ -856,21 +856,21 @@ func fixturesSnapshotCmd(args []string, stdout, stderr io.Writer) error {
 			}
 		}
 	}
-	out(stdout, "снапшот %s: движок %s, задач %d, успешных рендеров %d (%.2f%%)\n",
+	out(stdout, "snapshot %s: engine %s, tasks %d, successful renders %d (%.2f%%)\n",
 		*label, *engine, len(snap.Rows), rendered, pct(rendered, len(snap.Rows)))
 	if unanalyzed > 0 {
-		out(stdout, "  предупреждение: %d успешных рендеров без штампа анализатора (rules_version NULL) — вердикты по ним от прошлого анализа, диф детекции по ним деградирует\n", unanalyzed)
+		out(stdout, "  warning: %d successful renders without the analyzer stamp (rules_version NULL) — their verdicts are from a previous analysis, the detection diff over them degrades\n", unanalyzed)
 	}
 	if snap.Streams != nil {
-		out(stdout, "  q:analyze %d записей, q:render остаток %d, q:render-fallback %d, q:dead %d\n",
+		out(stdout, "  q:analyze %d records, the q:render leftover %d, q:render-fallback %d, q:dead %d\n",
 			snap.Streams.AnalyzeLen, snap.Streams.RenderLen, snap.Streams.FallbackLen, snap.Streams.DeadLen)
 	}
 	if snap.Metrics != nil {
-		out(stdout, "  метрики: задач этапа %.0f, причин финализаций %d, тарпит/cert/dns %.0f/%.0f/%.0f\n",
+		out(stdout, "  metrics: %.0f stage tasks, %d finalization reasons, tarpit/cert/dns %.0f/%.0f/%.0f\n",
 			snap.Metrics.Tasks, len(snap.Metrics.TaskFinalized),
 			snap.Metrics.TarpitFinalized, snap.Metrics.CertFinalized, snap.Metrics.DNSFinalized)
 	}
-	out(stdout, "снапшот записан: %s\n", path)
+	out(stdout, "snapshot written: %s\n", path)
 	return nil
 }
 

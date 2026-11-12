@@ -99,7 +99,7 @@ func domainFixtureInfo(t *testing.T) domainInfo {
 	t.Helper()
 	var info domainInfo
 	if err := json.Unmarshal([]byte(domainFixtureJSON), &info); err != nil {
-		t.Fatalf("разбор фикстуры: %v", err)
+		t.Fatalf("parsing the fixture: %v", err)
 	}
 	return info
 }
@@ -140,11 +140,11 @@ func (p *domainPool) calls() ([]string, [][]any) {
 }
 
 func (p *domainPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("domainPool: CopyFrom не должен вызываться")
+	return 0, errors.New("domainPool: CopyFrom must not be called")
 }
 
 func (p *domainPool) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, fmt.Errorf("domainPool: неожидаемый Exec: %s", sql)
+	return pgconn.CommandTag{}, fmt.Errorf("domainPool: unexpected Exec: %s", sql)
 }
 
 func (p *domainPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -183,7 +183,7 @@ func (p *domainPool) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 		}
 		return domainRowsOf([]any{[]byte(best)}), nil
 	default:
-		return nil, fmt.Errorf("domainPool: неожидаемый SQL Query: %s", sql)
+		return nil, fmt.Errorf("domainPool: unexpected SQL Query: %s", sql)
 	}
 }
 
@@ -215,11 +215,11 @@ func (r *domainRows) Next() bool {
 
 func (r *domainRows) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) {
-		return errors.New("domainRows: Scan без Next")
+		return errors.New("domainRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("domainRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("domainRows: %d destinations, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		v := row[i]
@@ -237,7 +237,7 @@ func (r *domainRows) Scan(dest ...any) error {
 			}
 			*dst = v.(string)
 		default:
-			return fmt.Errorf("domainRows: приёмник %T не поддерживается", d)
+			return fmt.Errorf("domainRows: the destination %T is not supported", d)
 		}
 	}
 	return nil
@@ -286,17 +286,17 @@ func TestFetchDomainInfo(t *testing.T) {
 		t.Fatalf("fetchDomainInfo: %v", err)
 	}
 	if !found {
-		t.Fatal("found = false, хочу true")
+		t.Fatal("found = false, want true")
 	}
 	if string(raw) != domainFixtureJSON {
-		t.Errorf("raw не совпадает с ответом функции:\n%s", raw)
+		t.Errorf("raw does not match the function response:\n%s", raw)
 	}
 	queries, args := pool.calls()
 	if len(queries) != 1 || queries[0] != wantDomainInfoSQL {
-		t.Fatalf("запросы = %q, хочу один domainInfoSQL", queries)
+		t.Fatalf("queries = %q, want one domainInfoSQL", queries)
 	}
 	if len(args) != 1 || args[0][0] != "laravel-11.crawl.test" {
-		t.Errorf("аргументы = %v, хочу имя punycode первым аргументом", args)
+		t.Errorf("args = %v, want the punycode name as the first argument", args)
 	}
 
 	if info.Zone.ID != 1 || info.Zone.Name != "crawl.test" || info.Zone.NameUnicode != "" {
@@ -312,7 +312,7 @@ func TestFetchDomainInfo(t *testing.T) {
 		t.Errorf("dns_alive = %+v", info.DNSAlive)
 	}
 	if len(info.Results) != 3 {
-		t.Fatalf("results = %d, хочу 3", len(info.Results))
+		t.Fatalf("results = %d, want 3", len(info.Results))
 	}
 	first := info.Results[0]
 	if first.Subdomain != "" || first.SchemeName != "https" || first.HTTPStatus != 200 ||
@@ -320,14 +320,14 @@ func TestFetchDomainInfo(t *testing.T) {
 		t.Errorf("results[0] = %+v", first)
 	}
 	if info.Laravel == nil {
-		t.Fatal("laravel = nil, хочу агрегат")
+		t.Fatal("laravel = nil, want the aggregate")
 	}
 	if info.Laravel.Score != 1.25 || info.Laravel.VerMin != "11.0" || info.Laravel.VerMax != "11.4" ||
 		info.Laravel.RulesVersion != 42 {
 		t.Errorf("laravel = %+v", info.Laravel)
 	}
 	if len(info.Laravel.Findings) != 2 || !info.Laravel.Findings[0].IsLaravel || info.Laravel.Findings[1].IsLaravel {
-		t.Errorf("findings = %+v, хочу уверенное + слабое", info.Laravel.Findings)
+		t.Errorf("findings = %+v, want a confirmed + a weak one", info.Laravel.Findings)
 	}
 	if sigs := info.Laravel.Findings[0].Signals; len(sigs) != 2 || sigs[0].Rule != "cookie_xsrf" || sigs[1].Evidence != "X-Laravel-Version: 11" {
 		t.Errorf("signals = %+v", sigs)
@@ -337,7 +337,7 @@ func TestFetchDomainInfo(t *testing.T) {
 	pool = newDomainPool()
 	_, raw, found, err = fetchDomainInfo(context.Background(), pool, "no-such.crawl.test")
 	if err != nil || found || raw != nil {
-		t.Errorf("NULL: raw=%v found=%v err=%v, хочу nil/false/nil", raw, found, err)
+		t.Errorf("NULL: raw=%v found=%v err=%v, want nil/false/nil", raw, found, err)
 	}
 
 	// Pool errors carry context; a nil pool is an error, not a panic.
@@ -345,17 +345,17 @@ func TestFetchDomainInfo(t *testing.T) {
 	pool = newDomainPool()
 	pool.setQueryErr(boom)
 	if _, _, _, err := fetchDomainInfo(context.Background(), pool, "x.crawl.test"); err == nil || !strings.Contains(err.Error(), "domain: domain_info:") {
-		t.Errorf("err = %v, хочу контекст «domain: domain_info:»", err)
+		t.Errorf("err = %v, want the \"domain: domain_info:\" context", err)
 	}
 	if _, _, _, err := fetchDomainInfo(context.Background(), nil, "x.crawl.test"); err == nil {
-		t.Error("fetchDomainInfo(nil) = nil, хочу ошибку")
+		t.Error("fetchDomainInfo(nil) = nil, want an error")
 	}
 
 	// Broken json is a parse error, not silence.
 	pool = newDomainPool()
-	pool.seedInfo("bad.crawl.test", "{не json")
-	if _, _, _, err := fetchDomainInfo(context.Background(), pool, "bad.crawl.test"); err == nil || !strings.Contains(err.Error(), "разбор json") {
-		t.Errorf("битый json: err = %v, хочу ошибку разбора", err)
+	pool.seedInfo("bad.crawl.test", "{not json")
+	if _, _, _, err := fetchDomainInfo(context.Background(), pool, "bad.crawl.test"); err == nil || !strings.Contains(err.Error(), "json parsing") {
+		t.Errorf("broken json: err = %v, want a parse error", err)
 	}
 }
 
@@ -380,7 +380,7 @@ func TestDomainNormalizeForms(t *testing.T) {
 			continue
 		}
 		if res.ASCII != want {
-			t.Errorf("Normalize(%q).ASCII = %q, хочу %q", in, res.ASCII, want)
+			t.Errorf("Normalize(%q).ASCII = %q, want %q", in, res.ASCII, want)
 		}
 		pool.seedInfo(want, domainFixtureJSON)
 		if _, _, found, err := fetchDomainInfo(context.Background(), pool, res.ASCII); err != nil || !found {
@@ -416,30 +416,30 @@ func TestFetchCatalogZone(t *testing.T) {
 
 	zone, found, err := fetchCatalogZone(context.Background(), pool, "shop.example.co.uk")
 	if err != nil || !found || zone != "co.uk" {
-		t.Errorf("co.uk: zone=%q found=%v err=%v, хочу co.uk/true", zone, found, err)
+		t.Errorf("co.uk: zone=%q found=%v err=%v, want co.uk/true", zone, found, err)
 	}
 	_, args := pool.calls()
 	if len(args) != 1 || !reflect.DeepEqual(args[0][0], []string{"example.co.uk", "co.uk", "uk"}) {
-		t.Errorf("аргументы = %v, хочу суффиксы-кандидаты", args)
+		t.Errorf("args = %v, want the suffix candidates", args)
 	}
 
 	zone, found, err = fetchCatalogZone(context.Background(), pool, "free.test")
 	if err != nil || !found || zone != "test" {
-		t.Errorf("test: zone=%q found=%v err=%v, хочу test/true", zone, found, err)
+		t.Errorf("test: zone=%q found=%v err=%v, want test/true", zone, found, err)
 	}
 
 	zone, found, err = fetchCatalogZone(context.Background(), pool, "x.unknown.tld")
 	if err != nil || found || zone != "unknown.tld" {
-		t.Errorf("нет зоны: zone=%q found=%v err=%v, хочу unknown.tld/false", zone, found, err)
+		t.Errorf("no zone: zone=%q found=%v err=%v, want unknown.tld/false", zone, found, err)
 	}
 
 	// Errors and a nil pool.
 	pool.setQueryErr(errors.New("boom"))
-	if _, _, err := fetchCatalogZone(context.Background(), pool, "x.test"); err == nil || !strings.Contains(err.Error(), "domain: зоны:") {
-		t.Errorf("err = %v, хочу контекст «domain: зоны:»", err)
+	if _, _, err := fetchCatalogZone(context.Background(), pool, "x.test"); err == nil || !strings.Contains(err.Error(), "domain: zones:") {
+		t.Errorf("err = %v, want the \"domain: zones:\" context", err)
 	}
 	if _, _, err := fetchCatalogZone(context.Background(), nil, "x.test"); err == nil {
-		t.Error("fetchCatalogZone(nil) = nil, хочу ошибку")
+		t.Error("fetchCatalogZone(nil) = nil, want an error")
 	}
 }
 
@@ -457,7 +457,7 @@ func TestSelectContentResult(t *testing.T) {
 		wantOK  bool
 	}{
 		{
-			name: "рендер приоритетнее первой",
+			name: "the render outranks the first one",
 			results: []domainResult{
 				{Subdomain: "", ContentHash: hash, Rendered: false},
 				{Subdomain: "www", ContentHash: hash, Rendered: true},
@@ -465,7 +465,7 @@ func TestSelectContentResult(t *testing.T) {
 			wantIdx: 1, wantOK: true,
 		},
 		{
-			name: "без рендера — первая с контентом",
+			name: "no render — the first one with content",
 			results: []domainResult{
 				{Subdomain: "", ContentHash: ""},
 				{Subdomain: "www", ContentHash: hash},
@@ -474,7 +474,7 @@ func TestSelectContentResult(t *testing.T) {
 			wantIdx: 1, wantOK: true,
 		},
 		{
-			name: "апекс-DOM раньше www-DOM (порядок функции)",
+			name: "the apex DOM before the www DOM (the function order)",
 			results: []domainResult{
 				{Subdomain: "", ContentHash: hash, Rendered: true},
 				{Subdomain: "www", ContentHash: hash, Rendered: true},
@@ -482,7 +482,7 @@ func TestSelectContentResult(t *testing.T) {
 			wantIdx: 0, wantOK: true,
 		},
 		{
-			name: "контента нет вообще",
+			name: "no content at all",
 			results: []domainResult{
 				{Subdomain: "", ContentHash: ""},
 				{Subdomain: "api", ContentHash: "", Error: 1},
@@ -494,23 +494,23 @@ func TestSelectContentResult(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, ok := selectContentResult(tc.results)
 			if ok != tc.wantOK {
-				t.Fatalf("ok = %v, хочу %v", ok, tc.wantOK)
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}
 			if ok && got != tc.results[tc.wantIdx] {
-				t.Errorf("выбрана запись %+v, хочу %+v", got, tc.results[tc.wantIdx])
+				t.Errorf("the record selected %+v, want %+v", got, tc.results[tc.wantIdx])
 			}
 		})
 	}
 	if _, ok := selectContentResult(nil); ok {
-		t.Error("selectContentResult(nil) = true, хочу false")
+		t.Error("selectContentResult(nil) = true, want false")
 	}
 }
 
 // --- formatting ---------------------------------------------------------------
 
 func TestSubLabel(t *testing.T) {
-	if got := subLabel(""); got != "(апекс)" {
-		t.Errorf("subLabel(\"\") = %q, хочу (апекс)", got)
+	if got := subLabel(""); got != "(apex)" {
+		t.Errorf("subLabel(\"\") = %q, want (apex)", got)
 	}
 	if got := subLabel("www"); got != "www" {
 		t.Errorf("subLabel(www) = %q", got)
@@ -529,7 +529,7 @@ func TestVerRange(t *testing.T) {
 	}
 	for _, tc := range cases {
 		if got := verRange(tc.min, tc.max); got != tc.want {
-			t.Errorf("verRange(%q, %q) = %q, хочу %q", tc.min, tc.max, got, tc.want)
+			t.Errorf("verRange(%q, %q) = %q, want %q", tc.min, tc.max, got, tc.want)
 		}
 	}
 }
@@ -540,11 +540,11 @@ func TestHTTPErrorName(t *testing.T) {
 		want string
 	}{
 		{0, "none"}, {1, "timeout"}, {2, "redirects"},
-		{3, "tls"}, {4, "body"}, {5, "network"}, {9, "код 9"},
+		{3, "tls"}, {4, "body"}, {5, "network"}, {9, "code 9"},
 	}
 	for _, tc := range cases {
 		if got := httpErrorName(tc.code); got != tc.want {
-			t.Errorf("httpErrorName(%d) = %q, хочу %q", tc.code, got, tc.want)
+			t.Errorf("httpErrorName(%d) = %q, want %q", tc.code, got, tc.want)
 		}
 	}
 }
@@ -557,11 +557,11 @@ func TestFormatDomainTS(t *testing.T) {
 		{"2026-10-16T09:00:00.5+00:00", "2026-10-16 09:00:00"},
 		{"2026-10-16T09:00:08+00:00", "2026-10-16 09:00:08"},
 		{"2026-10-16", "2026-10-16"},
-		{"не время", "не время"},
+		{"not a time", "not a time"},
 	}
 	for _, tc := range cases {
 		if got := formatDomainTS(tc.in); got != tc.want {
-			t.Errorf("formatDomainTS(%q) = %q, хочу %q", tc.in, got, tc.want)
+			t.Errorf("formatDomainTS(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 	if got := formatDomainTSShort("2026-10-16T09:00:08+00:00"); got != "2026-10-16 09:00" {
@@ -578,12 +578,12 @@ func TestResultCells(t *testing.T) {
 		r    domainResult
 		want string
 	}{
-		{"http 0 — прочерк", domainResult{}, "—"},
-		{"статус", domainResult{HTTPStatus: 200}, "200"},
+		{"http 0 — a dash", domainResult{}, "—"},
+		{"a status", domainResult{HTTPStatus: 200}, "200"},
 	}
 	for _, tc := range cases {
 		if got := httpStatusDesc(tc.r); got != tc.want {
-			t.Errorf("%s: httpStatusDesc = %q, хочу %q", tc.name, got, tc.want)
+			t.Errorf("%s: httpStatusDesc = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 
@@ -592,13 +592,13 @@ func TestResultCells(t *testing.T) {
 		r    domainResult
 		want string
 	}{
-		{"без контента", domainResult{}, "—"},
-		{"сырой HTML", domainResult{ContentHash: "ab"}, "HTML"},
-		{"DOM рендера", domainResult{ContentHash: "ab", Rendered: true}, "DOM"},
+		{"no content", domainResult{}, "—"},
+		{"raw HTML", domainResult{ContentHash: "ab"}, "HTML"},
+		{"the render DOM", domainResult{ContentHash: "ab", Rendered: true}, "DOM"},
 	}
 	for _, tc := range content {
 		if got := contentKind(tc.r); got != tc.want {
-			t.Errorf("%s: contentKind = %q, хочу %q", tc.name, got, tc.want)
+			t.Errorf("%s: contentKind = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 
@@ -607,13 +607,13 @@ func TestResultCells(t *testing.T) {
 		r    domainResult
 		want string
 	}{
-		{"нет связи", domainResult{AliasKind: 0}, "—"},
-		{"идентичен апексу", domainResult{AliasKind: 1, Alias: ""}, "≡ (апекс)"},
-		{"редирект на www", domainResult{AliasKind: 2, Alias: "www"}, "→ www"},
+		{"no relation", domainResult{AliasKind: 0}, "—"},
+		{"identical to the apex", domainResult{AliasKind: 1, Alias: ""}, "≡ (apex)"},
+		{"a redirect to www", domainResult{AliasKind: 2, Alias: "www"}, "→ www"},
 	}
 	for _, tc := range aliases {
 		if got := aliasDesc(tc.r); got != tc.want {
-			t.Errorf("%s: aliasDesc = %q, хочу %q", tc.name, got, tc.want)
+			t.Errorf("%s: aliasDesc = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 
@@ -622,14 +622,14 @@ func TestResultCells(t *testing.T) {
 		r    domainResult
 		want string
 	}{
-		{"только URL", domainResult{FinalURL: "https://x.test/"}, "https://x.test/"},
-		{"только ошибка", domainResult{Error: 1}, "ошибка 1 (timeout)"},
-		{"URL и ошибка", domainResult{FinalURL: "http://x.test/", Error: 3}, "http://x.test/ — ошибка 3 (tls)"},
-		{"пусто", domainResult{}, "—"},
+		{"a URL only", domainResult{FinalURL: "https://x.test/"}, "https://x.test/"},
+		{"an error only", domainResult{Error: 1}, "error 1 (timeout)"},
+		{"a URL and an error", domainResult{FinalURL: "http://x.test/", Error: 3}, "http://x.test/ — error 3 (tls)"},
+		{"empty", domainResult{}, "—"},
 	}
 	for _, tc := range finals {
 		if got := resultFinalDesc(tc.r); got != tc.want {
-			t.Errorf("%s: resultFinalDesc = %q, хочу %q", tc.name, got, tc.want)
+			t.Errorf("%s: resultFinalDesc = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
@@ -648,17 +648,17 @@ func TestWriteDomainText(t *testing.T) {
 	got := b.String()
 
 	for _, want := range []string{
-		"домен:        laravel-11.crawl.test\n",
-		"зона:         crawl.test (id 1)\n",
-		"статус:       alive\n",
-		"проверка:     done\n",
-		"проверен:     2026-10-16\n",
-		"в очереди с:  2026-10-16 09:00:00\n",
-		"DNS-живые субдомены (dns_mask = 3): (апекс), www\n",
-		"результаты по субдоменам и вариантам:\n",
+		"domain:        laravel-11.crawl.test\n",
+		"zone:          crawl.test (id 1)\n",
+		"status:        alive\n",
+		"check:         done\n",
+		"checked:       2026-10-16\n",
+		"queued since:  2026-10-16 09:00:00\n",
+		"DNS-alive subdomains (dns_mask = 3): (apex), www\n",
+		"results by subdomain and variant:\n",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("сводка не содержит %q:\n%s", want, got)
+			t.Errorf("the summary does not contain %q:\n%s", want, got)
 		}
 	}
 
@@ -666,7 +666,7 @@ func TestWriteDomainText(t *testing.T) {
 	var apexLine, wwwLine, apiLine string
 	for _, line := range strings.Split(got, "\n") {
 		switch {
-		case strings.HasPrefix(line, "(апекс)"):
+		case strings.HasPrefix(line, "(apex)"):
 			apexLine = line
 		case strings.HasPrefix(line, "www"):
 			wwwLine = line
@@ -680,47 +680,47 @@ func TestWriteDomainText(t *testing.T) {
 	// immediately by the separator, not byte-based slack; data rows are
 	// padded to the same width (www → 3 + 4 spaces).
 	for _, line := range strings.Split(got, "\n") {
-		if strings.HasPrefix(line, "субдомен ") {
-			if !strings.HasPrefix(line, "субдомен вар.") {
-				t.Errorf("заголовок таблицы с байтовым паддингом: %q", line)
+		if strings.HasPrefix(line, "subdomain ") {
+			if !strings.HasPrefix(line, "subdomain var.") {
+				t.Errorf("the table header with byte padding: %q", line)
 			}
 		}
 	}
-	if !strings.Contains(got, "\nwww      main ") {
-		t.Errorf("строка www не выровнена по рунам («субдомен» = 8 рун: 8−3=5 пробелов + разделитель):\n%q", wwwLine)
+	if !strings.Contains(got, "\nwww       main ") {
+		t.Errorf("the www line is not rune-aligned (\"subdomain\" = 9 runes: 9−3=6 spaces + the separator):\n%q", wwwLine)
 	}
 	for _, cell := range []string{"main", "https", "200", "DOM", "—", "2026-10-16 09:00", "https://laravel-11.crawl.test/"} {
 		if !strings.Contains(apexLine, cell) {
-			t.Errorf("строка апекса без %q: %q", cell, apexLine)
+			t.Errorf("the apex line without %q: %q", cell, apexLine)
 		}
 	}
-	for _, cell := range []string{"www", "HTML", "≡ (апекс)"} {
+	for _, cell := range []string{"www", "HTML", "≡ (apex)"} {
 		if !strings.Contains(wwwLine, cell) {
-			t.Errorf("строка www без %q: %q", cell, wwwLine)
+			t.Errorf("the www line without %q: %q", cell, wwwLine)
 		}
 	}
-	for _, cell := range []string{"api", "http", "—", "ошибка 1 (timeout)"} {
+	for _, cell := range []string{"api", "http", "—", "error 1 (timeout)"} {
 		if !strings.Contains(apiLine, cell) {
-			t.Errorf("строка api без %q: %q", cell, apiLine)
+			t.Errorf("the api line without %q: %q", cell, apiLine)
 		}
 	}
 
 	for _, want := range []string{
 		"Laravel:\n",
-		"  score:       1.250 (порог 0.600)\n",
-		"  версии:      11.0 – 11.4\n",
-		"  субдомены:   (апекс)\n",
-		"  правила:     версия 42, обновлено 2026-10-16 09:01:00\n",
-		"  срабатывания (is_laravel = true):\n",
-		"    (апекс) main  score 1.250, версии 11.0 – 11.4:\n",
-		"      cookie_xsrf (+0.500): «Set-Cookie: XSRF-TOKEN=eyJ…»\n",
-		"      header_laravel (+0.750): «X-Laravel-Version: 11»\n",
-		"  слабые срабатывания (is_laravel = false, score < 0.600):\n",
+		"  score:       1.250 (threshold 0.600)\n",
+		"  versions:    11.0 – 11.4\n",
+		"  subdomains:  (apex)\n",
+		"  rules:       version 42, updated 2026-10-16 09:01:00\n",
+		"  firings (is_laravel = true):\n",
+		"    (apex) main  score 1.250, versions 11.0 – 11.4:\n",
+		"      cookie_xsrf (+0.500): \"Set-Cookie: XSRF-TOKEN=eyJ...\"\n",
+		"      header_laravel (+0.750): \"X-Laravel-Version: 11\"\n",
+		"  weak firings (is_laravel = false, score < 0.600):\n",
 		"    www main  score 0.250:\n",
-		"      meta_generator (+0.250): «Laravel»\n",
+		"      meta_generator (+0.250): \"Laravel\"\n",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("раздел Laravel без %q:\n%s", want, got)
+			t.Errorf("the Laravel section without %q:\n%s", want, got)
 		}
 	}
 }
@@ -745,20 +745,20 @@ func TestWriteDomainTextVariants(t *testing.T) {
 	writeDomainText(&b, info, 0.6)
 	got := b.String()
 	for _, want := range []string{
-		"домен:        xn--e1afmkfd.xn--p1ai\n",
-		"unicode:      пример.рф\n",
-		"зона:         xn--p1ai (unicode: рф, id 7)\n",
-		"статус:       temp_error\n",
-		"проверка:     queued\n",
-		"проверен:     —\n",
-		"флаги:        is_idn, render_pending\n",
-		"temp-попытки: 2\n",
-		"DNS-живые субдомены (dns_mask = 0): нет\n",
-		"  — нет (домен не проверялся или DNS не делегирован)\n",
-		"  — признаков не найдено (нет записи в laravel_domains;\n",
+		"domain:        xn--e1afmkfd.xn--p1ai\n",
+		"unicode:       пример.рф\n",
+		"zone:          xn--p1ai (unicode: рф, id 7)\n",
+		"status:        temp_error\n",
+		"check:         queued\n",
+		"checked:       —\n",
+		"flags:         is_idn, render_pending\n",
+		"temp attempts: 2\n",
+		"DNS-alive subdomains (dns_mask = 0): none\n",
+		"  — none (the domain was not checked or the DNS is not delegated)\n",
+		"  — no signs found (no row in laravel_domains;\n",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("сводка (вариант) не содержит %q:\n%s", want, got)
+			t.Errorf("the summary (variant) does not contain %q:\n%s", want, got)
 		}
 	}
 }
@@ -774,20 +774,20 @@ func TestWriteDomainJSON(t *testing.T) {
 	}
 	got := b.String()
 	if !strings.HasSuffix(got, "\n") {
-		t.Error("json не кончается переводом строки")
+		t.Error("the json does not end with a newline")
 	}
 	if !strings.Contains(got, "\n  \"zone\"") {
-		t.Errorf("json без отступа 2 пробела:\n%s", got)
+		t.Errorf("the json without the 2-space indent:\n%s", got)
 	}
 	var have, want map[string]any
 	if err := json.Unmarshal([]byte(got), &have); err != nil {
-		t.Fatalf("вывод не json: %v;\n%s", err, got)
+		t.Fatalf("the output is not json: %v;\n%s", err, got)
 	}
 	if err := json.Unmarshal([]byte(domainFixtureJSON), &want); err != nil {
-		t.Fatalf("фикстура не json: %v", err)
+		t.Fatalf("the fixture is not json: %v", err)
 	}
 	if !reflect.DeepEqual(have, want) {
-		t.Errorf("pretty-print изменил данные:\n%s", got)
+		t.Errorf("the pretty-print changed the data:\n%s", got)
 	}
 }
 
@@ -804,10 +804,10 @@ func TestWriteDomainNotFoundJSON(t *testing.T) {
 		ZoneFound bool   `json:"zone_found"`
 	}
 	if err := json.Unmarshal(b.Bytes(), &doc); err != nil {
-		t.Fatalf("вывод не json: %v;\n%s", err, b.String())
+		t.Fatalf("the output is not json: %v;\n%s", err, b.String())
 	}
 	if doc.Found || doc.Name != "example.crawl.test" || doc.Zone != "crawl.test" || doc.ZoneFound {
-		t.Errorf("doc = %+v, хочу found=false, зона crawl.test без записи", doc)
+		t.Errorf("doc = %+v, want found=false, the zone crawl.test without a row", doc)
 	}
 }
 
@@ -822,27 +822,27 @@ func TestDomainNotFound(t *testing.T) {
 	pool.zones = []string{"crawl.test"}
 
 	err := domainNotFound(context.Background(), pool, "example.crawl.test", false, &strings.Builder{})
-	if err == nil || !strings.Contains(err.Error(), "в зоне crawl.test нет домена с меткой example") {
-		t.Errorf("err = %v, хочу «в зоне crawl.test нет домена с меткой example»", err)
+	if err == nil || !strings.Contains(err.Error(), "the zone crawl.test has no domain with the label example") {
+		t.Errorf("err = %v, want \"the zone crawl.test has no domain with the label example\"", err)
 	}
 
 	var out bytes.Buffer
 	err = domainNotFound(context.Background(), pool, "example.crawl.test", true, &out)
 	if err == nil || !strings.Contains(out.String(), `"found":false`) || !strings.Contains(out.String(), `"zone_found":true`) {
-		t.Errorf("--json: err=%v out=%s; хочу found:false + zone_found:true + ошибка", err, out.String())
+		t.Errorf("--json: err=%v out=%s; want found:false + zone_found:true + an error", err, out.String())
 	}
 
 	pool = newDomainPool() // no zones at all
 	err = domainNotFound(context.Background(), pool, "example.unknown.tld", false, &strings.Builder{})
-	if err == nil || !strings.Contains(err.Error(), "зона unknown.tld отсутствует в справочнике zones") {
-		t.Errorf("err = %v, хочу «зона unknown.tld отсутствует в справочнике zones»", err)
+	if err == nil || !strings.Contains(err.Error(), "zone unknown.tld is missing from the zones catalog") {
+		t.Errorf("err = %v, want \"zone unknown.tld is missing from the zones catalog\"", err)
 	}
 
 	// A clarification failure is a command error, not "not found".
 	pool = newDomainPool()
 	pool.setQueryErr(errors.New("boom"))
-	if err := domainNotFound(context.Background(), pool, "x.crawl.test", false, &strings.Builder{}); err == nil || !strings.Contains(err.Error(), "domain: зоны:") {
-		t.Errorf("err = %v, хочу ошибку уточнения зоны", err)
+	if err := domainNotFound(context.Background(), pool, "x.crawl.test", false, &strings.Builder{}); err == nil || !strings.Contains(err.Error(), "domain: zones:") {
+		t.Errorf("err = %v, want a zone clarification error", err)
 	}
 }
 
@@ -863,15 +863,15 @@ func TestWriteDomainContent(t *testing.T) {
 		t.Fatalf("writeDomainContent: %v", err)
 	}
 	if stdout.String() != string(page) {
-		t.Errorf("stdout = %q, хочу только байты контента", stdout.String())
+		t.Errorf("stdout = %q, want only the content bytes", stdout.String())
 	}
 	for _, want := range []string{
-		"домен:        laravel-11.crawl.test", // the summary goes to stderr
-		"контент (--content): субдомен (апекс), вариант main, DOM (рендер),",
-		fmt.Sprintf(" %d байт, хэш 00112233445566778899aabbccddeeff", len(page)),
+		"domain:        laravel-11.crawl.test", // the summary goes to stderr
+		"content (--content): subdomain (apex), variant main, DOM (render),",
+		fmt.Sprintf(" %d bytes, hash 00112233445566778899aabbccddeeff", len(page)),
 	} {
 		if !strings.Contains(stderr.String(), want) {
-			t.Errorf("stderr не содержит %q:\n%s", want, stderr.String())
+			t.Errorf("stderr does not contain %q:\n%s", want, stderr.String())
 		}
 	}
 
@@ -879,8 +879,8 @@ func TestWriteDomainContent(t *testing.T) {
 	noContent := info
 	noContent.Results = []domainResult{{Subdomain: "api", Error: 1}}
 	if err := writeDomainContent(context.Background(), store, noContent, 0.6, &stdout, &stderr); err == nil ||
-		!strings.Contains(err.Error(), "нет сохранённого контента") {
-		t.Errorf("err = %v, хочу «нет сохранённого контента»", err)
+		!strings.Contains(err.Error(), "no stored content") {
+		t.Errorf("err = %v, want \"no stored content\"", err)
 	}
 
 	// A broken hash from the function (not 16 hex bytes) — a data error,
@@ -889,9 +889,9 @@ func TestWriteDomainContent(t *testing.T) {
 	badHash := info
 	badHash.Results = []domainResult{{Subdomain: "", ContentHash: "abc", Rendered: true}}
 	if err := writeDomainContent(context.Background(), store, badHash, 0.6, &stdout, &stderr); err == nil ||
-		!strings.Contains(err.Error(), "некорректный content_hash") ||
-		!strings.Contains(err.Error(), "(субдомен (апекс),") {
-		t.Errorf("err = %v, хочу «некорректный content_hash» с меткой (апекс)", err)
+		!strings.Contains(err.Error(), "invalid content_hash") ||
+		!strings.Contains(err.Error(), "(subdomain (apex),") {
+		t.Errorf("err = %v, want \"invalid content_hash\" with the (apex) label", err)
 	}
 
 	// The store did not find the bytes (the reference exists, the block
@@ -899,7 +899,7 @@ func TestWriteDomainContent(t *testing.T) {
 	store = &fakeContentStore{err: content.ErrNotFound}
 	if err := writeDomainContent(context.Background(), store, info, 0.6, &stdout, &stderr); err == nil ||
 		!strings.Contains(err.Error(), "00112233445566778899aabbccddeeff") {
-		t.Errorf("err = %v, хочу ошибку с хэшем контента", err)
+		t.Errorf("err = %v, want an error with the content hash", err)
 	}
 }
 
@@ -922,13 +922,13 @@ func TestRunDomain(t *testing.T) {
 
 	code, stdout, stderr := runCase("domain", "laravel-11.crawl.test")
 	if code != exitError {
-		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitError, stderr)
+		t.Fatalf("code = %d, want %d; stderr:\n%s", code, exitError, stderr)
 	}
 	if !strings.Contains(stderr, "domain: config:") {
-		t.Errorf("stderr без контекста конфигурации:\n%s", stderr)
+		t.Errorf("stderr without the configuration context:\n%s", stderr)
 	}
 	if stdout != "" {
-		t.Errorf("stdout до соединения не пуст:\n%s", stdout)
+		t.Errorf("stdout before the connection is not empty:\n%s", stdout)
 	}
 
 	// Name forms (case/trailing dot/unicode) pass normalization — the same
@@ -936,17 +936,17 @@ func TestRunDomain(t *testing.T) {
 	for _, name := range []string{"Laravel-11.CRAWL.Test.", "пример.crawl.test", "xn--e1afmkfd.crawl.test"} {
 		code, _, stderr = runCase("domain", "--json", name)
 		if code != exitError || !strings.Contains(stderr, "domain: config:") {
-			t.Errorf("domain --json %q: код %d, stderr:\n%s; хочу ошибку конфигурации", name, code, stderr)
+			t.Errorf("domain --json %q: code %d, stderr:\n%s; want a configuration error", name, code, stderr)
 		}
 	}
 
 	// Input validation comes before the configuration.
 	code, _, stderr = runCase("domain", "bad!!name.test")
-	if code != exitUsage || !strings.Contains(stderr, "некорректное имя домена") {
-		t.Errorf("невалидное имя: код %d, stderr:\n%s; хочу код 2", code, stderr)
+	if code != exitUsage || !strings.Contains(stderr, "invalid domain name") {
+		t.Errorf("an invalid name: code %d, stderr:\n%s; want code 2", code, stderr)
 	}
 	code, _, stderr = runCase("domain", "--json", "--content", "x.crawl.test")
-	if code != exitUsage || !strings.Contains(stderr, "несовместимы") {
-		t.Errorf("--json --content: код %d, stderr:\n%s; хочу код 2", code, stderr)
+	if code != exitUsage || !strings.Contains(stderr, "incompatible") {
+		t.Errorf("--json --content: code %d, stderr:\n%s; want code 2", code, stderr)
 	}
 }

@@ -52,7 +52,7 @@ func TestZonesSyncSQLContract(t *testing.T) {
 		zonesDeactivateMissingSQL: wantZonesDeactivateMissing,
 	} {
 		if sql != want {
-			t.Errorf("SQL-контракт:\nполучен %s\nожидался %s", sql, want)
+			t.Errorf("the SQL contract:\ngot %s\nwant %s", sql, want)
 		}
 	}
 }
@@ -64,20 +64,20 @@ func TestParseZoneList(t *testing.T) {
 	// unicode and punycode spellings of one zone (dedup after
 	// normalization), a trailing comment and empty lines.
 	src := "# Version 2026101900, Last Updated Sun Oct 19 07:07:01 2026 UTC\n" +
-		"AAA\nCOM\nOrg\nРФ\nXN--P1AI\n# хвостовой комментарий — не версия\n\n"
+		"AAA\nCOM\nOrg\nРФ\nXN--P1AI\n# a trailing comment is not the version\n\n"
 	list, err := parseZoneList([]byte(src))
 	if err != nil {
 		t.Fatalf("parseZoneList: %v", err)
 	}
 	if list.Version != "2026101900" {
-		t.Errorf("версия = %q, хочу 2026101900", list.Version)
+		t.Errorf("the version = %q, want 2026101900", list.Version)
 	}
 	want := []string{"aaa", "com", "org", "xn--p1ai"} // XN--P1AI and its unicode spelling converge into one
 	if !reflect.DeepEqual(list.Zones, want) {
-		t.Errorf("зоны = %v, хочу %v", list.Zones, want)
+		t.Errorf("the zones = %v, want %v", list.Zones, want)
 	}
 	if list.Duplicates != 1 {
-		t.Errorf("дублей %d, хочу 1", list.Duplicates)
+		t.Errorf("duplicates %d, want 1", list.Duplicates)
 	}
 }
 
@@ -85,7 +85,7 @@ func TestParseZoneListVersion(t *testing.T) {
 	cases := map[string]string{
 		"# Version 2026101900, Last Updated Sun Oct 19 07:07:01 2026 UTC": "2026101900",
 		"# Version 42":  "42",
-		"# свой список": "свой список", // a non-version comment — in full
+		"# a custom list": "a custom list", // a non-version comment — in full
 		"#":             "",
 	}
 	for comment, want := range cases {
@@ -95,24 +95,24 @@ func TestParseZoneListVersion(t *testing.T) {
 			t.Fatalf("parseZoneList(%q): %v", src, err)
 		}
 		if list.Version != want {
-			t.Errorf("версия из %q = %q, хочу %q", comment, list.Version, want)
+			t.Errorf("the version from %q = %q, want %q", comment, list.Version, want)
 		}
 	}
 	// A file without comments at all.
 	list, err := parseZoneList([]byte("COM\nORG\n"))
 	if err != nil {
-		t.Fatalf("parseZoneList без комментария: %v", err)
+		t.Fatalf("parseZoneList without a comment: %v", err)
 	}
 	if list.Version != "" {
-		t.Errorf("версия = %q, хочу пустую", list.Version)
+		t.Errorf("the version = %q, want empty", list.Version)
 	}
 	// A comment after the zone lines — not a header, does not become the version.
-	list, err = parseZoneList([]byte("COM\n# поздний комментарий\nORG\n"))
+	list, err = parseZoneList([]byte("COM\n# a late comment\nORG\n"))
 	if err != nil {
-		t.Fatalf("parseZoneList с поздним комментарием: %v", err)
+		t.Fatalf("parseZoneList with a late comment: %v", err)
 	}
 	if list.Version != "" {
-		t.Errorf("версия из хвостового комментария = %q, хочу пустую", list.Version)
+		t.Errorf("the version from the trailing comment = %q, want empty", list.Version)
 	}
 }
 
@@ -122,22 +122,22 @@ func TestParseZoneListGarbageLine(t *testing.T) {
 	// and an empty line.
 	src := "# Version 1\nCOM\n\nbad!!zone\nORG\n"
 	_, err := parseZoneList([]byte(src))
-	if err == nil || !strings.Contains(err.Error(), "строка 4") {
-		t.Fatalf("ошибка = %v, хочу номер строки 4", err)
+	if err == nil || !strings.Contains(err.Error(), "line 4") {
+		t.Fatalf("err = %v, want the line number 4", err)
 	}
 	if !strings.Contains(err.Error(), "bad!!zone") {
-		t.Errorf("ошибка не называет мусорную строку: %v", err)
+		t.Errorf("the error does not name the junk line: %v", err)
 	}
 }
 
 func TestParseZoneListNoZones(t *testing.T) {
 	for name, src := range map[string]string{
-		"пустой файл":          "",
-		"только комментарий":   "# Version 1\n",
-		"только пустые строки": "\n\n",
+		"an empty file":          "",
+		"a comment only":   "# Version 1\n",
+		"empty lines only": "\n\n",
 	} {
-		if _, err := parseZoneList([]byte(src)); err == nil || !strings.Contains(err.Error(), "зон в файле нет") {
-			t.Errorf("%s: ошибка = %v, хочу «зон в файле нет» (страховка --deactivate-missing)", name, err)
+		if _, err := parseZoneList([]byte(src)); err == nil || !strings.Contains(err.Error(), "no zones in the file") {
+			t.Errorf("%s: err = %v, want \"no zones in the file\" (the --deactivate-missing guard)", name, err)
 		}
 	}
 }
@@ -150,7 +150,7 @@ func TestParseZoneListCRLF(t *testing.T) {
 		t.Fatalf("parseZoneList CRLF: %v", err)
 	}
 	if !reflect.DeepEqual(list.Zones, []string{"com", "org"}) {
-		t.Errorf("зоны = %v", list.Zones)
+		t.Errorf("the zones = %v", list.Zones)
 	}
 }
 
@@ -175,21 +175,21 @@ func TestFetchZoneList(t *testing.T) {
 		t.Fatalf("fetchZoneList: %v", err)
 	}
 	if string(data) != body {
-		t.Errorf("тело = %q, хочу содержимое среза", data)
+		t.Errorf("the body = %q, want the slice content", data)
 	}
 
 	if _, err := fetchZoneList(context.Background(), srv.URL+"/404"); err == nil ||
 		!strings.Contains(err.Error(), "HTTP 404") {
-		t.Errorf("ошибка 404 = %v, хочу HTTP 404", err)
+		t.Errorf("the 404 error = %v, want HTTP 404", err)
 	}
 	if _, err := fetchZoneList(context.Background(), srv.URL+"/big"); err == nil ||
-		!strings.Contains(err.Error(), "больше лимита") {
-		t.Errorf("ошибка потолка = %v, хочу «больше лимита»", err)
+		!strings.Contains(err.Error(), "over the limit") {
+		t.Errorf("the cap error = %v, want \"over the limit\"", err)
 	}
 	// An unreachable address — a download error (timeout / connection refusal).
 	if _, err := fetchZoneList(context.Background(), "http://127.0.0.1:1/tlds.txt"); err == nil ||
-		!strings.Contains(err.Error(), "загрузка") {
-		t.Errorf("ошибка соединения = %v, хочу контекст загрузки", err)
+		!strings.Contains(err.Error(), "download") {
+		t.Errorf("the connection error = %v, want the download context", err)
 	}
 }
 
@@ -206,18 +206,18 @@ func TestReadZoneListFile(t *testing.T) {
 		t.Fatalf("readZoneListFile: %v", err)
 	}
 	if !strings.HasPrefix(string(data), "# Version") {
-		t.Errorf("содержимое = %q", data)
+		t.Errorf("the content = %q", data)
 	}
 
 	big := filepath.Join(dir, "big.txt")
 	if err := os.WriteFile(big, bytes.Repeat([]byte("a\n"), 600*1024), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readZoneListFile(big); err == nil || !strings.Contains(err.Error(), "больше лимита") {
-		t.Errorf("ошибка потолка = %v, хочу «больше лимита»", err)
+	if _, err := readZoneListFile(big); err == nil || !strings.Contains(err.Error(), "over the limit") {
+		t.Errorf("the cap error = %v, want \"over the limit\"", err)
 	}
 	if _, err := readZoneListFile(filepath.Join(dir, "nope.txt")); err == nil {
-		t.Error("несуществующий файл — ошибка")
+		t.Error("a nonexistent file is an error")
 	}
 }
 
@@ -254,7 +254,7 @@ func newSyncPool() *syncPool {
 }
 
 func (p *syncPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("syncPool: CopyFrom не должен вызываться")
+	return 0, errors.New("syncPool: CopyFrom must not be called")
 }
 
 func (p *syncPool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -279,7 +279,7 @@ func (p *syncPool) Exec(_ context.Context, sql string, args ...any) (pgconn.Comm
 		}
 		return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", inserted)), nil
 	default:
-		return pgconn.CommandTag{}, errors.New("syncPool: неожидаемый SQL Exec: " + sql)
+		return pgconn.CommandTag{}, errors.New("syncPool: unexpected SQL Exec: " + sql)
 	}
 }
 
@@ -313,7 +313,7 @@ func (p *syncPool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		}
 		return statusRowsOf(rows...), nil
 	default:
-		return nil, errors.New("syncPool: неожидаемый SQL Query: " + sql)
+		return nil, errors.New("syncPool: unexpected SQL Query: " + sql)
 	}
 }
 
@@ -354,30 +354,30 @@ func TestZonesSyncRun(t *testing.T) {
 	}
 	got := stdout.String()
 	for _, want := range []string{
-		"прочитано зон 5 (дублей в файле 0), добавлено 3, уже было 2",
+		"zones read 5 (duplicates in the file 0), added 3, already existed 2",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("вывод не содержит %q:\n%s", want, got)
+			t.Errorf("the output does not contain %q:\n%s", want, got)
 		}
 	}
 	if strings.Contains(got, "retired") {
-		t.Errorf("без --deactivate-missing отчёта о выключении быть не должно:\n%s", got)
+		t.Errorf("without --deactivate-missing there must be no disabling report:\n%s", got)
 	}
 
 	// A single batch insert: the names in file order, unicode — only for
 	// XN-- zones (an empty string for ASCII → NULL via nullif in SQL).
 	if len(pool.execs) != 1 {
-		t.Fatalf("Exec-вызовов %d, хочу 1 (одна вставка)", len(pool.execs))
+		t.Fatalf("Exec calls %d, want 1 (one insert)", len(pool.execs))
 	}
 	call := pool.execs[0]
 	if call.sql != zonesSyncInsertSQL {
-		t.Errorf("SQL = %s, хочу zonesSyncInsertSQL", call.sql)
+		t.Errorf("SQL = %s, want zonesSyncInsertSQL", call.sql)
 	}
 	if want := []string{"com", "example.test", "xn--80adxhks", "org", "xn--p1ai"}; !reflect.DeepEqual(call.args[0], want) {
-		t.Errorf("имена = %v, хочу %v", call.args[0], want)
+		t.Errorf("the names = %v, want %v", call.args[0], want)
 	}
 	if want := []string{"", "", "москва", "", "рф"}; !reflect.DeepEqual(call.args[1], want) {
-		t.Errorf("unicode = %v, хочу %v", call.args[1], want)
+		t.Errorf("unicode = %v, want %v", call.args[1], want)
 	}
 
 	// New zones — enabled, with ids after the seed; existing ones are not
@@ -385,25 +385,25 @@ func TestZonesSyncRun(t *testing.T) {
 	for _, name := range []string{"com", "org", "xn--p1ai"} {
 		i := pool.zoneIndex(name)
 		if i < 0 {
-			t.Fatalf("зона %s не вставлена", name)
+			t.Fatalf("the zone %s was not inserted", name)
 		}
 		if !pool.zones[i].active {
-			t.Errorf("новая зона %s должна быть включённой (ТЗ 5.1)", name)
+			t.Errorf("the new zone %s must be enabled (spec 5.1)", name)
 		}
 	}
 	if pool.zones[pool.zoneIndex("example.test")].active {
-		t.Error("существующая выключенная example.test не должна включаться")
+		t.Error("the existing disabled example.test must not be enabled")
 	}
 	crawl := pool.zones[pool.zoneIndex("crawl.test")]
 	if !crawl.active || crawl.total != 120 || crawl.checked != 80 {
-		t.Errorf("crawl.test изменена: %+v — sync не трогает существующие", crawl)
+		t.Errorf("crawl.test changed: %+v — sync does not touch existing rows", crawl)
 	}
 
 	// Without the flag the DB zones missing from the slice are not
 	// disabled — no UPDATE was executed.
 	for _, q := range pool.queries {
 		if q.sql == zonesDeactivateMissingSQL {
-			t.Errorf("без --deactivate-missing выключения быть не должно: %v", q)
+			t.Errorf("without --deactivate-missing there must be no disabling: %v", q)
 		}
 	}
 
@@ -411,13 +411,13 @@ func TestZonesSyncRun(t *testing.T) {
 	// pool state unchanged.
 	stdout.Reset()
 	if err := zonesSyncRun(context.Background(), pool, list, false, &stdout); err != nil {
-		t.Fatalf("повторный zonesSyncRun: %v", err)
+		t.Fatalf("a repeated zonesSyncRun: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "добавлено 0, уже было 5") {
-		t.Errorf("повторный запуск не идемпотентен:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "added 0, already existed 5") {
+		t.Errorf("the repeated run is not idempotent:\n%s", stdout.String())
 	}
 	if len(pool.zones) != 6 {
-		t.Errorf("зон в пуле %d, хочу 6 (без дублей)", len(pool.zones))
+		t.Errorf("zones in the pool %d, want 6 (no duplicates)", len(pool.zones))
 	}
 }
 
@@ -433,11 +433,11 @@ func TestZonesSyncRunDeactivateMissing(t *testing.T) {
 	// crawl.test is in the DB but not in the slice — disabled and listed;
 	// example.test is not in the slice but is already disabled — the
 	// is_active guard, it does not get into the report.
-	if !strings.Contains(got, "выключено отсутствующих в срезе (retired TLD): 1: crawl.test") {
-		t.Errorf("вывод не содержит списка выключенных:\n%s", got)
+	if !strings.Contains(got, "disabled missing from the slice (retired TLD): 1: crawl.test") {
+		t.Errorf("the output does not contain the disabled list:\n%s", got)
 	}
 	if i := pool.zoneIndex("crawl.test"); i < 0 || pool.zones[i].active {
-		t.Error("crawl.test должна быть выключена")
+		t.Error("crawl.test must be disabled")
 	}
 	// The UPDATE is executed once with the full zone list of the slice.
 	var deact []subCall
@@ -447,19 +447,19 @@ func TestZonesSyncRunDeactivateMissing(t *testing.T) {
 		}
 	}
 	if len(deact) != 1 {
-		t.Fatalf("выключающих UPDATE %d, хочу 1", len(deact))
+		t.Fatalf("disabling UPDATEs %d, want 1", len(deact))
 	}
 	if want := []string{"com", "example.test", "xn--80adxhks", "org", "xn--p1ai"}; !reflect.DeepEqual(deact[0].args[0], want) {
-		t.Errorf("аргумент выключения = %v, хочу %v", deact[0].args[0], want)
+		t.Errorf("the disabling argument = %v, want %v", deact[0].args[0], want)
 	}
 
 	// A repeated run — idempotent: nothing left to disable.
 	stdout.Reset()
 	if err := zonesSyncRun(context.Background(), pool, list, true, &stdout); err != nil {
-		t.Fatalf("повторный zonesSyncRun: %v", err)
+		t.Fatalf("a repeated zonesSyncRun: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "отсутствующих в срезе активных зон нет") {
-		t.Errorf("повторный запуск не сообщает «нет активных»:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "no active zones missing from the slice") {
+		t.Errorf("the repeated run does not report \"no active ones\":\n%s", stdout.String())
 	}
 }
 
@@ -467,17 +467,17 @@ func TestZonesSyncRunErrors(t *testing.T) {
 	list := syncSampleList(t)
 
 	pool := newSyncPool()
-	pool.execErr = errors.New("отказ записи")
+	pool.execErr = errors.New("a write failure")
 	err := zonesSyncRun(context.Background(), pool, list, false, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "вставка зон") {
-		t.Fatalf("ошибка вставки = %v, хочу контекст «вставка зон»", err)
+	if err == nil || !strings.Contains(err.Error(), "zone insert") {
+		t.Fatalf("the insert error = %v, want the \"zone insert\" context", err)
 	}
 
 	pool = newSyncPool()
-	pool.queryErr = errors.New("бой соединения")
+	pool.queryErr = errors.New("connection failure")
 	err = zonesSyncRun(context.Background(), pool, list, true, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "выключение отсутствующих в срезе") {
-		t.Fatalf("ошибка выключения = %v, хочу контекст выключения", err)
+	if err == nil || !strings.Contains(err.Error(), "disabling the zones missing from the slice") {
+		t.Fatalf("the disabling error = %v, want the disabling context", err)
 	}
 }
 
@@ -501,24 +501,24 @@ func TestRunZonesSyncExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	commentsOnly := filepath.Join(dir, "empty.txt")
-	if err := os.WriteFile(commentsOnly, []byte("# только комментарий\n"), 0o644); err != nil {
+	if err := os.WriteFile(commentsOnly, []byte("# a comment only\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	cases := []runCase{
-		{name: "sync --file — нет конфигурации", args: []string{"zones", "sync", "--file", good},
+		{name: "sync --file — no configuration", args: []string{"zones", "sync", "--file", good},
 			code: exitError, inErr: "zones sync: config:"},
-		{name: "sync мусорная строка — до конфигурации", args: []string{"zones", "sync", "--file", bad},
-			code: exitError, inErr: "zones sync: строка 3"},
-		{name: "sync несуществующий файл", args: []string{"zones", "sync", "--file", filepath.Join(dir, "nope.txt")},
-			code: exitError, inErr: "zones sync: чтение"},
-		{name: "sync файл без зон", args: []string{"zones", "sync", "--file", commentsOnly},
-			code: exitError, inErr: "зон в файле нет"},
-		{name: "sync --file и --url несовместимы", args: []string{"zones", "sync", "--file", good, "--url", "http://example.invalid/tlds.txt"},
-			code: exitUsage, inErr: "несовместимы"},
-		{name: "sync лишний аргумент", args: []string{"zones", "sync", "foo"},
-			code: exitUsage, inErr: "лишние аргументы"},
-		{name: "sync неизвестный флаг", args: []string{"zones", "sync", "--nope"},
+		{name: "sync a junk line — before the configuration", args: []string{"zones", "sync", "--file", bad},
+			code: exitError, inErr: "zones sync: line 3"},
+		{name: "sync a nonexistent file", args: []string{"zones", "sync", "--file", filepath.Join(dir, "nope.txt")},
+			code: exitError, inErr: "zones sync: reading"},
+		{name: "sync a file without zones", args: []string{"zones", "sync", "--file", commentsOnly},
+			code: exitError, inErr: "no zones in the file"},
+		{name: "sync --file and --url are incompatible", args: []string{"zones", "sync", "--file", good, "--url", "http://example.invalid/tlds.txt"},
+			code: exitUsage, inErr: "incompatible"},
+		{name: "sync an extra argument", args: []string{"zones", "sync", "foo"},
+			code: exitUsage, inErr: "extra arguments"},
+		{name: "sync an unknown flag", args: []string{"zones", "sync", "--nope"},
 			code: exitUsage, inErr: "zones sync:"},
 	}
 	for _, tc := range cases {
@@ -526,10 +526,10 @@ func TestRunZonesSyncExecution(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.args, &stdout, &stderr)
 			if code != tc.code {
-				t.Errorf("run(%q) код = %d, хочу %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
+				t.Errorf("run(%q) code = %d, want %d; stderr:\n%s", tc.args, code, tc.code, stderr.String())
 			}
 			if tc.inErr != "" && !strings.Contains(stderr.String(), tc.inErr) {
-				t.Errorf("run(%q) stderr не содержит %q:\n%s", tc.args, tc.inErr, stderr.String())
+				t.Errorf("run(%q) stderr does not contain %q:\n%s", tc.args, tc.inErr, stderr.String())
 			}
 		})
 	}
@@ -553,19 +553,19 @@ func TestRunZonesSyncURL(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"zones", "sync", "--url", srv.URL + "/tlds.txt"}, &stdout, &stderr)
 	if code != exitError || !strings.Contains(stderr.String(), "zones sync: config:") {
-		t.Errorf("код = %d, stderr:\n%s; хочу отказ конфигурации после успешной загрузки", code, stderr.String())
+		t.Errorf("code = %d, stderr:\n%s; want a configuration refusal after a successful download", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "версия файла: 2026101900") {
-		t.Errorf("stdout не сообщает версию среза:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "file version: 2026101900") {
+		t.Errorf("stdout does not report the slice version:\n%s", stdout.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	code = run([]string{"zones", "sync", "--url", srv.URL + "/broken"}, &stdout, &stderr)
 	if code != exitError || !strings.Contains(stderr.String(), "HTTP 500") {
-		t.Errorf("код = %d, stderr:\n%s; хочу ошибку загрузки HTTP 500", code, stderr.String())
+		t.Errorf("code = %d, stderr:\n%s; want an HTTP 500 download error", code, stderr.String())
 	}
 	if strings.Contains(stderr.String(), "config:") {
-		t.Errorf("отказ источника не должен доходить до конфигурации:\n%s", stderr.String())
+		t.Errorf("a source failure must not reach the configuration:\n%s", stderr.String())
 	}
 }

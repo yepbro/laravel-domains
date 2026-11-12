@@ -49,26 +49,26 @@ import (
 )
 
 // recheckHelp — the crawlerctl recheck --help text.
-const recheckHelp = `crawlerctl recheck — принудительная постановка домена на проверку
+const recheckHelp = `crawlerctl recheck — force-scheduling a domain for a check
 
-Использование:
-  crawlerctl recheck <домен> [домен …]
+Usage:
+  crawlerctl recheck <domain> [domain …]
 
-Домены (одно имя или несколько, в любой форме: unicode/punycode,
-регистр, точка на конце) ставятся на проверку, не дожидаясь интервала
-перепроверки (ТЗ 5.3): найденные по имени домены переводятся в
-check_state = pending (queued_at сбрасывается), публикацию в q:dns
-делает планировщик — с учётом backpressure, темп задаёт очередь.
-Это «ручные задачи» crawlerctl из ТЗ 4.1.
+The domains (one name or several, in any form: unicode/punycode, case,
+a trailing dot) are scheduled for a check without waiting for the recheck
+interval (spec 5.3): the domains found by name are moved to
+check_state = pending (queued_at is reset), the publication into q:dns
+is done by the scheduler — with the backpressure respected, the queue sets
+the pace. These are the crawlerctl "manual tasks" from spec 4.1.
 
-Домен в работе (queued) переводится как возврат lease: он проверится
-заново; уже ожидающий (pending) остаётся в очереди. Удалённый
-(deleted) домен не проверяется (ТЗ 13.1) — отказ с сообщением.
-Не найденные имена (нет зоны в справочнике или нет метки в зоне)
-перечисляются в отказе, код 1; некорректное имя — код 2.
+A domain in flight (queued) is moved like a lease refund: it will be
+checked again; an already waiting (pending) one stays in the queue. A deleted
+domain is not checked (spec 13.1) — a refusal with a message.
+The not-found names (no zone in the catalog or no label in the zone)
+are listed in the refusal, exit code 1; a malformed name — code 2.
 
-Коды возврата: 0 — все домены поставлены, 1 — часть не поставлена
-или ошибка, 2 — использование.
+Exit codes: 0 — all domains scheduled, 1 — some were not scheduled
+or an error, 2 — usage.
 `
 
 // ---------------------------------------------------------------- SQL
@@ -160,7 +160,7 @@ type recheckItem struct {
 func fetchRecheckItems(ctx context.Context, pool db.DB, names []string) ([]recheckItem, error) {
 	rows, err := pool.Query(ctx, recheckLookupSQL, names)
 	if err != nil {
-		return nil, fmt.Errorf("разрешение имён доменов: %w", err)
+		return nil, fmt.Errorf("domain name resolution: %w", err)
 	}
 	defer rows.Close()
 	items := make([]recheckItem, 0, len(names))
@@ -169,16 +169,16 @@ func fetchRecheckItems(ctx context.Context, pool db.DB, names []string) ([]reche
 		var state, status int16 // schema codes (smallint), model types below
 		if err := rows.Scan(&it.ord, &it.zoneID, &it.zoneName, &it.zoneOn,
 			&it.domainID, &it.label, &state, &status); err != nil {
-			return nil, fmt.Errorf("разрешение имён доменов: чтение: %w", err)
+			return nil, fmt.Errorf("domain name resolution: reading: %w", err)
 		}
 		it.state, it.status = model.CheckState(state), model.Status(status)
 		if it.ord < 1 || it.ord > int64(len(names)) {
-			return nil, fmt.Errorf("разрешение имён доменов: ord %d вне диапазона 1..%d (контракт WITH ORDINALITY)", it.ord, len(names))
+			return nil, fmt.Errorf("domain name resolution: ord %d out of range 1..%d (the WITH ORDINALITY contract)", it.ord, len(names))
 		}
 		items = append(items, it)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("разрешение имён доменов: %w", err)
+		return nil, fmt.Errorf("domain name resolution: %w", err)
 	}
 	return items, nil
 }
@@ -205,7 +205,7 @@ func recheckTranslate(ctx context.Context, pool recheckDB, keys []recheckKey) (m
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("перевод доменов в pending: транзакция: %w", err)
+		return nil, fmt.Errorf("moving domains to pending: transaction: %w", err)
 	}
 	// Rollback unconditionally: after Commit it is a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -216,27 +216,27 @@ func recheckTranslate(ctx context.Context, pool recheckDB, keys []recheckKey) (m
 	oldStates := make(map[recheckKey]model.CheckState, len(keys))
 	rows, err := tx.Query(ctx, recheckStatesSQL, zones, ids, int16(model.StatusDeleted))
 	if err != nil {
-		return nil, fmt.Errorf("перевод доменов в pending: чтение состояний: %w", err)
+		return nil, fmt.Errorf("moving domains to pending: reading states: %w", err)
 	}
 	for rows.Next() {
 		var k recheckKey
 		var state int16
 		if err := rows.Scan(&k.zone, &k.id, &state); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("перевод доменов в pending: чтение состояний: строка: %w", err)
+			return nil, fmt.Errorf("moving domains to pending: reading states: row: %w", err)
 		}
 		oldStates[k] = model.CheckState(state)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return nil, fmt.Errorf("перевод доменов в pending: чтение состояний: %w", err)
+		return nil, fmt.Errorf("moving domains to pending: reading states: %w", err)
 	}
 	rows.Close()
 
 	rows, err = tx.Query(ctx, recheckUpdateSQL,
 		int16(model.CheckStatePending), zones, ids, int16(model.StatusDeleted))
 	if err != nil {
-		return nil, fmt.Errorf("перевод доменов в pending: %w", err)
+		return nil, fmt.Errorf("moving domains to pending: %w", err)
 	}
 	shift := db.NewZoneShift()
 	done := make(map[recheckKey]bool, len(keys))
@@ -244,7 +244,7 @@ func recheckTranslate(ctx context.Context, pool recheckDB, keys []recheckKey) (m
 		var k recheckKey
 		if err := rows.Scan(&k.zone, &k.id); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("перевод доменов в pending: чтение: %w", err)
+			return nil, fmt.Errorf("moving domains to pending: reading: %w", err)
 		}
 		done[k] = true
 		switch oldStates[k] {
@@ -257,15 +257,15 @@ func recheckTranslate(ctx context.Context, pool recheckDB, keys []recheckKey) (m
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return nil, fmt.Errorf("перевод доменов в pending: %w", err)
+		return nil, fmt.Errorf("moving domains to pending: %w", err)
 	}
 	rows.Close()
 
 	if err := shift.Exec(ctx, tx); err != nil {
-		return nil, fmt.Errorf("перевод доменов в pending: %w", err)
+		return nil, fmt.Errorf("moving domains to pending: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("перевод доменов в pending: фиксация: %w", err)
+		return nil, fmt.Errorf("moving domains to pending: commit: %w", err)
 	}
 	return done, nil
 }
@@ -294,14 +294,14 @@ func recheckRun(ctx context.Context, pool recheckDB, names []string, stdout io.W
 			// A candidate zone for the message — the longest name suffix
 			// (the domainNotFound style, T-081: what exactly is not found).
 			zone := zoneSuffixCandidates(name)[0]
-			out(stdout, "%s: не найден: зоны %s нет в справочнике (зоны создаёт ingest при первом файле)\n", name, zone)
+			out(stdout, "%s: not found: the zone %s is not in the catalog (ingest creates zones on the first file)\n", name, zone)
 			failed = append(failed, name)
 		case it.domainID == 0:
-			out(stdout, "%s: не найден: в зоне %s нет домена с меткой %s\n",
+			out(stdout, "%s: not found: the zone %s has no domain with the label %s\n",
 				name, it.zoneName, strings.TrimSuffix(name, "."+it.zoneName))
 			failed = append(failed, name)
 		case it.status == model.StatusDeleted:
-			out(stdout, "%s: удалён (deleted) — повторная проверка не выполняется (ТЗ 13.1)\n", name)
+			out(stdout, "%s: deleted — the re-check is not performed (spec 13.1)\n", name)
 			failed = append(failed, name)
 		default:
 			keys = append(keys, recheckKey{zone: it.zoneID, id: it.domainID})
@@ -326,23 +326,23 @@ func recheckRun(ctx context.Context, pool recheckDB, names []string, stdout io.W
 		k := recheckKey{zone: it.zoneID, id: it.domainID}
 		if !translated[k] {
 			if it.status != model.StatusDeleted {
-				out(stdout, "%s: не поставлен: статус изменился на deleted во время команды (ТЗ 13.1)\n", name)
+				out(stdout, "%s: not scheduled: the status changed to deleted during the command (spec 13.1)\n", name)
 				failed = append(failed, name)
 			}
 			continue
 		}
 		note := ""
 		if !it.zoneOn {
-			note = " — зона выключена, домен ждёт включения (crawlerctl zones enable " + it.zoneName + ")"
+			note = " — the zone is disabled, the domain awaits the zone being enabled (crawlerctl zones enable " + it.zoneName + ")"
 		}
-		out(stdout, "%s: поставлен на проверку (было check_state: %s)%s\n", name, it.state, note)
+		out(stdout, "%s: scheduled for a check (was check_state: %s)%s\n", name, it.state, note)
 	}
 
-	out(stdout, "переведено в проверку (pending): %d из %d\n", len(translated), len(items))
+	out(stdout, "moved to pending: %d of %d\n", len(translated), len(items))
 	if len(failed) > 0 {
-		return fmt.Errorf("не поставлены: %s", joinNames(failed))
+		return fmt.Errorf("not scheduled: %s", joinNames(failed))
 	}
-	out(stdout, "домены проверит планировщик: выборка pending → q:dns (backpressure задаёт темп, ТЗ 5.3)\n")
+	out(stdout, "the scheduler will check the domains: the pending selection → q:dns (the backpressure sets the pace, spec 5.3)\n")
 	return nil
 }
 
@@ -368,13 +368,13 @@ func cmdRecheck(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return usagef("укажите домен: crawlerctl recheck example.crawl.test")
+		return usagef("specify a domain: crawlerctl recheck example.crawl.test")
 	}
 	names := make([]string, 0, fs.NArg())
 	for _, a := range fs.Args() {
 		res, err := idn.Normalize(a)
 		if err != nil {
-			return usagef("recheck: некорректное имя домена %q: %v", a, err)
+			return usagef("recheck: invalid domain name %q: %v", a, err)
 		}
 		names = append(names, res.ASCII)
 	}

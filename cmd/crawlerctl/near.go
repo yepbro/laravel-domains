@@ -25,22 +25,23 @@ import (
 )
 
 // nearHelp — the crawlerctl near --help text.
-const nearHelp = `crawlerctl near — находки Laravel в серой зоне порога (T-115)
+const nearHelp = `crawlerctl near — Laravel finds in the threshold gray zone (T-115)
 
-Использование:
-  crawlerctl near [--zone ИМЯ] [--min-score F]
+Usage:
+  crawlerctl near [--zone NAME] [--min-score F]
 
-Выводит находки laravel_findings с min-score/2 <= score < min-score
-(«почти-срабатывания»: признаки есть, порог is_laravel не пройден) —
-домен, субдомен, сработавшие правила с evidence. Материал калибровки
-весов правил и порога: стабильная серая зона — норма, всплеск после
-смены правил — сигнал деградации точности.
+Prints the laravel_findings finds with min-score/2 <= score < min-score
+("near-firings": the signs are there, the is_laravel threshold is not passed)
+— the domain, the subdomain, the fired rules with evidence. Calibration
+material for the rule weights and the threshold: a stable gray zone is the
+norm, a spike after a rule change is a precision degradation signal.
 
-Порог по умолчанию — analyzer.laravel_min_score из конфигурации (боевой
-порог записи в laravel_domains, как test-rules); без конфигурации — 0.6.
-Явный --min-score переопределяет оба источника. Зона — punycode-имя
-справочника zones (unicode приводится к punycode).
-Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
+The default threshold is analyzer.laravel_min_score from the configuration
+(the production threshold for writing into laravel_domains, like test-rules);
+without the configuration — 0.6. An explicit --min-score overrides both
+sources. The zone — the punycode name of the zones catalog (unicode is
+converted to punycode).
+Exit codes: 0 — success, 1 — error, 2 — usage.
 `
 
 // nearRow — a gray-zone selection row: domain + finding (subdomain×variant).
@@ -78,9 +79,9 @@ const nearSelectSQL = "SELECT f.zone_id, f.domain_id, d.label || '.' || z.name A
 
 func cmdNear(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("near")
-	zone := fs.String("zone", "", "зона находок (punycode; пусто — все)")
+	zone := fs.String("zone", "", "the findings zone (punycode; empty — all)")
 	minScore := fs.Float64("min-score", 0.6,
-		"порог is_laravel (по умолчанию analyzer.laravel_min_score из конфигурации, без неё 0.6)")
+		"the is_laravel threshold (default analyzer.laravel_min_score from the configuration, 0.6 without it)")
 	if handled, err := parseFlags(fs, nearHelp, args, stdout); handled {
 		return err
 	}
@@ -90,15 +91,15 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 		// directories (internal/idn.NormalizeZone): the zone is stored in punycode.
 		normalized, err := idn.NormalizeZone(*zone)
 		if err != nil {
-			return usagef("near: некорректное имя зоны %q: %v", *zone, err)
+			return usagef("near: invalid zone name %q: %v", *zone, err)
 		}
 		zoneName = normalized
 	}
 	if fs.NArg() > 0 {
-		return usagef("near: лишние аргументы %v (команда принимает только --zone и --min-score)", fs.Args())
+		return usagef("near: extra arguments %v (the command takes only --zone and --min-score)", fs.Args())
 	}
 	if !(*minScore > 0 && *minScore < 1) {
-		return usagef("near: порог %v вне (0, 1)", *minScore)
+		return usagef("near: the threshold %v is outside (0, 1)", *minScore)
 	}
 
 	// The default threshold is kept in sync with the production configuration
@@ -125,7 +126,7 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 	}
 	defer pool.Close()
 
-	zoneDesc := "все"
+	zoneDesc := "all"
 	var zoneID *int16
 	if zoneName != "" {
 		id, found, err := analyzer.ZoneIDByName(ctx, pool, zoneName)
@@ -133,7 +134,7 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("near: %w", err)
 		}
 		if !found {
-			return fmt.Errorf("near: зона %s не найдена в справочнике (зоны создаёт ingest при первом файле)", zoneName)
+			return fmt.Errorf("near: zone %s is not in the catalog (ingest creates zones on the first file)", zoneName)
 		}
 		zoneID, zoneDesc = &id, zoneName
 	}
@@ -143,7 +144,7 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("near: %w", err)
 	}
 
-	out(stdout, "near: серая зона [%.3f .. %.3f), зона: %s, находок: %d\n\n",
+	out(stdout, "near: the gray zone [%.3f .. %.3f), zone: %s, findings: %d\n\n",
 		*minScore/2, *minScore, zoneDesc, len(rows))
 	domains := 0
 	prevDomain := int64(-1)
@@ -155,10 +156,10 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 		nearPrintRow(stdout, r)
 	}
 	if len(rows) == 0 {
-		out(stdout, "  (пусто — слабых находок в диапазоне нет)\n")
+		out(stdout, "  (empty — no weak findings in the range)\n")
 		return nil
 	}
-	out(stdout, "\nnear: доменов: %d\n", domains)
+	out(stdout, "\nnear: domains: %d\n", domains)
 	return nil
 }
 
@@ -183,11 +184,11 @@ func nearFetch(ctx context.Context, pool db.DB, zoneID *int16, minScore float64)
 		if err := rs.Scan(&r.ZoneID, &r.DomainID, &r.Name, &r.SubdomainID,
 			&r.Subdomain, &r.Variant, &r.Score, &r.VerMin, &r.VerMax,
 			&r.IsLaravel, &signals); err != nil {
-			return nil, fmt.Errorf("чтение находки: %w", err)
+			return nil, fmt.Errorf("finding reading: %w", err)
 		}
 		if len(signals) > 0 {
 			if err := json.Unmarshal(signals, &r.Signals); err != nil {
-				return nil, fmt.Errorf("signals домена %s: %w", r.Name, err)
+				return nil, fmt.Errorf("signals of the domain %s: %w", r.Name, err)
 			}
 		}
 		res = append(res, r)
@@ -203,7 +204,7 @@ func nearFetch(ctx context.Context, pool db.DB, zoneID *int16, minScore float64)
 func nearPrintRow(w io.Writer, r nearRow) {
 	sub := r.Subdomain
 	if sub == "" {
-		sub = "(апекс)"
+		sub = "(apex)"
 	}
 	variant := "main"
 	if model.Variant(r.Variant) == model.VariantHTTP {
@@ -217,9 +218,9 @@ func nearPrintRow(w io.Writer, r nearRow) {
 	if r.IsLaravel {
 		verdict = "  is_laravel!"
 	}
-	out(w, "%s  %s/%s  score=%.3f  ver=%s  правил=%d%s\n",
+	out(w, "%s  %s/%s  score=%.3f  ver=%s  rules=%d%s\n",
 		r.Name, sub, variant, r.Score, ver, len(r.Signals), verdict)
 	for _, s := range r.Signals {
-		out(w, "    - %-28s w=%.2f  «%s»\n", s.Rule, s.Weight, s.Evidence)
+		out(w, "    - %-28s w=%.2f  \"%s\"\n", s.Rule, s.Weight, s.Evidence)
 	}
 }

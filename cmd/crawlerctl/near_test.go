@@ -69,11 +69,11 @@ type nearPool struct {
 var _ db.DB = (*nearPool)(nil)
 
 func (p *nearPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("nearPool: CopyFrom не должен вызываться")
+	return 0, errors.New("nearPool: CopyFrom must not be called")
 }
 
 func (p *nearPool) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, fmt.Errorf("nearPool: неожидаемый Exec: %s", sql)
+	return pgconn.CommandTag{}, fmt.Errorf("nearPool: unexpected Exec: %s", sql)
 }
 
 func (p *nearPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -88,7 +88,7 @@ func (p *nearPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 		return nil, p.queryErr
 	}
 	if sql != nearSelectSQL {
-		return nil, fmt.Errorf("nearPool: неожидаемый SQL Query: %s", sql)
+		return nil, fmt.Errorf("nearPool: unexpected SQL Query: %s", sql)
 	}
 	return p.selectRows(args), nil
 }
@@ -154,59 +154,59 @@ func TestNearFetch(t *testing.T) {
 		t.Fatalf("nearFetch: %v", err)
 	}
 	if len(rows) != 3 {
-		t.Fatalf("строк = %d, хочу 3 (диапазон [0.3 .. 0.6))", len(rows))
+		t.Fatalf("rows = %d, want 3 (the range [0.3 .. 0.6))", len(rows))
 	}
 	if rows[0].Name != "alpha.com" || rows[0].Score != 0.5875 {
-		t.Errorf("первая строка = %s %.4f, хочу alpha.com 0.5875 (score DESC)", rows[0].Name, rows[0].Score)
+		t.Errorf("the first row = %s %.4f, want alpha.com 0.5875 (score DESC)", rows[0].Name, rows[0].Score)
 	}
 	if len(rows[0].Signals) != 2 || rows[0].Signals[0].Rule != "cookie_xsrf_token" {
-		t.Errorf("signals alpha.com = %+v, хочу два правила с разбором JSON", rows[0].Signals)
+		t.Errorf("signals of alpha.com = %+v, want two rules parsed from JSON", rows[0].Signals)
 	}
 
 	// Zone filter: com only.
 	zoneID := int16(3)
 	rows, err = nearFetch(context.Background(), pool, &zoneID, 0.6)
 	if err != nil {
-		t.Fatalf("nearFetch зоны: %v", err)
+		t.Fatalf("nearFetch by zone: %v", err)
 	}
 	if len(rows) != 2 {
-		t.Fatalf("строк зоны com = %d, хочу 2", len(rows))
+		t.Fatalf("rows of the zone com = %d, want 2", len(rows))
 	}
 	for _, r := range rows {
 		if r.ZoneID != 3 {
-			t.Errorf("строка вне зоны: %+v", r)
+			t.Errorf("a row outside the zone: %+v", r)
 		}
 	}
 
 	// The parameters of the first call — a nil zone (all) and the range bounds.
 	first := pool.args[0]
 	if first[0] != nil {
-		t.Errorf("args[0] = %v, хочу nil для зоны без фильтра", first[0])
+		t.Errorf("args[0] = %v, want nil for no zone filter", first[0])
 	}
 	if lo := first[1].(float32); lo != 0.3 {
-		t.Errorf("нижняя граница = %v, хочу 0.3 (min/2)", lo)
+		t.Errorf("the lower bound = %v, want 0.3 (min/2)", lo)
 	}
 	if hi := first[2].(float32); hi != 0.6 {
-		t.Errorf("верхняя граница = %v, хочу 0.6 (min)", hi)
+		t.Errorf("the upper bound = %v, want 0.6 (min)", hi)
 	}
 }
 
 // TestNearFetchErrors — DB errors and a garbage signals payload do not
 // crash a correct path but finish the command.
 func TestNearFetchErrors(t *testing.T) {
-	t.Run("ошибка БД", func(t *testing.T) {
-		pool := &nearPool{queryErr: errors.New("бд недоступна")}
+	t.Run("a DB error", func(t *testing.T) {
+		pool := &nearPool{queryErr: errors.New("db unavailable")}
 		if _, err := nearFetch(context.Background(), pool, nil, 0.6); err == nil {
-			t.Fatal("nearFetch с ошибкой БД = nil, хочу ошибку")
+			t.Fatal("nearFetch with a DB error = nil, want an error")
 		}
 	})
-	t.Run("мусор в signals", func(t *testing.T) {
+	t.Run("junk in signals", func(t *testing.T) {
 		pool := &nearPool{seeds: []nearSeed{
-			{zone: 3, domain: 1, name: "x.com", score: 0.4, signalsJxn: `{не-json`},
+			{zone: 3, domain: 1, name: "x.com", score: 0.4, signalsJxn: `{not-json`},
 		}}
 		if _, err := nearFetch(context.Background(), pool, nil, 0.6); err == nil ||
 			!strings.Contains(err.Error(), "signals") {
-			t.Fatalf("ошибка = %v, хочу отказ разбора signals", err)
+			t.Fatalf("err = %v, want a signals parse refusal", err)
 		}
 	})
 }
@@ -223,21 +223,21 @@ func TestNearPrintRow(t *testing.T) {
 	})
 	got := buf.String()
 	for _, want := range []string{
-		"example.com  www/http  score=0.500  ver=[9.19..12]  правил=1",
+		"example.com  www/http  score=0.500  ver=[9.19..12]  rules=1",
 		"cookie_xsrf_token", "XSRF-TOKEN",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("вывод не содержит %q:\n%s", want, got)
+			t.Errorf("the output does not contain %q:\n%s", want, got)
 		}
 	}
 
 	buf.Reset()
 	nearPrintRow(&buf, nearRow{Name: "a.com", Subdomain: "", Score: 0.35})
-	if !strings.Contains(buf.String(), "a.com  (апекс)/main") {
-		t.Errorf("пустая метка не отображена как апекс:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "a.com  (apex)/main") {
+		t.Errorf("the empty label is not shown as the apex:\n%s", buf.String())
 	}
 	if !strings.Contains(buf.String(), "ver=-") {
-		t.Errorf("пустые версии не отображены прочерком:\n%s", buf.String())
+		t.Errorf("the empty versions are not shown with a dash:\n%s", buf.String())
 	}
 }
 
@@ -249,13 +249,13 @@ func TestRunNear(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"near"}, &stdout, &stderr)
 	if code != exitError {
-		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitError, stderr.String())
+		t.Fatalf("code = %d, want %d; stderr:\n%s", code, exitError, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "near: config:") {
-		t.Errorf("stderr не содержит контекста конфигурации:\n%s", stderr.String())
+		t.Errorf("stderr does not contain the configuration context:\n%s", stderr.String())
 	}
 	if stdout.Len() != 0 {
-		t.Errorf("stdout до соединения не пуст:\n%s", stdout.String())
+		t.Errorf("stdout before the connection is not empty:\n%s", stdout.String())
 	}
 }
 
@@ -266,12 +266,12 @@ func TestRunNearUsage(t *testing.T) {
 	for _, args := range [][]string{
 		{"near", "--min-score", "1.5"},
 		{"near", "--min-score", "0"},
-		{"near", "лишний"},
+		{"near", "an extra one"},
 	} {
 		var stdout, stderr bytes.Buffer
 		code := run(args, &stdout, &stderr)
 		if code != exitUsage {
-			t.Errorf("run(%v) = %d, хочу %d; stderr:\n%s", args, code, exitUsage, stderr.String())
+			t.Errorf("run(%v) = %d, want %d; stderr:\n%s", args, code, exitUsage, stderr.String())
 		}
 	}
 }

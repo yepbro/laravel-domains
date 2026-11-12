@@ -36,11 +36,11 @@ func setStdin(t *testing.T, r *strings.Reader) {
 func parseOutput(t *testing.T, stdout *bytes.Buffer) auth.PasswordHash {
 	t.Helper()
 	if !hashRe.MatchString(stdout.String()) {
-		t.Fatalf("вывод не похож на password_hash (ТЗД §7.2): %q", stdout.String())
+		t.Fatalf("the output does not look like a password_hash (the dashboard spec §7.2): %q", stdout.String())
 	}
 	ph, err := auth.Parse(strings.TrimRight(stdout.String(), "\n"))
 	if err != nil {
-		t.Fatalf("Parse(вывод): %v", err)
+		t.Fatalf("Parse(output): %v", err)
 	}
 	return ph
 }
@@ -48,12 +48,12 @@ func parseOutput(t *testing.T, stdout *bytes.Buffer) auth.PasswordHash {
 // Argument: the string is printed and verifies back against its own password.
 func TestRunDashboardSecretArgument(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"dashboard-secret", "s3cret-пароль"}, &stdout, &stderr)
+	code := run([]string{"dashboard-secret", "s3cret-password"}, &stdout, &stderr)
 	if code != exitOK {
-		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitOK, stderr.String())
+		t.Fatalf("code = %d, want %d; stderr:\n%s", code, exitOK, stderr.String())
 	}
-	if ph := parseOutput(t, &stdout); !ph.Verify("s3cret-пароль") {
-		t.Errorf("раундтрип: хэш не сверяется со своим паролем")
+	if ph := parseOutput(t, &stdout); !ph.Verify("s3cret-password") {
+		t.Errorf("roundtrip: the hash does not verify against its own password")
 	}
 }
 
@@ -64,10 +64,10 @@ func TestRunDashboardSecretStdin(t *testing.T) {
 		name string
 		in   string
 	}{
-		{"с переводом строки", "stdin-пароль\n"},
-		{"без перевода строки", "stdin-пароль"},
-		{"лишние строки не читаются", "stdin-пароль\nвторая-строка\n"},
-		{"перевод строки CRLF", "stdin-пароль\r\n"},
+		{"with a newline", "stdin-password\n"},
+		{"without a newline", "stdin-password"},
+		{"extra lines are not read", "stdin-password\nsecond-line\n"},
+		{"a CRLF newline", "stdin-password\r\n"},
 	}
 	for _, tt := range ok {
 		t.Run(tt.name, func(t *testing.T) {
@@ -75,15 +75,15 @@ func TestRunDashboardSecretStdin(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run([]string{"dashboard-secret"}, &stdout, &stderr)
 			if code != exitOK {
-				t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitOK, stderr.String())
+				t.Fatalf("code = %d, want %d; stderr:\n%s", code, exitOK, stderr.String())
 			}
 			// Full verification (600,000 iterations ≈ 0.4 s) runs on the
 			// cases where the "first line" behavior is actually
 			// distinguishable: trailing newline, extra lines, CRLF.
 			ph := parseOutput(t, &stdout)
-			deep := tt.name != "без перевода строки"
-			if deep && !ph.Verify("stdin-пароль") {
-				t.Errorf("хэш из stdin не сверяется с паролем первой строки")
+			deep := tt.name != "without a newline"
+			if deep && !ph.Verify("stdin-password") {
+				t.Errorf("the hash from stdin does not verify against the first line's password")
 			}
 		})
 	}
@@ -92,9 +92,9 @@ func TestRunDashboardSecretStdin(t *testing.T) {
 		name string
 		in   string
 	}{
-		{"пустой stdin (EOF)", ""},
-		{"одна пустая строка", "\n"},
-		{"пустая строка CRLF", "\r\n"},
+		{"empty stdin (EOF)", ""},
+		{"one empty line", "\n"},
+		{"an empty CRLF line", "\r\n"},
 	}
 	for _, tt := range empty {
 		t.Run(tt.name, func(t *testing.T) {
@@ -102,10 +102,10 @@ func TestRunDashboardSecretStdin(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run([]string{"dashboard-secret"}, &stdout, &stderr)
 			if code != exitUsage {
-				t.Fatalf("код = %d, хочу %d (пустой пароль — ошибка использования)", code, exitUsage)
+				t.Fatalf("code = %d, want %d (an empty password — a usage error)", code, exitUsage)
 			}
-			if !strings.Contains(stderr.String(), "пустой пароль") {
-				t.Errorf("stderr не объясняет пустой пароль:\n%s", stderr.String())
+			if !strings.Contains(stderr.String(), "empty password") {
+				t.Errorf("stderr does not explain the empty password:\n%s", stderr.String())
 			}
 		})
 	}
@@ -115,23 +115,23 @@ func TestRunDashboardSecretStdin(t *testing.T) {
 // an empty argument is a usage error and is not silently replaced by
 // stdin. A stdin read error (not EOF) is an execution error (code 1).
 func TestRunDashboardSecretArgumentPrecedence(t *testing.T) {
-	setStdin(t, strings.NewReader("из-stdin\n"))
+	setStdin(t, strings.NewReader("from-stdin\n"))
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"dashboard-secret", "из-аргумента"}, &stdout, &stderr)
+	code := run([]string{"dashboard-secret", "from-argument"}, &stdout, &stderr)
 	if code != exitOK {
-		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitOK, stderr.String())
+		t.Fatalf("code = %d, want %d; stderr:\n%s", code, exitOK, stderr.String())
 	}
-	if ph := parseOutput(t, &stdout); !ph.Verify("из-аргумента") {
-		t.Errorf("аргумент обязан быть важнее stdin")
+	if ph := parseOutput(t, &stdout); !ph.Verify("from-argument") {
+		t.Errorf("the argument must take precedence over stdin")
 	}
 
-	setStdin(t, strings.NewReader("непустой-stdin\n"))
+	setStdin(t, strings.NewReader("nonempty-stdin\n"))
 	stdout, stderr = bytes.Buffer{}, bytes.Buffer{}
 	code = run([]string{"dashboard-secret", ""}, &stdout, &stderr)
 	if code != exitUsage {
-		t.Fatalf("пустой аргумент: код = %d, хочу %d", code, exitUsage)
+		t.Fatalf("an empty argument: code = %d, want %d", code, exitUsage)
 	}
-	if !strings.Contains(stderr.String(), "пустой пароль") {
+	if !strings.Contains(stderr.String(), "empty password") {
 		t.Errorf("stderr:\n%s", stderr.String())
 	}
 }
@@ -142,12 +142,12 @@ func TestRunDashboardSecretHelp(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"dashboard-secret", "--help"}, &stdout, &stderr)
 	if code != exitOK {
-		t.Fatalf("код = %d, хочу %d", code, exitOK)
+		t.Fatalf("code = %d, want %d", code, exitOK)
 	}
 	help := stdout.String()
-	for _, want := range []string{"crawlerctl dashboard-secret", "истории shell", "600000", "pbkdf2-sha256"} {
+	for _, want := range []string{"crawlerctl dashboard-secret", "shell history", "600000", "pbkdf2-sha256"} {
 		if !strings.Contains(help, want) {
-			t.Errorf("справка не содержит %q:\n%s", want, help)
+			t.Errorf("the help does not contain %q:\n%s", want, help)
 		}
 	}
 }
@@ -165,16 +165,16 @@ func TestRunDashboardSecretStdinReadError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"dashboard-secret"}, &stdout, &stderr)
 	if code != exitError {
-		t.Fatalf("код = %d, хочу %d (ошибка чтения stdin — ошибка выполнения)", code, exitError)
+		t.Fatalf("code = %d, want %d (a stdin reading error — an execution error)", code, exitError)
 	}
-	if !strings.Contains(stderr.String(), "чтение пароля") {
-		t.Errorf("stderr не объясняет отказ чтения:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "reading the password") {
+		t.Errorf("stderr does not explain the reading refusal:\n%s", stderr.String())
 	}
 }
 
 // The process stdin remains the default source (the seam is restored).
 func TestStdinRestored(t *testing.T) {
 	if stdin != os.Stdin {
-		t.Errorf("после тестов stdin обязан вернуться к os.Stdin, получено %v", stdin)
+		t.Errorf("after the tests stdin must be back to os.Stdin, got %v", stdin)
 	}
 }

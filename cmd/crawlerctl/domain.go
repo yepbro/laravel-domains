@@ -55,36 +55,38 @@ import (
 )
 
 // domainHelp — help text for crawlerctl domain --help.
-const domainHelp = `crawlerctl domain — информация о домене по имени (ТЗ 5.11)
+const domainHelp = `crawlerctl domain — the domain info by name (spec 5.11)
 
-Использование:
-  crawlerctl domain <имя> [--json]
-  crawlerctl domain <имя> --content
+Usage:
+  crawlerctl domain <name> [--json]
+  crawlerctl domain <name> --content
 
-Имя — в любой форме: unicode или punycode, любой регистр, точка на конце
-(нормализация по ТЗ 5.2 через internal/idn; в БД имя хранится punycode).
+The name — in any form: unicode or punycode, any case, a trailing dot
+(normalization per spec 5.2 via internal/idn; punycode is stored in the DB).
 
-Данные — SQL-функция domain_info (миграция 000006): зона, статус,
-состояние проверки, последняя проверка, DNS-живые субдомены (расшифровка
-dns_mask), результаты по субдоменам и вариантам (схема, HTTP-статус,
-итоговый URL, алиас, контент DOM/HTML, ошибка, время проверки) и признаки
-Laravel: score, диапазон версий, сработавшие правила с фрагментами-
-свидетельствами; слабые срабатывания — отдельной секцией с пометкой
-is_laravel (домены только со слабыми срабатываниями ниже порога записи
-в laravel_domains не имеют и функцией не раскрываются).
+The data — the SQL function domain_info (migration 000006): the zone, the
+status, the check state, the last check, the DNS-alive subdomains (the
+dns_mask decoding), the results by subdomain and variant (the scheme, the
+HTTP status, the final URL, the alias, the DOM/HTML content, the error,
+the check time) and the Laravel signs: the score, the version range, the
+fired rules with evidence fragments; weak firings — a separate section
+with the is_laravel mark (domains with only weak firings below the write
+threshold into laravel_domains have no row and are not exposed by the
+function).
 
---json     ответ domain_info как есть, pretty-print (2 пробела);
-           не найдено — {"found":false,…} и код 1.
---content  вместо сводки вывести в stdout сохранённый контент выбранной
-           записи как есть (байты; приоритет — отрендеренный DOM, иначе
-           первая запись с контентом в порядке субдомен×вариант).
-           Сводка и пометка о выбранной записи — в stderr, stdout можно
-           перенаправлять в файл. Несовместим с --json.
+--json     the domain_info response as-is, pretty-print (2 spaces);
+           not found — {"found":false,…} and exit code 1.
+--content  instead of the summary, print the stored content of the selected
+           record to stdout as-is (bytes; the priority — the rendered DOM,
+           otherwise the first record with content in the subdomain×variant
+           order). The summary and the note about the selected record go to
+           stderr, stdout can be redirected to a file. Incompatible with
+           --json.
 
-Неизвестный домен или зона — понятное сообщение (что именно не найдено),
-код 1; некорректное имя — код 2. Команда работает на стеке dev-окружения
-(PostgreSQL; --content — ещё и каталог контента).
-Коды возврата: 0 — успех, 1 — не найдено/ошибка, 2 — использование.
+An unknown domain or zone — a clear message (what exactly was not found),
+exit code 1; a malformed name — code 2. The command runs on the dev
+environment stack (PostgreSQL; --content — also the content directory).
+Exit codes: 0 — success, 1 — not found/error, 2 — usage.
 `
 
 // ---------------------------------------------------------------- SQL
@@ -205,7 +207,7 @@ type domainInfo struct {
 // the domain or zone was not found: found=false without an error.
 func fetchDomainInfo(ctx context.Context, pool db.DB, name string) (info domainInfo, raw []byte, found bool, err error) {
 	if pool == nil {
-		return domainInfo{}, nil, false, errors.New("domain: domain_info: пул не задан")
+		return domainInfo{}, nil, false, errors.New("domain: domain_info: pool not set")
 	}
 	rows, err := pool.Query(ctx, domainInfoSQL, name)
 	if err != nil {
@@ -213,10 +215,10 @@ func fetchDomainInfo(ctx context.Context, pool db.DB, name string) (info domainI
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return domainInfo{}, nil, false, errors.New("domain: domain_info: пустой ответ")
+		return domainInfo{}, nil, false, errors.New("domain: domain_info: empty response")
 	}
 	if err := rows.Scan(&raw); err != nil {
-		return domainInfo{}, nil, false, fmt.Errorf("domain: domain_info: чтение: %w", err)
+		return domainInfo{}, nil, false, fmt.Errorf("domain: domain_info: reading: %w", err)
 	}
 	if err := rows.Err(); err != nil {
 		return domainInfo{}, nil, false, fmt.Errorf("domain: domain_info: %w", err)
@@ -225,7 +227,7 @@ func fetchDomainInfo(ctx context.Context, pool db.DB, name string) (info domainI
 		return domainInfo{}, nil, false, nil
 	}
 	if err := json.Unmarshal(raw, &info); err != nil {
-		return domainInfo{}, nil, false, fmt.Errorf("domain: domain_info: разбор json: %w", err)
+		return domainInfo{}, nil, false, fmt.Errorf("domain: domain_info: json parsing: %w", err)
 	}
 	return info, raw, true, nil
 }
@@ -249,7 +251,7 @@ func zoneSuffixCandidates(name string) []string {
 // candidate — for the "which zone is missing" message) and found.
 func fetchCatalogZone(ctx context.Context, pool db.DB, name string) (best string, found bool, err error) {
 	if pool == nil {
-		return "", false, errors.New("domain: зоны: пул не задан")
+		return "", false, errors.New("domain: zones: pool not set")
 	}
 	cands := zoneSuffixCandidates(name)
 	if len(cands) == 0 {
@@ -257,7 +259,7 @@ func fetchCatalogZone(ctx context.Context, pool db.DB, name string) (best string
 	}
 	rows, err := pool.Query(ctx, zoneLongestSQL, cands)
 	if err != nil {
-		return "", false, fmt.Errorf("domain: зоны: %w", err)
+		return "", false, fmt.Errorf("domain: zones: %w", err)
 	}
 	defer rows.Close()
 	var zone []byte
@@ -266,10 +268,10 @@ func fetchCatalogZone(ctx context.Context, pool db.DB, name string) (best string
 		return cands[0], false, rows.Err()
 	}
 	if err := rows.Scan(&zone); err != nil {
-		return "", false, fmt.Errorf("domain: зоны: чтение: %w", err)
+		return "", false, fmt.Errorf("domain: zones: reading: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return "", false, fmt.Errorf("domain: зоны: %w", err)
+		return "", false, fmt.Errorf("domain: zones: %w", err)
 	}
 	if zone == nil {
 		return cands[0], false, nil
@@ -282,7 +284,7 @@ func fetchCatalogZone(ctx context.Context, pool db.DB, name string) (best string
 // subLabel — subdomain label for output: ” — the domain's apex (id 0).
 func subLabel(label string) string {
 	if label == "" {
-		return "(апекс)"
+		return "(apex)"
 	}
 	return label
 }
@@ -369,7 +371,7 @@ func httpErrorName(code int16) string {
 	case 5:
 		return "network"
 	default:
-		return fmt.Sprintf("код %d", code)
+		return fmt.Sprintf("code %d", code)
 	}
 }
 
@@ -405,7 +407,7 @@ func aliasDesc(r domainResult) string {
 func resultFinalDesc(r domainResult) string {
 	desc := r.FinalURL
 	if r.Error != 0 {
-		msg := fmt.Sprintf("ошибка %d (%s)", r.Error, httpErrorName(r.Error))
+		msg := fmt.Sprintf("error %d (%s)", r.Error, httpErrorName(r.Error))
 		if desc != "" {
 			desc += " — " + msg
 		} else {
@@ -423,19 +425,19 @@ func resultFinalDesc(r domainResult) string {
 func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 	d, z := info.Domain, info.Zone
 
-	out(w, "домен:        %s\n", d.Name)
+	out(w, "domain:        %s\n", d.Name)
 	if u := idn.ToUnicode(d.Name); u != d.Name {
 		out(w, "unicode:      %s\n", u)
 	}
 	if z.NameUnicode != "" && z.NameUnicode != z.Name {
-		out(w, "зона:         %s (unicode: %s, id %d)\n", z.Name, z.NameUnicode, z.ID)
+		out(w, "zone:          %s (unicode: %s, id %d)\n", z.Name, z.NameUnicode, z.ID)
 	} else {
-		out(w, "зона:         %s (id %d)\n", z.Name, z.ID)
+		out(w, "zone:          %s (id %d)\n", z.Name, z.ID)
 	}
-	out(w, "статус:       %s\nпроверка:     %s\nпроверен:     %s\n",
+	out(w, "status:        %s\ncheck:         %s\nchecked:       %s\n",
 		orEmDash(d.StatusName), orEmDash(d.CheckStateName), orEmDash(d.LastCheckedAt))
 	if d.QueuedAt != "" {
-		out(w, "в очереди с:  %s\n", formatDomainTS(d.QueuedAt))
+		out(w, "queued since:  %s\n", formatDomainTS(d.QueuedAt))
 	}
 	var flags []string
 	if d.IsIDN {
@@ -445,31 +447,31 @@ func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 		flags = append(flags, "render_pending")
 	}
 	if len(flags) > 0 {
-		out(w, "флаги:        %s\n", strings.Join(flags, ", "))
+		out(w, "flags:         %s\n", strings.Join(flags, ", "))
 	}
 	if d.TempAttempts > 0 {
-		out(w, "temp-попытки: %d\n", d.TempAttempts)
+		out(w, "temp attempts: %d\n", d.TempAttempts)
 	}
 
 	// The dns_mask breakdown — labels from the subdomains reference table (spec 5.11).
 	if len(info.DNSAlive) == 0 {
-		out(w, "\nDNS-живые субдомены (dns_mask = %d): нет\n", d.DNSMask)
+		out(w, "\nDNS-alive subdomains (dns_mask = %d): none\n", d.DNSMask)
 	} else {
 		labels := make([]string, len(info.DNSAlive))
 		for i, s := range info.DNSAlive {
 			labels[i] = subLabel(s.Label)
 		}
-		out(w, "\nDNS-живые субдомены (dns_mask = %d): %s\n", d.DNSMask, strings.Join(labels, ", "))
+		out(w, "\nDNS-alive subdomains (dns_mask = %d): %s\n", d.DNSMask, strings.Join(labels, ", "))
 	}
 
 	// Results by subdomain × variant — a monospace table (the
 	// writeStatusTable style: widths from content, the last column
 	// without padding).
-	out(w, "\nрезультаты по субдоменам и вариантам:\n")
+	out(w, "\nresults by subdomain and variant:\n")
 	if len(info.Results) == 0 {
-		out(w, "  — нет (домен не проверялся или DNS не делегирован)\n")
+		out(w, "  — none (the domain was not checked or the DNS is not delegated)\n")
 	} else {
-		head := []string{"субдомен", "вар.", "схема", "http", "контент", "алиас", "проверен", "итоговый URL / ошибка"}
+		head := []string{"subdomain", "var.", "scheme", "http", "content", "alias", "checked", "final URL / error"}
 		rows := [][]string{head}
 		for _, r := range info.Results {
 			rows = append(rows, []string{
@@ -517,8 +519,8 @@ func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 func writeLaravelText(w io.Writer, l *domainLaravel, minScore float64) {
 	out(w, "\nLaravel:\n")
 	if l == nil {
-		out(w, "  — признаков не найдено (нет записи в laravel_domains;\n"+
-			"    домены только со слабыми срабатываниями ниже порога %s не раскрываются)\n",
+		out(w, "  — no signs found (no row in laravel_domains;\n"+
+			"    domains with only weak firings below the %s threshold are not exposed)\n",
 			scoreFmt(minScore))
 		return
 	}
@@ -527,10 +529,10 @@ func writeLaravelText(w io.Writer, l *domainLaravel, minScore float64) {
 	for i, s := range l.FoundOn {
 		labels[i] = subLabel(s.Label)
 	}
-	out(w, "  score:       %s (порог %s)\n", scoreFmt(l.Score), scoreFmt(minScore))
-	out(w, "  версии:      %s\n", verRange(l.VerMin, l.VerMax))
-	out(w, "  субдомены:   %s\n", orEmDash(strings.Join(labels, ", ")))
-	out(w, "  правила:     версия %d, обновлено %s\n", l.RulesVersion, orEmDash(formatDomainTS(l.UpdatedAt)))
+	out(w, "  score:       %s (threshold %s)\n", scoreFmt(l.Score), scoreFmt(minScore))
+	out(w, "  versions:    %s\n", verRange(l.VerMin, l.VerMax))
+	out(w, "  subdomains:  %s\n", orEmDash(strings.Join(labels, ", ")))
+	out(w, "  rules:       version %d, updated %s\n", l.RulesVersion, orEmDash(formatDomainTS(l.UpdatedAt)))
 
 	var weak, strong []domainFinding
 	for _, f := range l.Findings {
@@ -541,13 +543,13 @@ func writeLaravelText(w io.Writer, l *domainLaravel, minScore float64) {
 		}
 	}
 	if len(strong) > 0 {
-		out(w, "  срабатывания (is_laravel = true):\n")
+		out(w, "  firings (is_laravel = true):\n")
 		for _, f := range strong {
 			writeFindingText(w, f)
 		}
 	}
 	if len(weak) > 0 {
-		out(w, "  слабые срабатывания (is_laravel = false, score < %s):\n", scoreFmt(minScore))
+		out(w, "  weak firings (is_laravel = false, score < %s):\n", scoreFmt(minScore))
 		for _, f := range weak {
 			writeFindingText(w, f)
 		}
@@ -559,12 +561,12 @@ func writeLaravelText(w io.Writer, l *domainLaravel, minScore float64) {
 func writeFindingText(w io.Writer, f domainFinding) {
 	ver := verRange(f.VerMin, f.VerMax)
 	if ver != "—" {
-		out(w, "    %s %s  score %s, версии %s:\n", subLabel(f.Subdomain), model.Variant(f.Variant), scoreFmt(f.Score), ver)
+		out(w, "    %s %s  score %s, versions %s:\n", subLabel(f.Subdomain), model.Variant(f.Variant), scoreFmt(f.Score), ver)
 	} else {
 		out(w, "    %s %s  score %s:\n", subLabel(f.Subdomain), model.Variant(f.Variant), scoreFmt(f.Score))
 	}
 	for _, s := range f.Signals {
-		out(w, "      %s (+%s): «%s»\n", s.Rule, scoreFmt(s.Weight), s.Evidence)
+		out(w, "      %s (+%s): \"%s\"\n", s.Rule, scoreFmt(s.Weight), s.Evidence)
 	}
 }
 
@@ -587,7 +589,7 @@ func writeDomainJSON(w io.Writer, raw []byte) error {
 	}
 	buf.WriteByte('\n')
 	if _, err := w.Write(buf.Bytes()); err != nil {
-		return fmt.Errorf("domain: вывод json: %w", err)
+		return fmt.Errorf("domain: json output: %w", err)
 	}
 	return nil
 }
@@ -604,7 +606,7 @@ func writeDomainNotFoundJSON(w io.Writer, name, zone string, zoneFound bool) err
 		Zone      string `json:"zone"`
 		ZoneFound bool   `json:"zone_found"`
 	}{false, name, zone, zoneFound}); err != nil {
-		return fmt.Errorf("domain: вывод json: %w", err)
+		return fmt.Errorf("domain: json output: %w", err)
 	}
 	return nil
 }
@@ -649,29 +651,29 @@ func selectContentResult(results []domainResult) (domainResult, bool) {
 func writeDomainContent(ctx context.Context, store domainContentStore, info domainInfo, minScore float64, stdout, stderr io.Writer) error {
 	sel, ok := selectContentResult(info.Results)
 	if !ok {
-		return errors.New("domain: у домена нет сохранённого контента (content_hash пуст во всех результатах — проверка не дошла до загрузки тел)")
+		return errors.New("domain: the domain has no stored content (content_hash is empty in all the results — the check never got to body fetching)")
 	}
 	rawHash, err := hex.DecodeString(sel.ContentHash)
 	if err != nil || len(rawHash) != content.HashLen {
-		return fmt.Errorf("domain: некорректный content_hash %q в результате (субдомен %s, вариант %s)",
+		return fmt.Errorf("domain: invalid content_hash %q in a result (subdomain %s, variant %s)",
 			sel.ContentHash, subLabel(sel.Subdomain), model.Variant(sel.Variant))
 	}
 	var hash content.Hash
 	copy(hash[:], rawHash)
 	data, err := store.Get(ctx, hash)
 	if err != nil {
-		return fmt.Errorf("domain: контент %s: %w", sel.ContentHash, err)
+		return fmt.Errorf("domain: content %s: %w", sel.ContentHash, err)
 	}
 
 	kind := "HTML"
 	if sel.Rendered {
-		kind = "DOM (рендер)"
+		kind = "DOM (render)"
 	}
 	writeDomainText(stderr, info, minScore)
-	out(stderr, "\nконтент (--content): субдомен %s, вариант %s, %s, %d байт, хэш %s\n",
+	out(stderr, "\ncontent (--content): subdomain %s, variant %s, %s, %d bytes, hash %s\n",
 		subLabel(sel.Subdomain), model.Variant(sel.Variant), kind, len(data), sel.ContentHash)
 	if _, err := stdout.Write(data); err != nil {
-		return fmt.Errorf("domain: вывод контента: %w", err)
+		return fmt.Errorf("domain: content output: %w", err)
 	}
 	return nil
 }
@@ -682,23 +684,23 @@ func writeDomainContent(ctx context.Context, store domainContentStore, info doma
 // domain_info query, output (--json / --content / human-readable).
 func cmdDomain(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("domain")
-	asJSON := fs.Bool("json", false, "машинный вывод: ответ domain_info как есть (pretty-print)")
-	withContent := fs.Bool("content", false, "вывести сохранённый контент записи (байты DOM/HTML) вместо сводки")
+	asJSON := fs.Bool("json", false, "machine output: the domain_info response as-is (pretty-print)")
+	withContent := fs.Bool("content", false, "print the stored record content (DOM/HTML bytes) instead of the summary")
 	if handled, err := parseFlags(fs, domainHelp, args, stdout); handled {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return usagef("укажите имя домена: crawlerctl domain example.crawl.test")
+		return usagef("specify a domain name: crawlerctl domain example.crawl.test")
 	}
 	if *asJSON && *withContent {
-		return usagef("domain: флаги --json и --content несовместимы (машинный вывод не смешивается с байтами контента)")
+		return usagef("domain: the --json and --content flags are incompatible (machine output is not mixed with content bytes)")
 	}
 	// Operator input normalization — Normalize from internal/idn: the same
 	// pipeline as for incoming rows (spec 5.2). Before the configuration:
 	// a bad name is code 2 without touching the stack.
 	res, err := idn.Normalize(fs.Arg(0))
 	if err != nil {
-		return usagef("некорректное имя домена %q: %v", fs.Arg(0), err)
+		return usagef("invalid domain name %q: %v", fs.Arg(0), err)
 	}
 
 	// Configuration — a single YAML + environment (internal/config): the
@@ -775,7 +777,7 @@ func domainNotFound(ctx context.Context, pool db.DB, name string, asJSON bool, s
 	}
 	if zoneFound {
 		label := strings.TrimSuffix(name, "."+zone)
-		return fmt.Errorf("domain: домен %s не найден: в зоне %s нет домена с меткой %s (домен не загружен ingest-ом, либо зона имени — другая: зона отделяется по последней метке имени (TLD) и справочнику zones, ТЗТ tld-only-zones §4)", name, zone, label)
+		return fmt.Errorf("domain: domain %s not found: the zone %s has no domain with the label %s (the domain was not ingested, or the name's zone is a different one: the zone is split by the name's last label (TLD) and the zones catalog, the tld-only-zones spec §4)", name, zone, label)
 	}
-	return fmt.Errorf("domain: домен %s не найден: зона %s отсутствует в справочнике zones (зоны создаёт ingest при первом файле)", name, zone)
+	return fmt.Errorf("domain: domain %s not found: the zone %s is missing from the zones catalog (ingest creates zones on the first file)", name, zone)
 }

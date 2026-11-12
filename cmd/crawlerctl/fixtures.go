@@ -134,122 +134,128 @@ import (
 
 // fixturesHelp — help text for crawlerctl fixtures [--help]; it is also
 // printed for fixtures <action> --help.
-const fixturesHelp = `crawlerctl fixtures — фикстуры стенда сравнения движков рендера (T-242/T-243/T-244)
+const fixturesHelp = `crawlerctl fixtures — the render engine comparison bench fixtures (T-242/T-243/T-244)
 
-Использование:
-  crawlerctl fixtures export --out КАТАЛОГ [--ok N] [--failed N]
+Usage:
+  crawlerctl fixtures export --out DIR [--ok N] [--failed N]
                               [--heavy N] [--smoke N] [--weeks N]
                               [--seed N]
-  crawlerctl fixtures import --dir КАТАЛОГ [--force] [--publish all|smoke]
-  crawlerctl fixtures snapshot --dir КАТАЛОГ --label ИМЯ --engine ИМЯ
-                               [--metrics URL] [--engine-rss-max БАЙТ]
-                               [--engine-crashes N] [--out ФАЙЛ] [--no-dom]
-  crawlerctl fixtures report --baseline ФАЙЛ --candidate ФАЙЛ
-                               [--out ФАЙЛ] [--memory-budget БАЙТ]
+  crawlerctl fixtures import --dir DIR [--force] [--publish all|smoke]
+  crawlerctl fixtures snapshot --dir DIR --label NAME --engine NAME
+                               [--metrics URL] [--engine-rss-max BYTES]
+                               [--engine-crashes N] [--out FILE] [--no-dom]
+  crawlerctl fixtures report --baseline FILE --candidate FILE
+                               [--out FILE] [--memory-budget BYTES]
                                [--fail-exit]
 
-Выгрузка фикстуры доменов с БД (ТЗ рендера §6.1 п. 1–2): выборка строк
-subdomain_results — реальных задач q:render (final_url после SPA-вердикта
-T-057) — стратами ok (~2000 случайных успешных у chromium) / failed
-(~500 проблемных последних недель: финализации без рендера по маркеру
-render_failed_at T-210 — тарпиты/класс задачи T-172, включая движко-
-независимые cert/DNS: класс в строке не хранится, их доля видна на стенде
-по причинам финализаций) / heavy (~500 SPA-тяжёлых — самый крупный
-контент), пропорционально долям зон. Плюс smoke-подвыборка доменов (~300)
-для сокращённых прогонов смены версий движков. Контент-хранилище не
-выгружается (DOM пишет рендер стенда).
+Exporting a domain fixture from the DB (the render spec §6.1 items 1–2):
+a selection of subdomain_results rows — real q:render tasks (final_url
+after the SPA verdict T-057) — by the strata ok (~2000 random successful
+at chromium) / failed (~500 problematic of the recent weeks: finalizations
+without a render by the render_failed_at marker T-210 — tarpits/task class
+T-172, including the engine-independent cert/DNS: the class is not stored
+in the row, their share is visible on the bench via the finalization
+reasons) / heavy (~500 SPA-heavy — the largest content), proportional to
+the zone shares. Plus a smoke subsample of domains (~300) for the shortened
+runs of engine version changes. The content store is not exported (the DOM
+is written by the bench render).
 
-  --out КАТАЛОГ  каталог дампа (обязателен); создаётся, существующие
-                 файлы дампа перезаписываются
-  --ok N         квота успешных (по умолчанию 2000)
-  --failed N     квота проблемных (по умолчанию 500)
-  --heavy N      квота SPA-тяжёлых (по умолчанию 500)
-  --smoke N      число smoke-доменов (по умолчанию 300)
-  --weeks N      окно свежести проблемных, недели (по умолчанию 4)
-  --seed N       seed детерминированной выборки (по умолчанию 242):
-                 тот же seed и те же данные — те же строки дампа
+  --out DIR      the dump directory (required); created, the existing dump
+                 files are overwritten
+  --ok N         the ok quota (the default 2000)
+  --failed N     the failed quota (the default 500)
+  --heavy N      the SPA-heavy quota (the default 500)
+  --smoke N      the number of smoke domains (the default 300)
+  --weeks N      the failed freshness window, weeks (the default 4)
+  --seed N       the deterministic selection seed (the default 242):
+                 the same seed and the same data — the same dump rows
 
-import — идемпотентный накат дампа формата v1 в тестовую БД (§6.1 п. 3)
-и публикация задач фикстуры прямо в q:render (§6.1 п. 4) — рендер-этап
-тестируется изолированно, без DNS/HTTP. Накат — запись без отката
-(перезаписывает зоны/домены/строки результатов по PK и выметает
-contents): без --force — dry-run, печатаются цель (user@host:port/dbname
-из DSN, без пароля — сверьте, что это стенд, а не прод) и полный план
-(строки по таблицам вставка/обновление, дубли ключей, выметаемый
-контент) без единой записи; --force — накат, цель и план печатаются
-перед первой записью. Накат идёт по первичным ключам
-из ключей дампа (повторный накат не дублирует, а восстанавливает
-состояние дампа — прогоны сравниваются на одном старте); зоны входят
-мимо identity (OVERRIDING SYSTEM VALUE), последовательности zones.id и
-domain_id_seq выставляются выше максимума; контентные ссылки дампа
-сбрасываются (contents не выгружался — DOM пишет сам стенд). БД должна
-быть чистой (миграции дев-стека без данных): зона/домен с тем же
-именем, но другим id — конфликт, накат останавливается до записи.
+import — an idempotent import of a format v1 dump into a test DB (§6.1
+item 3) and publishing of the fixture tasks straight into q:render (§6.1
+item 4) — the render stage is tested in isolation, without DNS/HTTP. The
+import is a write without a rollback (overwrites the zones/domains/result
+rows by PK and sweeps the contents): without --force — a dry-run, the
+target (user@host:port/dbname from the DSN, no password — verify it is
+the bench, not production) and the full plan (rows per table
+insert/update, key duplicates, the swept content) are printed without a
+single write; --force — the import, the target and the plan are printed
+before the first write. The import goes over the primary keys from the
+dump keys (a repeated import does not duplicate but restores the dump
+state — the runs are compared from the same start); the zones enter past
+the identity (OVERRIDING SYSTEM VALUE), the zones.id and domain_id_seq
+sequences are set above the maximum; the dump's content links are reset
+(contents was not exported — the DOM is written by the bench itself). The
+DB must be clean (the dev-stack migrations without data): a zone/domain
+with the same name but a different id — a conflict, the import stops
+before writing.
 
-  --dir КАТАЛОГ   каталог дампа (обязателен; формат v1 — export)
-  --force         выполнение наката (без флага — dry-run: цель и план
-                  без записи; сверяйте цель — инструмент тестовой БД)
-  --publish РЕЖИМ публикация задач фикстуры в q:render (только с
-                  --force): all — все записи
-                  дампа, smoke — домены smoke-подвыборки. Публикация
-                  идёт в Redis конфигурации (redis.addr) — воркер стенда
-                  должен читать тот же инстанс. Повторный запуск с
-                  --publish добавляет записи
-                  заново: между прогонами очищайте q:render (инструкция —
+  --dir DIR       the dump directory (required; the format v1 — export)
+  --force         perform the import (without the flag — dry-run: the target
+                  and the plan without writes; verify the target — a test-DB
+                  tool)
+  --publish MODE  publishing the fixture tasks into q:render (only with
+                  --force): all — all the dump rows,
+                  smoke — the smoke subsample domains. The publishing goes
+                  into the configuration's Redis (redis.addr) — the bench
+                  worker must read the same instance. A repeated run with
+                  --publish adds the rows
+                  again: clear q:render between runs (the instructions —
                   docs/dev-environment.md)
 
-Дампа не хватает строк страты (мало данных) — берутся все доступные,
-деградация отмечается в выводе и manifest.json. Формат дампа v1 —
-контракт export→import, подробно: doc-комментарии cmd/crawlerctl/
-fixtures.go и fixtures_import.go.
+The dump has fewer stratum rows than the quota (little data) — all the
+available ones are taken, the degradation is noted in the output and
+manifest.json. The dump format v1 — the export→import contract, in detail:
+the doc comments of cmd/crawlerctl/fixtures.go and fixtures_import.go.
 
-snapshot — фиксация результатов одного прогона (§6.1 п. 5) в JSON-снимок
-вход отчёта: строки фикстуры из тестовой БД (успешные рендеры, длина/
-хэш/узлы/скрипты DOM, вердикты анализатора), границы q:analyze из Redis
-(темп) и — с --metrics — счётчики этапа render-worker (причины
-финализаций, время страницы). Снимается ПОСЛЕ прогона (пустая q:render,
-фолбэк доработан) и ДО повторного import (накат сбрасывает строки и
-выметает контент — по БД задним числом прогон не прочесть). Между
-прогонами перезапускайте render-worker: счётчики /metrics тогда равны
-ровно прогону (иначе отчёт пометит их накопительными и деградирует
-завязанные вердикты).
+snapshot — capturing one run's results (§6.1 item 5) into a JSON snapshot,
+the report's input: the fixture rows from the test DB (successful renders,
+the DOM length/hash/nodes/scripts, the analyzer verdicts), the q:analyze
+boundaries from Redis (the pace) and — with --metrics — the render-worker
+stage counters (the finalization reasons, the page time). Taken AFTER the
+run (an empty q:render, the fallback drained) and BEFORE the repeated
+import (the import resets the rows and sweeps the content — the run cannot
+be read back from the DB). Between runs restart the render-worker: the
+/metrics counters then equal exactly the run (otherwise the report marks
+them cumulative and degrades the tied verdicts).
 
-  --dir КАТАЛОГ        каталог дампа фикстуры (ключи прогона; обязателен)
-  --label ИМЯ          метка прогона (обязательна; файл —
+  --dir DIR            the fixture dump directory (the run's keys; required)
+  --label NAME         the run label (required; the file is
                        <dir>/<label>.snapshot.json)
-  --engine ИМЯ         движок прогона: chromium|moli|lightpanda (обязателен)
-  --metrics URL        URL /metrics render-worker стенда (пусто — без
-                       метрик этапа; например http://render-worker:9105/metrics)
-  --engine-rss-max N   макс. RSS контейнера движка за прогон, байты
-                       (периодический docker stats --no-stream во время
-                       прогона; 0 — не задан: в dev-стеке экспортёра
-                       памяти движков нет, отчёт без него деградирует
-                       по порогу памяти)
-  --engine-crashes N   падения ядра движка за прогон (>= 0 — задано)
-  --no-dom             не читать DOM хранилища (без узлов/скриптов)
+  --engine NAME        the run engine: chromium|moli|lightpanda (required)
+  --metrics URL        the bench render-worker's /metrics URL (empty — no
+                       stage metrics; e.g. http://render-worker:9105/metrics)
+  --engine-rss-max N   the engine container's max RSS over the run, bytes
+                       (a periodic docker stats --no-stream during the run;
+                       0 — not set: the dev stack has no engine memory
+                       exporter, the report without it degrades the memory
+                       threshold)
+  --engine-crashes N   engine core crashes over the run (>= 0 — set)
+  --no-dom             do not read the store DOM (no nodes/scripts)
 
-report — сравнение снапшотов по метрикам ТЗ §5.1 п. 3 (успешность,
-причины финализаций, темп ср./p95, память, диф детекции Laravel против
-baseline-chromium по протоколу T-213, структурные метрики DOM —
-нормализованное сравнение, побайтовый диф не применяется) с явными
-строками вердикта против порогов §5.1 п. 4 (детекция <1%, успешность,
-темп, память <⅓ бюджета chromium, 0 crashes). Отсутствующий источник —
-строка «НЕТ ДАННЫХ», отчёт не выдумывает значения.
+report — a snapshot comparison over the spec §5.1 item 3 metrics (success,
+the finalization reasons, the avg/p95 pace, memory, the Laravel detection
+diff against baseline-chromium per the T-213 protocol, the structural DOM
+metrics — a normalized comparison, no byte-level diff is applied) with
+explicit verdict rows against the §5.1 item 4 thresholds (detection <1%,
+success, pace, memory <⅓ of the chromium budget, 0 crashes). A missing
+source — a "NO DATA" row, the report invents no values.
 
-  --baseline ФАЙЛ    снапшот baseline-chromium (обязателен)
-  --candidate ФАЙЛ   снапшот движка-кандидата (обязателен)
-  --out ФАЙЛ         записать отчёт файлом (для протокола T-247)
-  --memory-budget N  бюджет памяти chromium для порога ⅓ (по умолчанию
-                     2 GiB — прод-бюджет рендер-контура, ТЗ 3.2)
-  --fail-exit        код 1 при любом вердикте НЕ ПРОЙДЕН (для скриптов)
+  --baseline FILE    the baseline-chromium snapshot (required)
+  --candidate FILE   the candidate engine's snapshot (required)
+  --out FILE         write the report to a file (for the T-247 protocol)
+  --memory-budget N  the chromium memory budget for the ⅓ threshold (the
+                     default 2 GiB — the render circuit's production budget,
+                     spec 3.2)
+  --fail-exit        exit code 1 on any FAILED verdict (for scripts)
 
-Подключение к БД — как у остальных команд: postgres.dsn конфигурации
-(CRAWLER_POSTGRES_DSN / APP_PG_DSN). export читает БД без записи;
-import пишет в тестовую БД и (с --publish) в Redis; snapshot читает БД,
-Redis (redis.addr) и хранилище контента (content.dir) без записи;
-report работает по файлам снапшотов без инфраструктуры.
+The DB connection — as with the other commands: the configuration's
+postgres.dsn (CRAWLER_POSTGRES_DSN / APP_PG_DSN). export reads the DB
+without writes; import writes into a test DB and (with --publish) into
+Redis; snapshot reads the DB, Redis (redis.addr) and the content store
+(content.dir) without writes; report works over the snapshot files without
+infrastructure.
 
-Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
+Exit codes: 0 — success, 1 — error, 2 — usage.
 `
 
 // Quota defaults — the spec §6.1 item 1 plan (3000 rows: ~2000/500/500)
@@ -564,7 +570,7 @@ func fixturesAllocateQuotas(counts map[int16]int64, total int) map[int16]int {
 func fixturesZoneCounts(ctx context.Context, pool db.DB, sql string, args ...any) (map[int16]int64, error) {
 	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("подсчёт страты по зонам: %w", err)
+		return nil, fmt.Errorf("stratum count by zones: %w", err)
 	}
 	defer rows.Close()
 	counts := make(map[int16]int64)
@@ -572,12 +578,12 @@ func fixturesZoneCounts(ctx context.Context, pool db.DB, sql string, args ...any
 		var zone int16
 		var n int64
 		if err := rows.Scan(&zone, &n); err != nil {
-			return nil, fmt.Errorf("подсчёт страты по зонам: чтение: %w", err)
+			return nil, fmt.Errorf("stratum count by zones: reading: %w", err)
 		}
 		counts[zone] = n
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("подсчёт страты по зонам: %w", err)
+		return nil, fmt.Errorf("stratum count by zones: %w", err)
 	}
 	return counts, nil
 }
@@ -592,12 +598,12 @@ func fixturesScanResults(rows pgx.Rows) ([]fixturesResult, error) {
 			&r.Scheme, &r.HTTPStatus, &r.FinalURL, &r.AliasKind, &r.AliasSubdomainID,
 			&r.Headers, &r.Cookies, &r.Rendered, &r.ContentHash, &r.Error,
 			&r.ResponseMs, &r.CheckedAt, &r.RulesVersion, &r.RenderFailedAt); err != nil {
-			return nil, fmt.Errorf("чтение строк страты: %w", err)
+			return nil, fmt.Errorf("stratum row reading: %w", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("чтение строк страты: %w", err)
+		return nil, fmt.Errorf("stratum row reading: %w", err)
 	}
 	return out, nil
 }
@@ -624,12 +630,12 @@ func fixturesPickHeavy(ctx context.Context, pool db.DB, quotas map[int16]int, se
 	for _, z := range fixturesSortedZones(quotas) {
 		rows, err := pool.Query(ctx, fixturesSelectHeavySQL, z, seed, int64(quotas[z]))
 		if err != nil {
-			return nil, fmt.Errorf("выборка heavy (зона %d): %w", z, err)
+			return nil, fmt.Errorf("heavy selection (zone %d): %w", z, err)
 		}
 		part, err := fixturesScanResults(rows)
 		rows.Close()
 		if err != nil {
-			return nil, fmt.Errorf("выборка heavy (зона %d): %w", z, err)
+			return nil, fmt.Errorf("heavy selection (zone %d): %w", z, err)
 		}
 		out = append(out, part...)
 	}
@@ -646,12 +652,12 @@ func fixturesPickOk(ctx context.Context, pool db.DB, quotas map[int16]int, seed 
 		rows, err := pool.Query(ctx, fixturesSelectOkSQL,
 			z, hz, hd, hs, hv, seed, int64(quotas[z]))
 		if err != nil {
-			return nil, fmt.Errorf("выборка ok (зона %d): %w", z, err)
+			return nil, fmt.Errorf("ok selection (zone %d): %w", z, err)
 		}
 		part, err := fixturesScanResults(rows)
 		rows.Close()
 		if err != nil {
-			return nil, fmt.Errorf("выборка ok (зона %d): %w", z, err)
+			return nil, fmt.Errorf("ok selection (zone %d): %w", z, err)
 		}
 		out = append(out, part...)
 	}
@@ -665,12 +671,12 @@ func fixturesPickFailed(ctx context.Context, pool db.DB, quotas map[int16]int, s
 	for _, z := range fixturesSortedZones(quotas) {
 		rows, err := pool.Query(ctx, fixturesSelectFailedSQL, z, weeks, seed, int64(quotas[z]))
 		if err != nil {
-			return nil, fmt.Errorf("выборка failed (зона %d): %w", z, err)
+			return nil, fmt.Errorf("failed selection (zone %d): %w", z, err)
 		}
 		part, err := fixturesScanResults(rows)
 		rows.Close()
 		if err != nil {
-			return nil, fmt.Errorf("выборка failed (зона %d): %w", z, err)
+			return nil, fmt.Errorf("failed selection (zone %d): %w", z, err)
 		}
 		out = append(out, part...)
 	}
@@ -697,19 +703,19 @@ func fixturesFetchDomains(ctx context.Context, pool db.DB, rows []fixturesResult
 	out := []fixturesDomain{} // not nil: an empty selection = an empty file, not an absence
 	rrows, err := pool.Query(ctx, fixturesDomainsSQL, zones, domains)
 	if err != nil {
-		return nil, fmt.Errorf("выборка доменов фикстуры: %w", err)
+		return nil, fmt.Errorf("fixture domain selection: %w", err)
 	}
 	defer rrows.Close()
 	for rrows.Next() {
 		var d fixturesDomain
 		if err := rrows.Scan(&d.ZoneID, &d.ID, &d.Label, &d.Status, &d.CheckState,
 			&d.Flags, &d.DNSMask, &d.QueuedAt, &d.LastCheckedAt, &d.TempAttempts); err != nil {
-			return nil, fmt.Errorf("выборка доменов фикстуры: чтение: %w", err)
+			return nil, fmt.Errorf("fixture domain selection: reading: %w", err)
 		}
 		out = append(out, d)
 	}
 	if err := rrows.Err(); err != nil {
-		return nil, fmt.Errorf("выборка доменов фикстуры: %w", err)
+		return nil, fmt.Errorf("fixture domain selection: %w", err)
 	}
 	return out, nil
 }
@@ -727,19 +733,19 @@ func fixturesFetchZones(ctx context.Context, pool db.DB, domains []fixturesDomai
 	out := []fixturesZone{}
 	rows, err := pool.Query(ctx, fixturesZonesSQL, ids)
 	if err != nil {
-		return nil, fmt.Errorf("выборка зон фикстуры: %w", err)
+		return nil, fmt.Errorf("fixture zone selection: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var z fixturesZone
 		if err := rows.Scan(&z.ID, &z.Name, &z.NameUnicode, &z.IsActive,
 			&z.DomainsTotal, &z.DomainsChecked, &z.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("выборка зон фикстуры: чтение: %w", err)
+			return nil, fmt.Errorf("fixture zone selection: reading: %w", err)
 		}
 		out = append(out, z)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("выборка зон фикстуры: %w", err)
+		return nil, fmt.Errorf("fixture zone selection: %w", err)
 	}
 	return out, nil
 }
@@ -822,7 +828,7 @@ func fixturesEncodeAll[T any](w io.Writer, rows []T) error {
 	enc.SetEscapeHTML(false)
 	for i := range rows {
 		if err := enc.Encode(&rows[i]); err != nil {
-			return fmt.Errorf("строка %d: %w", i+1, err)
+			return fmt.Errorf("line %d: %w", i+1, err)
 		}
 	}
 	return nil
@@ -849,15 +855,15 @@ func fixturesWriteFile(dir, name string, write func(*bufio.Writer) error) error 
 	if err := w.Flush(); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
-		return fmt.Errorf("%s: запись: %w", tmp, err)
+		return fmt.Errorf("%s: writing: %w", tmp, err)
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("%s: закрытие: %w", tmp, err)
+		return fmt.Errorf("%s: closing: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, full); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("%s: переименование: %w", full, err)
+		return fmt.Errorf("%s: renaming: %w", full, err)
 	}
 	return nil
 }
@@ -983,13 +989,13 @@ func fixturesExportRun(ctx context.Context, pool db.DB, p fixturesParams, stdout
 		// Duplicates outside the T-210 invariants: they did not enter the
 		// dump, the operator sees the fact (the source data needs
 		// analysis).
-		out(stdout, "дубли ключей между стратами (пропущены): %d\n", collect.dups)
+		out(stdout, "duplicate keys across the strata (skipped): %d\n", collect.dups)
 	}
 
 	// The dump directory is private (0700): the files carry episode
 	// cookies/headers.
 	if err := os.MkdirAll(p.OutDir, 0o700); err != nil {
-		return nil, fmt.Errorf("каталог дампа %s: %w", p.OutDir, err)
+		return nil, fmt.Errorf("the dump directory %s: %w", p.OutDir, err)
 	}
 	// The previous manifest.json goes before the first data file is
 	// written: a re-export failing midway does NOT leave the old manifest
@@ -998,7 +1004,7 @@ func fixturesExportRun(ctx context.Context, pool db.DB, p fixturesParams, stdout
 	// review T-242 P1). Until that point a failure (DB queries) does not
 	// touch the old complete dump.
 	if err := os.Remove(filepath.Join(p.OutDir, "manifest.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("удаление прежнего манифеста: %w", err)
+		return nil, fmt.Errorf("removing the previous manifest: %w", err)
 	}
 	// Order: manifest.json last — its presence means a completed dump.
 	manifest.Files["zones.ndjson"] = len(zones)
@@ -1027,12 +1033,12 @@ func fixturesExportRun(ctx context.Context, pool db.DB, p fixturesParams, stdout
 	}
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
-		return nil, fmt.Errorf("манифест: %w", err)
+		return nil, fmt.Errorf("manifest: %w", err)
 	}
 	manifestJSON = append(manifestJSON, '\n')
 	if err := fixturesWriteFile(p.OutDir, "manifest.json", func(w *bufio.Writer) error {
 		if _, err := w.Write(manifestJSON); err != nil {
-			return fmt.Errorf("манифест: запись: %w", err)
+			return fmt.Errorf("manifest: writing: %w", err)
 		}
 		return nil
 	}); err != nil {
@@ -1044,21 +1050,21 @@ func fixturesExportRun(ctx context.Context, pool db.DB, p fixturesParams, stdout
 		s := manifest.Strata[name]
 		note := ""
 		if s.Degraded {
-			note = " — деградация: данных меньше квоты"
+			note = " — degradation: less data than the quota"
 		}
-		out(stdout, "страта %s: квота %d, доступно %d, взято %d%s\n",
+		out(stdout, "stratum %s: quota %d, available %d, taken %d%s\n",
 			name, s.Quota, s.Available, s.Taken, note)
 	}
 	if p.Smoke > 0 && len(smoke) < p.Smoke {
-		out(stdout, "smoke: доменов в выборке %d из %d — деградация: уникальных доменов меньше\n", len(smoke), p.Smoke)
+		out(stdout, "smoke: domains in the selection %d of %d — degradation: fewer unique domains\n", len(smoke), p.Smoke)
 	} else {
-		out(stdout, "smoke: доменов %d\n", len(smoke))
+		out(stdout, "smoke: domains %d\n", len(smoke))
 	}
 	for _, name := range []string{"zones.ndjson", "domains.ndjson", "subdomain_results.ndjson", "smoke.ndjson"} {
-		out(stdout, "  %s: %d строк\n", name, manifest.Files[name])
+		out(stdout, "  %s: %d rows\n", name, manifest.Files[name])
 	}
 	out(stdout, "  manifest.json: ok\n")
-	out(stdout, "дамп записан: %s (формат v1, накат — T-243)\n", p.OutDir)
+	out(stdout, "dump written: %s (format v1, import — T-243)\n", p.OutDir)
 	return manifest, nil
 }
 
@@ -1069,7 +1075,7 @@ func fixturesExportRun(ctx context.Context, pool db.DB, p fixturesParams, stdout
 // fixtures_snapshot.go / fixtures_report.go).
 func cmdFixtures(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usagef("укажите действие: crawlerctl fixtures export|import|snapshot|report")
+		return usagef("specify an action: crawlerctl fixtures export|import|snapshot|report")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
@@ -1085,7 +1091,7 @@ func cmdFixtures(args []string, stdout, stderr io.Writer) error {
 		out(stdout, "%s", fixturesHelp)
 		return flag.ErrHelp
 	default:
-		return usagef("неизвестное действие %q (допустимы: export, import, snapshot, report)", action)
+		return usagef("unknown action %q (valid: export, import, snapshot, report)", action)
 	}
 }
 
@@ -1097,32 +1103,32 @@ func cmdFixtures(args []string, stdout, stderr io.Writer) error {
 // (.tmp + rename), rerunning the command overwrites the dump.
 func fixturesExportCmd(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("fixtures export")
-	outDir := fs.String("out", "", "каталог дампа (обязателен)")
-	okN := fs.Int("ok", fixturesDefaultOK, "квота успешных (rendered)")
-	failedN := fs.Int("failed", fixturesDefaultFailed, "квота проблемных (render_failed_at)")
-	heavyN := fs.Int("heavy", fixturesDefaultHeavy, "квота SPA-тяжёлых (крупный контент)")
-	smokeN := fs.Int("smoke", fixturesDefaultSmoke, "число smoke-доменов")
-	weeks := fs.Int("weeks", fixturesDefaultWeeks, "окно свежести проблемных, недели")
-	seed := fs.Int64("seed", fixturesDefaultSeed, "seed детерминированной выборки")
+	outDir := fs.String("out", "", "the dump directory (required)")
+	okN := fs.Int("ok", fixturesDefaultOK, "the ok quota (rendered)")
+	failedN := fs.Int("failed", fixturesDefaultFailed, "the failed quota (render_failed_at)")
+	heavyN := fs.Int("heavy", fixturesDefaultHeavy, "the SPA-heavy quota (large content)")
+	smokeN := fs.Int("smoke", fixturesDefaultSmoke, "the number of smoke domains")
+	weeks := fs.Int("weeks", fixturesDefaultWeeks, "the failed freshness window, weeks")
+	seed := fs.Int64("seed", fixturesDefaultSeed, "the deterministic selection seed")
 	if handled, err := parseFlags(fs, fixturesHelp, args, stdout); handled {
 		return err
 	}
 	if strings.TrimSpace(*outDir) == "" {
-		return usagef("укажите каталог дампа: crawlerctl fixtures export --out /path/to/fixtures")
+		return usagef("specify the dump directory: crawlerctl fixtures export --out /path/to/fixtures")
 	}
 	if fs.NArg() > 0 {
-		return usagef("fixtures export: лишние аргументы %v (команда принимает только флаги)", fs.Args())
+		return usagef("fixtures export: extra arguments %v (the command takes only flags)", fs.Args())
 	}
 	for name, v := range map[string]int{"--ok": *okN, "--failed": *failedN, "--heavy": *heavyN, "--smoke": *smokeN} {
 		if v < 0 {
-			return usagef("fixtures export: %s: отрицательное значение %d", name, v)
+			return usagef("fixtures export: %s: negative value %d", name, v)
 		}
 	}
 	if *okN+*failedN+*heavyN == 0 {
-		return usagef("fixtures export: сумма квот страт нулевая (--ok/--failed/--heavy)")
+		return usagef("fixtures export: the stratum quota sum is zero (--ok/--failed/--heavy)")
 	}
 	if *weeks < 1 {
-		return usagef("fixtures export: --weeks: окно свежести не меньше 1 недели (получено %d)", *weeks)
+		return usagef("fixtures export: --weeks: the freshness window is at least 1 week (got %d)", *weeks)
 	}
 
 	ctx, stop := signalCtx()

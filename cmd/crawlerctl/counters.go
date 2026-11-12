@@ -28,30 +28,29 @@ import (
 )
 
 // countersHelp — help text for crawlerctl counters --help.
-const countersHelp = `crawlerctl counters — инкрементальные счётчики конвейера (T-178)
+const countersHelp = `crawlerctl counters — the pipeline's incremental counters (T-178)
 
-Использование:
+Usage:
   crawlerctl counters list
-  crawlerctl counters recount [--zone ИМЯ]
-  crawlerctl counters verify [--zone ИМЯ] [--tolerance N]
+  crawlerctl counters recount [--zone NAME]
+  crawlerctl counters verify [--zone NAME] [--tolerance N]
 
-Счётчики состояний конвейера (колонки зон + строки crawler_counters)
-ведутся дельтами в транзакциях переходов; авторитет — периодическая
-реконсиляция monitor (совмещённый проход раз в
+The pipeline state counters (the zone columns + the crawler_counters rows)
+are maintained by deltas in the transition transactions; the authority is
+the periodic monitor reconciliation (a combined pass every
 monitor.zone_stats_interval).
 
-  list     значения всех счётчиков: зоны — итогами, глобальные —
-           построчно, с возрастом последней записи
-  recount  один проход реконсиляции (те же Once-функции monitor):
-           вывод «до → после» по позициям с ненулевым дрейфом;
-           --zone — перезаписать колонки только выбранной зоны
-           (глобальные счётчики пересчитываются всегда)
-  verify   сверка счётчиков с живыми агрегатами БЕЗ записи;
-           код возврата 0 — расхождений нет (в пределах допуска
-           --tolerance, по умолчанию 0), 1 — есть дрейф
+  list     the values of all the counters: the zones — as totals, the global
+           ones — line by line, with the age of the last record
+  recount  one reconciliation pass (the same monitor Once functions):
+           a "before → after" output for the positions with a non-zero drift;
+           --zone — overwrite the columns of the selected zone only
+           (the global counters are always recomputed)
+  verify   a cross-check of the counters against the live aggregates WITHOUT
+           writes; exit code 0 — no divergences (within the --tolerance
+           tolerance, the default 0), 1 — there is drift
 
-Коды возврата: 0 — успех, 1 — ошибка выполнения или дрейф (verify),
-2 — использование.
+Exit codes: 0 — success, 1 — an execution error or drift (verify), 2 — usage.
 `
 
 // ---------------------------------------------------------------- SQL list
@@ -72,7 +71,7 @@ const countersListRowsSQL = "SELECT name, value, updated_at FROM crawler_counter
 // PerCommand contract: crawlerctl counters --help → exit code 0).
 func cmdCounters(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usagef("укажите подкоманду: crawlerctl counters list|recount|verify")
+		return usagef("specify a subcommand: crawlerctl counters list|recount|verify")
 	}
 	switch args[0] {
 	case "help", "-h", "--help":
@@ -85,7 +84,7 @@ func cmdCounters(args []string, stdout, stderr io.Writer) error {
 	case "verify":
 		return countersVerify(args[1:], stdout, stderr)
 	default:
-		return usagef("counters: неизвестная подкоманда %q (list, recount, verify)", args[0])
+		return usagef("counters: unknown subcommand %q (list, recount, verify)", args[0])
 	}
 }
 
@@ -115,7 +114,7 @@ func countersZoneName(name string) (string, error) {
 	}
 	normalized, err := idn.NormalizeZone(name)
 	if err != nil {
-		return "", fmt.Errorf("некорректное имя зоны %q: %w", name, err)
+		return "", fmt.Errorf("invalid zone name %q: %w", name, err)
 	}
 	return normalized, nil
 }
@@ -124,14 +123,14 @@ func countersZoneName(name string) (string, error) {
 // empty name — nil (all zones).
 func countersResolveZone(ctx context.Context, pool *pgxpool.Pool, normalized string) (*int16, string, error) {
 	if normalized == "" {
-		return nil, "все", nil
+		return nil, "all", nil
 	}
 	id, found, err := analyzer.ZoneIDByName(ctx, pool, normalized)
 	if err != nil {
 		return nil, "", err
 	}
 	if !found {
-		return nil, "", fmt.Errorf("зона %s не найдена в справочнике (зоны создаёт ingest при первом файле)", normalized)
+		return nil, "", fmt.Errorf("zone %s is not in the catalog (ingest creates zones on the first file)", normalized)
 	}
 	return &id, normalized, nil
 }
@@ -146,9 +145,9 @@ func countersAge(at time.Time) string {
 	case d < 0:
 		d = 0
 	case d < time.Minute:
-		return fmt.Sprintf("%dс назад", int(d.Seconds()))
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
 	}
-	return fmt.Sprintf("%s назад", monitorAgeDuration(d))
+	return fmt.Sprintf("%s ago", monitorAgeDuration(d))
 }
 
 // monitorAgeDuration — rounded age interval (the status.FormatDuration
@@ -157,11 +156,11 @@ func countersAge(at time.Time) string {
 func monitorAgeDuration(d time.Duration) string {
 	switch {
 	case d < time.Hour:
-		return fmt.Sprintf("%dм", (d+30*time.Second)/time.Minute)
+		return fmt.Sprintf("%dm", (d+30*time.Second)/time.Minute)
 	case d < 24*time.Hour:
-		return fmt.Sprintf("%dч %02dм", d/time.Hour, (d%time.Hour)/time.Minute)
+		return fmt.Sprintf("%dh %02dm", d/time.Hour, (d%time.Hour)/time.Minute)
 	default:
-		return fmt.Sprintf("%dд %dч", d/(24*time.Hour), (d%(24*time.Hour))/time.Hour)
+		return fmt.Sprintf("%dd %dh", d/(24*time.Hour), (d%(24*time.Hour))/time.Hour)
 	}
 }
 
@@ -173,7 +172,7 @@ func countersList(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if fs.NArg() > 0 {
-		return usagef("counters list: лишние аргументы %v (подкоманда без параметров)", fs.Args())
+		return usagef("counters list: extra arguments %v (the subcommand takes no parameters)", fs.Args())
 	}
 
 	ctx, stop := signalCtx()
@@ -195,26 +194,26 @@ func countersList(args []string, stdout, stderr io.Writer) error {
 	}
 	rows, err := pool.Query(ctx, countersListZonesSQL)
 	if err != nil {
-		return fmt.Errorf("counters list: зоны: %w", err)
+		return fmt.Errorf("counters list: zones: %w", err)
 	}
 	if !rows.Next() {
 		rows.Close()
-		return fmt.Errorf("counters list: зоны: пустой ответ агрегата")
+		return fmt.Errorf("counters list: zones: empty aggregate response")
 	}
 	if err := rows.Scan(&z.total, &z.pending, &z.queued, &z.checked, &z.laravel, &z.updated, &z.count); err != nil {
 		rows.Close()
-		return fmt.Errorf("counters list: зоны: чтение: %w", err)
+		return fmt.Errorf("counters list: zones: reading: %w", err)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return fmt.Errorf("counters list: зоны: %w", err)
+		return fmt.Errorf("counters list: zones: %w", err)
 	}
 	rows.Close()
 
 	// Global counters — line by line.
 	crows, err := pool.Query(ctx, countersListRowsSQL)
 	if err != nil {
-		return fmt.Errorf("counters list: счётчики: %w", err)
+		return fmt.Errorf("counters list: counters: %w", err)
 	}
 	defer crows.Close()
 	type counterRow struct {
@@ -227,29 +226,29 @@ func countersList(args []string, stdout, stderr io.Writer) error {
 		var r counterRow
 		var updated time.Time
 		if err := crows.Scan(&r.name, &r.value, &updated); err != nil {
-			return fmt.Errorf("counters list: счётчики: чтение: %w", err)
+			return fmt.Errorf("counters list: counters: reading: %w", err)
 		}
 		r.updated = updated
 		counters = append(counters, r)
 	}
 	if err := crows.Err(); err != nil {
-		return fmt.Errorf("counters list: счётчики: %w", err)
+		return fmt.Errorf("counters list: counters: %w", err)
 	}
 
-	out(stdout, "counters: зоны — суммы справочника\n")
-	out(stdout, "  всего: %d   pending: %d   queued: %d   проверено: %d   laravel: %d\n",
+	out(stdout, "counters: zones — the catalog sums\n")
+	out(stdout, "  total: %d   pending: %d   queued: %d   checked: %d   laravel: %d\n",
 		z.total, z.pending, z.queued, z.checked, z.laravel)
 	if z.updated != nil {
-		out(stdout, "  реконсиляция зон: %s\n", countersAge(*z.updated))
+		out(stdout, "  zone reconciliation: %s\n", countersAge(*z.updated))
 	} else if z.count > 0 {
-		out(stdout, "  реконсиляция зон: ещё не было (зоны: %d)\n", z.count)
+		out(stdout, "  zone reconciliation: not yet (zones: %d)\n", z.count)
 	} else {
-		out(stdout, "  реконсиляция зон: — (зон нет)\n")
+		out(stdout, "  zone reconciliation: — (no zones)\n")
 	}
 
-	out(stdout, "\ncounters: глобальные — crawler_counters\n")
+	out(stdout, "\ncounters: global — crawler_counters\n")
 	if len(counters) == 0 {
-		out(stdout, "  (пусто — строки создаёт первая реконсиляция, ТЗИ §5)\n")
+		out(stdout, "  (empty — the first reconciliation creates the rows, the incremental-counters spec §5)\n")
 		return nil
 	}
 	width := 0
@@ -268,12 +267,12 @@ func countersList(args []string, stdout, stderr io.Writer) error {
 
 func countersRecount(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("counters recount")
-	zone := fs.String("zone", "", "зона (punycode; пусто — все зоны; глобальные счётчики пересчитываются всегда)")
+	zone := fs.String("zone", "", "the zone (punycode; empty — all zones; the global counters are always recomputed)")
 	if handled, err := parseFlags(fs, countersHelp, args, stdout); handled {
 		return err
 	}
 	if fs.NArg() > 0 {
-		return usagef("counters recount: лишние аргументы %v", fs.Args())
+		return usagef("counters recount: extra arguments %v", fs.Args())
 	}
 	normalized, err := countersZoneName(*zone)
 	if err != nil {
@@ -299,7 +298,7 @@ func countersRecount(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("counters recount: %w", err)
 	}
 
-	out(stdout, "counters recount: проход реконсиляции (zone_stats_interval — тот же проход monitor), зона: %s, перезаписано зон: %d\n",
+	out(stdout, "counters recount: a reconciliation pass (zone_stats_interval — the same monitor pass), zone: %s, zones overwritten: %d\n",
 		zoneDesc, res.Zones)
 	drifted := 0
 	for _, p := range res.Positions {
@@ -310,9 +309,9 @@ func countersRecount(args []string, stdout, stderr io.Writer) error {
 		out(stdout, "  %-32s %12d → %d (Δ%d)\n", p.Counter, p.Old, p.New, p.Drift())
 	}
 	if drifted == 0 {
-		out(stdout, "  дрейфа нет — счётчики уже сходились с агрегатами\n")
+		out(stdout, "  no drift — the counters already matched the aggregates\n")
 	} else {
-		out(stdout, "итог: позиций с дрейфом: %d (исправлены проходом)\n", drifted)
+		out(stdout, "total: %d positions with drift (fixed by the pass)\n", drifted)
 	}
 	return nil
 }
@@ -321,16 +320,16 @@ func countersRecount(args []string, stdout, stderr io.Writer) error {
 
 func countersVerify(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("counters verify")
-	zone := fs.String("zone", "", "зона (punycode; пусто — все зоны; глобальные счётчики сверяются всегда)")
-	tolerance := fs.Int64("tolerance", 0, "допуск расхождения (0 — точное совпадение)")
+	zone := fs.String("zone", "", "the zone (punycode; empty — all zones; the global counters are always cross-checked)")
+	tolerance := fs.Int64("tolerance", 0, "the mismatch tolerance (0 — an exact match)")
 	if handled, err := parseFlags(fs, countersHelp, args, stdout); handled {
 		return err
 	}
 	if fs.NArg() > 0 {
-		return usagef("counters verify: лишние аргументы %v", fs.Args())
+		return usagef("counters verify: extra arguments %v", fs.Args())
 	}
 	if *tolerance < 0 {
-		return usagef("counters verify: допуск %d < 0", *tolerance)
+		return usagef("counters verify: the tolerance %d < 0", *tolerance)
 	}
 	normalized, err := countersZoneName(*zone)
 	if err != nil {
@@ -359,17 +358,17 @@ func countersVerify(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("counters verify: %w", err)
 	}
 
-	out(stdout, "counters verify: сверка сохранённых счётчиков с живыми агрегатами (без записи), зона: %s, допуск: %d\n",
+	out(stdout, "counters verify: a cross-check of the stored counters against the live aggregates (no writes), zone: %s, tolerance: %d\n",
 		zoneDesc, *tolerance)
 	if len(mismatch) == 0 {
-		out(stdout, "  расхождений нет\n")
+		out(stdout, "  no mismatches\n")
 		return nil
 	}
-	out(stdout, "  %-32s %14s %14s %s\n", "счётчик", "сохранено", "агрегат", "Δ")
+	out(stdout, "  %-32s %14s %14s %s\n", "counter", "stored", "aggregate", "Δ")
 	for _, p := range mismatch {
 		out(stdout, "  %-32s %14d %14d %d\n", p.Counter, p.Old, p.New, p.Drift())
 	}
 	// Exit code 1: drift exists — the calling script must see the mismatch.
-	return fmt.Errorf("counters verify: дрейф счётчиков — %d позиций (лечит crawlerctl counters recount)",
+	return fmt.Errorf("counters verify: counter drift — %d positions (crawlerctl counters recount fixes it)",
 		len(mismatch))
 }
