@@ -470,10 +470,10 @@ func TestApplyAdd_StepErrors(t *testing.T) {
 	}{
 		{"the transaction failure", func(p *applyAddPool) { p.beginErr = boom }, 0, "transaction"},
 		{"the chunk boundary failure", func(p *applyAddPool) { p.boundErr = boom }, 2, "chunk boundary"},
-		{"the insert failure", func(p *applyAddPool) { p.insertErr = boom }, 3, "inserting the add batch|s new domains"},
+		{"the insert failure", func(p *applyAddPool) { p.insertErr = boom }, 3, "inserting the add batch's new domains"},
 		{"the zone deltas failure", func(p *applyAddPool) { p.zoneDeltaErr = boom }, 5, "zone counter deltas"},
 		{"the revive failure", func(p *applyAddPool) { p.reviveErr = boom }, 6, "reviving deleted"},
-		{"the count failure", func(p *applyAddPool) { p.countErr = boom }, 7, "counting the add batch|s domains"},
+		{"the count failure", func(p *applyAddPool) { p.countErr = boom }, 7, "counting the add batch's domains"},
 		{"the cleanup failure", func(p *applyAddPool) { p.clearErr = boom }, 8, "cleaning the batch"},
 		{"the commit failure", func(p *applyAddPool) { p.commitErr = boom }, 8, "commit"},
 	}
