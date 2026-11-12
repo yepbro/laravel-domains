@@ -187,7 +187,7 @@ func TestParsePromExpositionErrorLines(t *testing.T) {
 		{"labels not closed (line 2)", "# T x\nm{a=\"1 5\n", "line 2: labels without a closing"},
 		{"no value (line 1)", "m{x=\"1\"}\n", "line 1: no value"},
 		{"no value after the hash", "m #x\n", "line 1: no value"},
-		{"the value is not a number (line 3)", "m 1\nm 2\nm abc\n", "line 3: value"},
+		{"the value is not a number (line 3)", "m 1\nm 2\nm abc\n", "line 3: the value"},
 		{"a label without quotes (line 1)", "m{x=1} 5\n", "line 1"},
 	}
 	for _, tc := range cases {
