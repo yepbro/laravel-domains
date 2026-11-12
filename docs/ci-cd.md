@@ -1,156 +1,160 @@
-# CI/CD: боевой деплой через GitHub Actions
+# CI/CD: production deployment via GitHub Actions
 
-Непрерывный деплой боевого сервера (дополнение к T-135): после зелёного
-CI на `production` тот же коммит собирается в статические бинарники и
-устанавливается на сервер systemd-деплоя ([`deploy.md`](deploy.md)).
-`master` — ветка разработки (ci без деплоя); на прод уходит только
-смердженное в `production`. Конфигурации сервера (`/etc/crawler`, юниты,
-nginx, сертификаты) конвейер не трогает — только `/opt/crawler/bin`.
+Continuous deployment to the production server (a supplement to T-135): after
+green CI on `production`, the same commit is built into static binaries and
+installed on the server by the systemd deployment ([`deploy.md`](deploy.md)).
+`master` is the development branch (ci without deploy); only what is merged
+into `production` goes to production. The pipeline does not touch the server
+configuration (`/etc/crawler`, units, nginx, certificates) — only
+`/opt/crawler/bin`.
 
-## Конвейер
+## Pipeline
 
 ```
-push в production ──▶ ci (тесты, lint, интеграция)
-                      │ успех
-                      ▼
-                 deploy (workflow_run)
-                      │ build (setup-go + make web-css + go build)
-                      │ upload (scp по deploy-ключу)
-                      │ install (deploy/deploy-install.sh: бэкап → замена → рестарт)
-                      ▼
-                 healthcheck (deploy/deploy-healthcheck.sh)
-                      │ провал install → откат на /opt/crawler/bin.prev (trap)
-                      │ провал healthcheck → rollback (deploy/deploy-rollback.sh)
-                      ▼
-                 production (10 юнитов, healthz 9100…9108)
+push to production ──▶ ci (tests, lint, integration)
+                       │ success
+                       ▼
+                   deploy (workflow_run)
+                       │ build (setup-go + make web-css + go build)
+                       │ upload (scp with the deploy key)
+                       │ install (deploy/deploy-install.sh: backup → replace → restart)
+                       ▼
+                   healthcheck (deploy/deploy-healthcheck.sh)
+                       │ install failure → rollback to /opt/crawler/bin.prev (trap)
+                       │ healthcheck failure → rollback (deploy/deploy-rollback.sh)
+                       ▼
+                   production (10 units, healthz 9100…9108)
 ```
 
-| Файл | Назначение |
+| File | Purpose |
 |---|---|
-| [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) | workflow: запуск после успеха `ci` на `production` (или вручную), сборка, деплой, откат по провалу healthcheck |
-| [`deploy/deploy-install.sh`](../deploy/deploy-install.sh) | серверная сторона: атомарная замена `/opt/crawler/bin` с откатом |
-| [`deploy/deploy-healthcheck.sh`](../deploy/deploy-healthcheck.sh) | серверная сторона: 10 юнитов active + healthz + crawlerctl |
-| [`deploy/deploy-rollback.sh`](../deploy/deploy-rollback.sh) | серверная сторона: восстановление `bin.prev` и перезапуск набора (T-137) |
-| [`deploy/telegram-notify.sh`](../deploy/telegram-notify.sh) | извещения Telegram о событиях конвейера (§10.4) |
+| [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) | workflow: runs after `ci` succeeds on `production` (or manually), build, deploy, rollback on healthcheck failure |
+| [`deploy/deploy-install.sh`](../deploy/deploy-install.sh) | server side: atomic replacement of `/opt/crawler/bin` with rollback |
+| [`deploy/deploy-healthcheck.sh`](../deploy/deploy-healthcheck.sh) | server side: 10 units active + healthz + crawlerctl |
+| [`deploy/deploy-rollback.sh`](../deploy/deploy-rollback.sh) | server side: restoring `bin.prev` and restarting the set (T-137) |
+| [`deploy/telegram-notify.sh`](../deploy/telegram-notify.sh) | Telegram notifications about pipeline events (§10.4) |
 
-Принципы:
+Principles:
 
-- **деплоится ровно тот SHA, что протестирован** — `workflow_run` передаёт
-  `head_sha` прошедшего ci рана, checkout идёт по нему;
-- **деплой бинарников — конвейером, деплой конфигурации — оператором**:
-  `/etc/crawler/*`, `/etc/systemd/system/crawler-*`, nginx и сертификаты
-  меняются вручную по [`deploy.md`](deploy.md) (редкие операции);
-- **откат автоматический на любом шаге после остановки набора** (ТЗ §10.4,
-  T-137): предыдущие бинарники остаются в `/opt/crawler/bin.prev`; ошибка
-  установки после успешной остановки восстанавливает их и перезапускает
-  набор (trap в `deploy-install.sh`; сбой самой остановки набора —
-  бинарники не тронуты, но состояние юнитов требует проверки — извещение
-  «неизвестен»; отсутствие архива — сервер не тронут; сбой подготовки
-  бэкапа — бинарники не тронуты, набор был остановлен и перезапущен,
-  при сбое старта — извещение «неизвестен»); провал healthcheck —
-  отдельный шаг rollback конвейера (`deploy/deploy-rollback.sh`: копия
-  бэкапа → stop → атомарная замена → start со сбросом start-limit → лёгкая
-  проверка юнитов), до диагностики — возврат рабочей версии важнее сбора
-  логов (логи новой версии остаются в journalctl). Граничные случаи:
-  нет `bin.prev` (первый деплой) — откатывать нечего, набор не тронут и
-  остаётся на новой версии; откат сам упал или набор поднялся не весь —
-  извещение называет это явно и зовёт оператора; потеря связи ssh —
-  состояние неизвестно. Откат возвращает только бинарники: схема БД
-  остаётся на версии нового релиза, поэтому релиз, применивший
-  миграцию, автоматическим откатом не восстанавливается — набор N-1
-  упадёт на старте, извещение позовёт оператора (down-миграция —
-  вручную и осознанно, [`operations.md`](operations.md) §4.1);
-- **Chromium не переустанавливается**: версия зафиксирована
-  (`CHROMEDP_HEADLESS_IMAGE` в `.env.example`), обновление — ручной шаг
-  [`deploy.md` §4.3](deploy.md).
+- **exactly the SHA that was tested gets deployed** — `workflow_run` passes
+  the `head_sha` of the passed ci run, and the checkout uses it;
+- **binaries are deployed by the pipeline, configuration by the operator**:
+  `/etc/crawler/*`, `/etc/systemd/system/crawler-*`, nginx and certificates
+  are changed manually per [`deploy.md`](deploy.md) (rare operations);
+- **rollback is automatic at any step after the set is stopped** (spec
+  §10.4, T-137): the previous binaries remain in `/opt/crawler/bin.prev`; an
+  install error after a successful stop restores them and restarts the set
+  (trap in `deploy-install.sh`; if stopping the set itself fails — the
+  binaries are untouched, but the unit state needs checking — the
+  notification is "unknown"; a missing archive — the server is untouched; a
+  backup preparation failure — the binaries are untouched, the set was
+  stopped and restarted, and on a start failure the notification is
+  "unknown"); a healthcheck failure — a separate pipeline rollback step
+  (`deploy/deploy-rollback.sh`: copy the backup → stop → atomic replacement
+  → start with a start-limit reset → a light unit check); before
+  diagnostics — restoring a working version matters more than collecting
+  logs (the new version's logs remain in journalctl). Edge cases: no
+  `bin.prev` (the first deploy) — there is nothing to roll back to, the set
+  is untouched and stays on the new version; the rollback itself failed or
+  the set did not fully come up — the notification states this explicitly
+  and calls the operator; ssh connection loss — the state is unknown.
+  Rollback restores only the binaries: the DB schema stays at the new
+  release's version, so a release that applied a migration is not restored
+  by automatic rollback — the N-1 set will fail at startup and the
+  notification will call the operator (a down-migration is manual and
+  deliberate, [`operations.md`](operations.md) §4.1);
+- **Chromium is not reinstalled**: the version is pinned
+  (`CHROMEDP_HEADLESS_IMAGE` in `.env.example`); updating is a manual step
+  in [`deploy.md` §4.3](deploy.md).
 
-## Секреты репозитория (Settings → Secrets → Actions)
+## Repository secrets (Settings → Secrets → Actions)
 
-| Секрет | Содержимое |
+| Secret | Contents |
 |---|---|
-| `DEPLOY_SSH_KEY` | закрытый ed25519-ключ деплоя (публичная половина — в `/root/.ssh/authorized_keys` сервера) |
-| `DEPLOY_SSH_KNOWN_HOSTS` | строка `ssh-keyscan -t ed25519 <host>` — защита от MITM в CI |
-| `TELEGRAM_BOT_TOKEN` | токен Telegram-бота для извещений о конвейере (§10.4) |
-| `TELEGRAM_CHAT_ID` | id выделенной группы, куда бот отправляет извещения |
+| `DEPLOY_SSH_KEY` | the private ed25519 deploy key (the public half — in the server's `/root/.ssh/authorized_keys`) |
+| `DEPLOY_SSH_KNOWN_HOSTS` | the `ssh-keyscan -t ed25519 <host>` output — MITM protection in CI |
+| `TELEGRAM_BOT_TOKEN` | the Telegram bot token for pipeline notifications (§10.4) |
+| `TELEGRAM_CHAT_ID` | the id of the dedicated group the bot sends notifications to |
 
-Адрес сервера указан в workflow открыто (не секрет). Значения секретов
-не печатаются в логи ранов и не попадают в извещения.
+The server address is given in the workflow openly (not a secret). Secret
+values are not printed to run logs and do not get into notifications.
 
-## Извещения Telegram (ТЗ §10.4)
+## Telegram notifications (spec §10.4)
 
-О событиях конвейера GitHub Actions бот отправляет извещения в
-выделенную группу — один вызов
-[`deploy/telegram-notify.sh`](../deploy/telegram-notify.sh) последним
-шагом workflow (`ci.yml` — при провале, `deploy.yml` — при любом
-исходе). Алерты рантайма сервиса ходят в ту же группу механизмом
-ТЗ §5.9 (цикл алертов monitor; с T-162 их доставка оператору тоже
-этот скрипт — режимом `--message "🚨 …"`, вызов exec-ом из monitor,
-секреты из EnvironmentFile юнита; постановка/семантика —
-[`operations.md`](operations.md) §4.3), для CI/CD вызовы не менялись.
+On pipeline events the GitHub Actions bot sends notifications to a dedicated
+group — one call to [`deploy/telegram-notify.sh`](../deploy/telegram-notify.sh)
+as the last step of the workflow (`ci.yml` — on failure, `deploy.yml` — on
+any outcome). Service runtime alerts go to the same group via the spec §5.9
+mechanism (the monitor alert loop; since T-162 their delivery to the
+operator is handled by this script too — in the `--message "🚨 …"` mode,
+invoked via exec from monitor, secrets from the unit's EnvironmentFile;
+setup and semantics — [`operations.md`](operations.md) §4.3); the CI/CD
+calls did not change.
 
-События и условия отправки:
+Events and sending conditions:
 
-| Событие | Условие |
+| Event | Condition |
 |---|---|
-| 🟥 ❌ Ошибка в коде | провал шага линта или сборки (образов/бинарников) в `ci` |
-| 🛑 Ошибка тестов | провал модульных тестов, тестов правил, интеграционных или детектора гонок (`-race`, monitor) в `ci` |
-| ✅ Деплой успешен | установка на сервер и healthcheck прошли |
-| ⛔️ Деплой не успешен | провал любого шага `deploy`, включая healthcheck; отменённый ран (в т.ч. по таймауту) — тоже |
-| ⚠️ Ошибка конвейера CI | фолбэк: провал прочих шагов ci (диагностика, подготовка окружения) |
+| 🟥 ❌ Code error | a lint or build (images/binaries) step failed in `ci` |
+| 🛑 Test failure | unit tests, rules tests, integration tests or the race detector (`-race`, monitor) failed in `ci` |
+| ✅ Deploy succeeded | the server install and the healthcheck passed |
+| ⛔️ Deploy failed | any `deploy` step failed, including the healthcheck; a cancelled run (including by timeout) counts too |
+| ⚠️ CI pipeline error | fallback: the other ci steps failed (diagnostics, environment preparation) |
 
-Формат сообщения — простой текст: маркер события в начале (карта выше —
-выбор заказчика по живому рендеру Telegram), тип события,
-workflow и шаг, версия деплоя (`git describe` из шага сборки) и факт
-отката для деплоев, виновный коммит (короткий SHA + первая строка
-subject; в PR-ранах — head-коммит ветки PR), ссылка на ран.
-Факт отката — по фактическим исходам шагов: провал установки до
-остановки набора — строки про откат нет (нет архива — сервер не
-тронут; сбой подготовки бэкапа — бинарники не тронуты, набор
-перезапущен) или «неизвестен, проверьте сервер» (не остановился набор,
-не поднялся остановленный набор); сбой внутри установки — по
-результату
-trap-отката: «выполнен на предыдущую версию (bin.prev)», «выполнен,
-но не все юниты active — требуется оператор» или «не удался —
-состояние сервера требует проверки оператора»; провал healthcheck →
-результат шага rollback (`deploy-rollback.sh`): «выполнен»,
-«выполнен, но не все юниты active — требуется оператор», «не выполнен
-— предыдущей версии нет (bin.prev отсутствует, первый деплой); на
-сервере осталась новая версия» или «не удался — состояние сервера
-требует проверки оператора»; прерывание работы с сервером (потеря
-связи ssh, отмена рана) → «неизвестен, проверьте сервер»; провал до
-начала установки (сборка, scp) → строки про откат нет.
+The message format is plain text: an event marker at the start (the map
+above — the customer's choice based on live Telegram rendering), the event
+type, the workflow and step, the deploy version (`git describe` from the
+build step) and the rollback fact for deploys, the offending commit (short
+SHA + the first subject line; in PR runs — the head commit of the PR
+branch), and a link to the run. The rollback fact reflects the actual step
+outcomes: an install failure before the set is stopped — no rollback line
+(the archive is missing — the server is untouched; a backup preparation
+failure — the binaries are untouched, the set was restarted) or "unknown,
+check the server" (the set did not stop; the stopped set did not come up);
+a failure inside the install — by the trap rollback result: "completed to
+the previous version (bin.prev)", "completed, but not all units are active
+— operator required" or "failed — the server state requires operator
+review"; a healthcheck failure → the rollback step result
+(`deploy-rollback.sh`): "completed", "completed, but not all units are
+active — operator required", "not performed — there is no previous version
+(bin.prev is missing, the first deploy); the new version remains on the
+server" or "failed — the server state requires operator review"; an
+interrupted server session (ssh connection loss, run cancellation) →
+"unknown, check the server"; a failure before the install begins (build,
+scp) → no rollback line.
 
-Принципы:
+Principles:
 
-- **одно событие — одно сообщение**, без промежуточных статусов: шаг
-  уведомления выполняется один раз по завершении рана;
-- **сбой отправки не красит ран**: шаг идёт с `continue-on-error`,
-  собственный провал скрипта фиксируется только в логе;
-- **молчание вспомогательных и ручных прогонов**: `mutation.yml`
-  извещений не отправляет, ручные запуски `ci` (`workflow_dispatch`)
-  тоже; ручной запуск `deploy` — штатный деплой, извещается;
-- **пропуск при отсутствии секретов** (PR из форка, репозиторий без
-  настроенных секретов): скрипт печатает причину в лог и выходит 0;
-  PR из веток самого репозитория секреты видят — токен бота доверяется
-  участникам с push-доступом (это же условие слияния);
-- исключение из таблицы §10.4: провал прочих шагов ci (диагностика,
-  подготовка окружения) отправляется с фолбэк-типом
-  «Ошибка конвейера CI» — молчать о красном ране хуже.
+- **one event — one message**, no intermediate statuses: the notification
+  step runs once when the run finishes;
+- **a send failure does not redden the run**: the step runs with
+  `continue-on-error`; the script's own failure is recorded only in the log;
+- **auxiliary and manual runs stay silent**: `mutation.yml` sends no
+  notifications, and neither do manual `ci` runs (`workflow_dispatch`); a
+  manual `deploy` run is a regular deploy and is notified;
+- **skipped when secrets are absent** (a PR from a fork, a repository
+  without configured secrets): the script prints the reason to the log and
+  exits 0; PRs from the repository's own branches do see the secrets — the
+  bot token is trusted to collaborators with push access (the same merge
+  condition);
+- an exception to the §10.4 table: a failure of the other ci steps
+  (diagnostics, environment preparation) is sent with the fallback type
+  "CI pipeline error" — staying silent about a red run is worse.
 
-## Ручной запуск и операции
+## Manual runs and operations
 
 ```bash
-# запустить деплой текущего production без ожидания ci (GitHub → Actions → deploy → Run workflow)
+# run a deploy of the current production without waiting for ci (GitHub → Actions → deploy → Run workflow)
 gh workflow run deploy
 
-# на сервере: предыдущие бинарники (последний успешный деплой)
+# on the server: the previous binaries (the last successful deploy)
 ls /opt/crawler/bin.prev
 
-# откат вручную — тот же скрипт, что запускает конвейер по провалу
-# healthcheck; на сервере скрипт не хранится — передать по stdin из
-# чекаута репозитория (или предварительно скопировать на сервер)
+# manual rollback — the same script the pipeline runs on a healthcheck
+# failure; the script is not stored on the server — pipe it via stdin from
+# a repository checkout (or copy it to the server first)
 ssh root@155.212.174.88 'bash -s' -- < deploy/deploy-rollback.sh
 ```
 
-Первый деплой нового сервера — по [`operations.md` §3](operations.md)
-(вручную); CI/CD подключается после заведения секретов и ключа.
+The first deploy of a new server — per [`operations.md` §3](operations.md)
+(manual); CI/CD is hooked up after the secrets and the key are set up.

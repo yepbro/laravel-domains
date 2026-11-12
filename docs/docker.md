@@ -1,311 +1,324 @@
-# Инструкция по работе с Docker
+# Docker Guide
 
-Практическая шпаргалка: запуск и остановка окружения, выполнение команд
-внутри контейнеров, работа с томами и диагностика. Про архитектуру
-окружения — [`dev-environment.md`](dev-environment.md), полный список
-make-команд — `make help`.
+A practical cheat sheet: starting and stopping the environment, running
+commands inside containers, working with volumes, and diagnostics. For the
+environment architecture — [`dev-environment.md`](dev-environment.md); for
+the full list of make commands — `make help`.
 
-## 1. Предпроверка
+## 1. Pre-check
 
 ```bash
 docker version --format '{{.Server.Version}}'   # Docker Engine ≥ 24
-docker compose version                          # Compose v2 (плагин, не docker-compose)
-cp .env.example .env                            # один раз; DEV_UID/DEV_GID = ваш id -u / id -g
+docker compose version                          # Compose v2 (a plugin, not docker-compose)
+cp .env.example .env                            # once; DEV_UID/DEV_GID = your id -u / id -g
 ```
 
-Всё (сборка, тесты, линт, миграции) выполняется в контейнерах — Go на хосте
-не нужен.
+Everything (builds, tests, lint, migrations) runs in containers — Go is not
+needed on the host.
 
-## 2. Запуск и остановка
+## 2. Starting and stopping
 
-### Стандартные сценарии (make)
+### Standard scenarios (make)
 
 ```bash
-make up          # инфраструктура + testbed + приложения; ждёт все healthchecks
-make up-infra    # только postgres + redis + unbound (схему применят сервисы)
-make down        # остановить всё; тома и данные сохраняются
-make clean       # остановить И удалить все тома (БД, кэши, контент); спросит подтверждение
-make clean FORCE=1   # то же без вопроса
-make ps          # статус всех контейнеров
-make logs SERVICE=analyzer   # логи одного сервиса (tail + follow)
+make up          # infrastructure + testbed + apps; waits for all healthchecks
+make up-infra    # postgres + redis + unbound only (the services apply the schema)
+make down        # stop everything; volumes and data are kept
+make clean       # stop AND remove all volumes (DB, caches, content); asks for confirmation
+make clean FORCE=1   # the same without asking
+make ps          # status of all containers
+make logs SERVICE=analyzer   # one service's logs (tail + follow)
 ```
 
-- `make up` после правок Go-кода пересобирает только изменённое (hot reload
-  работает дальше сам, через air).
-- `make up` идемпотентен: повторный запуск ничего не ломает.
-- `make clean && make up` поднимает окружение с нуля без ручных шагов.
+- After Go code edits, `make up` rebuilds only what changed (hot reload then
+  keeps working on its own, via air).
+- `make up` is idempotent: rerunning it breaks nothing.
+- `make clean && make up` brings the environment up from scratch with no
+  manual steps.
 
-### Что проверяют healthchecks (T-110)
+### What the healthchecks check (T-110)
 
-- Инфраструктура — собственные проверки образов: `pg_isready` (postgres),
-  `redis-cli ping` (redis), резолв тестового имени (unbound).
-- Сервисы приложения (профиль app) — **liveness** `/livez` на порту метрик:
-  контейнер здоров, пока процесс жив и отвечает HTTP. Readiness `/healthz`
-  (пинг пула PostgreSQL, 503 при сбое) в healthcheck сознательно не
-  используется: задачи воркеры тянут из Redis-очередей сами, а при
-  недоступной БД стена unhealthy-воркеров лишь дублирует статус самого
-  postgres. Проверить готовность вручную (порты метрик наружу не
-  публикуются — изнутри контейнера сервиса или через tools):
+- Infrastructure — the images' own checks: `pg_isready` (postgres),
+  `redis-cli ping` (redis), resolution of a test name (unbound).
+- The app services (the app profile) — **liveness** `/livez` on the metrics
+  port: the container is healthy as long as the process is alive and answers
+  HTTP. The readiness `/healthz` (a PostgreSQL pool ping, 503 on failure) is
+  deliberately not used in the healthcheck: workers pull tasks from the
+  Redis queues themselves, and with the DB down a wall of unhealthy workers
+  would only duplicate the postgres status itself. Check readiness manually
+  (the metrics ports are not published outward — from inside the service
+  container or via tools):
   `dc exec scheduler wget -qO- http://127.0.0.1:9102/healthz`
-  (порты — таблица «Метрики» в [`services.md`](services.md)).
-- `tools` — healthcheck отключён: контейнер живёт как `sleep infinity` без
-  HTTP-сервера, проверка была вечно красной (шум в `dc ps`, подвисший
-  `up --wait` с профилем tools).
-- `render` (профиль runtime) — healthcheck-а нет: образ headless-shell без
-  HTTP-клиента (wget/curl); живость процесса держит `restart: unless-stopped`
-  по коду выхода. Пробы доступны из сети crawler_net с хоста:
+  (the ports — the "Metrics" table in [`services.md`](services.md)).
+- `tools` — the healthcheck is disabled: the container lives as
+  `sleep infinity` without an HTTP server, and the check was permanently red
+  (noise in `dc ps`, a hanging `up --wait` with the tools profile).
+- `render` (the runtime profile) — no healthcheck: the headless-shell image
+  has no HTTP client (wget/curl); process liveness is maintained by
+  `restart: unless-stopped` on the exit code. The probes are reachable from
+  the crawler_net network on the host:
   `wget -qO- http://172.28.100.15:9105/healthz`.
-- `lightpanda` / `moli` (профиль render-engines, этап 35) — CDP-эндпоинт
-  `/json/version` (тот же, что проверяет воркер у chromium). В собственный
-  образ moli curl положен специально, проба идёт по статическому адресу
-  сервиса `172.28.100.17` (moli биндится на него — см. compose); официальный
-  образ lightpanda — debian-slim без HTTP-клиента, там зонд на `127.0.0.1`
-  — чистый bash (`/dev/tcp` + `grep` по «Browser» в теле ответа).
+- `lightpanda` / `moli` (the render-engines profile, stage 35) — the CDP
+  endpoint `/json/version` (the same one the worker checks against
+  chromium). curl is placed into the moli image on purpose, and the probe
+  goes to the service's static address `172.28.100.17` (moli binds to it —
+  see compose); the official lightpanda image is debian-slim without an
+  HTTP client, so its probe against `127.0.0.1` is plain bash (`/dev/tcp` +
+  a `grep` for "Browser" in the response body).
 
-### Прямые команды docker compose
+### Direct docker compose commands
 
-Makefile — обёртка над compose. Канонический вызов из корня репозитория:
+The Makefile is a wrapper over compose. The canonical invocation from the
+repository root:
 
 ```bash
-docker compose --project-directory . -f deploy/docker/compose.yaml --env-file .env <команда>
+docker compose --project-directory . -f deploy/docker/compose.yaml --env-file .env <command>
 ```
 
-Удобно сделать алиас (добавьте в ~/.bashrc):
+It is convenient to make an alias (add it to ~/.bashrc):
 
 ```bash
 alias dc='docker compose --project-directory . -f deploy/docker/compose.yaml --env-file .env'
 ```
 
-Дальше в примерах — `dc`.
+The examples below use `dc`.
 
 ```bash
-dc ps -a                                  # все контейнеры, включая остановленные
-dc logs -f --tail=100 unbound             # логи
-dc restart coredns testweb                # перезапустить сервисы
-dc stop http-worker                       # мягкая остановка одного сервиса
-dc up -d --no-deps http-worker            # поднять один сервис без зависимостей
-dc --profile monitoring up -d             # включить профиль (аналогично tools, app, testbed)
-dc --profile '*' down --remove-orphans    # остановить всё под всеми профилями
-dc --profile '*' down -v                  # + удалить тома (= make clean FORCE=1)
+dc ps -a                                  # all containers, including stopped ones
+dc logs -f --tail=100 unbound             # logs
+dc restart coredns testweb                # restart services
+dc stop http-worker                       # a graceful stop of one service
+dc up -d --no-deps http-worker            # bring up one service without dependencies
+dc --profile monitoring up -d             # enable a profile (same for tools, app, testbed)
+dc --profile '*' down --remove-orphans    # stop everything under all profiles
+dc --profile '*' down -v                  # + remove volumes (= make clean FORCE=1)
 ```
 
-Важно: **не** запускайте `docker compose` из каталога `deploy/docker` без
-`--project-directory .` — относительные пути (тома, сборка) разрешаются от
-корня проекта, и без флага конфигурация не соберётся.
+Important: do **not** run `docker compose` from the `deploy/docker` directory
+without `--project-directory .` — relative paths (volumes, build) resolve
+against the project root, and without the flag the configuration will not
+assemble.
 
-### Перезапуск отдельного сервиса после правок
+### Restarting a single service after edits
 
-Go-сервисы пересобираются сами (air следит за файлами). Остальные сервисы
-перечитывают конфиг только при пересоздании:
+Go services rebuild themselves (air watches the files). The other services
+re-read their config only on recreation:
 
 ```bash
-dc restart unbound                 # конфиг unbound изменился
-make testbed-gen                   # пересоздаёт зоны/фикстуры и перезапускает coredns/testweb/unbound
-dc up -d --force-recreate testweb  # если правили compose-параметры сервиса
+dc restart unbound                 # the unbound config changed
+make testbed-gen                   # regenerates zones/fixtures and restarts coredns/testweb/unbound
+dc up -d --force-recreate testweb  # if you edited the service's compose parameters
 ```
 
-## 3. Команды внутри контейнеров
+## 3. Commands inside containers
 
-Два способа:
+Two ways:
 
-- `exec` — команда **в уже запущенном** контейнере (сервис должен работать);
-- `run --rm` — **одноразовый контейнер** поверх образа сервиса (зависимости
-  не поднимает; полезно для утилит).
+- `exec` — a command **in an already running** container (the service must
+  be up);
+- `run --rm` — a **one-off container** on top of the service image (does not
+  bring up dependencies; useful for utilities).
 
 ```bash
-# интерактивная оболочка
-make shell                       # tools-контейнер (Go-тулчейн, есть интернет для модулей)
-make shell SERVICE=analyzer      # оболочка внутри запущенного сервиса приложения
+# interactive shell
+make shell                       # the tools container (Go toolchain, internet access for modules)
+make shell SERVICE=analyzer      # a shell inside a running app service
 
-# то же напрямую
-dc exec analyzer sh              # запущенный сервис
-dc run --rm tools sh             # одноразовый tools
+# the same directly
+dc exec analyzer sh              # a running service
+dc run --rm tools sh             # one-off tools
 
-# разовые команды
-dc exec postgres psql -U admin -d crawler -c '\dt'     # SQL одним вызовом
-dc exec redis redis-cli XLEN q:dns                     # длина стрима
-dc exec unbound nslookup same-site.crawl.test 127.0.0.1   # проверить резолвер
-dc exec testweb wget -qO- http://127.0.0.1:2019/config/   # admin-API Caddy
-dc run --rm tools go test ./internal/... -count=1       # тесты без make
+# one-off commands
+dc exec postgres psql -U admin -d crawler -c '\dt'     # SQL in a single call
+dc exec redis redis-cli XLEN q:dns                     # stream length
+dc exec unbound nslookup same-site.crawl.test 127.0.0.1   # check the resolver
+dc exec testweb wget -qO- http://127.0.0.1:2019/config/   # the Caddy admin API
+dc run --rm tools go test ./internal/... -count=1       # tests without make
 ```
 
-Через make:
+Via make:
 
 ```bash
-make psql                # интерактивная консоль PostgreSQL
-make redis-cli           # интерактивная консоль Redis
-make test                # модульные тесты (в tools)
+make psql                # the interactive PostgreSQL console
+make redis-cli           # the interactive Redis console
+make test                # unit tests (in tools)
 make lint                # golangci-lint
-make migrate-up          # применить миграции вручную (обычно не нужно: сервисы сами)
+make migrate-up          # apply migrations manually (usually not needed: the services do it themselves)
 make migrate-new NAME=my_migration
-make debug SERVICE=dns-worker   # сервис под delve, отладчик на 127.0.0.1:2345
+make debug SERVICE=dns-worker   # the service under delve, the debugger on 127.0.0.1:2345
 ```
 
-Пользователь в контейнерах приложений — ваш UID/GID из `.env` (файлы,
-создаваемые в bind-mount, принадлежат вам). HOME внутри — `/tmp`.
+The user in the app containers is your UID/GID from `.env` (files created in
+bind mounts belong to you). HOME inside is `/tmp`.
 
-## 4. Тестовый стенд: как смотреть сценарии руками
+## 4. Testbed: how to inspect the scenarios by hand
 
-Статические сайты testweb с хоста — через `curl --resolve` (порты
-`127.0.0.1:8088`/`8443` из `.env`):
+The testweb static sites from the host — via `curl --resolve` (the
+`127.0.0.1:8088`/`8443` ports from `.env`):
 
 ```bash
 curl --resolve same-site.crawl.test:8088:127.0.0.1 http://same-site.crawl.test:8088/
 curl -k --resolve spa-shell.crawl.test:8443:127.0.0.1 https://spa-shell.crawl.test:8443/
 ```
 
-DNS-запросы к тестовым зонам — через запущенный unbound (из любого контейнера
-сети; на хосте порт 53 не публикуется):
+DNS queries to the test zones — via the running unbound (from any container
+on the network; port 53 is not published on the host):
 
 ```bash
 dc exec unbound nslookup parked-1.crawl.test 127.0.0.1
-dc exec unbound nslookup example.com 127.0.0.1    # → ошибка: наружу в testbed не резолвится
+dc exec unbound nslookup example.com 127.0.0.1    # → an error: external names do not resolve in the testbed
 ```
 
-«Злые» эндпоинты mockserver (внутри сети — напрямую по IP):
+The mockserver "evil" endpoints (from inside the network — directly by IP):
 
 ```bash
 dc run --rm --no-deps tools wget -qO- http://172.28.100.13:8080/healthz
 ```
 
-Домены сценариев (`tarpit.crawl.test`, `huge-body.crawl.test`, `zip-bomb.crawl.test`,
-`infinite-redirect`/`cycle-redirect`, `truncated`, `garbage-content`,
-`bad-charset-*`, `cookies`, `slow-headers`, `tls-*`) резолвятся в mockserver и
-обслуживаются как виртуальные хосты: запрос `/` по Host сценария получает его
-«злой» ответ (карта маршрутов — `cmd/mockserver`, соответствует `mock_path` из
-`scenarios.yaml`). TLS-сценарии получают по SNI сертификат со своим дефектом
-(самоподписанный / просроченный / чужой SAN). Правки исходника mockserver
-подхватываются `make test-integration` (образ пересобирается).
+The scenario domains (`tarpit.crawl.test`, `huge-body.crawl.test`,
+`zip-bomb.crawl.test`, `infinite-redirect`/`cycle-redirect`, `truncated`,
+`garbage-content`, `bad-charset-*`, `cookies`, `slow-headers`, `tls-*`)
+resolve to the mockserver and are served as virtual hosts: a `/` request
+with a scenario's Host gets that scenario's "evil" response (the route map
+is in `cmd/mockserver`, matching `mock_path` from `scenarios.yaml`). The TLS
+scenarios get a certificate with their own defect over SNI (self-signed /
+expired / a wrong SAN). Edits to the mockserver source are picked up by
+`make test-integration` (the image is rebuilt).
 
-Полный список сценариев: `deploy/docker/testbed/scenarios.yaml`.
+The full scenario list: `deploy/docker/testbed/scenarios.yaml`.
 
-## 5. Томa и данные
+## 5. Volumes and data
 
-| Том | Что внутри | Когда очищается |
+| Volume | Contents | When cleared |
 |---|---|---|
-| `crawler_pg_data` | база PostgreSQL | `make clean` |
-| `crawler_gomodcache`, `crawler_gocache` | кэши Go (быстрая пересборка) | `make clean` |
-| `crawler_caddy_data`, `crawler_caddy_config` | TLS-сертификаты testweb | `make clean` |
-| `crawler_prom_data` | метрики Prometheus (7 дней) | `make clean` |
+| `crawler_pg_data` | the PostgreSQL database | `make clean` |
+| `crawler_gomodcache`, `crawler_gocache` | Go caches (fast rebuilds) | `make clean` |
+| `crawler_caddy_data`, `crawler_caddy_config` | the testweb TLS certificates | `make clean` |
+| `crawler_prom_data` | Prometheus metrics (7 days) | `make clean` |
 
-Данные вне томов: `var/incoming` (файлы доменов), `var/content` (контент) —
-bind-mount из репозитория, в git не попадают.
+Data outside volumes: `var/incoming` (domain files), `var/content` (content)
+— bind mounts from the repository, never committed to git.
 
 ```bash
 docker volume ls | grep crawler
-docker volume rm crawler_pg_data     # точечный сброс только БД
+docker volume rm crawler_pg_data     # a targeted reset of the DB only
 ```
 
-## 6. Сборка образов
+## 6. Building images
 
 ```bash
-make build            # dev-образы (crawler/go-dev, unbound, mockserver) — кэшируется
-make build-runtime    # проверочные боевые образы: crawler/runtime:check, crawler/render:check
-dc build tools        # собрать один сервис
-dc build --no-cache unbound   # пересобрать без кэша (если «что-то странное»)
+make build            # dev images (crawler/go-dev, unbound, mockserver) — cached
+make build-runtime    # production check images: crawler/runtime:check, crawler/render:check
+dc build tools        # build one service
+dc build --no-cache unbound   # rebuild without the cache (if something looks off)
 ```
 
-Обычный `make up` тоже собирает образы при необходимости (`--build`).
-После смены версий в `.env` (`GO_VERSION`, `ALPINE_VERSION`, …) образы
-пересоберутся автоматически при следующем `make up`/`make build`.
+A regular `make up` also builds images when needed (`--build`). After
+changing the versions in `.env` (`GO_VERSION`, `ALPINE_VERSION`, …) the
+images are rebuilt automatically on the next `make up`/`make build`.
 
-### Боевой render-контейнер (профиль runtime)
+### The production render container (the runtime profile)
 
-`make build-runtime` проверяет только сборку образов. Полный боевой
-контейнер рендера поднимается профилем `runtime` — сервис `render`
-(`crawler/render:local`): render-worker + собственный Chromium в одном
-контейнере (`Dockerfile.render`; в образе `USER nobody`, в compose
-запуск переопределён на `user: ${DEV_UID:-1000}:${DEV_GID:-1000}` —
-воркер пишет пак-контент в host-bind `./var/content`, принадлежащий
-`DEV_UID`, без ручного `chown`; непривилегированный не-root запуск
-сохраняется — ТЗ §9/§10.1), с фиксированными ресурсными требованиями
-ТЗ §3.2/§9/§10.1 (T-065):
+`make build-runtime` only checks that the images build. The full production
+render container is brought up by the `runtime` profile — the `render`
+service (`crawler/render:local`): render-worker + its own Chromium in one
+container (`Dockerfile.render`; the image has `USER nobody`, in compose the
+launch is overridden to `user: ${DEV_UID:-1000}:${DEV_GID:-1000}` — the
+worker writes pack content to the host bind `./var/content` owned by
+`DEV_UID`, without a manual `chown`; the unprivileged non-root run is
+preserved — spec §9/§10.1), with the fixed resource requirements of spec
+§3.2/§9/§10.1 (T-065):
 
 ```bash
-dc --profile runtime up -d render   # поднимет и зависимости (postgres, redis)
-docker inspect crawler-render-1 --format '{{.HostConfig.Memory}}'   # 2147483648 ≈ 2 ГБ (ТЗ 3.2)
-dc --profile runtime stop render    # остановить
+dc --profile runtime up -d render   # also brings up the dependencies (postgres, redis)
+docker inspect crawler-render-1 --format '{{.HostConfig.Memory}}'   # 2147483648 ≈ 2 GB (spec 3.2)
+dc --profile runtime stop render    # stop it
 ```
 
-- `mem_limit: ${MEM_RENDER:-2048m}` — бюджет Chromium ≈ 2 ГБ (ТЗ 3.2);
-  `mem_limit` — docker-аналог cgroup `MemoryMax` из ТЗ 10.1: OOM-killer
-  не затрагивает PostgreSQL и остальные сервисы.
-- `shm_size: 1gb`, `init: true` — как dev-сервису chromium (ТЗ 4.3).
-- `cap_drop: ALL`, `no-new-privileges`, непривилегированный пользователь
-  (в образе `nobody`, в compose — `DEV_UID`/`DEV_GID` под запись в
-  host-bind `var/content`) — рендер недоверенных страниц без root (ТЗ §9).
-- перезапуск Chromium каждые N страниц и по порогу RSS — изнутри воркера
-  (`render.restart_every_pages`, `render.restart_memory_bytes`; конфиг —
-  `deploy/docker/config.render.yaml`, `remote_url` пуст — боевой режим),
-  жёсткий потолок — `mem_limit`; детали — [`render.md`](render.md),
-  раздел «Перезапуск браузера и порог памяти».
-- systemd-юниты с `MemoryMax`/`User=` (постановка вне Docker) —
-  [`deploy/systemd/`](../deploy/systemd/), инструкция
-  [`deploy.md`](deploy.md) (этап 9, ТЗ 10.1 — нативный боевой деплой:
-  пакеты ОС, статические бинарники; docker-runtime остаётся вариантом
-  для Docker-хостов).
+- `mem_limit: ${MEM_RENDER:-2048m}` — the Chromium budget ≈ 2 GB (spec 3.2);
+  `mem_limit` is the docker analog of the cgroup `MemoryMax` from spec 10.1:
+  the OOM-killer does not touch PostgreSQL or the other services.
+- `shm_size: 1gb`, `init: true` — as for the dev chromium service (spec 4.3).
+- `cap_drop: ALL`, `no-new-privileges`, an unprivileged user (`nobody` in
+  the image, `DEV_UID`/`DEV_GID` in compose, matching the writes to the
+  `var/content` host bind) — rendering untrusted pages without root
+  (spec §9).
+- Chromium restarts every N pages and on the RSS threshold — from inside the
+  worker (`render.restart_every_pages`, `render.restart_memory_bytes`;
+  config — `deploy/docker/config.render.yaml`, `remote_url` empty —
+  production mode); the hard cap is `mem_limit`; details —
+  [`render.md`](render.md), the "Browser restart and memory threshold"
+  section.
+- systemd units with `MemoryMax`/`User=` (deployment outside Docker) —
+  [`deploy/systemd/`](../deploy/systemd/), instructions in
+  [`deploy.md`](deploy.md) (stage 9, spec 10.1 — the native production
+  deployment: OS packages, static binaries; docker-runtime remains an
+  option for Docker hosts).
 
-Сервис потребляет `q:render` полным рабочим циклом (T-067: рендер в
-изолированных контекстах, замена сырого HTML на итоговый DOM в
-хранилище, публикация `q:analyze`) — конвейер описан в
-[`render.md`](render.md) «Цикл очередей».
+The service consumes `q:render` with a full work cycle (T-067: render in
+isolated contexts, replacing the raw HTML with the final DOM in storage,
+publishing `q:analyze`) — the pipeline is described in
+[`render.md`](render.md), "Queue cycle".
 
-## 7. Диагностика Docker
+## 7. Docker diagnostics
 
 ```bash
-dc ps -a                          # unhealthy/exited — первый взгляд
-dc logs --tail=200 <сервис>       # почему падает
-dc top analyzer                   # процессы внутри контейнера
-docker stats --noheader           # потребление CPU/RAM всеми контейнерами
-docker inspect crawler-analyzer-1 --format '{{.HostConfig.Memory}}'  # лимит
-dc events                         # поток событий (restart, oom и т.п.)
+dc ps -a                          # unhealthy/exited — the first look
+dc logs --tail=200 <service>      # why it is crashing
+dc top analyzer                   # processes inside the container
+docker stats --noheader           # CPU/RAM usage of all containers
+docker inspect crawler-analyzer-1 --format '{{.HostConfig.Memory}}'  # the limit
+dc events                         # the event stream (restart, oom, etc.)
 ```
 
-Типовые проблемы:
+Typical problems:
 
-- **`pool overlaps`** при создании сети — подсеть из compose занята другим
-  проектом. Проверьте `docker network ls` + `docker network inspect <имя>`;
-  при необходимости замените подсеть `172.28.100.0/24` в `deploy/docker/compose.yaml`,
+- **`pool overlaps`** when creating a network — the compose subnet is taken
+  by another project. Check `docker network ls` +
+  `docker network inspect <name>`; if necessary, replace the
+  `172.28.100.0/24` subnet in `deploy/docker/compose.yaml`,
   `deploy/docker/unbound/*.conf`, `deploy/docker/testbed/scenarios.yaml`,
-  `test/integration/env_test.go`, `deploy/docker/config.dev.yaml` и выполните
+  `test/integration/env_test.go`, `deploy/docker/config.dev.yaml` and run
   `make testbed-gen`.
-- **Контейнер приложения в restart-цикле** — `dc logs <сервис>`: чаще всего
-  это air с некомпилирующимся кодом; ошибка видна в логе, после правки всё
-  пересоберётся само.
-- **Permission denied в `var/`** — каталог создан root (например, Docker'ом
-  при авто-создании bind-mount). Лечится: `sudo chown -R $(id -u):$(id -g) var`.
-- **Порт занят на хосте** — поменяйте `PG_PORT`/`REDIS_PORT`/… в `.env`.
-- **«Address already in use» при старте сервиса** — живой одноразовый
-  run-контейнер (`make test`/`lint`/`debug` из другого дерева) занял адрес
-  остановленного статического сервиса — остаточный риск плана адресов
-  (§8): дождитесь завершения прогона или уберите зависший `tools-run-…`
-  (пункт «Обвисшие» ниже), затем стартуйте сервис заново.
-- **Место кончилось** — `docker system df`; чистить кэши сборок:
-  `docker builder prune` (безопасно, пересборка дольше), тома проекта — только
-  через `make clean`.
-- **«Обвисшие» одноразовые контейнеры tools** — `dc rm -f tools-run-…` или
+- **An app container in a restart loop** — `dc logs <service>`: most often
+  it is air with non-compiling code; the error is visible in the log, and
+  after the fix everything rebuilds on its own.
+- **Permission denied in `var/`** — the directory was created by root (for
+  example, by Docker when auto-creating a bind mount). Fix:
+  `sudo chown -R $(id -u):$(id -g) var`.
+- **A port is taken on the host** — change `PG_PORT`/`REDIS_PORT`/… in `.env`.
+- **"Address already in use" at service start** — a live one-off run
+  container (`make test`/`lint`/`debug` from another tree) took the address
+  of a stopped static service — a residual risk of the address plan (§8):
+  wait for the run to finish or remove the stuck `tools-run-…` (the "Hung
+  containers" item below), then start the service again.
+- **Out of disk space** — `docker system df`; clean the build caches with
+  `docker builder prune` (safe, rebuilds take longer); the project volumes —
+  only via `make clean`.
+- **"Hung" one-off tools containers** — `dc rm -f tools-run-…` or
   `docker rm $(docker ps -aq --filter label=com.docker.compose.project=crawler --filter status=exited)`.
 
-## 8. Сеть, адреса и порты
+## 8. Network, addresses and ports
 
-Сеть `crawler_crawler_net` (`172.28.100.0/24`). Все **долгоживущие** сервисы
-получили статические адреса (T-180): динамический аллокатор Docker не
-резервирует адреса остановленных контейнеров, и стартующий динамический
-сервис занимал чужой адрес — владелец падал «Address already in use»
-и не поднимался без ручного лечения (инциденты 2026-10-23/24 — этап 28
-в `tasks/tasks.md`). План адресов по классам:
+The `crawler_crawler_net` network (`172.28.100.0/24`). All **long-lived**
+services got static addresses (T-180): Docker's dynamic allocator does not
+reserve the addresses of stopped containers, and a starting dynamic service
+would take someone else's address — the owner failed with
+"Address already in use" and would not come up without manual fixing
+(incidents 2026-10-23/24 — stage 28 in `tasks/tasks.md`). The address plan
+by class:
 
-| Сервис | Адрес | Профиль |
+| Service | Address | Profile |
 |---|---|---|
-| postgres | `172.28.100.2` | по умолчанию |
-| redis | `172.28.100.3` | по умолчанию |
-| unbound | `172.28.100.10` | по умолчанию (DNS всех сервисов приложения) |
+| postgres | `172.28.100.2` | default |
+| redis | `172.28.100.3` | default |
+| unbound | `172.28.100.10` | default (the DNS of all app services) |
 | coredns | `172.28.100.11` | testbed |
-| testweb | `172.28.100.12` | testbed (все домены-фикстуры; testbedgen печёт адрес в зоны) |
+| testweb | `172.28.100.12` | testbed (all fixture domains; testbedgen bakes the address into the zones) |
 | mockserver | `172.28.100.13` | testbed |
 | chromium | `172.28.100.14` | app (CDP `ws://…:9222`) |
-| render | `172.28.100.15` | runtime (боевой render-контейнер) |
-| render-fallback | `172.28.100.18` | runtime (воркер B — фолбэк-рендер, T-240) |
+| render | `172.28.100.15` | runtime (the production render container) |
+| render-fallback | `172.28.100.18` | runtime (worker B — the fallback render, T-240) |
 | lightpanda | `172.28.100.16` | render-engines (CDP `ws://…:9222`, T-241) |
 | moli | `172.28.100.17` | render-engines (CDP `ws://…:9222`, T-241) |
 | monitor | `172.28.100.20` | app |
@@ -320,145 +333,155 @@ dc events                         # поток событий (restart, oom и �
 | prometheus | `172.28.100.30` | monitoring |
 | adminer | `172.28.100.31` | tools |
 | redis-insight | `172.28.100.32` | tools |
-| tools | — (динамический) | tools — единственное исключение плана (см. ниже) |
-| — | `172.28.100.250` | «чёрная дыра»: адрес без слушателя, сценарий закрытых портов — не занимается ни одним сервисом |
+| tools | — (dynamic) | tools — the only exception to the plan (see below) |
+| — | `172.28.100.250` | the "black hole": an address with no listener, the closed-ports scenario — claimed by no service |
 
-Адреса сервисов приложения выбраны по мнемонике: адрес `.2k` — порт метрик
-`910k` (monitor `9100` → `.20`, … dashboard `9108` → `.28`); `.29` — резерв
-под новый сервис app, у monitoring/tools свободно с `.33`. Движки рендера
-(этап 35, T-241) стоят рядом с chromium/render — `.16`/`.17`: портов метрик
-у них нет (браузеры, не Go-сервисы), поэтому мнемоника `.2k` не применяется.
-Воркер B (render-fallback, T-240) — Go-сервис класса runtime: `.18`,
-следующий за движками рендера; мнемоника `.2k` не применяется — класс
-runtime живёт в отдельных контейнерах со своими портами метрик
-(`:9105` в каждом, network namespace свой — конфликта нет); в
-systemd-деплое у воркера B фиксированный loopback-порт метрик 9120
-(deploy.md §2.3), вынесенный из диапазона экземпляров `render-worker@`.
-Адреса инфраструктуры/testbed/chromium/render исторические и не меняются — они
-зафиксированы у потребителей (DNS-зоны testbedgen `172.28.100.12`,
-`ws://172.28.100.14:9222` у live-тестов рендера, DSN `172.28.100.2`
-в `config.dev.yaml` и тестах миграций); адрес lightpanda зашит ещё и в её
-`--advertise-host` (реклама CDP-адреса в `/json/version` — compose.yaml),
-а адрес moli — в `command --host` и адресе healthcheck (moli биндится на
-свой статический адрес и пробует `/json/version` по нему): смена адреса
-любого движка по плану — правка всех мест сразу (ipv4_address + флаги).
+The app service addresses follow a mnemonic: the address `.2k` — the
+metrics port `910k` (monitor `9100` → `.20`, … dashboard `9108` → `.28`);
+`.29` is reserved for a new app service, and monitoring/tools are free from
+`.33` on. The render engines (stage 35, T-241) sit next to chromium/render —
+`.16`/`.17`: they have no metrics ports (browsers, not Go services), so the
+`.2k` mnemonic does not apply. Worker B (render-fallback, T-240) is a Go
+service of the runtime class: `.18`, right after the render engines; the
+`.2k` mnemonic does not apply — the runtime class lives in separate
+containers with its own metrics ports (`:9105` in each, each with its own
+network namespace — no conflict); in the systemd deployment worker B has a
+fixed loopback metrics port 9120 (deploy.md §2.3), moved out of the
+`render-worker@` instance range. The infrastructure/testbed/chromium/render
+addresses are historical and do not change — they are pinned at their
+consumers (the testbedgen DNS zones `172.28.100.12`,
+`ws://172.28.100.14:9222` in the render live tests, the DSN `172.28.100.2`
+in `config.dev.yaml` and the migration tests); the lightpanda address is
+also baked into its `--advertise-host` (advertising the CDP address in
+`/json/version` — compose.yaml), and the moli address — into
+`command --host` and the healthcheck address (moli binds to its static
+address and probes `/json/version` on it): changing any engine's address
+under the plan means editing all the places at once (ipv4_address + flags).
 
-**Исключение — `tools`: адрес не задаётся.** Его прогоны (`make test`,
-`make lint`, `docker compose run …`) — одноразовые run-контейнеры,
-запускаемые параллельно из основного дерева и worktree'ов с
-`COMPOSE_PROJECT_NAME=crawler`, т.е. в ту же сеть `crawler_net`: общий
-статический адрес конфликтовал бы между ними.
+**The exception — `tools`: no address is assigned.** Its runs (`make test`,
+`make lint`, `docker compose run …`) are one-off run containers launched in
+parallel from the main tree and from worktrees with
+`COMPOSE_PROJECT_NAME=crawler`, i.e. onto the same `crawler_net` network: a
+shared static address would conflict between them.
 
-Остаточный риск (принят осознанно): если владелец статического адреса
-**остановлен**, его адрес становится младшим свободным (аллокатор выдаёт
-свободные адреса с младших), и следующий одноразовый run-контейнер займёт
-его — тогда владелец не стартанёт «Address already in use». Окно ограничено
-временем жизни run-контейнера и самозалечивается (`--rm`): дождаться
-завершения прогона (или убрать зависший `dc rm -f tools-run-…`, см. §7)
-и стартовать владельца заново. Пока все статические сервисы запущены,
-run-контейнеры берут свободные младшие адреса (.4–.9, .18–.19, …) и никому
-не мешают.
-По той же причине `make debug SERVICE=<app-сервис>` (run-контейнер сервиса
-приложения) запускайте после остановки штатного контейнера сервиса:
-`dc stop <сервис>` — иначе run-контейнер не получит его статический адрес.
+The residual risk (accepted deliberately): if the owner of a static address
+is **stopped**, its address becomes the lowest free one (the allocator
+hands out free addresses from the lowest), and the next one-off run
+container will take it — then the owner will not start, with
+"Address already in use". The window is bounded by the run container's
+lifetime and self-heals (`--rm`): wait for the run to finish (or remove the
+stuck one with `dc rm -f tools-run-…`, see §7) and start the owner again.
+While all static services are running, the run containers take free low
+addresses (.4–.9, .18–.19, …) and bother no one.
+For the same reason, run `make debug SERVICE=<app service>` (a run container
+of an app service) after stopping the service's regular container:
+`dc stop <service>` — otherwise the run container will not get its static
+address.
 
-Разовое замечание на переходе (обновление до T-180): контейнеры, запущенные
-до введения плана, держат старые динамические адреса и могут конфликтовать
-с новыми статическими (например, scheduler мог занимать .15 рендера) —
-первое применение плана требует полного пересоздания `make down && make up`;
-после него порядок стартов профилей не важен.
+A one-time transition note (the update to T-180): containers started before
+the plan was introduced keep their old dynamic addresses and may conflict
+with the new static ones (for example, scheduler could be holding the
+render's .15) — the first application of the plan requires a full
+recreation via `make down && make up`; after it, the profile start order
+does not matter.
 
-Порты на хосте (только `127.0.0.1`): `5432` PostgreSQL, `6379` Redis,
-`9090` Prometheus, `8080` Adminer, `5540` Redis Insight, `8088`/`8443`
-testweb HTTP/HTTPS, `8081` лендинг web (`WEB_PORT` в `.env`), `8090`
-операторский дашборд dashboard (`DASHBOARD_PORT`; вход по паролю —
-dev-креды в config.dev.yaml, см. [`dev-environment.md`](dev-environment.md)).
-Метрики сервисов: `9100`–`9108`
-(только внутри сети).
+Host ports (`127.0.0.1` only): `5432` PostgreSQL, `6379` Redis, `9090`
+Prometheus, `8080` Adminer, `5540` Redis Insight, `8088`/`8443` testweb
+HTTP/HTTPS, `8081` the web landing page (`WEB_PORT` in `.env`), `8090` the
+dashboard service's operator dashboard (`DASHBOARD_PORT`; password login —
+dev creds in config.dev.yaml, see [`dev-environment.md`](dev-environment.md)).
+Service metrics: `9100`–`9108` (inside the network only).
 
-Имена сервисов (`postgres`, `redis`, …) резолвятся Docker-DNS из любого
-контейнера сети; у сервисов приложения весь остальной DNS идёт через unbound
-(изоляция от интернета), а у `tools` — обычный (нужен proxy.golang.org:
-новые зависимости качаются `make mod-download`).
+Service names (`postgres`, `redis`, …) resolve via Docker DNS from any
+container on the network; for the app services all the remaining DNS goes
+through unbound (isolation from the internet), while `tools` gets regular
+DNS (proxy.golang.org is needed: new dependencies are downloaded with
+`make mod-download`).
 
-## 9. Unbound: режимы, память и fallback-резолверы
+## 9. Unbound: modes, memory and fallback resolvers
 
-Конфиги — `deploy/docker/unbound/`; `Dockerfile.unbound` прогоняет оба через
-`unbound-checkconf` при сборке образа. Режим задаётся переменной `UNBOUND_MODE`
-и переключается только `make up` / `make up-internet` (см.
-[`dev-environment.md`](dev-environment.md)).
+The configs are in `deploy/docker/unbound/`; `Dockerfile.unbound` runs both
+through `unbound-checkconf` when building the image. The mode is set by the
+`UNBOUND_MODE` variable and is switched only by `make up` /
+`make up-internet` (see [`dev-environment.md`](dev-environment.md)).
 
-| Режим | Конфиг | Поведение |
+| Mode | Config | Behavior |
 |---|---|---|
-| `testbed` (по умолчанию) | `unbound.testbed.conf` | весь трафик форвардится в coredns (172.28.100.11): тестовые зоны отвечают авторитетно, остальное — REFUSED, наружу ничего не уходит (интеграционные тесты DNS-этапа) |
-| `internet` (`make up-internet`) | `unbound.internet.conf` | полноценная рекурсия с корневых серверов, prefetch, кэш в бюджете ТЗ §3.2 |
+| `testbed` (default) | `unbound.testbed.conf` | all traffic is forwarded to coredns (172.28.100.11): the test zones answer authoritatively, everything else gets REFUSED, nothing leaves for the outside (integration tests of the DNS stage) |
+| `internet` (`make up-internet`) | `unbound.internet.conf` | full recursion from the root servers, prefetch, the cache within the spec §3.2 budget |
 
-Параметры режима `internet` (ТЗ §5.4, §3.2):
+Parameters of the `internet` mode (spec §5.4, §3.2):
 
-- **Рекурсия** — без `forward-zone`: unbound резолвит сам от корневых серверов
-  (встроенные root hints). **Prefetch** (`prefetch: yes`): запись, запрошенная
-  при остатке TTL < 10 %, обновляется до истечения срока — популярные записи
-  не выпадают из кэша (формулировка ТЗ §5.4).
-- **Кэш** ≈ 542 МБ — внутри окна ТЗ §5.4 (512–768 МБ):
-  `msg-cache-size 128m` + `rrset-cache-size 384m` (≈3× msg — рекомендация
-  NLnet Labs 2–4×) + `neg-cache-size 16m` (у краулера массово NXDOMAIN) +
-  `key-cache-size 4m` (валидатор DNSSEC отключён, чистый `iterator`) +
-  `infra-cache-numhosts 100000` (~10 МБ статистики RTT/таймаутов NS).
-- **Память контейнера** — `mem_limit: ${MEM_UNBOUND:-700m}`: бюджет ТЗ §3.2
-  «Unbound (кэш) ≈ 0,7 ГБ»; `mem_limit` — docker-аналог `MemoryMax` из §10.1.
-  Кэш-таблицы растут лениво по заполнении (стартовый RSS ≈ 20 МБ), но лимит
-  обязан вмещать полностью заполненный кэш: ~542 МБ + запас ~160 МБ на
-  процесс, буферы потоков (`num-threads: 2` под нагрузку
-  `dns.concurrency`/`dns.max_qps`) и фрагментацию аллокатора. Режим `testbed`
-  занимает ~150 МБ и вписывается в любой лимит — при нехватке памяти на
-  dev-машине в testbed можно вернуть `MEM_UNBOUND=256m` в `.env`.
-  Боевой `MemoryMax` поднят до 800M (T-160: суточный рост кэша на ≈47 млн
-  имён до 733.9 MiB у потолка 700M — load-measurements §12); dev-лимит
-  700m оставлен сознательно (как mem_limit http-worker после T-143):
-  рост — эффект многосуточного прогона, dev-сессии короче, а потолок
-  память не резервирует.
+- **Recursion** — no `forward-zone`: unbound resolves on its own from the
+  root servers (built-in root hints). **Prefetch** (`prefetch: yes`): a
+  record requested while its remaining TTL is < 10% is refreshed before it
+  expires — popular records do not fall out of the cache (the spec §5.4
+  wording).
+- **Cache** ≈ 542 MB — inside the spec §5.4 window (512–768 MB):
+  `msg-cache-size 128m` + `rrset-cache-size 384m` (≈3× msg — the NLnet Labs
+  recommendation of 2–4×) + `neg-cache-size 16m` (the crawler gets NXDOMAIN
+  en masse) + `key-cache-size 4m` (the DNSSEC validator is disabled, a pure
+  `iterator`) + `infra-cache-numhosts 100000` (~10 MB of NS RTT/timeout
+  statistics).
+- **Container memory** — `mem_limit: ${MEM_UNBOUND:-700m}`: the spec §3.2
+  budget "Unbound (cache) ≈ 0.7 GB"; `mem_limit` is the docker analog of
+  `MemoryMax` from §10.1. The cache tables grow lazily as they fill (the
+  startup RSS ≈ 20 MB), but the limit must accommodate a fully filled
+  cache: ~542 MB + ~160 MB of headroom for the process, the thread buffers
+  (`num-threads: 2` for the `dns.concurrency`/`dns.max_qps` load) and
+  allocator fragmentation. The `testbed` mode uses ~150 MB and fits any
+  limit — if the dev machine is short on memory, `MEM_UNBOUND=256m` can be
+  restored in `.env` for the testbed. The production `MemoryMax` was raised
+  to 800M (T-160: daily cache growth to ≈47 million names reaching
+  733.9 MiB at the 700M cap — load-measurements §12); the dev limit of 700m
+  was left deliberately (like the http-worker mem_limit after T-143): the
+  growth is an effect of a multi-day run, dev sessions are shorter, and the
+  cap does not reserve memory.
 
-### Почему публичные fallback-резолверы не в конфиге unbound
+### Why the public fallback resolvers are not in the unbound config
 
-ТЗ §5.4: «Публичные резолверы — только как fallback (список в конфиге)».
-Семантика unbound не позволяет реализовать это внутри резолвера:
+Spec §5.4: "Public resolvers — only as a fallback (the list in the config)".
+The unbound semantics do not allow implementing this inside the resolver:
 
-- `forward-zone` с `name: "."` перехватывает **все** запросы — форвардеры
-  становятся первичными для всего трафика;
-- `forward-first: yes` меняет лишь направление отказа: при SERVFAIL от
-  форвардера unbound повторяет запрос собственной рекурсией. Обратного
-  направления «рекурсия → форвардер при SERVFAIL» в unbound нет — такой
-  fallback реализуют на клиенте запросов.
+- a `forward-zone` with `name: "."` intercepts **all** queries — the
+  forwarders become primary for all traffic;
+- `forward-first: yes` only changes the direction of failure: on SERVFAIL
+  from a forwarder, unbound retries the query with its own recursion. The
+  reverse direction "recursion → forwarder on SERVFAIL" does not exist in
+  unbound — such a fallback is implemented in the query client.
 
-Пропускать crawl (сотни миллионов доменов) через `1.1.1.1`/`9.9.9.9` первым
-маршрутом противоречит букве ТЗ («только как fallback»), рискует упереться в
-rate-limit публичных сервисов и обесценивает локальный кэш с prefetch.
+Routing the crawl (hundreds of millions of domains) through
+`1.1.1.1`/`9.9.9.9` as the first hop contradicts the letter of the spec
+("only as a fallback"), risks hitting the rate limits of the public
+services, and devalues the local cache with prefetch.
 
-Поэтому список живёт в конфиге приложения и потребляется **клиентом
-dns-worker**: при SERVFAIL/таймауте локального unbound (`dns.resolvers`)
-запрос повторяется напрямую в `dns.fallback_resolvers` (`internal/dnsclient`,
-T-034). Поле и env-переопределение `CRAWLER_DNS_FALLBACK_RESOLVERS` есть с
-T-006; дефолты по ТЗ §5.10 — `1.1.1.1:53`, `9.9.9.9:53` (общедоступные
-anycast-резолверы двух независимых операторов — Cloudflare и Quad9). В
-dev/testbed список пуст (`config.dev.yaml`) — изоляция от интернета
-сохраняется; при `make up-internet` включается при необходимости той же
-переменной. Подробности — [`configuration.md`](configuration.md), секция `dns`.
+So the list lives in the application config and is consumed by the
+**dns-worker client**: on SERVFAIL/timeout of the local unbound
+(`dns.resolvers`) the query is retried directly against
+`dns.fallback_resolvers` (`internal/dnsclient`, T-034). The field and the
+`CRAWLER_DNS_FALLBACK_RESOLVERS` env override exist since T-006; the
+defaults per spec §5.10 are `1.1.1.1:53`, `9.9.9.9:53` (public anycast
+resolvers of two independent operators — Cloudflare and Quad9). In
+dev/testbed the list is empty (`config.dev.yaml`) — isolation from the
+internet is preserved; with `make up-internet` it is enabled when needed
+via the same variable. Details — [`configuration.md`](configuration.md),
+the `dns` section.
 
-## 10. Шпаргалка по сценариям
+## 10. Scenario cheat sheet
 
 ```bash
-# повседневная работа
+# everyday work
 make up && make logs SERVICE=analyzer
 
-# «упало, поднять всё заново с чистой БД»
+# "it fell over, bring everything back up with a clean DB"
 make db-reset
 
-# посмотреть состояние конкретного домена в тестовой зоне
+# look at the state of a specific domain in a test zone
 make domain NAME=laravel-11-vite.crawl.test
 
-# прогнать всё, что гоняет CI
+# run everything CI runs
 make lint && make test && make test-rules && make test-integration && make build-runtime
 
-# закончить день
+# end the day
 make down
 ```
