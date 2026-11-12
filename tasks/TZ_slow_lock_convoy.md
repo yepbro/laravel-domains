@@ -1,174 +1,186 @@
-# Техническое задание: конвой строковых блокировок `domains` — наблюдаемость держателя и потолок ожидания
+# Specification: the row-lock convoy on `domains` — holder observability and a wait cap
 
-Версия: 1.0 (по итогам разбора кластера блокировок окна после деплоя
-2026-10-25 12:37 MSK — записи №2–№4/№6/№11 журнала; лог:
-`log_min_duration_statement = 3000`, T-177). Класс — не плановая
-патология (планы жертв — точечные сканы по PK), а инцидент
-взаимоблокировочного ожидания: длинная транзакция держит строчные
-локи `domains` десятки минут, точечные соседи ждут без потолка.
+Version: 1.0 (based on the analysis of the lock cluster of the window
+after the 2026-10-25 12:37 MSK deploy — log entries #2–#4/#6/#11; the
+log: `log_min_duration_statement = 3000`, T-177). The class is not a
+planned pathology (the victim plans are point scans by PK) but a
+deadlock-wait incident: a long transaction holds row locks on
+`domains` for tens of minutes while point neighbors wait without a
+cap.
 
 ---
 
-## 1. Сегодняшнее состояние и источник
+## 1. Current state and source
 
-Жертвы конвоя — точечные операторы write-пути конвейера (все — по
-PK, все — в окне 25.10 10:22–12:44 UTC):
+The convoy victims are point statements of the pipeline write path
+(all by PK, all within the Oct 25 10:22–12:44 UTC window):
 
-| № журнала | Запрос | Источник | n>3 c | медиана | max |
+| Log entry | Statement | Source | n>3 s | median | max |
 |---|---|---|---|---|---|
-| №2 | `SELECT status, check_state … FOR UPDATE` | httpworker/record.go (T-178: чтение старых значений счётчиков) | 10 | 15,5 мин | 37,1 мин |
-| №3 | `UPDATE … SET flags = flags \| 4 …` | dnsworker: бит http_published при публикации q:http | 145 | 3,7 с | 37,3 мин |
-| №4 | `WITH b AS (… queued_at < … )` — возврат lease | scheduler/LeaseWatch (T-029) | 30 | 4,6 с | 39,4 мин |
-| №6 | `WITH s AS (… FOR UPDATE), upd …` — запись результата DNS | dnsworker/result.go | 46 | 3,9 с | 15,4 мин |
-| №11 | `WITH s AS (… FOR UPDATE)` — запись результата HTTP | httpworker/record.go | 35 | 3,7 с | 6,1 с |
+| #2 | `SELECT status, check_state … FOR UPDATE` | httpworker/record.go (T-178: reading old counter values) | 10 | 15.5 min | 37.1 min |
+| #3 | `UPDATE … SET flags = flags \| 4 …` | dnsworker: the http_published bit on q:http publication | 145 | 3.7 s | 37.3 min |
+| #4 | `WITH b AS (… queued_at < … )` — lease return | scheduler/LeaseWatch (T-029) | 30 | 4.6 s | 39.4 min |
+| #6 | `WITH s AS (… FOR UPDATE), upd …` — DNS result write | dnsworker/result.go | 46 | 3.9 s | 15.4 min |
+| #11 | `WITH s AS (… FOR UPDATE)` — HTTP result write | httpworker/record.go | 35 | 3.7 s | 6.1 s |
 
-Суммарно ≈6,1 ч времени БД за 3,6 ч окна — вторая по тяжести группа
-после retrySelectSQL (T-191).
+In total ≈6.1 h of DB time over the 3.6 h window — the second-heaviest
+group after retrySelectSQL (T-191).
 
-## 2. Диагноз (реконструкция по журналу, EXPLAIN на боевой БД)
+## 2. Diagnosis (a reconstruction from the log, EXPLAIN on the production DB)
 
-EXPLAIN жертв (боевые параметры, строка конвоя `(560, 25398110)`):
-Index Scan `domains_default_pkey`, cost 2,8, rows 1 — **план
-идеален, время — не план, а ожидание строкового лока**.
+EXPLAIN of the victims (production parameters, the convoy row
+`(560, 25398110)`): Index Scan `domains_default_pkey`, cost 2.8,
+rows 1 — **the plan is perfect; the time is not the plan but the wait
+for a row lock**.
 
-Реконструкция по timestamps (старт = отметка журнала − duration):
+Reconstruction from timestamps (start = the log timestamp − duration):
 
-1. **Волна 1, массовый держатель ~10:22–10:38**: девять жертв
-   (lease-возврат, publish, записи результатов; зоны 1, 2, 3, 4, 15,
-   105, 121, 290×2 — разные строки по всей таблице) стартовали
-   10:22:13–10:22:50 и **освободились одновременно 10:38:04.212–.226**
-   (ожидания 895–950 с) — подпись одной транзакции, державшей
-   разрозненные строки ≈16 мин: обход таблицы с UPDATE по ходу.
-2. **Волна 2, одиночный конвой 10:40–11:17**: пять сессий трёх
-   сервисов (dns-worker + 4 соединения http-worker) встали на **одну
-   строку `(zone_id=560, id=25398110)`** с ожиданиями 1604–2240 с и
-   **освободились в одну секунду 11:17:27.899–11:17:28.138** — держатель
-   жил ≈37 мин; очередь из пяти — классический конвой.
-3. **Хвост 11:17–12:44**: ожидания 3–7 с по разным строкам —
-   растянутые транзакции write-пути под I/O-штормом retrySelectSQL
-   (T-191: 16 GiB чтений каждые ~90 с) плюс короткие локи соседей.
-4. **Оператор исключён**: journalctl sshd за 13:00–14:30 MSK — ни
-   одного Accepted-входа; держатель — транзакция приложения.
-   Точная идентификация невозможна пост-фактум:
-   **`log_lock_waits = off`** — журнал не содержит ни одного
-   «process still waiting for …» (0 строк за сутки); имя держателя
-   (pid, оператор, транзакция) не восстановимо. Гипотеза-кандидат
-   (не доказуема задним числом): транзакция записи результата,
-   растянутая штормом (TOAST-удаления/вставки `subdomain_results`,
-   refcount `contents`) — проверяется только при повторении с
-   включённым log_lock_waits.
-5. **Последствие — стояние конвейера ≈55 мин**: q:dns у watermark 125
-   всё окно («публикация приостановлена» каждые ~30 с, scheduler),
-   dns-worker не мог записать результаты (жертва №6) → XACK не шёл →
-   глубина не убывала → диспетчер не публиковал. Алерт «замороженная
-   очередь» (T-162) не срабатывает по определению (доставки шли,
-   пусть и медленно); сигнал был только потоком сообщений T-177.
+1. **Wave 1, a mass holder ~10:22–10:38**: nine victims (a lease
+   return, a publish, result writes; zones 1, 2, 3, 4, 15, 105, 121,
+   290×2 — different rows across the whole table) started at
+   10:22:13–10:22:50 and **were released simultaneously at
+   10:38:04.212–.226** (waits of 895–950 s) — the signature of a single
+   transaction holding scattered rows for ≈16 min: a table traversal
+   with UPDATEs along the way.
+2. **Wave 2, a single convoy 10:40–11:17**: five sessions of three
+   services (dns-worker + 4 http-worker connections) queued on **one
+   row `(zone_id=560, id=25398110)`** with waits of 1604–2240 s and
+   **were released within one second 11:17:27.899–11:17:28.138** — the
+   holder lived ≈37 min; a queue of five is a classic convoy.
+3. **The tail 11:17–12:44**: waits of 3–7 s on various rows —
+   write-path transactions stretched by the retrySelectSQL I/O storm
+   (T-191: 16 GiB of reads every ~90 s) plus short neighbor locks.
+4. **The operator is ruled out**: journalctl sshd for 13:00–14:30 MSK —
+   not a single Accepted login; the holder is an application
+   transaction. Exact identification is impossible post factum:
+   **`log_lock_waits = off`** — the log contains no
+   "process still waiting for …" lines (0 lines per day); the holder's
+   identity (pid, statement, transaction) is unrecoverable. The
+   candidate hypothesis (not provable retroactively): a result-write
+   transaction stretched by the storm (TOAST deletes/inserts into
+   `subdomain_results`, the `contents` refcount) — verifiable only on
+   recurrence with log_lock_waits enabled.
+5. **The consequence — a pipeline standstill of ≈55 min**: q:dns sat
+   at watermark 125 the whole window ("publication suspended" every
+   ~30 s, scheduler); dns-worker could not write results (victim #6) →
+   no XACK → the depth did not decrease → the dispatcher did not
+   publish. The "frozen queue" alert (T-162) does not fire by
+   definition (deliveries were happening, albeit slowly); the only
+   signal was the stream of T-177 messages.
 
-## 3. Целевое состояние
+## 3. Target state
 
-1. При повторении журнал БД **по имени называет держателя** (pid,
-   оператор, время ожидания) — `log_lock_waits = on`.
-2. Конвой обрезается потолком: точечный write-путь ждёт строку не
-   дольше `lock_timeout = 30 с`, дальше — откат транзакции и штатный
-   повтор доставки (at-least-once, ТЗ §3.4), вместо 37 минут немого
-   ожидания, разрывающего конвейер.
-3. Точечный фикс держателя — отдельной задачей по данным повторения
-   (эта волна даёт только класс, не имя).
+1. On recurrence the DB log **names the holder** (pid, statement, wait
+   time) — `log_lock_waits = on`.
+2. The convoy is cut off by a cap: the point write path waits on a row
+   for no longer than `lock_timeout = 30 s`; beyond that — a
+   transaction rollback and the normal delivery retry (at-least-once,
+   spec §3.4), instead of 37 minutes of silent waiting that breaks the
+   pipeline.
+3. A point fix of the holder — a separate task based on the recurrence
+   data (this wave yields only the class, not the name).
 
-## 4. Изменения
+## 4. Changes
 
-### 4.1. `log_lock_waits = on` на боевой БД (операционно)
+### 4.1. `log_lock_waits = on` on the production DB (operational)
 
-reload-параметр; пишет одну строку «process N still waiting for
-ShareLock on transaction X …» при ожидании дольше `deadlock_timeout`
-(1 с). Цена — несколько строк журнала только в минуты реального
-конкурентного ожидания; выгода — имя держателя в следующем инциденте.
-Зафиксировать в боевых конфиг-файлах (путь — T-086/T-177, где уже
-лежит `log_min_duration_statement`) и в dev-конфиге
-(`deploy/docker`).
+A reload parameter; writes one line "process N still waiting for
+ShareLock on transaction X …" when a wait exceeds `deadlock_timeout`
+(1 s). The cost — a few log lines only during minutes of real
+concurrent waits; the benefit — the holder's name in the next
+incident. Pin it in the production config files (the path —
+T-086/T-177, where `log_min_duration_statement` already lives) and in
+the dev config (`deploy/docker`).
 
-### 4.2. `lock_timeout = 30 s` пулам write-путей
+### 4.2. `lock_timeout = 30 s` for the write-path pools
 
-В `db.Options.AfterConnect` (проводка `service.Options.DBAfterConnect`)
-рядом с `NoParallelGather` (T-171) — новый хук `db.LockTimeout(30s)`
-(`SET lock_timeout = '30s'`), включаемый у dns-worker, http-worker,
-scheduler (пулы, чьи транзакции берут строчные локи `domains`):
+In `db.Options.AfterConnect` (wiring `service.Options.DBAfterConnect`)
+next to `NoParallelGather` (T-171) — a new hook `db.LockTimeout(30s)`
+(`SET lock_timeout = '30s'`), enabled for dns-worker, http-worker,
+scheduler (the pools whose transactions take row locks on `domains`):
 
-- 30 с на три порядка выше штатных ожиданий (мс на запись результата)
-  и на порядок ниже инцидентных (15–39 мин) — режет только конвой;
-- откат транзакции записи → доставка без XACK → повтор после
-  бэкоффа доставки (минуты) переживает окно держателя; исчерпание
-  попыток → q:dead — видимый сигнал (алерт T-162) вместо немого
-  стояния q:dns у watermark;
-- монитор/dashboard/анализатор не трогаются (читатели без строчных
-  локов; реконсиляция — короткие построчные UPDATE зон).
+- 30 s is three orders of magnitude above the normal waits (ms per
+  result write) and one order below the incident ones (15–39 min) —
+  it cuts only the convoy;
+- a write transaction rollback → a delivery without XACK → a retry
+  after the delivery backoff (minutes) outlives the holder's window;
+  attempt exhaustion → q:dead — a visible signal (the T-162 alert)
+  instead of the silent q:dns standstill at the watermark;
+- monitor/dashboard/analyzer untouched (readers without row locks;
+  reconciliation — short per-row zone UPDATEs).
 
-Значение — константа-дефолт с обоснованием в комментарии; вынос в
-конфиг не требуется (инцидентный потолок, не тюнинг).
+The value is a default constant with the rationale in a comment; no
+config knob is needed (an incident cap, not tuning).
 
-### 4.3. Зависимости
+### 4.3. Dependencies
 
-Миграций нет. 4.1 — операционно сразу (не ждёт деплоя); 4.2 — код,
-очередной деплой. Координация с T-191: обе правят поведение scheduler
-пула (AfterConnect хук) — файлы совпадают, выполнять в одну волну
-или последовательно без конфликта (разные хуки одного проводника).
+No migrations. 4.1 — operational, immediately (does not wait for a
+deploy); 4.2 — code, the next deploy. Coordination with T-191: both
+change the scheduler pool behavior (the AfterConnect hook) — the files
+overlap; run in one wave or sequentially without conflict (different
+hooks of the same wiring).
 
-## 5. Риски и границы
+## 5. Risks and boundaries
 
-1. **lock_timeout может резать легитимно длинные ожидания** массовых
-   проходов (lease-возврат №4 конкурирует с enqueue по одним строкам):
-   30 с потолок покрывает наблюдавшиеся нормы (максимум секунд вне
-   инцидента — 10,6 с enqueue); контроль — журнал T-177 + WARN
-   таймаутов в сервисах (метрика откатов).
-2. **Держатель волны 1 не идентифицирован** — обходный UPDATE по
-   таблице 16 мин; кандидаты в коде отсутствуют (enqueue/lease/записи
-   — пачки по ключам, секунды) — при повторении с log_lock_waits
-   разбирать по имени; фикс держателя — вне этой задачи.
-3. Хвост 3–5 с (№3/№6/№11 вне монстров) — I/O-шторм T-191, уходит
-   его фиксом; отдельной правки не требует (контроль после T-191).
+1. **lock_timeout may cut legitimately long waits** of mass passes
+   (lease return #4 competes with enqueue for the same rows): the 30 s
+   cap covers the observed norms (a maximum of seconds outside the
+   incident — 10.6 s for enqueue); the control — the T-177 log + WARNs
+   on timeouts in the services (a rollback metric).
+2. **The wave 1 holder is not identified** — a table-traversing UPDATE
+   for 16 min; no candidates in the code (enqueue/lease/writes are
+   key-based batches, seconds) — on recurrence with log_lock_waits,
+   analyze by name; the holder fix is outside this task.
+3. The 3–5 s tail (#3/#6/#11 outside the monsters) — the T-191 I/O
+   storm, goes away with its fix; needs no separate change (monitor
+   after T-191).
 
-## 6. Принятые решения и отклонённые варианты
+## 6. Accepted decisions and rejected alternatives
 
-1. **Наблюдаемость + потолок, не точечный фикс** — держатель не
-   восстановим задним числом; класс закрыт наблюдением (4.1) и
-   ограничением ущерба (4.2), имя — по повторению.
-2. Отклонено **«ничего не делать, раз инцидент разовый»**: конвейер
-   молча стоял 55 мин; без log_lock_waits следующее повторение снова
-   безымянное.
-3. Отклонён **`idle_in_transaction_session_timeout`** (защита от
-   забытых транзакций): операторских сессий в окне не было, главный
-   путь — приложение; параметр режет и легитимные длинные транзакции
-   ingest-применения файлов.
-4. Отклонён **`statement_timeout` на write-пулы**: режет сами
-   длинные операции (enqueue 10,6 с, записи под штормом), превращая
-   медленные успехи в откат; lock_timeout адресно ловит только
-   ожидание чужого лока.
-5. Отклонено **ожидание повтора без потолка** (только 4.1): повторение
-   снова стоит час конвейера ради одной строки журнала.
+1. **Observability + a cap, not a point fix** — the holder is not
+   recoverable retroactively; the class is closed by observation (4.1)
+   and damage limitation (4.2); the name — upon recurrence.
+2. Rejected **"do nothing, the incident is a one-off"**: the pipeline
+   stood silently for 55 min; without log_lock_waits the next
+   recurrence will be nameless again.
+3. Rejected **`idle_in_transaction_session_timeout`** (protection
+   against forgotten transactions): no operator sessions in the
+   window, the main path is the application; the parameter also cuts
+   legitimate long transactions of the file-ingest apply.
+4. Rejected **`statement_timeout` on the write pools**: it cuts the
+   long operations themselves (enqueue 10.6 s, writes under the
+   storm), turning slow successes into rollbacks; lock_timeout
+   targets precisely the wait for someone else's lock.
+5. Rejected **waiting for a recurrence without a cap** (4.1 only):
+   the recurrence would again cost an hour of pipeline standstill for
+   one log line.
 
-## 7. Тестирование и приёмка
+## 7. Testing and acceptance
 
-1. Юнит: хук `db.LockTimeout` устанавливает `lock_timeout` в
-   AfterConnect (по образцу теста NoParallelGather pool_test.go);
-   проводка включена у dns-worker/http-worker/scheduler, не включена
-   у monitor/web/dashboard.
-2. Интеграция: сессия пула видит `lock_timeout = 30s`
-   (`SHOW lock_timeout`); операция, ждущая строку дольше потолка,
-   получает SQLSTATE 55P03 и штатный путь повтора (сценарий на
-   testbed: удержание строки второй сессией).
-3. Приёмка: на бою `SHOW log_lock_waits` = on; при повторении
-   конвоя журнал содержит «process … still waiting» с pid и
-   транзакцией держателя; ожидания в журнале T-177 не превышают
-   потолка (30 с) вне собственно держателя; `make test` +
-   `make test-integration` зелёные.
+1. Unit: the `db.LockTimeout` hook sets `lock_timeout` in
+   AfterConnect (modeled on the NoParallelGather test in
+   pool_test.go); the wiring is enabled for
+   dns-worker/http-worker/scheduler and not for
+   monitor/web/dashboard.
+2. Integration: a pool session sees `lock_timeout = 30s`
+   (`SHOW lock_timeout`); an operation waiting on a row longer than
+   the cap gets SQLSTATE 55P03 and the normal retry path (a testbed
+   scenario: the row held by a second session).
+3. Acceptance: in production `SHOW log_lock_waits` = on; on convoy
+   recurrence the log contains "process … still waiting" with the pid
+   and the transaction of the holder; waits in the T-177 log do not
+   exceed the cap (30 s) except the holder itself; `make test` +
+   `make test-integration` green.
 
-## 8. Этапность
+## 8. Staging
 
-1. Операционно: `log_lock_waits = on` на бою (reload) + фиксация в
-   конфигах (4.1).
-2. Код: хук `db.LockTimeout` + проводка трёх пулов (4.2).
-3. Тесты §7, примечание в docs/operations.md (разбор инцидента
-   25.10: сигнатура конвоя, где искать держателя в журнале).
+1. Operational: `log_lock_waits = on` in production (reload) + pinning
+   in the configs (4.1).
+2. Code: the `db.LockTimeout` hook + the wiring of the three pools
+   (4.2).
+3. The §7 tests, a note in docs/operations.md (the Oct 25 incident
+   analysis: the convoy signature, where to look for the holder in
+   the log).
 
-Зависимости: T-171 (место хука AfterConnect); координация с T-191
-(общий проводник пула scheduler). Миграций нет.
+Dependencies: T-171 (the AfterConnect hook location); coordination
+with T-191 (the shared scheduler pool wiring). No migrations.

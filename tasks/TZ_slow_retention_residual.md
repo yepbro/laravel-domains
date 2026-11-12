@@ -1,142 +1,152 @@
-# Техническое задание: остаточная медленность retention-дренажа — сериальный проход и аппаратный фактор
+# Specification: residual slowness of the retention drain — a serial pass and the hardware factor
 
-Версия: 1.0 (по итогам разбора лога медленных запросов окна после
-деплоя 3bffc62 — 2026-10-25 18:16 → 10-26 03:05 UTC, запросы №4/№8 по
-суммарному времени БД; лог: `log_min_duration_statement = 3000`, T-177,
-локальная копия `tmp/pg_slow_after_3bffc62.log`). Дополняет
+Version: 1.0 (based on the analysis of the slow-query log of the
+window after the 3bffc62 deploy — 2026-10-25 18:16 → 10-26 03:05 UTC,
+statements #4/#8 by total DB time; the log:
+`log_min_duration_statement = 3000`, T-177, local copy
+`tmp/pg_slow_after_3bffc62.log`). It extends
 [`TZ_slow_retention_drain.md`](./TZ_slow_retention_drain.md) (T-185):
-время-курсор себя оправдал (медиана 75,9 с → 13,8 с), но проход не ушёл
-из журнала медленных — разбор почему и что ещё можно.
+the time cursor proved itself (median 75.9 s → 13.8 s), but the pass
+has not left the slow log — an analysis of why and what else can be
+done.
 
 ---
 
-## 1. Сегодняшнее состояние и источник
+## 1. Current state and source
 
-`retentionSelectSQL` (`internal/content/retention.go:150`) — время-форма
-T-185 (курсор `(checked_at, PK)`, окно старения
+`retentionSelectSQL` (`internal/content/retention.go:150`) — the T-185
+time form (the cursor `(checked_at, PK)`, the aging window
 `checked_at < now() − retention`, `LIMIT content.retention_batch`
-(10 000), JOIN `domains` (render-безопасность, status) + anti-join
-`laravel_domains`), часовой `RetentionLoop` http-worker; рядом
-`retentionClearSQL` — пакетная очистка (UPDATE … FROM unnest, NULL-ы
-payload-колонок) отобранной пачки.
+(10,000), a JOIN on `domains` (render safety, status) + an anti-join
+on `laravel_domains`), the hourly `RetentionLoop` of http-worker; next
+to it `retentionClearSQL` — the batch cleaning (UPDATE … FROM unnest,
+NULLing the payload columns) of the selected batch.
 
-Статистика окна после 3bffc62: SELECT — 38 событий, медиана **13,8 с**,
-max **222,8 с** (первый проход после рестарта деплоя — якорное окно
-T-185 §4); UPDATE-очистка — 37 событий, медиана 12,1 с. Для сравнения,
-до T-185 (окно 24.10): медиана 75,9 с, max 262,5 с — выигрыш ~5,5×
+Statistics of the window after 3bffc62: SELECT — 38 events, median
+**13.8 s**, max **222.8 s** (the first pass after the deploy restart —
+the anchor window of T-185 §4); the UPDATE cleaning — 37 events,
+median 12.1 s. For comparison, before T-185 (the Oct 24 window):
+median 75.9 s, max 262.5 s — the ~5.5× gain
 
-подтверждён.
+is confirmed.
 
-## 2. Диагноз (EXPLAIN ANALYZE, BUFFERS на боевой БД, 26.10)
+## 2. Diagnosis (EXPLAIN ANALYZE, BUFFERS on the production DB, Oct 26)
 
-Замер прохода с часовым окном (курсор = now−7ч, старение 6 ч, LIMIT
-10 000), стационарный голод CPU/IO (PSI some avg300 ≈ 80 %):
+A measurement of the pass with an hourly window (cursor = now−7h,
+aging 6 h, LIMIT 10,000), a steady-state CPU/IO starvation (PSI some
+avg300 ≈ 80%):
 
-| Узел плана | Факт | Буферы |
+| Plan node | Actual | Buffers |
 |---|---|---|
-| Parallel Index Scan `subdomain_results_default_checked_at_idx` (2 workers, Gather Merge) + Incremental Sort | ~70 тыс. строк окна исследовано: фильтр «есть что чистить» (content_hash/jsonb) отбросил ~45 тыс. (**65 %**) — heap-визит каждой | 23,7k hit + 39,6k read, **I/O 36 с** |
-| Anti Join `laravel_domains` (Index Only, PK) | 22,6 тыс. проб, дёшев | 45,4k hit |
-| Join `domains` (PK-пробы: status, флаг рендера) | 22,0 тыс. проб | 101k hit + 8,5k read, I/O 16 с |
-| Итого | пачка 10 000 за **24,7 с** (суперпользователь, 2 параллельных воркера) | 170,6k hit + 48,2k read |
+| Parallel Index Scan `subdomain_results_default_checked_at_idx` (2 workers, Gather Merge) + Incremental Sort | ~70k window rows examined: the "something to clean" filter (content_hash/jsonb) rejected ~45k (**65%**) — a heap visit for each | 23.7k hit + 39.6k read, **I/O 36 s** |
+| Anti Join `laravel_domains` (Index Only, PK) | 22.6k probes, cheap | 45.4k hit |
+| Join `domains` (PK probes: status, the render flag) | 22.0k probes | 101k hit + 8.5k read, I/O 16 s |
+| Total | a batch of 10,000 in **24.7 s** (superuser, 2 parallel workers) | 170.6k hit + 48.2k read |
 
-1. **Окно старения — 84 229 строк/час** (замер count), а не «≈15 тыс.»
-   из оценки T-185 §2: приток `subdomain_results` ≈ 2–3 млн/сут.
-   Масштабная константа ТЗ была занижена в 5,6 раза — отсюда «0,3–1 с»
-   оценки против 5–25 с факта.
-2. **Стоимость формы — необходимый минимум**: payload-колонки
-   (`content_hash`, jsonb) вне индекса `checked_at` и не могут быть
-   индексированы (HOT-инвариант `subdomain_results` — очистка это
-   миллионы UPDATE/сутки, класс T-104/T-175); значит, каждая строка
-   окна требует heap-визита, а 65 % из них ничего не чистят. JOIN
-   `domains` — точечные PK-пробы, дешевле некуда. Курсор T-185 уже
-   гарантирует однократное посещение каждой строки окна за жизнь.
-3. **Главный множитель — I/O-голод**: 48 тыс. чтений прохода при
-   competition с конвейером (PSI ~80 %) растягивают минимум формы с
-   единиц секунд до десятков; в полуночный шторм — до 86–94 с.
-4. **Проход отбирает CPU у конвейера**: пул http-worker не имеет
-   `NoParallelGather` (T-181/T-171 ставили хук monitor/dashboard/
-   scheduler) — дренаж собирает 2 параллельных воркера (Gather Merge)
-   на том же сервисе, где работают HTTP-слоты.
+1. **The aging window is 84,229 rows/hour** (a count measurement), not
+   the "≈15k" of the T-185 §2 estimate: the `subdomain_results` inflow
+   ≈ 2–3M/day. The spec's scale constant underestimated the window by
+   5.6× — hence the "0.3–1 s" estimate versus 5–25 s in fact.
+2. **The form's cost is the necessary minimum**: the payload columns
+   (`content_hash`, jsonb) are outside the `checked_at` index and
+   cannot be indexed (the HOT invariant of `subdomain_results` —
+   cleaning is millions of UPDATEs/day, the T-104/T-175 class);
+   therefore every window row requires a heap visit, and 65% of them
+   clean nothing. The JOIN on `domains` — point PK probes, as cheap as
+   it gets. The T-185 cursor already guarantees a single lifetime
+   visit of every window row.
+3. **The main multiplier — I/O starvation**: 48k reads per pass under
+   competition with the pipeline (PSI ~80%) stretch the form's minimum
+   from single seconds to tens; in the midnight storm — up to 86–94 s.
+4. **The pass takes CPU away from the pipeline**: the http-worker pool
+   lacks `NoParallelGather` (T-181/T-171 installed the hook on
+   monitor/dashboard/scheduler) — the drain gathers 2 parallel workers
+   (Gather Merge) on the same service where the HTTP slots run.
 
-## 3. Целевое состояние
+## 3. Target state
 
-1. Дренаж retention не отбирает ядра у конвейера: пул http-worker —
-   сериальный (`max_parallel_workers_per_gather = 0`), проход отдаёт
-   стенку времени в обмен на CPU-справедливость (стенка фонового
-   дренажа не критична — темп задаёт `retention_batch`/интервал, диск
-   T-166 дренируется часами).
-2. SQL/схема не меняются: форма оптимальна (§2.2), миграций нет.
-3. Контрольная точка: после снятия CPU/IO-голода (второй render-хост,
-   operations 24.10) — повторный замер; цель — уход записей SELECT и
-   UPDATE-очистки из журнала медленных (порог 3 с, T-177) в
-   стационаре.
+1. The retention drain does not take cores away from the pipeline: the
+   http-worker pool is serial (`max_parallel_workers_per_gather = 0`);
+   the pass trades wall-clock time for CPU fairness (the wall time of
+   a background drain is not critical — the pace is set by
+   `retention_batch`/the interval; the T-166 disk drains over hours).
+2. SQL/schema unchanged: the form is optimal (§2.2), no migrations.
+3. A checkpoint: after the CPU/IO starvation is lifted (a second
+   render host, operations Oct 24) — a re-measurement; the goal — the
+   SELECT and UPDATE-cleaning entries leaving the slow log (the 3 s
+   threshold, T-177) in steady state.
 
-## 4. Изменения
+## 4. Changes
 
-### 4.1. NoParallelGather пулу http-worker
+### 4.1. NoParallelGather for the http-worker pool
 
-`cmd/http-worker` (wiring `service.Options.DBAfterConnect`): хук
-`db.NoParallelGather` (T-171) пула сервиса — продление действующего
-решения на четвёртый сервис. Точечные операторы HTTP-слотов (PK, unnest)
-параллелизм не используют — behaviour пула меняется только для
-агрегатных/сканирующих операторов фоновых циклов сервиса (retention,
-проход доработки рендера T-066 уже сериален по своей природе).
+`cmd/http-worker` (wiring `service.Options.DBAfterConnect`): the
+`db.NoParallelGather` hook (T-171) on the service pool — extending the
+existing solution to the fourth service. The point statements of the
+HTTP slots (PK, unnest) do not use parallelism — the pool behavior
+changes only for the aggregate/scanning statements of the service's
+background loops (retention; the T-066 render rework pass is already
+serial by nature).
 
-### 4.2. Документация и наблюдаемость
+### 4.2. Documentation and observability
 
-- `docs/db.md` (таблица хуков T-171): http-worker в списке;
-  обоснование — retention-дренаж.
-- Комментарий `retentionSelectSQL`: фактический масштаб окна
-  (≈84 тыс. строк/ч против 15 тыс. оценки T-185) и минимум формы
-  (§2.2) — чтобы следующий разбор не искал «потерянный индекс».
+- `docs/db.md` (the T-171 hook table): http-worker in the list; the
+  rationale — the retention drain.
+- A `retentionSelectSQL` comment: the actual window scale (≈84k rows/h
+  versus the 15k of the T-185 estimate) and the form's minimum (§2.2)
+  — so that the next analysis does not hunt for a "lost index".
 
-### 4.3. Что осознанно НЕ меняется
+### 4.3. What is deliberately NOT changed
 
-- `retention_batch`, интервал цикла: сумма работы за окно не зависит от
-  нарезки (один проход по срезу старения), мельче пачки — дольше окно
-  дренажа без выгоды.
-- Индексы по payload-колонкам и `rendered` — HOT-инвариант.
-- Частота прохода — темп диктует цель диска T-166/T-167.
+- `retention_batch`, the loop interval: the total work per window does
+  not depend on the slicing (one pass over the aging slice); smaller
+  batches — a longer drain window with no benefit.
+- Indexes on the payload columns and `rendered` — the HOT invariant.
+- The pass frequency — the pace is dictated by the T-166/T-167 disk
+  goal.
 
-## 5. Риски и границы
+## 5. Risks and boundaries
 
-1. Стенка одного прохода вырастет (~×1,5–2 в голод) — фоновый дренаж
-   не на критическом пути; контроль — метрика длительности прохода и
-   глубина «неочищенного» хвоста (`content.retention` лаг), алерт
-   диска T-162 остаётся страховкой.
-2. Если после аппаратного расширения проход всё ещё >3 с — возврат к
-   разбору с новыми замерами (кандидаты того круга: сужение JOIN
-   условием по счётчику `render_pending`, двухфазная выборка) —
-   фиксируется контрольной точкой §3.3, не этой задачей.
+1. The wall time of a single pass will grow (~×1.5–2 under starvation)
+   — a background drain is not on the critical path; the control — the
+   pass-duration metric and the depth of the "uncleaned" tail (the
+   `content.retention` lag); the T-162 disk alert remains the guard.
+2. If after the hardware expansion the pass is still >3 s — back to
+   analysis with new measurements (the candidates of that circle:
+   narrowing the JOIN with a condition on the `render_pending`
+   counter, a two-phase selection) — captured by the §3.3 checkpoint,
+   not by this task.
 
-## 6. Принятые решения и отклонённые варианты
+## 6. Accepted decisions and rejected alternatives
 
-1. **Сериальность вместо «ускорения»** — единственное честное локальное
-   решение: форма уже минимальна (§2.2), а параллелизм дренажа
-   конкурирует с тем же сервисом за голодный CPU.
-2. Отклонён **частичный индекс по payload/`rendered`** — HOT-инвариант
-   (класс T-104/T-175/T-182).
-3. Отклонено **уменьшение `retention_batch`** — не меняет сумму работы.
-4. Отклонено **перенос retention в отдельный сервис/пул** — второй пул
-   в бюджете соединений (docs/db.md §«Бюджет соединений») ради одного
-   цикла; хук решает теми же средствами.
+1. **Serial over "speedup"** — the only honest local solution: the
+   form is already minimal (§2.2), and the drain's parallelism
+   competes for the starved CPU with the same service.
+2. Rejected a **partial index on payload/`rendered`** — the HOT
+   invariant (the T-104/T-175/T-182 class).
+3. Rejected **reducing `retention_batch`** — it does not change the
+   total work.
+4. Rejected **moving retention to a separate service/pool** — a second
+   pool in the connection budget (docs/db.md §"Connection budget") for
+   a single loop; the hook solves it with the same means.
 
-## 7. Тестирование и приёмка
+## 7. Testing and acceptance
 
-1. Юнит: wiring-тест `cmd/http-worker` (или конфиг-тест сборки) — пул
-   получает AfterConnect-хук (по образцу тестов T-171/T-192);
-   SQL-контракты не меняются.
-2. Интеграционные: не требуются (поведение SQL не меняется) —
-   существующие тесты retention остаются зелёными.
-3. Приёмка: `EXPLAIN` прохода в сессии сервиса — без Gather/Parallel
-   узлов; записи retention в журнале медленных не учащаются;
-   контрольная точка §3.3 после расширения рендера.
+1. Unit: a wiring test of `cmd/http-worker` (or a build config test) —
+   the pool gets the AfterConnect hook (modeled on the T-171/T-192
+   tests); the SQL contracts unchanged.
+2. Integration: not required (the SQL behavior is unchanged) — the
+   existing retention tests stay green.
+3. Acceptance: the `EXPLAIN` of a pass in a service session — no
+   Gather/Parallel nodes; retention entries in the slow log do not
+   become more frequent; the §3.3 checkpoint after the render
+   expansion.
 
-## 8. Этапность
+## 8. Staging
 
-1. Хук §4.1 (wiring + тест).
-2. Документация §4.2.
-3. Контрольная точка — заметка в задаче (замер после аппаратного
-   расширения рендера).
+1. The §4.1 hook (wiring + test).
+2. Documentation §4.2.
+3. A checkpoint — a note in the task (a measurement after the hardware
+   expansion of render).
 
-Зависимости: нет. Миграций нет.
+Dependencies: none. No migrations.

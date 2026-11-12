@@ -1,168 +1,180 @@
-# Техническое задание: дренаж retention по времени — курсор цикла вместо ежечасных кругов
+# Specification: the time-based retention drain — a loop cursor instead of hourly circles
 
-Версия: 1.0 (по итогам разбора лога медленных запросов боя 2026-10-24 —
-запрос №13 журнала, тяжелейший по суммарному времени; лог:
-`log_min_duration_statement = 3000`, T-177). Синергия — индекс окон
-T-171 `subdomain_results_checked_idx` и счётчик рендер-долга T-175
-`crawler_counters['render_pending']`.
+Version: 1.0 (based on the analysis of the production slow-query log
+of 2026-10-24 — log entry #13, the heaviest by total time; the log:
+`log_min_duration_statement = 3000`, T-177). Synergy — the T-171
+window index `subdomain_results_checked_idx` and the T-175 render-debt
+counter `crawler_counters['render_pending']`.
 
 ---
 
-## 1. Сегодняшнее состояние и источник
+## 1. Current state and source
 
-Запрос `retentionSelectSQL` (`internal/content/retention.go:132`):
-пачка кандидатов очистки контента не-находок (T-166) — возраст
-`checked_at < now() − retention` (6 ч), есть что чистить (content_hash
-или jsonb), рендер-безопасность (`rendered OR (flags & 2) = 0` через
-JOIN domains), домен жив, не находка (anti-join laravel_domains);
-курсор row-value по PK, `LIMIT 10000`.
+The `retentionSelectSQL` query (`internal/content/retention.go:132`):
+a batch of content-cleanup candidates for non-finds (T-166) — the age
+`checked_at < now() − retention` (6 h), something to clean
+(content_hash or jsonb), render safety (`rendered OR (flags & 2) = 0`
+via a JOIN on domains), the domain alive and not a find (an anti-join
+on laravel_domains); a row-value cursor by PK, `LIMIT 10000`.
 
-Вызывается `RetentionOnce` ← часовой `RetentionLoop` (http-worker).
-Курсор прохода начинается с нуля **каждый проход** (`after :=
-retentionKey{}`) и переживает только пачки внутри прохода.
+Called by `RetentionOnce` ← the hourly `RetentionLoop` (http-worker).
+The pass cursor starts from zero **on every pass** (`after :=
+retentionKey{}`) and survives only batches within a pass.
 
-Статистика боя (журнал 24.10 09:51–12:15): **50 срабатываний** порога
-3 с, медиана **75,9 с**, max 262,5 с — ≈63 минуты времени БД за 2,4 ч,
-крупнейший единичный потребитель журнала.
+Production statistics (the log of Oct 24 09:51–12:15): **50 triggers**
+of the 3 s threshold, median **75.9 s**, max 262.5 s — ≈63 minutes of
+DB time over 2.4 h, the largest single consumer of the log.
 
-## 2. Диагноз (EXPLAIN на боевой БД, 24.10)
+## 2. Diagnosis (EXPLAIN on the production DB, Oct 24)
 
-- План: Index Scan `subdomain_results_default_pkey` (курсор row-value,
-  ORDER BY PK); индекс возраста T-171 `subdomain_results_checked_idx`
-  **не используется** — порядок PK принуждает планировщика.
-- Каждый батч идёт по PK-пространству от курсора, посещая heap каждой
-  строки: ещё не состарившиеся (рассеяны по всему PK-порядку — конвейер
-  проверяет зоны по кругу), уже очищенные (jsonb NULL — выпадают из
-  отбора только после heap-визита), плюс JOIN domains (flags/status —
-  heap) и anti-join laravel_domains на каждую строку-кандидата.
-- Проход стартует с нуля ежечасно: пройденная и очищенная история
-  (миллионы строк) перечитывается **каждый час**; 50 батчей прохода ×
-  десятки секунд; дорожка растёт линейно с таблицей (перепроверки
-  пишут новые строки, приток ≈3 млн/сут).
-- Ретраи защищённых строк держатся именно полными кругами: записи под
-  защитой снимка очередей (retentionpending.go) и рендер-долга
-  («вернутся следующим» проходом) имеют замороженный `checked_at` —
-  курсор по времени обязан получить взамен явный механизм ретраев
-  (§4.3–4.4), иначе очищение застревает до перепроверки (месяцы) и
-  диск растёт (цель T-166/T-167 сорвана).
+- The plan: Index Scan `subdomain_results_default_pkey` (a row-value
+  cursor, ORDER BY PK); the T-171 age index
+  `subdomain_results_checked_idx` is **not used** — the PK order
+  forces the planner.
+- Each batch walks the PK space from the cursor, visiting the heap of
+  every row: rows not yet aged (scattered across the whole PK order —
+  the pipeline checks zones round-robin), rows already cleaned
+  (jsonb NULL — they drop out of the selection only after a heap
+  visit), plus a JOIN on domains (flags/status — heap) and an
+  anti-join on laravel_domains for every candidate row.
+- The pass starts from zero hourly: the already-traversed and cleaned
+  history (millions of rows) is re-read **every hour**; 50 pass
+  batches × tens of seconds; the trail grows linearly with the table
+  (rechecks write new rows, the inflow ≈3M/day).
+- Retries of protected rows are handled precisely by full circles:
+  rows under the protection of the queue snapshot
+  (retentionpending.go) and of render debt ("they will come back with
+  the next pass") have a frozen `checked_at` — a time cursor must get
+  an explicit retry mechanism in exchange (§4.3–4.4), otherwise
+  cleaning stalls until the recheck (months) and the disk grows (the
+  T-166/T-167 goal is defeated).
 
-## 3. Целевое состояние
+## 3. Target state
 
-1. Цена прохода ∝ **притоку** (стареющий срез часа ≈ десятки тысяч
-   строк), а не размеру таблицы: индекс возраста обслуживает выборку.
-2. Каждая строка посещается **один раз за жизнь**: очищенная остаётся
-   позади курсора; перепроверённая (DELETE+INSERT, fresh checked_at —
-   T-058) входит в дренаж заново, когда состарится.
-3. Ретраи — явные и ограниченные: список ключей защиты очередей
-   (bounded, точечные предложения) и catch-up-круг по обнулению
-   рендер-долга.
-4. Интерлок q:analyze, снимок защиты, семантика purge/decref/delete,
-   статистики и метрики T-166 — без изменений.
+1. The pass cost ∝ the **inflow** (an aging hourly slice ≈ tens of
+   thousands of rows), not the table size: the age index serves the
+   selection.
+2. Every row is visited **once in its life**: a cleaned one stays
+   behind the cursor; a rechecked one (DELETE+INSERT, fresh
+   checked_at — T-058) enters the drain again once it ages.
+3. Retries are explicit and bounded: a list of queue-protection keys
+   (bounded, point offers) and a catch-up circle on the zeroing of
+   render debt.
+4. The q:analyze interlock, the protection snapshot, the
+   purge/decref/delete semantics, and the T-166 statistics and
+   metrics — unchanged.
 
-## 4. Схема решения
+## 4. Solution design
 
-### 4.1. Выборка по времени (окно старения)
+### 4.1. Time-based selection (the aging window)
 
-`retentionSelectSQL`: курсор и сортировка — по времени:
+`retentionSelectSQL`: the cursor and the ordering — by time:
 
 ```sql
 WHERE r.checked_at < now() - $1::interval
   AND (r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant)
       > ($2, $3, $4, $5, $6)
-  AND (…есть что чистить… renders-safe JOIN … anti-join …)
+  AND (…something to clean… renders-safe JOIN … anti-join …)
 ORDER BY r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant
 LIMIT $7
 ```
 
-- Диапазон от курсора даёт `subdomain_results_checked_idx (checked_at)`
-  (T-171): newly-aged срез + неотработанный хвост предыдущих окон
-  (интерлоки/блокировки) — всё впереди курсора.
-- Детерминизм порядка внутри одинаковых `checked_at` (now() стабильна
-  в транзакции записи — пачки строк делят отметку): **Incremental
-  Sort** по остальным ключам поверх порядка индекса (PG16) — проверить
-  EXPLAIN'ом; если планировщик не берёт — композитный индекс
-  `(checked_at, zone_id, domain_id, …)` отдельной миграцией (решение
-  исполнителя по фактическому плану; расширение индекса ≈ +30 байт ×
-  строки против полной дорожки — дёшево).
+- The range from the cursor engages `subdomain_results_checked_idx
+  (checked_at)` (T-171): the newly-aged slice + the unprocessed tail
+  of previous windows (interlocks/blocks) — everything is ahead of the
+  cursor.
+- Order determinism within equal `checked_at` values (now() is stable
+  within the write transaction — batches of rows share the timestamp):
+  **Incremental Sort** by the remaining keys on top of the index order
+  (PG16) — verify with EXPLAIN; if the planner does not take it — a
+  composite index `(checked_at, zone_id, domain_id, …)` as a separate
+  migration (the implementer decides based on the actual plan;
+  widening the index ≈ +30 bytes × rows versus the full trail —
+  cheap).
 
-### 4.2. Курсор цикла (переживает проходы)
+### 4.2. The loop cursor (survives passes)
 
-Состояние `RetentionLoop`: курсор инициализируется нулём при старте
-процесса (один catch-up-круг по старту — платится рестартом, не часом)
-и продвигается пачками; «неполная пачка» — дренаж до конца окна
-старения, следующий проход продолжает с места остановки.
+The `RetentionLoop` state: the cursor is initialized to zero at
+process start (one catch-up circle at startup — paid by the restart,
+not by the hour) and advances in batches; an "incomplete batch" —
+drain to the end of the aging window, the next pass continues from
+where it stopped.
 
-### 4.3. Ретраи защиты очередей — bounded-список ключей
+### 4.3. Queue-protection retries — a bounded key list
 
-Ключи, отложенные `deferBatch` (снимок q:render/q:analyze), больше не
-«подберутся следующим кругом»: цикл держит их в памяти (bounded, лимит
-— порядок глубин стримов у watermark'ов; превышение — Warn и
-консервативный catch-up-круг) и в следующем проходе предлагает их
-**точечно** (`= ANY(ключи)` PK-зонд), исключая из предложения те, чья
-защита ушла и очистка прошла. Потеря списка (рестарт) — покрывается
-catch-up-кругом старта.
+Keys deferred by `deferBatch` (a snapshot of q:render/q:analyze) are
+no longer "picked up on the next circle": the loop keeps them in
+memory (bounded; the limit — the order of the stream depths at the
+watermarks; exceeding it — a Warn and a conservative catch-up circle)
+and in the next pass offers them **point-wise** (`= ANY(keys)`, a PK
+probe), excluding from the offer those whose protection has lifted and
+whose cleaning has completed. Losing the list (a restart) — covered by
+the startup catch-up circle.
 
-### 4.4. Catch-up по рендер-долгу
+### 4.4. Catch-up on render debt
 
-Строки под флагом render_pending отфильтровываются JOIN'ом молча —
-курсор по времени их проходит. Момент снятия всей защиты — обнуление
-счётчика T-175 `crawler_counters['render_pending']` (точечное чтение
-в начале прохода): при переходе в 0 цикл планирует один полный круг с
-нулевого курсора (догоняет всё, что копилось за эпоху долга; частота —
-по факту дренажей долга, не по часам). Отсутствие строки счётчика
-(до деплоя T-175) — fallback: круг раз в сутки в спокойный час
-(конфиг-поле не заводить — константа, комментарий).
+Rows under the render_pending flag are silently filtered out by the
+JOIN — the time cursor walks past them. The moment all protection
+lifts is the zeroing of the T-175 counter
+`crawler_counters['render_pending']` (a point read at the start of a
+pass): when it transitions to 0, the loop schedules one full circle
+from the zero cursor (catching up on everything accumulated during
+the debt epoch; the frequency — by the actual debt drains, not by the
+clock). The absence of the counter row (before the T-175 deploy) — a
+fallback: a circle once a day in a quiet hour (do not add a config
+field — a constant, with a comment).
 
-### 4.5. Что не меняется
+### 4.5. What stays unchanged
 
-`retentionPurgeSQL`/`decref`/`delete` (охранные повторные проверки
-возраста и хэша уже стоят), интерлок `retentionBlocked`, снимки
-`retentionPendingSnapshot` и их обновление длинного дренажа, метрики
-`OnPass`.
+`retentionPurgeSQL`/`decref`/`delete` (the guard re-checks of age and
+hash are already in place), the `retentionBlocked` interlock, the
+`retentionPendingSnapshot` snapshots and their updating during a long
+drain, the `OnPass` metrics.
 
-## 5. Тестирование и приёмка
+## 5. Testing and acceptance
 
-1. Юнит: текст `retentionSelectSQL` (курсор/ORDER BY по времени);
-   курсор цикла через проходы; bounded-список: предложение точечных
-   ключей, эвикция; catch-up: триггер по счётчику 0, fallback-сутки.
-2. Интеграция: строка очищается один раз (повторные проходы её не
-   посещают — счётчик вызовов SQL); защищённая снимком строка
-   очищается следующим проходом после снятия защиты (точечное
-   предложение); render_pending-строка — catch-up-кругом после
-   обнуления счётчика; перепроверённая строка (DELETE+INSERT) входит
-   в дренаж повторно после старения.
-3. Приёмка: записи `retentionSelectSQL` исчезают из журнала медленных
-   (T-177); часовой проход — секунды (лог длительностей `OnPass`);
-   плато диска T-166/T-167 удерживается (контроль content_size);
-   `make test` + `make test-integration` зелёные.
+1. Unit: the text of `retentionSelectSQL` (a time-based cursor/ORDER
+   BY); the loop cursor across passes; the bounded list: offering
+   point keys, eviction; catch-up: the counter-0 trigger, the
+   fallback day.
+2. Integration: a row is cleaned once (subsequent passes do not visit
+   it — an SQL call counter); a row protected by a snapshot is cleaned
+   by the next pass after the protection lifts (a point offer); a
+   render_pending row — by a catch-up circle after the counter zeroes;
+   a rechecked row (DELETE+INSERT) enters the drain again after aging.
+3. Acceptance: the `retentionSelectSQL` entries disappear from the
+   slow log (T-177); the hourly pass takes seconds (the `OnPass`
+   duration log); the T-166/T-167 disk plateau holds (content_size
+   monitoring); `make test` + `make test-integration` green.
 
-## 6. Принятые решения и отклонённые варианты
+## 6. Accepted decisions and rejected alternatives
 
-1. **Курсор по времени, не по PK**: строки стареют в порядке
-   checked_at — окно обслуживает индекс T-171; PK-порядок стареющее
-   множество не локализует (проверки идут по кругу зон).
-2. **Явные ретраи вместо полных кругов**: ежечасный круг был
-   одновременно и ретраем, и дорожкой; замена — bounded-список
-   (очереди) + catch-up по счётчику долга (флаг) — оба механизма
-   ограничены и наблюдаемы.
-3. Отклонён **PK-курсор, переживший проходы, без ретраев**: теряет
-   защищённые строки до перепроверки — утечка контента, Regression
-   против цели T-166.
-4. Отклонено **«мельче батчи/реже проходы»** (вариант «в» разбора):
-   смягчает симптом, дорожка и рост с таблицей остаются.
-5. Композитный индекс — **только по факту плана** (§4.1): если
-   Incremental Sort держится, схема не трогается вовсе.
+1. **A time cursor, not a PK cursor**: rows age in checked_at order —
+   the window is served by the T-171 index; the PK order does not
+   localize the aging set (checks go round-robin over the zones).
+2. **Explicit retries instead of full circles**: the hourly circle
+   served as both the retry and the trail; the replacement — a bounded
+   list (queues) + a catch-up on the debt counter (the flag) — both
+   mechanisms are bounded and observable.
+3. Rejected a **PK cursor surviving passes without retries**: it loses
+   protected rows until the recheck — a content leak, a Regression
+   against the T-166 goal.
+4. Rejected **"smaller batches / rarer passes"** (variant "c" of the
+   analysis): it softens the symptom; the trail and the growth with
+   the table remain.
+5. The composite index — **only based on the actual plan** (§4.1): if
+   Incremental Sort holds, the schema is not touched at all.
 
-## 7. Этапность
+## 7. Staging
 
-1. `retentionSelectSQL` по времени + курсор цикла (§4.1–4.2), catch-up
-   старта.
-2. Bounded-список ретраев защиты очередей (§4.3).
-3. Catch-up по счётчику T-175 + fallback-сутки (§4.4).
-4. Тесты §5; документация: `docs/content.md` (модель дренажа
-   «один раз за жизнь», ретраи), `docs/render.md` (взаимодействие с
-   рендер-долгом).
+1. The time-based `retentionSelectSQL` + the loop cursor (§4.1–4.2),
+   the startup catch-up.
+2. The bounded list of queue-protection retries (§4.3).
+3. Catch-up on the T-175 counter + the fallback day (§4.4).
+4. The §5 tests; documentation: `docs/content.md` (the "once in a
+   life" drain model, retries), `docs/render.md` (the interaction with
+   render debt).
 
-Зависимости: индекс T-171 (уже в бою, миграция 0014); счётчик T-175 —
-опционально (§4.4 fallback работает без него). Миграция — только при
-недостаточности Incremental Sort (§4.1).
+Dependencies: the T-171 index (already in production, migration 0014);
+the T-175 counter — optional (the §4.4 fallback works without it). A
+migration — only if Incremental Sort proves insufficient (§4.1).
